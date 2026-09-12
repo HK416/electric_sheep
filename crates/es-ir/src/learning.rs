@@ -26,29 +26,6 @@ use crate::types::{ElemType, Frame, PortType, Shape, TimeRef, Unit};
 const LEARNING_TAG: &str = "es.learning_hash.v1";
 const POLICY_TAG: &str = "es.policy_hash.v1";
 
-// --- Diagnostic codes ---------------------------------------------------------------------
-// TODO(P27-merge): fold these into `codes.rs` with severity and title. Until then
-// `Diagnostic::new` reports them as errors with no title, which is correct but terse.
-
-/// Schema version disagreement between the graph and its wrapper.
-pub const LRN_001: &str = "LRN-001";
-/// Node has the wrong number of input ports for its kind.
-pub const LRN_002: &str = "LRN-002";
-/// Graph boundary does not match the declared tensor ports.
-pub const LRN_010: &str = "LRN-010";
-/// A boundary port is missing from, or disagrees with, `PolicyContract::inputs`.
-pub const LRN_011: &str = "LRN-011";
-/// `execute_chunk` exceeds `horizon` (spec 8.4).
-pub const LRN_020: &str = "LRN-020";
-/// The contract disagrees with the policy head it describes.
-pub const LRN_021: &str = "LRN-021";
-/// `observation_window` disagrees with the temporal node (spec 7.5 layer 3).
-pub const LRN_022: &str = "LRN-022";
-/// A contract field that must be positive is zero.
-pub const LRN_023: &str = "LRN-023";
-/// Normalizer direction disagrees with the units it is asked to produce.
-pub const LRN_030: &str = "LRN-030";
-
 /// One named tensor port. Spec 8.2 calls this `TensorPort`; it is exactly [`Port`].
 pub type TensorPort = Port;
 
@@ -644,7 +621,7 @@ impl LearningGraph {
         }
         if self.schema_version != self.nodes.schema_version {
             diags.push(Diagnostic::new(
-                LRN_001,
+                codes::LRN_001,
                 format!(
                     "wrapper says schema {} but the graph says {}",
                     self.schema_version, self.nodes.schema_version
@@ -665,7 +642,7 @@ impl LearningGraph {
             if n < min || max.is_some_and(|m| n > m) {
                 diags.push(
                     Diagnostic::new(
-                        LRN_002,
+                        codes::LRN_002,
                         format!("{} declares {n} input ports, expected {min}..", node.kind()),
                     )
                     .at(*id),
@@ -683,7 +660,7 @@ impl LearningGraph {
         ] {
             if declared.len() != refs.len() {
                 diags.push(Diagnostic::new(
-                    LRN_010,
+                    codes::LRN_010,
                     format!(
                         "{} declared {side} ports but the graph boundary has {}",
                         declared.len(),
@@ -708,7 +685,7 @@ impl LearningGraph {
                 if let Err(d) = port.ty.compatible(&found.ty) {
                     diags.push(
                         Diagnostic::new(
-                            LRN_010,
+                            codes::LRN_010,
                             format!(
                                 "{side} \"{}\" does not match the node: {}",
                                 port.name, d.message
@@ -728,7 +705,7 @@ impl LearningGraph {
             match self.policy.contract.inputs.get(&port.name) {
                 None => diags.push(
                     Diagnostic::new(
-                        LRN_011,
+                        codes::LRN_011,
                         format!("PolicyContract has no input named \"{}\"", port.name),
                     )
                     .on_port(port.name.clone()),
@@ -737,7 +714,7 @@ impl LearningGraph {
                     if let Err(d) = port.ty.compatible(&declared.ty) {
                         diags.push(
                             Diagnostic::new(
-                                LRN_011,
+                                codes::LRN_011,
                                 format!("contract input \"{}\": {}", port.name, d.message),
                             )
                             .on_port(port.name.clone()),
@@ -757,12 +734,15 @@ impl LearningGraph {
             ("observation_window", c.observation_window),
         ] {
             if v == 0 {
-                diags.push(Diagnostic::new(LRN_023, format!("{name} must be positive")));
+                diags.push(Diagnostic::new(
+                    codes::LRN_023,
+                    format!("{name} must be positive"),
+                ));
             }
         }
         if c.replanning_hz <= 0.0 || !c.replanning_hz.is_finite() {
             diags.push(Diagnostic::new(
-                LRN_023,
+                codes::LRN_023,
                 format!(
                     "replanning_hz must be positive and finite, got {}",
                     c.replanning_hz
@@ -772,7 +752,7 @@ impl LearningGraph {
         if c.execute_chunk > c.horizon {
             diags.push(
                 Diagnostic::new(
-                    LRN_020,
+                    codes::LRN_020,
                     format!(
                         "execute_chunk {} exceeds horizon {}",
                         c.execute_chunk, c.horizon
@@ -797,13 +777,13 @@ impl LearningGraph {
         });
         match head {
             None => diags.push(
-                Diagnostic::new(LRN_021, "the graph has no policy head")
+                Diagnostic::new(codes::LRN_021, "the graph has no policy head")
                     .with_hint("add a PolicyHead node, or reference a whole VLA with PolicyBundle"),
             ),
             Some((action_dim, horizon)) => {
                 if action_dim != c.action_dim {
                     diags.push(Diagnostic::new(
-                        LRN_021,
+                        codes::LRN_021,
                         format!(
                             "contract action_dim {} but the head produces {action_dim}",
                             c.action_dim
@@ -812,7 +792,7 @@ impl LearningGraph {
                 }
                 if horizon != c.horizon {
                     diags.push(Diagnostic::new(
-                        LRN_021,
+                        codes::LRN_021,
                         format!(
                             "contract horizon {} but the head produces {horizon}",
                             c.horizon
@@ -833,7 +813,7 @@ impl LearningGraph {
                 if *execute_chunk > *horizon {
                     diags.push(
                         Diagnostic::new(
-                            LRN_020,
+                            codes::LRN_020,
                             format!("execute_chunk {execute_chunk} exceeds horizon {horizon}"),
                         )
                         .at(*id),
@@ -842,7 +822,7 @@ impl LearningGraph {
                 if (*horizon, *execute_chunk) != (c.horizon, c.execute_chunk) {
                     diags.push(
                         Diagnostic::new(
-                            LRN_021,
+                            codes::LRN_021,
                             format!(
                                 "chunker is ({horizon}, {execute_chunk}) but the contract is ({}, {})",
                                 c.horizon, c.execute_chunk
@@ -866,7 +846,7 @@ impl LearningGraph {
         if window != c.observation_window {
             diags.push(
                 Diagnostic::new(
-                    LRN_022,
+                    codes::LRN_022,
                     format!(
                         "observation_window {} but the temporal node sees {window} frames",
                         c.observation_window
@@ -908,7 +888,7 @@ impl LearningGraph {
             if (*direction == NormalizeDir::Forward) != out_unit.is_policy_input() {
                 diags.push(
                     Diagnostic::new(
-                        LRN_030,
+                        codes::LRN_030,
                         format!("{direction:?} normalizer produces {out_unit:?}"),
                     )
                     .at(*id)
@@ -976,11 +956,14 @@ impl LearningGraph {
 
 // --- Test support -------------------------------------------------------------------------
 
-// `#[cfg(test)]`, not a `testing` feature: `es-ir/Cargo.toml` declares no such feature and
-// `proptest` is a dev-dependency, so the strategy is reachable from this crate's unit tests
-// only. TODO(P27-merge): promote to `feature = "testing"` if another crate needs it.
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod testing {
+    //! Fixtures and the proptest generator for the Appendix B.7 properties (P25).
+
+    // `use super::*` is how a test-support module reads; clippy only exempts `#[cfg(test)]`
+    // ones automatically, and this one is also reachable through `feature = "testing"`.
+    #![allow(clippy::wildcard_imports)]
+
     use super::*;
     use crate::graph::{NodeId, PortRef};
     use proptest::prelude::*;
@@ -1180,21 +1163,21 @@ mod tests {
     fn execute_chunk_above_horizon_is_lrn_020() {
         let mut g = act();
         g.policy.contract.execute_chunk = 80;
-        assert!(has(&g, LRN_020), "{:#?}", errors(&g));
+        assert!(has(&g, codes::LRN_020), "{:#?}", errors(&g));
     }
 
     #[test]
     fn contract_disagreeing_with_the_head_is_lrn_021() {
         let mut g = act();
         g.policy.contract.action_dim = 9;
-        assert!(has(&g, LRN_021), "{:#?}", errors(&g));
+        assert!(has(&g, codes::LRN_021), "{:#?}", errors(&g));
     }
 
     #[test]
     fn observation_window_must_match_the_temporal_node() {
         let mut g = act();
         g.policy.contract.observation_window = 2;
-        assert!(has(&g, LRN_022), "{:#?}", errors(&g));
+        assert!(has(&g, codes::LRN_022), "{:#?}", errors(&g));
     }
 
     #[test]
@@ -1219,7 +1202,7 @@ mod tests {
                 out_unit: Unit::Dimensionless,
             },
         );
-        assert!(has(&g, LRN_030), "{:#?}", errors(&g));
+        assert!(has(&g, codes::LRN_030), "{:#?}", errors(&g));
     }
 
     #[test]
@@ -1229,7 +1212,7 @@ mod tests {
             unreachable!()
         };
         inputs.truncate(1);
-        assert!(has(&g, LRN_002), "{:#?}", errors(&g));
+        assert!(has(&g, codes::LRN_002), "{:#?}", errors(&g));
     }
 
     #[test]

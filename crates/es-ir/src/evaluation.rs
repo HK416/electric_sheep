@@ -23,26 +23,9 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
+use crate::codes;
 use crate::diag::Diagnostic;
 use crate::hash::CanonWriter;
-
-// --- Diagnostic codes (spec 10) -----------------------------------------------------------
-// TODO(P27-merge): fold these into `crate::codes::CODES` once that file owns an `EVAL-` block.
-// Until then `Diagnostic::new` reports an unknown code as an error with no title, which is the
-// right severity for all six.
-
-/// An acceptance criterion names a metric or a suite that is not declared.
-pub const EVAL_001: &str = "EVAL-001";
-/// A threshold or a perturbation parameter is not finite.
-pub const EVAL_002: &str = "EVAL-002";
-/// The episode batch is empty, or the explicit seed list does not match `n_episodes`.
-pub const EVAL_003: &str = "EVAL-003";
-/// Two episodes share a seed, or two perturbations in one suite share a stream.
-pub const EVAL_004: &str = "EVAL-004";
-/// A perturbation range runs backwards (`lo > hi`).
-pub const EVAL_005: &str = "EVAL-005";
-/// An augmentation allow-list carries no justification (INV-15).
-pub const EVAL_006: &str = "EVAL-006";
 
 /// Domain separator for [`EvaluationIr::evaluation_hash`].
 const EVAL_TAG: &str = "es.ir.evaluation.v1";
@@ -259,13 +242,13 @@ impl PerturbationKind {
         for r in r {
             if !r.lo.is_finite() || !r.hi.is_finite() {
                 out.push(Diagnostic::new(
-                    EVAL_002,
+                    codes::EVAL_002,
                     format!("{at}: {} range is not finite", self.name()),
                 ));
             } else if r.lo > r.hi {
                 out.push(
                     Diagnostic::new(
-                        EVAL_005,
+                        codes::EVAL_005,
                         format!("{at}: {} range [{}, {}]", self.name(), r.lo, r.hi),
                     )
                     .with_hint("a range is written [lo, hi] with lo <= hi"),
@@ -275,7 +258,7 @@ impl PerturbationKind {
         for c in c {
             if c.lo > c.hi {
                 out.push(Diagnostic::new(
-                    EVAL_005,
+                    codes::EVAL_005,
                     format!("{at}: {} count [{}, {}]", self.name(), c.lo, c.hi),
                 ));
             }
@@ -283,7 +266,7 @@ impl PerturbationKind {
         for v in s {
             if !v.is_finite() {
                 out.push(Diagnostic::new(
-                    EVAL_002,
+                    codes::EVAL_002,
                     format!("{at}: {} has a non-finite parameter", self.name()),
                 ));
             }
@@ -544,7 +527,7 @@ impl EpisodeBatch {
     fn check(&self, out: &mut Vec<Diagnostic>) {
         if self.n_episodes == 0 {
             out.push(Diagnostic::new(
-                EVAL_003,
+                codes::EVAL_003,
                 "n_episodes is 0; a cell with no episodes has no metric",
             ));
         }
@@ -553,7 +536,7 @@ impl EpisodeBatch {
         };
         if list.len() as u64 != u64::from(self.n_episodes) {
             out.push(Diagnostic::new(
-                EVAL_003,
+                codes::EVAL_003,
                 format!(
                     "{} explicit seeds for {} episodes",
                     list.len(),
@@ -565,7 +548,7 @@ impl EpisodeBatch {
         for s in list {
             if !seen.insert(*s) {
                 out.push(
-                    Diagnostic::new(EVAL_004, format!("seed {s} appears twice"))
+                    Diagnostic::new(codes::EVAL_004, format!("seed {s} appears twice"))
                         .with_hint("duplicate seeds replay the same episode and skew the metric"),
                 );
             }
@@ -661,7 +644,7 @@ impl EvaluationIr {
         for suite in &self.suites {
             if !suite_names.insert(suite.name.as_str()) {
                 out.push(Diagnostic::new(
-                    EVAL_004,
+                    codes::EVAL_004,
                     format!("suite \"{}\" is declared twice", suite.name),
                 ));
             }
@@ -670,7 +653,7 @@ impl EvaluationIr {
                 if !streams.insert(p.stream) {
                     out.push(
                         Diagnostic::new(
-                            EVAL_004,
+                            codes::EVAL_004,
                             format!(
                                 "suite \"{}\": stream {} is used twice",
                                 suite.name, p.stream
@@ -688,7 +671,7 @@ impl EvaluationIr {
             if !declared.contains(&c.metric) {
                 out.push(
                     Diagnostic::new(
-                        EVAL_001,
+                        codes::EVAL_001,
                         format!(
                             "acceptance names metric {}, which is not in `metrics`",
                             c.metric.name()
@@ -700,14 +683,14 @@ impl EvaluationIr {
             if let Some(s) = &c.suite {
                 if !suite_names.contains(s.as_str()) {
                     out.push(Diagnostic::new(
-                        EVAL_001,
+                        codes::EVAL_001,
                         format!("acceptance names suite \"{s}\", which is not declared"),
                     ));
                 }
             }
             if !c.threshold.is_finite() {
                 out.push(Diagnostic::new(
-                    EVAL_002,
+                    codes::EVAL_002,
                     format!("threshold for {} is not finite", c.metric.name()),
                 ));
             }
@@ -716,8 +699,11 @@ impl EvaluationIr {
         if let AugmentationPolicy::AllowList { justification, .. } = &self.augmentation {
             if justification.trim().is_empty() {
                 out.push(
-                    Diagnostic::new(EVAL_006, "augmentation allow-list has no justification")
-                        .with_hint("INV-15: say why these nodes stay on during evaluation"),
+                    Diagnostic::new(
+                        codes::EVAL_006,
+                        "augmentation allow-list has no justification",
+                    )
+                    .with_hint("INV-15: say why these nodes stay on during evaluation"),
                 );
             }
         }
@@ -797,13 +783,13 @@ pub struct EvaluationReport {
     pub episodes: Vec<String>,
 }
 
-#[cfg(test)]
-mod testing_support {
-    //! Proptest strategy for a well-formed [`EvaluationIr`].
-    //!
-    //! Kept `#[cfg(test)]` rather than `#[cfg(any(test, feature = "testing"))]`: this packet
-    //! may not edit `Cargo.toml`, and a `feature = "testing"` gate with no such feature
-    //! declared trips `unexpected_cfgs` under `-D warnings`.
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
+    //! Proptest strategy for a well-formed [`EvaluationIr`] (Appendix B.7, P25).
+
+    // `use super::*` is how a test-support module reads; clippy only exempts `#[cfg(test)]`
+    // ones automatically, and this one is also reachable through `feature = "testing"`.
+    #![allow(clippy::wildcard_imports)]
 
     use super::*;
     use proptest::prelude::*;
@@ -915,7 +901,7 @@ mod testing_support {
 
 #[cfg(test)]
 mod tests {
-    use super::testing_support::arbitrary_evaluation_ir;
+    use super::testing::arbitrary_evaluation_ir;
     use super::*;
     use proptest::prelude::*;
 
@@ -1009,7 +995,7 @@ mod tests {
             nodes: ["color_jitter".to_owned()].into_iter().collect(),
             justification: "  ".into(),
         };
-        assert_eq!(codes(&ir.validate()), [EVAL_006]);
+        assert_eq!(codes(&ir.validate()), [codes::EVAL_006]);
     }
 
     #[test]
@@ -1017,7 +1003,7 @@ mod tests {
         let mut ir = fixture();
         ir.acceptance[0].metric = MetricSpec::DomainGap; // not in `metrics`
         ir.acceptance[1].suite = Some("no_such_suite".into());
-        assert_eq!(codes(&ir.validate()), [EVAL_001, EVAL_001]);
+        assert_eq!(codes(&ir.validate()), [codes::EVAL_001, codes::EVAL_001]);
     }
 
     #[test]
@@ -1027,7 +1013,7 @@ mod tests {
             n_episodes: 3,
             seeds: SeedPlan::Explicit(vec![7, 7, 9]),
         };
-        assert_eq!(codes(&ir.validate()), [EVAL_004]);
+        assert_eq!(codes(&ir.validate()), [codes::EVAL_004]);
     }
 
     #[test]
@@ -1037,7 +1023,7 @@ mod tests {
             n_episodes: 0,
             seeds: SeedPlan::Explicit(vec![1, 2]),
         };
-        assert_eq!(codes(&ir.validate()), [EVAL_003, EVAL_003]);
+        assert_eq!(codes(&ir.validate()), [codes::EVAL_003, codes::EVAL_003]);
     }
 
     #[test]
@@ -1054,7 +1040,12 @@ mod tests {
         ir.acceptance[0].threshold = f64::NAN;
         assert_eq!(
             codes(&ir.validate()),
-            [EVAL_005, EVAL_002, EVAL_005, EVAL_002]
+            [
+                codes::EVAL_005,
+                codes::EVAL_002,
+                codes::EVAL_005,
+                codes::EVAL_002
+            ]
         );
     }
 
@@ -1062,7 +1053,7 @@ mod tests {
     fn duplicate_streams_in_one_suite_are_reported() {
         let mut ir = fixture();
         ir.suites[1].perturbations[1].stream = 0;
-        assert_eq!(codes(&ir.validate()), [EVAL_004]);
+        assert_eq!(codes(&ir.validate()), [codes::EVAL_004]);
     }
 
     #[test]

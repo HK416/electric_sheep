@@ -18,30 +18,14 @@ use std::collections::BTreeSet;
 use es_core::time::TickRate;
 use serde::{Deserialize, Serialize};
 
+use crate::codes;
 use crate::diag::Diagnostic;
 use crate::hash::CanonWriter;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
-// --- Diagnostic codes ---------------------------------------------------------------------
 // `codes::DEP_031` (envelope exceeds robot capability) needs the robot description, which this
 // IR only references by name; that check belongs to the cross-IR pass (P26), not here.
-// TODO(P27-merge): move these rows into `crate::codes::CODES` so they gain titles.
-pub const DEP_001: &str = "DEP-001";
-pub const DEP_010: &str = "DEP-010";
-pub const DEP_011: &str = "DEP-011";
-pub const DEP_012: &str = "DEP-012";
-pub const DEP_013: &str = "DEP-013";
-pub const DEP_014: &str = "DEP-014";
-pub const DEP_015: &str = "DEP-015";
-pub const DEP_020: &str = "DEP-020";
-pub const DEP_021: &str = "DEP-021";
-pub const DEP_022: &str = "DEP-022";
-pub const DEP_023: &str = "DEP-023";
-pub const DEP_024: &str = "DEP-024";
-pub const DEP_030: &str = "DEP-030";
-pub const DEP_040: &str = "DEP-040";
-
 // --- Small shared types -------------------------------------------------------------------
 
 /// A duration in whole microseconds. Integer by construction: `f64` time is forbidden
@@ -325,7 +309,7 @@ impl DeploymentIr {
         let mut out = Vec::new();
         if self.schema_version != SCHEMA_VERSION {
             out.push(Diagnostic::new(
-                DEP_001,
+                codes::DEP_001,
                 format!(
                     "schema_version {} is not supported (expected {SCHEMA_VERSION})",
                     self.schema_version
@@ -334,7 +318,7 @@ impl DeploymentIr {
         }
         let n = self.robot.n_joints;
         if n == 0 {
-            out.push(Diagnostic::new(DEP_010, "robot.n_joints is 0"));
+            out.push(Diagnostic::new(codes::DEP_010, "robot.n_joints is 0"));
         }
         self.check_envelope(n, &mut out);
         self.check_timing(&mut out);
@@ -348,7 +332,7 @@ impl DeploymentIr {
         let s = &self.safety;
         if s.n_joints() != n {
             out.push(Diagnostic::new(
-                DEP_010,
+                codes::DEP_010,
                 format!(
                     "safety.position has {} entries but robot.n_joints is {n}",
                     s.n_joints()
@@ -384,12 +368,12 @@ impl DeploymentIr {
         for (i, limit) in s.position.iter().enumerate() {
             if !limit.lower.is_finite() || !limit.upper.is_finite() {
                 out.push(Diagnostic::new(
-                    DEP_011,
+                    codes::DEP_011,
                     format!("safety.position[{i}] is not finite"),
                 ));
             } else if limit.lower >= limit.upper {
                 out.push(Diagnostic::new(
-                    DEP_012,
+                    codes::DEP_012,
                     format!(
                         "safety.position[{i}]: lower {} is not below upper {}",
                         limit.lower, limit.upper
@@ -399,7 +383,7 @@ impl DeploymentIr {
         }
         if s.position_soft_margin.len() != s.position.len() {
             out.push(Diagnostic::new(
-                DEP_010,
+                codes::DEP_010,
                 format!(
                     "safety.position_soft_margin has {} entries but safety.position has {}",
                     s.position_soft_margin.len(),
@@ -410,12 +394,12 @@ impl DeploymentIr {
         for (i, (margin, limit)) in s.position_soft_margin.iter().zip(&s.position).enumerate() {
             if !margin.is_finite() || *margin < 0.0 {
                 out.push(Diagnostic::new(
-                    DEP_011,
+                    codes::DEP_011,
                     format!("safety.position_soft_margin[{i}] is not a non-negative number"),
                 ));
             } else if 2.0 * margin >= limit.upper - limit.lower {
                 out.push(Diagnostic::new(
-                    DEP_014,
+                    codes::DEP_014,
                     format!("safety.position_soft_margin[{i}] leaves no room inside the limit"),
                 ));
             }
@@ -431,13 +415,13 @@ impl DeploymentIr {
             ("deadlines.actuation_budget", d.actuation_budget),
         ] {
             if v.0 == 0 {
-                out.push(Diagnostic::new(DEP_020, format!("{name} is 0")));
+                out.push(Diagnostic::new(codes::DEP_020, format!("{name} is 0")));
             }
         }
         let period = self.rate.control_period();
         if d.actuation_budget > period {
             out.push(Diagnostic::new(
-                DEP_021,
+                codes::DEP_021,
                 format!(
                     "deadlines.actuation_budget {} us exceeds the control period {} us",
                     d.actuation_budget.0, period.0
@@ -446,7 +430,7 @@ impl DeploymentIr {
         }
         if d.observation_age < d.inference_budget {
             out.push(Diagnostic::new(
-                DEP_021,
+                codes::DEP_021,
                 format!(
                     "deadlines.observation_age {} us is below inference_budget {} us, so the \
                      staleness bound can never be met",
@@ -457,7 +441,7 @@ impl DeploymentIr {
         let (c, i) = (self.rate.control, self.rate.inference);
         if u128::from(i.num()) * u128::from(c.den()) > u128::from(c.num()) * u128::from(i.den()) {
             out.push(Diagnostic::new(
-                DEP_021,
+                codes::DEP_021,
                 "rate.inference is faster than rate.control",
             ));
         }
@@ -469,7 +453,7 @@ impl DeploymentIr {
         for w in &self.watchdogs.0 {
             if !seen.insert(w.key()) {
                 out.push(Diagnostic::new(
-                    DEP_024,
+                    codes::DEP_024,
                     format!("duplicate watchdog {}", w.key()),
                 ));
             }
@@ -501,7 +485,7 @@ impl DeploymentIr {
                 Watchdog::SensorDropout { sensor, max_gap } => {
                     if sensor.is_empty() {
                         out.push(Diagnostic::new(
-                            DEP_023,
+                            codes::DEP_023,
                             "watchdog sensor_dropout has no sensor",
                         ));
                     }
@@ -510,7 +494,7 @@ impl DeploymentIr {
                 Watchdog::EnvelopeViolationRate { window, max_frac } => {
                     if *window == 0 || !(0.0..=1.0).contains(max_frac) || *max_frac <= 0.0 {
                         out.push(Diagnostic::new(
-                            DEP_023,
+                            codes::DEP_023,
                             format!(
                                 "watchdog envelope_violation_rate: window {window}, max_frac \
                                  {max_frac} must be a positive window and a fraction in (0, 1]"
@@ -528,14 +512,14 @@ impl DeploymentIr {
             FallbackPolicy::RetractToHome { trajectory } => {
                 if trajectory.is_empty() {
                     out.push(Diagnostic::new(
-                        DEP_030,
+                        codes::DEP_030,
                         "fallback retract_to_home has an empty trajectory",
                     ));
                 }
                 for (i, waypoint) in trajectory.iter().enumerate() {
                     if waypoint.len() != n {
                         out.push(Diagnostic::new(
-                            DEP_010,
+                            codes::DEP_010,
                             format!(
                                 "fallback waypoint {i} has {} entries but robot.n_joints is {n}",
                                 waypoint.len()
@@ -549,7 +533,7 @@ impl DeploymentIr {
                         .all(|(l, q)| l.contains(*q))
                     {
                         out.push(Diagnostic::new(
-                            DEP_030,
+                            codes::DEP_030,
                             format!("fallback waypoint {i} is outside the position limits"),
                         ));
                     }
@@ -557,7 +541,7 @@ impl DeploymentIr {
             }
             FallbackPolicy::HandoffController { id } if id.is_empty() => {
                 out.push(Diagnostic::new(
-                    DEP_030,
+                    codes::DEP_030,
                     "fallback handoff_controller has no controller id",
                 ));
             }
@@ -569,7 +553,7 @@ impl DeploymentIr {
         let a = self.action;
         if a.horizon == 0 || a.execute_chunk == 0 || a.execute_chunk > a.horizon {
             out.push(Diagnostic::new(
-                DEP_040,
+                codes::DEP_040,
                 format!(
                     "action: execute_chunk {} must be in 1..={} (horizon)",
                     a.execute_chunk, a.horizon
@@ -585,19 +569,19 @@ impl DeploymentIr {
         };
         match expected {
             Some(dim) if a.dim != dim => out.push(Diagnostic::new(
-                DEP_010,
+                codes::DEP_010,
                 format!(
                     "action.dim {} does not match {dim} for {:?}",
                     a.dim, a.space
                 ),
             )),
-            _ if a.dim == 0 => out.push(Diagnostic::new(DEP_040, "action.dim is 0")),
+            _ if a.dim == 0 => out.push(Diagnostic::new(codes::DEP_040, "action.dim is 0")),
             _ => {}
         }
         if let ExecutionMode::TemporalEnsemble { decay } = self.execution {
             if !decay.is_finite() || decay <= 0.0 {
                 out.push(Diagnostic::new(
-                    DEP_040,
+                    codes::DEP_040,
                     format!("execution temporal_ensemble decay {decay} must be positive"),
                 ));
             }
@@ -768,10 +752,13 @@ fn canon_f64s(w: &mut CanonWriter, v: &[f64]) {
 
 fn check_scalar(name: &str, v: f64, out: &mut Vec<Diagnostic>) {
     if !v.is_finite() {
-        out.push(Diagnostic::new(DEP_011, format!("{name} is not finite")));
+        out.push(Diagnostic::new(
+            codes::DEP_011,
+            format!("{name} is not finite"),
+        ));
     } else if v <= 0.0 {
         out.push(Diagnostic::new(
-            DEP_013,
+            codes::DEP_013,
             format!("{name} must be positive, got {v}"),
         ));
     }
@@ -780,7 +767,7 @@ fn check_scalar(name: &str, v: f64, out: &mut Vec<Diagnostic>) {
 fn check_positive(name: &str, v: &[f64], n: usize, out: &mut Vec<Diagnostic>) {
     if v.len() != n {
         out.push(Diagnostic::new(
-            DEP_010,
+            codes::DEP_010,
             format!("{name} has {} entries but robot.n_joints is {n}", v.len()),
         ));
     }
@@ -791,10 +778,13 @@ fn check_positive(name: &str, v: &[f64], n: usize, out: &mut Vec<Diagnostic>) {
 
 fn check_within(name: &str, v: Micros, budget: Micros, out: &mut Vec<Diagnostic>) {
     if v.0 == 0 {
-        out.push(Diagnostic::new(DEP_023, format!("{name} timeout is 0")));
+        out.push(Diagnostic::new(
+            codes::DEP_023,
+            format!("{name} timeout is 0"),
+        ));
     } else if v > budget {
         out.push(Diagnostic::new(
-            DEP_022,
+            codes::DEP_022,
             format!(
                 "{name} timeout {} us exceeds its deadline {} us",
                 v.0, budget.0
@@ -804,7 +794,7 @@ fn check_within(name: &str, v: Micros, budget: Micros, out: &mut Vec<Diagnostic>
 }
 
 fn check_workspace(ws: &Workspace, out: &mut Vec<Diagnostic>) {
-    let bad = |msg: String| Diagnostic::new(DEP_015, msg);
+    let bad = |msg: String| Diagnostic::new(codes::DEP_015, msg);
     match ws {
         Workspace::Box { min, max } => {
             for i in 0..3 {
@@ -847,11 +837,14 @@ fn check_workspace(ws: &Workspace, out: &mut Vec<Diagnostic>) {
 
 // --- Generators ---------------------------------------------------------------------------
 
-// `proptest` is a dev-dependency of this crate, so the generator is `cfg(test)` rather than
-// behind a `testing` feature (adding the feature means editing `Cargo.toml`, which P23 does
-// not own).
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod testing {
+    //! Fixtures and the proptest generator for the Appendix B.7 properties (P25).
+
+    // `use super::*` is how a test-support module reads; clippy only exempts `#[cfg(test)]`
+    // ones automatically, and this one is also reachable through `feature = "testing"`.
+    #![allow(clippy::wildcard_imports)]
+
     use super::*;
     use proptest::prelude::*;
 
@@ -1083,7 +1076,7 @@ mod tests {
             lower: 1.0,
             upper: -1.0,
         };
-        assert!(has(&ir.validate(), DEP_012));
+        assert!(has(&ir.validate(), codes::DEP_012));
     }
 
     #[test]
@@ -1093,7 +1086,7 @@ mod tests {
         ir.safety.torque_max[1] = f64::NAN;
         let diags = ir.validate();
         assert!(
-            has(&diags, DEP_013) && has(&diags, DEP_011),
+            has(&diags, codes::DEP_013) && has(&diags, codes::DEP_011),
             "{:?}",
             codes(&diags)
         );
@@ -1106,7 +1099,7 @@ mod tests {
         ir.robot.n_joints = 6;
         let found = codes(&ir.validate());
         assert!(
-            found.iter().filter(|c| *c == DEP_010).count() >= 2,
+            found.iter().filter(|c| *c == codes::DEP_010).count() >= 2,
             "{found:?}"
         );
     }
@@ -1118,11 +1111,11 @@ mod tests {
         ir.deadlines.observation_age = Micros(1_000); // < inference budget
         let found = codes(&ir.validate());
         assert!(
-            found.iter().filter(|c| *c == DEP_021).count() == 2,
+            found.iter().filter(|c| *c == codes::DEP_021).count() == 2,
             "{found:?}"
         );
         // The stale-observation watchdog now sits outside its own deadline.
-        assert!(found.iter().any(|c| c == DEP_022), "{found:?}");
+        assert!(found.iter().any(|c| c == codes::DEP_022), "{found:?}");
     }
 
     #[test]
@@ -1131,16 +1124,16 @@ mod tests {
         ir.fallback = FallbackPolicy::RetractToHome {
             trajectory: vec![vec![99.0; 7]],
         };
-        assert!(has(&ir.validate(), DEP_030));
+        assert!(has(&ir.validate(), codes::DEP_030));
         ir.fallback = FallbackPolicy::HandoffController { id: String::new() };
-        assert!(has(&ir.validate(), DEP_030));
+        assert!(has(&ir.validate(), codes::DEP_030));
     }
 
     #[test]
     fn duplicate_watchdogs_are_reported() {
         let mut ir = seven_dof();
         ir.watchdogs.0.push(Watchdog::ChunkUnderrun);
-        assert!(has(&ir.validate(), DEP_024));
+        assert!(has(&ir.validate(), codes::DEP_024));
     }
 
     #[test]

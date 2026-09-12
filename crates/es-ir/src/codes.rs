@@ -25,16 +25,54 @@ pub const GRAPH_010: &str = "GRAPH-010";
 // --- Canonical encoding / hash chain (spec 5.3) -------------------------------------------
 pub const HASH_001: &str = "HASH-001";
 
-// --- Observation (spec 7.2) ---------------------------------------------------------------
+// --- Task (spec 7.4) ----------------------------------------------------------------------
+pub const TASK_001: &str = "TASK-001";
+
+// --- Observation (spec 7.2 .. 7.5) --------------------------------------------------------
 pub const OBS_021: &str = "OBS-021";
 pub const OBS_034: &str = "OBS-034";
+pub const OBS_040: &str = "OBS-040";
+pub const OBS_041: &str = "OBS-041";
+pub const OBS_042: &str = "OBS-042";
+pub const OBS_043: &str = "OBS-043";
 
-// --- Learning (spec 8.4) ------------------------------------------------------------------
+// --- Learning (spec 8.2 .. 8.6) -----------------------------------------------------------
+pub const LRN_001: &str = "LRN-001";
+pub const LRN_002: &str = "LRN-002";
+pub const LRN_010: &str = "LRN-010";
+pub const LRN_011: &str = "LRN-011";
+pub const LRN_020: &str = "LRN-020";
+pub const LRN_021: &str = "LRN-021";
+pub const LRN_022: &str = "LRN-022";
+pub const LRN_023: &str = "LRN-023";
+pub const LRN_030: &str = "LRN-030";
 pub const LRN_052: &str = "LRN-052";
 
-// --- Deployment (spec 9.3, spec 11.6) -----------------------------------------------------
+// --- Deployment (spec 9.2 .. 9.4, spec 11.6) ----------------------------------------------
+pub const DEP_001: &str = "DEP-001";
+pub const DEP_010: &str = "DEP-010";
+pub const DEP_011: &str = "DEP-011";
+pub const DEP_012: &str = "DEP-012";
+pub const DEP_013: &str = "DEP-013";
+pub const DEP_014: &str = "DEP-014";
+pub const DEP_015: &str = "DEP-015";
+pub const DEP_020: &str = "DEP-020";
+pub const DEP_021: &str = "DEP-021";
+pub const DEP_022: &str = "DEP-022";
+pub const DEP_023: &str = "DEP-023";
+pub const DEP_024: &str = "DEP-024";
+pub const DEP_030: &str = "DEP-030";
 pub const DEP_031: &str = "DEP-031";
+pub const DEP_040: &str = "DEP-040";
 pub const DEP_114: &str = "DEP-114";
+
+// --- Evaluation (spec 10.2, spec 10.4) ----------------------------------------------------
+pub const EVAL_001: &str = "EVAL-001";
+pub const EVAL_002: &str = "EVAL-002";
+pub const EVAL_003: &str = "EVAL-003";
+pub const EVAL_004: &str = "EVAL-004";
+pub const EVAL_005: &str = "EVAL-005";
+pub const EVAL_006: &str = "EVAL-006";
 
 // --- Determinism (spec 6.6) ---------------------------------------------------------------
 pub const DET_001: &str = "DET-001";
@@ -75,7 +113,21 @@ use Severity::{Error, Warning};
 /// The full dictionary. Sorted by code so a reader can scan it.
 #[rustfmt::skip]
 pub const CODES: &[CodeEntry] = &[
+    e(DEP_001, Error, "unsupported Deployment IR schema version", "9.2"),
+    e(DEP_010, Error, "size does not match robot.n_joints", "9.2"),
+    e(DEP_011, Error, "safety limit is not finite", "9.3"),
+    e(DEP_012, Error, "safety limit interval is empty", "9.3"),
+    e(DEP_013, Error, "safety limit must be positive", "9.3"),
+    e(DEP_014, Error, "soft margin leaves no room inside the limit", "9.3"),
+    e(DEP_015, Error, "workspace is empty or not finite", "9.3"),
+    e(DEP_020, Error, "deadline is 0", "9.4"),
+    e(DEP_021, Error, "timing budget cannot be met at this rate", "9.4"),
+    e(DEP_022, Error, "watchdog timeout exceeds the deadline it guards", "9.4"),
+    e(DEP_023, Error, "watchdog parameter is out of range", "9.4"),
+    e(DEP_024, Error, "duplicate watchdog", "9.4"),
+    e(DEP_030, Error, "fallback policy is not executable", "9.4"),
     e(DEP_031, Error, "deployment envelope exceeds robot capability", "9.3"),
+    e(DEP_040, Error, "action contract is inconsistent", "9.2"),
     e(DEP_114, Warning, "not supported by the selected runtime", "11.6"),
     e(DET_001, Error, "global RNG is forbidden; use TaskRng", "6.6"),
     e(DET_002, Error, "wall-clock access is forbidden", "6.6"),
@@ -84,14 +136,34 @@ pub const CODES: &[CodeEntry] = &[
     e(DET_021, Warning, "undeclared RNG stream", "6.6"),
     e(DET_030, Error, "unordered Reduce is rejected in deterministic mode", "6.6"),
     e(DET_040, Error, "tier 1 cannot be declared with an external backend", "6.6"),
+    e(EVAL_001, Error, "acceptance names an undeclared metric or suite", "10.2"),
+    e(EVAL_002, Error, "threshold or perturbation parameter is not finite", "10.2"),
+    e(EVAL_003, Error, "episode batch is empty or its seed list does not match", "10.4"),
+    e(EVAL_004, Error, "duplicate episode seed or perturbation stream", "10.4"),
+    e(EVAL_005, Error, "perturbation range runs backwards", "10.2"),
+    e(EVAL_006, Error, "augmentation allow-list carries no justification", "10.2"),
     e(GRAPH_001, Error, "the graph contains a cycle", "11.1"),
     e(GRAPH_002, Error, "edge or boundary port refers to an unknown node", "11.1"),
     e(GRAPH_003, Error, "input port has more than one incoming edge", "11.1"),
     e(GRAPH_010, Error, "unknown port name", "11.1"),
     e(HASH_001, Error, "value is not encodable in canonical form", "5.3"),
+    e(LRN_001, Error, "schema version disagrees with the graph", "8.2"),
+    e(LRN_002, Error, "wrong number of input ports for this node kind", "8.3"),
+    e(LRN_010, Error, "graph boundary does not match the declared tensor ports", "8.2"),
+    e(LRN_011, Error, "boundary port disagrees with the policy contract", "8.4"),
+    e(LRN_020, Error, "execute_chunk exceeds horizon", "8.4"),
+    e(LRN_021, Error, "contract disagrees with the policy head it describes", "8.4"),
+    e(LRN_022, Error, "observation_window disagrees with the temporal node", "7.5"),
+    e(LRN_023, Error, "contract field that must be positive is 0", "8.4"),
+    e(LRN_030, Error, "normalizer direction disagrees with the units it produces", "8.3"),
     e(LRN_052, Error, "inference latency exceeds the control period", "8.4"),
     e(OBS_021, Error, "color space mismatch", "7.2"),
     e(OBS_034, Error, "intrinsics were not updated for the resize", "7.2"),
+    e(OBS_040, Error, "Normalize output does not carry a Normalized unit", "7.3"),
+    e(OBS_041, Error, "augmentation node is not training_only", "7.3"),
+    e(OBS_042, Error, "TemporalWindow reaches further back than History keeps", "7.5"),
+    e(OBS_043, Error, "named output does not name a node port", "7.4"),
+    e(TASK_001, Error, "ObservationSpec declaration and graph disagree", "7.4"),
     e(TYPE_001, Error, "element type mismatch", "5.4"),
     e(TYPE_002, Error, "shape mismatch", "5.4"),
     e(TYPE_003, Error, "unit mismatch", "5.4"),
@@ -145,8 +217,12 @@ mod tests {
         // The constants used across the crate; a code with no entry has no severity or title.
         for code in [
             TYPE_001, TYPE_002, TYPE_003, TYPE_004, TYPE_010, TYPE_011, TYPE_014, TYPE_020,
-            GRAPH_001, GRAPH_002, GRAPH_003, GRAPH_010, HASH_001, OBS_021, OBS_034, LRN_052,
-            DEP_031, DEP_114, DET_001, DET_002, DET_010, DET_020, DET_021, DET_030, DET_040,
+            GRAPH_001, GRAPH_002, GRAPH_003, GRAPH_010, HASH_001, TASK_001, OBS_021, OBS_034,
+            OBS_040, OBS_041, OBS_042, OBS_043, LRN_001, LRN_002, LRN_010, LRN_011, LRN_020,
+            LRN_021, LRN_022, LRN_023, LRN_030, LRN_052, DEP_001, DEP_010, DEP_011, DEP_012,
+            DEP_013, DEP_014, DEP_015, DEP_020, DEP_021, DEP_022, DEP_023, DEP_024, DEP_030,
+            DEP_031, DEP_040, DEP_114, EVAL_001, EVAL_002, EVAL_003, EVAL_004, EVAL_005, EVAL_006,
+            DET_001, DET_002, DET_010, DET_020, DET_021, DET_030, DET_040,
         ] {
             assert!(lookup(code).is_some(), "{code} missing from CODES");
         }

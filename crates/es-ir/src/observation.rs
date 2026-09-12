@@ -23,13 +23,6 @@ use crate::hash::{canonical_hash, CanonWriter};
 use crate::image::{ChannelFormat, ColorSpace, ImageDType, ImageSpec, Intrinsics, Rect};
 use crate::types::{Align, PortType, TimeRef};
 
-/// Codes this module reports that are not in the dictionary yet.
-// TODO(P27-merge): add these rows to `codes.rs` with their severities and titles.
-pub const OBS_040: &str = "OBS-040";
-pub const OBS_041: &str = "OBS-041";
-pub const OBS_042: &str = "OBS-042";
-pub const OBS_043: &str = "OBS-043";
-
 /// Domain separator for [`ObservationIr::observation_hash`].
 const OBS_TAG: &str = "es.observation_hash.v1";
 
@@ -650,7 +643,7 @@ impl ObservationIr {
                     if !matches!(io.output.unit, crate::types::Unit::Normalized { .. }) {
                         diags.push(
                             Diagnostic::new(
-                                OBS_040,
+                                codes::OBS_040,
                                 format!("Normalize output carries {:?}", io.output.unit),
                             )
                             .at(*id)
@@ -661,7 +654,7 @@ impl ObservationIr {
                 }
                 ObservationNode::Augment { training_only, .. } if !*training_only => {
                     diags.push(
-                        Diagnostic::new(OBS_041, "augmentation node is not training_only")
+                        Diagnostic::new(codes::OBS_041, "augmentation node is not training_only")
                             .at(*id)
                             .with_hint(
                                 "augmentation must switch off under Evaluation IR (spec 7.3)",
@@ -701,7 +694,7 @@ impl ObservationIr {
                         if h.depth < window.required_depth() {
                             diags.push(
                                 Diagnostic::new(
-                                    OBS_042,
+                                    codes::OBS_042,
                                     format!(
                                         "window reaches back {} samples, History keeps {}",
                                         window.required_depth(),
@@ -726,9 +719,12 @@ impl ObservationIr {
                 .and_then(|ports| ports.into_iter().find(|p| p.name == out.port.port));
             match declared {
                 None => diags.push(
-                    Diagnostic::new(OBS_043, format!("output \"{name}\" names no node port"))
-                        .at(out.port.node)
-                        .on_port(out.port.port.clone()),
+                    Diagnostic::new(
+                        codes::OBS_043,
+                        format!("output \"{name}\" names no node port"),
+                    )
+                    .at(out.port.node)
+                    .on_port(out.port.port.clone()),
                 ),
                 Some(p) if p.ty != out.ty => diags.push(
                     Diagnostic::new(
@@ -892,10 +888,13 @@ fn image_out(
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testing"))]
 pub mod testing {
-    //! `proptest` is a dev-dependency and the crate has no `testing` feature, so this module is
-    //! `#[cfg(test)]`. P25 needs a `testing` feature added to `Cargo.toml` to reach it.
+    //! Fixtures and the proptest generator for the Appendix B.7 properties (P25).
+
+    // `use super::*` is how a test-support module reads; clippy only exempts `#[cfg(test)]`
+    // ones automatically, and this one is also reachable through `feature = "testing"`.
+    #![allow(clippy::wildcard_imports)]
 
     use std::time::Duration;
 
@@ -1227,7 +1226,7 @@ mod tests {
                 io: Io::unary(raw.clone(), raw.clone()),
             },
         );
-        assert_eq!(ir.validate()[0].code.as_str(), OBS_040);
+        assert_eq!(ir.validate()[0].code.as_str(), codes::OBS_040);
 
         let mut good = raw.clone();
         good.unit = Unit::Normalized { lo: -1.0, hi: 1.0 };
@@ -1253,7 +1252,7 @@ mod tests {
                 io: Io::unary(ty.clone(), ty),
             },
         );
-        assert_eq!(ir.validate()[0].code.as_str(), OBS_041);
+        assert_eq!(ir.validate()[0].code.as_str(), codes::OBS_041);
     }
 
     #[test]
@@ -1275,7 +1274,7 @@ mod tests {
                 io: Io::unary(ty.clone(), ty),
             },
         );
-        assert_eq!(ir.validate()[0].code.as_str(), OBS_042);
+        assert_eq!(ir.validate()[0].code.as_str(), codes::OBS_042);
 
         ir.temporal.history.insert(sensor(), History { depth: 10 });
         assert!(ir.validate().is_empty());
@@ -1313,7 +1312,10 @@ mod tests {
     fn an_output_that_names_no_port_is_obs_043() {
         let mut ir = resize_crop_chain(true);
         ir.outputs.get_mut("rgb_front").unwrap().port.port = "nope".to_owned();
-        assert!(ir.validate().iter().any(|d| d.code.as_str() == OBS_043));
+        assert!(ir
+            .validate()
+            .iter()
+            .any(|d| d.code.as_str() == codes::OBS_043));
     }
 
     #[test]

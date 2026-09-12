@@ -1,0 +1,256 @@
+//! Appendix B.7: the five normalization invariants, which are gate 2 of spec 28.7.
+//!
+//! Run with `cargo test -p es-ir --features testing norm`. Without the feature the
+//! generators do not exist, so the file compiles to nothing rather than failing to build.
+
+#![cfg(feature = "testing")]
+
+use es_ir::hash::canonical_hash;
+use es_ir::norm::{canon_learning, canon_observation, canon_task};
+use es_ir::testing::{
+    arbitrary_deployment_ir, arbitrary_evaluation_ir, arbitrary_layout, arbitrary_learning_graph,
+    arbitrary_observation_ir, arbitrary_task_ir, arbitrary_unit, deployment_edits,
+    evaluation_edits, learning_edits, observation_edits, shuffle_learning_ids,
+    shuffle_observation_ids, shuffle_task_ids, task_edits,
+};
+use proptest::prelude::*;
+use serde::{de::DeserializeOwned, Serialize};
+
+/// `serde_json` is built with `float_roundtrip` workspace-wide, so an `f64` survives exactly.
+fn json_round_trip<T: Serialize + DeserializeOwned>(v: &T) -> T {
+    serde_json::from_str(&serde_json::to_string(v).expect("serialize")).expect("deserialize")
+}
+
+// --- B.7.1 hash(canon(g)) == hash(canon(shuffle_ids(g))) ----------------------------------
+//
+// Deployment IR and Evaluation IR carry no graph and therefore no node ids, so this property
+// is vacuous for them.
+
+proptest! {
+    #[test]
+    fn norm_hash_independent_of_node_ids_task(ir in arbitrary_task_ir(), seed in any::<u64>()) {
+        let shuffled = shuffle_task_ids(&ir, seed);
+        prop_assert_eq!(
+            canon_task(&ir).unwrap().task_hash().unwrap(),
+            canon_task(&shuffled).unwrap().task_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn norm_hash_independent_of_node_ids_observation(
+        ir in arbitrary_observation_ir(),
+        seed in any::<u64>(),
+    ) {
+        let shuffled = shuffle_observation_ids(&ir, seed);
+        prop_assert_eq!(
+            canon_observation(&ir).unwrap().observation_hash().unwrap(),
+            canon_observation(&shuffled).unwrap().observation_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn norm_hash_independent_of_node_ids_learning(
+        g in arbitrary_learning_graph(),
+        seed in any::<u64>(),
+    ) {
+        let shuffled = shuffle_learning_ids(&g, seed);
+        prop_assert_eq!(
+            canon_learning(&g).unwrap().learning_hash().unwrap(),
+            canon_learning(&shuffled).unwrap().learning_hash().unwrap()
+        );
+    }
+
+    /// Spec 11.2: `*_graph_hash` is the authoring identity, so the *only* hash a relabelling
+    /// is allowed to move is that one.
+    #[test]
+    fn norm_task_graph_hash_sees_node_ids(ir in arbitrary_task_ir(), seed in any::<u64>()) {
+        let shuffled = shuffle_task_ids(&ir, seed);
+        prop_assert_eq!(ir.task_hash().unwrap(), shuffled.task_hash().unwrap());
+        prop_assert_ne!(
+            ir.task_graph_hash().unwrap(),
+            shuffled.task_graph_hash().unwrap()
+        );
+    }
+}
+
+// --- B.7.2 hash(canon(g)) == hash(canon(move_ui(g))) --------------------------------------
+//
+// Layout lives in an `.eslayout` sidecar (spec 5.1 rule 7), never in the IR, so the property
+// is that the hash API takes no layout input at all: a layout can only travel *alongside* a
+// graph, and moving it cannot reach the hash.
+// TODO(P28): once the `.esgraph` writer/parser lands, switch this to
+// `hash(parse_esgraph(write_esgraph(&g, &layout))) == hash(&g)`.
+
+proptest! {
+    #[test]
+    fn norm_hash_independent_of_ui(
+        ir in arbitrary_task_ir(),
+        obs in arbitrary_observation_ir(),
+        lrn in arbitrary_learning_graph(),
+        layout in arbitrary_layout(),
+        moved in arbitrary_layout(),
+    ) {
+        // A layout can only ride alongside an IR, never inside it, so "moving the UI" is
+        // swapping the sidecar and leaving the document alone.
+        let before = (&ir, &layout);
+        let after = (&ir, &moved);
+        prop_assert_eq!(before.0.task_hash().unwrap(), after.0.task_hash().unwrap());
+        prop_assert_eq!(
+            canonical_hash(&before.0.graph).unwrap(),
+            canonical_hash(&after.0.graph).unwrap()
+        );
+        // And the same for the two other graph IRs: the hash reads no layout input.
+        prop_assert_eq!(
+            (&obs, &layout).0.observation_hash().unwrap(),
+            (&obs, &moved).0.observation_hash().unwrap()
+        );
+        prop_assert_eq!(
+            (&lrn, &layout).0.learning_hash().unwrap(),
+            (&lrn, &moved).0.learning_hash().unwrap()
+        );
+    }
+}
+
+// --- B.7.3 hash(canon(deser(ser(g)))) == hash(canon(g)) -----------------------------------
+
+proptest! {
+    #[test]
+    fn norm_roundtrip_preserves_hash_task(ir in arbitrary_task_ir()) {
+        let back = json_round_trip(&ir);
+        prop_assert_eq!(back.task_hash().unwrap(), ir.task_hash().unwrap());
+        prop_assert_eq!(back.task_graph_hash().unwrap(), ir.task_graph_hash().unwrap());
+    }
+
+    #[test]
+    fn norm_roundtrip_preserves_hash_observation(ir in arbitrary_observation_ir()) {
+        prop_assert_eq!(
+            json_round_trip(&ir).observation_hash().unwrap(),
+            ir.observation_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn norm_roundtrip_preserves_hash_learning(g in arbitrary_learning_graph()) {
+        let back = json_round_trip(&g);
+        prop_assert_eq!(back.learning_hash().unwrap(), g.learning_hash().unwrap());
+        prop_assert_eq!(back.policy_hash().unwrap(), g.policy_hash().unwrap());
+    }
+
+    #[test]
+    fn norm_roundtrip_preserves_hash_deployment(ir in arbitrary_deployment_ir()) {
+        prop_assert_eq!(
+            json_round_trip(&ir).deployment_hash().unwrap(),
+            ir.deployment_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn norm_roundtrip_preserves_hash_evaluation(ir in arbitrary_evaluation_ir()) {
+        prop_assert_eq!(
+            json_round_trip(&ir).evaluation_hash().unwrap(),
+            ir.evaluation_hash().unwrap()
+        );
+    }
+}
+
+// --- B.7.4 hash(canon(g)) != hash(canon(change_any_param(g))) -----------------------------
+
+proptest! {
+    #[test]
+    fn norm_param_change_changes_hash_task(
+        ir in arbitrary_task_ir(),
+        pick in any::<prop::sample::Index>(),
+    ) {
+        let edits = task_edits(&ir);
+        let edited = pick.get(&edits).clone();
+        prop_assume!(edited != ir);
+        prop_assert_ne!(
+            canon_task(&ir).unwrap().task_hash().unwrap(),
+            canon_task(&edited).unwrap().task_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn norm_param_change_changes_hash_observation(
+        ir in arbitrary_observation_ir(),
+        pick in any::<prop::sample::Index>(),
+    ) {
+        let edits = observation_edits(&ir);
+        let edited = pick.get(&edits).clone();
+        prop_assume!(edited != ir);
+        prop_assert_ne!(
+            canon_observation(&ir).unwrap().observation_hash().unwrap(),
+            canon_observation(&edited).unwrap().observation_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn norm_param_change_changes_hash_learning(
+        g in arbitrary_learning_graph(),
+        pick in any::<prop::sample::Index>(),
+    ) {
+        let edits = learning_edits(&g);
+        let edited = pick.get(&edits).clone();
+        prop_assume!(edited != g);
+        prop_assert_ne!(
+            canon_learning(&g).unwrap().learning_hash().unwrap(),
+            canon_learning(&edited).unwrap().learning_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn norm_param_change_changes_hash_deployment(
+        ir in arbitrary_deployment_ir(),
+        pick in any::<prop::sample::Index>(),
+    ) {
+        let edits = deployment_edits(&ir);
+        let edited = pick.get(&edits).clone();
+        prop_assume!(edited != ir);
+        prop_assert_ne!(
+            ir.deployment_hash().unwrap(),
+            edited.deployment_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn norm_param_change_changes_hash_evaluation(
+        ir in arbitrary_evaluation_ir(),
+        pick in any::<prop::sample::Index>(),
+    ) {
+        let edits = evaluation_edits(&ir);
+        let edited = pick.get(&edits).clone();
+        prop_assume!(edited != ir);
+        prop_assert_ne!(
+            ir.evaluation_hash().unwrap(),
+            edited.evaluation_hash().unwrap()
+        );
+    }
+}
+
+// --- B.7.5 unit algebra laws ---------------------------------------------------------------
+
+proptest! {
+    /// Over the algebraic units only: `docs/design/ir-types.md` keeps `Quaternion`,
+    /// `RotationMatrix`, `Normalized`, `Pixel`, `Luminance`, `Depth`, `Token`, `Current` and
+    /// `Voltage` opaque precisely so that algebra on them is an error, not a silent result.
+    #[test]
+    fn norm_unit_algebra_laws(a in arbitrary_unit(), b in arbitrary_unit()) {
+        prop_assert_eq!(a.mul(&b).unwrap(), b.mul(&a).unwrap());
+        prop_assert_eq!(a.mul(&b).unwrap().div(&b).unwrap(), a.clone());
+        prop_assert_eq!(a.div(&b).unwrap().mul(&b).unwrap(), a);
+    }
+
+    #[test]
+    fn norm_opaque_units_have_no_algebra(a in arbitrary_unit()) {
+        use es_ir::types::Unit;
+        for opaque in [
+            Unit::Quaternion,
+            Unit::RotationMatrix,
+            Unit::Token,
+            Unit::Normalized { lo: -1.0, hi: 1.0 },
+        ] {
+            let err = a.mul(&opaque).unwrap_err();
+            prop_assert_eq!(err.code.as_str(), es_ir::codes::TYPE_010);
+        }
+    }
+}

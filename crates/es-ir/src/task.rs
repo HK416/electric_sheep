@@ -23,11 +23,6 @@ use crate::hash::{canonical_hash, CanonWriter};
 use crate::image::ChannelFormat;
 use crate::types::{ElemType, Frame, PortType, Shape, TimeRef, Unit};
 
-/// Codes this module needs that the P27 dictionary does not carry yet. Reported as errors
-/// with no title until they are merged.
-// TODO(P27-merge): move `TASK-001` into `codes.rs` with its severity and title.
-pub const TASK_001: &str = "TASK-001";
-
 /// Current Task IR schema version.
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -1056,14 +1051,14 @@ impl TaskIr {
                         Some(ch) if ch.ty == *ty => {}
                         Some(_) => diags.push(
                             Diagnostic::new(
-                                TASK_001,
+                                codes::TASK_001,
                                 format!("channel \"{channel}\" is declared with a different type"),
                             )
                             .at(*id),
                         ),
                         None => diags.push(
                             Diagnostic::new(
-                                TASK_001,
+                                codes::TASK_001,
                                 format!("channel \"{channel}\" is not in the ObservationSpec"),
                             )
                             .at(*id),
@@ -1086,7 +1081,7 @@ impl TaskIr {
         for name in self.observation_spec.channels.keys() {
             if !bound.contains(name.as_str()) {
                 diags.push(Diagnostic::new(
-                    TASK_001,
+                    codes::TASK_001,
                     format!("declared channel \"{name}\" has no ObservationSpec node"),
                 ));
             }
@@ -1148,13 +1143,9 @@ impl TaskIr {
     }
 }
 
-/// Fixtures and the proptest generator P25 uses for the Appendix B.7 properties.
-///
-/// `Cargo.toml` has no `testing` feature and `proptest` is a dev-dependency, so this is
-/// `#[cfg(test)]` and crate-visible rather than `#[cfg(any(test, feature = "testing"))]` and
-/// `pub`. Promoting it is a `Cargo.toml` change, which this packet may not make.
-#[cfg(test)]
-pub(crate) mod testing {
+/// Fixtures and the proptest generator for the Appendix B.7 properties (P25).
+#[cfg(any(test, feature = "testing"))]
+pub mod testing {
     use super::{
         ArithOp, CmpOp, Distribution, JointQuantity, NormKind, ObsChannel, ObsSource,
         ObservationSpec, SceneRef, TaskConfig, TaskGraph, TaskIr, TaskNode, TerminationKind, Unit,
@@ -1166,7 +1157,7 @@ pub(crate) mod testing {
     use proptest::prelude::*;
     use std::collections::BTreeMap;
 
-    pub(crate) fn ty(elem: ElemType, n: u64, unit: Unit, frame: Frame) -> PortType {
+    pub fn ty(elem: ElemType, n: u64, unit: Unit, frame: Frame) -> PortType {
         PortType {
             elem,
             shape: Shape::new([n]),
@@ -1187,7 +1178,7 @@ pub(crate) mod testing {
 
     /// `k` reward terms (distance between two bodies), a timeout, one observation channel and
     /// a randomized / reset parameter — the shape of every pick-and-place-class task.
-    pub(crate) fn task_ir(terms: &[(String, f64, f64)], dof: u32) -> TaskIr {
+    pub fn task_ir(terms: &[(String, f64, f64)], dof: u32) -> TaskIr {
         let mut g = TaskGraph::new(SCHEMA_VERSION);
         let mut next = 0u32;
         let mut add = |g: &mut TaskGraph, node: TaskNode| {
@@ -1353,7 +1344,7 @@ pub(crate) mod testing {
     }
 
     /// Valid, connected small Task IRs (Appendix B.7).
-    pub(crate) fn arbitrary_task_ir() -> impl Strategy<Value = TaskIr> {
+    pub fn arbitrary_task_ir() -> impl Strategy<Value = TaskIr> {
         (
             proptest::collection::vec(("term[a-c]{1,3}", 0.1f64..4.0, 0.01f64..2.0), 1..4),
             1u32..8,
@@ -1534,7 +1525,7 @@ mod tests {
     fn observation_channel_must_be_declared() {
         let mut ir = fixture();
         ir.observation_spec.channels.clear();
-        assert_eq!(codes_of(&ir.validate()), vec![TASK_001]);
+        assert_eq!(codes_of(&ir.validate()), vec![codes::TASK_001]);
     }
 
     #[test]

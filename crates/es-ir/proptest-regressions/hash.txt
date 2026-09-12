@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc d1cc0aa7a01cae3130efd821187d42a9750ed6c3b1d4ad6bffba2cccdb053d24 # shrinks to g = Graph { schema_version: 1, nodes: {NodeId(3): Const { v: 0 }, NodeId(10): Add { bias: 2 }, NodeId(17): Add { bias: 2 }, NodeId(24): Add { bias: 0 }, NodeId(31): Add { bias: 0 }, NodeId(38): Scale { k: 0.0 }}, edges: [Edge { from: PortRef { node: NodeId(10), port: "out" }, to: PortRef { node: NodeId(38), port: "x" } }, Edge { from: PortRef { node: NodeId(10), port: "out" }, to: PortRef { node: NodeId(24), port: "a" } }, Edge { from: PortRef { node: NodeId(17), port: "out" }, to: PortRef { node: NodeId(31), port: "a" } }], inputs: [], outputs: [] }

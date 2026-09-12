@@ -8,7 +8,7 @@
 //! [`canonical_hash`] is the semantic identity of a graph (`*_hash` in spec 11.2): independent
 //! of `NodeId` values and of node order, sensitive to every parameter.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -113,91 +113,119 @@ impl CanonWriter {
     }
 }
 
-/// Semantic identity of a graph (spec 11.2 `*_hash`).
+/// A node's *colour*: a digest of its kind, its parameters and — refined to a fixpoint — the
+/// colours of everything it consumes and feeds, each through the port name that connects them.
+/// A colour is what a node is, with no trace of what it is called.
+type Colour = [u8; 32];
+
+/// Colour every node, in topological order.
 ///
-/// Nodes are relabelled by content before encoding: each node gets an upstream fingerprint
-/// (its own kind and params plus the fingerprints of everything feeding it) and a downstream
-/// fingerprint (same, going the other way), and the canonical order is the sort by that pair.
-/// Node ids and node order therefore cannot reach the hash, while two nodes that differ in any
-/// parameter, or in what they consume or feed, get different ranks.
-///
-/// Nodes that tie on both fingerprints are interchangeable: their whole upstream *and*
-/// downstream cones are identical, so swapping them leaves the encoded edge set unchanged.
-pub fn canonical_hash<N: IrNode>(g: &Graph<N>) -> Result<[u8; 32], Diagnostic> {
+/// The first round is the node's own kind and parameters. Each further round mixes in the
+/// sorted multiset of `(direction, near port, neighbour colour, far port)` over both incoming
+/// and outgoing edges, which is one round of colour refinement; the loop stops as soon as a
+/// round splits no further cell. So two nodes end up the same colour only when their whole
+/// neighbourhoods, to any depth, agree — and node ids never enter.
+fn refine<N: IrNode>(g: &Graph<N>) -> Result<(Vec<NodeId>, Vec<Colour>), Diagnostic> {
     let order = g.topo_order()?;
     let n = order.len();
     let pos: BTreeMap<NodeId, usize> = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
 
-    // Per-node kind + canonical params.
-    let mut sig: Vec<(&'static str, Vec<u8>)> = Vec::with_capacity(n);
+    let mut colour = Vec::with_capacity(n);
     for id in &order {
         let node = &g.nodes[id];
         let mut w = CanonWriter::new();
+        w.str(node.kind());
         node.params_canonical(&mut w);
-        sig.push((node.kind(), w.finish()?));
+        colour.push(w.hash()?);
     }
 
-    let mut up = vec![[0u8; 32]; n];
-    for (i, id) in order.iter().enumerate() {
-        let mut incoming: Vec<(&str, [u8; 32], &str)> = g
-            .edges
-            .iter()
-            .filter(|e| e.to.node == *id)
-            .map(|e| {
-                (
-                    e.to.port.as_str(),
-                    up[pos[&e.from.node]],
-                    e.from.port.as_str(),
-                )
-            })
-            .collect();
-        incoming.sort_unstable();
-        up[i] = fingerprint(&sig[i], &incoming)?;
+    let cells = |c: &[Colour]| c.iter().copied().collect::<BTreeSet<Colour>>().len();
+    let mut split = cells(&colour);
+    // A refinement round splits at least one cell or it is at the fixpoint, so `n` rounds is
+    // always enough.
+    for _ in 0..n {
+        let mut next = Vec::with_capacity(n);
+        for (i, id) in order.iter().enumerate() {
+            let mut neighbours: Vec<(u8, &str, Colour, &str)> = Vec::new();
+            for e in &g.edges {
+                if e.to.node == *id {
+                    neighbours.push((
+                        0,
+                        e.to.port.as_str(),
+                        colour[pos[&e.from.node]],
+                        e.from.port.as_str(),
+                    ));
+                }
+                if e.from.node == *id {
+                    neighbours.push((
+                        1,
+                        e.from.port.as_str(),
+                        colour[pos[&e.to.node]],
+                        e.to.port.as_str(),
+                    ));
+                }
+            }
+            neighbours.sort_unstable();
+            let mut w = CanonWriter::new();
+            w.digest(&colour[i]);
+            w.seq(neighbours.len());
+            for (dir, near, digest, far) in neighbours {
+                w.u8(dir);
+                w.str(near);
+                w.digest(&digest);
+                w.str(far);
+            }
+            next.push(w.hash()?);
+        }
+        colour = next;
+        let refined = cells(&colour);
+        if refined == split {
+            break;
+        }
+        split = refined;
     }
+    Ok((order, colour))
+}
 
-    let mut down = vec![[0u8; 32]; n];
-    for (i, id) in order.iter().enumerate().rev() {
-        let mut outgoing: Vec<(&str, [u8; 32], &str)> = g
-            .edges
-            .iter()
-            .filter(|e| e.from.node == *id)
-            .map(|e| {
-                (
-                    e.from.port.as_str(),
-                    down[pos[&e.to.node]],
-                    e.to.port.as_str(),
-                )
-            })
-            .collect();
-        outgoing.sort_unstable();
-        down[i] = fingerprint(&sig[i], &outgoing)?;
-    }
+/// The canonical node order: the sort by colour. [`crate::norm::canon_graph`] relabels by it.
+///
+/// Nodes that share a colour are interchangeable as far as [`canonical_hash`] is concerned, so
+/// which of them comes first is left to the topological order and does not matter.
+pub fn canonical_order<N: IrNode>(g: &Graph<N>) -> Result<Vec<NodeId>, Diagnostic> {
+    let (order, colour) = refine(g)?;
+    let mut ranked: Vec<usize> = (0..order.len()).collect();
+    ranked.sort_by_key(|&i| colour[i]);
+    Ok(ranked.into_iter().map(|i| order[i]).collect())
+}
 
-    // Canonical rank: sort by (upstream, downstream) fingerprint.
-    let mut ranked: Vec<usize> = (0..n).collect();
-    ranked.sort_by_key(|&i| (up[i], down[i]));
-    let mut rank = vec![0u32; n];
-    for (r, &i) in ranked.iter().enumerate() {
-        rank[i] = u32::try_from(r).unwrap_or(u32::MAX);
-    }
-    let rank_of = |id: &NodeId| rank[pos[id]];
+/// Semantic identity of a graph (spec 11.2 `*_hash`).
+///
+/// Nodes and edges are encoded by colour, as sorted multisets. A `NodeId` is therefore not
+/// merely renumbered out of the hash, it is never consulted — which is what makes the
+/// Appendix B.7 relabelling invariant hold for *every* graph, including one whose nodes tie
+/// on colour, rather than for those where a tie-break happened to be stable.
+pub fn canonical_hash<N: IrNode>(g: &Graph<N>) -> Result<[u8; 32], Diagnostic> {
+    let (order, colour) = refine(g)?;
+    let pos: BTreeMap<NodeId, usize> = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let colour_of = |id: &NodeId| colour[pos[id]];
 
     let mut w = CanonWriter::new();
     w.str(CANON_TAG);
     w.u32(g.schema_version);
-    w.seq(n);
-    for &i in &ranked {
-        w.str(sig[i].0);
-        w.bytes(&sig[i].1);
+    let mut nodes = colour.clone();
+    nodes.sort_unstable();
+    w.seq(nodes.len());
+    for c in &nodes {
+        w.digest(c);
     }
-    let mut edges: Vec<(u32, &str, u32, &str)> = g
+    let mut edges: Vec<(Colour, &str, Colour, &str)> = g
         .edges
         .iter()
         .map(|e| {
             (
-                rank_of(&e.from.node),
+                colour_of(&e.from.node),
                 e.from.port.as_str(),
-                rank_of(&e.to.node),
+                colour_of(&e.to.node),
                 e.to.port.as_str(),
             )
         })
@@ -205,34 +233,18 @@ pub fn canonical_hash<N: IrNode>(g: &Graph<N>) -> Result<[u8; 32], Diagnostic> {
     edges.sort_unstable();
     w.seq(edges.len());
     for (from, from_port, to, to_port) in edges {
-        w.u32(from);
+        w.digest(&from);
         w.str(from_port);
-        w.u32(to);
+        w.digest(&to);
         w.str(to_port);
     }
     // Boundary order is semantic (it is the argument order), so it is not sorted.
     for boundary in [&g.inputs, &g.outputs] {
         w.seq(boundary.len());
         for p in boundary {
-            w.u32(rank_of(&p.node));
+            w.digest(&colour_of(&p.node));
             w.str(&p.port);
         }
-    }
-    w.hash()
-}
-
-fn fingerprint(
-    sig: &(&'static str, Vec<u8>),
-    neighbours: &[(&str, [u8; 32], &str)],
-) -> Result<[u8; 32], Diagnostic> {
-    let mut w = CanonWriter::new();
-    w.str(sig.0);
-    w.bytes(&sig.1);
-    w.seq(neighbours.len());
-    for (near_port, digest, far_port) in neighbours {
-        w.str(near_port);
-        w.digest(digest);
-        w.str(far_port);
     }
     w.hash()
 }
@@ -532,6 +544,31 @@ mod tests {
         assert_eq!(
             canonical_hash(&g).unwrap(),
             canonical_hash(&swapped).unwrap()
+        );
+    }
+
+    /// Regression, found by `hash_independent_of_node_ids`: two `Add` nodes whose *parents*
+    /// are indistinguishable from below tie on every fingerprint an earlier two-pass scheme
+    /// computed, yet their parents are told apart from above — so ranking them by a tie-break
+    /// made the hash depend on node ids. Encoding by colour removes the tie-break entirely.
+    #[test]
+    fn ties_whose_parents_differ_still_hash_stably() {
+        let mut g = Graph::new(1);
+        for (id, node) in [
+            (10, ToyNode::Add { bias: 2 }),
+            (17, ToyNode::Add { bias: 2 }),
+            (24, ToyNode::Add { bias: 0 }),
+            (31, ToyNode::Add { bias: 0 }),
+            (38, ToyNode::Scale { k: 0.0 }),
+        ] {
+            g.insert(NodeId(id), node);
+        }
+        g.connect(NodeId(10), "out", NodeId(38), "x");
+        g.connect(NodeId(10), "out", NodeId(24), "a");
+        g.connect(NodeId(17), "out", NodeId(31), "a");
+        assert_eq!(
+            canonical_hash(&relabel(&g, |i| 10_000 - i)).unwrap(),
+            canonical_hash(&g).unwrap()
         );
     }
 
