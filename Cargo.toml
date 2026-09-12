@@ -13,6 +13,7 @@ repository = "https://github.com/HK416/electric_sheep"
 es-math = { path = "crates/es-math" }
 es-core = { path = "crates/es-core" }
 es-ir = { path = "crates/es-ir" }
+es-assets = { path = "crates/es-assets" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"

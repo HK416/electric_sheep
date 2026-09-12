@@ -39,7 +39,10 @@ fn cmd_ci(root: &Path) -> bool {
                 "warnings",
             ],
         )
-        && run_cargo(root, &["test", "--workspace"])
+        && run_cargo(
+            root,
+            &["test", "--workspace", "--features", "es-ir/testing"],
+        )
         && context_budget::run(&root.join("crates"))
         && layering::run(root)
         && spec_refs::run(root)
