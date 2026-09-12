@@ -1,0 +1,6 @@
+# Spec 3.4: HashMap/HashSet iteration order is non-deterministic. Use BTreeMap/BTreeSet
+# or indexmap in IR, kernels and anything hashed.
+disallowed-types = [
+  { path = "std::collections::HashMap", reason = "non-deterministic iteration (spec 3.4); use BTreeMap" },
+  { path = "std::collections::HashSet", reason = "non-deterministic iteration (spec 3.4); use BTreeSet" },
+]
