@@ -4,15 +4,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project status
 
-This repo is currently **specification-only**. It contains `docs/ARCHITECTURE.ko.md` (the v1.0
-technical spec, ~3000 lines, in Korean — the canonical source of truth; `docs/ARCHITECTURE.md`
-is reserved for the English translation, which is derived from the Korean and not yet
-present), a stub `README.md`, and `.gitignore`. There is no Cargo workspace, source, or
-build tooling yet. The crates, `xtask`, and `es` CLI described below are defined by the
-spec and do not exist until implemented. Before adding anything, read the relevant
-`docs/ARCHITECTURE.ko.md` section (§ numbers
-below) — it is prescriptive, not aspirational, and pins exact type signatures, error codes,
-and invariants.
+`docs/ARCHITECTURE.ko.md` (the v1.0 technical spec, ~3000 lines, in Korean) is the canonical
+source of truth; `docs/ARCHITECTURE.md` is reserved for the English translation (not yet
+present). Implementation of M0 (spec §28.2) is under way as a Cargo workspace: `xtask/`
+(verification entry point), `crates/es-math`, `es-core`, `es-ir`, `es-assets`,
+`es-physics-core`, `es-physics-backend`, `es-telemetry`. Work packets live in
+`docs/packets/M0/`, design notes in `docs/design/`, pinned external API digests in
+`docs/api-notes/`. Before adding anything, read the relevant `docs/ARCHITECTURE.ko.md`
+section (§ numbers below) — it is prescriptive, not aspirational, and pins exact type
+signatures, error codes, and invariants. Gate every change with
+`cargo xtask ci` (fmt, clippy `-D warnings`, tests incl. `es-ir/testing` property tests,
+context-budget, layering, spec-refs, goldens).
 
 ## What this is
 
@@ -54,7 +56,7 @@ offline-compiled with a content-hash cache.
 ## Commands (spec-defined; see §26.2, §1.5)
 
 All verification routes through a single entry point, `cargo xtask` (`xtask/`), which CI
-enforces. `es` is the runtime/CLI. None are runnable until implemented.
+enforces. `es` is the runtime/CLI (not yet implemented).
 
 - `cargo xtask context-budget` — enforce the per-crate line cap (§1.5)
 - `cargo xtask` layering check — enforce the crate-layer rules in §4.2 (see the `LAYERS`
