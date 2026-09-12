@@ -20,8 +20,10 @@ pub mod types;
 pub mod cross;
 pub mod deployment;
 pub mod evaluation;
+pub mod factory;
 pub mod learning;
 pub mod observation;
+pub mod serial;
 pub mod task;
 
 pub use diag::{DiagCode, Diagnostic, Severity};
