@@ -29,39 +29,22 @@ use crate::observation::{ObservationIr, ObservationNode};
 use crate::task::{ActionSpace as TaskSpace, ObsSource, TaskIr, TaskNode};
 use crate::types::TimeRef;
 
-// TODO(P27-merge): fold these into `codes.rs` with severity and title. Until then
-// `Diagnostic::new` reports them as errors with no title, which is correct but terse.
-
-/// Observation IR is an observation of a different Task IR (spec 7.4).
-pub const XIR_001: &str = "XIR-001";
-/// An Observation source node reads a channel the Task IR does not declare (spec 7.4).
-pub const XIR_002: &str = "XIR-002";
-/// Observation outputs and `PolicyContract::inputs` do not name the same tensors (spec 8.4).
-pub const XIR_010: &str = "XIR-010";
-/// `TemporalWindow::n_steps` disagrees with `observation_window` (spec 7.5, spec 8.4).
-pub const XIR_011: &str = "XIR-011";
-/// `action_dim` disagrees with the deployed action contract (spec 8.5, spec 9.2).
-pub const XIR_020: &str = "XIR-020";
-/// Execution mode disagrees between Learning IR and Deployment IR (spec 8.5, spec 9.2).
-pub const XIR_021: &str = "XIR-021";
-/// `horizon` / `execute_chunk` disagree with the deployed action contract (spec 8.5).
-pub const XIR_022: &str = "XIR-022";
-/// `replanning_hz` is not an integer divisor of the control rate (spec 8.4).
-pub const XIR_023: &str = "XIR-023";
-/// `runtime.deadline_ms` does not fit the deployment inference budget (spec 8.4, spec 9.4).
-pub const XIR_024: &str = "XIR-024";
-/// Task `ActionSpec::dim` disagrees with `action_dim` (spec 8.4, spec 8.5).
-pub const XIR_030: &str = "XIR-030";
-/// Task `ActionSpec::space` disagrees with the deployed action space (spec 8.5).
-pub const XIR_031: &str = "XIR-031";
-/// Task `ActionSpec::control_rate_hz` disagrees with `Deployment.rate.control` (spec 9.2).
-pub const XIR_032: &str = "XIR-032";
-/// Evaluation IR references a different Task or Observation IR (spec 10.4).
-pub const XIR_040: &str = "XIR-040";
-/// `INV-15`: an augmentation node would stay on during evaluation (spec 7.3, spec 10.4).
-pub const XIR_050: &str = "XIR-050";
-/// The evaluation allow-list names a node that is not an Observation `Augment` node.
-pub const XIR_051: &str = "XIR-051";
+// The `XIR-0xx` codes this module reports (severity and title in `codes.rs`):
+// XIR-001 observation IR belongs to a different Task IR (spec 7.4)
+// XIR-002 an Observation source node reads a channel the Task IR does not declare (spec 7.4)
+// XIR-010 observation outputs and `PolicyContract::inputs` do not name the same tensors (spec 8.4)
+// XIR-011 `TemporalWindow::n_steps` disagrees with `observation_window` (spec 7.5, spec 8.4)
+// XIR-020 `action_dim` disagrees with the deployed action contract (spec 8.5, spec 9.2)
+// XIR-021 execution mode disagrees between Learning IR and Deployment IR (spec 8.5, spec 9.2)
+// XIR-022 `horizon` / `execute_chunk` disagree with the deployed action contract (spec 8.5)
+// XIR-023 `replanning_hz` is not an integer divisor of the control rate (spec 8.4)
+// XIR-024 `runtime.deadline_ms` does not fit the deployment inference budget (spec 8.4, spec 9.4)
+// XIR-030 task `ActionSpec::dim` disagrees with `action_dim` (spec 8.4, spec 8.5)
+// XIR-031 task `ActionSpec::space` disagrees with the deployed action space (spec 8.5)
+// XIR-032 task `ActionSpec::control_rate_hz` disagrees with `Deployment.rate.control` (spec 9.2)
+// XIR-040 Evaluation IR references a different Task or Observation IR (spec 10.4)
+// XIR-050 `INV-15`: an augmentation node would stay on during evaluation (spec 7.3, spec 10.4)
+// XIR-051 the evaluation allow-list names a node that is not an Observation `Augment` node
 
 /// The five IRs of one execution, as `check` sees them. Evaluation is optional: a deployment
 /// bundle has no Evaluation IR, and the first four boundaries are checkable without it.
@@ -117,7 +100,7 @@ fn task_observation(b: &IrBundle, out: &mut Vec<Diagnostic>) {
         Ok(h) if h == b.observation.task_ref => {}
         Ok(h) => out.push(
             Diagnostic::new(
-                XIR_001,
+                codes::XIR_001,
                 format!(
                     "observation.task_ref is {}, the task hashes to {}",
                     short(&b.observation.task_ref),
@@ -138,7 +121,7 @@ fn task_observation(b: &IrBundle, out: &mut Vec<Diagnostic>) {
         match declared {
             None => out.push(
                 Diagnostic::new(
-                    XIR_002,
+                    codes::XIR_002,
                     format!("{} reads {:?}, which no channel declares", node.kind(), key),
                 )
                 .at(*id)
@@ -166,7 +149,7 @@ fn observation_learning(b: &IrBundle, out: &mut Vec<Diagnostic>) {
         let Some(produced) = b.observation.outputs.get(name) else {
             out.push(
                 Diagnostic::new(
-                    XIR_010,
+                    codes::XIR_010,
                     format!("policy input \"{name}\" is not produced by the Observation IR"),
                 )
                 .on_port(name.clone())
@@ -226,7 +209,7 @@ fn observation_learning(b: &IrBundle, out: &mut Vec<Diagnostic>) {
         if !contract.inputs.contains_key(name) {
             out.push(
                 Diagnostic::new(
-                    XIR_010,
+                    codes::XIR_010,
                     format!("observation output \"{name}\" is not a policy input"),
                 )
                 .on_port(name.clone())
@@ -240,7 +223,7 @@ fn observation_learning(b: &IrBundle, out: &mut Vec<Diagnostic>) {
     if n_steps != contract.observation_window {
         out.push(
             Diagnostic::new(
-                XIR_011,
+                codes::XIR_011,
                 format!(
                     "TemporalWindow n_steps {n_steps} against observation_window {}",
                     contract.observation_window
@@ -279,7 +262,7 @@ fn learning_deployment(b: &IrBundle, out: &mut Vec<Diagnostic>) {
     if c.action_dim as usize != a.dim {
         out.push(
             Diagnostic::new(
-                XIR_020,
+                codes::XIR_020,
                 format!(
                     "policy action_dim {} against deployment action.dim {} ({} envelope joints)",
                     c.action_dim,
@@ -293,7 +276,7 @@ fn learning_deployment(b: &IrBundle, out: &mut Vec<Diagnostic>) {
     if !same_mode(c.execution_mode, &b.deployment.execution) {
         out.push(
             Diagnostic::new(
-                XIR_021,
+                codes::XIR_021,
                 format!(
                     "policy {:?} against deployment {:?}",
                     c.execution_mode, b.deployment.execution
@@ -305,7 +288,7 @@ fn learning_deployment(b: &IrBundle, out: &mut Vec<Diagnostic>) {
     if c.horizon as usize != a.horizon || c.execute_chunk as usize != a.execute_chunk {
         out.push(
             Diagnostic::new(
-                XIR_022,
+                codes::XIR_022,
                 format!(
                     "policy horizon {} / execute_chunk {} against deployment {} / {}",
                     c.horizon, c.execute_chunk, a.horizon, a.execute_chunk
@@ -320,7 +303,7 @@ fn learning_deployment(b: &IrBundle, out: &mut Vec<Diagnostic>) {
     if !(c.replanning_hz > 0.0 && ratio >= 1.0 && (ratio - ratio.round()).abs() < 1e-6) {
         out.push(
             Diagnostic::new(
-                XIR_023,
+                codes::XIR_023,
                 format!(
                     "replanning_hz {} against dt_ctrl {control_hz} Hz",
                     c.replanning_hz
@@ -359,7 +342,7 @@ fn learning_deployment(b: &IrBundle, out: &mut Vec<Diagnostic>) {
     if f64::from(c.runtime.deadline_ms) > budget_ms {
         out.push(
             Diagnostic::new(
-                XIR_024,
+                codes::XIR_024,
                 format!(
                     "runtime.deadline_ms {} exceeds deadlines.inference_budget {budget_ms} ms",
                     c.runtime.deadline_ms
@@ -401,7 +384,7 @@ fn task_action(b: &IrBundle, out: &mut Vec<Diagnostic>) {
         if *dim != c.action_dim {
             out.push(
                 Diagnostic::new(
-                    XIR_030,
+                    codes::XIR_030,
                     format!(
                         "task ActionSpec dim {dim} against action_dim {}",
                         c.action_dim
@@ -414,7 +397,7 @@ fn task_action(b: &IrBundle, out: &mut Vec<Diagnostic>) {
         if !maps_to(*space, b.deployment.action.space) {
             out.push(
                 Diagnostic::new(
-                    XIR_031,
+                    codes::XIR_031,
                     format!(
                         "task declares {space:?}, deployment executes {:?}",
                         b.deployment.action.space
@@ -428,7 +411,7 @@ fn task_action(b: &IrBundle, out: &mut Vec<Diagnostic>) {
         if (f64::from(*control_rate_hz) - control_hz).abs() > 1e-3 {
             out.push(
                 Diagnostic::new(
-                    XIR_032,
+                    codes::XIR_032,
                     format!("task control_rate_hz {control_rate_hz} against rate.control {control_hz} Hz"),
                 )
                 .at(*id)
@@ -498,7 +481,7 @@ fn evaluation(b: &IrBundle, ev: &EvaluationIr, out: &mut Vec<Diagnostic>) {
         if !*training_only && !allowed.contains(&id.0.to_string()) {
             out.push(
                 Diagnostic::new(
-                    XIR_050,
+                    codes::XIR_050,
                     format!("augmentation node {} would run during evaluation", id.0),
                 )
                 .at(*id)
@@ -513,7 +496,7 @@ fn evaluation(b: &IrBundle, ev: &EvaluationIr, out: &mut Vec<Diagnostic>) {
         if !augment_nodes.contains(name) {
             out.push(
                 Diagnostic::new(
-                    XIR_051,
+                    codes::XIR_051,
                     format!("allow-list names \"{name}\", which is no Augment node of this graph"),
                 )
                 .with_hint("INV-15: the allow-list names Observation IR nodes by node id"),
@@ -546,7 +529,7 @@ fn check_ref(
     if want != have {
         out.push(
             Diagnostic::new(
-                XIR_040,
+                codes::XIR_040,
                 format!(
                     "evaluation {what} reference is {}, the bundle hashes to {}",
                     short(&want),

@@ -7,14 +7,29 @@
 
 use es_ir::hash::canonical_hash;
 use es_ir::norm::{canon_learning, canon_observation, canon_task};
+use es_ir::serial::{parse_esgraph, write_esgraph, AnyIr, Layout};
 use es_ir::testing::{
     arbitrary_deployment_ir, arbitrary_evaluation_ir, arbitrary_layout, arbitrary_learning_graph,
     arbitrary_observation_ir, arbitrary_task_ir, arbitrary_unit, deployment_edits,
     evaluation_edits, learning_edits, observation_edits, shuffle_learning_ids,
     shuffle_observation_ids, shuffle_task_ids, task_edits,
 };
+use es_ir::NodeId;
 use proptest::prelude::*;
 use serde::{de::DeserializeOwned, Serialize};
+use std::collections::BTreeMap;
+
+/// `arbitrary_layout` yields the raw position map; the `.eslayout` sidecar itself is
+/// `serial::Layout` (spec 5.1 rule 7).
+fn to_layout(positions: BTreeMap<NodeId, (f32, f32)>) -> Layout {
+    Layout {
+        positions: positions
+            .into_iter()
+            .map(|(id, (x, y))| (id, [x, y]))
+            .collect(),
+        ..Layout::default()
+    }
+}
 
 /// `serde_json` is built with `float_roundtrip` workspace-wide, so an `f64` survives exactly.
 fn json_round_trip<T: Serialize + DeserializeOwned>(v: &T) -> T {
@@ -75,11 +90,10 @@ proptest! {
 
 // --- B.7.2 hash(canon(g)) == hash(canon(move_ui(g))) --------------------------------------
 //
-// Layout lives in an `.eslayout` sidecar (spec 5.1 rule 7), never in the IR, so the property
-// is that the hash API takes no layout input at all: a layout can only travel *alongside* a
-// graph, and moving it cannot reach the hash.
-// TODO(P28): once the `.esgraph` writer/parser lands, switch this to
-// `hash(parse_esgraph(write_esgraph(&g, &layout))) == hash(&g)`.
+// Layout lives in an `.eslayout` sidecar (spec 5.1 rule 7), never in the IR: writing a graph
+// with an arbitrary layout attached to a `.esgraph` / `.eslayout` pair and parsing the pair
+// back must recover a document that hashes identically to the original, whatever the layout
+// says — `hash(parse_esgraph(write_esgraph(&g, &layout))) == hash(&g)`.
 
 proptest! {
     #[test]
@@ -87,27 +101,30 @@ proptest! {
         ir in arbitrary_task_ir(),
         obs in arbitrary_observation_ir(),
         lrn in arbitrary_learning_graph(),
-        layout in arbitrary_layout(),
-        moved in arbitrary_layout(),
+        positions in arbitrary_layout(),
     ) {
-        // A layout can only ride alongside an IR, never inside it, so "moving the UI" is
-        // swapping the sidecar and leaving the document alone.
-        let before = (&ir, &layout);
-        let after = (&ir, &moved);
-        prop_assert_eq!(before.0.task_hash().unwrap(), after.0.task_hash().unwrap());
+        let layout = to_layout(positions);
+
+        let (graph_toml, layout_toml) = write_esgraph(&AnyIr::Task(ir.clone()), Some(&layout)).unwrap();
+        let (parsed, _) = parse_esgraph(&graph_toml, layout_toml.as_deref()).unwrap();
+        let AnyIr::Task(parsed) = parsed else { unreachable!("wrote a Task IR") };
+        prop_assert_eq!(parsed.task_hash().unwrap(), ir.task_hash().unwrap());
         prop_assert_eq!(
-            canonical_hash(&before.0.graph).unwrap(),
-            canonical_hash(&after.0.graph).unwrap()
+            canonical_hash(&parsed.graph).unwrap(),
+            canonical_hash(&ir.graph).unwrap()
         );
-        // And the same for the two other graph IRs: the hash reads no layout input.
-        prop_assert_eq!(
-            (&obs, &layout).0.observation_hash().unwrap(),
-            (&obs, &moved).0.observation_hash().unwrap()
-        );
-        prop_assert_eq!(
-            (&lrn, &layout).0.learning_hash().unwrap(),
-            (&lrn, &moved).0.learning_hash().unwrap()
-        );
+
+        let (graph_toml, layout_toml) =
+            write_esgraph(&AnyIr::Observation(obs.clone()), Some(&layout)).unwrap();
+        let (parsed, _) = parse_esgraph(&graph_toml, layout_toml.as_deref()).unwrap();
+        let AnyIr::Observation(parsed) = parsed else { unreachable!("wrote an Observation IR") };
+        prop_assert_eq!(parsed.observation_hash().unwrap(), obs.observation_hash().unwrap());
+
+        let (graph_toml, layout_toml) =
+            write_esgraph(&AnyIr::Learning(lrn.clone()), Some(&layout)).unwrap();
+        let (parsed, _) = parse_esgraph(&graph_toml, layout_toml.as_deref()).unwrap();
+        let AnyIr::Learning(parsed) = parsed else { unreachable!("wrote a Learning IR") };
+        prop_assert_eq!(parsed.learning_hash().unwrap(), lrn.learning_hash().unwrap());
     }
 }
 

@@ -672,7 +672,7 @@ fn cross_evaluation_is_optional() {
 fn cross_observation_of_another_task() {
     let mut f = Fixture::new();
     f.observation.task_ref = [0u8; 32];
-    assert_code(&f, cross::XIR_001);
+    assert_code(&f, codes::XIR_001);
 }
 
 #[test]
@@ -684,7 +684,7 @@ fn cross_source_node_reads_an_undeclared_channel() {
         panic!("node 0 is the ImageInput");
     };
     *sensor = StableId::from_path("cam_wrist");
-    assert_code(&f, cross::XIR_002);
+    assert_code(&f, codes::XIR_002);
 }
 
 #[test]
@@ -709,7 +709,7 @@ fn cross_policy_input_is_not_produced() {
     let out = f.observation.outputs.remove("rgb_front").unwrap();
     f.observation.outputs.insert("rgb_wrist".to_owned(), out);
     f.seal();
-    assert_code(&f, cross::XIR_010);
+    assert_code(&f, codes::XIR_010);
 }
 
 #[test]
@@ -759,7 +759,7 @@ fn cross_temporal_window_disagrees_with_observation_window() {
         align: Align::Hold,
     });
     f.seal();
-    assert_code(&f, cross::XIR_011);
+    assert_code(&f, codes::XIR_011);
 }
 
 // --- Rules 3 and 4: Learning <-> Deployment ---------------------------------------------------
@@ -768,28 +768,28 @@ fn cross_temporal_window_disagrees_with_observation_window() {
 fn cross_action_dim_disagrees_with_the_deployment() {
     let mut f = Fixture::new();
     f.learning.policy.contract.action_dim = 7;
-    assert_code(&f, cross::XIR_020);
+    assert_code(&f, codes::XIR_020);
 }
 
 #[test]
 fn cross_execution_mode_disagrees() {
     let mut f = Fixture::new();
     f.deployment.execution = ExecutionMode::RecedingHorizon;
-    assert_code(&f, cross::XIR_021);
+    assert_code(&f, codes::XIR_021);
 }
 
 #[test]
 fn cross_chunk_shape_disagrees() {
     let mut f = Fixture::new();
     f.learning.policy.contract.horizon = 40;
-    assert_code(&f, cross::XIR_022);
+    assert_code(&f, codes::XIR_022);
 }
 
 #[test]
 fn cross_replanning_rate_is_not_an_integer_divisor() {
     let mut f = Fixture::new();
     f.learning.policy.contract.replanning_hz = 30.0;
-    assert_code(&f, cross::XIR_023);
+    assert_code(&f, codes::XIR_023);
 }
 
 #[test]
@@ -804,7 +804,7 @@ fn cross_inference_latency_exceeds_the_budget() {
 fn cross_policy_deadline_exceeds_the_watchdog_budget() {
     let mut f = Fixture::new();
     f.learning.policy.contract.runtime.deadline_ms = 50.0;
-    assert_code(&f, cross::XIR_024);
+    assert_code(&f, codes::XIR_024);
 }
 
 // --- Rule 5: Task.ActionSpec <-> Learning / Deployment ----------------------------------------
@@ -818,14 +818,14 @@ fn cross_task_action_dim_disagrees() {
     };
     *dim = 6;
     f.seal();
-    assert_code(&f, cross::XIR_030);
+    assert_code(&f, codes::XIR_030);
 }
 
 #[test]
 fn cross_task_action_space_disagrees() {
     let mut f = Fixture::new();
     f.deployment.action.space = DepSpace::JointTorque;
-    assert_code(&f, cross::XIR_031);
+    assert_code(&f, codes::XIR_031);
 }
 
 #[test]
@@ -840,7 +840,7 @@ fn cross_task_control_rate_disagrees() {
     };
     *control_rate_hz = 50.0;
     f.seal();
-    assert_code(&f, cross::XIR_032);
+    assert_code(&f, codes::XIR_032);
 }
 
 // --- Rule 6: Deployment.envelope <-> robot capability -----------------------------------------
@@ -868,7 +868,7 @@ fn cross_envelope_is_wider_than_the_robot() {
 fn cross_evaluation_references_another_task() {
     let mut f = Fixture::new();
     f.evaluation.task = hex(&[0u8; 32]);
-    assert_code(&f, cross::XIR_040);
+    assert_code(&f, codes::XIR_040);
 }
 
 #[test]
@@ -897,7 +897,7 @@ fn cross_augmentation_would_run_during_evaluation() {
         },
     );
     f.seal();
-    assert_code(&f, cross::XIR_050);
+    assert_code(&f, codes::XIR_050);
 }
 
 #[test]
@@ -908,5 +908,5 @@ fn cross_allow_list_names_an_unknown_node() {
         justification: "domain gap study (spec 24.3)".to_owned(),
     };
     f.seal();
-    assert_code(&f, cross::XIR_051);
+    assert_code(&f, codes::XIR_051);
 }

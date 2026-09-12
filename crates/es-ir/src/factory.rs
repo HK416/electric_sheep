@@ -20,6 +20,7 @@ use es_core::StableId;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::codes;
 use crate::diag::Diagnostic;
 use crate::graph::{IrNode, Port};
 use crate::learning::{
@@ -32,12 +33,10 @@ use crate::task::{
 };
 use crate::types::{ElemType, Frame, PortType, Shape, TimeRef, Unit};
 
-// Codes this module needs that the P27 dictionary does not carry yet (same pattern as
-// `task::TASK_001`).
-// TODO(P27-merge): move these into `codes.rs` with their severity and title.
-pub const FACTORY_001: &str = "FACTORY-001"; // unknown node kind
-pub const FACTORY_002: &str = "FACTORY-002"; // kind already owned by another registered factory
-pub const FACTORY_003: &str = "FACTORY-003"; // params do not match the node's shape
+// The `FACTORY-00x` codes this module reports (severity and title in `codes.rs`):
+// FACTORY-001 unknown node kind
+// FACTORY-002 kind already owned by another registered factory
+// FACTORY-003 params do not match the node's shape
 
 /// One parameter an editor or generator needs to fill in.
 #[derive(Clone, Debug, PartialEq)]
@@ -405,7 +404,7 @@ fn deserialize_tagged<T: DeserializeOwned>(
 ) -> Result<T, Diagnostic> {
     if !valid_kinds.contains(&kind) {
         return Err(Diagnostic::new(
-            FACTORY_001,
+            codes::FACTORY_001,
             format!("unknown node kind '{kind}'"),
         ));
     }
@@ -414,7 +413,10 @@ fn deserialize_tagged<T: DeserializeOwned>(
     toml::Value::Table(tagged)
         .try_into()
         .map_err(|e: toml::de::Error| {
-            Diagnostic::new(FACTORY_003, format!("cannot build '{kind}' node: {e}"))
+            Diagnostic::new(
+                codes::FACTORY_003,
+                format!("cannot build '{kind}' node: {e}"),
+            )
         })
 }
 
@@ -500,7 +502,7 @@ macro_rules! node_registry {
                 for &kind in factory.kinds() {
                     if self.index.contains_key(kind) {
                         return Err(Diagnostic::new(
-                            FACTORY_002,
+                            codes::FACTORY_002,
                             format!("kind '{kind}' is already registered"),
                         ));
                     }
@@ -515,7 +517,7 @@ macro_rules! node_registry {
 
             pub fn create(&self, kind: &str, params: &toml::Value) -> Result<$node, Diagnostic> {
                 let &slot = self.index.get(kind).ok_or_else(|| {
-                    Diagnostic::new(FACTORY_001, format!("unknown node kind '{kind}'"))
+                    Diagnostic::new(codes::FACTORY_001, format!("unknown node kind '{kind}'"))
                 })?;
                 self.factories[slot].create(kind, params)
             }

@@ -83,6 +83,28 @@ pub const DET_021: &str = "DET-021";
 pub const DET_030: &str = "DET-030";
 pub const DET_040: &str = "DET-040";
 
+// --- Node factories (spec 6.3, spec 8.3) --------------------------------------------------
+pub const FACTORY_001: &str = "FACTORY-001";
+pub const FACTORY_002: &str = "FACTORY-002";
+pub const FACTORY_003: &str = "FACTORY-003";
+
+// --- Cross-IR checks (spec 11.1) ----------------------------------------------------------
+pub const XIR_001: &str = "XIR-001";
+pub const XIR_002: &str = "XIR-002";
+pub const XIR_010: &str = "XIR-010";
+pub const XIR_011: &str = "XIR-011";
+pub const XIR_020: &str = "XIR-020";
+pub const XIR_021: &str = "XIR-021";
+pub const XIR_022: &str = "XIR-022";
+pub const XIR_023: &str = "XIR-023";
+pub const XIR_024: &str = "XIR-024";
+pub const XIR_030: &str = "XIR-030";
+pub const XIR_031: &str = "XIR-031";
+pub const XIR_032: &str = "XIR-032";
+pub const XIR_040: &str = "XIR-040";
+pub const XIR_050: &str = "XIR-050";
+pub const XIR_051: &str = "XIR-051";
+
 /// One row of the dictionary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CodeEntry {
@@ -142,6 +164,9 @@ pub const CODES: &[CodeEntry] = &[
     e(EVAL_004, Error, "duplicate episode seed or perturbation stream", "10.4"),
     e(EVAL_005, Error, "perturbation range runs backwards", "10.2"),
     e(EVAL_006, Error, "augmentation allow-list carries no justification", "10.2"),
+    e(FACTORY_001, Error, "unknown node kind", "6.3"),
+    e(FACTORY_002, Error, "kind already owned by another registered factory", "6.3"),
+    e(FACTORY_003, Error, "params do not match the node's shape", "6.3"),
     e(GRAPH_001, Error, "the graph contains a cycle", "11.1"),
     e(GRAPH_002, Error, "edge or boundary port refers to an unknown node", "11.1"),
     e(GRAPH_003, Error, "input port has more than one incoming edge", "11.1"),
@@ -172,6 +197,21 @@ pub const CODES: &[CodeEntry] = &[
     e(TYPE_011, Error, "policy input must be Normalized, Dimensionless or Token", "5.4"),
     e(TYPE_014, Error, "time alignment is not specified", "5.4"),
     e(TYPE_020, Error, "ImageSpec mismatch", "7.2"),
+    e(XIR_001, Error, "observation IR belongs to a different Task IR", "7.4"),
+    e(XIR_002, Error, "observation source reads a channel the Task IR does not declare", "7.4"),
+    e(XIR_010, Error, "observation output and policy input do not name the same tensors", "8.4"),
+    e(XIR_011, Error, "TemporalWindow n_steps disagrees with observation_window", "7.5"),
+    e(XIR_020, Error, "action_dim disagrees with the deployed action contract", "8.5"),
+    e(XIR_021, Error, "execution mode disagrees between Learning IR and Deployment IR", "8.5"),
+    e(XIR_022, Error, "horizon or execute_chunk disagrees with the deployed action contract", "8.5"),
+    e(XIR_023, Error, "replanning_hz is not an integer divisor of the control rate", "8.4"),
+    e(XIR_024, Error, "runtime.deadline_ms does not fit the deployment inference budget", "8.4"),
+    e(XIR_030, Error, "task ActionSpec dim disagrees with action_dim", "8.4"),
+    e(XIR_031, Error, "task ActionSpec space disagrees with the deployed action space", "8.5"),
+    e(XIR_032, Error, "task control_rate_hz disagrees with Deployment.rate.control", "9.2"),
+    e(XIR_040, Error, "evaluation references a different Task or Observation IR", "10.4"),
+    e(XIR_050, Error, "augmentation node would stay on during evaluation", "7.3"),
+    e(XIR_051, Error, "allow-list names a node that is not an Observation Augment node", "10.4"),
 ];
 
 /// Looks a code up in the dictionary.
@@ -191,7 +231,7 @@ mod tests {
             assert!(seen.insert(entry.code), "duplicate code {}", entry.code);
             let (prefix, number) = entry.code.split_once('-').expect(entry.code);
             assert!(
-                (2..=6).contains(&prefix.len())
+                (2..=7).contains(&prefix.len())
                     && prefix.chars().all(|c| c.is_ascii_uppercase())
                     && number.len() == 3
                     && number.chars().all(|c| c.is_ascii_digit()),
@@ -216,13 +256,83 @@ mod tests {
     fn every_exported_constant_has_an_entry() {
         // The constants used across the crate; a code with no entry has no severity or title.
         for code in [
-            TYPE_001, TYPE_002, TYPE_003, TYPE_004, TYPE_010, TYPE_011, TYPE_014, TYPE_020,
-            GRAPH_001, GRAPH_002, GRAPH_003, GRAPH_010, HASH_001, TASK_001, OBS_021, OBS_034,
-            OBS_040, OBS_041, OBS_042, OBS_043, LRN_001, LRN_002, LRN_010, LRN_011, LRN_020,
-            LRN_021, LRN_022, LRN_023, LRN_030, LRN_052, DEP_001, DEP_010, DEP_011, DEP_012,
-            DEP_013, DEP_014, DEP_015, DEP_020, DEP_021, DEP_022, DEP_023, DEP_024, DEP_030,
-            DEP_031, DEP_040, DEP_114, EVAL_001, EVAL_002, EVAL_003, EVAL_004, EVAL_005, EVAL_006,
-            DET_001, DET_002, DET_010, DET_020, DET_021, DET_030, DET_040,
+            TYPE_001,
+            TYPE_002,
+            TYPE_003,
+            TYPE_004,
+            TYPE_010,
+            TYPE_011,
+            TYPE_014,
+            TYPE_020,
+            GRAPH_001,
+            GRAPH_002,
+            GRAPH_003,
+            GRAPH_010,
+            HASH_001,
+            TASK_001,
+            OBS_021,
+            OBS_034,
+            OBS_040,
+            OBS_041,
+            OBS_042,
+            OBS_043,
+            LRN_001,
+            LRN_002,
+            LRN_010,
+            LRN_011,
+            LRN_020,
+            LRN_021,
+            LRN_022,
+            LRN_023,
+            LRN_030,
+            LRN_052,
+            DEP_001,
+            DEP_010,
+            DEP_011,
+            DEP_012,
+            DEP_013,
+            DEP_014,
+            DEP_015,
+            DEP_020,
+            DEP_021,
+            DEP_022,
+            DEP_023,
+            DEP_024,
+            DEP_030,
+            DEP_031,
+            DEP_040,
+            DEP_114,
+            EVAL_001,
+            EVAL_002,
+            EVAL_003,
+            EVAL_004,
+            EVAL_005,
+            EVAL_006,
+            DET_001,
+            DET_002,
+            DET_010,
+            DET_020,
+            DET_021,
+            DET_030,
+            DET_040,
+            FACTORY_001,
+            FACTORY_002,
+            FACTORY_003,
+            XIR_001,
+            XIR_002,
+            XIR_010,
+            XIR_011,
+            XIR_020,
+            XIR_021,
+            XIR_022,
+            XIR_023,
+            XIR_024,
+            XIR_030,
+            XIR_031,
+            XIR_032,
+            XIR_040,
+            XIR_050,
+            XIR_051,
         ] {
             assert!(lookup(code).is_some(), "{code} missing from CODES");
         }
