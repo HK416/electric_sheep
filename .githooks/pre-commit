@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# pre-commit hook: reject non-Latin letters in staged non-documentation files.
+# Documentation (*.md, *.txt, *.rst, anything under docs/) may be multilingual.
+# See .githooks/ (run: git config core.hooksPath .githooks) and CLAUDE.md "Conventions".
+set -euo pipefail
+
+# perl is used instead of grep -P: it is portable across macOS (BSD grep lacks -P) and Linux.
+# Any letter whose script is not Latin; accented Latin, symbols and emoji are allowed.
+nonlatin='(?!\p{Script=Latin})\p{L}'
+status=0
+
+is_doc() {
+	case "$1" in
+		*.md|*.txt|*.rst|docs/*|*/docs/*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+while IFS= read -r path; do
+	[ -n "$path" ] || continue
+	is_doc "$path" && continue
+	# Check staged content (not the working tree) for non-Latin letters; print "line:content".
+	hits=$(git show ":$path" | perl -CSD -ne "print \"\$.:\$_\" if /$nonlatin/" || true)
+	if [ -n "$hits" ]; then
+		if [ "$status" -eq 0 ]; then
+			echo "pre-commit: non-English text (non-Latin letters) found in non-documentation files (code must be English):" >&2
+		fi
+		while IFS= read -r line; do
+			echo "  $path:$line" >&2
+		done <<< "$hits"
+		status=1
+	fi
+done < <(git diff --cached --name-only --diff-filter=AM)
+
+[ "$status" -eq 0 ] || echo "pre-commit: move non-English text into docs (*.md/*.txt/*.rst or docs/) or remove it." >&2
+
+# Translation-sync check: docs/ARCHITECTURE.ko.md (Korean canonical) and docs/ARCHITECTURE.md
+# (English translation) must be staged together. Bypass with SKIP_DOC_SYNC=1.
+if [ "${SKIP_DOC_SYNC:-}" != "1" ]; then
+	staged=$(git diff --cached --name-only --diff-filter=AM)
+	ko=0; en=0
+	grep -qx 'docs/ARCHITECTURE.ko.md' <<< "$staged" && ko=1
+	grep -qx 'docs/ARCHITECTURE.md' <<< "$staged" && en=1
+	if [ "$ko" -ne "$en" ]; then
+		echo "pre-commit: docs/ARCHITECTURE.ko.md and docs/ARCHITECTURE.md must be updated together (translation sync). Stage both, or set SKIP_DOC_SYNC=1 to bypass." >&2
+		status=1
+	fi
+fi
+
+exit "$status"

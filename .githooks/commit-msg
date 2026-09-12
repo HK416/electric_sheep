@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# commit-msg hook: enforce Conventional-Commit style, ban trailers/footers, ban non-Latin letters.
+# See .githooks/ (run: git config core.hooksPath .githooks) and CLAUDE.md "Conventions".
+set -euo pipefail
+
+msg_file="$1"
+first_line=$(head -n1 "$msg_file")
+
+# Skip merge/fixup/squash commits (auto-generated or amended later).
+case "$first_line" in
+	"Merge "*|"Revert "*|"fixup! "*|"squash! "*|"amend! "*) exit 0 ;;
+esac
+
+fail() {
+	echo "commit-msg: $1" >&2
+	exit 1
+}
+
+# 1. Conventional Commit subject line.
+prefix_re='^(feat|fix|refactor|docs|init|test|chore|build|ci|perf|style)(\([^)]+\))?!?: .+'
+if ! printf '%s' "$first_line" | grep -Eq "$prefix_re"; then
+	fail "subject must match: <type>[(scope)][!]: <summary>
+  allowed types: feat fix refactor docs init test chore build ci perf style
+  got: $first_line"
+fi
+
+# 2. Forbidden trailers/footers (case-insensitive), anywhere in the message.
+if grep -Eiq '^[[:space:]]*(co-authored-by|claude-session|signed-off-by)[[:space:]]*:|generated with' "$msg_file"; then
+	fail "commit message must not contain trailers/footers
+  (Co-Authored-By, Claude-Session, Signed-off-by, or 'Generated with' lines are not allowed)"
+fi
+
+# 3. No non-Latin letters anywhere (source and commits are English-only).
+#    Accented Latin (é, ü), symbols (→, ✓, —) and emoji are allowed — only foreign scripts are rejected.
+# perl is used instead of grep -P: it is portable across macOS (BSD grep lacks -P) and Linux.
+if ! perl -CSD -ne 'exit 1 if /(?!\p{Script=Latin})\p{L}/' "$msg_file"; then
+	fail "commit message must be written in English (non-English text (non-Latin letters) found)"
+fi
+
+exit 0
