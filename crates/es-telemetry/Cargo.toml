@@ -14,6 +14,9 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Installs es-core's allocation counter for this crate's tests (P17), so ring.rs can assert
+# push() never touches the heap after construction.
+es-core = { workspace = true, features = ["alloc-count"] }
 
 [lints]
 workspace = true
