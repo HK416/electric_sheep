@@ -7,8 +7,11 @@
 //! only. Nothing here computes physics, and nothing here reads a file from disk.
 #![forbid(unsafe_code)]
 
+pub mod fuzz;
+pub mod gltf;
 pub mod mjcf;
 pub mod scene;
+pub mod urdf;
 
 pub use mjcf::{parse_str as parse_mjcf, Import, MjcfError, Warning};
 pub use scene::{scene_id, SceneDesc, SceneError};

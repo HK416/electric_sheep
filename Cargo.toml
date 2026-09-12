@@ -15,6 +15,8 @@ es-core = { path = "crates/es-core" }
 es-ir = { path = "crates/es-ir" }
 es-assets = { path = "crates/es-assets" }
 es-telemetry = { path = "crates/es-telemetry" }
+es-physics-core = { path = "crates/es-physics-core" }
+es-physics-backend = { path = "crates/es-physics-backend" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"

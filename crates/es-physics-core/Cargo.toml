@@ -1,5 +1,5 @@
 [package]
-name = "es-assets"
+name = "es-physics-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,14 +8,9 @@ license.workspace = true
 [dependencies]
 es-core = { workspace = true }
 es-math = { workspace = true }
+es-assets = { workspace = true }
 serde = { workspace = true }
-blake3 = { workspace = true }
 thiserror = { workspace = true }
-gltf = { version = "1", default-features = false, features = ["utils", "names", "KHR_materials_emissive_strength"] }
-roxmltree = "0.20"
-
-[dev-dependencies]
-proptest = { workspace = true }
 
 [lints]
 workspace = true
