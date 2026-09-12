@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<!-- P34 error fixture: two disjoint link trees, no joint connects them. -->
+<robot name="two_roots">
+  <link name="root_a">
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.01" iyy="0.01" izz="0.01" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+
+  <link name="child_a">
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.01" iyy="0.01" izz="0.01" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+
+  <link name="root_b">
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.01" iyy="0.01" izz="0.01" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+
+  <joint name="a_to_a" type="fixed">
+    <parent link="root_a"/>
+    <child link="child_a"/>
+  </joint>
+</robot>

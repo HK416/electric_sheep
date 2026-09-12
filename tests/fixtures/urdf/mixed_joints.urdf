@@ -1,0 +1,74 @@
+<?xml version="1.0"?>
+<!-- P34 oracle fixture: fixed + continuous + prismatic joints, a transmission and a
+     package:// mesh reference, plus a <gazebo> block that must warn, not fail. -->
+<robot name="mixed">
+  <link name="base_link">
+    <inertial>
+      <mass value="3.0"/>
+      <inertia ixx="0.02" iyy="0.02" izz="0.02" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+
+  <link name="sensor_mount">
+    <inertial>
+      <mass value="0.1"/>
+      <inertia ixx="0.0001" iyy="0.0001" izz="0.0001" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+    <visual>
+      <geometry>
+        <mesh filename="package://robo_pkg/meshes/mount.stl" scale="1 1 1"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <link name="turret">
+    <inertial>
+      <mass value="1.5"/>
+      <inertia ixx="0.005" iyy="0.005" izz="0.005" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+
+  <link name="slider">
+    <inertial>
+      <mass value="0.8"/>
+      <inertia ixx="0.001" iyy="0.001" izz="0.001" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+
+  <joint name="mount_weld" type="fixed">
+    <parent link="base_link"/>
+    <child link="sensor_mount"/>
+    <origin xyz="0 0 0.2" rpy="0 0 0"/>
+  </joint>
+
+  <joint name="spin" type="continuous">
+    <parent link="base_link"/>
+    <child link="turret"/>
+    <origin xyz="0 0 0.05" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit effort="10" velocity="5"/>
+    <dynamics damping="0.02" friction="0"/>
+  </joint>
+
+  <joint name="lift" type="prismatic">
+    <parent link="turret"/>
+    <child link="slider"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="0" upper="0.5" effort="100" velocity="0.2"/>
+  </joint>
+
+  <transmission name="spin_trans">
+    <type>transmission_interface/SimpleTransmission</type>
+    <joint name="spin">
+      <hardwareInterface>hardware_interface/EffortJointInterface</hardwareInterface>
+    </joint>
+    <actuator name="spin_motor">
+      <mechanicalReduction>50</mechanicalReduction>
+    </actuator>
+  </transmission>
+
+  <gazebo reference="turret">
+    <material>Gazebo/Blue</material>
+  </gazebo>
+</robot>

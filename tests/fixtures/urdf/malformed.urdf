@@ -1,0 +1,13 @@
+<?xml version="1.0"?>
+<!-- P34 error fixture: unclosed element, must fail to parse rather than panic. -->
+<robot name="malformed">
+  <link name="base_link">
+    <inertial>
+      <mass value="1.0"/>
+      <inertia ixx="0.01" iyy="0.01" izz="0.01" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+  </link>
+  <joint name="broken" type="revolute">
+    <parent link="base_link"/>
+    <child link="missing_link">
+</robot>

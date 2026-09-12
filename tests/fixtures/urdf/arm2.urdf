@@ -1,0 +1,68 @@
+<?xml version="1.0"?>
+<!-- P34 oracle fixture: a 2-DoF arm, base -> link1 -> link2, both revolute. -->
+<robot name="arm2">
+  <link name="base_link">
+    <inertial>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <mass value="2.0"/>
+      <inertia ixx="0.01" iyy="0.01" izz="0.01" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.2 0.2 0.1"/>
+      </geometry>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0.05" rpy="0 0 0"/>
+      <geometry>
+        <box size="0.2 0.2 0.1"/>
+      </geometry>
+    </collision>
+  </link>
+
+  <link name="link1">
+    <inertial>
+      <origin xyz="0.15 0 0" rpy="0 0 0"/>
+      <mass value="1.0"/>
+      <inertia ixx="0.001" iyy="0.02" izz="0.02" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+    <visual>
+      <origin xyz="0.15 0 0" rpy="0 1.5707963267948966 0"/>
+      <geometry>
+        <cylinder radius="0.03" length="0.3"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <link name="link2">
+    <inertial>
+      <origin xyz="0.1 0 0" rpy="0 0 0"/>
+      <mass value="0.5"/>
+      <inertia ixx="0.0005" iyy="0.01" izz="0.01" ixy="0" ixz="0" iyz="0"/>
+    </inertial>
+    <visual>
+      <geometry>
+        <sphere radius="0.04"/>
+      </geometry>
+    </visual>
+  </link>
+
+  <joint name="shoulder" type="revolute">
+    <parent link="base_link"/>
+    <child link="link1"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1.5707963267948966" upper="1.5707963267948966" effort="50" velocity="2"/>
+    <dynamics damping="0.1" friction="0.01"/>
+  </joint>
+
+  <joint name="elbow" type="revolute">
+    <parent link="link1"/>
+    <child link="link2"/>
+    <origin xyz="0.3 0 0" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <limit lower="-1.0" upper="1.0" effort="20" velocity="2"/>
+    <dynamics damping="0.05" friction="0"/>
+  </joint>
+</robot>
