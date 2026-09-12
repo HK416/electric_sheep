@@ -6,6 +6,15 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde = { workspace = true }
+wide = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+# `float_roundtrip` is required, not optional: serde_json's default float parser is a fast
+# approximation that can land 1 ULP away from the serialised value, so a round trip is not
+# bit-exact without it (spec §3.5 tier 1).
+serde_json = { workspace = true, features = ["float_roundtrip"] }
 
 [lints]
 workspace = true
