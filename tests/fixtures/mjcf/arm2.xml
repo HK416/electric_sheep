@@ -1,0 +1,22 @@
+<mujoco model="arm2">
+  <compiler angle="radian" autolimits="true"/>
+  <default>
+    <joint type="hinge" axis="0 0 1" damping="0.5" range="-1 1"/>
+    <geom type="capsule" size="0.03" density="1000"/>
+    <default class="heavy">
+      <geom size="0.06" density="2000"/>
+      <joint damping="5"/>
+    </default>
+  </default>
+  <worldbody>
+    <body name="link1" pos="0 0 0.2">
+      <joint name="j1"/>
+      <geom name="g1" fromto="0 0 0 0.3 0 0"/>
+      <body name="link2" pos="0.3 0 0" childclass="heavy">
+        <joint name="j2" damping="1"/>
+        <geom name="g2" fromto="0 0 0 0.25 0 0"/>
+        <geom name="g3" class="main" type="sphere"/>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>

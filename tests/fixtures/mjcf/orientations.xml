@@ -1,0 +1,11 @@
+<mujoco model="orientations">
+  <compiler angle="degree" eulerseq="xyz"/>
+  <worldbody>
+    <body name="b_quat" quat="0.70710678 0 0 0.70710678"/>
+    <body name="b_euler" euler="0 0 90"/>
+    <body name="b_axisangle" axisangle="0 0 1 90"/>
+    <body name="b_xyaxes" xyaxes="0 1 0 -1 0 0"/>
+    <body name="b_zaxis" zaxis="1 0 0"/>
+    <body name="b_negative_w" quat="-0.70710678 0 0 0.70710678"/>
+  </worldbody>
+</mujoco>

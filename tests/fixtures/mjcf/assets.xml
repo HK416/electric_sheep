@@ -1,0 +1,19 @@
+<mujoco model="assets">
+  <compiler meshdir="meshes/" texturedir="textures"/>
+  <asset>
+    <mesh name="arm" file="arm.stl"/>
+    <mesh file="parts/gripper.obj"/>
+    <texture name="wood" file="wood.png" type="2d"/>
+    <material name="woodmat" texture="wood"/>
+    <hfield name="terrain" file="terrain.png"/>
+  </asset>
+  <worldbody>
+    <geom name="ground" type="hfield" hfield="terrain"/>
+    <body name="tool">
+      <geom name="armmesh" type="mesh" mesh="arm" material="woodmat"/>
+      <geom name="grip" type="mesh" mesh="gripper" contype="0" conaffinity="0"/>
+    </body>
+  </worldbody>
+  <equality/>
+  <keyframe/>
+</mujoco>

@@ -1,0 +1,45 @@
+<mujoco model="actuated">
+  <compiler angle="degree"/>
+  <worldbody>
+    <body name="base">
+      <joint name="slide1" type="slide" axis="1 0 0" range="-0.5 0.5"/>
+      <geom name="box1" type="box" size="0.1 0.1 0.1"/>
+      <site name="s1" pos="0 0 0.1"/>
+      <site name="s2" pos="0.1 0 0.1"/>
+      <camera name="wrist" pos="0 0 0.3" fovy="60"/>
+      <body name="finger">
+        <joint name="hinge1" type="hinge" axis="0 1 0" range="0 45"/>
+        <geom name="tip" type="sphere" size="0.02"/>
+      </body>
+    </body>
+  </worldbody>
+  <tendon>
+    <fixed name="coupler">
+      <joint joint="slide1" coef="1"/>
+      <joint joint="hinge1" coef="-0.5"/>
+    </fixed>
+    <spatial name="cable" range="0 0.4" stiffness="7" damping="0.3">
+      <site site="s1"/>
+      <site site="s2"/>
+    </spatial>
+  </tendon>
+  <actuator>
+    <motor name="m1" joint="slide1" gear="10" ctrlrange="-1 1" forcerange="-50 50"/>
+    <position name="p1" joint="hinge1" kp="30" kv="2" ctrlrange="0 0.7"/>
+    <velocity name="v1" joint="hinge1" kv="4"/>
+    <general name="g1" tendon="coupler" gainprm="5 0 0 0 0 0 0 0 0 0" biasprm="0 -3 0"/>
+  </actuator>
+  <sensor>
+    <jointpos joint="hinge1" noise="0.001"/>
+    <jointvel name="hv" joint="hinge1" cutoff="10"/>
+    <actuatorfrc actuator="m1"/>
+    <framepos objtype="site" objname="s1"/>
+    <framequat objtype="body" objname="finger"/>
+    <accelerometer site="s1"/>
+    <gyro site="s1"/>
+    <force site="s2"/>
+    <torque site="s2"/>
+    <touch site="s2"/>
+    <rangefinder site="s1"/>
+  </sensor>
+</mujoco>
