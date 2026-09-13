@@ -82,19 +82,38 @@ rather than short-circuited with `!=`.
 Two more resource limits sit in front of the token check, both on `Server::bind_with(addr,
 token, cfg: ServerConfig)` (`Server::bind` calls it with `ServerConfig::default()`):
 
+- **Connection cap** (`ServerConfig::max_clients`, default `DEFAULT_MAX_CLIENTS = 64`): checked
+  in the accept loop itself, before a thread is spawned for the connection at all — so before
+  `Hello` is even read, which means before the version/token checks. `in_flight =
+  handshaking.load() + clients.len()` counts every connection currently occupying a "slot",
+  whether it is mid-handshake or already registered; a connection arriving once that is
+  `>= max_clients` gets `Bye { reason: "too many clients" }`, written synchronously by the
+  accept loop thread, and its socket is dropped (closed) without ever spawning a thread or
+  reading a byte from it. This is a behavior change from the original shape (which checked the
+  cap inside the per-connection thread, after the token/version checks): an over-cap
+  connection's `Hello` — even one with a bad token — is never read, so it only ever gets "too
+  many clients", not a token- or version-specific reason. The accept loop is single-threaded,
+  so this check-then-increment has no race with itself — the earlier `ponytail` note about two
+  connections racing past the boundary no longer applies; the sequencing here (not a held
+  mutex) is what makes it exact.
 - **Handshake timeout** (`ServerConfig::handshake_timeout`, default `HANDSHAKE_TIMEOUT = 5s`):
-  applied with `TcpStream::set_read_timeout` before the server reads `Hello`, so a peer that
-  connects and sends nothing is dropped once the timeout elapses instead of pinning a server
-  thread forever. Cleared (`set_read_timeout(None)`) immediately after a successful `Hello`
+  an absolute deadline, not a per-read one. The accept loop records `Instant::now() +
+  handshake_timeout` when the connection is admitted; `read_message_until` re-derives the
+  *remaining* time before every socket read that would block and uses that as the read's
+  timeout, erroring out once no time is left. A peer dribbling a single byte every few seconds
+  — each individual read comfortably inside its own per-read timeout — is still cut off once
+  the total elapsed time crosses the deadline, which a single `set_read_timeout(Some(duration))`
+  applied once (the original shape) could not do: that call bounds one read, not the sum of
+  many partial ones. Cleared (`set_read_timeout(None)`) immediately after a successful `Hello`
   read, so a session's later reads (the `Subscribe` loop) block normally for as long as the
   connection lives.
-- **Connection cap** (`ServerConfig::max_clients`, default `DEFAULT_MAX_CLIENTS = 64`): checked
-  after the version/token checks (so a bad token still gets its own `Bye` reason) and before
-  registration. The 65th concurrent client (at the default) gets
-  `Bye { reason: "too many clients" }` and is never added to the client map. ponytail: the check
-  and the registration insert are not one atomic step, so two connections arriving at exactly
-  the boundary can both pass before either registers — acceptable for this loopback shim; an
-  exact cap needs one mutex held across "check and insert".
+- **Observability**: `Server::stats()` reports `handshaking` (connections admitted past the cap
+  check but not yet past the handshake) and `threads_live` (every `serve_client` thread
+  currently running, handshaking or registered) alongside the per-client `sent`/`dropped`
+  counters, so a caller — or a test — can see the cap actually holding rather than trusting it
+  blindly. Both are shared `AtomicUsize` counters; `threads_live` is decremented by an RAII
+  guard on thread exit so every path (clean return, an early `?`, a panic unwind) accounts for
+  itself once.
 
 **What this is not**: the token travels in clear text inside the JSON body, and there is no
 channel encryption. That is fine on `127.0.0.1` (the spec 25.1 default bind) between processes

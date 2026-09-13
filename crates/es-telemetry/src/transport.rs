@@ -31,11 +31,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -119,10 +119,18 @@ pub struct ClientStats {
 }
 
 /// Snapshot of every currently connected client's [`ClientStats`], keyed by the session id the
-/// server assigned it in [`HelloAck::session_id`].
+/// server assigned it in [`HelloAck::session_id`], plus accept-loop thread accounting
+/// (P-M2-R8) so a caller can see the cap actually holding rather than trusting it blindly.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ServerStats {
     pub clients: BTreeMap<u64, ClientStats>,
+    /// Connections past the accept loop's cap check but not yet past the handshake (no
+    /// `HelloAck`/`Bye` sent yet). Counted separately from `clients` because a connection here
+    /// holds a cap "slot" and a thread without appearing in the client map.
+    pub handshaking: usize,
+    /// Threads currently running `serve_client` (handshaking or registered), decremented on
+    /// thread exit via a shared [`AtomicUsize`] — see [`CounterGuard`].
+    pub threads_live: usize,
 }
 
 /// A running telemetry server: one accept loop thread plus one reader/writer thread pair per
@@ -133,6 +141,19 @@ pub struct ServerStats {
 pub struct Server {
     local_addr: SocketAddr,
     clients: Arc<Mutex<BTreeMap<u64, ClientHandle>>>,
+    handshaking: Arc<AtomicUsize>,
+    threads_live: Arc<AtomicUsize>,
+}
+
+/// RAII decrement for a shared counter: created when a slot/thread is claimed, dropped
+/// (decrementing) on every exit path — early return, `?`, or panic unwind — so nothing needs
+/// to remember to decrement by hand.
+struct CounterGuard(Arc<AtomicUsize>);
+
+impl Drop for CounterGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Server {
@@ -162,21 +183,59 @@ impl Server {
             Arc::new(Mutex::new(BTreeMap::new()));
         let token = Arc::new(token);
         let next_id = Arc::new(AtomicU64::new(0));
+        let handshaking = Arc::new(AtomicUsize::new(0));
+        let threads_live = Arc::new(AtomicUsize::new(0));
 
         let accept_clients = Arc::clone(&clients);
+        let accept_handshaking = Arc::clone(&handshaking);
+        let accept_threads_live = Arc::clone(&threads_live);
         thread::spawn(move || {
             for incoming in listener.incoming() {
-                let Ok(stream) = incoming else { break };
+                let Ok(mut stream) = incoming else { break };
                 let id = next_id.fetch_add(1, Ordering::SeqCst);
+
+                // Connection cap (spec 25.1, P-M2-R8): checked here, before spawning a thread
+                // for this connection, against every "slot" a connection can occupy — a live
+                // handshake plus an already-registered client — so a peer past the cap never
+                // gets a thread and is refused before it can even send `Hello`. The accept
+                // loop is single-threaded, so this check-then-increment has no race with
+                // itself (unlike the old check inside `serve_client`, which ran concurrently
+                // per connection).
+                let in_flight = accept_handshaking.load(Ordering::SeqCst)
+                    + accept_clients.lock().expect("client map lock").len();
+                if in_flight >= cfg.max_clients {
+                    let _ = write_message(
+                        &mut stream,
+                        &Message::Bye {
+                            reason: "too many clients".to_string(),
+                        },
+                    );
+                    continue;
+                }
+
+                accept_handshaking.fetch_add(1, Ordering::SeqCst);
+                accept_threads_live.fetch_add(1, Ordering::SeqCst);
                 let clients = Arc::clone(&accept_clients);
                 let token = Arc::clone(&token);
-                thread::spawn(move || serve_client(id, stream, &clients, &token, cfg));
+                let handshaking = Arc::clone(&accept_handshaking);
+                let threads_live = Arc::clone(&accept_threads_live);
+                // Instant captured at accept, not inside the spawned thread: the deadline is
+                // an absolute wall-clock point the handshake read loop checks before every
+                // partial read, so a peer dribbling one byte at a time is still cut off on
+                // time regardless of how many short reads that takes.
+                let deadline = Instant::now() + cfg.handshake_timeout;
+                thread::spawn(move || {
+                    let _threads_live_guard = CounterGuard(threads_live);
+                    serve_client(id, stream, &clients, &token, deadline, handshaking);
+                });
             }
         });
 
         Ok(Server {
             local_addr,
             clients,
+            handshaking,
+            threads_live,
         })
     }
 
@@ -208,7 +267,8 @@ impl Server {
         }
     }
 
-    /// A snapshot of every currently connected client's counters.
+    /// A snapshot of every currently connected client's counters, plus accept-loop thread
+    /// accounting (P-M2-R8).
     pub fn stats(&self) -> ServerStats {
         let clients = self.clients.lock().expect("client map lock");
         ServerStats {
@@ -224,30 +284,36 @@ impl Server {
                     )
                 })
                 .collect(),
+            handshaking: self.handshaking.load(Ordering::SeqCst),
+            threads_live: self.threads_live.load(Ordering::SeqCst),
         }
     }
 }
 
 /// Handles one accepted connection end to end: handshake, then register-and-relay until the
-/// client disconnects. Runs entirely on its own thread; errors just end the connection.
+/// client disconnects. Runs entirely on its own thread; errors just end the connection. The
+/// connection cap itself is enforced by the caller (the accept loop) before this function is
+/// ever spawned — by the time this runs, the connection already holds a handshaking slot,
+/// tracked by `handshaking` and released via [`CounterGuard`] on every exit path.
 fn serve_client(
     id: u64,
     mut stream: TcpStream,
     clients: &Arc<Mutex<BTreeMap<u64, ClientHandle>>>,
     token: &Arc<Option<String>>,
-    cfg: ServerConfig,
+    handshake_deadline: Instant,
+    handshaking: Arc<AtomicUsize>,
 ) {
-    // A peer that connects and stays silent must not pin this thread forever (spec 25.1); once
-    // past the handshake the subscribe-loop read below should block normally, so the timeout is
-    // cleared again immediately after.
-    if stream
-        .set_read_timeout(Some(cfg.handshake_timeout))
-        .is_err()
-    {
-        return;
-    }
+    let mut handshaking_guard = Some(CounterGuard(handshaking));
+
+    // A peer that connects and stays silent — or dribbles one byte at a time — must not pin
+    // this thread forever (spec 25.1). `read_message_until` re-checks `handshake_deadline`
+    // before every partial read, so the *total* time spent here is bounded regardless of how
+    // many short reads it takes; once past the handshake the subscribe-loop read below blocks
+    // normally, so the timeout is cleared again immediately after.
     let mut buf = Vec::new();
-    let Ok(Message::Hello(hello)) = read_message(&mut stream, &mut buf) else {
+    let Ok(Message::Hello(hello)) =
+        read_message_until(&mut stream, &mut buf, Some(handshake_deadline))
+    else {
         return;
     };
     if stream.set_read_timeout(None).is_err() {
@@ -256,18 +322,6 @@ fn serve_client(
 
     if let Some(reason) = reject_reason(&hello, token.as_ref().as_ref()) {
         let _ = write_message(&mut stream, &Message::Bye { reason });
-        return;
-    }
-    // Connection cap (spec 25.1): checked after the handshake's own checks so a bad token or
-    // version still gets its specific reason, and before registration so a refused client never
-    // occupies a `ClientHandle` slot.
-    if clients.lock().expect("client map lock").len() >= cfg.max_clients {
-        let _ = write_message(
-            &mut stream,
-            &Message::Bye {
-                reason: "too many clients".to_string(),
-            },
-        );
         return;
     }
     let version = negotiate(&hello.versions_supported, &server_versions())
@@ -293,6 +347,11 @@ fn serve_client(
             counters,
         },
     );
+    // Only now is this connection a registered client, counted via `clients.len()` in the
+    // accept loop's cap check instead of `handshaking` — release the slot right after
+    // insertion (not right after the `HelloAck` write above) so the connection is never
+    // invisible to the cap check in between.
+    drop(handshaking_guard.take());
 
     let Ok(mut writer_stream) = stream.try_clone() else {
         clients.lock().expect("client map lock").remove(&id);
@@ -455,6 +514,20 @@ impl Client {
 /// Reads bytes off `stream` into `buf` until one full length-prefixed message can be decoded,
 /// then drains those bytes back out of `buf` so it holds only the unconsumed remainder.
 fn read_message(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<Message> {
+    read_message_until(stream, buf, None)
+}
+
+/// Like [`read_message`], but when `deadline` is set, the *total* time spent waiting for the
+/// message to complete is bounded by it, not just each individual read: before every read that
+/// would block, the remaining time until `deadline` becomes that read's timeout, and running
+/// out of remaining time is itself a timeout error. This is what makes the handshake deadline
+/// (P-M2-R8) absolute — a peer sending one byte every few seconds, each within its own read's
+/// timeout, still cannot keep the total under `deadline` forever.
+fn read_message_until(
+    stream: &mut TcpStream,
+    buf: &mut Vec<u8>,
+    deadline: Option<Instant>,
+) -> io::Result<Message> {
     loop {
         match decode(buf) {
             Ok((msg, used)) => {
@@ -462,6 +535,16 @@ fn read_message(stream: &mut TcpStream, buf: &mut Vec<u8>) -> io::Result<Message
                 return Ok(msg);
             }
             Err(crate::protocol::ProtoError::Incomplete { .. }) => {
+                if let Some(deadline) = deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "handshake deadline exceeded",
+                        ));
+                    }
+                    stream.set_read_timeout(Some(remaining))?;
+                }
                 let mut chunk = [0u8; 4096];
                 let n = stream.read(&mut chunk)?;
                 if n == 0 {
@@ -592,6 +675,123 @@ mod tests {
             Message::Bye { reason } => assert!(reason.contains("version"), "{reason}"),
             other => panic!("expected Bye, got {other:?}"),
         }
+    }
+
+    /// P-M2-R8 oracle: `max_clients + 8` silent sockets. The first `max_clients` fill the cap
+    /// (each occupies a handshaking slot and a thread); the extra 8 arrive once the accept loop
+    /// already sees the cap full and must be refused with `Bye` right there — before ever being
+    /// read from, and without spawning a thread — so `threads_live` never exceeds the cap by
+    /// more than a small constant, even while the first batch is still waiting out its
+    /// handshake deadline.
+    #[test]
+    fn connections_past_the_cap_get_bye_without_spawning_a_thread() {
+        let cfg = ServerConfig {
+            handshake_timeout: Duration::from_millis(200),
+            max_clients: 8,
+        };
+        let server = Server::bind_with("127.0.0.1:0".parse().unwrap(), None, cfg).unwrap();
+
+        // Fill the cap with silent connections: never send `Hello`, so each sits in
+        // `handshaking` until the deadline elapses.
+        let filling: Vec<TcpStream> = (0..cfg.max_clients)
+            .map(|_| TcpStream::connect(local(&server)).unwrap())
+            .collect();
+        // Give the accept loop a moment to see and admit each one.
+        thread::sleep(Duration::from_millis(50));
+
+        let mut extra: Vec<TcpStream> = (0..8)
+            .map(|_| TcpStream::connect(local(&server)).unwrap())
+            .collect();
+        for stream in &mut extra {
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut buf = Vec::new();
+            match read_message(stream, &mut buf).expect("a refused connection still gets a reply") {
+                Message::Bye { reason } => assert!(reason.contains("too many"), "{reason}"),
+                other => panic!("expected Bye, got {other:?}"),
+            }
+        }
+
+        // Bounded well below `max_clients + 8`: the extra sockets above never got a thread, even
+        // though the filling connections have not hit their handshake deadline yet.
+        let stats = server.stats();
+        assert!(
+            stats.threads_live <= cfg.max_clients + 2,
+            "threads_live must stay bounded by the cap, not by the number of connection \
+             attempts: {stats:?}"
+        );
+
+        // Once the deadline passes, the filling connections are dropped too.
+        thread::sleep(cfg.handshake_timeout + Duration::from_millis(500));
+        let stats_after = server.stats();
+        assert!(
+            stats_after.threads_live <= cfg.max_clients + 2,
+            "threads_live must stay bounded after the deadline too: {stats_after:?}"
+        );
+        assert_eq!(
+            stats_after.handshaking, 0,
+            "every handshake should be done or timed out"
+        );
+
+        drop(filling);
+    }
+
+    /// P-M2-R8 oracle: a peer sending one byte at a time, each within its own read's timeout,
+    /// must still be dropped once the *total* handshake time exceeds `HANDSHAKE_TIMEOUT` — the
+    /// bug being fixed is that the old per-read `set_read_timeout` never enforced a total
+    /// budget across many short reads.
+    #[test]
+    fn a_dribbling_client_is_dropped_at_the_absolute_handshake_deadline() {
+        let cfg = ServerConfig {
+            handshake_timeout: Duration::from_millis(300),
+            ..ServerConfig::default()
+        };
+        let server = Server::bind_with("127.0.0.1:0".parse().unwrap(), None, cfg).unwrap();
+        let mut stream = TcpStream::connect(local(&server)).unwrap();
+
+        let hello_bytes = encode(&Message::Hello(Hello {
+            versions_supported: vec![PROTOCOL_VERSION],
+            token: None,
+            client: "dribbler".into(),
+        }));
+        assert!(
+            hello_bytes.len() > 5,
+            "the dribble must take more than one byte to matter"
+        );
+
+        let start = Instant::now();
+        let budget = cfg.handshake_timeout + Duration::from_secs(1);
+        // One byte every 30ms is far slower than the 300ms deadline, so the server must cut
+        // this off mid-message rather than ever completing the handshake.
+        for &byte in &hello_bytes {
+            if start.elapsed() > budget || stream.write_all(&[byte]).is_err() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+
+        stream.set_read_timeout(Some(budget)).unwrap();
+        let mut buf = [0u8; 1];
+        // The server closes with some dribbled bytes still unread in the kernel receive
+        // buffer, so the OS may report an abrupt reset/abort here instead of a clean EOF
+        // (observed on Windows) — either is fine, since the point is that the connection
+        // ends within the deadline, not the exact shutdown flavor.
+        match stream.read(&mut buf) {
+            Ok(n) => assert_eq!(n, 0, "expected EOF, got data"),
+            Err(e) => assert!(
+                matches!(
+                    e.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ),
+                "unexpected read error: {e:?}"
+            ),
+        }
+        assert!(
+            start.elapsed() < budget,
+            "must be dropped within HANDSHAKE_TIMEOUT + 1s, took {:?}",
+            start.elapsed()
+        );
     }
 
     fn frame(stream: StreamId, tick: u64) -> Frame {
