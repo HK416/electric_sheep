@@ -17,6 +17,8 @@ es-env = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+# `evidence`: an evidence bundle entry is addressed by its blake3 (spec 27.1).
+blake3 = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

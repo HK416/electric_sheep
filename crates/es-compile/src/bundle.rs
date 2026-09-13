@@ -59,6 +59,28 @@ pub const DEPLOYMENT: &str = "deployment.toml";
 pub const WEIGHTS: &str = "weights.safetensors";
 pub const EVALUATION: &str = "evaluation.toml";
 
+// Entries a `BundleKind::Evidence` container adds (spec 27.1). They live here, next to the
+// policy-bundle names, so one file is the whole namespace and two crates cannot disagree about
+// a path; `es-eval::evidence` writes and reads them. See `docs/design/safety-case.md`.
+
+/// The serialized `es_ir::hash::HashChain` of the attested run. The manifest's slots are the
+/// subset a deployment bundle can know; `execution_hash` needs the whole chain (spec 5.3).
+pub const CHAIN: &str = "chain.json";
+/// The Safety Case graph: requirements, claims, evidence, traceability (spec 27.1).
+pub const SAFETY_CASE: &str = "safety_case/case.json";
+/// The deployment bundle, embedded whole rather than re-serialized entry by entry, so that
+/// opening it re-runs every check `PolicyBundle::open` already performs.
+pub const POLICY_BUNDLE: &str = "policy/policy.esb";
+/// The two spec 10.5 artifacts, under `reports/<i>/`.
+pub const REPORT_JSON: &str = "report.json";
+pub const EVALUATION_LOCK: &str = "evaluation.lock";
+
+/// `reports/<i>/<name>` — the entry path of one evaluation run's artifact.
+#[must_use]
+pub fn report_entry(index: usize, name: &str) -> String {
+    format!("reports/{index}/{name}")
+}
+
 // --- manifest -------------------------------------------------------------------------------
 
 /// What the bundle is for. The two share a container and a manifest; `Evidence` simply carries
