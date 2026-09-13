@@ -89,7 +89,9 @@ safetensors file before the first `forward`, and a missing key is an error, neve
 | `TemporalEncoder { Transformer }` | `nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=out_dim, nhead=8, batch_first=True), 1)` | `v = self.nk(x)` | prefix |
 | `TemporalEncoder { TemporalConv, Gru, Mamba }` | — | — | `Unsupported` |
 | `PolicyHead { Regression }` | `Linear(in, horizon * action_dim)` | `v = self.nk(x).reshape(H, A)` | exact |
-| `PolicyHead { Diffusion, FlowMatching, Discrete, Energy }` | — | — | `Unsupported` |
+| `PolicyHead { Diffusion { Ddpm, Ddim } }` | `_DdpmHead` (section 8) | `v = self.nk(cond, noise)` | exact |
+| `PolicyHead { FlowMatching }` | `_FlowHead` (section 8) | `v = self.nk(cond, noise)` | exact |
+| `PolicyHead { Diffusion { DpmSolver }, Discrete, Energy }` | — | — | `Unsupported` |
 | `PolicyBundle` | — | — | `Unsupported` |
 | `ActionChunker` | — | `v = x[:K]` | none |
 | `Normalizer { MeanStd / MinMax }` | `register_buffer(..., persistent=False)` | `v = (x - mean) / std` or its inverse | none |
@@ -210,10 +212,13 @@ or dtype disagreement is not a large error, it is `Equivalence::pass = false` wi
 
 Nothing below is a "later, maybe". Each is deferred because its oracle is not in this packet.
 
-- **Diffusion and FlowMatching sampling loops.** `HeadKind::Diffusion { n_steps, scheduler }`
-  and `FlowMatching { n_steps }` are iterative samplers with their own noise schedule and their
-  own RNG. Determinism of the noise draw (spec 3.4 forbids a global RNG) is the actual design
-  problem and it dwarfs the lowering. `Unsupported` until a packet owns the sampler contract.
+- **`DpmSolver`.** A multistep solver whose coefficients depend on the exact `lambda`
+  parametrisation, i.e. on a choice that spec 8.3 does not pin. Two defensible implementations
+  disagree by more than the tier-4 tolerance, so it stays `Unsupported` until the IR says which.
+- **A UNet or transformer denoiser, and cross-attention conditioning.** Section 8's denoiser is
+  one hidden layer. Real Diffusion Policy uses a 1-D conditional UNet with FiLM; that is a node
+  set question (`Fusion { FiLm }` is `Unsupported` too), not a sampler question, and it belongs
+  with the packet that lowers FiLM.
 - **`PolicyBundle` (SmolVLA, π₀).** Spec 8.3 is explicit that a 3.5 B VLA is referenced whole
   and not decomposed. The eventual lowering is a *passthrough*: load the bundle's own module,
   check the interface against `PolicyContract`, call it. It is `Unsupported` here rather than
@@ -226,3 +231,115 @@ Nothing below is a "later, maybe". Each is deferred because its oracle is not in
   `VulkanRuntime` at M3. The subprocess is the M1 shape and is meant to be slow.
 - **Real LeRobot ACT checkpoint key remap.** The M1 gate (spec 8.9) needs it; it is a fixture,
   and fixtures belong with the gate.
+
+## 8. Sampler heads: `Diffusion` and `FlowMatching` (spec 8.3, spec 8.5)
+
+Both heads are *iterative*: they start from noise and refine it into the action chunk. Spec 8.5
+says the output is a chunk `[H, A]`, so the sampler's state is that chunk flattened,
+`x_dim = H * A`, and `.reshape(H, A)` happens once at the end.
+
+### 8.1 Where the noise comes from
+
+An ancestral sampler draws random numbers, and spec 3.4 forbids a global RNG on a deterministic
+path. Both draws are therefore **data**, not calls:
+
+- **The initial `x_T`** is a *declared graph input* named by `PolicyContract::inputs`, exactly
+  like an observation. The IR already supports this — the head simply declares a second input
+  port — so no IR change was needed and `PolicyRuntime::infer` stays a pure function of its
+  named inputs. A sampler head that declares only one input is `LowerError::Shape`, never a
+  head that quietly invents its own noise. (The alternative the packet allowed — a `noise_seed`
+  scalar input feeding a seeded `torch.Generator` — was **not** taken: a seed makes the result
+  a function of torch's RNG algorithm, which is not part of the hash chain and is not
+  reproducible in the Rust reference.)
+- **The per-step draws `z_t`** of DDPM are non-trainable buffers in the checkpoint,
+  `nodes.<k>.noise_<t>` of shape `[x_dim]`, one per step with `sigma_t != 0`. They are ordinary
+  exact keys, so `validate_keys` requires them: a checkpoint missing `noise_3` is an error, not
+  a silent zero. DDIM (eta = 0) consumes none and declares none, which is visible in the key
+  set. The caller who wants a different sample writes a different `x_T` and a different noise
+  buffer set — both are content, both enter `weights_hash`, both are therefore in the hash
+  chain (spec 5.3).
+
+This is what makes the tier-4 comparison possible at all: torch and the Rust reference consume
+*the same* numbers, so a difference between them is a difference in the sampler, not in two
+RNGs.
+
+### 8.2 The denoiser
+
+One network serves both heads (`_Denoiser` in the generated file):
+
+```
+eps_theta(x_t, cond, t) = l1(relu(l0([x_t, cond, temb(t)])))
+    l0: Linear(x_dim + cond + cond, cond)
+    l1: Linear(cond, x_dim)
+```
+
+`cond` is the trailing width of the head's first input, i.e. the fused observation embedding.
+Spec 8.3 carries **no** hidden width and no embedding width for the head, so — as with
+`nhead = 8` in section 3 — both are lowering choices, and the choice is "reuse the conditioning
+width" rather than a new constant. `cond` must be even, because the timestep embedding is half
+sine and half cosine.
+
+```
+temb(t)_i        = sin(t * w_i),  temb(t)_{half+i} = cos(t * w_i)
+w_i              = exp(-ln(1e4) * i / half),   half = cond / 2
+```
+
+### 8.3 `Diffusion`: DDPM and DDIM
+
+Linear beta schedule, `beta_0 = 1e-4` to `beta_{n-1} = 0.02` (Ho et al.; LeRobot's default),
+`alpha_t = 1 - beta_t`, `abar_t = prod_{j<=t} alpha_j`. Spec 8.3 pins `n_steps` and the
+scheduler kind and nothing else, so the two endpoints are lowering constants.
+
+Both schedulers collapse to one update, which is why there is one loop and not two:
+
+```
+for t = n_steps-1 down to 0:
+    eps = eps_theta(x, cond, float(t))
+    x   = c1[t] * x + c3[t] * eps
+    if sigma[t] != 0:  x = x + sigma[t] * noise_t
+```
+
+| | `c1[t]` | `c3[t]` | `sigma[t]` |
+|---|---|---|---|
+| `Ddpm` | `1/sqrt(alpha_t)` | `-c1[t] * beta_t / sqrt(1 - abar_t)` | `sqrt(beta_t)`, and `0` at `t = 0` |
+| `Ddim` (eta = 0) | `sqrt(abar_{t-1} / abar_t)` | `sqrt(1 - abar_{t-1}) - c1[t] * sqrt(1 - abar_t)` | `0` |
+
+with `abar_{-1} = 1`. The three coefficient lists are computed **in Rust, in f32, with
+`es_math::approx`** and emitted into the generated Python as shortest-round-trip literals; they
+are plain Python lists, not buffers, so they never enter `state_dict` and a checkpoint can never
+disagree with the IR about the schedule (the `Normalizer` rule of section 3, applied again). The
+same `diffusion_schedule` function feeds the Rust reference, so the tier-4 test measures the
+loop and the network rather than two spellings of a beta schedule.
+
+### 8.4 `FlowMatching`
+
+Euler integration of `dx/dt = v_theta(x, cond, t)` from the noise at `t = 0` to the action at
+`t = 1`, in `n_steps` equal steps — the SmolVLA / π₀ sampler shape, with the same denoiser
+standing in for `v_theta`:
+
+```
+dt = 1 / n_steps
+for i = 0 .. n_steps-1:
+    x = x + dt * v_theta(x, cond, i / n_steps)
+```
+
+No noise beyond `x_0`, so no `noise_<t>` keys. Note that this lowers the *sampler*, not
+SmolVLA: a real SmolVLA checkpoint is a `PolicyBundle` (section 7) and stays `Unsupported`.
+
+### 8.5 Tier-4 result (spec 8.9, spec 28.7 gate 12)
+
+`src/reference.rs` (test-only) mirrors the generated module in f32 with a fixed op order and
+`es_math::approx` for `exp`/`sin`/`cos`/`sqrt`, and the test compares it against torch for
+state 4 -> `Linear` -> cond 16, action 2, horizon 3, 8 steps. Measured with torch 2.14.0+cpu:
+
+| head | `max_abs` | `max_rel` | tier-4 limit |
+|---|---|---|---|
+| `Diffusion { Ddpm }` | 5.96e-8 | 2.60e-6 | 1e-5 |
+| `Diffusion { Ddim }` | 3.73e-8 | 4.32e-7 | 1e-5 |
+| `FlowMatching` | 1.04e-7 | 1.37e-6 | 1e-5 |
+
+The residual is the gap between `es_math::approx` and libm in the timestep embedding plus
+matmul accumulation order; it does not grow with the step count in these configurations because
+both schedulers contract towards the denoiser's output. The tests re-run each policy and assert
+the spec 8.9 bitwise row as well, which is where a hidden RNG would show up. They **SKIP**
+(printing why) when no interpreter with `torch` is found; `ES_PYTHON` points at one.

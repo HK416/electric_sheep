@@ -22,6 +22,9 @@
 
 pub mod equiv;
 pub mod lower;
+/// The tier-4 Rust reference for the sampler heads. Test-only: it is an oracle, not a runtime.
+#[cfg(test)]
+mod reference;
 pub mod runtime;
 pub mod torch_runtime;
 pub mod weights;

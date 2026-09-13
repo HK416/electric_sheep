@@ -15,8 +15,8 @@ use std::fmt::Write as _;
 
 use es_ir::graph::{IrNode, NodeId};
 use es_ir::learning::{
-    FusionKind, HeadKind, LearningGraph, LearningNode, NormalizeDir, StateEncoderKind, StatsSource,
-    TemporalKind, VisionBackbone,
+    DiffusionScheduler, FusionKind, HeadKind, LearningGraph, LearningNode, NormalizeDir,
+    StateEncoderKind, StatsSource, TemporalKind, VisionBackbone,
 };
 use es_ir::types::ElemType;
 use es_ir::Diagnostic;
@@ -30,6 +30,150 @@ const LOWERING_TAG: &str = "es.lowering.torch.v1";
 /// do not carry a head count, so it is a lowering constant; a checkpoint that disagrees fails
 /// the shape check rather than being silently reinterpreted (design note section 3).
 const TRANSFORMER_HEADS: u64 = 8;
+
+/// Ends of the linear beta schedule (Ho et al. 2020, and `LeRobot`'s Diffusion Policy default).
+/// Spec 8.3 gives `HeadKind::Diffusion` an `n_steps` and a scheduler kind and nothing else, so
+/// the betas are lowering constants exactly as `TRANSFORMER_HEADS` is (design note section 8).
+const BETA_START: f32 = 1e-4;
+const BETA_END: f32 = 0.02;
+
+/// Per-step coefficients of the reverse loop, written so both schedulers share one line:
+/// `x_{t-1} = c1[t] * x_t + c3[t] * eps_theta(x_t, cond, t) + sigma[t] * z_t`.
+///
+/// The lowering emits these as float literals into the generated Python and the test-only Rust
+/// reference calls [`diffusion_schedule`] for the same `f32`s, so the tier-4 comparison measures
+/// the sampling loop and the network, not two spellings of a beta schedule.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Schedule {
+    pub c1: Vec<f32>,
+    pub c3: Vec<f32>,
+    /// Zero at `t == 0` and for every `t` under `Ddim` (eta = 0), which is what makes DDIM
+    /// consume no `noise_<t>` buffer at all.
+    pub sigma: Vec<f32>,
+}
+
+/// The DDPM/DDIM coefficients for `n_steps` under a linear beta schedule, in f32 with a fixed
+/// op order (spec 3.4). `alpha_bar` is a running product, so it is accumulated ascending in `t`.
+pub(crate) fn diffusion_schedule(n_steps: u32, scheduler: DiffusionScheduler) -> Schedule {
+    let n = n_steps as usize;
+    let mut beta = Vec::with_capacity(n);
+    let mut alpha_bar = Vec::with_capacity(n);
+    for t in 0..n {
+        let f = if n == 1 {
+            0.0
+        } else {
+            t as f32 / (n - 1) as f32
+        };
+        let b = BETA_START + (BETA_END - BETA_START) * f;
+        let prev = if t == 0 { 1.0 } else { alpha_bar[t - 1] };
+        beta.push(b);
+        alpha_bar.push(prev * (1.0 - b));
+    }
+
+    let mut s = Schedule {
+        c1: Vec::with_capacity(n),
+        c3: Vec::with_capacity(n),
+        sigma: Vec::with_capacity(n),
+    };
+    for t in 0..n {
+        let prev_bar = if t == 0 { 1.0 } else { alpha_bar[t - 1] };
+        match scheduler {
+            // Ancestral sampling: x = (x - beta/sqrt(1-abar) * eps) / sqrt(alpha) + sqrt(beta) z.
+            DiffusionScheduler::Ddpm => {
+                let c1 = 1.0 / es_math::approx::sqrt(1.0 - beta[t]);
+                s.c3.push(-c1 * beta[t] / es_math::approx::sqrt(1.0 - alpha_bar[t]));
+                s.c1.push(c1);
+                s.sigma.push(if t == 0 {
+                    0.0
+                } else {
+                    es_math::approx::sqrt(beta[t])
+                });
+            }
+            // eta = 0: x = sqrt(abar_prev) * x0_hat + sqrt(1 - abar_prev) * eps, deterministic.
+            DiffusionScheduler::Ddim => {
+                let c1 = es_math::approx::sqrt(prev_bar / alpha_bar[t]);
+                s.c3.push(
+                    es_math::approx::sqrt(1.0 - prev_bar)
+                        - c1 * es_math::approx::sqrt(1.0 - alpha_bar[t]),
+                );
+                s.c1.push(c1);
+                s.sigma.push(0.0);
+            }
+            DiffusionScheduler::DpmSolver => unreachable!("rejected as Unsupported before here"),
+        }
+    }
+    s
+}
+
+/// The sampler runtime the generated file needs: a sinusoidal timestep embedding and the one
+/// denoising network both heads share. Emitted only when a sampler head is present.
+const SAMPLER_PY: &str = r"
+
+def _sinusoidal(t, dim):
+    # DDPM timestep embedding: [sin(t * w_i), cos(t * w_i)], w_i = exp(-ln(1e4) * i / half).
+    half = dim // 2
+    i = torch.arange(half, dtype=torch.float32)
+    a = t * torch.exp(-9.210340371976184 * i / half)
+    return torch.cat([torch.sin(a), torch.cos(a)], dim=-1)
+
+
+class _Denoiser(nn.Module):
+    # eps_theta for Diffusion, v_theta for FlowMatching: one hidden layer over
+    # [x_t, cond, temb]. Spec 8.3 carries no width for it, so the hidden width is the
+    # conditioning width (design note section 8). A UNet is a later packet.
+    def __init__(self, x_dim, cond):
+        super().__init__()
+        self.l0 = nn.Linear(x_dim + cond + cond, cond)
+        self.l1 = nn.Linear(cond, x_dim)
+
+    def forward(self, x, cond, temb):
+        return self.l1(torch.relu(self.l0(torch.cat([x, cond, temb], dim=-1))))
+";
+
+/// The DDPM/DDIM head. `noise` is the initial `x_T` and arrives as a declared graph input; the
+/// per-step draws are non-trainable `noise_<t>` buffers in the checkpoint, so a run is a
+/// function of its inputs alone (spec 3.4: no global RNG).
+const DDPM_PY: &str = r#"
+
+class _DdpmHead(nn.Module):
+    def __init__(self, x_dim, cond, horizon, action_dim, n_steps, c1, c3, sigma):
+        super().__init__()
+        self.net = _Denoiser(x_dim, cond)
+        self.cond, self.horizon, self.action_dim = cond, horizon, action_dim
+        self.n_steps, self.c1, self.c3, self.sigma = n_steps, c1, c3, sigma
+        for t in range(n_steps):
+            if sigma[t] != 0.0:
+                self.register_buffer("noise_%d" % t, torch.zeros(x_dim))
+
+    def forward(self, cond, noise):
+        x = noise.reshape(-1)
+        for t in range(self.n_steps - 1, -1, -1):
+            eps = self.net(x, cond, _sinusoidal(float(t), self.cond))
+            x = self.c1[t] * x + self.c3[t] * eps
+            if self.sigma[t] != 0.0:
+                x = x + self.sigma[t] * getattr(self, "noise_%d" % t)
+        return x.reshape(self.horizon, self.action_dim)
+"#;
+
+/// The flow-matching head: Euler integration of `dx/dt = v_theta(x, cond, t)` from the noise at
+/// `t = 0` to the action at `t = 1`, in `n_steps` equal steps.
+const FLOW_PY: &str = r"
+
+class _FlowHead(nn.Module):
+    def __init__(self, x_dim, cond, horizon, action_dim, n_steps):
+        super().__init__()
+        self.net = _Denoiser(x_dim, cond)
+        self.cond, self.horizon, self.action_dim = cond, horizon, action_dim
+        self.n_steps = n_steps
+
+    def forward(self, cond, noise):
+        x = noise.reshape(-1)
+        dt = 1.0 / self.n_steps
+        for i in range(self.n_steps):
+            v = self.net(x, cond, _sinusoidal(i / self.n_steps, self.cond))
+            x = x + dt * v
+        return x.reshape(self.horizon, self.action_dim)
+";
 
 /// A lowered graph: a complete `PyTorch` file plus the checkpoint contract it implies.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -183,6 +327,17 @@ struct Lowering {
     keys: Vec<String>,
     shapes: BTreeMap<String, Vec<u64>>,
     needs_torchvision: bool,
+    needs_sampler: bool,
+    needs_ddpm: bool,
+    needs_flow: bool,
+}
+
+/// What [`Lowering::sampler`] worked out for a sampler head.
+struct Sampler {
+    cond: u64,
+    /// Flattened action-chunk width `H * action_dim`, the sampler's state width.
+    x_dim: u64,
+    call: String,
 }
 
 impl Lowering {
@@ -201,6 +356,64 @@ impl Lowering {
     /// Declares a prefix claim over an opaque sub-module.
     fn claim(&mut self, id: NodeId) {
         self.keys.push(format!("{WEIGHT_PREFIX}{}.*", id.0));
+    }
+
+    /// Everything a sampler head needs that does not depend on which sampler it is: the shapes,
+    /// the two-input check, the denoiser's keys, and the forward call.
+    ///
+    /// Both heads take **two** inputs — the conditioning feature and the initial noise `x_T`,
+    /// which is a declared graph input so a sample is a function of its inputs (design note
+    /// section 8). Spec 8.3's node parameters carry no hidden width, so the denoiser's hidden
+    /// width and the timestep-embedding width are both the conditioning width.
+    fn sampler(
+        &mut self,
+        id: NodeId,
+        node: &LearningNode,
+        args: &[String],
+        horizon: u32,
+        action_dim: u32,
+        n_steps: u32,
+    ) -> Result<Sampler, LowerError> {
+        let shape = |message: String| LowerError::Shape {
+            node: id.0,
+            message,
+        };
+        if n_steps == 0 {
+            return Err(shape("a sampler needs at least one step".to_owned()));
+        }
+        let ports = node.inputs();
+        if ports.len() != 2 || args.len() != 2 {
+            return Err(shape(format!(
+                "a Diffusion/FlowMatching head takes two inputs, the conditioning feature and \
+                 the initial noise x_T, and declares {} (design note section 8)",
+                ports.len()
+            )));
+        }
+        let x_dim = u64::from(horizon) * u64::from(action_dim);
+        let noise: u64 = ports[1].ty.shape.dims().iter().product();
+        if noise != x_dim {
+            return Err(shape(format!(
+                "the noise port holds {noise} elements, the action chunk needs {x_dim}"
+            )));
+        }
+        let cond = in_dim(node, 0, id)?;
+        if cond % 2 != 0 {
+            return Err(shape(format!(
+                "the timestep embedding is half sin and half cos, so the conditioning width \
+                 must be even, got {cond}"
+            )));
+        }
+
+        self.needs_sampler = true;
+        self.exact(id, "net.l0.weight", vec![cond, x_dim + cond + cond]);
+        self.exact(id, "net.l0.bias", vec![cond]);
+        self.exact(id, "net.l1.weight", vec![x_dim, cond]);
+        self.exact(id, "net.l1.bias", vec![x_dim]);
+        Ok(Sampler {
+            cond,
+            x_dim,
+            call: format!("self.n{}({}, {})", id.0, args[0], args[1]),
+        })
     }
 
     /// A `nn.Linear` member plus its two exact keys.
@@ -344,6 +557,43 @@ impl Lowering {
                         args[0]
                     ))
                 }
+                HeadKind::Diffusion { n_steps, scheduler } => {
+                    if *scheduler == DiffusionScheduler::DpmSolver {
+                        return Err(unsupported("PolicyHead{Diffusion}", scheduler));
+                    }
+                    let s = self.sampler(id, node, args, *horizon, *action_dim, *n_steps)?;
+                    let sched = diffusion_schedule(*n_steps, *scheduler);
+                    for (t, sigma) in sched.sigma.iter().enumerate() {
+                        if *sigma != 0.0 {
+                            self.exact(id, &format!("noise_{t}"), vec![s.x_dim]);
+                        }
+                    }
+                    self.needs_ddpm = true;
+                    self.member(
+                        id,
+                        &format!(
+                            "_DdpmHead({}, {}, {horizon}, {action_dim}, {n_steps}, {}, {}, {})",
+                            s.x_dim,
+                            s.cond,
+                            json_f32s(&sched.c1),
+                            json_f32s(&sched.c3),
+                            json_f32s(&sched.sigma),
+                        ),
+                    );
+                    Ok(s.call)
+                }
+                HeadKind::FlowMatching { n_steps } => {
+                    let s = self.sampler(id, node, args, *horizon, *action_dim, *n_steps)?;
+                    self.needs_flow = true;
+                    self.member(
+                        id,
+                        &format!(
+                            "_FlowHead({}, {}, {horizon}, {action_dim}, {n_steps})",
+                            s.x_dim, s.cond
+                        ),
+                    );
+                    Ok(s.call)
+                }
                 other => Err(unsupported("PolicyHead", other)),
             },
 
@@ -418,6 +668,15 @@ impl Lowering {
                  \x20   return m\n",
             );
         }
+        if self.needs_sampler {
+            source.push_str(SAMPLER_PY);
+        }
+        if self.needs_ddpm {
+            source.push_str(DDPM_PY);
+        }
+        if self.needs_flow {
+            source.push_str(FLOW_PY);
+        }
         source.push_str(
             "\n\nclass EsPolicy(nn.Module):\n    def __init__(self):\n        super().__init__()\n",
         );
@@ -445,6 +704,12 @@ impl Lowering {
 /// A Python float list. `serde_json` renders f64 shortest-round-trip, which is both exact and
 /// stable, so two lowerings of the same statistics are byte-identical.
 fn json_floats(values: &[f64]) -> String {
+    serde_json::to_string(values).unwrap_or_else(|_| "[]".to_owned())
+}
+
+/// The same for f32: shortest round-trip, so the literal Python parses back to the exact f32
+/// the schedule computed.
+fn json_f32s(values: &[f32]) -> String {
     serde_json::to_string(values).unwrap_or_else(|_| "[]".to_owned())
 }
 
@@ -535,22 +800,206 @@ mod tests {
 
     #[test]
     fn deferred_heads_are_unsupported_not_silently_wrong() {
-        use es_ir::learning::{ArchKind, DiffusionScheduler};
+        use es_ir::learning::ArchKind;
         let mut g = act();
-        g.policy.architecture = ArchKind::Diffusion;
+        g.policy.architecture = ArchKind::Discrete;
         let LearningNode::PolicyHead { kind, .. } = g.nodes.nodes.get_mut(&NodeId(4)).unwrap()
         else {
             unreachable!()
         };
-        *kind = HeadKind::Diffusion {
-            n_steps: 100,
-            scheduler: DiffusionScheduler::Ddpm,
-        };
+        *kind = HeadKind::Discrete { vocab: 256 };
         let err = lower_to_torch(&g).unwrap_err();
         assert!(
-            matches!(&err, LowerError::Unsupported(k) if k.starts_with("PolicyHead{Diffusion")),
+            matches!(&err, LowerError::Unsupported(k) if k.starts_with("PolicyHead{Discrete")),
             "{err}"
         );
+    }
+
+    // --- sampler heads (design note section 8) ----------------------------------------------
+
+    use crate::reference::{sampler_graph, N_STEPS};
+
+    fn sampler(kind: HeadKind) -> LearningGraph {
+        sampler_graph(
+            kind,
+            es_ir::learning::WeightsRef::Safetensors {
+                path: "w.safetensors".to_owned(),
+                hash: [0u8; 32],
+            },
+        )
+    }
+
+    fn ddpm() -> LearningGraph {
+        sampler(HeadKind::Diffusion {
+            n_steps: N_STEPS,
+            scheduler: DiffusionScheduler::Ddpm,
+        })
+    }
+
+    fn flow() -> LearningGraph {
+        sampler(HeadKind::FlowMatching { n_steps: N_STEPS })
+    }
+
+    #[test]
+    fn sampler_lowering_is_byte_identical_across_runs() {
+        for g in [ddpm(), flow()] {
+            let a = lower_to_torch(&g).unwrap();
+            let b = lower_to_torch(&g.clone()).unwrap();
+            assert_eq!(a.source, b.source);
+            assert_eq!(a.lowering_hash, b.lowering_hash);
+            assert_eq!(a.weight_keys, b.weight_keys);
+        }
+        // The step count is part of the architecture, so it must move the hash.
+        let other = sampler(HeadKind::FlowMatching { n_steps: 9 });
+        assert_ne!(
+            lower_to_torch(&flow()).unwrap().lowering_hash,
+            lower_to_torch(&other).unwrap().lowering_hash
+        );
+        // So must the scheduler, which only changes the emitted coefficients.
+        let ddim = sampler(HeadKind::Diffusion {
+            n_steps: N_STEPS,
+            scheduler: DiffusionScheduler::Ddim,
+        });
+        assert_ne!(
+            lower_to_torch(&ddpm()).unwrap().lowering_hash,
+            lower_to_torch(&ddim).unwrap().lowering_hash
+        );
+    }
+
+    #[test]
+    fn the_sampling_loop_is_in_the_source_with_the_declared_step_count() {
+        let d = lower_to_torch(&ddpm()).unwrap();
+        assert!(d.source.contains("class _DdpmHead"), "{}", d.source);
+        assert!(d
+            .source
+            .contains("for t in range(self.n_steps - 1, -1, -1):"));
+        assert!(d.source.contains("_sinusoidal(float(t), self.cond)"));
+        // x_dim = H*A = 6, cond = 16, and the literal step count.
+        assert!(
+            d.source.contains("_DdpmHead(6, 16, 3, 2, 8, ["),
+            "{}",
+            d.source
+        );
+        assert!(!d.source.contains("class _FlowHead"));
+        assert!(!d.source.contains("torchvision"));
+
+        let f = lower_to_torch(&flow()).unwrap();
+        assert!(f.source.contains("class _FlowHead"), "{}", f.source);
+        assert!(f.source.contains("for i in range(self.n_steps):"));
+        assert!(f.source.contains("x = x + dt * v"));
+        assert!(f.source.contains("_FlowHead(6, 16, 3, 2, 8)"));
+        assert!(!f.source.contains("class _DdpmHead"));
+        // Both share one denoiser definition.
+        assert!(d.source.contains("class _Denoiser") && f.source.contains("class _Denoiser"));
+        assert!(d.source.contains("return {\"actions\": v1_chunk}"));
+    }
+
+    #[test]
+    fn ddpm_declares_a_noise_buffer_per_stochastic_step_and_ddim_declares_none() {
+        let d = lower_to_torch(&ddpm()).unwrap();
+        let noise: Vec<&String> = d
+            .weight_keys
+            .iter()
+            .filter(|k| k.contains(".noise_"))
+            .collect();
+        // t = 0 is the final, noise-free step, so 7 draws for 8 steps.
+        assert_eq!(noise.len(), N_STEPS as usize - 1, "{noise:?}");
+        assert!(!noise.iter().any(|k| k.ends_with("noise_0")));
+        assert_eq!(d.weight_shapes["nodes.1.noise_1"], vec![6]);
+
+        // The denoiser's own keys: [x_dim + cond + cond] in, cond hidden, x_dim out.
+        assert_eq!(d.weight_shapes["nodes.1.net.l0.weight"], vec![16, 38]);
+        assert_eq!(d.weight_shapes["nodes.1.net.l0.bias"], vec![16]);
+        assert_eq!(d.weight_shapes["nodes.1.net.l1.weight"], vec![6, 16]);
+        assert_eq!(d.weight_shapes["nodes.1.net.l1.bias"], vec![6]);
+
+        for g in [
+            sampler(HeadKind::Diffusion {
+                n_steps: N_STEPS,
+                scheduler: DiffusionScheduler::Ddim,
+            }),
+            flow(),
+        ] {
+            let m = lower_to_torch(&g).unwrap();
+            assert!(!m.weight_keys.iter().any(|k| k.contains(".noise_")));
+            assert!(m.weight_keys.iter().all(|k| !k.ends_with(".*")));
+        }
+    }
+
+    /// A checkpoint for one head must not load into the other, and a missing noise draw must
+    /// not be silently replaced by zeros.
+    #[test]
+    fn the_key_set_binds_the_checkpoint_to_the_head() {
+        use crate::weights::{parse_header, validate_keys, write_safetensors};
+        let d = lower_to_torch(&ddpm()).unwrap();
+        let f = lower_to_torch(&flow()).unwrap();
+        let ck = crate::reference::checkpoint(&d.weight_shapes, 7);
+        let header = parse_header(&write_safetensors(&ck)).unwrap();
+        validate_keys(&d, &header).unwrap();
+
+        let err = validate_keys(&f, &header).unwrap_err();
+        let crate::PolicyError::WeightMismatch { unexpected, .. } = &err else {
+            panic!("{err}")
+        };
+        assert_eq!(unexpected.len(), N_STEPS as usize - 1, "{unexpected:?}");
+
+        let mut short = ck;
+        short.remove("nodes.1.noise_3");
+        let header = parse_header(&write_safetensors(&short)).unwrap();
+        let err = validate_keys(&d, &header).unwrap_err();
+        let crate::PolicyError::WeightMismatch { missing, .. } = &err else {
+            panic!("{err}")
+        };
+        assert_eq!(missing, &["nodes.1.noise_3"]);
+    }
+
+    #[test]
+    fn a_sampler_head_without_a_noise_input_does_not_lower() {
+        let mut g = ddpm();
+        let LearningNode::PolicyHead { inputs, .. } = g.nodes.nodes.get_mut(&NodeId(1)).unwrap()
+        else {
+            unreachable!()
+        };
+        inputs.pop();
+        g.inputs.pop();
+        g.nodes.inputs.pop();
+        g.policy.contract.inputs.remove("noise");
+        let err = lower_to_torch(&g).unwrap_err();
+        assert!(
+            matches!(&err, LowerError::Shape { message, .. } if message.contains("initial noise")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn dpm_solver_is_unsupported_rather_than_approximated() {
+        let err = lower_to_torch(&sampler(HeadKind::Diffusion {
+            n_steps: N_STEPS,
+            scheduler: DiffusionScheduler::DpmSolver,
+        }))
+        .unwrap_err();
+        assert!(
+            matches!(&err, LowerError::Unsupported(k) if k == "PolicyHead{Diffusion}{DpmSolver}"),
+            "{err}"
+        );
+    }
+
+    /// The schedule is the one the design note writes down: `alpha_bar` decreasing, DDPM noisy
+    /// except at the last step, DDIM noise-free throughout.
+    #[test]
+    fn the_schedule_matches_the_documented_form() {
+        let d = diffusion_schedule(8, DiffusionScheduler::Ddpm);
+        assert!(d.sigma[0].abs() < f32::EPSILON);
+        assert!(d.sigma[1..].iter().all(|s| *s > 0.0), "{:?}", d.sigma);
+        // beta grows with t, so 1/sqrt(alpha) does too, and the eps coefficient is negative.
+        assert!(d.c1.windows(2).all(|w| w[1] > w[0]), "{:?}", d.c1);
+        assert!(d.c3.iter().all(|c| *c < 0.0), "{:?}", d.c3);
+
+        let i = diffusion_schedule(8, DiffusionScheduler::Ddim);
+        assert!(i.sigma.iter().all(|s| *s == 0.0));
+        // eta = 0 leaves x_t untouched between steps whose alpha_bar barely moves.
+        assert!(i.c1.iter().all(|c| *c > 1.0), "{:?}", i.c1);
+        assert_eq!(diffusion_schedule(1, DiffusionScheduler::Ddpm).c1.len(), 1);
     }
 
     #[test]
