@@ -8,8 +8,10 @@ Canonical spec: `docs/ARCHITECTURE.ko.md`. Agent rules: `AGENTS.md`, `CLAUDE.md`
 
 ## Status
 
-M0 (contracts) in progress. Crates: `es-math`, `es-core`, `es-ir`, `es-assets`,
-`es-physics-core`, `es-physics-backend`, `es-telemetry`; verification via `cargo xtask ci`.
+M0 (contracts) complete; M1 (vision vertical slice) implemented for everything that runs
+without a GPU or network. See `docs/reviews/` for milestone reviews and `docs/packets/`
+for work packets. Verification via `cargo xtask ci`; `es --check-deps` lists which
+optional oracles (MuJoCo, MJWarp, PyTorch) are available.
 
 ```bash
 git config core.hooksPath .githooks

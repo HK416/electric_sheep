@@ -5,16 +5,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project status
 
 `docs/ARCHITECTURE.ko.md` (the v1.0 technical spec, ~3000 lines, in Korean) is the canonical
-source of truth; `docs/ARCHITECTURE.md` is reserved for the English translation (not yet
-present). Implementation of M0 (spec §28.2) is under way as a Cargo workspace: `xtask/`
-(verification entry point), `crates/es-math`, `es-core`, `es-ir`, `es-assets`,
-`es-physics-core`, `es-physics-backend`, `es-telemetry`. Work packets live in
-`docs/packets/M0/`, design notes in `docs/design/`, pinned external API digests in
-`docs/api-notes/`. Before adding anything, read the relevant `docs/ARCHITECTURE.ko.md`
-section (§ numbers below) — it is prescriptive, not aspirational, and pins exact type
-signatures, error codes, and invariants. Gate every change with
+source of truth; `docs/ARCHITECTURE.md` is its English translation. M0 (contracts) is
+complete and reviewed (`docs/reviews/M0.md`); M1 (vision vertical slice) is implemented for
+everything that runs without a GPU or network (`docs/reviews/M1.md`). Cargo workspace:
+`xtask/` (verification entry point), `crates/es` (CLI), `es-editor`, and the library crates
+listed in the layering table below (`es-ir-types` at layer 2 holds the graph-agnostic IR
+types split out of `es-ir`). Work packets live in `docs/packets/<milestone>/`, design notes
+in `docs/design/`, pinned external API digests in `docs/api-notes/`, milestone reviews in
+`docs/reviews/`. Every document under `docs/` has a Korean sibling `<name>.ko.md`; keep
+the pairing when adding or changing docs. Before adding anything, read the relevant
+`docs/ARCHITECTURE.ko.md` section (§ numbers below) — it is prescriptive, not aspirational,
+and pins exact type signatures, error codes, and invariants. Gate every change with
 `cargo xtask ci` (fmt, clippy `-D warnings`, tests incl. `es-ir/testing` property tests,
-context-budget, layering, spec-refs, goldens).
+context-budget, layering, spec-refs, goldens). Reference oracles that need Python packages
+(MuJoCo, MJWarp, PyTorch) skip with a printed reason when the package is missing; set
+`ES_PYTHON` to an interpreter that has them to run them for real.
 
 ## What this is
 
