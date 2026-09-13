@@ -13,6 +13,7 @@
 
 pub mod identity;
 pub mod lerobot;
+pub mod lerobot_config;
 
 use std::path::{Path, PathBuf};
 

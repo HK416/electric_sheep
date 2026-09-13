@@ -1,0 +1,29 @@
+{
+  "type": "diffusion",
+  "input_features": {
+    "observation.images.top": { "type": "VISUAL", "shape": [3, 480, 640] },
+    "observation.state": { "type": "STATE", "shape": [8] }
+  },
+  "output_features": {
+    "action": { "type": "ACTION", "shape": [8] }
+  },
+  "normalization_mapping": {
+    "VISUAL": "MEAN_STD",
+    "STATE": "MEAN_STD",
+    "ACTION": "MEAN_STD"
+  },
+  "horizon": 16,
+  "n_action_steps": 8,
+  "n_obs_steps": 2,
+  "crop_shape": [216, 288],
+  "crop_is_random": true,
+  "use_group_norm": true,
+  "down_dims": [512, 1024, 2048],
+  "kernel_size": 5,
+  "noise_scheduler_type": "DDPM",
+  "num_train_timesteps": 100,
+  "beta_schedule": "squaredcos_cap_v2",
+  "prediction_type": "epsilon",
+  "num_inference_steps": 10,
+  "optimizer_lr": 1e-4
+}

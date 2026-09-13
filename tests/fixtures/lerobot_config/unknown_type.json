@@ -1,0 +1,9 @@
+{
+  "type": "smolvla",
+  "input_features": {
+    "observation.images.top": { "type": "VISUAL", "shape": [3, 224, 224] }
+  },
+  "output_features": {
+    "action": { "type": "ACTION", "shape": [8] }
+  }
+}

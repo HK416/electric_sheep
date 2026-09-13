@@ -1,0 +1,32 @@
+{
+  "type": "act",
+  "input_features": {
+    "observation.images.top": { "type": "VISUAL", "shape": [3, 224, 224] },
+    "observation.state": { "type": "STATE", "shape": [8] }
+  },
+  "output_features": {
+    "action": { "type": "ACTION", "shape": [8] }
+  },
+  "normalization_mapping": {
+    "VISUAL": "MEAN_STD",
+    "STATE": "MEAN_STD",
+    "ACTION": "MEAN_STD"
+  },
+  "chunk_size": 50,
+  "n_action_steps": 20,
+  "n_obs_steps": 1,
+  "vision_backbone": "resnet18",
+  "pretrained_backbone_weights": "ResNet18_Weights.IMAGENET1K_V1",
+  "dim_model": 512,
+  "n_heads": 8,
+  "dim_feedforward": 3200,
+  "n_encoder_layers": 4,
+  "n_decoder_layers": 1,
+  "use_vae": true,
+  "latent_dim": 32,
+  "temporal_ensemble_coeff": null,
+  "dropout": 0.1,
+  "kl_weight": 10.0,
+  "optimizer_lr": 1e-5,
+  "optimizer_weight_decay": 1e-4
+}
