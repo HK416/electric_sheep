@@ -6,11 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `docs/ARCHITECTURE.ko.md` (the v1.0 technical spec, ~3000 lines, in Korean) is the canonical
 source of truth; `docs/ARCHITECTURE.md` is its English translation. M0 (contracts), M1
-(vision vertical slice) and M2 (evaluation, batch domains, policy extension) are implemented
-and reviewed for everything that runs without a GPU or network (`docs/reviews/M0.md`,
-`M1.md`, `M2.md`; review follow-ups are `docs/packets/<M>/P-<M>-R<n>.md`). M3 work starts
-with the offline-verifiable waves (embedded no-std runtime, Safety Case evidence bundle,
-learning loop CLI, domain-gap diagnostics, 3DGS importer, editable graph editor). Cargo workspace:
+(vision vertical slice), M2 (evaluation, batch domains, policy extension) and the offline
+waves of M3 (no-std embedded runtime, 3DGS importer, domain-gap diagnostics, Safety Case
+evidence bundle, editable graph editor, learning loop) are implemented and reviewed for
+everything that runs without a GPU, network or robot hardware (`docs/reviews/M0.md` ..
+`M3.md`; review follow-ups are `docs/packets/<M>/P-<M>-R<n>.md`). Still open and needing
+hardware, network or a human: M3 W1 real-robot interface/HIL/cameras, M2 W4 Newton
+backend, the 4,096-env and ±10% memory gates, a real LeRobot checkpoint (M1-R2), the
+Python builder (`es-py`), GPU lowering and rendering (M1 W2/W3 remainder, M4). Cargo workspace:
 `xtask/` (verification entry point), `crates/es` (CLI), `es-editor`, and the library crates
 listed in the layering table below (`es-ir-types` at layer 2 holds the graph-agnostic IR
 types split out of `es-ir`). Work packets live in `docs/packets/<milestone>/`, design notes

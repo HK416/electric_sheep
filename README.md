@@ -8,8 +8,8 @@ Canonical spec: `docs/ARCHITECTURE.ko.md`. Agent rules: `AGENTS.md`, `CLAUDE.md`
 
 ## Status
 
-M0 (contracts), M1 (vision vertical slice) and M2 (evaluation and extension) implemented and
-reviewed for everything that runs without a GPU or network; M3 offline waves in progress. See `docs/reviews/` for milestone reviews and `docs/packets/`
+M0–M2 and the offline waves of M3 are implemented and reviewed for everything that runs
+without a GPU, network or robot hardware; see `docs/reviews/` for what remains open. See `docs/reviews/` for milestone reviews and `docs/packets/`
 for work packets. Verification via `cargo xtask ci`; `es --check-deps` lists which
 optional oracles (MuJoCo, MJWarp, PyTorch) are available.
 
