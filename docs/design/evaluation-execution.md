@@ -30,6 +30,7 @@ for suite in ir.suites                     # a row of the §10.1 table
   for episode in 0 .. ir.episodes.n_episodes
       overrides = plan.apply_at_reset(suite_id, episode)
       env.reset()
+      cpu_plan.reset()                               # §2.4: the observation stream ends here
       loop
           inputs  = capture(env.backend().state())      # §2.3
           if plan step-drops this frame: reuse the held observation, age it
@@ -79,10 +80,16 @@ What makes that hold here:
 - The two escape hatches are named in the lock, not hidden: `execution_hash` covers the
   runtime and the hardware capability, `evaluation_hash` covers the conditions.
 
-### 2.2 INV-15 — augmentation refusal
+### 2.2 INV-15 — augmentation auto-disable, then refusal
 
-Before anything runs, the Observation IR is scanned for `ObservationNode::Augment`. A node
-that is not in `AugmentationPolicy::AllowList` is `EvalError::AugmentationEnabled`. The
+§10.4 says augmentation is *auto-disabled* in evaluation, and that is what the plan does: a
+`training_only` `Augment` node lowers to an identity pass-through
+(`docs/design/observation-lowering.md` §3), so it cannot run here and needs no allow-list
+entry. The refusal is what is left over.
+
+Before anything runs, the Observation IR is scanned for an `ObservationNode::Augment` that is
+**not** `training_only` — one that would actually execute. A node like that which is
+not in `AugmentationPolicy::AllowList` is `EvalError::AugmentationEnabled`. The
 graph is **not** rewritten and the node is **not** stripped: silently editing the
 observation pipeline would change `observation_hash` relative to what the caller thinks it
 evaluated, and the report would then attest to a graph that was never declared. The author
@@ -110,6 +117,31 @@ The `CpuPlan`'s input buffers are named by the `StableId` of the `ImageInput` se
 observation is refused by name rather than fed zeros. A cell that silently evaluated a
 policy on black frames would produce a number, and a wrong number in this table is worse
 than no table.
+
+### 2.4 Plan state is per episode (P-M2-R1)
+
+One `CpuPlan` is compiled per run, but a `TemporalWindow` ring is a *stream*, and a stream
+ends where an episode does. `run_episode` therefore calls `CpuPlan::reset()` right after
+`env.reset`, which refills every ring to the state `compile` left it in
+(`docs/design/observation-lowering.md` §9.1). Without it the first frames of every episode
+after the first would carry the previous episode's tail, and the first episode of cell 2 would
+carry cell 1's — so the §10.1 table would depend on the order the suites were declared in.
+The oracle reverses the suite order over a windowed observation and asserts every cell is
+unchanged.
+
+Note what this does *not* cover: a `Perturbation` draw is keyed by the suite's **position**
+(`EnvRng::new(seed, cell_index, episode, stream)`), so reordering suites does legitimately
+change a perturbed suite's draws. The order-independence oracle therefore uses two
+perturbation-free suites. Keying the stream on the suite *name* instead is a separate
+question about §10.4's `suite_id`, not about plan state.
+
+### 2.5 `nu != NJ` is an error (P-M2-R7)
+
+`NJ` is the deployment's joint count, and the loaded model has to agree: `run_episode` refuses
+with `EvalError::JointMismatch` unless `model.nu == NJ` and the model carries at least `NJ`
+`qpos`/`qvel` entries. Nothing is broadcast and nothing is padded — a `ctrl` vector filled
+with copies of joint `NJ−1`, or a safety input padded with `0.0`, is a wrong number in the
+§10.1 table, which is worse than a refused run.
 
 ## 3. Perturbation realisation (`perturb.rs`)
 

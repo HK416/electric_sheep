@@ -228,13 +228,21 @@ impl Evaluation {
     }
 }
 
-/// INV-15. An `Augment` node outside the allow-list refuses the run; the graph is never
-/// rewritten, because stripping a node would make `observation_hash` describe a graph the
-/// caller never declared.
+/// INV-15. A `training_only` `Augment` node is *auto-disabled* (§10.4): `CpuPlan::compile`
+/// lowers it to an identity pass-through, so it cannot run here and does not need the
+/// allow-list. Any other `Augment` node outside the allow-list refuses the run; the graph is
+/// never rewritten, because stripping a node would make `observation_hash` describe a graph
+/// the caller never declared.
 fn refuse_augmentation(ir: &EvaluationIr, obs: &ObservationIr) -> Result<(), EvalError> {
     use es_ir::evaluation::AugmentationPolicy;
     for (id, node) in &obs.graph.nodes {
-        if !matches!(node, ObservationNode::Augment { .. }) {
+        if !matches!(
+            node,
+            ObservationNode::Augment {
+                training_only: false,
+                ..
+            }
+        ) {
             continue;
         }
         let key = id.0.to_string();
@@ -291,13 +299,26 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     mode: ExecutionMode,
     seq: &mut u64,
 ) -> Result<Episode, EvalError> {
+    let (nu, nq, nv) = {
+        let m = env.model();
+        (m.nu as usize, m.nq as usize, m.nv as usize)
+    };
+    // The deployment's NJ *is* the actuator count; a model that disagrees would otherwise be
+    // driven by a broadcast copy of joint NJ-1 and observed through zero-padded state.
+    if nu != NJ || nq < NJ || nv < NJ {
+        return Err(EvalError::JointMismatch { nu, nq, nv, nj: NJ });
+    }
+
     env.reset(None)?;
+    // An episode is where an observation stream ends (spec 7.5 layer 1): without this, the
+    // first frames of this episode would see the tail of the previous one, and cell 2 would
+    // see cell 1 — making the §10.1 table depend on suite order (§10.4).
+    plan.reset();
     // A latch left over from the previous episode would poison the rest of the cell. Clearing
     // it is not disabling the plane (INV-12): the envelope, watchdogs and counters are
     // untouched and the next violation latches again.
     safety.reset_latch();
 
-    let nu = env.model().nu as usize;
     let mut overrides = ResetOverrides::default();
     perturbations.apply_at_reset(cell, seed, episode, &mut overrides);
     let hold = vec![0.0; nu];
@@ -358,9 +379,8 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         let age = Micros(((ring.len().saturating_sub(1) as u64) + extra_age) * control_us);
         let safe = safety.validate(&chunk, age, env.tick());
 
-        for (i, v) in ctrl.iter_mut().enumerate() {
-            *v = safe.q[i.min(NJ - 1)];
-        }
+        // `nu == NJ` was checked at run start, so this is a copy, not a broadcast.
+        ctrl.copy_from_slice(&safe.q);
         step_state.apply_per_step(&mut ctrl);
         let out = env.step(&ctrl)?;
         if let Some(ep) = out.episodes.into_iter().next() {
@@ -431,14 +451,12 @@ fn capture(
     Ok((descs, bytes))
 }
 
-/// The first `NJ` joint positions and velocities of env 0.
+/// The first `NJ` joint positions and velocities of env 0. Nothing is padded: `run_episode`
+/// refused the run unless the model carries at least `NJ` of each.
 fn joint_state<const NJ: usize>(state: &StateView<'_>) -> ([f64; NJ], [f64; NJ]) {
     let (mut q, mut qd) = ([0.0; NJ], [0.0; NJ]);
-    let (qpos, qvel) = (state.qpos_of(0), state.qvel_of(0));
-    for i in 0..NJ {
-        q[i] = qpos.get(i).copied().unwrap_or(0.0);
-        qd[i] = qvel.get(i).copied().unwrap_or(0.0);
-    }
+    q.copy_from_slice(&state.qpos_of(0)[..NJ]);
+    qd.copy_from_slice(&state.qvel_of(0)[..NJ]);
     (q, qd)
 }
 

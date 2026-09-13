@@ -523,6 +523,25 @@ impl CpuPlan {
                 };
                 self.emit(produced, id, feeds, op, out);
             }
+            // INV-15 (spec 7.3, spec 10.4), realised structurally: this plan is the
+            // evaluation / deployment path — there are no augmentation kernels on it and
+            // there is no training mode to reach them from — so a `training_only` node is an
+            // identity pass-through. The node is not removed from the graph, so
+            // `observation_hash` still describes what the author declared; it simply produces
+            // no step and its consumers read the upstream buffer. A node that is *not*
+            // `training_only` would have to run here, and cannot: `COMPILE-002`. (Augmentation
+            // kernels, and with them a training plan mode, are a later packet.)
+            ObservationNode::Augment { training_only, .. } => {
+                if !*training_only {
+                    diags.push(unsupported("Augment outside training_only", id));
+                    return;
+                }
+                let Some(&src) = feeds.first() else {
+                    diags.push(unsupported("Augment without an input", id));
+                    return;
+                };
+                produced.insert(id, src);
+            }
             other => diags.push(unsupported(other.kind(), id)),
         }
 
@@ -541,6 +560,21 @@ impl CpuPlan {
                 });
                 produced.insert(id, out);
             }
+        }
+    }
+
+    /// Clears every stateful buffer back to the state a freshly compiled plan is in.
+    ///
+    /// The `TemporalWindow` rings are the only state a plan carries (spec 7.5 layer 1), and a
+    /// stream ends at an episode boundary: `es-eval` calls this after every `env.reset` so
+    /// episode N's first frames cannot see episode N-1's tail, and cell 2's cannot see cell
+    /// 1's. Without it the §10.1 table would depend on suite order — the one thing §10.4
+    /// exists to prevent.
+    pub fn reset(&mut self) {
+        for ring in self.rings.values_mut() {
+            ring.data.fill(0.0);
+            ring.cursor = 0;
+            ring.pushed = 0;
         }
     }
 

@@ -107,6 +107,8 @@ fn model() -> ModelInfo {
 /// A spring-damper integrator: deterministic, transcendental-free (§3.4).
 #[derive(Debug)]
 struct FakeBackend {
+    /// Actuators beyond the scene's two, so a `nu != NJ` model can be loaded (P-M2-R7).
+    nu_extra: u32,
     caps: Capabilities,
     model: Option<ModelInfo>,
     qpos: Vec<f64>,
@@ -117,8 +119,17 @@ struct FakeBackend {
 }
 
 impl FakeBackend {
+    /// The same integrator with one actuator more than the deployment declares joints.
+    fn wide() -> Self {
+        Self {
+            nu_extra: 1,
+            ..Self::new()
+        }
+    }
+
     fn new() -> Self {
         Self {
+            nu_extra: 0,
             caps: Capabilities {
                 name: "fake".to_owned(),
                 determinism: DeterminismTier::Bitwise,
@@ -153,6 +164,7 @@ impl PhysicsBackend for FakeBackend {
     fn load(&mut self, _scene: &SceneDesc, cfg: &LoadConfig) -> Result<ModelInfo, PhysicsError> {
         let info = ModelInfo {
             n_envs: cfg.n_envs,
+            nu: model().nu + self.nu_extra,
             ..model()
         };
         let n = cfg.n_envs as usize;
@@ -412,7 +424,8 @@ fn task_ir() -> TaskIr {
 }
 
 /// `StateInput(j0) -> Normalize`. No image input: there is no renderer in this build.
-fn observation_ir(task_ref: [u8; 32], augment: bool) -> ObservationIr {
+/// `augment` appends an `Augment` node with that `training_only` flag.
+fn observation_ir(task_ref: [u8; 32], augment: Option<bool>) -> ObservationIr {
     let raw = joint_ty(Unit::Angle);
     let norm = PortType {
         unit: Unit::Normalized { lo: -1.0, hi: 1.0 },
@@ -435,12 +448,12 @@ fn observation_ir(task_ref: [u8; 32], augment: bool) -> ObservationIr {
     );
     ir.graph.connect(NodeId(0), "out", NodeId(1), "in0");
     let mut last = NodeId(1);
-    if augment {
+    if let Some(training_only) = augment {
         ir.graph.insert(
             NodeId(2),
             ObservationNode::Augment {
                 kind: AugmentKind::GaussianNoise { sigma: 0.01 },
-                training_only: true,
+                training_only,
                 io: Io::unary(norm.clone(), norm.clone()),
             },
         );
@@ -454,6 +467,47 @@ fn observation_ir(task_ref: [u8; 32], augment: bool) -> ObservationIr {
             ty: norm,
         },
     )]);
+    ir
+}
+
+/// `StateInput(j0) -> Normalize -> TemporalWindow(n = 2)`. The policy reads the first element
+/// of the window, which is the *oldest* frame, so anything left in the ring by a previous
+/// episode or cell changes this cell's numbers — the leak P-M2-R1 closes.
+fn windowed_observation_ir(task_ref: [u8; 32]) -> ObservationIr {
+    let mut ir = observation_ir(task_ref, None);
+    let norm = ir.outputs["joint_state"].ty.clone();
+    let windowed = PortType {
+        shape: Shape::new([2, 1]),
+        time: TimeRef::Window {
+            base: Box::new(norm.time.clone()),
+            n: 2,
+            stride: 1,
+        },
+        ..norm.clone()
+    };
+    // Layer 1 of spec 7.5: the ring the window reaches back over.
+    ir.temporal
+        .history
+        .insert(joint_id("j0"), es_ir::observation::History { depth: 2 });
+    ir.graph.insert(
+        NodeId(2),
+        ObservationNode::TemporalWindowNode {
+            window: es_ir::observation::TemporalWindow {
+                n_steps: 2,
+                stride: 1,
+                align: es_ir::types::Align::Hold,
+            },
+            io: Io::unary(norm, windowed.clone()),
+        },
+    );
+    ir.graph.connect(NodeId(1), "out", NodeId(2), "in0");
+    ir.outputs.insert(
+        "joint_state".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(NodeId(2), "out"),
+            ty: windowed,
+        },
+    );
     ir
 }
 
@@ -571,18 +625,35 @@ fn basic_metrics() -> Vec<MetricSpec> {
 
 fn run_with(
     ir: &EvaluationIr,
-    obs_augment: bool,
+    obs_augment: Option<bool>,
     target: f64,
 ) -> Result<EvaluationReport, EvalError> {
     let task = task_ir();
     let obs = observation_ir(task.task_hash().expect("task hashes"), obs_augment);
+    run_obs(ir, &obs, target)
+}
+
+/// The same run over a `TemporalWindow` observation: the plan then carries ring state across
+/// `run` calls, which is what P-M2-R1 is about.
+fn run_windowed(ir: &EvaluationIr) -> EvaluationReport {
+    let task = task_ir();
+    let obs = windowed_observation_ir(task.task_hash().expect("task hashes"));
+    run_obs(ir, &obs, 0.2).expect("the windowed fixture evaluation runs")
+}
+
+fn run_obs(
+    ir: &EvaluationIr,
+    obs: &ObservationIr,
+    target: f64,
+) -> Result<EvaluationReport, EvalError> {
+    let task = task_ir();
     let deploy = deployment_ir();
     let mut policy = FakePolicy { target };
     Evaluation::run::<FakeBackend, _, NJ, H>(
         ir,
         &task,
         &scene(),
-        &obs,
+        obs,
         &mut policy,
         &deploy,
         FakeBackend::new,
@@ -592,7 +663,7 @@ fn run_with(
 }
 
 fn run_ok(ir: &EvaluationIr) -> EvaluationReport {
-    run_with(ir, false, 0.2).expect("the fixture evaluation runs")
+    run_with(ir, None, 0.2).expect("the fixture evaluation runs")
 }
 
 // --- Tests --------------------------------------------------------------------------------
@@ -639,7 +710,7 @@ fn changing_the_seed_changes_at_least_one_metric() {
 fn artifacts_land_where_the_spec_says() {
     let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
     let task = task_ir();
-    let obs = observation_ir(task.task_hash().expect("task hashes"), false);
+    let obs = observation_ir(task.task_hash().expect("task hashes"), None);
     let mut policy = FakePolicy { target: 0.2 };
     let (report, lock) = Evaluation::run::<FakeBackend, _, NJ, H>(
         &ir,
@@ -710,24 +781,122 @@ fn an_unavailable_metric_never_passes_acceptance() {
 #[test]
 fn an_augment_node_outside_the_allow_list_is_refused() {
     let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
-    let err = run_with(&ir, true, 0.2).expect_err("INV-15 refuses the run");
+    let err = run_with(&ir, Some(false), 0.2).expect_err("INV-15 refuses the run");
     assert!(
         matches!(err, EvalError::AugmentationEnabled { .. }),
         "expected an INV-15 refusal, got {err}"
     );
 }
 
+/// The allow-list is honoured — the INV-15 refusal does not fire for a node named in it —
+/// and the run is then refused by the compiler, which has no augmentation kernel. Asserting
+/// the exact outcome, because `Ok(_) | Err(Plan(_))` would pass without the allow-list ever
+/// being read.
 #[test]
-fn an_allow_listed_augment_node_runs() {
+fn an_allow_listed_augment_node_gets_past_inv_15_and_dies_in_the_compiler() {
     let mut ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
     ir.augmentation = AugmentationPolicy::AllowList {
         nodes: BTreeSet::from(["2".to_owned()]),
         justification: "the fixture measures that the allow-list is honoured".to_owned(),
     };
-    // The plan has no Augment kernel yet, so this must fail in the compiler, not in INV-15.
-    match run_with(&ir, true, 0.2) {
-        Ok(_) | Err(EvalError::Plan(_)) => {}
-        Err(other) => panic!("the allow-list was not honoured: {other}"),
+    match run_with(&ir, Some(false), 0.2) {
+        Err(EvalError::Plan(msg)) => assert!(
+            msg.contains("augmentation") || msg.contains("Augment"),
+            "the compiler must name the node it cannot lower: {msg}"
+        ),
+        other => panic!("expected a compiler refusal, got {other:?}"),
+    }
+}
+
+/// INV-15 as §10.4 words it: a `training_only` node is *auto-disabled*, not refused. The plan
+/// lowers it to an identity pass-through, so the report must equal the one from the same
+/// graph without the node.
+#[test]
+fn a_training_only_augment_node_is_disabled_not_refused() {
+    let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
+    let with = run_with(&ir, Some(true), 0.2).expect("a training_only node must not refuse");
+    let without = run_with(&ir, None, 0.2).expect("runs");
+    assert_eq!(
+        with.cells, without.cells,
+        "a disabled Augment node must change nothing it touches"
+    );
+}
+
+/// P-M2-R7. `nu != NJ` is an error at run start, never a broadcast of joint `NJ - 1`.
+#[test]
+fn a_model_with_more_actuators_than_joints_is_refused() {
+    let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
+    let task = task_ir();
+    let obs = observation_ir(task.task_hash().expect("task hashes"), None);
+    let mut policy = FakePolicy { target: 0.2 };
+    let err = Evaluation::run::<FakeBackend, _, NJ, H>(
+        &ir,
+        &task,
+        &scene(),
+        &obs,
+        &mut policy,
+        &deployment_ir(),
+        FakeBackend::wide,
+        &RunConfig::default(),
+    )
+    .expect_err("a 3-actuator model against NJ = 2 must refuse");
+    match err {
+        EvalError::JointMismatch { nu, nj, .. } => assert_eq!((nu, nj), (3, NJ)),
+        other => panic!("expected JointMismatch, got {other}"),
+    }
+}
+
+/// P-M2-R1. The plan's `TemporalWindow` rings are episode state: with them cleared per
+/// episode, a cell's numbers cannot depend on which suite ran before it.
+#[test]
+fn reversing_the_suite_order_leaves_every_cell_unchanged() {
+    let mut ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
+    // Two perturbation-free suites: `Perturbation` draws are keyed by the suite's *position*
+    // (`EnvRng::new(seed, cell, episode, stream)`), so a perturbed suite is order-dependent by
+    // construction and would test that derivation rather than the ring state.
+    ir.suites = vec![
+        PerturbationSuite {
+            name: "nominal_a".to_owned(),
+            perturbations: Vec::new(),
+        },
+        PerturbationSuite {
+            name: "nominal_b".to_owned(),
+            perturbations: Vec::new(),
+        },
+    ];
+    let forward = run_windowed(&ir);
+    for metric in basic_metrics() {
+        let of = |suite: &str| {
+            forward
+                .cells
+                .iter()
+                .find(|c| c.suite == suite && c.metric == metric)
+                .map(|c| c.value.clone())
+                .expect("the cell is measured")
+        };
+        assert_eq!(
+            of("nominal_a"),
+            of("nominal_b"),
+            "two identical suites must measure the same: {}",
+            metric.name()
+        );
+    }
+
+    ir.suites.reverse();
+    let reversed = run_windowed(&ir);
+    for cell in &forward.cells {
+        let other = reversed
+            .cells
+            .iter()
+            .find(|c| c.suite == cell.suite && c.metric == cell.metric)
+            .expect("the same cells, in the other order");
+        assert_eq!(
+            cell,
+            other,
+            "§10.4: {}.{} must not depend on suite order",
+            cell.suite,
+            cell.metric.name()
+        );
     }
 }
 
@@ -744,7 +913,7 @@ fn an_unsupported_perturbation_kind_is_named_not_skipped() {
             0,
         )],
     });
-    let err = run_with(&ir, false, 0.2).expect_err("an unrealisable kind refuses the run");
+    let err = run_with(&ir, None, 0.2).expect_err("an unrealisable kind refuses the run");
     match err {
         EvalError::Unsupported { kind, .. } => assert_eq!(kind, "light_intensity"),
         other => panic!("expected Unsupported, got {other}"),
@@ -754,8 +923,8 @@ fn an_unsupported_perturbation_kind_is_named_not_skipped() {
 #[test]
 fn the_envelope_violation_rate_rises_when_the_policy_leaves_the_envelope() {
     let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
-    let clean = rate_of(&run_with(&ir, false, 0.2).expect("runs"));
-    let wild = rate_of(&run_with(&ir, false, 100.0).expect("runs"));
+    let clean = rate_of(&run_with(&ir, None, 0.2).expect("runs"));
+    let wild = rate_of(&run_with(&ir, None, 100.0).expect("runs"));
     assert!(
         wild > 0.0,
         "commanding 100 rad against a 2.8 rad limit must show up as a violation"

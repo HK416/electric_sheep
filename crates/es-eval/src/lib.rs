@@ -11,8 +11,10 @@
 //!   never silently skipped;
 //! * a metric nobody measured is `es_ir::evaluation::MetricValue::Unavailable` carrying a
 //!   reason, never a fabricated `0.0`;
-//! * augmentation stays off (INV-15): an `Augment` node outside the allow-list is
-//!   [`EvalError::AugmentationEnabled`], and the graph is never rewritten to get past it.
+//! * augmentation stays off (INV-15): a `training_only` `Augment` node is auto-disabled by
+//!   the plan (it lowers to an identity pass-through, §10.4), any other one outside the
+//!   allow-list is [`EvalError::AugmentationEnabled`], and the graph is never rewritten to
+//!   get past either.
 
 pub mod metrics;
 pub mod perturb;
@@ -42,6 +44,18 @@ pub enum EvalError {
          justification"
     )]
     AugmentationEnabled { node: String },
+    /// The loaded model and the deployment's joint count disagree. Never broadcast, never
+    /// zero-padded: a wrong command is worse than a refused run (§10.1).
+    #[error(
+        "the model has {nu} actuators, {nq} qpos and {nv} qvel entries; the deployment \
+         declares {nj} joints"
+    )]
+    JointMismatch {
+        nu: usize,
+        nq: usize,
+        nv: usize,
+        nj: usize,
+    },
     #[error("evaluation IR is not valid: {0}")]
     InvalidIr(String),
     #[error("observation plan: {0}")]

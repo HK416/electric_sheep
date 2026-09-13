@@ -62,12 +62,27 @@ time, never a silent no-op.
 | `Concat{axis}` | `concat` | §8 |
 | `Stack{axis}` | `stack` | §8 |
 | `TemporalWindowNode` | `history_push` + `window_gather` | §9 |
+| `Augment{training_only}` | — | identity pass-through, §9.1 |
 | output elem ≠ `F32` | `cast_f32_to_f16` / `_bf16` | `half`, round-to-nearest-even |
-| `Pad`, `Undistort`, `Rectify`, `Warp`, `CameraProjection`, `ToGray`, `ChannelSelect`, `QuantizeU8`, `FrameStack`, `Delta`, `Mask`, `MultiViewPack`, `Augment`, `LanguageInput` | — | `COMPILE-002`, later waves |
+| `Pad`, `Undistort`, `Rectify`, `Warp`, `CameraProjection`, `ToGray`, `ChannelSelect`, `QuantizeU8`, `FrameStack`, `Delta`, `Mask`, `MultiViewPack`, `LanguageInput`, `Augment` (not `training_only`) | — | `COMPILE-002`, later waves |
 
-`Augment` will stay unimplemented on this path until the RNG stream contract exists; it is
-`training_only` (spec 7.3), and the evaluation path it would be wrong on is the path that
-matters first.
+### `Augment` and INV-15 (spec 7.3, spec 10.4)
+
+This plan is the evaluation and deployment path: there are no augmentation kernels on it and
+there is no training mode from which to reach them, so there is no `PlanOptions { training }`
+flag — the flag belongs in the packet that brings the kernels, and inventing it now would be a
+switch with one position. What the two node flavours lower to:
+
+| node | lowering |
+|---|---|
+| `Augment { training_only: true }` | identity: no step, no buffer; consumers read the producer's buffer |
+| `Augment { training_only: false }` | `COMPILE-002` |
+
+The identity case *is* how "evaluation disables augmentation" is realised (§10.4's
+auto-disable). The node is **not** removed from the graph: stripping it would make
+`observation_hash` describe a graph the author never declared. `es-eval` therefore no longer
+has to refuse a `training_only` node — the plan has already disabled it — and still refuses
+any other `Augment` node outside its allow-list.
 
 ### Determinism rules every kernel obeys (spec 3.4)
 
@@ -219,6 +234,16 @@ has filled, the oldest available frame is repeated (`Align::Hold`); `Align::Inte
 `Align::Reject` are `COMPILE-002` for now.
 
 Output shape is `[n_steps, ...frame_shape]`.
+
+### 9.1 `CpuPlan::reset` — the rings are the plan's only state
+
+A stream ends at an episode boundary. `CpuPlan::reset()` refills every ring with zeros and
+puts `cursor` and `pushed` back to 0, which is exactly the state `compile` leaves them in, so
+`reset(); run(x)` equals a freshly compiled plan's first `run(x)` (asserted in
+`crates/es-compile/tests/observation_cpu.rs`). `es-eval` calls it after every `env.reset`
+(P-M2-R1): without it, episode N's first frames see episode N−1's tail and cell 2's see cell
+1's, which makes the §10.1 table depend on suite order — the one thing §10.4 exists to
+prevent. Any future stateful buffer on this path must be cleared here too.
 
 ## 10. Plan, buffers, debug vs release (spec 11.5)
 

@@ -307,6 +307,164 @@ fn compiler_hash_separates_the_two_plans() {
     assert!(debug.buffer_of(NodeId(2)).is_some());
 }
 
+/// `StateInput([2] f32)` -> `TemporalWindow(n = 2, stride = 1)`, the smallest graph that
+/// carries plan state across `run` calls.
+fn windowed() -> ObservationIr {
+    let raw = PortType {
+        elem: ElemType::F32,
+        shape: Shape::new([2]),
+        unit: Unit::Angle,
+        frame: Frame::Joint(sensor()),
+        time: TimeRef::Sensor {
+            id: sensor(),
+            align: Align::Hold,
+        },
+        image: None,
+    };
+    let win = PortType {
+        shape: Shape::new([2, 2]),
+        time: TimeRef::Window {
+            base: Box::new(raw.time.clone()),
+            n: 2,
+            stride: 1,
+        },
+        ..raw.clone()
+    };
+    let mut ir = ObservationIr::new(1, [0u8; 32]);
+    ir.temporal
+        .history
+        .insert(sensor(), es_ir::observation::History { depth: 2 });
+    ir.graph.insert(
+        NodeId(0),
+        ObservationNode::StateInput {
+            source: sensor(),
+            io: Io::source(raw.clone()),
+        },
+    );
+    ir.graph.insert(
+        NodeId(1),
+        ObservationNode::TemporalWindowNode {
+            window: es_ir::observation::TemporalWindow {
+                n_steps: 2,
+                stride: 1,
+                align: Align::Hold,
+            },
+            io: Io::unary(raw, win.clone()),
+        },
+    );
+    ir.graph.connect(NodeId(0), OUT, NodeId(1), &in_port(0));
+    ir.graph.outputs.push(PortRef::new(NodeId(1), OUT));
+    ir.outputs.insert(
+        "joint_state".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(NodeId(1), OUT),
+            ty: win,
+        },
+    );
+    ir
+}
+
+fn run_state(plan: &mut CpuPlan, v: [f32; 2]) -> Vec<u8> {
+    let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let inputs = BTreeMap::from([(
+        sensor().to_string(),
+        TensorRef::new(ElemType::F32, [2], &bytes),
+    )]);
+    plan.run(&inputs).expect("runs")["joint_state"].data.clone()
+}
+
+/// P-M2-R1. A `run` after `reset` must equal a fresh plan's first `run`: the rings are the
+/// only state, and an episode boundary ends the stream (spec 7.5 layer 1, §10.4).
+#[test]
+fn reset_returns_the_plan_to_a_freshly_compiled_one() {
+    let ir = windowed();
+    let mut plan = CpuPlan::compile(&ir, PlanMode::Release).expect("compiles");
+    for v in [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]] {
+        let _ = run_state(&mut plan, v);
+    }
+    let leaked = run_state(&mut plan, [7.0, 8.0]);
+    plan.reset();
+    let after_reset = run_state(&mut plan, [7.0, 8.0]);
+
+    let mut fresh = CpuPlan::compile(&ir, PlanMode::Release).expect("compiles");
+    let first = run_state(&mut fresh, [7.0, 8.0]);
+    assert_eq!(after_reset, first, "reset must clear every ring");
+    assert_ne!(
+        leaked, first,
+        "the fixture must be history-sensitive, or the test proves nothing"
+    );
+    assert!(plan.rings.values().all(|r| r.pushed == 1 && r.cursor == 0));
+}
+
+/// P-M2-R2 / INV-15. A `training_only` `Augment` is an identity pass-through on this path,
+/// so a converted `LeRobot` graph that carries one still plans and still runs.
+#[test]
+fn a_training_only_augment_is_an_identity_pass_through() {
+    let plain = chain();
+    let mut ir = chain();
+    let out_ty = ir.outputs["rgb_front"].ty.clone();
+    ir.graph.insert(
+        NodeId(4),
+        ObservationNode::Augment {
+            kind: es_ir::observation::AugmentKind::GaussianNoise { sigma: 0.1 },
+            training_only: true,
+            io: Io::unary(out_ty.clone(), out_ty.clone()),
+        },
+    );
+    ir.graph.connect(NodeId(3), OUT, NodeId(4), &in_port(0));
+    ir.graph.outputs.clear();
+    ir.graph.outputs.push(PortRef::new(NodeId(4), OUT));
+    ir.outputs.insert(
+        "rgb_front".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(NodeId(4), OUT),
+            ty: out_ty,
+        },
+    );
+    assert!(ir.validate().is_empty(), "{:?}", ir.validate());
+
+    let mut with_augment = CpuPlan::compile(&ir, PlanMode::Release).expect("compiles");
+    let mut without = CpuPlan::compile(&plain, PlanMode::Release).expect("compiles");
+    assert_eq!(
+        with_augment.steps.len(),
+        without.steps.len(),
+        "an identity node must not emit a step"
+    );
+
+    let px = gradient_8x6();
+    let inputs = BTreeMap::from([(
+        sensor().to_string(),
+        TensorRef::new(ElemType::U8, [6, 8, 3], &px),
+    )]);
+    assert_eq!(
+        with_augment.run(&inputs).expect("runs")["rgb_front"],
+        without.run(&inputs).expect("runs")["rgb_front"]
+    );
+}
+
+/// An `Augment` that is *not* `training_only` would have to actually run here, and there is
+/// no augmentation kernel on this path: a diagnostic, never a silent identity.
+#[test]
+fn an_augment_that_is_not_training_only_is_a_diagnostic() {
+    let mut ir = chain();
+    let out_ty = ir.outputs["rgb_front"].ty.clone();
+    ir.graph.insert(
+        NodeId(4),
+        ObservationNode::Augment {
+            kind: es_ir::observation::AugmentKind::GaussianNoise { sigma: 0.1 },
+            training_only: false,
+            io: Io::unary(out_ty.clone(), out_ty),
+        },
+    );
+    ir.graph.connect(NodeId(3), OUT, NodeId(4), &in_port(0));
+    let errs = CpuPlan::compile(&ir, PlanMode::Release).unwrap_err();
+    assert!(
+        errs.iter()
+            .any(|d| d.code.as_str() == "OBS-041" || d.code.as_str() == "COMPILE-002"),
+        "{errs:?}"
+    );
+}
+
 #[test]
 fn an_unsupported_node_is_a_diagnostic_not_a_silent_no_op() {
     let mut ir = chain();
