@@ -15,12 +15,27 @@
 `crates/es-policy/tests/act_checkpoint.rs`는 둘을 정직하게 유지시키는 오라클이다 (spec §1.4).
 
 체크포인트는 절대 커밋하지 않는다. `target/lerobot-cache/`에 다운로드하며, 테스트는
-`ES_ACT_CHECKPOINT`를 통해 이를 찾는다:
+`ES_ACT_CHECKPOINT`를 통해 이를 찾는다. **INV-16**: `allow_patterns`는 상류에 하나가
+추가되더라도 어떤 `.bin`/`.pt`/`.ckpt`/`.pkl`(pickle)도 디스크에 올라오지 못하게 막고,
+`revision`은 이 파일이 검증된 정확한 커밋을 고정하며, 다운로드 후의 assertion은 같은
+불변식에 대한 두 번째의 독립적인 검사다:
 
 ```
-python -c "from huggingface_hub import snapshot_download; \
-  snapshot_download('lerobot/act_aloha_sim_transfer_cube_human', \
-    local_dir='target/lerobot-cache/act_aloha_sim_transfer_cube_human')"
+python -c "
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+REVISION = 'ba73b2766f1371cdc133ca4efb97eb090d744625'  # resolved via HfApi().model_info(...).sha
+
+path = snapshot_download(
+    'lerobot/act_aloha_sim_transfer_cube_human',
+    revision=REVISION,
+    allow_patterns=['*.safetensors', '*.json'],
+    local_dir='target/lerobot-cache/act_aloha_sim_transfer_cube_human',
+)
+banned = [p for pat in ('*.bin', '*.pt', '*.ckpt', '*.pkl') for p in Path(path).rglob(pat)]
+assert not banned, f'pickle-loadable file(s) in snapshot: {banned}'
+"
 ```
 
 ## 1. 0.6.1에서 `select_action`이 실제로 무엇인가

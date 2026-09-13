@@ -104,6 +104,8 @@ pub struct ImageSpec {
 
 ### 2.3 카메라 컨벤션 (§3.1)
 
+`Intrinsics::from_fovy`는 골든 카메라 경로 위에 있다: `fx`/`fy`는 뷰별 파라미터 버퍼로 들어가고, 모든 골든 픽셀이 이들의 함수다. 그래서 자산이 저장하는 `f64` `fovy`를 받아 한 번 캐스트한 뒤, 나머지는 `es_math::approx::tan`을 거쳐 고정된 순서로 — 절반, `tan`, 나눗셈 — `f32`로 처리한다. 이를 대체하기 전의 호스트 `libm` `tan`은 아무것으로도 고정되어 있지 않았고(리뷰 M4 S-11), `approx::tan`으로 옮기면서 64×64 / `fovy = 1.2`에서 `fy`가 정확히 1 ULP만큼 이동했다(`46.774269` → `46.774265`) — 이것이 `Rs` 골든이 재생성된 이유다 — [§5](#5-cpu-references-14) 참고.
+
 `CameraView { pose, spec }`. `pose`는 `T_world_camera`다. 카메라 프레임은 OpenCV다: **+Z 전방, +X 오른쪽, +Y 아래**. 이미지 원점은 좌상단, x는 오른쪽, y는 아래쪽. 픽셀 `(px, py)`에 대한 주 광선은, 카메라 공간에서,
 
 ```
@@ -247,6 +249,17 @@ pub fn path_trace(scene: &TriScene, view: &CameraView, cfg: &RenderConfig) -> Cp
 | `cornell_rs_depth` | `Depth32` | f32 | 64×64 |
 | `cornell_rs_seg` | `SegmentationId` | u32 | 64×64 |
 | `cornell_pt1spp` | `PtRadiance` | f32 | 64×64×3 |
+
+처음 작성된 이후 한 번 재생성되었다, 리뷰 M4 S-11 때문에(`Intrinsics::from_fovy`가 호스트 `tan`에서 `es_math::approx::tan`으로 옮겨간 것, [§2.3](#23-camera-convention-31) 참고). `fy`의 1 ULP 이동은 광선 방향의 서브픽셀 변화이므로, 차이는 실루엣 에지에 국한된다:
+
+| 골든 | 차이 |
+|---|---|
+| `cornell_rs_rgb8` | 12288 바이트 중 57개 차이(에지 픽셀이므로 빨간 벽/흰 상자 경계에서 최대 183까지) |
+| `cornell_rs_depth` | 4096 floats 중 1604개 차이, 최대 절대값 4.05e-6 m, 최대 17 ULP |
+| `cornell_rs_seg` | 4096 픽셀 중 19개가 이웃 geom을 취함 |
+| `cornell_pt1spp` | **바이트 단위로 동일** |
+
+GPU는 재생성된 파일과 여전히 정확히 일치한다(`Rgb8`/`SegmentationId` 비트 동일, RTX 4060에서 `Depth32`/`Normal` 0 ULP) — 이것이 핵심이다: 이동은 공유된 입력에 있는 것이지, 어느 경로의 산술에 있는 것이 아니다.
 
 `cornell_pt1spp`는 1 spp, 바운스 2, ReSTIR와 SVGF는 꺼짐이다 — RNG, 바운스 루프, 이미셔티브 히트를 모두 운동시키는 가장 작은 것이며, 64 샘플의 노이즈까지 고정하지 않고도 골든이 비트 정확하게 고정할 수 있는 유일한 PT 구성이다.
 
