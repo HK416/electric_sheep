@@ -5,12 +5,26 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+# Off => the Deployment IR front door (`SafetyPlane::from_ir`, `SafetyConfigError`) goes away
+# and the crate builds `no_std` with zero heap (spec 9.6, Appendix B.4). The runtime itself —
+# `SafetyPlane::from_config`, `validate` — is identical either way (spec 9.5).
+std = ["dep:es-ir", "dep:thiserror", "serde/std", "es-core/std"]
+
 [dependencies]
-es-core = { workspace = true }
-es-math = { workspace = true }
-es-ir = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
+# Path, not `workspace = true`: same reason as `serde` below — the workspace entry does not
+# set `default-features`, so a crate-level `default-features = false` there is ignored.
+es-core = { path = "../es-core", default-features = false }
+es-ir = { workspace = true, optional = true }
+# `f64::sqrt` is `std`-only; libm's is correctly rounded, so taking it on both sides keeps one
+# code path instead of two that happen to agree (see `config::sqrt`).
+libm = { version = "0.2", default-features = false }
+# Not `workspace = true`: the workspace entry does not set `default-features`, so a
+# crate-level `default-features = false` there would be ignored and `serde/std` would leak
+# into the `no_std` build.
+serde = { version = "1", default-features = false, features = ["derive"] }
+thiserror = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

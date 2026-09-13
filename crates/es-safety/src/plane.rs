@@ -4,11 +4,16 @@
 //! be turned off. See `docs/design/safety-plane.md` for the algorithm in prose.
 
 use es_core::PhysTick;
-use es_ir::deployment::{ActionSpace, DeploymentIr, ExecutionMode, Micros};
 
-use crate::config::{Envelope, Fallback, SafetyConfigError, Watchdogs};
+use crate::config::{Envelope, Fallback, SafetyConfig, Watchdogs};
 use crate::counters::SafetyCounters;
+use crate::ir_types::{ActionSpace, ExecutionMode, Micros};
+
+#[cfg(feature = "std")]
+use crate::config::SafetyConfigError;
 use crate::types::{ActionChunk, ActionSource, EventSet, FallbackKind, SafeAction, ViolationKind};
+#[cfg(feature = "std")]
+use es_ir::deployment::DeploymentIr;
 
 /// Everything the plane remembers between control ticks. Pre-allocated: no field grows.
 #[derive(Clone, Copy, Debug)]
@@ -62,8 +67,9 @@ impl<const NJ: usize, const H: usize> SafetyState<NJ, H> {
 
 /// The policy-independent, deterministic, fail-safe action filter (spec 9.1, Appendix B.4).
 ///
-/// Built only from a validated [`DeploymentIr`]: there is no constructor that omits the
-/// envelope and no field that disables it (INV-12).
+/// Built only from a [`SafetyConfig`], which always carries a complete envelope: there is no
+/// constructor that omits it and no field that disables it (INV-12). `from_ir` is the same
+/// path with the Deployment IR converted first.
 #[derive(Clone, Debug)]
 pub struct SafetyPlane<const NJ: usize, const H: usize> {
     envelope: Envelope<NJ>,
@@ -74,11 +80,33 @@ pub struct SafetyPlane<const NJ: usize, const H: usize> {
 }
 
 impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
-    /// The only constructor (spec 9.2).
+    /// The constructor (spec 9.2, spec 9.6). Plain data in, running plane out: no heap, no
+    /// `es-ir`, no `std`, and no way to fail — a config always describes *some* envelope, and
+    /// [`Envelope::sanitize`] narrows a degenerate one rather than skipping a clamp stage
+    /// (INV-12).
+    ///
+    /// This is what the embedded deployment target calls; `from_ir` funnels into it, so both
+    /// run identical code (spec 9.5).
+    pub fn from_config(config: &SafetyConfig<NJ>) -> Self {
+        let mut envelope = config.envelope;
+        envelope.sanitize();
+        Self {
+            state: SafetyState::new(&envelope),
+            envelope,
+            watchdogs: config.watchdogs,
+            fallback: config.fallback,
+            counters: SafetyCounters::new(config.watchdogs.window_len()),
+        }
+    }
+
+    /// The Deployment IR constructor (spec 9.2): converts to a [`SafetyConfig`] and delegates
+    /// to [`Self::from_config`].
     ///
     /// Rejects an IR whose own validator complains, whose joint count or horizon disagrees
-    /// with the const generics, whose limits are not finite, or whose violation-rate window
-    /// exceeds the pre-allocated ring.
+    /// with the const generics, whose limits are not finite, whose violation-rate window
+    /// exceeds the pre-allocated ring, or whose hull / retract trajectory / sensor table is
+    /// larger than the pre-allocated arrays.
+    #[cfg(feature = "std")]
     pub fn from_ir(ir: &DeploymentIr) -> Result<Self, SafetyConfigError> {
         if let Some(d) = ir.validate().first() {
             return Err(SafetyConfigError::InvalidIr(format!("{d}")));
@@ -96,16 +124,11 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
                 expected: H,
             });
         }
-        let envelope = Envelope::from_ir(ir)?;
-        let watchdogs = Watchdogs::from_ir(ir)?;
-        let counters = SafetyCounters::new(watchdogs.window_len());
-        Ok(Self {
-            state: SafetyState::new(&envelope),
-            envelope,
-            watchdogs,
+        Ok(Self::from_config(&SafetyConfig {
+            envelope: Envelope::from_ir(ir)?,
+            watchdogs: Watchdogs::from_ir(ir)?,
             fallback: Fallback::from_ir(ir)?,
-            counters,
-        })
+        }))
     }
 
     pub fn envelope(&self) -> &Envelope<NJ> {
@@ -149,8 +172,8 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
     /// A sample from `sensor` arrived at `now` (spec 9.4 `SensorDropout`). Unknown names are
     /// ignored: only configured sensors are watched.
     pub fn sensor_seen(&mut self, sensor: &str, now: PhysTick) {
-        for s in &mut self.watchdogs.sensors {
-            if s.name == sensor {
+        for s in self.watchdogs.sensors_mut() {
+            if s.matches(sensor) {
                 s.last_seen = now;
             }
         }
@@ -233,7 +256,7 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
                 events.insert(ViolationKind::HeartbeatLoss);
             }
         }
-        for s in &self.watchdogs.sensors {
+        for s in self.watchdogs.sensors() {
             let gap = now
                 .ticks_since(s.last_seen)
                 .unwrap_or(0)
@@ -396,8 +419,13 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
                 q
             }
             FallbackKind::RetractToHome => {
-                let last = self.fallback.trajectory.len() - 1;
-                let q = self.fallback.trajectory[st.retract_idx.min(last)];
+                // A `RetractToHome` with no waypoints is unconstructible (see
+                // `Fallback::stationary`); holding is the safe read of it either way.
+                let traj = self.fallback.trajectory();
+                let Some(last) = traj.len().checked_sub(1) else {
+                    return st.last_safe;
+                };
+                let q = traj[st.retract_idx.min(last)];
                 st.retract_idx = (st.retract_idx + 1).min(last);
                 q
             }

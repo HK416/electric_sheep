@@ -24,6 +24,12 @@ underrun), §10.3 (`envelope_violation_rate`, `chunk_underrun_rate`), §18.5 (fa
 
 ## `no_std` 상태
 
+> **대체됨 (M3 W2).** 이 절 마지막에서 이후 패킷으로 미뤄 두었던 분리 작업은 이미 끝났다.
+> `--no-default-features`에서 이 크레이트는 실제로 `no_std`이고, 아래에서 언급하는 `Vec`은
+> 모두 고정 크기 배열이 되었으며, `SafetyPlane::from_config`가 `from_ir`가 위임하는 유일한
+> 구성 경로다. `docs/design/embedded-runtime.md` §2–3 을 보라. 이하 내용은 현재 빌드에 대한
+> 진술이 아니라 당시의 판단 근거로 남겨 둔다.
+
 부록 B.4는 "no_std 가능, 힙 할당 0"이라고 말한다. `es-ir`는 `std`이고 (`String`, `Vec`,
 `BTreeSet`, `serde`를 사용한다), `from_ir`가 이를 읽어야 하므로 크레이트 전체는 M1
 동안 `std`로 남는다. 지금 전달되는 것은 운영상 중요한 절반이다.

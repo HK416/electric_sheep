@@ -6,13 +6,21 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
+default = ["std"]
+# Everything except `PhysTick` and `ring::ArrayRing`, which are what the embedded deployment
+# target needs (spec 9.6: no-std capable, zero heap). See `docs/design/embedded-runtime.md`.
+std = ["dep:blake3", "dep:thiserror", "serde/std"]
 # Installs AllocCounter as the global allocator so assert_no_alloc works outside `cargo test`.
-alloc-count = []
+# Implies `std`: the counter wraps `std::alloc::System`.
+alloc-count = ["std"]
 
 [dependencies]
-blake3 = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
+blake3 = { workspace = true, optional = true }
+# Not `workspace = true`: the workspace entry does not set `default-features`, so a
+# crate-level `default-features = false` there is ignored and `serde/std` leaks into the
+# `no_std` build. Features are additive, so every other crate still gets `serde/std`.
+serde = { version = "1", default-features = false, features = ["derive"] }
+thiserror = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

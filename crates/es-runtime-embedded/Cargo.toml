@@ -5,19 +5,35 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+default = ["std"]
+# Off => only `core_rt` (the Safety Plane + chunk cursor + telemetry ring control loop), built
+# `no_std` with zero heap (spec 9.6). The bundle reader, the observation plan, the
+# `PolicyRuntime` trait object and the hash chain are the `std` layer on top of it.
+std = [
+    "dep:es-ir",
+    "dep:es-compile",
+    "dep:es-policy",
+    "dep:blake3",
+    "dep:thiserror",
+    "es-core/std",
+    "es-safety/std",
+]
+
 [dependencies]
-es-core = { workspace = true }
-es-math = { workspace = true }
-es-ir = { workspace = true }
-es-compile = { workspace = true }
-es-safety = { workspace = true }
-es-policy = { workspace = true }
-blake3 = { workspace = true }
-serde = { workspace = true }
-thiserror = { workspace = true }
+# Path, not `workspace = true`: the workspace entries do not set `default-features`, so a
+# crate-level `default-features = false` there is ignored.
+es-core = { path = "../es-core", default-features = false }
+es-safety = { path = "../es-safety", default-features = false }
+es-ir = { workspace = true, optional = true }
+es-compile = { workspace = true, optional = true }
+es-policy = { workspace = true, optional = true }
+blake3 = { workspace = true, optional = true }
+thiserror = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+es-math = { workspace = true }
 # Installs es-core's allocation counter for this crate's tests (P17), so the chunk-reuse path
 # of `tick` can be asserted allocation-free (spec 9.6).
 es-core = { workspace = true, features = ["alloc-count"] }

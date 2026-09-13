@@ -26,10 +26,30 @@
 //!
 //! No Python, no physics, no rendering, no filesystem: [`EmbeddedRuntime::from_bundle`] takes
 //! bytes.
+//!
+//! # Two layers (spec 9.6: no-std capable, zero heap)
+//!
+//! - [`core_rt`] — [`EmbeddedCore`], the control loop itself: Safety Plane + chunk cursor +
+//!   telemetry ring, built with `--no-default-features` on a bare-metal target. The
+//!   Observation IR evaluation and the inference step are function pointers
+//!   ([`ObserveFn`], [`InferFn`]), not traits, so nothing allocates and INV-17 is untouched.
+//! - the default `std` layer — [`EmbeddedRuntime`], which plugs `es_compile::CpuPlan` and a
+//!   `dyn es_policy::PolicyRuntime` (ONNX / Vulkan / NPU) into that same loop and adds the
+//!   bundle reader and the hash chain.
+//!
+//! See `docs/design/embedded-runtime.md`.
+
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod core_rt;
+#[cfg(feature = "std")]
 mod hardware;
+#[cfg(feature = "std")]
 mod runtime;
 
+pub use core_rt::{EmbeddedCore, InferFn, ObserveFn, TickRecord, TELEMETRY_TICKS};
+#[cfg(feature = "std")]
 pub use hardware::hardware_capability;
-pub use runtime::{EmbeddedRuntime, RuntimeError, TickRecord};
+#[cfg(feature = "std")]
+pub use runtime::{EmbeddedRuntime, RuntimeError};

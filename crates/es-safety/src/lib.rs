@@ -15,9 +15,10 @@
 //!
 //! - **INV-11** — no dependency on `es-policy`, enforced by `cargo xtask layering` (spec 4.2
 //!   rule 8). Nothing here names a policy, a network or a tensor.
-//! - **INV-12** — no code path disables the plane. [`SafetyPlane::from_ir`] is the only
-//!   constructor, every field is private, there is no `enabled` flag and no `#[cfg(test)]`
-//!   shortcut. A test that needs room widens its envelope.
+//! - **INV-12** — no code path disables the plane. [`SafetyPlane::from_config`] is the only
+//!   constructor (`from_ir` converts the IR and delegates to it), every field is private,
+//!   there is no `enabled` flag and no `#[cfg(test)]` shortcut. A test that needs room widens
+//!   its envelope.
 //! - **INV-13** — [`SafetyPlane::validate`] returns no `Result`. A safe action always exists,
 //!   so propagating an error would only invite the caller to ignore it.
 //!
@@ -26,18 +27,38 @@
 //! constant control period, computed once from the rational tick rate and never accumulated.
 //! No `HashMap`, no RNG, no global state, no `unsafe`.
 //!
-//! Allocation: the hot path allocates nothing. The retract trajectory and the sensor-dropout
-//! table are the only heap objects and both are sized in `from_ir`. See
-//! `docs/design/safety-plane.md` for why the crate is `std` rather than `no_std` in M1.
+//! Allocation: nothing in this crate allocates — not the hot path, not construction. The
+//! retract trajectory, the convex-hull faces and the sensor-dropout table are fixed-size
+//! arrays inside [`SafetyConfig`].
+//!
+//! # `no_std` (spec 9.6, Appendix B.4)
+//!
+//! `--no-default-features` drops `std`, `es-ir`, `thiserror` and `serde/std`, and what is left
+//! is the whole runtime: [`SafetyPlane`], [`SafetyConfig`], [`ActionChunk`], [`SafeAction`],
+//! [`SafetyCounters`] and the envelope / watchdog / fallback config structs. What goes is only
+//! the Deployment IR front door — [`SafetyPlane::from_ir`] and [`SafetyConfigError`] — because
+//! `es-ir` is a `std` crate. `validate` is identical either way (INV-13), which is the point:
+//! spec 9.5 wants the *same code* in simulation and on the robot.
+//!
+//! See `docs/design/embedded-runtime.md` for the split and `docs/design/safety-plane.md` for
+//! the algorithm.
 
+#![cfg_attr(not(feature = "std"), no_std)]
 #![forbid(unsafe_code)]
 
 mod config;
 mod counters;
+mod ir_types;
 mod plane;
 mod types;
 
-pub use config::{Envelope, Fallback, SafetyConfigError, SensorWatch, Watchdogs};
+#[cfg(feature = "std")]
+pub use config::SafetyConfigError;
+pub use config::{
+    Envelope, Fallback, SafetyConfig, SensorWatch, Watchdogs, WorkspaceSpec, MAX_HULL_FACES,
+    MAX_RETRACT_WAYPOINTS, MAX_SENSORS, SENSOR_NAME_CAP,
+};
 pub use counters::{SafetyCounters, WINDOW_CAP};
+pub use ir_types::{ActionSpace, ExecutionMode, HalfSpace, Limit, Micros};
 pub use plane::{SafetyPlane, SafetyState};
 pub use types::{ActionChunk, ActionSource, EventSet, FallbackKind, SafeAction, ViolationKind};

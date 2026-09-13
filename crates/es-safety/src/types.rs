@@ -3,8 +3,9 @@
 //! Everything here is `Copy` and fixed size: an action chunk is an array, not a slice, so the
 //! runtime never borrows caller memory and never allocates.
 
-use es_ir::deployment::ExecutionMode;
 use serde::{Deserialize, Serialize};
+
+use crate::ir_types::ExecutionMode;
 
 /// One policy output: `H` predicted actions of `NJ` components each (spec 8.5).
 ///

@@ -3,11 +3,17 @@
 //! Every step is an integer tick. Floating-point time accumulation is forbidden (§3.4) and is
 //! prevented here by construction: no type in this module stores an `f64`, and the only way to
 //! obtain seconds is [`SimTime::as_secs_f64`], at the edge of the system.
+//!
+//! `no_std` note (§9.6): [`PhysTick`] is the one type the Safety Plane needs on the embedded
+//! target, so it stays outside the `std` feature. [`TickRate`] and [`SimTime`] do not —
+//! `TickRate::rational` reports [`Error`], which is `std`-only.
 
-use std::num::NonZeroU64;
+#[cfg(feature = "std")]
+use core::num::NonZeroU64;
 
 use serde::{Deserialize, Serialize};
 
+#[cfg(feature = "std")]
 use crate::Error;
 
 /// A physics tick number. Every sensor sample carries one (§18.1).
@@ -41,14 +47,18 @@ impl PhysTick {
 
 /// An exact rational tick rate in hertz (`num / den`).
 ///
+/// `std` only: its fallible constructor reports [`Error`].
+///
 /// Rational rather than `f64` so that 30 Hz, 240/7 Hz and 1 kHz are all exact and a tick count
 /// converts to seconds without accumulated error.
+#[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct TickRate {
     num: NonZeroU64,
     den: NonZeroU64,
 }
 
+#[cfg(feature = "std")]
 impl TickRate {
     /// `hz` ticks per second.
     ///
@@ -86,12 +96,14 @@ impl TickRate {
 }
 
 /// Simulation time: a tick count plus the rate it is counted at (§18.1).
+#[cfg(feature = "std")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SimTime {
     tick: PhysTick,
     rate: TickRate,
 }
 
+#[cfg(feature = "std")]
 impl SimTime {
     pub const fn new(tick: PhysTick, rate: TickRate) -> Self {
         Self { tick, rate }

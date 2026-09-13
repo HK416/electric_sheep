@@ -4,34 +4,16 @@ use std::collections::BTreeMap;
 
 use es_compile::bundle::{BundleError, PolicyBundle};
 use es_compile::{CpuPlan, Tensor, TensorRef};
-use es_core::ring::RingBuffer;
+use es_core::ring::ArrayRing;
 use es_core::PhysTick;
 use es_ir::deployment::{ExecutionMode, Micros};
 use es_ir::hash::{DatasetHash, HardwareCapability, HashChain};
 use es_ir::types::ElemType;
 use es_policy::{PolicyError, PolicyRuntime, WeightsSource};
-use es_safety::{
-    ActionChunk, ActionSource, SafeAction, SafetyConfigError, SafetyCounters, SafetyPlane,
-};
+use es_safety::{ActionChunk, SafeAction, SafetyConfigError, SafetyCounters};
 
+use crate::core_rt::{EmbeddedCore, TickRecord, TELEMETRY_TICKS};
 use crate::hardware::hardware_capability;
-
-/// Telemetry depth. One second of history at 1 kHz, which is the highest control rate spec 9.2
-/// contemplates; the ring is allocated once in `from_bundle` and never grows.
-const TELEMETRY_TICKS: usize = 1024;
-
-/// One control tick, as the deployment records it. Plain `Copy` data: pushing one must not
-/// allocate, so nothing here owns a heap object.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TickRecord {
-    pub tick: PhysTick,
-    pub source: ActionSource,
-    /// `es_safety::EventSet` as its bitset, so the record stays a POD a transport can memcpy.
-    pub events: u32,
-    /// Whether this tick ran the policy or reused the buffered chunk (spec 8.6).
-    pub replanned: bool,
-    pub obs_age: Micros,
-}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -69,34 +51,24 @@ pub enum RuntimeError {
 pub struct EmbeddedRuntime<const NJ: usize, const H: usize> {
     bundle: PolicyBundle,
     plan: CpuPlan,
-    plane: SafetyPlane<NJ, H>,
     policy: Box<dyn PolicyRuntime>,
-    telemetry: RingBuffer<TickRecord>,
+    /// The `no_std` control loop: Safety Plane, chunk cursor, telemetry ring. Everything this
+    /// type adds is the `std` front end that feeds it (spec 9.5, spec 9.6).
+    core: EmbeddedCore<NJ, H, TELEMETRY_TICKS>,
     hardware: HardwareCapability,
     /// The Learning IR's single output port: the action chunk (spec 8.5).
     action_out: String,
     mode: ExecutionMode,
-    /// Control ticks between two inferences (spec 8.6).
-    replan_every: u64,
-    /// Actions consumed from the buffered chunk since it was produced.
-    consumed: u64,
-    chunk: ActionChunk<NJ, H>,
-    started: bool,
-    /// The chunk sequence number handed to the plane (spec 8.6, P-M1-R3): incremented once
-    /// per policy invocation (a replan tick), never per control tick, so the plane can tell a
-    /// genuine replan from the ticks that merely reuse the buffered chunk.
-    seq: u64,
 }
 
 impl<const NJ: usize, const H: usize> std::fmt::Debug for EmbeddedRuntime<NJ, H> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EmbeddedRuntime")
             .field("action_out", &self.action_out)
-            .field("replan_every", &self.replan_every)
-            .field("consumed", &self.consumed)
+            .field("replan_every", &self.core.replan_interval())
             .field(
                 "telemetry_pushed",
-                &(self.telemetry.oldest_seq() + self.telemetry.len() as u64),
+                &(self.core.telemetry().oldest_seq() + self.core.telemetry().len() as u64),
             )
             .finish_non_exhaustive()
     }
@@ -115,7 +87,7 @@ impl<const NJ: usize, const H: usize> EmbeddedRuntime<NJ, H> {
     ) -> Result<Self, RuntimeError> {
         let bundle = PolicyBundle::open(bytes)?;
         let plan = bundle.compile_plan()?;
-        let plane = SafetyPlane::<NJ, H>::from_ir(&bundle.deployment)?;
+        let plane = es_safety::SafetyPlane::<NJ, H>::from_ir(&bundle.deployment)?;
         policy.load(
             &bundle.learning,
             &WeightsSource::InMemory(bundle.weights.clone()),
@@ -132,17 +104,11 @@ impl<const NJ: usize, const H: usize> EmbeddedRuntime<NJ, H> {
 
         Ok(Self {
             plan,
-            plane,
             policy,
-            telemetry: RingBuffer::with_capacity(TELEMETRY_TICKS),
+            core: EmbeddedCore::with_plane(plane, mode, replan_every),
             hardware: hardware_capability(),
             action_out,
             mode,
-            replan_every,
-            consumed: 0,
-            chunk: ActionChunk::empty(mode),
-            started: false,
-            seq: 0,
             bundle,
         })
     }
@@ -165,23 +131,8 @@ impl<const NJ: usize, const H: usize> EmbeddedRuntime<NJ, H> {
         now: PhysTick,
         obs_age: Micros,
     ) -> SafeAction<NJ> {
-        let replanned = !self.started || self.consumed >= self.replan_every;
-        if replanned {
-            self.seq += 1;
-            self.chunk = self.infer(sensors).with_seq(self.seq);
-            self.consumed = 0;
-            self.started = true;
-        }
-        let action = self.plane.validate(&self.chunk, obs_age, now);
-        self.consumed += 1;
-        self.telemetry.push(TickRecord {
-            tick: now,
-            source: action.source,
-            events: action.events.bits(),
-            replanned,
-            obs_age,
-        });
-        action
+        let chunk = self.core.should_replan().then(|| self.infer(sensors));
+        self.core.step(chunk, now, obs_age)
     }
 
     /// Run the observation plan and the policy, and pack the result into an action chunk.
@@ -241,8 +192,13 @@ impl<const NJ: usize, const H: usize> EmbeddedRuntime<NJ, H> {
         &self.bundle
     }
 
-    pub fn telemetry(&self) -> &RingBuffer<TickRecord> {
-        &self.telemetry
+    pub fn telemetry(&self) -> &ArrayRing<TickRecord, TELEMETRY_TICKS> {
+        self.core.telemetry()
+    }
+
+    /// The `no_std` control loop this runtime is a front end for (spec 9.6).
+    pub fn core(&self) -> &EmbeddedCore<NJ, H, TELEMETRY_TICKS> {
+        &self.core
     }
 
     pub fn hardware(&self) -> HardwareCapability {
@@ -251,37 +207,37 @@ impl<const NJ: usize, const H: usize> EmbeddedRuntime<NJ, H> {
 
     /// Control ticks between two inferences (spec 8.6).
     pub fn replan_interval(&self) -> u64 {
-        self.replan_every
+        self.core.replan_interval()
     }
 
     pub fn counters(&self) -> &SafetyCounters {
-        self.plane.counters()
+        self.core.counters()
     }
 
     /// Seed the plane with the measured joint state, so its hold target is where the robot
     /// actually is. Call before the first [`tick`](Self::tick).
     pub fn observe_state(&mut self, q: &[f64; NJ], qd: &[f64; NJ]) {
-        self.plane.observe_state(q, qd);
+        self.core.plane_mut().observe_state(q, qd);
     }
 
     /// Forwarded to the plane: the controller is alive as of `now` (spec 9.4).
     pub fn heartbeat(&mut self, now: PhysTick) {
-        self.plane.heartbeat(now);
+        self.core.plane_mut().heartbeat(now);
     }
 
     /// Forwarded to the plane: a sample from `sensor` arrived at `now` (spec 9.4).
     pub fn sensor_seen(&mut self, sensor: &str, now: PhysTick) {
-        self.plane.sensor_seen(sensor, now);
+        self.core.plane_mut().sensor_seen(sensor, now);
     }
 
     /// Forwarded to the plane: clear the emergency-stop latch. An operator action — the plane
     /// never clears its own latch (spec 9.4).
     pub fn reset_latch(&mut self) {
-        self.plane.reset_latch();
+        self.core.plane_mut().reset_latch();
     }
 
     pub fn is_latched(&self) -> bool {
-        self.plane.is_latched()
+        self.core.plane().is_latched()
     }
 }
 

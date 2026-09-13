@@ -21,6 +21,12 @@ room widens the envelope in its fixture.
 
 ## `no_std` status
 
+> **Superseded (M3 W2).** The split described at the end of this section has been done: the
+> crate *is* `no_std` under `--no-default-features`, the `Vec`s named below are now fixed-size
+> arrays, and `SafetyPlane::from_config` is the single construction path `from_ir` delegates
+> to. See `docs/design/embedded-runtime.md` §2–3. The rest of this section is kept for the
+> reasoning, not as a statement of the current build.
+
 Appendix B.4 says "no_std 가능, 힙 할당 0". `es-ir` is `std` (it uses `String`, `Vec`,
 `BTreeSet`, `serde`), and `from_ir` must read it, so the crate as a whole stays `std` for
 M1. What is delivered now is the half that matters operationally:
