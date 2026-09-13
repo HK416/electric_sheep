@@ -7,15 +7,21 @@
 //! Layer rule (§4.2): may depend on layers 0..=8 only. In particular **not** on `es-telemetry`
 //! (layer 10) — [`EnvMetrics`] is a plain struct that `es-telemetry` converts.
 
+pub mod chunk_buffer;
+pub mod domains;
 pub mod env;
 pub mod episode;
+pub mod inference;
 pub mod plan;
 pub mod randomize;
 pub mod rng;
 pub mod scheduler;
 
+pub use chunk_buffer::{ChunkBuffer, CHUNK_SLOTS};
+pub use domains::{DomainRunner, DomainSizing};
 pub use env::{Env, EnvMetrics, StepOutcome};
 pub use episode::{Episode, EpisodeRecorder, Termination};
+pub use inference::{latency_ticks, AsyncInference, Submission};
 pub use randomize::RandomizationPlan;
 pub use rng::EnvRng;
 pub use scheduler::{BatchDomains, Device, DomainCfg, Schedule, TickPlan};

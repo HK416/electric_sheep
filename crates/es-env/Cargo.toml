@@ -12,6 +12,7 @@ es-ir = { workspace = true }
 es-assets = { workspace = true }
 es-physics-core = { workspace = true }
 es-compile = { workspace = true }
+es-policy = { workspace = true }
 es-safety = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }

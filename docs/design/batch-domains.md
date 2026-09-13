@@ -188,3 +188,115 @@ observes; render, inference and VRAM fields stay `None` until those domains exis
   `set_ctrl` — and it will not be optional (INV-12).
 - **Training domain execution** — scheduled, but the hand-off to `es-data` is W-later.
 - **Backend model-parameter randomization** — see §5's ceiling.
+
+---
+
+# M2 W2 — round-robin execution, async inference, chunk buffer
+
+§8 above listed four of these as deferred. This section replaces those entries; §1–§7 still
+describe the M1 W6 foundation and are unchanged.
+
+## 9. The runner
+
+`DomainRunner<NJ, H>` executes a `Schedule` over an `Env`. Its clock is the **control tick**:
+one `inference.period` window of simulation ticks, which is exactly what one `Env::step`
+advances. One `Env::step_with_policy` is one control tick, in §12.1 phase order.
+
+```
+observation ticks in [t, t+inference.period)
+    └─ Schedule::observation_envs(t)        round_robin, §12.2 — only these envs
+         └─ CpuPlan::run (or the raw qpos‖qvel row)  → latest[env]
+inference tick in the same window
+    └─ submit(env, control_tick) ascending by env id, §12.3
+poll(control_tick)
+    └─ up to inference.batch, FIFO → one PolicyRuntime::infer over the stacked batch
+         └─ ChunkBuffer::push(chunk, submit_tick + latency_ticks)     ← App. B.5 apply_at
+every control tick
+    └─ ChunkBuffer::next_action → SafetyPlane::validate → Env::step(ctrl)
+```
+
+The last arrow is the **only** path from a chunk to an actuator, and both of its branches take
+it: an underrun hands the plane `ActionChunk::empty` and the plane answers with the fallback
+(§8.6, §9.4). No branch reaches `set_ctrl` around the plane, including in tests — the test
+envelope is widened, never disabled (INV-12).
+
+Two things are arrays rather than singletons, both because the state behind them is per-env:
+`planes: &mut [SafetyPlane]` (hold target, rate-limit history and the e-stop latch are
+per-robot, §9.3) and `plans: &mut [CpuPlan]` (a `TemporalWindow` ring is a per-env history,
+§7.5). A shared instance would interleave one env's history into another's.
+
+## 10. Simulated latency (§12.3)
+
+`latency_ticks = ceil(expected_latency_ms × control_rate)`, computed once, in integers, from
+`RuntimeHints::expected_latency_ms`. It is the whole of the async model:
+
+- A submission is released when `submit_tick + latency_ticks <= control_tick`, never earlier
+  even if a real backend finished sooner — §12.3's deterministic mode waits.
+- The chunk is applied at `submit_tick + latency_ticks`, **not** at the tick it arrived
+  (App. B.5 `ChunkArrival::apply_at`). If a narrow `inference.batch` delivered it late, the
+  rows already in the past are simply never served; that shows up as an underrun in the
+  counters rather than as a silent time shift.
+- Nothing reads a clock. `Instant` appears in `es-env` only in `EnvMetrics::simulation_wall`,
+  which is a measurement, not an input to any decision.
+
+Real threading is a later packet and belongs behind this same interface: `submit` hands work
+to a worker, `poll` takes it back, and the release rule stays here so that swapping the worker
+in cannot change semantics. Deterministic first (§12.3); real-time mode releases early and
+records the divergence in the replay.
+
+## 11. The chunk buffer (§8.5, §8.6)
+
+`ChunkBuffer<NJ, H>` holds `CHUNK_SLOTS = 8` chunks inline. `next_action` allocates nothing:
+the covering set is an inline `[usize; 8]`, insertion-sorted by push sequence, so the
+combination order is arrival order and never slot order — which is what makes the ensemble sum
+bitwise reproducible.
+
+| `ChunkBlendPolicy` | rule | span of one chunk |
+|---|---|---|
+| `HardSwitch` | newest covering chunk wins | `min(valid, K)` |
+| `LinearBlend { steps }` | ramp previous → newest over `steps` ticks | `min(valid, K)` |
+| `TemporalEnsemble { weight_decay }` | `w_i = exp(-m·i)`, `i = 0` **oldest** | `valid` |
+
+ACT indexes its exponential weights from the oldest overlapping prediction, so a smaller `m`
+incorporates a new observation faster; `es_math::approx::exp` is used, not `f64::exp` (§3.4
+forbids std transcendentals on a deterministic path). `K = execute_chunk` bounds the first two
+blends because §8.5 replans after `K`; `TemporalEnsemble` deliberately reads all `valid` rows,
+because averaging the overlap *is* the method.
+
+`next_action` returns `None` on underrun and counts it. It never fabricates a row — a
+fabricated action would reach the actuator having been checked against nothing.
+
+## 12. What batch-independence actually means
+
+A 16-env run replays bitwise for a fixed `observation.batch`. Across different
+`observation.batch` it does **not**, and that is correct rather than a defect: round-robin
+changes which envs are observed on which tick, only an observed env submits, only a submitting
+env gets a chunk, and an env without a chunk gets the Safety Plane's fallback. Halving the
+observation batch halves each env's observation rate and raises its `chunk_underrun_rate`.
+
+The invariant that does hold, and the one the tests assert:
+
+> Two envs are indistinguishable exactly when their observation ticks coincide.
+
+Concretely, with `simulation.batch = 16` the envs partition into `16 / observation.batch`
+round-robin groups; trajectories are identical inside a group and different between groups,
+and `underrun_rate(4) > underrun_rate(8) > underrun_rate(16)`.
+
+### Sizing the §28.4 gate
+
+`DomainSizing` is integer arithmetic over a configuration — no allocation, so the gate
+configuration can be costed on a laptop that cannot run it. For `GATE` (4,096 sim env,
+512 obs env, 2 views, 224×224, 30 Hz, `H = 20`, `NJ = 7`):
+
+| quantity | round-robin 512 | every camera on |
+|---|---|---|
+| `camera_frames_per_sec` | 30,720 | 245,760 |
+| `pixels_per_sec` | 1.54 G | 12.3 G |
+| render output (RGB8) | 4.6 GB/s | 37 GB/s |
+| after `f32` normalization | 18.5 GB/s | 148 GB/s |
+| chunk buffers (8 slots × `H` × `NJ` × f64) | 36.7 MB | 36.7 MB |
+
+The 8× in the last two columns is the whole argument for §12.2. All of it is
+**`Target / Status: unverified`** (§12.4): the §28.4 W2 gate — 4,096 sim env × 512 obs env
+stable — is a budget here, not a measurement, and the executed test is the scaled 16-env
+version.

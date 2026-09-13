@@ -9,10 +9,14 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use es_assets::scene::SceneDesc;
+use es_compile::CpuPlan;
 use es_core::{EnvHealth, FailureAction, FailureKind, FailurePolicy, PhysTick, SimTime};
 use es_ir::task::TaskIr;
 use es_physics_core::backend::{LoadConfig, ModelInfo, PhysicsBackend, StateView};
+use es_policy::PolicyRuntime;
+use es_safety::SafetyPlane;
 
+use crate::domains::DomainRunner;
 use crate::episode::{self, Episode, EpisodeRecorder, EpisodeShape, StepRow, Termination};
 use crate::plan::{ScalarPlan, Source};
 use crate::randomize::{ParamScales, RandomizationPlan, ResetBuffer};
@@ -311,6 +315,47 @@ impl<B: PhysicsBackend> Env<B> {
         if !to_reset.is_empty() {
             outcome.episodes = self.reset(Some(&to_reset))?;
         }
+        Ok(outcome)
+    }
+
+    /// One control step driven by a policy instead of by a caller-supplied `ctrl` (§12).
+    ///
+    /// The phase order is §12.1's: observation (camera round-robin over the simulation ticks
+    /// of this control window), then inference (submit, poll, run the released batch into the
+    /// chunk buffers), then action. The action phase is the only actuator path, and it runs
+    /// **through** `planes` — an underrun hands the plane an empty chunk and the plane answers
+    /// with the fallback; no branch reaches [`Env::step`] around it (`INV-12`).
+    ///
+    /// `planes` is one [`SafetyPlane`] per env, because its hold target, rate-limit history and
+    /// latch are per-robot state (§9.3). `plans` is either empty — the raw `qpos ‖ qvel`
+    /// observation — or one [`CpuPlan`] per env, whose `TemporalWindow` rings are likewise
+    /// per-env (§7.5).
+    pub fn step_with_policy<const NJ: usize, const H: usize>(
+        &mut self,
+        runner: &mut DomainRunner<NJ, H>,
+        policy: &mut dyn PolicyRuntime,
+        planes: &mut [SafetyPlane<NJ, H>],
+        plans: &mut [CpuPlan],
+    ) -> Result<StepOutcome, EnvError> {
+        let nu = self.model.nu as usize;
+        if nu != NJ {
+            return Err(EnvError::shape("action dim", nu, NJ));
+        }
+        let sim_tick = self.tick.0;
+        {
+            let state = self.backend.state();
+            runner.observe_window(sim_tick, &self.model, &state, plans)?;
+        }
+        runner.infer_window(sim_tick, policy)?;
+        let mut ctrl = vec![0.0; self.n_envs as usize * nu];
+        runner.emit_actions(self.tick, planes, &mut ctrl)?;
+        let outcome = self.step(&ctrl)?;
+        for (env, done) in outcome.dones.iter().enumerate() {
+            if *done {
+                runner.reset_env(env as u32);
+            }
+        }
+        runner.advance();
         Ok(outcome)
     }
 
