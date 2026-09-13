@@ -926,6 +926,30 @@ fn backend_compare_unblocked_but_unavailable_exits_0() {
 }
 
 #[test]
+fn backend_compare_newton_is_skipped_or_runs() {
+    // arm2.xml has no explicit cone (default pyramidal) and no <actuator>/<sensor>, so it is
+    // never blocked by Newton's mapping report (spec 14.4) -- unlike `pendulum_fixture`, which
+    // is. That isolates the availability check this test targets.
+    let scene = Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/mjcf/arm2.xml"
+    ));
+    let out = bin()
+        .env("ES_PYTHON", "es-no-such-python")
+        .args(["backend", "compare", "--scene"])
+        .arg(scene)
+        .args(["--backends", "newton"])
+        .output()
+        .expect("run es");
+    let text = stdout(&out);
+    assert!(
+        text.contains("semantic mapping report - backend `newton`"),
+        "{text}"
+    );
+    assert!(text.contains("backend `newton`: SKIPPED"), "{text}");
+}
+
+#[test]
 fn backend_compare_unknown_backend_exits_2() {
     let scene = pendulum_fixture();
     let out = bin()

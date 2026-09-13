@@ -2,7 +2,7 @@
 
 use es_assets::scene::SceneDesc;
 use es_physics_backend::{
-    compare_backends, mapping_report, BackendKind, MjWarpBackend, MuJoCoCpuBackend,
+    compare_backends, mapping_report, BackendKind, MjWarpBackend, MuJoCoCpuBackend, NewtonBackend,
 };
 use es_physics_core::{LoadConfig, PhysicsBackend};
 
@@ -17,7 +17,7 @@ semantic-mapping report (spec 17.2) -- always, even when the backend is unavaila
 yet implemented. Then, for every pair of requested backends that are both available and not
 blocked by their mapping report, runs the same scene on both from a shared reset state and
 prints a spec 3.5 tier 3 comparison (spec 14.4: a mapping blocked by severity error never
-runs). `newton` and `physx` have no adapter yet and print a `not implemented (M2/M3)` row.
+runs). `physx` has no adapter yet and prints a `not implemented (M2/M3)` row.
 
     --scene <path>     MJCF (.xml) or URDF (.urdf) scene file
     --task <path>      Task IR TOML; reads its SceneRef path (must not be hash-only)
@@ -173,19 +173,21 @@ fn make_backend(kind: BackendKind) -> Box<dyn PhysicsBackend> {
     match kind {
         BackendKind::MuJoCoCpu => Box::new(MuJoCoCpuBackend::new()),
         BackendKind::MjWarp => Box::new(MjWarpBackend::new()),
-        BackendKind::Newton | BackendKind::PhysX => {
-            unreachable!("newton/physx are never in the `available` list")
+        BackendKind::Newton => Box::new(NewtonBackend::new()),
+        BackendKind::PhysX => {
+            unreachable!("physx is never in the `available` list")
         }
     }
 }
 
 /// `Ok(())` when the backend is implemented and its Python side is reachable; `Err(reason)`
-/// otherwise, `newton`/`physx` included (spec 17.1: no adapter until M2/M3).
+/// otherwise, `physx` included (spec 17.1: no adapter until M3).
 fn availability(kind: BackendKind) -> Result<(), String> {
     match kind {
         BackendKind::MuJoCoCpu => MuJoCoCpuBackend::is_available(),
         BackendKind::MjWarp => MjWarpBackend::is_available(),
-        BackendKind::Newton | BackendKind::PhysX => Err("not implemented (M2/M3)".to_owned()),
+        BackendKind::Newton => NewtonBackend::is_available(),
+        BackendKind::PhysX => Err("not implemented (M2/M3)".to_owned()),
     }
 }
 

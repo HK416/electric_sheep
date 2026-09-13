@@ -28,13 +28,14 @@ docs/packets/M1/CLI-backend-compare.md
   `.urdf`. `--task` reads the `SceneRef`; a hash-only ref (`path` empty) is a runtime
   error telling the user to pass `--scene` directly.
 - Prints `mapping_report(scene, kind)` for every requested backend first, unconditionally
-  -- this must run even for a backend with no adapter (`newton`, `physx`) or one that
-  turns out to be unavailable, so the semantic-mapping table is always visible.
+  -- this must run even for a backend with no adapter (`physx`) or one that turns out to
+  be unavailable, so the semantic-mapping table is always visible.
 - Then, per requested backend: a mapping report that is `blocked` (spec 14.4) is never
   probed for availability and is reported `SKIPPED (blocked by mapping report, ...)`
   naming the blocking features. Otherwise `MuJoCoCpuBackend::is_available()` /
-  `MjWarpBackend::is_available()` decide `available` vs `SKIPPED (<reason>)`; `newton`/
-  `physx` always print `SKIPPED (not implemented (M2/M3))` (no adapter exists).
+  `MjWarpBackend::is_available()` / `NewtonBackend::is_available()` decide `available` vs
+  `SKIPPED (<reason>)`; `physx` always prints `SKIPPED (not implemented (M2/M3))` (no
+  adapter exists).
 - For every pair of backends that both ended up `available`, constructs both instances,
   pre-loads each with a `LoadConfig { n_envs: --envs, seed: --seed, rate: None }` (so
   `compare_backends`, which only loads when `model_info()` is `None`, picks these up
