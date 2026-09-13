@@ -22,6 +22,8 @@ USAGE:
     es ir check <task.toml> <obs.toml> <learning.toml> <deploy.toml> [eval.toml]
     es task compile <task.toml> <obs.toml> [--release]
     es eval compare <A.json> <B.json>
+    es eval run --config <eval.toml> --policy <policy.esb> --scene <file.xml|urdf> [OPTIONS]
+    es import lerobot-config --config <config.json> [--stats ...] [--dataset ...] --out <dir>
     es dataset info <root>
     es backend compare --scene <file.xml|urdf> --backends mujoco-cpu,mjwarp[,newton,physx]
     es bench [--memory-report --obs <obs.toml> ...]
@@ -43,6 +45,7 @@ fn dispatch(args: &[String]) -> Result<u8, CliError> {
         Some("ir") => cmd::ir::dispatch(&args[1..]),
         Some("task") => cmd::task::dispatch(&args[1..]),
         Some("eval") => cmd::eval::dispatch(&args[1..]),
+        Some("import") => cmd::import::dispatch(&args[1..]),
         Some("dataset") => cmd::dataset::dispatch(&args[1..]),
         Some("backend") => cmd::backend::dispatch(&args[1..]),
         Some("bench") => cmd::bench::dispatch(&args[1..]),

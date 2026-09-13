@@ -1058,3 +1058,127 @@ fn bench_memory_report_missing_obs_is_usage_error() {
         .expect("run es");
     assert_eq!(out.status.code(), Some(2));
 }
+
+// --- `es eval run` / `es import lerobot-config` (M2 packet CLI-eval-run-import) --------------
+
+/// Bytes that stand in for a checkpoint, exactly as
+/// `crates/es-runtime-embedded/tests/embedded.rs` does it: nothing parses them, the bundle
+/// only has to carry them intact and hash-match.
+const WEIGHTS: &[u8] = b"not really safetensors, but hashed like it";
+
+/// The fixture's inference budget is two control periods, which only admits a replan every
+/// other tick; widening it (INV-12: widen the envelope, never disable a watchdog) lets the
+/// 10 Hz replan cadence the Learning IR declares actually fit -- copied from
+/// `crates/es-runtime-embedded/tests/embedded.rs`.
+fn widen_inference_budget(dep: &mut DeploymentIr) {
+    let period = dep.rate.control_period().0;
+    dep.deadlines.inference_budget = Micros(period * 12);
+    dep.deadlines.observation_age = Micros(period * 16);
+    for w in &mut dep.watchdogs.0 {
+        match w {
+            Watchdog::InferenceDeadline { budget } => *budget = dep.deadlines.inference_budget,
+            Watchdog::StaleObservation { max_age } => *max_age = dep.deadlines.observation_age,
+            _ => {}
+        }
+    }
+}
+
+/// The fixture, with the weights reference pointing at [`WEIGHTS`] and a deployment whose
+/// timing admits the declared replan cadence.
+fn deployable_fixture() -> Fixture {
+    let mut f = Fixture::new();
+    f.learning.policy.weights = WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(WEIGHTS).as_bytes(),
+    };
+    widen_inference_budget(&mut f.deployment);
+    assert!(f.diags().is_empty(), "fixture must stay consistent");
+    f
+}
+
+fn build_policy_bundle(f: &Fixture) -> Vec<u8> {
+    es_compile::PolicyBundle::build(&f.task, &f.observation, &f.learning, &f.deployment, WEIGHTS)
+        .expect("the fixture builds a policy bundle")
+}
+
+/// CI's PR job (spec 1.4) has neither a `mujoco` Python nor a `torch` Python, so `eval run`
+/// must refuse to fake a run and exit with the distinct SKIPPED code instead of 0 or 1.
+#[test]
+fn eval_run_skips_when_backend_or_runtime_unavailable() {
+    let dir = scratch_dir("eval-run-skip");
+    let f = deployable_fixture();
+
+    let policy_path = dir.join("policy.esb");
+    std::fs::write(&policy_path, build_policy_bundle(&f)).expect("write policy.esb");
+    let config_path = dir.join("eval.toml");
+    write(
+        &config_path,
+        &es_ir::serial::evaluation_to_toml(&f.evaluation).expect("evaluation toml"),
+    );
+
+    let out = bin()
+        .args(["eval", "run", "--config"])
+        .arg(&config_path)
+        .arg("--policy")
+        .arg(&policy_path)
+        // The backend/runtime availability check happens before the scene is ever read
+        // (never fake a run, spec 1.4), so a scene that does not exist is fine here.
+        .arg("--scene")
+        .arg("does-not-exist.xml")
+        .arg("--out")
+        .arg(dir.join("out"))
+        .output()
+        .expect("run es");
+    let text = stdout(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("SKIPPED"), "{text}");
+}
+
+/// `es import lerobot-config` on the shared M2 W6 fixture (spec 14.4), round-tripping the
+/// two IRs it writes through `es ir validate`.
+#[test]
+fn import_lerobot_config_round_trips_through_ir_validate() {
+    let dir = scratch_dir("import-lerobot");
+    let config = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/lerobot_config/act_config.json"
+    );
+    let out_dir = dir.join("out");
+
+    let out = bin()
+        .args(["import", "lerobot-config", "--config", config, "--out"])
+        .arg(&out_dir)
+        .output()
+        .expect("run es");
+    let text = stdout(&out);
+    assert!(
+        out.status.success(),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("observation_hash:"), "{text}");
+    assert!(text.contains("learning_hash:"), "{text}");
+
+    let observation = out_dir.join("observation.toml");
+    let learning = out_dir.join("learning.toml");
+    assert!(observation.is_file());
+    assert!(learning.is_file());
+
+    let validate = bin()
+        .args(["ir", "validate"])
+        .args([&observation, &learning])
+        .output()
+        .expect("run es");
+    let vtext = stdout(&validate);
+    assert!(
+        validate.status.success(),
+        "stdout:\n{vtext}\nstderr:\n{}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    assert!(!vtext.contains("ERROR"), "{vtext}");
+}

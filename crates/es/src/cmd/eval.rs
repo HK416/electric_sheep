@@ -1,6 +1,13 @@
-//! `es eval compare` (spec 10.5).
+//! `es eval compare` / `es eval run` (spec 10.5).
 
-use es_ir::evaluation::{EvaluationReport, MetricValue};
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use es_compile::PolicyBundle;
+use es_eval::{Evaluation, RunConfig};
+use es_ir::evaluation::{AcceptanceResult, EvaluationReport, MetricValue};
+use es_physics_backend::MuJoCoCpuBackend;
+use es_policy::{PolicyRuntime, TorchRuntime, WeightsSource};
 
 use crate::error::CliError;
 
@@ -17,11 +24,39 @@ a two-sided Welch t-test p-value is computed (plain Rust, no stats crate) and fl
 when |p| < 0.05.
 ";
 
+const RUN_HELP: &str = "\
+es eval run --config <eval.toml> --policy <policy.esb> --scene <file.xml|urdf> [OPTIONS]
+
+Opens the policy bundle (spec 9.6, `PolicyBundle::open`), parses the Evaluation IR from
+--config, and checks that the requested physics backend and policy runtime are actually
+available before doing anything else -- an evaluation this machine cannot really run is
+refused, never faked (spec 1.4). When either is unavailable, prints `SKIPPED (<reason>)`
+and exits 3.
+
+Otherwise loads the scene, runs the evaluation (`es_eval::Evaluation::run`) and writes,
+under --out:
+  report.json         spec 10.5, via `es_eval::write_artifacts`
+  evaluation.lock      spec 10.5, via `es_eval::write_artifacts`
+  report.html          a minimal static HTML table rendered from report.json (escaped,
+                        no template crate)
+`episodes/` replay is not produced by this build -- there is no renderer yet (M2 packet
+CLI-eval-run-import); `report.html` carries no failure-episode links because of that.
+
+    --out <dir>        output directory (default: ./eval-out)
+    --backend <name>   physics backend; only `mujoco-cpu` is supported (default, spec 17.1)
+    --runtime <name>   policy runtime; only `torch` is supported (default, spec 2.4)
+
+Exit code: 0 when every acceptance result is Determined{passed: true}; 1 when any failed or
+is Unavailable (both printed); 2 on a usage error; 3 when the backend or runtime is
+unavailable (distinct from 1: nothing ran).
+";
+
 pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
     match args.first().map(String::as_str) {
         Some("compare") => compare(&args[1..]),
+        Some("run") => run(&args[1..]),
         Some("--help" | "-h") | None => {
-            println!("{HELP}");
+            println!("{HELP}\n{RUN_HELP}");
             Ok(0)
         }
         Some(other) => Err(CliError::Usage(format!(
@@ -142,6 +177,259 @@ fn compare(args: &[String]) -> Result<u8, CliError> {
     println!();
     println!("A: passed={}   B: passed={}", a.passed, b.passed);
     Ok(0)
+}
+
+// --- `es eval run` ---------------------------------------------------------------------------
+
+struct RunArgs {
+    config: String,
+    policy: String,
+    scene: String,
+    out: PathBuf,
+    backend: String,
+    runtime: String,
+}
+
+fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
+    let (mut config, mut policy, mut scene, mut out) = (None, None, None, None);
+    let (mut backend, mut runtime) = ("mujoco-cpu".to_owned(), "torch".to_owned());
+
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut val = || {
+            it.next()
+                .ok_or_else(|| CliError::Usage(format!("{a}: missing value\n\n{RUN_HELP}")))
+        };
+        match a.as_str() {
+            "--help" | "-h" => return Err(CliError::Usage(RUN_HELP.to_owned())),
+            "--config" => config = Some(val()?.clone()),
+            "--policy" => policy = Some(val()?.clone()),
+            "--scene" => scene = Some(val()?.clone()),
+            "--out" => out = Some(PathBuf::from(val()?)),
+            "--backend" => backend.clone_from(val()?),
+            "--runtime" => runtime.clone_from(val()?),
+            other => {
+                return Err(CliError::Usage(format!(
+                    "unknown flag '{other}'\n\n{RUN_HELP}"
+                )))
+            }
+        }
+    }
+    let req = |v: Option<String>, name: &str| {
+        v.ok_or_else(|| CliError::Usage(format!("{name} is required\n\n{RUN_HELP}")))
+    };
+    Ok(RunArgs {
+        config: req(config, "--config")?,
+        policy: req(policy, "--policy")?,
+        scene: req(scene, "--scene")?,
+        out: out.unwrap_or_else(|| PathBuf::from("eval-out")),
+        backend,
+        runtime,
+    })
+}
+
+/// `Evaluation::run` (and the `SafetyPlane` inside it) is generic over the joint count and
+/// chunk horizon, which a `policy.esb` only reveals at runtime. Rather than a speculative
+/// type-erased `PhysicsBackend`/`SafetyPlane` path, this enumerates the (joints, horizon)
+/// pairs the fixtures and real robots in this repo actually use.
+/// ponytail: a fixed dispatch table, not a runtime-generic solver -- add a pair here when a
+/// new robot/horizon combination needs `es eval run`.
+macro_rules! dispatch_nj_h {
+    ($nj:expr, $h:expr, $($args:expr),+ $(,)?) => {
+        match ($nj, $h) {
+            (1, 1) => run_typed::<1, 1>($($args),+),
+            (6, 1) => run_typed::<6, 1>($($args),+),
+            (6, 8) => run_typed::<6, 8>($($args),+),
+            (6, 16) => run_typed::<6, 16>($($args),+),
+            (6, 50) => run_typed::<6, 50>($($args),+),
+            (7, 1) => run_typed::<7, 1>($($args),+),
+            (7, 8) => run_typed::<7, 8>($($args),+),
+            (7, 16) => run_typed::<7, 16>($($args),+),
+            (7, 50) => run_typed::<7, 50>($($args),+),
+            (8, 50) => run_typed::<8, 50>($($args),+),
+            (nj, h) => Err(CliError::Runtime(format!(
+                "unsupported (n_joints={nj}, horizon={h}); es eval run supports a fixed table \
+                 of pairs (crates/es/src/cmd/eval.rs) -- add one for this robot"
+            ))),
+        }
+    };
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_typed<const NJ: usize, const H: usize>(
+    bundle: &PolicyBundle,
+    eval_ir: &es_ir::evaluation::EvaluationIr,
+    scene: &es_assets::scene::SceneDesc,
+    policy: &mut dyn PolicyRuntime,
+    cfg: &RunConfig,
+) -> Result<(EvaluationReport, es_eval::EvaluationLock), CliError> {
+    Evaluation::run::<MuJoCoCpuBackend, _, NJ, H>(
+        eval_ir,
+        &bundle.task,
+        scene,
+        &bundle.observation,
+        policy,
+        &bundle.deployment,
+        MuJoCoCpuBackend::new,
+        cfg,
+    )
+    .map_err(|e| CliError::Runtime(e.to_string()))
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// `report.html` (spec 10.5): a table over the same data as `report.json`, no template crate.
+fn write_report_html(report: &EvaluationReport, path: &Path) -> Result<(), CliError> {
+    use std::fmt::Write as _;
+
+    let mut html = String::new();
+    html.push_str("<!doctype html>\n<meta charset=\"utf-8\">\n<title>Evaluation report</title>\n");
+    let _ = write!(
+        html,
+        "<h1>Evaluation report</h1>\n<p>evaluation_hash: {}<br>execution_hash: {}<br>passed: {}</p>\n",
+        crate::util::hex(&report.evaluation_hash),
+        crate::util::hex(&report.execution_hash),
+        report.passed,
+    );
+    html.push_str(
+        "<h2>cells</h2>\n<table border=\"1\"><tr><th>suite</th><th>metric</th><th>value</th><th>n_episodes</th></tr>\n",
+    );
+    for c in &report.cells {
+        let _ = writeln!(
+            html,
+            "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+            escape_html(&c.suite),
+            escape_html(c.metric.name()),
+            escape_html(&value_repr(&c.value)),
+            c.n_episodes,
+        );
+    }
+    html.push_str(
+        "</table>\n<h2>acceptance</h2>\n<table border=\"1\"><tr><th>suite</th><th>metric</th><th>observed</th><th>passed</th></tr>\n",
+    );
+    for a in &report.acceptance {
+        match a {
+            AcceptanceResult::Determined {
+                criterion,
+                observed,
+                passed,
+            } => {
+                let _ = writeln!(
+                    html,
+                    "<tr><td>{}</td><td>{}</td><td>{observed}</td><td>{passed}</td></tr>",
+                    escape_html(criterion.suite.as_deref().unwrap_or("*")),
+                    escape_html(criterion.metric.name()),
+                );
+            }
+            AcceptanceResult::Unavailable { metric, reason } => {
+                let _ = writeln!(
+                    html,
+                    "<tr><td>*</td><td>{}</td><td colspan=\"2\">unavailable: {}</td></tr>",
+                    escape_html(metric.name()),
+                    escape_html(reason),
+                );
+            }
+        }
+    }
+    html.push_str("</table>\n");
+    std::fs::write(path, html).map_err(|e| CliError::Runtime(format!("{}: {e}", path.display())))
+}
+
+fn now_unix() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn run(args: &[String]) -> Result<u8, CliError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{RUN_HELP}");
+        return Ok(0);
+    }
+    let a = parse_run_args(args)?;
+    if a.backend != "mujoco-cpu" {
+        return Err(CliError::Usage(format!(
+            "unknown --backend '{}': only mujoco-cpu is supported\n\n{RUN_HELP}",
+            a.backend
+        )));
+    }
+    if a.runtime != "torch" {
+        return Err(CliError::Usage(format!(
+            "unknown --runtime '{}': only torch is supported\n\n{RUN_HELP}",
+            a.runtime
+        )));
+    }
+
+    let bytes =
+        std::fs::read(&a.policy).map_err(|e| CliError::Runtime(format!("{}: {e}", a.policy)))?;
+    let bundle = PolicyBundle::open(&bytes).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let config_raw = std::fs::read_to_string(&a.config)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", a.config)))?;
+    let eval_ir = es_ir::serial::evaluation_from_toml(&config_raw)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", a.config)))?;
+
+    if let Err(reason) = MuJoCoCpuBackend::is_available() {
+        println!("SKIPPED (mujoco-cpu backend unavailable: {reason})");
+        return Ok(3);
+    }
+    if let Err(reason) = es_policy::torch_runtime::is_available() {
+        println!("SKIPPED (torch runtime unavailable: {reason})");
+        return Ok(3);
+    }
+
+    let scene = super::backend::load_scene(&a.scene)?;
+
+    let mut policy = TorchRuntime::new();
+    policy
+        .load(
+            &bundle.learning,
+            &WeightsSource::InMemory(bundle.weights.clone()),
+        )
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+
+    let cfg = RunConfig {
+        created: now_unix(),
+        ..RunConfig::default()
+    };
+    let nj = bundle.deployment.robot.n_joints;
+    let h = bundle.deployment.action.horizon;
+    let (report, lock) = dispatch_nj_h!(nj, h, &bundle, &eval_ir, &scene, &mut policy, &cfg)?;
+
+    std::fs::create_dir_all(&a.out)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", a.out.display())))?;
+    es_eval::write_artifacts(&report, &lock, &a.out)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    write_report_html(&report, &a.out.join("report.html"))?;
+
+    let mut ok = true;
+    for r in &report.acceptance {
+        match r {
+            AcceptanceResult::Determined { passed: true, .. } => {}
+            AcceptanceResult::Determined {
+                criterion,
+                observed,
+                passed: false,
+            } => {
+                ok = false;
+                println!(
+                    "FAILED suite={:?} metric={} observed={observed}",
+                    criterion.suite,
+                    criterion.metric.name()
+                );
+            }
+            AcceptanceResult::Unavailable { metric, reason } => {
+                ok = false;
+                println!("UNAVAILABLE metric={}: {reason}", metric.name());
+            }
+        }
+    }
+    println!("wrote {}", a.out.display());
+    Ok(u8::from(!ok))
 }
 
 // --- Welch's t-test, in plain Rust (no stats crate) -----------------------------------------

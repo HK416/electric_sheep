@@ -122,7 +122,7 @@ fn parse_args(args: &[String]) -> Result<Args, CliError> {
     })
 }
 
-fn load_scene(path: &str) -> Result<SceneDesc, CliError> {
+pub(crate) fn load_scene(path: &str) -> Result<SceneDesc, CliError> {
     let raw =
         std::fs::read_to_string(path).map_err(|e| CliError::Runtime(format!("{path}: {e}")))?;
     let is_urdf = std::path::Path::new(path)

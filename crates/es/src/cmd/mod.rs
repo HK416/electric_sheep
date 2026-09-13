@@ -5,5 +5,6 @@ pub mod bench;
 pub mod check_deps;
 pub mod dataset;
 pub mod eval;
+pub mod import;
 pub mod ir;
 pub mod task;

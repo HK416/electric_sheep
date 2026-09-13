@@ -18,6 +18,10 @@ es-physics-core = { workspace = true }
 es-assets = { workspace = true }
 es-data = { workspace = true }
 es-telemetry = { workspace = true }
+es-eval = { workspace = true }
+es-env = { workspace = true }
+es-safety = { workspace = true }
+es-policy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
