@@ -7,6 +7,7 @@
 
 use es_assets::scene::{Body, Geom, SceneDesc, Shape};
 use es_core::StableId;
+use es_math::approx::{self, coeffs::PI};
 use es_math::{Pose, Vec3};
 use std::collections::BTreeMap;
 
@@ -133,7 +134,7 @@ fn face_normal(v: &[[f32; 3]; 3]) -> Option<[f32; 3]> {
         e1[2] * e2[0] - e1[0] * e2[2],
         e1[0] * e2[1] - e1[1] * e2[0],
     ];
-    let len = es_math::approx::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+    let len = approx::sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
     (len > 0.0).then(|| [c[0] / len, c[1] / len, c[2] / len])
 }
 
@@ -259,16 +260,30 @@ fn box_tris(h: Vec3) -> Vec<[Vec3; 3]> {
         .collect()
 }
 
+/// Longitude angle of segment `seg`, in `f32`. `seg == SPHERE_SEGMENTS` is the wrap-around
+/// copy of segment 0 and is folded onto it, so the seam closes exactly instead of on a
+/// `sin(2*pi)` residue.
+fn phi_of(seg: u32) -> f32 {
+    2.0 * PI * (seg % SPHERE_SEGMENTS) as f32 / SPHERE_SEGMENTS as f32
+}
+
 /// UV sphere scaled per axis. `SPHERE_RINGS` latitude bands, `SPHERE_SEGMENTS` longitude.
+///
+/// The unit direction is computed entirely in `f32` through [`approx`] — never the host
+/// `libm` (spec 3.2, 3.4) — then widened exactly and scaled by the `f64` radii. These
+/// vertices are what `TriScene::to_floats` uploads to the GPU *and* what the CPU reference
+/// traverses, so a host-dependent `sin` here would desynchronize the two paths.
 #[allow(clippy::many_single_char_names)]
 fn ellipsoid_tris(r: Vec3) -> Vec<[Vec3; 3]> {
     let point = |ring: u32, seg: u32| {
-        let theta = std::f64::consts::PI * f64::from(ring) / f64::from(SPHERE_RINGS);
-        let phi = 2.0 * std::f64::consts::PI * f64::from(seg) / f64::from(SPHERE_SEGMENTS);
+        let theta = PI * ring as f32 / SPHERE_RINGS as f32;
+        let phi = phi_of(seg);
+        let (st, ct) = (approx::sin(theta), approx::cos(theta));
+        let (sp, cp) = (approx::sin(phi), approx::cos(phi));
         Vec3::new(
-            r.x * theta.sin() * phi.cos(),
-            r.y * theta.sin() * phi.sin(),
-            r.z * theta.cos(),
+            r.x * f64::from(st * cp),
+            r.y * f64::from(st * sp),
+            r.z * f64::from(ct),
         )
     };
     let mut out = Vec::new();
@@ -291,8 +306,12 @@ fn ellipsoid_tris(r: Vec3) -> Vec<[Vec3; 3]> {
 /// flat discs (cylinder).
 fn capsule_tris(radius: f64, half_length: f64, round_caps: bool) -> Vec<[Vec3; 3]> {
     let ring = |seg: u32, z: f64, r: f64| {
-        let phi = 2.0 * std::f64::consts::PI * f64::from(seg) / f64::from(SPHERE_SEGMENTS);
-        Vec3::new(r * phi.cos(), r * phi.sin(), z)
+        let phi = phi_of(seg);
+        Vec3::new(
+            r * f64::from(approx::cos(phi)),
+            r * f64::from(approx::sin(phi)),
+            z,
+        )
     };
     let mut out = Vec::new();
     for seg in 0..SPHERE_SEGMENTS {
@@ -312,9 +331,12 @@ fn capsule_tris(radius: f64, half_length: f64, round_caps: bool) -> Vec<[Vec3; 3
             for band in 0..CAP_RINGS {
                 for seg in 0..SPHERE_SEGMENTS {
                     let cap = |band: u32, seg: u32| {
-                        let t =
-                            std::f64::consts::FRAC_PI_2 * f64::from(band) / f64::from(CAP_RINGS);
-                        ring(seg, z0 + sign * radius * t.sin(), radius * t.cos())
+                        let t = 0.5 * PI * band as f32 / CAP_RINGS as f32;
+                        ring(
+                            seg,
+                            z0 + sign * radius * f64::from(approx::sin(t)),
+                            radius * f64::from(approx::cos(t)),
+                        )
                     };
                     let (a, b) = (cap(band, seg), cap(band, seg + 1));
                     let (c, d) = (cap(band + 1, seg + 1), cap(band + 1, seg));
@@ -470,6 +492,56 @@ mod tests {
         )]);
         let err = TriScene::from_scene(&s).unwrap_err();
         assert!(matches!(err, RenderError::UnsupportedShape { ref geom, .. } if geom == "m"));
+    }
+
+    /// The tessellation feeds both paths: `to_floats` is what `Renderer::upload_tris`
+    /// hands the GPU, `tris` is what `cpu::rasterize` traverses. Asserting the upload
+    /// buffer carries the vertices bit for bit is what makes "same vertices on both sides"
+    /// a test rather than a comment — and the repeat pass pins that the `f32`
+    /// `approx::{sin, cos}` tessellation is reproducible (spec 3.4).
+    #[test]
+    fn curved_shapes_upload_the_vertices_the_cpu_reference_traverses() {
+        let s = scene(vec![body(
+            "b",
+            Pose::IDENTITY,
+            vec![
+                geom("s", Shape::Sphere { radius: 0.37 }, [1.0; 4]),
+                geom(
+                    "c",
+                    Shape::Capsule {
+                        radius: 0.21,
+                        half_length: 0.6,
+                    },
+                    [1.0; 4],
+                ),
+                geom(
+                    "y",
+                    Shape::Cylinder {
+                        radius: 0.21,
+                        half_length: 0.6,
+                    },
+                    [1.0; 4],
+                ),
+            ],
+        )]);
+        let tri = TriScene::from_scene(&s).unwrap();
+        let floats = tri.to_floats();
+        assert!(tri.tris.len() > 200, "{} triangles", tri.tris.len());
+        for (i, t) in tri.tris.iter().enumerate() {
+            for (j, v) in t.v.iter().flatten().enumerate() {
+                let got = floats[i * TRI_STRIDE + j];
+                assert_eq!(
+                    got.to_bits(),
+                    v.to_bits(),
+                    "triangle {i} component {j}: upload buffer differs from the CPU vertex"
+                );
+                assert!(v.is_finite(), "triangle {i} component {j} is not finite");
+            }
+        }
+        assert!(
+            TriScene::from_scene(&s).unwrap() == tri,
+            "tessellation is not reproducible"
+        );
     }
 
     #[test]

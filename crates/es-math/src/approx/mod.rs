@@ -27,7 +27,8 @@ use coeffs::{
     ATAN_C0, ATAN_C1, ATAN_C2, ATAN_C3, COS_C0, COS_C1, COS_C2, EXP_C0, EXP_C1, EXP_C2, EXP_C3,
     EXP_C4, EXP_C5, LN2_HI, LN2_LO, LOG2E, LOG_C0, LOG_C1, LOG_C2, LOG_C3, LOG_C4, LOG_C5, LOG_C6,
     LOG_C7, LOG_C8, PI, PIO2, PIO2_1, PIO2_2, PIO2_3, PIO2_LO, PIO4, PIO4_LO, PI_LO, SIN_C0,
-    SIN_C1, SIN_C2, SQRT_HALF, TAN_PIO8, TWO_OVER_PI,
+    SIN_C1, SIN_C2, SQRT_HALF, TAN_C0, TAN_C1, TAN_C2, TAN_C3, TAN_C4, TAN_C5, TAN_PIO8,
+    TWO_OVER_PI,
 };
 
 /// `2^k` for `k` in `[-126, 127]`, built directly in the exponent field (exact).
@@ -114,6 +115,38 @@ pub fn cos(x: f32) -> f32 {
         1 => -sin_kernel(r),
         2 => -cos_kernel(r),
         _ => sin_kernel(r),
+    }
+}
+
+/// `tan(r)` for `|r| <= pi/4`.
+#[inline]
+fn tan_kernel(r: f32) -> f32 {
+    let z = r * r;
+    (((((TAN_C0 * z + TAN_C1) * z + TAN_C2) * z + TAN_C3) * z + TAN_C4) * z + TAN_C5) * z * r + r
+}
+
+/// Tangent, over the same Cody-Waite reduction [`sin`] and [`cos`] use.
+///
+/// A dedicated minimax rather than `sin(x) / cos(x)`: the quotient measures 3 ULP (two
+/// kernel errors plus the division), over the 2 ULP target. `tan` has period pi, so only
+/// the low bit of the quadrant matters — `-1.0 / tan(r)` on the odd quadrants, which is
+/// where the pole at `pi/2` comes from.
+///
+/// Primary domain `|x| <= 6.5`, away from the poles at odd multiples of `pi/2` — narrower
+/// than `sin`/`cos` because `tan'(x) = 1 + tan^2(x)` amplifies the residual argument error
+/// of the shared reduction: 2 ULP there, 3 ULP measured out to `|x| = 1e3`, and unbounded
+/// within `~1e-3` of a pole (`docs/design/transcendental.md`). Non-finite gives `NaN`.
+#[must_use]
+pub fn tan(x: f32) -> f32 {
+    if !x.is_finite() {
+        return f32::NAN;
+    }
+    let (r, quadrant) = reduce_quadrant(x);
+    let y = tan_kernel(r);
+    if quadrant & 1 == 0 {
+        y
+    } else {
+        -1.0 / y
     }
 }
 
@@ -310,6 +343,42 @@ mod tests {
         assert!(sweep("rsqrt", 1e-30, 1e30, rsqrt, |v| 1.0 / v.sqrt()) <= 2);
     }
 
+    /// `tan` needs its own sweep: the reference has poles, so points are filtered by
+    /// magnitude rather than by domain (see the `tan` docs for why).
+    fn tan_sweep(lo: f64, hi: f64, seed: u64) -> u64 {
+        let mut rng = Rng(seed);
+        let (mut worst, mut worst_at, mut skipped) = (0, 0.0f32, 0usize);
+        for i in 0..POINTS {
+            for x in [
+                (lo + (hi - lo) * i as f64 / POINTS as f64) as f32,
+                rng.range(lo, hi),
+            ] {
+                let want = f64::from(x).tan();
+                // |tan x| > 1e3 is within ~1e-3 of an odd multiple of pi/2.
+                if want.abs() > 1e3 {
+                    skipped += 1;
+                    continue;
+                }
+                let d = ulp(tan(x), want as f32);
+                if d > worst {
+                    worst = d;
+                    worst_at = x;
+                }
+            }
+        }
+        println!("approx::tan    max {worst} ULP over [{lo}, {hi}] minus poles ({skipped} near-pole points skipped, worst at {worst_at:e})");
+        worst
+    }
+
+    #[test]
+    fn tan_ulp_within_target() {
+        assert!(tan_sweep(-1.5, 1.5, 0x1234_5678_9abc_def0) <= 2);
+        assert!(tan_sweep(-6.5, 6.5, 0x1357_9bdf_0246_8ace) <= 2);
+        // Beyond the primary domain the bound is not claimed, only reported: the residual
+        // error of the reduction is amplified by tan'(x) = 1 + tan^2.
+        tan_sweep(-1e3, 1e3, 0x0f1e_2d3c_4b5a_6978);
+    }
+
     #[test]
     fn atan2_ulp_within_target() {
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
@@ -336,6 +405,10 @@ mod tests {
         assert!(sin(f32::NAN).is_nan());
         assert!(sin(f32::INFINITY).is_nan());
         assert_eq!(sin(0.0), 0.0);
+        assert!(tan(f32::NAN).is_nan());
+        assert!(tan(f32::INFINITY).is_nan());
+        assert_eq!(tan(0.0), 0.0);
+        assert!((tan(PIO4) - 1.0).abs() < 1e-6);
         assert_eq!(cos(0.0), 1.0);
         assert_eq!(exp(0.0), 1.0);
         assert_eq!(exp(f32::NEG_INFINITY), 0.0);

@@ -126,6 +126,17 @@ world pose from its parent chain, and tessellates every `Geom` into world-space 
 Tessellation counts are constants, not a quality setting: a changed count changes every
 golden, so it must be a deliberate edit, not a knob.
 
+The curved shapes' vertex directions are computed in `f32` through `es_math::approx::{sin,
+cos}`, never the host `libm` (§3.2 `DET-010`), then widened exactly to `f64` and scaled by the
+`f64` radii. The tessellation runs on the CPU for **both** paths — `Renderer::upload_tris`
+uploads `TriScene::to_floats()` and `es_render::cpu` traverses the same `TriScene` — so a
+host-dependent `sin` here would hand the GPU different geometry than the reference on a
+different machine, silently. The longitude angle folds `seg == SPHERE_SEGMENTS` onto segment
+0 (`phi_of`) so the seam closes on identical bits rather than on a `sin(2π)` residue, which in
+`f32` is ~1e-7 rather than the ~1e-16 of the `f64` version it replaced. The unit test
+`curved_shapes_upload_the_vertices_the_cpu_reference_traverses` asserts the upload buffer
+carries the CPU's vertices bit for bit, and that a repeat tessellation reproduces them.
+
 Each triangle carries: 3 world positions (f32), a world geometric normal (f32×3, from the
 triangle winding), an albedo (f32×3, `Geom::rgba` RGB), an emission (f32×3, non-zero only for
 geoms whose name ends in `_light` — see [§4.2](#42-restir-di)), and a segmentation id (u32).
@@ -166,6 +177,14 @@ intrinsics (§7.2 `OBS-034`, INV-14) and this crate has no `ImageSpec::resized` 
 correctly.
 
 ### 2.3 Camera convention (§3.1)
+
+`Intrinsics::from_fovy` is on the golden camera path: `fx`/`fy` feed the per-view parameter
+buffer, and every golden pixel is a function of them. It therefore takes the `f64` `fovy` the
+asset stores, casts once, and does the rest in `f32` through `es_math::approx::tan` in a fixed
+order — halve, `tan`, divide. The host `libm` `tan` it replaced was not pinned by anything
+(review M4 S-11); moving to `approx::tan` shifted `fy` at 64×64 / `fovy = 1.2` by exactly 1
+ULP (`46.774269` → `46.774265`), which is why the `Rs` goldens were regenerated — see
+[§5](#5-cpu-references-14).
 
 `CameraView { pose, spec }`. `pose` is `T_world_camera`. The camera frame is OpenCV: **+Z
 forward, +X right, +Y down**. Image origin is top-left, x right, y down. The primary ray for
@@ -395,6 +414,22 @@ still agreed. Overlapping the walls into the floor and ceiling removed all nine.
 | `cornell_rs_depth` | `Depth32` | f32 | 64×64 |
 | `cornell_rs_seg` | `SegmentationId` | u32 | 64×64 |
 | `cornell_pt1spp` | `PtRadiance` | f32 | 64×64×3 |
+
+Regenerated once since they were first written, for review M4 S-11 (`Intrinsics::from_fovy`
+moving from the host `tan` to `es_math::approx::tan`, [§2.3](#23-camera-convention-31)). The
+1 ULP shift in `fy` is a sub-pixel change of the ray directions, so the diff is confined to
+silhouette edges:
+
+| golden | diff |
+|---|---|
+| `cornell_rs_rgb8` | 57 of 12288 bytes differ (edge pixels, so up to 183 on a red-wall/white-box boundary) |
+| `cornell_rs_depth` | 1604 of 4096 floats differ, max abs 4.05e-6 m, max 17 ULP |
+| `cornell_rs_seg` | 19 of 4096 pixels take the neighbouring geom |
+| `cornell_pt1spp` | **byte-identical** |
+
+The GPU still matches the regenerated files exactly (`Rgb8`/`SegmentationId` bit-equal,
+`Depth32`/`Normal` 0 ULP on an RTX 4060), which is the point: the shift is in the shared
+input, not in either path's arithmetic.
 
 `cornell_pt1spp` is 1 spp, 2 bounces, ReSTIR and SVGF off — the smallest thing that exercises
 the RNG, the bounce loop and the emissive hit, and the only PT configuration a golden can pin

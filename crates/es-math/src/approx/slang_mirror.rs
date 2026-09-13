@@ -55,6 +55,7 @@ fn slang_mirror_keeps_the_horner_expressions() {
         "(((((EXP_C0 * r + EXP_C1) * r + EXP_C2) * r + EXP_C3) * r + EXP_C4) * r + EXP_C5) * z",
         "((((((((LOG_C0 * m + LOG_C1) * m + LOG_C2) * m + LOG_C3) * m + LOG_C4) * m + LOG_C5)",
         "(((ATAN_C0 * z + ATAN_C1) * z + ATAN_C2) * z + ATAN_C3) * z * x + x",
+        "(((((TAN_C0 * z + TAN_C1) * z + TAN_C2) * z + TAN_C3) * z + TAN_C4) * z + TAN_C5) * z * r + r",
         "((x - n * PIO2_1) - n * PIO2_2) - n * PIO2_3",
     ] {
         assert!(slang.contains(expr), "missing from approx.slang: {expr}");

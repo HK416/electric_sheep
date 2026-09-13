@@ -26,6 +26,7 @@ coefficients *and* evaluation order.
 | fn | primary domain | reduction |
 |---|---|---|
 | `sin`, `cos` | `|x| ≤ 1e3` | Cody–Waite: `n = floor(x·2/π + 0.5)` (`floor`, not `round` — HLSL/Slang `round` is round-half-to-even while Rust's is round-half-away, so the mirror must not use it), `r = ((x − n·DP1) − n·DP2) − n·DP3`, three `f32` constants carrying ≈ 48 bits of π/2. Quadrant `n & 3` selects the sin- or cos-kernel and the sign. |
+| `tan` | `|x| ≤ 6.5`, off the poles | The **same** `reduce_quadrant` as `sin`/`cos` — one reduction, one place to get wrong. `tan` has period π, so only `quadrant & 1` matters: the even quadrants return the kernel, the odd ones `-1.0 / kernel`. The kernel is Cephes `tanf.c`'s own 6-term minimax in `r²`, **not** `sin(x)/cos(x)`: the quotient measures 3 ULP (two kernel errors plus the division), over target. The domain is narrower than `sin`/`cos` because `tan'(x) = 1 + tan²(x)` amplifies the reduction's residual argument error — see the table below. |
 | `exp` | `[-88, 88]` (f32 range) | `n = floor(x·log2e + 0.5)`, `r = (x − n·LN2_HI) − n·LN2_LO`, polynomial on `r`, then scale by `2^n` built with `f32::from_bits` (exact). |
 | `ln` | `(0, f32::MAX]` | `x = m·2^e` with `m ∈ [√½, √2)` via exponent-field extraction, polynomial in `m − 1`, then `+ e·ln2` split into `LN2_HI/LN2_LO`. |
 | `atan2` | all finite `(y, x)` | `atan` on `|y/x|` or `|x/y|`, itself reduced to `[0, tan(π/8)]` by `t → (t−1)/(t+1)`, then quadrant fix-up. Each of `π`, `π/2`, `π/4` is carried as a `_HI`/`_LO` pair (nearest `f32` plus the `f32` residue of the true value); reconstructing as `(PI - a) + PI_LO` rather than `PI - a` is what takes `atan2` from 3 ULP to 2. |
@@ -39,8 +40,8 @@ implemented (no kernel in the spec needs it, and it would not be worth the GPU d
 ## Coefficient provenance
 
 The polynomial coefficients in `src/approx/coeffs.rs` are the single-precision minimax
-coefficients from the **Cephes Math Library** (S. L. Moshier, `sinf.c`, `expf.c`, `logf.c`,
-`atanf.c`), public domain. They were fitted with a Remez exchange against the reduced domains
+coefficients from the **Cephes Math Library** (S. L. Moshier, `sinf.c`, `tanf.c`, `expf.c`,
+`logf.c`, `atanf.c`), public domain. They were fitted with a Remez exchange against the reduced domains
 listed above, which are exactly the reduced domains used here. They are reproduced verbatim
 as decimal literals — no rounding, no re-derivation — so that the Rust and Slang files can be
 compared literal-by-literal (P09). `clippy::unreadable_literal`, `clippy::excessive_precision`
@@ -65,11 +66,21 @@ Measured on x86-64 (Windows, rustc 1.85, debug profile), `cargo test -p es-math 
 |---|---|---|
 | `sin` | `[-1e3, 1e3]` and `[-6.5, 6.5]` | 1 |
 | `cos` | `[-1e3, 1e3]` and `[-6.5, 6.5]` | 1 |
+| `tan` | `[-1.5, 1.5]` and `[-6.5, 6.5]` (primary) | 2 |
+| `tan` | `[-1e3, 1e3]` (reported, **not** bounded) | 3 |
 | `exp` | `[-88, 88]` | 1 |
 | `ln` | `[1e-30, 1e30]` and `[0.5, 2]` | 1 |
 | `atan2` | unit circle + random pairs over `[1e-6, 1e6]` | 2 |
 | `sqrt` | `[0, 1e30]` | 0 |
 | `rsqrt` | `[1e-30, 1e30]` | 1 |
+
+`tan` is the one function whose primary domain is not the full `sin`/`cos` range. Its sweep
+filters by magnitude rather than by domain — points where the `f64` reference exceeds `1e3`
+are within ~1e-3 of a pole and are skipped — because the amplification factor of `tan` is
+`tan'(x)/tan(x) = 1/tan + tan`, so a reduction error that is 0.1 ULP for `sin` is 3 ULP for
+`tan` at `|x| ≈ 600`, and unbounded at a pole. The bound claimed is 2 ULP over `|x| ≤ 6.5`;
+the wider sweep is printed for the record and asserts nothing. `es-render` uses `tan` only on
+`fovy/2 ∈ (0, π/2)`, well inside the bound.
 
 All at or under the 2 ULP target. The numbers are a property of the coefficients and the
 evaluation order, not of the host, so they should hold anywhere the same `f32` operations

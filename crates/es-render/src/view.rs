@@ -22,13 +22,19 @@ pub struct Intrinsics {
 impl Intrinsics {
     /// Intrinsics from a vertical field of view, the form `es_assets::scene::Camera` carries.
     /// Principal point at the image centre.
+    ///
+    /// `fovy_rad` is `f64` because that is how the asset stores it; everything after the
+    /// first cast is `f32` through [`es_math::approx::tan`], never the host `libm`. `fx`/`fy`
+    /// sit on the golden camera path — every golden pixel is a function of them — so a
+    /// platform's `tan` must not be able to move them (spec 3.2, 3.4). Op order is fixed:
+    /// halve, `tan`, divide.
     pub fn from_fovy(width: u32, height: u32, fovy_rad: f64) -> Self {
-        let fy = f64::from(height) * 0.5 / (fovy_rad * 0.5).tan();
+        let f = (height as f32 * 0.5) / es_math::approx::tan(fovy_rad as f32 * 0.5);
         Self {
-            fx: fy as f32,
-            fy: fy as f32,
-            cx: f64::from(width) as f32 * 0.5,
-            cy: f64::from(height) as f32 * 0.5,
+            fx: f,
+            fy: f,
+            cx: width as f32 * 0.5,
+            cy: height as f32 * 0.5,
         }
     }
 }
@@ -245,5 +251,22 @@ impl RenderConfig {
             RenderPath::Rs => 1,
             RenderPath::Pt { bounces, .. } => bounces,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins both the arithmetic and its order: no host `tan` anywhere on the camera path
+    /// that produces the goldens (review M4 S-11).
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn intrinsics_come_from_approx_tan_in_f32() {
+        let i = Intrinsics::from_fovy(64, 48, 1.2);
+        let want = (48.0f32 * 0.5) / es_math::approx::tan(1.2f32 * 0.5);
+        assert_eq!(i.fy.to_bits(), want.to_bits(), "fy {} vs {want}", i.fy);
+        assert_eq!(i.fx, i.fy);
+        assert_eq!((i.cx, i.cy), (32.0, 24.0));
     }
 }

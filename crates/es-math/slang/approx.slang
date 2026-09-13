@@ -25,6 +25,13 @@ static const float COS_C0 = 2.443315711809948e-5;
 static const float COS_C1 = -1.388731625493765e-3;
 static const float COS_C2 = 4.166664568298827e-2;
 
+static const float TAN_C0 = 9.38540185543E-3;
+static const float TAN_C1 = 3.11992232697E-3;
+static const float TAN_C2 = 2.44301354525E-2;
+static const float TAN_C3 = 5.34112807005E-2;
+static const float TAN_C4 = 1.33387994085E-1;
+static const float TAN_C5 = 3.33331568548E-1;
+
 // --- exp ---------------------------------------------------------------------------------
 static const float LOG2E = 1.44269504088896341;
 static const float LN2_HI = 0.693359375;
@@ -127,6 +134,20 @@ float es_cos(float x) {
     if (quadrant == 1) { return -es_sin_kernel(r); }
     if (quadrant == 2) { return -es_cos_kernel(r); }
     return es_sin_kernel(r);
+}
+
+float es_tan_kernel(float r) {
+    float z = r * r;
+    return (((((TAN_C0 * z + TAN_C1) * z + TAN_C2) * z + TAN_C3) * z + TAN_C4) * z + TAN_C5) * z * r + r;
+}
+
+float es_tan(float x) {
+    float r;
+    int quadrant;
+    es_reduce_quadrant(x, r, quadrant);
+    float y = es_tan_kernel(r);
+    if ((quadrant & 1) == 0) { return y; }
+    return -1.0 / y;
 }
 
 float es_exp(float x) {

@@ -40,6 +40,14 @@ pub const COS_C0: f32 = 2.443315711809948e-5;
 pub const COS_C1: f32 = -1.388731625493765e-3;
 pub const COS_C2: f32 = 4.166664568298827e-2;
 
+// tan(r)/r - 1 on |r| <= pi/4, in r^2. Cephes `tanf.c`; same reduction as sin/cos above.
+pub const TAN_C0: f32 = 9.38540185543E-3;
+pub const TAN_C1: f32 = 3.11992232697E-3;
+pub const TAN_C2: f32 = 2.44301354525E-2;
+pub const TAN_C3: f32 = 5.34112807005E-2;
+pub const TAN_C4: f32 = 1.33387994085E-1;
+pub const TAN_C5: f32 = 3.33331568548E-1;
+
 // --- exp ---------------------------------------------------------------------------------
 pub const LOG2E: f32 = 1.44269504088896341;
 // ln(2) split so that n * LN2_HI is exact for every n in the f32 exponent range.
