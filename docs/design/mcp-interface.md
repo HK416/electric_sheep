@@ -61,6 +61,23 @@ Neither path panics. A line that is not JSON at all gets `-32700 Parse error` wi
 (JSON-RPC 2.0's own rule for an error with no request to attach to) and the server keeps
 reading the next line.
 
+A request line is untrusted input over an otherwise-trusted transport (spec 25.1: stdio only,
+but the process on the other end of the pipe is still an external tool, not this crate's own
+code), so two more faults are rejected before any JSON parsing is attempted, per the M4 review
+(S-3) and pinned in `docs/api-notes/mcp.md` "Request size cap":
+
+- A line longer than `ServerConfig::max_request_bytes` (default `MAX_REQUEST_BYTES`, 16 MiB)
+  gets `-32600 Invalid Request` with `id: null`. The bytes past the cap are never buffered in
+  full -- `Server::run`'s line reader tracks length as it streams and drops the rest once the
+  cap is crossed, so an oversized line costs O(cap) memory, not O(line length), before it is
+  rejected.
+- A line that is not valid UTF-8 gets `-32700 Parse error` instead of the old behavior (`String`
+  conversion failing inside `BufRead::lines()`, which propagated `io::ErrorKind::InvalidData`
+  out of `run()` and ended the session on one bad byte).
+
+Both discard the offending line and keep the loop alive for the next one -- the same shape as
+the JSON parse error above, just checked one layer earlier.
+
 ## Ceiling
 
 - No pagination on `tools/list` (`cursor`/`nextCursor`): six tools fit one response. Add it if

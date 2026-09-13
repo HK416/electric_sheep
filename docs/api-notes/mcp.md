@@ -80,9 +80,39 @@ exactly this split.
 
 | code | meaning | when `es_script::mcp` sends it |
 |---|---|---|
-| `-32700` | Parse error | a stdio line is not valid JSON |
+| `-32700` | Parse error | a stdio line is not valid JSON, or is not valid UTF-8 at all |
+| `-32600` | Invalid Request | a stdio line is longer than `ServerConfig::max_request_bytes` |
 | `-32601` | Method not found | `dispatch`'s method is none of `initialize`/`ping`/`tools/list`/`tools/call` |
 | `-32602` | Invalid params | unknown tool name, or a `ToolError::BadParams` from a tool body |
 
-These three are the standard JSON-RPC 2.0 reserved codes, not MCP-specific; MCP itself defines
-no additional codes beyond what its "Error Handling" section labels a protocol error.
+These four are standard JSON-RPC 2.0 reserved codes, not MCP-specific; MCP itself defines no
+additional codes beyond what its "Error Handling" section labels a protocol error.
+
+## Request size cap
+
+M4 review finding **S-3**: `Server::run` used to read lines with `std::io::BufRead::lines()`,
+which has no length limit (an attacker-or-bug-controlled line is fully buffered, converted to a
+`String`, and only then handed to `serde_json` -- for `validate`'s `toml` argument, allocated
+*again* as the decoded JSON string, then parsed as TOML, so one huge line cost multiples of its
+own size before anything checked it) and turns a non-UTF-8 byte into an `io::Error` that
+`line?` propagates straight out of `run()`, ending the whole session on one bad byte.
+
+Fixed by reading raw bytes with a length cap before any `String`/JSON conversion is attempted:
+
+- `ServerConfig::max_request_bytes` (default [`MAX_REQUEST_BYTES`], 16 MiB) bounds one line.
+  `Server::run`'s internal reader tracks the running length as bytes stream in from the
+  `BufRead` and, once the running total would exceed the cap, stops appending to the buffer
+  (dropping what it already has) for the rest of that line -- so the memory cost of an
+  oversized line is bounded by the cap, not by how large the line actually is. Once the line's
+  terminating newline (or EOF) is reached, the server writes `-32600 Invalid Request` with
+  `id: null` and moves on to the next line; nothing is parsed as JSON.
+- A line at or under the cap is decoded with `std::str::from_utf8` (not `String::from_utf8`,
+  which would consume the buffer on success but still needed a fallible path) rather than
+  relying on `io::Read`/`io::BufRead`'s own (fallible, session-ending) UTF-8 conversion. A
+  decode failure gets `-32700 Parse error` with `id: null` -- same shape as a line that decodes
+  fine but fails `serde_json::from_str`, just one step earlier -- and the loop keeps running.
+
+Both faults are exercised in `crates/es-script/src/mcp.rs`'s `mod tests`: a line built at the
+real 16 MiB default (not a shrunk-down cap) confirms the size check fires at the size the
+review actually flagged, and a lone `0xFF` byte followed by a valid `initialize` confirms the
+loop survives invalid UTF-8 and answers the next request normally.

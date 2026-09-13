@@ -68,13 +68,37 @@ the CLI can swap in any backend without `repair_loop` knowing about HTTP at all.
   table at the time this was written -- re-check that table if this ever looks stale). Reads
   `ANTHROPIC_API_KEY` from the environment only, never from a file in the repo. The feature is
   optional specifically so the default `es-script` / `es` build never links a TLS stack.
+  `AnthropicProvider::with_endpoint` posts to a caller-chosen URL instead of the real API --
+  the only reason it exists is so a test can point it at a local `TcpListener`.
+
+**Timeouts and error hygiene (M4 review S-8):** the `ureq::Agent` behind `AnthropicProvider` is
+built with both `timeout_connect` and `timeout_read` set to `AnthropicProvider::DEFAULT_TIMEOUT`
+(60 s), overridable via `with_timeout` / `es task generate --timeout SECS` -- `ureq`'s own
+default has *no* read timeout, so a stalled provider used to hang the round (and the whole CLI
+invocation) forever. A timeout is reported as `GenerateError::Timeout`, kept distinct from the
+catch-all `GenerateError::Provider(String)` so a caller does not have to string-match "timed
+out" out of a message to react to it differently (e.g. retry vs. give up). Every other provider
+failure's message is redacted (any literal occurrence of the API key is replaced with
+`<redacted>`, in case a proxy or error page ever echoes a request header back) and capped at
+256 bytes (`redact_and_truncate`) before being wrapped in `GenerateError::Provider` -- the old
+`format!("unexpected response shape: {resp}")` printed an unbounded provider response body
+verbatim, which both risked a key leak (had one ever appeared in a response) and could dump an
+arbitrarily large blob into logs or stdout.
 
 ## CLI
 
-`es task generate --prompt "..." [--scene scene.xml] [--rounds N] [--provider
+`es task generate --prompt "..." [--scene scene.xml] [--rounds N] [--timeout SECS] [--provider
 anthropic|stdin] --out <dir>` (`crates/es/src/cmd/generate.rs`, routed from `es task generate`
 in `main.rs` before falling through to the existing `cmd::task::dispatch` for `es task
 compile`). `--scene` hashes the named file with `blake3` for both `SceneRef::scene_hash` and
 `asset_hash` -- a placeholder, not a real asset-import hash (that is `es-assets`' job); a
 generation loop typically won't have the imported scene's real content hash yet. On success,
 writes `task.toml` under `--out` via `es_ir::serial::task_to_toml`.
+
+`--rounds` defaults to 3 and is checked against `1..=10` before any provider call: 0 rounds can
+never produce a result and an unbounded round count times an unbounded per-round timeout was an
+unbounded worst-case runtime for one invocation (M4 review S-8, `es/src/cmd/generate.rs:49`
+used to accept any `u32`). Outside that range `dispatch` returns `CliError::Usage`, exit code 2
+like any other bad argument. `--timeout` (default 60) is seconds, forwarded to
+`AnthropicProvider::with_timeout`; `--provider stdin` ignores it, since it never makes a network
+call.

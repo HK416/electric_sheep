@@ -17,6 +17,27 @@ use crate::tools::{self, ToolError};
 /// The MCP protocol version this server speaks (2025-06-18, the latest at implementation time).
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 
+/// Default cap on one JSON-RPC request line (spec 25.1 stdio transport, `docs/api-notes/mcp.md`
+/// "Request size cap"): an untrusted line this big must be rejected before it is allocated in
+/// full, not after being parsed as JSON/TOML. Override via [`ServerConfig::max_request_bytes`].
+pub const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+/// Tunable knobs for [`Server`]. `Default` matches the spec-pinned defaults.
+#[derive(Clone, Copy, Debug)]
+pub struct ServerConfig {
+    /// Requests longer than this (bytes, before the trailing newline) get a `-32600` error
+    /// instead of being buffered and parsed. See [`MAX_REQUEST_BYTES`].
+    pub max_request_bytes: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            max_request_bytes: MAX_REQUEST_BYTES,
+        }
+    }
+}
+
 /// One MCP tool's name, description and JSON Schema input shape, for `tools/list`.
 struct ToolDef {
     name: &'static str,
@@ -121,6 +142,7 @@ fn tool_defs() -> Vec<ToolDef> {
 type RpcError = (i64, String);
 
 const PARSE_ERROR: i64 = -32700;
+const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
 
@@ -128,31 +150,124 @@ fn error_response(id: &Value, code: i64, message: &str) -> String {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}}).to_string()
 }
 
+/// One line read off `input`: a complete line's raw bytes (newline stripped), or a marker that
+/// the line exceeded the configured cap before a newline was found (the bytes were discarded as
+/// they streamed in -- this never buffers an oversized line in full, per S-3).
+enum RawLine {
+    Bytes(Vec<u8>),
+    TooLong,
+}
+
+/// Reads one newline-delimited line from `reader`, capping how many bytes of it are retained at
+/// `max_bytes`. Returns `Ok(None)` only at true EOF with nothing left to read. A line at or
+/// under the cap is returned in full (`RawLine::Bytes`); over the cap, bytes past the cap are
+/// consumed and dropped rather than appended, so memory use stays bounded regardless of how
+/// large the offending line is, and `RawLine::TooLong` is returned once its terminating newline
+/// (or EOF) is reached.
+fn read_raw_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> std::io::Result<Option<RawLine>> {
+    let mut buf = Vec::new();
+    let mut too_long = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            return Ok(if buf.is_empty() && !too_long {
+                None
+            } else {
+                Some(if too_long {
+                    RawLine::TooLong
+                } else {
+                    RawLine::Bytes(buf)
+                })
+            });
+        }
+        // `chunk_len` is the part of `available` that belongs to the current line (up to the
+        // newline, if this fill_buf call happens to contain one -- otherwise all of it). The cap
+        // check below must see this uniformly regardless of which case it is, or a line whose
+        // entire length (including the newline) lands in one fill_buf call would skip the cap
+        // entirely.
+        let newline_pos = available.iter().position(|&b| b == b'\n');
+        let chunk_len = newline_pos.unwrap_or(available.len());
+        if !too_long {
+            if buf.len() + chunk_len > max_bytes {
+                too_long = true;
+                buf.clear();
+                buf.shrink_to_fit();
+            } else {
+                buf.extend_from_slice(&available[..chunk_len]);
+            }
+        }
+        let consumed = newline_pos.map_or(available.len(), |pos| pos + 1);
+        reader.consume(consumed);
+        if newline_pos.is_some() {
+            return Ok(Some(if too_long {
+                RawLine::TooLong
+            } else {
+                RawLine::Bytes(buf)
+            }));
+        }
+    }
+}
+
 /// The MCP server: reads newline-delimited JSON-RPC requests from `input`, writes
 /// newline-delimited responses to `output`, until `input` reaches EOF. A malformed request
 /// never crashes the loop -- it gets a JSON-RPC error response (or, for a notification with no
-/// `id`, no response at all, per JSON-RPC 2.0).
+/// `id`, no response at all, per JSON-RPC 2.0). Two request-level faults are handled the same
+/// way, before any JSON parsing: a line over [`ServerConfig::max_request_bytes`] gets `-32600`
+/// (S-3), and a line that is not valid UTF-8 gets `-32700` instead of ending the session
+/// (`docs/api-notes/mcp.md` "Request size cap").
 #[derive(Debug)]
-pub struct Server;
+pub struct Server {
+    config: ServerConfig,
+}
 
 impl Server {
     pub fn new() -> Self {
-        Self
+        Self {
+            config: ServerConfig::default(),
+        }
     }
 
-    pub fn run<R: BufRead, W: Write>(&self, input: R, mut output: W) -> std::io::Result<()> {
-        for line in input.lines() {
-            let line = line?;
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            if let Some(response) = Self::handle_line(line) {
+    /// A server with non-default limits, e.g. a smaller `max_request_bytes` for a constrained
+    /// embedding.
+    pub fn with_config(config: ServerConfig) -> Self {
+        Self { config }
+    }
+
+    pub fn run<R: BufRead, W: Write>(&self, mut input: R, mut output: W) -> std::io::Result<()> {
+        loop {
+            let Some(raw) = read_raw_line(&mut input, self.config.max_request_bytes)? else {
+                return Ok(());
+            };
+            let response = match raw {
+                RawLine::TooLong => Some(error_response(
+                    &Value::Null,
+                    INVALID_REQUEST,
+                    &format!(
+                        "request exceeds max_request_bytes ({})",
+                        self.config.max_request_bytes
+                    ),
+                )),
+                RawLine::Bytes(bytes) => match std::str::from_utf8(&bytes) {
+                    Err(e) => Some(error_response(
+                        &Value::Null,
+                        PARSE_ERROR,
+                        &format!("invalid UTF-8 in request: {e}"),
+                    )),
+                    Ok(line) => {
+                        let line = line.trim();
+                        if line.is_empty() {
+                            None
+                        } else {
+                            Self::handle_line(line)
+                        }
+                    }
+                },
+            };
+            if let Some(response) = response {
                 writeln!(output, "{response}")?;
                 output.flush()?;
             }
         }
-        Ok(())
     }
 
     fn handle_line(line: &str) -> Option<String> {
@@ -295,5 +410,75 @@ mod tests {
     fn malformed_json_line_is_a_parse_error_not_a_crash() {
         let resp = run_lines(&["not json"]);
         assert_eq!(resp[0]["error"]["code"], PARSE_ERROR);
+    }
+
+    /// S-3 oracle: an over-cap line gets `-32600` and is discarded, and the session survives to
+    /// answer a normal request on the next line -- a 64 MiB line against the real 16 MiB default,
+    /// not a shrunk-down cap, so the fix is exercised at the size the review flagged.
+    #[test]
+    fn oversized_line_is_invalid_request_and_the_session_stays_alive() {
+        let huge = "x".repeat(64 * 1024 * 1024);
+        let input = format!(
+            "{huge}\n{}\n",
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#
+        );
+        let mut out = Vec::new();
+        Server::new()
+            .run(BufReader::new(input.as_bytes()), &mut out)
+            .expect("run");
+        let responses: Vec<Value> = String::from_utf8(out)
+            .expect("utf8")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("valid json-rpc response"))
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], INVALID_REQUEST);
+        assert_eq!(responses[1]["result"]["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    /// Same shape as above but against a small configured cap, so the "discarded, loop alive"
+    /// behavior is also pinned without allocating tens of megabytes per test run.
+    #[test]
+    fn oversized_line_with_a_small_configured_cap_is_invalid_request() {
+        let input = format!(
+            "{}\n{}\n",
+            "x".repeat(100),
+            r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#
+        );
+        let mut out = Vec::new();
+        Server::with_config(ServerConfig {
+            max_request_bytes: 64,
+        })
+        .run(BufReader::new(input.as_bytes()), &mut out)
+        .expect("run");
+        let responses: Vec<Value> = String::from_utf8(out)
+            .expect("utf8")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("valid json-rpc response"))
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], INVALID_REQUEST);
+        assert_eq!(responses[1]["result"], json!({}));
+    }
+
+    /// S-3 oracle: a non-UTF-8 byte gets `-32700` (parse error) instead of killing the loop via
+    /// `line?` propagating `InvalidData` out of `run()`.
+    #[test]
+    fn invalid_utf8_byte_is_a_parse_error_and_the_session_stays_alive() {
+        let mut input = vec![0xFFu8, b'\n'];
+        input.extend_from_slice(br#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#);
+        input.push(b'\n');
+        let mut out = Vec::new();
+        Server::new()
+            .run(BufReader::new(&input[..]), &mut out)
+            .expect("run");
+        let responses: Vec<Value> = String::from_utf8(out)
+            .expect("utf8")
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("valid json-rpc response"))
+            .collect();
+        assert_eq!(responses.len(), 2);
+        assert_eq!(responses[0]["error"]["code"], PARSE_ERROR);
+        assert_eq!(responses[1]["result"], json!({}));
     }
 }

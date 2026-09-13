@@ -201,13 +201,19 @@ fn hex(bytes: &[u8; 32]) -> String {
 // --- parsing a reply -------------------------------------------------------------------------
 
 /// A [`repair_loop`] round failure: the reply had no parseable Task IR, or the provider itself
-/// failed (network error, missing key, non-2xx response).
+/// failed (network error, missing key, non-2xx response, or a timeout).
 #[derive(Debug, thiserror::Error)]
 pub enum GenerateError {
     #[error("no Task IR TOML block in the reply ({0})")]
     NoTaskCandidate(String),
     #[error("provider failed: {0}")]
     Provider(String),
+    /// The provider took longer than the configured connect/read timeout (S-8;
+    /// [`AnthropicProvider::DEFAULT_TIMEOUT`] / `--timeout`). Kept distinct from `Provider` so a
+    /// caller (or a test) can tell "the network is slow" apart from any other failure without
+    /// string-matching the message.
+    #[error("provider timed out")]
+    Timeout,
 }
 
 /// Extracts a Task IR (and, if present, an Observation IR) from a model reply. Looks inside
@@ -385,6 +391,19 @@ fn with_feedback(initial: &Prompt, diagnostics: &[String]) -> Prompt {
 
 // --- Anthropic provider (feature `llm`) -------------------------------------------------------
 
+/// S-8 default: `ureq::post` had no read timeout, so a stalled provider hung `es task generate`
+/// forever. This bounds both the connect and the read side of one call; override via
+/// [`AnthropicProvider::with_timeout`] / `es task generate --timeout`.
+#[cfg(feature = "llm")]
+pub const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// S-8: a provider error message never contains the API key (checked by redaction below, not
+/// merely "the key isn't logged on the happy path"), and is capped at this many bytes so a
+/// stalled or misbehaving provider can't blow up logs/output with its entire response body
+/// (`unexpected response shape: {resp}` used to print it whole).
+#[cfg(feature = "llm")]
+const MAX_PROVIDER_ERROR_BYTES: usize = 256;
+
 /// [`repair_loop`]'s provider closure over the Anthropic Messages API
 /// (`POST https://api.anthropic.com/v1/messages`, `anthropic-version: 2023-06-01`).
 ///
@@ -393,7 +412,12 @@ fn with_feedback(initial: &Prompt, diagnostics: &[String]) -> Prompt {
 pub struct AnthropicProvider {
     api_key: String,
     model: String,
+    endpoint: String,
+    agent: ureq::Agent,
 }
+
+#[cfg(feature = "llm")]
+const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 
 #[cfg(feature = "llm")]
 impl std::fmt::Debug for AnthropicProvider {
@@ -401,18 +425,42 @@ impl std::fmt::Debug for AnthropicProvider {
         f.debug_struct("AnthropicProvider")
             .field("api_key", &"<redacted>")
             .field("model", &self.model)
-            .finish()
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
     }
 }
 
 #[cfg(feature = "llm")]
 impl AnthropicProvider {
+    /// Same as [`Self::with_timeout`] with [`DEFAULT_TIMEOUT`].
     pub fn from_env() -> Result<Self, GenerateError> {
+        Self::with_timeout(DEFAULT_TIMEOUT)
+    }
+
+    /// `timeout` bounds both the TCP connect and each socket read of one call to the provider
+    /// (S-8) — a stalled provider fails with [`GenerateError::Timeout`] instead of hanging.
+    pub fn with_timeout(timeout: std::time::Duration) -> Result<Self, GenerateError> {
+        Self::with_endpoint(ANTHROPIC_ENDPOINT, timeout)
+    }
+
+    /// Same as [`Self::with_timeout`] but posts to `endpoint` instead of the real Anthropic API.
+    /// Exists so the S-8 timeout behavior can be exercised against a local `TcpListener` that
+    /// never replies, without making a real network call in tests.
+    pub fn with_endpoint(
+        endpoint: impl Into<String>,
+        timeout: std::time::Duration,
+    ) -> Result<Self, GenerateError> {
         let api_key = std::env::var("ANTHROPIC_API_KEY")
             .map_err(|_| GenerateError::Provider("ANTHROPIC_API_KEY is not set".to_owned()))?;
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(timeout)
+            .timeout_read(timeout)
+            .build();
         Ok(Self {
             api_key,
             model: "claude-sonnet-5".to_owned(),
+            endpoint: endpoint.into(),
+            agent,
         })
     }
 
@@ -424,16 +472,110 @@ impl AnthropicProvider {
             "system": prompt.system,
             "messages": [{ "role": "user", "content": prompt.user }],
         });
-        let resp: serde_json::Value = ureq::post("https://api.anthropic.com/v1/messages")
+        let resp: serde_json::Value = self
+            .agent
+            .post(&self.endpoint)
             .set("x-api-key", &self.api_key)
             .set("anthropic-version", "2023-06-01")
             .send_json(body)
-            .map_err(|e| GenerateError::Provider(e.to_string()))?
+            .map_err(|e| self.provider_error(&e))?
             .into_json()
-            .map_err(|e| GenerateError::Provider(format!("bad JSON response: {e}")))?;
+            .map_err(|e| self.provider_error_str(&format!("bad JSON response: {e}")))?;
         resp["content"][0]["text"]
             .as_str()
             .map(str::to_owned)
-            .ok_or_else(|| GenerateError::Provider(format!("unexpected response shape: {resp}")))
+            .ok_or_else(|| self.provider_error_str(&format!("unexpected response shape: {resp}")))
+    }
+
+    /// Maps a `ureq` failure to [`GenerateError::Timeout`] when it was in fact a connect/read
+    /// timeout (normalized by `ureq` to `io::ErrorKind::TimedOut`), else a truncated, key-redacted
+    /// [`GenerateError::Provider`].
+    fn provider_error(&self, err: &ureq::Error) -> GenerateError {
+        use std::error::Error as _;
+        let timed_out = err
+            .source()
+            .and_then(|s| s.downcast_ref::<std::io::Error>())
+            .is_some_and(|io_err| io_err.kind() == std::io::ErrorKind::TimedOut);
+        if timed_out {
+            return GenerateError::Timeout;
+        }
+        self.provider_error_str(&err.to_string())
+    }
+
+    fn provider_error_str(&self, message: &str) -> GenerateError {
+        GenerateError::Provider(redact_and_truncate(
+            message,
+            &self.api_key,
+            MAX_PROVIDER_ERROR_BYTES,
+        ))
+    }
+}
+
+/// Replaces any occurrence of `secret` with `<redacted>`, then truncates to at most `max_bytes`
+/// bytes at a UTF-8 char boundary.
+#[cfg(feature = "llm")]
+fn redact_and_truncate(message: &str, secret: &str, max_bytes: usize) -> String {
+    let redacted = if secret.is_empty() {
+        message.to_owned()
+    } else {
+        message.replace(secret, "<redacted>")
+    };
+    if redacted.len() <= max_bytes {
+        return redacted;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    redacted[..end].to_owned()
+}
+
+#[cfg(all(test, feature = "llm"))]
+mod llm_tests {
+    use super::*;
+
+    #[test]
+    fn redact_and_truncate_removes_the_secret_and_caps_the_length() {
+        let msg = format!(
+            "provider said: key sk-secret-abc123 was rejected, body: {}",
+            "x".repeat(500)
+        );
+        let out = redact_and_truncate(&msg, "sk-secret-abc123", MAX_PROVIDER_ERROR_BYTES);
+        assert!(!out.contains("sk-secret-abc123"), "{out}");
+        assert!(out.len() <= MAX_PROVIDER_ERROR_BYTES);
+    }
+
+    /// S-8 oracle: a provider that accepts a connection and never replies must fail with
+    /// `GenerateError::Timeout`, not hang `es task generate` forever.
+    #[test]
+    fn a_stalled_provider_times_out_instead_of_hanging() {
+        use std::net::TcpListener;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local_addr");
+        // Accepts the connection and then never writes a response. Not joined: the process
+        // ending after this test reaps it, and joining would itself need a timeout.
+        let _server = std::thread::spawn(move || {
+            // Keep the accepted socket alive for the sleep -- dropping it immediately would
+            // reset the connection and the client would see a connection error, not a timeout.
+            if let Ok((stream, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(5));
+                drop(stream);
+            }
+        });
+
+        std::env::set_var("ANTHROPIC_API_KEY", "test-key-must-not-leak");
+        let mut provider = AnthropicProvider::with_endpoint(
+            format!("http://{addr}/v1/messages"),
+            Duration::from_secs(1),
+        )
+        .expect("ANTHROPIC_API_KEY is set above");
+        let prompt = Prompt {
+            system: "sys".to_owned(),
+            user: "user".to_owned(),
+        };
+        let result = provider.call(&prompt);
+        assert!(matches!(result, Err(GenerateError::Timeout)), "{result:?}");
     }
 }
