@@ -113,3 +113,6 @@ $RECYCLE.BIN/
 
 # Windows shortcuts
 *.lnk
+
+# project python venv for reference oracles
+.venv/

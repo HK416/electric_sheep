@@ -29,6 +29,10 @@ es-runtime-embedded = { path = "crates/es-runtime-embedded" }
 es-editor = { path = "crates/es-editor" }
 es-eval = { path = "crates/es-eval" }
 es-splat = { path = "crates/es-splat" }
+es-script = { path = "crates/es-script" }
+es-render = { path = "crates/es-render" }
+es-usd = { path = "crates/es-usd" }
+es-gpu = { path = "crates/es-gpu" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"
