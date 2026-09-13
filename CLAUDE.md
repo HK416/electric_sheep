@@ -5,18 +5,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project status
 
 `docs/ARCHITECTURE.ko.md` (the v1.0 technical spec, ~3000 lines, in Korean) is the canonical
-source of truth; `docs/ARCHITECTURE.md` is its English translation. M0 (contracts), M1
-(vision vertical slice), M2 (evaluation, batch domains, policy extension) and the offline
-waves of M3 (no-std embedded runtime, 3DGS importer, domain-gap diagnostics, Safety Case
-evidence bundle, editable graph editor, learning loop) are implemented and reviewed for
-everything that runs without a GPU, network or robot hardware (`docs/reviews/M0.md` ..
-`M3.md`; review follow-ups are `docs/packets/<M>/P-<M>-R<n>.md`). Still open and needing
-hardware, network or a human: M3 W1 real-robot interface/HIL/cameras, M2 W4 Newton
-backend, the 4,096-env and ±10% memory gates, a real LeRobot checkpoint (M1-R2), the
-Python builder (`es-py`), GPU lowering and rendering (M1 W2/W3 remainder, M4). Cargo workspace:
-`xtask/` (verification entry point), `crates/es` (CLI), `es-editor`, and the library crates
-listed in the layering table below (`es-ir-types` at layer 2 holds the graph-agnostic IR
-types split out of `es-ir`). Work packets live in `docs/packets/<milestone>/`, design notes
+source of truth; `docs/ARCHITECTURE.md` is its English translation. M0–M3 and M4 are implemented and reviewed (`docs/reviews/M0.md` .. `M4.md`; review
+follow-ups are `docs/packets/<M>/P-<M>-R<n>.md`). GPU paths (es-gpu, es-render, Observation
+IR GPU lowering, MJWarp/Newton adapters) were verified on an RTX 4060 with the Vulkan SDK;
+the Python oracles (MuJoCo, PyTorch, LeRobot ACT checkpoint, diffusers) run from the project
+venv `.venv` (set `ES_PYTHON` to its interpreter). Still open: M3 W1 real-robot
+interface/HIL/cameras (hardware), the native physics solver prototype (cut by spec §1.9 #1),
+and the human decisions listed in the reviews. Work packets live in `docs/packets/<milestone>/`, design notes
 in `docs/design/`, pinned external API digests in `docs/api-notes/`, milestone reviews in
 `docs/reviews/`. Every document under `docs/` has a Korean sibling `<name>.ko.md`; keep
 the pairing when adding or changing docs. Before adding anything, read the relevant
