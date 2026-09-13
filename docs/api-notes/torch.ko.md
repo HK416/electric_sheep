@@ -19,6 +19,7 @@ spec 8.7 (lowering), spec 8.9 (tier-4 동등성). lowering 계약 자체는
 | `numpy` | **설치하지 않음, 필요 없음** — 아래 "numpy 없음" 참고 |
 | `safetensors` 패키지 | **필요 없음** — 리더는 `struct` + `json` 15줄이면 충분하다 |
 | `torchvision` | `VisionEncoder`가 있는 그래프에서만 필요; 아직 CI에서 실행되지 않음 |
+| `diffusers` | **0.40.0**, `python/ddpm_ref_check.py`(DDPM/DDIM 오라클)에서만 필요; 순수 Python, `pip install diffusers` |
 
 로컬 실행을 위한 설치:
 
@@ -31,6 +32,28 @@ ES_PYTHON=<venv>/Scripts/python cargo test -p es-policy
 `ES_PYTHON`은 `MuJoCo` 오라클이 쓰는 것과 같은 변수이므로, venv 하나로 둘 다 처리할 수 있다.
 이 변수가 없으면 `python`, 그다음 `python3` 순서로 시도한다; 어디에도 `torch`가 없으면 동등성
 테스트는 `SKIPPED`를 출력하고 통과하며, 다른 모든 테스트는 그대로 실행된다.
+
+## `diffusers` — 독립적인 DDPM/DDIM 오라클
+
+`python/ddpm_ref_check.py`는 같은 stdin/stdout JSON 형태를 가진 두 번째, 더 작은
+스크립트다. 이것이 존재하는 이유는 `src/reference.rs`의 Rust 레퍼런스가 lowering을
+미러링하므로 잘못된 *스케줄*을 잡아낼 수 없기 때문이다(M2 리뷰,
+`crates/es-policy/src/reference.rs:26`). 이것이 호출하는 것:
+
+| 심볼 | 용도 |
+|---|---|
+| `diffusers.DDPMScheduler(num_train_timesteps, beta_schedule, variance_type, clip_sample, clip_sample_range, prediction_type)` | 검사 대상 스케줄 |
+| `diffusers.DDIMScheduler(...)` | 동일하되 `variance_type`은 없음(그런 것이 없으며, eta = 0은 분산을 쓰지 않는다) |
+| `.set_timesteps(n)` / `.timesteps` / `.alphas_cumprod` | 서브샘플과 누적 alpha |
+| `._get_variance(t)` / `._get_variance(t, prev_t)` | 스텝별 분산; private이며, 버전이 올라갈 때 가장 먼저 깨질 만한 지점 |
+| `.step(model_output, t, sample).prev_sample` | 두 번째 테스트를 위한 전체 샘플러 루프 |
+| `diffusers.schedulers.scheduling_ddpm.randn_tensor` | DDPM에 새로운 추출 대신 체크포인트의 `noise_<t>` 버퍼를 넘기도록 monkeypatch되어, 양쪽이 같은 숫자를 소비한다(spec 3.4) |
+
+알아둘 만한 두 가지 shape 사항: `DDPMScheduler.step`은 학습된 분산을 감지하기 위해
+`model_output.shape[1]`을 읽으므로, lowering된 head가 갖지 않는 배치 축이 필요하다
+(스크립트가 reshape한다); 그리고 `_get_variance`는 private API이므로, `diffusers` 업그레이드는
+이 표에 대한 diff가 된다. `diffusers`가 없으면 -> `torch`가 없을 때와 마찬가지로 두 테스트
+모두 `SKIPPED`를 출력하고 통과한다.
 
 ## 이 코드가 의존하는 Python API
 
@@ -128,6 +151,12 @@ Rust 쪽 검사를 통과한 불일치라도 여전히 요란하게 실패한다
 - `torchvision`은 lowering에서 참조되지만 이를 실행하는 테스트는 아직 없다; M1 ACT 체크포인트
   게이트(spec 8.9)가 그것을 다룰 자리다.
 - 실제 LeRobot ACT 체크포인트는 이 스킴으로의 키 리맵이 필요하다 — 설계 노트 5절 참고.
+- `"epsilon"`이 아닌 `prediction_type`은 `LowerError::Unsupported`다: lowering된
+  denoiser는 `eps_theta`이며, `"sample"` / `"v_prediction"`은 다른 `pred_original_sample`을
+  요구한다.
+- `timestep_spacing`은 `diffusers`의 `"leading"` 기본값으로 고정되어 있다;
+  `"linspace"` / `"trailing"`은 모델링되지 않으며, `steps_offset != 0`,
+  `rescale_betas_zero_snr`, `thresholding`, `DDIMScheduler`의 `eta > 0`도 마찬가지다.
 - 배치 없음. 생성된 모듈은 샘플 하나를 기준으로 작성된다; `Linear`는 어차피 선행 축을
   브로드캐스트하지만, `PolicyHead`의 `reshape(H, A)`가 그 컨벤션을 고정하고 있어 바꿔야 할
   것이다.

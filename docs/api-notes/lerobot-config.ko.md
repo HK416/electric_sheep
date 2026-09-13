@@ -74,10 +74,20 @@
 | `down_dims` | `[int, ...]` | U-Net 채널 폭, 예: `[512, 1024, 2048]` |
 | `kernel_size` | int | |
 | `noise_scheduler_type` | string | 예: `"DDPM"`, `"DDIM"` |
-| `num_train_timesteps` | int | |
-| `beta_schedule` | string | 예: `"squaredcos_cap_v2"` |
-| `prediction_type` | string | 예: `"epsilon"` — 그대로 전달하는 것 이상으로는 모델링하지 않음 |
+| `num_train_timesteps` | int | 기본값 `100`; beta 스케줄이 만들어지는 그리드 |
+| `beta_schedule` | string | 기본값 `"squaredcos_cap_v2"`; 우리가 lowering하는 다른 하나는 `"linear"` |
+| `prediction_type` | string | 기본값 `"epsilon"`; `"sample"` / `"v_prediction"`은 그대로 전달되며 lowering에서 거부된다 |
 | `num_inference_steps` | int \| null | 없으면 `num_train_timesteps`를 기본값으로 사용 |
+| `clip_sample` | bool | 기본값 `true` — `diffusers`가 `pred_original_sample`을 clamp한다 |
+| `clip_sample_range` | float | 기본값 `1.0` |
+
+이 여섯 개는 `diffusers`의 `DDPMScheduler` / `DDIMScheduler` 설정이며 모두 변경 없이
+`HeadKind::Diffusion`에 도달한다: 한 스케줄로 학습된 체크포인트는 다른 스케줄 아래에서는
+재현되지 않는다. `variance_type`은 LeRobot 필드가 **아니므로**, 변환은 `diffusers` 자신의
+기본값인 `fixed_small`을 고정해서 쓴다. 위의 기본값들은 `미검증 (unverified)`이다 —
+`lerobot/common/policies/diffusion/configuration_diffusion.py`를 가져온 것이 아니라
+기억을 되살린 것이다; 이들은 `es_ir::learning::HeadKind::Diffusion`과
+`DiffusionConfig`의 `serde` 기본값이므로, 필드를 생략한 config도 여전히 변환된다.
 
 `noise_scheduler_type`은 `es_ir::learning::DiffusionScheduler`로 다음과 같이 매핑된다:
 `"DDPM" -> Ddpm`, `"DDIM" -> Ddim`, 그 외에는 인식하지 못한 값을 알리는 경고와 함께

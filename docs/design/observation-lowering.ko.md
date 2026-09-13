@@ -68,12 +68,27 @@ CHW f32는 PyTorch가, 따라서 LeRobot이 정책에 공급하는 형태이며,
 | `Concat{axis}` | `concat` | §8 |
 | `Stack{axis}` | `stack` | §8 |
 | `TemporalWindowNode` | `history_push` + `window_gather` | §9 |
+| `Augment{training_only}` | — | identity pass-through, §9.1 |
 | 출력 elem ≠ `F32` | `cast_f32_to_f16` / `_bf16` | `half`, round-to-nearest-even |
-| `Pad`, `Undistort`, `Rectify`, `Warp`, `CameraProjection`, `ToGray`, `ChannelSelect`, `QuantizeU8`, `FrameStack`, `Delta`, `Mask`, `MultiViewPack`, `Augment`, `LanguageInput` | — | `COMPILE-002`, 이후 웨이브 |
+| `Pad`, `Undistort`, `Rectify`, `Warp`, `CameraProjection`, `ToGray`, `ChannelSelect`, `QuantizeU8`, `FrameStack`, `Delta`, `Mask`, `MultiViewPack`, `LanguageInput`, `Augment`(`training_only`이 아닌 것) | — | `COMPILE-002`, 이후 웨이브 |
 
-`Augment`는 RNG 스트림 계약이 생기기 전까지는 이 경로에서 구현되지 않은 채로
-남는다. 이것은 `training_only`이며(spec 7.3), 이것이 잘못 동작할 평가 경로가
-가장 먼저 중요한 경로이기 때문이다.
+### `Augment`와 INV-15 (spec 7.3, spec 10.4)
+
+이 계획은 평가와 배포 경로다: 여기에는 augmentation 커널이 없고 거기 도달할 학습
+모드도 없으므로, `PlanOptions { training }` 플래그는 없다 — 그 플래그는 커널을
+들여오는 패킷에 속하며, 지금 그것을 지어내면 위치가 하나뿐인 스위치가 될 것이다. 두
+노드 형태가 lowering되는 방식:
+
+| 노드 | lowering |
+|---|---|
+| `Augment { training_only: true }` | identity: 스텝 없음, 버퍼 없음; 소비자는 producer의 버퍼를 읽는다 |
+| `Augment { training_only: false }` | `COMPILE-002` |
+
+identity인 경우가 *바로* "평가가 augmentation을 비활성화한다"가 실현되는 방식이다
+(§10.4의 자동 비활성화). 노드는 그래프에서 **제거되지 않는다**: 벗겨내면
+`observation_hash`가 저자가 결코 선언한 적 없는 그래프를 기술하게 될 것이다.
+따라서 `es-eval`은 더 이상 `training_only` 노드를 거부할 필요가 없다 — 계획이 이미
+그것을 비활성화했다 — 그리고 여전히 allow-list 밖의 다른 `Augment` 노드는 거부한다.
 
 ### 모든 커널이 따르는 결정성 규칙 (spec 3.4)
 
@@ -234,6 +249,17 @@ window_gather(ring, slot_len, depth, cursor, n, stride, dst)
 `Align::Reject`는 지금은 `COMPILE-002`다.
 
 출력 shape는 `[n_steps, ...frame_shape]`이다.
+
+### 9.1 `CpuPlan::reset` — ring들이 계획의 유일한 상태다
+
+스트림은 에피소드 경계에서 끝난다. `CpuPlan::reset()`은 모든 ring을 0으로 다시 채우고
+`cursor`와 `pushed`를 0으로 되돌리는데, 이는 정확히 `compile`이 남겨둔 상태이므로
+`reset(); run(x)`는 새로 컴파일된 계획의 첫 `run(x)`와 같다
+(`crates/es-compile/tests/observation_cpu.rs`에서 단언됨). `es-eval`은 매
+`env.reset` 뒤에 이를 호출한다(P-M2-R1): 이것이 없다면 에피소드 N의 첫 프레임들은
+에피소드 N−1의 꼬리를 보게 되고 셀 2의 것은 셀 1의 것을 보게 되어, §10.1 표가 스위트
+순서에 의존하게 될 것이다 — 이는 정확히 §10.4가 막기 위해 존재하는 것이다. 이후 이
+경로에 추가되는 상태를 지니는 버퍼는 무엇이든 여기서도 지워져야 한다.
 
 ## 10. 계획, 버퍼, 디버그 대 릴리스 (spec 11.5)
 

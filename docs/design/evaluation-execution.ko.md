@@ -31,6 +31,7 @@ for suite in ir.suites                     # a row of the §10.1 table
   for episode in 0 .. ir.episodes.n_episodes
       overrides = plan.apply_at_reset(suite_id, episode)
       env.reset()
+      cpu_plan.reset()                               # §2.4: the observation stream ends here
       loop
           inputs  = capture(env.backend().state())      # §2.3
           if plan step-drops this frame: reuse the held observation, age it
@@ -81,13 +82,19 @@ ring들은 스위트 사이로 새어 나가서는 안 되는 에피소드별 �
 - 두 개의 예외 통로는 숨겨지지 않고 lock에 이름이 명시된다: `execution_hash`는 런타임과
   하드웨어 능력(capability)을 포함하고, `evaluation_hash`는 조건을 포함한다.
 
-### 2.2 INV-15 — augmentation 거부
+### 2.2 INV-15 — augmentation 자동 비활성화, 그리고 거부
 
-무엇이든 실행되기 전에, Observation IR은 `ObservationNode::Augment`를 찾아 스캔된다.
-`AugmentationPolicy::AllowList`에 없는 노드는 `EvalError::AugmentationEnabled`다. 그래프는
-**다시 쓰이지 않고** 노드도 **제거되지 않는다**: observation 파이프라인을 조용히 편집하면
-호출자가 평가했다고 생각하는 것과 다른 `observation_hash`가 되어 버리고, 리포트는 결코
-선언된 적 없는 그래프를 증명하게 된다. 작성자는 Observation IR에서 그 노드를 빼거나,
+§10.4는 평가에서 augmentation이 *자동으로 비활성화*된다고 말하며, 계획이 실제로 하는 일이
+바로 그것이다: `training_only` `Augment` 노드는 identity pass-through로 lowering되므로
+(`docs/design/observation-lowering.md` §3), 여기서는 실행될 수 없고 allow-list 항목도
+필요 없다. 거부는 그러고 남는 것을 다룬다.
+
+무엇이든 실행되기 전에, Observation IR은 `training_only`가 **아닌**
+`ObservationNode::Augment` — 즉 실제로 실행될 노드 — 를 찾아 스캔된다.
+`AugmentationPolicy::AllowList`에 없는 그런 노드는 `EvalError::AugmentationEnabled`다.
+그래프는 **다시 쓰이지 않고** 노드도 **제거되지 않는다**: observation 파이프라인을 조용히
+편집하면 호출자가 평가했다고 생각하는 것과 다른 `observation_hash`가 되어 버리고, 리포트는
+결코 선언된 적 없는 그래프를 증명하게 된다. 작성자는 Observation IR에서 그 노드를 빼거나,
 근거와 함께 allow-list를 작성해야 하며, 그 근거는 결국 리포트의 조건(conditions)에
 남는다.
 
@@ -112,6 +119,30 @@ allow-list 항목은 노드의 `NodeId`를 10진수(`"7"`)로 매칭한다. `es-
 observation은 0으로 채워지는 대신 이름으로 거부된다. 검은 프레임에 대해 정책을 조용히
 평가하는 셀은 숫자 하나를 만들어낼 것이고, 이 표에서 틀린 숫자는 표가 없는 것보다
 나쁘다.
+
+### 2.4 계획 상태는 에피소드별이다 (P-M2-R1)
+
+`CpuPlan` 하나는 실행마다 컴파일되지만, `TemporalWindow` ring은 *스트림*이며, 스트림은
+에피소드가 끝나는 곳에서 끝난다. 그래서 `run_episode`는 `env.reset` 직후에
+`CpuPlan::reset()`을 호출하며, 이는 모든 ring을 `compile`이 남겨둔 상태로 다시 채운다
+(`docs/design/observation-lowering.md` §9.1). 이것이 없다면 첫 번째 이후 모든 에피소드의
+첫 프레임들은 이전 에피소드의 꼬리를 지니게 되고, 셀 2의 첫 에피소드는 셀 1의 것을 지니게
+될 것이다 — 그러면 §10.1 표는 스위트가 선언된 순서에 의존하게 될 것이다. 오라클은 윈도우가
+있는 observation에 대해 스위트 순서를 뒤집어 모든 셀이 변하지 않음을 단언한다.
+
+이것이 다루지 *않는* 것에 유의하라: `Perturbation` 추첨은 스위트의 **위치**
+(`EnvRng::new(seed, cell_index, episode, stream)`)로 키가 매겨지므로, 스위트 순서를
+바꾸는 것은 perturbation이 있는 스위트의 추첨을 정당하게 바꾼다. 따라서 순서-무관성
+오라클은 perturbation이 없는 스위트 두 개를 쓴다. 스트림을 스위트 *이름*으로 키잉하는
+것은 계획 상태에 관한 것이 아니라 §10.4의 `suite_id`에 관한 별개의 질문이다.
+
+### 2.5 `nu != NJ`는 오류다 (P-M2-R7)
+
+`NJ`는 배포의 관절 수이며, 로드된 모델은 이에 동의해야 한다: `run_episode`는
+`model.nu == NJ`이고 모델이 최소한 `NJ`개의 `qpos`/`qvel` 항목을 지니지 않는 한
+`EvalError::JointMismatch`로 거부한다. 아무것도 브로드캐스트되지 않고 아무것도 패딩되지
+않는다 — 관절 `NJ−1`의 복사본으로 채워진 `ctrl` 벡터나, `0.0`으로 패딩된 safety 입력은
+§10.1 표에 잘못된 숫자를 만들어내며, 이는 거부된 실행보다 나쁘다.
 
 ## 3. Perturbation 실현 (`perturb.rs`)
 

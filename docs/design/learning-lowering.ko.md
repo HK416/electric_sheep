@@ -280,30 +280,75 @@ w_i              = exp(-ln(1e4) * i / half),   half = cond / 2
 
 ### 8.3 `Diffusion`: DDPM과 DDIM
 
-선형 beta 스케줄, `beta_0 = 1e-4`부터 `beta_{n-1} = 0.02`까지(Ho et al.; LeRobot의 기본값),
-`alpha_t = 1 - beta_t`, `abar_t = prod_{j<=t} alpha_j`. spec 8.3은 `n_steps`와 스케줄러
-종류만 고정하고 그 외에는 정하지 않으므로, 두 끝값은 lowering 상수다.
+스케줄은 `diffusers`의 `DDPMScheduler` / `DDIMScheduler`인데, 이것이 실제 LeRobot
+Diffusion Policy 체크포인트가 학습된 대상이기 때문이다. 필요한 모든 것은 노드
+(`HeadKind::Diffusion`, P-M2-R6에서 `serde` 기본값과 함께 추가되어 이전 IR도 여전히
+로드된다) 위에 있다: `num_train_timesteps`, `beta_schedule`, `variance_type`,
+`prediction_type`, `clip_sample`, `clip_sample_range`. 오직 `beta_start = 1e-4` /
+`beta_end = 0.02`만 lowering 상수로 남는데, 3절의 `nhead = 8`처럼 LeRobot이 이들을
+override하지 않기 때문이다.
 
-두 스케줄러 모두 하나의 업데이트로 귀결되며, 그래서 루프가 둘이 아니라 하나다:
+**스케줄은 `n_steps`가 아니라 학습 그리드에 대해 만들어진다.** `betas`는
+`num_train_timesteps`개의 항목을 가진다(`"linear"`는 `torch.linspace`;
+`"squaredcos_cap_v2"`는 `alpha_bar(t) = cos((t + 0.008)/1.008 * pi/2)^2`을 `0.999`에서
+상한을 둔 `betas_for_alpha_bar`). `abar_t = prod_{j<=t} alpha_j`는 같은 그리드에 대한
+것이며, `n_steps`개의 **추론** timestep은 기본값 `timestep_spacing = "leading"` 아래에서
+`set_timesteps`가 하는 것과 정확히 같은 방식으로 그로부터 서브샘플링된다:
 
 ```
-for t = n_steps-1 down to 0:
+stride    = num_train_timesteps // n_steps          # integer division
+timesteps = [(n_steps-1)*stride, ..., 2*stride, stride, 0]
+```
+
+그래서 100개 중 8스텝은 `[7 .. 0]`이 아니라 `[84, 72, 60, 48, 36, 24, 12, 0]`이다.
+`abar_prev`는 그 목록의 **다음** 항목이며(`previous_timestep`), 끝을 넘어서면 `1.0`이다.
+M2 리뷰의 발견이 정확히 이것이었다: 추론 스텝들에 걸쳐 `BETA_START..BETA_END`를 펼치는
+스케줄은 다른 모델이며, 실제 체크포인트는 그 아래에서 재현되지 않을 것이다.
+
+하나의 루프가 여전히 두 스케줄러 모두를 담당하는데, 이제는 `clip_sample`이 적용될
+자리를 갖도록 `diffusers` 자신의 분해로 이루어진다(아핀 `c1*x + c3*eps`는 clamp를
+표현할 수 없다):
+
+```
+for i, t in enumerate(timesteps):
     eps = eps_theta(x, cond, float(t))
-    x   = c1[t] * x + c3[t] * eps
-    if sigma[t] != 0:  x = x + sigma[t] * noise_t
+    x0  = (x - sqrt_1mab[i] * eps) / sqrt_ab[i]     # pred_original_sample
+    if clip_sample:  x0 = clamp(x0, -range, +range)
+    x   = c0[i] * x0 + cx[i] * x + ce[i] * eps
+    if sigma[i] != 0:  x = x + sigma[i] * noise_t
 ```
 
-| | `c1[t]` | `c3[t]` | `sigma[t]` |
-|---|---|---|---|
-| `Ddpm` | `1/sqrt(alpha_t)` | `-c1[t] * beta_t / sqrt(1 - abar_t)` | `sqrt(beta_t)`, `t = 0`에서는 `0` |
-| `Ddim` (eta = 0) | `sqrt(abar_{t-1} / abar_t)` | `sqrt(1 - abar_{t-1}) - c1[t] * sqrt(1 - abar_t)` | `0` |
+| | `c0[i]` | `cx[i]` | `ce[i]` | `sigma[i]` |
+|---|---|---|---|---|
+| `Ddpm` | `sqrt(abar_prev) * beta_cur / (1 - abar_t)` | `sqrt(alpha_cur) * (1 - abar_prev) / (1 - abar_t)` | `0` | `sqrt(var_t)`, `t = 0`에서는 `0` |
+| `Ddim` (eta = 0) | `sqrt(abar_prev)` | `0` | `sqrt(1 - abar_prev)` | `0` |
 
-`abar_{-1} = 1`이다. 세 계수 리스트는 **Rust에서, f32로, `es_math::approx`를 사용해**
-계산되어, 생성된 Python 안에 shortest-round-trip 리터럴로 삽입된다; 이들은 버퍼가 아니라
-평범한 Python 리스트이므로 결코 `state_dict`에 들어가지 않고, 체크포인트가 스케줄에 대해
-IR과 불일치할 수 없다(3절의 `Normalizer` 규칙이 다시 적용된 것). 동일한 `diffusion_schedule`
-함수가 Rust 참조 구현에도 공급되므로, tier-4 테스트는 beta 스케줄의 두 가지 표기를 비교하는
-게 아니라 루프와 네트워크 자체를 측정한다.
+`alpha_cur = abar_t / abar_prev`, `beta_cur = 1 - alpha_cur`이며, 분산은
+`DDPMScheduler._get_variance`에서 오고 diffusers가 하듯이 아래로 `1e-20`에서 clamp된다:
+
+| `variance_type` | `var_t` |
+|---|---|
+| `fixed_small` (기본값) | `(1 - abar_prev) / (1 - abar_t) * beta_cur` — 사후(posterior) `beta~_t` |
+| `fixed_large` | `beta_cur` |
+
+`fixed_large`는 `DDPMScheduler`의 다른 고정 옵션이다; `DDIMScheduler`에는
+`variance_type`이 전혀 없으므로 `Ddim` 아래에서는 그 필드가 무시된다(그리고 eta = 0은
+어차피 분산을 쓰지 않는다). `epsilon`이 아닌 `prediction_type`은
+`LowerError::Unsupported`다: 8.2절의 denoiser는 `eps_theta`이며, 다른 척하는 것은
+조용히 잘못된 action chunk가 된다. 홀수인 `cond`도 같은 이유로 `LowerError::Shape`다 —
+`_sinusoidal`은 `2*(cond//2)`개의 값을 반환할 것이고 `_Denoiser.l0`은 오라클이 그것을
+보지 못하는 실행 시점에 shape이 어긋날 것이다.
+
+계수 리스트들은 **Rust에서, f32로, `es_math::approx`를 사용해** 계산되어, timestep
+목록과 함께 shortest-round-trip 리터럴로 생성된 Python 안에 삽입된다; 이들은 버퍼가
+아니라 평범한 Python 리스트이므로 결코 `state_dict`에 들어가지 않고, 체크포인트가
+스케줄에 대해 IR과 불일치할 수 없다(3절의 `Normalizer` 규칙이 다시 적용된 것). 8.1절의
+`noise_<t>` 버퍼는 **실제** diffusers timestep으로 키가 매겨지므로, 100개 중 8스텝짜리
+DDPM head는 `noise_12 .. noise_84`를 선언하고 `noise_0`은 선언하지 않는다.
+
+`src/reference.rs`는 의도적으로 여전히 `diffusion_schedule`을 lowering과 공유한다(8.1절
+참고) — 지금 그것을 정직하게 만드는 것은 `diffusion_schedule`이 이제 자신만의 독립적인
+오라클을 가진다는 사실이다(8.5절).
 
 ### 8.4 `FlowMatching`
 
@@ -323,20 +368,40 @@ SmolVLA 자체가 아님에 유의하라: 실제 SmolVLA 체크포인트는 `Pol
 
 ### 8.5 Tier-4 결과 (spec 8.9, spec 28.7 gate 12)
 
-`src/reference.rs`(test 전용)는 고정된 연산 순서와 `exp`/`sin`/`cos`/`sqrt`에 대한
-`es_math::approx`를 사용해 생성된 모듈을 f32로 미러링하며, 테스트는 state 4 -> `Linear` ->
-cond 16, action 2, horizon 3, 8 steps 구성에서 이를 torch와 비교한다. torch 2.14.0+cpu로
-측정한 값:
+세 오라클이 있으며, 독립성이 점점 커진다. 필요한 wheel을 지닌 인터프리터를 찾지 못하면
+모두 이유를 출력하며 **SKIP**한다; `ES_PYTHON`이 그런 인터프리터를 가리킨다.
 
-| 헤드 | `max_abs` | `max_rel` | tier-4 한계 |
+1. `src/reference.rs`(test 전용)는 고정된 연산 순서와 `exp`/`sin`/`cos`/`sqrt`에 대한
+   `es_math::approx`를 사용해 생성된 모듈을 f32로 미러링하며, 테스트는 state 4 ->
+   `Linear` -> cond 16, action 2, horizon 3, 100개의 학습 timestep 중 8개의 추론 스텝,
+   `squaredcos_cap_v2` / `fixed_small` / `clip_sample` 구성에서 이를 torch와 비교한다.
+2. `diffusion_schedule_matches_diffusers`는 `python/ddpm_ref_check.py`를 실행하는데,
+   이는 실제 `DDPMScheduler` / `DDIMScheduler`를 만들고 `alphas_cumprod`(전체 100개),
+   서브샘플링된 `timesteps`(허용오차 없이 정확히 같음), 스텝별 `_get_variance`를
+   스케줄러 x `beta_schedule` x `variance_type`의 여덟 조합 전체에 대해 비교한다.
+3. `torch_{ddpm,ddim}_matches_diffusers_step_loop`는 전체 lowering된 head를 torch를
+   통해 실행하고 이를 같은 작은 denoiser 가중치에 대한 **직접
+   `scheduler.step(model_output, t, sample)` 루프**와 비교한다. Python 쪽에서는
+   네트워크만 다시 만들어지며, 모든 계수는 diffusers에서 오므로, 이 레퍼런스는 더 이상
+   lowering을 한 줄씩 미러링하지 않는다. DDPM의 ancestral 추출은 체크포인트의
+   `noise_<t>` 버퍼로 `randn_tensor`를 monkeypatch하여 공급되는데, 이것이 ancestral
+   샘플러를 아예 비교할 수 있는 유일한 방법이다(8.1절).
+
+torch 2.14.0+cpu와 diffusers 0.40.0으로 측정한 값:
+
+| 테스트 | `max_abs` | `max_rel` | 한계 |
 |---|---|---|---|
-| `Diffusion { Ddpm }` | 5.96e-8 | 2.60e-6 | 1e-5 |
-| `Diffusion { Ddim }` | 3.73e-8 | 4.32e-7 | 1e-5 |
-| `FlowMatching` | 1.04e-7 | 1.37e-6 | 1e-5 |
+| `torch_ddpm_matches_rust` | 2.76e-7 | 2.24e-6 | 1e-5 |
+| `torch_ddim_matches_rust` | 1.79e-7 | 2.65e-7 | 1e-5 |
+| `torch_flow_matching_matches_rust` | 1.04e-7 | 1.37e-6 | 1e-5 |
+| `torch_ddpm_matches_diffusers_step_loop` | 6.86e-7 | 1.82e-6 | 1e-5 |
+| `torch_ddim_matches_diffusers_step_loop` | 1.34e-6 | 2.72e-6 | 1e-5 |
+| `diffusion_schedule_matches_diffusers` (`alphas_cumprod`) | <= 2.39e-7 | — | 1e-5 |
+| `diffusion_schedule_matches_diffusers` (`_get_variance`) | <= 4.18e-7 | — | 1e-5 |
+| `diffusion_schedule_matches_diffusers` (`timesteps`) | 0 | — | 정확 |
 
-잔차는 타임스텝 임베딩에서의 `es_math::approx`와 libm 사이의 격차에 matmul 누적 순서가
-더해진 것이다; 이 구성들에서는 스텝 수가 늘어나도 잔차가 커지지 않는데, 두 스케줄러 모두
-denoiser의 출력 쪽으로 수렴하기 때문이다. 테스트는 각 정책을 재실행해 spec 8.9의 비트 단위
-일치 행도 함께 검증하며, 숨겨진 RNG가 있다면 바로 여기서 드러난다. `torch`가 설치된
-인터프리터를 찾지 못하면 이유를 출력하며 **SKIP**한다; `ES_PYTHON`이 그런 인터프리터를
-가리킨다.
+잔차는 타임스텝 임베딩과 스케줄에서의 `es_math::approx`와 libm 사이의 격차에 matmul
+누적 순서가 더해진 것이다; 이 구성들에서는 두 스케줄러 모두 denoiser의 출력 쪽으로
+수렴하기 때문에 스텝 수가 늘어나도 잔차가 커지지 않는다. 테스트는 각 정책을 재실행해
+spec 8.9의 비트 단위 일치 행도 함께 검증하며, 숨겨진 RNG가 있다면 바로 여기서
+드러난다.
