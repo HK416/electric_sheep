@@ -10,11 +10,18 @@
 //! `es-physics-core` and external crates only.
 #![forbid(unsafe_code)]
 
+pub mod mapping;
 pub mod mjcf_out;
+pub mod mjwarp;
 pub mod mujoco;
 pub mod proc;
 
+pub use mapping::{
+    compare_backends, lookup, mapping_report, BackendKind, CompareReport, Mapping, MappingReport,
+    MappingRow, SemanticMapping, Severity, Spec17Row, Status, TaskFeature,
+};
 pub use mjcf_out::scene_to_mjcf;
+pub use mjwarp::MjWarpBackend;
 pub use mujoco::MuJoCoCpuBackend;
 
 #[cfg(test)]
