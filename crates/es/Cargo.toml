@@ -10,6 +10,11 @@ description = "es -- Electric Sheep runtime/CLI (spec 2.5, 10.5, 11.1)"
 name = "es"
 path = "src/main.rs"
 
+[features]
+# `es task generate --provider anthropic` (spec 14.5); off by default so the default build
+# never links a TLS stack (see crates/es-script/Cargo.toml's own `llm` feature).
+es-script-llm = ["es-script/llm"]
+
 [dependencies]
 es-ir = { workspace = true }
 es-compile = { workspace = true }
@@ -22,10 +27,13 @@ es-eval = { workspace = true }
 es-env = { workspace = true }
 es-safety = { workspace = true }
 es-policy = { workspace = true }
+es-script = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 blake3 = { workspace = true }
+# `es evidence keygen/sign/verify --trust` (spec 25.1): same pin as es-eval's `ed25519-dalek`.
+ed25519-dalek = "3.0.0"
 
 [dev-dependencies]
 es-core = { workspace = true }

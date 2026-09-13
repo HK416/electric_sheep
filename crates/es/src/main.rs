@@ -46,11 +46,15 @@ fn dispatch(args: &[String]) -> Result<u8, CliError> {
         }
         Some("--check-deps") => Ok(cmd::check_deps::run()),
         Some("ir") => cmd::ir::dispatch(&args[1..]),
+        Some("task") if args.get(1).map(String::as_str) == Some("generate") => {
+            cmd::generate::dispatch(&args[2..])
+        }
         Some("task") => cmd::task::dispatch(&args[1..]),
         Some("eval") => cmd::eval::dispatch(&args[1..]),
         Some("evidence") => cmd::evidence::dispatch(&args[1..]),
         Some("gap") => cmd::gap::dispatch(&args[1..]),
         Some("loop") => cmd::r#loop::dispatch(&args[1..]),
+        Some("mcp") => cmd::mcp::dispatch(&args[1..]),
         Some("import") => cmd::import::dispatch(&args[1..]),
         Some("dataset") => cmd::dataset::dispatch(&args[1..]),
         Some("backend") => cmd::backend::dispatch(&args[1..]),

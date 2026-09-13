@@ -1,10 +1,13 @@
-//! `es import lerobot-config` (spec 14.4 external conversion).
+//! `es import lerobot-config` (spec 14.4 external conversion), `es import roboverse` and
+//! `es import usd` (spec 28.6, the native `.usda` subset reader).
 
 use std::path::PathBuf;
 
 use es_data::lerobot::LeRobotDataset;
 use es_data::lerobot_config::{convert, LeRobotPolicyConfig, Stats};
+use es_data::roboverse::{self, RoboVerseTask};
 use es_ir::serial;
+use serde::Serialize;
 
 use crate::error::CliError;
 use crate::util::hex;
@@ -32,6 +35,8 @@ missing feature) or an I/O error, 2 on a usage error.
 pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
     match args.first().map(String::as_str) {
         Some("lerobot-config") => lerobot_config(&args[1..]),
+        Some("roboverse") => roboverse_import(&args[1..]),
+        Some("usd") => usd_import(&args[1..]),
         Some("--help" | "-h") | None => {
             println!("{HELP}");
             Ok(0)
@@ -151,5 +156,172 @@ fn lerobot_config(args: &[String]) -> Result<u8, CliError> {
     }
     println!("observation_hash: {}", hex(&obs_hash));
     println!("learning_hash: {}", hex(&learning_hash));
+    Ok(0)
+}
+
+// --- `es import roboverse` (spec 14.4 external conversion) ---------------------------------
+
+const ROBOVERSE_HELP: &str = "\
+es import roboverse <task.json> --out <dir>
+
+Converts a RoboVerse / MetaSim task config (spec 14.4 external conversion) into a
+(Task IR, Observation IR) pair via `es_data::roboverse::convert`, and writes:
+  <out>/task.toml           (via es_ir::serial)
+  <out>/observation.toml    (via es_ir::serial)
+  <out>/provenance.json     (source name, version, license, and every external asset path)
+
+Prints every non-fatal warning, every unmapped item (spec 14.4: an unrecognized checker or
+asset shape is reported, not silently dropped), and both IR content hashes.
+
+Exit code: 0 on success, 1 on a ConvertError, an I/O error, or an unmapped item with
+severity = error (spec 14.4: unmapped items block execution), 2 on a usage error.
+";
+
+#[derive(Serialize)]
+struct ProvenanceFile {
+    name: String,
+    version: Option<String>,
+    license: Option<String>,
+    scene_refs: Vec<roboverse::SceneAssetRef>,
+}
+
+fn roboverse_import(args: &[String]) -> Result<u8, CliError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{ROBOVERSE_HELP}");
+        return Ok(0);
+    }
+    let (task_path, out) = match args {
+        [task, flag, out] if flag == "--out" => (task.clone(), PathBuf::from(out)),
+        _ => {
+            return Err(CliError::Usage(format!(
+                "usage: es import roboverse <task.json> --out <dir>\n\n{ROBOVERSE_HELP}"
+            )))
+        }
+    };
+
+    let raw = std::fs::read_to_string(&task_path)
+        .map_err(|e| CliError::Runtime(format!("{task_path}: {e}")))?;
+    let task = match RoboVerseTask::parse(&raw) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("error: {task_path}: {e}");
+            return Ok(1);
+        }
+    };
+    let converted = match roboverse::convert(&task) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return Ok(1);
+        }
+    };
+
+    for w in &converted.warnings {
+        println!("warning: {w}");
+    }
+    for u in &converted.unmapped {
+        println!("unmapped ({:?}): {}", u.severity, u.item);
+    }
+
+    let task_hash = converted
+        .task
+        .task_hash()
+        .map_err(|d| CliError::Runtime(d.to_string()))?;
+    let obs_hash = converted
+        .observation
+        .observation_hash()
+        .map_err(|d| CliError::Runtime(d.to_string()))?;
+    let task_toml =
+        serial::task_to_toml(&converted.task).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let obs_toml = serial::observation_to_toml(&converted.observation)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let provenance_json = serde_json::to_string_pretty(&ProvenanceFile {
+        name: converted.provenance.name,
+        version: converted.provenance.version,
+        license: converted.provenance.license,
+        scene_refs: converted.scene_refs,
+    })
+    .map_err(|e| CliError::Runtime(e.to_string()))?;
+
+    std::fs::create_dir_all(&out)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", out.display())))?;
+    std::fs::write(out.join("task.toml"), task_toml)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", out.display())))?;
+    std::fs::write(out.join("observation.toml"), obs_toml)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", out.display())))?;
+    std::fs::write(out.join("provenance.json"), provenance_json)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", out.display())))?;
+
+    println!("task_hash: {}", hex(&task_hash));
+    println!("observation_hash: {}", hex(&obs_hash));
+
+    let blocked = converted
+        .unmapped
+        .iter()
+        .any(|u| u.severity == roboverse::Severity::Error);
+    Ok(u8::from(blocked))
+}
+
+const USD_HELP: &str = "\
+es import usd <file.usda> --out <scene.json>
+
+Reads a `.usda` text layer with the native subset reader (spec 28.6; spec 1.9 item 6 keeps
+this reader minimal, with USD Bake as the supported fallback) and writes the resulting
+`SceneDesc` as JSON.
+
+Applies the spec 3.1 conventions once: `upAxis = \"Y\"` is rotated onto Z-up, every length is
+scaled by `metersPerUnit`, and revolute limits and angular drive targets are converted from
+the schema's degrees to radians. Prints every warning, then the scene content hash.
+
+Composition arcs (`references`, `payload`, `variantSet`), `.usdc` and `.usdz` are refused by
+prim path rather than silently ignored: flatten the layer with USD Bake first.
+
+Exit code: 0 on success, 1 on a parse or mapping error, 2 on a usage error.
+";
+
+fn usd_import(args: &[String]) -> Result<u8, CliError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{USD_HELP}");
+        return Ok(0);
+    }
+    let (path, out) = match args {
+        [file, flag, out] if flag == "--out" => (file.clone(), PathBuf::from(out)),
+        _ => {
+            return Err(CliError::Usage(format!(
+                "usage: es import usd <file.usda> --out <scene.json>\n\n{USD_HELP}"
+            )))
+        }
+    };
+
+    let text =
+        std::fs::read_to_string(&path).map_err(|e| CliError::Runtime(format!("{path}: {e}")))?;
+    let (scene, warnings) = match es_physics_core::usd::import_usda(&text) {
+        Ok(imported) => imported,
+        Err(e) => {
+            eprintln!("error: {path}: {e}");
+            return Ok(1);
+        }
+    };
+    for w in &warnings {
+        println!("warning: {w}");
+    }
+
+    let json =
+        serde_json::to_string_pretty(&scene).map_err(|e| CliError::Runtime(e.to_string()))?;
+    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
+    }
+    std::fs::write(&out, json).map_err(|e| CliError::Runtime(format!("{}: {e}", out.display())))?;
+
+    let geoms: usize = scene.bodies.iter().map(|b| b.geoms.len()).sum();
+    println!(
+        "bodies: {} joints: {} geoms: {} assets: {}",
+        scene.bodies.len(),
+        scene.joints.len(),
+        geoms,
+        scene.assets.len()
+    );
+    println!("scene_hash: {}", hex(&scene.scene_hash()));
     Ok(0)
 }

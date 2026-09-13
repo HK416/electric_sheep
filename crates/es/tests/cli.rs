@@ -903,6 +903,7 @@ fn backend_compare_blocked_backend_exits_1() {
 fn backend_compare_unblocked_but_unavailable_exits_0() {
     let scene = pendulum_fixture();
     let out = bin()
+        .env("ES_PYTHON", "es-no-such-python")
         .args(["backend", "compare", "--scene"])
         .arg(&scene)
         .args(["--backends", "mujoco-cpu"])
@@ -1118,6 +1119,7 @@ fn eval_run_skips_when_backend_or_runtime_unavailable() {
     );
 
     let out = bin()
+        .env("ES_PYTHON", "es-no-such-python")
         .args(["eval", "run", "--config"])
         .arg(&config_path)
         .arg("--policy")
@@ -1186,11 +1188,14 @@ fn import_lerobot_config_round_trips_through_ir_validate() {
 
 // --- `es evidence` (spec 27.1, spec 28.7 gate 16) --------------------------------------------
 
-use es_compile::bundle::{self, EVALUATION_LOCK, POLICY_BUNDLE, REPORT_JSON, SAFETY_CASE};
+use ed25519_dalek::SigningKey;
+use es_compile::bundle::{
+    self, BundleManifest, EVALUATION_LOCK, POLICY_BUNDLE, REPORT_JSON, SAFETY_CASE,
+};
 use es_compile::PolicyBundle;
 use es_eval::evidence::{
     report_entries, Claim, Evidence, EvidenceBundle, EvidenceKind, Requirement, SafetyCase,
-    Severity, EVID_ENTRY_HASH,
+    Severity, SignatureStatus, EVID_ENTRY_HASH, EVID_NOT_CANONICAL,
 };
 use es_eval::{BackendCaps, EvaluationLock};
 use es_ir::evaluation::{
@@ -1365,7 +1370,7 @@ fn rewrite_entry(bytes: &[u8], entry: &str, payload: Vec<u8>) -> Vec<u8> {
 #[test]
 fn evidence_bundle_round_trips() {
     let built = build_evidence(40.0);
-    let report = EvidenceBundle::verify(&built.bytes, None).expect("verifies");
+    let report = EvidenceBundle::verify(&built.bytes, None, &[]).expect("verifies");
     assert!(
         report.ok(),
         "diagnostics: {:?}\ncoverage: {:?}",
@@ -1403,7 +1408,7 @@ fn evidence_verify_catches_a_tampered_report() {
     payload.push(b' ');
     let tampered = rewrite_entry(&built.bytes, &entry, payload);
 
-    let report = EvidenceBundle::verify(&tampered, None).expect("verifies");
+    let report = EvidenceBundle::verify(&tampered, None, &[]).expect("verifies");
     assert!(!report.ok(), "a rewritten report entry must not verify");
     assert!(
         report
@@ -1428,7 +1433,7 @@ fn evidence_verify_fails_an_uncovered_requirement() {
     text.push('\n');
     let cut = rewrite_entry(&built.bytes, SAFETY_CASE, text.into_bytes());
 
-    let report = EvidenceBundle::verify(&cut, None).expect("verifies");
+    let report = EvidenceBundle::verify(&cut, None, &[]).expect("verifies");
     assert!(!report.ok());
     let req = report
         .coverage
@@ -1455,7 +1460,7 @@ fn evidence_verify_against_lists_revalidation() {
     let b = build_evidence(35.0); // a tighter envelope: `deployment_hash` moves
     assert_ne!(a.chain.deployment, b.chain.deployment);
 
-    let report = EvidenceBundle::verify(&a.bytes, Some(&b.bytes)).expect("verifies");
+    let report = EvidenceBundle::verify(&a.bytes, Some(&b.bytes), &[]).expect("verifies");
     // `--against` is advisory: a differing predecessor is not a defect of this bundle.
     assert!(report.ok(), "{:?}", report.diagnostics);
     let deployment: Vec<_> = report
@@ -1527,7 +1532,7 @@ fn evidence_build_and_verify_cli_round_trip() {
     let text = stdout(&verify);
     assert!(verify.status.success(), "{text}");
     assert!(text.contains("REQ-07"), "{text}");
-    assert!(text.contains("signature:      unverified"), "{text}");
+    assert!(text.contains("signature:      absent"), "{text}");
     assert!(!text.contains("UNCOVERED"), "{text}");
 
     let json = bin()
@@ -1537,6 +1542,229 @@ fn evidence_build_and_verify_cli_round_trip() {
     assert!(json.status.success(), "{}", stdout(&json));
     let parsed: serde_json::Value = serde_json::from_str(&stdout(&json)).expect("json");
     assert_eq!(parsed["coverage"].as_array().expect("coverage").len(), 2);
+}
+
+// --- `es evidence sign`/`verify --trust` (spec 25.1) ---------------------------------------
+
+#[test]
+fn evidence_sign_then_verify_is_valid_against_the_trusted_key() {
+    let built = build_evidence(40.0);
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let signed = EvidenceBundle::sign(&built.bytes, &signing_key).expect("signs");
+
+    let trusted = [signing_key.verifying_key()];
+    let report = EvidenceBundle::verify(&signed, None, &trusted).expect("verifies");
+    assert!(report.ok(), "{:?}", report.diagnostics);
+    assert_eq!(
+        report.signature,
+        SignatureStatus::Valid(signing_key.verifying_key().to_bytes())
+    );
+
+    // Untrusted (empty trust list): the same signature checks out cryptographically but is
+    // not `Valid` until the caller says so.
+    let untrusted_report = EvidenceBundle::verify(&signed, None, &[]).expect("verifies");
+    assert_eq!(
+        untrusted_report.signature,
+        SignatureStatus::UntrustedKey(signing_key.verifying_key().to_bytes())
+    );
+    assert!(
+        untrusted_report.ok(),
+        "an untrusted signature is not a gate-16 defect"
+    );
+}
+
+#[test]
+fn evidence_verify_flags_a_tampered_signed_bundle_invalid() {
+    let built = build_evidence(40.0);
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let signed = EvidenceBundle::sign(&built.bytes, &signing_key).expect("signs");
+
+    let entry = bundle::report_entry(0, REPORT_JSON);
+    let mut payload = bundle::read(&signed).expect("reads").entries[&entry].clone();
+    payload.push(b' ');
+    let tampered = rewrite_entry(&signed, &entry, payload);
+
+    let report =
+        EvidenceBundle::verify(&tampered, None, &[signing_key.verifying_key()]).expect("verifies");
+    assert_eq!(report.signature, SignatureStatus::Invalid);
+}
+
+#[test]
+fn evidence_verify_reports_wrong_trusted_key_as_untrusted() {
+    let built = build_evidence(40.0);
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let other_key = SigningKey::from_bytes(&[9u8; 32]);
+    let signed = EvidenceBundle::sign(&built.bytes, &signing_key).expect("signs");
+
+    let report =
+        EvidenceBundle::verify(&signed, None, &[other_key.verifying_key()]).expect("verifies");
+    assert_eq!(
+        report.signature,
+        SignatureStatus::UntrustedKey(signing_key.verifying_key().to_bytes())
+    );
+}
+
+#[test]
+fn evidence_verify_a_schema_v1_bundle_reports_absent_signature() {
+    let built = build_evidence(40.0);
+    // `build` always writes the current schema version; force it back to 1 (what every
+    // evidence.esb written before this packet looks like -- no signature fields at all) and
+    // confirm it still opens and verifies (spec 25.3: old versions stay readable).
+    let raw = bundle::read(&built.bytes).expect("reads");
+    let v1 = BundleManifest {
+        schema_version: 1,
+        ..raw.manifest
+    };
+    let v1_bytes = bundle::write(&v1, &raw.entries).expect("writes");
+
+    let report = EvidenceBundle::verify(&v1_bytes, None, &[]).expect("verifies");
+    assert!(report.ok(), "{:?}", report.diagnostics);
+    assert_eq!(report.signature, SignatureStatus::Absent);
+}
+
+#[test]
+fn evidence_verify_catches_a_reindented_report() {
+    let built = build_evidence(40.0);
+    let entry = bundle::report_entry(0, REPORT_JSON);
+    let raw = bundle::read(&built.bytes).expect("reads");
+    // Same JSON value, compact instead of `build`'s canonical sorted-key pretty-print: proves
+    // the canonical-form check is about exact bytes, not just parseability.
+    let value: serde_json::Value = serde_json::from_slice(&raw.entries[&entry]).expect("parses");
+    let reindented = serde_json::to_string(&value)
+        .expect("compact json")
+        .into_bytes();
+    let bad = rewrite_entry(&built.bytes, &entry, reindented);
+
+    let report = EvidenceBundle::verify(&bad, None, &[]).expect("verifies");
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == EVID_NOT_CANONICAL),
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+#[test]
+fn evidence_keygen_sign_and_verify_trust_cli_round_trip() {
+    let dir = scratch_dir("evidence-sign-cli");
+    let built = build_evidence(40.0);
+    let bundle_path = dir.join("evidence.esb");
+    std::fs::write(&bundle_path, &built.bytes).expect("write bundle");
+
+    let key_path = dir.join("key.eskey");
+    let keygen_out = bin()
+        .args(["evidence", "keygen", "--out", key_path.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    assert!(keygen_out.status.success(), "{}", stdout(&keygen_out));
+    assert!(
+        stdout(&keygen_out).contains("public key:"),
+        "{}",
+        stdout(&keygen_out)
+    );
+    assert_eq!(
+        std::fs::metadata(&key_path).expect("key file").len(),
+        32,
+        "a signing seed is exactly 32 bytes"
+    );
+
+    let signed_path = dir.join("signed.esb");
+    let sign_out = bin()
+        .args(["evidence", "sign"])
+        .args(["--key", key_path.to_str().unwrap()])
+        .args(["--in", bundle_path.to_str().unwrap()])
+        .args(["--out", signed_path.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    assert!(sign_out.status.success(), "{}", stdout(&sign_out));
+    let sign_text = stdout(&sign_out);
+    let pub_hex = sign_text
+        .lines()
+        .find_map(|l| l.strip_prefix("signer public key: "))
+        .expect("sign prints the signer's public key")
+        .to_owned();
+    let pub_path = dir.join("pub.hex");
+    write(&pub_path, &pub_hex);
+
+    // No `--trust`: the signature checks out but nothing says to trust that key.
+    let untrusted = bin()
+        .args(["evidence", "verify", signed_path.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    assert!(untrusted.status.success(), "{}", stdout(&untrusted));
+    assert!(
+        stdout(&untrusted).contains("untrusted key"),
+        "{}",
+        stdout(&untrusted)
+    );
+
+    // `--trust pub.hex`: now it is valid.
+    let trusted = bin()
+        .args(["evidence", "verify", signed_path.to_str().unwrap()])
+        .args(["--trust", pub_path.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    assert!(trusted.status.success(), "{}", stdout(&trusted));
+    assert!(
+        stdout(&trusted).contains("signature:      valid"),
+        "{}",
+        stdout(&trusted)
+    );
+
+    // `--require-signature` with no trusted key fails even though gate 16 passes.
+    let required_untrusted = bin()
+        .args([
+            "evidence",
+            "verify",
+            signed_path.to_str().unwrap(),
+            "--require-signature",
+        ])
+        .output()
+        .expect("run es");
+    assert_eq!(
+        required_untrusted.status.code(),
+        Some(1),
+        "{}",
+        stdout(&required_untrusted)
+    );
+
+    // `--require-signature` with the right `--trust` succeeds.
+    let required_trusted = bin()
+        .args(["evidence", "verify", signed_path.to_str().unwrap()])
+        .args(["--trust", pub_path.to_str().unwrap(), "--require-signature"])
+        .output()
+        .expect("run es");
+    assert!(
+        required_trusted.status.success(),
+        "{}",
+        stdout(&required_trusted)
+    );
+}
+
+#[test]
+fn evidence_replay_dry_run_prints_the_plan_and_is_skipped_otherwise() {
+    let dir = scratch_dir("evidence-replay");
+    let built = build_evidence(40.0);
+    let path = dir.join("evidence.esb");
+    std::fs::write(&path, &built.bytes).expect("write bundle");
+
+    let skipped = bin()
+        .args(["evidence", "replay", path.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    assert_eq!(skipped.status.code(), Some(3), "{}", stdout(&skipped));
+    assert!(stdout(&skipped).contains("SKIPPED"), "{}", stdout(&skipped));
+
+    let dry = bin()
+        .args(["evidence", "replay", "--dry-run", path.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    assert!(dry.status.success(), "{}", stdout(&dry));
+    let text = stdout(&dry);
+    assert!(text.contains("REPORT"), "{text}");
+    assert!(text.contains("1 plan(s) printed"), "{text}");
 }
 
 // --- `es gap` (spec 24.3, spec 28.7 gate 15) -----------------------------------------------
@@ -1846,6 +2074,7 @@ fn loop_collect_skips_with_exit_three_when_the_backend_is_unavailable() {
     std::fs::write(&policy, build_policy_bundle(&deployable_fixture())).expect("write policy.esb");
 
     let out = bin()
+        .env("ES_PYTHON", "es-no-such-python")
         .args(["loop", "collect", "--policy"])
         .arg(&policy)
         // Availability is checked before the scene is touched, so a missing file is fine.
@@ -2043,7 +2272,7 @@ fn evidence_verify_treats_a_foreign_lock_as_stale() {
     let swapped = rewrite_entry(&a.bytes, &entry, foreign);
     let swapped = rewrite_entry(&swapped, SAFETY_CASE, text.into_bytes());
 
-    let report = EvidenceBundle::verify(&swapped, None).expect("verifies");
+    let report = EvidenceBundle::verify(&swapped, None, &[]).expect("verifies");
     assert!(!report.ok(), "a lock of another run is not coverage");
     let req = report
         .coverage
@@ -2075,7 +2304,7 @@ fn evidence_verify_fails_a_case_with_no_requirements() {
     text.push('\n');
     let empty = rewrite_entry(&built.bytes, SAFETY_CASE, text.into_bytes());
 
-    let report = EvidenceBundle::verify(&empty, None).expect("verifies");
+    let report = EvidenceBundle::verify(&empty, None, &[]).expect("verifies");
     assert!(report.coverage.is_empty());
     assert!(!report.ok(), "an empty case must not verify");
     assert!(
@@ -2095,4 +2324,269 @@ fn evidence_verify_fails_a_case_with_no_requirements() {
         .output()
         .expect("run es");
     assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
+
+// --- `es mcp` (spec 14.5 MCP interface) ------------------------------------------------------
+
+/// Spawns `es mcp` with piped stdin/stdout, writes newline-delimited JSON-RPC requests, closes
+/// stdin, and returns the newline-delimited responses parsed as JSON -- the CLI-process
+/// counterpart of `crates/es-script/tests/mcp.rs`'s in-process harness.
+fn run_mcp(requests: &[String]) -> Vec<serde_json::Value> {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let mut child = bin()
+        .args(["mcp"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn es mcp");
+    {
+        let stdin = child.stdin.as_mut().expect("piped stdin");
+        for req in requests {
+            writeln!(stdin, "{req}").expect("write request");
+        }
+    } // drop stdin: EOF, so the server loop ends
+    let out = child.wait_with_output().expect("es mcp exits");
+    assert!(
+        out.status.success(),
+        "es mcp exited non-zero: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    stdout(&out)
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap_or_else(|e| panic!("not JSON: {l}: {e}")))
+        .collect()
+}
+
+#[test]
+fn mcp_initialize_tools_list_and_validate_over_piped_stdin() {
+    let dir = scratch_dir("mcp");
+    let (task, ..) = write_fixture_toml(&dir);
+    let task_toml = std::fs::read_to_string(&task).expect("read fixture task toml");
+
+    let requests = vec![
+        serde_json::json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            .to_string(),
+        serde_json::json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}).to_string(),
+        serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": {"name": "validate", "arguments": {"kind": "task", "toml": task_toml}}
+        })
+        .to_string(),
+    ];
+    let responses = run_mcp(&requests);
+    assert_eq!(responses.len(), 3);
+    assert!(responses[0]["result"]["protocolVersion"].is_string());
+    let tools = responses[1]["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+    assert!(tools.iter().any(|t| t["name"] == "validate"));
+    assert_eq!(responses[2]["result"]["isError"], false);
+    let body: serde_json::Value = serde_json::from_str(
+        responses[2]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .expect("json content");
+    assert_eq!(body["kind"], "task");
+    assert_eq!(body["has_error"], false);
+}
+
+// --- `es import roboverse` (spec 14.4 external conversion, M4 W6) ---------------------------
+
+/// `es import roboverse` on the M4 W6 pick-and-place fixture, round-tripping the Task IR /
+/// Observation IR pair it writes through `es ir validate`.
+#[test]
+fn import_roboverse_round_trips_through_ir_validate() {
+    let dir = scratch_dir("import-roboverse");
+    let task_json = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/roboverse/pick_and_place.json"
+    );
+    let out_dir = dir.join("out");
+
+    let out = bin()
+        .args(["import", "roboverse", task_json, "--out"])
+        .arg(&out_dir)
+        .output()
+        .expect("run es");
+    let text = stdout(&out);
+    assert!(
+        out.status.success(),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("task_hash:"), "{text}");
+    assert!(text.contains("observation_hash:"), "{text}");
+
+    let task = out_dir.join("task.toml");
+    let observation = out_dir.join("observation.toml");
+    let provenance = out_dir.join("provenance.json");
+    assert!(task.is_file());
+    assert!(observation.is_file());
+    assert!(provenance.is_file());
+
+    let provenance_body: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&provenance).expect("read provenance.json"))
+            .expect("provenance.json is valid JSON");
+    assert_eq!(provenance_body["license"], "Apache-2.0");
+
+    let validate = bin()
+        .args(["ir", "validate"])
+        .args([&task, &observation])
+        .output()
+        .expect("run es");
+    let vtext = stdout(&validate);
+    assert!(
+        validate.status.success(),
+        "stdout:\n{vtext}\nstderr:\n{}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    assert!(!vtext.contains("ERROR"), "{vtext}");
+}
+
+/// spec 14.4: an unmapped item with `severity: error` blocks execution -- an unrecognized
+/// checker kind must exit 1, not 0.
+#[test]
+fn import_roboverse_exits_1_on_an_unmapped_checker() {
+    let dir = scratch_dir("import-roboverse-unmapped");
+    let task_json = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/roboverse/unknown_checker.json"
+    );
+
+    let out = bin()
+        .args(["import", "roboverse", task_json, "--out"])
+        .arg(dir.join("out"))
+        .output()
+        .expect("run es");
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{text}");
+    assert!(text.contains("unmapped"), "{text}");
+    assert!(text.contains("SomeFutureChecker"), "{text}");
+}
+
+// --- `es task generate` (spec 14.5) --------------------------------------------------------
+
+/// `task_ir()` (above) has no `Reward` node; `es-script::generate`'s completeness check
+/// (`GEN-001`) wants one, so this appends a disconnected but well-typed one.
+fn task_ir_with_reward() -> TaskIr {
+    let mut task = task_ir();
+    task.graph.insert(
+        NodeId(99),
+        TaskNode::Reward {
+            name: "progress".to_owned(),
+            weight: 1.0,
+            aggregation: es_ir::task::Aggregation::Sum,
+            ty: PortType {
+                elem: ElemType::F32,
+                shape: Shape::new([1]),
+                unit: Unit::Normalized { lo: -1.0, hi: 1.0 },
+                frame: Frame::World,
+                time: TimeRef::Tick,
+                image: None,
+            },
+        },
+    );
+    task
+}
+
+#[test]
+fn task_generate_stdin_provider_accepts_a_valid_reply() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let task = task_ir_with_reward();
+    let reply = format!(
+        "```toml\n{}\n```",
+        es_ir::serial::task_to_toml(&task).expect("task toml")
+    );
+
+    let dir = scratch_dir("task-generate-stdin");
+    let mut child = bin()
+        .args(["task", "generate", "--prompt", "reach the target"])
+        .args(["--provider", "stdin", "--out"])
+        .arg(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn es task generate");
+    child
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(reply.as_bytes())
+        .expect("write reply");
+    let out = child.wait_with_output().expect("es task generate exits");
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dir.join("task.toml").exists(), "{}", stdout(&out));
+}
+
+#[test]
+fn task_generate_reports_failure_when_no_round_validates() {
+    let dir = scratch_dir("task-generate-stdin-empty");
+    let out = bin()
+        .args(["task", "generate", "--prompt", "reach the target"])
+        .args(["--provider", "stdin", "--rounds", "1", "--out"])
+        .arg(&dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("run es task generate");
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(!dir.join("task.toml").exists());
+}
+
+/// Workspace-root path of a hand-written `.usda` fixture (M4 W3).
+fn usd_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/usd")
+        .join(name)
+}
+
+#[test]
+fn import_usd_writes_a_scene_that_round_trips() {
+    let dir = scratch_dir("import-usd");
+    let out = dir.join("scene.json");
+    let run = bin()
+        .args(["import", "usd"])
+        .arg(usd_fixture("pendulum.usda"))
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("run es import usd");
+    assert_eq!(run.status.code(), Some(0), "{}", stdout(&run));
+    let printed = stdout(&run);
+    assert!(printed.contains("bodies: 2"), "{printed}");
+    assert!(printed.contains("joints: 1"), "{printed}");
+    assert!(printed.contains("scene_hash: "), "{printed}");
+
+    let json = std::fs::read_to_string(&out).expect("scene.json");
+    let scene: es_assets::scene::SceneDesc = serde_json::from_str(&json).expect("scene json");
+    assert!(scene.validate().is_ok());
+    // The hash the CLI printed is the hash of what it wrote.
+    let hash = hex(&scene.scene_hash());
+    assert!(printed.contains(&hash), "{printed}");
+}
+
+#[test]
+fn import_usd_refuses_a_referenced_layer_by_prim_path() {
+    let dir = scratch_dir("import-usd-refused");
+    let out = dir.join("scene.json");
+    let run = bin()
+        .args(["import", "usd"])
+        .arg(usd_fixture("referenced.usda"))
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("run es import usd");
+    assert_eq!(run.status.code(), Some(1), "{}", stdout(&run));
+    let err = String::from_utf8_lossy(&run.stderr);
+    assert!(err.contains("/World/robot"), "{err}");
+    assert!(!out.exists(), "nothing is written on a refusal");
 }
