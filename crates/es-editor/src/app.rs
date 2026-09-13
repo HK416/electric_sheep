@@ -4,9 +4,10 @@
 //! and under test. This file turns positions into rectangles, and it is the only part CI
 //! merely compiles rather than runs, because running it needs a display.
 //!
-//! Read-only (spec 23.4 stage 1): the graph pans and zooms, nodes do not move. There is no
-//! code path that writes a position back into an IR, because layout is not IR (spec 4.2
-//! rule 7) and because editing is stage 2.
+//! The **Graph** tab has two modes. Read-only (spec 23.4 stage 1) draws all four IRs stacked
+//! and moves nothing. `Edit` (stage 2) drives one [`EditSession`] over the Task IR: every
+//! gesture becomes one [`Edit`], and nothing else. A drag writes a position into the
+//! `.eslayout` sidecar, never into an IR (spec 4.2 rule 7).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -17,17 +18,23 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use es_compile::bundle;
 use es_compile::PolicyBundle;
 use es_ir::deployment::DeploymentIr;
+use es_ir::graph::PortRef;
 use es_ir::learning::LearningGraph;
 use es_ir::observation::ObservationIr;
 use es_ir::serial::{self, Layout};
 use es_ir::task::TaskIr;
+use es_ir::NodeId;
 
+use crate::model::edit::{self, Edit, EditIr, EditSession};
 use crate::model::graph_view::{CrossEdge, LayerView, LayeredGraph, NodeView};
 use crate::model::image_view::{BeforeAfter, ImagePair};
+use crate::model::palette::Palette;
 use crate::model::telemetry_view::{Source, TelemetryModel};
 
 const NODE_W: f32 = 178.0;
 const NODE_H: f32 = 40.0;
+/// Click radius of a port, in graph units.
+const PORT_R: f32 = 7.0;
 /// Telemetry messages drained per frame (spec 23.3 runs the viewer on a budget).
 const PUMP_BUDGET: usize = 256;
 
@@ -42,10 +49,28 @@ enum Tab {
 /// One opened bundle: the four IRs' view-model plus whatever the image tab could make of it.
 struct Opened {
     graph: LayeredGraph,
+    task: TaskIr,
     observation: ObservationIr,
     pairs: Vec<ImagePair>,
     image_error: Option<String>,
     textures: BTreeMap<String, (egui::TextureHandle, egui::TextureHandle)>,
+}
+
+/// What the pointer is doing between press and release.
+#[derive(Clone, Debug)]
+enum Drag {
+    /// Moving a node. `origin` is where it was when the drag started, so the single
+    /// `Edit::MoveNode` pushed on release has the correct state to undo to.
+    Node {
+        id: NodeId,
+        origin: [f32; 2],
+        grab: Vec2,
+    },
+    /// Pulling a wire out of an output port.
+    Link {
+        from: PortRef,
+    },
+    Pan,
 }
 
 pub struct EditorApp {
@@ -57,6 +82,11 @@ pub struct EditorApp {
     source: Source,
     pan: Vec2,
     zoom: f32,
+    /// `Some` while the Graph tab is in edit mode (spec 23.4 stage 2).
+    edit: Option<EditSession>,
+    palette: Palette,
+    drag: Option<Drag>,
+    selected: Option<NodeId>,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -82,7 +112,63 @@ impl EditorApp {
             source,
             pan: Vec2::new(60.0, 40.0),
             zoom: 1.0,
+            edit: None,
+            palette: Palette::default(),
+            drag: None,
+            selected: None,
         }
+    }
+
+    /// Enters or leaves edit mode. Entering starts a session on the opened bundle's Task IR,
+    /// seeded with the positions the read-only view already laid out; leaving drops the
+    /// session, and with it the undo history.
+    fn set_edit_mode(&mut self, on: bool) {
+        if !on {
+            self.edit = None;
+            self.drag = None;
+            self.selected = None;
+            return;
+        }
+        let Some(opened) = &self.opened else {
+            "open a bundle before editing".clone_into(&mut self.status);
+            return;
+        };
+        let mut layout = sidecar(Path::new(self.path.trim())).unwrap_or_default();
+        for node in &opened.graph.layers[crate::model::graph_view::TASK].nodes {
+            if let Some(pos) = node.layout {
+                layout.positions.entry(node.id).or_insert(pos);
+            }
+        }
+        let graph = EditIr::Task(opened.task.clone());
+        edit::fill_missing_positions(&graph, &mut layout, 6);
+        let session = EditSession::new(graph, layout);
+        self.palette = Palette::from_registries(&session.registries);
+        self.status = format!("editing the Task IR: {} nodes", session.graph.nodes().len());
+        self.edit = Some(session);
+    }
+
+    /// Writes the `.esgraph` and its `.eslayout` next to the loaded path (spec 14.3).
+    fn save_edits(&mut self) {
+        let Some(session) = &self.edit else { return };
+        let (graph_toml, layout_toml) = match session.save() {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.status = format!("save failed: {e}");
+                return;
+            }
+        };
+        let (graph_path, layout_path) =
+            save_paths(Path::new(self.path.trim()), session.graph.kind());
+        self.status = match fs::write(&graph_path, graph_toml)
+            .and_then(|()| fs::write(&layout_path, layout_toml))
+        {
+            Ok(()) => format!(
+                "wrote {} and {}",
+                graph_path.display(),
+                layout_path.display()
+            ),
+            Err(e) => format!("save failed: {e}"),
+        };
     }
 
     /// Open a bundle at startup (`es-editor <bundle.esb>`).
@@ -120,8 +206,10 @@ impl EditorApp {
                     graph.cross_edges.len(),
                     graph.diagnostics.len(),
                 );
+                self.edit = None;
                 self.opened = Some(Opened {
                     graph,
+                    task,
                     observation,
                     pairs,
                     image_error,
@@ -156,6 +244,31 @@ impl eframe::App for EditorApp {
                 ] {
                     ui.selectable_value(&mut self.tab, tab, name);
                 }
+                ui.separator();
+                let mut editing = self.edit.is_some();
+                if ui.toggle_value(&mut editing, "Edit").changed() {
+                    self.tab = Tab::Graph;
+                    self.set_edit_mode(editing);
+                }
+                if self.edit.is_some() {
+                    if ui.button("Save").clicked() {
+                        self.save_edits();
+                    }
+                    let (undo, redo) = self
+                        .edit
+                        .as_ref()
+                        .map_or((false, false), |s| (s.can_undo(), s.can_redo()));
+                    if ui.add_enabled(undo, egui::Button::new("Undo")).clicked() {
+                        if let Some(s) = self.edit.as_mut() {
+                            s.undo();
+                        }
+                    }
+                    if ui.add_enabled(redo, egui::Button::new("Redo")).clicked() {
+                        if let Some(s) = self.edit.as_mut() {
+                            s.redo();
+                        }
+                    }
+                }
             });
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -180,6 +293,10 @@ impl eframe::App for EditorApp {
 
 impl EditorApp {
     fn graph_tab(&mut self, ui: &mut egui::Ui) {
+        if self.edit.is_some() {
+            self.edit_canvas(ui);
+            return;
+        }
         let Some(opened) = &self.opened else {
             ui.label("Open a bundle to see the layered graph (spec 23.2).");
             return;
@@ -203,6 +320,139 @@ impl EditorApp {
         for edge in &opened.graph.cross_edges {
             paint_cross_edge(&painter, &opened.graph, edge, &at, size, zoom);
         }
+    }
+
+    /// Edit mode (spec 23.4 stage 2). Every branch below ends in exactly one
+    /// [`EditSession::apply`], [`EditSession::undo`] or [`EditSession::redo`] call - this
+    /// function decides nothing else, which is what keeps the untested half thin.
+    fn edit_canvas(&mut self, ui: &mut egui::Ui) {
+        let Self {
+            edit: Some(session),
+            palette,
+            pan,
+            zoom,
+            drag,
+            selected,
+            status,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        if response.hovered() {
+            *zoom = (*zoom * ui.input(eframe::egui::InputState::zoom_delta)).clamp(0.2, 4.0);
+        }
+        let origin = response.rect.min + *pan;
+        let z = *zoom;
+        let to_graph = move |p: Pos2| [(p.x - origin.x) / z, (p.y - origin.y) / z];
+
+        // An owned snapshot of the geometry the pointer is tested against, so that no borrow
+        // of `session` is alive across the one `apply` below.
+        let mut view = CanvasView::of(session, origin, z);
+
+        let mut pending: Option<Edit> = None;
+        if let (true, Some(pos)) = (response.drag_started(), response.interact_pointer_pos()) {
+            let started = view.start_drag(pos);
+            if let Drag::Node { id, .. } = &started {
+                *selected = Some(*id);
+            }
+            *drag = Some(started);
+        }
+        match drag.clone() {
+            Some(Drag::Pan) => *pan += response.drag_delta(),
+            Some(Drag::Node {
+                id,
+                grab,
+                origin: was,
+            }) => {
+                if let Some(pos) = response.interact_pointer_pos() {
+                    let moved = to_graph(pos - grab);
+                    if response.drag_stopped() {
+                        // Put the node back where the gesture began and record one edit, so
+                        // undo returns to the position before the whole drag.
+                        session.layout.positions.insert(id, was);
+                        pending = Some(Edit::MoveNode {
+                            node: id,
+                            pos: moved,
+                        });
+                    } else {
+                        session.layout.positions.insert(id, moved);
+                        view.positions.insert(id, moved);
+                    }
+                }
+            }
+            Some(Drag::Link { from }) => {
+                if let (Some(pos), Some(start)) =
+                    (response.interact_pointer_pos(), view.port_pos(&from, false))
+                {
+                    bezier(&painter, start, pos, true, LINK, z);
+                    if response.drag_stopped() {
+                        if let Some(to) = view.port_at(pos, true) {
+                            pending = Some(Edit::Connect { from, to });
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+        if response.drag_stopped() {
+            *drag = None;
+        }
+
+        ui.input(|i| {
+            if i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace) {
+                if let Some(node) = *selected {
+                    pending = Some(Edit::RemoveNode { node });
+                }
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::Z) {
+                session.undo();
+            }
+            if i.modifiers.command && i.key_pressed(egui::Key::Y) {
+                session.redo();
+            }
+        });
+
+        let ir = session.graph.kind();
+        let menu_at = response.interact_pointer_pos().map(to_graph);
+        response.context_menu(|ui| {
+            ui.label("Add node");
+            for (category, entries) in palette.by_category() {
+                if entries.first().is_none_or(|e| e.ir != ir) {
+                    continue;
+                }
+                ui.menu_button(category, |ui| {
+                    for entry in entries {
+                        if ui.button(&entry.kind).clicked() {
+                            pending = Some(Edit::AddNode {
+                                kind: entry.kind.clone(),
+                                params: entry.defaults(),
+                                pos: menu_at.unwrap_or([0.0, 0.0]),
+                            });
+                            ui.close_kind(egui::UiKind::Menu);
+                        }
+                    }
+                });
+            }
+        });
+
+        if let Some(edit) = pending {
+            match session.apply(edit) {
+                Ok(()) => *status = format!("{} edits", session.history().len()),
+                Err(diags) => {
+                    *status = diags.first().map_or_else(
+                        || "edit refused".to_owned(),
+                        |d| format!("refused: {} {}", d.code, d.message),
+                    );
+                }
+            }
+            view = CanvasView::of(session, origin, z);
+        }
+        if selected.is_some_and(|id| !session.graph.contains(id)) {
+            *selected = None;
+        }
+        view.paint(&painter, *selected);
     }
 
     fn telemetry_tab(&mut self, ui: &mut egui::Ui) {
@@ -448,4 +698,177 @@ fn sidecar(path: &Path) -> Option<Layout> {
         path.with_extension("eslayout")
     };
     serial::parse_toml(&fs::read_to_string(file).ok()?).ok()
+}
+
+// --- the edit canvas -------------------------------------------------------------------------
+
+const LINK: Color32 = Color32::from_rgb(200, 180, 90);
+const PIN_IN: Color32 = Color32::from_rgb(120, 170, 255);
+
+/// One frame of canvas geometry, owned. Built from the session, used for hit-testing and
+/// painting, and rebuilt after an edit - so the mutation and the drawing never hold a borrow
+/// of the session at the same time.
+struct CanvasView {
+    origin: Pos2,
+    zoom: f32,
+    positions: BTreeMap<NodeId, [f32; 2]>,
+    kinds: BTreeMap<NodeId, &'static str>,
+    /// `(inputs, outputs)` as the node itself declares them.
+    ports: BTreeMap<NodeId, (Vec<String>, Vec<String>)>,
+    edges: Vec<es_ir::Edge>,
+}
+
+impl CanvasView {
+    fn of(session: &EditSession, origin: Pos2, zoom: f32) -> Self {
+        let kinds = edit::kinds_by_id(&session.graph);
+        let ports = kinds
+            .keys()
+            .map(|id| {
+                (
+                    *id,
+                    (
+                        session.graph.port_names(*id, es_ir::Dir::In),
+                        session.graph.port_names(*id, es_ir::Dir::Out),
+                    ),
+                )
+            })
+            .collect();
+        Self {
+            origin,
+            zoom,
+            positions: session.layout.positions.clone(),
+            kinds,
+            ports,
+            edges: session.graph.edges().to_vec(),
+        }
+    }
+
+    fn rect(&self, id: NodeId) -> Option<Rect> {
+        let p = self.positions.get(&id)?;
+        Some(Rect::from_min_size(
+            self.origin + Vec2::new(p[0], p[1]) * self.zoom,
+            Vec2::new(NODE_W, NODE_H) * self.zoom,
+        ))
+    }
+
+    fn names(&self, id: NodeId, input: bool) -> &[String] {
+        self.ports.get(&id).map_or(
+            &[][..],
+            |(i, o)| {
+                if input {
+                    i.as_slice()
+                } else {
+                    o.as_slice()
+                }
+            },
+        )
+    }
+
+    fn pin(rect: Rect, i: usize, n: usize, input: bool) -> Pos2 {
+        let t = (i as f32 + 1.0) / (n as f32 + 1.0);
+        Pos2::new(
+            if input { rect.left() } else { rect.right() },
+            rect.top() + rect.height() * t,
+        )
+    }
+
+    fn port_pos(&self, port: &PortRef, input: bool) -> Option<Pos2> {
+        let rect = self.rect(port.node)?;
+        let names = self.names(port.node, input);
+        let i = names.iter().position(|n| *n == port.port)?;
+        Some(Self::pin(rect, i, names.len(), input))
+    }
+
+    /// The port whose pin is under `pos`, if any.
+    fn port_at(&self, pos: Pos2, input: bool) -> Option<PortRef> {
+        for id in self.kinds.keys() {
+            let Some(rect) = self.rect(*id) else { continue };
+            let names = self.names(*id, input);
+            for (i, name) in names.iter().enumerate() {
+                if Self::pin(rect, i, names.len(), input).distance(pos) <= PORT_R * self.zoom {
+                    return Some(PortRef::new(*id, name.clone()));
+                }
+            }
+        }
+        None
+    }
+
+    /// Output pin first (a wire is pulled from a producer), then the node body, then the
+    /// background.
+    fn start_drag(&self, pos: Pos2) -> Drag {
+        if let Some(from) = self.port_at(pos, false) {
+            return Drag::Link { from };
+        }
+        for id in self.kinds.keys() {
+            if let Some(rect) = self.rect(*id) {
+                if rect.contains(pos) {
+                    return Drag::Node {
+                        id: *id,
+                        origin: self.positions.get(id).copied().unwrap_or_default(),
+                        grab: pos - rect.min,
+                    };
+                }
+            }
+        }
+        Drag::Pan
+    }
+
+    fn paint(&self, painter: &egui::Painter, selected: Option<NodeId>) {
+        for edge in &self.edges {
+            let (Some(p0), Some(p3)) = (
+                self.port_pos(&edge.from, false),
+                self.port_pos(&edge.to, true),
+            ) else {
+                continue;
+            };
+            bezier(painter, p0, p3, true, Color32::from_gray(140), self.zoom);
+        }
+        let font = FontId::proportional(12.0 * self.zoom);
+        for (id, kind) in &self.kinds {
+            let Some(rect) = self.rect(*id) else { continue };
+            let fill = if selected == Some(*id) {
+                Color32::from_rgb(60, 72, 96)
+            } else {
+                Color32::from_rgb(40, 44, 52)
+            };
+            painter.rect_filled(rect, 4.0, fill);
+            painter.rect_stroke(
+                rect,
+                4.0,
+                Stroke::new(1.0_f32, Color32::from_gray(110)),
+                egui::StrokeKind::Inside,
+            );
+            painter.text(
+                rect.min + Vec2::splat(6.0 * self.zoom),
+                Align2::LEFT_TOP,
+                format!("{kind} #{}", id.0),
+                font.clone(),
+                Color32::from_gray(220),
+            );
+            for (input, colour) in [(true, PIN_IN), (false, LINK)] {
+                let n = self.names(*id, input).len();
+                for i in 0..n {
+                    painter.circle_filled(
+                        Self::pin(rect, i, n, input),
+                        PORT_R * 0.5 * self.zoom,
+                        colour,
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Where `Save` writes: `<stem>.esgraph` and `<stem>.eslayout` beside the loaded path, or
+/// inside it when a directory of per-IR TOML files was opened (spec 14.3).
+fn save_paths(path: &Path, kind: es_ir::serial::IrKind) -> (PathBuf, PathBuf) {
+    let stem = if path.is_dir() {
+        path.join(format!("{kind:?}").to_lowercase())
+    } else {
+        path.to_path_buf()
+    };
+    (
+        stem.with_extension("esgraph"),
+        stem.with_extension("eslayout"),
+    )
 }

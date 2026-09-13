@@ -126,3 +126,74 @@ compiled one) adds eframe's `x11` / `wayland` features; building headless does n
   node is the next packet.
 - The §28.7 gate-9 number (telemetry + graph view cost < 1% of training throughput):
   `Target / Status: unverified` — it cannot be measured from a viewer with no producer.
+
+---
+
+## 9. Stage 2: the editable graph (§23.4, M3 W6)
+
+Read-only stayed; editing was added beside it, not on top of it. `LayeredGraph` is untouched —
+the prediction in §3 held: adopting an editing model was a change to `app.rs` plus two new
+view-model files.
+
+| Half | Where | Tested |
+|---|---|---|
+| edit model | `src/model/edit.rs`, `src/model/palette.rs` | fully, headless |
+| canvas | `src/app.rs` (`edit_canvas`, `CanvasView`) | compiled only |
+
+`EditSession` owns one IR (`EditIr::{Task, Observation, Learning}` — Deployment and Evaluation
+are records, not graphs), its `.eslayout` `Layout`, the two node registries, the diagnostics
+list, and the undo/redo stacks. Six edits cover everything the UI can do: `AddNode`,
+`RemoveNode`, `Connect`, `Disconnect`, `SetParam`, `MoveNode`.
+
+### What editing must not do
+
+- **`MoveNode` is layout-only.** It writes `Layout::positions` and nothing else; a test moves a
+  node three times and asserts `task_hash` is unchanged, and a second test asserts the
+  `.esgraph` half of `save()` is byte-identical before and after a move (§4.2 rule 7, §14.3).
+- **No per-kind code in the editor.** Nodes come from `TaskNodeRegistry::create` /
+  `LearningNodeRegistry::create`, parameters are replaced by re-serializing the node and handing
+  the table back to the factory, and the add-node menu is `Palette::from_registries`. Adding a
+  node kind to `es-ir` is visible here with no edit at all. See `docs/design/node-sdk.md`.
+- **No new abstraction.** `INV-17` allows two node factories and the SDK is exactly those two
+  plus `NodeSchema`. The consequence is that Observation IR has no factory, so `AddNode` and
+  `SetParam` on an Observation graph report `FACTORY-001` while its other four edits work.
+
+### Validation, and what "refused" means
+
+Every edit runs both checks: `EditIr::validate()` (the IR's own full pass) fills the advisory
+diagnostics list, and `Graph::validate_declared_ports()` decides the edit's fate. An edit that
+introduces a **new error** there — a port type mismatch (`TYPE-003`), an unknown port
+(`GRAPH-010`), a second edge into one input (`GRAPH-003`) — is reverted and returned, and it
+never enters the history. Errors that were already in the graph stay: an editor that refuses to
+work on a broken graph is an editor nobody can fix a graph with, and a half-authored graph is
+exactly the one someone opens the editor for.
+
+`RemoveNode` takes every incident edge with it, so a removal cannot leave the dangling endpoint
+that `GRAPH-002` would then refuse the removal for.
+
+### Undo
+
+Whole-state snapshots, one per edit, not per-edit inverses. Undoing `RemoveNode` by inverse has
+to restore the node, its parameters, its layout entry and every incident edge — four chances to
+be subtly wrong, and subtly wrong undo is worse than fat undo. An authored graph is hundreds of
+nodes; the `ponytail:` comment in `edit.rs` names the upgrade path if that ever stops being
+true. A test round-trips three edits through undo and redo and compares the IR, the layout and
+the hash.
+
+### Still no `egui-snarl`
+
+Re-decided with editing in hand, and the answer did not change. What snarl would replace is
+`CanvasView` plus the painting loop: ~190 lines of hit-testing pins, dragging rectangles and
+drawing beziers, which is not enough to earn a dependency that brings its own node model,
+its own layout store and its own idea of a port — three concepts that already exist here as
+`es_ir::Graph`, `es_ir::serial::Layout` and `es_ir::Port`. The gesture-to-`Edit` mapping, which
+is the part that would actually be hard to get right, is not something snarl does for us: it is
+`EditSession`, and it is tested.
+
+### Not here
+
+- Search, minimap, multi-select, copy/paste, box-select (§23.4 lists search and large-graph
+  performance as stage-2 needs; the single-selection canvas is what the six edits need).
+- A parameter inspector panel. `Edit::SetParam` and `NodeSchema` are both in place and tested;
+  the widget that fills a `ParamType` in is UI work with no model behind it left to design.
+- Editing Observation IR nodes, and the Control Graph (IR-C) — stage 3, M4.
