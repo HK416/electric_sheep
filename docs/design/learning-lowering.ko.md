@@ -87,7 +87,9 @@ class EsPolicy(nn.Module):
 | `TemporalEncoder { Transformer }` | `nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=out_dim, nhead=8, batch_first=True), 1)` | `v = self.nk(x)` | 접두사 |
 | `TemporalEncoder { TemporalConv, Gru, Mamba }` | — | — | `Unsupported` |
 | `PolicyHead { Regression }` | `Linear(in, horizon * action_dim)` | `v = self.nk(x).reshape(H, A)` | 정확 |
-| `PolicyHead { Diffusion, FlowMatching, Discrete, Energy }` | — | — | `Unsupported` |
+| `PolicyHead { Diffusion { Ddpm, Ddim } }` | `_DdpmHead` (8절) | `v = self.nk(cond, noise)` | 정확 |
+| `PolicyHead { FlowMatching }` | `_FlowHead` (8절) | `v = self.nk(cond, noise)` | 정확 |
+| `PolicyHead { Diffusion { DpmSolver }, Discrete, Energy }` | — | — | `Unsupported` |
 | `PolicyBundle` | — | — | `Unsupported` |
 | `ActionChunker` | — | `v = x[:K]` | 없음 |
 | `Normalizer { MeanStd / MinMax }` | `register_buffer(..., persistent=False)` | `v = (x - mean) / std` 또는 그 역연산 | 없음 |
@@ -207,10 +209,13 @@ dtype이 불일치하는 것은 큰 오차로 취급되지 않고, `max_abs = in
 아래 항목들은 "나중에 하면 될지도"가 아니다. 각각은 그 오라클이 이 패킷에 없기 때문에 보류된
 것이다.
 
-- **Diffusion과 FlowMatching 샘플링 루프.** `HeadKind::Diffusion { n_steps, scheduler }`와
-  `FlowMatching { n_steps }`는 각자의 노이즈 스케줄과 각자의 RNG를 가진 반복적 샘플러다. 노이즈
-  추출의 결정성(spec 3.4는 전역 RNG를 금지한다)이 진짜 설계 문제이며 lowering보다 훨씬 크다.
-  어떤 패킷이 샘플러 계약을 소유하기 전까지는 `Unsupported`다.
+- **`DpmSolver`.** 계수가 정확한 `lambda` 파라미터화, 즉 spec 8.3이 고정하지 않은 선택지에
+  좌우되는 multistep 솔버다. 정당화 가능한 두 구현이 tier-4 허용오차보다 더 크게 어긋나므로,
+  IR이 어느 쪽인지 말해줄 때까지 `Unsupported`로 남는다.
+- **UNet 또는 transformer denoiser, 그리고 cross-attention conditioning.** 8절의 denoiser는
+  hidden layer 하나짜리다. 실제 Diffusion Policy는 FiLM을 쓰는 1차원 conditional UNet을
+  사용한다; 이는 샘플러 문제가 아니라 노드 집합 문제이며(`Fusion { FiLm }`도 마찬가지로
+  `Unsupported`다), FiLM을 lowering하는 패킷에서 다룰 일이다.
 - **`PolicyBundle` (SmolVLA, π₀).** spec 8.3은 3.5B VLA가 분해되지 않고 통째로 참조된다고
   명시한다. 최종적인 lowering은 *passthrough*가 될 것이다: 번들 자신의 모듈을 로드하고,
   인터페이스를 `PolicyContract`와 대조 검사한 뒤 호출한다. 여기서 반쯤 구현하는 대신
@@ -223,3 +228,115 @@ dtype이 불일치하는 것은 큰 오차로 취급되지 않고, `max_abs = in
   `VulkanRuntime`을 M3에 둔다. 서브프로세스가 M1의 형태이며, 원래 느리게 의도된 것이다.
 - **실제 LeRobot ACT 체크포인트 키 리맵.** M1 게이트(spec 8.9)에 필요하다; 이것은 픽스처이며,
   픽스처는 게이트와 함께 있어야 한다.
+
+## 8. 샘플러 헤드: `Diffusion`과 `FlowMatching` (spec 8.3, spec 8.5)
+
+두 헤드 모두 *반복적(iterative)*이다: 노이즈에서 시작해 그것을 action chunk로 정제해 나간다.
+spec 8.5는 출력이 청크 `[H, A]`라고 규정하므로, 샘플러의 상태는 그 청크를 평탄화한 것, 즉
+`x_dim = H * A`이며, `.reshape(H, A)`는 마지막에 한 번만 일어난다.
+
+### 8.1 노이즈는 어디서 오는가
+
+ancestral 샘플러는 난수를 뽑는데, spec 3.4는 결정적 경로에서 전역 RNG를 금지한다. 따라서 두
+종류의 추출 모두 호출이 아니라 **데이터**다:
+
+- **초기값 `x_T`**는 관측치와 마찬가지로 `PolicyContract::inputs`가 이름 붙인 *선언된 그래프
+  입력*이다. IR은 이미 이를 지원한다 — 헤드는 그저 두 번째 입력 포트를 선언할 뿐이다 — 그래서
+  IR 변경이 필요 없었고 `PolicyRuntime::infer`는 여전히 이름 붙은 입력들의 순수 함수로 남는다.
+  입력을 하나만 선언하는 샘플러 헤드는 `LowerError::Shape`이며, 조용히 자기만의 노이즈를
+  만들어내는 헤드는 결코 허용되지 않는다. (이 패킷이 허용했던 대안 — 시드가 걸린
+  `torch.Generator`에 공급되는 `noise_seed` 스칼라 입력 — 은 **채택되지 않았다**: 시드는 결과를
+  torch의 RNG 알고리즘의 함수로 만드는데, 이는 해시 체인의 일부가 아니고 Rust 참조 구현에서
+  재현 가능하지도 않다.)
+- DDPM의 **스텝별 추출값 `z_t`**는 체크포인트 안의 학습되지 않는 버퍼, `nodes.<k>.noise_<t>`
+  (shape `[x_dim]`)이며, `sigma_t != 0`인 스텝마다 하나씩 있다. 이들은 평범한 exact 키이므로
+  `validate_keys`가 이를 요구한다: `noise_3`이 없는 체크포인트는 오류이지, 조용한 0이 아니다.
+  DDIM (eta = 0)은 아무것도 소비하지 않고 아무것도 선언하지 않으며, 이는 키 집합에서 드러난다.
+  다른 샘플을 원하는 호출자는 다른 `x_T`와 다른 노이즈 버퍼 집합을 쓴다 — 둘 다 콘텐츠이고,
+  둘 다 `weights_hash`에 들어가며, 따라서 둘 다 해시 체인 안에 있다(spec 5.3).
+
+바로 이것이 tier-4 비교를 애초에 가능하게 만드는 것이다: torch와 Rust 참조 구현은 *동일한*
+숫자를 소비하므로, 둘 사이의 차이는 두 RNG의 차이가 아니라 샘플러 자체의 차이다.
+
+### 8.2 Denoiser
+
+네트워크 하나가 두 헤드 모두를 담당한다 (생성된 파일에서는 `_Denoiser`):
+
+```
+eps_theta(x_t, cond, t) = l1(relu(l0([x_t, cond, temb(t)])))
+    l0: Linear(x_dim + cond + cond, cond)
+    l1: Linear(cond, x_dim)
+```
+
+`cond`는 헤드의 첫 번째 입력의 마지막 축 너비, 즉 융합된 관측 임베딩이다. spec 8.3은 헤드의
+hidden 너비도 임베딩 너비도 싣고 있지 **않으므로** — 3절의 `nhead = 8`과 마찬가지로 — 둘 다
+lowering 상의 선택이며, 그 선택은 새 상수를 도입하는 대신 "conditioning 너비를 재사용"하는
+것이다. 타임스텝 임베딩이 절반은 sine, 절반은 cosine이므로 `cond`는 짝수여야 한다.
+
+```
+temb(t)_i        = sin(t * w_i),  temb(t)_{half+i} = cos(t * w_i)
+w_i              = exp(-ln(1e4) * i / half),   half = cond / 2
+```
+
+### 8.3 `Diffusion`: DDPM과 DDIM
+
+선형 beta 스케줄, `beta_0 = 1e-4`부터 `beta_{n-1} = 0.02`까지(Ho et al.; LeRobot의 기본값),
+`alpha_t = 1 - beta_t`, `abar_t = prod_{j<=t} alpha_j`. spec 8.3은 `n_steps`와 스케줄러
+종류만 고정하고 그 외에는 정하지 않으므로, 두 끝값은 lowering 상수다.
+
+두 스케줄러 모두 하나의 업데이트로 귀결되며, 그래서 루프가 둘이 아니라 하나다:
+
+```
+for t = n_steps-1 down to 0:
+    eps = eps_theta(x, cond, float(t))
+    x   = c1[t] * x + c3[t] * eps
+    if sigma[t] != 0:  x = x + sigma[t] * noise_t
+```
+
+| | `c1[t]` | `c3[t]` | `sigma[t]` |
+|---|---|---|---|
+| `Ddpm` | `1/sqrt(alpha_t)` | `-c1[t] * beta_t / sqrt(1 - abar_t)` | `sqrt(beta_t)`, `t = 0`에서는 `0` |
+| `Ddim` (eta = 0) | `sqrt(abar_{t-1} / abar_t)` | `sqrt(1 - abar_{t-1}) - c1[t] * sqrt(1 - abar_t)` | `0` |
+
+`abar_{-1} = 1`이다. 세 계수 리스트는 **Rust에서, f32로, `es_math::approx`를 사용해**
+계산되어, 생성된 Python 안에 shortest-round-trip 리터럴로 삽입된다; 이들은 버퍼가 아니라
+평범한 Python 리스트이므로 결코 `state_dict`에 들어가지 않고, 체크포인트가 스케줄에 대해
+IR과 불일치할 수 없다(3절의 `Normalizer` 규칙이 다시 적용된 것). 동일한 `diffusion_schedule`
+함수가 Rust 참조 구현에도 공급되므로, tier-4 테스트는 beta 스케줄의 두 가지 표기를 비교하는
+게 아니라 루프와 네트워크 자체를 측정한다.
+
+### 8.4 `FlowMatching`
+
+`t = 0`의 노이즈에서 `t = 1`의 액션까지, `n_steps`개의 동일한 스텝으로
+`dx/dt = v_theta(x, cond, t)`를 오일러 적분한다 — SmolVLA / π₀ 샘플러의 형태이며, 동일한
+denoiser가 `v_theta`를 대신한다:
+
+```
+dt = 1 / n_steps
+for i = 0 .. n_steps-1:
+    x = x + dt * v_theta(x, cond, i / n_steps)
+```
+
+`x_0` 이후에는 노이즈가 없으므로 `noise_<t>` 키도 없다. 이것이 lowering하는 것은 *샘플러*이지
+SmolVLA 자체가 아님에 유의하라: 실제 SmolVLA 체크포인트는 `PolicyBundle`(7절)이며 여전히
+`Unsupported`다.
+
+### 8.5 Tier-4 결과 (spec 8.9, spec 28.7 gate 12)
+
+`src/reference.rs`(test 전용)는 고정된 연산 순서와 `exp`/`sin`/`cos`/`sqrt`에 대한
+`es_math::approx`를 사용해 생성된 모듈을 f32로 미러링하며, 테스트는 state 4 -> `Linear` ->
+cond 16, action 2, horizon 3, 8 steps 구성에서 이를 torch와 비교한다. torch 2.14.0+cpu로
+측정한 값:
+
+| 헤드 | `max_abs` | `max_rel` | tier-4 한계 |
+|---|---|---|---|
+| `Diffusion { Ddpm }` | 5.96e-8 | 2.60e-6 | 1e-5 |
+| `Diffusion { Ddim }` | 3.73e-8 | 4.32e-7 | 1e-5 |
+| `FlowMatching` | 1.04e-7 | 1.37e-6 | 1e-5 |
+
+잔차는 타임스텝 임베딩에서의 `es_math::approx`와 libm 사이의 격차에 matmul 누적 순서가
+더해진 것이다; 이 구성들에서는 스텝 수가 늘어나도 잔차가 커지지 않는데, 두 스케줄러 모두
+denoiser의 출력 쪽으로 수렴하기 때문이다. 테스트는 각 정책을 재실행해 spec 8.9의 비트 단위
+일치 행도 함께 검증하며, 숨겨진 RNG가 있다면 바로 여기서 드러난다. `torch`가 설치된
+인터프리터를 찾지 못하면 이유를 출력하며 **SKIP**한다; `ES_PYTHON`이 그런 인터프리터를
+가리킨다.
