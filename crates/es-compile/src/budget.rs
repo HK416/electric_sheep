@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use es_core::sizing;
 use es_ir::graph::IrNode;
 use es_ir::image::{ChannelFormat, ImageDType, ImageSpec};
 use es_ir::learning::LearningGraph;
@@ -264,7 +265,9 @@ impl MemoryBudget {
         // -- physics state (backend-owned sizing, spec 20.2) --
         let physics_state = match inputs.model {
             Some(m) => {
-                let per_env = u64::from(m.nq + m.nv + m.nu + m.nsensordata);
+                // Widened per term: the sum of four u32 model sizes can overflow u32.
+                let per_env =
+                    u64::from(m.nq) + u64::from(m.nv) + u64::from(m.nu) + u64::from(m.nsensordata);
                 let bytes = per_env * u64::from(d.n_sim_envs) * 8;
                 BudgetItem {
                     name: "physics_state".to_owned(),
@@ -388,7 +391,9 @@ impl MemoryBudget {
         );
         add_domain("inference", policy_weights.bytes);
 
-        // -- inference activations: sum of LearningNode output shapes x inference batch -- //
+        // -- inference activations: sum of LearningNode output shapes x inference batch.
+        // Every node output, not a liveness peak as spec 20.2 asks for: the worst case, which
+        // over-counts whenever the runtime reuses a buffer. -- //
         let inference_activations = match inputs.learning {
             None => BudgetItem::unavailable("inference_activations", "no Learning IR given"),
             Some(lg) => {
@@ -404,7 +409,7 @@ impl MemoryBudget {
                     name: "inference_activations".to_owned(),
                     bytes: per_sample * u64::from(d.inference_batch),
                     formula: format!(
-                        "sum(node output elems)={per_sample}B x inference_batch={} ({bpe}B/elem, {:?})",
+                        "worst case (no liveness): sum(node output elems)={per_sample}B x inference_batch={} ({bpe}B/elem, {:?})",
                         d.inference_batch, inputs.precision
                     ),
                 }
@@ -412,26 +417,31 @@ impl MemoryBudget {
         };
         add_domain("inference", inference_activations.bytes);
 
-        // -- chunk buffers: n_sim_envs x horizon x action_dim x 4B x 2 (spec 20.2) -- //
-        let chunk_buffers = match inputs.learning {
-            None => BudgetItem::unavailable("chunk_buffers", "no Learning IR given"),
-            Some(lg) => {
-                let c = &lg.policy.contract;
-                let bytes = u64::from(d.n_sim_envs)
-                    * u64::from(c.horizon)
-                    * u64::from(c.action_dim)
-                    * 4
-                    * 2;
-                BudgetItem {
-                    name: "chunk_buffers".to_owned(),
-                    bytes,
-                    formula: format!(
-                        "n_sim_envs={} x horizon={} x action_dim={} x 4B x 2 (double buffer)",
-                        d.n_sim_envs, c.horizon, c.action_dim
+        // -- chunk buffers: the one sizing model, shared with the runtime's own buffers
+        // (`es_core::sizing`, P-M2-R5). Deviates from spec 20.2's `n_sim_envs x H x NJ x 4B
+        // x 2` on purpose -- see the formula string. -- //
+        let chunk_buffers =
+            match inputs.learning {
+                None => BudgetItem::unavailable("chunk_buffers", "no Learning IR given"),
+                Some(lg) => {
+                    let c = &lg.policy.contract;
+                    let bytes = sizing::chunk_buffer_bytes(
+                        u64::from(d.n_sim_envs),
+                        u64::from(c.action_dim),
+                        u64::from(c.horizon),
+                    );
+                    BudgetItem {
+                        name: "chunk_buffers".to_owned(),
+                        bytes,
+                        formula: format!(
+                        "n_sim_envs={} x CHUNK_SLOTS={} x horizon={} x action_dim={} x 8B (f64) \
+                         -- deviates from spec 20.2's `x 4B x 2`: the runtime keeps \
+                         CHUNK_SLOTS overlapping chunks of f64 per env (spec 8.6)",
+                        d.n_sim_envs, sizing::CHUNK_SLOTS, c.horizon, c.action_dim
                     ),
+                    }
                 }
-            }
-        };
+            };
         add_domain("control", chunk_buffers.bytes);
 
         let bandwidth_per_tick = Some(BudgetItem {
@@ -661,23 +671,46 @@ mod tests {
             .unwrap();
         assert_eq!(inference.bytes, 128);
 
-        // chunk: 4 sim envs x horizon=5 x action_dim=2 x 4B x 2 = 320
+        // chunk: 4 sim envs x CHUNK_SLOTS=8 x horizon=5 x action_dim=2 x 8B (f64) = 2560
         let chunk = report
             .items
             .iter()
             .find(|i| i.name == "chunk_buffers")
             .unwrap();
-        assert_eq!(chunk.bytes, 320);
+        assert_eq!(chunk.bytes, 2560);
 
-        assert_eq!(report.total_bytes, 256 + 32 + 96 + 128 + 320);
+        assert_eq!(report.total_bytes, 256 + 32 + 96 + 128 + 2560);
         assert_eq!(report.per_domain["simulation"], 256);
-        assert_eq!(report.per_domain["control"], 320);
+        assert_eq!(report.per_domain["control"], 2560);
 
         // Every item states its formula, even the unavailable ones.
         assert!(report.items.iter().all(|i| !i.formula.is_empty()));
 
         let bw = report.bandwidth_per_tick.unwrap();
         assert_eq!(bw.bytes, atlas.bytes + obs_inter.bytes);
+    }
+
+    /// P-M2-R5: the budget and the runtime size the chunk buffers with the same function, at
+    /// the §12.4 gate configuration (4,096 sim envs, `H = 20`, `NJ = 7` — `es_env::
+    /// DomainSizing::GATE`, which calls `es_core::sizing::chunk_buffer_bytes` too).
+    #[test]
+    fn chunk_buffers_agree_with_the_runtime_sizing_at_the_gate_configuration() {
+        let obs = obs_fixture();
+        let mut learning = learning_fixture();
+        learning.policy.contract.horizon = 20;
+        learning.policy.contract.action_dim = 7;
+        let model = ModelSizes::default();
+        let mut inp = inputs(&obs, &learning, &model);
+        inp.domains.n_sim_envs = 4096;
+        inp.domains.n_obs_envs = 512;
+        let chunk = MemoryBudget::estimate(&inp)
+            .items
+            .into_iter()
+            .find(|i| i.name == "chunk_buffers")
+            .unwrap();
+        assert_eq!(chunk.bytes, sizing::chunk_buffer_bytes(4096, 7, 20));
+        assert_eq!(chunk.bytes, 36_700_160, "the design note's 36.7 MB");
+        assert!(chunk.formula.contains("deviates from spec 20.2"));
     }
 
     #[test]

@@ -46,10 +46,12 @@ vision + policy subtotal                                 ≈ 3.1 GB
 + PyTorch, if training shares the GPU                     ≈ 8-16 GB
 ```
 
-`MemoryBudget::estimate` reproduces the first three lines exactly from an
+`MemoryBudget::estimate` reproduces the first two lines exactly from an
 `ObservationIr`/`LearningGraph` shaped like that example (render tile atlas, observation
-intermediates, chunk buffers); inference activations and policy weights are two of the items
-this model states as `unavailable` rather than guessing (§4).
+intermediates); inference activations and policy weights are two of the items this model
+states as `unavailable` rather than guessing (§4). The chunk-buffer line it deliberately does
+**not** reproduce: 4096×8×50×8×8 = 105 MB rather than 13 MB, because the runtime holds eight
+overlapping f64 chunks per env — see §3 below.
 
 ## 3. The items and their formulas
 
@@ -65,7 +67,22 @@ Every item is a `BudgetItem { name, bytes, formula }`. `bytes == 0` with a formu
 | `history_buffers` | `sum over History entries: depth x per_sensor_bytes x n_obs_envs` | `ObservationIr::temporal.history` (spec 7.5 layer 1) joined against the `ImageInput`/`StateInput` node that owns each sensor id |
 | `policy_weights` | always `unavailable` | `WeightsRef` (spec 8.3) carries a path and a blake3 hash only — no byte size (`INV-16` keeps loading to `safetensors`, it does not add a size field) |
 | `inference_activations` | `sum(LearningNode output shapes) x inference_batch x precision_bytes` | `LearningGraph::nodes` via `IrNode::outputs` (every node's declared output ports, spec 8.3) |
-| `chunk_buffers` | `n_sim_envs x horizon x action_dim x 4B x 2` (double buffer) | `LearningGraph::policy.contract` (`horizon`, `action_dim`) |
+| `chunk_buffers` | `n_sim_envs x CHUNK_SLOTS x horizon x action_dim x 8B` (f64) — `es_core::sizing::chunk_buffer_bytes`, **deviating from spec 20.2's `x 4B x 2`**, see below | `LearningGraph::policy.contract` (`horizon`, `action_dim`) |
+
+### `chunk_buffers`: one model, and it is not spec 20.2's (P-M2-R5)
+
+Spec 20.2 budgets `n_sim_envs x H x NJ x 4B x 2` — one f32 chunk, double-buffered. The
+runtime keeps `CHUNK_SLOTS = 8` *overlapping* chunks of f64 per env, because ACT temporal
+ensembling averages every live chunk (spec 8.6) and the control path is f64 throughout. That
+is 4x the spec's figure, and it is the implementation that is right: the spec's line predates
+the ensembling buffer.
+
+Two in-tree models of the same quantity is how the spec 28.7 gate 13 ±10% check ends up
+unreachable, so there is exactly one — `es_core::sizing::chunk_buffer_bytes` at layer 1, which
+both `es_env::DomainSizing` (layer 9) and this budget (layer 7) call. The two crates cannot
+see each other (spec 4.2), which is why the formula sits below them both. At the spec 12.4
+gate configuration (4,096 envs, `H = 20`, `NJ = 7`) it is 36.7 MB, and
+`cargo test -p es-compile budget` asserts the budget item equals that function.
 
 `bandwidth_per_tick` is `render_tile_atlas + observation_intermediates`: the bytes that move
 once per simulation tick, independent of any Hz (spec 12.4's bandwidth column needs a rate to

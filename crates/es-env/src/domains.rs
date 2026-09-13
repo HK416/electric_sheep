@@ -14,6 +14,10 @@
 //! the plane, including the underrun branch — an underrun hands the plane an *empty* chunk and
 //! the plane answers with the fallback (§8.6, §9.4, `INV-12`).
 //!
+//! The chunk handed to the plane carries one `seq` **per policy invocation result**, not per
+//! control tick: `SafetyPlane::accept` moves `last_chunk_tick` only for a `seq` it has not
+//! seen, and that is what `ViolationKind::InferenceDeadline` measures (see [`Submitted`]).
+//!
 //! Everything is counted in ticks. The runner's own clock is the **control tick**: one
 //! `inference.period` window of simulation ticks, which is exactly what one
 //! [`Env::step`](crate::Env::step) advances. Inference latency is a whole number of those
@@ -44,6 +48,19 @@ struct Latest {
     submitted: bool,
 }
 
+/// What one env's [`SafetyPlane`] was last handed (§8.6, §9.4).
+///
+/// `seq` advances **once per policy invocation result**, never once per control tick: the
+/// plane's `accept` refreshes `last_chunk_tick` only for a `seq` it has not seen, and that
+/// timestamp is what `ViolationKind::InferenceDeadline` measures. A fresh `seq` every tick
+/// makes a dead policy look alive.
+#[derive(Clone, Copy, Debug, Default)]
+struct Submitted {
+    seq: u64,
+    /// [`ChunkBuffer::arrivals`] the submitted chunk was built from.
+    arrivals: u64,
+}
+
 /// Runs a [`Schedule`] over an [`Env`](crate::Env): camera selection, asynchronous inference,
 /// chunk buffers (§12).
 ///
@@ -56,6 +73,7 @@ pub struct DomainRunner<const NJ: usize, const H: usize> {
     inference: AsyncInference,
     buffers: Vec<ChunkBuffer<NJ, H>>,
     latest: Vec<Option<Latest>>,
+    submitted: Vec<Submitted>,
     obs_port: String,
     action_port: String,
     mode: ExecutionMode,
@@ -94,6 +112,7 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
             ),
             buffers: vec![ChunkBuffer::new(k, blend); envs],
             latest: vec![None; envs],
+            submitted: vec![Submitted::default(); envs],
             obs_port: "state".to_owned(),
             action_port: "action".to_owned(),
             mode: execution_mode(contract.execution_mode, blend),
@@ -260,19 +279,40 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
         }
         let period_us = self.control_period_us();
         for env in 0..envs {
-            let chunk = match self.buffers[env].next_action(self.control_tick) {
-                Some(row) => {
+            let row = self.buffers[env].next_action(self.control_tick);
+            let arrivals = self.buffers[env].arrivals();
+            let chunk = match row {
+                // A policy result the plane has not seen yet, and it covers this tick: stamp
+                // one fresh `seq` and hand over the rows it will drive until the next result.
+                // The lookahead is exact — no chunk can reach the buffer without changing
+                // `arrivals`, which is what triggers the next rebuild — so the plane's own
+                // cursor (§8.5) walks exactly the rows per-tick blending would have produced.
+                Some(first) if arrivals != self.submitted[env].arrivals => {
                     let mut actions = [[0.0; NJ]; H];
-                    actions[0] = row;
-                    // One row synthesized per control tick: `control_tick` is strictly
-                    // increasing, so it is a valid chunk `seq` (spec 8.6, P-M1-R3) — the
-                    // plane must treat every tick's row as a fresh chunk, not content it
-                    // might coincidentally repeat.
-                    ActionChunk::new(actions, 1, self.mode).with_seq(self.control_tick)
+                    actions[0] = first;
+                    let mut valid = 1;
+                    while valid < H {
+                        match self.buffers[env].action_at(self.control_tick + valid as u64) {
+                            Some(r) => {
+                                actions[valid] = r;
+                                valid += 1;
+                            }
+                            None => break,
+                        }
+                    }
+                    self.submitted[env].seq += 1;
+                    self.submitted[env].arrivals = arrivals;
+                    ActionChunk::new(actions, valid, self.mode).with_seq(self.submitted[env].seq)
                 }
-                // Underrun: an empty chunk, so the plane produces the fallback (§8.6, §9.4).
-                // Never a fabricated action.
-                None => ActionChunk::empty(self.mode).with_seq(self.control_tick),
+                // No new result — including the underrun case, where the buffer covers
+                // nothing. Resubmit the previous `seq`: `SafetyPlane::accept` copies nothing
+                // for a `seq` it has already seen, so these rows are never read, the plane
+                // keeps consuming the chunk it holds, and `last_chunk_tick` stays where the
+                // last real result put it. That is what lets `InferenceDeadline` fire when a
+                // policy stops producing (§9.4, P-M2-R3); once the held chunk is exhausted
+                // the plane's own `ChunkUnderrun` produces the fallback (§8.6). Never a
+                // fabricated action.
+                _ => ActionChunk::empty(self.mode).with_seq(self.submitted[env].seq),
             };
             let age = self.latest[env]
                 .as_ref()
@@ -286,6 +326,17 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
     /// The episode of `env` ended: its chunks and queued inference describe a state that no
     /// longer exists (§13.1).
     pub fn reset_env(&mut self, env: u32) {
+        let arrivals = self
+            .buffers
+            .get(env as usize)
+            .map_or(0, ChunkBuffer::arrivals);
+        if let Some(s) = self.submitted.get_mut(env as usize) {
+            // A new `seq` with no rows behind it: the next `emit_actions` makes the plane
+            // drop the chunk it still holds for the finished episode rather than keep
+            // consuming it (§13.1).
+            s.seq += 1;
+            s.arrivals = arrivals;
+        }
         if let Some(b) = self.buffers.get_mut(env as usize) {
             b.clear();
         }
@@ -445,8 +496,6 @@ pub struct DomainSizing {
     pub camera_hz: u64,
     pub action_dim: u64,
     pub horizon: u64,
-    /// Chunks kept per env — [`crate::chunk_buffer::CHUNK_SLOTS`].
-    pub chunk_slots: u64,
 }
 
 impl DomainSizing {
@@ -461,7 +510,6 @@ impl DomainSizing {
         camera_hz: 30,
         action_dim: 7,
         horizon: 20,
-        chunk_slots: crate::chunk_buffer::CHUNK_SLOTS as u64,
     };
 
     /// Round-robin cycle length: how many observation ticks it takes to visit every env
@@ -490,9 +538,12 @@ impl DomainSizing {
         self.render_bytes_per_sec() * 4
     }
 
-    /// Chunk buffers for the whole simulation batch: `f64[H][NJ]` per slot, per env.
+    /// Chunk buffers for the whole simulation batch: `CHUNK_SLOTS` × `f64[H][NJ]` per env.
+    ///
+    /// The formula lives in `es_core::sizing` because `es-compile`'s memory budget must size
+    /// the same buffers and cannot depend on this crate (§4.2, §20.2, P-M2-R5).
     pub fn chunk_buffer_bytes(self) -> u64 {
-        self.sim_envs * self.chunk_slots * self.horizon * self.action_dim * 8
+        es_core::sizing::chunk_buffer_bytes(self.sim_envs, self.action_dim, self.horizon)
     }
 
     /// What the same configuration would cost with every camera on (`EnvSelection::All`) —
@@ -520,6 +571,7 @@ mod tests {
     use es_ir::learning::{LearningGraph, RuntimeHints};
     use es_ir::task::{Distribution, JointQuantity, TaskNode};
     use es_policy::{PolicyError, PolicyInfo, WeightsSource};
+    use es_safety::ViolationKind;
 
     const NJ: usize = 1;
     const H: usize = 4;
@@ -830,6 +882,69 @@ mod tests {
             "a fully observed batch mostly has a chunk: {r16}"
         );
         assert_ne!(run(4, 60), run(16, 60), "trajectories are not batch-free");
+    }
+
+    /// P-M2-R3: a policy that stops producing must trip `InferenceDeadline`.
+    ///
+    /// The chunk `seq` the plane judges freshness by is stamped once per policy invocation
+    /// result, so once the results stop, `last_chunk_tick` stops moving and the watchdog
+    /// fires. It must *not* fire while the policy is alive — a fresh chunk every control tick
+    /// would have made a dead policy indistinguishable from a live one, which is the bug.
+    #[test]
+    fn a_policy_that_stops_producing_trips_the_inference_deadline() {
+        const ALIVE: usize = 12;
+        // One control step is 4 sim ticks x 4,000 us = 16 ms of plane time, so a 50 ms budget
+        // survives the 2-tick inference latency but not a policy that stops.
+        let budget = Micros(50_000);
+        let mut ir = deployment_ir();
+        ir.deadlines.inference_budget = budget;
+        ir.watchdogs = WatchdogSet(vec![
+            Watchdog::ChunkUnderrun,
+            Watchdog::InferenceDeadline { budget },
+        ]);
+
+        let task = task();
+        let mut env = Env::new(&task, &fake_scene(), FakeBackend::new(), &domains(16), 5).unwrap();
+        let mut runner = DomainRunner::<NJ, H>::new(
+            env.schedule(),
+            &contract(),
+            ChunkBlendPolicy::HardSwitch,
+            TickRate::hz(250),
+        )
+        .unwrap();
+        let mut planes = vec![SafetyPlane::<NJ, H>::from_ir(&ir).unwrap(); 16];
+        let mut policy = FakePolicy::default();
+        let deadlines = |planes: &[SafetyPlane<NJ, H>]| -> u64 {
+            planes
+                .iter()
+                .map(|p| p.counters().count(ViolationKind::InferenceDeadline))
+                .sum()
+        };
+
+        for _ in 0..ALIVE {
+            env.step_with_policy(&mut runner, &mut policy, &mut planes, &mut [])
+                .unwrap();
+        }
+        assert!(runner.inference_calls() > 0, "the policy did run");
+        assert_eq!(deadlines(&planes), 0, "a live policy never trips it");
+
+        // The policy stops: the control loop keeps running, so `Env::step_with_policy` minus
+        // the two phases that need a live policy.
+        let mut fired_after = None;
+        for step in 0..8 {
+            let mut ctrl = vec![0.0; 16 * NJ];
+            runner
+                .emit_actions(env.tick(), &mut planes, &mut ctrl)
+                .unwrap();
+            env.step(&ctrl).unwrap();
+            runner.advance();
+            if fired_after.is_none() && deadlines(&planes) > 0 {
+                fired_after = Some(step + 1);
+            }
+        }
+        let fired_after = fired_after.expect("a dead policy trips InferenceDeadline");
+        // 50 ms of budget at 16 ms per control step: the fourth silent step, not the eighth.
+        assert_eq!(fired_after, 4, "fired within the budget, not late");
     }
 
     #[test]

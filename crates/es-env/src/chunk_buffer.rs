@@ -24,7 +24,10 @@ use es_safety::ActionChunk;
 /// replanning every 4 control ticks) that is 5. Eight slots leave headroom and keep the
 /// scan cheap; a ninth chunk evicts the oldest, which is the one the ACT weights have
 /// already decayed to nothing.
-pub const CHUNK_SLOTS: usize = 8;
+///
+/// It lives in `es-core` because `es-compile`'s memory budget sizes this buffer too and
+/// cannot see this crate (§4.2, §20.2).
+pub use es_core::sizing::CHUNK_SLOTS;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Slot<const NJ: usize, const H: usize> {
@@ -83,6 +86,13 @@ impl<const NJ: usize, const H: usize> ChunkBuffer<NJ, H> {
 
     pub fn blend(&self) -> ChunkBlendPolicy {
         self.blend
+    }
+
+    /// Chunks pushed since construction — one per policy invocation result delivered to this
+    /// env. It is what stamps the `ActionChunk::seq` the Safety Plane judges freshness by
+    /// (§8.6, §9.4): a tick that adds no arrival must not look like a new chunk.
+    pub fn arrivals(&self) -> u64 {
+        self.next_seq - 1
     }
 
     /// Chunks currently held (live slots), for tests and telemetry.
@@ -145,15 +155,30 @@ impl<const NJ: usize, const H: usize> ChunkBuffer<NJ, H> {
         }
     }
 
-    /// The action for `tick`, or `None` on underrun (§8.6).
+    /// The action for `tick`, or `None` on underrun (§8.6), counted into `served`/`underruns`.
     ///
-    /// No allocation: the overlap set is an inline `[usize; CHUNK_SLOTS]`, insertion-sorted by
-    /// arrival so the reduction order is fixed (§12.3).
+    /// Call once per control tick per env: the counters are §12.4's `chunk_underrun_rate`.
+    /// Use [`ChunkBuffer::action_at`] for a lookahead that must not be counted.
     pub fn next_action(&mut self, tick: u64) -> Option<[f64; NJ]> {
+        let out = self.action_at(tick);
+        if out.is_some() {
+            self.served += 1;
+        } else {
+            self.underruns += 1;
+        }
+        out
+    }
+
+    /// The action for `tick`, or `None` on underrun (§8.6), without touching the counters.
+    ///
+    /// No allocation and no copy of a slot: the overlap set is an inline `[usize;
+    /// CHUNK_SLOTS]` of *borrowed* slots, insertion-sorted by arrival so the reduction order
+    /// is fixed (§12.3).
+    pub fn action_at(&self, tick: u64) -> Option<[f64; NJ]> {
         let mut order = [0usize; CHUNK_SLOTS];
         let mut n = 0usize;
         for i in 0..CHUNK_SLOTS {
-            let s = self.slots[i];
+            let s = &self.slots[i];
             if s.valid == 0 || tick < s.start || tick - s.start >= self.span(s.valid) as u64 {
                 continue;
             }
@@ -168,10 +193,8 @@ impl<const NJ: usize, const H: usize> ChunkBuffer<NJ, H> {
             n += 1;
         }
         if n == 0 {
-            self.underruns += 1;
             return None;
         }
-        self.served += 1;
         let row = |i: usize| {
             let s = &self.slots[i];
             s.actions[(tick - s.start) as usize]
@@ -338,6 +361,24 @@ mod tests {
         b.clear();
         assert_eq!(b.next_action(0), None, "reset drops stale predictions");
         assert!(b.underrun_rate().is_some_and(|r| r > 0.0));
+    }
+
+    /// `action_at` is the lookahead `DomainRunner` builds one chunk per arrival from: same
+    /// rows, but it must not move `served`/`underruns` — those are per control tick (§12.4).
+    #[test]
+    fn action_at_is_next_action_without_the_counters() {
+        let mut b = ChunkBuffer::<1, H>::new(4, ensemble(0.3));
+        assert_eq!(b.arrivals(), 0);
+        b.push(&chunk([1.0, 2.0, 3.0, 4.0], 4), 5);
+        assert_eq!(b.arrivals(), 1);
+        for tick in 4..10 {
+            assert_eq!(b.action_at(tick), b.action_at(tick), "pure");
+        }
+        assert_eq!((b.served(), b.underruns()), (0, 0));
+        for tick in 4..10 {
+            assert_eq!(b.next_action(tick), b.action_at(tick));
+        }
+        assert_eq!((b.served(), b.underruns()), (4, 2));
     }
 
     #[test]

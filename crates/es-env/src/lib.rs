@@ -21,7 +21,7 @@ pub use chunk_buffer::{ChunkBuffer, CHUNK_SLOTS};
 pub use domains::{DomainRunner, DomainSizing};
 pub use env::{Env, EnvMetrics, StepOutcome};
 pub use episode::{Episode, EpisodeRecorder, Termination};
-pub use inference::{latency_ticks, AsyncInference, Submission};
+pub use inference::{default_max_pending, latency_ticks, AsyncInference, Submission};
 pub use randomize::RandomizationPlan;
 pub use rng::EnvRng;
 pub use scheduler::{BatchDomains, Device, DomainCfg, Schedule, TickPlan};

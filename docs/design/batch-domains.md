@@ -220,6 +220,27 @@ it: an underrun hands the plane `ActionChunk::empty` and the plane answers with 
 (§8.6, §9.4). No branch reaches `set_ctrl` around the plane, including in tests — the test
 envelope is widened, never disabled (INV-12).
 
+### One `seq` per policy result, not per control tick (P-M2-R3)
+
+`SafetyPlane::accept` copies a chunk in only when its `seq` is one it has not seen, and that
+is also the only thing that moves `last_chunk_tick` — the timestamp
+`ViolationKind::InferenceDeadline` measures. So the runner stamps `seq` **once per policy
+invocation result**:
+
+- A result that covers the current tick gets a fresh `seq` and the rows it will drive until
+  the next result arrives (`ChunkBuffer::action_at` as a lookahead). The plane's own cursor
+  then walks them, exactly as `es-runtime-embedded` does on a non-replan tick. The lookahead
+  is exact because nothing can reach the buffer without changing `ChunkBuffer::arrivals`,
+  which is what triggers the next rebuild.
+- Every other tick resubmits the previous `seq`. The plane ignores the payload of a `seq` it
+  already holds, so those ticks neither refresh `last_chunk_tick` nor fabricate an action.
+- An episode reset bumps the `seq` with no rows behind it, so the plane drops the finished
+  episode's chunk instead of consuming it further (§13.1).
+
+A fresh `seq` every control tick — what the runner used to do — makes a dead policy
+indistinguishable from a live one: `InferenceDeadline` could never fire through
+`DomainRunner`, and a stopped policy showed up only as `ChunkUnderrun`.
+
 Two things are arrays rather than singletons, both because the state behind them is per-env:
 `planes: &mut [SafetyPlane]` (hold target, rate-limit history and the e-stop latch are
 per-robot, §9.3) and `plans: &mut [CpuPlan]` (a `TemporalWindow` ring is a per-env history,
@@ -238,6 +259,20 @@ per-robot, §9.3) and `plans: &mut [CpuPlan]` (a `TemporalWindow` ring is a per-
   counters rather than as a silent time shift.
 - Nothing reads a clock. `Instant` appears in `es-env` only in `EnvMetrics::simulation_wall`,
   which is a measurement, not an input to any decision.
+
+### The queue is bounded (P-M2-R4)
+
+`max_pending` defaults to `inference.batch × latency_ticks + batch` — exactly the work in
+flight when the pipeline keeps up: one batch released per tick for the whole latency, plus the
+batch being filled. `with_max_pending` overrides it (clamped to at least one batch).
+
+A submission that would exceed the bound is dropped and counted in `dropped_submissions`; the
+**newest** is dropped, so the queue stays FIFO and back-pressure still delays work in schedule
+order. A dropped observation never produces a chunk, so it surfaces where every other missing
+chunk does — as an underrun, and then the plane's fallback. An unbounded queue would instead
+grow without limit whenever `inference.batch` is under the arrival rate (the normal
+over-subscribed case §12.2's round-robin exists for), which at the §28.4 gate configuration is
+the out-of-memory §20.3 forbids.
 
 Real threading is a later packet and belongs behind this same interface: `submit` hands work
 to a worker, `poll` takes it back, and the release rule stays here so that swapping the worker
@@ -265,6 +300,13 @@ because averaging the overlap *is* the method.
 
 `next_action` returns `None` on underrun and counts it. It never fabricates a row — a
 fabricated action would reach the actuator having been checked against nothing.
+`action_at` is the same lookup without the counters, for the per-arrival chunk the runner
+builds; the counters stay one per control tick, which is what §12.4's `chunk_underrun_rate`
+divides by.
+
+`CHUNK_SLOTS` itself lives in `es_core::sizing` together with `chunk_buffer_bytes`, because
+`es-compile`'s memory budget sizes these same buffers and cannot depend on `es-env` (§4.2).
+One formula, two callers (P-M2-R5).
 
 ## 12. What batch-independence actually means
 

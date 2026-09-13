@@ -53,6 +53,18 @@ pub fn latency_ticks(expected_latency_ms: f32, control: TickRate) -> u64 {
         .div_ceil(control.den().saturating_mul(1_000_000))
 }
 
+/// The default queue bound: `batch × latency_ticks + batch` (§12.3, P-M2-R4).
+///
+/// That is exactly the work in flight when the pipeline keeps up — one batch released per
+/// tick for the whole latency, plus the batch being filled. Anything beyond it is backlog
+/// the pipeline will never catch up on, so holding it only delays the underrun and costs
+/// memory that §20.3 has already budgeted elsewhere.
+pub fn default_max_pending(latency_ticks: u64, batch: u32) -> usize {
+    let batch = u64::from(batch.max(1));
+    let cap = batch.saturating_mul(latency_ticks).saturating_add(batch);
+    usize::try_from(cap).unwrap_or(usize::MAX)
+}
+
 /// The deterministic simulated inference pipeline of §12.3.
 ///
 /// FIFO by construction: submissions are released in submit order, and the caller submits in
@@ -62,22 +74,51 @@ pub fn latency_ticks(expected_latency_ms: f32, control: TickRate) -> u64 {
 pub struct AsyncInference {
     latency_ticks: u64,
     batch: u32,
+    max_pending: usize,
     queue: VecDeque<Submission>,
     submitted: u64,
     released: u64,
+    dropped: u64,
 }
 
 impl AsyncInference {
     /// `batch` is the inference domain's batch size (§12.1); it is clamped to at least 1,
     /// because a zero-width batch would never drain the queue.
+    ///
+    /// The queue is bounded at [`AsyncInference::max_pending`] from the start: an arrival rate
+    /// above `batch` per tick is the normal over-subscribed case (§12.2's round-robin exists
+    /// because it is), and an unbounded queue would turn it into the out-of-memory §20.3
+    /// forbids rather than into the underrun it is.
     pub fn new(latency_ticks: u64, batch: u32) -> Self {
+        let batch = batch.max(1);
         Self {
             latency_ticks,
-            batch: batch.max(1),
+            batch,
+            max_pending: default_max_pending(latency_ticks, batch),
             queue: VecDeque::new(),
             submitted: 0,
             released: 0,
+            dropped: 0,
         }
+    }
+
+    /// Overrides the queue bound (default: [`default_max_pending`]). Clamped to at least
+    /// `batch`, since a queue that cannot hold one batch could never release a full one.
+    #[must_use]
+    pub fn with_max_pending(mut self, max_pending: usize) -> Self {
+        self.max_pending = max_pending.max(self.batch as usize);
+        self
+    }
+
+    /// The most submissions that may wait at once.
+    pub fn max_pending(&self) -> usize {
+        self.max_pending
+    }
+
+    /// Submissions refused because the queue was full — they never reach the policy, so each
+    /// one surfaces downstream as a chunk underrun (§8.6), which is the honest signal.
+    pub fn dropped_submissions(&self) -> u64 {
+        self.dropped
     }
 
     pub fn latency_ticks(&self) -> u64 {
@@ -100,7 +141,15 @@ impl AsyncInference {
         self.released
     }
 
+    /// Queues one observation, or drops it if the queue is already at `max_pending`.
+    ///
+    /// The **newest** is dropped, never the oldest: the queue stays FIFO, so back-pressure
+    /// still delays work in schedule order instead of reshuffling it (§12.3).
     pub fn submit(&mut self, env: u32, submit_tick: u64, inputs: BTreeMap<String, Tensor>) {
+        if self.queue.len() >= self.max_pending {
+            self.dropped += 1;
+            return;
+        }
         self.queue.push_back(Submission {
             env,
             submit_tick,
@@ -157,8 +206,11 @@ mod tests {
     }
 
     /// The full release trace of a run: `(release_tick, env, submit_tick)`.
+    ///
+    /// The queue bound is lifted here: these tests are about release *order*, and the bound is
+    /// exercised on its own in `a_full_queue_drops_the_newest_instead_of_growing`.
     fn run(batch: u32, latency: u64, ticks: u64, envs: u32) -> Vec<(u64, u32, u64)> {
-        let mut inf = AsyncInference::new(latency, batch);
+        let mut inf = AsyncInference::new(latency, batch).with_max_pending(usize::MAX);
         let mut trace = Vec::new();
         for t in 0..ticks {
             for env in 0..envs {
@@ -251,5 +303,38 @@ mod tests {
     #[test]
     fn a_run_replays_bitwise() {
         assert_eq!(run(3, 7, 50, 5), run(3, 7, 50, 5));
+    }
+
+    /// P-M2-R4: the §28.4 gate configuration's arrival rate against the narrowest possible
+    /// batch. 4,096 envs × 10,000 ticks is 40.96 M submissions; the queue must stay at its
+    /// cap and the excess must be *counted*, not held (§20.3 — this is the out-of-memory the
+    /// unbounded queue used to be).
+    #[test]
+    fn a_full_queue_drops_the_newest_instead_of_growing() {
+        let (envs, ticks) = (4096u32, 10_000u64);
+        let mut inf = AsyncInference::new(2, 1);
+        assert_eq!(inf.max_pending(), 3, "batch x latency + batch");
+        for t in 0..ticks {
+            for env in 0..envs {
+                inf.submit(env, t, BTreeMap::new());
+            }
+            assert!(inf.pending() <= inf.max_pending(), "tick {t}");
+            inf.poll(t);
+        }
+        let attempts = u64::from(envs) * ticks;
+        assert_eq!(inf.submitted() + inf.dropped_submissions(), attempts);
+        assert!(
+            inf.dropped_submissions() > attempts / 2,
+            "the backlog is dropped, not held"
+        );
+        assert!(
+            inf.released() > 0,
+            "the pipeline still runs at its batch width"
+        );
+        // A cap below one batch would never fill a batch; it is clamped up.
+        assert_eq!(
+            AsyncInference::new(0, 8).with_max_pending(1).max_pending(),
+            8
+        );
     }
 }
