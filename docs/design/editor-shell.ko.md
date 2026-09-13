@@ -127,3 +127,79 @@ Deployment IR은 그래프가 아니라 레코드이므로(§9.2), 그 밴드는
   패킷이다.
 - §28.7 gate-9 수치(텔레메트리 + 그래프 뷰 비용이 학습 처리량의 1% 미만): `Target /
   Status: 미검증 (unverified)` — 생산자 없는 뷰어로는 측정할 수 없다.
+
+---
+
+## 9. 2단계: 편집 가능한 그래프 (§23.4, M3 W6)
+
+읽기 전용은 그대로 남았고; 편집은 그 위가 아니라 곁에 추가되었다. `LayeredGraph`는
+손대지 않았다 — §3의 예측이 맞아떨어졌다: 편집 모델을 도입하는 것은 `app.rs`에 대한
+변경과 두 개의 새 view-model 파일이었다.
+
+| 절반 | 위치 | 테스트 |
+|---|---|---|
+| edit 모델 | `src/model/edit.rs`, `src/model/palette.rs` | 완전히, 헤드리스로 |
+| canvas | `src/app.rs` (`edit_canvas`, `CanvasView`) | 컴파일만 |
+
+`EditSession`은 하나의 IR(`EditIr::{Task, Observation, Learning}` — Deployment와
+Evaluation은 그래프가 아니라 레코드다), 그 `.eslayout` `Layout`, 두 노드 레지스트리, 진단
+목록, undo/redo 스택을 소유한다. 여섯 개의 편집이 UI가 할 수 있는 모든 것을 다룬다:
+`AddNode`, `RemoveNode`, `Connect`, `Disconnect`, `SetParam`, `MoveNode`.
+
+### 편집이 해서는 안 되는 것
+
+- **`MoveNode`는 레이아웃 전용이다.** `Layout::positions`만 쓸 뿐 그 외에는 아무것도
+  쓰지 않는다; 테스트 하나는 노드를 세 번 옮기고 `task_hash`가 바뀌지 않았음을
+  단언하고, 두 번째 테스트는 `save()`의 `.esgraph` 쪽 절반이 이동 전후로 바이트
+  단위로 동일함을 단언한다(§4.2 규칙 7, §14.3).
+- **에디터에는 kind별 코드가 없다.** 노드는 `TaskNodeRegistry::create` /
+  `LearningNodeRegistry::create`로부터 나오고, 파라미터는 노드를 재직렬화해서 그
+  테이블을 factory에 돌려주는 방식으로 교체되며, add-node 메뉴는
+  `Palette::from_registries`다. `es-ir`에 노드 kind를 추가하면 여기서는 아무
+  편집 없이도 그것이 보인다. `docs/design/node-sdk.md`를 보라.
+- **새 추상화 없음.** `INV-17`은 두 개의 노드 factory를 허용하며 SDK는 정확히 그
+  둘에 `NodeSchema`를 더한 것이다. 그 결과 Observation IR에는 factory가 없으므로,
+  Observation 그래프에 대한 `AddNode`와 `SetParam`은 `FACTORY-001`을 보고하는
+  반면 나머지 네 편집은 동작한다.
+
+### 검증, 그리고 "거부됨"이 의미하는 것
+
+모든 편집은 두 검사를 모두 실행한다: `EditIr::validate()`(IR 자신의 전체 패스)가
+권고성 진단 목록을 채우고, `Graph::validate_declared_ports()`가 그 편집의 운명을
+결정한다. 그 검사에서 **새 오류**를 일으키는 편집 — 포트 타입 불일치(`TYPE-003`), 알
+수 없는 포트(`GRAPH-010`), 하나의 입력에 두 번째로 들어오는 엣지(`GRAPH-003`) — 는
+되돌려져 반환되며, 히스토리에는 절대 들어가지 않는다. 이미 그래프에 있던 오류는 그대로
+남는다: 깨진 그래프에서는 작업을 거부하는 에디터는 아무도 그래프를 고칠 수 없는
+에디터이고, 절반만 저작된 그래프야말로 누군가 에디터를 여는 바로 그 대상이다.
+
+`RemoveNode`는 걸려 있는 모든 엣지를 함께 가져가므로, 제거 작업이 나중에
+`GRAPH-002`가 그 제거를 거부하게 만들 매달린 끝점을 남길 수 없다.
+
+### Undo
+
+편집별 역연산이 아니라, 편집 하나당 하나의 전체 상태 스냅샷이다. `RemoveNode`를
+역연산으로 undo하려면 노드, 그 파라미터, 그 레이아웃 항목, 걸려 있던 모든 엣지를
+복원해야 한다 — 은근히 틀릴 기회가 네 번이고, 은근히 틀린 undo는 뚱뚱한 undo보다
+나쁘다. 저작된 그래프는 수백 개의 노드다; `edit.rs`의 `ponytail:` 주석이 그것이 더
+이상 사실이 아니게 될 때의 업그레이드 경로를 명명한다. 테스트 하나가 세 편집을 undo와
+redo로 왕복시키고 IR, 레이아웃, 해시를 비교한다.
+
+### 여전히 `egui-snarl` 없음
+
+편집 기능을 손에 쥔 채로 다시 결정했지만, 답은 바뀌지 않았다. snarl이 대체할
+것은 `CanvasView`와 페인팅 루프다: 핀 히트 테스트, 사각형 드래그, 베지어 곡선 그리기
+약 190줄인데, 이는 자신만의 노드 모델, 자신만의 레이아웃 저장소, 자신만의 포트
+개념을 들여오는 의존성을 받아들일 만큼은 아니다 — 이 세 개념은 이미 여기에
+`es_ir::Graph`, `es_ir::serial::Layout`, `es_ir::Port`로 존재한다. 실제로 제대로
+만들기 어려운 부분인 제스처-`Edit` 매핑은 snarl이 우리 대신 해주는 것이 아니다:
+그것은 `EditSession`이고, 테스트되어 있다.
+
+### 여기 없는 것
+
+- 검색, 미니맵, 다중 선택, 복사/붙여넣기, 박스 선택(§23.4는 검색과 대형 그래프
+  성능을 2단계 요구 사항으로 나열한다; 여섯 개의 편집이 필요로 하는 것은 단일
+  선택 캔버스다).
+- 파라미터 인스펙터 패널. `Edit::SetParam`과 `NodeSchema`는 둘 다 준비되어 있고
+  테스트되어 있다; `ParamType`을 채워 넣는 위젯은 그 뒤에 설계할 모델이 남아
+  있지 않은 UI 작업이다.
+- Observation IR 노드 편집, 그리고 Control Graph(IR-C) — 3단계, M4.
