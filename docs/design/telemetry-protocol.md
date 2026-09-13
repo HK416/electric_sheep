@@ -73,6 +73,29 @@ the connection without registering the client. When `token` is `None`, no check 
 the local-development shape (`es --check-deps` running the editor against a local sim with no
 token configured).
 
+The comparison itself is `transport::ct_eq`, a constant-time fold over `max(a.len(), b.len())`
+bytes with no early return (no `subtle` dependency — five lines), not `PartialEq` on `String`:
+a naive `!=` compare stops at the first differing byte, which leaks how much of a guessed token
+was correct through timing. A length mismatch is folded into the same accumulator up front
+rather than short-circuited with `!=`.
+
+Two more resource limits sit in front of the token check, both on `Server::bind_with(addr,
+token, cfg: ServerConfig)` (`Server::bind` calls it with `ServerConfig::default()`):
+
+- **Handshake timeout** (`ServerConfig::handshake_timeout`, default `HANDSHAKE_TIMEOUT = 5s`):
+  applied with `TcpStream::set_read_timeout` before the server reads `Hello`, so a peer that
+  connects and sends nothing is dropped once the timeout elapses instead of pinning a server
+  thread forever. Cleared (`set_read_timeout(None)`) immediately after a successful `Hello`
+  read, so a session's later reads (the `Subscribe` loop) block normally for as long as the
+  connection lives.
+- **Connection cap** (`ServerConfig::max_clients`, default `DEFAULT_MAX_CLIENTS = 64`): checked
+  after the version/token checks (so a bad token still gets its own `Bye` reason) and before
+  registration. The 65th concurrent client (at the default) gets
+  `Bye { reason: "too many clients" }` and is never added to the client map. ponytail: the check
+  and the registration insert are not one atomic step, so two connections arriving at exactly
+  the boundary can both pass before either registers — acceptable for this loopback shim; an
+  exact cap needs one mutex held across "check and insert".
+
 **What this is not**: the token travels in clear text inside the JSON body, and there is no
 channel encryption. That is fine on `127.0.0.1` (the spec 25.1 default bind) between processes
 owned by the same user, and not fine across an untrusted network. TLS is spec 25.1's other

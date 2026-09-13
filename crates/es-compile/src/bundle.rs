@@ -44,6 +44,13 @@ pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
 /// [`CpuPlan::compiler_hash`], so it cannot be a silent difference.
 pub const BUNDLE_PLAN_MODE: PlanMode = PlanMode::Release;
 
+/// Adversarial-header guards (spec 25.1): a real bundle has a handful of entries with short
+/// names (see [`MANIFEST`] and friends below), so these are generous ceilings, not a real
+/// limit — they exist so a header claiming a huge entry count or name length fails fast with a
+/// [`BundleError`] instead of driving the reader into a long loop or a large allocation.
+pub const MAX_ENTRIES: usize = 4096;
+pub const MAX_NAME_LEN: usize = 4096;
+
 pub const MANIFEST: &str = "manifest.toml";
 pub const TASK: &str = "task.toml";
 pub const OBSERVATION: &str = "observation.toml";
@@ -200,6 +207,18 @@ pub enum BundleError {
     HashMismatch { slot: &'static str },
     #[error("compiling the observation plan failed:\n{0}")]
     Compile(String),
+    /// The manifest's hash slot for `slot` is required for a `Policy` bundle (spec 5.3, spec
+    /// 9.6) but the manifest leaves it empty. Unlike [`HashMismatch`](Self::HashMismatch), this
+    /// is not "the artifact lies about a value" — it is "the artifact never claims one at all",
+    /// which would otherwise open with no chain check on that slot whatsoever.
+    #[error("the manifest's \"{slot}\" hash slot is required for a policy bundle but is empty (spec 5.3)")]
+    MissingHash { slot: &'static str },
+    #[error("{extra} byte(s) of unexplained data follow the last payload")]
+    TrailingBytes { extra: usize },
+    #[error("the container claims {count} entries; the cap is {MAX_ENTRIES}")]
+    TooManyEntries { count: usize },
+    #[error("an entry name is {len} bytes; the cap is {MAX_NAME_LEN}")]
+    NameTooLong { len: usize },
 }
 
 fn render(diags: &[Diagnostic]) -> String {
@@ -268,9 +287,17 @@ pub fn write(
 
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&u32::try_from(all.len()).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(
+        &u32::try_from(all.len())
+            .map_err(|_| BundleError::TooManyEntries { count: all.len() })?
+            .to_le_bytes(),
+    );
     for (name, payload) in &all {
-        out.extend_from_slice(&u32::try_from(name.len()).unwrap_or(u32::MAX).to_le_bytes());
+        out.extend_from_slice(
+            &u32::try_from(name.len())
+                .map_err(|_| BundleError::NameTooLong { len: name.len() })?
+                .to_le_bytes(),
+        );
         out.extend_from_slice(name.as_bytes());
         out.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         out.extend_from_slice(blake3::hash(payload).as_bytes());
@@ -319,10 +346,16 @@ pub fn read(bytes: &[u8]) -> Result<Bundle, BundleError> {
         return Err(BundleError::BadMagic(magic));
     }
     let count = c.u32("the entry count")? as usize;
+    if count > MAX_ENTRIES {
+        return Err(BundleError::TooManyEntries { count });
+    }
 
-    let mut header: Vec<(String, u64, [u8; 32])> = Vec::with_capacity(count.min(1024));
+    let mut header: Vec<(String, u64, [u8; 32])> = Vec::with_capacity(count);
     for _ in 0..count {
         let name_len = c.u32("an entry name length")? as usize;
+        if name_len > MAX_NAME_LEN {
+            return Err(BundleError::NameTooLong { len: name_len });
+        }
         let name = std::str::from_utf8(c.take(name_len, "an entry name")?)
             .map_err(|_| BundleError::BadName)?
             .to_owned();
@@ -359,6 +392,12 @@ pub fn read(bytes: &[u8]) -> Result<Bundle, BundleError> {
         } else {
             entries.insert(name, payload.to_vec());
         }
+    }
+
+    if c.at != bytes.len() {
+        return Err(BundleError::TrailingBytes {
+            extra: bytes.len().saturating_sub(c.at),
+        });
     }
 
     Ok(Bundle {
@@ -444,6 +483,23 @@ impl PolicyBundle {
                 found: raw.manifest.kind,
             });
         }
+        // A slot a deployment bundle must fill (spec 5.3, spec 9.6) that the manifest leaves
+        // `None` opens with no chain check on that slot at all — reject before trusting any of
+        // the entries below. `runtime`, `dataset` and `policy` stay optional (see
+        // `docs/design/policy-bundle.md`).
+        let hashes = raw.manifest.hashes;
+        for (slot, want) in [
+            ("task", hashes.task),
+            ("observation", hashes.observation),
+            ("learning", hashes.learning),
+            ("deployment", hashes.deployment),
+            ("compiler", hashes.compiler),
+        ] {
+            if want.is_none() {
+                return Err(BundleError::MissingHash { slot });
+            }
+        }
+
         let task = serial::task_from_toml(raw.text(TASK)?).map_err(toml_err(TASK))?;
         let observation =
             serial::observation_from_toml(raw.text(OBSERVATION)?).map_err(toml_err(OBSERVATION))?;
@@ -599,6 +655,72 @@ mod tests {
         assert_eq!(unhex(&hex(&d)), Some(d));
         assert_eq!(unhex("zz"), None);
         assert_eq!(unhex(&"g".repeat(64)), None);
+    }
+
+    #[test]
+    fn trailing_bytes_after_the_last_payload_are_rejected() {
+        let mut bytes = write(&manifest(), &entries()).expect("writes");
+        bytes.push(0);
+        assert_eq!(read(&bytes), Err(BundleError::TrailingBytes { extra: 1 }));
+    }
+
+    #[test]
+    fn open_rejects_a_manifest_with_hash_slots_stripped() {
+        let bytes = write(&manifest(), &BTreeMap::new()).expect("writes");
+        assert_eq!(
+            PolicyBundle::open(&bytes),
+            Err(BundleError::MissingHash { slot: "task" })
+        );
+    }
+
+    #[test]
+    fn a_header_claiming_len_u32_max_errors_without_panicking() {
+        let mut bytes = Vec::from(MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // entry count
+        bytes.extend_from_slice(&4u32.to_le_bytes()); // name_len
+        bytes.extend_from_slice(b"a.in");
+        bytes.extend_from_slice(&u64::from(u32::MAX).to_le_bytes()); // payload len
+        bytes.extend_from_slice(&[0u8; 32]); // hash, never reached
+        let result = std::panic::catch_unwind(|| read(&bytes)).expect("read must not panic");
+        assert!(
+            matches!(result, Err(BundleError::Truncated(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_len_past_the_buffer_errors_without_panicking() {
+        let mut bytes = Vec::from(MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes()); // entry count
+        bytes.extend_from_slice(&500u32.to_le_bytes()); // name_len: under the cap, past EOF
+        let result = std::panic::catch_unwind(|| read(&bytes)).expect("read must not panic");
+        assert!(
+            matches!(result, Err(BundleError::Truncated(_))),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_billion_declared_entries_errors_without_panicking() {
+        let mut bytes = Vec::from(MAGIC);
+        bytes.extend_from_slice(&1_000_000_000u32.to_le_bytes()); // entry count, nothing behind it
+        let result = std::panic::catch_unwind(|| read(&bytes)).expect("read must not panic");
+        assert!(
+            matches!(result, Err(BundleError::TooManyEntries { .. })),
+            "{result:?}"
+        );
+    }
+
+    #[test]
+    fn a_name_len_over_the_cap_is_rejected() {
+        let mut bytes = Vec::from(MAGIC);
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&u32::MAX.to_le_bytes()); // name_len, far over MAX_NAME_LEN
+        let result = std::panic::catch_unwind(|| read(&bytes)).expect("read must not panic");
+        assert!(
+            matches!(result, Err(BundleError::NameTooLong { .. })),
+            "{result:?}"
+        );
     }
 
     #[test]

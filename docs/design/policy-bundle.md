@@ -51,7 +51,15 @@ empty.
 **Reading is hostile-input safe.** Every length comes from the file, so the reader is a cursor
 that returns `Truncated` rather than slicing out of bounds; names must be UTF-8; a duplicate or
 out-of-order name is `Unsorted`; and every payload's `blake3` is checked before it is handed
-back. A single flipped byte fails to open.
+back. A single flipped byte fails to open. `entry_count` and each `name_len` are checked against
+`MAX_ENTRIES` / `MAX_NAME_LEN` (4096 each) before either is used for anything — a header
+claiming a billion entries or a multi-gigabyte name is `TooManyEntries` / `NameTooLong`, not a
+long loop or a large allocation on the strength of untrusted input — and every arithmetic step
+on a length or offset (`Cursor::take`'s `checked_add`, the `u32`/`u64` conversions in both `read`
+and `write`) is a checked op that returns a `BundleError` on failure rather than panicking.
+Bytes left over after the last payload are `TrailingBytes { extra }`: the "the layout for a
+given set of entries is unique" claim above only holds if extra bytes are rejected, not quietly
+ignored.
 
 The `1` in `ESB1` is the *container generation*, not the manifest's `schema_version`. A future
 incompatible layout gets a new magic so that an old reader fails loudly instead of
@@ -118,6 +126,15 @@ can compute.
 artifact's claim; the IRs are the evidence. A slot whose recomputed value disagrees is
 `BundleError::HashMismatch { slot }` naming the slot, which is the unit spec 27.1's
 `revalidation_trigger` is written in.
+
+Before any of that, `open` checks that `task`, `observation`, `learning`, `deployment` and
+`compiler` are all present (`Some`) in the manifest's `hashes` — `BundleError::MissingHash
+{ slot }` naming the first absent one otherwise. A manifest that leaves one of these `None`
+opened with no spec 5.3 check on that slot at all before this check existed, which is a bigger
+gap than a wrong hash: `want.is_some() && want != got` treats "not claimed" and "claimed
+correctly" the same way. `policy`, `runtime` and `dataset` stay optional — `policy` is redundant
+with the direct `weights` blake3 check `open` already does, and `runtime`/`dataset` are absent
+from every `Policy` bundle by design (section 4).
 
 ### Why the compiled plan is not in the bundle
 

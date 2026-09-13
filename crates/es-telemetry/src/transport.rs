@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -43,6 +44,34 @@ use crate::PROTOCOL_VERSION;
 
 /// Depth of each client's outgoing frame queue (see "Backpressure" above).
 pub const CLIENT_QUEUE_CAPACITY: usize = 16;
+
+/// Default for [`ServerConfig::handshake_timeout`] (spec 25.1): a connected peer that never
+/// sends `Hello` must not be able to pin a server thread forever.
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default for [`ServerConfig::max_clients`] (spec 25.1): an accept-loop connection cap so an
+/// unbounded number of peers cannot spawn an unbounded number of threads.
+pub const DEFAULT_MAX_CLIENTS: usize = 64;
+
+/// Tunables for [`Server::bind_with`]; [`Server::bind`] uses the defaults (spec 25.1).
+#[derive(Clone, Copy, Debug)]
+pub struct ServerConfig {
+    /// A client that connects and then sends nothing is dropped once this much time has passed
+    /// without a complete `Hello` arriving.
+    pub handshake_timeout: Duration,
+    /// Clients registered at once. A connection arriving once the server already holds this
+    /// many is refused with `Bye { reason: "too many clients" }` before it can register.
+    pub max_clients: usize,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            handshake_timeout: HANDSHAKE_TIMEOUT,
+            max_clients: DEFAULT_MAX_CLIENTS,
+        }
+    }
+}
 
 /// Versions this server offers during negotiation: current and N-1 (spec 25.3), or just current
 /// when there is no N-1 yet.
@@ -108,8 +137,8 @@ pub struct Server {
 
 impl Server {
     /// Binds `addr` (`127.0.0.1:0` picks an ephemeral loopback port) and starts accepting
-    /// clients on a background thread. `token`, when set, is required in every client's
-    /// [`Hello`] (spec 25.1); when `None`, any client is accepted.
+    /// clients on a background thread, using [`ServerConfig::default`] (spec 25.1). `token`,
+    /// when set, is required in every client's [`Hello`]; when `None`, any client is accepted.
     ///
     /// ponytail: the accept thread is fire-and-forget — there is no `Server::shutdown` that
     /// joins it, so the listener stays bound for the process's life even after every `Server`
@@ -117,6 +146,16 @@ impl Server {
     /// listener should; add a shutdown flag + a self-connect wakeup if a caller ever needs to
     /// rebind the same address later.
     pub fn bind(addr: SocketAddr, token: Option<String>) -> io::Result<Server> {
+        Self::bind_with(addr, token, ServerConfig::default())
+    }
+
+    /// Like [`Server::bind`] but with explicit [`ServerConfig`] tunables (handshake timeout,
+    /// connection cap) instead of the defaults.
+    pub fn bind_with(
+        addr: SocketAddr,
+        token: Option<String>,
+        cfg: ServerConfig,
+    ) -> io::Result<Server> {
         let listener = TcpListener::bind(addr)?;
         let local_addr = listener.local_addr()?;
         let clients: Arc<Mutex<BTreeMap<u64, ClientHandle>>> =
@@ -131,7 +170,7 @@ impl Server {
                 let id = next_id.fetch_add(1, Ordering::SeqCst);
                 let clients = Arc::clone(&accept_clients);
                 let token = Arc::clone(&token);
-                thread::spawn(move || serve_client(id, stream, &clients, &token));
+                thread::spawn(move || serve_client(id, stream, &clients, &token, cfg));
             }
         });
 
@@ -196,14 +235,39 @@ fn serve_client(
     mut stream: TcpStream,
     clients: &Arc<Mutex<BTreeMap<u64, ClientHandle>>>,
     token: &Arc<Option<String>>,
+    cfg: ServerConfig,
 ) {
+    // A peer that connects and stays silent must not pin this thread forever (spec 25.1); once
+    // past the handshake the subscribe-loop read below should block normally, so the timeout is
+    // cleared again immediately after.
+    if stream
+        .set_read_timeout(Some(cfg.handshake_timeout))
+        .is_err()
+    {
+        return;
+    }
     let mut buf = Vec::new();
     let Ok(Message::Hello(hello)) = read_message(&mut stream, &mut buf) else {
         return;
     };
+    if stream.set_read_timeout(None).is_err() {
+        return;
+    }
 
     if let Some(reason) = reject_reason(&hello, token.as_ref().as_ref()) {
         let _ = write_message(&mut stream, &Message::Bye { reason });
+        return;
+    }
+    // Connection cap (spec 25.1): checked after the handshake's own checks so a bad token or
+    // version still gets its specific reason, and before registration so a refused client never
+    // occupies a `ClientHandle` slot.
+    if clients.lock().expect("client map lock").len() >= cfg.max_clients {
+        let _ = write_message(
+            &mut stream,
+            &Message::Bye {
+                reason: "too many clients".to_string(),
+            },
+        );
         return;
     }
     let version = negotiate(&hello.versions_supported, &server_versions())
@@ -271,11 +335,26 @@ fn reject_reason(hello: &Hello, token: Option<&String>) -> Option<String> {
         ));
     }
     if let Some(expected) = token {
-        if hello.token.as_ref() != Some(expected) {
+        let ok = match hello.token.as_deref() {
+            Some(got) => ct_eq(got.as_bytes(), expected.as_bytes()),
+            None => false,
+        };
+        if !ok {
             return Some("missing or invalid token".to_string());
         }
     }
     None
+}
+
+/// Constant-time byte-slice equality (spec 25.1): folds every position up to `max(a.len(),
+/// b.len())` with no early return, so how far a wrong token gets before differing does not
+/// change how long the comparison takes. No `subtle` dependency — this is the whole thing.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff: u8 = u8::from(a.len() != b.len());
+    for i in 0..a.len().max(b.len()) {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    diff == 0
 }
 
 /// A connected telemetry client: one TCP connection, past the handshake.
@@ -434,6 +513,65 @@ mod tests {
         let err2 = Client::connect(local(&server), None, "test-client")
             .expect_err("missing token must be rejected");
         assert!(matches!(err2, TransportError::Rejected { .. }), "{err2:?}");
+    }
+
+    #[test]
+    fn ct_eq_matches_slice_equality_including_different_lengths() {
+        assert!(ct_eq(b"same", b"same"));
+        assert!(!ct_eq(b"same", b"diff"));
+        assert!(!ct_eq(b"short", b"much longer"));
+        assert!(!ct_eq(b"", b"x"));
+        assert!(ct_eq(b"", b""));
+    }
+
+    #[test]
+    fn a_token_of_different_length_is_still_rejected() {
+        let server = Server::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Some("a-fairly-long-secret-token".into()),
+        )
+        .unwrap();
+        let err = Client::connect(local(&server), Some("short".into()), "test-client")
+            .expect_err("mismatched-length token must be rejected");
+        assert!(matches!(err, TransportError::Rejected { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_silent_client_is_dropped_after_the_handshake_timeout() {
+        let cfg = ServerConfig {
+            handshake_timeout: Duration::from_millis(200),
+            ..ServerConfig::default()
+        };
+        let server = Server::bind_with("127.0.0.1:0".parse().unwrap(), None, cfg).unwrap();
+        let mut stream = TcpStream::connect(local(&server)).unwrap();
+        // Send nothing. Give the client-side read a generous budget past the server's own
+        // timeout, so a read that returns is proof the server closed the connection, not that
+        // this stream gave up first.
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let mut buf = [0u8; 1];
+        let n = stream
+            .read(&mut buf)
+            .expect("server must close a silent client's connection after the handshake timeout");
+        assert_eq!(n, 0, "expected EOF, got data");
+    }
+
+    #[test]
+    fn a_connection_past_max_clients_is_refused() {
+        let server = Server::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        // Held alive for the whole test: a dropped `Client` closes its socket, which would let
+        // the server reap it and free a slot before the (max_clients + 1)th connect below.
+        let _clients: Vec<Client> = (0..DEFAULT_MAX_CLIENTS)
+            .map(|_| Client::connect(local(&server), None, "c").unwrap())
+            .collect();
+
+        let err = Client::connect(local(&server), None, "one-too-many")
+            .expect_err("the connection past max_clients must be refused");
+        match err {
+            TransportError::Rejected { reason } => assert!(reason.contains("too many"), "{reason}"),
+            other => panic!("expected Rejected, got {other:?}"),
+        }
     }
 
     #[test]

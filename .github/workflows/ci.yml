@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,3 +28,45 @@ jobs:
 
       - name: cargo xtask ci
         run: cargo xtask ci
+
+  # Tier 2 (spec 1.4, 28.7): the reference oracles the PR job cannot run without an environment
+  # that has MuJoCo/PyTorch installed. Deliberately not on the PR path — installing Python +
+  # two large wheels would blow the < 10 min PR budget (spec 26.2) — so this only runs on a push
+  # to main or a manual dispatch, and its failure is real (`continue-on-error: false`), not a
+  # soft signal.
+  oracles:
+    name: Reference oracle tier (spec 1.4, 28.7)
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Versions pinned in docs/api-notes/mujoco.md, torch.md and torchvision.md. mujoco_warp
+      # needs a GPU this runner does not have, so it is excluded below and stays
+      # `Target / Status: unverified` (spec 12.4) rather than faked green.
+      - name: install reference oracles
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install mujoco==3.13.0
+          # torchvision pulls torch 2.14.0 with it; it is what generates the observation
+          # goldens, so without it `gen_goldens` SKIPs and their provenance is unchecked.
+          python -m pip install torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: cargo test against the reference oracles
+        env:
+          ES_PYTHON: python
+        run: |
+          set -euo pipefail
+          cargo test -p es-physics-backend -p es-policy -p es-compile -- --skip mjwarp --nocapture 2>&1 | tee oracles.log
+          ! grep -q '^SKIP' oracles.log
