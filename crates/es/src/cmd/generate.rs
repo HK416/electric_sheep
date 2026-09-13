@@ -4,30 +4,40 @@
 
 use std::io::Read as _;
 use std::path::Path;
+use std::time::Duration;
 
 use es_script::generate::{self, GenerateError, GenerationReport, Palette, Prompt, TaskSpecPrompt};
 
 use crate::error::CliError;
 use crate::util::hex;
 
+/// S-8: an unbounded `--rounds` means an unbounded number of provider calls (each of which can
+/// itself take up to `--timeout`); this range keeps one `generate` invocation's worst case
+/// finite.
+const MIN_ROUNDS: u32 = 1;
+const MAX_ROUNDS: u32 = 10;
+
 const HELP: &str = "\
-es task generate --prompt \"...\" [--scene scene.xml] [--rounds N] [--provider anthropic|stdin] --out <dir>
+es task generate --prompt \"...\" [--scene scene.xml] [--rounds N] [--timeout SECS] [--provider anthropic|stdin] --out <dir>
 
 Builds a prompt from the node palette (es_ir::factory, spec 14.5) and the description,
 asks the provider for a Task IR as TOML, validates the candidate with the same validator
 `es ir validate` uses, and feeds diagnostics back verbatim until one candidate passes or
---rounds is exhausted (default 3). On success, writes <out>/task.toml.
+--rounds is exhausted (default 3, range 1..=10). On success, writes <out>/task.toml.
 
     --provider stdin       reads one model reply from stdin per round (default; works with
                             any external LLM, no API key needed)
     --provider anthropic   calls the Anthropic Messages API (needs ANTHROPIC_API_KEY; this
                             binary must be built with `--features es-script-llm`)
+    --timeout SECS         connect/read timeout for the anthropic provider (default 60);
+                            ignored by --provider stdin
 ";
 
 pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
     let mut description = None;
     let mut scene_path = None;
     let mut rounds = 3u32;
+    let mut timeout_secs = 60u64;
     let mut provider_name = "stdin".to_owned();
     let mut out_dir = None;
 
@@ -52,6 +62,12 @@ pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
                     .parse()
                     .map_err(|_| CliError::Usage(HELP.to_owned()))?;
             }
+            "--timeout" => {
+                i += 1;
+                timeout_secs = next_arg(args, i)?
+                    .parse()
+                    .map_err(|_| CliError::Usage(HELP.to_owned()))?;
+            }
             "--provider" => {
                 i += 1;
                 provider_name = next_arg(args, i)?;
@@ -72,6 +88,11 @@ pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
     let description = description.ok_or_else(|| CliError::Usage(HELP.to_owned()))?;
     let out_dir = out_dir.ok_or_else(|| CliError::Usage(HELP.to_owned()))?;
     let scene = scene_path.map(|p| scene_ref(&p)).transpose()?;
+    if !(MIN_ROUNDS..=MAX_ROUNDS).contains(&rounds) {
+        return Err(CliError::Usage(format!(
+            "es task generate: --rounds must be between {MIN_ROUNDS} and {MAX_ROUNDS} (got {rounds})\n\n{HELP}"
+        )));
+    }
 
     let req = TaskSpecPrompt {
         description,
@@ -81,7 +102,7 @@ pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
     let palette = Palette::from_builtins();
     let prompt = generate::build_prompt(&palette, &req);
 
-    let mut provider = make_provider(&provider_name)?;
+    let mut provider = make_provider(&provider_name, Duration::from_secs(timeout_secs))?;
     let report = generate::repair_loop(&prompt, &mut *provider, rounds);
     print_report(&report);
 
@@ -112,10 +133,10 @@ fn scene_ref(path: &str) -> Result<es_ir::task::SceneRef, CliError> {
 
 type Provider = Box<dyn FnMut(&Prompt) -> Result<String, GenerateError>>;
 
-fn make_provider(name: &str) -> Result<Provider, CliError> {
+fn make_provider(name: &str, timeout: Duration) -> Result<Provider, CliError> {
     match name {
         "stdin" => Ok(Box::new(stdin_provider)),
-        "anthropic" => anthropic_provider(),
+        "anthropic" => anthropic_provider(timeout),
         other => Err(CliError::Usage(format!(
             "es task generate: unknown --provider '{other}'\n\n{HELP}"
         ))),
@@ -135,14 +156,14 @@ fn stdin_provider(_prompt: &Prompt) -> Result<String, GenerateError> {
 }
 
 #[cfg(feature = "es-script-llm")]
-fn anthropic_provider() -> Result<Provider, CliError> {
-    let mut provider =
-        generate::AnthropicProvider::from_env().map_err(|e| CliError::Runtime(e.to_string()))?;
+fn anthropic_provider(timeout: Duration) -> Result<Provider, CliError> {
+    let mut provider = generate::AnthropicProvider::with_timeout(timeout)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
     Ok(Box::new(move |p: &Prompt| provider.call(p)))
 }
 
 #[cfg(not(feature = "es-script-llm"))]
-fn anthropic_provider() -> Result<Provider, CliError> {
+fn anthropic_provider(_timeout: Duration) -> Result<Provider, CliError> {
     Err(CliError::Usage(
         "--provider anthropic needs `es` built with `--features es-script-llm`".to_owned(),
     ))
@@ -170,4 +191,63 @@ fn write_task(dir: &Path, task: &es_ir::task::TaskIr) -> Result<(), CliError> {
     println!("wrote {}", path.display());
     println!("task_hash: {}", hex(&hash));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// S-8 oracle: `--rounds` outside 1..=10 is a usage error (exit 2 at the `main` level), not
+    /// an unbounded number of provider calls. Checked at `dispatch()` directly (rather than
+    /// spawning the `es` binary) since this test lives in `crates/es/src/cmd/generate.rs`, the
+    /// only `es` file in this packet's declared scope.
+    #[test]
+    fn rounds_outside_one_to_ten_is_a_usage_error() {
+        for rounds in ["0", "11"] {
+            let dir = std::env::temp_dir().join(format!("es-cmd-generate-rounds-test-{rounds}"));
+            let args = [
+                "--prompt".to_owned(),
+                "reach the target".to_owned(),
+                "--rounds".to_owned(),
+                rounds.to_owned(),
+                "--out".to_owned(),
+                dir.to_string_lossy().into_owned(),
+            ];
+            let result = dispatch(&args);
+            assert!(
+                matches!(result, Err(CliError::Usage(_))),
+                "--rounds {rounds}: {result:?}"
+            );
+            assert!(!dir.join("task.toml").exists());
+        }
+    }
+
+    #[test]
+    fn rounds_at_the_boundary_passes_the_usage_check() {
+        // 1 and 10 are in range: the rounds check itself must not reject them. An unknown
+        // provider name is used so `dispatch` still returns a `Usage` error -- but from the
+        // `--provider` branch, never from the rounds check -- without going anywhere near
+        // stdin or the network.
+        for rounds in ["1", "10"] {
+            let dir = std::env::temp_dir().join(format!("es-cmd-generate-rounds-ok-test-{rounds}"));
+            let args = [
+                "--prompt".to_owned(),
+                "reach the target".to_owned(),
+                "--rounds".to_owned(),
+                rounds.to_owned(),
+                "--provider".to_owned(),
+                "not-a-real-provider".to_owned(),
+                "--out".to_owned(),
+                dir.to_string_lossy().into_owned(),
+            ];
+            let err = dispatch(&args).expect_err("unknown provider is a usage error");
+            let CliError::Usage(msg) = err else {
+                panic!("--rounds {rounds}: expected Usage, got {err:?}");
+            };
+            assert!(
+                msg.contains("unknown --provider"),
+                "--rounds {rounds}: {msg}"
+            );
+        }
+    }
 }

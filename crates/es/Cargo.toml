@@ -20,6 +20,7 @@ es-ir = { workspace = true }
 es-compile = { workspace = true }
 es-physics-backend = { workspace = true }
 es-physics-core = { workspace = true }
+es-usd = { workspace = true }
 es-assets = { workspace = true }
 es-data = { workspace = true }
 es-telemetry = { workspace = true }

@@ -480,6 +480,18 @@ fn geom(prim: &Prim, shape: Shape, pose: Pose) -> Geom {
     }
 }
 
+/// A `faceVertexCounts` entry, checked to be a small non-negative integer that fits `u32`
+/// (spec: a polygon face) rather than whatever a `float` happens to hold. `f64 as i64` is a
+/// saturating cast in Rust, so `1e20` lands on `i64::MAX` here and is then rejected by
+/// `u32::try_from` instead of silently saturating all the way to `usize::MAX` (S-1).
+fn usd_face_vertex_count(count: f64) -> Option<usize> {
+    if !count.is_finite() || count.fract() != 0.0 {
+        return None;
+    }
+    let n = u32::try_from(count as i64).ok()?;
+    (n >= 3).then_some(n as usize)
+}
+
 /// Triangulates the mesh, converts it onto spec 3.1 and hashes the *content*, so the same
 /// geometry authored twice gets one hash (spec 5.3, the rule the glTF importer already uses).
 fn mesh_asset(prim: &Prim, fix: Quat, mpu: f64) -> Result<AssetRef, UsdSceneError> {
@@ -510,13 +522,24 @@ fn mesh_asset(prim: &Prim, fix: Quat, mpu: f64) -> Result<AssetRef, UsdSceneErro
     let mut tris: Vec<u32> = Vec::new();
     let mut cursor = 0usize;
     for count in counts {
-        let n = count as usize;
-        if n < 3 || cursor + n > indices.len() {
-            return Err(invalid(
+        // S-1 (docs/reviews/M4.md): `count` is a USD `float`, so a file can put `1e20` where a
+        // face vertex count belongs. `count as usize` saturates instead of erroring, and
+        // `cursor + n` can then wrap in release. Route both through checked conversions.
+        let n = usd_face_vertex_count(count).ok_or_else(|| {
+            invalid(
                 &prim.path,
-                "faceVertexCounts does not agree with faceVertexIndices",
-            ));
-        }
+                format!("faceVertexCounts entry {count} must be an integer in 3..=u32::MAX"),
+            )
+        })?;
+        let next_cursor = cursor
+            .checked_add(n)
+            .filter(|next| *next <= indices.len())
+            .ok_or_else(|| {
+                invalid(
+                    &prim.path,
+                    "faceVertexCounts does not agree with faceVertexIndices",
+                )
+            })?;
         // Fan triangulation: a USD face is planar and convex by convention.
         for k in 1..n - 1 {
             for offset in [0, k, k + 1] {
@@ -533,7 +556,7 @@ fn mesh_asset(prim: &Prim, fix: Quat, mpu: f64) -> Result<AssetRef, UsdSceneErro
                 tris.push(index as u32);
             }
         }
-        cursor += n;
+        cursor = next_cursor;
     }
 
     let mut hasher = blake3::Hasher::new();
@@ -761,6 +784,22 @@ mod tests {
         assert!(import_usda(&edited).is_err());
         let edited = fixture("mesh_cube.usda").replace("0, 3, 2, 1,", "0, 3, 2, 99,");
         assert!(import_usda(&edited).is_err());
+    }
+
+    #[test]
+    fn a_face_vertex_count_that_overflows_u32_is_an_error_not_ub() {
+        // S-1 (docs/reviews/M4.md): `count as usize` used to saturate to `usize::MAX` and the
+        // `cursor + n > indices.len()` guard wrapped past it in release, reaching the indexing
+        // below with an out-of-bounds `cursor`. A pathological count must be a hard error.
+        let edited = fixture("mesh_cube.usda").replace(
+            "int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]",
+            "int[] faceVertexCounts = [3, 1e20, 4, 4, 4, 4]",
+        );
+        let err = import_usda(&edited).expect_err("an out-of-range count must be rejected");
+        let UsdSceneError::Invalid { message, .. } = err else {
+            panic!("expected Invalid, got {err:?}");
+        };
+        assert!(message.contains("faceVertexCounts"), "{message}");
     }
 
     #[test]

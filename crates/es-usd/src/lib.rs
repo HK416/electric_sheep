@@ -22,6 +22,12 @@
 
 mod parse;
 
+/// Hard cap on a `.usda` layer's byte size, checked before the tokenizer expands the text into
+/// a `Vec<char>` (S-2, `docs/reviews/M4.md`): an uncapped read lets one file drive an
+/// allocation with no ceiling. 64 MiB is far past any real hand-authored or USD-Bake-flattened
+/// scene this reader is meant for.
+pub const MAX_USDA_BYTES: usize = 64 * 1024 * 1024;
+
 use std::collections::BTreeMap;
 
 use es_math::{Pose, Quat, Vec3};

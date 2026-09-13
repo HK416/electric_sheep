@@ -9,10 +9,17 @@ use std::collections::BTreeMap;
 
 use es_math::Quat;
 
-use crate::{Prim, Specifier, StageMeta, UpAxis, UsdError, UsdStage, Value};
+use crate::{Prim, Specifier, StageMeta, UpAxis, UsdError, UsdStage, Value, MAX_USDA_BYTES};
 
-/// Guard against a pathological file recursing the parser into a stack overflow.
+/// Guard against a pathological file recursing the parser into a stack overflow via prim
+/// nesting (`def` inside `def` inside ...).
 const MAX_DEPTH: usize = 64;
+
+/// Guard against a pathological *value* recursing the parser into a stack overflow (S-2,
+/// `docs/reviews/M4.md`): `MAX_DEPTH` above only counts prim nesting, but
+/// `raw_value` <-> `raw_sequence` recurse on `[[[[...]]]]` / `((((...))))` with no counter of
+/// their own.
+const MAX_VALUE_DEPTH: usize = 64;
 
 /// Composition arcs and other layer features this reader refuses (api-note 5). Route: flatten
 /// with USD Bake (spec 2.5).
@@ -34,12 +41,22 @@ const UNSUPPORTED_META: &[&str] = &[
 /// [`UsdError::Syntax`] with the source line for a grammar violation, or
 /// [`UsdError::Unsupported`] naming the prim for a feature outside the documented subset.
 pub fn parse_usda(text: &str) -> Result<UsdStage, UsdError> {
+    if text.len() > MAX_USDA_BYTES {
+        return Err(syntax(
+            1,
+            format!(
+                "layer is {} bytes, over the {MAX_USDA_BYTES}-byte cap",
+                text.len()
+            ),
+        ));
+    }
     let body = strip_header(text)?;
     let tokens = lex(body.text, body.line)?;
     let mut parser = Parser {
         toks: tokens,
         pos: 0,
         warnings: Vec::new(),
+        value_depth: 0,
     };
     let mut meta = StageMeta::default();
     if parser.peek_punct('(') {
@@ -349,6 +366,8 @@ struct Parser {
     toks: Vec<Token>,
     pos: usize,
     warnings: Vec<String>,
+    /// Current `raw_value`/`raw_sequence` nesting depth; see `MAX_VALUE_DEPTH`.
+    value_depth: usize,
 }
 
 /// Qualifiers that may precede an attribute or relationship declaration.
@@ -631,11 +650,30 @@ impl Parser {
             Some(Tok::Ident(s)) => Ok(Raw::Ident(s)),
             Some(Tok::Path(p)) => Ok(Raw::Path(p)),
             Some(Tok::Asset(a)) => Ok(Raw::Asset(a)),
-            Some(Tok::Punct('(')) => Ok(Raw::Tuple(self.raw_sequence(path, ')')?)),
-            Some(Tok::Punct('[')) => Ok(Raw::List(self.raw_sequence(path, ']')?)),
+            Some(Tok::Punct('(')) => Ok(Raw::Tuple(self.nested_sequence(path, ')', line)?)),
+            Some(Tok::Punct('[')) => Ok(Raw::List(self.nested_sequence(path, ']', line)?)),
             Some(Tok::Punct('{')) => Err(unsupported(path, "dictionary-valued attribute", line)),
             _ => Err(syntax(line, "expected a value")),
         }
+    }
+
+    /// `raw_sequence`, guarded by `MAX_VALUE_DEPTH`: `raw_value` and `raw_sequence` recurse
+    /// into each other on nested `[...]`/`(...)` literals with no other bound, so a file that
+    /// is just `[[[[...]]]]` would otherwise overflow the stack (S-2, `docs/reviews/M4.md`).
+    fn nested_sequence(
+        &mut self,
+        path: &str,
+        close: char,
+        line: usize,
+    ) -> Result<Vec<Raw>, UsdError> {
+        self.value_depth += 1;
+        let result = if self.value_depth > MAX_VALUE_DEPTH {
+            Err(syntax(line, "value nesting is too deep"))
+        } else {
+            self.raw_sequence(path, close)
+        };
+        self.value_depth -= 1;
+        result
     }
 
     fn raw_sequence(&mut self, path: &str, close: char) -> Result<Vec<Raw>, UsdError> {
@@ -1037,6 +1075,22 @@ mod tests {
         for _ in 0..(MAX_DEPTH + 5) {
             text.push_str("}\n");
         }
+        assert!(matches!(parse_usda(&text), Err(UsdError::Syntax { .. })));
+    }
+
+    #[test]
+    fn deep_value_nesting_errors_instead_of_overflowing() {
+        // S-2 (docs/reviews/M4.md): `raw_value`/`raw_sequence` used to recurse with no bound
+        // of their own. 100 KB of `[` would abort the process on the old code; it must now
+        // return promptly instead.
+        let opens = "[".repeat(100_000);
+        let text = format!("#usda 1.0\ndef Xform \"p\"\n{{\n    double[] v = {opens}\n}}\n");
+        assert!(matches!(parse_usda(&text), Err(UsdError::Syntax { .. })));
+    }
+
+    #[test]
+    fn oversized_layer_is_rejected_before_the_char_vec() {
+        let text = "a".repeat(MAX_USDA_BYTES + 1);
         assert!(matches!(parse_usda(&text), Err(UsdError::Syntax { .. })));
     }
 }

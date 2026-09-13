@@ -2677,7 +2677,7 @@ fn evidence_verify_flags_a_rewritten_manifest_on_a_signed_bundle() {
     );
 }
 
-/// S-9 (P-M4-S9-S10): a blocked RoboVerse conversion must leave no output behind -- the
+/// S-9 (P-M4-S9-S10): a blocked `RoboVerse` conversion must leave no output behind -- the
 /// `severity: error` check now runs before the first `std::fs::write`, matching `import usd`.
 #[test]
 fn import_roboverse_writes_nothing_when_an_unmapped_item_blocks_it() {
