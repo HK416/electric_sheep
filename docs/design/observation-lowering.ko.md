@@ -2,7 +2,7 @@
 
 # Observation IR → CPU 레퍼런스 실행 계획
 
-`crates/es-compile` (layer 7)를 위한 설계 노트. Spec: spec 7.2, spec 7.3, spec 7.5,
+`crates/es-compile`(layer 7)를 위한 설계 노트. Spec: spec 7.2, spec 7.3, spec 7.5,
 spec 7.6, spec 7.7, spec 11.1, spec 11.3, spec 11.5, spec 3.1, spec 3.4. Work
 packet: `docs/packets/M1/W3-observation-cpu-ref.md`.
 
@@ -87,7 +87,7 @@ CHW f32는 PyTorch가, 따라서 LeRobot이 정책에 공급하는 형태이며,
 ## 4. Resize: bilinear, `align_corners = false`, 반화소 중심
 
 목표 의미론: `torch.nn.functional.interpolate(x, size=(h, w), mode="bilinear",
-align_corners=False, antialias=False)`, 이는 torchvision의
+align_corners=False, antialias=False)`이며, 이는 torchvision의
 `Resize(..., antialias=False)`이기도 하다.
 
 길이 `D`인 축의 출력 인덱스 `d`마다, `scale = S / D`일 때:
@@ -101,26 +101,29 @@ l1     = s - i0                       // in [0, 1]
 l0     = 1 - l1
 ```
 
-그리고 표본은, 정확히 다음 결합 순서로 계산된다(이는 PyTorch의 순서이며,
-재결합하면 마지막 비트들이 달라진다):
+그리고 표본은 정확히 다음 결합 순서로 계산된다(이는 PyTorch의 순서이며, 재결합하면
+마지막 비트들이 달라진다):
 
 ```
 out = h0 * (w0 * v[y0][x0] + w1 * v[y0][x1])
     + h1 * (w0 * v[y1][x0] + w1 * v[y1][x1])
 ```
 
-모든 산술은 f32다. `s`는 f32인 `scale`로부터 f32로 계산된다. f64로 계산한
-다음 좁히면 어떤 크기에서는 다른 비트가 나오므로, f32 경로가 규범적이다.
+모든 산술은 f32다. `s`는 f32인 `scale`로부터 f32로 계산된다. f64로 계산한 다음
+좁히면 어떤 크기에서는 다른 비트가 나오므로, f32 경로가 규범적이다.
 
-이것은 상수 이미지에 대해서도 **정확하지 않다**. 탭들이 `l0 = 1 - l1`로
-결합되는데, 이 f32 합이 정확히 1이 아니므로, 균일한(flat) 입력이 1 ulp
-어긋나게 돌아올 수 있다. 그것은 PyTorch의 동작이기도 하며, PyTorch와
-일치시키는 것이 계약이다 — proptest는 동등성이 아니라 2 ulp를 확인한다.
-상수에 대해 정확한 결합 방식이라면 다른 커널이 될 것이다.
+이것은 상수 이미지에 대해서도 **정확하지 않다**: 탭들이 `l0 = 1 - l1`로 결합되는데,
+이 f32 합이 정확히 1이 아니므로 균일한(flat) 입력이 1 ulp 어긋나게 돌아올 수 있다.
+PyTorch도 거기서 정확하지 않다 — 상수 5×5 → 7×7에 대한 `interpolate`는 서로 다른 세
+값을 반환한다 — 그래서 proptest는 동등성이 아니라 2 ulp를 단언한다. 상수에 대해
+정확한 결합 방식이라면 다른 커널이 될 것이다.
 
-**안티에일리어싱은 구현되지 않는다.** 다운스케일에서 `antialias=True`는
-이 알고리즘의 개선판이 아니라 다른 알고리즘(지지 영역을 넓힌 필터)이다.
-§11을 참조.
+torch 2.14를 기준으로 golden 크기(8×6 → 4×3)에서 이 커널은 **비트 단위로 동일**하다.
+모든 크기에서 비트 단위로 동일한 것은 아니다: 어디서 얼마나 다른지는 §12 항목 6에
+기록되어 있다.
+
+**안티에일리어싱은 구현되지 않는다.** 다운스케일에서 `antialias=True`는 이 알고리즘의
+개선판이 아니라 다른 알고리즘(지지 영역을 넓힌 필터)이다. §11을 참조.
 
 ## 5. Crop
 
@@ -160,17 +163,26 @@ srgb_eotf(x) = x <= 0.04045 ? x / 12.92
 공유된다. 이는 `libm` 대비 약간의 정확도를 대가로 치르지만, 여기서 중요한
 단 하나, 즉 CPU 오라클과 GPU 커널이 *같은* 비트를 낸다는 것을 얻는다.
 
-**LUT-256.** 노드의 입력이 u8일 때(`Dequantize`보다 앞서 `ImageInput`에
-직접 연결된 `ColorTransform`), 입력은 256가지 값만 가지므로, 계획은
-`srgb_eotf(k / 255)`를 `k`마다 한 번씩 계산해 `[f32; 256]` 테이블에 넣고
-그것을 인덱싱하여 CHW f32를 쓴다 — dequantize가 접혀 들어가 있으므로,
-두 단계짜리 형태와 이 융합된 형태는 같은 텐서를 낸다. 이 테이블은 같은
-`srgb_eotf`로 만들어지므로, 두 경로는 리뷰가 아니라 구성상 일치한다. 이
-노드의 golden은 바로 그 테이블이다.
+**허용오차가 있는 유일한 golden.** 이 표의 오라클은 f64로 계산되어 f32로 한 번
+반올림된 IEC 61966-2-1 공식이다 — 구할 수 있는 가장 정확한 참조값이며, 구성상 f32
+다항식 피팅으로는 *도달할 수 없다*. 그래서 `srgb_to_linear_lut256.json`은
+`"tolerance_ulp": 7`을 싣고 있고 `observation_cpu.rs`는 이를 사이드카에서 읽는다.
+7 ULP(상대 오차 4.8e-7, 최악 항목 `k = 12`)는 통과시키기 위해 고른 여유값이 아니라
+256개 항목 전체에 대해 측정된 최댓값이다: 38개 항목은 정확하고, 167개는 2 ULP
+이내이며, 3개가 7에 이른다. 이 집합의 다른 모든 golden에는 허용오차가 없으며
+바이트 단위로 비교된다. 허용오차가 테스트가 아니라 사이드카에 사는 이유는 사이드카가
+CI 읽기 전용이기 때문이다 — 그것을 넓히는 것은 golden을 수정하는 일이며,
+`cargo xtask verify-goldens`가 이를 거부한다.
 
-`Linear → SRgb`(역변환, spec 7.7의 왕복 오라클에 필요)는 이 part에서는
-구현되지 않는다 — 왕복 오라클은 다음 웨이브이며, LUT는 정확히 역변환되지
-않는다.
+**LUT-256.** 노드의 입력이 u8일 때(`Dequantize`보다 앞서 `ImageInput`에 직접 연결된
+`ColorTransform`), 입력은 256가지 값만 가지므로, 계획은 `srgb_eotf(k / 255)`를
+`k`마다 한 번씩 계산해 `[f32; 256]` 테이블에 넣고 그것을 인덱싱하여 CHW f32를 쓴다 —
+dequantize가 접혀 들어가 있으므로, 두 단계짜리 형태와 이 융합된 형태는 같은 텐서를
+낸다. 이 테이블은 같은 `srgb_eotf`로 만들어지므로, 두 경로는 리뷰가 아니라 구성상
+일치한다. 이 노드의 golden은 바로 그 테이블이다.
+
+`Linear → SRgb`(역변환, spec 7.7의 왕복 오라클에 필요)는 이 part에서는 구현되지
+않는다 — 왕복 오라클은 다음 웨이브이며, LUT는 정확히 역변환되지 않는다.
 
 ## 7. Normalize
 
@@ -209,7 +221,7 @@ CHW, 채널 `c`마다:
 - `TemporalWindow(n_steps, stride, align)` — 노드. shape을 가진다.
 - `TemporalEncoder` — Learning IR. 여기 없다.
 
-```rust
+```
 history_push(ring, slot_len, depth, cursor, frame)   // writes slot cursor % depth
 window_gather(ring, slot_len, depth, cursor, n, stride, dst)
 ```
@@ -275,38 +287,67 @@ Fusion 경계 (spec 11.4): 리덕션, shape 변경, sensor 읽기, 그리고 —
 
 ## 12. LeRobot에 대해 무엇이 `unverified`인가
 
-spec 12.4의 규칙에 따라, 미검증은 암시되지 않고 명시된다.
+spec 12.4의 규칙에 따라, 미검증(unverified)은 암시되지 않고 명시된다. 항목 2는
+golden들이 torch로부터 재생성되면서(§13) `unverified`에서 **measured**로 옮겨졌다;
+항목 6은 그 측정이 밝혀낸 것이다.
 
-1. **LeRobot이 실제로 어떤 resize를 호출하는지 — `unverified`이며 리뷰의
-   최우선 질문.** 이 노트는
-   `interpolate(..., align_corners=False, antialias=False)`를 구현한다.
-   torchvision의 `Resize`는 0.17부터 `antialias=True`가 기본값이었고,
-   서로 다른 LeRobot 정책(ACT, Diffusion Policy, SmolVLA, π₀)은 서로 다른
-   곳에서 resize한다 — 데이터셋 transform, processor, 또는 아예 하지
-   않음. 그 호출 지점 중 하나를 읽고 확정하기 전까지는, spec 7.7이 주장하는
-   일치는 어떤 다운스케일에 대해서도 검증되지 않은 채로 남는다. 답이
-   `antialias=True`라면, 안티에일리어싱 커널은 이 커널의 변경이 아니라
-   추가 커널 id가 된다.
-2. **u8 → f32 스케일링 — `unverified`.** `/255`는 `ToTensor`와 일치한다.
-   일부 LeRobot 경로는 torchcodec/ffmpeg가 디코딩한, u8 양자화가 전혀
-   일어나지 않은 이미 float인 video 프레임을 넘겨준다.
-3. **`Normalize` 통계 — `unverified`.** 계획은 IR이 싣고 있는 것을 그대로
-   적용한다. 그것이 LeRobot의 데이터셋별 `mean`/`std`인지 ImageNet의
-   것인지는 한 계층 위의, 데이터셋에 관한 질문이다.
-4. **f16 반올림 — `unverified`.** `half`는 round-to-nearest-even을 쓴다.
-   PyTorch의 `.half()`도 그렇지만, 이는 확인된 것이 아니라 단언된 것이다.
-5. **`n_steps` 프레임이 아직 존재하지 않을 때의 ring 버퍼 채움 동작 —
-   `unverified`.** LeRobot의 `delta_timestamps`는 에피소드의 첫 프레임으로
-   clamp하는데, 이는 여기서 `Align::Hold`가 하는 것과 같지만, 그 동등성은
-   아직 실행되어 확인된 적이 없다.
+1. **LeRobot이 실제로 어떤 resize를 호출하는지 — `unverified`이며 리뷰의 최우선
+   질문.** 이 노트는 `interpolate(..., align_corners=False, antialias=False)`를
+   구현한다. torchvision의 `Resize`는 0.17부터 `antialias=True`가 기본값이었고, 서로
+   다른 LeRobot 정책(ACT, Diffusion Policy, SmolVLA, π₀)은 서로 다른 곳에서 resize한다 —
+   데이터셋 transform, processor, 또는 아예 하지 않음. 그 호출 지점 중 하나를 읽고
+   확정하기 전까지는, spec 7.7이 주장하는 일치는 어떤 다운스케일에 대해서도 검증되지
+   않은 채로 남는다. 답이 `antialias=True`라면, 안티에일리어싱 커널은 이 커널의 변경이
+   아니라 추가 커널 id가 된다.
+2. **u8 → f32 스케일링 — measured.** `cast_u8_hwc_to_f32_chw`는 golden 이미지에서
+   `torchvision.transforms.functional.to_tensor`와 비트 단위로 동일하다: 같은 permute,
+   같은 f32 255 나눗셈. 여전히 `unverified`로 남는 것은 어떤 LeRobot 경로가 실제로
+   쓰이는가이다 — 일부는 torchcodec/ffmpeg가 디코딩한, u8 양자화가 전혀 일어나지 않은
+   이미 float인 video 프레임을 넘겨준다.
+3. **`Normalize` 통계 — `unverified`.** 계획은 IR이 싣고 있는 것을 그대로 적용한다.
+   그것이 LeRobot의 데이터셋별 `mean`/`std`인지 ImageNet의 것인지는 한 계층 위의,
+   데이터셋에 관한 질문이다.
+4. **f16 반올림 — `unverified`.** `half`는 round-to-nearest-even을 쓴다. PyTorch의
+   `.half()`도 그렇지만, 이는 확인된 것이 아니라 단언된 것이다.
+5. **`n_steps` 프레임이 아직 존재하지 않을 때의 ring 버퍼 채움 동작 — `unverified`.**
+   LeRobot의 `delta_timestamps`는 에피소드의 첫 프레임으로 clamp하는데, 이는 여기서
+   `Align::Hold`가 하는 것과 같지만, 그 동등성은 아직 실행되어 확인된 적이 없다.
+6. **golden 크기를 벗어난 `resize_bilinear` — measured, 그리고 불일치한다.** torch
+   2.14 CPU에 대해 4,624개의 (source, target) 크기 쌍을 스윕한 결과: 1,585개가 비트
+   단위로 동일하고(그중에 golden 크기도 있다), 나머지는 **1~4 ULP** 차이가 난다.
+   반화소 컨벤션은 원인이 *아니다* — source 인덱스는 정확히 일치하며, 이를 f64로
+   계산해 좁히면 불일치가 나아지는 게 아니라 오히려 더 나빠진다. 이것이 §4가 f32
+   경로를 규범적으로 유지하는 이유다. 다른 것은 두 탭 가중치가 만들어지는 방식이다:
+   이 커널은 `l0 = 1 - l1`을 취하는 반면, torch의 CPU 커널은 둘을 그 합으로
+   정규화하는 것처럼 보인다 — 이는 길이 1인 source 축을 설명하는 유일한 해석이다:
+   거기서 torch는 입력값을 정확히 그대로 반환하지만(탭 하나, 가중치 정확히 1) 이
+   커널은 `l0 * v + l1 * v`를 반환하여 1 ULP가 어긋난다. 이를 일치시키려면 새 커널
+   id(가중치는 `compiler_hash`가 다루는 수치의 일부다)와 그에 맞는 Slang 변경이
+   필요하므로, 이는 패치가 아니라 그 자체로 하나의 패킷이며, 추론이 아니라 torch의
+   소스를 읽어야 한다. 그때까지는, "PyTorch와 비트 단위로 일치한다"는 고정된
+   golden 크기들에서는 참이고 그 외에서는 4-ULP만큼 참이다.
 
 ## 13. Goldens
 
-`tests/golden/observation/*.bin`과 파일당 하나의 `.json` 사이드카(shape,
-dtype, kernel, 그것이 무엇을 고정하는지에 대한 한 문장). 한 번
-`cargo test -p es-compile --test gen_goldens -- --ignored`로 생성된 뒤에는
-영원히 읽기 전용이다(spec 1.4; `cargo xtask verify-goldens`가 어떤 수정에
-대해서도 실패한다). 하나를 재생성하는 것은 그 뒤에 spec 변경이 있는
-의도적인 행위이며, 테스트를 통과시키기 위한 방편이 결코 아니다.
+`tests/golden/observation/*.bin`과 파일당 하나의 `.json` 사이드카(shape, dtype, kernel,
+그것이 고정하는 것, 그것을 만들어낸 오라클 호출, 그리고 선택적인 `tolerance_ulp`).
+
+**이것들은 PyTorch와 torchvision에서 나오며, 그것들이 검사하는 커널에서는 결코 나오지
+않는다**(spec 1.4): `crates/es-compile/python/gen_observation_goldens.py`는 이
+workspace에서 아무것도 import하지 않으며, 이것이 고정된 버전들은
+`docs/api-notes/torchvision.md`에 있다. 이들을 `es-compile` 자신으로부터 생성하는
+것이 M1 리뷰의 블로커였다 — 잘못된 반화소 컨벤션이 지적당하는 대신 그대로 굳어졌을
+것이다. 패킷: `docs/packets/M1/P-M1-R1.md`.
+
+`cargo test -p es-compile --test gen_goldens`는 그 스크립트를 임시 디렉터리로 다시
+실행하여 바이트가 하나라도 다르면 실패하므로, torch가 설치되어 있으면(`ES_PYTHON`이
+그것을 가리킨다) 출처(provenance)가 기계적으로 검사되고, 설치되어 있지 않으면
+`SKIPPED`를 출력한다. golden을 교체하는 것은 `tests/golden/observation`에서 스크립트를
+실행하고 `GOLDEN_UPDATE=1 cargo xtask verify-goldens`로 커밋을 게이트하는 것을
+뜻한다 — 그 뒤에 spec 변경이 있는 의도적인 행위이며, 테스트를 통과시키기 위한 방편이
+결코 아니다.
+
+사이드카가 `tolerance_ulp`를 선언하지 않는 한 비교는 바이트 단위다; `srgb_to_linear_lut256`만이
+§6의 이유로 7 ULP에서 그렇게 한다.
 
 리틀 엔디언 f32/u8, 빈틈없이 채워짐 — arena가 들고 있는 것과 같은 바이트다.

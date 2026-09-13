@@ -123,14 +123,24 @@ pub fn validate(&mut self, chunk: &ActionChunk<NJ, H>, obs_age: Micros, now: Phy
 어떤 watchdog도 평가되지 않고 어떤 chunk도 받아들여지지 않는다. `reset_latch()`만이
 이를 해제한다.
 
-**1단계 — chunk 수락.** 들어온 chunk를 저장된 chunk와 비교한다(`valid`, `mode`, 그리고
-`valid`한 앞부분 행들을 비트 단위로). 다르면 새 chunk이므로 복사해 넣고
-`cursor = 0`, `last_chunk_tick = now`로 둔다. 동일하면 커서는 계속 진행한다.
+**1단계 — chunk 수락.** chunk 정체성 질문 — 이것이 지난 tick과 같은 chunk인가,
+새로운 것인가? — 은 `ActionChunk::seq`(P-M1-R3)로 답해진다. 이는 호출자가 공급하는,
+정책 호출마다 단조 증가하는 카운터다(spec 8.6): chunk는 `seq`가 마지막으로 받아들여진
+것보다 엄격히 클 때에만 새것이다; 내용은 결코 비교되지 않는다. 새것이면 그것을
+복사해 넣고 `cursor = 0`, `last_chunk_tick = now`로 두며 `seq`를 기억한다. `seq`가
+더 크지 않으면(같은 값의 반복을 포함해) 커서는 저장된 chunk 위에서 계속 진행한다.
+plane이 처음 보는 chunk는 그 `seq`가 무엇이든 무조건 받아들여진다.
 
-> 알려진 한계: 동일한 chunk를 두 번 연속 내보내는 정책은 오래된(stale) chunk로 읽혀
-> 결국 `ChunkUnderrun`을 유발한다. 이는 안전한 쪽으로 치우치는 것이며, 부록 B.4의
-> chunk 형태에 시퀀스 번호를 넣지 않기 위한 선택이다. 실제 워크로드가 이 문제에
-> 부딪히면 해법은 휴리스틱이 아니라 `ActionChunk`에 `seq: u64`를 추가하는 것이다.
+이는 정당한 replan에서(정지된 hold, 포화된 출력) 비트 단위로 동일한 chunk를 다시
+내보내는 정책도 여전히 신선한 것으로 읽힌다는 뜻이다 — `ChunkUnderrun`으로의 느린
+미끄러짐이 아니라 `ActionSource::Policy`로 — 바이트는 바뀌지 않았어도 호출자가
+`seq`를 진전시켰기 때문이다. 반대로, 같은 `seq`를 두 번 재제출하는 호출자는(자신의
+카운터를 진전시키지 못한 것이다) 오래된(stale) 것으로 읽히고, 커서는 결국 저장된
+chunk를 지나쳐 `ChunkUnderrun`으로 진행한다 — 이는 plane 안의 특수한 경우가 아니라
+호출자 버그에 대한 기본적으로 안전한(safe-by-default) 결과다. `es-runtime-embedded::EmbeddedRuntime`은
+`infer` 호출(replan tick)마다 한 번씩 자신의 카운터를 증가시키고, 버퍼링된 chunk를
+그저 소비하기만 하는 tick들에 걸쳐서는 같은 `seq`를 재사용한다. 이는 호출자 쪽
+용어로 정확히 "새 chunk" 대 "아직 소비 중"이다.
 
 **2단계 — 실행 가능 길이.** `RecedingHorizon`에서는 `len = min(chunk_valid, K)`이며
 `K = action.execute_chunk`이고, 그 외 모든 모드에서는 `min(chunk_valid, H)`이다
@@ -249,7 +259,7 @@ pub struct SafetyCounters {
 `K = 3`에 대해 재생한다. 각 fixture는 완전한 `DeploymentIr`와 스텝 목록을 싣고
 있다. 각 스텝은 입력(chunk 또는 "이전 것을 재사용", `obs_age_us`, heartbeat,
 관측된 sensor)과 기대되는 `source`, 기대되는 이벤트 집합, 선택적으로 기대되는
-`q`를 선언한다. 카운터는 실행이 끝난 시점에 검사된다. 열일곱 개의 시나리오:
+`q`를 선언한다. 카운터는 실행이 끝난 시점에 검사된다. 열아홉 개의 시나리오:
 
 | # | Fixture | 무엇을 증명하는가 |
 |---|---|---|
@@ -270,6 +280,8 @@ pub struct SafetyCounters {
 | 15 | `violation_rate` | 충분히 많은 clamp된 스텝이 window 비율을 `max_frac` 위로 밀어 rate watchdog을 트립시킴 |
 | 16 | `estop_latch` | E-stop이 한 번 트립되면 이후 모든 스텝은 완벽한 chunk가 와도 `reset_latch()` 전까지 `Fallback(EmergencyStop)`으로 남음 |
 | 17 | `retract_completes` | `RetractToHome`이 waypoint 단위로 진행되며 마지막 것을 유지함 |
+| 18 | `identical_chunks_fresh_seq` | 매 replan마다 엄격히 더 큰 `seq`로 재제출된 비트 단위로 동일한 chunk는 여전히 `source = Policy`다 (P-M1-R3) |
+| 19 | `repeated_seq_is_stale` | 이전과 *같은* `seq`로 재제출된 chunk는 받아들여지지 않는다; 커서는 그것을 지나쳐 `ChunkUnderrun`으로 진행한다 (P-M1-R3) |
 
 거기에 더해 `tests/properties.rs`: `NaN`, `±Inf`, subnormal, 모든 한계를 크게
 벗어난 값을 담은 임의의 chunk와, 임의의 `obs_age`/tick 시퀀스에 대해, 반환되는
