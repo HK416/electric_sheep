@@ -26,6 +26,7 @@ es-env = { path = "crates/es-env" }
 es-safety = { path = "crates/es-safety" }
 es-compile = { path = "crates/es-compile" }
 es-runtime-embedded = { path = "crates/es-runtime-embedded" }
+es-editor = { path = "crates/es-editor" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"
@@ -34,6 +35,13 @@ thiserror = "2"
 proptest = "1"
 wide = "0.7"
 crossbeam = "0.8"
+# egui 0.32 is the newest release whose MSRV is the workspace `rust-version` (1.85); 0.36
+# raises it. Minimal features: the editor paints rectangles and lines, nothing else.
+eframe = { version = "0.32.3", default-features = false, features = [
+    "glow",
+    "default_fonts",
+] }
+egui = { version = "0.32.3", default-features = false }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "warn"

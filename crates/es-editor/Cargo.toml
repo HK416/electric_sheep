@@ -1,0 +1,25 @@
+[package]
+name = "es-editor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "es-editor -- read-only layered graph view, telemetry and before/after images (spec 23)"
+
+[[bin]]
+name = "es-editor"
+path = "src/main.rs"
+
+[dependencies]
+es-core = { workspace = true }
+es-ir = { workspace = true }
+es-compile = { workspace = true }
+es-telemetry = { workspace = true }
+eframe = { workspace = true }
+egui = { workspace = true }
+
+[dev-dependencies]
+es-math = { workspace = true }
+
+[lints]
+workspace = true
