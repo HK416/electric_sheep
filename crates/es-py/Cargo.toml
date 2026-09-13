@@ -1,0 +1,33 @@
+[package]
+name = "es-py"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+# `cdylib` is what maturin loads as the `es_native` Python extension module; `rlib` keeps the
+# crate usable as an ordinary Rust dependency (the integration test links it that way) and lets
+# `cargo test --workspace` / `cargo check --workspace` build it with zero Python involvement.
+[lib]
+name = "es_native"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+es-ir = { workspace = true }
+es-ir-types = { workspace = true }
+es-compile = { workspace = true }
+es-assets = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+pyo3 = { workspace = true, optional = true }
+
+# Off by default so `cargo build`/`cargo test --workspace` never require a Python dev
+# environment (CLAUDE.md, spec 2.1: Python is first-class on the learning/authoring path only,
+# never on the core). `maturin` turns this on via `--features python`.
+[features]
+default = []
+python = ["dep:pyo3"]
+
+[lints]
+workspace = true

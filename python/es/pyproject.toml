@@ -1,0 +1,21 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "es"
+version = "0.1.0"
+description = "Electric Sheep Python authoring builder (spec 14.2)"
+requires-python = ">=3.12"
+dependencies = ["blake3"]
+
+# `manifest-path` points at the actual Cargo crate (`crates/es-py`, layer 11); `python-source`
+# is this file's own parent directory (`python/`), so maturin finds the pure-Python `es` package
+# right next to this file and merges the compiled extension into it. `features = ["python"]` is
+# what turns on the `pyo3` half of `es-py` (see `crates/es-py/Cargo.toml`) — the default
+# workspace build never needs it.
+[tool.maturin]
+manifest-path = "../../crates/es-py/Cargo.toml"
+python-source = ".."
+module-name = "es.es_native"
+features = ["python"]
