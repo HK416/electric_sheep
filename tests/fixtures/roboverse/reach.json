@@ -1,0 +1,35 @@
+{
+  "name": "reach_target",
+  "license": "MIT",
+  "robots": [
+    {
+      "name": "ur5",
+      "mjcf_path": "roboverse_data/robots/ur5/mjcf/ur5.xml",
+      "control_type": {
+        "elbow": "position",
+        "shoulder_pan": "position"
+      }
+    }
+  ],
+  "cameras": [
+    {
+      "name": "wrist",
+      "resolution": [64, 64],
+      "intrinsics": { "fx": 64.0, "fy": 64.0, "cx": 32.0, "cy": 32.0 }
+    }
+  ],
+  "episode_length": 100,
+  "checker": {
+    "kind": "JointPosChecker",
+    "robot": "ur5",
+    "joint": "elbow",
+    "target": 0.5,
+    "tolerance": 0.02
+  },
+  "randomization": [
+    {
+      "target": "ur5.mass",
+      "distribution": { "kind": "uniform", "low": 0.8, "high": 1.2 }
+    }
+  ]
+}

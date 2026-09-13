@@ -1,0 +1,15 @@
+{
+  "name": "bad_task",
+  "robots": [
+    {
+      "name": "r",
+      "urdf_path": "r.urdf",
+      "control_type": { "j1": "position" }
+    }
+  ],
+  "episode_length": 50,
+  "checker": {
+    "kind": "SomeFutureChecker",
+    "foo": 1
+  }
+}

@@ -21,6 +21,7 @@ pub mod identity;
 pub mod intervention;
 pub mod lerobot;
 pub mod lerobot_config;
+pub mod roboverse;
 
 use std::path::{Path, PathBuf};
 

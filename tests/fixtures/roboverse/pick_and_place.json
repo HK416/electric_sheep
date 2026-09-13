@@ -1,0 +1,36 @@
+{
+  "name": "pick_cube",
+  "version": "0.1.0",
+  "license": "Apache-2.0",
+  "scene": "scenes/table.usd",
+  "robots": [
+    {
+      "name": "franka",
+      "urdf_path": "roboverse_data/robots/franka/urdf/franka.urdf",
+      "control_type": {
+        "joint1": "position",
+        "joint2": "position",
+        "joint3": "position"
+      }
+    }
+  ],
+  "objects": [
+    {
+      "name": "cube",
+      "usd_path": "roboverse_data/objects/cube/cube.usd"
+    }
+  ],
+  "cameras": [
+    {
+      "name": "front",
+      "resolution": [128, 128]
+    }
+  ],
+  "episode_length": 250,
+  "control_rate_hz": 20.0,
+  "checker": {
+    "kind": "DetectedChecker",
+    "object": "cube",
+    "detector": "franka"
+  }
+}
