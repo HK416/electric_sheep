@@ -7,16 +7,18 @@
 //! belongs in `.eslayout` sidecars, not here (rule 7).
 //!
 //! Foundation (P18, P19, P27): [`types`], [`image`], [`diag`], [`codes`], [`graph`], [`hash`].
+//! The first four live in `es-ir-types` since P-M0-R4 (spec 1.5 context budget) and are
+//! re-exported here unchanged.
 //! The five IRs (P20..P24) fill in [`task`], [`observation`], [`learning`], [`deployment`],
 //! [`evaluation`], and the boundary rules (P26) fill in [`cross`].
 
-pub mod codes;
-pub mod diag;
 pub mod graph;
 pub mod hash;
-pub mod image;
 pub mod norm;
-pub mod types;
+
+// Split out to `es-ir-types` for the spec 1.5 context budget (P-M0-R4), re-exported here so
+// every `es_ir::codes::..` / `es_ir::types::..` path still resolves.
+pub use es_ir_types::{codes, diag, image, types};
 
 pub mod cross;
 pub mod deployment;

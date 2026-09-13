@@ -24,6 +24,7 @@ pub const GRAPH_010: &str = "GRAPH-010";
 
 // --- Canonical encoding / hash chain (spec 5.3) -------------------------------------------
 pub const HASH_001: &str = "HASH-001";
+pub const HASH_002: &str = "HASH-002";
 
 // --- Task (spec 7.4) ----------------------------------------------------------------------
 pub const TASK_001: &str = "TASK-001";
@@ -172,6 +173,7 @@ pub const CODES: &[CodeEntry] = &[
     e(GRAPH_003, Error, "input port has more than one incoming edge", "11.1"),
     e(GRAPH_010, Error, "unknown port name", "11.1"),
     e(HASH_001, Error, "value is not encodable in canonical form", "5.3"),
+    e(HASH_002, Error, "graph too symmetric to canonicalize", "5.3"),
     e(LRN_001, Error, "schema version disagrees with the graph", "8.2"),
     e(LRN_002, Error, "wrong number of input ports for this node kind", "8.3"),
     e(LRN_010, Error, "graph boundary does not match the declared tensor ports", "8.2"),
@@ -269,6 +271,7 @@ mod tests {
             GRAPH_003,
             GRAPH_010,
             HASH_001,
+            HASH_002,
             TASK_001,
             OBS_021,
             OBS_034,

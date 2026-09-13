@@ -10,7 +10,7 @@ use std::time::Duration;
 use es_math::conventions::Pose;
 use serde::{Deserialize, Serialize};
 
-use crate::hash::CanonWriter;
+use crate::canon::CanonWriter;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChannelFormat {

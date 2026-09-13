@@ -8,15 +8,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+pub use es_ir_types::NodeId;
+
 use crate::codes;
 use crate::diag::Diagnostic;
 use crate::hash::CanonWriter;
 use crate::types::PortType;
-
-/// Authoring identity of a node. **Not** part of the semantic hash (spec 11.2): it appears in
-/// `*_graph_hash`, never in `*_hash`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct NodeId(pub u32);
 
 /// One side of an edge: a named port on a node.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

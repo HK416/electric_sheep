@@ -13,6 +13,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("es-core", 1),
     ("es-gpu", 2),
     ("es-assets", 2),
+    ("es-ir-types", 2),
     ("es-usd", 2),
     ("es-actuator", 3),
     ("es-sensor", 3),

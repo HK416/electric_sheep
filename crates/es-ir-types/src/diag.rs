@@ -8,7 +8,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::codes;
-use crate::graph::NodeId;
+use crate::NodeId;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Severity {

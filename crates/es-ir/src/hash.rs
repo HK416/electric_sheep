@@ -1,16 +1,17 @@
-//! Canonical encoding and the hash chain (spec 5.3, spec 11.2, Appendix B.6).
+//! Canonical hashing and the hash chain (spec 5.3, spec 11.2, Appendix B.6).
 //!
-//! [`CanonWriter`] is the only way a value becomes hash input: little-endian integers,
-//! length-prefixed strings and byte strings, `f64` as IEEE bits with `-0.0` normalized and
-//! `NaN` rejected. Maps must be iterated in sorted key order — use `BTreeMap`, which is sorted
-//! by construction (`HashMap` is banned by spec 3.4 and by clippy).
+//! The byte encoder itself is [`CanonWriter`], re-exported here from `es-ir-types`.
 //!
 //! [`canonical_hash`] is the semantic identity of a graph (`*_hash` in spec 11.2): independent
-//! of `NodeId` values and of node order, sensitive to every parameter.
+//! of `NodeId` values and of node order, sensitive to every parameter, and — within the
+//! refinement cap of `docs/design/hash-canonicalization.md` — distinct for non-isomorphic
+//! graphs.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
+
+pub use es_ir_types::canon::CanonWriter;
 
 use crate::codes;
 use crate::diag::Diagnostic;
@@ -20,126 +21,60 @@ use crate::graph::{Graph, IrNode, NodeId};
 const CANON_TAG: &str = "es.ir.canon.v1";
 const CHAIN_TAG: &str = "es.execution_hash.v1";
 
-/// Canonical byte encoder. Writes never fail; an unencodable value latches an error that
-/// [`CanonWriter::finish`] returns, so node encoders stay infallible.
-#[derive(Debug, Default)]
-pub struct CanonWriter {
-    buf: Vec<u8>,
-    err: Option<Diagnostic>,
-}
-
-impl CanonWriter {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Length-prefixed UTF-8.
-    pub fn str(&mut self, s: &str) {
-        self.bytes(s.as_bytes());
-    }
-
-    /// Length-prefixed bytes.
-    pub fn bytes(&mut self, b: &[u8]) {
-        self.seq(b.len());
-        self.buf.extend_from_slice(b);
-    }
-
-    /// A raw 32-byte digest: fixed width, so no length prefix.
-    pub fn digest(&mut self, d: &[u8; 32]) {
-        self.buf.extend_from_slice(d);
-    }
-
-    /// Element count of a sequence or map. Every variable-length item is prefixed with one.
-    pub fn seq(&mut self, len: usize) {
-        self.u32(u32::try_from(len).unwrap_or(u32::MAX));
-    }
-
-    pub fn u8(&mut self, v: u8) {
-        self.buf.push(v);
-    }
-
-    pub fn u32(&mut self, v: u32) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
-    }
-
-    pub fn u64(&mut self, v: u64) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
-    }
-
-    pub fn i64(&mut self, v: i64) {
-        self.buf.extend_from_slice(&v.to_le_bytes());
-    }
-
-    pub fn bool(&mut self, v: bool) {
-        self.u8(u8::from(v));
-    }
-
-    /// `f32` is widened: the two are then interchangeable in a hash, which is what a spec
-    /// field switching precision should mean.
-    pub fn f32(&mut self, v: f32) {
-        self.f64(f64::from(v));
-    }
-
-    /// IEEE bits, with `-0.0` normalized to `0.0` (they compare equal, so they must hash
-    /// equal) and `NaN` rejected (it compares unequal to itself, so no hash of it is sound).
-    pub fn f64(&mut self, v: f64) {
-        if v.is_nan() {
-            self.fail(Diagnostic::new(
-                codes::HASH_001,
-                "NaN cannot be encoded canonically",
-            ));
-            return;
-        }
-        let v = if v == 0.0 { 0.0 } else { v };
-        self.buf.extend_from_slice(&v.to_bits().to_le_bytes());
-    }
-
-    /// Latches a diagnostic; the first one wins.
-    pub fn fail(&mut self, diag: Diagnostic) {
-        if self.err.is_none() {
-            self.err = Some(diag);
-        }
-    }
-
-    pub fn finish(self) -> Result<Vec<u8>, Diagnostic> {
-        match self.err {
-            Some(e) => Err(e),
-            None => Ok(self.buf),
-        }
-    }
-
-    pub fn hash(self) -> Result<[u8; 32], Diagnostic> {
-        Ok(*blake3::hash(&self.finish()?).as_bytes())
-    }
-}
-
 /// A node's *colour*: a digest of its kind, its parameters and — refined to a fixpoint — the
 /// colours of everything it consumes and feeds, each through the port name that connects them.
 /// A colour is what a node is, with no trace of what it is called.
 type Colour = [u8; 32];
 
-/// Colour every node, in topological order.
+/// Domain separator for the recoloured node of an individualization branch.
+const INDIV_TAG: &str = "es.ir.canon.indiv.v1";
+
+/// Hard cap on refinement passes inside one [`canonical_hash`]. Individualization is
+/// exponential in the worst case, so past this the answer is refused (`HASH-002`) rather than
+/// guessed. See `docs/design/hash-canonicalization.md`.
+const REFINE_CAP: u32 = 10_000;
+
+/// Node position lookup, so an edge's endpoints can be read as colour indices.
+type Pos = BTreeMap<NodeId, usize>;
+
+fn cells(colour: &[Colour]) -> usize {
+    colour.iter().copied().collect::<BTreeSet<Colour>>().len()
+}
+
+/// Round 0 of the colouring: the node's own kind and parameters, nothing else.
+fn initial_colours<N: IrNode>(g: &Graph<N>, order: &[NodeId]) -> Result<Vec<Colour>, Diagnostic> {
+    order
+        .iter()
+        .map(|id| {
+            let node = &g.nodes[id];
+            let mut w = CanonWriter::new();
+            w.str(node.kind());
+            node.params_canonical(&mut w);
+            w.hash()
+        })
+        .collect()
+}
+
+/// Refine `colour` to its fixpoint (1-dimensional Weisfeiler-Leman).
 ///
-/// The first round is the node's own kind and parameters. Each further round mixes in the
-/// sorted multiset of `(direction, near port, neighbour colour, far port)` over both incoming
-/// and outgoing edges, which is one round of colour refinement; the loop stops as soon as a
-/// round splits no further cell. So two nodes end up the same colour only when their whole
-/// neighbourhoods, to any depth, agree — and node ids never enter.
-fn refine<N: IrNode>(g: &Graph<N>) -> Result<(Vec<NodeId>, Vec<Colour>), Diagnostic> {
-    let order = g.topo_order()?;
-    let n = order.len();
-    let pos: BTreeMap<NodeId, usize> = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
-
-    let mut colour = Vec::with_capacity(n);
-    for id in &order {
-        let node = &g.nodes[id];
-        let mut w = CanonWriter::new();
-        w.str(node.kind());
-        node.params_canonical(&mut w);
-        colour.push(w.hash()?);
+/// Each round mixes into every node the sorted multiset of `(direction, near port, neighbour
+/// colour, far port)` over both incoming and outgoing edges; the loop stops as soon as a round
+/// splits no further cell. Node ids never enter. Each call spends one unit of `budget`.
+fn refine_from<N: IrNode>(
+    g: &Graph<N>,
+    order: &[NodeId],
+    pos: &Pos,
+    mut colour: Vec<Colour>,
+    budget: &mut u32,
+) -> Result<Vec<Colour>, Diagnostic> {
+    if *budget == 0 {
+        return Err(Diagnostic::new(
+            codes::HASH_002,
+            "graph too symmetric to canonicalize",
+        ));
     }
-
-    let cells = |c: &[Colour]| c.iter().copied().collect::<BTreeSet<Colour>>().len();
+    *budget -= 1;
+    let n = order.len();
     let mut split = cells(&colour);
     // A refinement round splits at least one cell or it is at the fixpoint, so `n` rounds is
     // always enough.
@@ -184,35 +119,82 @@ fn refine<N: IrNode>(g: &Graph<N>) -> Result<(Vec<NodeId>, Vec<Colour>), Diagnos
         }
         split = refined;
     }
-    Ok((order, colour))
+    Ok(colour)
 }
 
-/// The canonical node order: the sort by colour. [`crate::norm::canon_graph`] relabels by it.
-///
-/// Nodes that share a colour are interchangeable as far as [`canonical_hash`] is concerned, so
-/// which of them comes first is left to the topological order and does not matter.
-pub fn canonical_order<N: IrNode>(g: &Graph<N>) -> Result<Vec<NodeId>, Diagnostic> {
-    let (order, colour) = refine(g)?;
-    let mut ranked: Vec<usize> = (0..order.len()).collect();
-    ranked.sort_by_key(|&i| colour[i]);
-    Ok(ranked.into_iter().map(|i| order[i]).collect())
+/// Colour every node, in topological order, to the 1-WL fixpoint.
+fn refine<N: IrNode>(g: &Graph<N>) -> Result<(Vec<NodeId>, Pos, Vec<Colour>), Diagnostic> {
+    let order = g.topo_order()?;
+    let pos: Pos = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let initial = initial_colours(g, &order)?;
+    let mut budget = REFINE_CAP;
+    let colour = refine_from(g, &order, &pos, initial, &mut budget)?;
+    Ok((order, pos, colour))
 }
 
-/// Semantic identity of a graph (spec 11.2 `*_hash`).
+/// The colour class to branch on: the smallest one with more than one member, ties broken by
+/// the colour itself. Both are properties of the colouring, never of node ids, so every
+/// relabelling of a graph picks the same class.
+fn ambiguous_class(colour: &[Colour]) -> Option<Colour> {
+    let mut count: BTreeMap<Colour, usize> = BTreeMap::new();
+    for c in colour {
+        *count.entry(*c).or_default() += 1;
+    }
+    count
+        .into_iter()
+        .filter(|(_, n)| *n > 1)
+        .min_by_key(|(c, n)| (*n, *c))
+        .map(|(c, _)| c)
+}
+
+/// Recolour one node so refinement can tell it from its class-mates.
+fn distinguish(c: Colour) -> Colour {
+    let mut w = CanonWriter::new();
+    w.str(INDIV_TAG);
+    w.digest(&c);
+    w.hash()
+        .expect("a tag and a digest contain no floats, so encoding cannot fail")
+}
+
+/// Canonical form: individualization-refinement.
 ///
-/// Nodes and edges are encoded by colour, as sorted multisets. A `NodeId` is therefore not
-/// merely renumbered out of the hash, it is never consulted — which is what makes the
-/// Appendix B.7 relabelling invariant hold for *every* graph, including one whose nodes tie
-/// on colour, rather than for those where a tie-break happened to be stable.
-pub fn canonical_hash<N: IrNode>(g: &Graph<N>) -> Result<[u8; 32], Diagnostic> {
-    let (order, colour) = refine(g)?;
-    let pos: BTreeMap<NodeId, usize> = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+/// A discrete colouring is encoded directly. Otherwise every member of [`ambiguous_class`] is
+/// tried in turn as the distinguished node, refinement is re-run, and the lexicographically
+/// smallest encoding over all branches wins. Trying *every* member is what makes the result
+/// independent of which node happened to be picked, so isomorphic graphs still agree.
+fn canonical_encoding<N: IrNode>(
+    g: &Graph<N>,
+    order: &[NodeId],
+    pos: &Pos,
+    colour: &[Colour],
+    budget: &mut u32,
+) -> Result<Vec<u8>, Diagnostic> {
+    let Some(target) = ambiguous_class(colour) else {
+        return encode(g, pos, colour);
+    };
+    let mut best: Option<Vec<u8>> = None;
+    for i in 0..order.len() {
+        if colour[i] != target {
+            continue;
+        }
+        let mut branch = colour.to_vec();
+        branch[i] = distinguish(colour[i]);
+        let branch = refine_from(g, order, pos, branch, budget)?;
+        let enc = canonical_encoding(g, order, pos, &branch, budget)?;
+        if best.as_ref().is_none_or(|b| enc < *b) {
+            best = Some(enc);
+        }
+    }
+    Ok(best.expect("an ambiguous class has at least two members"))
+}
+
+/// Encode a colouring as sorted node and edge multisets plus the (ordered) boundary.
+fn encode<N: IrNode>(g: &Graph<N>, pos: &Pos, colour: &[Colour]) -> Result<Vec<u8>, Diagnostic> {
     let colour_of = |id: &NodeId| colour[pos[id]];
-
     let mut w = CanonWriter::new();
     w.str(CANON_TAG);
     w.u32(g.schema_version);
-    let mut nodes = colour.clone();
+    let mut nodes = colour.to_vec();
     nodes.sort_unstable();
     w.seq(nodes.len());
     for c in &nodes {
@@ -246,7 +228,40 @@ pub fn canonical_hash<N: IrNode>(g: &Graph<N>) -> Result<[u8; 32], Diagnostic> {
             w.str(&p.port);
         }
     }
-    w.hash()
+    w.finish()
+}
+
+/// The canonical node order: the sort by colour. [`crate::norm::canon_graph`] relabels by it.
+///
+/// Only the 1-WL colouring is used here, not the individualization [`canonical_hash`] goes on
+/// to do: this is a relabelling order, not an identity, so nodes left sharing a colour may come
+/// in any order and the topological one is as good as another.
+pub fn canonical_order<N: IrNode>(g: &Graph<N>) -> Result<Vec<NodeId>, Diagnostic> {
+    let (order, _pos, colour) = refine(g)?;
+    let mut ranked: Vec<usize> = (0..order.len()).collect();
+    ranked.sort_by_key(|&i| colour[i]);
+    Ok(ranked.into_iter().map(|i| order[i]).collect())
+}
+
+/// Semantic identity of a graph (spec 11.2 `*_hash`).
+///
+/// Nodes and edges are encoded by colour, as sorted multisets. A `NodeId` is therefore not
+/// merely renumbered out of the hash, it is never consulted — which is what makes the
+/// Appendix B.7 relabelling invariant hold for *every* graph, including one whose nodes tie
+/// on colour, rather than for those where a tie-break happened to be stable.
+///
+/// Colours come from refinement plus individualization, so isomorphic graphs agree and
+/// non-isomorphic ones are separated whenever the search completes. A graph symmetric enough
+/// to exhaust the refinement cap is reported as `HASH-002` instead of being given a hash that
+/// might be wrong. See `docs/design/hash-canonicalization.md`.
+pub fn canonical_hash<N: IrNode>(g: &Graph<N>) -> Result<[u8; 32], Diagnostic> {
+    let order = g.topo_order()?;
+    let pos: Pos = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+    let initial = initial_colours(g, &order)?;
+    let mut budget = REFINE_CAP;
+    let colour = refine_from(g, &order, &pos, initial, &mut budget)?;
+    let bytes = canonical_encoding(g, &order, &pos, &colour, &mut budget)?;
+    Ok(*blake3::hash(&bytes).as_bytes())
 }
 
 /// `content + schema + split` — the split is part of the identity because the same data with a
@@ -570,6 +585,93 @@ mod tests {
             canonical_hash(&relabel(&g, |i| 10_000 - i)).unwrap(),
             canonical_hash(&g).unwrap()
         );
+    }
+
+    /// Wire `pairs` of (Const index, Add index, port) over 4 `Const` and 4 `Add` nodes, all
+    /// identical. Every node is regular in both directions, so 1-WL alone cannot split a cell.
+    fn ring(pairs: [(u32, u32, &str); 8]) -> Graph<ToyNode> {
+        let mut g = Graph::new(1);
+        for i in 0..4 {
+            g.insert(NodeId(i), ToyNode::Const { v: 1 });
+            g.insert(NodeId(10 + i), ToyNode::Add { bias: 0 });
+        }
+        for (c, a, port) in pairs {
+            g.connect(NodeId(c), "out", NodeId(10 + a), port);
+        }
+        g
+    }
+
+    /// The M0-review counterexample: one 8-cycle and two disjoint 4-cycles over the same eight
+    /// nodes collide under plain colour refinement. Individualization must tell them apart.
+    #[test]
+    fn eight_cycle_differs_from_two_four_cycles() {
+        let eight = ring([
+            (0, 0, "a"),
+            (1, 0, "b"),
+            (1, 1, "a"),
+            (2, 1, "b"),
+            (2, 2, "a"),
+            (3, 2, "b"),
+            (3, 3, "a"),
+            (0, 3, "b"),
+        ]);
+        let two_fours = ring([
+            (0, 0, "a"),
+            (1, 0, "b"),
+            (1, 1, "a"),
+            (0, 1, "b"),
+            (2, 2, "a"),
+            (3, 2, "b"),
+            (3, 3, "a"),
+            (2, 3, "b"),
+        ]);
+        // Plain colour refinement really does collide on these two: that is the ceiling
+        // individualization lifts, and this half of the assertion keeps the fixture honest.
+        let plain = |g: &Graph<ToyNode>| {
+            let (order, pos, colour) = refine(g).unwrap();
+            assert!(ambiguous_class(&colour).is_some(), "{order:?}");
+            encode(g, &pos, &colour).unwrap()
+        };
+        assert_eq!(plain(&eight), plain(&two_fours));
+        assert_ne!(
+            canonical_hash(&eight).unwrap(),
+            canonical_hash(&two_fours).unwrap()
+        );
+        // Both are still relabelling-invariant, which is the point of taking the minimum over
+        // every choice of distinguished node.
+        for g in [&eight, &two_fours] {
+            assert_eq!(
+                canonical_hash(&relabel(g, |i| 10_000 - i)).unwrap(),
+                canonical_hash(g).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn exhausted_refinement_budget_is_reported() {
+        let g = ring([
+            (0, 0, "a"),
+            (1, 0, "b"),
+            (1, 1, "a"),
+            (2, 1, "b"),
+            (2, 2, "a"),
+            (3, 2, "b"),
+            (3, 3, "a"),
+            (0, 3, "b"),
+        ]);
+        let order = g.topo_order().unwrap();
+        let pos: Pos = order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+        let mut budget = 1;
+        let colour = refine_from(
+            &g,
+            &order,
+            &pos,
+            initial_colours(&g, &order).unwrap(),
+            &mut budget,
+        )
+        .unwrap();
+        let err = canonical_encoding(&g, &order, &pos, &colour, &mut budget).unwrap_err();
+        assert_eq!(err.code.as_str(), codes::HASH_002);
     }
 
     #[test]

@@ -1,25 +1,17 @@
 [package]
-name = "es-ir"
+name = "es-ir-types"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
-[features]
-# Exposes the `testing` modules (proptest strategies) to integration tests and other crates.
-testing = ["dep:proptest"]
-
 [dependencies]
 es-core = { workspace = true }
-es-ir-types = { workspace = true }
 es-math = { workspace = true }
 blake3 = { workspace = true }
 serde = { workspace = true }
-toml = { workspace = true }
-proptest = { workspace = true, optional = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
 serde_json = { workspace = true }
 
 [lints]

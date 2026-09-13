@@ -5,9 +5,9 @@
 use es_core::StableId;
 use serde::{Deserialize, Serialize};
 
+use crate::canon::CanonWriter;
 use crate::codes;
 use crate::diag::Diagnostic;
-use crate::hash::CanonWriter;
 use crate::image::ImageSpec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
