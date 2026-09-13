@@ -24,6 +24,7 @@ es-sensor = { path = "crates/es-sensor" }
 es-env = { path = "crates/es-env" }
 es-safety = { path = "crates/es-safety" }
 es-compile = { path = "crates/es-compile" }
+es-runtime-embedded = { path = "crates/es-runtime-embedded" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"

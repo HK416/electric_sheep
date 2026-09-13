@@ -27,6 +27,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("es-policy", 8),
     ("es-safety", 8),
     ("es-env", 9),
+    ("es-runtime-embedded", 9),
     ("es-data", 10),
     ("es-telemetry", 10),
     ("es-eval", 10),

@@ -9,9 +9,14 @@
 //! convention, the layouts, and what is still `unverified` against `LeRobot` (spec 7.7).
 #![forbid(unsafe_code)]
 
+pub mod bundle;
 pub mod exec;
 pub mod kernels;
 pub mod plan;
 
+pub use bundle::{
+    Bundle, BundleError, BundleHashes, BundleKind, BundleManifest, PolicyBundle,
+    BUNDLE_SCHEMA_VERSION,
+};
 pub use exec::{ExecError, Outputs, Tensor, TensorRef};
 pub use plan::{BufferDesc, BufferId, CpuPlan, Home, Op, PlanMode, Step};
