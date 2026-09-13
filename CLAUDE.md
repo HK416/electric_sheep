@@ -5,9 +5,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project status
 
 `docs/ARCHITECTURE.ko.md` (the v1.0 technical spec, ~3000 lines, in Korean) is the canonical
-source of truth; `docs/ARCHITECTURE.md` is its English translation. M0 (contracts) is
-complete and reviewed (`docs/reviews/M0.md`); M1 (vision vertical slice) is implemented for
-everything that runs without a GPU or network (`docs/reviews/M1.md`). Cargo workspace:
+source of truth; `docs/ARCHITECTURE.md` is its English translation. M0 (contracts), M1
+(vision vertical slice) and M2 (evaluation, batch domains, policy extension) are implemented
+and reviewed for everything that runs without a GPU or network (`docs/reviews/M0.md`,
+`M1.md`, `M2.md`; review follow-ups are `docs/packets/<M>/P-<M>-R<n>.md`). M3 work starts
+with the offline-verifiable waves (embedded no-std runtime, Safety Case evidence bundle,
+learning loop CLI, domain-gap diagnostics, 3DGS importer, editable graph editor). Cargo workspace:
 `xtask/` (verification entry point), `crates/es` (CLI), `es-editor`, and the library crates
 listed in the layering table below (`es-ir-types` at layer 2 holds the graph-agnostic IR
 types split out of `es-ir`). Work packets live in `docs/packets/<milestone>/`, design notes
