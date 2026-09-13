@@ -1,4 +1,4 @@
-<!-- Korean translation of docs/design/policy-bundle.md. The English file is the working copy; regenerate this when it changes. -->
+<!-- Korean translation of docs/docs/design/policy-bundle.ko.md. The English file is the working copy; regenerate this when it changes. -->
 
 # `policy.esb` — 배포 번들 포맷
 
@@ -52,7 +52,14 @@ then the payloads, concatenated, in the same order.
 **읽기는 악의적 입력에 안전하다.** 모든 길이 값이 파일에서 나오므로, 리더는 범위를 벗어나
 슬라이싱하는 대신 `Truncated`를 반환하는 커서다; 이름은 반드시 UTF-8이어야 한다; 중복되거나
 순서가 어긋난 이름은 `Unsorted`가 된다; 그리고 모든 페이로드의 `blake3`가 반환되기 전에
-검증된다. 비트 하나만 뒤집혀도 열기에 실패한다.
+검증된다. 비트 하나만 뒤집혀도 열기에 실패한다. `entry_count`와 각 `name_len`은 사용되기 전에
+`MAX_ENTRIES` / `MAX_NAME_LEN`(각각 4096)과 대조 검사된다 — 10억 개의 엔트리나 기가바이트
+단위의 이름을 주장하는 헤더는 신뢰할 수 없는 입력의 힘을 빌려 긴 루프를 돌거나 큰 할당을 하는
+대신 `TooManyEntries` / `NameTooLong`이 된다 — 그리고 길이나 오프셋에 대한 모든 산술 연산
+(`Cursor::take`의 `checked_add`, `read`와 `write` 양쪽의 `u32`/`u64` 변환)은 패닉하는 대신
+실패 시 `BundleError`를 반환하는 체크된 연산이다. 마지막 페이로드 이후 남은 바이트는
+`TrailingBytes { extra }`가 된다: 앞서 말한 "주어진 엔트리 집합에 대한 레이아웃은 유일하다"라는
+주장은 남는 바이트가 조용히 무시되지 않고 거부될 때만 성립한다.
 
 `ESB1`의 `1`은 매니페스트의 `schema_version`이 아니라 *컨테이너 세대(container generation)*다.
 향후 호환되지 않는 레이아웃은 새로운 매직 값을 받아, 오래된 리더가 잘못 해석하는 대신 명확하게
@@ -123,13 +130,76 @@ observation plan을 컴파일하고, 체크포인트를 `WeightsRef::hash`와 �
 담은 `BundleError::HashMismatch { slot }`가 되며, 이는 spec 27.1의 `revalidation_trigger`가
 기술되는 단위이기도 하다.
 
+`open`은 이 모든 작업에 앞서, 매니페스트의 `hashes` 안에서 `task`, `observation`, `learning`,
+`deployment`, `compiler`가 모두 존재하는지(`Some`인지) 확인한다 — 그렇지 않다면 처음으로 없는
+슬롯의 이름을 담은 `BundleError::MissingHash { slot }`가 된다. 이 검사가 존재하기 전에는, 이
+슬롯들 중 하나를 `None`으로 남긴 매니페스트가 그 슬롯에 대한 spec 5.3 검사를 전혀 거치지 않고
+열렸으며, 이는 잘못된 해시보다 더 큰 구멍이다: `want.is_some() && want != got`은 "주장되지
+않음"과 "정확하게 주장됨"을 동일하게 취급한다. `policy`, `runtime`, `dataset`은 선택 사항으로
+남는다 — `policy`는 `open`이 이미 수행하는 직접적인 `weights` blake3 검사와 중복이며,
+`runtime`/`dataset`은 설계상 모든 `Policy` 번들에 없다(4절).
+
+### 컴파일된 plan이 번들 안에 없는 이유
+
+`CpuPlan`은 `Serialize`가 아니다 — 확정된 버퍼 위치, 아레나(arena) 레이아웃, 그리고 살아있는
+`TemporalWindow` 링 상태를 담고 있으며 — 이를 직렬화하면 컴파일러의 내부 표현이 배포 산출물에
+그대로 얼어붙게 되는데, 이는 spec 25.3이 원하지 않는 것이다. 그래서 번들은 Observation IR을
+저장하고 `PolicyBundle::compile_plan`이 로드 시점에 plan을 다시 빌드한다. 이 재구축의 건전성을
+보장하는 것은 `compiler` 해시다: `CpuPlan::compiler_hash`는 크레이트 버전, plan 모드, 커널 id
+테이블을 포함하므로, 다른 수치 결과를 낳을 재구축은 실행되기 전에 열기부터 실패한다. 배포 번들은
+항상 `PlanMode::Release`(`BUNDLE_PLAN_MODE`)로 컴파일되며, 이 모드는 `compiler_hash` 안에
+포함되어 있으므로 조용한 차이가 될 수 없다.
+
+## 6. `es-runtime-embedded`
+
+spec 9.6은 구성 요소를 나열하고 있으며, 이 크레이트는 그것들을 조합할 뿐 아무것도 더하지 않는다:
+
+```
+compiled observation plan   es-compile   (spec 7, spec 11.3)
+policy runtime              es-policy    (spec 2.4, one Box<dyn PolicyRuntime>)
+Safety Plane                es-safety    (spec 9, whole)
+telemetry ring              here         (see below)
+```
+
+`EmbeddedRuntime::from_bundle`가 **유일한** 생성자이며 항상 `SafetyPlane`을 만든다; `tick`은
+오직 플레인만 만들어 낼 수 있는 `SafeAction`을 반환한다(`INV-12`, `INV-13`).
+`SafetyPlane::from_ir`은 또한 관절 수가 `NJ`가 아니거나 액션 호라이즌이 `H`가 아닌 번들을
+거부하는 역할도 한다.
+
+### 재계획 주기 (spec 8.6)
+
+`rate.control / rate.inference` 컨트롤 틱마다 추론 한 번, `action.execute_chunk`로 상한이
+걸린다 — K를 넘어선 행은 명령이 아니라 예측이다(spec 8.5). 이 비율은 두 유리수 `TickRate`로부터
+정확히 계산된다; `XIR-023`이 이미 `PolicyContract::replanning_hz`와 일치하는지 검사했으므로,
+누적될 부동소수점 주기는 없다(spec 3.4). 재계획 사이에는 버퍼링된 청크가 다시 제출되고 플레인이
+자신의 커서를 전진시킨다.
+
+### 실패는 청크이지, 오류가 아니다
+
+누락된 센서 텐서, plan 오류, 추론 오류, 또는 형태(shape)가 잘못된 액션 텐서는 모두 **빈
+청크**를 만들어 낸다. 플레인은 이를 청크 언더런과 설정된 폴백으로 바꾼다. `tick`에 오류
+반환이 없는 이유는, 액션 없는 컨트롤 틱이란 존재하지 않기 때문이다.
+
+### 할당
+
+모든 크기는 `from_bundle`에서 정해진다. **reuse** 틱은 아무것도 할당하지 않는다 —
+`es_core::alloc_count::assert_no_alloc`으로 단언된다. **replan** 틱은 이 크레이트가 소유하지
+않는 정확히 두 곳에서 할당한다:
+
+1. `CpuPlan::run`은 호출마다 새로운 f32 아레나를 가져가며 `tick`은 그것을 위한 빌린(borrowed)
+   입력 맵을 만든다;
+2. `PolicyRuntime::infer`는 trait 경계다; 구현체가 자신의 버퍼를 소유한다.
+
+따라서 spec 9.6의 "zero heap allocation"은 플레인, 청크 버퍼, 텔레메트리 링에 의해 충족되며,
+이 두 경계는 M2의 작업이다.
+
 ### 텔레메트리 링
 
 `RingBuffer`는 `es_core::ring`(레이어 1)에 있다. `es_telemetry::ring`은 이를 재수출하고 이
 크레이트는 그것을 직접 쓰므로 여기에 중복된 링은 없다
 (`docs/packets/M1/W8-telemetry-transport.md` 참조).
 
-## 7. 알려진 한계
+ 알려진 한계
 
 - 서명 없음, 암호화 없음. `signature` 슬롯은 존재하지만 아무것도 채우지 않는다 (spec 25.1).
 - 압축 없음, 의도적으로 (2절 참고).

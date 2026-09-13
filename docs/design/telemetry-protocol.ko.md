@@ -1,4 +1,4 @@
-<!-- Korean translation of docs/design/telemetry-protocol.md. The English file is the working copy; regenerate this when it changes. -->
+<!-- Korean translation of docs/docs/design/telemetry-protocol.ko.md. The English file is the working copy; regenerate this when it changes. -->
 
 # 텔레메트리 프로토콜 — 와이어 형식과 M1 루프백 트랜스포트
 
@@ -72,6 +72,27 @@ TCP 연결 하나가 세션 하나다. 핸드셰이크 이후 관계는 비대�
 회신하고 클라이언트를 등록하지 않은 채 연결을 닫는다. `token`이 `None`일 때는 아무 검사도
 실행되지 않는다 — 이것이 로컬 개발 형태다(`es --check-deps`가 토큰이 설정되지 않은 로컬
 시뮬레이터에 대해 에디터를 실행하는 경우).
+
+비교 자체는 `String`에 대한 `PartialEq`가 아니라 `transport::ct_eq`이며, 조기 반환 없이
+`max(a.len(), b.len())` 바이트에 걸친 상수 시간 폴드(fold)다(`subtle` 의존성 없이 — 다섯
+줄): 순진한 `!=` 비교는 처음 다른 바이트에서 멈추는데, 이는 타이밍을 통해 추측한 토큰이 얼마나
+맞았는지를 유출시킨다. 길이 불일치는 `!=`로 조기 종료되는 대신 같은 누산기에 미리 접어 넣어진다.
+
+토큰 검사 앞에는 두 가지 자원 제한이 더 있으며, 둘 다 `Server::bind_with(addr, token, cfg:
+ServerConfig)` 위에 있다(`Server::bind`는 이를 `ServerConfig::default()`로 호출한다):
+
+- **핸드셰이크 타임아웃** (`ServerConfig::handshake_timeout`, 기본값 `HANDSHAKE_TIMEOUT =
+  5s`): 서버가 `Hello`를 읽기 전에 `TcpStream::set_read_timeout`으로 적용되므로, 연결한 뒤
+  아무것도 보내지 않는 피어는 서버 스레드를 영원히 붙잡아 두는 대신 타임아웃이 지나면
+  버려진다. 성공적인 `Hello` 읽기 직후 해제되어(`set_read_timeout(None)`), 세션의 이후
+  읽기(`Subscribe` 루프)는 연결이 살아있는 동안 정상적으로 블록된다.
+- **연결 상한** (`ServerConfig::max_clients`, 기본값 `DEFAULT_MAX_CLIENTS = 64`): 버전/토큰
+  검사 이후(그래서 잘못된 토큰은 여전히 자신만의 `Bye` 사유를 받는다) 그리고 등록 전에
+  검사된다. (기본값 기준) 65번째 동시 클라이언트는 `Bye { reason: "too many clients" }`를
+  받고 클라이언트 맵에 결코 추가되지 않는다. ponytail: 검사와 등록 삽입은 하나의 원자적
+  단계가 아니므로, 정확히 그 경계에서 도착한 두 연결이 둘 다 등록 전에 검사를 통과할 수 있다
+  — 이 루프백 shim에는 받아들일 만하다; 정확한 상한이 필요하다면 "검사와 삽입"에 걸쳐 하나의
+  뮤텍스를 유지해야 한다.
 
 **이것이 아닌 것**: 토큰은 JSON 본문 안에 평문으로 전달되며, 채널 암호화는 존재하지 않는다.
 같은 사용자가 소유한 프로세스 간 `127.0.0.1`(spec 25.1의 기본 바인드)에서는 문제가 없지만,
