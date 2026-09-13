@@ -1,0 +1,10 @@
+{
+  "name": "crop_8x6_at_2_1_4x4",
+  "dtype": "f32",
+  "layout": "row-major, little-endian, tightly packed",
+  "shape": [3, 4, 4],
+  "kernel": "crop.v1",
+  "pins": "origin top-left (OpenCV, spec 3.1); pairs with ImageSpec::cropped for the intrinsics",
+  "generator": "cargo test -p es-compile --test gen_goldens -- --ignored",
+  "spec": "docs/design/observation-lowering.md"
+}

@@ -12,6 +12,7 @@ es-ir = { workspace = true }
 es-assets = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+half = "2"
 
 [dev-dependencies]
 proptest = { workspace = true }

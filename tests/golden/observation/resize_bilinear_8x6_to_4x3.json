@@ -1,0 +1,10 @@
+{
+  "name": "resize_bilinear_8x6_to_4x3",
+  "dtype": "f32",
+  "layout": "row-major, little-endian, tightly packed",
+  "shape": [3, 3, 4],
+  "kernel": "resize_bilinear.v1",
+  "pins": "half-pixel centres, align_corners=false, no antialias, PyTorch's tap association",
+  "generator": "cargo test -p es-compile --test gen_goldens -- --ignored",
+  "spec": "docs/design/observation-lowering.md"
+}
