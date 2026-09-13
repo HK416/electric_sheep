@@ -12,12 +12,27 @@ project venv. `crates/es-policy/src/lerobot.rs` implements exactly this file;
 `crates/es-policy/tests/act_checkpoint.rs` is the oracle that keeps the two honest (spec §1.4).
 
 The checkpoint is never committed. It is downloaded into `target/lerobot-cache/` and the test
-finds it through `ES_ACT_CHECKPOINT`:
+finds it through `ES_ACT_CHECKPOINT`. **INV-16**: `allow_patterns` keeps any `.bin`/`.pt`/
+`.ckpt`/`.pkl` (pickle) off disk even if one is added upstream, `revision` pins the exact commit
+this file was verified against, and the assertion after the download is a second, independent
+check of the same invariant:
 
 ```
-python -c "from huggingface_hub import snapshot_download; \
-  snapshot_download('lerobot/act_aloha_sim_transfer_cube_human', \
-    local_dir='target/lerobot-cache/act_aloha_sim_transfer_cube_human')"
+python -c "
+from pathlib import Path
+from huggingface_hub import snapshot_download
+
+REVISION = 'ba73b2766f1371cdc133ca4efb97eb090d744625'  # resolved via HfApi().model_info(...).sha
+
+path = snapshot_download(
+    'lerobot/act_aloha_sim_transfer_cube_human',
+    revision=REVISION,
+    allow_patterns=['*.safetensors', '*.json'],
+    local_dir='target/lerobot-cache/act_aloha_sim_transfer_cube_human',
+)
+banned = [p for pat in ('*.bin', '*.pt', '*.ckpt', '*.pkl') for p in Path(path).rglob(pat)]
+assert not banned, f'pickle-loadable file(s) in snapshot: {banned}'
+"
 ```
 
 ## 1. What `select_action` actually is at 0.6.1

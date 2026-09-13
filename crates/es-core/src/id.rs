@@ -82,8 +82,10 @@ mod tests {
         let a = StableId::from_path("robot/arm/joint_1");
         assert_eq!(a, StableId::from_path("robot/arm/joint_1"));
         assert_ne!(a, StableId::from_path("robot/arm/joint_2"));
-        // Pinned: a change here breaks every hash chain downstream (§5.3).
-        assert_eq!(a.to_string().len(), 32);
+        // Golden vector, mirrored in `python/es/selfcheck.py` (S-14): a change here breaks
+        // every hash chain downstream (§5.3) *and* silently desyncs the Python builder's
+        // reimplementation, so both sides pin the same hex literal.
+        assert_eq!(a.to_string(), "6d2e29e8077ed3c571f21602d29c7145");
     }
 
     #[test]
