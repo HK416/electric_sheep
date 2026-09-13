@@ -1,0 +1,364 @@
+{
+  "name": "violation_rate",
+  "spec": "spec 9.4 EnvelopeViolationRate - the spec 10.3 metric crosses its bound",
+  "deployment": {
+    "schema_version": 1,
+    "robot": {
+      "name": "w5-rig",
+      "target": {
+        "simulated": {
+          "scene": "scenes/w5.usd"
+        }
+      },
+      "n_joints": 3
+    },
+    "action": {
+      "space": "joint_position",
+      "dim": 3,
+      "horizon": 4,
+      "execute_chunk": 3
+    },
+    "safety": {
+      "position": [
+        {
+          "lower": -0.1,
+          "upper": 0.1
+        },
+        {
+          "lower": -0.1,
+          "upper": 0.1
+        },
+        {
+          "lower": -0.1,
+          "upper": 0.1
+        }
+      ],
+      "position_soft_margin": [
+        0.05,
+        0.05,
+        0.05
+      ],
+      "velocity_max": [
+        1000.0,
+        1000.0,
+        1000.0
+      ],
+      "acceleration_max": [
+        100000.0,
+        100000.0,
+        100000.0
+      ],
+      "torque_max": [
+        1000.0,
+        1000.0,
+        1000.0
+      ],
+      "jerk_max": null,
+      "action_rate": {
+        "first_diff_max": [
+          10.0,
+          10.0,
+          10.0
+        ],
+        "second_diff_max": [
+          20.0,
+          20.0,
+          20.0
+        ]
+      },
+      "workspace": {
+        "box": {
+          "min": [
+            -1000.0,
+            -1000.0,
+            -1000.0
+          ],
+          "max": [
+            1000.0,
+            1000.0,
+            1000.0
+          ]
+        }
+      },
+      "ee_velocity_max": 100.0,
+      "min_self_distance": 0.01,
+      "min_env_distance": 0.01,
+      "contact_force_max": 200.0
+    },
+    "execution": "receding_horizon",
+    "deadlines": {
+      "observation_age": 100000,
+      "inference_budget": 50000,
+      "actuation_budget": 5000
+    },
+    "watchdogs": [
+      "chunk_underrun",
+      {
+        "envelope_violation_rate": {
+          "window": 4,
+          "max_frac": 0.5
+        }
+      }
+    ],
+    "fallback": "hold_position",
+    "rate": {
+      "control": {
+        "num": 100,
+        "den": 1
+      },
+      "inference": {
+        "num": 10,
+        "den": 1
+      }
+    }
+  },
+  "steps": [
+    {
+      "tick": 0,
+      "obs_age_us": 1000,
+      "chunk": {
+        "actions": [
+          [
+            0.01,
+            0.01,
+            0.01
+          ],
+          [
+            0.01,
+            0.01,
+            0.01
+          ],
+          [
+            0.01,
+            0.01,
+            0.01
+          ],
+          [
+            0.01,
+            0.01,
+            0.01
+          ]
+        ],
+        "valid": 4
+      },
+      "expect": {
+        "source": "policy",
+        "events": [],
+        "q": [
+          0.01,
+          0.01,
+          0.01
+        ]
+      }
+    },
+    {
+      "tick": 1,
+      "obs_age_us": 1000,
+      "chunk": {
+        "actions": [
+          [
+            0.02,
+            0.02,
+            0.02
+          ],
+          [
+            0.02,
+            0.02,
+            0.02
+          ],
+          [
+            0.02,
+            0.02,
+            0.02
+          ],
+          [
+            0.02,
+            0.02,
+            0.02
+          ]
+        ],
+        "valid": 4
+      },
+      "expect": {
+        "source": "policy",
+        "events": [],
+        "q": [
+          0.02,
+          0.02,
+          0.02
+        ]
+      }
+    },
+    {
+      "tick": 2,
+      "obs_age_us": 1000,
+      "chunk": {
+        "actions": [
+          [
+            1.0,
+            1.0,
+            1.0
+          ],
+          [
+            1.0,
+            1.0,
+            1.0
+          ],
+          [
+            1.0,
+            1.0,
+            1.0
+          ],
+          [
+            1.0,
+            1.0,
+            1.0
+          ]
+        ],
+        "valid": 4
+      },
+      "expect": {
+        "source": "clamped",
+        "events": [
+          "position"
+        ],
+        "q": [
+          0.05,
+          0.05,
+          0.05
+        ]
+      }
+    },
+    {
+      "tick": 3,
+      "obs_age_us": 1000,
+      "chunk": {
+        "actions": [
+          [
+            1.1,
+            1.1,
+            1.1
+          ],
+          [
+            1.1,
+            1.1,
+            1.1
+          ],
+          [
+            1.1,
+            1.1,
+            1.1
+          ],
+          [
+            1.1,
+            1.1,
+            1.1
+          ]
+        ],
+        "valid": 4
+      },
+      "expect": {
+        "source": "clamped",
+        "events": [
+          "position"
+        ],
+        "q": [
+          0.05,
+          0.05,
+          0.05
+        ]
+      }
+    },
+    {
+      "tick": 4,
+      "obs_age_us": 1000,
+      "chunk": {
+        "actions": [
+          [
+            1.2,
+            1.2,
+            1.2
+          ],
+          [
+            1.2,
+            1.2,
+            1.2
+          ],
+          [
+            1.2,
+            1.2,
+            1.2
+          ],
+          [
+            1.2,
+            1.2,
+            1.2
+          ]
+        ],
+        "valid": 4
+      },
+      "expect": {
+        "source": "clamped",
+        "events": [
+          "position"
+        ],
+        "q": [
+          0.05,
+          0.05,
+          0.05
+        ]
+      }
+    },
+    {
+      "tick": 5,
+      "obs_age_us": 1000,
+      "chunk": {
+        "actions": [
+          [
+            1.3,
+            1.3,
+            1.3
+          ],
+          [
+            1.3,
+            1.3,
+            1.3
+          ],
+          [
+            1.3,
+            1.3,
+            1.3
+          ],
+          [
+            1.3,
+            1.3,
+            1.3
+          ]
+        ],
+        "valid": 4
+      },
+      "expect": {
+        "source": {
+          "fallback": "hold_position"
+        },
+        "events": [
+          "violation_rate"
+        ],
+        "q": [
+          0.05,
+          0.05,
+          0.05
+        ]
+      }
+    }
+  ],
+  "expect_counters": {
+    "steps": 6,
+    "clamped_steps": 3,
+    "fallback_activations": 1,
+    "violations": {
+      "position": 3,
+      "violation_rate": 1
+    }
+  }
+}

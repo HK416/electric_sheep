@@ -15,6 +15,9 @@ thiserror = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 serde_json = { workspace = true }
+# Installs es-core's allocation counter for this crate's tests (P17), so `properties.rs` can
+# assert that `validate` never touches the heap after construction (spec 9.6).
+es-core = { workspace = true, features = ["alloc-count"] }
 
 [lints]
 workspace = true
