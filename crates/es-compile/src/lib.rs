@@ -12,6 +12,7 @@
 pub mod budget;
 pub mod bundle;
 pub mod exec;
+pub mod gpu;
 pub mod kernels;
 pub mod plan;
 
@@ -24,4 +25,5 @@ pub use bundle::{
     BUNDLE_SCHEMA_VERSION,
 };
 pub use exec::{ExecError, Outputs, Tensor, TensorRef};
+pub use gpu::{GpuPlan, GpuRunError, KernelKey};
 pub use plan::{BufferDesc, BufferId, CpuPlan, Home, Op, PlanMode, Step};

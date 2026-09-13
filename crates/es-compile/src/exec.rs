@@ -12,7 +12,8 @@ use crate::kernels;
 use crate::plan::{BufferId, CpuPlan, Home, Op};
 
 /// Element width in bytes. `Bool` is one byte, as in every tensor library.
-fn width(dtype: ElemType) -> usize {
+// `pub(crate)` for `crate::gpu::exec`, which validates the same inputs before uploading them.
+pub(crate) fn width(dtype: ElemType) -> usize {
     match dtype {
         ElemType::F64 => 8,
         ElemType::F32 | ElemType::I32 => 4,
@@ -254,7 +255,9 @@ impl CpuPlan {
     }
 }
 
-fn read_input<'a>(
+// `pub(crate)` for `crate::gpu::exec`: the GPU path must reject a mismatched input with the
+// same `ExecError` the CPU path does, not a different one.
+pub(crate) fn read_input<'a>(
     inputs: &BTreeMap<String, TensorRef<'a>>,
     name: &str,
     dtype: ElemType,

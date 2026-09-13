@@ -293,23 +293,49 @@ arena는 aliasing되지 않는다.** 이 CPU 레퍼런스 경로에는 fusion이
 바꿔야 하며, 그것이 소스가 아니라 id들이 해시되는 이유이자, 새 커널이
 삽입되지 않고 항상 뒤에 추가되는 이유다.
 
-## 11. GPU lowering (미룸) — 각 커널이 어떻게 미러링될 것인가
+## 11. GPU lowering (완료) - 각 커널이 어떻게 미러링되는가
 
-지금 적어 두는 이유는 CPU 커널들이 GPU가 따라올 수 없는 모양으로 만들어지지
-않게 하기 위해서다.
+`GpuPlan::compile`(`crates/es-compile/src/gpu/`)은 `CpuPlan::compile`을 실행한 뒤
+그것을 미러링한다: 같은 위상 정렬, 같은 버퍼 테이블, 노드당 같은 커널. 두 번째
+컴파일러가 아니므로 두 경로가 *결정*을 달리해서 갈라질 수는 없다. 계산이 달라질
+수만 있고, 그것이 `tests/observation_gpu.rs`가 측정하는 것이다.
 
-| 커널 | GPU 형태 |
-|---|---|
-| `resize_bilinear` / `_nearest` | 출력 픽셀당 스레드 하나; f32로 동일한 인덱스 산술. 텍스처 샘플러는 **사용하지 않는다**: 그 필터링 정밀도는 벤더마다 다르게 정의된다. |
-| `crop` | 소비자 안으로 인덱스 오프셋으로 융합됨 |
-| `srgb_to_linear` | 원소별, `es-math/slang/approx.slang`의 `approx::exp`/`ln` (같은 계수). LUT는 텍스처가 아니라 256개 항목의 uniform 버퍼가 된다. |
-| `normalize` | 원소별, 위와 하나의 커널로 융합됨 |
-| `cast` | 원소별; f16은 RTE를 사용하는 SPIR-V `Float16` capability를 통해 |
-| `concat` / `stack` | 복사, 또는 producer들을 목적지의 서브 범위로 계획하여 없앰 |
-| `history_push` / `window_gather` | ring은 device 메모리에 있음; gather는 인덱스 리맵 |
+커널은 `crates/es-compile/slang/observation.slang`에 있고, 커널 id당 진입점 하나이며
+전적으로 `-D` 정의(dtype, 채널, 크기, 버퍼 오프셋)로 특수화된다. 따라서 파이프라인은
+`(커널 id, 정의)`의 순수 함수다.
 
-Fusion 경계 (spec 11.4): 리덕션, shape 변경, sensor 읽기, 그리고 — 디버그
-모드에서는 — 모든 노드 경계.
+| 커널 | GPU 형태 | 측정값 |
+|---|---|---|
+| `cast_u8_hwc_to_f32_chw` | 출력 원소당 스레드 하나, 같은 `ch/y/x` 분해, `float(byte) / 255.0` | CPU 커널 및 `dequantize_8x6_rgb`와 비트 일치 |
+| `resize_bilinear` | 출력 픽셀당 스레드 하나, section 4의 인덱스 산술과 PyTorch의 결합 순서를 그대로. 텍스처 샘플러는 **사용하지 않는다**: 그 필터링 정밀도는 벤더마다 다르게 정의된다 | 골든 크기에서, 그리고 17x17 이하 무작위 크기 쌍 50/50에서 비트 일치, 최대 0 ULP |
+| `resize_nearest` | 동일, `min((uint)(scale * d), S - 1)` | CPU 커널과 비트 일치 |
+| `crop` | 자체 디스패치, 평면당 인덱스 오프셋. 소비자로 융합하지 않는다: 디버그 모드는 노드 경계를 유지하고(section 10) 융합은 이후 패킷이다 | `crop_8x6_at_2_1_4x4`와 비트 일치 |
+| `srgb_to_linear` | 하나의 id 뒤에 진입점 둘: `srgb_to_linear_u8`은 LUT를 인덱싱하고, `srgb_to_linear`는 `es-math/slang/approx.slang`으로 EOTF를 평가한다. LUT는 `kernels::srgb_to_linear_lut()`에서 업로드한 256개 항목 **storage** 버퍼다 - CPU 자신의 바이트이지 재유도가 아니며, 텍스처도 아니다 | LUT 경로는 사이드카의 7 ULP 이내(CPU 커널이 f64 공식과 갖는 거리 그 자체), 원소별 경로는 CPU 커널과 비트 일치, 0 ULP |
+| `normalize_mean_std` / `normalize_range` | 원소별; mean/std는 LUT와 같은 `aux` 버퍼에 실리고, `lo`/`hi`는 정의 안에 f32 **비트 패턴**으로 들어간다(십진 왕복이 두 번 반올림하지 못하도록). `crop`과 같은 이유로 producer와 융합하지 않는다 | `normalize_imagenet_4x3`과 비트 일치 |
+| `concat` / `stack` | 입력당 디스패치 하나, 그 입력의 `outer x chunk` 원소를 고정된 슬롯으로 복사. producer로 없애지 않는다: 그것이 융합이다. Slang 진입점은 `concat_copy` / `stack_copy`이고(`concat`과 `stack`은 Slang 코어 모듈이 차지한다) 커널 id는 `concat.v1` / `stack.v1` 그대로다 | CPU 커널과 비트 일치 |
+| `history_push` / `window_gather` | ring은 device 메모리에 있고 `run` 사이에 유지된다. `cursor`/`pushed`는 run마다 업로드되는 작은 `state` 버퍼에 실린다. 파이프라인의 정의는 컴파일 타임이고 커서는 아니기 때문이다. `window_gather`는 인덱스 리맵 | `history_window_n2_s1`과 비트 일치; `GpuPlan::reset`은 `CpuPlan::reset`과 동일 |
+| `cast_f32_to_f16` / `_bf16` | 원소별, `half` 크레이트의 round-to-nearest-even을 정수 연산으로 미러링. 좁힌 **비트**는 f16 버퍼가 아니라 `uint` 영역으로 간다: 디바이스를 16비트 스토리지로 열지 않았고, 아레나는 f32를 유지해 spec 11.5의 노드별 뷰가 살아남는다 | CPU 커널과 비트 일치 |
+
+바인딩 다섯 개가 모든 커널을 담당한다 - `arena`(f32 중간값 + f32 입력), `words`(u8
+입력, 이어서 좁힌 출력 비트), `aux`(LUT + normalize 통계), `rings`, `state` - 그래서
+디스크립터 레이아웃 하나가 계획 전체를 덮고 모든 버퍼 오프셋이 정의가 될 수 있다.
+
+결정성(spec 3.4): execution mode는 `Capabilities::deterministic_execution_modes()`에서
+온다 - capability 질의에서 유도한 *컴파일* 입력이지 디바이스 설정이 아니다 - 그리고
+`es_gpu::apply_exec_modes`가 float 연산에 `NoContraction`을 붙인다. 그것이 없으면
+리사이즈의 `scale * (d + 0.5) - 0.5`가 fma가 되어 마지막 비트가 움직인다. 단일 큐,
+`run`당 제출 한 번, 디스패치 사이 전체 배리어, 원자 연산·공유 메모리·서브그룹 연산
+없음, 워크그룹 수에 대한 의존 없음. 아레나 전체를 `run`마다 다시 업로드하므로 한
+계획의 두 실행이 달라질 경로 자체가 없다.
+
+`GpuPlan::compiler_hash()` = CPU 계획의 해시(크레이트 버전, 계획 모드, 커널 id) +
+파이프라인마다의 SPIR-V 콘텐츠 해시. 그래서 커널 id가 움직이지 않아도 `.slang` 파일을
+고치면 해시가 바뀐다(spec 3.4 항목 7). 문서화된 유일한 차이는 비정규수다: 결정적
+execution mode가 디바이스에서 이를 0으로 flush하지만 CPU 커널은 그러지 않는다.
+
+Fusion 경계 (spec 11.4): 리덕션, shape 변경, sensor 읽기, 그리고 - 디버그 모드에서는 -
+모든 노드 경계. **융합은 아직 구현하지 않았다.** 두 모드 모두에서 모든 노드가 자기
+디스패치를 갖는다. CPU 계획이 모든 노드를 자기 스텝으로 유지하는 것과 같다(section 10).
 
 ## 12. LeRobot에 대해 무엇이 `unverified`인가
 

@@ -272,22 +272,53 @@ table, in order). It fills the `compiler` slot of `execution_hash` (spec 5.3, sp
 changing a kernel's numerics must change it, which is why the ids — not the source — are
 hashed and why a new kernel is appended, never inserted.
 
-## 11. GPU lowering (deferred) — how each kernel will mirror
+## 11. GPU lowering (delivered) - how each kernel mirrors
 
-Written down now so the CPU kernels are not shaped in a way the GPU cannot follow.
+`GpuPlan::compile` (`crates/es-compile/src/gpu/`) runs `CpuPlan::compile` and mirrors it:
+the same topological order, the same buffer table, the same kernel per node. It is not a
+second compiler, so the two paths cannot drift apart by *deciding* differently - only by
+computing differently, which is what `tests/observation_gpu.rs` measures.
 
-| kernel | GPU form |
-|---|---|
-| `resize_bilinear` / `_nearest` | one thread per output pixel; identical index arithmetic in f32. Texture samplers are **not** used: their filtering precision is vendor-defined. |
-| `crop` | fused into the consumer as an index offset |
-| `srgb_to_linear` | element-wise, `approx::exp`/`ln` from `es-math/slang/approx.slang` (same coefficients). The LUT becomes a 256-entry uniform buffer, not a texture. |
-| `normalize` | element-wise, fuses with the above into one kernel |
-| `cast` | element-wise; f16 through the SPIR-V `Float16` capability with RTE |
-| `concat` / `stack` | copy, or elided by planning the producers into the destination's sub-ranges |
-| `history_push` / `window_gather` | the ring lives in device memory; gather is an index remap |
+Kernels: `crates/es-compile/slang/observation.slang`, one entry point per kernel id,
+specialised entirely by `-D` defines (dtype, channels, sizes and buffer offsets). A pipeline
+is therefore a pure function of `(kernel id, defines)`: two resizes to the same size share
+one, two to different sizes do not.
 
-Fusion boundary (spec 11.4): reductions, shape changes, sensor reads, and — in debug mode —
-every node boundary.
+| kernel | GPU form | measured |
+|---|---|---|
+| `cast_u8_hwc_to_f32_chw` | one thread per output element, same `ch/y/x` decomposition, `float(byte) / 255.0` | bit-equal to the CPU kernel and to `dequantize_8x6_rgb` |
+| `resize_bilinear` | one thread per output pixel, the section 4 index arithmetic and PyTorch's association verbatim. Texture samplers are **not** used: their filtering precision is vendor-defined | bit-equal at the golden size and on 50/50 random `(source, target)` pairs up to 17x17, worst 0 ULP |
+| `resize_nearest` | same, `min((uint)(scale * d), S - 1)` | bit-equal to the CPU kernel |
+| `crop` | its own dispatch, an index offset per plane. Not fused into the consumer: debug mode keeps node boundaries (section 10), and fusion is a later packet | bit-equal to `crop_8x6_at_2_1_4x4` |
+| `srgb_to_linear` | two entry points behind one id: `srgb_to_linear_u8` indexes the LUT, `srgb_to_linear` evaluates the EOTF through `es-math/slang/approx.slang`. The LUT is a 256-entry **storage** buffer uploaded from `kernels::srgb_to_linear_lut()` - the CPU's own bytes, not a re-derivation, and not a texture | LUT path within the sidecar's 7 ULP of the golden (the CPU kernel's own distance from the f64 formula); elementwise path bit-equal to the CPU kernel, 0 ULP |
+| `normalize_mean_std` / `normalize_range` | element-wise; mean/std ride in the same `aux` buffer as the LUT, `lo`/`hi` are f32 **bit patterns** in the defines so a decimal round-trip cannot round twice. Not fused with its producer, for the reason `crop` is not | bit-equal to `normalize_imagenet_4x3` |
+| `concat` / `stack` | one dispatch per input, copying that input's `outer x chunk` elements into its fixed slot. Not elided into the producers: that is fusion. The Slang entries are `concat_copy` / `stack_copy` - `concat` and `stack` are taken by the Slang core module - while the kernel ids stay `concat.v1` / `stack.v1` | bit-equal to the CPU kernel |
+| `history_push` / `window_gather` | the rings live in device memory and survive across `run`s; `cursor`/`pushed` ride in a small `state` buffer uploaded per run, because a pipeline's defines are compile-time and a cursor is not. `window_gather` is an index remap | bit-equal to `history_window_n2_s1`; `GpuPlan::reset` equals `CpuPlan::reset` |
+| `cast_f32_to_f16` / `_bf16` | element-wise, the `half` crate's round-to-nearest-even mirrored in integer ops. The narrowed **bits** go to a `uint` region, not an f16 buffer: the device is not opened with 16-bit storage, and the arena keeps the f32 so spec 11.5's per-node view survives | bit-equal to the CPU kernel |
+
+Five bindings serve every kernel - `arena` (f32 intermediates + f32 inputs), `words` (u8
+inputs, then narrowed output bits), `aux` (LUT + normalize statistics), `rings`, `state` -
+so one descriptor layout covers the whole plan and every buffer offset can be a define.
+
+Determinism (spec 3.4): the execution modes come from
+`Capabilities::deterministic_execution_modes()` - a *compile* input derived from the
+capability query, never a device setting - and `es_gpu::apply_exec_modes` patches
+`NoContraction` onto the float arithmetic, without which the resize's
+`scale * (d + 0.5) - 0.5` becomes an fma and the last bits move. One queue, one submission
+per `run`, a full barrier between dispatches, no atomics, no shared memory, no subgroup
+operations, no dependence on the workgroup count. The whole arena is re-uploaded each `run`
+rather than patched, which removes the only way two runs of one plan could differ.
+
+`GpuPlan::compiler_hash()` = the CPU plan's hash (crate version, plan mode, kernel ids) plus
+every pipeline's SPIR-V content hash, so editing a `.slang` file moves it even when no kernel
+id did (spec 3.4 item 7). Denormals are the one documented divergence: the deterministic
+execution modes flush them to zero on the device and the CPU kernels do not.
+
+Fusion boundary (spec 11.4): reductions, shape changes, sensor reads, and - in debug mode -
+every node boundary. **No fusion is implemented yet**; every node is its own dispatch in both
+modes, exactly as the CPU plan keeps every node its own step (section 10). Release-mode
+fusion and arena aliasing are a packet of their own, and they are what `PlanMode` reaching
+the hash is there to protect.
 
 ## 12. What is `unverified` against LeRobot
 
