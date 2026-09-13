@@ -750,20 +750,40 @@ pub struct CellResult {
 }
 
 /// A metric aggregates either to a number or, for `failure_mode_histogram`, to counts per
-/// failure cause (spec 10.3).
+/// failure cause (spec 10.3). `Unavailable` is not a fabricated `0.0`: `es-eval` uses it for a
+/// metric this runtime never measured, carrying why.
+///
+/// Adding this variant does not disturb the wire format of the other two: `MetricValue` has no
+/// explicit `#[serde(tag = ...)]`, so it round-trips through serde's default externally tagged
+/// representation (`{"scalar": 0.92}`, `{"histogram": {...}}`) and old JSON with only those two
+/// keys still parses.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MetricValue {
     Scalar(f64),
     Histogram(BTreeMap<String, u64>),
+    Unavailable { reason: String },
 }
 
-/// One acceptance line's verdict.
+/// One acceptance line's verdict (spec 10.2). `Unavailable` is not a pass: a metric this
+/// runtime never measured has no `observed` value to invent one for.
+///
+/// `#[serde(untagged)]` rather than the enum default: `Determined`'s three fields are exactly
+/// what this type used to be as a bare struct (`{criterion, observed, passed}`), so untagged
+/// deserialization matches old `report.json` files against `Determined` with no wrapping tag
+/// and no change to their wire shape.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct AcceptanceResult {
-    pub criterion: AcceptanceCriterion,
-    pub observed: f64,
-    pub passed: bool,
+#[serde(untagged)]
+pub enum AcceptanceResult {
+    Determined {
+        criterion: AcceptanceCriterion,
+        observed: f64,
+        passed: bool,
+    },
+    Unavailable {
+        metric: MetricSpec,
+        reason: String,
+    },
 }
 
 /// `report.json` of spec 10.5, and the content of `evaluation.lock`.
@@ -1149,12 +1169,26 @@ mod tests {
                     ),
                     n_episodes: 100,
                 },
+                CellResult {
+                    suite: "nominal".into(),
+                    metric: MetricSpec::CollisionRate,
+                    value: MetricValue::Unavailable {
+                        reason: "PhysicsBackend reports no contacts in this build".into(),
+                    },
+                    n_episodes: 100,
+                },
             ],
-            acceptance: vec![AcceptanceResult {
-                criterion: fixture().acceptance[0].clone(),
-                observed: 0.92,
-                passed: true,
-            }],
+            acceptance: vec![
+                AcceptanceResult::Determined {
+                    criterion: fixture().acceptance[0].clone(),
+                    observed: 0.92,
+                    passed: true,
+                },
+                AcceptanceResult::Unavailable {
+                    metric: MetricSpec::CollisionRate,
+                    reason: "PhysicsBackend reports no contacts in this build".into(),
+                },
+            ],
             passed: true,
             episodes: vec!["episodes/nominal_0007.esr".into()],
         };

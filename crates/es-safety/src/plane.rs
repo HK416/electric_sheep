@@ -187,8 +187,6 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
             let mut events = EventSet::EMPTY;
             events.insert(ViolationKind::EstopLatched);
             let q = self.scrub(self.state.last_safe);
-            // A latched step is still a fallback step (spec 9.4, spec 10.3).
-            self.counters.fallback_activations += 1;
             return self.finish(
                 q,
                 ActionSource::Fallback(FallbackKind::EmergencyStop),
@@ -260,7 +258,6 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
             if kind == FallbackKind::EmergencyStop {
                 self.state.estop_latched = true;
             }
-            self.counters.fallback_activations += 1;
             return self.finish(q, ActionSource::Fallback(kind), events);
         }
 
@@ -272,7 +269,6 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
         let source = if events.is_empty() {
             ActionSource::Policy
         } else {
-            self.counters.clamped_steps += 1;
             ActionSource::Clamped
         };
         self.finish(a, source, events)
@@ -428,6 +424,10 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
         for kind in events.iter() {
             self.counters.record(kind);
         }
+        self.counters.record_step(
+            matches!(source, ActionSource::Clamped),
+            matches!(source, ActionSource::Fallback(_)),
+        );
         self.counters.steps += 1;
         self.counters.window.push(!events.is_empty());
 

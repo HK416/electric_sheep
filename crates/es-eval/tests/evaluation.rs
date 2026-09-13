@@ -10,16 +10,16 @@ use es_assets::scene::SceneDesc;
 use es_compile::Tensor;
 use es_core::time::{PhysTick, TickRate};
 use es_core::{FailureKind, StableId};
-use es_eval::runner::Outcome;
-use es_eval::{EvalError, EvalReport, Evaluation, RunConfig};
+use es_eval::{EvalError, Evaluation, RunConfig};
 use es_ir::deployment::{
     ActionContract, ActionSpace as DepSpace, Deadlines, DeploymentIr, ExecutionMode,
     FallbackPolicy, Limit, Micros, RateLimit, RateSpec, RobotRef, RobotTarget, SafetyEnvelope,
     Watchdog, WatchdogSet, Workspace,
 };
 use es_ir::evaluation::{
-    AcceptanceCriterion, Aggregation, AugmentationPolicy, Comparator, EpisodeBatch, EvaluationIr,
-    MetricSpec, Perturbation, PerturbationKind, PerturbationSuite, Range, ReplayPolicy, SeedPlan,
+    AcceptanceCriterion, AcceptanceResult, Aggregation, AugmentationPolicy, Comparator,
+    EpisodeBatch, EvaluationIr, EvaluationReport, MetricSpec, Perturbation, PerturbationKind,
+    PerturbationSuite, Range, ReplayPolicy, SeedPlan,
 };
 use es_ir::graph::{NodeId, PortRef};
 use es_ir::learning::LearningGraph;
@@ -569,7 +569,11 @@ fn basic_metrics() -> Vec<MetricSpec> {
 
 // --- Driver -------------------------------------------------------------------------------
 
-fn run_with(ir: &EvaluationIr, obs_augment: bool, target: f64) -> Result<EvalReport, EvalError> {
+fn run_with(
+    ir: &EvaluationIr,
+    obs_augment: bool,
+    target: f64,
+) -> Result<EvaluationReport, EvalError> {
     let task = task_ir();
     let obs = observation_ir(task.task_hash().expect("task hashes"), obs_augment);
     let deploy = deployment_ir();
@@ -587,7 +591,7 @@ fn run_with(ir: &EvaluationIr, obs_augment: bool, target: f64) -> Result<EvalRep
     .map(|(report, _lock)| report)
 }
 
-fn run_ok(ir: &EvaluationIr) -> EvalReport {
+fn run_ok(ir: &EvaluationIr) -> EvaluationReport {
     run_with(ir, false, 0.2).expect("the fixture evaluation runs")
 }
 
@@ -597,12 +601,11 @@ fn run_ok(ir: &EvaluationIr) -> EvalReport {
 fn the_report_has_one_cell_per_suite_and_metric() {
     let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
     let report = run_ok(&ir);
-    assert_eq!(report.report.cells.len(), 2 * basic_metrics().len());
+    assert_eq!(report.cells.len(), 2 * basic_metrics().len());
     for suite in ["nominal", "actuator_noise"] {
         for metric in basic_metrics() {
             assert!(
                 report
-                    .report
                     .cells
                     .iter()
                     .any(|c| c.suite == suite && c.metric == metric),
@@ -612,11 +615,7 @@ fn the_report_has_one_cell_per_suite_and_metric() {
         }
     }
     assert!(
-        report
-            .report
-            .cells
-            .iter()
-            .all(|c| c.n_episodes == N_EPISODES),
+        report.cells.iter().all(|c| c.n_episodes == N_EPISODES),
         "every episode of the cell must contribute"
     );
 }
@@ -633,7 +632,7 @@ fn two_runs_produce_byte_identical_reports() {
 fn changing_the_seed_changes_at_least_one_metric() {
     let a = run_ok(&evaluation_ir(1, basic_metrics(), Vec::new()));
     let b = run_ok(&evaluation_ir(999, basic_metrics(), Vec::new()));
-    assert_ne!(a.report.cells, b.report.cells);
+    assert_ne!(a.cells, b.cells);
 }
 
 #[test]
@@ -663,7 +662,7 @@ fn artifacts_land_where_the_spec_says() {
     assert_eq!(lock.seeds.len(), N_EPISODES as usize);
     assert_eq!(lock.backend.name, "fake");
     assert!(
-        report.report.episodes.is_empty(),
+        report.episodes.is_empty(),
         "episodes/ replay is a later packet and must not be claimed"
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -683,30 +682,28 @@ fn an_unavailable_metric_never_passes_acceptance() {
     let report = run_ok(&evaluation_ir(20_260_912, metrics, acceptance));
 
     let verdict = report
-        .verdicts
+        .acceptance
         .iter()
-        .find(|v| v.criterion.metric == MetricSpec::CollisionRate)
+        .find(|a| match a {
+            AcceptanceResult::Unavailable { metric, .. } => *metric == MetricSpec::CollisionRate,
+            AcceptanceResult::Determined { criterion, .. } => {
+                criterion.metric == MetricSpec::CollisionRate
+            }
+        })
         .expect("the criterion is judged");
+    // `AcceptanceResult::Unavailable` has no `observed` field to fabricate a measurement in.
     assert!(
-        matches!(verdict.outcome, Outcome::Unavailable { .. }),
-        "an unmeasured metric is Unavailable, not a pass: {:?}",
-        verdict.outcome
+        matches!(verdict, AcceptanceResult::Unavailable { .. }),
+        "an unmeasured metric is Unavailable, not a pass: {verdict:?}"
     );
-    assert!(!report.report.passed, "Unavailable must not pass the run");
+    assert!(!report.passed, "Unavailable must not pass the run");
     assert!(
         report
-            .unmeasured
+            .cells
             .iter()
-            .any(|u| u.metric == MetricSpec::CollisionRate),
-        "the reason must be recorded"
-    );
-    assert!(
-        !report
-            .report
-            .acceptance
-            .iter()
-            .any(|a| a.criterion.metric == MetricSpec::CollisionRate),
-        "no fabricated `observed` for an unmeasured metric"
+            .any(|c| c.metric == MetricSpec::CollisionRate
+                && matches!(c.value, es_ir::evaluation::MetricValue::Unavailable { .. })),
+        "the reason must be recorded on the cell"
     );
 }
 
@@ -729,8 +726,7 @@ fn an_allow_listed_augment_node_runs() {
     };
     // The plan has no Augment kernel yet, so this must fail in the compiler, not in INV-15.
     match run_with(&ir, true, 0.2) {
-        Ok(_) => {}
-        Err(EvalError::Plan(_)) => {}
+        Ok(_) | Err(EvalError::Plan(_)) => {}
         Err(other) => panic!("the allow-list was not honoured: {other}"),
     }
 }
@@ -770,15 +766,15 @@ fn the_envelope_violation_rate_rises_when_the_policy_leaves_the_envelope() {
     );
 }
 
-fn rate_of(report: &EvalReport) -> f64 {
+fn rate_of(report: &EvaluationReport) -> f64 {
     report
-        .report
         .cells
         .iter()
         .find(|c| c.suite == "nominal" && c.metric == MetricSpec::EnvelopeViolationRate)
         .and_then(|c| match c.value {
             es_ir::evaluation::MetricValue::Scalar(v) => Some(v),
-            es_ir::evaluation::MetricValue::Histogram(_) => None,
+            es_ir::evaluation::MetricValue::Histogram(_)
+            | es_ir::evaluation::MetricValue::Unavailable { .. } => None,
         })
         .expect("the metric is measured")
 }
@@ -791,7 +787,6 @@ fn a_perturbed_suite_differs_from_nominal() {
     let report = run_ok(&ir);
     let of = |suite: &str| -> Vec<es_ir::evaluation::MetricValue> {
         report
-            .report
             .cells
             .iter()
             .filter(|c| c.suite == suite)

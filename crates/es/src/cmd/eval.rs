@@ -50,7 +50,7 @@ fn samples_of(raw: &serde_json::Value, idx: usize) -> Option<Vec<f64>> {
 fn scalar(v: &MetricValue) -> Option<f64> {
     match v {
         MetricValue::Scalar(x) => Some(*x),
-        MetricValue::Histogram(_) => None,
+        MetricValue::Histogram(_) | MetricValue::Unavailable { .. } => None,
     }
 }
 
@@ -58,6 +58,7 @@ fn value_repr(v: &MetricValue) -> String {
     match v {
         MetricValue::Scalar(x) => format!("{x:.6}"),
         MetricValue::Histogram(h) => format!("{h:?}"),
+        MetricValue::Unavailable { reason } => format!("unavailable ({reason})"),
     }
 }
 

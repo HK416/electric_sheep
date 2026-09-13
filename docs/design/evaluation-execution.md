@@ -180,11 +180,15 @@ Two notes on the definitions.
 - **`envelope_violation_rate` is cumulative over the cell, not the watchdog's window.**
   `SafetyCounters::envelope_violation_rate()` is the sliding fraction the §9.4 rate
   watchdog reads; the §10.3 metric is the whole-cell rate, so it is computed from the
-  cumulative counters instead. `clamped_steps` and `fallback_activations` are counted on
-  different branches of `validate`; the sum is capped at `steps` so a future branch that
-  increments both cannot produce a rate above 1. **ceiling:** if the plane ever grows a
-  step that is both clamped and a fallback, this under-reports by the overlap; the fix is a
-  single `dirty_steps` counter in `es-safety`, which is a one-line change there.
+  cumulative counters instead: `counters.dirty_steps / counters.steps`.
+  **Answered (M2 W1b).** `clamped_steps` and `fallback_activations` used to be counted on
+  different branches of `validate`, summed and capped at `steps`; a future branch that
+  incremented both would have under-reported by the overlap. `SafetyCounters::record_step`
+  (called once from `SafetyPlane::finish`, the single tail every `validate` path returns
+  through) now sets `clamped_steps` and/or `fallback_activations` and increments
+  `dirty_steps` by at most one regardless of how many of the two are true, so the metric is
+  exact even for a step that is both at once — see
+  `es_safety::counters::tests::a_step_that_is_both_clamped_and_a_fallback_counts_once`.
 - **No `step/s`.** The performance row is the nine metrics of §12.4 and nothing else.
 
 Aggregation across episodes is `Aggregation::{Mean, Min, Max, P95}` over a `Vec<f64>`
@@ -202,24 +206,24 @@ suite, §10.2) and yields one `Verdict`:
 - `Pass { observed }` / `Fail { observed }` when the metric was measured,
 - `Unavailable { reason }` when it was not.
 
-**`Unavailable` is not a pass.** `EvalReport::passed` is true only when every verdict is
-`Pass`. This is the part of the schema that does not fit `es-ir`'s
-`AcceptanceResult { criterion, observed: f64, passed: bool }`: there is no way to say
-"not measured" in an `f64`, and writing `observed: 0.0, passed: false` invents a
-measurement. So `es-eval` owns `Verdict` and `report.json` is `EvalReport`, which embeds
-the §10.5 `EvaluationReport` (carrying only the measured cells and the resolvable
-acceptance lines) and adds `unmeasured` and `verdicts`.
+**`Unavailable` is not a pass.** `EvaluationReport::passed` is true only when every
+`AcceptanceResult` is `Determined { passed: true, .. }`.
 
-> **Reviewer question.** The clean fix is `MetricValue::Unavailable` and an
-> `AcceptanceResult::Unavailable` variant in `es_ir::evaluation`, which would delete
-> `EvalReport` and let `run` return `EvaluationReport` directly. That is an `es-ir` change
-> and out of this packet's scope.
+> **Answered (M2 W1b).** `es_ir::evaluation` now has `MetricValue::Unavailable { reason }`
+> and `AcceptanceResult::Unavailable { metric, reason }` (the latter turned `AcceptanceResult`
+> from a bare struct into an enum, `#[serde(untagged)]` so the old `{criterion, observed,
+> passed}` shape still round-trips as the `Determined` variant). `run` returns
+> `(EvaluationReport, EvaluationLock)` directly; the `EvalReport` wrapper, `Unmeasured`,
+> `Verdict` and `Outcome` are gone from `es-eval` — every declared metric gets one
+> `CellResult` (measured or `MetricValue::Unavailable`) and every acceptance line one
+> `AcceptanceResult` (`Determined` or `Unavailable`), so there is nothing left for a wrapper
+> to add.
 
 ## 6. Artifacts (§10.5)
 
 ```
 write_artifacts(&report, &lock, dir)
-  → report.json        EvalReport: cells x suites, unmeasured, verdicts
+  → report.json        es_ir::evaluation::EvaluationReport, written as-is (§10.5)
   → evaluation.lock    evaluation_hash + execution_hash + seeds + backend capabilities
 ```
 
@@ -231,23 +235,29 @@ empty, not populated with paths to files that do not exist.
 ### `report.json`
 
 ```jsonc
-{
-  "report": {                       // es_ir::evaluation::EvaluationReport, §10.5
-    "schema_version": 1,
-    "evaluation_hash": [32 bytes],
-    "execution_hash":  [32 bytes],
-    "cells":      [ { "suite": "nominal", "metric": "success_rate",
-                      "value": { "scalar": 0.92 }, "n_episodes": 100 } ],
-    "acceptance": [ { "criterion": {...}, "observed": 0.92, "passed": true } ],
-    "passed": false,
-    "episodes": []
-  },
-  "unmeasured": [ { "suite": "nominal", "metric": "collision_rate",
-                    "reason": "no contact reporting in this backend" } ],
-  "verdicts":   [ { "criterion": {...}, "suite": "nominal",
-                    "outcome": { "pass": { "observed": 0.92 } } } ]
+{                                    // es_ir::evaluation::EvaluationReport, §10.5
+  "schema_version": 1,
+  "evaluation_hash": [32 bytes],
+  "execution_hash":  [32 bytes],
+  "cells": [
+    { "suite": "nominal", "metric": "success_rate",
+      "value": { "scalar": 0.92 }, "n_episodes": 100 },
+    { "suite": "nominal", "metric": "collision_rate",
+      "value": { "unavailable": { "reason": "no contact reporting in this backend" } },
+      "n_episodes": 100 }
+  ],
+  "acceptance": [
+    { "criterion": {...}, "observed": 0.92, "passed": true },
+    { "metric": "collision_rate", "reason": "no contact reporting in this backend" }
+  ],
+  "passed": false,
+  "episodes": []
 }
 ```
+
+The two `acceptance` shapes are `AcceptanceResult::Determined` and `::Unavailable`; the
+enum is `#[serde(untagged)]`, so which one a line is is read off which fields it has, not
+a tag.
 
 ### `evaluation.lock`
 

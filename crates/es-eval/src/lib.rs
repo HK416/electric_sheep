@@ -9,7 +9,7 @@
 //!   changing the policy cannot change the perturbation sequence (§10.4);
 //! * a `PerturbationKind` this build cannot realise is [`EvalError::Unsupported`] naming it,
 //!   never silently skipped;
-//! * a metric nobody measured is [`Unavailable`](metrics::Measured::Unavailable) carrying a
+//! * a metric nobody measured is `es_ir::evaluation::MetricValue::Unavailable` carrying a
 //!   reason, never a fabricated `0.0`;
 //! * augmentation stays off (INV-15): an `Augment` node outside the allow-list is
 //!   [`EvalError::AugmentationEnabled`], and the graph is never rewritten to get past it.
@@ -18,12 +18,9 @@ pub mod metrics;
 pub mod perturb;
 pub mod runner;
 
-pub use metrics::{compute, Measured};
+pub use metrics::compute;
 pub use perturb::{PerturbationPlan, ResetOverrides, StepState};
-pub use runner::{
-    write_artifacts, BackendCaps, EvalReport, Evaluation, EvaluationLock, Outcome, RunConfig,
-    Unmeasured, Verdict,
-};
+pub use runner::{write_artifacts, BackendCaps, Evaluation, EvaluationLock, RunConfig};
 
 /// Everything that stops an evaluation from producing a report.
 ///

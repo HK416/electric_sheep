@@ -1,7 +1,7 @@
 //! Metric computation (§10.3) and the §12.4 performance set.
 //!
 //! The rule that shapes this module: **nothing is invented**. A metric this runtime does not
-//! measure is [`Measured::Unavailable`] carrying the reason, never `0.0`. A zero in the
+//! measure is [`MetricValue::Unavailable`] carrying the reason, never `0.0`. A zero in the
 //! §10.1 table reads as "the policy never collided"; the truth is that nothing counted
 //! collisions, and the two must not be confusable.
 
@@ -12,28 +12,9 @@ use es_env::{EnvMetrics, Episode, Termination};
 use es_ir::evaluation::{Aggregation, MetricSpec, MetricValue};
 use es_safety::{SafetyCounters, ViolationKind};
 
-/// A metric value, or the reason there is none.
-///
-/// `es_ir::evaluation::MetricValue` has no `Unavailable` variant, so this wraps it; see
-/// `docs/design/evaluation-execution.md` section 5 for the reviewer question about moving the
-/// variant into the IR.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Measured {
-    Value(MetricValue),
-    Unavailable(&'static str),
-}
-
-impl Measured {
-    fn scalar(v: f64) -> Self {
-        Self::Value(MetricValue::Scalar(v))
-    }
-
-    /// The number, when there is one and it is a scalar.
-    pub fn as_scalar(&self) -> Option<f64> {
-        match self {
-            Self::Value(MetricValue::Scalar(v)) => Some(*v),
-            _ => None,
-        }
+fn unavailable(reason: &str) -> MetricValue {
+    MetricValue::Unavailable {
+        reason: reason.to_owned(),
     }
 }
 
@@ -46,49 +27,43 @@ pub fn compute(
     episodes: &[Episode],
     counters: &SafetyCounters,
     env: &EnvMetrics,
-) -> Measured {
+) -> MetricValue {
     match spec {
-        MetricSpec::SuccessRate => per_episode(spec, episodes).map_or(
-            Measured::Unavailable("no episode finished in this cell"),
-            |v| Measured::scalar(mean(&v)),
+        MetricSpec::SuccessRate => per_episode(spec, episodes).map_or_else(
+            || unavailable("no episode finished in this cell"),
+            |v| MetricValue::Scalar(mean(&v)),
         ),
         MetricSpec::EpisodeLength | MetricSpec::ActionSmoothness => per_episode(spec, episodes)
-            .map_or(
-                Measured::Unavailable("no episode finished in this cell"),
-                |v| Measured::scalar(mean(&v)),
+            .map_or_else(
+                || unavailable("no episode finished in this cell"),
+                |v| MetricValue::Scalar(mean(&v)),
             ),
         // §9.3 / §10.3: the fraction of steps the plane clamped, projected or fell back on,
         // over the whole cell. `SafetyCounters::envelope_violation_rate` is the *sliding*
         // fraction the §9.4 rate watchdog reads, which is a different question.
         MetricSpec::EnvelopeViolationRate => {
             if counters.steps == 0 {
-                return Measured::Unavailable("the Safety Plane validated no step");
+                return unavailable("the Safety Plane validated no step");
             }
-            let dirty = counters
-                .clamped_steps
-                .saturating_add(counters.fallback_activations)
-                .min(counters.steps);
-            Measured::scalar(dirty as f64 / counters.steps as f64)
+            MetricValue::Scalar(counters.dirty_steps as f64 / counters.steps as f64)
         }
         MetricSpec::ChunkUnderrunRate => {
             if counters.steps == 0 {
-                Measured::Unavailable("the Safety Plane validated no step")
+                unavailable("the Safety Plane validated no step")
             } else {
-                Measured::scalar(counters.chunk_underrun_rate())
+                MetricValue::Scalar(counters.chunk_underrun_rate())
             }
         }
-        MetricSpec::FailureModeHistogram => Measured::Value(MetricValue::Histogram(
-            failure_histogram(episodes, counters),
-        )),
+        MetricSpec::FailureModeHistogram => {
+            MetricValue::Histogram(failure_histogram(episodes, counters))
+        }
         MetricSpec::InterventionRate => {
-            Measured::Unavailable("human intervention is a hardware/HIL signal (§24.2)")
+            unavailable("human intervention is a hardware/HIL signal (§24.2)")
         }
         MetricSpec::CollisionRate => {
-            Measured::Unavailable("PhysicsBackend reports no contacts in this build")
+            unavailable("PhysicsBackend reports no contacts in this build")
         }
-        MetricSpec::DomainGap => {
-            Measured::Unavailable("requires real-log replay (§24.3), not in this build")
-        }
+        MetricSpec::DomainGap => unavailable("requires real-log replay (§24.3), not in this build"),
         // §12.4: pass-through only. `EnvMetrics` is `Option` per field precisely so an
         // unmeasured throughput stays unmeasured all the way into the report.
         MetricSpec::PhysicsStepsPerSec => opt(env.physics_steps_per_sec),
@@ -103,10 +78,10 @@ pub fn compute(
     }
 }
 
-fn opt(v: Option<f64>) -> Measured {
-    v.map_or(
-        Measured::Unavailable("not instrumented in this build (§12.4)"),
-        Measured::scalar,
+fn opt(v: Option<f64>) -> MetricValue {
+    v.map_or_else(
+        || unavailable("not instrumented in this build (§12.4)"),
+        MetricValue::Scalar,
     )
 }
 

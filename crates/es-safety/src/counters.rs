@@ -81,6 +81,12 @@ pub struct SafetyCounters {
     pub steps: u64,
     /// Steps whose action the envelope changed (spec 9.3).
     pub clamped_steps: u64,
+    /// Steps whose emitted action differed from the raw policy action for any reason — clamp,
+    /// fallback, or (should a future branch ever do both to the same step) either at once.
+    /// [`Self::record_step`] increments this by at most one per step, so a step counted in both
+    /// `clamped_steps` and `fallback_activations` is still exactly one `dirty_steps`: the
+    /// denominator `es-eval`'s `envelope_violation_rate` metric wants (spec 9.3, spec 10.3).
+    pub dirty_steps: u64,
     pub(crate) window: ViolationWindow,
 }
 
@@ -91,6 +97,7 @@ impl SafetyCounters {
             fallback_activations: 0,
             steps: 0,
             clamped_steps: 0,
+            dirty_steps: 0,
             window: ViolationWindow::new(window),
         }
     }
@@ -101,6 +108,21 @@ impl SafetyCounters {
 
     pub(crate) fn record(&mut self, kind: ViolationKind) {
         self.violations[kind.index()] += 1;
+    }
+
+    /// Records one validated step's outcome. `clamped` and `fell_back` are not mutually
+    /// exclusive: `dirty_steps` counts the step once whether one or both are true, so it never
+    /// double-counts a step that both a clamp stage and a fallback touched.
+    pub(crate) fn record_step(&mut self, clamped: bool, fell_back: bool) {
+        if clamped {
+            self.clamped_steps += 1;
+        }
+        if fell_back {
+            self.fallback_activations += 1;
+        }
+        if clamped || fell_back {
+            self.dirty_steps += 1;
+        }
     }
 
     /// Fraction of steps in the sliding window the plane clamped, projected or fell back on
@@ -124,6 +146,7 @@ impl SafetyCounters {
         self.fallback_activations = 0;
         self.steps = 0;
         self.clamped_steps = 0;
+        self.dirty_steps = 0;
         self.window.clear();
     }
 }
@@ -164,5 +187,28 @@ mod tests {
         assert!(c.envelope_violation_rate() < 1e-12);
         assert!(c.chunk_underrun_rate() < 1e-12);
         assert_eq!(c.count(ViolationKind::Position), 0);
+    }
+
+    /// A step that is both clamped and a fallback (a case `SafetyPlane::validate` cannot
+    /// produce today, but might in a future branch, per the design note's "ceiling") still
+    /// counts as exactly one dirty step, not two.
+    #[test]
+    fn a_step_that_is_both_clamped_and_a_fallback_counts_once() {
+        let mut c = SafetyCounters::new(16);
+        c.record_step(true, true);
+        assert_eq!(c.clamped_steps, 1);
+        assert_eq!(c.fallback_activations, 1);
+        assert_eq!(c.dirty_steps, 1);
+    }
+
+    #[test]
+    fn clamp_only_and_fallback_only_each_count_one_dirty_step() {
+        let mut c = SafetyCounters::new(16);
+        c.record_step(true, false);
+        c.record_step(false, true);
+        c.record_step(false, false);
+        assert_eq!(c.clamped_steps, 1);
+        assert_eq!(c.fallback_activations, 1);
+        assert_eq!(c.dirty_steps, 2);
     }
 }

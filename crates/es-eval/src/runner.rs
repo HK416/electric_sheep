@@ -15,8 +15,7 @@ use es_env::scheduler::BatchDomains;
 use es_env::{Env, EnvMetrics, Episode};
 use es_ir::deployment::{DeploymentIr, ExecutionMode, Micros};
 use es_ir::evaluation::{
-    AcceptanceCriterion, AcceptanceResult, CellResult, EvaluationIr, EvaluationReport, MetricSpec,
-    MetricValue, SeedPlan,
+    AcceptanceResult, CellResult, EvaluationIr, EvaluationReport, MetricSpec, MetricValue, SeedPlan,
 };
 use es_ir::hash::{canonical_hash, DatasetHash, HardwareCapability, HashChain};
 use es_ir::observation::{ObservationIr, ObservationNode};
@@ -27,7 +26,7 @@ use es_policy::PolicyRuntime;
 use es_safety::{ActionChunk, SafetyPlane};
 use serde::{Deserialize, Serialize};
 
-use crate::metrics::{self, Measured};
+use crate::metrics;
 use crate::perturb::{PerturbationPlan, ResetOverrides, StepState};
 use crate::{hex32, EvalError};
 
@@ -64,39 +63,6 @@ impl Default for RunConfig {
             hardware: HardwareCapability([0; 32]),
         }
     }
-}
-
-/// A metric a cell declared and this runtime could not measure. Never a `0.0`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Unmeasured {
-    pub suite: String,
-    pub metric: MetricSpec,
-    pub reason: String,
-}
-
-/// One acceptance line's verdict. `Unavailable` is **not** a pass.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Outcome {
-    Pass { observed: f64 },
-    Fail { observed: f64 },
-    Unavailable { reason: String },
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Verdict {
-    pub criterion: AcceptanceCriterion,
-    pub suite: String,
-    pub outcome: Outcome,
-}
-
-/// `report.json` (§10.5): the IR's own report plus what its schema cannot express.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct EvalReport {
-    pub schema_version: u32,
-    pub report: EvaluationReport,
-    pub unmeasured: Vec<Unmeasured>,
-    pub verdicts: Vec<Verdict>,
 }
 
 /// The backend half of `evaluation.lock`: what a re-run would have to match (§17.2).
@@ -147,7 +113,7 @@ impl Evaluation {
         deploy: &DeploymentIr,
         mut new_backend: F,
         cfg: &RunConfig,
-    ) -> Result<(EvalReport, EvaluationLock), EvalError>
+    ) -> Result<(EvaluationReport, EvaluationLock), EvalError>
     where
         B: PhysicsBackend,
         F: FnMut() -> B,
@@ -170,8 +136,7 @@ impl Evaluation {
         let mut perturbations: Option<PerturbationPlan> = None;
         let mut caps: Option<BackendCaps> = None;
         let mut cells: Vec<CellResult> = Vec::new();
-        let mut unmeasured: Vec<Unmeasured> = Vec::new();
-        let mut measured: BTreeMap<(String, MetricSpec), Measured> = BTreeMap::new();
+        let mut measured: BTreeMap<(String, MetricSpec), MetricValue> = BTreeMap::new();
         let mut samples: BTreeMap<(String, MetricSpec), Vec<f64>> = BTreeMap::new();
 
         for (cell, suite) in ir.suites.iter().enumerate() {
@@ -215,29 +180,15 @@ impl Evaluation {
                 safety.counters(),
                 &env_metrics,
                 &mut cells,
-                &mut unmeasured,
                 &mut measured,
                 &mut samples,
             );
         }
 
-        let verdicts = judge(ir, &measured, &samples);
-        let acceptance: Vec<AcceptanceResult> = verdicts
+        let acceptance = judge(ir, &measured, &samples);
+        let passed = acceptance
             .iter()
-            .filter_map(|v| match v.outcome {
-                Outcome::Pass { observed } => Some((v.criterion.clone(), observed, true)),
-                Outcome::Fail { observed } => Some((v.criterion.clone(), observed, false)),
-                Outcome::Unavailable { .. } => None,
-            })
-            .map(|(criterion, observed, passed)| AcceptanceResult {
-                criterion,
-                observed,
-                passed,
-            })
-            .collect();
-        let passed = verdicts
-            .iter()
-            .all(|v| matches!(v.outcome, Outcome::Pass { .. }));
+            .all(|a| matches!(a, AcceptanceResult::Determined { passed: true, .. }));
 
         let evaluation_hash = ir
             .evaluation_hash()
@@ -245,21 +196,16 @@ impl Evaluation {
         let chain = hash_chain(task, obs, deploy, evaluation_hash, &plan, policy, cfg)?;
         let execution_hash = chain.execution_hash();
 
-        let report = EvalReport {
+        let report = EvaluationReport {
             schema_version: SCHEMA_VERSION,
-            report: EvaluationReport {
-                schema_version: SCHEMA_VERSION,
-                evaluation_hash,
-                execution_hash,
-                cells,
-                acceptance,
-                passed,
-                // `report.html` and `episodes/` replay are a later packet; an empty list is
-                // honest, a list of paths to files nobody wrote is not.
-                episodes: Vec::new(),
-            },
-            unmeasured,
-            verdicts,
+            evaluation_hash,
+            execution_hash,
+            cells,
+            acceptance,
+            passed,
+            // `report.html` and `episodes/` replay are a later packet; an empty list is
+            // honest, a list of paths to files nobody wrote is not.
+            episodes: Vec::new(),
         };
         let lock = EvaluationLock {
             schema_version: SCHEMA_VERSION,
@@ -554,7 +500,8 @@ fn to_f64(t: &Tensor) -> Result<Vec<f64>, EvalError> {
     }
 }
 
-/// Computes every declared metric for one cell and files it as measured or unmeasured.
+/// Computes every declared metric for one cell. Every declared metric gets exactly one
+/// `CellResult`, measured or `MetricValue::Unavailable` — never a missing row.
 #[allow(clippy::too_many_arguments)]
 fn record_cell(
     ir: &EvaluationIr,
@@ -563,8 +510,7 @@ fn record_cell(
     counters: &es_safety::SafetyCounters,
     env_metrics: &EnvMetrics,
     cells: &mut Vec<CellResult>,
-    unmeasured: &mut Vec<Unmeasured>,
-    measured: &mut BTreeMap<(String, MetricSpec), Measured>,
+    measured: &mut BTreeMap<(String, MetricSpec), MetricValue>,
     samples: &mut BTreeMap<(String, MetricSpec), Vec<f64>>,
 ) {
     // `MetricSpec::ALL` order, not the document's, so the report is byte-stable whatever
@@ -574,19 +520,12 @@ fn record_cell(
             continue;
         }
         let value = metrics::compute(&metric, episodes, counters, env_metrics);
-        match &value {
-            Measured::Value(v) => cells.push(CellResult {
-                suite: suite.to_owned(),
-                metric,
-                value: v.clone(),
-                n_episodes: episodes.len() as u32,
-            }),
-            Measured::Unavailable(reason) => unmeasured.push(Unmeasured {
-                suite: suite.to_owned(),
-                metric,
-                reason: (*reason).to_owned(),
-            }),
-        }
+        cells.push(CellResult {
+            suite: suite.to_owned(),
+            metric,
+            value: value.clone(),
+            n_episodes: episodes.len() as u32,
+        });
         if let Some(v) = metrics::per_episode(&metric, episodes) {
             samples.insert((suite.to_owned(), metric), v);
         }
@@ -595,12 +534,12 @@ fn record_cell(
 }
 
 /// §10.2 acceptance. A criterion with no `suite` applies to every suite; a criterion whose
-/// metric was not measured is `Unavailable`, which is not a pass.
+/// metric was not measured is `AcceptanceResult::Unavailable`, which is not a pass.
 fn judge(
     ir: &EvaluationIr,
-    measured: &BTreeMap<(String, MetricSpec), Measured>,
+    measured: &BTreeMap<(String, MetricSpec), MetricValue>,
     samples: &BTreeMap<(String, MetricSpec), Vec<f64>>,
-) -> Vec<Verdict> {
+) -> Vec<AcceptanceResult> {
     let mut out = Vec::new();
     for c in &ir.acceptance {
         for suite in &ir.suites {
@@ -608,17 +547,17 @@ fn judge(
                 continue;
             }
             let key = (suite.name.clone(), c.metric);
-            let outcome = match measured.get(&key) {
-                None => Outcome::Unavailable {
-                    reason: "the suite did not declare this metric".to_owned(),
-                },
-                Some(Measured::Unavailable(reason)) => Outcome::Unavailable {
-                    reason: (*reason).to_owned(),
-                },
-                Some(Measured::Value(MetricValue::Histogram(_))) => Outcome::Unavailable {
-                    reason: "a histogram has no scalar to compare against a threshold".to_owned(),
-                },
-                Some(Measured::Value(MetricValue::Scalar(cell))) => {
+            let unavailable = |reason: String| AcceptanceResult::Unavailable {
+                metric: c.metric,
+                reason,
+            };
+            let result = match measured.get(&key) {
+                None => unavailable("the suite did not declare this metric".to_owned()),
+                Some(MetricValue::Unavailable { reason }) => unavailable(reason.clone()),
+                Some(MetricValue::Histogram(_)) => unavailable(
+                    "a histogram has no scalar to compare against a threshold".to_owned(),
+                ),
+                Some(MetricValue::Scalar(cell)) => {
                     // A metric with a per-episode sample honours the criterion's aggregation;
                     // one that only exists at cell level has the same value under every
                     // aggregation (design note section 4).
@@ -626,18 +565,14 @@ fn judge(
                         .get(&key)
                         .and_then(|v| metrics::aggregate(v, c.aggregation))
                         .unwrap_or(*cell);
-                    if c.comparator.holds(observed, c.threshold) {
-                        Outcome::Pass { observed }
-                    } else {
-                        Outcome::Fail { observed }
+                    AcceptanceResult::Determined {
+                        criterion: c.clone(),
+                        observed,
+                        passed: c.comparator.holds(observed, c.threshold),
                     }
                 }
             };
-            out.push(Verdict {
-                criterion: c.clone(),
-                suite: suite.name.clone(),
-                outcome,
-            });
+            out.push(result);
         }
     }
     out
@@ -675,7 +610,7 @@ fn hash_chain(
 
 /// §10.5. `report.html` and `episodes/` are a later packet, and this writes neither.
 pub fn write_artifacts(
-    report: &EvalReport,
+    report: &EvaluationReport,
     lock: &EvaluationLock,
     dir: &Path,
 ) -> Result<(), EvalError> {
