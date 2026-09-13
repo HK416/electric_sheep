@@ -6,8 +6,10 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+ash = { workspace = true }
 es-core = { workspace = true }
 es-math = { workspace = true }
+gpu-allocator = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
