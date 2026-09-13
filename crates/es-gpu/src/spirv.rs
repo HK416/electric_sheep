@@ -12,8 +12,17 @@
 //! instructions, and the logical layout (capabilities → extensions → memory model → entry
 //! points → execution modes → debug → annotations → types/functions) tells us where an
 //! insertion is legal.
+//!
+//! Hand-written SPIR-V is checked by [`validate_spirv`] (`spirv-val` from the Vulkan SDK)
+//! rather than trusted, because a header parse cannot tell a legal module from a plausible
+//! one.
+
+use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Once;
 
 use crate::caps::ExecModes;
+use crate::error::GpuError;
 
 const MAGIC: u32 = 0x0723_0203;
 const HEADER_WORDS: usize = 5;
@@ -35,9 +44,26 @@ const OP_GROUP_MEMBER_DECORATE: u16 = 75;
 pub const DECORATION_NO_CONTRACTION: u32 = 42;
 
 /// `ExecutionMode` values of `SPV_KHR_float_controls`.
+pub const EXEC_MODE_DENORM_PRESERVE: u32 = 4459;
 pub const EXEC_MODE_DENORM_FLUSH_TO_ZERO: u32 = 4460;
 pub const EXEC_MODE_SIGNED_ZERO_INF_NAN_PRESERVE: u32 = 4461;
 pub const EXEC_MODE_ROUNDING_MODE_RTE: u32 = 4462;
+pub const EXEC_MODE_ROUNDING_MODE_RTZ: u32 = 4463;
+
+/// The float width every mode this module adds applies to (spec §3.3: f32 only).
+const PATCH_WIDTH: u32 = 32;
+
+/// The mode that contradicts `mode` at the same width. A module declaring both is invalid
+/// SPIR-V, so the patcher refuses rather than producing one.
+fn conflicting_mode(mode: u32) -> Option<u32> {
+    match mode {
+        EXEC_MODE_DENORM_FLUSH_TO_ZERO => Some(EXEC_MODE_DENORM_PRESERVE),
+        EXEC_MODE_DENORM_PRESERVE => Some(EXEC_MODE_DENORM_FLUSH_TO_ZERO),
+        EXEC_MODE_ROUNDING_MODE_RTE => Some(EXEC_MODE_ROUNDING_MODE_RTZ),
+        EXEC_MODE_ROUNDING_MODE_RTZ => Some(EXEC_MODE_ROUNDING_MODE_RTE),
+        _ => None,
+    }
+}
 
 /// `Capability` values of `SPV_KHR_float_controls`.
 const CAP_DENORM_FLUSH_TO_ZERO: u32 = 4465;
@@ -182,18 +208,40 @@ pub fn spirv_entry_points(words: &[u32]) -> Vec<String> {
         .collect()
 }
 
+/// Every `OpExecutionMode <entry> <mode> <literal>` in the module, as `(entry, mode, width)`.
+///
+/// Restricted to the one-literal-operand form, which is what every `SPV_KHR_float_controls`
+/// mode uses; `LocalSize` and the other multi-operand modes carry a different word count and
+/// so can never be mistaken for one.
+fn declared_modes(words: &[u32], insts: &[Inst]) -> Vec<(u32, u32, u32)> {
+    insts
+        .iter()
+        .filter(|i| i.op == OP_EXECUTION_MODE && i.len == 4)
+        .map(|i| (words[i.start + 1], words[i.start + 2], words[i.start + 3]))
+        .collect()
+}
+
 /// Add the execution modes and decorations of `modes` to a compiled module (spec §3.4
 /// step 3).
 ///
-/// Idempotent: a mode already declared is not declared twice, and an instruction already
-/// carrying `NoContraction` is not decorated twice. Returns `None` if `words` is not a
-/// SPIR-V module with an entry point.
-pub fn apply_exec_modes(words: &[u32], modes: ExecModes) -> Option<Vec<u32>> {
-    let insts = instructions(words)?;
-    let entry = insts
+/// Applied to **every** `OpEntryPoint`, not just the first. Idempotent, and idempotent per
+/// `(entry point, mode, width)`: `DenormFlushToZero 16` does not suppress the requested
+/// `DenormFlushToZero 32`, and a mode already present on entry point A is still added to
+/// entry point B. `Err` if `words` is not a SPIR-V module with an entry point, or if an
+/// entry point already declares a mode that contradicts a requested one at the same width
+/// (`DenormPreserve 32` vs `DenormFlushToZero 32`) — declaring both is invalid SPIR-V, so
+/// the patcher refuses instead of emitting it.
+pub fn apply_exec_modes(words: &[u32], modes: ExecModes) -> Result<Vec<u32>, GpuError> {
+    let insts =
+        instructions(words).ok_or_else(|| GpuError::Spirv("not a SPIR-V module".to_owned()))?;
+    let entries: Vec<u32> = insts
         .iter()
-        .find(|i| i.op == OP_ENTRY_POINT && i.len >= 3)
-        .map(|i| words[i.start + 2])?;
+        .filter(|i| i.op == OP_ENTRY_POINT && i.len >= 3)
+        .map(|i| words[i.start + 2])
+        .collect();
+    if entries.is_empty() {
+        return Err(GpuError::Spirv("module has no entry point".to_owned()));
+    }
 
     // Section boundaries. The layout is fixed by the SPIR-V spec, so "after the last X" is
     // a legal insertion point for another X.
@@ -226,6 +274,7 @@ pub fn apply_exec_modes(words: &[u32], modes: ExecModes) -> Option<Vec<u32>> {
 
     let mut new_caps = Vec::new();
     let mut new_modes = Vec::new();
+    let declared = declared_modes(words, &insts);
     let has_cap = |c: u32| {
         insts
             .iter()
@@ -251,12 +300,24 @@ pub fn apply_exec_modes(words: &[u32], modes: ExecModes) -> Option<Vec<u32>> {
         if !want {
             continue;
         }
+        // Refuse before emitting anything, so a conflicting module is never half-patched.
+        for &e in &entries {
+            if let Some(other) = conflicting_mode(mode) {
+                if declared.contains(&(e, other, PATCH_WIDTH)) {
+                    return Err(GpuError::Spirv(format!(
+                        "entry point %{e} already declares execution mode {other} at width \
+                         {PATCH_WIDTH}; mode {mode} contradicts it"
+                    )));
+                }
+            }
+        }
         if !has_cap(cap) {
             new_caps.extend(inst(OP_CAPABILITY, &[cap]));
         }
-        if !spirv_has_execution_mode(words, mode) {
-            // Operand is the float width the mode applies to; f32 only (spec §3.3).
-            new_modes.extend(inst(OP_EXECUTION_MODE, &[entry, mode, 32]));
+        for &e in &entries {
+            if !declared.contains(&(e, mode, PATCH_WIDTH)) {
+                new_modes.extend(inst(OP_EXECUTION_MODE, &[e, mode, PATCH_WIDTH]));
+            }
         }
     }
 
@@ -305,7 +366,51 @@ pub fn apply_exec_modes(words: &[u32], modes: ExecModes) -> Option<Vec<u32>> {
     out.extend_from_slice(&words[em_end..dec_end]);
     out.extend_from_slice(&new_decorations);
     out.extend_from_slice(&words[dec_end..]);
-    Some(out)
+    Ok(out)
+}
+
+/// Counter for `spirv-val` scratch names, so concurrent validations never share a file.
+static VAL_COUNTER: AtomicU64 = AtomicU64::new(0);
+static VAL_MISSING_NOTE: Once = Once::new();
+
+/// Run `spirv-val` (Vulkan SDK) over a module.
+///
+/// `Ok(true)` — it ran and accepted the module. `Ok(false)` — it is not installed, so
+/// nothing was checked; a note is printed once per process. `Err` — it rejected the module,
+/// or it is missing and `ES_REQUIRE_SPIRV_VAL=1` says that is not acceptable. The executable
+/// is `spirv-val` on `PATH`, or `ES_SPIRV_VAL`.
+///
+/// This is the only thing in the crate that can catch a bad hand-written patch: `spirv.rs`
+/// writes SPIR-V, and a header parse only proves the word stream is well-formed.
+pub fn validate_spirv(words: &[u32]) -> Result<bool, GpuError> {
+    let exe = std::env::var("ES_SPIRV_VAL").unwrap_or_else(|_| "spirv-val".to_owned());
+    let n = VAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("es-spirv-val-{}-{n}.spv", std::process::id()));
+    let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    std::fs::write(&path, bytes)?;
+    let out = Command::new(&exe).arg(&path).output();
+    let _ = std::fs::remove_file(&path);
+    match out {
+        Ok(o) if o.status.success() => Ok(true),
+        Ok(o) => Err(GpuError::Spirv(format!(
+            "spirv-val rejected the module: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        ))),
+        Err(e) => {
+            if std::env::var("ES_REQUIRE_SPIRV_VAL").as_deref() == Ok("1") {
+                return Err(GpuError::Spirv(format!(
+                    "ES_REQUIRE_SPIRV_VAL=1 but `{exe}` did not run: {e}"
+                )));
+            }
+            VAL_MISSING_NOTE.call_once(|| {
+                println!(
+                    "NOTE spirv-val is not on PATH: patched SPIR-V is unvalidated (set \
+                     ES_REQUIRE_SPIRV_VAL=1 to make this an error)"
+                );
+            });
+            Ok(false)
+        }
+    }
 }
 
 /// Index of the first instruction that starts the type/constant section, for a module with
@@ -342,7 +447,8 @@ mod tests {
 
     /// Smallest module the patcher accepts: header, `OpCapability` Shader, memory model,
     /// entry point, `LocalSize`, one `OpFMul` in a function.
-    fn minimal_module() -> Vec<u32> {
+    /// `extra` adds float-control execution modes in the section SPIR-V's layout requires.
+    fn module_with_modes(extra: &[(u32, u32)]) -> Vec<u32> {
         let mut w = vec![MAGIC, 0x0001_0300, 0, 20, 0];
         w.extend(inst(OP_CAPABILITY, &[1])); // Shader
         w.extend(inst(OP_MEMORY_MODEL, &[0, 1]));
@@ -350,9 +456,16 @@ mod tests {
         entry.extend(literal_string("main"));
         w.extend(inst(OP_ENTRY_POINT, &entry));
         w.extend(inst(OP_EXECUTION_MODE, &[4, 17, 64, 1, 1])); // LocalSize
+        for (mode, width) in extra {
+            w.extend(inst(OP_EXECUTION_MODE, &[4, *mode, *width]));
+        }
         w.extend(inst(OP_DECORATE, &[9, 30])); // some unrelated decoration
         w.extend(inst(133, &[6, 7, 8, 8])); // OpFMul %6 %7 = %8 * %8
         w
+    }
+
+    fn minimal_module() -> Vec<u32> {
+        module_with_modes(&[])
     }
 
     #[test]
@@ -424,6 +537,79 @@ mod tests {
         assert_eq!(once, twice);
     }
 
+    /// Review `docs/reviews/M4.md` S-5: the old "already present?" test compared the mode
+    /// word only, so a mode declared for f16 suppressed the requested f32 one.
+    #[test]
+    fn a_mode_at_another_width_does_not_suppress_the_requested_one() {
+        let w = module_with_modes(&[(EXEC_MODE_DENORM_FLUSH_TO_ZERO, 16)]);
+        let p = apply_exec_modes(&w, ExecModes::deterministic()).unwrap();
+        let insts = instructions(&p).unwrap();
+        let widths: Vec<u32> = declared_modes(&p, &insts)
+            .into_iter()
+            .filter(|(_, mode, _)| *mode == EXEC_MODE_DENORM_FLUSH_TO_ZERO)
+            .map(|(_, _, width)| width)
+            .collect();
+        assert_eq!(
+            widths,
+            [16, 32],
+            "the f32 mode must be added next to the f16 one"
+        );
+    }
+
+    /// Two entry points: every mode lands on both, and the patch stays idempotent.
+    #[test]
+    fn every_entry_point_gets_every_mode() {
+        let mut w = vec![MAGIC, 0x0001_0300, 0, 20, 0];
+        w.extend(inst(OP_CAPABILITY, &[1]));
+        w.extend(inst(OP_MEMORY_MODEL, &[0, 1]));
+        for (id, name) in [(4u32, "main"), (5, "other")] {
+            let mut entry = vec![5, id];
+            entry.extend(literal_string(name));
+            w.extend(inst(OP_ENTRY_POINT, &entry));
+        }
+        w.extend(inst(OP_EXECUTION_MODE, &[4, 17, 64, 1, 1])); // LocalSize, three operands
+        w.extend(inst(133, &[6, 7, 8, 8])); // OpFMul
+
+        let p = apply_exec_modes(&w, ExecModes::deterministic()).unwrap();
+        assert_eq!(spirv_entry_points(&p), ["main", "other"]);
+        let insts = instructions(&p).unwrap();
+        let declared = declared_modes(&p, &insts);
+        for entry in [4, 5] {
+            for mode in [
+                EXEC_MODE_DENORM_FLUSH_TO_ZERO,
+                EXEC_MODE_ROUNDING_MODE_RTE,
+                EXEC_MODE_SIGNED_ZERO_INF_NAN_PRESERVE,
+            ] {
+                assert!(
+                    declared.contains(&(entry, mode, 32)),
+                    "entry %{entry} is missing mode {mode}"
+                );
+            }
+        }
+        assert_eq!(
+            apply_exec_modes(&p, ExecModes::deterministic()).unwrap(),
+            p,
+            "still idempotent with two entry points"
+        );
+    }
+
+    /// A contradiction is refused, not patched: `DenormPreserve 32` plus the requested
+    /// `DenormFlushToZero 32` would be invalid SPIR-V.
+    #[test]
+    fn patch_refuses_a_conflicting_mode_at_the_same_width() {
+        let w = module_with_modes(&[(EXEC_MODE_DENORM_PRESERVE, 32)]);
+        let err = apply_exec_modes(&w, ExecModes::deterministic()).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&EXEC_MODE_DENORM_PRESERVE.to_string()),
+            "unexpected error: {err}"
+        );
+
+        // The same mode at another width is not a conflict: f16 preserve, f32 flush.
+        let ok = module_with_modes(&[(EXEC_MODE_DENORM_PRESERVE, 16)]);
+        assert!(apply_exec_modes(&ok, ExecModes::deterministic()).is_ok());
+    }
+
     #[test]
     fn patch_with_no_modes_changes_nothing() {
         let m = minimal_module();
@@ -434,7 +620,8 @@ mod tests {
     fn patch_rejects_a_module_without_an_entry_point() {
         let mut w = vec![MAGIC, 0x0001_0300, 0, 20, 0];
         w.extend(inst(OP_CAPABILITY, &[1]));
-        assert!(apply_exec_modes(&w, ExecModes::deterministic()).is_none());
+        assert!(apply_exec_modes(&w, ExecModes::deterministic()).is_err());
+        assert!(apply_exec_modes(&[0, 0, 0], ExecModes::none()).is_err());
     }
 
     #[test]

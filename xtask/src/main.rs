@@ -7,8 +7,9 @@ mod nostd;
 mod scope;
 mod spec_refs;
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::{Command, ExitCode, Stdio};
 
 fn workspace_root() -> PathBuf {
     // xtask's own manifest dir is `<root>/xtask`; the workspace root is its parent.
@@ -27,6 +28,72 @@ fn run_cargo(root: &Path, args: &[&str]) -> bool {
         .is_ok_and(|s| s.success())
 }
 
+/// Words that mark a `SKIP` line as one of the GPU-dependent oracles (`es-gpu`, `es-render`,
+/// `es-compile`'s GPU lowering). Matched case-insensitively over the rest of the line.
+const GPU_SKIP_WORDS: [&str; 5] = ["gpu", "vulkan", "render", "slangc", "device"];
+
+/// Whether a captured line is a GPU oracle reporting that it did not run.
+///
+/// Pure, so xtask's own tests cover it without a GPU (review `docs/reviews/M4.md` S-7).
+fn is_gpu_skip(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("SKIP") else {
+        return false;
+    };
+    let rest = rest.to_ascii_lowercase();
+    GPU_SKIP_WORDS.iter().any(|w| rest.contains(w))
+}
+
+/// `cargo test --workspace` with `--nocapture`, forwarding the output and scanning it.
+///
+/// `--nocapture` is what makes the `SKIP` lines visible at all: without it a GPU-less
+/// machine prints nothing and reports `ok`. With `ES_REQUIRE_GPU=1` — a machine that claims
+/// a GPU — a GPU SKIP is a failure, the same way `nostd --require` turns a missing target
+/// into one. Unset (the PR runner, which has no GPU) it is only reported.
+fn run_tests(root: &Path) -> bool {
+    let args = [
+        "test",
+        "--workspace",
+        "--features",
+        "es-ir/testing",
+        "--",
+        "--nocapture",
+    ];
+    println!("$ cargo {}", args.join(" "));
+    let mut child = match Command::new("cargo")
+        .args(args)
+        .current_dir(root)
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("cannot start `cargo test`: {e}");
+            return false;
+        }
+    };
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let mut skipped: Vec<String> = Vec::new();
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        println!("{line}");
+        if is_gpu_skip(&line) {
+            skipped.push(line);
+        }
+    }
+    if !child.wait().is_ok_and(|s| s.success()) {
+        return false;
+    }
+
+    let require = std::env::var("ES_REQUIRE_GPU").as_deref() == Ok("1");
+    for line in &skipped {
+        if require {
+            eprintln!("FAIL ES_REQUIRE_GPU=1 but a GPU oracle did not run: {line}");
+        } else {
+            println!("NOTE GPU oracle skipped (ES_REQUIRE_GPU unset): {line}");
+        }
+    }
+    !require || skipped.is_empty()
+}
+
 fn cmd_ci(root: &Path) -> bool {
     run_cargo(root, &["fmt", "--check"])
         && run_cargo(
@@ -40,10 +107,7 @@ fn cmd_ci(root: &Path) -> bool {
                 "warnings",
             ],
         )
-        && run_cargo(
-            root,
-            &["test", "--workspace", "--features", "es-ir/testing"],
-        )
+        && run_tests(root)
         && context_budget::run(&root.join("crates"))
         && layering::run(root)
         && nostd::run(root, false)
@@ -90,5 +154,36 @@ fn main() -> ExitCode {
         ExitCode::SUCCESS
     } else {
         ExitCode::FAILURE
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_gpu_skip;
+
+    #[test]
+    fn spots_the_gpu_oracles_reporting_that_they_did_not_run() {
+        for line in [
+            "SKIP tree_reduction: no Vulkan device (no Vulkan loader: ...)",
+            "SKIP execution_modes_are_present_in_the_spirv: no slangc (slangc not found)",
+            "SKIP path_traced_cornell_box_matches_the_golden: no GPU",
+            "SKIP render: no device",
+        ] {
+            assert!(is_gpu_skip(line), "missed: {line}");
+        }
+    }
+
+    #[test]
+    fn leaves_other_skips_and_other_lines_alone() {
+        for line in [
+            "SKIP nostd: target thumbv7em-none-eabihf not installed",
+            "SKIP: ES_ACT_CHECKPOINT is unset",
+            "SKIP: no Python with `torch`",
+            "    SKIP tree_reduction: no Vulkan device", // not at the start of the line
+            "test gpu_thing ... ok",
+            "RAN device: NVIDIA GeForce RTX 4060",
+        ] {
+            assert!(!is_gpu_skip(line), "false positive: {line}");
+        }
     }
 }

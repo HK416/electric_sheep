@@ -39,6 +39,7 @@ pub use pipeline::{BindingDesc, BindingKind, CommandRecorder, ComputePipeline};
 pub use slang::{SlangCompiler, SpirvModule};
 pub use spirv::{
     apply_exec_modes, spirv_entry_points, spirv_float_arithmetic_count, spirv_has_execution_mode,
-    spirv_no_contraction_count, DECORATION_NO_CONTRACTION, EXEC_MODE_DENORM_FLUSH_TO_ZERO,
-    EXEC_MODE_ROUNDING_MODE_RTE, EXEC_MODE_SIGNED_ZERO_INF_NAN_PRESERVE,
+    spirv_no_contraction_count, validate_spirv, DECORATION_NO_CONTRACTION,
+    EXEC_MODE_DENORM_FLUSH_TO_ZERO, EXEC_MODE_DENORM_PRESERVE, EXEC_MODE_ROUNDING_MODE_RTE,
+    EXEC_MODE_ROUNDING_MODE_RTZ, EXEC_MODE_SIGNED_ZERO_INF_NAN_PRESERVE,
 };

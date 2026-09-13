@@ -26,7 +26,10 @@ policy: which kernel to run, how to fuse, what to schedule is §11 (`es-compile`
    ever created; there is no API here to ask for one.
 4. `Gpu::none_available()` is the CI predicate: true when the loader is missing, instance
    creation fails, or no physical device is reported. Every GPU test starts with it and
-   prints `SKIP` with the reason.
+   prints `SKIP` with the reason. `cargo xtask ci` runs the test step with `--nocapture` and
+   scans for those `SKIP` lines: with `ES_REQUIRE_GPU=1` — a machine that claims a GPU — any
+   of them fails the run, the way `cargo xtask nostd --require` treats a missing target. The
+   PR runner has no GPU and leaves the variable unset, so there the skips are only reported.
 
 ## Capabilities are queried, never set
 
@@ -88,8 +91,11 @@ for kernels outside the deterministic contract (§3.2 exempts neural-network ker
 - `slangc` is found through `ES_SLANGC` or `PATH`. Its `-v` output goes into the cache key,
   because §3.4 item 7 pins the compiler version, not only the source.
 - Cache: `target/es-slang-cache/<hash>.spv`, `hash = blake3(source ‖ entry ‖ profile ‖
-  defines ‖ exec_modes ‖ slangc version ‖ include dir)`. A hit does not invoke `slangc` at
-  all; `SlangCompiler::invocations()` counts real invocations so the test can prove the hit.
+  defines ‖ exec_modes ‖ slangc version ‖ include dirs ‖ every file under them)`. The include
+  walk is **recursive** and sorted, keyed by each file's path relative to its include root, so
+  a `#include "sub/helper.slang"` is part of the identity; walk errors propagate rather than
+  quietly weakening the key. A hit does not invoke `slangc` at all;
+  `SlangCompiler::invocations()` counts real invocations so the test can prove the hit.
   Content-addressed, therefore shareable between ranks (§22) and packageable into a bundle so
   deployment needs no Slang (§11.4).
 - Flags: `-target spirv -profile <p> -entry <e> -O0 -fp-mode precise -emit-spirv-directly`
@@ -100,9 +106,18 @@ for kernels outside the deterministic contract (§3.2 exempts neural-network ker
   SPIR-V writer (`spirv.rs`, ~200 lines, no dependency) that inserts the capability,
   the `SPV_KHR_float_controls` extension, the `OpExecutionMode`s after the entry point, and
   one `OpDecorate <id> NoContraction` per float-arithmetic result id.
+  The patch is keyed on `(entry point, mode, float width)`: it covers *every* `OpEntryPoint`,
+  a mode declared at another width does not suppress the requested f32 one, and a module that
+  already declares a contradicting mode at that width (`DenormPreserve 32` vs a requested
+  `DenormFlushToZero 32`) is refused with `GpuError::Spirv` rather than patched into something
+  invalid.
 - `spirv_has_execution_mode(&words, mode)` / `spirv_no_contraction_count(&words)` parse the
   header and instruction stream so tests can *prove* the modes are in the binary rather than
   trusting a flag.
+- `validate_spirv(&words)` runs **`spirv-val`** (Vulkan SDK, `PATH` or `ES_SPIRV_VAL`) over
+  the patched module on every cold compile — a header parse says a word stream is well-formed,
+  not that a module is legal, and this crate writes SPIR-V by hand. Missing tool: one printed
+  `NOTE` and `Ok(false)`, or an error under `ES_REQUIRE_SPIRV_VAL=1`.
 
 `SpirvModule { words, hash, entry }`. The hash is the `compile_hash` ingredient of §11.4.
 
@@ -110,7 +125,10 @@ for kernels outside the deterministic contract (§3.2 exempts neural-network ker
 
 `gpu-allocator` owns device memory; buffers are `Buffer::new(gpu, bytes, Usage)` with
 `Storage` / `Uniform` / `Staging` (host-visible). `upload` / `download` copy through a
-staging buffer and a one-shot command buffer.
+staging buffer and a one-shot command buffer. A `Buffer` records the `bytes` it was asked for
+alongside what was allocated (`bytes.max(4)`, then the allocator's alignment padding), and
+`download` returns exactly the requested length — the padding is never handed back as if it
+were data.
 
 `ComputePipeline::new(gpu, &SpirvModule, &[BindingDesc])` builds a single descriptor set
 (set 0, storage or uniform buffers only). `CommandRecorder` records

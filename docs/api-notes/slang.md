@@ -47,6 +47,26 @@ test `execution_modes_are_present_in_the_spirv`, which parses the final binary r
 trusting any flag. If a later Slang release grows the flags, the patch stays correct (it
 skips what is already there) and the flags can be added to the command line.
 
+The patch is per `(entry point, mode, float width)`, not per mode:
+
+* it runs over **every** `OpEntryPoint`, so a multi-entry module gets the modes on all of
+  them;
+* `DenormFlushToZero 16` does not count as the requested `DenormFlushToZero 32` — the width
+  operand is compared;
+* a module that already declares a *contradicting* mode at the requested width
+  (`DenormPreserve 32` against a requested `DenormFlushToZero 32`, or `RoundingModeRTZ 32`
+  against `RoundingModeRTE 32`) is **refused** with a `GpuError::Spirv`, not patched into an
+  invalid module.
+
+## Validation
+
+`spirv.rs` writes SPIR-V by hand, so the result is checked with **`spirv-val`** (Vulkan SDK)
+on every cold compile — a cache hit never pays for it. The executable is `spirv-val` on
+`PATH`, or `ES_SPIRV_VAL`. When it is absent, `validate_spirv` prints one
+`NOTE spirv-val is not on PATH: …` per process and returns `Ok(false)`; with
+`ES_REQUIRE_SPIRV_VAL=1` that absence is an error instead. `patched_kernels_pass_spirv_val`
+asserts both `sum.slang` and `approx_probe.slang` come out valid after patching.
+
 `unverified`: whether a Slang attribute (`[require(...)]`, `[SpvExecutionMode(...)]` or
 similar) can express `RoundingModeRTE` in source. The source-level route was not found in
 `slangc -h` output; the patch was chosen because it is checkable from the binary.
@@ -55,9 +75,16 @@ similar) can express `RoundingModeRTE` in source. The source-level route was not
 
 `target/es-slang-cache/<blake3>.spv`, overridable with `ES_SLANG_CACHE` (or
 `CARGO_TARGET_DIR`). The key hashes: source text, entry, profile, defines, the requested
-`ExecModes`, every include directory path **and the contents of the files in it**, and the
-`slangc -v` string. A hit does not start a process — `SlangCompiler::invocations()` proves
-it in `cache_hit_does_not_start_slangc`.
+`ExecModes`, every include directory path **and the contents of every file reachable from
+it, recursively**, and the `slangc -v` string. A hit does not start a process —
+`SlangCompiler::invocations()` proves it in `cache_hit_does_not_start_slangc`.
+
+The include walk is sorted, keyed by each file's path relative to the include root (so
+moving a file between subdirectories moves the key), and **propagates its errors**: an
+unreadable include tree fails the compile instead of silently producing a weaker key that
+would serve a stale `.spv`. `editing_an_included_subdirectory_file_recompiles` is the
+oracle — a kernel that `#include`s `sub/helper.slang`, compiled three times with the helper
+edited in between, must show exactly two `slangc` invocations.
 
 Content-addressing is what lets ranks share the cache (spec §22) and lets `es task compile`
 package it into a bundle so deployment needs no Slang (§11.4).

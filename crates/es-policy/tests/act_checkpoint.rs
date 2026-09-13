@@ -91,6 +91,15 @@ fn reference(dir: &str) -> Result<RefReply, String> {
     Ok(reply)
 }
 
+/// Whether a reference failure means "this machine does not have the oracle" (SKIP) rather
+/// than "the oracle ran and something is wrong" (FAIL). Only an absent interpreter or an
+/// absent module qualifies; every other exception is a real result.
+fn is_missing_dependency(why: &str) -> bool {
+    why.starts_with("cannot start `")
+        || why.starts_with("ModuleNotFoundError:")
+        || why.starts_with("ImportError:")
+}
+
 #[test]
 fn a_real_lerobot_act_checkpoint_reproduces_its_actions() {
     let Ok(dir) = std::env::var("ES_ACT_CHECKPOINT") else {
@@ -110,12 +119,15 @@ fn a_real_lerobot_act_checkpoint_reproduces_its_actions() {
     let policy = act_policy(&cfg, &dir, source_hash, weights_hash(&remapped)).unwrap();
 
     // The reference first: if `lerobot` is missing there is nothing to compare against.
+    // A *reference error* is not the same thing (review `docs/reviews/M4.md` S-7): an
+    // installed LeRobot that raised is a failure, not an environment this machine lacks.
     let reference = match reference(&dir) {
         Ok(r) => r,
-        Err(why) => {
-            println!("SKIP: the LeRobot reference did not run ({why})");
+        Err(why) if is_missing_dependency(&why) => {
+            println!("SKIP: the LeRobot reference is not installed ({why})");
             return;
         }
+        Err(why) => panic!("the LeRobot reference failed: {why}"),
     };
 
     let mut runtime = TorchRuntime::new();

@@ -8,7 +8,11 @@
 //! * the Slang cache serves a second compile without starting `slangc` (§2.3);
 //! * a fixed-order tree reduction over 1M f32 is bit-identical across two runs and equal to
 //!   the CPU mirror bit for bit (§3.4, §3.5 tier 1);
-//! * §28.7 gate 3: `es_math::approx` on the CPU vs `approx.slang` on the GPU, bit for bit.
+//! * §28.7 gate 3: `es_math::approx` on the CPU vs `approx.slang` on the GPU, bit for bit;
+//! * `spirv-val` accepts the patched modules, so the hand-written SPIR-V is checked rather
+//!   than trusted (review `docs/reviews/M4.md` S-6);
+//! * `download` hands back exactly the requested byte count, not the allocator's padding
+//!   (S-12).
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -222,6 +226,56 @@ fn execution_modes_are_present_in_the_spirv() {
     println!(
         "RAN exec modes in SPIR-V: 3/3, NoContraction {decorated}/{arithmetic}, hash {}",
         &module.hash[..16]
+    );
+}
+
+/// Review `docs/reviews/M4.md` S-6, packet `P-M4-R7`: `spirv.rs` hand-writes SPIR-V, so the
+/// patched module is checked by `spirv-val` rather than by a header parse. `ES_REQUIRE_SPIRV_VAL=1`
+/// turns "the tool is not installed" into a failure; without it that is a printed SKIP.
+#[test]
+fn patched_kernels_pass_spirv_val() {
+    let test = "patched_kernels_pass_spirv_val";
+    let Some(compiler) = open_slang(test) else {
+        return;
+    };
+    let compiler = compiler.with_include(math_slang_dir());
+    for file in ["sum.slang", "approx_probe.slang"] {
+        let defines = BTreeMap::from([("ES_N".to_owned(), N.to_string())]);
+        let module = compile(&compiler, file, &defines, ExecModes::deterministic());
+        let ran = es_gpu::validate_spirv(&module.words)
+            .unwrap_or_else(|e| panic!("spirv-val rejected the patched {file}: {e}"));
+        if ran {
+            println!("RAN spirv-val: patched {file} accepted");
+        } else {
+            println!(
+                "SKIP {test}: no spirv-val on PATH (set ES_REQUIRE_SPIRV_VAL=1 to require it)"
+            );
+            return;
+        }
+    }
+}
+
+/// Review `docs/reviews/M4.md` S-12: `download` used to hand back the whole allocation,
+/// which `gpu-allocator` pads, so `download_f32().len()` could exceed the requested count.
+#[test]
+fn download_returns_exactly_the_requested_length() {
+    let test = "download_returns_exactly_the_requested_length";
+    let Some(gpu) = open_gpu(test) else {
+        return;
+    };
+    // Three floats: below any plausible allocation alignment, so padding would show.
+    let data = [1.0f32, 2.0, 3.0];
+    for usage in [Usage::Storage, Usage::Staging] {
+        let mut buffer = Buffer::from_f32(&gpu, &data, usage).expect("buffer");
+        let got = buffer.download_f32().expect("download");
+        assert_eq!(got.len(), data.len(), "{usage:?} download length");
+        assert_eq!(got, data, "{usage:?} download contents");
+        assert_eq!(buffer.download().expect("download").len(), data.len() * 4);
+    }
+    println!(
+        "RAN buffer download: {} f32 in, {} f32 out",
+        data.len(),
+        data.len()
     );
 }
 

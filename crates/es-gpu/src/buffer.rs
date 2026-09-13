@@ -42,13 +42,18 @@ pub struct Buffer<'gpu> {
     gpu: &'gpu Gpu,
     handle: vk::Buffer,
     allocation: Option<Allocation>,
+    /// Bytes actually allocated: `len.max(4)`, then whatever `gpu-allocator` padded it to.
     size: u64,
+    /// Bytes the caller asked for. `download` returns exactly this many, never the padding
+    /// (review `docs/reviews/M4.md` S-12).
+    len: u64,
     usage: Usage,
 }
 
 impl std::fmt::Debug for Buffer<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Buffer")
+            .field("len", &self.len)
             .field("size", &self.size)
             .field("usage", &self.usage)
             .finish()
@@ -87,6 +92,7 @@ impl<'gpu> Buffer<'gpu> {
             handle,
             allocation: Some(allocation),
             size: bytes.max(4),
+            len: bytes,
             usage,
         })
     }
@@ -138,15 +144,22 @@ impl<'gpu> Buffer<'gpu> {
         copy(self.gpu, staging.handle, self.handle, data.len() as u64)
     }
 
-    /// Read the whole buffer back.
+    /// Read the buffer back: exactly the `bytes` it was created with.
+    ///
+    /// The mapped slice covers the whole allocation, which `gpu-allocator` pads to the
+    /// device's alignment, so the tail is trimmed here rather than handed to the caller as
+    /// if it were data.
     pub fn download(&mut self) -> Result<Vec<u8>, GpuError> {
         let size = self.size;
-        if let Some(src) = self.mapped() {
-            return Ok(src.to_vec());
-        }
-        let mut staging = Buffer::new(self.gpu, size, Usage::Staging)?;
-        copy(self.gpu, self.handle, staging.handle, size)?;
-        staging.download()
+        let mut bytes = if let Some(src) = self.mapped() {
+            src.to_vec()
+        } else {
+            let mut staging = Buffer::new(self.gpu, size, Usage::Staging)?;
+            copy(self.gpu, self.handle, staging.handle, size)?;
+            staging.download()?
+        };
+        bytes.truncate(self.len as usize);
+        Ok(bytes)
     }
 
     /// Read the buffer back as `f32`.

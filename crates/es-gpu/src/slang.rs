@@ -118,7 +118,7 @@ impl SlangCompiler {
         defines: &BTreeMap<String, String>,
         modes: ExecModes,
     ) -> Result<SpirvModule, GpuError> {
-        let hash = self.cache_key(source, entry, profile, defines, modes);
+        let hash = self.cache_key(source, entry, profile, defines, modes)?;
         let cached = self.cache_dir.join(format!("{hash}.spv"));
         if let Ok(bytes) = std::fs::read(&cached) {
             return Ok(SpirvModule {
@@ -176,8 +176,10 @@ impl SlangCompiler {
         // slangc emits DenormFlushToZero from `-denorm-mode-fp32 ftz`; RoundingModeRTE,
         // SignedZeroInfNanPreserve and NoContraction it does not emit, so they are patched
         // in. See docs/api-notes/slang.md.
-        let words = spirv::apply_exec_modes(&raw, modes)
-            .ok_or_else(|| GpuError::Spirv("slangc output has no entry point".to_owned()))?;
+        let words = spirv::apply_exec_modes(&raw, modes)?;
+        // The patch is hand-written SPIR-V; `spirv-val` is what says it is legal, and it is
+        // not in the cache path, so a hit never pays for it (review M4 S-6).
+        spirv::validate_spirv(&words)?;
         // Publish the cache entry by write-then-rename to a name unique to this call, so a
         // concurrent reader never sees half a file. Two calls racing on the same cache key
         // compile independently and both reach here — deterministic compilation (spec §3.4)
@@ -208,6 +210,11 @@ impl SlangCompiler {
         self.compile(&source, entry, profile, defines, modes)
     }
 
+    /// Content hash of every input `slangc` will see.
+    ///
+    /// Errors from walking an include directory **propagate**: an unreadable include tree
+    /// means the key cannot be computed, and computing one anyway would publish a `.spv`
+    /// under a key that does not describe it (review `docs/reviews/M4.md` S-4).
     fn cache_key(
         &self,
         source: &str,
@@ -215,7 +222,7 @@ impl SlangCompiler {
         profile: &str,
         defines: &BTreeMap<String, String>,
         modes: ExecModes,
-    ) -> String {
+    ) -> Result<String, GpuError> {
         let mut h = blake3::Hasher::new();
         h.update(source.as_bytes());
         h.update(b"\0entry\0");
@@ -237,25 +244,54 @@ impl SlangCompiler {
         for dir in &self.include_dirs {
             h.update(dir.to_string_lossy().as_bytes());
             h.update(b";");
-            // Include files are inputs too: hash their contents, not just the path.
-            if let Ok(entries) = std::fs::read_dir(dir) {
-                let mut files: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
-                files.sort();
-                for f in files {
-                    if let Ok(bytes) = std::fs::read(&f) {
-                        h.update(
-                            f.file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .as_bytes(),
-                        );
-                        h.update(&bytes);
-                    }
-                }
-            }
+            // Include files are inputs too: hash their contents, not just the path, and
+            // recurse — `#include "sub/helper.slang"` is reachable from `-I <dir>`.
+            hash_include_tree(&mut h, dir, "", 0)?;
         }
-        h.finalize().to_hex().to_string()
+        Ok(h.finalize().to_hex().to_string())
     }
+}
+
+/// How deep an include tree may nest before the walk gives up. A symlink loop would
+/// otherwise recurse until the stack dies; no real include tree is anywhere near this.
+const MAX_INCLUDE_DEPTH: u32 = 32;
+
+/// Hash every file reachable from `dir`, in sorted order, keyed by its path relative to the
+/// include root so moving a file between subdirectories changes the key.
+fn hash_include_tree(
+    h: &mut blake3::Hasher,
+    dir: &Path,
+    prefix: &str,
+    depth: u32,
+) -> Result<(), GpuError> {
+    if depth > MAX_INCLUDE_DEPTH {
+        return Err(GpuError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "include tree deeper than {MAX_INCLUDE_DEPTH} at {}",
+                dir.display()
+            ),
+        )));
+    }
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<Result<_, _>>()?;
+    paths.sort();
+    for path in paths {
+        let name = format!(
+            "{prefix}{}",
+            path.file_name().unwrap_or_default().to_string_lossy()
+        );
+        if path.is_dir() {
+            hash_include_tree(h, &path, &format!("{name}/"), depth + 1)?;
+        } else {
+            h.update(name.as_bytes());
+            h.update(b"\0");
+            h.update(&std::fs::read(&path)?);
+            h.update(b";");
+        }
+    }
+    Ok(())
 }
 
 /// `target/es-slang-cache`, overridable with `ES_SLANG_CACHE` (spec §2.3).
@@ -304,34 +340,89 @@ mod tests {
     fn cache_key_separates_every_input() {
         let c = compiler("v1");
         let d = BTreeMap::new();
-        let base = c.cache_key("src", "main", "glsl_450", &d, ExecModes::none());
+        let key = |c: &SlangCompiler,
+                   src: &str,
+                   entry: &str,
+                   profile: &str,
+                   defines: &BTreeMap<String, String>,
+                   modes: ExecModes| {
+            c.cache_key(src, entry, profile, defines, modes).unwrap()
+        };
+        let base = key(&c, "src", "main", "glsl_450", &d, ExecModes::none());
 
         assert_ne!(
             base,
-            c.cache_key("src2", "main", "glsl_450", &d, ExecModes::none())
+            key(&c, "src2", "main", "glsl_450", &d, ExecModes::none())
         );
         assert_ne!(
             base,
-            c.cache_key("src", "other", "glsl_450", &d, ExecModes::none())
+            key(&c, "src", "other", "glsl_450", &d, ExecModes::none())
         );
         assert_ne!(
             base,
-            c.cache_key("src", "main", "sm_6_0", &d, ExecModes::none())
+            key(&c, "src", "main", "sm_6_0", &d, ExecModes::none())
         );
         assert_ne!(
             base,
-            c.cache_key("src", "main", "glsl_450", &d, ExecModes::deterministic())
+            key(
+                &c,
+                "src",
+                "main",
+                "glsl_450",
+                &d,
+                ExecModes::deterministic()
+            )
         );
         let defines = BTreeMap::from([("N".to_owned(), "4".to_owned())]);
         assert_ne!(
             base,
-            c.cache_key("src", "main", "glsl_450", &defines, ExecModes::none())
+            key(&c, "src", "main", "glsl_450", &defines, ExecModes::none())
         );
         // Spec 3.4 item 7: the compiler version is part of the identity.
         assert_ne!(
             base,
-            compiler("v2").cache_key("src", "main", "glsl_450", &d, ExecModes::none())
+            key(
+                &compiler("v2"),
+                "src",
+                "main",
+                "glsl_450",
+                &d,
+                ExecModes::none()
+            )
         );
+    }
+
+    /// Review `docs/reviews/M4.md` S-4: the include walk was one level deep and swallowed
+    /// read errors, so a `sub/helper.slang` contributed nothing to the key. No `slangc`
+    /// needed — this is the key function alone.
+    #[test]
+    fn cache_key_covers_files_in_include_subdirectories() {
+        let root = std::env::temp_dir().join(format!(
+            "es-slang-include-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let sub = root.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("helper.slang"), "float helper() { return 1.0; }").unwrap();
+
+        let c = compiler("v1").with_include(&root);
+        let d = BTreeMap::new();
+        let before = c
+            .cache_key("src", "main", "glsl_450", &d, ExecModes::none())
+            .unwrap();
+
+        std::fs::write(sub.join("helper.slang"), "float helper() { return 2.0; }").unwrap();
+        let after = c
+            .cache_key("src", "main", "glsl_450", &d, ExecModes::none())
+            .unwrap();
+        assert_ne!(before, after, "editing sub/helper.slang must move the key");
+
+        // A path that cannot be walked is an error, not a silently weaker key.
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(c
+            .cache_key("src", "main", "glsl_450", &d, ExecModes::none())
+            .is_err());
     }
 
     #[test]
@@ -345,8 +436,10 @@ mod tests {
         b.insert("B".to_owned(), "2".to_owned());
         b.insert("A".to_owned(), "1".to_owned());
         assert_eq!(
-            c.cache_key("s", "main", "p", &a, ExecModes::none()),
+            c.cache_key("s", "main", "p", &a, ExecModes::none())
+                .unwrap(),
             c.cache_key("s", "main", "p", &b, ExecModes::none())
+                .unwrap()
         );
     }
 
@@ -458,5 +551,62 @@ void main(uint3 tid : SV_DispatchThreadID) {
         );
 
         let _ = std::fs::remove_dir_all(&cache_dir);
+    }
+
+    /// Review `docs/reviews/M4.md` S-4, packet `P-M4-R5`: a kernel that `#include`s
+    /// `sub/helper.slang` must recompile when the helper changes. Counted end to end through
+    /// `slangc`, so it proves the cache actually missed, not just that a hash moved. SKIP
+    /// when `slangc` is unavailable (spec 1.4).
+    #[test]
+    fn editing_an_included_subdirectory_file_recompiles() {
+        let test = "editing_an_included_subdirectory_file_recompiles";
+        if !slangc_available() {
+            println!("SKIP {test}: no slangc");
+            return;
+        }
+
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("es-slang-inc-{}-{n}", std::process::id()));
+        let cache_dir = root.join("cache");
+        let includes = root.join("include");
+        std::fs::create_dir_all(includes.join("sub")).unwrap();
+        let helper = includes.join("sub").join("helper.slang");
+        std::fs::write(&helper, "float es_helper(float x) { return x + 1.0; }\n").unwrap();
+
+        let source = r#"
+#include "sub/helper.slang"
+[[vk::binding(0, 0)]] RWStructuredBuffer<float> dst;
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    dst[tid.x] = es_helper(float(tid.x));
+}
+"#;
+        let compiler = real_compiler(&cache_dir).with_include(&includes);
+        let d = BTreeMap::new();
+        let first = compiler
+            .compile(source, "main", "glsl_450", &d, ExecModes::none())
+            .unwrap_or_else(|e| panic!("first compile: {e}"));
+        assert_eq!(compiler.invocations(), 1, "first compile must be a miss");
+        compiler
+            .compile(source, "main", "glsl_450", &d, ExecModes::none())
+            .unwrap();
+        assert_eq!(compiler.invocations(), 1, "second compile must be a hit");
+
+        std::fs::write(&helper, "float es_helper(float x) { return x + 2.0; }\n").unwrap();
+        let third = compiler
+            .compile(source, "main", "glsl_450", &d, ExecModes::none())
+            .unwrap_or_else(|e| panic!("compile after editing the helper: {e}"));
+        assert_eq!(
+            compiler.invocations(),
+            2,
+            "editing sub/helper.slang must miss the cache"
+        );
+        assert_ne!(first.hash, third.hash, "the key must move with the helper");
+        assert_ne!(first.words, third.words, "and so must the SPIR-V");
+        println!("RAN include cache: 2 slangc invocation(s) for three compiles");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

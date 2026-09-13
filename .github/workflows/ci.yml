@@ -27,6 +27,14 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # `cargo xtask ci` runs the test step with `--nocapture` and scans the output for
+      # `^SKIP` lines from the GPU oracles (es-gpu / es-render / es-compile's GPU lowering).
+      # This runner has no GPU, no Vulkan loader and no `slangc`, so those tests SKIP by
+      # design and `ES_REQUIRE_GPU` is deliberately left **unset**: the skips are printed as
+      # `NOTE GPU oracle skipped` and do not fail the job. Set `ES_REQUIRE_GPU=1` on a runner
+      # that actually has a GPU — then a SKIP is a hard failure, the way
+      # `cargo xtask nostd --require` treats a missing target (review `docs/reviews/M4.md`
+      # S-7, packet `docs/packets/M4/P-M4-R6.md`).
       - name: cargo xtask ci
         run: cargo xtask ci
 
