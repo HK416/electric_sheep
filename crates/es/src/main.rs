@@ -24,6 +24,7 @@ USAGE:
     es eval compare <A.json> <B.json>
     es dataset info <root>
     es backend compare --scene <file.xml|urdf> --backends mujoco-cpu,mjwarp[,newton,physx]
+    es bench [--memory-report --obs <obs.toml> ...]
 
 Run `es <subcommand> --help` for details on one subcommand.
 ";
@@ -44,6 +45,7 @@ fn dispatch(args: &[String]) -> Result<u8, CliError> {
         Some("eval") => cmd::eval::dispatch(&args[1..]),
         Some("dataset") => cmd::dataset::dispatch(&args[1..]),
         Some("backend") => cmd::backend::dispatch(&args[1..]),
+        Some("bench") => cmd::bench::dispatch(&args[1..]),
         Some(other) => Err(CliError::Usage(format!(
             "unknown command '{other}'\n\n{TOP_HELP}"
         ))),

@@ -934,3 +934,127 @@ fn backend_compare_unknown_backend_exits_2() {
         .expect("run es");
     assert_eq!(out.status.code(), Some(2));
 }
+
+// --- `es bench` (spec 12.4, 20.2, 20.3) -------------------------------------------------------
+
+#[test]
+fn bench_without_memory_report_prints_nine_metric_stub() {
+    let out = bin().args(["bench"]).output().expect("run es");
+    let text = stdout(&out);
+    assert!(out.status.success(), "stdout:\n{text}");
+    for metric in [
+        "physics_steps_per_sec",
+        "camera_frames_per_sec",
+        "pixels_per_sec",
+        "observation_gb_per_sec",
+        "policy_inferences_per_sec",
+        "actions_per_sec",
+        "end_to_end_latency",
+        "gpu_memory_peak",
+        "chunk_underrun_rate",
+    ] {
+        assert!(
+            text.contains(metric),
+            "missing metric '{metric}' in:\n{text}"
+        );
+    }
+    assert!(text.contains("unmeasured"), "{text}");
+    assert!(text.contains("Target / Status: unverified"), "{text}");
+}
+
+#[test]
+fn bench_memory_report_prints_table_and_exits_zero_when_balanced() {
+    let dir = scratch_dir("bench-memory-report");
+    let (_, observation, learning, ..) = write_fixture_toml(&dir);
+
+    let out = bin()
+        .args(["bench", "--memory-report", "--obs"])
+        .arg(&observation)
+        .arg("--learning")
+        .arg(&learning)
+        .args([
+            "--sim-envs",
+            "8",
+            "--obs-envs",
+            "4",
+            "--views",
+            "1",
+            "--inference-batch",
+            "16",
+        ])
+        .output()
+        .expect("run es");
+    let text = stdout(&out);
+    assert!(
+        out.status.success(),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for item in [
+        "physics_state",
+        "render_tile_atlas",
+        "observation_intermediates",
+        "history_buffers",
+        "policy_weights",
+        "inference_activations",
+        "chunk_buffers",
+        "total",
+        "per domain:",
+    ] {
+        assert!(text.contains(item), "missing '{item}' in:\n{text}");
+    }
+    assert!(text.contains("GiB"), "{text}");
+    assert!(text.contains("no spec 20.3 rule violations"), "{text}");
+}
+
+#[test]
+fn bench_memory_report_obs_over_sim_envs_exits_1() {
+    let dir = scratch_dir("bench-memory-report-violation");
+    let (_, observation, learning, ..) = write_fixture_toml(&dir);
+
+    let out = bin()
+        .args(["bench", "--memory-report", "--obs"])
+        .arg(&observation)
+        .arg("--learning")
+        .arg(&learning)
+        .args([
+            "--sim-envs",
+            "2",
+            "--obs-envs",
+            "4",
+            "--views",
+            "1",
+            "--inference-batch",
+            "4",
+        ])
+        .output()
+        .expect("run es");
+    let text = stdout(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("obs_batch_le_sim_batch"), "{text}");
+}
+
+#[test]
+fn bench_memory_report_missing_obs_is_usage_error() {
+    let out = bin()
+        .args([
+            "bench",
+            "--memory-report",
+            "--sim-envs",
+            "1",
+            "--obs-envs",
+            "1",
+            "--views",
+            "1",
+            "--inference-batch",
+            "1",
+        ])
+        .output()
+        .expect("run es");
+    assert_eq!(out.status.code(), Some(2));
+}

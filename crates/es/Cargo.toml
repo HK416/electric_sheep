@@ -17,6 +17,7 @@ es-physics-backend = { workspace = true }
 es-physics-core = { workspace = true }
 es-assets = { workspace = true }
 es-data = { workspace = true }
+es-telemetry = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

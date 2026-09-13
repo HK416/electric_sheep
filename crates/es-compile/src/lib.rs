@@ -9,11 +9,16 @@
 //! convention, the layouts, and what is still `unverified` against `LeRobot` (spec 7.7).
 #![forbid(unsafe_code)]
 
+pub mod budget;
 pub mod bundle;
 pub mod exec;
 pub mod kernels;
 pub mod plan;
 
+pub use budget::{
+    BudgetDomains, BudgetInputs, BudgetItem, BudgetViolation, MemoryBudget, MemoryReport,
+    ModelSizes, Precision, TileAtlasCfg,
+};
 pub use bundle::{
     Bundle, BundleError, BundleHashes, BundleKind, BundleManifest, PolicyBundle,
     BUNDLE_SCHEMA_VERSION,
