@@ -9,11 +9,15 @@ license.workspace = true
 es-core = { workspace = true }
 es-ir = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
+blake3 = { workspace = true }
+# Default features pull in arrow + five compression codecs; the LeRobot columns this crate
+# reads and writes are plain/uncompressed primitives, so the low-level column API is enough.
+parquet = { version = "59.3", default-features = false }
 
 [dev-dependencies]
 proptest = { workspace = true }
-serde_json = { workspace = true }
 
 [lints]
 workspace = true
