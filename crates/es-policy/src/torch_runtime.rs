@@ -17,12 +17,12 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use es_compile::Tensor;
-use es_ir::learning::LearningGraph;
+use es_ir::learning::{LearningGraph, PolicyHandle};
 use es_ir::types::ElemType;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-use crate::lower::lower_to_torch;
+use crate::lower::{lower_to_torch, TorchModule};
 use crate::runtime::{
     runtime_hash_of, InferenceBackend, PolicyError, PolicyInfo, PolicyRuntime, WeightsSource,
 };
@@ -274,6 +274,49 @@ impl TorchRuntime {
             }
         }
     }
+
+    /// Load a module that was lowered outside [`lower_to_torch`].
+    ///
+    /// One caller: [`crate::lerobot::lower_act`], whose architecture parameters live in the
+    /// checkpoint's own `config.json` because spec 8.3's node parameters do not carry them.
+    /// Every check [`PolicyRuntime::load`] performs is performed here too — the declared
+    /// weights hash (spec 5.3) and the key/shape contract — because a runtime that loads
+    /// whatever it is handed cannot support the hash chain.
+    pub fn load_lowered(
+        &mut self,
+        module: &TorchModule,
+        policy: &PolicyHandle,
+        weights: &WeightsSource,
+    ) -> Result<PolicyInfo, PolicyError> {
+        let (path, bytes) = self.checkpoint(weights)?;
+        let got = weights_hash(&bytes);
+        let expected = *policy.weights.hash();
+        if got != expected {
+            return Err(PolicyError::WeightsHash {
+                expected: hex(&expected),
+                got: hex(&got),
+            });
+        }
+        validate_keys(module, &parse_header(&bytes)?)?;
+
+        let mut process = Process::spawn()?;
+        let reply: LoadReply = process.call(&Request::Load {
+            source: &module.source,
+            weights_path: &path.to_string_lossy(),
+        })?;
+
+        let info = PolicyInfo {
+            backend: InferenceBackend::Torch,
+            lowering_hash: module.lowering_hash,
+            weights_hash: got,
+            action_dim: policy.contract.action_dim,
+            horizon: policy.contract.horizon,
+            version: reply.torch_version,
+        };
+        self.process = Some(process);
+        self.info = Some(info.clone());
+        Ok(info)
+    }
 }
 
 impl Drop for TorchRuntime {
@@ -292,38 +335,10 @@ impl PolicyRuntime for TorchRuntime {
         graph: &LearningGraph,
         weights: &WeightsSource,
     ) -> Result<PolicyInfo, PolicyError> {
-        let module = lower_to_torch(graph)?;
-        let (path, bytes) = self.checkpoint(weights)?;
-
         // The checkpoint must be the one the IR names (spec 5.3) and must fit the lowered
         // graph (design note section 4). Both before Python sees it.
-        let got = weights_hash(&bytes);
-        let expected = *graph.policy.weights.hash();
-        if got != expected {
-            return Err(PolicyError::WeightsHash {
-                expected: hex(&expected),
-                got: hex(&got),
-            });
-        }
-        validate_keys(&module, &parse_header(&bytes)?)?;
-
-        let mut process = Process::spawn()?;
-        let reply: LoadReply = process.call(&Request::Load {
-            source: &module.source,
-            weights_path: &path.to_string_lossy(),
-        })?;
-
-        let info = PolicyInfo {
-            backend: InferenceBackend::Torch,
-            lowering_hash: module.lowering_hash,
-            weights_hash: got,
-            action_dim: graph.policy.contract.action_dim,
-            horizon: graph.policy.contract.horizon,
-            version: reply.torch_version,
-        };
-        self.process = Some(process);
-        self.info = Some(info.clone());
-        Ok(info)
+        let module = lower_to_torch(graph)?;
+        self.load_lowered(&module, &graph.policy, weights)
     }
 
     fn infer(

@@ -21,6 +21,8 @@
 #![forbid(unsafe_code)]
 
 pub mod equiv;
+/// Loading a real `LeRobot` ACT checkpoint — spec 8.9's M1 gate.
+pub mod lerobot;
 pub mod lower;
 /// The tier-4 Rust reference for the sampler heads. Test-only: it is an oracle, not a runtime.
 #[cfg(test)]
@@ -30,6 +32,7 @@ pub mod torch_runtime;
 pub mod weights;
 
 pub use equiv::{compare_actions, Equivalence, Tolerance};
+pub use lerobot::{act_policy, lower_act, remap_act_keys, remap_checkpoint, ActConfig};
 pub use lower::{lower_to_torch, LowerError, TorchModule};
 pub use runtime::{InferenceBackend, PolicyError, PolicyInfo, PolicyRuntime, WeightsSource};
 pub use torch_runtime::TorchRuntime;

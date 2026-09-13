@@ -116,3 +116,9 @@ $RECYCLE.BIN/
 
 # project python venv for reference oracles
 .venv/
+
+# `es evidence keygen` output: a raw 32-byte ed25519 signing seed (spec 25.1). Never commit one.
+*.eskey
+
+# LeRobot checkpoints fetched by the reference oracles (P-M1-R2). Never committed.
+target/lerobot-cache/

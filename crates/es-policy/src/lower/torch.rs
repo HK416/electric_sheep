@@ -848,16 +848,23 @@ impl Lowering {
         }
         let _ = writeln!(source, "        return {{{}}}", returns.join(", "));
 
-        let mut h = blake3::Hasher::new();
-        h.update(LOWERING_TAG.as_bytes());
-        h.update(source.as_bytes());
         TorchModule {
-            lowering_hash: *h.finalize().as_bytes(),
+            lowering_hash: lowering_hash(&source),
             source,
             weight_keys: self.keys,
             weight_shapes: self.shapes,
         }
     }
+}
+
+/// `blake3(LOWERING_TAG || source)` — [`TorchModule::lowering_hash`], the `compiler` slot of
+/// `execution_hash` (spec 5.3). Shared with [`crate::lerobot`], whose ACT lowering produces the
+/// same artifact from a checkpoint's `config.json` rather than from a `LearningGraph`.
+pub(crate) fn lowering_hash(source: &str) -> [u8; 32] {
+    let mut h = blake3::Hasher::new();
+    h.update(LOWERING_TAG.as_bytes());
+    h.update(source.as_bytes());
+    *h.finalize().as_bytes()
 }
 
 /// A Python float list. `serde_json` renders f64 shortest-round-trip, which is both exact and

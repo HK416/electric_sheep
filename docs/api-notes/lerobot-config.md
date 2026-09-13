@@ -1,7 +1,12 @@
 # LeRobot policy `config.json` — shape and normalization stats
 
-**Pinned version: NONE.** Nothing in this workspace pins `lerobot`; no Python package was
-installed and no real `config.json` was read while writing this file. Every field below is
+**Pinned version: `lerobot` 0.6.1 for ACT only** — see the ACT section below and
+`docs/api-notes/lerobot-act.md`, which was written against a real checkpoint. Everything else
+on this page predates that and is still **`unverified`**: no real `diffusion` `config.json` and
+no real `meta/stats.json` has been read.
+
+Original header, still true of every section except ACT: nothing in this workspace pinned
+`lerobot`; no Python package was installed and no real `config.json` was read. Every field below is
 reconstructed from memory of LeRobot around the `v0.1`/`v0.2` `lerobot-train` era (roughly
 the same generation as `docs/api-notes/lerobot-dataset.md`'s `codebase_version: "v2.1"`
 datasets) and is **`unverified`** unless a line says otherwise. Spec §1.7 names exactly this
@@ -40,26 +45,46 @@ but only ever *produces* `MeanStd`-shaped `Normalize`/`Normalizer` nodes today �
 normalization node with a warning, since the Observation IR's `NormalizeStats` has no
 identity variant.
 
-## ACT (`type: "act"`) — `unverified`
+## ACT (`type: "act"`) — **verified**, `lerobot` 0.6.1
 
-| field | type | note |
-|---|---|---|
-| `chunk_size` | int | prediction horizon `H` (spec §8.4) |
-| `n_action_steps` | int | execution length `K` |
-| `n_obs_steps` | int | almost always `1` for ACT |
-| `vision_backbone` | string | e.g. `"resnet18"` |
-| `pretrained_backbone_weights` | string \| null | e.g. `"ResNet18_Weights.IMAGENET1K_V1"` |
-| `dim_model` | int | transformer width |
-| `n_heads` | int | attention heads |
-| `dim_feedforward` | int | |
-| `n_encoder_layers` | int | |
-| `n_decoder_layers` | int | |
-| `use_vae` | bool | CVAE encoder toggle |
-| `latent_dim` | int | |
-| `temporal_ensemble_coeff` | float \| null | present => temporal ensembling at inference |
-| `dropout` | float | |
-| `kl_weight` | float | |
-| `optimizer_lr`, `optimizer_weight_decay`, … | — | training-only; not modeled, carried in `extra`, reported as warnings |
+No longer `unverified`: `docs/api-notes/lerobot-act.md` pins this table against the real
+`lerobot/act_aloha_sim_transfer_cube_human` checkpoint and its `config.json`, read in the
+project venv. Read that file for the checkpoint's key names, shapes and forward-pass
+semantics; the fields below are the config half of it, with the values that checkpoint carries.
+
+| field | type | value there | note |
+|---|---|---|---|
+| `chunk_size` | int | `100` | prediction horizon `H` (spec §8.4) |
+| `n_action_steps` | int | `100` | execution length `K` |
+| `n_obs_steps` | int | `1` | `1` for ACT |
+| `vision_backbone` | string | `"resnet18"` | torchvision model name, built with `norm_layer=FrozenBatchNorm2d` and truncated at `layer4` |
+| `pretrained_backbone_weights` | string \| null | `"ResNet18_Weights.IMAGENET1K_V1"` | a *training* record; the checkpoint carries fine-tuned backbone weights |
+| `replace_final_stride_with_dilation` | bool | `false` | third entry of `replace_stride_with_dilation` |
+| `pre_norm` | bool | `false` | post-norm; under `false` the encoder has no final `LayerNorm` |
+| `dim_model` | int | `512` | transformer width |
+| `n_heads` | int | `8` | attention heads |
+| `dim_feedforward` | int | `3200` | |
+| `feedforward_activation` | string | `"relu"` | |
+| `n_encoder_layers` | int | `4` | |
+| `n_decoder_layers` | int | `1` | |
+| `use_vae` | bool | `true` | CVAE encoder toggle — **training-only**: `ACT.forward` gates it on `self.training`, so the latent is zeros at inference |
+| `latent_dim` | int | `32` | |
+| `n_vae_encoder_layers` | int | `4` | training-only |
+| `temporal_ensemble_coeff` | float \| null | `null` | present => temporal ensembling, which is runtime scheduling rather than a forward pass |
+| `dropout` | float | `0.1` | holds no parameters; identity under `eval()` |
+| `kl_weight` | float | `10.0` | training-only |
+| `device`, `use_amp` | — | `"cuda"`, `false` | training records; a CPU load merely warns |
+| `optimizer_lr`, `optimizer_weight_decay`, … | — | | training-only; not modeled, carried in `extra`, reported as warnings |
+
+Two corrections to the reconstructed-from-memory text elsewhere in this file, now that a real
+file has been read:
+
+- `input_features` / `output_features` have exactly the shape guessed above
+  (`name -> {type, shape}` with `VISUAL`/`STATE`/`ACTION`), and the ACT feature names really are
+  `observation.images.<camera>`, `observation.state`, `action`;
+- a `VISUAL` feature's normalization statistics are **per-channel `[3, 1, 1]`**, not per-pixel
+  and not flat `[3]` — see `lerobot-act.md` §3. `es-data`'s flat `FeatureStats` loader does not
+  parse that nesting; that follow-up is still open.
 
 ## Diffusion Policy (`type: "diffusion"`) — `unverified`
 
