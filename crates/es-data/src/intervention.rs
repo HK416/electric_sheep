@@ -276,6 +276,12 @@ pub fn label(root: &Path, segments: &[InterventionSegment]) -> Result<LabelRepor
         let index = meta.episode_index;
         let mut ep = dataset.read_episode(index)?;
         let n = ep.len();
+        let meta_len = meta.length as usize;
+        if meta_len != n {
+            return Err(DataError::Inconsistent(format!(
+                "episode {index}: meta.length {meta_len} disagrees with parquet length {n}"
+            )));
+        }
         let values: Vec<i64> = (0..n)
             .map(|i| i64::from(masks.get(&index).is_some_and(|m| m[i])))
             .collect();

@@ -3,6 +3,7 @@
 mod context_budget;
 mod goldens;
 mod layering;
+mod nostd;
 mod scope;
 mod spec_refs;
 
@@ -45,6 +46,7 @@ fn cmd_ci(root: &Path) -> bool {
         )
         && context_budget::run(&root.join("crates"))
         && layering::run(root)
+        && nostd::run(root, false)
         && spec_refs::run(root)
         && goldens::run(root)
 }
@@ -67,17 +69,18 @@ fn main() -> ExitCode {
                 false
             }
         }
+        Some("nostd") => nostd::run(&root, args.next().as_deref() == Some("--require")),
         Some("ci") => cmd_ci(&root),
         Some(other) => {
             eprintln!("unknown xtask command: {other}");
             eprintln!(
-                "available: context-budget, layering, check-spec-refs, verify-goldens, check-scope <packet.md>, ci"
+                "available: context-budget, layering, check-spec-refs, verify-goldens, check-scope <packet.md>, nostd [--require], ci"
             );
             false
         }
         None => {
             eprintln!(
-                "usage: cargo xtask <context-budget|layering|check-spec-refs|verify-goldens|check-scope|ci>"
+                "usage: cargo xtask <context-budget|layering|check-spec-refs|verify-goldens|check-scope|nostd|ci>"
             );
             false
         }

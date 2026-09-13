@@ -23,11 +23,19 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          targets: thumbv7em-none-eabihf
 
       - uses: Swatinem/rust-cache@v2
 
       - name: cargo xtask ci
         run: cargo xtask ci
+
+      # `cargo xtask ci` runs `nostd` too, but SKIPs quietly if the target isn't installed
+      # (the common case on a dev machine). The toolchain step above installs it here, so
+      # `--require` turns a SKIP into a hard failure instead of a silently rotting check
+      # (review `docs/reviews/M3.md` Should-fix, packet `docs/packets/M3/P-M3-R4.md`).
+      - name: cargo xtask nostd (required)
+        run: cargo xtask nostd --require
 
   # Tier 2 (spec 1.4, 28.7): the reference oracles the PR job cannot run without an environment
   # that has MuJoCo/PyTorch installed. Deliberately not on the PR path — installing Python +

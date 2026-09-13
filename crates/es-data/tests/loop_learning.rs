@@ -801,3 +801,24 @@ fn loop_jsonl_chains_collect_intervene_distill() {
     assert_eq!(out_steps.len(), 1);
     assert_eq!(out_steps[0].kind, LoopKind::Distill);
 }
+
+/// Review `docs/reviews/M3.md` Should-fix, packet `docs/packets/M3/P-M3-R7.md`: a dataset
+/// whose `meta/episodes.jsonl` disagrees with its parquet is a reported error, not a panic,
+/// on the mask-indexing path in `intervention::label`.
+#[test]
+fn label_on_mismatched_metadata_is_an_error_not_a_panic() {
+    let root = scratch("loop-mismatch");
+    collect_into(&root, 1, 11);
+
+    // `meta/episodes.jsonl` now claims episode 0 is shorter than the `STEPS`-row parquet file
+    // `collect_into` actually wrote.
+    let path = root.join("meta/episodes.jsonl");
+    let text = std::fs::read_to_string(&path).unwrap();
+    let shorter = format!("\"length\":{}", STEPS - 3);
+    let full = format!("\"length\":{STEPS}");
+    assert!(text.contains(&full), "fixture episode length: {text}");
+    std::fs::write(&path, text.replace(&full, &shorter)).unwrap();
+
+    let err = es_data::label(&root, &[]).expect_err("mismatched metadata must not panic");
+    assert!(matches!(err, es_data::DataError::Inconsistent(_)), "{err}");
+}
