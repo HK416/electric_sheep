@@ -1,0 +1,28 @@
+[package]
+name = "es"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "es -- Electric Sheep runtime/CLI (spec 2.5, 10.5, 11.1)"
+
+[[bin]]
+name = "es"
+path = "src/main.rs"
+
+[dependencies]
+es-ir = { workspace = true }
+es-compile = { workspace = true }
+es-physics-backend = { workspace = true }
+es-data = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+es-core = { workspace = true }
+es-math = { workspace = true }
+
+[lints]
+workspace = true

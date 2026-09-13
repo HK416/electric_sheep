@@ -18,6 +18,9 @@ es-telemetry = { path = "crates/es-telemetry" }
 es-physics-core = { path = "crates/es-physics-core" }
 es-physics-backend = { path = "crates/es-physics-backend" }
 es-data = { path = "crates/es-data" }
+es-policy = { path = "crates/es-policy" }
+es-actuator = { path = "crates/es-actuator" }
+es-sensor = { path = "crates/es-sensor" }
 es-env = { path = "crates/es-env" }
 es-safety = { path = "crates/es-safety" }
 es-compile = { path = "crates/es-compile" }
