@@ -19,6 +19,8 @@ is_doc() {
 while IFS= read -r path; do
 	[ -n "$path" ] || continue
 	is_doc "$path" && continue
+	# Skip binary files (git reports "-	-" in numstat for them), e.g. golden tensors.
+	git diff --cached --numstat -- "$path" | grep -q '^-' && continue
 	# Check staged content (not the working tree) for non-Latin letters; print "line:content".
 	hits=$(git show ":$path" | perl -CSD -ne "print \"\$.:\$_\" if /$nonlatin/" || true)
 	if [ -n "$hits" ]; then
