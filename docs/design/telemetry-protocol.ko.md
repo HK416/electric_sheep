@@ -1,0 +1,155 @@
+<!-- Korean translation of docs/design/telemetry-protocol.md. The English file is the working copy; regenerate this when it changes. -->
+
+# 텔레메트리 프로토콜 — 와이어 형식과 M1 루프백 트랜스포트
+
+`es-telemetry::protocol`과 `es-telemetry::transport`에 대한 설계 노트다. Spec: spec 23.1
+(백엔드 중립, 에디터는 클라이언트), spec 23.2–23.4 (계층 그래프 뷰, 성능 게이트),
+spec 25.1 (보안), spec 25.3 (API 버전 관리), spec 12.4 (성능 지표 집합). 이 문서는 spec 28.3이
+W8 패킷(`docs/packets/M1/W8-telemetry-transport.md`)의 선행 조건으로 지정하는 M1 설계 문서다.
+
+## 1. 이 문서가 존재하는 이유
+
+Spec 23.1: **"에디터는 학습을 호스팅하지 않는다. 실행 중인 프로세스에 접속하는 클라이언트다."** 이는
+접속할 *대상*이 있어야만 성립한다: 프로세스(시뮬레이터, 임베디드 런타임, 또는 순수 Python 학습
+루프)가 소켓을 열고 상태를 스트리밍하며, 임의 개수의 리더 — egui 에디터, CLI, 로깅 스크립트 —
+가 프로듀서의 코드 경로를 바꾸지 않고 여기에 붙는다. Spec 23.1은 또한 이 프로토콜이 Electric
+Sheep 전용이 아니어야 한다고 못박으며("얇은 Python 어댑터... 가 채택의 쐐기다"), 그래서 와이어
+스키마(`es_telemetry::protocol`)는 ES 전용 개념을 하나도 담지 않는다: 스트림 id, 틱, 페이로드가
+전부다.
+
+이 문서는 의도적으로 분리된 두 계층을 다룬다.
+
+- **스키마** (`protocol.rs`): 메시지가 어떻게 전달되는지와 무관하게, 메시지가 *무엇인지*;
+- **트랜스포트** (`transport.rs`, W8에서 추가): 로컬호스트에서 스키마를 처음부터 끝까지
+  검증하기에 충분한 `std::net::TcpListener`/`TcpStream` 구현. 최종 트랜스포트가 아님을
+  명시적으로 밝힌다 — §6 참고.
+
+## 2. 메시지 흐름
+
+```
+   client (editor / lerobot-adapter / CLI)              server (sim / embedded runtime)
+            |                                                       |
+            |  TCP connect ------------------------------------->   |
+            |                                                       |
+            |  Hello { versions_supported, token, client } ----->   |  negotiate() + token check
+            |                                                       |
+            |  <----------------------- HelloAck { version,         |  (accepted)
+            |                            session_id,                |
+            |                            execution_hash }           |
+            |                    or                                 |
+            |  <----------------------- Bye { reason }               |  (rejected, socket closes)
+            |                                                       |
+            |  Subscribe { streams: [..] } ----------------------->  |  replaces subscription set
+            |                                                       |
+            |  <====================================================|  Frame, Frame, Frame, ...
+            |                                                       |  (only for subscribed streams)
+            |  Subscribe { streams: [..] } ----------------------->  |  (may re-subscribe any time)
+            |                                                       |
+            |  Bye { reason } ------------------------------------>  |  (either side may end it)
+```
+
+TCP 연결 하나가 세션 하나다. 핸드셰이크 이후 관계는 비대칭적이다: 클라이언트가 내보내는 메시지는
+`Subscribe`(뷰가 바뀔 때마다)와 `Bye`뿐이고, 서버가 내보내는 메시지는 `Frame`뿐이다(해당 프레임의
+스트림을 구독 중인 클라이언트들에게 팬아웃된다) — 어느 스레드가 무엇을 쓰는지는
+`crates/es-telemetry/src/transport.rs`의 모듈 문서를 참고하라. 두 스레드가 동기화 없이 같은
+소켓에 쓰면 바이트가 뒤섞이기 때문이다.
+
+## 3. 프레이밍
+
+`protocol::encode`/`decode`: `codec (1 byte) | body_len (u32, LE) | body`. `codec = 0`은
+현재 JSON이다; 바이너리 코덱은 와이어 브레이크가 아니라 추가 variant이므로, JSON이 빠른 것보다
+`Codec`이 enum으로 남아 있는 것이 더 중요하다. `decode_with_max`는 바이트를 건드리기 전에
+과도하게 큰 `body_len`을 거부하므로, 손상된 길이 프리픽스로 큰 할당을 강제할 수 없다.
+
+이는 트랜스포트가 M1 TCP shim이든 이후의 QUIC 스트림이든 의도적으로 동일한 프레이밍이다:
+`transport.rs`는 `TcpStream` 주위에 "하나의 `decode`가 성공할 때까지 읽고, 반복" 로직만 추가할
+뿐, 프레임 바이트의 어떤 부분도 TCP를 가정하지 않는다.
+
+## 4. 인증 (spec 25.1)
+
+`Server::bind(addr, token: Option<String>)`. `token`이 `Some`일 때, 모든 `Hello.token`은
+정확히 일치해야 하며 그렇지 않으면 서버는 `Bye { reason: "missing or invalid token" }`을
+회신하고 클라이언트를 등록하지 않은 채 연결을 닫는다. `token`이 `None`일 때는 아무 검사도
+실행되지 않는다 — 이것이 로컬 개발 형태다(`es --check-deps`가 토큰이 설정되지 않은 로컬
+시뮬레이터에 대해 에디터를 실행하는 경우).
+
+**이것이 아닌 것**: 토큰은 JSON 본문 안에 평문으로 전달되며, 채널 암호화는 존재하지 않는다.
+같은 사용자가 소유한 프로세스 간 `127.0.0.1`(spec 25.1의 기본 바인드)에서는 문제가 없지만,
+신뢰할 수 없는 네트워크에서는 그렇지 않다. TLS는 이 표면에 대한 spec 25.1의 또 다른 요구사항이며
+여기서는 구현되지 않는다 — §6 참고.
+
+## 5. 버전 관리 (spec 25.3)
+
+`negotiate(client_versions, server_versions) -> Option<u32>` (이 패킷 이전부터 변경 없음)는
+양쪽이 모두 나열한 것 중 가장 높은 버전을 선택한다. 서버는 `{PROTOCOL_VERSION,
+PROTOCOL_VERSION - 1}` — "N과 N-1" — 을 제시하므로, 이전 릴리스에 맞춰 빌드된 에디터도 롤아웃
+중 더 새로운 런타임에 접속할 수 있다; `PROTOCOL_VERSION`이 `1`일 때는 아직 N-1이 없으므로
+서버는 `{1}`만 제시한다. 공유 버전이 없으면 핸드셰이크 거부(`Bye`, reason에 양쪽 목록을 명시)일
+뿐, 조용한 다운그레이드나 패닉이 아니다.
+
+`Message`, `Frame`, `Payload`, `PerfMetrics` 자체에는 버전 필드가 없다: spec 25.3은 버전을
+*핸드셰이크 안에* 두는데, 세션은 한 번 협상한 뒤 그 수명 동안 하나의 방언만 말하기 때문이다.
+향후 호환되지 않는 스키마 변경은 `PROTOCOL_VERSION`을 올린다; 추가적인 변경(새 `Payload`
+variant, 새 옵션 필드)은 그럴 필요가 없다 — `docs/design/policy-bundle.md`의 매니페스트
+형식이 이미 `serde`의 `Option` 필드로 이 논리를 취하고 있는 것과 같다.
+
+## 6. 백프레셔
+
+Spec 23.4의 게이트 9 — 학습/시뮬레이션 루프에 대한 텔레메트리 오버헤드는 1% 미만이어야 한다 —
+는 네트워크가 아니라 *프로듀서*에 대한 진술이다. `Server::publish`는 어떤 구독자가 무엇을
+하고 있든 상관없이 유한한 시간 안에 반환해야 한다:
+
+- 각 클라이언트는 자신만의 유한 큐(`CLIENT_QUEUE_CAPACITY = 16` 프레임)를 가진다;
+- `publish`는 논블로킹 `try_send`를 수행한다; 큐가 가득 차면 프레임은 드롭되고 해당
+  클라이언트의 `ClientStats::dropped`에 집계될 뿐, 결코 대기하지 않는다;
+- 느린 클라이언트 — 읽기를 멈췄거나 바쁜 이미지 스트림에서 뒤처진 클라이언트 — 는 오직 자신의
+  데이터만 잃는다. 시뮬레이션이나 다른 구독자, 심지어 자기 연결의 생존성조차 늦출 수 없다(큐는
+  해당 클라이언트의 라이터 스레드에서 독립적으로 비워진다).
+
+16이라는 값은 "몇 틱 정도의 여유"를 위한 추정치이지 측정치가 아니다 — M1 패킷의 테스트
+(`a_slow_client_drops_frames_without_blocking_the_publisher`)는 정책의 *형태*(드롭이 발생하고
+프로듀서는 결코 블록되지 않는다)만 증명할 뿐, 16이 실제 그래프 뷰 세션에 맞는 깊이라는 것까지
+증명하지는 않는다. 그 숫자를 조율하고 게이트 9의 실제 "< 1%" 질문에 답하려면 실행 중인 학습
+루프에 대해 실행 중인 에디터가 필요하다 — 단위 테스트가 만들어낼 수 있는 범위 밖이다.
+**`Target / Status: 미검증 (unverified)`** — < 1% 수치 자체에 대해서다; 이 문서는 그것이
+참이 되게 해줄 메커니즘(논블로킹 팬아웃)이 갖춰져 있다는 것만 확립한다.
+
+## 7. Python 어댑터에 필요한 것
+
+Spec 23.1의 백엔드 중립 요구사항은 LeRobot/Isaac Lab/Newton 학습 루프가 어떤 Rust 코드도
+링크하지 않고 프레임을 내보낼 수 있어야 한다는 뜻이다. `protocol.rs`의 크레이트 레벨 문서
+주석이 이미 JSON 본문 형태를 전부 설명하고 있으며, W8은 다운스트림 Rust 리더에게 그저
+파싱되는 것이 아니라 실행 중인 `Server`에 *푸시*하고자 하는 Python 클라이언트를 위해 요구사항을
+하나 더 추가한다:
+
+1. 런타임이 출력했거나 설정된 주소로 TCP 연결을 연다.
+2. 길이 프리픽스가 붙은 `Hello` 하나를 보낸다(`{"type": "hello", "versions_supported": [1],
+   "token": null_or_the_configured_token, "client": "lerobot-adapter"}`), §3의 5바이트
+   `codec | len` 헤더를 사용한다(`codec = 0`).
+3. 길이 프리픽스가 붙은 회신 하나를 읽는다. `"type": "hello_ack"`이면 계속 진행하고,
+   `"type": "bye"`이면 연결이 닫히는 중이며 `reason`이 그 이유를 말해준다(잘못된 토큰 또는
+   버전 불일치 — 서버는 거부된 소켓에서 계속 듣지 않으므로, 새 연결에서 수정된 `Hello`로
+   재시도한다).
+4. `Frame` 메시지를 직접 보낸다 — 프로듀서는 아무것도 `Subscribe`할 필요가 없다; `Server`의
+   팬아웃을 구독하는 것은 *리더*뿐이다. 스칼라와 `Metrics` 페이로드만 계속 푸시하는 학습
+   루프는 텐서/이미지 인코딩을 전혀 필요로 하지 않는다.
+
+protobuf도, 스키마 컴파일러도, 소켓과 JSON 인코더 외의 어떤 의존성도 필요 없다 — 이들
+프레임워크 모두 이미 손에 쥐고 있는 것들이다.
+
+## 8. 알려진 한계 (이 패킷)
+
+- **`Server`에 종료 핸드셰이크가 없다.** `Server::bind`의 accept 스레드는 프로세스 수명
+  내내 실행되며, 그것을 조인하는 `Server::close`가 없다. 리스너가 살아야 하는 만큼만 정확히
+  사는 임베디드 런타임이나 시뮬레이터 프로세스에는 문제없다; 같은 주소를 나중에 다시 바인딩해야
+  하는 호출자는 셧다운 플래그와 셀프-커넥트 웨이크업이 필요하지만, 여기서는 구축되지 않았다.
+- **TLS 없음, QUIC 없음.** Spec 23.4는 원격 에디터 경로에 QUIC을, spec 25.1은 TLS를
+  원하지만, 둘 다 `es-telemetry::transport`에는 존재하지 않는다. 둘 다 `es-transport`
+  (layer 11, `CLAUDE.md`에 따르면 CUDA/HIP을 링크할 수 있는 유일한 크레이트)의 작업으로
+  나중에 처리된다 — 이 트랜스포트는 그 크레이트가 존재하기 전에 M1 게이트가 스키마와
+  백프레셔 정책을 검증할 수 있게 해주는 루프백/신뢰된 네트워크용 shim이다.
+- **큐 깊이가 예산이 아니라 고정값이다.** `CLIENT_QUEUE_CAPACITY`는 상수이지, spec 23.3이
+  상태 스트리밍에 대해 서술하는 "스텝당 20 µs 샘플링 예산"이 아니다. 그 예산을 실제 레이트
+  리미터(깊이 리미터가 아니라)로 바꾸는 것은 측정할 실제 프로듀서가 생긴 이후의 작업이다.
+- **재접속/재개 없음.** TCP 연결이 끊기면 클라이언트의 구독 상태를 잃는다; 재접속 후 처음부터
+  다시 구독한다. `session_id` 기반의 재개는 존재하지 않는다.
