@@ -100,6 +100,33 @@ not a silent hold. Joining two different `Window`s is also an error: the learnin
 carry a type hash identically across machines. `Normalized`'s two `f64`s go through the writer's
 float rule (−0.0 → 0.0, NaN rejected); no other float reaches the hash from this module.
 
+## Where the vocabulary lives (`es-ir-types`, layer 2)
+
+`es-ir` holds the five IRs, the graph skeleton and the graph canonicalizer; everything below
+them that does **not** know what a graph is lives one crate down, in `es-ir-types`, so both
+crates fit one context window (spec 1.5). `es-ir` re-exports every item at its original path,
+so `es_ir::types::PortType`, `es_ir::task::Expr` and `es_ir::HashChain` keep resolving and no
+downstream crate changes.
+
+| `es-ir-types` module | holds | packet |
+|---|---|---|
+| `types`, `image`, `diag`, `codes`, `canon` | the type system, `ImageSpec`, diagnostics, `CanonWriter` | `P-M0-R4` |
+| `expr` | the spec 6.3 parameter enums (`ArithOp`, `MathFunc`, `Distribution`, …) and the spec 6.5 `Expr` + its evaluator | `P-M4-S16` |
+| `chain` | `HashChain`, `DatasetHash`, `HardwareCapability`, `ChangedComponent` — digests only, no graph hashing | `P-M4-S16` |
+
+The graph-shaped halves stay in `es-ir` on purpose: `canonical_hash` / `canonical_order` need
+`Graph<N>`, and IR-C's `ControlGraph` validates against a `TaskIr`, so neither can move down a
+layer without dragging the graph with it.
+
+## Schema versions
+
+Each IR carries its own `schema_version`, and it is **hash input** — which is what lets an
+older file keep its hash after the constant is bumped. `TaskIr::validate` accepts
+`1 ..= SCHEMA_VERSION` and reports `TASK-002` outside that range, the way `DeploymentIr` reports
+`DEP-001`: `0` is an unwritten field, and a version past this build's means the file carries
+nodes and fields this build cannot see, so nothing downstream should pin a `task_hash` for it.
+There is no migration step — an older supported version is read as it stands.
+
 ## Schema migrations
 
 `docs/packets/M0/P29.md` freezes the builtin node kind lists (spec 28.7 gate 10) and

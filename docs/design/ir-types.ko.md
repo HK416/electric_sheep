@@ -107,6 +107,34 @@ join은 조용한 hold가 아니라 오류다. 서로 다른 두 `Window`를 결
 writer의 float 규칙(−0.0 → 0.0, NaN은 거부됨)을 거친다; 이 모듈로부터 해시에
 도달하는 다른 float은 없다.
 
+## 어휘가 사는 곳 (`es-ir-types`, layer 2)
+
+`es-ir`은 다섯 개의 IR과 그래프 뼈대, 그래프 정규화기를 담는다; 그 아래에서 그래프가
+무엇인지 **모르는** 모든 것은 한 크레이트 아래인 `es-ir-types`에 살며, 그래서 두 크레이트
+모두 한 컨텍스트 윈도우에 들어간다(spec 1.5). `es-ir`은 모든 항목을 원래 경로로
+재수출하므로 `es_ir::types::PortType`, `es_ir::task::Expr`, `es_ir::HashChain`이 그대로
+해석되고 하위 크레이트는 하나도 바뀌지 않는다.
+
+| `es-ir-types` 모듈 | 담는 것 | 패킷 |
+|---|---|---|
+| `types`, `image`, `diag`, `codes`, `canon` | 타입 시스템, `ImageSpec`, 진단, `CanonWriter` | `P-M0-R4` |
+| `expr` | spec 6.3 파라미터 enum들(`ArithOp`, `MathFunc`, `Distribution`, …)과 spec 6.5 `Expr` + 평가기 | `P-M4-S16` |
+| `chain` | `HashChain`, `DatasetHash`, `HardwareCapability`, `ChangedComponent` — 다이제스트뿐, 그래프 해싱 없음 | `P-M4-S16` |
+
+그래프 형태인 나머지 절반은 의도적으로 `es-ir`에 남는다: `canonical_hash` /
+`canonical_order`는 `Graph<N>`이 필요하고, IR-C의 `ControlGraph`는 `TaskIr`에 대해
+검증하므로, 둘 다 그래프를 함께 끌고 내려가지 않고서는 layer를 내릴 수 없다.
+
+## 스키마 버전
+
+각 IR은 자신의 `schema_version`을 싣고, 그것은 **해시 입력**이다 — 상수가 올라간 뒤에도
+예전 파일이 자기 해시를 유지하는 이유가 이것이다. `TaskIr::validate`는
+`1 ..= SCHEMA_VERSION`을 받아들이고 그 범위를 벗어나면 `TASK-002`를 보고한다.
+`DeploymentIr`이 `DEP-001`을 보고하는 것과 같다: `0`은 기록되지 않은 필드이고, 이 빌드보다
+높은 버전은 이 빌드가 볼 수 없는 노드와 필드를 싣고 있다는 뜻이므로, 그에 대해 하위
+어디에서도 `task_hash`를 고정해서는 안 된다. 마이그레이션 단계는 없다 — 지원되는 예전
+버전은 있는 그대로 읽힌다.
+
 ## 스키마 마이그레이션
 
 `docs/packets/M0/P29.md`는 내장 노드 kind 목록을 동결하며(spec 28.7 게이트 10),

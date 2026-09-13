@@ -13,8 +13,10 @@
 use serde::{Deserialize, Serialize};
 
 pub mod canon;
+pub mod chain;
 pub mod codes;
 pub mod diag;
+pub mod expr;
 pub mod image;
 pub mod types;
 
@@ -26,6 +28,7 @@ pub mod types;
 pub struct NodeId(pub u32);
 
 pub use canon::CanonWriter;
+pub use chain::{ChangedComponent, DatasetHash, HardwareCapability, HashChain};
 pub use diag::{DiagCode, Diagnostic, Severity};
 pub use image::{
     CameraModel, ChannelFormat, ColorSpace, DistortionModel, ImageDType, ImageSpec, Intrinsics,

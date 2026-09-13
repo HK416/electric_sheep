@@ -20,6 +20,25 @@ use es_ir::task::TaskIr;
 /// ended rather than left spinning.
 const MAX_DESCENT: u32 = 256;
 
+/// The three ports [`ControlExecutor::write_ports`] owns
+/// (`docs/design/control-graph.md` §3.1).
+const STAGE_INDEX: &str = "stage.index";
+const STAGE_TICKS: &str = "stage.ticks";
+const STAGE_DONE: &str = "stage.done";
+
+/// Drops the stage ports from a port map.
+///
+/// [`crate::env::Env`] keeps **one** map for the whole batch and refills it per env, so the
+/// stage ports are the only entries that would otherwise survive the change of env: every
+/// other binding is overwritten. Without this, env *e*'s task-level `Terminate` cone and its
+/// first-entry `Branch` — both evaluated before this env's first [`ControlExecutor::step`]
+/// writes anything — read what env *e-1* left behind.
+pub fn clear_stage_ports(ports: &mut BTreeMap<String, f64>) {
+    for key in [STAGE_INDEX, STAGE_TICKS, STAGE_DONE] {
+        ports.remove(key);
+    }
+}
+
 /// One level of the path from the root down to the active `SubTask`: which node, and which of
 /// its children the path went through (the `Sequence` position, the `Repeat` iteration, or
 /// 0 = `then` / 1 = `else` for a `Branch`).
@@ -200,9 +219,9 @@ impl ControlExecutor {
                 )
             })
             .map_or(0, |f| f.index);
-        ports.insert("stage.index".to_owned(), f64::from(index));
-        ports.insert("stage.ticks".to_owned(), f64::from(self.stage[i].ticks));
-        ports.insert("stage.done".to_owned(), done);
+        ports.insert(STAGE_INDEX.to_owned(), f64::from(index));
+        ports.insert(STAGE_TICKS.to_owned(), f64::from(self.stage[i].ticks));
+        ports.insert(STAGE_DONE.to_owned(), done);
     }
 
     fn push(&mut self, i: usize, node: NodeId, index: u32) {
@@ -361,14 +380,40 @@ mod tests {
         }
     }
 
-    fn env_of(task: &TaskIr) -> Env<FakeBackend> {
+    fn env_of_n(task: &TaskIr, n_envs: u32) -> Env<FakeBackend> {
         let domains = BatchDomains {
-            simulation: DomainCfg::new(1, 1),
-            observation: DomainCfg::new(1, 10),
-            inference: DomainCfg::new(1, 20),
+            simulation: DomainCfg::new(n_envs, 1),
+            observation: DomainCfg::new(n_envs, 10),
+            inference: DomainCfg::new(n_envs, 20),
             training: None,
         };
         Env::new(task, &fake_scene(), FakeBackend::new(), &domains, 7).expect("the task compiles")
+    }
+
+    fn env_of(task: &TaskIr) -> Env<FakeBackend> {
+        env_of_n(task, 1)
+    }
+
+    /// A two-env task whose root `Branch` picks `then_` / `else_` from `condition`.
+    fn branch_task(condition: Expr) -> TaskIr {
+        let mut task = staged_task(&["then", "else"]);
+        task.control = Some(ControlGraph {
+            root: NodeId(0),
+            nodes: BTreeMap::from([
+                (
+                    NodeId(0),
+                    ControlNode::Branch {
+                        condition,
+                        then_: NodeId(1),
+                        else_: NodeId(2),
+                    },
+                ),
+                // `stage.ticks > 20` never holds inside the window these tests run.
+                (NodeId(1), stage("then", &["then"], 20.0, 50)),
+                (NodeId(2), stage("else", &["else"], 20.0, 50)),
+            ]),
+        });
+        task
     }
 
     /// `pick -> move -> place`, each stage two steps long.
@@ -543,6 +588,40 @@ mod tests {
         let mut env = env_of(&task);
         let out = env.step(&[0.05]).expect("step");
         assert!(out.dones[0], "qpos[0] > -1.0 holds on the first step");
+    }
+
+    /// B-1: one port map is shared by the whole batch, so the `stage.*` ports env 0 writes
+    /// must not be what env 1's first-entry `Branch` reads. Both envs enter on the same step
+    /// and neither has spent a tick in a stage yet, so `stage.ticks` is unbound for both and
+    /// both take the `else` arm — env 1 only sees `1.0` if env 0's value leaked.
+    #[test]
+    fn stage_ports_do_not_leak_into_the_next_env() {
+        let task = branch_task(gt("stage.ticks", 0.5));
+        let mut env = env_of_n(&task, 2);
+        env.step(&[0.05, 0.05]).expect("step");
+        assert_eq!(env.stage_name(0), Some("else"));
+        assert_eq!(env.stage_name(1), Some("else"), "env 1 read env 0's ticks");
+    }
+
+    /// B-1 / R1 acceptance: with two envs whose `Branch` conditions disagree, each env takes
+    /// the arm **its own** port value selects, and swapping which env holds which value swaps
+    /// the stages rather than leaving them where the evaluation order put them.
+    #[test]
+    fn a_branch_is_per_env() {
+        // The hinge starts at 0 and the torque sign decides `qpos[0]`'s sign after one step.
+        let task = branch_task(gt("qpos[0]", 0.0));
+        let names = |ctrl: &[f64]| {
+            let mut env = env_of_n(&task, 2);
+            env.step(ctrl).expect("step");
+            [
+                env.stage_name(0).map(str::to_owned),
+                env.stage_name(1).map(str::to_owned),
+            ]
+        };
+        let then_ = Some("then".to_owned());
+        let else_ = Some("else".to_owned());
+        assert_eq!(names(&[0.05, -0.05]), [then_.clone(), else_.clone()]);
+        assert_eq!(names(&[-0.05, 0.05]), [else_, then_]);
     }
 
     #[test]

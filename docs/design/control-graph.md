@@ -129,6 +129,17 @@ Everything else an `Expr` can name is an IR-D binding (`qpos[i]`, `qvel[i]`, `se
 `time`, `time.episode`) produced by `ScalarPlan` — IR-C introduces no new evaluator and no new
 `Expr` variant.
 
+**The three stage ports are per env.** `Env` keeps one port map for the whole batch and refills
+it per env in `bind_ports`; the IR-D bindings are overwritten there, but the stage ports are
+not in that set, so `bind_ports` calls `control::clear_stage_ports` first. Without that, the
+two readers that run *before* this env's own `write_ports` — the task-level `Terminate` cone in
+`episode::evaluate`, and the `Branch` evaluated once on graph entry — would see the previous
+env's stage, and the batch's answer would depend on the order envs happen to be stepped in
+(`docs/reviews/M4.md` B-1, packet `P-M4-R1`). The consequence for authors: on the step a graph
+is entered, no stage has run yet for that env, so `stage.*` is **unbound** and an entry `Branch`
+naming one evaluates to `None` — falsy, the `else_` arm. Branch on IR-D state there, not on
+`stage.*`.
+
 ### 3.2 Reward composition
 
 With `control = None`, the episode reward is unchanged: `sum(weight * term)` over every

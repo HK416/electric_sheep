@@ -133,6 +133,17 @@ stage.done     단계가 완료된 스텝에서는 1.0, 그 외에는 0.0
 (`qpos[i]`, `qvel[i]`, `sensor[i]`, `time`, `time.episode`)이다 — IR-C는 새로운
 evaluator도 새로운 `Expr` variant도 도입하지 않는다.
 
+**세 단계 포트는 env마다 독립이다.** `Env`는 배치 전체에 대해 포트 맵을 하나만 두고
+`bind_ports`에서 env마다 다시 채운다; IR-D 바인딩은 거기서 덮어써지지만 단계 포트는 그
+집합에 없으므로, `bind_ports`가 먼저 `control::clear_stage_ports`를 호출한다. 그러지
+않으면 해당 env 자신의 `write_ports`보다 **먼저** 실행되는 두 독자 — `episode::evaluate`
+안의 task 레벨 `Terminate` 콘과, 그래프 진입 시 한 번 평가되는 `Branch` — 가 이전 env의
+단계를 읽게 되고, 배치의 답이 env를 어떤 순서로 스텝했는지에 의존하게 된다
+(`docs/reviews/M4.md` B-1, 패킷 `P-M4-R1`). 작성자에게 주는 함의: 그래프에 진입하는
+스텝에서는 그 env에 대해 아직 어떤 단계도 실행되지 않았으므로 `stage.*`는 **바인딩되지
+않은** 상태이고, 그것을 지목하는 진입 `Branch`는 `None`으로 평가된다 — falsy, 즉 `else_`
+갈래다. 그 자리에서는 `stage.*`가 아니라 IR-D 상태로 분기하라.
+
 ### 3.2 보상 합성
 
 `control = None`일 때 에피소드 보상은 변하지 않는다: 모든 `Reward` 노드에 대한

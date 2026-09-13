@@ -367,7 +367,13 @@ impl<B: PhysicsBackend> Env<B> {
     }
 
     /// The ports one env's reward and termination cones read, refilled in place.
+    ///
+    /// Every binding below is overwritten for this env, but the `stage.*` ports the control
+    /// executor writes are not in that set, so they are dropped first: a leftover would make
+    /// the next env's `Terminate` cone and first-entry `Branch` a function of the previous env
+    /// (`docs/reviews/M4.md` B-1).
     fn bind_ports(&mut self, env: u32) {
+        crate::control::clear_stage_ports(&mut self.ports);
         let state = self.backend.state();
         let rate = self.model.rate;
         let episode_ticks = u64::from(self.steps[env as usize])

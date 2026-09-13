@@ -34,153 +34,15 @@ pub const SCHEMA_VERSION: u32 = 2;
 const TASK_TAG: &str = "es.ir.task.v1";
 const TASK_GRAPH_TAG: &str = "es.ir.task_graph.v1";
 
-// --- parameter enums -----------------------------------------------------------------------
+// --- parameter vocabulary and expressions ----------------------------------------------------
+//
+// Moved to `es-ir-types` for the spec 1.5 context budget (`docs/packets/M4/P-M4-S16.md`);
+// nothing here knows the graph, and every path below stays `es_ir::task::..`.
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum JointQuantity {
-    Position,
-    Velocity,
-    Torque,
-}
-
-impl JointQuantity {
-    fn unit(self) -> Unit {
-        match self {
-            Self::Position => Unit::Angle,
-            Self::Velocity => Unit::AngularVelocity,
-            Self::Torque => Unit::Torque,
-        }
-    }
-}
-
-/// Element-wise arithmetic. `Mul` and `Div` scale by a dimensionless operand; a product of two
-/// different units is an explicit conversion and is not expressible as one node.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ArithOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    Min,
-    Max,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CmpOp {
-    Lt,
-    Le,
-    Gt,
-    Ge,
-    Eq,
-    Ne,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum LogicOp {
-    And,
-    Or,
-    Xor,
-    Not,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ReduceOp {
-    Sum,
-    Mean,
-    Min,
-    Max,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum NormKind {
-    L1,
-    L2,
-    Linf,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MathFunc {
-    Abs,
-    Sign,
-    Sqrt,
-    Exp,
-    Ln,
-    Sin,
-    Cos,
-    Tanh,
-}
-
-impl MathFunc {
-    /// Transcendentals need `es-math::approx` in task kernels (spec 6.6, `DET-010`).
-    fn is_transcendental(self) -> bool {
-        !matches!(self, Self::Abs | Self::Sign | Self::Sqrt)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Aggregation {
-    Sum,
-    Mean,
-    Min,
-    Max,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TerminationKind {
-    Success,
-    Failure,
-    Timeout,
-}
-
-/// Action space declaration only; the full `ActionSpec` of spec 9.2 lives in Deployment IR.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ActionSpace {
-    JointPosition,
-    JointVelocity,
-    JointTorque,
-    EePose,
-    EeDelta,
-    Gripper,
-}
-
-/// Sampling distribution for randomization and reset (spec 6.3).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Distribution {
-    Constant(f64),
-    Uniform { lo: f64, hi: f64 },
-    LogUniform { lo: f64, hi: f64 },
-    Normal { mean: f64, std: f64 },
-    Choice(Vec<f64>),
-}
-
-impl Distribution {
-    fn canonical(&self, w: &mut CanonWriter) {
-        match self {
-            Self::Constant(v) => {
-                w.str("Constant");
-                w.f64(*v);
-            }
-            Self::Uniform { lo, hi } | Self::LogUniform { lo, hi } => {
-                w.str(if matches!(self, Self::Uniform { .. }) {
-                    "Uniform"
-                } else {
-                    "LogUniform"
-                });
-                w.f64(*lo);
-                w.f64(*hi);
-            }
-            Self::Normal { mean, std } => {
-                w.str("Normal");
-                w.f64(*mean);
-                w.f64(*std);
-            }
-            Self::Choice(vs) => {
-                w.str("Choice");
-                wf64s(w, vs);
-            }
-        }
-    }
-}
+pub use es_ir_types::expr::{
+    ActionSpace, Aggregation, ArithOp, CmpOp, Distribution, Expr, JointQuantity, LogicOp, MathFunc,
+    NormKind, ReduceOp, TerminationKind,
+};
 
 // --- port type helpers ---------------------------------------------------------------------
 
@@ -806,81 +668,6 @@ impl IrNode for TaskNode {
     }
 }
 
-// --- expressions (spec 6.5) ------------------------------------------------------------------
-
-/// The authoring-side expression form. The parser of spec 6.5 expands one of these into a
-/// `TaskNode` subgraph in M1 lowering; no Rhai interpreter is ever called. Loops, assignment
-/// and function definitions are parse errors, so they have no representation here — and there
-/// is no transcendental variant (spec 6.6 `DET-010` makes those a [`TaskNode::MathFn`] with
-/// `approx = true`).
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub enum Expr {
-    /// Reference to a named graph port.
-    Port(String),
-    Const(f64),
-    Arith {
-        op: ArithOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
-    Compare {
-        op: CmpOp,
-        lhs: Box<Expr>,
-        rhs: Box<Expr>,
-    },
-    Clamp {
-        value: Box<Expr>,
-        lo: f64,
-        hi: f64,
-    },
-}
-
-impl Expr {
-    /// Evaluates against named port values.
-    ///
-    /// Deterministic by construction: every operation is an IEEE `f32`-representable `f64`
-    /// arithmetic op in a fixed order, comparisons yield exactly `1.0` or `0.0`, and anything
-    /// that would produce a non-finite value — a missing port, division by zero, an inverted
-    /// clamp range, an overflow — is `None` rather than a `NaN` that no hash can encode.
-    pub fn eval(&self, ports: &BTreeMap<String, f64>) -> Option<f64> {
-        let finite = |v: f64| v.is_finite().then_some(v);
-        match self {
-            Self::Port(name) => ports.get(name).copied().and_then(finite),
-            Self::Const(v) => finite(*v),
-            Self::Arith { op, lhs, rhs } => {
-                let (a, b) = (lhs.eval(ports)?, rhs.eval(ports)?);
-                finite(match op {
-                    ArithOp::Add => a + b,
-                    ArithOp::Sub => a - b,
-                    ArithOp::Mul => a * b,
-                    ArithOp::Div => a / b,
-                    ArithOp::Min => a.min(b),
-                    ArithOp::Max => a.max(b),
-                })
-            }
-            Self::Compare { op, lhs, rhs } => {
-                let (a, b) = (lhs.eval(ports)?, rhs.eval(ports)?);
-                // Exact IEEE comparison is the rule, not an approximation of one: two runs
-                // must agree bit for bit, and both operands are already finite here.
-                #[allow(clippy::float_cmp)]
-                let t = match op {
-                    CmpOp::Lt => a < b,
-                    CmpOp::Le => a <= b,
-                    CmpOp::Gt => a > b,
-                    CmpOp::Ge => a >= b,
-                    CmpOp::Eq => a == b,
-                    CmpOp::Ne => a != b,
-                };
-                Some(f64::from(u8::from(t)))
-            }
-            Self::Clamp { value, lo, hi } => {
-                let v = value.eval(ports)?;
-                (lo <= hi).then(|| v.clamp(*lo, *hi)).and_then(finite)
-            }
-        }
-    }
-}
-
 // --- the IR ------------------------------------------------------------------------------------
 
 /// The scene the task runs in: the authored path plus the hashes that pin its content
@@ -1007,6 +794,19 @@ impl TaskIr {
         let mut diags = self.graph.validate_declared_ports();
         if let Err(d) = self.graph.topo_order() {
             diags.push(d);
+        }
+        // A file from a newer writer carries nodes and fields this build cannot see, and a `0`
+        // is an unwritten field; either way `task_hash` would pin something never validated.
+        // Older supported versions stay readable -- the version is hashed, so their hashes
+        // survive (`docs/design/ir-types.md`).
+        if self.schema_version == 0 || self.schema_version > SCHEMA_VERSION {
+            diags.push(Diagnostic::new(
+                codes::TASK_002,
+                format!(
+                    "schema_version {} is not supported (expected 1..={SCHEMA_VERSION})",
+                    self.schema_version
+                ),
+            ));
         }
 
         let stream_check = |diags: &mut Vec<Diagnostic>, id: NodeId, stream: &String| {
@@ -1502,6 +1302,29 @@ mod tests {
         let ir = fixture();
         let json = serde_json::to_string(&ir).unwrap();
         assert_eq!(serde_json::from_str::<TaskIr>(&json).unwrap(), ir);
+    }
+
+    /// S-13: `0` and anything past [`SCHEMA_VERSION`] are rejected; every version this build
+    /// still understands loads, from a file as much as from memory.
+    #[test]
+    fn unsupported_schema_versions_are_rejected() {
+        let with = |v: u32| {
+            let mut ir = fixture();
+            ir.schema_version = v;
+            ir
+        };
+        assert_eq!(codes_of(&with(0).validate()), [codes::TASK_002]);
+        assert_eq!(
+            codes_of(&with(SCHEMA_VERSION + 1).validate()),
+            [codes::TASK_002]
+        );
+        for v in 1..=SCHEMA_VERSION {
+            assert!(with(v).validate().is_empty(), "version {v} is supported");
+        }
+        // The same guard is what a loaded file meets: `task_from_toml` builds a `TaskIr`.
+        let toml = crate::serial::task_to_toml(&with(SCHEMA_VERSION + 1)).unwrap();
+        let loaded = crate::serial::task_from_toml(&toml).unwrap();
+        assert_eq!(codes_of(&loaded.validate()), [codes::TASK_002]);
     }
 
     #[test]
