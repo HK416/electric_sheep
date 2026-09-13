@@ -2,9 +2,14 @@
   "name": "normalize_imagenet_4x3",
   "dtype": "f32",
   "layout": "row-major, little-endian, tightly packed",
-  "shape": [3, 3, 4],
+  "shape": [
+    3,
+    3,
+    4
+  ],
   "kernel": "normalize_mean_std.v1",
   "pins": "(x - mean[c]) / std[c] by division, not by a reciprocal multiply",
-  "generator": "cargo test -p es-compile --test gen_goldens -- --ignored",
+  "oracle": "torchvision.transforms.functional.normalize",
+  "generator": "crates/es-compile/python/gen_observation_goldens.py",
   "spec": "docs/design/observation-lowering.md"
 }

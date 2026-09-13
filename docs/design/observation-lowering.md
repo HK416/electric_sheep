@@ -106,9 +106,13 @@ All arithmetic f32. `s` is computed in f32 from f32 `scale`; computing it in f64
 narrowing gives different bits at some sizes, so the f32 path is normative.
 
 This is **not** exact on a constant image: the taps are combined with `l0 = 1 - l1`, whose
-f32 sum is not exactly 1, so a flat input can come back off by an ulp. That is PyTorch's
-behaviour too, and matching PyTorch is the contract — the proptest asserts 2 ulp, not
-equality. An association that is exact on constants would be a different kernel.
+f32 sum is not exactly 1, so a flat input can come back off by an ulp. PyTorch is not exact
+there either — `interpolate` on a constant 5×5 → 7×7 returns three distinct values — so the
+proptest asserts 2 ulp, not equality. An association that is exact on constants would be a
+different kernel.
+
+Measured against torch 2.14 at the golden size (8×6 → 4×3) this kernel is **bit-equal**. It is
+not bit-equal at every size: see §12 item 6, which records where and by how much.
 
 **Antialiasing is not implemented.** For a downscale, `antialias=True` is a different
 algorithm (a support-widened filter), not a refinement of this one. See §11.
@@ -147,6 +151,16 @@ srgb_eotf(x) = x <= 0.04045 ? x / 12.92
 `exp(2.4 * ln(t))` through `es_math::approx`, whose coefficients the Slang mirror shares.
 That costs a little accuracy against `libm`; it buys the only thing that matters here, which
 is that the CPU oracle and the GPU kernel produce the *same* bits.
+
+**The one golden with a tolerance.** The oracle for this table is the IEC 61966-2-1 formula
+evaluated in f64 and rounded once to f32 — the most accurate reference available, and by
+construction *not* reachable by a f32 polynomial fit. So `srgb_to_linear_lut256.json` carries
+`"tolerance_ulp": 7` and `observation_cpu.rs` reads it from the sidecar. 7 ULP (4.8e-7
+relative, worst entry `k = 12`) is the measured maximum over all 256 entries, not a margin
+picked to pass: 38 entries are exact, 167 are within 2 ULP, 3 reach 7. Every other golden in
+the set has no tolerance and is compared byte-for-byte. The tolerance lives in the sidecar
+rather than the test because the sidecar is CI read-only — widening it means modifying a
+golden, which `cargo xtask verify-goldens` refuses.
 
 **LUT-256.** When the node's input is u8 (a `ColorTransform` wired straight to an
 `ImageInput`, ahead of any `Dequantize`), the input takes only 256 values, so the plan
@@ -252,7 +266,9 @@ every node boundary.
 
 ## 12. What is `unverified` against LeRobot
 
-Marked per spec 12.4's rule that unverified is stated, not implied.
+Marked per spec 12.4's rule that unverified is stated, not implied. Item 2 moved from
+`unverified` to **measured** when the goldens were regenerated from torch (§13); item 6 is
+what that measurement turned up.
 
 1. **Which resize LeRobot actually calls — `unverified`, and the top question for review.**
    This note implements `interpolate(..., align_corners=False, antialias=False)`. torchvision's
@@ -261,9 +277,11 @@ Marked per spec 12.4's rule that unverified is stated, not implied.
    processor, or not at all. Until one of those call sites is read and pinned, the agreement
    claimed by spec 7.7 is untested for any downscale. If the answer is `antialias=True`, an
    antialiased kernel is an additional kernel id, not a change to this one.
-2. **u8 → f32 scaling — `unverified`.** `/255` matches `ToTensor`. Some LeRobot paths hand
-   over an already-float video frame decoded by torchcodec/ffmpeg, where the u8 quantisation
-   never happened.
+2. **u8 → f32 scaling — measured.** `cast_u8_hwc_to_f32_chw` is bit-equal to
+   `torchvision.transforms.functional.to_tensor` on the golden image: same permute, same f32
+   division by 255. What stays `unverified` is which LeRobot path is in play — some hand over
+   an already-float video frame decoded by torchcodec/ffmpeg, where the u8 quantisation never
+   happened.
 3. **`Normalize` statistics — `unverified`.** The plan applies whatever the IR carries. Whether
    those are LeRobot's per-dataset `mean`/`std` or ImageNet's is a dataset question, one layer
    up.
@@ -272,13 +290,39 @@ Marked per spec 12.4's rule that unverified is stated, not implied.
 5. **Ring-buffer fill behaviour before `n_steps` frames exist — `unverified`.** LeRobot's
    `delta_timestamps` clamps to the first frame of the episode, which is what `Align::Hold`
    does here, but the equality has not been run.
+6. **`resize_bilinear` away from the golden size — measured, and it disagrees.** A sweep of
+   4,624 (source, target) size pairs against torch 2.14 CPU: 1,585 bit-equal (the golden size
+   among them), the rest off by **1 to 4 ULP**. The half-pixel convention is *not* the cause —
+   the source indices agree exactly, and computing them in f64 and narrowing makes the
+   disagreement worse, not better, which is why §4 keeps the f32 path normative. What differs
+   is how the two tap weights are formed: this kernel takes `l0 = 1 - l1`, torch's CPU kernel
+   appears to normalise both by their sum, which is the only reading that explains a source
+   axis of length 1 — there torch returns the input value exactly (one tap, weight exactly 1)
+   while this kernel returns `l0 * v + l1 * v`, off by 1 ULP. Matching it means a new kernel id
+   (weights are part of the numerics `compiler_hash` covers) and a matching Slang change, so it
+   is a packet of its own, not a patch, and it needs torch's source read rather than inferred.
+   Until then, "matches PyTorch bit for bit" is true at the pinned golden sizes and
+   4-ULP-true elsewhere.
 
 ## 13. Goldens
 
-`tests/golden/observation/*.bin` + a `.json` sidecar per file (shape, dtype, kernel, a
-sentence on what it pins). Generated once by
-`cargo test -p es-compile --test gen_goldens -- --ignored`, then read-only for ever
-(spec 1.4; `cargo xtask verify-goldens` fails on any modification). Regenerating one is a
-deliberate act with a spec change behind it, never a way to make a test pass.
+`tests/golden/observation/*.bin` + a `.json` sidecar per file (shape, dtype, kernel, what it
+pins, the oracle call that produced it, and an optional `tolerance_ulp`).
+
+**They come from PyTorch and torchvision, never from the kernels they check** (spec 1.4):
+`crates/es-compile/python/gen_observation_goldens.py` imports nothing from this workspace, and
+the versions it was pinned against are in `docs/api-notes/torchvision.md`. Generating them
+from `es-compile` itself was the M1 review's blocker — a wrong half-pixel convention would
+have been enshrined rather than caught. Packet: `docs/packets/M1/P-M1-R1.md`.
+
+`cargo test -p es-compile --test gen_goldens` re-runs that script into a temp directory and
+fails if a byte differs, so provenance is machine-checked whenever torch is installed
+(`ES_PYTHON` points at it) and prints `SKIPPED` when it is not. Replacing a golden means
+running the script at `tests/golden/observation` and gating the commit with
+`GOLDEN_UPDATE=1 cargo xtask verify-goldens` — a deliberate act with a spec change behind it,
+never a way to make a test pass.
+
+Comparison is byte-for-byte unless the sidecar declares a `tolerance_ulp`; only
+`srgb_to_linear_lut256` does, at 7 ULP, for the reason in §6.
 
 Little-endian f32/u8, tightly packed — the same bytes the arena holds.

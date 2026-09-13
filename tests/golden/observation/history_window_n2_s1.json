@@ -2,9 +2,13 @@
   "name": "history_window_n2_s1",
   "dtype": "f32",
   "layout": "row-major, little-endian, tightly packed",
-  "shape": [2, 4],
+  "shape": [
+    2,
+    4
+  ],
   "kernel": "window_gather.v1",
   "pins": "oldest -> newest, current frame last; Align::Hold before the ring fills",
-  "generator": "cargo test -p es-compile --test gen_goldens -- --ignored",
+  "oracle": "torch.stack",
+  "generator": "crates/es-compile/python/gen_observation_goldens.py",
   "spec": "docs/design/observation-lowering.md"
 }

@@ -2,9 +2,14 @@
   "name": "dequantize_8x6_rgb",
   "dtype": "f32",
   "layout": "row-major, little-endian, tightly packed",
-  "shape": [3, 6, 8],
+  "shape": [
+    3,
+    6,
+    8
+  ],
   "kernel": "cast_u8_hwc_to_f32_chw.v1",
-  "pins": "the HWC u8 -> CHW f32 /255 boundary conversion (torchvision ToTensor)",
-  "generator": "cargo test -p es-compile --test gen_goldens -- --ignored",
+  "pins": "the HWC u8 -> CHW f32 /255 boundary conversion",
+  "oracle": "torchvision.transforms.functional.to_tensor",
+  "generator": "crates/es-compile/python/gen_observation_goldens.py",
   "spec": "docs/design/observation-lowering.md"
 }

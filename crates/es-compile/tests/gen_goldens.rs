@@ -1,148 +1,119 @@
-//! Generator for `tests/golden/observation/**` (spec 1.4).
+//! Provenance harness for `tests/golden/observation/**` (spec 1.4).
 //!
-//! Run **once**:
+//! The goldens are produced by `crates/es-compile/python/gen_observation_goldens.py`, which
+//! calls `PyTorch` and torchvision and never touches `es-compile`. This test re-runs that
+//! script into a temp directory and fails if a single byte differs from the checked-in files,
+//! so "these goldens came from the reference oracle" is a CI-checkable claim rather than a
+//! sentence in a design note.
+//!
+//! It **SKIPs, loudly, when torch/torchvision is absent** — spec 1.4 wants the harness to
+//! exist whether or not the oracle is installed on a given machine, and a missing wheel must
+//! not be reported as a passing provenance check. Point `ES_PYTHON` at an interpreter that
+//! has both to run it for real:
 //!
 //! ```text
-//! cargo test -p es-compile --test gen_goldens -- --ignored
+//! ES_PYTHON=<venv>/Scripts/python cargo test -p es-compile --test gen_goldens
 //! ```
 //!
-//! After that the files are read-only for ever: `cargo xtask verify-goldens` fails on any
-//! modification, and a golden is never edited to make a test pass. Regenerating one is a
-//! deliberate act with a spec change and a new kernel id behind it (design note §13).
-//!
-//! Layout on disk: little-endian, tightly packed, exactly the arena bytes. Each `.bin` has a
-//! `.json` sidecar naming shape, dtype, kernel and what the file pins.
+//! To *replace* the goldens after a deliberate spec change, run the script at the golden
+//! directory directly and gate the commit with `GOLDEN_UPDATE=1 cargo xtask verify-goldens`
+//! (design note §13). A golden is never edited to make a test pass.
 
-use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use es_compile::kernels;
-use es_ir::image::Rect;
-
-fn golden_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/observation")
+fn manifest(rel: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
-/// The 8x6 RGB u8 HWC synthetic gradient every image golden starts from. Chosen so every
-/// channel varies on a different axis: a channel swap or an HWC/CHW slip is visible.
-fn gradient_8x6() -> Vec<u8> {
-    let mut px = Vec::with_capacity(8 * 6 * 3);
-    for y in 0..6u32 {
-        for x in 0..8u32 {
-            px.push((x * 32) as u8);
-            px.push((y * 40) as u8);
-            px.push(((x + y) * 16) as u8);
+/// Interpreters to try, in order. `ES_PYTHON` overrides the search entirely — the same knob
+/// the `MuJoCo` and torch oracles use, so one venv serves all three.
+fn python_candidates() -> Vec<String> {
+    match std::env::var("ES_PYTHON") {
+        Ok(p) if !p.is_empty() => vec![p],
+        _ => vec!["python".to_owned(), "python3".to_owned()],
+    }
+}
+
+/// The first interpreter that can import both dependencies, or why none could.
+fn oracle_python() -> Result<String, String> {
+    let mut tried = Vec::new();
+    for python in python_candidates() {
+        match Command::new(&python)
+            .args(["-c", "import torch, torchvision"])
+            .output()
+        {
+            Ok(out) if out.status.success() => return Ok(python),
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                tried.push(format!(
+                    "`{python}`: {}",
+                    stderr.lines().last().unwrap_or("import failed").trim()
+                ));
+            }
+            Err(e) => tried.push(format!("`{python}`: {e}")),
         }
     }
-    px
+    Err(format!(
+        "no Python interpreter with torch + torchvision (set ES_PYTHON to choose one): {}",
+        tried.join("; ")
+    ))
 }
 
-fn write(name: &str, dtype: &str, shape: &[usize], kernel: &str, pins: &str, bytes: &[u8]) {
-    let dir = golden_dir();
-    fs::create_dir_all(&dir).expect("create tests/golden/observation");
-    fs::write(dir.join(format!("{name}.bin")), bytes).expect("write .bin");
-    let dims = shape
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-    let json = format!(
-        "{{\n  \"name\": \"{name}\",\n  \"dtype\": \"{dtype}\",\n  \"layout\": \"row-major, little-endian, tightly packed\",\n  \"shape\": [{dims}],\n  \"kernel\": \"{kernel}\",\n  \"pins\": \"{pins}\",\n  \"generator\": \"cargo test -p es-compile --test gen_goldens -- --ignored\",\n  \"spec\": \"docs/design/observation-lowering.md\"\n}}\n"
+fn run_script(python: &str, out_dir: &Path) {
+    let script = manifest("python/gen_observation_goldens.py");
+    let out = Command::new(python)
+        .arg(&script)
+        .arg(out_dir)
+        .output()
+        .unwrap_or_else(|e| panic!("spawn {python} {}: {e}", script.display()));
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
     );
-    fs::write(dir.join(format!("{name}.json")), json).expect("write .json");
-}
-
-fn f32_bytes(v: &[f32]) -> Vec<u8> {
-    v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
 
 #[test]
-#[ignore = "generator; goldens are written once and then read-only (spec 1.4)"]
-fn generate() {
-    let src = gradient_8x6();
-
-    // 1. ToTensor: HWC u8 -> CHW f32 / 255.
-    let mut chw = vec![0.0f32; 3 * 6 * 8];
-    kernels::cast_u8_hwc_to_f32_chw(&src, 6, 8, 3, &mut chw);
-    write(
-        "dequantize_8x6_rgb",
-        "f32",
-        &[3, 6, 8],
-        "cast_u8_hwc_to_f32_chw.v1",
-        "the HWC u8 -> CHW f32 /255 boundary conversion (torchvision ToTensor)",
-        &f32_bytes(&chw),
-    );
-
-    // 2. Bilinear downscale, align_corners=false, antialias=false.
-    let mut small = vec![0.0f32; 3 * 3 * 4];
-    kernels::resize_bilinear(&chw, 8, 6, 3, 4, 3, &mut small);
-    write(
-        "resize_bilinear_8x6_to_4x3",
-        "f32",
-        &[3, 3, 4],
-        "resize_bilinear.v1",
-        "half-pixel centres, align_corners=false, no antialias, PyTorch's tap association",
-        &f32_bytes(&small),
-    );
-
-    // 3. Crop.
-    let rect = Rect {
-        x: 2,
-        y: 1,
-        width: 4,
-        height: 4,
+fn the_goldens_are_what_the_torch_oracle_produces() {
+    let python = match oracle_python() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIPPED the_goldens_are_what_the_torch_oracle_produces: {why}");
+            return;
+        }
     };
-    let mut cropped = vec![0.0f32; 3 * 4 * 4];
-    kernels::crop(&chw, 8, 6, 3, rect, &mut cropped);
-    write(
-        "crop_8x6_at_2_1_4x4",
-        "f32",
-        &[3, 4, 4],
-        "crop.v1",
-        "origin top-left (OpenCV, spec 3.1); pairs with ImageSpec::cropped for the intrinsics",
-        &f32_bytes(&cropped),
-    );
 
-    // 4. The sRGB EOTF at every u8 input.
-    let lut = kernels::srgb_to_linear_lut();
-    write(
-        "srgb_to_linear_lut256",
-        "f32",
-        &[256],
-        "srgb_to_linear.v1",
-        "sRGB EOTF at k/255 via es_math::approx exp(2.4 * ln t); no std powf (DET-010)",
-        &f32_bytes(&lut),
-    );
+    let fresh = std::env::temp_dir().join("es-compile-observation-goldens");
+    let _ = std::fs::remove_dir_all(&fresh);
+    run_script(&python, &fresh);
 
-    // 5. Per-channel normalize with the ImageNet statistics.
-    let mean = [0.485f32, 0.456, 0.406];
-    let std = [0.229f32, 0.224, 0.225];
-    let mut norm = vec![0.0f32; 3 * 3 * 4];
-    kernels::normalize_mean_std(&small, 12, &mean, &std, &mut norm);
-    write(
-        "normalize_imagenet_4x3",
-        "f32",
-        &[3, 3, 4],
-        "normalize_mean_std.v1",
-        "(x - mean[c]) / std[c] by division, not by a reciprocal multiply",
-        &f32_bytes(&norm),
-    );
+    let checked_in = manifest("../../tests/golden/observation");
+    let mut names: Vec<_> = std::fs::read_dir(&checked_in)
+        .expect("tests/golden/observation")
+        .map(|e| e.expect("dir entry").file_name())
+        .collect();
+    names.sort();
+    assert!(!names.is_empty(), "no goldens to check");
 
-    // 6. A two-frame history window over a 4-element state, after three pushes.
-    let (slot, depth) = (4usize, 4usize);
-    let mut ring = vec![0.0f32; slot * depth];
-    for i in 0..3usize {
-        let f = i as f32;
-        kernels::history_push(&mut ring, slot, depth, i, &[f, f + 0.5, f + 1.0, f + 1.5]);
+    for name in names {
+        let want = std::fs::read(checked_in.join(&name)).expect("read checked-in golden");
+        let got = std::fs::read(fresh.join(&name)).unwrap_or_else(|e| {
+            panic!(
+                "the oracle did not produce `{}`: {e} — a golden with no generator is a golden \
+                 with no provenance (spec 1.4)",
+                name.to_string_lossy()
+            )
+        });
+        assert!(
+            want == got,
+            "`{}` differs from what the oracle just produced ({} vs {} bytes). Either the \
+             kernel semantics moved or torch/torchvision were upgraded past the versions \
+             pinned in docs/api-notes/torchvision.md.",
+            name.to_string_lossy(),
+            want.len(),
+            got.len()
+        );
     }
-    let mut win = vec![0.0f32; slot * 2];
-    kernels::window_gather(&ring, slot, depth, 2, 3, 2, 1, &mut win);
-    write(
-        "history_window_n2_s1",
-        "f32",
-        &[2, 4],
-        "window_gather.v1",
-        "oldest -> newest, current frame last; Align::Hold before the ring fills",
-        &f32_bytes(&win),
-    );
 }

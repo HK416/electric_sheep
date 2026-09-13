@@ -2,9 +2,13 @@
   "name": "srgb_to_linear_lut256",
   "dtype": "f32",
   "layout": "row-major, little-endian, tightly packed",
-  "shape": [256],
+  "shape": [
+    256
+  ],
   "kernel": "srgb_to_linear.v1",
-  "pins": "sRGB EOTF at k/255 via es_math::approx exp(2.4 * ln t); no std powf (DET-010)",
-  "generator": "cargo test -p es-compile --test gen_goldens -- --ignored",
-  "spec": "docs/design/observation-lowering.md"
+  "pins": "sRGB EOTF at k/255; the reference f64 formula rounded to f32, not a polynomial fit",
+  "oracle": "IEC 61966-2-1 in torch.float64, cast to float32",
+  "generator": "crates/es-compile/python/gen_observation_goldens.py",
+  "spec": "docs/design/observation-lowering.md",
+  "tolerance_ulp": 7
 }
