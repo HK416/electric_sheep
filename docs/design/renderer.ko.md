@@ -1,0 +1,296 @@
+<!-- Korean translation of docs/design/renderer.md. The English file is the working copy; regenerate this when it changes. -->
+
+# 렌더러 — 타일 아틀라스, 컴퓨트 래스터라이저, 컴퓨트 패스 트레이서
+
+Spec: 사양 §15 (비전 데이터 플레인: 렌더 → 관측, 타일 아틀라스, 렌더 경로, 가속 구조), §3.1 (OpenCV 카메라 및 이미지 컨벤션, sRGB 기본값), §3.3 (렌더링은 FP32, 카메라 상대 좌표), §3.4 (결정론적 실행 계약), §7.2 (`ImageSpec`), §16.2 (스플랫 경로는 별도 기능이 아니라 *렌더 경로*다), §28.3 W2 (타일 아틀라스 + 채널 계약), §28.6 (PT + ReSTIR + SVGF), §1.4 (골든 이미지가 오라클), §1.9 항목 2 (패스 트레이서가 두 번째로 삭감되는 대상).
+
+Crate: `es-render`, layer 5 (§4.2). `es-core`, `es-math`, `es-gpu`, `es-assets`, `es-sensor`만 사용할 수 있고 그 위는 사용할 수 없다. 특히 `es-ir`(layer 6)를 볼 수 없으므로, §7.2의 전체 `ImageSpec`은 여기서 사용할 수 *없다* — [§2.2](#22-imagespec-at-layer-5) 참고.
+
+## 0. 이것은 무엇이고 무엇이 아닌가
+
+`es-render`는 §15.1의 채널 계약을 다수의 카메라에 대해 한 번에, GPU에서, 프레임 내부에 호스트 왕복 없이 생산한다. 두 개의 렌더 경로가 있으며, 둘 다 **컴퓨트 셰이더**다:
+
+| 경로 | 무엇인가 | 상태 |
+|---|---|---|
+| `Rs` | 화면 공간 스캔 래스터라이저 | §15.3의 비전 학습 기본값 |
+| `Pt` | 패스 트레이서, 선택적 ReSTIR DI 및 SVGF 패스 | §1.9 항목 2, 삭감 가능 |
+
+`es-gpu`는 컴퓨트 파이프라인만 제공한다 — 그래픽스 파이프라인 없음, `VK_KHR_ray_tracing_pipeline` 없음, 가속 구조 확장 없음(`docs/design/gpu-foundation.md` 참고). 따라서 §15.4의 TLAS/BLAS 설계는 **구현되지 않는다**: 두 경로 모두 평평한 삼각형 배열을 인덱스 순서로 순회한다. 그것이 이 패킷의 정직한 한계이며, 이 crate가 테스트되는 씬 크기가 로봇 셀이 아니라 "수백 개의 삼각형"인 이유다.
+
+여기 없는 것, 의도적으로:
+
+- **스플랫.** §16.2는 3DGS를 이 crate의 세 번째 렌더 경로로 둔다. `es-splat`(layer 5, 같은 layer, 어느 방향으로도 의존 없음)이 오늘 자산 측을 소유한다. 나중을 위한 훅은 `RenderPath`다: `Splat` variant가 `Rs`/`Pt` 옆에 놓여 같은 채널을 같은 아틀라스에 쓴다. 아틀라스, 채널, `Atlas::read_tile` API의 어느 것도 삼각형을 전제하지 않는다.
+- **센서 리얼리즘**(§18.3: 왜곡, 롤링 셔터, 모션 블러, 노출, 샷 노이즈, 깊이 홀). 렌더러는 깨끗한 채널을 방출하고, 리얼리즘은 아틀라스에 대한 이후 패스다. 그 결과 §7.2의 `DistortionModel::None`과 `ShutterModel::Global`만 지원되며, 렌더러는 그 외를 요청하는 뷰를 조용히 무시하는 대신 *거부한다*.
+- **옵티컬 플로우 및 속도 채널.** `Channel::Flow`는 프리미티브별 이전 프레임 변환이 필요한데, 렌더러는 아직 이전 프레임 개념이 없다. 요청하면 에러이지, 빈 버퍼가 아니다.
+- **텍스처와 머티리얼.** geom당 평평한 알베도 하나, `Geom::rgba`에서. UV 없음, 텍스처 샘플링 없음, PBR 없음.
+
+## 1. 타일 아틀라스 (§15.2)
+
+### 1.1 레이아웃
+
+`maxMultiviewViewCount`는 데스크톱 GPU에서 32이므로, 수백 대의 카메라는 멀티뷰가 될 수 없다(§15.2). 모든 카메라는 하나의 **타일**을 받고, 타일은 채널당 하나의 아틀라스에 `tiles_per_row` 폭으로 행 우선 순서로 패킹된다:
+
+```
+TileAtlasCfg { tile_w, tile_h, tiles_per_row }
+
+rows          = ceil(n_tiles / tiles_per_row)
+atlas_w       = tiles_per_row * tile_w
+atlas_h       = rows          * tile_h
+tile_origin(i) = ( (i % tiles_per_row) * tile_w,
+                   (i / tiles_per_row) * tile_h )
+```
+
+`tile_origin`은 테이블 조회가 아니라 닫힌 형식이다: 레이아웃이 결정론적이므로, 다운스트림 소비자는 호스트 전송 없이 산술만으로 환경별 텐서를 재구성한다(§15.2). `n_tiles`가 고르게 나누어떨어지지 않으면 마지막 행은 패딩되며, 패딩된 타일은 채널의 배경값으로 초기화되고 `read_tile`이 절대 읽지 않는다.
+
+채널**당** 하나의 아틀라스이지, RGBA+깊이를 인터리브한 아틀라스 하나가 아니다. 이유: §15.1의 채널들은 원소 타입이 서로 다르고(`u8` ×3, `f32` ×1, `u32` ×1, `f32` ×3), 컴퓨트 셰이더는 `StructuredBuffer<T>`를 쓰므로, 인터리빙은 비트캐스트 계층과 패킹 규칙을 요구할 뿐 아무 이득이 없다. 그래서 `Atlas`는 `BTreeMap<Channel, Buffer>`를 보유한다.
+
+제약 확인(§15.2): `atlas_w`와 `atlas_h`는 모두 `maxImageDimension2D`(§15.2가 언급하는 데스크톱 GPU에서 16384) 이하여야 한다. 여기서 아틀라스는 `VkImage`가 아니라 버퍼이므로 이 한계가 물리적으로 구속하지는 않지만, 그래도 강제된다 — `es-compile`의 예산 모델이 강제하기 때문이며, 이 crate가 받아들이지만 예산이 거부하는 레이아웃은 거짓말이 되기 때문이다.
+
+### 1.2 `atlas_bytes()`
+
+이 공식은 `crates/es-compile/src/budget.rs`(§20.2)의 `render_tile_atlas` 항목의 **거울상**이다. `es-compile`은 layer 7이고 layer 5에서 의존할 수 없으므로, 산술은 중복되며 테스트로 고정된다:
+
+```
+atlas_bytes(cfg, n_tiles, channel)
+  = rows * tiles_per_row * tile_w * tile_h * components * dtype_bytes * 2
+                                                                       ^ 더블 버퍼
+```
+
+`components`는 `Channel::n_components()`, `dtype_bytes`는 `Channel::dtype()`에서 온다. `* 2`는 `budget.rs`가 적용하는 더블 버퍼 계수다.
+
+`Renderer`는 그것을 **할당하지 않는다**: 대신 `device_bytes()`를 할당하는데, 단일 버퍼이고 컴포넌트당 32비트 워드 하나다. 컴퓨트 셰이더가 워드 단위로 주소되는 스토리지 버퍼에 쓰기 때문이다. 그래서 `Rgb8`은 디바이스에서 픽셀당 패킹된 `RGBA8` 워드 하나이며(셰이더는 워드의 3바이트만 이웃과 경합 없이 쓸 수 없다), 사용하지 않는 알파는 `Atlas::read_tile`에서 버려진다. 따라서 `device_bytes`는 `atlas_bytes / 2`가 아니며, 두 이름이 모두 존재하는 이유는 어느 쪽도 다른 쪽인 것처럼 조용히 보고되지 않게 하기 위해서다: `atlas_bytes`를 할당량으로 보고하면 과대평가이고, `device_bytes`를 예산에 보고하면 정상 상태 계획을 과소평가하는 것이다.
+
+§15.2와 대조할 참고 수치: 224×224 `Rgb8` 타일 512개, `tiles_per_row = 23` → 행 23, 아틀라스 5152×5152, `atlas_bytes` = 23·23·224·224·3·1·2 = 159,258,624 B ≈ 152 MiB (사양의 87 MB는 단일 버퍼 512타일 수치이며, 5376×5376으로 다르게 패딩된 것이다 — 둘 다 `tiles_per_row`가 다를 뿐 같은 공식이다).
+
+## 2. 입력
+
+### 2.1 씬
+
+`Renderer::upload_scene(&SceneDesc)`는 `SceneDesc` 순서로 바디를 순회하며, 각 바디의 부모 체인으로부터 월드 포즈를 합성하고, 모든 `Geom`을 월드 공간 삼각형으로 테셀레이션한다:
+
+| `Shape` | 테셀레이션 |
+|---|---|
+| `Box` | 삼각형 12개 |
+| `Plane` | 유한 반폭에 대해 삼각형 2개; 무한 평면(`half_x == 0`)은 고정 100 m 반폭 사용 |
+| `Sphere` | UV 구, 고정 16×8 |
+| `Capsule` | 실린더 16 세그먼트 + 16×4 반구 캡 2개 |
+| `Cylinder`, `Ellipsoid` | 각각의 반지름으로 `Capsule`/`Sphere`와 동일 |
+| `Mesh` | `RenderError::Unsupported` — `SceneDesc`는 정점이 아니라 `AssetRef`를 갖고 있고, `es_assets::gltf::MeshData`를 연결하려면 이 패킷이 소유하지 않는 자산 리졸버가 필요하다 |
+| `HeightField` | `RenderError::Unsupported` |
+
+테셀레이션 개수는 품질 설정이 아니라 상수다: 개수를 바꾸면 모든 골든이 바뀌므로, 실수가 아니라 의도적인 편집이어야 한다.
+
+각 삼각형은 다음을 갖는다: 월드 위치 3개(f32), 월드 기하 노멀(f32×3, 삼각형 와인딩에서), 알베도(f32×3, `Geom::rgba`의 RGB), 이미션(f32×3, 이름이 `_light`로 끝나는 geom에서만 0이 아님 — [§4.2](#42-restir-di) 참고), 세그멘테이션 id(u32). 세그멘테이션 id는 `1 + 순회 순서에서의 geom 인덱스`이며, `0`은 배경을 의미한다. id는 1부터 시작하는 밀집값이라 `SegmentationId` 채널에서 `0`이 "히트 없음"을 명확히 나타낸다.
+
+버퍼 레이아웃은 삼각형당 스트라이드 20 floats(80 B)의 평평한 `f32` 배열이다 — `v0 v1 v2 n albedo emission seg pad`, 세그멘테이션 id는 슬롯 18에 `asuint` 비트캐스트된다. 버퍼 하나, 스트라이드 하나, 양쪽에서 동일하다.
+
+### 2.2 layer 5의 `ImageSpec`
+
+§7.2의 `ImageSpec`은 `es-ir`(layer 6)에 있다. `es-render`는 자신만의 **부분집합**인 `es_render::ImageSpec`을 정의하며, 렌더러가 준수하는 필드만 담는다:
+
+```rust
+pub struct ImageSpec {
+    pub width: u32,
+    pub height: u32,
+    pub intrinsics: Intrinsics, // fx, fy, cx, cy — 스큐 없음
+    pub near: f32,
+    pub far: f32,
+}
+```
+
+`color_space`는 `Rgb8`에 대해 `SRgb`로, `RgbF32Linear`/`PtRadiance`에 대해 `Linear`로 고정된다(§3.1: sRGB가 기본값이고 선형 변환은 암묵적이 아니라 명시적 노드다). `camera_model`은 `Pinhole`로, `distortion`은 `None`으로, `shutter`는 `Global`로 고정된다. 이것들이 필드가 아닌 이유는 필드가 선택을 암시하는데 여기에는 선택이 없기 때문이다; `es-ir`가 다운스트림에 붙이는 *Observation IR*의 `ImageSpec`은 전체 집합을 유지하며, `ImageSpec::to_contract()`는 §7.2의 타이밍 절반을 경계 너머로 나르는 `es_sensor::CameraContract`를 만든다.
+
+렌더러는 모든 뷰에 대해 `width == tile_w && height == tile_h`를 검증한다. 타일과 해상도가 다른 뷰는 리샘플이 아니라 에러다: 조용한 리샘플은 intrinsics를 바꿀 것이고(§7.2 `OBS-034`, INV-14), 이 crate에는 그것을 올바르게 할 `ImageSpec::resized`가 없다.
+
+### 2.3 카메라 컨벤션 (§3.1)
+
+`CameraView { pose, spec }`. `pose`는 `T_world_camera`다. 카메라 프레임은 OpenCV다: **+Z 전방, +X 오른쪽, +Y 아래**. 이미지 원점은 좌상단, x는 오른쪽, y는 아래쪽. 픽셀 `(px, py)`에 대한 주 광선은, 카메라 공간에서,
+
+```
+d_cam = ( (px + 0.5 - cx) / fx,
+          (py + 0.5 - cy) / fy,
+          1 )                         // 정규화되지 않음
+```
+
+이고, 월드 공간에서는 `o = pose.position`, `d = pose.orientation.rotate(d_cam)`이다. `d_cam.z == 1`이 정확히 성립하므로, 광선 파라미터 `t`는 나눗셈이나 별도의 깊이 재구성 없이 **곧** 미터 단위의 카메라 공간 깊이이며, `Depth32`의 `unit_m`은 `1.0`이다.
+
+§3.3은 카메라 상대 좌표를 요구한다. 렌더러는 이를 문자 그대로 취한다: 삼각형 위치는 한 번 `f64`→`f32`로 월드 공간에 업로드되고, 셰이더는 교차 전에 카메라 원점을 뺀다. 따라서 월드 원점에서 먼 정점도 *카메라로부터의* 거리만큼만 f32 가수부를 잃는다.
+
+## 3. `Rs` — 컴퓨트 래스터라이저
+
+아틀라스 픽셀당 스레드 하나; `[numthreads(8, 8, 1)]`; 디스패치는 아틀라스 전체를 덮으므로 패딩된 타일도 같은 커널에 의해 지워진다. 픽셀당:
+
+1. 타일 좌표(역변환된 `tile_origin`)에서 뷰 인덱스를 읽고, 그다음 뷰별 파라미터 버퍼에서 뷰의 포즈와 intrinsics를 읽는다.
+2. §2.3처럼 주 광선을 만든다.
+3. 삼각형 `0..n_tri`를 오름차순 인덱스로 **스캔**한다. 각각에 대해: Möller–Trumbore 교차; `t <= near` 또는 `t >= far`이면 거부(이것이 near/far 클립이다); 가장 작은 `t`를 가진 히트를 유지하고, 동률은 낮은 삼각형 인덱스로 깨뜨린다.
+4. 셰이딩하고 네 채널을 쓴다.
+
+이 루프에 대해 세 가지:
+
+- **비닝 단계가 없다.** `ponytail:` 공간 구조 없이 O(픽셀 × 삼각형) — 한계는 프레임당 수백 개의 삼각형이다. 업그레이드 경로는 §15.4의 TLAS인데, 아직 `es-gpu`가 노출하지 않는 Vulkan 확장이 필요하다; 타일당 삼각형 비닝 컴팩션 패스가 중간 단계이며 (2)와 (3) 사이에 출력을 바꾸지 않고 끼워진다.
+- **순회 순서가 곧 출력의 정체성이다.** 오름차순 인덱스, `t`에 대한 엄격한 `<`는 히트에 대한 전순서이므로, 승자는 스레드 스케줄링에 의존하지 않는다. 깊이 버퍼도 없고 읽기-수정-쓰기도 없으므로 원자적 연산도 없다(어차피 §3.4가 FP 원자적 연산을 금지한다).
+- **커버리지와 깊이는 패스 트레이서가 쓰는 것과 동일한 광선-삼각형 교차에서 나온다.** 화면 공간 에지 함수와 보간된 `1/z`에서가 아니다. 이것이 §15.3의 요구사항 "깊이, 세그, 노멀은 RS와 PT 사이에 비트 동일"이 근사가 아니라 *구성상* 성립하는 이유의 전부다 — [§6](#6-pt--rs-channel-agreement-14) 참고. 그렇다면 이것을 래스터라이저라고 부르는 것은 고정 함수 삼각형 셋업이 아니라 *루프 구조*(픽셀당 스레드 하나, 프리미티브 스캔, 깊이 테스트)에 대한 진술이다.
+
+### 3.1 셰이딩
+
+플랫 + 램버트, 방향광 하나 `L`(`RenderConfig` 필드, 광원을 *향한* 월드 공간 방향, 그리고 앰비언트 항):
+
+```
+n        = geometric normal, flipped to face the ray
+lambert  = ambient + max(0, dot(n, L)) * (1 - ambient)
+rgb_lin  = albedo * lambert
+```
+
+`Rs`에는 그림자 광선이 없다 — 그림자 광선은 픽셀당 전체 삼각형 배열을 다시 한번 스캔하는 것이며, `Pt` 경로가 제대로 모델링하는 효과 하나를 위해 기본 비전 경로의 비용을 두 배로 만든다. `ponytail:` `Rs`에는 그림자 없음; 누락된 접촉 그림자가 정책에 실제로 해를 끼친다는 골든이 나오면 그림자 스캔을 추가.
+
+`Rgb8`은 `rgb_lin`을 **정확한 조각별 sRGB 전달 함수**로 인코딩한 것이다(§3.1: sRGB가 기본 색공간):
+
+```
+srgb(c) = 12.92 * c                              c <= 0.0031308
+        = 1.055 * c^(1/2.4) - 0.055              otherwise
+u8      = round_half_away_from_zero(255 * clamp(srgb, 0, 1))
+```
+
+`c^(1/2.4)`는 양쪽에서 `es_exp(es_ln(c) * (1/2.4))`다 — CPU에서는 `es_math::approx`, GPU에서는 `approx.slang`(§3.2 `DET-010`: 관측 경로에서 `std`/`GLSL.std.450` 초월함수 금지). §28.7 게이트 3이 이미 그 둘이 비트 단위로 일치함을 증명하며, 이것이 `Rgb8`을 CPU에서 생성된 골든과 비트 비교할 수 있게 만드는 이유다.
+
+### 3.2 기록되는 채널
+
+| 채널 | 값 | 배경 |
+|---|---|---|
+| `Rgb8` | 위 참고, u8 × 3 | `0, 0, 0` |
+| `Depth32 { unit_m: 1.0 }` | 카메라 공간 미터 단위 `t` | `far` |
+| `SegmentationId` | geom id, 1부터 시작 | `0` |
+| `Normal` | 카메라 공간의 면 노멀(`Channel::Normal`은 카메라 공간이라고 문서화됨), 단위 길이, f32 × 3 | `0, 0, 0` |
+
+이 집합 밖의 채널(`Rs` 경로에서 `Flow`, `RgbF32Linear`, `PtRadiance`)을 요청하는 `RenderConfig`는 `RenderError::UnsupportedChannel`이다.
+
+## 4. `Pt` — 컴퓨트 패스 트레이서 (§28.6, §1.9 항목 2)
+
+`Pt { spp, bounces, restir, svgf }`. 픽셀당 스레드 하나, `spp` 샘플, `bounces` 비스페큘러 바운스, 모두 디퓨즈. `PtRadiance`(선형 f32×3)와, §15.3이 `Rs`와 일치하기를 요구하는 `Depth32`/`SegmentationId`/`Normal` 채널(**샘플 0의 1차 히트**에서)을 쓴다.
+
+샘플당 추정자:
+
+```
+throughput = 1
+radiance   = 0
+ray        = primary
+for bounce in 0..bounces:
+    hit = scan(ray)                       // same routine as Rs
+    if !hit: radiance += throughput * sky; break
+    radiance += throughput * emission(hit)
+    throughput *= albedo(hit)             // cosine-weighted sampling cancels
+                                          // the cos term and the 1/pi BRDF
+    ray = cosine_hemisphere(n, rng)
+radiance /= spp                           // accumulated in a fixed sample order
+```
+
+코사인 가중 반구 샘플링은 디퓨즈 throughput 갱신을 알베도 곱셈만으로 만들어, pdf로 나누는 일도 0/0의 가능성도 없다. 러시안 룰렛은 **사용하지 않는다**: 픽셀당 작업량을 데이터 의존적으로 만들 것이고, 어차피 바운스 개수는 고정된 작은 값이다.
+
+`spp` 누적은 오름차순 샘플 인덱스로 하는 평범한 순차 `+=`이지, 트리도 `DeterministicAcc`도 아니다. §18.4의 비닝 누적기는 *순서*가 고정되지 않은 리덕션을 위한 것이다; 여기서는 루프가 순서를 고정하므로 저렴한 방법이 곧 재현 가능한 방법이다.
+
+### 4.1 RNG
+
+카운터 기반이며 스텝이 아니라 주소로 접근한다. `es_env::rng`(§3.4: 전역 RNG 없음)와 정확히 같은 설계다: 값은 자신의 좌표만의 순수 함수다.
+
+```
+key(view, px, py, sample, bounce, stream)
+    = mix32( mix32( mix32( mix32( mix32(seed ^ view) ^ (px*73856093 ^ py*19349663) )
+                           ^ sample ) ^ bounce ) ^ stream )
+```
+
+`mix32`는 32비트 파이널라이저 `(z ^= z>>16) *= 0x85eb_ca6b; (z ^= z>>13) *= 0xc2b2_ae35; z ^= z>>16`이다. **32비트이지 `es_env::rng`의 splitmix64가 아니다**: Slang의 `uint64_t`는 `shaderInt64`가 필요한데, 이 crate가 실행되어야 하는 모든 타깃(특히 MoltenVK)에서 §3.3이 그것을 보장하지 않는다. 반면 32비트 믹서는 능력 검사 없이도 Rust와 Slang 사이에서 비트 동일하다. "고정 바운스 디퓨즈 패스 트레이서에 충분히 비상관"을 넘어서는 통계적 품질은 `미검증 (unverified)`이며, 렌더링 이외에는 어디에도 쓰이지 않는다.
+
+`[0, 1)`의 `f32`는 `(x >> 8) as f32 * (1 / 16777216)`이며 — 양쪽에서 정확하고, 절대 1.0이 되지 않는다.
+
+### 4.2 ReSTIR DI
+
+교과서적인 ReSTIR DI이며, `Pt { restir: true }`로 켜지고 기본값은 꺼짐이다. 세 개의 패스, 세 번의 디스패치, 패스당 예비 버퍼 하나(제자리 갱신이 없으므로 읽기/쓰기 위험도, 패스 내 디스패치 순서 의존도 없음):
+
+1. **초기 후보.** 이미셔티브 삼각형(이름이 `_light`로 끝나는 geom; `Geom::rgba`의 RGB가 방출 복사휘도) 위에서 균일 샘플 `M = 8`개. 비가려짐 타겟 함수 `p̂ = |albedo/π · Le · G|`에 대한 가중 예비 샘플링, 그다음 생존자에 대해 그림자 스캔 **한 번**. 가려지지 않은 생존자는 `W = 0`을 유지한다.
+2. **시간적 재사용**, 패스 하나: 같은 픽셀에서 이전 `render()` 호출이 남긴 예비와 결합한다. 모션 벡터 재투영은 없다 — 이전 예비는 *같은* 픽셀에서 읽히며, 이는 정적 카메라와 정적 지오메트리에서만 옳다. 첫 `render()`에서는 이전 버퍼가 모두 0이므로 이 패스는 아무 일도 하지 않고 프레임은 공간적 재사용만 한다. 숨기지 않고 문서화됨: 움직이는 카메라는 오래된 재사용을 겪으며 이는 지연으로 보인다.
+3. **공간적 재사용**, 패스 하나: 고정 오프셋 `(±3, 0), (0, ±3)`의 이웃 4개와 결합하며, 각각 깊이가 10% 이내이고 노멀이 25° 이내일 때만 받아들인다(표준 기하 유사성 테스트). RNG로 흔들린 것이 아니라 고정 오프셋이다: 지터는 덜 상관된 노이즈를 사서 결과가 오직 픽셀 격자만의 함수라고 말할 수 있는 능력을 대가로 치른다.
+
+건너뛴 것, §28.6이 채워야 할 목록: MIS 가중치(예비들은 재사용을 편향 없이 만드는 GRIS/pairwise-MIS 가중치가 아니라 편향된 `1/M` 결합을 쓴다), 재사용 시의 편향 보정 가시성 재검사, ReSTIR **GI** 전체(이것은 직접광만이며, 간접 바운스는 위의 평범한 패스 트레이스 추정자를 통과한다), 여러 광원 타입(이미셔티브 삼각형뿐 — 환경맵 없음, 해석적 광원 없음), `M`을 20에서 클램핑하는 것 이상의 예비 노화.
+
+### 4.3 SVGF
+
+`Pt { svgf: true }`로 켜지고 기본값은 꺼짐이다. à-trous 패스 세트 **하나**, `n`번 반복(`svgf_iterations`, 기본 4), 2D에 걸쳐 스트라이드 `1 << i`로 분리된 표준 5탭 B-스플라인 웨이블릿 커널 `(1, 4, 6, 4, 1)/16`, 깊이와 노멀에 대한 에지 스토핑:
+
+```
+w = w_depth * w_normal
+w_depth  = exp(-|z_p - z_q| / (sigma_z * |grad z| + eps))
+w_normal = max(0, dot(n_p, n_q))^sigma_n
+```
+
+건너뛴 것: SVGF의 **V**. 색상의 시간적 누적도, 픽셀당 분산 추정도, 분산 유도 `w_luminance` 항도, 저샘플 영역을 위한 7×7 분산 프리필터도, 디스오클루전 처리도, 히스토리 길이 기반 커널 확장도 없다. 남은 것은 에지 인지 à-trous 필터다 — 실제로 유용한 디노이저이지만 SVGF 논문의 알고리즘은 아니다. §28.6이 그렇게 이름 붙였기 때문에 `svgf`라고 불리며, 커널의 문서 주석도 이 문단과 똑같은 말을 한다.
+
+## 5. CPU 레퍼런스 (§1.4)
+
+오라클은 GPU가 아니다. `es_render::cpu`는 순수 Rust로, `es-gpu` 없이, `unsafe` 없이 작성되었고, `tests/golden/render/`의 모든 골든을 생성하는 것이 바로 이것이다.
+
+```rust
+pub fn rasterize(scene: &TriScene, view: &CameraView, cfg: &RenderConfig) -> CpuFrame
+pub fn path_trace(scene: &TriScene, view: &CameraView, cfg: &RenderConfig) -> CpuFrame
+```
+
+`CpuFrame`은 채널당 `Vec` 하나와 타일 형태를 보유한다. 두 함수는 셰이더와 *같은 알고리즘*이며, 식 단위, 같은 순서로 — 같은 교차 루틴, 같은 순회 순서, 같은 `es_math::approx` 호출, 같은 누적 순서다. 두 텍스트가 갈리는 곳에서는 Slang이 틀린 것이지, Rust가 틀린 것이 아니다.
+
+이것이 골든을 GPU 경로가 아니라 **한 번** CPU 경로로 생성하는 이유다: RTX 4060에서 만들어진 골든은 그 드라이버의 산술을 저장소에 구워 넣을 것이고, 다음 디바이스는 실제로는 디바이스 차이일 뿐인 테스트를 "실패"할 것이다. 골든 파일은 CI 읽기 전용이며(§1.4), `xtask verify-goldens`가 강제한다.
+
+골든을 위한 씬: Rust로 만든 Cornell box(`es_render::cornell`) — 벽 5개(흰색, 빨간 왼쪽, 초록 오른쪽), 내부 상자 2개, 이미셔티브 천장 패널 `ceiling_light` 1개, 64×64 타일, 카메라 1개, 방향광 1개. geom 8개, 삼각형 96개.
+
+**그 씬에는 동일 평면 위의 면이 두 개도 없으며**, 내부 두 상자는 바닥에 파묻혀 있다. 이것은 스타일이 아니라 정확성 요구사항이다: 두 삼각형이 평면을 공유하는 곳에서는 광선이 정확히 같은 `t`에서 둘 다 맞고, 승자는 barycentrics가 `u + v <= 1`의 어느 쪽에 떨어지는지로 결정되는데 — 이는 CPU와 GPU가 1 ULP만큼 다르게 답할 수 있는 것이다. 벽이 바닥과 천장에 단순히 맞닿기만 했을 때는, 4096 픽셀 중 9개가 GPU에서 다른 면을 골랐고(반올림이 아니라 전체 픽셀 색상 차이), 깊이와 세그멘테이션은 여전히 일치했다. 벽을 바닥과 천장에 겹쳐 넣자 그 아홉 개가 모두 사라졌다.
+
+| 골든 | 채널 | dtype | shape |
+|---|---|---|---|
+| `cornell_rs_rgb8` | `Rgb8` | u8 | 64×64×3 |
+| `cornell_rs_depth` | `Depth32` | f32 | 64×64 |
+| `cornell_rs_seg` | `SegmentationId` | u32 | 64×64 |
+| `cornell_pt1spp` | `PtRadiance` | f32 | 64×64×3 |
+
+`cornell_pt1spp`는 1 spp, 바운스 2, ReSTIR와 SVGF는 꺼짐이다 — RNG, 바운스 루프, 이미셔티브 히트를 모두 운동시키는 가장 작은 것이며, 64 샘플의 노이즈까지 고정하지 않고도 골든이 비트 정확하게 고정할 수 있는 유일한 PT 구성이다.
+
+### 5.1 허용 오차
+
+주장된 허용 오차와, NVIDIA RTX 4060 Laptop GPU(드라이버 592.82, Slang 2026.8)에서 64×64로 **측정된** 값:
+
+| 비교 | 주장 | 측정 |
+|---|---|---|
+| CPU `Rs`/`Pt` vs 골든 | 비트 동일(생성한 주체이므로) | 비트 동일, 골든 4개 모두 |
+| GPU `Rs` `Rgb8` vs 골든 | 비트 동일 | 12288 바이트 중 0개 차이 |
+| GPU `Rs` `SegmentationId` vs 골든 | 비트 동일 | 비트 동일 |
+| GPU `Rs` `Depth32` vs 골든 | ≤ 1 ULP | **0 ULP** |
+| GPU `Rs` `Normal` vs 골든 | ≤ 1 ULP | **0 ULP** |
+| GPU `Pt` 1 spp vs CPU `Pt` 1 spp | 비트 동일 | 0 ULP |
+| GPU `Pt` + SVGF vs CPU | 비트 동일 | 0 ULP |
+| GPU `Rs` 실행 A vs 실행 B | 비트 동일, 모든 채널 | 비트 동일 |
+| GPU `Pt` + ReSTIR (+ SVGF) vs CPU | ≤ 1e-5 정규화 | **1.3e-7 정규화, 최대 10 ULP** |
+
+`Depth32`와 `Normal`이 0이 아니라 1 ULP까지 허용되는 이유는 Möller–Trumbore 나눗셈이 두 텍스트가 정당하게 다를 수 있는 유일한 지점이기 때문이다 — 한쪽의 `(1/det) * x`와 다른 쪽의 `x / det`는 소스 차이가 아니라 컴파일러 선택이다. 이 디바이스는 우연히 0을 준다. 테스트는 측정된 ULP를 출력하므로, 0에서 1로의 회귀는 1이 통과하더라도 눈에 보인다.
+
+**ReSTIR는 비트 동일하지 않은 유일한 경로**이며, 이미지 피크의 10 ULP / 1.3e-7이다. 예비 패스들은 이웃에 걸쳐 `p̂ · W · M`을 합산하는데, 셰이더 컴파일러는 `NoContraction` 아래에서도 단일 식 내에서 재결합할 자유가 있다. 그 결과는 숫자가 보여주는 것보다 나쁘다: 재샘플링 결정은 임계값 `rand · w_sum < weight`이므로, 가중치의 1 ULP 차이가 픽셀에서 *다른* 광원 샘플을 고를 수 있다. 이 디바이스, 이 해상도에서는 일어나지 않았고, 설계상 그것을 막는 것은 아무것도 없다 — 이것이 허용 오차가 픽셀당이 아니라 이미지 피크에 대해 명시되는 이유다(렌더링된 이미지 대부분은 0에 가깝고, 1e-7 픽셀에서의 1e-7 차이는 아무도 구별할 수 없는 이미지에 대해 100% 상대 오차다).
+
+## 6. PT ↔ RS 채널 일치 (§1.4, §15.3)
+
+§15.3의 출력 계약은 깊이, 세그멘테이션, 노멀이 렌더 경로 사이에서 **비트 동일**하고 RGB만 유사성 임계값이라고 말한다. 테스트 `pt_and_rs_agree_on_geometry`는 같은 씬을 두 경로로 렌더링하여 정확히 그것을 단언하며, CPU에서(어디서나 실행되도록) 그리고 GPU에서(디바이스 고유 발산도 잡히도록):
+
+```
+rs.depth == pt.depth        bitwise
+rs.seg   == pt.seg          bitwise
+rs.normal == pt.normal      bitwise
+```
+
+이것이 구성상 성립하는 이유는 두 경로 모두 1차 광선에 대해 같은 순서로 같은 삼각형 배열에 대해 같은 `nearest_hit`을 호출하고, `Pt`가 어떤 바운스나 RNG 추출 이전에 샘플 0의 1차 히트에서 이 세 채널을 쓰기 때문이다. 나중에 누군가 `Rs` 스캔을 진짜 고정 함수 스타일 래스터라이저로 바꾸면 이 테스트가 실패할 것이고, 그 수정은 문서화된 깊이 허용 오차이지 골든 변경이 아니다.
+
+RGB는 경로 사이에서 비교되지 *않는다*: `Rs`는 원바운스 해석적 셰이딩이고 `Pt`는 다른 적분의 몬테카를로 추정이다. 둘 사이의 SSIM 임계값(§15.3이 요구하는 것)은 수렴된 PT 렌더와 SSIM 구현이 필요하며, 둘 다 여기서는 `미검증 (unverified)`이고 패스 트레이서를 실전으로 만드는 §28.6 패킷에 속한다.
+
+## 7. 결정론 (§3.4)
+
+- 컴퓨트 큐 하나, 레코더 하나, 모든 디스패치 뒤에 전체 배리어 — 모두 `es-gpu`에서 상속되며 여기서는 선택 사항이 아니다.
+- 원자적 연산 없음. 공유 메모리 없음. 서브그룹 연산 없음. 워크그룹 개수에 대한 의존 없음: 모든 커널은 `SV_DispatchThreadID`만으로 인덱싱하고 경계를 검사한다.
+- 모든 초월함수는 `approx.slang` / `es_math::approx`를 거친다.
+- `ExecModes`는 `Gpu::deterministic_execution_modes()`에서 오며 모든 `SlangCompiler::compile_file` 호출에 전달되므로, `NoContraction`과 §3.4 3단계 실행 모드가 모든 모듈에 들어간다.
+- `HashMap` 없음. 채널 맵은 `BTreeMap`, 나머지는 모두 뷰로 인덱싱되는 `Vec`.
+- RNG는 `(view, pixel, sample, bounce, stream)`으로 주소되므로, 샘플 순서, 스레드 순서, 디스패치 형태가 추출값을 바꿀 수 없다.
+
+이것이 **사지 않는 것**: 디바이스 *간* 비트 동일. §3.5 tier 1은 실행 해시에 같은 `hardware_capability`를 요구하고, 위의 `Depth32` 1 ULP 허용 오차는 이미 GPU와 CPU가 같은 텍스트의 서로 다른 두 구현이라는 인정이다. 이 crate가 하는 주장은: 같은 디바이스, 같은 바이너리 → 같은 비트; 그리고 명시된 허용 오차에서의 CPU → GPU 일치, 그것뿐이다.
