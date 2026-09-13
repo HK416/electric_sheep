@@ -7,17 +7,32 @@
 //! on-disk format this crate assumes is described — and its uncertainty marked — in
 //! `docs/api-notes/lerobot-dataset.md`.
 //!
-//! Layer rule (spec 4.2): this crate may depend on `es-core`, `es-ir` and external crates
-//! only.
+//! The learning loop (spec 13) lives here too: `collect` rolls out episodes into a dataset,
+//! `intervention` labels them, and `distill` merges and splits — see
+//! `docs/design/learning-loop.md`.
+//!
+//! Layer rule (spec 4.2): this crate is layer 10, so it may depend on any lower layer —
+//! `es-core`, `es-ir`, `es-assets`, `es-physics-core`, `es-compile`, `es-policy`, `es-safety`,
+//! `es-env` — and on external crates.
 #![forbid(unsafe_code)]
 
+pub mod collect;
 pub mod identity;
+pub mod intervention;
 pub mod lerobot;
 pub mod lerobot_config;
 
 use std::path::{Path, PathBuf};
 
+pub use collect::{
+    append_loop_step, distill, read_loop_steps, CollectReport, CollectSpec, Collector, Intervener,
+    LoopKind, LoopStep, SplitSpec,
+};
 pub use identity::{BaseModel, DatasetIdentity, Split, TrainingIdentity};
+pub use intervention::{
+    label, ActionSourceCode, InterventionSegment, InterventionSource, LabelReport, ACTION_SOURCE,
+    INTERVENTION,
+};
 pub use lerobot::{
     Column, Dtype, Episode, EpisodeMeta, FeatureSpec, Info, LeRobotDataset, LeRobotWriter, Task,
     VideoRef,
@@ -56,6 +71,10 @@ pub enum DataError {
     /// Canonical encoding refused a value (spec 11.2: `NaN` has no canonical form).
     #[error("canonical encoding failed: {0}")]
     Canon(es_ir::Diagnostic),
+    /// A learning-loop step (spec 13) refused: the env runtime, the Safety Plane or the
+    /// policy said no, or the step's own arguments do not describe a runnable loop.
+    #[error("learning loop: {0}")]
+    Loop(String),
 }
 
 impl DataError {

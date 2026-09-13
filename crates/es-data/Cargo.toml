@@ -9,6 +9,14 @@ license.workspace = true
 es-core = { workspace = true }
 es-ir = { workspace = true }
 es-math = { workspace = true }
+# The learning loop (spec 13): `collect` rolls out a policy through the env runtime with the
+# mandatory Safety Plane. es-data is layer 10, so every one of these is strictly lower.
+es-assets = { workspace = true }
+es-compile = { workspace = true }
+es-env = { workspace = true }
+es-physics-core = { workspace = true }
+es-policy = { workspace = true }
+es-safety = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -19,9 +27,6 @@ parquet = { version = "59.3", default-features = false }
 
 [dev-dependencies]
 proptest = { workspace = true }
-# Oracle only (P-M2-R2): a converted config must actually plan. es-data is layer 10 and
-# es-compile layer 7, so this is a legal, strictly-lower dependency.
-es-compile = { workspace = true }
 
 [lints]
 workspace = true
