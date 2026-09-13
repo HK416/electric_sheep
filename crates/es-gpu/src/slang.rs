@@ -7,14 +7,41 @@
 //! that a deployment target needs no Slang at all (§11.4), and what makes the cache
 //! shareable between ranks (§22).
 
-use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::caps::ExecModes;
 use crate::error::GpuError;
 use crate::spirv;
+
+/// Process-wide, so scratch names are unique across every `SlangCompiler` instance and every
+/// thread in this process, not just within one instance's own invocation count.
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// One `compile` call's `slangc` input/output, in the OS temp dir rather than the cache dir —
+/// so two calls (any two threads, any two `SlangCompiler`s) never share a file even when they
+/// share a cache key. Removed on drop, success or failure.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new(n: u64) -> Result<Self, GpuError> {
+        let dir = std::env::temp_dir().join(format!("es-slang-{}-{n}", std::process::id()));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 /// A compiled SPIR-V module.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -33,7 +60,7 @@ pub struct SlangCompiler {
     version: String,
     cache_dir: PathBuf,
     include_dirs: Vec<PathBuf>,
-    invocations: Cell<usize>,
+    invocations: AtomicUsize,
 }
 
 impl SlangCompiler {
@@ -57,7 +84,7 @@ impl SlangCompiler {
             version,
             cache_dir: default_cache_dir(),
             include_dirs: Vec::new(),
-            invocations: Cell::new(0),
+            invocations: AtomicUsize::new(0),
         })
     }
 
@@ -75,7 +102,7 @@ impl SlangCompiler {
 
     /// How many times `slangc` has actually been started. A cache hit does not move this.
     pub fn invocations(&self) -> usize {
-        self.invocations.get()
+        self.invocations.load(Ordering::Relaxed)
     }
 
     pub fn cache_dir(&self) -> &Path {
@@ -102,11 +129,15 @@ impl SlangCompiler {
         }
 
         std::fs::create_dir_all(&self.cache_dir)?;
-        // Scratch names carry the process id and an invocation counter: two processes (or
-        // two test threads) compiling the same key must not delete each other's input.
-        let tag = format!("{}-{}", std::process::id(), self.invocations.get());
-        let src_path = self.cache_dir.join(format!("{hash}.{tag}.slang"));
-        let out_path = self.cache_dir.join(format!("{hash}.{tag}.raw.spv"));
+        // Scratch input/output live in a per-call temp dir, named by a process-wide atomic
+        // counter, so no two calls — different threads, different `SlangCompiler`s, even the
+        // same key — ever share a file. The files inside are further tagged by the counter
+        // and thread id for a readable name if one is left behind by a crash.
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let tid = format!("{:?}", std::thread::current().id());
+        let scratch = ScratchDir::new(n)?;
+        let src_path = scratch.path().join(format!("{hash}-{n}-{tid}.slang"));
+        let out_path = scratch.path().join(format!("{hash}-{n}-{tid}.raw.spv"));
         std::fs::write(&src_path, source)?;
 
         let mut cmd = Command::new(&self.exe);
@@ -130,12 +161,12 @@ impl SlangCompiler {
             cmd.arg(format!("-D{k}={v}"));
         }
 
-        self.invocations.set(self.invocations.get() + 1);
+        self.invocations.fetch_add(1, Ordering::Relaxed);
         let out = cmd
             .output()
             .map_err(|e| GpuError::SlangcMissing(format!("{}: {e}", self.exe.display())))?;
         if !out.status.success() {
-            let _ = std::fs::remove_file(&src_path);
+            // `scratch` is removed on drop below; nothing to clean up here.
             return Err(GpuError::SlangcFailed(
                 String::from_utf8_lossy(&out.stderr).trim().to_owned(),
             ));
@@ -147,12 +178,15 @@ impl SlangCompiler {
         // in. See docs/api-notes/slang.md.
         let words = spirv::apply_exec_modes(&raw, modes)
             .ok_or_else(|| GpuError::Spirv("slangc output has no entry point".to_owned()))?;
-        // Publish the cache entry by rename, so a concurrent reader never sees half a file.
-        let partial = self.cache_dir.join(format!("{hash}.{tag}.partial"));
-        std::fs::write(&partial, bytes_from_words(&words))?;
-        std::fs::rename(&partial, &cached)?;
-        let _ = std::fs::remove_file(&src_path);
-        let _ = std::fs::remove_file(&out_path);
+        // Publish the cache entry by write-then-rename to a name unique to this call, so a
+        // concurrent reader never sees half a file. Two calls racing on the same cache key
+        // compile independently and both reach here — deterministic compilation (spec §3.4)
+        // means their bytes are identical, so whichever rename lands second just overwrites
+        // the first with the same content; the cache dir still ends up with exactly one
+        // `<hash>.spv`.
+        let tmp = self.cache_dir.join(format!("{hash}.spv.tmp-{n}"));
+        std::fs::write(&tmp, bytes_from_words(&words))?;
+        std::fs::rename(&tmp, &cached)?;
 
         Ok(SpirvModule {
             words,
@@ -262,7 +296,7 @@ mod tests {
             version: version.to_owned(),
             cache_dir: PathBuf::from("/nonexistent"),
             include_dirs: Vec::new(),
-            invocations: Cell::new(0),
+            invocations: AtomicUsize::new(0),
         }
     }
 
@@ -322,5 +356,107 @@ mod tests {
         assert_eq!(words_from_bytes(&bytes_from_words(&w)).unwrap(), w);
         assert!(words_from_bytes(&[1, 2, 3]).is_err());
         assert!(words_from_bytes(&[]).is_err());
+    }
+
+    fn slangc_available() -> bool {
+        let exe = std::env::var("ES_SLANGC").unwrap_or_else(|_| "slangc".to_owned());
+        Command::new(exe).arg("-v").output().is_ok()
+    }
+
+    /// A real compiler (not the `/nonexistent`-`cache_dir` one above) pointed at `cache_dir`.
+    fn real_compiler(cache_dir: &Path) -> SlangCompiler {
+        SlangCompiler {
+            exe: PathBuf::from(std::env::var("ES_SLANGC").unwrap_or_else(|_| "slangc".to_owned())),
+            version: "test".to_owned(),
+            cache_dir: cache_dir.to_path_buf(),
+            include_dirs: Vec::new(),
+            invocations: AtomicUsize::new(0),
+        }
+    }
+
+    const TEST_SOURCE: &str = r#"
+[[vk::binding(0, 0)]] RWStructuredBuffer<float> dst;
+[[vk::binding(1, 0)]] StructuredBuffer<float> src;
+
+[shader("compute")]
+[numthreads(64, 1, 1)]
+void main(uint3 tid : SV_DispatchThreadID) {
+    uint i = tid.x;
+    dst[i] = src[2 * i] + src[2 * i + 1];
+}
+"#;
+
+    /// Oracle for the bug this module fixes: two calls compiling the *same* cache key at the
+    /// same time, whether through one shared `SlangCompiler` or through separate instances,
+    /// must not delete each other's scratch input (`os error 2`) and must leave the cache
+    /// with exactly one published `.spv` for that key. SKIP when `slangc` is unavailable
+    /// (spec 1.4).
+    #[test]
+    fn eight_concurrent_compiles_of_the_same_key_do_not_clobber_each_other() {
+        if !slangc_available() {
+            println!("SKIP eight_concurrent_compiles_of_the_same_key_do_not_clobber_each_other: no slangc");
+            return;
+        }
+
+        let cache_dir = std::env::temp_dir().join(format!(
+            "es-slang-test-cache-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&cache_dir);
+
+        let shared = real_compiler(&cache_dir);
+        let results: Vec<Result<SpirvModule, GpuError>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8u32)
+                .map(|i| {
+                    let cache_dir = cache_dir.clone();
+                    let shared = &shared;
+                    scope.spawn(move || {
+                        let d = BTreeMap::new();
+                        if i % 2 == 0 {
+                            // A separate `SlangCompiler` instance, same cache dir and key.
+                            real_compiler(&cache_dir).compile(
+                                TEST_SOURCE,
+                                "main",
+                                "glsl_450",
+                                &d,
+                                ExecModes::none(),
+                            )
+                        } else {
+                            shared.compile(TEST_SOURCE, "main", "glsl_450", &d, ExecModes::none())
+                        }
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+
+        let modules: Vec<SpirvModule> = results
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| r.unwrap_or_else(|e| panic!("thread {i}: {e}")))
+            .collect();
+        let first = &modules[0].words;
+        for (i, m) in modules.iter().enumerate() {
+            assert_eq!(
+                &m.words, first,
+                "thread {i} produced different SPIR-V words"
+            );
+        }
+
+        let spv_files: Vec<PathBuf> = std::fs::read_dir(&cache_dir)
+            .expect("cache dir exists")
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("spv"))
+            .collect();
+        assert_eq!(
+            spv_files.len(),
+            1,
+            "expected exactly one .spv in {}: {spv_files:?}",
+            cache_dir.display()
+        );
+
+        let _ = std::fs::remove_dir_all(&cache_dir);
     }
 }

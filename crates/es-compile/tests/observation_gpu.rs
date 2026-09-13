@@ -49,19 +49,8 @@ fn device(test: &str) -> Option<Gpu> {
     }
 }
 
-/// One device test at a time.
-///
-/// `SlangCompiler` names its scratch files `{pid}-{invocations}`, and each compiler starts
-/// that counter at 0, so two threads of *one* process compiling the same cache key delete
-/// each other's input mid-compile (`os error 2`). Serialising here keeps this oracle about
-/// the lowering; the concurrency hole is `es-gpu`'s and is filed separately.
-static DEVICE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 /// Runs `body` on a device, or prints SKIP. Saves repeating the guard in every test.
 fn on_gpu(test: &str, body: impl FnOnce(&Gpu)) {
-    let _serialised = DEVICE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(gpu) = device(test) {
         body(&gpu);
         println!("RAN {test} on {}", gpu.capabilities().device_name);
