@@ -30,11 +30,13 @@ sh_rest     3 * ((d+1)^2 - 1) * count, or empty
 
 대안(원본 파일 값을 그대로 저장하고 접근 시점에 활성화 함수를 적용)은 어떤 입력에 대해서도 라운드트립을 정확하게 만들지만, `exp`/`sigmoid`를 GPU 업로드 경로를 포함한 모든 소비자에게 밀어넣게 된다. 임포트 시점에 디코딩하는 방식은 glTF 임포터가 정점 데이터에 대해 하는 것과, §5.3이 말하는 "디코딩된 콘텐츠를 해시한다"는 것과 일치하므로 이 방식을 택한다.
 
+**결정성(Determinism) (P-M3 리뷰, §3.2/§3.4).** `exp`, `ln`, `sigmoid`, `logit`은 모두 §5.3 체인 입력인 `SplatScene::asset_hash`에 반영되므로, 호스트의 `libm`에 의존해서는 안 된다: 동일한 캡처를 임포트하는 두 대의 기계는 반드시 동일하게 해시되어야 한다. 따라서 `sigmoid`/`logit`/`scale`의 디코딩과 인코딩은 `f64::exp`/`f64::ln`을 계산한 뒤 한 번 `f32`로 반올림하는 대신, GPU와 공유하는(`crates/es-math/slang/approx.slang`) 유일한 결정적 초월함수 구현인 `es_math::approx::exp` / `es_math::approx::ln`을 전적으로 `f32`로 거친다. `es_math::approx`는 오차를 IEEE 정확 반올림이 아니라 ULP 단위로 제한하므로, 이는 호스트 `libm`이 주던 것과는 엄밀히 다른(그리고 다소 덜 정확한) 근사다; `a_non_fixed_point_activation_round_trips_to_a_relative_1e_6`의 상대 오차 `1e-6` 허용치가 이미 그 차이를 포괄하며, 바이트 단위로 정확한 픽스처들이 뽑히는 고정점 집합도 그에 맞춰 바뀌었다 — `0.0`은 `es_math::approx` 아래에서 `exp`/`ln`과 `sigmoid`/`logit` 양쪽 모두의 고정점이므로(`exp(0) == 1`, `ln(1) == 0`, `sigmoid(0) == 0.5`, `logit(0.5) == 0`, 모두 비트 단위로 정확), 두 `cube20_*.ply` 픽스처는 모든 정점에 대해 `scale_0..2`와 `opacity`를 `0.0`으로 설정하여 재생성되었다; 다른 모든 필드(위치, 법선, SH 계수, 회전)는 변경되지 않았다.
+
 ### 1.2 `AssetKind`에는 `Splat` variant가 없다
 
 `AssetKind`는 이 패킷이 소유하지 않는 `es-assets`에 있으므로, `AssetRef::kind`는 `Mesh`이고 `path`가 `.ply`를 담는다. `AssetKind::Splat`을 추가하는 패킷이 이를 바꿔야 한다; 오늘은 이 variant로 분기하는 곳이 없다.
 
-## 2. Axis conversion
+## 2. 축 변환
 
 3DGS 재구성은 COLMAP/OpenCV 카메라 관례를 물려받는다: 월드 프레임은 첫 번째 카메라의 것이므로 **+Y가 아래쪽, +Z가 전방**이다. §3.1은 오른손 좌표계 Z-up이다. 둘 사이의 고정 회전은 `R_x(-90 deg)`다:
 
@@ -46,7 +48,7 @@ x_es = +x_gs        y_es = +z_gs        z_es = -y_gs
 
 이는 쿼터니언 곱이 아니라 **부호 반전을 동반한 성분 스위즐(swizzle)**로 구현된다. 동일한 회전이면서 비트 단위로 정확하고 정확히 역변환 가능한데, 이것이 PLY 라운드트립을 의미 있게 만드는 요소다. 쿼터니언도 벡터 부분에 동일한 스위즐을 적용받는다(회전에 의한 켤레 연산은 벡터 부분에 그 회전을 작용시키고, 스칼라 부분은 불변이다). 스케일은 변환하지 *않는다*: 이들은 월드 방향이 아니라 가우시안 자체 프레임에서의 범위(extent)이기 때문이다.
 
-## 3. Position alignment: `Similarity`
+## 3. 위치 정렬: `Similarity`
 
 ```
 Similarity { scale: f64, rot: Quat, trans: Vec3 }     apply(p) = scale * (rot * p) + trans
@@ -67,7 +69,7 @@ Similarity::fit(src: &[Vec3], dst: &[Vec3]) -> Result<Similarity, SplatError>
 
 ICP와 RANSAC(§16.2)은 여기에 없다. `fit`은 다른 누군가가 선택한 대응점 — 지정된 마커, 등록 UI, 또는 검출기 — 을 입력으로 받으며, 그것이 M3 W3 범위의 전부다.
 
-## 4. Colour alignment: `ColorAffine`
+## 4. 색상 정렬: `ColorAffine`
 
 §16.1이 이를 특별히 짚는다: 스캔의 색공간을 로봇의 실제 카메라에 매핑하는 것이 정책을 다시 in-distribution으로 되돌리는 요소였다. 스펙은 다항식 매핑을 요구하며, 그 첫 번째 유용한 항이 채널별 아핀(affine)이므로 이것이 바로 그 내용이다:
 
@@ -82,7 +84,7 @@ ColorAffine::fit(src: &[[f32; 3]], dst: &[[f32; 3]]) -> Result<ColorAffine, Spla
 
 색상 정렬은 언젠가 `scene_hash`(§16.2)에 포함되어야 한다. 이 패킷에는 그것을 해시해 넣을 `SceneDesc`를 만드는 부분이 없으므로 아직은 포함되지 않는다.
 
-## 5. LBS binding
+## 5. LBS 바인딩
 
 §16.2의 첫 번째 설계 결정: 스플랫은 물리를 대체하지 않는다. 각 가우시안은 하나 이상의 강체(rigid body)에 올라타며, 그 강체들이 어디에 있는지는 §17의 물리가 알려준다.
 
@@ -105,7 +107,7 @@ skin(&Binding, &SplatScene, &BTreeMap<StableId, Pose>) -> SkinnedSplats
 
 이는 CPU 경로다. GPU 경로는 컴퓨트 셰이더에서 동일한 산술을 수행하며 래스터라이저와 함께 다뤄질 것이다.
 
-## 6. Hashing
+## 6. 해싱
 
 `asset_hash`는 도메인 태그, 가우시안 개수, `sh_degree`, 그리고 파일 순서대로 나열된 모든 속성 배열(각각 길이 접두) 위에서 계산한 `blake3`다. **디코딩된** 값 위에서 계산하므로, 동일한 캡처를 ascii PLY로 읽든 `binary_little_endian` PLY로 읽든 동일하게 해시되며 — 테스트로 확인됨 — 향후 `.spz` 디코더도 이 성질을 별도 작업 없이 그대로 물려받는다. **파일 순서** 위에서 계산하는 이유는, 3DGS PLY에는 정렬 기준으로 삼을 표준적인 가우시안 순서가 없고 하나를 새로 만드는 것은 누구도 요청하지 않은 정렬이 될 것이기 때문이다; 파일의 순서가 곧 그 캡처의 정체성이다.
 
