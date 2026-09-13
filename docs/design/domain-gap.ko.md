@@ -38,7 +38,15 @@ Spec 참조: §24.3 (도메인 갭 진단: 무엇을 비교하는지, 왜 정책
 - 양쪽의 `mean`, `std`, 그리고 그 차이(`real - sim`).
 - **KS 통계량 `D`**: 두 표본 콜모고로프-스미르노프(Kolmogorov-Smirnov) 통계량,
   `sup_x |F_sim(x) - F_real(x)|`이며, 정렬 병합(sorted merge)으로 계산한다 — 통계 크레이트
-  없음(§1 툴체인 최소주의).
+  없음(§1 툴체인 최소주의). 병합은 값 전체의 반복 구간(run of repeats)을 지나칠 때까지 두
+  커서를 **모두** 진행시킨 뒤에야 갭을 평가한다(표준 `ks_2samp` 시맨틱스): 경험적 CDF는
+  우연속(right-continuous) 계단 함수이므로, 동점 구간 중간의 한 점은 어느 CDF 위에도 있지
+  않고, 거기서 측정한 차이는 `D`가 아니다. 로봇 데이터에서는 이것이 예외가 아니라 흔한
+  경우다 — 이진 플래그, 양자화된 인코더 카운트, 그리고 §5의 데이터셋별 stride가 두 표본
+  개수를 서로 다르게 만든다 — 그리고 동점 중간을 측정하면 두 *동일한* 이진 채널에 대해 300
+  대 100 표본에서 예컨대 `0.333`을 보고하게 되는데, 이는 기본 `0.3` 임계값을 넘는다. 단위
+  테스트는 반복된 단일 값, 이진 채널, 10단계 양자화 채널 각각에 대해 `n`이 서로 다를 때도
+  `D = 0`을 고정한다.
 - **Wasserstein-1**(1차원 샘플에 대한 earth mover's distance): 지지집합(support) 위에서
   `|F_sim(x) - F_real(x)|`를 적분한 값이며, 정렬된 샘플로부터 계산한다 — 이 역시 통계 크레이트
   없음.
@@ -62,17 +70,20 @@ Spec 참조: §24.3 (도메인 갭 진단: 무엇을 비교하는지, 왜 정책
 
 ```
 GapOptions { max_samples_per_feature: usize, threshold: f64 }   // KS D threshold, default 0.3
-FeatureSamples { dims: usize, values: Vec<f64> }                 // flat, row-major, len = n*dims
+FeatureSamples { dims: usize, values: Vec<f64>, nonfinite_dropped: usize }  // row-major, n*dims
 EpisodeSummary { success: Option<bool>, length: u64, envelope_violation: Option<f64> }
 GapInput { channels: BTreeMap<String, FeatureSamples>, episodes: Vec<EpisodeSummary> }
 
 ChannelGap { name, sim_n, real_n, sim_mean, real_mean, sim_std, real_std, mean_diff,
-             ks_d, wasserstein1, sim_quantiles: [f64; 3], real_quantiles: [f64; 3], flagged }
+             ks_d, wasserstein1, sim_quantiles: [f64; 3], real_quantiles: [f64; 3],
+             sim_nonfinite_dropped, real_nonfinite_dropped, flagged }
+DimsMismatch { channel: String, sim_dims: usize, real_dims: usize }
 EpisodeGap { sim_success_rate, real_success_rate, sim_length_mean, real_length_mean,
              sim_envelope_violation_rate, real_envelope_violation_rate: MetricValue }
 Suspect { channel: String, ks_d: f64, knob: &'static str }
 GapReport { threshold, channels: Vec<ChannelGap>, unmatched_sim: Vec<String>,
-            unmatched_real: Vec<String>, episodes: EpisodeGap, suspects: Vec<Suspect> }
+            unmatched_real: Vec<String>, dims_mismatch: Vec<DimsMismatch>,
+            episodes: EpisodeGap, suspects: Vec<Suspect> }
 ```
 
 `BTreeMap`만 사용한다(`HashMap`은 절대 안 됨, §18.4 결정성 관례를 같은 이유로 여기까지
@@ -90,6 +101,11 @@ GapReport { threshold, channels: Vec<ChannelGap>, unmatched_sim: Vec<String>,
 것에 대해 거리를 지어내는 것은 정확히 이 코드베이스가 금지하는 "조작된 `0.0`"이 되기
 때문이다.
 
+양쪽 모두에 존재하지만 `dims`가 다른 이름은 같은 종류의 스키마 차이다: 그것은
+`dims_mismatch`에 들어가고 점수화되지 않는다. 6차원 sim 피처의 차원 `d`를 7차원 real
+피처의 차원 `d`와 비교하는 것(혹은 더 나쁘게는, sim 인덱스를 그 마지막 컬럼으로 클램핑하는
+것)은 서로 다른 두 물리량을 짝지어 그것들에 대한 `D`를 보고하는 셈이다.
+
 ## 5. 서브샘플링 (유계, 결정적)
 
 `GapInput` 구성(`crates/es/src/cmd/gap.rs` 안)은 모든 에피소드의 프레임을 읽지만
@@ -99,6 +115,20 @@ GapReport { threshold, channels: Vec<ChannelGap>, unmatched_sim: Vec<String>,
 저수지 샘플링(reservoir sampling)도 없다 — 위치 기반의 고정 stride는 결정적이며, 한
 에피소드 안의 프레임들은 이미 시간적으로 상관되어 있으므로, 이 리포트가 계산하는 채널별
 주변(marginal) 통계에 대해서는 무작위 추출보다 대표성이 떨어지지 않는다.
+
+`LeRobotWriter` 이외의 것이 작성한 데이터셋이 가질 수 있는 두 가지 경우가 있으며, 둘 다
+`es-data`가 아니라 여기서 처리된다:
+
+- **비유한(non-finite) 값.** 어느 차원에든 `NaN`/`Inf`가 있는, 유지된 프레임은 버려지고
+  `FeatureSamples::nonfinite_dropped`에 집계되며, 채널별·쪽별로 `ChannelGap`에 노출된다.
+  KS도 Wasserstein-1도 `NaN`에 대해서는 의미가 없고, `serde_json`도 그것을 인코딩할 방법이
+  없다 — 그래서 필터링되지 않은 샘플 하나가 표가 이미 출력된 *이후에* `gap_report.json`을
+  무너뜨리곤 했다. `GapReport::to_json`이 `Result`를 반환하는 것도 같은 이유다: 이미 출력을
+  낸 명령의 마지막 단계가 패닉이어서는 안 된다.
+- **`n * dims`보다 짧은 컬럼.** `dims`는 피처가 선언한 `elem_count`에서 온다; 프레임당
+  그만큼의 값을 담고 있지 않은 컬럼은 자기모순적인(inconsistent) 데이터셋이므로, 행
+  슬라이스는 `get(..)`으로 이루어지고 miss는 인덱스 패닉이 아니라 `DataError::Inconsistent`
+  (`CliError::Runtime`, exit 1)가 된다.
 
 ## 6. Suspects: flag된 채널을 §18.3 노브에 매핑하기
 
@@ -122,11 +152,12 @@ flag된 각 채널은 이름-접두어 휴리스틱으로 §18.3 센서 리얼�
 
 ## 7. 리포트 스키마
 
-`GapReport::to_json(&self) -> String`는 `serde_json::to_string_pretty`다(struct는
-이미 `Serialize`를 derive한다); 파일은 CLI가 `gap_report.json`으로 쓴다. `GapReport`는 CLI가
-stdout에도 출력하는 평문 표를 위해 `Display`를 구현한다: 채널당 한 행(`name`, 양쪽의 `n`,
-양쪽의 `mean`/`std`, `KS D`, `W1`, flagged 표시), 그 뒤로 unmatched-feature 목록, 에피소드
-수준 블록, suspects 목록이 이어진다.
+`GapReport::to_json(&self) -> Result<String, serde_json::Error>`는
+`serde_json::to_string_pretty`다(struct는 이미 `Serialize`를 derive한다); 파일은 CLI가
+`gap_report.json`으로 쓴다. `GapReport`는 CLI가 stdout에도 출력하는 평문 표를 위해
+`Display`를 구현한다: 채널당 한 행(`name`, 양쪽의 `n`, 양쪽의 `mean`/`std`, `KS D`, `W1`,
+flagged 표시), 그 뒤로 unmatched-feature 목록, `dims_mismatch` 목록, 있을 경우의
+non-finite drop 개수, 에피소드 수준 블록, suspects 목록이 이어진다.
 
 ## 8. CLI
 

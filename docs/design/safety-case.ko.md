@@ -83,7 +83,18 @@ spec 27.1 트리의 `scene/`, `training/`, `validation/determinism.json`,
 
 > 요구사항은, 그것에 연결된 적어도 하나의 evidence가 번들 엔트리로 존재하고, 그
 > 기록된 `hash`가 그 엔트리 바이트의 blake3와 같고, 그 `execution_hash`가 번들 자신의
-> `chain.execution_hash()`와 같을 때 **커버(covered)**된 것이다.
+> `chain.execution_hash()`와 같을 때 — *case*가 기록한 대로도, *엔트리 자신*이 그런
+> 것으로도 — **커버(covered)**된 것이다.
+
+이 마지막 절의 뒷부분이 바로 `verify`가 엔트리들을 파싱하고 case만 읽지 않는 이유다.
+spec 10.5가 정의하는 모든 `reports/<i>/` 아티팩트는 그것을 만든 실행의 해시를 담고 있다:
+`report.json`은 `execution_hash` 바이트로, `evaluation.lock`은 hex로, 그리고 잠긴 스위트의
+`evaluation_hash`까지. 둘 다 파싱되고 둘 다 `chain.json`에 대해 교차 검사된다.
+`report.json`만 검사하는 것은 정확히 `EvidenceKind::Lock` 하나 크기만 한 구멍을 남겼다:
+다른 실행에서 가져온 lock을, 그 파일의 blake3를 기록하도록 case를 다시 써서 넣으면, case가
+스스로에 대해 할 수 있는 모든 검사를 통과하고 커버리지로 세어졌다. 자신의 내용이 다른
+실행(또는 다른 Evaluation IR)을 가리키는 엔트리는 진단이면서 *동시에* 그 evidence를
+`stale`에 넣는다.
 
 존재하고 해시도 맞지만 *다른* `execution_hash`를 지닌 연결된 evidence는 커버로
 보고되지 않고 **stale**로 보고된다: 그것은 다른 machine의 실제 측정값이기 때문이다. stale한
@@ -91,9 +102,13 @@ evidence만 가진 요구사항은 커버되지 않은 것이며, `es evidence v
 
 `SafetyCase::validate`는 이 모든 것보다 먼저 실행되어 그래프 자체를 거부할 수
 있다: 중복된 id, 존재하지 않는 요구사항을 가리키는 claim이나 traceability 키, 존재하지 않는
-evidence를 가리키는 traceability 엔트리, evidence 목록이 아예 없는 요구사항. 유효하지 않은
-case로부터 `evidence.esb`를 만드는 것은 거부된다 — 검증 불가능한 아티팩트는 아티팩트가
-없는 것보다 나쁘다(spec 26.1: *검증되지 않은 것은 실행되지 않은 것이다*).
+evidence를 가리키는 traceability 엔트리, evidence 목록이 아예 없는 요구사항, 그리고
+**요구사항이 하나도 없는** case(`EVID-008`). 마지막 것은 현학이 아니다:
+`VerifyReport::ok()`는 "모든 요구사항이 커버된다"인데, 이는 빈 표에 대해서는 공허하게
+참(vacuously true)이므로, 이것이 없으면 `es evidence verify`는 아무 주장도 하지 않는 문서에
+대해 초록색 게이트-16 결과를 출력하게 된다. 유효하지 않은 case로부터 `evidence.esb`를
+만드는 것은 거부된다 — 검증 불가능한 아티팩트는 아티팩트가 없는 것보다 나쁘다(spec 26.1:
+*검증되지 않은 것은 실행되지 않은 것이다*).
 
 ## 5. `revalidation_trigger` — "실질적 변경" 표
 
