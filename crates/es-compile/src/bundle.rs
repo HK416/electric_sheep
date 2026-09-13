@@ -37,7 +37,12 @@ pub const MAGIC: [u8; 4] = *b"ESB1";
 
 /// Manifest schema version (spec 25.3: the bundle format is versioned and old versions stay
 /// readable; a *newer* one is refused).
-pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
+///
+/// 2 adds the `signer_public_key` slot next to `signature` (spec 25.1, `es-eval::evidence`
+/// detached signing). A version-1 manifest simply has neither field, which is exactly what
+/// an unsigned bundle looks like at version 2 too, so no migration code is needed: `open`
+/// keeps accepting version 1, and it verifies as `signature: Absent`.
+pub const BUNDLE_SCHEMA_VERSION: u32 = 2;
 
 /// A deployment bundle is always compiled in this mode, so `compiler_hash` is comparable
 /// between the machine that built the bundle and the one that opens it. The mode reaches
@@ -130,10 +135,17 @@ pub struct BundleManifest {
     /// a timestamp inside the artifact would break byte-identical rebuilds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_utc: Option<String>,
-    /// Spec 25.1 reserves a signature over the container; no crypto is implemented yet, so
-    /// this is the slot and nothing verifies it. A reader must not treat `Some` as trust.
+    /// Detached ed25519 signature (spec 25.1): `es-eval::evidence::EvidenceBundle::sign`
+    /// writes it, `verify` checks it against `signer_public_key`. A reader must still treat
+    /// `Some` as unauthenticated until it is checked against a *trusted* key -- see
+    /// `SignatureStatus`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<Vec<u8>>,
+    /// The ed25519 public key `signature` was produced with. Always `Some` alongside a
+    /// `Some` signature and `None` alongside `None` -- two independent `Option`s only
+    /// because `hex32` is already the `Option<[u8; 32]>` codec every other slot uses.
+    #[serde(with = "hex32", default, skip_serializing_if = "Option::is_none")]
+    pub signer_public_key: Option<[u8; 32]>,
 }
 
 impl BundleManifest {
@@ -144,6 +156,7 @@ impl BundleManifest {
             hashes,
             created_utc: None,
             signature: None,
+            signer_public_key: None,
         }
     }
 }

@@ -137,17 +137,30 @@ code, because "this bundle differs from that one" is not a defect of this bundle
 Stated here because spec 27.1 ends with a positioning warning and the CLI must not read as more
 than it is.
 
-- **No signature.** `BundleManifest.signature` is a reserved slot, nothing populates it and
-  nothing checks it (spec 25.1: native plugin signature verification is optional and later).
-  Every hash in the bundle is self-consistent; none of it is *authenticated*. Anyone who can
-  rewrite the file can rewrite the hashes with it. `verify` prints `signature: unverified`.
-- **No replay.** Spec 27.1 wants `es evidence verify` to also re-run the replay and compare
-  metrics; M4 (spec 28.6) owns that. Today it checks that the reports in the bundle are the
-  reports the bundle claims, not that re-running them would produce them again. Gate 17 is an
-  M4 gate for exactly this reason.
+- **A signature is authentication, not endorsement.** `EvidenceBundle::sign` (M4, W7,
+  spec 25.1) adds a detached ed25519 signature over every entry's `(name, hash)` pair, and
+  `verify(bytes, against, trusted_keys)` reports `signature: Valid(key) | Invalid | Absent |
+  UntrustedKey`. `Valid` only means *the bytes the caller has are the bytes a `trusted_keys`
+  holder signed* -- it says nothing about whether that signer checked anything, and it is
+  still not part of [`VerifyReport::ok`]: whether a bundle is even required to carry a
+  trusted signature is a caller policy (`es evidence verify --require-signature`), not a
+  property of the bundle. `Absent` is what every bundle built before W7 still reports (a
+  `schema_version: 1` manifest has no signature fields at all, and that is not a defect --
+  spec 25.3 keeps old versions readable). A key is only as trustworthy as however
+  `--trust pub.hex` was populated; this design does not add a PKI, a revocation list, or
+  key rotation, only the primitive those would be built on.
+- **A rerun plan is not a rerun.** `VerifyReport::replayable` (spec 28.6 gate 17 prerequisite)
+  names, per `reports/<i>/` entry, the `evaluation_hash`/`execution_hash`/`seeds` a rerun
+  would need, and `es evidence replay --dry-run` prints it. Nothing here re-executes a cell or
+  compares a re-run metric against the recorded one -- that needs a `PhysicsBackend` +
+  `PolicyRuntime` pair this crate does not link, which is exactly why plain `es evidence
+  replay` prints `SKIPPED` (the same convention as `es eval run` with no backend available)
+  instead of pretending to run something. The canonical-form check on `report.json` (byte-for-
+  byte equal to `serde_json` re-serialization of its parsed form with sorted keys) only proves
+  the entry is *machine-written*, not that re-running it would reproduce the same numbers.
 - **No conformity.** The bundle is evidence collection and tracking for writing a technical
-  file. It is not a certification, and a green `verify` is not a conformity statement
-  (spec 27.1).
+  file. It is not a certification, and a green `verify` -- signed or not -- is not a
+  conformity statement (spec 27.1).
 - **No judgement of the argument.** That every requirement has evidence says nothing about
   whether the requirements are the right ones or the claims follow. That is the human review
   the `HumanReview` evidence kind exists to record, not to replace.

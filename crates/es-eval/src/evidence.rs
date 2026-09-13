@@ -18,15 +18,21 @@
 //! * `revalidation_trigger` hangs off the evidence *kind*, not off the requirement, because
 //!   what invalidates a fact is a property of how the fact was produced (spec 27.1).
 //!
-//! What this does not do, stated once here and once in the CLI output: there is no signature
-//! (spec 25.1 reserves the slot; nothing fills or checks it) and no replay re-execution
-//! (spec 28.6, gate 17). A green verify means the bundle is self-consistent, not authentic.
+//! `sign`/`verify` add a detached ed25519 signature over the container (spec 25.1): a
+//! `manifest.schema_version` of 2 is the first that can carry it, but a version-1 bundle keeps
+//! opening and simply verifies as `signature: Absent` -- there is no migration to write. What
+//! this still does not do, stated once here and once in the CLI output: re-run anything.
+//! `VerifyReport::replayable` names the reports a future `es evidence replay` would rerun; the
+//! rerun itself needs a `PhysicsBackend`/`PolicyRuntime` and is out of scope until M4 finishes
+//! it (spec 28.6, gate 17). A green verify means the bundle is self-consistent and, once
+//! signed by a trusted key, authentic -- it is still not a replay and not a conformity claim.
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use es_compile::bundle::{
-    self, report_entry, BundleError, BundleHashes, BundleKind, BundleManifest, PolicyBundle, CHAIN,
-    EVALUATION_LOCK, POLICY_BUNDLE, REPORT_JSON, SAFETY_CASE,
+    self, report_entry, BundleError, BundleHashes, BundleKind, BundleManifest, PolicyBundle,
+    BUNDLE_SCHEMA_VERSION, CHAIN, EVALUATION_LOCK, POLICY_BUNDLE, REPORT_JSON, SAFETY_CASE,
 };
 use es_ir::evaluation::EvaluationReport;
 use es_ir::hash::{ChangedComponent, HashChain};
@@ -233,6 +239,7 @@ pub const EVID_ENTRY_HASH: &str = "EVID-005";
 pub const EVID_EXECUTION_HASH: &str = "EVID-006";
 pub const EVID_CHAIN_SLOT: &str = "EVID-007";
 pub const EVID_EMPTY_CASE: &str = "EVID-008";
+pub const EVID_NOT_CANONICAL: &str = "EVID-009";
 
 /// Which changes invalidate evidence of this kind (spec 27.1 `revalidation_trigger`, in the
 /// units of spec 5.3 `HashChain::diff`). The table and its reasoning are in
@@ -307,10 +314,19 @@ fn json_err(entry: &str) -> impl Fn(serde_json::Error) -> EvidenceError + '_ {
     }
 }
 
-/// Pretty JSON plus the trailing newline, so a bundle entry and the file `write_artifacts`
-/// wrote to disk are byte-identical and hash the same.
+/// Canonical pretty JSON plus the trailing newline: routed through `serde_json::Value` (a
+/// `BTreeMap` under the hood -- the workspace never turns on `preserve_order`), so object keys
+/// come out sorted regardless of the field order the source struct declares them in. This is
+/// the form [`EvidenceBundle::verify`] checks every `reports/<i>/report.json` against (the
+/// canonical-form check): a bundle entry that is not exactly this is not something `build`
+/// could have produced, signature aside.
 fn to_json<T: Serialize>(value: &T, entry: &str) -> Result<Vec<u8>, EvidenceError> {
-    let mut text = serde_json::to_string_pretty(value).map_err(json_err(entry))?;
+    canonical_json(value).map_err(json_err(entry))
+}
+
+fn canonical_json<T: Serialize>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
+    let value = serde_json::to_value(value)?;
+    let mut text = serde_json::to_string_pretty(&value)?;
     text.push('\n');
     Ok(text.into_bytes())
 }
@@ -329,6 +345,63 @@ pub fn report_entries(
         out.insert(l.clone(), to_json(lock, &l)?);
     }
     Ok(out)
+}
+
+// --- signing -------------------------------------------------------------------------------
+
+/// What a bundle's ed25519 signature checks to (spec 25.1). `Valid` and `UntrustedKey` both
+/// mean the cryptography checked out -- they differ only in whether the caller's
+/// `trusted_keys` names that key, which is a policy question `verify` cannot answer on its
+/// own. `Absent` is what every bundle built before this packet still reports: a version-1
+/// manifest has no `signature` field at all, and that is not a defect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureStatus {
+    /// The signature verifies against `signer_public_key`, and that key is in `trusted_keys`.
+    Valid([u8; 32]),
+    /// Either the container was changed after signing, or `signature`/`signer_public_key`
+    /// does not decode to a valid ed25519 pair at all.
+    Invalid,
+    /// `manifest.signature` is `None` (every version-1 bundle; an unsigned version-2 one).
+    Absent,
+    /// The signature verifies, but its key is not one the caller trusts.
+    UntrustedKey([u8; 32]),
+}
+
+/// blake3 over every non-manifest entry's `(name, hash)` pair, in the sorted order a
+/// `BTreeMap` already gives them. This, not the container's own per-entry hashes, is what
+/// [`EvidenceBundle::sign`] and [`EvidenceBundle::verify`] exchange over ed25519: the manifest
+/// itself is never in `entries` (`bundle::read` parses it out separately), so a signature
+/// computed this way cannot be circular -- it authenticates every entry the signer saw,
+/// including a `signer_public_key` swap being impossible without invalidating it, without
+/// ever needing to hash itself.
+fn signing_digest(entries: &BTreeMap<String, Vec<u8>>) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    for (name, payload) in entries {
+        hasher.update(name.as_bytes());
+        hasher.update(blake3::hash(payload).as_bytes());
+    }
+    *hasher.finalize().as_bytes()
+}
+
+fn signature_status(
+    manifest: &BundleManifest,
+    entries: &BTreeMap<String, Vec<u8>>,
+    trusted_keys: &[VerifyingKey],
+) -> SignatureStatus {
+    let Some(sig_bytes) = manifest.signature.as_deref() else {
+        return SignatureStatus::Absent;
+    };
+    let checked = manifest
+        .signer_public_key
+        .and_then(|pk| VerifyingKey::from_bytes(&pk).ok().zip(Some(pk)))
+        .zip(Signature::from_slice(sig_bytes).ok())
+        .filter(|((vk, _), sig)| vk.verify(&signing_digest(entries), sig).is_ok());
+    match checked {
+        None => SignatureStatus::Invalid,
+        Some(((vk, pk), _)) if trusted_keys.contains(&vk) => SignatureStatus::Valid(pk),
+        Some(((_, pk), _)) => SignatureStatus::UntrustedKey(pk),
+    }
 }
 
 // --- the bundle --------------------------------------------------------------------------
@@ -421,12 +494,48 @@ impl EvidenceBundle {
         })
     }
 
+    /// Re-emit `bytes` with `signature` and `signer_public_key` filled in (spec 25.1, spec
+    /// 25.3 `schema_version` 2). `signing_key` is always built from a caller-supplied seed
+    /// (`es evidence keygen`, `SigningKey::from_bytes`) -- nothing here generates one, which
+    /// is the whole reason `ed25519-dalek`'s `rand_core` feature stays off.
+    ///
+    /// The container is otherwise untouched: same entries, same manifest hash slots, only the
+    /// two signature fields and `schema_version` (bumped by `BundleManifest::new` when the
+    /// input predates it) change.
+    pub fn sign(bytes: &[u8], signing_key: &SigningKey) -> Result<Vec<u8>, EvidenceError> {
+        let raw = bundle::read(bytes)?;
+        if raw.manifest.kind != BundleKind::Evidence {
+            return Err(BundleError::KindMismatch {
+                expected: BundleKind::Evidence,
+                found: raw.manifest.kind,
+            }
+            .into());
+        }
+        let signature = signing_key.sign(&signing_digest(&raw.entries));
+        let manifest = BundleManifest {
+            // A version-1 input is upgraded to the version that can carry a signature; a
+            // version-2 one is already there.
+            schema_version: BUNDLE_SCHEMA_VERSION,
+            signature: Some(Vec::from(signature.to_bytes())),
+            signer_public_key: Some(signing_key.verifying_key().to_bytes()),
+            ..raw.manifest
+        };
+        Ok(bundle::write(&manifest, &raw.entries)?)
+    }
+
     /// Everything the bundle claims about itself, re-derived (see [`VerifyReport`]).
     ///
     /// `against` is an earlier `evidence.esb` to compare the chain with; it only fills
     /// [`VerifyReport::revalidation`] and never affects [`VerifyReport::ok`], because "this
-    /// bundle differs from that one" is not a defect of this bundle.
-    pub fn verify(bytes: &[u8], against: Option<&[u8]>) -> Result<VerifyReport, EvidenceError> {
+    /// bundle differs from that one" is not a defect of this bundle. `trusted_keys` decides
+    /// [`SignatureStatus::Valid`] vs. [`SignatureStatus::UntrustedKey`] and likewise never
+    /// affects `ok()` -- whether to *require* a trusted signature is a caller policy (the CLI's
+    /// `--require-signature`), not a property of the bundle.
+    pub fn verify(
+        bytes: &[u8],
+        against: Option<&[u8]>,
+        trusted_keys: &[VerifyingKey],
+    ) -> Result<VerifyReport, EvidenceError> {
         let b = Self::open(bytes)?;
         let mut diagnostics = b.case.validate();
         let execution_hash = b.chain.execution_hash();
@@ -481,6 +590,24 @@ impl EvidenceBundle {
             let (got, what) = if name.ends_with(REPORT_JSON) {
                 let report: EvaluationReport =
                     serde_json::from_slice(payload).map_err(json_err(name))?;
+                // Canonical-form check (spec 28.6 gate 17, replay prerequisite): re-serializing
+                // the parsed value with sorted keys must reproduce these exact bytes. That is
+                // the only thing a hand-edited or differently-indented `report.json` cannot
+                // survive, and it is also exactly the form `build` writes -- see `to_json`.
+                let canonical = canonical_json(&report).map_err(json_err(name))?;
+                if canonical != *payload {
+                    diagnostics.push(
+                        Diagnostic::new(
+                            EVID_NOT_CANONICAL,
+                            format!("\"{name}\" is not canonical JSON"),
+                        )
+                        .with_hint(
+                            "re-serializing the parsed report with sorted keys does not \
+                             reproduce these bytes -- the entry was hand-edited or re-indented \
+                             after `es evidence build` wrote it",
+                        ),
+                    );
+                }
                 (crate::hex32(&report.execution_hash), "reports")
             } else if name.ends_with(EVALUATION_LOCK) {
                 let lock: EvaluationLock =
@@ -594,11 +721,35 @@ impl EvidenceBundle {
             }
         }
 
+        // 6. The rerun plan a future `es evidence replay` would execute (spec 28.6 gate 17):
+        //    one entry per `reports/<i>/` this bundle actually carries, in index order.
+        let mut replayable = Vec::new();
+        for i in 0.. {
+            let (Some(rp), Some(lp)) = (
+                b.entries.get(&report_entry(i, REPORT_JSON)),
+                b.entries.get(&report_entry(i, EVALUATION_LOCK)),
+            ) else {
+                break;
+            };
+            let name = report_entry(i, REPORT_JSON);
+            let report: EvaluationReport = serde_json::from_slice(rp).map_err(json_err(&name))?;
+            let lock: EvaluationLock =
+                serde_json::from_slice(lp).map_err(json_err(&report_entry(i, EVALUATION_LOCK)))?;
+            replayable.push(ReplayPlan {
+                report_index: i,
+                evaluation_hash: report.evaluation_hash,
+                execution_hash: report.execution_hash,
+                seeds: lock.seeds,
+            });
+        }
+
         Ok(VerifyReport {
             entries: b.entries.len(),
             execution_hash,
+            signature: signature_status(&b.manifest, &b.entries, trusted_keys),
             coverage,
             revalidation,
+            replayable,
             diagnostics,
         })
     }
@@ -650,14 +801,31 @@ pub struct RequirementCoverage {
     pub covered: bool,
 }
 
+/// The rerun a future `es evidence replay` would perform for one `reports/<i>/` entry (spec
+/// 28.6 gate 17). Everything a `PhysicsBackend` + `PolicyRuntime` pair needs to reproduce the
+/// cell and compare against `execution_hash`; nothing here runs it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayPlan {
+    pub report_index: usize,
+    pub evaluation_hash: [u8; 32],
+    pub execution_hash: [u8; 32],
+    pub seeds: Vec<u64>,
+}
+
 /// What [`EvidenceBundle::verify`] found. `ok()` is the CLI's exit code.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct VerifyReport {
     pub entries: usize,
     pub execution_hash: [u8; 32],
+    /// Whether the container's ed25519 signature checks out against a caller-trusted key
+    /// (spec 25.1). Never part of [`Self::ok`] -- whether a signature is *required* is the
+    /// CLI's `--require-signature`, a caller policy, not a property of the bundle.
+    pub signature: SignatureStatus,
     pub coverage: Vec<RequirementCoverage>,
     /// Per changed component since `--against`, the evidence that must be re-run (spec 27.1).
     pub revalidation: Vec<(ChangedComponent, Vec<String>)>,
+    /// The rerun plan for every `reports/<i>/` entry the bundle carries (spec 28.6 gate 17).
+    pub replayable: Vec<ReplayPlan>,
     pub diagnostics: Vec<Diagnostic>,
 }
 

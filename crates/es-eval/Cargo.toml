@@ -19,6 +19,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 # `evidence`: an evidence bundle entry is addressed by its blake3 (spec 27.1).
 blake3 = { workspace = true }
+# `evidence::sign`/`verify` (spec 25.1): default features only (`fast`, `zeroize`) -- the
+# `rand_core` feature is off on purpose, since a signing key is always built from a
+# caller-supplied 32-byte seed (`es evidence keygen`), never generated in-process.
+ed25519-dalek = "3.0.0"
 
 [dev-dependencies]
 proptest = { workspace = true }
