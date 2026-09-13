@@ -56,11 +56,17 @@ pub fn negotiate(client: &[u32], server: &[u32]) -> Option<u32> {
 pub enum Message {
     Hello(Hello),
     HelloAck(HelloAck),
-    Subscribe { streams: Vec<StreamId> },
+    Subscribe {
+        streams: Vec<StreamId>,
+    },
     Frame(Frame),
     Ping,
     Pong,
-    Bye,
+    /// Either side may send this to end the session; `es_telemetry::transport::Server` sends it
+    /// instead of `HelloAck` when a handshake is rejected (spec 25.1/25.3), naming why.
+    Bye {
+        reason: String,
+    },
 }
 
 /// One sample on a stream: when it happened (sim tick and wall clock) and what it carries.
@@ -293,7 +299,9 @@ mod tests {
             }),
             Message::Ping,
             Message::Pong,
-            Message::Bye,
+            Message::Bye {
+                reason: "session ended".to_string(),
+            },
         ]
     }
 

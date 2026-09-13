@@ -176,15 +176,13 @@ crate does not own:
 Spec 9.6's "zero heap allocation" is therefore met by the plane, the chunk buffer and the
 telemetry ring, and those two boundaries are the M2 work.
 
-### Telemetry ring — a known duplication
+### Telemetry ring
 
-`es_telemetry::ring::RingBuffer` is the real one and it is better (sequence numbers,
-`drain_since`, a dropped count). `es-telemetry` is layer 10 and this crate is layer 9, so
-depending on it is a layering violation (spec 4.2). The ~50-line `TelemetryRing` here is the
-lazy fix. **The correct fix, when a second crate at layer <= 9 wants a ring, is to move
-`RingBuffer` into `es-core` (layer 1) and delete this one.**
+`RingBuffer` lives in `es_core::ring` (layer 1); `es_telemetry::ring` re-exports it and
+this crate uses it directly, so no ring is duplicated here (see
+`docs/packets/M1/W8-telemetry-transport.md`).
 
-## 7. Known ceilings
+ Known ceilings
 
 - No signature, no encryption. The `signature` slot exists; nothing fills it (spec 25.1).
 - No compression, deliberately (section 2).

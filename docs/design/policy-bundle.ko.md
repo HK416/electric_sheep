@@ -123,68 +123,11 @@ observation plan을 컴파일하고, 체크포인트를 `WeightsRef::hash`와 �
 담은 `BundleError::HashMismatch { slot }`가 되며, 이는 spec 27.1의 `revalidation_trigger`가
 기술되는 단위이기도 하다.
 
-### 컴파일된 플랜이 번들에 없는 이유
+### 텔레메트리 링
 
-`CpuPlan`은 `Serialize`가 아니다 — 해석된 버퍼 위치, 아레나(arena) 레이아웃, 그리고 살아 있는
-`TemporalWindow` 링 상태를 담고 있으며 — 이를 직렬화하면 컴파일러의 내부 표현이 배포 산출물
-안에 그대로 얼어붙게 되는데, 이는 spec 25.3이 원하지 않는 바다. 그래서 번들은 Observation IR을
-저장하고, `PolicyBundle::compile_plan`이 로드 시점에 플랜을 다시 빌드한다. 이것이 안전하다는
-근거는 `compiler` 해시다: `CpuPlan::compiler_hash`는 크레이트 버전, 플랜 모드, 커널 id
-테이블을 커버하므로, 다른 수치 결과를 만들어낼 재빌드는 실행되기 전에 열기에서 실패한다. 배포
-번들은 항상 `PlanMode::Release` (`BUNDLE_PLAN_MODE`)로 컴파일되며, 이 모드는 `compiler_hash`
-안에 포함되어 있으므로 조용한 차이가 될 수 없다.
-
-## 6. `es-runtime-embedded`
-
-spec 9.6이 구성 요소를 나열하며, 이 크레이트는 그것들을 조합할 뿐 아무것도 추가하지 않는다:
-
-```
-compiled observation plan   es-compile   (spec 7, spec 11.3)
-policy runtime              es-policy    (spec 2.4, one Box<dyn PolicyRuntime>)
-Safety Plane                es-safety    (spec 9, whole)
-telemetry ring              here         (see below)
-```
-
-`EmbeddedRuntime::from_bundle`가 **유일한** 생성자이며 항상 `SafetyPlane`을 빌드한다;
-`tick`은 오직 plane만이 만들어낼 수 있는 `SafeAction`을 반환한다 (`INV-12`, `INV-13`).
-관절 수가 `NJ`가 아니거나 액션 지평(action horizon)이 `H`가 아닌 번들을 거부하는 것 역시
-`SafetyPlane::from_ir`다.
-
-### 리플랜 주기 (spec 8.6)
-
-`rate.control / rate.inference` 컨트롤 틱마다 한 번의 추론이 이루어지며,
-`action.execute_chunk`로 상한이 걸린다 — K를 넘어서는 행(row)들은 명령이 아니라 예측이다
-(spec 8.5). 이 비율은 두 유리수 `TickRate`로부터 정확히 계산된다; `XIR-023`이 이미 이것이
-`PolicyContract::replanning_hz`와 일치함을 검사했으므로, 누적되는 부동소수점 주기는 없다
-(spec 3.4). 리플랜 사이에는 버퍼링된 청크가 다시 제출되고, plane이 자신의 커서를 진행시킨다.
-
-### 실패는 에러가 아니라 청크다
-
-누락된 센서 텐서, 플랜 에러, 추론 에러, 혹은 형태(shape)가 잘못된 액션 텐서 — 이들 모두
-**빈 청크(empty chunk)**를 만들어낸다. plane은 이를 청크 언더런(chunk underrun)과 설정된
-폴백(fallback)으로 전환한다. `tick`에 에러 반환이 없는 이유는, 액션 없는 컨트롤 틱이란
-존재하지 않기 때문이다.
-
-### 할당
-
-모든 크기는 `from_bundle`에서 결정된다. **재사용(reuse)** 틱은 아무것도 할당하지 않는다 —
-`es_core::alloc_count::assert_no_alloc`으로 단언(assert)된다. **리플랜(replan)** 틱은 이
-크레이트가 소유하지 않는 정확히 두 곳에서 할당이 일어난다:
-
-1. `CpuPlan::run`은 호출마다 새로운 f32 아레나를 받고, `tick`은 그것을 위한 borrowed 입력
-   맵을 만든다;
-2. `PolicyRuntime::infer`는 트레이트 경계다; 구현체들이 각자의 버퍼를 소유한다.
-
-따라서 spec 9.6의 "제로 힙 할당(zero heap allocation)"은 plane, 청크 버퍼, 텔레메트리 링에
-대해서는 충족되며, 저 두 경계는 M2에서 다룰 작업이다.
-
-### 텔레메트리 링 — 알려진 중복
-
-`es_telemetry::ring::RingBuffer`가 진짜(real one)이고 더 낫다 (시퀀스 번호, `drain_since`,
-드롭 카운트). `es-telemetry`는 레이어 10이고 이 크레이트는 레이어 9이므로, 이를 의존하는 것은
-레이어링 위반이다 (spec 4.2). 여기 있는 ~50줄짜리 `TelemetryRing`은 게으른(lazy) 임시방편이다.
-**레이어 9 이하의 두 번째 크레이트가 링을 필요로 하게 되면, 올바른 해결책은 `RingBuffer`를
-`es-core`(레이어 1)로 옮기고 이것을 삭제하는 것이다.**
+`RingBuffer`는 `es_core::ring`(레이어 1)에 있다. `es_telemetry::ring`은 이를 재수출하고 이
+크레이트는 그것을 직접 쓰므로 여기에 중복된 링은 없다
+(`docs/packets/M1/W8-telemetry-transport.md` 참조).
 
 ## 7. 알려진 한계
 

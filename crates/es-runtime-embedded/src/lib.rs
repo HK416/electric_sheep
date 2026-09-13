@@ -20,16 +20,16 @@
 //!
 //! Layer rule (spec 4.2): layer 9, alongside `es-env`. It may use `es-safety` / `es-policy`
 //! (8) and `es-compile` (7); only `es-ros2` and `es-py` (11) may depend on it. Notably it may
-//! **not** use `es-telemetry` (10) — see [`ring`] for what that costs.
+//! **not** use `es-telemetry` (10) — its telemetry ring is `es_core::ring::RingBuffer`
+//! (layer 1) instead, the same type `es-telemetry` re-exports, so no layering violation is
+//! needed to share it.
 //!
 //! No Python, no physics, no rendering, no filesystem: [`EmbeddedRuntime::from_bundle`] takes
 //! bytes.
 #![forbid(unsafe_code)]
 
 mod hardware;
-mod ring;
 mod runtime;
 
 pub use hardware::hardware_capability;
-pub use ring::{TelemetryRing, TickRecord};
-pub use runtime::{EmbeddedRuntime, RuntimeError};
+pub use runtime::{EmbeddedRuntime, RuntimeError, TickRecord};

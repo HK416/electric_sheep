@@ -4,19 +4,34 @@ use std::collections::BTreeMap;
 
 use es_compile::bundle::{BundleError, PolicyBundle};
 use es_compile::{CpuPlan, Tensor, TensorRef};
+use es_core::ring::RingBuffer;
 use es_core::PhysTick;
 use es_ir::deployment::{ExecutionMode, Micros};
 use es_ir::hash::{DatasetHash, HardwareCapability, HashChain};
 use es_ir::types::ElemType;
 use es_policy::{PolicyError, PolicyRuntime, WeightsSource};
-use es_safety::{ActionChunk, SafeAction, SafetyConfigError, SafetyCounters, SafetyPlane};
+use es_safety::{
+    ActionChunk, ActionSource, SafeAction, SafetyConfigError, SafetyCounters, SafetyPlane,
+};
 
 use crate::hardware::hardware_capability;
-use crate::ring::{TelemetryRing, TickRecord};
 
 /// Telemetry depth. One second of history at 1 kHz, which is the highest control rate spec 9.2
 /// contemplates; the ring is allocated once in `from_bundle` and never grows.
 const TELEMETRY_TICKS: usize = 1024;
+
+/// One control tick, as the deployment records it. Plain `Copy` data: pushing one must not
+/// allocate, so nothing here owns a heap object.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TickRecord {
+    pub tick: PhysTick,
+    pub source: ActionSource,
+    /// `es_safety::EventSet` as its bitset, so the record stays a POD a transport can memcpy.
+    pub events: u32,
+    /// Whether this tick ran the policy or reused the buffered chunk (spec 8.6).
+    pub replanned: bool,
+    pub obs_age: Micros,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum RuntimeError {
@@ -56,7 +71,7 @@ pub struct EmbeddedRuntime<const NJ: usize, const H: usize> {
     plan: CpuPlan,
     plane: SafetyPlane<NJ, H>,
     policy: Box<dyn PolicyRuntime>,
-    telemetry: TelemetryRing,
+    telemetry: RingBuffer<TickRecord>,
     hardware: HardwareCapability,
     /// The Learning IR's single output port: the action chunk (spec 8.5).
     action_out: String,
@@ -75,7 +90,10 @@ impl<const NJ: usize, const H: usize> std::fmt::Debug for EmbeddedRuntime<NJ, H>
             .field("action_out", &self.action_out)
             .field("replan_every", &self.replan_every)
             .field("consumed", &self.consumed)
-            .field("telemetry_pushed", &self.telemetry.pushed())
+            .field(
+                "telemetry_pushed",
+                &(self.telemetry.oldest_seq() + self.telemetry.len() as u64),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -112,7 +130,7 @@ impl<const NJ: usize, const H: usize> EmbeddedRuntime<NJ, H> {
             plan,
             plane,
             policy,
-            telemetry: TelemetryRing::with_capacity(TELEMETRY_TICKS),
+            telemetry: RingBuffer::with_capacity(TELEMETRY_TICKS),
             hardware: hardware_capability(),
             action_out,
             mode,
@@ -217,7 +235,7 @@ impl<const NJ: usize, const H: usize> EmbeddedRuntime<NJ, H> {
         &self.bundle
     }
 
-    pub fn telemetry(&self) -> &TelemetryRing {
+    pub fn telemetry(&self) -> &RingBuffer<TickRecord> {
         &self.telemetry
     }
 

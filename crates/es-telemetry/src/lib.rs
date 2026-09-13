@@ -4,8 +4,11 @@
 //! `docs/packets/M0/P40.md`.
 //!
 //! Layer rule (spec 4.2): this crate may depend on `es-math`, `es-core`, `es-ir` and external
-//! crates only. It defines the wire *schema* and an in-memory ring buffer; no transport (no
-//! sockets, QUIC, or TLS — that is `es-transport`, layer 11) and no network dependency here.
+//! crates only. It defines the wire *schema*, an in-memory ring buffer, and (as of the M1
+//! W8 packet) a loopback TCP transport built on `std::net` alone — no new dependency, no QUIC,
+//! no TLS. QUIC/zenoh and TLS are `es-transport` (layer 11, the only crate allowed to link
+//! CUDA/HIP) work for a later packet; see [`transport`] for exactly what this stopgap does and
+//! does not provide.
 //!
 //! # Backend-neutral: the Python adapter
 //!
@@ -32,9 +35,11 @@
 
 pub mod protocol;
 pub mod ring;
+pub mod transport;
 
 pub use protocol::{
     decode, decode_with_max, encode, encode_with, negotiate, Codec, Frame, Hello, HelloAck,
     Message, Payload, PerfMetrics, ProtoError, StreamId, DEFAULT_MAX_FRAME_BYTES, PROTOCOL_VERSION,
 };
 pub use ring::RingBuffer;
+pub use transport::{Client, ClientStats, Server, ServerStats, TransportError};

@@ -11,6 +11,7 @@ pub mod failure;
 pub mod id;
 pub mod job;
 pub mod pool;
+pub mod ring;
 pub mod time;
 
 pub use failure::{EnvHealth, Error, FailureAction, FailureKind, FailurePolicy};
