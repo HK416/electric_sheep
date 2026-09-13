@@ -148,19 +148,26 @@ spec 27.1의 "실질적 변경"의 기계적인 절반이다. 이는 참고용�
 많은 것을 증명하는 것처럼 읽혀서는 안 되기 때문이다.
 
 - **서명은 인증(authentication)이지 보증(endorsement)이 아니다.**
-  `EvidenceBundle::sign`(M4, W7, spec 25.1)은 모든 항목의 `(name, hash)` 쌍에
-  대해 분리된(detached) ed25519 서명을 추가하며, `verify(bytes, against,
-  trusted_keys)`는 `signature: Valid(key) | Invalid | Absent | UntrustedKey`를
-  보고한다. `Valid`는 오직 *호출자가 가진 바이트가 `trusted_keys` 소지자가 서명한
-  바이트와 같다*는 것만을 뜻한다 -- 그 서명자가 무언가를 확인했는지는 전혀 말해주지
-  않으며, 이는 여전히 [`VerifyReport::ok`]의 일부가 아니다: 번들이 신뢰된 서명을
-  지녀야 하는지 여부조차 번들의 속성이 아니라 호출자 정책이다
-  (`es evidence verify --require-signature`). `Absent`는 W7 이전에 만들어진 모든
-  번들이 여전히 보고하는 값이다(`schema_version: 1` 매니페스트에는 서명 필드가
-  아예 없으며, 이는 결함이 아니다 -- spec 25.3은 구버전을 계속 읽을 수 있게
-  유지한다). 키는 `--trust pub.hex`가 어떻게 채워졌는지 이상으로는 신뢰할 수
-  없다; 이 설계는 PKI도, 폐기 목록도, 키 로테이션도 추가하지 않으며, 그것들이
-  세워질 원시 요소만을 추가한다.
+  `EvidenceBundle::sign`(M4, W7, spec 25.1)은 컨테이너 전체에 대한 분리된(detached)
+  ed25519 서명을 추가하며, `verify(bytes, against, trusted_keys)`는
+  `signature: Valid(key) | Invalid | Absent | UntrustedKey`를 보고한다. 서명되는
+  메시지(스킴 `ed25519-esb-v2`, P-M4-R2)는 `CanonWriter` 인코딩으로, 스킴 id, 자신의
+  `signature` 슬롯만 비워진 매니페스트(그래서 `hashes`, 선언된 spec 5.3 체인,
+  `kind`, `schema_version`, `signer_public_key`가 모두 포함된다), 그리고 정렬된
+  순서의 모든 항목의 `(name, blake3(payload))` 쌍을 문자열과 blob마다 길이 접두를
+  붙여 담는다. 첫 번째 스킴(`v1`, M4 W7)은 항목들만 서명했으므로, 서명된 번들의
+  매니페스트가 다시 쓰여도 여전히 검증에 통과할 수 있었다; 스킴 id가 매니페스트
+  필드가 아니라 다이제스트 안에 있기 때문에, 이제 `v1` 서명은 `Invalid`로
+  보고된다 -- 이 바이너리는 자신이 계산하지 않은 메시지를 보증할 수 없다. `Valid`는
+  오직 *호출자가 가진 바이트가 `trusted_keys` 소지자가 서명한 바이트와 같다*는 것만을
+  뜻한다 -- 그 서명자가 무언가를 확인했는지는 전혀 말해주지 않으며, 이는 여전히
+  [`VerifyReport::ok`]의 일부가 아니다: 번들이 신뢰된 서명을 지녀야 하는지 여부조차
+  번들의 속성이 아니라 호출자 정책이다(`es evidence verify --require-signature`).
+  `Absent`는 W7 이전에 만들어진 모든 번들이 여전히 보고하는 값이다
+  (`schema_version: 1` 매니페스트에는 서명 필드가 아예 없으며, 이는 결함이 아니다 --
+  spec 25.3은 구버전을 계속 읽을 수 있게 유지한다). 키는 `--trust pub.hex`가
+  어떻게 채워졌는지 이상으로는 신뢰할 수 없다; 이 설계는 PKI도, 폐기 목록도, 키
+  로테이션도 추가하지 않으며, 그것들이 세워질 원시 요소만을 추가한다.
 - **재실행 계획은 재실행이 아니다.** `VerifyReport::replayable`(spec 28.6 게이트
   17의 전제 조건)은 `reports/<i>/` 항목마다, 재실행이 필요로 할
   `evaluation_hash`/`execution_hash`/`seeds`를 이름 붙이며,

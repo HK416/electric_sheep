@@ -263,3 +263,4 @@ factory가 만들어낼 수 없는 kind를 주장하는 셈이 될 것이다.
 * **`Env` 안의 `reset_on_entry` 연결** (§3.4).
 * **IR-C를 컴파일러로 lowering하기** (`es-compile`): 여기 있는 executor는 CPU 참조이며,
   `ScalarPlan`이 보상 콘에 대해 그런 것과 같다.
+</content>

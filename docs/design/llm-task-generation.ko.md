@@ -71,15 +71,40 @@ GenerateError>`이므로, 테스트는 `Vec<String>` 이터레이터로 미리 �
   `claude-api` 스킬의 모델 표에서 현재 Sonnet 등급 모델 -- 이것이 낡아 보이면 그 표를
   다시 확인할 것). `ANTHROPIC_API_KEY`는 오직 환경 변수에서만 읽으며, 저장소 안의
   파일에서는 절대 읽지 않는다. 이 feature가 선택적인 것은 정확히 기본 `es-script` /
-  `es` 빌드가 TLS 스택을 절대 링크하지 않도록 하기 위해서다.
+  `es` 빌드가 TLS 스택을 절대 링크하지 않도록 하기 위해서다. `AnthropicProvider::with_endpoint`는
+  실제 API 대신 호출자가 고른 URL로 요청을 보낸다 -- 이것이 존재하는 유일한 이유는
+  테스트가 이를 로컬 `TcpListener`로 향하게 할 수 있도록 하기 위해서다.
+
+**타임아웃과 오류 위생 (M4 review S-8):** `AnthropicProvider` 뒤의 `ureq::Agent`는
+`timeout_connect`와 `timeout_read` 둘 다 `AnthropicProvider::DEFAULT_TIMEOUT`(60초)로
+설정되어 만들어지며, `with_timeout` / `es task generate --timeout SECS`로 재정의할 수
+있다 -- `ureq` 자체의 기본값에는 읽기 타임아웃이 *없어서*, 멈춰버린 provider가 그
+라운드(그리고 CLI 호출 전체)를 영원히 매달리게 만들곤 했다. 타임아웃은
+`GenerateError::Timeout`으로 보고되며, 이는 포괄적인 `GenerateError::Provider(String)`와
+구분되게 유지된다. 그래서 호출자가 다르게 반응하려면(재시도할지 포기할지 등) 메시지에서
+"timed out"을 문자열 매칭할 필요가 없다. 다른 모든 provider 실패의 메시지는(프록시나
+오류 페이지가 요청 헤더를 그대로 돌려보내는 경우를 대비해 API 키가 그대로 나타나는
+자리는 모두 `<redacted>`로 대체되어) 수정된 뒤 256바이트로 잘리고(`redact_and_truncate`)
+`GenerateError::Provider`로 감싸진다 -- 예전의 `format!("unexpected response shape:
+{resp}")`는 무한정 큰 provider 응답 본문을 그대로 출력했는데, 이는 키 유출
+위험을(응답에 키가 나타난 적이 있었다면) 안겨줄 뿐 아니라 임의로 큰 덩어리를 로그나
+stdout에 쏟아낼 수 있었다.
 
 ## CLI
 
-`es task generate --prompt "..." [--scene scene.xml] [--rounds N] [--provider
-anthropic|stdin] --out <dir>` (`crates/es/src/cmd/generate.rs`, `main.rs`에서
+`es task generate --prompt "..." [--scene scene.xml] [--rounds N] [--timeout SECS]
+[--provider anthropic|stdin] --out <dir>` (`crates/es/src/cmd/generate.rs`, `main.rs`에서
 `es task generate`로부터 라우팅되며, `es task compile`을 위한 기존
 `cmd::task::dispatch`로 넘어가기 전에 처리된다). `--scene`은 이름 붙은 파일을 `blake3`로
 해시해 `SceneRef::scene_hash`와 `asset_hash` 양쪽에 쓴다 -- 이는 실제 asset-import
 해시(그것은 `es-assets`의 일)가 아니라 자리표시자다; 생성 루프는 보통 임포트된 씬의
 실제 콘텐츠 해시를 아직 갖고 있지 않을 것이다. 성공하면 `es_ir::serial::task_to_toml`을
 통해 `--out` 아래에 `task.toml`을 쓴다.
+
+`--rounds`의 기본값은 3이며 어떤 provider 호출보다도 먼저 `1..=10`에 대해 검사된다:
+라운드 0은 절대 결과를 만들어낼 수 없고, 상한 없는 라운드 수에 상한 없는 라운드당
+타임아웃을 곱하면 한 번의 호출에 대해 상한 없는 최악 실행 시간이 되어 버렸다(M4
+review S-8, `es/src/cmd/generate.rs:49`는 예전에 어떤 `u32`든 받아들였다). 그 범위
+밖이면 `dispatch`는 다른 잘못된 인자와 마찬가지로 종료 코드 2인 `CliError::Usage`를
+반환한다. `--timeout`(기본값 60)은 초 단위이며 `AnthropicProvider::with_timeout`으로
+전달된다; `--provider stdin`은 네트워크 호출을 전혀 하지 않으므로 이를 무시한다.

@@ -29,7 +29,11 @@ capability *조회*, Slang 호출 + SPIR-V 캐시, 버퍼, compute 파이프라�
    않는다; 여기에는 그것을 요청할 API가 없다.
 4. `Gpu::none_available()`은 CI 판정식이다: loader가 없거나, 인스턴스 생성이 실패하거나,
    보고된 물리 디바이스가 없을 때 참이다. 모든 GPU 테스트는 이것으로 시작해 이유와 함께
-   `SKIP`을 출력한다.
+   `SKIP`을 출력한다. `cargo xtask ci`는 테스트 단계를 `--nocapture`로 실행하고 그
+   `SKIP` 줄들을 스캔한다: `ES_REQUIRE_GPU=1`이면(GPU가 있다고 주장하는 머신) 그중
+   하나라도 있으면 실행이 실패하는데, 이는 `cargo xtask nostd --require`가 타깃 부재를
+   다루는 방식과 같다. PR 러너에는 GPU가 없고 이 변수를 설정하지 않으므로, 거기서는
+   스킵이 보고만 될 뿐이다.
 
 ## Capability는 조회될 뿐, 절대 설정되지 않는다
 
@@ -91,10 +95,13 @@ ExecModes { denorm_flush_to_zero_f32, rounding_mode_rte_f32, signed_zero_inf_nan
 - `slangc`는 `ES_SLANGC` 또는 `PATH`를 통해 찾는다. 그 `-v` 출력은 캐시 키에 들어가는데,
   §3.4 항목 7이 소스뿐 아니라 컴파일러 버전도 고정하기 때문이다.
 - 캐시: `target/es-slang-cache/<hash>.spv`, `hash = blake3(source ‖ entry ‖ profile ‖
-  defines ‖ exec_modes ‖ slangc version ‖ include dir)`. 히트는 `slangc`를 전혀 호출하지
-  않는다; `SlangCompiler::invocations()`가 실제 호출 횟수를 세어 테스트가 히트를 증명할
-  수 있게 한다. 콘텐츠 어드레싱이므로 랭크 간에 공유 가능하고(§22), 배포가 Slang을
-  필요로 하지 않도록 번들에 담을 수 있다(§11.4).
+  defines ‖ exec_modes ‖ slangc version ‖ include dirs ‖그 아래의 모든 파일)`. include
+  순회는 **재귀적**이고 정렬되며, 각 파일의 경로를 그것의 include root에 대한 상대
+  경로로 키로 삼는다. 그래서 `#include "sub/helper.slang"`도 아이덴티티의 일부가
+  된다; 순회 오류는 키를 조용히 약화시키는 대신 그대로 전파된다. 히트는 `slangc`를
+  전혀 호출하지 않는다; `SlangCompiler::invocations()`가 실제 호출 횟수를 세어 테스트가
+  히트를 증명할 수 있게 한다. 콘텐츠 어드레싱이므로 랭크 간에 공유 가능하고(§22),
+  배포가 Slang을 필요로 하지 않도록 번들에 담을 수 있다(§11.4).
 - 플래그: `-target spirv -profile <p> -entry <e> -O0 -fp-mode precise
   -emit-spirv-directly`, 모드가 요청되면 `-denorm-mode-fp32 ftz`도 추가. 정확한 플래그와
   각각이 실제로 무엇을 방출하는 것으로 관찰되었는지: `docs/api-notes/slang.md`.
@@ -103,9 +110,19 @@ ExecModes { denorm_flush_to_zero_f32, rounding_mode_rte_f32, signed_zero_inf_nan
   SPIR-V writer(`spirv.rs`, 약 200줄, 의존성 없음)이며, capability, `SPV_KHR_float_controls`
   확장, 진입점 뒤의 `OpExecutionMode`들, 그리고 float 산술 결과 id마다 하나씩의
   `OpDecorate <id> NoContraction`을 삽입한다.
+  이 패치는 `(진입점, 모드, float 너비)`로 키가 매겨진다: *모든* `OpEntryPoint`를
+  다루고, 다른 너비에 선언된 모드는 요청된 f32 모드를 억제하지 않으며, 이미 그
+  너비에 모순되는 모드를 선언한 모듈(요청된 `DenormFlushToZero 32`에 대한
+  `DenormPreserve 32`)은 패치되어 유효하지 않은 것으로 만들어지는 대신
+  `GpuError::Spirv`로 거부된다.
 - `spirv_has_execution_mode(&words, mode)` / `spirv_no_contraction_count(&words)`는
   헤더와 명령 스트림을 파싱하므로, 테스트는 플래그를 신뢰하는 대신 그 모드들이 바이너리
   안에 있음을 *증명*할 수 있다.
+- `validate_spirv(&words)`는 콜드 컴파일마다 패치된 모듈에 대해 **`spirv-val`**
+  (Vulkan SDK, `PATH` 또는 `ES_SPIRV_VAL`)을 실행한다 — 헤더 파싱은 워드 스트림이
+  잘 구성되어 있다는 것을 말할 뿐 모듈이 합법적이라는 것을 말하지 않으며, 이
+  crate는 SPIR-V를 손으로 작성한다. 도구가 없으면: 출력된 `NOTE`와 함께 `Ok(false)`,
+  또는 `ES_REQUIRE_SPIRV_VAL=1` 아래에서는 오류.
 
 `SpirvModule { words, hash, entry }`. 이 해시가 §11.4의 `compile_hash` 구성 요소다.
 
@@ -113,7 +130,10 @@ ExecModes { denorm_flush_to_zero_f32, rounding_mode_rte_f32, signed_zero_inf_nan
 
 `gpu-allocator`가 디바이스 메모리를 소유한다; 버퍼는 `Storage` / `Uniform` /
 `Staging`(host-visible)을 갖는 `Buffer::new(gpu, bytes, Usage)`다. `upload` /
-`download`는 staging 버퍼와 일회성 커맨드 버퍼를 통해 복사한다.
+`download`는 staging 버퍼와 일회성 커맨드 버퍼를 통해 복사한다. `Buffer`는 요청받은
+`bytes`를 실제로 할당된 것(`bytes.max(4)`에 할당자의 정렬 패딩을 더한 것)과 함께
+기록하며, `download`는 정확히 요청된 길이를 반환한다 — 패딩이 데이터인 양 돌려주는
+일은 없다.
 
 `ComputePipeline::new(gpu, &SpirvModule, &[BindingDesc])`는 단일 descriptor set을
 만든다(set 0, storage 또는 uniform 버퍼만). `CommandRecorder`는 하나의 compute 큐에

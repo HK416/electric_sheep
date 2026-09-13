@@ -15,7 +15,7 @@ Spec: spec 14.5 (약 1759번째 줄, MCP 인터페이스 요구사항).
 |---|---|
 | 검증 대상 | 프로토콜 버전 **`2025-06-18`**, 2026-09-13에 <https://modelcontextprotocol.io/specification/2025-06-18/basic/transports>와 <https://modelcontextprotocol.io/specification/2025-06-18/server/tools>에서 가져옴 |
 | MCP SDK crate | **없음** -- 작업 패킷에 따라 `serde_json` 위에서 JSON-RPC 2.0을 직접 구현 |
-| 실제 클라이언트와의 상호운용 | **미검증** -- 작성된 스펙 페이지에 대해서만 확인했을 뿐, 실제 MCP 클라이언트(Claude Desktop, IDE의 MCP 통합, `@modelcontextprotocol/inspector`)에 대해서는 한 번도 확인하지 않았다; spec 12.4의 관례에 따라 측정되지 않은 것은 `Target / Status: 미검증` |
+| 실제 클라이언트와의 상호운용 | **미검증 (unverified)** -- 작성된 스펙 페이지에 대해서만 확인했을 뿐, 실제 MCP 클라이언트(Claude Desktop, IDE의 MCP 통합, `@modelcontextprotocol/inspector`)에 대해서는 한 번도 확인하지 않았다; spec 12.4의 관례에 따라 측정되지 않은 것은 `Target / Status: 미검증 (unverified)` |
 
 ## Transport -- stdio 프레이밍
 
@@ -81,9 +81,42 @@ Spec: spec 14.5 (약 1759번째 줄, MCP 인터페이스 요구사항).
 
 | 코드 | 의미 | `es_script::mcp`가 보내는 상황 |
 |---|---|---|
-| `-32700` | Parse error | stdio 한 줄이 유효한 JSON이 아닐 때 |
+| `-32700` | Parse error | stdio 한 줄이 유효한 JSON이 아니거나, 아예 유효한 UTF-8이 아닐 때 |
+| `-32600` | Invalid Request | stdio 한 줄이 `ServerConfig::max_request_bytes`보다 길 때 |
 | `-32601` | Method not found | `dispatch`의 메서드가 `initialize`/`ping`/`tools/list`/`tools/call` 중 어느 것도 아닐 때 |
 | `-32602` | Invalid params | 알 수 없는 도구 이름, 또는 도구 본체에서 온 `ToolError::BadParams` |
 
-이 세 가지는 MCP 전용이 아니라 표준 JSON-RPC 2.0의 예약된 코드다; MCP 자체는 "Error
+이 네 가지는 MCP 전용이 아니라 표준 JSON-RPC 2.0의 예약된 코드다; MCP 자체는 "Error
 Handling" 절이 프로토콜 오류로 표시하는 것 이상의 추가 코드를 정의하지 않는다.
+
+## 요청 크기 상한
+
+M4 리뷰 발견사항 **S-3**: `Server::run`은 예전에 `std::io::BufRead::lines()`로 줄을
+읽었는데, 이는 길이 제한이 없다(공격자나 버그가 제어하는 줄이 통째로 버퍼링되어
+`String`으로 변환된 뒤에야 비로소 `serde_json`에 전달된다 -- `validate`의 `toml` 인자의
+경우, 디코드된 JSON 문자열로 *다시* 할당된 뒤 TOML로 파싱되므로, 거대한 줄 하나가
+무언가 확인하기도 전에 자기 크기의 몇 배를 소모한다) 그리고 UTF-8이 아닌 바이트를
+`io::Error`로 바꾸어 `line?`이 이를 `run()` 밖으로 그대로 전파시켜, 잘못된 바이트 하나로
+세션 전체를 끝내버린다.
+
+`String`/JSON 변환을 시도하기 전에 길이 상한을 두고 원시 바이트를 읽도록 수정했다:
+
+- `ServerConfig::max_request_bytes`(기본값 [`MAX_REQUEST_BYTES`], 16 MiB)는 한 줄을
+  제한한다. `Server::run`의 내부 리더는 `BufRead`로부터 바이트가 흘러들어오는 동안
+  누적 길이를 추적하며, 누적 합이 상한을 넘어서는 순간부터는 그 줄의 나머지 부분에
+  대해 버퍼에 더 이상 추가하지 않는다(이미 가진 것은 버린다) -- 그래서 지나치게 큰
+  줄의 메모리 비용은 그 줄이 실제로 얼마나 큰가가 아니라 상한으로 제한된다. 줄을
+  끝내는 개행(또는 EOF)에 도달하면 서버는 `id: null`로 `-32600 Invalid Request`를
+  쓰고 다음 줄로 넘어간다; 아무것도 JSON으로 파싱되지 않는다.
+- 상한 이하의 줄은 `io::Read`/`io::BufRead` 자체의(실패 가능하고, 세션을 끝내버리는)
+  UTF-8 변환에 의존하는 대신 `std::str::from_utf8`로 디코드된다(성공 시 버퍼를
+  소비해버리지만 그래도 실패 가능한 경로가 필요했던 `String::from_utf8`이 아니라).
+  디코드 실패는 `id: null`로 `-32700 Parse error`를 받는다 -- 디코드는 되지만
+  `serde_json::from_str`이 실패하는 줄과 같은 형태이며, 다만 한 단계 앞에서 일어날
+  뿐이다 -- 그리고 루프는 계속 돈다.
+
+두 결함 모두 `crates/es-script/src/mcp.rs`의 `mod tests`에서 검사된다: 실제 16 MiB
+기본값으로(축소된 상한이 아니라) 만든 줄은 리뷰가 실제로 지적한 크기에서 크기 검사가
+발동함을 확인하고, 유효한 `initialize`가 뒤따르는 단독 `0xFF` 바이트는 루프가 잘못된
+UTF-8에서 살아남아 다음 요청에 정상적으로 응답함을 확인한다.
+</content>

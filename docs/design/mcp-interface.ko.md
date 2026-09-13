@@ -65,6 +65,23 @@ MCP 스펙 자체의 "Protocol Errors"와 "Tool Execution Errors" 구분에 맞�
 오류에 대한 JSON-RPC 2.0 자체의 규칙) `-32700 Parse error`를 받으며, 서버는 다음
 줄을 계속 읽는다.
 
+요청 한 줄은 그 자체로는 신뢰되는 transport 위의 신뢰되지 않는 입력이다(spec 25.1:
+stdio만 쓰지만, 파이프 반대편의 프로세스는 여전히 이 crate 자신의 코드가 아니라 외부
+도구다). 그래서 M4 review(S-3)에 따라, 그리고 `docs/api-notes/mcp.md`의 "Request
+size cap"에 고정된 대로, JSON 파싱이 시도되기도 전에 두 가지 결함이 더 걸러진다:
+
+- `ServerConfig::max_request_bytes`(기본값 `MAX_REQUEST_BYTES`, 16 MiB)보다 긴 줄은
+  `id: null`과 함께 `-32600 Invalid Request`를 받는다. 상한을 넘는 바이트는 절대
+  전부 버퍼링되지 않는다 -- `Server::run`의 줄 읽기는 스트리밍하면서 길이를
+  추적하고 상한을 넘는 순간 나머지를 버리므로, 지나치게 큰 줄의 비용은 줄 길이가
+  아니라 O(상한) 메모리다.
+- 유효한 UTF-8이 아닌 줄은 예전 동작(`BufRead::lines()` 내부에서 `String` 변환이
+  실패해 `io::ErrorKind::InvalidData`가 `run()` 밖으로 전파되고 나쁜 바이트 하나에
+  세션 전체가 끝나던 것) 대신 `-32700 Parse error`를 받는다.
+
+둘 다 문제가 된 줄을 버리고 다음 줄을 위해 루프를 살려 둔다 -- 위의 JSON 파싱 오류와
+같은 모양이며, 다만 한 계층 더 앞에서 검사될 뿐이다.
+
 ## Ceiling
 
 - `tools/list`에 페이지네이션이 없다(`cursor`/`nextCursor`): 도구 여섯 개는 응답
