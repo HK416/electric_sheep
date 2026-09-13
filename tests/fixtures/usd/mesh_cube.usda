@@ -1,0 +1,43 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 1
+    upAxis = "Z"
+    doc = "One mesh collider with explicit mass properties. The faces are quads, so the importer has to triangulate them."
+)
+
+def Xform "World"
+{
+    def Mesh "block" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsCollisionAPI", "PhysicsMassAPI"]
+    )
+    {
+        double3 xformOp:translate = (0, 0, 0.5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        float physics:mass = 2
+        point3f physics:centerOfMass = (0, 0, 0)
+        float3 physics:diagonalInertia = (0.0833, 0.0833, 0.0833)
+
+        point3f[] points = [
+            (-0.5, -0.5, -0.5),
+            ( 0.5, -0.5, -0.5),
+            ( 0.5,  0.5, -0.5),
+            (-0.5,  0.5, -0.5),
+            (-0.5, -0.5,  0.5),
+            ( 0.5, -0.5,  0.5),
+            ( 0.5,  0.5,  0.5),
+            (-0.5,  0.5,  0.5)
+        ]
+        int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+        int[] faceVertexIndices = [
+            0, 3, 2, 1,
+            4, 5, 6, 7,
+            0, 1, 5, 4,
+            1, 2, 6, 5,
+            2, 3, 7, 6,
+            3, 0, 4, 7
+        ]
+        uniform token subdivisionScheme = "none"
+    }
+}

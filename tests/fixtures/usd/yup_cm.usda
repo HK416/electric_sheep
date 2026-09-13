@@ -1,0 +1,53 @@
+#usda 1.0
+(
+    defaultPrim = "World"
+    metersPerUnit = 0.01
+    upAxis = "Y"
+    doc = "USD defaults: Y-up, centimetres. The post is 300 cm along USD +Y, which is spec 3.1 (0, 0, 3) m; the arm hangs 50 cm along USD -Y from it, which is 0.5 m along spec 3.1 -Z relative to the post."
+)
+
+def Xform "World"
+{
+    def Xform "post" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+    )
+    {
+        double3 xformOp:translate = (0, 300, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Sphere "head" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 10
+        }
+    }
+
+    def Xform "arm" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+    )
+    {
+        double3 xformOp:translate = (0, 250, 0)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+
+        def Cylinder "shaft" (
+            prepend apiSchemas = ["PhysicsCollisionAPI"]
+        )
+        {
+            double radius = 4
+            double height = 50
+            uniform token axis = "Y"
+        }
+    }
+
+    def PhysicsPrismaticJoint "slider"
+    {
+        rel physics:body0 = </World/post>
+        rel physics:body1 = </World/arm>
+        point3f physics:localPos0 = (0, -50, 0)
+        point3f physics:localPos1 = (0, 0, 0)
+        uniform token physics:axis = "Y"
+        float physics:lowerLimit = -20
+        float physics:upperLimit = 20
+    }
+}

@@ -10,6 +10,7 @@ es-core = { workspace = true }
 es-math = { workspace = true }
 es-assets = { workspace = true }
 es-usd = { workspace = true }
+blake3 = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 
