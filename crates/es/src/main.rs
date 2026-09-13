@@ -23,6 +23,9 @@ USAGE:
     es task compile <task.toml> <obs.toml> [--release]
     es eval compare <A.json> <B.json>
     es eval run --config <eval.toml> --policy <policy.esb> --scene <file.xml|urdf> [OPTIONS]
+    es evidence verify <bundle.esb> [--against <other.esb>] [--json]
+    es gap --sim <root> --real <root> [--out gap_report.json] [--max-samples N] [--threshold D]
+    es loop collect|intervene|distill ...   (see `es loop --help`)
     es import lerobot-config --config <config.json> [--stats ...] [--dataset ...] --out <dir>
     es dataset info <root>
     es backend compare --scene <file.xml|urdf> --backends mujoco-cpu,mjwarp[,newton,physx]
@@ -45,6 +48,9 @@ fn dispatch(args: &[String]) -> Result<u8, CliError> {
         Some("ir") => cmd::ir::dispatch(&args[1..]),
         Some("task") => cmd::task::dispatch(&args[1..]),
         Some("eval") => cmd::eval::dispatch(&args[1..]),
+        Some("evidence") => cmd::evidence::dispatch(&args[1..]),
+        Some("gap") => cmd::gap::dispatch(&args[1..]),
+        Some("loop") => cmd::r#loop::dispatch(&args[1..]),
         Some("import") => cmd::import::dispatch(&args[1..]),
         Some("dataset") => cmd::dataset::dispatch(&args[1..]),
         Some("backend") => cmd::backend::dispatch(&args[1..]),

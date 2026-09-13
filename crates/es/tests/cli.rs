@@ -1182,3 +1182,703 @@ fn import_lerobot_config_round_trips_through_ir_validate() {
     );
     assert!(!vtext.contains("ERROR"), "{vtext}");
 }
+
+// --- `es evidence` (spec 27.1, spec 28.7 gate 16) --------------------------------------------
+
+use es_compile::bundle::{self, EVALUATION_LOCK, POLICY_BUNDLE, REPORT_JSON, SAFETY_CASE};
+use es_compile::PolicyBundle;
+use es_eval::evidence::{
+    report_entries, Claim, Evidence, EvidenceBundle, EvidenceKind, Requirement, SafetyCase,
+    Severity, EVID_ENTRY_HASH,
+};
+use es_eval::{BackendCaps, EvaluationLock};
+use es_ir::evaluation::{
+    AcceptanceResult, CellResult, EvaluationReport, MetricValue as EvalMetricValue,
+};
+use es_ir::hash::{canonical_hash, ChangedComponent, DatasetHash, HardwareCapability, HashChain};
+
+/// [`deployable_fixture`] with one envelope knob the `--against` test can tighten, which is
+/// the smallest real change that moves `deployment_hash` (spec 5.3).
+fn evidence_fixture(contact_force_max: f64) -> Fixture {
+    let mut f = deployable_fixture();
+    f.deployment.safety.contact_force_max = contact_force_max;
+    f
+}
+
+/// Everything one `evidence.esb` is built from, kept so a test can rebuild it after tampering.
+struct EvidenceCase {
+    policy: Vec<u8>,
+    chain: HashChain,
+    runs: Vec<(EvaluationReport, EvaluationLock)>,
+    case: SafetyCase,
+    bytes: Vec<u8>,
+}
+
+/// One evaluation run's artifacts (spec 10.5), of the execution `chain` describes.
+fn run_artifacts(f: &Fixture, chain: &HashChain) -> (EvaluationReport, EvaluationLock) {
+    let evaluation_hash = f.evaluation.evaluation_hash().expect("evaluation hashes");
+    let execution_hash = chain.execution_hash();
+    let report = EvaluationReport {
+        schema_version: 1,
+        evaluation_hash,
+        execution_hash,
+        cells: vec![CellResult {
+            suite: "lighting".to_owned(),
+            metric: MetricSpec::SuccessRate,
+            value: EvalMetricValue::Scalar(0.91),
+            n_episodes: 50,
+        }],
+        acceptance: vec![AcceptanceResult::Determined {
+            criterion: f.evaluation.acceptance[0].clone(),
+            observed: 0.91,
+            passed: true,
+        }],
+        passed: true,
+        episodes: Vec::new(),
+    };
+    let lock = EvaluationLock {
+        schema_version: 1,
+        evaluation_hash: hex(&evaluation_hash),
+        execution_hash: hex(&execution_hash),
+        seeds: vec![7],
+        backend: BackendCaps {
+            name: "mujoco-cpu".to_owned(),
+            determinism: "bitwise".to_owned(),
+            float: "f64".to_owned(),
+            max_envs: 1,
+            gpu_resident: false,
+            supports_reset_subset: false,
+            supports_state_get_set: true,
+            quirks: Vec::new(),
+        },
+        created: 0,
+    };
+    (report, lock)
+}
+
+/// A complete Safety Case over `runs`: one requirement evidenced by the report, one by the
+/// lock, plus the claim a human would write for the first.
+fn safety_case(
+    runs: &[(EvaluationReport, EvaluationLock)],
+    execution_hash: [u8; 32],
+) -> SafetyCase {
+    let entries = report_entries(runs).expect("report entries");
+    let evidence = |id: &str, kind: EvidenceKind, entry: String| Evidence {
+        id: id.to_owned(),
+        kind,
+        hash: *blake3::hash(&entries[&entry]).as_bytes(),
+        entry,
+        execution_hash,
+    };
+    let requirement = |id: &str, text: &str| Requirement {
+        id: id.to_owned(),
+        text: text.to_owned(),
+        source: "(EU) 2023/1230 Annex III".to_owned(),
+        severity: Severity::Critical,
+    };
+    SafetyCase {
+        schema_version: 1,
+        requirements: vec![
+            requirement(
+                "REQ-07",
+                "the end effector stays inside the declared envelope",
+            ),
+            requirement(
+                "REQ-11",
+                "the evaluated conditions are recorded and reproducible",
+            ),
+        ],
+        claims: vec![Claim {
+            id: "CLM-01".to_owned(),
+            text: "the envelope bounds it and the lighting suite measured it".to_owned(),
+            requirement: "REQ-07".to_owned(),
+        }],
+        evidence: vec![
+            evidence(
+                "EV-report",
+                EvidenceKind::EvalReport,
+                bundle::report_entry(0, REPORT_JSON),
+            ),
+            evidence(
+                "EV-lock",
+                EvidenceKind::Lock,
+                bundle::report_entry(0, EVALUATION_LOCK),
+            ),
+        ],
+        traceability: BTreeMap::from([
+            ("REQ-07".to_owned(), vec!["EV-report".to_owned()]),
+            ("REQ-11".to_owned(), vec!["EV-lock".to_owned()]),
+        ]),
+    }
+}
+
+fn build_evidence(contact_force_max: f64) -> EvidenceCase {
+    let f = evidence_fixture(contact_force_max);
+    let policy = build_policy_bundle(&f);
+    let m = PolicyBundle::open(&policy)
+        .expect("policy bundle opens")
+        .manifest
+        .hashes;
+    let slot = |v: Option<[u8; 32]>| v.expect("a policy bundle fills this slot");
+    let chain = HashChain {
+        asset: vec![f.task.scene.asset_hash],
+        scene: f.task.scene.scene_hash,
+        task_graph: canonical_hash(&f.task.graph).expect("task graph hashes"),
+        task: slot(m.task),
+        observation: slot(m.observation),
+        learning: slot(m.learning),
+        policy: slot(m.policy),
+        dataset: DatasetHash {
+            content: [1; 32],
+            schema: [2; 32],
+            split: [3; 32],
+        },
+        deployment: slot(m.deployment),
+        evaluation: Some(f.evaluation.evaluation_hash().expect("evaluation hashes")),
+        compiler: slot(m.compiler),
+        runtime: [9; 32],
+        hardware: HardwareCapability([8; 32]),
+    };
+    let runs = vec![run_artifacts(&f, &chain)];
+    let case = safety_case(&runs, chain.execution_hash());
+    let bytes = EvidenceBundle::build(&policy, &chain, &runs, &case, &BTreeMap::new())
+        .expect("evidence bundle builds");
+    EvidenceCase {
+        policy,
+        chain,
+        runs,
+        case,
+        bytes,
+    }
+}
+
+/// Rewrite one entry of a sealed bundle and re-seal the container, so that the container's own
+/// blake3 check passes and only the Safety Case's recorded hash can catch the change.
+fn rewrite_entry(bytes: &[u8], entry: &str, payload: Vec<u8>) -> Vec<u8> {
+    let raw = bundle::read(bytes).expect("reads");
+    let mut entries = raw.entries;
+    entries.insert(entry.to_owned(), payload);
+    bundle::write(&raw.manifest, &entries).expect("writes")
+}
+
+#[test]
+fn evidence_bundle_round_trips() {
+    let built = build_evidence(40.0);
+    let report = EvidenceBundle::verify(&built.bytes, None).expect("verifies");
+    assert!(
+        report.ok(),
+        "diagnostics: {:?}\ncoverage: {:?}",
+        report.diagnostics,
+        report.coverage
+    );
+    assert_eq!(report.execution_hash, built.chain.execution_hash());
+    assert!(report.coverage.iter().all(|c| c.covered));
+    assert!(report.coverage.iter().all(|c| c.stale.is_empty()));
+    assert!(report.revalidation.is_empty());
+    // The policy bundle is embedded whole and still opens on its own (spec 9.6).
+    let opened = EvidenceBundle::open(&built.bytes).expect("opens");
+    assert_eq!(opened.entries[POLICY_BUNDLE], built.policy);
+    assert_eq!(opened.case, built.case);
+    assert_eq!(opened.chain, built.chain);
+    // Deterministic: same inputs, same bytes.
+    let again = EvidenceBundle::build(
+        &built.policy,
+        &built.chain,
+        &built.runs,
+        &built.case,
+        &BTreeMap::new(),
+    )
+    .expect("builds");
+    assert_eq!(again, built.bytes);
+}
+
+#[test]
+fn evidence_verify_catches_a_tampered_report() {
+    let built = build_evidence(40.0);
+    let entry = bundle::report_entry(0, REPORT_JSON);
+    // Still valid JSON and still the same report -- only the bytes differ, which is exactly
+    // what the recorded blake3 exists to catch.
+    let mut payload = bundle::read(&built.bytes).expect("reads").entries[&entry].clone();
+    payload.push(b' ');
+    let tampered = rewrite_entry(&built.bytes, &entry, payload);
+
+    let report = EvidenceBundle::verify(&tampered, None).expect("verifies");
+    assert!(!report.ok(), "a rewritten report entry must not verify");
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == EVID_ENTRY_HASH),
+        "{:?}",
+        report.diagnostics
+    );
+    let covered = report.coverage.iter().filter(|c| c.covered).count();
+    assert_eq!(covered, 1, "only the lock's requirement stays covered");
+}
+
+#[test]
+fn evidence_verify_fails_an_uncovered_requirement() {
+    let built = build_evidence(40.0);
+    // `build` refuses a case with a missing link, so the link is cut in the sealed bundle --
+    // the same thing an editor downstream of the build would do.
+    let mut case = built.case.clone();
+    case.traceability.remove("REQ-07");
+    let mut text = serde_json::to_string_pretty(&case).expect("serializes");
+    text.push('\n');
+    let cut = rewrite_entry(&built.bytes, SAFETY_CASE, text.into_bytes());
+
+    let report = EvidenceBundle::verify(&cut, None).expect("verifies");
+    assert!(!report.ok());
+    let req = report
+        .coverage
+        .iter()
+        .find(|c| c.requirement == "REQ-07")
+        .expect("REQ-07 is still a requirement");
+    assert!(!req.covered);
+    assert!(req.evidence.is_empty());
+
+    let dir = scratch_dir("evidence-uncovered");
+    let path = dir.join("evidence.esb");
+    std::fs::write(&path, &cut).expect("write bundle");
+    let out = bin()
+        .args(["evidence", "verify", path.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(stdout(&out).contains("UNCOVERED"), "{}", stdout(&out));
+}
+
+#[test]
+fn evidence_verify_against_lists_revalidation() {
+    let a = build_evidence(40.0);
+    let b = build_evidence(35.0); // a tighter envelope: `deployment_hash` moves
+    assert_ne!(a.chain.deployment, b.chain.deployment);
+
+    let report = EvidenceBundle::verify(&a.bytes, Some(&b.bytes)).expect("verifies");
+    // `--against` is advisory: a differing predecessor is not a defect of this bundle.
+    assert!(report.ok(), "{:?}", report.diagnostics);
+    let deployment: Vec<_> = report
+        .revalidation
+        .iter()
+        .filter(|(c, _)| *c == ChangedComponent::Deployment)
+        .collect();
+    assert_eq!(deployment.len(), 1, "{:?}", report.revalidation);
+    assert_eq!(
+        deployment[0].1,
+        vec!["EV-report".to_owned(), "EV-lock".to_owned()],
+        "a changed envelope invalidates both run-produced kinds (spec 27.1)"
+    );
+    // Nothing else moved: the two bundles differ in the envelope alone.
+    assert!(
+        report
+            .revalidation
+            .iter()
+            .all(|(c, _)| *c == ChangedComponent::Deployment),
+        "{:?}",
+        report.revalidation
+    );
+}
+
+#[test]
+fn evidence_build_and_verify_cli_round_trip() {
+    let dir = scratch_dir("evidence-cli");
+    let built = build_evidence(40.0);
+
+    let policy = dir.join("policy.esb");
+    std::fs::write(&policy, &built.policy).expect("write policy");
+    let chain = dir.join("chain.json");
+    write(
+        &chain,
+        &serde_json::to_string_pretty(&built.chain).expect("chain json"),
+    );
+    let case = dir.join("case.json");
+    write(
+        &case,
+        &serde_json::to_string_pretty(&built.case).expect("case json"),
+    );
+    let run_dir = dir.join("run0");
+    es_eval::write_artifacts(&built.runs[0].0, &built.runs[0].1, &run_dir).expect("artifacts");
+    let out_path = dir.join("evidence.esb");
+
+    let out = bin()
+        .args(["evidence", "build"])
+        .args(["--policy", policy.to_str().unwrap()])
+        .args(["--chain", chain.to_str().unwrap()])
+        .args(["--report", run_dir.to_str().unwrap()])
+        .args(["--case", case.to_str().unwrap()])
+        .args(["--out", out_path.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    assert!(
+        out.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The CLI re-serializes the two artifacts it read from disk; they must be the same bytes
+    // the library sealed, or the case's recorded hashes would not match.
+    assert_eq!(std::fs::read(&out_path).expect("read bundle"), built.bytes);
+
+    let verify = bin()
+        .args(["evidence", "verify", out_path.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    let text = stdout(&verify);
+    assert!(verify.status.success(), "{text}");
+    assert!(text.contains("REQ-07"), "{text}");
+    assert!(text.contains("signature:      unverified"), "{text}");
+    assert!(!text.contains("UNCOVERED"), "{text}");
+
+    let json = bin()
+        .args(["evidence", "verify", out_path.to_str().unwrap(), "--json"])
+        .output()
+        .expect("run es");
+    assert!(json.status.success(), "{}", stdout(&json));
+    let parsed: serde_json::Value = serde_json::from_str(&stdout(&json)).expect("json");
+    assert_eq!(parsed["coverage"].as_array().expect("coverage").len(), 2);
+}
+
+// --- `es gap` (spec 24.3, spec 28.7 gate 15) -----------------------------------------------
+
+use es_data::{Column, Dtype, Episode, FeatureSpec, Info, LeRobotWriter};
+
+/// A minimal `LeRobot` dataset: one episode, one scalar `observation.state` feature, one
+/// `action` feature, plus `success` and `action_source` bookkeeping columns (the design doc's
+/// episode-level convention). `shift` is added to every `action` value so the sim/real
+/// fixtures can disagree on exactly one channel.
+fn write_gap_fixture(root: &Path, shift: f64) {
+    let mut features = BTreeMap::new();
+    features.insert(
+        "observation.state".to_owned(),
+        FeatureSpec::new(Dtype::Float32, [1u64]),
+    );
+    features.insert(
+        "action".to_owned(),
+        FeatureSpec::new(Dtype::Float32, [1u64]),
+    );
+    features.insert("success".to_owned(), FeatureSpec::new(Dtype::Int64, [1u64]));
+    features.insert(
+        "action_source".to_owned(),
+        FeatureSpec::new(Dtype::Int64, [1u64]),
+    );
+
+    let mut writer = LeRobotWriter::create(root, Info::new(30.0, features)).expect("create");
+    for ep_idx in 0..2u32 {
+        let n = 40usize;
+        let mut columns = BTreeMap::new();
+        columns.insert(
+            "observation.state".to_owned(),
+            Column::F32((0..n).map(|i| (i % 9) as f32).collect()),
+        );
+        columns.insert(
+            "action".to_owned(),
+            Column::F32((0..n).map(|i| (i % 5) as f32 + shift as f32).collect()),
+        );
+        columns.insert(
+            "success".to_owned(),
+            Column::I64(vec![i64::from(ep_idx % 2 == 0); n]),
+        );
+        columns.insert(
+            "action_source".to_owned(),
+            // Every 10th frame is "clamped" (nonzero) -- a fixed, checkable rate.
+            Column::I64((0..n).map(|i| i64::from(i % 10 == 0)).collect()),
+        );
+        let episode = Episode {
+            index: ep_idx,
+            tasks: vec!["task".to_owned()],
+            timestamps: (0..n).map(|i| i as f64 / 30.0).collect(),
+            task_index: vec![0; n],
+            columns,
+            video: BTreeMap::new(),
+        };
+        writer.write_episode(&episode).expect("write episode");
+    }
+    writer.finish().expect("finish");
+}
+
+#[test]
+fn gap_identical_datasets_exit_zero_and_write_report() {
+    let dir = scratch_dir("gap-identical");
+    let sim = dir.join("sim");
+    let real = dir.join("real");
+    write_gap_fixture(&sim, 0.0);
+    write_gap_fixture(&real, 0.0);
+    let out = dir.join("gap_report.json");
+
+    let result = bin()
+        .args([
+            "gap",
+            "--sim",
+            sim.to_str().unwrap(),
+            "--real",
+            real.to_str().unwrap(),
+        ])
+        .args(["--out", out.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    let text = stdout(&result);
+    assert!(
+        result.status.success(),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(text.contains("observation.state"), "{text}");
+    assert!(text.contains("action"), "{text}");
+    assert!(out.is_file());
+
+    let report: es_eval::domain_gap::GapReport =
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("read report"))
+            .expect("report json");
+    assert!(!report.has_flagged(), "{report:?}");
+}
+
+#[test]
+fn gap_shifted_action_channel_is_flagged_and_exits_one() {
+    let dir = scratch_dir("gap-shifted");
+    let sim = dir.join("sim");
+    let real = dir.join("real");
+    write_gap_fixture(&sim, 0.0);
+    write_gap_fixture(&real, 50.0);
+    let out = dir.join("gap_report.json");
+
+    let result = bin()
+        .args([
+            "gap",
+            "--sim",
+            sim.to_str().unwrap(),
+            "--real",
+            real.to_str().unwrap(),
+        ])
+        .args(["--out", out.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    assert_eq!(result.status.code(), Some(1), "{}", stdout(&result));
+
+    let report: es_eval::domain_gap::GapReport =
+        serde_json::from_str(&std::fs::read_to_string(&out).expect("read report"))
+            .expect("report json");
+    assert!(report.has_flagged(), "{report:?}");
+    assert!(
+        report.suspects.iter().any(|s| s.channel == "action"),
+        "{report:?}"
+    );
+    let state = report
+        .channels
+        .iter()
+        .find(|c| c.name == "observation.state")
+        .expect("state channel present");
+    assert!(!state.flagged, "{report:?}");
+}
+
+#[test]
+fn gap_missing_required_flags_is_usage_error() {
+    let out = bin()
+        .args(["gap", "--sim", "/nonexistent"])
+        .output()
+        .expect("run es");
+    assert_eq!(out.status.code(), Some(2));
+}
+
+// --- `es loop` (spec 13.1, 13.2, 13.3; docs/packets/M3/W7-learning-loop.md) -----------------
+
+/// A minimal collected-looking dataset: `episodes` episodes of 8 frames with the two loop
+/// columns already in the schema, so `es loop intervene` moves `content` and not `schema`.
+fn write_loop_fixture(root: &Path, episodes: u32) {
+    let mut features = BTreeMap::new();
+    features.insert(
+        "observation.state".to_owned(),
+        FeatureSpec::new(Dtype::Float32, [2u64]),
+    );
+    features.insert(
+        "action".to_owned(),
+        FeatureSpec::new(Dtype::Float32, [1u64]),
+    );
+    features.insert(
+        "intervention".to_owned(),
+        FeatureSpec::new(Dtype::Int64, [1u64]),
+    );
+    features.insert(
+        "action_source".to_owned(),
+        FeatureSpec::new(Dtype::Int64, [1u64]),
+    );
+    let mut writer = LeRobotWriter::create(root, Info::new(100.0, features)).expect("create");
+    for index in 0..episodes {
+        let n = 8usize;
+        let mut columns = BTreeMap::new();
+        columns.insert(
+            "observation.state".to_owned(),
+            Column::F32((0..n * 2).map(|i| i as f32 + index as f32).collect()),
+        );
+        columns.insert(
+            "action".to_owned(),
+            Column::F32((0..n).map(|i| i as f32 * 0.25).collect()),
+        );
+        columns.insert("intervention".to_owned(), Column::I64(vec![0; n]));
+        columns.insert("action_source".to_owned(), Column::I64(vec![0; n]));
+        writer
+            .write_episode(&Episode {
+                index,
+                tasks: vec!["es:task:fixture".to_owned()],
+                timestamps: (0..n).map(|i| i as f64 / 100.0).collect(),
+                task_index: vec![0; n],
+                columns,
+                video: BTreeMap::new(),
+            })
+            .expect("write episode");
+    }
+    writer.finish().expect("finish");
+}
+
+/// `es loop intervene` labels a dataset in place: `content` moves, `schema` does not, and the
+/// ledger records the step (spec 13.2, 13.3, 19.2).
+#[test]
+fn loop_intervene_labels_a_dataset_and_moves_only_the_content_hash() {
+    let dir = scratch_dir("loop-intervene");
+    let root = dir.join("data");
+    write_loop_fixture(&root, 2);
+
+    let segments = dir.join("segments.json");
+    write(
+        &segments,
+        r#"[{"episode": 1, "start_frame": 2, "end_frame": 4, "source": "teleop",
+             "operator_id": "op-1", "note": "corrected the grasp"}]"#,
+    );
+
+    let out = bin()
+        .args(["loop", "intervene", "--dataset"])
+        .arg(&root)
+        .arg("--segments")
+        .arg(&segments)
+        .output()
+        .expect("run es");
+    let text = stdout(&out);
+    assert!(
+        out.status.success(),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        text.contains("labelled 3 frames across 1 episodes"),
+        "{text}"
+    );
+    assert!(text.contains("unchanged"), "schema must not move: {text}");
+    let before = text
+        .lines()
+        .find_map(|l| l.strip_prefix("content before: "))
+        .expect("content before");
+    let after = text
+        .lines()
+        .find_map(|l| l.strip_prefix("content after:  "))
+        .expect("content after");
+    assert_ne!(before, after, "the parquet bytes changed: {text}");
+
+    // Provenance on disk, and one ledger line (spec 13.2, 13.3).
+    let jsonl = std::fs::read_to_string(root.join("meta/interventions.jsonl")).expect("segments");
+    assert!(jsonl.contains("\"operator_id\":\"op-1\""), "{jsonl}");
+    let ledger = std::fs::read_to_string(root.join("loop.jsonl")).expect("ledger");
+    assert_eq!(ledger.lines().count(), 1, "{ledger}");
+    assert!(ledger.contains("\"intervene\""), "{ledger}");
+}
+
+/// `es loop distill` merges two datasets, writes the spec 19.3 identity, and appends the step
+/// to every input ledger as well as the output's (spec 13.3).
+#[test]
+fn loop_distill_merges_two_datasets_and_writes_training_identity() {
+    let dir = scratch_dir("loop-distill");
+    let (a, b, out) = (dir.join("a"), dir.join("b"), dir.join("merged"));
+    write_loop_fixture(&a, 3);
+    write_loop_fixture(&b, 2);
+
+    let run = bin()
+        .args(["loop", "distill", "--in"])
+        .arg(&a)
+        .arg("--in")
+        .arg(&b)
+        .args([
+            "--train", "0.6", "--val", "0.2", "--test", "0.2", "--seed", "7",
+        ])
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("run es");
+    let text = stdout(&run);
+    assert!(
+        run.status.success(),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(text.contains("training_hash:"), "{text}");
+    assert!(text.contains("all-zero digest"), "{text}");
+
+    let identity: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("training_identity.json")).expect("identity"),
+    )
+    .expect("identity json");
+    assert!(identity.get("dataset").is_some(), "{identity}");
+
+    // `es dataset info` sees five episodes: the merge summed them.
+    let info = bin()
+        .args(["dataset", "info"])
+        .arg(&out)
+        .output()
+        .expect("run es");
+    let itext = stdout(&info);
+    assert!(info.status.success(), "{itext}");
+    assert!(itext.contains("episodes: 5"), "{itext}");
+
+    for root in [&a, &b, &out] {
+        let ledger = std::fs::read_to_string(root.join("loop.jsonl")).expect("ledger");
+        assert!(
+            ledger.contains("\"distill\""),
+            "{}: {ledger}",
+            root.display()
+        );
+    }
+}
+
+/// `es loop collect` refuses rather than fakes when the backend or the runtime is missing
+/// (spec 1.4). Exit 3 is "nothing ran", distinct from a failed run (1) or bad usage (2).
+#[test]
+fn loop_collect_skips_with_exit_three_when_the_backend_is_unavailable() {
+    let dir = scratch_dir("loop-collect-skip");
+    let policy = dir.join("policy.esb");
+    std::fs::write(&policy, build_policy_bundle(&deployable_fixture())).expect("write policy.esb");
+
+    let out = bin()
+        .args(["loop", "collect", "--policy"])
+        .arg(&policy)
+        // Availability is checked before the scene is touched, so a missing file is fine.
+        .args([
+            "--scene",
+            "does-not-exist.xml",
+            "--episodes",
+            "1",
+            "--seed",
+            "1",
+            "--out",
+        ])
+        .arg(dir.join("out"))
+        .output()
+        .expect("run es");
+    let text = stdout(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(text.contains("SKIPPED"), "{text}");
+}
+
+/// An unknown subcommand and a missing required flag are usage errors, not runtime ones.
+#[test]
+fn loop_usage_errors_exit_two() {
+    for args in [
+        vec!["loop", "nope"],
+        vec!["loop", "distill", "--out", "x"],
+        vec!["loop", "intervene", "--dataset", "x"],
+    ] {
+        let out = bin().args(&args).output().expect("run es");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+    }
+}
