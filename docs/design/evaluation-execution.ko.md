@@ -182,12 +182,16 @@ runner가 소유하는 `StepState`에 대해 `apply_per_step`에서 일어난다
 
 - **`envelope_violation_rate`는 watchdog의 window가 아니라 셀 전체에 대한 누적값이다.**
   `SafetyCounters::envelope_violation_rate()`는 §9.4의 rate watchdog이 읽는 슬라이딩
-  비율이다; §10.3의 지표는 셀 전체의 비율이므로, 대신 누적 카운터로부터 계산된다.
-  `clamped_steps`와 `fallback_activations`는 `validate`의 서로 다른 분기에서 세어지며,
-  그 합은 `steps`로 상한이 걸려 있어 나중에 둘 다를 증가시키는 분기가 생기더라도 비율이
-  1을 넘을 수 없다. **한계(ceiling):** plane이 언젠가 clamp이면서 동시에 fallback인
-  스텝을 갖게 되면, 이는 그 중첩분만큼 과소 보고한다; 해법은 `es-safety`에 단일
-  `dirty_steps` 카운터를 두는 것이며, 이는 그곳에서 한 줄짜리 변경이다.
+  비율이다; §10.3의 지표는 셀 전체의 비율이므로, 대신 누적 카운터로부터 계산된다:
+  `counters.dirty_steps / counters.steps`.
+  **답변됨 (M2 W1b).** `clamped_steps`와 `fallback_activations`는 예전에는 `validate`의
+  서로 다른 분기에서 세어져 합산되고 `steps`로 상한이 걸렸다; 나중에 둘 다를
+  증가시키는 분기가 생겼다면 그 중첩분만큼 과소 보고했을 것이다. `SafetyCounters::record_step`
+  (모든 `validate` 경로가 돌아가는 그 하나의 꼬리인 `SafetyPlane::finish`에서 한 번
+  호출됨)은 이제 `clamped_steps`와/또는 `fallback_activations`를 세팅하고, 둘 중 몇 개가
+  참이든 상관없이 `dirty_steps`를 최대 하나만 증가시키므로, 이 지표는 둘 다에 해당하는
+  스텝에 대해서도 정확하다 — `es_safety::counters::tests::a_step_that_is_both_clamped_and_a_fallback_counts_once`를
+  참고.
 - **`step/s`는 없다.** 성능 행은 §12.4의 아홉 개 지표뿐이며 그 외에는 아무것도 없다.
 
 에피소드에 걸친 집계는 `(cell_index, seed)`로 정렬된 `Vec<f64>`에 대한
@@ -204,24 +208,24 @@ runner가 소유하는 `StepState`에 대해 `apply_per_step`에서 일어난다
 - 지표가 측정되었을 때는 `Pass { observed }` / `Fail { observed }`,
 - 측정되지 않았을 때는 `Unavailable { reason }`.
 
-**`Unavailable`은 통과가 아니다.** `EvalReport::passed`는 모든 verdict가 `Pass`일
-때만 참이다. 이것은 `es-ir`의 `AcceptanceResult { criterion, observed: f64, passed: bool }`에
-맞지 않는 스키마 부분이다: `f64`로는 "측정되지 않음"을 표현할 방법이 없고,
-`observed: 0.0, passed: false`라고 쓰는 것은 측정값을 지어내는 것이다. 그래서 `es-eval`이
-`Verdict`를 소유하며, `report.json`은 `EvalReport`인데, 이는 §10.5의 `EvaluationReport`
-(측정된 셀과 해석 가능한 수용 기준 라인만을 실음)를 담고 `unmeasured`와 `verdicts`를
-추가한다.
+**`Unavailable`은 통과가 아니다.** `EvaluationReport::passed`는 모든 `AcceptanceResult`가
+`Determined { passed: true, .. }`일 때만 참이다.
 
-> **리뷰어 질문.** 깔끔한 해법은 `es_ir::evaluation`에 `MetricValue::Unavailable`과
-> `AcceptanceResult::Unavailable` variant를 두는 것이며, 이렇게 하면 `EvalReport`를 삭제하고
-> `run`이 `EvaluationReport`를 직접 반환하게 할 수 있다. 그것은 `es-ir` 변경이며 이
-> 패킷의 범위 밖이다.
+> **답변됨 (M2 W1b).** `es_ir::evaluation`은 이제 `MetricValue::Unavailable { reason }`와
+> `AcceptanceResult::Unavailable { metric, reason }`를 갖는다(후자는 `AcceptanceResult`를
+> 단순 구조체에서 enum으로 바꾸었고, `#[serde(untagged)]`이므로 예전의
+> `{criterion, observed, passed}` 형태도 여전히 `Determined` variant로 왕복한다).
+> `run`은 `(EvaluationReport, EvaluationLock)`을 직접 반환한다; `EvalReport` 래퍼,
+> `Unmeasured`, `Verdict`, `Outcome`은 `es-eval`에서 사라졌다 — 선언된 지표마다
+> 하나의 `CellResult`(측정됨 또는 `MetricValue::Unavailable`)를, 수용 기준 한 줄마다
+> 하나의 `AcceptanceResult`(`Determined` 또는 `Unavailable`)를 얻으므로, 래퍼가 더할
+> 것이 남아 있지 않다.
 
 ## 6. 산출물 (§10.5)
 
 ```
 write_artifacts(&report, &lock, dir)
-  → report.json        EvalReport: cells x suites, unmeasured, verdicts
+  → report.json        es_ir::evaluation::EvaluationReport, written as-is (§10.5)
   → evaluation.lock    evaluation_hash + execution_hash + seeds + backend capabilities
 ```
 
@@ -233,23 +237,29 @@ write_artifacts(&report, &lock, dir)
 ### `report.json`
 
 ```jsonc
-{
-  "report": {                       // es_ir::evaluation::EvaluationReport, §10.5
-    "schema_version": 1,
-    "evaluation_hash": [32 bytes],
-    "execution_hash":  [32 bytes],
-    "cells":      [ { "suite": "nominal", "metric": "success_rate",
-                      "value": { "scalar": 0.92 }, "n_episodes": 100 } ],
-    "acceptance": [ { "criterion": {...}, "observed": 0.92, "passed": true } ],
-    "passed": false,
-    "episodes": []
-  },
-  "unmeasured": [ { "suite": "nominal", "metric": "collision_rate",
-                    "reason": "no contact reporting in this backend" } ],
-  "verdicts":   [ { "criterion": {...}, "suite": "nominal",
-                    "outcome": { "pass": { "observed": 0.92 } } } ]
+{                                    // es_ir::evaluation::EvaluationReport, §10.5
+  "schema_version": 1,
+  "evaluation_hash": [32 bytes],
+  "execution_hash":  [32 bytes],
+  "cells": [
+    { "suite": "nominal", "metric": "success_rate",
+      "value": { "scalar": 0.92 }, "n_episodes": 100 },
+    { "suite": "nominal", "metric": "collision_rate",
+      "value": { "unavailable": { "reason": "no contact reporting in this backend" } },
+      "n_episodes": 100 }
+  ],
+  "acceptance": [
+    { "criterion": {...}, "observed": 0.92, "passed": true },
+    { "metric": "collision_rate", "reason": "no contact reporting in this backend" }
+  ],
+  "passed": false,
+  "episodes": []
 }
 ```
+
+두 가지 `acceptance` 형태는 `AcceptanceResult::Determined`와 `::Unavailable`이다; 이
+enum은 `#[serde(untagged)]`이므로, 한 줄이 어느 것인지는 태그가 아니라 어떤 필드를
+가지고 있는지로 읽힌다.
 
 ### `evaluation.lock`
 
