@@ -7,10 +7,13 @@
 //! The script is embedded with `include_str!` and handed to `python -c`, so there is no
 //! installed-data-file lookup at runtime and editing the script forces a rebuild.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use es_physics_core::PhysicsError;
+use es_assets::scene::SceneDesc;
+use es_core::{StableId, TickRate};
+use es_physics_core::{IndexRange, ModelInfo, PhysicsError};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
@@ -136,20 +139,24 @@ fn truncate(line: &str) -> String {
 }
 
 /// Interpreters to try, in order. `ES_PYTHON` overrides the search entirely.
-fn python_candidates() -> Vec<String> {
+pub(crate) fn python_candidates() -> Vec<String> {
     match std::env::var("ES_PYTHON") {
         Ok(path) if !path.trim().is_empty() => vec![path],
         _ => vec!["python".to_owned(), "python3".to_owned()],
     }
 }
 
-/// Whether a Python with the `mujoco` package can be found.
+/// Whether some interpreter can `import` `modules` (a Python import list).
 ///
 /// `Err` carries what was tried and why it failed, so a CI skip message says something useful.
-pub fn is_available() -> Result<(), String> {
+/// Shared by every out-of-process backend; `what` names the packages in that message.
+pub(crate) fn import_available(modules: &str, what: &str) -> Result<(), String> {
     let mut tried = Vec::new();
     for python in python_candidates() {
-        match Command::new(&python).args(["-c", "import mujoco"]).output() {
+        match Command::new(&python)
+            .args(["-c", &format!("import {modules}")])
+            .output()
+        {
             Ok(out) if out.status.success() => return Ok(()),
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
@@ -162,9 +169,14 @@ pub fn is_available() -> Result<(), String> {
         }
     }
     Err(format!(
-        "no Python interpreter with the `mujoco` package (set ES_PYTHON to choose one): {}",
+        "no Python interpreter with the {what} (set ES_PYTHON to choose one): {}",
         tried.join("; ")
     ))
+}
+
+/// Whether a Python with the `mujoco` package can be found.
+pub fn is_available() -> Result<(), String> {
+    import_available("mujoco", "`mujoco` package")
 }
 
 /// A running reference process.
@@ -176,12 +188,21 @@ pub struct Process {
 }
 
 impl Process {
-    /// Starts the first interpreter that spawns.
+    /// Starts the first interpreter that spawns, running [`SCRIPT`].
     pub fn spawn() -> Result<Self, PhysicsError> {
+        Self::spawn_with(SCRIPT, "MuJoCo")
+    }
+
+    /// Starts the first interpreter that spawns, running `script`.
+    ///
+    /// `engine` names the backend in the failure message. Every out-of-process backend speaks
+    /// this one protocol, so they share the spawn / call / drop trio and differ only in which
+    /// script is on the other end.
+    pub fn spawn_with(script: &str, engine: &str) -> Result<Self, PhysicsError> {
         let mut tried = Vec::new();
         for python in python_candidates() {
             let spawned = Command::new(&python)
-                .args(["-c", SCRIPT])
+                .args(["-c", script])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 // Every Python-side failure is reported on stdout as JSON, so stderr carries
@@ -202,7 +223,7 @@ impl Process {
             }
         }
         Err(PhysicsError::Backend(format!(
-            "cannot start the MuJoCo reference process: {}",
+            "cannot start the {engine} reference process: {}",
             tried.join("; ")
         )))
     }
@@ -238,6 +259,96 @@ impl Drop for Process {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+/// The tick rate a timestep in seconds stands for (spec 18.1: integer ticks are the model).
+pub(crate) fn rate_from_timestep(timestep: f64) -> Result<TickRate, PhysicsError> {
+    let nanos = (timestep * 1e9).round();
+    if !(nanos.is_finite() && nanos >= 1.0) {
+        return Err(PhysicsError::Backend(format!(
+            "timestep {timestep} is not a positive number of nanoseconds"
+        )));
+    }
+    let divisor = gcd(1_000_000_000, nanos as u64);
+    TickRate::rational(1_000_000_000 / divisor, nanos as u64 / divisor)
+        .map_err(|e| PhysicsError::Backend(e.to_string()))
+}
+
+fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
+}
+
+fn id_of(
+    map: &BTreeMap<&str, StableId>,
+    engine: &str,
+    kind: &str,
+    name: &str,
+) -> Result<StableId, PhysicsError> {
+    map.get(name).copied().ok_or_else(|| {
+        PhysicsError::Protocol(format!(
+            "{engine} reported a {kind} `{name}` the scene does not have"
+        ))
+    })
+}
+
+/// Turns a `load` reply into a [`ModelInfo`] by matching the engine's names back to the scene's
+/// [`StableId`]s. Every out-of-process backend answers in this one shape, so they share it.
+///
+/// A name the scene does not have is a [`PhysicsError::Protocol`], never a silent mismatch: the
+/// index ranges are what the runtime addresses state by, so a wrong one is a wrong robot.
+pub(crate) fn model_info(
+    reply: &LoadReply,
+    scene: &SceneDesc,
+    engine: &str,
+    n_envs: u32,
+    rate: TickRate,
+) -> Result<ModelInfo, PhysicsError> {
+    fn by_name<'a, T: 'a>(
+        items: impl IntoIterator<Item = &'a T>,
+        field: impl Fn(&'a T) -> (&'a str, StableId),
+    ) -> BTreeMap<&'a str, StableId> {
+        items.into_iter().map(field).collect()
+    }
+    let joints = by_name(&scene.joints, |j| (j.name.as_str(), j.id));
+    let actuators = by_name(&scene.actuators, |a| (a.name.as_str(), a.id));
+    let sensors = by_name(&scene.sensors, |s| (s.name.as_str(), s.id));
+    let bodies = by_name(&scene.bodies, |b| (b.name.as_str(), b.id));
+
+    let mut info = ModelInfo {
+        nq: reply.nq,
+        nv: reply.nv,
+        nu: reply.nu,
+        nsensordata: reply.nsensordata,
+        nbody: reply.nbody,
+        n_envs,
+        rate,
+        ..ModelInfo::default()
+    };
+    for joint in &reply.joints {
+        let id = id_of(&joints, engine, "joint", &joint.name)?;
+        info.qpos
+            .insert(id, IndexRange::new(joint.qpos[0], joint.qpos[1]));
+        info.dof
+            .insert(id, IndexRange::new(joint.dof[0], joint.dof[1]));
+    }
+    for (index, name) in reply.actuators.iter().enumerate() {
+        let id = id_of(&actuators, engine, "actuator", name)?;
+        info.actuator.insert(id, IndexRange::new(index as u32, 1));
+    }
+    for sensor in &reply.sensors {
+        let id = id_of(&sensors, engine, "sensor", &sensor.name)?;
+        info.sensor
+            .insert(id, IndexRange::new(sensor.adr, sensor.dim));
+    }
+    for (index, name) in reply.bodies.iter().enumerate() {
+        let id = id_of(&bodies, engine, "body", name)?;
+        info.body.insert(id, IndexRange::new(index as u32, 1));
+    }
+    Ok(info)
 }
 
 #[cfg(test)]

@@ -323,24 +323,76 @@ fn mjwarp(feature: TaskFeature) -> Mapping {
 /// Newton has no adapter yet, so only the spec 17.2 rows are filled: everything else is
 /// `TODO(api-notes)`, never a guess.
 fn newton(feature: TaskFeature) -> Mapping {
+    // The Spec17 rows are the spec 17.2 table's statement about the *engine*; the Capability
+    // rows are what `NewtonBackend` was verified to deliver through `add_mjcf` in newton 1.6.0.
+    // Where the two differ, the Capability row is the one that gates execution (spec 14.4).
     const CONTROLLER: &str = "a joint controller (spec 17.2), not a MuJoCo position gain";
     const SOLVER: &str = "solver-dependent (spec 17.2), not MuJoCo solref / solimp";
     const CONTACT: &str = "read from the contact buffer (spec 17.2), not a sensor";
+    const NO_ACTUATOR: &str =
+        "newton 1.6 add_mjcf imports no <actuator> (Model.actuators is empty): unactuated";
+    const NO_SENSOR: &str =
+        "newton 1.6 add_mjcf imports no <sensor>: sensordata would silently read empty";
+    const NO_CONTACT: &str =
+        "this adapter steps with contacts = None: the scene would run without contacts";
     match feature {
-        TaskFeature::Spec17(Spec17Row::ActuatorPd)
-        | TaskFeature::Capability(Feature::ActuatorPosition) => Mapping::approximated(CONTROLLER),
-        TaskFeature::Spec17(Spec17Row::ContactFrictionCone)
-        | TaskFeature::Capability(Feature::ContactPyramidal | Feature::ContactElliptic) => {
-            Mapping::native("selectable pyramidal or elliptic (spec 17.2)")
+        TaskFeature::Spec17(Spec17Row::ActuatorPd) => Mapping::approximated(CONTROLLER),
+        TaskFeature::Spec17(Spec17Row::ContactFrictionCone) => {
+            Mapping::native("selectable pyramidal or elliptic (spec 17.2), `SolverMuJoCo(cone=)`")
         }
-        TaskFeature::Spec17(Spec17Row::ContactSoftParams)
-        | TaskFeature::Capability(Feature::ContactSoftParams) => Mapping::approximated(SOLVER),
+        TaskFeature::Spec17(Spec17Row::ContactSoftParams) => Mapping::approximated(SOLVER),
         TaskFeature::Spec17(Spec17Row::JointArmature)
-        | TaskFeature::Capability(Feature::JointArmature) => Mapping::native("armature"),
-        TaskFeature::Spec17(Spec17Row::SensorContactForce)
-        | TaskFeature::Capability(Feature::SensorForce | Feature::SensorTouch) => {
-            Mapping::approximated(CONTACT)
+        | TaskFeature::Capability(Feature::JointArmature) => {
+            // Verified: `Model.joint_armature` carries the MJCF value at the joint's dof.
+            Mapping::native("armature")
         }
+        TaskFeature::Spec17(Spec17Row::SensorContactForce) => Mapping::approximated(CONTACT),
+        // Verified: `Model.joint_type` carries all four MJCF joint kinds, and
+        // `Model.joint_limit_lower` the scene's limits.
+        TaskFeature::Capability(
+            Feature::JointFree
+            | Feature::JointBall
+            | Feature::JointHinge
+            | Feature::JointSlide
+            | Feature::JointFixed
+            | Feature::JointLimit,
+        ) => Mapping::native("Newton's own joint, imported from the MJCF"),
+        TaskFeature::Capability(
+            Feature::ActuatorMotor
+            | Feature::ActuatorPosition
+            | Feature::ActuatorVelocity
+            | Feature::ActuatorGeneral
+            | Feature::ActuatorOnJoint
+            | Feature::ActuatorOnTendon
+            | Feature::ActuatorOnSite
+            | Feature::Tendon,
+        ) => Mapping::blocked(NO_ACTUATOR),
+        TaskFeature::Capability(
+            Feature::SensorJointPos
+            | Feature::SensorJointVel
+            | Feature::SensorActuatorFrc
+            | Feature::SensorFramePos
+            | Feature::SensorFrameQuat
+            | Feature::SensorAccelerometer
+            | Feature::SensorGyro
+            | Feature::SensorForce
+            | Feature::SensorTorque
+            | Feature::SensorTouch
+            | Feature::SensorRangeFinder
+            | Feature::SensorCamera,
+        ) => Mapping::blocked(NO_SENSOR),
+        // Every scene carries the MJCF default cone, so blocking it would block everything.
+        // It is warned about instead: the run keeps going, loudly (spec 14.4 severity rules).
+        TaskFeature::Capability(Feature::ContactPyramidal) => Mapping::approximated(NO_CONTACT),
+        // These are contact semantics a scene explicitly asked for, and this adapter has none.
+        TaskFeature::Capability(
+            Feature::ContactElliptic
+            | Feature::ContactSoftParams
+            | Feature::ContactCondim6
+            | Feature::ContactMesh
+            | Feature::ContactHeightField,
+        ) => Mapping::blocked(NO_CONTACT),
+        // Joint springs and friction loss were not checked against the importer.
         TaskFeature::Capability(_) => Mapping::unverified(),
     }
 }
@@ -802,8 +854,10 @@ mod tests {
     /// Never a guessed native mapping: what has not been checked says so (spec 1.7).
     #[test]
     fn unchecked_rows_are_unsupported_warnings_with_a_todo() {
+        // Joint springs were never checked against Newton's MJCF importer; sensors and
+        // actuators were, and are blocked rather than merely unverified.
         let mapping = lookup(
-            TaskFeature::Capability(Feature::SensorCamera),
+            TaskFeature::Capability(Feature::JointSpring),
             BackendKind::Newton,
         );
         assert_eq!(mapping.severity, Severity::Warning);
@@ -851,13 +905,11 @@ mod tests {
             assert!(features.contains(&expected.to_owned()), "{features:?}");
         }
         assert!(report.blocked, "{report}");
-        // Newton has no adapter, so the same scene is only warned about, never blocked.
+        // Newton blocks it too, for its own reason: `add_mjcf` imports no `<actuator>`, so
+        // running this scene there would quietly drop the actuation (spec 14.4).
         let newton = mapping_report(&actuated, BackendKind::Newton);
-        assert!(!newton.blocked, "{newton}");
-        assert!(newton
-            .rows
-            .iter()
-            .any(|r| r.mapping.severity == Severity::Warning));
+        assert!(newton.blocked, "{newton}");
+        assert!(newton.to_string().contains("add_mjcf"), "{newton}");
     }
 
     /// A scene every backend can map is not blocked anywhere, so `blocked` is not just "true".

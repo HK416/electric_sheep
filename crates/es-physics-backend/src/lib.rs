@@ -14,6 +14,7 @@ pub mod mapping;
 pub mod mjcf_out;
 pub mod mjwarp;
 pub mod mujoco;
+pub mod newton;
 pub mod proc;
 
 pub use mapping::{
@@ -23,6 +24,7 @@ pub use mapping::{
 pub use mjcf_out::scene_to_mjcf;
 pub use mjwarp::MjWarpBackend;
 pub use mujoco::MuJoCoCpuBackend;
+pub use newton::NewtonBackend;
 
 #[cfg(test)]
 mod tests_support {

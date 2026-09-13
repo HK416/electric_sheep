@@ -1,21 +1,24 @@
-//! `MjWarpBackend` — `MuJoCo` Warp, the batched GPU backend (spec 4.3, spec 17.1).
+//! `NewtonBackend` — NVIDIA Newton, the second GPU backend (spec 4.3, spec 17.2).
 //!
-//! Same shape as [`MuJoCoCpuBackend`](crate::MuJoCoCpuBackend): no Rust binding exists and the
-//! core runtime must not link Python (spec 2.4), so `python/mjwarp_ref.py` holds the model and
-//! this adapter speaks the same line-delimited JSON to it. The difference is what is on the
-//! other end — one `Data` with `nworld = n_envs` on a GPU instead of a list of `MjData`, which
-//! is the simulation batch of spec 12.1.
+//! Same shape as [`MjWarpBackend`](crate::MjWarpBackend): no Rust binding exists and the core
+//! runtime must not link Python (spec 2.4), so `python/newton_ref.py` holds the model and this
+//! adapter speaks the shared line-delimited JSON of [`crate::proc`] to it. What is on the other
+//! end is a `newton.Model` whose `world_count` is the batch of spec 12.1.
 //!
-//! Two things are declared honestly rather than flatteringly:
+//! Newton is *not* a `MuJoCo` clone, and the point of having it is that it disagrees: spec 17.2
+//! exists because the same Task IR must not behave differently here. What was verified against
+//! newton 1.6.0 (see `docs/api-notes/newton.md`) and what it costs:
 //!
-//! * **Determinism is tier 2, never tier 1** (spec 17.3): a GPU backend declares cross-backend
-//!   tolerance, and only `mujoco-cpu` may claim bitwise. Evidence bundles run on the CPU.
-//! * **`mujoco_warp` is young.** Every API name used here is listed as *unverified* in
-//!   `docs/api-notes/mujoco-warp.md`; CI has no GPU, so the live test skips (spec 1.7 —
-//!   inventing a plausible API name is the cheapest mistake an agent can make).
-//!
-//! Anything in the scene `MJWarp` cannot map is refused at [`load`](PhysicsBackend::load) by the
-//! spec 17.2 mapping report, before a process is spawned (spec 14.4).
+//! * **The solver is `SolverFeatherstone`, not `SolverMuJoCo`.** newton 1.6.0 pins
+//!   `mujoco-warp~=3.12.0`; this workspace needs 3.13.0 for `MjWarpBackend`, and importing
+//!   `SolverMuJoCo` against 3.13.0 fails to compile its kernels. Featherstone is Newton's own
+//!   reduced-coordinate solver, so the cross-backend comparison is a real one.
+//! * **`ModelBuilder.add_mjcf` imports no `<actuator>` and no `<sensor>`** (`Model.actuators`
+//!   comes back empty). An actuated or sensored scene is therefore *refused by name* at
+//!   [`load`](PhysicsBackend::load) rather than run silently unactuated — spec 14.4, and the
+//!   whole reason the mapping report gates execution.
+//! * **Contacts are not wired** in this adapter, so no contact capability is declared.
+//! * **Determinism is tier 2, never tier 1** (spec 17.3): only `mujoco-cpu` may claim bitwise.
 
 use es_assets::scene::SceneDesc;
 use es_core::{FailureKind, PhysTick};
@@ -33,40 +36,27 @@ use crate::proc::{
 };
 
 /// The backend's name in `es backend compare --backends ...` (spec 17.2).
-pub const NAME: &str = "mjwarp";
+pub const NAME: &str = "newton";
 
-/// Largest batch declared. Spec 12.1 sizes the simulation domain at 4,096 envs; the ceiling
-/// here is device memory, which the capability declaration cannot know, so this is a declared
-/// bound and not a measurement (spec 12.4: unverified numbers are targets).
+/// The engine's name in protocol failure messages.
+const ENGINE: &str = "Newton";
+
+/// Largest batch declared. As with `mjwarp`, the real ceiling is device memory, which a
+/// capability declaration cannot know, so this is a declared bound and not a measurement
+/// (spec 12.4: unverified numbers are targets).
 pub const MAX_ENVS: u32 = 8192;
 
 /// The reference script, embedded at build time.
-pub const SCRIPT: &str = include_str!("../python/mjwarp_ref.py");
+pub const SCRIPT: &str = include_str!("../python/newton_ref.py");
 
 /// What this backend declares (spec 4.3).
 ///
-/// The feature sets *are* the `MJWarp` column of the spec 17.2 table: `MuJoCo` semantics fed by
-/// the same MJCF emitter, minus what the table pins narrower. Deriving them from
-/// [`crate::mujoco::capabilities`] rather than restating them is what keeps the declaration and
-/// the mapping report from drifting apart; a test asserts the two agree feature by feature.
+/// Every set here is what `newton.ModelBuilder.add_mjcf` was *observed* to import in 1.6.0, not
+/// what the engine can do in principle: `Model.joint_type` carries all four MJCF joint kinds,
+/// `Model.joint_armature` carries the scene's armature and `Model.joint_limit_lower` its
+/// limits, while `Model.actuators` and the sensor arrays come back empty. Spec 1.7: a plausible
+/// API name is the cheapest thing an agent can invent, so nothing unobserved is declared.
 pub fn capabilities() -> Capabilities {
-    let cpu = crate::mujoco::capabilities();
-    let mut contact = cpu.contact;
-    // spec 17.2 maps MJWarp's friction cone to pyramidal.
-    contact.remove(&Feature::ContactElliptic);
-    // Unverified against the engine, so not declared (TODO(api-notes)).
-    contact.remove(&Feature::ContactCondim6);
-    let mut quirks = cpu.quirks;
-    quirks.push(BackendQuirk::new(
-        Feature::ContactPyramidal,
-        "spec 17.2 pins MJWarp's friction cone to pyramidal; an elliptic scene is refused by \
-         name rather than silently re-coned",
-    ));
-    quirks.push(BackendQuirk::new(
-        Feature::JointArmature,
-        "state is computed in f32 and widened to f64 at the process boundary, so values agree \
-         with mujoco-cpu to a tolerance (spec 3.5 tier 2), never bit for bit",
-    ));
     Capabilities {
         name: NAME.to_owned(),
         // spec 17.3: a GPU backend declares tier 2 or 3, never tier 1.
@@ -75,20 +65,55 @@ pub fn capabilities() -> Capabilities {
             max_envs: MAX_ENVS,
             gpu_resident: true,
         },
-        joints: cpu.joints,
-        actuators: cpu.actuators,
-        sensors: cpu.sensors,
-        contact,
+        joints: [
+            Feature::JointFree,
+            Feature::JointBall,
+            Feature::JointHinge,
+            Feature::JointSlide,
+            Feature::JointFixed,
+            Feature::JointLimit,
+            Feature::JointArmature,
+        ]
+        .into(),
+        // `add_mjcf` imports neither, and a quiet zero is worse than a refusal.
+        actuators: [].into(),
+        sensors: [].into(),
+        // Only the MJCF default cone, which every scene carries; anything a scene asks for
+        // beyond it (elliptic, soft params, condim 6, mesh, height field) is refused, because
+        // this adapter steps with no collision pipeline at all. See the quirk below.
+        contact: [Feature::ContactPyramidal].into(),
         float: FloatPrecision::F32,
         supports_reset_subset: true,
         supports_state_get_set: true,
-        quirks,
+        quirks: vec![
+            BackendQuirk::new(
+                Feature::JointFree,
+                "a free joint's coordinates are Newton's (pos xyz, quat xyzw) where MuJoCo \
+                 writes (pos xyz, quat wxyz), so qpos is not element-wise comparable with \
+                 mujoco-cpu for a floating base",
+            ),
+            BackendQuirk::new(
+                Feature::ContactPyramidal,
+                "contacts are NOT wired: this adapter steps with `contacts = None`, so bodies                  that touch pass through each other. The cone is declared only because every                  MJCF carries one; wire `newton.CollisionPipeline` before trusting any scene                  whose bodies collide",
+            ),
+            BackendQuirk::new(
+                Feature::JointArmature,
+                "state is computed in f32 and widened to f64 at the process boundary, so values \
+                 agree with mujoco-cpu to a tolerance (spec 3.5 tier 2), never bit for bit",
+            ),
+            BackendQuirk::new(
+                Feature::JointHinge,
+                "the solver is SolverFeatherstone, not SolverMuJoCo: newton 1.6.0 pins \
+                 mujoco-warp ~=3.12.0 and this workspace needs 3.13.0, so contact and joint \
+                 dynamics are Newton's own and differ from MuJoCo by more than rounding",
+            ),
+        ],
     }
 }
 
-/// `MuJoCo` Warp behind [`PhysicsBackend`], driven through a Python subprocess.
+/// Newton behind [`PhysicsBackend`], driven through a Python subprocess.
 #[derive(Debug)]
-pub struct MjWarpBackend {
+pub struct NewtonBackend {
     caps: Capabilities,
     process: Option<Process>,
     model: Option<ModelInfo>,
@@ -106,13 +131,13 @@ struct StateBuffers {
     xquat: Vec<f64>,
 }
 
-impl Default for MjWarpBackend {
+impl Default for NewtonBackend {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl MjWarpBackend {
+impl NewtonBackend {
     pub fn new() -> Self {
         Self {
             caps: capabilities(),
@@ -123,10 +148,10 @@ impl MjWarpBackend {
         }
     }
 
-    /// Whether a Python interpreter with `mujoco_warp` and `warp` is available. `Err` explains
-    /// what was tried, so a machine without a GPU skips with a reason instead of failing CI.
+    /// Whether a Python interpreter with `newton` is available. `Err` explains what was tried,
+    /// so a machine without it skips with a reason instead of failing CI.
     pub fn is_available() -> Result<(), String> {
-        import_available("mujoco_warp, warp", "`mujoco_warp` and `warp` packages")
+        import_available("newton", "`newton` package")
     }
 
     fn process(&mut self) -> Result<&mut Process, PhysicsError> {
@@ -172,7 +197,7 @@ impl MjWarpBackend {
     }
 }
 
-impl PhysicsBackend for MjWarpBackend {
+impl PhysicsBackend for NewtonBackend {
     fn capabilities(&self) -> &Capabilities {
         &self.caps
     }
@@ -185,12 +210,10 @@ impl PhysicsBackend for MjWarpBackend {
         }
         // spec 14.4: the semantic mapping report is the gate, and it runs before anything is
         // spawned. An unmapped row with `severity: error` blocks execution, named.
-        let report = mapping_report(scene, BackendKind::MjWarp);
+        let report = mapping_report(scene, BackendKind::Newton);
         if report.blocked {
             return Err(PhysicsError::Unsupported(report.to_string()));
         }
-        // Features are the report's business; what is left for the capability check is the
-        // run-level shape of the request (spec 11.6).
         let unmet = check_requirements(
             &Requirements {
                 n_envs: cfg.n_envs,
@@ -202,21 +225,22 @@ impl PhysicsBackend for MjWarpBackend {
             return Err(PhysicsError::Requirements(unmet));
         }
 
+        // Newton reads MJCF, so the same emitter feeds all three backends: one scene
+        // description, one text, three engines (spec 17.2).
         let mjcf = scene_to_mjcf(scene)?;
         let rate = match cfg.rate {
             Some(rate) => rate,
             None => rate_from_timestep(scene.options.timestep)?,
         };
 
-        let mut process = Process::spawn_with(SCRIPT, "MuJoCo Warp")?;
+        let mut process = Process::spawn_with(SCRIPT, ENGINE)?;
         let reply: LoadReply = process.call(&Request::Load {
             mjcf: &mjcf,
             n_envs: cfg.n_envs,
             timestep: Some(rate.period_secs_f64()),
             seed: cfg.seed,
         })?;
-
-        let info = model_info(&reply, scene, "MuJoCo Warp", cfg.n_envs, rate)?;
+        let info = model_info(&reply, scene, ENGINE, cfg.n_envs, rate)?;
 
         self.process = Some(process);
         self.model = Some(info.clone());
@@ -331,11 +355,11 @@ mod tests {
     use crate::mapping::{lookup, Status, TaskFeature};
     use crate::proc::parse_response;
 
-    /// Skips the body of a test, with a reason, when `MuJoCo` Warp is not installed (no GPU in
-    /// CI, and the package is optional — spec 2.4).
-    macro_rules! require_mjwarp {
+    /// Skips the body of a test, with a reason, when Newton is not installed (no GPU in CI, and
+    /// the package is optional — spec 2.4).
+    macro_rules! require_newton {
         ($name:literal) => {
-            if let Err(reason) = MjWarpBackend::is_available() {
+            if let Err(reason) = NewtonBackend::is_available() {
                 eprintln!("SKIP {}: {reason}", $name);
                 return;
             }
@@ -343,9 +367,8 @@ mod tests {
         };
     }
 
-    /// Pyramidal cone (the MJCF default), so the scene is mappable on `MJWarp`; `pendulum.xml`
-    /// asks for an elliptic one and is refused by design.
-    const PENDULUM: &str = r#"<mujoco model="warp-pendulum">
+    /// No actuators and no sensors, so the scene is mappable on Newton.
+    const PENDULUM: &str = r#"<mujoco model="newton-pendulum">
          <option timestep="0.001" gravity="0 0 -9.81"/>
          <worldbody><body name="rod" pos="0 0 1">
            <joint name="hinge" type="hinge" axis="0 1 0" damping="0.1" armature="0.01"/>
@@ -376,28 +399,38 @@ mod tests {
     fn capabilities_are_declared_honestly() {
         let caps = capabilities();
         assert_eq!(caps.name, NAME);
+        assert_eq!(
+            BackendKind::from_name(&caps.name),
+            Some(BackendKind::Newton)
+        );
         // spec 17.3: a GPU backend declares tier 2 or 3; only mujoco-cpu may claim bitwise.
         assert_eq!(caps.determinism, DeterminismTier::CrossBackend);
         assert_ne!(caps.determinism, DeterminismTier::Bitwise);
         assert!(caps.batch.gpu_resident);
-        assert_eq!(caps.batch.max_envs, MAX_ENVS);
         assert_eq!(caps.float, FloatPrecision::F32);
-        assert!(caps.has(Feature::JointHinge) && caps.has(Feature::ContactPyramidal));
-        // spec 17.2 pins the cone to pyramidal.
-        assert!(!caps.has(Feature::ContactElliptic));
+        // Verified imported by `add_mjcf`.
+        assert!(caps.has(Feature::JointHinge) && caps.has(Feature::JointArmature));
+        assert!(caps.has(Feature::JointFree) && caps.has(Feature::JointLimit));
+        // Verified *not* imported, so not declared.
+        assert!(!caps.has(Feature::ActuatorMotor) && !caps.has(Feature::ActuatorPosition));
+        assert!(!caps.has(Feature::SensorJointPos));
+        // The default cone is declared, but with a quirk saying contacts are not wired; a
+        // scene that asks for anything more than the default is refused.
+        assert!(caps.has(Feature::ContactPyramidal) && !caps.has(Feature::ContactElliptic));
+        assert!(!caps.has(Feature::ContactMesh) && !caps.has(Feature::ContactSoftParams));
         assert!(!caps.quirks.is_empty());
     }
 
     /// The declaration and the spec 17.2 table must say the same thing about every feature.
     #[test]
-    fn the_declaration_is_the_mjwarp_column_of_the_mapping() {
+    fn the_declaration_is_the_newton_column_of_the_mapping() {
         let caps = capabilities();
         for feature in TaskFeature::all() {
             let TaskFeature::Capability(capability) = feature else {
                 continue;
             };
             let mapped = matches!(
-                lookup(feature, BackendKind::MjWarp).status,
+                lookup(feature, BackendKind::Newton).status,
                 Status::Native(_) | Status::Approximated(_)
             );
             assert_eq!(
@@ -409,31 +442,32 @@ mod tests {
         }
     }
 
-    /// spec 14.4: an unmapped row with `severity: error` blocks execution, and it does so
-    /// before a process is spawned, so this holds with or without `MuJoCo` Warp installed.
+    /// spec 14.4: `add_mjcf` drops `<actuator>`, so an actuated scene is refused by name rather
+    /// than run unactuated. This holds with or without Newton installed — the report is the gate
+    /// and it runs before a process is spawned.
     #[test]
-    fn a_blocked_scene_is_refused_with_the_report_as_the_message() {
-        let elliptic = es_assets::parse_mjcf(
-            r#"<mujoco><option cone="elliptic"/><worldbody><body name="b">
+    fn an_actuated_scene_is_refused_rather_than_run_unactuated() {
+        let actuated = es_assets::parse_mjcf(
+            r#"<mujoco><worldbody><body name="b">
                  <joint name="j" type="hinge"/><geom name="g" type="sphere" size="0.1"/>
-               </body></worldbody></mujoco>"#,
+               </body></worldbody>
+               <actuator><motor name="m" joint="j" gear="1"/></actuator></mujoco>"#,
         )
         .unwrap()
         .scene;
-        let err = MjWarpBackend::new()
-            .load(&elliptic, &LoadConfig::default())
+        let err = NewtonBackend::new()
+            .load(&actuated, &LoadConfig::default())
             .unwrap_err();
         let PhysicsError::Unsupported(message) = &err else {
             panic!("expected an unsupported failure, got {err:?}");
         };
-        assert!(message.contains("ContactElliptic"), "{message}");
         assert!(message.contains("blocked: yes"), "{message}");
-        assert!(message.contains("spec 17.2"), "{message}");
+        assert!(message.contains("add_mjcf"), "{message}");
     }
 
     #[test]
     fn a_batch_larger_than_declared_is_refused_at_load() {
-        let err = MjWarpBackend::new()
+        let err = NewtonBackend::new()
             .load(
                 &pendulum(),
                 &LoadConfig {
@@ -449,7 +483,7 @@ mod tests {
                 max_envs: MAX_ENVS,
             }])
         );
-        assert!(MjWarpBackend::new()
+        assert!(NewtonBackend::new()
             .load(
                 &pendulum(),
                 &LoadConfig {
@@ -462,7 +496,7 @@ mod tests {
 
     #[test]
     fn calls_before_load_are_not_loaded_errors() {
-        let mut backend = MjWarpBackend::new();
+        let mut backend = NewtonBackend::new();
         assert!(backend.model_info().is_none());
         assert_eq!(backend.step(1), Err(PhysicsError::NotLoaded));
         assert_eq!(backend.set_ctrl(&[]), Err(PhysicsError::NotLoaded));
@@ -470,27 +504,23 @@ mod tests {
         assert_eq!(backend.state().qpos.len(), 0);
     }
 
-    #[test]
-    fn rate_and_timestep_agree() {
-        assert_eq!(rate_from_timestep(0.001).unwrap(), TickRate::hz(1000));
-        assert!(rate_from_timestep(0.0).is_err());
-        assert!(rate_from_timestep(f64::NAN).is_err());
-    }
-
     /// The protocol is exercised with canned lines, so it is tested without Python or a GPU:
-    /// `mjwarp_ref.py` answers in exactly the shapes `mujoco_ref.py` does.
+    /// `newton_ref.py` answers in exactly the shapes the other two scripts do.
     #[test]
     fn the_protocol_round_trips_on_canned_json() {
+        // `add_mjcf` imports no actuators or sensors, and Newton has no world body, so a
+        // one-link pendulum is nq 1 / nu 0 / nbody 1 here where MuJoCo says nbody 2.
         let reply: LoadReply = parse_response(
-            r#"{"ok":true,"nq":1,"nv":1,"nu":1,"nsensordata":0,"nbody":2,
+            r#"{"ok":true,"nq":1,"nv":1,"nu":0,"nsensordata":0,"nbody":1,
                 "joints":[{"name":"hinge","qpos":[0,1],"dof":[0,1]}],
-                "actuators":["m"],"sensors":[],"bodies":["world","rod"]}"#,
+                "actuators":[],"sensors":[],"bodies":["rod"]}"#,
         )
         .unwrap();
-        assert_eq!((reply.nq, reply.nbody), (1, 2));
-        assert_eq!(reply.joints[0].dof, [0, 1]);
+        assert_eq!((reply.nq, reply.nu, reply.nbody), (1, 0, 1));
+        assert_eq!(reply.joints[0].qpos, [0, 1]);
+        assert!(reply.actuators.is_empty() && reply.sensors.is_empty());
 
-        // Two envs' worth of state, env-major, as `nworld = 2` produces it.
+        // Two envs' worth of state, env-major, as `world_count = 2` produces it.
         let state: StateReply = parse_response(
             r#"{"ok":true,"qpos":[0.25,-0.25],"qvel":[1.0,-1.0],"act":[],"sensordata":[],
                 "xpos":[],"xquat":[]}"#,
@@ -502,10 +532,9 @@ mod tests {
         let _: Ack = parse_response(r#"{"ok":true}"#).unwrap();
 
         // A Python-side failure is a typed error, not a dead process.
-        let err = parse_response::<Ack>(r#"{"ok":false,"error":"ValueError: no model loaded"}"#)
-            .unwrap_err();
         assert_eq!(
-            err,
+            parse_response::<Ack>(r#"{"ok":false,"error":"ValueError: no model loaded"}"#)
+                .unwrap_err(),
             PhysicsError::Backend("ValueError: no model loaded".to_owned())
         );
         assert!(matches!(
@@ -517,13 +546,13 @@ mod tests {
     #[test]
     fn the_embedded_script_is_the_file_on_disk() {
         for name in [
-            "mujoco_warp",
-            "put_model",
-            "put_data",
-            "nworld",
-            "mjw.step",
-            "mjw.forward",
-            "mj_resetData",
+            "import newton",
+            "add_mjcf",
+            "add_world",
+            "finalize",
+            "SolverFeatherstone",
+            "eval_fk",
+            "joint_q_start",
         ] {
             assert!(SCRIPT.contains(name), "the script does not mention {name}");
         }
@@ -533,9 +562,9 @@ mod tests {
     }
 
     #[test]
-    fn mjwarp_pendulum() {
-        require_mjwarp!("mjwarp_pendulum");
-        let mut backend = MjWarpBackend::new();
+    fn newton_pendulum() {
+        require_newton!("newton_pendulum");
+        let mut backend = NewtonBackend::new();
         let cfg = LoadConfig {
             n_envs: 2,
             rate: Some(TickRate::hz(1000)),
@@ -560,7 +589,7 @@ mod tests {
         let state = backend.state();
         assert!(state.is_finite());
         assert_eq!(state.qpos.len(), 2);
-        eprintln!("mjwarp_pendulum qpos after 100 ticks: {:?}", state.qpos);
+        eprintln!("newton_pendulum qpos after 100 ticks: {:?}", state.qpos);
         // Each env swings towards the hanging position, and they stay independent.
         assert!(state.qpos[0] < start[0] && state.qpos[1] > start[1]);
         assert_ne!(state.qpos_of(0), state.qpos_of(1));
@@ -570,81 +599,28 @@ mod tests {
         assert!(backend.state().qpos.iter().all(|q| q.abs() < 1e-9));
     }
 
-    /// The whole point of the packet: the same scene on both backends, scored with spec 3.5
-    /// tier 3 metrics. Needs both engines, so it skips without them.
-    /// spec 17.3: `mjwarp` declares tier 2, so tier 2 is what is asserted. Whether the runs
-    /// came out bit for bit is *recorded* rather than relied on — a GPU backend that happens to
-    /// be reproducible today must not become a test that fails on the next driver.
+    /// The packet's point: the same scene on Newton and on the CPU oracle, scored with spec 3.5
+    /// tier 3 metrics. Newton runs its own solver, so the bound is loose on purpose — this
+    /// records the disagreement rather than asserting the two engines agree.
     #[test]
-    fn mjwarp_runs_agree_to_the_declared_tier() {
-        require_mjwarp!("mjwarp_runs_agree_to_the_declared_tier");
-        let run = || {
-            let mut backend = MjWarpBackend::new();
-            backend
-                .load(
-                    &pendulum(),
-                    &LoadConfig {
-                        n_envs: 2,
-                        rate: Some(TickRate::hz(1000)),
-                        seed: 1,
-                    },
-                )
-                .unwrap();
-            backend
-                .set_state(&StateView {
-                    n_envs: 2,
-                    qpos: &[0.3_f64, -0.2],
-                    ..StateView::default()
-                })
-                .unwrap();
-            backend.step(200).unwrap();
-            let state = backend.state();
-            (state.qpos.to_vec(), state.qvel.to_vec())
-        };
-        let (qpos_a, qvel_a) = run();
-        let (qpos_b, qvel_b) = run();
-
-        let bitwise = qpos_a
-            .iter()
-            .zip(&qpos_b)
-            .all(|(x, y)| x.to_bits() == y.to_bits())
-            && qvel_a
-                .iter()
-                .zip(&qvel_b)
-                .all(|(x, y)| x.to_bits() == y.to_bits());
-        let delta = qpos_a
-            .iter()
-            .chain(&qvel_a)
-            .zip(qpos_b.iter().chain(&qvel_b))
-            .map(|(x, y)| (x - y).abs())
-            .fold(0.0_f64, f64::max);
-        eprintln!(
-            "mjwarp determinism over 200 ticks: bitwise={bitwise}, max |delta|={delta:e}              (declared tier {:?})",
-            capabilities().determinism
-        );
-        // The declared contract, and all that may be asserted of a GPU backend.
-        assert!(delta < 1e-9, "run-to-run delta {delta:e} exceeds tier 2");
-    }
-
-    #[test]
-    fn mjwarp_against_mujoco_cpu() {
-        require_mjwarp!("mjwarp_against_mujoco_cpu");
+    fn newton_against_mujoco_cpu() {
+        require_newton!("newton_against_mujoco_cpu");
         if let Err(reason) = crate::MuJoCoCpuBackend::is_available() {
-            eprintln!("SKIP mjwarp_against_mujoco_cpu: {reason}");
+            eprintln!("SKIP newton_against_mujoco_cpu: {reason}");
             return;
         }
         let mut cpu = crate::MuJoCoCpuBackend::new();
-        let mut warp = MjWarpBackend::new();
+        let mut newton = NewtonBackend::new();
         let report =
-            crate::mapping::compare_backends(&mut cpu, &mut warp, &swinging(), &[], 200).unwrap();
+            crate::mapping::compare_backends(&mut cpu, &mut newton, &swinging(), &[], 200).unwrap();
         assert_eq!(report.tier_a, DeterminismTier::PhysicsMeaning);
         assert_eq!(report.tier_b, DeterminismTier::CrossBackend);
         assert!(report.mapping_a.is_some() && report.mapping_b.is_some());
         eprintln!("{report}");
-        // f32 on the GPU against f64 on the CPU: agreement is a tolerance, not bit equality
-        // (spec 17.3). Measured 7.4e-8 on an RTX 4060 Laptop with mujoco-warp 3.13.0; the
-        // bound keeps two decades of headroom for other hardware and is a regression guard,
-        // not a validated accuracy claim (spec 12.4).
-        assert!(report.max_dqpos < 1e-5, "{report}");
+        // A different solver (Featherstone, f32) against MuJoCo (f64): measured 5.9e-4 over
+        // 200 ticks on an RTX 4060 Laptop, diverging past the 1e-6 tolerance at tick 6. The
+        // bound records that the two stay on the same trajectory; it is not a validated
+        // agreement tolerance, and spec 17.2 is why the gap is tracked at all.
+        assert!(report.max_dqpos < 1e-2, "{report}");
     }
 }

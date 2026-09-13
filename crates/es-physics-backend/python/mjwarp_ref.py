@@ -24,14 +24,20 @@ as **unverified** (no GPU in CI). Failures surface as protocol errors, never as 
 import json
 import sys
 
+# `warp` prints an initialization banner ("Warp x.y.z initialized:" and a device table) on
+# stdout, and stdout is the protocol. The real handle is taken first and everything else --
+# imports, `wp.init()`, any future chatter -- is pointed at stderr, which Rust discards.
+_OUT = sys.stdout
+sys.stdout = sys.stderr
+
 try:
     import mujoco
     import mujoco_warp as mjw
     import numpy as np
     import warp as wp
 except ImportError as exc:  # Reported as a protocol response, not a traceback on stderr.
-    sys.stdout.write(json.dumps({"ok": False, "error": "import failed: %s" % exc}) + "\n")
-    sys.stdout.flush()
+    _OUT.write(json.dumps({"ok": False, "error": "import failed: %s" % exc}) + "\n")
+    _OUT.flush()
     raise SystemExit(1)
 
 # qpos / dof width per joint type, indexed by mjtJoint (free, ball, slide, hinge).
@@ -210,8 +216,8 @@ def main():
             payload["ok"] = True
         except Exception as exc:  # Any failure is a protocol response, never a crash.
             payload = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
-        sys.stdout.write(json.dumps(payload) + "\n")
-        sys.stdout.flush()
+        _OUT.write(json.dumps(payload) + "\n")
+        _OUT.flush()
 
 
 if __name__ == "__main__":
