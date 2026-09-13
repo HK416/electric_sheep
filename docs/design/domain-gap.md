@@ -35,7 +35,15 @@ see §4):
 
 - `mean`, `std` on each side, and their difference (`real - sim`).
 - **KS statistic `D`**: the two-sample Kolmogorov-Smirnov statistic, `sup_x |F_sim(x) -
-  F_real(x)|`, computed by a sorted merge — no stats crate (§1 toolchain minimalism).
+  F_real(x)|`, computed by a sorted merge — no stats crate (§1 toolchain minimalism). The
+  merge advances **both** cursors past a value's whole run of repeats before it evaluates the
+  gap (standard `ks_2samp` semantics): an empirical CDF is a right-continuous step function,
+  so a point in the middle of a tie run is on neither CDF and the difference measured there is
+  not a `D`. Robot data makes that the common case, not a corner one — binary flags, quantised
+  encoder counts, and the per-dataset stride in §5 leaves the two sample counts unequal — and
+  measuring mid-tie reports e.g. `0.333` for two *identical* binary channels at 300 vs 100
+  samples, over the default `0.3` threshold. Unit tests pin `D = 0` for a repeated single
+  value, a binary channel and a 10-level quantised channel, all at unequal `n`.
 - **Wasserstein-1** (earth mover's distance for 1-D samples): the integral of `|F_sim(x) -
   F_real(x)|` over the support, computed from the sorted samples — also no stats crate.
 - A small quantile table (p10/p50/p90) on each side, nearest-rank (no interpolation, same
@@ -57,17 +65,20 @@ like any other, and p50/p95 fall out of the quantile table.
 
 ```
 GapOptions { max_samples_per_feature: usize, threshold: f64 }   // KS D threshold, default 0.3
-FeatureSamples { dims: usize, values: Vec<f64> }                 // flat, row-major, len = n*dims
+FeatureSamples { dims: usize, values: Vec<f64>, nonfinite_dropped: usize }  // row-major, n*dims
 EpisodeSummary { success: Option<bool>, length: u64, envelope_violation: Option<f64> }
 GapInput { channels: BTreeMap<String, FeatureSamples>, episodes: Vec<EpisodeSummary> }
 
 ChannelGap { name, sim_n, real_n, sim_mean, real_mean, sim_std, real_std, mean_diff,
-             ks_d, wasserstein1, sim_quantiles: [f64; 3], real_quantiles: [f64; 3], flagged }
+             ks_d, wasserstein1, sim_quantiles: [f64; 3], real_quantiles: [f64; 3],
+             sim_nonfinite_dropped, real_nonfinite_dropped, flagged }
+DimsMismatch { channel: String, sim_dims: usize, real_dims: usize }
 EpisodeGap { sim_success_rate, real_success_rate, sim_length_mean, real_length_mean,
              sim_envelope_violation_rate, real_envelope_violation_rate: MetricValue }
 Suspect { channel: String, ks_d: f64, knob: &'static str }
 GapReport { threshold, channels: Vec<ChannelGap>, unmatched_sim: Vec<String>,
-            unmatched_real: Vec<String>, episodes: EpisodeGap, suspects: Vec<Suspect> }
+            unmatched_real: Vec<String>, dims_mismatch: Vec<DimsMismatch>,
+            episodes: EpisodeGap, suspects: Vec<Suspect> }
 ```
 
 `BTreeMap` only (never `HashMap`, §18.4 determinism convention extended here for the same
@@ -85,6 +96,11 @@ it is listed in `unmatched_sim` / `unmatched_real` instead, since a feature that
 exist on both sides is a schema difference, not a distribution gap, and inventing a distance
 against nothing would be exactly the "fabricated `0.0`" this codebase forbids.
 
+A name that *is* on both sides but with a different `dims` is the same kind of schema
+difference: it goes in `dims_mismatch` and is not scored. Comparing dim `d` of a 6-wide sim
+feature against dim `d` of a 7-wide real one (or, worse, clamping the sim index to its last
+column) pairs two different physical quantities and reports a `D` for them.
+
 ## 5. Subsampling (bounded, deterministic)
 
 `GapInput` construction (in `crates/es/src/cmd/gap.rs`) reads every episode's frames but
@@ -94,6 +110,20 @@ keeps at most `max_samples_per_feature` samples per channel: given `n` total fra
 random replacement — a fixed stride by position is deterministic and, since frames within an
 episode are already temporally correlated, no less representative than a random draw for the
 per-channel marginal statistics this report computes.
+
+Two things a dataset written by something other than `LeRobotWriter` can be, both handled
+here rather than in `es-data`:
+
+- **A non-finite value.** A kept frame with a `NaN`/`Inf` in any of its dims is dropped and
+  counted in `FeatureSamples::nonfinite_dropped`, surfaced per channel and side in
+  `ChannelGap`. Neither KS nor Wasserstein-1 has a meaning over `NaN`, and `serde_json` has no
+  encoding for one — so an unfiltered sample used to take `gap_report.json` down *after* the
+  table had been printed. `GapReport::to_json` returns `Result` for the same reason: the last
+  step of a command that already produced output must not be a panic.
+- **A column shorter than `n * dims`.** `dims` comes from the feature's declared
+  `elem_count`; a column that does not hold that many values per frame is an inconsistent
+  dataset, so the row slice is a `get(..)` and the miss is a `DataError::Inconsistent`
+  (`CliError::Runtime`, exit 1), not an index panic.
 
 ## 6. Suspects: mapping a flagged channel to a §18.3 knob
 
@@ -117,11 +147,13 @@ is a pointer for a human to go look, not a diagnosis) and lives as a `const` sli
 
 ## 7. Report schema
 
-`GapReport::to_json(&self) -> String` is `serde_json::to_string_pretty` (the struct already
-derives `Serialize`); the file is written by the CLI as `gap_report.json`. `GapReport`
-implements `Display` for the plain-text table the CLI also prints to stdout: one row per
-channel (`name`, `n` each side, `mean`/`std` each side, `KS D`, `W1`, flagged marker),
-followed by the unmatched-feature lists, the episode-level block, and the suspects list.
+`GapReport::to_json(&self) -> Result<String, serde_json::Error>` is
+`serde_json::to_string_pretty` (the struct already derives `Serialize`); the file is written
+by the CLI as `gap_report.json`. `GapReport` implements `Display` for the plain-text table the
+CLI also prints to stdout: one row per channel (`name`, `n` each side, `mean`/`std` each side,
+`KS D`, `W1`, flagged marker), followed by the unmatched-feature lists, the `dims_mismatch`
+list, the non-finite drop count when there is one, the episode-level block, and the suspects
+list.
 
 ## 8. CLI
 

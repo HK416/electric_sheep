@@ -82,7 +82,10 @@ pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
         .map_err(|e| CliError::Runtime(e.to_string()))?;
 
     print!("{report}");
-    std::fs::write(&out, report.to_json()).map_err(|e| CliError::Runtime(format!("{out}: {e}")))?;
+    let json = report
+        .to_json()
+        .map_err(|e| CliError::Runtime(format!("{out}: {e}")))?;
+    std::fs::write(&out, json).map_err(|e| CliError::Runtime(format!("{out}: {e}")))?;
     println!("\nwrote {out}");
 
     Ok(u8::from(report.has_flagged()))
@@ -162,10 +165,27 @@ fn build_input(
             let flat = column_f64(col);
             let dims = samples.dims.max(1);
             for local in 0..n {
-                if (offset + local as u64) % stride == 0 {
-                    samples
-                        .values
-                        .extend_from_slice(&flat[local * dims..(local + 1) * dims]);
+                if (offset + local as u64) % stride != 0 {
+                    continue;
+                }
+                // A foreign dataset whose column is shorter than `n * dims` is inconsistent,
+                // not a panic: the declared `elem_count` is what `dims` came from.
+                let row = flat.get(local * dims..(local + 1) * dims).ok_or_else(|| {
+                    es_data::DataError::Inconsistent(format!(
+                        "episode {}: column \"{name}\" holds {} values, {} short of the {} \
+                         frames x {dims} dims its feature declares",
+                        meta.episode_index,
+                        flat.len(),
+                        n * dims - flat.len().min(n * dims),
+                        n
+                    ))
+                })?;
+                // `serde_json` has no encoding for NaN/Inf and neither KS nor Wasserstein-1
+                // has a meaning over them, so the frame is dropped and counted (design §5).
+                if row.iter().all(|v| v.is_finite()) {
+                    samples.values.extend_from_slice(row);
+                } else {
+                    samples.nonfinite_dropped += 1;
                 }
             }
         }

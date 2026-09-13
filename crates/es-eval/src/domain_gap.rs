@@ -81,15 +81,23 @@ impl Default for GapOptions {
 ///
 /// A scalar feature is `dims == 1`. Values are assumed already subsampled by the caller
 /// (design doc §5) — this type does not know how many frames it came from.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct FeatureSamples {
     pub dims: usize,
     pub values: Vec<f64>,
+    /// Frames the caller refused to put in `values` because at least one of their dims was
+    /// not finite (design doc §5). Reported, never silently absorbed: `serde_json` has no
+    /// encoding for NaN/Inf, and a distribution statistic over them has no meaning either.
+    pub nonfinite_dropped: usize,
 }
 
 impl FeatureSamples {
     pub fn new(dims: usize, values: Vec<f64>) -> Self {
-        Self { dims, values }
+        Self {
+            dims,
+            values,
+            nonfinite_dropped: 0,
+        }
     }
 
     /// The `d`-th dim's samples across all frames.
@@ -136,7 +144,23 @@ pub struct ChannelGap {
     pub wasserstein1: f64,
     pub sim_quantiles: [f64; 3],
     pub real_quantiles: [f64; 3],
+    /// Frames dropped for a non-finite value on each side, carried through from
+    /// [`FeatureSamples::nonfinite_dropped`] so the row says how much of the channel it saw.
+    #[serde(default)]
+    pub sim_nonfinite_dropped: usize,
+    #[serde(default)]
+    pub real_nonfinite_dropped: usize,
     pub flagged: bool,
+}
+
+/// A channel both sides carry under the same name but with a different width. Listed, not
+/// scored: dim `d` of a 6-wide sim feature and dim `d` of a 7-wide real one are two different
+/// physical quantities, and comparing them is the "fabricated number" the design doc forbids.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DimsMismatch {
+    pub channel: String,
+    pub sim_dims: usize,
+    pub real_dims: usize,
 }
 
 /// Episode-level gap (§10.3 `success_rate`, `episode_length`, `envelope_violation_rate`).
@@ -165,13 +189,18 @@ pub struct GapReport {
     pub channels: Vec<ChannelGap>,
     pub unmatched_sim: Vec<String>,
     pub unmatched_real: Vec<String>,
+    /// Channels paired by name whose widths disagree (see [`DimsMismatch`]).
+    #[serde(default)]
+    pub dims_mismatch: Vec<DimsMismatch>,
     pub episodes: EpisodeGap,
     pub suspects: Vec<Suspect>,
 }
 
 impl GapReport {
-    pub fn to_json(&self) -> String {
-        serde_json::to_string_pretty(self).expect("GapReport always serializes")
+    /// `Result`, not an `.expect`: `serde_json` refuses NaN/Inf, and a report the CLI has
+    /// already printed must not take the process down on the way to disk.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
     }
 
     /// True when at least one channel exceeded `threshold` — the CLI's exit-code-1 condition.
@@ -224,6 +253,22 @@ impl fmt::Display for GapReport {
                 "unmatched (real only): {}",
                 self.unmatched_real.join(", ")
             )?;
+        }
+        if !self.dims_mismatch.is_empty() {
+            writeln!(f)?;
+            writeln!(f, "dims mismatch (not scored):")?;
+            for m in &self.dims_mismatch {
+                writeln!(f, "  {} sim={} real={}", m.channel, m.sim_dims, m.real_dims)?;
+            }
+        }
+        let dropped: usize = self
+            .channels
+            .iter()
+            .map(|c| c.sim_nonfinite_dropped + c.real_nonfinite_dropped)
+            .sum();
+        if dropped > 0 {
+            writeln!(f)?;
+            writeln!(f, "dropped {dropped} non-finite frame(s) before comparing")?;
         }
         writeln!(f)?;
         writeln!(f, "episodes:")?;
@@ -284,6 +329,7 @@ impl DomainGap {
         let mut channels = Vec::new();
         let mut unmatched_sim = Vec::new();
         let mut unmatched_real = Vec::new();
+        let mut dims_mismatch = Vec::new();
 
         // BTreeMap keys are already sorted; a merge-join gives deterministic paired /
         // unmatched partitioning in one pass with no HashMap involved.
@@ -293,7 +339,15 @@ impl DomainGap {
             match (si.peek(), ri.peek()) {
                 (Some((sk, sv)), Some((rk, rv))) => match sk.cmp(rk) {
                     std::cmp::Ordering::Equal => {
-                        channels.extend(compare_channel(sk, sv, rv, opts.threshold));
+                        if sv.dims == rv.dims {
+                            channels.extend(compare_channel(sk, sv, rv, opts.threshold));
+                        } else {
+                            dims_mismatch.push(DimsMismatch {
+                                channel: (*sk).clone(),
+                                sim_dims: sv.dims,
+                                real_dims: rv.dims,
+                            });
+                        }
                         si.next();
                         ri.next();
                     }
@@ -335,6 +389,7 @@ impl DomainGap {
             channels,
             unmatched_sim,
             unmatched_real,
+            dims_mismatch,
             episodes,
             suspects,
         })
@@ -347,11 +402,14 @@ fn compare_channel(
     real: &FeatureSamples,
     threshold: f64,
 ) -> Vec<ChannelGap> {
-    let dims = sim.dims.max(real.dims);
+    // `compute` only pairs channels of equal width; a mismatch is listed, never clamped onto
+    // an unrelated column.
+    debug_assert_eq!(sim.dims, real.dims);
+    let dims = sim.dims.max(1);
     (0..dims)
         .map(|d| {
-            let a = sim.column(d.min(sim.dims.saturating_sub(1)));
-            let b = real.column(d.min(real.dims.saturating_sub(1)));
+            let a = sim.column(d);
+            let b = real.column(d);
             let dim_name = if dims == 1 {
                 name.to_owned()
             } else {
@@ -371,6 +429,8 @@ fn compare_channel(
                 wasserstein1: wasserstein1(&a, &b),
                 sim_quantiles: quantiles(&a),
                 real_quantiles: quantiles(&b),
+                sim_nonfinite_dropped: sim.nonfinite_dropped,
+                real_nonfinite_dropped: real.nonfinite_dropped,
                 flagged: ks_d > threshold,
             }
         })
@@ -430,6 +490,13 @@ fn envelope_violation_rate(episodes: &[EpisodeSummary]) -> MetricValue {
 
 /// Two-sample Kolmogorov-Smirnov statistic `D = sup_x |F_a(x) - F_b(x)|`, via a sorted merge
 /// of both samples (`O((n+m) log(n+m))` for the sort, `O(n+m)` for the merge).
+///
+/// The empirical CDFs are right-continuous step functions, so the supremum is only ever
+/// attained *after* a value's whole run of repeats: each step of the merge picks the smaller
+/// of the two cursors' values and advances **both** cursors past every sample equal to it
+/// before evaluating the gap (standard `ks_2samp` semantics). Advancing one repeat at a time
+/// instead reports a gap at a point that is not on either CDF, which on robot data — binary
+/// flags, quantised encoder counts, unequal sample counts — is a large fabricated `D`.
 pub fn ks_statistic(sim: &[f64], real: &[f64]) -> f64 {
     if sim.is_empty() || real.is_empty() {
         return 0.0;
@@ -442,11 +509,14 @@ pub fn ks_statistic(sim: &[f64], real: &[f64]) -> f64 {
     let (mut i_sim, mut i_real) = (0usize, 0usize);
     let mut max_gap = 0.0f64;
     while i_sim < n_sim && i_real < n_real {
+        // `total_cmp`, the same order the sort used, so the two loops below cannot disagree
+        // with it on -0.0/NaN and the merge always advances.
         let (sv, rv) = (sim[i_sim], real[i_real]);
-        if sv <= rv {
+        let x = if sv.total_cmp(&rv).is_le() { sv } else { rv };
+        while i_sim < n_sim && sim[i_sim].total_cmp(&x).is_le() {
             i_sim += 1;
         }
-        if rv <= sv {
+        while i_real < n_real && real[i_real].total_cmp(&x).is_le() {
             i_real += 1;
         }
         let f_sim = i_sim as f64 / n_sim as f64;
@@ -524,6 +594,45 @@ mod tests {
         // a = {0,1,2,3}, b = {2,3,4,5}. At x=1: Fa=2/4=0.5, Fb=0. At x=3: Fa=1, Fb=2/4=0.5.
         // Max |Fa-Fb| = 0.5.
         let d = ks_statistic(&[0.0, 1.0, 2.0, 3.0], &[2.0, 3.0, 4.0, 5.0]);
+        assert!((d - 0.5).abs() < 1e-12, "{d}");
+    }
+
+    // --- KS past ties (docs/packets/M3/P-M3-R1.md) -------------------------------------
+
+    #[test]
+    fn ks_statistic_is_zero_for_one_repeated_value_at_unequal_n() {
+        // Both CDFs are the single step 0 -> 1 at x = 1. Advancing one repeat at a time
+        // evaluated the gap at points that are on neither CDF and reported D = 2/3.
+        assert!(ks_statistic(&[1.0, 1.0, 1.0], &[1.0]).abs() < 1e-12);
+        assert!(ks_statistic(&[1.0], &[1.0, 1.0, 1.0]).abs() < 1e-12);
+    }
+
+    #[test]
+    fn ks_statistic_is_zero_for_a_binary_channel_at_unequal_n() {
+        // A gripper flag / an `action_source` bit: 40% zeros on both sides, 300 vs 100
+        // samples. Identical distributions, so D must be exactly 0.
+        let sim: Vec<f64> = (0..300).map(|i| f64::from(u8::from(i % 5 >= 2))).collect();
+        let real: Vec<f64> = (0..100).map(|i| f64::from(u8::from(i % 5 >= 2))).collect();
+        let d = ks_statistic(&sim, &real);
+        assert!(d.abs() < 1e-12, "{d}");
+    }
+
+    #[test]
+    fn ks_statistic_is_zero_for_a_quantised_channel_at_unequal_n() {
+        // A 10-level quantised encoder channel, same levels and same proportions on both
+        // sides at 500 vs 100 samples.
+        let sim: Vec<f64> = (0..500).map(|i| f64::from(i % 10)).collect();
+        let real: Vec<f64> = (0..100).map(|i| f64::from(i % 10)).collect();
+        let d = ks_statistic(&sim, &real);
+        assert!(d.abs() < 1e-12, "{d}");
+    }
+
+    #[test]
+    fn ks_statistic_still_sees_a_shifted_tie_run() {
+        // Ties are not an excuse to report 0: {0,0,0,0} vs {1,1} share no support.
+        assert!((ks_statistic(&[0.0; 4], &[1.0, 1.0]) - 1.0).abs() < 1e-12);
+        // Half the sim mass sits on a value the real side never takes.
+        let d = ks_statistic(&[0.0, 0.0, 1.0, 1.0], &[1.0]);
         assert!((d - 0.5).abs() < 1e-12, "{d}");
     }
 
@@ -714,9 +823,26 @@ mod tests {
         let v: Vec<f64> = vec![1.0, 2.0, 3.0];
         let a = input(&[("action", 1, &v)], vec![]);
         let report = DomainGap::compute(&a, &a, &GapOptions::default()).unwrap();
-        let json = report.to_json();
+        let json = report.to_json().expect("serializes");
         let back: GapReport = serde_json::from_str(&json).unwrap();
         assert_eq!(back, report);
+    }
+
+    #[test]
+    fn a_channel_whose_width_disagrees_is_listed_not_clamped() {
+        let sim = input(&[("observation.state", 2, &[0.0, 1.0, 2.0, 3.0])], vec![]);
+        let real = input(&[("observation.state", 3, &[0.0, 1.0, 2.0])], vec![]);
+        let report = DomainGap::compute(&sim, &real, &GapOptions::default()).unwrap();
+        assert!(report.channels.is_empty(), "{report}");
+        assert_eq!(
+            report.dims_mismatch,
+            vec![DimsMismatch {
+                channel: "observation.state".to_owned(),
+                sim_dims: 2,
+                real_dims: 3,
+            }]
+        );
+        assert!(!report.has_flagged());
     }
 
     #[test]

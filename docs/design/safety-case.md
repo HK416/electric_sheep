@@ -79,17 +79,31 @@ The rule the gate checks, per requirement:
 
 > A requirement is **covered** when at least one evidence linked to it exists as a bundle
 > entry, its recorded `hash` equals the blake3 of that entry's bytes, and its
-> `execution_hash` equals the bundle's own `chain.execution_hash()`.
+> `execution_hash` equals the bundle's own `chain.execution_hash()` -- both as the *case*
+> records it and as the *entry itself* does.
 
-Linked evidence that exists and hashes correctly but carries a *different* `execution_hash` is
-reported as **stale**, not as coverage: it is a real measurement of a different machine. A
-requirement with only stale evidence is uncovered, and `es evidence verify` exits 1.
+The second half of that last clause is why `verify` parses the entries and does not only read
+the case. Every `reports/<i>/` artifact spec 10.5 defines carries the hash of the run that
+produced it: `report.json` as `execution_hash` bytes, `evaluation.lock` as hex, plus the
+`evaluation_hash` of the suite that was locked. Both are parsed and both are cross-checked
+against `chain.json`. Checking only `report.json` left a hole exactly the size of an
+`EvidenceKind::Lock`: a lock lifted from another run, with the case rewritten to record that
+file's blake3, satisfied every check the case could make about itself and counted as coverage.
+An entry whose own contents name a different run (or a different Evaluation IR) is a
+diagnostic *and* puts its evidence in `stale`.
+
+Linked evidence that exists and hashes correctly but is of a different run is reported as
+**stale**, not as coverage: it is a real measurement of a different machine. A requirement with
+only stale evidence is uncovered, and `es evidence verify` exits 1.
 
 `SafetyCase::validate` runs before any of that and rejects the graph itself: duplicate ids,
 a claim or traceability key naming a requirement that does not exist, a traceability entry
-naming evidence that does not exist, and a requirement with no evidence list at all. Building
-an `evidence.esb` from an invalid case is refused -- an unverifiable artifact is worse than no
-artifact (spec 26.1: *what is not verified is not run*).
+naming evidence that does not exist, a requirement with no evidence list at all, and a case
+with **no requirements** (`EVID-008`). The last one is not pedantry: `VerifyReport::ok()` is
+"every requirement is covered", which is vacuously true over an empty table, so without it
+`es evidence verify` prints a green gate-16 result over a document that argues nothing.
+Building an `evidence.esb` from an invalid case is refused -- an unverifiable artifact is worse
+than no artifact (spec 26.1: *what is not verified is not run*).
 
 ## 5. `revalidation_trigger` -- the "substantial modification" table
 

@@ -11,8 +11,10 @@
 //!
 //! * evidence is addressed as a *bundle entry plus its blake3*, never as a path or a URL, so
 //!   an edge cannot silently point at something that was swapped;
-//! * coverage requires the evidence's `execution_hash` to be the bundle's own — evidence from
-//!   a different run is *stale*, reported, and does not count (gate 16);
+//! * coverage requires the evidence's `execution_hash` to be the bundle's own — both as the
+//!   case records it and as the entry's own spec 10.5 contents (`report.json`,
+//!   `evaluation.lock`) record it — so evidence from a different run is *stale*, reported, and
+//!   does not count (gate 16);
 //! * `revalidation_trigger` hangs off the evidence *kind*, not off the requirement, because
 //!   what invalidates a fact is a property of how the fact was produced (spec 27.1).
 //!
@@ -186,6 +188,18 @@ impl SafetyCase {
                 }
             }
         }
+        if self.requirements.is_empty() {
+            out.push(
+                Diagnostic::new(
+                    EVID_EMPTY_CASE,
+                    "the safety case declares no requirements".to_owned(),
+                )
+                .with_hint(
+                    "a case with nothing to cover is vacuously complete; spec 27.1 wants the \
+                     requirements a conformity file argues over, not an empty table",
+                ),
+            );
+        }
         for r in &self.requirements {
             if self.traceability.get(&r.id).is_none_or(Vec::is_empty) {
                 out.push(
@@ -218,6 +232,7 @@ pub const EVID_ENTRY_MISSING: &str = "EVID-004";
 pub const EVID_ENTRY_HASH: &str = "EVID-005";
 pub const EVID_EXECUTION_HASH: &str = "EVID-006";
 pub const EVID_CHAIN_SLOT: &str = "EVID-007";
+pub const EVID_EMPTY_CASE: &str = "EVID-008";
 
 /// Which changes invalidate evidence of this kind (spec 27.1 `revalidation_trigger`, in the
 /// units of spec 5.3 `HashChain::diff`). The table and its reasoning are in
@@ -452,25 +467,62 @@ impl EvidenceBundle {
             }
         }
 
-        // 3. Every report in the bundle is a report of *this* execution (spec 5.3).
+        // 3. Every artifact in the bundle is an artifact of *this* execution (spec 5.3). Both
+        //    spec 10.5 files carry the hash, so both are parsed: a `report.json` records it as
+        //    bytes, an `evaluation.lock` as hex, and an entry the case links to but whose own
+        //    contents name another run is not evidence of this one — it goes in `stale`
+        //    below, not just in the diagnostics.
+        let hex_execution = crate::hex32(&execution_hash);
+        let mut foreign: BTreeSet<&String> = BTreeSet::new();
         for (name, payload) in &b.entries {
-            if !name.ends_with(REPORT_JSON) || !name.starts_with("reports/") {
+            if !name.starts_with("reports/") {
                 continue;
             }
-            let report: EvaluationReport =
-                serde_json::from_slice(payload).map_err(json_err(name))?;
-            if report.execution_hash != execution_hash {
+            let (got, what) = if name.ends_with(REPORT_JSON) {
+                let report: EvaluationReport =
+                    serde_json::from_slice(payload).map_err(json_err(name))?;
+                (crate::hex32(&report.execution_hash), "reports")
+            } else if name.ends_with(EVALUATION_LOCK) {
+                let lock: EvaluationLock =
+                    serde_json::from_slice(payload).map_err(json_err(name))?;
+                // The evaluation slot is the suite the lock says it locked; a lock of a
+                // different suite is as foreign as one of a different run.
+                if b.chain
+                    .evaluation
+                    .is_some_and(|e| crate::hex32(&e) != lock.evaluation_hash)
+                {
+                    diagnostics.push(
+                        Diagnostic::new(
+                            EVID_EXECUTION_HASH,
+                            format!(
+                                "\"{name}\" locks evaluation_hash {} but the bundle's chain \
+                                 records {}",
+                                lock.evaluation_hash,
+                                b.chain
+                                    .evaluation
+                                    .map_or_else(|| "none".to_owned(), |e| crate::hex32(&e))
+                            ),
+                        )
+                        .with_hint("the lock is of a different Evaluation IR"),
+                    );
+                    foreign.insert(name);
+                }
+                (lock.execution_hash.clone(), "locks")
+            } else {
+                continue;
+            };
+            if got != hex_execution {
                 diagnostics.push(
                     Diagnostic::new(
                         EVID_EXECUTION_HASH,
                         format!(
-                            "\"{name}\" reports execution_hash {} but the bundle attests {}",
-                            crate::hex32(&report.execution_hash),
-                            crate::hex32(&execution_hash)
+                            "\"{name}\" {what} execution_hash {got} but the bundle attests \
+                             {hex_execution}"
                         ),
                     )
-                    .with_hint("the report is of a different run than the bundle's chain.json"),
+                    .with_hint("the artifact is of a different run than the bundle's chain.json"),
                 );
+                foreign.insert(name);
             }
         }
 
@@ -490,7 +542,7 @@ impl EvidenceBundle {
                         .entries
                         .get(&e.entry)
                         .is_some_and(|p| blake3::hash(p).as_bytes() == &e.hash);
-                    if intact && e.execution_hash == execution_hash {
+                    if intact && e.execution_hash == execution_hash && !foreign.contains(&e.entry) {
                         evidence.push(id);
                     } else {
                         stale.push(id);
@@ -519,8 +571,9 @@ impl EvidenceBundle {
                     ),
                 )
                 .with_hint(
-                    "stale means the evidence is of a different execution_hash, or its entry \
-                     no longer matches its recorded hash",
+                    "stale means the evidence is of a different execution_hash -- as the case \
+                     records it or as the entry itself does -- or its entry no longer matches \
+                     its recorded hash",
                 ),
             );
         }
@@ -590,7 +643,9 @@ pub struct RequirementCoverage {
     pub severity: Severity,
     /// Evidence that exists, hashes correctly and is of this bundle's execution.
     pub evidence: Vec<String>,
-    /// Linked evidence that is not: a different run, or an entry that no longer matches.
+    /// Linked evidence that is not: an entry that no longer matches its recorded hash, or one
+    /// of a different run -- either because the case records a foreign `execution_hash` or
+    /// because the entry's own `report.json` / `evaluation.lock` contents do.
     pub stale: Vec<String>,
     pub covered: bool,
 }
@@ -670,6 +725,20 @@ mod tests {
         // An empty list is the same thing as no list.
         c.traceability.insert("REQ-08".to_owned(), vec![]);
         assert_eq!(codes(&c.validate()), [EVID_UNCOVERED]);
+    }
+
+    #[test]
+    fn a_case_with_no_requirements_is_a_diagnostic() {
+        // `VerifyReport::ok()` is "every requirement covered", which is vacuously true over an
+        // empty table -- so the empty table itself has to be the finding.
+        let c = SafetyCase {
+            requirements: vec![],
+            claims: vec![],
+            traceability: BTreeMap::new(),
+            ..case()
+        };
+        assert_eq!(codes(&c.validate()), [EVID_EMPTY_CASE]);
+        assert!(c.validate().iter().any(Diagnostic::is_error));
     }
 
     #[test]

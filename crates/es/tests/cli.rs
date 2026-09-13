@@ -1882,3 +1882,216 @@ fn loop_usage_errors_exit_two() {
         assert_eq!(out.status.code(), Some(2), "{args:?}");
     }
 }
+
+// --- P-M3-R2 / P-M3-R5 follow-ups (docs/reviews/M3.md) --------------------------------------
+
+/// A hostile `LeRobot` dataset: `write_gap_fixture`'s schema with `observation.state` values
+/// replaced by `NaN`, and -- after the writer has had its say -- `meta/info.json` patched to
+/// declare `action` two elements wide when the parquet column holds one per frame. Both are
+/// things a foreign dataset can be and `LeRobotWriter` cannot produce, so they are made here
+/// rather than fixed up in `es-data`.
+fn write_hostile_gap_fixture(root: &Path, nan: bool, widen_action: bool) {
+    let mut features = BTreeMap::new();
+    features.insert(
+        "observation.state".to_owned(),
+        FeatureSpec::new(Dtype::Float32, [1u64]),
+    );
+    features.insert(
+        "action".to_owned(),
+        FeatureSpec::new(Dtype::Float32, [1u64]),
+    );
+
+    let mut writer = LeRobotWriter::create(root, Info::new(30.0, features)).expect("create");
+    let n = 40usize;
+    let mut columns = BTreeMap::new();
+    columns.insert(
+        "observation.state".to_owned(),
+        Column::F32(
+            (0..n)
+                .map(|i| {
+                    if nan && i % 7 == 0 {
+                        f32::NAN
+                    } else {
+                        (i % 9) as f32
+                    }
+                })
+                .collect(),
+        ),
+    );
+    columns.insert(
+        "action".to_owned(),
+        Column::F32((0..n).map(|i| (i % 5) as f32).collect()),
+    );
+    writer
+        .write_episode(&Episode {
+            index: 0,
+            tasks: vec!["task".to_owned()],
+            timestamps: (0..n).map(|i| i as f64 / 30.0).collect(),
+            task_index: vec![0; n],
+            columns,
+            video: BTreeMap::new(),
+        })
+        .expect("write episode");
+    writer.finish().expect("finish");
+
+    if widen_action {
+        let path = root.join("meta").join("info.json");
+        let text = std::fs::read_to_string(&path).expect("read info.json");
+        // The `action` feature is the only `[1]` shape before `observation.state`'s, and
+        // serde_json preserves key order, so a targeted replace is enough here.
+        let patched = text.replacen(
+            "\"shape\": [\n        1\n      ]",
+            "\"shape\": [\n        2\n      ]",
+            1,
+        );
+        assert_ne!(patched, text, "info.json shape not found:\n{text}");
+        write(&path, &patched);
+    }
+}
+
+/// Both hostile shapes at once: `es gap` must exit with a message, never panic (P-M3-R2).
+#[test]
+fn gap_hostile_dataset_errors_instead_of_panicking() {
+    let dir = scratch_dir("gap-hostile");
+    let sim = dir.join("sim");
+    let real = dir.join("real");
+    write_hostile_gap_fixture(&sim, true, true);
+    write_gap_fixture(&real, 0.0);
+
+    let out = bin()
+        .args([
+            "gap",
+            "--sim",
+            sim.to_str().unwrap(),
+            "--real",
+            real.to_str().unwrap(),
+        ])
+        .args(["--out", dir.join("gap_report.json").to_str().unwrap()])
+        .output()
+        .expect("run es");
+    let err = String::from_utf8_lossy(&out.stderr).into_owned();
+    assert_eq!(out.status.code(), Some(1), "stdout:\n{}", stdout(&out));
+    assert!(err.contains("error:"), "{err}");
+    assert!(err.contains("inconsistent"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+}
+
+/// A `NaN` on its own is dropped and counted, not a panic on the way to `gap_report.json`
+/// (the `.expect` in `GapReport::to_json` that P-M3-R2 removed).
+#[test]
+fn gap_nonfinite_samples_are_dropped_and_counted() {
+    let dir = scratch_dir("gap-nonfinite");
+    let sim = dir.join("sim");
+    let real = dir.join("real");
+    write_hostile_gap_fixture(&sim, true, false);
+    write_hostile_gap_fixture(&real, false, false);
+    let out_path = dir.join("gap_report.json");
+
+    let out = bin()
+        .args([
+            "gap",
+            "--sim",
+            sim.to_str().unwrap(),
+            "--real",
+            real.to_str().unwrap(),
+        ])
+        .args(["--out", out_path.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    assert!(
+        out.status.code() == Some(0) || out.status.code() == Some(1),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: es_eval::domain_gap::GapReport =
+        serde_json::from_str(&std::fs::read_to_string(&out_path).expect("read report"))
+            .expect("report json");
+    let state = report
+        .channels
+        .iter()
+        .find(|c| c.name == "observation.state")
+        .expect("state channel present");
+    assert_eq!(state.sim_nonfinite_dropped, 6, "{report}");
+    assert_eq!(state.real_nonfinite_dropped, 0, "{report}");
+    assert!(
+        state.sim_mean.is_finite() && state.sim_std.is_finite(),
+        "{report}"
+    );
+}
+
+/// A `reports/0/evaluation.lock` lifted from another run, with the Safety Case rewritten to
+/// record *its* blake3, so the entry-hash check passes and only the lock's own
+/// `execution_hash` can catch the swap (P-M3-R5).
+#[test]
+fn evidence_verify_treats_a_foreign_lock_as_stale() {
+    let a = build_evidence(40.0);
+    let b = build_evidence(35.0); // a tighter envelope: `execution_hash` moves
+    assert_ne!(a.chain.execution_hash(), b.chain.execution_hash());
+
+    let entry = bundle::report_entry(0, EVALUATION_LOCK);
+    let foreign = bundle::read(&b.bytes).expect("reads").entries[&entry].clone();
+    let mut case = a.case.clone();
+    for e in &mut case.evidence {
+        if e.entry == entry {
+            e.hash = *blake3::hash(&foreign).as_bytes();
+        }
+    }
+    let mut text = serde_json::to_string_pretty(&case).expect("serializes");
+    text.push('\n');
+    let swapped = rewrite_entry(&a.bytes, &entry, foreign);
+    let swapped = rewrite_entry(&swapped, SAFETY_CASE, text.into_bytes());
+
+    let report = EvidenceBundle::verify(&swapped, None).expect("verifies");
+    assert!(!report.ok(), "a lock of another run is not coverage");
+    let req = report
+        .coverage
+        .iter()
+        .find(|c| c.requirement == "REQ-11")
+        .expect("REQ-11 is the lock's requirement");
+    assert!(!req.covered, "{req:?}");
+    assert_eq!(req.stale, vec!["EV-lock".to_owned()]);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == es_eval::evidence::EVID_EXECUTION_HASH),
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+/// A case with no requirements is vacuously "every requirement covered"; verify must still
+/// fail it (P-M3-R5).
+#[test]
+fn evidence_verify_fails_a_case_with_no_requirements() {
+    let built = build_evidence(40.0);
+    let mut case = built.case.clone();
+    case.requirements.clear();
+    case.claims.clear();
+    case.traceability.clear();
+    let mut text = serde_json::to_string_pretty(&case).expect("serializes");
+    text.push('\n');
+    let empty = rewrite_entry(&built.bytes, SAFETY_CASE, text.into_bytes());
+
+    let report = EvidenceBundle::verify(&empty, None).expect("verifies");
+    assert!(report.coverage.is_empty());
+    assert!(!report.ok(), "an empty case must not verify");
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == es_eval::evidence::EVID_EMPTY_CASE),
+        "{:?}",
+        report.diagnostics
+    );
+
+    let dir = scratch_dir("evidence-empty-case");
+    let path = dir.join("evidence.esb");
+    std::fs::write(&path, &empty).expect("write bundle");
+    let out = bin()
+        .args(["evidence", "verify", path.to_str().unwrap()])
+        .output()
+        .expect("run es");
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
