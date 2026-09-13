@@ -47,7 +47,10 @@ impl Similarity {
     /// quaternion method for the rotation.
     ///
     /// Needs at least 3 correspondences: three non-collinear points fix a rotation, two do
-    /// not. Degenerate input is an error, never a silent identity.
+    /// not. Degenerate input is an error, never a silent identity — coincident `src` points
+    /// (`SplatError::DegenerateFit` via zero spread) and collinear ones (same error, via a
+    /// near-zero second principal spread) are both rejected rather than returning an
+    /// arbitrary rotation about the line.
     ///
     /// The 4x4 symmetric eigenproblem is solved by a fixed-sweep cyclic Jacobi rotation,
     /// which needs `sqrt` and division and no transcendental at all — so there is neither a
@@ -80,9 +83,13 @@ impl Similarity {
         };
         let (src_mean, dst_mean) = (mean(src), mean(dst));
 
-        // `s[a][b] = sum_i src_centred[a] * dst_centred[b]`, accumulated in index order.
+        // `s[a][b] = sum_i src_centred[a] * dst_centred[b]`, accumulated in index order. Also
+        // tracks the centred `src` point of largest norm, a fixed (order-independent) choice
+        // of reference axis for the rank check below.
         let mut s = [[0.0f64; 3]; 3];
         let mut src_spread = 0.0f64;
+        let mut axis = Vec3::ZERO;
+        let mut axis_norm2 = 0.0f64;
         for (a, b) in src.iter().zip(dst) {
             let a = *a - src_mean;
             let b = *b - dst_mean;
@@ -92,9 +99,31 @@ impl Similarity {
                     s[i][j] += av[i] * bv[j];
                 }
             }
-            src_spread += a.dot(a);
+            let a_norm2 = a.dot(a);
+            src_spread += a_norm2;
+            if a_norm2 > axis_norm2 {
+                axis_norm2 = a_norm2;
+                axis = a;
+            }
         }
         if src_spread <= 0.0 {
+            return Err(SplatError::DegenerateFit);
+        }
+
+        // Rank check: correspondences confined to a single line fix a rotation about that
+        // line only and leave it arbitrary around it (spec 16.2's doc promise: "degenerate
+        // input is an error, never a silent identity"). `axis` is the centred point of
+        // largest norm; summing every centred point's component perpendicular to it is the
+        // second principal spread, and it is near zero exactly when every point lies on
+        // `axis`'s line through the centroid, i.e. rank < 2.
+        let axis_unit = axis.scale(1.0 / axis_norm2.sqrt());
+        let mut perp_spread = 0.0f64;
+        for a in src {
+            let c = *a - src_mean;
+            let perp = c - axis_unit.scale(c.dot(axis_unit));
+            perp_spread += perp.dot(perp);
+        }
+        if perp_spread <= src_spread * f64::EPSILON.sqrt() {
             return Err(SplatError::DegenerateFit);
         }
 

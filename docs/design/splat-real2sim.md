@@ -49,6 +49,22 @@ exact for any input but push `exp`/`sigmoid` into every consumer, including the 
 path. Decoded-on-import matches what the glTF importer does with vertex data and what §5.3
 means by hashing decoded content, so it wins.
 
+**Determinism (P-M3 review, §3.2/§3.4).** `exp`, `ln`, `sigmoid` and `logit` all feed
+`SplatScene::asset_hash`, a §5.3 chain input, so they must not depend on the host's `libm`:
+two machines importing the same capture must hash it identically. `sigmoid`/`logit`/`scale`
+decode and encode therefore route through `es_math::approx::exp` / `es_math::approx::ln` — the
+one deterministic transcendental implementation shared with the GPU (`crates/es-math/slang/
+approx.slang`) — entirely in `f32`, rather than through `f64::exp`/`f64::ln` rounded once to
+`f32`. `es_math::approx` bounds its error by ULPs, not by IEEE correct rounding, so this is a
+strictly different (and slightly less accurate) approximation than the host `libm` gave; the
+`1e-6` relative tolerance in `a_non_fixed_point_activation_round_trips_to_a_relative_1e_6`
+already covers the difference, and the fixed-point set the byte-exact fixtures draw from
+changed along with it — `0.0` is a fixed point of both `exp`/`ln` and `sigmoid`/`logit` under
+`es_math::approx` (`exp(0) == 1`, `ln(1) == 0`, `sigmoid(0) == 0.5`, `logit(0.5) == 0`, all
+bit-exact), so the two `cube20_*.ply` fixtures were regenerated with `scale_0..2` and
+`opacity` set to `0.0` for every vertex; every other field (positions, normals, SH
+coefficients, rotations) is unchanged.
+
 ### 1.2 `AssetKind` has no `Splat` variant
 
 `AssetKind` lives in `es-assets`, which this packet does not own, so `AssetRef::kind` is

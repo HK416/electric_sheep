@@ -15,6 +15,9 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Installs es-core's allocation counter for this crate's tests (P17/P-M3-R3), so
+# `tests/splat.rs` can bound the ascii PLY reader's reserve on a hostile header.
+es-core = { workspace = true, features = ["alloc-count"] }
 
 [lints]
 workspace = true

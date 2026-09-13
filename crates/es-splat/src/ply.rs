@@ -38,7 +38,7 @@ const SH_REST_COUNTS: [usize; 4] = [0, 9, 24, 45];
 
 /// Alpha is clamped into `[ALPHA_FLOOR, 1 - ALPHA_FLOOR]` before `logit` on write, so a
 /// saturated Gaussian writes a large finite value instead of an infinity.
-const ALPHA_FLOOR: f64 = 1e-7;
+const ALPHA_FLOOR: f32 = 1e-7;
 
 /// Why a byte slice is not a Gaussian splat capture. Also carries the alignment-fit failures
 /// of [`crate::Similarity`] and [`crate::ColorAffine`]: one crate, one error type.
@@ -389,15 +389,40 @@ impl Plan {
     }
 }
 
-/// `sigmoid`, evaluated in `f64` and rounded once to `f32`.
+/// `sigmoid`, entirely in `f32` through [`es_math::approx`] (`exp`) so `asset_hash` is
+/// reproducible across libms (spec 3.2/3.4, `es_math::approx` is the one deterministic
+/// transcendental implementation) rather than depending on the host's `f64::exp`. This trades
+/// `f64::exp`'s correctly-rounded result for `es_math::approx::exp`'s bounded-ULP one; see
+/// `docs/design/splat-real2sim.md` section 1.1 for the round-trip consequence.
 fn sigmoid(x: f64) -> f32 {
-    (1.0 / (1.0 + (-x).exp())) as f32
+    let x = x as f32;
+    1.0 / (1.0 + es_math::approx::exp(-x))
 }
 
 /// Inverse of [`sigmoid`]. Saturating alpha is clamped rather than sent to an infinity.
 fn logit(y: f32) -> f32 {
-    let y = f64::from(y).clamp(ALPHA_FLOOR, 1.0 - ALPHA_FLOOR);
-    (y / (1.0 - y)).ln() as f32
+    let y = y.clamp(ALPHA_FLOOR, 1.0 - ALPHA_FLOOR);
+    es_math::approx::ln(y / (1.0 - y))
+}
+
+/// How many vertex records the file could possibly hold, bounding a hostile header's
+/// declared `count` by the file's actual size rather than trusting it (P-M3-R3). A binary
+/// record needs exactly `stride` bytes; an ascii one needs at least two bytes per property
+/// (one digit, one separator). `Vec::with_capacity` calls below use this, not `count`
+/// directly, so a header that declares far more vertices than the file has room for cannot
+/// amplify the reserve past what the file could actually contain.
+fn reserve_count(
+    format: Format,
+    props: usize,
+    stride: usize,
+    count: usize,
+    available: usize,
+) -> usize {
+    let bytes_per_record = match format {
+        Format::Ascii => 2 * props.max(1),
+        Format::BinaryLe => stride.max(1),
+    };
+    count.min(available / bytes_per_record)
 }
 
 /// Reads a Gaussian splat capture. See the module docs for the axis conversion and the API
@@ -438,13 +463,20 @@ pub fn import_ply(bytes: &[u8]) -> Result<SplatScene, SplatError> {
     }
 
     let per_rest = plan.rest.len();
+    let reserve = reserve_count(
+        header.format,
+        header.props.len(),
+        header.stride,
+        count,
+        available,
+    );
     let mut scene = SplatScene {
-        positions: Vec::with_capacity(3 * count),
-        scales: Vec::with_capacity(3 * count),
-        rotations: Vec::with_capacity(4 * count),
-        opacities: Vec::with_capacity(count),
-        sh_dc: Vec::with_capacity(3 * count),
-        sh_rest: Vec::with_capacity(per_rest * count),
+        positions: Vec::with_capacity(3 * reserve),
+        scales: Vec::with_capacity(3 * reserve),
+        rotations: Vec::with_capacity(4 * reserve),
+        opacities: Vec::with_capacity(reserve),
+        sh_dc: Vec::with_capacity(3 * reserve),
+        sh_rest: Vec::with_capacity(per_rest * reserve),
         sh_degree: plan.sh_degree,
         bounds: crate::Bounds::default(),
         asset: SplatScene::asset_ref([0u8; 32]),
@@ -512,7 +544,9 @@ pub fn import_ply(bytes: &[u8]) -> Result<SplatScene, SplatError> {
             .extend_from_slice(&[fx as f32, fz as f32, -fy as f32]);
 
         for slot in plan.scale {
-            scene.scales.push(get(slot)?.exp() as f32);
+            // `f32`, through `es_math::approx::exp` (see `sigmoid` above): the same
+            // determinism reason applies to every activation that feeds `asset_hash`.
+            scene.scales.push(es_math::approx::exp(get(slot)? as f32));
         }
 
         // File order is wxyz and unnormalised; store xyzw, unit, `w >= 0` (spec 3.1).
@@ -613,9 +647,10 @@ impl SplatScene {
             put(logit(self.opacities[i]), &mut out);
             for c in 0..3 {
                 // A non-positive standard deviation has no logarithm; clamp rather than
-                // write a NaN that no reader could interpret.
-                let s = f64::from(self.scales[3 * i + c]).max(f64::from(f32::MIN_POSITIVE));
-                put(s.ln() as f32, &mut out);
+                // write a NaN that no reader could interpret. `f32`, through
+                // `es_math::approx::ln` — see `sigmoid`'s doc comment for why.
+                let s = self.scales[3 * i + c].max(f32::MIN_POSITIVE);
+                put(es_math::approx::ln(s), &mut out);
             }
             let (qx, qy, qz, qw) = (
                 self.rotations[4 * i],
@@ -629,5 +664,44 @@ impl SplatScene {
             put(qy, &mut out);
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod reserve_tests {
+    use super::*;
+
+    /// P-M3-R3's oracle in miniature: a ~1 MB ascii file declaring 500,000 vertices at the
+    /// full SH-degree-3 property count (59 properties) must not reserve anywhere near the
+    /// ~118 MB the pre-fix `3 * count` / `per_rest * count` calls would have asked for — six
+    /// `f32` arrays sized off `reserve`, 59 slots per vertex in the worst case (every
+    /// property lands in a distinct array), must stay under 8 MB total.
+    #[test]
+    fn ascii_reserve_is_bounded_by_file_size_not_declared_count() {
+        let count = 500_000;
+        let available = 1_000_000;
+        let props = 59;
+        let reserve = reserve_count(Format::Ascii, props, 0, count, available);
+        assert!(
+            reserve < count / 10,
+            "reserve {reserve} barely below {count}"
+        );
+        let worst_case_bytes = reserve * props * std::mem::size_of::<f32>();
+        assert!(
+            worst_case_bytes < 8_000_000,
+            "reserve {reserve} implies {worst_case_bytes} bytes, expected < 8 MB"
+        );
+    }
+
+    /// The binary path was already bounded by the `Truncated` check before this fix (the
+    /// review's own finding), so this pins that `reserve_count` does not regress it: a wildly
+    /// over-declared `count` still caps at what `available / stride` full records fit.
+    #[test]
+    fn binary_reserve_is_bounded_by_stride() {
+        let stride = 4 * 62;
+        let available = 1_000_000;
+        let count = available / stride + 1_000_000;
+        let reserve = reserve_count(Format::BinaryLe, 0, stride, count, available);
+        assert_eq!(reserve, available / stride);
     }
 }

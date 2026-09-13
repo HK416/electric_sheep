@@ -43,6 +43,7 @@ end_header
 | `f_rest_0..44` | 45 | SH degrees 1..3, **channel-major**: 15 coefficients for R, then 15 for G, then 15 for B | none (kept as stored; see the caveat below) | `unverified` |
 | `opacity` | 1 | **logit** of alpha | `alpha = sigmoid(opacity)` | `unverified` |
 | `scale_0..2` | 3 | **natural log** of the per-axis standard deviation, in the Gaussian's *own* frame | `sigma = exp(scale_i)`; no axis fix — these are local-frame extents, not world directions | `unverified` |
+| — | — | — | `exp`/`ln`/`sigmoid`/`logit` above run through `es_math::approx` (`f32`, ULP-bounded, not IEEE-correctly-rounded) rather than the host `libm`, because they feed `SplatScene::asset_hash` (§5.3) and must give the same bits on every machine (§3.2/§3.4). See `docs/design/splat-real2sim.md` §1.1 for the accuracy consequence. | — |
 | `rot_0..3` | 4 | Quaternion **wxyz**, stored **unnormalised** (the trainer normalises at render time) | normalise, reorder to §3.1 xyzw with `w >= 0`, then apply the axis fix | `unverified` |
 
 `f_rest` length depends on the trained SH degree: `3 * ((d+1)^2 - 1)` = 0 / 9 / 24 / 45 for

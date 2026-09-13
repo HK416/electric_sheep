@@ -164,6 +164,69 @@ fn malformed_input_is_a_typed_error() {
     ));
 }
 
+/// P-M3-R3's oracle: a hostile ascii header can declare far more vertices than the file has
+/// room for. Before the fix, the six `SplatScene` array reserves were sized off the declared
+/// `count` alone, so this ~1 MB file (500,000 one-token lines against a 59-property header)
+/// asked for roughly 118 MB before the very first line's field count was even checked.
+#[test]
+fn a_hostile_ascii_header_does_not_amplify_the_reserve() {
+    const N: usize = 500_000;
+    let mut names = vec!["x".to_owned(), "y".to_owned(), "z".to_owned()];
+    names.extend((0..3).map(|i| format!("f_dc_{i}")));
+    names.extend((0..45).map(|i| format!("f_rest_{i}")));
+    names.push("opacity".to_owned());
+    names.extend((0..3).map(|i| format!("scale_{i}")));
+    names.extend((0..4).map(|i| format!("rot_{i}")));
+
+    let mut text = format!("ply\nformat ascii 1.0\nelement vertex {N}\n");
+    for name in &names {
+        use std::fmt::Write as _;
+        writeln!(text, "property float {name}").expect("write to String cannot fail");
+    }
+    text.push_str("end_header\n");
+    for _ in 0..N {
+        text.push_str("0\n");
+    }
+    assert!(
+        (900_000..1_100_000).contains(&text.len()),
+        "fixture should be about 1 MB, got {}",
+        text.len()
+    );
+
+    let before = es_core::alloc_count::allocation_count();
+    let err = import_ply(text.as_bytes()).unwrap_err();
+    let allocations = es_core::alloc_count::allocation_count() - before;
+
+    assert!(
+        matches!(
+            err,
+            SplatError::BadFieldCount {
+                vertex: 0,
+                found: 1,
+                expected: 59,
+            }
+        ),
+        "{err}"
+    );
+    // `allocation_count` counts calls, not bytes, so it cannot pin the "under 8 MB" bound by
+    // itself — that is pinned directly against the reserve formula in
+    // `ply::reserve_tests::ascii_reserve_is_bounded_by_file_size_not_declared_count`. What it
+    // catches here is the other half of the regression: an unbounded reserve would still be
+    // one `Vec::with_capacity` call each (cheap in count, catastrophic in bytes), but a
+    // reserve that silently fell back to *no* upfront reserve would instead show up as an
+    // allocation per `push`/`extend_from_slice` scaling with the header's declared count —
+    // header parsing plus the six array reserves is on the order of a hundred calls, not
+    // hundreds of thousands.
+    assert!(
+        es_core::alloc_count::counting_enabled(),
+        "the alloc-count feature must be enabled for this assertion to mean anything"
+    );
+    assert!(
+        allocations < 1_000,
+        "unexpectedly many allocations: {allocations}"
+    );
+}
+
 #[test]
 fn a_non_finite_value_is_rejected_rather_than_poisoning_the_hash() {
     let text = "ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\n\
@@ -257,6 +320,42 @@ fn similarity_fit_refuses_degenerate_input() {
     assert!(matches!(
         Similarity::fit(&p[..3], &p[..4]).unwrap_err(),
         SplatError::PointCountMismatch { src: 3, dst: 4 }
+    ));
+}
+
+/// P-M3-R6's oracle: four points on a line give a rotation that is fixed about the line but
+/// arbitrary around it — an error, not the silent identity-adjacent rotation the pre-fix code
+/// returned (the doc at `Similarity::fit` already promised this; the check was missing).
+#[test]
+fn similarity_fit_refuses_collinear_input() {
+    let p = vec![
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec3::new(2.0, 0.0, 0.0),
+        Vec3::new(3.0, 0.0, 0.0),
+    ];
+    assert!(matches!(
+        Similarity::fit(&p, &p).unwrap_err(),
+        SplatError::DegenerateFit
+    ));
+
+    // Collinear but not axis-aligned, and `dst` a different (still collinear) line: the
+    // check must not be a special case of "src equals dst" or "src is along an axis".
+    let src = vec![
+        Vec3::new(0.0, 0.0, 0.0),
+        Vec3::new(1.0, 2.0, 3.0),
+        Vec3::new(2.0, 4.0, 6.0),
+        Vec3::new(-1.0, -2.0, -3.0),
+    ];
+    let dst = vec![
+        Vec3::new(5.0, 0.0, 0.0),
+        Vec3::new(5.0, 1.0, 0.0),
+        Vec3::new(5.0, 2.0, 0.0),
+        Vec3::new(5.0, -1.0, 0.0),
+    ];
+    assert!(matches!(
+        Similarity::fit(&src, &dst).unwrap_err(),
+        SplatError::DegenerateFit
     ));
 }
 
