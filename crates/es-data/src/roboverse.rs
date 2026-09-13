@@ -223,6 +223,11 @@ pub enum ConvertError {
     Json(#[from] serde_json::Error),
     #[error("no robots declared")]
     NoRobots,
+    /// It divides the episode length into `limit_s` and lands in `TaskConfig`, so a `0.0`,
+    /// a negative or a non-finite rate puts `+inf`/`NaN` into the Task IR and into
+    /// `task_hash` (`CanonWriter` rejects `NaN`, but only much later and as an IR error).
+    #[error("control_rate_hz must be finite and greater than 0, got {0}")]
+    ControlRate(f32),
     #[error("IR construction failed: {0}")]
     Ir(String),
 }
@@ -592,13 +597,17 @@ pub fn convert(task: &RoboVerseTask) -> Result<Converted, ConvertError> {
     let mut channels: BTreeMap<String, ObsChannel> = BTreeMap::new();
     let mut rng_streams: BTreeSet<String> = BTreeSet::new();
 
-    let control_rate_hz = task.control_rate_hz.unwrap_or_else(|| {
-        warnings.push(format!(
-            "no control_rate_hz given; assuming {DEFAULT_CONTROL_RATE_HZ} Hz \
-             (docs/api-notes/roboverse.md: unverified)"
-        ));
-        DEFAULT_CONTROL_RATE_HZ
-    });
+    let control_rate_hz = match task.control_rate_hz {
+        Some(hz) if hz.is_finite() && hz > 0.0 => hz,
+        Some(hz) => return Err(ConvertError::ControlRate(hz)),
+        None => {
+            warnings.push(format!(
+                "no control_rate_hz given; assuming {DEFAULT_CONTROL_RATE_HZ} Hz \
+                 (docs/api-notes/roboverse.md: unverified)"
+            ));
+            DEFAULT_CONTROL_RATE_HZ
+        }
+    };
 
     for robot in &task.robots {
         match robot.asset.resolve() {

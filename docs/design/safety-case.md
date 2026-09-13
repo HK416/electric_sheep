@@ -138,10 +138,18 @@ Stated here because spec 27.1 ends with a positioning warning and the CLI must n
 than it is.
 
 - **A signature is authentication, not endorsement.** `EvidenceBundle::sign` (M4, W7,
-  spec 25.1) adds a detached ed25519 signature over every entry's `(name, hash)` pair, and
+  spec 25.1) adds a detached ed25519 signature over the container, and
   `verify(bytes, against, trusted_keys)` reports `signature: Valid(key) | Invalid | Absent |
-  UntrustedKey`. `Valid` only means *the bytes the caller has are the bytes a `trusted_keys`
-  holder signed* -- it says nothing about whether that signer checked anything, and it is
+  UntrustedKey`. The signed message (scheme `ed25519-esb-v2`, P-M4-R2) is a `CanonWriter`
+  encoding of the scheme id, the manifest with only its own `signature` slot cleared -- so
+  `hashes`, the declared spec 5.3 chain, `kind`, `schema_version` and `signer_public_key` are
+  all covered -- and every entry's `(name, blake3(payload))` pair in sorted order, with a
+  length prefix on every string and blob. The first scheme (`v1`, M4 W7) signed only the
+  entries, so a signed bundle's manifest could be rewritten and still verify; because the
+  scheme id is inside the digest rather than in a manifest field, a `v1` signature now reports
+  `Invalid` -- this binary cannot vouch for a message it did not compute. `Valid` only means
+  *the bytes the caller has are the bytes a `trusted_keys` holder signed* -- it says nothing
+  about whether that signer checked anything, and it is
   still not part of [`VerifyReport::ok`]: whether a bundle is even required to carry a
   trusted signature is a caller policy (`es evidence verify --require-signature`), not a
   property of the bundle. `Absent` is what every bundle built before W7 still reports (a

@@ -2614,3 +2614,85 @@ fn import_usd_refuses_a_referenced_layer_by_prim_path() {
     assert!(err.contains("/World/robot"), "{err}");
     assert!(!out.exists(), "nothing is written on a refusal");
 }
+
+/// S-2 (docs/reviews/M4.md): the CLI must refuse a file over `es_usd::MAX_USDA_BYTES` by its
+/// metadata length, the same cap `parse_usda` enforces, rather than reading it fully into
+/// memory first.
+#[test]
+fn import_usd_refuses_an_oversized_file() {
+    let dir = scratch_dir("import-usd-oversized");
+    let huge = dir.join("huge.usda");
+    std::fs::write(&huge, vec![b'a'; es_usd::MAX_USDA_BYTES + 1]).expect("write huge fixture");
+    let out = dir.join("scene.json");
+    let run = bin()
+        .args(["import", "usd"])
+        .arg(&huge)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("run es import usd");
+    assert_eq!(run.status.code(), Some(1), "{}", stdout(&run));
+    let err = String::from_utf8_lossy(&run.stderr);
+    assert!(err.contains("cap"), "{err}");
+    assert!(!out.exists(), "nothing is written on a refusal");
+    let _ = std::fs::remove_file(&huge);
+}
+
+// --- signed-manifest tamper (P-M4-R2, review B-2) ------------------------------------------
+
+/// The signature must cover the manifest, not just the entries: rewriting the declared spec
+/// 5.3 chain on a signed bundle -- same entries, same key, same signature bytes -- must not
+/// still report `Valid`. It must also be caught unsigned, because `verify` now cross-checks
+/// the bundle's own `manifest.hashes` against its `chain.json`.
+#[test]
+fn evidence_verify_flags_a_rewritten_manifest_on_a_signed_bundle() {
+    let built = build_evidence(40.0);
+    let signing_key = SigningKey::from_bytes(&[7u8; 32]);
+    let signed = EvidenceBundle::sign(&built.bytes, &signing_key).expect("signs");
+    let raw = bundle::read(&signed).expect("reads");
+
+    let manifest = BundleManifest {
+        hashes: es_compile::bundle::BundleHashes {
+            task: Some([0xAB; 32]),
+            ..raw.manifest.hashes
+        },
+        ..raw.manifest
+    };
+    let rewritten = bundle::write(&manifest, &raw.entries).expect("writes");
+
+    let report =
+        EvidenceBundle::verify(&rewritten, None, &[signing_key.verifying_key()]).expect("verifies");
+    assert_eq!(report.signature, SignatureStatus::Invalid);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.code.as_str() == es_eval::evidence::EVID_CHAIN_SLOT),
+        "{:?}",
+        report.diagnostics
+    );
+    assert!(
+        !report.ok(),
+        "a manifest that contradicts chain.json is a defect"
+    );
+}
+
+/// S-9 (P-M4-S9-S10): a blocked RoboVerse conversion must leave no output behind -- the
+/// `severity: error` check now runs before the first `std::fs::write`, matching `import usd`.
+#[test]
+fn import_roboverse_writes_nothing_when_an_unmapped_item_blocks_it() {
+    let dir = scratch_dir("import-roboverse-nothing-written");
+    let task_json = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/roboverse/unknown_checker.json"
+    );
+    let out_dir = dir.join("out");
+
+    let out = bin()
+        .args(["import", "roboverse", task_json, "--out"])
+        .arg(&out_dir)
+        .output()
+        .expect("run es");
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(!out_dir.exists(), "nothing is written on a refusal");
+}

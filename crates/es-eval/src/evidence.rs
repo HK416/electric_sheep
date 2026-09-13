@@ -35,7 +35,7 @@ use es_compile::bundle::{
     BUNDLE_SCHEMA_VERSION, CHAIN, EVALUATION_LOCK, POLICY_BUNDLE, REPORT_JSON, SAFETY_CASE,
 };
 use es_ir::evaluation::EvaluationReport;
-use es_ir::hash::{ChangedComponent, HashChain};
+use es_ir::hash::{CanonWriter, ChangedComponent, HashChain};
 use es_ir::Diagnostic;
 use serde::{Deserialize, Serialize};
 
@@ -368,20 +368,46 @@ pub enum SignatureStatus {
     UntrustedKey([u8; 32]),
 }
 
-/// blake3 over every non-manifest entry's `(name, hash)` pair, in the sorted order a
-/// `BTreeMap` already gives them. This, not the container's own per-entry hashes, is what
-/// [`EvidenceBundle::sign`] and [`EvidenceBundle::verify`] exchange over ed25519: the manifest
-/// itself is never in `entries` (`bundle::read` parses it out separately), so a signature
-/// computed this way cannot be circular -- it authenticates every entry the signer saw,
-/// including a `signer_public_key` swap being impossible without invalidating it, without
-/// ever needing to hash itself.
-fn signing_digest(entries: &BTreeMap<String, Vec<u8>>) -> [u8; 32] {
-    let mut hasher = blake3::Hasher::new();
+/// Signature scheme id, mixed into [`signing_digest`] as a domain separator (spec 25.1).
+///
+/// `ed25519-esb-v1` (M4 W7) hashed only `name || blake3(payload)` per entry: the manifest was
+/// outside the signature, so `manifest.hashes` -- the declared spec 5.3 chain -- and
+/// `manifest.kind` could be rewritten on a signed bundle and it still verified; and with no
+/// length prefixes, `("ab", "c")` and `("a", "bc")` serialized alike. `v2` signs the whole
+/// manifest except the `signature` slot itself and length-prefixes every field.
+///
+/// The id lives *inside* the digest rather than in a new manifest field: a v1 signature
+/// therefore fails to verify under v2 and reports [`SignatureStatus::Invalid`], which is the
+/// honest answer -- this binary cannot vouch for a signature it did not compute the message
+/// for. That also means the container format is unchanged, so no `schema_version` bump.
+const SIGNATURE_SCHEME: &str = "ed25519-esb-v2";
+
+/// blake3 over the scheme id, the manifest minus its own `signature` slot, and every
+/// non-manifest entry's `(name, blake3(payload))` pair in the sorted order a `BTreeMap`
+/// already gives them. Encoded with [`CanonWriter`] (spec 5.3, Appendix B.6), so every string
+/// and blob carries a length prefix and no two different entry sets share a message.
+///
+/// The manifest goes in as canonical JSON rather than field by field on purpose: a field added
+/// to `BundleManifest` later is then signed automatically instead of being silently left out,
+/// which is exactly the failure this replaces. Clearing `signature` first is what keeps the
+/// digest from being circular; everything else -- `schema_version`, `kind`, `hashes`,
+/// `created_utc`, `signer_public_key` -- is covered, so a key swap or a rewritten chain slot
+/// invalidates the signature.
+fn signing_digest(manifest: &BundleManifest, entries: &BTreeMap<String, Vec<u8>>) -> [u8; 32] {
+    let unsigned = BundleManifest {
+        signature: None,
+        ..manifest.clone()
+    };
+    let mut w = CanonWriter::new();
+    w.str(SIGNATURE_SCHEME);
+    // `BundleManifest` is plain data: no map keys, no floats, so neither call can fail.
+    w.bytes(&canonical_json(&unsigned).expect("a manifest serializes"));
+    w.seq(entries.len());
     for (name, payload) in entries {
-        hasher.update(name.as_bytes());
-        hasher.update(blake3::hash(payload).as_bytes());
+        w.str(name);
+        w.digest(blake3::hash(payload).as_bytes());
     }
-    *hasher.finalize().as_bytes()
+    w.hash().expect("no float is encoded")
 }
 
 fn signature_status(
@@ -392,11 +418,12 @@ fn signature_status(
     let Some(sig_bytes) = manifest.signature.as_deref() else {
         return SignatureStatus::Absent;
     };
+    let digest = signing_digest(manifest, entries);
     let checked = manifest
         .signer_public_key
         .and_then(|pk| VerifyingKey::from_bytes(&pk).ok().zip(Some(pk)))
         .zip(Signature::from_slice(sig_bytes).ok())
-        .filter(|((vk, _), sig)| vk.verify(&signing_digest(entries), sig).is_ok());
+        .filter(|((vk, _), sig)| vk.verify(&digest, sig).is_ok());
     match checked {
         None => SignatureStatus::Invalid,
         Some(((vk, pk), _)) if trusted_keys.contains(&vk) => SignatureStatus::Valid(pk),
@@ -511,14 +538,20 @@ impl EvidenceBundle {
             }
             .into());
         }
-        let signature = signing_key.sign(&signing_digest(&raw.entries));
-        let manifest = BundleManifest {
+        // The message is the manifest as it will be written, so `verify` re-derives it from
+        // what it reads: same `schema_version`, same key, `signature` itself excluded.
+        let unsigned = BundleManifest {
             // A version-1 input is upgraded to the version that can carry a signature; a
             // version-2 one is already there.
             schema_version: BUNDLE_SCHEMA_VERSION,
-            signature: Some(Vec::from(signature.to_bytes())),
+            signature: None,
             signer_public_key: Some(signing_key.verifying_key().to_bytes()),
             ..raw.manifest
+        };
+        let signature = signing_key.sign(&signing_digest(&unsigned, &raw.entries));
+        let manifest = BundleManifest {
+            signature: Some(Vec::from(signature.to_bytes())),
+            ..unsigned
         };
         Ok(bundle::write(&manifest, &raw.entries)?)
     }
@@ -547,7 +580,19 @@ impl EvidenceBundle {
             .get(POLICY_BUNDLE)
             .ok_or(BundleError::MissingEntry(POLICY_BUNDLE))?;
         let policy = PolicyBundle::open(policy_bytes)?;
-        diagnostics.extend(chain_vs_manifest(&b.chain, &policy.manifest.hashes));
+        diagnostics.extend(chain_vs_manifest(
+            &b.chain,
+            &policy.manifest.hashes,
+            "the embedded policy bundle",
+        ));
+        // ... and the bundle's *own* manifest, which `build` fills from that policy bundle
+        // plus the chain's `runtime`/`dataset`. An unsigned bundle whose manifest disagrees
+        // with its `chain.json` is a rewritten manifest; a signed one cannot get this far.
+        diagnostics.extend(chain_vs_manifest(
+            &b.chain,
+            &b.manifest.hashes,
+            "this bundle's own manifest",
+        ));
 
         // 2. Every evidence edge points at an entry that is there and unchanged.
         for e in &b.case.evidence {
@@ -755,26 +800,32 @@ impl EvidenceBundle {
     }
 }
 
-/// The chain the runtime attested vs. what the deployment bundle sealed. `learning` and
-/// `policy` are warnings, not errors: the bundle hashes the declared graph, the runtime chain
-/// records what was actually loaded (`docs/design/safety-case.md` section 3).
-fn chain_vs_manifest(chain: &HashChain, m: &BundleHashes) -> Vec<Diagnostic> {
+/// The chain the runtime attested vs. what a manifest sealed — `source` names which one.
+/// `learning` and `policy` are warnings, not errors: the bundle hashes the declared graph, the
+/// runtime chain records what was actually loaded (`docs/design/safety-case.md` section 3).
+/// Slots the manifest leaves `None` are slots it does not claim, so they are skipped: a
+/// deployment bundle fills neither `runtime` nor `dataset`.
+fn chain_vs_manifest(chain: &HashChain, m: &BundleHashes, source: &str) -> Vec<Diagnostic> {
     let mut out = Vec::new();
+    let mut disagrees = |slot: &str| {
+        out.push(Diagnostic::new(
+            EVID_CHAIN_SLOT,
+            format!("chain.json's \"{slot}\" hash is not the one {source} records (spec 5.3)"),
+        ));
+    };
     for (slot, want, got) in [
         ("task", m.task, chain.task),
         ("observation", m.observation, chain.observation),
         ("deployment", m.deployment, chain.deployment),
         ("compiler", m.compiler, chain.compiler),
+        ("runtime", m.runtime, chain.runtime),
     ] {
         if want.is_some_and(|w| w != got) {
-            out.push(Diagnostic::new(
-                EVID_CHAIN_SLOT,
-                format!(
-                    "chain.json's \"{slot}\" hash is not the one the embedded policy bundle \
-                     records (spec 5.3)"
-                ),
-            ));
+            disagrees(slot);
         }
+    }
+    if m.dataset.is_some_and(|d| d != chain.dataset) {
+        disagrees("dataset");
     }
     out
 }
@@ -954,6 +1005,133 @@ mod tests {
         assert!(!invalidated_by(EvidenceKind::HumanReview).contains(&C::Policy));
         // A golden is a claim about the pipeline, not about the weights.
         assert!(!invalidated_by(EvidenceKind::GoldenTest).contains(&C::Dataset));
+    }
+
+    // --- signing (P-M4-R2, review B-2) ----------------------------------------------------
+
+    fn manifest() -> BundleManifest {
+        BundleManifest::new(
+            BundleKind::Evidence,
+            BundleHashes {
+                task: Some([3u8; 32]),
+                ..BundleHashes::default()
+            },
+        )
+    }
+
+    fn entries(pairs: &[(&str, &str)]) -> BTreeMap<String, Vec<u8>> {
+        pairs
+            .iter()
+            .map(|(n, p)| ((*n).to_owned(), (*p).as_bytes().to_vec()))
+            .collect()
+    }
+
+    fn key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    /// Sign a `(manifest, entries)` pair the way [`EvidenceBundle::sign`] does, without
+    /// building a whole container -- the container round trip is asserted in
+    /// `crates/es/tests/cli.rs`.
+    fn signed(m: &BundleManifest, e: &BTreeMap<String, Vec<u8>>) -> BundleManifest {
+        let unsigned = BundleManifest {
+            signature: None,
+            signer_public_key: Some(key().verifying_key().to_bytes()),
+            ..m.clone()
+        };
+        BundleManifest {
+            signature: Some(Vec::from(
+                key().sign(&signing_digest(&unsigned, e)).to_bytes(),
+            )),
+            ..unsigned
+        }
+    }
+
+    fn status(m: &BundleManifest, e: &BTreeMap<String, Vec<u8>>) -> SignatureStatus {
+        signature_status(m, e, &[key().verifying_key()])
+    }
+
+    /// B-2: the manifest was outside the signature, so `hashes` (the declared spec 5.3 chain)
+    /// and `kind` could be rewritten on a signed bundle and it still verified.
+    #[test]
+    fn the_signature_covers_every_manifest_field_but_the_signature() {
+        let e = entries(&[("chain.json", "1"), ("safety_case/case.json", "2")]);
+        let m = signed(&manifest(), &e);
+        assert_eq!(
+            status(&m, &e),
+            SignatureStatus::Valid(key().verifying_key().to_bytes())
+        );
+
+        // Same entries, same key, same signature bytes -- only the manifest changed.
+        let rewritten = [
+            BundleManifest {
+                hashes: BundleHashes {
+                    task: Some([9u8; 32]),
+                    ..m.hashes
+                },
+                ..m.clone()
+            },
+            BundleManifest {
+                kind: BundleKind::Policy,
+                ..m.clone()
+            },
+            BundleManifest {
+                schema_version: m.schema_version + 1,
+                ..m.clone()
+            },
+            BundleManifest {
+                created_utc: Some("2026-01-01T00:00:00Z".to_owned()),
+                ..m.clone()
+            },
+            BundleManifest {
+                signer_public_key: Some(
+                    SigningKey::from_bytes(&[9u8; 32])
+                        .verifying_key()
+                        .to_bytes(),
+                ),
+                ..m.clone()
+            },
+        ];
+        for bad in rewritten {
+            assert_eq!(status(&bad, &e), SignatureStatus::Invalid, "{bad:?}");
+        }
+    }
+
+    /// The other half of B-2: `name || blake3(payload)` with no length prefix let two
+    /// different entry sets serialize identically. `CanonWriter` prefixes both.
+    #[test]
+    fn a_name_payload_split_shift_changes_the_digest() {
+        let m = manifest();
+        assert_ne!(
+            signing_digest(&m, &entries(&[("ab", "c")])),
+            signing_digest(&m, &entries(&[("a", "bc")]))
+        );
+        // The entry count is in the message too, so entries cannot be merged or split away.
+        assert_ne!(
+            signing_digest(&m, &entries(&[("a", "x"), ("b", "x")])),
+            signing_digest(&m, &entries(&[("a", "x")]))
+        );
+    }
+
+    /// A v1 signature (`blake3` of `name || hash`, no manifest, no prefixes) does not verify
+    /// under `ed25519-esb-v2`: the scheme id is inside the digest, so the honest report is
+    /// `Invalid` rather than a silent pass. Documented in `docs/design/safety-case.md` 6.
+    #[test]
+    fn a_v1_signature_is_invalid_under_v2() {
+        let e = entries(&[("chain.json", "1")]);
+        let mut hasher = blake3::Hasher::new();
+        for (name, payload) in &e {
+            hasher.update(name.as_bytes());
+            hasher.update(blake3::hash(payload).as_bytes());
+        }
+        let v1 = BundleManifest {
+            signature: Some(Vec::from(
+                key().sign(hasher.finalize().as_bytes()).to_bytes(),
+            )),
+            signer_public_key: Some(key().verifying_key().to_bytes()),
+            ..manifest()
+        };
+        assert_eq!(status(&v1, &e), SignatureStatus::Invalid);
     }
 
     #[test]

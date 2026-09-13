@@ -174,7 +174,8 @@ Prints every non-fatal warning, every unmapped item (spec 14.4: an unrecognized 
 asset shape is reported, not silently dropped), and both IR content hashes.
 
 Exit code: 0 on success, 1 on a ConvertError, an I/O error, or an unmapped item with
-severity = error (spec 14.4: unmapped items block execution), 2 on a usage error.
+severity = error (spec 14.4: unmapped items block execution), 2 on a usage error. On a
+refusal nothing is written -- the check runs before the first file.
 ";
 
 #[derive(Serialize)]
@@ -223,6 +224,18 @@ fn roboverse_import(args: &[String]) -> Result<u8, CliError> {
         println!("unmapped ({:?}): {}", u.severity, u.item);
     }
 
+    // spec 14.4: an `Error`-severity unmapped item blocks the import. Decided *before* any
+    // artifact is written, so a refusal leaves no complete-looking output directory behind
+    // (`usd_import` below has the same contract).
+    if converted
+        .unmapped
+        .iter()
+        .any(|u| u.severity == roboverse::Severity::Error)
+    {
+        eprintln!("error: unmapped items block this conversion; nothing was written");
+        return Ok(1);
+    }
+
     let task_hash = converted
         .task
         .task_hash()
@@ -254,12 +267,7 @@ fn roboverse_import(args: &[String]) -> Result<u8, CliError> {
 
     println!("task_hash: {}", hex(&task_hash));
     println!("observation_hash: {}", hex(&obs_hash));
-
-    let blocked = converted
-        .unmapped
-        .iter()
-        .any(|u| u.severity == roboverse::Severity::Error);
-    Ok(u8::from(blocked))
+    Ok(0)
 }
 
 const USD_HELP: &str = "\
@@ -293,6 +301,19 @@ fn usd_import(args: &[String]) -> Result<u8, CliError> {
         }
     };
 
+    // S-2 (docs/reviews/M4.md): cap the read at the same size `es_usd::parse_usda` enforces,
+    // so a huge file is refused by its metadata length rather than fully read into memory
+    // first only to be rejected afterward.
+    let len = std::fs::metadata(&path)
+        .map_err(|e| CliError::Runtime(format!("{path}: {e}")))?
+        .len();
+    if len > es_usd::MAX_USDA_BYTES as u64 {
+        eprintln!(
+            "error: {path}: file is {len} bytes, over the {}-byte cap",
+            es_usd::MAX_USDA_BYTES
+        );
+        return Ok(1);
+    }
     let text =
         std::fs::read_to_string(&path).map_err(|e| CliError::Runtime(format!("{path}: {e}")))?;
     let (scene, warnings) = match es_physics_core::usd::import_usda(&text) {

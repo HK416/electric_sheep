@@ -207,3 +207,36 @@ fn task_hash_and_observation_hash_are_stable_across_runs() {
         b.observation.observation_hash().unwrap()
     );
 }
+
+// --- `control_rate_hz` (P-M4-S9-S10, review S-10) -------------------------------------------
+
+fn reach_with_control_rate(v: serde_json::Value) -> Result<es_data::roboverse::Converted, String> {
+    let mut json: serde_json::Value = serde_json::from_str(REACH_JSON).expect("fixture parses");
+    json["control_rate_hz"] = v;
+    let task = RoboVerseTask::parse(&json.to_string()).expect("task parses");
+    convert(&task).map_err(|e| e.to_string())
+}
+
+/// `control_rate_hz` divides the episode length into the `Terminate(Timeout)` threshold and
+/// lands in `TaskConfig`, so a zero, a negative or a non-finite rate would put `+inf`/`NaN`
+/// into the Task IR and into `task_hash`. It must be refused at the conversion boundary.
+#[test]
+fn a_nonpositive_or_nonfinite_control_rate_is_a_convert_error() {
+    for bad in [serde_json::json!(0.0), serde_json::json!(-30.0)] {
+        let err = reach_with_control_rate(bad.clone()).expect_err(&format!("{bad} is refused"));
+        assert!(err.contains("control_rate_hz"), "{err}");
+    }
+    // Non-finite cannot arrive through JSON (`serde_json` refuses it as "number out of
+    // range"), but `RoboVerseTask` is public and can be built in memory, so the guard is at
+    // the conversion boundary rather than in the parser.
+    let mut task = RoboVerseTask::parse(REACH_JSON).expect("task parses");
+    for bad in [f32::NAN, f32::INFINITY] {
+        task.control_rate_hz = Some(bad);
+        assert!(convert(&task).is_err(), "{bad} is refused");
+    }
+
+    // The neighbouring good value still converts, and a missing one still defaults.
+    assert!(reach_with_control_rate(serde_json::json!(30.0)).is_ok());
+    task.control_rate_hz = None;
+    assert!(convert(&task).is_ok());
+}
