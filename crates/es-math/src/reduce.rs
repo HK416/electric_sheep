@@ -34,6 +34,21 @@ pub trait DeterministicAcc<T>: Default + Clone {
 /// argument lapses. Raising `K` buys range; lowering `W` buys term budget.
 const W: i32 = 26;
 
+/// Deposits before the exactness argument lapses.
+///
+/// One deposit adds less than `2^W` quanta to a bin (a slice is smaller than the bin's top
+/// boundary, which is `2^W` times its quantum), and a bin stays exact while it holds fewer
+/// than `2^53` quanta — so `2^53 / 2^W = 2^(53 - W)` deposits, `2^27` at `W = 26`. The
+/// ceiling is on the whole reduction: `merge` adds bin contents *and* term counts, so
+/// splitting the work across accumulators does not buy more budget.
+const MAX_TERMS: u32 = 1 << (53 - W);
+
+/// Poison bits. A non-finite input is recorded here, never in the bins, so a later rescale
+/// cannot drop it and `merge` can combine two states with a commutative, idempotent `|`.
+const POISON_POS_INF: u8 = 1;
+const POISON_NEG_INF: u8 = 2;
+const POISON_NAN: u8 = 4;
+
 /// Binned / RFA accumulator in the Demmel–Nguyen sense (spec §18.4, signature from
 /// Appendix B.8).
 ///
@@ -44,6 +59,10 @@ const W: i32 = 26;
 pub struct BinnedAcc<const K: usize = 3> {
     bins: [f64; K],
     index: Option<i32>,
+    /// Non-finite inputs seen so far, as `POISON_*` bits — outside the bin array on purpose.
+    poison: u8,
+    /// Deposits so far, for the [`MAX_TERMS`] ceiling. Saturating, so it cannot wrap.
+    terms: u32,
 }
 
 impl<const K: usize> Default for BinnedAcc<K> {
@@ -51,6 +70,8 @@ impl<const K: usize> Default for BinnedAcc<K> {
         Self {
             bins: [0.0; K],
             index: None,
+            poison: 0,
+            terms: 0,
         }
     }
 }
@@ -110,6 +131,22 @@ impl<const K: usize> BinnedAcc<K> {
             Some(_) => {}
         }
     }
+
+    /// Books `n` deposits against the exactness ceiling.
+    fn count(&mut self, n: u32) {
+        self.terms = self.terms.saturating_add(n);
+        debug_assert!(
+            self.terms <= MAX_TERMS,
+            "BinnedAcc term ceiling exceeded: {} deposits > 2^{} (docs/design/deterministic-reduce.md)",
+            self.terms,
+            53 - W
+        );
+    }
+
+    #[cfg(test)]
+    fn set_terms_for_test(&mut self, terms: u32) {
+        self.terms = terms;
+    }
 }
 
 impl<const K: usize> DeterministicAcc<f64> for BinnedAcc<K> {
@@ -118,12 +155,17 @@ impl<const K: usize> DeterministicAcc<f64> for BinnedAcc<K> {
             return;
         }
         if !v.is_finite() {
-            // Poison: infinities and NaN propagate through merge and finish. Reproducibility
-            // is only claimed for finite inputs.
-            self.bins[0] += v;
-            self.rescale_to(0);
+            // Poison, recorded before any bin arithmetic so no rescale can lose it.
+            self.poison |= if v.is_nan() {
+                POISON_NAN
+            } else if v > 0.0 {
+                POISON_POS_INF
+            } else {
+                POISON_NEG_INF
+            };
             return;
         }
+        self.count(1);
         self.rescale_to(index_for(v));
         let index = self.index.unwrap_or(0);
         let mut r = v;
@@ -136,11 +178,15 @@ impl<const K: usize> DeterministicAcc<f64> for BinnedAcc<K> {
     }
 
     fn merge(&mut self, other: &Self) {
+        // Both are commutative and associative, and both must survive an empty other side.
+        self.poison |= other.poison;
+        self.count(other.terms);
         let Some(other_index) = other.index else {
             return;
         };
         let Some(index) = self.index else {
-            *self = *other;
+            self.bins = other.bins;
+            self.index = other.index;
             return;
         };
         let mut other = *other;
@@ -155,6 +201,19 @@ impl<const K: usize> DeterministicAcc<f64> for BinnedAcc<K> {
     }
 
     fn finish(&self) -> f64 {
+        // Poison first, matching IEEE `sum`: NaN dominates, +Inf with -Inf is NaN, and a lone
+        // infinity dominates every finite term.
+        if self.poison != 0 {
+            let both = POISON_POS_INF | POISON_NEG_INF;
+            if self.poison & POISON_NAN != 0 || self.poison & both == both {
+                return f64::NAN;
+            }
+            return if self.poison & POISON_POS_INF != 0 {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            };
+        }
         // Fixed order, smallest bin first: the only rounding in the algorithm, and a pure
         // function of the bin contents.
         self.bins.iter().rev().sum()
@@ -217,6 +276,26 @@ mod tests {
         )
     }
 
+    /// `NaN` / `±Inf` mixed with subnormals and normals: the poison case that used to be
+    /// order-dependent (`P-M0-R1`).
+    fn poisoned_values() -> impl Strategy<Value = Vec<f64>> {
+        prop::collection::vec(
+            prop_oneof![
+                Just(f64::NAN),
+                Just(f64::INFINITY),
+                Just(f64::NEG_INFINITY),
+                Just(f64::MIN_POSITIVE),
+                Just(-f64::MIN_POSITIVE),
+                // Smallest subnormal, both signs.
+                Just(f64::from_bits(1)),
+                Just(-f64::from_bits(1)),
+                -1.0..1.0f64,
+                -1e12..1e12f64,
+            ],
+            1..64,
+        )
+    }
+
     proptest! {
         #[test]
         fn permutation_is_bit_identical(v in values(), seed in 1u64..u64::MAX) {
@@ -255,6 +334,22 @@ mod tests {
             right.merge(&yz);
 
             prop_assert_eq!(left.finish().to_bits(), right.finish().to_bits());
+        }
+
+        /// Non-finite inputs must be as order-independent as finite ones: the poison state is
+        /// what `finish` reports, and it is a function of the multiset, not of the order.
+        #[test]
+        fn poisoned_permutation_is_bit_identical(v in poisoned_values(), seed in 1u64..u64::MAX) {
+            prop_assert_eq!(sum_in_order(&v), sum_in_order(&shuffled(&v, seed)));
+        }
+
+        #[test]
+        fn poisoned_split_merge_tree_is_bit_identical(
+            v in poisoned_values(),
+            seed in 1u64..u64::MAX,
+        ) {
+            let mut s = seed;
+            prop_assert_eq!(sum_in_order(&v), sum_by_tree(&v, &mut s).finish().to_bits());
         }
 
         /// Within the covered range the result must still be a good sum, not just a stable one.
@@ -307,10 +402,64 @@ mod tests {
     }
 
     #[test]
-    fn non_finite_poisons() {
+    fn non_finite_poisons_whatever_the_order() {
+        let nan = |vs: &[f64]| f64::from_bits(sum_in_order(vs)).is_nan();
+        let sum = |vs: &[f64]| f64::from_bits(sum_in_order(vs));
+
+        assert!(nan(&[1.0, f64::NAN]) && nan(&[f64::NAN, 1.0]));
+        // The regression: a tiny earlier value made the rescale swallow the poison.
+        assert!(nan(&[1e-300, f64::NAN]) && nan(&[f64::NAN, 1e-300]));
+        // IEEE `sum` semantics: Inf + (-Inf) is NaN, in either order.
+        assert!(nan(&[f64::INFINITY, f64::NEG_INFINITY]));
+        assert!(nan(&[f64::NEG_INFINITY, 1e-300, f64::INFINITY]));
+        // NaN dominates a lone infinity; a lone infinity dominates the finite terms.
+        assert!(nan(&[f64::INFINITY, f64::NAN]) && nan(&[f64::NAN, f64::INFINITY]));
+        assert_eq!(sum(&[1.0, f64::INFINITY]), f64::INFINITY);
+        assert_eq!(sum(&[f64::INFINITY, 1.0]), f64::INFINITY);
+        assert_eq!(sum(&[1e300, f64::NEG_INFINITY]), f64::NEG_INFINITY);
+    }
+
+    #[test]
+    fn poison_survives_a_merge_from_either_side() {
+        let poisoned = {
+            let mut a = Acc::default();
+            a.add(f64::NAN);
+            a
+        };
+        let mut finite = Acc::default();
+        finite.add(1.0);
+
+        let mut left = finite;
+        left.merge(&poisoned);
+        let mut right = poisoned;
+        right.merge(&finite);
+        assert!(left.finish().is_nan() && right.finish().is_nan());
+
+        // An empty accumulator must pick the poison up too.
+        let mut empty = Acc::default();
+        empty.merge(&poisoned);
+        assert!(empty.finish().is_nan());
+    }
+
+    /// The exactness ceiling is a `debug_assert`, so this only fires in a debug build.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "term ceiling")]
+    fn depositing_past_the_term_ceiling_trips_the_assert() {
         let mut acc = Acc::default();
+        // Cheap path to the ceiling: 2^27 real deposits would take minutes.
+        acc.set_terms_for_test(MAX_TERMS);
         acc.add(1.0);
-        acc.add(f64::NAN);
-        assert!(acc.finish().is_nan());
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "term ceiling")]
+    fn merging_past_the_term_ceiling_trips_the_assert() {
+        let mut a = Acc::default();
+        let mut b = Acc::default();
+        a.set_terms_for_test(MAX_TERMS);
+        b.set_terms_for_test(1);
+        a.merge(&b);
     }
 }

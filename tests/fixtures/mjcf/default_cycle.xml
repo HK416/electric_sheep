@@ -1,0 +1,13 @@
+<!-- P-M0-R3: a nested <default> that re-declares its own enclosing class. Accepted, it would
+     make `a` its own parent and any element with class="a" would walk that chain forever. -->
+<mujoco model="default_cycle">
+  <default class="a">
+    <geom size="0.1"/>
+    <default class="a">
+      <geom size="0.2"/>
+    </default>
+  </default>
+  <worldbody>
+    <geom class="a" type="sphere"/>
+  </worldbody>
+</mujoco>

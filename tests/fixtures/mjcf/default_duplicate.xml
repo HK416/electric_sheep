@@ -1,0 +1,21 @@
+<!-- P-M0-R3: the same class name declared twice. The second declaration used to overwrite the
+     first one's parent link while merging its attributes, losing the first inheritance
+     silently. MuJoCo rejects duplicate class names, and so do we. -->
+<mujoco model="default_duplicate">
+  <default>
+    <default class="base">
+      <geom size="0.1"/>
+    </default>
+    <default class="x">
+      <geom size="0.2"/>
+    </default>
+  </default>
+  <default>
+    <default class="x">
+      <geom size="0.3"/>
+    </default>
+  </default>
+  <worldbody>
+    <geom class="x" type="sphere"/>
+  </worldbody>
+</mujoco>

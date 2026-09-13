@@ -22,7 +22,7 @@ mod attrs;
 mod elements;
 mod orient;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use es_core::StableId;
 use es_math::units::DEG_TO_RAD;
@@ -84,6 +84,14 @@ pub enum MjcfError {
     },
     #[error("line {line}: unknown default class `{class}`")]
     UnknownClass { line: u32, class: String },
+    /// A second `<default class="x">`. `MuJoCo` rejects these; silently merging them would
+    /// drop the first declaration's parent link without a diagnostic.
+    #[error("line {line}: duplicate default class `{class}`")]
+    DuplicateClass { line: u32, class: String },
+    /// Backstop for a class whose parent chain does not terminate. `parse_default` builds a
+    /// forest, so this is unreachable from a parsed file — it guards the walk itself.
+    #[error("line {line}: default class `{class}` is part of a parent cycle")]
+    ClassCycle { line: u32, class: String },
     #[error("line {line}: unsupported eulerseq `{seq}`")]
     BadEulerSeq { line: u32, seq: String },
     /// The file parsed but the scene it describes is malformed — duplicate names, for one.
@@ -165,6 +173,8 @@ pub(crate) struct Parser<'a> {
     doc: &'a Document<'a>,
     compiler: Compiler,
     classes: BTreeMap<&'a str, Class<'a>>,
+    /// Class names already declared by a `<default>`, to reject a second declaration.
+    declared: BTreeSet<&'a str>,
     pub(crate) scene: SceneDesc,
     pub(crate) warnings: Vec<Warning>,
     pub(crate) names: Names,
@@ -215,6 +225,7 @@ impl<'a> Parser<'a> {
             doc,
             compiler: Compiler::default(),
             classes,
+            declared: BTreeSet::from(["main"]),
             scene: SceneDesc::default(),
             warnings: Vec::new(),
             names: Names::default(),
@@ -303,6 +314,14 @@ impl<'a> Parser<'a> {
                     class: name.to_owned(),
                 })?;
             chain.push(def);
+            // A chain longer than the class table has revisited a class: bail instead of
+            // walking a cycle forever. MJCF is untrusted input.
+            if chain.len() > self.classes.len() {
+                return Err(MjcfError::ClassCycle {
+                    line,
+                    class: class.to_owned(),
+                });
+            }
             cursor = def.parent;
         }
         let mut merged = BTreeMap::new();
@@ -433,6 +452,18 @@ impl<'a> Parser<'a> {
         parent: Option<&'a str>,
     ) -> Result<(), MjcfError> {
         let name = node.attribute("class").unwrap_or("main");
+        // `main` is the implicit root class, so repeated top-level <default> sections merge
+        // into it. Everything else must be declared once: that makes the class graph a forest
+        // (a nested <default> can only name a class no ancestor has used), which is what keeps
+        // `resolve` from walking a cycle. An unnamed *nested* <default> would take the name
+        // `main` and so make the root its own descendant — it is rejected here as a duplicate.
+        let is_root_main = parent.is_none() && name == "main";
+        if !is_root_main && !self.declared.insert(name) {
+            return Err(MjcfError::DuplicateClass {
+                line: self.line(node),
+                class: name.to_owned(),
+            });
+        }
         // A top-level unnamed <default> *is* the main class; a named one derives from it.
         let parent = if name == "main" {
             None
@@ -837,6 +868,77 @@ mod tests {
             parse_str(xml).unwrap_err(),
             MjcfError::Scene(crate::scene::SceneError::DuplicateId { .. })
         ));
+    }
+
+    /// Parses in a worker thread so a regression loops there instead of hanging the suite.
+    fn parse_bounded(xml: String) -> Result<Vec<Warning>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = parse_str(&xml)
+                .map(|import| import.warnings)
+                .map_err(|e| e.to_string());
+            let _ = tx.send(result);
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("parse did not finish within 5s")
+    }
+
+    fn fixture(name: &str) -> String {
+        let path = format!(
+            "{}/../../tests/fixtures/mjcf/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"))
+    }
+
+    #[test]
+    fn a_self_parenting_default_class_is_rejected_without_hanging() {
+        let err = parse_bounded(fixture("default_cycle.xml")).unwrap_err();
+        assert_eq!(err, "line 6: duplicate default class `a`");
+    }
+
+    #[test]
+    fn a_duplicate_default_class_is_rejected_without_hanging() {
+        let err = parse_bounded(fixture("default_duplicate.xml")).unwrap_err();
+        assert_eq!(err, "line 14: duplicate default class `x`");
+    }
+
+    #[test]
+    fn an_unnamed_nested_default_is_rejected() {
+        // It would otherwise be named `main` and become a descendant of its own root.
+        let err = parse_bounded(
+            "<mujoco>\n<default class=\"a\">\n<default>\n<geom size=\"1\"/>\n</default>\n</default>\n</mujoco>"
+                .to_owned(),
+        )
+        .unwrap_err();
+        assert_eq!(err, "line 3: duplicate default class `main`");
+    }
+
+    #[test]
+    fn repeated_top_level_defaults_still_merge_into_main() {
+        let xml = "<mujoco><default><geom type=\"box\"/></default>\
+                   <default><geom size=\"1 1 1\"/></default>\
+                   <worldbody><geom name=\"g\"/></worldbody></mujoco>";
+        let warnings = parse_bounded(xml.to_owned()).expect("main may be declared twice");
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
+    #[test]
+    fn a_cyclic_class_graph_cannot_loop_resolve() {
+        // `parse_default` cannot build this; the bound in `resolve` is the backstop.
+        let doc = Document::parse("<mujoco/>").unwrap();
+        let mut parser = Parser::new(&doc);
+        for (name, parent) in [("a", "b"), ("b", "a")] {
+            parser.classes.insert(
+                name,
+                Class {
+                    parent: Some(parent),
+                    attrs: BTreeMap::new(),
+                },
+            );
+        }
+        let err = parser.resolve("geom", "a", 1).unwrap_err();
+        assert!(matches!(err, MjcfError::ClassCycle { .. }), "{err}");
     }
 
     #[test]

@@ -25,6 +25,9 @@ pub trait DeterministicAcc<T>: Default + Clone {
 pub struct BinnedAcc<const K: usize = 3> { bins: [f64; K], index: Option<i32> }
 ```
 
+The implementation carries two more private, `Copy` fields — `poison: u8` and `terms: u32`
+(both below) — which the public signature does not show. The layout stays allocation-free.
+
 `index` is the bin index of the largest magnitude deposited so far; `None` means empty.
 Bin `j` of an accumulator with index `i` covers the exponent window
 
@@ -76,6 +79,27 @@ contents, so splitting the work across accumulators does not buy more budget. Pa
 exactness argument lapses and bins start to round; a reduction that large needs a larger `K`
 (and a proportionally smaller `W`), which is why `K` is a const parameter.
 
+### The ceiling is checked, not just documented
+
+The exact bound: one deposit adds **less than `2^W` quanta** to a bin (the slice `part` is
+smaller than the bin's top boundary `2^(-W·(i+j))`, which is `2^W` times that bin's quantum
+`2^(-W·(i+j+1))`), and a bin holds an exact integer count of quanta only while that count is
+under `2^53`. So
+
+```
+MAX_TERMS = 2^53 / 2^W = 2^(53 - W) = 2^27 = 134_217_728      (W = 26)
+```
+
+`terms: u32` counts finite deposits (a zero or a non-finite input touches no bin, so neither
+is counted), saturating rather than wrapping, and `merge` **adds** the two counts — the
+budget is per reduction, not per accumulator. Both `add` and `merge` then
+`debug_assert!(terms <= MAX_TERMS)`. It is a `debug_assert` on purpose — the counter would be
+pure overhead in a release kernel — so the guarantee it buys is that a reduction that large
+is caught in a debug run or a test, not that release builds refuse it. Past the ceiling bins
+round and order independence lapses, which is exactly why the breach must be loud somewhere.
+The count is itself order-independent (it is the multiset size), so the assert cannot fire
+for one permutation and stay quiet for another.
+
 ## Rescale and merge
 
 Rescaling to a smaller index (a larger value arrived) shifts bins down by `d` positions and
@@ -105,12 +129,38 @@ Truncation is toward zero, so a long sum of same-sign values is biased slightly 
 rather than being unbiased. Deterministic rounding-to-nearest would remove the bias but
 reintroduce an order-dependent tie-break, so it is not used.
 
-Non-finite inputs poison the accumulator (they are added straight into bin 0 and propagate
-through `merge`/`finish`); reproducibility is only claimed for finite inputs.
+## Non-finite inputs — poison bits, not a bin
+
+A non-finite input never reaches the bins. It sets a bit in `poison: u8`
+(`+Inf` / `-Inf` / `NaN`) **before** any bin arithmetic, and `add` returns.
+
+That placement is the whole point. Depositing a non-finite value into bin 0 and then
+rescaling (what the first implementation did) loses it whenever the accumulator's index is
+already coarser than 0: `rescale_to` shifts the bins down, and `NaN` falls off the bottom —
+so `add(1e-300); add(NAN)` finished as `0.0` while `add(NAN); add(1e-300)` finished as `NaN`.
+Order-dependent, i.e. a direct breach of the `DET-011` contract this module exists to keep.
+A flag outside the bin array cannot be shifted away.
+
+`merge` combines the states with `|`: commutative, associative and idempotent, so the
+non-finite path inherits the same invariant as the bins with no extra argument.
+
+`finish` reports the poison before it sums, matching what IEEE `sum` would have produced:
+
+| state | `finish` |
+|---|---|
+| `NaN` seen | `NaN` |
+| both `+Inf` and `-Inf` seen | `NaN` (`Inf + (-Inf)`) |
+| one infinity only | that infinity, whatever the finite terms are |
+| no poison | the bin sum |
+
+`NaN` is returned as the `f64::NAN` constant, so `finish().to_bits()` is identical across
+permutations — poisoned reductions are bit-reproducible, not merely "some NaN".
 
 ## Oracle
 
 `cargo test -p es-math reduce::` — proptest over random `f64` vectors asserts that the
 `finish()` bits are identical for (a) the original order, (b) an arbitrary permutation,
-(c) an arbitrary split-merge tree over the same elements. Bit equality of a CPU `BinnedAcc`
+(c) an arbitrary split-merge tree over the same elements. A second pair of proptests runs the
+same two properties over vectors that mix `NaN` / `±Inf` with subnormals and normals, and a
+debug-only `#[should_panic]` test deposits past `MAX_TERMS`. Bit equality of a CPU `BinnedAcc`
 against a GPU subgroup reduction is **Target / Status: unverified** (needs the M2 Vulkan path).
