@@ -264,11 +264,15 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
                 Some(row) => {
                     let mut actions = [[0.0; NJ]; H];
                     actions[0] = row;
-                    ActionChunk::new(actions, 1, self.mode)
+                    // One row synthesized per control tick: `control_tick` is strictly
+                    // increasing, so it is a valid chunk `seq` (spec 8.6, P-M1-R3) — the
+                    // plane must treat every tick's row as a fresh chunk, not content it
+                    // might coincidentally repeat.
+                    ActionChunk::new(actions, 1, self.mode).with_seq(self.control_tick)
                 }
                 // Underrun: an empty chunk, so the plane produces the fallback (§8.6, §9.4).
                 // Never a fabricated action.
-                None => ActionChunk::empty(self.mode),
+                None => ActionChunk::empty(self.mode).with_seq(self.control_tick),
             };
             let age = self.latest[env]
                 .as_ref()

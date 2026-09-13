@@ -120,14 +120,23 @@ one.
 the scrubbed hold action. Counters record the step and the fallback activation; no watchdog
 is evaluated, no chunk is accepted. Only `reset_latch()` clears it.
 
-**Step 1 — chunk acceptance.** The incoming chunk is compared to the stored one (`valid`,
-`mode`, and the first `valid` rows bitwise). If it differs, it is a new chunk: copy it in,
-`cursor = 0`, `last_chunk_tick = now`. If it is identical, the cursor keeps advancing.
+**Step 1 — chunk acceptance.** The chunk-identity question — is this the same chunk as last
+tick, or a new one? — is answered by `ActionChunk::seq` (P-M1-R3), a caller-supplied,
+monotonic-per-policy-invocation counter (spec 8.6): a chunk is new iff `seq` is strictly
+greater than the last one accepted; content is never compared. If it is new, copy it in,
+`cursor = 0`, `last_chunk_tick = now`, remember `seq`. If `seq` is not greater (including a
+repeat of the same value), the cursor keeps advancing over the stored chunk. The very first
+chunk a plane ever sees is accepted unconditionally, whatever its `seq`.
 
-> Known ceiling: a policy that emits a bit-identical chunk twice in a row is read as a
-> stale chunk and eventually trips `ChunkUnderrun`. That errs to the safe side and avoids
-> putting a sequence number in the Appendix B.4 chunk shape. If real workloads hit it, the
-> fix is a `seq: u64` on `ActionChunk`, not a heuristic.
+This means a policy that re-emits a bit-identical chunk on a genuine replan (a stationary
+hold, a saturated output) still reads as fresh — `ActionSource::Policy`, not a slow slide
+into `ChunkUnderrun` — because the caller advanced `seq`, even though the bytes did not.
+Conversely, a caller that resubmits the same `seq` twice (it failed to advance its own
+counter) is read as stale and the cursor eventually runs past the stored chunk into
+`ChunkUnderrun` — the safe-by-default outcome for a caller bug, not a special case in the
+plane. `es-runtime-embedded::EmbeddedRuntime` increments its counter once per `infer` call
+(replan tick) and reuses the same `seq` across the ticks that merely consume the buffered
+chunk, which is exactly "new chunk" vs. "still consuming" in caller terms.
 
 **Step 2 — executable length.** `len = min(chunk_valid, K)` under `RecedingHorizon`, where
 `K = action.execute_chunk`; `min(chunk_valid, H)` under every other mode (§8.5). Rows past
@@ -243,7 +252,7 @@ which does not touch the latch.
 `K = 3`. Each fixture carries a full `DeploymentIr` plus a step list; each step declares the
 inputs (chunk or "reuse the previous one", `obs_age_us`, heartbeat, sensors seen) and the
 expected `source`, expected event set, and optionally the expected `q`. Counters are checked
-at the end of the run. Seventeen scenarios:
+at the end of the run. Nineteen scenarios:
 
 | # | Fixture | What it proves |
 |---|---|---|
@@ -264,6 +273,8 @@ at the end of the run. Seventeen scenarios:
 | 15 | `violation_rate` | Enough clamped steps to push the window fraction over `max_frac`, which trips the rate watchdog |
 | 16 | `estop_latch` | E-stop trips once and every later step stays `Fallback(EmergencyStop)` even with a perfect chunk, until `reset_latch()` |
 | 17 | `retract_completes` | `RetractToHome` steps waypoint by waypoint and holds the last one |
+| 18 | `identical_chunks_fresh_seq` | A bit-identical chunk resubmitted with a strictly greater `seq` on each replan is still `source = Policy` (P-M1-R3) |
+| 19 | `repeated_seq_is_stale` | A chunk resubmitted with the *same* `seq` as before is not accepted; the cursor runs past it into `ChunkUnderrun` (P-M1-R3) |
 
 Plus `tests/properties.rs`: for arbitrary chunks containing `NaN`, `±Inf`, subnormals and
 values far outside every limit, and arbitrary `obs_age`/tick sequences, the returned `q` is

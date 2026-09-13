@@ -15,15 +15,24 @@ pub struct ActionChunk<const NJ: usize, const H: usize> {
     pub actions: [[f64; NJ]; H],
     pub valid: usize,
     pub mode: ExecutionMode,
+    /// Caller-supplied, monotonic per policy invocation (spec 8.6). The plane treats a chunk
+    /// as new iff `seq` is strictly greater than the last one it accepted — content is no
+    /// longer consulted (`docs/design/safety-plane.md`, P-M1-R3). `0` from [`Self::new`] /
+    /// [`Self::empty`] means "unknown"; that is safe because the plane always accepts the
+    /// very first chunk it ever sees regardless of `seq`. A caller that cares about
+    /// freshness (the embedded runtime) must call [`Self::with_seq`].
+    pub seq: u64,
 }
 
 impl<const NJ: usize, const H: usize> ActionChunk<NJ, H> {
-    /// A chunk of `valid` rows, clamped to `H`.
+    /// A chunk of `valid` rows, clamped to `H`. `seq` defaults to `0` ("unknown"); chain
+    /// [`Self::with_seq`] when the caller tracks a real sequence number.
     pub fn new(actions: [[f64; NJ]; H], valid: usize, mode: ExecutionMode) -> Self {
         Self {
             actions,
             valid: valid.min(H),
             mode,
+            seq: 0,
         }
     }
 
@@ -33,7 +42,15 @@ impl<const NJ: usize, const H: usize> ActionChunk<NJ, H> {
             actions: [[0.0; NJ]; H],
             valid: 0,
             mode,
+            seq: 0,
         }
+    }
+
+    /// Attaches the caller's per-invocation sequence number (spec 8.6).
+    #[must_use]
+    pub fn with_seq(mut self, seq: u64) -> Self {
+        self.seq = seq;
+        self
     }
 }
 

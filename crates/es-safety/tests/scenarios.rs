@@ -79,6 +79,12 @@ const fn yes() -> bool {
 struct Chunk {
     actions: Vec<Vec<Num>>,
     valid: usize,
+    /// The caller's sequence number (spec 8.6, P-M1-R3). Absent means "auto-assign the next
+    /// one" — the common case, standing in for a policy invocation that always advances its
+    /// own counter. A fixture sets this explicitly only to force a *repeated* seq (simulating
+    /// a caller that failed to advance it), which is otherwise untestable from JSON alone.
+    #[serde(default)]
+    seq: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +137,9 @@ fn run<const NJ: usize, const H: usize>(sc: &Scenario) {
         .collect();
 
     let mut held = ActionChunk::<NJ, H>::empty(mode);
+    // Auto-assigned seq for a step that doesn't pin one explicitly — stands in for a caller
+    // (the embedded runtime) that increments its own counter on every policy invocation.
+    let mut next_seq = 1u64;
     for (i, step) in sc.steps.iter().enumerate() {
         let now = PhysTick(step.tick);
         let at = format!("{} step {i} (tick {})", sc.name, step.tick);
@@ -147,7 +156,13 @@ fn run<const NJ: usize, const H: usize>(sc: &Scenario) {
                     *v = n.get();
                 }
             }
-            held = ActionChunk::new(actions, c.valid, mode);
+            let seq = c.seq.unwrap_or_else(|| {
+                let s = next_seq;
+                next_seq += 1;
+                s
+            });
+            next_seq = next_seq.max(seq + 1);
+            held = ActionChunk::new(actions, c.valid, mode).with_seq(seq);
         }
         if step.heartbeat {
             plane.heartbeat(now);

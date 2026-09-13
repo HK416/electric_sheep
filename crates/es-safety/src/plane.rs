@@ -30,6 +30,8 @@ pub struct SafetyState<const NJ: usize, const H: usize> {
     last_chunk_tick: PhysTick,
     last_beat_tick: PhysTick,
     estop_latched: bool,
+    /// The `seq` of the last chunk accepted; `None` before the first one (spec 8.6).
+    last_seq: Option<u64>,
 }
 
 impl<const NJ: usize, const H: usize> SafetyState<NJ, H> {
@@ -53,6 +55,7 @@ impl<const NJ: usize, const H: usize> SafetyState<NJ, H> {
             last_chunk_tick: PhysTick::ZERO,
             last_beat_tick: PhysTick::ZERO,
             estop_latched: false,
+            last_seq: None,
         }
     }
 }
@@ -283,21 +286,21 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
             .saturating_mul(self.envelope.period_us)
     }
 
-    /// Copies `chunk` in if it differs from the stored one. Identity is content equality over
-    /// the valid prefix; see the "known ceiling" note in docs/design/safety-plane.md.
+    /// Copies `chunk` in iff it is newer than the stored one. Identity is the caller's `seq`
+    /// (spec 8.6, P-M1-R3) — content is never consulted, so a policy re-emitting an identical
+    /// chunk on a fresh replan still advances (`ActionSource::Policy`), and a caller that
+    /// resubmits the same `seq` twice is judged stale (the cursor keeps running past the
+    /// stored chunk, which is the chunk-underrun path). The very first chunk this plane ever
+    /// sees is always accepted, whatever its `seq`.
     fn accept(&mut self, chunk: &ActionChunk<NJ, H>, now: PhysTick) {
-        let same = chunk.valid == self.state.chunk_valid
-            && chunk.mode == self.state.chunk_mode
-            && chunk.actions[..chunk.valid]
-                .iter()
-                .zip(&self.state.chunk[..chunk.valid])
-                .all(|(a, b)| a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits()));
-        if !same {
+        let is_new = self.state.last_seq.is_none_or(|last| chunk.seq > last);
+        if is_new {
             self.state.chunk = chunk.actions;
             self.state.chunk_valid = chunk.valid;
             self.state.chunk_mode = chunk.mode;
             self.state.cursor = 0;
             self.state.last_chunk_tick = now;
+            self.state.last_seq = Some(chunk.seq);
         }
     }
 

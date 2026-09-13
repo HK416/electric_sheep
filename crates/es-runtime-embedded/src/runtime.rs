@@ -82,6 +82,10 @@ pub struct EmbeddedRuntime<const NJ: usize, const H: usize> {
     consumed: u64,
     chunk: ActionChunk<NJ, H>,
     started: bool,
+    /// The chunk sequence number handed to the plane (spec 8.6, P-M1-R3): incremented once
+    /// per policy invocation (a replan tick), never per control tick, so the plane can tell a
+    /// genuine replan from the ticks that merely reuse the buffered chunk.
+    seq: u64,
 }
 
 impl<const NJ: usize, const H: usize> std::fmt::Debug for EmbeddedRuntime<NJ, H> {
@@ -138,6 +142,7 @@ impl<const NJ: usize, const H: usize> EmbeddedRuntime<NJ, H> {
             consumed: 0,
             chunk: ActionChunk::empty(mode),
             started: false,
+            seq: 0,
             bundle,
         })
     }
@@ -162,7 +167,8 @@ impl<const NJ: usize, const H: usize> EmbeddedRuntime<NJ, H> {
     ) -> SafeAction<NJ> {
         let replanned = !self.started || self.consumed >= self.replan_every;
         if replanned {
-            self.chunk = self.infer(sensors);
+            self.seq += 1;
+            self.chunk = self.infer(sensors).with_seq(self.seq);
             self.consumed = 0;
             self.started = true;
         }

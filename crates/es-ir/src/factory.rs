@@ -6,7 +6,9 @@
 //! to link the node enums at all. [`BuiltinTaskNodes`] / [`BuiltinLearningNodes`] cover the
 //! spec 6.3 / spec 8.3 node sets; [`BUILTIN_TASK_KINDS`] / [`BUILTIN_LEARNING_KINDS`] pin their
 //! kind strings so a rename is caught here rather than silently changing `*_hash` (spec 28.7
-//! gate 10).
+//! gate 10). [`BUILTIN_TASK_KINDS_HASH`] / [`BUILTIN_LEARNING_KINDS_HASH`] make that machine
+//! checked (P-M1-R6): a test recomputes the hash from the live lists and fails the build if
+//! either list moved.
 //!
 //! `params` is a `toml::Value` table of the node's own fields (no `kind` key); a factory adds
 //! the tag itself. Both node enums derive `Serialize`/`Deserialize` with serde's default
@@ -110,6 +112,40 @@ pub const BUILTIN_LEARNING_KINDS: &[&str] = &[
     "PolicyBundle",
     "ActionChunker",
     "Normalizer",
+];
+
+/// blake3 over a kind list, sorted and joined by `\n` so the hash depends on the kind set,
+/// never on the order the array happens to be written in (spec 28.7 gate 10, P-M1-R6). Used
+/// only by the freeze test below; nothing at runtime recomputes it.
+#[cfg(test)]
+fn kinds_hash(kinds: &[&str]) -> [u8; 32] {
+    let mut sorted: Vec<&str> = kinds.to_vec();
+    sorted.sort_unstable();
+    *blake3::hash(sorted.join("\n").as_bytes()).as_bytes()
+}
+
+/// Frozen blake3 hash of [`BUILTIN_TASK_KINDS`] (spec 28.7 gate 10).
+///
+/// Changing this hash is a schema change: bump `schema_version` and add a migration note in
+/// `docs/design/ir-types.md`.
+#[rustfmt::skip]
+pub const BUILTIN_TASK_KINDS_HASH: [u8; 32] = [
+    0x07, 0x92, 0x83, 0x85, 0x2d, 0x9d, 0x3f, 0xaf,
+    0x85, 0xc7, 0xda, 0x5d, 0x48, 0xfa, 0x0c, 0x88,
+    0x21, 0x0a, 0xb5, 0xc3, 0x7c, 0x82, 0xef, 0xfc,
+    0x3b, 0xb2, 0x36, 0xe2, 0x60, 0x3e, 0x14, 0x4c,
+];
+
+/// Frozen blake3 hash of [`BUILTIN_LEARNING_KINDS`] (spec 28.7 gate 10).
+///
+/// Changing this hash is a schema change: bump `schema_version` and add a migration note in
+/// `docs/design/ir-types.md`.
+#[rustfmt::skip]
+pub const BUILTIN_LEARNING_KINDS_HASH: [u8; 32] = [
+    0xa1, 0x7d, 0x06, 0x53, 0xf6, 0xc0, 0x16, 0x0c,
+    0xfc, 0xe3, 0x52, 0xa4, 0x86, 0xca, 0x04, 0x0b,
+    0xbd, 0xbd, 0xf4, 0xb5, 0x21, 0x39, 0xa1, 0x2f,
+    0xfc, 0xf0, 0x92, 0x0e, 0x1c, 0xaf, 0xfe, 0x51,
 ];
 
 fn placeholder_id() -> StableId {
@@ -542,3 +578,33 @@ node_registry!(
     LearningNode,
     BuiltinLearningNodes
 );
+
+#[cfg(test)]
+mod frozen_kind_lists {
+    use super::{
+        kinds_hash, BUILTIN_LEARNING_KINDS, BUILTIN_LEARNING_KINDS_HASH, BUILTIN_TASK_KINDS,
+        BUILTIN_TASK_KINDS_HASH,
+    };
+
+    /// Spec 28.7 gate 10: a rename, addition, or removal in either kind list must fail CI, not
+    /// silently change `task_hash` / `learning_hash` for every graph that uses the kind.
+    #[test]
+    fn builtin_task_kinds_hash_is_frozen() {
+        assert_eq!(
+            kinds_hash(BUILTIN_TASK_KINDS),
+            BUILTIN_TASK_KINDS_HASH,
+            "BUILTIN_TASK_KINDS changed — this is a schema change (see the doc comment on \
+             BUILTIN_TASK_KINDS_HASH)"
+        );
+    }
+
+    #[test]
+    fn builtin_learning_kinds_hash_is_frozen() {
+        assert_eq!(
+            kinds_hash(BUILTIN_LEARNING_KINDS),
+            BUILTIN_LEARNING_KINDS_HASH,
+            "BUILTIN_LEARNING_KINDS changed — this is a schema change (see the doc comment on \
+             BUILTIN_LEARNING_KINDS_HASH)"
+        );
+    }
+}

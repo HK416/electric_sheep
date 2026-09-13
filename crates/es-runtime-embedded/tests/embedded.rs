@@ -637,9 +637,9 @@ const WEIGHTS: &[u8] = b"not really safetensors, but hashed like it";
 struct FakeRuntime {
     /// Every action component of every emitted row.
     value: f64,
-    /// Added to `value` on each call, so two successive chunks differ. The Safety Plane keeps
-    /// its cursor when a chunk is byte-identical to the stored one, which a constant policy
-    /// would run out of (see `docs/design/safety-plane.md`).
+    /// Added to `value` on each call, so two successive chunks differ. Chunk freshness is
+    /// judged by `ActionChunk::seq` now (P-M1-R3), not content, so a constant policy (`drift
+    /// == 0.0`) is no longer a bug magnet here — this still exercises the general case.
     drift: f64,
     calls: u32,
     info: Option<PolicyInfo>,
