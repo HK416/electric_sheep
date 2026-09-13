@@ -51,9 +51,12 @@ vision + policy subtotal                                 ≈ 3.1 GB
 ```
 
 `MemoryBudget::estimate`는 그 예시와 같은 형태의
-`ObservationIr`/`LearningGraph`로부터 처음 세 줄을 정확히 재현한다(render
-tile atlas, observation 중간값, chunk 버퍼); 추론 활성화값과 정책
-가중치는 이 모델이 추측하는 대신 `unavailable`로 명시하는 두 항목이다(§4).
+`ObservationIr`/`LearningGraph`로부터 처음 두 줄을 정확히 재현한다(render
+tile atlas, observation 중간값); 추론 활성화값과 정책 가중치는 이 모델이
+추측하는 대신 `unavailable`로 명시하는 두 항목이다(§4). chunk 버퍼 줄은
+의도적으로 재현하지 **않는다**: 13 MB가 아니라 4096×8×50×8×8 = 105 MB인데,
+런타임이 env마다 여덟 개의 겹치는 f64 chunk를 유지하기 때문이다 — 아래 §3을
+보라.
 
 ## 3. 항목과 그 공식
 
@@ -70,7 +73,24 @@ formula가 `"unavailable: ..."`로 시작하는 것은 "이것으로 크기를 �
 | `history_buffers` | History 항목에 대한 합: `depth x per_sensor_bytes x n_obs_envs` | `ObservationIr::temporal.history`(spec 7.5 layer 1)를 각 sensor id를 소유하는 `ImageInput`/`StateInput` 노드와 조인 |
 | `policy_weights` | 항상 `unavailable` | `WeightsRef`(spec 8.3)는 경로와 blake3 해시만 실을 뿐 바이트 크기가 없다(`INV-16`은 로딩을 `safetensors`로 유지할 뿐 크기 필드를 추가하지 않는다) |
 | `inference_activations` | `sum(LearningNode output shapes) x inference_batch x precision_bytes` | `IrNode::outputs`를 통한 `LearningGraph::nodes`(각 노드가 선언한 출력 포트, spec 8.3) |
-| `chunk_buffers` | `n_sim_envs x horizon x action_dim x 4B x 2`(더블 버퍼) | `LearningGraph::policy.contract`(`horizon`, `action_dim`) |
+| `chunk_buffers` | `n_sim_envs x CHUNK_SLOTS x horizon x action_dim x 8B`(f64) — `es_core::sizing::chunk_buffer_bytes`, **spec 20.2의 `x 4B x 2`에서 벗어남**, 아래를 보라 | `LearningGraph::policy.contract`(`horizon`, `action_dim`) |
+
+### `chunk_buffers`: 모델은 하나뿐이고, 그것은 spec 20.2의 것이 아니다 (P-M2-R5)
+
+spec 20.2는 `n_sim_envs x H x NJ x 4B x 2`를 예산으로 잡는다 — f32 chunk 하나를
+더블 버퍼링한 것이다. 런타임은 env마다 `CHUNK_SLOTS = 8`개의 *겹치는* f64
+chunk를 유지하는데, ACT의 temporal ensembling이 살아있는 모든 chunk를
+평균하고(spec 8.6) 제어 경로 전체가 f64이기 때문이다. 이는 spec의 수치의
+4배이며, 옳은 쪽은 구현이다: spec의 그 줄은 ensembling 버퍼보다 먼저
+쓰였다.
+
+같은 양에 대한 두 개의 in-tree 모델이 있으면 spec 28.7 gate 13의 ±10% 검사가
+도달 불가능해지므로, 정확히 하나만 존재한다 — layer 1의
+`es_core::sizing::chunk_buffer_bytes`이며, `es_env::DomainSizing`(layer 9)과
+이 예산(layer 7) 둘 다 이를 호출한다. 두 크레이트는 서로를 볼 수 없으므로
+(spec 4.2), 이 공식은 둘 아래에 자리 잡는다. spec 12.4 게이트 구성(4,096
+env, `H = 20`, `NJ = 7`)에서 이는 36.7 MB이며, `cargo test -p es-compile
+budget`은 예산 항목이 그 함수와 같음을 단언한다.
 
 `bandwidth_per_tick`는 `render_tile_atlas + observation_intermediates`다:
 어떤 Hz와도 무관하게 simulation tick 한 번마다 이동하는 바이트 수다(spec

@@ -241,6 +241,28 @@ fallback으로 응답한다(§8.6, §9.4). 어떤 갈래도 plane을 우회해 `
 도달하지 않는다. 테스트에서도 마찬가지다 — 테스트 범위(envelope)는 넓어질
 뿐 절대 비활성화되지 않는다(INV-12).
 
+### 제어 tick마다가 아니라 정책 결과마다 하나의 `seq` (P-M2-R3)
+
+`SafetyPlane::accept`는 아직 보지 못한 `seq`일 때만 chunk를 받아들이며, 그것이
+`last_chunk_tick`을 옮기는 유일한 것이기도 하다 — `ViolationKind::InferenceDeadline`이
+측정하는 타임스탬프다. 그래서 실행기는 `seq`를 **정책 호출 결과당 한 번** 찍는다.
+
+- 현재 tick을 커버하는 결과는 새 `seq`와, 다음 결과가 도착할 때까지 그것이 구동할
+  행들을 받는다(`ChunkBuffer::action_at`을 선견(lookahead)으로 사용). 이후 plane
+  자신의 커서가 `es-runtime-embedded`가 재계획하지 않는 tick에서 하는 것과 정확히
+  같은 방식으로 그 행들을 따라간다. 이 선견은 정확한데, `ChunkBuffer::arrivals`를
+  바꾸지 않고서는 아무것도 버퍼에 도달할 수 없고, 바로 그것이 다음 재구성을
+  촉발하기 때문이다.
+- 그 외의 모든 tick은 이전 `seq`를 재제출한다. plane은 이미 보유한 `seq`의
+  페이로드를 무시하므로, 그런 tick들은 `last_chunk_tick`을 갱신하지도, 행동을
+  조작해내지도 않는다.
+- 에피소드 리셋은 뒤에 행 없이 `seq`를 올린다. 그래서 plane은 끝난 에피소드의
+  chunk를 계속 소비하는 대신 그것을 버린다(§13.1).
+
+제어 tick마다 새 `seq`를 찍던 예전 방식은 죽은 정책과 살아있는 정책을 구별할 수
+없게 만들었다: `InferenceDeadline`은 `DomainRunner`를 통해서는 절대 발화할 수
+없었고, 멈춘 정책은 오직 `ChunkUnderrun`으로만 나타났다.
+
 두 가지는 단일 인스턴스가 아니라 배열인데, 둘 다 그 배후의 상태가 env마다
 다르기 때문이다: `planes: &mut [SafetyPlane]`(hold target, rate-limit 이력,
 e-stop 래치는 로봇마다 다르다, §9.3)와 `plans: &mut [CpuPlan]`(`TemporalWindow`
@@ -263,6 +285,22 @@ e-stop 래치는 로봇마다 다르다, §9.3)와 `plans: &mut [CpuPlan]`(`Temp
 - 그 무엇도 시계를 읽지 않는다. `Instant`는 `es-env`에서
   `EnvMetrics::simulation_wall`에만 등장하며, 이는 측정값일 뿐 어떤 결정에도
   입력되지 않는다.
+
+### 큐는 유한하다 (P-M2-R4)
+
+`max_pending`의 기본값은 `inference.batch × latency_ticks + batch`다 — 파이프라인이
+뒤처지지 않을 때 실제로 진행 중인 작업량과 정확히 같다: 전체 latency 동안
+tick마다 방출되는 배치 하나에, 지금 채워지고 있는 배치를 더한 것이다.
+`with_max_pending`이 이를 재정의한다(최소 배치 하나로 클램프됨).
+
+이 한도를 넘기는 제출은 버려지고 `dropped_submissions`에 집계된다. **가장 최신**
+것이 버려지므로 큐는 여전히 FIFO를 유지하며 back-pressure는 여전히 스케줄
+순서대로 작업을 지연시킬 뿐 뒤섞지 않는다. 버려진 관측은 chunk를 만들어내지
+않으므로, 다른 모든 누락된 chunk와 같은 곳에서 드러난다 — underrun으로, 그다음
+plane의 fallback으로. 유한하지 않은 큐였다면 `inference.batch`가 도착률에 못
+미칠 때마다(§12.2의 round-robin이 존재하는 이유인, 통상적인 과다구독 상황) 한없이
+자라났을 것이고, §28.4 게이트 구성에서 이는 §20.3이 금지하는 메모리 부족
+상태다.
 
 실제 스레딩은 이후 패킷의 몫이며 바로 이 인터페이스 뒤에 자리 잡아야 한다:
 `submit`이 worker에게 작업을 넘기고 `poll`이 그것을 되받으며, 방출 규칙은
@@ -292,7 +330,13 @@ ACT는 가장 오래된 겹치는 예측에서부터 지수 가중치를 인덱�
 
 `next_action`은 underrun 시 `None`을 반환하고 그것을 카운트한다. 절대 행을
 조작해내지 않는다 — 조작된 행동은 아무 검사도 거치지 않은 채 actuator에
-도달하게 될 것이다.
+도달하게 될 것이다. `action_at`은 실행기가 구성하는 도착당(per-arrival) chunk를
+위해 카운터 없이 수행하는 동일한 조회다. 카운터는 여전히 제어 tick당 하나이며,
+이것이 §12.4의 `chunk_underrun_rate`가 나누는 분모다.
+
+`CHUNK_SLOTS` 자체는 `chunk_buffer_bytes`와 함께 `es_core::sizing`에 있다.
+`es-compile`의 메모리 예산이 바로 이 버퍼들의 크기를 산정해야 하는데 `es-env`에
+의존할 수 없기 때문이다(§4.2). 공식 하나, 호출자 둘(P-M2-R5).
 
 ## 12. 배치 독립성이 실제로 의미하는 것
 
