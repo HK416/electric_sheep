@@ -1,0 +1,15 @@
+{
+  "dtype": "u32",
+  "generator": "cargo test -p es-render -- --ignored generate_goldens",
+  "kernel": "raster.v1",
+  "layout": "row-major, little-endian, tightly packed",
+  "name": "cornell_rs_seg",
+  "oracle": "es_render::cpu, the pure-Rust mirror of the Slang kernels",
+  "pins": "OpenCV camera frame and top-left image origin (spec 3.1); depth in metres, unit_m = 1",
+  "shape": [
+    64,
+    64,
+    1
+  ],
+  "spec": "docs/design/renderer.md"
+}
