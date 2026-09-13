@@ -207,3 +207,126 @@ terminate 원뿔 안의 그 외 모든 노드 종류는
 - **training 도메인 실행** — 스케줄은 되어 있지만 `es-data`로의 인계는 이후
   W의 몫이다.
 - **Backend 모델 파라미터 무작위화** — §5의 한계를 참조.
+
+---
+
+# M2 W2 — 라운드로빈 실행, 비동기 추론, chunk 버퍼
+
+위 §8은 이 중 네 가지를 미룬 것으로 나열했다. 이 절은 그 항목들을 대체하며,
+§1–§7은 여전히 M1 W6 기반을 설명하고 변경되지 않는다.
+
+## 9. 실행기
+
+`DomainRunner<NJ, H>`는 `Env` 위에서 `Schedule`을 실행한다. 이것의 시계는
+**제어 tick**이다: `inference.period`만큼의 simulation tick 구간이며, 이는
+정확히 `Env::step` 하나가 전진시키는 양이다. `Env::step_with_policy` 하나가
+§12.1 위상 순서로 진행되는 제어 tick 하나다.
+
+```
+observation ticks in [t, t+inference.period)
+    └─ Schedule::observation_envs(t)        round_robin, §12.2 — only these envs
+         └─ CpuPlan::run (or the raw qpos‖qvel row)  → latest[env]
+inference tick in the same window
+    └─ submit(env, control_tick) ascending by env id, §12.3
+poll(control_tick)
+    └─ up to inference.batch, FIFO → one PolicyRuntime::infer over the stacked batch
+         └─ ChunkBuffer::push(chunk, submit_tick + latency_ticks)     ← App. B.5 apply_at
+every control tick
+    └─ ChunkBuffer::next_action → SafetyPlane::validate → Env::step(ctrl)
+```
+
+마지막 화살표는 chunk에서 actuator로 가는 **유일한** 경로이며, 두 갈래 모두
+그것을 거친다: underrun은 plane에 `ActionChunk::empty`를 건네고, plane은
+fallback으로 응답한다(§8.6, §9.4). 어떤 갈래도 plane을 우회해 `set_ctrl`에
+도달하지 않는다. 테스트에서도 마찬가지다 — 테스트 범위(envelope)는 넓어질
+뿐 절대 비활성화되지 않는다(INV-12).
+
+두 가지는 단일 인스턴스가 아니라 배열인데, 둘 다 그 배후의 상태가 env마다
+다르기 때문이다: `planes: &mut [SafetyPlane]`(hold target, rate-limit 이력,
+e-stop 래치는 로봇마다 다르다, §9.3)와 `plans: &mut [CpuPlan]`(`TemporalWindow`
+링은 env마다의 이력이다, §7.5). 공유 인스턴스라면 한 env의 이력이 다른 env의
+것과 뒤섞이게 된다.
+
+## 10. 시뮬레이션된 지연 (§12.3)
+
+`latency_ticks = ceil(expected_latency_ms × control_rate)`는
+`RuntimeHints::expected_latency_ms`로부터 정수로 한 번 계산된다. 이것이 비동기
+모델의 전부다.
+
+- 제출(submission)은 `submit_tick + latency_ticks <= control_tick`일 때
+  방출되며, 실제 backend가 더 일찍 끝나더라도 절대 더 일찍 방출되지 않는다 —
+  §12.3의 결정적 모드는 기다린다.
+- chunk는 도착한 tick이 아니라 `submit_tick + latency_ticks`에 적용된다
+  (부록 B.5 `ChunkArrival::apply_at`). 좁은 `inference.batch`가 그것을 늦게
+  전달했다면, 이미 과거가 된 행들은 그냥 서빙되지 않는다. 이는 조용한 시간
+  이동이 아니라 카운터상의 underrun으로 나타난다.
+- 그 무엇도 시계를 읽지 않는다. `Instant`는 `es-env`에서
+  `EnvMetrics::simulation_wall`에만 등장하며, 이는 측정값일 뿐 어떤 결정에도
+  입력되지 않는다.
+
+실제 스레딩은 이후 패킷의 몫이며 바로 이 인터페이스 뒤에 자리 잡아야 한다:
+`submit`이 worker에게 작업을 넘기고 `poll`이 그것을 되받으며, 방출 규칙은
+여기 그대로 남아 worker를 바꿔 끼워도 의미론이 바뀌지 않는다. 결정적 방식이
+먼저다(§12.3); 실시간 모드는 더 일찍 방출하고 그 편차를 replay에 기록한다.
+
+## 11. Chunk 버퍼 (§8.5, §8.6)
+
+`ChunkBuffer<NJ, H>`는 `CHUNK_SLOTS = 8`개의 chunk를 인라인으로 보유한다.
+`next_action`은 아무것도 할당하지 않는다: 커버링 집합은 인라인
+`[usize; 8]`이며 push 순서로 삽입 정렬되어 있으므로, 결합 순서는 항상 슬롯
+순서가 아니라 도착 순서다 — 이것이 앙상블 합을 비트 단위로 재현 가능하게
+만드는 요인이다.
+
+| `ChunkBlendPolicy` | 규칙 | chunk 하나의 span |
+|---|---|---|
+| `HardSwitch` | 가장 최근의 커버링 chunk가 승리 | `min(valid, K)` |
+| `LinearBlend { steps }` | `steps` tick에 걸쳐 이전 → 최신으로 램프 | `min(valid, K)` |
+| `TemporalEnsemble { weight_decay }` | `w_i = exp(-m·i)`, `i = 0`이 **가장 오래된 것** | `valid` |
+
+ACT는 가장 오래된 겹치는 예측에서부터 지수 가중치를 인덱싱하므로, `m`이
+작을수록 새 관측을 더 빨리 반영한다; `f64::exp`가 아니라
+`es_math::approx::exp`가 쓰인다(§3.4는 결정적 경로에서 std 초월함수를
+금지한다). `K = execute_chunk`는 앞의 두 블렌드를 제한하는데, §8.5가 `K`
+이후 재계획하기 때문이다; `TemporalEnsemble`은 `valid`한 모든 행을
+의도적으로 읽는데, 겹치는 부분을 평균하는 것 자체가 그 방법이기 때문이다.
+
+`next_action`은 underrun 시 `None`을 반환하고 그것을 카운트한다. 절대 행을
+조작해내지 않는다 — 조작된 행동은 아무 검사도 거치지 않은 채 actuator에
+도달하게 될 것이다.
+
+## 12. 배치 독립성이 실제로 의미하는 것
+
+16-env 실행은 고정된 `observation.batch`에 대해 비트 단위로 replay된다.
+서로 다른 `observation.batch` 사이에서는 그렇지 **않으며**, 이것은 결함이
+아니라 옳은 동작이다: round-robin은 어느 tick에 어느 env가 관측되는지를
+바꾸고, 관측된 env만 제출하며, 제출한 env만 chunk를 받고, chunk가 없는
+env는 Safety Plane의 fallback을 받는다. observation 배치를 절반으로
+줄이면 각 env의 관측 빈도가 절반이 되고 `chunk_underrun_rate`가 올라간다.
+
+실제로 성립하는 불변량, 즉 테스트가 단언하는 것은 다음과 같다.
+
+> 두 env는 그들의 observation tick이 일치할 때에 한해 구별 불가능하다.
+
+구체적으로, `simulation.batch = 16`일 때 env들은 `16 / observation.batch`개의
+round-robin 그룹으로 나뉜다; 궤적은 그룹 내부에서는 동일하고 그룹 사이에서는
+다르며, `underrun_rate(4) > underrun_rate(8) > underrun_rate(16)`이다.
+
+### §28.4 게이트의 규모 산정
+
+`DomainSizing`은 구성(configuration)에 대한 정수 연산이다 — 할당이 없으므로,
+게이트 구성을 실제로 돌릴 수 없는 노트북에서도 비용을 산정할 수 있다.
+`GATE`(4,096 sim env, 512 obs env, 2 view, 224×224, 30 Hz, `H = 20`,
+`NJ = 7`)에 대해:
+
+| 수량 | round-robin 512 | 모든 카메라 켬 |
+|---|---|---|
+| `camera_frames_per_sec` | 30,720 | 245,760 |
+| `pixels_per_sec` | 1.54 G | 12.3 G |
+| 렌더 출력 (RGB8) | 4.6 GB/s | 37 GB/s |
+| `f32` 정규화 후 | 18.5 GB/s | 148 GB/s |
+| chunk 버퍼 (8 slots × `H` × `NJ` × f64) | 36.7 MB | 36.7 MB |
+
+마지막 두 열의 8배 차이가 §12.2의 논거 전부다. 이 모두는
+**`Target / Status: 미검증`**이다(§12.4): §28.4 W2 게이트 — 4,096 sim env ×
+512 obs env 안정 — 는 여기서는 측정이 아니라 예산(budget)이며, 실제로
+실행되는 테스트는 축소된 16-env 버전이다.
