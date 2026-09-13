@@ -1,4 +1,4 @@
-<!-- Korean translation of docs/docs/design/telemetry-protocol.ko.md. The English file is the working copy; regenerate this when it changes. -->
+<!-- Korean translation of docs/design/telemetry-protocol.md. The English file is the working copy; regenerate this when it changes. -->
 
 # 텔레메트리 프로토콜 — 와이어 형식과 M1 루프백 트랜스포트
 
@@ -81,18 +81,35 @@ TCP 연결 하나가 세션 하나다. 핸드셰이크 이후 관계는 비대�
 토큰 검사 앞에는 두 가지 자원 제한이 더 있으며, 둘 다 `Server::bind_with(addr, token, cfg:
 ServerConfig)` 위에 있다(`Server::bind`는 이를 `ServerConfig::default()`로 호출한다):
 
+- **연결 상한** (`ServerConfig::max_clients`, 기본값 `DEFAULT_MAX_CLIENTS = 64`): accept
+  루프 자체에서, 연결에 대해 스레드가 스폰되기도 전에 검사된다 — 즉 `Hello`를 읽기도 전이며,
+  이는 버전/토큰 검사보다도 전이라는 뜻이다. `in_flight = handshaking.load() +
+  clients.len()`은 미드핸드셰이크든 이미 등록됐든 현재 "슬롯"을 차지하고 있는 모든 연결을
+  센다; 도착한 연결이 `>= max_clients`이면 accept 루프 스레드가 동기적으로 `Bye { reason:
+  "too many clients" }`를 쓰고, 스레드를 스폰하거나 바이트 하나 읽는 일 없이 소켓을 드롭한다
+  (닫는다). 이는 원래 형태(토큰/버전 검사 이후, 연결별 스레드 안에서 상한을 검사하던 방식)와
+  다른 동작 변경이다: 상한을 초과한 연결의 `Hello` — 잘못된 토큰을 가진 것이라도 — 는 결코
+  읽히지 않으므로, 토큰별 또는 버전별 사유가 아니라 오직 "too many clients"만 받는다. accept
+  루프는 단일 스레드이므로 이 검사-후-증가에는 자기 자신과의 경합이 없다 — 두 연결이 경계를
+  넘어 경합할 수 있다던 앞선 `ponytail` 노트는 더 이상 적용되지 않는다; 여기서 정확함을
+  만드는 것은 (유지되는 뮤텍스가 아니라) 이 순서다.
 - **핸드셰이크 타임아웃** (`ServerConfig::handshake_timeout`, 기본값 `HANDSHAKE_TIMEOUT =
-  5s`): 서버가 `Hello`를 읽기 전에 `TcpStream::set_read_timeout`으로 적용되므로, 연결한 뒤
-  아무것도 보내지 않는 피어는 서버 스레드를 영원히 붙잡아 두는 대신 타임아웃이 지나면
-  버려진다. 성공적인 `Hello` 읽기 직후 해제되어(`set_read_timeout(None)`), 세션의 이후
-  읽기(`Subscribe` 루프)는 연결이 살아있는 동안 정상적으로 블록된다.
-- **연결 상한** (`ServerConfig::max_clients`, 기본값 `DEFAULT_MAX_CLIENTS = 64`): 버전/토큰
-  검사 이후(그래서 잘못된 토큰은 여전히 자신만의 `Bye` 사유를 받는다) 그리고 등록 전에
-  검사된다. (기본값 기준) 65번째 동시 클라이언트는 `Bye { reason: "too many clients" }`를
-  받고 클라이언트 맵에 결코 추가되지 않는다. ponytail: 검사와 등록 삽입은 하나의 원자적
-  단계가 아니므로, 정확히 그 경계에서 도착한 두 연결이 둘 다 등록 전에 검사를 통과할 수 있다
-  — 이 루프백 shim에는 받아들일 만하다; 정확한 상한이 필요하다면 "검사와 삽입"에 걸쳐 하나의
-  뮤텍스를 유지해야 한다.
+  5s`): 개별 읽기 단위가 아니라 절대 데드라인이다. accept 루프는 연결이 admit될 때
+  `Instant::now() + handshake_timeout`을 기록한다; `read_message_until`은 블록될 수 있는
+  모든 소켓 읽기 전에 *남은* 시간을 다시 계산해 그것을 해당 읽기의 타임아웃으로 사용하며,
+  남은 시간이 없어지면 오류를 낸다. 몇 초마다 한 바이트씩 흘리는 피어 — 각 개별 읽기는 자신의
+  읽기별 타임아웃 안에 넉넉히 들어가더라도 — 는 전체 경과 시간이 데드라인을 넘는 순간 여전히
+  끊긴다. 이는 한 번 적용된 단일 `set_read_timeout(Some(duration))`(원래 형태)로는 할 수
+  없던 일이다: 그 호출은 하나의 읽기만 경계 지을 뿐, 여러 부분 읽기의 합을 경계 짓지 않는다.
+  성공적인 `Hello` 읽기 직후 해제되어(`set_read_timeout(None)`), 세션의 이후 읽기
+  (`Subscribe` 루프)는 연결이 살아있는 동안 정상적으로 블록된다.
+- **관측 가능성**: `Server::stats()`는 클라이언트별 `sent`/`dropped` 카운터와 더불어
+  `handshaking`(상한 검사를 통과해 admit됐지만 아직 핸드셰이크를 통과하지 못한 연결)과
+  `threads_live`(핸드셰이크 중이든 등록됐든, 현재 실행 중인 모든 `serve_client` 스레드)를
+  보고하므로, 호출자 — 또는 테스트 — 는 상한이 그저 신뢰의 대상이 아니라 실제로 지켜지고
+  있음을 볼 수 있다. 둘 다 공유 `AtomicUsize` 카운터이며, `threads_live`는 스레드 종료 시
+  RAII 가드에 의해 감소되므로 모든 경로(정상 반환, 이른 `?`, 패닉 언와인드)가 정확히 한 번씩
+  계산에 반영된다.
 
 **이것이 아닌 것**: 토큰은 JSON 본문 안에 평문으로 전달되며, 채널 암호화는 존재하지 않는다.
 같은 사용자가 소유한 프로세스 간 `127.0.0.1`(spec 25.1의 기본 바인드)에서는 문제가 없지만,
