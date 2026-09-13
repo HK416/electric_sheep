@@ -1,0 +1,25 @@
+[package]
+name = "es-eval"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+es-core = { workspace = true }
+es-assets = { workspace = true }
+es-physics-core = { workspace = true }
+es-ir = { workspace = true }
+es-compile = { workspace = true }
+es-policy = { workspace = true }
+es-safety = { workspace = true }
+es-env = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

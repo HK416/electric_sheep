@@ -27,6 +27,7 @@ es-safety = { path = "crates/es-safety" }
 es-compile = { path = "crates/es-compile" }
 es-runtime-embedded = { path = "crates/es-runtime-embedded" }
 es-editor = { path = "crates/es-editor" }
+es-eval = { path = "crates/es-eval" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 toml = "0.8"
