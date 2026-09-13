@@ -15,6 +15,8 @@ pub const TYPE_010: &str = "TYPE-010";
 pub const TYPE_011: &str = "TYPE-011";
 pub const TYPE_014: &str = "TYPE-014";
 pub const TYPE_020: &str = "TYPE-020";
+/// A condition expression is not boolean (spec 6.2 IR-C, spec 6.5).
+pub const TYPE_030: &str = "TYPE-030";
 
 // --- Graph / semantic pass (spec 11.1) ----------------------------------------------------
 pub const GRAPH_001: &str = "GRAPH-001";
@@ -28,6 +30,14 @@ pub const HASH_002: &str = "HASH-002";
 
 // --- Task (spec 7.4) ----------------------------------------------------------------------
 pub const TASK_001: &str = "TASK-001";
+
+// --- Control graph / IR-C (spec 6.2) ------------------------------------------------------
+pub const CTRL_001: &str = "CTRL-001";
+pub const CTRL_002: &str = "CTRL-002";
+pub const CTRL_003: &str = "CTRL-003";
+pub const CTRL_004: &str = "CTRL-004";
+pub const CTRL_005: &str = "CTRL-005";
+pub const CTRL_006: &str = "CTRL-006";
 
 // --- Observation (spec 7.2 .. 7.5) --------------------------------------------------------
 pub const OBS_021: &str = "OBS-021";
@@ -136,6 +146,12 @@ use Severity::{Error, Warning};
 /// The full dictionary. Sorted by code so a reader can scan it.
 #[rustfmt::skip]
 pub const CODES: &[CodeEntry] = &[
+    e(CTRL_001, Error, "control node reference names a node that does not exist", "6.2"),
+    e(CTRL_002, Error, "control node is unreachable from the root", "6.2"),
+    e(CTRL_003, Error, "control node has more than one parent", "6.2"),
+    e(CTRL_004, Error, "the control graph contains a cycle", "6.2"),
+    e(CTRL_005, Error, "Repeat count or SubTask timeout must be greater than 0", "6.2"),
+    e(CTRL_006, Error, "SubTask names a stage, reward or channel the Task IR does not declare", "6.2"),
     e(DEP_001, Error, "unsupported Deployment IR schema version", "9.2"),
     e(DEP_010, Error, "size does not match robot.n_joints", "9.2"),
     e(DEP_011, Error, "safety limit is not finite", "9.3"),
@@ -199,6 +215,7 @@ pub const CODES: &[CodeEntry] = &[
     e(TYPE_011, Error, "policy input must be Normalized, Dimensionless or Token", "5.4"),
     e(TYPE_014, Error, "time alignment is not specified", "5.4"),
     e(TYPE_020, Error, "ImageSpec mismatch", "7.2"),
+    e(TYPE_030, Error, "condition expression is not boolean", "6.2"),
     e(XIR_001, Error, "observation IR belongs to a different Task IR", "7.4"),
     e(XIR_002, Error, "observation source reads a channel the Task IR does not declare", "7.4"),
     e(XIR_010, Error, "observation output and policy input do not name the same tensors", "8.4"),
@@ -266,6 +283,7 @@ mod tests {
             TYPE_011,
             TYPE_014,
             TYPE_020,
+            TYPE_030,
             GRAPH_001,
             GRAPH_002,
             GRAPH_003,
@@ -273,6 +291,12 @@ mod tests {
             HASH_001,
             HASH_002,
             TASK_001,
+            CTRL_001,
+            CTRL_002,
+            CTRL_003,
+            CTRL_004,
+            CTRL_005,
+            CTRL_006,
             OBS_021,
             OBS_034,
             OBS_040,

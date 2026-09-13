@@ -17,6 +17,7 @@ use std::fmt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::control::ControlGraph;
 use crate::deployment::DeploymentIr;
 use crate::evaluation::EvaluationIr;
 use crate::graph::{Edge, Graph, NodeId, PortRef};
@@ -203,6 +204,36 @@ struct TaskIrToml {
     graph: GraphToml<TaskNode>,
     observation_spec: ObservationSpec,
     config: TaskConfig,
+    /// IR-C (spec 6.2). `nodes` is `NodeId`-keyed, so it goes through the same re-keying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    control: Option<ControlGraphToml>,
+}
+
+/// TOML-safe mirror of `ControlGraph`: `nodes` re-keyed from `NodeId` to its decimal string.
+#[derive(Serialize, Deserialize)]
+struct ControlGraphToml {
+    root: u32,
+    nodes: BTreeMap<String, crate::control::ControlNode>,
+}
+
+impl From<&ControlGraph> for ControlGraphToml {
+    fn from(g: &ControlGraph) -> Self {
+        Self {
+            root: g.root.0,
+            nodes: node_map_to_toml(&g.nodes),
+        }
+    }
+}
+
+impl TryFrom<ControlGraphToml> for ControlGraph {
+    type Error = SerialError;
+
+    fn try_from(g: ControlGraphToml) -> Result<Self, SerialError> {
+        Ok(ControlGraph {
+            root: NodeId(g.root),
+            nodes: node_map_from_toml(g.nodes)?,
+        })
+    }
 }
 
 impl From<&TaskIr> for TaskIrToml {
@@ -213,6 +244,7 @@ impl From<&TaskIr> for TaskIrToml {
             graph: GraphToml::from(&ir.graph),
             observation_spec: ir.observation_spec.clone(),
             config: ir.config.clone(),
+            control: ir.control.as_ref().map(ControlGraphToml::from),
         }
     }
 }
@@ -227,6 +259,7 @@ impl TryFrom<TaskIrToml> for TaskIr {
             graph: TaskGraph::try_from(m.graph)?,
             observation_spec: m.observation_spec,
             config: m.config,
+            control: m.control.map(ControlGraph::try_from).transpose()?,
         })
     }
 }

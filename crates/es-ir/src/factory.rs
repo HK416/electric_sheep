@@ -101,6 +101,14 @@ pub const BUILTIN_TASK_KINDS: &[&str] = &[
     "Record",
 ];
 
+/// The spec 6.2 IR-C node set, frozen the same way (spec 28.7 gate 10).
+///
+/// Deliberately **not** part of [`BUILTIN_TASK_KINDS`]: that list is what a
+/// [`TaskNodeFactory`] can build into a `TaskNode`, and a control node is not one. IR-C has no
+/// factory trait of its own either — `INV-17` allows no eighth extension point, and editing a
+/// Control Graph is a later M4 packet (spec 23.4).
+pub const BUILTIN_CONTROL_KINDS: &[&str] = &["Sequence", "Branch", "Repeat", "SubTask"];
+
 /// The spec 8.3 node set, frozen the same way for `learning_hash`.
 pub const BUILTIN_LEARNING_KINDS: &[&str] = &[
     "VisionEncoder",
@@ -146,6 +154,18 @@ pub const BUILTIN_LEARNING_KINDS_HASH: [u8; 32] = [
     0xfc, 0xe3, 0x52, 0xa4, 0x86, 0xca, 0x04, 0x0b,
     0xbd, 0xbd, 0xf4, 0xb5, 0x21, 0x39, 0xa1, 0x2f,
     0xfc, 0xf0, 0x92, 0x0e, 0x1c, 0xaf, 0xfe, 0x51,
+];
+
+/// Frozen blake3 hash of [`BUILTIN_CONTROL_KINDS`] (spec 28.7 gate 10).
+///
+/// Changing this hash is a schema change: bump `schema_version` and add a migration note in
+/// `docs/design/ir-types.md`.
+#[rustfmt::skip]
+pub const BUILTIN_CONTROL_KINDS_HASH: [u8; 32] = [
+    0x24, 0x38, 0x21, 0x8d, 0x1b, 0xb4, 0x98, 0xaa,
+    0xe9, 0x8d, 0xe8, 0x95, 0x69, 0xfd, 0x62, 0xbb,
+    0xe1, 0x82, 0x0e, 0xa1, 0xc8, 0x60, 0xda, 0x04,
+    0x71, 0xa5, 0xe9, 0x82, 0x35, 0xa2, 0x11, 0x58,
 ];
 
 fn placeholder_id() -> StableId {
@@ -582,8 +602,8 @@ node_registry!(
 #[cfg(test)]
 mod frozen_kind_lists {
     use super::{
-        kinds_hash, BUILTIN_LEARNING_KINDS, BUILTIN_LEARNING_KINDS_HASH, BUILTIN_TASK_KINDS,
-        BUILTIN_TASK_KINDS_HASH,
+        kinds_hash, BUILTIN_CONTROL_KINDS, BUILTIN_CONTROL_KINDS_HASH, BUILTIN_LEARNING_KINDS,
+        BUILTIN_LEARNING_KINDS_HASH, BUILTIN_TASK_KINDS, BUILTIN_TASK_KINDS_HASH,
     };
 
     /// Spec 28.7 gate 10: a rename, addition, or removal in either kind list must fail CI, not
@@ -595,6 +615,17 @@ mod frozen_kind_lists {
             BUILTIN_TASK_KINDS_HASH,
             "BUILTIN_TASK_KINDS changed — this is a schema change (see the doc comment on \
              BUILTIN_TASK_KINDS_HASH)"
+        );
+    }
+
+    /// The IR-C kind list is frozen for the same reason: it feeds `task_hash` through
+    /// `ControlNode::kind`.
+    #[test]
+    fn builtin_control_kinds_hash_is_frozen() {
+        assert_eq!(
+            kinds_hash(BUILTIN_CONTROL_KINDS),
+            BUILTIN_CONTROL_KINDS_HASH,
+            "BUILTIN_CONTROL_KINDS changed — this is a schema change (see the doc comment on              BUILTIN_CONTROL_KINDS_HASH)"
         );
     }
 

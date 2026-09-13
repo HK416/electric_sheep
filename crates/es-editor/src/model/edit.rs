@@ -679,6 +679,7 @@ mod tests {
             },
             graph: Graph::new(1),
             observation_spec: ObservationSpec::default(),
+            control: None,
             config: TaskConfig {
                 max_episode_steps: 200,
                 control_rate_hz: 30.0,

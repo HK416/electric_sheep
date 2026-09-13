@@ -16,6 +16,7 @@ use es_physics_core::backend::{LoadConfig, ModelInfo, PhysicsBackend, StateView}
 use es_policy::PolicyRuntime;
 use es_safety::SafetyPlane;
 
+use crate::control::ControlExecutor;
 use crate::domains::DomainRunner;
 use crate::episode::{self, Episode, EpisodeRecorder, EpisodeShape, StepRow, Termination};
 use crate::plan::{ScalarPlan, Source};
@@ -64,6 +65,8 @@ pub struct Env<B: PhysicsBackend> {
     schedule: Schedule,
     model: ModelInfo,
     scalar: ScalarPlan,
+    /// IR-C (spec 6.2). `None` is the IR-D-only task, and then nothing below changes.
+    control: Option<ControlExecutor>,
     randomization: RandomizationPlan,
     recorder: EpisodeRecorder,
     failure_policy: FailurePolicy,
@@ -129,6 +132,7 @@ impl<B: PhysicsBackend> Env<B> {
         let envs = n_envs as usize;
         let mut env = Self {
             scalar: ScalarPlan::compile(task, scene, &model)?,
+            control: ControlExecutor::new(task, n_envs),
             randomization: RandomizationPlan::compile(task, scene, &model)?,
             recorder: EpisodeRecorder::new(n_envs, shape, task.config.max_episode_steps),
             failure_policy: FailurePolicy::default(),
@@ -218,6 +222,9 @@ impl<B: PhysicsBackend> Env<B> {
                 },
             );
             self.episode[i] += 1;
+            if let Some(control) = self.control.as_mut() {
+                control.reset_env(*env);
+            }
             rows_qpos.extend_from_slice(qpos);
             rows_qvel.extend_from_slice(qvel);
             if self.recorder.open(*env).steps() > 0 {
@@ -384,27 +391,56 @@ impl<B: PhysicsBackend> Env<B> {
         }
     }
 
+    /// The task's own `Terminate` predicates and the episode budget, then — when the task has
+    /// a control graph — the stage machine (spec 6.2). A task-level predicate is a
+    /// whole-episode statement and wins over a stage transition.
     fn evaluate_env(&mut self, env: u32) -> Termination {
         self.bind_ports(env);
-        episode::evaluate(
+        let task_level = episode::evaluate(
             &self.scalar,
             &self.ports,
             self.steps[env as usize],
             self.max_episode_steps,
-        )
+        );
+        let Some(control) = self.control.as_mut() else {
+            return task_level;
+        };
+        let outcome = control.step(env, &mut self.ports);
+        match (task_level, outcome.done, outcome.failed) {
+            (Termination::Running, true, true) => Termination::Failure,
+            (Termination::Running, true, false) => Termination::Success,
+            (other, _, _) => other,
+        }
+    }
+
+    /// The active stage's name, when the task has a control graph (spec 6.2).
+    pub fn stage_name(&self, env: u32) -> Option<&str> {
+        self.control.as_ref()?.stage_name(env)
     }
 
     /// `sum(weight * term)` over the task's `Reward` nodes, in ascending node id. A term that
     /// cannot be evaluated contributes nothing rather than poisoning the sum with a `NaN`.
+    ///
+    /// With a control graph the sum runs over the **active stage's** terms only, scaled by the
+    /// stage weight (`docs/design/control-graph.md` §3.2).
     fn reward_of(&self, env: u32) -> f64 {
         if !self.health[env as usize].participates_in_reduction() {
             return 0.0;
         }
-        self.scalar
-            .rewards
-            .iter()
-            .filter_map(|t| t.expr.eval(&self.ports).map(|v| t.weight * v))
-            .sum()
+        let (stage, weight) = match self.control.as_ref().map(|c| c.scored_stage(env)) {
+            None => (None, 1.0),
+            // The graph finished or timed out: no stage is scoring this step.
+            Some(None) => return 0.0,
+            Some(Some((names, weight))) => (Some(names), weight),
+        };
+        weight
+            * self
+                .scalar
+                .rewards
+                .iter()
+                .filter(|t| stage.is_none_or(|names| names.contains(&t.name)))
+                .filter_map(|t| t.expr.eval(&self.ports).map(|v| t.weight * v))
+                .sum::<f64>()
     }
 
     /// Episodes closed so far are handed out by `step` and `reset`; this is the live one.
@@ -516,6 +552,7 @@ pub(crate) mod tests {
             },
             graph,
             observation_spec: es_ir::task::ObservationSpec::default(),
+            control: None,
             config: TaskConfig {
                 max_episode_steps: 0,
                 control_rate_hz: 50.0,

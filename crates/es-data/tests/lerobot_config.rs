@@ -119,6 +119,7 @@ fn task_and_deployment(conv: &Converted) -> (TaskIr, DeploymentIr) {
         },
         graph,
         observation_spec: ObservationSpec { channels },
+        control: None,
         config: TaskConfig {
             max_episode_steps: 400,
             control_rate_hz: control_hz as f32,

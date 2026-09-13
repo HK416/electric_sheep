@@ -2,12 +2,14 @@
 //! randomization, reward/termination evaluation, and episode recording.
 //!
 //! See `docs/design/batch-domains.md` and `docs/ARCHITECTURE.ko.md` §12 (four batch domains),
-//! §6.4 (execution semantics), §18.1 (integer time), §18.5 (failure semantics).
+//! §6.4 (execution semantics), §18.1 (integer time), §18.5 (failure semantics), and
+//! `docs/design/control-graph.md` for IR-C execution ([`control`]).
 //!
 //! Layer rule (§4.2): may depend on layers 0..=8 only. In particular **not** on `es-telemetry`
 //! (layer 10) — [`EnvMetrics`] is a plain struct that `es-telemetry` converts.
 
 pub mod chunk_buffer;
+pub mod control;
 pub mod domains;
 pub mod env;
 pub mod episode;
@@ -18,6 +20,7 @@ pub mod rng;
 pub mod scheduler;
 
 pub use chunk_buffer::{ChunkBuffer, CHUNK_SLOTS};
+pub use control::{ControlExecutor, StageOutcome, StageState};
 pub use domains::{DomainRunner, DomainSizing};
 pub use env::{Env, EnvMetrics, StepOutcome};
 pub use episode::{Episode, EpisodeRecorder, Termination};

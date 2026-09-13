@@ -209,6 +209,7 @@ fn task_ir() -> TaskIr {
         },
         graph,
         observation_spec: ObservationSpec { channels },
+        control: None,
         config: TaskConfig {
             max_episode_steps: 400,
             control_rate_hz: CONTROL_HZ as f32,

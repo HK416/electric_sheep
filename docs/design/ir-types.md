@@ -99,3 +99,14 @@ not a silent hold. Joining two different `Window`s is also an error: the learnin
 `PortType::canonical` writes the whole type into a `CanonWriter` (`hash.rs`) so node params that
 carry a type hash identically across machines. `Normalized`'s two `f64`s go through the writer's
 float rule (−0.0 → 0.0, NaN rejected); no other float reaches the hash from this module.
+
+## Schema migrations
+
+`docs/packets/M0/P29.md` freezes the builtin node kind lists (spec 28.7 gate 10) and
+`factory.rs` asserts each list's blake3 digest, so a rename, an addition or a removal fails CI
+rather than silently moving `task_hash` / `learning_hash`. Every such change is recorded here.
+
+| version | change |
+|---|---|
+| Task IR `1` | initial IR-D schema (P20) |
+| Task IR `2` | IR-C: `TaskIr.control: Option<ControlGraph>`, mixed into `task_hash`. `None` is the default and every pre-IR-C file parses unchanged, but the version itself is hash input, so every `task_hash` moves. New frozen list `BUILTIN_CONTROL_KINDS` = `Sequence`, `Branch`, `Repeat`, `SubTask`, digest `2438218d1bb498aae98de89569fd62bbe1820ea1c860da0471a5e98235a21158`. `BUILTIN_TASK_KINDS` and its digest are unchanged: a control node is not a `TaskNode`, so `TaskNodeFactory` does not claim these kinds. See `docs/design/control-graph.md`. |

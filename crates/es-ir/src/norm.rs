@@ -113,6 +113,7 @@ pub mod testing {
     //! layout sidecar, one-step edits, and the algebraic units.
 
     use super::{relabel, relabel_observation};
+    use crate::control::{ControlGraph, ControlNode};
     use crate::deployment::DeploymentIr;
     use crate::evaluation::EvaluationIr;
     use crate::graph::{Graph, IrNode, NodeId};
@@ -170,9 +171,54 @@ pub mod testing {
         out
     }
 
+    /// Relabels a control tree by `map`, root and child references included. IR-C is part of
+    /// `task_hash` (spec 6.2), so it has to survive the same relabelling as IR-D.
+    fn relabel_control(g: &ControlGraph, map: &BTreeMap<NodeId, NodeId>) -> ControlGraph {
+        let at = |id: NodeId| *map.get(&id).unwrap_or(&id);
+        ControlGraph {
+            root: at(g.root),
+            nodes: g
+                .nodes
+                .iter()
+                .map(|(id, node)| {
+                    let node = match node {
+                        ControlNode::Sequence { children } => ControlNode::Sequence {
+                            children: children.iter().map(|c| at(*c)).collect(),
+                        },
+                        ControlNode::Branch {
+                            condition,
+                            then_,
+                            else_,
+                        } => ControlNode::Branch {
+                            condition: condition.clone(),
+                            then_: at(*then_),
+                            else_: at(*else_),
+                        },
+                        ControlNode::Repeat { body, until } => ControlNode::Repeat {
+                            body: at(*body),
+                            until: until.clone(),
+                        },
+                        leaf @ ControlNode::SubTask { .. } => leaf.clone(),
+                    };
+                    (at(*id), node)
+                })
+                .collect(),
+        }
+    }
+
     pub fn shuffle_task_ids(ir: &TaskIr, seed: u64) -> TaskIr {
+        let control = ir.control.as_ref().map(|c| {
+            let map: BTreeMap<NodeId, NodeId> = c
+                .nodes
+                .keys()
+                .zip(permutation(c.nodes.len(), seed ^ 0xc0_c0))
+                .map(|(id, new)| (*id, NodeId(new)))
+                .collect();
+            relabel_control(c, &map)
+        });
         TaskIr {
             graph: shuffle_ids(&ir.graph, seed),
+            control,
             ..ir.clone()
         }
     }
@@ -247,6 +293,28 @@ pub mod testing {
         let mut scene = ir.clone();
         scene.scene.scene_hash[0] ^= 1;
         out.push(scene);
+        // IR-C is part of task_hash (spec 6.2), so a control edit must move it too.
+        if let Some(control) = &ir.control {
+            let mut edited = ir.clone();
+            let mut tree = control.clone();
+            if let Some(node) = tree.nodes.values_mut().next() {
+                if let crate::control::ControlNode::SubTask { timeout_ticks, .. } = node {
+                    *timeout_ticks += 1;
+                } else if let crate::control::ControlNode::Sequence { children } = node {
+                    children.reverse();
+                }
+            }
+            edited.control = Some(tree);
+            out.push(edited);
+        } else {
+            let mut edited = ir.clone();
+            edited.control = Some(crate::task::testing::control_tree(&[(
+                "unused".to_owned(),
+                1.0,
+                1.0,
+            )]));
+            out.push(edited);
+        }
         out.extend(graph_edits(&ir.graph).into_iter().map(|graph| TaskIr {
             graph,
             ..ir.clone()

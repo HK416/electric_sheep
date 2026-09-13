@@ -369,6 +369,7 @@ fn task_ir() -> TaskIr {
                 },
             )]),
         },
+        control: None,
         config: TaskConfig {
             max_episode_steps: STEPS,
             control_rate_hz: CONTROL_HZ as f32,

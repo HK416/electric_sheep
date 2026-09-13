@@ -2,8 +2,9 @@
 //! `ObservationSpec` declaration (spec 6). Filled in by P20 — no neural nets here (rule 6).
 //!
 //! This module carries **IR-D** only: a pure dataflow DAG with no side effects (spec 6.2).
-//! The IR-C control nodes (`Sequence`, `Branch`, `SubTask`, `Repeat`) are M4 and deliberately
-//! have no variants here; standard pick-and-place / reach / push tasks need IR-D alone.
+//! The IR-C control nodes (`Sequence`, `Branch`, `SubTask`, `Repeat`) are deliberately not
+//! `TaskNode` variants; they live in [`crate::control`] and hang off [`TaskIr::control`].
+//! Standard pick-and-place / reach / push tasks need IR-D alone.
 //!
 //! Three prohibitions of spec 6.1 are structural rather than checked: there is no node for a
 //! neural network, none for preprocessing (Observation IR owns it) and none for wall-clock
@@ -17,6 +18,7 @@ use es_core::StableId;
 use serde::{Deserialize, Serialize};
 
 use crate::codes;
+use crate::control::ControlGraph;
 use crate::diag::Diagnostic;
 use crate::graph::{Graph, IrNode, NodeId, Port};
 use crate::hash::{canonical_hash, CanonWriter};
@@ -24,7 +26,10 @@ use crate::image::ChannelFormat;
 use crate::types::{ElemType, Frame, PortType, Shape, TimeRef, Unit};
 
 /// Current Task IR schema version.
-pub const SCHEMA_VERSION: u32 = 1;
+///
+/// `2` since IR-C: [`TaskIr`] carries an optional [`ControlGraph`] and `task_hash` mixes it in
+/// (migration note in `docs/design/ir-types.md`).
+pub const SCHEMA_VERSION: u32 = 2;
 
 const TASK_TAG: &str = "es.ir.task.v1";
 const TASK_GRAPH_TAG: &str = "es.ir.task_graph.v1";
@@ -987,6 +992,10 @@ pub struct TaskIr {
     pub graph: TaskGraph,
     pub observation_spec: ObservationSpec,
     pub config: TaskConfig,
+    /// IR-C (spec 6.2). `None` is the IR-D-only task and the default, so every task authored
+    /// before IR-C parses unchanged.
+    #[serde(default)]
+    pub control: Option<ControlGraph>,
 }
 
 impl TaskIr {
@@ -1087,6 +1096,10 @@ impl TaskIr {
             }
         }
 
+        if let Some(control) = &self.control {
+            diags.extend(control.validate(self));
+        }
+
         if let Err(d) = self.task_hash() {
             diags.push(d);
         }
@@ -1104,6 +1117,13 @@ impl TaskIr {
         self.observation_spec.canonical(&mut w);
         self.config.canonical(&mut w);
         w.digest(&graph);
+        match &self.control {
+            Some(control) => {
+                w.bool(true);
+                w.digest(&control.control_hash()?);
+            }
+            None => w.bool(false),
+        }
         w.hash()
     }
 
@@ -1147,15 +1167,16 @@ impl TaskIr {
 #[cfg(any(test, feature = "testing"))]
 pub mod testing {
     use super::{
-        ArithOp, CmpOp, Distribution, JointQuantity, NormKind, ObsChannel, ObsSource,
+        ArithOp, CmpOp, Distribution, Expr, JointQuantity, NormKind, ObsChannel, ObsSource,
         ObservationSpec, SceneRef, TaskConfig, TaskGraph, TaskIr, TaskNode, TerminationKind, Unit,
         SCHEMA_VERSION,
     };
+    use crate::control::{ControlGraph, ControlNode, RepeatUntil, SubTaskRef};
     use crate::graph::NodeId;
     use crate::types::{ElemType, Frame, PortType, Shape, TimeRef};
     use es_core::StableId;
     use proptest::prelude::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     pub fn ty(elem: ElemType, n: u64, unit: Unit, frame: Frame) -> PortType {
         PortType {
@@ -1331,6 +1352,7 @@ pub mod testing {
             },
             graph: g,
             observation_spec: ObservationSpec { channels },
+            control: None,
             config: TaskConfig {
                 max_episode_steps: 400,
                 control_rate_hz: 50.0,
@@ -1343,16 +1365,91 @@ pub mod testing {
         }
     }
 
-    /// Valid, connected small Task IRs (Appendix B.7).
+    /// A `Sequence` of one stage per reward term, wrapped in a `Repeat` and reached through a
+    /// `Branch` — every IR-C kind of spec 6.2, over a task that actually declares those rewards.
+    pub fn control_tree(terms: &[(String, f64, f64)]) -> ControlGraph {
+        let done = |port: &str| Expr::Compare {
+            op: CmpOp::Gt,
+            lhs: Box::new(Expr::Port(port.to_owned())),
+            rhs: Box::new(Expr::Const(0.5)),
+        };
+        let mut nodes = BTreeMap::new();
+        let stage_ids: Vec<NodeId> = (0..terms.len())
+            .map(|i| NodeId(u32::try_from(i).unwrap_or(0) + 4))
+            .collect();
+        for ((name, weight, _), id) in terms.iter().zip(&stage_ids) {
+            nodes.insert(
+                *id,
+                ControlNode::SubTask {
+                    task: SubTaskRef {
+                        name: name.clone(),
+                        rewards: [name.clone()].into(),
+                        observation: ["joint_state".to_owned()].into(),
+                        success: Some(done("stage.done")),
+                        reset_on_entry: false,
+                        weight: *weight,
+                    },
+                    timeout_ticks: 40,
+                },
+            );
+        }
+        nodes.insert(
+            NodeId(3),
+            ControlNode::Sequence {
+                children: stage_ids,
+            },
+        );
+        nodes.insert(
+            NodeId(2),
+            ControlNode::Repeat {
+                body: NodeId(3),
+                until: RepeatUntil::Count(2),
+            },
+        );
+        nodes.insert(
+            NodeId(1),
+            ControlNode::SubTask {
+                task: SubTaskRef {
+                    name: "abort".to_owned(),
+                    rewards: BTreeSet::new(),
+                    observation: BTreeSet::new(),
+                    success: Some(done("stage.ticks")),
+                    reset_on_entry: true,
+                    weight: 0.0,
+                },
+                timeout_ticks: 5,
+            },
+        );
+        nodes.insert(
+            NodeId(0),
+            ControlNode::Branch {
+                condition: done("time.episode"),
+                then_: NodeId(2),
+                else_: NodeId(1),
+            },
+        );
+        ControlGraph {
+            root: NodeId(0),
+            nodes,
+        }
+    }
+
+    /// Valid, connected small Task IRs (Appendix B.7), half of them carrying a control tree so
+    /// the five properties cover IR-C as well as IR-D.
     pub fn arbitrary_task_ir() -> impl Strategy<Value = TaskIr> {
         (
             proptest::collection::vec(("term[a-c]{1,3}", 0.1f64..4.0, 0.01f64..2.0), 1..4),
             1u32..8,
+            any::<bool>(),
         )
-            .prop_map(|(mut terms, dof)| {
+            .prop_map(|(mut terms, dof, control)| {
                 terms.sort_by(|a, b| a.0.cmp(&b.0));
                 terms.dedup_by(|a, b| a.0 == b.0);
-                task_ir(&terms, dof)
+                let mut ir = task_ir(&terms, dof);
+                if control {
+                    ir.control = Some(control_tree(&terms));
+                }
+                ir
             })
     }
 }

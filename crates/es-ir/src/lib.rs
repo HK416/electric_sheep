@@ -10,7 +10,8 @@
 //! The first four live in `es-ir-types` since P-M0-R4 (spec 1.5 context budget) and are
 //! re-exported here unchanged.
 //! The five IRs (P20..P24) fill in [`task`], [`observation`], [`learning`], [`deployment`],
-//! [`evaluation`], and the boundary rules (P26) fill in [`cross`].
+//! [`evaluation`], and the boundary rules (P26) fill in [`cross`]. IR-C, the Task IR control
+//! graph (spec 6.2), is [`control`]; see `docs/design/control-graph.md`.
 
 pub mod graph;
 pub mod hash;
@@ -20,6 +21,7 @@ pub mod norm;
 // every `es_ir::codes::..` / `es_ir::types::..` path still resolves.
 pub use es_ir_types::{codes, diag, image, types};
 
+pub mod control;
 pub mod cross;
 pub mod deployment;
 pub mod evaluation;
@@ -41,6 +43,7 @@ pub mod testing {
     pub use crate::task::testing::arbitrary_task_ir;
 }
 
+pub use control::{ControlGraph, ControlNode, ControlNodeId, RepeatUntil, SubTaskRef};
 pub use diag::{DiagCode, Diagnostic, Severity};
 pub use graph::{Dir, Edge, Graph, IrNode, NodeId, Port, PortRef};
 pub use hash::{
