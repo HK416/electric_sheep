@@ -857,3 +857,80 @@ fn missing_file_exits_1() {
         .expect("run es");
     assert_eq!(out.status.code(), Some(1));
 }
+
+/// The shared MJCF fixture (`option cone="elliptic"`), also used by `es-physics-backend`'s own
+/// mapping tests: it blocks `mjwarp` (spec 17.2 maps `MJWarp`'s cone to pyramidal only) but not
+/// `mujoco-cpu`.
+fn pendulum_fixture() -> PathBuf {
+    Path::new(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/mjcf/pendulum.xml"
+    ))
+    .to_path_buf()
+}
+
+#[test]
+fn backend_compare_blocked_backend_exits_1() {
+    let scene = pendulum_fixture();
+    let out = bin()
+        .args(["backend", "compare", "--scene"])
+        .arg(&scene)
+        .args(["--backends", "mujoco-cpu,mjwarp"])
+        .output()
+        .expect("run es");
+    let text = stdout(&out);
+    assert!(
+        text.contains("semantic mapping report - backend `mujoco-cpu`"),
+        "{text}"
+    );
+    assert!(
+        text.contains("semantic mapping report - backend `mjwarp`"),
+        "{text}"
+    );
+    // `mjwarp` maps the scene's elliptic friction cone to `blocked` (spec 17.2/14.4)
+    // regardless of whether a Python `mujoco_warp` is installed, so it is always skipped.
+    assert!(text.contains("backend `mjwarp`: SKIPPED"), "{text}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn backend_compare_unblocked_but_unavailable_exits_0() {
+    let scene = pendulum_fixture();
+    let out = bin()
+        .args(["backend", "compare", "--scene"])
+        .arg(&scene)
+        .args(["--backends", "mujoco-cpu"])
+        .output()
+        .expect("run es");
+    let text = stdout(&out);
+    assert!(
+        text.contains("semantic mapping report - backend `mujoco-cpu`"),
+        "{text}"
+    );
+    // CI's Python has no `mujoco` package, so the only requested backend is skipped for an
+    // environment reason (spec: environment-reason skips still exit 0).
+    assert!(text.contains("backend `mujoco-cpu`: SKIPPED"), "{text}");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn backend_compare_unknown_backend_exits_2() {
+    let scene = pendulum_fixture();
+    let out = bin()
+        .args(["backend", "compare", "--scene"])
+        .arg(&scene)
+        .args(["--backends", "not-a-real-backend"])
+        .output()
+        .expect("run es");
+    assert_eq!(out.status.code(), Some(2));
+}
