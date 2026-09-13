@@ -74,10 +74,20 @@ identity variant.
 | `down_dims` | `[int, ...]` | U-Net channel widths, e.g. `[512, 1024, 2048]` |
 | `kernel_size` | int | |
 | `noise_scheduler_type` | string | e.g. `"DDPM"`, `"DDIM"` |
-| `num_train_timesteps` | int | |
-| `beta_schedule` | string | e.g. `"squaredcos_cap_v2"` |
-| `prediction_type` | string | e.g. `"epsilon"` — not modeled beyond being carried through |
+| `num_train_timesteps` | int | default `100`; the grid the beta schedule is built over |
+| `beta_schedule` | string | default `"squaredcos_cap_v2"`; `"linear"` is the other one we lower |
+| `prediction_type` | string | default `"epsilon"`; `"sample"` / `"v_prediction"` are carried through and refused by the lowering |
 | `num_inference_steps` | int \| null | defaults to `num_train_timesteps` when absent |
+| `clip_sample` | bool | default `true` — `diffusers` clamps `pred_original_sample` |
+| `clip_sample_range` | float | default `1.0` |
+
+These six are `diffusers`' `DDPMScheduler` / `DDIMScheduler` configuration and all of them
+reach `HeadKind::Diffusion` unchanged: a checkpoint trained under one schedule does not
+reproduce under another. `variance_type` is **not** a LeRobot field, so the conversion pins
+`diffusers`' own default, `fixed_small`. The defaults above are `unverified` — recalled from
+`lerobot/common/policies/diffusion/configuration_diffusion.py`, not fetched; they are the
+`serde` defaults in `es_ir::learning::HeadKind::Diffusion` and in `DiffusionConfig`, so a
+config that omits a field still converts.
 
 `noise_scheduler_type` maps to `es_ir::learning::DiffusionScheduler` as: `"DDPM" ->
 Ddpm`, `"DDIM" -> Ddim`, anything else -> `DpmSolver` with a warning naming the unrecognized

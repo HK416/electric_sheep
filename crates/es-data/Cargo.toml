@@ -19,6 +19,9 @@ parquet = { version = "59.3", default-features = false }
 
 [dev-dependencies]
 proptest = { workspace = true }
+# Oracle only (P-M2-R2): a converted config must actually plan. es-data is layer 10 and
+# es-compile layer 7, so this is a legal, strictly-lower dependency.
+es-compile = { workspace = true }
 
 [lints]
 workspace = true

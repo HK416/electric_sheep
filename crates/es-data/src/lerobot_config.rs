@@ -21,9 +21,10 @@ use es_ir::image::{
     Rect, ShutterModel,
 };
 use es_ir::learning::{
-    ActionExecutionMode, ArchKind, ChunkBlendPolicy, DiffusionScheduler, FusionKind, HeadKind,
-    LearningGraph, LearningNode, NormalizeDir, PolicyContract, PolicyHandle, RuntimeHints,
-    StateEncoderKind, StatsSource, TemporalKind, VisionBackbone, WeightsRef,
+    ActionExecutionMode, ArchKind, BetaSchedule, ChunkBlendPolicy, DiffusionScheduler, FusionKind,
+    HeadKind, LearningGraph, LearningNode, NormalizeDir, PolicyContract, PolicyHandle,
+    PredictionType, RuntimeHints, StateEncoderKind, StatsSource, TemporalKind, VarianceType,
+    VisionBackbone, WeightsRef,
 };
 use es_ir::observation::{
     self, AugmentKind, History, Io, NormalizeStats, ObservationIr, ObservationNode,
@@ -121,6 +122,12 @@ pub struct DiffusionConfig {
     pub prediction_type: String,
     #[serde(default)]
     pub num_inference_steps: Option<u32>,
+    /// `diffusers`' `clip_sample` / `clip_sample_range`, which `LeRobot` re-exports with the
+    /// same defaults. Optional here because older configs predate them.
+    #[serde(default = "default_clip_sample")]
+    pub clip_sample: bool,
+    #[serde(default = "default_clip_sample_range")]
+    pub clip_sample_range: f32,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -198,8 +205,24 @@ pub enum ConfigError {
     Json(#[from] serde_json::Error),
     #[error("missing or malformed feature: {0}")]
     MissingFeature(String),
+    #[error("feature dimension out of range: {0}")]
+    OutOfRange(String),
     #[error("IR construction failed: {0}")]
     Ir(String),
+}
+
+/// Largest `shape` entry this crate will turn into a buffer. `config.json` is untrusted
+/// input, and every dim is allocated at least twice (the mean and the std of an identity
+/// statistic); 65,536 is orders of magnitude above any real robot's joint or action count.
+const MAX_DIM: u64 = 65_536;
+
+fn checked_dim(name: &str, what: &str, dim: u64) -> Result<u32, ConfigError> {
+    if dim == 0 || dim > MAX_DIM {
+        return Err(ConfigError::OutOfRange(format!(
+            "\"{name}\": {what} dim is {dim}, outside 1..={MAX_DIM}"
+        )));
+    }
+    Ok(dim as u32)
 }
 
 /// The result of [`convert`]: a consistent Observation IR / Learning IR pair, plus every
@@ -419,9 +442,14 @@ fn build_visual_stream(
         );
         obs.graph
             .connect(cur_id, observation::OUT, crop_id, &observation::in_port(0));
+        (cur_id, cur_ty, cur_spec) = (crop_id, cropped_ty, cropped_spec);
         if is_random {
-            // Unwired: spec §7.3/INV-15 disables it structurally under Evaluation IR, leaving
-            // the deterministic centred crop above as what eval (and sim/real) actually run.
+            // `Augment` is geometry-preserving in this IR (it propagates the incoming
+            // `ImageSpec` unchanged), so LeRobot's random crop is the centred `Crop` above
+            // plus an offset jitter *of that window*, which is what this node names. Wired
+            // into the chain rather than dangling: an unreachable node is a graph no planner
+            // can lower. `training_only` means evaluation and deployment auto-disable it
+            // (INV-15, spec §7.3/§10.4) and run the deterministic centred crop.
             let aug_id = next_id(counter);
             obs.graph.insert(
                 aug_id,
@@ -431,11 +459,13 @@ fn build_visual_stream(
                         height: crop_h,
                     },
                     training_only: true,
-                    io: Io::unary(cur_ty.clone(), cropped_ty.clone()),
+                    io: Io::unary(cur_ty.clone(), cur_ty.clone()),
                 },
             );
+            obs.graph
+                .connect(cur_id, observation::OUT, aug_id, &observation::in_port(0));
+            cur_id = aug_id;
         }
-        (cur_id, cur_ty, cur_spec) = (crop_id, cropped_ty, cropped_spec);
     }
 
     let resized_spec = cur_spec.resized(POLICY_RESOLUTION, POLICY_RESOLUTION, true);
@@ -507,6 +537,7 @@ fn build_state_stream(
             feature.shape
         )));
     };
+    let dim = u64::from(checked_dim(name, "STATE", dim)?);
     let source = StableId::from_path(name);
     // Joint position control (spec §5.4's `Unit::Angle`) is the assumption this crate makes
     // for an unqualified STATE vector — LeRobot's config.json carries no physical unit
@@ -579,6 +610,45 @@ fn vision_backbone(name: &str, warnings: &mut Vec<String>) -> VisionBackbone {
                 "unrecognized vision_backbone \"{other}\"; assuming resnet18"
             ));
             VisionBackbone::ResNet18
+        }
+    }
+}
+
+fn default_clip_sample() -> bool {
+    true
+}
+
+fn default_clip_sample_range() -> f32 {
+    1.0
+}
+
+/// `diffusers`' `beta_schedule`. An unrecognized one falls back to `LeRobot`'s default with a
+/// warning rather than to silence: the schedule decides every coefficient of the sampler.
+fn beta_schedule(name: &str, warnings: &mut Vec<String>) -> BetaSchedule {
+    match name {
+        "linear" => BetaSchedule::Linear,
+        "squaredcos_cap_v2" => BetaSchedule::SquaredcosCapV2,
+        other => {
+            warnings.push(format!(
+                "unrecognized beta_schedule \"{other}\"; assuming \"squaredcos_cap_v2\""
+            ));
+            BetaSchedule::SquaredcosCapV2
+        }
+    }
+}
+
+/// `diffusers`' `prediction_type`. Only `epsilon` lowers today, but the other two are carried
+/// through so `es-policy` can refuse them by name instead of misreading the denoiser.
+fn prediction_type(name: &str, warnings: &mut Vec<String>) -> PredictionType {
+    match name {
+        "epsilon" => PredictionType::Epsilon,
+        "sample" => PredictionType::Sample,
+        "v_prediction" => PredictionType::VPrediction,
+        other => {
+            warnings.push(format!(
+                "unrecognized prediction_type \"{other}\"; assuming \"epsilon\""
+            ));
+            PredictionType::Epsilon
         }
     }
 }
@@ -755,7 +825,19 @@ fn build_learning(
             (
                 c.horizon,
                 c.n_action_steps,
-                HeadKind::Diffusion { n_steps, scheduler },
+                HeadKind::Diffusion {
+                    n_steps,
+                    scheduler,
+                    // The schedule is built over the *training* grid and subsampled to
+                    // `n_steps`, so both numbers have to survive the conversion.
+                    num_train_timesteps: c.num_train_timesteps,
+                    beta_schedule: beta_schedule(&c.beta_schedule, warnings),
+                    // Not a `LeRobot` field: `DDPMScheduler`'s default is `fixed_small`.
+                    variance_type: VarianceType::FixedSmall,
+                    prediction_type: prediction_type(&c.prediction_type, warnings),
+                    clip_sample: c.clip_sample,
+                    clip_sample_range: c.clip_sample_range,
+                },
                 ActionExecutionMode::RecedingHorizon,
                 ChunkBlendPolicy::HardSwitch,
             )
@@ -946,7 +1028,7 @@ pub fn convert(
             action_cfg.shape
         )));
     };
-    let action_dim = action_dim as u32;
+    let action_dim = checked_dim(action_name, "ACTION", action_dim)?;
     let n_obs_steps = cfg.n_obs_steps();
 
     let crop = match cfg {

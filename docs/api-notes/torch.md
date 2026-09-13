@@ -16,6 +16,7 @@ M1 backend), spec 8.7 (lowering), spec 8.9 (tier-4 equivalence). The lowering co
 | `numpy` | **not installed, not required** — see "No numpy" below |
 | `safetensors` package | **not required** — the reader is 15 lines of `struct` + `json` |
 | `torchvision` | required **only** for a graph with a `VisionEncoder`; not exercised by CI yet |
+| `diffusers` | **0.40.0**, required only by `python/ddpm_ref_check.py` (the DDPM/DDIM oracle); pure Python, `pip install diffusers` |
 
 Install for a local run:
 
@@ -28,6 +29,26 @@ ES_PYTHON=<venv>/Scripts/python cargo test -p es-policy
 `ES_PYTHON` is the same variable the `MuJoCo` oracle uses, so one venv can serve both. Without
 it, `python` then `python3` are tried in order; with no `torch` anywhere, the equivalence test
 prints `SKIPPED` and passes, and every other test still runs.
+
+## `diffusers` — the independent DDPM/DDIM oracle
+
+`python/ddpm_ref_check.py` is a second, smaller script with the same stdin/stdout JSON shape.
+It exists because the Rust reference of `src/reference.rs` mirrors the lowering, so it cannot
+catch a wrong *schedule* (M2 review, `crates/es-policy/src/reference.rs:26`). What it calls:
+
+| symbol | used for |
+|---|---|
+| `diffusers.DDPMScheduler(num_train_timesteps, beta_schedule, variance_type, clip_sample, clip_sample_range, prediction_type)` | the schedule under test |
+| `diffusers.DDIMScheduler(...)` | same, minus `variance_type` (it has none; eta = 0 uses no variance) |
+| `.set_timesteps(n)` / `.timesteps` / `.alphas_cumprod` | the subsample and the cumulative alphas |
+| `._get_variance(t)` / `._get_variance(t, prev_t)` | per-step variance; private, and the one place a version bump is likely to bite |
+| `.step(model_output, t, sample).prev_sample` | the whole sampler loop, for the second test |
+| `diffusers.schedulers.scheduling_ddpm.randn_tensor` | monkeypatched to hand DDPM the checkpoint's `noise_<t>` buffer instead of a fresh draw, so both sides consume the same numbers (spec 3.4) |
+
+Two shapes worth knowing: `DDPMScheduler.step` reads `model_output.shape[1]` to detect a
+learned variance, so it needs a batch axis the lowered head does not have (the script
+reshapes); and `_get_variance` is private API, so a `diffusers` upgrade is a diff against this
+table. No `diffusers` -> both tests print `SKIPPED` and pass, as with `torch`.
 
 ## The Python API this depends on
 
@@ -127,6 +148,11 @@ where it can be read.
   gate (spec 8.9) is where that lands.
 - A real LeRobot ACT checkpoint needs a key remap onto this scheme — see the design note,
   section 5.
+- `prediction_type` other than `"epsilon"` is `LowerError::Unsupported`: the lowered denoiser
+  is `eps_theta`, and `"sample"` / `"v_prediction"` are a different `pred_original_sample`.
+- `timestep_spacing` is pinned to `diffusers`' `"leading"` default; `"linspace"` / `"trailing"`
+  are not modeled, and neither are `steps_offset != 0`, `rescale_betas_zero_snr`, `thresholding`
+  or `DDIMScheduler`'s `eta > 0`.
 - No batching. The generated module is written for one sample; `Linear` broadcasts a leading
   axis anyway, but `PolicyHead`'s `reshape(H, A)` pins the convention and would need changing.
 - Startup cost is a whole Python interpreter plus a torch import, roughly a second. This is the

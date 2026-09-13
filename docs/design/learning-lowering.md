@@ -286,30 +286,72 @@ w_i              = exp(-ln(1e4) * i / half),   half = cond / 2
 
 ### 8.3 `Diffusion`: DDPM and DDIM
 
-Linear beta schedule, `beta_0 = 1e-4` to `beta_{n-1} = 0.02` (Ho et al.; LeRobot's default),
-`alpha_t = 1 - beta_t`, `abar_t = prod_{j<=t} alpha_j`. Spec 8.3 pins `n_steps` and the
-scheduler kind and nothing else, so the two endpoints are lowering constants.
+The schedule is `diffusers`' `DDPMScheduler` / `DDIMScheduler`, because that is what a LeRobot
+Diffusion Policy checkpoint was trained under. Everything it needs is on the node
+(`HeadKind::Diffusion`, added in P-M2-R6 with `serde` defaults so older IR still loads):
+`num_train_timesteps`, `beta_schedule`, `variance_type`, `prediction_type`, `clip_sample`,
+`clip_sample_range`. Only `beta_start = 1e-4` / `beta_end = 0.02` stay lowering constants, as
+`nhead = 8` is in section 3 — LeRobot does not override them.
 
-Both schedulers collapse to one update, which is why there is one loop and not two:
+**The schedule is built over the training grid, not over `n_steps`.** `betas` has
+`num_train_timesteps` entries (`torch.linspace` for `"linear"`; `betas_for_alpha_bar` with
+`alpha_bar(t) = cos((t + 0.008)/1.008 * pi/2)^2` capped at `0.999` for `"squaredcos_cap_v2"`),
+`abar_t = prod_{j<=t} alpha_j` over that same grid, and the `n_steps` **inference** timesteps
+are subsampled out of it exactly as `set_timesteps` does under the default
+`timestep_spacing = "leading"`:
 
 ```
-for t = n_steps-1 down to 0:
+stride    = num_train_timesteps // n_steps          # integer division
+timesteps = [(n_steps-1)*stride, ..., 2*stride, stride, 0]
+```
+
+so 8 steps out of 100 are `[84, 72, 60, 48, 36, 24, 12, 0]`, not `[7 .. 0]`. `abar_prev` is the
+**next** entry of that list (`previous_timestep`), and `1.0` past the end. The M2 review's
+finding was exactly this: a schedule spanning `BETA_START..BETA_END` across the inference steps
+is a different model, and a real checkpoint will not reproduce under it.
+
+One loop still serves both schedulers, now in `diffusers`' own decomposition so that
+`clip_sample` has somewhere to apply (an affine `c1*x + c3*eps` cannot express a clamp):
+
+```
+for i, t in enumerate(timesteps):
     eps = eps_theta(x, cond, float(t))
-    x   = c1[t] * x + c3[t] * eps
-    if sigma[t] != 0:  x = x + sigma[t] * noise_t
+    x0  = (x - sqrt_1mab[i] * eps) / sqrt_ab[i]     # pred_original_sample
+    if clip_sample:  x0 = clamp(x0, -range, +range)
+    x   = c0[i] * x0 + cx[i] * x + ce[i] * eps
+    if sigma[i] != 0:  x = x + sigma[i] * noise_t
 ```
 
-| | `c1[t]` | `c3[t]` | `sigma[t]` |
-|---|---|---|---|
-| `Ddpm` | `1/sqrt(alpha_t)` | `-c1[t] * beta_t / sqrt(1 - abar_t)` | `sqrt(beta_t)`, and `0` at `t = 0` |
-| `Ddim` (eta = 0) | `sqrt(abar_{t-1} / abar_t)` | `sqrt(1 - abar_{t-1}) - c1[t] * sqrt(1 - abar_t)` | `0` |
+| | `c0[i]` | `cx[i]` | `ce[i]` | `sigma[i]` |
+|---|---|---|---|---|
+| `Ddpm` | `sqrt(abar_prev) * beta_cur / (1 - abar_t)` | `sqrt(alpha_cur) * (1 - abar_prev) / (1 - abar_t)` | `0` | `sqrt(var_t)`, and `0` at `t = 0` |
+| `Ddim` (eta = 0) | `sqrt(abar_prev)` | `0` | `sqrt(1 - abar_prev)` | `0` |
 
-with `abar_{-1} = 1`. The three coefficient lists are computed **in Rust, in f32, with
-`es_math::approx`** and emitted into the generated Python as shortest-round-trip literals; they
-are plain Python lists, not buffers, so they never enter `state_dict` and a checkpoint can never
-disagree with the IR about the schedule (the `Normalizer` rule of section 3, applied again). The
-same `diffusion_schedule` function feeds the Rust reference, so the tier-4 test measures the
-loop and the network rather than two spellings of a beta schedule.
+with `alpha_cur = abar_t / abar_prev`, `beta_cur = 1 - alpha_cur`, and the variance from
+`DDPMScheduler._get_variance`, clamped below at `1e-20` as diffusers does:
+
+| `variance_type` | `var_t` |
+|---|---|
+| `fixed_small` (default) | `(1 - abar_prev) / (1 - abar_t) * beta_cur` — the posterior `beta~_t` |
+| `fixed_large` | `beta_cur` |
+
+`fixed_large` is `DDPMScheduler`'s other fixed option; `DDIMScheduler` has no `variance_type`
+at all, so under `Ddim` the field is ignored (and eta = 0 uses no variance anyway).
+`prediction_type` other than `epsilon` is `LowerError::Unsupported`: the denoiser of section
+8.2 is `eps_theta`, and pretending otherwise is a silently wrong action chunk. An odd `cond` is
+`LowerError::Shape` for the same reason — `_sinusoidal` would return `2*(cond//2)` values and
+`_Denoiser.l0` would mismatch at run time, where the oracle is blind to it.
+
+The coefficient lists are computed **in Rust, in f32, with `es_math::approx`** and emitted into
+the generated Python as shortest-round-trip literals, together with the timestep list; they are
+plain Python lists, not buffers, so they never enter `state_dict` and a checkpoint can never
+disagree with the IR about the schedule (the `Normalizer` rule of section 3, applied again).
+The `noise_<t>` buffers of section 8.1 are keyed by the **real** diffusers timestep, so an
+8-step DDPM head out of 100 declares `noise_12 .. noise_84` and no `noise_0`.
+
+`src/reference.rs` still shares `diffusion_schedule` with the lowering, on purpose (see section
+8.1) — what makes that honest now is that `diffusion_schedule` has its own independent oracle,
+section 8.5.
 
 ### 8.4 `FlowMatching`
 
@@ -328,18 +370,39 @@ SmolVLA: a real SmolVLA checkpoint is a `PolicyBundle` (section 7) and stays `Un
 
 ### 8.5 Tier-4 result (spec 8.9, spec 28.7 gate 12)
 
-`src/reference.rs` (test-only) mirrors the generated module in f32 with a fixed op order and
-`es_math::approx` for `exp`/`sin`/`cos`/`sqrt`, and the test compares it against torch for
-state 4 -> `Linear` -> cond 16, action 2, horizon 3, 8 steps. Measured with torch 2.14.0+cpu:
+Three oracles, in increasing independence. All of them **SKIP** (printing why) when no
+interpreter with the wheel they need is found; `ES_PYTHON` points at one.
 
-| head | `max_abs` | `max_rel` | tier-4 limit |
+1. `src/reference.rs` (test-only) mirrors the generated module in f32 with a fixed op order and
+   `es_math::approx` for `exp`/`sin`/`cos`/`sqrt`, and the test compares it against torch for
+   state 4 -> `Linear` -> cond 16, action 2, horizon 3, 8 inference steps out of 100 training
+   timesteps, `squaredcos_cap_v2` / `fixed_small` / `clip_sample`.
+2. `diffusion_schedule_matches_diffusers` runs `python/ddpm_ref_check.py`, which builds a real
+   `DDPMScheduler` / `DDIMScheduler`, and compares `alphas_cumprod` (all 100), the subsampled
+   `timesteps` (exactly equal, not within a tolerance) and `_get_variance` per step, over all
+   eight combinations of scheduler x `beta_schedule` x `variance_type`.
+3. `torch_{ddpm,ddim}_matches_diffusers_step_loop` runs the whole lowered head through torch and
+   compares it to a **direct `scheduler.step(model_output, t, sample)` loop** over the same tiny
+   denoiser weights. Only the network is rebuilt on the Python side; every coefficient comes
+   from diffusers, so the reference no longer mirrors the lowering line for line. DDPM's
+   ancestral draw is supplied by monkeypatching `randn_tensor` with the checkpoint's `noise_<t>`
+   buffer, which is the only way to compare an ancestral sampler at all (section 8.1).
+
+Measured with torch 2.14.0+cpu and diffusers 0.40.0:
+
+| test | `max_abs` | `max_rel` | limit |
 |---|---|---|---|
-| `Diffusion { Ddpm }` | 5.96e-8 | 2.60e-6 | 1e-5 |
-| `Diffusion { Ddim }` | 3.73e-8 | 4.32e-7 | 1e-5 |
-| `FlowMatching` | 1.04e-7 | 1.37e-6 | 1e-5 |
+| `torch_ddpm_matches_rust` | 2.76e-7 | 2.24e-6 | 1e-5 |
+| `torch_ddim_matches_rust` | 1.79e-7 | 2.65e-7 | 1e-5 |
+| `torch_flow_matching_matches_rust` | 1.04e-7 | 1.37e-6 | 1e-5 |
+| `torch_ddpm_matches_diffusers_step_loop` | 6.86e-7 | 1.82e-6 | 1e-5 |
+| `torch_ddim_matches_diffusers_step_loop` | 1.34e-6 | 2.72e-6 | 1e-5 |
+| `diffusion_schedule_matches_diffusers` (`alphas_cumprod`) | <= 2.39e-7 | — | 1e-5 |
+| `diffusion_schedule_matches_diffusers` (`_get_variance`) | <= 4.18e-7 | — | 1e-5 |
+| `diffusion_schedule_matches_diffusers` (`timesteps`) | 0 | — | exact |
 
-The residual is the gap between `es_math::approx` and libm in the timestep embedding plus
-matmul accumulation order; it does not grow with the step count in these configurations because
-both schedulers contract towards the denoiser's output. The tests re-run each policy and assert
-the spec 8.9 bitwise row as well, which is where a hidden RNG would show up. They **SKIP**
-(printing why) when no interpreter with `torch` is found; `ES_PYTHON` points at one.
+The residual is the gap between `es_math::approx` and libm in the timestep embedding and the
+schedule plus matmul accumulation order; it does not grow with the step count in these
+configurations because both schedulers contract towards the denoiser's output. The tests re-run
+each policy and assert the spec 8.9 bitwise row as well, which is where a hidden RNG would show
+up.

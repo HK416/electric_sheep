@@ -138,7 +138,7 @@ fn truncate(line: &str) -> String {
 
 /// Interpreters to try, in order. `ES_PYTHON` overrides the search entirely — the same knob
 /// the `MuJoCo` oracle uses, so one environment variable points both at the same venv.
-fn python_candidates() -> Vec<String> {
+pub(crate) fn python_candidates() -> Vec<String> {
     match std::env::var("ES_PYTHON") {
         Ok(path) if !path.trim().is_empty() => vec![path],
         _ => vec!["python".to_owned(), "python3".to_owned()],

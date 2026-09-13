@@ -15,8 +15,9 @@ use std::fmt::Write as _;
 
 use es_ir::graph::{IrNode, NodeId};
 use es_ir::learning::{
-    DiffusionScheduler, FusionKind, HeadKind, LearningGraph, LearningNode, NormalizeDir,
-    StateEncoderKind, StatsSource, TemporalKind, VisionBackbone,
+    BetaSchedule, DiffusionScheduler, FusionKind, HeadKind, LearningGraph, LearningNode,
+    NormalizeDir, PredictionType, StateEncoderKind, StatsSource, TemporalKind, VarianceType,
+    VisionBackbone,
 };
 use es_ir::types::ElemType;
 use es_ir::Diagnostic;
@@ -31,72 +32,181 @@ const LOWERING_TAG: &str = "es.lowering.torch.v1";
 /// the shape check rather than being silently reinterpreted (design note section 3).
 const TRANSFORMER_HEADS: u64 = 8;
 
-/// Ends of the linear beta schedule (Ho et al. 2020, and `LeRobot`'s Diffusion Policy default).
-/// Spec 8.3 gives `HeadKind::Diffusion` an `n_steps` and a scheduler kind and nothing else, so
-/// the betas are lowering constants exactly as `TRANSFORMER_HEADS` is (design note section 8).
+/// Ends of the linear beta schedule — `diffusers`' `beta_start` / `beta_end` defaults, which
+/// `LeRobot` does not override. Spec 8.3 does not carry them, so they stay lowering constants
+/// exactly as `TRANSFORMER_HEADS` is (design note section 8).
 const BETA_START: f32 = 1e-4;
 const BETA_END: f32 = 0.02;
 
-/// Per-step coefficients of the reverse loop, written so both schedulers share one line:
-/// `x_{t-1} = c1[t] * x_t + c3[t] * eps_theta(x_t, cond, t) + sigma[t] * z_t`.
-///
-/// The lowering emits these as float literals into the generated Python and the test-only Rust
-/// reference calls [`diffusion_schedule`] for the same `f32`s, so the tier-4 comparison measures
-/// the sampling loop and the network, not two spellings of a beta schedule.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Schedule {
-    pub c1: Vec<f32>,
-    pub c3: Vec<f32>,
-    /// Zero at `t == 0` and for every `t` under `Ddim` (eta = 0), which is what makes DDIM
-    /// consume no `noise_<t>` buffer at all.
-    pub sigma: Vec<f32>,
+/// `betas_for_alpha_bar`'s cap in `diffusers`.
+const MAX_BETA: f32 = 0.999;
+
+/// The parameters of one `DDPMScheduler` / `DDIMScheduler`, unpacked from
+/// [`HeadKind::Diffusion`] so [`diffusion_schedule`] takes one argument instead of seven.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DiffusionParams {
+    pub n_steps: u32,
+    pub scheduler: DiffusionScheduler,
+    pub num_train_timesteps: u32,
+    pub beta_schedule: BetaSchedule,
+    pub variance_type: VarianceType,
+    pub clip_sample: bool,
+    pub clip_sample_range: f32,
 }
 
-/// The DDPM/DDIM coefficients for `n_steps` under a linear beta schedule, in f32 with a fixed
-/// op order (spec 3.4). `alpha_bar` is a running product, so it is accumulated ascending in `t`.
-pub(crate) fn diffusion_schedule(n_steps: u32, scheduler: DiffusionScheduler) -> Schedule {
-    let n = n_steps as usize;
-    let mut beta = Vec::with_capacity(n);
-    let mut alpha_bar = Vec::with_capacity(n);
-    for t in 0..n {
-        let f = if n == 1 {
-            0.0
-        } else {
-            t as f32 / (n - 1) as f32
-        };
-        let b = BETA_START + (BETA_END - BETA_START) * f;
+impl DiffusionParams {
+    /// The scheduler configuration of a `Diffusion` head, `None` for any other head.
+    pub(crate) fn from_head(kind: &HeadKind) -> Option<Self> {
+        match *kind {
+            HeadKind::Diffusion {
+                n_steps,
+                scheduler,
+                num_train_timesteps,
+                beta_schedule,
+                variance_type,
+                clip_sample,
+                clip_sample_range,
+                ..
+            } => Some(Self {
+                n_steps,
+                scheduler,
+                num_train_timesteps,
+                beta_schedule,
+                variance_type,
+                clip_sample,
+                clip_sample_range,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// The schedule of one sampler, in `diffusers`' own terms (design note section 8.3).
+///
+/// Per inference step `i`, with `t = timesteps[i]`:
+///
+/// ```text
+/// x0 = (x - sqrt_1mab[i] * eps) / sqrt_ab[i]          # pred_original_sample
+/// x0 = clamp(x0, -range, range)                       # iff clip_sample
+/// x  = c0[i] * x0 + cx[i] * x + ce[i] * eps + sigma[i] * z_t
+/// ```
+///
+/// `cx` is zero under `Ddim` and `ce` is zero under `Ddpm`; splitting them is what lets one
+/// loop serve both while `clip_sample` stays applicable to `x0` (an affine `c1 * x + c3 * eps`
+/// cannot express the clamp).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Schedule {
+    /// `alphas_cumprod` over the **training** grid, length `num_train_timesteps`.
+    pub alpha_bar: Vec<f32>,
+    /// The inference timesteps, descending, as `set_timesteps` produces them.
+    pub timesteps: Vec<u32>,
+    pub sqrt_ab: Vec<f32>,
+    pub sqrt_1mab: Vec<f32>,
+    pub c0: Vec<f32>,
+    pub cx: Vec<f32>,
+    pub ce: Vec<f32>,
+    /// Zero at `t == 0` and everywhere under `Ddim` (eta = 0), which is what makes DDIM consume
+    /// no `noise_<t>` buffer at all.
+    pub sigma: Vec<f32>,
+    /// `DDPMScheduler::_get_variance` per inference step, before the square root.
+    pub variance: Vec<f32>,
+}
+
+/// `betas` over the training grid, `diffusers`' `DDPMScheduler.__init__` (`betas_for_alpha_bar`
+/// for `squaredcos_cap_v2`), in f32 with a fixed op order (spec 3.4).
+fn betas(n: usize, schedule: BetaSchedule) -> Vec<f32> {
+    match schedule {
+        // torch.linspace(beta_start, beta_end, n).
+        BetaSchedule::Linear => (0..n)
+            .map(|t| {
+                let f = if n == 1 {
+                    0.0
+                } else {
+                    t as f32 / (n - 1) as f32
+                };
+                BETA_START + (BETA_END - BETA_START) * f
+            })
+            .collect(),
+        // alpha_bar(t) = cos((t + 0.008) / 1.008 * pi / 2)^2, beta_i = 1 - abar(t2)/abar(t1).
+        BetaSchedule::SquaredcosCapV2 => {
+            let abar = |t: f32| {
+                let c = es_math::approx::cos((t + 0.008) / 1.008 * std::f32::consts::FRAC_PI_2);
+                c * c
+            };
+            (0..n)
+                .map(|i| {
+                    let t1 = i as f32 / n as f32;
+                    let t2 = (i + 1) as f32 / n as f32;
+                    (1.0 - abar(t2) / abar(t1)).min(MAX_BETA)
+                })
+                .collect()
+        }
+    }
+}
+
+/// The schedule `diffusers` would build for `p`, in f32 with a fixed op order (spec 3.4).
+///
+/// `alpha_bar` is a running product, so it is accumulated ascending over the **training** grid;
+/// the inference timesteps are then subsampled out of it exactly as `set_timesteps` does under
+/// `timestep_spacing = "leading"` (the default of both schedulers):
+/// `timesteps = (arange(0, n_steps) * (num_train_timesteps // n_steps))[::-1]`.
+pub(crate) fn diffusion_schedule(p: &DiffusionParams) -> Schedule {
+    let train = p.num_train_timesteps.max(1) as usize;
+    let n = p.n_steps.max(1) as usize;
+    let beta = betas(train, p.beta_schedule);
+    let mut alpha_bar: Vec<f32> = Vec::with_capacity(train);
+    for (t, b) in beta.iter().enumerate() {
         let prev = if t == 0 { 1.0 } else { alpha_bar[t - 1] };
-        beta.push(b);
         alpha_bar.push(prev * (1.0 - b));
     }
 
+    let stride = (train / n).max(1);
+    let timesteps: Vec<u32> = (0..n).rev().map(|i| (i * stride) as u32).collect();
+
+    let sqrt = es_math::approx::sqrt;
     let mut s = Schedule {
-        c1: Vec::with_capacity(n),
-        c3: Vec::with_capacity(n),
+        timesteps: timesteps.clone(),
+        alpha_bar: alpha_bar.clone(),
+        sqrt_ab: Vec::with_capacity(n),
+        sqrt_1mab: Vec::with_capacity(n),
+        c0: Vec::with_capacity(n),
+        cx: Vec::with_capacity(n),
+        ce: Vec::with_capacity(n),
         sigma: Vec::with_capacity(n),
+        variance: Vec::with_capacity(n),
     };
-    for t in 0..n {
-        let prev_bar = if t == 0 { 1.0 } else { alpha_bar[t - 1] };
-        match scheduler {
-            // Ancestral sampling: x = (x - beta/sqrt(1-abar) * eps) / sqrt(alpha) + sqrt(beta) z.
+    for (i, t) in timesteps.iter().enumerate() {
+        let ab = alpha_bar[*t as usize];
+        // `previous_timestep`: the next entry of `timesteps`, and `self.one` past the end.
+        let prev = match timesteps.get(i + 1) {
+            Some(pt) => alpha_bar[*pt as usize],
+            None => 1.0,
+        };
+        let cur_alpha = ab / prev;
+        let cur_beta = 1.0 - cur_alpha;
+        // `_get_variance`, clamped to 1e-20 as diffusers does before any log. `variance_type`
+        // is a `DDPMScheduler` field: `DDIMScheduler` has none and always reports the
+        // posterior variance, which under eta = 0 is unused anyway.
+        let small = ((1.0 - prev) / (1.0 - ab) * cur_beta).max(1e-20);
+        let var = match (p.variance_type, p.scheduler) {
+            (VarianceType::FixedLarge, DiffusionScheduler::Ddpm) => cur_beta.max(1e-20),
+            _ => small,
+        };
+        s.sqrt_ab.push(sqrt(ab));
+        s.sqrt_1mab.push(sqrt(1.0 - ab));
+        s.variance.push(var);
+        match p.scheduler {
             DiffusionScheduler::Ddpm => {
-                let c1 = 1.0 / es_math::approx::sqrt(1.0 - beta[t]);
-                s.c3.push(-c1 * beta[t] / es_math::approx::sqrt(1.0 - alpha_bar[t]));
-                s.c1.push(c1);
-                s.sigma.push(if t == 0 {
-                    0.0
-                } else {
-                    es_math::approx::sqrt(beta[t])
-                });
+                s.c0.push(sqrt(prev) * cur_beta / (1.0 - ab));
+                s.cx.push(sqrt(cur_alpha) * (1.0 - prev) / (1.0 - ab));
+                s.ce.push(0.0);
+                s.sigma.push(if *t == 0 { 0.0 } else { sqrt(var) });
             }
             // eta = 0: x = sqrt(abar_prev) * x0_hat + sqrt(1 - abar_prev) * eps, deterministic.
             DiffusionScheduler::Ddim => {
-                let c1 = es_math::approx::sqrt(prev_bar / alpha_bar[t]);
-                s.c3.push(
-                    es_math::approx::sqrt(1.0 - prev_bar)
-                        - c1 * es_math::approx::sqrt(1.0 - alpha_bar[t]),
-                );
-                s.c1.push(c1);
+                s.c0.push(sqrt(prev));
+                s.cx.push(0.0);
+                s.ce.push(sqrt(1.0 - prev));
                 s.sigma.push(0.0);
             }
             DiffusionScheduler::DpmSolver => unreachable!("rejected as Unsupported before here"),
@@ -136,22 +246,28 @@ class _Denoiser(nn.Module):
 const DDPM_PY: &str = r#"
 
 class _DdpmHead(nn.Module):
-    def __init__(self, x_dim, cond, horizon, action_dim, n_steps, c1, c3, sigma):
+    # One diffusers DDPM/DDIM step, on the subsampled inference timesteps. `clip` is the
+    # clip_sample_range or None. See docs/design/learning-lowering.md section 8.3.
+    def __init__(self, x_dim, cond, horizon, action_dim, ts, sa, sb, c0, cx, ce, sigma, clip):
         super().__init__()
         self.net = _Denoiser(x_dim, cond)
         self.cond, self.horizon, self.action_dim = cond, horizon, action_dim
-        self.n_steps, self.c1, self.c3, self.sigma = n_steps, c1, c3, sigma
-        for t in range(n_steps):
-            if sigma[t] != 0.0:
+        self.ts, self.sa, self.sb = ts, sa, sb
+        self.c0, self.cx, self.ce, self.sigma, self.clip = c0, cx, ce, sigma, clip
+        for i, t in enumerate(ts):
+            if sigma[i] != 0.0:
                 self.register_buffer("noise_%d" % t, torch.zeros(x_dim))
 
     def forward(self, cond, noise):
         x = noise.reshape(-1)
-        for t in range(self.n_steps - 1, -1, -1):
+        for i, t in enumerate(self.ts):
             eps = self.net(x, cond, _sinusoidal(float(t), self.cond))
-            x = self.c1[t] * x + self.c3[t] * eps
-            if self.sigma[t] != 0.0:
-                x = x + self.sigma[t] * getattr(self, "noise_%d" % t)
+            x0 = (x - self.sb[i] * eps) / self.sa[i]
+            if self.clip is not None:
+                x0 = torch.clamp(x0, -self.clip, self.clip)
+            x = self.c0[i] * x0 + self.cx[i] * x + self.ce[i] * eps
+            if self.sigma[i] != 0.0:
+                x = x + self.sigma[i] * getattr(self, "noise_%d" % t)
         return x.reshape(self.horizon, self.action_dim)
 "#;
 
@@ -557,27 +673,70 @@ impl Lowering {
                         args[0]
                     ))
                 }
-                HeadKind::Diffusion { n_steps, scheduler } => {
+                HeadKind::Diffusion {
+                    n_steps,
+                    scheduler,
+                    num_train_timesteps,
+                    prediction_type,
+                    clip_sample,
+                    clip_sample_range,
+                    ..
+                } => {
                     if *scheduler == DiffusionScheduler::DpmSolver {
                         return Err(unsupported("PolicyHead{Diffusion}", scheduler));
                     }
+                    // The denoiser is eps_theta; `sample` and `v_prediction` are a different
+                    // pred_original_sample and would be a silently wrong chunk (design note 8.3).
+                    if *prediction_type != PredictionType::Epsilon {
+                        return Err(unsupported("PolicyHead{Diffusion}", prediction_type));
+                    }
+                    if *num_train_timesteps < *n_steps {
+                        return Err(LowerError::Shape {
+                            node: id.0,
+                            message: format!(
+                                "n_steps = {n_steps} inference steps cannot be subsampled out of \
+                                 num_train_timesteps = {num_train_timesteps}"
+                            ),
+                        });
+                    }
                     let s = self.sampler(id, node, args, *horizon, *action_dim, *n_steps)?;
-                    let sched = diffusion_schedule(*n_steps, *scheduler);
-                    for (t, sigma) in sched.sigma.iter().enumerate() {
+                    let sched = diffusion_schedule(
+                        &DiffusionParams::from_head(kind).expect("this arm is a Diffusion head"),
+                    );
+                    for (i, sigma) in sched.sigma.iter().enumerate() {
                         if *sigma != 0.0 {
-                            self.exact(id, &format!("noise_{t}"), vec![s.x_dim]);
+                            self.exact(id, &format!("noise_{}", sched.timesteps[i]), vec![s.x_dim]);
                         }
                     }
                     self.needs_ddpm = true;
+                    let ts = format!(
+                        "[{}]",
+                        sched
+                            .timesteps
+                            .iter()
+                            .map(u32::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
                     self.member(
                         id,
                         &format!(
-                            "_DdpmHead({}, {}, {horizon}, {action_dim}, {n_steps}, {}, {}, {})",
+                            "_DdpmHead({}, {}, {horizon}, {action_dim}, {ts}, {}, {}, {}, {}, {}, {}, {})",
                             s.x_dim,
                             s.cond,
-                            json_f32s(&sched.c1),
-                            json_f32s(&sched.c3),
+                            json_f32s(&sched.sqrt_ab),
+                            json_f32s(&sched.sqrt_1mab),
+                            json_f32s(&sched.c0),
+                            json_f32s(&sched.cx),
+                            json_f32s(&sched.ce),
                             json_f32s(&sched.sigma),
+                            if *clip_sample {
+                                // Debug is shortest-round-trip and always carries a `.`, so it
+                                // is a Python float literal, never an int.
+                                format!("{clip_sample_range:?}")
+                            } else {
+                                "None".to_owned()
+                            },
                         ),
                     );
                     Ok(s.call)
@@ -817,7 +976,7 @@ mod tests {
 
     // --- sampler heads (design note section 8) ----------------------------------------------
 
-    use crate::reference::{sampler_graph, N_STEPS};
+    use crate::reference::{diffusion_head, diffusion_params, sampler_graph, N_STEPS};
 
     fn sampler(kind: HeadKind) -> LearningGraph {
         sampler_graph(
@@ -829,11 +988,16 @@ mod tests {
         )
     }
 
+    fn head(scheduler: DiffusionScheduler) -> HeadKind {
+        diffusion_head(&diffusion_params(
+            scheduler,
+            BetaSchedule::SquaredcosCapV2,
+            VarianceType::FixedSmall,
+        ))
+    }
+
     fn ddpm() -> LearningGraph {
-        sampler(HeadKind::Diffusion {
-            n_steps: N_STEPS,
-            scheduler: DiffusionScheduler::Ddpm,
-        })
+        sampler(head(DiffusionScheduler::Ddpm))
     }
 
     fn flow() -> LearningGraph {
@@ -856,10 +1020,7 @@ mod tests {
             lower_to_torch(&other).unwrap().lowering_hash
         );
         // So must the scheduler, which only changes the emitted coefficients.
-        let ddim = sampler(HeadKind::Diffusion {
-            n_steps: N_STEPS,
-            scheduler: DiffusionScheduler::Ddim,
-        });
+        let ddim = sampler(head(DiffusionScheduler::Ddim));
         assert_ne!(
             lower_to_torch(&ddpm()).unwrap().lowering_hash,
             lower_to_torch(&ddim).unwrap().lowering_hash
@@ -870,13 +1031,15 @@ mod tests {
     fn the_sampling_loop_is_in_the_source_with_the_declared_step_count() {
         let d = lower_to_torch(&ddpm()).unwrap();
         assert!(d.source.contains("class _DdpmHead"), "{}", d.source);
+        assert!(d.source.contains("for i, t in enumerate(self.ts):"));
+        assert!(d.source.contains("_sinusoidal(float(t), self.cond)"));
         assert!(d
             .source
-            .contains("for t in range(self.n_steps - 1, -1, -1):"));
-        assert!(d.source.contains("_sinusoidal(float(t), self.cond)"));
-        // x_dim = H*A = 6, cond = 16, and the literal step count.
+            .contains("x0 = torch.clamp(x0, -self.clip, self.clip)"));
+        // x_dim = H*A = 6, cond = 16, and the 8 timesteps subsampled out of 100 at stride 12.
         assert!(
-            d.source.contains("_DdpmHead(6, 16, 3, 2, 8, ["),
+            d.source
+                .contains("_DdpmHead(6, 16, 3, 2, [84, 72, 60, 48, 36, 24, 12, 0], ["),
             "{}",
             d.source
         );
@@ -902,10 +1065,11 @@ mod tests {
             .iter()
             .filter(|k| k.contains(".noise_"))
             .collect();
-        // t = 0 is the final, noise-free step, so 7 draws for 8 steps.
+        // t = 0 is the final, noise-free step, so 7 draws for 8 steps, keyed by the real
+        // diffusers timestep rather than by the loop index.
         assert_eq!(noise.len(), N_STEPS as usize - 1, "{noise:?}");
         assert!(!noise.iter().any(|k| k.ends_with("noise_0")));
-        assert_eq!(d.weight_shapes["nodes.1.noise_1"], vec![6]);
+        assert_eq!(d.weight_shapes["nodes.1.noise_12"], vec![6]);
 
         // The denoiser's own keys: [x_dim + cond + cond] in, cond hidden, x_dim out.
         assert_eq!(d.weight_shapes["nodes.1.net.l0.weight"], vec![16, 38]);
@@ -913,13 +1077,7 @@ mod tests {
         assert_eq!(d.weight_shapes["nodes.1.net.l1.weight"], vec![6, 16]);
         assert_eq!(d.weight_shapes["nodes.1.net.l1.bias"], vec![6]);
 
-        for g in [
-            sampler(HeadKind::Diffusion {
-                n_steps: N_STEPS,
-                scheduler: DiffusionScheduler::Ddim,
-            }),
-            flow(),
-        ] {
+        for g in [sampler(head(DiffusionScheduler::Ddim)), flow()] {
             let m = lower_to_torch(&g).unwrap();
             assert!(!m.weight_keys.iter().any(|k| k.contains(".noise_")));
             assert!(m.weight_keys.iter().all(|k| !k.ends_with(".*")));
@@ -944,13 +1102,13 @@ mod tests {
         assert_eq!(unexpected.len(), N_STEPS as usize - 1, "{unexpected:?}");
 
         let mut short = ck;
-        short.remove("nodes.1.noise_3");
+        short.remove("nodes.1.noise_36");
         let header = parse_header(&write_safetensors(&short)).unwrap();
         let err = validate_keys(&d, &header).unwrap_err();
         let crate::PolicyError::WeightMismatch { missing, .. } = &err else {
             panic!("{err}")
         };
-        assert_eq!(missing, &["nodes.1.noise_3"]);
+        assert_eq!(missing, &["nodes.1.noise_36"]);
     }
 
     #[test]
@@ -973,33 +1131,91 @@ mod tests {
 
     #[test]
     fn dpm_solver_is_unsupported_rather_than_approximated() {
-        let err = lower_to_torch(&sampler(HeadKind::Diffusion {
-            n_steps: N_STEPS,
-            scheduler: DiffusionScheduler::DpmSolver,
-        }))
-        .unwrap_err();
+        let err = lower_to_torch(&sampler(head(DiffusionScheduler::DpmSolver))).unwrap_err();
         assert!(
             matches!(&err, LowerError::Unsupported(k) if k == "PolicyHead{Diffusion}{DpmSolver}"),
             "{err}"
         );
     }
 
-    /// The schedule is the one the design note writes down: `alpha_bar` decreasing, DDPM noisy
-    /// except at the last step, DDIM noise-free throughout.
+    /// The schedule is the one the design note writes down: built over the *training* grid and
+    /// subsampled to the inference steps, DDPM noisy except at `t = 0`, DDIM noise-free.
+    /// `reference::tests::diffusion_schedule_matches_diffusers` is the independent oracle.
     #[test]
     fn the_schedule_matches_the_documented_form() {
-        let d = diffusion_schedule(8, DiffusionScheduler::Ddpm);
-        assert!(d.sigma[0].abs() < f32::EPSILON);
-        assert!(d.sigma[1..].iter().all(|s| *s > 0.0), "{:?}", d.sigma);
-        // beta grows with t, so 1/sqrt(alpha) does too, and the eps coefficient is negative.
-        assert!(d.c1.windows(2).all(|w| w[1] > w[0]), "{:?}", d.c1);
-        assert!(d.c3.iter().all(|c| *c < 0.0), "{:?}", d.c3);
+        let params = diffusion_params(
+            DiffusionScheduler::Ddpm,
+            BetaSchedule::SquaredcosCapV2,
+            VarianceType::FixedSmall,
+        );
+        let ddpm_sched = diffusion_schedule(&params);
+        assert_eq!(ddpm_sched.alpha_bar.len(), 100);
+        assert!(ddpm_sched.alpha_bar.windows(2).all(|w| w[1] < w[0]));
+        assert_eq!(ddpm_sched.timesteps, vec![84, 72, 60, 48, 36, 24, 12, 0]);
+        assert!(ddpm_sched.sigma[7].abs() < f32::EPSILON);
+        assert!(ddpm_sched.sigma[..7].iter().all(|s| *s > 0.0));
+        assert!(ddpm_sched.ce.iter().all(|c| *c == 0.0));
 
-        let i = diffusion_schedule(8, DiffusionScheduler::Ddim);
-        assert!(i.sigma.iter().all(|s| *s == 0.0));
-        // eta = 0 leaves x_t untouched between steps whose alpha_bar barely moves.
-        assert!(i.c1.iter().all(|c| *c > 1.0), "{:?}", i.c1);
-        assert_eq!(diffusion_schedule(1, DiffusionScheduler::Ddpm).c1.len(), 1);
+        let mut ddim = params;
+        ddim.scheduler = DiffusionScheduler::Ddim;
+        let ddim_sched = diffusion_schedule(&ddim);
+        assert!(ddim_sched.sigma.iter().all(|s| *s == 0.0));
+        assert!(ddim_sched.cx.iter().all(|c| *c == 0.0));
+        // The last step lands on abar_prev = 1, i.e. the clean sample.
+        assert!((ddim_sched.c0[7] - 1.0).abs() < 1e-6 && ddim_sched.ce[7].abs() < 1e-6);
+        // fixed_large is beta_t itself, larger than the posterior variance beta~_t.
+        let mut large = params;
+        large.variance_type = VarianceType::FixedLarge;
+        assert!(diffusion_schedule(&large).variance[0] > ddpm_sched.variance[0]);
+
+        let mut one = params;
+        one.n_steps = 1;
+        assert_eq!(diffusion_schedule(&one).timesteps, vec![0]);
+    }
+
+    /// `_sinusoidal` returns `2 * (dim // 2)` values, so an odd conditioning width would make
+    /// `_Denoiser.l0` mismatch at run time. It is a lowering error, not a torch traceback.
+    #[test]
+    fn an_odd_conditioning_width_is_rejected() {
+        let mut g = ddpm();
+        let LearningNode::StateEncoder { out_dim, .. } = g.nodes.nodes.get_mut(&NodeId(0)).unwrap()
+        else {
+            unreachable!()
+        };
+        *out_dim = 15;
+        let LearningNode::PolicyHead { inputs, .. } = g.nodes.nodes.get_mut(&NodeId(1)).unwrap()
+        else {
+            unreachable!()
+        };
+        inputs[0].ty.shape = es_ir::types::Shape::new(vec![15]);
+        let err = lower_to_torch(&g).unwrap_err();
+        assert!(
+            matches!(&err, LowerError::Shape { message, .. } if message.contains("must be even")),
+            "{err}"
+        );
+    }
+
+    /// `prediction_type` is part of the checkpoint's contract: the denoiser is `eps_theta`, so
+    /// `sample` and `v_prediction` would be a silently wrong chunk.
+    #[test]
+    fn a_non_epsilon_prediction_type_is_unsupported() {
+        let mut g = ddpm();
+        let LearningNode::PolicyHead { kind, .. } = g.nodes.nodes.get_mut(&NodeId(1)).unwrap()
+        else {
+            unreachable!()
+        };
+        let HeadKind::Diffusion {
+            prediction_type, ..
+        } = kind
+        else {
+            unreachable!()
+        };
+        *prediction_type = PredictionType::VPrediction;
+        let err = lower_to_torch(&g).unwrap_err();
+        assert!(
+            matches!(&err, LowerError::Unsupported(k) if k.contains("VPrediction")),
+            "{err}"
+        );
     }
 
     #[test]

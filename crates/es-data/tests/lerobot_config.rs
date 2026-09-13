@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+use es_compile::{CpuPlan, PlanMode};
 use es_core::time::TickRate;
 use es_data::lerobot::Info;
 use es_data::lerobot_config::LeRobotPolicyConfig::Act;
@@ -218,6 +219,39 @@ fn diffusion_config_converts_and_validates_clean() {
     assert_clean(&conv);
 }
 
+/// P-M2-R6: the scheduler configuration has to survive the conversion, or `es-policy` builds
+/// the schedule over the wrong grid. `num_inference_steps` (10) and `num_train_timesteps` (100)
+/// are different numbers in the fixture precisely so a collapse of the two would show.
+#[test]
+fn the_diffusion_scheduler_config_passes_through() {
+    let cfg = LeRobotPolicyConfig::parse(DIFFUSION_JSON).unwrap();
+    let conv = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
+    let kind = conv
+        .learning
+        .nodes
+        .nodes
+        .values()
+        .find_map(|n| match n {
+            es_ir::learning::LearningNode::PolicyHead { kind, .. } => Some(*kind),
+            _ => None,
+        })
+        .expect("the converted graph has a head");
+    assert_eq!(
+        kind,
+        es_ir::learning::HeadKind::Diffusion {
+            n_steps: 10,
+            scheduler: es_ir::learning::DiffusionScheduler::Ddpm,
+            num_train_timesteps: 100,
+            beta_schedule: es_ir::learning::BetaSchedule::SquaredcosCapV2,
+            variance_type: es_ir::learning::VarianceType::FixedSmall,
+            prediction_type: es_ir::learning::PredictionType::Epsilon,
+            // Absent from the fixture, so these are the `LeRobot` defaults.
+            clip_sample: true,
+            clip_sample_range: 1.0,
+        }
+    );
+}
+
 #[test]
 fn n_obs_steps_above_one_yields_history_and_window() {
     let Act(mut c) = LeRobotPolicyConfig::parse(ACT_JSON).unwrap() else {
@@ -272,17 +306,60 @@ fn diffusion_crop_yields_a_crop_node_with_rescaled_intrinsics() {
         "INV-14: Crop must move the principal point"
     );
 
-    // `crop_is_random` is recorded as an unwired, training_only Augment node (spec §7.3).
-    let augment_is_training_only = conv.observation.graph.nodes.values().any(|n| {
-        matches!(
-            n,
-            ObservationNode::Augment {
-                training_only: true,
-                ..
-            }
-        )
-    });
-    assert!(augment_is_training_only);
+    // `crop_is_random` is an offset jitter of that centred window: a training_only Augment
+    // node wired after the Crop (spec §7.3), which evaluation auto-disables (INV-15).
+    let aug = conv
+        .observation
+        .graph
+        .nodes
+        .iter()
+        .find_map(|(id, n)| match n {
+            ObservationNode::Augment { training_only, .. } => Some((*id, *training_only)),
+            _ => None,
+        })
+        .expect("crop_is_random yields an Augment node");
+    assert!(aug.1, "INV-15: the node must be training_only");
+    assert!(
+        conv.observation
+            .graph
+            .edges
+            .iter()
+            .any(|e| e.to.node == aug.0),
+        "the Augment node must be wired into the chain, not left dangling"
+    );
+    assert!(
+        conv.observation
+            .graph
+            .edges
+            .iter()
+            .any(|e| e.from.node == aug.0),
+        "the Augment node must feed the rest of the chain"
+    );
+}
+
+/// P-M2-R2. The whole point of a conversion is that the result runs: every fixture's
+/// `Converted::observation` must lower to a `CpuPlan` with no diagnostics — including the
+/// `crop_shape` one, whose `Augment` node used to make the graph unplannable.
+#[test]
+fn every_converted_observation_compiles_to_a_plan() {
+    for json in [ACT_JSON, DIFFUSION_JSON] {
+        let cfg = LeRobotPolicyConfig::parse(json).unwrap();
+        let conv = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
+        for mode in [PlanMode::Debug, PlanMode::Release] {
+            let plan = CpuPlan::compile(&conv.observation, mode)
+                .unwrap_or_else(|d| panic!("{:#?}", errors(&d)));
+            assert!(plan.warnings.is_empty(), "{:#?}", plan.warnings);
+            assert!(!plan.steps.is_empty());
+        }
+    }
+}
+
+#[test]
+fn an_unbounded_state_dim_is_rejected() {
+    let json = ACT_JSON.replace(r#""shape": [8] }"#, r#""shape": [70000] }"#);
+    let cfg = LeRobotPolicyConfig::parse(&json).unwrap();
+    let err = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap_err();
+    assert!(matches!(err, ConfigError::OutOfRange(_)), "{err}");
 }
 
 #[test]

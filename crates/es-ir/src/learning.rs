@@ -75,15 +75,69 @@ pub enum DiffusionScheduler {
     DpmSolver,
 }
 
+/// `diffusers`' `beta_schedule`. `LeRobot`'s Diffusion Policy default is `squaredcos_cap_v2`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum BetaSchedule {
+    Linear,
+    #[default]
+    SquaredcosCapV2,
+}
+
+/// `diffusers`' `variance_type`. Its (and `LeRobot`'s) default is `fixed_small`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VarianceType {
+    #[default]
+    FixedSmall,
+    FixedLarge,
+}
+
+/// `diffusers`' `prediction_type`: what the denoiser's output means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PredictionType {
+    #[default]
+    Epsilon,
+    Sample,
+    VPrediction,
+}
+
+fn default_train_timesteps() -> u32 {
+    100
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_clip_range() -> f32 {
+    1.0
+}
+
 /// Spec 8.3. The head is the only node that turns features into an action chunk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum HeadKind {
     /// ACT, plain behaviour cloning.
     Regression,
-    /// Diffusion Policy.
+    /// Diffusion Policy. The fields after `scheduler` are `diffusers`' `DDPMScheduler` /
+    /// `DDIMScheduler` configuration, which a checkpoint was trained under and without which it
+    /// cannot be reproduced; the `serde` defaults are `LeRobot`'s Diffusion Policy defaults
+    /// (`lerobot/common/policies/diffusion/configuration_diffusion.py`; `Status: unverified`,
+    /// recalled rather than fetched — see `docs/api-notes/lerobot-config.md`). `n_steps` stays
+    /// the number of *inference* steps, subsampled out of `num_train_timesteps`.
     Diffusion {
         n_steps: u32,
         scheduler: DiffusionScheduler,
+        #[serde(default = "default_train_timesteps")]
+        num_train_timesteps: u32,
+        #[serde(default)]
+        beta_schedule: BetaSchedule,
+        #[serde(default)]
+        variance_type: VarianceType,
+        #[serde(default)]
+        prediction_type: PredictionType,
+        #[serde(default = "default_true")]
+        clip_sample: bool,
+        #[serde(default = "default_clip_range")]
+        clip_sample_range: f32,
     },
     /// pi0, `SmolVLA`.
     FlowMatching { n_steps: u32 },
