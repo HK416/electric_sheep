@@ -164,7 +164,12 @@ std_msgs::msg::Float64MultiArray;`, subscribed on `"~/commands"`), which refuses
 the Safety Plane, so this crate offers no way to put an unvalidated action on an actuator topic.
 `NJ != joints.len()` fails at construction. Inbound `sensor_msgs/JointState` is reordered by name
 into the configured joint order (a missing joint rejects the sample) before it reaches
-`SafetyPlane::observe_state` / `sensor_seen`.
+`SafetyPlane::observe_state` / `sensor_seen`. A named joint whose `position` or `velocity` value
+the sample does not carry rejects it the same way (`ROS2-013`, `PartialJointState`) — a default is
+not a measurement (§25.1). The one exception the message definition forces: an entirely empty
+`velocity` (the array `sensor_msgs/JointState` documents as "may be empty") is read as "this driver
+does not report velocity" and yields `qd = [0.0; NJ]`; a non-empty but too-short `velocity` is a
+partial sample and is refused. `position` has no such reading: short or empty is always an error.
 
 ## 5. Message subset
 
@@ -199,7 +204,9 @@ substituted for it), an HWC byte buffer, a `PhysTick`, and the Safety Plane inpu
 | `extrinsics`, `color_space`, `shutter`, `exposure`, `rate_hz` | `CameraIngestConfig`; ROS carries none of them and no default is invented |
 | `channels`, `dtype`, `depth_scale` | encoding, section 6.3 |
 
-Monocular only: `r` must be identity and `p[3]`, `p[7]` (`Tx`, `Ty`) zero (`CAM-005`).
+Monocular only: `r` must be the identity and `p[3]`, `p[7]` (`Tx`, `Ty`) zero (`CAM-005`). An
+all-zero `r` — what ROS drivers publish for an uncalibrated monocular camera — is read as the
+identity; those two shapes are the only ones accepted, and no tolerance is introduced.
 
 ### 6.2 ROI, binning, size (INV-14)
 
@@ -212,7 +219,12 @@ spec = calib.cropped(Rect { roi }, true)                          // skipped for
 spec = spec.resized(roi.width / bx, roi.height / by, true)       // skipped when bx = by = 1
 ```
 
-- `roi.width % bx != 0` -> `CAM-006` (the resize ratio would not be `1 / bx`).
+- `CAM-006` is "the ROI/binning pair is not usable", and covers three rules, each with its own
+  message: a zero `roi.width`/`roi.height`; a rectangle outside the calibration
+  (`roi.x_offset + roi.width > CameraInfo.width`, likewise for `y`, summed in `u64` so it cannot
+  wrap) — `ImageSpec::cropped` subtracts the origin unconditionally, so an unchecked rectangle
+  yields a valid-looking spec with a negative `cx`; and `roi.width % bx != 0` (the resize ratio
+  would not be `1 / bx`).
 - The result must equal `Image.width/height`; otherwise `CAM-007`, unless the config sets
   `rescale_to_image = true`, which applies one more `resized(image.width, image.height, true)`.
 - `rescale = false` is never passed. No code in `camera` writes an intrinsic except the `k`/`p`
@@ -274,6 +286,9 @@ ingest accepts all four names (the table above).
 - The derived spec must match the declared one (§26.1: "what is not validated is not executed"):
   enum fields and size equal, intrinsics per `intrinsics_consistent_with`, distortion coefficients
   within 1e-9 relative. `CAM-008` names the first differing field.
+- No `CameraInfo` has arrived yet is `CAM-010`, not `CAM-008`: a startup race a caller retries
+  through is not the same condition as a camera calibrated for a different stream, which stops the
+  line. `CameraError::code` therefore spans `CAM-001` .. `CAM-010`.
 - Latest `CameraInfo` wins; a content change (header excluded) re-derives and re-checks.
 
 ### 6.5 Time (§18.1, §3.4)
@@ -328,6 +343,9 @@ offset  size  field
 
 - One message per datagram, ≤ 65,507 bytes (> 1,472 fragments on a 1,500 MTU link; documented,
   not forbidden).
+- `session_id` is regenerated on every accepted `Hello`; `0` only in `Hello` itself. Accepting a
+  `Hello` rewinds `last_seq`, so freshness is what stops a recorded `Hello` + `Command` pair from
+  replaying: under the new id every recorded datagram fails the session check (§25.1).
 - Dropped before `HilCore`, and counted: bad magic, version, length or tag, wrong session
   (`rx_invalid`); `seq ≤` last accepted (`rx_stale`). A `seq` gap adds to `rx_lost`.
 - f64 travel as `to_bits`: a NaN arrives as the same NaN and meets the plane's non-finite rule.
@@ -375,7 +393,10 @@ without a trailer (crash) replays up to its last complete record and reports `tr
 `SafetyPlane::from_ir`, wrap it in `EmbeddedCore::with_plane`, apply `ObserveState` / `Heartbeat` /
 `Step` in order, re-encode each `SafeAction` as a `Decision` record, compare bytes.
 `ReplayReport { steps, identical, first_divergence: Option<(u64 index, PhysTick)>, live_hash,
-replay_hash, truncated }`.
+replay_hash, truncated }`. The verdict is one predicate, `ReplayReport::is_verified() = identical
+&& !truncated && steps > 0 && live_hash == replay_hash`: a log with no `Decision` record compares
+nothing and both its hashes are blake3 of nothing, so `identical` is `false` when `steps == 0` and
+a caller cannot read a clean verification off an empty file (§1.4).
 
 **Gate (§24.2, §28.5):** a live run over real loopback UDP, with injected delay, loss, reordering,
 a late command, a NaN row and a heartbeat gap, replays to **byte-identical decisions**

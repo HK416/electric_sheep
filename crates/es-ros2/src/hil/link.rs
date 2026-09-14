@@ -64,6 +64,9 @@ pub struct HilLink<const NJ: usize, const H: usize> {
     max_datagram: usize,
     local_addr: SocketAddr,
     session_id: u64,
+    /// Bumped for every session this link opens, so two `Hello`s inside one clock tick still
+    /// get different ids (design note section 7.7).
+    session_counter: u64,
     peer: Option<SocketAddr>,
     /// Highest `seq` accepted from the peer in this session.
     last_seq: u64,
@@ -93,17 +96,15 @@ impl<const NJ: usize, const H: usize> HilLink<NJ, H> {
         sock.set_nonblocking(true)?;
         let local_addr = sock.local_addr()?;
         let started = Instant::now();
-        // Session ids only have to be unlikely to repeat across restarts of the same port, so
-        // that a stale peer's datagrams are rejected; they are not a secret (the tag is).
-        let session_id = (super::stats::wall_ns() ^ (u64::from(local_addr.port()) << 48)) | 1;
-        Ok(Self {
+        let mut link = Self {
             sock,
             core,
             key: cfg.key,
             stats_every: cfg.stats_every.max(1),
             max_datagram: cfg.max_datagram.clamp(wire::HEADER_LEN, wire::MAX_DATAGRAM),
             local_addr,
-            session_id,
+            session_id: 0,
+            session_counter: 0,
             peer: None,
             last_seq: 0,
             tx_seq: 0,
@@ -111,7 +112,10 @@ impl<const NJ: usize, const H: usize> HilLink<NJ, H> {
             sent: [(u64::MAX, started); RTT_SLOTS],
             rx: Vec::new(),
             tx: Vec::new(),
-        })
+        };
+        // The field is never left uninitialised, even though no session is open yet.
+        link.session_id = link.next_session_id();
+        Ok(link)
     }
 
     pub fn local_addr(&self) -> SocketAddr {
@@ -248,6 +252,16 @@ impl<const NJ: usize, const H: usize> HilLink<NJ, H> {
             return;
         }
         self.peer = Some(from);
+        // A fresh session per `Hello` (design note section 7.7). Accepting a `Hello` rewinds
+        // `last_seq`, so without this a recorded `Hello` + `Command` pair would replay: the
+        // rewind would make the recorded commands look new again. Under a fresh id they fail
+        // the `hdr.session_id` check in `accept` instead, and never reach the plane.
+        self.session_counter = self.session_counter.wrapping_add(1);
+        self.session_id = self.next_session_id();
+        self.tx_seq = 0;
+        // A slot left over from the previous session would otherwise time a round trip that
+        // spans the boundary.
+        self.sent = [(u64::MAX, self.started); RTT_SLOTS];
         // The controller keeps one `seq` counter across the handshake, so the session starts
         // from the `Hello`'s own `seq` rather than from zero.
         self.last_seq = hdr.seq;
@@ -260,6 +274,24 @@ impl<const NJ: usize, const H: usize> HilLink<NJ, H> {
                 start_tick: now.0,
             },
         );
+    }
+
+    /// A session id for the session about to open. It is not a secret (the tag is), it only has
+    /// to be *fresh*, so that a datagram authenticated under an earlier session fails the
+    /// `hdr.session_id` check. Never `0` (`Hello`'s reserved value) and never the current id.
+    fn next_session_id(&self) -> u64 {
+        // No RNG (spec 3.4 forbids a global one): the wall clock, the port and the per-link
+        // counter are enough to not repeat, and repeating is all that matters here.
+        let id = (super::stats::wall_ns()
+            ^ (u64::from(self.local_addr.port()) << 48)
+            ^ self.session_counter.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+            | 1;
+        // Bit 0 stays set either way, so neither branch can produce `0`.
+        if id == self.session_id {
+            id ^ 2
+        } else {
+            id
+        }
     }
 
     fn observe_rtt(&mut self, obs_tick: PhysTick) {

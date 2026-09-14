@@ -62,10 +62,16 @@ impl Ros2Node {
 /// section 4.5): a joint the sample does not carry rejects the whole sample (`ROS2-013`) rather
 /// than silently leaving it at zero, so a partial state never reaches
 /// `SafetyPlane::observe_state` / `sensor_seen`.
+///
+/// The one exception the message definition forces: `velocity` "may be empty", and an entirely
+/// empty `velocity` means "this driver does not report velocity", which reads as `qd = [0.0; NJ]`.
+/// A non-empty but too-short `velocity` is a partial sample and is refused; `position` has no such
+/// reading, so short or empty is always an error.
 pub fn reorder_joint_state<const NJ: usize>(
     joints: &[String],
     state: &JointState,
 ) -> Result<([f64; NJ], [f64; NJ]), Ros2Error> {
+    let velocity_reported = !state.velocity.is_empty();
     let mut q = [0.0f64; NJ];
     let mut qd = [0.0f64; NJ];
     for (i, name) in joints.iter().enumerate() {
@@ -74,10 +80,25 @@ pub fn reorder_joint_state<const NJ: usize>(
             .iter()
             .position(|n| n == name)
             .ok_or_else(|| Ros2Error::MissingJoint(name.clone()))?;
-        q[i] = state.position.get(idx).copied().unwrap_or(0.0);
-        qd[i] = state.velocity.get(idx).copied().unwrap_or(0.0);
+        q[i] = *state
+            .position
+            .get(idx)
+            .ok_or_else(|| partial(name, "position"))?;
+        if velocity_reported {
+            qd[i] = *state
+                .velocity
+                .get(idx)
+                .ok_or_else(|| partial(name, "velocity"))?;
+        }
     }
     Ok((q, qd))
+}
+
+fn partial(joint: &str, field: &'static str) -> Ros2Error {
+    Ros2Error::PartialJointState {
+        joint: joint.to_owned(),
+        field,
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +135,45 @@ mod tests {
         let joints = vec!["j1".to_owned(), "j3".to_owned()];
         let err = reorder_joint_state::<2>(&joints, &s).unwrap_err();
         assert_eq!(err.code(), "ROS2-013");
+    }
+
+    #[test]
+    fn a_short_position_array_is_refused() {
+        let joints = vec!["j1".to_owned(), "j2".to_owned()];
+        let s = state(&["j1", "j2"], &[1.0], &[10.0, 20.0]);
+        let err = reorder_joint_state::<2>(&joints, &s).unwrap_err();
+        assert_eq!(err.code(), "ROS2-013");
+        let msg = err.to_string();
+        assert!(msg.contains("j2"), "{msg}");
+        assert!(msg.contains("position"), "{msg}");
+    }
+
+    #[test]
+    fn a_short_velocity_array_is_refused() {
+        let joints = vec!["j1".to_owned(), "j2".to_owned()];
+        let s = state(&["j1", "j2"], &[1.0, 2.0], &[10.0]);
+        let err = reorder_joint_state::<2>(&joints, &s).unwrap_err();
+        assert_eq!(err.code(), "ROS2-013");
+        let msg = err.to_string();
+        assert!(msg.contains("j2"), "{msg}");
+        assert!(msg.contains("velocity"), "{msg}");
+    }
+
+    #[test]
+    fn an_empty_velocity_array_is_the_documented_zero() {
+        let joints = vec!["j2".to_owned(), "j1".to_owned()];
+        let s = state(&["j1", "j2"], &[1.0, 2.0], &[]);
+        let (q, qd) = reorder_joint_state::<2>(&joints, &s).unwrap();
+        assert_eq!(q, [2.0, 1.0]);
+        assert_eq!(qd, [0.0, 0.0]);
+    }
+
+    #[test]
+    fn an_empty_position_array_is_refused() {
+        let joints = vec!["j1".to_owned(), "j2".to_owned()];
+        let s = state(&["j1", "j2"], &[], &[10.0, 20.0]);
+        let err = reorder_joint_state::<2>(&joints, &s).unwrap_err();
+        assert_eq!(err.code(), "ROS2-013");
+        assert!(err.to_string().contains("position"), "{err}");
     }
 }

@@ -168,7 +168,12 @@ interfaces (%zu)"). `SafeAction`은 오직 Safety Plane에서만 나오므로, �
 action을 actuator topic에 올릴 방법을 전혀 제공하지 않는다. `NJ != joints.len()`은 생성 시점에
 실패한다. 들어오는 `sensor_msgs/JointState`는 `SafetyPlane::observe_state` / `sensor_seen`에
 도달하기 전에 설정된 joint 순서로 이름 기준 재정렬된다(joint가 하나라도 빠지면 sample이
-거부된다).
+거부된다). 이름은 있지만 sample이 그 joint의 `position`/`velocity` 값을 담고 있지 않은 경우도
+같은 방식으로 거부된다(`ROS2-013`, `PartialJointState`) — 기본값은 측정값이 아니다(§25.1).
+메시지 정의가 강제하는 유일한 예외: 완전히 비어 있는 `velocity`(`sensor_msgs/JointState`가
+"may be empty"로 문서화한 배열)는 "이 드라이버는 velocity를 보고하지 않는다"로 읽어
+`qd = [0.0; NJ]`가 되고, 비어 있지 않지만 길이가 모자란 `velocity`는 부분 sample이므로
+거부된다. `position`에는 그런 해석이 없다: 짧거나 비어 있으면 항상 오류다.
 
 ## 5. 메시지 서브셋
 
@@ -203,6 +208,8 @@ W1에 없는 것: `trajectory_msgs/JointTrajectory`(해시는 나중을 위해 �
 | `channels`, `dtype`, `depth_scale` | encoding, 섹션 6.3 |
 
 단안(monocular)만: `r`은 identity여야 하고 `p[3]`, `p[7]`(`Tx`, `Ty`)은 0이어야 한다(`CAM-005`).
+all-zero `r`—보정되지 않은 단안 카메라에 대해 ROS 드라이버가 publish하는 값—은 identity로
+읽는다; 받아들이는 형태는 이 둘뿐이며, 허용 오차는 도입하지 않는다.
 
 ### 6.2 ROI, binning, 크기 (INV-14)
 
@@ -216,7 +223,12 @@ spec = calib.cropped(Rect { roi }, true)                          // skipped for
 spec = spec.resized(roi.width / bx, roi.height / by, true)       // skipped when bx = by = 1
 ```
 
-- `roi.width % bx != 0` -> `CAM-006`(resize 비율이 `1 / bx`가 아니게 된다).
+- `CAM-006`은 "ROI/binning 쌍을 쓸 수 없다"는 뜻이며, 세 가지 규칙을 포괄하고 각각 고유한
+  메시지를 갖는다: `roi.width`/`roi.height`가 0인 경우; 사각형이 calibration 밖으로 나가는
+  경우(`roi.x_offset + roi.width > CameraInfo.width`, `y`도 마찬가지, 넘침이 없도록 `u64`로
+  더한다) — `ImageSpec::cropped`는 원점을 무조건 빼기 때문에, 검사하지 않은 사각형은 `cx`가
+  음수인 그럴듯한 spec을 만들어낸다; 그리고 `roi.width % bx != 0`(resize 비율이 `1 / bx`가
+  아니게 된다).
 - 결과는 `Image.width/height`와 같아야 한다; 그렇지 않으면 `CAM-007`이다, 단 config가
   `rescale_to_image = true`를 설정한 경우는 예외이며, 그 경우 `resized(image.width, image.height,
   true)`를 한 번 더 적용한다.
@@ -279,6 +291,9 @@ CUG·(u-128)`, `buv = 2^19 + CUB·(u-128)`, `y = max(0, Y-16)·CY`이며, 각 �
 - 유도된 spec은 선언된 것과 일치해야 한다(§26.1: "검증되지 않은 것은 실행되지 않는다"): enum
   필드와 size가 같고, intrinsics는 `intrinsics_consistent_with` 기준, distortion 계수는 상대
   오차 1e-9 이내. `CAM-008`은 처음으로 다른 필드의 이름을 알려준다.
+- `CameraInfo`가 아직 하나도 도착하지 않은 것은 `CAM-008`이 아니라 `CAM-010`이다: 호출자가
+  재시도로 넘길 수 있는 기동 시점의 경합은, 라인을 멈춰 세우는 "다른 스트림에 맞춰 보정된
+  카메라"와 같은 조건이 아니다. 따라서 `CameraError::code`는 `CAM-001` .. `CAM-010`이다.
 - 가장 최근의 `CameraInfo`가 우선한다; 내용 변경(header 제외)이 있으면 다시 유도하고 다시
   검사한다.
 
@@ -335,6 +350,9 @@ offset  size  field
 
 - datagram당 메시지 하나, ≤ 65,507바이트(1,500 MTU 링크에서 1,472바이트를 넘으면 조각남;
   문서화되어 있을 뿐 금지되지는 않음).
+- `session_id`는 accept된 모든 `Hello`마다 새로 생성된다; `0`은 `Hello` 자신에서만 쓰인다.
+  `Hello`를 accept하면 `last_seq`가 되감기므로, 기록된 `Hello` + `Command` 쌍의 재생을 막는 것은
+  이 신선함이다: 새 id 아래에서는 기록된 모든 datagram이 session 검사에서 탈락한다(§25.1).
 - `HilCore` 이전에 버려지고 카운트됨: 잘못된 magic, version, length, tag, 잘못된
   session(`rx_invalid`); `seq ≤` 마지막으로 accept된 값(`rx_stale`). `seq`에 gap이 있으면
   `rx_lost`에 더해진다.
@@ -386,7 +404,10 @@ trailer  0xFF | u32 40 | [u8;32] blake3(concatenated Decision record bytes) | u6
 재구성하고, `EmbeddedCore::with_plane`으로 감싸고, `ObserveState` / `Heartbeat` / `Step`을
 순서대로 적용하고, 각 `SafeAction`을 `Decision` 레코드로 다시 인코딩하여 바이트를 비교한다.
 `ReplayReport { steps, identical, first_divergence: Option<(u64 index, PhysTick)>, live_hash,
-replay_hash, truncated }`.
+replay_hash, truncated }`. 판정은 하나의 술어다, `ReplayReport::is_verified() = identical
+&& !truncated && steps > 0 && live_hash == replay_hash`: `Decision` 레코드가 하나도 없는 로그는
+비교한 것이 없고 두 해시 모두 아무것도 아닌 것의 blake3이므로, `steps == 0`이면 `identical`은
+`false`이고 호출자가 빈 파일에서 깨끗한 검증 결과를 읽어낼 수 없다(§1.4).
 
 **게이트(§24.2, §28.5):** 실제 loopback UDP를 통한 live 실행이 delay, loss, 재정렬, 지연된
 command, NaN row, heartbeat gap을 주입받은 채로 **바이트 단위로 동일한 결정**(`identical`,

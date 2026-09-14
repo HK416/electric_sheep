@@ -101,6 +101,13 @@ pub enum Ros2Error {
     /// reorder by name (design note section 4.5).
     #[error("JointState is missing joint `{0}`")]
     MissingJoint(String),
+    /// An inbound `sensor_msgs/JointState` named the joint but its `position`/`velocity` array
+    /// is too short to carry that joint's value. `sensor_msgs/JointState` says those arrays
+    /// "may be empty", so this is ordinary driver behaviour, not an attack — but a default is
+    /// not a measurement (spec 25.1), so the whole sample is rejected rather than fabricating a
+    /// zero for `SafetyPlane::observe_state` (design note section 4.5).
+    #[error("JointState carries no `{field}` for joint `{joint}`")]
+    PartialJointState { joint: String, field: &'static str },
     /// A zenoh session, publisher, subscriber or liveliness operation failed. Wraps the
     /// library's own message; only built when the `zenoh` feature is on.
     #[cfg(feature = "zenoh")]
@@ -128,7 +135,8 @@ impl Ros2Error {
             Ros2Error::TransientLocalUnsupported => "ROS2-012",
             Ros2Error::UnknownActuatorTopic(_)
             | Ros2Error::ActuatorJointCount { .. }
-            | Ros2Error::MissingJoint(_) => "ROS2-013",
+            | Ros2Error::MissingJoint(_)
+            | Ros2Error::PartialJointState { .. } => "ROS2-013",
             #[cfg(feature = "zenoh")]
             Ros2Error::Zenoh(_) => "ROS2-020",
         }
@@ -137,7 +145,7 @@ impl Ros2Error {
 
 /// Why a `sensor_msgs/CameraInfo` + `sensor_msgs/Image` pair could not become a validated
 /// frame (`docs/design/ros2-boundary.md` sections 6.1–6.5). [`CameraError::code`] is the
-/// stable `CAM-001` .. `CAM-009` string; the `Display` message is for humans only.
+/// stable `CAM-001` .. `CAM-010` string; the `Display` message is for humans only.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum CameraError {
     /// `CAM-001`: an `encoding` outside the subset of `docs/api-notes/ros2-cdr.md` (bayer,
@@ -161,8 +169,10 @@ pub enum CameraError {
     /// monocular (design note section 6.1).
     #[error("CameraInfo is not monocular: {0}")]
     NotMonocular(String),
-    /// `CAM-006`: the ROI cannot be binned by the declared factor, so the resize would not be
-    /// a clean `1 / binning` (design note section 6.2).
+    /// `CAM-006`: the ROI/binning pair is not usable — a zero dimension, a rectangle that does
+    /// not fit the calibration, or a width/height the binning factor does not divide, which
+    /// would make the resize something other than a clean `1 / binning` (design note section
+    /// 6.2). The message says which of the three it was.
     #[error("roi/binning: {0}")]
     RoiBinning(String),
     /// `CAM-007`: the calibration resolution after ROI and binning is not the image's, and the
@@ -173,8 +183,10 @@ pub enum CameraError {
     /// is the first differing field (spec 26.1 — the declared spec is never replaced).
     #[error("derived spec differs from the declared one at `{0}`")]
     DeclaredMismatch(&'static str),
-    /// `CAM-008` as well: with no `CameraInfo` there is no derived spec, so there is nothing
-    /// to validate the declared one against, so nothing is executed (spec 26.1).
+    /// `CAM-010`: with no `CameraInfo` there is no derived spec, so there is nothing to
+    /// validate the declared one against, so nothing is executed (spec 26.1). Its own code,
+    /// not `CAM-008`: a startup race a caller retries through is not the same condition as a
+    /// camera calibrated for a different stream, which stops the line (design note 6.4).
     #[error("no CameraInfo has arrived for this camera yet")]
     NotCalibrated,
     /// `CAM-009`: a header stamp that is before the clock epoch, has `nanosec >= 10^9`, or
@@ -195,8 +207,9 @@ impl CameraError {
             CameraError::NotMonocular(_) => "CAM-005",
             CameraError::RoiBinning(_) => "CAM-006",
             CameraError::SizeMismatch(_) => "CAM-007",
-            CameraError::DeclaredMismatch(_) | CameraError::NotCalibrated => "CAM-008",
+            CameraError::DeclaredMismatch(_) => "CAM-008",
             CameraError::BadStamp(_) => "CAM-009",
+            CameraError::NotCalibrated => "CAM-010",
         }
     }
 }
