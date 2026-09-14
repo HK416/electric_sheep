@@ -29,3 +29,15 @@ IR을 조용히 만드는 대신 요란하게 실패한다 (M4 리뷰 S-14).
 maturin develop --release --features python   # from this directory, once, to build es_native
 PYTHONPATH=python <venv>/Scripts/python.exe -m es.selfcheck
 ```
+
+## `encode_video.py`
+
+위 빌더와는 무관하다: `encode_video.py`는 `es video mosaic`가 만든 raw 프레임 출력을
+`.mp4`로 변환하는 독립 스크립트다 (M5 V4, 설계 노트 `docs/design/visible-learning.md`
+2.9절, 9절). `cv2.VideoWriter`를 쓰며 fourcc는 `mp4v`다 — 오라클 서버에는 `ffmpeg`
+바이너리가 없고 이 코덱만 열린다. 이 패킷에서 유일한 Python 단계이며, `es video mosaic`
+자체는 순수 Rust다. `opencv-python`이 설치된 Python이 필요하다:
+
+```
+<venv>/bin/python python/es/encode_video.py --frames <mosaic dir> --out demo.mp4 --fps 10
+```

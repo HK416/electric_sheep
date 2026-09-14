@@ -13,3 +13,4 @@ pub mod ir;
 pub mod r#loop;
 pub mod mcp;
 pub mod task;
+pub mod video;
