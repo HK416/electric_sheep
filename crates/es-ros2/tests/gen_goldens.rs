@@ -110,11 +110,13 @@ fn goldens_are_what_rosbags_and_xxhash_produce() {
     println!("RAN gen_goldens");
 
     let checked_in = manifest("../../tests/golden/ros2");
-    // `rmw_zenoh/` is the live network capture (W1b's `capture_reference_goldens`), a different
-    // oracle than this script; `session_loopback.rs` checks it.
+    // `rmw_zenoh/` is the live network capture (W1b's `capture_reference_goldens`) and
+    // `camera/` is W1c's rosbags/OpenCV/`image_geometry`/`cv_bridge` set
+    // (`gen_camera_goldens.rs`): different oracles than this script, each checked by its own
+    // harness.
     let names: Vec<String> = list_files_relative(&checked_in)
         .into_iter()
-        .filter(|n| !n.starts_with("rmw_zenoh/"))
+        .filter(|n| !n.starts_with("rmw_zenoh/") && !n.starts_with("camera/"))
         .collect();
     assert!(!names.is_empty(), "no goldens to check");
     assert_eq!(

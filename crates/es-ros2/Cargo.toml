@@ -13,6 +13,12 @@ zenoh = ["dep:zenoh"]
 
 [dependencies]
 es-core = { workspace = true }
+# W1c camera ingest (docs/packets/M3/W1c-camera-ingest.md): `es_ir::image::ImageSpec` and its
+# INV-14 transforms, `es_math::conventions::Pose` for the extrinsics, and `es_safety::Micros`
+# for the observation age the Safety Plane's watchdogs read. Layers 6, 0 and 8 under this
+# crate's layer 11 (spec 4.2).
+es-ir = { workspace = true }
+es-math = { workspace = true }
 es-safety = { workspace = true }
 thiserror = { workspace = true }
 serde = { workspace = true }

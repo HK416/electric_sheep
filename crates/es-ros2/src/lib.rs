@@ -18,10 +18,16 @@
 //! behind the `zenoh` cargo feature (off by default, design note section 2) so `es` and any
 //! embedded consumer never link it. [`config`] itself needs no feature: parsing a
 //! [`config::Ros2Config`] is plain data, checked the same way on every machine.
+//!
+//! W1c adds [`camera`]: `sensor_msgs/CameraInfo` + `sensor_msgs/Image` become a validated
+//! `es_ir::image::ImageSpec`, an HWC byte buffer and a `PhysTick` (design note section 6,
+//! spec 7.2, INV-14). It needs no feature and no network either — a message in, a checked
+//! frame out.
 
 #[cfg(feature = "zenoh")]
 pub mod actuator;
 pub mod attachment;
+pub mod camera;
 pub mod cdr;
 pub mod config;
 mod error;

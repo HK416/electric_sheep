@@ -236,10 +236,35 @@ spec = spec.resized(roi.width / bx, roi.height / by, true)       // skipped when
 | other | `CAM-001` | | |
 
 cv_bridge maps `yuv422 -> cv::COLOR_YUV2RGB_UYVY` and `yuv422_yuy2 -> cv::COLOR_YUV2RGB_YUY2`
-(`cv_bridge.cpp`). W1c copies OpenCV's fixed-point BT.601 constants from the pinned OpenCV source
-into this section; the goldens decide. Checks before any allocation (§25.1): `step ≥ width × bpp`,
+(`cv_bridge.cpp`). Checks before any allocation (§25.1): `step ≥ width × bpp`,
 `data.len() == step × height`, `width × height × bpp ≤ max_bytes`, even width for YUV (`CAM-002`).
 Row padding beyond `width × bpp` is stripped.
+
+**YUV 4:2:2 constants (W1c).** `crates/es-ros2/src/camera.rs` copies OpenCV's fixed-point BT.601
+integers verbatim from `modules/imgproc/src/color_yuv.simd.hpp` (OpenCV 5.0.0, the version inside
+`opencv-python-headless 5.0.0.93`, which is what produced `tests/golden/ros2/camera/yuv/*.rgb`):
+
+| Constant | Value |
+|---|---|
+| `ITUR_BT_601_SHIFT` | 20 |
+| `ITUR_BT_601_CY` | 1220542 |
+| `ITUR_BT_601_CUB` | 2116026 |
+| `ITUR_BT_601_CUG` | -409993 |
+| `ITUR_BT_601_CVG` | -852492 |
+| `ITUR_BT_601_CVR` | 1673527 |
+
+Per pixel pair, following `YUV422toRGB888Invoker` with `uIdx = 0` (`uidx = 1 - yIdx`,
+`vidx = (2 + uidx) % 4`), `uvToRGBuv` and `yRGBuvToRGBA`:
+`ruv = 2^19 + CVR·(v-128)`, `guv = 2^19 + CVG·(v-128) + CUG·(u-128)`, `buv = 2^19 + CUB·(u-128)`,
+`y = max(0, Y-16)·CY`, and each channel is `clamp((y + ·uv) >> 20, 0, 255)`. `yIdx` is 1 for
+`uyvy`/`yuv422` and 0 for `yuyv`/`yuv422_yuy2`. The goldens decide, and they agree byte for byte
+(`uyvy_and_yuyv_match_opencv_bit_exact`).
+
+**cv_bridge spelling (W1c, measured).** RoboStack Kilted's `ros-kilted-cv-bridge 4.1.0` rejects
+the modern names: `encoding_to_cvtype2("uyvy")` raises `Unrecognized image encoding [uyvy]`, and
+so does `"yuyv"`; only the deprecated `yuv422` / `yuv422_yuy2` resolve (to `CV_8UC2`). The
+`--ros` cross-check therefore hands cv_bridge the deprecated spelling of the same layout, and
+ingest accepts all four names (the table above).
 
 ### 6.4 Identity
 

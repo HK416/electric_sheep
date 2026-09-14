@@ -1,0 +1,69 @@
+{
+  "fields": {
+    "binning_x": 2,
+    "binning_y": 2,
+    "d": [
+      -0.1,
+      0.01,
+      0.001,
+      -0.002,
+      0.0005
+    ],
+    "distortion_model": "plumb_bob",
+    "header": {
+      "frame_id": "cam",
+      "stamp": {
+        "nanosec": 2,
+        "sec": 1
+      }
+    },
+    "height": 480,
+    "k": [
+      600.0,
+      0.0,
+      319.5,
+      0.0,
+      610.0,
+      239.5,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "p": [
+      600.0,
+      0.0,
+      319.5,
+      0.0,
+      0.0,
+      610.0,
+      239.5,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0
+    ],
+    "r": [
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0,
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ],
+    "roi": {
+      "do_rectify": false,
+      "height": 360,
+      "width": 480,
+      "x_offset": 80,
+      "y_offset": 60
+    },
+    "width": 640
+  },
+  "little_endian": true,
+  "rosbags_version": "0.11.5",
+  "typename": "sensor_msgs/msg/CameraInfo"
+}

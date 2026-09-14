@@ -1,0 +1,10 @@
+{
+  "image_uyvy": {
+    "encoding": "yuv422",
+    "rgb8_hex": "009a00009a00ff66ffff7dff828282383838ffe114cb00000036ff4affffab0000ff2b82c84700ffbb55ff4d00ffe114"
+  },
+  "image_yuyv": {
+    "encoding": "yuv422_yuy2",
+    "rgb8_hex": "009a00009a00ff66ffff7dff828282383838ffe114cb00000036ff4affffab0000ff2b82c84700ffbb55ff4d00ffe114"
+  }
+}

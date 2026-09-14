@@ -135,6 +135,72 @@ impl Ros2Error {
     }
 }
 
+/// Why a `sensor_msgs/CameraInfo` + `sensor_msgs/Image` pair could not become a validated
+/// frame (`docs/design/ros2-boundary.md` sections 6.1–6.5). [`CameraError::code`] is the
+/// stable `CAM-001` .. `CAM-009` string; the `Display` message is for humans only.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum CameraError {
+    /// `CAM-001`: an `encoding` outside the subset of `docs/api-notes/ros2-cdr.md` (bayer,
+    /// `nv12`, a generic `<n>{U,S,F}C<k>`, ...). Demosaicing and planar YUV are not this
+    /// packet's job (design note section 6.3).
+    #[error("unsupported image encoding `{0}`")]
+    UnsupportedEncoding(String),
+    /// `CAM-002`: `step`, `data.len()` or `width * height` do not describe a decodable frame.
+    /// Reported before any allocation (spec 25.1).
+    #[error("malformed image: {0}")]
+    MalformedImage(String),
+    /// `CAM-003`: a `header.frame_id` that is not the configured one (design note 6.4).
+    #[error("frame_id `{found}` is not the configured `{expected}`")]
+    FrameIdMismatch { expected: String, found: String },
+    /// `CAM-004`: a `distortion_model` this crate cannot represent exactly — an unknown name,
+    /// the wrong `d` length, or `rational_polynomial` with a non-zero `k4..k6` tail (design
+    /// note section 6.1 and open question 3).
+    #[error("unsupported distortion model: {0}")]
+    UnsupportedDistortion(String),
+    /// `CAM-005`: `r` is not the identity, or `p` carries a stereo baseline. Camera ingest is
+    /// monocular (design note section 6.1).
+    #[error("CameraInfo is not monocular: {0}")]
+    NotMonocular(String),
+    /// `CAM-006`: the ROI cannot be binned by the declared factor, so the resize would not be
+    /// a clean `1 / binning` (design note section 6.2).
+    #[error("roi/binning: {0}")]
+    RoiBinning(String),
+    /// `CAM-007`: the calibration resolution after ROI and binning is not the image's, and the
+    /// configuration did not ask for a rescale (design note section 6.2, INV-14).
+    #[error("size: {0}")]
+    SizeMismatch(String),
+    /// `CAM-008`: the derived spec differs from the Observation IR's declared one; the payload
+    /// is the first differing field (spec 26.1 — the declared spec is never replaced).
+    #[error("derived spec differs from the declared one at `{0}`")]
+    DeclaredMismatch(&'static str),
+    /// `CAM-008` as well: with no `CameraInfo` there is no derived spec, so there is nothing
+    /// to validate the declared one against, so nothing is executed (spec 26.1).
+    #[error("no CameraInfo has arrived for this camera yet")]
+    NotCalibrated,
+    /// `CAM-009`: a header stamp that is before the clock epoch, has `nanosec >= 10^9`, or
+    /// does not fit a tick counter (design note section 6.5, spec 18.1).
+    #[error("invalid header stamp: {0}")]
+    BadStamp(String),
+}
+
+impl CameraError {
+    /// The stable error code, exactly `docs/design/ros2-boundary.md` sections 6.1–6.5.
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            CameraError::UnsupportedEncoding(_) => "CAM-001",
+            CameraError::MalformedImage(_) => "CAM-002",
+            CameraError::FrameIdMismatch { .. } => "CAM-003",
+            CameraError::UnsupportedDistortion(_) => "CAM-004",
+            CameraError::NotMonocular(_) => "CAM-005",
+            CameraError::RoiBinning(_) => "CAM-006",
+            CameraError::SizeMismatch(_) => "CAM-007",
+            CameraError::DeclaredMismatch(_) | CameraError::NotCalibrated => "CAM-008",
+            CameraError::BadStamp(_) => "CAM-009",
+        }
+    }
+}
+
 /// Why a 33-byte `rmw_zenoh` attachment failed to decode (`docs/api-notes/rmw-zenoh.md`
 /// "Attachment: 33 bytes").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

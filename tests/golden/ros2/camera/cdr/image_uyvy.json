@@ -1,0 +1,53 @@
+{
+  "fields": {
+    "data": [
+      0,
+      0,
+      0,
+      16,
+      255,
+      235,
+      255,
+      255,
+      128,
+      128,
+      128,
+      64,
+      0,
+      255,
+      255,
+      0,
+      255,
+      0,
+      0,
+      255,
+      128,
+      16,
+      235,
+      128,
+      64,
+      100,
+      192,
+      200,
+      0,
+      128,
+      255,
+      255
+    ],
+    "encoding": "uyvy",
+    "header": {
+      "frame_id": "cam",
+      "stamp": {
+        "nanosec": 2,
+        "sec": 1
+      }
+    },
+    "height": 2,
+    "is_bigendian": 0,
+    "step": 16,
+    "width": 8
+  },
+  "little_endian": true,
+  "rosbags_version": "0.11.5",
+  "typename": "sensor_msgs/msg/Image"
+}

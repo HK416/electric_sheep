@@ -77,6 +77,19 @@ With `--ros` (run as `scripts/ros2-env.sh "$ES_ROS2_ENV" python gen_camera_golde
 when every part ran it prints `RAN gen_camera_goldens`. If `cv-bridge`/`image-geometry` cannot be
 co-installed with the W1b environment, use `ES_ROS2_VISION_ENV` and record that here.
 
+**Environment, measured 2026-09-14 (oracle server, `$HOME/envs/ros2-kilted`).** `cv-bridge` and
+`image-geometry` *are* co-installed in the same prefix as the W1b `ros-base` / `rmw-zenoh-cpp`
+environment — design note section 8's "co-installation is unverified" is now verified for this
+prefix, and `ES_ROS2_VISION_ENV` is **not** needed. One real divergence was found and is recorded
+in design note section 6.3: this `ros-kilted-cv-bridge 4.1.0` only recognizes the deprecated
+`yuv422` / `yuv422_yuy2` encoding strings (`encoding_to_cvtype2("uyvy")` raises `Unrecognized
+image encoding [uyvy]`), so `--ros` feeds cv_bridge those names for the same two fixtures.
+
+**Deviation.** `crates/es-ros2/tests/gen_goldens.rs` (W1a's harness, outside this packet's
+`context`) compares the *whole* `tests/golden/ros2/` file set against what `gen_ros2_goldens.py`
+produces, so adding `tests/golden/ros2/camera/**` makes it fail wherever `ES_PYTHON` is set. One
+line there now skips `camera/`, the way it already skips `rmw_zenoh/`.
+
 Fixtures. `CameraInfo`: **A** 640x480 `plumb_bob`, `d = [-0.1, 0.01, 0.001, -0.002, 0.0005]`,
 `k = [600,0,319.5, 0,610,239.5, 0,0,1]`, `r` identity, `p = [600,0,319.5,0, 0,610,239.5,0, 0,0,1,0]`;
 **B** = A with `roi = {80, 60, 360, 480}` (x, y, height, width), `binning 2x2`, image 240x180;

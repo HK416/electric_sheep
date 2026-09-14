@@ -1,0 +1,45 @@
+{
+  "fields": {
+    "data": [
+      0,
+      0,
+      0,
+      0,
+      111,
+      18,
+      131,
+      58,
+      0,
+      0,
+      0,
+      63,
+      0,
+      0,
+      160,
+      63,
+      0,
+      0,
+      96,
+      64,
+      0,
+      0,
+      32,
+      65
+    ],
+    "encoding": "32FC1",
+    "header": {
+      "frame_id": "cam",
+      "stamp": {
+        "nanosec": 2,
+        "sec": 1
+      }
+    },
+    "height": 2,
+    "is_bigendian": 0,
+    "step": 12,
+    "width": 3
+  },
+  "little_endian": true,
+  "rosbags_version": "0.11.5",
+  "typename": "sensor_msgs/msg/Image"
+}
