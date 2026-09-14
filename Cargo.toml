@@ -49,9 +49,15 @@ wide = "0.7"
 crossbeam = "0.8"
 # egui 0.32 is the newest release whose MSRV is the workspace `rust-version` (1.85); 0.36
 # raises it. Minimal features: the editor paints rectangles and lines, nothing else.
+# `x11` + `wayland` are required on Linux (spec 26.1's primary platform), not optional: with
+# neither, winit hits its own `compile_error!` and the whole workspace fails to build there.
+# Neither needs a system -dev package at build time; both are no-ops on Windows/macOS
+# (docs/packets/M4/P-M4-R9.md).
 eframe = { version = "0.32.3", default-features = false, features = [
     "glow",
     "default_fonts",
+    "x11",
+    "wayland",
 ] }
 egui = { version = "0.32.3", default-features = false }
 # abi3-py312: one compiled extension works on any CPython >= 3.12 (stable ABI), matching the

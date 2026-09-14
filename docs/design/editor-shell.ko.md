@@ -114,9 +114,17 @@ Deployment IR은 그래프가 아니라 레코드이므로(§9.2), 그 밴드는
 
 워크스페이스에 고정된 `eframe`/`egui` `0.32.3`. 최신 릴리스(0.36.2)가 아니라: 0.32가
 워크스페이스 `rust-version`(1.85)과 MSRV가 맞는 마지막 버전이다. 기능은 최소한이다 —
-`glow` + `default_fonts`, accesskit 없음, wgpu 없음, persistence 없음 — 이는 이 크레이트의
-증분 재빌드를 약 2.4초로 유지한다. *실행 가능한* 바이너리(컴파일만 된 것이 아니라)를
-원하는 Linux CI는 eframe의 `x11`/`wayland` 기능을 추가한다; 헤드리스 빌드에는 필요 없다.
+`glow` + `default_fonts` + 두 Linux 윈도잉 백엔드 `x11`/`wayland`; accesskit 없음, wgpu 없음,
+persistence 없음 — 이는 이 크레이트의 증분 재빌드를 약 2.4초로 유지한다.
+
+`x11`/`wayland`는 실행 가능한 바이너리만을 위한 것이 아니라 Linux에서 필수다: 둘 다 없으면
+winit 0.30이 자체 `compile_error!`("The platform you're compiling for is not supported by
+winit")에서 멈추므로, Linux에서는 `cargo clippy --workspace`조차 실패한다(§26.1은 Linux
+x86_64를 1차 플랫폼으로 정한다). 네이티브 Wayland 세션과 순수 X11 호스트가 각자의 백엔드를
+필요로 하므로 둘 다 켠다. 둘 다 빌드 시점에 시스템 `-dev` 패키지를 요구하지 않으며 —
+pkg-config 검색 경로를 비워도 `cargo check -p es-editor`가 성공한다 — Windows/macOS에서는
+아무 효과가 없다. Linux에서 창을 여는 것은 실행해 보지 않았다(검증 호스트에 디스플레이 없음):
+`Status: unverified`. 패킷: `docs/packets/M4/P-M4-R9.md`.
 
 ## 8. 여기 없는 것
 

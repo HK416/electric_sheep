@@ -113,9 +113,17 @@ stream is attached (§23.3), that frame replaces the gradient and nothing else c
 
 `eframe` / `egui` `0.32.3`, pinned in the workspace. Not the newest release (0.36.2): 0.32 is
 the last one whose MSRV matches the workspace `rust-version` (1.85). Features are minimal —
-`glow` + `default_fonts`, no accesskit, no wgpu, no persistence — which keeps the incremental
-rebuild of this crate at ~2.4 s. A Linux CI that wants a *runnable* binary (not just a
-compiled one) adds eframe's `x11` / `wayland` features; building headless does not need them.
+`glow` + `default_fonts` + the two Linux windowing backends `x11` / `wayland`; no accesskit, no
+wgpu, no persistence — which keeps the incremental rebuild of this crate at ~2.4 s.
+
+`x11` / `wayland` are required on Linux, not only for a runnable binary: with neither, winit
+0.30 stops at its own `compile_error!` ("The platform you're compiling for is not supported by
+winit"), so even `cargo clippy --workspace` fails there (§26.1 makes Linux x86_64 the primary
+platform). Both are enabled because a native Wayland session and a plain X11 host each need
+their own backend. Neither needs a system `-dev` package at build time — `cargo check -p
+es-editor` succeeds with the pkg-config search path emptied — and on Windows/macOS both are
+no-ops. Opening a window on Linux has not been exercised (no display on the verification
+host): `Status: unverified`. Packet: `docs/packets/M4/P-M4-R9.md`.
 
 ## 8. Not here
 
