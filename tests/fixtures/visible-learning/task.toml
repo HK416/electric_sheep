@@ -1,0 +1,727 @@
+# Task IR (spec 6) for the SO-101 cube-into-bin demo -- plan V, packet M5/V0.
+#
+# Scene: tests/fixtures/mjcf/so101_pick_place.xml (see its PROVENANCE.json).
+# `scene_hash` is `SceneDesc::scene_hash()` of that file as parsed; `asset_hash` is the
+# blake3 of the file's bytes -- the derivative vendors no separate asset.
+#
+# Parameters, fixed here so V1 and V3 cite them: NJ = 6, control rate 50 Hz,
+# max_episode_steps = 400, image 96x96 Rgb8 from the one fixed `overhead` camera.
+#
+# This document *declares* the ObservationSpec and owns no preprocessing and no neural net
+# (spec 5.1): the image chain is observation.toml, the policy is learning.toml.
+#
+# Randomization (spec 6.3) is the cube free joint's `qpos` only. Mass, friction and
+# actuator-gain targets are deliberately absent: `es-env` records such a draw but never
+# pushes it into the backend (crates/es-env/src/randomize.rs:24-26), so declaring one would
+# put a number in the episode record that never reached the physics.
+#
+# Two ceilings of the IR-D cone, recorded rather than papered over (design note section 5.4):
+#  * `GetJointState` binds one scalar -- a joint's *first* qpos/qvel index
+#    (crates/es-env/src/plan.rs:196-206). For the cube's free joint that is `x`, so the
+#    success predicate is the bin's x span plus a settling bound, not a 3-axis AABB.
+#  * Task IR-D has no constant leaf, and `Arith::Mul`'s right operand is dimensionless under
+#    the spec 5.4 unit algebra, so neither `x - c` nor `v * v` is expressible; the shaped
+#    reward is a `Normalize` of the cube's x and `|v| < b` is two `Compare`s and an `And`.
+# `Normalize` and `Logic` are existing TaskNode variants that `es-env`'s cone lowering does
+# not yet handle (plan.rs:125-179) -- that is a V1 change in es-env, not an es-ir change.
+
+es_schema = 1
+kind = "task"
+
+[body]
+schema_version = 2
+
+[body.config]
+control_rate_hz = 50.0
+deterministic = true
+max_episode_steps = 400
+rng_streams = [
+    "cube.x",
+    "cube.y",
+    "reset.0",
+    "reset.1",
+    "reset.2",
+    "reset.3",
+    "reset.4",
+    "reset.5",
+    "reset.cube.z",
+]
+
+[body.graph]
+inputs = []
+outputs = []
+schema_version = 2
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 0
+port = "value"
+
+[body.graph.edges.to]
+node = 1
+port = "value"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 2
+port = "value"
+
+[body.graph.edges.to]
+node = 3
+port = "value"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 5
+port = "value"
+
+[body.graph.edges.to]
+node = 7
+port = "value"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 7
+port = "value"
+
+[body.graph.edges.to]
+node = 8
+port = "value"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 5
+port = "value"
+
+[body.graph.edges.to]
+node = 9
+port = "a"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 5
+port = "value"
+
+[body.graph.edges.to]
+node = 10
+port = "a"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 6
+port = "value"
+
+[body.graph.edges.to]
+node = 11
+port = "a"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 6
+port = "value"
+
+[body.graph.edges.to]
+node = 12
+port = "a"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 9
+port = "value"
+
+[body.graph.edges.to]
+node = 13
+port = "a"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 10
+port = "value"
+
+[body.graph.edges.to]
+node = 13
+port = "b"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 11
+port = "value"
+
+[body.graph.edges.to]
+node = 14
+port = "a"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 12
+port = "value"
+
+[body.graph.edges.to]
+node = 14
+port = "b"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 13
+port = "value"
+
+[body.graph.edges.to]
+node = 15
+port = "a"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 14
+port = "value"
+
+[body.graph.edges.to]
+node = 15
+port = "b"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 15
+port = "value"
+
+[body.graph.edges.to]
+node = 16
+port = "value"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 5
+port = "value"
+
+[body.graph.edges.to]
+node = 17
+port = "a"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 17
+port = "value"
+
+[body.graph.edges.to]
+node = 18
+port = "value"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 19
+port = "value"
+
+[body.graph.edges.to]
+node = 20
+port = "a"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 20
+port = "value"
+
+[body.graph.edges.to]
+node = 21
+port = "value"
+
+[body.graph.nodes.0.GetSensor]
+sensor = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.graph.nodes.0.GetSensor.ty]
+elem = "F32"
+shape = [
+    3,
+    96,
+    96,
+]
+unit = "Pixel"
+
+[body.graph.nodes.0.GetSensor.ty.frame]
+Camera = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.graph.nodes.0.GetSensor.ty.image]
+camera_model = "Pinhole"
+channels = "Rgb"
+color_space = "SRgb"
+distortion = "None"
+dtype = "U8"
+height = 96
+rate_hz = 50.0
+shutter = "Global"
+width = 96
+
+[body.graph.nodes.0.GetSensor.ty.image.exposure]
+nanos = 2000000
+secs = 0
+
+[body.graph.nodes.0.GetSensor.ty.image.extrinsics.orientation]
+w = 1.0
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.0.GetSensor.ty.image.extrinsics.position]
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.0.GetSensor.ty.image.intrinsics]
+cx = 48.0
+cy = 48.0
+fx = 115.88225099390857
+fy = 115.88225099390857
+skew = 0.0
+
+[body.graph.nodes.0.GetSensor.ty.time.Sensor]
+align = "Hold"
+id = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.graph.nodes.1.ObservationSpec]
+channel = "rgb_overhead"
+
+[body.graph.nodes.1.ObservationSpec.ty]
+elem = "F32"
+shape = [
+    3,
+    96,
+    96,
+]
+unit = "Pixel"
+
+[body.graph.nodes.1.ObservationSpec.ty.frame]
+Camera = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.graph.nodes.1.ObservationSpec.ty.image]
+camera_model = "Pinhole"
+channels = "Rgb"
+color_space = "SRgb"
+distortion = "None"
+dtype = "U8"
+height = 96
+rate_hz = 50.0
+shutter = "Global"
+width = 96
+
+[body.graph.nodes.1.ObservationSpec.ty.image.exposure]
+nanos = 2000000
+secs = 0
+
+[body.graph.nodes.1.ObservationSpec.ty.image.extrinsics.orientation]
+w = 1.0
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.1.ObservationSpec.ty.image.extrinsics.position]
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.1.ObservationSpec.ty.image.intrinsics]
+cx = 48.0
+cy = 48.0
+fx = 115.88225099390857
+fy = 115.88225099390857
+skew = 0.0
+
+[body.graph.nodes.1.ObservationSpec.ty.time.Sensor]
+align = "Hold"
+id = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.graph.nodes.10.Compare]
+op = "Lt"
+rhs = 0.17
+
+[body.graph.nodes.10.Compare.ty]
+elem = "F32"
+shape = [1]
+time = "Tick"
+unit = "Angle"
+
+[body.graph.nodes.10.Compare.ty.frame]
+Joint = "3c949ea0617b793a8ff5fbb816c4b662"
+
+[body.graph.nodes.11.Compare]
+op = "Gt"
+rhs = -0.05
+
+[body.graph.nodes.11.Compare.ty]
+elem = "F32"
+shape = [1]
+time = "Tick"
+unit = "AngularVelocity"
+
+[body.graph.nodes.11.Compare.ty.frame]
+Joint = "3c949ea0617b793a8ff5fbb816c4b662"
+
+[body.graph.nodes.12.Compare]
+op = "Lt"
+rhs = 0.05
+
+[body.graph.nodes.12.Compare.ty]
+elem = "F32"
+shape = [1]
+time = "Tick"
+unit = "AngularVelocity"
+
+[body.graph.nodes.12.Compare.ty.frame]
+Joint = "3c949ea0617b793a8ff5fbb816c4b662"
+
+[body.graph.nodes.13.Logic]
+op = "And"
+shape = [1]
+
+[body.graph.nodes.14.Logic]
+op = "And"
+shape = [1]
+
+[body.graph.nodes.15.Logic]
+op = "And"
+shape = [1]
+
+[body.graph.nodes.16.Terminate]
+kind = "Success"
+
+[body.graph.nodes.17.Compare]
+op = "Gt"
+rhs = 0.55
+
+[body.graph.nodes.17.Compare.ty]
+elem = "F32"
+shape = [1]
+time = "Tick"
+unit = "Angle"
+
+[body.graph.nodes.17.Compare.ty.frame]
+Joint = "3c949ea0617b793a8ff5fbb816c4b662"
+
+[body.graph.nodes.18.Terminate]
+kind = "Failure"
+
+[body.graph.nodes.19.GetTime]
+since_reset = true
+
+[body.graph.nodes.2.GetJointState]
+body = "501f1cde65535d4d1900d14204382d3c"
+joints = [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+]
+quantity = "Position"
+
+[body.graph.nodes.20.Compare]
+op = "Ge"
+rhs = 8.0
+
+[body.graph.nodes.20.Compare.ty]
+elem = "F32"
+frame = "World"
+shape = [1]
+time = "Tick"
+unit = "Time"
+
+[body.graph.nodes.21.Terminate]
+kind = "Timeout"
+
+[body.graph.nodes.22.ResetState]
+stream = "reset.0"
+target = "joint.shoulder_pan.qpos"
+
+[body.graph.nodes.22.ResetState.dist.Uniform]
+hi = 0.0
+lo = 0.0
+
+[body.graph.nodes.23.ResetState]
+stream = "reset.1"
+target = "joint.shoulder_lift.qpos"
+
+[body.graph.nodes.23.ResetState.dist.Uniform]
+hi = 0.0
+lo = 0.0
+
+[body.graph.nodes.24.ResetState]
+stream = "reset.2"
+target = "joint.elbow_flex.qpos"
+
+[body.graph.nodes.24.ResetState.dist.Uniform]
+hi = 0.0
+lo = 0.0
+
+[body.graph.nodes.25.ResetState]
+stream = "reset.3"
+target = "joint.wrist_flex.qpos"
+
+[body.graph.nodes.25.ResetState.dist.Uniform]
+hi = 0.0
+lo = 0.0
+
+[body.graph.nodes.26.ResetState]
+stream = "reset.4"
+target = "joint.wrist_roll.qpos"
+
+[body.graph.nodes.26.ResetState.dist.Uniform]
+hi = 0.0
+lo = 0.0
+
+[body.graph.nodes.27.ResetState]
+stream = "reset.5"
+target = "joint.gripper.qpos"
+
+[body.graph.nodes.27.ResetState.dist.Uniform]
+hi = 0.0
+lo = 0.0
+
+[body.graph.nodes.28.ResetState]
+stream = "reset.cube.z"
+target = "qpos[8]"
+
+[body.graph.nodes.28.ResetState.dist.Uniform]
+hi = 0.02
+lo = 0.02
+
+[body.graph.nodes.29.Randomization]
+stream = "cube.x"
+target = "qpos[6]"
+
+[body.graph.nodes.29.Randomization.dist.Uniform]
+hi = 0.27
+lo = 0.21
+
+[body.graph.nodes.3.ObservationSpec]
+channel = "joint_state"
+
+[body.graph.nodes.3.ObservationSpec.ty]
+elem = "F32"
+shape = [6]
+time = "Tick"
+unit = "Angle"
+
+[body.graph.nodes.3.ObservationSpec.ty.frame]
+Joint = "501f1cde65535d4d1900d14204382d3c"
+
+[body.graph.nodes.30.Randomization]
+stream = "cube.y"
+target = "qpos[7]"
+
+[body.graph.nodes.30.Randomization.dist.Uniform]
+hi = 0.05
+lo = -0.05
+
+[body.graph.nodes.4.ActionSpec]
+control_rate_hz = 50.0
+dim = 6
+space = "JointPosition"
+
+[body.graph.nodes.5.GetJointState]
+body = "3c949ea0617b793a8ff5fbb816c4b662"
+joints = ["cube_free"]
+quantity = "Position"
+
+[body.graph.nodes.6.GetJointState]
+body = "3c949ea0617b793a8ff5fbb816c4b662"
+joints = ["cube_free"]
+quantity = "Velocity"
+
+[body.graph.nodes.7.Normalize]
+hi = [0.3]
+lo = [0.05]
+out_hi = 1.0
+out_lo = 0.0
+
+[body.graph.nodes.7.Normalize.ty]
+elem = "F32"
+shape = [1]
+time = "Tick"
+unit = "Angle"
+
+[body.graph.nodes.7.Normalize.ty.frame]
+Joint = "3c949ea0617b793a8ff5fbb816c4b662"
+
+[body.graph.nodes.8.Reward]
+aggregation = "Sum"
+name = "cube_towards_bin"
+weight = -1.0
+
+[body.graph.nodes.8.Reward.ty]
+elem = "F32"
+shape = [1]
+time = "Tick"
+
+[body.graph.nodes.8.Reward.ty.frame]
+Joint = "3c949ea0617b793a8ff5fbb816c4b662"
+
+[body.graph.nodes.8.Reward.ty.unit.Normalized]
+hi = 1.0
+lo = 0.0
+
+[body.graph.nodes.9.Compare]
+op = "Gt"
+rhs = 0.05
+
+[body.graph.nodes.9.Compare.ty]
+elem = "F32"
+shape = [1]
+time = "Tick"
+unit = "Angle"
+
+[body.graph.nodes.9.Compare.ty.frame]
+Joint = "3c949ea0617b793a8ff5fbb816c4b662"
+
+[body.observation_spec.channels.joint_state.source.JointState]
+body = "501f1cde65535d4d1900d14204382d3c"
+dof = 6
+
+[body.observation_spec.channels.joint_state.ty]
+elem = "F32"
+shape = [6]
+time = "Tick"
+unit = "Angle"
+
+[body.observation_spec.channels.joint_state.ty.frame]
+Joint = "501f1cde65535d4d1900d14204382d3c"
+
+[body.observation_spec.channels.rgb_overhead.source.Sensor]
+format = "Rgb"
+id = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.observation_spec.channels.rgb_overhead.ty]
+elem = "F32"
+shape = [
+    3,
+    96,
+    96,
+]
+unit = "Pixel"
+
+[body.observation_spec.channels.rgb_overhead.ty.frame]
+Camera = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.observation_spec.channels.rgb_overhead.ty.image]
+camera_model = "Pinhole"
+channels = "Rgb"
+color_space = "SRgb"
+distortion = "None"
+dtype = "U8"
+height = 96
+rate_hz = 50.0
+shutter = "Global"
+width = 96
+
+[body.observation_spec.channels.rgb_overhead.ty.image.exposure]
+nanos = 2000000
+secs = 0
+
+[body.observation_spec.channels.rgb_overhead.ty.image.extrinsics.orientation]
+w = 1.0
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.observation_spec.channels.rgb_overhead.ty.image.extrinsics.position]
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.observation_spec.channels.rgb_overhead.ty.image.intrinsics]
+cx = 48.0
+cy = 48.0
+fx = 115.88225099390857
+fy = 115.88225099390857
+skew = 0.0
+
+[body.observation_spec.channels.rgb_overhead.ty.time.Sensor]
+align = "Hold"
+id = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.scene]
+asset_hash = [
+    188,
+    134,
+    40,
+    163,
+    188,
+    109,
+    187,
+    35,
+    143,
+    107,
+    225,
+    31,
+    103,
+    184,
+    32,
+    174,
+    84,
+    103,
+    5,
+    237,
+    80,
+    237,
+    114,
+    229,
+    227,
+    31,
+    185,
+    105,
+    90,
+    3,
+    241,
+    51,
+]
+path = "tests/fixtures/mjcf/so101_pick_place.xml"
+scene_hash = [
+    100,
+    150,
+    130,
+    85,
+    218,
+    233,
+    119,
+    81,
+    11,
+    161,
+    191,
+    240,
+    131,
+    92,
+    200,
+    14,
+    157,
+    137,
+    212,
+    3,
+    10,
+    142,
+    99,
+    75,
+    139,
+    29,
+    186,
+    52,
+    197,
+    55,
+    38,
+    107,
+]

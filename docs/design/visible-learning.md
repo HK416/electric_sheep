@@ -301,7 +301,12 @@ mesh model cannot traverse this pipeline at all.** The policy is:
   bin and one camera. Alongside it, `tests/fixtures/mjcf/so101_pick_place.LICENSE` (the upstream
   Apache-2.0 text) and `so101_pick_place.PROVENANCE.json` — upstream repo, path, commit, the blake3 of
   upstream `so101.xml`, and the derivation rules. Dropping the visual meshes is exactly what makes the
-  file small enough to vendor; the collision geoms are already primitives.
+  file small enough to vendor; the collision geoms are already primitives. As built, each link also
+  gains **one** visual-only primitive (`contype=0 conaffinity=0`, named `<link>_shell`) in place of the
+  mesh geoms it lost, so the arm is still recognisable to the renderer; `camera_mount_shell` carries the
+  0.012 kg of the mesh it replaces, and every other link has an explicit `<inertial>`, so no added shell
+  changes a mass property. The manifest's `derivation` array is the authoritative list, and
+  `so101_provenance.rs` is what checks it.
 - **Fetch, never vendor, the 17 MB.** V0's provenance oracle fetches upstream `so101.xml` at the pinned
   commit, checks its blake3 against the manifest, and asserts our derivative is kinematically identical:
   same joint names in the same order, same axes, same ranges, same body offsets and orientations, same
@@ -385,13 +390,47 @@ randomization (section 2.7), so the same `(task_hash, seed, episode)` produces t
 `cube inside the bin volume for N consecutive control steps`, as a Task IR `Terminate` node of kind
 `Success` (`crates/es-ir-types/src/expr.rs:105`). The cube's free-joint `qpos` is its world pose, and
 `es-env`'s task plan lowers `Source::Qpos` leaves (`crates/es-env/src/plan.rs:19-28`), so the predicate
-"cube centroid within the bin AABB and `|v|` below a threshold" is a plain `Qpos`/`Qvel` expression with
-no new node type.
+is a plain `Qpos`/`Qvel` expression with no new node type.
 
 The "for N consecutive steps" part is the one thing the cone cannot count: Task IR-D is a stateless
 dataflow DAG. V0 resolves it the cheap way — the bin is deep enough and the velocity bound tight enough
 that the predicate is only true once the cube has settled, and `N = 1`. If a settling counter turns out
 to be needed it belongs in IR-C (§6, control), not in a new IR-D node: open question 3.
+
+**What V0 measured, which narrows the predicate below "AABB and `|v|`".** Three limits of the *existing*
+cone, none of which is an `es-ir` change:
+
+1. **A cone leaf is one scalar, the joint's first index.** `Ctx::joint_leaf`
+   (`crates/es-env/src/plan.rs:181-208`) takes `joints.first()` and binds `qpos[range.start]`. For the
+   cube's free joint that is `x` alone; `y` and `z` are not addressable from a `TaskNode` at all, because
+   no node reads `qpos[i]` by index (only `Randomization` / `ResetState` target *strings* do,
+   `randomize.rs:141-153`). The predicate V0 authored is therefore **the bin's x span plus a settling
+   bound**, and the scene is laid out so that span discriminates: the cube starts at x ≈ 0.24 and the bin
+   interior is x ∈ [0.050, 0.170], with the bin's y span (±0.105) covering the reachable y at that x.
+2. **There is no constant leaf and no absolute value.** `TaskNode` has no `Const`, and `Arith::Mul`'s
+   right operand is dimensionless under the §5.4 unit algebra (`task.rs` `inputs()`), so neither
+   `x - c` nor `v * v` is expressible. `Compare { rhs: Some(c) }` folds the only constant available, so
+   `|v| < b` is written as two `Compare`s and an `And`, and the shaped reward is a `Normalize` of the
+   cube's x (a reward term must be dimensionless or normalized, `TYPE-011`).
+3. **`Normalize` and `Logic` are `TaskNode` variants the cone lowering does not yet handle.**
+   `Ctx::lower` (`plan.rs:125-179`) covers `GetJointState`, `GetSensor`, `GetTime`, `Arith`, `Compare`
+   and `Clamp`; anything else is `EnvError::Unsupported` by name. Adding `Normalize` and `Logic` there
+   is **V1 work in `es-env`** (layer 9) and touches no IR: `Expr` already has `Logic` and the normalize
+   is an affine `Arith`. V0's documents are authored against the node set, not against the lowering.
+
+A 3-axis AABB needs one of: a `GetBodyPose` leaf in the cone, a `Slice` leaf over a free joint's 7-wide
+`qpos`, or three `jointpos`-style sensors. All three are IR or `es-env` work beyond V0's scope — open
+question 3 is widened to cover it.
+
+**The same shape of gap on the observation side.** `capture` (`crates/es-eval/src/runner.rs:411-420`)
+resolves an observation input name against `ModelInfo.qpos`, which is keyed by **joint**, or against
+`ModelInfo.sensor`; there is no `qvel` path and no body path. The Task IR channel and the Observation IR
+`StateInput` must name the *same* id for the cross-IR check (`XIR-002`), and `DEP-031` compares the
+Safety Plane envelope against that channel's `dof`, so a 6-joint robot is one channel of `dof = 6` named
+by the robot's body — which `capture` then cannot resolve. `crates/es-eval/tests/evaluation.rs:427-440`
+side-steps this by naming a body in the Task IR and a joint in the Observation IR, which never passes
+`cross::check`. V1 owns the fix (widen `capture` to a joint *set* and to `qvel`, or emit `jointpos` /
+`jointvel` sensors into the scene); V0 declares the honest 6-wide state and records the gap here.
 
 ## 6. Learning and training (V2)
 

@@ -299,7 +299,11 @@ released under the Apache License 2.0", `robotstudio_so101/README.md`), MuJoCo 3
   `tests/fixtures/mjcf/so101_pick_place.LICENSE` (상류 Apache-2.0 원문)와
   `so101_pick_place.PROVENANCE.json` — 상류 저장소, 경로, 커밋, 상류 `so101.xml`의 blake3, 파생 규칙.
   시각 메시를 버리는 것이 바로 이 파일을 벤더링 가능한 크기로 만드는 이유이며, 충돌 geom은 이미
-  프리미티브다.
+  프리미티브다. 실제로 만든 파일에서는 각 링크가 잃어버린 메시 geom 대신 시각 전용 프리미티브
+  **하나**씩 (`contype=0 conaffinity=0`, 이름 `<link>_shell`) 얻어서 렌더러에서도 팔로 알아볼 수 있다.
+  `camera_mount_shell`은 대체한 메시의 0.012 kg을 그대로 들고 있고 나머지 링크에는 모두 명시적
+  `<inertial>`이 있으므로, 추가된 shell이 질량 특성을 바꾸지 않는다. 권위 있는 목록은 매니페스트의
+  `derivation` 배열이고, 그것을 검사하는 것이 `so101_provenance.rs`다.
 - **17 MB는 절대 벤더링하지 않고 받아온다.** V0의 프로비넌스 오라클이 고정 커밋의 상류 `so101.xml`을
   받아 매니페스트의 blake3와 대조하고, 우리 파생본이 기구학적으로 동일함을 단언한다: 같은 순서의 같은
   관절 이름, 같은 축, 같은 범위, 같은 바디 오프셋과 방향, 같은 질량과 관성을 파싱된 `SceneDesc`의
@@ -380,13 +384,48 @@ impratio="10"/>`.
 
 `큐브가 N 제어 스텝 연속으로 바구니 부피 안에 있음`, Task IR의 `Success` 종류 `Terminate` 노드로
 (`crates/es-ir-types/src/expr.rs:105`). 큐브의 free joint `qpos`가 곧 월드 포즈이고, `es-env`의 태스크
-플랜은 `Source::Qpos` 리프를 로워링하므로 (`crates/es-env/src/plan.rs:19-28`), "큐브 중심이 바구니 AABB
-안이고 `|v|`가 임계값 미만"이라는 술어는 새 노드 타입 없는 평범한 `Qpos`/`Qvel` 식이다.
+플랜은 `Source::Qpos` 리프를 로워링하므로 (`crates/es-env/src/plan.rs:19-28`), 술어는 새 노드 타입 없는
+평범한 `Qpos`/`Qvel` 식이다.
 
 "N 스텝 연속"만은 콘이 셀 수 없다: Task IR-D는 상태 없는 데이터플로 DAG다. V0는 싸게 해결한다 —
 바구니가 충분히 깊고 속도 경계가 충분히 빡빡해서 큐브가 안정된 뒤에만 술어가 참이 되게 하고 `N = 1`로
 둔다. 진짜 안정 카운터가 필요하다고 밝혀지면 그것은 새 IR-D 노드가 아니라 IR-C (§6, 제어)에 속한다:
 미해결 질문 3.
+
+**V0가 측정한 것, 그리고 술어가 "AABB 그리고 `|v|`"보다 좁아진 이유.** *기존* 콘의 세 가지 한계이며,
+셋 다 `es-ir` 변경이 아니다:
+
+1. **콘 리프는 스칼라 하나, 그 관절의 첫 인덱스다.** `Ctx::joint_leaf`
+   (`crates/es-env/src/plan.rs:181-208`)는 `joints.first()`를 취해 `qpos[range.start]`를 바인딩한다.
+   큐브의 free joint에서는 그것이 `x` 하나뿐이고, `y`와 `z`는 `TaskNode`에서 아예 주소 지정이 안 된다 —
+   `qpos[i]`를 인덱스로 읽는 노드가 없기 때문이다 (인덱스를 쓰는 것은 `Randomization` / `ResetState`의
+   타깃 *문자열*뿐, `randomize.rs:141-153`). 그래서 V0가 작성한 술어는 **바구니의 x 구간 + 정지 경계**다.
+   장면은 그 구간이 판별력을 갖도록 배치했다: 큐브는 x ≈ 0.24에서 시작하고 바구니 내부는
+   x ∈ [0.050, 0.170]이며, 그 x에서 도달 가능한 y를 바구니의 y 폭(±0.105)이 덮는다.
+2. **상수 리프도 절댓값도 없다.** `TaskNode`에 `Const`가 없고, `Arith::Mul`의 오른쪽 피연산자는 §5.4
+   단위 대수에서 무차원이다 (`task.rs`의 `inputs()`). 따라서 `x - c`도 `v * v`도 표현할 수 없다.
+   유일하게 쓸 수 있는 상수는 `Compare { rhs: Some(c) }`가 접어 넣는 것뿐이므로 `|v| < b`는 `Compare`
+   둘과 `And` 하나로 쓰고, 성형 보상은 큐브 x의 `Normalize`로 쓴다 (보상 항은 무차원이거나 정규화되어야
+   한다, `TYPE-011`).
+3. **`Normalize`와 `Logic`은 콘 로워링이 아직 다루지 않는 `TaskNode` 변형이다.** `Ctx::lower`
+   (`plan.rs:125-179`)는 `GetJointState`, `GetSensor`, `GetTime`, `Arith`, `Compare`, `Clamp`만 다루고
+   나머지는 이름을 밝힌 `EnvError::Unsupported`다. 거기에 `Normalize`와 `Logic`을 더하는 것은 IR을 건드리지
+   않는 **`es-env` (레이어 9)의 V1 작업**이다: `Expr`에는 이미 `Logic`이 있고 정규화는 아핀 `Arith`다.
+   V0의 문서는 로워링이 아니라 노드 집합을 기준으로 작성된다.
+
+3축 AABB에는 셋 중 하나가 필요하다: 콘 안의 `GetBodyPose` 리프, free joint의 7폭 `qpos`에 대한 `Slice`
+리프, 또는 `jointpos` 계열 센서 셋. 셋 다 V0 범위를 넘는 IR 또는 `es-env` 작업이다 — 미해결 질문 3을
+여기까지 넓힌다.
+
+**관측 쪽에도 같은 모양의 간극.** `capture` (`crates/es-eval/src/runner.rs:411-420`)는 관측 입력 이름을
+**관절**로 키가 잡힌 `ModelInfo.qpos`나 `ModelInfo.sensor`에 대해 해석한다. `qvel` 경로도 바디 경로도
+없다. 교차 IR 검사 (`XIR-002`)는 Task IR 채널과 Observation IR `StateInput`이 *같은* id를 부르기를
+요구하고, `DEP-031`은 Safety Plane 엔벨로프를 그 채널의 `dof`와 비교한다. 그래서 6관절 로봇은 로봇 바디가
+부르는 `dof = 6` 채널 하나가 되는데, 바로 그것을 `capture`가 해석하지 못한다.
+`crates/es-eval/tests/evaluation.rs:427-440`은 Task IR에는 바디를, Observation IR에는 관절을 적어 이를
+피해 가지만 그 조합은 `cross::check`를 통과하지 못한다. 수정은 V1의 몫이고 (`capture`를 관절 *집합*과
+`qvel`까지 넓히거나, 장면에 `jointpos` / `jointvel` 센서를 내보내거나), V0는 정직한 6폭 상태를 선언하고
+간극을 여기 기록한다.
 
 ## 6. 학습과 훈련 (V2)
 

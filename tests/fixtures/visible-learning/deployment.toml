@@ -1,0 +1,150 @@
+# Deployment IR + Safety Plane (spec 9) for the SO-101 cube-into-bin demo -- packet M5/V0.
+#
+# The envelope is a *document*, never a switch (INV-12): nothing here can disable the Safety
+# Plane, and V3 tightens these numbers for the demo suite rather than bypassing them.
+#
+# `safety.position` is the scene's own six joint ranges, read out of the parsed MJCF rather
+# than transcribed; `torque_max` is the `sts3215` class `forcerange` (2.94 N m). Velocity,
+# acceleration and the action-rate limits are chosen for the 50 Hz control tick and are the
+# knob V3 turns.
+#
+# Rates are integer `TickRate`s (spec 18.1): control 50 Hz, inference 5 Hz. The deadlines are
+# whole multiples of the control period -- observation_age 4x, inference_budget 2x,
+# actuation_budget 1/2x -- so nothing here is a float duration.
+#
+# `target` is the simulated scene; V3 or a real SO-101 swaps it for `Physical { driver }`
+# without touching the envelope.
+
+es_schema = 1
+kind = "deployment"
+
+[body]
+fallback = "hold_position"
+schema_version = 1
+watchdogs = [
+    { inference_deadline = { budget = 40000 } },
+    "chunk_underrun",
+    { stale_observation = { max_age = 80000 } },
+    { envelope_violation_rate = { max_frac = 0.05, window = 200 } },
+]
+
+[body.action]
+dim = 6
+execute_chunk = 10
+horizon = 16
+space = "joint_position"
+
+[body.deadlines]
+actuation_budget = 10000
+inference_budget = 40000
+observation_age = 80000
+
+[body.execution.temporal_ensemble]
+decay = 0.01
+
+[body.rate.control]
+den = 1
+num = 50
+
+[body.rate.inference]
+den = 1
+num = 5
+
+[body.robot]
+n_joints = 6
+name = "so101"
+
+[body.robot.target.simulated]
+scene = "tests/fixtures/mjcf/so101_pick_place.xml"
+
+[body.safety]
+acceleration_max = [
+    20.0,
+    20.0,
+    20.0,
+    20.0,
+    20.0,
+    20.0,
+]
+contact_force_max = 15.0
+ee_velocity_max = 0.6
+min_env_distance = 0.005
+min_self_distance = 0.005
+position_soft_margin = [
+    0.05,
+    0.05,
+    0.05,
+    0.05,
+    0.05,
+    0.05,
+]
+torque_max = [
+    2.94,
+    2.94,
+    2.94,
+    2.94,
+    2.94,
+    2.94,
+]
+velocity_max = [
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+    3.0,
+]
+
+[body.safety.action_rate]
+first_diff_max = [
+    0.08,
+    0.08,
+    0.08,
+    0.08,
+    0.08,
+    0.08,
+]
+second_diff_max = [
+    0.04,
+    0.04,
+    0.04,
+    0.04,
+    0.04,
+    0.04,
+]
+
+[[body.safety.position]]
+lower = -1.91986
+upper = 1.91986
+
+[[body.safety.position]]
+lower = -1.7453293
+upper = 1.7453293
+
+[[body.safety.position]]
+lower = -1.69
+upper = 1.69
+
+[[body.safety.position]]
+lower = -1.658063
+upper = 1.658063
+
+[[body.safety.position]]
+lower = -2.7438473
+upper = 2.7438473
+
+[[body.safety.position]]
+lower = -0.174533
+upper = 1.7453292
+
+[body.safety.workspace.box]
+max = [
+    0.45,
+    0.45,
+    0.6,
+]
+min = [
+    -0.45,
+    -0.45,
+    -0.01,
+]

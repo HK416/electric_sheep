@@ -1,0 +1,33 @@
+{
+  "repo": "https://github.com/google-deepmind/mujoco_menagerie",
+  "path": "robotstudio_so101/so101.xml",
+  "commit": "ac6b2b09983786f3036cab1000221017fa2193b4",
+  "blake3_so101_xml": "170a4b3148286a0954474dbf544e4154c93988ecdd631febbde3d6a42119747c",
+  "bytes_so101_xml": 16670,
+  "license": "Apache-2.0",
+  "license_file": "so101_pick_place.LICENSE",
+  "license_source": "robotstudio_so101/LICENSE at the pinned commit, unmodified",
+  "derivative": "so101_pick_place.xml",
+  "vendored": [
+    "so101_pick_place.xml",
+    "so101_pick_place.LICENSE",
+    "so101_pick_place.PROVENANCE.json"
+  ],
+  "never_vendored": [
+    "robotstudio_so101/assets/**  (19 STL meshes, 17230580 B)",
+    "robotstudio_so101/so101.png",
+    "robotstudio_so101/scene.xml",
+    "robotstudio_so101/scene_box.xml"
+  ],
+  "derivation": [
+    "Carried over unchanged from upstream so101.xml: the body tree (base, shoulder, upper_arm, lower_arm, wrist, gripper, camera_mount, moving_jaw_so101_v1) with byte-equal `pos` and orientation; the six hinge joints (shoulder_pan, shoulder_lift, elbow_flex, wrist_flex, wrist_roll, gripper) with byte-equal `axis`, `range` and the `sts3215` class `damping`/`armature`/`frictionloss`; every `<inertial>` (mass and fullinertia); every primitive (non-mesh) geom with its `pos`, orientation and `size`; the six `<position>` actuators with their `kp`, `kv`, `forcerange` and `ctrlrange`; and `<option>` apart from one attribute listed below.",
+    "Dropped: every `type=\"mesh\"` geom, together with `<asset>`, `meshdir` and `<material>`. A mesh geom is `PhysicsError::Unsupported` in crates/es-physics-backend/src/mjcf_out.rs and is refused by crates/es-render/src/scene.rs, so a mesh-bearing model reaches neither MuJoCo nor the renderer through this pipeline. The three `class=\"collision_gripper_mesh\"` collision meshes are dropped without replacement: the jaws they cover are already described by the explicit box/sphere primitives of `class=\"collision_gripper\"`, which are kept.",
+    "Added: one visual-only primitive (`contype=0 conaffinity=0`) per link, named `<link>_shell`, standing in for that link's dropped visual meshes. `camera_mount_shell` carries the 0.012 kg of the visual mesh it replaces, so the mount's mass is unchanged; every other link has an explicit `<inertial>`, which MuJoCo prefers over geom-derived inertia, so the added shells change no mass property.",
+    "Flattened: the upstream `class=\"so101\"`/`\"visual\"`/`\"collision\"`/`\"collision_gripper\"`/`\"collision_gripper_mesh\"`/`\"backlash\"` default classes are gone; only `class=\"sts3215\"` survives, and it carries only `<joint>` and `<position>` values. Attributes those classes supplied to geoms (`condim`, `friction`, `solref`, `rgba`, `mass`) are written out explicitly on each geom.",
+    "Not represented by SceneDesc, therefore removed so the fixture parses with zero warnings (crates/es-assets/src/mjcf/attrs.rs `report_unknown`): geom `group` and `priority`, site `group`, `<option ls_iterations>`, `<mesh maxhullvert>`, the whole `<visual>` section, and the `mode`/`resolution`/`sensorsize`/`focal` attributes of a `<camera>`. Dropping `priority=\"1\"` from the gripper contact geoms means MuJoCo mixes contact parameters instead of letting the gripper win; `mjcf_out` cannot emit `priority` in any case.",
+    "Removed: the wrist camera `wrist_cam`, whose `mode`/`resolution`/`sensorsize`/`focal` attributes SceneDesc does not carry, and which the demo does not use -- `MultiViewPack` is rejected by crates/es-compile/src/plan.rs, so the demo has exactly one camera.",
+    "Added scene, not from upstream: a `table` ground plane; a `bin` of one floor plate and four thin walls (interior x in [0.050, 0.170], y in [-0.105, 0.105], floor top z = 0.008); a free-joint `cube` body (`cube_free`, box half-extents 0.015 0.015 0.02, 0.05 kg) nominally at (0.24, 0, 0.02); one fixed overhead `<camera name=\"overhead\">` at (0.16, 0, 0.5); and one visual-only `ceiling_light` geom, whose `_light` name suffix is how crates/es-render/src/scene.rs infers an emitter. The cube deviates from upstream `scene_box.xml` (`size=\"0.02 0.02 0.03\"` at `pos=\"0.5 0 0.03\"`): it is smaller so the SO-101 jaws close on it, and nearer so it is inside the arm's reach.",
+    "The file is flat: no `<include>`, no `<keyframe>`, no `<equality>`, no `<contact>`, no `<tendon>`, no `<sensor>`."
+  ],
+  "oracle": "crates/es-assets/tests/so101_provenance.rs fetches upstream so101.xml at `commit` (from $ES_MENAGERIE_CACHE/<commit>/so101.xml, else `curl -fsSL` into target/), verifies `blake3_so101_xml` before parsing it, and asserts the kinematic equality above."
+}

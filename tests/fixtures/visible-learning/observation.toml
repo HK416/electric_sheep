@@ -1,0 +1,363 @@
+# Observation IR (spec 7) for the SO-101 cube-into-bin demo -- plan V, packet M5/V0.
+#
+# `task_ref` is task.toml's `task_hash`. One Task IR may carry several Observation IRs.
+#
+# The ImageSpec is declared once, here, at the size the renderer will produce: 96x96 Rgb8
+# from the `overhead` camera, pinhole, fx = fy = (96/2)/tan(45 deg / 2), principal point at
+# the centre. There is no `Resize` and no `Crop` node, so no intrinsics transform is owed
+# (spec 7.2, INV-14). There is no `MultiViewPack`: plan lowering rejects it
+# (crates/es-compile/src/plan.rs:545), which is why the demo has exactly one camera.
+#
+# Time model (spec 7.5): `TemporalWindow { n_steps = 1 }`, matching the policy contract's
+# `observation_window` (XIR-011); the `TemporalEncoder` lives in learning.toml.
+#
+# Ceiling: `StateInput` names the robot's `base` body, which is what the Task IR channel
+# declares (spec 7.4 / XIR-002) and what DEP-031 measures the Safety Plane envelope against.
+# The evaluation runner resolves an observation input against `ModelInfo.qpos`, which is
+# keyed by *joint* (crates/es-eval/src/runner.rs:417-420), so feeding this 6-wide state -- and
+# the image input, which needs a renderer -- is V0b/V1 work, exactly like the gap the design
+# note records in section 2.2.
+
+es_schema = 1
+kind = "observation"
+
+[body]
+schema_version = 1
+task_ref = [
+    251,
+    98,
+    210,
+    100,
+    117,
+    124,
+    33,
+    97,
+    103,
+    191,
+    11,
+    13,
+    8,
+    5,
+    145,
+    162,
+    201,
+    208,
+    137,
+    222,
+    12,
+    164,
+    217,
+    83,
+    203,
+    88,
+    138,
+    219,
+    191,
+    6,
+    5,
+    121,
+]
+
+[body.graph]
+inputs = []
+outputs = []
+schema_version = 1
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 0
+port = "out"
+
+[body.graph.edges.to]
+node = 1
+port = "in0"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 2
+port = "out"
+
+[body.graph.edges.to]
+node = 3
+port = "in0"
+
+[body.graph.nodes.0.ImageInput]
+sensor = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.graph.nodes.0.ImageInput.io]
+inputs = []
+
+[body.graph.nodes.0.ImageInput.io.output]
+elem = "F32"
+shape = [
+    3,
+    96,
+    96,
+]
+unit = "Pixel"
+
+[body.graph.nodes.0.ImageInput.io.output.frame]
+Camera = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.graph.nodes.0.ImageInput.io.output.image]
+camera_model = "Pinhole"
+channels = "Rgb"
+color_space = "SRgb"
+distortion = "None"
+dtype = "U8"
+height = 96
+rate_hz = 50.0
+shutter = "Global"
+width = 96
+
+[body.graph.nodes.0.ImageInput.io.output.image.exposure]
+nanos = 2000000
+secs = 0
+
+[body.graph.nodes.0.ImageInput.io.output.image.extrinsics.orientation]
+w = 1.0
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.0.ImageInput.io.output.image.extrinsics.position]
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.0.ImageInput.io.output.image.intrinsics]
+cx = 48.0
+cy = 48.0
+fx = 115.88225099390857
+fy = 115.88225099390857
+skew = 0.0
+
+[body.graph.nodes.0.ImageInput.io.output.time.Sensor]
+align = "Hold"
+id = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[[body.graph.nodes.1.Normalize.io.inputs]]
+elem = "F32"
+shape = [
+    3,
+    96,
+    96,
+]
+unit = "Pixel"
+
+[body.graph.nodes.1.Normalize.io.inputs.frame]
+Camera = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.graph.nodes.1.Normalize.io.inputs.image]
+camera_model = "Pinhole"
+channels = "Rgb"
+color_space = "SRgb"
+distortion = "None"
+dtype = "U8"
+height = 96
+rate_hz = 50.0
+shutter = "Global"
+width = 96
+
+[body.graph.nodes.1.Normalize.io.inputs.image.exposure]
+nanos = 2000000
+secs = 0
+
+[body.graph.nodes.1.Normalize.io.inputs.image.extrinsics.orientation]
+w = 1.0
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.1.Normalize.io.inputs.image.extrinsics.position]
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.1.Normalize.io.inputs.image.intrinsics]
+cx = 48.0
+cy = 48.0
+fx = 115.88225099390857
+fy = 115.88225099390857
+skew = 0.0
+
+[body.graph.nodes.1.Normalize.io.inputs.time.Sensor]
+align = "Hold"
+id = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.graph.nodes.1.Normalize.io.output]
+elem = "F32"
+shape = [
+    3,
+    96,
+    96,
+]
+
+[body.graph.nodes.1.Normalize.io.output.frame]
+Camera = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.graph.nodes.1.Normalize.io.output.image]
+camera_model = "Pinhole"
+channels = "Rgb"
+color_space = "SRgb"
+distortion = "None"
+dtype = "F32"
+height = 96
+rate_hz = 50.0
+shutter = "Global"
+width = 96
+
+[body.graph.nodes.1.Normalize.io.output.image.exposure]
+nanos = 2000000
+secs = 0
+
+[body.graph.nodes.1.Normalize.io.output.image.extrinsics.orientation]
+w = 1.0
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.1.Normalize.io.output.image.extrinsics.position]
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.1.Normalize.io.output.image.intrinsics]
+cx = 48.0
+cy = 48.0
+fx = 115.88225099390857
+fy = 115.88225099390857
+skew = 0.0
+
+[body.graph.nodes.1.Normalize.io.output.time.Sensor]
+align = "Hold"
+id = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.graph.nodes.1.Normalize.io.output.unit.Normalized]
+hi = 1.0
+lo = 0.0
+
+[body.graph.nodes.1.Normalize.stats.Range]
+hi = 1.0
+lo = 0.0
+
+[body.graph.nodes.2.StateInput]
+source = "501f1cde65535d4d1900d14204382d3c"
+
+[body.graph.nodes.2.StateInput.io]
+inputs = []
+
+[body.graph.nodes.2.StateInput.io.output]
+elem = "F32"
+shape = [6]
+time = "Tick"
+unit = "Angle"
+
+[body.graph.nodes.2.StateInput.io.output.frame]
+Joint = "501f1cde65535d4d1900d14204382d3c"
+
+[[body.graph.nodes.3.Normalize.io.inputs]]
+elem = "F32"
+shape = [6]
+time = "Tick"
+unit = "Angle"
+
+[body.graph.nodes.3.Normalize.io.inputs.frame]
+Joint = "501f1cde65535d4d1900d14204382d3c"
+
+[body.graph.nodes.3.Normalize.io.output]
+elem = "F32"
+shape = [6]
+time = "Tick"
+
+[body.graph.nodes.3.Normalize.io.output.frame]
+Joint = "501f1cde65535d4d1900d14204382d3c"
+
+[body.graph.nodes.3.Normalize.io.output.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.graph.nodes.3.Normalize.stats.Range]
+hi = 1.0
+lo = -1.0
+
+[body.outputs.joint_state.port]
+node = 3
+port = "out"
+
+[body.outputs.joint_state.ty]
+elem = "F32"
+shape = [6]
+time = "Tick"
+
+[body.outputs.joint_state.ty.frame]
+Joint = "501f1cde65535d4d1900d14204382d3c"
+
+[body.outputs.joint_state.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.outputs.rgb_overhead.port]
+node = 1
+port = "out"
+
+[body.outputs.rgb_overhead.ty]
+elem = "F32"
+shape = [
+    3,
+    96,
+    96,
+]
+
+[body.outputs.rgb_overhead.ty.frame]
+Camera = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.outputs.rgb_overhead.ty.image]
+camera_model = "Pinhole"
+channels = "Rgb"
+color_space = "SRgb"
+distortion = "None"
+dtype = "F32"
+height = 96
+rate_hz = 50.0
+shutter = "Global"
+width = 96
+
+[body.outputs.rgb_overhead.ty.image.exposure]
+nanos = 2000000
+secs = 0
+
+[body.outputs.rgb_overhead.ty.image.extrinsics.orientation]
+w = 1.0
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.outputs.rgb_overhead.ty.image.extrinsics.position]
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.outputs.rgb_overhead.ty.image.intrinsics]
+cx = 48.0
+cy = 48.0
+fx = 115.88225099390857
+fy = 115.88225099390857
+skew = 0.0
+
+[body.outputs.rgb_overhead.ty.time.Sensor]
+align = "Hold"
+id = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.outputs.rgb_overhead.ty.unit.Normalized]
+hi = 1.0
+lo = 0.0
+
+[body.temporal.history]
+
+[body.temporal.window]
+align = "Hold"
+n_steps = 1
+stride = 1

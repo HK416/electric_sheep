@@ -1,0 +1,217 @@
+<!--
+  SO-101 cube-into-bin demo scene (plan V, packet M5/V0).
+
+  A hand-derived, primitives-only, single-file derivative of
+  google-deepmind/mujoco_menagerie robotstudio_so101/so101.xml at commit
+  ac6b2b09983786f3036cab1000221017fa2193b4 (Apache-2.0). The upstream kinematics
+  (body frames, joint names/axes/ranges, inertials, actuator gains and ctrlranges,
+  and every primitive collision geom) are carried over byte for byte; every mesh
+  geom is dropped, because neither the MJCF emitter nor the renderer can carry one,
+  and each link gains one visual-only primitive in its place.
+
+  See so101_pick_place.PROVENANCE.json for the full derivation rules and the upstream
+  blake3, and so101_pick_place.LICENSE for the upstream licence. The upstream STL
+  meshes are never vendored; crates/es-assets/tests/so101_provenance.rs fetches
+  so101.xml at the pinned commit and proves the kinematic equality.
+-->
+<mujoco model="so101_pick_place">
+  <option integrator="implicitfast" timestep="0.005" cone="elliptic" iterations="10" impratio="10"/>
+
+  <compiler angle="radian" autolimits="true"/>
+
+  <default>
+    <default class="sts3215">
+      <joint damping="0.60" frictionloss="0.052" armature="0.028"/>
+      <position kp="998.22" kv="2.731" forcerange="-2.94 2.94"/>
+    </default>
+  </default>
+
+  <worldbody>
+    <!-- Table: the ground plane the arm, the cube and the bin stand on. -->
+    <geom name="table" type="plane" size="0.6 0.6 0.05" rgba="0.76 0.71 0.62 1"/>
+
+    <!-- Bin: a floor plate and four thin walls. Interior x in [0.050, 0.170],
+         y in [-0.105, 0.105], floor top at z = 0.008. -->
+    <geom name="bin_floor" type="box" size="0.064 0.109 0.004" pos="0.11 0 0.004" rgba="0.25 0.35 0.55 1"/>
+    <geom name="bin_wall_nx" type="box" size="0.004 0.109 0.045" pos="0.046 0 0.045" rgba="0.25 0.35 0.55 1"/>
+    <geom name="bin_wall_px" type="box" size="0.004 0.109 0.045" pos="0.174 0 0.045" rgba="0.25 0.35 0.55 1"/>
+    <geom name="bin_wall_ny" type="box" size="0.064 0.004 0.045" pos="0.11 -0.109 0.045" rgba="0.25 0.35 0.55 1"/>
+    <geom name="bin_wall_py" type="box" size="0.064 0.004 0.045" pos="0.11 0.109 0.045" rgba="0.25 0.35 0.55 1"/>
+
+    <!-- Emitter for the path-traced render path: es-render infers emission from the
+         `_light` name suffix (crates/es-render/src/scene.rs:30). -->
+    <geom name="ceiling_light" type="box" size="0.12 0.12 0.005" pos="0.16 0 0.8" contype="0" conaffinity="0"
+      rgba="1 1 1 1"/>
+
+    <!-- The one fixed overhead camera the Observation IR declares. Identity orientation
+         looks along -Z with image-up along +Y. -->
+    <camera name="overhead" pos="0.16 0 0.5" fovy="45"/>
+
+    <!-- Link base -->
+    <body name="base" pos="0 0 0" quat="1 0 0 0">
+      <inertial pos="0.0137179 -5.19711e-05 0.0334843" mass="0.147"
+        fullinertia="0.000114686 0.000136117 0.000130364 -4.59787e-07 4.97151e-06 9.75275e-08"/>
+      <!-- Replaces the base_motor_holder_so101_v1, base_so101_v2, sts3215_03a_v1 and
+           waveshare_mounting_plate_so101_v2 visual meshes. -->
+      <geom name="base_shell" type="box" size="0.045 0.035 0.024" pos="0.005 0 0.024" contype="0" conaffinity="0"
+        rgba="1 0.82 0.12 1"/>
+      <!-- Frame baseframe -->
+      <site name="baseframe" pos="0 0 0" quat="1 0 0 0"/>
+      <!-- Link shoulder -->
+      <body name="shoulder" pos="0.0388353 0 0.0624" quat="0 0 -1 0">
+        <!-- Joint from base to shoulder -->
+        <joint axis="0 0 1" name="shoulder_pan" type="hinge" range="-1.91986 1.91986" class="sts3215"/>
+        <inertial pos="-0.0307604 -1.7e-05 -0.0252713" mass="0.100006"
+          fullinertia="8.3759e-05 8.10403e-05 2.39783e-05 7.55525e-08 -1.16342e-06 1.54663e-07"/>
+        <!-- Upstream class="collision" primitive, sts3215_03a_v1_2 -->
+        <geom name="shoulder_servo_col" type="box" condim="3" pos="-0.030399 0.000422 -0.0387" quat="1 1 1 -1"
+          size="0.023 0.015 0.01"/>
+        <!-- Upstream class="collision" primitive, motor_holder_so101_base_v1 -->
+        <geom name="shoulder_holder_col" type="box" condim="3" pos="-0.025 0 0.0" quat="1 1 -1 1"
+          size="0.038 0.025 0.02"/>
+        <!-- Replaces the sts3215_03a_v1_2, motor_holder_so101_base_v1 and
+             rotation_pitch_so101_v1 visual meshes. -->
+        <geom name="shoulder_shell" type="box" size="0.04 0.025 0.03" pos="-0.025 0 -0.025" contype="0"
+          conaffinity="0" rgba="1 0.82 0.12 1"/>
+        <!-- Link upper_arm -->
+        <body name="upper_arm" pos="-0.0303992 -0.0182778 -0.0542" quat="1 -1 -1 -1">
+          <!-- Joint from shoulder to upper_arm -->
+          <joint axis="0 0 1" name="shoulder_lift" type="hinge" range="-1.7453293 1.7453293" class="sts3215"/>
+          <inertial pos="-0.089847 -0.008382 0.018409" mass="0.103"
+            fullinertia="4.08002e-05 0.000147318 0.000142487 -1.97819e-05 -4.03016e-08 8.97326e-09"/>
+          <!-- Upstream class="collision" primitive, sts3215_03a_v1_3 -->
+          <geom name="upper_arm_servo_col" type="box" condim="3" pos="-0.06 0 0.02" quat="0 -1 1 0"
+            size="0.01 0.07 0.03"/>
+          <!-- Upstream class="collision" primitive, upper_arm_so101_v1 -->
+          <geom name="upper_arm_link_col" type="box" condim="3" pos="-0.12 -0.014 0.0182" quat="0 1 0 0"
+            size="0.01 0.02 0.015"/>
+          <!-- Replaces the sts3215_03a_v1_3 and upper_arm_so101_v1 visual meshes. -->
+          <geom name="upper_arm_shell" type="capsule" size="0.018" fromto="0 0 0.0182 -0.11257 -0.028 0.0182"
+            contype="0" conaffinity="0" rgba="1 0.82 0.12 1"/>
+          <!-- Link lower_arm -->
+          <body name="lower_arm" pos="-0.11257 -0.028 0" quat="1 0 0 1">
+            <!-- Joint from upper_arm to lower_arm -->
+            <!-- Note: 5-degree calibration offset applied to joint range -->
+            <joint axis="0 0 1" name="elbow_flex" type="hinge" range="-1.69 1.69" class="sts3215"/>
+            <inertial pos="-0.098070 0.0032438 0.018283" mass="0.104"
+              fullinertia="2.87438e-05 0.000159844 0.00014529 7.41152e-06 1.26409e-06 -4.90188e-08"/>
+            <!-- Upstream class="collision" primitive, under_arm_so101_v1 -->
+            <geom name="lower_arm_link_col" type="box" condim="3" pos="-0.05 0 0.0182" quat="0 1 0 0"
+              size="0.07 0.01 0.03"/>
+            <!-- Upstream class="collision" primitive, motor_holder_so101_wrist_v1 -->
+            <geom name="lower_arm_holder_col" type="box" condim="3" pos="-0.125 0.005 0.018" quat="0 -1 0 0"
+              size="0.023 0.013 0.018"/>
+            <!-- Replaces the under_arm_so101_v1, motor_holder_so101_wrist_v1 and
+                 sts3215_03a_v1_4 visual meshes. -->
+            <geom name="lower_arm_shell" type="capsule" size="0.016" fromto="0 0 0.0182 -0.1349 0.0052 0.0182"
+              contype="0" conaffinity="0" rgba="1 0.82 0.12 1"/>
+            <!-- Link wrist -->
+            <body name="wrist" pos="-0.1349 0.0052 0" quat="1 0 0 -1">
+              <!-- Joint from lower_arm to wrist -->
+              <joint axis="0 0 1" name="wrist_flex" type="hinge" range="-1.658063 1.658063" class="sts3215"/>
+              <inertial pos="-0.000103312 -0.0386143 0.0281156" mass="0.079"
+                fullinertia="3.68263e-05 2.5391e-05 2.1e-05 1.7893e-08 -5.28128e-08 3.6412e-06"/>
+              <!-- Upstream class="collision" primitive, sts3215_03a_no_horn_v1 -->
+              <geom name="wrist_servo_col" type="box" condim="3" pos="0 -0.0424 0.0256" quat="1 1 1 -1"
+                size="0.029 0.015 0.018"/>
+              <!-- Upstream class="collision" primitive, wrist_roll_pitch_so101_v2 -->
+              <geom name="wrist_pitch_col" type="box" condim="3" pos="0 -0.02 0.0191" quat="1 -1 -1 -1"
+                size="0.027 0.01 0.03"/>
+              <!-- Replaces the sts3215_03a_no_horn_v1 and wrist_roll_pitch_so101_v2 visual meshes. -->
+              <geom name="wrist_shell" type="capsule" size="0.017" fromto="0 0 0.0181 0 -0.0611 0.0181"
+                contype="0" conaffinity="0" rgba="1 0.82 0.12 1"/>
+              <!-- Link gripper -->
+              <body name="gripper" pos="5.55112e-17 -0.0611 0.0181" quat="0.0172091 -0.0172091 0.706897 0.706897">
+                <!-- Joint from wrist to gripper -->
+                <joint axis="0 0 1" name="wrist_roll" type="hinge" range="-2.7438473 2.7438473" class="sts3215"/>
+                <inertial pos="0.000214 0.000245 -0.025187" mass="0.087"
+                  fullinertia="2.75087e-05 4.33657e-05 3.45059e-05 -3.35241e-07 -5.7352e-06 -5.17847e-08"/>
+                <!-- Upstream class="collision" primitive, wrist_roll_follower_so101_v1 -->
+                <geom name="fixed_jaw_col" type="box" condim="3" pos="0 -0.000218 0.00095" quat="0 1 0 0"
+                  size="0.01 0.01 0.018"/>
+                <!-- Upstream class="collision_gripper" primitives -->
+                <geom name="fixed_jaw_box1" type="box" size="0.0325 0.015 0.015" pos="-0.0025 0 -0.022" condim="6"
+                  friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                <geom name="fixed_jaw_box2" type="box" size="0.01 0.015 0.005" pos="-0.024 0 -0.04" condim="6"
+                  friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                <geom name="fixed_jaw_sph_tip1" type="sphere" size="0.00075" pos="-0.0081 0 -0.101" condim="6"
+                  friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                <geom name="fixed_jaw_sph_tip2" type="sphere" size="0.00075" pos="-0.0081 0.0035 -0.0975"
+                  condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                <geom name="fixed_jaw_sph_tip3" type="sphere" size="0.00075" pos="-0.0081 -0.0035 -0.0975"
+                  condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                <geom name="fixed_jaw_box3" type="capsule" size="0.0011 0.002" pos="-0.009 0 -0.103"
+                  euler="1.57 0 0" condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                <geom name="fixed_jaw_box4" type="box" size="0.001 0.004 0.004" pos="-0.009 0 -0.0982" condim="6"
+                  friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                <geom name="fixed_jaw_box5" type="box" size="0.001 0.005 0.006" pos="-0.0108 0 -0.0905"
+                  condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                <geom name="fixed_jaw_box6" type="box" size="0.001 0.009 0.008" pos="-0.0125 0 -0.0727"
+                  condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                <geom name="fixed_jaw_box7" type="box" size="0.001 0.01 0.008" pos="-0.0143 0 -0.053" condim="6"
+                  friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                <!-- Replaces the sts3215_03a_v1_5 and wrist_roll_follower_so101_v1 visual meshes. -->
+                <geom name="gripper_shell" type="box" size="0.018 0.018 0.015" pos="0.004 0 -0.018" contype="0"
+                  conaffinity="0" rgba="1 0.82 0.12 1"/>
+                <!-- Frame gripperframe -->
+                <site name="gripperframe" pos="0.012 -0.000218 -0.098127" quat="1 0 1 0"/>
+                <!-- Camera mount -->
+                <body name="camera_mount">
+                  <!-- Upstream class="collision_gripper" primitives -->
+                  <geom name="camera_box1" type="box" size="0.015 0.015 0.003" pos="-0.0025 0.03 -0.03"
+                    condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                  <geom name="camera_box2" type="box" size="0.021 0.021 0.003" pos="-0.001 0.06 -0.04"
+                    euler="-0.55 0 0" condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                  <!-- Replaces the wrist_roll_follower_so101_camera_mount visual mesh; carries
+                       its 0.012 kg so the mount's mass is unchanged. -->
+                  <geom name="camera_mount_shell" type="box" size="0.015 0.035 0.008" pos="0 0.03 -0.03"
+                    mass="0.012" contype="0" conaffinity="0" rgba="1 0.82 0.12 1"/>
+                </body>
+                <!-- Link moving_jaw_so101_v1 -->
+                <body name="moving_jaw_so101_v1" pos="0.0202 0.0188 -0.0234" quat="1 1 0 0">
+                  <!-- Joint from gripper to moving_jaw_so101_v1 -->
+                  <joint axis="0 0 1" name="gripper" type="hinge" range="-0.174533 1.7453292" class="sts3215"/>
+                  <inertial pos="-0.001575 -0.0300244 0.0192755" mass="0.012"
+                    fullinertia="6.61427e-06 1.89032e-06 5.28738e-06 -3.19807e-07 -5.90717e-09 -1.09945e-07"/>
+                  <!-- Upstream class="collision_gripper" primitives -->
+                  <geom name="moving_jaw_box1" type="box" size="0.01 0.01 0.015" pos="-0.0 -0.013 0.019"
+                    condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                  <geom name="moving_jaw_sph_tip1" type="sphere" size="0.00075" pos="-0.012 -0.078 0.0192"
+                    condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                  <geom name="moving_jaw_sph_tip2" type="sphere" size="0.00075" pos="-0.012 -0.0745 0.0225"
+                    condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                  <geom name="moving_jaw_sph_tip3" type="sphere" size="0.00075" pos="-0.012 -0.0745 0.0155"
+                    condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                  <geom name="moving_jaw_box2" type="box" size="0.001 0.004 0.004" pos="-0.0113 -0.076 0.01875"
+                    condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                  <geom name="moving_jaw_box3" type="box" size="0.001 0.005 0.006" pos="-0.0093 -0.067 0.01875"
+                    condim="6" friction="1 5e-3 5e-4" solref="0.01 1" rgba="1 0 0 1" mass="0"/>
+                  <!-- Replaces the moving_jaw_so101_v1 visual mesh. -->
+                  <geom name="moving_jaw_shell" type="box" size="0.008 0.04 0.012" pos="-0.006 -0.04 0.019"
+                    contype="0" conaffinity="0" rgba="1 0.82 0.12 1"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+
+    <!-- The manipulated cube. Its free joint is the Task IR's randomization target. -->
+    <body name="cube" pos="0.24 0 0.02">
+      <freejoint name="cube_free"/>
+      <inertial pos="0 0 0" mass="0.05" diaginertia="1.0417e-05 1.0417e-05 7.5e-06"/>
+      <geom name="cube_geom" type="box" size="0.015 0.015 0.02" condim="3" friction="1 0.03 0.003"
+        rgba="0.85 0.2 0.15 1"/>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position class="sts3215" name="shoulder_pan" joint="shoulder_pan" ctrlrange="-1.91986 1.91986"/>
+    <position class="sts3215" name="shoulder_lift" joint="shoulder_lift" ctrlrange="-1.74533 1.74533"/>
+    <position class="sts3215" name="elbow_flex" joint="elbow_flex" ctrlrange="-1.69 1.69"/>
+    <position class="sts3215" name="wrist_flex" joint="wrist_flex" ctrlrange="-1.65806 1.65806"/>
+    <position class="sts3215" name="wrist_roll" joint="wrist_roll" ctrlrange="-2.74385 2.84121"/>
+    <position class="sts3215" name="gripper" joint="gripper" ctrlrange="-0.17453 1.74533"/>
+  </actuator>
+</mujoco>

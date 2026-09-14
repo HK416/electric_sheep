@@ -2696,3 +2696,146 @@ fn import_roboverse_writes_nothing_when_an_unmapped_item_blocks_it() {
     assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
     assert!(!out_dir.exists(), "nothing is written on a refusal");
 }
+
+// --- plan V: the SO-101 cube-into-bin demo documents (packet M5/V0) -------------------------
+
+/// Workspace-root path of one of the four plan V fixture documents.
+fn vl_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/visible-learning")
+        .join(name)
+}
+
+/// The four documents validate, cross-check and compile, and every hash they print is stable
+/// across two runs -- the hash chain (spec 5.3) is a function of the documents alone.
+#[test]
+fn visible_learning_documents_compile() {
+    let task = vl_fixture("task.toml");
+    let observation = vl_fixture("observation.toml");
+    let learning = vl_fixture("learning.toml");
+    let deployment = vl_fixture("deployment.toml");
+
+    let validate = || {
+        let out = bin()
+            .args(["ir", "validate"])
+            .args([&task, &observation, &learning, &deployment])
+            .output()
+            .expect("run es ir validate");
+        assert!(
+            out.status.success(),
+            "stdout:\n{}\nstderr:\n{}",
+            stdout(&out),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        stdout(&out)
+    };
+    let first = validate();
+    for kind in ["task", "observation", "learning", "deployment"] {
+        assert!(first.contains(&format!("{kind}_hash: ")), "{first}");
+    }
+    assert!(!first.contains("ERROR"), "{first}");
+    assert_eq!(first, validate(), "the four hashes are not stable");
+
+    // The cross-IR check (spec 11.1) over the same four documents.
+    let cross = bin()
+        .args(["ir", "check"])
+        .args([&task, &observation, &learning, &deployment])
+        .output()
+        .expect("run es ir check");
+    let text = stdout(&cross);
+    assert!(cross.status.success(), "{text}");
+    assert!(!text.contains("ERROR"), "{text}");
+
+    // And the Observation IR lowers to a CPU plan.
+    let compile = || {
+        let out = bin()
+            .args(["task", "compile"])
+            .args([&task, &observation])
+            .output()
+            .expect("run es task compile");
+        assert!(out.status.success(), "{}", stdout(&out));
+        stdout(&out)
+    };
+    let plan = compile();
+    assert!(plan.contains("compiler_hash: "), "{plan}");
+    assert!(plan.contains("shape=[3, 96, 96]"), "{plan}");
+    assert_eq!(plan, compile(), "the compiler hash is not stable");
+}
+
+/// Packet M5/V0 puts this test here rather than in `es-physics-backend`'s own
+/// `tests/so101_scene.rs`: `RandomizationPlan` lives in `es-env` (layer 9), and a dev
+/// dependency from layer 4 on layer 9 is a `cargo xtask layering` rule-1 violation --
+/// `cargo metadata` does not distinguish a dev dependency. The `es` binary crate is not in
+/// the spec 4.2 layer table and already depends on both.
+#[test]
+fn the_cube_free_joint_is_randomizable() {
+    use es_env::randomize::{RandomizationPlan, ResetBuffer};
+    use es_physics_backend::MuJoCoCpuBackend;
+    use es_physics_core::{LoadConfig, PhysicsBackend};
+
+    if let Err(reason) = MuJoCoCpuBackend::is_available() {
+        println!("SKIP the_cube_free_joint_is_randomizable: {reason}");
+        return;
+    }
+    let xml = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/mjcf/so101_pick_place.xml"),
+    )
+    .expect("the demo scene");
+    let scene = es_assets::parse_mjcf(&xml)
+        .expect("the demo scene parses")
+        .scene;
+    let mut backend = MuJoCoCpuBackend::new();
+    let model = backend
+        .load(
+            &scene,
+            &LoadConfig {
+                n_envs: 1,
+                rate: Some(TickRate::hz(200)),
+                seed: 1,
+            },
+        )
+        .expect("the demo scene loads");
+
+    let raw = std::fs::read_to_string(vl_fixture("task.toml")).expect("task.toml");
+    let task = es_ir::serial::task_from_toml(&raw).expect("task.toml parses");
+    // Every declared target resolves; an unresolvable one is `EnvError::Unsupported` by name.
+    let plan = RandomizationPlan::compile(&task, &scene, &model).expect("every target resolves");
+    assert!(!plan.is_empty());
+
+    let draw = |seed: u64, episode: u64| {
+        let mut qpos = vec![0.0; model.nq as usize];
+        let mut qvel = vec![0.0; model.nv as usize];
+        let mut scales = es_env::randomize::ParamScales::new();
+        plan.apply(
+            seed,
+            0,
+            episode,
+            &mut ResetBuffer {
+                qpos: &mut qpos,
+                qvel: &mut qvel,
+                scales: &mut scales,
+            },
+        );
+        // No mass/friction/gain target is declared, so nothing is recorded but not applied.
+        assert!(scales.is_empty(), "{scales:?}");
+        qpos
+    };
+
+    let a = draw(7, 0);
+    assert_eq!(
+        a,
+        draw(7, 0),
+        "the same (seed, episode) is not reproducible"
+    );
+    let b = draw(7, 1);
+    assert_ne!(a[6..9], b[6..9], "two episodes give the same cube pose");
+    assert_ne!(
+        a[6..9],
+        draw(8, 0)[6..9],
+        "two seeds give the same cube pose"
+    );
+    // The arm's reset is deterministic; only the cube moves.
+    assert_eq!(a[..6], b[..6]);
+    println!("RAN the_cube_free_joint_is_randomizable");
+}
