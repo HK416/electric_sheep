@@ -14,10 +14,10 @@ Spec: §24.1 (mode A: key expression, CDR, attachment, liveliness "with `zenoh-r
 |---|---|
 | crate | **`zenoh = "=1.8.0"`** (released 2026-03-13): the exact version ROS 2's `zenoh_cpp_vendor` builds (zenoh-c 1.8.0 -> `zenoh 1.8.0` at `2687c51352121f006e3a603ce07925a8ad0b295c`, `docs/api-notes/rmw-zenoh.md`). Latest is 1.10.1 (2026-09-07). <https://crates.io/api/v1/crates/zenoh/versions>, retrieved 2026-09-14 |
 | where the signatures below were read | tag **`1.10.1`**, `https://raw.githubusercontent.com/eclipse-zenoh/zenoh/1.10.1/<path>`; the attachment serializer at `2687c51` (1.8.0). Any 1.8.0/1.10.1 signature difference surfaces as a compile error in W1b, which corrects this file |
-| declared MSRV | `rust_version = "1.75.0"` for both 1.8.0 and 1.10.1 (crates.io per-version API); README: "some of its dependencies may require newer Rust versions". A local resolve of 1.10.1 with `rust-version = "1.85"` and cargo's MSRV-aware resolver picked **0 dependencies above 1.85** (e.g. `time-core v0.1.7`, "available: v0.1.9, requires Rust 1.88.0"). A real `cargo +1.85 build` of 1.8.0 is **unverified** |
+| declared MSRV | `rust_version = "1.75.0"` for both 1.8.0 and 1.10.1 (crates.io per-version API); README: "some of its dependencies may require newer Rust versions". A local resolve of 1.10.1 with `rust-version = "1.85"` and cargo's MSRV-aware resolver picked **0 dependencies above 1.85** (e.g. `time-core v0.1.7`, "available: v0.1.9, requires Rust 1.88.0"). **W1b, 2026-09-14: `cargo +1.85 check -p es-ros2 --features zenoh` PASSES** (Windows, `1.85-x86_64-pc-windows-msvc`) with `.cargo/config.toml`'s `[resolver] incompatible-rust-versions = "fallback"` — real `cargo +1.85` build of 1.8.0 verified, not just resolved |
 | license | `EPL-2.0 OR Apache-2.0` |
 | `zenoh-ext` | **not a dependency.** The two serializer encodings rmw_zenoh's attachment needs are hand-rolled (below) |
-| interop peer versions | upstream ROS 2 kilted/lyrical/rolling: zenoh 1.8.0 (= our pin). RoboStack `ros-kilted-rmw-zenoh-cpp 0.6.6` links `libzenohc >=1.7.2,<1.7.3`; `ros-lyrical-rmw-zenoh-cpp 0.10.x` links `libzenohc >=1.9.0,<1.9.1`. Wire compatibility 1.8.0 <-> 1.7.2 (the CI oracle's router) is **unverified** until the W1b live oracle runs |
+| interop peer versions | upstream ROS 2 kilted/lyrical/rolling: zenoh 1.8.0 (= our pin). RoboStack `ros-kilted-rmw-zenoh-cpp 0.6.6` links `libzenohc >=1.7.2,<1.7.3`; `ros-lyrical-rmw-zenoh-cpp 0.10.x` links `libzenohc >=1.9.0,<1.9.1`. **W1b, 2026-09-14: wire compatibility 1.8.0 (us) <-> 1.7.2 (RoboStack Kilted's `rmw_zenohd`) VERIFIED** — `rmw_zenoh_interop.rs`'s live oracle (talker/listener/CLI/`topic pub`, all five scenarios) passed against a real `rmw_zenohd` router from that build |
 
 Dependency line (W1b):
 
@@ -33,7 +33,10 @@ zenoh = { version = "=1.8.0", default-features = false, features = ["transport_t
 - TLS/crypto come from `transport_tls`/`transport_quic` (`rustls`, `ring`, `quinn`, `rcgen`)
   and `transport_multilink -> auth_pubkey -> rsa`.
 - `default-features = false, features = ["transport_tcp"]`: 272 packages, **no rustls / ring /
-  quinn / rsa / tungstenite** (local `cargo tree` resolve; defaults: 383). Build **unverified**.
+  quinn / rsa / tungstenite** (local `cargo tree` resolve; defaults: 383). **W1b, 2026-09-14:
+  build VERIFIED** on Windows and Linux (`cargo build -p es-ros2 --features zenoh`); `cargo tree
+  -p es-ros2 --features zenoh -e normal --prefix none | grep -cE '^(rustls|ring|quinn|rsa) '`
+  prints `0` on both.
 - `unstable` gates `Sample::source_info`, reliability and zenoh-ext advanced pub/sub. Nothing
   here needs it. `liveliness` is **stable** (`pub mod liveliness` has no cfg gate).
 
@@ -118,4 +121,10 @@ other connects (`zenoh/tests/liveliness.rs`: a token on peer2 is seen by a livel
 on peer1). Reading back the port bound to `:0` needs `get_locators_from_session`, which uses
 `internal` APIs -- **not enabled here**. `es-ros2` tests instead reserve a port with
 `std::net::TcpListener::bind("127.0.0.1:0")`, drop it, and listen on that port (retry on
-`AddrInUse`).
+`AddrInUse`). **W1b, 2026-09-14:** `session_loopback.rs`'s 13 tests use exactly this pattern
+(no retry loop implemented — not observed to be needed in ~10 repeated local runs); all pass
+on Windows and Linux. `LivelinessToken` and `zenoh::pubsub::Publisher`/`Subscriber` in 1.8.0
+carry **no lifetime parameter that leaks into `es-ros2`'s own structs** except
+`Publisher<'static>` (obtained straight from `Session::declare_publisher`, since `Session` is
+internally `Arc`-backed) — the `Publisher<'_>` notation elsewhere in this file is 1.10.1's API;
+1.8.0's compiles the same way with `'static`.

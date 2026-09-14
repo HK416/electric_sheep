@@ -39,6 +39,102 @@ pub enum NameError {
     BadQos(String),
 }
 
+/// Every runtime and configuration error `es-ros2` can report (`docs/design/ros2-boundary.md`
+/// section 4.2's table, plus a few conditions that table leaves unnumbered: config parsing and
+/// actuator lookup). [`Ros2Error::code`] is the stable string a caller logs or matches on; the
+/// `Display` message (via `thiserror`) is for humans only and may change.
+#[derive(Debug, Error)]
+pub enum Ros2Error {
+    /// TOML syntax, an unknown key, or a missing/malformed required field. Not in section 4.2's
+    /// table (that table is about mode/probe conditions); this is the catch-all for "the file
+    /// itself does not parse".
+    #[error("ros2 config: {0}")]
+    Config(String),
+    /// Both `[ros2.rmw_zenoh]` and `[ros2.dds_bridge]` are present: modes A and B are mutually
+    /// exclusive (spec 24.1).
+    #[error("[ros2.rmw_zenoh] and [ros2.dds_bridge] cannot both be configured (A xor B)")]
+    BothModesConfigured,
+    /// `[ros2.rust_dds]` (mode C) is present: parsed only so this rejection is specific, mode C
+    /// is not built.
+    #[error("[ros2.rust_dds] (mode C) is not implemented")]
+    ModeCNotBuilt,
+    /// Mode A's startup probe found a `zenoh-plugin-ros2dds` bridge token already on the
+    /// network.
+    #[error("mode A startup probe found a bridge token: {0}")]
+    ModeAFoundBridge(String),
+    /// Mode B's startup probe found no bridge-plugin liveliness token: there is no bridge to
+    /// talk to.
+    #[error("mode B startup probe found no bridge plugin token")]
+    ModeBNoBridge,
+    /// Mode B's startup probe found a plain `rmw_zenoh` node token: the two modes would collide
+    /// on the same domain.
+    #[error("mode B startup probe found an rmw_zenoh token: {0}")]
+    ModeBFoundRmwZenoh(String),
+    /// A liveliness subscriber armed at startup saw a conflicting token appear later: the node
+    /// latches this and fails every later `put`/`send` closed (spec 24.1, design note 4.2).
+    #[error("a conflicting liveliness token appeared after startup: {0}")]
+    LatchedConflict(String),
+    /// A generic [`crate::session::Publisher`] was requested on a topic reserved for
+    /// [`crate::actuator::ActuatorPublisher`] (design note section 4.5).
+    #[error("`{0}` is a reserved actuator topic; publish through Ros2Node::actuator instead")]
+    ReservedActuatorTopic(String),
+    /// `Publisher::put` was given a [`crate::msg::Msg`] whose type does not match the one the
+    /// publisher was declared with.
+    #[error("message type does not match the publisher's declared type")]
+    TypeMismatch,
+    /// `TRANSIENT_LOCAL` was requested. Refused: the zenoh-ext advanced-pub/sub key literals it
+    /// needs are unverified (`docs/api-notes/rmw-zenoh.md` "Payload and data path").
+    #[error("TRANSIENT_LOCAL is not supported")]
+    TransientLocalUnsupported,
+    /// `Ros2Config` has no `[[ros2.actuator]]` entry for the requested topic.
+    #[error("no configured actuator topic `{0}`")]
+    UnknownActuatorTopic(String),
+    /// The requested `ActuatorPublisher::<NJ>`'s `NJ` does not match the configured topic's
+    /// joint count (design note section 4.5: "`NJ != joints.len()` fails at construction").
+    #[error("actuator topic `{topic}` has {found} configured joints, expected {expected}")]
+    ActuatorJointCount {
+        topic: String,
+        expected: usize,
+        found: usize,
+    },
+    /// An inbound `sensor_msgs/JointState` did not carry every joint the caller asked to
+    /// reorder by name (design note section 4.5).
+    #[error("JointState is missing joint `{0}`")]
+    MissingJoint(String),
+    /// A zenoh session, publisher, subscriber or liveliness operation failed. Wraps the
+    /// library's own message; only built when the `zenoh` feature is on.
+    #[cfg(feature = "zenoh")]
+    #[error("zenoh: {0}")]
+    Zenoh(String),
+}
+
+impl Ros2Error {
+    /// The stable error code, exactly the codes of `docs/design/ros2-boundary.md` section 4.2
+    /// for the conditions that table lists (`ROS2-001` .. `ROS2-012`); `ROS2-000`, `ROS2-013`
+    /// and `ROS2-020` cover conditions the table does not number (config parsing, actuator
+    /// lookup, and zenoh transport failures respectively).
+    #[must_use]
+    pub fn code(&self) -> &'static str {
+        match self {
+            Ros2Error::Config(_) => "ROS2-000",
+            Ros2Error::BothModesConfigured => "ROS2-001",
+            Ros2Error::ModeCNotBuilt => "ROS2-002",
+            Ros2Error::ModeAFoundBridge(_) => "ROS2-003",
+            Ros2Error::ModeBNoBridge => "ROS2-004",
+            Ros2Error::ModeBFoundRmwZenoh(_) => "ROS2-005",
+            Ros2Error::LatchedConflict(_) => "ROS2-006",
+            Ros2Error::ReservedActuatorTopic(_) => "ROS2-010",
+            Ros2Error::TypeMismatch => "ROS2-011",
+            Ros2Error::TransientLocalUnsupported => "ROS2-012",
+            Ros2Error::UnknownActuatorTopic(_)
+            | Ros2Error::ActuatorJointCount { .. }
+            | Ros2Error::MissingJoint(_) => "ROS2-013",
+            #[cfg(feature = "zenoh")]
+            Ros2Error::Zenoh(_) => "ROS2-020",
+        }
+    }
+}
+
 /// Why a 33-byte `rmw_zenoh` attachment failed to decode (`docs/api-notes/rmw-zenoh.md`
 /// "Attachment: 33 bytes").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]

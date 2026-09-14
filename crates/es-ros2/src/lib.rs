@@ -10,12 +10,22 @@
 //! `rmw_zenoh` sample attachment and its GID derivation. The zenoh session itself (W1b), camera
 //! ingest (W1c) and HIL (W1d) are later packets in the same crate.
 //!
-//! Layer rule (spec 4.2): this crate is layer 11 and depends only on `es-core` (layer 1) among
-//! workspace crates. No trait is added here (INV-17): message dispatch is the [`msg::MsgType`] /
-//! [`msg::Msg`] enums, not a trait object.
+//! Layer rule (spec 4.2): this crate is layer 11 and depends on `es-core` (layer 1) and
+//! `es-safety` (layer 8) among workspace crates. No trait is added here (INV-17): message
+//! dispatch is the [`msg::MsgType`] / [`msg::Msg`] enums, not a trait object.
+//!
+//! W1b adds the zenoh session (this module list's [`config`], [`session`], [`actuator`]), gated
+//! behind the `zenoh` cargo feature (off by default, design note section 2) so `es` and any
+//! embedded consumer never link it. [`config`] itself needs no feature: parsing a
+//! [`config::Ros2Config`] is plain data, checked the same way on every machine.
 
+#[cfg(feature = "zenoh")]
+pub mod actuator;
 pub mod attachment;
 pub mod cdr;
+pub mod config;
 mod error;
 pub mod msg;
 pub mod names;
+#[cfg(feature = "zenoh")]
+pub mod session;

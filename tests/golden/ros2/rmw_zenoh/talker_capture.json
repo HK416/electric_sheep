@@ -1,0 +1,23 @@
+{
+  "attachments_hex": [
+    "010000000000000005620e9b201dd51810f7c771e2c442c54844d1d8a20eeb5914",
+    "0200000000000000b81ca8d6201dd51810f7c771e2c442c54844d1d8a20eeb5914",
+    "0300000000000000f7cc4212211dd51810f7c771e2c442c54844d1d8a20eeb5914"
+  ],
+  "joint_state_pub_hex": "00010000000000000000000001000000005f726f02000000030000006a310000030000006a32000002000000000000000000e03f000000000000f0bf0000000000000000",
+  "listener_sub_token": "@ros2_lv/73/9f89b84f49800abbcdb946929ebd18d1/0/10/MS/%/%/listener/%chatter/std_msgs::msg::dds_::String_/RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18/::,10:,:,:,,",
+  "payloads_hex": [
+    "000100000f00000048656c6c6f20576f726c643a203100",
+    "000100000f00000048656c6c6f20576f726c643a203200",
+    "000100000f00000048656c6c6f20576f726c643a203300"
+  ],
+  "robostack_versions": {
+    "ros-kilted-cv-bridge": "4.1.0-np2py312h3b5449b_21",
+    "ros-kilted-demo-nodes-cpp": "0.36.4-np2py312h2ed9cc7_21",
+    "ros-kilted-image-geometry": "4.1.0-np2py312h3b5449b_21",
+    "ros-kilted-rmw-zenoh-cpp": "0.6.6-np2py312ha80d210_21",
+    "ros-kilted-ros-base": "0.12.0-np2py312h2ed9cc7_21"
+  },
+  "talker_node_token": "@ros2_lv/73/a57729c4fcea9b446ceed53e32e5e6ab/0/0/NN/%/%/talker",
+  "talker_pub_token": "@ros2_lv/73/a57729c4fcea9b446ceed53e32e5e6ab/0/10/MP/%/%/talker/%chatter/std_msgs::msg::dds_::String_/RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18/::,7:,:,:,,"
+}

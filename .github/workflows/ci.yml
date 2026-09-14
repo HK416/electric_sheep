@@ -135,3 +135,30 @@ jobs:
           cargo test -p es-policy --test act_checkpoint -- --nocapture 2>&1 | tee act.log
           # A skip prints no RAN line, so this is what fails the step when the oracle did not run.
           grep -q '^RAN act_checkpoint' act.log
+
+      # M3 W1b (docs/design/ros2-boundary.md section 8, docs/packets/M3/W1b-ros2-zenoh-session.md):
+      # no docker, no sudo. micromamba is a single static binary; RoboStack recommends pixi, but
+      # a plain `micromamba create` needs no privileged install step either.
+      - name: install micromamba
+        run: |
+          set -euo pipefail
+          curl -Ls https://micro.mamba.pm/api/micromamba/linux-64/latest | tar -xvj bin/micromamba
+          mkdir -p "$HOME/.local/bin"
+          mv bin/micromamba "$HOME/.local/bin/micromamba"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # Only the packages this packet's oracle touches (a router, the `ros2` CLI,
+      # `demo_nodes_cpp`); `cv-bridge`/`image-geometry` are W1c's and design note section 8
+      # flags their co-installation with the rest as unverified, so W1b does not risk it here.
+      - name: create the ROS 2 Kilted + rmw_zenoh environment
+        run: |
+          set -euo pipefail
+          micromamba create -y -p "$HOME/envs/ros2-kilted" -c conda-forge -c robostack-kilted \
+            ros-kilted-ros-base=0.12.0 ros-kilted-rmw-zenoh-cpp=0.6.6 ros-kilted-demo-nodes-cpp=0.36.4
+
+      - name: live rmw_zenoh interop (spec 24.1, W1b)
+        run: |
+          set -euo pipefail
+          export ES_ROS2_ENV="$HOME/envs/ros2-kilted"
+          cargo test -p es-ros2 --features zenoh --test rmw_zenoh_interop -- --nocapture --test-threads=1 2>&1 | tee interop.log
+          grep -q '^RAN rmw_zenoh_interop' interop.log

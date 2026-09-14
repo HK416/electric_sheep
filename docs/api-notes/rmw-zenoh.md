@@ -49,7 +49,10 @@ for `MP`/`MS`/`SS`/`SC`: `/ TopicName / TopicType / TopicTypeHash / TopicQoS` (r
   allow keys with "//""). Enclave: "just `%` if not set".
 - `Zid` = `zid.to_string()`: zenoh-c -> uhlc 0.8.2 `write!(f, "{:x}", u128::from_le_bytes(self.0))`
   (lowercase hex, no leading zeros). Same string from zenoh-rs 1.8.0 `ZenohId`'s `Display`:
-  **unverified** (W1b live oracle).
+  **VERIFIED, W1b 2026-09-14** — `demo_talker_reaches_our_subscriber`'s round trip of a live
+  `rmw_zenoh_cpp` talker's own token (built from its C++-side `Zid`) through `LivelinessToken::
+  parse` / `to_key_expr` is byte-identical, which is only possible if the two `Display`
+  implementations agree.
 - `Nid`, `Id`: decimal, one context-wide counter from 0 (`next_entity_id_(0)`, `fetch_add(1)`). A
   node token repeats its id: `.../<nid>/<nid>/NN/...`.
 - Discovery: each node does `liveliness_get` on `@ros2_lv/<domain_id>/**`, then declares a
@@ -79,7 +82,10 @@ Verbatim (design.md):
 
 `simplified_XXH3_128bits(liveliness_keyexpr)`, stored `memcpy(gid, &low64, 8)` then `&high64`
 (x86_64: `low64.to_le_bytes() ++ high64.to_le_bytes()`). Equality with stock XXH3-128 (seed 0):
-**unverified** -- W1a's golden uses PyPI `xxhash` (stock), W1b compares against a live talker's GID.
+**VERIFIED, W1b 2026-09-14** -- W1a's golden uses PyPI `xxhash` (stock);
+`demo_talker_reaches_our_subscriber` additionally compares a live `demo_nodes_cpp` talker's
+attachment `gid` against `gid_of(<that talker's MP token>)` computed by this crate, and they
+match, against a real C++ `rmw_zenoh_cpp` publisher (not just the Python golden).
 
 ## Attachment: 33 bytes (`attachment_helpers.cpp`; rolling = kilted = jazzy)
 
@@ -187,9 +193,9 @@ const SLASH_REPLACEMSNT_CHAR: &str = "§";
 
 | Item | Closed by |
 |---|---|
-| zenoh-rs `ZenohId` string = zenoh-c's | W1b `demo_talker_reaches_our_subscriber` (token round trip) |
-| GID = stock XXH3-128 | W1b, talker attachment GID vs `gid_of(talker MP token)` |
-| zenoh 1.8.0 (us) <-> 1.7.2 (RoboStack router) wire compatibility | W1b live oracle |
-| trailing padding / options bits in real rmw_zenoh CDR | W1a `rclpy` cross-check, W1b capture |
-| rmw_zenoh `CdrVersion` | same |
+| zenoh-rs `ZenohId` string = zenoh-c's | **W1b, 2026-09-14, VERIFIED**: `demo_talker_reaches_our_subscriber` round-trips the live talker's `MP` token (`LivelinessToken::parse` / `to_key_expr` byte-identical) against a real RoboStack Kilted `rmw_zenohd` |
+| GID = stock XXH3-128 | **W1b, 2026-09-14, VERIFIED**: the same test's received attachment `gid` equals `gid_of(<talker's MP token>)` |
+| zenoh 1.8.0 (us) <-> 1.7.2 (RoboStack router) wire compatibility | **W1b, 2026-09-14, VERIFIED**: all five `rmw_zenoh_interop.rs` scenarios pass live against `ros-kilted-rmw-zenoh-cpp 0.6.6` (`libzenohc 1.7.2`) |
+| trailing padding / options bits in real rmw_zenoh CDR | **W1b, 2026-09-14, VERIFIED (no decoder change needed)**: `ros2_topic_pub_joint_state_reaches_our_subscriber` and `capture_reference_goldens` decode a real `ros2 topic pub` `JointState` (empty `velocity`/`effort`) byte-for-byte with the existing `CdrReader`; see `docs/api-notes/ros2-cdr.md` "Encapsulation header" |
+| rmw_zenoh `CdrVersion` | same — real network bytes match plain XCDR1, `PLAIN_CDR`, exactly as W1a's `rclpy` evidence predicted |
 | mode B attachment / data path | not scheduled (`Target / Status: unverified`) |

@@ -50,11 +50,14 @@ fn is_gpu_skip(line: &str) -> bool {
 /// a GPU — a GPU SKIP is a failure, the same way `nostd --require` turns a missing target
 /// into one. Unset (the PR runner, which has no GPU) it is only reported.
 fn run_tests(root: &Path) -> bool {
+    // `es-ros2/zenoh` (docs/packets/M3/W1b-ros2-zenoh-session.md): off by default (spec 4.2 —
+    // `es` and any embedded consumer must not link zenoh), but the PR tier still builds, lints
+    // and runs the in-process loopback session tests against it.
     let args = [
         "test",
         "--workspace",
         "--features",
-        "es-ir/testing",
+        "es-ir/testing,es-ros2/zenoh",
         "--",
         "--nocapture",
     ];
@@ -102,6 +105,8 @@ fn cmd_ci(root: &Path) -> bool {
                 "clippy",
                 "--workspace",
                 "--all-targets",
+                "--features",
+                "es-ros2/zenoh",
                 "--",
                 "-D",
                 "warnings",

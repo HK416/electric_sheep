@@ -1,2 +1,9 @@
 [alias]
 xtask = "run --quiet --package xtask --"
+
+# `zenoh = "=1.8.0"` (crates/es-ros2, `zenoh` feature, docs/api-notes/zenoh-rs.md) pulls in
+# dependencies whose own `rust-version` can exceed the workspace's pinned 1.85; this tells
+# cargo's MSRV-aware resolver to fall back to an older, compatible version of such a
+# dependency instead of failing the resolve (docs/design/ros2-boundary.md section 2).
+[resolver]
+incompatible-rust-versions = "fallback"

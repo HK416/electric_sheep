@@ -1,7 +1,16 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # scripts/ros2-env.sh <prefix> <cmd...> — run <cmd...> with a RoboStack ROS 2 environment at
 # <prefix> activated, without micromamba/pixi at test time (docs/design/ros2-boundary.md
-# section 8). POSIX sh, no bashisms.
+# section 8).
+#
+# Needs a real bash, not POSIX `/bin/sh`: RoboStack's own activation scripts (e.g.
+# `ros-kilted-ros-workspace_activate.sh`) call bash's `source` builtin internally, which
+# `/bin/sh` (dash on the oracle server) does not provide (`source: not found`) — this crate's
+# W1a evidence found that gap (`docs/api-notes/ros2-cdr.md` "Live ROS 2 byte capture"), and W1b
+# closes it by running everything below under bash instead of patching around `source`. The
+# Rust harness (`tests/rmw_zenoh_interop.rs`) also invokes this file as `bash
+# scripts/ros2-env.sh ...` explicitly, so it works even if the executable bit does not survive
+# a checkout.
 set -eu
 
 if [ "$#" -lt 2 ]; then

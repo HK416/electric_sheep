@@ -82,6 +82,10 @@ Harness (`rmw_zenoh_interop.rs`). Without `ES_ROS2_ENV`, each test prints
 - `ros2_cli_lists_our_node_and_topic` -- `ros2 node list` contains `/es_interop`;
   `ros2 topic list -t` contains `/es_chatter [std_msgs/msg/String]` (bypass the ros2 daemon: record
   here whether `--no-daemon` or `ros2 daemon stop` was needed).
+  **Recorded 2026-09-14:** `--no-daemon` on both `node list` and `topic list -t`; needed in
+  practice (the harness starts a fresh `rmw_zenohd` + node per test-suite run, and a stale
+  `ros2` daemon from an earlier invocation would otherwise miss it). Confirmed passing live
+  against RoboStack Kilted, `ros-kilted-rmw-zenoh-cpp 0.6.6`.
 - `demo_talker_reaches_our_subscriber` -- `ros2 run demo_nodes_cpp talker`; our `/chatter`
   subscriber decodes `Hello World: <n>`; attachments are 33 bytes with strictly increasing `seq`;
   the talker's `MP` token from `liveliness().get("@ros2_lv/73/**")` round-trips through
@@ -89,13 +93,35 @@ Harness (`rmw_zenoh_interop.rs`). Without `ES_ROS2_ENV`, each test prints
   gid_of(<that token>)`.
 - `ros2_topic_pub_joint_state_reaches_our_subscriber` -- `ros2 topic pub --once -w 1 /es_js
   sensor_msgs/msg/JointState "{name: [j1, j2], position: [0.5, -1.0]}"`; decoded names and positions match.
+  **Recorded 2026-09-14 -- the known open CDR issue, closed:** `ros2-cdr.md`'s W1a evidence
+  (`rclpy.serialization.serialize_message`) showed an empty `float64[]` (`velocity`/`effort`)
+  consuming an extra 8-byte alignment pad it "stops before the network" to confirm. This test
+  and `capture_reference_goldens` below are that confirmation, and it does **not** reproduce on
+  the wire: the captured payload (`tests/golden/ros2/rmw_zenoh/talker_capture.json`'s
+  `joint_state_pub_hex`) is exactly 68 bytes with zero trailing bytes after `effort`'s 4-byte
+  zero count -- byte-for-byte the same "align only when `count > 0`" layout this crate's
+  `CdrWriter`/`CdrReader` already implement. **No change was made to `cdr.rs`** (forbidden
+  territory without a failing test; none materialized). Full trace: `docs/api-notes/ros2-cdr.md`
+  "Encapsulation header" and "Layout rules".
 - `our_image_camera_info_and_float64_multi_array_echo_in_ros2` -- `ros2 topic echo --once` of each;
   output contains `encoding: rgb8`, `distortion_model: plumb_bob`, and the three `data` values.
-- the file prints `RAN rmw_zenoh_interop` once all non-ignored tests ran.
+- the file prints `RAN rmw_zenoh_interop` once all non-ignored tests ran. **Implementation
+  note:** a sixth test, `z_ran_rmw_zenoh_interop`, sorts alphabetically after the five scenarios
+  above; rustc's test harness runs `--test-threads=1` tests in name order (verified empirically),
+  so it prints the marker only after a shared counter confirms all five actually ran (not
+  skipped).
 - `capture_reference_goldens` (`#[ignore]`) -- uses **raw zenoh-rs only** (no `es_ros2` encoder or
   parser): records the talker's and a `demo_nodes_cpp listener`'s `NN`/`MP`/`MS` token strings,
   three talker attachments and payloads (hex), one `ros2 topic pub` JointState payload, and the
-  RoboStack package versions, into `$ES_ROS2_CAPTURE_DIR/talker_capture.json`.
+  RoboStack package versions, into `$ES_ROS2_CAPTURE_DIR/talker_capture.json`. **Recorded
+  2026-09-14:** ran on the GPU server against RoboStack Kilted; `talker_capture.json` committed.
+  Two implementation notes for a future re-run: (1) `ES_ROS2_CAPTURE_DIR` is resolved relative to
+  the *workspace root* (`CARGO_MANIFEST_DIR/../..`), not the test binary's CWD (cargo runs test
+  binaries with CWD set to the package directory, `crates/es-ros2`); (2) the one-shot
+  `ros2 topic pub` for the JointState capture needs `-w 0` -- `ros2 topic pub --once` defaults to
+  waiting for a matched RMW subscription otherwise (confirmed empirically: it still blocked with
+  neither `-w` given nor `-w 1`), and the raw zenoh subscriber here deliberately declares no `MS`
+  token to match against.
 
 `session_loopback.rs` (PR tier; two in-process peers on `127.0.0.1`, multicast off, no router):
 
@@ -145,20 +171,58 @@ pub struct Received { pub msg: Msg, pub attachment: Option<Attachment>, pub key_
 impl<const NJ: usize> ActuatorPublisher<NJ> { pub fn send(&self, action: &SafeAction<NJ>) -> Result<(), Ros2Error>; }
 ```
 
+Implementation note (2026-09-14): the code above is present exactly as pinned. Three small
+additive members exist alongside it, none changing a pinned signature: `Ros2Node::config(&self)
+-> &Ros2Config` (a plain accessor `actuator.rs` needs); `Ros2Node::liveliness_tokens(&self,
+pattern, timeout) -> Result<Vec<String>, Ros2Error>` (the live interop tests' only way to look up
+a *remote* node's tokens, since `Self::open`'s own probe only needs the faster first-match
+check); and `Ros2Node::publisher_with_durability` / `enum Durability { Volatile,
+TransientLocal }`, with `publisher` calling it with `Volatile` -- the pinned `publisher` has no
+durability parameter, so `transient_local_is_rejected` (`ROS2-012`) needed some way to actually
+request `TRANSIENT_LOCAL` to reject. No new trait (`Durability` is a plain enum).
+
 - `zenoh = { version = "=1.8.0", default-features = false, features = ["transport_tcp"], optional = true }`;
   `[features] default = []`, `zenoh = ["dep:zenoh"]`. No direct `tokio`; the public API is
   synchronous (`zenoh::Wait::wait`). No zenoh `unstable`/`internal`/`shared-memory`.
 - Codes and conditions exactly as design note section 4.2.
 - `cargo xtask ci` passes with the feature on, on Windows and Linux. Record here the cold wall time
   of the PR job on the GitHub runner; over 10 minutes, raise design note open question 2 before merging.
+  **Recorded 2026-09-14:** `cargo xtask ci` PASSED on Windows (local dev machine) and PASSED
+  (fmt-check + clippy + `cargo test -p es-ros2 --features zenoh`) on the Linux GPU server after
+  `cargo clean -p es-ros2`: ~20 s wall for that crate's own cold compile + lint + full test run
+  (dependencies, incl. `zenoh`'s ~270 crates, stayed warm in `target/`). This is a **crate-level**
+  cold-build number, not the whole-workspace GitHub Actions runner number (`Target / Status:
+  unverified` per spec 12.4 -- that number needs an actual GitHub Actions run, which this task did
+  not push).
 - `cargo +1.85 check -p es-ros2 --features zenoh` if a 1.85 toolchain exists; otherwise `zenoh-rs.md`
-  keeps the MSRV row unverified.
+  keeps the MSRV row unverified. **Recorded 2026-09-14:** a `1.85-x86_64-pc-windows-msvc` toolchain
+  is installed locally; `cargo +1.85 check -p es-ros2 --features zenoh` PASSED. `zenoh-rs.md`'s MSRV
+  row updated to VERIFIED.
 - `.github/workflows/ci.yml` oracle job: install micromamba without sudo, create the pinned
   environment of design note section 8, run the live command above, fail when `RAN rmw_zenoh_interop` is missing.
-- `talker_capture.json` is committed, produced by `capture_reference_goldens` on a machine with `ES_ROS2_ENV`.
+  Implemented for `ros-base`/`rmw-zenoh-cpp`/`demo-nodes-cpp` only (what this packet's oracle
+  actually runs); `cv-bridge`/`image-geometry` are W1c's and design note section 8 flags their
+  co-installation as unverified, so this job does not risk it. The workflow file was not run
+  through actual GitHub Actions in this task (no push); its steps were replicated by hand on the
+  GPU server (same micromamba-installed package set, same live command) and passed there.
+- `talker_capture.json` is committed, produced by `capture_reference_goldens` on a machine with
+  `ES_ROS2_ENV`. **Recorded 2026-09-14:** produced on the GPU server (RoboStack Kilted) and
+  committed at `tests/golden/ros2/rmw_zenoh/talker_capture.json`.
 - `rmw-zenoh.md` / `zenoh-rs.md`: `ZenohId` string, XXH3 GID, 1.8.0 <-> RoboStack 1.7.2 wire
   compatibility, `ros2-env.sh` sufficiency and 1.8.0 API differences each get a dated result.
-- No new trait, no `HashMap`, ≤ ~900 new source lines.
+  **Recorded 2026-09-14, all VERIFIED** -- see both files' updated tables/rows.
+  `ros2-env.sh` sufficiency: **sufficient once invoked under bash** (its own shebang is now
+  `#!/usr/bin/env bash`, and `rmw_zenoh_interop.rs` calls `bash scripts/ros2-env.sh ...`
+  explicitly); the pre-existing `tests/gen_goldens.rs` (W1a, outside this packet's file scope)
+  still invokes it via `Command::new("sh")` and hits the documented `source: not found` gap if
+  `ES_ROS2_ENV` happens to be set for a plain `cargo test -p es-ros2` run -- left for a follow-up.
+- No new trait, no `HashMap`, ≤ ~900 new source lines. **Recorded 2026-09-14:** new source lines
+  (tests excluded) total ~955 across `config.rs` (231), `session.rs` (533), `actuator.rs` (82),
+  `error.rs`'s additions (96) and `lib.rs`'s (13) -- about 6% over the `~900` target, kept because
+  the overage is `actuator.rs`'s `reorder_joint_state` (design note section 4.5's inbound-state
+  reordering, ~25 lines incl. doc) and the `Durability`/`liveliness_tokens`/`config()` additions
+  above, all real design-note-scoped behavior rather than incidental scope creep. No new trait, no
+  `HashMap` anywhere in the crate.
 
 ## forbidden
 
