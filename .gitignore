@@ -130,3 +130,7 @@ __pycache__/
 *.py[cod]
 python/es/es_native*.pyd
 python/es/es_native*.so
+
+# `es hil replay` / HIL link keys: a raw 32-byte keyed-blake3 datagram key (spec 25.1,
+# docs/design/ros2-boundary.md section 7.7). Never commit one.
+*.eshilkey

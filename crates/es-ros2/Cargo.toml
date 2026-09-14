@@ -13,10 +13,19 @@ zenoh = ["dep:zenoh"]
 
 [dependencies]
 es-core = { workspace = true }
+es-ir = { workspace = true }
 es-safety = { workspace = true }
+es-telemetry = { workspace = true }
+# Path, not `workspace = true`: the workspace entry does not set `default-features`, so a
+# crate-level `default-features = false` there would be ignored. The HIL module needs
+# `core_rt::EmbeddedCore` and nothing above it, so `es-policy`/`es-compile` stay unlinked
+# (docs/design/ros2-boundary.md section 2).
+es-runtime-embedded = { path = "../es-runtime-embedded", default-features = false }
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
+blake3 = { workspace = true }
 # Pinned exactly: what ROS 2's zenoh_cpp_vendor builds against (docs/api-notes/rmw-zenoh.md).
 # `default-features = false` + `xxh3` only: this packet needs `xxh3_128` for GID, nothing else
 # (no zenoh, no tokio; `cargo tree -p es-ros2 -e normal` must show neither).
@@ -35,7 +44,6 @@ zenoh = { version = "=1.8.0", default-features = false, features = [
 
 [dev-dependencies]
 proptest = { workspace = true }
-serde_json = { workspace = true }
 es-core = { workspace = true, features = ["alloc-count"] }
 
 [lints]
