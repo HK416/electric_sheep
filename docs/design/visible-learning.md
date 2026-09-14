@@ -543,6 +543,30 @@ intrinsics. `es-render`'s own `ImageSpec` subset (`crates/es-render/src/view.rs:
 the Observation IR's declared `ImageSpec` at plan time and a mismatch is an error, not a rescale — the same
 "what is not validated is not executed" rule §26.1 states and W1c applied to cameras.
 
+### 7.4 As built (V0b), and two things the plan above got wrong
+
+Both deviations are structural, not preferences:
+
+- **`Env` does not hold the renderer.** `EnvRenderer<'gpu>` borrows the `Gpu`, so a field on `Env` would
+  put a lifetime on `Env<B>` — a type `crates/es-data/src/collect.rs:297` and
+  `crates/es-eval/src/runner.rs:143` both name, and neither is V0b's to edit. The renderer is therefore
+  the caller's, and `EnvRenderer::frame(&ModelInfo, &StateView, env)` takes the state the caller already
+  has (the acceptance signature already had that shape). `Env` and `domains.rs` are untouched, which is
+  why "with the feature off, byte-identical behaviour" is trivially true rather than tested.
+- **`es-eval` has no `render` feature.** It takes a *frame source* —
+  `es_eval::runner::FrameSource = dyn FnMut(&ModelInfo, &StateView) -> Result<Vec<u8>, String>` — through
+  `Evaluation::run_with_frames`, and `Evaluation::run` passes `None`. Layer 10 therefore never links
+  Vulkan even to refuse an image, and the refusal path is testable on any machine. The caller wires
+  `EnvRenderer::frame` into that closure; V3 is where the CLI does it.
+
+**Finding for V1/V2.** V0's `observation.toml` declares the `ImageInput` *tensor* as `F32` `[3, 96, 96]`
+(CHW) while its `ImageSpec` says `dtype = U8` — so the renderer's `Rgb8` `[96, 96, 3]` tile does not fit
+that buffer, and `capture` refuses it naming both sizes. The `ImageSpec` itself matches the renderer
+exactly (`the_declared_image_spec_is_checked_not_coerced` checks V0's own file). The fix belongs to
+whichever packet next edits the fixture: declare the `ImageInput` as `U8 [96, 96, 3]` and put an
+`ObservationNode::Dequantize` after it — `Op::Dequantize` (`crates/es-compile/src/plan.rs:73`) is exactly
+"HWC u8 → CHW f32 /255" and already exists. V0b does not edit V0's fixtures.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:

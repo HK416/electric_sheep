@@ -535,6 +535,30 @@ INV-14는 건드리지 않는다: 렌더러는 선언된 크기로 정확히 타
 Observation IR이 선언한 `ImageSpec`과 대조되고, 불일치는 리스케일이 아니라 에러다 — §26.1이 말하는
 "검증되지 않은 것은 실행되지 않는다"이고 W1c가 카메라에 적용한 바로 그 규칙이다.
 
+### 7.4 구현 결과 (V0b), 그리고 위 계획이 틀렸던 두 가지
+
+둘 다 취향이 아니라 구조적 제약이다:
+
+- **`Env`는 렌더러를 들고 있지 않는다.** `EnvRenderer<'gpu>`는 `Gpu`를 빌리므로, `Env`의 필드로 두면
+  `Env<B>`에 수명이 붙는다 — `crates/es-data/src/collect.rs:297`과 `crates/es-eval/src/runner.rs:143`이
+  모두 이름으로 쓰는 타입이고, 둘 다 V0b가 고칠 수 있는 파일이 아니다. 그래서 렌더러는 호출자의 것이고,
+  `EnvRenderer::frame(&ModelInfo, &StateView, env)`이 호출자가 이미 들고 있는 상태를 받는다 (수용 기준의
+  시그니처가 이미 그 모양이었다). `Env`와 `domains.rs`는 건드리지 않았고, 그래서 "피처가 꺼지면 바이트
+  단위로 동일한 동작"은 테스트할 대상이 아니라 자명한 참이다.
+- **`es-eval`에는 `render` 피처가 없다.** 대신 프레임 소스 —
+  `es_eval::runner::FrameSource = dyn FnMut(&ModelInfo, &StateView) -> Result<Vec<u8>, String>` — 를
+  `Evaluation::run_with_frames`로 받고, `Evaluation::run`은 `None`을 넘긴다. 레이어 10은 이미지를
+  *거부하기 위해서조차* Vulkan을 링크하지 않고, 거부 경로는 어느 머신에서나 테스트된다. 호출자가
+  `EnvRenderer::frame`을 그 클로저에 연결하며, CLI가 그렇게 하는 것은 V3이다.
+
+**V1/V2를 위한 발견.** V0의 `observation.toml`은 `ImageInput`의 *텐서*를 `F32` `[3, 96, 96]` (CHW)로
+선언하면서 `ImageSpec`의 `dtype`은 `U8`이라고 말한다 — 즉 렌더러의 `Rgb8` `[96, 96, 3]` 타일은 그 버퍼에
+맞지 않고, `capture`는 양쪽 크기를 적어 거부한다. `ImageSpec` 자체는 렌더러와 정확히 일치한다 (V0의 파일을
+그대로 읽어 `the_declared_image_spec_is_checked_not_coerced`가 확인한다). 수정은 픽스처를 다음에 고치는
+패킷의 몫이다: `ImageInput`을 `U8 [96, 96, 3]`으로 선언하고 뒤에 `ObservationNode::Dequantize`를 두면 된다
+— `Op::Dequantize` (`crates/es-compile/src/plan.rs:73`)가 정확히 "HWC u8 → CHW f32 /255"이고 이미 있다.
+V0b는 V0의 픽스처를 고치지 않는다.
+
 ## 8. 안전 오버레이 (V3)
 
 렌더된 프레임마다 V3는 `events.json`에 레코드 하나를 붙인다:

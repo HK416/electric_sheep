@@ -1,0 +1,10 @@
+{
+  "dtype": "u8",
+  "layout": "row-major, little-endian, tightly packed",
+  "name": "so101_frame0",
+  "shape": [
+    96,
+    96,
+    3
+  ]
+}

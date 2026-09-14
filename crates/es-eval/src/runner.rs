@@ -65,6 +65,18 @@ impl Default for RunConfig {
     }
 }
 
+/// Where an image observation input's pixels come from (§7.2, §10.1).
+///
+/// Given the loaded model and the current state, one camera frame in exactly the dtype, count
+/// and layout the plan declared, or the reason there is none. A closure rather than the
+/// renderer itself: `es-eval` is layer 10 and `es-render` layer 5, and linking Vulkan here
+/// just to *refuse* an image would be the wrong trade — the caller owns
+/// `es_env::render::EnvRenderer` (feature `render`) and hands its `frame` in through this.
+///
+/// Nothing on this path resamples, converts or reorders: a frame that is not what the plan
+/// declared is an error, and every conversion is an Observation IR node (§7.2, `INV-14`).
+pub type FrameSource<'a> = dyn FnMut(&ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> + 'a;
+
 /// The backend half of `evaluation.lock`: what a re-run would have to match (§17.2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BackendCaps {
@@ -111,8 +123,42 @@ impl Evaluation {
         obs: &ObservationIr,
         policy: &mut dyn PolicyRuntime,
         deploy: &DeploymentIr,
+        new_backend: F,
+        cfg: &RunConfig,
+    ) -> Result<(EvaluationReport, EvaluationLock), EvalError>
+    where
+        B: PhysicsBackend,
+        F: FnMut() -> B,
+    {
+        Self::run_with_frames::<B, F, NJ, H>(
+            ir,
+            task,
+            scene,
+            obs,
+            policy,
+            deploy,
+            new_backend,
+            cfg,
+            None,
+        )
+    }
+
+    /// [`Self::run`] with a source for image observation inputs (§7.2).
+    ///
+    /// With `frames: None` — what [`Self::run`] passes — an image input is refused exactly as
+    /// before: this narrows the §10.1 refusal, it does not remove it, and nothing is ever
+    /// zero-filled.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_with_frames<B, F, const NJ: usize, const H: usize>(
+        ir: &EvaluationIr,
+        task: &TaskIr,
+        scene: &SceneDesc,
+        obs: &ObservationIr,
+        policy: &mut dyn PolicyRuntime,
+        deploy: &DeploymentIr,
         mut new_backend: F,
         cfg: &RunConfig,
+        mut frames: Option<&mut FrameSource<'_>>,
     ) -> Result<(EvaluationReport, EvaluationLock), EvalError>
     where
         B: PhysicsBackend,
@@ -169,6 +215,7 @@ impl Evaluation {
                     cfg.action_output.as_deref(),
                     deploy.execution,
                     &mut seq,
+                    frames.as_deref_mut(),
                 )?);
             }
 
@@ -298,6 +345,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     action_output: Option<&str>,
     mode: ExecutionMode,
     seq: &mut u64,
+    mut frames: Option<&mut FrameSource<'_>>,
 ) -> Result<Episode, EvalError> {
     let (nu, nq, nv) = {
         let m = env.model();
@@ -342,7 +390,12 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         if dropped && !ring.is_empty() {
             extra_age += 1;
         } else {
-            let (names, bytes) = capture(plan, env.model(), &env.backend().state())?;
+            let (names, bytes) = capture(
+                plan,
+                env.model(),
+                &env.backend().state(),
+                frames.as_deref_mut(),
+            )?;
             let inputs: BTreeMap<String, TensorRef<'_>> = names
                 .iter()
                 .zip(&bytes)
@@ -404,6 +457,7 @@ fn capture(
     plan: &CpuPlan,
     model: &ModelInfo,
     state: &StateView<'_>,
+    mut frames: Option<&mut FrameSource<'_>>,
 ) -> Result<Captured, EvalError> {
     let mut descs = Vec::new();
     let mut bytes = Vec::new();
@@ -418,13 +472,31 @@ fn capture(
         } else if let Some(r) = model.sensor.get(&source) {
             state.sensordata[r.as_range()].to_vec()
         } else {
-            // An image input: there is no renderer in this build (§4.3, es-render is layer 5).
-            // Feeding it zeros would produce a number, and a wrong number in the §10.1 table
-            // is worse than no table.
-            return Err(EvalError::Plan(format!(
-                "observation input \"{name}\" is not a joint or sensor of the loaded model; \
-                 image inputs need a renderer, which this build has none of"
-            )));
+            // An image input. Without a frame source there is no renderer in this build
+            // (§4.3, es-render is layer 5): feeding it zeros would produce a number, and a
+            // wrong number in the §10.1 table is worse than no table.
+            let Some(frame) = frames.as_deref_mut() else {
+                return Err(EvalError::Plan(format!(
+                    "observation input \"{name}\" is not a joint or sensor of the loaded model; \
+                     image inputs need a renderer, which this build has none of"
+                )));
+            };
+            // Exactly what the plan declared, or nothing: the frame is not resized, converted
+            // or reordered here — every such step is an Observation IR node (§7.2, INV-14).
+            let data = frame(model, state).map_err(EvalError::Plan)?;
+            let want = desc.elems * elem_bytes(desc.dtype);
+            if data.len() != want {
+                return Err(EvalError::Plan(format!(
+                    "observation input \"{name}\": the plan wants {} {:?} elements ({want} bytes), \
+                     the frame supplies {} bytes",
+                    desc.elems,
+                    desc.dtype,
+                    data.len()
+                )));
+            }
+            descs.push((name.clone(), desc.dtype, desc.shape.clone()));
+            bytes.push(data);
+            continue;
         };
         if values.len() != desc.elems {
             return Err(EvalError::Plan(format!(
@@ -449,6 +521,16 @@ fn capture(
         bytes.push(data);
     }
     Ok((descs, bytes))
+}
+
+/// Bytes one element of `e` occupies in a plan buffer.
+fn elem_bytes(e: ElemType) -> usize {
+    match e {
+        ElemType::F32 | ElemType::I32 => 4,
+        ElemType::F16 | ElemType::Bf16 => 2,
+        ElemType::F64 => 8,
+        ElemType::U8 | ElemType::Bool => 1,
+    }
 }
 
 /// The first `NJ` joint positions and velocities of env 0. Nothing is padded: `run_episode`

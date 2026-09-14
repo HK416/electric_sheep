@@ -52,7 +52,9 @@ pub use view::{
     CameraView, ImageSpec, Intrinsics, RenderConfig, RenderPath, TileAtlasCfg, ViewParams,
 };
 
-use es_sensor::Channel;
+/// Re-exported so naming a channel does not oblige a caller to depend on `es-sensor` as well
+/// (`es-env`'s `render` feature, `docs/packets/M5/V0b-render-in-the-loop.md`).
+pub use es_sensor::Channel;
 
 /// Channels the [`RenderPath::Rs`] path writes (spec 15.1). Anything else is
 /// [`RenderError::UnsupportedChannel`].
