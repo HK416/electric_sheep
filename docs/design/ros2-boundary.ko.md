@@ -208,6 +208,8 @@ W1에 없는 것: `trajectory_msgs/JointTrajectory`(해시는 나중을 위해 �
 | `channels`, `dtype`, `depth_scale` | encoding, 섹션 6.3 |
 
 단안(monocular)만: `r`은 identity여야 하고 `p[3]`, `p[7]`(`Tx`, `Ty`)은 0이어야 한다(`CAM-005`).
+all-zero `r`—보정되지 않은 단안 카메라에 대해 ROS 드라이버가 publish하는 값—은 identity로
+읽는다; 받아들이는 형태는 이 둘뿐이며, 허용 오차는 도입하지 않는다.
 
 ### 6.2 ROI, binning, 크기 (INV-14)
 
@@ -221,7 +223,12 @@ spec = calib.cropped(Rect { roi }, true)                          // skipped for
 spec = spec.resized(roi.width / bx, roi.height / by, true)       // skipped when bx = by = 1
 ```
 
-- `roi.width % bx != 0` -> `CAM-006`(resize 비율이 `1 / bx`가 아니게 된다).
+- `CAM-006`은 "ROI/binning 쌍을 쓸 수 없다"는 뜻이며, 세 가지 규칙을 포괄하고 각각 고유한
+  메시지를 갖는다: `roi.width`/`roi.height`가 0인 경우; 사각형이 calibration 밖으로 나가는
+  경우(`roi.x_offset + roi.width > CameraInfo.width`, `y`도 마찬가지, 넘침이 없도록 `u64`로
+  더한다) — `ImageSpec::cropped`는 원점을 무조건 빼기 때문에, 검사하지 않은 사각형은 `cx`가
+  음수인 그럴듯한 spec을 만들어낸다; 그리고 `roi.width % bx != 0`(resize 비율이 `1 / bx`가
+  아니게 된다).
 - 결과는 `Image.width/height`와 같아야 한다; 그렇지 않으면 `CAM-007`이다, 단 config가
   `rescale_to_image = true`를 설정한 경우는 예외이며, 그 경우 `resized(image.width, image.height,
   true)`를 한 번 더 적용한다.
@@ -284,6 +291,9 @@ CUG·(u-128)`, `buv = 2^19 + CUB·(u-128)`, `y = max(0, Y-16)·CY`이며, 각 �
 - 유도된 spec은 선언된 것과 일치해야 한다(§26.1: "검증되지 않은 것은 실행되지 않는다"): enum
   필드와 size가 같고, intrinsics는 `intrinsics_consistent_with` 기준, distortion 계수는 상대
   오차 1e-9 이내. `CAM-008`은 처음으로 다른 필드의 이름을 알려준다.
+- `CameraInfo`가 아직 하나도 도착하지 않은 것은 `CAM-008`이 아니라 `CAM-010`이다: 호출자가
+  재시도로 넘길 수 있는 기동 시점의 경합은, 라인을 멈춰 세우는 "다른 스트림에 맞춰 보정된
+  카메라"와 같은 조건이 아니다. 따라서 `CameraError::code`는 `CAM-001` .. `CAM-010`이다.
 - 가장 최근의 `CameraInfo`가 우선한다; 내용 변경(header 제외)이 있으면 다시 유도하고 다시
   검사한다.
 

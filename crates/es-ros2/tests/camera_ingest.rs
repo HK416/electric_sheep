@@ -188,6 +188,63 @@ fn roi_width_not_divisible_by_binning_is_rejected() {
     );
 }
 
+/// `ImageSpec::cropped` trusts its rectangle, so the bound has to be checked here (spec 26.1).
+#[test]
+fn an_roi_outside_the_calibration_is_rejected() {
+    // info_b: a 640x480 calibration, ROI 480x360+80+60, binning 2.
+    let mut right = info("info_b");
+    right.roi.x_offset = 10_000;
+    let err = derive_spec(&right, &sized(240, 180, "rgb8"), &cfg()).unwrap_err();
+    assert_eq!(code(&err), "CAM-006");
+    assert!(err.to_string().contains("640x480"), "{err}");
+
+    let mut below = info("info_b");
+    below.roi.y_offset = 300; // 300 + 360 > 480
+    let err = derive_spec(&below, &sized(240, 180, "rgb8"), &cfg()).unwrap_err();
+    assert_eq!(code(&err), "CAM-006");
+    assert!(err.to_string().contains("640x480"), "{err}");
+
+    // The rectangle that ends exactly on the last row/column is inside.
+    let mut flush = info("info_b");
+    flush.roi.x_offset = 160;
+    flush.roi.y_offset = 120;
+    derive_spec(&flush, &sized(240, 180, "rgb8"), &cfg()).expect("480x360+160+120 fits 640x480");
+}
+
+/// `CAM-006` is one code for three rules, so the message has to say which one refused
+/// (design note section 6.2).
+#[test]
+fn roi_rejections_name_which_rule_failed() {
+    let image = sized(240, 180, "rgb8");
+    let message = |mutate: fn(&mut CameraInfo)| {
+        let mut bad = info("info_b");
+        mutate(&mut bad);
+        let err = derive_spec(&bad, &image, &cfg()).unwrap_err();
+        assert_eq!(code(&err), "CAM-006");
+        err.to_string()
+    };
+    let zero = message(|i| i.roi.width = 0);
+    let outside = message(|i| i.roi.x_offset = 10_000);
+    let indivisible = message(|i| i.roi.width = 361);
+    assert_ne!(zero, outside);
+    assert_ne!(zero, indivisible);
+    assert_ne!(outside, indivisible);
+}
+
+/// An uncalibrated monocular ROS driver publishes `r = [0; 9]`; it means the identity
+/// (design note section 6.1).
+#[test]
+fn an_all_zero_r_is_the_identity() {
+    let image = sized(640, 480, "rgb8");
+    let want = derive_spec(&info("info_a"), &image, &cfg()).unwrap();
+
+    let mut zeroed = info("info_a");
+    zeroed.r = [0.0; 9];
+    let got = derive_spec(&zeroed, &image, &cfg()).unwrap();
+    assert_eq!(got, want);
+    assert_matches_matrix(&got, &matrix("info_a", "intrinsic_matrix"));
+}
+
 #[test]
 fn image_size_mismatch_needs_explicit_rescale() {
     let a = info("info_a");
@@ -248,7 +305,13 @@ fn non_identity_r_or_nonzero_tx_is_rejected() {
     for mutate in [
         |i: &mut CameraInfo| i.r[0] = 0.999,
         |i: &mut CameraInfo| i.r[1] = 0.01,
-        |i: &mut CameraInfo| i.r = [0.0; 9],
+        |i: &mut CameraInfo| {
+            i.r = {
+                let mut r = [0.0; 9];
+                r[8] = 1.0;
+                r
+            }
+        },
         |i: &mut CameraInfo| i.p[3] = 0.05,
         |i: &mut CameraInfo| i.p[7] = -0.05,
     ] {
@@ -695,8 +758,9 @@ fn camera_ingest_validates_then_decodes_and_dates_a_frame() {
     let clock = StampClock::new(Time { sec: 0, nanosec: 0 }, TickRate::hz(1000));
     let mut ingest = CameraIngest::new(cfg, declared, clock);
 
-    // Nothing is executed before a CameraInfo has arrived.
-    assert_eq!(code(&ingest.on_image(&frame).unwrap_err()), "CAM-008");
+    // Nothing is executed before a CameraInfo has arrived -- and that is its own code, not
+    // the "calibrated for another stream" one below (design note section 6.4).
+    assert_eq!(code(&ingest.on_image(&frame).unwrap_err()), "CAM-010");
 
     ingest.on_camera_info(info("info_a"));
     let accepted = ingest.on_image(&frame).unwrap();
@@ -711,6 +775,24 @@ fn camera_ingest_validates_then_decodes_and_dates_a_frame() {
     assert!(!out.events.contains(ViolationKind::SensorDropout));
 
     // A CameraInfo whose calibration no longer matches the declared spec stops the stream.
+    ingest.on_camera_info(info("info_c"));
+    assert_eq!(code(&ingest.on_image(&frame).unwrap_err()), "CAM-008");
+}
+
+/// "No `CameraInfo` yet" is a startup race a caller retries through; "calibrated for another
+/// stream" stops the line. They are not the same condition and do not share a code
+/// (design note section 6.4).
+#[test]
+fn no_camera_info_is_its_own_code() {
+    let mut cfg = cfg();
+    cfg.rescale_to_image = true;
+    let frame = img("image_rgb8");
+    let declared = derive_spec(&info("info_a"), &frame, &cfg).unwrap();
+    let clock = StampClock::new(Time { sec: 0, nanosec: 0 }, TickRate::hz(1000));
+    let mut ingest = CameraIngest::new(cfg, declared, clock);
+
+    assert_eq!(code(&ingest.on_image(&frame).unwrap_err()), "CAM-010");
+
     ingest.on_camera_info(info("info_c"));
     assert_eq!(code(&ingest.on_image(&frame).unwrap_err()), "CAM-008");
 }

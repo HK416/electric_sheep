@@ -378,7 +378,10 @@ fn check_frame_id(expected: &str, found: &str) -> Result<(), CameraError> {
 #[allow(clippy::float_cmp)]
 fn check_monocular(info: &CameraInfo) -> Result<(), CameraError> {
     const IDENTITY: [f64; 9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
-    if info.r != IDENTITY {
+    // An all-zero `r` is what ROS drivers publish for an uncalibrated monocular camera; it
+    // means the same thing as the identity here and is the only other accepted shape (design
+    // note 6.1). Still no tolerance: these are the two, nothing near them.
+    if info.r != IDENTITY && info.r != [0.0; 9] {
         return Err(CameraError::NotMonocular(format!(
             "r is not the identity: {:?}",
             info.r
@@ -470,6 +473,18 @@ fn roi_and_binning(calib: &ImageSpec, info: &CameraInfo) -> Result<ImageSpec, Ca
             return Err(CameraError::RoiBinning(format!(
                 "roi {}x{} has a zero dimension",
                 roi.width, roi.height
+            )));
+        }
+        // `ImageSpec::cropped` subtracts the origin from `cx`/`cy` unconditionally, so a
+        // rectangle off the sensor would come back as a valid-looking spec with a negative
+        // principal point (spec 26.1: a `CameraInfo` is outside data). `u64` so the sum cannot
+        // wrap.
+        let (x, y) = (u64::from(roi.x_offset), u64::from(roi.y_offset));
+        let (w64, h64) = (u64::from(roi.width), u64::from(roi.height));
+        if x + w64 > u64::from(info.width) || y + h64 > u64::from(info.height) {
+            return Err(CameraError::RoiBinning(format!(
+                "roi {}x{}+{}+{} is outside the {}x{} calibration",
+                roi.width, roi.height, roi.x_offset, roi.y_offset, info.width, info.height
             )));
         }
         let rect = Rect {
@@ -931,6 +946,6 @@ mod tests {
         let err = ingest
             .on_image(&image("rgb8", 3, 2, 9, vec![0; 18]))
             .unwrap_err();
-        assert_eq!(err.code(), "CAM-008");
+        assert_eq!(err.code(), "CAM-010");
     }
 }

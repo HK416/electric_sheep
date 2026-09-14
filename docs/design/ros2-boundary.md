@@ -204,7 +204,9 @@ substituted for it), an HWC byte buffer, a `PhysTick`, and the Safety Plane inpu
 | `extrinsics`, `color_space`, `shutter`, `exposure`, `rate_hz` | `CameraIngestConfig`; ROS carries none of them and no default is invented |
 | `channels`, `dtype`, `depth_scale` | encoding, section 6.3 |
 
-Monocular only: `r` must be identity and `p[3]`, `p[7]` (`Tx`, `Ty`) zero (`CAM-005`).
+Monocular only: `r` must be the identity and `p[3]`, `p[7]` (`Tx`, `Ty`) zero (`CAM-005`). An
+all-zero `r` — what ROS drivers publish for an uncalibrated monocular camera — is read as the
+identity; those two shapes are the only ones accepted, and no tolerance is introduced.
 
 ### 6.2 ROI, binning, size (INV-14)
 
@@ -217,7 +219,12 @@ spec = calib.cropped(Rect { roi }, true)                          // skipped for
 spec = spec.resized(roi.width / bx, roi.height / by, true)       // skipped when bx = by = 1
 ```
 
-- `roi.width % bx != 0` -> `CAM-006` (the resize ratio would not be `1 / bx`).
+- `CAM-006` is "the ROI/binning pair is not usable", and covers three rules, each with its own
+  message: a zero `roi.width`/`roi.height`; a rectangle outside the calibration
+  (`roi.x_offset + roi.width > CameraInfo.width`, likewise for `y`, summed in `u64` so it cannot
+  wrap) — `ImageSpec::cropped` subtracts the origin unconditionally, so an unchecked rectangle
+  yields a valid-looking spec with a negative `cx`; and `roi.width % bx != 0` (the resize ratio
+  would not be `1 / bx`).
 - The result must equal `Image.width/height`; otherwise `CAM-007`, unless the config sets
   `rescale_to_image = true`, which applies one more `resized(image.width, image.height, true)`.
 - `rescale = false` is never passed. No code in `camera` writes an intrinsic except the `k`/`p`
@@ -279,6 +286,9 @@ ingest accepts all four names (the table above).
 - The derived spec must match the declared one (§26.1: "what is not validated is not executed"):
   enum fields and size equal, intrinsics per `intrinsics_consistent_with`, distortion coefficients
   within 1e-9 relative. `CAM-008` names the first differing field.
+- No `CameraInfo` has arrived yet is `CAM-010`, not `CAM-008`: a startup race a caller retries
+  through is not the same condition as a camera calibrated for a different stream, which stops the
+  line. `CameraError::code` therefore spans `CAM-001` .. `CAM-010`.
 - Latest `CameraInfo` wins; a content change (header excluded) re-derives and re-checks.
 
 ### 6.5 Time (§18.1, §3.4)
