@@ -40,6 +40,8 @@ use es_policy::{PolicyError, PolicyInfo, PolicyRuntime, WeightsSource};
 const NJ: usize = 2;
 const H: usize = 2;
 const CONTROL_HZ: u64 = 100;
+/// Side of the square test frame, in pixels.
+const IMG: u32 = 8;
 const N_EPISODES: u32 = 6;
 
 // --- Scene, model, backend ----------------------------------------------------------------
@@ -471,6 +473,54 @@ fn observation_ir(task_ref: [u8; 32], augment: Option<bool>) -> ObservationIr {
     ir
 }
 
+/// One `ImageInput`, 8x8 `Rgb8`: the port §10.1 refuses without a frame source and serves
+/// with one (packet `docs/packets/M5/V0b-render-in-the-loop.md`).
+#[allow(clippy::default_trait_access)] // `es-eval` does not depend on `es-math` for `Pose`.
+fn image_observation_ir(task_ref: [u8; 32]) -> ObservationIr {
+    let camera = StableId::from_path("camera/overhead");
+    let ty = PortType {
+        elem: ElemType::U8,
+        shape: Shape::new([u64::from(IMG), u64::from(IMG), 3]),
+        unit: Unit::Pixel,
+        frame: Frame::Camera(camera),
+        time: TimeRef::Sensor {
+            id: camera,
+            align: es_ir::types::Align::Hold,
+        },
+        image: Some(es_ir::image::ImageSpec {
+            width: IMG,
+            height: IMG,
+            channels: es_ir::image::ChannelFormat::Rgb,
+            dtype: es_ir::image::ImageDType::U8,
+            color_space: es_ir::image::ColorSpace::SRgb,
+            camera_model: es_ir::image::CameraModel::Pinhole,
+            intrinsics: es_ir::image::Intrinsics::new(4.0, 4.0, 4.0, 4.0),
+            extrinsics: Default::default(),
+            distortion: es_ir::image::DistortionModel::None,
+            shutter: es_ir::image::ShutterModel::Global,
+            exposure: std::time::Duration::ZERO,
+            rate_hz: CONTROL_HZ as f32,
+            depth_scale: None,
+        }),
+    };
+    let mut ir = ObservationIr::new(1, task_ref);
+    ir.graph.insert(
+        NodeId(0),
+        ObservationNode::ImageInput {
+            sensor: camera,
+            io: Io::source(ty.clone()),
+        },
+    );
+    ir.outputs = BTreeMap::from([(
+        "rgb".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(NodeId(0), "out"),
+            ty,
+        },
+    )]);
+    ir
+}
+
 /// `StateInput(j0) -> Normalize -> TemporalWindow(n = 2)`. The policy reads the first element
 /// of the window, which is the *oldest* frame, so anything left in the ring by a previous
 /// episode or cell changes this cell's numbers — the leak P-M2-R1 closes.
@@ -647,10 +697,19 @@ fn run_obs(
     obs: &ObservationIr,
     target: f64,
 ) -> Result<EvaluationReport, EvalError> {
+    run_obs_frames(ir, obs, target, None)
+}
+
+fn run_obs_frames(
+    ir: &EvaluationIr,
+    obs: &ObservationIr,
+    target: f64,
+    frames: Option<&mut es_eval::runner::FrameSource<'_>>,
+) -> Result<EvaluationReport, EvalError> {
     let task = task_ir();
     let deploy = deployment_ir();
     let mut policy = FakePolicy { target };
-    Evaluation::run::<FakeBackend, _, NJ, H>(
+    Evaluation::run_with_frames::<FakeBackend, _, NJ, H>(
         ir,
         &task,
         &scene(),
@@ -659,6 +718,7 @@ fn run_obs(
         &deploy,
         FakeBackend::new,
         &RunConfig::default(),
+        frames,
     )
     .map(|(report, _lock)| report)
 }
@@ -964,4 +1024,60 @@ fn a_perturbed_suite_differs_from_nominal() {
             .collect()
     };
     assert_ne!(of("nominal"), of("actuator_noise"));
+}
+
+// --- the image observation port (packet M5/V0b) ------------------------------------------
+
+/// §10.1: an image input the runner cannot serve is refused, with the same message as before
+/// V0b. Nothing is ever zero-filled — a wrong number in the §10.1 table is worse than no row.
+#[test]
+fn without_a_renderer_an_image_input_is_still_refused() {
+    let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
+    let task = task_ir();
+    let obs = image_observation_ir(task.task_hash().expect("task hashes"));
+    let err = run_obs(&ir, &obs, 0.2).expect_err("an image input with no frame source");
+    let EvalError::Plan(message) = &err else {
+        panic!("expected EvalError::Plan, got {err}");
+    };
+    assert!(
+        message.contains("image inputs need a renderer, which this build has none of"),
+        "{message}"
+    );
+}
+
+/// With a frame source (`es_env::render::EnvRenderer::frame` in a real run) the same input is
+/// served, and the bytes reach the plan unchanged.
+#[test]
+fn a_frame_source_serves_the_image_input() {
+    let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
+    let task = task_ir();
+    let obs = image_observation_ir(task.task_hash().expect("task hashes"));
+    let mut calls = 0u32;
+    let mut frames = |_: &ModelInfo, _: &StateView<'_>| {
+        calls += 1;
+        Ok(vec![0x5a_u8; IMG as usize * IMG as usize * 3])
+    };
+    let report = run_obs_frames(&ir, &obs, 0.2, Some(&mut frames)).expect("the image run");
+    assert!(!report.cells.is_empty());
+    assert!(calls > 0, "the frame source was never asked for a frame");
+}
+
+/// A frame that is not exactly what the plan declared is an error naming both sizes: `es-eval`
+/// does not resample, pad or convert to make one fit (§7.2, `INV-14`).
+#[test]
+fn a_frame_of_the_wrong_size_is_refused_not_resized() {
+    let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
+    let task = task_ir();
+    let obs = image_observation_ir(task.task_hash().expect("task hashes"));
+    let mut frames = |_: &ModelInfo, _: &StateView<'_>| Ok(vec![0_u8; 4]);
+    let err = run_obs_frames(&ir, &obs, 0.2, Some(&mut frames)).expect_err("a short frame");
+    let EvalError::Plan(message) = &err else {
+        panic!("expected EvalError::Plan, got {err}");
+    };
+    assert!(message.contains("the frame supplies 4 bytes"), "{message}");
+
+    // A frame source that cannot render says so, and the reason survives.
+    let mut broken = |_: &ModelInfo, _: &StateView<'_>| Err("no camera in the scene".to_owned());
+    let err = run_obs_frames(&ir, &obs, 0.2, Some(&mut broken)).expect_err("a broken source");
+    assert!(format!("{err}").contains("no camera in the scene"), "{err}");
 }

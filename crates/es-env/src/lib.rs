@@ -16,6 +16,10 @@ pub mod episode;
 pub mod inference;
 pub mod plan;
 pub mod randomize;
+/// The renderer in the env loop. Feature `render` (off by default): the only part of this
+/// crate that links Vulkan (§15, `docs/design/visible-learning.md` section 7).
+#[cfg(feature = "render")]
+pub mod render;
 pub mod rng;
 pub mod scheduler;
 
@@ -26,6 +30,8 @@ pub use env::{Env, EnvMetrics, StepOutcome};
 pub use episode::{Episode, EpisodeRecorder, Termination};
 pub use inference::{default_max_pending, latency_ticks, AsyncInference, Submission};
 pub use randomize::RandomizationPlan;
+#[cfg(feature = "render")]
+pub use render::{EnvRenderer, EnvRendererCfg};
 pub use rng::EnvRng;
 pub use scheduler::{BatchDomains, Device, DomainCfg, Schedule, TickPlan};
 
@@ -42,6 +48,16 @@ pub enum EnvError {
     /// The Task IR is well formed but cannot drive an env (a dangling sink, say).
     #[error("task: {0}")]
     Task(String),
+    /// The Observation IR's declared `ImageSpec` and what the renderer produces disagree
+    /// (§7.2, §26.1, `INV-14`). Never repaired: resampling or converting to fit would make
+    /// `observation_hash` describe a pipeline nobody declared, and `Resize` / `Crop` /
+    /// `ColorTransform` are Observation IR nodes that carry the intrinsics with them.
+    #[error("image spec: the observation declares {field} = {declared}, the renderer produces {produced}")]
+    ImageSpec {
+        field: &'static str,
+        declared: String,
+        produced: String,
+    },
     /// The backend refused a call.
     #[error(transparent)]
     Physics(#[from] es_physics_core::backend::PhysicsError),

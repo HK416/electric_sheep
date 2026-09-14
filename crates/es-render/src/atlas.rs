@@ -163,6 +163,36 @@ impl Tile {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    /// `"u8"`, `"u32"` or `"f32"` — the `dtype` key of the sidecar the goldens carry.
+    pub fn dtype(&self) -> &'static str {
+        match &self.data {
+            TileData::U8(_) => "u8",
+            TileData::U32(_) => "u32",
+            TileData::F32(_) => "f32",
+        }
+    }
+
+    /// Writes `<dir>/<stem>.bin` ([`Self::to_bytes`]) and `<dir>/<stem>.json` (`dtype`,
+    /// `shape`, `layout`) — the pair `tests/golden/render/*` already uses, so a frame written
+    /// out of a running env and a golden are the same two files.
+    ///
+    /// Raw bytes, not PNG: there is no image encoder in the workspace, the raw frame is what
+    /// is compared bit for bit, and a second encoding would be one more thing to keep
+    /// identical (`docs/design/visible-learning.md` section 7.2).
+    pub fn write_to(&self, dir: &std::path::Path, stem: &str) -> std::io::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join(format!("{stem}.bin")), self.to_bytes())?;
+        let sidecar = serde_json::json!({
+            "name": stem,
+            "dtype": self.dtype(),
+            "layout": "row-major, little-endian, tightly packed",
+            "shape": self.shape,
+        });
+        let text = serde_json::to_string_pretty(&sidecar)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        std::fs::write(dir.join(format!("{stem}.json")), format!("{text}\n"))
+    }
 }
 
 #[cfg(test)]

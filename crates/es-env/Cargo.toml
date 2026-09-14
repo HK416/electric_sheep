@@ -16,6 +16,15 @@ es-policy = { workspace = true }
 es-safety = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
+# `render` only (spec 4.2: layer 5 and layer 2, both below this crate's layer 9). Off by
+# default, so the default build of `es-env` -- and `es-runtime-embedded`, `es-ros2` and
+# `es eval run` with it -- links no Vulkan at all.
+es-render = { workspace = true, optional = true }
+es-gpu = { workspace = true, optional = true }
+
+[features]
+default = []
+render = ["dep:es-render", "dep:es-gpu"]
 
 [dev-dependencies]
 proptest = { workspace = true }

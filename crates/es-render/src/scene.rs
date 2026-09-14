@@ -54,10 +54,33 @@ pub struct TriScene {
 impl TriScene {
     /// Tessellate every geom of every body, in `SceneDesc` body order then geom order.
     pub fn from_scene(scene: &SceneDesc) -> Result<Self, RenderError> {
-        let world = world_poses(scene);
+        Self::from_scene_with_poses(scene, &BTreeMap::new())
+    }
+
+    /// [`Self::from_scene`] with the body poses of a *running* env: a body listed in `world`
+    /// is placed at that world pose, a body absent from it keeps the scene's static pose. The
+    /// tessellation, the geom order and the segmentation ids are the same either way, so a
+    /// posed frame and a static frame are comparable pixel for pixel.
+    ///
+    /// A map rather than a `StateView`: this crate is layer 5 and the physics state is layer 3
+    /// (spec 4.2), so the caller does the lookup and `es-render` gains no dependency.
+    ///
+    /// Ceiling, stated rather than hidden (`docs/design/visible-learning.md` section 7.1): the
+    /// whole scene is re-tessellated per call, because the shaders scan a flat triangle array
+    /// with no per-body transform and spec 15.4's acceleration structure is not implemented
+    /// (see the crate docs). The honest limit is the same few hundred triangles.
+    pub fn from_scene_with_poses(
+        scene: &SceneDesc,
+        world: &BTreeMap<StableId, Pose>,
+    ) -> Result<Self, RenderError> {
+        let statics = world_poses(scene);
         let mut out = Self::default();
         for body in &scene.bodies {
-            let body_pose = world.get(&body.id).copied().unwrap_or(Pose::IDENTITY);
+            let body_pose = world
+                .get(&body.id)
+                .or_else(|| statics.get(&body.id))
+                .copied()
+                .unwrap_or(Pose::IDENTITY);
             for geom in &body.geoms {
                 out.push_geom(geom, body_pose.compose(geom.pose))?;
             }
