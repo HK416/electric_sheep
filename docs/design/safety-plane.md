@@ -164,6 +164,20 @@ changes the recorded event, never the response.
 | 6 | `SensorDropout` | for any configured sensor, `micros_since(last_seen, now) > max_gap` |
 | 7 | `EnvelopeViolationRate` | `window.fraction() > max_frac`, using the window **as of the previous step** — this step's own clamp has not been recorded yet, which is what keeps the rule non-circular |
 
+**A partially filled window never trips** (P-M3-W1-R1). `window.fraction()` is
+`ones / window`, not `ones / steps-seen-so-far`, and reads `0.0` until the ring holds `window`
+steps. Dividing by the steps seen so far makes the *first* dirty step of a run a rate of
+exactly `1.0`, so any `max_frac < 1.0` trips on step two — and because the fallback step is
+itself dirty, the rate stays `1.0` and the plane never leaves the fallback (with
+`EmergencyStop`, it latches). A HIL cold start is the quickest way in (its first tick has no
+chunk, so `ChunkUnderrun` fires), but one transient clamp at step 3 of any deployment does the
+same. `window` is the warm-up period; there is no separate grace-period field, and §10.3's
+own example acceptance of `<= 0.01` only reads as written if the denominator is the window.
+
+Known ceiling, not fixed here: once the watchdog *has* tripped on a full window it does not
+release itself, because the fallback steps it causes are dirty and refill the window
+(`tests/properties.rs:a_tripped_rate_watchdog_does_not_release_itself` pins this).
+
 `ChunkUnderrun` and `NanInf` are armed always. The other five are armed only if the IR lists
 them; an unlisted watchdog never trips, which is a configuration choice, not a disabled
 safety layer — the envelope clamps below always run.

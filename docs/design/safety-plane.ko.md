@@ -168,6 +168,21 @@ watchdog이 발동했는지는 기록되는 이벤트만 바꿀 뿐 응답을 �
 | 6 | `SensorDropout` | 설정된 어떤 sensor에 대해서든 `micros_since(last_seen, now) > max_gap` |
 | 7 | `EnvelopeViolationRate` | `window.fraction() > max_frac`이며, **이전 스텝 시점**의 window를 사용한다 — 이번 스텝 자체의 clamp는 아직 기록되지 않았고, 그것이 이 규칙을 순환적이지 않게 만든다 |
 
+**부분적으로만 채워진 window는 절대 트립되지 않는다** (P-M3-W1-R1).
+`window.fraction()`은 `ones / 지금까지_관측한_스텝`이 아니라 `ones / window`이며, 링이
+`window`개의 스텝을 담을 때까지는 `0.0`을 반환한다. 지금까지 관측한 스텝 수로 나누면 실행의
+*첫* dirty 스텝이 정확히 비율 `1.0`이 되어 `max_frac < 1.0`인 모든 설정이 두 번째 스텝에서
+트립된다 — 그리고 fallback 스텝 자체가 dirty이므로 비율은 `1.0`에 머물고 plane은 fallback을
+영영 벗어나지 못한다(`EmergencyStop`이면 래치된다). HIL 콜드 스타트가 가장 빠른 진입
+경로지만(첫 틱에 chunk가 없으므로 `ChunkUnderrun`이 발생한다), 임의의 배포에서 3번째 스텝에
+일시적 clamp 하나만 있어도 똑같이 일어난다. `window` 자체가 워밍업 구간이며, 별도의 유예
+기간 필드는 없다. §10.3의 예시 수용 기준 `<= 0.01`도 분모가 window일 때에만 문자 그대로
+읽힌다.
+
+여기서 고치지 않은 알려진 한계: 가득 찬 window에서 한 번 트립된 뒤에는 watchdog이 스스로
+풀리지 않는다. 그것이 유발한 fallback 스텝들이 dirty이고 window를 다시 채우기 때문이다
+(`tests/properties.rs:a_tripped_rate_watchdog_does_not_release_itself`가 이를 고정한다).
+
 `ChunkUnderrun`과 `NanInf`는 항상 활성화되어 있다. 나머지 다섯은 IR이 나열한
 경우에만 활성화된다. 나열되지 않은 watchdog은 절대 트립되지 않는데, 이는 안전
 계층의 비활성화가 아니라 설정 선택이다 — envelope의 clamp들은 아래에서 항상

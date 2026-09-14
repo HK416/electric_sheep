@@ -11,7 +11,7 @@ use es_ir::deployment::{
     Micros, RateLimit, RateSpec, RobotRef, RobotTarget, SafetyEnvelope, Watchdog, WatchdogSet,
     Workspace, SCHEMA_VERSION,
 };
-use es_safety::{ActionChunk, ActionSource, FallbackKind, SafetyPlane, ViolationKind};
+use es_safety::{ActionChunk, ActionSource, FallbackKind, SafeAction, SafetyPlane, ViolationKind};
 use proptest::prelude::*;
 
 const NJ: usize = 3;
@@ -265,4 +265,166 @@ fn determinism_two_planes_same_inputs_same_outputs() {
         assert_eq!(x.source, y.source);
         assert_eq!(x.events, y.events);
     }
+}
+
+// --- The spec 9.4 rate watchdog (P-M3-W1-R1) -------------------------------------------------
+
+/// A plane whose only *configured* watchdog is the rate one, so nothing but `ChunkUnderrun`
+/// and `NanInf` (always armed, INV-12) can trip. `window: 8, max_frac: 0.25` means "more than
+/// two dirty steps in the last eight".
+fn rate_plane(fallback: FallbackPolicy) -> SafetyPlane<NJ, H> {
+    SafetyPlane::from_ir(&ir(
+        fallback,
+        vec![Watchdog::EnvelopeViolationRate {
+            window: 8,
+            max_frac: 0.25,
+        }],
+    ))
+    .expect("valid config")
+}
+
+/// One step commanding `target` on every joint. Each call carries a fresh `seq`, so the plane
+/// accepts the chunk and executes row 0 rather than running the previous one off its end.
+fn step(p: &mut SafetyPlane<NJ, H>, t: u64, target: f64) -> SafeAction<NJ> {
+    let chunk =
+        ActionChunk::new([[target; NJ]; H], 1, ExecutionMode::RecedingHorizon).with_seq(t + 1);
+    p.validate(&chunk, Micros(1_000), PhysTick(t))
+}
+
+/// A step commanding the pose the plane is already holding at zero velocity: no clamp stage
+/// touches it, so it is clean.
+fn hold_step(p: &mut SafetyPlane<NJ, H>, t: u64) -> SafeAction<NJ> {
+    let target = p.last_safe_action()[0];
+    step(p, t, target)
+}
+
+/// `1.0` is far outside the per-step velocity budget (`8 rad/s * 10 ms = 0.08`), so the step is
+/// clamped — dirty, but a clamp, not a watchdog trip.
+fn dirty_step(p: &mut SafetyPlane<NJ, H>, t: u64) -> SafeAction<NJ> {
+    let out = step(p, t, 1.0);
+    assert_eq!(out.source, ActionSource::Clamped, "step at tick {t}");
+    assert!(out.events.contains(ViolationKind::Velocity));
+    out
+}
+
+/// B-1 of `docs/reviews/M3-W1.md`: a window with fewer than `window` steps in it is not a
+/// sample of anything, so it must never trip. The first step here is the HIL cold start — the
+/// controller has not answered yet, so there is no chunk — and before the fix it made the rate
+/// exactly `1.0`, latching every following step into the fallback.
+#[test]
+fn a_partial_window_never_trips_the_rate_watchdog() {
+    let mut p = rate_plane(FallbackPolicy::HoldPosition);
+    let out = p.validate(
+        &ActionChunk::empty(ExecutionMode::RecedingHorizon),
+        Micros(1_000),
+        PhysTick(0),
+    );
+    assert!(out.events.contains(ViolationKind::ChunkUnderrun));
+    // Steps 2..8 fill the rest of the eight-step window. The window is never full, so the
+    // watchdog has nothing to judge and every step is the policy's own action.
+    for t in 1..8u64 {
+        let out = hold_step(&mut p, t);
+        assert_eq!(out.source, ActionSource::Policy, "step {}", t + 1);
+        assert!(
+            !out.events.contains(ViolationKind::ViolationRate),
+            "step {}",
+            t + 1
+        );
+    }
+    // The eighth step is the one that fills the window, and only then does the rate become a
+    // number: one dirty step out of eight, not out of one.
+    assert!((p.counters().envelope_violation_rate() - 0.125).abs() < 1e-12);
+}
+
+/// Once the window *is* full the watchdog judges it, at the configured threshold and not
+/// before: three dirty steps out of eight is `0.375 > 0.25`, two is `0.25` and is not.
+#[test]
+fn a_full_window_trips_at_the_threshold() {
+    let mut p = rate_plane(FallbackPolicy::HoldPosition);
+    for t in 0..8u64 {
+        assert_eq!(hold_step(&mut p, t).source, ActionSource::Policy);
+    }
+    // Dirty steps 9, 10 and 11: the window they are judged against holds 0, 1 and 2 dirty
+    // steps respectively, so none of them trips.
+    for t in 8..11u64 {
+        let out = dirty_step(&mut p, t);
+        assert!(
+            !out.events.contains(ViolationKind::ViolationRate),
+            "step {} tripped early",
+            t + 1
+        );
+    }
+    // Step 12 reads 3/8 and trips.
+    let out = hold_step(&mut p, 11);
+    assert!(out.events.contains(ViolationKind::ViolationRate));
+    assert_eq!(
+        out.source,
+        ActionSource::Fallback(FallbackKind::HoldPosition)
+    );
+}
+
+/// The rate is over the last `window` steps and nothing older: a dirty step that has slid out
+/// stops counting, so a run under the threshold recovers on its own.
+#[test]
+fn the_rate_falls_back_out_of_the_window() {
+    let mut p = rate_plane(FallbackPolicy::HoldPosition);
+    for t in 0..8u64 {
+        hold_step(&mut p, t);
+    }
+    dirty_step(&mut p, 8);
+    // 1/8 is under the threshold, so the plane keeps executing the policy while the bit ages.
+    for t in 9..17u64 {
+        let out = hold_step(&mut p, t);
+        assert_eq!(out.source, ActionSource::Policy, "step {}", t + 1);
+        assert!(!out.events.contains(ViolationKind::ViolationRate));
+    }
+    // Eight clean steps later the bit is gone and the rate reads zero, not the run's history.
+    assert!(p.counters().envelope_violation_rate() < 1e-12);
+    assert_eq!(p.counters().dirty_steps, 1);
+}
+
+/// A tripped rate watchdog holds itself tripped: its own fallback step is dirty
+/// (`plane.rs`'s `window.push(!events.is_empty())`), so the window refills with the
+/// watchdog's own output and the fraction only grows. Deliberately pinned rather than fixed —
+/// P-M3-W1-R1 owns the denominator, and the dirty-bit rule is `forbidden` to it. Worth a
+/// follow-up: after the burst that tripped it the policy may be fine, and nothing here can
+/// tell.
+#[test]
+fn a_tripped_rate_watchdog_does_not_release_itself() {
+    let mut p = rate_plane(FallbackPolicy::HoldPosition);
+    for t in 0..8u64 {
+        hold_step(&mut p, t);
+    }
+    for t in 8..11u64 {
+        dirty_step(&mut p, t);
+    }
+    for t in 11..40u64 {
+        let out = hold_step(&mut p, t);
+        assert!(
+            out.events.contains(ViolationKind::ViolationRate),
+            "step {} released the watchdog",
+            t + 1
+        );
+    }
+}
+
+/// The blocker's worst case: with `FallbackPolicy::EmergencyStop` the rate watchdog's trip
+/// latches the e-stop (`plane.rs`'s step 4a), and one clamped step used to be enough to trip
+/// it on the very next step. A single clamp is not a rate.
+///
+/// The first step is a *clamp*, not the packet's `ChunkUnderrun`: that watchdog is armed
+/// unconditionally, so an empty first chunk latches the e-stop by itself and would prove
+/// nothing about the rate window.
+#[test]
+fn an_estop_rate_watchdog_does_not_latch_on_step_two() {
+    let mut p = rate_plane(FallbackPolicy::EmergencyStop);
+    dirty_step(&mut p, 0);
+    assert!(!p.is_latched(), "a clamp is not a watchdog trip");
+    let out = hold_step(&mut p, 1);
+    assert!(!out.events.contains(ViolationKind::ViolationRate));
+    assert_eq!(out.source, ActionSource::Policy);
+    assert!(
+        !p.is_latched(),
+        "one dirty step out of a window of 8 latched the e-stop"
+    );
 }

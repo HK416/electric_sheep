@@ -55,12 +55,16 @@ impl ViolationWindow {
         self.filled = (self.filled + 1).min(self.len);
     }
 
-    /// Violated steps over observed steps. Zero before the first step.
+    /// Violated steps over the **configured window**, not over the steps observed so far, and
+    /// `0.0` until the window is full. A partially filled window is not a sample of anything:
+    /// dividing by `filled` makes the first dirty step of a run read `1.0`, which trips the
+    /// spec 9.4 rate watchdog for any `max_frac < 1.0` and — since the fallback step is itself
+    /// dirty — never lets go again (`docs/reviews/M3-W1.md` B-1).
     pub(crate) fn fraction(&self) -> f64 {
-        if self.filled == 0 {
+        if self.filled < self.len {
             0.0
         } else {
-            self.ones as f64 / self.filled as f64
+            self.ones as f64 / self.len as f64
         }
     }
 
@@ -125,8 +129,13 @@ impl SafetyCounters {
         }
     }
 
-    /// Fraction of steps in the sliding window the plane clamped, projected or fell back on
+    /// Fraction of the **last `window` steps** the plane clamped, projected or fell back on
     /// (spec 10.3 `envelope_violation_rate`, read by the spec 9.4 rate watchdog).
+    ///
+    /// Reads `0.0` until the window has seen `window` steps: the watchdog judges a full
+    /// window or nothing, so a cold start cannot make one early violation look like a 100 %
+    /// rate. `es-eval`'s metric of the same name is unaffected — it computes the rate over a
+    /// whole episode from `dirty_steps`/`steps`, not from this ring.
     pub fn envelope_violation_rate(&self) -> f64 {
         self.window.fraction()
     }
