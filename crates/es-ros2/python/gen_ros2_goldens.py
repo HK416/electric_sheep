@@ -408,7 +408,15 @@ def _check_rihs01(golden_dir: Path) -> tuple[bool, list[str]]:
 
 
 def _check_cdr_bytes(golden_dir: Path) -> tuple[bool, list[str]]:
+    """The live ROS 2 stack must read every golden back as the fixture message.
+
+    Byte equality with `serialize_message` is not the oracle: Fast-CDR leaves alignment padding
+    uninitialized and `serialize_message`'s buffer carries trailing bytes the network capture
+    does not (`docs/api-notes/ros2-cdr.md`). The wire direction is judged by the live capture in
+    `tests/golden/ros2/rmw_zenoh/`. Byte differences are still printed, as information.
+    """
     import rclpy.serialization
+    from rosidl_runtime_py.convert import message_to_ordereddict
 
     ok = True
     lines = []
@@ -418,12 +426,24 @@ def _check_cdr_bytes(golden_dir: Path) -> tuple[bool, list[str]]:
         name = spec["name"]
         want = (golden_dir / "cdr" / f"{name}.bin").read_bytes()
         msg = _build_rclpy_message(name, spec["typename"], spec["fields"])
+        try:
+            decoded = rclpy.serialization.deserialize_message(want, type(msg))
+        except Exception as e:  # any failure to read a golden is the finding
+            ok = False
+            lines.append(f"{name}: DECODE FAILED ({e})")
+            continue
+        if message_to_ordereddict(decoded) != message_to_ordereddict(msg):
+            ok = False
+            lines.append(f"{name}: MISMATCH rclpy read {decoded!r}, fixture is {msg!r}")
+            continue
         got = bytes(rclpy.serialization.serialize_message(msg))
         if got == want:
-            lines.append(f"{name}: match ({len(got)} bytes)")
+            lines.append(f"{name}: decodes to the fixture (bytes identical, {len(got)})")
             continue
-        ok = False
-        lines.append(f"{name}: MISMATCH (golden {len(want)} bytes, rclpy {len(got)} bytes)")
+        lines.append(
+            f"{name}: decodes to the fixture (bytes differ, informational: "
+            f"golden {len(want)}, rclpy {len(got)})"
+        )
         lines.extend(_diff_report(want, got))
     return ok, lines
 

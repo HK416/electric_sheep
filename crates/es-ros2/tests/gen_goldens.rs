@@ -110,7 +110,12 @@ fn goldens_are_what_rosbags_and_xxhash_produce() {
     println!("RAN gen_goldens");
 
     let checked_in = manifest("../../tests/golden/ros2");
-    let names = list_files_relative(&checked_in);
+    // `rmw_zenoh/` is the live network capture (W1b's `capture_reference_goldens`), a different
+    // oracle than this script; `session_loopback.rs` checks it.
+    let names: Vec<String> = list_files_relative(&checked_in)
+        .into_iter()
+        .filter(|n| !n.starts_with("rmw_zenoh/"))
+        .collect();
     assert!(!names.is_empty(), "no goldens to check");
     assert_eq!(
         names,
@@ -141,7 +146,7 @@ fn robostack_hashes_and_rclpy_bytes_agree_with_the_goldens() {
 
     let script = manifest("scripts/ros2-env.sh");
     let golden_dir = manifest("../../tests/golden/ros2");
-    let out = Command::new("sh")
+    let out = Command::new("bash")
         .arg(&script)
         .arg(&ros2_env)
         .arg("python")

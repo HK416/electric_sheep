@@ -213,9 +213,10 @@ request `TRANSIENT_LOCAL` to reject. No new trait (`Durability` is a plain enum)
   **Recorded 2026-09-14, all VERIFIED** -- see both files' updated tables/rows.
   `ros2-env.sh` sufficiency: **sufficient once invoked under bash** (its own shebang is now
   `#!/usr/bin/env bash`, and `rmw_zenoh_interop.rs` calls `bash scripts/ros2-env.sh ...`
-  explicitly); the pre-existing `tests/gen_goldens.rs` (W1a, outside this packet's file scope)
-  still invokes it via `Command::new("sh")` and hits the documented `source: not found` gap if
-  `ES_ROS2_ENV` happens to be set for a plain `cargo test -p es-ros2` run -- left for a follow-up.
+  explicitly). Follow-up commit (same day): `tests/gen_goldens.rs` (W1a) also calls it via
+  `bash`, skips `rmw_zenoh/` (this packet's capture, a different oracle) in its file-set
+  comparison, and its rclpy check became `deserialize_message(golden) == fixture` instead of byte
+  equality -- see `docs/api-notes/ros2-cdr.md` "Live ROS 2 byte capture". Not a codec change.
 - No new trait, no `HashMap`, ≤ ~900 new source lines. **Recorded 2026-09-14:** new source lines
   (tests excluded) total ~955 across `config.rs` (231), `session.rs` (533), `actuator.rs` (82),
   `error.rs`'s additions (96) and `lib.rs`'s (13) -- about 6% over the `~900` target, kept because
