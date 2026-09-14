@@ -80,6 +80,10 @@ jobs:
           # goldens, so without it `gen_goldens` SKIPs and their provenance is unchecked.
           python -m pip install torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install diffusers==0.40.0 newton==1.6.0 warp-lang==1.17.0
+          # es-ros2 golden provenance (docs/design/ros2-boundary.md section 8,
+          # docs/packets/M3/P-M3-W1-R4.md): without these, `gen_goldens` and the rosbags/OpenCV
+          # half of `gen_camera_goldens` SKIP and 32 checked-in goldens go unchecked.
+          python -m pip install rosbags==0.11.5 xxhash==4.0.1 opencv-python-headless==5.0.0.93
 
       # lerobot 0.6.1 is pinned to torch 2.11 / torchvision 0.26 (docs/api-notes/lerobot-act.md)
       # and cannot share the torch 2.14 environment above, so the ACT oracle gets its own venv.
@@ -147,14 +151,16 @@ jobs:
           mv bin/micromamba "$HOME/.local/bin/micromamba"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # Only the packages this packet's oracle touches (a router, the `ros2` CLI,
-      # `demo_nodes_cpp`); `cv-bridge`/`image-geometry` are W1c's and design note section 8
-      # flags their co-installation with the rest as unverified, so W1b does not risk it here.
+      # One prefix for the router, the `ros2` CLI, `demo_nodes_cpp` and (measured 2026-09-14,
+      # docs/packets/M3/W1c-camera-ingest.md "Environment, measured") `cv-bridge`/
+      # `image-geometry`: all five co-install here, so design note section 8's former
+      # "co-installation is unverified" caution and the second-prefix fallback are gone.
       - name: create the ROS 2 Kilted + rmw_zenoh environment
         run: |
           set -euo pipefail
           micromamba create -y -p "$HOME/envs/ros2-kilted" -c conda-forge -c robostack-kilted \
-            ros-kilted-ros-base=0.12.0 ros-kilted-rmw-zenoh-cpp=0.6.6 ros-kilted-demo-nodes-cpp=0.36.4
+            ros-kilted-ros-base=0.12.0 ros-kilted-rmw-zenoh-cpp=0.6.6 ros-kilted-demo-nodes-cpp=0.36.4 \
+            ros-kilted-cv-bridge=4.1.0 ros-kilted-image-geometry=4.1.0
 
       - name: live rmw_zenoh interop (spec 24.1, W1b)
         run: |
@@ -162,3 +168,17 @@ jobs:
           export ES_ROS2_ENV="$HOME/envs/ros2-kilted"
           cargo test -p es-ros2 --features zenoh --test rmw_zenoh_interop -- --nocapture --test-threads=1 2>&1 | tee interop.log
           grep -q '^RAN rmw_zenoh_interop' interop.log
+
+      # M3 W1's golden-provenance oracles (spec 1.4, review docs/reviews/M3-W1.md S-3, packet
+      # docs/packets/M3/P-M3-W1-R4.md): a missing `RAN` line means the harness SKIPped instead
+      # of re-deriving the checked-in goldens, which must fail the job, not pass it quietly.
+      - name: es-ros2 golden provenance (spec 1.4, P-M3-W1-R4)
+        env:
+          ES_PYTHON: python
+        run: |
+          set -euo pipefail
+          export ES_ROS2_ENV="$HOME/envs/ros2-kilted"
+          cargo test -p es-ros2 --test gen_goldens --test gen_camera_goldens -- --nocapture 2>&1 | tee ros2-provenance.log
+          grep -q '^RAN gen_goldens' ros2-provenance.log
+          grep -q '^RAN robostack_hashes_and_rclpy_bytes_agree_with_the_goldens' ros2-provenance.log
+          grep -q '^RAN gen_camera_goldens' ros2-provenance.log
