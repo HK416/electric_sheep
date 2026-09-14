@@ -49,6 +49,12 @@ fn is_gpu_skip(line: &str) -> bool {
 /// machine prints nothing and reports `ok`. With `ES_REQUIRE_GPU=1` — a machine that claims
 /// a GPU — a GPU SKIP is a failure, the same way `nostd --require` turns a missing target
 /// into one. Unset (the PR runner, which has no GPU) it is only reported.
+///
+/// `ES_REQUIRE_ORACLES=1` is the symmetric flag for every other reference oracle (`MuJoCo`,
+/// `PyTorch`, the `es-ros2` golden provenance harnesses, …): any `SKIP` line `is_gpu_skip`
+/// does **not** claim is one of those, and with the flag set it fails the run the same way a
+/// GPU skip does under `ES_REQUIRE_GPU=1`. Unset, it is only a `NOTE` (review `docs/reviews/
+/// M3-W1.md` S-3, packet `docs/packets/M3/P-M3-W1-R4.md`).
 fn run_tests(root: &Path) -> bool {
     // `es-ros2/zenoh` (docs/packets/M3/W1b-ros2-zenoh-session.md): off by default (spec 4.2 —
     // `es` and any embedded consumer must not link zenoh), but the PR tier still builds, lints
@@ -75,26 +81,43 @@ fn run_tests(root: &Path) -> bool {
         }
     };
     let stdout = child.stdout.take().expect("stdout is piped");
-    let mut skipped: Vec<String> = Vec::new();
+    let mut gpu_skipped: Vec<String> = Vec::new();
+    let mut other_skipped: Vec<String> = Vec::new();
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
         println!("{line}");
-        if is_gpu_skip(&line) {
-            skipped.push(line);
+        if line.starts_with("SKIP") {
+            if is_gpu_skip(&line) {
+                gpu_skipped.push(line);
+            } else {
+                other_skipped.push(line);
+            }
         }
     }
     if !child.wait().is_ok_and(|s| s.success()) {
         return false;
     }
 
-    let require = std::env::var("ES_REQUIRE_GPU").as_deref() == Ok("1");
-    for line in &skipped {
-        if require {
+    let require_gpu = std::env::var("ES_REQUIRE_GPU").as_deref() == Ok("1");
+    let mut ok = true;
+    for line in &gpu_skipped {
+        if require_gpu {
             eprintln!("FAIL ES_REQUIRE_GPU=1 but a GPU oracle did not run: {line}");
+            ok = false;
         } else {
             println!("NOTE GPU oracle skipped (ES_REQUIRE_GPU unset): {line}");
         }
     }
-    !require || skipped.is_empty()
+
+    let require_oracles = std::env::var("ES_REQUIRE_ORACLES").as_deref() == Ok("1");
+    for line in &other_skipped {
+        if require_oracles {
+            eprintln!("FAIL ES_REQUIRE_ORACLES=1 but a reference oracle did not run: {line}");
+            ok = false;
+        } else {
+            println!("NOTE oracle skipped (ES_REQUIRE_ORACLES unset): {line}");
+        }
+    }
+    ok
 }
 
 fn cmd_ci(root: &Path) -> bool {
@@ -190,5 +213,15 @@ mod tests {
         ] {
             assert!(!is_gpu_skip(line), "false positive: {line}");
         }
+    }
+
+    /// The es-ros2 golden-provenance SKIP lines carry no GPU word by design (design note
+    /// `docs/design/ros2-boundary.md` section 8), so `ES_REQUIRE_ORACLES=1` — not
+    /// `ES_REQUIRE_GPU=1` — is what catches them (review `docs/reviews/M3-W1.md` S-3).
+    #[test]
+    fn a_non_gpu_skip_is_not_a_gpu_skip() {
+        let line =
+            "SKIP gen_camera_goldens: no Python interpreter with rosbags + cv2 (set ES_PYTHON to choose one)";
+        assert!(!is_gpu_skip(line), "false positive: {line}");
     }
 }

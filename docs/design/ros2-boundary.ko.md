@@ -425,8 +425,8 @@ command가 plane에 도달해서는 안 된다. 테스트는 고정된 테스트
 | RoboStack JSON, `rclpy.serialization.serialize_message` | 해시 cross-check; 실제 RMW CDR 바이트 | `ES_ROS2_ENV` | 오라클 job / Linux 서버 | `SKIP` |
 | rmw_zenoh design.md 예제 | token과 key 리터럴 | — | PR | — |
 | 라이브 `rmw_zenohd`, `ros2` CLI, `demo_nodes_cpp` | 양방향 interop; `tests/golden/ros2/rmw_zenoh/**` capture | `ES_ROS2_ENV` | 오라클 job / Linux 서버 | `SKIP`; 실행 시 `RAN rmw_zenoh_interop` |
-| image_geometry, cv_bridge (RoboStack) | ROI/binning 아래의 intrinsics; encoding 변환 | `ES_ROS2_ENV` | golden 생성, provenance | `SKIP` |
-| opencv-python-headless 5.0.0.93 | YUV golden | `cv2`가 있는 `ES_PYTHON` | provenance | `SKIP` |
+| image_geometry, cv_bridge (RoboStack) | ROI/binning 아래의 intrinsics; encoding 변환 | `ES_ROS2_ENV` | golden 생성, provenance(오라클 job) | `SKIP` |
+| opencv-python-headless 5.0.0.93 | YUV golden | `cv2`가 있는 `ES_PYTHON` | provenance(오라클 job) | `SKIP` |
 | HIL live == replay | 게이트 | — | PR | — |
 
 `ES_ROS2_ENV`는 RoboStack 환경의 prefix다. 레퍼런스 명령은
@@ -452,9 +452,10 @@ export ES_PYTHON="$HOME/envs/es-oracles/bin/python"
 
 다섯 개의 RoboStack 패키지 모두 `robostack-kilted`의 `linux-64`에 존재한다(prefix.dev
 repodata, 2026-09-14); kilted는 `python_abi 3.12`에 pin되어 있다. `cv-bridge`/`image-geometry`는
-`np126` 빌드(`_10`)인 반면 나머지는 `np2` 빌드(`_21`)다: 하나의 prefix에 공존 설치할 수
-있는지는 **미검증**이다. solver가 거부하면 W1c는 두 번째 prefix인 `ES_ROS2_VISION_ENV`를 쓰고
-그것을 기록한다.
+`np126` 빌드(`_10`)인 반면 나머지는 `np2` 빌드(`_21`)다; 오라클 서버에서 2026-09-14에 측정한
+결과(`docs/packets/M3/W1c-camera-ingest.md`의 "Environment, measured"): 다섯 개 모두 위의 한
+prefix에 **실제로** 공존 설치된다. solver 거부 시의 대안이었던 두 번째 prefix
+`ES_ROS2_VISION_ENV`는 필요 없다.
 
 ## 9. 패킷 순서
 

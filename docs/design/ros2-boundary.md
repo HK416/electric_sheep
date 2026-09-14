@@ -413,8 +413,8 @@ must not reach the plane. Tests use a fixed test key.
 | RoboStack JSON, `rclpy.serialization.serialize_message` | hash cross-check; real-RMW CDR bytes | `ES_ROS2_ENV` | oracle job / Linux server | `SKIP` |
 | rmw_zenoh design.md examples | token and key literals | — | PR | — |
 | live `rmw_zenohd`, `ros2` CLI, `demo_nodes_cpp` | interop both ways; `tests/golden/ros2/rmw_zenoh/**` capture | `ES_ROS2_ENV` | oracle job / Linux server | `SKIP`; `RAN rmw_zenoh_interop` when run |
-| image_geometry, cv_bridge (RoboStack) | intrinsics under ROI/binning; encoding conversions | `ES_ROS2_ENV` | golden generation, provenance | `SKIP` |
-| opencv-python-headless 5.0.0.93 | YUV goldens | `ES_PYTHON` with `cv2` | provenance | `SKIP` |
+| image_geometry, cv_bridge (RoboStack) | intrinsics under ROI/binning; encoding conversions | `ES_ROS2_ENV` | golden generation, provenance (oracle job) | `SKIP` |
+| opencv-python-headless 5.0.0.93 | YUV goldens | `ES_PYTHON` with `cv2` | provenance (oracle job) | `SKIP` |
 | HIL live == replay | the gate | — | PR | — |
 
 `ES_ROS2_ENV` is the prefix of a RoboStack environment. Reference commands run through
@@ -438,8 +438,10 @@ export ES_PYTHON="$HOME/envs/es-oracles/bin/python"
 
 All five RoboStack packages exist for `linux-64` in `robostack-kilted` (prefix.dev repodata,
 2026-09-14); kilted is pinned to `python_abi 3.12`. `cv-bridge`/`image-geometry` are `np126`
-builds (`_10`) while the rest are `np2` builds (`_21`): co-installation in one prefix is
-**unverified**. If the solver refuses, W1c uses a second prefix, `ES_ROS2_VISION_ENV`, and records it.
+builds (`_10`) while the rest are `np2` builds (`_21`); measured 2026-09-14 on the oracle server
+(`docs/packets/M3/W1c-camera-ingest.md`, "Environment, measured"): all five **do** co-install in
+the one prefix above. `ES_ROS2_VISION_ENV`, the second-prefix fallback for a solver refusal, is
+not needed.
 
 ## 9. Packet order
 
