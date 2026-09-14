@@ -14,7 +14,7 @@ Spec: §24.1 (mode A implements CDR with `zenoh-rs`), §1.4 (goldens come from t
 | Type-hash reference | RoboStack `robostack-kilted`: `ros-kilted-std-msgs-5.5.2`, `ros-kilted-sensor-msgs-5.5.2`, `ros-kilted-trajectory-msgs-5.5.2` (build `np2py312hf80f32c_21`), `ros-kilted-builtin-interfaces-2.3.1`; `share/<pkg>/msg/<T>.json` -> `type_hashes[0].hash_string`. Cross-checked against rosbags `Typestore.hash_rihs01`: **all 11 agree**; rosbags gives identical hashes for `ROS2_JAZZY`, `ROS2_KILTED`, `ROS2_LYRICAL` |
 | Encapsulation | OMG DDS-XTypes 1.3, clause 7.6.3.1.2, Table 60, <https://www.omg.org/spec/DDS-XTypes/1.3/PDF> |
 | Message definitions | <https://github.com/ros2/common_interfaces> (rolling), <https://github.com/ros2/rcl_interfaces> (`builtin_interfaces`) |
-| Live ROS 2 byte capture | **unverified** until W1b's interop oracle (`docs/packets/M3/W1b-ros2-zenoh-session.md`) records real rmw_zenoh payloads |
+| Live ROS 2 byte capture | W1a ran `robostack_hashes_and_rclpy_bytes_agree_with_the_goldens` on the oracle server (RoboStack ROS 2 Kilted). `scripts/ros2-env.sh` (POSIX `sh`, per the work packet) cannot activate this prefix unattended: `ros-kilted-ros-workspace_activate.sh` calls bash's `source` builtin, which `/bin/sh` (dash on the oracle server) does not provide (`source: not found`) — a real, recorded environment gap, not a weakened test. Run by hand instead (`RIHS01` **PASS**, all 11 `share/<pkg>/msg/<T>.json` hashes match `rihs01.json`; CDR bytes **FAIL**, see "Encapsulation header" below) to get the evidence this row and that section record. Open for W1b: fix the activation (run it under bash, or patch around the `source` call) and capture real network bytes, not just `rclpy.serialization.serialize_message` |
 
 ## Encapsulation header (4 bytes, precedes every payload)
 
@@ -24,7 +24,19 @@ Spec: §24.1 (mode A implements CDR with `zenoh-rs`), §1.4 (goldens come from t
 - ROS 2 serializes XCDR1 `PLAIN_CDR`: rmw_fastrtps `TypeSupport_impl.cpp`:
   `eprosima::fastcdr::Cdr ser(..., DEFAULT_ENDIAN, CdrVersion::XCDRv1); ser.set_encoding_flag(PLAIN_CDR);`.
   rmw_zenoh's `type_support.cpp` calls `ser.serialize_encapsulation()`; its `CdrVersion` is
-  **unverified** (settled by the W1b capture).
+  **unverified** (settled by the W1b capture). W1a evidence (`rclpy.serialization
+  .serialize_message` under `RMW_IMPLEMENTATION=rmw_zenoh_cpp`, RoboStack Kilted, oracle
+  server): every populated field, and every message's total length, matches this table's plain
+  XCDR1 layout exactly for `String`, `Image` and `CameraInfo`, consistent with XCDR1 rather
+  than an XCDR2 appendable/`DHEADER` layout. Two real divergences, not padding-adjacent noise:
+  (1) alignment padding bytes are **not** zero — Fast-CDR leaves whatever was already in the
+  buffer (observed ASCII fragments of unrelated strings), so a decoder must never read padding
+  content, only skip it (this crate's `CdrReader` already does); (2) `JointState`'s two *empty*
+  `float64[]` fields (`velocity`, `effort`) each still consume an 8-byte alignment pad before
+  their (absent) elements — 84 bytes on the wire vs. this table's 76 — where rosbags (and this
+  crate's `CdrWriter`) skip that pad when `count == 0`. Not yet resolved: whether a live zenoh
+  publish (not `rclpy.serialization.serialize_message`, which stops before the network) agrees,
+  and whether the empty-sequence padding difference needs a decoder change in W1b.
 - Bytes 2-3: options. XTypes: the low 2 bits of the second byte *shall* carry the trailing
   padding count to the next 4-byte boundary. rmw_fastrtps never sets them; rosbags writes
   `00 00` and no trailing padding.

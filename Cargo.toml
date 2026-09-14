@@ -34,6 +34,7 @@ es-render = { path = "crates/es-render" }
 es-usd = { path = "crates/es-usd" }
 es-gpu = { path = "crates/es-gpu" }
 es-py = { path = "crates/es-py" }
+es-ros2 = { path = "crates/es-ros2" }
 ash = "0.38.0"
 gpu-allocator = { version = "0.28.0", default-features = false, features = [
     "vulkan",

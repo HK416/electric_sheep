@@ -1,0 +1,16 @@
+{
+  "fields": {
+    "data": [
+      0.25,
+      -0.5,
+      1.0
+    ],
+    "layout": {
+      "data_offset": 0,
+      "dim": []
+    }
+  },
+  "little_endian": true,
+  "rosbags_version": "0.11.5",
+  "typename": "std_msgs/msg/Float64MultiArray"
+}

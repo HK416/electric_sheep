@@ -1,0 +1,26 @@
+[package]
+name = "es-ros2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+es-core = { workspace = true }
+thiserror = { workspace = true }
+# Pinned exactly: what ROS 2's zenoh_cpp_vendor builds against (docs/api-notes/rmw-zenoh.md).
+# `default-features = false` + `xxh3` only: this packet needs `xxh3_128` for GID, nothing else
+# (no zenoh, no tokio; `cargo tree -p es-ros2 -e normal` must show neither).
+# `xxhash-rust` 0.8.18 declares no `rust_version`; verified directly: `cargo +1.85 check -p
+# es-ros2 --all-targets` passes against the workspace's pinned `rust-version = "1.85"`.
+xxhash-rust = { version = "=0.8.18", default-features = false, features = [
+    "xxh3",
+] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+es-core = { workspace = true, features = ["alloc-count"] }
+
+[lints]
+workspace = true

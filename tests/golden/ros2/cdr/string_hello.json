@@ -1,0 +1,8 @@
+{
+  "fields": {
+    "data": "hello"
+  },
+  "little_endian": true,
+  "rosbags_version": "0.11.5",
+  "typename": "std_msgs/msg/String"
+}

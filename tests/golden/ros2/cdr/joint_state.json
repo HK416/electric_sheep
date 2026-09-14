@@ -1,0 +1,24 @@
+{
+  "fields": {
+    "effort": [],
+    "header": {
+      "frame_id": "base",
+      "stamp": {
+        "nanosec": 2,
+        "sec": 1
+      }
+    },
+    "name": [
+      "j1",
+      "j2"
+    ],
+    "position": [
+      0.5,
+      -1.0
+    ],
+    "velocity": []
+  },
+  "little_endian": true,
+  "rosbags_version": "0.11.5",
+  "typename": "sensor_msgs/msg/JointState"
+}
