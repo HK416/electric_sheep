@@ -1,1 +1,4 @@
 * text=auto eol=lf
+# Raw frame/tensor goldens and fixtures: never eol-normalised, never text-scanned by hooks.
+tests/golden/**/*.bin binary
+tests/fixtures/**/*.bin binary

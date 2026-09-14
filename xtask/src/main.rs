@@ -58,12 +58,14 @@ fn is_gpu_skip(line: &str) -> bool {
 fn run_tests(root: &Path) -> bool {
     // `es-ros2/zenoh` (docs/packets/M3/W1b-ros2-zenoh-session.md): off by default (spec 4.2 —
     // `es` and any embedded consumer must not link zenoh), but the PR tier still builds, lints
-    // and runs the in-process loopback session tests against it.
+    // and runs the in-process loopback session tests against it. `es-env/render`
+    // (docs/packets/M5/V0b-render-in-the-loop.md): same precedent, so the render-in-the-loop
+    // golden and the GPU==CPU frame check are gated here rather than never.
     let args = [
         "test",
         "--workspace",
         "--features",
-        "es-ir/testing,es-ros2/zenoh",
+        "es-ir/testing,es-ros2/zenoh,es-env/render",
         "--",
         "--nocapture",
     ];
@@ -129,7 +131,7 @@ fn cmd_ci(root: &Path) -> bool {
                 "--workspace",
                 "--all-targets",
                 "--features",
-                "es-ros2/zenoh",
+                "es-ros2/zenoh,es-env/render",
                 "--",
                 "-D",
                 "warnings",
