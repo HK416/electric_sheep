@@ -48,8 +48,15 @@ const FIXTURE_TICKS: u64 = 120;
 const PERIOD: Duration = Duration::from_micros(1_000);
 const DT: f64 = 0.001;
 
-// Deliberate perturbations, all counted in *States received* so that the injected pattern is
-// the same whatever the host's sleep granularity turns out to be.
+// Deliberate perturbations, all placed by the count of *States received*, so that where they
+// land in the stream does not change with the host's sleep granularity.
+/// Wall-clock silence the controller keeps after sending an injected command — the late one and
+/// the `NaN` row. Without it the gate goes vacuous under host load: one tick bins every command
+/// that arrived since the last one and the highest `seq` wins (design note section 7.3 step 3),
+/// so an injection is judged only if nothing newer shares its bin. Counting that silence in
+/// States buys none, because a stalled loop hands the controller a backlog of States it consumes
+/// in microseconds; the silence has to be real time.
+const QUIET_AFTER_INJECTION: Duration = Duration::from_millis(12);
 /// Two commands are held back and released `LATE_BY` States later; one would be enough to
 /// prove the deadline-miss path, two give the gate margin on a host that happens to bin them
 /// differently.
@@ -226,8 +233,10 @@ fn command_for(obs_tick: PhysTick, n: u64) -> HilMsg<NJ, H> {
 
 /// The external controller: its own thread, its own socket, its own clock. Everything it does
 /// to the stream — delay, loss, the swapped pair, the late command, the `NaN`, the heartbeat
-/// gap — is driven by a fixed-seed xorshift and by the count of States it has seen, never by
-/// the host's wall clock, so the injected pattern does not change with timer granularity.
+/// gap — is placed by a fixed-seed xorshift and by the count of States it has seen, not by the
+/// host's wall clock. The one thing the wall clock decides is [`QUIET_AFTER_INJECTION`]: how
+/// long the controller stays silent after an injected command, which is what keeps that command
+/// the newest one in its tick bin under load.
 fn controller(link_addr: SocketAddr, stop: &AtomicBool) {
     let sock = UdpSocket::bind("127.0.0.1:0").expect("controller socket");
     sock.set_nonblocking(true).expect("non-blocking");
@@ -242,6 +251,7 @@ fn controller(link_addr: SocketAddr, stop: &AtomicBool) {
     let mut held: VecDeque<HilMsg<NJ, H>> = VecDeque::new();
     let mut swap_hold: Option<HilMsg<NJ, H>> = None;
     let mut next_hello = Instant::now();
+    let mut quiet_until = Instant::now();
     let mut tx = Vec::new();
     let mut rx = vec![0u8; wire::MAX_DATAGRAM];
 
@@ -274,12 +284,9 @@ fn controller(link_addr: SocketAddr, stop: &AtomicBool) {
                         enqueue(&mut queue, &mut last_due, &mut rng, HilMsg::Heartbeat);
                     }
                     // The two injections that must survive to be judged -- the late command
-                    // and the `NaN` row -- get a few States of silence around them, so the
-                    // link cannot supersede them with a fresher command in the same tick.
-                    let quiet = LATE_AT
-                        .iter()
-                        .any(|a| (a + LATE_BY..a + LATE_BY + 5).contains(&states))
-                        || (NAN_AT + 1..NAN_AT + 4).contains(&states);
+                    // and the `NaN` row -- are each followed by real-time silence, so the link
+                    // cannot supersede them with a fresher command in the same tick.
+                    let quiet = Instant::now() < quiet_until;
                     // 5 % loss: that answer is simply never produced. The `NaN` is exempt.
                     let send = !quiet && (states == NAN_AT || xorshift(&mut rng) % 20 != 0);
                     if send {
@@ -295,11 +302,15 @@ fn controller(link_addr: SocketAddr, stop: &AtomicBool) {
                                 // the newer one.
                                 enqueue(&mut queue, &mut last_due, &mut rng, msg);
                             }
+                            if states == NAN_AT {
+                                quiet_until = last_due + QUIET_AFTER_INJECTION;
+                            }
                         }
                     }
                     if LATE_AT.iter().any(|a| states == a + LATE_BY) {
                         if let Some(msg) = held.pop_front() {
                             enqueue(&mut queue, &mut last_due, &mut rng, msg);
+                            quiet_until = last_due + QUIET_AFTER_INJECTION;
                         }
                     }
                 }
@@ -605,11 +616,13 @@ impl Peer {
         self.buf.clone()
     }
 
-    fn put(&mut self, msg: &HilMsg<NJ, H>) {
+    /// Returns the exact datagram it sent, so a test can keep it the way a recorder would.
+    fn put(&mut self, msg: &HilMsg<NJ, H>) -> Vec<u8> {
         self.seq += 1;
         let (session, seq) = (self.session, self.seq);
         let bytes = self.frame(session, seq, msg);
         self.put_raw(&bytes);
+        bytes
     }
 
     fn put_raw(&mut self, bytes: &[u8]) {
@@ -628,18 +641,30 @@ impl Peer {
 /// Everything is settled with a sleep *before* the tick rather than by ticking until something
 /// arrives, so the tick at which each datagram lands is fixed and two runs of the same script
 /// produce the same log.
-fn handshake(link: &mut HilLink<NJ, H>, peer: &mut Peer, t: &mut u64) {
-    peer.put(&HilMsg::Hello {
+/// Returns the raw `Hello` datagram, which a passive recorder on the same host would also have.
+fn handshake(link: &mut HilLink<NJ, H>, peer: &mut Peer, t: &mut u64) -> Vec<u8> {
+    let hello = peer.put(&HilMsg::Hello {
         nj: NJ as u32,
         h: H as u32,
         deployment_hash: deployment_hash(),
     });
     settle();
     step(link, t);
-    match peer.recv() {
-        Some((hdr, HilMsg::HelloAck { .. })) => peer.session = hdr.session_id,
-        other => panic!("expected a HelloAck, got {other:?}"),
+    peer.session = recv_ack(peer);
+    hello
+}
+
+/// The session id of the next `HelloAck`, skipping the `State`s the link sends every tick.
+fn recv_ack(peer: &mut Peer) -> u64 {
+    for _ in 0..64 {
+        match peer.recv() {
+            Some((hdr, HilMsg::HelloAck { .. })) => return hdr.session_id,
+            // A `State`: the link sends one every tick, so they queue up ahead of the ack.
+            Some(_) => {}
+            None => break,
+        }
     }
+    panic!("expected a HelloAck");
 }
 
 fn settle() {
@@ -719,6 +744,80 @@ fn bad_tag_wrong_session_and_stale_seq_never_reach_the_plane() {
     assert_eq!(stats_bad.heartbeats, stats_clean.heartbeats);
     assert_eq!(plane_bad, plane_clean, "the plane's counters must be equal");
     assert_eq!(log_bad, log_clean, "the log must be byte-identical");
+}
+
+/// A recorded session must not replay (design note section 7.7, spec 25.1). The `Hello` rewinds
+/// `last_seq`, so freshness has to come from the session id.
+#[test]
+fn a_replayed_session_does_not_reach_the_plane() {
+    let log = SharedLog::default();
+    let mut link = new_link(&log, 100);
+    let mut peer = Peer::open(link.local_addr());
+    let mut t = 0u64;
+    // Everything a passive recorder on the same host would have kept.
+    let hello = handshake(&mut link, &mut peer, &mut t);
+    let first_session = peer.session;
+
+    let command = peer.put(&small_command(PhysTick(t)));
+    settle();
+    step(&mut link, &mut t);
+    let before = link.stats();
+    assert_eq!(before.commands, 1, "the live command reached the plane");
+
+    // The recorded `Hello`, byte for byte: still authentic, so the link accepts it.
+    peer.put_raw(&hello);
+    settle();
+    step(&mut link, &mut t);
+    let second_session = recv_ack(&mut peer);
+    assert_ne!(
+        second_session, first_session,
+        "a Hello must open a fresh session"
+    );
+
+    // The recorded `Command` is now authenticated under a dead session.
+    peer.put_raw(&command);
+    settle();
+    step(&mut link, &mut t);
+    let after = link.stats();
+    assert_eq!(
+        after.commands, before.commands,
+        "a replayed command must not reach the plane"
+    );
+    assert_eq!(after.rx_invalid, before.rx_invalid + 1);
+
+    link.finish().expect("trailer");
+}
+
+/// The fix must not break reconnection: after the new `Hello`, a freshly framed command on the
+/// new session is accepted as usual.
+#[test]
+fn a_second_hello_starts_a_clean_session() {
+    let log = SharedLog::default();
+    let mut link = new_link(&log, 100);
+    let mut peer = Peer::open(link.local_addr());
+    let mut t = 0u64;
+    let hello = handshake(&mut link, &mut peer, &mut t);
+
+    peer.put(&small_command(PhysTick(t)));
+    settle();
+    step(&mut link, &mut t);
+    assert_eq!(link.stats().commands, 1);
+
+    peer.put_raw(&hello);
+    settle();
+    step(&mut link, &mut t);
+    peer.session = recv_ack(&mut peer);
+
+    peer.put(&small_command(PhysTick(t)));
+    settle();
+    step(&mut link, &mut t);
+    assert_eq!(
+        link.stats().commands,
+        2,
+        "the controller can still reconnect"
+    );
+
+    link.finish().expect("trailer");
 }
 
 #[test]

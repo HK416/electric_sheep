@@ -333,6 +333,9 @@ offset  size  field
 
 - One message per datagram, ≤ 65,507 bytes (> 1,472 fragments on a 1,500 MTU link; documented,
   not forbidden).
+- `session_id` is regenerated on every accepted `Hello`; `0` only in `Hello` itself. Accepting a
+  `Hello` rewinds `last_seq`, so freshness is what stops a recorded `Hello` + `Command` pair from
+  replaying: under the new id every recorded datagram fails the session check (§25.1).
 - Dropped before `HilCore`, and counted: bad magic, version, length or tag, wrong session
   (`rx_invalid`); `seq ≤` last accepted (`rx_stale`). A `seq` gap adds to `rx_lost`.
 - f64 travel as `to_bits`: a NaN arrives as the same NaN and meets the plane's non-finite rule.

@@ -340,6 +340,9 @@ offset  size  field
 
 - datagram당 메시지 하나, ≤ 65,507바이트(1,500 MTU 링크에서 1,472바이트를 넘으면 조각남;
   문서화되어 있을 뿐 금지되지는 않음).
+- `session_id`는 accept된 모든 `Hello`마다 새로 생성된다; `0`은 `Hello` 자신에서만 쓰인다.
+  `Hello`를 accept하면 `last_seq`가 되감기므로, 기록된 `Hello` + `Command` 쌍의 재생을 막는 것은
+  이 신선함이다: 새 id 아래에서는 기록된 모든 datagram이 session 검사에서 탈락한다(§25.1).
 - `HilCore` 이전에 버려지고 카운트됨: 잘못된 magic, version, length, tag, 잘못된
   session(`rx_invalid`); `seq ≤` 마지막으로 accept된 값(`rx_stale`). `seq`에 gap이 있으면
   `rx_lost`에 더해진다.
