@@ -49,3 +49,28 @@ impl Contract {
         }
     }
 }
+
+/// The ACT fixture with the backbone trained from scratch.
+///
+/// `es_ir::learning::testing::act_like` declares `pretrained = true` — which is what ACT
+/// really is — and `lower_to_torch` now refuses that rather than silently ignoring it
+/// (packet `docs/packets/M5/V2b-observation-bake.md`). The IR fixture keeps telling the
+/// truth; the tests that put it through the lowering clear the one flag here, in one place.
+#[cfg(test)]
+pub(crate) fn act_from_scratch(
+    state_dim: u32,
+    feat: u32,
+    heads: u32,
+    horizon: u32,
+    execute: u32,
+    obs_window: u32,
+) -> LearningGraph {
+    let mut g =
+        es_ir::learning::testing::act_like(state_dim, feat, heads, horizon, execute, obs_window);
+    for node in g.nodes.nodes.values_mut() {
+        if let es_ir::learning::LearningNode::VisionEncoder { pretrained, .. } = node {
+            *pretrained = false;
+        }
+    }
+    g
+}

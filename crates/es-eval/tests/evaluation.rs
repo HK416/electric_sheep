@@ -1513,3 +1513,229 @@ fn the_frames_are_byte_identical_across_runs() {
     assert_eq!(runs[0].0, runs[1].0, "the frames moved between runs");
     assert_eq!(runs[0].1, runs[1].1, "the events moved between runs");
 }
+
+// --- packet M5/V2b: the training set goes through the same executor -------------------------
+
+/// A demo-shaped Observation IR: `StateInput -> Normalize{−1..1}` **and**
+/// `ImageInput -> Dequantize -> Normalize{0..1}`, which is the shape of
+/// `tests/fixtures/visible-learning/observation.toml`. The state input names the **body** the
+/// Task IR's `ObservationSpec` declares, not a joint, so it resolves through
+/// `ObsSource::JointState { body, dof }` — the one state reading a recorded dataset can feed.
+fn baked_observation_ir(task_ref: [u8; 32]) -> ObservationIr {
+    let body = scene().bodies[0].id;
+    let raw = PortType {
+        frame: Frame::Joint(body),
+        ..joint_ty(Unit::Angle)
+    };
+    let norm = PortType {
+        unit: Unit::Normalized { lo: -1.0, hi: 1.0 },
+        ..raw.clone()
+    };
+    let mut ir = image_observation_ir(task_ref);
+    let u8_image = ir.graph.nodes[&NodeId(0)].io().output.clone();
+    let f32_image = PortType {
+        elem: ElemType::F32,
+        shape: Shape::new([3, u64::from(IMG), u64::from(IMG)]),
+        image: u8_image.image.map(|mut i| {
+            i.dtype = es_ir::image::ImageDType::F32;
+            i
+        }),
+        ..u8_image.clone()
+    };
+    let scaled = PortType {
+        unit: Unit::Normalized { lo: 0.0, hi: 1.0 },
+        ..f32_image.clone()
+    };
+    ir.graph.insert(
+        NodeId(1),
+        ObservationNode::Dequantize {
+            io: Io::unary(u8_image, f32_image.clone()),
+        },
+    );
+    ir.graph.insert(
+        NodeId(2),
+        ObservationNode::Normalize {
+            stats: NormalizeStats::Range { lo: 0.0, hi: 1.0 },
+            io: Io::unary(f32_image, scaled.clone()),
+        },
+    );
+    ir.graph.insert(
+        NodeId(3),
+        ObservationNode::StateInput {
+            source: body,
+            io: Io::source(raw.clone()),
+        },
+    );
+    ir.graph.insert(
+        NodeId(4),
+        ObservationNode::Normalize {
+            stats: NormalizeStats::Range { lo: -1.0, hi: 1.0 },
+            io: Io::unary(raw, norm.clone()),
+        },
+    );
+    ir.graph.connect(NodeId(0), "out", NodeId(1), "in0");
+    ir.graph.connect(NodeId(1), "out", NodeId(2), "in0");
+    ir.graph.connect(NodeId(3), "out", NodeId(4), "in0");
+    ir.outputs = BTreeMap::from([
+        (
+            "rgb".to_owned(),
+            ObservationOutput {
+                port: PortRef::new(NodeId(2), "out"),
+                ty: scaled,
+            },
+        ),
+        (
+            "joint_state".to_owned(),
+            ObservationOutput {
+                port: PortRef::new(NodeId(4), "out"),
+                ty: norm,
+            },
+        ),
+    ]);
+    ir
+}
+
+/// A policy that keeps every observation map it was handed, so the test can compare what the
+/// *inference* path computed against what the bake computes from the same raw values.
+#[derive(Debug, Default)]
+struct RecordingPolicy {
+    seen: Vec<BTreeMap<String, Tensor>>,
+}
+
+impl PolicyRuntime for RecordingPolicy {
+    fn load(
+        &mut self,
+        _graph: &LearningGraph,
+        _weights: &WeightsSource,
+    ) -> Result<PolicyInfo, PolicyError> {
+        Err(PolicyError::NotLoaded)
+    }
+
+    fn infer(
+        &mut self,
+        inputs: &BTreeMap<String, Tensor>,
+    ) -> Result<BTreeMap<String, Tensor>, PolicyError> {
+        self.seen.push(inputs.clone());
+        let data: Vec<u8> = (0..H * NJ).flat_map(|_| 0.1f32.to_le_bytes()).collect();
+        Ok(BTreeMap::from([(
+            "action".to_owned(),
+            Tensor {
+                dtype: ElemType::F32,
+                shape: vec![H as u64, NJ as u64],
+                data,
+            },
+        )]))
+    }
+
+    fn info(&self) -> Option<&PolicyInfo> {
+        None
+    }
+
+    fn runtime_hash(&self) -> [u8; 32] {
+        [11; 32]
+    }
+}
+
+/// **The oracle of packet M5/V2b.** What `es dataset bake` writes for a frame is what
+/// `capture` serves the policy for that same frame — every port, every byte, for a whole run.
+///
+/// This is the test that would have failed before the packet: training fed the raw
+/// `observation.state` row where inference feeds `(q + 1) / 2`, and re-implemented
+/// `Op::Dequantize` in Python (design note section 7.6 finding 3, open question 11). There is
+/// no tolerance here on purpose — the two paths run the same `CpuPlan` over the same bytes, so
+/// "close" would mean one of them had grown a conversion of its own.
+#[test]
+fn a_baked_frame_is_bit_identical_to_what_capture_serves() {
+    let ir = one_suite(Vec::new());
+    let task = task_ir();
+    let obs = baked_observation_ir(task.task_hash().expect("task hashes"));
+
+    // The frame source is also the recorder: it is handed the very `StateView` `capture` reads,
+    // so the rows below are the rows the plan saw, not a re-simulation of them.
+    let mut recorded: Vec<(Vec<f64>, Vec<u8>)> = Vec::new();
+    let mut frames = |_: &LightOverride, _: &ModelInfo, state: &StateView<'_>| {
+        let q = state.qpos_of(0)[0];
+        let mut tile = vec![0_u8; IMG as usize * IMG as usize * 3];
+        for (i, byte) in tile.iter_mut().enumerate() {
+            *byte = (((q.abs() * 1000.0) as usize + i * 7) % 256) as u8;
+        }
+        recorded.push((state.qpos_of(0).to_vec(), tile.clone()));
+        Ok(tile)
+    };
+    let mut policy = RecordingPolicy::default();
+    Evaluation::run_with_frames::<FakeBackend, _, NJ, H>(
+        &ir,
+        &task,
+        &scene(),
+        &obs,
+        &mut policy,
+        &deployment_ir(),
+        FakeBackend::new,
+        &RunConfig::default(),
+        Some(&mut frames),
+        None,
+    )
+    .expect("the demo-shaped observation runs");
+
+    assert_eq!(
+        recorded.len(),
+        policy.seen.len(),
+        "one captured frame per inference"
+    );
+    assert!(recorded.len() >= N_EPISODES as usize, "{}", recorded.len());
+
+    let mut bake = es_eval::ObservationBake::new(&obs, &task).expect("the bake compiles");
+    let ports: Vec<String> = bake.outputs().map(|(n, _, _)| n.to_owned()).collect();
+    assert_eq!(ports, vec!["joint_state".to_owned(), "rgb".to_owned()]);
+    for (frame, ((state, tile), served)) in recorded.iter().zip(&policy.seen).enumerate() {
+        let baked = bake
+            .frame(state, &mut |_| Ok(tile.clone()))
+            .unwrap_or_else(|e| panic!("bake frame {frame}: {e}"));
+        assert_eq!(
+            baked, *served,
+            "frame {frame}: the bake and `capture` disagree. Training and inference would see \
+             different observations, which is exactly the defect packet M5/V2b closes."
+        );
+    }
+    // Non-vacuity: both nodes the old training path got wrong must actually fire here, or the
+    // assertion above would be comparing two copies of the raw input and would have passed
+    // before this packet too. `Normalize{−1..1}` maps `q` to `(q + 1) / 2`, which is the affine
+    // shift open question 11 names; `Dequantize` maps an HWC `u8` tile to CHW `f32 / 255`.
+    let last = policy.seen.last().expect("at least one inference");
+    let (raw_q, raw_tile) = recorded.last().expect("at least one frame");
+    let state_out = f32::from_le_bytes(last["joint_state"].data[..4].try_into().expect("4 bytes"));
+    assert!(
+        (f64::from(state_out) - f64::midpoint(raw_q[0], 1.0)).abs() < 1e-6,
+        "the state Normalize did not fire: {state_out} for q = {}",
+        raw_q[0]
+    );
+    assert_ne!(
+        last["rgb"].data, *raw_tile,
+        "the image Dequantize did not fire"
+    );
+    println!(
+        "RAN observation_bake_bit_identity: {} frames x {} ports, byte-equal; state Normalize \
+         and image Dequantize both fired",
+        recorded.len(),
+        ports.len()
+    );
+}
+
+/// An input that is read out of a loaded model has no reading in a recorded dataset. The bake
+/// says so at construction, naming the port, rather than guessing an offset into
+/// `observation.state` halfway through an episode.
+#[test]
+fn a_bake_refuses_an_input_the_dataset_cannot_feed() {
+    let task = task_ir();
+    // `observation_ir`'s `StateInput` names joint `j0`, which resolves through `ModelInfo::qpos`
+    // at inference and through nothing at all here.
+    let obs = observation_ir(task.task_hash().expect("task hashes"), None);
+    let err = es_eval::ObservationBake::new(&obs, &task).expect_err("a qpos input");
+    let EvalError::Plan(message) = &err else {
+        panic!("expected EvalError::Plan, got {err}");
+    };
+    assert!(
+        message.contains("there is no loaded model here: the frames are recorded"),
+        "{message}"
+    );
+}

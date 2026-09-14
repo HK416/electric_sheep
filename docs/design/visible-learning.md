@@ -451,17 +451,21 @@ Calling it "ACT" in the demo would be a small lie; the design note and the packe
 Three steps, with the Rust/Python line exactly where §2.3 puts it:
 
 ```
-es policy lower --policy untrained.esb --out build/
-<py> python/es/train_act.py --module build/ --dataset ds/ --out model.safetensors
-es policy pack --policy untrained.esb --weights model.safetensors --out trained.esb
+es policy lower   --policy untrained.esb --out build/
+es dataset bake   --policy untrained.esb --out baked/ --frames tiles/ ds/     # V2b
+<py> python/es/train_act.py --module build/ --baked baked/ --out model.safetensors
+es policy pack    --policy untrained.esb --weights model.safetensors --out trained.esb
 ```
+
+(The `bake` line is V2b's; section 7.9 says why V2's three steps were not enough.)
 
 - `lower` writes `TorchModule.source` verbatim plus `contract.json` — the `weight_keys` and
   `weight_shapes` the lowering declares (`crates/es-policy/src/lower/torch.rs:297`) and the
   `lowering_hash`.
-- `train_act.py` `exec`s that source, builds `EsPolicy()`, reads the LeRobot v2.1 dataset, runs the
-  optimizer, and writes `safetensors` **keyed exactly by `contract.json`**. It knows nothing about the IR
-  and is not allowed to define a layer.
+- `bake` runs every recorded frame through the bundle's own Observation IR (V2b, section 7.9).
+- `train_act.py` `exec`s that source, builds `EsPolicy()`, reads the **baked** observation set, runs the
+  optimizer, and writes `safetensors` **keyed exactly by `contract.json`**. It knows nothing about the IR,
+  is not allowed to define a layer, and after V2b implements no Observation IR node either.
 - `pack` reads the safetensors, checks every key and shape against the contract, refuses anything else,
   and rewrites the bundle with the new `weights.safetensors` and a recomputed manifest
   (`crates/es-compile/src/bundle.rs:467`, `:513`). `safetensors` only; no pickle path is added anywhere

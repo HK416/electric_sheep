@@ -446,16 +446,20 @@ impratio="10"/>`.
 세 단계, Rust/Python 선은 정확히 §2.3이 두는 자리에:
 
 ```
-es policy lower --policy untrained.esb --out build/
-<py> python/es/train_act.py --module build/ --dataset ds/ --out model.safetensors
-es policy pack --policy untrained.esb --weights model.safetensors --out trained.esb
+es policy lower   --policy untrained.esb --out build/
+es dataset bake   --policy untrained.esb --out baked/ --frames tiles/ ds/     # V2b
+<py> python/es/train_act.py --module build/ --baked baked/ --out model.safetensors
+es policy pack    --policy untrained.esb --weights model.safetensors --out trained.esb
 ```
+
+(`bake` 줄은 V2b의 것이다. V2의 세 단계로 왜 충분하지 않았는지는 섹션 7.9.)
 
 - `lower`는 `TorchModule.source`를 그대로 쓰고, 더해서 `contract.json` — 로워링이 선언하는
   `weight_keys`와 `weight_shapes` (`crates/es-policy/src/lower/torch.rs:297`), 그리고 `lowering_hash`.
-- `train_act.py`는 그 소스를 `exec`하고 `EsPolicy()`를 만들고 LeRobot v2.1 데이터셋을 읽고 옵티마이저를
-  돌린 뒤 **`contract.json`의 키로만** `safetensors`를 쓴다. IR에 대해 아무것도 모르며 레이어를 정의할
-  권한이 없다.
+- `bake`는 기록된 모든 프레임을 번들 자신의 Observation IR로 통과시킨다 (V2b, 섹션 7.9).
+- `train_act.py`는 그 소스를 `exec`하고 `EsPolicy()`를 만들고 **구운** 관측 세트를 읽고
+  옵티마이저를 돌린 뒤 **`contract.json`의 키로만** `safetensors`를 쓴다. IR에 대해 아무것도
+  모르며 레이어를 정의할 권한이 없고, V2b 이후에는 Observation IR 노드도 구현하지 않는다.
 - `pack`은 safetensors를 읽어 모든 키와 모양을 컨트랙트와 대조하고, 그 외 무엇이든 거부하며, 새
   `weights.safetensors`와 재계산된 매니페스트로 번들을 다시 쓴다 (`crates/es-compile/src/bundle.rs:467`,
   `:513`). `safetensors`만 쓰고 어디에도 pickle 경로를 추가하지 않으며 (INV-16), `WeightsSource`에

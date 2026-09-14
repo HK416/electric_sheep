@@ -352,7 +352,9 @@ fn learning_graph() -> LearningGraph {
         LearningNode::VisionEncoder {
             inputs: vec![rgb.clone()],
             backbone: VisionBackbone::ResNet18,
-            pretrained: true,
+            // From scratch: `lower_to_torch` refuses `true` rather than ignoring it, and this
+            // fixture is lowered (packet M5/V2b).
+            pretrained: false,
             frozen: false,
             out_dim: feat,
             token_count: 0,
@@ -4088,4 +4090,166 @@ fn visible_learning_demo_run() {
         "non-vacuity: the Safety Plane never clamped, so the overlay shows nothing"
     );
     println!("RAN visible_learning_demo_run");
+}
+
+// --- packet M5/V2b: `es dataset bake` ------------------------------------------------------
+
+/// The demo's own `observation.state` / `action` widths, and a tile the demo `ImageSpec` fits.
+const BAKE_DOF: usize = 6;
+const BAKE_TILE: usize = 96 * 96 * 3;
+
+/// Two short episodes with the columns the demo reads, plus the flat `<NNNNNN>.bin` tiles
+/// `es loop collect --frames` writes beside them.
+fn write_bake_fixture(root: &Path, tiles: &Path, episodes: u32, frames: usize) {
+    let mut features = BTreeMap::new();
+    features.insert(
+        "observation.state".to_owned(),
+        FeatureSpec::new(Dtype::Float32, [BAKE_DOF as u64]),
+    );
+    features.insert(
+        "action".to_owned(),
+        FeatureSpec::new(Dtype::Float32, [BAKE_DOF as u64]),
+    );
+    let mut writer = LeRobotWriter::create(root, Info::new(50.0, features)).expect("create");
+    std::fs::create_dir_all(tiles).expect("tiles dir");
+    let mut global = 0usize;
+    for index in 0..episodes {
+        let mut columns = BTreeMap::new();
+        // A ramp inside the joint range, so `Normalize{Range -1..1}` has something to move.
+        columns.insert(
+            "observation.state".to_owned(),
+            Column::F32(
+                (0..frames * BAKE_DOF)
+                    .map(|i| (i as f32 % 7.0) / 7.0 - 0.5)
+                    .collect(),
+            ),
+        );
+        columns.insert(
+            "action".to_owned(),
+            Column::F32(
+                (0..frames * BAKE_DOF)
+                    .map(|i| (i % 5) as f32 * 0.1)
+                    .collect(),
+            ),
+        );
+        writer
+            .write_episode(&Episode {
+                index,
+                tasks: vec!["bake".to_owned()],
+                timestamps: (0..frames).map(|i| i as f64 / 50.0).collect(),
+                task_index: vec![0; frames],
+                columns,
+                video: BTreeMap::new(),
+            })
+            .expect("write episode");
+        for _ in 0..frames {
+            let tile: Vec<u8> = (0..BAKE_TILE)
+                .map(|i| ((i + global * 13) % 256) as u8)
+                .collect();
+            std::fs::write(tiles.join(format!("{global:06}.bin")), &tile).expect("tile");
+            global += 1;
+        }
+    }
+    writer.finish().expect("finish");
+}
+
+/// `es dataset bake` writes one safetensors per episode under the Observation IR's own output
+/// names, plus a manifest that says which documents produced them (packet M5/V2b, spec 19.2).
+#[test]
+fn dataset_bake_writes_safetensors_and_a_manifest() {
+    let dir = scratch_dir("dataset-bake");
+    let bundle = write_demo_bundle(&dir);
+    let (root, tiles, out) = (dir.join("ds"), dir.join("tiles"), dir.join("baked"));
+    let (episodes, frames) = (2u32, 3usize);
+    write_bake_fixture(&root, &tiles, episodes, frames);
+
+    let result = bin()
+        .args([
+            "dataset",
+            "bake",
+            "--policy",
+            bundle.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--frames",
+            tiles.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run es dataset bake");
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(result.status.code(), Some(0), "{printed}");
+
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("manifest.json")).expect("manifest.json"),
+    )
+    .expect("manifest.json parses");
+    assert_eq!(manifest["frames"].as_u64(), Some(6));
+    assert_eq!(manifest["episodes"].as_array().map(Vec::len), Some(2));
+    // The manifest names the Observation IR that produced the tensors, taken from the bundle
+    // rather than re-derived -- so a baked set and the bundle that evaluates it cannot drift.
+    let opened = es_compile::PolicyBundle::open(&std::fs::read(&bundle).expect("read bundle"))
+        .expect("the bundle opens");
+    let expected = opened
+        .manifest
+        .hashes
+        .observation
+        .expect("observation_hash");
+    assert_eq!(
+        manifest["observation_hash"].as_str(),
+        Some(hex(&expected).as_str()),
+        "{manifest}"
+    );
+
+    let header = es_policy::weights::parse_header(
+        &std::fs::read(out.join("episode_000000.safetensors")).expect("episode 0"),
+    )
+    .expect("the baked file is safetensors");
+    let shape = |name: &str| header.get(name).map(|e| e.shape.clone());
+    assert_eq!(shape("joint_state"), Some(vec![frames as u64, 6]));
+    assert_eq!(
+        shape("rgb_overhead"),
+        Some(vec![frames as u64, 3, 96, 96]),
+        "the image output is CHW f32, which is `Dequantize`'s output and not the raw tile"
+    );
+    assert_eq!(shape("action"), Some(vec![frames as u64, 6]));
+    assert!(out.join("episode_000001.safetensors").is_file());
+}
+
+/// An image input with no pixels is refused, naming the port. Baking zeros there would produce
+/// a file that looks complete and trains a policy on a blank camera (design note section 7.6).
+#[test]
+fn dataset_bake_without_frames_refuses_an_image_observation() {
+    let dir = scratch_dir("dataset-bake-nopix");
+    let bundle = write_demo_bundle(&dir);
+    let (root, tiles, out) = (dir.join("ds"), dir.join("tiles"), dir.join("baked"));
+    write_bake_fixture(&root, &tiles, 1, 2);
+
+    let result = bin()
+        .args([
+            "dataset",
+            "bake",
+            "--policy",
+            bundle.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run es dataset bake");
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(result.status.code(), Some(1), "{printed}");
+    assert!(printed.contains("--frames was not given"), "{printed}");
+    assert!(
+        !out.join("episode_000000.safetensors").is_file(),
+        "a refused bake left a file behind"
+    );
 }

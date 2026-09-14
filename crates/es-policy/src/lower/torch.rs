@@ -549,13 +549,33 @@ impl Lowering {
         let k = id.0;
         match node {
             LearningNode::VisionEncoder {
-                backbone, out_dim, ..
+                backbone,
+                out_dim,
+                pretrained,
+                ..
             } => {
                 let name = match backbone {
                     VisionBackbone::ResNet18 => "resnet18",
                     VisionBackbone::ResNet34 => "resnet34",
                     other => return Err(unsupported("VisionEncoder", other)),
                 };
+                // Refused rather than ignored (design note section 7.6, open question 6).
+                // Honouring it is `weights="DEFAULT"` in `_backbone` -- one line, and the wrong
+                // one: it makes `EsPolicy()` fetch ImageNet weights over the network at every
+                // construction, including inside `TorchRuntime::load` at inference, where
+                // `load_state_dict(strict=True)` overwrites every one of them a moment later. A
+                // lowering that needs the network to instantiate contradicts spec 2.5, and
+                // weights nobody hashed are outside the chain (spec 5.3).
+                if *pretrained {
+                    return Err(LowerError::Unsupported(
+                        "VisionEncoder{pretrained = true}: this lowering initializes the \
+                         backbone from scratch and has no network-free way to obtain ImageNet \
+                         weights, nor a hash slot that would cover them (spec 2.5, 5.3). Set \
+                         pretrained = false, or pack the initial weights into the bundle's own \
+                         checkpoint (WeightsRef) and load them through `es policy pack`."
+                            .to_owned(),
+                    ));
+                }
                 self.needs_torchvision = true;
                 self.member(id, &format!("_backbone({name:?}, {out_dim})"));
                 self.claim(id);
@@ -887,10 +907,10 @@ fn json_f32s(values: &[f32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use es_ir::learning::testing::act_like;
+    use crate::lower::act_from_scratch;
 
     fn act() -> LearningGraph {
-        act_like(8, 512, 8, 50, 20, 1)
+        act_from_scratch(8, 512, 8, 50, 20, 1)
     }
 
     #[test]
@@ -907,7 +927,7 @@ mod tests {
     #[test]
     fn a_different_architecture_moves_the_lowering_hash() {
         let a = lower_to_torch(&act()).unwrap();
-        let b = lower_to_torch(&act_like(8, 256, 8, 50, 20, 1)).unwrap();
+        let b = lower_to_torch(&act_from_scratch(8, 256, 8, 50, 20, 1)).unwrap();
         assert_ne!(a.lowering_hash, b.lowering_hash);
     }
 
@@ -984,6 +1004,37 @@ mod tests {
             matches!(&err, LowerError::Unsupported(k) if k.starts_with("PolicyHead{Discrete")),
             "{err}"
         );
+    }
+
+    /// V2's open question 6, answered by refusal (packet M5/V2b).
+    ///
+    /// The lowering used to read `pretrained` and drop it, so the IR said "pretrained" and the
+    /// module trained from scratch. Either is defensible; disagreeing silently is not.
+    #[test]
+    fn a_pretrained_vision_encoder_is_refused_not_ignored() {
+        let mut g = act();
+        let LearningNode::VisionEncoder { pretrained, .. } =
+            g.nodes.nodes.get_mut(&NodeId(0)).unwrap()
+        else {
+            unreachable!()
+        };
+        *pretrained = true;
+        let err = lower_to_torch(&g).unwrap_err();
+        let LowerError::Unsupported(message) = &err else {
+            panic!("expected Unsupported, got {err}");
+        };
+        assert!(
+            message.starts_with("VisionEncoder{pretrained = true}") && message.contains("spec 2.5"),
+            "{message}"
+        );
+        // And the flag is the only thing standing in the way: cleared, the same graph lowers.
+        let LearningNode::VisionEncoder { pretrained, .. } =
+            g.nodes.nodes.get_mut(&NodeId(0)).unwrap()
+        else {
+            unreachable!()
+        };
+        *pretrained = false;
+        assert!(lower_to_torch(&g).is_ok());
     }
 
     // --- sampler heads (design note section 8) ----------------------------------------------

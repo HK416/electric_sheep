@@ -117,7 +117,12 @@ port = "joint_state"
 backbone = "ResNet18"
 frozen = false
 out_dim = 512
-pretrained = true
+# From scratch, and now said out loud. V2 declared `true` and the lowering ignored it, so the
+# demo trained from scratch anyway (design note section 7.6); V2b makes `lower_to_torch` refuse
+# `true` rather than ignore it, and this is the flag that was always the truth. It moves
+# `learning_hash` and `policy_hash`; `task_hash` and `observation_hash` do not move, so the
+# baked observation set and `evaluation.toml` are unaffected.
+pretrained = false
 token_count = 0
 
 [[body.nodes.nodes.0.VisionEncoder.inputs]]

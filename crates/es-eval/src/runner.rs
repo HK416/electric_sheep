@@ -323,7 +323,7 @@ impl Evaluation {
                     env.model(),
                     frames.is_some(),
                 )?);
-                sources = Some(input_sources(&plan, obs, task, env.model())?);
+                sources = Some(input_sources(&plan, obs, task, Some(env.model()))?);
                 caps = Some(backend_caps(&env));
             }
             let perturbations = perturbations.as_ref().expect("just compiled");
@@ -627,7 +627,7 @@ type Captured = (Vec<(String, ElemType, Vec<u64>)>, Vec<Vec<u8>>, Option<u64>);
 /// Resolved once, against the *documents* rather than guessed per step: an input is an image
 /// because the Observation IR says `ImageInput`, not because nothing else matched it.
 #[derive(Clone, Copy, Debug)]
-enum Capture {
+pub(crate) enum Capture {
     /// One joint's `qpos` range in the loaded model.
     Qpos(es_physics_core::backend::IndexRange),
     Sensor(es_physics_core::backend::IndexRange),
@@ -642,11 +642,15 @@ enum Capture {
 
 /// Resolves every plan input **before the first episode**, so an observation this build
 /// cannot capture is one error at the start of the run rather than a surprise mid-table.
-fn input_sources(
+///
+/// `model` is `None` when the frames are *recorded* rather than simulated (`crate::bake`): a
+/// dataset carries `observation.state` and tiles, so the two arms that index a loaded model
+/// have no reading there and the input is refused by name instead of guessed at.
+pub(crate) fn input_sources(
     plan: &CpuPlan,
     obs: &ObservationIr,
     task: &TaskIr,
-    model: &ModelInfo,
+    model: Option<&ModelInfo>,
 ) -> Result<BTreeMap<String, Capture>, EvalError> {
     use es_ir::task::ObsSource;
 
@@ -670,17 +674,23 @@ fn input_sources(
             });
         let how = if is_image {
             Capture::Image
-        } else if let Some(r) = model.qpos.get(&source) {
+        } else if let Some(r) = model.and_then(|m| m.qpos.get(&source)) {
             Capture::Qpos(*r)
-        } else if let Some(r) = model.sensor.get(&source) {
+        } else if let Some(r) = model.and_then(|m| m.sensor.get(&source)) {
             Capture::Sensor(*r)
         } else if let Some(dof) = joints {
             Capture::Joints(dof)
         } else {
+            let model = if model.is_some() {
+                "a joint or sensor of the loaded model, "
+            } else {
+                // No model here means recorded frames, and saying "the loaded model" would
+                // send the reader looking for a scene that this path never opens.
+                "(there is no loaded model here: the frames are recorded) "
+            };
             return Err(EvalError::Plan(format!(
-                "observation input \"{name}\" is none of: a joint or sensor of the loaded \
-                 model, an ImageInput of the Observation IR, or a JointState channel of the \
-                 Task IR's ObservationSpec"
+                "observation input \"{name}\" is none of: {model}an ImageInput of the \
+                 Observation IR, or a JointState channel of the Task IR's ObservationSpec"
             )));
         };
         out.insert(name.clone(), how);
@@ -755,33 +765,47 @@ fn capture(
                 continue;
             }
         };
-        if values.len() != desc.elems {
-            return Err(EvalError::Plan(format!(
-                "observation input \"{name}\": the plan wants {} elements, the model supplies {}",
-                desc.elems,
-                values.len()
-            )));
-        }
-        let data = match desc.dtype {
-            ElemType::F32 => values
-                .iter()
-                .flat_map(|v| (*v as f32).to_le_bytes())
-                .collect(),
-            ElemType::F64 => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
-            other => {
-                return Err(EvalError::Plan(format!(
-                    "observation input \"{name}\" is {other:?}; state capture produces floats"
-                )))
-            }
-        };
         descs.push((name.clone(), desc.dtype, desc.shape.clone()));
-        bytes.push(data);
+        bytes.push(encode_state(name, desc.dtype, desc.elems, &values)?);
     }
     Ok((descs, bytes, rendered))
 }
 
+/// State values into one plan input buffer.
+///
+/// The one place this conversion happens. `crate::bake` calls it with a recorded
+/// `observation.state` row where [`capture`] calls it with a live `qpos` slice, so a training
+/// input and an inference input cannot be two different roundings of the same number
+/// (design note `docs/design/visible-learning.md` section 7.9).
+pub(crate) fn encode_state(
+    name: &str,
+    dtype: ElemType,
+    elems: usize,
+    values: &[f64],
+) -> Result<Vec<u8>, EvalError> {
+    if values.len() != elems {
+        return Err(EvalError::Plan(format!(
+            "observation input \"{name}\": the plan wants {elems} elements, the source supplies \
+             {}",
+            values.len()
+        )));
+    }
+    Ok(match dtype {
+        ElemType::F32 => values
+            .iter()
+            .flat_map(|v| (*v as f32).to_le_bytes())
+            .collect(),
+        ElemType::F64 => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+        other => {
+            return Err(EvalError::Plan(format!(
+                "observation input \"{name}\" is {other:?}; state capture produces floats"
+            )))
+        }
+    })
+}
+
 /// Bytes one element of `e` occupies in a plan buffer.
-fn elem_bytes(e: ElemType) -> usize {
+pub(crate) fn elem_bytes(e: ElemType) -> usize {
     match e {
         ElemType::F32 | ElemType::I32 => 4,
         ElemType::F16 | ElemType::Bf16 => 2,

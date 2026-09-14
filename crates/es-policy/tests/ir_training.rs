@@ -225,11 +225,18 @@ fn train_act_defines_no_layer() {
         "torchvision",
         "torch.load",
         "pickle",
+        // Packet M5/V2b: no Observation IR node has a second implementation here. `permute` and
+        // `/ 255` were `Op::Dequantize` by hand, and `pyarrow` was the raw dataset read that
+        // bypassed the plan. The observation comes from `es dataset bake` or it does not come.
+        "permute(",
+        "/ 255",
+        "pyarrow",
     ] {
         assert!(
             !source.contains(forbidden),
             "python/es/train_act.py contains `{forbidden}`: the architecture comes from the \
-             lowering or it does not come (and weights are safetensors only, INV-16)"
+             lowering and the observation from the Observation IR, or they do not come (and \
+             weights are safetensors only, INV-16)"
         );
     }
     println!("RAN no_layer: {} lines scanned", source.lines().count());
@@ -366,23 +373,30 @@ fn python_with_torch() -> Result<String, String> {
     ))
 }
 
-/// A `LeRobot` v2.1 dataset of two short episodes, written the way `es loop collect` writes one
-/// (`docs/api-notes/lerobot-dataset.md`): `meta/` plus one 3-level-list parquet per episode.
+/// A `LeRobot` v2.1 dataset of two short episodes plus the flat `<NNNNNN>.bin` tiles
+/// `es loop collect --frames` writes beside one, in the layout
+/// `docs/api-notes/lerobot-dataset.md` records: `meta/` plus one 3-level-list parquet per
+/// episode. argv is `<dataset root> <tiles dir>`.
 ///
 /// Written through `pyarrow` rather than `es-data`, because `es-data` is layer 10 and this
-/// crate is layer 8 (spec 4.2). The rows are a ramp, so there is something for L1 to fit.
+/// crate is layer 8 (spec 4.2). The rows are a ramp, so there is something for L1 to fit, and
+/// the tiles are a per-frame pattern so the image branch is not a constant either.
 const MINI_DATASET_PY: &str = r#"
 import json, os, sys
 import pyarrow as pa, pyarrow.parquet as pq
-root, episodes, frames, state_w, action_w = sys.argv[1], 2, 24, 25, 6
+root, tiles, episodes, frames, state_w, action_w = sys.argv[1], sys.argv[2], 2, 24, 25, 6
+tile_bytes = 96 * 96 * 3
 os.makedirs(os.path.join(root, "meta"), exist_ok=True)
 os.makedirs(os.path.join(root, "data", "chunk-000"), exist_ok=True)
+os.makedirs(tiles, exist_ok=True)
+feature = lambda w: {"dtype": "float32", "shape": [w]}
 info = {
     "codebase_version": "v2.1", "robot_type": "es", "total_episodes": episodes,
     "total_frames": episodes * frames, "total_tasks": 1, "total_videos": 0,
     "total_chunks": 1, "chunks_size": 1000, "fps": 50.0, "splits": {"train": "0:%d" % episodes},
     "data_path": "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
-    "video_path": None, "features": {},
+    "video_path": None,
+    "features": {"observation.state": feature(state_w), "action": feature(action_w)},
 }
 json.dump(info, open(os.path.join(root, "meta", "info.json"), "w"))
 with open(os.path.join(root, "meta", "episodes.jsonl"), "w") as h:
@@ -396,10 +410,14 @@ for e in range(episodes):
         phase = (t + 4 * e) / float(frames)
         state.append([0.30 * phase * (1 + (i % 3)) for i in range(state_w)])
         action.append([0.30 * phase * (1 + (i % 3)) for i in range(action_w)])
+    column = lambda rows: pa.array(rows, type=pa.list_(pa.float32()))
     pq.write_table(
-        pa.table({"observation.state": state, "action": action}),
+        pa.table({"observation.state": column(state), "action": column(action)}),
         os.path.join(root, "data", "chunk-000", "episode_%06d.parquet" % e),
     )
+for i in range(episodes * frames):
+    tile = bytes(((j + 13 * i) % 256) for j in range(tile_bytes))
+    open(os.path.join(tiles, "%06d.bin" % i), "wb").write(tile)
 "#;
 
 fn run(python: &str, args: &[&str]) -> std::process::Output {
@@ -420,12 +438,18 @@ fn train_act_py() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/es/train_act.py")
 }
 
-/// Facts 3 and 4 in one run, because fact 4 needs fact 3's checkpoint: train on a tiny fixed
-/// dataset with a fixed seed, require the loss to fall, pack the result, and put it through
-/// `TorchRuntime` and `es eval run`.
+/// Facts 3 and 4 in one run, because fact 4 needs fact 3's checkpoint: bake a tiny fixed
+/// dataset through the bundle's own Observation IR, train on **that** with a fixed seed,
+/// require the loss to fall, pack the result, and put it through `TorchRuntime`.
+///
+/// The bake is not a step in the way; it is what makes the run honest (packet M5/V2b). V2
+/// trained on the raw `observation.state` row and a Python copy of `Op::Dequantize`, so the
+/// module saw one observation in training and another at inference. What `train_act.py` reads
+/// here is byte-for-byte what `capture` computes, which `es-eval`'s
+/// `a_baked_frame_is_bit_identical_to_what_capture_serves` pins without an interpreter.
 #[test]
 #[ignore = "needs torch, torchvision and pyarrow"]
-fn the_loss_falls_and_the_packed_bundle_round_trips() {
+fn act_training_uses_baked_observations() {
     let python = match python_with_torch() {
         Ok(p) => p,
         Err(why) => {
@@ -437,11 +461,30 @@ fn the_loss_falls_and_the_packed_bundle_round_trips() {
     let (path, bundle) = demo_bundle(&dir);
     let (build, contract) = lowered(&dir, &path);
 
-    let dataset = dir.join("ds");
+    let (dataset, tiles, baked) = (dir.join("ds"), dir.join("tiles"), dir.join("baked"));
     run(
         &python,
-        &["-c", MINI_DATASET_PY, &dataset.to_string_lossy()],
+        &[
+            "-c",
+            MINI_DATASET_PY,
+            &dataset.to_string_lossy(),
+            &tiles.to_string_lossy(),
+        ],
     );
+
+    // --- the observation, exactly once, in Rust ------------------------------------------
+    let bake = es(&[
+        "dataset",
+        "bake",
+        "--policy",
+        &path.to_string_lossy(),
+        "--out",
+        &baked.to_string_lossy(),
+        "--frames",
+        &tiles.to_string_lossy(),
+        &dataset.to_string_lossy(),
+    ]);
+    assert_eq!(bake.status.code(), Some(0), "{}", text(&bake));
 
     // --- fact 3: it learns something ---------------------------------------------------
     let weights = dir.join("model.safetensors");
@@ -451,8 +494,8 @@ fn the_loss_falls_and_the_packed_bundle_round_trips() {
             &train_act_py().to_string_lossy(),
             "--module",
             &build.to_string_lossy(),
-            "--dataset",
-            &dataset.to_string_lossy(),
+            "--baked",
+            &baked.to_string_lossy(),
             "--out",
             &weights.to_string_lossy(),
             "--batch",
@@ -511,34 +554,32 @@ fn the_loss_falls_and_the_packed_bundle_round_trips() {
     // A held-out observation, written to disk so both sides read the same numbers rather than
     // recomputing them from two copies of one formula.
     //
-    // Every port `train_act.py` reported as zero-filled stays zero here. That is not a
-    // convenience: the dataset carries no pixels (design note section 7.6), so the image port
-    // saw nothing but zeros in training, every `BatchNorm2d` running variance in the backbone
-    // collapsed towards zero, and a non-zero image at inference is divided by the square root
-    // of that — twenty layers of it turns into `inf` and then `NaN`. Feeding the port what
-    // training fed it is the only in-distribution observation that exists until V3 writes
-    // frames; `joint_state` is genuinely held out.
-    let zero_filled: Vec<String> = report["zero_filled_inputs"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(ToOwned::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
+    // Every port gets real values now. V2 had to zero the image port here because the dataset
+    // carried no pixels, so every `BatchNorm2d` running variance in the backbone had collapsed
+    // towards zero and a non-zero image at inference turned into `inf` and then `NaN`. The bake
+    // feeds the image port the tiles, so there is no port left that saw only zeros in training
+    // and no reason to hand inference one.
     let held_out: BTreeMap<String, Vec<f32>> = contract
         .inputs
         .iter()
         .map(|(port, shape)| {
             let n = shape.iter().product::<u64>() as usize;
-            let values = if zero_filled.contains(port) {
-                vec![0.0f32; n]
-            } else {
-                (0..n).map(|i| (i % 23) as f32 / 23.0 - 0.5).collect()
-            };
+            let values = (0..n).map(|i| (i % 23) as f32 / 23.0).collect();
             (port.clone(), values)
         })
         .collect();
+    // The bake is what the module trained on, and the report says which plan produced it.
+    assert_eq!(
+        report["ports"].as_array().map(Vec::len),
+        Some(contract.inputs.len()),
+        "training fed a different set of ports than the contract declares: {line}"
+    );
+    assert!(
+        report["observation_hash"]
+            .as_str()
+            .is_some_and(|h| h.len() == 64),
+        "the baked manifest carried no observation_hash: {line}"
+    );
     let observation = dir.join("observation.json");
     std::fs::write(
         &observation,

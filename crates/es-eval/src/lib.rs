@@ -16,12 +16,14 @@
 //!   allow-list is [`EvalError::AugmentationEnabled`], and the graph is never rewritten to
 //!   get past either.
 
+pub mod bake;
 pub mod domain_gap;
 pub mod evidence;
 pub mod metrics;
 pub mod perturb;
 pub mod runner;
 
+pub use bake::ObservationBake;
 pub use metrics::compute;
 pub use perturb::{LightOverride, PerturbationPlan, ResetOverrides, StepState};
 pub use runner::{

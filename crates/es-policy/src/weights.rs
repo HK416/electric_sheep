@@ -180,13 +180,13 @@ pub fn hex(digest: &[u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lower::act_from_scratch;
     use crate::lower::lower_to_torch;
-    use es_ir::learning::testing::act_like;
 
     /// A checkpoint for the ACT fixture: every exact key at its declared shape, plus two
     /// tensors standing in for each opaque sub-module.
     fn act_checkpoint() -> (TorchModule, Checkpoint) {
-        let module = lower_to_torch(&act_like(8, 512, 8, 50, 20, 1)).unwrap();
+        let module = lower_to_torch(&act_from_scratch(8, 512, 8, 50, 20, 1)).unwrap();
         let mut file: Checkpoint = module
             .weight_shapes
             .iter()

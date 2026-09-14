@@ -1,4 +1,4 @@
-"""Optimize the module `es policy lower` emitted, and nothing else (M5 V2; spec 2.3, 8.1).
+"""Optimize the module `es policy lower` emitted, and nothing else (M5 V2/V2b; spec 2.3, 8.1).
 
 This script owns the optimizer and nothing above it. It `exec`s `<module dir>/es_policy.py` --
 the file `es_policy::lower::lower_to_torch` generated from the bundle's `LearningGraph` -- and
@@ -12,25 +12,30 @@ identity is `TrainingIdentity` (spec 19.2), which V2 does not populate.
 
 Usage:
 
-    train_act.py --module <dir> --dataset <root> --out model.safetensors
-                 [--frames <dir>] [--epochs N] [--batch N] [--lr F] [--seed N] [--device cpu]
+    train_act.py --module <dir> --baked <dir> --out model.safetensors
+                 [--epochs N] [--batch N] [--lr F] [--seed N] [--device cpu]
                  [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json]
 
 Prints one JSON line on stdout and nothing else:
 
     {"initial_loss": f, "final_loss": f, "steps": n, ...}
 
-Three things it deliberately does not do, all for the same reason the rest of the repo does not:
+**It implements no Observation IR node, and that is the point of V2b.** `--baked` is the output
+of `es dataset bake --policy <bundle.esb> --frames <tiles> <dataset>`, which ran every recorded
+frame through the *same* `CpuPlan` `es eval run` runs at inference (`es_eval::ObservationBake`).
+V2 read the LeRobot parquet directly and re-implemented `Op::Dequantize` here, and fed the state
+port the raw `observation.state` row -- while the demo's Observation IR puts a
+`Normalize{Range -1..1}` on it. The policy trained on `q` and was evaluated on `(q + 1) / 2`,
+and every success rate in design note section 7.8 is depressed by it (open question 11). Reading
+the bake is not a convenience: it is the only way the two paths cannot disagree.
 
-  * it reads and writes no format that can execute code on load (`INV-16`). The checkpoint it
-    writes is safetensors, in the same layout `crates/es-policy/src/weights.rs` implements, so
-    `es policy pack` and `torch_ref.py` both read it without the `safetensors` package being
-    installed;
-  * it does not use `lerobot.datasets.LeRobotDataset`: `lerobot` 0.6.1 refuses
-    `codebase_version: "v2.1"` outright (design note section 7.5) and this repo writes v2.1. It
-    reads the parquet files and `meta/` directly, with `pyarrow`;
+Two more things it deliberately does not do, both for the reason the rest of the repo does not:
+
+  * it reads and writes no format that can execute code on load (`INV-16`). Both the checkpoint
+    it writes and the baked set it reads are safetensors, in the layout
+    `crates/es-policy/src/weights.rs` implements, so no package beyond `torch` is needed;
   * it does no pre- or post-processing. Normalization, chunking and unnormalizing are IR nodes
-    and are already inside `es_policy.py` (spec 8.7).
+    and are already inside `es_policy.py` (spec 8.7) or inside the bake (spec 7.2).
 
 **The lowered module is single-sample.** `PolicyHead{Regression}` lowers to
 `.reshape(horizon, action_dim)` and `ActionChunker` to `[:execute_chunk]`, neither of which
@@ -59,112 +64,25 @@ def build_policy(module_dir: Path):
     return namespace["EsPolicy"]()
 
 
-def prod(shape) -> int:
-    out = 1
-    for d in shape:
-        out *= int(d)
+# --- safetensors, both ways (the layout crates/es-policy/src/weights.rs reads and writes) ----
+
+
+def read_safetensors(path: Path) -> dict:
+    """`name -> tensor`. F32 only, which is what the writer emits and what the bake refuses to
+    depart from; any other dtype here would mean two readers of one format."""
+    blob = path.read_bytes()
+    size = struct.unpack_from("<Q", blob, 0)[0]
+    header, base, out = json.loads(blob[8 : 8 + size]), 8 + size, {}
+    for name, entry in header.items():
+        if name == "__metadata__":
+            continue
+        if entry["dtype"] != "F32":
+            raise SystemExit("%s: %s is %s, not F32" % (path, name, entry["dtype"]))
+        a, b = entry["data_offsets"]
+        out[name] = torch.frombuffer(
+            bytearray(blob[base + a : base + b]), dtype=torch.float32
+        ).reshape(entry["shape"])
     return out
-
-
-# --- the dataset LeRobotWriter wrote (spec 13.2, docs/api-notes/lerobot-dataset.md) ---------
-
-
-def read_dataset(root: Path):
-    """Per episode: the `observation.state` rows and the `action` rows, in frame order."""
-    import pyarrow.parquet as pq
-
-    info = json.loads((root / "meta" / "info.json").read_text(encoding="utf-8"))
-    chunks_size = int(info.get("chunks_size", 1000))
-    template = info["data_path"]
-    episodes = [
-        json.loads(line)
-        for line in (root / "meta" / "episodes.jsonl").read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    states, actions = [], []
-    for episode in sorted(episodes, key=lambda e: e["episode_index"]):
-        index = int(episode["episode_index"])
-        path = root / template.format(
-            episode_chunk=index // chunks_size, episode_index=index, video_key=""
-        )
-        table = pq.read_table(path)
-        states.append(table.column("observation.state").to_pylist())
-        actions.append(table.column("action").to_pylist())
-    return states, actions
-
-
-def read_frames(frames_dir: Path, count: int):
-    """The raw tiles `es loop collect --frames` wrote: `<NNNNNN>.bin` plus a `.json` sidecar.
-
-    One per recorded control step, in dataset frame order, so tile `i` is row `i` of the
-    concatenated episodes. The sidecar is read, never assumed: a shape or dtype this does not
-    expect is a refusal, because a wrongly-reshaped image trains a policy that looks fine.
-    """
-    first = json.loads((frames_dir / "000000.json").read_text(encoding="utf-8"))
-    if first.get("dtype") != "u8" or len(first.get("shape", [])) != 3:
-        raise SystemExit("%s: expected a 3-D u8 tile, got %r" % (frames_dir, first))
-    h, w, c = (int(d) for d in first["shape"])
-    tiles = torch.empty((count, h, w, c), dtype=torch.uint8)
-    for i in range(count):
-        raw = (frames_dir / ("%06d.bin" % i)).read_bytes()
-        if len(raw) != h * w * c:
-            raise SystemExit(
-                "%s/%06d.bin: %d bytes for a %dx%dx%d tile" % (frames_dir, i, len(raw), h, w, c)
-            )
-        tiles[i] = torch.frombuffer(bytearray(raw), dtype=torch.uint8).reshape(h, w, c)
-    return tiles
-
-
-def dequantize(tile: torch.Tensor) -> torch.Tensor:
-    """HWC u8 -> CHW f32 / 255.
-
-    This is `ObservationNode::Dequantize` (`es_compile::plan::Op::Dequantize`), which at
-    inference runs inside the Observation IR's compiled plan. Training has no plan runner on
-    the Python side, so the one op is re-implemented here; it is the only place in this repo
-    where an IR node has a second implementation, and it is named in the design note as such.
-    If the demo's Observation IR ever grows a second node between the image port and the
-    Learning IR input, this stops being true and a real plan-bake step is needed.
-    """
-    return tile.permute(2, 0, 1).to(torch.float32) / 255.0
-
-
-def plan_inputs(contract: dict, state_width: int, have_frames: bool):
-    """Which graph input port is fed from where.
-
-    An input port whose element count fits inside an `observation.state` row is fed from the
-    front of that row -- which is the arm's own `qpos`, the joint state. Anything wider is an
-    image: fed from `--frames` when there is one, and otherwise fed zeros and named in the
-    output JSON, because a silently-zero input is the failure mode that looks like a trained
-    policy. `es loop collect` writes pixels only with `--frames` (design note section 7.6).
-    """
-    fed, images, zero_filled = [], [], []
-    for port, shape in sorted(contract["inputs"].items()):
-        shape = [int(d) for d in shape]
-        if prod(shape) <= state_width:
-            fed.append((port, shape, prod(shape)))
-        elif have_frames:
-            images.append((port, shape))
-        else:
-            zero_filled.append((port, shape))
-    return fed, images, zero_filled
-
-
-def make_samples(states, actions, chunk: int):
-    """One sample per frame: its `observation.state` row and the next `chunk` recorded actions.
-
-    The last action is repeated when the episode ends inside the horizon; dropping those frames
-    would drop exactly the part of the demonstration where the cube is released.
-    """
-    samples = []
-    for state_rows, action_rows in zip(states, actions):
-        n = len(state_rows)
-        for t in range(n):
-            target = [action_rows[min(t + k, n - 1)] for k in range(chunk)]
-            samples.append((state_rows[t], target))
-    return samples
-
-
-# --- safetensors out (the same layout crates/es-policy/src/weights.rs reads) ----------------
 
 
 def write_safetensors(path: Path, tensors: dict) -> None:
@@ -194,17 +112,61 @@ def checkpoint_tensors(model) -> dict:
     return out
 
 
+# --- the baked observation set (`es dataset bake`, spec 7.2, 19.2) ---------------------------
+
+
+def read_baked(baked: Path, ports: dict) -> tuple:
+    """Every episode's baked tensors, in manifest order, plus the total frame count.
+
+    A contract input with no baked tensor is a refusal, not a zero-filled port: a silently-zero
+    input is the failure mode that looks like a trained policy (design note section 7.6).
+    """
+    manifest = json.loads((baked / "manifest.json").read_text(encoding="utf-8"))
+    missing = sorted(set(ports) - set(manifest["tensors"]))
+    if missing:
+        raise SystemExit(
+            "%s bakes no tensor for %s; the module's inputs are %s and the bake produced %s. "
+            "Re-run `es dataset bake` against the same bundle."
+            % (baked, missing, sorted(ports), sorted(manifest["tensors"]))
+        )
+    episodes = []
+    for entry in manifest["episodes"]:
+        tensors = read_safetensors(baked / entry["file"])
+        n = int(entry["frames"])
+        for name, tensor in tensors.items():
+            if tensor.shape[0] != n:
+                raise SystemExit(
+                    "%s: %s has %d rows for %d frames" % (entry["file"], name, tensor.shape[0], n)
+                )
+        episodes.append(tensors)
+    return manifest, episodes
+
+
+def make_samples(episodes: list, chunk: int) -> list:
+    """One sample per frame: `(episode, t, [row indices of the next `chunk` actions])`.
+
+    The last action is repeated when the episode ends inside the horizon; dropping those frames
+    would drop exactly the part of the demonstration where the cube is released.
+    """
+    samples = []
+    for index, tensors in enumerate(episodes):
+        n = tensors["action"].shape[0]
+        for t in range(n):
+            samples.append((index, t, [min(t + k, n - 1) for k in range(chunk)]))
+    return samples
+
+
 # --- the loop -------------------------------------------------------------------------------
 
 
 def main(argv: list) -> int:
     p = argparse.ArgumentParser(description="train the lowered Learning IR module")
     p.add_argument("--module", required=True, type=Path)
-    p.add_argument("--dataset", required=True, type=Path)
     p.add_argument(
-        "--frames",
+        "--baked",
+        required=True,
         type=Path,
-        help="the <NNNNNN>.bin tiles `es loop collect --frames` wrote, in dataset frame order",
+        help="the output of `es dataset bake`: the dataset run through the Observation IR",
     )
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--epochs", type=int, default=1)
@@ -224,6 +186,7 @@ def main(argv: list) -> int:
     torch.manual_seed(a.seed)
     device = torch.device(a.device)
     contract = json.loads((a.module / "contract.json").read_text(encoding="utf-8"))
+    shapes = {port: [int(d) for d in shape] for port, shape in contract["inputs"].items()}
     model = build_policy(a.module).to(device)
 
     # The chunk width is the module's own: `ActionChunker` slices the head's horizon down to
@@ -231,29 +194,18 @@ def main(argv: list) -> int:
     model.eval()
     with torch.no_grad():
         probe = {
-            port: torch.zeros([int(d) for d in shape], dtype=torch.float32, device=device)
-            for port, shape in contract["inputs"].items()
+            port: torch.zeros(shape, dtype=torch.float32, device=device)
+            for port, shape in shapes.items()
         }
         out = model(**probe)
         if len(out) != 1:
             raise SystemExit("the lowered graph has %d outputs; V2 trains one" % len(out))
         chunk = int(next(iter(out.values())).shape[0])
 
-    states, actions = read_dataset(a.dataset)
-    if not states or not states[0]:
-        raise SystemExit("%s holds no frames" % a.dataset)
-    fed, images, zero_filled = plan_inputs(contract, len(states[0][0]), a.frames is not None)
-    samples = make_samples(states, actions, chunk)
-    tiles = read_frames(a.frames, len(samples)) if images else None
-    if tiles is not None and len(tiles) != len(samples):
-        raise SystemExit(
-            "%s holds %d frames for %d dataset rows" % (a.frames, len(tiles), len(samples))
-        )
-    # One shared tensor per pixel-less port: every step would build the same zeros otherwise,
-    # and 17k copies of a 96x96 image is a gigabyte of nothing.
-    zeros = {
-        port: torch.zeros(shape, dtype=torch.float32, device=device) for port, shape in zero_filled
-    }
+    manifest, episodes = read_baked(a.baked, shapes)
+    samples = make_samples(episodes, chunk)
+    if not samples:
+        raise SystemExit("%s holds no frames" % a.baked)
 
     marks = sorted({int(s) for s in a.checkpoint_at.split(",") if s.strip()})
     per_epoch = len(samples) // max(1, a.batch)
@@ -273,17 +225,13 @@ def main(argv: list) -> int:
             if cursor >= len(order):
                 order = torch.randperm(len(samples), generator=generator).tolist()
                 cursor = 0
-            row = order[cursor]
-            state_row, target_rows = samples[row]
+            index, t, rows = samples[order[cursor]]
             cursor += 1
-            inputs = dict(zeros)
-            for port, shape in images:
-                inputs[port] = dequantize(tiles[row].to(device)).reshape(shape)
-            for port, shape, count in fed:
-                inputs[port] = torch.tensor(
-                    state_row[:count], dtype=torch.float32, device=device
-                ).reshape(shape)
-            target = torch.tensor(target_rows, dtype=torch.float32, device=device)
+            tensors = episodes[index]
+            inputs = {
+                port: tensors[port][t].to(device).reshape(shape) for port, shape in shapes.items()
+            }
+            target = tensors["action"][rows].to(device)
             predicted = next(iter(model(**inputs).values()))
             loss = torch.nn.functional.l1_loss(predicted, target) / a.batch
             loss.backward()
@@ -310,8 +258,8 @@ def main(argv: list) -> int:
         "samples": len(samples),
         "batch": a.batch,
         "chunk": chunk,
-        "zero_filled_inputs": [port for port, _ in zero_filled],
-        "image_inputs": [port for port, _ in images],
+        "ports": sorted(shapes),
+        "observation_hash": manifest.get("observation_hash"),
     }
     sys.stdout.write(json.dumps(report) + "\n")
     return 0
