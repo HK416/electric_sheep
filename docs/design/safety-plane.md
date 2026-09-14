@@ -162,7 +162,7 @@ changes the recorded event, never the response.
 | 4 | `InferenceDeadline` | `micros_since(last_chunk_tick, now) > budget` — the budget measures how long the plane has gone without a fresh chunk |
 | 5 | `ControllerHeartbeat` | `micros_since(last_beat_tick, now) > timeout` |
 | 6 | `SensorDropout` | for any configured sensor, `micros_since(last_seen, now) > max_gap` |
-| 7 | `EnvelopeViolationRate` | `window.fraction() > max_frac`, using the window **as of the previous step** — this step's own clamp has not been recorded yet, which is what keeps the rule non-circular |
+| 7 | `EnvelopeViolationRate` | `window.fraction() > max_frac`, using the window **as of the previous step** — this step's own clamp has not been recorded yet, which is what keeps the rule non-circular — and the window never records this watchdog's own trip, which keeps it non-circular one step later too (P-M3-W1-R7) |
 
 **A partially filled window never trips** (P-M3-W1-R1). `window.fraction()` is
 `ones / window`, not `ones / steps-seen-so-far`, and reads `0.0` until the ring holds `window`
@@ -174,9 +174,22 @@ chunk, so `ChunkUnderrun` fires), but one transient clamp at step 3 of any deplo
 same. `window` is the warm-up period; there is no separate grace-period field, and §10.3's
 own example acceptance of `<= 0.01` only reads as written if the denominator is the window.
 
-Known ceiling, not fixed here: once the watchdog *has* tripped on a full window it does not
-release itself, because the fallback steps it causes are dirty and refill the window
-(`tests/properties.rs:a_tripped_rate_watchdog_does_not_release_itself` pins this).
+**The watchdog does not measure its own fallbacks** (P-M3-W1-R7). The window records a step as
+a violation iff it was dirty for a reason *other than* `ViolationRate`:
+`window.push(!events.without(ViolationRate).is_empty())`. Without that clause every step after
+the trip is a fallback step whose only event is the watchdog's own, the ring refills with that
+echo, `ones` never decays and the trip is permanent — a latch, for *every* fallback policy, that
+`is_latched()` does not report and `reset_latch()` cannot clear. With it, release is automatic
+and bounded: the watchdog stops firing at most `window` steps after the last genuine violation
+leaves the ring, which is what §18.5 ("a fallback is normal behaviour, not a failure") asks for.
+A step dirty for any real reason — a clamp, `NanInf`, `ChunkUnderrun`, `HeartbeatLoss`,
+`SensorDropout`, `StaleObservation`, `InferenceDeadline` — still counts, so a plane that keeps
+genuinely violating keeps the watchdog tripped. Only the watchdog's *input ring* changes:
+`dirty_steps`, `clamped_steps`, `fallback_activations`, `steps` and `violations[ViolationRate]`
+still count every fallback step including the watchdog's own, which is what §10.3's
+episode-level `envelope_violation_rate` in `es-eval` reads. `EmergencyStop` is untouched — §9.4
+attaches "latch" to that one policy, so a genuine rate trip still latches and only
+`reset_latch()` clears it (`tests/properties.rs:an_estop_rate_trip_still_latches`).
 
 `ChunkUnderrun` and `NanInf` are armed always. The other five are armed only if the IR lists
 them; an unlisted watchdog never trips, which is a configuration choice, not a disabled
@@ -189,8 +202,8 @@ control rate.
 then run it through the final scrub (non-finite → hold, then hard position clamp) so the
 fallback output is inside the envelope by the same rule as the policy output.
 `source = Fallback(kind)`, `fallback_activations += 1`. The violation window records this
-step as a violation. Per §18.5 this is *normal operation*: the env stays `Ok` and the event
-is recorded.
+step as a violation unless its only event was the rate watchdog's own trip (see row 7). Per
+§18.5 this is *normal operation*: the env stays `Ok` and the event is recorded.
 
 **Step 4b — clamp path** (nothing tripped). The candidate row is clamped in exactly this
 order, each stage recording its `ViolationKind` if it changed the value:
@@ -257,8 +270,10 @@ pub struct SafetyCounters {
 ```
 
 - `envelope_violation_rate()` — fraction of steps in the sliding window that were clamped,
-  projected or fell back. This is the §10.3 first-class metric, and it is the same number
-  the `EnvelopeViolationRate` watchdog reads. The window is a `[u64; 4]` bit ring (cap 256)
+  projected or fell back for a reason other than the rate watchdog itself (row 7). This is
+  the §10.3 first-class metric, and it is the same number the `EnvelopeViolationRate`
+  watchdog reads; `es-eval`'s episode-level metric of the same name is `dirty_steps / steps`
+  and does count every fallback step. The window is a `[u64; 4]` bit ring (cap 256)
   with a running ones-count, so the fraction is an integer ratio, not an accumulated float.
 - `chunk_underrun_rate()` — `violations[ChunkUnderrun] / steps` (§8.6, §10.3).
 - `violations[kind]` — per-kind counts for the `failure_mode_histogram` of §10.3.

@@ -153,6 +153,14 @@ impl EventSet {
         self.0
     }
 
+    /// This set with `kind` removed; removing an absent kind is the identity. The spec 9.4 rate
+    /// watchdog measures the window through this so it never measures its own trip
+    /// (P-M3-W1-R7).
+    #[must_use]
+    pub const fn without(self, kind: ViolationKind) -> Self {
+        Self(self.0 & !(1 << kind.index()))
+    }
+
     /// Every kind in the set, in [`ViolationKind::ALL`] order.
     pub fn iter(self) -> impl Iterator<Item = ViolationKind> {
         ViolationKind::ALL
@@ -173,5 +181,27 @@ impl<const NJ: usize> SafeAction<NJ> {
     /// Whether the action left the plane unchanged (spec 10.3: this step is not a violation).
     pub fn is_clean(&self) -> bool {
         self.source == ActionSource::Policy && self.events.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// P-M3-W1-R7: the rate watchdog's window uses this to skip its own echo.
+    #[test]
+    fn without_removes_exactly_one_kind() {
+        let mut s = EventSet::EMPTY;
+        s.insert(ViolationKind::Velocity);
+        s.insert(ViolationKind::ViolationRate);
+        // Removing an absent kind is the identity.
+        assert_eq!(s.without(ViolationKind::Torque), s);
+        // Other kinds survive.
+        let rest = s.without(ViolationKind::ViolationRate);
+        assert!(rest.contains(ViolationKind::Velocity));
+        assert!(!rest.contains(ViolationKind::ViolationRate));
+        // Removing the only present kind empties the set.
+        assert_eq!(rest.without(ViolationKind::Velocity), EventSet::EMPTY);
+        assert!(EventSet::EMPTY.without(ViolationKind::Velocity).is_empty());
     }
 }

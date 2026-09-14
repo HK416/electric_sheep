@@ -457,7 +457,14 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
             matches!(source, ActionSource::Fallback(_)),
         );
         self.counters.steps += 1;
-        self.counters.window.push(!events.is_empty());
+        // The rate watchdog's input ring, and the one place its own event is not a violation:
+        // a step that is dirty only because the watchdog already tripped would otherwise refill
+        // the window with the watchdog's echo and the trip would never end (spec 9.4, spec 18.5,
+        // P-M3-W1-R7). Every other event — a clamp, `NanInf`, an underrun, a dropout — still
+        // counts, and the counters above still record every fallback step (spec 10.3).
+        self.counters
+            .window
+            .push(!events.without(ViolationKind::ViolationRate).is_empty());
 
         self.state.prev_vel = self.state.vel;
         for (i, v) in self.state.vel.iter_mut().enumerate() {

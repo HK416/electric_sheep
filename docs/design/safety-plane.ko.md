@@ -166,7 +166,7 @@ watchdog이 발동했는지는 기록되는 이벤트만 바꿀 뿐 응답을 �
 | 4 | `InferenceDeadline` | `micros_since(last_chunk_tick, now) > budget` — 이 예산은 plane이 새 chunk 없이 얼마나 오래 지났는지를 측정한다 |
 | 5 | `ControllerHeartbeat` | `micros_since(last_beat_tick, now) > timeout` |
 | 6 | `SensorDropout` | 설정된 어떤 sensor에 대해서든 `micros_since(last_seen, now) > max_gap` |
-| 7 | `EnvelopeViolationRate` | `window.fraction() > max_frac`이며, **이전 스텝 시점**의 window를 사용한다 — 이번 스텝 자체의 clamp는 아직 기록되지 않았고, 그것이 이 규칙을 순환적이지 않게 만든다 |
+| 7 | `EnvelopeViolationRate` | `window.fraction() > max_frac`이며, **이전 스텝 시점**의 window를 사용한다 — 이번 스텝 자체의 clamp는 아직 기록되지 않았고, 그것이 이 규칙을 순환적이지 않게 만든다. 그리고 window는 이 watchdog 자신의 트립을 절대 기록하지 않으며, 그것이 한 스텝 뒤에서도 이 규칙을 순환적이지 않게 유지한다 (P-M3-W1-R7) |
 
 **부분적으로만 채워진 window는 절대 트립되지 않는다** (P-M3-W1-R1).
 `window.fraction()`은 `ones / 지금까지_관측한_스텝`이 아니라 `ones / window`이며, 링이
@@ -179,9 +179,22 @@ watchdog이 발동했는지는 기록되는 이벤트만 바꿀 뿐 응답을 �
 기간 필드는 없다. §10.3의 예시 수용 기준 `<= 0.01`도 분모가 window일 때에만 문자 그대로
 읽힌다.
 
-여기서 고치지 않은 알려진 한계: 가득 찬 window에서 한 번 트립된 뒤에는 watchdog이 스스로
-풀리지 않는다. 그것이 유발한 fallback 스텝들이 dirty이고 window를 다시 채우기 때문이다
-(`tests/properties.rs:a_tripped_rate_watchdog_does_not_release_itself`가 이를 고정한다).
+**watchdog은 자기 자신의 fallback을 측정하지 않는다** (P-M3-W1-R7). window는 해당 스텝이
+`ViolationRate`가 *아닌* 다른 이유로 dirty였을 때에만 위반으로 기록한다:
+`window.push(!events.without(ViolationRate).is_empty())`. 이 조항이 없으면 트립 이후의 모든
+스텝은 유일한 이벤트가 watchdog 자신의 것인 fallback 스텝이고, 링은 그 메아리로 다시 채워져
+`ones`가 결코 감소하지 않으며 트립이 영구화된다 — 즉 *모든* fallback 정책에 대해,
+`is_latched()`가 보고하지 못하고 `reset_latch()`로도 풀 수 없는 래치가 된다. 이 조항이 있으면
+해제는 자동이고 유계다: 마지막 진짜 위반이 링에서 빠져나간 뒤 늦어도 `window` 스텝 안에
+watchdog은 발동을 멈춘다. 이것이 §18.5("폴백은 정상 동작이지 실패가 아니다")가 요구하는
+바다. 진짜 이유로 dirty인 스텝 — clamp, `NanInf`, `ChunkUnderrun`, `HeartbeatLoss`,
+`SensorDropout`, `StaleObservation`, `InferenceDeadline` — 은 여전히 계산되므로, 실제로 계속
+위반하는 plane은 watchdog이 계속 트립된 상태로 남는다. 바뀌는 것은 watchdog의 *입력 링*뿐이다:
+`dirty_steps`, `clamped_steps`, `fallback_activations`, `steps`, `violations[ViolationRate]`는
+watchdog 자신의 것을 포함해 모든 fallback 스텝을 그대로 센다. `es-eval`의 §10.3 에피소드 단위
+`envelope_violation_rate`가 읽는 것이 바로 그것이다. `EmergencyStop`은 건드리지 않는다 —
+§9.4는 "래치"를 그 정책 하나에만 붙이므로, 진짜 rate 트립은 여전히 래치되고 `reset_latch()`만이
+그것을 푼다(`tests/properties.rs:an_estop_rate_trip_still_latches`).
 
 `ChunkUnderrun`과 `NanInf`는 항상 활성화되어 있다. 나머지 다섯은 IR이 나열한
 경우에만 활성화된다. 나열되지 않은 watchdog은 절대 트립되지 않는데, 이는 안전
@@ -195,7 +208,8 @@ watchdog이 발동했는지는 기록되는 이벤트만 바꿀 뿐 응답을 �
 생성한 뒤(아래 참조), 그것을 최종 정리(non-finite → hold, 그다음 hard position
 clamp)에 통과시켜 fallback 출력이 정책 출력과 동일한 규칙으로 envelope 안에
 들어오게 한다. `source = Fallback(kind)`, `fallback_activations += 1`. violation
-window는 이 스텝을 위반으로 기록한다. §18.5에 따라 이것은 *정상 동작*이다 — env는
+window는, 이 스텝의 유일한 이벤트가 rate watchdog 자신의 트립인 경우를 제외하고, 이 스텝을
+위반으로 기록한다(7번 행 참조). §18.5에 따라 이것은 *정상 동작*이다 — env는
 `Ok` 상태를 유지하고 이벤트가 기록된다.
 
 **4b단계 — clamp 경로** (아무것도 트립되지 않은 경우). 후보 행은 정확히 다음
@@ -264,10 +278,12 @@ pub struct SafetyCounters {
 }
 ```
 
-- `envelope_violation_rate()` — 슬라이딩 윈도 안에서 clamp되었거나, 투영되었거나,
-  fallback으로 떨어진 스텝의 비율. 이것이 §10.3의 1급 지표이며, `EnvelopeViolationRate`
-  watchdog이 읽는 것과 같은 수치다. window는 누적 1의 개수를 함께 들고 있는
-  `[u64; 4]` 비트 ring(상한 256)이므로, 이 비율은 누적된 float가 아니라 정수 비다.
+- `envelope_violation_rate()` — 슬라이딩 윈도 안에서 clamp되었거나, 투영되었거나, rate
+  watchdog 자신이 아닌 이유로 fallback으로 떨어진 스텝의 비율(7번 행). 이것이 §10.3의 1급
+  지표이며, `EnvelopeViolationRate` watchdog이 읽는 것과 같은 수치다. 같은 이름을 가진
+  `es-eval`의 에피소드 단위 지표는 `dirty_steps / steps`이며, 그쪽은 모든 fallback 스텝을
+  센다. window는 누적 1의 개수를 함께 들고 있는 `[u64; 4]` 비트 ring(상한 256)이므로, 이
+  비율은 누적된 float가 아니라 정수 비다.
 - `chunk_underrun_rate()` — `violations[ChunkUnderrun] / steps` (§8.6, §10.3).
 - `violations[kind]` — §10.3의 `failure_mode_histogram`을 위한 종류별 카운트.
 

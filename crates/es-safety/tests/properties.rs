@@ -291,6 +291,12 @@ fn step(p: &mut SafetyPlane<NJ, H>, t: u64, target: f64) -> SafeAction<NJ> {
     p.validate(&chunk, Micros(1_000), PhysTick(t))
 }
 
+/// A step whose every component is `NaN`. `NanInf` is armed unconditionally (INV-12), so this
+/// is a genuine violation even on a step the rate watchdog has already failed.
+fn nan_step(p: &mut SafetyPlane<NJ, H>, t: u64) -> SafeAction<NJ> {
+    step(p, t, f64::NAN)
+}
+
 /// A step commanding the pose the plane is already holding at zero velocity: no clamp stage
 /// touches it, so it is clean.
 fn hold_step(p: &mut SafetyPlane<NJ, H>, t: u64) -> SafeAction<NJ> {
@@ -383,14 +389,14 @@ fn the_rate_falls_back_out_of_the_window() {
     assert_eq!(p.counters().dirty_steps, 1);
 }
 
-/// A tripped rate watchdog holds itself tripped: its own fallback step is dirty
-/// (`plane.rs`'s `window.push(!events.is_empty())`), so the window refills with the
-/// watchdog's own output and the fraction only grows. Deliberately pinned rather than fixed —
-/// P-M3-W1-R1 owns the denominator, and the dirty-bit rule is `forbidden` to it. Worth a
-/// follow-up: after the burst that tripped it the policy may be fine, and nothing here can
-/// tell.
+/// P-M3-W1-R7, replacing `a_tripped_rate_watchdog_does_not_release_itself`, which pinned the
+/// bug this test now forbids: the watchdog's own fallback steps used to refill the window with
+/// its own echo, so the trip was a permanent, invisible latch. The window now records a step as
+/// dirty only for reasons other than `ViolationRate`, so once the genuine violations age out the
+/// plane goes back to executing the policy — within `window` steps of the last real one
+/// (spec 18.5: a fallback is normal behaviour, not a failure).
 #[test]
-fn a_tripped_rate_watchdog_does_not_release_itself() {
+fn a_tripped_rate_watchdog_releases_after_a_clean_window() {
     let mut p = rate_plane(FallbackPolicy::HoldPosition);
     for t in 0..8u64 {
         hold_step(&mut p, t);
@@ -398,14 +404,99 @@ fn a_tripped_rate_watchdog_does_not_release_itself() {
     for t in 8..11u64 {
         dirty_step(&mut p, t);
     }
-    for t in 11..40u64 {
+    // Step 12 reads 3/8 and trips; the last genuine violation was step 11.
+    let out = hold_step(&mut p, 11);
+    assert!(out.events.contains(ViolationKind::ViolationRate));
+    assert_eq!(
+        out.source,
+        ActionSource::Fallback(FallbackKind::HoldPosition)
+    );
+    // Every step from here is clean, so the trip must be gone by step 19 — `window` steps
+    // after the last genuine violation — at the very latest.
+    let mut released = None;
+    for t in 12..19u64 {
         let out = hold_step(&mut p, t);
+        if out.events.contains(ViolationKind::ViolationRate) {
+            assert_eq!(
+                out.source,
+                ActionSource::Fallback(FallbackKind::HoldPosition)
+            );
+            continue;
+        }
+        assert_eq!(out.source, ActionSource::Policy, "step {}", t + 1);
+        released = Some(t);
+        break;
+    }
+    let released = released.expect("the watchdog never released itself");
+    // And it stays released: nothing it does afterwards puts a bit back in the window.
+    for t in released + 1..40u64 {
+        let out = hold_step(&mut p, t);
+        assert_eq!(out.source, ActionSource::Policy, "step {}", t + 1);
+        assert!(!out.events.contains(ViolationKind::ViolationRate));
+    }
+    assert!(p.counters().envelope_violation_rate() < 1e-12);
+}
+
+/// The other half of R7: the window must stay blind only to the watchdog's *own* event. A
+/// policy that keeps emitting `NaN` keeps tripping the always-armed `NanInf` watchdog, and that
+/// event is recorded on the fallback step it causes, so the rate stays over the bound and the
+/// plane stays in the fallback for as long as the violations continue.
+#[test]
+fn a_real_violation_during_a_trip_still_counts() {
+    let mut p = rate_plane(FallbackPolicy::HoldPosition);
+    for t in 0..8u64 {
+        hold_step(&mut p, t);
+    }
+    for t in 8..11u64 {
+        dirty_step(&mut p, t);
+    }
+    assert!(hold_step(&mut p, 11)
+        .events
+        .contains(ViolationKind::ViolationRate));
+    for t in 12..42u64 {
+        let out = nan_step(&mut p, t);
+        assert!(
+            out.events.contains(ViolationKind::NonFinite),
+            "step {}",
+            t + 1
+        );
         assert!(
             out.events.contains(ViolationKind::ViolationRate),
-            "step {} released the watchdog",
+            "step {} released the watchdog while it was still being violated",
             t + 1
         );
     }
+}
+
+/// The guard against "fixing" the spec 10.3 counters along with the watchdog's input ring. Only
+/// the ring changed: every fallback step the watchdog causes is still one `fallback_activation`,
+/// one `ViolationRate` violation and one `dirty_step`, which is what `es-eval`'s episode-level
+/// `envelope_violation_rate` (`dirty_steps / steps`) reads.
+#[test]
+fn the_metric_counters_still_count_every_fallback() {
+    let mut p = rate_plane(FallbackPolicy::HoldPosition);
+    for t in 0..8u64 {
+        hold_step(&mut p, t);
+    }
+    for t in 8..11u64 {
+        dirty_step(&mut p, t);
+    }
+    let mut fallbacks = 0;
+    for t in 11..24u64 {
+        if hold_step(&mut p, t)
+            .events
+            .contains(ViolationKind::ViolationRate)
+        {
+            fallbacks += 1;
+        }
+    }
+    assert!(fallbacks > 0, "the watchdog never tripped");
+    let c = p.counters();
+    assert_eq!(c.fallback_activations, fallbacks);
+    assert_eq!(c.count(ViolationKind::ViolationRate), fallbacks);
+    assert_eq!(c.clamped_steps, 3);
+    assert_eq!(c.dirty_steps, fallbacks + 3);
+    assert_eq!(c.steps, 24);
 }
 
 /// The blocker's worst case: with `FallbackPolicy::EmergencyStop` the rate watchdog's trip
@@ -427,4 +518,40 @@ fn an_estop_rate_watchdog_does_not_latch_on_step_two() {
         !p.is_latched(),
         "one dirty step out of a window of 8 latched the e-stop"
     );
+}
+
+/// The one real latch survives R7 (spec 9.4 attaches "latch" to `EmergencyStop` and to nothing
+/// else, INV-12): a genuine rate trip on a full window still engages the e-stop, every later
+/// step short-circuits on it, and only `reset_latch()` clears it.
+#[test]
+fn an_estop_rate_trip_still_latches() {
+    let mut p = rate_plane(FallbackPolicy::EmergencyStop);
+    for t in 0..8u64 {
+        hold_step(&mut p, t);
+    }
+    for t in 8..11u64 {
+        dirty_step(&mut p, t);
+    }
+    assert!(!p.is_latched(), "a clamp is not a watchdog trip");
+    let out = hold_step(&mut p, 11);
+    assert!(out.events.contains(ViolationKind::ViolationRate));
+    assert_eq!(
+        out.source,
+        ActionSource::Fallback(FallbackKind::EmergencyStop)
+    );
+    assert!(p.is_latched(), "a genuine rate trip must latch the e-stop");
+    // Long past the window that tripped it, the latch is still the latch.
+    for t in 12..40u64 {
+        let out = hold_step(&mut p, t);
+        assert_eq!(
+            out.source,
+            ActionSource::Fallback(FallbackKind::EmergencyStop),
+            "step {}",
+            t + 1
+        );
+        assert!(out.events.contains(ViolationKind::EstopLatched));
+    }
+    assert!(p.is_latched());
+    p.reset_latch();
+    assert!(!p.is_latched());
 }
