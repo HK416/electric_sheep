@@ -35,8 +35,8 @@ pub use intervention::{
     INTERVENTION,
 };
 pub use lerobot::{
-    Column, Dtype, Episode, EpisodeMeta, FeatureSpec, Info, LeRobotDataset, LeRobotWriter, Task,
-    VideoRef,
+    export_v3, Column, Dtype, Episode, EpisodeMeta, ExportReport, FeatureSpec, Info,
+    LeRobotDataset, LeRobotWriter, Task, VideoRef,
 };
 
 /// Everything that can go wrong reading or writing a dataset.

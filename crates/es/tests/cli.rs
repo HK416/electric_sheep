@@ -2168,6 +2168,69 @@ fn loop_collect_skips_with_exit_three_when_the_backend_is_unavailable() {
     assert!(text.contains("SKIPPED"), "{text}");
 }
 
+/// `es dataset export --lerobot-v3` turns a v2.1 dataset into the layout `lerobot` 0.6.1
+/// reads, leaves the source alone, and records where it came from (spec 19.1, 19.2; packet
+/// `docs/packets/M5/V1b-lerobot-v3-export.md`). What the real package makes of the output is
+/// `crates/es-data/tests/lerobot_v3.rs`; this only checks the command.
+#[test]
+fn dataset_export_writes_a_v3_dataset() {
+    let dir = scratch_dir("dataset-export");
+    let root = dir.join("v21");
+    let out = dir.join("v30");
+    write_loop_fixture(&root, 2);
+
+    let res = bin()
+        .args(["dataset", "export", "--lerobot-v3"])
+        .arg(&root)
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("run es");
+    let text = stdout(&res);
+    assert!(res.status.success(), "{text}");
+    assert!(text.contains("episodes: 2"), "{text}");
+    assert!(text.contains("frames: 16"), "{text}");
+
+    let info: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("meta/info.json")).expect("exported info.json"),
+    )
+    .expect("info json");
+    assert_eq!(info["codebase_version"], "v3.0", "{info}");
+    assert!(out.join("data/chunk-000/file-000.parquet").is_file());
+    assert!(out
+        .join("meta/episodes/chunk-000/file-000.parquet")
+        .is_file());
+    assert!(out.join("meta/tasks.parquet").is_file());
+    assert!(out.join("meta/es_provenance.json").is_file());
+
+    // The source keeps writing and reading v2.1 (packet `forbidden`).
+    let source: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(root.join("meta/info.json")).expect("source info.json"),
+    )
+    .expect("info json");
+    assert_eq!(source["codebase_version"], "v2.1", "{source}");
+
+    // A missing --out is usage (2); a root that is not a dataset is a runtime failure (1).
+    let usage = bin()
+        .args(["dataset", "export", "--lerobot-v3"])
+        .arg(&root)
+        .output()
+        .expect("run es");
+    assert_eq!(usage.status.code(), Some(2), "{}", stdout(&usage));
+    let missing = bin()
+        .args([
+            "dataset",
+            "export",
+            "--lerobot-v3",
+            "does-not-exist",
+            "--out",
+        ])
+        .arg(dir.join("nope"))
+        .output()
+        .expect("run es");
+    assert_eq!(missing.status.code(), Some(1), "{}", stdout(&missing));
+}
+
 /// An unknown subcommand and a missing required flag are usage errors, not runtime ones.
 #[test]
 fn loop_usage_errors_exit_two() {

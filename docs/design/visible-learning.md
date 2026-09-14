@@ -628,6 +628,78 @@ question 2 in the direction of a v3 writer, and `docs/api-notes/lerobot-dataset.
 the writer is deliberately unchanged here, because the packet that changes it is the one that
 implements v3.0.
 
+### 7.7 As built (V1b): the LeRobot v3.0 export, and what the format actually requires
+
+V1's dataset oracle answered with a refusal (section 7.5), and V1b is the repair: a converter,
+not a change of writer. `es loop collect` still writes `codebase_version: "v2.1"` — V2's
+training script reads it directly, and moving that format under a concurrent packet would have
+been the expensive kind of correct. `es dataset export --lerobot-v3 <root> --out <dir>` is the
+new command, `crates/es-data/src/lerobot/v3.rs` is all of it, and
+`docs/api-notes/lerobot-dataset.md`'s "LeRobot v3.0" section is the format pinned against
+`lerobot` 0.6.1 on the oracle server — read out of the installed package *and* executed against
+it, file path by file path.
+
+**Measured 2026-09-15**, `ES_LEROBOT_PYTHON=$HOME/venvs/es-lerobot-cuda/bin/python cargo test
+-p es-data --test lerobot_v3 -- --nocapture`: `RAN lerobot_v3_export`. `LeRobotDataset` opened
+the export, reported `codebase_version 3.0`, 2 episodes / 7 frames, iterated all 7, and handed
+back `observation.state` and `action` equal to the parquet we wrote to 1e-5 across every frame,
+the camera as a `[3, 4, 6]` CHW tensor, and a pixel sum of 111.6706 against our own 28476/255 =
+111.67059. The v2.1 oracle next door still prints its `SKIP`, with the refusal as the reason;
+that is the honest state of a format 0.6.1 does not read.
+
+**Four things the format required that the v2.1 note did not say.**
+
+1. **A `shape: [1]` feature is a scalar column, not a length-1 list.** `DatasetInfo.__post_init__`
+   turns every `shape` into a tuple and `get_hf_features_from_features` then branches on
+   `shape == (1,)` before it branches on `len(shape) == 1`. v2.1's writer emits every feature as
+   a 3-level LIST, so `reward`, `timestamp` and the four index columns all change shape on the
+   way out. A `[6]` feature is still a list — a variable-size parquet `list<T>` is accepted
+   where the declared `fixed_size_list<T>[6]` is, because `datasets` casts it, which is why the
+   existing schema builders are reusable at all.
+2. **The five bookkeeping columns are mandatory in `features`.** They drive
+   `Dataset.from_parquet(..., features=...)`, so a column in the file and not in `info.json` is
+   not a harmless extra. v2.1 left this `unverified`; v3.0 answers it.
+3. **`meta/tasks.parquet` is read through `pandas`, and the task string must be its index.**
+   `dataset_reader.py:352` is `self._meta.tasks.iloc[task_idx].name` — `.name` of a row is the
+   *index* value. Two parquet columns are not enough: the file also carries the `pandas`
+   key/value metadata in its footer naming `task` as `index_columns`. This is the one place the
+   export writes a Python library's private serialization convention, and the api-note quotes
+   the exact blob.
+4. **Images do not need a video codec, and should not use one.** `dtype: "image"` stores an
+   encoded image file inline in the data parquet as `struct<bytes, path>`; `dtype: "video"`
+   needs a decoder, and on the oracle server `torchcodec` is installed but does not load
+   (`libnppicc.so.12` missing) so it falls back to `pyav`. The export writes `image`, and no
+   encoder runs anywhere — not `~/.local/bin/ffmpeg`, not from Rust, not from the oracle's
+   Python side.
+
+**No PNG crate, still.** Section 7.2 refused to add an image encoder because the only consumer
+was numpy. `lerobot` is a second consumer and it wants a decodable file, so `v3.rs` carries
+~70 lines of PNG: 8-bit truecolor, filter 0, and a zlib stream of *stored* deflate blocks. That
+costs about 0.1% over the raw frame and buys a file PIL opens. It is checked by
+`png_round_trips`, which parses the encoder's own output back — every chunk CRC, the LEN/NLEN
+pairs, the Adler-32 — so the encoder has an oracle that needs no interpreter.
+
+**Provenance is a sidecar, not `info.json`.** Spec §19.2 makes the export a derived artifact,
+so `meta/es_provenance.json` records the source's `content`/`schema`/`split` hashes and its
+`codebase_version`. It is not extra `info.json` keys because `DatasetInfo.from_dict` drops
+unknown keys with a warning and `to_dict` would not write them back — provenance there would
+not survive a LeRobot-side rewrite.
+
+**Three deliberate omissions.**
+
+- **`meta/stats.json` is not written.** `load_stats` returns `None` when it is absent and no
+  read path needs it; it exists for training's normalization. Inventing statistics to fill a
+  file is worse than leaving it out, and nothing in plan V trains through `lerobot`.
+- **No chunk/file splitting.** One `data/chunk-000/file-000.parquet` and one
+  `meta/episodes/chunk-000/file-000.parquet`. `data_files_size_in_mb` is advisory — the reader
+  globs `data/*/*.parquet` — and an export currently buffers one dataset in memory, which is
+  marked in the source as the ceiling it is.
+- **A camera with no frames behind it is dropped, not exported.** `es loop collect` writes no
+  pixels today (section 7.5), so `--frames <dir>` is where they come from:
+  `<dir>/<name>/<NNNNNN>.bin`, the raw dump `EnvRenderer` already writes, one subdirectory per
+  `observation.images.<name>`. Without it the feature is dropped and the command says so,
+  rather than declaring an image feature nothing can load.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:

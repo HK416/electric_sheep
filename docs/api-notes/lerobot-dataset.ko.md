@@ -216,3 +216,225 @@ lerobot_oracle -- --nocapture`를 실행한 결과:
 
 그때까지 `crates/es-data/tests/lerobot_oracle.rs`는 모든 머신에서 위 거부 사유를 그대로 실어
 `SKIP lerobot_oracle: <why>`를 출력한다.
+
+---
+
+# LeRobot v3.0 — 디스크 레이아웃 — `검증됨`
+
+**고정 버전: `lerobot` 0.6.1**, `datasets` 4.8.5, `pyarrow` 25.0.1, `pandas` 2.3.3, `cv2` 4.13.0,
+오라클 서버. 2026-09-15에 설치된 패키지에서 직접 읽었다. 패킷은
+`docs/packets/M5/V1b-lerobot-v3-export.md`:
+
+```
+~/venvs/es-lerobot-cuda/lib/python3.12/site-packages/lerobot/datasets/
+    utils.py             (경로 템플릿, DatasetInfo, 청크/파일 크기)
+    dataset_metadata.py  (CODEBASE_VERSION, image_keys/video_keys, 로드 경로)
+    dataset_reader.py    (get_item, hf_dataset features, tasks 조회)
+    io_utils.py          (load_nested_dataset, tasks/episodes/stats 읽기·쓰기)
+    feature_utils.py     (get_hf_features_from_features)
+    lerobot_dataset.py   (LeRobotDataset.__init__, 독스트링의 레이아웃)
+~/venvs/es-lerobot-cuda/lib/python3.12/site-packages/lerobot/scripts/convert_dataset_v21_to_v30.py
+```
+
+0.6.1에 `lerobot/datasets/v30/` 디렉터리는 없다. v3.0이 곧 포맷 자체이고,
+`convert_dataset_v21_to_v30.py`는 이미 허브에 있는 데이터셋의 업그레이드 경로다.
+
+아래 내용은 문서로만 옮긴 것이 아니라 0.6.1에 대해 **실행**해 확인했다. 정확히 이 모양으로,
+`crates/es-data/src/lerobot/v3.rs`가 쓰는 물리 인코딩으로 쓴 데이터셋이
+`LeRobotDataset(repo_id=..., root=...)`으로 열리고 프레임을 돌려준다.
+
+## 디렉터리 레이아웃
+
+```
+<root>/
+├── meta/
+│   ├── info.json
+│   ├── tasks.parquet
+│   ├── stats.json                        (선택)
+│   ├── es_provenance.json                (우리 것, LeRobot의 것이 아님 — 아래 참조)
+│   └── episodes/
+│       └── chunk-000/
+│           └── file-000.parquet
+├── data/
+│   └── chunk-000/
+│       └── file-000.parquet
+└── videos/                               (`dtype: "video"` 피처가 있을 때만)
+    └── <video_key>/
+        └── chunk-000/
+            └── file-000.mp4
+```
+
+상수, `datasets/utils.py:88-107`:
+
+| 이름 | 값 |
+|---|---|
+| `DEFAULT_CHUNK_SIZE` | `1000` (청크 디렉터리당 최대 파일 수) |
+| `DEFAULT_DATA_FILE_SIZE_IN_MB` | `100` |
+| `DEFAULT_VIDEO_FILE_SIZE_IN_MB` | `200` |
+| `INFO_PATH` | `meta/info.json` |
+| `STATS_PATH` | `meta/stats.json` |
+| `DEFAULT_TASKS_PATH` | `meta/tasks.parquet` |
+| `DEFAULT_EPISODES_PATH` | `meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet` |
+| `DEFAULT_DATA_PATH` | `data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet` |
+| `DEFAULT_VIDEO_PATH` | `videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4` |
+| `DEFAULT_IMAGE_PATH` | `images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}.png` |
+| `CODEBASE_VERSION` | `"v3.0"` (`datasets/dataset_metadata.py:60`) |
+
+v2.1에서 플레이스홀더가 바뀌었다. **`data_path`와 `video_path`에 `{episode_chunk}`도
+`{episode_index}`도 없다.** 한 파일이 여러 에피소드를 담고, 어떤 에피소드가 어느 파일에 있는지는
+에피소드 인덱스 산술이 아니라 `meta/episodes/*.parquet`에서 나온다.
+`load_nested_dataset`(`io_utils.py:63-83`)은 그냥 `data/*/*.parquet`을 글롭하므로, 청크/파일 번호는
+에피소드 테이블이 말하는 것과 자기 일관적이기만 하면 된다.
+
+`DEFAULT_IMAGE_PATH`는 *라이터 쪽* 스테이징 경로(`image_writer.py`)이고 리더는 그것을 해석하지
+않는다. 이미지 픽셀은 데이터 parquet을 통해 리더에 도달한다 — 아래 참조.
+
+## `meta/info.json`
+
+`DatasetInfo.from_dict`(`utils.py:114-196`)이 파싱한다. 모르는 키는 **`logger.warning`과 함께
+버려지고**, 없는 선택 키는 데이터클래스 기본값을 쓴다.
+
+| 필드 | 타입 | 필수 | 메모 |
+|---|---|---|---|
+| `codebase_version` | string | 예 | `3.0`으로 파싱되어야 한다. `2.1`은 `BackwardCompatibilityError`, `> 3.0`은 `ForwardCompatibilityError` |
+| `fps` | int | 예 | `__post_init__`이 `<= 0`을 거부 |
+| `features` | object | 예 | `name -> {dtype, shape, names}`. parquet 스키마 전체를 결정한다 |
+| `total_episodes` | int | 아니오 (0) | `0`이면 `meta/episodes`를 읽지 않는다 |
+| `total_frames` | int | 아니오 (0) | |
+| `total_tasks` | int | 아니오 (0) | `0`이면 `meta/tasks.parquet`을 읽지 않고, 그러면 `get_item`이 `meta.tasks.iloc[...]`에서 예외 |
+| `chunks_size` | int | 아니오 (1000) | `> 0` |
+| `data_files_size_in_mb` | int | 아니오 (100) | `> 0` |
+| `video_files_size_in_mb` | int | 아니오 (200) | `> 0` |
+| `data_path` | string | 아니오 (기본값) | |
+| `video_path` | string \| null | 아니오 (기본값) | `dtype: "video"` 피처가 없으면 `null` |
+| `robot_type` | string \| null | 아니오 | |
+| `splits` | object | 아니오 (`{}`) | |
+| `tools` | list \| null | 아니오 | OpenAI 형식 도구 스키마. 없으면 생략된다 |
+
+v2.1 필드인 `total_videos`와 `total_chunks`는 v3.0 필드가 *아니며* 경고와 함께 버려진다.
+
+### `features` -> parquet 스키마
+
+`DatasetInfo.__post_init__`이 모든 `shape`를 리스트에서 **튜플**로 바꾸고,
+`get_hf_features_from_features`(`feature_utils.py:43-83`)가 이 순서로 매핑한다:
+
+| 조건 | `datasets` 피처 | arrow 타입 |
+|---|---|---|
+| `dtype == "video"` | *건너뜀* | 컬럼 자체가 없다 |
+| `dtype == "image"` | `datasets.Image()` | `struct<bytes: binary, path: string>` |
+| `shape == (1,)` | `datasets.Value(dtype)` | 평범한 스칼라 |
+| `len(shape) == 1` | `datasets.List(Value(dtype), length=n)` | `fixed_size_list<item: T>[n]` |
+| `len(shape) in 2..=5` | `Array2D`..`Array5D` | 중첩 고정 크기 리스트 |
+
+물리는 두 가지 결과가 있다:
+
+- **`shape: [1]` 피처는 길이 1 리스트가 아니라 스칼라 컬럼이다.** v2.1 라이터는 모든 피처를 3-레벨
+  LIST로 쓴다. v3.0에서는 `reward`, `timestamp`, `frame_index`, `episode_index`, `index`,
+  `task_index`가 평범한 프리미티브여야 한다.
+- 다섯 부기 컬럼은 **`features`에 반드시 나타나야 한다.** `features`가 곧
+  `Dataset.from_parquet(..., features=...)`이 파일을 캐스트하는 대상이기 때문이다. v2.1에서 남겨둔
+  미해결 질문(위의 `미검증`)이 v3.0에서는 답이 나왔다: 필수다.
+
+선언이 `fixed_size_list<item: T>[n]`인 자리에 parquet 가변 길이 `list<item: T>`가 와도 받아들인다 —
+`datasets`가 캐스트한다 — 그래서 `columns.rs`가 이미 쓰는 3-레벨 LIST를 재사용할 수 있다. 가정이
+아니라 측정이다.
+
+### ffmpeg·torchcodec 없이 읽히는 이미지 피처
+
+`dtype: "image"` 픽셀은 **데이터 parquet 안에** `struct<bytes: binary, path: string>`로 들어간다.
+`bytes`는 인코딩된 이미지 파일(여기서는 PNG)이고 `path`는 null이다.
+`hf_transform_to_torch`(`io_utils.py:266-293`)가 PIL 이미지를 `[0, 1]` 범위의 `float32` `(C, H, W)`
+텐서로 바꾼다. 이 경로는 `torchcodec`·`pyav`·`ffmpeg` 어느 것도 건드리지 않는다.
+
+다른 선택지인 `dtype: "video"`는 디코더가 필요하다. `dataset_reader._query_videos`가
+`decode_video_frames`를 부른다. 오라클 서버에서 `torchcodec`은 설치되어 있지만 **로드되지 않고**
+(`libnppicc.so.12: cannot open shared object file`) `pyav`로 폴백한다. 그래서
+`es dataset export --lerobot-v3`는 `video`가 아니라 `image`를 쓰고, 인코더를 전혀 호출하지 않는다 —
+`~/.local/bin/ffmpeg`도, Rust에서도, 오라클의 Python 쪽에서도.
+
+대가는 크기다. stored-deflate PNG는 원시 프레임 + 약 0.1%다. `data_files_size_in_mb`는 권고값이므로
+(리더는 글롭한다) 큰 데이터 파일 하나도 합법이다. 분할은 최적화이지 정확성 요건이 아니다.
+
+## `meta/episodes/chunk-XXX/file-XXX.parquet`
+
+`load_episodes`(`io_utils.py:212-218`)가 **피처 선언 없이** 읽고 — arrow 타입은 파일에서 추론된다 —
+`stats/*` 컬럼을 모두 버린다. 리더가 실제로 쓰는 컬럼:
+
+| 컬럼 | 타입 | 사용처 |
+|---|---|---|
+| `episode_index` | int64 | `filter_episodes`, `_check_cached_episodes_sufficient` |
+| `length` | int64 | `meta.episodes[i]["length"]` |
+| `dataset_from_index` | int64 | `dataset_reader._get_query_indices` (delta-timestamp 윈도) |
+| `dataset_to_index` | int64 | 동일. 끝은 배타적 |
+| `tasks` | list\<string\> | 에피소드 단위 태스크 레이블 |
+| `data/chunk_index` | int64 | `DatasetMetadata.get_data_file_path` |
+| `data/file_index` | int64 | 동일 |
+| `meta/episodes/chunk_index` | int64 | *라이터*의 append 경로 |
+| `meta/episodes/file_index` | int64 | 동일 |
+| `videos/<key>/chunk_index`, `videos/<key>/file_index`, `videos/<key>/from_timestamp` | int64/float | `dtype: "video"` 피처에만 |
+| `stats/<feature>/<stat>` | — | 선택적 에피소드별 통계. 로드 시 버려진다 |
+
+컬럼 *이름*에 `/`가 들어간다. 중첩 그룹이 아니라, 이름에 슬래시가 들어간 평평한 최상위 parquet
+필드다.
+
+`dataset_from_index` / `dataset_to_index`는 파일 순서로 에피소드에 대해 누적되며, 데이터 parquet의
+`index` 컬럼과 일치한다.
+
+## `meta/tasks.parquet`
+
+`load_tasks`는 `pd.read_parquet(...)` 뒤에 `tasks.index.name = "task"`이고(`io_utils.py:184-187`),
+리더는 프레임의 태스크를 `self._meta.tasks.iloc[task_idx].name`(`dataset_reader.py:352`)으로 푼다 —
+즉 **태스크 문자열은 컬럼 값이 아니라 pandas 인덱스여야 한다.** 그래서 파일은 parquet 컬럼 두 개,
+`task_index`(int64)와 `task`(string)를 담고, *그 위에* 어느 쪽이 인덱스인지 pyarrow에게 알려주는
+푸터의 `pandas` key/value 메타데이터를 담는다:
+
+```json
+{"index_columns": ["task"],
+ "column_indexes": [{"name": null, "field_name": null, "pandas_type": "unicode",
+                     "numpy_type": "object", "metadata": {"encoding": "UTF-8"}}],
+ "columns": [{"name": "task_index", "field_name": "task_index", "pandas_type": "int64",
+              "numpy_type": "int64", "metadata": null},
+             {"name": "task", "field_name": "task", "pandas_type": "unicode",
+              "numpy_type": "object", "metadata": null}],
+ "pandas_version": "2.3.3"}
+```
+
+조회가 위치 기반(`iloc`)이므로 행 순서는 `task_index`와 일치해야 한다.
+
+## `meta/stats.json`
+
+**선택 사항.** 파일이 없으면 `load_stats`는 `None`을 돌려주고(`io_utils.py:161-175`) 읽기 경로에서
+그것을 요구하는 곳은 없다. 내용은 `{feature: {mean|std|min|max|count: [...]}}`이고 학습의 정규화가
+소비한다. `es dataset export --lerobot-v3`는 그것을 쓰지 않는다. LeRobot 호환성은 데이터셋을 *읽을 수
+있느냐*의 문제이고, 통계를 지어내는 것은 빼는 것보다 나쁘다. 내보낸 것으로 LeRobot 쪽에서 학습하려는
+사람이 있다면 그것이 후속 작업이다.
+
+## 받아들여진 parquet 물리 인코딩
+
+0.6.1 / pyarrow 25.0.1에 대해 `parquet 59.3`의 저수준 컬럼 API로 써서 측정했다:
+
+- `UNCOMPRESSED` 페이지 (`crates/es-data/Cargo.toml`에 코덱 피처가 켜져 있지 않다).
+- `ARROW:schema` 푸터 메타데이터 없음. pyarrow가 parquet 스키마에서 arrow 타입을 추론하고
+  `datasets`가 선언된 피처로 캐스트한다.
+- `fixed_size_list`가 선언된 자리에 3-레벨 LIST
+  (`optional group X (LIST) { repeated group list { optional T item; } }`).
+- 이미지 컬럼에 `optional group X { optional byte_array bytes; optional byte_array path (String); }`,
+  `path`는 모든 행에서 null.
+- 다섯 부기 컬럼과 모든 `shape: [1]` 피처에 평범한 `optional` 프리미티브.
+- 파일 전체에 로우 그룹 하나. `write_table_one_row_group_per_episode`는 LeRobot 자체 라이터가 하는
+  것이고(`io_utils.py:295-309`) 임의 접근 최적화이지 요건이 아니다.
+
+## `meta/es_provenance.json` — 우리 것이고 LeRobot의 것이 아니다
+
+스펙 §19.2에 따라 내보낸 것은 파생 산출물이므로 출처를 기록한다:
+
+```json
+{"source_root": "...", "source_codebase_version": "v2.1",
+ "content": "<64 hex>", "schema": "<64 hex>", "split": "<64 hex>",
+ "exported_by": "es dataset export --lerobot-v3"}
+```
+
+세 해시는 표시 전용 all-train 스플릿으로 원본에 대해 계산한 `DatasetIdentity::compute`이며,
+`es dataset info`가 출력하는 것과 정확히 같다. `info.json`의 추가 키가 아니라 사이드카인 이유는
+`DatasetInfo.from_dict`가 모르는 키를 (경고와 함께) 버리고 `to_dict`가 그것을 되쓰지 않기 때문이다 —
+`info.json`에 넣은 출처는 LeRobot 쪽 재기록을 살아남지 못한다.

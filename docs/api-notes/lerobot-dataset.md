@@ -223,3 +223,232 @@ between writing v3.0 directly and shipping a converter is a packet of its own (s
 
 Until then `crates/es-data/tests/lerobot_oracle.rs` prints `SKIP lerobot_oracle: <why>` with
 that refusal as the reason, on every machine.
+
+---
+
+# LeRobot v3.0 — on-disk layout — `verified`
+
+**Pinned version: `lerobot` 0.6.1**, with `datasets` 4.8.5, `pyarrow` 25.0.1, `pandas` 2.3.3,
+`cv2` 4.13.0, on the oracle server. Read on 2026-09-15 from the installed package, packet
+`docs/packets/M5/V1b-lerobot-v3-export.md`:
+
+```
+~/venvs/es-lerobot-cuda/lib/python3.12/site-packages/lerobot/datasets/
+    utils.py             (path templates, DatasetInfo, chunk/file sizes)
+    dataset_metadata.py  (CODEBASE_VERSION, image_keys/video_keys, load path)
+    dataset_reader.py    (get_item, the hf_dataset features, the tasks lookup)
+    io_utils.py          (load_nested_dataset, load/write tasks, episodes, stats)
+    feature_utils.py     (get_hf_features_from_features)
+    lerobot_dataset.py   (LeRobotDataset.__init__, the docstring layout)
+~/venvs/es-lerobot-cuda/lib/python3.12/site-packages/lerobot/scripts/convert_dataset_v21_to_v30.py
+```
+
+There is no `lerobot/datasets/v30/` directory in 0.6.1; v3.0 *is* the format, and
+`convert_dataset_v21_to_v30.py` is the upgrade path for datasets already on the hub.
+
+Everything below was additionally **executed** against 0.6.1: a dataset in exactly this shape,
+written with the physical encodings `crates/es-data/src/lerobot/v3.rs` uses, opens with
+`LeRobotDataset(repo_id=..., root=...)` and yields frames.
+
+## Directory layout
+
+```
+<root>/
+├── meta/
+│   ├── info.json
+│   ├── tasks.parquet
+│   ├── stats.json                        (optional)
+│   ├── es_provenance.json                (ours, not LeRobot's -- see below)
+│   └── episodes/
+│       └── chunk-000/
+│           └── file-000.parquet
+├── data/
+│   └── chunk-000/
+│       └── file-000.parquet
+└── videos/                               (only for `dtype: "video"` features)
+    └── <video_key>/
+        └── chunk-000/
+            └── file-000.mp4
+```
+
+Constants, `datasets/utils.py:88-107`:
+
+| name | value |
+|---|---|
+| `DEFAULT_CHUNK_SIZE` | `1000` (max files per chunk directory) |
+| `DEFAULT_DATA_FILE_SIZE_IN_MB` | `100` |
+| `DEFAULT_VIDEO_FILE_SIZE_IN_MB` | `200` |
+| `INFO_PATH` | `meta/info.json` |
+| `STATS_PATH` | `meta/stats.json` |
+| `DEFAULT_TASKS_PATH` | `meta/tasks.parquet` |
+| `DEFAULT_EPISODES_PATH` | `meta/episodes/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet` |
+| `DEFAULT_DATA_PATH` | `data/chunk-{chunk_index:03d}/file-{file_index:03d}.parquet` |
+| `DEFAULT_VIDEO_PATH` | `videos/{video_key}/chunk-{chunk_index:03d}/file-{file_index:03d}.mp4` |
+| `DEFAULT_IMAGE_PATH` | `images/{image_key}/episode-{episode_index:06d}/frame-{frame_index:06d}.png` |
+| `CODEBASE_VERSION` | `"v3.0"` (`datasets/dataset_metadata.py:60`) |
+
+The placeholders changed from v2.1: **there is no `{episode_chunk}` and no `{episode_index}` in
+`data_path` or `video_path`.** A file holds many episodes, and which file an episode is in comes
+out of `meta/episodes/*.parquet`, not out of arithmetic on the episode index.
+`load_nested_dataset` (`io_utils.py:63-83`) simply globs `data/*/*.parquet`, so the chunk/file
+numbering only has to be self-consistent with what the episodes table says.
+
+`DEFAULT_IMAGE_PATH` is a *writer-side* staging path (`image_writer.py`); the reader never
+resolves it. Image pixels reach the reader through the data parquet — see below.
+
+## `meta/info.json`
+
+Parsed by `DatasetInfo.from_dict` (`utils.py:114-196`). Unknown keys are **dropped with a
+`logger.warning`**; missing optional keys take the dataclass default.
+
+| field | type | required | note |
+|---|---|---|---|
+| `codebase_version` | string | yes | must parse as `3.0`; `2.1` raises `BackwardCompatibilityError`, `> 3.0` raises `ForwardCompatibilityError` |
+| `fps` | int | yes | `__post_init__` rejects `<= 0` |
+| `features` | object | yes | `name -> {dtype, shape, names}`; drives the whole parquet schema |
+| `total_episodes` | int | no (0) | `0` means "do not load `meta/episodes`" |
+| `total_frames` | int | no (0) | |
+| `total_tasks` | int | no (0) | `0` means "do not load `meta/tasks.parquet`", and then `get_item` raises on `meta.tasks.iloc[...]` |
+| `chunks_size` | int | no (1000) | must be `> 0` |
+| `data_files_size_in_mb` | int | no (100) | must be `> 0` |
+| `video_files_size_in_mb` | int | no (200) | must be `> 0` |
+| `data_path` | string | no (default) | |
+| `video_path` | string \| null | no (default) | `null` for a dataset with no `dtype: "video"` feature |
+| `robot_type` | string \| null | no | |
+| `splits` | object | no (`{}`) | |
+| `tools` | list \| null | no | OpenAI-style tool schemas; omitted when unset |
+
+`total_videos` and `total_chunks` — v2.1 fields — are *not* v3.0 fields and are dropped with a
+warning.
+
+### `features` -> the parquet schema
+
+`DatasetInfo.__post_init__` coerces every `shape` from list to **tuple**, and
+`get_hf_features_from_features` (`feature_utils.py:43-83`) then maps, in this order:
+
+| condition | `datasets` feature | arrow type |
+|---|---|---|
+| `dtype == "video"` | *skipped* | no column at all |
+| `dtype == "image"` | `datasets.Image()` | `struct<bytes: binary, path: string>` |
+| `shape == (1,)` | `datasets.Value(dtype)` | plain scalar |
+| `len(shape) == 1` | `datasets.List(Value(dtype), length=n)` | `fixed_size_list<item: T>[n]` |
+| `len(shape) in 2..=5` | `Array2D`..`Array5D` | nested fixed-size lists |
+
+Two consequences that bite:
+
+- **A `shape: [1]` feature is a scalar column, not a length-1 list.** v2.1's writer emits every
+  feature as a 3-level LIST; for v3.0 `reward`, `timestamp`, `frame_index`, `episode_index`,
+  `index` and `task_index` must be plain primitives.
+- The five bookkeeping columns **must appear in `features`**, because `features` is what
+  `Dataset.from_parquet(..., features=...)` casts the file to. This was the open question v2.1
+  left (`unverified` above); for v3.0 it is answered: they are required.
+
+A parquet variable-size `list<item: T>` is accepted where `fixed_size_list<item: T>[n]` is
+declared — `datasets` casts it — which is why the 3-level LIST `columns.rs` already writes is
+reusable. Measured, not assumed.
+
+### Image features without ffmpeg or torchcodec
+
+`dtype: "image"` pixels live **inline in the data parquet** as
+`struct<bytes: binary, path: string>`, where `bytes` is an encoded image file (PNG here) and
+`path` is null. `hf_transform_to_torch` (`io_utils.py:266-293`) turns the PIL image into a
+`float32` `(C, H, W)` tensor in `[0, 1]`. Nothing in that path touches `torchcodec`, `pyav` or
+`ffmpeg`.
+
+`dtype: "video"` is the other option and does need a decoder: `dataset_reader._query_videos`
+calls `decode_video_frames`. On the oracle server `torchcodec` is installed but **cannot load**
+(`libnppicc.so.12: cannot open shared object file`), so it falls back to `pyav`. `es dataset
+export --lerobot-v3` therefore writes `image`, never `video`, and calls no encoder — not
+`~/.local/bin/ffmpeg`, not from Rust, not from the Python side of the oracle.
+
+The cost is size: a stored-deflate PNG is roughly the raw frame plus 0.1%.
+`data_files_size_in_mb` is advisory (the reader globs), so a single large data file is legal;
+splitting is an optimisation, not a correctness requirement.
+
+## `meta/episodes/chunk-XXX/file-XXX.parquet`
+
+Loaded by `load_episodes` (`io_utils.py:212-218`) with **no declared features** — the arrow
+types are inferred from the file — then every `stats/*` column is dropped. Columns the reader
+actually uses:
+
+| column | type | used by |
+|---|---|---|
+| `episode_index` | int64 | `filter_episodes`, `_check_cached_episodes_sufficient` |
+| `length` | int64 | `meta.episodes[i]["length"]` |
+| `dataset_from_index` | int64 | `dataset_reader._get_query_indices` (delta-timestamp windows) |
+| `dataset_to_index` | int64 | same; exclusive end |
+| `tasks` | list\<string\> | episode-level task labels |
+| `data/chunk_index` | int64 | `DatasetMetadata.get_data_file_path` |
+| `data/file_index` | int64 | same |
+| `meta/episodes/chunk_index` | int64 | the *writer*'s append path |
+| `meta/episodes/file_index` | int64 | same |
+| `videos/<key>/chunk_index`, `videos/<key>/file_index`, `videos/<key>/from_timestamp` | int64/float | only for `dtype: "video"` features |
+| `stats/<feature>/<stat>` | — | optional per-episode statistics; dropped on load |
+
+The column *names* contain `/`. They are flat top-level parquet fields whose name happens to
+contain a slash, not nested groups.
+
+`dataset_from_index` / `dataset_to_index` are cumulative over episodes in file order, and match
+the `index` column in the data parquet.
+
+## `meta/tasks.parquet`
+
+`load_tasks` is `pd.read_parquet(...)` followed by `tasks.index.name = "task"`
+(`io_utils.py:184-187`), and the reader resolves a frame's task with
+`self._meta.tasks.iloc[task_idx].name` (`dataset_reader.py:352`) — i.e. **the task string must
+be the pandas index, not a column value**. So the file carries two parquet columns,
+`task_index` (int64) and `task` (string), *plus* the `pandas` key/value metadata in the footer
+that tells pyarrow which one is the index:
+
+```json
+{"index_columns": ["task"],
+ "column_indexes": [{"name": null, "field_name": null, "pandas_type": "unicode",
+                     "numpy_type": "object", "metadata": {"encoding": "UTF-8"}}],
+ "columns": [{"name": "task_index", "field_name": "task_index", "pandas_type": "int64",
+              "numpy_type": "int64", "metadata": null},
+             {"name": "task", "field_name": "task", "pandas_type": "unicode",
+              "numpy_type": "object", "metadata": null}],
+ "pandas_version": "2.3.3"}
+```
+
+Row order must agree with `task_index`, because the lookup is positional (`iloc`).
+
+## `meta/stats.json`
+
+**Optional.** `load_stats` returns `None` when the file is absent (`io_utils.py:161-175`) and
+nothing on the read path requires it. It is `{feature: {mean|std|min|max|count: [...]}}`,
+consumed by training's normalization. `es dataset export --lerobot-v3` does not write it:
+LeRobot compatibility is about the dataset being *readable*, and inventing statistics would be
+worse than omitting them. If a human wants to train LeRobot-side off an export, that is the
+follow-up.
+
+## Parquet physical encodings that were accepted
+
+Measured against 0.6.1 / pyarrow 25.0.1, writing with `parquet 59.3`'s low-level column API:
+
+- `UNCOMPRESSED` pages (no codec feature enabled in `crates/es-data/Cargo.toml`).
+- No `ARROW:schema` footer metadata. pyarrow infers arrow types from the parquet schema and
+  `datasets` casts to the declared features.
+- 3-level LIST (`optional group X (LIST) { repeated group list { optional T item; } }`) where a
+  `fixed_size_list` is declared.
+- `optional group X { optional byte_array bytes; optional byte_array path (String); }` for an
+  image column, with `path` written as null on every row.
+- Plain `optional` primitives for the five bookkeeping columns and for any `shape: [1]` feature.
+- One row group for the whole file. `write_table_one_row_group_per_episode` is what LeRobot's
+  own writer does (`io_utils.py:295-309`) and is a random-access optimisation, not a
+  requirement.
+
+## `meta/es_provenance.json` — ours, not LeRobot's
+
+Spec §19.2 makes the export a derived artifact, so it records where it came from:
+
+```json
+{"source_root": "...", "source_codebase_version": "v2.1",
+ "content": "<64 hex>", "schema": "<64 hex>", "split": "<64 hex>",
+ "exported_by": "es dataset export --lerobot-v3"}
+```
+
+The three hashes are `DatasetIdentity::compute` over the source with a display-only all-train
+split, exactly as `es dataset info` prints them. It is a sidecar rather than extra `info.json`
+keys because `DatasetInfo.from_dict` drops unknown keys (with a warning) and `to_dict` would
+not write them back — provenance in `info.json` would not survive a LeRobot-side rewrite.

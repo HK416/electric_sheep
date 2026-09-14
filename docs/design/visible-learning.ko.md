@@ -609,6 +609,70 @@ v2.1 → v3.0 변환기를 안내한다. 이는 미해결 질문 2를 v3 writer 
 `docs/api-notes/lerobot-dataset.ko.md`가 이를 기록한다. writer는 여기서 의도적으로 건드리지 않는다.
 그것을 바꾸는 패킷은 v3.0을 구현하는 패킷이기 때문이다.
 
+### 7.7 구현 결과 (V1b): LeRobot v3.0 내보내기, 그리고 포맷이 실제로 요구한 것
+
+V1의 데이터셋 오라클은 거부로 답했고(7.5절), V1b는 그 수리다 — 라이터 교체가 아니라 변환기.
+`es loop collect`는 여전히 `codebase_version: "v2.1"`을 쓴다. V2의 학습 스크립트가 그것을 직접 읽고,
+동시에 진행 중인 패킷 밑에서 포맷을 옮기는 것은 비싼 쪽의 정답이었을 것이다. 새 명령은
+`es dataset export --lerobot-v3 <root> --out <dir>`, 구현 전부는
+`crates/es-data/src/lerobot/v3.rs`, 포맷은 오라클 서버의 `lerobot` 0.6.1에 대해 고정해
+`docs/api-notes/lerobot-dataset.md`의 "LeRobot v3.0" 절에 적었다 — 설치된 패키지를 읽고 *또한*
+그것에 대해 실행해서, 파일 경로 단위로.
+
+**2026-09-15 측정**, `ES_LEROBOT_PYTHON=$HOME/venvs/es-lerobot-cuda/bin/python cargo test
+-p es-data --test lerobot_v3 -- --nocapture`: `RAN lerobot_v3_export`. `LeRobotDataset`가 내보낸
+것을 열어 `codebase_version 3.0`, 에피소드 2개 / 프레임 7개를 보고했고, 7프레임을 모두 순회했으며,
+`observation.state`와 `action`을 모든 프레임에서 우리가 쓴 parquet과 1e-5 이내로 일치하게,
+카메라를 `[3, 4, 6]` CHW 텐서로, 픽셀 합을 111.6706(우리 계산 28476/255 = 111.67059)으로 돌려줬다.
+옆의 v2.1 오라클은 여전히 거부를 사유로 `SKIP`을 출력한다. 0.6.1이 읽지 않는 포맷의 정직한 상태다.
+
+**v2.1 노트가 말하지 못했던, 포맷이 요구한 네 가지.**
+
+1. **`shape: [1]` 피처는 길이 1 리스트가 아니라 스칼라 컬럼이다.** `DatasetInfo.__post_init__`이
+   모든 `shape`를 튜플로 바꾸고, `get_hf_features_from_features`가 `len(shape) == 1`보다 먼저
+   `shape == (1,)`로 분기한다. v2.1 라이터는 모든 피처를 3-레벨 LIST로 내보내므로 `reward`,
+   `timestamp`와 네 개의 인덱스 컬럼이 나가는 길에 모양을 바꾼다. `[6]` 피처는 여전히 리스트다 —
+   선언이 `fixed_size_list<T>[6]`인 자리에 parquet 가변 `list<T>`가 와도 `datasets`가 캐스트하므로
+   기존 스키마 빌더를 재사용할 수 있다.
+2. **다섯 부기 컬럼은 `features`에 필수다.** 그것이 `Dataset.from_parquet(..., features=...)`을
+   구동하므로, 파일에는 있고 `info.json`에는 없는 컬럼은 무해한 덤이 아니다. v2.1이 `미검증`으로
+   남긴 질문에 v3.0이 답한다.
+3. **`meta/tasks.parquet`은 `pandas`로 읽히고, 태스크 문자열은 그 인덱스여야 한다.**
+   `dataset_reader.py:352`가 `self._meta.tasks.iloc[task_idx].name`이고, 행의 `.name`은 *인덱스*
+   값이다. parquet 컬럼 두 개로는 부족하다 — 파일은 푸터에 `task`를 `index_columns`로 지목하는
+   `pandas` key/value 메타데이터도 담는다. 내보내기가 Python 라이브러리의 내부 직렬화 관행을 쓰는
+   유일한 지점이고, api-note가 그 블록을 그대로 인용한다.
+4. **이미지는 비디오 코덱이 필요 없고, 써서도 안 된다.** `dtype: "image"`는 인코딩된 이미지 파일을
+   데이터 parquet 안에 `struct<bytes, path>`로 저장한다. `dtype: "video"`는 디코더가 필요하고,
+   오라클 서버의 `torchcodec`은 설치되어 있지만 로드되지 않아(`libnppicc.so.12` 없음) `pyav`로
+   폴백한다. 내보내기는 `image`를 쓰고, 어디서도 인코더가 돌지 않는다 — `~/.local/bin/ffmpeg`도,
+   Rust에서도, 오라클의 Python 쪽에서도.
+
+**여전히 PNG 크레이트는 없다.** 7.2절은 유일한 소비자가 numpy라서 이미지 인코더 추가를 거부했다.
+`lerobot`이 두 번째 소비자이고 디코드 가능한 파일을 원하므로, `v3.rs`가 ~70줄의 PNG를 담는다:
+8비트 트루컬러, 필터 0, *stored* deflate 블록의 zlib 스트림. 원시 프레임 대비 약 0.1%를 쓰고 PIL이
+여는 파일을 얻는다. 검사는 `png_round_trips`로, 인코더 자신의 출력을 되파싱한다 — 모든 청크 CRC,
+LEN/NLEN 쌍, Adler-32 — 그래서 인코더는 인터프리터가 필요 없는 오라클을 갖는다.
+
+**출처는 `info.json`이 아니라 사이드카다.** 스펙 §19.2에 따라 내보낸 것은 파생 산출물이므로
+`meta/es_provenance.json`이 원본의 `content`/`schema`/`split` 해시와 `codebase_version`을 기록한다.
+`info.json`의 추가 키가 아닌 이유는 `DatasetInfo.from_dict`가 모르는 키를 경고와 함께 버리고
+`to_dict`가 그것을 되쓰지 않기 때문이다 — 거기 넣은 출처는 LeRobot 쪽 재기록을 살아남지 못한다.
+
+**의도적으로 뺀 세 가지.**
+
+- **`meta/stats.json`을 쓰지 않는다.** 없으면 `load_stats`가 `None`을 돌려주고 읽기 경로에서
+  필요하지 않다. 그것은 학습의 정규화를 위한 것이다. 파일을 채우려고 통계를 지어내는 것은 빼는
+  것보다 나쁘고, 플랜 V에서 `lerobot`을 통해 학습하는 것은 없다.
+- **청크/파일 분할 없음.** `data/chunk-000/file-000.parquet` 하나와
+  `meta/episodes/chunk-000/file-000.parquet` 하나. `data_files_size_in_mb`는 권고값이고(리더는
+  `data/*/*.parquet`을 글롭한다), 내보내기는 현재 데이터셋 하나를 메모리에 올린다 — 그 한계는
+  소스에 그대로 표시했다.
+- **픽셀이 없는 카메라는 내보내지 않고 버린다.** `es loop collect`는 오늘 픽셀을 쓰지 않으므로
+  (7.5절) 픽셀은 `--frames <dir>`에서 온다: `<dir>/<name>/<NNNNNN>.bin`, `EnvRenderer`가 이미
+  쓰는 원시 덤프를 `observation.images.<name>`마다 하위 디렉터리 하나로. 그것이 없으면 피처를
+  버리고 명령이 그렇게 말한다. 아무도 못 읽을 이미지 피처를 선언하지 않는다.
+
 ## 8. 안전 오버레이 (V3)
 
 렌더된 프레임마다 V3는 `events.json`에 레코드 하나를 붙인다:
