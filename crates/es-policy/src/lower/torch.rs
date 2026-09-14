@@ -559,7 +559,12 @@ impl Lowering {
                 self.needs_torchvision = true;
                 self.member(id, &format!("_backbone({name:?}, {out_dim})"));
                 self.claim(id);
-                Ok(format!("self.n{k}({})", args[0]))
+                // A torchvision backbone is `nn.BatchNorm2d` all the way down, and that
+                // refuses a 3-D input outright ("expected 4D input (got 3D input)"). The IR
+                // port is one image (spec 8.3 has no batch axis — spec 5.2 gives the
+                // inference domain its own batch size), so run it as a one-image batch, the
+                // same trade the token-less `TemporalEncoder` arm below makes.
+                Ok(format!("self.n{k}({}.unsqueeze(0)).squeeze(0)", args[0]))
             }
 
             LearningNode::StateEncoder { kind, out_dim, .. } => match kind {

@@ -3428,3 +3428,202 @@ fn loop_collect_expert_needs_no_torch() {
     assert!(text.contains("terminations:"), "{text}");
     println!("RAN loop_collect_expert_needs_no_torch");
 }
+
+// --- plan V: `es policy lower` / `es policy pack` (packet M5/V2) ------------------------------
+
+/// A checkpoint that fits a lowered module exactly: every declared shape, plus one tensor
+/// standing in for each opaque sub-module a `prefix.*` claim covers.
+fn conforming_checkpoint(module: &es_policy::TorchModule) -> es_policy::weights::Checkpoint {
+    let mut file: es_policy::weights::Checkpoint = module
+        .weight_shapes
+        .iter()
+        .map(|(k, shape)| {
+            let n = shape.iter().product::<u64>() as usize;
+            (k.clone(), (shape.clone(), vec![0.01f32; n]))
+        })
+        .collect();
+    for claim in module.weight_keys.iter().filter(|k| k.ends_with(".*")) {
+        file.insert(
+            format!("{}conv1.weight", claim.trim_end_matches('*')),
+            (vec![2], vec![1.0, 2.0]),
+        );
+    }
+    file
+}
+
+/// `es policy lower` writes the module verbatim and a contract that describes it (spec 8.7).
+#[test]
+fn policy_lower_writes_the_module_and_contract() {
+    let dir = scratch_dir("policy-lower");
+    let policy = write_demo_bundle(&dir);
+    let build = dir.join("build");
+
+    let out = bin()
+        .args(["policy", "lower", "--policy"])
+        .arg(&policy)
+        .arg("--out")
+        .arg(&build)
+        .output()
+        .expect("run es policy lower");
+    let text = stdout(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout:\n{text}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The module is the IR's, byte for byte -- the packet's whole reason for existing.
+    let bytes = std::fs::read(&policy).expect("read policy.esb");
+    let bundle = es_compile::PolicyBundle::open(&bytes).expect("open policy.esb");
+    let module = es_policy::lower_to_torch(&bundle.learning).expect("the demo graph lowers");
+    let written = std::fs::read_to_string(build.join("es_policy.py")).expect("es_policy.py");
+    assert_eq!(written, module.source);
+
+    let contract: es_policy::lower::Contract = serde_json::from_str(
+        &std::fs::read_to_string(build.join("contract.json")).expect("contract.json"),
+    )
+    .expect("contract.json parses");
+    assert_eq!(
+        contract,
+        es_policy::lower::Contract::new(&module, &bundle.learning)
+    );
+    assert!(text.contains("lowering_hash: "), "{text}");
+}
+
+/// `INV-16`: the only weight format is safetensors, and a file that is not one is refused by
+/// the header reader before anything can execute. There is no pickle path to reach.
+#[test]
+fn policy_pack_rejects_a_non_safetensors_file() {
+    let dir = scratch_dir("policy-pack-pickle");
+    let policy = write_demo_bundle(&dir);
+    // A real pickle prologue. Nothing here unpickles it; it fails as a malformed header.
+    let pickled = dir.join("model.pkl");
+    std::fs::write(&pickled, b"\x80\x04\x95\x10\x00\x00\x00\x00\x00\x00\x00").expect("write");
+
+    let out = bin()
+        .args(["policy", "pack", "--policy"])
+        .arg(&policy)
+        .arg("--weights")
+        .arg(&pickled)
+        .arg("--out")
+        .arg(dir.join("trained.esb"))
+        .output()
+        .expect("run es policy pack");
+    let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(1), "{text}");
+    assert!(text.contains("safetensors"), "{text}");
+    assert!(
+        !dir.join("trained.esb").exists(),
+        "a refusal wrote a bundle"
+    );
+}
+
+/// Usage errors are exit 2, not 1 -- the distinction `main.rs` makes for every subcommand.
+#[test]
+fn policy_usage_errors_exit_2() {
+    for args in [
+        vec!["policy", "lower"],
+        vec!["policy", "lower", "--policy", "a.esb"],
+        vec!["policy", "pack", "--policy", "a.esb", "--out", "b.esb"],
+        vec!["policy", "lower", "--nonsense", "x"],
+        vec!["policy", "distill"],
+    ] {
+        let out = bin().args(&args).output().expect("run es policy");
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stdout(&out));
+    }
+    let help = bin()
+        .args(["policy", "--help"])
+        .output()
+        .expect("run es policy --help");
+    assert_eq!(help.status.code(), Some(0));
+    assert!(
+        stdout(&help).contains("es policy lower"),
+        "{}",
+        stdout(&help)
+    );
+}
+
+/// The packet's headline: a bundle `es policy pack` produced is loaded by `es eval run
+/// --policy` with **no change to the eval path** (`crates/es/src/cmd/eval.rs:387-393`). That is
+/// the assertion a `lower_act` bundle would fail, and it is why plan V does not use it
+/// (`docs/design/visible-learning.md` section 2.5).
+///
+/// Without `mujoco` and `torch` this is the SKIPPED path (exit 3), which still proves the
+/// bundle opened and its four IRs re-validated -- both happen before the availability check.
+#[test]
+fn policy_pack_output_is_accepted_by_eval_run() {
+    let dir = scratch_dir("policy-eval-run");
+    let f = deployable_fixture();
+    let untrained = dir.join("untrained.esb");
+    std::fs::write(&untrained, build_policy_bundle(&f)).expect("write untrained.esb");
+    let config = dir.join("eval.toml");
+    write(
+        &config,
+        &es_ir::serial::evaluation_to_toml(&f.evaluation).expect("evaluation toml"),
+    );
+
+    let module = es_policy::lower_to_torch(&f.learning).expect("the fixture graph lowers");
+    let weights = dir.join("model.safetensors");
+    std::fs::write(
+        &weights,
+        es_policy::weights::write_safetensors(&conforming_checkpoint(&module)),
+    )
+    .expect("write the checkpoint");
+
+    let trained = dir.join("trained.esb");
+    let packed = bin()
+        .args(["policy", "pack", "--policy"])
+        .arg(&untrained)
+        .arg("--weights")
+        .arg(&weights)
+        .arg("--out")
+        .arg(&trained)
+        .output()
+        .expect("run es policy pack");
+    assert_eq!(
+        packed.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&packed),
+        String::from_utf8_lossy(&packed.stderr)
+    );
+
+    let run = bin()
+        .args(["eval", "run", "--config"])
+        .arg(&config)
+        .arg("--policy")
+        .arg(&trained)
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .arg("--out")
+        .arg(dir.join("out"))
+        .output()
+        .expect("run es eval run");
+    let text = format!("{}{}", stdout(&run), String::from_utf8_lossy(&run.stderr));
+    if run.status.code() == Some(3) {
+        assert!(text.contains("SKIPPED"), "{text}");
+        println!(
+            "SKIP policy_pack_output_is_accepted_by_eval_run: {}",
+            text.trim()
+        );
+        return;
+    }
+    // Anything else: it must not have been the *policy load* that failed. What the run does
+    // after that is the Evaluation IR's business, not this packet's.
+    for refusal in [
+        "weights hash mismatch",
+        "does not match the lowered graph",
+        "malformed safetensors",
+        "no PyTorch lowering",
+    ] {
+        assert!(
+            !text.contains(refusal),
+            "eval run refused the packed bundle: {text}"
+        );
+    }
+    println!(
+        "RAN policy_pack_output_is_accepted_by_eval_run (exit {:?})",
+        run.status.code()
+    );
+}

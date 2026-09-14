@@ -628,6 +628,107 @@ question 2 in the direction of a v3 writer, and `docs/api-notes/lerobot-dataset.
 the writer is deliberately unchanged here, because the packet that changes it is the one that
 implements v3.0.
 
+### 7.6 As built (V2), and the six things the plan above did not know
+
+`es policy lower` and `es policy pack` (`crates/es/src/cmd/policy.rs`) are the Rust ends of
+section 6.2, and `python/es/train_act.py` is the optimizer between them. `es_policy::lower::Contract`
+is the whole of what crosses spec 2.3's split besides the module source. Everything else below
+is a finding, and four of the five are things the repo could not have known without running
+this leg for the first time.
+
+**1. The lowering emitted a module that could not run.** `VisionEncoder{ResNet18}` lowered to
+`self.n0(inputs["rgb_overhead"])`, and the IR port is one image — `[3, 96, 96]`, no batch axis,
+because spec 5.2 gives the inference domain its own batch size. Every torchvision backbone is
+`nn.BatchNorm2d` all the way down, and that refuses a 3-D input outright: *"expected 4D input
+(got 3D input)"*. No test had ever caught it, because the only graph `torch_equivalence.rs`
+puts through PyTorch is a state-only MLP (`a_state_only_graph_lowers_to_torch_alone`), and
+`es_ir::learning::testing::act_like` declares `[3, 224, 224]` — the same shape, the same
+failure. **Every** `lower_to_torch` consumer with a vision encoder was broken, so the fix is one
+line in the lowering rather than a workaround in this packet: run it as a one-image batch,
+`self.n0(x.unsqueeze(0)).squeeze(0)`, which is exactly the trade the token-less
+`TemporalEncoder` arm two branches down already makes. That widens V2's declared context by
+`crates/es-policy/src/lower/torch.rs`; the `lowering_hash` of any graph with a vision encoder
+moves, and no golden pins it.
+
+**2. The collector had a frame sink and no caller, so V2 wired one.** V1 implemented
+`CollectSpec`'s `FrameSink` in `es-data` and tested it there, but nothing ever handed the CLI
+one: `crates/es/src/cmd/loop.rs` passed `None`, so every `es loop collect` run printed *"camera
+`rgb_overhead`: `info.json` declares a video feature ... but no mp4 was written"* and the
+dataset carried no pixels at all. `es loop collect --frames <dir>` now builds the `Gpu` and the
+`EnvRenderer` inside the collect call — that borrow is exactly why `Env` does not hold a
+renderer (section 7.4) — configures it from the Task IR's own image channel and its `ImageSpec`,
+and writes `<dir>/<NNNNNN>.bin` + `.json`, one raw tile per control step, in the format the
+render goldens and `es video mosaic` already use. It is behind a new `render` feature on `es`,
+off by default, so the ordinary CLI still links no Vulkan (spec 4.2); a build without the
+feature refuses `--frames` rather than writing a dataset with a hole in it. Measured on the
+oracle server: a 352-step demonstration renders in 1.8 s, and the "no mp4 was written" warning
+is gone.
+
+**3. Training re-implements exactly one Observation IR node, and that is a debt.** The tile is
+HWC `u8`; the Learning IR input is CHW `f32`. At inference the Observation IR's compiled plan
+does that conversion with `Op::Dequantize` (`es_compile::plan::Op::Dequantize`). Python has no
+plan runner, so `train_act.py`'s `dequantize` **is** that node, and it is the only place in this
+repo where an IR node has a second implementation. It survives only because the demo's
+Observation IR is exactly `ImageInput -> Dequantize -> sink`: the moment a second node appears
+between the image port and the Learning IR input, training and inference silently disagree. The
+real fix is an `es` step that bakes the observation plan over a dataset, which is a packet and
+not a line.
+
+**4. `es eval run` still cannot feed an image, so V2 reports no success rate.**
+`Evaluation::run` passes `frames: None` and `capture` refuses an image input by name
+(`crates/es-eval/src/runner.rs:475-481`) — deliberately, "a wrong number in the spec 10.1 table
+is worse than no table". `Evaluation::run_with_frames` and the `renderer_cfg` this packet added
+to `cmd/loop.rs` are between them everything V3 needs to close that, but closing it is V3's, and
+so is the demo's `evaluation.toml`, which does not exist yet. The strongest honest claim V2
+makes about the trained bundle is the packet's own: `es eval run --policy trained.esb` **gets
+past `TorchRuntime::load`**, which is the assertion a `lower_act` bundle fails (section 2.5).
+
+**5. `es loop collect --episodes N` only solves episode 0.** Measured on the oracle server:
+`--episodes 50 --seed 1` ends `success 1, timeout 49`, while the same seeds run one episode at
+a time (`--episodes 1 --seed s`, `s = 1..50`) end 49 successes and one timeout. Something the
+scripted expert or the collector carries across an episode boundary is not reset —
+`Collector::run`'s loop, `ScriptedExpert`'s waypoint state, or the arm's own pose. This is V1
+code and V2 does not touch it; V2's dataset is 50 single-episode runs merged with
+`es loop distill`, and the defect wants a V1 follow-up packet. It also means V1's oracle
+(`expert_solves_the_pinned_seeds`, eight seeds at one episode each) could not have seen it.
+
+**6. It is `policy_hash`, not `learning_hash`, that a checkpoint moves.** Section 6.2 and the
+packet both said `policy_hash`, and that is right, but it is worth pinning: `learning_hash`
+covers the graph (`canon_learning`) and does not move, while `policy_hash` hashes `WeightsRef`
+into it (`LearningGraph::policy_hash`) and does. `pack_recomputes_the_manifest_rather_than_patching_it`
+asserts all four slots: `policy` moves, `learning`, `task` and `observation` do not.
+
+**Open question 6 is answered, and a smaller one opens.** `_backbone` is
+`getattr(torchvision.models, name)()` with no `weights=` argument, so training is from scratch
+and needs no network at any point. The Learning IR node carries `pretrained = true`, and the
+lowering **ignores it** — a silent divergence between what the IR declares and what runs. It is
+harmless today (the answer we want is "from scratch") and it should either be honoured or
+rejected rather than dropped.
+
+**What was measured, on the oracle server (RTX 4090, `~/venvs/es-lerobot-cuda`, torch
+2.11.0+cu129).** 50 demonstrations, 50 of them `Success`, 17,697 frames: 3.4 MB of LeRobot v2.1
+parquet and 485 MB of rendered tiles. A five-episode held-out set from seeds 101-105, 4 of 5
+`Success`. Training ran 20,000 optimizer steps at `--batch 8` (the lowered module is
+single-sample — `reshape(horizon, action_dim)` and `[:execute_chunk]` carry no batch axis — so a
+batch is accumulated, one forward at a time), and the L1 chunk loss fell 0.727 -> 0.0507 ->
+0.0309 -> 0.0171 at steps 1 / 1,000 / 5,000 / 20,000. Every wall clock is an observation and not
+a claim, and no throughput figure is stated anywhere (spec 12.4). The 20k checkpoint is 61 MB and
+is **not** committed; it lives on the server under `~/artifacts/plan-v/`, and its blake3 is
+recorded in `docs/packets/M5/V2-act-training.md`.
+
+**Deviations from the packet's acceptance, all deliberate.** `train_act.py` takes three flags the
+packet did not list — `--checkpoint-at` (which also caps the run, so "20,000 steps" is exact),
+`--loss-curve`, and `--frames` for the tiles the collector now writes — and its JSON line carries
+five keys beyond the three the packet pinned.
+`the_loss_falls` and `the_packed_bundle_round_trips` are one test, because fact 4 needs fact 3's
+checkpoint and training twice to keep two names would be waste. `eval_run_accepts_the_trained_bundle`
+moved to `crates/es/tests/cli.rs` as `policy_pack_output_is_accepted_by_eval_run`, because the
+Evaluation IR fixture lives there and `tests/fixtures/visible-learning/` has no `evaluation.toml`
+(that is V3's document). The round-trip also got stronger than the packet asked: it compares
+`TorchRuntime::infer` against a *direct* PyTorch forward on a held-out observation at spec 8.9's
+tier-4 fp32 tolerance, which covers the safetensors writer, `pack`'s validation, the
+`nodes.N` -> `nN` rename and the wire protocol in one number.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:

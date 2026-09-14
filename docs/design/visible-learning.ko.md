@@ -609,6 +609,102 @@ v2.1 → v3.0 변환기를 안내한다. 이는 미해결 질문 2를 v3 writer 
 `docs/api-notes/lerobot-dataset.ko.md`가 이를 기록한다. writer는 여기서 의도적으로 건드리지 않는다.
 그것을 바꾸는 패킷은 v3.0을 구현하는 패킷이기 때문이다.
 
+### 7.6 V2 실제 구현, 그리고 위 계획이 몰랐던 여섯 가지
+
+`es policy lower`와 `es policy pack` (`crates/es/src/cmd/policy.rs`)이 6.2절의 Rust 쪽 양 끝이고,
+`python/es/train_act.py`가 그 사이의 옵티마이저다. `es_policy::lower::Contract`가 모듈 소스를
+제외하면 스펙 2.3의 분할선을 넘는 것의 전부다. 아래는 전부 발견 사항이며, 다섯 중 넷은 이
+구간을 처음 실제로 돌려보지 않고서는 알 수 없던 것들이다.
+
+**1. 로워링이 실행 불가능한 모듈을 만들고 있었다.** `VisionEncoder{ResNet18}`은
+`self.n0(inputs["rgb_overhead"])`로 내려가고, IR 포트는 이미지 한 장 — `[3, 96, 96]`, 배치 축
+없음. 스펙 5.2가 추론 도메인에 자체 배치 크기를 주기 때문이다. 그런데 torchvision 백본은
+바닥까지 `nn.BatchNorm2d`이고, 이것은 3차원 입력을 그냥 거부한다: *"expected 4D input (got 3D
+input)"*. 어떤 테스트도 이를 잡지 못했는데, `torch_equivalence.rs`가 PyTorch에 태우는 유일한
+그래프가 state-only MLP(`a_state_only_graph_lowers_to_torch_alone`)이고,
+`es_ir::learning::testing::act_like`는 `[3, 224, 224]`을 선언한다 — 같은 모양, 같은 실패.
+비전 인코더를 가진 **모든** `lower_to_torch` 소비자가 깨져 있었으므로, 수정은 이 패킷 안의
+우회가 아니라 로워링의 한 줄이다: 이미지 한 장짜리 배치로 돌린다 —
+`self.n0(x.unsqueeze(0)).squeeze(0)`. 바로 두 갈래 아래의 토큰 없는 `TemporalEncoder` 가지가
+이미 하고 있는 것과 같은 거래다. 이로써 V2의 선언된 context에
+`crates/es-policy/src/lower/torch.rs`가 하나 늘었다. 비전 인코더가 있는 그래프의
+`lowering_hash`는 이동하며, 이를 고정하는 골든은 없다.
+
+**2. 수집기에는 frame sink가 있었지만 호출자가 없었다. 그래서 V2가 연결했다.** V1은
+`CollectSpec`의 `FrameSink`를 `es-data`에 구현하고 거기서 테스트했지만, CLI에 그것을 넘겨주는
+곳이 없었다: `crates/es/src/cmd/loop.rs`가 `None`을 넘겼고, 그래서 모든 `es loop collect` 실행이
+*"camera `rgb_overhead`: `info.json` declares a video feature ... but no mp4 was written"*를
+출력했으며 데이터셋에는 픽셀이 전혀 없었다. 이제 `es loop collect --frames <dir>`가 collect 호출
+안에서 `Gpu`와 `EnvRenderer`를 만든다 — 바로 그 borrow가 `Env`가 렌더러를 들고 있지 않은
+이유다(7.4절) — Task IR 자신의 이미지 채널과 `ImageSpec`으로 설정하고, 컨트롤 스텝마다 raw tile
+하나를 `<dir>/<NNNNNN>.bin` + `.json`으로 쓴다. 렌더 골든과 `es video mosaic`이 이미 쓰는 형식이다.
+`es`의 새 `render` 피처 뒤에 있고 기본은 꺼져 있으므로, 평소의 CLI는 여전히 Vulkan을 전혀 링크하지
+않는다(스펙 4.2). 피처 없는 빌드는 구멍 뚫린 데이터셋을 쓰는 대신 `--frames`를 거부한다. 오라클
+서버에서 측정: 352 스텝 시연 하나가 1.8초에 렌더되고, "no mp4 was written" 경고는 사라졌다.
+
+**3. 학습이 Observation IR 노드를 정확히 하나 재구현한다. 그리고 그것은 부채다.** tile은 HWC
+`u8`이고 Learning IR 입력은 CHW `f32`다. 추론에서는 Observation IR의 컴파일된 plan이
+`Op::Dequantize`(`es_compile::plan::Op::Dequantize`)로 그 변환을 한다. Python 쪽에는 plan 러너가
+없으므로 `train_act.py`의 `dequantize`가 **그 노드다**. 이 저장소에서 IR 노드가 두 번째 구현을
+갖는 유일한 곳이다. 데모의 Observation IR이 정확히 `ImageInput -> Dequantize -> sink`이기 때문에만
+성립한다: 이미지 포트와 Learning IR 입력 사이에 노드가 하나라도 더 생기는 순간 학습과 추론이
+조용히 어긋난다. 진짜 해법은 데이터셋 위에 observation plan을 굽는 `es` 단계이고, 그것은 한 줄이
+아니라 패킷이다.
+
+**4. `es eval run`은 여전히 이미지를 넣을 수 없다. 그래서 V2는 성공률을 보고하지 않는다.**
+`Evaluation::run`은 `frames: None`을 넘기고 `capture`는 이미지 입력을 이름을 대며 거부한다
+(`crates/es-eval/src/runner.rs:475-481`). 의도적이다 — "스펙 10.1 표의 틀린 숫자는 표가 없는 것보다
+나쁘다". `Evaluation::run_with_frames`와 이 패킷이 `cmd/loop.rs`에 넣은 `renderer_cfg`가 둘이서
+V3가 그것을 닫는 데 필요한 전부지만, 닫는 것은 V3의 몫이고 아직 존재하지 않는 데모
+`evaluation.toml`도 마찬가지다. 학습된 번들에 대해 V2가 하는 가장 강한 정직한 주장은 패킷 자신의
+것이다: `es eval run --policy trained.esb`가 **`TorchRuntime::load`를 통과한다**. `lower_act`
+번들이라면 실패할 단언이다(2.5절).
+
+**5. `es loop collect --episodes N`은 0번 에피소드만 푼다.** 오라클 서버에서 측정:
+`--episodes 50 --seed 1`은 `success 1, timeout 49`로 끝나는 반면, 같은 시드를 한 에피소드씩
+돌리면(`--episodes 1 --seed s`, `s = 1..50`) 49 성공 1 타임아웃이다. 스크립트 전문가 또는
+수집기가 에피소드 경계를 넘어 들고 가는 무언가가 리셋되지 않는다 — `Collector::run`의 루프,
+`ScriptedExpert`의 웨이포인트 상태, 또는 팔의 자세. 이것은 V1 코드이고 V2는 건드리지 않는다.
+V2의 데이터셋은 단일 에피소드 실행 50개를 `es loop distill`로 병합한 것이며, 이 결함은 V1
+후속 패킷이 필요하다. 아울러 V1의 오라클(`expert_solves_the_pinned_seeds`, 시드 8개를 각각 한
+에피소드씩)은 이것을 볼 수 없었다는 뜻이기도 하다.
+
+**6. 체크포인트가 움직이는 것은 `learning_hash`가 아니라 `policy_hash`다.** 6.2절과 패킷 모두
+`policy_hash`라고 했고 그게 맞지만, 못 박아 둘 가치가 있다: `learning_hash`는 그래프를
+덮고(`canon_learning`) 움직이지 않으며, `policy_hash`는 `WeightsRef`를 그 안에 해싱하므로
+(`LearningGraph::policy_hash`) 움직인다.
+`pack_recomputes_the_manifest_rather_than_patching_it`이 네 슬롯을 모두 단언한다: `policy`는
+움직이고 `learning`, `task`, `observation`은 움직이지 않는다.
+
+**미결 질문 6은 답이 나왔고, 더 작은 것이 하나 열렸다.** `_backbone`은 `weights=` 인자 없는
+`getattr(torchvision.models, name)()`이므로, 학습은 처음부터(from scratch)이고 어느 시점에도
+네트워크가 필요 없다. Learning IR 노드는 `pretrained = true`를 들고 있고, 로워링은 그것을
+**무시한다** — IR이 선언한 것과 실제로 도는 것 사이의 조용한 불일치다. 오늘은 무해하지만
+(우리가 원하는 답이 "from scratch"다) 존중하거나 거부해야지 버려서는 안 된다.
+
+**측정된 것, 오라클 서버에서 (RTX 4090, `~/venvs/es-lerobot-cuda`, torch 2.11.0+cu129).**
+시연 50개, 그중 50개가 `Success`, 프레임 17,697개: LeRobot v2.1 parquet 3.4 MB와 렌더된 tile
+485 MB. 시드 101-105의 held-out 5개 에피소드, 5개 중 4개 `Success`. 학습은 `--batch 8`로 20,000
+optimizer step을 돌았고(로워링된 모듈은 single-sample이다 — `reshape(horizon, action_dim)`과
+`[:execute_chunk]`에 배치 축이 없다 — 그래서 배치는 forward 한 번씩 누적된다), 액션 청크 L1 loss는
+step 1 / 1,000 / 5,000 / 20,000에서 0.727 -> 0.0507 -> 0.0309 -> 0.0171로 떨어졌다. 모든 벽시계
+시간은 관측이지 주장이 아니며, 어떤 처리량 수치도 어디에도 적지 않는다(스펙 12.4). 20k
+체크포인트는 61 MB이고 커밋하지 **않는다**. 서버의 `~/artifacts/plan-v/` 아래에 있고 blake3은
+`docs/packets/M5/V2-act-training.md`에 기록한다.
+
+**패킷 acceptance로부터의 이탈, 전부 의도적이다.** `train_act.py`는 패킷에 없던 플래그 세 개를
+받는다 — `--checkpoint-at`(실행 길이도 상한으로 잡으므로 "20,000 step"이 정확하다),
+`--loss-curve`, 그리고 수집기가 이제 쓰는 tile을 읽는 `--frames` — 그리고 JSON 한 줄에 패킷이 못
+박은 셋 외에 다섯 개의 키를 더 싣는다.
+`the_loss_falls`와 `the_packed_bundle_round_trips`는 한 테스트다. 사실 4가 사실 3의
+체크포인트를 필요로 하고, 이름 둘을 지키자고 두 번 학습하는 것은 낭비이기 때문이다.
+`eval_run_accepts_the_trained_bundle`은 `crates/es/tests/cli.rs`의
+`policy_pack_output_is_accepted_by_eval_run`으로 옮겼다. Evaluation IR 픽스처가 거기 있고
+`tests/fixtures/visible-learning/`에는 `evaluation.toml`이 없기 때문이다(그것은 V3의 문서다).
+round-trip은 패킷이 요구한 것보다 강해졌다: held-out 관측 하나에 대해 `TorchRuntime::infer`를
+*직접* PyTorch forward와 스펙 8.9의 tier-4 fp32 허용오차로 비교한다. safetensors writer,
+`pack`의 검증, `nodes.N` -> `nN` 이름 변환, 와이어 프로토콜을 한 숫자로 덮는다.
+
 ## 8. 안전 오버레이 (V3)
 
 렌더된 프레임마다 V3는 `events.json`에 레코드 하나를 붙인다:

@@ -14,6 +14,9 @@ path = "src/main.rs"
 # `es task generate --provider anthropic` (spec 14.5); off by default so the default build
 # never links a TLS stack (see crates/es-script/Cargo.toml's own `llm` feature).
 es-script-llm = ["es-script/llm"]
+# `es loop collect --frames` (spec 15.2, packet M5/V2). Off by default so the default build of
+# the CLI links no Vulkan at all -- the same trade `es-env`'s own `render` feature makes.
+render = ["es-env/render", "dep:es-gpu"]
 
 [dependencies]
 es-ir = { workspace = true }
@@ -29,6 +32,7 @@ es-env = { workspace = true }
 es-safety = { workspace = true }
 es-policy = { workspace = true }
 es-script = { workspace = true }
+es-gpu = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
