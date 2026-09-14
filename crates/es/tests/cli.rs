@@ -859,6 +859,50 @@ fn missing_file_exits_1() {
     assert_eq!(out.status.code(), Some(1));
 }
 
+#[test]
+fn video_usage_errors_exit_2() {
+    // No flags at all is a usage error, not a runtime one (see `crates/es/tests/video.rs` for
+    // the mosaic's own behavior tests).
+    let out = bin().args(["video", "mosaic"]).output().expect("run es");
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+}
+
+#[test]
+fn video_mosaic_missing_events_is_exit_1() {
+    let dir = scratch_dir("video-missing-events");
+    let frames = dir.join("frames");
+    let cell = frames.join("00");
+    std::fs::create_dir_all(&cell).expect("create cell dir");
+    write(
+        &cell.join("layout.json"),
+        r#"{"shape":[2,2,3],"dtype":"u8"}"#,
+    );
+    std::fs::write(cell.join("000000.bin"), [0u8; 12]).expect("write frame");
+    let report = dir.join("report.json");
+    write(
+        &report,
+        r#"{"cells":[{"metric":"success_rate","value":{"scalar":1.0},"n_episodes":1}]}"#,
+    );
+    let out_dir = dir.join("out");
+
+    // Every required flag is present and well-formed; only the file --events names is
+    // missing, so this is a runtime failure (exit 1), not a usage error (exit 2).
+    let out = bin()
+        .args(["video", "mosaic"])
+        .arg("--frames")
+        .arg(&frames)
+        .arg("--events")
+        .arg(dir.join("does-not-exist.json"))
+        .arg("--report")
+        .arg(&report)
+        .args(["--grid", "1x1"])
+        .arg("--out")
+        .arg(&out_dir)
+        .output()
+        .expect("run es");
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+}
+
 /// The shared MJCF fixture (`option cone="elliptic"`), also used by `es-physics-backend`'s own
 /// mapping tests: it blocks `mjwarp` (spec 17.2 maps `MJWarp`'s cone to pyramidal only) but not
 /// `mujoco-cpu`.

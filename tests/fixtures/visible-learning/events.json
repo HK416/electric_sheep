@@ -1,0 +1,226 @@
+{
+  "00": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "01": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Clamped",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "02": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Fallback",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "03": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Human",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Human",
+      "tick": 1
+    }
+  ],
+  "04": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "05": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "06": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "07": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "08": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "09": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "10": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "11": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "12": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "13": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "14": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ],
+  "15": [
+    {
+      "events": [],
+      "frame": 0,
+      "source": "Policy",
+      "tick": 0
+    },
+    {
+      "events": [],
+      "frame": 1,
+      "source": "Policy",
+      "tick": 1
+    }
+  ]
+}

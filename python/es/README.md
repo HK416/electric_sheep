@@ -26,3 +26,15 @@ fails loudly instead of producing IR that validates against the wrong bodies (M4
 maturin develop --release --features python   # from this directory, once, to build es_native
 PYTHONPATH=python <venv>/Scripts/python.exe -m es.selfcheck
 ```
+
+## `encode_video.py`
+
+Unrelated to the builder above: `encode_video.py` is a standalone script (M5 V4, design note
+`docs/design/visible-learning.md` sections 2.9, 9) that turns `es video mosaic`'s raw frame
+output into an `.mp4`, with `cv2.VideoWriter` (`mp4v` fourcc -- the only codec that opens on the
+oracle server; there is no `ffmpeg` binary there). It is the one Python step in that packet; `es
+video mosaic` itself is pure Rust. Needs a Python with `opencv-python`:
+
+```
+<venv>/bin/python python/es/encode_video.py --frames <mosaic dir> --out demo.mp4 --fps 10
+```
