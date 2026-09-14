@@ -38,3 +38,44 @@ video mosaic` itself is pure Rust. Needs a Python with `opencv-python`:
 ```
 <venv>/bin/python python/es/encode_video.py --frames <mosaic dir> --out demo.mp4 --fps 10
 ```
+
+## `train_act.py`
+
+Also unrelated to the builder: `train_act.py` is the optimizer half of the spec 2.3 training
+split (M5 V2, design note `docs/design/visible-learning.md` sections 6, 7.6). It is the **only**
+Python in that packet — `es policy lower` and `es policy pack` are Rust and need no interpreter.
+
+```
+es policy lower --policy untrained.esb --out build/
+<venv>/bin/python python/es/train_act.py --module build/ --dataset ds/ --out model.safetensors \
+    [--epochs N] [--batch N] [--lr F] [--seed N] [--device cuda] \
+    [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json]
+es policy pack --policy untrained.esb --weights model.safetensors --out trained.esb
+```
+
+It `exec`s the `build/es_policy.py` that `es policy lower` wrote — the module
+`es_policy::lower::lower_to_torch` generated from the bundle's own `LearningGraph` — and
+optimizes that and nothing else. **It defines no layer**: the architecture comes from the
+Learning IR or it does not come, which is what makes spec 1.4's "the same IR run in PyTorch is
+the ground truth" literally true rather than approximately true.
+`crates/es-policy/tests/ir_training.rs` asserts both halves of that (a byte-equality check
+against the lowering, and a source scan of this file).
+
+It writes safetensors keyed exactly as `build/contract.json` declares, so `es policy pack` can
+check every key and shape before admitting it into a bundle (spec 25.1). No format that can
+execute code on load is read or written anywhere on this path (`INV-16`).
+
+Two things it needs to be told about, both recorded in the design note:
+
+- the dataset is read with `pyarrow` straight off disk, not through
+  `lerobot.datasets.LeRobotDataset`, which refuses this repo's `codebase_version: "v2.1"`;
+- pixels are the `<NNNNNN>.bin` tiles `es loop collect --frames` wrote, one per control step, in
+  dataset frame order. Without `--frames` an image port is fed zeros and said so in the output
+  JSON, because a silently-zero input is the failure mode that looks like a trained policy;
+- the HWC `u8` tile becomes a CHW `f32` input here rather than in the Observation IR's plan. That
+  is the one place in the repo where an IR node (`Op::Dequantize`) has a second implementation,
+  and it holds only while the demo's Observation IR is exactly `ImageInput -> Dequantize -> sink`;
+- the lowered module is single-sample, so `--batch N` accumulates N samples into one optimizer
+  step rather than running one batched forward.
+
+Needs a Python with `torch`, `torchvision` and `pyarrow`.

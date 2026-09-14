@@ -41,3 +41,43 @@ PYTHONPATH=python <venv>/Scripts/python.exe -m es.selfcheck
 ```
 <venv>/bin/python python/es/encode_video.py --frames <mosaic dir> --out demo.mp4 --fps 10
 ```
+
+## `train_act.py`
+
+이것도 위 빌더와는 무관하다: `train_act.py`는 스펙 2.3 학습 분할의 옵티마이저 쪽이다
+(M5 V2, 설계 노트 `docs/design/visible-learning.md` 6절, 7.6절). 그 패킷에서 **유일한**
+Python이다 — `es policy lower`와 `es policy pack`은 Rust이고 인터프리터가 필요 없다.
+
+```
+es policy lower --policy untrained.esb --out build/
+<venv>/bin/python python/es/train_act.py --module build/ --dataset ds/ --out model.safetensors \
+    [--epochs N] [--batch N] [--lr F] [--seed N] [--device cuda] \
+    [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json]
+es policy pack --policy untrained.esb --weights model.safetensors --out trained.esb
+```
+
+`es policy lower`가 쓴 `build/es_policy.py` — 번들 자신의 `LearningGraph`로부터
+`es_policy::lower::lower_to_torch`가 생성한 모듈 — 을 `exec`하고, 그것만 최적화한다.
+**레이어를 하나도 정의하지 않는다**: 아키텍처는 Learning IR에서 오거나 아예 오지 않는다.
+이것이 스펙 1.4의 "같은 IR을 PyTorch로 돌린 것이 ground truth"를 근사적으로가 아니라
+문자 그대로 참으로 만든다. `crates/es-policy/tests/ir_training.rs`가 양쪽을 모두 검사한다
+(로워링과의 바이트 일치 검사, 그리고 이 파일에 대한 소스 스캔).
+
+`build/contract.json`이 선언한 그대로의 키로 safetensors를 쓰므로, `es policy pack`이
+번들에 받아들이기 전에 모든 키와 shape을 검사할 수 있다 (스펙 25.1). 이 경로 어디에서도
+로드 시 코드를 실행할 수 있는 포맷은 읽지도 쓰지도 않는다 (`INV-16`).
+
+알아둬야 할 두 가지, 둘 다 설계 노트에 기록되어 있다:
+
+- 데이터셋은 `lerobot.datasets.LeRobotDataset`이 아니라 `pyarrow`로 디스크에서 직접 읽는다.
+  그 클래스는 이 저장소의 `codebase_version: "v2.1"`을 거부한다;
+- 픽셀은 `es loop collect --frames`가 쓴 `<NNNNNN>.bin` tile이다. 컨트롤 스텝마다 하나씩,
+  데이터셋 프레임 순서로. `--frames` 없이는 이미지 포트에 0이 들어가고 그 사실이 출력 JSON에
+  적힌다. 조용히 0인 입력은 학습된 정책처럼 보이는 실패 모드이기 때문이다;
+- HWC `u8` tile을 CHW `f32` 입력으로 바꾸는 일은 Observation IR의 plan이 아니라 여기서 한다.
+  저장소에서 IR 노드(`Op::Dequantize`)가 두 번째 구현을 갖는 유일한 곳이며, 데모의 Observation
+  IR이 정확히 `ImageInput -> Dequantize -> sink`인 동안에만 성립한다;
+- 로워링된 모듈은 single-sample이므로, `--batch N`은 배치 forward 한 번이 아니라 N개 샘플을
+  한 optimizer step으로 누적한다.
+
+`torch`, `torchvision`, `pyarrow`가 설치된 Python이 필요하다.

@@ -8,10 +8,14 @@ which is why this packet trains the IR-owned graph instead. Depends on V1 (the d
 
 ```
 crates/es/src/cmd/policy.rs
+crates/es/src/cmd/loop.rs
 crates/es/src/cmd/mod.rs
+crates/es/Cargo.toml
+xtask/src/main.rs
 crates/es/src/main.rs
 crates/es/tests/cli.rs
 crates/es-policy/src/lower/mod.rs
+crates/es-policy/src/lower/torch.rs
 python/es/train_act.py
 python/es/README.md
 python/es/README.ko.md
@@ -146,3 +150,91 @@ python/es/train_act.py --module <dir> --dataset <root> --out model.safetensors \
   (`crates/es-data/src/collect.rs:650-665`) — a fabricated digest makes `training_hash` a lie.
 - `crates/es-env`, `crates/es-eval`, `crates/es-render`, `crates/es-data` — V0b, V1, V3.
 - Reporting any wall-clock training figure as fact.
+
+## as built
+
+Design note: `docs/design/visible-learning.md` section 7.6 carries the findings; this section
+carries the deltas to the packet above and the artifacts.
+
+**The `## context` gained one file.** `crates/es-policy/src/lower/torch.rs`, for one line.
+`VisionEncoder{ResNet18}` lowered to `self.n0(inputs["rgb_overhead"])` over a `[3, 96, 96]` IR
+port, and every torchvision backbone is `nn.BatchNorm2d`, which refuses a 3-D input: *"expected
+4D input (got 3D input)"*. The lowering therefore emitted a module that had never run and could
+not run, for every graph with a vision encoder — `torch_equivalence.rs` only ever puts a
+state-only MLP through PyTorch. The fix is `self.n0(x.unsqueeze(0)).squeeze(0)`, the same trade
+the token-less `TemporalEncoder` arm already makes, in the lowering rather than in this packet,
+because every caller routes through it. No golden pins a `lower_to_torch` lowering hash.
+
+**Three flags `train_act.py` gained.** `--checkpoint-at 1000,5000,20000` (which also caps the run,
+so a step count is exact rather than an epoch's rounding), `--loss-curve curve.json`, and
+`--frames <dir>` for the tiles the collector now writes. Its one JSON line carries `samples`,
+`batch`, `chunk`, `zero_filled_inputs` and `image_inputs` beyond the three keys the acceptance
+pinned; the oracle reads only the three.
+
+**Test names.** `the_loss_falls` and `the_packed_bundle_round_trips` are one test,
+`the_loss_falls_and_the_packed_bundle_round_trips`, because fact 4 needs fact 3's checkpoint.
+`eval_run_accepts_the_trained_bundle` is `policy_pack_output_is_accepted_by_eval_run` in
+`crates/es/tests/cli.rs`, where the Evaluation IR fixture lives —
+`tests/fixtures/visible-learning/` has no `evaluation.toml`, which is V3's document. The
+round-trip is stronger than asked: it compares `TorchRuntime::infer` against a *direct* PyTorch
+forward on a held-out observation at spec 8.9's tier-4 fp32 tolerance.
+
+**One thing the packet did not scope, added on the orchestrator's decision.**
+`es loop collect` had a `FrameSink` and no caller (`crates/es/src/cmd/loop.rs` passed `None`), so
+the dataset carried no pixels and the image port would have trained on zeros. `--frames <dir>`
+now builds the `Gpu` and the `EnvRenderer` in the collect call, configures them from the Task
+IR's own image channel and `ImageSpec`, and writes one raw tile per control step. It is behind a
+new `render` feature on `es`, off by default so the ordinary CLI links no Vulkan (spec 4.2);
+without it the flag is refused rather than silently ignored. `xtask` gates `es/render` in the PR
+tier alongside `es-env/render`, because a branch CI never compiles is a branch that rots. That
+adds `crates/es/src/cmd/loop.rs`, `crates/es/Cargo.toml` and `xtask/src/main.rs` to the context.
+Design note 7.6 items 2-3 carry it, including the one debt it creates: `train_act.py` now
+re-implements `Op::Dequantize`, the single Observation IR node between the tile and the Learning
+IR input.
+
+**Two things this packet found that it does not own** (design note 7.6, items 4-5): `es eval run`
+still cannot feed an image input (`es-eval/src/runner.rs:475-481`), so **V2 states no success
+rate** — its claim is the packet's own, that the bundle gets past `TorchRuntime::load`, and the
+demo's `evaluation.toml` does not exist yet either; and `es loop collect --episodes N` solves
+only episode 0 (`--episodes 50 --seed 1` ends `success 1, timeout 49`; the same seeds one
+episode at a time end 49 successes). Both are V1/V3 code.
+
+### artifacts (oracle server, RTX 4090, `~/venvs/es-lerobot-cuda`, torch 2.11.0+cu129)
+
+Nothing below is committed. Everything lives under `~/artifacts/plan-v/` on the oracle server;
+the generator for each is the command in the table.
+
+| Artifact | How | Size / value |
+|---|---|---|
+| `ds-train` + `frames-train` | `es loop collect --expert so101-pick-place --episodes 1 --seed s --frames ...`, `s = 1..50`, merged by `es loop distill` | 50 episodes, 17,697 frames, 3.4 MB parquet + 485 MB of tiles, **50/50 `Success`** |
+| `ds-holdout` + `frames-holdout` | the same, seeds 101-105 | 5 episodes, 2,313 frames, 464 KB + 64 MB, 4/5 `Success` |
+| `build/` | `es policy lower --policy untrained.esb --out build/` | `lowering_hash 956abb67775d4db61177fae4051e3883628e07183e4925483bca1e0249aeec6d`, 10 weight keys (8 exact, 2 prefix claims) |
+| `model-1000.safetensors` | `train_act.py --frames frames-train --batch 8 --lr 1e-4 --seed 0 --device cuda --checkpoint-at 1000,5000,20000` | 61 MB, 142 tensors, blake3 `57c7e537fbfde3711e76582edc796fca09d0cbc3a2411cbe2e242c6b5b2bf1e8` |
+| `model-5000.safetensors` | the same run | blake3 `ae1c38c5662226887eecff6473d44a9f61a51fd2d1e7782c403eb146e3bba2b0` |
+| `model-20000.safetensors` | the same run | blake3 `0f0ad5c80faeebd698ae7fecd579b724502d278bd5c0af8e8479d73e064f476a` |
+| `trained-20000.esb` | `es policy pack --policy untrained.esb --weights model-20000.safetensors` | `policy_hash 840aef948493bc59e74e510bfe1e87cdce3291cbdb1ed40f4364db1e34aa3662` |
+| `loss-curve.json` | `--loss-curve` | 20,000 per-step L1 losses |
+
+Training loss, L1 over the action chunk, mean of the 100 steps ending at each mark:
+
+| step | 1 | 100 | 1,000 | 5,000 | 20,000 |
+|---|---|---|---|---|---|
+| loss | 0.7267 | 0.1825 | 0.0507 | 0.0309 | 0.0171 |
+
+Measured on the oracle server with `ES_PYTHON=~/venvs/es` (the one venv with both `mujoco` and
+`torch`): `es eval run --config <fixture eval.toml> --policy trained-{1000,5000,20000}.esb` gets
+**past `TorchRuntime::load`** for all three and fails afterwards, inside `Evaluation::run`, on
+the fixture suite's `light_intensity` perturbation. Getting past the load is the packet's claim
+and it holds. **There is no success rate here**, and not for want of trying: the demo has no
+`evaluation.toml` yet, and `Evaluation::run` still passes `frames: None`, so `capture` would
+refuse the image input by name. Both are V3's.
+
+The oracle's own end-to-end equality number, on the bundle it trains and packs itself:
+`TorchRuntime::infer` against a direct PyTorch forward on a held-out observation gives
+`max_abs = 0` at spec 8.9's tier-4 fp32 tolerance of 1e-5 — exactly equal, not merely within
+tolerance. It covers the safetensors writer, `pack`'s validation, the `nodes.N` -> `nN` rename
+and the wire protocol in one number.
+
+Collecting the 55 demonstrations took under two minutes and the 20,000-step run about eleven,
+both with rendering on. Those are **observations**, not performance claims, and no throughput
+figure is derived from them (spec 12.4).

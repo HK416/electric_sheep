@@ -65,7 +65,7 @@ fn run_tests(root: &Path) -> bool {
         "test",
         "--workspace",
         "--features",
-        "es-ir/testing,es-ros2/zenoh,es-env/render",
+        "es-ir/testing,es-ros2/zenoh,es-env/render,es/render",
         "--",
         "--nocapture",
     ];
@@ -131,7 +131,7 @@ fn cmd_ci(root: &Path) -> bool {
                 "--workspace",
                 "--all-targets",
                 "--features",
-                "es-ros2/zenoh,es-env/render",
+                "es-ros2/zenoh,es-env/render,es/render",
                 "--",
                 "-D",
                 "warnings",

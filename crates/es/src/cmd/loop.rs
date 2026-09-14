@@ -28,7 +28,7 @@ use crate::util::hex;
 const HELP: &str = "\
 es loop collect --policy <policy.esb> --scene <file.xml|urdf> --episodes <N> --seed <S>
                 --out <root> [--backend mujoco-cpu] [--runtime torch] [--max-steps <N>]
-                [--expert so101-pick-place]
+                [--expert so101-pick-place] [--frames <dir>]
 es loop intervene --dataset <root> --segments <segments.json>
 es loop distill --in <root> [--in <root>...] [--train 0.8] [--val 0.1] [--test 0.1]
                 [--seed <S>] --out <root>
@@ -41,8 +41,12 @@ collect    Opens the policy bundle (spec 9.6), rolls out <N> episodes through th
            and an `intervention` column per frame (spec 13.2). Checks that the requested
            backend and runtime are available first; when either is not, prints
            `SKIPPED (<reason>)` and exits 3 without faking a run (spec 1.4).
-           No mp4 is written: there is no renderer in this build, so an image channel
-           becomes a declared video feature with VideoRef placeholders, plus a warning.
+           Without --frames no pixels are written: an image channel becomes a declared
+           video feature with VideoRef placeholders, plus a warning. --frames <dir> renders
+           the Task IR's one image channel from its own camera, once per control step, as
+           <dir>/<NNNNNN>.bin + .json -- the raw-tile format `es video mosaic` and the render
+           goldens already use. It needs the `render` feature and a Vulkan device; a build
+           without it refuses the flag rather than writing a dataset with a hole in it.
            --expert replaces the policy with a scripted demonstration: it drives every
            control tick through the same chunk buffer and the same Safety Plane (INV-12),
            records action_source=Human, and needs no Torch runtime. --policy is still
@@ -158,10 +162,47 @@ macro_rules! dispatch_nj_h {
     };
 }
 
+/// The renderer `--frames` needs, built from what the bundle's Task IR already declares.
+///
+/// One image channel: `MultiViewPack` is rejected upstream anyway, and a second camera would be
+/// a second frame directory this flag does not have a name for. The `ImageSpec` is the Task
+/// IR's, so a scene whose camera does not produce what the IR declares is refused by
+/// `EnvRenderer::check` rather than silently rendered at the wrong size (`INV-14`).
+#[cfg(feature = "render")]
+fn renderer_cfg(
+    bundle: &PolicyBundle,
+    frames: &std::path::Path,
+) -> Result<es_env::EnvRendererCfg, CliError> {
+    let images: Vec<_> = bundle
+        .task
+        .observation_spec
+        .channels
+        .iter()
+        .filter_map(|(name, c)| c.ty.image.as_ref().map(|spec| (name, &c.ty.frame, spec)))
+        .collect();
+    let [(name, frame, spec)] = images.as_slice() else {
+        return Err(CliError::Runtime(format!(
+            "--frames needs exactly one image channel in the Task IR's ObservationSpec; it \
+             declares {}",
+            images.len()
+        )));
+    };
+    let es_ir::types::Frame::Camera(camera) = frame else {
+        return Err(CliError::Runtime(format!(
+            "image channel {name:?} is not in a camera frame, so there is no camera to render \
+             it from"
+        )));
+    };
+    let mut cfg = es_env::EnvRendererCfg::rgb(*camera, spec.width, spec.height);
+    cfg.frames_dir = Some(frames.to_path_buf());
+    Ok(cfg)
+}
+
 fn collect_typed<const NJ: usize, const H: usize>(
     spec: &CollectSpec<'_>,
     policy: &mut dyn PolicyRuntime,
     mut expert: Option<&mut ScriptedExpert>,
+    frames: Option<&std::path::Path>,
 ) -> Result<CollectReport, CliError> {
     // Teleop is real-robot I/O (M3 W1) and stays off this path; the one scripted intervener
     // the CLI offers is `--expert`. `es loop intervene` labels afterwards.
@@ -183,6 +224,44 @@ fn collect_typed<const NJ: usize, const H: usize>(
             None => Intervention::Abort,
         }
     };
+    // With a renderer, the image channel the Task IR declares stops being a dangling video
+    // reference: `EnvRenderer::frame` writes `<dir>/<NNNNNN>.bin` + `.json` per control step.
+    // The `Gpu` and the renderer live here because `EnvRenderer<'gpu>` borrows the device, and
+    // putting that borrow on `Env` would put a lifetime on a type `es-data` and `es-eval` both
+    // name (design note section 7.4).
+    #[cfg(feature = "render")]
+    if let Some(dir) = frames {
+        let cfg = renderer_cfg(spec.bundle, dir)?;
+        let gpu = es_gpu::Gpu::open(es_gpu::GpuOptions::default())
+            .map_err(|e| CliError::Runtime(format!("no Vulkan device for --frames: {e}")))?;
+        let mut renderer = es_env::EnvRenderer::new(&gpu, spec.scene, cfg)
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
+        std::fs::create_dir_all(dir)
+            .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
+        let mut sink = |model: &ModelInfo, state: &es_physics_core::backend::StateView<'_>| {
+            renderer
+                .frame(model, state, 0)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        return Collector::run::<MuJoCoCpuBackend, _, NJ, H>(
+            spec,
+            policy,
+            MuJoCoCpuBackend::new,
+            &mut hook,
+            Some(&mut sink),
+        )
+        .map_err(|e| CliError::Runtime(e.to_string()));
+    }
+    #[cfg(not(feature = "render"))]
+    if frames.is_some() {
+        return Err(CliError::Runtime(
+            "--frames needs the `render` feature; this build links no renderer (spec 4.2: \
+             es-render is layer 5 and the default build of `es` does not pull it in). Rebuild \
+             with `cargo build -p es --features render`."
+                .to_owned(),
+        ));
+    }
     Collector::run::<MuJoCoCpuBackend, _, NJ, H>(
         spec,
         policy,
@@ -300,6 +379,7 @@ fn collect(args: &[String]) -> Result<u8, CliError> {
             "--runtime",
             "--max-steps",
             "--expert",
+            "--frames",
         ],
     )?;
     let expert_name = one(&pairs, "--expert").map(ToOwned::to_owned);
@@ -309,6 +389,7 @@ fn collect(args: &[String]) -> Result<u8, CliError> {
     let episodes: u32 = number(&pairs, "--episodes", 1)?;
     let seed: u64 = number(&pairs, "--seed", 0)?;
     let max_steps: u32 = number(&pairs, "--max-steps", 0)?;
+    let frames = one(&pairs, "--frames").map(PathBuf::from);
     let backend = one(&pairs, "--backend").unwrap_or("mujoco-cpu");
     let runtime = one(&pairs, "--runtime").unwrap_or("torch");
     if backend != "mujoco-cpu" {
@@ -369,7 +450,7 @@ fn collect(args: &[String]) -> Result<u8, CliError> {
     };
     let nj = bundle.deployment.robot.n_joints;
     let h = bundle.deployment.action.horizon;
-    let report = dispatch_nj_h!(nj, h, &spec, policy, expert.as_mut())?;
+    let report = dispatch_nj_h!(nj, h, &spec, policy, expert.as_mut(), frames.as_deref())?;
 
     for w in &report.warnings {
         println!("warning: {w}");

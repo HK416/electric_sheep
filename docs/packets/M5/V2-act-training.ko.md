@@ -8,10 +8,14 @@
 
 ```
 crates/es/src/cmd/policy.rs
+crates/es/src/cmd/loop.rs
 crates/es/src/cmd/mod.rs
+crates/es/Cargo.toml
+xtask/src/main.rs
 crates/es/src/main.rs
 crates/es/tests/cli.rs
 crates/es-policy/src/lower/mod.rs
+crates/es-policy/src/lower/torch.rs
 python/es/train_act.py
 python/es/README.md
 python/es/README.ko.md
@@ -147,3 +151,87 @@ python/es/train_act.py --module <dir> --dataset <root> --out model.safetensors \
   (`crates/es-data/src/collect.rs:650-665`) — 지어낸 다이제스트는 `training_hash`를 거짓말로 만든다.
 - `crates/es-env`, `crates/es-eval`, `crates/es-render`, `crates/es-data` — V0b, V1, V3.
 - 벽시계 학습 수치를 사실로 보고하는 것.
+
+## as built
+
+설계 노트: `docs/design/visible-learning.ko.md` 7.6절이 발견 사항을 담는다. 이 절은 위 패킷과의
+차이와 산출물을 담는다.
+
+**`## context`에 파일 하나가 늘었다.** `crates/es-policy/src/lower/torch.rs`, 한 줄 때문에.
+`VisionEncoder{ResNet18}`은 `[3, 96, 96]` IR 포트 위에서 `self.n0(inputs["rgb_overhead"])`로
+내려가는데, torchvision 백본은 전부 `nn.BatchNorm2d`이고 이것은 3차원 입력을 거부한다:
+*"expected 4D input (got 3D input)"*. 즉 로워링은 비전 인코더를 가진 모든 그래프에 대해 한 번도
+돌아본 적 없고 돌 수도 없는 모듈을 내보내고 있었다 — `torch_equivalence.rs`는 state-only MLP만
+PyTorch에 태운다. 수정은 `self.n0(x.unsqueeze(0)).squeeze(0)`, 토큰 없는 `TemporalEncoder` 가지가
+이미 하는 것과 같은 거래이며, 모든 호출자가 그곳을 지나므로 이 패킷 안이 아니라 로워링에서
+고친다. `lower_to_torch`의 lowering hash를 고정하는 골든은 없다.
+
+**`train_act.py`가 얻은 플래그 셋.** `--checkpoint-at 1000,5000,20000`(실행 길이도 상한으로
+잡으므로 step 수가 에폭 반올림이 아니라 정확하다), `--loss-curve curve.json`, 그리고 수집기가 이제
+쓰는 tile을 읽는 `--frames <dir>`. JSON 한 줄은 acceptance가 못 박은 세 키 외에 `samples`,
+`batch`, `chunk`, `zero_filled_inputs`, `image_inputs`를 더 싣는다. 오라클은 셋만 읽는다.
+
+**테스트 이름.** `the_loss_falls`와 `the_packed_bundle_round_trips`는 한 테스트
+`the_loss_falls_and_the_packed_bundle_round_trips`다. 사실 4가 사실 3의 체크포인트를 필요로 하기
+때문이다. `eval_run_accepts_the_trained_bundle`은 `crates/es/tests/cli.rs`의
+`policy_pack_output_is_accepted_by_eval_run`이다. Evaluation IR 픽스처가 거기 있고
+`tests/fixtures/visible-learning/`에는 `evaluation.toml`이 없다(V3의 문서다). round-trip은 요구된
+것보다 강하다: held-out 관측 하나에 대해 `TorchRuntime::infer`를 *직접* PyTorch forward와 스펙
+8.9의 tier-4 fp32 허용오차로 비교한다.
+
+**패킷이 범위에 넣지 않았지만 오케스트레이터 결정으로 추가된 것 하나.**
+`es loop collect`에는 `FrameSink`가 있었지만 호출자가 없었고(`crates/es/src/cmd/loop.rs`가
+`None`을 넘겼다), 그래서 데이터셋에 픽셀이 없었고 이미지 포트는 0으로 학습됐을 것이다. 이제
+`--frames <dir>`가 collect 호출 안에서 `Gpu`와 `EnvRenderer`를 만들고, Task IR 자신의 이미지
+채널과 `ImageSpec`으로 설정하고, 컨트롤 스텝마다 raw tile 하나를 쓴다. `es`의 새 `render` 피처
+뒤에 있고 기본은 꺼져 있어 평소 CLI는 Vulkan을 링크하지 않는다(스펙 4.2). 피처가 없으면 플래그를
+조용히 무시하지 않고 거부한다. `xtask`는 PR 티어에서 `es-env/render`와 나란히 `es/render`를
+켠다. CI가 한 번도 컴파일하지 않는 분기는 썩는 분기이기 때문이다. 이로써 context에
+`crates/es/src/cmd/loop.rs`, `crates/es/Cargo.toml`, `xtask/src/main.rs`가 추가된다. 설계 노트
+7.6절 항목 2-3이 이를 담고, 그것이 만든 부채도 함께 담는다: `train_act.py`가 이제 tile과 Learning
+IR 입력 사이의 유일한 Observation IR 노드인 `Op::Dequantize`를 재구현한다.
+
+**이 패킷이 찾았지만 소유하지 않는 두 가지**(설계 노트 7.6절 항목 4-5): `es eval run`은 여전히
+이미지 입력을 넣을 수 없어서(`es-eval/src/runner.rs:475-481`) **V2는 성공률을 적지 않는다** —
+주장은 패킷 자신의 것, 번들이 `TorchRuntime::load`를 통과한다는 것이고, 데모의
+`evaluation.toml`도 아직 없다; 그리고 `es loop collect --episodes N`은 0번 에피소드만 푼다
+(`--episodes 50 --seed 1`은 `success 1, timeout 49`, 같은 시드를 한 에피소드씩 돌리면 49 성공).
+둘 다 V1/V3 코드다.
+
+### 산출물 (오라클 서버, RTX 4090, `~/venvs/es-lerobot-cuda`, torch 2.11.0+cu129)
+
+아래 중 커밋되는 것은 없다. 전부 오라클 서버의 `~/artifacts/plan-v/` 아래에 있고, 각각의 생성기는
+표의 명령이다.
+
+| 산출물 | 생성 | 크기 / 값 |
+|---|---|---|
+| `ds-train` + `frames-train` | `es loop collect --expert so101-pick-place --episodes 1 --seed s --frames ...`, `s = 1..50`, `es loop distill`로 병합 | 에피소드 50, 프레임 17,697, parquet 3.4 MB + tile 485 MB, **50/50 `Success`** |
+| `ds-holdout` + `frames-holdout` | 동일, 시드 101-105 | 에피소드 5, 프레임 2,313, 464 KB + 64 MB, 4/5 `Success` |
+| `build/` | `es policy lower --policy untrained.esb --out build/` | `lowering_hash 956abb67775d4db61177fae4051e3883628e07183e4925483bca1e0249aeec6d`, weight key 10개 (exact 8, prefix claim 2) |
+| `model-1000.safetensors` | `train_act.py --frames frames-train --batch 8 --lr 1e-4 --seed 0 --device cuda --checkpoint-at 1000,5000,20000` | 61 MB, 텐서 142개, blake3 `57c7e537fbfde3711e76582edc796fca09d0cbc3a2411cbe2e242c6b5b2bf1e8` |
+| `model-5000.safetensors` | 같은 실행 | blake3 `ae1c38c5662226887eecff6473d44a9f61a51fd2d1e7782c403eb146e3bba2b0` |
+| `model-20000.safetensors` | 같은 실행 | blake3 `0f0ad5c80faeebd698ae7fecd579b724502d278bd5c0af8e8479d73e064f476a` |
+| `trained-20000.esb` | `es policy pack --policy untrained.esb --weights model-20000.safetensors` | `policy_hash 840aef948493bc59e74e510bfe1e87cdce3291cbdb1ed40f4364db1e34aa3662` |
+| `loss-curve.json` | `--loss-curve` | step별 L1 loss 20,000개 |
+
+학습 loss, 액션 청크에 대한 L1, 각 지점에서 끝나는 100 step의 평균:
+
+| step | 1 | 100 | 1,000 | 5,000 | 20,000 |
+|---|---|---|---|---|---|
+| loss | 0.7267 | 0.1825 | 0.0507 | 0.0309 | 0.0171 |
+
+오라클 서버에서 `ES_PYTHON=~/venvs/es`로 측정(`mujoco`와 `torch`를 둘 다 가진 유일한 venv):
+`es eval run --config <픽스처 eval.toml> --policy trained-{1000,5000,20000}.esb`는 셋 다
+**`TorchRuntime::load`를 통과**하고, 그 뒤 `Evaluation::run` 안에서 픽스처 스위트의
+`light_intensity` perturbation에서 실패한다. load를 통과하는 것이 패킷의 주장이고 그것은
+성립한다. **여기에 성공률은 없다.** 시도하지 않아서가 아니다: 데모에는 아직 `evaluation.toml`이
+없고, `Evaluation::run`은 여전히 `frames: None`을 넘기므로 `capture`가 이미지 입력을 이름을 대며
+거부한다. 둘 다 V3의 몫이다.
+
+오라클 자신의 종단 간 동등성 숫자, 자기가 학습하고 pack한 번들에 대해: held-out 관측 하나에서
+`TorchRuntime::infer`와 직접 PyTorch forward의 `max_abs = 0`, 스펙 8.9의 tier-4 fp32 허용오차
+1e-5 기준 — 허용오차 이내가 아니라 정확히 같다. safetensors writer, `pack`의 검증,
+`nodes.N` -> `nN` 이름 변환, 와이어 프로토콜을 한 숫자로 덮는다.
+
+시연 55개 수집은 2분 미만, 20,000 step 실행은 약 11분 걸렸다. 둘 다 렌더링을 켠 채로. 이것들은
+**관측**이지 성능 주장이 아니며, 여기서 어떤 처리량 수치도 유도하지 않는다(스펙 12.4).
