@@ -122,3 +122,11 @@ $RECYCLE.BIN/
 
 # LeRobot checkpoints fetched by the reference oracles (P-M1-R2). Never committed.
 target/lerobot-cache/
+
+### Python ###
+# Bytecode caches and the per-platform `es_native` extension that
+# `maturin develop --release --features python` builds from python/es (P-M4-R10). Never committed.
+__pycache__/
+*.py[cod]
+python/es/es_native*.pyd
+python/es/es_native*.so
