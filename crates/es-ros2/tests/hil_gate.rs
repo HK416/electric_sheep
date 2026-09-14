@@ -428,6 +428,7 @@ fn hil_live_run_replays_to_byte_identical_decisions() {
     assert!(report.identical, "decisions are not byte-identical");
     assert_eq!(report.live_hash, report.replay_hash);
     assert_eq!(report.live_hash, live_hash);
+    assert!(report.is_verified(), "{report:?}");
 
     // Non-vacuity (design note section 7.5): the run must have exercised the plane.
     assert!(out.clamped >= 1, "no clamped step: {out:?}");
@@ -479,6 +480,7 @@ fn v1_fixture_still_replays_identically() {
     assert!(report.identical, "{report:?}");
     assert_eq!(report.live_hash, report.replay_hash);
     assert!(report.steps > 0);
+    assert!(report.is_verified(), "{report:?}");
 }
 
 // --- log-level oracles ---------------------------------------------------------------------
@@ -504,8 +506,9 @@ fn records(log: &[u8]) -> Vec<(u8, usize, usize, usize)> {
     out
 }
 
-#[test]
-fn tampered_step_diverges_at_its_tick() {
+/// The fixture with one clean `Step`'s first action word flipped: `(bytes, record index of the
+/// step, its tick)`.
+fn tampered_fixture() -> (Vec<u8>, usize, u64) {
     let mut bytes = fixture_bytes();
     let recs = records(&bytes);
     // A `Step` that carried a chunk and whose `Decision` came out of the plane untouched: a
@@ -526,7 +529,12 @@ fn tampered_step_diverges_at_its_tick() {
     let tick = u64::from_le_bytes(bytes[body..body + 8].try_into().expect("8 bytes"));
     // Actions start after `tick`, `obs_age_us`, `has_chunk` and `rows`.
     bytes[body + 19] ^= 0x01;
+    (bytes, idx, tick)
+}
 
+#[test]
+fn tampered_step_diverges_at_its_tick() {
+    let (bytes, idx, tick) = tampered_fixture();
     let report = replay::<NJ, H>(&bytes).expect("a tampered log still parses");
     assert!(!report.identical);
     assert_ne!(report.live_hash, report.replay_hash);
@@ -556,6 +564,62 @@ fn truncated_log_replays_its_complete_prefix() {
     assert!(prefix.identical);
     assert!(prefix.steps > 0 && prefix.steps < whole.steps);
     assert_eq!(prefix.live_hash, prefix.replay_hash);
+    // A correct replay of an incomplete run is not a verified one.
+    assert!(!prefix.is_verified());
+}
+
+/// A header and a trailer with nothing between them satisfies every field the report carries --
+/// both hashes are blake3 of nothing -- so the report itself has to say it verified nothing
+/// (spec 1.4, design note section 7.5).
+#[test]
+fn a_log_with_no_decisions_does_not_verify() {
+    let full = fixture_bytes();
+    let mut empty = full[..first_record(&full)].to_vec();
+    let mut body = Vec::new();
+    body.extend_from_slice(blake3::hash(&[]).as_bytes());
+    body.extend_from_slice(&0u64.to_le_bytes());
+    empty.push(0xFF);
+    empty.extend_from_slice(&u32::try_from(body.len()).expect("40").to_le_bytes());
+    empty.extend_from_slice(&body);
+
+    let report = replay::<NJ, H>(&empty).expect("a header plus a trailer parses");
+    assert_eq!(report.steps, 0);
+    assert!(!report.truncated, "it has a trailer");
+    // Both are the hash of nothing; that is exactly the point.
+    assert_eq!(report.live_hash, report.replay_hash);
+    assert!(!report.identical, "nothing was compared");
+    assert!(!report.is_verified());
+}
+
+#[test]
+fn a_header_only_log_does_not_verify() {
+    let full = fixture_bytes();
+    let report = replay::<NJ, H>(&full[..first_record(&full)]).expect("a header alone parses");
+    assert!(report.truncated);
+    assert_eq!(report.steps, 0);
+    assert!(!report.is_verified());
+}
+
+/// The one predicate a caller should read, on the three logs whose answers are known.
+#[test]
+fn the_gate_predicate_is_the_gate() {
+    let full = fixture_bytes();
+    assert!(replay::<NJ, H>(&full)
+        .expect("the fixture replays")
+        .is_verified());
+
+    let (tampered, _, _) = tampered_fixture();
+    assert!(!replay::<NJ, H>(&tampered)
+        .expect("a tampered log still parses")
+        .is_verified());
+
+    let recs = records(&full);
+    let cut_at = recs[recs.len() / 2];
+    let mut cut = full.clone();
+    cut.truncate(cut_at.1 + cut_at.2 / 2);
+    assert!(!replay::<NJ, H>(&cut)
+        .expect("the prefix replays")
+        .is_verified());
 }
 
 #[test]

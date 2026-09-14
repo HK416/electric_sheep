@@ -22,7 +22,8 @@ use super::log::{self, Cur, HilLogError};
 pub struct ReplayReport {
     /// `Decision` records replayed.
     pub steps: u64,
-    /// Every replayed decision matched the logged one, byte for byte.
+    /// Every replayed decision matched the logged one, byte for byte. A log with no `Decision`
+    /// record verifies nothing, so it is never `identical`.
     pub identical: bool,
     /// `(index, tick)` of the first decision that did not.
     pub first_divergence: Option<(u64, PhysTick)>,
@@ -33,6 +34,17 @@ pub struct ReplayReport {
     pub replay_hash: [u8; 32],
     /// The log ends inside a record or without a trailer; the complete prefix was replayed.
     pub truncated: bool,
+}
+
+impl ReplayReport {
+    /// The gate of spec 24.2 as one predicate: a complete log, of a run that actually decided
+    /// something, that replays to the same decisions and the same hash. A caller that
+    /// re-assembles it from the fields is one dropped conjunct away from verifying an empty
+    /// file (design note section 7.5).
+    #[must_use]
+    pub fn is_verified(&self) -> bool {
+        self.identical && !self.truncated && self.steps > 0 && self.live_hash == self.replay_hash
+    }
 }
 
 /// Replays `log_bytes`. `NJ` and `H` must match the log's header ([`HilLogError::Shape`]
@@ -123,7 +135,10 @@ pub fn replay<const NJ: usize, const H: usize>(
 
     Ok(ReplayReport {
         steps,
-        identical,
+        // A header and a trailer with nothing between them -- a run that crashed before its
+        // first tick, or a file truncated to the header and re-trailered -- compares nothing,
+        // and a check that can pass on nothing is not a check (spec 1.4).
+        identical: identical && steps > 0,
         first_divergence,
         // The trailer is the live run's own claim about its decisions, so it is preferred over
         // the recomputation: a tampered trailer must show up as a hash mismatch.

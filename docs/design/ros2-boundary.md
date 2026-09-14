@@ -393,7 +393,10 @@ without a trailer (crash) replays up to its last complete record and reports `tr
 `SafetyPlane::from_ir`, wrap it in `EmbeddedCore::with_plane`, apply `ObserveState` / `Heartbeat` /
 `Step` in order, re-encode each `SafeAction` as a `Decision` record, compare bytes.
 `ReplayReport { steps, identical, first_divergence: Option<(u64 index, PhysTick)>, live_hash,
-replay_hash, truncated }`.
+replay_hash, truncated }`. The verdict is one predicate, `ReplayReport::is_verified() = identical
+&& !truncated && steps > 0 && live_hash == replay_hash`: a log with no `Decision` record compares
+nothing and both its hashes are blake3 of nothing, so `identical` is `false` when `steps == 0` and
+a caller cannot read a clean verification off an empty file (§1.4).
 
 **Gate (§24.2, §28.5):** a live run over real loopback UDP, with injected delay, loss, reordering,
 a late command, a NaN row and a heartbeat gap, replays to **byte-identical decisions**

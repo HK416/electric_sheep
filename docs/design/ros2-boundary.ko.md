@@ -404,7 +404,10 @@ trailer  0xFF | u32 40 | [u8;32] blake3(concatenated Decision record bytes) | u6
 재구성하고, `EmbeddedCore::with_plane`으로 감싸고, `ObserveState` / `Heartbeat` / `Step`을
 순서대로 적용하고, 각 `SafeAction`을 `Decision` 레코드로 다시 인코딩하여 바이트를 비교한다.
 `ReplayReport { steps, identical, first_divergence: Option<(u64 index, PhysTick)>, live_hash,
-replay_hash, truncated }`.
+replay_hash, truncated }`. 판정은 하나의 술어다, `ReplayReport::is_verified() = identical
+&& !truncated && steps > 0 && live_hash == replay_hash`: `Decision` 레코드가 하나도 없는 로그는
+비교한 것이 없고 두 해시 모두 아무것도 아닌 것의 blake3이므로, `steps == 0`이면 `identical`은
+`false`이고 호출자가 빈 파일에서 깨끗한 검증 결과를 읽어낼 수 없다(§1.4).
 
 **게이트(§24.2, §28.5):** 실제 loopback UDP를 통한 live 실행이 delay, loss, 재정렬, 지연된
 command, NaN row, heartbeat gap을 주입받은 채로 **바이트 단위로 동일한 결정**(`identical`,
