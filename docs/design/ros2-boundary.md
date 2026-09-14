@@ -164,7 +164,12 @@ std_msgs::msg::Float64MultiArray;`, subscribed on `"~/commands"`), which refuses
 the Safety Plane, so this crate offers no way to put an unvalidated action on an actuator topic.
 `NJ != joints.len()` fails at construction. Inbound `sensor_msgs/JointState` is reordered by name
 into the configured joint order (a missing joint rejects the sample) before it reaches
-`SafetyPlane::observe_state` / `sensor_seen`.
+`SafetyPlane::observe_state` / `sensor_seen`. A named joint whose `position` or `velocity` value
+the sample does not carry rejects it the same way (`ROS2-013`, `PartialJointState`) — a default is
+not a measurement (§25.1). The one exception the message definition forces: an entirely empty
+`velocity` (the array `sensor_msgs/JointState` documents as "may be empty") is read as "this driver
+does not report velocity" and yields `qd = [0.0; NJ]`; a non-empty but too-short `velocity` is a
+partial sample and is refused. `position` has no such reading: short or empty is always an error.
 
 ## 5. Message subset
 

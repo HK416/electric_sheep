@@ -168,7 +168,12 @@ interfaces (%zu)"). `SafeAction`은 오직 Safety Plane에서만 나오므로, �
 action을 actuator topic에 올릴 방법을 전혀 제공하지 않는다. `NJ != joints.len()`은 생성 시점에
 실패한다. 들어오는 `sensor_msgs/JointState`는 `SafetyPlane::observe_state` / `sensor_seen`에
 도달하기 전에 설정된 joint 순서로 이름 기준 재정렬된다(joint가 하나라도 빠지면 sample이
-거부된다).
+거부된다). 이름은 있지만 sample이 그 joint의 `position`/`velocity` 값을 담고 있지 않은 경우도
+같은 방식으로 거부된다(`ROS2-013`, `PartialJointState`) — 기본값은 측정값이 아니다(§25.1).
+메시지 정의가 강제하는 유일한 예외: 완전히 비어 있는 `velocity`(`sensor_msgs/JointState`가
+"may be empty"로 문서화한 배열)는 "이 드라이버는 velocity를 보고하지 않는다"로 읽어
+`qd = [0.0; NJ]`가 되고, 비어 있지 않지만 길이가 모자란 `velocity`는 부분 sample이므로
+거부된다. `position`에는 그런 해석이 없다: 짧거나 비어 있으면 항상 오류다.
 
 ## 5. 메시지 서브셋
 

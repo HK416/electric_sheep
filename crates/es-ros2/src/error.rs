@@ -101,6 +101,13 @@ pub enum Ros2Error {
     /// reorder by name (design note section 4.5).
     #[error("JointState is missing joint `{0}`")]
     MissingJoint(String),
+    /// An inbound `sensor_msgs/JointState` named the joint but its `position`/`velocity` array
+    /// is too short to carry that joint's value. `sensor_msgs/JointState` says those arrays
+    /// "may be empty", so this is ordinary driver behaviour, not an attack — but a default is
+    /// not a measurement (spec 25.1), so the whole sample is rejected rather than fabricating a
+    /// zero for `SafetyPlane::observe_state` (design note section 4.5).
+    #[error("JointState carries no `{field}` for joint `{joint}`")]
+    PartialJointState { joint: String, field: &'static str },
     /// A zenoh session, publisher, subscriber or liveliness operation failed. Wraps the
     /// library's own message; only built when the `zenoh` feature is on.
     #[cfg(feature = "zenoh")]
@@ -128,7 +135,8 @@ impl Ros2Error {
             Ros2Error::TransientLocalUnsupported => "ROS2-012",
             Ros2Error::UnknownActuatorTopic(_)
             | Ros2Error::ActuatorJointCount { .. }
-            | Ros2Error::MissingJoint(_) => "ROS2-013",
+            | Ros2Error::MissingJoint(_)
+            | Ros2Error::PartialJointState { .. } => "ROS2-013",
             #[cfg(feature = "zenoh")]
             Ros2Error::Zenoh(_) => "ROS2-020",
         }
