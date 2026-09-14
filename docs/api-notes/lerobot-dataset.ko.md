@@ -190,3 +190,29 @@ W7에서는 어떤 비디오 파일도 열거나 디코딩하거나 기록하지
 `Unit::Angle`/`Unit::Length`가 아니라 `Unit::Dimensionless`인 이유: `names` 리스트
 (`"shoulder_pan"` 등)는 단위 선언이 아니며, `is_policy_input()`은 `Dimensionless`를 받아들이는데
 이 텐서들이 실제로 그렇게 쓰이기 때문이다.
+
+## 실제 패키지로 측정, 2026-09-15 — `검증됨 / verified`
+
+오라클 서버에서(패킷 `docs/packets/M5/V1`) 이 크레이트가 쓴 데이터셋(`observation.state`, `action`,
+`reward`, `action_source`, `intervention`, 에피소드 2개, 비디오 피처 없음)에 대해
+`ES_LEROBOT_PYTHON=$HOME/venvs/es-lerobot-cuda/bin/python cargo test -p es-data --test
+lerobot_oracle -- --nocapture`를 실행한 결과:
+
+| 항목 | 결과 |
+|---|---|
+| `lerobot` | 0.6.1, `datasets` 4.8.5, `pyarrow` 25.0.1 — `[dataset]` extra가 이제 설치되어 있다 |
+| `import lerobot.datasets.lerobot_dataset` | 성공 |
+| `LeRobotDataset(repo_id=..., root=<ours>)` | **거부**: `BackwardCompatibilityError: The dataset you requested is in 2.1 format. We introduced a new format since v3.0 which is not backward compatible with v2.1.` |
+| `lerobot.datasets.dataset_metadata.CODEBASE_VERSION` | `"v3.0"` |
+
+즉 패킷이 요구한 발견은 "거부"이며, 설계 노트 미해결 질문 2에 대한 결론이다: **`lerobot` 0.6.1은
+`codebase_version: "v2.1"`을 아예 읽지 않는다.** 버전 게이트가 먼저 걸리므로 우리의 parquet, `meta/*.jsonl`,
+컬럼 dtype 중 어느 것도 검증되지 않았다. 이 문서의 나머지 `미검증` 표시는 그대로 유지된다.
+
+이것이 "우리의 v2.1 writer가 틀렸다"는 뜻은 아니다. v2.1은 `lerobot`이 직접 배포했던 포맷이고, 0.6.1이
+하위 호환을 끊으면서 허브 데이터셋용으로 `python -m lerobot.scripts.convert_dataset_v21_to_v30`을 제공할
+뿐이다. v3.0을 직접 쓸 것인지 변환기를 낼 것인지는 별도 패킷의 문제이며(스펙 §19.1), 여기서
+`crates/es-data/src/lerobot/meta.rs`의 `codebase_version`은 의도적으로 손대지 않는다.
+
+그때까지 `crates/es-data/tests/lerobot_oracle.rs`는 모든 머신에서 위 거부 사유를 그대로 실어
+`SKIP lerobot_oracle: <why>`를 출력한다.

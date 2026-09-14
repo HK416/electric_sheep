@@ -177,3 +177,68 @@ impl ScriptedExpert {
 - `crates/es-policy`, `crates/es/src/cmd/eval.rs`, `crates/es-eval` — V2와 V3.
 - 실제 패키지 대신 손으로 쓴 Python/Rust LeRobot 리더 재구현.
 - 변경을 통과시키려고 전문가의 성공 임계값을 낮추는 것.
+
+## 구현 결과
+
+2026-09-15 오라클 서버 측정. 근거는 설계 노트 7.5절에 있고, 여기에는 위 패킷과 달라진 점을 적는다.
+
+**오라클 결과.** `expert_success`: **고정 시드 8개 중 8개가 `Termination::Success`로 끝나고, 8개 모두
+큐브를 bin의 3차원 내부에 넣는다**(테스트는 기록된 데이터셋에서 큐브의 최종 `x`, `y`, `z`를 직접 읽는다.
+Task IR 판정식은 `x`만 보기 때문이다). `ik_round_trips_through_forward_kinematics`: 목표 120개, MuJoCo
+자신의 순기구학 대비 최대 오차 3.3e-8 m. `the_same_seed_gives_the_same_demonstration`: `ctrl`이 바이트
+단위로 동일. `lerobot_oracle`: **SKIP** — `[dataset]` extra가 설치된 `lerobot` 0.6.1이
+`codebase_version: "v2.1"`을 아예 거부한다(`BackwardCompatibilityError`, 자신의 상수는 `"v3.0"`).
+이것이 미해결 질문 2가 기다리던 발견이다. `docs/api-notes/lerobot-dataset.ko.md`가 기록하고 writer는
+의도적으로 그대로 둔다.
+
+**오케스트레이터가 내린 결정과 그 위치.**
+
+1. *성공 판정식*: V0의 Task IR 판정식을 유지하되 정직하게 좁혔다 — 오라클이 백엔드 상태에서 `y`와 `z`를
+   직접 확인하고, IR이 센 성공 수와 실제로 bin에 들어간 큐브 수가 같은지 단언한다. 아래 3번 편차를 잡아낸
+   것이 이 단언이다.
+2. *Observation 픽스처*: `ImageInput`이 `U8 [96, 96, 3]`이 되고 그 뒤에 `ObservationNode::Dequantize`가
+   붙는다(V0b 7.4절 요청). `XIR-002`가 선언된 채널 타입과 소스 노드 출력을 비교하므로 Task IR 채널도 함께
+   옮겨야 했고, 그래서 `task_hash`와 `observation_hash`가 모두 이동했다. `es ir check`와
+   `es task compile`은 통과하고, 컴파일된 플랜은 여전히 `shape=[3, 96, 96]`으로 끝난다.
+3. *`crates/es-eval/tests/evaluation.rs`의 XIR-002*: **건드리지 않았다.** `cross::check`를 읽어보니 반대
+   결론이었다 — *데모의* 문서들은 이미 양쪽에서 같은 `StableId`를 쓰므로 `es loop collect`를 막는 것이
+   없었다. 그 테스트 픽스처는 `es-eval`의 것이고 패킷은 해당 크레이트 수정을 금지한다. 사람에게 남기는
+   질문으로 기록한다.
+4. *도달 가능성*: 씬이 옮겨졌고, "최소한"보다 더 옮겨졌다 — 설계 노트 7.5절 1, 2번.
+   `tests/golden/render/so101_frame0.*`는 승인된 생성기(`generate_so101_golden`)로 바뀐 씬에서
+   재생성했으므로, 이 커밋에서는 `cargo xtask verify-goldens`에 `GOLDEN_UPDATE=1`이 필요하다.
+5. *센서*: 추가하지 않았다. expert는 컬렉터가 이미 스크립트 개입자에게 넘기는 관측 행에서 `qvel`을 읽는다.
+
+**수용 시그니처와의 편차** — 각각 측정이 강제한 것이다:
+
+- `ExpertCfg`는 큐브의 **자유 관절**을 지목한다. 개입자 훅에는 `qpos ‖ qvel` 관측 행이 전달되고 거기에
+  `xpos`는 없으며, 자유 관절의 `qpos`가 곧 그 바디의 월드 포즈다. 같은 이유로 `gripper_body`는 사라졌다 —
+  단계 전이는 측정된 관절각을 비교하며, 그것도 같은 행에 있다.
+- `ExpertCfg`에 `carry_pitch`, `drop_height`, `grasp_depth`, `step_max`, `accel_max`,
+  `horizon`, `execute`가 추가됐다. 앞의 셋은 팔의 작업공간이 강제하는 기하(운반 높이에서 수직 하향 접근은
+  `wrist_flex` 범위를 벗어난다)이고, 뒤의 넷은 시연이 기록되는 배포 계약이다. `es loop collect`는 이를
+  번들의 Deployment IR에서 읽는다.
+- `Stage`에 여덟 번째 항목 `Lower`가 있다.
+- `ScriptedExpert::chunk`가 기본이고 `action`은 그 첫 행이다. 한 틱짜리 스텝 명령은 Safety Plane이 거의
+  매 틱 클램프한다(설계 노트 7.5절 4번).
+- `Intervener`는 `Intervention<NJ>`(`Policy` / `Action` / `Chunk` / `Abort`)를 반환하고 `&ModelInfo`를
+  받는다. `Collector::run`은 선택적 `FrameSink`를 받고 `terminations`, `rendered`, 플레인의
+  `SafetyCounters`를 보고한다. "도달 불가 웨이포인트는 에피소드를 실패시킨다"를 표현 가능하게 만드는 것이
+  `Abort`다.
+- `crates/es-env/src/plan.rs`에 `Normalize`/`Logic` 로워링이 추가되고(설계 노트 5.4절이 V1에 할당),
+  `crates/es-env/Cargo.toml`에 `es-physics-backend` dev-dependency가 생겼다(레이어 4, 오라클 전용).
+  `tests/fixtures/visible-learning/deployment.toml`의 `envelope_violation_rate.max_frac`은
+  0.05 → 0.9로 넓혔다.
+- `crates/es/tests/cli.rs`에 `#[ignore]` 생성기 `regenerate_visible_learning_documents`가 생겼다. V1
+  이후 두 데모 문서의 어떤 해시도 손으로 적지 않는다.
+
+**사람에게 남기는 질문.**
+
+1. 이 커밋은 `cargo xtask verify-goldens`에 `GOLDEN_UPDATE=1`이 필요하다. 데모 씬이 바뀌었고 프레임
+   골든은 그 씬의 순수 함수이기 때문이다. 재생성은 승인된 `generate_so101_golden` 경로지만, "망가진 씬을
+   옮긴 것"이 골든을 옮길 정당한 이유인지는 사람이 확인해야 한다.
+2. `crates/es-eval/tests/evaluation.rs:427-440`은 여전히 Task IR의 바디와 Observation IR의 관절을 짝
+   지으며, `cross::check`라면 거부할 조합이다. `es-eval`의 픽스처이고 이 패킷은 그 크레이트를 건드릴 수
+   없다.
+3. LeRobot v3.0: v3.0(또는 변환기)을 구현하는 패킷이 나올 때까지 writer는 v2.1로 두고 오라클은 SKIP으로
+   둔다. 플랜 V의 어떤 단계도 `lerobot`으로 데이터셋을 되읽지 않는다.

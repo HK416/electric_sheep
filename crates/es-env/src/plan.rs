@@ -10,7 +10,10 @@ use std::collections::BTreeMap;
 
 use es_assets::scene::SceneDesc;
 use es_ir::graph::{NodeId, PortRef};
-use es_ir::task::{Aggregation, Expr, JointQuantity, TaskGraph, TaskIr, TaskNode, TerminationKind};
+use es_ir::task::{
+    Aggregation, ArithOp, Expr, JointQuantity, LogicOp, TaskGraph, TaskIr, TaskNode,
+    TerminationKind,
+};
 use es_physics_core::backend::ModelInfo;
 
 use crate::EnvError;
@@ -167,6 +170,77 @@ impl Ctx<'_> {
                 };
                 Ok(Expr::Compare { op: *op, lhs, rhs })
             }
+            // `Normalize` is an affine map, and the clamp is what makes the declared
+            // `Unit::Normalized { lo, hi }` true of the value and not only of the annotation
+            // (`TYPE-011`): a reward term outside its own declared range is the bug the unit
+            // algebra exists to catch.
+            TaskNode::Normalize {
+                lo,
+                hi,
+                out_lo,
+                out_hi,
+                ..
+            } => {
+                let (lo, hi) = (lo.first().copied(), hi.first().copied());
+                let (Some(lo), Some(hi)) = (lo, hi) else {
+                    return Err(EnvError::Task(
+                        "Normalize with an empty lo/hi in a reward or termination cone".to_owned(),
+                    ));
+                };
+                if (hi - lo).abs() < f64::EPSILON {
+                    return Err(EnvError::Task(format!(
+                        "Normalize maps the empty range [{lo}, {hi}]"
+                    )));
+                }
+                let scale = (out_hi - out_lo) / (hi - lo);
+                let shifted = Expr::Arith {
+                    op: ArithOp::Sub,
+                    lhs: Box::new(self.lower_input(id, "value", depth)?),
+                    rhs: Box::new(Expr::Const(lo)),
+                };
+                Ok(Expr::Clamp {
+                    value: Box::new(Expr::Arith {
+                        op: ArithOp::Add,
+                        lhs: Box::new(Expr::Const(*out_lo)),
+                        rhs: Box::new(Expr::Arith {
+                            op: ArithOp::Mul,
+                            lhs: Box::new(shifted),
+                            rhs: Box::new(Expr::Const(scale)),
+                        }),
+                    }),
+                    lo: out_lo.min(*out_hi),
+                    hi: out_lo.max(*out_hi),
+                })
+            }
+            // `Compare` yields exactly 1.0 or 0.0 (`Expr::eval`), so the four logic ops are
+            // arithmetic on those two values -- no new `Expr` variant, and no `es-ir` change.
+            TaskNode::Logic { op, .. } => {
+                let a = Box::new(self.lower_input(id, "a", depth)?);
+                if *op == LogicOp::Not {
+                    return Ok(Expr::Arith {
+                        op: ArithOp::Sub,
+                        lhs: Box::new(Expr::Const(1.0)),
+                        rhs: a,
+                    });
+                }
+                let b = Box::new(self.lower_input(id, "b", depth)?);
+                let binary = |op| Expr::Arith {
+                    op,
+                    lhs: a.clone(),
+                    rhs: b.clone(),
+                };
+                Ok(match op {
+                    LogicOp::And => binary(ArithOp::Mul),
+                    LogicOp::Or => binary(ArithOp::Max),
+                    // |a - b| for values that are 0 or 1.
+                    LogicOp::Xor => Expr::Arith {
+                        op: ArithOp::Sub,
+                        lhs: Box::new(binary(ArithOp::Max)),
+                        rhs: Box::new(binary(ArithOp::Min)),
+                    },
+                    LogicOp::Not => unreachable!("handled above"),
+                })
+            }
             TaskNode::Clamp { lo, hi, .. } => Ok(Expr::Clamp {
                 value: Box::new(self.lower_input(id, "value", depth)?),
                 lo: lo.first().copied().unwrap_or(f64::MIN),
@@ -213,5 +287,139 @@ impl Ctx<'_> {
     fn bind(&mut self, name: String, source: Source) -> Expr {
         self.bindings.insert(name.clone(), source);
         Expr::Port(name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+
+    use es_assets::scene::SceneDesc;
+    use es_core::StableId;
+    use es_physics_core::backend::IndexRange;
+
+    use super::*;
+
+    fn repo_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    fn scene() -> SceneDesc {
+        let path = repo_root().join("tests/fixtures/mjcf/so101_pick_place.xml");
+        let xml =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        es_assets::parse_mjcf(&xml)
+            .expect("the V0 fixture parses")
+            .scene
+    }
+
+    fn joint_id(scene: &SceneDesc, name: &str) -> StableId {
+        scene
+            .joints
+            .iter()
+            .find(|j| j.name == name)
+            .unwrap_or_else(|| panic!("the fixture has a joint named {name}"))
+            .id
+    }
+
+    fn task_ir() -> TaskIr {
+        let path = repo_root().join("tests/fixtures/visible-learning/task.toml");
+        let text =
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        es_ir::serial::task_from_toml(&text).expect("V0's task document parses")
+    }
+
+    /// The lowering V0's documents need and V1 adds (`Normalize`, `Logic`): the demo task's
+    /// reward and termination cones compile, on any machine, with no backend at all.
+    #[test]
+    fn the_demo_task_cones_lower() {
+        let task = task_ir();
+        let scene = scene();
+        // A model with every joint the cones read, shaped as MuJoCo lays the demo scene out.
+        let mut model = ModelInfo {
+            nq: 13,
+            nv: 12,
+            nu: 6,
+            nbody: 10,
+            ..ModelInfo::default()
+        };
+        let names = [
+            "shoulder_pan",
+            "shoulder_lift",
+            "elbow_flex",
+            "wrist_flex",
+            "wrist_roll",
+            "gripper",
+        ];
+        for (i, name) in names.into_iter().enumerate() {
+            let id = joint_id(&scene, name);
+            model.qpos.insert(id, IndexRange::new(i as u32, 1));
+            model.dof.insert(id, IndexRange::new(i as u32, 1));
+        }
+        let cube = joint_id(&scene, "cube_free");
+        model.qpos.insert(cube, IndexRange::new(6, 7));
+        model.dof.insert(cube, IndexRange::new(6, 6));
+
+        let plan = ScalarPlan::compile(&task, &scene, &model).expect("the demo task's cones lower");
+        assert_eq!(plan.rewards.len(), 1, "one shaped reward");
+        assert_eq!(plan.terminations.len(), 3, "success, failure, timeout");
+
+        // The success predicate is true for a cube inside the bin's x span and at rest, and false
+        // for one still on the table -- evaluated through the very `Expr` the env runs.
+        // The cube's free joint starts at `qpos[6]`; the gripper's own joint is `qpos[5]`.
+        let ports = |x: f64, vx: f64, grip: f64| {
+            let mut p = BTreeMap::new();
+            for (name, source) in &plan.bindings {
+                p.insert(
+                    name.clone(),
+                    match source {
+                        Source::Qpos(6) => x,
+                        Source::Qpos(_) => grip,
+                        Source::Qvel(_) => vx,
+                        Source::Sensor(_) | Source::Time { .. } => 0.0,
+                    },
+                );
+            }
+            p
+        };
+        // What the demonstration commands: the predicate's threshold is 0.6, because a jaw
+        // holding the cube stalls near 0.30 (design note section 7.5).
+        let (open, closed) = (0.9, 0.30);
+        let success = plan
+            .terminations
+            .iter()
+            .find(|(kind, _)| *kind == TerminationKind::Success)
+            .expect("a Success node")
+            .1
+            .clone();
+        assert_eq!(
+            success.eval(&ports(0.14, 0.0, open)),
+            Some(1.0),
+            "released in the bin"
+        );
+        assert_eq!(
+            success.eval(&ports(0.14, 0.0, closed)),
+            Some(0.0),
+            "carried across the bin, still in the jaws"
+        );
+        assert_eq!(
+            success.eval(&ports(0.24, 0.0, open)),
+            Some(0.0),
+            "on the table"
+        );
+        assert_eq!(
+            success.eval(&ports(0.14, 2.0, open)),
+            Some(0.0),
+            "still moving"
+        );
+
+        // The shaped reward is normalized, whatever the cube does (`TYPE-011`).
+        let reward = &plan.rewards[0].expr;
+        for x in [-1.0, 0.0, 0.14, 0.3, 5.0] {
+            let v = reward
+                .eval(&ports(x, 0.0, open))
+                .expect("the reward evaluates");
+            assert!((0.0..=1.0).contains(&v), "reward {v} for x = {x}");
+        }
     }
 }

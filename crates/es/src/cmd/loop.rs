@@ -8,11 +8,19 @@
 
 use std::path::PathBuf;
 
+use es_assets::scene::{JointKind, SceneDesc};
 use es_compile::PolicyBundle;
-use es_data::collect::{CollectSpec, Collector, SplitSpec};
+use es_data::collect::{CollectSpec, Collector, Intervention, SplitSpec};
 use es_data::{CollectReport, InterventionSegment};
+use es_env::expert::{demo_cfg, ScriptedExpert};
+use es_env::Termination;
 use es_physics_backend::MuJoCoCpuBackend;
+use es_physics_core::backend::ModelInfo;
 use es_policy::{PolicyRuntime, TorchRuntime, WeightsSource};
+
+/// The one scripted expert the CLI knows: SO-101, cube into the bin
+/// (`docs/design/visible-learning.md` section 5).
+const EXPERT_NAME: &str = "so101-pick-place";
 
 use crate::error::CliError;
 use crate::util::hex;
@@ -20,6 +28,7 @@ use crate::util::hex;
 const HELP: &str = "\
 es loop collect --policy <policy.esb> --scene <file.xml|urdf> --episodes <N> --seed <S>
                 --out <root> [--backend mujoco-cpu] [--runtime torch] [--max-steps <N>]
+                [--expert so101-pick-place]
 es loop intervene --dataset <root> --segments <segments.json>
 es loop distill --in <root> [--in <root>...] [--train 0.8] [--val 0.1] [--test 0.1]
                 [--seed <S>] --out <root>
@@ -34,6 +43,12 @@ collect    Opens the policy bundle (spec 9.6), rolls out <N> episodes through th
            `SKIPPED (<reason>)` and exits 3 without faking a run (spec 1.4).
            No mp4 is written: there is no renderer in this build, so an image channel
            becomes a declared video feature with VideoRef placeholders, plus a warning.
+           --expert replaces the policy with a scripted demonstration: it drives every
+           control tick through the same chunk buffer and the same Safety Plane (INV-12),
+           records action_source=Human, and needs no Torch runtime. --policy is still
+           required -- the bundle carries the Task, Observation and Deployment IR the
+           collector reads -- but its weights are never loaded. A waypoint the arm cannot
+           reach ends that episode as a failed demonstration (spec 17.2), written, not dropped.
 
 intervene  Applies intervention segments to a dataset that is already on disk. <segments.json>
            is a JSON array of
@@ -146,12 +161,130 @@ macro_rules! dispatch_nj_h {
 fn collect_typed<const NJ: usize, const H: usize>(
     spec: &CollectSpec<'_>,
     policy: &mut dyn PolicyRuntime,
+    mut expert: Option<&mut ScriptedExpert>,
 ) -> Result<CollectReport, CliError> {
-    // No intervener on the CLI path: teleop is real-robot I/O (M3 W1) and a scripted
-    // intervener is a program, not a flag. `es loop intervene` labels afterwards.
-    let mut none = |_: u32, _: u32, _: &[f64]| None;
-    Collector::run::<MuJoCoCpuBackend, _, NJ, H>(spec, policy, MuJoCoCpuBackend::new, &mut none)
-        .map_err(|e| CliError::Runtime(e.to_string()))
+    // Teleop is real-robot I/O (M3 W1) and stays off this path; the one scripted intervener
+    // the CLI offers is `--expert`. `es loop intervene` labels afterwards.
+    let mut hook = |_episode: u32, frame: u32, model: &ModelInfo, obs: &[f64]| {
+        let Some(expert) = expert.as_deref_mut() else {
+            return Intervention::Policy;
+        };
+        if frame == 0 {
+            expert.reset();
+        }
+        let state = es_env::expert::state_of_row(model, obs);
+        match expert.chunk(model, &state, 0) {
+            Some(rows) => Intervention::Chunk(
+                rows.iter()
+                    .filter_map(|r| <[f64; NJ]>::try_from(r.as_slice()).ok())
+                    .collect(),
+            ),
+            // Out of reach: a failed demonstration, never a clamped approximation (spec 17.2).
+            None => Intervention::Abort,
+        }
+    };
+    Collector::run::<MuJoCoCpuBackend, _, NJ, H>(
+        spec,
+        policy,
+        MuJoCoCpuBackend::new,
+        &mut hook,
+        None,
+    )
+    .map_err(|e| CliError::Runtime(e.to_string()))
+}
+
+/// The `PolicyRuntime` slot under `--expert`: the bundle's Task, Observation and Deployment IR
+/// are what the collector needs, and its weights are never loaded, so nothing is behind this.
+/// Every call is a named error rather than a zero tensor — if the collector ever reached the
+/// policy under `--expert`, that would be a bug worth a message (spec 17.2).
+#[derive(Debug, Default)]
+struct NoPolicy;
+
+impl PolicyRuntime for NoPolicy {
+    fn load(
+        &mut self,
+        _graph: &es_ir::learning::LearningGraph,
+        _weights: &WeightsSource,
+    ) -> Result<es_policy::PolicyInfo, es_policy::PolicyError> {
+        Err(es_policy::PolicyError::Backend(
+            "es loop collect --expert loads no policy".to_owned(),
+        ))
+    }
+
+    fn infer(
+        &mut self,
+        _inputs: &std::collections::BTreeMap<String, es_compile::Tensor>,
+    ) -> Result<std::collections::BTreeMap<String, es_compile::Tensor>, es_policy::PolicyError>
+    {
+        Err(es_policy::PolicyError::Backend(
+            "es loop collect --expert has no policy to infer with".to_owned(),
+        ))
+    }
+
+    fn info(&self) -> Option<&es_policy::PolicyInfo> {
+        None
+    }
+
+    fn runtime_hash(&self) -> [u8; 32] {
+        [0; 32]
+    }
+}
+
+/// The scripted expert for `--expert <name>`, built from the scene it will drive.
+///
+/// The cube is the scene's one free-joint body: a demonstration that picks something up needs
+/// something that can be picked up, and naming it by id would put a scene detail in a flag.
+fn build_expert(
+    name: &str,
+    scene: &SceneDesc,
+    deploy: &es_ir::deployment::DeploymentIr,
+) -> Result<ScriptedExpert, CliError> {
+    if name != EXPERT_NAME {
+        return Err(CliError::Usage(format!(
+            "unknown --expert '{name}': only {EXPERT_NAME} exists\n\n{HELP}"
+        )));
+    }
+    let free: Vec<_> = scene
+        .joints
+        .iter()
+        .filter(|j| j.kind == JointKind::Free)
+        .collect();
+    let [joint] = free.as_slice() else {
+        return Err(CliError::Runtime(format!(
+            "--expert {EXPERT_NAME} needs exactly one free-joint body to pick up; the scene has {}",
+            free.len()
+        )));
+    };
+    let mut cfg = demo_cfg(joint.id);
+    pace(&mut cfg, deploy);
+    ScriptedExpert::new(scene, cfg).map_err(|e| CliError::Runtime(e.to_string()))
+}
+
+/// Paces the expert to the envelope it will be recorded through (`INV-12`: the demonstration
+/// obeys the Safety Plane rather than being corrected by it, and the plane is still the only
+/// actuator path). A tenth is held back so nothing lands exactly on a limit.
+fn pace(cfg: &mut es_env::ExpertCfg, deploy: &es_ir::deployment::DeploymentIr) {
+    let s = &deploy.safety;
+    let dt = deploy.rate.control.period_secs_f64();
+    let least = |values: &[f64]| {
+        values
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .fold(f64::INFINITY, f64::min)
+    };
+    let step = least(&s.velocity_max) * dt;
+    let step = step.min(least(&s.action_rate.first_diff_max));
+    let accel = least(&s.acceleration_max) * dt * dt;
+    let accel = accel.min(least(&s.action_rate.second_diff_max));
+    if step.is_finite() {
+        cfg.step_max = 0.9 * step;
+    }
+    if accel.is_finite() {
+        cfg.accel_max = 0.9 * accel;
+    }
+    cfg.horizon = deploy.action.horizon as u32;
+    cfg.execute = deploy.action.execute_chunk as u32;
 }
 
 fn collect(args: &[String]) -> Result<u8, CliError> {
@@ -166,8 +299,10 @@ fn collect(args: &[String]) -> Result<u8, CliError> {
             "--backend",
             "--runtime",
             "--max-steps",
+            "--expert",
         ],
     )?;
+    let expert_name = one(&pairs, "--expert").map(ToOwned::to_owned);
     let policy_path = required(&pairs, "--policy")?.to_owned();
     let scene_path = required(&pairs, "--scene")?.to_owned();
     let out = PathBuf::from(required(&pairs, "--out")?);
@@ -196,19 +331,33 @@ fn collect(args: &[String]) -> Result<u8, CliError> {
         println!("SKIPPED (mujoco-cpu backend unavailable: {reason})");
         return Ok(3);
     }
-    if let Err(reason) = es_policy::torch_runtime::is_available() {
-        println!("SKIPPED (torch runtime unavailable: {reason})");
-        return Ok(3);
+    // `--expert` drives every tick itself, so the bundle's weights are never loaded and the
+    // Torch runtime is not needed at all (design note section 5.1).
+    if expert_name.is_none() {
+        if let Err(reason) = es_policy::torch_runtime::is_available() {
+            println!("SKIPPED (torch runtime unavailable: {reason})");
+            return Ok(3);
+        }
     }
 
     let scene = super::backend::load_scene(&scene_path)?;
-    let mut runtime = TorchRuntime::new();
-    runtime
-        .load(
-            &bundle.learning,
-            &WeightsSource::InMemory(bundle.weights.clone()),
-        )
-        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let mut expert = match &expert_name {
+        Some(name) => Some(build_expert(name, &scene, &bundle.deployment)?),
+        None => None,
+    };
+    let mut torch = TorchRuntime::new();
+    let mut no_policy = NoPolicy;
+    let policy: &mut dyn PolicyRuntime = if expert.is_some() {
+        &mut no_policy
+    } else {
+        torch
+            .load(
+                &bundle.learning,
+                &WeightsSource::InMemory(bundle.weights.clone()),
+            )
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
+        &mut torch
+    };
 
     let spec = CollectSpec {
         bundle: &bundle,
@@ -220,14 +369,37 @@ fn collect(args: &[String]) -> Result<u8, CliError> {
     };
     let nj = bundle.deployment.robot.n_joints;
     let h = bundle.deployment.action.horizon;
-    let report = dispatch_nj_h!(nj, h, &spec, &mut runtime)?;
+    let report = dispatch_nj_h!(nj, h, &spec, policy, expert.as_mut())?;
 
     for w in &report.warnings {
         println!("warning: {w}");
     }
     println!("wrote {}", report.root.display());
     println!("episodes: {}   frames: {}", report.episodes, report.frames);
+    let count = |t: Termination| report.terminations.iter().filter(|x| **x == t).count();
+    println!(
+        "terminations: success {}   failure {}   timeout {}   running {}",
+        count(Termination::Success),
+        count(Termination::Failure),
+        count(Termination::Timeout),
+        count(Termination::Running)
+    );
     println!("intervention frames: {}", report.intervention_frames);
+    // What the plane did, per spec 10.3's failure-mode histogram: a demonstration the envelope
+    // had to correct is worth seeing, not hiding (INV-12).
+    let kinds: Vec<String> = es_safety::ViolationKind::ALL
+        .iter()
+        .filter(|k| report.safety.count(**k) > 0)
+        .map(|k| format!("{k:?}={}", report.safety.count(*k)))
+        .collect();
+    println!(
+        "safety: {} steps, {} clamped, {} fallback{}{}",
+        report.safety.steps,
+        report.safety.clamped_steps,
+        report.safety.fallback_activations,
+        if kinds.is_empty() { "" } else { "   " },
+        kinds.join(" ")
+    );
     println!("content: {}", hex(&report.content));
     println!("schema:  {}", hex(&report.schema));
     Ok(0)

@@ -8,6 +8,14 @@
 # acceleration and the action-rate limits are chosen for the 50 Hz control tick and are the
 # knob V3 turns.
 #
+# `envelope_violation_rate` is deliberately loose (packet M5/V1). Everything on this path
+# commands *joint positions*: a chunk carries where the arm should be, and the plane turns
+# each chunk into motion the envelope allows -- so a demonstration that asks for a pose the
+# arm has not reached yet is clamped on most ticks by construction, not by anomaly. At V0's
+# 0.05 the watchdog latched the fallback a second into every demonstration and froze the arm.
+# Widening it is the sanctioned move; disabling the plane is not (INV-12), and every clamp is
+# still counted, still recorded as `action_source = Clamped`, and still V3's material.
+#
 # Rates are integer `TickRate`s (spec 18.1): control 50 Hz, inference 5 Hz. The deadlines are
 # whole multiples of the control period -- observation_age 4x, inference_budget 2x,
 # actuation_budget 1/2x -- so nothing here is a float duration.
@@ -25,7 +33,7 @@ watchdogs = [
     { inference_deadline = { budget = 40000 } },
     "chunk_underrun",
     { stale_observation = { max_age = 80000 } },
-    { envelope_violation_rate = { max_frac = 0.05, window = 200 } },
+    { envelope_violation_rate = { max_frac = 0.9, window = 200 } },
 ]
 
 [body.action]

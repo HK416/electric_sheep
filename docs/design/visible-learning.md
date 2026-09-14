@@ -567,6 +567,67 @@ whichever packet next edits the fixture: declare the `ImageInput` as `U8 [96, 96
 `ObservationNode::Dequantize` after it — `Op::Dequantize` (`crates/es-compile/src/plan.rs:73`) is exactly
 "HWC u8 → CHW f32 /255" and already exists. V0b does not edit V0's fixtures.
 
+### 7.5 As built (V1), and the four things V0's scene and documents got wrong
+
+Everything below was measured on the oracle server against
+`tests/fixtures/mjcf/so101_pick_place.xml`, and every number in `es_env::expert::demo_cfg` is
+one of these measurements. The oracle is `expert_solves_the_pinned_seeds`
+(`crates/es/tests/cli.rs`): eight pinned seeds through `es loop collect --expert`, with the
+cube's final `x`, `y` **and** `z` read back out of the written dataset — because the Task IR's
+own predicate sees `x` alone (section 5.4) and a success rate taken from it would be a rate
+about the predicate, not about the expert.
+
+**1. The bin was inside the robot, and out of its reach.** At V0's place — centred on the +X
+axis at `x = 0.11` — `bin_wall_nx` intersected `shoulder_holder_col`, the shoulder's own
+collision box, by 11 mm: MuJoCo reported the contact at the rest pose and `shoulder_pan` could
+not turn at all. Beyond that, *no point above the bin's interior was in the arm's workspace*:
+with a 0.16 m tool and SO-101's `wrist_flex` range, nothing at `x < 0.14`, `z > 0.04` has an
+elbow-up solution. The bin now sits beside the arm (interior `x ∈ [0.09, 0.19]`,
+`y ∈ [-0.15, -0.05]`), which is reachable, clear of the shoulder, and wholly inside the
+overhead camera's frustum at wall height — the last of which the rendered golden depends on:
+placing it so the wall tops straddled the frustum edge made the GPU frame differ from the CPU
+reference in 3 of 27,648 bytes.
+
+**2. The cube is 25 mm, not 30.** One jaw is fixed. The gap is centred on the tool site only
+at one opening, and a cube approached with the base yawed presents its diagonal: a 30 mm cube
+left about 2 mm of clearance at the near corner of the draw, which the arm loses on the way
+down and shoves the cube instead of grasping it. `pos_tol` also came down from 0.035 rad to
+0.01 (about 2 mm at the tool) for the same reason.
+
+**3. The success predicate fires while the cube is still in the jaws.** "Cube `x` inside the
+bin's span and at rest" is just as true of a cube *carried* across the bin as of one lying in
+it, and V1 measured exactly that: 8 of 8 episodes ended `Success` with the cube 10 cm in the
+air. The cone gains one more scalar it *can* read — the gripper's own joint — so the predicate
+is now "in the bin's x span, at rest, **and not being held**". The threshold is 0.6 rad because
+a jaw holding the 25 mm cube stalls at about 0.30 however hard it is told to close; the
+demonstration therefore opens to 0.9, not 0.4. The expert also gained a `Lower` stage: released
+from carry height the cube lands on the wall as often as in the bin, and — since the predicate
+cannot see `z` — the episode ends with the cube still falling.
+
+**4. A step command is not a demonstration.** `execute_chunk = 10` at 5 Hz inference with
+`TemporalEnsemble`: the expert's per-tick position target reaches the actuator as a chunk, and
+the Safety Plane turns each chunk into motion the envelope allows. A scripted driver that
+jumps straight to its IK solution is therefore clamped on nearly every tick — measured: 39 of
+40 steps, `Velocity` and `Acceleration` — and V0's `envelope_violation_rate { max_frac = 0.05 }`
+latched the fallback about a second into every demonstration and froze the arm for the rest of
+it. Two changes, both recorded: the expert emits a **ramped chunk** (`step_max`, `accel_max`,
+read out of the Deployment IR it will be recorded through, with anti-windup against the
+measured joint), and the demo's `max_frac` is widened to 0.9. Widening the envelope is the
+sanctioned move; disabling the plane is not (`INV-12`), every clamp is still counted, and the
+clamped steps are still recorded as `action_source = Clamped` — which is V3's material.
+
+**What it measures.** 8/8 pinned seeds end in `Success` and 8/8 put the cube inside the bin's
+three-dimensional interior, in about 350 control steps (7 s) of a 900-step (18 s) budget. The
+IK itself round-trips through MuJoCo's own forward kinematics to 3.3e-8 m over 120 targets, and
+two runs of one seed produce byte-identical `ctrl` rows.
+
+**The dataset oracle answered, and the answer is a refusal.** `lerobot` 0.6.1 with the
+`[dataset]` extra installed does not read `codebase_version: "v2.1"` at all — it raises
+`BackwardCompatibilityError` and points at its own v2.1 → v3.0 converter. That settles open
+question 2 in the direction of a v3 writer, and `docs/api-notes/lerobot-dataset.md` records it;
+the writer is deliberately unchanged here, because the packet that changes it is the one that
+implements v3.0.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:

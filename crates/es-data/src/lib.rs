@@ -26,8 +26,8 @@ pub mod roboverse;
 use std::path::{Path, PathBuf};
 
 pub use collect::{
-    append_loop_step, distill, read_loop_steps, CollectReport, CollectSpec, Collector, Intervener,
-    LoopKind, LoopStep, SplitSpec,
+    append_loop_step, distill, read_loop_steps, CollectReport, CollectSpec, Collector, FrameSink,
+    Intervener, Intervention, LoopKind, LoopStep, SplitSpec,
 };
 pub use identity::{BaseModel, DatasetIdentity, Split, TrainingIdentity};
 pub use intervention::{

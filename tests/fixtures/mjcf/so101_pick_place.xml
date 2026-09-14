@@ -30,13 +30,17 @@
     <!-- Table: the ground plane the arm, the cube and the bin stand on. -->
     <geom name="table" type="plane" size="0.6 0.6 0.05" rgba="0.76 0.71 0.62 1"/>
 
-    <!-- Bin: a floor plate and four thin walls. Interior x in [0.050, 0.170],
-         y in [-0.105, 0.105], floor top at z = 0.008. -->
-    <geom name="bin_floor" type="box" size="0.064 0.109 0.004" pos="0.11 0 0.004" rgba="0.25 0.35 0.55 1"/>
-    <geom name="bin_wall_nx" type="box" size="0.004 0.109 0.045" pos="0.046 0 0.045" rgba="0.25 0.35 0.55 1"/>
-    <geom name="bin_wall_px" type="box" size="0.004 0.109 0.045" pos="0.174 0 0.045" rgba="0.25 0.35 0.55 1"/>
-    <geom name="bin_wall_ny" type="box" size="0.064 0.004 0.045" pos="0.11 -0.109 0.045" rgba="0.25 0.35 0.55 1"/>
-    <geom name="bin_wall_py" type="box" size="0.064 0.004 0.045" pos="0.11 0.109 0.045" rgba="0.25 0.35 0.55 1"/>
+    <!-- Bin: a floor plate and four thin walls. Interior x in [0.090, 0.190],
+         y in [-0.150, -0.050], floor top at z = 0.008. It sits beside the arm, not in front
+         of it: at V0's place (centred on the +X axis at x = 0.11) its near wall intersected
+         the shoulder's own collision box and jammed shoulder_pan, and no point above its
+         interior was inside the arm's workspace (packet M5/V1). It is also wholly inside the
+         overhead camera's frustum at wall height, which the rendered golden depends on. -->
+    <geom name="bin_floor" type="box" size="0.054 0.054 0.004" pos="0.14 -0.1 0.004" rgba="0.25 0.35 0.55 1"/>
+    <geom name="bin_wall_nx" type="box" size="0.004 0.054 0.045" pos="0.086 -0.1 0.045" rgba="0.25 0.35 0.55 1"/>
+    <geom name="bin_wall_px" type="box" size="0.004 0.054 0.045" pos="0.194 -0.1 0.045" rgba="0.25 0.35 0.55 1"/>
+    <geom name="bin_wall_ny" type="box" size="0.054 0.004 0.045" pos="0.14 -0.154 0.045" rgba="0.25 0.35 0.55 1"/>
+    <geom name="bin_wall_py" type="box" size="0.054 0.004 0.045" pos="0.14 -0.046 0.045" rgba="0.25 0.35 0.55 1"/>
 
     <!-- Emitter for the path-traced render path: es-render infers emission from the
          `_light` name suffix (crates/es-render/src/scene.rs:30). -->
@@ -200,8 +204,8 @@
     <!-- The manipulated cube. Its free joint is the Task IR's randomization target. -->
     <body name="cube" pos="0.24 0 0.02">
       <freejoint name="cube_free"/>
-      <inertial pos="0 0 0" mass="0.05" diaginertia="1.0417e-05 1.0417e-05 7.5e-06"/>
-      <geom name="cube_geom" type="box" size="0.015 0.015 0.02" condim="3" friction="1 0.03 0.003"
+      <inertial pos="0 0 0" mass="0.05" diaginertia="9.2708e-06 9.2708e-06 5.2083e-06"/>
+      <geom name="cube_geom" type="box" size="0.0125 0.0125 0.02" condim="3" friction="1 0.03 0.003"
         rgba="0.85 0.2 0.15 1"/>
     </body>
   </worldbody>

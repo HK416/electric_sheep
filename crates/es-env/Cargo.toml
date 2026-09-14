@@ -29,6 +29,10 @@ render = ["dep:es-render", "dep:es-gpu"]
 [dev-dependencies]
 proptest = { workspace = true }
 serde_json = { workspace = true }
+# Oracle only (spec 1.4): MuJoCo's own forward kinematics is what judges the closed-form IK,
+# and the expert's success rate is measured against a real rollout. Layer 4, below this
+# crate's 9, and a dev-dependency -- `es-env` itself still never links a backend.
+es-physics-backend = { workspace = true }
 
 [lints]
 workspace = true

@@ -13,6 +13,8 @@ pub mod control;
 pub mod domains;
 pub mod env;
 pub mod episode;
+/// The scripted pick-and-place expert (`docs/design/visible-learning.md` section 5).
+pub mod expert;
 pub mod inference;
 pub mod plan;
 pub mod randomize;
@@ -28,6 +30,7 @@ pub use control::{ControlExecutor, StageOutcome, StageState};
 pub use domains::{DomainRunner, DomainSizing};
 pub use env::{Env, EnvMetrics, StepOutcome};
 pub use episode::{Episode, EpisodeRecorder, Termination};
+pub use expert::{so101_ik, ExpertCfg, Links, ScriptedExpert, Stage};
 pub use inference::{default_max_pending, latency_ticks, AsyncInference, Submission};
 pub use randomize::RandomizationPlan;
 #[cfg(feature = "render")]

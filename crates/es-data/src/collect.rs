@@ -21,10 +21,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use es_assets::scene::SceneDesc;
 use es_compile::{PolicyBundle, Tensor};
 use es_env::scheduler::BatchDomains;
-use es_env::{DomainRunner, Env};
+use es_env::{DomainRunner, Env, Termination};
 use es_ir::learning::{ChunkBlendPolicy, LearningGraph, LearningNode};
 use es_ir::types::ElemType;
-use es_physics_core::backend::PhysicsBackend;
+use es_physics_core::backend::{ModelInfo, PhysicsBackend, StateView};
 use es_policy::{PolicyError, PolicyInfo, PolicyRuntime, WeightsSource};
 use es_safety::SafetyPlane;
 use serde::{Deserialize, Serialize};
@@ -145,12 +145,44 @@ pub fn read_loop_steps(root: &Path) -> Result<Vec<LoopStep>, DataError> {
 
 // --- collection -----------------------------------------------------------------------------
 
-/// The scripted-intervention hook: `Fn(episode, frame, &obs) -> Option<[f64; NJ]>`.
+/// What a scripted intervener does with one control tick.
 ///
-/// `obs` is the observation the policy was handed for that control tick (the `qpos ‖ qvel`
-/// row of spec 12.2's raw path), so a scripted intervener is a pure function of the state and
-/// the run stays bit-reproducible for a seed — which is what makes it usable as an oracle.
-pub type Intervener<'a, const NJ: usize> = &'a mut dyn FnMut(u32, u32, &[f64]) -> Option<[f64; NJ]>;
+/// [`Abort`](Self::Abort) exists because a scripted driver can run out of answers — a waypoint
+/// outside the robot's workspace, say — and the honest record of that is a demonstration that
+/// ended in failure, not one clamped to something reachable (spec 17.2).
+#[derive(Clone, Debug, PartialEq)]
+pub enum Intervention<const NJ: usize> {
+    /// Leave this tick to the policy.
+    Policy,
+    /// Drive this tick with this action, held for the whole chunk horizon. It still travels
+    /// chunk buffer -> `SafetyPlane` -> `ctrl` like any other (`INV-12`).
+    Action([f64; NJ]),
+    /// Drive the next ticks with these actions, one row per control tick. A row short of the
+    /// horizon repeats the last one; rows past it are dropped. A scripted driver that paces
+    /// itself to the Safety Plane's envelope emits a chunk rather than a step, because a step
+    /// is what the envelope has to clamp (design note section 5.3).
+    Chunk(Vec<[f64; NJ]>),
+    /// Stop here: the episode is recorded as a failed demonstration.
+    Abort,
+}
+
+/// The scripted-intervention hook: `Fn(episode, frame, &model, &obs) -> Intervention<NJ>`.
+///
+/// `obs` is the observation the policy was handed for that control tick (the `qpos ‖ qvel` row
+/// of spec 12.2's raw path) and `model` says where each joint sits in it, so a scripted
+/// intervener is a pure function of the state and the run stays bit-reproducible for a seed —
+/// which is what makes it usable as an oracle.
+pub type Intervener<'a, const NJ: usize> =
+    &'a mut dyn FnMut(u32, u32, &ModelInfo, &[f64]) -> Intervention<NJ>;
+
+/// Called once per control step with the state that step ended in.
+///
+/// A closure, not a renderer: `es-data` is layer 10 and `es-render` layer 5, and this is the
+/// same trade `es_eval::runner::FrameSource` makes — the caller owns
+/// `es_env::render::EnvRenderer` (feature `render`) and hands its `frame` in through this, so
+/// nothing here links Vulkan. With a sink, `info.json`'s video feature stops being a dangling
+/// reference.
+pub type FrameSink<'a> = &'a mut dyn FnMut(&ModelInfo, &StateView<'_>) -> Result<(), String>;
 
 /// What [`Collector::run`] is given that the bundle does not say.
 #[derive(Debug)]
@@ -165,13 +197,21 @@ pub struct CollectSpec<'a> {
 }
 
 /// What one collect run produced.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct CollectReport {
     pub root: PathBuf,
     pub episodes: u32,
     pub frames: u64,
     pub intervention_frames: u64,
     pub segments: Vec<InterventionSegment>,
+    /// How each episode ended, in episode order — the demonstration's own verdict, which the
+    /// `LeRobot` columns have no place for.
+    pub terminations: Vec<Termination>,
+    /// Frames handed to the [`FrameSink`], if there was one.
+    pub rendered: u64,
+    /// What the Safety Plane did across the run: spec 10.3's `failure_mode_histogram`, plus
+    /// the clamp and fallback counts `action_source` is classified from.
+    pub safety: es_safety::SafetyCounters,
     pub content: [u8; 32],
     pub schema: [u8; 32],
     /// Honest gaps, one line each — currently the image channels for which `info.json`
@@ -187,10 +227,16 @@ struct Intervened<'a, const NJ: usize, const H: usize> {
     inner: &'a mut dyn PolicyRuntime,
     intervener: Intervener<'a, NJ>,
     action_port: String,
+    /// The loaded model, so the intervener can find a joint inside the observation row.
+    model: ModelInfo,
     episode: u32,
     frame: u32,
     /// Set by the last `infer` call: did the intervener take this tick?
     injected: bool,
+    /// Set by the last `infer` call: did the intervener give up?
+    aborted: bool,
+    /// The last chunk the intervener asked for, repeated on an abort.
+    last: Vec<[f64; NJ]>,
 }
 
 impl<const NJ: usize, const H: usize> PolicyRuntime for Intervened<'_, NJ, H> {
@@ -208,11 +254,29 @@ impl<const NJ: usize, const H: usize> PolicyRuntime for Intervened<'_, NJ, H> {
     ) -> Result<BTreeMap<String, Tensor>, PolicyError> {
         let obs = inputs.values().next().map_or_else(Vec::new, tensor_to_f64);
         self.injected = false;
-        if let Some(action) = (self.intervener)(self.episode, self.frame, &obs) {
-            self.injected = true;
+        let taken = (self.intervener)(self.episode, self.frame, &self.model, &obs);
+        self.aborted = taken == Intervention::Abort;
+        // A driver that gave up repeats what it last asked for -- through the plane, like every
+        // other chunk (`INV-12`) -- and the collector ends the episode on the flag above. The
+        // alternative, an empty chunk, is a watchdog event the demonstration did not have.
+        let rows = match taken {
+            Intervention::Action(a) => Some(vec![a]),
+            Intervention::Chunk(rows) if !rows.is_empty() => Some(rows),
+            // An empty chunk is nothing to execute, which is the policy's tick.
+            Intervention::Policy | Intervention::Chunk(_) => None,
+            Intervention::Abort => Some(self.last.clone()),
+        };
+        if let Some(rows) = &rows {
+            if !self.aborted {
+                self.injected = true;
+                self.last.clone_from(rows);
+            }
+        }
+        if let Some(rows) = rows {
+            let last = *rows.last().unwrap_or(&[0.0; NJ]);
             let mut data = Vec::with_capacity(H * NJ * 4);
-            for _ in 0..H {
-                for v in &action {
+            for k in 0..H {
+                for v in rows.get(k).unwrap_or(&last) {
                     data.extend_from_slice(&(*v as f32).to_le_bytes());
                 }
             }
@@ -283,6 +347,7 @@ impl Collector {
         policy: &mut dyn PolicyRuntime,
         mut new_backend: F,
         intervener: Intervener<'_, NJ>,
+        mut frame_sink: Option<FrameSink<'_>>,
     ) -> Result<CollectReport, DataError>
     where
         B: PhysicsBackend,
@@ -324,7 +389,7 @@ impl Collector {
             spec.max_steps
         };
         let fps = control.num() as f64 / control.den() as f64;
-        let (features, warnings) = collect_features(bundle, nq + nv, nu);
+        let (features, warnings) = collect_features(bundle, nq + nv, nu, frame_sink.is_some());
         let task_name = format!(
             "es:task:{}",
             hex(&bundle.task.task_hash().map_err(DataError::Canon)?)
@@ -334,20 +399,26 @@ impl Collector {
             inner: policy,
             intervener,
             action_port: "action".to_owned(),
+            model: env.model().clone(),
             episode: 0,
             frame: 0,
             injected: false,
+            aborted: false,
+            last: vec![[0.0; NJ]],
         };
 
         let mut writer = LeRobotWriter::create(spec.out_root, Info::new(fps, features))?;
         let mut segments = Vec::new();
         let mut frames = 0u64;
         let mut intervention_frames = 0u64;
+        let mut terminations = Vec::with_capacity(spec.n_episodes as usize);
+        let mut rendered = 0u64;
 
         for index in 0..spec.n_episodes {
             let mut sources: Vec<i64> = Vec::with_capacity(max_steps as usize);
             let mut human = vec![false; max_steps as usize + latency + execute + 1];
             let mut closed = None;
+            let mut aborted = false;
             for frame in 0..max_steps {
                 wrapper.episode = index;
                 wrapper.frame = frame;
@@ -368,15 +439,26 @@ impl Collector {
                 }
                 let after = counters_of(&planes[0]);
                 sources.push(classify(before, after, human[frame as usize]).as_i64());
+                // One frame per control step, from the state the step ended in — the same
+                // state the row above recorded.
+                if let Some(sink) = frame_sink.as_deref_mut() {
+                    let state = env.backend().state();
+                    sink(env.model(), &state).map_err(DataError::Loop)?;
+                    rendered += 1;
+                }
                 if let Some(ep) = outcome.episodes.into_iter().next() {
                     closed = Some(ep);
+                    break;
+                }
+                if wrapper.aborted {
+                    aborted = true;
                     break;
                 }
             }
             // The budget ran out before a terminal condition: close the open episode. Exactly
             // one reset happens per episode either way, so the task's own randomization draws
             // stay a pure function of `seed` and the episode index.
-            let episode = match closed {
+            let mut episode = match closed {
                 Some(ep) => ep,
                 None => env
                     .reset(None)
@@ -387,6 +469,12 @@ impl Collector {
                         DataError::Loop(format!("episode {index} closed no episode on reset"))
                     })?,
             };
+            // A scripted driver that gave up is a failed demonstration, and the episode is
+            // still written: dropping it would hide what the expert cannot do.
+            if aborted {
+                episode.termination = Termination::Failure;
+            }
+            terminations.push(episode.termination);
             runner.reset_env(0);
             planes[0].reset_latch();
 
@@ -439,6 +527,9 @@ impl Collector {
             frames,
             intervention_frames,
             segments,
+            terminations,
+            rendered,
+            safety: *planes[0].counters(),
             content,
             schema,
             warnings,
@@ -471,11 +562,13 @@ fn classify(before: (u64, u64), after: (u64, u64), human: bool) -> ActionSourceC
 }
 
 /// The feature set of design note section 3, plus one `video` feature per image channel the
-/// task declares — and one warning for each, because no mp4 is written.
+/// task declares — and, with no frame sink, one warning for each, because then nothing at all
+/// was written for that channel.
 fn collect_features(
     bundle: &PolicyBundle,
     state: usize,
     nu: usize,
+    rendering: bool,
 ) -> (BTreeMap<String, FeatureSpec>, Vec<String>) {
     let mut f = BTreeMap::new();
     f.insert(
@@ -502,10 +595,13 @@ fn collect_features(
             format!("observation.images.{name}"),
             FeatureSpec::new(Dtype::Video, channel.ty.shape.dims().to_vec()),
         );
-        warnings.push(format!(
-            "camera {name:?}: info.json declares a video feature and read_episode will produce \
-             VideoRef placeholders, but no mp4 was written (no renderer in this build)"
-        ));
+        if !rendering {
+            warnings.push(format!(
+                "camera {name:?}: info.json declares a video feature and read_episode will \
+                 produce VideoRef placeholders, but no mp4 was written (no renderer in this \
+                 build)"
+            ));
+        }
     }
     (f, warnings)
 }

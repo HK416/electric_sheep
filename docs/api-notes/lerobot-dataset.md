@@ -194,3 +194,32 @@ Three deliberate lossy edges, all forced by what the format does *not* record:
 `Unit::Dimensionless` rather than `Unit::Angle`/`Unit::Length`: the `names` list
 (`"shoulder_pan"`, …) is not a unit declaration, and `is_policy_input()` accepts
 `Dimensionless`, which is what these tensors are used as.
+
+## Measured against the real package, 2026-09-15 — `verified`
+
+`ES_LEROBOT_PYTHON=$HOME/venvs/es-lerobot-cuda/bin/python cargo test -p es-data --test
+lerobot_oracle -- --nocapture`, on the oracle server (packet `docs/packets/M5/V1`), against a
+dataset this crate wrote (`observation.state`, `action`, `reward`, `action_source`,
+`intervention`; two episodes; no video feature):
+
+| Thing | Result |
+|---|---|
+| `lerobot` | 0.6.1, with `datasets` 4.8.5 and `pyarrow` 25.0.1 — the `[dataset]` extra **is** installed now |
+| `import lerobot.datasets.lerobot_dataset` | works |
+| `LeRobotDataset(repo_id=..., root=<ours>)` | **refuses**: `BackwardCompatibilityError: The dataset you requested is in 2.1 format. We introduced a new format since v3.0 which is not backward compatible with v2.1.` |
+| `lerobot.datasets.dataset_metadata.CODEBASE_VERSION` | `"v3.0"` |
+
+So the finding the packet asked for is a refusal, and it is decisive for design-note open
+question 2: **`lerobot` 0.6.1 does not read `codebase_version: "v2.1"` at all**, so nothing
+about our parquet, our `meta/*.jsonl` or our column dtypes was exercised — the version gate
+fires first. Nothing here upgrades that verdict for the rest of this file: every `unverified`
+above is still unverified.
+
+What this does *not* say: that our v2.1 writer is wrong. v2.1 is a format `lerobot` itself
+shipped; 0.6.1 simply dropped backward compatibility and offers
+`python -m lerobot.scripts.convert_dataset_v21_to_v30` for datasets on the hub. The choice
+between writing v3.0 directly and shipping a converter is a packet of its own (spec 19.1), and
+`crates/es-data/src/lerobot/meta.rs`'s `codebase_version` is deliberately left alone here.
+
+Until then `crates/es-data/tests/lerobot_oracle.rs` prints `SKIP lerobot_oracle: <why>` with
+that refusal as the reason, on every machine.

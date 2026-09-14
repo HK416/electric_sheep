@@ -12,10 +12,13 @@ use es_assets::scene::SceneDesc;
 use es_compile::{BundleKind, BundleManifest, PolicyBundle, Tensor};
 use es_core::time::{PhysTick, TickRate};
 use es_core::{FailureKind, StableId};
-use es_data::collect::{read_loop_steps, CollectSpec, Collector, LoopKind, SplitSpec};
+use es_data::collect::{
+    read_loop_steps, CollectSpec, Collector, Intervention, LoopKind, SplitSpec,
+};
 use es_data::intervention::{ActionSourceCode, InterventionSegment, InterventionSource};
 use es_data::{Column, LeRobotDataset};
 use es_data::{ACTION_SOURCE, INTERVENTION};
+use es_env::Termination;
 use es_ir::deployment::{
     ActionContract, ActionSpace as DepSpace, Deadlines, DeploymentIr, ExecutionMode,
     FallbackPolicy, Limit, Micros, RateLimit, RateSpec, RobotRef, RobotTarget, SafetyEnvelope,
@@ -529,8 +532,12 @@ fn scratch(name: &str) -> std::path::PathBuf {
 
 /// Injects a constant action on [`INJECT`] of every episode; a pure function of the frame, so
 /// the run stays reproducible.
-fn scripted(_episode: u32, frame: u32, _obs: &[f64]) -> Option<[f64; NJ]> {
-    INJECT.contains(&frame).then_some([0.7; NJ])
+fn scripted(_episode: u32, frame: u32, _model: &ModelInfo, _obs: &[f64]) -> Intervention<NJ> {
+    if INJECT.contains(&frame) {
+        Intervention::Action([0.7; NJ])
+    } else {
+        Intervention::Policy
+    }
 }
 
 fn collect_into(root: &std::path::Path, episodes: u32, seed: u64) -> es_data::CollectReport {
@@ -550,6 +557,79 @@ fn collect_into(root: &std::path::Path, episodes: u32, seed: u64) -> es_data::Co
         &mut policy,
         FakeBackend::new,
         &mut hook,
+        None,
+    )
+    .expect("the fixture collect run succeeds")
+}
+
+/// The same bundle with one image channel declared, so `collect_features` emits the `video`
+/// feature whose dangling-reference warning V1 is about. Only the Task IR's `ObservationSpec`
+/// matters here: nothing on the collect path reads the pixels.
+fn bundle_with_camera() -> PolicyBundle {
+    use es_ir::image::{
+        CameraModel, ChannelFormat, ColorSpace, DistortionModel, ImageDType, ImageSpec, Intrinsics,
+        ShutterModel,
+    };
+    let sensor = StableId::from_path("sensor:overhead");
+    let spec = ImageSpec {
+        width: 8,
+        height: 6,
+        channels: ChannelFormat::Rgb,
+        dtype: ImageDType::U8,
+        color_space: ColorSpace::SRgb,
+        camera_model: CameraModel::Pinhole,
+        intrinsics: Intrinsics::new(8.0, 8.0, 4.0, 3.0),
+        extrinsics: es_math::Pose::IDENTITY,
+        distortion: DistortionModel::None,
+        shutter: ShutterModel::Global,
+        exposure: std::time::Duration::from_micros(500),
+        rate_hz: CONTROL_HZ as f32,
+        depth_scale: None,
+    };
+    let mut b = bundle();
+    b.task.observation_spec.channels.insert(
+        "overhead".to_owned(),
+        ObsChannel {
+            source: ObsSource::Sensor {
+                id: sensor,
+                format: ChannelFormat::Rgb,
+            },
+            ty: PortType {
+                elem: ElemType::U8,
+                shape: Shape::new([6, 8, 3]),
+                unit: Unit::Pixel,
+                frame: Frame::Camera(sensor),
+                time: TimeRef::Tick,
+                image: Some(spec),
+            },
+        },
+    );
+    b
+}
+
+/// One collect run with a bundle, an intervener and an optional frame sink, so the tests below
+/// differ in exactly the thing they are about.
+fn collect_with(
+    root: &std::path::Path,
+    b: &PolicyBundle,
+    hook: es_data::Intervener<'_, NJ>,
+    sink: Option<es_data::FrameSink<'_>>,
+) -> es_data::CollectReport {
+    let s = scene();
+    let mut policy = FakePolicy { target: 0.2 };
+    Collector::run::<FakeBackend, _, NJ, H>(
+        &CollectSpec {
+            bundle: b,
+            scene: &s,
+            n_episodes: 2,
+            seed: 7,
+            max_steps: STEPS,
+            out_root: root,
+        },
+        &mut policy,
+        FakeBackend::new,
+        hook,
+        sink,
     )
     .expect("the fixture collect run succeeds")
 }
@@ -822,4 +902,128 @@ fn label_on_mismatched_metadata_is_an_error_not_a_panic() {
 
     let err = es_data::label(&root, &[]).expect_err("mismatched metadata must not panic");
     assert!(matches!(err, es_data::DataError::Inconsistent(_)), "{err}");
+}
+
+// --- V1: frames, aborted demonstrations, and a clamped scripted action -----------------------
+
+fn no_intervention(_: u32, _: u32, _: &ModelInfo, _: &[f64]) -> Intervention<NJ> {
+    Intervention::Policy
+}
+
+/// Packet M5/V1: with a frame sink, the collector calls it exactly once per recorded control
+/// step, and `info.json`'s video feature stops carrying the "no mp4 was written" warning.
+#[test]
+fn frames_are_written_once_per_control_step() {
+    let root = scratch("loop-frames");
+    let b = bundle_with_camera();
+    let mut seen: Vec<(u32, f64)> = Vec::new();
+    let mut sink = |model: &ModelInfo, state: &StateView<'_>| {
+        seen.push((model.nq, state.qpos_of(0)[0]));
+        Ok(())
+    };
+    let report = collect_with(&root, &b, &mut no_intervention, Some(&mut sink));
+
+    assert_eq!(report.rendered, report.frames);
+    assert_eq!(seen.len() as u64, report.frames);
+    assert!(
+        report.warnings.is_empty(),
+        "a rendered run has no dangling video reference: {:?}",
+        report.warnings
+    );
+    // The frame is taken from the state the step ended in, not from a constant.
+    let moved = seen
+        .iter()
+        .filter(|(_, q)| (q - seen[0].1).abs() > 1e-12)
+        .count();
+    assert!(moved > 0, "every frame saw the same state");
+}
+
+/// The other half: no sink, and the run is exactly what it was before V1 -- the warning, the
+/// declared video feature and the `VideoRef` placeholders all unchanged.
+#[test]
+fn without_a_renderer_collect_behaves_as_before() {
+    let root = scratch("loop-no-frames");
+    let b = bundle_with_camera();
+    let report = collect_with(&root, &b, &mut no_intervention, None);
+
+    assert_eq!(report.rendered, 0);
+    assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+    assert!(
+        report.warnings[0].contains("no mp4 was written"),
+        "{:?}",
+        report.warnings
+    );
+    let dataset = LeRobotDataset::open(&root).expect("the collected dataset opens");
+    let ep = dataset.read_episode(0).expect("episode reads back");
+    assert!(
+        ep.video.contains_key("observation.images.overhead"),
+        "the dangling VideoRef is still produced: {:?}",
+        ep.video.keys().collect::<Vec<_>>()
+    );
+}
+
+/// Packet M5/V1: a scripted driver that gives up ends that episode as a failed demonstration,
+/// and the episode is still written -- dropping it would hide what the expert cannot do.
+#[test]
+fn an_unreachable_waypoint_fails_the_episode() {
+    let root = scratch("loop-abort");
+    let b = bundle();
+    let mut hook = |_: u32, frame: u32, _: &ModelInfo, _: &[f64]| {
+        if frame >= 3 {
+            Intervention::Abort
+        } else {
+            Intervention::Action([0.1; NJ])
+        }
+    };
+    let report = collect_with(&root, &b, &mut hook, None);
+
+    assert_eq!(
+        report.terminations,
+        vec![Termination::Failure; 2],
+        "an aborted demonstration is a failure, not a timeout"
+    );
+    let dataset = LeRobotDataset::open(&root).expect("the collected dataset opens");
+    assert_eq!(dataset.episodes().len(), 2, "aborted episodes are written");
+    let ep = dataset.read_episode(0).expect("episode reads back");
+    assert!(ep.len() >= 3 && ep.len() < STEPS as usize, "{}", ep.len());
+}
+
+/// Spec 8.6 / 9.3 and `INV-12`: the demonstration is recorded as the actuator saw it. With an
+/// envelope too tight for the injected action, the recorded `action` is the clamped value and
+/// `action_source` says `Clamped`, not `Human`.
+#[test]
+fn clamped_expert_actions_are_recorded_clamped() {
+    let root = scratch("loop-clamped");
+    let mut b = bundle();
+    // Tighten the envelope -- never disable the plane (INV-12).
+    b.deployment.safety.position = vec![Limit::symmetric(0.3); NJ];
+    b.deployment.safety.position_soft_margin = vec![0.0; NJ];
+    let report = collect_with(&root, &b, &mut scripted, None);
+
+    let dataset = LeRobotDataset::open(&root).expect("the collected dataset opens");
+    let ep = dataset.read_episode(0).expect("episode reads back");
+    let sources = i64_column(&ep, ACTION_SOURCE);
+    let intervention = i64_column(&ep, INTERVENTION);
+    let action = match ep.columns.get("action") {
+        Some(Column::F32(v)) => v.clone(),
+        other => panic!("action: expected a float32 column, got {other:?}"),
+    };
+    // The frames the expert drove: none of them may read `Human`, because none of them
+    // reached the actuator as the expert asked.
+    let injected: Vec<usize> = (0..ep.len()).filter(|f| intervention[*f] == 1).collect();
+    assert!(!injected.is_empty(), "nothing was injected");
+    for frame in injected {
+        assert_eq!(
+            sources[frame],
+            ActionSourceCode::Clamped.as_i64(),
+            "frame {frame}: a clamped demonstration must not be recorded as Human ({sources:?})"
+        );
+        for (j, v) in action[frame * NJ..(frame + 1) * NJ].iter().enumerate() {
+            assert!(
+                *v <= 0.3 + 1e-6,
+                "frame {frame} joint {j}: recorded {v}, outside the envelope it passed through"
+            );
+        }
+    }
+    assert!(report.intervention_frames > 0);
 }

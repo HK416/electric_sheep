@@ -179,3 +179,77 @@ impl ScriptedExpert {
 - `crates/es-policy`, `crates/es/src/cmd/eval.rs`, `crates/es-eval` — V2 and V3.
 - A hand-written Python or Rust re-implementation of LeRobot's reader in place of the real package.
 - Lowering the expert's success threshold to make a change pass.
+
+## as built
+
+Measured on the oracle server, 2026-09-15. Design note section 7.5 has the reasoning; this is
+what changed against the packet above.
+
+**Oracle results.** `expert_success`: **8 of 8 pinned seeds end in `Termination::Success`, and
+8 of 8 put the cube inside the bin's three-dimensional interior** (the test reads the cube's
+final `x`, `y` and `z` out of the written dataset, because the Task IR's predicate sees `x`
+alone). `ik_round_trips_through_forward_kinematics`: 120 targets, worst error 3.3e-8 m against
+MuJoCo's own forward kinematics. `the_same_seed_gives_the_same_demonstration`: byte-identical
+`ctrl`. `lerobot_oracle`: **SKIP** — `lerobot` 0.6.1 *with* the `[dataset]` extra refuses
+`codebase_version: "v2.1"` outright (`BackwardCompatibilityError`, its own constant is
+`"v3.0"`), which is the finding open question 2 was waiting for;
+`docs/api-notes/lerobot-dataset.md` records it and the writer is deliberately unchanged.
+
+**Decisions taken by the orchestrator, and where they live.**
+
+1. *Success predicate*: V0's Task IR predicate is kept and narrowed honestly — the oracle
+   checks `y` and `z` from the backend state itself, and asserts that the count of IR
+   successes equals the count of cubes actually in the bin. That assertion is what caught
+   deviation 3 below.
+2. *Observation fixture*: `ImageInput` is now `U8 [96, 96, 3]` with an `ObservationNode::
+   Dequantize` after it, as V0b's section 7.4 asked. The Task IR's channel had to move with it
+   (`XIR-002` compares the declared channel type with the source node's output), so both
+   `task_hash` and `observation_hash` moved; `es ir check` and `es task compile` pass, and the
+   compiled plan still ends in `shape=[3, 96, 96]`.
+3. *XIR-002 in `crates/es-eval/tests/evaluation.rs`*: **not touched.** Reading `cross::check`
+   settled it the other way — the *demo's* documents already name the same `StableId` on both
+   sides, so nothing blocked `es loop collect`; that test's fixture is `es-eval`'s own and the
+   packet forbids editing `es-eval`. Recorded here as a human question.
+4. *Reachability*: the scene moved, and further than "minimally" — design note section 7.5
+   items 1 and 2. `tests/golden/render/so101_frame0.*` is regenerated from the changed scene
+   with the sanctioned generator (`generate_so101_golden`), so `cargo xtask verify-goldens`
+   needs `GOLDEN_UPDATE=1` for this commit.
+5. *Sensors*: none added. The expert reads `qvel` from the observation row the collector
+   already hands a scripted intervener, not from a new `<sensor>`.
+
+**Deviations from the acceptance signatures**, each forced by something measured:
+
+- `ExpertCfg` names the cube's **free joint**, not its body: the intervener hook is handed the
+  `qpos ‖ qvel` observation row, which has no `xpos` in it, and a free joint's `qpos` *is* the
+  body's world pose. `gripper_body` is gone with it — stage transitions compare measured joint
+  angles, which is what the same row carries.
+- `ExpertCfg` gained `carry_pitch`, `drop_height`, `grasp_depth`, `step_max`, `accel_max`,
+  `horizon` and `execute`. The first three are geometry the arm's own workspace forces
+  (a straight-down approach at carry height leaves `wrist_flex`'s range); the last four are
+  the deployment contract the demonstration is recorded through, and `es loop collect` reads
+  them out of the bundle's Deployment IR rather than guessing.
+- `Stage` has an eighth variant, `Lower`.
+- `ScriptedExpert::chunk` is the primitive and `action` is its first row: a one-tick step
+  command is clamped by the Safety Plane on nearly every tick (design note 7.5 item 4).
+- `Intervener` returns an `Intervention<NJ>` (`Policy` / `Action` / `Chunk` / `Abort`) and is
+  handed `&ModelInfo`; `Collector::run` takes an optional `FrameSink` and reports
+  `terminations`, `rendered` and the plane's `SafetyCounters`. `Abort` is what makes "an
+  unreachable waypoint fails the episode" expressible at all.
+- `crates/es-env/src/plan.rs` gained `Normalize` and `Logic` lowering (design note 5.4 assigned
+  it to V1) and `crates/es-env/Cargo.toml` a dev-dependency on `es-physics-backend` (layer 4,
+  oracle only). `tests/fixtures/visible-learning/deployment.toml`'s
+  `envelope_violation_rate.max_frac` went 0.05 → 0.9.
+- `crates/es/tests/cli.rs` gained `regenerate_visible_learning_documents`, an `#[ignore]`d
+  generator: after V1 no hash in the two demo documents is typed in by hand.
+
+**Human questions.**
+
+1. `cargo xtask verify-goldens` needs `GOLDEN_UPDATE=1` for this commit, because the demo
+   scene changed and the frame golden is a pure function of it. The regeneration is the
+   sanctioned `generate_so101_golden` path, but a human should confirm that moving a broken
+   scene is the right reason to move a golden.
+2. `crates/es-eval/tests/evaluation.rs:427-440` still pairs a body in the Task IR with a joint
+   in the Observation IR, which `cross::check` would reject. It is `es-eval`'s fixture and this
+   packet is forbidden from touching that crate.
+3. LeRobot v3.0: the writer stays v2.1 and the oracle stays a SKIP until a packet implements
+   v3.0 (or a converter). Nothing in plan V reads a dataset back through `lerobot`.
