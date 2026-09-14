@@ -801,6 +801,108 @@ not survive a LeRobot-side rewrite.
   `observation.images.<name>`. Without it the feature is dropped and the command says so,
   rather than declaring an image feature nothing can load.
 
+### 7.8 As built (V3), and the two things the plan above did not know
+
+`es eval run --frames <dir>` is the whole of section 8's input: it renders the Task IR's one
+image channel per control step, writes `<dir>/<suite>-<NN>/<NNNNNN>.bin` plus one
+`layout.json` per cell, and writes `<out>/events.json` with one
+`{ frame, tick, source, events }` record per frame — the directory shape and the JSON shape
+`es video mosaic` already read, checked by `eval_run_output_is_what_es_video_mosaic_reads`
+without a GPU or a physics backend. A cell is one **episode** of one suite, because
+`Evaluation::run` gives every episode its own `Env` (`BatchDomains::single_env()`), which is
+why 16 episodes are 16 directories and the 4x4 grid is a grid of episodes.
+
+**1. `capture` guessed which input was an image, and the guess was wrong.** The rule was "any
+plan input that is neither a `qpos` nor a `sensor` id is an image". That was invisible while
+`Evaluation::run` passed `frames: None` — every such input was refused — and became a bug the
+moment V3 supplied a frame source: the demo's `StateInput` names the robot **body**
+(`ObsSource::JointState { body, dof: 6 }`, not a joint id and not a sensor id), so the first
+real run served a 27,648-byte camera tile into a 6-element `F32` buffer and stopped with a
+size mismatch. `input_sources` now resolves every input **once, before the first episode**,
+against the documents: an input is an image because the Observation IR says `ImageInput`, and
+a `JointState { body, dof }` channel reads the leading `dof` joint positions — the same
+convention `joint_state::<NJ>` already uses to feed the Safety Plane. Anything else is an
+error at the start of the run rather than a surprise in the middle of the table.
+`docs/design/evaluation-execution.md` section 2.3 is the table.
+
+**2. The lighting kinds could not be realised through `EnvRendererCfg`.** Section 2.7 expected
+"once V0b lands a renderer, the two lighting kinds become implementable", and they are — but
+not where the plan assumed. The `Rs` path shades from `RenderConfig::light_dir` and
+`::ambient`, both fixed when a `Renderer` is built; `EnvRendererCfg` carries neither, and V0b
+owns that surface. The demo scene's one emissive geom (`ceiling_light`) is no help either: it
+sits at `z = 0.8` directly **above** the overhead camera at `z = 0.5`, so it is behind the
+camera and out of frame, and on the `Rs` path an emissive geom lights nothing but its own
+pixels. So the kernels landed as two pure functions on `es-eval`'s side —
+`LightOverride::scene` (a gain on every geom's `rgba`, which is *exactly* a radiance gain
+because the Lambert term is linear in `albedo`) and `LightOverride::rotate_dir` (a yaw on
+`light_dir`) — and `es eval run` composes `es_render::Renderer` with V0b's own public
+`render_config` / `body_poses` / `camera_view` to apply them, rebuilding the renderer only
+when the draw changes. `es-render` and `es-env/src/render.rs` are untouched; the `es` crate's
+`render` feature gained `es-render` as a direct dependency, which costs the default build
+nothing (it is off by default, spec 4.2).
+
+**The envelope was not tightened, because it did not need to be.** Section 8 says the demo's
+clamps come from tightening the Deployment IR's limits. The measurement says they come for
+free: an ACT chunk is not ramped the way V1's scripted expert is (section 7.5 finding 4), so
+the plane clamps on its own, and the non-vacuity rule holds without touching
+`deployment.toml`. That is the better outcome — the demo's envelope is the one the
+demonstrations were recorded through — and it leaves INV-12 untouched either way.
+
+**What was measured, on the oracle server (RTX 4090, `~/venvs/es/bin/python`, mujoco 3.13.0,
+torch 2.14.0+cpu), 2026-09-14.** `evaluation_hash 5d70c21c…3b9ff7`, seeds 101-116 — held out
+from the 1-50 the demonstrations were collected on. Success rate is the headline and the only
+headline (§12.4):
+
+| checkpoint | nominal success rate | mean episode length |
+|---|---|---|
+| 1,000 steps | 0.0625 (1/16) | 851.1 |
+| 5,000 steps | 0.0000 (0/16) | 900.0 |
+| 20,000 steps | 0.1250 (2/16) | 883.5 |
+
+and the 20,000-step checkpoint across the suite, 16 episodes each:
+
+| suite | success rate | mean episode length |
+|---|---|---|
+| nominal | 0.1250 | 883.5 |
+| light_intensity | 0.0625 | 887.4 |
+| light_direction | 0.1250 | 883.5 |
+| observation_delay | 0.1250 | 883.5 |
+| torque_noise | 0.0000 | 900.0 |
+| backlash | 0.0000 | 900.0 |
+
+96 episodes, 85,407 rendered frames, 28 minutes. The non-vacuity rule holds — 2 `Success`
+episodes and 76,967 `Clamped` steps — but it holds for a reason worth stating plainly rather
+than counting as a pass:
+
+**Not one step in any run was `ActionSource::Policy`.** 76,967 `Clamped` and 8,440 `Fallback`
+out of 85,407; `envelope_violation_rate` is exactly `1.0` in every cell of every suite. The
+policy's raw chunk is outside the envelope on every single step, the rate watchdog trips, and
+the fallback holds position about 10% of the time. A `light_direction` row equal to the
+`nominal` row to four decimals is the same fact from the other side: what the arm does is
+being decided by the Safety Plane, not by the pixels.
+
+**The most likely cause is a train/inference observation mismatch, and it is V2's debt, not a
+V3 finding about the policy.** `train_act.py` feeds the graph's state port the **raw**
+`observation.state` row and re-implements exactly one Observation IR node, `Dequantize`
+(section 7.6 finding 3). But the demo's Observation IR is not `ImageInput -> Dequantize ->
+sink`: it is `StateInput -> Normalize{Range −1..1}` and `ImageInput -> Dequantize ->
+Normalize{Range 0..1}`. The image branch is safe — `normalize_range(x, 0, 1)` is the identity
+— and the state branch is not: at inference the policy receives `(q + 1) / 2`, and in training
+it received `q`. An affine shift of the entire proprioceptive input, silently, exactly as
+finding 3 predicted would happen "the moment a second node appears". Plan V does not fix it
+here: the fix is a plan-bake step in training (or a retrain through the compiled plan), both
+of which are V2's, and this packet is forbidden from retraining. It is **open question 11**.
+
+So the honest reading of the table is: the pipeline runs end to end and produces a real §10.1
+table, the Safety Plane demonstrably governs the arm, and the *policy* number is not yet a
+measurement of ACT — it is a measurement of ACT fed an observation it was not trained on.
+
+**Video.** `es video mosaic --grid 4x4` over the 16 nominal cells gives 900 frames of
+384x392 (16 tiles of 96x96 plus an 8-pixel label strip), and `python/es/encode_video.py
+--fps 50` gives an 18-second mp4 at the control rate: 10.5 MB `mp4v` for the 20,000-step run,
+and 1.5 MB for an H.264 copy through the server's own `ffmpeg 7.0.2` over the same raw
+frames. The mp4 is not in the hash chain (section 9); the frames are.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -893,8 +995,11 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
    `CameraIntrinsic` need the `ImageSpec` intrinsics to move with the camera (INV-14, the reason they were
    refused), `ColorTemperature` needs a spectral light model the renderer does not have. Default: leave all
    four `Unsupported`; V3 implements `LightIntensity` and `LightDirection` only.
-5. **Video codec.** Measured: only `mp4v` encodes on the server (section 2.9). Default: ship `mp4v`. If an
-   H.264 file is wanted, a human installs `ffmpeg` (or an OpenCV with `libx264`) — plan V installs nothing.
+5. **Video codec.** Measured: only `mp4v` encodes through `cv2` on the server (section 2.9). Default: ship
+   `mp4v`. **Answered in passing (V3):** `~/.local/bin/ffmpeg 7.0.2-static` is on the server already, so an
+   H.264 copy of the same raw mosaic frames costs one pipe and is 7x smaller (1.5 MB against 10.5 MB for 18
+   seconds). Nothing was installed and `encode_video.py` is unchanged; the H.264 file is a second view of
+   the same frames, not a second pipeline.
 6. **Pretrained backbone.** Whether `_backbone("resnet18", 512)` loads ImageNet weights, and therefore
    whether training needs the network, is unverified. Default: train from scratch on the demo's small image
    if it does.
@@ -908,3 +1013,10 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
 10. **Gate 7.** Does closing plan V close §28.7 gate 7 as met with the SO-101 / cube-into-bin substitution
     recorded, or does gate 7 stay open for a Franka with two RGB views? Default: record it met, with the
     substitution and the `Target / Status: unverified` rows of section 1 named in the M5 review.
+11. **The state port is normalized at inference and not in training** (section 7.8). `train_act.py` feeds
+    the raw `observation.state` row; the Observation IR puts `Normalize{Range −1..1}` between `StateInput`
+    and the Learning IR input, so the policy sees `(q + 1) / 2` at evaluation and saw `q` while training.
+    Every success rate in section 7.8 is depressed by it. Default: make training bake the compiled
+    observation plan (the "real fix" section 7.6 finding 3 already names) and retrain — which is a V2-shaped
+    packet, not a line. The cheap alternative, dropping the state `Normalize` from the demo's Observation
+    IR, moves `observation_hash` and invalidates the packed bundles, so it is not cheaper.

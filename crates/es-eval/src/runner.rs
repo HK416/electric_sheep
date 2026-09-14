@@ -6,11 +6,11 @@
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use es_assets::scene::SceneDesc;
 use es_compile::{CpuPlan, Home, PlanMode, Tensor, TensorRef};
-use es_core::StableId;
+use es_core::{PhysTick, StableId};
 use es_env::scheduler::BatchDomains;
 use es_env::{Env, EnvMetrics, Episode};
 use es_ir::deployment::{DeploymentIr, ExecutionMode, Micros};
@@ -23,11 +23,11 @@ use es_ir::task::TaskIr;
 use es_ir::types::ElemType;
 use es_physics_core::backend::{ModelInfo, PhysicsBackend, StateView};
 use es_policy::PolicyRuntime;
-use es_safety::{ActionChunk, SafetyPlane};
+use es_safety::{ActionChunk, ActionSource, SafetyPlane};
 use serde::{Deserialize, Serialize};
 
 use crate::metrics;
-use crate::perturb::{PerturbationPlan, ResetOverrides, StepState};
+use crate::perturb::{LightOverride, PerturbationPlan, ResetOverrides, StepState};
 use crate::{hex32, EvalError};
 
 /// Schema version of `report.json` and `evaluation.lock`.
@@ -67,15 +67,139 @@ impl Default for RunConfig {
 
 /// Where an image observation input's pixels come from (§7.2, §10.1).
 ///
-/// Given the loaded model and the current state, one camera frame in exactly the dtype, count
-/// and layout the plan declared, or the reason there is none. A closure rather than the
-/// renderer itself: `es-eval` is layer 10 and `es-render` layer 5, and linking Vulkan here
-/// just to *refuse* an image would be the wrong trade — the caller owns
+/// Given this episode's lighting, the loaded model and the current state, one camera frame in
+/// exactly the dtype, count and layout the plan declared, or the reason there is none. A
+/// closure rather than the renderer itself: `es-eval` is layer 10 and `es-render` layer 5, and
+/// linking Vulkan here just to *refuse* an image would be the wrong trade — the caller owns
 /// `es_env::render::EnvRenderer` (feature `render`) and hands its `frame` in through this.
+///
+/// The [`LightOverride`] is this cell and episode's draw (§10.2). It is constant for a whole
+/// episode, so a caller rebuilds its renderer only when it changes.
 ///
 /// Nothing on this path resamples, converts or reorders: a frame that is not what the plan
 /// declared is an error, and every conversion is an Observation IR node (§7.2, `INV-14`).
-pub type FrameSource<'a> = dyn FnMut(&ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> + 'a;
+pub type FrameSource<'a> =
+    dyn FnMut(&LightOverride, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> + 'a;
+
+/// Where the emitted action came from, as `es video mosaic` spells it.
+///
+/// The same four outcomes `es-data` writes into a dataset's `action_source` column
+/// (`es_data::ActionSourceCode`, `crates/es-data/src/collect.rs:552`), duplicated rather than
+/// shared because `es-data` is layer 10 like this crate and §4.2 forbids a same-layer
+/// dependency. `Human` cannot occur here — an evaluation has no teleop — but it is one of the
+/// four the overlay reads, so the variant stays.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EventSource {
+    Policy,
+    Clamped,
+    Fallback,
+    Human,
+}
+
+impl From<ActionSource> for EventSource {
+    /// Read off the plane's own per-step output rather than re-derived from counter deltas:
+    /// `SafeAction` already says which of the four this step was (§9.3, §9.4).
+    fn from(s: ActionSource) -> Self {
+        match s {
+            ActionSource::Policy => Self::Policy,
+            ActionSource::Clamped => Self::Clamped,
+            ActionSource::Fallback(_) => Self::Fallback,
+        }
+    }
+}
+
+/// One record per rendered frame, written as `events.json` beside `frames/`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepEvent {
+    /// Index of the frame this describes inside its cell, dense and ascending from 0.
+    pub frame: u64,
+    pub tick: PhysTick,
+    pub source: EventSource,
+    /// `es_safety::EventSet::bits()` for this step: the `ViolationKind` bitset, `0` when the
+    /// step was clean.
+    pub events: u32,
+}
+
+/// Where a run puts its frames and events; `None` is today's behaviour exactly.
+///
+/// One subdirectory per cell — a cell being one episode of one suite, because
+/// `BatchDomains::single_env()` makes every episode its own run — holding `<NNNNNN>.bin` plus
+/// one `layout.json`, which is the directory shape `es video mosaic` tiles.
+#[derive(Clone, Debug, Default)]
+pub struct FrameSink {
+    pub dir: PathBuf,
+    /// Cell name -> its frame-ordered records, in the shape `events.json` is written in.
+    pub events: BTreeMap<String, Vec<StepEvent>>,
+}
+
+impl FrameSink {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self {
+            dir: dir.into(),
+            events: BTreeMap::new(),
+        }
+    }
+
+    /// Writes `events.json`: `{ "<cell>": [ StepEvent, ... ] }`.
+    pub fn write_events(&self, path: &Path) -> Result<(), EvalError> {
+        let mut text = serde_json::to_string_pretty(&self.events)
+            .map_err(|e| EvalError::Plan(e.to_string()))?;
+        text.push('\n');
+        fs::write(path, text).map_err(|source| EvalError::Io {
+            path: path.display().to_string(),
+            source,
+        })
+    }
+}
+
+/// One cell's frame directory: the raw `.bin` sequence plus the `layout.json` that pins their
+/// shape, written as the frames are captured.
+struct CellFrames {
+    dir: PathBuf,
+    n: u64,
+}
+
+impl CellFrames {
+    /// Appends one frame and returns its index. The first one writes `layout.json`, so a cell
+    /// that rendered nothing leaves no half-described directory behind.
+    fn write(&mut self, dtype: ElemType, shape: &[u64], data: &[u8]) -> Result<u64, EvalError> {
+        let io = |path: &Path| {
+            let p = path.display().to_string();
+            move |source| EvalError::Io {
+                path: p.clone(),
+                source,
+            }
+        };
+        if self.n == 0 {
+            fs::create_dir_all(&self.dir).map_err(io(&self.dir))?;
+            let layout = self.dir.join("layout.json");
+            let text = format!(
+                "{{\"dtype\":\"{}\",\"shape\":{:?}}}\n",
+                dtype_name(dtype),
+                shape
+            );
+            fs::write(&layout, text).map_err(io(&layout))?;
+        }
+        let path = self.dir.join(format!("{:06}.bin", self.n));
+        fs::write(&path, data).map_err(io(&path))?;
+        self.n += 1;
+        Ok(self.n - 1)
+    }
+}
+
+/// The `layout.json` spelling of an element type — the one `es video mosaic` and the render
+/// goldens read.
+fn dtype_name(e: ElemType) -> &'static str {
+    match e {
+        ElemType::U8 => "u8",
+        ElemType::Bool => "bool",
+        ElemType::F16 => "f16",
+        ElemType::Bf16 => "bf16",
+        ElemType::F32 => "f32",
+        ElemType::F64 => "f64",
+        ElemType::I32 => "i32",
+    }
+}
 
 /// The backend half of `evaluation.lock`: what a re-run would have to match (§17.2).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,14 +264,17 @@ impl Evaluation {
             new_backend,
             cfg,
             None,
+            None,
         )
     }
 
-    /// [`Self::run`] with a source for image observation inputs (§7.2).
+    /// [`Self::run`] with a source for image observation inputs (§7.2) and, optionally, a
+    /// place to put the frames and the per-step records that describe them.
     ///
     /// With `frames: None` — what [`Self::run`] passes — an image input is refused exactly as
     /// before: this narrows the §10.1 refusal, it does not remove it, and nothing is ever
-    /// zero-filled.
+    /// zero-filled. With `sink: None` the frames are rendered and consumed, exactly as V0b
+    /// left it; with one, every captured frame also lands on disk and gains a [`StepEvent`].
     #[allow(clippy::too_many_arguments)]
     pub fn run_with_frames<B, F, const NJ: usize, const H: usize>(
         ir: &EvaluationIr,
@@ -159,6 +286,7 @@ impl Evaluation {
         mut new_backend: F,
         cfg: &RunConfig,
         mut frames: Option<&mut FrameSource<'_>>,
+        mut sink: Option<&mut FrameSink>,
     ) -> Result<(EvaluationReport, EvaluationLock), EvalError>
     where
         B: PhysicsBackend,
@@ -180,6 +308,7 @@ impl Evaluation {
         let ms_to_steps = |ms: u32| (u64::from(ms) * 1000 / control_us.max(1)) as usize;
 
         let mut perturbations: Option<PerturbationPlan> = None;
+        let mut sources: Option<BTreeMap<String, Capture>> = None;
         let mut caps: Option<BackendCaps> = None;
         let mut cells: Vec<CellResult> = Vec::new();
         let mut measured: BTreeMap<(String, MetricSpec), MetricValue> = BTreeMap::new();
@@ -188,7 +317,13 @@ impl Evaluation {
         for (cell, suite) in ir.suites.iter().enumerate() {
             let mut env: Env<B> = Env::new(task, scene, new_backend(), &domains, seeds[0])?;
             if perturbations.is_none() {
-                perturbations = Some(PerturbationPlan::compile(ir, scene, env.model())?);
+                perturbations = Some(PerturbationPlan::compile(
+                    ir,
+                    scene,
+                    env.model(),
+                    frames.is_some(),
+                )?);
+                sources = Some(input_sources(&plan, obs, task, env.model())?);
                 caps = Some(backend_caps(&env));
             }
             let perturbations = perturbations.as_ref().expect("just compiled");
@@ -200,9 +335,18 @@ impl Evaluation {
             // iff its `seq` grew (spec 8.6), and the plane lives as long as the cell.
             let mut seq = 0u64;
             for (idx, seed) in seeds.iter().enumerate() {
-                episodes.push(run_episode::<B, NJ, H>(
+                // One cell of the mosaic is one episode of one suite: `single_env()` makes
+                // them independent runs, so the grid is `suites x episodes` directories.
+                let name = format!("{}-{idx:02}", suite.name);
+                let mut cell_frames = sink.as_deref().map(|s| CellFrames {
+                    dir: s.dir.join(&name),
+                    n: 0,
+                });
+                let mut events = Vec::new();
+                let episode = run_episode::<B, NJ, H>(
                     &mut env,
                     &mut plan,
+                    sources.as_ref().expect("just resolved"),
                     policy,
                     &mut safety,
                     perturbations,
@@ -216,7 +360,13 @@ impl Evaluation {
                     deploy.execution,
                     &mut seq,
                     frames.as_deref_mut(),
-                )?);
+                    cell_frames.as_mut(),
+                    &mut events,
+                )?;
+                if let Some(s) = sink.as_deref_mut() {
+                    s.events.insert(name, events);
+                }
+                episodes.push(episode);
             }
 
             let env_metrics = env.metrics();
@@ -333,6 +483,7 @@ fn backend_caps<B: PhysicsBackend>(env: &Env<B>) -> BackendCaps {
 fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     env: &mut Env<B>,
     plan: &mut CpuPlan,
+    sources: &BTreeMap<String, Capture>,
     policy: &mut dyn PolicyRuntime,
     safety: &mut SafetyPlane<NJ, H>,
     perturbations: &PerturbationPlan,
@@ -346,6 +497,8 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     mode: ExecutionMode,
     seq: &mut u64,
     mut frames: Option<&mut FrameSource<'_>>,
+    mut cell_frames: Option<&mut CellFrames>,
+    events: &mut Vec<StepEvent>,
 ) -> Result<Episode, EvalError> {
     let (nu, nq, nv) = {
         let m = env.model();
@@ -385,17 +538,22 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     let mut extra_age = 0u64;
     let mut ctrl = vec![0.0; nu];
 
+    let mut frame_idx: Option<u64> = None;
     for _ in 0..max_steps {
         let dropped = step_state.drop_observation();
         if dropped && !ring.is_empty() {
             extra_age += 1;
         } else {
-            let (names, bytes) = capture(
+            let (names, bytes, rendered) = capture(
                 plan,
+                sources,
                 env.model(),
                 &env.backend().state(),
                 frames.as_deref_mut(),
+                &overrides.light,
+                cell_frames.as_deref_mut(),
             )?;
+            frame_idx = rendered;
             let inputs: BTreeMap<String, TensorRef<'_>> = names
                 .iter()
                 .zip(&bytes)
@@ -431,6 +589,17 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         safety.heartbeat(env.tick());
         let age = Micros(((ring.len().saturating_sub(1) as u64) + extra_age) * control_us);
         let safe = safety.validate(&chunk, age, env.tick());
+        // One record per frame that reached disk, carrying the plane's own verdict on the step
+        // that frame was captured for (design note section 8). A step whose observation was
+        // dropped rendered nothing, so it adds no record and the two stay the same length.
+        if let Some(frame) = frame_idx.take() {
+            events.push(StepEvent {
+                frame,
+                tick: env.tick(),
+                source: safe.source.into(),
+                events: safe.events.bits(),
+            });
+        }
 
         // `nu == NJ` was checked at run start, so this is a copy, not a broadcast.
         ctrl.copy_from_slice(&safe.q);
@@ -450,53 +619,141 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
 /// The plan's input buffers, filled from the physics state.
 ///
 /// Returns the descriptors and the owned bytes separately so the caller can build the
-/// borrowed `TensorRef`s over them.
-type Captured = (Vec<(String, ElemType, Vec<u64>)>, Vec<Vec<u8>>);
+/// borrowed `TensorRef`s over them, plus the index of the frame this step wrote, if any.
+type Captured = (Vec<(String, ElemType, Vec<u64>)>, Vec<Vec<u8>>, Option<u64>);
+
+/// Where one plan input's values come from (§7.4, §10.1).
+///
+/// Resolved once, against the *documents* rather than guessed per step: an input is an image
+/// because the Observation IR says `ImageInput`, not because nothing else matched it.
+#[derive(Clone, Copy, Debug)]
+enum Capture {
+    /// One joint's `qpos` range in the loaded model.
+    Qpos(es_physics_core::backend::IndexRange),
+    Sensor(es_physics_core::backend::IndexRange),
+    /// A Task IR `ObsSource::JointState { body, dof }` channel: the leading `dof` joint
+    /// positions of env 0. The same convention [`joint_state`] uses for the Safety Plane —
+    /// which is why `run_episode` refuses a model carrying fewer than `NJ` of them — and the
+    /// only reading available, because that channel names a body and a count, not joints.
+    Joints(usize),
+    /// An `ObservationNode::ImageInput`: the frame source's bytes, unconverted.
+    Image,
+}
+
+/// Resolves every plan input **before the first episode**, so an observation this build
+/// cannot capture is one error at the start of the run rather than a surprise mid-table.
+fn input_sources(
+    plan: &CpuPlan,
+    obs: &ObservationIr,
+    task: &TaskIr,
+    model: &ModelInfo,
+) -> Result<BTreeMap<String, Capture>, EvalError> {
+    use es_ir::task::ObsSource;
+
+    let mut out = BTreeMap::new();
+    for (name, id) in &plan.inputs {
+        if !matches!(plan.buffers[id.0].home, Home::Input(_)) {
+            continue;
+        }
+        let source = StableId::from_hex(name).map_err(|e| EvalError::Plan(e.to_string()))?;
+        let is_image =
+            obs.graph.nodes.values().any(
+                |n| matches!(n, ObservationNode::ImageInput { sensor, .. } if *sensor == source),
+            );
+        let joints = task
+            .observation_spec
+            .channels
+            .values()
+            .find_map(|c| match c.source {
+                ObsSource::JointState { body, dof } if body == source => Some(dof as usize),
+                _ => None,
+            });
+        let how = if is_image {
+            Capture::Image
+        } else if let Some(r) = model.qpos.get(&source) {
+            Capture::Qpos(*r)
+        } else if let Some(r) = model.sensor.get(&source) {
+            Capture::Sensor(*r)
+        } else if let Some(dof) = joints {
+            Capture::Joints(dof)
+        } else {
+            return Err(EvalError::Plan(format!(
+                "observation input \"{name}\" is none of: a joint or sensor of the loaded \
+                 model, an ImageInput of the Observation IR, or a JointState channel of the \
+                 Task IR's ObservationSpec"
+            )));
+        };
+        out.insert(name.clone(), how);
+    }
+    Ok(out)
+}
 
 fn capture(
     plan: &CpuPlan,
+    sources: &BTreeMap<String, Capture>,
     model: &ModelInfo,
     state: &StateView<'_>,
     mut frames: Option<&mut FrameSource<'_>>,
+    light: &LightOverride,
+    mut cell_frames: Option<&mut CellFrames>,
 ) -> Result<Captured, EvalError> {
     let mut descs = Vec::new();
     let mut bytes = Vec::new();
+    let mut rendered = None;
     for (name, id) in &plan.inputs {
         let desc = &plan.buffers[id.0];
         let Home::Input(_) = &desc.home else {
             continue;
         };
-        let source = StableId::from_hex(name).map_err(|e| EvalError::Plan(e.to_string()))?;
-        let values: Vec<f64> = if let Some(r) = model.qpos.get(&source) {
-            state.qpos_of(0)[r.as_range()].to_vec()
-        } else if let Some(r) = model.sensor.get(&source) {
-            state.sensordata[r.as_range()].to_vec()
-        } else {
-            // An image input. Without a frame source there is no renderer in this build
-            // (§4.3, es-render is layer 5): feeding it zeros would produce a number, and a
-            // wrong number in the §10.1 table is worse than no table.
-            let Some(frame) = frames.as_deref_mut() else {
-                return Err(EvalError::Plan(format!(
-                    "observation input \"{name}\" is not a joint or sensor of the loaded model; \
-                     image inputs need a renderer, which this build has none of"
-                )));
-            };
-            // Exactly what the plan declared, or nothing: the frame is not resized, converted
-            // or reordered here — every such step is an Observation IR node (§7.2, INV-14).
-            let data = frame(model, state).map_err(EvalError::Plan)?;
-            let want = desc.elems * elem_bytes(desc.dtype);
-            if data.len() != want {
-                return Err(EvalError::Plan(format!(
-                    "observation input \"{name}\": the plan wants {} {:?} elements ({want} bytes), \
-                     the frame supplies {} bytes",
-                    desc.elems,
-                    desc.dtype,
-                    data.len()
-                )));
+        let how = sources.get(name).copied().ok_or_else(|| {
+            EvalError::Plan(format!("observation input \"{name}\" is unresolved"))
+        })?;
+        let values: Vec<f64> = match how {
+            Capture::Qpos(r) => state.qpos_of(0)[r.as_range()].to_vec(),
+            Capture::Sensor(r) => state.sensordata[r.as_range()].to_vec(),
+            Capture::Joints(dof) => {
+                let q = state.qpos_of(0);
+                if q.len() < dof {
+                    return Err(EvalError::Plan(format!(
+                        "observation input \"{name}\" wants {dof} joint positions; the model \
+                         carries {}",
+                        q.len()
+                    )));
+                }
+                q[..dof].to_vec()
             }
-            descs.push((name.clone(), desc.dtype, desc.shape.clone()));
-            bytes.push(data);
-            continue;
+            Capture::Image => {
+                // Without a frame source there is no renderer in this build (§4.3, es-render is
+                // layer 5): feeding it zeros would produce a number, and a wrong number in the
+                // §10.1 table is worse than no table.
+                let Some(frame) = frames.as_deref_mut() else {
+                    return Err(EvalError::Plan(format!(
+                        "observation input \"{name}\" is an image; image inputs need a \
+                         renderer, which this build has none of"
+                    )));
+                };
+                // Exactly what the plan declared, or nothing: the frame is not resized, converted
+                // or reordered here — every such step is an Observation IR node (§7.2, INV-14).
+                let data = frame(light, model, state).map_err(EvalError::Plan)?;
+                let want = desc.elems * elem_bytes(desc.dtype);
+                if data.len() != want {
+                    return Err(EvalError::Plan(format!(
+                        "observation input \"{name}\": the plan wants {} {:?} elements \
+                         ({want} bytes), the frame supplies {} bytes",
+                        desc.elems,
+                        desc.dtype,
+                        data.len()
+                    )));
+                }
+                // The frame the policy sees is the frame on disk: written here, from the same
+                // bytes, before anything downstream can touch them.
+                if let Some(cell) = cell_frames.as_deref_mut() {
+                    rendered = Some(cell.write(desc.dtype, &desc.shape, &data)?);
+                }
+                descs.push((name.clone(), desc.dtype, desc.shape.clone()));
+                bytes.push(data);
+                continue;
+            }
         };
         if values.len() != desc.elems {
             return Err(EvalError::Plan(format!(
@@ -520,7 +777,7 @@ fn capture(
         descs.push((name.clone(), desc.dtype, desc.shape.clone()));
         bytes.push(data);
     }
-    Ok((descs, bytes))
+    Ok((descs, bytes, rendered))
 }
 
 /// Bytes one element of `e` occupies in a plan buffer.

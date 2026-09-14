@@ -109,11 +109,24 @@ The `CpuPlan`'s input buffers are named by the `StableId` of the `ImageInput` se
 
 | plan input | source | status |
 |---|---|---|
+| an `ObservationNode::ImageInput` | the frame source's bytes, unconverted | supported with `--frames` |
 | `StateInput` whose id is in `ModelInfo::qpos` | that env's `qpos` slice | supported |
 | `StateInput` whose id is in `ModelInfo::sensor` | that env's `sensordata` slice | supported |
-| `ImageInput` (any id not in either map) | a rendered frame | `EvalError::Unsupported` |
+| `StateInput` whose id is a Task IR `ObsSource::JointState { body, dof }` | the leading `dof` joint positions of env 0 | supported |
+| anything else | — | `EvalError::Plan`, before the first episode |
 
-`es-render` (layer 5) does not exist yet, so there is no camera in this build and an image
+Every input is resolved **once**, before the first episode, by `input_sources`. An input is
+an image because the *Observation IR* says `ImageInput`, not because nothing else matched
+it: the earlier rule ("any id in neither map is an image") served a 27,648-byte camera tile
+to a 6-element joint-state buffer the moment a frame source existed, which is what packet
+M5/V3 hit on the demo's own documents.
+
+The `JointState { body, dof }` row is the one reading available for that channel: it names a
+body and a DoF count, not joints, so capture takes the leading `dof` positions — the same
+convention `joint_state::<NJ>` already uses to feed the Safety Plane, and the reason
+`run_episode` refuses a model carrying fewer than `NJ` of them (§2.5).
+
+Without a frame source (`Evaluation::run`, or `es eval run` with no `--frames`) an image
 observation is refused by name rather than fed zeros. A cell that silently evaluated a
 policy on black frames would produce a number, and a wrong number in this table is worse
 than no table.
@@ -145,15 +158,18 @@ with copies of joint `NJ−1`, or a safety input padded with `0.0`, is a wrong n
 
 ## 3. Perturbation realisation (`perturb.rs`)
 
-`PerturbationPlan::compile(&EvaluationIr, &SceneDesc, &ModelInfo)` resolves every
-perturbation of every suite **once**, before any episode runs, so the per-episode path has
-no matching on strings and cannot fail. A kind this runtime cannot realise is
+`PerturbationPlan::compile(&EvaluationIr, &SceneDesc, &ModelInfo, has_renderer)` resolves
+every perturbation of every suite **once**, before any episode runs, so the per-episode path
+has no matching on strings and cannot fail. A kind this runtime cannot realise is
 `EvalError::Unsupported(kind)` naming it at compile time — never skipped silently, and
 never approximated (same rule as `RandomizationPlan` in `batch-domains.md` §5 and as
 `PhysicsBackend::load` in §17.2).
 
-`scene` and `model` are unused today; they are in the signature because every kind in the
-"scene mutation" group below resolves a target against them the moment it is implemented.
+`has_renderer` is whether the run was given a frame source (`Evaluation::run_with_frames`,
+i.e. `es eval run --frames` on a build with the `render` feature). The two lighting kinds are
+realisable only then; without one they are refused by name rather than drawn and dropped.
+`model` is unused today; it is in the signature because every kind in the "state mutation"
+group below resolves a target against it the moment it is implemented.
 
 ### 3.1 Realised now
 
@@ -164,6 +180,15 @@ never approximated (same rule as `RandomizationPlan` in `batch-domains.md` §5 a
 | `frame_drop` | Bernoulli `prob` per step; a hit drops a burst of `[lo, hi]` consecutive frames, during which the previous observation is reused and `obs_age` keeps growing | per step |
 | `torque_noise` | multiplicative `1 + N(0, rel_sigma)` on each control channel, drawn per step per channel | per step |
 | `backlash` | a per-episode deadband of `[lo, hi]` rad: a commanded change smaller than the band does not move the actuator | per step |
+| `light_intensity` | a gain drawn from `range`, applied to every geom's `rgba` in a clone of the scene before the `TriScene` upload. The `Rs` path shades `albedo * (ambient + n.l * (1 - ambient)) + emission`, which is *linear* in `albedo`, so scaling the colours is exactly scaling the incident radiance. Only `dist = "uniform"` has a kernel; the other two are refused by name. | per episode |
+| `light_direction` | a yaw drawn from `[-range_deg, range_deg]`, applied to `RenderConfig::light_dir` about `+Z` through `es_math::approx::sin`/`cos` (never `std`'s, §3.4) | per episode |
+
+The two lighting kinds are `LightOverride { intensity, yaw_deg }`, drawn in `apply_at_reset`
+like every other per-episode knob and handed to the frame source with every frame. The
+*renderer* is the caller's (`es-eval` is layer 10 and links no Vulkan, `visible-learning.md`
+§7.4), so `LightOverride::scene` and `::rotate_dir` are the kernels and the caller applies
+them; `es eval run` rebuilds its renderer only when the draw changes, so a suite with no
+light perturbation builds exactly one for the whole run.
 
 `ms` lists (`observation_delay`, `action_delay`) are a `Choice` distribution: one value is
 drawn per episode, so a cell with `ms: [0, 20, 50]` mixes the three conditions across its
@@ -179,14 +204,15 @@ state-mutating kind is in §3.2.
 
 | kind | blocked on |
 |---|---|
-| `light_intensity`, `light_direction`, `color_temperature` | a renderer. `es-render` (layer 5) is not implemented; there is no light to perturb. |
-| `camera_extrinsic`, `camera_intrinsic` | the same, plus `ImageSpec` intrinsics rewriting at capture (INV-14) — an intrinsic perturbation that skipped the `ImageSpec` transform would be a silent lie about the camera. |
-| `occluder` | a renderer and scene-graph insertion. |
-| `object_pose` | a per-episode reset override. `Env::reset` takes no state and `Env` owns its backend, so `es-eval` cannot write `qpos` before a step. The hook is an `Env::reset_with(&ResetOverrides)` in a follow-up `es-env` packet; `ResetOverrides` is already shaped to carry it. |
+| `light_intensity`, `light_direction` | **nothing, given a frame source.** Without one (`Evaluation::run`, or `es eval run` with no `--frames`) there is no rendered image to perturb, and they are refused with that reason. |
+| `color_temperature` | a coloured light. The `Rs` path shades from one white directional light and `RenderConfig` carries no light colour, so there is nothing to set; adding one is an `es-render` change (layer 5). |
+| `camera_extrinsic`, `camera_intrinsic` | `ImageSpec` intrinsics rewriting at capture (INV-14) — an intrinsic perturbation that skipped the `ImageSpec` transform would be a silent lie about the camera. A renderer alone does not unblock these. |
+| `occluder` | scene-graph insertion: an occluder is a geom the Task IR did not declare, and a scene with one would no longer be the scene `scene_hash` names. |
+| `object_pose` | a per-episode reset override. `Env::reset` takes no state and `Env` owns its backend, so `es-eval` cannot write `qpos` before a step. The hook is an `Env::reset_with(&ResetOverrides)` in a follow-up `es-env` packet; `ResetOverrides` is already shaped to carry it. **The demo does not need it**: Task IR `Randomization` (§6.3) already moves the cube's free joint at every reset, in every suite (`visible-learning.md` section 2.7). |
 
-That is 5 realised of 12. The gate for M2 W1 (§28.4, "Evaluation IR 전 스위트 동작") is
-therefore **not** met by this packet alone; it needs the renderer waves. The refusal is
-loud so that a report can never claim a `lighting_shift` row it did not run.
+That is 7 realised of 12, 2 of them only with `--frames`. The gate for M2 W1 (§28.4,
+"Evaluation IR 전 스위트 동작") is therefore still **not** met by these packets alone. The
+refusal is loud so that a report can never claim a `lighting_shift` row it did not run.
 
 ## 4. Metrics (`metrics.rs`)
 

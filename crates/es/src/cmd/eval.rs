@@ -26,6 +26,7 @@ when |p| < 0.05.
 
 const RUN_HELP: &str = "\
 es eval run --config <eval.toml> --policy <policy.esb> --scene <file.xml|urdf> [OPTIONS]
+            [--frames <dir>]
 
 Opens the policy bundle (spec 9.6, `PolicyBundle::open`), parses the Evaluation IR from
 --config, and checks that the requested physics backend and policy runtime are actually
@@ -42,7 +43,16 @@ under --out:
 `episodes/` replay is not produced by this build -- there is no renderer yet (M2 packet
 CLI-eval-run-import); `report.html` carries no failure-episode links because of that.
 
+With --frames <dir> the run also renders the Task IR's one image channel from the scene's
+own camera, which is what lets an Observation IR with an image input be evaluated at all
+(spec 7.2). It writes one subdirectory per cell -- a cell being one episode of one suite,
+named `<suite>-<NN>` -- holding `<NNNNNN>.bin` plus one `layout.json`, and an `events.json`
+under --out with one { frame, tick, source, events } record per frame. That is exactly what
+`es video mosaic` reads. It needs the `render` feature and a Vulkan device; a build without
+the feature refuses the flag rather than running with no frames.
+
     --out <dir>        output directory (default: ./eval-out)
+    --frames <dir>     render every step here (needs the `render` feature)
     --backend <name>   physics backend; only `mujoco-cpu` is supported (default, spec 17.1)
     --runtime <name>   policy runtime; only `torch` is supported (default, spec 2.4)
 
@@ -186,6 +196,7 @@ struct RunArgs {
     policy: String,
     scene: String,
     out: PathBuf,
+    frames: Option<PathBuf>,
     backend: String,
     runtime: String,
 }
@@ -193,6 +204,7 @@ struct RunArgs {
 fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
     let (mut config, mut policy, mut scene, mut out) = (None, None, None, None);
     let (mut backend, mut runtime) = ("mujoco-cpu".to_owned(), "torch".to_owned());
+    let mut frames = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -206,6 +218,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
             "--policy" => policy = Some(val()?.clone()),
             "--scene" => scene = Some(val()?.clone()),
             "--out" => out = Some(PathBuf::from(val()?)),
+            "--frames" => frames = Some(PathBuf::from(val()?)),
             "--backend" => backend.clone_from(val()?),
             "--runtime" => runtime.clone_from(val()?),
             other => {
@@ -223,6 +236,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
         policy: req(policy, "--policy")?,
         scene: req(scene, "--scene")?,
         out: out.unwrap_or_else(|| PathBuf::from("eval-out")),
+        frames,
         backend,
         runtime,
     })
@@ -262,18 +276,149 @@ fn run_typed<const NJ: usize, const H: usize>(
     scene: &es_assets::scene::SceneDesc,
     policy: &mut dyn PolicyRuntime,
     cfg: &RunConfig,
+    sink: Option<&mut es_eval::FrameSink>,
 ) -> Result<(EvaluationReport, es_eval::EvaluationLock), CliError> {
-    Evaluation::run::<MuJoCoCpuBackend, _, NJ, H>(
-        eval_ir,
-        &bundle.task,
-        scene,
-        &bundle.observation,
-        policy,
-        &bundle.deployment,
-        MuJoCoCpuBackend::new,
-        cfg,
-    )
-    .map_err(|e| CliError::Runtime(e.to_string()))
+    let mut run = |frames: Option<&mut es_eval::runner::FrameSource<'_>>,
+                   sink: Option<&mut es_eval::FrameSink>| {
+        Evaluation::run_with_frames::<MuJoCoCpuBackend, _, NJ, H>(
+            eval_ir,
+            &bundle.task,
+            scene,
+            &bundle.observation,
+            policy,
+            &bundle.deployment,
+            MuJoCoCpuBackend::new,
+            cfg,
+            frames,
+            sink,
+        )
+        .map_err(|e| CliError::Runtime(e.to_string()))
+    };
+    // The `Gpu` and the renderer live here because a renderer borrows the device, and putting
+    // that borrow on `Env` would put a lifetime on a type `es-data` and `es-eval` both name
+    // (design note section 7.4).
+    #[cfg(feature = "render")]
+    if sink.is_some() {
+        let rcfg = renderer_cfg(bundle)?;
+        let gpu = es_gpu::Gpu::open(es_gpu::GpuOptions::default())
+            .map_err(|e| CliError::Runtime(format!("no Vulkan device for --frames: {e}")))?;
+        let mut rig = LightRig::new(&gpu, scene.clone(), rcfg);
+        let mut source =
+            |light: &es_eval::LightOverride,
+             model: &es_physics_core::backend::ModelInfo,
+             state: &es_physics_core::backend::StateView<'_>| {
+                rig.frame(light, model, state)
+            };
+        return run(Some(&mut source), sink);
+    }
+    run(None, sink)
+}
+
+/// The renderer `--frames` needs, built from what the bundle's Task IR already declares.
+///
+/// The same rule `es loop collect --frames` follows (`crates/es/src/cmd/loop.rs`): one image
+/// channel, rendered from the camera its `Frame` names, at the `ImageSpec` the IR declares --
+/// so a scene whose camera produces something else is refused rather than silently resampled
+/// (`INV-14`).
+#[cfg(feature = "render")]
+fn renderer_cfg(bundle: &PolicyBundle) -> Result<es_env::EnvRendererCfg, CliError> {
+    let images: Vec<_> = bundle
+        .task
+        .observation_spec
+        .channels
+        .iter()
+        .filter_map(|(name, c)| c.ty.image.as_ref().map(|spec| (name, &c.ty.frame, spec)))
+        .collect();
+    let [(name, frame, spec)] = images.as_slice() else {
+        return Err(CliError::Runtime(format!(
+            "--frames needs exactly one image channel in the Task IR's ObservationSpec; it \
+             declares {}",
+            images.len()
+        )));
+    };
+    let es_ir::types::Frame::Camera(camera) = frame else {
+        return Err(CliError::Runtime(format!(
+            "image channel {name:?} is not in a camera frame, so there is no camera to render \
+             it from"
+        )));
+    };
+    Ok(es_env::EnvRendererCfg::rgb(
+        *camera,
+        spec.width,
+        spec.height,
+    ))
+}
+
+/// One camera, rendered under one episode's lighting (spec 10.2).
+///
+/// Not `es_env::EnvRenderer`: a light perturbation sets `RenderConfig::light_dir`, which is
+/// fixed when a renderer is built and which `EnvRendererCfg` does not carry -- and V0b owns
+/// that surface, so this composes the same public pieces (`es_env::render::render_config`,
+/// `body_poses`, `camera_view`) instead of widening it. Everything else is identical, which is
+/// why the frames are still the ones the render goldens pin.
+///
+/// The renderer is rebuilt only when the lighting changes, so a suite with no light
+/// perturbation builds exactly one for the whole run.
+#[cfg(feature = "render")]
+struct LightRig<'gpu> {
+    gpu: &'gpu es_gpu::Gpu,
+    /// The scene as authored; every episode's scene is derived from this one.
+    scene: es_assets::scene::SceneDesc,
+    cfg: es_env::EnvRendererCfg,
+    lit: Option<(
+        es_eval::LightOverride,
+        es_assets::scene::SceneDesc,
+        es_render::Renderer<'gpu>,
+    )>,
+}
+
+#[cfg(feature = "render")]
+impl<'gpu> LightRig<'gpu> {
+    fn new(
+        gpu: &'gpu es_gpu::Gpu,
+        scene: es_assets::scene::SceneDesc,
+        cfg: es_env::EnvRendererCfg,
+    ) -> Self {
+        Self {
+            gpu,
+            scene,
+            cfg,
+            lit: None,
+        }
+    }
+
+    fn frame(
+        &mut self,
+        light: &es_eval::LightOverride,
+        model: &es_physics_core::backend::ModelInfo,
+        state: &es_physics_core::backend::StateView<'_>,
+    ) -> Result<Vec<u8>, String> {
+        if self.lit.as_ref().is_none_or(|(l, _, _)| l != light) {
+            let scene = light.scene(&self.scene);
+            let mut rc = es_env::render::render_config(&self.cfg);
+            let d = light.rotate_dir([rc.light_dir.x, rc.light_dir.y, rc.light_dir.z]);
+            (rc.light_dir.x, rc.light_dir.y, rc.light_dir.z) = (d[0], d[1], d[2]);
+            let renderer =
+                es_render::Renderer::new(self.gpu, rc).map_err(|e| format!("renderer: {e}"))?;
+            self.lit = Some((*light, scene, renderer));
+        }
+        let (_, scene, renderer) = self.lit.as_mut().expect("just built");
+        let world = es_env::render::body_poses(model, state, 0);
+        let tri = es_render::TriScene::from_scene_with_poses(scene, &world)
+            .map_err(|e| format!("tessellation: {e}"))?;
+        let view = es_env::render::camera_view(scene, &self.cfg, &world)
+            .map_err(|e| format!("camera: {e}"))?;
+        renderer
+            .upload_tris(tri)
+            .map_err(|e| format!("scene upload: {e}"))?;
+        let mut atlas = renderer
+            .render(&[view])
+            .map_err(|e| format!("render: {e}"))?;
+        let tile = atlas
+            .read_tile(0, self.cfg.channel)
+            .map_err(|e| format!("readback: {e}"))?;
+        Ok(tile.to_bytes())
+    }
 }
 
 fn escape_html(s: &str) -> String {
@@ -364,6 +509,17 @@ fn run(args: &[String]) -> Result<u8, CliError> {
             a.runtime
         )));
     }
+    // Before anything is loaded: a build that cannot render says so instead of running the
+    // whole evaluation and writing no frames.
+    #[cfg(not(feature = "render"))]
+    if a.frames.is_some() {
+        return Err(CliError::Usage(
+            "--frames needs the `render` feature; this build links no renderer (spec 4.2: \
+             es-render is layer 5 and the default build of `es` does not pull it in). Rebuild \
+             with `cargo build -p es --features render`."
+                .to_owned(),
+        ));
+    }
 
     let bytes =
         std::fs::read(&a.policy).map_err(|e| CliError::Runtime(format!("{}: {e}", a.policy)))?;
@@ -398,13 +554,33 @@ fn run(args: &[String]) -> Result<u8, CliError> {
     };
     let nj = bundle.deployment.robot.n_joints;
     let h = bundle.deployment.action.horizon;
-    let (report, lock) = dispatch_nj_h!(nj, h, &bundle, &eval_ir, &scene, &mut policy, &cfg)?;
+    let mut sink = a.frames.as_ref().map(es_eval::FrameSink::new);
+    let (report, lock) = dispatch_nj_h!(
+        nj,
+        h,
+        &bundle,
+        &eval_ir,
+        &scene,
+        &mut policy,
+        &cfg,
+        sink.as_mut()
+    )?;
 
     std::fs::create_dir_all(&a.out)
         .map_err(|e| CliError::Runtime(format!("{}: {e}", a.out.display())))?;
     es_eval::write_artifacts(&report, &lock, &a.out)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
     write_report_html(&report, &a.out.join("report.html"))?;
+    if let Some(sink) = &sink {
+        sink.write_events(&a.out.join("events.json"))
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
+        let frames: usize = sink.events.values().map(Vec::len).sum();
+        println!(
+            "frames: {frames} in {} cell(s) under {}",
+            sink.events.len(),
+            sink.dir.display()
+        );
+    }
 
     let mut ok = true;
     for r in &report.acceptance {

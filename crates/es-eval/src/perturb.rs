@@ -17,6 +17,7 @@ use es_core::StableId;
 use es_env::rng::EnvRng;
 use es_ir::evaluation::{CountRange, EvaluationIr, PerturbationKind, Range};
 use es_ir::task::Distribution;
+use es_math::approx;
 use es_physics_core::backend::ModelInfo;
 
 use crate::EvalError;
@@ -44,6 +45,83 @@ pub struct TorqueNoise {
     pub stream: StableId,
 }
 
+/// The scene lighting one episode renders under (§10.2 `light_intensity`, `light_direction`).
+///
+/// Two scalars rather than a light model: the render path the demo uses shades
+/// `albedo * (ambient + n.l * (1 - ambient)) + emission` from **one** directional light
+/// (`crates/es-render/src/cpu.rs:177-186`), so a light is exactly a gain and a direction.
+///
+/// The gain is applied to the scene's own colours ([`Self::scene`]) rather than to a renderer
+/// knob, because that Lambert term is linear in `albedo`: scaling every geom's rgba by `k` is
+/// *identical* to scaling the incident radiance by `k`, and it happens before the `TriScene`
+/// upload, where this crate can reach. The direction is applied to the renderer's
+/// `light_dir` ([`Self::rotate_dir`]), which has no scene equivalent.
+///
+/// `ponytail:` the gain is exact for the `Rs` Lambert path only; on a path tracer, scaling
+/// albedo *and* emission double-counts, and the gain would have to move to the emitters
+/// alone. Split it when a path-traced suite exists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LightOverride {
+    /// Multiplier on the light's radiance; `1.0` is the scene as authored.
+    pub intensity: f64,
+    /// Yaw of the light direction about `+Z`, in degrees; `0.0` is the scene as authored.
+    pub yaw_deg: f64,
+}
+
+impl Default for LightOverride {
+    /// The scene as authored: the identity, so a suite with no light perturbation renders
+    /// exactly what every earlier packet rendered.
+    fn default() -> Self {
+        Self {
+            intensity: 1.0,
+            yaw_deg: 0.0,
+        }
+    }
+}
+
+impl LightOverride {
+    /// Whether this leaves the scene as authored. A caller holding a renderer rebuilds it
+    /// only when the override changes, so the nominal cell builds exactly one.
+    pub fn is_identity(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `base` with every geom's colour scaled by [`Self::intensity`] — the scene to
+    /// tessellate and upload for this episode.
+    ///
+    /// Alpha is untouched: it is not radiance. A clone rather than an in-place edit, because
+    /// the caller's scene is the *authored* one and every episode starts from it.
+    pub fn scene(&self, base: &SceneDesc) -> SceneDesc {
+        let mut out = base.clone();
+        // Exact, not within a margin: this is the "nothing was drawn" path, and a draw that
+        // really did land on 1.0 renders the same scene either way.
+        if self.intensity.to_bits() == 1.0_f64.to_bits() {
+            return out;
+        }
+        for body in &mut out.bodies {
+            for geom in &mut body.geoms {
+                for c in &mut geom.rgba[..3] {
+                    *c *= self.intensity;
+                }
+            }
+        }
+        out
+    }
+
+    /// `dir` yawed about `+Z` by [`Self::yaw_deg`], for the renderer's one directional light.
+    ///
+    /// `es_math::approx`, not `std`: a perturbation draw is an input to the §10.1 table and
+    /// two machines must agree on it bit for bit (§3.4).
+    pub fn rotate_dir(&self, dir: [f64; 3]) -> [f64; 3] {
+        if self.yaw_deg.to_bits() == 0.0_f64.to_bits() {
+            return dir;
+        }
+        let a = (self.yaw_deg as f32).to_radians();
+        let (s, c) = (f64::from(approx::sin(a)), f64::from(approx::cos(a)));
+        [dir[0] * c - dir[1] * s, dir[0] * s + dir[1] * c, dir[2]]
+    }
+}
+
 /// What one episode of one cell was set up with.
 ///
 /// Named for the hook it will become: when `es-env` grows a reset that takes state, the
@@ -59,6 +137,9 @@ pub struct ResetOverrides {
     pub torque_noise: Option<TorqueNoise>,
     /// Actuator deadband in radians: a commanded change smaller than this does not move.
     pub backlash_rad: f64,
+    /// The lighting this episode renders under. Read by the frame source, not by the step
+    /// loop: the physics does not see it.
+    pub light: LightOverride,
 }
 
 /// One perturbation, resolved against the streams it draws from.
@@ -69,6 +150,8 @@ enum Entry {
     FrameDrop(FrameDrop),
     TorqueNoise(TorqueNoise),
     Backlash { rad: Range, stream: StableId },
+    LightIntensity { range: Range, stream: StableId },
+    LightDirection { range_deg: f64, stream: StableId },
 }
 
 /// One row of the §10.1 table: the suite's name and its resolved perturbations.
@@ -87,19 +170,22 @@ pub struct PerturbationPlan {
 impl PerturbationPlan {
     /// Resolves every perturbation of every suite.
     ///
-    /// `scene` and `model` are not read today; they are in the signature because every kind in
-    /// the scene-mutation group resolves a target against them the moment one is implemented,
-    /// and changing the signature later would touch every caller.
+    /// `has_renderer` is whether the run was given a frame source: the two lighting kinds are
+    /// realisable only then, and without one they are refused by name exactly as before rather
+    /// than drawn and dropped (§17.2). `model` is not read today; it is in the signature
+    /// because every kind in the state-mutation group resolves a target against it the moment
+    /// one is implemented.
     pub fn compile(
         ir: &EvaluationIr,
         _scene: &SceneDesc,
         _model: &ModelInfo,
+        has_renderer: bool,
     ) -> Result<Self, EvalError> {
         let mut cells = Vec::with_capacity(ir.suites.len());
         for suite in &ir.suites {
             let mut entries = Vec::with_capacity(suite.perturbations.len());
             for p in &suite.perturbations {
-                entries.push(resolve(&p.kind, stream_id(p.stream))?);
+                entries.push(resolve(&p.kind, stream_id(p.stream), has_renderer)?);
             }
             cells.push(Cell {
                 name: suite.name.clone(),
@@ -146,6 +232,22 @@ impl PerturbationPlan {
                         })
                         .abs();
                 }
+                Entry::LightIntensity { range, stream } => {
+                    let mut rng = EnvRng::new(seed, suite_id, episode, *stream);
+                    out.light.intensity = rng
+                        .sample(&Distribution::Uniform {
+                            lo: range.lo,
+                            hi: range.hi,
+                        })
+                        .max(0.0);
+                }
+                Entry::LightDirection { range_deg, stream } => {
+                    let mut rng = EnvRng::new(seed, suite_id, episode, *stream);
+                    out.light.yaw_deg = rng.sample(&Distribution::Uniform {
+                        lo: -*range_deg,
+                        hi: *range_deg,
+                    });
+                }
                 // Per-step processes: the parameters travel to the step loop, the draws happen
                 // there so every step consumes from the same stream in order.
                 Entry::FrameDrop(f) => out.frame_drop = Some(*f),
@@ -155,9 +257,13 @@ impl PerturbationPlan {
     }
 }
 
-fn resolve(kind: &PerturbationKind, stream: StableId) -> Result<Entry, EvalError> {
+fn resolve(
+    kind: &PerturbationKind,
+    stream: StableId,
+    has_renderer: bool,
+) -> Result<Entry, EvalError> {
     const NO_RENDERER: &str =
-        "es-render (layer 5) is not implemented, so there is nothing to perturb";
+        "this run has no frame source, so there is no rendered image to perturb; pass          `--frames` to a build with the `render` feature";
     match kind {
         PerturbationKind::ObservationDelay { ms } => Ok(Entry::ObservationDelay {
             ms: ms.iter().map(|v| f64::from(*v)).collect(),
@@ -177,12 +283,38 @@ fn resolve(kind: &PerturbationKind, stream: StableId) -> Result<Entry, EvalError
             stream,
         })),
         PerturbationKind::Backlash { rad } => Ok(Entry::Backlash { rad: *rad, stream }),
-        PerturbationKind::LightIntensity { .. }
-        | PerturbationKind::LightDirection { .. }
-        | PerturbationKind::ColorTemperature { .. }
-        | PerturbationKind::Occluder { .. } => {
-            Err(EvalError::unsupported(kind.name(), NO_RENDERER))
+        PerturbationKind::LightIntensity { range, dist } => {
+            if !has_renderer {
+                return Err(EvalError::unsupported(kind.name(), NO_RENDERER));
+            }
+            if *dist != es_ir::evaluation::Distribution::Uniform {
+                return Err(EvalError::unsupported(
+                    kind.name(),
+                    "only `dist = \"uniform\"` has a kernel; a log-uniform or normal gain is                      one match arm, and no suite in this repo asks for one",
+                ));
+            }
+            Ok(Entry::LightIntensity {
+                range: *range,
+                stream,
+            })
         }
+        PerturbationKind::LightDirection { range_deg } => {
+            if !has_renderer {
+                return Err(EvalError::unsupported(kind.name(), NO_RENDERER));
+            }
+            Ok(Entry::LightDirection {
+                range_deg: *range_deg,
+                stream,
+            })
+        }
+        PerturbationKind::ColorTemperature { .. } => Err(EvalError::unsupported(
+            kind.name(),
+            "the Rs path shades from one white directional light and `RenderConfig` carries no              light colour, so a colour temperature has nothing to set (es-render, layer 5)",
+        )),
+        PerturbationKind::Occluder { .. } => Err(EvalError::unsupported(
+            kind.name(),
+            "an occluder is a geom that is not in the scene, and a scene the Task IR did not              declare would not be the scene `scene_hash` names",
+        )),
         PerturbationKind::CameraExtrinsic { .. } | PerturbationKind::CameraIntrinsic { .. } => {
             Err(EvalError::unsupported(
                 kind.name(),

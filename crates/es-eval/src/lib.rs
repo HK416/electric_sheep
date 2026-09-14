@@ -23,8 +23,11 @@ pub mod perturb;
 pub mod runner;
 
 pub use metrics::compute;
-pub use perturb::{PerturbationPlan, ResetOverrides, StepState};
-pub use runner::{write_artifacts, BackendCaps, Evaluation, EvaluationLock, RunConfig};
+pub use perturb::{LightOverride, PerturbationPlan, ResetOverrides, StepState};
+pub use runner::{
+    write_artifacts, BackendCaps, Evaluation, EvaluationLock, EventSource, FrameSink, RunConfig,
+    StepEvent,
+};
 
 /// Everything that stops an evaluation from producing a report.
 ///

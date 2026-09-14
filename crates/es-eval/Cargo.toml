@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 es-core = { workspace = true }
+# `perturb::LightOverride::rotate_dir`: `approx::sin`/`cos`, never `std`'s (spec 3.4).
+es-math = { workspace = true }
 es-assets = { workspace = true }
 es-physics-core = { workspace = true }
 es-ir = { workspace = true }

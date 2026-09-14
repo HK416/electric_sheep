@@ -111,11 +111,24 @@ allow-list 항목은 노드의 `NodeId`를 10진수(`"7"`)로 매칭한다. `es-
 
 | plan 입력 | source | 상태 |
 |---|---|---|
+| `ObservationNode::ImageInput` | 프레임 소스의 바이트, 변환 없이 | `--frames`와 함께 지원됨 |
 | id가 `ModelInfo::qpos`에 있는 `StateInput` | 해당 env의 `qpos` 슬라이스 | 지원됨 |
 | id가 `ModelInfo::sensor`에 있는 `StateInput` | 해당 env의 `sensordata` 슬라이스 | 지원됨 |
-| `ImageInput` (두 맵 어디에도 없는 id) | 렌더링된 프레임 | `EvalError::Unsupported` |
+| id가 Task IR의 `ObsSource::JointState { body, dof }`인 `StateInput` | env 0의 앞쪽 `dof`개 관절 위치 | 지원됨 |
+| 그 외 | — | 첫 에피소드 이전에 `EvalError::Plan` |
 
-`es-render`(layer 5)는 아직 존재하지 않으므로 이 빌드에는 카메라가 없으며, 이미지
+모든 입력은 첫 에피소드 이전에 `input_sources`가 **한 번만** 해석한다. 입력이 이미지인
+이유는 다른 것에 매칭되지 않아서가 아니라 *Observation IR*이 `ImageInput`이라고 말하기
+때문이다: 이전 규칙("두 맵 어디에도 없는 id는 이미지")은 프레임 소스가 생기는 순간
+27,648바이트짜리 카메라 타일을 6원소 관절 상태 버퍼에 먹였고, 그것이 패킷 M5/V3가 데모
+자신의 문서에서 마주친 일이다.
+
+`JointState { body, dof }` 행은 그 채널에 대해 가능한 유일한 해석이다: 관절이 아니라 body와
+DoF 개수를 지칭하므로 캡처는 앞쪽 `dof`개 위치를 가져간다 — `joint_state::<NJ>`가 Safety
+Plane에 먹이기 위해 이미 쓰는 것과 같은 규약이며, `run_episode`가 `NJ`개보다 적게 지닌
+모델을 거부하는 이유(§2.5)이기도 하다.
+
+프레임 소스가 없으면(`Evaluation::run`, 또는 `--frames` 없는 `es eval run`) 이미지
 observation은 0으로 채워지는 대신 이름으로 거부된다. 검은 프레임에 대해 정책을 조용히
 평가하는 셀은 숫자 하나를 만들어낼 것이고, 이 표에서 틀린 숫자는 표가 없는 것보다
 나쁘다.
@@ -146,16 +159,18 @@ observation은 0으로 채워지는 대신 이름으로 거부된다. 검은 프
 
 ## 3. Perturbation 실현 (`perturb.rs`)
 
-`PerturbationPlan::compile(&EvaluationIr, &SceneDesc, &ModelInfo)`은 어떤 에피소드가
-실행되기 전에 모든 스위트의 모든 perturbation을 **한 번만** 해석하므로, 에피소드별 경로에는
-문자열 매칭이 없고 실패할 수 없다. 이 런타임이 실현할 수 없는 종류는 컴파일 시점에
-그것을 이름으로 지목하는 `EvalError::Unsupported(kind)`다 — 조용히 건너뛰는 일도, 근사하는
-일도 결코 없다(`batch-domains.md` §5의 `RandomizationPlan`, §17.2의
+`PerturbationPlan::compile(&EvaluationIr, &SceneDesc, &ModelInfo, has_renderer)`는 어떤
+에피소드가 실행되기 전에 모든 스위트의 모든 perturbation을 **한 번만** 해석하므로,
+에피소드별 경로에는 문자열 매칭이 없고 실패할 수 없다. 이 런타임이 실현할 수 없는 종류는
+컴파일 시점에 그것을 이름으로 지목하는 `EvalError::Unsupported(kind)`다 — 조용히 건너뛰는
+일도, 근사하는 일도 결코 없다(`batch-domains.md` §5의 `RandomizationPlan`, §17.2의
 `PhysicsBackend::load`와 같은 규칙).
 
-`scene`과 `model`은 오늘은 쓰이지 않는다. 이들이 시그니처에 있는 이유는, 아래 "씬
-변형(scene mutation)" 그룹의 모든 종류가 구현되는 순간 이들에 대해 대상을 해석하게 되기
-때문이다.
+`has_renderer`는 이 실행이 프레임 소스를 받았는가다(`Evaluation::run_with_frames`, 즉
+`render` 피처로 빌드한 빌드의 `es eval run --frames`). 두 조명 종류는 그때만 실현
+가능하며, 없을 때는 추첨해놓고 버리는 대신 이름으로 거부된다. `model`은 오늘은 쓰이지
+않는다; 시그니처에 있는 이유는 아래 "상태 변형" 그룹의 모든 종류가 구현되는 순간 그것에
+대해 대상을 해석하게 되기 때문이다.
 
 ### 3.1 지금 실현된 것
 
@@ -166,6 +181,15 @@ observation은 0으로 채워지는 대신 이름으로 거부된다. 검은 프
 | `frame_drop` | 스텝마다 베르누이 `prob`; 적중하면 `[lo, hi]`개의 연속 프레임 버스트를 드롭하고, 그동안 이전 observation이 재사용되며 `obs_age`는 계속 커진다 | 스텝마다 |
 | `torque_noise` | 각 제어 채널에 곱해지는 `1 + N(0, rel_sigma)`, 스텝마다 채널마다 추첨됨 | 스텝마다 |
 | `backlash` | 에피소드별 `[lo, hi]` rad의 데드밴드: 그 밴드보다 작은 명령 변화는 액추에이터를 움직이지 않는다 | 스텝마다 |
+| `light_intensity` | `range`에서 추첨한 이득을, `TriScene` 업로드 전에 씬 복사본의 모든 geom `rgba`에 곱한다. `Rs` 경로는 `albedo * (ambient + n.l * (1 - ambient)) + emission`을 쉐이딩하므로 `albedo`에 대해 *선형*이고, 따라서 색을 재는 것은 입사 복사휘도를 재는 것과 정확히 같다. `dist = "uniform"`만 커널이 있고 나머지 둘은 이름으로 거부된다. | 에피소드마다 |
+| `light_direction` | `[-range_deg, range_deg]`에서 추첨한 yaw를 `es_math::approx::sin`/`cos`(결코 `std`의 것이 아니다, §3.4)로 `+Z` 둘레의 `RenderConfig::light_dir`에 적용한다 | 에피소드마다 |
+
+두 조명 종류는 `LightOverride { intensity, yaw_deg }`이며, 다른 모든 에피소드별 노브처럼
+`apply_at_reset`에서 추첨되어 프레임마다 프레임 소스에 전달된다. *렌더러*는 호출자의
+것이므로(`es-eval`은 layer 10이고 Vulkan을 링크하지 않는다, `visible-learning.md` §7.4)
+`LightOverride::scene`과 `::rotate_dir`이 커널이고 적용은 호출자가 한다. `es eval run`은
+추첨이 바뀔 때만 렌더러를 다시 만들므로, 조명 perturbation이 없는 스위트는 실행 전체에
+대해 정확히 하나만 만든다.
 
 `ms` 목록(`observation_delay`, `action_delay`)은 `Choice` 분포다: 에피소드마다 값 하나가
 추첨되므로, `ms: [0, 20, 50]`인 셀은 §10.2가 쓴 그대로 세 조건을 자신의 에피소드들에
@@ -181,14 +205,16 @@ runner가 소유하는 `StepState`에 대해 `apply_per_step`에서 일어난다
 
 | 종류 | 무엇에 막혀 있나 |
 |---|---|
-| `light_intensity`, `light_direction`, `color_temperature` | 렌더러. `es-render`(layer 5)는 구현되어 있지 않다; 흔들 조명 자체가 없다. |
-| `camera_extrinsic`, `camera_intrinsic` | 같은 이유에 더해, 캡처 시점의 `ImageSpec` intrinsics 재작성(INV-14) — `ImageSpec` 변환을 건너뛴 intrinsic perturbation은 카메라에 대한 조용한 거짓말이 될 것이다. |
-| `occluder` | 렌더러와 씬 그래프 삽입. |
-| `object_pose` | 에피소드별 reset 오버라이드. `Env::reset`은 상태를 받지 않고 `Env`가 자신의 backend를 소유하므로, `es-eval`은 스텝 이전에 `qpos`를 쓸 수 없다. 그 hook은 이후 `es-env` 패킷의 `Env::reset_with(&ResetOverrides)`이며, `ResetOverrides`는 이미 그것을 실어 나를 형태로 되어 있다. |
+| `light_intensity`, `light_direction` | **프레임 소스만 있으면 아무것도 막지 않는다.** 없으면(`Evaluation::run`, 또는 `--frames` 없는 `es eval run`) 흔들 렌더 이미지가 없으므로 그 이유를 들어 거부된다. |
+| `color_temperature` | 색이 있는 조명. `Rs` 경로는 흰색 방향광 하나로 쉐이딩하고 `RenderConfig`에는 조명 색이 없으므로 설정할 대상 자체가 없다; 추가하는 것은 `es-render`(layer 5) 변경이다. |
+| `camera_extrinsic`, `camera_intrinsic` | 캡처 시점의 `ImageSpec` intrinsics 재작성(INV-14) — `ImageSpec` 변환을 건너뛴 intrinsic perturbation은 카메라에 대한 조용한 거짓말이 될 것이다. 렌더러만으로는 풀리지 않는다. |
+| `occluder` | 씬 그래프 삽입: occluder는 Task IR이 선언하지 않은 geom이고, 그것이 들어간 씬은 더 이상 `scene_hash`가 가리키는 씬이 아니다. |
+| `object_pose` | 에피소드별 reset 오버라이드. `Env::reset`은 상태를 받지 않고 `Env`가 자신의 backend를 소유하므로, `es-eval`은 스텝 이전에 `qpos`를 쓸 수 없다. 그 hook은 이후 `es-env` 패킷의 `Env::reset_with(&ResetOverrides)`이며, `ResetOverrides`는 이미 그것을 실어 나를 형태로 되어 있다. **데모에는 필요 없다**: Task IR `Randomization`(§6.3)이 이미 모든 스위트의 모든 reset에서 큐브의 free joint를 움직인다(`visible-learning.md` section 2.7). |
 
-12개 중 5개가 실현되었다. 따라서 M2 W1의 게이트(§28.4, "Evaluation IR 전 스위트 동작")는
-이 패킷만으로는 충족되지 **않으며**, 렌더러 웨이브가 필요하다. 거부는 요란하게
-일어나므로, 리포트가 실행하지 않은 `lighting_shift` 행을 주장하는 일은 결코 없다.
+12개 중 7개가 실현되었고, 그중 2개는 `--frames`가 있을 때만이다. 따라서 M2 W1의
+게이트(§28.4, "Evaluation IR 전 스위트 동작")는 이 패킷들만으로는 여전히 충족되지
+**않는다**. 거부는 요란하게 일어나므로, 리포트가 실행하지 않은 `lighting_shift` 행을
+주장하는 일은 결코 없다.
 
 ## 4. 지표 (`metrics.rs`)
 

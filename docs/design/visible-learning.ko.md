@@ -769,6 +769,105 @@ LEN/NLEN 쌍, Adler-32 — 그래서 인코더는 인터프리터가 필요 없�
   쓰는 원시 덤프를 `observation.images.<name>`마다 하위 디렉터리 하나로. 그것이 없으면 피처를
   버리고 명령이 그렇게 말한다. 아무도 못 읽을 이미지 피처를 선언하지 않는다.
 
+### 7.8 구현 결과 (V3), 그리고 위 계획이 몰랐던 두 가지
+
+`es eval run --frames <dir>`가 섹션 8의 입력 전부다: 제어 스텝마다 Task IR의 이미지 채널
+하나를 렌더하고, `<dir>/<suite>-<NN>/<NNNNNN>.bin`과 셀마다 `layout.json` 하나를 쓰며,
+`<out>/events.json`에 프레임마다 `{ frame, tick, source, events }` 레코드 하나를 쓴다 —
+`es video mosaic`이 이미 읽는 디렉터리 모양이자 JSON 모양이고, GPU도 물리 백엔드도 없이
+`eval_run_output_is_what_es_video_mosaic_reads`가 확인한다. 셀 하나는 한 스위트의 한
+**에피소드**다. `Evaluation::run`이 에피소드마다 자신의 `Env`를 주기
+때문이며(`BatchDomains::single_env()`), 그래서 16 에피소드가 16개 디렉터리이고 4x4 격자는
+에피소드의 격자다.
+
+**1. `capture`가 어느 입력이 이미지인지 추측했고, 그 추측은 틀렸다.** 규칙은 "`qpos`도
+`sensor`도 아닌 plan 입력은 모두 이미지"였다. `Evaluation::run`이 `frames: None`을 넘기는
+동안에는 그런 입력이 전부 거부되었으므로 보이지 않았고, V3가 프레임 소스를 공급하는 순간
+버그가 되었다: 데모의 `StateInput`은 로봇 **body**를 지칭하므로
+(`ObsSource::JointState { body, dof: 6 }`, 관절 id도 센서 id도 아니다) 첫 실제 실행은
+27,648바이트 카메라 타일을 6원소 `F32` 버퍼에 먹이고 크기 불일치로 멈췄다. 이제
+`input_sources`가 **첫 에피소드 이전에 한 번만** 문서에 대해 모든 입력을 해석한다: 입력이
+이미지인 이유는 Observation IR이 `ImageInput`이라고 말하기 때문이고,
+`JointState { body, dof }` 채널은 앞쪽 `dof`개 관절 위치를 읽는다 — `joint_state::<NJ>`가
+Safety Plane에 먹이려고 이미 쓰는 것과 같은 규약이다. 그 외의 것은 표 중간의 뜻밖의 사고가
+아니라 실행 시작 시점의 오류다. `docs/design/evaluation-execution.md` 섹션 2.3이 그 표다.
+
+**2. 조명 종류는 `EnvRendererCfg`를 통해서는 실현될 수 없었다.** 섹션 2.7은 "V0b가
+렌더러를 놓으면 두 조명 종류는 구현 가능해진다"고 기대했고 실제로 그렇지만, 계획이 가정한
+자리에서는 아니었다. `Rs` 경로는 `RenderConfig::light_dir`와 `::ambient`로 쉐이딩하는데 둘
+다 `Renderer`를 만들 때 고정되고, `EnvRendererCfg`는 둘 다 싣지 않으며, 그 표면은 V0b의
+것이다. 데모 씬의 유일한 발광 geom(`ceiling_light`)도 도움이 안 된다: `z = 0.8`로
+`z = 0.5`의 오버헤드 카메라 **바로 위**에 있어 카메라 뒤이자 화면 밖이고, `Rs` 경로에서
+발광 geom은 자기 픽셀 말고는 아무것도 비추지 않는다. 그래서 커널은 `es-eval` 쪽 순수 함수
+둘로 안착했다 — `LightOverride::scene`(모든 geom `rgba`에 곱하는 이득이며, Lambert 항이
+`albedo`에 선형이므로 이는 *정확히* 복사휘도 이득이다)와
+`LightOverride::rotate_dir`(`light_dir`의 yaw) — 그리고 `es eval run`이
+`es_render::Renderer`를 V0b 자신의 공개 `render_config` / `body_poses` / `camera_view`와
+조합해 그것을 적용하며, 추첨이 바뀔 때만 렌더러를 다시 만든다. `es-render`와
+`es-env/src/render.rs`는 손대지 않았다. `es` 크레이트의 `render` 피처가 `es-render`를 직접
+의존성으로 얻었을 뿐이고, 기본 빌드에는 아무 비용이 없다(기본 꺼짐, spec 4.2).
+
+**envelope은 조이지 않았다. 조일 필요가 없었기 때문이다.** 섹션 8은 데모의 clamp가
+Deployment IR의 한계를 조여서 나온다고 말한다. 측정은 그것이 공짜로 나온다고 말한다: ACT
+청크는 V1의 스크립트 전문가처럼 램프되지 않으므로(섹션 7.5 발견 4) plane이 스스로 clamp
+하며, `deployment.toml`을 건드리지 않고도 비공허성 규칙이 성립한다. 그쪽이 더 나은 결과다 —
+데모의 envelope이 시연을 기록할 때 쓴 바로 그 envelope이다 — 그리고 어느 쪽이든 INV-12는
+건드리지 않는다.
+
+**무엇을 측정했나 — 오라클 서버(RTX 4090, `~/venvs/es/bin/python`, mujoco 3.13.0,
+torch 2.14.0+cpu), 2026-09-14.** `evaluation_hash 5d70c21c…3b9ff7`, 시드 101-116 —
+시연을 수집한 1-50에서 제외된 홀드아웃이다. 성공률이 헤드라인이고 유일한 헤드라인이다(§12.4):
+
+| 체크포인트 | nominal 성공률 | 평균 에피소드 길이 |
+|---|---|---|
+| 1,000 스텝 | 0.0625 (1/16) | 851.1 |
+| 5,000 스텝 | 0.0000 (0/16) | 900.0 |
+| 20,000 스텝 | 0.1250 (2/16) | 883.5 |
+
+그리고 20,000 스텝 체크포인트의 스위트별(각 16 에피소드):
+
+| 스위트 | 성공률 | 평균 에피소드 길이 |
+|---|---|---|
+| nominal | 0.1250 | 883.5 |
+| light_intensity | 0.0625 | 887.4 |
+| light_direction | 0.1250 | 883.5 |
+| observation_delay | 0.1250 | 883.5 |
+| torque_noise | 0.0000 | 900.0 |
+| backlash | 0.0000 | 900.0 |
+
+96 에피소드, 렌더된 프레임 85,407장, 28분. 비공허성 규칙은 성립한다 — `Success` 2회,
+`Clamped` 76,967 스텝 — 그러나 통과로 세기보다는 그대로 말해두는 편이 나은 이유로
+성립한다:
+
+**어느 실행에서도 `ActionSource::Policy` 스텝은 단 하나도 없었다.** 85,407 중 `Clamped`
+76,967, `Fallback` 8,440이고, 모든 스위트의 모든 셀에서 `envelope_violation_rate`가 정확히
+`1.0`이다. 정책의 원본 청크는 매 스텝 envelope 밖에 있고, rate watchdog이 트립하며,
+fallback이 약 10%의 스텝에서 자세를 유지한다. `light_direction` 행이 소수점 넷째 자리까지
+`nominal` 행과 같다는 것은 같은 사실의 다른 면이다: 팔이 하는 일을 결정하는 것은 픽셀이
+아니라 Safety Plane이다.
+
+**가장 유력한 원인은 학습/추론 observation 불일치이며, 이는 정책에 대한 V3의 발견이 아니라
+V2의 부채다.** `train_act.py`는 그래프의 상태 포트에 **원본** `observation.state` 행을
+먹이고, Observation IR 노드 중 정확히 하나 `Dequantize`만 재구현한다(섹션 7.6 발견 3).
+그러나 데모의 Observation IR은 `ImageInput -> Dequantize -> sink`가 아니다:
+`StateInput -> Normalize{Range −1..1}`이고 `ImageInput -> Dequantize ->
+Normalize{Range 0..1}`이다. 이미지 가지는 안전하다 — `normalize_range(x, 0, 1)`은
+항등이다 — 상태 가지는 그렇지 않다: 추론에서 정책은 `(q + 1) / 2`를 받고, 학습에서는 `q`를
+받았다. 고유수용 입력 전체의 아핀 이동이며, 발견 3이 "두 번째 노드가 나타나는 순간"
+일어나리라 예측한 바로 그것이다. 플랜 V는 여기서 고치지 않는다: 고침은 학습 쪽의
+plan-bake 단계(또는 컴파일된 plan을 통한 재학습)이고 둘 다 V2의 것이며, 이 패킷은 재학습이
+금지되어 있다. **미해결 질문 11**이다.
+
+따라서 이 표의 정직한 독법은 이렇다: 파이프라인은 끝에서 끝까지 돌고 실제 §10.1 표를
+만들며, Safety Plane이 팔을 실제로 지배하고, *정책* 숫자는 아직 ACT의 측정치가 아니다 —
+학습받지 않은 observation을 먹은 ACT의 측정치다.
+
+**비디오.** 16개 nominal 셀에 대한 `es video mosaic --grid 4x4`가 384x392 프레임 900장을
+주고(96x96 타일 16개에 8픽셀 레이블 띠), `python/es/encode_video.py --fps 50`이 제어
+레이트의 18초 mp4를 준다: 20,000 스텝 실행에 `mp4v` 10.5 MB, 같은 원본 프레임을 서버 자신의
+`ffmpeg 7.0.2`로 통과시킨 H.264 사본은 1.5 MB. mp4는 해시 체인에 없다(섹션 9); 프레임이
+증거다.
+
 ## 8. 안전 오버레이 (V3)
 
 렌더된 프레임마다 V3는 `events.json`에 레코드 하나를 붙인다:
@@ -859,9 +958,11 @@ V0 (장면 + IR)  ∥  V0b (루프 안의 렌더링)  ∥  V4 (영상 조립)
    `CameraIntrinsic`은 INV-14가 요구하듯 `ImageSpec` 내부 파라미터가 카메라를 따라 움직여야 하며 (그게
    애초 거부 사유다), `ColorTemperature`는 렌더러에 없는 분광 광원 모델이 필요하다. 기본값: 넷 다
    `Unsupported`로 두고 V3는 `LightIntensity`와 `LightDirection`만 구현한다.
-5. **비디오 코덱.** 측정 결과 서버에서는 `mp4v`만 인코딩된다 (섹션 2.9). 기본값: `mp4v`로 출시. H.264
-   파일을 원하면 사람이 `ffmpeg`을 (또는 `libx264`가 있는 OpenCV를) 설치한다 — 플랜 V는 아무것도
-   설치하지 않는다.
+5. **비디오 코덱.** 측정 결과 서버의 `cv2`로는 `mp4v`만 인코딩된다 (섹션 2.9). 기본값: `mp4v`로 출시.
+   **V3에서 덤으로 답이 나왔다:** `~/.local/bin/ffmpeg 7.0.2-static`이 이미 서버에 있으므로, 같은 원시
+   모자이크 프레임의 H.264 사본은 파이프 하나면 되고 7배 작다(18초에 10.5 MB 대 1.5 MB). 아무것도
+   설치하지 않았고 `encode_video.py`도 그대로다; H.264 파일은 같은 프레임의 두 번째 뷰이지 두 번째
+   파이프라인이 아니다.
 6. **사전학습 백본.** `_backbone("resnet18", 512)`가 ImageNet 가중치를 로드하는지, 따라서 학습에
    네트워크가 필요한지는 미검증이다. 기본값: 그렇다면 데모의 작은 이미지로 처음부터 학습한다.
 7. **PNG.** 기본값: 기존 골든 포맷인 원시 `.bin` + 사이드카 (섹션 7.2). 사람이 이미지 뷰어로 프레임을
@@ -873,3 +974,10 @@ V0 (장면 + IR)  ∥  V0b (루프 안의 렌더링)  ∥  V4 (영상 조립)
 10. **게이트 7.** 플랜 V를 닫으면 SO-101 / 큐브-바구니 대체를 기록한 채 §28.7 게이트 7을 충족으로
     기록하는가, 아니면 RGB 2뷰 Franka를 위해 게이트 7을 계속 열어 두는가? 기본값: 충족으로 기록하되,
     대체 사실과 섹션 1의 `Target / Status: unverified` 행들을 M5 리뷰에 명시한다.
+11. **상태 포트가 추론에서는 정규화되고 학습에서는 되지 않는다** (섹션 7.8). `train_act.py`는 원본
+    `observation.state` 행을 먹이지만, Observation IR은 `StateInput`과 Learning IR 입력 사이에
+    `Normalize{Range −1..1}`을 둔다. 그래서 정책은 평가에서 `(q + 1) / 2`를 보고 학습에서는 `q`를
+    보았다. 섹션 7.8의 모든 성공률이 이것 때문에 눌려 있다. 기본값: 학습이 컴파일된 observation plan을
+    굽도록 하고(섹션 7.6 발견 3이 이미 이름 붙인 "진짜 고침") 재학습한다 — 한 줄이 아니라 V2 모양의
+    패킷이다. 값싼 대안인 데모 Observation IR에서 상태 `Normalize`를 빼는 것은 `observation_hash`를
+    움직여 패킹된 번들을 무효화하므로 더 싸지 않다.

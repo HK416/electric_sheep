@@ -10,7 +10,7 @@ use es_assets::scene::SceneDesc;
 use es_compile::Tensor;
 use es_core::time::{PhysTick, TickRate};
 use es_core::{FailureKind, StableId};
-use es_eval::{EvalError, Evaluation, RunConfig};
+use es_eval::{EvalError, Evaluation, EventSource, FrameSink, LightOverride, RunConfig};
 use es_ir::deployment::{
     ActionContract, ActionSpace as DepSpace, Deadlines, DeploymentIr, ExecutionMode,
     FallbackPolicy, Limit, Micros, RateLimit, RateSpec, RobotRef, RobotTarget, SafetyEnvelope,
@@ -697,7 +697,7 @@ fn run_obs(
     obs: &ObservationIr,
     target: f64,
 ) -> Result<EvaluationReport, EvalError> {
-    run_obs_frames(ir, obs, target, None)
+    run_obs_frames(ir, obs, target, None, None)
 }
 
 fn run_obs_frames(
@@ -705,9 +705,20 @@ fn run_obs_frames(
     obs: &ObservationIr,
     target: f64,
     frames: Option<&mut es_eval::runner::FrameSource<'_>>,
+    sink: Option<&mut es_eval::FrameSink>,
+) -> Result<EvaluationReport, EvalError> {
+    run_deploy(ir, obs, target, &deployment_ir(), frames, sink)
+}
+
+fn run_deploy(
+    ir: &EvaluationIr,
+    obs: &ObservationIr,
+    target: f64,
+    deploy: &DeploymentIr,
+    frames: Option<&mut es_eval::runner::FrameSource<'_>>,
+    sink: Option<&mut es_eval::FrameSink>,
 ) -> Result<EvaluationReport, EvalError> {
     let task = task_ir();
-    let deploy = deployment_ir();
     let mut policy = FakePolicy { target };
     Evaluation::run_with_frames::<FakeBackend, _, NJ, H>(
         ir,
@@ -715,10 +726,11 @@ fn run_obs_frames(
         &scene(),
         obs,
         &mut policy,
-        &deploy,
+        deploy,
         FakeBackend::new,
         &RunConfig::default(),
         frames,
+        sink,
     )
     .map(|(report, _lock)| report)
 }
@@ -1053,11 +1065,11 @@ fn a_frame_source_serves_the_image_input() {
     let task = task_ir();
     let obs = image_observation_ir(task.task_hash().expect("task hashes"));
     let mut calls = 0u32;
-    let mut frames = |_: &ModelInfo, _: &StateView<'_>| {
+    let mut frames = |_: &LightOverride, _: &ModelInfo, _: &StateView<'_>| {
         calls += 1;
         Ok(vec![0x5a_u8; IMG as usize * IMG as usize * 3])
     };
-    let report = run_obs_frames(&ir, &obs, 0.2, Some(&mut frames)).expect("the image run");
+    let report = run_obs_frames(&ir, &obs, 0.2, Some(&mut frames), None).expect("the image run");
     assert!(!report.cells.is_empty());
     assert!(calls > 0, "the frame source was never asked for a frame");
 }
@@ -1069,15 +1081,435 @@ fn a_frame_of_the_wrong_size_is_refused_not_resized() {
     let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
     let task = task_ir();
     let obs = image_observation_ir(task.task_hash().expect("task hashes"));
-    let mut frames = |_: &ModelInfo, _: &StateView<'_>| Ok(vec![0_u8; 4]);
-    let err = run_obs_frames(&ir, &obs, 0.2, Some(&mut frames)).expect_err("a short frame");
+    let mut frames = |_: &LightOverride, _: &ModelInfo, _: &StateView<'_>| Ok(vec![0_u8; 4]);
+    let err = run_obs_frames(&ir, &obs, 0.2, Some(&mut frames), None).expect_err("a short frame");
     let EvalError::Plan(message) = &err else {
         panic!("expected EvalError::Plan, got {err}");
     };
     assert!(message.contains("the frame supplies 4 bytes"), "{message}");
 
     // A frame source that cannot render says so, and the reason survives.
-    let mut broken = |_: &ModelInfo, _: &StateView<'_>| Err("no camera in the scene".to_owned());
-    let err = run_obs_frames(&ir, &obs, 0.2, Some(&mut broken)).expect_err("a broken source");
+    let mut broken = |_: &LightOverride, _: &ModelInfo, _: &StateView<'_>| {
+        Err("no camera in the scene".to_owned())
+    };
+    let err = run_obs_frames(&ir, &obs, 0.2, Some(&mut broken), None).expect_err("a broken source");
     assert!(format!("{err}").contains("no camera in the scene"), "{err}");
+}
+
+// --- packet M5/V3: the frame sink, the event stream and the two lighting kernels -------------
+
+/// A scratch directory of this test binary's own, emptied first so a rerun starts clean.
+fn scratch(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("es-eval-v3").join(name);
+    let _ = std::fs::remove_dir_all(&dir);
+    dir
+}
+
+/// A frame source whose bytes are a pure function of the state and the lighting, so two runs
+/// of the same conditions agree.
+fn state_frames(
+) -> impl FnMut(&LightOverride, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> {
+    |light: &LightOverride, _: &ModelInfo, state: &StateView<'_>| {
+        let q = state.qpos_of(0)[0] * light.intensity;
+        let mut out = vec![0_u8; IMG as usize * IMG as usize * 3];
+        // `FakePolicy::infer` reads the first four bytes of its first input as an `f32`, so
+        // they carry the joint angle; the rest is a flat fill derived from the same number.
+        out[..4].copy_from_slice(&(q as f32).to_le_bytes());
+        out[4..].fill(((q.abs() * 100.0) as u32 % 251) as u8);
+        Ok(out)
+    }
+}
+
+/// An evaluation with one suite, so `suites x episodes` is just the episode count.
+fn one_suite(perturbations: Vec<Perturbation>) -> EvaluationIr {
+    let mut ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
+    ir.suites = vec![PerturbationSuite {
+        name: "nominal".to_owned(),
+        perturbations,
+    }];
+    ir
+}
+
+fn image_ir() -> (EvaluationIr, ObservationIr) {
+    let task = task_ir();
+    (
+        one_suite(Vec::new()),
+        image_observation_ir(task.task_hash().expect("task hashes")),
+    )
+}
+
+/// The grid is one cell per **episode**, not per suite: `Evaluation::run` hardcodes
+/// `BatchDomains::single_env()`, so sixteen demo episodes are sixteen independent runs and
+/// sixteen directories for `es video mosaic` to tile.
+#[test]
+fn every_episode_of_every_suite_gets_its_own_frame_dir() {
+    let (ir, obs) = image_ir();
+    let dir = scratch("cells");
+    let mut sink = FrameSink::new(&dir);
+    let mut frames = state_frames();
+    run_obs_frames(&ir, &obs, 0.2, Some(&mut frames), Some(&mut sink)).expect("the image run");
+
+    let cells = ir.suites.len() * N_EPISODES as usize;
+    assert_eq!(sink.events.len(), cells);
+    let mut layouts = BTreeSet::new();
+    for name in sink.events.keys() {
+        let cell = dir.join(name);
+        let layout = std::fs::read_to_string(cell.join("layout.json")).expect("layout.json");
+        assert_eq!(
+            layout.trim(),
+            format!("{{\"dtype\":\"u8\",\"shape\":[{IMG}, {IMG}, 3]}}"),
+            "{name}"
+        );
+        layouts.insert(layout);
+        assert!(cell.join("000000.bin").is_file(), "{name} has no frame 0");
+    }
+    assert_eq!(layouts.len(), 1, "the cells must be mosaic-able together");
+}
+
+/// `events.json` describes the frames on disk and nothing else: one record per frame, dense
+/// and ascending, each carrying the `PhysTick` of the step it was captured for.
+#[test]
+fn events_json_has_one_record_per_frame() {
+    let (ir, obs) = image_ir();
+    let dir = scratch("events");
+    let mut sink = FrameSink::new(&dir);
+    let mut frames = state_frames();
+    run_obs_frames(&ir, &obs, 0.2, Some(&mut frames), Some(&mut sink)).expect("the image run");
+
+    for (name, records) in &sink.events {
+        let on_disk = std::fs::read_dir(dir.join(name))
+            .expect("the cell directory")
+            .filter(|e| {
+                e.as_ref()
+                    .expect("entry")
+                    .path()
+                    .extension()
+                    .is_some_and(|x| x == "bin")
+            })
+            .count();
+        assert_eq!(records.len(), on_disk, "{name}");
+        assert!(!records.is_empty(), "{name} rendered nothing");
+        for (i, r) in records.iter().enumerate() {
+            assert_eq!(r.frame, i as u64, "{name}");
+        }
+        // The tick is the step's, so it advances with the episode and never repeats.
+        let ticks: Vec<u64> = records.iter().map(|r| r.tick.0).collect();
+        assert!(ticks.windows(2).all(|w| w[0] < w[1]), "{name}: {ticks:?}");
+    }
+
+    let path = dir.join("events.json");
+    sink.write_events(&path).expect("events.json");
+    let text = std::fs::read_to_string(&path).expect("read back");
+    // The spelling `es video mosaic` reads (`crates/es/src/cmd/video.rs`).
+    assert!(text.contains("\"source\": \"Policy\""), "{text:.400}");
+    assert!(text.contains("\"frame\": 0"), "{text:.400}");
+}
+
+/// The overlay reads the Safety Plane, not the policy: a tightened envelope clamps the same
+/// trajectory a wide one passes through untouched. Nothing here disables the plane (INV-12) --
+/// both runs validate every step, and only the limits differ.
+#[test]
+fn a_tightened_envelope_clamps_and_a_widened_one_does_not() {
+    let (ir, obs) = image_ir();
+
+    let mut wide = deployment_ir();
+    // Widening, never disabling (INV-12): every step is still validated and still counted.
+    wide.safety.position = vec![Limit::symmetric(1e6); NJ];
+    wide.safety.velocity_max = vec![1e6; NJ];
+    wide.safety.acceleration_max = vec![1e9; NJ];
+    wide.safety.torque_max = vec![1e6; NJ];
+    wide.safety.action_rate = RateLimit {
+        first_diff_max: vec![1e6; NJ],
+        second_diff_max: vec![1e6; NJ],
+    };
+    let dir = scratch("wide");
+    let mut sink = FrameSink::new(&dir);
+    let mut frames = state_frames();
+    run_deploy(&ir, &obs, 0.2, &wide, Some(&mut frames), Some(&mut sink)).expect("the wide run");
+    let dirty: usize = sink
+        .events
+        .values()
+        .flatten()
+        .filter(|e| e.source != EventSource::Policy)
+        .count();
+    assert_eq!(dirty, 0, "a wide envelope must not clamp");
+    assert!(sink.events.values().flatten().all(|e| e.events == 0));
+
+    let mut tight = deployment_ir();
+    tight.safety.action_rate.first_diff_max = vec![1e-4; NJ];
+    let tight_dir = scratch("tight");
+    let mut tight_sink = FrameSink::new(&tight_dir);
+    let mut frames = state_frames();
+    run_deploy(
+        &ir,
+        &obs,
+        0.2,
+        &tight,
+        Some(&mut frames),
+        Some(&mut tight_sink),
+    )
+    .expect("the tight run");
+    let clamped: Vec<_> = tight_sink
+        .events
+        .values()
+        .flatten()
+        .filter(|e| e.source == EventSource::Clamped)
+        .collect();
+    assert!(!clamped.is_empty(), "a tightened envelope must clamp");
+    assert!(
+        clamped.iter().all(|e| e.events != 0),
+        "a clamped step records which limit it hit"
+    );
+}
+
+/// INV-12: no path in this crate skips `SafetyPlane::validate`, and there is no flag, `cfg` or
+/// test hook that would. A source scan, because the property is about code that does not exist.
+#[test]
+fn the_plane_is_never_disabled() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut validates = 0usize;
+    for entry in std::fs::read_dir(&src).expect("src/") {
+        let path = entry.expect("entry").path();
+        if path.extension().is_some_and(|e| e == "rs") {
+            let text = std::fs::read_to_string(&path).expect("source");
+            validates += text.matches("safety.validate(").count();
+            for banned in [
+                "skip_safety",
+                "disable_safety",
+                "no_safety",
+                "unchecked_action",
+            ] {
+                assert!(!text.contains(banned), "{}: {banned}", path.display());
+            }
+        }
+    }
+    assert_eq!(validates, 1, "exactly one call site, in the step loop");
+}
+
+/// The two lighting kernels are arithmetic on the scene and on the light direction, so they
+/// are checkable without a device: the gain multiplies every colour, the yaw turns the
+/// direction about `+Z`, and both are the identity when nothing was drawn.
+#[test]
+fn the_light_kernels_scale_the_scene_and_turn_the_light() {
+    let base = scene();
+    let identity = LightOverride::default();
+    assert!(identity.is_identity());
+    assert_eq!(
+        identity.rotate_dir([0.3, 0.4, 0.8]).map(f64::to_bits),
+        [0.3_f64, 0.4, 0.8].map(f64::to_bits),
+    );
+    let rgba = |s: &SceneDesc| -> Vec<[f64; 4]> {
+        s.bodies
+            .iter()
+            .flat_map(|b| &b.geoms)
+            .map(|g| g.rgba)
+            .collect()
+    };
+    assert!(!rgba(&base).is_empty(), "the fixture scene has a geom");
+    assert_eq!(rgba(&identity.scene(&base)), rgba(&base));
+
+    let dim = LightOverride {
+        intensity: 0.25,
+        yaw_deg: 0.0,
+    };
+    let dimmed = dim.scene(&base);
+    for (a, b) in dimmed.bodies.iter().zip(&base.bodies) {
+        for (g, h) in a.geoms.iter().zip(&b.geoms) {
+            for c in 0..3 {
+                assert!((g.rgba[c] - h.rgba[c] * 0.25).abs() < 1e-12);
+            }
+            // Alpha is not radiance.
+            assert_eq!(g.rgba[3].to_bits(), h.rgba[3].to_bits());
+        }
+    }
+
+    let turned = LightOverride {
+        intensity: 1.0,
+        yaw_deg: 90.0,
+    }
+    .rotate_dir([1.0, 0.0, 0.5]);
+    assert!(turned[0].abs() < 1e-6, "{turned:?}");
+    assert!((turned[1] - 1.0).abs() < 1e-6, "{turned:?}");
+    assert_eq!(
+        turned[2].to_bits(),
+        0.5_f64.to_bits(),
+        "a yaw does not change the elevation"
+    );
+}
+
+/// With a frame source the two lighting kinds run and reach the frames; without one they are
+/// refused by name, never drawn and dropped (§17.2).
+#[test]
+fn the_light_kinds_need_a_frame_source() {
+    let light = vec![
+        Perturbation::new(
+            PerturbationKind::LightIntensity {
+                range: Range::new(0.2, 0.4),
+                dist: es_ir::evaluation::Distribution::Uniform,
+            },
+            0,
+        ),
+        Perturbation::new(PerturbationKind::LightDirection { range_deg: 30.0 }, 1),
+    ];
+    let ir = one_suite(light);
+    let task = task_ir();
+    let obs = image_observation_ir(task.task_hash().expect("task hashes"));
+
+    let err = run_obs_frames(&ir, &obs, 0.2, None, None).expect_err("no frame source");
+    let EvalError::Unsupported { kind, reason } = &err else {
+        panic!("expected EvalError::Unsupported, got {err}");
+    };
+    assert_eq!(*kind, "light_intensity");
+    assert!(reason.contains("no frame source"), "{reason}");
+
+    // With one, the draw reaches the frame source and is not the identity.
+    let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
+    let mut frames = |light: &LightOverride, _: &ModelInfo, _: &StateView<'_>| {
+        seen.insert((light.intensity.to_bits(), light.yaw_deg.to_bits()));
+        Ok(vec![0x5a_u8; IMG as usize * IMG as usize * 3])
+    };
+    run_obs_frames(&ir, &obs, 0.2, Some(&mut frames), None).expect("the lit run");
+    assert_eq!(
+        seen.len(),
+        N_EPISODES as usize,
+        "each episode draws its own lighting"
+    );
+    assert!(
+        !seen.contains(&(1.0_f64.to_bits(), 0.0_f64.to_bits())),
+        "a declared light perturbation must not leave the scene as authored"
+    );
+}
+
+/// The kinds this build still cannot realise are refused by name, each with a reason that is
+/// true *after* the two lighting kernels landed.
+#[test]
+fn the_remaining_kinds_are_still_unsupported_by_name() {
+    let cases = [
+        (
+            PerturbationKind::ColorTemperature {
+                range_k: Range::new(3000.0, 6500.0),
+            },
+            "color_temperature",
+            "light colour",
+        ),
+        (
+            PerturbationKind::Occluder {
+                count: es_ir::evaluation::CountRange::new(1, 2),
+                size_m: Range::new(0.01, 0.05),
+            },
+            "occluder",
+            "not in the scene",
+        ),
+        (
+            PerturbationKind::CameraExtrinsic {
+                pos_sigma_m: 0.01,
+                rot_sigma_deg: 1.0,
+            },
+            "camera_extrinsic",
+            "INV-14",
+        ),
+        (
+            PerturbationKind::CameraIntrinsic {
+                focal_rel_sigma: 0.01,
+            },
+            "camera_intrinsic",
+            "INV-14",
+        ),
+        (
+            PerturbationKind::ObjectPose {
+                target: "cube".to_owned(),
+                pos_sigma_m: 0.01,
+                yaw_deg: 10.0,
+            },
+            "object_pose",
+            "Env::reset takes no state override",
+        ),
+    ];
+    let task = task_ir();
+    let obs = image_observation_ir(task.task_hash().expect("task hashes"));
+    for (kind, name, because) in cases {
+        let ir = one_suite(vec![Perturbation::new(kind, 0)]);
+        // Even *with* a frame source: a renderer is not what these are blocked on.
+        let mut frames = state_frames();
+        let err =
+            run_obs_frames(&ir, &obs, 0.2, Some(&mut frames), None).expect_err("still unsupported");
+        let EvalError::Unsupported { kind, reason } = &err else {
+            panic!("expected EvalError::Unsupported for {name}, got {err}");
+        };
+        assert_eq!(*kind, name);
+        assert!(reason.contains(because), "{name}: {reason}");
+    }
+}
+
+/// §10.4 fairness: the lighting kinds draw from their own streams, so adding one to a suite
+/// cannot move any other stream's cursor. If this fails, every report ever written moves.
+#[test]
+fn enabling_the_light_kinds_does_not_move_other_streams() {
+    let noisy = vec![
+        Perturbation::new(PerturbationKind::TorqueNoise { rel_sigma: 0.05 }, 0),
+        Perturbation::new(
+            PerturbationKind::Backlash {
+                rad: Range::new(0.0, 0.01),
+            },
+            1,
+        ),
+    ];
+    let task = task_ir();
+    let obs = image_observation_ir(task.task_hash().expect("task hashes"));
+    let mut frames = state_frames();
+    let without = run_obs_frames(
+        &one_suite(noisy.clone()),
+        &obs,
+        0.2,
+        Some(&mut frames),
+        None,
+    )
+    .expect("the run without lighting");
+
+    let mut lit = noisy;
+    lit.push(Perturbation::new(
+        PerturbationKind::LightDirection { range_deg: 30.0 },
+        2,
+    ));
+    let mut frames = state_frames();
+    let with = run_obs_frames(&one_suite(lit), &obs, 0.2, Some(&mut frames), None)
+        .expect("the run with lighting");
+
+    assert_eq!(
+        serde_json::to_string(&without.cells).expect("cells"),
+        serde_json::to_string(&with.cells).expect("cells"),
+        "a lighting draw moved another stream"
+    );
+}
+
+/// Design note section 9: same conditions, byte-identical frames on the CPU path. The frame
+/// source here is a pure function of the state, so this is the runner's half of that claim --
+/// the ordering, the drop handling and the file names.
+#[test]
+fn the_frames_are_byte_identical_across_runs() {
+    let (ir, obs) = image_ir();
+    let mut runs = Vec::new();
+    for run in 0..2 {
+        let dir = scratch(&format!("repeat{run}"));
+        let mut sink = FrameSink::new(&dir);
+        let mut frames = state_frames();
+        run_obs_frames(&ir, &obs, 0.2, Some(&mut frames), Some(&mut sink)).expect("the run");
+        let mut all = Vec::new();
+        for name in sink.events.keys() {
+            for entry in std::fs::read_dir(dir.join(name)).expect("cell") {
+                let path = entry.expect("entry").path();
+                all.push((
+                    path.file_name()
+                        .expect("name")
+                        .to_string_lossy()
+                        .into_owned(),
+                    std::fs::read(&path).expect("frame"),
+                ));
+            }
+        }
+        all.sort();
+        runs.push((all, sink.events));
+    }
+    assert_eq!(runs[0].0, runs[1].0, "the frames moved between runs");
+    assert_eq!(runs[0].1, runs[1].1, "the events moved between runs");
 }
