@@ -68,9 +68,10 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Versions pinned in docs/api-notes/mujoco.md, torch.md and torchvision.md. mujoco_warp
-      # needs a GPU this runner does not have, so it is excluded below and stays
-      # `Target / Status: unverified` (spec 12.4) rather than faked green.
+      # Versions pinned in docs/api-notes/mujoco.md, torch.md, torchvision.md and newton.md.
+      # Everything here runs on a CPU: newton through warp's CPU device, diffusers is pure
+      # Python. mujoco_warp needs a CUDA GPU this runner does not have, so it is excluded below
+      # and stays `Target / Status: unverified` (spec 12.4) rather than faked green (P-M4-R11).
       - name: install reference oracles
         run: |
           python -m pip install --upgrade pip
@@ -78,11 +79,59 @@ jobs:
           # torchvision pulls torch 2.14.0 with it; it is what generates the observation
           # goldens, so without it `gen_goldens` SKIPs and their provenance is unchecked.
           python -m pip install torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install diffusers==0.40.0 newton==1.6.0 warp-lang==1.17.0
+
+      # lerobot 0.6.1 is pinned to torch 2.11 / torchvision 0.26 (docs/api-notes/lerobot-act.md)
+      # and cannot share the torch 2.14 environment above, so the ACT oracle gets its own venv.
+      # The checkpoint download is the api-note's: pinned revision, safetensors/json only, and
+      # an assertion that no pickle-loadable file landed (INV-16). It goes to RUNNER_TEMP, not
+      # target/, so rust-cache never stores the weights.
+      - name: install the LeRobot ACT oracle
+        env:
+          ES_ACT_CHECKPOINT: ${{ runner.temp }}/lerobot-cache/act_aloha_sim_transfer_cube_human
+        run: |
+          python -m venv "$RUNNER_TEMP/lerobot-venv"
+          LEROBOT_PY="$RUNNER_TEMP/lerobot-venv/bin/python"
+          "$LEROBOT_PY" -m pip install --upgrade pip
+          "$LEROBOT_PY" -m pip install torch==2.11.0+cpu torchvision==0.26.0+cpu lerobot==0.6.1 --extra-index-url https://download.pytorch.org/whl/cpu
+          "$LEROBOT_PY" - <<'PY'
+          import os
+          from pathlib import Path
+          from huggingface_hub import snapshot_download
+
+          REVISION = "ba73b2766f1371cdc133ca4efb97eb090d744625"  # docs/api-notes/lerobot-act.md
+          path = snapshot_download(
+              "lerobot/act_aloha_sim_transfer_cube_human",
+              revision=REVISION,
+              allow_patterns=["*.safetensors", "*.json"],
+              local_dir=os.environ["ES_ACT_CHECKPOINT"],
+          )
+          banned = [p for pat in ("*.bin", "*.pt", "*.ckpt", "*.pkl") for p in Path(path).rglob(pat)]
+          assert not banned, f"pickle-loadable file(s) in snapshot: {banned}"
+          PY
 
       - name: cargo test against the reference oracles
         env:
           ES_PYTHON: python
         run: |
           set -euo pipefail
-          cargo test -p es-physics-backend -p es-policy -p es-compile -- --skip mjwarp --nocapture 2>&1 | tee oracles.log
-          ! grep -q '^SKIP' oracles.log
+          # The ACT oracle runs in the next step, against the LeRobot interpreter.
+          cargo test -p es-physics-backend -p es-policy -p es-compile -- --skip mjwarp --skip a_real_lerobot_act_checkpoint --nocapture 2>&1 | tee oracles.log
+          # No GPU and no slangc here, so es-compile's GPU lowering tests (tests/observation_gpu.rs)
+          # SKIP with exactly these two reasons; they run on a GPU host under
+          # `ES_REQUIRE_GPU=1 cargo xtask ci`. Any other SKIP means an oracle installed above
+          # silently did not run, and fails the job.
+          if grep '^SKIP' oracles.log | grep -vE '^SKIP [a-z0-9_]+: no (slangc|Vulkan device) \('; then
+            echo "::error::a CPU reference oracle skipped (see the lines above)"
+            exit 1
+          fi
+
+      - name: cargo test against the LeRobot ACT checkpoint
+        env:
+          ES_PYTHON: ${{ runner.temp }}/lerobot-venv/bin/python
+          ES_ACT_CHECKPOINT: ${{ runner.temp }}/lerobot-cache/act_aloha_sim_transfer_cube_human
+        run: |
+          set -euo pipefail
+          cargo test -p es-policy --test act_checkpoint -- --nocapture 2>&1 | tee act.log
+          # A skip prints no RAN line, so this is what fails the step when the oracle did not run.
+          grep -q '^RAN act_checkpoint' act.log
