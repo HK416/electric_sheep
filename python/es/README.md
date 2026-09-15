@@ -51,7 +51,8 @@ es policy lower --policy untrained.esb --out build/
 es dataset bake --policy untrained.esb --out baked/ --frames tiles/ ds/
 <venv>/bin/python python/es/train_act.py --module build/ --baked baked/ --out model.safetensors \
     [--epochs N] [--batch N] [--lr F] [--seed N] [--device cuda] \
-    [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json]
+    [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json] \
+    [--resident-gpu] [--amp bf16] [--compile]
 es policy pack --policy untrained.esb --weights model.safetensors --out trained.esb
 ```
 
@@ -79,6 +80,12 @@ Three things it needs to be told about, all recorded in the design note:
   "silently zero" failure mode V2 had to warn about;
 - the lowered module is single-sample, so `--batch N` accumulates N samples into one optimizer
   step rather than running one batched forward.
+
+The three speed flags (M5 V5, design note section 7.11) split by whether they move the numbers:
+`--resident-gpu` moves the baked set onto `--device` once instead of per sample and is
+**bit-identical** to the default path at the same `--seed`; `--amp bf16` and `--compile` change the
+bits and are opt-in for that reason. `--batch` stays at 8 by default because the design note's
+measured runs are at 8 — raise it with a linearly scaled `--lr` (`--batch 32 --lr 4e-4`).
 
 Needs a Python with `torch` and `torchvision`. `pyarrow` is no longer read here — `es dataset
 bake` does the dataset reading, in Rust.

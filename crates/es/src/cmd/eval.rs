@@ -51,10 +51,30 @@ under --out with one { frame, tick, source, events } record per frame. That is e
 `es video mosaic` reads. It needs the `render` feature and a Vulkan device; a build without
 the feature refuses the flag rather than running with no frames.
 
+With --jobs N (default 1) the evaluation's cells -- a cell being one suite, run as its whole
+episode list -- are partitioned round-robin over N worker processes: this same binary,
+re-invoked as `es eval run --shard i/N --shard-out <file>`. A worker runs the cells it owns
+and judges nothing; the parent merges them back into the cell order the sequential run would
+have written, and computes the report, the `evaluation_hash` and `evaluation.lock` itself. So
+--jobs is a scheduling choice and not a different evaluation: at the same seeds the artifacts
+are byte-identical to --jobs 1 (`evaluation.lock`'s `created` timestamp excepted).
+
+The split is by suite and not by episode on purpose. Inside one suite the runner keeps one
+`Env`, one `SafetyPlane` and one monotonic chunk sequence for all of the episodes, and
+`Env::reset` keys the task's randomization by an episode counter that cannot be seeked -- so
+episode 5 of a suite is not reproducible without having run episodes 0..4. An evaluation with
+one suite gets no speedup from --jobs, and N is clamped to the suite count.
+
+A worker that fails stops the run with one error naming the shard, its exit code and its last
+line of stderr. A partial report is never written.
+
     --out <dir>        output directory (default: ./eval-out)
     --frames <dir>     render every step here (needs the `render` feature)
     --backend <name>   physics backend; only `mujoco-cpu` is supported (default, spec 17.1)
     --runtime <name>   policy runtime; only `torch` is supported (default, spec 2.4)
+    --jobs <N>         worker processes for the cells (default 1); 0 is refused
+    --shard <i/N>      run only the cells of shard i (worker mode); needs --shard-out
+    --shard-out <file> where a worker writes its cells; implies no report and no lock
 
 Exit code: 0 when every acceptance result is Determined{passed: true}; 1 when any failed or
 is Unavailable (both printed); 2 on a usage error; 3 when the backend or runtime is
@@ -191,6 +211,7 @@ fn compare(args: &[String]) -> Result<u8, CliError> {
 
 // --- `es eval run` ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 struct RunArgs {
     config: String,
     policy: String,
@@ -199,12 +220,18 @@ struct RunArgs {
     frames: Option<PathBuf>,
     backend: String,
     runtime: String,
+    /// Worker processes to partition the cells over. 1 is the sequential path, which is the
+    /// same code with one shard.
+    jobs: u32,
+    /// `(index, count)` when this process *is* a worker.
+    shard: Option<(u32, u32)>,
+    shard_out: Option<PathBuf>,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
     let (mut config, mut policy, mut scene, mut out) = (None, None, None, None);
     let (mut backend, mut runtime) = ("mujoco-cpu".to_owned(), "torch".to_owned());
-    let mut frames = None;
+    let (mut frames, mut jobs, mut shard, mut shard_out) = (None, 1u32, None, None);
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -221,12 +248,40 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
             "--frames" => frames = Some(PathBuf::from(val()?)),
             "--backend" => backend.clone_from(val()?),
             "--runtime" => runtime.clone_from(val()?),
+            "--jobs" => {
+                let v = val()?;
+                jobs = v.parse().map_err(|_| {
+                    CliError::Usage(format!("--jobs {v:?} is not a number\n\n{RUN_HELP}"))
+                })?;
+            }
+            "--shard" => shard = Some(parse_shard(val()?)?),
+            "--shard-out" => shard_out = Some(PathBuf::from(val()?)),
             other => {
                 return Err(CliError::Usage(format!(
                     "unknown flag '{other}'\n\n{RUN_HELP}"
                 )))
             }
         }
+    }
+    // `--jobs 0` would be "run nothing and report on it", which is a lie with an exit code.
+    if jobs == 0 {
+        return Err(CliError::Usage(format!(
+            "--jobs 0 runs no cell; the sequential run is --jobs 1\n\n{RUN_HELP}"
+        )));
+    }
+    if shard.is_some() && jobs > 1 {
+        return Err(CliError::Usage(format!(
+            "--shard is worker mode and --jobs spawns workers; a worker is never a parent\n\n\
+             {RUN_HELP}"
+        )));
+    }
+    // A worker that wrote a report would write one covering a subset of the suites, under a
+    // correct `evaluation_hash` (spec 10.4). The two flags travel together or not at all.
+    if shard.is_some() != shard_out.is_some() {
+        return Err(CliError::Usage(format!(
+            "--shard and --shard-out go together: a worker's cells are not a report\n\n\
+             {RUN_HELP}"
+        )));
     }
     let req = |v: Option<String>, name: &str| {
         v.ok_or_else(|| CliError::Usage(format!("{name} is required\n\n{RUN_HELP}")))
@@ -239,7 +294,24 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
         frames,
         backend,
         runtime,
+        jobs,
+        shard,
+        shard_out,
     })
+}
+
+/// `i/N`, with the range checked here so a worker cannot be asked for a shard that is not part
+/// of the partition.
+fn parse_shard(s: &str) -> Result<(u32, u32), CliError> {
+    let bad = || CliError::Usage(format!("--shard {s:?} is not `i/N`\n\n{RUN_HELP}"));
+    let (i, n) = s.split_once('/').ok_or_else(bad)?;
+    let (i, n): (u32, u32) = (i.parse().map_err(|_| bad())?, n.parse().map_err(|_| bad())?);
+    if n == 0 || i >= n {
+        return Err(CliError::Usage(format!(
+            "--shard {i}/{n}: the count must be at least 1 and the index below it\n\n{RUN_HELP}"
+        )));
+    }
+    Ok((i, n))
 }
 
 /// `Evaluation::run` (and the `SafetyPlane` inside it) is generic over the joint count and
@@ -276,11 +348,11 @@ fn run_typed<const NJ: usize, const H: usize>(
     scene: &es_assets::scene::SceneDesc,
     policy: &mut dyn PolicyRuntime,
     cfg: &RunConfig,
-    sink: Option<&mut es_eval::FrameSink>,
-) -> Result<(EvaluationReport, es_eval::EvaluationLock), CliError> {
-    let mut run = |frames: Option<&mut es_eval::runner::FrameSource<'_>>,
-                   sink: Option<&mut es_eval::FrameSink>| {
-        Evaluation::run_with_frames::<MuJoCoCpuBackend, _, NJ, H>(
+    frames_dir: Option<&Path>,
+    shard: (u32, u32),
+) -> Result<es_eval::Shard, CliError> {
+    let mut run = |frames: Option<&mut es_eval::runner::FrameSource<'_>>| {
+        Evaluation::run_shard::<MuJoCoCpuBackend, _, NJ, H>(
             eval_ir,
             &bundle.task,
             scene,
@@ -290,7 +362,8 @@ fn run_typed<const NJ: usize, const H: usize>(
             MuJoCoCpuBackend::new,
             cfg,
             frames,
-            sink,
+            frames_dir,
+            shard,
         )
         .map_err(|e| CliError::Runtime(e.to_string()))
     };
@@ -298,7 +371,7 @@ fn run_typed<const NJ: usize, const H: usize>(
     // that borrow on `Env` would put a lifetime on a type `es-data` and `es-eval` both name
     // (design note section 7.4).
     #[cfg(feature = "render")]
-    if sink.is_some() {
+    if frames_dir.is_some() {
         let rcfg = renderer_cfg(bundle)?;
         let gpu = es_gpu::Gpu::open(es_gpu::GpuOptions::default())
             .map_err(|e| CliError::Runtime(format!("no Vulkan device for --frames: {e}")))?;
@@ -309,9 +382,9 @@ fn run_typed<const NJ: usize, const H: usize>(
              state: &es_physics_core::backend::StateView<'_>| {
                 rig.frame(light, model, state)
             };
-        return run(Some(&mut source), sink);
+        return run(Some(&mut source));
     }
-    run(None, sink)
+    run(None)
 }
 
 /// The renderer `--frames` needs, built from what the bundle's Task IR already declares.
@@ -554,24 +627,66 @@ fn run(args: &[String]) -> Result<u8, CliError> {
     };
     let nj = bundle.deployment.robot.n_joints;
     let h = bundle.deployment.action.horizon;
-    let mut sink = a.frames.as_ref().map(es_eval::FrameSink::new);
-    let (report, lock) = dispatch_nj_h!(
-        nj,
-        h,
-        &bundle,
+    // More workers than cells would start interpreters that own nothing; the partition N has
+    // to be the one the workers are actually told, so it is clamped before either is decided.
+    let jobs = a.jobs.min(eval_ir.suites.len().max(1) as u32);
+    let mut shards = if jobs > 1 {
+        println!(
+            "es eval run --jobs {jobs}: {} cell(s) over {jobs} worker(s)",
+            eval_ir.suites.len()
+        );
+        spawn_shards(&a, jobs)?
+    } else {
+        vec![dispatch_nj_h!(
+            nj,
+            h,
+            &bundle,
+            &eval_ir,
+            &scene,
+            &mut policy,
+            &cfg,
+            a.frames.as_deref(),
+            a.shard.unwrap_or((0, 1))
+        )?]
+    };
+
+    // Worker mode stops here: the cells go to the parent and nothing else is written. A
+    // report over a subset of the suites would carry a correct `evaluation_hash` (spec 10.4).
+    if let Some(path) = &a.shard_out {
+        let (i, n) = a.shard.expect("--shard-out implies --shard");
+        let text = serde_json::to_string(&shards[0])
+            .map_err(|e| CliError::Runtime(format!("serializing shard {i}/{n}: {e}")))?;
+        std::fs::write(path, text)
+            .map_err(|e| CliError::Runtime(format!("{}: {e}", path.display())))?;
+        println!("shard {i}/{n}: {} cell(s)", shards[0].cells.len());
+        return Ok(0);
+    }
+
+    let mut events = std::collections::BTreeMap::new();
+    for s in &mut shards {
+        events.append(&mut s.events);
+    }
+    let (report, lock) = Evaluation::merge(
         &eval_ir,
-        &scene,
-        &mut policy,
+        &bundle.task,
+        &bundle.observation,
+        &bundle.deployment,
+        &policy,
         &cfg,
-        sink.as_mut()
-    )?;
+        &shards,
+    )
+    .map_err(|e| CliError::Runtime(e.to_string()))?;
 
     std::fs::create_dir_all(&a.out)
         .map_err(|e| CliError::Runtime(format!("{}: {e}", a.out.display())))?;
     es_eval::write_artifacts(&report, &lock, &a.out)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
     write_report_html(&report, &a.out.join("report.html"))?;
-    if let Some(sink) = &sink {
+    if let Some(dir) = &a.frames {
+        let sink = es_eval::FrameSink {
+            dir: dir.clone(),
+            events,
+        };
         sink.write_events(&a.out.join("events.json"))
             .map_err(|e| CliError::Runtime(e.to_string()))?;
         let frames: usize = sink.events.values().map(Vec::len).sum();
@@ -606,6 +721,114 @@ fn run(args: &[String]) -> Result<u8, CliError> {
     }
     println!("wrote {}", a.out.display());
     Ok(u8::from(!ok))
+}
+
+// --- `--jobs N`: one worker process per shard (packet M5/V5) --------------------------------
+
+/// Spawns one `es eval run --shard i/N --shard-out <file>` per shard, all at once, and
+/// collects their cells in shard order.
+///
+/// Processes and not threads, because the physics backend is itself a Python subprocess with
+/// one env in it and `TorchRuntime` holds another: threads here would queue behind the same
+/// two interpreters (design note section 7.11). The same binary and the same documents, so a
+/// worker is this code with a different shard, never a second implementation.
+///
+/// The children write their frames straight into the shared `--frames` directory: cell names
+/// are globally unique and shards own disjoint cells, so there is nothing to merge and nothing
+/// to collide.
+fn spawn_shards(a: &RunArgs, jobs: u32) -> Result<Vec<es_eval::Shard>, CliError> {
+    let exe = std::env::current_exe()
+        .map_err(|e| CliError::Runtime(format!("cannot find this executable to re-run it: {e}")))?;
+    let dir = a.out.join("shards");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
+
+    let mut running = Vec::new();
+    for i in 0..jobs {
+        let path = dir.join(format!("{i}.json"));
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args(["eval", "run", "--config"])
+            .arg(&a.config)
+            .arg("--policy")
+            .arg(&a.policy)
+            .arg("--scene")
+            .arg(&a.scene)
+            .arg("--backend")
+            .arg(&a.backend)
+            .arg("--runtime")
+            .arg(&a.runtime)
+            .arg("--shard")
+            .arg(format!("{i}/{jobs}"))
+            .arg("--shard-out")
+            .arg(&path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if let Some(f) = &a.frames {
+            cmd.arg("--frames").arg(f);
+        }
+        let child = cmd
+            .spawn()
+            .map_err(|e| CliError::Runtime(format!("spawning {}: {e}", exe.display())))?;
+        running.push((i, path, child));
+    }
+
+    // Every child is waited on before anything is returned, so a failure does not leave the
+    // rest of them orphaned behind a `?`.
+    let mut shards = Vec::with_capacity(running.len());
+    let mut failed: Option<CliError> = None;
+    for (i, path, child) in running {
+        let out = match child.wait_with_output() {
+            Ok(out) => out,
+            Err(e) => {
+                failed.get_or_insert(CliError::Runtime(format!(
+                    "waiting for shard {i}/{jobs}: {e}"
+                )));
+                continue;
+            }
+        };
+        if !out.status.success() {
+            failed.get_or_insert(shard_failed(
+                i,
+                jobs,
+                out.status.code(),
+                &String::from_utf8_lossy(&out.stderr),
+            ));
+            continue;
+        }
+        match std::fs::read(&path)
+            .map_err(|e| format!("{}: {e}", path.display()))
+            .and_then(|b| {
+                serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", path.display()))
+            }) {
+            Ok(s) => shards.push(s),
+            Err(e) => {
+                failed.get_or_insert(CliError::Runtime(format!(
+                    "shard {i}/{jobs} exited 0 but its cells are unreadable: {e}"
+                )));
+            }
+        }
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    Ok(shards)
+}
+
+/// The one error a failed worker becomes: which shard, what it exited with, and the last thing
+/// it said. Never a partial report -- a merge missing a suite would wear a correct
+/// `evaluation_hash` over numbers nobody measured (spec 10.4).
+fn shard_failed(index: u32, count: u32, code: Option<i32>, stderr: &str) -> CliError {
+    let last = stderr
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("(no output)");
+    CliError::Runtime(format!(
+        "es eval run --shard {index}/{count} failed ({}): {last}",
+        code.map_or_else(|| "killed by a signal".to_owned(), |c| format!("exit {c}")),
+    ))
 }
 
 // --- Welch's t-test, in plain Rust (no stats crate) -----------------------------------------
@@ -732,4 +955,85 @@ fn ln_gamma(x: f64) -> f64 {
     }
     let t = x + g + 0.5;
     0.5 * (2.0 * std::f64::consts::PI).ln() + (x + 0.5) * t.ln() - t + acc.ln()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(extra: &[&str]) -> Vec<String> {
+        let mut v = vec![
+            "--config".to_owned(),
+            "e.toml".to_owned(),
+            "--policy".to_owned(),
+            "p.esb".to_owned(),
+            "--scene".to_owned(),
+            "s.xml".to_owned(),
+        ];
+        v.extend(extra.iter().map(|s| (*s).to_owned()));
+        v
+    }
+
+    fn usage(extra: &[&str]) -> String {
+        match parse_run_args(&args(extra)) {
+            Err(CliError::Usage(text)) => text,
+            other => panic!("{extra:?} was not refused: {other:?}"),
+        }
+    }
+
+    /// The default is the sequential run, and it is the same partition the sharded path uses.
+    #[test]
+    fn jobs_defaults_to_one_and_names_no_shard() {
+        let a = parse_run_args(&args(&[])).expect("the bare form parses");
+        assert_eq!(a.jobs, 1);
+        assert_eq!(a.shard, None);
+        assert_eq!(a.shard_out, None);
+    }
+
+    /// `--jobs 0` is "run no cell and report on it". Refused before anything is opened.
+    #[test]
+    fn jobs_zero_is_refused() {
+        assert!(usage(&["--jobs", "0"]).contains("--jobs 0 runs no cell"));
+    }
+
+    /// A worker's cells are not a report (spec 10.4): the two flags travel together, and a
+    /// worker is never also a parent.
+    #[test]
+    fn a_shard_needs_a_shard_out_and_refuses_to_be_a_parent() {
+        assert!(usage(&["--shard", "0/4"]).contains("go together"));
+        assert!(usage(&["--shard-out", "s.json"]).contains("go together"));
+        assert!(
+            usage(&["--shard", "0/4", "--shard-out", "s.json", "--jobs", "2"])
+                .contains("never a parent")
+        );
+    }
+
+    /// The partition is checked where it is parsed, so no worker is ever asked for a shard
+    /// outside it.
+    #[test]
+    fn a_shard_outside_the_partition_is_refused() {
+        assert!(usage(&["--shard", "4/4", "--shard-out", "s.json"]).contains("index below it"));
+        assert!(usage(&["--shard", "0/0", "--shard-out", "s.json"]).contains("index below it"));
+        assert!(usage(&["--shard", "0-4", "--shard-out", "s.json"]).contains("is not `i/N`"));
+    }
+
+    /// A lost worker is one named error carrying enough to act on: which shard, how it died,
+    /// and the last thing it printed.
+    #[test]
+    fn a_failed_shard_names_itself() {
+        let CliError::Runtime(text) =
+            shard_failed(2, 6, Some(3), "loading\nSKIPPED (no torch)\n\n")
+        else {
+            panic!("a failed shard must be a runtime error");
+        };
+        assert!(text.contains("--shard 2/6"), "{text}");
+        assert!(text.contains("exit 3"), "{text}");
+        assert!(text.contains("SKIPPED (no torch)"), "{text}");
+
+        let CliError::Runtime(text) = shard_failed(0, 2, None, "") else {
+            panic!("a killed shard must be a runtime error");
+        };
+        assert!(text.contains("killed by a signal"), "{text}");
+        assert!(text.contains("(no output)"), "{text}");
+    }
 }

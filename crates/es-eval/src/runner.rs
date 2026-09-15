@@ -225,6 +225,37 @@ pub struct EvaluationLock {
     pub created: u64,
 }
 
+/// One cell's contribution to the §10.1 table, exactly as `record_cell` produced it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ShardCell {
+    /// Index into `EvaluationIr::suites`. This is what puts a merged report back into the
+    /// order the sequential run would have written it, whichever worker produced the cell and
+    /// whichever finished first (§10.4).
+    pub cell: u32,
+    /// One entry per declared metric, in `MetricSpec::ALL` order.
+    pub results: Vec<CellResult>,
+    /// The per-episode samples of the metrics that have one ([`metrics::per_episode`]), which
+    /// is what an `Aggregation` other than `Mean` needs and `CellResult` does not carry.
+    pub samples: Vec<(MetricSpec, Vec<f64>)>,
+}
+
+/// What one worker of a `--jobs N` run hands back (design note `docs/design/visible-learning.md`
+/// section 7.11).
+///
+/// A shard is a *partition of the cells*, never of the episodes: one cell owns one `Env`, one
+/// `SafetyPlane` and one monotonic `seq` for all of its episodes, and `Env::reset` keys the
+/// task's own randomization by an episode counter that cannot be seeked (§10.4). Splitting
+/// finer would change the run; splitting here does not.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct Shard {
+    pub cells: Vec<ShardCell>,
+    /// The backend this worker actually opened; `None` when the shard owned no cell.
+    pub backend: Option<BackendCaps>,
+    /// This worker's slice of `events.json`, keyed by cell name exactly as [`FrameSink`] keys
+    /// it. Cell names are globally unique, so the workers' maps are disjoint.
+    pub events: BTreeMap<String, Vec<StepEvent>>,
+}
+
 /// Namespace for [`Evaluation::run`]. Not a trait and not state: INV-17 allows seven
 /// extension points and this is none of them.
 #[derive(Debug)]
@@ -283,15 +314,72 @@ impl Evaluation {
         obs: &ObservationIr,
         policy: &mut dyn PolicyRuntime,
         deploy: &DeploymentIr,
-        mut new_backend: F,
+        new_backend: F,
         cfg: &RunConfig,
-        mut frames: Option<&mut FrameSource<'_>>,
-        mut sink: Option<&mut FrameSink>,
+        frames: Option<&mut FrameSource<'_>>,
+        sink: Option<&mut FrameSink>,
     ) -> Result<(EvaluationReport, EvaluationLock), EvalError>
     where
         B: PhysicsBackend,
         F: FnMut() -> B,
     {
+        // The sequential path *is* the sharded path with one shard: byte-identity between
+        // `--jobs 1` and this is by construction, not by a second implementation (§3.5).
+        let dir = sink.as_deref().map(|s| s.dir.clone());
+        let mut shard = Self::run_shard::<B, F, NJ, H>(
+            ir,
+            task,
+            scene,
+            obs,
+            policy,
+            deploy,
+            new_backend,
+            cfg,
+            frames,
+            dir.as_deref(),
+            (0, 1),
+        )?;
+        if let Some(s) = sink {
+            s.events = std::mem::take(&mut shard.events);
+        }
+        Self::merge(ir, task, obs, deploy, policy, cfg, &[shard])
+    }
+
+    /// The cells this shard owns, run and left unjudged for [`Self::merge`].
+    ///
+    /// `shard` is `(index, count)` and the partition is round-robin on the cell index: cell
+    /// `c` belongs to shard `c % count`. Fixed by the cell index alone, so it does not depend
+    /// on how long a suite takes, on how many workers actually started, or on any iteration
+    /// order (§3.4). `(0, 1)` is every cell.
+    ///
+    /// `frames_dir` is [`FrameSink::dir`]: every cell writes into its own `<dir>/<cell>/`, and
+    /// cell names are globally unique, so two shards writing into one directory cannot collide
+    /// and no frame merge step exists.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_shard<B, F, const NJ: usize, const H: usize>(
+        ir: &EvaluationIr,
+        task: &TaskIr,
+        scene: &SceneDesc,
+        obs: &ObservationIr,
+        policy: &mut dyn PolicyRuntime,
+        deploy: &DeploymentIr,
+        mut new_backend: F,
+        cfg: &RunConfig,
+        mut frames: Option<&mut FrameSource<'_>>,
+        frames_dir: Option<&Path>,
+        shard: (u32, u32),
+    ) -> Result<Shard, EvalError>
+    where
+        B: PhysicsBackend,
+        F: FnMut() -> B,
+    {
+        let (index, count) = shard;
+        if count == 0 || index >= count {
+            return Err(EvalError::Shard(format!(
+                "{index}/{count} is not a partition: the count must be at least 1 and the \
+                 index below it"
+            )));
+        }
         if let Some(d) = ir.validate().first() {
             return Err(EvalError::InvalidIr(format!("{d}")));
         }
@@ -309,12 +397,12 @@ impl Evaluation {
 
         let mut perturbations: Option<PerturbationPlan> = None;
         let mut sources: Option<BTreeMap<String, Capture>> = None;
-        let mut caps: Option<BackendCaps> = None;
-        let mut cells: Vec<CellResult> = Vec::new();
-        let mut measured: BTreeMap<(String, MetricSpec), MetricValue> = BTreeMap::new();
-        let mut samples: BTreeMap<(String, MetricSpec), Vec<f64>> = BTreeMap::new();
+        let mut out = Shard::default();
 
         for (cell, suite) in ir.suites.iter().enumerate() {
+            if cell as u32 % count != index {
+                continue;
+            }
             let mut env: Env<B> = Env::new(task, scene, new_backend(), &domains, seeds[0])?;
             if perturbations.is_none() {
                 perturbations = Some(PerturbationPlan::compile(
@@ -324,7 +412,9 @@ impl Evaluation {
                     frames.is_some(),
                 )?);
                 sources = Some(input_sources(&plan, obs, task, Some(env.model()))?);
-                caps = Some(backend_caps(&env));
+                // Every cell opens the same backend on the same scene, so which cell this
+                // shard happened to reach first does not change the answer.
+                out.backend = Some(backend_caps(&env));
             }
             let perturbations = perturbations.as_ref().expect("just compiled");
             let mut safety = SafetyPlane::<NJ, H>::from_ir(deploy)
@@ -338,8 +428,8 @@ impl Evaluation {
                 // One cell of the mosaic is one episode of one suite: `single_env()` makes
                 // them independent runs, so the grid is `suites x episodes` directories.
                 let name = format!("{}-{idx:02}", suite.name);
-                let mut cell_frames = sink.as_deref().map(|s| CellFrames {
-                    dir: s.dir.join(&name),
+                let mut cell_frames = frames_dir.map(|d| CellFrames {
+                    dir: d.join(&name),
                     n: 0,
                 });
                 let mut events = Vec::new();
@@ -363,23 +453,70 @@ impl Evaluation {
                     cell_frames.as_mut(),
                     &mut events,
                 )?;
-                if let Some(s) = sink.as_deref_mut() {
-                    s.events.insert(name, events);
+                if frames_dir.is_some() {
+                    out.events.insert(name, events);
                 }
                 episodes.push(episode);
             }
 
             let env_metrics = env.metrics();
-            record_cell(
+            out.cells.push(record_cell(
                 ir,
+                cell as u32,
                 &suite.name,
                 &episodes,
                 safety.counters(),
                 &env_metrics,
-                &mut cells,
-                &mut measured,
-                &mut samples,
-            );
+            ));
+        }
+        Ok(out)
+    }
+
+    /// The §10.5 artifacts, from every worker's cells put back in canonical order.
+    ///
+    /// The judgement, the hash chain and both artifacts are computed **here and only here**,
+    /// from the same `judge` over the same `measured`/`samples` maps the sequential path
+    /// builds — so `--jobs N` cannot produce a report that `--jobs 1` would not have (§10.4).
+    ///
+    /// A cell set that is not exactly `0..suites.len()`, each cell once, is refused. A report
+    /// missing a suite because a worker was lost would otherwise carry a correct
+    /// `evaluation_hash` over numbers nobody measured.
+    pub fn merge(
+        ir: &EvaluationIr,
+        task: &TaskIr,
+        obs: &ObservationIr,
+        deploy: &DeploymentIr,
+        policy: &dyn PolicyRuntime,
+        cfg: &RunConfig,
+        shards: &[Shard],
+    ) -> Result<(EvaluationReport, EvaluationLock), EvalError> {
+        let plan = CpuPlan::compile(obs, PlanMode::Release)
+            .map_err(|d| EvalError::Plan(d.iter().map(ToString::to_string).collect()))?;
+
+        // Stable, so the metric order inside a cell is untouched and only the cells move.
+        let mut merged: Vec<&ShardCell> = shards.iter().flat_map(|s| &s.cells).collect();
+        merged.sort_by_key(|c| c.cell);
+        let covered: Vec<u32> = merged.iter().map(|c| c.cell).collect();
+        if covered.iter().copied().ne(0..ir.suites.len() as u32) {
+            return Err(EvalError::Shard(format!(
+                "the merged workers cover cells {covered:?}; the evaluation has {} suites and \
+                 every cell must appear exactly once",
+                ir.suites.len()
+            )));
+        }
+
+        let mut cells: Vec<CellResult> = Vec::new();
+        let mut measured: BTreeMap<(String, MetricSpec), MetricValue> = BTreeMap::new();
+        let mut samples: BTreeMap<(String, MetricSpec), Vec<f64>> = BTreeMap::new();
+        for c in merged {
+            let suite = &ir.suites[c.cell as usize].name;
+            for r in &c.results {
+                measured.insert((suite.clone(), r.metric), r.value.clone());
+                cells.push(r.clone());
+            }
+            for (metric, v) in &c.samples {
+                samples.insert((suite.clone(), *metric), v.clone());
+            }
         }
 
         let acceptance = judge(ir, &measured, &samples);
@@ -408,17 +545,22 @@ impl Evaluation {
             schema_version: SCHEMA_VERSION,
             evaluation_hash: hex32(&evaluation_hash),
             execution_hash: hex32(&execution_hash),
-            seeds,
-            backend: caps.unwrap_or_else(|| BackendCaps {
-                name: "none".to_owned(),
-                determinism: "unknown".to_owned(),
-                float: "unknown".to_owned(),
-                max_envs: 0,
-                gpu_resident: false,
-                supports_reset_subset: false,
-                supports_state_get_set: false,
-                quirks: Vec::new(),
-            }),
+            seeds: resolve_seeds(ir),
+            // Shard 0 owns cell 0, and the workers are collected in shard order, so this is
+            // the same backend the sequential run would have reported.
+            backend: shards
+                .iter()
+                .find_map(|s| s.backend.clone())
+                .unwrap_or_else(|| BackendCaps {
+                    name: "none".to_owned(),
+                    determinism: "unknown".to_owned(),
+                    float: "unknown".to_owned(),
+                    max_envs: 0,
+                    gpu_resident: false,
+                    supports_reset_subset: false,
+                    supports_state_get_set: false,
+                    quirks: Vec::new(),
+                }),
             created: cfg.created,
         };
         Ok((report, lock))
@@ -883,35 +1025,36 @@ fn to_f64(t: &Tensor) -> Result<Vec<f64>, EvalError> {
 
 /// Computes every declared metric for one cell. Every declared metric gets exactly one
 /// `CellResult`, measured or `MetricValue::Unavailable` — never a missing row.
-#[allow(clippy::too_many_arguments)]
 fn record_cell(
     ir: &EvaluationIr,
+    cell: u32,
     suite: &str,
     episodes: &[Episode],
     counters: &es_safety::SafetyCounters,
     env_metrics: &EnvMetrics,
-    cells: &mut Vec<CellResult>,
-    measured: &mut BTreeMap<(String, MetricSpec), MetricValue>,
-    samples: &mut BTreeMap<(String, MetricSpec), Vec<f64>>,
-) {
+) -> ShardCell {
+    let mut out = ShardCell {
+        cell,
+        results: Vec::new(),
+        samples: Vec::new(),
+    };
     // `MetricSpec::ALL` order, not the document's, so the report is byte-stable whatever
     // order the author listed the metrics in.
     for metric in MetricSpec::ALL {
         if !ir.metrics.contains(&metric) {
             continue;
         }
-        let value = metrics::compute(&metric, episodes, counters, env_metrics);
-        cells.push(CellResult {
+        out.results.push(CellResult {
             suite: suite.to_owned(),
             metric,
-            value: value.clone(),
+            value: metrics::compute(&metric, episodes, counters, env_metrics),
             n_episodes: episodes.len() as u32,
         });
         if let Some(v) = metrics::per_episode(&metric, episodes) {
-            samples.insert((suite.to_owned(), metric), v);
+            out.samples.push((metric, v));
         }
-        measured.insert((suite.to_owned(), metric), value);
     }
+    out
 }
 
 /// §10.2 acceptance. A criterion with no `suite` applies to every suite; a criterion whose

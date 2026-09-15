@@ -15,6 +15,7 @@ Usage:
     train_act.py --module <dir> --baked <dir> --out model.safetensors
                  [--epochs N] [--batch N] [--lr F] [--seed N] [--device cpu]
                  [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json]
+                 [--resident-gpu] [--amp bf16] [--compile]
 
 Prints one JSON line on stdout and nothing else:
 
@@ -42,11 +43,34 @@ Two more things it deliberately does not do, both for the reason the rest of the
 carries a batch axis -- spec 5.2 gives the inference domain its own batch size, so the IR has
 none. `--batch N` is therefore N samples accumulated into one optimizer step: the same gradient
 a batched forward would produce, one forward at a time.
+
+**The three speed flags, and which of them move the numbers** (packet M5/V5):
+
+  * `--resident-gpu` moves the whole baked set onto `--device` once, instead of copying one
+    sample per forward. It changes *where* a tensor lives and nothing else -- the batch order,
+    the dtype and the arithmetic are untouched -- so the loss curve is **bit-identical** to the
+    default path at the same `--seed`, which
+    `crates/es-policy/tests/ir_training.rs::resident_gpu_does_not_move_the_loss` pins. It needs
+    the baked set to fit in device memory; the size it moved is printed to stderr so a run that
+    does not fit says why.
+  * `--amp bf16` and `--compile` **do** change the bits: bf16 autocast rounds every matmul's
+    inputs and `torch.compile` is free to fuse and reassociate. Both are opt-in for exactly
+    that reason -- use them for a sweep, not for a run whose numbers are quoted. The gate that
+    stays either way is the fp32 inference-equivalence check in `ir_training.rs`, and it runs
+    on a checkpoint trained at the defaults.
+
+`--batch` defaults to 8 and stays there: the design note's measured runs are at 8, and moving
+the default would silently invalidate them. Raising it is a different run, not a faster one --
+`--batch N` accumulates N samples per optimizer step, so N x fewer steps cover the same data,
+and the convention is to scale the step with it linearly: `--batch 32 --lr 4e-4` for the
+`--batch 8 --lr 1e-4` default. Neither the scaling nor the batch size enters a hash slot
+(spec 8.1); both belong in whatever records the training run.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import struct
 import sys
@@ -170,10 +194,39 @@ def main(argv: list) -> int:
     )
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--epochs", type=int, default=1)
-    p.add_argument("--batch", type=int, default=8)
-    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument(
+        "--batch",
+        type=int,
+        default=8,
+        help="samples accumulated into one optimizer step; the default is 8 because the "
+        "design note's measured runs are at 8. Scale --lr with it linearly",
+    )
+    p.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+        help="AdamW step; the convention with --batch is linear scaling, so --batch 32 "
+        "goes with --lr 4e-4",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
+    p.add_argument(
+        "--resident-gpu",
+        action="store_true",
+        help="move the whole baked set onto --device once instead of per sample; the loss "
+        "curve is bit-identical to the default path at the same --seed",
+    )
+    p.add_argument(
+        "--amp",
+        choices=["off", "bf16"],
+        default="off",
+        help="bf16 autocast over the forward and the loss; opt-in because it changes the bits",
+    )
+    p.add_argument(
+        "--compile",
+        action="store_true",
+        help="torch.compile the lowered module; opt-in because it changes the bits",
+    )
     p.add_argument(
         "--checkpoint-at",
         default="",
@@ -203,6 +256,12 @@ def main(argv: list) -> int:
         chunk = int(next(iter(out.values())).shape[0])
 
     manifest, episodes = read_baked(a.baked, shapes)
+    if a.resident_gpu:
+        # Where the tensors live, not what they are: same dtype, same values, same order, so
+        # the `.to(device)` in the loop below becomes a no-op and the loss does not move.
+        moved = sum(t.numel() * t.element_size() for e in episodes for t in e.values())
+        episodes = [{name: t.to(device) for name, t in e.items()} for e in episodes]
+        sys.stderr.write("resident on %s: %.1f MiB\n" % (device, moved / (1 << 20)))
     samples = make_samples(episodes, chunk)
     if not samples:
         raise SystemExit("%s holds no frames" % a.baked)
@@ -215,6 +274,14 @@ def main(argv: list) -> int:
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=a.lr)
     generator = torch.Generator().manual_seed(a.seed)
+    # `model` stays the thing whose `state_dict` is written: `torch.compile` returns a wrapper
+    # whose parameter names are prefixed, and `checkpoint_tensors` would not recognise them.
+    forward = torch.compile(model) if a.compile else model
+    amp = (
+        torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        if a.amp == "bf16"
+        else contextlib.nullcontext()
+    )
     model.train()
     losses = []
     order, cursor = [], 0
@@ -232,8 +299,9 @@ def main(argv: list) -> int:
                 port: tensors[port][t].to(device).reshape(shape) for port, shape in shapes.items()
             }
             target = tensors["action"][rows].to(device)
-            predicted = next(iter(model(**inputs).values()))
-            loss = torch.nn.functional.l1_loss(predicted, target) / a.batch
+            with amp:
+                predicted = next(iter(forward(**inputs).values()))
+                loss = torch.nn.functional.l1_loss(predicted, target) / a.batch
             loss.backward()
             accumulated += float(loss.detach())
         optimizer.step()
@@ -257,6 +325,11 @@ def main(argv: list) -> int:
         "steps": len(losses),
         "samples": len(samples),
         "batch": a.batch,
+        # Which of the three speed flags were on, because two of them change the bits and a
+        # number whose mode is not recorded is a number nobody can reproduce.
+        "resident_gpu": a.resident_gpu,
+        "amp": a.amp,
+        "compiled": a.compile,
         "chunk": chunk,
         "ports": sorted(shapes),
         "observation_hash": manifest.get("observation_hash"),

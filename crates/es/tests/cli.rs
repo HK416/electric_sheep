@@ -1212,6 +1212,48 @@ fn eval_run_skips_when_backend_or_runtime_unavailable() {
     assert!(text.contains("SKIPPED"), "{text}");
 }
 
+/// Packet M5/V5. `--jobs 0` is "run no cell and report on it": a usage error (exit 2) raised
+/// while parsing, before a bundle, a scene or a Python interpreter is touched -- which is why
+/// this runs in the PR tier where neither `mujoco` nor `torch` exists. The same check covers
+/// the worker-mode flags, which must never write a report over a subset of the suites.
+#[test]
+fn eval_run_jobs_zero_and_the_worker_flags_are_usage_errors() {
+    let dir = scratch_dir("eval-run-jobs");
+    for (flags, wanted) in [
+        (vec!["--jobs", "0"], "--jobs 0 runs no cell"),
+        (vec!["--jobs", "x"], "is not a number"),
+        (vec!["--shard", "0/4"], "go together"),
+        (
+            vec!["--shard", "4/4", "--shard-out", "s.json"],
+            "index below it",
+        ),
+        (
+            vec!["--shard", "0/4", "--shard-out", "s.json", "--jobs", "2"],
+            "never a parent",
+        ),
+    ] {
+        let out = bin()
+            .env("ES_PYTHON", "es-no-such-python")
+            .args(["eval", "run", "--config"])
+            .arg(dir.join("nothing.toml"))
+            .arg("--policy")
+            .arg(dir.join("nothing.esb"))
+            .arg("--scene")
+            .arg("does-not-exist.xml")
+            .arg("--out")
+            .arg(dir.join("out"))
+            .args(&flags)
+            .output()
+            .expect("run es eval run");
+        let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(2), "{flags:?}: {text}");
+        assert!(text.contains(wanted), "{flags:?}: {text}");
+        // Refused before anything was opened, let alone written.
+        assert!(!dir.join("out").exists(), "{flags:?}: {text}");
+    }
+    println!("RAN eval_run_jobs_zero_and_the_worker_flags_are_usage_errors");
+}
+
 /// `es import lerobot-config` on the shared M2 W6 fixture (spec 14.4), round-tripping the
 /// two IRs it writes through `es ir validate`.
 #[test]

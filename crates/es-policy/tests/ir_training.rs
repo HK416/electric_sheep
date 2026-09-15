@@ -671,6 +671,116 @@ fn act_training_uses_baked_observations() {
     );
 }
 
+/// Packet M5/V5. `--resident-gpu` moves the baked set onto the device once instead of copying
+/// one sample per forward. It must move **where the tensors live and nothing else**: same batch
+/// order, same dtype, same arithmetic, so the loss curve is bit-identical at the same `--seed`.
+///
+/// Run here on the CPU, where `.to(device)` is a no-op either way — which is exactly the point.
+/// If the resident path ever changed the dtype, the sample order or the accumulation, this
+/// would catch it without a GPU, and the two `--loss-curve` files are compared as **bytes**,
+/// not with a tolerance.
+///
+/// `--amp bf16` and `--compile` are deliberately not in this comparison: they change the bits,
+/// which is why they are opt-in. The gate that stays either way is
+/// `act_training_uses_baked_observations`' tier-4 fp32 round-trip, at the defaults.
+#[test]
+#[ignore = "needs torch, torchvision and pyarrow"]
+fn resident_gpu_does_not_move_the_loss() {
+    let python = match python_with_torch() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP ir_training: {why}");
+            return;
+        }
+    };
+    let dir = scratch_dir("resident");
+    let (path, _bundle) = demo_bundle(&dir);
+    let (build, _contract) = lowered(&dir, &path);
+
+    let (dataset, tiles, baked) = (dir.join("ds"), dir.join("tiles"), dir.join("baked"));
+    run(
+        &python,
+        &[
+            "-c",
+            MINI_DATASET_PY,
+            &dataset.to_string_lossy(),
+            &tiles.to_string_lossy(),
+        ],
+    );
+    let bake = es(&[
+        "dataset",
+        "bake",
+        "--policy",
+        &path.to_string_lossy(),
+        "--out",
+        &baked.to_string_lossy(),
+        "--frames",
+        &tiles.to_string_lossy(),
+        &dataset.to_string_lossy(),
+    ]);
+    assert_eq!(bake.status.code(), Some(0), "{}", text(&bake));
+
+    let train = |tag: &str, resident: bool| -> (Vec<u8>, String) {
+        let curve = dir.join(format!("{tag}.json"));
+        let out = dir.join(format!("{tag}.safetensors"));
+        let mut args = vec![
+            train_act_py().to_string_lossy().into_owned(),
+            "--module".to_owned(),
+            build.to_string_lossy().into_owned(),
+            "--baked".to_owned(),
+            baked.to_string_lossy().into_owned(),
+            "--out".to_owned(),
+            out.to_string_lossy().into_owned(),
+            "--batch".to_owned(),
+            "4".to_owned(),
+            "--seed".to_owned(),
+            "0".to_owned(),
+            "--checkpoint-at".to_owned(),
+            ORACLE_STEPS.to_string(),
+            "--loss-curve".to_owned(),
+            curve.to_string_lossy().into_owned(),
+        ];
+        if resident {
+            args.push("--resident-gpu".to_owned());
+        }
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let done = run(&python, &borrowed);
+        let line = String::from_utf8_lossy(&done.stdout)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_owned();
+        (
+            std::fs::read(&curve).unwrap_or_else(|e| panic!("{}: {e}", curve.display())),
+            line,
+        )
+    };
+
+    let (plain, plain_report) = train("plain", false);
+    let (resident, resident_report) = train("resident", true);
+    assert_eq!(
+        String::from_utf8_lossy(&resident),
+        String::from_utf8_lossy(&plain),
+        "--resident-gpu moved the loss; it may only move where the tensors live"
+    );
+    // ...and the curve has to be over something: 40 steps that are not all the same number.
+    let losses: Vec<f64> = serde_json::from_slice(&plain).expect("the loss curve is JSON");
+    assert_eq!(losses.len(), ORACLE_STEPS, "{plain_report}");
+    assert!(
+        losses.iter().any(|v| (v - losses[0]).abs() > 0.0),
+        "the loss never moved at all: {losses:?}"
+    );
+    assert!(
+        resident_report.contains("\"resident_gpu\":true"),
+        "the report must record the mode it ran in: {resident_report}"
+    );
+    println!(
+        "RAN resident_gpu_does_not_move_the_loss: {ORACLE_STEPS} bit-identical steps, \
+         {} bytes of curve\n  plain:    {plain_report}\n  resident: {resident_report}",
+        plain.len()
+    );
+}
+
 /// `EsPolicy` in a plain interpreter, with no `TorchRuntime` between it and the checkpoint:
 /// argv is `<module dir> <model.safetensors> <observation.json>` and stdout is the flattened
 /// action chunk as JSON. Deliberately not importing `torch_ref.py` — the point is to be a

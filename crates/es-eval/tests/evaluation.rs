@@ -1739,3 +1739,243 @@ fn a_bake_refuses_an_input_the_dataset_cannot_feed() {
         "{message}"
     );
 }
+
+// --- packet M5/V5: `--jobs N` is a partition of the cells ------------------------------------
+
+/// Four suites, so `--jobs 4` is one cell per worker and `--jobs 1` is all four in a row. The
+/// perturbations are the supported kinds on four separate streams, which is what makes the
+/// four cells four different runs rather than four copies of one.
+fn four_suite_image_ir() -> (EvaluationIr, ObservationIr) {
+    let (mut ir, obs) = image_ir();
+    ir.suites = vec![
+        PerturbationSuite {
+            name: "nominal".to_owned(),
+            perturbations: Vec::new(),
+        },
+        PerturbationSuite {
+            name: "torque_noise".to_owned(),
+            perturbations: vec![Perturbation::new(
+                PerturbationKind::TorqueNoise { rel_sigma: 0.05 },
+                0,
+            )],
+        },
+        PerturbationSuite {
+            name: "backlash".to_owned(),
+            perturbations: vec![Perturbation::new(
+                PerturbationKind::Backlash {
+                    rad: Range::new(0.0, 0.01),
+                },
+                1,
+            )],
+        },
+        PerturbationSuite {
+            name: "light_intensity".to_owned(),
+            perturbations: vec![Perturbation::new(
+                PerturbationKind::LightIntensity {
+                    range: Range::new(0.5, 1.5),
+                    dist: es_ir::evaluation::Distribution::default(),
+                },
+                2,
+            )],
+        },
+    ];
+    (ir, obs)
+}
+
+/// The three artifacts as bytes, plus every frame on disk: what `--jobs N` is allowed to move,
+/// which is nothing.
+type Artifacts = (Vec<u8>, Vec<u8>, Vec<u8>, Vec<(String, Vec<u8>)>);
+
+fn read_artifacts(
+    report: &EvaluationReport,
+    lock: &es_eval::EvaluationLock,
+    events: &FrameSink,
+    dir: &std::path::Path,
+) -> Artifacts {
+    let out = dir.join("artifacts");
+    es_eval::write_artifacts(report, lock, &out).expect("the two spec 10.5 artifacts");
+    let events_path = out.join("events.json");
+    events.write_events(&events_path).expect("events.json");
+
+    let mut frames = Vec::new();
+    for name in events.events.keys() {
+        for entry in std::fs::read_dir(dir.join(name)).expect("the cell directory") {
+            let path = entry.expect("entry").path();
+            let file = path
+                .file_name()
+                .expect("name")
+                .to_string_lossy()
+                .into_owned();
+            frames.push((
+                format!("{name}/{file}"),
+                std::fs::read(&path).expect("frame"),
+            ));
+        }
+    }
+    frames.sort();
+    (
+        std::fs::read(out.join("report.json")).expect("report.json"),
+        std::fs::read(out.join("evaluation.lock")).expect("evaluation.lock"),
+        std::fs::read(&events_path).expect("events.json"),
+        frames,
+    )
+}
+
+/// `jobs` workers over the cells, merged the way `es eval run --jobs N` merges them.
+///
+/// A **fresh `FakePolicy` per shard**, which is what a separate process gives: if a cell read
+/// anything the previous cell left behind in the policy, this would not agree with the
+/// sequential run.
+fn sharded(ir: &EvaluationIr, obs: &ObservationIr, jobs: u32, dir: &std::path::Path) -> Artifacts {
+    let task = task_ir();
+    let (deploy, cfg) = (deployment_ir(), RunConfig::default());
+    let mut shards = Vec::new();
+    let mut events = FrameSink::new(dir);
+    for i in 0..jobs {
+        let mut policy = FakePolicy { target: 0.2 };
+        let mut frames = state_frames();
+        let mut shard = Evaluation::run_shard::<FakeBackend, _, NJ, H>(
+            ir,
+            &task,
+            &scene(),
+            obs,
+            &mut policy,
+            &deploy,
+            FakeBackend::new,
+            &cfg,
+            Some(&mut frames),
+            Some(dir),
+            (i, jobs),
+        )
+        .unwrap_or_else(|e| panic!("shard {i}/{jobs}: {e}"));
+        events.events.append(&mut shard.events);
+        shards.push(shard);
+    }
+    let policy = FakePolicy { target: 0.2 };
+    let (report, lock) = Evaluation::merge(ir, &task, obs, &deploy, &policy, &cfg, &shards)
+        .expect("the workers merge");
+    read_artifacts(&report, &lock, &events, dir)
+}
+
+/// The headline of the packet: `--jobs 4` is a scheduling choice, not a different evaluation.
+///
+/// Three runs of one four-suite image evaluation — the sequential entry point, one worker, and
+/// four workers — and all three must produce byte-identical `report.json`, `evaluation.lock`
+/// and `events.json`, and byte-identical frames in every cell directory (spec 10.4, spec 3.5
+/// tier 1).
+#[test]
+fn sharding_the_cells_produces_a_byte_identical_report() {
+    let (ir, obs) = four_suite_image_ir();
+
+    let sequential = {
+        let dir = scratch("jobs-seq");
+        let task = task_ir();
+        let mut policy = FakePolicy { target: 0.2 };
+        let mut frames = state_frames();
+        let mut sink = FrameSink::new(&dir);
+        let (report, lock) = Evaluation::run_with_frames::<FakeBackend, _, NJ, H>(
+            &ir,
+            &task,
+            &scene(),
+            &obs,
+            &mut policy,
+            &deployment_ir(),
+            FakeBackend::new,
+            &RunConfig::default(),
+            Some(&mut frames),
+            Some(&mut sink),
+        )
+        .expect("the sequential run");
+        read_artifacts(&report, &lock, &sink, &dir)
+    };
+
+    let one = sharded(&ir, &obs, 1, &scratch("jobs-1"));
+    let four = sharded(&ir, &obs, 4, &scratch("jobs-4"));
+
+    for (jobs, got) in [(1, &one), (4, &four)] {
+        assert_eq!(
+            String::from_utf8_lossy(&got.0),
+            String::from_utf8_lossy(&sequential.0),
+            "--jobs {jobs} moved report.json"
+        );
+        assert_eq!(got.1, sequential.1, "--jobs {jobs} moved evaluation.lock");
+        assert_eq!(
+            String::from_utf8_lossy(&got.2),
+            String::from_utf8_lossy(&sequential.2),
+            "--jobs {jobs} moved events.json"
+        );
+        assert_eq!(
+            got.3.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            sequential.3.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            "--jobs {jobs} moved which frames exist"
+        );
+        assert_eq!(got.3, sequential.3, "--jobs {jobs} moved the frame bytes");
+    }
+    // The comparison has to be over something: four suites x N_EPISODES cells, each holding a
+    // `layout.json` and at least one frame.
+    let cells = ir.suites.len() * N_EPISODES as usize;
+    assert!(
+        sequential.3.len() > cells * 2,
+        "the fixture rendered {} files over {cells} cells",
+        sequential.3.len()
+    );
+}
+
+/// A worker that died must not become a report over the suites that survived: a merge that
+/// does not cover every cell exactly once is refused, and the refusal names what it got
+/// (spec 10.4).
+#[test]
+fn a_merge_missing_a_cell_is_refused() {
+    let (ir, obs) = four_suite_image_ir();
+    let task = task_ir();
+    let (deploy, cfg) = (deployment_ir(), RunConfig::default());
+    let dir = scratch("jobs-lost");
+
+    let mut shards = Vec::new();
+    for i in 0..4 {
+        let mut policy = FakePolicy { target: 0.2 };
+        let mut frames = state_frames();
+        shards.push(
+            Evaluation::run_shard::<FakeBackend, _, NJ, H>(
+                &ir,
+                &task,
+                &scene(),
+                &obs,
+                &mut policy,
+                &deploy,
+                FakeBackend::new,
+                &cfg,
+                Some(&mut frames),
+                Some(&dir),
+                (i, 4),
+            )
+            .expect("the shard runs"),
+        );
+    }
+    let policy = FakePolicy { target: 0.2 };
+    shards.remove(2);
+    let err = Evaluation::merge(&ir, &task, &obs, &deploy, &policy, &cfg, &shards)
+        .expect_err("a merge missing a cell is not a report");
+    let message = err.to_string();
+    assert!(matches!(err, EvalError::Shard(_)), "{message}");
+    assert!(message.contains("[0, 1, 3]"), "{message}");
+
+    // The same four shards, all present, do produce one.
+    assert!(
+        Evaluation::run_shard::<FakeBackend, _, NJ, H>(
+            &ir,
+            &task,
+            &scene(),
+            &obs,
+            &mut FakePolicy { target: 0.2 },
+            &deploy,
+            FakeBackend::new,
+            &cfg,
+            Some(&mut state_frames()),
+            Some(&dir),
+            (0, 0),
+        )
+        .is_err(),
+        "a zero-count partition is not a partition"
+    );
+}

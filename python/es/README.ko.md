@@ -54,7 +54,8 @@ es policy lower --policy untrained.esb --out build/
 es dataset bake --policy untrained.esb --out baked/ --frames tiles/ ds/
 <venv>/bin/python python/es/train_act.py --module build/ --baked baked/ --out model.safetensors \
     [--epochs N] [--batch N] [--lr F] [--seed N] [--device cuda] \
-    [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json]
+    [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json] \
+    [--resident-gpu] [--amp bf16] [--compile]
 es policy pack --policy untrained.esb --weights model.safetensors --out trained.esb
 ```
 
@@ -81,6 +82,12 @@ es policy pack --policy untrained.esb --weights model.safetensors --out trained.
   "조용히 0" 실패 모드가 은퇴한다;
 - 로워링된 모듈은 single-sample이므로, `--batch N`은 배치 forward 한 번이 아니라 N개 샘플을
   한 optimizer step으로 누적한다.
+
+속도 플래그 셋(M5 V5, 설계 노트 섹션 7.11)은 숫자를 움직이느냐로 갈린다. `--resident-gpu`는 베이크된
+세트를 샘플마다가 아니라 한 번에 `--device`로 올리며 같은 `--seed`에서 기본 경로와 **비트 단위로
+동일**하다. `--amp bf16`과 `--compile`은 비트를 바꾸고, 그래서 옵트인이다. `--batch`의 기본값이 8인
+이유는 설계 노트의 측정 실행이 8이기 때문이다. 올릴 때는 `--lr`을 선형으로 같이 올린다
+(`--batch 32 --lr 4e-4`).
 
 `torch`와 `torchvision`이 설치된 Python이 필요하다. `pyarrow`는 더 이상 여기서 읽지 않는다 —
 데이터셋 읽기는 `es dataset bake`가 Rust로 한다.

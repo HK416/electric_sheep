@@ -28,7 +28,7 @@ pub use metrics::compute;
 pub use perturb::{LightOverride, PerturbationPlan, ResetOverrides, StepState};
 pub use runner::{
     write_artifacts, BackendCaps, Evaluation, EvaluationLock, EventSource, FrameSink, RunConfig,
-    StepEvent,
+    Shard, ShardCell, StepEvent,
 };
 
 /// Everything that stops an evaluation from producing a report.
@@ -65,6 +65,10 @@ pub enum EvalError {
     },
     #[error("evaluation IR is not valid: {0}")]
     InvalidIr(String),
+    /// A `--jobs N` partition that is not one: an out-of-range shard, or a merge whose workers
+    /// do not cover every cell exactly once. Never a partial report (§10.4).
+    #[error("shard: {0}")]
+    Shard(String),
     #[error("observation plan: {0}")]
     Plan(String),
     #[error("policy: {0}")]

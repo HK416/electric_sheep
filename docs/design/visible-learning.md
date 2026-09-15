@@ -1065,6 +1065,84 @@ still does not work, but it now fails for a reason with a number attached to it.
 copies through the server's `ffmpeg 7.0.2`. The mp4 is not in the hash chain (section 9); the
 frames are.
 
+### 7.11 As built (V5 phase 1): the fast cycle, and the split that was not available
+
+Packet `docs/packets/M5/V5-fast-cycle.md`. One collect -> train -> evaluate cycle is measured at
+roughly an hour, sequential: ~5 min for the nominal 16 episodes, ~28 min for the 6-suite
+96-episode run, ~11 min for 20,000 training steps at batch 8. V5 cuts it **without changing a
+number**: nothing here is allowed to move a success rate, a loss or a frame.
+
+**1. The episode-level split does not exist, and saying so is the finding.** The obvious design —
+one worker per episode — is unavailable, and not for a reason that more code fixes. Inside one
+**cell** (one suite, all of its episodes) `Evaluation::run_with_frames` keeps one `Env`, one
+`SafetyPlane` and one monotonic chunk `seq` for the whole cell, and `Env::reset` bumps a per-env
+episode counter (`crates/es-env/src/env.rs:224`) that keys the task's own `RandomizationPlan`.
+Episode 5's initial state is therefore not reproducible without having run episodes 0..4; the safety
+counters behind `envelope_violation_rate` and `chunk_underrun_rate` are cell-level sums; and
+`env.metrics()` accumulates over the cell. A per-episode worker would have to either re-run the
+episodes before its own (no speedup) or produce different numbers (not allowed). Seeking the
+episode counter is an `es-env` change, which this packet forbids itself.
+
+A **cell**, by contrast, is genuinely self-contained: its own `Env`, its own `SafetyPlane`, `seq`
+from 0, `plan.reset()` on every episode including its first. The two things cells share are the
+compiled `CpuPlan` — reset per episode, so a freshly compiled plan and a reset one are the same
+plan — and the `PolicyRuntime`, which is feed-forward (`TorchRuntime::infer` keeps no state between
+calls; the temporal window lives in the plan). **So `--jobs N` partitions the cells,
+round-robin: cell `c` belongs to shard `c % N`.** The demo's six suites are where its 28 minutes
+are; the nominal run is one suite and gets nothing, and `N` is clamped to the suite count.
+
+**2. The sequential path is the sharded path with one shard.** `Evaluation::run_shard` runs the
+cells a shard owns and judges nothing; `Evaluation::merge` sorts every worker's cells by their
+index into `EvaluationIr::suites` (a stable sort, so the metric order inside a cell is untouched)
+and computes `judge`, the hash chain, `report.json` and `evaluation.lock` — once, in the parent.
+`run_with_frames` is now literally `run_shard((0, 1))` followed by `merge`, so byte-identity
+between `--jobs 1` and the old path is by construction rather than by a second implementation
+(spec 3.5 tier 1). The workers are processes, not threads, because the physics backend is a Python
+subprocess with one env in it and `TorchRuntime` holds another; threads would queue behind the same
+two interpreters.
+
+Frames need no merge step at all: a cell writes into `<frames>/<suite>-<NN>/`, cell names are
+globally unique and shards own disjoint cells, so the children write into one directory without
+colliding. Each hands back its slice of `events.json` and the parent concatenates the (disjoint)
+maps.
+
+**3. A lost worker is an error, never a short report.** A merge whose cells are not exactly
+`0..suites.len()`, each once, is `EvalError::Shard` naming what it got. Without that check a run
+that lost one child would produce a report over five suites carrying a perfectly correct
+`evaluation_hash` — the worst available failure mode, because it is indistinguishable from a real
+measurement. At the CLI a failed child is one named error carrying the shard, its exit code and its
+last line of stderr.
+
+**4. Two of the nine metrics are already not reproducible, and `--jobs` makes that visible.**
+`physics_steps_per_sec` and `actions_per_sec` are `EnvMetrics::simulation_wall` divided into a
+counter, so a sharded run measures each worker's own clock. They move run-to-run in the sequential
+path too; the demo's `evaluation.toml` declares neither and neither does the oracle fixture. This
+is recorded rather than fixed — the fix is `es-env`'s, and no number in this note depends on it.
+
+**5. The training flags, and which of them are honest to quote.** `--resident-gpu` moves the whole
+baked set onto the device once instead of copying one sample per forward. It changes *where* the
+tensors live and nothing else, so the loss curve — and the checkpoint — are **bit-identical** to
+the default path at the same seed, which `resident_gpu_does_not_move_the_loss` pins by comparing
+two `--loss-curve` files as bytes. `--amp bf16` and `--compile` are opt-in **because** they change
+the bits: measured locally on the fixture, 40 steps at batch 4 give `initial_loss`
+0.5596105996519327 at fp32 and 0.5595557652413845 under bf16 autocast. `--batch` stays at 8 so the
+numbers above stay reproducible; the documented convention for raising it is linear `--lr` scaling
+(`--batch 32 --lr 4e-4`).
+
+**6. Not measured yet.** Every timing claim for this section is phase 2, on the oracle server:
+
+| what | Target | Status |
+| --- | --- | --- |
+| 6-suite 96-episode run at `--jobs 6` | ~5-6 min, from 28 min | **unverified** |
+| its `report.json` / `events.json` against the sequential run | byte-identical | **unverified** |
+| 20,000 steps at batch 8, `--resident-gpu` | faster than 11 min | **unverified** |
+| the same with `--amp bf16` | faster still, different bits | **unverified** |
+
+One local limitation worth recording so it is not rediscovered: `--compile` cannot be exercised on
+the Windows development box — `torch._inductor` reads its templates with the ANSI codepage and dies
+on a `UnicodeDecodeError` under a `cp949` locale. That is torch's bug, not this script's; the flag
+is wired and gets its measurement on the Linux server.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
