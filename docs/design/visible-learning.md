@@ -3110,6 +3110,276 @@ the commanded `grip_closed`, pinned in `crates/es/tests/cli.rs`) and has no reas
 opening any better.
 
 
+### 7.24 As built (V16): the release is not a function of the observation
+
+Packet `docs/packets/M5/V16-the-hand-opens.md`. V15 left one channel of a six-wide L1
+regression and four questions about it. All four are answered here, and the answer is not the
+one any of the three candidate fixes was aimed at: **at the moment the demonstrations open the
+hand, the policy's entire input is frozen, and the target is not.**
+
+Every table below is over V15's own artefacts — the 200-demonstration baked set,
+`model-40000.safetensors`, the lowered `build/`, the `.estraj` and the rendered tiles of the
+40,000-step evaluation — with each input port rebuilt exactly as the Observation IR builds it
+(`joint_state` → `(q + 1) / 2`, `sim_cube_pose` → `(p + 0.3) / 0.6`, `rgb_overhead` →
+`U8 HWC / 255` to CHW). The scripts are `~/artifacts/plan-v/v16/part1{,b,c,d}.py`.
+
+**1. Open-loop at the release, the policy predicts the opening, and early.** Twenty training
+demonstrations, onset = one past the last frame commanding the jaw shut (V15's `tail` start),
+median onset frame 163 of 184. Mean over the twenty:
+
+| rel | target | row 0 | row 2 | row 4 | row 6 | row 9 | arm `|P9−P0|` | recorded `|a+9−a|` |
+|---|---|---|---|---|---|---|---|---|
+| −9 | −0.046 | −0.041 | −0.039 | −0.040 | −0.050 | −0.033 | 0.2016 | 0.1892 |
+| −7 | −0.046 | −0.040 | −0.039 | −0.042 | −0.048 | **0.007** | 0.1101 | 0.1033 |
+| −5 | −0.046 | −0.039 | −0.039 | −0.038 | −0.027 | 0.073 | 0.0534 | 0.0360 |
+| −3 | −0.046 | −0.039 | −0.034 | −0.013 | 0.031 | 0.177 | 0.0193 | 0.0008 |
+| −1 | −0.045 | −0.031 | −0.002 | 0.053 | 0.133 | 0.308 | 0.0165 | 0.0036 |
+| **0** | −0.036 | −0.012 | 0.040 | 0.118 | 0.216 | 0.391 | 0.0138 | 0.0000 |
+| +2 | 0.006 | 0.049 | 0.139 | 0.243 | 0.347 | 0.498 | 0.0138 | 0.0000 |
+| +4 | 0.080 | **0.129** | 0.246 | 0.352 | 0.439 | 0.563 | 0.0157 | 0.0000 |
+| +8 | 0.306 | 0.318 | 0.431 | 0.501 | 0.566 | 0.711 | 0.0165 | 0.0000 |
+| +12 | 0.498 | 0.505 | 0.580 | 0.660 | 0.753 | 0.848 | 0.0249 | 0.0000 |
+| +14 | 0.568 | 0.573 | 0.677 | 0.767 | 0.827 | 0.851 | 0.0286 | 0.0000 |
+
+Row 9 lifts off the hold value seven frames *before* the onset and row 0 crosses
+`grip_closed + 0.1` at onset+3 (median; min −1, max +3) in **20 of 20** demonstrations. The
+predictions track the recorded ramp within about 0.05 rad and, from onset to onset+6, lead it.
+The arm rows predict *stationary*, not "keep lowering": `|P9 − P0|` is 0.014 rad at the onset
+against a recorded 0.000. **The open-loop fit is not the defect.** V13's 0.016 rad gripper
+residual was an average over the whole episode and it is not concentrated here.
+
+**2. The closed-loop hold is on the manifold, and nothing in the state can move it.** Eight
+carrying episodes of V15's 40,000-step suites, sampled 300 control ticks after the cube entered
+the bin, against the mean release-onset state of all 200 demonstrations, in the policy's
+normalized input space:
+
+| dim | hold | demo onset | gap | gap / σ | raw gap |
+|---|---|---|---|---|---|
+| `shoulder_pan` | 0.8853 | 0.8864 | −0.0011 | −1077 | −0.0022 rad |
+| `shoulder_lift` | 0.2132 | 0.2176 | −0.0044 | −6.5 | **−0.0088 rad** |
+| `elbow_flex` | 0.8325 | 0.8309 | +0.0016 | +54 | +0.0033 rad |
+| `wrist_flex` | 1.2309 | 1.2322 | −0.0013 | −750 | −0.0025 rad |
+| `wrist_roll` | 0.5009 | 0.5000 | +0.0009 | +891 | +0.0018 rad |
+| `gripper` | 0.5467 | 0.5469 | −0.0002 | −0.4 | −0.0003 rad |
+| `cube_x` / `cube_y` / `cube_z` | 0.7211 / 0.3408 / 0.6040 | 0.7234 / 0.3436 / 0.6027 | −0.0023 / −0.0028 / +0.0013 | −1.9 / −2.5 / +0.4 | −1.4 / −1.7 / +0.8 mm |
+
+L2 distance hold → demo onset, normalized: **0.0120** (arm alone 0.0050, cube alone 0.0109).
+The largest raw gap is 8.8 mrad on `shoulder_lift`; every other arm joint is within 3.3 mrad and
+the cube within 1.7 mm. Open-loop at that hold the module predicts, mean of the eight episodes,
+gripper rows
+
+```
+-0.039  -0.036  -0.027  -0.018  0.002  0.025  0.053  0.105  0.150  0.203
+```
+
+— the same ramp shape as the demonstration's own onset−3, and row 0 is closed. Then the
+perturbation sweep, on `e40000-train nominal-02` (its own row 0 = −0.0306): moving **any one**
+of the thirteen state dimensions the whole way to the demonstration mean does not lift row 0
+above `grip_closed + 0.1`; moving **all thirteen together** leaves it at −0.0291; feeding the
+hold's state with **demonstration 0's own release-onset tile** leaves it at −0.0287.
+
+Swapping one port at a time between the demonstration's onset and onset+4 frames names why —
+mean over 20 demonstrations, then the same donor swapped into the hold over the 8 carrying
+episodes:
+
+| port swapped in | onset → row 0 | row 9 | hold → row 0 | row 9 |
+|---|---|---|---|---|
+| (none) | −0.0118 | 0.3913 | −0.0387 | 0.2030 |
+| `joint_state` | −0.0119 | 0.3911 | −0.0374 | 0.2048 |
+| `sim_cube_pose` | −0.0118 | 0.3912 | −0.0382 | 0.2042 |
+| **`rgb_overhead`** | **0.1288** | **0.5634** | **0.1344** | **0.5665** |
+| (all three) | 0.1286 | 0.5630 | 0.1358 | 0.5690 |
+
+**The whole release decision is carried by the tile.** Either state port moves row 0 by a
+milliradian; the tile moves it by 0.17 rad and reproduces the entire onset → onset+4 change on
+its own — including *into the hold*, where it lifts the command from −0.039 to +0.134, past the
+0.093 rad at which the jaw stalls on the cube. So the answer to "if it predicts closed at the
+hold but open at the onset, what is the smallest perturbation that flips it" is: **no
+perturbation of the recorded state, and any tile from four frames after a demonstration's
+onset.**
+
+**And the tile signal is smaller than the tile noise.** Per relative frame, the mean per-dimension
+distance of the input from the onset frame's input, over 40 demonstrations (normalized units ×1000):
+
+| rel | `shoulder_lift` | `gripper` | `cube_z` | tile | target grip |
+|---|---|---|---|---|---|
+| −15 | 252.51 | 0.68 | 94.12 | 42.22 | −0.0460 |
+| −5 | 28.88 | 0.06 | 9.99 | 7.95 | −0.0459 |
+| −2 | **0.32** | 0.02 | 0.14 | **0.18** | −0.0459 |
+| 0 | 0.00 | 0.00 | 0.00 | 0.00 | −0.0360 |
+| +2 | **0.89** | 0.02 | 0.13 | **0.38** | 0.0060 |
+| +4 | 1.12 | 0.05 | 0.24 | 0.40 | **0.0799** |
+| +5 | 1.12 | 0.06 | 0.25 | 0.41 | 0.1289 |
+| +6 | 1.14 | **11.60** | 0.23 | 0.41 | 0.1858 |
+| +9 | 1.15 | 104.85 | 29.27 | 0.58 | 0.3658 |
+
+From onset−2 to onset+5 the **entire input is frozen** — no dimension moves by more than
+1.2 × 10⁻³ normalized, the tile by 4.3 × 10⁻⁴ — while the target ramps from −0.046 to
++0.129 rad. The gripper joint itself only starts reading differently at onset+6, which is the
+tick the command finally crosses the stall angle. Counted directly: the frames of a
+demonstration whose every input dimension is within 0.002 of the onset frame's number **6**
+(median of 40) and carry gripper targets from −0.0460 to +0.0807 with a median of **+0.0057 rad**.
+
+That median is the whole result. An L1 fit over a one-to-many cluster returns the conditional
+median, and V15's measured closed-loop command at the hold is **+0.0071 rad** — 1.4 mrad from
+the number the cluster predicts. The jaw stalls on the 30 mm cube at 0.093 rad, so any command
+below 0.093 leaves the measured joint, and therefore the whole observation, exactly where it
+was. **The hold is an arithmetic fixed point, not a generalization failure.**
+
+Two things make it inescapable inside this packet's scope. The frozen window is ~6 control
+ticks long because the Deployment IR's `acceleration_max = 20 rad/s²` allows 0.008 rad of
+change in the per-tick step at 50 Hz, so a command travelling the 0.143 rad from `grip_closed`
+to the stall angle needs about six ticks from rest — the envelope puts the window there, and
+the envelope is forbidden here. And the distance from a closed-loop hold tile to the *nearest*
+tile of the matched demonstration is 6.2 × 10⁻⁴ to 2.9 × 10⁻³ (nearest frame at onset ± 3 in
+8 of 8 episodes), i.e. **1.5 to 6.8 times the entire release signal** — so what separates
+"hold" from "open now" is below what separates the closed loop from its own training data.
+Collection and evaluation do render identically: at tick 0 of the same seed the two tiles are
+bit-identical, and they diverge afterwards only because the expert and the policy command
+differently.
+
+**3. There is no unnormalizer, so there is no scale to be wrong.** The demo's Learning IR graph
+is `VisionEncoder`, two `StateEncoder`s, `Fusion`, `TemporalEncoder`, `PolicyHead`,
+`ActionChunker` — **no `Unnormalizer` node**. The `actions` output declares
+`Normalized { lo: −1, hi: 1 }` and nothing applies it; `es dataset bake` writes the recorded
+`action` column through unchanged (`crates/es/src/cmd/dataset.rs:289`). Target, prediction and
+actuator command are all radians on the demonstrations' own scale. **No rescaling is warranted
+and no IR document change is owed.** The distributions, one sample every 5 control ticks of a
+carrying episode:
+
+| | n | min | p05 | p50 | p95 | max | below the soft bound |
+|---|---|---|---|---|---|---|---|
+| grasp + carry | 25 | −0.0453 | −0.0449 | −0.0308 | 0.9121 | 0.9294 | 0.0 % |
+| **hold** | 170 | −0.0407 | −0.0402 | **−0.0394** | −0.0257 | −0.0153 | **0.0 %** |
+| demonstrations, 40 frames before onset | — | −0.0480 | — | −0.0461 | — | −0.0339 | — |
+| demonstrations, the release tail | — | −0.0364 | — | 0.4177 | — | 0.8646 | — |
+
+The policy's closed regression is −0.039, *inside* the demonstrations' −0.048 … −0.034. **The
+packet's premise about the soft bound needs a correction**: the −0.1245 pinning on 30 – 63 % of
+ticks is not the carrying episodes' hold. V15's own per-episode table shows it — the final
+gripper reading is 0.086 – 0.093 in every carrying episode and −0.125 only in the ones that
+never grasped, where the jaw is *empty* and a command of −0.04 drives the free joint to its
+clamp. The gripper is still the only joint ever clamped, but the clamping is a symptom of the
+failed grasps, not of the hold.
+
+**4. The ensemble is not the obstacle; it is the only thing helping.** `es_eval::runner` invokes
+the policy once per **control** tick, so a chunk is pushed every tick, its span is `valid = 10`
+rows, `CHUNK_SLOTS = 8` caps the overlap at eight, and `w_i = exp(−0.01 i)` is within 6.8 % of
+uniform: the executed command is the near-uniform mean of rows 0..7 of the eight most recent
+chunks.
+
+| demonstration 0, its own release | newest chunk row 0 | the ensemble |
+|---|---|---|
+| crosses the midpoint 0.426 at | onset + 10 ticks | onset + **11** ticks |
+| peak reached (target peak 0.900) | 0.847 | **0.838** |
+
+**One control tick of lag and 1 % of attenuation** on the step the demonstrations actually
+contain. At the hold the sign reverses — 400 ticks from the carry of `e40000-train nominal-02`:
+
+| | min | median | max | ticks above `grip_closed + 0.1` |
+|---|---|---|---|---|
+| newest chunk row 0 only (what `HardSwitch` would execute) | −0.0428 | **−0.0394** | −0.0061 | 0 / 400 |
+| the temporal ensemble (what runs) | −0.0435 | **+0.0071** | +0.0408 | 0 / 400 |
+
+The blend moves the gripper command **0.047 rad toward the release**, because it averages rows
+0..7 of a rising ramp. Neither series reaches the 0.093 stall. **Candidate (b) is refuted by
+measurement: the Deployment IR's other `execution` variants all lower to `HardSwitch`
+(`es_eval::runner::blend_of`), which is strictly worse here, so V15's bundle was not re-run
+under one.** Candidate (c) is refuted by table 2: the hold's thirteen recorded state dimensions
+are within 1 – 9 mrad and 1.7 mm of the release manifold and none of them, alone or together,
+flips the prediction — and the data-side repair it suggested (jittering the expert's `Lower`
+target) widens the frozen cluster instead of unfreezing it, which makes the conditional median
+worse, not better.
+
+What table 4 does turn up is the largest single lever anyone has measured on this failure, and
+it is not this packet's variable. `deployment.toml` declares `rate.inference = 5 Hz` against
+`rate.control = 50 Hz` and `learning.toml` declares `replanning_hz = 5.0`, but the evaluation
+runner replans every control tick, so the chunk's later rows are never executed. Under the
+declared 5 Hz — one chunk every ten control ticks, driving its own rows 0..9 in order — the
+commanded gripper at the hold would walk −0.039 → 0.203 and cross the 0.093 stall at row 7 or
+8 in **8 of the 8 carrying episodes**. That is open question 23.
+
+**Part 2 — the weighting, and the prediction it confirmed.** Candidate (b) is refuted by table
+4 and (c) by table 2, so (a) is what moved, and it is also the knob the packet asked for. The
+diagnosis predicts it will not be enough — a channel weight multiplies a channel's error and
+cannot move the conditional median of a frozen cluster — and the run is worth its twenty-two
+minutes precisely because it makes that prediction falsifiable: the module already separates
+the onset from onset+4 by 0.14 rad on a 4.3 × 10⁻⁴ tile signal, and five times the gradient is
+five times the incentive to sharpen that separation.
+
+`python/es/train_act.py --channel-weight 5=5`: `(|d| * w).mean()` with `w = [1,1,1,1,1,5]`, one
+flag, and `w = 1` everywhere is `l1_loss` exactly — which the oracle
+`channel_weight_of_one_is_the_unweighted_loss` pins byte for byte, so every loss curve in this
+section stays comparable. Nothing else moved: V15's baked set, V15's lowered module
+(`lowering_hash 70a8fec7…`), V15's untrained bundle, 40,000 steps, batch 8, lr 1e-4, seed 0,
+`--resident-gpu`. The flag enters no hash slot (spec 8.1), so `task_hash eb6efefa…`,
+`observation_hash 899c16a9…`, `learning_hash 5dac0a46…` and `deployment_hash` are all V15's
+and only the weight bytes move (`policy_hash` → `47516aa7…`). Training loss 0.0920 → 0.0241 is
+the *weighted* objective and is not comparable to V15's 0.0476 → 0.0146; the comparable number
+is the unweighted open-loop L1:
+
+| open-loop, 6 demonstrations, every 3rd frame | V15 | **V16 (gripper ×5)** |
+|---|---|---|
+| chunk L1, all six channels, unweighted | 0.0116 | 0.0134 |
+| chunk L1, the gripper channel alone | 0.0095 | **0.0109** |
+
+The gripper channel's own unweighted error got *worse*, which is what moving an objective away
+from its unweighted optimum does. What the weighting did change is the shape of the ramp; what
+it did not change is the row that reaches the actuator. At the hold of V15's eight carrying
+episodes, mean of the eight:
+
+| gripper chunk at the hold | row 0 | row 2 | row 4 | row 6 | row 7 | row 9 | rows 0..7 mean (what the ensemble executes) |
+|---|---|---|---|---|---|---|---|
+| V15 | −0.039 | −0.027 | 0.002 | 0.053 | 0.105 | 0.203 | **+0.0071** |
+| **V16** | **−0.046** | −0.026 | 0.015 | **0.091** | 0.146 | **0.256** | **+0.0214** |
+
+Row 9 rose 26 % and row 6 by 0.038 rad — the ramp is steeper. **Row 0 fell by 7 mrad**, and the
+command the ensemble actually issues is still a quarter of the 0.093 rad stall. Row 0 clears the
+stall in 0 of 8 holds under either checkpoint. That is the one-to-many argument, confirmed by
+the experiment designed to break it.
+
+Closed loop, the same two suites at the same 1,800-step budget:
+
+| nominal suite | V15, 200 demos, 40k | **V16, gripper ×5, 40k** |
+|---|---|---|
+| `success_rate`, training 1–16 | 0 / 16 | **0 / 16** |
+| `success_rate`, held-out 101–116 | 0 / 16 | **0 / 16** (twice, identical) |
+| cube lifted clear, training / held-out | 8 / 16 · 9 / 16 | **5 / 16 · 4 / 16** |
+| carried into the bin, training / held-out | 5 / 16 · 4 / 16 | **0 / 16 · 0 / 16** |
+| **released inside the bin** | 0 / 16 | **0 / 16** |
+| `envelope_violation_rate`, tr / ho | 0.7148 / 0.3381 | **0.0510 / 0.0485** |
+| `violation.position`, tr / ho | 16,529 / 7,801 | **0 / 0** |
+| gripper ticks outside its soft bound, tr / ho | 18,159 (63.1 %) / 8,557 (29.7 %) | **0 (0.0 %) / 0 (0.0 %)** |
+| `episode_length` | 1800 / 1800 | 1800 / 1800 |
+
+Two rows deserve to survive the verdict. `violation.position` is **zero on both suites** and the
+gripper is outside its soft bound on not one of 57,600 control ticks: five times the gradient
+pulled the closed regression from below −0.1245 up to −0.068 … −0.081, inside the envelope. The
+single-joint clamping signature V14 and V15 both reported is gone, and the release did not
+follow it out — which is table 3's conclusion, now confirmed from the Safety Plane's side as
+well as the policy's. And the hand does open: the final gripper reading is 0.89 – 1.39 rad in
+five training and two held-out episodes, every one of them an episode that never grasped. That
+is V15's finding unchanged.
+
+What it cost is the carry. Eight and nine carries became **zero and zero**, and lifts fell from
+8 and 9 to 5 and 4. Five times the gripper channel is one fifth of the relative weight on each
+of the five arm channels, and the arm is what finds the cube and moves it.
+
+**Wall clocks** (observations, not a throughput claim — §12.4): train 40,000 steps 1,331 s on
+the RTX 4090; three 16-episode nominal suites with frames at the 1,800-step budget 1,583 s;
+Part 1's four analyses about four minutes in total on the CPU.
+
+**Verdict.** The single variable moved, the prediction held, and the fix is refuted by its own
+measurement: the gripper's ramp got 26 % steeper at row 9 and 7 mrad *shallower* at row 0 —
+the only row that reaches the actuator — and the closed loop lost every carry it had. Held-out
+`success_rate` is 0, below the unchanged acceptance threshold of 0.5, so the stop rule fires:
+no six-suite sweep, no showcase videos, no second variable. **V15's checkpoint is still plan
+V's best policy.** What V16 leaves behind is not a list of things to try next but a measured
+account of why none of the three candidates could have worked — the release is frozen out of
+the observation for six control ticks by the Deployment IR's own acceleration limit, and the
+chunk that already predicts it is never executed past its first row — and two open questions,
+22 and 23, whose defaults a human now has to choose between.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -3445,3 +3715,37 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     tight, budget — but nothing measured needs it. Default: **keep 1,800**, and re-run the
     baseline tables at that budget once a policy releases, since a budget that was never the
     binding constraint is the safer of the two errors.
+22. **The release is not observable, and a memoryless policy cannot be made to see it**
+    (section 7.24, V16). Measured: from onset−2 to onset+5 the whole policy input is frozen to
+    within 1.2 × 10⁻³ normalized (the tile to 4.3 × 10⁻⁴) while the target ramps from −0.046 to
+    +0.129 rad, and the ~6 frames of a demonstration within 0.002 of the onset input carry
+    gripper targets from −0.046 to +0.081 with a median of **+0.0057 rad** — which is what an L1
+    fit returns and, to 1.4 mrad, what the closed loop commands. The window is ~6 control ticks
+    long because the Deployment IR's `acceleration_max = 20 rad/s²` allows 0.008 rad of change
+    in the per-tick step at 50 Hz, so under this envelope **no quantity of demonstrations makes
+    the release a function of the observation.** Three ways out, none of them a fix packet's
+    single variable. **(i) Give the policy a clock**: `TemporalWindow { n_steps > 1 }` in the
+    Observation IR with a matching `observation_window` and `TemporalEncoder { n_frames }` in
+    the Learning IR. It moves `observation_hash` and `learning_hash` and needs a re-bake and a
+    retrain — and on its own it makes things *worse*, because the demonstrations contain no long
+    stationary hold before the release (the measured dwell is a median of 0 frames), so the
+    closed-loop hold's history would be unseen too; it only works paired with a data change.
+    **(ii) Cue the release**: change the expert so the hand opens on something the observation
+    carries — the cube crossing the bin rim, say — so the frozen window has one target rather
+    than six. **(iii) Honour the declared replanning rate** (question 23), so that the chunk,
+    which already predicts the release, is what gets executed. Default: **(iii) first**, because
+    it is measured to cross the stall angle in 8 of the 8 carrying holds and costs no
+    retraining, then (ii).
+23. **`rate.inference = 5 Hz` and `replanning_hz = 5.0` are declared and not honoured**
+    (section 7.24, V16). `es_eval::runner` calls `infer_chunk` once per **control** tick whatever
+    the Deployment IR's `rate.inference` says, so a chunk is pushed every tick and rows 1..9 of
+    it never execute: the temporal ensemble averages rows 0..7 of the eight newest chunks and
+    `HardSwitch` would serve row 0 of the newest. Measured cost at the hold: the commanded
+    gripper is +0.007 rad while the same chunk's rows 7, 8 and 9 are 0.105, 0.150 and 0.203 and
+    would cross the 0.093 rad stall. It is not obviously a defect — inference every control tick
+    with temporal ensembling is a legitimate ACT deployment, and it is what produced every
+    demonstration — but the two documents say 5 Hz and the runtime does 50. Default: **leave it
+    and record it**, because the collection path has the same cadence and moving it re-dates
+    every number in sections 7.11 – 7.24; what a human owes is a decision on what
+    `rate.inference` means when the policy is synchronous, and whichever way it goes, one of the
+    two sides must change.
