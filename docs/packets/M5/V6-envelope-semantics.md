@@ -1,0 +1,241 @@
+# M5 V6 — one envelope semantics for collection and evaluation
+
+Design note: `docs/design/visible-learning.md` **section 7.12**, and sections 7.5–7.10 plus open
+question 12 for how it got here. Spec: §9.3, §9.4, §9.5, Appendix B.4. Read those, and
+`docs/design/safety-plane.md`, before this file. Depends on V1 (the scripted expert and its
+pinned-seed oracle), V1c (the per-episode reset, `action_commanded`) and V3 (the suite and its
+non-vacuity gate).
+
+## the defect
+
+**The evaluation harness fails the expert, so no policy can pass it.**
+
+`Collector::run` seeded the Safety Plane with `observe_state` once per episode.
+`es_eval::runner`, `es_ros2::hil` and `es_runtime_embedded` called it before **every**
+`validate`. `observe_state` overwrote `last_safe`, `prev_safe`, `vel` and `prev_vel` — the four
+fields that stages 3 (velocity), 4 (acceleration) and 7 (rate limit) of the clamp are differences
+of. So the same envelope meant two different things:
+
+| | what `velocity_max` / `acceleration_max` / `action_rate` bounded |
+|---|---|
+| `es loop collect` | the plane's own command, tick to tick |
+| `es eval run`, HIL, embedded | the command **minus the measured joint** — the servo's following error |
+
+With the demo's numbers the binding stage is acceleration and the second reading collapses to
+`a − q − q̇·dt ≤ acceleration_max · dt² = 0.008` rad. The scripted expert paces itself to exactly
+what the Deployment IR allows, passes **50/50** through `es loop collect`, and scores **0 of 16**
+through `es eval run`. Every evaluation cell V3, V2b and V1c ever reported carries
+`envelope_violation_rate 1.0000` and not one step of `ActionSource::Policy` — measured against a
+ceiling of zero.
+
+V1c measured this and could not fix it: `es-safety` was in its `forbidden` list, and closing the
+gap from the collector instead (re-seed every step) drops the expert to 2/8 on its own golden
+threshold. This packet fixes it where it belongs.
+
+## the decision, and the spec lines it rests on
+
+**`velocity_limit`, `acceleration_limit` and `rate_limit` are differences of the plane's own
+commands. The measured state enters the envelope exactly once per episode, as the seed.**
+
+* **§9.3.** The table is *constraints applied to the policy output*, and every dynamic row of it
+  says **clamp**: `velocity_limit` → "관절·EE 속도 상한 / 클램프 + 카운터", `rate_limit` → "액션
+  1차·2차 미분 상한 / 필터링". A measured velocity is not clampable — only the value the plane is
+  about to emit is. The quantity each row bounds must therefore be one of the plane's own.
+* **§9.5.** "**`deployment_hash`가 같으면 안전 동작이 같다** — 이것이 §27.1 증거물의 핵심 주장이다."
+  The same deployment hash must give the same safe action in simulation and on the robot. A clamp
+  computed from feedback cannot: `qvel` is exact in MuJoCo and arrives over a serial bus,
+  quantized and late, from an `STS3215`. Reading it into the envelope would break the claim §9.5
+  calls the core of the evidence bundle, and §3.4's determinism rules with it.
+* **§9.3, again, for what is *not* added.** There is no row for "the command is far from the
+  measurement". `position_limit` and `workspace` are the two rows that bound where a command may
+  go, and neither moves. The orchestrator's standing default — bound the measured velocity and
+  brake toward the measured pose — is **not** taken, because the spec is not silent and §9.5 rules
+  it out.
+* **Physically, for this robot.** SO-101 is six Feetech `STS3215`s driven as MuJoCo `position`
+  actuators: `kp = 998.22`, `kv = 2.731`, `forcerange = ±2.94 N·m`. The loop closes inside the
+  servo — the host sends a goal and the servo makes torque from the error — and
+  `2.94 / 998.22 = 0.0029` rad is where that torque saturates. **Three milliradians of following
+  error already means full torque.** The pre-V6 evaluation bound of `0.008` rad was a bound on the
+  servo's error signal at 2.7× its saturation point: it bounded torque, in the row that says
+  velocity, while `torque_limit` sits two rows above and the model's own `forcerange` already
+  enforces it.
+
+**No number in `tests/fixtures/visible-learning/deployment.toml` moves.** The defect was the
+reference, not the limits. The file gains the derivation of every number it declares — the servo
+ratings behind `velocity_max = 3.0` rad/s and `acceleration_max = 20` rad/s², the fact that the
+two `action_rate` rows are dominated at 50 Hz and exist so the bound does not depend on the control
+rate, and the three limits it declares that `es-safety` does not enforce (`ee_velocity_max`,
+`contact_force_max`, the distance minima: no FK and no contact query in the plane).
+
+## context
+
+```
+crates/es-safety/src/plane.rs
+crates/es-safety/tests/envelope_reference.rs
+crates/es-data/src/collect.rs
+crates/es-eval/src/runner.rs
+crates/es-eval/tests/evaluation.rs
+crates/es-env/src/expert.rs
+crates/es/src/cmd/loop.rs
+crates/es/tests/cli.rs
+tests/fixtures/visible-learning/deployment.toml
+docs/design/safety-plane.md
+docs/design/safety-plane.ko.md
+docs/design/visible-learning.md
+docs/design/visible-learning.ko.md
+docs/packets/M5/V6-envelope-semantics.md
+docs/packets/M5/V6-envelope-semantics.ko.md
+```
+
+`es-ros2` and `es-runtime-embedded` need **no change**: neither has episodes, both construct a
+fresh plane, and both already call `observe_state` before every `validate`. That is the test of
+whether the rule is one rule — if it had needed a per-consumer patch, it would not have been one.
+
+## spec
+
+- **§9.3, §9.5, INV-12.** Nothing is disabled, no envelope number moves, no constraint is skipped.
+  `observe_state` gains a guard; `begin_episode` clears the latch and re-arms the seed, which is
+  strictly less than the `reset_latch` it replaces was already allowed to do.
+- **INV-13.** `SafetyPlane::validate` keeps its signature and still returns no `Result`.
+- **INV-17.** No new trait. One `bool` field, one public method, one `impl` block moved.
+- **§3.4, §3.5.** The plane stays a pure function of its commands and its seed: no float time, no
+  `HashMap`, no RNG, no new transcendental. The seed is a single `observe_state` per episode, which
+  a run records.
+- **§9.6, Appendix B.4.** Still `no_std`-able and still zero-heap: the new field is a `bool` inside
+  the pre-allocated `SafetyState`. `construction_and_validation_allocate_nothing` covers it.
+- **§1.5.** Measured: **+101 / -54 source lines, net +47**, across the five source files —
+  `es-safety` +36, `es-env` +37 (the moved pacing), `es-eval` +5, `es-data` -7, `es` -24 (the
+  pacing left). Every crate stays well inside its cap; tests are excluded, as the rule says.
+
+## oracle
+
+```
+cargo fmt --check
+cargo clippy -p es-safety -p es-eval -p es-data -p es-env -p es-ros2 -p es-runtime-embedded -p es --all-targets -- -D warnings
+cargo clippy -p es --features render --all-targets -- -D warnings
+cargo test -p es-safety -p es-eval -p es-env -p es-data -p es-runtime-embedded
+cargo test -p es-ros2 --test hil_gate
+cargo test -p es --test cli
+cargo xtask layering
+cargo xtask context-budget
+cargo xtask check-spec-refs
+cargo xtask verify-goldens
+cargo xtask ci
+```
+
+- `crates/es-safety/tests/envelope_reference.rs`:
+  **`the_envelope_bounds_commands_not_the_following_error`** — builds a plane from the demo's
+  *committed* `deployment.toml`, drives it with the expert's own pacing rule against a first-order
+  plant that trails by up to `0.1774` rad (22× the old bound), and asserts sixty consecutive
+  `ActionSource::Policy` steps whose output equals the command bit for bit, **and** that a caller
+  observing every tick produces the identical sequence to one observing once. Measured to fail on
+  pre-V6 code at step 1. It also asserts the plant really did trail, so it cannot pass vacuously.
+- `crates/es-safety/tests/envelope_reference.rs`:
+  **`a_command_outside_the_envelope_is_still_clamped`** — V6 widened nothing. 50 rad/s against a
+  3 rad/s limit is still `Clamped`, still `ViolationKind::Acceleration`, still counted.
+- `crates/es-safety/tests/envelope_reference.rs`:
+  **`begin_episode_re_arms_the_seed_and_clears_the_latch`** — a mid-episode measurement never moves
+  the clamp reference; the next episode's first one does.
+- `crates/es-eval/tests/evaluation.rs`:
+  **`the_runner_seeds_the_plane_once_per_episode_and_observes_every_step`** — this crate's half of
+  the call discipline, in the style of the `the_plane_is_never_disabled` scan beside it: one
+  `observe_state`, before the one `validate`, one `begin_episode`, and no bare `reset_latch`.
+- `crates/es-data/tests/loop_learning.rs`: **`a_second_episode_repeats_the_first_exactly`** —
+  V1c's own regression, unchanged and still passing, which is what says the collector's episode
+  boundary still re-seeds now that it goes through `begin_episode`.
+- `crates/es-ros2/tests/hil_gate.rs`: **`v1_fixture_still_replays_identically`** — unchanged and
+  **not regenerated**. `tests/fixtures/hil/v1_small.eshil` carries 120 `observe_state` records with
+  112 distinct values, so a change to the arithmetic would have moved every decision in it; the HIL
+  rig's plant is a perfect position servo, so the two readings coincide there and the log replays
+  byte for byte. That is the measurement, not an assumption.
+- `crates/es-safety/tests/scenarios.rs` (the §28.7 gate 8 suite) and `properties.rs`: **unchanged,
+  no fixture re-pinned.** Every scenario seeds once at the start, which is exactly the discipline
+  V6 makes universal.
+
+**The server oracle** — `crates/es/tests/cli.rs`
+**`expert_passes_the_evaluation_harness`**. Runs `ScriptedExpert` **as the policy** through
+`es_eval::Evaluation` — the real runner, the real plane, the real Task IR success predicate — on
+the same eight pinned seeds `[1, 2, 3, 5, 8, 13, 21, 34]` and the same `0.875` threshold as
+`expert_solves_the_pinned_seeds`, which are now one pair of constants shared by both tests. Only
+`MuJoCoCpuBackend` can drive the SO-101 scene, so it skips with a printed reason without `mujoco`
+and is named here as a server oracle. Two narrowings, both in the test's own doc comment: one
+`Evaluation::run` per seed with one episode each (`Evaluation::run` keys the Task IR's
+randomization by an episode counter and seeds the `Env` from `seeds[0]`, so a single 8-episode cell
+would be eight draws of *one* seed), and a constant 96×96 frame, because the expert reads joints
+and never pixels — which is what lets this oracle need `mujoco` without a Vulkan device.
+
+**V3's non-vacuity rule stays meaningful.** After V6 a `Clamped` step comes from the policy's own
+chunk: consecutive rows differing by more than `acceleration_max · dt² = 0.008` rad, or a row past
+a soft joint limit. Both are reachable in **every** suite including `nominal` — V1c's
+widened-envelope diagnostic measured the trained policy as "almost all `violation.position`", the
+soft-limit stage, which V6 does not touch — and `torque_noise` / `backlash` remain the suites most
+likely to push the policy into them by moving the arm out from under its own chunk. Locally the
+reachability is pinned without a policy at all by `a_command_outside_the_envelope_is_still_clamped`
+(`es-safety`) and by `the_envelope_violation_rate_rises_when_the_policy_leaves_the_envelope` and
+`a_tightened_envelope_clamps_and_a_widened_one_does_not` (`es-eval`). Whether the trained bundle
+still trips it is a phase-2 measurement; if it stops, that is a finding to report, not a number to
+force.
+
+**Phase 2, on the oracle server** (`ES_PYTHON`, `~/venvs/es-lerobot-cuda/bin/python`; nothing is
+retrained and no knob moves):
+
+```
+cargo test -p es --test cli expert_passes_the_evaluation_harness -- --nocapture
+cargo test -p es --test cli expert_solves_the_pinned_seeds       -- --nocapture   # still 8/8
+es eval run --config tests/fixtures/visible-learning/evaluation.toml \
+            --policy ~/artifacts/plan-v/v1c/trained-20000.esb --frames … --jobs 6
+```
+
+The first is the packet's own gate. The second and third re-measure V1c's committed 20,000-step
+bundle — the nominal 16 and the six-suite 96 — under the corrected envelope semantics, against the
+V1c tables in design note section 7.10. `evaluation.toml`'s `success_rate >= 0.5` is not lowered;
+whatever comes out is reported against it.
+
+## acceptance
+
+```rust
+// crates/es-safety/src/plane.rs
+impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
+    /// Seeds the command chain from the measured joint state. Only the first call after
+    /// `begin_episode` (or after construction) moves anything, so every consumer may call it
+    /// before every `validate` and all of them get the same envelope.
+    pub fn observe_state(&mut self, q: &[f64; NJ], qd: &[f64; NJ]);
+
+    /// Clears the e-stop latch and re-arms the seed. Not a way to weaken anything (INV-12).
+    pub fn begin_episode(&mut self);
+}
+
+// crates/es-env/src/expert.rs
+impl ExpertCfg {
+    /// Paces the expert to the envelope it will be driven through. `replan_every` is how many
+    /// rows of each chunk execute before the caller asks for another: `es loop collect` passes
+    /// `action.execute_chunk`, `es_eval::runner` passes 1.
+    pub fn pace_to(&mut self, deploy: &es_ir::deployment::DeploymentIr, replan_every: u32);
+}
+```
+
+- One rule, enforced in one place. `observe_state` decides what a measurement means; no consumer
+  decides it locally. Collection, evaluation, HIL and embedded all call it before every `validate`.
+- `Collector::run` loses its `if frame == 0`; `run_episode` loses its `reset_latch`. Both call
+  `begin_episode` at the episode boundary.
+- `validate` keeps its signature (INV-13); no path disables or bypasses the plane (INV-12); no new
+  trait (INV-17); no envelope number moves; no golden is edited and no safety scenario is re-pinned.
+- `deployment.toml` gains prose only. `deployment_hash` does not move, so every packed bundle,
+  `evaluation.toml` and `.eshil` header stays valid.
+- `tests/fixtures/hil/v1_small.eshil` is not regenerated and still replays byte for byte.
+
+## forbidden
+
+- Changing any limit in `tests/fixtures/visible-learning/deployment.toml`, or any threshold
+  anywhere — `expert_solves_the_pinned_seeds`' `0.875`, `evaluation.toml`'s `success_rate >= 0.5`,
+  V3's non-vacuity gate. A measurement that fails its acceptance is reported as failing it.
+- Adding a bypass, a `cfg`, a feature flag or a test hook that weakens the plane (INV-12), or
+  giving `validate` a `Result` (INV-13), or making `es-safety` depend on `es-policy` (INV-11).
+- A new extension point, a new trait, or a `PolicyRuntime` method for episode boundaries. The V6
+  oracle's expert-as-policy is a test scaffold and lives in the test file.
+- Fixing the two asymmetries section 7.12 finding 6 records — the evaluation runner's per-tick
+  replan and its extra reset. Both move every evaluation number plan V has reported, and neither is
+  an envelope question. They are open question 13.
+- Retraining anything. Phase 2 re-measures V1c's committed bundle and changes no training knob.
+- `crates/es-ros2/**` and `crates/es-runtime-embedded/**` source. If the rule needed a patch there,
+  it was not one rule.

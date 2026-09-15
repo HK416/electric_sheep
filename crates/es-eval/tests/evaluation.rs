@@ -1286,6 +1286,35 @@ fn the_plane_is_never_disabled() {
     assert_eq!(validates, 1, "exactly one call site, in the step loop");
 }
 
+/// Packet M5/V6: this crate's half of the one envelope semantics. The runner observes before
+/// **every** `validate` and opens every episode with `begin_episode`, exactly as
+/// `es_data::Collector` does -- what those two calls *mean* is `SafetyPlane`'s to decide
+/// (`crates/es-safety/tests/envelope_reference.rs`), and neither consumer may decide it
+/// locally again. A source scan, because the property is about call discipline rather than
+/// about a value this crate can read back.
+#[test]
+fn the_runner_seeds_the_plane_once_per_episode_and_observes_every_step() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runner.rs");
+    let text = std::fs::read_to_string(&path).expect("src/runner.rs");
+    assert_eq!(
+        text.matches("safety.observe_state(").count(),
+        1,
+        "one observation, in the step loop, before the one `safety.validate(`"
+    );
+    assert_eq!(
+        text.matches("safety.begin_episode()").count(),
+        1,
+        "one episode boundary, at the top of `run_episode`"
+    );
+    assert!(
+        !text.contains("safety.reset_latch()"),
+        "`begin_episode` is the episode boundary: clearing only the latch leaves the command          chain anchored on the previous episode's last command (packet M5/V1c, M5/V6)"
+    );
+    let observe = text.find("safety.observe_state(").expect("the observation");
+    let validate = text.find("safety.validate(").expect("the validation");
+    assert!(observe < validate, "the observation comes first");
+}
+
 /// The two lighting kernels are arithmetic on the scene and on the light direction, so they
 /// are checkable without a device: the gain multiplies every colour, the yaw turns the
 /// direction about `+Z`, and both are the identity when nothing was drawn.

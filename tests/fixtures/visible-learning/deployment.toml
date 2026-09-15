@@ -8,6 +8,39 @@
 # acceleration and the action-rate limits are chosen for the 50 Hz control tick and are the
 # knob V3 turns.
 #
+# What every number is, physically (packet M5/V6; no number below moved, the defect V6 fixed
+# was what the plane measures them *against*, not the limits themselves):
+#
+#  * The arm is six Feetech `STS3215` serial-bus servos, and the scene drives them as MuJoCo
+#    `position` actuators: `kp = 998.22`, `kv = 2.731`, `forcerange = +/-2.94 N m`
+#    (tests/fixtures/mjcf/so101_pick_place.xml, `class="sts3215"`). That is a PD loop closed
+#    *inside* the servo: the host sends a goal position and the servo makes torque out of the
+#    error. `2.94 / 998.22 = 0.0029` rad is where it saturates -- **a following error of three
+#    milliradians already means full torque**, and under load it is larger still. So the gap
+#    between a command and the measured joint is the servo's *input*, not a velocity, and an
+#    envelope that bounded it would be bounding torque, which is `torque_max`'s row.
+#  * `velocity_max = 3.0` rad/s. The STS3215 is rated about 0.238 s per 60 deg at 7.4 V, i.e.
+#    ~4.4 rad/s unloaded; 3.0 rad/s is roughly two thirds of that, which is about where it
+#    runs holding the arm up. At 50 Hz that is `0.06` rad (3.4 deg) of commanded motion per
+#    control tick.
+#  * `acceleration_max = 20.0` rad/s^2: 3.0 rad/s is reached in 0.15 s, 7.5 control ticks.
+#    Feasible with margin -- the rotor alone (`armature = 0.028`) costs `0.028 * 20 = 0.56`
+#    N m, a fifth of the stall torque, and the links are grams -- which is the point: a
+#    command stream inside this bound is one the servo can actually follow, so the commanded
+#    and the measured trajectory stay close. At 50 Hz it allows `0.008` rad of change in the
+#    per-tick step, and it is the stage that binds.
+#  * `action_rate.first_diff_max = 0.08` (4.0 rad/s) and `second_diff_max = 0.04` rad
+#    (100 rad/s^2) are both looser than the two rows above at this control rate, so at 50 Hz
+#    neither ever fires. They are the rate backstop for a control rate this file does not
+#    have: spec 9.3 bounds the *action's* first and second difference in action units, and
+#    that bound must not depend on `rate.control` being 50 Hz.
+#  * `position_soft_margin = 0.05` rad (2.9 deg) inside the scene's own joint ranges.
+#  * `ee_velocity_max = 0.6` m/s and `contact_force_max`, `min_self_distance`,
+#    `min_env_distance` are declared and **not enforced by `es-safety`** -- there is no
+#    forward kinematics and no contact query in the plane (docs/design/safety-plane.md,
+#    "not implemented"). They are documented limits, not live ones, and saying so here is
+#    cheaper than a reader assuming otherwise.
+#
 # `envelope_violation_rate` is deliberately loose (packet M5/V1). Everything on this path
 # commands *joint positions*: a chunk carries where the arm should be, and the plane turns
 # each chunk into motion the envelope allows -- so a demonstration that asks for a pose the

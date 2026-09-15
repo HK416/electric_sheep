@@ -24,7 +24,9 @@ pub struct SafetyState<const NJ: usize, const H: usize> {
     chunk_mode: ExecutionMode,
     /// Index of the next row to execute.
     cursor: usize,
-    /// Last emitted action: the hold target of every fallback.
+    /// Last emitted action: the hold target of every fallback, and the reference every
+    /// derivative stage of [`SafetyPlane::clamp`] is measured against. Commands, not
+    /// measurements -- see [`SafetyPlane::observe_state`], which seeds it once.
     last_safe: [f64; NJ],
     prev_safe: [f64; NJ],
     /// Velocity estimate implied by the last two emitted actions.
@@ -37,6 +39,10 @@ pub struct SafetyState<const NJ: usize, const H: usize> {
     estop_latched: bool,
     /// The `seq` of the last chunk accepted; `None` before the first one (spec 8.6).
     last_seq: Option<u64>,
+    /// Whether [`SafetyPlane::observe_state`] has already put the command chain on the
+    /// robot's measured pose. Armed by [`SafetyPlane::begin_episode`], never by `validate`
+    /// (packet M5/V6).
+    seeded: bool,
 }
 
 impl<const NJ: usize, const H: usize> SafetyState<NJ, H> {
@@ -61,6 +67,7 @@ impl<const NJ: usize, const H: usize> SafetyState<NJ, H> {
             last_beat_tick: PhysTick::ZERO,
             estop_latched: false,
             last_seq: None,
+            seeded: false,
         }
     }
 }
@@ -159,6 +166,17 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
         self.state.estop_latched = false;
     }
 
+    /// Starts a new episode on the same plane: clears the latch and re-arms the seed, so the
+    /// next [`Self::observe_state`] puts the command chain back on the robot's measured pose.
+    ///
+    /// Not a way to weaken anything (INV-12): the envelope, the watchdogs and the counters
+    /// are untouched, and the next violation latches again. Without it a second episode opens
+    /// believing the arm is still where the previous episode's last command left it.
+    pub fn begin_episode(&mut self) {
+        self.state.estop_latched = false;
+        self.state.seeded = false;
+    }
+
     /// Zeroes the statistics. Does not touch the latch or the envelope.
     pub fn reset_counters(&mut self) {
         self.counters.reset();
@@ -179,9 +197,27 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
         }
     }
 
-    /// Seeds the measured joint state, so the hold target is where the robot actually is.
-    /// Non-finite input is dropped and every value is clamped into the hard limits.
+    /// Seeds the command chain from the measured joint state, so the first command of an
+    /// episode starts where the robot actually is. Non-finite input is dropped and every
+    /// value is clamped into the hard limits.
+    ///
+    /// **Measurement enters the envelope exactly once, here** (packet M5/V6). Spec 9.3's
+    /// table constrains the *policy output*, and every row of it says `clamp`: the quantity
+    /// bounded has to be one the plane is about to emit, so `velocity_limit`,
+    /// `acceleration_limit` and `rate_limit` are differences of the plane's own commands and
+    /// not of the servo's following error. Keeping them that way is also what makes spec
+    /// 9.5's claim true -- the same `deployment_hash` gives the same safe action in
+    /// simulation and on hardware, where the feedback is noisier and slower.
+    ///
+    /// So a caller may call this before **every** `validate` and only the first call after
+    /// [`Self::begin_episode`] (or after construction) moves anything: collection,
+    /// evaluation, HIL and the embedded runtime all observe the same way and all get the
+    /// same envelope. A caller that never calls it starts from the soft-limit midpoints.
     pub fn observe_state(&mut self, q: &[f64; NJ], qd: &[f64; NJ]) {
+        if self.state.seeded {
+            return;
+        }
+        self.state.seeded = true;
         for i in 0..NJ {
             if q[i].is_finite() {
                 self.state.last_safe[i] =

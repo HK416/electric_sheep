@@ -425,24 +425,15 @@ impl Collector {
             for frame in 0..max_steps {
                 wrapper.episode = index;
                 wrapper.frame = frame;
-                // "A caller that knows the real pose calls `observe_state` before the first
-                // `validate`" (`SafetyPlane::new`). `reset_latch` clears the latch but not the
-                // hold target, the velocity or the rate history, so without this the plane
-                // opens every episode after the first believing the arm is still where the
-                // previous episode's last command left it -- and clamps the demonstration back
-                // toward a pose that no longer exists (packet M5/V1c).
-                //
-                // Once per episode, not once per step: inside an episode the envelope is a
-                // bound on the commanded motion, which is what `ScriptedExpert` paces itself
-                // to. Re-seeding every step turns it into a bound on the following error
-                // instead -- which is what `es_eval::runner` does, and the disagreement
-                // between the two is design note section 7.10, not something this packet may
-                // settle (`deployment.toml` and the expert's pacing are both forbidden here).
-                //
-                // `frame` here is this loop's own counter, which really is 0 once per episode.
-                // The `frame` an *intervener* sees is not (`infer` runs on release, not on
-                // submit) — see `frame_zero_is_not_a_hook_an_intervener_may_reset_on`.
-                if frame == 0 {
+                // Every consumer of the plane observes before every `validate` and none of
+                // them decides what that means: `SafetyPlane::observe_state` seeds the
+                // command chain on the first call after `begin_episode` and ignores the rest,
+                // so collection, evaluation, HIL and the embedded runtime all measure the
+                // envelope against the same thing -- the plane's own commands (packet M5/V6,
+                // design note section 7.12). Before V6 this was `if frame == 0` here and
+                // unconditional in `es_eval::runner`, and the two paths disagreed about what
+                // `velocity_max` bounds.
+                {
                     let state = env.backend().state();
                     let (mut q, mut qd) = ([0.0; NJ], [0.0; NJ]);
                     q.copy_from_slice(&state.qpos_of(0)[..NJ]);
@@ -506,7 +497,9 @@ impl Collector {
             }
             terminations.push(episode.termination);
             runner.reset_env(0);
-            planes[0].reset_latch();
+            // Clears the latch *and* re-arms the seed, so the next episode's first
+            // `observe_state` puts the command chain back on the arm (packet M5/V6).
+            planes[0].begin_episode();
 
             let n = episode.steps();
             if sources.len() < n {

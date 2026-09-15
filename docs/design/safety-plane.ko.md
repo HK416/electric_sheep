@@ -91,13 +91,15 @@ SafetyPlane<NJ, H>
 │     chunk_valid:  usize             valid rows of `chunk`
 │     chunk_mode:   ExecutionMode
 │     cursor:       usize             index of the next row to execute
-│     last_safe:    [f64; NJ]         last emitted action (the hold target)
+│     last_safe:    [f64; NJ]         last emitted action (the hold target, and the
+│                                     reference every derivative stage measures against)
 │     prev_safe:    [f64; NJ]         the one before it (second difference)
 │     vel:          [f64; NJ]         velocity estimate, (last_safe - prev_safe) / dt_s
 │     prev_vel:     [f64; NJ]         previous velocity estimate (acceleration)
 │     retract_idx:  usize             cursor into the retract trajectory
 │     last_chunk_tick / last_beat_tick: PhysTick
 │     estop_latched: bool
+│     seeded:       bool              observe_state has put the chain on the real pose
 └── counters: SafetyCounters
       violations: [u64; ViolationKind::COUNT]
       fallback_activations, steps, clamped_steps: u64
@@ -111,6 +113,23 @@ SafetyPlane<NJ, H>
 있다. 실제 자세를 아는 런타임은 첫 `validate` 이전에 `observe_state(&q, &qd)`를
 호출한다 — 이것이 실제 로봇 팔에 필요한 보정 손잡이(calibration knob)다. 물리적
 관절이 중간값이 말하는 위치에 있는 경우는 결코 없기 때문이다.
+
+**측정값은 에피소드당 정확히 한 번, 그 자리에서만 envelope에 들어온다**(패킷
+`docs/packets/M5/V6-envelope-semantics.md`). `observe_state`는 `begin_episode` 직후(또는
+생성 직후)의 첫 호출에서만 `last_safe`, `prev_safe`, `vel`, `prev_vel`을 심고, 그 이후의
+모든 호출에서는 아무것도 건드리지 않고 반환한다. 따라서 호출자는 **매** `validate` 앞에서
+이것을 호출해도 되고, 실제로 모든 호출자가 그렇게 한다. `begin_episode`는 e-stop 래치를
+해제하고 시드를 다시 무장시킨다. 수집기나 평가 러너가 에피소드 경계에서 부르는 것이
+이것이며, 무엇도 약화시키지 않는다(INV-12).
+
+이유는 편의가 아니라 §9.3과 §9.5다. §9.3의 표는 *정책 출력*에 적용되는 제약이고 동적
+행은 모두 **클램프**라고 말한다. 클램프할 수 있는 값은 plane이 지금 내보내려는 값뿐이다.
+그러므로 아래 3·4·7단계는 plane 자신의 명령들의 차분이지, 서보의 추종 오차(following
+error)의 차분이 결코 아니다. 또한 §9.5는 같은 `deployment_hash`가 시뮬과 실기에서 같은
+안전 액션을 주어야 한다고 요구하는데, 피드백에서 계산한 클램프는 그럴 수 없다 — MuJoCo의
+`qvel`은 정확하지만 실기에서는 같은 값이 시리얼 버스를 통해 양자화되고 지연되어 돌아온다.
+매 tick 다시 시드하는 호출자는 서보의 토크를 *만들어내는* 위치 오차를 제한하는 셈이며,
+그것은 `torque_limit`의 행이고 드라이브 자신의 포화로 이미 강제된다.
 
 ## `validate` — 알고리즘
 
@@ -219,8 +238,9 @@ window는, 이 스텝의 유일한 이벤트가 rate watchdog 자신의 트립�
    단계 순서를 동일하게 유지하기 위해 이 정리는 방어적 no-op으로 남는다.
 2. **position** — soft limit `[lower + margin, upper - margin]`로 clamp한다
    (§9.3 `position_limit`).
-3. **velocity** — 암시된 속도 `(a - last_safe) / dt_s`. `|v| > vel_max[i]`이면
-   `a = last_safe + sign(v) * vel_max[i] * dt_s`로 설정한다.
+3. **velocity** — 암시된 속도 `(a - last_safe) / dt_s`. 여기서 `last_safe`는 plane
+   자신의 마지막 명령이며 측정된 관절이 아니다(§9.3, §9.5 — 위의 시드 규칙 참조).
+   `|v| > vel_max[i]`이면 `a = last_safe + sign(v) * vel_max[i] * dt_s`로 설정한다.
 4. **acceleration** — 암시된 가속도 `(v - vel[i]) / dt_s`. `acc_max[i]`를
    초과하면 속도를 `vel[i] ± acc_max[i] * dt_s`로 clamp하고 그로부터 `a`를
    재구성한다.

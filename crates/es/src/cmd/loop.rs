@@ -345,35 +345,11 @@ fn build_expert(
         )));
     };
     let mut cfg = demo_cfg(joint.id);
-    pace(&mut cfg, deploy);
+    // The collector replans at the deployment's inference rate and executes `execute_chunk`
+    // rows before the next chunk arrives; `es_eval::runner` replans every control tick and
+    // executes one. `ExpertCfg::pace_to` is the one definition both use (packet M5/V6).
+    cfg.pace_to(deploy, deploy.action.execute_chunk as u32);
     ScriptedExpert::new(scene, cfg).map_err(|e| CliError::Runtime(e.to_string()))
-}
-
-/// Paces the expert to the envelope it will be recorded through (`INV-12`: the demonstration
-/// obeys the Safety Plane rather than being corrected by it, and the plane is still the only
-/// actuator path). A tenth is held back so nothing lands exactly on a limit.
-fn pace(cfg: &mut es_env::ExpertCfg, deploy: &es_ir::deployment::DeploymentIr) {
-    let s = &deploy.safety;
-    let dt = deploy.rate.control.period_secs_f64();
-    let least = |values: &[f64]| {
-        values
-            .iter()
-            .copied()
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .fold(f64::INFINITY, f64::min)
-    };
-    let step = least(&s.velocity_max) * dt;
-    let step = step.min(least(&s.action_rate.first_diff_max));
-    let accel = least(&s.acceleration_max) * dt * dt;
-    let accel = accel.min(least(&s.action_rate.second_diff_max));
-    if step.is_finite() {
-        cfg.step_max = 0.9 * step;
-    }
-    if accel.is_finite() {
-        cfg.accel_max = 0.9 * accel;
-    }
-    cfg.horizon = deploy.action.horizon as u32;
-    cfg.execute = deploy.action.execute_chunk as u32;
 }
 
 fn collect(args: &[String]) -> Result<u8, CliError> {

@@ -3510,6 +3510,16 @@ fn demo_scene_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mjcf/so101_pick_place.xml")
 }
 
+/// The pinned seed set both expert oracles run on: `expert_solves_the_pinned_seeds` through
+/// `es loop collect`, `expert_passes_the_evaluation_harness` through `es_eval::Evaluation`.
+/// Same seeds and same threshold on both paths is the point of packet M5/V6 -- a harness the
+/// expert fails is a harness no policy can pass (design note section 7.12).
+const SEEDS: [u64; 8] = [1, 2, 3, 5, 8, 13, 21, 34];
+
+/// Fraction of the pinned seeds that must end in `Success`. A property of the expert, not a
+/// tuning knob: lowering it to make a change pass is the same as editing a golden.
+const THRESHOLD: f64 = 0.875;
+
 /// Packet M5/V1 oracle 1 -- the expert's success rate over a pinned seed set.
 ///
 /// The threshold is a property of the expert, not a tuning knob: lowering it to make a change
@@ -3521,10 +3531,6 @@ fn demo_scene_path() -> PathBuf {
 /// narrower than it.
 #[test]
 fn expert_solves_the_pinned_seeds() {
-    const SEEDS: [u64; 8] = [1, 2, 3, 5, 8, 13, 21, 34];
-    /// Fraction of the pinned seeds whose demonstration must end in `Success`.
-    const THRESHOLD: f64 = 0.875;
-
     if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
         println!("SKIP expert_success: {reason}");
         return;
@@ -3607,6 +3613,233 @@ fn expert_solves_the_pinned_seeds() {
         "the Task IR called an episode a success whose cube is not in the bin: the predicate \
          reads x alone, and this is what it misses"
     );
+}
+
+/// Packet M5/V6 oracle -- **the harness passes the expert**, on the same pinned seeds and the
+/// same threshold as `expert_solves_the_pinned_seeds` above.
+///
+/// This is the test that was missing. Until V6, `es_eval::runner` re-seeded the Safety Plane
+/// from the measured joints before every `validate`, so `velocity_max` / `acceleration_max` /
+/// the action-rate limits bounded the servo's *following error* rather than the plane's own
+/// commands; the bound collapsed to `acceleration_max * dt^2 = 0.008` rad and the scripted
+/// expert -- which paces itself to exactly what the Deployment IR allows and passes 50/50
+/// through `es loop collect` -- scored **0 of 16** through `es eval run`. No policy can pass a
+/// harness the expert fails, so every evaluation number the demo has ever reported was taken
+/// against a ceiling of zero (design note `docs/design/visible-learning.md` section 7.12).
+///
+/// **The server oracle.** Only `MuJoCoCpuBackend` can drive the SO-101 scene, so this is named
+/// here and run on the oracle server; without `mujoco` it prints a reason and skips, exactly
+/// like the collection oracle it mirrors.
+///
+/// Two deliberate narrowings, both of which leave the measurement honest:
+///
+/// * **One `Evaluation::run` per seed, one episode each.** `Evaluation::run` seeds one `Env`
+///   from `seeds[0]` and keys the Task IR's own randomization by an episode counter, so a
+///   single 8-episode cell would be eight draws of *one* seed. Eight single-episode runs are
+///   eight draws of the eight pinned seeds, which is what the collection oracle measures.
+/// * **A constant frame.** The demo's Observation IR carries a 96x96 `Rgb8` input, and the
+///   runner refuses an image input it cannot serve rather than zero-filling one. The expert
+///   reads joints, never pixels (`ScriptedExpert::chunk` takes a `StateView`), so the frame
+///   cannot change its decisions -- and serving a constant one is what lets this oracle need
+///   `mujoco` and not also a Vulkan device. `visible_learning_demo_run` is the run that
+///   renders for real.
+#[test]
+fn expert_passes_the_evaluation_harness() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const NJ: usize = 6;
+    const H: usize = 16;
+
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP expert_passes_the_evaluation_harness: {reason}");
+        return;
+    }
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let task = es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml");
+    let obs =
+        es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml");
+    let deploy =
+        es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml");
+    let scene = es_assets::parse_mjcf(
+        &std::fs::read_to_string(demo_scene_path()).expect("the demo scene is in the repo"),
+    )
+    .expect("the demo scene parses")
+    .scene;
+    let cube = scene
+        .joints
+        .iter()
+        .find(|j| j.kind == es_assets::scene::JointKind::Free)
+        .expect("the scene has one free-joint body to pick up")
+        .id;
+    // The image the plan declares, once: 96x96 Rgb8, HWC.
+    let blank = vec![0u8; 96 * 96 * 3];
+
+    let mut succeeded = 0usize;
+    let mut worst_violation = 0.0f64;
+    for seed in SEEDS {
+        let mut cfg = es_env::expert::demo_cfg(cube);
+        // `es_eval::runner` calls the policy once per control tick, so exactly one row of each
+        // chunk executes before the next one is asked for -- unlike `es loop collect`, which
+        // replans at the deployment's inference rate and executes `execute_chunk` rows.
+        cfg.pace_to(&deploy, 1);
+        let expert = es_env::expert::ScriptedExpert::new(&scene, cfg).expect("the expert builds");
+        let seen: SeenState = Rc::new(RefCell::new(None));
+
+        let mut ir = demo_evaluation_ir(
+            hex(&task.task_hash().expect("task hash")),
+            hex(&obs.observation_hash().expect("observation hash")),
+        );
+        ir.episodes = es_ir::evaluation::EpisodeBatch {
+            n_episodes: 1,
+            seeds: es_ir::evaluation::SeedPlan::Explicit(vec![seed]),
+        };
+        ir.suites.truncate(1);
+        assert_eq!(ir.suites[0].name, "nominal");
+
+        let mut policy = ExpertPolicy::<NJ, H> {
+            expert,
+            seen: Rc::clone(&seen),
+        };
+        let taken = Rc::clone(&seen);
+        let blank_for_source = blank.clone();
+        let mut frames =
+            move |_light: &es_eval::LightOverride,
+                  model: &es_physics_core::backend::ModelInfo,
+                  state: &es_physics_core::backend::StateView<'_>| {
+                let mut row = state.qpos_of(0).to_vec();
+                row.extend_from_slice(state.qvel_of(0));
+                *taken.borrow_mut() = Some((model.clone(), row));
+                Ok::<Vec<u8>, String>(blank_for_source.clone())
+            };
+        let (report, _lock) =
+            es_eval::Evaluation::run_with_frames::<es_physics_backend::MuJoCoCpuBackend, _, NJ, H>(
+                &ir,
+                &task,
+                &scene,
+                &obs,
+                &mut policy,
+                &deploy,
+                es_physics_backend::MuJoCoCpuBackend::new,
+                &es_eval::RunConfig::default(),
+                Some(&mut frames),
+                None,
+            )
+            .expect("the expert runs through the evaluation harness");
+
+        let metric = |m: es_ir::evaluation::MetricSpec| {
+            report
+                .cells
+                .iter()
+                .find(|c| c.suite == "nominal" && c.metric == m)
+                .and_then(|c| match c.value {
+                    es_ir::evaluation::MetricValue::Scalar(v) => Some(v),
+                    _ => None,
+                })
+                .unwrap_or(f64::NAN)
+        };
+        let rate = metric(es_ir::evaluation::MetricSpec::SuccessRate);
+        let violation = metric(es_ir::evaluation::MetricSpec::EnvelopeViolationRate);
+        let length = metric(es_ir::evaluation::MetricSpec::EpisodeLength);
+        worst_violation = worst_violation.max(violation);
+        if rate > 0.0 {
+            succeeded += 1;
+        }
+        println!(
+            "seed {seed}: success_rate {rate:.4}  envelope_violation_rate {violation:.4}  \
+             episode_length {length:.1}"
+        );
+    }
+
+    let rate = succeeded as f64 / SEEDS.len() as f64;
+    println!(
+        "RAN expert_passes_the_evaluation_harness: {succeeded}/{} pinned seeds ended in \
+         Success through es-eval, worst envelope_violation_rate {worst_violation:.4}",
+        SEEDS.len()
+    );
+    assert!(
+        rate >= THRESHOLD,
+        "the evaluation harness passed the expert on {succeeded}/{} pinned seeds ({rate:.3}), \
+         below the {THRESHOLD} `expert_solves_the_pinned_seeds` measures on the collection \
+         path. The two paths run the same expert through the same Deployment IR and must \
+         agree; lowering this threshold is editing a golden.",
+        SEEDS.len()
+    );
+    // The expert paces itself to the envelope, so the plane has nothing to correct. A run
+    // that clamps more than a couple of ticks per 900-step episode means the two readings
+    // have drifted apart again -- it is the symptom V6 exists to remove, not a metric to tune.
+    assert!(
+        worst_violation < 0.02,
+        "the plane corrected {worst_violation:.4} of the expert's steps; a demonstration the \
+         envelope corrects is a demonstration of the envelope (packet M5/V1, M5/V6)"
+    );
+}
+
+/// [`es_env::expert::ScriptedExpert`] wearing the `PolicyRuntime` the evaluation runner drives.
+///
+/// The expert needs the cube's free-joint `qpos`, which the demo's Observation IR does not
+/// carry (it emits six normalized joint angles and an image). The runner's frame source is
+/// handed the full `StateView` immediately before the policy is called, so the frame closure
+/// leaves the raw `qpos || qvel` row here on its way past. That is a test scaffold, not a new
+/// extension point: `PolicyRuntime` is one of the seven `INV-17` allows and this is an impl
+/// of it, nothing more.
+struct ExpertPolicy<const NJ: usize, const H: usize> {
+    expert: es_env::expert::ScriptedExpert,
+    seen: SeenState,
+}
+
+/// The loaded model and the raw `qpos || qvel` row the frame source last saw.
+type SeenState =
+    std::rc::Rc<std::cell::RefCell<Option<(es_physics_core::backend::ModelInfo, Vec<f64>)>>>;
+
+impl<const NJ: usize, const H: usize> es_policy::PolicyRuntime for ExpertPolicy<NJ, H> {
+    fn load(
+        &mut self,
+        _graph: &es_ir::learning::LearningGraph,
+        _weights: &es_policy::WeightsSource,
+    ) -> Result<es_policy::PolicyInfo, es_policy::PolicyError> {
+        Err(es_policy::PolicyError::NotLoaded)
+    }
+
+    fn infer(
+        &mut self,
+        _inputs: &std::collections::BTreeMap<String, es_compile::Tensor>,
+    ) -> Result<std::collections::BTreeMap<String, es_compile::Tensor>, es_policy::PolicyError>
+    {
+        let seen = self.seen.borrow();
+        let (model, row) = seen
+            .as_ref()
+            .ok_or_else(|| es_policy::PolicyError::Backend("no state captured yet".to_owned()))?;
+        let state = es_env::expert::state_of_row(model, row);
+        // Out of reach ends the demonstration in `es loop collect`; here it holds, so the
+        // episode runs out its budget and is scored a failure rather than an error.
+        let rows = self
+            .expert
+            .chunk(model, &state, 0)
+            .unwrap_or_else(|| vec![state.qpos_of(0)[..NJ].to_vec(); H]);
+        let mut data = Vec::with_capacity(H * NJ * 8);
+        for r in rows.iter().take(H) {
+            for j in 0..NJ {
+                data.extend_from_slice(&r.get(j).copied().unwrap_or(0.0).to_le_bytes());
+            }
+        }
+        Ok(std::collections::BTreeMap::from([(
+            "action".to_owned(),
+            es_compile::Tensor {
+                dtype: es_ir::types::ElemType::F64,
+                shape: vec![H as u64, NJ as u64],
+                data,
+            },
+        )]))
+    }
+
+    fn info(&self) -> Option<&es_policy::PolicyInfo> {
+        None
+    }
+
+    fn runtime_hash(&self) -> [u8; 32] {
+        *blake3::hash(b"es-env::ScriptedExpert").as_bytes()
+    }
 }
 
 /// Packet M5/V1: `--expert` drives every tick itself, so a machine with `mujoco` but no

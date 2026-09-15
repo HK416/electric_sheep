@@ -89,13 +89,15 @@ SafetyPlane<NJ, H>
 │     chunk_valid:  usize             valid rows of `chunk`
 │     chunk_mode:   ExecutionMode
 │     cursor:       usize             index of the next row to execute
-│     last_safe:    [f64; NJ]         last emitted action (the hold target)
+│     last_safe:    [f64; NJ]         last emitted action (the hold target, and the
+│                                     reference every derivative stage measures against)
 │     prev_safe:    [f64; NJ]         the one before it (second difference)
 │     vel:          [f64; NJ]         velocity estimate, (last_safe - prev_safe) / dt_s
 │     prev_vel:     [f64; NJ]         previous velocity estimate (acceleration)
 │     retract_idx:  usize             cursor into the retract trajectory
 │     last_chunk_tick / last_beat_tick: PhysTick
 │     estop_latched: bool
+│     seeded:       bool              observe_state has put the chain on the real pose
 └── counters: SafetyCounters
       violations: [u64; ViolationKind::COUNT]
       fallback_activations, steps, clamped_steps: u64
@@ -109,6 +111,23 @@ heap objects and both are final after `from_ir`.
 construction. A runtime that knows the real pose calls `observe_state(&q, &qd)` before the
 first `validate` — that is the calibration knob a real arm needs, since a physical joint is
 never where the midpoint says it is.
+
+**Measurement enters the envelope exactly once per episode, and only there** (packet
+`docs/packets/M5/V6-envelope-semantics.md`). `observe_state` seeds `last_safe`, `prev_safe`,
+`vel` and `prev_vel` on the first call after `begin_episode` (or after construction) and
+returns without touching anything on every call after that, so a caller may — and every caller
+does — call it before *every* `validate`. `begin_episode` clears the e-stop latch and re-arms
+the seed; it is what a collector or an evaluation runner calls at an episode boundary, and it
+weakens nothing (INV-12).
+
+The reason is §9.3 and §9.5, not convenience. §9.3's table constrains the *policy output* and
+every dynamic row of it says **clamp**, which only a value the plane is about to emit can be;
+so stages 3, 4 and 7 below are differences of the plane's own commands, never of the servo's
+following error. And §9.5 requires the same `deployment_hash` to give the same safe action in
+simulation and on the robot — which a clamp computed from feedback, exact in MuJoCo and
+quantized and late over a serial bus, cannot. A caller that re-seeded every tick would be
+bounding the position error that *generates* the servo's torque, which is `torque_limit`'s row
+and is already enforced by the drive's own saturation.
 
 ## `validate` — the algorithm
 
@@ -212,8 +231,9 @@ order, each stage recording its `ViolationKind` if it changed the value:
    defensive no-op so the stage order is the same on both paths.
 2. **position** — clamp to the soft limit `[lower + margin, upper - margin]` (§9.3
    `position_limit`).
-3. **velocity** — implied velocity `(a - last_safe) / dt_s`; if `|v| > vel_max[i]`, set
-   `a = last_safe + sign(v) * vel_max[i] * dt_s`.
+3. **velocity** — implied velocity `(a - last_safe) / dt_s`, where `last_safe` is the plane's
+   own last command and never the measured joint (§9.3, §9.5 — see the seed rule above); if
+   `|v| > vel_max[i]`, set `a = last_safe + sign(v) * vel_max[i] * dt_s`.
 4. **acceleration** — implied acceleration `(v - vel[i]) / dt_s`; if over `acc_max[i]`,
    clamp the velocity to `vel[i] ± acc_max[i] * dt_s` and rebuild `a` from it.
 5. **torque** — only when `action.space == JointTorque`, where the action *is* a torque:

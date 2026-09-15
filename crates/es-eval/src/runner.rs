@@ -657,10 +657,11 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     // first frames of this episode would see the tail of the previous one, and cell 2 would
     // see cell 1 — making the §10.1 table depend on suite order (§10.4).
     plan.reset();
-    // A latch left over from the previous episode would poison the rest of the cell. Clearing
-    // it is not disabling the plane (INV-12): the envelope, watchdogs and counters are
-    // untouched and the next violation latches again.
-    safety.reset_latch();
+    // A latch left over from the previous episode would poison the rest of the cell, and so
+    // would a command chain still anchored on where the previous episode's last command left
+    // the arm. `begin_episode` clears both; it is not disabling the plane (INV-12), since the
+    // envelope, watchdogs and counters are untouched and the next violation latches again.
+    safety.begin_episode();
 
     let mut overrides = ResetOverrides::default();
     perturbations.apply_at_reset(cell, seed, episode, &mut overrides);
@@ -726,6 +727,10 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         *seq += 1;
         let chunk = infer_chunk::<NJ, H>(policy, observed, action_output, mode, *seq)?;
 
+        // Before every `validate`, exactly like `es_data::Collector`, `es_ros2::hil` and
+        // `es_runtime_embedded`: the plane decides that only the first call of an episode
+        // seeds the command chain, so the envelope bounds the plane's own commands and not
+        // the servo's following error (packet M5/V6, design note section 7.12).
         let (q, qd) = joint_state::<NJ>(&env.backend().state());
         safety.observe_state(&q, &qd);
         safety.heartbeat(env.tick());

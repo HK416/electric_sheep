@@ -397,6 +397,43 @@ pub struct ExpertCfg {
     pub execute: u32,
 }
 
+impl ExpertCfg {
+    /// Paces the expert to the envelope it will be driven through (`INV-12`: the
+    /// demonstration obeys the Safety Plane rather than being corrected by it, and the plane
+    /// is still the only actuator path). A tenth is held back so nothing lands exactly on a
+    /// limit.
+    ///
+    /// `replan_every` is how many rows of each chunk actually execute before the caller asks
+    /// for another one: `es loop collect` runs inference at the deployment's `rate.inference`
+    /// and executes `action.execute_chunk` rows, while `es_eval::runner` calls the policy once
+    /// per **control** tick and therefore executes exactly one (packet M5/V6). Getting it
+    /// wrong is not a safety question -- the plane clamps either way -- but the expert's
+    /// command integrator would run ahead of the arm and every tick would be corrected.
+    pub fn pace_to(&mut self, deploy: &es_ir::deployment::DeploymentIr, replan_every: u32) {
+        let s = &deploy.safety;
+        let dt = deploy.rate.control.period_secs_f64();
+        let least = |values: &[f64]| {
+            values
+                .iter()
+                .copied()
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .fold(f64::INFINITY, f64::min)
+        };
+        let step = least(&s.velocity_max) * dt;
+        let step = step.min(least(&s.action_rate.first_diff_max));
+        let accel = least(&s.acceleration_max) * dt * dt;
+        let accel = accel.min(least(&s.action_rate.second_diff_max));
+        if step.is_finite() {
+            self.step_max = 0.9 * step;
+        }
+        if accel.is_finite() {
+            self.accel_max = 0.9 * accel;
+        }
+        self.horizon = deploy.action.horizon as u32;
+        self.execute = replan_every.max(1);
+    }
+}
+
 /// One scripted demonstration, stage by stage.
 ///
 /// A concrete struct reached through the intervener hook `es-data`'s collector already takes,
