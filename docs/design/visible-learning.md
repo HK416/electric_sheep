@@ -2852,6 +2852,106 @@ the cube in the right place when it ran out. V13's numbers, not V11's, are the b
 here.
 
 
+### 7.22 As built (V14): the hand never opens, and four times the demonstrations does not open it
+
+Packet `docs/packets/M5/V14-release-and-demos.md`. Two questions, one each, and the second is
+the single variable V13's stop rule left open.
+
+**Part 1: does the policy release if it is given time?** V13's three carrying episodes were
+still holding the cube over the bin when the 900-step budget ran out, so the budget was hiding
+the answer. `max_episode_steps` is a generated value — `regenerate_visible_learning_documents`
+owns it — so the change is the generator's constant, 900/18.0 s → **1800/36.0 s** (the `Timeout`
+leaf compares elapsed seconds, so both move), and a regeneration. V13's `model-20000.safetensors`
+is then repacked into a bundle built from the regenerated documents: **the weight bytes are
+unchanged** (86 tensors, the same `weights_hash` and the same `lowering_hash` `70a8fec7…`) and
+`learning_hash` `5dac0a46…` is unchanged, while `task_hash` `d7a7c061…` → `78814eb4…`,
+`observation_hash` `4b069f6c…` → `72b8609a…` and `policy_hash` → `8dbff824…` all move, which is
+the hash chain doing its job for a Task IR value (§5.3).
+
+| budget 1,800, nominal suite | training seeds 1–16 | held-out 101–116 |
+|---|---|---|
+| `success_rate` (harness) | 1 / 16 | 0 / 16 |
+| cube lifted clear of the table | 3 / 16 | 3 / 16 |
+| **cube carried into the bin volume** | **3 / 16** — 03 @ 917, 11 @ 147, 15 @ 172 | **2 / 16** — 01 @ 143, 04 @ 142 |
+| **cube released inside the bin** | **0 / 16** | **0 / 16** |
+| cube still inside the bin at tick 1800 | 3 / 16 | 2 / 16 |
+| `envelope_violation_rate` | 0.4227 | 0.5457 |
+| `episode_length` | 1691.5 | 1800.0 |
+
+Every carrying episode holds the cube inside the bin volume for the entire remainder of the
+episode — 883 to 1,653 control steps, 17.7 to 33.1 s — with the gripper joint at 0.078 – 0.093
+rad, which is the jaw stalled on the 30 mm cube (section 7.19's measured 0.0934). **Not one
+episode opens the hand.** Eighteen more seconds changed no verdict on either suite; what they
+bought is the knowledge that the hold is indefinite rather than late. The one `success` is the
+episode V13 already disclaimed: training seed 3, 64 ticks, a 1.8 mm lift, not a carry.
+
+**`violation.position` is the gripper, and only the gripper.** `events.json` carries the
+`ViolationKind` bitset per frame and no joint index, so this is derived by replaying the
+`.estraj` positions against the Deployment IR's soft bounds — `[lower + margin, upper - margin]`,
+the exact interval `SafetyPlane::clamp` stage 2 clamps the *command* to.
+
+| joint | training seeds, ticks outside the soft bound | held-out |
+|---|---|---|
+| `shoulder_pan` / `shoulder_lift` / `elbow_flex` / `wrist_roll` | 0 | 0 |
+| `wrist_flex` | 23 (0.1%) | 18 (0.1%) |
+| **`gripper`** | **10,145 of 27,064 (37.5%)** | **14,690 of 28,800 (51.0%)** |
+| the harness's own `violation.position` | 9,265 | 13,380 |
+
+The gripper's soft interval is `[-0.1245, 1.6953]` rad and the pinned ticks sit within 1 mrad of
+the **lower** bound. The policy commands the jaw shut harder than the envelope allows for half of
+every episode and the Safety Plane clamps it there — the same fact as "it never opens", seen
+from the plane's side. Caveat, stated because the derivation is not the command itself: `.estraj`
+records state, so this counts the ticks whose *measured* position has reached the clamped
+command's bound, not the clamp events. The two agree to within 10% of each other on both suites
+and every other joint is zero, which is as much as the recorded data can say.
+
+**Part 2: 50 demonstrations → 200.** V12's exact command at 50 Hz with the `PACE = 0.5` expert,
+`--episodes 200 --seed 1` — seeds past 50 are new draws of the same `Randomization` streams —
+then bake, then the V13 graph with V2's knobs.
+
+| | V12 / V13 (50) | **V14 (200)** |
+|---|---|---|
+| demonstrations | 50 / 50 `Success` | **200 / 200 `Success`** |
+| frames | 9,038 | **35,918** |
+| training loss, initial → 20,000 → 40,000 | 0.0632 → 0.0162 → — | 0.1167 → 0.0186 → **0.0148** |
+
+The loss was still falling at 20,000, so 40,000 was also written and is the final checkpoint.
+Evaluation is at the **900**-step budget, not 1,800: Part 1's answer is that nothing is released
+at 1,800 either, so the longer budget buys nothing and 900 is what V13's table is on.
+
+| nominal suite, budget 900 | V13, 50 demos, 20k | V14, 200 demos, 20k | **V14, 200 demos, 40k** |
+|---|---|---|---|
+| `success_rate`, training seeds 1–16 | 1 / 16 | 0 / 16 | **1 / 16** |
+| `success_rate`, held-out 101–116 | 0 / 16 | 0 / 16 | **0 / 16** (twice, identical) |
+| cube lifted clear, training / held-out | 4 / 16 · — | 8 / 16 · 6 / 16 | **9 / 16 · 9 / 16** |
+| **cube carried into the bin, training** | **3 / 16** | 0 / 16 | **8 / 16** |
+| **cube carried into the bin, held-out** | **0 / 16** | 2 / 16 | **9 / 16** |
+| **cube released inside the bin** | 0 / 16 | 0 / 16 | **0 / 16** |
+| `envelope_violation_rate`, training / held-out | 0.5396 / 0.6392 | 0.5017 / 0.6120 | **0.1587 / 0.2060** |
+| `violation.position`, training / held-out | 5,655 / 7,542 | 5,690 / 7,222 | **657 / 1,357** |
+| `episode_length`, training / held-out | 847.75 / 900 | 900 / 900 | 855.125 / 900 |
+
+The two held-out runs on the 40,000-step checkpoint agree to the last digit, so the numbers are
+the policy's and not the schedule's. The 20,000-step column is worth keeping: on four times the
+data, 20,000 steps is *under*-trained — it lifts as often as 40,000 and carries almost never —
+so "20,000 steps" is a property of the 50-demonstration set and not of the recipe.
+
+**Wall clocks** (observations, not a throughput claim — §12.4): collect 200 episodes with frames
+208 s; bake 8 s (35,918 frames, 3.8 GB); lower + train 40,000 steps 1,411 s on the RTX 4090
+shared with the evaluation; one 16-episode nominal suite with frames 265 s at the 900-step
+budget and 470 – 620 s at 1,800.
+
+**Verdict.** Four times the demonstrations is the largest single-variable move plan V has
+measured. Held-out carries go from **0 / 16 to 9 / 16**; the envelope violation rate falls by a
+factor of three and `violation.position` from 7,542 frames to 1,357. On more than half of the
+seeds it has never seen, the policy finds the cube, grasps it, lifts it ~125 mm and puts it over
+the bin. **And the harness still scores 0 / 16, because the last thing the task needs is the one
+thing the policy has never done: open the hand.** Zero releases in 96 evaluated episodes across
+both parts, at 900 steps and at 1,800. Held-out `success_rate` is below the unchanged acceptance
+threshold of 0.5, so the stop rule fires: no six-suite sweep, no showcase videos, and no second
+variable here. What remains is not reach, not grasp, not generalization and not the budget — it
+is one joint that is commanded shut for the whole episode and clamped there.
+
 
 ## 8. Safety overlay (V3)
 
@@ -3154,3 +3254,31 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     a batch axis is what spec 5.2 already says the training domain has, and (b) would hide a
     lowering that is wrong for every other normalization-bearing backbone. Either way it is one
     variable and the next packet's whole content.
+21. **The success predicate is x-only, and the budget is now 1,800** (section 7.22, V14). Two
+    decisions in one, both for the human. **(a) What would the Task IR need in order to express
+    the three-dimensional bin check?** `cube_in_the_bin` in `crates/es/tests/cli.rs` is
+    `x in [0.09, 0.19) and y in [-0.15, -0.05) and z < 0.09`; the Task IR's own predicate is
+    `cube x in (0.09, 0.19) and cube vx in (-0.05, 0.05) and gripper > 0.6`, because
+    `GetJointState{joints: ["cube_free"]}` yields one scalar — a cone leaf is one scalar
+    (section 5.4) — so the free joint's y and z are not reachable at all. V14 measured what that
+    costs: 9 of 16 held-out episodes put the cube inside the real bin volume and the harness
+    scored every one of them `timeout`, while the one episode it *did* score `success` (training
+    seed 3 at the 40,000-step checkpoint, tick 182) had the cube 125 mm in the air, inside the
+    bin's x span and nowhere near the bin. The predicate is neither sound nor complete for the
+    task the demo claims. Three ways out. **(i)** Give `GetJointState` a component index (or a
+    `GetBodyPose`-style vector output plus a `Slice`), so three `Compare`s over three components
+    can be `And`-ed — the smallest change, and it is a §6 schema change with a `task_hash` move.
+    **(ii)** Author the check as a `GetBodyPose` on the cube body, which already returns a
+    3-vector (node 34 uses it for the privileged observation channel), plus a comparison node
+    that takes a vector and a box. **(iii)** Leave the Task IR as it is and accept that the demo's
+    `success_rate` is a proxy, reporting the 3-D carry count beside it forever. Default:
+    **(i)**, because "the cone leaf is one scalar" is the actual limit and indexing is the
+    minimum that lifts it; (iii) is what V13 and V14 both had to do in prose and it does not
+    scale to M6. **(b) Should `max_episode_steps` stay at 1,800?** V14 raised it to answer
+    whether the policy ever releases; the answer is no, at any budget, and the cost of the
+    larger number is that every evaluation suite takes twice as long (265 s → 470 – 620 s per
+    16 episodes) and `episode_length` is no longer comparable to sections 7.19 – 7.21. Keeping
+    it is honest — the demonstration takes ~180 control steps and 1,800 is a generous, not a
+    tight, budget — but nothing measured needs it. Default: **keep 1,800**, and re-run the
+    baseline tables at that budget once a policy releases, since a budget that was never the
+    binding constraint is the safer of the two errors.
