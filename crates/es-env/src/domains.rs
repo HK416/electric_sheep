@@ -310,10 +310,17 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
     /// state (§9.3), so a shared plane would blend one env's history into another's limits.
     pub fn emit_actions(
         &mut self,
-        now: PhysTick,
         planes: &mut [SafetyPlane<NJ, H>],
         ctrl: &mut [f64],
     ) -> Result<(), EnvError> {
+        // **The plane's clock is the control tick** (packet M5/V17). `SafetyPlane` turns a
+        // tick difference into microseconds with the Deployment IR's *control* period
+        // (`es_safety::config`, `period_us = rate.control_period()`), so handing it the
+        // simulation tick multiplied every watchdog gap by the substeps of one control step
+        // (packet M5/V11). It was invisible while a chunk arrived every control tick --
+        // `accept` stamps `last_chunk_tick = now` before the deadline is measured, so the gap
+        // was always zero -- and honouring `rate.inference` makes it real.
+        let now = PhysTick(self.control_tick);
         let envs = self.buffers.len();
         if planes.len() != envs {
             return Err(EnvError::shape("safety planes", envs, planes.len()));
@@ -905,9 +912,12 @@ mod tests {
     #[test]
     fn a_policy_that_stops_producing_trips_the_inference_deadline() {
         const ALIVE: usize = 12;
-        // One control step is 4 sim ticks x 4,000 us = 16 ms of plane time, so a 50 ms budget
-        // survives the 2-tick inference latency but not a policy that stops.
-        let budget = Micros(50_000);
+        // One control step is 4,000 us of plane time -- the Deployment IR's control period,
+        // which is the unit `SafetyPlane` converts tick differences with and therefore the
+        // clock `emit_actions` hands it (packet M5/V17; before V17 this was the simulation
+        // tick and one control step counted as four). A 12.5 ms budget survives the inference
+        // latency but not a policy that stops.
+        let budget = Micros(12_500);
         let mut ir = deployment_ir();
         ir.deadlines.inference_budget = budget;
         ir.watchdogs = WatchdogSet(vec![
@@ -945,9 +955,7 @@ mod tests {
         let mut fired_after = None;
         for step in 0..8 {
             let mut ctrl = vec![0.0; 16 * NJ];
-            runner
-                .emit_actions(env.tick(), &mut planes, &mut ctrl)
-                .unwrap();
+            runner.emit_actions(&mut planes, &mut ctrl).unwrap();
             env.step(&ctrl).unwrap();
             runner.advance();
             if fired_after.is_none() && deadlines(&planes) > 0 {
@@ -955,7 +963,7 @@ mod tests {
             }
         }
         let fired_after = fired_after.expect("a dead policy trips InferenceDeadline");
-        // 50 ms of budget at 16 ms per control step: the fourth silent step, not the eighth.
+        // 12.5 ms of budget at 4 ms per control step: the fourth silent step, not the eighth.
         assert_eq!(fired_after, 4, "fired within the budget, not late");
     }
 
@@ -1007,9 +1015,7 @@ mod tests {
             }
             runner.infer_window(sim_tick, &mut policy).unwrap();
             let mut ctrl = vec![0.0; 16 * NJ];
-            runner
-                .emit_actions(env.tick(), &mut planes, &mut ctrl)
-                .unwrap();
+            runner.emit_actions(&mut planes, &mut ctrl).unwrap();
             for i in 0..16usize {
                 let row = &ctrl[i * NJ..(i + 1) * NJ];
                 let safe = planes[i].last_safe_action();

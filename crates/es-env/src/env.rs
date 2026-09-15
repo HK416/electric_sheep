@@ -369,7 +369,7 @@ impl<B: PhysicsBackend> Env<B> {
         }
         runner.infer_window(sim_tick, policy)?;
         let mut ctrl = vec![0.0; self.n_envs as usize * nu];
-        runner.emit_actions(self.tick, planes, &mut ctrl)?;
+        runner.emit_actions(planes, &mut ctrl)?;
         let outcome = self.step(&ctrl)?;
         for (env, done) in outcome.dones.iter().enumerate() {
             if *done {

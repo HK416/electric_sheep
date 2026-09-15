@@ -804,9 +804,20 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         // the servo's following error (packet M5/V6, design note section 7.12).
         let (q, qd) = joint_state::<NJ>(&env.backend().state());
         safety.observe_state(&q, &qd);
-        safety.heartbeat(env.tick());
+        // **The plane's clock is the control tick, not the simulation tick** (packet M5/V17).
+        // `SafetyPlane` turns a tick difference into microseconds with the Deployment IR's
+        // *control* period (`es_safety::config`, `period_us = rate.control_period()`), so a
+        // `now` counted in simulation ticks multiplies every watchdog gap by the substeps of
+        // one control step -- four on the demo scene, which steps at 200 Hz under a 50 Hz
+        // control rate (packet M5/V11). It never showed while a chunk arrived on every control
+        // tick, because `accept` stamps `last_chunk_tick = now` before the deadline is
+        // measured and the gap was always zero; honouring `rate.inference` makes the gap real
+        // and the factor visible. Measured on the V15 checkpoint at the declared 5 Hz:
+        // `violation.inference_deadline` on 25,920 of 28,800 control ticks.
+        let now = PhysTick(u64::from(step));
+        safety.heartbeat(now);
         let age = Micros(((ring.len().saturating_sub(1) as u64) + extra_age) * control_us);
-        let safe = safety.validate(&fed, age, env.tick());
+        let safe = safety.validate(&fed, age, now);
         // One record per frame that reached disk, carrying the plane's own verdict on the step
         // that frame was captured for (design note section 8). A step whose observation was
         // dropped rendered nothing, so it adds no record and the two stay the same length.
