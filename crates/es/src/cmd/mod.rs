@@ -13,5 +13,9 @@ pub mod ir;
 pub mod r#loop;
 pub mod mcp;
 pub mod policy;
+/// `es video showcase` (packet M5/V9): only with the `render` feature, because it is the one
+/// subcommand that opens a Vulkan device.
+#[cfg(feature = "render")]
+pub mod showcase;
 pub mod task;
 pub mod video;

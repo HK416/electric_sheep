@@ -12,6 +12,7 @@ use es_assets::scene::SceneDesc;
 use es_compile::{CpuPlan, Home, PlanMode, Tensor, TensorRef};
 use es_core::{PhysTick, StableId};
 use es_env::scheduler::BatchDomains;
+use es_env::traj::Trajectory;
 use es_env::{plane_chunk, ChunkBuffer, Env, EnvMetrics, Episode, PlaneFeed};
 use es_ir::deployment::{DeploymentIr, ExecutionMode, Micros};
 use es_ir::evaluation::{
@@ -47,6 +48,11 @@ pub struct RunConfig {
     pub created: u64,
     pub dataset: DatasetHash,
     pub hardware: HardwareCapability,
+    /// Where to write each cell's `.estraj` state trajectory, one file per episode
+    /// (`es_env::traj`, packet M5/V9). `None` writes none, which is what every caller before
+    /// V9 did. Not part of the evaluation document and not in either artifact: it is the
+    /// record of what the robot did, and the input `es video showcase` replays.
+    pub traj_dir: Option<PathBuf>,
 }
 
 impl Default for RunConfig {
@@ -61,6 +67,7 @@ impl Default for RunConfig {
                 split: [0; 32],
             },
             hardware: HardwareCapability([0; 32]),
+            traj_dir: None,
         }
     }
 }
@@ -444,6 +451,10 @@ impl Evaluation {
                     n: 0,
                 });
                 let mut events = Vec::new();
+                // One `.estraj` per episode, the same cell name the frames use: what the
+                // arm and the cube did, tick by tick, so the run can be re-rendered from an
+                // independent camera without re-running the physics (packet M5/V9).
+                let mut traj = cfg.traj_dir.as_ref().map(|_| Trajectory::new(env.model()));
                 let episode = run_episode::<B, NJ, H>(
                     &mut env,
                     &mut plan,
@@ -463,8 +474,12 @@ impl Evaluation {
                     &mut feed,
                     frames.as_deref_mut(),
                     cell_frames.as_mut(),
+                    traj.as_mut(),
                     &mut events,
                 )?;
+                if let (Some(dir), Some(traj)) = (cfg.traj_dir.as_ref(), &traj) {
+                    traj.write(&dir.join(format!("{name}.estraj")))?;
+                }
                 if frames_dir.is_some() {
                     out.events.insert(name, events);
                 }
@@ -653,6 +668,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     feed: &mut PlaneFeed,
     mut frames: Option<&mut FrameSource<'_>>,
     mut cell_frames: Option<&mut CellFrames>,
+    mut traj: Option<&mut Trajectory>,
     events: &mut Vec<StepEvent>,
 ) -> Result<Episode, EvalError> {
     let (nu, nq, nv) = {
@@ -710,6 +726,12 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         if dropped && !ring.is_empty() {
             extra_age += 1;
         } else {
+            // Recorded where the frame is captured, not where the tick begins, so trajectory
+            // index and frame index are the same number even under `observation_delay` --
+            // which is what lets a replay be compared to the recorded frames (packet M5/V9).
+            if let Some(t) = traj.as_deref_mut() {
+                t.push(env.model(), &env.backend().state(), 0)?;
+            }
             let (names, bytes, rendered) = capture(
                 plan,
                 sources,

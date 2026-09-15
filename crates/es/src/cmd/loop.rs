@@ -28,7 +28,7 @@ use crate::util::hex;
 const HELP: &str = "\
 es loop collect --policy <policy.esb> --scene <file.xml|urdf> --episodes <N> --seed <S>
                 --out <root> [--backend mujoco-cpu] [--runtime torch] [--max-steps <N>]
-                [--expert so101-pick-place] [--frames <dir>]
+                [--expert so101-pick-place] [--frames <dir>] [--traj <dir>]
 es loop intervene --dataset <root> --segments <segments.json>
 es loop distill --in <root> [--in <root>...] [--train 0.8] [--val 0.1] [--test 0.1]
                 [--seed <S>] --out <root>
@@ -47,6 +47,9 @@ collect    Opens the policy bundle (spec 9.6), rolls out <N> episodes through th
            <dir>/<NNNNNN>.bin + .json -- the raw-tile format `es video mosaic` and the render
            goldens already use. It needs the `render` feature and a Vulkan device; a build
            without it refuses the flag rather than writing a dataset with a hole in it.
+           Every episode's per-tick state (qpos, qvel and every body's world pose) is
+           written to <root>/traj/ep-NNN.estraj, or to --traj <dir>; `es video showcase`
+           re-renders a run from those files with an independent camera.
            --expert replaces the policy with a scripted demonstration: it drives every
            control tick through the same chunk buffer and the same Safety Plane (INV-12),
            records action_source=Human, and needs no Torch runtime. --policy is still
@@ -366,6 +369,7 @@ fn collect(args: &[String]) -> Result<u8, CliError> {
             "--max-steps",
             "--expert",
             "--frames",
+            "--traj",
         ],
     )?;
     let expert_name = one(&pairs, "--expert").map(ToOwned::to_owned);
@@ -376,6 +380,10 @@ fn collect(args: &[String]) -> Result<u8, CliError> {
     let seed: u64 = number(&pairs, "--seed", 0)?;
     let max_steps: u32 = number(&pairs, "--max-steps", 0)?;
     let frames = one(&pairs, "--frames").map(PathBuf::from);
+    // Always recorded, never a flag to remember (packet M5/V9): the per-tick state is what
+    // `es video showcase` replays and what "what the robot did" means for provenance. It sits
+    // beside the `LeRobot` files, not inside them, so no dataset hash moves.
+    let traj_dir = one(&pairs, "--traj").map_or_else(|| out.join("traj"), PathBuf::from);
     let backend = one(&pairs, "--backend").unwrap_or("mujoco-cpu");
     let runtime = one(&pairs, "--runtime").unwrap_or("torch");
     if backend != "mujoco-cpu" {
@@ -433,6 +441,7 @@ fn collect(args: &[String]) -> Result<u8, CliError> {
         seed,
         max_steps,
         out_root: &out,
+        traj_dir: Some(traj_dir.clone()),
     };
     let nj = bundle.deployment.robot.n_joints;
     let h = bundle.deployment.action.horizon;
@@ -443,6 +452,7 @@ fn collect(args: &[String]) -> Result<u8, CliError> {
     }
     println!("wrote {}", report.root.display());
     println!("episodes: {}   frames: {}", report.episodes, report.frames);
+    println!("trajectories: {}", traj_dir.display());
     let count = |t: Termination| report.terminations.iter().filter(|x| **x == t).count();
     println!(
         "terminations: success {}   failure {}   timeout {}   running {}",

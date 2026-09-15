@@ -34,6 +34,9 @@ per timestep) plus one shared <out>/layout.json.
 
 pub fn dispatch(args: &[String]) -> i32 {
     match args.first().map(String::as_str) {
+        // The human-facing render: an independent camera over the recorded states, not the
+        // policy's observation tiles (packet M5/V9).
+        Some("showcase") => showcase(&args[1..]),
         Some("mosaic") => match parse_and_run(&args[1..]) {
             Ok(()) => 0,
             Err(VideoError::Usage(m)) => {
@@ -54,6 +57,33 @@ pub fn dispatch(args: &[String]) -> i32 {
             2
         }
     }
+}
+
+/// `es video showcase`, or the reason this build cannot run it.
+#[cfg(feature = "render")]
+fn showcase(args: &[String]) -> i32 {
+    match crate::cmd::showcase::run(args) {
+        Ok(code) => i32::from(code),
+        Err(crate::error::CliError::Usage(m)) => {
+            eprintln!("{m}");
+            2
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            1
+        }
+    }
+}
+
+/// Without the `render` feature there is no renderer to link, so the flag is refused rather
+/// than answered with an empty directory (spec 4.2: `es-render` is layer 5 and the default
+/// build of `es` pulls in no Vulkan at all).
+#[cfg(not(feature = "render"))]
+fn showcase(_args: &[String]) -> i32 {
+    eprintln!(
+        "es video showcase needs the `render` feature; this build links no renderer.          Rebuild with `cargo build -p es --features render`."
+    );
+    2
 }
 
 enum VideoError {

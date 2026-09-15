@@ -4009,6 +4009,7 @@ fn collection_and_evaluation_draw_the_same_scene_for_a_seed() {
             bundle: &bundle,
             scene: &scene,
             out_root: &out,
+            traj_dir: None,
             n_episodes: 1,
             seed: SEED,
             max_steps: 4,
@@ -4971,4 +4972,234 @@ fn dataset_bake_names_both_refusals_when_the_scene_cannot_be_loaded() {
         "why the refusal could not be answered is not in the message: {printed}"
     );
     println!("RAN dataset_bake_names_both_refusals");
+}
+
+// --- packet M5/V9: `es video showcase` -----------------------------------------------------
+
+/// `es video showcase` needs a camera and a run, and says so instead of writing an empty
+/// directory. Runs everywhere: no GPU, no backend, no fixture (spec 26.1).
+#[test]
+fn video_showcase_usage_errors_exit_2() {
+    for extra in [
+        vec!["showcase"],
+        vec!["showcase", "--run", "nowhere"],
+        vec!["showcase", "--run", "r", "--scene", "s", "--out", "o"],
+        vec![
+            "showcase", "--run", "r", "--scene", "s", "--out", "o", "--camera", "overhead",
+            "--eye", "0,0,1",
+        ],
+        vec!["showcase", "--run", "r", "--eye", "not,a,number"],
+    ] {
+        let out = bin().arg("video").args(&extra).output().expect("es video");
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{extra:?}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    println!("RAN video_showcase_usage_errors_exit_2");
+}
+
+/// Packet M5/V9's oracle -- **a replay is the run**, byte for byte.
+///
+/// The expert is driven through `es_eval::Evaluation` exactly as
+/// `expert_passes_the_evaluation_harness` drives it, but the frame source is the CPU reference
+/// rasterizer (`es_render::cpu`, the same function that generates every render golden) at the
+/// demo's own 96x96 observation `ImageSpec`, and the run records its `.estraj` trajectories.
+/// Then every tick of the trajectory is re-rendered from the *file* and compared to the frame
+/// the run wrote. If the recorded states were not the states the policy saw, or if
+/// `Trajectory::poses` were a re-derivation rather than the pose map the renderer was handed,
+/// the two would differ -- there is no tolerance here.
+///
+/// The CPU rasterizer and not a Vulkan device, deliberately: the claim is about the *states*,
+/// and the renderer is a pure function of them either way (`docs/design/renderer.md` section
+/// 5). That keeps this oracle needing only `mujoco` -- it is a **server oracle**, and prints a
+/// reason and skips without it, like the two expert oracles it sits beside.
+/// `showcase_replay_of_a_real_run_is_bit_identical` is the same claim through the GPU path and
+/// through the CLI, on a real run.
+#[test]
+#[cfg(feature = "render")]
+fn a_showcase_replay_reproduces_the_frames_the_policy_saw() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const NJ: usize = 6;
+    const H: usize = 16;
+    /// Two and a half seconds of episode: enough for the arm to move, short enough that
+    /// 2 x N software rasterizations is a test and not a job.
+    const TICKS: u32 = 120;
+
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP a_showcase_replay_reproduces_the_frames_the_policy_saw: {reason}");
+        return;
+    }
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let task = es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml");
+    let obs =
+        es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml");
+    let deploy =
+        es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml");
+    let scene = es_assets::parse_mjcf(
+        &std::fs::read_to_string(demo_scene_path()).expect("the demo scene is in the repo"),
+    )
+    .expect("the demo scene parses")
+    .scene;
+    let cube = scene
+        .joints
+        .iter()
+        .find(|j| j.kind == es_assets::scene::JointKind::Free)
+        .expect("the scene has one free-joint body to pick up")
+        .id;
+    // The camera and the size the Observation IR declares: the run's own `ImageSpec`.
+    let camera = scene.cameras.first().expect("the demo scene has a camera");
+    let rcfg = es_env::EnvRendererCfg::rgb(camera.id, 96, 96);
+    let rc = es_env::render::config(96, 96, es_render::Channel::Rgb8, es_render::RenderPath::Rs);
+    let cpu_frame = |poses: &std::collections::BTreeMap<es_core::StableId, es_math::Pose>| {
+        let tri = es_render::TriScene::from_scene_with_poses(&scene, poses)
+            .expect("the demo scene tessellates");
+        let view = es_env::render::camera_view(&scene, &rcfg, poses).expect("the camera resolves");
+        es_render::cpu::rasterize(&tri, &view, &rc, 0)
+            .tile(es_render::Channel::Rgb8)
+            .expect("an Rgb8 tile")
+            .to_bytes()
+    };
+
+    let dir = scratch_dir("showcase-replay");
+    let frames_dir = dir.join("frames");
+    let traj_dir = dir.join("traj");
+
+    let mut cfg = es_env::expert::demo_cfg(cube);
+    cfg.pace_to(&deploy, 1);
+    let expert = es_env::expert::ScriptedExpert::new(&scene, cfg).expect("the expert builds");
+    let seen: SeenState = Rc::new(RefCell::new(None));
+    let mut policy = ExpertPolicy::<NJ, H> {
+        expert,
+        seen: Rc::clone(&seen),
+    };
+    let taken = Rc::clone(&seen);
+    let mut source = |_light: &es_eval::LightOverride,
+                      model: &es_physics_core::backend::ModelInfo,
+                      state: &es_physics_core::backend::StateView<'_>| {
+        let mut row = state.qpos_of(0).to_vec();
+        row.extend_from_slice(state.qvel_of(0));
+        *taken.borrow_mut() = Some((model.clone(), row));
+        Ok::<Vec<u8>, String>(cpu_frame(&es_env::render::body_poses(model, state, 0)))
+    };
+
+    let mut ir = demo_evaluation_ir(
+        hex(&task.task_hash().expect("task hash")),
+        hex(&obs.observation_hash().expect("observation hash")),
+    );
+    ir.episodes = es_ir::evaluation::EpisodeBatch {
+        n_episodes: 1,
+        seeds: es_ir::evaluation::SeedPlan::Explicit(vec![SEEDS[0]]),
+    };
+    ir.suites.truncate(1);
+    assert_eq!(ir.suites[0].name, "nominal");
+    let mut sink = es_eval::FrameSink::new(&frames_dir);
+    es_eval::Evaluation::run_with_frames::<es_physics_backend::MuJoCoCpuBackend, _, NJ, H>(
+        &ir,
+        &task,
+        &scene,
+        &obs,
+        &mut policy,
+        &deploy,
+        es_physics_backend::MuJoCoCpuBackend::new,
+        &es_eval::RunConfig {
+            max_steps: Some(TICKS),
+            traj_dir: Some(traj_dir.clone()),
+            ..es_eval::RunConfig::default()
+        },
+        Some(&mut source),
+        Some(&mut sink),
+    )
+    .expect("the expert runs through the evaluation harness");
+
+    // The replay: the trajectory file alone, no backend, no policy, no `StateView`.
+    let traj = es_env::traj::Trajectory::read(&traj_dir.join("nominal-00.estraj"))
+        .expect("the run wrote a trajectory");
+    let cell = frames_dir.join("nominal-00");
+    assert_eq!(
+        traj.ticks(),
+        sink.events["nominal-00"].len(),
+        "one trajectory record per frame the run wrote"
+    );
+    assert!(traj.ticks() > 0, "the run recorded nothing");
+    for tick in 0..traj.ticks() {
+        let recorded = std::fs::read(cell.join(format!("{tick:06}.bin")))
+            .unwrap_or_else(|e| panic!("frame {tick}: {e}"));
+        assert_eq!(
+            cpu_frame(&traj.poses(tick)),
+            recorded,
+            "frame {tick} differs: the replayed state is not the state the policy saw"
+        );
+    }
+    println!(
+        "RAN a_showcase_replay_reproduces_the_frames_the_policy_saw: {} frame(s) identical",
+        traj.ticks()
+    );
+}
+
+/// The same claim on a real run and through the real command: `es video showcase --camera
+/// <the run's own camera> --width/--height <the run's own ImageSpec>` reproduces the frames
+/// `es eval run --frames` wrote, byte for byte, on the GPU path.
+///
+/// `#[ignore]`: it needs a finished run with both `traj/` and `frames/` in it, and a Vulkan
+/// device. `ES_SHOWCASE_RUN` points at the run directory and `ES_SHOWCASE_CELL` at one of its
+/// cells (default `nominal-00`).
+#[test]
+#[ignore = "needs a finished run with traj/ and frames/ (ES_SHOWCASE_RUN) and a GPU"]
+fn showcase_replay_of_a_real_run_is_bit_identical() {
+    let Ok(run) = std::env::var("ES_SHOWCASE_RUN") else {
+        println!("SKIP showcase_replay_of_a_real_run_is_bit_identical: ES_SHOWCASE_RUN unset");
+        return;
+    };
+    let run = PathBuf::from(run);
+    let cell = std::env::var("ES_SHOWCASE_CELL").unwrap_or_else(|_| "nominal-00".to_owned());
+    let recorded = run.join("frames").join(&cell);
+    let out = scratch_dir("showcase-real").join("replay");
+    let got = bin()
+        .args(["video", "showcase", "--run"])
+        .arg(&run)
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .args(["--camera", "overhead", "--width", "96", "--height", "96"])
+        .args(["--cell", &cell])
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("run es video showcase");
+    let text = format!("{}{}", stdout(&got), String::from_utf8_lossy(&got.stderr));
+    assert_eq!(got.status.code(), Some(0), "{text}");
+
+    let mut n = 0usize;
+    loop {
+        let name = format!("{n:06}.bin");
+        let (Ok(a), Ok(b)) = (
+            std::fs::read(recorded.join(&name)),
+            std::fs::read(out.join(&name)),
+        ) else {
+            break;
+        };
+        assert_eq!(a, b, "frame {n} of {cell} differs");
+        n += 1;
+    }
+    assert!(
+        n > 0,
+        "no frames compared: {} vs {}",
+        recorded.display(),
+        out.display()
+    );
+    // The replay must not stop early either.
+    let on_disk = std::fs::read_dir(&recorded)
+        .expect("the recorded cell")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+        .count();
+    assert_eq!(
+        n, on_disk,
+        "the replay rendered {n} of {on_disk} recorded frames"
+    );
+    println!("RAN showcase_replay_of_a_real_run_is_bit_identical: {n} frame(s) identical");
 }

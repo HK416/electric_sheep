@@ -76,6 +76,7 @@ line of stderr. A partial report is never written.
 
     --out <dir>        output directory (default: ./eval-out)
     --frames <dir>     render every step here (needs the `render` feature)
+    --traj <dir>       per-episode `.estraj` state trajectories (default <out>/traj)
     --backend <name>   physics backend; only `mujoco-cpu` is supported (default, spec 17.1)
     --runtime <name>   policy runtime; only `torch` is supported (default, spec 2.4)
     --jobs <N>         worker processes for the cells (default 1); 0 is refused
@@ -224,6 +225,8 @@ struct RunArgs {
     scene: String,
     out: PathBuf,
     frames: Option<PathBuf>,
+    /// Where the per-episode `.estraj` state trajectories go; `<out>/traj` unless named.
+    traj: Option<PathBuf>,
     backend: String,
     runtime: String,
     /// Worker processes to partition the cells over. 1 is the sequential path, which is the
@@ -238,6 +241,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
     let (mut config, mut policy, mut scene, mut out) = (None, None, None, None);
     let (mut backend, mut runtime) = ("mujoco-cpu".to_owned(), "torch".to_owned());
     let (mut frames, mut jobs, mut shard, mut shard_out) = (None, 1u32, None, None);
+    let mut traj = None;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -252,6 +256,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
             "--scene" => scene = Some(val()?.clone()),
             "--out" => out = Some(PathBuf::from(val()?)),
             "--frames" => frames = Some(PathBuf::from(val()?)),
+            "--traj" => traj = Some(PathBuf::from(val()?)),
             "--backend" => backend.clone_from(val()?),
             "--runtime" => runtime.clone_from(val()?),
             "--jobs" => {
@@ -298,6 +303,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
         scene: req(scene, "--scene")?,
         out: out.unwrap_or_else(|| PathBuf::from("eval-out")),
         frames,
+        traj,
         backend,
         runtime,
         jobs,
@@ -627,8 +633,13 @@ fn run(args: &[String]) -> Result<u8, CliError> {
         )
         .map_err(|e| CliError::Runtime(e.to_string()))?;
 
+    // Always recorded, never a flag to remember: a run that cannot say what the arm did is a
+    // run nobody can re-render or audit, and an episode of it is under a megabyte (packet
+    // M5/V9). `--traj` only moves it.
+    let traj_dir = a.traj.clone().unwrap_or_else(|| a.out.join("traj"));
     let cfg = RunConfig {
         created: now_unix(),
+        traj_dir: Some(traj_dir.clone()),
         ..RunConfig::default()
     };
     let nj = bundle.deployment.robot.n_joints;
@@ -702,6 +713,8 @@ fn run(args: &[String]) -> Result<u8, CliError> {
             sink.dir.display()
         );
     }
+
+    println!("trajectories: {}", traj_dir.display());
 
     let mut ok = true;
     for r in &report.acceptance {
@@ -810,6 +823,10 @@ fn spawn_shards(a: &RunArgs, jobs: u32) -> Result<Vec<es_eval::Shard>, CliError>
         if let Some(f) = &a.frames {
             cmd.arg("--frames").arg(f);
         }
+        // Cell names are globally unique and shards own disjoint cells, so the trajectories
+        // share one directory exactly as the frames do, with nothing to merge.
+        cmd.arg("--traj")
+            .arg(a.traj.clone().unwrap_or_else(|| a.out.join("traj")));
         for (name, value) in &thread_env {
             cmd.env(name, value);
         }
