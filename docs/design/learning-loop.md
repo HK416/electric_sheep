@@ -68,12 +68,19 @@ file exists. Overlap is resolved only in the per-frame column, where it is a boo
 
 ### 2.2 Per-frame columns
 
-Two columns join the LeRobot feature set:
+Three columns join the LeRobot feature set:
 
 | feature | dtype | shape | meaning |
 |---|---|---|---|
 | `intervention` | `int64` | `[1]` | `0` or `1`: is this frame inside any segment |
 | `action_source` | `int64` | `[1]` | `0` policy, `1` clamped, `2` fallback, `3` human |
+| `action_commanded` | `float32` | `[nu]` | the pre-plane command of that tick (packet M5/V1c) |
+
+`action` is the `SafeAction` the plane handed toward the actuator; `action_commanded` is the
+row the chunk buffer served for the same tick, before the plane judged it. What is executed is
+what is recorded, and what was asked for is kept beside it — so a `Clamped` frame can be read
+without re-running the plane. On a tick the buffer had no row for there was no command, and the
+column repeats the plane's own answer; `action_source` reads `2` (fallback) for exactly those.
 
 `intervention` is a `u8` value in §13.2's sense; it is stored as `int64` because the four
 column dtypes this crate reads and writes are `float32 / float64 / int64 / bool` (see

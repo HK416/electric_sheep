@@ -73,12 +73,19 @@ machine이 주도하는 intervener다(고전적 컨트롤러, 재생된 시연, 
 
 ### 2.2 프레임별 컬럼
 
-두 개의 컬럼이 LeRobot 피처 집합에 합류한다:
+세 개의 컬럼이 LeRobot 피처 집합에 합류한다:
 
 | feature | dtype | shape | meaning |
 |---|---|---|---|
 | `intervention` | `int64` | `[1]` | `0` 또는 `1`: 이 프레임이 어떤 세그먼트 안에 있는가 |
 | `action_source` | `int64` | `[1]` | `0` policy, `1` clamped, `2` fallback, `3` human |
+| `action_commanded` | `float32` | `[nu]` | 그 틱의 플레인 통과 이전 명령 (패킷 M5/V1c) |
+
+`action`은 플레인이 액추에이터 쪽으로 건넨 `SafeAction`이고, `action_commanded`는 같은 틱에 청크
+버퍼가 내어준 행, 즉 플레인이 판정하기 전의 값이다. 실행된 것이 기록되는 것이고 요청된 것은 그
+옆에 남는다 — 그래서 `Clamped` 프레임을 플레인을 다시 돌리지 않고 읽을 수 있다. 버퍼에 그 틱의
+행이 없었던 틱에는 명령 자체가 없었으므로 컬럼은 플레인 자신의 답을 되풀이하며,
+`action_source`는 정확히 그 틱들에서 `2`(fallback)를 읽는다.
 
 `intervention`은 §13.2의 의미에서는 `u8` 값이다; `int64`로 저장되는 이유는 이
 크레이트가 읽고 쓰는 네 가지 컬럼 dtype이 `float32 / float64 / int64 / bool`이기

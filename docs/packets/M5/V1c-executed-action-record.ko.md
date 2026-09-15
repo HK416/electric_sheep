@@ -63,8 +63,11 @@ crates/es-data/src/lib.rs
 crates/es-data/tests/loop_learning.rs
 crates/es-data/tests/lerobot_v3.rs
 crates/es/src/cmd/loop.rs
+crates/es/tests/cli.rs
 docs/api-notes/lerobot-dataset.md
 docs/api-notes/lerobot-dataset.ko.md
+docs/design/learning-loop.md
+docs/design/learning-loop.ko.md
 docs/design/visible-learning.md
 docs/design/visible-learning.ko.md
 docs/packets/M5/V1c-executed-action-record.md
@@ -81,9 +84,10 @@ V1b의 익스포터가 옳게 쓰였다는 증거다.
 ## spec
 
 - **§9.3, §9.4, INV-12.** 아무것도 우회하지 않고 아무것도 끄지 않는다. 플레인은 이미 API가 있는
-  입력 하나를 받을 뿐이고(`observe_state`, 문서 주석 자체가 "실제 자세를 아는 호출자는 이것을
-  호출한다"고 말한다), `validate`는 시그니처를 유지한다(INV-13). 액추에이터로 가는 값은 여전히
-  `SafeAction`뿐이고, `action_commanded`는 디스크 위의 출처 기록이며 제어 경로로 되읽히지 않는다.
+  호출 하나를 에피소드당 한 번 받을 뿐이고(`observe_state`, 문서 주석 자체가 "실제 자세를 아는
+  호출자는 첫 `validate` 전에 이것을 호출한다"고 말한다), `validate`는 시그니처를
+  유지한다(INV-13). 액추에이터로 가는 값은 여전히 `SafeAction`뿐이고, `action_commanded`는 디스크
+  위의 출처 기록이며 제어 경로로 되읽히지 않는다.
 - **§13.2.** 수집된 프레임은 자기 출처를 싣는다. `action_source`는 액추에이터 값이 *어떻게*
   만들어졌는지 이미 말했고, `action_commanded`는 *무엇을 요청했는지*를 말한다. 플레인을 다시
   돌리지 않고 `Clamped` 프레임을 읽을 수 있게 하는 것이 그것이다.
@@ -126,10 +130,17 @@ cargo xtask ci
   하며, 적어도 하나의 `action_commanded` 값은 밖이어야 한다. 출처 컬럼을 클램프한 라이터도,
   명령을 액션으로 기록한 라이터도 이 테스트에 걸린다.
 - `crates/es-data/tests/loop_learning.rs`: **`a_second_episode_repeats_the_first_exactly`** —
-  에피소드 리셋 회귀. 픽스처의 균등 리셋 추출을 상수로 고정하고 속도 엔벌로프를 좁히면 한 실행의
-  두 에피소드는 물리적으로 동일하다. 그러면 `action`, `action_commanded`, `observation.state`,
-  `action_source`가 행 단위로 같아야 한다. **이 패킷 이전에는 실패함을 측정했다**(에피소드 1이
-  에피소드 0의 마지막 명령에서 이어져 `0.065`로 시작, 에피소드 0은 `0.005`).
+  에피소드 리셋 회귀의 플레인 쪽. 픽스처의 균등 리셋 추출을 상수로 고정하고 속도 엔벌로프를
+  좁히면 한 실행의 두 에피소드는 물리적으로 동일하다. 그러면 `action`, `action_commanded`,
+  `observation.state`, `action_source`가 행 단위로 같아야 한다. **이 패킷 이전에는 실패함을
+  측정했다**(에피소드 1이 에피소드 0의 마지막 명령에서 이어져 `0.065`로 시작, 에피소드 0은
+  `0.005`).
+- `crates/es-data/tests/loop_learning.rs`:
+  **`frame_zero_is_not_a_hook_an_intervener_may_reset_on`** — 전문가 쪽이고, 실제로 중요한 쪽이다.
+  제어 틱 하나의 추론 지연을 선언한 계약에서 개입자의 **어떤** 호출도, 어떤 에피소드에서도
+  `frame == 0`이 아니다. `es loop collect --expert`가 세웠던 가정이 바로 그것이고, 테스트는 그것을
+  주석이 아니라 수집기의 속성으로 진술한다. 픽스처는 `expected_latency_ms = 0.0`을 선언했고,
+  그래서 V1 자신의 오라클은 이것을 볼 수 없었다.
 - `crates/es-env/src/expert.rs`: `reset_restarts_the_ramp_from_the_measured_joints` — 같은 경계의
   전문가 쪽. 이미 올발랐고 이제 고정된다: `reset` 뒤 첫 청크는 이전 에피소드 적분기의 연장이
   아니라 측정된 관절에서 `step_max` 하나 떨어진 값이다.
@@ -142,9 +153,13 @@ cargo xtask ci
 
 ```
 cargo test -p es-data --test lerobot_v3 -- --ignored --nocapture      # RAN lerobot_v3_export
-cargo test -p es --test cli -- --ignored expert_solves_the_pinned_seeds
-es loop collect --expert so101-pick-place --episodes 3 --seed 1       # 1이 아니라 3 성공
+cargo test -p es --test cli expert_solves_the_pinned_seeds            # 8/8, 변화 없음
+es loop collect --expert so101-pick-place --episodes 50 --seed 1      # 1이 아니라 50 성공
 ```
+
+`expert_solves_the_pinned_seeds`가 이 패킷이 수집/평가 비대칭을 얼마나 떠맡을 수 있는지를
+결정하는 가드다. `0.875` 임계값은 전문가의 속성이고 그것을 낮추는 것은 골든을 고치는 것이다.
+수집기가 플레인을 언제 심는지를 바꾸는 어떤 변경도 이 테스트를 8/8로 유지해야 한다.
 
 **측정**(플랜 V의 목적, CI 티어가 아니라 오라클 서버): 학습 50 에피소드와 홀드아웃 5
 에피소드를 프레임과 함께 **한 개의** `es loop collect --episodes 50` 명령으로 재수집하고,
@@ -185,9 +200,12 @@ info.json features:
   "action_commanded":  { "dtype": "float32", "shape": [nu] }   # 신규
 ```
 
-- `Collector::run`은 매 `step_with_policy` 직전에 백엔드 자신의 관절 상태로
-  `planes[0].observe_state(&q, &qd)`를 호출한다. `es_eval::runner`가 호출하는 것과 사이클상 같은
-  지점이다.
+- `Collector::run`은 매 에피소드의 첫 프레임에서 백엔드 자신의 관절 상태로
+  `planes[0].observe_state(&q, &qd)`를 호출한다 — 메서드 문서가 요구하는 "첫 `validate` 전에".
+  매 스텝이 **아니다**: 그것은 `es_eval::runner`의 엔벌로프 해석이고, 다른 해석이며, 여기서
+  채택하면 전문가가 V1 자신의 오라클에서 2/8로 떨어진다.
+- `es loop collect --expert`는 **에피소드 인덱스**가 바뀔 때 스크립트 전문가를 리셋하며, 결코
+  `frame == 0`에 의존하지 않는다.
 - `action`은 의미도 바이트도 그대로다: `ep.ctrl`, 즉 `emit_actions`와 `Env::step`이 복사한
   `safe.q`. 이 패킷은 `action`이 무엇인지를 바꾸지 않는다. 그것이 무엇인지를 *구성상 참*으로 만들고
   오라클로 고정한다.

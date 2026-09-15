@@ -1065,6 +1065,169 @@ still does not work, but it now fails for a reason with a number attached to it.
 copies through the server's `ffmpeg 7.0.2`. The mp4 is not in the hash chain (section 9); the
 frames are.
 
+### 7.10 As built (V1c): what is executed is what is recorded, and where the arm actually stops
+
+Section 7.9 ended on open question 12: the demonstrations' action convention and the Deployment
+IR's envelope were never checked against each other, and three ends could move. V1c checked them,
+and the first thing it found is that the question's premise was off by one packet.
+
+**1. `action` was already the executed action.** `DomainRunner::emit_actions` copies
+`SafeAction::q` into `ctrl`, `Env::step` records `ctrl`, `to_lerobot` writes it as `action`. Open
+question 12's option (a) — "record `action` as the next commanded position rather than the servo
+target" — describes a change that was already in the code. Nobody could see it, because nothing in
+the repository asserted it and the pre-plane command was thrown away, so a `Clamped` frame could
+not be read without re-running the plane. V1c pins it (`ctrl` is `SafetyPlane::last_safe_action()`
+bit for bit, `f64::to_bits`, no tolerance) and keeps the command in a second column,
+`action_commanded`. That moves `dataset_schema_hash`; `task_hash`, `observation_hash`,
+`learning_hash` and `lowering_hash` do not move, and `lerobot 0.6.1` reads the extra feature
+through V1b's v3.0 export (`RAN lerobot_v3_export`, with `"action_commanded": {"dtype":
+"float32"}` in the features it reports back).
+
+**2. "`es loop collect --episodes N` only solves episode 0" was the inference phase, not the
+plane and not the expert's `reset`.** Section 7.6's finding 5 named three suspects and all three
+were wrong. `es loop collect --expert` resets `ScriptedExpert` from the intervener hook on
+`frame == 0`; that hook is `PolicyRuntime::infer`, which runs when a submitted observation is
+*released* — `expected_latency_ms` ticks after the submit (section 12.3 of the spec). The demo's
+`learning.toml` declares `15.0` ms against a 20 ms control period, so the first call of every
+episode is frame 1 and **`frame == 0` never fires at all**. It looked correct only because a
+freshly constructed `ScriptedExpert` starts reset: episode 0 needs no reset and gets away with it,
+and every episode after it runs with the previous one's stage and latched cube. Keying on the
+episode index takes `--episodes 50 --seed 1` from **1/50 to 50/50**, and the held-out five from
+0/5 to 5/5 — in one command each. `crates/es-data`'s fixture declared `expected_latency_ms = 0.0`,
+which is exactly why V1's own oracle could not have seen it; the regression test now states the
+property (`frame_zero_is_not_a_hook_an_intervener_may_reset_on`: with a declared latency, **no**
+call of the intervener has frame 0).
+
+A second, smaller instance of the same class: `Collector::run` reset the env, the chunk buffers
+and the e-stop latch between episodes but never the plane's hold target, velocity or rate history,
+so the plane opened each episode believing the arm was still where the last command left it. It is
+now seeded from the measured pose on the first frame of every episode — which is what
+`SafetyPlane`'s own documentation says a caller that knows the real pose does before the first
+`validate` — and `a_second_episode_repeats_the_first_exactly` fails without it.
+
+**3. The collect path and the evaluation path disagree about what the envelope is measured
+against, and that disagreement is not closable from the collector.** `es_eval::runner`,
+`es_ros2::hil` and `es_runtime_embedded` call `observe_state` before **every** `validate`, which
+re-seeds `last_safe`, `prev_safe`, `vel` and `prev_vel`; the envelope is then a bound on the
+**following error**. With the demo's numbers the binding stage is acceleration, and the bound is
+`a − q − q̇·dt ≤ acceleration_max · dt² = 0.008` rad. `Collector::run` seeds once per episode, so
+inside an episode the envelope bounds *commanded* motion — which is what `ScriptedExpert::chunk`
+paces itself to, and its doc comment says so in as many words.
+
+Making the collector re-seed every step was implemented and measured, because that is the change
+that would make the two paths agree. It drops the scripted expert to **2/8 on
+`expert_solves_the_pinned_seeds`** (threshold `0.875`, a golden) and to **0/16 on the evaluation's
+own seeds 101–116**, and a 50-episode collect to 18/50. The reason is structural: the expert plans
+a 16-row chunk executed over 10 ticks from the pose at chunk start, and no re-pacing of
+`step_max` / `accel_max` / the anti-windup lead satisfies a 0.008 rad following-error bound across
+ten open-loop ticks. The two knobs that would are `deployment.toml`'s envelope and
+`execute_chunk`, and both are outside V1c. So the asymmetry stays, written down with numbers
+instead of guessed at, and open question 12 stays open — with option (a) struck off as already
+done and option (c) answered below.
+
+**The diagnostic that decides how to read everything else: open question 12's option (c), run.**
+V2b's own 20,000-step checkpoint was re-packed into a bundle whose deployment document is a
+*scratch* copy — `velocity_max` 3.0 → 30.0, `acceleration_max` 20.0 → 400.0, `ee_velocity_max`
+0.6 → 6.0, both action-rate limits → 1.0, everything else including the watchdogs untouched — and
+run over the same 16 nominal episodes. The committed fixture was not edited and nothing was
+disabled (INV-12); `weights_hash`, `lowering_hash`, `task_hash` and `observation_hash` all match
+V2b's, so only the envelope moved.
+
+| | V2b, committed envelope | the same bundle, widened |
+|---|---|---|
+| `success_rate` (nominal, 16) | 0.0000 | **0.0000** |
+| `episode_length` | 900.00 | 900.00 (16/16 timeout) |
+| `envelope_violation_rate` | 1.0000 | **0.0551** |
+| `ActionSource::Policy` | 0 / 86,400 | **13,606 / 14,400** |
+| `ActionSource::Clamped` | 77,880 | 794 |
+| `ActionSource::Fallback` | 8,520 | **0** |
+
+**So the Safety Plane was not what was stopping the arm.** Given an envelope it does not fight,
+ACT drives 94.5 % of the steps itself, the watchdog never latches, and the success rate is
+unchanged at zero with every episode running out its full 900-step budget. Widening the envelope
+buys a policy that moves and still cannot do the task. That is worth knowing before anyone spends
+a packet on option (b), and it is why V1c's own retraining below is reported as a measurement of
+the demonstrations' convention and not as an attempt to pass `success_rate >= 0.5`.
+
+**What was measured, on the oracle server, 2026-09-15.** Every training knob is V2's and V2b's:
+`--batch 8 --lr 1e-4 --seed 0`, checkpoints at 1k/5k/20k, the same 50 training episodes and the
+same 5 held out. What moved is the collection: **one** `es loop collect --episodes 50 --seed 1`
+command instead of fifty single-episode runs merged by `es loop distill`, with the expert reset
+per episode and the plane seeded per episode. 50/50 `Success`, 5/5 on the held-out set, 18,263
+frames (against V2's 17,697), baked to 1.9 GB with `observation_hash f4a50730…55f6e0` and
+`lowering_hash 956abb67…ec6d` — both byte-identical to V2's and V2b's, so neither the observation
+nor the architecture moved.
+
+The demonstrations themselves changed, and this is the packet's own result:
+
+| | V2b's set | V1c's set |
+|---|---|---|
+| `\|action − qpos\|`, median over all frames | 0.2413 | **0.0027** |
+| the same, arm joints 0–4 only | — | 0.0009 |
+| the same, gripper (joint 5) | — | 0.1436 |
+| frames where `action ≠ action_commanded` | not recorded | 11,580 / 18,263 |
+| `action_source` | — | 11,581 clamped, 6,631 human, 50 fallback, 1 policy |
+
+A hundredfold drop in the lead, from seeding the plane with the arm's real pose at the start of
+each episode rather than letting `last_safe` start at zero and drift. The 50 fallbacks are one
+per episode — the chunk underrun on frame 0, before the first inference result exists — and the
+violation-rate watchdog never fires once, against V2b's ~10 % of steps.
+
+Training loss, L1 over the action chunk, mean of the 100 steps ending at each mark:
+
+| step | 1 | 100 | 1,000 | 5,000 | 20,000 |
+|---|---|---|---|---|---|
+| V2 (raw state) | 0.7267 | 0.1825 | 0.0507 | 0.0309 | 0.0171 |
+| V2b (baked) | 0.7261 | 0.2085 | 0.0528 | 0.0325 | 0.0166 |
+| V1c (baked, re-collected) | 0.7476 | 0.2053 | 0.0560 | 0.0319 | **0.0176** |
+
+The same curve for the third time. Success rate, 16 held-out episodes on seeds 101–116:
+
+| checkpoint | V3 nominal | V2b nominal | V1c nominal | V1c mean episode length |
+|---|---|---|---|---|
+| 1,000 steps | 0.0625 (1/16) | 0.1250 (2/16) | 0.0000 (0/16) | 900.0 |
+| 5,000 steps | 0.0000 (0/16) | 0.0625 (1/16) | 0.0000 (0/16) | 900.0 |
+| 20,000 steps | 0.1250 (2/16) | 0.0000 (0/16) | **0.0625 (1/16)** | 876.7 |
+
+and the 20,000-step checkpoint across the suite, 16 episodes each:
+
+| suite | V3 | V2b | V1c |
+|---|---|---|---|
+| nominal | 0.1250 | 0.0000 | 0.0625 |
+| light_intensity | 0.0625 | 0.0000 | 0.1250 |
+| light_direction | 0.1250 | 0.0000 | 0.0000 |
+| observation_delay | 0.1250 | 0.0000 | 0.0000 |
+| torque_noise | 0.0000 | 0.0000 | 0.0000 |
+| backlash | 0.0000 | 0.0000 | 0.1250 |
+
+Four `Success` episodes in 96, against V2b's zero and V3's two. **`evaluation.toml` asks for
+`success_rate >= 0.5`. The nominal suite measured `0.0625`. It fails, and nothing was lowered to
+make it not fail.** Every V1c cell still reports `envelope_violation_rate 1.0000`, and across the
+six suites 84,772 frames are 76,412 `Clamped` and 8,360 `Fallback` with **not one
+`ActionSource::Policy`** — because the evaluation path's reading of the envelope bounds the
+following error at 0.008 rad, and no imitation policy at an L1 of 0.0176 is that precise. Cleaning
+up the demonstrations did not change that, and could not have: it is a property of the two
+readings, not of the data.
+
+Run through the same widened scratch envelope as the diagnostic above, V1c's 20,000-step
+checkpoint reports `envelope_violation_rate 0.4127`, 8,457 `Policy` and 5,943 `Clamped` steps of
+14,400 (almost all `violation.position` — the policy commands poses past the joints' soft
+limits), no fallback at all, and `success_rate 0.0000`. Both policies, freed of the plane, move
+and neither does the task.
+
+**So the honest reading of V1c is: the demonstrations were fixed, the collection loop was fixed,
+and the demo still does not work — and for the first time the reason is not downstream of either.
+The bottleneck is the policy.** Three packets have now each removed one confound (V2b the
+observation, V1c the demonstrations and the episode loop, the two diagnostics the envelope), and
+what is left is 50 demonstrations, 20,000 optimizer steps, and an ACT that imitates a training
+frame to 0.0176 L1 and generalizes to a held-out cube pose about one time in sixteen.
+
+**Video.** `es video mosaic --grid 4x4` over the 16 nominal cells and `python/es/encode_video.py
+--fps 50`, the same pipeline V3 and V2b used: 900 frames of 384x392 each,
+`demo-{1000,5000,20000}.mp4` at 12.9 / 12.7 / 11.4 MB `mp4v` and 2.0 / 1.9 / 1.7 MB for the H.264
+copies through the server's `ffmpeg 7.0.2`. The mp4 is not in the hash chain (section 9); the
+frames are.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -1201,3 +1364,18 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     to find out whether the policy can do the task at all**, then (a) or (b) to earn the tight
     envelope back. V2b does none of them — it is forbidden from `es-safety`, `es-env` and
     `deployment.toml` — and its contribution is that the number above exists.
+
+    **Partly answered (V1c, section 7.10), and the question is now sharper.** ~~(a)~~ was already
+    done: `action` has always been the post-plane `SafeAction`, and V1c only asserts it and adds
+    `action_commanded` beside it. **(c) was run** on V2b's own 20,000-step checkpoint through a
+    scratch deployment document: `envelope_violation_rate` falls `1.0000 -> 0.0551`, `Fallback`
+    falls `8,520 -> 0`, `ActionSource::Policy` rises `0 -> 13,606 of 14,400` — and `success_rate`
+    stays `0.0000`, every episode a 900-step timeout. **The plane was not what was stopping the
+    arm.** V1c also found that the collect and evaluation paths measure the envelope against two
+    different references (commanded motion against following error), that closing that from the
+    collector costs the scripted expert its own oracle (2/8 against a pinned 0.875), and that
+    "only episode 0 is solved" was none of section 7.6's three suspects but the inference phase
+    (`frame == 0` never fires when a latency is declared; fixed, 1/50 -> 50/50). What is left for a
+    human is narrower: **(b)**, a delta action space, or **(c)** as a permanent widening of the
+    demo's `deployment.toml` — and (c) now has to be argued on grounds other than success rate,
+    because it does not move it.

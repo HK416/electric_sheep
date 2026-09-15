@@ -69,6 +69,8 @@ crates/es/src/cmd/loop.rs
 crates/es/tests/cli.rs
 docs/api-notes/lerobot-dataset.md
 docs/api-notes/lerobot-dataset.ko.md
+docs/design/learning-loop.md
+docs/design/learning-loop.ko.md
 docs/design/visible-learning.md
 docs/design/visible-learning.ko.md
 docs/packets/M5/V1c-executed-action-record.md

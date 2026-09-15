@@ -438,6 +438,10 @@ impl Collector {
                 // instead -- which is what `es_eval::runner` does, and the disagreement
                 // between the two is design note section 7.10, not something this packet may
                 // settle (`deployment.toml` and the expert's pacing are both forbidden here).
+                //
+                // `frame` here is this loop's own counter, which really is 0 once per episode.
+                // The `frame` an *intervener* sees is not (`infer` runs on release, not on
+                // submit) — see `frame_zero_is_not_a_hook_an_intervener_may_reset_on`.
                 if frame == 0 {
                     let state = env.backend().state();
                     let (mut q, mut qd) = ([0.0; NJ], [0.0; NJ]);
