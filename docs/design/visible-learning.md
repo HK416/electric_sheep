@@ -2647,6 +2647,136 @@ own ACT, 100,000 steps). **Do not move a second variable here.** The next packet
 hypothesis and one variable — resolution or demonstration count — and V11's numbers are the
 baseline it is compared against.
 
+### 7.21 As built (V13): the deployed function was not the trained function
+
+Packet `docs/packets/M5/V13-groupnorm-backbone.md`. Lowering rule:
+`docs/design/learning-lowering.md` section 5.1.
+
+Every IR-owned vision policy of plan V reported a small loss and then scored zero closed-loop.
+V11's open-loop analysis of its own checkpoint, over its own training episodes, found why, and
+it is not drift, not the blend and not the pairing: **`train()` and `eval()` were different
+functions.**
+
+**The mechanism.** `lower_to_torch` lowered `VisionEncoder { ResNet18, pretrained: false }` to
+torchvision's `resnet18()`, whose default norm layer is `BatchNorm2d` — 20 of them, and the only
+modules in the whole graph with running statistics (`n1`/`n2`/`n4`/`n6` are `Linear`, `n3` is a
+`TransformerEncoder`, i.e. LayerNorm). The lowering is single-sample by construction: spec 8.3's
+ports carry no batch axis — spec 5.2 gives the inference domain its own batch size — so the
+image goes through `.unsqueeze(0)` and the head through `.reshape(16, 6)`.
+`python/es/train_act.py --batch 8` therefore accumulates eight *single-sample* forwards, and
+every `BatchNorm2d` fitted **N = 1** statistics: instance normalization with a batch counter.
+`crates/es-policy/python/torch_ref.py:85` then calls `model.eval()`, which swaps in the running
+averages the training never used.
+
+| V11's checkpoint, 10-row chunk L1 over its own training episodes | |
+|---|---|
+| `train()` — what training minimized, and what the loss curve reported | **0.011** |
+| `eval()` — what `es eval run` actually executed | **0.031 – 0.039** |
+| `eval()` after recalibrating the running statistics over all 9,038 frames, batches of 64 | 0.029 |
+| baseline: hold the current pose for every row | 0.048 |
+
+The recalibration row is the one that decides it. It is the best any post-processing of the
+weights can do — the same tensors a batched forward would have handed those BatchNorms, 155
+updates over the whole training set — and it gets a fifth of the way. The fix has to be in the
+lowering.
+
+**The decision** (architect): for `pretrained: false`, lower with
+`norm_layer = lambda c: nn.GroupNorm(32, c)`. GroupNorm normalizes over channel groups of the one
+sample in front of it; it has no `training` branch and no running buffers, so the two modes are
+the same function bit for bit, the single-sample lowering stays valid, and the running-statistics
+buffers leave the weight contract. It is what Diffusion Policy substitutes into ResNet for
+exactly this reason, and 32 groups divides every ResNet stage width. This is a **lowering**
+decision — §8.3 pins no normalization — so `lowering_hash` and `compiler_hash` move and
+`learning_hash` does not. The `pretrained: true` path is untouched: still refused here, and
+LeRobot checkpoints keep ImageNet's BatchNorm as `FrozenBatchNorm2d` through `lerobot.rs` (V8),
+which is right because frozen affine constants have no training mode either.
+
+The declared weight keys did not move — the backbone is the prefix claim `nodes.0.*`, all 14
+keys byte-identical to V11's — so what changed is the set of tensors *under* the claim: the
+checkpoint went from 146 tensors to **86**, the 60 missing ones being
+`running_mean`/`running_var`/`num_batches_tracked` × 20.
+
+**Measured.** V11's recipe on V11's own baked set, one variable moved:
+`es policy lower` (`lowering_hash` `fdd68ec4…` → `70a8fec7…`, weight keys unchanged) →
+`train_act.py --batch 8 --lr 1e-4 --seed 0 --device cuda --resident-gpu`, 20,000 steps →
+`es policy pack`.
+
+| | V11 (BatchNorm) | **V13 (GroupNorm)** |
+|---|---|---|
+| training loss, initial → final | 0.0565 → 0.0132 | 0.0607 → **0.0147** |
+| wall clock, 20,000 steps, RTX 4090 (shared) | 654 s | 719 s |
+| checkpoint tensors | 146 | **86** |
+| running-statistic buffers in the module | 60 | **0** |
+| open-loop chunk L1, `eval()` — the inference path | 0.0313 / 0.0373 / 0.0385 | **0.0132 / 0.0135 / 0.0133** |
+| open-loop chunk L1, `train()` — what the loss reported | 0.0107 / 0.0122 / 0.0111 | 0.0136 / 0.0139 / 0.0139 |
+| baseline: hold the current pose | 0.0484 / 0.0488 / 0.0481 | 0.0484 / 0.0488 / 0.0481 |
+| `max abs(train() − eval())`, backbone alone, fixed input | — | **0** (bit-identical) |
+
+The two rows converged: `eval()` now *matches the reported loss* (0.0133 against 0.0147) instead
+of being three times it, and `train()` is now very slightly the worse of the two, which is what
+dropout predicts. The remaining whole-module difference is 0.0169 and is entirely dropout — the
+three `nn.Dropout` members of `nn.TransformerEncoderLayer` plus `MultiheadAttention`'s attention
+dropout, which is a float read off `self.training` rather than a module. Force all four to zero
+and the whole module is bit-identical between the modes; that is `identity.py`'s assertion and
+the oracle `the_backbone_computes_the_same_function_in_train_and_eval` is the Python-side half
+of it. Dropout is intended regularization and it works in the safe direction (inference runs the
+expectation), which is also why V11's 0.011 was, if anything, *pessimistic*: the whole 3x gap
+was the normalization.
+
+**Closed loop: the arm now arrives at the cube, and still does not solve the task.**
+`es eval run` with frames, `--jobs 6`, on V11's own two suites — the training seeds 1–16 and the
+held-out seeds 101–116:
+
+| | V11 (BatchNorm) | **V13 (GroupNorm)** |
+|---|---|---|
+| `success_rate`, training seeds 1–16 | 0 / 16 | **0 / 16** |
+| `success_rate`, held-out seeds 101–116 | 0 / 16 | **0 / 16** |
+| `envelope_violation_rate`, training / held-out | 0.3152 / 0.2735 | **0.5770 / 0.6244** |
+| `episode_length` | 900 (every episode) | 900 (every episode) |
+| widest joint travel, first 6 episodes | 1.667 – 1.696 rad | 1.515 – 1.623 rad |
+| **episodes in which the cube moves at all** | **0 / 16 and 0 / 16** | **14 / 16 and 14 / 16** |
+| cube displacement, held-out, per episode | 0.4 mm (settling) in all 16 | 0.4 – 200.2 mm, median ~9 mm |
+
+That last pair of rows is the whole result. V11's policy swept the arm and **never reached the
+cube** — 0.4 mm in every episode of both suites is the cube settling on the table at reset.
+V13's reaches it in 14 of 16 on both suites and shoves it, twice by more than 190 mm. The fix
+turned "the policy never arrives" into "the policy arrives and cannot close the hand", which is
+a different failure and the first closed-loop movement any IR-owned vision policy of plan V has
+produced. It also cost envelope headroom: `violation.position` went from 2,881 to 7,466 on the
+held-out suite, so the Safety Plane is clamping a policy that now commands large motions.
+
+**On V12's bake, the cube leaves the table.** V12's pairing-fixed 50 Hz set (section 7.20) was
+finished in time, so the same module and the same knobs were trained on it as well: loss
+0.0632 → 0.0162, open-loop `eval()` 0.0137 / 0.0144 / 0.0149 against `train()` 0.0142 / 0.0148 /
+0.0154 — the same convergence, against a "hold the current pose" baseline of 0.0565 rather than
+0.0484, which is the pairing fix showing up as a genuinely harder target.
+
+| trained on | train seeds 1–16 | held-out 101–116 | `envelope_violation_rate` | `episode_length` |
+|---|---|---|---|---|
+| V11's bake | 0 / 16 | 0 / 16 | 0.5770 / 0.6244 | 900 / 900 |
+| **V12's bake** | **1 / 16** | 0 / 16 | 0.5396 / 0.6392 | 847.75 / 900 |
+
+Read the trajectories before that `1 / 16`. **In three training-seed episodes (03, 11, 15) the
+policy grasps the cube, lifts it 118 – 124 mm and carries it to the bin** — (0.25, 0.00, 0.02) →
+(0.13, −0.10, 0.06 … 0.14) — and holds it there until the 900-step budget runs out, so all three
+score `timeout`. The one episode the harness scores `success` (02, terminated at tick 64) lifted
+the cube 1.6 mm and is not a carry; it wants its own look and is not what this section claims.
+The claim is the three carries: for the first time in plan V an IR-owned vision policy picks the
+cube up. One is rendered at
+`~/artifacts/plan-v/v13/v12/v13-carry-nominal-03-h264.mp4` (`es video showcase --cell
+nominal-03`, 900 ticks, 1280x720, 0.9 MiB). No held-out episode succeeded.
+
+**Verdict, and the stop rule.** The train/deploy gap was real, is measured, and is closed: 0
+difference between `train()` and `eval()` over the backbone, and an `eval()` open-loop L1 that
+fell 2.4x to meet the reported loss. Held-out `success_rate` is still 0/16 on both bakes, so the
+stop rule fires and no second variable moves here. What the numbers point at next is the
+**release**, not the reach: row 5 (the gripper) is the joint with the largest residual in every
+open-loop table — 0.0162 blended against 0.0032 – 0.0103 for the arm joints, 0.0823 against the
+current pose — and "carries the cube over the bin and never opens" is exactly what that
+predicts. The 900-step budget is the second thing to look at: three episodes were still holding
+the cube in the right place when it ran out. V13's numbers, not V11's, are the baseline from
+here.
+
 
 ## 8. Safety overlay (V3)
 
@@ -2913,3 +3043,23 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     cannot brake against, and at 200 Hz the arm was velocity-saturated and could not overshoot
     what it could not track. The expert now paces to half the envelope instead of nine tenths
     (`PACE`, swept and measured); no envelope limit and no gate moved.
+19. **Should the IR name the normalization?** (section 7.21, V13.) `VisionEncoder` carries
+    `backbone`, `out_dim`, `pretrained` and `frozen`, and says nothing about normalization, so
+    "a from-scratch ResNet18 is lowered with `GroupNorm(32, c)`" is a lowering rule
+    (`learning-lowering.md` section 5.1) and lives in `lowering_hash`, not `learning_hash`. That
+    is the right place for it *as long as there is one defensible answer per `pretrained`
+    value*, which there is today: batch statistics are unusable under a single-sample lowering,
+    and a LeRobot checkpoint's frozen BatchNorm is the only thing its ImageNet weights fit.
+    Default: **leave it in the lowering.** The alternative — a `norm:
+    { Group { groups }, Frozen, Batch }` field on `VisionEncoder` — makes the choice hashable as
+    part of the architecture and lets two experiments differ by it without a compiler change,
+    and it is what a second backbone family or a resumed-from-BatchNorm checkpoint would force.
+    It is also an `es-ir` change, and `es-ir` is at **5,947 of the 6,000-line target** (§1.5), so
+    the honest sequencing is: split `es-ir` first, then decide. Revisit when either a
+    `pretrained: true` path lands in this lowering or a second normalization is actually wanted.
+    Noted in passing, because every document in plan V says "16-row chunk" and the lowered module
+    does not: the head emits `horizon = 16` rows and the chunker slices `v4_chunk[:10]`
+    (`execute_chunk = 10`, `tests/fixtures/visible-learning/learning.toml:272`), so
+    `es_eval::infer_chunk` takes `rows = min(len / NJ, H) = 10` and every open-loop L1 in
+    section 7.21 is over 10 rows. That is the fixture's intent (`replanning_hz = 5 = 50 Hz / 10`),
+    not a bug — but "16" in prose means the head's horizon, never the executed chunk.

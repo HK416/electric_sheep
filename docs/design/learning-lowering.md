@@ -179,6 +179,38 @@ The consequence to state plainly: **the generated file needs `torchvision` whene
 has a `VisionEncoder`, and needs only `torch` otherwise.** The state-only path — which is what
 the tier-4 harness test exercises — has no torchvision dependency.
 
+### 5.1 The normalization rule: a from-scratch backbone has no training mode
+
+**Rule.** `VisionEncoder { pretrained: false }` is lowered with
+`norm_layer = lambda c: nn.GroupNorm(32, c)`. Never a batch-statistics norm. Spec 8.3 is not
+touched by this — it is a lowering decision, so `lowering_hash` and `compiler_hash` move and
+`learning_hash` does not.
+
+The reason is this lowering's own shape. Spec 8.3's ports carry no batch axis (spec 5.2 gives
+the inference domain its own batch size), so a `VisionEncoder` lowers to
+`self.n{k}(x.unsqueeze(0)).squeeze(0)` — one image, always. A trainer batches by accumulating
+gradients over single-sample forwards, so torchvision's default `BatchNorm2d` fits **N = 1**
+statistics at every one of ResNet18's 20 layers — it is instance normalization with a batch
+counter — and then `torch_ref.py`'s `model.eval()` swaps in the running averages. The trained
+function and the deployed function are different functions, which no post-processing of the
+weights repairs: measured on V11's checkpoint, chunk L1 0.011 in `train()` against 0.031–0.039
+in `eval()`, with 0.048 for "hold the current pose", and recalibrating the running statistics
+over the whole training set in batches of 64 only reached 0.029 (design note
+`visible-learning.md` section 7.21).
+
+`GroupNorm` normalizes over channel groups of the sample in front of it. It has no `training`
+branch and no running buffers, so `train()` and `eval()` are bit-identical and the weight
+contract loses the 60 `running_mean` / `running_var` / `num_batches_tracked` buffers. It is
+what Diffusion Policy replaces ResNet's BatchNorm with, for exactly this reason. 32 groups
+divides every ResNet stage width (64, 128, 256, 512).
+
+Two things this rule does **not** cover. `pretrained: true` is still refused here (section 7.6,
+open question 6); a LeRobot checkpoint keeps ImageNet's BatchNorm as `FrozenBatchNorm2d` through
+`lerobot.rs`, which is correct because frozen affine constants have no training mode either. And
+`nn.TransformerEncoderLayer`'s dropout stays at torchvision's default `0.1`: that is intended
+stochastic regularization, off at inference by construction, and it is the one remaining
+`train()`/`eval()` difference in a lowered module.
+
 ACT's own transformer encoder/decoder is *not* modelled node-by-node. Spec 8.1 is explicit that
 layer-level authoring is PyTorch's job; the IR describes the interface. `TemporalEncoder
 { Transformer }` is therefore a single opaque `nn.TransformerEncoder` with a prefix claim, and a

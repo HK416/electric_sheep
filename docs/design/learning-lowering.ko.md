@@ -174,6 +174,38 @@ ResNet은 정확히 99.9%만 맞고 그래서 오라클로서는 아예 없는 �
 필요로 하고, 그 외에는 `torch`만 있으면 된다.** state만 다루는 경로 — tier-4 하네스 테스트가
 실행하는 바로 그 경로 — 에는 torchvision 의존성이 없다.
 
+### 5.1 정규화 규칙: 처음부터 학습하는 backbone에는 학습 모드가 없다
+
+**규칙.** `VisionEncoder { pretrained: false }`는
+`norm_layer = lambda c: nn.GroupNorm(32, c)`로 로워링한다. 배치 통계 기반 정규화는 쓰지
+않는다. 이것은 spec 8.3을 건드리지 않는다 — 로워링 결정이므로 `lowering_hash`와
+`compiler_hash`는 움직이고 `learning_hash`는 움직이지 않는다.
+
+이유는 이 로워링 자체의 형태에 있다. spec 8.3의 포트에는 배치 축이 없고(spec 5.2가 추론
+도메인에 자기 배치 크기를 준다), 그래서 `VisionEncoder`는
+`self.n{k}(x.unsqueeze(0)).squeeze(0)` — 항상 이미지 한 장 — 으로 내려간다. 트레이너는
+단일 샘플 forward의 그래디언트를 누적해서 배치를 만들므로, torchvision 기본값인
+`BatchNorm2d`는 ResNet18의 20개 층 전부에서 **N = 1** 통계를 적합한다(사실상 배치 카운터가
+달린 instance normalization). 그리고 `torch_ref.py`의 `model.eval()`이 그 자리에 running
+평균을 끼워 넣는다. 학습된 함수와 배포된 함수가 서로 다른 함수이고, 가중치를 후처리해서
+고칠 수 있는 종류가 아니다: V11 체크포인트에서 측정한 chunk L1은 `train()`에서 0.011,
+`eval()`에서 0.031–0.039, "현재 자세 유지" 기준선이 0.048이었고, 학습 세트 전체를 배치 64로
+돌려 running 통계를 재보정해도 0.029까지밖에 내려가지 않았다(설계 노트
+`visible-learning.ko.md` 7.21절).
+
+`GroupNorm`은 눈앞의 샘플 하나를 채널 그룹 단위로 정규화한다. `training` 분기도 running
+버퍼도 없으므로 `train()`과 `eval()`이 비트 단위로 같고, 가중치 계약에서
+`running_mean`/`running_var`/`num_batches_tracked` 버퍼 60개가 사라진다. Diffusion Policy가
+바로 이 이유로 ResNet의 BatchNorm을 바꿔 끼우는 것과 같은 선택이다. 그룹 32는 ResNet의 모든
+stage 폭(64, 128, 256, 512)을 나눈다.
+
+이 규칙이 다루지 **않는** 두 가지. `pretrained: true`는 여기서 여전히 거부된다(7.6절,
+열린 질문 6); LeRobot 체크포인트는 `lerobot.rs`를 통해 ImageNet의 BatchNorm을
+`FrozenBatchNorm2d`로 유지하는데, 고정된 affine 상수에도 학습 모드가 없으므로 이쪽이 맞다.
+그리고 `nn.TransformerEncoderLayer`의 dropout은 기본값 `0.1` 그대로 둔다: 의도된 확률적
+정규화이고 추론에서는 구조적으로 꺼지며, 로워링된 모듈에 남는 유일한 `train()`/`eval()`
+차이다.
+
 ACT 자체의 transformer encoder/decoder는 노드 단위로 모델링되지 *않는다*. spec 8.1은 레이어
 단위 저작이 PyTorch의 일이라고 명시하며, IR은 인터페이스만 기술한다. 따라서
 `TemporalEncoder { Transformer }`는 prefix claim을 가진 단일 opaque `nn.TransformerEncoder`이며,
