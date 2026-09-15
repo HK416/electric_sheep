@@ -708,33 +708,7 @@ fn resident_gpu_does_not_move_the_loss() {
     let (path, _bundle) = demo_bundle(&dir);
     let (build, _contract) = lowered(&dir, &path);
 
-    let (dataset, tiles, baked) = (dir.join("ds"), dir.join("tiles"), dir.join("baked"));
-    run(
-        &python,
-        &[
-            "-c",
-            MINI_DATASET_PY,
-            &dataset.to_string_lossy(),
-            &tiles.to_string_lossy(),
-        ],
-    );
-    let bake = es(&[
-        "dataset",
-        "bake",
-        "--policy",
-        &path.to_string_lossy(),
-        "--out",
-        &baked.to_string_lossy(),
-        "--frames",
-        &tiles.to_string_lossy(),
-        // The demo's second JointState channel sends the bake to the scene (packet M5/V7a),
-        // and the Task IR's `scene.path` is repository-relative while this test does not run
-        // from the root: name the file the way `es eval run --scene` does.
-        "--scene",
-        &demo_scene().to_string_lossy(),
-        &dataset.to_string_lossy(),
-    ]);
-    assert_eq!(bake.status.code(), Some(0), "{}", text(&bake));
+    let baked = mini_baked(&python, &dir, &path);
 
     let train = |tag: &str, resident: bool| -> (Vec<u8>, String) {
         let curve = dir.join(format!("{tag}.json"));
@@ -794,6 +768,128 @@ fn resident_gpu_does_not_move_the_loss() {
         "RAN resident_gpu_does_not_move_the_loss: {ORACLE_STEPS} bit-identical steps, \
          {} bytes of curve\n  plain:    {plain_report}\n  resident: {resident_report}",
         plain.len()
+    );
+}
+
+/// `MINI_DATASET_PY` through `es dataset bake`: the few-frame baked set both training oracles
+/// optimize over. Shared because building it twice is the expensive half of either test.
+fn mini_baked(python: &str, dir: &Path, bundle: &Path) -> PathBuf {
+    let (dataset, tiles, baked) = (dir.join("ds"), dir.join("tiles"), dir.join("baked"));
+    run(
+        python,
+        &[
+            "-c",
+            MINI_DATASET_PY,
+            &dataset.to_string_lossy(),
+            &tiles.to_string_lossy(),
+        ],
+    );
+    let bake = es(&[
+        "dataset",
+        "bake",
+        "--policy",
+        &bundle.to_string_lossy(),
+        "--out",
+        &baked.to_string_lossy(),
+        "--frames",
+        &tiles.to_string_lossy(),
+        // The demo's second JointState channel sends the bake to the scene (packet M5/V7a),
+        // and the Task IR's `scene.path` is repository-relative while this test does not run
+        // from the root: name the file the way `es eval run --scene` does.
+        "--scene",
+        &demo_scene().to_string_lossy(),
+        &dataset.to_string_lossy(),
+    ]);
+    assert_eq!(bake.status.code(), Some(0), "{}", text(&bake));
+    baked
+}
+
+/// `--channel-weight` (packet M5/V16) scales one action channel's absolute error and nothing
+/// else about the run.
+///
+/// Two properties, and the first is the one that protects every number already measured: an
+/// **all-ones** weighting must be bit-identical to no weighting, because `(|d| * 1).mean()` is
+/// `l1_loss`. If it ever is not, every loss curve in design note section 7 was taken under a
+/// different objective than the one the script now runs. The second is that a weight that is
+/// not one *does* move the curve, and that the run summary records the vector it ran under --
+/// the flag enters no hash slot (spec 8.1), so the summary is the only place it is written
+/// down.
+#[test]
+#[ignore = "needs torch, torchvision and pyarrow"]
+fn channel_weight_of_one_is_the_unweighted_loss() {
+    let python = match python_with_torch() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP ir_training: {why}");
+            return;
+        }
+    };
+    let dir = scratch_dir("chanweight");
+    let (path, _bundle) = demo_bundle(&dir);
+    let (build, _contract) = lowered(&dir, &path);
+    let baked = mini_baked(&python, &dir, &path);
+
+    let train = |tag: &str, weight: Option<&str>| -> (Vec<u8>, String) {
+        let curve = dir.join(format!("{tag}.json"));
+        let out = dir.join(format!("{tag}.safetensors"));
+        let mut args = vec![
+            train_act_py().to_string_lossy().into_owned(),
+            "--module".to_owned(),
+            build.to_string_lossy().into_owned(),
+            "--baked".to_owned(),
+            baked.to_string_lossy().into_owned(),
+            "--out".to_owned(),
+            out.to_string_lossy().into_owned(),
+            "--batch".to_owned(),
+            "4".to_owned(),
+            "--seed".to_owned(),
+            "0".to_owned(),
+            "--checkpoint-at".to_owned(),
+            ORACLE_STEPS.to_string(),
+            "--loss-curve".to_owned(),
+            curve.to_string_lossy().into_owned(),
+        ];
+        if let Some(w) = weight {
+            args.push("--channel-weight".to_owned());
+            args.push(w.to_owned());
+        }
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let done = run(&python, &borrowed);
+        let line = String::from_utf8_lossy(&done.stdout)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_owned();
+        (
+            std::fs::read(&curve).unwrap_or_else(|e| panic!("{}: {e}", curve.display())),
+            line,
+        )
+    };
+
+    let (plain, plain_report) = train("plain", None);
+    let (ones, _) = train("ones", Some("5=1"));
+    assert_eq!(
+        String::from_utf8_lossy(&ones),
+        String::from_utf8_lossy(&plain),
+        "--channel-weight 5=1 moved the loss; an all-ones weighting must be `l1_loss`"
+    );
+    let (five, five_report) = train("five", Some("5=5"));
+    assert_ne!(
+        String::from_utf8_lossy(&five),
+        String::from_utf8_lossy(&plain),
+        "--channel-weight 5=5 did not move the loss at all"
+    );
+    assert!(
+        five_report.contains("\"channel_weight\": [1.0, 1.0, 1.0, 1.0, 1.0, 5.0]"),
+        "the report must record the weighting it ran under: {five_report}"
+    );
+    assert!(
+        plain_report.contains("\"channel_weight\": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]"),
+        "an unweighted run records all ones: {plain_report}"
+    );
+    println!(
+        "RAN channel_weight_of_one_is_the_unweighted_loss: {ORACLE_STEPS} steps\n  \
+         plain: {plain_report}\n  five:  {five_report}"
     );
 }
 

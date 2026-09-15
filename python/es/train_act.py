@@ -59,6 +59,18 @@ a batched forward would produce, one forward at a time.
     stays either way is the fp32 inference-equivalence check in `ir_training.rs`, and it runs
     on a checkpoint trained at the defaults.
 
+**`--channel-weight`, and why it is a flag and not an IR node** (packet M5/V16): the loss is
+an unweighted L1 over `chunk x action_dim`, so every action channel gets the same gradient
+whatever it means. V16 measured the consequence on the demo: the gripper's "open now" frames
+are 7 % of an episode and their observation is frozen, so the fit returns the conditional
+median of the ramp and the jaw never crosses the angle at which it stalls on the cube
+(design note section 7.24). `--channel-weight 5=5` multiplies channel 5's absolute error by 5.
+It takes an **index**, not a name: which channel is the gripper is the scene's knowledge, and
+this script owns the optimizer and nothing above it. All-ones is the default and the default
+path is bit-identical to the unweighted one -- `(d * w).mean()` with `w = 1` is `l1_loss`.
+Like `--batch` and `--lr` it enters no hash slot (spec 8.1), so it belongs in the run summary,
+which is where it is printed.
+
 `--batch` defaults to 8 and stays there: the design note's measured runs are at 8, and moving
 the default would silently invalidate them. Raising it is a different run, not a faster one --
 `--batch N` accumulates N samples per optimizer step, so N x fewer steps cover the same data,
@@ -208,6 +220,14 @@ def main(argv: list) -> int:
         help="AdamW step; the convention with --batch is linear scaling, so --batch 32 "
         "goes with --lr 4e-4",
     )
+    p.add_argument(
+        "--channel-weight",
+        action="append",
+        default=[],
+        metavar="INDEX=WEIGHT",
+        help="scale one action channel's absolute error, e.g. --channel-weight 5=5; an index "
+        "because channel names are the scene's knowledge, not this script's. Repeatable",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
     p.add_argument(
@@ -255,6 +275,16 @@ def main(argv: list) -> int:
             raise SystemExit("the lowered graph has %d outputs; V2 trains one" % len(out))
         chunk = int(next(iter(out.values())).shape[0])
 
+    weights = torch.ones(contract["action_dim"], device=device)
+    for item in a.channel_weight:
+        index, _, value = item.partition("=")
+        if not value or not index.strip().isdigit() or int(index) >= len(weights):
+            raise SystemExit(
+                "--channel-weight wants INDEX=WEIGHT with 0 <= INDEX < %d, got %r"
+                % (len(weights), item)
+            )
+        weights[int(index)] = float(value)
+
     manifest, episodes = read_baked(a.baked, shapes)
     if a.resident_gpu:
         # Where the tensors live, not what they are: same dtype, same values, same order, so
@@ -301,7 +331,9 @@ def main(argv: list) -> int:
             target = tensors["action"][rows].to(device)
             with amp:
                 predicted = next(iter(forward(**inputs).values()))
-                loss = torch.nn.functional.l1_loss(predicted, target) / a.batch
+                # `(|d| * w).mean()` over [chunk, action_dim]; with every weight 1 this is
+                # exactly `l1_loss`, so an unweighted run is bit-identical to V15's.
+                loss = ((predicted - target).abs() * weights).mean() / a.batch
             loss.backward()
             accumulated += float(loss.detach())
         optimizer.step()
@@ -331,6 +363,7 @@ def main(argv: list) -> int:
         "amp": a.amp,
         "compiled": a.compile,
         "chunk": chunk,
+        "channel_weight": [float(v) for v in weights.tolist()],
         "ports": sorted(shapes),
         "observation_hash": manifest.get("observation_hash"),
     }
