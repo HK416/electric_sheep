@@ -3380,6 +3380,167 @@ the observation for six control ticks by the Deployment IR's own acceleration li
 chunk that already predicts it is never executed past its first row — and two open questions,
 22 and 23, whose defaults a human now has to choose between.
 
+### 7.25 As built (V17): the chunk that predicted the release is executed, and the hand opens
+
+Packet `docs/packets/M5/V17-inference-rate.md`. V16's diagnosis ended on a lever it was
+forbidden to pull: `deployment.toml` declares `rate.control = 50 Hz` against
+`rate.inference = 5 Hz`, and neither loop read the second number. This packet honours it on
+both paths and re-measures V15's 40,000-step checkpoint — no retraining, the same
+`model-40000.safetensors` file, the same `lowering_hash 70a8fec7…`, `task_hash eb6efefa…`,
+`observation_hash 899c16a9…`, `learning_hash 5dac0a46…`.
+
+**The cadence, before and after.** One rule, `es_env::replan_interval(rate) = rate.control /
+rate.inference` in whole control ticks, refused by name when it does not divide. Per 1,800-tick
+episode:
+
+| | policy calls per episode | chunk rows that reach the actuator | live chunks |
+|---|---|---|---|
+| V6b – V16 | **1,800** | row 0 of each, through an 8-deep ensemble | 8 |
+| **V17** | **180** | **rows 0..9 of each, in order** | **1** |
+
+The buffer is not special-cased. The lowered chunk is `[10, 6]`, so `valid = 10`; under
+`TemporalEnsemble` the span is `valid` rows and the next arrival is exactly ten ticks later, so
+the overlap set has one member and the exponential average degenerates to it. That is
+arithmetic, not a branch — `ChunkBuffer` and `plane_chunk` are untouched.
+
+**Two defects the change uncovered, both invisible while the policy was asked every tick.**
+
+1. **The plane's watchdog clock was the simulation tick.** `SafetyPlane` turns a tick
+   difference into microseconds with the Deployment IR's *control* period
+   (`es_safety::config`, `period_us = rate.control_period()`), and both loops handed it
+   `Env::tick` — the **simulation** tick, four per control step on this scene since V11
+   (`timestep = 0.005`, control 50 Hz). It could not show while a chunk arrived every control
+   tick, because `accept` stamps `last_chunk_tick = now` before the deadline is measured and
+   the gap was always zero. The first V17 run made it visible at once:
+   `violation.inference_deadline` on **25,920 of 28,800** control ticks with the 40 ms budget —
+   90 %, which is `80,000 µs × k > 40,000` for `k ≥ 1`, i.e. every tick but the one the chunk
+   arrives on. `DomainRunner::emit_actions` now uses its own `control_tick` and
+   `es_eval::runner` the episode step. `es-safety` itself is unchanged.
+2. **A 5 Hz re-plan cannot meet a 40 ms inference deadline.** Even with the clock corrected the
+   gap between arrivals *is* the re-plan period — up to 180 ms. `deployment.toml`'s
+   `inference_budget` and its `inference_deadline` watchdog become **240 ms** (the 200 ms the
+   document itself asks for plus the 40 ms it already allowed for the inference), and
+   `deadlines.observation_age` follows only because `DEP_021` refuses one below
+   `inference_budget`. The enforced staleness bound (`stale_observation`, 80 ms), every safety
+   limit and the 0.5 acceptance threshold did not move; the watchdog is still on. This is open
+   question 23's "one of the two sides must change", and it turned out to be both.
+   `deployment_hash` moves with it, so V15's weights were repacked into a bundle built from the
+   current documents — the same safetensors file, byte for byte.
+
+**Oracles** (oracle server, RTX 4090, tree `~/Projects/es-v17`, `~/artifacts/plan-v/v17/`,
+2026-09-16):
+
+| oracle | result |
+|---|---|
+| `the_runner_infers_once_per_declared_replan_period` | 100 control steps → **10** calls at a 10:1 ratio, **100** at 1:1 |
+| `an_inference_rate_that_does_not_divide_the_control_rate_is_refused` | `EvalError::Env` naming both rates and `3.33` control ticks |
+| `collection_and_evaluation_ask_the_policy_at_the_same_cadence` | **12 calls on each path** over 120 control ticks |
+| `collection_and_evaluation_draw_the_same_scene_for_a_seed` | 25 values identical |
+| `expert_passes_the_evaluation_harness` | **8/8**, `envelope_violation_rate` 0.2893 – **0.3021**, episode length 533 – 553 |
+| `expert_solves_the_pinned_seeds` | 8/8 |
+| V9 `a_showcase_replay_reproduces_the_frames_the_policy_saw` | pass |
+| V10 `recorded_actions_replay_to_the_same_outcome` | pass |
+| `the_temporal_ensemble_survives_the_grasp_window` | pass |
+| `cargo xtask ci` | green |
+
+The expert's `envelope_violation_rate` fell from V6b's 0.4815 – 0.5485 to 0.2893 – 0.3021 and
+its episodes got longer (533 – 553 against 330 – 354): executing a chunk's own rows in order is
+a smoother command stream than an eight-deep average of chunks that disagree, so the plane
+clamps it less often — and the expert paces itself to ten executed rows per chunk rather than
+one, which is what `ExpertCfg::pace_to` now receives on both paths.
+
+**What the two paths still do not share, measured and not asserted away.** The per-tick
+`qpos ‖ qvel` traces of `es loop collect` and `es eval run` on one seed diverge at **tick 1**,
+not tick 0 and not at a re-plan boundary: `es loop collect` applies the Learning IR's
+`RuntimeHints::expected_latency_ms = 15.0` (one control tick at 50 Hz) through
+`AsyncInference`, so its first chunk reaches the plane at tick 1 and tick 0 is a recorded
+underrun, while `es_eval::runner` has no latency model and executes row 0 at tick 0. Collection
+is at `1.44 × 10⁻⁷` rad on joint 0 where evaluation is at `−4.24 × 10⁻⁴`. That is open question
+24; V17 leaves inference-latency modelling exactly as it was.
+
+**The re-measurement.** V15's 40,000-step checkpoint, 1,800-step budget, three 16-episode
+nominal suites (649 s wall for the build, the repack and all three):
+
+| nominal suite | V15, 40k | V16, gripper ×5, 40k | **V17, 40k at the declared 5 Hz** |
+|---|---|---|---|
+| `success_rate`, training 1–16 | 0 / 16 | 0 / 16 | **2 / 16 = 0.1250** |
+| `success_rate`, held-out 101–116 | 0 / 16 | 0 / 16 | **1 / 16 = 0.0625** (twice, bit-identical) |
+| cube lifted clear, training / held-out | 8 / 16 · 9 / 16 | 5 / 16 · 4 / 16 | **6 / 16 · 6 / 16** |
+| carried into the bin, training / held-out | 5 / 16 · 4 / 16 | 0 / 16 · 0 / 16 | **5 / 16 · 5 / 16** |
+| **released inside the bin**, training / held-out | 0 / 16 · 0 / 16 | 0 / 16 · 0 / 16 | **2 / 16 · 2 / 16** |
+| `envelope_violation_rate`, tr / ho | 0.7148 / 0.3381 | 0.0510 / 0.0485 | **0.9985 / 0.9982** |
+| `episode_length`, tr / ho | 1800 / 1800 | 1800 / 1800 | **1627.1 / 1722.4** |
+
+**The hand opens.** Four releases in 48 evaluated episodes, three of them scored `success` by
+the Task IR's own cone, against **zero releases in 128 episodes** across V13, V14, V15 and V16.
+Per episode, training seeds 1–16 (`~/artifacts/plan-v/v17/e40000-train`):
+
+| cell | ticks | lift mm | lift @ | carry @ | release @ | harness | in bin |
+|---|---|---|---|---|---|---|---|
+| nominal-03 | 1800 | 132.7 | 132 | 220 | — | timeout | yes |
+| nominal-05 | 1800 | 132.0 | 133 | 190 | — | timeout | yes |
+| **nominal-08** | **602** | 124.0 | 125 | 180 | **410** | **success** | yes |
+| nominal-11 | 1800 | 125.4 | 122 | 185 | — | timeout | yes |
+| **nominal-15** | **231** | 117.5 | 115 | 188 | **225** | **success** | yes |
+| the other eleven | 1800 | 3.0 – 26.6 | — | — | — | timeout | no |
+
+and held-out 101–116 (`e40000-holdout-a`, and `-b` identical row for row):
+
+| cell | ticks | lift mm | lift @ | carry @ | release @ | harness | in bin |
+|---|---|---|---|---|---|---|---|
+| nominal-01 | 1800 | 153.0 | 110 | 243 | — | timeout | yes |
+| nominal-04 | 1800 | 123.3 | 121 | 210 | — | timeout | yes |
+| nominal-05 | 1800 | 124.9 | 121 | 209 | **1040** | timeout | yes |
+| nominal-11 | 1800 | 141.7 | 113 | 176 | — | timeout | yes |
+| **nominal-12** | **559** | 131.9 | 102 | 248 | **280** | **success** | yes |
+| nominal-02 | 1800 | 126.3 | 128 | — | — | timeout | no |
+| the other ten | 1800 | 2.0 – 14.8 | — | — | — | timeout | no |
+
+**Which predicate term fails.** It is the gripper, and only the gripper. Over the five held-out
+carrying episodes the cube is inside the bin's x span **and** settled (`|vx| < 0.05`) for
+1,557 – 1,618 of the 1,800 ticks, so neither position term nor the settling term is ever what
+blocks a scored success. The gripper's peak `qpos` over exactly those ticks is:
+
+| held-out cell | peak gripper while the cube is in the bin and settled | harness |
+|---|---|---|
+| nominal-11 | 0.227 | timeout |
+| nominal-01 | 0.335 | timeout |
+| nominal-04 | 0.409 | timeout |
+| **nominal-05** | **0.817** | timeout |
+| **nominal-12** | **0.820** | **success** |
+| *(training nominal-08, for scale)* | *0.844* | *success* |
+
+Three of the five never open past 0.41 rad — the old hold, unchanged. The fourth, nominal-05,
+opens to **0.817** and misses the cone by about **three milliradians** against the 0.820 that
+scored, then closes again to −0.009 rad by the end of the episode. So the release is now a
+thing the policy does, and what separates a release from a *scored* release is the last three
+milliradians of jaw travel and whether the jaw stays open.
+
+**What it cost: the envelope.** `envelope_violation_rate` went to **0.9985 / 0.9982** —
+`violation.acceleration` on 23,443 of 26,033 training ticks and 24,815 of 27,559 held-out
+ticks, `violation.velocity` on roughly half. Executing a chunk's rows 0..9 in order asks for
+0.02 – 0.03 rad of travel per control tick where `acceleration_max = 20 rad/s²` allows 0.008 in
+the per-tick *step*, so the plane rate-limits nearly every tick; the `EnvelopeViolationRate`
+watchdog (`max_frac = 0.9`, window 200) latches the fallback for 2,547 training and 2,690
+held-out ticks, about a tenth of the run. Under the eight-deep ensemble the same chunks were
+averaged into a much flatter command and the rate was 0.71 / 0.34. This is not new behaviour
+being introduced — it is the demonstrations' own command stream reaching the plane unaveraged,
+which is what V1's own note in `deployment.toml` predicted ("clamped on most ticks by
+construction, not by anomaly") — but at 0.9985 the watchdog is latching, and that is open
+question 25.
+
+**Verdict.** Honouring the declared re-plan rate is the first change in plan V that produced a
+release, and the first that produced a success on a held-out seed. It also recovered the carry
+V16 lost (0 → 5 of 16 on both suites) without retraining. Held-out `success_rate` is **0.0625**,
+below the unchanged acceptance threshold of 0.5, so the stop rule fires: no six-suite sweep, no
+showcase videos, no second variable. **V15's checkpoint is still plan V's best policy, and it
+is now measurably better than it was reported to be** — every number in sections 7.19 – 7.24
+was taken with the chunk's later rows dead. What V17 leaves is a much narrower target than V16
+did: the cube reaches the bin on 5 of 16 held-out seeds, sits there settled for 90 % of the
+episode, and the jaw opens to within three milliradians of the predicate on one of them.
+Open question 22's (ii) — cue the release on something the observation carries — is the next
+variable, and it now has a specific thing to fix rather than a fixed point to escape.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -3736,6 +3897,19 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     which already predicts the release, is what gets executed. Default: **(iii) first**, because
     it is measured to cross the stall angle in 8 of the 8 carrying holds and costs no
     retraining, then (ii).
+
+    **Answered (V17, section 7.25): the default was taken and it worked, partly.** Honouring
+    the declared 5 Hz re-plan on both paths, with no retraining and V15's own weights, produced
+    **4 releases in 48 episodes and 3 harness successes** against zero releases in the 128
+    episodes of V13 – V16, and recovered the carry V16 had lost (0 → 5 of 16 on both suites).
+    Held-out `success_rate` is 0.0625, still below 0.5, so the stop rule fires — but the
+    obstacle is no longer a fixed point. The cube is inside the bin's x span and settled for
+    1,557 – 1,618 of 1,800 ticks in every held-out carrying episode, so the only term that ever
+    blocks a scored success is the gripper, and the closest miss opens the jaw to 0.817 rad
+    against the 0.820 that scored — **three milliradians** — before closing again. **(ii) is
+    now the next variable**: cue the release on something the observation carries, so the jaw
+    opens the whole way and stays open. (i), a clock in the Observation IR, is unchanged in
+    cost and is still the one that needs a data change beside it.
 23. **`rate.inference = 5 Hz` and `replanning_hz = 5.0` are declared and not honoured**
     (section 7.24, V16). `es_eval::runner` calls `infer_chunk` once per **control** tick whatever
     the Deployment IR's `rate.inference` says, so a chunk is pushed every tick and rows 1..9 of
@@ -3749,3 +3923,52 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     every number in sections 7.11 – 7.24; what a human owes is a decision on what
     `rate.inference` means when the policy is synchronous, and whichever way it goes, one of the
     two sides must change.
+
+    **Answered (V17, section 7.25), and it was both sides.** The runtime honours the declared
+    rate on *both* paths through one rule, `es_env::replan_interval`, which refuses a rate that
+    does not divide the control rate by name. The document had to move too: a deployment
+    declaring a 5 Hz re-plan has up to 180 ms between chunk arrivals and cannot meet a 40 ms
+    `inference_deadline`, so the demo's `inference_budget` and its watchdog are stated for the
+    rate the same file declares — 240 ms, with `deadlines.observation_age` following only
+    because `DEP_021` refuses a smaller one. Every safety limit, the `stale_observation` bound
+    and the 0.5 acceptance threshold are unchanged. Two defects were found on the way — the
+    plane's watchdog clock was the *simulation* tick while its period is the *control* period
+    (fixed in V17, `es-safety` untouched), and the evaluator models no inference latency
+    (question 24). Every evaluation number in sections 7.19 – 7.24 was taken with the chunk's
+    later rows dead and is re-dated by this; every collection and training number carries
+    forward, because collection replanned every control tick too and a demonstration is the
+    expert's command stream, not a chunk's.
+24. **`es_eval::runner` has no inference-latency model and `es loop collect` does**
+    (section 7.25, V17). `DomainRunner` delays every chunk by
+    `latency_ticks(RuntimeHints::expected_latency_ms, rate.control)` — one control tick for the
+    demo's 15 ms at 50 Hz — so the collector's first chunk reaches the plane at tick 1 and tick
+    0 is a recorded underrun, while the evaluation runner executes row 0 at tick 0. Measured on
+    one seed: the two per-tick `qpos ‖ qvel` traces are identical at tick 0 and diverge at tick
+    1, `1.44 × 10⁻⁷` against `−4.24 × 10⁻⁴` on joint 0. It is not the cadence — V17's oracle
+    pins both paths at 12 policy calls per 120 control ticks — and it is not a safety question,
+    since the plane is the only actuator path on both. But it means "the two paths execute
+    chunks identically" is true of the schedule and not of the trajectory, and a policy
+    evaluated with zero inference latency is evaluated on a robot that does not exist. Default:
+    **give `es_eval::runner` the same `AsyncInference` the collector uses**, which is a packet
+    of its own and re-dates the evaluation numbers once more; the alternative is to declare
+    `expected_latency_ms = 0` for a simulated target and say so, which is a document change and
+    a claim no real robot can honour.
+25. **`envelope_violation_rate` is 0.998 under the declared cadence, and the watchdog latches**
+    (section 7.25, V17). Executing a chunk's rows 0..9 in order asks for 0.02 – 0.03 rad of
+    travel per control tick where the Deployment IR's `acceleration_max = 20 rad/s²` allows
+    0.008 rad of change in the per-tick step, so `SafetyPlane` rate-limits 23,443 of 26,033
+    training ticks and the `EnvelopeViolationRate` watchdog (`max_frac = 0.9`, window 200)
+    latches the fallback for about a tenth of every run. Under the eight-deep ensemble the same
+    chunks were averaged into a flatter stream and the rate was 0.71 / 0.34. Nothing new is
+    being commanded — this is the demonstrations' own command stream reaching the plane
+    unaveraged, which `deployment.toml` has predicted since V1 — but a run that spends a tenth
+    of its ticks in `hold_position` is not measuring the policy. Three ends could move and they
+    are not equivalent. **(a)** The expert paces itself to `PACE = 0.5` of the envelope and the
+    policy imitates what it emitted; raising `acceleration_max` to what the servo can actually
+    deliver is the INV-12-legal widening, and it is a Deployment IR decision rather than a
+    packet's. **(b)** A delta action space (question 12's option (b), still open) makes the
+    policy's output a ramp by construction. **(c)** Accept it and keep reporting
+    `envelope_violation_rate` beside the `action_source` histogram, which is what V1 – V16 did
+    at 0.71. Default: **(c) until a release is scored on held-out seeds**, then (a) — the number
+    only became binding once the chunk's later rows started executing, and what it binds on is
+    the same command stream every demonstration already contains.
