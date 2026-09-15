@@ -282,6 +282,34 @@ fn import_lerobot(args: &[String]) -> Result<u8, CliError> {
     let mut policy = act_policy(&cfg, dir, weights_hash(&original), weights_hash(&remapped))
         .map_err(|e| CliError::Runtime(format!("the checkpoint's config.json: {e}")))?;
 
+    // The checkpoint decides the *shape* of each input; the Observation IR decides its **unit**
+    // (spec 5.1 rule 6 and spec 7.4: preprocessing is the Observation IR's, and the unit is what
+    // preprocessing produced). `act_policy` can only guess the unit from `config.json`, which
+    // records none, so the contract adopts the one the Observation IR declares — after checking
+    // that the two agree about what they are talking about, which is a better error here than
+    // `XIR-010`'s at the far end.
+    for (name, port) in &mut policy.contract.inputs {
+        let produced = observation.outputs.get(name).ok_or_else(|| {
+            CliError::Runtime(format!(
+                "the checkpoint wants an input named \"{name}\"; {} produces {:?}.\nThe names \
+                 are the checkpoint's feature names with dots replaced by underscores (spec 8.4, \
+                 XIR-010).",
+                a["--observation"],
+                observation.outputs.keys().collect::<Vec<_>>()
+            ))
+        })?;
+        if produced.ty.elem != port.ty.elem || produced.ty.shape != port.ty.shape {
+            return Err(CliError::Runtime(format!(
+                "observation output \"{name}\" is {:?}{:?} but the checkpoint declares {:?}{:?}",
+                produced.ty.elem,
+                produced.ty.shape.dims(),
+                port.ty.elem,
+                port.ty.shape.dims()
+            )));
+        }
+        port.ty.unit = produced.ty.unit.clone();
+    }
+
     // Spec 9 owns the cadence; `act_policy` leaves these at zero because a `config.json` has no
     // control rate to read them from.
     let control_hz = deployment.rate.control.as_hz_f64();

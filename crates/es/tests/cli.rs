@@ -3536,16 +3536,23 @@ fn regenerate_visible_learning_documents() {
     //
     //  * the privileged branch is gone. `lerobot.utils.feature_utils` gives a policy exactly
     //    one `observation.state` feature, and a second state port has nowhere to land.
-    //  * the state port is **raw radians**. ACT carries its own normalization statistics in
-    //    the checkpoint (`normalize_inputs.buffer_observation_state.{mean,std}`) and applies
-    //    them as the first thing its forward pass does, so a `Normalize` here would be the
-    //    conversion applied twice.
+    //  * the state `Normalize` is the **identity** — `Range{0..1}`, i.e. `(q - 0) / (1 - 0)`.
+    //    ACT carries its own statistics in the checkpoint
+    //    (`normalize_inputs.buffer_observation_state.{mean,std}`, fitted to the values it was
+    //    trained on) and applies them as the first operation of its forward pass, so the
+    //    conversion is already owned. Applying a *second*, unrelated affine map here would
+    //    only change what those statistics had to absorb — and it would have to be applied to
+    //    the exported dataset too, which means implementing `Op::Normalize` a second time,
+    //    which is the defect section 7.9 removed. The node stays because spec 5.4 (`XIR`'s
+    //    `TYPE-011`) requires a policy input to be `Normalized`, and the honest thing to say
+    //    is that the Observation IR's normalization decision here *is* the identity.
     //  * the ports are named the way the checkpoint's `config.json` names its features, with
     //    dots replaced by underscores, because the name is what `XIR-010` matches and what
     //    reaches the lowered module as a `forward(**inputs)` keyword.
     //
     // The image branch is untouched, byte for byte: `Dequantize` then `Normalize{0..1}` is
-    // already exactly the [0, 1] float CHW tensor LeRobot's own loader produces from a PNG.
+    // already exactly the [0, 1] float CHW tensor LeRobot's own loader produces from a PNG —
+    // and it, too, is the identity on that branch, which is why nothing had to change.
     let mut v8 = obs.clone();
     v8.outputs.remove(CUBE_POSE);
     for node in [state_in, normalize] {
@@ -3554,28 +3561,18 @@ fn regenerate_visible_learning_documents() {
     v8.graph.edges.retain(|e| {
         ![state_in, normalize].contains(&e.from.node) && ![state_in, normalize].contains(&e.to.node)
     });
-    let joint = v8.outputs.remove("joint_state").expect("the state output");
+    let mut joint = v8.outputs.remove("joint_state").expect("the state output");
+    let identity = es_ir::types::Unit::Normalized { lo: 0.0, hi: 1.0 };
     let state_norm = joint.port.node;
-    let upstream = v8
-        .graph
-        .edges
-        .iter()
-        .find(|e| e.to.node == state_norm)
-        .expect("the state Normalize is fed by the StateInput")
-        .from
-        .clone();
-    let raw_state = v8.graph.nodes[&upstream.node].io().output.clone();
-    v8.graph.nodes.remove(&state_norm);
-    v8.graph
-        .edges
-        .retain(|e| e.to.node != state_norm && e.from.node != state_norm);
-    v8.outputs.insert(
-        "observation_state".to_owned(),
-        es_ir::observation::ObservationOutput {
-            port: upstream,
-            ty: raw_state,
-        },
-    );
+    match v8.graph.nodes.get_mut(&state_norm).expect("the state node") {
+        ObservationNode::Normalize { stats, io } => {
+            *stats = es_ir::observation::NormalizeStats::Range { lo: 0.0, hi: 1.0 };
+            io.output.unit = identity.clone();
+        }
+        other => panic!("the state output must come from a Normalize, not {other:?}"),
+    }
+    joint.ty.unit = identity;
+    v8.outputs.insert("observation_state".to_owned(), joint);
     let image = v8.outputs.remove("rgb_overhead").expect("the image output");
     v8.outputs
         .insert("observation_images_rgb_overhead".to_owned(), image);
@@ -3641,12 +3638,19 @@ const OBSERVATION_V8_HEADER: &str = "\
 # `es policy import-lerobot` -- not an IR-owned graph. Three things follow, and each is forced
 # by what that checkpoint *is*:
 #
-#  1. **The state port carries raw radians.** ACT stores its normalization statistics in the
-#     checkpoint itself (`normalize_inputs.buffer_observation_state.{mean,std}`) and applies
-#     them as the first operation of its forward pass. A `Normalize` here would be the same
-#     affine map applied twice, so the state branch is `StateInput` and nothing else. The
-#     `Unit::Angle` that reaches the policy contract is therefore the truth rather than a
-#     relaxation: the network is still not fed raw, its own first layer is the normalizer.
+#  1. **The state `Normalize` is the identity**: `Range{0..1}`, which is `(q - 0) / (1 - 0)`,
+#     so the policy is served the joint angles in radians as the scene reports them. ACT
+#     stores its own statistics in the checkpoint
+#     (`normalize_inputs.buffer_observation_state.{mean,std}`, fitted to the values it was
+#     trained on) and applies them as the first operation of its forward pass -- the
+#     conversion is already owned. A second, unrelated affine map here would only change what
+#     those statistics had to absorb, and it would have to be applied to the exported dataset
+#     as well, which means implementing `Op::Normalize` a second time. That is the defect
+#     section 7.9 removed. The node stays because spec 5.4 requires a policy input to be
+#     `Normalized`, `Dimensionless` or `Token` (`TYPE-011`, checked against the contract by
+#     the cross-IR pass), and what this port declares is exactly true: the Observation IR's
+#     normalization decision for an externally-normalizing policy is the identity, stated in
+#     the one node that decides it rather than left to a reader's inference.
 #  2. **There is one state port.** `lerobot.utils.feature_utils.dataset_to_policy_features`
 #     gives a policy exactly one `observation.state` feature, so V7a's simulator-privileged
 #     `sim_cube_pose` has nowhere to land and is dropped. V8 is the *vision* question, which
