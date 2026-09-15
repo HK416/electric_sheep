@@ -1144,7 +1144,9 @@ frame 0의 청크 언더런 — 이고, 위반율 워치독은 한 번도 발화
 | torque_noise | 0.0000 | 0.0000 | 0.0000 |
 | backlash | 0.0000 | 0.0000 | 0.1250 |
 
-96 에피소드 중 `Success` 넷. V2b는 0, V3는 2였다. **`evaluation.toml`은 `success_rate >= 0.5`를
+96 에피소드 중 `Success` 넷. V2b는 0, V3는 2였다. 그래서 V2b 번들에서 *"non-vacuity: no suite
+produced a single Success episode"*로 패닉했던 V3 자신의 비공허성 게이트가 이제 통과한다:
+`RAN visible_learning_demo_run`, 1,544초. **`evaluation.toml`은 `success_rate >= 0.5`를
 요구한다. nominal 스위트는 `0.0625`를 측정했다. 실패이고, 실패하지 않게 하려고 낮춘 것은 없다.**
 V1c의 모든 셀은 여전히 `envelope_violation_rate 1.0000`을 보고하고, 여섯 스위트 84,772 프레임은
 `Clamped` 76,412와 `Fallback` 8,360이며 **`ActionSource::Policy`는 단 하나도 없다** — 평가

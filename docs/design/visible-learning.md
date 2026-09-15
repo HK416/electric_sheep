@@ -1200,7 +1200,9 @@ and the 20,000-step checkpoint across the suite, 16 episodes each:
 | torque_noise | 0.0000 | 0.0000 | 0.0000 |
 | backlash | 0.0000 | 0.0000 | 0.1250 |
 
-Four `Success` episodes in 96, against V2b's zero and V3's two. **`evaluation.toml` asks for
+Four `Success` episodes in 96, against V2b's zero and V3's two — so V3's own non-vacuity gate,
+which panicked on the V2b bundle with *"non-vacuity: no suite produced a single Success
+episode"*, now passes: `RAN visible_learning_demo_run`, 1,544 s. **`evaluation.toml` asks for
 `success_rate >= 0.5`. The nominal suite measured `0.0625`. It fails, and nothing was lowered to
 make it not fail.** Every V1c cell still reports `envelope_violation_rate 1.0000`, and across the
 six suites 84,772 frames are 76,412 `Clamped` and 8,360 `Fallback` with **not one
