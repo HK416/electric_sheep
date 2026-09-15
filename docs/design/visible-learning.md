@@ -2952,6 +2952,163 @@ threshold of 0.5, so the stop rule fires: no six-suite sweep, no showcase videos
 variable here. What remains is not reach, not grasp, not generalization and not the budget — it
 is one joint that is commanded shut for the whole episode and clamped there.
 
+### 7.23 As built (V15): the release was in the data, and it was fourteen control steps long
+
+Packet `docs/packets/M5/V15-release-in-the-data.md`. The hypothesis this packet was opened on —
+that the recorded demonstrations end *before* the expert's `Release` stage, so the policy has
+never seen a hand open — is **false**, and the measurement that falsifies it is the useful part.
+
+**Part 1a — every demonstration contains the release, and only the first fourteen control steps
+of it.** V14's 200-demonstration `ds-train`, per episode, from the recorded `action` column and
+the `.estraj` beside it. "The tail" is the frames that follow the last command that closes the
+jaw.
+
+| per demonstration, median of 200 | V14, threshold 0.60 |
+|---|---|
+| episode length | 178 frames |
+| tail: frames after the last closed gripper command | **14** |
+| of those, commanded above 0.30 rad | 8 |
+| of those, commanded above 0.60 rad | **1** |
+| peak gripper command in the tail | **0.614** rad, of `grip_open` = 0.9 |
+| measured jaw at the last frame | 0.573 rad |
+| cube z at the last frame | 0.0276 m — resting on the bin floor, not held in the air |
+| cube inside the 3-D bin volume at the last frame | 200 / 200 |
+
+Asked the way the hypothesis framed it — "does the gripper command ever exceed the stall value
+before the episode ends?" — the answer is 200 / 200 and about 74 frames per episode, and it is
+the wrong question. The first such frame is tick 9: the expert holds the jaw wide open at 0.9
+for some 53 frames during `Approach` and `Descend`, on the way *down to the cube*. In the
+training set "the jaw is wide open" is overwhelmingly the approach. The release is a 14-frame
+tail in which the command climbs from `grip_closed` and is cut off at 0.614, having never
+reached the 0.9 it was aiming at.
+
+**Why it is cut off.** The episode ends on the Task IR's own `Terminate`, which fires on the
+first tick the predicate is true, and the predicate's gripper term was `gripper qpos > 0.6`. The
+expert's opening ramp is paced by `step_max` like every other joint (`ExpertCfg::pace_to`,
+`PACE = 0.5` of the Deployment IR's envelope — section 7.19), and the measured jaw lags the
+command, so crossing 0.6 takes 14 control steps and crossing 0.85 takes 19. The threshold was
+not choosing how strict "released" is; it was choosing **how much of the release survives into
+the data**.
+
+**Part 1b — the harness was already counting only released cubes.** The gripper term has been in
+the predicate since V1 (`add_gripper_open_term` in `crates/es/tests/cli.rs`), and open question
+21 states it. V14's 0 / 16 is that term and nothing else. Per tick, over the 1,800-step budget:
+
+| ticks of 1,800 satisfying | held-out 01 | held-out 04 | training 03 | training 11 | training 15 |
+|---|---|---|---|---|---|
+| cube x in (0.09, 0.19) | 1,691 | 1,697 | 920 | 1,688 | 1,668 |
+| … and `|vx| < 0.05` | 1,676 | 1,679 | 904 | 1,671 | 1,652 |
+| gripper qpos > 0.6 | 45 | 39 | 779 | 50 | 70 |
+| **all five terms** | **0** | **0** | **0** | **0** | **0** |
+
+So the settling term does not fail on contact jitter — it holds for 93 % of the episode, the
+cube's x drifting by under a millimetre for 30 s — and the x span is exactly the interval the
+3-D `cube_in_the_bin` check uses. The gripper ticks are the approach, before the cube is ever in
+the span. The blocking term is the gripper, at 0.078 – 0.093 rad from the moment it closes.
+
+**Part 2 — the predicate, before and after.** The structure does not move: five terms, `And`-ed,
+over `GetJointState` leaves and `Compare` nodes that already exist. One constant does.
+
+| | before (V1 – V14) | after (V15) |
+|---|---|---|
+| bin's x span | `cube x > 0.09` **and** `cube x < 0.19` | unchanged |
+| settling | `cube vx > -0.05` **and** `cube vx < 0.05` | unchanged — Part 1b shows it is not what fails |
+| the hand is open | `gripper qpos > 0.6` | **`gripper qpos > 0.85`** |
+
+0.85 is not a stricter reading of the same thing; it is a different thing. A jaw shut on the
+30 mm cube reads 0.09 and one that is *opening but still in contact with it* reads anything up
+to about 0.6, so only a jaw that is both commanded to `grip_open` and **empty** can reach 0.85.
+The episode therefore ends on a finished release rather than on the first millimetre of one, and
+what the demonstration records is the whole ramp plus the cube at rest under an open hand.
+`task_hash` `78814eb4…` → **`eb6efefa…`** and `observation_hash` `72b8609a…` → **`899c16a9…`**;
+`deployment_hash` does not move, and neither does `lowering_hash` (`70a8fec7…`).
+
+Two oracles pin the result rather than the intention. `expert_solves_the_pinned_seeds` now counts
+the opening commands in every demonstration's tail and fails below `RELEASE_FRAMES = 5` — the
+same kind of pin as `THRESHOLD`, and at the old threshold it was 1. `the_demo_task_cones_lower`
+evaluates the *lowered* success `Expr` on a jaw shut on the cube, on a jaw opening but not yet
+clear of it, and on a released one, with no backend at all.
+
+**What that bought in the data.** The same 200 seeds, collected through the same expert at the
+same pace, 200 / 200 `Success` both times:
+
+| per demonstration, median of 200 | V14, 0.60 | **V15, 0.85** |
+|---|---|---|
+| episode length | 178 | **183** |
+| tail after the last closed command | 14 | **19** |
+| of those, commanded above 0.30 | 8 | **13** |
+| of those, commanded above 0.60 | 1 | **6** |
+| peak gripper command in the tail | 0.614 | **0.846** |
+| measured jaw at the last frame | 0.573 | **0.834** |
+| cube z at the last frame | 0.0276 | 0.0279 |
+| total frames | 35,918 | 36,960 |
+
+Six times the frames that command the hand open past the stall, and a terminal state that is a
+released cube under an open hand rather than a jaw halfway through a ramp. The expert oracles are
+unchanged at 8 / 8 on both paths (`expert_solves_the_pinned_seeds`, worst
+`envelope_violation_rate` 0.1974 through `expert_passes_the_evaluation_harness`).
+
+**Part 3 — the same recipe, with the predicate as the single variable.** 200 demonstrations,
+bake, the V13 GroupNorm graph for 40,000 steps (batch 8, lr 1e-4, seed 0, `--resident-gpu`),
+pack, evaluate on the training seeds 1–16 and the held-out seeds 101–116. Loss 0.0476 → 0.0193
+at 20,000 → 0.0146 at 40,000; `learning_hash` `5dac0a46…` and `lowering_hash` `70a8fec7…` are
+V13's, so the trained function is V13's function on V15's data.
+
+| nominal suite | V14, 200 demos, 40k, **budget 900** | V15, 200 demos, 20k, budget 1,800 | **V15, 200 demos, 40k, budget 1,800** |
+|---|---|---|---|
+| `success_rate`, training 1–16 | 1 / 16 | 1 / 16 | **0 / 16** |
+| `success_rate`, held-out 101–116 | 0 / 16 | 0 / 16 | **0 / 16** (twice, identical) |
+| cube lifted clear, training / held-out | 9 / 16 · 9 / 16 | 3 / 16 · 4 / 16 | 8 / 16 · 9 / 16 |
+| **carried into the bin volume, training** | **8 / 16** | 1 / 16 | **5 / 16** |
+| **carried into the bin volume, held-out** | **9 / 16** | 0 / 16 | **4 / 16** |
+| **released inside the bin** | **0 / 16** | **0 / 16** | **0 / 16** |
+| `envelope_violation_rate`, tr / ho | 0.1587 / 0.2060 | 0.9025 / 0.9105 | 0.7148 / 0.3381 |
+| `violation.position`, tr / ho | 657 / 1,357 | 21,868 / 23,403 | 16,529 / 7,801 |
+| `episode_length`, tr / ho | 855.1 / 900 | 1700.1 / 1800 | 1800 / 1800 |
+
+The two held-out runs on the 40,000-step checkpoint agree cell for cell. **The budget is not the
+same in the two V14 and V15 columns** — V15's Task IR carries 1,800 (open question 21(b)'s
+default, kept) and V14's 200-demonstration table was taken at 900 — so the carry counts are
+generous to V15 and the violation rates are not a like-for-like comparison at all; a suite that
+runs twice as long accumulates twice the clamped frames. What is comparable, because it is a
+count of a thing that either happened or did not, is the release row: **zero, again, in 64 more
+episodes.**
+
+Per joint, the same single-joint signature as V14: the gripper is outside its soft bound for
+18,159 of 28,800 training-seed ticks (63.1 %) and 8,557 (29.7 %) held out, every other joint 0
+or 10. The carrying episodes hold the jaw at 0.086 – 0.093 rad — the jaw stalled on the cube —
+for the whole remainder.
+
+The policy does now open its hand; it simply never does it while holding the cube. Held-out 10
+and 15 finish with the jaw at 0.916 and 0.926 rad after failing the grasp, and the one
+`success` the 20,000-step checkpoint scored is the sharpest version of that: training seed 9,
+202 ticks, the cube at **(0.166, +0.370, 0.012)** — inside the bin's x span, at rest, under an
+open hand, and 470 mm from the bin along the y the predicate cannot see. The gripper term makes
+`success` mean *released*; it cannot make it mean *released in the bin*, which is exactly open
+question 21(a) and nothing V15 can fix inside the node set.
+
+**Wall clocks** (observations, not a throughput claim — §12.4): collect 200 demonstrations with
+frames 217 s; bake 5 s (36,960 frames, 3.9 GB); train 40,000 steps 1,332 s on the RTX 4090; one
+16-episode nominal suite with frames at the 1,800-step budget 515 – 533 s.
+
+**Verdict.** The hypothesis is falsified twice. The release was already in the demonstrations —
+every one of them, ending with the cube resting in the bin — and the predicate that truncated it
+was cutting a 14-frame ramp, not the release itself. Repairing that gave the data six times the
+open-commanded frames and a terminal state that is a released cube under an open hand, and the
+policy's behaviour did not move: **0 releases in 64 more evaluated episodes, 128 across V14 and
+V15**, at 900 steps and at 1,800. Held-out `success_rate` is 0, below the unchanged acceptance
+threshold of 0.5, so the stop rule fires — no six-suite sweep, no showcase videos, no second
+variable here.
+
+What V15 leaves behind is a smaller question than the one it was given. "The demonstration ends
+before the hand opens" is answered and wrong; "the harness cannot see a released cube" is
+answered and wrong. What is left is one channel of a six-wide L1 regression whose "open now"
+frames are 7 % of an episode and whose meaning is decided by the other five, and the next
+variable belongs on the learning side — the gripper channel's weight in the loss, or the
+temporal ensemble that already demonstrably lags this joint's *closure* (the blend never reaches
+the commanded `grip_closed`, pinned in `crates/es/tests/cli.rs`) and has no reason to treat its
+opening any better.
+
 
 ## 8. Safety overlay (V3)
 
@@ -3265,7 +3422,13 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     scored every one of them `timeout`, while the one episode it *did* score `success` (training
     seed 3 at the 40,000-step checkpoint, tick 182) had the cube 125 mm in the air, inside the
     bin's x span and nowhere near the bin. The predicate is neither sound nor complete for the
-    task the demo claims. Three ways out. **(i)** Give `GetJointState` a component index (or a
+    task the demo claims. **V15 settles the part of (a) that was a measurement rather than a
+    decision** (section 7.23): per tick over V14's five carrying episodes, 1,668 – 1,697 of the
+    1,800 ticks put the cube inside the bin's x span and 1,652 – 1,679 of those also satisfy
+    `|vx| < 0.05`, while **no tick satisfies all five terms**. The settling bound does not fail
+    on contact jitter and the x span is the same interval the 3-D check uses; the only term that
+    ever blocks a held cube is the gripper. What is left for a human is the y and z of it —
+    three ways out. **(i)** Give `GetJointState` a component index (or a
     `GetBodyPose`-style vector output plus a `Slice`), so three `Compare`s over three components
     can be `And`-ed — the smallest change, and it is a §6 schema change with a `task_hash` move.
     **(ii)** Author the check as a `GetBodyPose` on the cube body, which already returns a
