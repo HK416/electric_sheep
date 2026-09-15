@@ -1434,10 +1434,70 @@ by `a_command_outside_the_envelope_is_still_clamped` (`es-safety`) and
 still trips it is a phase-2 measurement, and if it stops tripping it that is a finding to report,
 not a number to force.
 
-**Not measured yet.** Everything above is local. The server run — the expert through the evaluation
-harness on the demo scene, then V1c's 20,000-step bundle re-measured nominal and across the six
-suites with `--jobs 6`, no retraining, no knob moved — is phase 2, and the tables here will be
-filled from it.
+**Phase 2, as measured** (oracle server, RTX 4090, `~/venvs/es-lerobot-cuda/bin/python`, tree
+`~/Projects/es-v6` — an archive checkout built from this branch's head at `5a7e00e`, no `git log`
+available in it — `~/artifacts/plan-v/v6/`, 2026-09-15. Nothing retrained, no knob moved.)
+
+**Three oracles, all server-gated.** `expert_solves_the_pinned_seeds` (collection): 8/8 pinned
+seeds `Success`, cube inside the bin's interior on all eight (`oracle-collect.log`).
+`expert_passes_the_evaluation_harness` (evaluation): 8/8, `envelope_violation_rate` 0.4815–0.5485
+per seed, episode length 330–354 (`oracle-eval.log`) — section 7.13 finding 7 has what that number
+is and why the packet's own gate is re-pinned because of it.
+`collection_and_evaluation_draw_the_same_scene_for_a_seed`: measured to fail exactly as designed to
+catch a real defect, just not the one V6b wrote it for — element 6 (the cube's `y`) came back
+`0.2550719976425171` from `es loop collect` and `0.255071989355131` from `es eval run`, the same
+draw, rounded twice (`oracle-parity.log`). Section 7.13 finding 8 has the fix.
+
+**V1c's 20,000-step bundle, re-measured under the corrected envelope:**
+
+| checkpoint | V3 nominal | V2b nominal | V1c nominal | V6, honest |
+|---|---|---|---|---|
+| 20,000 steps | 0.1250 (2/16) | 0.0000 (0/16) | 0.0625 (1/16) | **0.0000 (0/16)** |
+
+and the six-suite sweep, 16 episodes each, every one of the 112 cells running its full 900-step
+budget (`nominal-20000/report.json`, `suite-20000/report.json`):
+
+| suite | success_rate | envelope_violation_rate | fallback | clamped | policy (of 14,400) |
+|---|---|---|---|---|---|
+| nominal | 0.0000 | 0.2106 | 220 | 2,813 | 11,367 |
+| light_intensity | 0.0000 | 0.4790 | 333 | 6,565 | 7,502 |
+| light_direction | 0.0000 | 0.3609 | 400 | 4,797 | 9,203 |
+| observation_delay | 0.0000 | 0.2142 | 220 | 2,865 | 11,315 |
+| torque_noise | 0.0000 | 0.1817 | 140 | 2,476 | 11,784 |
+| backlash | 0.0000 | 0.2265 | 240 | 3,021 | 11,139 |
+
+Zero of ninety-six. `fallback` is `failure_mode_histogram`'s own bucket; `clamped` is
+`envelope_violation_rate · 14,400 − fallback`. In every suite `fallback` equals the histogram's
+`violation.rate` bucket exactly, so every fallback tick this run produced is the
+`EnvelopeViolationRate` watchdog and nothing else — no `NonFinite`, `StaleObservation`,
+`InferenceDeadline`, `HeartbeatLoss` or `SensorDropout` ever fired. Inside `clamped`, `nominal`'s
+own histogram is `violation.position 2,031`, `violation.acceleration 843`, `violation.velocity
+439` — position leads the next stage by more than 2:1, and the same order (position >
+acceleration > velocity, `violation.rate_limit` and `violation.torque` absent from every suite)
+holds in all six. §9.3's `position_limit` stage is the soft joint margin
+(`position_soft_margin = 0.05` rad, `deployment.toml`); the joint with the widest asymmetric range
+and by far the largest tracked offset in section 7.10's own diagnostic (the gripper, joint 5,
+`[-0.1745, 1.7453]` rad, median `|action − qpos| = 0.1436` against `0.0009` for the arm) is the
+likely tenant — a policy closing the gripper on the cube commands past that joint's soft limit far
+more readily than it ever outruns its own acceleration budget. That is a hypothesis, named as one,
+not a per-joint split this run captured; `events.json` carries the per-frame detail if a later
+packet wants it.
+
+**V3's non-vacuity rule holds, honestly this time.** `Clamped ≥ 1` — 2,813 clamped steps in
+`nominal` alone, real clamp math (§9.3 stages 2–4), not the following-error artifact V6 removed.
+The rule was vacuous under every V3, V2b and V1c number (sections 7.8–7.10: `envelope_violation_rate` was
+`1.0000` in each of them, every step `Clamped` or `Fallback`, none of it meaning what the gate
+assumed); it is not vacuous now.
+
+**The conclusion phase 2 was for.** The harness passes the expert — 8/8, at an envelope-violation
+rate the Deployment IR's own watchdog tolerates by a wide margin. The vision policy does not do
+the task — 0/16 nominal, 0/96 across the suite, its clamps dominated by a joint-limit stage rather
+than the temporal-ensemble jitter the expert's own run shows (section 7.13 finding 7), which reads
+as the policy commanding poses the arm cannot reach, not as a harness artifact correcting a policy
+that would otherwise succeed. Per the stop-rule ladder this note has followed since section 7.9,
+the next step is not a bigger model or a longer schedule on this observation: it is section 7.14's
+own move, already begun — V7a's privileged state port, whose own phase 2 is the next table this
+document owes.
 
 ### 7.13 As built (V6b): evaluation executes chunks the way collection does, and draws the same scene
 
@@ -1520,6 +1580,46 @@ collection numbers do: the demonstrations, the loss curves, `observation_hash`, 
 neither of which moved. Phase 2 re-measures V1c's committed 20,000-step bundle — no retraining, no
 knob moved — and that is the first evaluation table plan V has produced that measures the policy
 rather than the harness.
+
+**7. Phase 2 measured the mechanism finding 1 named, and it forced the harness's own gate to be
+re-pinned.** `expert_passes_the_evaluation_harness` asserted `worst_violation < 0.02` since phase
+1, on the assumption that the plane reads the expert's paced ramp tick by tick exactly as the
+expert emitted it. It does not, by construction of this section: the evaluation path is now routed
+through the same `ChunkBuffer` temporal-ensemble blend as collection — `decay = 0.01` over a
+16-row horizon — so what the plane judges each tick is `action_at`'s blend of every chunk still in
+span, not any one chunk's own paced row. Measured: `envelope_violation_rate` 0.4815–0.5485 across
+the eight pinned seeds (`oracle-eval.log`). Each contributing chunk is paced to 90% of
+`velocity_max·dt` and `acceleration_max·dt²` (section 7.12 finding 4), so the ~10% margin the
+pacing rule leaves is exactly the room that blend-induced jitter between chunks computed one
+control tick apart needs to trip the velocity and acceleration clamp stages, tick after tick, on a
+trajectory that never once asks for an out-of-range position. The collection path already showed
+the same shape in its own numbers: section 7.10's V1c demonstrations are `Clamped` or `Fallback`
+on 11,631 of 18,263 frames, **0.6368** — cited here because it is the same phenomenon, measured
+earlier, on the path this section is not re-measuring.
+
+So the `< 0.02` gate was not a limit this packet chose to loosen; it was a phase-1 reading of a
+path phase 1 had not yet routed through the buffer, and it stopped being true the moment finding 1
+above landed. `crates/es/tests/cli.rs` now reads the bound that is still true, out of the document
+rather than typed into the test — the Deployment IR's own `EnvelopeViolationRate` watchdog
+(`max_frac = 0.9`, `tests/fixtures/visible-learning/deployment.toml`) — because that is the number
+spec 9.4 actually acts on: above it the plane latches the fallback and the expert would be driving
+`hold_position`, not the task. At a worst case of 0.5485 the expert never comes close, and
+`expert_solves_the_pinned_seeds`'s 8/8 stays the golden the two paths are checked against. The
+`< 0.02` number is retired here, in writing, rather than quietly widened in the assertion alone.
+
+**8. The cross-path oracle measured a second, unrelated rounding, and it is fixed at the width the
+two paths share.** `collection_and_evaluation_draw_the_same_scene_for_a_seed` compared the two
+paths' first `qpos ‖ qvel` row as raw `f64` bits and failed: element 6 (the cube's `y`) read
+`0.2550719976425171` off `es_data::Collector`'s policy input and `0.255071989355131` off
+`es_eval::Evaluation`'s frame source, the same draw, rounded twice. The collector's own policy
+input is `es_env::domains::state_row`'s `f32` tensor — the plan-free path never carries an `f64`
+observation past the backend — and the demonstration `observation.state` column is written at the
+same `f32`; the evaluation runner's frame source, by contrast, is handed the backend's `f64`
+`StateView` directly, one conversion short of what the collector's own policy ever sees. Comparing
+the two at `f64` compared an `f32`-rounded number to an unrounded one, not two paths reading one
+number differently. The oracle now casts both sides to `f32` before the bit comparison — the width
+the two paths are actually the same object at, and the width every demonstration this project has
+ever recorded is written at.
 
 ### 7.14 As built (V7a phase 1): the cube's pose enters the state port, and what that is allowed to prove
 
