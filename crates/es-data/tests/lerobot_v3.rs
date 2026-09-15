@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use es_data::{
-    export_v3, Column, DatasetIdentity, Dtype, Episode, FeatureSpec, Info, LeRobotDataset,
-    LeRobotWriter, Split,
+    export_v3, Column, DatasetIdentity, Dtype, Episode, ExportOptions, FeatureSpec, Info,
+    LeRobotDataset, LeRobotWriter, Split,
 };
 
 const LENGTHS: [usize; 2] = [4, 3];
@@ -159,7 +159,8 @@ fn export_layout_is_v3() {
     write_fixture(&src, Some(&frames));
 
     let dataset = LeRobotDataset::open(&src).expect("open the v2.1 source");
-    let report = export_v3(&dataset, &out, Some(&frames)).expect("export");
+    let report =
+        export_v3(&dataset, &out, Some(&frames), &ExportOptions::default()).expect("export");
     assert_eq!(report.episodes, LENGTHS.len() as u32);
     assert_eq!(report.frames, total_frames() as u64);
     assert_eq!(report.cameras, vec![CAMERA.to_owned()]);
@@ -220,7 +221,7 @@ fn provenance_records_the_source_identity() {
     write_fixture(&src, None);
 
     let dataset = LeRobotDataset::open(&src).expect("open");
-    export_v3(&dataset, &out, None).expect("export");
+    export_v3(&dataset, &out, None, &ExportOptions::default()).expect("export");
 
     let split = Split::deterministic(LENGTHS.len() as u32, [1.0, 0.0, 0.0], 0);
     let identity = DatasetIdentity::compute(&dataset, &split).expect("identity");
@@ -240,7 +241,7 @@ fn images_without_frames_are_dropped_not_dangled() {
     write_fixture(&src, None);
 
     let dataset = LeRobotDataset::open(&src).expect("open");
-    let report = export_v3(&dataset, &out, None).expect("export");
+    let report = export_v3(&dataset, &out, None, &ExportOptions::default()).expect("export");
     assert!(report.cameras.is_empty(), "{:?}", report.cameras);
     assert_eq!(report.dropped, vec![CAMERA.to_owned()]);
     assert!(
@@ -290,7 +291,8 @@ fn lerobot_v3_export() {
     let written = write_fixture(&src, Some(&frames));
 
     let dataset = LeRobotDataset::open(&src).expect("open the v2.1 source");
-    let report = export_v3(&dataset, &out, Some(&frames)).expect("export");
+    let report =
+        export_v3(&dataset, &out, Some(&frames), &ExportOptions::default()).expect("export");
     assert_eq!(report.cameras, vec![CAMERA.to_owned()]);
 
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("python/lerobot_read_ref.py");
@@ -381,4 +383,92 @@ fn lerobot_v3_export() {
     );
 
     println!("RAN lerobot_v3_export: {text}");
+}
+
+/// Packet M5/V8 oracle: `meta/stats.json` is the file `lerobot` 0.6.1 loads, and its numbers
+/// are the numbers `lerobot` itself would have computed from the same parquet.
+///
+/// Why the file exists at all: `lerobot-train` normalizes every policy feature from
+/// `meta.stats`, and section 7.7's "three deliberate omissions" left it out because nothing
+/// then trained through `lerobot`. V8 does, so the export writes it — in Rust, in the same pass
+/// that writes the parquet, so there is one traversal of the values and not two.
+///
+/// The comparison runs *inside* the reference: `python/lerobot_stats_ref.py` loads our file
+/// with `LeRobotDataset` and recomputes the same statistics with `compute_episode_stats` +
+/// `aggregate_stats`, then reports the largest disagreement. The threshold is here.
+#[test]
+fn lerobot_v3_stats() {
+    let Ok(python) = std::env::var("ES_LEROBOT_PYTHON") else {
+        println!(
+            "SKIP lerobot_v3_stats: ES_LEROBOT_PYTHON is unset; point it at an interpreter \
+             with lerobot[dataset]"
+        );
+        return;
+    };
+    let dir = scratch("v3-stats");
+    let (src, frames, out) = (dir.join("src"), dir.join("frames"), dir.join("out"));
+    write_fixture(&src, Some(&frames));
+
+    let dataset = LeRobotDataset::open(&src).expect("open the v2.1 source");
+    export_v3(&dataset, &out, Some(&frames), &ExportOptions::default()).expect("export");
+
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("python/lerobot_stats_ref.py");
+    let output = match Command::new(&python).arg(&script).arg(&out).output() {
+        Ok(output) => output,
+        Err(e) => {
+            println!("SKIP lerobot_v3_stats: {python}: {e}");
+            return;
+        }
+    };
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    assert!(
+        output.status.success(),
+        "{}: exited {:?}\nstdout:\n{text}\nstderr:\n{}",
+        script.display(),
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if let Some(why) = field(&text, "skip") {
+        assert!(
+            why.starts_with("import lerobot.datasets"),
+            "lerobot refused the stats: {why}"
+        );
+        println!("SKIP lerobot_v3_stats: {why}");
+        return;
+    }
+
+    // Every feature LeRobot computes statistics for must be in our file, with all five keys and
+    // the same shape. A missing entry is a feature `lerobot-train` cannot normalize.
+    assert_eq!(
+        field(&text, "missing"),
+        Some("[]"),
+        "missing entries\n{text}"
+    );
+    let features = field(&text, "features").expect("features");
+    for name in [
+        "observation.state",
+        "action",
+        CAMERA,
+        "timestamp",
+        "frame_index",
+        "episode_index",
+        "index",
+        "task_index",
+    ] {
+        assert!(features.contains(name), "{name} has no stats\n{text}");
+    }
+
+    // The fixture is small enough that `sample_indices` is exhaustive, so the image statistics
+    // are the same reduction on both sides and there is nothing to allow for beyond float
+    // width: LeRobot accumulates a float32 column in float32, the export in f64.
+    let worst: f64 = field(&text, "worst")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| panic!("no worst in {text}"));
+    assert!(
+        worst < 1e-5,
+        "largest disagreement {worst} at {:?}\n{text}",
+        field(&text, "worst_key")
+    );
+
+    println!("RAN lerobot_v3_stats: {text}");
 }

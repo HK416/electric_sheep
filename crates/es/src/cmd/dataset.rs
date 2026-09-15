@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use es_compile::PolicyBundle;
-use es_data::{export_v3, Column, DatasetIdentity, LeRobotDataset, Split};
+use es_data::{export_v3, Column, DatasetIdentity, ExportOptions, LeRobotDataset, Split};
 use es_eval::ObservationBake;
 use es_ir::types::ElemType;
 
@@ -13,7 +13,8 @@ use crate::util::hex;
 
 const HELP: &str = "\
 es dataset info <root>
-es dataset export --lerobot-v3 <root> --out <dir> [--frames <dir>]
+es dataset export --lerobot-v3 <root> --out <dir> [--frames <dir>] [--drop <a,b>]
+                  [--state-dim <n>]
 es dataset bake --policy <bundle.esb> --out <dir> [--frames <dir>] <root>
 
 `info` opens a LeRobot dataset at <root>, and prints its features (as the spec 5.4 PortType
@@ -23,7 +24,8 @@ since `dataset info` has no split the caller actually intends to train with.
 
 `export --lerobot-v3` converts the v2.1 dataset at <root> into the v3.0 layout `lerobot`
 0.6.1 reads, under <dir>; the source is not modified. <dir>/meta/es_provenance.json records
-the source's content/schema/split hashes (spec 19.2).
+the source's content/schema/split hashes (spec 19.2), and <dir>/meta/stats.json the
+per-feature min/max/mean/std/count `lerobot`'s normalizers read (packet M5/V8).
 
 `bake` runs every frame of the dataset at <root> through the Observation IR the bundle
 carries -- the same `CpuPlan`, the same input resolution and the same encoding `es eval
@@ -44,6 +46,14 @@ train_act.py --baked <dir>` is the consumer.
                 For `bake`: the flat <dir>/<NNNNNN>.bin tiles `es loop collect --frames`
                 writes, in dataset-global frame order. An Observation IR with an image
                 input and no --frames is refused, never baked with zeros.
+--drop <a,b>    For `export`: source columns to leave out. `lerobot` classifies a policy
+                feature by name alone, so every `action*` column it sees becomes an action
+                head -- `--drop action_commanded,action_source` is what leaves one.
+--state-dim <n> For `export`: keep only the leading n values of `observation.state`. The
+                recorded row is env 0's whole qpos followed by its whole qvel, and only the
+                qpos part can be served back at inference (`es_eval`'s state capture reads
+                qpos; there is no qvel arm), so a policy trained on the whole row could
+                never be run.
 ";
 
 pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
@@ -67,12 +77,15 @@ fn export(args: &[String]) -> Result<u8, CliError> {
         return Ok(0);
     }
     let (mut root, mut out, mut frames) = (None, None, None);
+    let (mut drop, mut state_dim) = (None, None);
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         let slot = match arg.as_str() {
             "--lerobot-v3" => &mut root,
             "--out" => &mut out,
             "--frames" => &mut frames,
+            "--drop" => &mut drop,
+            "--state-dim" => &mut state_dim,
             other => {
                 return Err(CliError::Usage(format!(
                     "es dataset export: unexpected argument '{other}'\n\n{HELP}"
@@ -89,8 +102,33 @@ fn export(args: &[String]) -> Result<u8, CliError> {
         )));
     };
 
+    let opts = ExportOptions {
+        drop: drop
+            .iter()
+            .flat_map(|p| {
+                p.to_string_lossy()
+                    .split(',')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|s| !s.is_empty())
+            .collect(),
+        state_dim: state_dim
+            .as_ref()
+            .map(|p| {
+                p.to_string_lossy().parse::<usize>().map_err(|e| {
+                    CliError::Usage(format!(
+                        "es dataset export: --state-dim: {e}
+
+{HELP}"
+                    ))
+                })
+            })
+            .transpose()?,
+    };
+
     let dataset = LeRobotDataset::open(root).map_err(|e| CliError::Runtime(e.to_string()))?;
-    let report = export_v3(&dataset, &out, frames.as_deref())
+    let report = export_v3(&dataset, &out, frames.as_deref(), &opts)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
     println!("wrote: {}", out.display());
     println!("episodes: {}   frames: {}", report.episodes, report.frames);
