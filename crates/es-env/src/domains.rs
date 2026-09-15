@@ -58,7 +58,7 @@ pub fn replan_interval(rate: RateSpec) -> Result<u64, EnvError> {
     let den = u128::from(rate.control.den()) * u128::from(rate.inference.num());
     if num % den != 0 {
         return Err(EnvError::Schedule(format!(
-            "the deployment declares rate.control = {} Hz and rate.inference = {} Hz: one              re-plan period is {} control ticks, which is not a whole number",
+            "the deployment declares rate.control = {} Hz and rate.inference = {} Hz: one re-plan period is {} control ticks, which is not a whole number",
             rate.control.as_hz_f64(),
             rate.inference.as_hz_f64(),
             num as f64 / den as f64,
