@@ -50,8 +50,24 @@
 # still counted, still recorded as `action_source = Clamped`, and still V3's material.
 #
 # Rates are integer `TickRate`s (spec 18.1): control 50 Hz, inference 5 Hz. The deadlines are
-# whole multiples of the control period -- observation_age 4x, inference_budget 2x,
+# whole multiples of the control period -- observation_age 12x, inference_budget 12x,
 # actuation_budget 1/2x -- so nothing here is a float duration.
+#
+# `inference_budget` was 2x (40 ms) until packet M5/V17, and 2x cannot be met by a deployment
+# that declares `rate.inference = 5 Hz`. `SafetyPlane` measures `ViolationKind::InferenceDeadline`
+# as the time since the last chunk it has not seen before (`crates/es-safety/src/plane.rs`,
+# `last_chunk_tick`, spec 9.4). While the runtime replanned on every control tick that gap was
+# always zero; once it honours `rate.inference` the gap *is* the re-plan period -- one chunk
+# every 10 control ticks, so up to 180 ms between arrivals against a 40 ms number. Measured on
+# V15's checkpoint with the old value: the watchdog fired on 7 of every 10 control ticks and
+# the fallback held the arm for whole episodes. 12x = 240 ms is the 200 ms the document itself
+# asks for plus the 40 ms the old value allowed for the inference. This is the INV-12 move --
+# the number a watchdog is measured against moves, the watchdog stays on -- and it is the same
+# correction `widen_inference_budget` in `crates/es/tests/cli.rs` already applies to the M2
+# fixture for the same reason. `deadlines.observation_age` follows only because spec 9.4
+# (`DEP_021`) refuses an `observation_age` below `inference_budget`; the bound that is actually
+# enforced is the `stale_observation` watchdog's, unchanged at 80 ms. No safety limit moved and
+# `envelope_violation_rate`'s `max_frac` did not move.
 #
 # `target` is the simulated scene; V3 or a real SO-101 swaps it for `Physical { driver }`
 # without touching the envelope.
@@ -63,7 +79,7 @@ kind = "deployment"
 fallback = "hold_position"
 schema_version = 1
 watchdogs = [
-    { inference_deadline = { budget = 40000 } },
+    { inference_deadline = { budget = 240000 } },
     "chunk_underrun",
     { stale_observation = { max_age = 80000 } },
     { envelope_violation_rate = { max_frac = 0.9, window = 200 } },
@@ -77,8 +93,8 @@ space = "joint_position"
 
 [body.deadlines]
 actuation_budget = 10000
-inference_budget = 40000
-observation_age = 80000
+inference_budget = 240000
+observation_age = 240000
 
 [body.execution.temporal_ensemble]
 decay = 0.01
