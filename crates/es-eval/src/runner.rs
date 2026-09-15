@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use es_assets::scene::SceneDesc;
 use es_compile::{CpuPlan, Home, PlanMode, Tensor, TensorRef};
-use es_core::{PhysTick, StableId};
+use es_core::{PhysTick, StableId, TickRate};
 use es_env::scheduler::BatchDomains;
 use es_env::traj::Trajectory;
 use es_env::{plane_chunk, ChunkBuffer, Env, EnvMetrics, Episode, PlaneFeed};
@@ -396,7 +396,14 @@ impl Evaluation {
             .map_err(|d| EvalError::Plan(d.iter().map(ToString::to_string).collect()))?;
         let seeds = resolve_seeds(ir);
         let max_steps = cfg.max_steps.unwrap_or(task.config.max_episode_steps);
-        let domains = BatchDomains::single_env();
+        // One control step is one control period (packet M5/V11): `inference.period` is the
+        // scene's physics rate divided by the Deployment IR's `rate.control`, so evaluation
+        // steps the scene exactly as collection did.
+        let domains = BatchDomains::single_env_at(
+            TickRate::from_period_secs(scene.options.timestep)
+                .map_err(|e| EvalError::Env(es_env::EnvError::Schedule(e.to_string())))?,
+            deploy.rate.control,
+        )?;
         // One control step is `inference.period` simulation ticks (§12.1); the deployment
         // states what that step is worth in wall time.
         let control_us = deploy.rate.control_period().0;

@@ -93,6 +93,33 @@ impl TickRate {
     pub fn period_secs_f64(self) -> f64 {
         self.den() as f64 / self.num() as f64
     }
+
+    /// The rate a period in seconds stands for, rounded to whole nanoseconds and reduced so
+    /// that two ways of spelling the same rate compare equal.
+    ///
+    /// Edge conversion only: it is where a scene's `timestep` becomes integer ticks (spec
+    /// 18.1). Never used to accumulate time.
+    pub fn from_period_secs(secs: f64) -> Result<Self, Error> {
+        let nanos = (secs * 1e9).round();
+        if !(nanos.is_finite() && nanos >= 1.0) {
+            return Err(Error::InvalidTickRate {
+                num: 1_000_000_000,
+                den: 0,
+            });
+        }
+        let nanos = nanos as u64;
+        let divisor = gcd(1_000_000_000, nanos);
+        Self::rational(1_000_000_000 / divisor, nanos / divisor)
+    }
+}
+
+#[cfg(feature = "std")]
+const fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 {
+        a
+    } else {
+        gcd(b, a % b)
+    }
 }
 
 /// Simulation time: a tick count plus the rate it is counted at (§18.1).
