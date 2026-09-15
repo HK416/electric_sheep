@@ -30,7 +30,7 @@ use es_ir::learning::{
     TensorPort, WeightsRef,
 };
 use es_ir::types::{ElemType, Frame, PortType, Shape, TimeRef, Unit};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::lower::torch::lowering_hash;
 use crate::lower::{LowerError, TorchModule};
@@ -38,7 +38,7 @@ use crate::runtime::PolicyError;
 use crate::weights::{parse_header, SafetensorsEntry, WEIGHT_PREFIX};
 
 /// One entry of `input_features` / `output_features`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Feature {
     /// `"VISUAL"`, `"STATE"` or `"ACTION"`.
     #[serde(rename = "type")]
@@ -53,7 +53,7 @@ pub struct Feature {
 /// deployment concern, and is ignored rather than guessed at. `serde` defaults mirror
 /// `lerobot.policies.act.configuration_act.ACTConfig`, so a config that omits a field still
 /// loads — see `docs/api-notes/lerobot-act.md`.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ActConfig {
     #[serde(rename = "type")]
     pub kind: String,
@@ -290,6 +290,26 @@ pub fn remap_act_keys<'a>(
     out
 }
 
+/// The `__metadata__` key under which [`remap_checkpoint`] records the config that decides the
+/// module.
+///
+/// Spec 8.3's node parameters do not carry ACT's architecture (the module docs say why), so the
+/// only honest place for it is *inside the checkpoint*: the bytes are hashed into
+/// `WeightsRef::hash` and therefore into `policy_hash`, so the IR still decides which module
+/// runs — transitively, through the hash it declares (spec 5.3). A bundle whose weights were
+/// swapped is refused before this is ever read.
+pub const ACT_CONFIG_KEY: &str = "es.lerobot.act.config";
+
+/// The ACT config a [`remap_checkpoint`] output carries, or `None` for any other checkpoint.
+pub fn embedded_config(bytes: &[u8]) -> Result<Option<ActConfig>, PolicyError> {
+    let Some(raw) = crate::weights::metadata(bytes, ACT_CONFIG_KEY)? else {
+        return Ok(None);
+    };
+    ActConfig::parse(&raw)
+        .map(Some)
+        .map_err(|e| PolicyError::Safetensors(format!("{ACT_CONFIG_KEY}: {e}")))
+}
+
 /// Rewrite a `LeRobot` checkpoint into our key scheme, dropping the training-only tensors.
 ///
 /// Byte-level: the header is rebuilt and each surviving tensor's bytes are copied verbatim, so
@@ -331,6 +351,15 @@ pub fn remap_checkpoint(cfg: &ActConfig, bytes: &[u8]) -> Result<Vec<u8>, Policy
         );
     }
 
+    // The config travels with the weights (see `ACT_CONFIG_KEY`). `parse_header` skips
+    // `__metadata__`, so this adds no key any validator has to learn about.
+    header.insert(
+        "__metadata__".to_owned(),
+        serde_json::json!({
+            ACT_CONFIG_KEY: serde_json::to_string(cfg)
+                .map_err(|e| PolicyError::Safetensors(e.to_string()))?,
+        }),
+    );
     let header = serde_json::to_vec(&serde_json::Value::Object(header))
         .map_err(|e| PolicyError::Safetensors(e.to_string()))?;
     let mut out = (header.len() as u64).to_le_bytes().to_vec();
@@ -580,9 +609,14 @@ class EsPolicy(nn.Module):
         self.n{UNNORM_ACTION} = _ActNorm([{action}])
 
     def forward(self, **inputs):
-        # inputs: {state_in} [B, {state}], {img_in} [B, {image:?}], both unnormalized.
-        state = self.n{NORM_STATE}(inputs[{state_in:?}])
-        image = self.n{NORM_IMAGE}(inputs[{img_in:?}])
+        # inputs: {state_in} [B, {state}], {img_in} [B, {image:?}], both unnormalized --
+        # LeRobot normalizes inside the policy, from the buffers below, so the Observation IR
+        # must hand these over in raw units. One observation is accepted unbatched, which is
+        # what `es eval run` feeds (a spec 7.4 tensor carries no batch axis).
+        state = inputs[{state_in:?}]
+        image = inputs[{img_in:?}]
+        state = self.n{NORM_STATE}(state if state.dim() == 2 else state.unsqueeze(0))
+        image = self.n{NORM_IMAGE}(image if image.dim() == 4 else image.unsqueeze(0))
         batch = state.shape[0]
         # use_vae = {use_vae}: the CVAE encoder runs under `self.training` only, so at inference
         # the latent is zeros and all of its tensors are dropped from the checkpoint.

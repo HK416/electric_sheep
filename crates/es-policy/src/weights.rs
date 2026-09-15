@@ -39,9 +39,8 @@ struct RawEntry {
     data_offsets: [u64; 2],
 }
 
-/// Parse a safetensors header. The tensor bytes themselves are never touched — the Python side
-/// reads those, and shape checking only needs the header.
-pub fn parse_header(bytes: &[u8]) -> Result<BTreeMap<String, SafetensorsEntry>, PolicyError> {
+/// The header's JSON object and the length of the data segment behind it.
+fn header_of(bytes: &[u8]) -> Result<(BTreeMap<String, serde_json::Value>, u64), PolicyError> {
     let len_bytes: [u8; 8] = bytes
         .get(..8)
         .and_then(|b| b.try_into().ok())
@@ -52,8 +51,24 @@ pub fn parse_header(bytes: &[u8]) -> Result<BTreeMap<String, SafetensorsEntry>, 
     })?;
     let raw: BTreeMap<String, serde_json::Value> = serde_json::from_slice(header)
         .map_err(|e| PolicyError::Safetensors(format!("header is not a JSON object: {e}")))?;
+    Ok((raw, (bytes.len() - 8 - n) as u64))
+}
 
-    let data_len = (bytes.len() - 8 - n) as u64;
+/// One entry of the header's `__metadata__` string map — safetensors' own free-form slot, the
+/// only place a checkpoint may carry something that is not a tensor.
+pub fn metadata(bytes: &[u8], key: &str) -> Result<Option<String>, PolicyError> {
+    let (raw, _) = header_of(bytes)?;
+    Ok(raw
+        .get("__metadata__")
+        .and_then(|m| m.get(key))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned))
+}
+
+/// Parse a safetensors header. The tensor bytes themselves are never touched — the Python side
+/// reads those, and shape checking only needs the header.
+pub fn parse_header(bytes: &[u8]) -> Result<BTreeMap<String, SafetensorsEntry>, PolicyError> {
+    let (raw, data_len) = header_of(bytes)?;
     let mut out = BTreeMap::new();
     for (name, value) in raw {
         if name == "__metadata__" {

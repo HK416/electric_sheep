@@ -19,9 +19,17 @@
 //! ES_PYTHON=<venv>/python ES_ACT_CHECKPOINT=<dir> cargo test -p es-policy act -- --nocapture
 //! ```
 //!
-//! where `<dir>` holds `config.json` and `model.safetensors` from
-//! `lerobot/act_aloha_sim_transfer_cube_human`. The checkpoint is never committed — it lives
+//! where `<dir>` holds `config.json` and `model.safetensors` — from
+//! `lerobot/act_aloha_sim_transfer_cube_human`, or from a `lerobot-train` run of our own
+//! (packet `docs/packets/M5/V8-external-act.md`). The checkpoint is never committed — it lives
 //! under `target/lerobot-cache/` (see `.gitignore`).
+//!
+//! `ES_ACT_OBSERVATION=<file.json>` replaces the synthetic ramp with a **recorded frame**,
+//! `{"state": [...], "image": [...]}`, flat and row-major at the shapes `config.json` declares.
+//! That is what makes the gate meaningful for a checkpoint trained here rather than upstream:
+//! agreement on a ramp says the two modules compute the same function, agreement on a frame the
+//! policy was trained on says it on the input that decides the demo. The file is written with
+//! shortest-round-trip decimals, so the two sides still hold bit-identical f32.
 
 use std::collections::BTreeMap;
 use std::process::Command;
@@ -70,10 +78,33 @@ fn python() -> String {
     std::env::var("ES_PYTHON").unwrap_or_else(|_| "python".to_owned())
 }
 
+/// `ES_ACT_OBSERVATION`'s contents: one recorded frame, flat and row-major.
+#[derive(serde::Deserialize)]
+struct Obs {
+    state: Vec<f32>,
+    image: Vec<f32>,
+}
+
+/// The recorded frame both sides read, when one was named. A panic is a real failure: an
+/// observation that was asked for and could not be used must never fall back to the ramp.
+fn recorded(state_dim: usize, pixels: usize) -> Option<(Vec<f32>, Vec<f32>, String)> {
+    let path = std::env::var("ES_ACT_OBSERVATION").ok()?;
+    let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let obs: Obs = serde_json::from_str(&raw).unwrap_or_else(|e| panic!("{path}: {e}"));
+    assert_eq!(
+        (obs.state.len(), obs.image.len()),
+        (state_dim, pixels),
+        "{path}: the config declares {state_dim} state values and {pixels} pixels"
+    );
+    Some((obs.state, obs.image, path))
+}
+
 /// Run the real `LeRobot` policy. `Err` carries a reason to SKIP on, never a silent pass.
-fn reference(dir: &str) -> Result<RefReply, String> {
+fn reference(dir: &str, observation: Option<&str>) -> Result<RefReply, String> {
+    let mut args = vec!["-c".to_owned(), REF.to_owned(), dir.to_owned()];
+    args.extend(observation.map(str::to_owned));
     let out = Command::new(python())
-        .args(["-c", REF, dir])
+        .args(&args)
         .output()
         .map_err(|e| format!("cannot start `{}`: {e}", python()))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -118,10 +149,15 @@ fn a_real_lerobot_act_checkpoint_reproduces_its_actions() {
     let remapped = remap_checkpoint(&cfg, &original).expect("the remap must produce safetensors");
     let policy = act_policy(&cfg, &dir, source_hash, weights_hash(&remapped)).unwrap();
 
+    let state_dim = cfg.state_dim().unwrap();
+    let image_shape = cfg.image_shape();
+    let pixels = image_shape.iter().product::<u64>() as usize;
+    let frame = recorded(state_dim as usize, pixels);
+
     // The reference first: if `lerobot` is missing there is nothing to compare against.
     // A *reference error* is not the same thing (review `docs/reviews/M4.md` S-7): an
     // installed LeRobot that raised is a failure, not an environment this machine lacks.
-    let reference = match reference(&dir) {
+    let reference = match reference(&dir, frame.as_ref().map(|(_, _, p)| p.as_str())) {
         Ok(r) => r,
         Err(why) if is_missing_dependency(&why) => {
             println!("SKIP: the LeRobot reference is not installed ({why})");
@@ -144,10 +180,14 @@ fn a_real_lerobot_act_checkpoint_reproduces_its_actions() {
         Err(e) => panic!("load failed: {e}"),
     };
 
-    let state_dim = cfg.state_dim().unwrap();
-    let image_shape = cfg.image_shape();
-    let pixels = image_shape.iter().product::<u64>() as usize;
     let camera = cfg.cameras()[0].replace('.', "_");
+    let (state, image) = match &frame {
+        Some((state, image, _)) => (state.clone(), image.clone()),
+        None => (
+            ramp(state_dim as usize, 911, 3, 2048.0, -1.0),
+            ramp(pixels, 37, 11, 4096.0, 0.0),
+        ),
+    };
     let inputs: BTreeMap<String, Tensor> = [
         (
             camera,
@@ -155,15 +195,12 @@ fn a_real_lerobot_act_checkpoint_reproduces_its_actions() {
                 std::iter::once(1)
                     .chain(image_shape.iter().copied())
                     .collect(),
-                &ramp(pixels, 37, 11, 4096.0, 0.0),
+                &image,
             ),
         ),
         (
             "observation_state".to_owned(),
-            tensor(
-                vec![1, state_dim],
-                &ramp(state_dim as usize, 911, 3, 2048.0, -1.0),
-            ),
+            tensor(vec![1, state_dim], &state),
         ),
     ]
     .into_iter()
@@ -175,8 +212,14 @@ fn a_real_lerobot_act_checkpoint_reproduces_its_actions() {
 
     let e = compare_actions(ours, &theirs, Tolerance::TIER4_FP32);
     println!(
-        "RAN act_checkpoint: lerobot {} torch {} shape {:?} max_abs {:e} max_rel {:e}",
-        reference.lerobot, reference.torch, reference.shape, e.max_abs, e.max_rel
+        "RAN act_checkpoint: lerobot {} torch {} observation {} shape {:?} max_abs {:e} max_rel \
+         {:e}",
+        reference.lerobot,
+        reference.torch,
+        frame.as_ref().map_or("ramp", |(_, _, p)| p.as_str()),
+        reference.shape,
+        e.max_abs,
+        e.max_rel
     );
 
     assert_eq!(

@@ -7,16 +7,22 @@ our own lowering and `TorchRuntime`.
 
 Usage:
 
-    python act_ref.py <checkpoint dir>
+    python act_ref.py <checkpoint dir> [observation.json]
 
 prints one JSON line: {"ok": true, "lerobot": str, "torch": str, "shape": [..], "actions": [..]}
 or {"ok": false, "error": str}.
 
-The observation is a fixed integer-derived ramp rather than a seeded draw, so both sides
-compute it independently and no tensor crosses the process boundary. Every value is a small
-integer over a power of two and is therefore exact in f32 on both sides — a seeded
-`torch.Generator` would have had to be reimplemented in Rust, or a 3.7 MB image shipped over a
-pipe, to get the same guarantee.
+Without the second argument the observation is a fixed integer-derived ramp rather than a
+seeded draw, so both sides compute it independently and no tensor crosses the process boundary.
+Every value is a small integer over a power of two and is therefore exact in f32 on both sides
+— a seeded `torch.Generator` would have had to be reimplemented in Rust, or a 3.7 MB image
+shipped over a pipe, to get the same guarantee.
+
+With it, `{"state": [...], "image": [...]}` — flat, row-major, the shapes the config declares —
+is read by both sides instead. That is how a checkpoint trained on *this project's*
+demonstrations is compared on a frame it was actually trained on (packet M5/V8): the file is
+written with shortest-round-trip decimals, so `float()` here and `f32` there are the same
+number, and the exactness guarantee above is unchanged.
 
 Two notes on what "the real policy" means at the pinned version (see
 `docs/api-notes/lerobot-act.md`):
@@ -61,7 +67,7 @@ def ramp(count, step, offset, scale, shift):
     return [((i * step + offset) % 4096) / scale + shift for i in range(count)]
 
 
-def run(path):
+def run(path, observation=None):
     import torch
     from lerobot.policies.act.modeling_act import ACTPolicy
 
@@ -78,12 +84,22 @@ def run(path):
     action_mean = stats["unnormalize_outputs.buffer_action.mean"]
     action_std = stats["unnormalize_outputs.buffer_action.std"]
 
-    # The same ramp the Rust side builds: image in [0, 1), state in [-1, 1).
+    # The same observation the Rust side builds: either a recorded frame both sides read from
+    # one file, or the fixed ramp (image in [0, 1), state in [-1, 1)).
     pixels = image_shape[0] * image_shape[1] * image_shape[2]
-    image = torch.tensor(ramp(pixels, 37, 11, 4096.0, 0.0), dtype=torch.float32)
-    image = image.reshape(1, *image_shape)
-    state = torch.tensor(ramp(state_dim, 911, 3, 2048.0, -1.0), dtype=torch.float32)
-    state = state.reshape(1, state_dim)
+    if observation is None:
+        flat_image = ramp(pixels, 37, 11, 4096.0, 0.0)
+        flat_state = ramp(state_dim, 911, 3, 2048.0, -1.0)
+    else:
+        given = json.load(open(observation))
+        flat_image, flat_state = given["image"], given["state"]
+        if len(flat_image) != pixels or len(flat_state) != state_dim:
+            raise ValueError(
+                "observation has %d pixels and %d state values; the config declares %d and %d"
+                % (len(flat_image), len(flat_state), pixels, state_dim)
+            )
+    image = torch.tensor(flat_image, dtype=torch.float32).reshape(1, *image_shape)
+    state = torch.tensor(flat_state, dtype=torch.float32).reshape(1, state_dim)
 
     policy = ACTPolicy.from_pretrained(path)
     policy.eval()
@@ -108,7 +124,7 @@ def run(path):
 
 def main():
     try:
-        reply = run(sys.argv[1])
+        reply = run(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else None)
     except Exception as exc:  # Reported on the wire, never as a traceback on stderr.
         reply = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
     sys.stdout.write(json.dumps(reply) + "\n")

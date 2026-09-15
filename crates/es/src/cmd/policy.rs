@@ -14,9 +14,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use es_compile::PolicyBundle;
-use es_ir::learning::WeightsRef;
+use es_ir::graph::Graph;
+use es_ir::learning::{ActionExecutionMode, LearningGraph, WeightsRef};
+use es_ir::serial::{deployment_from_toml, observation_from_toml, task_from_toml};
+use es_policy::lerobot::{act_policy, remap_checkpoint, ActConfig};
 use es_policy::lower::{lower_to_torch, Contract};
-use es_policy::weights::{parse_header, validate_keys};
+use es_policy::weights::{parse_header, validate_keys, weights_hash};
 use es_policy::PolicyError;
 
 use crate::error::CliError;
@@ -25,8 +28,10 @@ use crate::util::hex;
 const HELP: &str = "\
 es policy lower --policy <in.esb> --out <dir>
 es policy pack  --policy <in.esb> --weights <model.safetensors> --out <out.esb>
+es policy import-lerobot --checkpoint <dir> --task <t.toml> --observation <o.toml>
+                         --deployment <d.toml> --out <out.esb>
 
-The Rust half of the spec 2.3 training split. Neither subcommand needs Python.
+The Rust half of the spec 2.3 training split. No subcommand needs Python.
 
 lower   Opens the policy bundle (spec 9.6), lowers its Learning IR to PyTorch
         (`es_policy::lower_to_torch`, spec 8.7) and writes, under <dir>:
@@ -46,6 +51,23 @@ pack    Reads <model.safetensors>, checks every key and every shape against the 
         unchanged, so `es eval run --policy <out.esb>` loads it with no change to the
         eval path.
 
+import-lerobot
+        Admits a policy designed and trained **outside** this project -- a LeRobot ACT
+        checkpoint (config.json + model.safetensors) -- into a bundle `es eval run` loads
+        with no change to the eval path (spec 8.9's M1 gate, packet M5/V8). The LeRobot
+        keys are remapped into this project's scheme and the training-only CVAE tensors
+        dropped (`es_policy::lerobot`; safetensors only, INV-16), and the checkpoint's own
+        config.json travels in the output's safetensors `__metadata__`, because spec 8.3's
+        node parameters cannot express a CVAE and a DETR decoder and the architecture has
+        to reach the runtime somehow.
+
+        The Learning IR written into the bundle is spec 8.1's shape for an external policy:
+        an opaque PolicyHandle with a fully typed contract, and no preprocessor nodes --
+        the Observation IR owns all of that. Chunk scheduling (execute_chunk,
+        replanning_hz, execution mode, deadline) comes from the Deployment IR, which spec 9
+        says owns it; chunk_size must already equal the deployment's horizon, and a
+        checkpoint that disagrees is named and refused rather than reshaped.
+
 Exit codes: 0 success, 1 runtime failure, 2 usage error.
 ";
 
@@ -53,6 +75,7 @@ pub fn dispatch(args: &[String]) -> i32 {
     let result = match args.first().map(String::as_str) {
         Some("lower") => lower(&args[1..]),
         Some("pack") => pack(&args[1..]),
+        Some("import-lerobot") => import_lerobot(&args[1..]),
         Some("--help" | "-h") | None => {
             println!("{HELP}");
             return 0;
@@ -189,6 +212,144 @@ fn pack(args: &[String]) -> Result<u8, CliError> {
         ("observation", reopened.manifest.hashes.observation),
         ("learning", reopened.manifest.hashes.learning),
         ("policy", reopened.manifest.hashes.policy),
+    ] {
+        if let Some(h) = value {
+            println!("{slot}_hash: {}", hex(&h));
+        }
+    }
+    Ok(0)
+}
+
+/// `es policy import-lerobot` — a policy designed and trained outside, under our Deployment IR.
+///
+/// The packet's whole point (`docs/packets/M5/V8-external-act.md`): spec 8 says "we do not
+/// invent a proprietary policy architecture", and the falsifiable form of that is a real
+/// `lerobot-train` ACT running through `es eval run`, the Safety Plane and the Evaluation IR
+/// with no change to any of them.
+fn import_lerobot(args: &[String]) -> Result<u8, CliError> {
+    let a = parse(
+        args,
+        &[
+            "--checkpoint",
+            "--task",
+            "--observation",
+            "--deployment",
+            "--out",
+        ],
+    )?;
+    let read = |flag: &str| -> Result<String, CliError> {
+        std::fs::read_to_string(&a[flag])
+            .map_err(|e| CliError::Runtime(format!("{}: {e}", a[flag])))
+    };
+
+    let dir = &a["--checkpoint"];
+    let config_raw = std::fs::read_to_string(format!("{dir}/config.json"))
+        .map_err(|e| CliError::Runtime(format!("{dir}/config.json: {e}")))?;
+    let cfg = ActConfig::parse(&config_raw)
+        .map_err(|e| CliError::Runtime(format!("{dir}/config.json: {e}")))?;
+    let original = std::fs::read(format!("{dir}/model.safetensors"))
+        .map_err(|e| CliError::Runtime(format!("{dir}/model.safetensors: {e}")))?;
+
+    let task = task_from_toml(&read("--task")?)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", a["--task"])))?;
+    let observation = observation_from_toml(&read("--observation")?)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", a["--observation"])))?;
+    let deployment = deployment_from_toml(&read("--deployment")?)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", a["--deployment"])))?;
+
+    // `lower_act` returns `actions[0][:n_action_steps]`, and the runtime buffers a whole
+    // `horizon`-row chunk. LeRobot's `n_action_steps` is the *scheduling* number, which spec 9
+    // gives to the Deployment IR — so the module has to hand back everything it predicted, and
+    // the training run has to have said so. Refused, never reshaped.
+    let action = deployment.action;
+    if cfg.chunk_size as usize != action.horizon || cfg.n_action_steps != cfg.chunk_size {
+        return Err(CliError::Runtime(format!(
+            "the checkpoint predicts chunk_size {} and returns n_action_steps {}; this \
+             deployment buffers a horizon of {} and executes {} of it.\nTrain with \
+             `--policy.chunk_size={} --policy.n_action_steps={}`: the Deployment IR owns the \
+             execution cadence (spec 9.2), the policy owns the prediction length (spec 8.5).",
+            cfg.chunk_size,
+            cfg.n_action_steps,
+            action.horizon,
+            action.execute_chunk,
+            action.horizon,
+            action.horizon,
+        )));
+    }
+
+    let remapped = remap_checkpoint(&cfg, &original)
+        .map_err(|e| CliError::Runtime(format!("remapping the checkpoint: {e}")))?;
+    let mut policy = act_policy(&cfg, dir, weights_hash(&original), weights_hash(&remapped))
+        .map_err(|e| CliError::Runtime(format!("the checkpoint's config.json: {e}")))?;
+
+    // Spec 9 owns the cadence; `act_policy` leaves these at zero because a `config.json` has no
+    // control rate to read them from.
+    let control_hz = deployment.rate.control.as_hz_f64();
+    policy.contract.execute_chunk = action.execute_chunk as u32;
+    policy.contract.replanning_hz = (control_hz / action.execute_chunk.max(1) as f64) as f32;
+    policy.contract.execution_mode = match deployment.execution {
+        es_ir::deployment::ExecutionMode::OpenLoopChunk => ActionExecutionMode::OpenLoopChunk,
+        es_ir::deployment::ExecutionMode::RecedingHorizon => ActionExecutionMode::RecedingHorizon,
+        es_ir::deployment::ExecutionMode::TemporalEnsemble { .. } => {
+            ActionExecutionMode::TemporalEnsemble
+        }
+        es_ir::deployment::ExecutionMode::RealTimeChunking => ActionExecutionMode::RealTimeChunking,
+    };
+    let budget_ms = deployment.deadlines.inference_budget.0 as f32 / 1000.0;
+    policy.contract.runtime.deadline_ms = budget_ms;
+    policy.contract.runtime.expected_latency_ms = budget_ms;
+    policy.weights = WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: weights_hash(&remapped),
+    };
+
+    // Spec 8.1: the preprocessor is described in the IR and the network is opaque. Every node
+    // this demo's preprocessing needs is in the Observation IR, so nothing is left for the
+    // Learning IR's own graph to hold — and an empty graph is the honest way to say that the
+    // architecture is the checkpoint's, not ours.
+    let learning = LearningGraph {
+        schema_version: 1,
+        inputs: Vec::new(),
+        nodes: Graph::new(1),
+        outputs: Vec::new(),
+        policy,
+    };
+
+    let bytes = PolicyBundle::build(&task, &observation, &learning, &deployment, &remapped)
+        .map_err(|e| CliError::Runtime(format!("building the bundle: {e}")))?;
+    let out = PathBuf::from(&a["--out"]);
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CliError::Runtime(format!("{}: {e}", parent.display())))?;
+    }
+    std::fs::write(&out, &bytes)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", out.display())))?;
+
+    // Reopened rather than trusted, like `pack`: `open` re-validates the four IRs, re-runs the
+    // cross-IR pass and recomputes every hash.
+    let reopened = PolicyBundle::open(&bytes)
+        .map_err(|e| CliError::Runtime(format!("the bundle just written does not open: {e}")))?;
+    println!("bundle:        {}", out.display());
+    println!(
+        "source:        {dir} ({} tensors -> {})",
+        parse_header(&original).map_or(0, |h| h.len()),
+        parse_header(&remapped).map_or(0, |h| h.len())
+    );
+    println!("source_hash:   {}", hex(&weights_hash(&original)));
+    println!("weights_hash:  {}", hex(&weights_hash(&remapped)));
+    println!(
+        "contract:      action_dim {} horizon {} execute_chunk {} replanning_hz {}",
+        learning.policy.contract.action_dim,
+        learning.policy.contract.horizon,
+        learning.policy.contract.execute_chunk,
+        learning.policy.contract.replanning_hz
+    );
+    for (slot, value) in [
+        ("task", reopened.manifest.hashes.task),
+        ("observation", reopened.manifest.hashes.observation),
+        ("learning", reopened.manifest.hashes.learning),
+        ("policy", reopened.manifest.hashes.policy),
+        ("deployment", reopened.manifest.hashes.deployment),
     ] {
         if let Some(h) = value {
             println!("{slot}_hash: {}", hex(&h));
