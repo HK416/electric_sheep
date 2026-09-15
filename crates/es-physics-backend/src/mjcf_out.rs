@@ -351,6 +351,13 @@ fn write_geom(
     attr(out, "contype", Some(contype.to_string()));
     attr(out, "conaffinity", Some(conaffinity.to_string()));
     attr(out, "condim", Some(geom.condim.to_string()));
+    // Contact parameter precedence: omitted at the default so the emitted XML stays the
+    // shape upstream wrote, emitted otherwise because it decides whose friction wins.
+    attr(
+        out,
+        "priority",
+        (geom.priority != 0).then(|| geom.priority.to_string()),
+    );
     match geom.mass {
         Some(mass) => attr(out, "mass", Some(num(mass))),
         None => attr(out, "density", Some(num(geom.density))),
@@ -548,13 +555,14 @@ mod tests {
                  <worldbody>
                    <body name="b">
                      <joint name="j" type="slide" axis="1 0 0" range="-1 1"/>
-                     <geom name="g" type="box" size="0.1 0.2 0.3" mass="2"/>
+                     <geom name="g" type="box" size="0.1 0.2 0.3" mass="2" priority="2"/>
                    </body>
                  </worldbody>
                  <actuator>
                    <motor name="m" joint="j" gear="10" ctrlrange="-1 1" forcerange="-50 50"/>
                    <position name="p" joint="j" kp="30" kv="2"/>
                    <velocity name="v" joint="j" kv="4"/>
+                   <position name="i" joint="j" kp="30" inheritrange="0.5"/>
                  </actuator>
                  <sensor>
                    <jointpos joint="j" noise="0.001"/>
@@ -562,7 +570,7 @@ mod tests {
                  </sensor>
                </mujoco>"#,
         );
-        assert_eq!(after.actuators.len(), 3);
+        assert_eq!(after.actuators.len(), 4);
         assert_eq!(after.sensors.len(), 2);
         assert_eq!(after.actuators[0].gear, before.actuators[0].gear);
         assert_eq!(after.actuators[0].ctrl_range, Some((-1.0, 1.0)));
@@ -572,6 +580,11 @@ mod tests {
         );
         assert_eq!(after.sensors[1].cutoff, 10.0);
         assert_eq!(after.bodies[1].geoms[0].mass, Some(2.0));
+        // Contact precedence and the compile-time `inheritrange` rewrite both survive: the
+        // joint's own (-1, 1) scaled by 0.5 about its midpoint (packet M6/B1b).
+        assert_eq!(after.bodies[1].geoms[0].priority, 2);
+        assert_eq!(before.actuators[3].ctrl_range, Some((-0.5, 0.5)));
+        assert_eq!(after.actuators[3].ctrl_range, Some((-0.5, 0.5)));
     }
 
     #[test]

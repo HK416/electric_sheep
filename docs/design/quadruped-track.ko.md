@@ -88,13 +88,32 @@ MJX에서 학습된 정책을, 우리가 `parse_mjcf` → `scene_to_mjcf` → Mu
 `the_emitted_mjcf_keeps_the_playground_option_block`이 회귀 테스트이고, Python이 필요 없으므로
 PR CI에서 돈다.
 
-왕복에서 여전히 떨어지는 것, 그리고 알려진 것: geom `priority`(그래서 MuJoCo가 바닥의 `0.6`을
-이기게 두지 않고 쌍별로 `max(1.0, 0.6) = 1.0`으로 마찰을 섞는다)와 `<position inheritrange>`
-(그래서 액추에이터가 MuJoCo가 유도했을 `ctrlrange`를 잃는다). 둘 다 행동이 0인 기립 궤적을
-움직이지 않고, 그래서 스텝 오라클의 허용오차는 백엔드가 선언한
-`DeterminismTier::PhysicsMeaning`이지 비트 동일이 아니다 — §4.3은 외부 백엔드가 tier 1을
-선언하는 것을 어차피 금지한다. 둘 다 고치기 싸지만 여기서 고치지 않는다: `priority` 필드는
-자기 테스트를 동반하는 `es-assets` 변경이다.
+둘이 더 실제였고, 패킷 M6/B1b 전에 여기 적혀 있던 문장 — "둘 다 행동이 0인 기립 궤적을 움직이지
+않는다" — 은 틀렸다. geom `priority`와 `<position inheritrange>`는 둘 다 왕복에서 떨어지고 있었고,
+스텝 오라클이 그중 첫 번째를 측정했다: `home`에서 물리 1,250스텝을 선 뒤, 같은 픽스처에 대해
+우리 백엔드와 MuJoCo 직접 실행이 좌표별 최대 **|Δqpos| = 7.574e-3**, 임계값 1e-3의 일곱 배로
+어긋났다.
+
+MuJoCo 단독 절제 실험이 원인을 정확히 분리했다: `go1_primitives.xml`의 바닥에서 `priority="1"`
+*만* 제거하면 7.574e-3이 마지막 자리까지 재현되고, `solimp`나 `inheritrange`를 제거하면 숫자가
+전혀 변하지 않는다. `priority`가 없으면 MuJoCo는 접촉 쌍의 마찰을 `max`로 섞으므로, 바닥의
+우선순위가 결정하는 대신 발의 `0.4`가 바닥의 `0.6`을 이기고, 자세가 다른 곳에 안착한다.
+
+M6/B1b가 둘 다 싣는다. `Geom.priority: i32`(MuJoCo 기본값 0)는 MJCF 임포터가 파싱하고,
+정준 씬 인코딩에서 `condim` 옆에 — 물리 의미이므로 조건 없이(§5.3) — 인코딩되며, 0이 아닐 때
+`mjcf_out`이 내보낸다. `<position inheritrange>`는 MuJoCo 컴파일러가 해석하는 방식 그대로
+임포트 시점에 액추에이터의 `ctrl_range`로 해석된다: 대상 관절 자신의 범위를 중점 기준으로
+스케일한 값이다. 변경 후 같은 오라클이 같은 1,250스텝에서 **최대 |Δqpos| = 8.882e-16**을
+측정한다 — 허용오차 안이라기보다 배정밀도 마지막 비트 수준의 일치다.
+
+허용오차는 여전히 비트 동일이 아니라 선언된 `DeterminismTier::PhysicsMeaning` 허용오차다:
+§4.3은 외부 백엔드가 tier 1을 선언하는 것을 금지하고, 오라클이 증명하는 것은 왕복에서 *의미*가
+떨어지지 않는다는 것이지 독립된 두 바이너리가 비트 단위로 일치한다는 것이 아니다. 인코딩에
+필드를 추가하면 모든 `scene_hash`와 그 하류의 모든 해시가 움직이므로,
+`tests/fixtures/quadruped/*.toml`과 `tests/fixtures/visible-learning/*.toml`은 각자의
+생성기(`regenerate_quadruped_documents`, `regenerate_visible_learning_documents`)로 재생성했다.
+`SCENE_TAG`은 `es.scene.v1` 그대로다: 그것은 도메인 분리자이고, 이 저장소는 필드 추가로 그것을
+올린 적이 없다(M6/B1이 같은 인코딩에 `ls_iterations`와 `eulerdamp`를 올림 없이 추가했다).
 
 `crates/es-physics-backend/tests/go1_step.rs`(`#[ignore]`, `mujoco`가 있는 `ES_PYTHON` 필요)는
 `home`에서 행동 0으로 250 제어 틱 × 5 서브스텝을 우리 백엔드로 밟고, NaN이 없으며 몸통이 여전히

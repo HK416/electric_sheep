@@ -712,6 +712,7 @@ impl<'a> Parser<'a> {
             contype,
             conaffinity,
             condim: attrs.int_or("condim", 3)?,
+            priority: attrs.sint_or("priority", 0)?,
             density: attrs.num_or("density", 1000.0)?,
             mass: attrs.num("mass")?,
             margin: attrs.num_or("margin", 0.0)?,

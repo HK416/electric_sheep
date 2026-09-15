@@ -95,13 +95,35 @@ MuJoCo `ls_iterations = 50` (its default) and left `eulerdamp` on. Both are now 
 emitted; `the_emitted_mjcf_keeps_the_playground_option_block` is the regression test and it needs
 no Python, so it runs in PR CI.
 
-What is still dropped on the round trip, and known: geom `priority` (so MuJoCo mixes friction
-pairwise, `max(1.0, 0.6) = 1.0`, instead of letting the floor's `0.6` win) and `<position
-inheritrange>` (so the actuators lose the `ctrlrange` MuJoCo would have derived). Neither moves a
-zero-action standing trajectory, which is why the step oracle's tolerance is the backend's
-declared `DeterminismTier::PhysicsMeaning` and not bitwise — §4.3 forbids an external backend
-declaring tier 1 in any case. Both are cheap to fix and neither is fixed here: a `priority`
-field is an `es-assets` change with its own tests.
+Two more were real, and the sentence that stood here before packet M6/B1b — "neither moves a
+zero-action standing trajectory" — was wrong. Geom `priority` and `<position inheritrange>` were
+both dropped on the round trip, and the step oracle measured the first of them: after 1,250
+physics steps standing from `home`, our backend and direct MuJoCo on the same fixture disagreed
+by a worst per-coordinate **|Δqpos| = 7.574e-3**, seven times the 1e-3 threshold.
+
+An ablation on direct MuJoCo alone isolated it: removing *only* `priority="1"` from the floor of
+`go1_primitives.xml` reproduces 7.574e-3 to the last digit, while removing `solimp` or
+`inheritrange` changes the number not at all. Without `priority` MuJoCo mixes the contact pair's
+friction by `max`, so the foot's `0.4` beats the floor's `0.6` instead of the floor's priority
+deciding outright, and the stance settles somewhere else.
+
+M6/B1b carries both. `Geom.priority: i32` (MuJoCo's default 0) is parsed by the MJCF importer,
+encoded in the canonical scene encoding next to `condim` — unconditionally, because it is
+physics meaning (§5.3) — and emitted by `mjcf_out` when non-zero. `<position inheritrange>` is
+resolved at import the way MuJoCo's compiler resolves it, into the actuator's `ctrl_range`: the
+target joint's own range scaled about its midpoint. After the change the same oracle measures
+**worst |Δqpos| = 8.882e-16** over the same 1,250 steps — agreement at the last bit of a double,
+not merely inside the tolerance.
+
+The tolerance is still a declared `DeterminismTier::PhysicsMeaning` tolerance rather than bitwise
+equality: §4.3 forbids an external backend declaring tier 1, and what the oracle proves is that
+nothing *semantic* is dropped on the round trip, not that two independent binaries agree bit for
+bit. Adding a field to the encoding moves every `scene_hash` and every hash downstream of it, so
+`tests/fixtures/quadruped/*.toml` and `tests/fixtures/visible-learning/*.toml` were regenerated
+through their generators (`regenerate_quadruped_documents`,
+`regenerate_visible_learning_documents`). `SCENE_TAG` stays `es.scene.v1`: it is a domain
+separator, and this repo has never bumped it for a field addition (M6/B1 added `ls_iterations`
+and `eulerdamp` to the same encoding without one).
 
 `crates/es-physics-backend/tests/go1_step.rs` (`#[ignore]`, needs `ES_PYTHON` with `mujoco`)
 steps 250 control ticks × 5 substeps from `home` with the action at zero through our backend,

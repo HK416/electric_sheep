@@ -147,6 +147,10 @@ pub struct Geom {
     pub conaffinity: u32,
     /// Contact dimensionality: 1, 3, 4 or 6.
     pub condim: u32,
+    /// Contact parameter precedence. When two geoms meet, the higher `priority` decides
+    /// friction, `condim`, `solref` and `solimp` outright; equal priorities mix them
+    /// (`MuJoCo` computation docs). Default 0.
+    pub priority: i32,
     /// kg/m^3, used when `mass` is `None`.
     pub density: f64,
     pub mass: Option<f64>,
@@ -748,6 +752,7 @@ fn encode_geom(c: &mut Canon, g: &Geom) {
     c.u32(g.contype);
     c.u32(g.conaffinity);
     c.u32(g.condim);
+    c.i32(g.priority);
     c.f64(g.density);
     match g.mass {
         None => c.u8(0),
@@ -906,6 +911,10 @@ impl Canon {
     }
 
     fn u32(&mut self, v: u32) {
+        self.buf.extend_from_slice(&v.to_le_bytes());
+    }
+
+    fn i32(&mut self, v: i32) {
         self.buf.extend_from_slice(&v.to_le_bytes());
     }
 

@@ -290,6 +290,7 @@ fn visit_node(
                 contype: 0,
                 conaffinity: 0,
                 condim: 3,
+                priority: 0,
                 density: 1000.0,
                 mass: None,
                 margin: 0.0,

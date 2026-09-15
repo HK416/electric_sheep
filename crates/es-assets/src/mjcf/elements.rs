@@ -201,7 +201,7 @@ impl<'a> Parser<'a> {
                 kind,
                 target,
                 gear: head(attrs.nums("gear")?, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
-                ctrl_range: self.limit(&attrs, "ctrllimited", "ctrlrange", 1.0)?,
+                ctrl_range: self.actuator_ctrl_range(tag, &attrs, target)?,
                 force_range: self.limit(&attrs, "forcelimited", "forcerange", 1.0)?,
             };
             attrs.report_unknown(&mut self.warnings);
@@ -209,6 +209,41 @@ impl<'a> Parser<'a> {
             self.scene.actuators.push(actuator);
         }
         Ok(())
+    }
+
+    /// `ctrlrange`, with `<position inheritrange>` resolved the way `MuJoCo`'s compiler
+    /// resolves it: the transmission target's own range, scaled by `inheritrange` about its
+    /// midpoint. It is a compile-time rewrite upstream, so resolving it here loses nothing --
+    /// and dropping it would leave the actuator unclamped, which silently widens the range
+    /// the policy's position targets are held to.
+    fn actuator_ctrl_range(
+        &self,
+        tag: &str,
+        attrs: &Attrs<'a>,
+        target: ActuatorTarget,
+    ) -> Result<Option<(f64, f64)>, MjcfError> {
+        let explicit = self.limit(attrs, "ctrllimited", "ctrlrange", 1.0)?;
+        // Upstream allows it on `position` and `intvelocity`; we only model the former.
+        if tag != "position" {
+            return Ok(explicit);
+        }
+        let Some(factor) = attrs.num("inheritrange")? else {
+            return Ok(explicit);
+        };
+        let ActuatorTarget::Joint(joint) = target else {
+            return Ok(explicit);
+        };
+        let range = self
+            .scene
+            .joints
+            .iter()
+            .find(|j| j.id == joint)
+            .and_then(|j| j.range);
+        let (Some((lo, hi)), true) = (range, factor > 0.0) else {
+            return Ok(explicit);
+        };
+        let (mid, half) = (f64::midpoint(lo, hi), (hi - lo) / 2.0);
+        Ok(Some((mid - factor * half, mid + factor * half)))
     }
 
     fn actuator_target(&self, attrs: &Attrs<'a>) -> Result<(ActuatorTarget, &'a str), MjcfError> {
