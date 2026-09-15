@@ -233,3 +233,31 @@ cargo xtask ci
   `ImageSpec`은 그대로이므로 비전 패킷이 온전히 물려받는다.
 * **데이터셋 포맷.** 새 컬럼 없음, 라이터 변경 없음, 익스포터 변경 없음.
 * **`python/es/train_act.py`.** 포트를 읽을 뿐, 이름을 알지 못한다.
+
+## 측정 결과 (2단계, 2026-09-15)
+
+기록은 설계 노트 `docs/design/visible-learning.md` 7.15절이고, 이것은 패킷의 판정이다.
+`481e4d4`의 서버 트리, `~/artifacts/plan-v/v7a/`.
+
+| 번들 | nominal `success_rate` | `envelope_violation_rate` | 스위트 (96 에피소드) |
+|---|---|---|---|
+| 1,000 step | 0/16 | 0.9853 | — |
+| 5,000 step | 1/16 | 0.2523 | — |
+| 20,000 step | 0/16 (샤딩 1/16) | 0.1460 (0.1628) | 4/96 |
+
+- acceptance 표의 모든 해시가 예측대로 돌아왔고, `deployment_hash`는 움직이지 않았다.
+- 큐브의 정확한 자세를 입력에 넣은 학습 손실은 모든 체크포인트에서 비전 전용 실행과 0.5 % 안에
+  있다(20,000에서 `0.0175` 대 `0.0176`): L1 목적함수는 큐브가 어디 있는지 아는 정책과 모르는
+  정책을 거의 구분하지 못한다.
+- **중단 규칙: 발동.** `success_rate >= 0.5`의 acceptance는 충족되지 않았고 낮추지도 않았다. 다음
+  용의자는 물리, 접촉 모델, 전문가의 궤적이지(7.15절 발견 8) 모델 크기나 학습 길이가 아니다.
+  2단계(더 높은 해상도의 비전)는 다음 패킷이 아니다; `docs/ARCHITECTURE.ko.md` 28.9절은 그 조사
+  앞에 외부 ACT(V8)를 대조 실험으로 둔다.
+- 판정 밖의 발견 둘: torch 런타임에서 `--jobs N`은 `--jobs 1`과 바이트 동일하지 않고(열린 질문
+  16), `cv2`는 `~/venvs/es`가 아니라 `~/venvs/es-lerobot`에 있어 위 서버 단계의 `encode_video.py`
+  줄이 잘못된 인터프리터를 적고 있다.
+- 실행 뒤 발견해 main에서 고친 회귀(`9087785`): `JointState` 채널이 둘이면 `es dataset bake`가
+  Task IR의 저장소 상대 경로 `scene.path`를 여는데 그 경로는 저장소 루트에서만 풀리므로,
+  `crates/es/tests/cli.rs`의 모델 기반 bake 오라클 둘이 `mujoco`가 있는 곳에서는 모두 실패했다.
+  이제 `es dataset bake --scene <file.xml>`이 `es eval run --scene`과 같은 방식으로 씬을 지정하고,
+  오라클은 그것을 넘긴다.

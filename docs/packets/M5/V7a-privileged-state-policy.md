@@ -292,3 +292,32 @@ loss curve. **No number is lowered to make a threshold pass** (`evaluation.toml`
   `ImageSpec` are unchanged, so the vision packet inherits them intact.
 * **The dataset format.** No new column, no writer change, no exporter change.
 * **`python/es/train_act.py`.** It reads ports; it does not know their names.
+
+## as measured (phase 2, 2026-09-15)
+
+Design note `docs/design/visible-learning.md` section 7.15 is the record; this is the packet's
+verdict. Server tree of `481e4d4`, `~/artifacts/plan-v/v7a/`.
+
+| bundle | nominal `success_rate` | `envelope_violation_rate` | suite (96 episodes) |
+|---|---|---|---|
+| 1,000 steps | 0/16 | 0.9853 | — |
+| 5,000 steps | 1/16 | 0.2523 | — |
+| 20,000 steps | 0/16 (1/16 sharded) | 0.1460 (0.1628) | 4/96 |
+
+- Every hash in the acceptance table came back as predicted; `deployment_hash` did not move.
+- The training loss with the cube's exact pose in the input is within half a percent of the
+  vision-only run at every checkpoint (`0.0175` vs `0.0176` at 20,000): the L1 objective barely
+  distinguishes a policy that knows where the cube is from one that does not.
+- **Stop rule: fired.** The acceptance of `success_rate >= 0.5` is not met and was not lowered.
+  The next suspects are the physics, the contact model and the expert's trajectories (section
+  7.15, finding 8), not model size or schedule length. Stage 2 (vision at a higher resolution) is
+  not the next packet; `docs/ARCHITECTURE.ko.md` section 28.9 puts the external ACT (V8) before
+  that investigation as the control experiment.
+- Two findings outside the verdict: `--jobs N` is not byte-identical to `--jobs 1` with a torch
+  runtime (open question 16), and `cv2` lives in `~/venvs/es-lerobot`, not `~/venvs/es`, so the
+  `encode_video.py` line of the server phase above names the wrong interpreter.
+- Regression found after the run and fixed on main (`9087785`): with two `JointState` channels
+  `es dataset bake` opens the Task IR's repository-relative `scene.path`, which only resolves
+  from the repository root, so the two model-backed bake oracles in `crates/es/tests/cli.rs`
+  failed wherever `mujoco` is present. `es dataset bake --scene <file.xml>` now names the scene
+  the way `es eval run --scene` does, and the oracles pass it.

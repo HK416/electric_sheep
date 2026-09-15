@@ -1838,6 +1838,187 @@ set through the widened Observation IR, lower, train 20,000 steps on V2b's exact
 The first command of that run is also the first real exercise of `es dataset bake`'s model load,
 which has no local coverage because this machine has no `mujoco`.
 
+**Measured (V7a phase 2), and it is section 7.15.** Every hash above came back exactly as
+predicted, the bake's model load worked on the first command, and the state policy scores
+`success_rate 0.0000` nominal at 20,000 steps. **The stop rule fires.**
+
+### 7.15 As built (V7a phase 2): the state policy measured, and the stop rule fires
+
+Packet `docs/packets/M5/V7a-privileged-state-policy.md`, its "server, phase 2" section. Run on the
+oracle server (RTX 4090, 16 cores) from a tree of commit `481e4d4` unpacked at `~/Projects/es-v7a`,
+with `ES_PYTHON=~/venvs/es/bin/python` for `mujoco` and `~/venvs/es-lerobot-cuda` for training.
+Everything below is under `~/artifacts/plan-v/v7a/`; the small files were copied to the requester's
+`target/plan-v/v7a/`.
+
+**The answer, first.** A policy handed the cube's exact pose in its own observation port, the arm's
+exact joint angles, the same 50 demonstrations and the same 20,000 optimizer steps scores
+`success_rate 0.0000` on the sixteen held-out nominal seeds — sixteen 900-step timeouts — and
+`0.0625`, one episode, in the sharded reading of the same cell. Across the full six-suite run it is
+**4 successes in 96 episodes**. **The stop rule fires.** Section 7.14 wrote down before the
+measurement what that means, and it still means it: the next suspect is the physics, the contact
+model or the expert's trajectories, not model size, schedule length or demonstration count.
+
+**1. The bake ran, and it is the first real exercise of the model-backed two-channel path.** No
+local test can reach the successful model load — this repo's CI machine has no `mujoco` — so the
+first command of the server run is the coverage. It resolved model-free, was refused, loaded
+`tests/fixtures/mjcf/so101_pick_place.xml` through `MuJoCoCpuBackend`, and wrote four tensors:
+
+```
+wrote: /home/LJM/artifacts/plan-v/v7a/baked
+episodes: 50   frames: 18263
+  action                       [6]
+  joint_state                  [6]
+  rgb_overhead                 [3, 96, 96]
+  sim_cube_pose                [7]
+observation_hash: 6c18f4552064d24b16cffa770cfc71941566f2b0443fe88569d439f747c72daf
+```
+
+50 episodes, 18,263 frames, 1.9 GB, six seconds. The same V1 dataset and the same V1c tiles
+(`~/artifacts/plan-v/v1c/ds-train`, `frames-train`) — nothing was re-collected, so
+`dataset_schema_hash` did not move and the comparison against V6's vision run moves one variable.
+
+**2. Every hash the packet predicted, measured.** `es ir check` on the five committed fixtures
+printed `task 6cf826c1…6b7b`, `observation 6c18f455…2daf`, `learning 5dac0a46…46f0`,
+`policy c94c2732…4a07`, `deployment 3b2ad568…6db1` (**unchanged**, as forbidden),
+`evaluation 0259fd44…f041e`, `compiler f2a02e84…70d6` — all seven exactly the acceptance table's
+values. `es policy lower` printed `lowering_hash fdd68ec4…0719` over
+`["joint_state", "rgb_overhead", "sim_cube_pose"]` and 14 weight keys (12 exact, 2 prefix claims),
+against V2b's 10: the third encoder is the whole difference. The three packed bundles:
+
+| checkpoint | tensors | `weights_hash` | `policy_hash` |
+|---|---|---|---|
+| 1,000 | 146 | `4ebf61fb…791c` | `8f62acfa…ea1e` |
+| 5,000 | 146 | `017ac45f…a72b` | `0e6d786f…f71ad` |
+| 20,000 | 146 | `ac03ceec…a581` | `301647f4…a4df` |
+
+**3. The loss fell, and it fell exactly as far as vision's did.** 20,000 steps at
+`--batch 8 --lr 1e-4 --seed 0 --resident-gpu` on `cuda`, 1,927.5 MiB resident, 10 min 35 s. The
+run's own summary is `initial_loss 0.06752 -> final_loss 0.01713` (the mean of the first and last
+tenth); beside V1c's vision run on the same knobs, the mean of the hundred steps ending at each
+checkpoint:
+
+| steps | V7a (state + vision) | V1c (vision only) |
+|---|---|---|
+| first 100 | 0.2057 | 0.2053 |
+| 1,000 | 0.0557 | 0.0560 |
+| 5,000 | 0.0308 | 0.0319 |
+| 20,000 | 0.0175 | 0.0176 |
+| reported `initial -> final` | 0.06752 -> 0.01713 | 0.06689 -> 0.01799 |
+
+**This is the first finding, and it is larger than the success table.** Giving the network the
+answer moved the training loss by about half a percent. A regression loss that does not notice a
+port containing the target's exact coordinates is not measuring the part of the behaviour that
+decides the task: the L1 distance to a 7-second scripted trajectory is dominated by the long, easy,
+cube-independent stretches, and the few frames where the cube's position actually selects the
+motion are a rounding error in it. The loss curve was never evidence that the policy was learning
+the task, and now there is a number for how little it was evidence of.
+
+**4. Nominal, seeds 101–116, sixteen episodes, one cell per checkpoint.** Beside V6's honest vision
+number (section 7.13's harness, V1c's 20,000-step bundle, `~/artifacts/plan-v/v6/`):
+
+| bundle | `success_rate` | `envelope_violation_rate` | `episode_length` | `Policy` / `Clamped` / `Fallback` |
+|---|---|---|---|---|
+| V7a state, 1,000 | 0.0000 | 0.9853 | 900.0 | 212 / 12,908 / 1,280 |
+| V7a state, 5,000 | 0.0625 | 0.2523 | 855.0 | 10,228 / 3,212 / 240 |
+| V7a state, 20,000 | **0.0000** | 0.1460 | 900.0 | 12,297 / 1,986 / 117 |
+| V7a state, 20,000, sharded | 0.0625 | 0.1628 | 854.6 | 11,448 / 2,106 / 120 |
+| V6 vision, 20,000 | 0.0000 | 0.2106 | 900.0 | 11,367 / 2,813 / 220 |
+
+The `ActionSource` counts are over the cell's whole frame budget (14,400 where every episode times
+out). The failure-mode histograms, same order:
+
+| bundle | `violation.position` | `violation.acceleration` | `violation.velocity` | `violation.rate` | `fallback` | `timeout` | `success` |
+|---|---|---|---|---|---|---|---|
+| V7a state, 1,000 | 11,772 | 1,387 | 358 | 1,280 | 1,280 | 16 | 0 |
+| V7a state, 5,000 | 2,629 | 585 | 229 | 240 | 240 | 15 | 1 |
+| V7a state, 20,000 | 1,334 | 668 | 185 | 117 | 117 | 16 | 0 |
+| V6 vision, 20,000 | 2,031 | 843 | 439 | 220 | 220 | 16 | 0 |
+
+So the state policy is *better behaved* than the vision policy on every axis that is not the task:
+it drives 85.4 % of its steps itself against vision's 78.9 %, it is clamped a third less often, it
+falls back half as often, and it hits the soft position limit a third as often. It still never puts
+the cube in the bin. Section 7.10's conclusion — "given an envelope it does not fight, ACT drives
+94.5 % of the steps itself and still cannot do the task" — survives the removal of the perception
+problem.
+
+**5. The full suite on the 20,000-step bundle**, `--jobs 6`, 96 episodes, 5 min 50 s against V1c's
+27 minutes sequential. `ActionSource` over its 83,429 frames: `Policy` 71,447, `Clamped` 11,449,
+`Fallback` 533.
+
+| suite | V7a `success_rate` | V7a `envelope_violation_rate` | V7a `episode_length` | V6 vision `success_rate` |
+|---|---|---|---|---|
+| nominal | 0.0625 | 0.1628 | 854.6 | 0.0000 |
+| light_intensity | 0.0000 | 0.1647 | 900.0 | 0.0000 |
+| light_direction | 0.0000 | 0.1462 | 900.0 | 0.0000 |
+| observation_delay | 0.0625 | 0.1080 | 853.9 | 0.0000 |
+| torque_noise | 0.1250 | 0.1682 | 805.8 | 0.0000 |
+| backlash | 0.0000 | 0.1137 | 900.0 | 0.0000 |
+| **total** | **4 / 96 = 0.0417** | | | **0 / 96** |
+
+`evaluation.toml`'s acceptance is on the nominal suite alone and it asks for `success_rate >= 0.5`.
+It asked for that before the run and it still asks for it; `passed` is `false` in every report and
+no threshold was touched. The two perturbed suites that score *above* nominal — `torque_noise` at
+2/16, `observation_delay` at 1/16 — are the two that add motion the policy did not command, which
+at n=16 is noise and is recorded as such rather than read as a result.
+
+**6. `--jobs N` is not byte-identical to `--jobs 1` when the runtime is torch, and this run
+measured it.** The standalone nominal cell scored 0/16 and the same cell inside the `--jobs 6`
+suite scored 1/16 — same bundle, same seeds, same document body. Re-running the standalone cell
+with `OMP_NUM_THREADS=MKL_NUM_THREADS=OPENBLAS_NUM_THREADS=TORCH_NUM_THREADS=2` reproduces the
+sharded reading **exactly**: `success_rate 0.0625`, `envelope_violation_rate 0.16279069767441862`,
+`episode_length 854.625`, and a histogram equal field for field. The cause is the per-shard thread
+cap merged as `56fa49b`: a worker of `--jobs 6` on a 16-core box is capped to `16/6 = 2` threads,
+a `--jobs 1` run keeps all sixteen, and torch's reduction order is a function of its thread count.
+A different sum is a different action is a different trajectory.
+
+Nothing in `es-eval` is wrong here: the spec 10.4 claim the V5 oracle pins — the parent partitions,
+the workers judge nothing, the merge restores cell order — holds, and the oracle that pins
+byte-identity at `N = 4` uses a deterministic fake runtime, which is exactly why it cannot see
+this. What is wrong is `es eval run --help`'s unqualified "at the same seeds the artifacts are
+byte-identical to --jobs 1". That is true of the harness and not of the composition of the harness
+with a thread-count-sensitive `PolicyRuntime`. It is open question 16, it moves no verdict here
+(0/16 and 1/16 are both far below 0.5), and the honest reading of the pair is that one episode of
+sixteen sits on the edge of solving and the other fifteen are nowhere near it.
+
+**7. Video.** `es video mosaic --grid 4x4` over each checkpoint's sixteen nominal cells gives 900
+frames of 384x392 (sixteen 96x96 tiles plus the 8-pixel label strip), and `encode_video.py
+--fps 50` an 18-second mp4 at the control rate. `cv2` lives in `~/venvs/es-lerobot`, not
+`~/venvs/es`, which is worth writing down because the packet's command line names the wrong one.
+
+| checkpoint | `mp4v` | H.264 |
+|---|---|---|
+| 1,000 | `demo-1000.mp4`, 5.31 MB | `demo-1000-h264.mp4`, 0.45 MB |
+| 5,000 | `demo-5000.mp4`, 6.46 MB | `demo-5000-h264.mp4`, 0.91 MB |
+| 20,000 | `demo-20000.mp4`, 8.18 MB | `demo-20000-h264.mp4`, 1.14 MB |
+
+The H.264 copies are `ffmpeg 7.0.2` over the same raw mosaic frames, not a transcode of the `mp4v`
+file. The mp4 is not in the hash chain (section 9); the frames are.
+
+**8. The verdict, and where it sends the ladder.** The stop rule is applied as written. The demo
+does not have a perception problem a bigger encoder would fix, and it does not have an optimizer
+problem a longer schedule would fix: the loss is converged, the envelope is not fighting the
+policy, 85 % of the steps are the policy's own, and the cube stays where it started. What is left
+is what section 7.14 named — the physics, the contact model, or the demonstrations themselves. The
+first three things to open, cheapest first, and none of them is a model:
+
+* **Do the demonstrations grasp?** V1's success predicate is the cube's `x` crossing into the bin
+  (section 5.4), and `es loop collect` reports 50/50. A scripted expert can satisfy that predicate
+  by pushing the cube rather than lifting it, and a policy that reproduces the trajectory of a push
+  and misses the contact by a millimetre gets nothing. The oracle is one replay of a recorded
+  episode with the gripper's contact forces logged, and it is a measurement nobody has taken.
+* **Does the gripper close on anything?** The SO-101's jaw against a 25 mm box under MuJoCo's
+  default contact parameters and `forcerange ±2.94 N·m` is a two-body question the scene has never
+  been asked in isolation.
+* **Is the executed chunk the trajectory the demonstrations contain?** Section 7.13 made evaluation
+  execute chunks the way collection does, and the ensemble blends fifteen of them; a 7-second
+  motion through a `decay = 0.01` exponential average is a smoothed motion, and whether the
+  smoothing survives the grasp window is measurable by replaying one demonstration through
+  `ChunkBuffer`.
+
+Stage 2 of the video — vision at a higher resolution with more demonstrations — is **not** the next
+packet. V7a existed to decide that, and it decided it: a vision policy cannot be expected to do
+what the policy holding the answer cannot do.
+
 ### 7.17 As built (V9): the showcase render
 
 Packet `docs/packets/M5/V9-showcase-render.md`. Everything this demo had produced was a
@@ -2144,3 +2325,29 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     it is **not** evidence that vision will work at 96×96 with 50 demonstrations. Default: treat a
     passing state policy as the go-ahead for stage 2 at a *higher* resolution and a larger set,
     and record the state policy's number as the ceiling the vision policy is measured against.
+
+    **Answered (V7a phase 2, section 7.15), on the branch nobody wanted.** The state policy scores
+    `0.0000` nominal at 20,000 steps (`0.0625` in the sharded reading of the same cell, 4/96 over
+    the full suite), so the open half never arose and the stop rule's half did. What the run adds
+    to the stop rule is a second number that points the same way: the training loss moved by half
+    a percent when the cube's exact pose entered the input, which means the L1 objective barely
+    distinguishes a policy that knows where the cube is from one that does not, and that the loss
+    curve was never evidence of task learning. Section 7.15's finding 8 names the three things to
+    open — do the demonstrations grasp or push, does the gripper close on a 25 mm box at all, and
+    does the temporal ensemble survive the grasp window — and a human should pick the order.
+    Stage 2 (vision, higher resolution, more demonstrations) is **not** the next packet.
+16. **`--jobs N` is not byte-identical to `--jobs 1` when the policy runtime is torch**
+    (section 7.15, finding 6). Measured: the nominal cell scores 0/16 standalone and 1/16 inside a
+    `--jobs 6` run of the same document body on the same bundle and seeds, and capping the
+    standalone run's BLAS/torch threads to 2 reproduces the sharded numbers to the last digit. The
+    per-shard thread cap (`56fa49b`) is correct and wanted — uncapped, six workers each size a
+    pool to every core and the run gets *slower* (section 7.11) — but the thread count changes
+    torch's reduction order, which changes the action, which changes the trajectory. The V5 oracle
+    cannot see it: it pins byte-identity at `N = 4` with a deterministic fake runtime. Default,
+    and the cheapest honest one: **fix the documentation, not the scheduler** — `es eval run
+    --help` and section 7.11 should say byte-identical *given a thread-count-independent runtime*,
+    and a reported number should carry its `--jobs`. A human who wants the stronger property has
+    two options that are not equivalent: pin every worker to the same thread count as a `--jobs 1`
+    run (which gives back the oversubscription that made `--jobs 6` slower than `--jobs 1`), or
+    make the thread count part of `hardware_capability` in the spec 5.3 chain so two runs that
+    differ in it are not claimed to be the same execution.
