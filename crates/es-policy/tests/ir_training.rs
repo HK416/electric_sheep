@@ -57,6 +57,12 @@ fn vl_fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// The demo scene, for `es dataset bake --scene` (the bundle's `scene.path` is relative to the
+/// repository root, which is not this test's working directory).
+fn demo_scene() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mjcf/so101_pick_place.xml")
+}
+
 /// `es`, next to this test's own executable.
 ///
 /// `CARGO_BIN_EXE_es` is only defined inside `es`'s own integration tests, and spec 4.2 forbids
@@ -496,6 +502,11 @@ fn act_training_uses_baked_observations() {
         &baked.to_string_lossy(),
         "--frames",
         &tiles.to_string_lossy(),
+        // The demo's second JointState channel sends the bake to the scene (packet M5/V7a),
+        // and the Task IR's `scene.path` is repository-relative while this test does not run
+        // from the root: name the file the way `es eval run --scene` does.
+        "--scene",
+        &demo_scene().to_string_lossy(),
         &dataset.to_string_lossy(),
     ]);
     assert_eq!(bake.status.code(), Some(0), "{}", text(&bake));
@@ -716,6 +727,11 @@ fn resident_gpu_does_not_move_the_loss() {
         &baked.to_string_lossy(),
         "--frames",
         &tiles.to_string_lossy(),
+        // The demo's second JointState channel sends the bake to the scene (packet M5/V7a),
+        // and the Task IR's `scene.path` is repository-relative while this test does not run
+        // from the root: name the file the way `es eval run --scene` does.
+        "--scene",
+        &demo_scene().to_string_lossy(),
         &dataset.to_string_lossy(),
     ]);
     assert_eq!(bake.status.code(), Some(0), "{}", text(&bake));
