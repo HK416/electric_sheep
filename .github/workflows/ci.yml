@@ -119,6 +119,9 @@ jobs:
           ES_PYTHON: python
         run: |
           set -euo pipefail
+          # es-policy's ir_training oracle drives `es policy lower/pack` through the binary,
+          # which a package-filtered `cargo test` does not build (it is `es`'s, layer 12).
+          cargo build -p es
           # The ACT oracle runs in the next step, against the LeRobot interpreter.
           cargo test -p es-physics-backend -p es-policy -p es-compile -- --skip mjwarp --skip a_real_lerobot_act_checkpoint --nocapture 2>&1 | tee oracles.log
           # No GPU and no slangc here, so es-compile's GPU lowering tests (tests/observation_gpu.rs)
