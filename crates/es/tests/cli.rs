@@ -4866,6 +4866,10 @@ fn dataset_bake_writes_safetensors_and_a_manifest() {
     let (episodes, frames) = (2u32, 3usize);
     write_bake_fixture(&root, &tiles, episodes, frames);
 
+    // The demo's second JointState channel sends the bake to the scene (packet M5/V7a),
+    // and the Task IR's `scene.path` is repository-relative: name the file the way
+    // `es eval run --scene` does, since this process does not run from the root.
+    let scene = demo_scene_path();
     let result = bin()
         .args([
             "dataset",
@@ -4876,6 +4880,8 @@ fn dataset_bake_writes_safetensors_and_a_manifest() {
             out.to_str().unwrap(),
             "--frames",
             tiles.to_str().unwrap(),
+            "--scene",
+            scene.to_str().unwrap(),
             root.to_str().unwrap(),
         ])
         .output()
@@ -4935,6 +4941,7 @@ fn dataset_bake_without_frames_refuses_an_image_observation() {
     let (root, tiles, out) = (dir.join("ds"), dir.join("tiles"), dir.join("baked"));
     write_bake_fixture(&root, &tiles, 1, 2);
 
+    let scene = demo_scene_path();
     let result = bin()
         .args([
             "dataset",
@@ -4943,6 +4950,8 @@ fn dataset_bake_without_frames_refuses_an_image_observation() {
             bundle.to_str().unwrap(),
             "--out",
             out.to_str().unwrap(),
+            "--scene",
+            scene.to_str().unwrap(),
             root.to_str().unwrap(),
         ])
         .output()

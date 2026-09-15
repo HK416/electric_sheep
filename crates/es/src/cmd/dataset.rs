@@ -14,7 +14,7 @@ use crate::util::hex;
 const HELP: &str = "\
 es dataset info <root>
 es dataset export --lerobot-v3 <root> --out <dir> [--frames <dir>]
-es dataset bake --policy <bundle.esb> --out <dir> [--frames <dir>] <root>
+es dataset bake --policy <bundle.esb> --out <dir> [--frames <dir>] [--scene <file.xml>] <root>
 
 `info` opens a LeRobot dataset at <root>, and prints its features (as the spec 5.4 PortType
 they present at an Observation IR port), episode count, and the dataset identity's three
@@ -44,6 +44,10 @@ train_act.py --baked <dir>` is the consumer.
                 For `bake`: the flat <dir>/<NNNNNN>.bin tiles `es loop collect --frames`
                 writes, in dataset-global frame order. An Observation IR with an image
                 input and no --frames is refused, never baked with zeros.
+--scene <file>  For `bake`: the scene to load when a channel needs the model's `qpos`
+                ranges (a second JointState channel, packet M5/V7a) -- the same file
+                `es eval run --scene` and `es loop collect --scene` take. Without it the
+                Task IR's `scene.path` is opened relative to the working directory.
 ";
 
 pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
@@ -117,13 +121,14 @@ fn bake(args: &[String]) -> Result<u8, CliError> {
         println!("{HELP}");
         return Ok(0);
     }
-    let (mut policy, mut out, mut frames, mut root) = (None, None, None, None);
+    let (mut policy, mut out, mut frames, mut scene, mut root) = (None, None, None, None, None);
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         let slot = match arg.as_str() {
             "--policy" => &mut policy,
             "--out" => &mut out,
             "--frames" => &mut frames,
+            "--scene" => &mut scene,
             other if other.starts_with("--") => {
                 return Err(CliError::Usage(format!(
                     "es dataset bake: unexpected argument '{other}'\n\n{HELP}"
@@ -161,11 +166,18 @@ fn bake(args: &[String]) -> Result<u8, CliError> {
     let mut plan = match ObservationBake::new(&bundle.observation, &bundle.task, None) {
         Ok(plan) => plan,
         Err(model_free) => {
-            let model = load_model(&bundle.task.scene.path).map_err(|why| {
+            // `--scene` names the file the way `es eval run` and `es loop collect` do;
+            // the Task IR's `scene.path` is relative to the repository and only resolves
+            // from its root, which a bake started elsewhere (a test, a server tree) is
+            // not.
+            let scene_path = scene.as_ref().map_or_else(
+                || bundle.task.scene.path.clone(),
+                |p| p.to_string_lossy().into_owned(),
+            );
+            let model = load_model(&scene_path).map_err(|why| {
                 CliError::Runtime(format!(
-                    "{model_free}\n  and the scene \"{}\" could not be loaded to resolve it: \
-                     {why}",
-                    bundle.task.scene.path
+                    "{model_free}\n  and the scene \"{scene_path}\" could not be loaded to \
+                     resolve it: {why}"
                 ))
             })?;
             ObservationBake::new(&bundle.observation, &bundle.task, Some(&model))
