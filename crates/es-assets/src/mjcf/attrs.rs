@@ -121,6 +121,18 @@ impl<'a> Attrs<'a> {
         Ok(self.num(name)?.unwrap_or(default))
     }
 
+    /// Signed sibling of [`Attrs::int_or`], for the `int` attributes `MuJoCo` allows to be
+    /// negative (`geom priority`). Accepts `1.0` for `1` the same way.
+    pub(crate) fn sint_or(&self, name: &'static str, default: i32) -> Result<i32, MjcfError> {
+        let Some(text) = self.get(name) else {
+            return Ok(default);
+        };
+        match self.num(name)? {
+            Some(v) if v.fract() == 0.0 && v.abs() <= f64::from(i32::MAX) => Ok(v as i32),
+            _ => Err(self.bad(name, text)),
+        }
+    }
+
     pub(crate) fn int_or(&self, name: &'static str, default: u32) -> Result<u32, MjcfError> {
         match self.get(name) {
             None => Ok(default),

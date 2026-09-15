@@ -397,6 +397,7 @@ mod tests {
             contype: 1,
             conaffinity: 1,
             condim: 3,
+            priority: 0,
             density: 1000.0,
             mass: None,
             margin: 0.0,

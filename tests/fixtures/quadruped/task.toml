@@ -41,7 +41,9 @@
 #    on the upright vector's z-component going negative, and the usual second guard is base
 #    height -- neither is expressible: `es-env`'s reward/termination cone binds a joint's
 #    FIRST qpos index (crates/es-env/src/plan.rs `joint_leaf`), and a free joint's first index
-#    is x, not z and not a quaternion component.
+#    is x, not z and not a quaternion component. (Its unit here is `Angle`, not `Length`:
+#    `JointQuantity::Position.unit()` is per-quantity, not per-joint-kind, and a free joint's
+#    translational coordinates come out typed as if they were hinge angles.)
 #  * The reward is forward speed normalized over the command bound, not upstream's
 #    `exp(-err^2 / tracking_sigma)`: `MathFn` is not in the cone and IR-D has no constant leaf
 #    to subtract a commanded velocity with. Upstream's fifteen shaped terms train the policy
@@ -398,36 +400,36 @@ asset_hash = [
 ]
 path = "tests/fixtures/mjcf/go1_primitives.xml"
 scene_hash = [
-    87,
-    219,
-    32,
-    148,
-    255,
-    176,
-    9,
-    45,
-    210,
-    82,
+    60,
+    147,
+    72,
+    234,
+    75,
+    225,
+    253,
+    54,
+    34,
+    60,
+    218,
+    71,
+    186,
     199,
+    180,
+    71,
+    198,
+    223,
+    204,
+    200,
+    49,
+    170,
+    167,
+    210,
+    101,
+    80,
+    226,
+    241,
+    137,
+    196,
+    154,
     153,
-    240,
-    240,
-    104,
-    89,
-    44,
-    8,
-    123,
-    8,
-    17,
-    113,
-    128,
-    169,
-    129,
-    59,
-    27,
-    178,
-    48,
-    44,
-    38,
-    138,
 ]

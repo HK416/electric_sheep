@@ -499,28 +499,53 @@ fn derivative_carries_the_home_keyframe() {
         HOME_QPOS,
         "upstream's `home` qpos moved under the pin"
     );
-    // The floor, the other thing inlined from the scene file.
-    assert!(
-        scene.contains("friction=\"0.6\" condim=\"3\"") && ours.contains("friction=\"0.6\""),
-        "the inlined floor is not upstream's"
-    );
+    // The floor, the other thing inlined from the scene file. Its contact parameters are
+    // compared attribute by attribute rather than as one substring, because attribute order
+    // is not upstream's contract; `priority` is in the list because it is what makes the
+    // floor's 0.6 the friction of every foot contact -- with it dropped, MuJoCo mixes the
+    // foot's 0.4 with the floor's by max and the stance settles measurably differently
+    // (`docs/design/quadruped-track.md` section 3.1).
+    let floor = |text: &str| -> String {
+        text.split("<geom")
+            .find(|e| e.contains("name=\"floor\""))
+            .expect("a floor geom")
+            .split_once("/>")
+            .expect("the geom element ends")
+            .0
+            .to_owned()
+    };
+    let (upstream_floor, our_floor) = (floor(&scene), floor(&ours));
+    for attr in ["priority=\"1\"", "friction=\"0.6\"", "condim=\"3\""] {
+        assert!(
+            upstream_floor.contains(attr),
+            "upstream's floor lost {attr}"
+        );
+        assert!(
+            our_floor.contains(attr),
+            "the derivative's floor lost {attr}"
+        );
+    }
+
+    // And that the attribute survives the import, not just the file.
+    let scene_desc = derivative().scene;
+    let imported = scene_desc
+        .bodies
+        .iter()
+        .flat_map(|b| &b.geoms)
+        .find(|g| g.name == "floor")
+        .expect("the floor geom imports");
+    assert_eq!(imported.priority, 1, "`priority` reached SceneDesc");
+    assert_eq!(imported.friction[0], 0.6, "the floor's sliding friction");
 }
 
 /// Only the deviations the manifest enumerates reach the importer's warning list. `<keyframe>`
-/// has no `SceneDesc` representation and geom `priority` / `group` are not carried, so a
-/// clean parse is impossible here (unlike `so101_pick_place.xml`) -- what must hold is that
-/// the set never grows silently.
+/// has no `SceneDesc` representation and geom `group` is not carried, so a clean parse is
+/// impossible here (unlike `so101_pick_place.xml`) -- what must hold is that the set never
+/// grows silently. `priority` and `<position inheritrange>` left this list in packet M6/B1b.
 #[test]
 fn derivative_parses_with_only_the_enumerated_warnings() {
     let import = derivative();
-    let expected = [
-        "<keyframe>",
-        "`priority`",
-        "`group`",
-        "`inheritrange`",
-        "`rgba`",
-        "`mode`",
-    ];
+    let expected = ["<keyframe>", "`group`", "`rgba`", "`mode`"];
     let unexpected: Vec<&str> = import
         .warnings
         .iter()
