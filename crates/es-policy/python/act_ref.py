@@ -112,7 +112,10 @@ def run(path, observation=None):
     image = torch.tensor(flat_image, dtype=torch.float32).reshape(1, *image_shape)
     state = torch.tensor(flat_state, dtype=torch.float32).reshape(1, state_dim)
 
-    policy = ACTPolicy.from_pretrained(path)
+    # CPU on both sides, always. `config.json` records the device the checkpoint was *trained*
+    # on, and `from_pretrained` honours it; our `TorchRuntime` is a CPU subprocess, and an
+    # fp32 comparison between two devices would measure cuDNN's kernel choice, not the module.
+    policy = ACTPolicy.from_pretrained(path).to("cpu")
     policy.eval()
     batch = {
         camera: (image - image_mean) / (image_std + 1e-8),
