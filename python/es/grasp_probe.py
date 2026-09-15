@@ -34,6 +34,8 @@ CUBE_HALF_HEIGHT = 0.02
 # `so101_pick_place.xml`'s bin interior, the same box `expert_solves_the_pinned_seeds` checks.
 BIN = ((0.09, 0.19), (-0.15, -0.05), 0.09)
 GRIPPER_JOINT = "gripper"
+# The Learning IR's chunk horizon (`learning.toml`, `ActionChunker.horizon`).
+HORIZON = 16
 
 
 def jaw_geoms(model, mj):
@@ -83,6 +85,7 @@ def replay(mj, model, data, rows, reset, substeps, fixed, moving, cube_geom, cub
                 float(data.qpos[grip_adr]),
                 np.array([data.qpos[cube_adr + i] for i in range(3)]),
                 row[6:9],
+                np.array(data.qpos[:6]),
             )
         )
     return log
@@ -109,7 +112,13 @@ def main() -> int:
     cube_joint = mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, "cube_free")
     cube_adr = model.jnt_qposadr[cube_joint]
     grip_adr = model.jnt_qposadr[mj.mj_name2id(model, mj.mjtObj.mjOBJ_JOINT, GRIPPER_JOINT)]
-    print(f"jaws: {len(fixed)} fixed geoms, {len(moving)} moving; timestep {model.opt.timestep}")
+    # `--substeps` is a measurement, not a setting: the cube column of the dump only tracks for
+    # the value `Env::step` actually uses, and the drift below is what says so.
+    period = args.substeps * model.opt.timestep
+    print(
+        f"jaws: {len(fixed)} fixed geoms, {len(moving)} moving; timestep {model.opt.timestep} s, "
+        f"so one recorded action row is {period} s = {1.0 / period:.1f} Hz"
+    )
 
     files = sorted(glob.glob(os.path.join(args.dump, "ep-*.txt")))
     if not files:
@@ -123,9 +132,12 @@ def main() -> int:
     print(header)
     print("-" * len(header))
     lifted, in_bin, lifts, windows, closures, drifts = 0, 0, [], [], [], []
+    copy_all, copy_grasp, grasp_frac, same, ahead = [], [], [], [], []
     for path in files:
-        raw = np.loadtxt(path)
-        reset, rows = raw[0], np.atleast_2d(raw[1:])
+        # Line 1 is `nq + nv` wide and every line after it is 9, so the two are read apart.
+        with open(path, encoding="utf-8") as fh:
+            reset = np.array(fh.readline().split(), dtype=float)
+        rows = np.loadtxt(path, skiprows=1, ndmin=2)
         log = replay(
             mj, model, data, rows, reset, args.substeps, fixed, moving, cube_geom, cube_adr,
             grip_adr,
@@ -145,7 +157,31 @@ def main() -> int:
             and BIN[1][0] < final[1] < BIN[1][1]
             and final[2] < BIN[2]
         )
-        drift = float(max(np.linalg.norm(e[5] - e[6]) for e in log))
+        # The last row's cube column is the *next* episode's reset draw -- `Env::step` resets on
+        # the terminal tick and the dump reads the state after it -- so the self-check stops one
+        # tick short.
+        drift = float(max(np.linalg.norm(e[5] - e[6]) for e in log[:-1]))
+        # How much of the learning objective the grasp actually is. `observation.state[t]` is
+        # the row ACT is trained on and `action[t:t+H]` its chunk target, so "repeat the joints
+        # you can already see" is a predictor that needs no policy at all. Raw radians -- not
+        # the normalized L1 the training curve reports, and not comparable to it.
+        arm = np.array([e[7] for e in log])
+        act = rows[:, :6]
+        per_tick = np.array(
+            [np.abs(act[t : t + HORIZON] - arm[t]).mean() for t in range(len(act) - HORIZON)]
+        )
+        copy_all.append(float(np.mean(per_tick)))
+        # Which state row the action belongs to. `Env::step` records `ctrl` beside the qpos the
+        # step *ended* in, so `observation.state[t]` is the result of `action[t]` and not the
+        # row it was computed from -- LeRobot's pairing is the other one. These two medians say
+        # how far apart the two readings are, in radians of joint travel.
+        same.append(float(np.median(np.abs(act - arm))))
+        ahead.append(float(np.median(np.abs(act[1:] - arm[:-1]))))
+        if both:
+            held = per_tick[both[0] : min(both[-1] + 1, len(per_tick))]
+            if held.size:
+                copy_grasp.append(float(np.mean(held)))
+                grasp_frac.append(len(held) / len(per_tick))
         left_table = lift > CUBE_HALF_HEIGHT
         lifted += int(left_table)
         in_bin += int(inside)
@@ -169,7 +205,14 @@ def main() -> int:
         f"  two-jaw contact ticks: median {float(np.median(windows)):.1f}, max {max(windows)}\n"
         f"  gripper joint closes to {closure:.4f} rad while both jaws touch the cube -- the "
         f"geometric closure the blended command has to reach\n"
-        f"  worst cube drift from the `es` replay: {max(drifts) * 1000:.4f} mm"
+        f"  worst cube drift from the `es` replay: {max(drifts) * 1000:.4f} mm\n"
+        f"  the grasp holds for {float(np.median(grasp_frac)) * 100:.1f} % of an episode; a "
+        f"chunk's L1 against 'repeat the\n  joints you can already see' is "
+        f"{float(np.median(copy_all)):.4f} rad over the whole trajectory and "
+        f"{float(np.median(copy_grasp)):.4f} rad\n  inside the grasp window (raw radians, not "
+        f"the normalized training loss)\n"
+        f"  |action[t] - qpos[t]| median {float(np.median(same)):.5f} rad, "
+        f"|action[t] - qpos[t-1]| median {float(np.median(ahead)):.5f} rad"
     )
     return 0
 

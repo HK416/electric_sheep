@@ -5080,6 +5080,12 @@ fn recorded_actions_replay_to_the_same_outcome() {
         let mut plane =
             es_safety::SafetyPlane::<NJ, H>::from_ir(&deploy).expect("the envelope builds");
         let (mut ok, mut in_bin, mut corrected) = (0usize, 0usize, 0u64);
+        let mut worst_correction = 0.0f64;
+        // `SafetyPlane::accept` takes a chunk only for a `seq` strictly greater than the last
+        // it saw, and `begin_episode` deliberately does not reset that (spec 8.6). One counter
+        // for the whole run, not one per episode -- restarting it makes every episode after
+        // the first a permanent chunk underrun, which is `hold_position` forever.
+        let mut seq = 0u64;
         for (index, demo) in demos.iter().enumerate() {
             let rows = f32col(demo, column);
             let mut closed = None;
@@ -5109,11 +5115,16 @@ fn recorded_actions_replay_to_the_same_outcome() {
                 }
                 let mut actions = [[0.0; NJ]; H];
                 actions[0] = want;
+                seq += 1;
                 let chunk = es_safety::ActionChunk::new(actions, 1, ExecutionMode::RecedingHorizon)
-                    .with_seq(t as u64 + 1);
+                    .with_seq(seq);
                 let safe = plane.validate(&chunk, Micros(0), env.tick());
-                if (0..NJ).any(|j| (safe.q[j] - want[j]).abs() > 1e-9) {
+                let delta = (0..NJ)
+                    .map(|j| (safe.q[j] - want[j]).abs())
+                    .fold(0.0f64, f64::max);
+                if delta > 1e-9 {
                     corrected += 1;
+                    worst_correction = worst_correction.max(delta);
                 }
                 let outcome = env.step(&safe.q).expect("the replay steps");
                 if let Some(text) = dump.as_mut() {
@@ -5165,7 +5176,7 @@ fn recorded_actions_replay_to_the_same_outcome() {
         }
         println!(
             "{column}: success {ok}/{n}, cube in the bin {in_bin}/{n}, plane corrected \
-             {corrected} ticks"
+             {corrected} ticks by at most {worst_correction:.3e} rad"
         );
         results.push((ok, in_bin));
     }
@@ -5333,8 +5344,22 @@ fn the_temporal_ensemble_survives_the_grasp_window() {
         "grasp window: ticks {first}..={end} of {}, termination {termination:?}",
         log.len()
     );
+    for stage in [
+        es_env::Stage::Approach,
+        es_env::Stage::Descend,
+        es_env::Stage::Close,
+        es_env::Stage::Lift,
+        es_env::Stage::Transport,
+        es_env::Stage::Lower,
+        es_env::Stage::Release,
+    ] {
+        if let Some(at) = log.iter().position(|(s, ..)| *s == stage) {
+            println!("  {stage:?} opens at tick {at}");
+        }
+    }
     println!("joint   max|blend-raw|      raw min     blend min       raw max     blend max");
     let mut worst = [0.0f64; NJ];
+    let mut reaches = [true; NJ];
     for (j, w) in worst.iter_mut().enumerate() {
         let dev = window
             .iter()
@@ -5357,6 +5382,7 @@ fn the_temporal_ensemble_survives_the_grasp_window() {
             .iter()
             .map(|(_, _, b, _)| b[j])
             .fold(f64::MIN, f64::max);
+        reaches[j] = bmin <= rmin && bmax >= rmax;
         println!("{j:>5} {dev:>15.5} {rmin:>13.5} {bmin:>13.5} {rmax:>13.5} {bmax:>13.5}");
     }
     let measured = window.iter().map(|(.., m)| *m).fold(f64::MAX, f64::min);
@@ -5376,5 +5402,20 @@ fn the_temporal_ensemble_survives_the_grasp_window() {
         termination,
         es_env::Termination::Success,
         "the expert driven through the temporal ensemble did not solve the task"
+    );
+    // The property, exactly: the ensemble is a *lag*, not a loss of range. Every joint's
+    // blended command still reaches both ends of what the newest chunk asked for -- including
+    // the gripper, whose closure is what decides whether the demonstrations grasp or push. No
+    // tolerance: the extremes are held long enough for every overlapping chunk to agree, so
+    // this is an equality and a regression in `decay` or `CHUNK_SLOTS` breaks it.
+    assert!(
+        reaches[NJ - 1],
+        "the temporal ensemble never lets the gripper reach the closure the expert commands: \
+         the blend opens the jaws and every demonstration is a push (packet M5/V10 \
+         measurement 3)"
+    );
+    assert!(
+        reaches.iter().all(|r| *r),
+        "a joint's blended command does not span what the newest chunk asked for: {reaches:?}"
     );
 }
