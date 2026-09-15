@@ -1838,6 +1838,108 @@ set through the widened Observation IR, lower, train 20,000 steps on V2b's exact
 The first command of that run is also the first real exercise of `es dataset bake`'s model load,
 which has no local coverage because this machine has no `mujoco`.
 
+### 7.17 As built (V9): the showcase render
+
+Packet `docs/packets/M5/V9-showcase-render.md`. Everything this demo had produced was a
+number, a hash, or the 4x4 mosaic of section 7.8 — 384x392 pixels of sixteen 96x96 tiles seen
+straight down, because the only camera in the pipeline is the one the network reads and it is
+96 pixels wide on purpose. Nobody can watch an arm pick a cube in that. V9 renders a run that
+has already happened, from a camera that exists in no scene, no `ObservationSpec` and no hash.
+
+**1. Replay, not a second camera, and the code decided it.** `EnvRenderer::frame` is already a
+pure function of poses and a view — `body_poses` → `TriScene::from_scene_with_poses` →
+`Renderer::render` → `read_tile` — and the only thing it takes from a running env is
+`StateView::xpos` / `xquat`. So "record what the renderer was handed" and "record what the
+robot did" are the same file, and once it exists the render is a replay with no physics
+backend, no policy and no Python in the process. `es eval run` and `es loop collect` now always
+write `<run>/traj/<cell>.estraj` (`crates/es-env/src/traj.rs`, `es_env::Trajectory`): magic,
+`nq`/`nv`/`nbody`/`ticks`, the body ids, then one row per control tick of
+`qpos ‖ qvel ‖ (pos[3] ‖ quat[4]) * nbody`. Under a megabyte an episode against the 24 MB of
+96x96 frames the same episode already writes.
+
+The alternative — `es eval run --showcase WxH`, a second `ImageSpec` rendered during the run —
+is smaller by a few lines and cannot do three things the replay does: re-render at another
+angle or resolution without re-running 900 steps of MuJoCo and a network; render **the expert**,
+which never goes through `es eval run` at all; and *be checked*, because a second camera in the
+loop has no reference to compare against and a replay has one.
+
+**2. The poses are stored, not re-derived, and that is the whole oracle.** Re-deriving body
+poses from `qpos` at replay time means forward kinematics, which means a physics backend in the
+replay process and a second `mj_forward` to disagree with. Stored, a replayed tick is the
+identical `BTreeMap<StableId, Pose>` the renderer was handed, so re-rendering a finished run at
+its **own** `ImageSpec` through its **own** camera must reproduce the recorded frames byte for
+byte. Two details are load-bearing rather than incidental: `Trajectory::poses` builds `Pose` by
+struct literal and not `Pose::new`, because normalising an already-canonical unit quaternion a
+second time moves its last bit; and a tick is recorded where the *frame* is captured, not where
+the control tick begins, so under `observation_delay` trajectory index and frame index stay the
+same number.
+
+Measured on the oracle server, 2026-09-15, both green:
+
+* `a_showcase_replay_reproduces_the_frames_the_policy_saw` — the scripted expert through
+  `es_eval::Evaluation` with `es_render::cpu::rasterize` (the generator of every render golden)
+  as its frame source at the demo's own 96x96 `ImageSpec`, then every tick re-rendered from the
+  file: **120 of 120 frames identical**, 23.6 s. Needs `mujoco`, not a GPU.
+* `showcase_replay_of_a_real_run_is_bit_identical` (`#[ignore]`d) — `es video showcase --camera
+  overhead --width 96 --height 96 --cell nominal-00` over a real `es eval run --frames` output
+  on the GPU path: **900 of 900 frames identical**, 5.7 s.
+
+**3. The camera is a command-line argument because the scene cannot grow one.** `scene_hash`
+feeds `task_hash` feeds `observation_hash` feeds every trained bundle, so adding a `<camera>` to
+`tests/fixtures/mjcf/so101_pick_place.xml` would invalidate the checkpoints the video exists to
+show. A camera that moves a hash is not an independent camera. `es_env::render::look_at` builds
+the `OpenCV` view of spec 3.1 from `--eye`, `--look-at` and `--fov`, world up `+Z`, and refuses
+a line of sight parallel to it rather than picking a roll. `--camera NAME` uses a camera the
+scene *does* declare, which is how the replay is checked against the run.
+
+The camera the videos use, found by rendering three frames of one episode at eight candidates
+and looking at them: **eye `(0.66, -0.46, 0.52)`, look-at `(0.14, -0.04, 0.04)`, fovy 36°,
+1280x720**. It holds the whole arm, the bin and the cube in frame for a whole episode, from in
+front of, to the side of and above the workspace.
+
+**4. What was rendered, and what it cost.** Wall clock, RTX 4090, `Rs`, 1280x720, one camera —
+an observation of this scene at this size, not a claim about the renderer (spec 12.4):
+**82.4 ms/frame** over 1407 frames (expert) and **78.2 ms/frame** over 900 (policy). The cost is
+not the pixels: section 7.1's stated ceiling is that the whole scene is re-tessellated and
+re-uploaded every frame, and at 2,978 triangles that is what this measures. The same renderer
+does 96x96 observation frames inside an evaluation at the same per-frame cost.
+
+| video | source | episodes | frames | fps | H.264 size |
+|---|---|---|---|---|---|
+| `expert-showcase.mp4` | `es loop collect --expert`, seed 1 | 4 (4/4 `Success`) | 1407 | 30 | 2.59 MiB |
+| `policy-20000-showcase.mp4` | `es eval run`, V7a 20,000-step bundle, seed 101 | 1 | 900 | 30 | 1.34 MiB |
+
+Both are one frame per recorded control tick, so at 30 fps they play at 0.6x the 50 Hz control
+rate — the grasp is visible rather than a blur, and the frame count is the tick count, which is
+what the oracle checks. The expert takes about 350 ticks (7 s) an episode and the policy's
+episodes all run the full 900-tick budget.
+
+**The contrast is the point and it is not flattering.** The four expert episodes pick the cube
+and drop it in the bin, four times out of four. The V7a 20,000-step state policy, on four
+held-out seeds (101–104) of the same nominal suite through the same envelope, scores
+`success_rate 0.0000`, `episode_length 900.0`, `envelope_violation_rate 0.0433` — four timeouts,
+155 acceleration clamps and 45 velocity clamps. Watching it, the arm lifts and hovers near the
+bin and never reaches the cube. That is a four-episode run made for the video with its own
+`evaluation_hash`, not the pinned sixteen-episode measurement, and it is reported here as what
+the video shows rather than as a table.
+
+**5. The path tracer runs headless here and is still not used.** `cargo test --release
+-p es-render` on the server passes `gpu_path_tracer_matches_the_cpu_reference_at_1spp`,
+`gpu_pt_and_rs_agree_on_geometry` and `gpu_restir_and_svgf_match_the_cpu_within_tolerance` on
+the RTX 4090 with no display, so PT is available. `es video showcase` is `Rs` only for a reason
+that is not the device: `PT_CHANNELS` is `PtRadiance` (linear `f32`) plus the three geometry
+channels and `Rgb8` is not among them, so a PT showcase needs a tone map — an exposure and a
+curve — and putting a look-decision behind a CLI flag with no oracle behind it is not this
+packet's call. `EnvRendererCfg::path` already carries the variant when someone wants it.
+
+**6. Two small findings.** `python/es/encode_video.py` no longer runs from `~/venvs/es`: that
+environment has `mujoco` and `torch` but no `opencv-python`, and `~/venvs/es-lerobot` is the one
+that does (cv2 4.13.0, `mp4v`, 13.0 MiB for the expert video). The H.264 files above came from
+the server's own `ffmpeg 7.0.2` over the same raw frames, which is the route section 7.8 already
+recorded and which is five times smaller. And `es loop collect --expert` writes its trajectories
+without needing a renderer at all, so the expert video costs one 0.4-second collection run — the
+expert has never needed pixels, and now neither does its video.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:

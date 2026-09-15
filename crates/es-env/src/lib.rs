@@ -24,6 +24,7 @@ pub mod randomize;
 pub mod render;
 pub mod rng;
 pub mod scheduler;
+pub mod traj;
 
 pub use chunk_buffer::{plane_chunk, ChunkBuffer, PlaneFeed, CHUNK_SLOTS};
 pub use control::{ControlExecutor, StageOutcome, StageState};
@@ -37,6 +38,7 @@ pub use randomize::RandomizationPlan;
 pub use render::{EnvRenderer, EnvRendererCfg};
 pub use rng::EnvRng;
 pub use scheduler::{BatchDomains, Device, DomainCfg, Schedule, TickPlan};
+pub use traj::Trajectory;
 
 /// Everything that can go wrong in the env runtime.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -61,6 +63,10 @@ pub enum EnvError {
         declared: String,
         produced: String,
     },
+    /// A `.estraj` state trajectory could not be written, read or parsed ([`traj`],
+    /// spec 25.1). A file whose header and length disagree is refused, never padded.
+    #[error("trajectory: {0}")]
+    Trajectory(String),
     /// The backend refused a call.
     #[error(transparent)]
     Physics(#[from] es_physics_core::backend::PhysicsError),

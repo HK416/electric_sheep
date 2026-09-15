@@ -70,8 +70,15 @@ impl EnvRendererCfg {
 /// CPU reference (`es_render::cpu`) cannot drift apart — every golden and the GPU/CPU
 /// comparison depend on them being the same config.
 pub fn render_config(cfg: &EnvRendererCfg) -> RenderConfig {
-    let atlas = TileAtlasCfg::row(cfg.width, cfg.height, 1);
-    let mut out = match cfg.path {
+    config(cfg.width, cfg.height, cfg.channel, cfg.path)
+}
+
+/// [`render_config`] without an [`EnvRendererCfg`], for a camera that is not a scene camera
+/// -- `es video showcase`'s free view (packet M5/V9). The same function underneath, so there
+/// is still exactly one place a render path becomes a [`RenderConfig`].
+pub fn config(width: u32, height: u32, channel: Channel, path: RenderPath) -> RenderConfig {
+    let atlas = TileAtlasCfg::row(width, height, 1);
+    let mut out = match path {
         RenderPath::Rs => RenderConfig::rs(atlas),
         RenderPath::Pt {
             spp,
@@ -91,37 +98,15 @@ pub fn render_config(cfg: &EnvRendererCfg) -> RenderConfig {
     };
     // Only the channel the caller asked for: every other one is an atlas-sized buffer nobody
     // reads back.
-    out.channels = BTreeSet::from([cfg.channel]);
+    out.channels = BTreeSet::from([channel]);
     out
 }
 
-/// World pose of every body the model indexes, read out of one env's `xpos` / `xquat` rows.
+/// World pose of every body the model indexes ([`crate::traj::body_poses`]).
 ///
-/// A body the backend does not report — an empty `xpos`, a short row — is simply absent from
-/// the map, and [`es_render::TriScene::from_scene_with_poses`] then keeps its scene pose. A
-/// partially known state degrades to the static scene, never to the origin.
-pub fn body_poses(model: &ModelInfo, state: &StateView<'_>, env: u32) -> BTreeMap<StableId, Pose> {
-    let nbody = model.nbody as usize;
-    let base = env as usize * nbody;
-    let mut out = BTreeMap::new();
-    for (id, range) in &model.body {
-        let row = base + range.start as usize;
-        let (Some(p), Some(q)) = (
-            state.xpos.get(row * 3..row * 3 + 3),
-            state.xquat.get(row * 4..row * 4 + 4),
-        ) else {
-            continue;
-        };
-        out.insert(
-            *id,
-            Pose::new(
-                Vec3::new(p[0], p[1], p[2]),
-                Quat::from_xyzw(q[0], q[1], q[2], q[3]),
-            ),
-        );
-    }
-    out
-}
+/// Defined beside the `.estraj` trajectory rather than here, because a replay re-poses a
+/// scene with no Vulkan device in the process and this module is the one that links one.
+pub use crate::traj::body_poses;
 
 /// The scene camera `cfg.camera`, in the `OpenCV` frame `es-render` renders from.
 ///
@@ -154,6 +139,67 @@ pub fn camera_view(
         pose,
         spec: es_render::ImageSpec::pinhole(cfg.width, cfg.height, camera.fovy),
     })
+}
+
+/// A camera that is **not** in the scene: eye, aim point and vertical field of view.
+///
+/// The showcase render (packet M5/V9) needs a view the Observation IR does not declare, and
+/// the scene file cannot grow one — `scene_hash` feeds `task_hash` feeds every trained
+/// bundle, so adding a `<camera>` to the demo MJCF would invalidate the checkpoints the video
+/// is meant to show. So the camera is built here, from the command line, in the same `OpenCV`
+/// frame [`camera_view`] converts scene cameras into (`+X` right, `+Y` down, `+Z` forward,
+/// spec 3.1). `INV-14` is not in play: nothing is resized: the intrinsics are computed from
+/// this `fovy` at this size, exactly like every other camera.
+///
+/// World up is `+Z`. An eye that looks straight up or down along it is refused rather than
+/// silently rolled.
+pub fn look_at(
+    eye: [f64; 3],
+    target: [f64; 3],
+    fovy_rad: f64,
+    width: u32,
+    height: u32,
+) -> Result<CameraView, EnvError> {
+    let (eye, target) = (
+        Vec3::new(eye[0], eye[1], eye[2]),
+        Vec3::new(target[0], target[1], target[2]),
+    );
+    let forward = (target - eye).normalize();
+    let up = Vec3::new(0.0, 0.0, 1.0);
+    let right = forward.cross(up);
+    if !forward.norm().is_finite() || right.norm() < 1e-9 {
+        return Err(EnvError::Task(format!(
+            "camera at {eye:?} looking at {target:?}: the view direction is degenerate or              parallel to world up (+Z), so there is no roll-free orientation"
+        )));
+    }
+    let right = right.normalize();
+    let down = forward.cross(right);
+    Ok(CameraView {
+        pose: Pose::new(eye, quat_from_basis(right, down, forward)),
+        spec: es_render::ImageSpec::pinhole(width, height, fovy_rad),
+    })
+}
+
+/// The rotation whose matrix has `x`, `y`, `z` as its columns, by Shepperd's method: pick the
+/// largest of the four denominators, so no branch divides by something near zero.
+fn quat_from_basis(x: Vec3, y: Vec3, z: Vec3) -> Quat {
+    let (m00, m01, m02) = (x.x, y.x, z.x);
+    let (m10, m11, m12) = (x.y, y.y, z.y);
+    let (m20, m21, m22) = (x.z, y.z, z.z);
+    let trace = m00 + m11 + m22;
+    if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        Quat::from_xyzw((m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25 * s)
+    } else if m00 > m11 && m00 > m22 {
+        let s = (1.0 + m00 - m11 - m22).sqrt() * 2.0;
+        Quat::from_xyzw(0.25 * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s)
+    } else if m11 > m22 {
+        let s = (1.0 + m11 - m00 - m22).sqrt() * 2.0;
+        Quat::from_xyzw((m01 + m10) / s, 0.25 * s, (m12 + m21) / s, (m02 - m20) / s)
+    } else {
+        let s = (1.0 + m22 - m00 - m11).sqrt() * 2.0;
+        Quat::from_xyzw((m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s)
+    }
 }
 
 /// One camera rendered from a running env's state, frame after frame.
@@ -367,5 +413,38 @@ fn color_space(channel: Channel) -> ColorSpace {
     match channel {
         Channel::Rgb8 => ColorSpace::SRgb,
         _ => ColorSpace::Linear,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The showcase camera aims where it is told, in the `OpenCV` frame `es-render` reads:
+    /// `+Z` is the view direction, `+Y` is image-down, `+X` is image-right (spec 3.1).
+    #[test]
+    fn look_at_puts_plus_z_on_the_view_direction() {
+        // Three-quarter view: in front of, to the side of and above the origin.
+        let eye = [0.6, -0.5, 0.4];
+        let view = look_at(eye, [0.0; 3], 45f64.to_radians(), 320, 240).expect("a view");
+        let eye = Vec3::new(eye[0], eye[1], eye[2]);
+        let q = view.pose.orientation;
+        let close = |a: Vec3, b: Vec3| (a - b).norm() < 1e-12;
+        assert!(close(
+            q.rotate(Vec3::new(0.0, 0.0, 1.0)),
+            (Vec3::ZERO - eye).normalize()
+        ));
+        // Image-right is horizontal, and image-down points below the horizon.
+        assert!(q.rotate(Vec3::new(1.0, 0.0, 0.0)).z.abs() < 1e-12);
+        assert!(q.rotate(Vec3::new(0.0, 1.0, 0.0)).z < 0.0);
+        assert_eq!((view.spec.width, view.spec.height), (320, 240));
+    }
+
+    /// Straight down the world-up axis has no roll-free orientation, and is refused rather
+    /// than resolved by an arbitrary choice.
+    #[test]
+    fn a_camera_looking_along_world_up_is_refused() {
+        let r = look_at([0.0, 0.0, 1.0], [0.0; 3], 0.8, 64, 64);
+        assert!(matches!(r, Err(EnvError::Task(_))), "{r:?}");
     }
 }
