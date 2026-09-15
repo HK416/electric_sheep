@@ -240,3 +240,72 @@ RAN act_checkpoint: lerobot 0.6.1 torch 2.11.0+cpu shape [100, 14] max_abs 0e0 m
 
 **Bitwise identical** — comfortably inside spec §8.9's tier-4 `1e-5`, and the test asserts the
 bitwise result rather than the tolerance so a future divergence cannot hide inside it.
+
+## 9. Two checkpoint layouts, and where the normalization statistics are — `verified`
+
+Everything above was measured against `lerobot/act_aloha_sim_transfer_cube_human`, which is a
+**pre-0.6 checkpoint re-uploaded**. A checkpoint `lerobot-train` 0.6.1 writes today is laid out
+differently in one respect, and packet `M5/V8` hit it head on.
+
+0.6.x moved normalization out of `ACTPolicy` into a *processor pipeline* (`lerobot/processor/`),
+so `predict_action_chunk` takes already-normalized inputs and returns normalized actions (that
+is section 1's finding), and the statistics no longer live in `model.safetensors` at all. A
+fresh checkpoint directory is:
+
+```
+pretrained_model/
+  config.json
+  model.safetensors                                        # 234 tensors, no normalizer buffers
+  train_config.json
+  policy_preprocessor.json                                 # the pipeline, step by step
+  policy_preprocessor_step_3_normalizer_processor.safetensors
+  policy_postprocessor.json
+  policy_postprocessor_step_0_unnormalizer_processor.safetensors
+```
+
+`policy_preprocessor.json` names the state file, so the step index is read and not guessed:
+
+```json
+{"steps": [ ..., {"registry_name": "normalizer_processor",
+                  "config": {"eps": 1e-08, "features": {...}, "norm_map": {...}},
+                  "state_file": "policy_preprocessor_step_3_normalizer_processor.safetensors"}]}
+```
+
+Its keys are **`<feature>.<stat>` with no prefix at all** — one entry per feature of the
+dataset, not per policy input:
+
+| key | shape |
+|---|---|
+| `observation.state.{mean,std,min,max}` | `[state_dim]` |
+| `observation.images.<name>.{mean,std,min,max}` | `[3, 1, 1]` |
+| `action.{mean,std,min,max}` | `[action_dim]` |
+| `<feature>.count` | `[1]` (`[1, 1, 1]` for an image) |
+| also `reward`, `timestamp`, `index`, `frame_index`, `episode_index`, `task_index` | |
+
+The old layout names the same tensors `normalize_inputs.buffer_observation_state.mean`,
+`normalize_inputs.buffer_<camera with dots as underscores>.mean` and
+`unnormalize_outputs.buffer_action.mean`, which is the table in section 3.
+
+**Both layouts load.** `es_policy::lerobot::remap_checkpoint` takes the processor state file as
+an option and only fills the entries the prefix table did not find, so an old checkpoint is read
+exactly as before and a new one gains its nodes 9/10/11 from the second file. Nothing selects
+between them by version, because "is the key there" is the question that actually matters.
+
+`python/act_ref.py` reads both the same way, which is what keeps the two sides of the §8.9 gate
+normalizing identically.
+
+**One more thing the reference needs.** `config.json` records the device the checkpoint was
+*trained* on (`"device": "cuda"`) and `ACTPolicy.from_pretrained` honours it, so the reference
+now forces `.to("cpu")`: our `TorchRuntime` is a CPU subprocess, and an fp32 comparison across
+two devices would be measuring cuDNN's kernel selection rather than the module.
+
+**Measured 2026-09-15** on an ACT trained here by `lerobot-train` 0.6.1 (chunk 16, 6 joints,
+96×96), on a frame out of this project's own demonstration dataset rather than the synthetic
+ramp:
+
+```
+RAN act_checkpoint: lerobot 0.6.1 torch 2.11.0+cu129 observation .../v8/frame.json
+                    shape [16, 6] max_abs 0e0 max_rel 0e0
+```
+
+Bitwise identical at both the 20,000- and the 100,000-step checkpoint.

@@ -413,14 +413,51 @@ that tells pyarrow which one is the index:
 
 Row order must agree with `task_index`, because the lookup is positional (`iloc`).
 
-## `meta/stats.json`
+## `meta/stats.json` — `verified`
 
-**Optional.** `load_stats` returns `None` when the file is absent (`io_utils.py:161-175`) and
-nothing on the read path requires it. It is `{feature: {mean|std|min|max|count: [...]}}`,
-consumed by training's normalization. `es dataset export --lerobot-v3` does not write it:
-LeRobot compatibility is about the dataset being *readable*, and inventing statistics would be
-worse than omitting them. If a human wants to train LeRobot-side off an export, that is the
-follow-up.
+**Optional for reading, required for training.** `load_stats` returns `None` when the file is
+absent (`io_utils.py:161-175`) and nothing on the read path requires it; `lerobot-train`
+normalizes every policy feature from `LeRobotDataset.meta.stats`, so a dataset without it
+cannot be trained on. Packet `M5/V8` is the follow-up the earlier version of this section
+called for, and `es dataset export --lerobot-v3` now writes it.
+
+**Shape.** `{feature: {stat: nested list}}`. `load_stats` is `load_json` then
+`cast_stats_to_numpy`, which is `flatten_dict` → `np.atleast_1d(np.array(v))` → `unflatten_dict`
+(`io_utils.py:148-158`), so any JSON number tree is accepted and the *shape of the list* is the
+shape the normalizers index. Three shapes occur, and `compute_stats._validate_stat_value`
+accepts no others:
+
+| feature | stat shape | example |
+|---|---|---|
+| `shape: [n]`, `n > 1` | `[n]` | `"observation.state": {"mean": [6 numbers]}` |
+| `shape: [1]` (scalar column) | `[1]` | `"timestamp": {"mean": [0.42]}` |
+| `dtype: "image"`/`"video"` | `[3, 1, 1]` (or `[1,1,1]`) | `{"mean": [[[0.79]], [[0.76]], [[0.70]]]}` |
+| any | `count` is always `[1]` | |
+
+**Keys.** `min`, `max`, `mean`, `std`, `count`, plus `q01`, `q10`, `q50`, `q90`, `q99`.
+`NormalizerProcessorStep` reads `mean`/`std` for `MEAN_STD`, `min`/`max` for `MIN_MAX`,
+`q01`/`q99` for `QUANTILES` and `q10`/`q90` for `QUANTILE10`, and raises a named error when the
+pair its mode wants is missing. **ACT is `MEAN_STD` on `VISUAL`, `STATE` and `ACTION`**
+(`ACTConfig.normalization_mapping`, measured at 0.6.1), so the export writes the first five and
+**omits the quantiles**: they are 5000-bin histogram estimates in LeRobot's own code
+(`RunningQuantileStats`), and a second approximation of an approximation is worse than a key
+that is honestly absent.
+
+**How LeRobot computes them, and how the export matches.** `compute_episode_stats` reduces one
+episode — `axis=0` for a vector column, `axis=(0,2,3)` and a `/255` for an image — and
+`aggregate_stats` pools the episodes with the parallel-variance formula
+(`(var_i + (mean_i − mean)²)` weighted by `count_i`), which is *exact*: the pooled mean and
+population standard deviation equal the ones computed over the whole dataset in one pass, which
+is what `crates/es-data/src/lerobot/v3.rs` does. `std` is population (`ddof = 0`) on both sides.
+
+**One honest difference: images are sampled.** `sample_images` takes
+`estimate_num_samples(n) = max(100, min(int(n**0.75), 10_000))` frames per episode and
+downsamples anything over 300 px, so LeRobot's image statistics are an estimate on a long
+episode while the export's are exact over every pixel of every frame. `count` for an image
+feature therefore differs too: LeRobot counts sampled frames, the export counts frames. On a
+dataset short enough that the sample is exhaustive the two agree to float precision, and
+`crates/es-data/tests/lerobot_v3.rs::lerobot_v3_stats` is that comparison — measured
+`2026-09-15`, worst disagreement `5.5e-08` over every feature and every key.
 
 ## Parquet physical encodings that were accepted
 

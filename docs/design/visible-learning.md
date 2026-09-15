@@ -1738,6 +1738,218 @@ set through the widened Observation IR, lower, train 20,000 steps on V2b's exact
 The first command of that run is also the first real exercise of `es dataset bake`'s model load,
 which has no local coverage because this machine has no `mujoco`.
 
+### 7.16 As built (V8): an external ACT through the runtime
+
+Packet `docs/packets/M5/V8-external-act.md`. Every policy this demo has measured was ours: an
+ACT-*shaped* Learning IR graph with no CVAE, no DETR decoder and a ResNet18 trained from scratch,
+because spec §8.3's `TemporalEncoder { Transformer }` carries a width and nothing else. It scores
+0/16, and V7a's privileged variant 0–1/16. That leaves two hypotheses the numbers cannot
+separate — **the model**, or **the data, the physics and the expert** — so V8 replaces the model
+and nothing else: LeRobot's own ACT, trained by `lerobot-train`, run through our Observation IR,
+our Deployment IR and Safety Plane, and `es eval run`.
+
+**The verdict first, because the stop rule was written before the measurement.** The external
+ACT reaches `success_rate = 0.0625` (1/16) nominal at 100,000 steps and 0/16 at 20,000 and
+50,000. The demo asks for `0.5` and the number was not lowered. **Hypothesis 1 is refused**: a
+real ACT with an ImageNet-pretrained backbone, a CVAE, a DETR decoder and five times the training
+schedule does no better on this dataset than the IR-shaped graph did. The next packet opens the
+scene, the contact model or the expert's trajectories. It does not open the optimizer, and it
+does not widen `es-ir`.
+
+**1. The claim that was actually being tested, and the four things it took.**
+
+Spec §8.1 says the network internals are opaque and the interface semantics are typed — "we do
+not invent a proprietary policy architecture". Making that falsifiable took four changes, and
+each one was a gap the project had recorded and not yet closed.
+
+* **`meta/stats.json`.** Section 7.7's "three deliberate omissions" listed it first, on the
+  grounds that nothing then trained through `lerobot`. `lerobot-train` normalizes every policy
+  feature from `LeRobotDataset.meta.stats`, so the file is now written natively in
+  `crates/es-data/src/lerobot/v3.rs`, in the same pass that writes the parquet — one traversal of
+  the values, not two. `min`/`max`/`mean`/population `std`/`count` per feature; `[3, 1, 1]` per
+  channel in `[0, 1]` for an image; **no `qNN` keys**, because those are 5000-bin histogram
+  estimates in LeRobot's own code that only `NormalizationMode.QUANTILES` reads, and ACT is
+  `MEAN_STD` throughout. The oracle is LeRobot judging its own format:
+  `lerobot_stats_ref.py` opens the export with `LeRobotDataset`, recomputes the same statistics
+  with `compute_episode_stats` + `aggregate_stats` on the same parquet, and reports the largest
+  disagreement — **RAN, worst `5.5e-08`** across every feature and every key, with no entry
+  missing. `docs/api-notes/lerobot-dataset.md` now pins the format.
+* **Two export selections, because `lerobot` classifies a policy feature by name alone.**
+  `dataset_to_policy_features` makes every key starting `action` an ACTION feature, so
+  `action_commanded` and `action_source` would have arrived as two more action heads;
+  `--drop` leaves them out. And `observation.state` is recorded as env 0's whole `qpos` followed
+  by its whole `qvel` (25 values), which **cannot be served back at inference** — `es_eval`'s
+  state capture reads `qpos` and has no `qvel` arm at all — so `--state-dim 6` keeps `qpos[..6]`,
+  exactly what `Capture::Joints(6)` hands the Observation IR. The refusal that prevents is a
+  training run that converges on an observation the runtime cannot produce.
+* **`es policy import-lerobot`, and where an external architecture lives.** It is not in the
+  Learning IR and cannot be. What the spec offers instead is its own answer, §8.3: *"π-class
+  models are not decomposed into nodes. They are referenced whole via `PolicyBundle`, but the
+  input/output contract (§8.4) is type-checked"* — and the risk register at §28 already names
+  exactly this as the fallback for "Learning IR cannot express real policies". So the bundle's
+  `LearningGraph` is **one `LearningNode::PolicyBundle`** carrying the contract's ports, and the
+  architecture parameters ride where they already lived: `remap_checkpoint` records the
+  checkpoint's own `config.json` in the output safetensors' `__metadata__`, and
+  `TorchRuntime::load` lowers with `lower_act` when it finds one. **The hash chain still
+  decides**: the config is inside the bytes `WeightsRef::hash` names, `load` verifies that hash
+  before Python sees anything, `validate_keys` still runs, and `INV-16` is untouched.
+* **`observation-v8.toml`**, a second Observation IR on the same Task IR (§7), with
+  `evaluation-v8.toml` naming it and not one acceptance threshold moved.
+
+**2. The two findings the plan above did not know.**
+
+**Finding 1 — the state port cannot carry raw radians, and the right answer is to say the
+normalization is the identity.** The plan was to declare the state port `Unit::Angle`, on the
+reasoning that ACT's normalizer is inside the checkpoint. The cross-IR pass refuses it: §5.4's
+`TYPE-011` is checked against `PolicyContract::inputs` and not only against the graph boundary
+(`crates/es-ir/src/cross.rs:200`), so a policy input is `Normalized`, `Dimensionless` or `Token`,
+full stop. That is the project's rule and V8 is forbidden `es-ir`, so it had to be obeyed.
+
+Obeying it by inserting a *real* affine map would have been the wrong fix, and it is worth
+saying why, because it is section 7.9's defect wearing a new hat. LeRobot's normalizer is fitted
+to the values the policy was **trained** on, so any map applied at inference must also be applied
+to the exported dataset — which means implementing `Op::Normalize` a second time, in the
+exporter, in Python's reach. One node, two implementations, again.
+
+So `observation-v8.toml`'s state branch is `Normalize { Range { lo: 0.0, hi: 1.0 } }`, which is
+`(q − 0) / (1 − 0)`: the identity, declared. The port says `Normalized { 0, 1 }`, which is true
+in the sense this codebase already uses the word — the `sim_cube_pose` header says it outright,
+"a `Normalize` is affine, not a clamp" — and the network is still not fed raw, because its own
+first layer is the normalizer the checkpoint carries. The Observation IR's normalization decision
+for an externally-normalizing policy *is* the identity, and the honest thing is to write it in
+the node that decides it rather than leave a reader to infer it from an absence.
+
+The import then takes each contract input's **unit** from the Observation IR (§5.1 rule 6: the
+Observation IR owns preprocessing) after checking that the two agree on `elem` and `shape`;
+`config.json` records no unit, so `act_policy` could only ever have guessed one.
+
+**Finding 2 — a checkpoint `lerobot-train` writes today does not carry its normalization
+statistics in `model.safetensors`.** 0.6.x moved normalization out of `ACTPolicy` into a processor
+pipeline, so the statistics live in
+`policy_preprocessor_step_3_normalizer_processor.safetensors`, keyed `<feature>.{mean,std,…}`
+with no prefix at all. The pinned upstream checkpoint the M4 gate used
+(`lerobot/act_aloha_sim_transfer_cube_human`) is a pre-0.6 upload and has them inline, which is
+why nothing had noticed. `remap_checkpoint` now takes the second file as an option and fills only
+the entries the prefix table did not find, so both layouts load and neither needs a flag;
+`act_ref.py` reads the same two. `docs/api-notes/lerobot-act.md` section 9 is the write-up.
+
+A third, smaller one: `config.json` records the device the checkpoint was *trained* on and
+`from_pretrained` honours it, so the reference now forces `.to("cpu")`. An fp32 comparison across
+two devices measures cuDNN's kernel choice, not the module.
+
+**3. The equivalence gate, on a frame this policy was trained on.** `act_checkpoint.rs` now takes
+`ES_ACT_OBSERVATION`, a recorded `{state, image}` written with shortest-round-trip decimals so
+both sides hold bit-identical f32. The frame is index 100 of the export — the arm mid-reach, the
+cube where the seed put it — and the image is `f32::from(byte) / 255.0f32`, which is exactly what
+`es_compile`'s `ToTensor` kernel serves at inference.
+
+| checkpoint | shape | `max_abs` | `max_rel` | tier |
+|---|---|---|---|---|
+| 20,000 | `[16, 6]` | `0e0` | `0e0` | bitwise (§8.9 tier 4 is `1e-5`) |
+| 100,000 | `[16, 6]` | `0e0` | `0e0` | bitwise |
+
+`lerobot` 0.6.1, `torch` 2.11.0+cu129 on CPU. Agreement on a ramp says the two modules compute
+the same function; agreement on a frame the policy was trained on says it on the input that
+decides the demo.
+
+**4. What was trained.** LeRobot's ACT defaults — ImageNet-pretrained ResNet18, `use_vae = true`,
+`latent_dim = 32`, `dim_model = 512`, 8 heads, `dim_feedforward = 3200`, 4 encoder / 1 decoder
+layers, `kl_weight = 10.0`, `lr = 1e-5` (backbone included), `dropout = 0.1`, every feature
+`MEAN_STD` — with two deviations, both required by the Deployment IR and neither a tuning choice:
+`chunk_size = 16` (LeRobot's default is 100; `XIR-022` requires the chunk the runtime buffers to
+be the chunk the policy predicts) and `n_action_steps = 16` rather than 10, because `lower_act`'s
+module returns `actions[0][:n_action_steps]` and the runtime needs the whole predicted chunk —
+`execute_chunk = 10` and the temporal ensemble are the Deployment IR's (§9.2). `n_action_steps`
+does not enter the ACT loss. Batch 8, seed 0, 100,000 steps, checkpoint every 10,000.
+
+Loss, as `lerobot-train` logged it (`l1` is the chunk's L1, `kld` the CVAE term × `kl_weight`):
+
+| step | 500 | 5,000 | 10,000 | 20,000 | 50,000 | 80,000 | 100,000 |
+|---|---|---|---|---|---|---|---|
+| total | 4.270 | 0.320 | 0.124 | 0.055 | 0.035 | 0.029 | 0.026 |
+| `l1` | 0.247 | 0.092 | 0.070 | 0.053 | 0.035 | 0.029 | 0.026 |
+| `kld` | 0.402 | 0.023 | 0.005 | 0.000 | 0.000 | 0.000 | 0.000 |
+
+It converges, and it converges to a *lower* L1 than V2b's IR-shaped graph reached (0.0166 at
+20,000 there is on a different normalization and is not directly comparable, but nothing here
+looks like a failed fit). **The loss was never the thing in doubt.**
+
+**5. The measurement.** 16 held-out episodes on seeds 101–116, `evaluation-v8.toml`, the V6
+envelope, `es eval run` with no change to the eval path.
+
+| checkpoint | `success_rate` | mean episode length | `envelope_violation_rate` | failures |
+|---|---|---|---|---|
+| 20,000 | 0.0000 (0/16) | 900.0 | 0.180 | 16 timeout |
+| 50,000 | 0.0000 (0/16) | 900.0 | 0.370 | 16 timeout, 40 fallback steps |
+| 100,000 | **0.0625 (1/16)** | 865.5 | 0.356 | 15 timeout, 14 fallback steps |
+
+The 100,000-step run was repeated and `report.json` came back **byte-identical**, which is the
+determinism the hash chain claims (§3.5 tier 1) exercised on the external policy.
+
+The full suite on the 100,000-step bundle, 16 episodes each, `--jobs 6`:
+
+| suite | `success_rate` | mean episode length | `envelope_violation_rate` |
+|---|---|---|---|
+| nominal | 0.0625 | 865.1 | 0.352 |
+| light_intensity | 0.0625 | 866.9 | 0.350 |
+| light_direction | 0.0625 | 873.0 | 0.253 |
+| observation_delay | 0.0625 | 867.3 | 0.329 |
+| torque_noise | 0.0625 | 866.2 | 0.352 |
+| backlash | 0.0625 | 864.6 | 0.285 |
+
+Every suite scores the same single episode. A perturbation sweep that does not move is what a
+table decided by something other than the perturbation looks like — the policy is not close
+enough to the task for a light change to matter.
+
+**6. One number in the statistics that is worth keeping.** The wrist-roll joint (index 4) has
+`observation.state.std = 0.0001` and `action.std = 0.0` over all 50 demonstrations: the scripted
+expert never turns it. LeRobot's `MEAN_STD` divides by `std + 1e-8`, so that channel's input is
+amplified by ~10⁴ and its output is pinned to the mean. Both behaviours are correct for a
+constant column and neither is a defect — but it is the kind of thing that only becomes visible
+once a real trainer reads a real `stats.json`, and it is recorded here rather than discovered
+twice.
+
+**7. Wall clocks** (RTX 4090, 16 cores; observations, not a benchmark).
+
+| phase | measured |
+|---|---|
+| `es dataset export --lerobot-v3` (50 episodes, 18,263 frames, 486 MB out) | 4 s |
+| `lerobot-train`, 100,000 steps, batch 8, CUDA | 33 m 50 s |
+| `es eval run`, 16 episodes, `--jobs 1`, with `--frames` | 5 m 44 s |
+| `es eval run`, 96 episodes (6 suites), `--jobs 6`, with `--frames` | 9 m 31 s |
+
+**8. The hashes.** `task_hash` and `deployment_hash` do not move — that is the point of the
+packet: the same task, the same envelope, a different policy.
+
+| slot | value |
+|---|---|
+| `task_hash` | `6cf826c1…6b7b` — unchanged from V7a |
+| `deployment_hash` | `3b2ad568…6db1` — unchanged from V6 |
+| `observation_hash` (V8) | `006820aa5f787b4731f5866c57764afb91af814c2e2627d89e8e4aac2e27497c` |
+| `evaluation_hash` (V8) | `d1819fca6ccf12597a49946d64b3ea1bb3ae16e8ec14d80e2ea95b46571de29c` |
+| `learning_hash` (100k) | `71d08b44f83eb017f24493c374e8f2c5585e71046d8ae9b8702312695595b1a5` |
+| `policy_hash` (20k / 50k / 100k) | `0d259d87…0244` / `a7f6acd2…0eda4` / `30ed13fa…42b6` |
+| source checkpoint (100k) | `5a84f19ab3d06f62f699951fe9e36971212c3a67387b2e0c044d4706c5d3dc75` |
+| `dataset_schema_hash` | `1f5ddafc…8777c` — the source dataset's, unchanged: no column was added |
+
+The source checkpoint's hash is in the chain as `BaseModelRef`, so the bundle names both the
+LeRobot file it came from and the remapped file it actually loads.
+
+**9. The video.** `es video mosaic --grid 4x4` over the 16 nominal cells of the 100,000-step run,
+900 frames at 384×392, then `encode_video.py` and an H.264 copy: `demo-v8-h264.mp4`, 1.6 MB. It
+shows the arm reaching and stalling, with the red border on the steps the plane clamped.
+
+**Open question (V8-1), for the section 12 list.** *What the external ACT's failure is allowed to
+conclude.* It rules out "our Learning IR node set is why the demo does not work", which was worth
+ruling out and is now ruled out with a bitwise-verified import. It does **not** rule out "96×96 is
+too small" or "50 episodes is too few" — V8 held those fixed on purpose, because moving them at
+the same time as the model would have measured two things. Default: treat the demo's failure as a
+**data and physics** finding, and make the next packet a diagnosis of the scene — replay the
+expert's own recorded actions through `es eval run` and confirm the harness reproduces its success
+rate, then vary resolution and demonstration count one at a time. The alternative, more
+demonstrations at a higher resolution immediately, is a bigger run that would leave the same
+ambiguity if it failed.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
