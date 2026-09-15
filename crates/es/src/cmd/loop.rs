@@ -206,11 +206,21 @@ fn collect_typed<const NJ: usize, const H: usize>(
 ) -> Result<CollectReport, CliError> {
     // Teleop is real-robot I/O (M3 W1) and stays off this path; the one scripted intervener
     // the CLI offers is `--expert`. `es loop intervene` labels afterwards.
-    let mut hook = |_episode: u32, frame: u32, model: &ModelInfo, obs: &[f64]| {
+    //
+    // The episode index, not `frame == 0`, is what says a new episode began: this hook is
+    // `PolicyRuntime::infer`, which runs on the *inference* tick (5 Hz against a 50 Hz control
+    // rate), so it sees frame 0 only when the episode happens to start on one. An episode
+    // whose length is not a multiple of the inference period puts every later episode off
+    // phase, and the expert then carries the finished episode's stage and latched cube into
+    // the next one -- which is why `es loop collect --episodes N` only solved episode 0
+    // (design note section 7.6 finding 5, packet M5/V1c).
+    let mut started: Option<u32> = None;
+    let mut hook = |episode: u32, _frame: u32, model: &ModelInfo, obs: &[f64]| {
         let Some(expert) = expert.as_deref_mut() else {
             return Intervention::Policy;
         };
-        if frame == 0 {
+        if started != Some(episode) {
+            started = Some(episode);
             expert.reset();
         }
         let state = es_env::expert::state_of_row(model, obs);

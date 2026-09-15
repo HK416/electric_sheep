@@ -425,13 +425,20 @@ impl Collector {
             for frame in 0..max_steps {
                 wrapper.episode = index;
                 wrapper.frame = frame;
-                // The plane is told where the robot actually is before it judges a command,
-                // exactly as `es_eval::runner` and the HIL loop do (spec 9.3). Without it the
-                // envelope is measured against the *previous command* here and against the
-                // *measured pose* at evaluation, so a demonstration recorded through one is
-                // clamped by the other -- and the plane's hold target, rate history and
-                // velocity carry across a reset into the next episode (packet M5/V1c).
-                {
+                // "A caller that knows the real pose calls `observe_state` before the first
+                // `validate`" (`SafetyPlane::new`). `reset_latch` clears the latch but not the
+                // hold target, the velocity or the rate history, so without this the plane
+                // opens every episode after the first believing the arm is still where the
+                // previous episode's last command left it -- and clamps the demonstration back
+                // toward a pose that no longer exists (packet M5/V1c).
+                //
+                // Once per episode, not once per step: inside an episode the envelope is a
+                // bound on the commanded motion, which is what `ScriptedExpert` paces itself
+                // to. Re-seeding every step turns it into a bound on the following error
+                // instead -- which is what `es_eval::runner` does, and the disagreement
+                // between the two is design note section 7.10, not something this packet may
+                // settle (`deployment.toml` and the expert's pacing are both forbidden here).
+                if frame == 0 {
                     let state = env.backend().state();
                     let (mut q, mut qd) = ([0.0; NJ], [0.0; NJ]);
                     q.copy_from_slice(&state.qpos_of(0)[..NJ]);

@@ -7,40 +7,54 @@ fixes a defect V2b measured but was forbidden from touching.
 
 ## the defect
 
-Two code paths drive the same Safety Plane and disagree about what the envelope is measured
-*against*.
+**Three findings, one of which this packet is forbidden from fixing.**
 
-`es_eval::runner` — and `es_ros2::hil`, and `es_runtime_embedded` — call
-`SafetyPlane::observe_state(q, qd)` with the measured joint state before every `validate`, which
-re-seeds `last_safe`, `prev_safe`, `vel` and `prev_vel`. The velocity stage then reads
-`(cmd − qpos) / dt` and the envelope becomes a bound on the **following error**: at 50 Hz with
-`velocity_max = 3.0`, a command may lead the joint it commands by `0.0600` rad.
+**1. `action` is already the executed action, and nothing said so.** `DomainRunner::emit_actions`
+copies `SafeAction::q` into `ctrl`, `Env::step` records `ctrl`, and `to_lerobot` writes it as
+`action` — so the column has always been post-clamp. Open question 12's option (a) ("record
+`action` as the next commanded position rather than the servo target") describes a change that
+was already made, which nobody could see because nothing in the repository asserted it and the
+raw command was thrown away. This packet pins it with a bit-equality oracle and keeps the
+pre-plane command in a second column, `action_commanded`, so that a `Clamped` frame can be read
+without re-running the plane.
 
-`es_data::collect::Collector::run` never called it. There, `last_safe` is the *previous command*,
-so the envelope bounds command-to-command motion, and `ScriptedExpert` paces itself to exactly
-that (`step_max = 0.054`) — while its anti-windup deliberately lets the command lead the measured
-joint by `4 × step_max = 0.216` rad, because that is what a position servo with an inference
-latency needs.
+**2. `es loop collect --episodes N` only solved episode 0, and the cause is the inference phase.**
+The scripted expert is reset from the intervener hook on `frame == 0`. That hook is
+`PolicyRuntime::infer`, which runs when a submitted observation is *released* —
+`expected_latency_ms` ticks after the submit (§12.3). The demo's `learning.toml` declares
+`15.0` ms against a 20 ms control period, so **the first call of every episode is frame 1, and
+`frame == 0` never fires at all**. It looked correct only because a freshly constructed
+`ScriptedExpert` starts reset: episode 0 needs no reset and gets away with it, and every episode
+after it runs with the previous one's stage and latched cube pose. Keying on the episode index
+instead takes `--episodes 50 --seed 1` from **1/50 to 50/50 successes in one command** (oracle
+server, measured). The plane's own carried state is a second, smaller instance of the same thing:
+`reset_latch` clears the latch but not the hold target, the velocity or the rate history, so the
+collector now seeds them from the measured pose once per episode — which is exactly what
+`SafetyPlane`'s own documentation says a caller that knows the real pose does before the first
+`validate`.
 
-So the demonstrations' `action` column leads its own `qpos` by a median **0.2413** rad, four times
-what the envelope allows at inference. ACT imitates that faithfully (V2b measured the chunk's first
-action within 0.02–0.16 rad of the recorded action), every step is velocity/acceleration/rate
-clamped, `envelope_violation_rate` is `1.0000`, the violation-rate watchdog latches
-`hold_position` on about a tenth of the steps, and **not one step in 86,400 was
-`ActionSource::Policy`**. The demonstrations and the envelope were never checked against each
-other — which is open question 12, stated as a root cause rather than as three options.
+**3. `es loop collect` and `es eval run` disagree about what the envelope is measured against —
+and this packet reports it rather than settling it.** `es_eval::runner`, `es_ros2::hil` and
+`es_runtime_embedded` call `observe_state` before **every** `validate`, which re-seeds
+`last_safe`, `prev_safe`, `vel` and `prev_vel`; the envelope is then a bound on the **following
+error**, and the demo's `acceleration_max` makes that bound `0.008` rad. `Collector::run` seeds it
+once per episode, so inside an episode the envelope bounds command-to-command motion — which is
+what `ScriptedExpert::chunk` paces itself to, and its doc comment says so. The demonstrations'
+`action` therefore leads its own `qpos` by a median `0.2413` rad, four times what the evaluation
+path allows, which is why V2b measured `envelope_violation_rate 1.0000` and **not one step in
+86,400 classified `ActionSource::Policy`**.
 
-The same carried plane state is the second defect: `Collector::run` resets the env, the chunk
-buffers and the e-stop latch between episodes but never the plane's hold target, velocity or rate
-history, so episode 1 begins with the plane believing the arm is still where episode 0's last
-command left it. That is why `es loop collect --episodes N` only solved episode 0 (design note
-section 7.6, finding 5) — not the scripted expert, whose `reset` was already correct.
+Making the collector re-seed every step *was tried and measured*: it drops the scripted expert to
+**2/8 on `expert_solves_the_pinned_seeds`**, whose threshold is `0.875` and is a golden, and to
+**0/16 on the evaluation's own seeds 101–116**. The expert plans a 16-row chunk executed over 10
+ticks from the pose at chunk start; no constant re-pacing satisfies a `0.008` rad following-error
+bound over ten open-loop ticks, and the two knobs that would (`deployment.toml`'s envelope,
+`execute_chunk`) are both in this packet's `forbidden` list. So the asymmetry is written down with
+numbers in design note section 7.10 and open question 12 stays open, now with the measurement that
+says which end has to move.
 
-**The principle this packet applies: what is executed is what is recorded.** `es loop collect`
-tells the plane where the robot is, exactly as every other actuator path does, and records the
-`SafeAction` the plane handed toward the actuator. The raw command is kept beside it in
-`action_commanded`. Demonstrations are then consistent with the envelope by construction, and one
-reset per episode is one reset of everything.
+**The principle this packet applies: what is executed is what is recorded** — and now it is
+asserted, labelled, and one reset per episode is one reset of everything.
 
 ## context
 
@@ -52,6 +66,7 @@ crates/es-data/src/lib.rs
 crates/es-data/tests/loop_learning.rs
 crates/es-data/tests/lerobot_v3.rs
 crates/es/src/cmd/loop.rs
+crates/es/tests/cli.rs
 docs/api-notes/lerobot-dataset.md
 docs/api-notes/lerobot-dataset.ko.md
 docs/design/visible-learning.md
@@ -69,11 +84,11 @@ the whole change, which is the evidence that V1b's exporter was written correctl
 
 ## spec
 
-- **§9.3, §9.4, INV-12.** Nothing is bypassed and nothing is disabled. The plane gains one input
-  it already has an API for (`observe_state`, and its doc comment says a caller that knows the real
-  pose calls it), and `validate` keeps its signature (INV-13). The only value that travels toward
-  the actuator is still the `SafeAction`; `action_commanded` is provenance on disk and is never
-  read back into a control path.
+- **§9.3, §9.4, INV-12.** Nothing is bypassed and nothing is disabled. The plane gains one call it
+  already has an API for — `observe_state`, once per episode, which its own doc comment says a
+  caller that knows the real pose makes before the first `validate` — and `validate` keeps its
+  signature (INV-13). The only value that travels toward the actuator is still the `SafeAction`;
+  `action_commanded` is provenance on disk and is never read back into a control path.
 - **§13.2.** A collected frame carries its provenance. `action_source` already said *how* the
   actuator value was produced; `action_commanded` says *what was asked for*, which is what makes a
   `Clamped` frame legible without re-running the plane.
@@ -118,11 +133,17 @@ cargo xtask ci
   must be inside the envelope; at least one `action_commanded` value must be outside it. A writer
   that clamped the provenance column, or recorded the command as the action, fails it.
 - `crates/es-data/tests/loop_learning.rs`: **`a_second_episode_repeats_the_first_exactly`** — the
-  episode-reset regression. The fixture's uniform reset draw is pinned to a constant and the
-  velocity envelope tightened, so two episodes of one run are physically identical; `action`,
-  `action_commanded`, `observation.state` and `action_source` must then be equal row for row.
-  **Measured to fail before this packet** (episode 1 continued from episode 0's last command,
-  `0.065` where episode 0 started at `0.005`).
+  plane half of the episode-reset regression. The fixture's uniform reset draw is pinned to a
+  constant and the velocity envelope tightened, so two episodes of one run are physically
+  identical; `action`, `action_commanded`, `observation.state` and `action_source` must then be
+  equal row for row. **Measured to fail before this packet** (episode 1 continued from episode 0's
+  last command, `0.065` where episode 0 started at `0.005`).
+- `crates/es-data/tests/loop_learning.rs`: **`frame_zero_is_not_a_hook_an_intervener_may_reset_on`**
+  — the expert half, and the one that matters. With a contract declaring one control tick of
+  inference latency, **no** call of the intervener has `frame == 0`, in any episode. That is the
+  assumption `es loop collect --expert` was built on, and the test states it as a property of the
+  collector rather than as a comment. The fixture declared `expected_latency_ms = 0.0`, which is
+  why V1's own oracle could not have seen it.
 - `crates/es-env/src/expert.rs`: `reset_restarts_the_ramp_from_the_measured_joints` — the expert
   side of the same boundary, which was already correct and is now pinned: after `reset` the first
   chunk is one `step_max` from the measured joints, not a continuation of the previous episode's
@@ -136,9 +157,13 @@ Reference — the oracle server (`ES_PYTHON`, `~/venvs/es-lerobot-cuda/bin/pytho
 
 ```
 cargo test -p es-data --test lerobot_v3 -- --ignored --nocapture      # RAN lerobot_v3_export
-cargo test -p es --test cli -- --ignored expert_solves_the_pinned_seeds
-es loop collect --expert so101-pick-place --episodes 3 --seed 1       # 3 successes, not 1
+cargo test -p es --test cli expert_solves_the_pinned_seeds            # 8/8, unchanged
+es loop collect --expert so101-pick-place --episodes 50 --seed 1      # 50 successes, not 1
 ```
+
+`expert_solves_the_pinned_seeds` is the guard that decides how much of the collect/eval asymmetry
+this packet may take on: its `0.875` threshold is a property of the expert and lowering it is
+editing a golden. Any change to when the collector seeds the plane must keep it at 8/8.
 
 **The measurement** (the point of plan V, oracle server, not a CI tier): re-collect 50 training
 episodes plus 5 held-out in **one** `es loop collect --episodes 50` command with frames,
@@ -181,8 +206,12 @@ info.json features:
   "action_commanded":  { "dtype": "float32", "shape": [nu] }   # new
 ```
 
-- `Collector::run` calls `planes[0].observe_state(&q, &qd)` with the backend's own joint state
-  before every `step_with_policy`, at the same point in the cycle `es_eval::runner` calls it.
+- `Collector::run` calls `planes[0].observe_state(&q, &qd)` with the backend's own joint state on
+  the first frame of every episode — "before the first `validate`", which is what the method's
+  documentation asks for. **Not** every step: that is `es_eval::runner`'s reading of the envelope,
+  it is a different reading, and adopting it here drops the expert to 2/8 on V1's own oracle.
+- `es loop collect --expert` resets the scripted expert on a change of **episode index**, never on
+  `frame == 0`.
 - `action` keeps its meaning and its bytes: `ep.ctrl`, which is `safe.q` copied by `emit_actions`
   and by `Env::step`. This packet does not change what `action` is; it makes what it is *true by
   construction* and pins it with an oracle.

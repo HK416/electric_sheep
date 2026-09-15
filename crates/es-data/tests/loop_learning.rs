@@ -1080,6 +1080,39 @@ fn the_dataset_records_the_executed_action_beside_the_raw_command() {
     );
 }
 
+/// The intervener hook runs inside `PolicyRuntime::infer`, which runs when a submitted
+/// observation is *released* — `expected_latency_ms` ticks later (§12.3). So `frame == 0` is
+/// **not** a hook an intervener may reset itself on: with any declared latency the first call of
+/// every episode is frame 1 or later, and a scripted driver keyed on frame 0 never resets at all.
+/// It looks correct only because a freshly constructed one starts reset, which is why
+/// `es loop collect --episodes N` solved episode 0 and nothing after it (design note section 7.6
+/// finding 5). `es loop collect --expert` keys on the episode index instead.
+#[test]
+fn frame_zero_is_not_a_hook_an_intervener_may_reset_on() {
+    let root = scratch("loop-latency-phase");
+    let mut b = bundle();
+    // One control tick of inference latency, which is what the demo's `learning.toml` declares.
+    b.learning.policy.contract.runtime.expected_latency_ms = 1000.0 / CONTROL_HZ as f32;
+    let mut seen: Vec<(u32, u32)> = Vec::new();
+    let mut record = |episode: u32, frame: u32, _: &ModelInfo, _: &[f64]| {
+        seen.push((episode, frame));
+        Intervention::Policy
+    };
+    collect_with(&root, &b, &mut record, None);
+
+    assert!(!seen.is_empty(), "the intervener was never called");
+    assert!(
+        seen.iter().all(|(_, frame)| *frame != 0),
+        "a declared latency must move the first call off frame 0: {seen:?}"
+    );
+    for episode in 0..2 {
+        assert!(
+            seen.iter().any(|(e, _)| *e == episode),
+            "episode {episode} never reached the intervener: {seen:?}"
+        );
+    }
+}
+
 /// The episode boundary carries nothing (spec 13.1). The fixture task resets to a constant, so
 /// with no randomization the second episode of one run is the first, row for row.
 ///
