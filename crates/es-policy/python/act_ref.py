@@ -78,11 +78,22 @@ def run(path, observation=None):
 
     stats = read_safetensors(path + "/model.safetensors")
     buffer = "normalize_inputs.buffer_" + camera.replace(".", "_")
+    if buffer + ".mean" not in stats:
+        # LeRobot 0.6.x's second checkpoint layout: normalization moved into a processor
+        # pipeline, whose state file `policy_preprocessor.json` names, keyed `<feature>.<stat>`
+        # with no prefix. Both layouts are read; `es_policy::lerobot` does the same.
+        pipeline = json.load(open(path + "/policy_preprocessor.json"))
+        step = next(s for s in pipeline["steps"] if s["registry_name"] == "normalizer_processor")
+        stats = read_safetensors(path + "/" + step["state_file"])
+        buffer, state, action = camera, "observation.state", "action"
+    else:
+        state, action = (
+            "normalize_inputs.buffer_observation_state",
+            "unnormalize_outputs.buffer_action",
+        )
     image_mean, image_std = stats[buffer + ".mean"], stats[buffer + ".std"]
-    state_mean = stats["normalize_inputs.buffer_observation_state.mean"]
-    state_std = stats["normalize_inputs.buffer_observation_state.std"]
-    action_mean = stats["unnormalize_outputs.buffer_action.mean"]
-    action_std = stats["unnormalize_outputs.buffer_action.std"]
+    state_mean, state_std = stats[state + ".mean"], stats[state + ".std"]
+    action_mean, action_std = stats[action + ".mean"], stats[action + ".std"]
 
     # The same observation the Rust side builds: either a recorded frame both sides read from
     # one file, or the fixed ramp (image in [0, 1), state in [-1, 1)).

@@ -220,6 +220,31 @@ fn pack(args: &[String]) -> Result<u8, CliError> {
     Ok(0)
 }
 
+/// The bytes of the preprocessor's `normalizer_processor` state file, when the checkpoint has
+/// one (`docs/api-notes/lerobot-act.md`: `LeRobot` 0.6.x's two checkpoint layouts).
+///
+/// `policy_preprocessor.json` names it, so the step index is read rather than guessed — it is
+/// `_step_3_` for ACT today and a pipeline change would move it.
+fn normalizer_state(dir: &str) -> Result<Option<Vec<u8>>, CliError> {
+    let Ok(raw) = std::fs::read_to_string(format!("{dir}/policy_preprocessor.json")) else {
+        return Ok(None);
+    };
+    let pipeline: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| CliError::Runtime(format!("{dir}/policy_preprocessor.json: {e}")))?;
+    let Some(name) = pipeline["steps"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|s| s["registry_name"] == "normalizer_processor")
+        .and_then(|s| s["state_file"].as_str())
+    else {
+        return Ok(None);
+    };
+    std::fs::read(format!("{dir}/{name}"))
+        .map(Some)
+        .map_err(|e| CliError::Runtime(format!("{dir}/{name}: {e}")))
+}
+
 /// `es policy import-lerobot` — a policy designed and trained outside, under our Deployment IR.
 ///
 /// The packet's whole point (`docs/packets/M5/V8-external-act.md`): spec 8 says "we do not
@@ -277,7 +302,12 @@ fn import_lerobot(args: &[String]) -> Result<u8, CliError> {
         )));
     }
 
-    let remapped = remap_checkpoint(&cfg, &original)
+    // LeRobot 0.6.x moved normalization out of `ACTPolicy` into a processor pipeline, so a
+    // checkpoint `lerobot-train` writes today keeps the statistics in a separate state file that
+    // `policy_preprocessor.json` names. An older checkpoint keeps them in `model.safetensors`
+    // and has no such file; both layouts load, and neither needs a flag.
+    let stats = normalizer_state(dir)?;
+    let remapped = remap_checkpoint(&cfg, &original, stats.as_deref())
         .map_err(|e| CliError::Runtime(format!("remapping the checkpoint: {e}")))?;
     let mut policy = act_policy(&cfg, dir, weights_hash(&original), weights_hash(&remapped))
         .map_err(|e| CliError::Runtime(format!("the checkpoint's config.json: {e}")))?;

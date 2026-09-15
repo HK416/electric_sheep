@@ -146,7 +146,22 @@ fn a_real_lerobot_act_checkpoint_reproduces_its_actions() {
     let original = std::fs::read(format!("{dir}/model.safetensors"))
         .unwrap_or_else(|e| panic!("{dir}/model.safetensors: {e}"));
     let source_hash = weights_hash(&original);
-    let remapped = remap_checkpoint(&cfg, &original).expect("the remap must produce safetensors");
+    // LeRobot 0.6.x's second checkpoint layout keeps the normalization statistics in a
+    // processor state file rather than in `model.safetensors`; both are read, neither is a flag.
+    let stats = std::fs::read_to_string(format!("{dir}/policy_preprocessor.json"))
+        .ok()
+        .and_then(|raw| {
+            let pipeline: serde_json::Value = serde_json::from_str(&raw).ok()?;
+            let name = pipeline["steps"]
+                .as_array()?
+                .iter()
+                .find(|s| s["registry_name"] == "normalizer_processor")?["state_file"]
+                .as_str()?
+                .to_owned();
+            std::fs::read(format!("{dir}/{name}")).ok()
+        });
+    let remapped = remap_checkpoint(&cfg, &original, stats.as_deref())
+        .expect("the remap must produce safetensors");
     let policy = act_policy(&cfg, &dir, source_hash, weights_hash(&remapped)).unwrap();
 
     let state_dim = cfg.state_dim().unwrap();
