@@ -579,11 +579,11 @@ impl Lowering {
                 self.needs_torchvision = true;
                 self.member(id, &format!("_backbone({name:?}, {out_dim})"));
                 self.claim(id);
-                // A torchvision backbone is `nn.BatchNorm2d` all the way down, and that
-                // refuses a 3-D input outright ("expected 4D input (got 3D input)"). The IR
-                // port is one image (spec 8.3 has no batch axis — spec 5.2 gives the
+                // The IR port is one image (spec 8.3 has no batch axis — spec 5.2 gives the
                 // inference domain its own batch size), so run it as a one-image batch, the
-                // same trade the token-less `TemporalEncoder` arm below makes.
+                // same trade the token-less `TemporalEncoder` arm below makes. The backbone
+                // needs that axis either way: torchvision's `_forward_impl` ends in
+                // `torch.flatten(x, 1)`, and `nn.GroupNorm` reads dim 0 as the batch.
                 Ok(format!("self.n{k}({}.unsqueeze(0)).squeeze(0)", args[0]))
             }
 
@@ -846,8 +846,16 @@ impl Lowering {
                 "\n\n\
                  def _backbone(name, out_dim):\n\
                  \x20   # Referenced, never re-implemented: torchvision is the provider.\n\
+                 \x20   # GroupNorm, not torchvision's default norm layer: this backbone is\n\
+                 \x20   # trained from scratch through a lowering that has no batch axis (spec\n\
+                 \x20   # 8.3), so a batch-statistics norm would fit N=1 statistics in train()\n\
+                 \x20   # and then use running ones in eval() -- a deployed function different\n\
+                 \x20   # from the trained one (design note section 7.21). GroupNorm has no\n\
+                 \x20   # training mode and no running buffers, so the two modes agree.\n\
                  \x20   import torchvision\n\
-                 \x20   m = getattr(torchvision.models, name)()\n\
+                 \x20   m = getattr(torchvision.models, name)(\n\
+                 \x20       norm_layer=lambda c: nn.GroupNorm(32, c)\n\
+                 \x20   )\n\
                  \x20   m.fc = nn.Linear(m.fc.in_features, out_dim)\n\
                  \x20   return m\n",
             );
@@ -961,6 +969,28 @@ mod tests {
         assert!(m.source.contains("[:20]"));
         assert!(m.source.contains("return {\"actions\": v5_actions}"));
         assert!(m.source.contains("import torchvision"));
+    }
+
+    /// Packet M5/V13. A from-scratch backbone is lowered with `GroupNorm`, which has no
+    /// training mode: `train()` and `eval()` are the same function, so what `train_act.py`
+    /// minimizes is what `torch_ref.py` deploys. `BatchNorm2d` was not — the lowering is
+    /// single-sample, so its statistics were fitted at N = 1 and replaced by running ones at
+    /// inference (design note section 7.21). No running-statistic buffer may survive either.
+    #[test]
+    fn a_from_scratch_backbone_has_no_training_mode() {
+        let m = lower_to_torch(&act()).unwrap();
+        assert!(!m.source.contains("BatchNorm"), "{}", m.source);
+        assert!(
+            m.source
+                .contains("norm_layer=lambda c: nn.GroupNorm(32, c)"),
+            "{}",
+            m.source
+        );
+        for key in m.weight_keys.iter().chain(m.weight_shapes.keys()) {
+            for stat in ["running_mean", "running_var", "num_batches_tracked"] {
+                assert!(!key.contains(stat), "contract declares `{key}`");
+            }
+        }
     }
 
     #[test]

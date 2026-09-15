@@ -817,3 +817,76 @@ with torch.inference_mode():
     out = next(iter(model(**inputs).values()))
 sys.stdout.write(json.dumps([float(v) for v in out.reshape(-1).tolist()]))
 "#;
+
+/// Packet M5/V13, the executable half of the fix: the lowered backbone has **no training
+/// mode**. `GroupNorm` normalizes over channel groups of the one sample in front of it, so
+/// `train()` and `eval()` are bit-for-bit the same function and no running-statistic buffer
+/// exists to drift. `BatchNorm2d` failed both halves: the lowering is single-sample (spec 8.3
+/// has no batch axis), so every one of the 20 layers fitted N = 1 statistics during training
+/// and then used running ones at inference — the train/deploy gap design note section 7.21
+/// measured at 0.011 vs 0.031 chunk L1.
+///
+/// Dropout inside `nn.TransformerEncoderLayer` is the remaining, intended train/eval
+/// difference — the three `nn.Dropout` members plus `MultiheadAttention`'s attention dropout,
+/// which is a float read off `self.training` rather than a module — which is why this asserts
+/// over the backbone rather than the whole module.
+#[test]
+#[ignore = "needs torch and torchvision"]
+fn the_backbone_computes_the_same_function_in_train_and_eval() {
+    let python = match python_with_torch() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP backbone_train_eval: {why}");
+            return;
+        }
+    };
+    let dir = scratch_dir("backbone-train-eval");
+    let (path, _) = demo_bundle(&dir);
+    let (build, _) = lowered(&dir, &path);
+
+    let script = dir.join("train_eval.py");
+    std::fs::write(&script, BACKBONE_TRAIN_EVAL_PY).expect("write the probe");
+    let out = run(
+        &python,
+        &[&script.to_string_lossy(), &build.to_string_lossy()],
+    );
+    println!("RAN backbone_train_eval: {}", text(&out).trim());
+}
+
+/// argv is `<module dir>`; exits non-zero with the offending keys or the deviation.
+const BACKBONE_TRAIN_EVAL_PY: &str = r#"
+import json, sys
+import torch
+module_dir = sys.argv[1]
+namespace = {}
+exec(compile(open(module_dir + "/es_policy.py").read(), "<es-policy>", "exec"), namespace)
+model = namespace["EsPolicy"]()
+
+stats = [
+    k
+    for k in model.state_dict()
+    if k.endswith(("running_mean", "running_var", "num_batches_tracked"))
+]
+assert not stats, "running statistics survived the lowering: %s" % stats[:4]
+
+backbones = [(n, m) for n, m in model.named_children() if type(m).__name__ == "ResNet"]
+assert backbones, "the demo graph has a VisionEncoder, so a backbone must be instantiated"
+
+shapes = json.load(open(module_dir + "/contract.json"))["inputs"]
+image = [s for s in shapes.values() if len(s) == 3][0]
+x = torch.rand([1] + image, generator=torch.Generator().manual_seed(0))
+for name, backbone in backbones:
+    with torch.no_grad():
+        model.train()
+        trained = backbone(x)
+        model.eval()
+        deployed = backbone(x)
+    assert torch.equal(trained, deployed), "%s: train() and eval() differ by %g" % (
+        name,
+        (trained - deployed).abs().max(),
+    )
+print(
+    "%d backbone(s) bit-identical in train() and eval() on %s, %d state_dict keys, "
+    "no running statistics" % (len(backbones), image, len(model.state_dict()))
+)
+"#;
