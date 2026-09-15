@@ -397,11 +397,27 @@ pub struct ExpertCfg {
     pub execute: u32,
 }
 
+/// The fraction of the Deployment IR's envelope the expert paces itself to.
+///
+/// Not "a tenth held back": the demo's SO-101 cannot *physically* deliver what its Deployment
+/// IR declares. `velocity_max = 3.0` rad/s and `acceleration_max = 20` rad/s^2 against a
+/// `forcerange` of 2.94 N*m means the arm has no braking authority left at the bottom of the
+/// descent, so at full pace the jaws overshoot the grasp pose by about 11 mm, hit the table
+/// and shove the cube out of reach. Until packet M5/V11 that never showed, because one control
+/// step was one 5 ms physics step and the arm was velocity-saturated the whole episode -- it
+/// could not track the ramp, so it could not overshoot it either.
+///
+/// Measured at the true 50 Hz on the eight pinned seeds (`expert_solves_the_pinned_seeds`,
+/// oracle server, mujoco 3.13): `0.9` scores 0/8, `0.75` 2/8, `0.6` 8/8, `0.5` 8/8, `0.35`
+/// 8/8. Half, for margin on both sides. This is a calibration of the *expert* against the
+/// scene's actuators; no envelope limit and no gate moved.
+const PACE: f64 = 0.5;
+
 impl ExpertCfg {
     /// Paces the expert to the envelope it will be driven through (`INV-12`: the
     /// demonstration obeys the Safety Plane rather than being corrected by it, and the plane
-    /// is still the only actuator path). A tenth is held back so nothing lands exactly on a
-    /// limit.
+    /// is still the only actuator path). `PACE` of the envelope, because the envelope is a
+    /// bound on the *command* and the arm is what has to follow it.
     ///
     /// `replan_every` is how many rows of each chunk actually execute before the caller asks
     /// for another one: `es loop collect` runs inference at the deployment's `rate.inference`
@@ -424,10 +440,10 @@ impl ExpertCfg {
         let accel = least(&s.acceleration_max) * dt * dt;
         let accel = accel.min(least(&s.action_rate.second_diff_max));
         if step.is_finite() {
-            self.step_max = 0.9 * step;
+            self.step_max = PACE * step;
         }
         if accel.is_finite() {
-            self.accel_max = 0.9 * accel;
+            self.accel_max = PACE * accel;
         }
         self.horizon = deploy.action.horizon as u32;
         self.execute = replan_every.max(1);
