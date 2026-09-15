@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use es_assets::scene::SceneDesc;
 use es_compile::{PolicyBundle, Tensor};
 use es_env::scheduler::BatchDomains;
+use es_env::traj::Trajectory;
 use es_env::{DomainRunner, Env, Termination};
 use es_ir::learning::{ChunkBlendPolicy, LearningGraph, LearningNode};
 use es_ir::types::ElemType;
@@ -196,6 +197,10 @@ pub struct CollectSpec<'a> {
     /// Episode step budget; `0` uses the task's own `max_episode_steps`.
     pub max_steps: u32,
     pub out_root: &'a Path,
+    /// Where to write each episode's `.estraj` state trajectory (`es_env::traj`, packet
+    /// M5/V9). `None` writes none. Not inside the `LeRobot` dataset's own files: nothing in
+    /// `dataset_content_hash` or `dataset_schema_hash` moves because of it.
+    pub traj_dir: Option<PathBuf>,
 }
 
 /// What one collect run produced.
@@ -417,6 +422,7 @@ impl Collector {
         let mut rendered = 0u64;
 
         for index in 0..spec.n_episodes {
+            let mut traj = spec.traj_dir.as_ref().map(|_| Trajectory::new(env.model()));
             let mut sources: Vec<i64> = Vec::with_capacity(max_steps as usize);
             let mut commanded: Vec<f64> = Vec::with_capacity(max_steps as usize * NJ);
             let mut human = vec![false; max_steps as usize + latency + execute + 1];
@@ -460,6 +466,13 @@ impl Collector {
                 }
                 let after = counters_of(&planes[0]);
                 sources.push(classify(before, after, human[frame as usize]).as_i64());
+                // The same state, per control step, as the `.estraj` trajectory `es video
+                // showcase` replays (packet M5/V9). Written whether or not pixels are, and
+                // taken at the frame sink's own tick so the two indices agree.
+                if let Some(t) = traj.as_mut() {
+                    let state = env.backend().state();
+                    t.push(env.model(), &state, 0).map_err(|e| bad(&e))?;
+                }
                 // One frame per control step, from the state the step ended in — the same
                 // state the row above recorded.
                 if let Some(sink) = frame_sink.as_deref_mut() {
@@ -496,6 +509,10 @@ impl Collector {
                 episode.termination = Termination::Failure;
             }
             terminations.push(episode.termination);
+            if let (Some(dir), Some(t)) = (spec.traj_dir.as_ref(), &traj) {
+                t.write(&dir.join(format!("ep-{index:03}.estraj")))
+                    .map_err(|e| bad(&e))?;
+            }
             runner.reset_env(0);
             // Clears the latch *and* re-arms the seed, so the next episode's first
             // `observe_state` puts the command chain back on the arm (packet M5/V6).

@@ -2603,6 +2603,183 @@ Monthly  gate check, specification update
 
 Effective parallelism: type A 4–8 / B 2–3 / C 1 / D 1 per day.
 
+### 28.9 After M5 — Assessment and Improvement Plan
+
+M5's vertical slice (plan V) was the first run of the whole `collect → bake → train → eval → video`
+cycle in one pass. This subsection feeds what it exposed back into the specification. The evidence
+is the as-built record `docs/design/visible-learning.md` 7.4–7.14 and its open questions 11–15,
+`docs/packets/M5/V0…V7a`, `docs/reviews/M0`–`M4` and `M3-W1`, and the 2026-09-15 measurements on
+the oracle server (RTX 4090). Gates are referenced by their §28.7 number and risks by their §29
+row rather than restated here. Every number that is not a measurement is marked
+`Target / Status: unverified`, and performance is stated only through the nine metrics of §12.4
+(no single `step/s` figure).
+
+In one paragraph: **the plumbing works, the policy still cannot do the task, and that fact only
+became believable after the harness had been fixed three times.** The five IRs, the hash chain, the
+Safety Plane and the Evaluation IR all ran end to end in the demo, and everything the collect and
+train paths produced (50 demonstrations, the loss curves, `observation_hash`, `lowering_hash`,
+`dataset_schema_hash`, the checkpoints) still stands. What was invalidated is the evaluation numbers
+alone (visible-learning.md 7.13), and that is what 1, 2 and 3 below are about.
+
+**1. What is lacking**
+
+| # | Item | Spec | As built |
+|---|---|---|---|
+| L1 | Real robot | §28.7 gates 14/15/16, §24.2 | There is no robot cell. HIL proves the host-side half only (`tests/fixtures/hil/v1_small.eshil` replays identically), and cameras are covered as far as the ROS 2 message boundary through fixture goldens. §29's "Safety Plane requirements do not match the real robot" row is still open |
+| L2 | Policy capability (vision) | the demo `evaluation.toml`'s `success_rate >= 0.5` | Re-measured after every harness fix: **0/16** nominal, **0/96** across the six suites (50 demos, 96×96, from scratch, 20,000 steps; visible-learning.md 7.12 phase 2) |
+| L3 | Policy capability (privileged state) | same | V7a phase 2 measured (2026-09-15): at 20,000 steps nominal **0/16 and 1/16** (two independent runs), 5,000 steps 1/16, six suites **4/96**. Every episode times out at 900 steps and `violation.position` is the largest bucket. `envelope_violation_rate` falls from 0.985 at 1,000 steps to 0.15 at 20,000 — the policy gets smoother as it trains and still never bins the cube (visible-learning.md 7.15). **Stop rule fired**: the next suspect is not model size or schedule length but the physics, the contact model or the expert's trajectories. Before that investigation, rung 3 (V8) is the control experiment — if a verified design trained by a verified trainer also fails, the data, physics or expert are at fault; if it succeeds, our variant was |
+| L4 | Oracle-first | §1.4 | Three harness defects were found **after** training finished: collector and evaluation disagreed on what the envelope is measured against (V6), evaluation had no chunk buffer and no temporal ensemble and a seed off-by-one (V6b). Before those, the scripted expert itself scored 0/16 through the harness. The missing oracle was one line: "the harness must pass the expert" |
+| L5 | What the evaluation gate is pinned to | §9.4, §10.3 | Through the fixed harness the expert passes 8/8, but its `envelope_violation_rate` is 0.4815–0.5485. The test gate was re-pinned from `< 0.02` to the Deployment IR's own watchdog `max_frac = 0.9` (visible-learning.md 7.13). The argument that §9.4 acts on that number is recorded, but **0.9 is wide enough to catch no policy regression at all.** Whether that is a silent widening is left as a human decision |
+| L6 | Safety limits | §9.3 table | `ee_velocity_max`, `contact_force_max`, `min_self_distance` and `min_env_distance` are declared in `tests/fixtures/visible-learning/deployment.toml` and **not enforced** by `es-safety` — the plane has no forward kinematics and no contact query. They are documented limits, not live ones |
+| L7 | Inference latency | §8.6, §9.2 | Evaluation models no latency (collection models one tick). The Deployment IR has no latency field and `Evaluation::run` is not given the Learning IR |
+| L8 | Physics and render backends | §4.3, §17.2, §15.3 | The backend is a Python subprocess speaking line-JSON and holds one env. `es eval run` uses `MuJoCoCpuBackend` only. The MJWarp and Newton adapters were verified at M4 but are not wired into the demo path. Rendering uses the raster path, §15.3's default, so M4's PT/ReSTIR/SVGF work contributes nothing to this demo |
+| L9 | Inference without Python | §2.4 | Both training and evaluation infer through a torch subprocess. The ONNX and Vulkan slots of `InferenceBackend` are reserved by name only |
+| L10 | Determinism | §3.5 | On the real MuJoCo/torch CPU stack `--jobs 1` and `--jobs 6` are not bit-identical (6 of 24 cells differ in histograms and episode length; `success_rate` and `envelope_violation_rate` are identical in every cell) — a consequence of `MuJoCoCpuBackend`'s declared tier 3, not a defect in the merge. CUDA training does not reproduce run to run, and `--resident-gpu` is bit-identical on CPU only |
+| L11 | Build reproducibility | §5.3's `compiler_hash` | `Cargo.lock` is in `.gitignore` and untracked. The hash chain claims a compiler while the dependency set is not pinned |
+| L12 | Privileged observation | §5.1, §7.4 | The `sim_` prefix is a convention with no validator. A Deployment IR in `Real` execution mode referencing a channel no robot can supply is stopped only by a human reading the port name (open question 14) |
+| L13 | Pretrained backbone | §8.3 | `pretrained = true` is refused by lowering. There is no path that loads pretrained weights at all. Owner decision on §29's licensing row (2026-09-15): torchvision's ImageNet ResNet18 weights (BSD-3) are allowed for the demo — rung 3 (V8) is the first to use them, through LeRobot ACT's defaults |
+| L14 | Context budget | §1.5 | `es-ir` is at 5,947 lines against a 6,000 target. Any improvement that touches the IR (delta action space, a provenance validator, widening `TemporalEncoder`) needs a split packet first |
+| L15 | CI stability | §26.2 | `es-telemetry`'s `transport::a_connection_past_max_clients_is_refused` fails intermittently under load on Windows. A refusal must also be accepted as ECONNRESET |
+| L16 | Shape of the record | §1.2 | The as-built record lives in one 1,300-line design note. This subsection is the first step of distilling it |
+| L17 | How gate 7 is judged | §28.7 gate 7 | The demo is SO-101 cube-into-bin, not a Franka with two RGB views. Whether gate 7 is recorded as met with the substitution named, or stays open as written, is undecided (visible-learning.md open question 9) |
+
+**Three rules this subsection fixes.** The rest is left to human judgement, but these three were
+paid for by M5 and therefore become specification.
+
+1. **A vertical slice carries the oracle "the harness passes the expert" before it trains anything**
+   (§1.4). If the scripted expert — not a policy — cannot be driven through the same evaluation
+   path, the same plane and the same success predicate, then every training number afterwards
+   measures the harness rather than the policy. M5 learned this late three times.
+2. **An invalidated measurement is marked invalid, never deleted.** The tables of 7.8–7.11 are still
+   there and 7.13 wrote the reason for their invalidity above them. A number that disappears gets
+   rediscovered; a number carrying its invalidation does not.
+3. **No performance claim rests on a metric that does not reproduce** (§12.4). If a metric depends
+   on a per-worker clock, the report does not even declare it until it is fixed.
+
+**2. Where the wall-clock goes**
+
+The cycle is measured (visible-learning.md 7.11 and 7.14, `docs/packets/M5/V5-fast-cycle.md`;
+oracle server, 2026-09-15).
+
+| Phase | Measured | Cause |
+|---|---|---|
+| nominal, 16 episodes | 4:16.49 / 4:16.68 (two independent runs, `report.json` and every frame byte-identical to each other) | a physics subprocess holding one env |
+| 6 suites, 96 episodes | 25:56 sequential → **5:49** with `--jobs 6` | cell-level sharding. Before the per-shard BLAS/torch thread caps it was *slower* than sequential, projected past four hours (~90 threads on 16 cores, load ~47) |
+| training, 20,000 steps at batch 8 | 10:53 default / 10:57 `--resident-gpu` / 12:53 bf16 / **10:00** `--compile` | no knob moves it much on an RTX 4090. At batch 8 the module runs one sample at a time, so it is kernel-launch bound |
+| training, batch 64 with linear lr scaling | 1:24:31, `final_loss` **NaN** | the linear-scaling convention does not hold for this model on this 50-episode dataset |
+
+What would remove each, and what it is worth:
+
+- **Remove the per-sample loop in the batch lowering.** This is the root cause of the training
+  time, and none of `--resident-gpu`, bf16 or `--compile` touched it. `Target / Status: unverified`.
+- **Large batches with warmup and an lr schedule.** Linear scaling was measured to diverge, so what
+  is needed is a schedule, not a convention. `Target / Status: unverified`.
+- **Episode-level sharding.** Blocked today by `es-env`'s episode counter — episode 5's initial
+  state is not reproducible without having run episodes 0..4. With a seek, the single-cell nominal
+  run parallelizes too.
+- **An in-process, multi-env physics backend.** The only lever that pays on the collect and the
+  evaluation path at once, and the adapters already exist (L8).
+- **Leave the frame path alone.** Raw `.bin` writes and the `cv2` mosaic are not the dominant term.
+- **The collect and bake phases have no wall-clock on record yet.** What is missing from the table
+  above is unmeasured, not fast. The next server run takes them in the same format.
+  `Target / Status: unverified`.
+
+**The limits of the measurement are themselves an optimization target.** Of §12.4's nine metrics,
+`physics_steps_per_sec` and `actions_per_sec` divide each worker's own clock under sharding and do
+not reproduce. The demo's `evaluation.toml` declares neither, but claiming throughput requires
+fixing them first.
+
+**Stop rule.** Once one cycle (collect, bake, train, eval) is under 30 minutes, stop the speed work.
+The largest remaining measured term is training at roughly 11 minutes, and below that the
+bottleneck is judgement rather than the machine.
+
+**3. Accuracy levers**
+
+(a) What would make a learned policy actually succeed, ordered by information per hour:
+
+| Rank | Lever | Why |
+|---|---|---|
+| 1 | Read V7a's privileged state policy result first | If a policy handed the cube's exact pose fails, the remaining suspects are the physics and the expert, not the graph. One experiment separates two questions |
+| 2 | 200–500 demonstrations, 224×224 or a wrist camera | Finding a 25 mm cube in 96×96 from scratch is the problem the current vision policy is solving |
+| 3 | A pretrained visual backbone | Needs `pretrained` support in lowering plus safetensors weights first (L13); rung 3 (V8) sidesteps this through the LeRobot checkpoint loader |
+| 4 | Teacher (privileged state) → student (vision) distillation | The remaining path if 1 passes and 2 fails |
+| 5 | Chunk 50 with the temporal-ensemble decay tuned to the envelope | Even the expert produces a 0.48–0.55 violation rate through the blend. A policy being clamped is not the policy's problem alone |
+| 6 | Training-time augmentation reusing the existing perturbation kernels | `light_intensity` and `light_direction` already run in evaluation; using them in training makes the evaluation suite the training distribution |
+| 7 | 100,000 steps with a warmup schedule | Only meaningful after 2 and 3. At 20,000 steps `final_loss` is already 0.0179 |
+| 8 | Smoother expert pacing that survives the blend | The pacing uses 90 % of each limit today, and the blend jitter eats the remaining 10 % |
+
+(b) What would make the measurements trustworthy:
+
+- **Model inference latency in evaluation** (L7). Evaluation is one tick better off than collection.
+- **More held-out seeds and per-metric confidence intervals.** Over 16 episodes the difference
+  between 0/16 and 1/16 is noise — V3, V2b and V1c oscillating between 0.0625 and 0.1250 is the
+  example, and V6b invalidated all of those numbers.
+- **Carry the expert as a control group in every evaluation report.** With the expert's own success
+  rate and violation rate beside the policy's, on the same seeds and the same suites, the table
+  itself says whether a number is the harness's doing or the policy's.
+- **Break the clamps down per stage and per joint.** `events.json` already carries it: nominal is
+  `violation.position` 2,031 against `acceleration` 843 and `velocity` 439, and the gripper joint
+  as the likely tenant is recorded only as a hypothesis.
+- **Pin "the harness passes the expert" as a prerequisite oracle of every vertical slice** (L4).
+  §1.4 already required it.
+
+**Stop rule (accuracy).** If levers 2 and 3 are both spent — 500 demonstrations, 224×224, a
+pretrained backbone — and nominal is still 0/16 while the privileged state policy passed, the answer
+is neither more data nor a bigger model. What is left is the mapping from observation to action, and
+the next move is lever 4 (distillation). Conversely, if even the privileged state policy is 0/16,
+levers 2, 3 and 4 are all skipped: L3's stop rule already names the suspects for that case.
+
+**4. The plan (packet ladder)**
+
+Each row is one §1.2 packet and each oracle is a runnable one-liner. The order follows information
+content and blocking relations.
+
+| Rank | Packet | Question it answers | Oracle (one line) | Type |
+|---|---|---|---|---|
+| 1 | **V7a phase 2** (done) | Can this graph do the task when the observation contains the answer | `es eval run` over 16 nominal seeds → `success_rate` in `report.json` (stop rule L3) | D |
+| 2 | **M5-R1 harness-first rule** | How does the same defect stop being found after training | A new vertical-slice packet's acceptance names the expert-through-harness test | A |
+| 3 | **V8 external ACT** | Does a policy designed and trained outside (LeRobot ACT, `lerobot-train`) succeed on the same demonstrations through the same harness — and does our runtime reproduce it identically | v3.0 export (+`meta/stats.json`) → `lerobot-train` → the `lerobot.rs` loader → gate-5-style bitwise equality → `es eval run` nominal `success_rate` (the demo's acceptance of 0.5, unchanged) | D |
+| 4 | **V9 showcase render** | Is there a video a person can watch | Replay-rendering the recorded state trajectory at the observation resolution is bit-identical to the recorded frames, and a 1280×720 H.264 mp4 comes out (the expert's 8/8 first) | B |
+| 5 | **Latency in evaluation** | Do evaluation and collection share one time contract | `cargo test -p es-eval`: with a declared latency, tick 0 is a chunk underrun | B |
+| 6 | **Re-pin the demo acceptance** | If not 0.9, what catches a policy regression | `es eval run` passes the expert and fails a policy whose violation rate exceeds the expert's worst | C |
+| 7 | **Commit `Cargo.lock`** | Does `compiler_hash` reproduce a build | `cargo xtask ci` checks the lock file and a `--locked` build | A |
+| 8 | **The telemetry flake** | Is CI green under load | `cargo test -p es-telemetry transport` passes 100 repeats | A |
+| 9 | **Vectorize the batch lowering** | What dominates training time | A 40-step loss curve byte-identical to the current path at lower wall-clock | B |
+| 10 | **`Env` episode seek** | Is episode-level parallelism possible | State after a seek is bit-identical to replaying 0..n | B |
+| 11 | **Wire MJWarp into evaluation** | Is the backend really replaceable | `es backend compare --backends mjwarp,mujoco-cpu` reports max \|dqpos\| and both reports judge the same | C |
+| 12 | **The unenforced safety limits** (L6) | Are the declared limits alive | `cargo test -p es-safety`: a command past the EE velocity limit is counted `Clamped` (INV-12 — widen, never disable) | B |
+| 13 | **Inference without Python** | Does the deployment path run without Python | Tier-4 equivalence (§8.9) with the torch path on the same checkpoint | C |
+| 14 | **Split `es-ir` → provenance validator** | Can a privileged channel leak onto a real robot | A `Real`-mode Deployment IR plus a `sim_` channel is a validation error | C |
+| 15 | **M5 review and distilling the design note** | Has the record come back into the specification | `docs/reviews/M5.md` exists and `cargo xtask check-spec-refs` passes | A |
+
+**What is not on the ladder, and why.** The native physics solver stays cut as §1.9 reduction 1, and
+rungs 12 and 14 stand in its place — what is needed now is not a new solver but a verdict on the
+contact model of the solver already in use. The PT/ReSTIR render path (§1.9 reduction 2) does not
+enter the policy's observation: there is no evidence that a 96×96 raster image is what blocks the
+policy. Rung 4's showcase render, however, is an offline replay of recorded trajectories, so PT can
+be used there for the first time as soon as it runs headless on the server. Editor and authoring
+work is absent — not one defect M5 exposed had a UI as its cause. Rungs 1, 2, 4, 6, 7 and 8 wait on
+no single human's judgement and can start in parallel (§28.8, types A and B); 3, 13 and 14 each wait
+on the row above them or on a split packet.
+
+**M6 is the second track: quadruped locomotion (owner decision, 2026-09-15).** The demo's purpose
+is to show "learning visibly worked" to a person, and the project's claim is "a policy designed and
+trained outside runs in our runtime with the same semantics" (§8, §1.9). Once rung 3 (V8) proves
+that with imitation learning on an arm, M6 proves the same claim again with an entirely different
+policy family and morphology: a MuJoCo Playground Go1/Go2 joystick policy trained by *their* PPO
+trainer (we build no RL trainer), its MLP imported into the Learning IR, run on our MuJoCo CPU
+backend under our Safety Plane and perturbation suites (pushes, friction, payload), and rendered by
+rung 4's showcase. Prerequisite packets: a primitives-only derivative of the quadruped model (our
+loader rejects `mesh` geoms), the observation stack expressed through the Observation IR's history
+window, a parity oracle between the training environment and our physics (both backends on the
+same XML, §17.2), and export of the observation-normalization parameters. Research digest:
+`docs/api-notes/mujoco-playground-quadruped.md`. The real-robot gates 14/15/16 stay open until a
+robot cell exists. If even rung 3 (V8) fails, a **physics, expert and action representation**
+investigation is inserted before M6: contact-model verification (judged by §17.2's backend
+comparison), a delta action space (§8.5, preceded by the `es-ir` split), and a redesign of the
+expert's trajectories. Either way, rungs 2, 5 and 6 of the ladder come first — if the harness
+cannot be trusted, neither conclusion is a measurement.
+
 ---
 
 ## 29. Risks
@@ -2615,7 +2792,7 @@ Effective parallelism: type A 4–8 / B 2–3 / C 1 / D 1 per day.
 | Weak oracle approves an incorrect implementation | High | §1.4. Secure PyTorch · MuJoCo · MPFR references. Infrastructure first via gate 1 |
 | **Vision bandwidth · VRAM limits scale** | Medium | §12.2 round_robin, §20 budget model, precompute then reject |
 | **Policy inference latency dominates the control cycle** | Medium | §8.4 LRN-052 compile check, §8.6 asynchronous chunks, ACT-class priority |
-| Pretrained backbone license | Medium | §25.2. `base_model.lock` + check at deployment |
+| Pretrained backbone license | Medium | §25.2. `base_model.lock` + check at deployment. Decision 2026-09-15: torchvision ImageNet ResNet18 (BSD-3) allowed for the demo (§28.9 L13) |
 | **3DGS alignment quality is insufficient** | Medium | §1.9 reduction #3. Replaceable with external tools + manual import |
 | Backend semantic mismatch | Medium | §17.2 comparison tools, block execution on error |
 | Integration consistency collapse across sessions | Medium | `AGENTS.md` layer, weekly audit |
