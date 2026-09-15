@@ -771,7 +771,7 @@ fn resident_gpu_does_not_move_the_loss() {
         "the loss never moved at all: {losses:?}"
     );
     assert!(
-        resident_report.contains("\"resident_gpu\":true"),
+        resident_report.contains("\"resident_gpu\": true"),
         "the report must record the mode it ran in: {resident_report}"
     );
     println!(

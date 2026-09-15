@@ -1230,18 +1230,115 @@ plan에 있다). **그래서 `--jobs N`은 셀을 라운드로빈으로 분할�
 `--batch`는 위 숫자들의 재현성을 위해 8로 유지한다. 올릴 때의 문서화된 관례는 `--lr` 선형 스케일링이다
 (`--batch 32 --lr 4e-4`).
 
-**6. 아직 측정하지 않은 것.** 이 섹션의 모든 시간 주장은 2단계, 오라클 서버에서 한다.
+**6. 측정 결과 (2단계), 오라클 서버, 2026-09-15.** 아래 모든 실행 전에 `nvidia-smi`는 사용률
+0% / 사용 메모리 55 MiB를 보였다. 16코어 박스는 다음 항목에서 스스로 그렇게 만든 경우를 빼면 그
+외에는 유휴 상태였다. V1c의 `trained-20000.esb`, `build/`, `baked/`(섹션 7.10)가 아래 모든 행의
+픽스처이며, 여기서 섹션 7.9나 7.10이 기록한 어떤 수치도 움직이지 않았다.
 
-| 항목 | Target | Status |
+| 항목 | Target | Observed |
 | --- | --- | --- |
-| 6 스위트 96 에피소드 실행, `--jobs 6` | 28분에서 약 5-6분 | **unverified** |
-| 그 `report.json` / `events.json`의 순차 실행 대비 | 바이트 동일 | **unverified** |
-| 배치 8로 20,000 스텝, `--resident-gpu` | 11분보다 빠르게 | **unverified** |
-| 같은 조건에 `--amp bf16` | 더 빠르게, 비트는 다름 | **unverified** |
+| 6 스위트 96 에피소드, 순차 (`--jobs 1`) | 28분 (V3 기준선) | 25:56 (같은 설정의 이전 실행, 이후 덮어써짐, 25:52 -- 일치) |
+| 6 스위트 96 에피소드, `--jobs 6`, 아래 수정 전 | 약 5-6분 | 끝까지 돌리지 못함: 순차의 초당 ~55프레임 대비 합산 초당 ~5프레임, 85분에 96개 중 35개 셀, 끝까지 기다리지 않고 종료(4시간 이상으로 투영됨) |
+| 6 스위트 96 에피소드, `--jobs 6`, 아래 수정 후 | 약 5-6분 | **5:49** |
+| nominal 단독, 16 에피소드, 순차, 독립된 두 번 실행 | 약 5분 | 4:16.49 / 4:16.68, 서로 바이트 동일(`report.json`과 모든 프레임) |
+| `report.json` / `events.json`, `--jobs 1` 대 `--jobs 6`(수정 후) | 바이트 동일 | 실제 백엔드에서는 비트 동일하지 않음 -- 아래 참조; `FakeBackend` 오라클은 바이트 동일 유지 |
+
+nominal 단독 설정은 스위트가 하나뿐이다. `crates/es/src/cmd/eval.rs`는
+`a.jobs.min(eval_ir.suites.len().max(1) as u32)`로 제한하므로 그 위에서 `--jobs 6`은 구조적으로
+`--jobs 1`로 실행된다 -- 별도로 시간을 잰 실행이 아니라 그 제한 코드를 읽어서 확인한 사실이다.
+
+**첫 `--jobs 6` 실행은 순차보다 5배 *느렸다*.** 각 샤드는 같은 바이너리를 다시 호출한 것이고
+(`spawn_shards`), 각 샤드 자신의 `TorchRuntime` 서브프로세스는 스레드 풀을 박스의 모든 코어로
+기본 설정한다. 16코어에 그런 여섯 개가 한꺼번에 약 90개의 OS 스레드를 원했고(서브프로세스당
+`nlwp` 23을 직접 측정), load average는 ~47을 유지했으며, 박스는 계산이 아니라 컨텍스트 스위칭에
+시간을 썼다 -- 85분에 96개 중 35개 셀, 끝나려면 4시간을 넘길 것으로 투영됐다.
+`crates/es/src/cmd/eval.rs`에서 수정: 이제 `spawn_shards`는 호출자가 이미 export하지 않은 경우에
+한해(`shard_thread_env` -- passthrough가 우선) 각 샤드의 `OMP_NUM_THREADS` / `MKL_NUM_THREADS` /
+`OPENBLAS_NUM_THREADS` / `TORCH_NUM_THREADS`를 `cores / jobs`(`shard_thread_cap`)로 설정하며,
+둘 다 실제 서브프로세스를 띄우지 않고 유닛 테스트된다. 수정 후 여섯 샤드는 각각 스레드 2-3개
+(`nlwp` 3, 각 ~136% CPU)를 측정했고 load average는 ~5.5로 떨어졌으며, 실행은 5:49에 끝났다 --
+패킷이 목표한 범위 안이고, 그 사이 박스에서 달라진 다른 것이 없다는 점은 전후의
+`nvidia-smi`/`uptime`으로 확인했다.
+
+**그 수정은 실제 백엔드의 바이트 동일성을 대가로 치르며, 이 패킷의 forbidden 목록은 그것을 여기서
+닫도록 두지 않는다.** `sharding_the_cells_produces_a_byte_identical_report`(`FakeBackend`, 실제
+부동소수점 없음)는 수정 후 재검증해도 여전히 바이트 단위로 통과한다. 그러나 실제 `mujoco-cpu` +
+`torch` 스택에서는 `--jobs 1`의 자체 서브프로세스는 (이 패킷 이전과 마찬가지로) 제한되지 않은 채
+남아 있는 반면 `--jobs 6` 샤드는 이제 `cores/jobs` 스레드로 제한된다 -- `--jobs 1`이 쓰는 것과
+다른 스레드 수이고, CPU 스레드 리덕션은 정확히 결합법칙을 만족하지 않는다. 측정 결과: 병합된
+report의 24개 셀 중 6개가 다르다 --
+
+| | `--jobs 1` | `--jobs 6`(수정 후) |
+| --- | --- | --- |
+| `light_intensity` `episode_length` | 845.3125 | 845.25 |
+| `nominal` `failure_mode_histogram` `violation.position` | 2,592 | 2,430 |
+| `light_intensity` `failure_mode_histogram` `violation.position` | 1,677 | 1,936 |
+
+-- 그리고 `success_rate`와 `envelope_violation_rate`는 24개 셀 전부 동일하며, 에피소드 후반부에서
+어떤 스텝의 위반 분류가 뒤바뀐 뒤로 소수의 개별 프레임이 다르다. 수정 탓으로 돌리기 전에 분리해서
+확인했다: 같은 nominal 단독 설정의 독립된 두 `--jobs 1` 실행은 서로 바이트 동일하고(위 표, 프레임
+포함 -- 실행마다 달라지는 고유한 비결정성을 배제), `--jobs 1` 실행 전에 `OMP_NUM_THREADS=16`(이
+박스의 코어 수)을 명시적으로 export해도 설정하지 않은 기본값 실행과 바이트 단위로 동일하다
+("명시적 대 기본값"이 변수라는 가설을 배제) -- 즉 divergence는 프로세스 분리가 아니라 스레드
+*수*를 따라간다. 이는 `MuJoCoCpuBackend` 자신이 선언한 `DeterminismTier::PhysicsMeaning`(섹션 9:
+tier 3, 비트 단위 아님)과 CPU 스레드 커널 일반의 하류 결과이지, 병합/샤딩 로직의 결함이 아니다.
+이를 닫으려면 `--jobs 1` 자체의 스레드 수도 제한해야 하는데, 이미 커밋된 V1c/V2b/V3 수치를 건드릴
+위험 없이 이 패킷이 그 값을 고를 근거가 없다 -- forbidden. "수정됨"이 아니라 실제 백엔드의 문서화된
+기존 한계로 남긴다.
+
+**학습, V2의 노브, 다섯 행 전부, `--checkpoint-at 20000`으로 20,000 스텝:**
+
+| 플래그 | 실제 시간 | `initial_loss` | `final_loss` |
+| --- | --- | --- | --- |
+| (a) 기본값 | 10:53.07 | 0.066787 | 0.017945 |
+| (b) `--resident-gpu` | 10:57.00 | 0.066568 | 0.017749 |
+| (c) `--resident-gpu --amp bf16` | 12:53.49 | 0.066955 | 0.018015 |
+| (d) `--resident-gpu --compile` | 10:00.07 | 0.066878 | 0.017895 |
+| (e) `--resident-gpu --batch 64 --lr 8e-4` | 1:24:31 | 0.050043 | **NaN** |
+
+(a)와 (b)는 `--device cuda`에서 비트 동일하지 **않다**: `cmp`는 `--loss-curve`와 체크포인트
+양쪽에서 다르다고 판정하며, 두 번째 옵티마이저 스텝부터 갈라진다(첫 스텝은 둘 다
+0.4806089662...로 일치; 두 번째는 0.48060897 대 0.48060090으로 상대 차이가 약 1e-5이며 그
+뒤로 커진다). 이는 평범한 CUDA 커널/알고리즘 선택 비결정성이다 -- `train_act.py`는
+`torch.use_deterministic_algorithms`를 설정하지 않으며, resident 텐서의 다른 메모리 레이아웃은
+매번 복사되는 텐서와 다른 cuDNN/cuBLAS 커널을 고를 수 있다. 설계 노트와 패킷의 "비트 동일" 주장은
+유닛 오라클이 실제로 검사하는 장치(CPU, 아래 7번 항목)에서는 정확하고 CUDA에서는 성립하지 않는다.
+둘 다 화해시키지 않고 그대로 기록한다. 화해시키는 일은 이 패킷 밖이다(`train_act.py`에 결정성을
+강제하는 코드를 추가하는 것도, 이 패킷의 forbidden 목록 밖에 있는 수치를 움직이는 것도 여기서 할
+수 없다).
+
+(c)는 (a)/(b)보다 **느리다**, 빠르지 않다: `--batch 8`에서는 모듈이 샘플을 한 번에 하나씩
+처리하므로(섹션 7.11의 5번 항목) forward 하나하나가 작아서 연산량이 아니라 실행 오버헤드에
+지배되고, bf16 autocast의 연산당 오버헤드가 거기서는 본전을 뽑지 못한다. (d)는 소폭 더 빠르다
+((a)/(b) 대비 약 8%) -- `torch.compile`의 융합은 이 규모에서도 무언가 할 일이 있고, 웜업 비용이
+160,000번의 forward/backward 호출에 걸쳐 상각된다. (e)는 같은 20,000 스텝에 대해 문서 자체의
+`--batch N` / `--lr` 선형 스케일링 관례(`--batch 64`, 8배, `--lr 8e-4`, 8배)를 그대로 따랐고
+`NaN`으로 발산했다. 이 배수에서, 이 모델과 이 50 에피소드 데이터셋에는 그 관례가 성립하지 않는다는
+발견이며, (e)가 (a)-(d)와 동등하다는 주장이 아니다(§12.4: 여기서 (e)를 `step/s` 수치나 권고로
+인용하지 않는다).
+
+**7. `cargo test -p es-policy --test ir_training -- --ignored --nocapture`, `ES_PYTHON`을 CUDA 학습
+venv로 지정, 서버 트리에서:**
+
+```
+RAN act_training_uses_baked_observations: loss 0.4456 -> 0.1828 over 40 steps (0.410x), chunk
+  [10, 6], max_abs vs a direct forward 0e0 (tol 1e-5), observation_hash
+  f4a50730ac95b91734c9678e75d9e6bc1845578bc2985e45b409e80f3355f6e0, torch 2.11.0+cu129
+RAN resident_gpu_does_not_move_the_loss: 40 bit-identical steps, 825 bytes of curve
+```
+
+`resident_gpu_does_not_move_the_loss`는 먼저 수정이 하나 더 필요했다: 마지막 assertion이 리터럴
+부분 문자열 `"resident_gpu":true`를 찾았는데, Python 기본 `json.dumps`는 이를 절대 내지 않는다
+(콜론 뒤에 항상 공백을 둔다: `"resident_gpu": true`) -- 테스트 자체의 기존 버그이며, 실제로
+돌리려면 `torch`가 필요해서 지금에서야 발견됐다. 패키지가 없으면 CI는 이유를 출력하고 건너뛴다.
+`crates/es-policy/tests/ir_training.rs`에서 수정; 이 테스트는 `--device cpu`로 돈다
+(`train_act.py`가 기본으로 떨어지는 값이며 이 패킷이 바꾸지 않았다) -- 그리고 그것이 바로 위에서
+측정한 CUDA divergence와 이 테스트의 비트 동일 주장이 서로 모순되지 않는 이유다. 서로 다른
+장치다.
 
 다시 발견하지 않도록 기록해 두는 로컬 제약 하나. `--compile`은 윈도우 개발 머신에서 시험할 수 없다.
 `torch._inductor`가 템플릿을 ANSI 코드페이지로 읽어 `cp949` 로캘에서 `UnicodeDecodeError`로 죽는다.
-이 스크립트가 아니라 torch의 버그다. 플래그는 연결되어 있고, 측정은 리눅스 서버에서 받는다.
+이 스크립트가 아니라 torch의 버그다. 위 (d) 행이 리눅스 서버에서 받은 측정값이다.
 
 ## 8. 안전 오버레이 (V3)
 

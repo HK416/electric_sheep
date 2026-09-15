@@ -168,13 +168,53 @@ python/es/train_act.py --module build --baked baked --out b.safetensors \
 
 | what | Target | Status |
 | --- | --- | --- |
-| 6-suite 96-episode run, `--jobs 6` | ~5-6 min (from 28 min) | **unverified** |
-| `report.json` / `events.json` identical to the sequential run | byte-identical | **unverified** |
-| 20,000 steps at batch 8, `--resident-gpu` | faster than 11 min | **unverified** |
-| 20,000 steps, `--resident-gpu --amp bf16` | faster still, different bits | **unverified** |
+| 6-suite 96-episode run, `--jobs 6` | ~5-6 min (from 28 min) | **Observed 2026-09-15: 5:49 (from 25:56 sequential), after the fix below** |
+| `report.json` / `events.json` identical to the sequential run | byte-identical | **Observed 2026-09-15: not bit-identical on the real backend -- see below** |
+| 20,000 steps at batch 8, `--resident-gpu` | faster than 11 min | **Observed 2026-09-15: 10:57 vs 10:53 default -- not faster; loss curve not bit-identical on CUDA, see below** |
+| 20,000 steps, `--resident-gpu --amp bf16` | faster still, different bits | **Observed 2026-09-15: 12:53 -- slower than the default, see below** |
 
-Every row above stays `Status: unverified` until it is measured on the server and the number is
-written into design note section 7.11. Nothing in phase 1 may quote one of them as measured.
+Full numbers, including the nominal-only run and the other two training rows, are in design note
+section 7.11. Two things found while measuring, neither of which this packet's forbidden list
+lets the numbers themselves absorb:
+
+**The first `--jobs 6` run was 5x *slower* than sequential, not faster.** Each shard's own
+`TorchRuntime` subprocess defaults its thread pool to every core on the box; six of them on a
+16-core server want on the order of 90 OS threads at once (load average ~47), and the box spent
+its time context-switching rather than computing. Fixed in `crates/es/src/cmd/eval.rs`
+(`spawn_shards`): each shard's `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS` /
+`TORCH_NUM_THREADS` is capped to `cores / jobs` unless the caller already exported a value (env
+passthrough wins), with `shard_thread_cap`/`shard_thread_env` unit-tested in isolation. After the
+fix, `--jobs 6` measured 5:49, in the packet's targeted range.
+
+**That fix costs the real backend's byte-identity, and the packet's forbidden list will not let
+it be closed here.** `sharding_the_cells_produces_a_byte_identical_report` (`FakeBackend`, no real
+floating point) still passes, byte for byte, re-verified after the fix. But on the real
+`mujoco-cpu` + `torch` stack, `--jobs 1`'s own subprocess is left uncapped (unchanged from before
+this packet) while a `--jobs 6` shard is now capped to `cores/jobs` threads -- a different thread
+count, and CPU-threaded reductions are not exactly associative. Measured: 6 of the merged
+report's 24 cells differ (`failure_mode_histogram` counts and one suite's mean `episode_length`);
+`success_rate` and `envelope_violation_rate` are identical in every cell, and a handful of
+individual frames differ later in an episode once a step's classification flips. Isolated before
+blaming the fix: two independent `--jobs 1` runs of the same config are byte-identical to each
+other (frames included), and explicitly exporting `OMP_NUM_THREADS=16` (this box's core count)
+before a `--jobs 1` run reproduces the unset-default run byte for byte -- so the divergence tracks
+thread *count*, not process separation or explicit-vs-default env. This is downstream of
+`MuJoCoCpuBackend`'s own declared `DeterminismTier::PhysicsMeaning` (design note section 9: tier
+3, not bitwise) and of CPU-threaded kernels in general, not a defect in the sharding logic.
+Closing it would mean capping `--jobs 1`'s own thread count too, at a value this packet has no
+basis to choose without moving the already-committed V1c/V2b/V3 numbers -- forbidden below. Left
+as a documented, pre-existing limitation of the real backend rather than "fixed."
+
+**`--resident-gpu` is bit-identical to the default on CPU (the oracle's own device, unchanged by
+this packet) but not on CUDA.** `resident_gpu_does_not_move_the_loss` passes, 40 bit-identical
+steps, after a second, unrelated fix: its last assertion checked for the literal substring
+`"resident_gpu":true`, which Python's default `json.dumps` never emits (it always spaces the
+colon: `"resident_gpu": true`) -- a pre-existing bug in the test itself, caught only now because
+running it needs real `torch` (`crates/es-policy/tests/ir_training.rs`). On the server, at
+`--device cuda`, run (a) and (b) below diverge from the first optimizer step: ordinary CUDA
+kernel/algorithm-selection non-determinism, since `train_act.py` sets no
+`torch.use_deterministic_algorithms`. The design note's "bit-identical" claim is accurate for the
+CPU path the unit oracle checks and does not hold on CUDA; both are recorded, not reconciled.
 
 ## acceptance
 
