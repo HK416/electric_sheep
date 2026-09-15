@@ -2641,6 +2641,7 @@ alone (visible-learning.md 7.13), and that is what 1, 2 and 3 below are about.
 | L14 | Context budget | §1.5 | `es-ir` is at 5,947 lines against a 6,000 target. Any improvement that touches the IR (delta action space, a provenance validator, widening `TemporalEncoder`) needs a split packet first |
 | L15 | CI stability | §26.2 | `es-telemetry`'s `transport::a_connection_past_max_clients_is_refused` fails intermittently under load on Windows. A refusal must also be accepted as ECONNRESET |
 | L16 | Shape of the record | §1.2 | The as-built record lives in one 1,300-line design note. This subsection is the first step of distilling it |
+| L18 | Control period | §9.2 `rate.control`, §12.1 batch domains | **The root cause V10 found (2026-09-15)**: the whole demo ran at **200 Hz**, not the declared 50. `Env::new` keeps the physics at the MJCF's `timestep 0.005` and `BatchDomains::single_env()` advances one tick per inference, so one recorded action row is one physics step (measured: the mujoco probe tracks the `es` replay to 0.0002 mm at one substep and diverges by 203 mm at four). Consequences: every dynamic envelope limit is 4x (acceleration 16x) looser per step, the per-tick command increment has a median of 0.0032 rad, a 16-row chunk spans 80 ms instead of 320 ms, and the dataset's `fps = 50` metadata is wrong. The data (replay 50/50), the grasp (50/50 lifted) and the ensemble (range preserved) are not the cause (visible-learning.md 7.18, open question 18). Fix = V11: keep the physics, derive the inference period from `rate.control` and the physics rate (4 substeps), refuse a non-dividing scene, re-collect and re-train |
 | L17 | How gate 7 is judged | §28.7 gate 7 | The demo is SO-101 cube-into-bin, not a Franka with two RGB views. Whether gate 7 is recorded as met with the substitution named, or stays open as written, is undecided (visible-learning.md open question 9) |
 
 **Three rules this subsection fixes.** The rest is left to human judgement, but these three were
@@ -2778,7 +2779,7 @@ robot cell exists. If even rung 3 (V8) fails, a **physics, expert and action rep
 investigation is inserted before M6 (**fired, 2026-09-15** — packet V10, a scene diagnosis: replay the
 expert's recorded actions through `es eval run`, judge grasp versus push from the gripper's contact
 forces, check whether the temporal ensemble survives the grasp window; then resolution and
-demonstration count one at a time): contact-model verification (judged by §17.2's backend
+demonstration count one at a time). **V10's verdict (2026-09-15)**: all three suspects are cleared and the cause is L18's control period. The next packet is V11, and nothing else in plan V moves until its number exists: contact-model verification (judged by §17.2's backend
 comparison), a delta action space (§8.5, preceded by the `es-ir` split), and a redesign of the
 expert's trajectories. Either way, rungs 2, 5 and 6 of the ladder come first — if the harness
 cannot be trusted, neither conclusion is a measurement.
