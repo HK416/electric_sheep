@@ -452,3 +452,33 @@ The three hashes are `DatasetIdentity::compute` over the source with a display-o
 split, exactly as `es dataset info` prints them. It is a sidecar rather than extra `info.json`
 keys because `DatasetInfo.from_dict` drops unknown keys (with a warning) and `to_dict` would
 not write them back — provenance in `info.json` would not survive a LeRobot-side rewrite.
+
+## The columns `es loop collect` writes — ours, not LeRobot's
+
+`observation.state`, `action` and `reward` are LeRobot's own names. Three more are Electric
+Sheep's, declared in `features` like any other so that both the v2.1 writer and the v3.0
+exporter carry them without a special case:
+
+| Column | dtype | shape | Meaning |
+|---|---|---|---|
+| `action_source` | `int64` | `[1]` | `es_data::ActionSourceCode`: `Policy` / `Human` / `Clamped` / `Fallback` (spec §13.2) |
+| `intervention` | `int64` | `[1]` | 1 where a human or a scripted intervener drove the tick |
+| `action_commanded` | `float32` | `[nu]` | the pre-plane command of that tick — **packet M5/V1c** |
+
+**`action` is the executed action, and `action_commanded` is what was asked for.** `action` is
+the `SafetyPlane::validate` result that `DomainRunner::emit_actions` copied into `ctrl`: what
+reached the actuator, after every clamp (`INV-12`). `action_commanded` is the row the chunk
+buffer served for the same tick, before the plane judged it. The two are equal on a tick the
+plane passed through unchanged, and on a tick the buffer had no row for at all — where there was
+no command, and `action_source` reads `Fallback`.
+
+A consumer training a policy wants `action`: it is the only column whose values the Deployment
+IR's envelope will let that policy reproduce. `action_commanded` is provenance, so that a
+`Clamped` frame can be read without re-running the plane.
+
+**This moved `dataset_schema_hash`** (and therefore `content`, §19.1/§19.2): a dataset collected
+before packet M5/V1c has no `action_commanded` column and hashes differently from one collected
+after, even from the same seed. That is the intended behaviour — the schema is part of a training
+run's input identity — and it is why V1c re-collects rather than patching the existing set. Both
+columns cross `es dataset export --lerobot-v3` unchanged (`export_layout_is_v3`), and `lerobot`
+0.6.1 reads a dataset that carries the extra feature (`lerobot_v3_export`).

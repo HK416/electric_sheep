@@ -81,6 +81,8 @@ pub struct DomainRunner<const NJ: usize, const H: usize> {
     control_tick: u64,
     observations: u64,
     inference_calls: u64,
+    /// The pre-plane command of the last [`emit_actions`](Self::emit_actions), `n_envs * NJ`.
+    commanded: Vec<f64>,
 }
 
 impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
@@ -121,6 +123,7 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
             control_tick: 0,
             observations: 0,
             inference_calls: 0,
+            commanded: vec![0.0; envs * NJ],
         })
     }
 
@@ -157,6 +160,18 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
 
     pub fn buffer(&self, env: u32) -> Option<&ChunkBuffer<NJ, H>> {
         self.buffers.get(env as usize)
+    }
+
+    /// What the last [`emit_actions`](Self::emit_actions) handed the Safety Plane, before the
+    /// plane answered: `n_envs * NJ`, row-major by env.
+    ///
+    /// This is provenance, never an actuator value — the only value that reaches the plant is
+    /// the plane's (`INV-12`). `es loop collect` records it beside the executed action so a
+    /// demonstration says both what was asked for and what was done (spec 13.2). On a tick the
+    /// chunk buffer had no row for, there was no command and the plane's own answer is
+    /// repeated; `action_source` reads `Fallback` for exactly those ticks.
+    pub fn commanded(&self) -> &[f64] {
+        &self.commanded
     }
 
     /// `chunk_underrun_rate` of §12.4, over every env. `None` before the first control tick.
@@ -319,6 +334,10 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
                 .map_or(self.control_tick + 1, |o| self.control_tick - o.tick);
             let safe = planes[env].validate(&chunk, Micros(age.saturating_mul(period_us)), now);
             ctrl[env * NJ..(env + 1) * NJ].copy_from_slice(&safe.q);
+            // The plane walks its own cursor over the rows the buffer served, so `row` is the
+            // command `validate` just judged (the comment on the rebuild branch above says why
+            // the two cannot drift). `None` is the underrun: nothing was commanded.
+            self.commanded[env * NJ..(env + 1) * NJ].copy_from_slice(&row.unwrap_or(safe.q));
         }
         Ok(())
     }
@@ -956,6 +975,73 @@ mod tests {
         let err =
             DomainRunner::<NJ, 9>::new(&s, &contract(), blend, TickRate::hz(250)).unwrap_err();
         assert!(err.to_string().contains("horizon"), "{err}");
+    }
+
+    /// `INV-12` and spec 13.2: `ctrl` is the plane's own answer, bit for bit, and the command
+    /// the plane was asked to judge is kept beside it rather than written to the actuator.
+    ///
+    /// The envelope is tightened rather than the plane removed, so the two values differ.
+    #[test]
+    fn emit_actions_writes_the_planes_answer_and_records_the_command() {
+        let mut ir = deployment_ir();
+        ir.safety.position = vec![Limit::symmetric(0.01); NJ];
+        ir.safety.position_soft_margin = vec![0.0; NJ];
+
+        let task = task();
+        let mut env = Env::new(&task, &fake_scene(), FakeBackend::new(), &domains(16), 5).unwrap();
+        let mut runner = DomainRunner::<NJ, H>::new(
+            env.schedule(),
+            &contract(),
+            ChunkBlendPolicy::HardSwitch,
+            TickRate::hz(250),
+        )
+        .unwrap();
+        let mut planes = vec![SafetyPlane::<NJ, H>::from_ir(&ir).unwrap(); 16];
+        let mut policy = FakePolicy::default();
+
+        // `Env::step_with_policy` with the one value it does not hand back: `ctrl`.
+        // `FakePolicy` ramps to `0.02 * H`, well outside the 0.01 rad envelope above.
+        let mut differed = 0;
+        for _ in 0..8 {
+            let sim_tick = env.tick().0;
+            {
+                use es_physics_core::backend::PhysicsBackend as _;
+                let state = env.backend().state();
+                runner
+                    .observe_window(sim_tick, env.model(), &state, &mut [])
+                    .unwrap();
+            }
+            runner.infer_window(sim_tick, &mut policy).unwrap();
+            let mut ctrl = vec![0.0; 16 * NJ];
+            runner
+                .emit_actions(env.tick(), &mut planes, &mut ctrl)
+                .unwrap();
+            for i in 0..16usize {
+                let row = &ctrl[i * NJ..(i + 1) * NJ];
+                let safe = planes[i].last_safe_action();
+                let commanded = &runner.commanded()[i * NJ..(i + 1) * NJ];
+                for (j, v) in row.iter().enumerate() {
+                    assert_eq!(
+                        v.to_bits(),
+                        safe[j].to_bits(),
+                        "env {i} joint {j}: ctrl is not the SafeAction bit for bit"
+                    );
+                    assert!(
+                        v.abs() <= 0.01 + 1e-12,
+                        "env {i} joint {j}: {v} left the envelope it passed through"
+                    );
+                }
+                if row != commanded {
+                    differed += 1;
+                }
+            }
+            env.step(&ctrl).unwrap();
+            runner.advance();
+        }
+        assert!(
+            differed > 0,
+            "an envelope this tight must have corrected the command at least once"
+        );
     }
 
     #[test]

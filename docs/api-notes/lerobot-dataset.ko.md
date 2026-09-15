@@ -438,3 +438,33 @@ v2.1 필드인 `total_videos`와 `total_chunks`는 v3.0 필드가 *아니며* �
 `es dataset info`가 출력하는 것과 정확히 같다. `info.json`의 추가 키가 아니라 사이드카인 이유는
 `DatasetInfo.from_dict`가 모르는 키를 (경고와 함께) 버리고 `to_dict`가 그것을 되쓰지 않기 때문이다 —
 `info.json`에 넣은 출처는 LeRobot 쪽 재기록을 살아남지 못한다.
+
+## `es loop collect`가 쓰는 컬럼 — 우리 것이고 LeRobot의 것이 아니다
+
+`observation.state`, `action`, `reward`는 LeRobot 자신의 이름이다. 나머지 셋은 Electric Sheep의
+것이며, 다른 피처와 똑같이 `features`에 선언되므로 v2.1 라이터도 v3.0 익스포터도 특수 분기 없이
+그대로 실어 나른다:
+
+| 컬럼 | dtype | shape | 의미 |
+|---|---|---|---|
+| `action_source` | `int64` | `[1]` | `es_data::ActionSourceCode`: `Policy` / `Human` / `Clamped` / `Fallback` (스펙 §13.2) |
+| `intervention` | `int64` | `[1]` | 사람 또는 스크립트 개입자가 그 틱을 몰았으면 1 |
+| `action_commanded` | `float32` | `[nu]` | 그 틱의 플레인 통과 **이전** 명령 — **패킷 M5/V1c** |
+
+**`action`은 실행된 액션이고 `action_commanded`는 요청된 값이다.** `action`은
+`DomainRunner::emit_actions`가 `ctrl`에 복사한 `SafetyPlane::validate`의 결과 — 모든 클램프를
+거친 뒤 액추에이터에 도달한 값이다(`INV-12`). `action_commanded`는 같은 틱에 청크 버퍼가 내어준
+행, 즉 플레인이 판정하기 전의 값이다. 플레인이 손대지 않고 통과시킨 틱에서 둘은 같고, 버퍼에 그
+틱의 행이 아예 없었던 틱 — 명령 자체가 없었고 `action_source`가 `Fallback`을 읽는 틱 — 에서도
+같다.
+
+정책을 학습시키는 소비자가 원하는 것은 `action`이다. Deployment IR의 엔벌로프가 그 정책에게
+재현하도록 허용하는 값을 가진 유일한 컬럼이기 때문이다. `action_commanded`는 출처 기록이며,
+플레인을 다시 돌리지 않고도 `Clamped` 프레임을 읽을 수 있게 한다.
+
+**이로써 `dataset_schema_hash`가 이동했다**(따라서 `content`도, §19.1/§19.2). 패킷 M5/V1c 이전에
+수집된 데이터셋에는 `action_commanded` 컬럼이 없으므로, 같은 시드에서 수집했더라도 이후의 것과
+해시가 다르다. 이는 의도된 동작이며 — 스키마는 학습 실행의 입력 정체성의 일부다 — V1c가 기존
+세트를 패치하는 대신 재수집하는 이유다. 두 컬럼 모두 `es dataset export --lerobot-v3`를 그대로
+통과하고(`export_layout_is_v3`), `lerobot` 0.6.1은 추가 피처를 실은 데이터셋을 읽는다
+(`lerobot_v3_export`).

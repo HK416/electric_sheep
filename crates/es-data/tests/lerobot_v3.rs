@@ -59,7 +59,7 @@ fn frame_bytes(frame: usize) -> Vec<u8> {
 /// `frames`, when given, also receives the raw frame dump the camera's pixels come from.
 fn write_fixture(root: &Path, frames: Option<&Path>) -> Vec<Episode> {
     let mut features = BTreeMap::new();
-    for name in ["observation.state", "action"] {
+    for name in ["observation.state", "action", es_data::ACTION_COMMANDED] {
         features.insert(
             name.to_owned(),
             FeatureSpec::new(Dtype::Float32, [NJ as u64]),
@@ -86,6 +86,12 @@ fn write_fixture(root: &Path, frames: Option<&Path>) -> Vec<Episode> {
                 (
                     "action".to_owned(),
                     Column::F32((0..n * NJ).map(|i| base - i as f32 * 0.5).collect()),
+                ),
+                (
+                    // Packet M5/V1c: the raw command, which differs from the executed action
+                    // wherever the plane corrected it.
+                    es_data::ACTION_COMMANDED.to_owned(),
+                    Column::F32((0..n * NJ).map(|i| base - i as f32 * 0.75).collect()),
                 ),
                 (
                     "reward".to_owned(),
@@ -184,6 +190,12 @@ fn export_layout_is_v3() {
     assert_eq!(features[CAMERA]["dtype"], "image", "not video: no decoder");
     assert_eq!(features[CAMERA]["shape"], serde_json::json!([H, W, 3]));
     assert_eq!(features["observation.state"]["dtype"], "float32");
+    // Both action columns cross the export: what was executed and what was asked for
+    // (packet M5/V1c).
+    for name in ["action", es_data::ACTION_COMMANDED] {
+        assert_eq!(features[name]["dtype"], "float32", "{name}");
+        assert_eq!(features[name]["shape"], serde_json::json!([NJ]), "{name}");
+    }
 
     // The source is untouched: V2's training script still reads v2.1 (packet `forbidden`).
     assert_eq!(

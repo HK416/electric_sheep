@@ -910,4 +910,39 @@ mod tests {
         assert_ne!(a[0], c[0], "reset re-plans from the new cube");
         assert_eq!(expert.stage(), Stage::Approach);
     }
+
+    /// Packet M5/V1c: `reset` also drops the ramp's integrator, so the first chunk of an
+    /// episode starts from the joints the arm actually has rather than from where the previous
+    /// episode's command ended.
+    #[test]
+    fn reset_restarts_the_ramp_from_the_measured_joints() {
+        let (mut expert, model) = expert();
+        let cube = row(Vec3::new(0.24, 0.0, 0.02), [0.0; 6]);
+        // Drive the command well away from the rest pose.
+        for _ in 0..40 {
+            expert
+                .chunk(&model, &state_of_row(&model, &cube), 0)
+                .expect("reachable");
+        }
+        let carried = expert
+            .chunk(&model, &state_of_row(&model, &cube), 0)
+            .expect("reachable")[0]
+            .clone();
+        expert.reset();
+        let fresh = expert
+            .chunk(&model, &state_of_row(&model, &cube), 0)
+            .expect("reachable")[0]
+            .clone();
+        assert_ne!(
+            carried, fresh,
+            "reset kept the previous episode's command integrator"
+        );
+        // The measured joints are all zero here, so a restarted ramp is one `step_max` out.
+        for (j, q) in fresh.iter().enumerate() {
+            assert!(
+                q.abs() <= expert.cfg.step_max + 1e-12,
+                "joint {j}: the first row of an episode is {q}, not one step from rest"
+            );
+        }
+    }
 }
