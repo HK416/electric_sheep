@@ -2647,6 +2647,80 @@ own ACT, 100,000 steps). **Do not move a second variable here.** The next packet
 hypothesis and one variable — resolution or demonstration count — and V11's numbers are the
 baseline it is compared against.
 
+### 7.20 As built (V12): the observation a policy acts on is the one the demonstration records
+
+Packet `docs/packets/M5/V12-observation-pairing.md`. Section 7.19 ended on "neither policy learns
+it anyway" with four suspects closed. This packet closes a fifth, which was in the recorder all
+along.
+
+**The defect.** `Env::step` ran `set_ctrl(ctrl)` -> `backend.step(substeps)` -> `let state =
+self.backend.state()` -> `StepRow { qpos/qvel/sensordata: <post-step>, ctrl }`, so a
+demonstration row `t` paired `observation.state[t]` -- the state **after** `action[t]` was
+executed -- with `action[t]`, and `Collector::run` rendered the frame and pushed the `.estraj`
+pose from that same post-step state. But the expert computed `action[t]` from the state
+*before* the step (`step_with_policy`: observe -> infer -> act -> step) and `es_eval::runner`
+does the same at inference. **Training learned `(s_{t+1}, image_{t+1}) -> a_t` while inference
+asks `(s_t, image_t) -> a_t`** -- one control period of lag in every input of every demonstration
+plan V has ever collected. LeRobot's convention is the other one: `observation[t]` is what
+`action[t]` was chosen from. V10 saw this and read it as noise, correctly for the time: at the
+200 Hz section 7.19 fixed, one control step was 5 ms and 0.7 mrad.
+
+**The fix is one place.** `Env::step` snapshots `qpos/qvel/sensordata` and the tick before
+`backend.step` and records *that* beside the `ctrl` just applied; reward, termination and failure
+stay the transition's, so `done` still marks the last frame. Every consumer -- collector,
+evaluator, HIL, the embedded runtime -- inherits it from the env. `Collector::run` moves its
+frame render and its `.estraj` push to the same instant, before the step, so image, state row and
+trajectory are one read of one state. That also removed a smaller defect nobody had named: a
+terminal step auto-resets the env inside `Env::step`, so the collector's post-step read had been
+rendering **the next episode's reset state** into the last frame of every episode.
+`es_eval::runner` needed no change -- it was already right, and that is the point.
+
+**The measurement flips by exactly one row.** Median over frames of
+`max_j abs(action[t] - qpos[t+k])`, over each packet's own 50-episode baked set (9,038 frames
+both times):
+
+| `k` | V11 (post-step row) | V12 (pre-step row) |
+|---|---|---|
+| -1 | 0.06159 rad | 0.11149 rad |
+| 0 | **0.02094 rad** | 0.06159 rad |
+| +1 | 0.06753 rad | **0.02137 rad** |
+
+V12's `k = 0` is V11's `k = -1` to five decimals. The command lead is now on the row the policy
+is asked to map from (0.062 rad) and the following error where it belongs (0.021 rad, at `t+1`).
+Nothing else moved: 50/50 demonstrations, `recorded_actions_replay_to_the_same_outcome` 50/50 on
+both action columns, V9's replay 900 frames bit-identical, `dataset_schema_hash` unmoved.
+
+**The result, and the stop rule.** Retrained with V2's exact knobs (20,000 steps, loss 0.0583 ->
+0.0141), the IR-owned graph scores **0/16 nominal (twice, bit-identical) and 0/16 on its own
+training seeds 1-16**, against V11's 0/16 and 0/16. What did move is the envelope: violation rate
+**0.2735 -> 0.0371** nominal and **0.3152 -> 0.0365** on the training seeds, with position
+violations falling from 3,402 to 6 and the fallback count to zero. Removing the lag made the
+policy's commands reachable from the state it emitted them in -- it just never reaches the cube.
+The stop rule fires on the training-seed number: seed 1 *is* training episode 0.
+
+**And the reason is now measured.** The orchestrator's open-loop analysis
+(`~/artifacts/plan-v/v11/openloop/`, re-run against V12's checkpoint) found it independently of
+the pairing: `train_act.py --batch 8` accumulates eight **single-sample** forwards, so every
+`BatchNorm2d` in the lowered ResNet18 trains on `N = 1` statistics while inference calls
+`model.eval()` and uses the running ones. Chunk L1 on three training episodes, V12's checkpoint:
+**0.0129 / 0.0127 / 0.0130 in `train()`** (which is the reported loss) against
+**0.0337 / 0.0438 / 0.0441 in `eval()`** -- the path `es eval run` executes -- against
+0.0565 / 0.0571 / 0.0561 for "hold the current pose". The deployed fit is three times the trained
+fit and a quarter better than doing nothing, on data it was trained on. The gap is the same size
+either side of the pairing fix, and the open-loop tables show no lag signature left: row 0 of the
+emitted chunk is closest to `action[t]`, and the blend the evaluator executes is now the aligned
+one. That is **open question 19**.
+
+**The external ACT is the control, and it also stays at 0/16.** V8's pipeline unchanged on the
+new export (100,000 steps, 2,175 s): `success_rate` **0/16** against V8's 1/16 at 200 Hz and
+V11's 0/16, with `envelope_violation_rate` moving the *opposite* way from the IR graph's,
+0.0523 -> 0.4267. LeRobot's ACT has no train/eval normalization gap -- `FrozenBatchNorm2d`, real
+batches -- so `BatchNorm` cannot be the whole story either, and the next packet has to face that
+number beside open question 19.
+
+The pairing fix stands on its own regardless: it is what LeRobot means by a demonstration, it is
+what the evaluator and every deployment path already assumed, and the next packet inherits it.
+
 ### 7.21 As built (V13): the deployed function was not the trained function
 
 Packet `docs/packets/M5/V13-groupnorm-backbone.md`. Lowering rule:
@@ -2776,6 +2850,7 @@ current pose — and "carries the cube over the bin and never opens" is exactly 
 predicts. The 900-step budget is the second thing to look at: three episodes were still holding
 the cube in the right place when it ran out. V13's numbers, not V11's, are the baseline from
 here.
+
 
 
 ## 8. Safety overlay (V3)
@@ -3063,3 +3138,19 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     `es_eval::infer_chunk` takes `rows = min(len / NJ, H) = 10` and every open-loop L1 in
     section 7.21 is over 10 rows. That is the fixture's intent (`replanning_hz = 5 = 50 Hz / 10`),
     not a bug — but "16" in prose means the head's horizon, never the executed chunk.
+20. **`BatchNorm` in the from-scratch backbone: the trained fit is not the deployed fit**
+    *Answered by V13 (section 7.21) before this question was merged: the from-scratch backbone now lowers with `GroupNorm`, so the trained fit is the deployed fit; vectorizing the batch lowering stays on the ladder for training speed, not correctness.*
+    (section 7.20). `python/es/train_act.py --batch N` accumulates N **single-sample** forwards
+    into one optimizer step, so every `BatchNorm2d` in the lowered ResNet18 is trained on `N = 1`
+    batch statistics, while `crates/es-policy/python/torch_ref.py` calls `model.eval()` and runs
+    on the running statistics. Measured on V12's own checkpoint and its own training episodes:
+    chunk L1 0.0129 in `train()` against 0.0337-0.0441 in `eval()`, where "hold the current pose"
+    is 0.0561-0.0571. Two ends could move. **(a)** Vectorize the batch in the lowering so a
+    training step is one forward over a real batch of N -- the honest fix, and it is a change to
+    `lower_to_torch`'s emitted module and to `train_act.py` together. **(b)** Make the IR's
+    `VisionEncoder{ResNet18}` lower to frozen or group normalization, which is what LeRobot's own
+    ACT does (`FrozenBatchNorm2d`) and which makes the two modes identical by construction, at
+    the cost of a lowering that no longer matches torchvision's default. Default: **(a)**, because
+    a batch axis is what spec 5.2 already says the training domain has, and (b) would hide a
+    lowering that is wrong for every other normalization-bearing backbone. Either way it is one
+    variable and the next packet's whole content.

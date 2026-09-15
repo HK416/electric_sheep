@@ -976,12 +976,28 @@ fn frames_are_written_once_per_control_step() {
         "a rendered run has no dangling video reference: {:?}",
         report.warnings
     );
-    // The frame is taken from the state the step ended in, not from a constant.
+    // The frame is taken from a state that moves, not from a constant.
     let moved = seen
         .iter()
         .filter(|(_, q)| (q - seen[0].1).abs() > 1e-12)
         .count();
     assert!(moved > 0, "every frame saw the same state");
+    // Packet M5/V12: the frame and the `observation.state` row of the same index are the same
+    // instant -- the one the action of that row was computed from.
+    let dataset = LeRobotDataset::open(&root).expect("the collected dataset opens");
+    let ep = dataset.read_episode(0).expect("episode reads back");
+    let state = match ep.columns.get("observation.state") {
+        Some(Column::F32(v)) => v.clone(),
+        other => panic!("observation.state: {other:?}"),
+    };
+    let width = state.len() / ep.len();
+    for (i, (_, q)) in seen.iter().take(ep.len()).enumerate() {
+        assert_eq!(
+            state[i * width].to_bits(),
+            (*q as f32).to_bits(),
+            "frame {i} and row {i} are different instants"
+        );
+    }
 }
 
 /// The other half: no sink, and the run is exactly what it was before V1 -- the warning, the

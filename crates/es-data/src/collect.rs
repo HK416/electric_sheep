@@ -179,7 +179,8 @@ pub enum Intervention<const NJ: usize> {
 pub type Intervener<'a, const NJ: usize> =
     &'a mut dyn FnMut(u32, u32, &ModelInfo, &[f64]) -> Intervention<NJ>;
 
-/// Called once per control step with the state that step ended in.
+/// Called once per control step with the state that step is entered with -- the same
+/// instant the `observation.state` row and the `.estraj` pose of that step carry (M5/V12).
 ///
 /// A closure, not a renderer: `es-data` is layer 10 and `es-render` layer 5, and this is the
 /// same trade `es_eval::runner::FrameSource` makes — the caller owns
@@ -453,6 +454,21 @@ impl Collector {
                     q.copy_from_slice(&state.qpos_of(0)[..NJ]);
                     qd.copy_from_slice(&state.qvel_of(0)[..NJ]);
                     planes[0].observe_state(&q, &qd);
+                    // Image, `.estraj` pose and `observation.state` row are one instant: the
+                    // state this control step is entered with, which is the state the expert
+                    // is about to compute its action from and the state the policy will be
+                    // handed at inference (packet M5/V12, design note section 7.20).
+                    // `Env::step` records the same instant, so trajectory index, frame index
+                    // and row index still agree -- and the terminal step no longer renders
+                    // the *next* episode's reset state, which is what the post-step read did
+                    // once `Env::step` auto-reset a done env.
+                    if let Some(t) = traj.as_mut() {
+                        t.push(env.model(), &state, 0).map_err(|e| bad(&e))?;
+                    }
+                    if let Some(sink) = frame_sink.as_deref_mut() {
+                        sink(env.model(), &state).map_err(DataError::Loop)?;
+                        rendered += 1;
+                    }
                 }
                 let before = counters_of(&planes[0]);
                 let outcome = env
@@ -474,20 +490,6 @@ impl Collector {
                 }
                 let after = counters_of(&planes[0]);
                 sources.push(classify(before, after, human[frame as usize]).as_i64());
-                // The same state, per control step, as the `.estraj` trajectory `es video
-                // showcase` replays (packet M5/V9). Written whether or not pixels are, and
-                // taken at the frame sink's own tick so the two indices agree.
-                if let Some(t) = traj.as_mut() {
-                    let state = env.backend().state();
-                    t.push(env.model(), &state, 0).map_err(|e| bad(&e))?;
-                }
-                // One frame per control step, from the state the step ended in — the same
-                // state the row above recorded.
-                if let Some(sink) = frame_sink.as_deref_mut() {
-                    let state = env.backend().state();
-                    sink(env.model(), &state).map_err(DataError::Loop)?;
-                    rendered += 1;
-                }
                 if let Some(ep) = outcome.episodes.into_iter().next() {
                     closed = Some(ep);
                     break;
