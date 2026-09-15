@@ -2333,6 +2333,151 @@ recorded and which is five times smaller. And `es loop collect --expert` writes 
 without needing a renderer at all, so the expert video costs one 0.4-second collection run — the
 expert has never needed pixels, and now neither does its video.
 
+### 7.18 As built (V10): the scene diagnosis
+
+Packet `docs/packets/M5/V10-scene-diagnosis.md`. Section 7.15's finding 8 named three suspects
+for why the demo still cannot be learned now that the harness passes the scripted expert
+(V6/V6b, sections 7.12–7.13) and the model is ruled out (V8, section 7.16: LeRobot's own ACT,
+a bitwise-verified import, 100,000 steps, 0/16 · 0/16 · 1/16). The three were the
+demonstrations, the grasp, and the temporal ensemble. V10 measures all three — no training, no
+model change, no fixture and no hash moved — and **all three are sound**. The measurement that
+proved the second one sound found a fourth thing nobody had looked at, and that is the finding.
+
+Everything below is the V1c training set: `~/artifacts/plan-v/v1c/ds-train`, `es loop collect
+--episodes 50 --seed 1`, 50 episodes, 18,263 frames, `task_hash aec2aea9…`, `observation_hash
+f4a50730…`, `dataset` content `51a953d6…`. Measured on the oracle server, 2026-09-15.
+
+**1. The recorded actions reproduce the demonstrations: 50/50.**
+`recorded_actions_replay_to_the_same_outcome` (`crates/es/tests/cli.rs`) replays each episode's
+recorded action rows open-loop from the same reset, through the same `Env` and the same
+`SafetyPlane`, and scores the result against what the demonstration itself recorded (the cube
+inside the bin's three-dimensional interior, which is what `expert_solves_the_pinned_seeds`
+checks and what the Task IR's x-only predicate cannot — section 5.4). A plain replay loop over
+`Env`, not a second `PolicyRuntime`: `INV-17` allows seven extension points and a
+recorded-action player is none of them, and the plane still sees every row.
+
+| replaying | cube in the bin | `Termination::Success` | ticks the plane corrected | worst correction |
+|---|---|---|---|---|
+| the demonstrations' own record | **50 / 50** | — | — | — |
+| `action` (the executed `SafeAction`) | **50 / 50** | 49 / 50 | 10,787 / 18,263 | 9.004e-4 rad |
+| `action_commanded` (the raw command) | **50 / 50** | 50 / 50 | 11,589 / 18,263 | 3.258e-1 rad |
+
+Three things this pins. **The data is sound** — every demonstration is a reproducible
+pick-and-place, and the executed-vs-commanded distinction costs nothing: both columns put all
+fifty cubes in the bin. **`action` really is the plane's own output** (section 7.10's claim,
+now measured from the other side): re-validating it moves it by at most 0.9 milliradians, which
+is `f32` storage and the rate limit rounding, while re-validating the raw command moves it by
+up to 0.33 rad. **The 49/50 is the Task IR predicate, not the physics**: one episode's cube is
+inside the bin and the x-only cone leaf says otherwise, which is exactly the ceiling section 5.4
+recorded. Replaying with a per-episode chunk `seq` instead of a per-run one scores 1/50 — the
+plane accepts a chunk only for a `seq` greater than the last it saw and `begin_episode`
+deliberately does not reset that, so every episode after the first is a permanent underrun. That
+is a property of the replay loop, written down here because it is the first thing the next
+person will get wrong.
+
+**2. The expert grasps; it does not push: 50/50.**
+`python/es/grasp_probe.py` replays the same fifty action sequences with plain `mujoco` 3.13 — no
+`es` runtime in the loop — and logs per tick the contact normal force between each jaw and
+`cube_geom`, the cube's height, and the gripper joint's commanded versus measured position. The
+reset state and the action rows come from the replay above (`ES_V10_DUMP`), because only that
+side knows the Task IR's randomization draw; the cube column of the dump is the self-check.
+
+| | measured |
+|---|---|
+| demonstrations that lift the cube clear of the table (> 20 mm, its half-height) | **50 / 50** |
+| lift, median / max | 122.65 mm / 127.67 mm |
+| ticks with **both** jaws in contact, median / max | 161.5 / 474 |
+| the grasp, as a fraction of an episode | 47.9 % |
+| gripper joint while both jaws hold the cube | 0.0950 rad (commanded −0.05, open 0.9) |
+| demonstrations ending with the cube in the bin | 50 / 50 |
+| worst cube divergence from the `es` replay | **0.0002 mm** |
+
+A 25 mm cube carried 122 mm above the table, held between two jaws for half the episode, is a
+grasp by any definition. The 0.0950 rad is the geometric closure the jaws stall at with the cube
+between them — the number section 5.3's `grip_closed = −0.05` overshoots on purpose so the servo
+saturates and the hold is firm.
+
+**3. The temporal ensemble lags; it never opens the gripper.**
+`the_temporal_ensemble_survives_the_grasp_window` drives one demonstration through
+`es_env::plane_chunk` exactly as `es loop collect` and `es eval run` do, and feeds a *second*
+`ChunkBuffer` the identical chunks under `HardSwitch`. The second one is the raw command — the
+newest chunk's own row for the tick — so the difference between the two is the ensemble and
+nothing else. Seed 1, `decay = 0.01`, `CHUNK_SLOTS = 8` overlapping chunks of a 16-row horizon.
+The episode is 351 ticks: `Approach` 0, `Descend` 71, `Close` 118, `Lift` 143, `Transport` 202,
+`Lower` 268, `Release` 314, and it ends in `Success`.
+
+| joint | max &#124;blend − raw&#124; over ticks 118–338 | raw min | blend min | raw max | blend max |
+|---|---|---|---|---|---|
+| 0 `shoulder_pan` | 0.22955 | −0.00031 | −0.00031 | 0.77272 | 0.77272 |
+| 1 `shoulder_lift` | 0.26197 | −1.37040 | −1.37040 | 0.16505 | 0.16505 |
+| 2 `elbow_flex` | 0.20923 | 0.24469 | 0.24469 | 0.71384 | 0.71384 |
+| 3 `wrist_flex` | 0.22593 | 1.08776 | 1.08776 | 1.51702 | 1.51702 |
+| 4 `wrist_roll` | 0.00000 | 0.00000 | 0.00000 | 0.00000 | 0.00000 |
+| 5 `gripper` | **0.35651** | **−0.05000** | **−0.05000** | 0.90000 | 0.90000 |
+
+**Every joint's blended command still reaches both ends of what the newest chunk asked for**,
+the gripper included: the blend closes to exactly `grip_closed = −0.05` and opens to exactly
+`grip_open = 0.9`. The ensemble is a *lag* — up to 0.357 rad on the gripper, about six and a
+half ticks of its ramp — and not a loss of range, because the extremes are held long enough for
+all eight overlapping chunks to agree on them. The jaw joint measures 0.0678 rad at its
+tightest, against the 0.0950 rad measurement 2 reports while the cube is held: the blend is well
+inside the closure the geometry allows. The test asserts the equality rather than a tolerance,
+so a change to `decay` or `CHUNK_SLOTS` that did open the gripper would fail it.
+
+**4. What the three measurements found on the way: one control step is 5 ms, not 20.**
+`grasp_probe.py` takes `--substeps` as a *measurement*, because only the right value keeps its
+cube column on the `es` replay's. At `--substeps 1` the worst divergence over fifty episodes is
+**0.0002 mm**; at `--substeps 4` it is **202.98 mm**. So one recorded action row is exactly one
+MuJoCo step of the scene's own `timestep="0.005"` — **200 Hz** — while
+`tests/fixtures/visible-learning/deployment.toml` declares `rate.control = 50` and
+`rate.inference = 5`. Nothing wires the two together: `Env::new` loads the scene with
+`LoadConfig { rate: None }`, so the physics keeps the MJCF's timestep, and `Env::step` advances
+`schedule.domains().inference.period` ticks, which `BatchDomains::single_env()` — the only
+thing `Collector::run` and `es_eval::runner` ever build — sets to 1.
+
+Three consequences, all arithmetic:
+
+* **Every dynamic Safety Plane limit is four times looser than the physics it governs.**
+  `SafetyPlane`'s `dt_s` comes from the Deployment IR, so `velocity_max · dt = 3.0 · 0.02 =
+  0.06` rad is allowed per *5 ms* step: 12 rad/s against a declared 3. `acceleration_max · dt²`
+  is looser by sixteen. The envelope is not violated, it is simply measured in the wrong unit.
+* **The signal a policy has to resolve is 3 milliradians.** Measured over the fifty episodes,
+  `|action[t] − qpos[t−1]|` has a median of **0.00322 rad** and `|action[t] − qpos[t]|` of
+  **0.00251 rad**. A 16-row chunk therefore spans about 80 ms and roughly 0.05 rad of travel,
+  on an action space whose joints run ±1.7 rad. At `--substeps 4` the same demonstrations show
+  0.0480 rad of chunk travel instead of 0.0982, and the per-tick increment drops to 0.00033 —
+  the numbers move because the dataset is being read at the rate it was authored for.
+* **The demonstrations are four times longer than anyone thinks.** A 351-tick episode is 1.76 s
+  of simulated time, not 7 s; `max_episode_steps = 900` is 4.5 s.
+
+The one-tick pairing question that this measurement makes askable is answered and is *not* a
+cause: `Env::step` records `ctrl` beside the qpos the step ended in, so `observation.state[t]`
+is the result of `action[t]` rather than the row it was computed from, which is the opposite of
+LeRobot's pairing — but at 5 ms the two readings differ by 0.7 milliradians
+(0.00251 against 0.00322), which is noise. A chunk's L1 against the trivial predictor "repeat
+the joints you can already see" is 0.0982 rad over a whole trajectory and 0.0964 rad inside the
+grasp window, so the grasp is not a vanishing fraction of the objective either: it is 47.9 % of
+the episode and no harder to predict than the rest of it. Both hypotheses are recorded here as
+measured and closed.
+
+**Verdict.** The scene, the demonstrations, the expert and the ensemble are not the cause. The
+data is a reproducible, two-jaw, 122 mm-lift pick-and-place in all fifty episodes; replaying it
+through the full stack puts fifty cubes in the bin; and the chunk blend the policy is trained
+against and evaluated through preserves the expert's commands exactly at both ends of every
+joint's range. What V10 found instead is that **the whole demo has been running at 200 Hz while
+every document declares 50 Hz**, which makes the learning problem four times finer than it was
+designed to be — 3 milliradians of commanded motion per step, 80 ms per chunk — and makes every
+dynamic envelope number four to sixteen times looser than the step it bounds.
+
+**The smallest next packet** is therefore not a model, a resolution or a demonstration count: it
+is to make one control step last one control period. `Env::new` already has the field —
+`LoadConfig::rate` is `Some` away from setting the physics rate, and `BatchDomains` already has
+a period the schedule honours — so the change is to derive one of the two from the Deployment
+IR's `rate.control` and refuse a scene whose timestep cannot divide it. Then re-collect and
+retrain with V2's exact knobs and compare against V8's 100,000-step numbers. Nothing else in
+plan V should move until that number exists, because every training and evaluation number the
+demo has produced was taken at four times the intended rate. Open question 18.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -2573,3 +2718,19 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     through `es eval run` and confirm the harness reproduces its success rate, then vary resolution
     and demonstration count one at a time. The alternative, more demonstrations at a higher
     resolution immediately, is a bigger run that would leave the same ambiguity if it failed.
+18. **The demo runs at 200 Hz and every document says 50** (section 7.18). `Env::new` loads the
+    scene with `LoadConfig { rate: None }` and `Env::step` advances
+    `schedule.domains().inference.period` simulation ticks, which `BatchDomains::single_env()`
+    — the only one `es loop collect` and `es eval run` ever build — sets to 1. So one control
+    step is one MJCF timestep, 5 ms, while `deployment.toml` declares `rate.control = 50` and
+    `rate.inference = 5`. Measured, not inferred: the mujoco probe's own replay tracks the `es`
+    replay to 0.0002 mm at one substep and diverges by 202.98 mm at four. Two ends could move
+    and they are not equivalent: **(a)** set `LoadConfig::rate` from the Deployment IR's
+    `rate.control`, which changes the *physics* timestep and therefore the contact behaviour
+    the demonstrations were recorded through; **(b)** derive `BatchDomains::inference.period`
+    from `rate.control / <the scene's physics rate>` and refuse a scene whose timestep does not
+    divide the control period, which keeps the physics exactly as it is and makes one control
+    step four substeps of it. Default, and the one that leaves the scene alone: **(b)**. Either
+    way every training and evaluation number plan V has produced was taken at four times the
+    intended control rate, so the re-collect and the retrain are part of the same packet, and
+    V8's 100,000-step numbers are what the result is compared against.
