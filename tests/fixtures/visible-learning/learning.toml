@@ -15,6 +15,19 @@
 #
 # `weights` is a `safetensors` reference with an all-zero hash: V2 packs the trained weights
 # and recomputes it. No pickle path exists anywhere (INV-16).
+#
+# Packet M5/V7a adds a third input, `sim_cube_pose`, and IT IS SIMULATOR-PRIVILEGED: a real
+# SO-101 has no sensor that reports where the cube is. It is stage 1 of the demo -- ask whether
+# the policy can do the task *given* the cube's pose, before asking whether a from-scratch
+# ResNet18 can find a 25 mm cube in a 96x96 frame (design note section 7.14). Nothing validates
+# the mark; the `sim_` prefix is the whole of it, carried from the Task IR channel through the
+# Observation IR output port to the policy contract. The graph is therefore
+#
+#   VisionEncoder{ResNet18}  -.
+#   StateEncoder{Mlp[256]}    +- Fusion{Concat} -> TemporalEncoder{Transformer}
+#   StateEncoder{Mlp[256]}   -'                      -> PolicyHead{Regression} -> ActionChunker
+#
+# and the deployment aimed at hardware is the one that drops the third branch.
 
 es_schema = 1
 kind = "learning"
@@ -52,6 +65,19 @@ time = "Tick"
 hi = 1.0
 lo = -1.0
 
+[[body.inputs]]
+name = "sim_cube_pose"
+
+[body.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [7]
+time = "Tick"
+
+[body.inputs.ty.unit.Normalized]
+hi = 0.3
+lo = -0.3
+
 [body.nodes]
 schema_version = 1
 
@@ -74,6 +100,16 @@ port = "out"
 [body.nodes.edges.to]
 node = 2
 port = "state"
+
+[[body.nodes.edges]]
+
+[body.nodes.edges.from]
+node = 6
+port = "out"
+
+[body.nodes.edges.to]
+node = 2
+port = "cube"
 
 [[body.nodes.edges]]
 
@@ -112,6 +148,10 @@ port = "rgb_overhead"
 [[body.nodes.inputs]]
 node = 1
 port = "joint_state"
+
+[[body.nodes.inputs]]
+node = 6
+port = "sim_cube_pose"
 
 [body.nodes.nodes.0.VisionEncoder]
 backbone = "ResNet18"
@@ -186,6 +226,16 @@ shape = [512]
 time = "Tick"
 unit = "Dimensionless"
 
+[[body.nodes.nodes.2.Fusion.inputs]]
+name = "cube"
+
+[body.nodes.nodes.2.Fusion.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [512]
+time = "Tick"
+unit = "Dimensionless"
+
 [body.nodes.nodes.3.TemporalEncoder]
 kind = "Transformer"
 n_frames = 1
@@ -243,6 +293,29 @@ time = "Tick"
 hi = 1.0
 lo = -1.0
 
+# The privileged branch (packet M5/V7a). Its own encoder rather than a wider `joint_state`:
+# the arm's six angles come off real encoders and the cube's seven numbers come off nothing a
+# robot carries, so they stay two ports all the way from the Task IR channel to here -- which
+# is also what lets the vision packet drop this one without moving `joint_state`'s hash.
+[body.nodes.nodes.6.StateEncoder]
+out_dim = 512
+
+[[body.nodes.nodes.6.StateEncoder.inputs]]
+name = "sim_cube_pose"
+
+[body.nodes.nodes.6.StateEncoder.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [7]
+time = "Tick"
+
+[body.nodes.nodes.6.StateEncoder.inputs.ty.unit.Normalized]
+hi = 0.3
+lo = -0.3
+
+[body.nodes.nodes.6.StateEncoder.kind.Mlp]
+hidden = [256]
+
 [[body.nodes.outputs]]
 node = 5
 port = "actions"
@@ -286,6 +359,19 @@ time = "Tick"
 [body.policy.contract.inputs.joint_state.ty.unit.Normalized]
 hi = 1.0
 lo = -1.0
+
+[body.policy.contract.inputs.sim_cube_pose]
+name = "sim_cube_pose"
+
+[body.policy.contract.inputs.sim_cube_pose.ty]
+elem = "F32"
+frame = "Policy"
+shape = [7]
+time = "Tick"
+
+[body.policy.contract.inputs.sim_cube_pose.ty.unit.Normalized]
+hi = 0.3
+lo = -0.3
 
 [body.policy.contract.inputs.rgb_overhead]
 name = "rgb_overhead"

@@ -153,8 +153,25 @@ fn bake(args: &[String]) -> Result<u8, CliError> {
         .map_err(|e| CliError::Runtime(format!("{}: {e}", policy.display())))?;
     let bundle = PolicyBundle::open(&bytes)
         .map_err(|e| CliError::Runtime(format!("{}: {e}", policy.display())))?;
-    let mut plan = ObservationBake::new(&bundle.observation, &bundle.task)
-        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    // No model first: a channel that reads the leading `dof` of the recorded row needs
+    // none, and asking for one would make every bake spawn a physics backend. Only a channel
+    // that names a joint needs its `qpos` range, and the sole authority on that layout is the
+    // backend that will also run the scene -- deriving it from the MJCF here would be a
+    // second implementation of exactly the kind packet M5/V2b removed.
+    let mut plan = match ObservationBake::new(&bundle.observation, &bundle.task, None) {
+        Ok(plan) => plan,
+        Err(model_free) => {
+            let model = load_model(&bundle.task.scene.path).map_err(|why| {
+                CliError::Runtime(format!(
+                    "{model_free}\n  and the scene \"{}\" could not be loaded to resolve it: \
+                     {why}",
+                    bundle.task.scene.path
+                ))
+            })?;
+            ObservationBake::new(&bundle.observation, &bundle.task, Some(&model))
+                .map_err(|e| CliError::Runtime(e.to_string()))?
+        }
+    };
     // Every output is stacked into an F32 tensor, which is the one dtype `write_safetensors`
     // emits (spec 8.4's `runtime.dtype` on this path). A plan that ends in anything else is
     // named here rather than silently narrowed.
@@ -353,4 +370,20 @@ fn info(args: &[String]) -> Result<u8, CliError> {
     println!("  schema:  {}", hex(&identity.schema));
     println!("  split:   {}", hex(&identity.split));
     Ok(0)
+}
+
+/// The `ModelInfo` of the scene the Task IR names — the `qpos` ranges a joint-named
+/// observation channel resolves against (packet M5/V7a).
+///
+/// `MuJoCoCpuBackend` is the same loader `es loop collect` and `es eval run` use, so the
+/// ranges a bake indexes the recorded row with are the ranges the run that recorded it
+/// indexed `qpos` with.
+fn load_model(scene: &str) -> Result<es_physics_core::ModelInfo, String> {
+    use es_physics_core::{LoadConfig, PhysicsBackend};
+
+    let xml = std::fs::read_to_string(scene).map_err(|e| format!("{scene}: {e}"))?;
+    let parsed = es_assets::parse_mjcf(&xml).map_err(|e| format!("{scene}: {e}"))?;
+    es_physics_backend::MuJoCoCpuBackend::new()
+        .load(&parsed.scene, &LoadConfig::default())
+        .map_err(|e| e.to_string())
 }

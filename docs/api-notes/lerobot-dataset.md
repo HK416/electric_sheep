@@ -482,3 +482,28 @@ after, even from the same seed. That is the intended behaviour — the schema is
 run's input identity — and it is why V1c re-collects rather than patching the existing set. Both
 columns cross `es dataset export --lerobot-v3` unchanged (`export_layout_is_v3`), and `lerobot`
 0.6.1 reads a dataset that carries the extra feature (`lerobot_v3_export`).
+
+### `observation.state` is `qpos ‖ qvel`, and packet M5/V7a depends on it
+
+`es_data::collect::to_lerobot` writes the row as the **whole** of env 0's `qpos` followed by
+the whole of its `qvel` — width `nq + nv`, never a joint subset. For the SO-101 demo scene that
+is `13 + 12 = 25`: six arm hinges at `qpos[0..6]`, the cube's free joint at `qpos[6..13]`
+(position `xyz` then quaternion `wxyz`), and the matching `qvel` behind them. `features`
+declares it as one `float32` feature of that width, and both the v2.1 writer and the v3.0
+exporter carry it with no special case.
+
+Two consequences, both load-bearing:
+
+* **A `qpos` `IndexRange` indexes the recorded row directly.** `es_eval::runner::capture` reads
+  `StateView::qpos_of(0)[r]` at inference; `es_eval::ObservationBake` reads `row[r]` from the
+  parquet. Same two bounds, no translation — the row is not a re-encoding of the state, it is
+  the state with `qvel` appended. That is what lets the demo's privileged `sim_cube_pose`
+  channel bake bit-identically to what inference serves
+  (`a_baked_frame_is_bit_identical_to_what_capture_serves`).
+* **`observation.state` already carried the cube's pose before V7a wanted it.** No column was
+  added and `dataset_schema_hash` did not move for this packet; what moved is which slices of
+  the row the Observation IR reads.
+
+The `names` list in the v2.1 example above (`["shoulder_pan", ...]`) illustrates LeRobot's own
+convention and is *not* what this writer emits for the demo: a 25-wide row of `qpos ‖ qvel` has
+no one-name-per-joint reading.

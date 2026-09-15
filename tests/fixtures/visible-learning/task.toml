@@ -8,6 +8,15 @@
 # max_episode_steps = 900 (18 s, against a scripted demonstration that takes about 7),
 # image 96x96 Rgb8 from the one fixed `overhead` camera.
 #
+# `sim_cube_pose` IS SIMULATOR-PRIVILEGED. A real SO-101 has no sensor that reports where the
+# cube is; this channel is the simulator handing the policy an answer, so that stage 1 of the
+# demo can ask whether the policy can do the task *given* the cube's pose before asking whether
+# it can find a 25 mm cube in a 96x96 frame (packet M5/V7a, design note section 7.14). Nothing
+# validates that: `ObsChannel` is { source, ty } and spec 7.4 says nothing else belongs there,
+# so the `sim_` prefix is the whole of the mark, and it is carried unchanged by the Observation
+# IR output port, the Learning IR input and the policy contract. A deployment aimed at hardware
+# must drop this channel; the vision packet is the one that does.
+#
 # This document *declares* the ObservationSpec and owns no preprocessing and no neural net
 # (spec 5.1): the image chain is observation.toml, the policy is learning.toml. The channel
 # is declared as the renderer delivers it -- U8, HWC [96, 96, 3] -- and observation.toml's
@@ -275,6 +284,36 @@ port = "value"
 
 [body.graph.edges.to]
 node = 16
+port = "value"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 34
+port = "pos"
+
+[body.graph.edges.to]
+node = 35
+port = "in0"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 34
+port = "quat"
+
+[body.graph.edges.to]
+node = 35
+port = "in1"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 35
+port = "value"
+
+[body.graph.edges.to]
+node = 36
 port = "value"
 
 [body.graph.nodes.0.GetSensor]
@@ -586,6 +625,37 @@ Joint = "501f1cde65535d4d1900d14204382d3c"
 op = "And"
 shape = [1]
 
+[body.graph.nodes.34.GetBodyPose]
+body = "9350d8ecdcc712946de16861aaa95dda"
+relative_to = "World"
+
+[body.graph.nodes.35.Concat]
+axis = 0
+
+[[body.graph.nodes.35.Concat.parts]]
+elem = "F32"
+frame = "World"
+shape = [3]
+time = "Tick"
+unit = "Length"
+
+[[body.graph.nodes.35.Concat.parts]]
+elem = "F32"
+frame = "World"
+shape = [4]
+time = "Tick"
+unit = "Quaternion"
+
+[body.graph.nodes.36.ObservationSpec]
+channel = "sim_cube_pose"
+
+[body.graph.nodes.36.ObservationSpec.ty]
+elem = "F32"
+frame = "World"
+shape = [7]
+time = "Tick"
+unit = "Length"
+
 [body.graph.nodes.4.ActionSpec]
 control_rate_hz = 50.0
 dim = 6
@@ -711,6 +781,17 @@ skew = 0.0
 [body.observation_spec.channels.rgb_overhead.ty.time.Sensor]
 align = "Hold"
 id = "8bc1e495c4728e7e2fc66b3137c4ca10"
+
+[body.observation_spec.channels.sim_cube_pose.source.JointState]
+body = "3c949ea0617b793a8ff5fbb816c4b662"
+dof = 7
+
+[body.observation_spec.channels.sim_cube_pose.ty]
+elem = "F32"
+frame = "World"
+shape = [7]
+time = "Tick"
+unit = "Length"
 
 [body.scene]
 asset_hash = [

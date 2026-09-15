@@ -829,6 +829,12 @@ pub(crate) fn input_sources(
 ) -> Result<BTreeMap<String, Capture>, EvalError> {
     use es_ir::task::ObsSource;
 
+    let state_channels = task
+        .observation_spec
+        .channels
+        .values()
+        .filter(|c| matches!(c.source, ObsSource::JointState { .. }))
+        .count();
     let mut out = BTreeMap::new();
     for (name, id) in &plan.inputs {
         if !matches!(plan.buffers[id.0].home, Home::Input(_)) {
@@ -854,6 +860,20 @@ pub(crate) fn input_sources(
         } else if let Some(r) = model.and_then(|m| m.sensor.get(&source)) {
             Capture::Sensor(*r)
         } else if let Some(dof) = joints {
+            // "The leading `dof` of the row" can place at most one channel. Once the
+            // `ObservationSpec` declares a second `JointState` channel, which of them starts
+            // at `qpos[0]` is not in the documents — it is in the model that ran — so a
+            // model-free resolution is refused by name here rather than silently served the
+            // wrong values (packet M5/V7a). With a model, the joint-named channel has already
+            // been answered by the `Qpos` arm above and never reaches this one.
+            if model.is_none() && state_channels > 1 {
+                return Err(EvalError::Plan(format!(
+                    "observation input \"{name}\" is one of {state_channels} JointState \
+                     channels, and there is no loaded model here (the frames are recorded): \
+                     only one channel can be the leading {dof} values of the row, and the \
+                     documents do not say which"
+                )));
+            }
             Capture::Joints(dof)
         } else {
             let model = if model.is_some() {

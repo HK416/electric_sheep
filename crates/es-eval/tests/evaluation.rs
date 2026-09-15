@@ -1646,6 +1646,33 @@ fn the_frames_are_byte_identical_across_runs() {
 
 // --- packet M5/V2b: the training set goes through the same executor -------------------------
 
+/// The privileged channel's name in this fixture (packet M5/V7a).
+const SIM_J1: &str = "sim_j1";
+
+/// [`task_ir`] plus the privileged channel the branch above implements. Separate rather than
+/// folded into `task_ir` so every other test in this file keeps the `task_hash` it had.
+///
+/// The channel names the **joint** `j1`, not a body: `input_sources` resolves a source id
+/// against `ModelInfo::qpos` before it falls back to the channel's leading-`dof` reading, and
+/// that is what serves the port `qpos[1..2]` on both the inference and the bake path.
+fn privileged_task_ir() -> TaskIr {
+    let mut task = task_ir();
+    task.observation_spec.channels.insert(
+        SIM_J1.to_owned(),
+        es_ir::task::ObsChannel {
+            source: ObsSource::JointState {
+                body: joint_id("j1"),
+                dof: 1,
+            },
+            ty: PortType {
+                frame: Frame::Joint(joint_id("j1")),
+                ..joint_ty(Unit::Angle)
+            },
+        },
+    );
+    task
+}
+
 /// A demo-shaped Observation IR: `StateInput -> Normalize{−1..1}` **and**
 /// `ImageInput -> Dequantize -> Normalize{0..1}`, which is the shape of
 /// `tests/fixtures/visible-learning/observation.toml`. The state input names the **body** the
@@ -1703,9 +1730,36 @@ fn baked_observation_ir(task_ref: [u8; 32]) -> ObservationIr {
             io: Io::unary(raw, norm.clone()),
         },
     );
+    // The privileged branch (packet M5/V7a), and the reason it is `j1` and not `j0`: `j1`'s
+    // `qpos` range starts at 1, so a bake that read "the leading `dof` of the recorded row"
+    // would serve `q[0]` here. The demo's own privileged channel is the cube's free joint at
+    // `qpos[6..13]`; this is the same shape of reading at the smallest size that has it.
+    let raw_j1 = PortType {
+        frame: Frame::Joint(joint_id("j1")),
+        ..joint_ty(Unit::Angle)
+    };
+    let norm_j1 = PortType {
+        unit: Unit::Normalized { lo: 0.0, hi: 2.0 },
+        ..raw_j1.clone()
+    };
+    ir.graph.insert(
+        NodeId(5),
+        ObservationNode::StateInput {
+            source: joint_id("j1"),
+            io: Io::source(raw_j1.clone()),
+        },
+    );
+    ir.graph.insert(
+        NodeId(6),
+        ObservationNode::Normalize {
+            stats: NormalizeStats::Range { lo: 0.0, hi: 2.0 },
+            io: Io::unary(raw_j1, norm_j1.clone()),
+        },
+    );
     ir.graph.connect(NodeId(0), "out", NodeId(1), "in0");
     ir.graph.connect(NodeId(1), "out", NodeId(2), "in0");
     ir.graph.connect(NodeId(3), "out", NodeId(4), "in0");
+    ir.graph.connect(NodeId(5), "out", NodeId(6), "in0");
     ir.outputs = BTreeMap::from([
         (
             "rgb".to_owned(),
@@ -1719,6 +1773,13 @@ fn baked_observation_ir(task_ref: [u8; 32]) -> ObservationIr {
             ObservationOutput {
                 port: PortRef::new(NodeId(4), "out"),
                 ty: norm,
+            },
+        ),
+        (
+            SIM_J1.to_owned(),
+            ObservationOutput {
+                port: PortRef::new(NodeId(6), "out"),
+                ty: norm_j1,
             },
         ),
     ]);
@@ -1777,7 +1838,7 @@ impl PolicyRuntime for RecordingPolicy {
 #[test]
 fn a_baked_frame_is_bit_identical_to_what_capture_serves() {
     let ir = one_suite(Vec::new());
-    let task = task_ir();
+    let task = privileged_task_ir();
     let obs = baked_observation_ir(task.task_hash().expect("task hashes"));
 
     // The frame source is also the recorder: it is handed the very `StateView` `capture` reads,
@@ -1814,9 +1875,20 @@ fn a_baked_frame_is_bit_identical_to_what_capture_serves() {
     );
     assert!(recorded.len() >= N_EPISODES as usize, "{}", recorded.len());
 
-    let mut bake = es_eval::ObservationBake::new(&obs, &task).expect("the bake compiles");
+    // The model is the one the run resolved against, and it is what carries `j1`'s `qpos`
+    // range. `observation.state` is `qpos ‖ qvel`, so that range indexes the recorded row
+    // exactly as `capture` indexes `StateView::qpos_of(0)`.
+    let mut bake =
+        es_eval::ObservationBake::new(&obs, &task, Some(&model())).expect("the bake compiles");
     let ports: Vec<String> = bake.outputs().map(|(n, _, _)| n.to_owned()).collect();
-    assert_eq!(ports, vec!["joint_state".to_owned(), "rgb".to_owned()]);
+    assert_eq!(
+        ports,
+        vec![
+            "joint_state".to_owned(),
+            "rgb".to_owned(),
+            SIM_J1.to_owned()
+        ]
+    );
     for (frame, ((state, tile), served)) in recorded.iter().zip(&policy.seen).enumerate() {
         let baked = bake
             .frame(state, &mut |_| Ok(tile.clone()))
@@ -1843,9 +1915,25 @@ fn a_baked_frame_is_bit_identical_to_what_capture_serves() {
         last["rgb"].data, *raw_tile,
         "the image Dequantize did not fire"
     );
+    // Non-vacuity for the privileged port (packet M5/V7a): it must be `q[1] / 2`, and `q[1]`
+    // must differ from `q[0]`, or the byte comparison above would pass on a bake that read the
+    // leading value of the row for both state ports -- which is what one did before this
+    // packet, and what it still does for any channel that names a body rather than a joint.
+    let privileged = f32::from_le_bytes(last[SIM_J1].data[..4].try_into().expect("4 bytes"));
+    assert!(
+        (f64::from(privileged) - raw_q[1] / 2.0).abs() < 1e-6,
+        "the privileged Normalize did not fire: {privileged} for q[1] = {}",
+        raw_q[1]
+    );
+    assert!(
+        (raw_q[1] - raw_q[0]).abs() > 1e-3,
+        "q[0] and q[1] coincide ({}, {}), so the offset is untested",
+        raw_q[0],
+        raw_q[1]
+    );
     println!(
-        "RAN observation_bake_bit_identity: {} frames x {} ports, byte-equal; state Normalize \
-         and image Dequantize both fired",
+        "RAN observation_bake_bit_identity: {} frames x {} ports, byte-equal; state Normalize, \
+         image Dequantize and the privileged qpos[1..2] port all fired",
         recorded.len(),
         ports.len()
     );
@@ -1860,7 +1948,7 @@ fn a_bake_refuses_an_input_the_dataset_cannot_feed() {
     // `observation_ir`'s `StateInput` names joint `j0`, which resolves through `ModelInfo::qpos`
     // at inference and through nothing at all here.
     let obs = observation_ir(task.task_hash().expect("task hashes"), None);
-    let err = es_eval::ObservationBake::new(&obs, &task).expect_err("a qpos input");
+    let err = es_eval::ObservationBake::new(&obs, &task, None).expect_err("a qpos input");
     let EvalError::Plan(message) = &err else {
         panic!("expected EvalError::Plan, got {err}");
     };
@@ -1868,6 +1956,26 @@ fn a_bake_refuses_an_input_the_dataset_cannot_feed() {
         message.contains("there is no loaded model here: the frames are recorded"),
         "{message}"
     );
+}
+
+/// Two `JointState` channels and no model is the one case the leading-`dof` convention cannot
+/// answer, and the bake says so at construction rather than serving one of them the other's
+/// values (packet M5/V7a). It is the refusal `es dataset bake` catches to go and load the
+/// scene's `qpos` ranges.
+#[test]
+fn a_bake_refuses_two_state_channels_without_a_model() {
+    let task = privileged_task_ir();
+    let obs = baked_observation_ir(task.task_hash().expect("task hashes"));
+    let err = es_eval::ObservationBake::new(&obs, &task, None).expect_err("two state channels");
+    let EvalError::Plan(message) = &err else {
+        panic!("expected EvalError::Plan, got {err}");
+    };
+    assert!(
+        message.contains("only one channel can be the leading"),
+        "{message}"
+    );
+    // And the same pair resolves once the model that ran is handed over.
+    es_eval::ObservationBake::new(&obs, &task, Some(&model())).expect("with the model");
 }
 
 // --- packet M5/V5: `--jobs N` is a partition of the cells ------------------------------------

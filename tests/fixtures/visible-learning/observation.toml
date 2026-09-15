@@ -19,6 +19,16 @@
 #
 # `StateInput` names the robot's `base` body, which is what the Task IR channel declares
 # (spec 7.4 / XIR-002) and what DEP-031 measures the Safety Plane envelope against.
+#
+# The second state branch is `sim_cube_pose`, and IT IS SIMULATOR-PRIVILEGED (packet M5/V7a,
+# design note section 7.14): no robot reports where the cube is. Its `StateInput` names the
+# cube's **free joint**, not the cube body, which is what makes the reading exact --
+# `input_sources` resolves a source id against `ModelInfo.qpos` before it falls back to the
+# Task IR channel's leading-`dof` reading, so the port is served the joint's own qpos[6..13] at
+# inference and the same range of the recorded `observation.state` row (`qpos || qvel`) when
+# `es dataset bake` reads it. Its `Normalize{Range}` is +-0.3 m, the arm's reach, which holds
+# both the cube's draw and the bin's interior; the quaternion's four values leave [0, 1] under
+# that range, which is harmless (a Normalize is affine, not a clamp) and deliberate.
 
 es_schema = 1
 kind = "observation"
@@ -26,38 +36,38 @@ kind = "observation"
 [body]
 schema_version = 1
 task_ref = [
-    174,
-    194,
-    174,
-    169,
-    224,
+    108,
+    248,
+    38,
+    193,
+    103,
+    254,
+    242,
+    88,
+    65,
     76,
-    176,
-    244,
-    178,
+    228,
+    9,
+    255,
+    81,
+    227,
+    16,
+    161,
     36,
-    164,
-    157,
-    161,
-    32,
-    161,
-    163,
-    156,
-    208,
-    68,
-    153,
-    166,
-    185,
-    41,
-    234,
-    11,
-    240,
-    194,
-    204,
-    250,
-    245,
-    27,
-    241,
+    15,
+    219,
+    75,
+    66,
+    181,
+    16,
+    53,
+    29,
+    91,
+    174,
+    62,
+    63,
+    107,
+    123,
 ]
 
 [body.graph]
@@ -93,6 +103,16 @@ port = "out"
 
 [body.graph.edges.to]
 node = 1
+port = "in0"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 5
+port = "out"
+
+[body.graph.edges.to]
+node = 6
 port = "in0"
 
 [body.graph.nodes.0.ImageInput]
@@ -393,6 +413,40 @@ skew = 0.0
 align = "Hold"
 id = "8bc1e495c4728e7e2fc66b3137c4ca10"
 
+[body.graph.nodes.5.StateInput]
+source = "3c949ea0617b793a8ff5fbb816c4b662"
+
+[body.graph.nodes.5.StateInput.io]
+inputs = []
+
+[body.graph.nodes.5.StateInput.io.output]
+elem = "F32"
+frame = "World"
+shape = [7]
+time = "Tick"
+unit = "Length"
+
+[[body.graph.nodes.6.Normalize.io.inputs]]
+elem = "F32"
+frame = "World"
+shape = [7]
+time = "Tick"
+unit = "Length"
+
+[body.graph.nodes.6.Normalize.io.output]
+elem = "F32"
+frame = "World"
+shape = [7]
+time = "Tick"
+
+[body.graph.nodes.6.Normalize.io.output.unit.Normalized]
+hi = 0.3
+lo = -0.3
+
+[body.graph.nodes.6.Normalize.stats.Range]
+hi = 0.3
+lo = -0.3
+
 [body.outputs.joint_state.port]
 node = 3
 port = "out"
@@ -464,6 +518,20 @@ id = "8bc1e495c4728e7e2fc66b3137c4ca10"
 [body.outputs.rgb_overhead.ty.unit.Normalized]
 hi = 1.0
 lo = 0.0
+
+[body.outputs.sim_cube_pose.port]
+node = 6
+port = "out"
+
+[body.outputs.sim_cube_pose.ty]
+elem = "F32"
+frame = "World"
+shape = [7]
+time = "Tick"
+
+[body.outputs.sim_cube_pose.ty.unit.Normalized]
+hi = 0.3
+lo = -0.3
 
 [body.temporal.history]
 

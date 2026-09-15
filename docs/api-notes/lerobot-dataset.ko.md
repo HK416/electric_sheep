@@ -468,3 +468,27 @@ v2.1 필드인 `total_videos`와 `total_chunks`는 v3.0 필드가 *아니며* �
 세트를 패치하는 대신 재수집하는 이유다. 두 컬럼 모두 `es dataset export --lerobot-v3`를 그대로
 통과하고(`export_layout_is_v3`), `lerobot` 0.6.1은 추가 피처를 실은 데이터셋을 읽는다
 (`lerobot_v3_export`).
+
+### `observation.state`는 `qpos ‖ qvel`이고, 패킷 M5/V7a는 이에 의존한다
+
+`es_data::collect::to_lerobot`는 이 행을 env 0의 `qpos` **전체** 뒤에 `qvel` **전체**를 붙여
+쓴다. 폭은 `nq + nv`이고, 관절의 일부를 고른 적은 한 번도 없다. SO-101 데모 씬에서는
+`13 + 12 = 25`다: `qpos[0..6]`에 팔의 여섯 힌지, `qpos[6..13]`에 큐브의 free 조인트
+(위치 `xyz` 다음 쿼터니언 `wxyz`), 그 뒤에 대응하는 `qvel`. `features`는 이를 그 폭의 `float32`
+피처 하나로 선언하며, v2.1 라이터도 v3.0 익스포터도 특수 분기 없이 실어 나른다.
+
+여기서 두 가지 귀결이 나오고, 둘 다 설계를 떠받친다:
+
+* **`qpos`의 `IndexRange`가 기록된 행을 그대로 인덱싱한다.** 추론에서
+  `es_eval::runner::capture`는 `StateView::qpos_of(0)[r]`을 읽고, `es_eval::ObservationBake`는
+  parquet에서 `row[r]`을 읽는다. 같은 두 경계이며 변환이 없다 — 이 행은 상태의 재인코딩이
+  아니라 상태에 `qvel`을 덧붙인 것이다. 데모의 특권 채널 `sim_cube_pose`가 추론이 내어주는
+  값과 비트 단위로 동일하게 bake되는 근거가 바로 이것이다
+  (`a_baked_frame_is_bit_identical_to_what_capture_serves`).
+* **`observation.state`는 V7a가 필요로 하기 전부터 이미 큐브의 포즈를 싣고 있었다.** 이 패킷은
+  컬럼을 추가하지 않았고 `dataset_schema_hash`도 움직이지 않았다. 움직인 것은 Observation IR이
+  그 행의 어느 구간을 읽는가다.
+
+위 v2.1 예시의 `names` 목록(`["shoulder_pan", ...]`)은 LeRobot 자신의 관례를 보여줄 뿐,
+데모에서 이 라이터가 내보내는 것이 아니다. `qpos ‖ qvel` 25칸 행에는 관절당 이름 하나라는
+읽기가 존재하지 않는다.

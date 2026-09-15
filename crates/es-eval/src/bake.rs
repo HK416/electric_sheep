@@ -23,6 +23,7 @@ use es_compile::{CpuPlan, Home, PlanMode, Tensor, TensorRef};
 use es_ir::observation::ObservationIr;
 use es_ir::task::TaskIr;
 use es_ir::types::ElemType;
+use es_physics_core::backend::ModelInfo;
 
 use crate::runner::{elem_bytes, encode_state, input_sources, Capture};
 use crate::EvalError;
@@ -37,15 +38,24 @@ pub struct ObservationBake {
 impl ObservationBake {
     /// Compiles the plan and resolves every input once, before any frame.
     ///
-    /// `PlanMode::Release` and no `ModelInfo`, both deliberately: release is what
-    /// `Evaluation::run` compiles, and a recorded dataset carries `observation.state` plus
-    /// tiles and nothing else — so an input that would have been read out of a loaded model's
-    /// `qpos` or `sensordata` is named and refused here rather than turned into a guessed
-    /// offset into a row.
-    pub fn new(obs: &ObservationIr, task: &TaskIr) -> Result<Self, EvalError> {
+    /// `PlanMode::Release` deliberately: it is what `Evaluation::run` compiles.
+    ///
+    /// `model` is the same [`ModelInfo`] `Evaluation::run` resolves against, and it is
+    /// [`None`] whenever the Observation IR does not need one. A recorded dataset carries
+    /// `observation.state` and tiles, so a channel that resolves through
+    /// `ObsSource::JointState { body, dof }` — the leading `dof` of the row — needs no model
+    /// at all. A channel that names a *joint* resolves to its `qpos` [`IndexRange`] instead
+    /// (packet M5/V7a: the cube's free joint does not start at `qpos[0]`, so "the leading
+    /// `dof`" cannot express it), and that range has to come from the model that ran. Without
+    /// one, the input is named and refused here rather than turned into a guessed offset.
+    pub fn new(
+        obs: &ObservationIr,
+        task: &TaskIr,
+        model: Option<&ModelInfo>,
+    ) -> Result<Self, EvalError> {
         let plan = CpuPlan::compile(obs, PlanMode::Release)
             .map_err(|d| EvalError::Plan(d.iter().map(ToString::to_string).collect()))?;
-        let sources = input_sources(&plan, obs, task, None)?;
+        let sources = input_sources(&plan, obs, task, model)?;
         Ok(Self { plan, sources })
     }
 
@@ -68,8 +78,8 @@ impl ObservationBake {
         })
     }
 
-    /// One frame: `state` is the recorded `observation.state` row — which is the arm's own
-    /// `qpos`, the way `es loop collect` records it — and `image` supplies a named image
+    /// One frame: `state` is the recorded `observation.state` row — which is `qpos ‖ qvel`,
+    /// the way `es_data::collect::to_lerobot` writes it — and `image` supplies a named image
     /// input's raw tile, unconverted.
     pub fn frame(
         &mut self,
@@ -113,13 +123,32 @@ impl ObservationBake {
                     }
                     data
                 }
-                // Unreachable: `input_sources` refused both at construction, because it was
-                // handed no model. Kept as a refusal rather than a panic so a later arm added
-                // to `Capture` fails loudly here instead of silently baking the wrong bytes.
-                Capture::Qpos(_) | Capture::Sensor(_) => {
+                // `observation.state` is `qpos ‖ qvel`, so a `qpos` range indexes the recorded
+                // row exactly as `capture` indexes `StateView::qpos_of(0)` — the same two
+                // bounds, not a translation of them. That is the whole reason this arm may
+                // exist: the row is not a re-encoding of the state, it is the state with
+                // `qvel` appended.
+                Capture::Qpos(r) => {
+                    let range = r.as_range();
+                    if state.len() < range.end {
+                        return Err(EvalError::Plan(format!(
+                            "observation input \"{name}\" reads qpos[{}..{}]; the recorded row \
+                             carries {} values",
+                            range.start,
+                            range.end,
+                            state.len()
+                        )));
+                    }
+                    encode_state(name, desc.dtype, desc.elems, &state[range])?
+                }
+                // Unreachable: `input_sources` refuses it at construction whenever the model is
+                // absent, and `sensordata` is not in the recorded row when it is present. Kept
+                // as a refusal rather than a panic so a later arm added to `Capture` fails
+                // loudly here instead of silently baking the wrong bytes.
+                Capture::Sensor(_) => {
                     return Err(EvalError::Plan(format!(
-                        "observation input \"{name}\" reads a loaded model; recorded frames \
-                         carry no model"
+                        "observation input \"{name}\" reads the model's sensordata; a recorded \
+                         row carries qpos and qvel only"
                     )))
                 }
             };

@@ -1521,6 +1521,124 @@ neither of which moved. Phase 2 re-measures V1c's committed 20,000-step bundle �
 knob moved — and that is the first evaluation table plan V has produced that measures the policy
 rather than the harness.
 
+### 7.14 As built (V7a phase 1): the cube's pose enters the state port, and what that is allowed to prove
+
+Packet `docs/packets/M5/V7a-privileged-state-policy.md`. Section 7.13 invalidated every
+evaluation number this demo had produced, so the next one has to be worth taking. The vision
+demo asks two questions at once — can this graph do the task, and can a from-scratch ResNet18
+find a 25 mm cube in 96×96 pixels — and V7a splits them by answering the first with the second
+removed: **the cube's pose is put into the state port.**
+
+It is stage 1 of the video, "state policy". Stage 2, vision at a higher resolution with more
+demonstrations, is a separate packet.
+
+**The stop rule, written down before the measurement.** If the state policy does not reach
+`success_rate ≥ 0.5` nominal on seeds 101–116, the next step is not a bigger model, a longer
+schedule or more demonstrations. It is the physics, the contact model or the expert's
+trajectories. A policy handed the cube's exact pose, the arm's exact joint angles and 50
+demonstrations of a 7-second scripted motion has no information left to lack.
+
+**1. The channel, and the three constraints that shaped it.** `sim_cube_pose` is a second
+`ObservationSpec` channel, `ObsSource::JointState { body: <the `cube_free` joint's id>, dof: 7 }`,
+typed `f32[7]`. Nothing was added to `es-ir`.
+
+* `es_eval::runner::input_sources` resolves a plan input's source id against `ModelInfo.qpos`
+  **before** it falls back to the Task IR channel's `dof`, and `ModelInfo.qpos` is keyed by
+  **joint** id. So a channel that names the `cube_free` joint is served `Capture::Qpos(6..13)` —
+  the joint's own seven values — while `joint_state`, which names the robot's `base` *body*,
+  keeps falling through to `Capture::Joints(6)`, "the leading six of the row". Both arms already
+  existed; this packet adds neither.
+* **Task IR-D cannot emit a free joint's `qpos`.** `GetJointState`'s output type is
+  `f32[joints.len()]`, one scalar per joint *name* — the ceiling section 5.4 recorded, and the
+  reason the success predicate sees the cube's `x` alone. The graph therefore shows the value as
+  `GetBodyPose{cube, World}` → `Concat{axis 0}` of `pos[3]` and `quat[4]` → `ObservationSpec`,
+  which the existing node set expresses and which type-checks edge for edge. The **channel**
+  names the joint rather than the body, because the channel decides the *reading*: through the
+  joint it is `qpos`, exactly; through the body it would be `xpos ‖ xquat`, which no recorded
+  dataset carries.
+* **`NormalizeStats::Range` is one `(lo, hi)` per port**, which is the second reason not to
+  simply widen `joint_state` from 6 to 13. At the state branch's `±1` the cube's 0.06 m draw
+  spans 0.03 of the output range; at `±0.3` — the arm's reach, containing both the draw
+  (`x ∈ [0.21, 0.27]`) and the bin's interior (`x ∈ [0.09, 0.19]`, `y ∈ [-0.15, -0.05]`) — it
+  spans 0.10. The quaternion's four values leave `[0, 1]` under that range (`w = 1` maps to
+  2.17); a `Normalize` is affine and not a clamp, and a box resting flat carries no signal
+  there, so it is written down rather than worked around.
+
+**2. Privilege is marked by name, because there is no field to mark it with.** `ObsChannel`
+carries `source` and `ty` and nothing else — §7.4 is explicit that the rest belongs to the
+Observation IR — so no `provenance` or `sim_only` field was invented. The mark is the `sim_`
+prefix, and it is carried unchanged by the Task IR channel, the Observation IR output port, the
+Learning IR input, the policy contract and `contract.json`, so it is visible at every hop of the
+chain. `sim_cube_pose` and not `sim.cube_pose`: the port name reaches Python as a key of
+`forward(**inputs)`, and a dot is a namespace separator in a LeRobot feature name.
+
+Keeping it a *second* port rather than a wider `joint_state` is also what lets the vision packet
+drop it again without moving `joint_state`'s hash. The arm's six angles come off real encoders;
+the cube's seven numbers come off nothing a robot carries, and the two do not get mixed into one
+tensor on the strength of both being floats.
+
+**3. The dataset needed nothing, and that was the finding.** `es_data::collect::to_lerobot`
+writes `observation.state` as env 0's whole `qpos` followed by its whole `qvel` — `13 + 12 = 25`
+for this scene — so the cube's pose has been in every demonstration since V1. No column was
+added, the v2.1 writer and the v3.0 export are untouched, and **`dataset_schema_hash` does not
+move**. What moved is which slices of the row the Observation IR reads.
+`docs/api-notes/lerobot-dataset.md` now records the layout, because the next three sentences
+depend on it.
+
+**4. The bake had to learn the offset, and the refusal matters more than the arm.** A `qpos`
+`IndexRange` indexes the recorded row with the same two bounds `capture` indexes
+`StateView::qpos_of(0)` with — the row is not a re-encoding of the state, it is the state with
+`qvel` appended. So `ObservationBake::frame` gains `Capture::Qpos(r) => row[r]` and
+`ObservationBake::new` gains the `Option<&ModelInfo>` V2b denied it, since a `qpos` range has to
+come from the model that ran; `es dataset bake` resolves model-free first and only loads the
+scene through `MuJoCoCpuBackend` when that is refused.
+
+The refusal is the part that had to be got right. Model-free, `Capture::Joints(dof)` means "the
+leading `dof` of the row", and **only one channel can be leading**. With a second `JointState`
+channel declared and no model, which one that is is not in the documents — it is in the model —
+so `input_sources` names the port and refuses. Without it the demo would have baked `row[..7]`,
+six arm angles and the cube's `x`, into the privileged port, and trained on it silently: the
+loss would have fallen, and the number would have meant nothing. That is the same class of
+defect as section 7.9's, caught before it produced a table rather than after.
+
+**5. What is pinned locally.** `a_baked_frame_is_bit_identical_to_what_capture_serves` now runs
+**two** state ports: `j0` through the leading-`dof` reading and `j1` — whose `qpos` range starts
+at **1** — through `Capture::Qpos`. Every output tensor of every frame is byte-equal to what the
+policy was served, with no tolerance, and the test asserts `q[0] ≠ q[1]` so it cannot pass by
+serving one port the other's values. `a_bake_refuses_two_state_channels_without_a_model` pins the
+refusal, and that the same pair resolves once the model is handed over.
+
+The two `es dataset bake` CLI tests now need `MuJoCoCpuBackend` and print a skip reason without
+it — the demo's second channel is resolved against the scene's `qpos` ranges, and the only
+authority on that layout is the backend that loads it. Deriving it from the MJCF here would be a
+second implementation of the kind section 7.9 removed. Their fixture row also became the real
+`qpos ‖ qvel` width (25) rather than the six values no run of `es loop collect` has ever written.
+
+**6. The hashes that moved.** All derived, all from the declared generator
+(`cargo test -p es --test cli -- --ignored regenerate_visible_learning_documents`):
+
+| slot | before (V6b) | after (V7a) |
+|---|---|---|
+| `task_hash` | `aec2aea9…1bf1` | `6cf826c1…6b7b` |
+| `observation_hash` | `f4a50730…f6e0` | `6c18f455…2daf` |
+| `learning_hash` | `82faf8c7…1b54` | `5dac0a46…46f0` |
+| `policy_hash` | `01583940…88cd` | `c94c2732…4a07` |
+| `evaluation_hash` | `5d70c21c…9ff7` | `0259fd44…f041e` |
+| `lowering_hash` | `956abb67…ec6d` | `fdd68ec4…0719` |
+| `deployment_hash` | `3b2ad568…6db1` | unchanged |
+| `compiler_hash` | `f2a02e84…70d6` | unchanged |
+| `dataset_schema_hash` | — | unchanged |
+
+`deployment_hash` is in the table so that it can be seen not to have moved: the envelope is V6's
+and V7a is forbidden from `es-safety`.
+
+**Not measured yet.** Everything above is local. The server run — bake the existing 50-episode
+set through the widened Observation IR, lower, train 20,000 steps on V2b's exact knobs with
+`--resident-gpu`, pack, sweep seeds 101–116 on the three checkpoints, then the six suites on the
+20,000-step bundle, then the 4×4 mosaic — is phase 2, and the tables here will be filled from it.
+The first command of that run is also the first real exercise of `es dataset bake`'s model load,
+which has no local coverage because this machine has no `mujoco`.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -1707,3 +1825,21 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     the collector's own function, with the buffer built from the Deployment IR. The double reset is
     gone. Every evaluation number in sections 7.8–7.11 is invalidated; every collection and
     training number carries forward.
+14. **Privilege has no field, and a `sim_` prefix is doing the work of one** (section 7.14).
+    `es_ir::task::ObsChannel` is `{ source, ty }` and §7.4 is explicit that nothing else belongs
+    there, so V7a marks `sim_cube_pose` by name rather than inventing a `provenance` or
+    `sim_only` flag. Nothing validates it: a Deployment IR aimed at a real SO-101 would happily
+    reference an Observation IR that reads a channel no robot can supply, and the only thing that
+    would stop it is a human reading the port name. Default: **keep the convention** — a field
+    with one user and no validator is the speculative abstraction `INV-17` exists to refuse, and
+    the vision packet is expected to delete this channel rather than deploy it. A human who wants
+    the chain to *enforce* it should ask for a validator rule (Deployment IR in `Real` execution
+    mode refuses an Observation IR whose Task IR channels are not all robot-supplied), which is a
+    spec change and an `es-ir` packet, not a field.
+15. **What the state policy is allowed to conclude** (section 7.14). V7a's stop rule says that if
+    the privileged policy does not reach `success_rate ≥ 0.5`, the next suspect is physics,
+    contact or the expert's trajectories — not model size. The converse is the open half: if it
+    *does* reach it, that is evidence the graph, envelope, expert and training loop are sound, and
+    it is **not** evidence that vision will work at 96×96 with 50 demonstrations. Default: treat a
+    passing state policy as the go-ahead for stage 2 at a *higher* resolution and a larger set,
+    and record the state policy's number as the ceiling the vision policy is measured against.

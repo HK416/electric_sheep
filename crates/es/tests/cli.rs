@@ -2924,7 +2924,7 @@ fn the_cube_free_joint_is_randomizable() {
     use es_physics_backend::MuJoCoCpuBackend;
     use es_physics_core::{LoadConfig, PhysicsBackend};
 
-    if let Err(reason) = MuJoCoCpuBackend::is_available() {
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
         println!("SKIP the_cube_free_joint_is_randomizable: {reason}");
         return;
     }
@@ -3006,6 +3006,15 @@ const TASK_HEADER: &str = "\
 # max_episode_steps = 900 (18 s, against a scripted demonstration that takes about 7),
 # image 96x96 Rgb8 from the one fixed `overhead` camera.
 #
+# `sim_cube_pose` IS SIMULATOR-PRIVILEGED. A real SO-101 has no sensor that reports where the
+# cube is; this channel is the simulator handing the policy an answer, so that stage 1 of the
+# demo can ask whether the policy can do the task *given* the cube's pose before asking whether
+# it can find a 25 mm cube in a 96x96 frame (packet M5/V7a, design note section 7.14). Nothing
+# validates that: `ObsChannel` is { source, ty } and spec 7.4 says nothing else belongs there,
+# so the `sim_` prefix is the whole of the mark, and it is carried unchanged by the Observation
+# IR output port, the Learning IR input and the policy contract. A deployment aimed at hardware
+# must drop this channel; the vision packet is the one that does.
+#
 # This document *declares* the ObservationSpec and owns no preprocessing and no neural net
 # (spec 5.1): the image chain is observation.toml, the policy is learning.toml. The channel
 # is declared as the renderer delivers it -- U8, HWC [96, 96, 3] -- and observation.toml's
@@ -3051,6 +3060,16 @@ const OBSERVATION_HEADER: &str = "\
 #
 # `StateInput` names the robot's `base` body, which is what the Task IR channel declares
 # (spec 7.4 / XIR-002) and what DEP-031 measures the Safety Plane envelope against.
+#
+# The second state branch is `sim_cube_pose`, and IT IS SIMULATOR-PRIVILEGED (packet M5/V7a,
+# design note section 7.14): no robot reports where the cube is. Its `StateInput` names the
+# cube's **free joint**, not the cube body, which is what makes the reading exact --
+# `input_sources` resolves a source id against `ModelInfo.qpos` before it falls back to the
+# Task IR channel's leading-`dof` reading, so the port is served the joint's own qpos[6..13] at
+# inference and the same range of the recorded `observation.state` row (`qpos || qvel`) when
+# `es dataset bake` reads it. Its `Normalize{Range}` is +-0.3 m, the arm's reach, which holds
+# both the cube's draw and the bin's interior; the quaternion's four values leave [0, 1] under
+# that range, which is harmless (a Normalize is affine, not a clamp) and deliberate.
 ";
 
 /// Adds `gripper is open` to the Task IR's success predicate, idempotently.
@@ -3174,6 +3193,115 @@ fn add_gripper_open_term(task: &mut es_ir::task::TaskIr) {
     task.graph.connect(and, "value", success, "value");
 }
 
+/// Packet M5/V7a: declares the cube's pose as a second `ObservationSpec` channel.
+///
+/// **`sim_cube_pose` is simulator-privileged.** A real SO-101 has no sensor that reports where
+/// the cube is; this channel exists so stage 1 of the demo can ask whether the policy can do
+/// the task *given* the cube's pose, before asking whether it can find a 25 mm cube in a 96x96
+/// frame. `ObsChannel` carries `source` and `ty` and nothing else (spec 7.4 forbids the rest),
+/// so there is no field to tag — the `sim_` prefix is the mark, and it is carried unchanged by
+/// the Observation IR output port, the Learning IR input and the policy contract.
+///
+/// Two ids, deliberately different. The graph *shows* the value as `GetBodyPose -> Concat`,
+/// because Task IR-D's `GetJointState` binds one scalar per joint name (design note section
+/// 5.4) and cannot emit a free joint's seven-wide `qpos`. The **channel** names the free joint
+/// instead, because that is what decides the reading: `es_eval::runner::input_sources` resolves
+/// a source id against `ModelInfo.qpos` first, so the channel is served as the joint's exact
+/// `qpos[6..13]` rather than as a body pose derived from it.
+fn add_privileged_cube_pose(
+    task: &mut es_ir::task::TaskIr,
+    scene: &es_assets::scene::SceneDesc,
+) -> (es_core::StableId, es_ir::types::PortType) {
+    use es_ir::graph::{Edge, NodeId, PortRef};
+    use es_ir::task::{ObsChannel, ObsSource, TaskNode};
+    use es_ir::types::{ElemType, Frame, PortType, Shape, TimeRef, Unit};
+
+    let joint = scene
+        .joints
+        .iter()
+        .find(|j| j.name == "cube_free")
+        .expect("the cube's free joint")
+        .id;
+    let body = scene
+        .bodies
+        .iter()
+        .find(|b| b.name == "cube")
+        .expect("the cube body")
+        .id;
+    let vec_of = |n: u64, unit: Unit| PortType {
+        elem: ElemType::F32,
+        shape: Shape::new([n]),
+        unit,
+        frame: Frame::World,
+        time: TimeRef::Tick,
+        image: None,
+    };
+    // `Unit::Length` for all seven: three of them are metres and the quaternion's four are
+    // dimensionless, and spec 5.4's algebra has no mixed unit. The position is what the policy
+    // is being given; the tail is named in the fixture header rather than mistyped.
+    let (pos, quat, pose) = (
+        vec_of(3, Unit::Length),
+        vec_of(4, Unit::Quaternion),
+        vec_of(7, Unit::Length),
+    );
+    let (get, cat, decl) = (NodeId(34), NodeId(35), NodeId(36));
+    task.graph.insert(
+        get,
+        TaskNode::GetBodyPose {
+            body,
+            relative_to: Frame::World,
+        },
+    );
+    task.graph.insert(
+        cat,
+        TaskNode::Concat {
+            parts: vec![pos, quat],
+            axis: 0,
+        },
+    );
+    task.graph.insert(
+        decl,
+        TaskNode::ObservationSpec {
+            channel: CUBE_POSE.to_owned(),
+            ty: pose.clone(),
+        },
+    );
+    // Idempotent: a second run replaces this packet's own edges rather than doubling them.
+    task.graph
+        .edges
+        .retain(|e| e.to.node != cat && e.to.node != decl);
+    task.graph.edges.extend([
+        Edge {
+            from: PortRef::new(get, "pos"),
+            to: PortRef::new(cat, "in0"),
+        },
+        Edge {
+            from: PortRef::new(get, "quat"),
+            to: PortRef::new(cat, "in1"),
+        },
+    ]);
+    task.graph.connect(cat, "value", decl, "value");
+    task.observation_spec.channels.insert(
+        CUBE_POSE.to_owned(),
+        ObsChannel {
+            source: ObsSource::JointState {
+                body: joint,
+                dof: 7,
+            },
+            ty: pose.clone(),
+        },
+    );
+    (joint, pose)
+}
+
+/// The privileged channel's name, shared by the Task IR channel, the Observation IR output
+/// port, the Learning IR input and the policy contract (packet M5/V7a).
+const CUBE_POSE: &str = "sim_cube_pose";
+
+/// The half-width, in metres, of the `Normalize{Range}` on `sim_cube_pose` -- the arm's reach,
+/// which contains the cube's draw and the bin's interior (packet M5/V7a).
+const CUBE_POSE_RANGE: f64 = 0.3;
+
 /// Regenerates `tests/fixtures/visible-learning/{task,observation}.toml` from the scene and
 /// from each other, so no hash in them is ever typed in by hand. Run explicitly:
 ///
@@ -3268,6 +3396,7 @@ fn regenerate_visible_learning_documents() {
         hwc(&mut channel.ty);
     }
     add_gripper_open_term(&mut task);
+    let (cube_joint, cube_pose_ty) = add_privileged_cube_pose(&mut task, &scene);
     let diags = task.validate();
     assert!(diags.is_empty(), "{diags:?}");
     write(
@@ -3337,6 +3466,58 @@ fn regenerate_visible_learning_documents() {
         obs.graph.connect(image_node, "out", deq, "in0");
         obs.graph.connect(deq, "out", sink.node, &sink.port);
     }
+
+    // --- the privileged state branch (packet M5/V7a) -----------------------------------
+    //
+    // `StateInput` names the cube's **free joint**, which is what makes this exact: with a
+    // model loaded, `input_sources` resolves a source id against `ModelInfo.qpos` before it
+    // falls back to the Task IR channel's leading-`dof` reading, so the port is served the
+    // joint's own `qpos[6..13]` at inference and the same range of the recorded
+    // `observation.state` row (`qpos || qvel`) when `es dataset bake` reads it.
+    //
+    // One `Normalize{Range}` covers all seven values, because `NormalizeStats::Range` is one
+    // (lo, hi) per port. +-0.3 m is the arm's reach: the cube's draw (x in [0.21, 0.27]) and
+    // the bin's interior (x in [0.09, 0.19], y in [-0.15, -0.05]) both sit inside it, and it
+    // is the bound that keeps the *position* signal wide -- the 0.06 m draw spans 0.10 of the
+    // output range here against 0.03 under the state branch's own +-1. The quaternion's four
+    // values leave [0, 1] under it (w = 1 maps to 2.17); that is harmless and deliberate, a
+    // `Normalize` is affine and not a clamp, and a box resting flat carries no signal there.
+    let cube_raw = cube_pose_ty;
+    let cube_norm = es_ir::types::PortType {
+        unit: es_ir::types::Unit::Normalized {
+            lo: -CUBE_POSE_RANGE,
+            hi: CUBE_POSE_RANGE,
+        },
+        ..cube_raw.clone()
+    };
+    let (state_in, normalize) = (es_ir::graph::NodeId(5), es_ir::graph::NodeId(6));
+    obs.graph.insert(
+        state_in,
+        ObservationNode::StateInput {
+            source: cube_joint,
+            io: Io::source(cube_raw.clone()),
+        },
+    );
+    obs.graph.insert(
+        normalize,
+        ObservationNode::Normalize {
+            stats: es_ir::observation::NormalizeStats::Range {
+                lo: -CUBE_POSE_RANGE,
+                hi: CUBE_POSE_RANGE,
+            },
+            io: Io::unary(cube_raw, cube_norm.clone()),
+        },
+    );
+    // Idempotent: a second run replaces this packet's own edge rather than doubling it.
+    obs.graph.edges.retain(|e| e.to.node != normalize);
+    obs.graph.connect(state_in, "out", normalize, "in0");
+    obs.outputs.insert(
+        CUBE_POSE.to_owned(),
+        es_ir::observation::ObservationOutput {
+            port: es_ir::graph::PortRef::new(normalize, "out"),
+            ty: cube_norm,
+        },
+    );
 
     let diags = obs.validate();
     assert!(diags.is_empty(), "{diags:?}");
@@ -4139,6 +4320,13 @@ fn policy_lower_writes_the_module_and_contract() {
         es_policy::lower::Contract::new(&module, &bundle.learning)
     );
     assert!(text.contains("lowering_hash: "), "{text}");
+    // Printed rather than pinned: no golden fixes the lowering, and a packet that moves the
+    // demo's Learning IR has to record where `lowering_hash` landed (design note section 7.6).
+    println!(
+        "RAN policy_lower: lowering_hash {} over inputs {:?}",
+        hex(&module.lowering_hash),
+        contract.inputs.keys().collect::<Vec<_>>()
+    );
 }
 
 /// `INV-16`: the only weight format is safetensors, and a file that is not one is refused by
@@ -4551,9 +4739,31 @@ fn visible_learning_demo_run() {
 
 // --- packet M5/V2b: `es dataset bake` ------------------------------------------------------
 
-/// The demo's own `observation.state` / `action` widths, and a tile the demo `ImageSpec` fits.
+/// The demo's own `action` width, and a tile the demo `ImageSpec` fits.
 const BAKE_DOF: usize = 6;
+
+/// The width of the demo scene's `observation.state` row: `qpos || qvel`, `nq = 13` (six arm
+/// hinges and the cube's seven-wide free joint) and `nv = 12`, exactly as
+/// `es_data::collect::to_lerobot` writes it. The old fixture wrote six values, which no run of
+/// `es loop collect` has ever produced -- it only passed because one channel read the leading
+/// six (packet M5/V7a).
+const BAKE_STATE: usize = 13 + 12;
+
 const BAKE_TILE: usize = 96 * 96 * 3;
+
+/// The demo's Observation IR has two `JointState` channels since packet M5/V7a, and only one
+/// of them can be the leading values of the recorded row, so `es dataset bake` resolves the
+/// other against the scene's `qpos` ranges -- which come from the backend that loads it. The
+/// executor itself is covered locally and backend-free by
+/// `a_baked_frame_is_bit_identical_to_what_capture_serves` (`es-eval`); what needs the backend
+/// here is only the CLI's plumbing around it.
+fn skip_without_bake_model(test: &str) -> bool {
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP {test}: {reason}");
+        return true;
+    }
+    false
+}
 
 /// Two short episodes with the columns the demo reads, plus the flat `<NNNNNN>.bin` tiles
 /// `es loop collect --frames` writes beside them.
@@ -4561,7 +4771,7 @@ fn write_bake_fixture(root: &Path, tiles: &Path, episodes: u32, frames: usize) {
     let mut features = BTreeMap::new();
     features.insert(
         "observation.state".to_owned(),
-        FeatureSpec::new(Dtype::Float32, [BAKE_DOF as u64]),
+        FeatureSpec::new(Dtype::Float32, [BAKE_STATE as u64]),
     );
     features.insert(
         "action".to_owned(),
@@ -4576,7 +4786,7 @@ fn write_bake_fixture(root: &Path, tiles: &Path, episodes: u32, frames: usize) {
         columns.insert(
             "observation.state".to_owned(),
             Column::F32(
-                (0..frames * BAKE_DOF)
+                (0..frames * BAKE_STATE)
                     .map(|i| (i as f32 % 7.0) / 7.0 - 0.5)
                     .collect(),
             ),
@@ -4614,6 +4824,9 @@ fn write_bake_fixture(root: &Path, tiles: &Path, episodes: u32, frames: usize) {
 /// names, plus a manifest that says which documents produced them (packet M5/V2b, spec 19.2).
 #[test]
 fn dataset_bake_writes_safetensors_and_a_manifest() {
+    if skip_without_bake_model("dataset_bake_writes_safetensors_and_a_manifest") {
+        return;
+    }
     let dir = scratch_dir("dataset-bake");
     let bundle = write_demo_bundle(&dir);
     let (root, tiles, out) = (dir.join("ds"), dir.join("tiles"), dir.join("baked"));
@@ -4681,6 +4894,9 @@ fn dataset_bake_writes_safetensors_and_a_manifest() {
 /// a file that looks complete and trains a policy on a blank camera (design note section 7.6).
 #[test]
 fn dataset_bake_without_frames_refuses_an_image_observation() {
+    if skip_without_bake_model("dataset_bake_without_frames_refuses_an_image_observation") {
+        return;
+    }
     let dir = scratch_dir("dataset-bake-nopix");
     let bundle = write_demo_bundle(&dir);
     let (root, tiles, out) = (dir.join("ds"), dir.join("tiles"), dir.join("baked"));
@@ -4709,4 +4925,50 @@ fn dataset_bake_without_frames_refuses_an_image_observation() {
         !out.join("episode_000000.safetensors").is_file(),
         "a refused bake left a file behind"
     );
+}
+
+/// The demo's two `JointState` channels cannot both be the leading values of the recorded row,
+/// so `es dataset bake` resolves model-free first and goes to the scene when that is refused
+/// (packet M5/V7a). Where the backend is missing -- PR CI, and this is the only coverage that
+/// branch has there -- both halves of the failure must be named: the refusal and why it could
+/// not be answered. Where the backend is present the two tests above cover the success, and
+/// this one steps aside rather than asserting an error that did not happen.
+#[test]
+fn dataset_bake_names_both_refusals_when_the_scene_cannot_be_loaded() {
+    let dir = scratch_dir("dataset-bake-nomodel");
+    let bundle = write_demo_bundle(&dir);
+    let (root, tiles, out) = (dir.join("ds"), dir.join("tiles"), dir.join("baked"));
+    write_bake_fixture(&root, &tiles, 1, 2);
+
+    let result = bin()
+        .args([
+            "dataset",
+            "bake",
+            "--policy",
+            bundle.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            root.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run es dataset bake");
+    let printed = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    if es_physics_backend::MuJoCoCpuBackend::is_available().is_ok() {
+        println!("SKIP dataset_bake_names_both_refusals: the backend resolved the channel");
+        return;
+    }
+    assert_eq!(result.status.code(), Some(1), "{printed}");
+    assert!(
+        printed.contains("only one channel can be the leading"),
+        "the model-free refusal is not in the message: {printed}"
+    );
+    assert!(
+        printed.contains("could not be loaded to resolve it"),
+        "why the refusal could not be answered is not in the message: {printed}"
+    );
+    println!("RAN dataset_bake_names_both_refusals");
 }
