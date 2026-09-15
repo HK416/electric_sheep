@@ -149,7 +149,7 @@ pub fn scene_to_mjcf(scene: &SceneDesc) -> Result<String, PhysicsError> {
             // The importer's root body *is* MJCF's implicit world body (P30 module docs), so
             // its contents go straight into <worldbody> rather than into a nested <body>.
             for geom in &root.geoms {
-                write_geom(&mut out, geom, 2)?;
+                write_geom(&mut out, &root.name, geom, 2)?;
             }
             if let Some(joints) = joints_by_body.get(&root.id) {
                 return Err(unsupported(format!(
@@ -229,7 +229,7 @@ fn write_body(
         write_joint(out, joint, depth + 1);
     }
     for geom in &body.geoms {
-        write_geom(out, geom, depth + 1)?;
+        write_geom(out, &body.name, geom, depth + 1)?;
     }
     for child in children.get(&body.id).into_iter().flatten() {
         write_body(out, child, children, joints_by_body, depth + 1)?;
@@ -271,7 +271,12 @@ fn write_joint(out: &mut String, joint: &Joint, depth: usize) {
     out.push_str("/>\n");
 }
 
-fn write_geom(out: &mut String, geom: &Geom, depth: usize) -> Result<(), PhysicsError> {
+fn write_geom(
+    out: &mut String,
+    owner: &str,
+    geom: &Geom,
+    depth: usize,
+) -> Result<(), PhysicsError> {
     let (kind, size) = match geom.shape {
         Shape::Plane {
             half_x,
@@ -306,10 +311,25 @@ fn write_geom(out: &mut String, geom: &Geom, depth: usize) -> Result<(), Physics
         }
     };
     let pad = "  ".repeat(depth);
+    // `MuJoCo` requires geom names to be unique across the model, while the scene names a
+    // geom the source left unnamed `geom<n>` with `n` counted per owner (`es_assets::scene`),
+    // so two bodies with unnamed geoms both carry a `geom1`. Nothing in the emitted file or
+    // in the Python side refers to a geom by name (contact pairs, sites and sensors on geoms
+    // are not emitted), so the name is a label: an auto-generated one is qualified by its
+    // owner, a source name is written verbatim.
+    let auto_named = geom
+        .name
+        .strip_prefix("geom")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let name = if auto_named {
+        format!("{owner}.{}", geom.name)
+    } else {
+        geom.name.clone()
+    };
     let _ = write!(
         out,
         "{pad}<geom name=\"{}\" type=\"{kind}\" size=\"{size}\"",
-        esc(&geom.name)
+        esc(&name)
     );
     attr(out, "pos", Some(vec3(geom.pose.position)));
     attr(out, "quat", quat(geom.pose.orientation));

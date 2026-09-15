@@ -154,7 +154,13 @@ fn field<'a>(json: &'a str, name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("the reference printed no \"{name}\": {json}"))
         .1
         .trim_start();
-    let end = after.find([',', '}']).unwrap_or(after.len() - 1);
+    // An array runs to its `]`; a scalar to the next separator. Cutting an array at its
+    // first `,` would hand back one element and call it the whole `qpos`.
+    let end = if after.starts_with('[') {
+        after.find(']').map_or(after.len(), |i| i + 1)
+    } else {
+        after.find([',', '}']).unwrap_or(after.len() - 1)
+    };
     after[..end].trim().trim_matches(['[', ']'].as_slice())
 }
 
