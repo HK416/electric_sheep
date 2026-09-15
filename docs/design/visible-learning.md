@@ -2478,6 +2478,176 @@ retrain with V2's exact knobs and compare against V8's 100,000-step numbers. Not
 plan V should move until that number exists, because every training and evaluation number the
 demo has produced was taken at four times the intended rate. Open question 18.
 
+### 7.19 As built (V11): one control step is one control period
+
+Packet `docs/packets/M5/V11-control-period.md`. Section 7.18's finding 4 — the demo ran at
+200 Hz while every document declared 50 — is fixed here, and open question 18's default **(b)**
+is what was built: keep the physics, decimate the control.
+
+**The derivation.** `BatchDomains::single_env_at(physics, control)` (`crates/es-env/src/scheduler.rs`)
+computes `period = physics / control` as an exact rational — `(pn·cd) / (pd·cn)` — and refuses a
+scene whose timestep does not divide the control period by name, with both rates in the message,
+rather than rounding it (App. B.5's validation style). For the demo that is `200 / 50 = 4`: one
+`Env::step` sets `ctrl` once, advances four physics ticks and records one row.
+`LoadConfig::rate` stays `None`, so the scene's own `timestep="0.005"` and therefore its contact
+behaviour are untouched — which is what the demonstrations and the M6 Go1 track both depend on.
+
+`observation.period` takes the same value, deliberately. `DomainRunner::observe_window` reads the
+state once *before* the window and then loops over the window's simulation ticks, so at
+`observation.period = 1` the same reading would be pushed into a `TemporalWindow` four times and
+the same frame rendered four times. One observation per control step is what the policy consumes.
+`rate.inference = 5` still means "re-plan every 10 control steps" — that is
+`action.execute_chunk` through the `ChunkBuffer` (section 7.13), untouched.
+
+It is wired into `Collector::run`, `es_eval::runner`, and the two section-7.18 tests that drive
+`Env` directly (through one `demo_domains` helper, so the tests step the scene the way the
+collector does). `es video showcase`'s `.estraj` record is **per control tick** and stays that
+way — both loops push one row after `step_with_policy` returns — so it is now a true 50 Hz record
+and `encode_video.py --fps 50` plays it in real time instead of at a quarter speed. Section
+7.17's table claims its 30 fps videos play at 0.6x the control rate; on 200 Hz ticks they were
+in fact 0.15x, and that is the only number in 7.17 this packet corrects. The dataset's
+`fps` was always `rate.control`; it is now true, and the rows really are 20 ms apart.
+`TickRate::from_period_secs` moves the timestep-to-ticks conversion into `es-core`, so the
+scheduler — which forbids `f64` time (§18.1) — can reach it without a second copy of the
+nanosecond rounding.
+
+Nothing in the canonical encoding changed, so **no fixture and no golden moved**; neither
+`regenerate_visible_learning_documents` nor `regenerate_quadruped_documents` had anything to do.
+
+**What the fix immediately exposed: the scripted expert stopped working.** At the true 50 Hz
+`expert_solves_the_pinned_seeds` scored **0/8**, every episode a timeout. Measured, by replaying
+the collected rows against the tool site with plain `mujoco`:
+
+| | measured |
+|---|---|
+| tool at the hover pose, xy distance to the latched cube | 0.0003 m (correct) |
+| tool z at the bottom of the descent, against a target of 0.0146 | **0.0033 m** |
+| cube displacement in the one control tick that hits it | **59 mm** |
+| `shoulder_lift` below its held command, afterwards | 0.018 rad |
+| the same joint, same `ctrl`, no contact, plain MuJoCo | 4.9e-4 rad |
+
+So the arm approaches correctly, **overshoots the grasp pose by about 11 mm**, drives the jaws
+into the table, swats the cube out of reach, and then rests on the table — where the waypoint
+machine's `pos_tol = 0.01` gate can never close again. The cause is a limit the scene cannot
+deliver: `velocity_max = 3.0` rad/s and `acceleration_max = 20` rad/s² against a `forcerange` of
+2.94 N·m leaves no braking authority at the bottom of the descent. It could not show before,
+because one control step was one 5 ms physics step and the arm was velocity-saturated for the
+whole episode — it could not track the ramp, so it could not overshoot it either. **Every
+demonstration plan V has ever collected was produced by an arm that was being dragged rather
+than driven.**
+
+`ExpertCfg::pace_to` already existed to pace the expert to the envelope; its factor is now
+`PACE = 0.5` instead of 0.9. Swept on the eight pinned seeds at the true rate: **0.9 → 0/8,
+0.75 → 2/8, 0.6 → 8/8, 0.5 → 8/8, 0.35 → 8/8**. Half, with margin on both sides. No envelope
+limit, no acceptance gate and no Deployment IR value moved: this is a calibration of the
+*expert* against the scene's own actuators, and it is the only knob V11 turned beyond the
+schedule.
+
+**V10's measurement flips, exactly.** `grasp_probe.py --substeps` is the same measurement V10
+used, on a **newly collected** fifty-episode set — the V1c set is 200 Hz data and cannot be
+replayed at 50 Hz, so it could not be reused.
+
+| `grasp_probe.py` | V10 (`--substeps 1` tracked) | V11 (`--substeps 4` tracks) |
+|---|---|---|
+| worst cube drift from the `es` replay, at 1 substep | 0.0002 mm | **195.0051 mm** |
+| worst cube drift from the `es` replay, at 4 substeps | 202.98 mm | **0.0000 mm** |
+| demonstrations lifting the cube clear of the table | 50 / 50 | **50 / 50** |
+| lift, median | 122.65 mm | 120.75 mm |
+| two-jaw contact ticks, median | 161.5 | 90.0 |
+| gripper joint while both jaws hold the cube | 0.0950 rad | 0.0934 rad |
+
+`recorded_actions_replay_to_the_same_outcome` on the new set: 50 recorded cubes in the bin,
+`action` reproduces 50 (50 `Success`), `action_commanded` reproduces 50.
+
+**The envelope, now measured against the step it bounds.**
+
+| | V6 / V10 (200 Hz) | V11 (50 Hz) |
+|---|---|---|
+| `expert_passes_the_evaluation_harness` | 8 / 8 | **8 / 8** |
+| worst `envelope_violation_rate` | 0.48 – 0.55 | **0.2044** (0.1535 – 0.2044) |
+| `expert_solves_the_pinned_seeds` | 8 / 8 | **8 / 8** |
+| `the_temporal_ensemble_survives_the_grasp_window` | `Success` | **`Success`** |
+| episode length, control steps | ~351 | 225 – 235 |
+
+**What a control step is now worth.** Both columns measured with one script over the same
+command (`--episodes 50 --seed 1`), so they are comparable to each other rather than to section
+7.18's per-joint figures.
+
+| per demonstration set | V1c (200 Hz) | V11 (50 Hz) |
+|---|---|---|
+| frames | 18,263 | 9,038 |
+| median episode, control steps | 352 | 179 |
+| median episode, simulated seconds | 1.76 | **3.58** |
+| `max_j abs(action[t] − action[t−1])`, median | 0.01687 rad | **0.03985 rad** |
+| `max_j abs(action[t] − qpos[t−1])`, median | 0.26506 rad | **0.06223 rad** |
+| 16-row chunk travel, median | 0.18931 rad | **0.47143 rad** |
+| `meta/info.json` `fps` / actual row spacing | 50 / 5 ms | **50 / 20 ms** |
+
+The command no longer leads the arm by a quarter of a radian, and a chunk is 320 ms and half a
+radian of travel instead of 80 ms and a fifth of one.
+
+**The two policies: neither learns the task, and the stop rule fires.**
+
+The IR-owned graph, V2's exact knobs on the new 50 Hz set (`es policy lower` →
+`train_act.py --batch 8 --lr 1e-4 --seed 0 --device cuda --resident-gpu`, 20,000 optimizer
+steps, initial loss 0.0565 → final **0.0132**, 654 s on the RTX 4090; V1c's 200 Hz run reached
+0.0180 from 0.0669):
+
+| suite | `success_rate` | `envelope_violation_rate` | `episode_length` |
+|---|---|---|---|
+| nominal (standalone, run a) | **0 / 16** | 0.2735 | 900 |
+| nominal (standalone, run b) | **0 / 16** | 0.2735 | 900 |
+| nominal (inside the suite) | 0 / 16 | 0.2706 | 900 |
+| light_intensity | 0 / 16 | 0.2922 | 900 |
+| light_direction | 0 / 16 | 0.2998 | 900 |
+| observation_delay | 0 / 16 | 0.2940 | 900 |
+| torque_noise | 0 / 16 | 0.5132 | 900 |
+| backlash | 0 / 16 | 0.2003 | 900 |
+
+The two nominal runs agree to the last digit, so the number is the policy's and not the
+schedule's. Every episode runs the full 900-step budget. Reading the `.estraj` records of the
+first six nominal cells: the arm moves **1.66 – 1.69 rad** on its widest joint and the cube
+finishes at **exactly its start pose** in all six, gripper wide open. The policy is not
+fumbling the grasp; it never arrives at the cube.
+
+The external ACT, V8's pipeline unchanged on the new export (`es dataset export --lerobot-v3
+--drop action_commanded,action_source --state-dim 6` → `lerobot-train --policy.type=act
+--steps=100000 --batch_size=8 --seed=0`, 2,033 s → `es policy import-lerobot` →
+`es eval run`): **0 / 16 nominal**, `envelope_violation_rate` 0.0523, every episode 900 steps.
+The six-suite sweep on the external ACT was **not** spent: the stop rule fires on the nominal
+number, which is what V8's 0/16 · 0/16 · 1/16 are, and a perturbation sweep of a policy that
+scores zero unperturbed measures nothing.
+
+| | V6 (200 Hz) | V8 (200 Hz) | **V11 (50 Hz)** |
+|---|---|---|---|
+| IR-owned graph, 20,000 steps, nominal | 0 / 16 | — | **0 / 16** |
+| LeRobot ACT, 20,000 / 50,000 / 100,000 steps, nominal | — | 0/16 · 0/16 · 1/16 | **0 / 16** at 100,000 |
+
+**Wall clocks** (observations, not a throughput claim — §12.4): collect 50 episodes with frames
+50 s; bake 1 s; lower + train 20,000 steps 654 s; the six-suite evaluation with frames
+(96 cells, 86,400 rendered frames, `--jobs 6`) 393 s; `lerobot-train` 100,000 steps 2,033 s;
+one 16-cell nominal run 10 – 25 min depending on contention.
+
+**Verdict.** The rate was wrong and is now right: one control step is one control period, the
+envelope is measured against the step it bounds (violation rate 0.48–0.55 → 0.2044 on the
+expert), a chunk is 320 ms of real motion, and the dataset's `fps` is true. The rate fix also
+found what nothing else had: **every demonstration plan V ever collected was produced by an arm
+being dragged rather than driven**, because the Deployment IR declares an acceleration the
+scene's 2.94 N·m actuators cannot brake against, and at 200 Hz the arm was velocity-saturated
+and could not overshoot what it could not track. Fixing that — the expert now paces to half the
+envelope — restores 50/50 demonstrations, 8/8 on both expert gates, and a violation rate less
+than half of V6's.
+
+**And neither policy learns it anyway: 0/16 and 0/16, against V6's 0/16 and V8's 1/16.** The
+stop rule fires. The learning problem was made *coarser* by the fix — 40 mrad per step instead
+of 17, half a radian per chunk instead of a fifth — and the result did not move. Whatever is
+wrong is not the control rate, not the demonstrations (50/50, replayed and probed), not the
+grasp (122 mm lifts, both jaws, half the episode), not the ensemble, and not the model (V8's
+own ACT, 100,000 steps). **Do not move a second variable here.** The next packet gets one
+hypothesis and one variable — resolution or demonstration count — and V11's numbers are the
+baseline it is compared against.
+
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -2734,3 +2904,12 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     way every training and evaluation number plan V has produced was taken at four times the
     intended control rate, so the re-collect and the retrain are part of the same packet, and
     V8's 100,000-step numbers are what the result is compared against.
+    **Answered (V11, section 7.19): (b), built.** `BatchDomains::single_env_at` derives the
+    inference *and* observation periods from the scene's physics rate and the Deployment IR's
+    `rate.control`, refusing a timestep that does not divide the control period by name;
+    `LoadConfig::rate` stays `None`. The answer came with a second finding the question could
+    not have anticipated: at the true rate the scripted expert overshoots the grasp pose by
+    11 mm and swats the cube, because the demo declares an acceleration its 2.94 N*m actuators
+    cannot brake against, and at 200 Hz the arm was velocity-saturated and could not overshoot
+    what it could not track. The expert now paces to half the envelope instead of nine tenths
+    (`PACE`, swept and measured); no envelope limit and no gate moved.

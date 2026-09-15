@@ -179,24 +179,11 @@ impl MuJoCoCpuBackend {
 /// The tick rate a timestep in seconds stands for. Integer ticks are the model (spec 18.1);
 /// this is the one conversion, at the edge, where a backend's own `dt` is set.
 fn rate_from_timestep(timestep: f64) -> Result<TickRate, PhysicsError> {
-    let nanos = (timestep * 1e9).round();
-    if !(nanos.is_finite() && nanos >= 1.0) {
-        return Err(PhysicsError::Backend(format!(
+    TickRate::from_period_secs(timestep).map_err(|_| {
+        PhysicsError::Backend(format!(
             "timestep {timestep} is not a positive number of nanoseconds"
-        )));
-    }
-    // Reduced, so that two ways of spelling the same rate compare equal.
-    let divisor = gcd(1_000_000_000, nanos as u64);
-    TickRate::rational(1_000_000_000 / divisor, nanos as u64 / divisor)
-        .map_err(|e| PhysicsError::Backend(e.to_string()))
-}
-
-fn gcd(a: u64, b: u64) -> u64 {
-    if b == 0 {
-        a
-    } else {
-        gcd(b, a % b)
-    }
+        ))
+    })
 }
 
 /// `name -> id` for one kind of scene element.

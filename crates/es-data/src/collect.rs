@@ -20,6 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use es_assets::scene::SceneDesc;
 use es_compile::{PolicyBundle, Tensor};
+use es_core::TickRate;
 use es_env::scheduler::BatchDomains;
 use es_env::traj::Trajectory;
 use es_env::{DomainRunner, Env, Termination};
@@ -365,7 +366,14 @@ impl Collector {
         let contract = &bundle.learning.policy.contract;
         let bad = |e: &dyn std::fmt::Display| DataError::Loop(e.to_string());
 
-        let domains = BatchDomains::single_env();
+        // One control step is one control period (packet M5/V11): the schedule is derived from
+        // the scene's own timestep and the Deployment IR's `rate.control`, so a recorded row is
+        // 1 / `rate.control` seconds of simulated time and the dataset's `fps` below is true.
+        let domains = BatchDomains::single_env_at(
+            TickRate::from_period_secs(spec.scene.options.timestep).map_err(|e| bad(&e))?,
+            deploy.rate.control,
+        )
+        .map_err(|e| bad(&e))?;
         let mut env: Env<B> =
             Env::new(&bundle.task, spec.scene, new_backend(), &domains, spec.seed)
                 .map_err(|e| bad(&e))?;

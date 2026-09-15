@@ -5,6 +5,7 @@
 //! backend. Periods are integer counts of simulation ticks — there is no `f64` in this module
 //! (§18.1 forbids float time accumulation).
 
+use es_core::TickRate;
 use serde::{Deserialize, Serialize};
 
 use crate::EnvError;
@@ -55,6 +56,10 @@ pub struct BatchDomains {
 
 impl BatchDomains {
     /// A single-env, everything-every-tick configuration — the smallest valid one.
+    ///
+    /// One control step is then one simulation tick. That is what a unit test with a mock
+    /// backend wants; a loop driven by a Deployment IR wants [`Self::single_env_at`], because
+    /// there the control rate is declared and the scene's timestep is whatever the scene says.
     pub fn single_env() -> Self {
         Self {
             simulation: DomainCfg::new(1, 1),
@@ -62,6 +67,42 @@ impl BatchDomains {
             inference: DomainCfg::new(1, 1),
             training: None,
         }
+    }
+
+    /// A single env whose control step is one control *period* (§12.1, packet M5/V11).
+    ///
+    /// `physics` is the rate the scene is stepped at and `control` the Deployment IR's
+    /// `rate.control`, so one [`Env::step`](crate::Env::step) advances `physics / control`
+    /// simulation ticks — the substeps of one control step — and records one row. The
+    /// observation domain shares that period: the state does not change inside the window, so
+    /// observing every simulation tick would push the same reading into a `TemporalWindow`
+    /// several times and re-render the same frame.
+    ///
+    /// A scene whose timestep does not divide the control period is refused by name rather
+    /// than rounded (App. B.5): a control step that is 3.5 substeps long is not a control step.
+    pub fn single_env_at(physics: TickRate, control: TickRate) -> Result<Self, EnvError> {
+        // `physics / control` as an exact rational: (pn/pd) / (cn/cd) = (pn*cd) / (pd*cn).
+        let (num, den) = (physics.num() * control.den(), physics.den() * control.num());
+        if den == 0 || num % den != 0 {
+            return Err(EnvError::Schedule(format!(
+                "the scene steps at {} Hz and the deployment declares rate.control = {} Hz:                  one control period is {} simulation ticks, which is not a whole number",
+                physics.as_hz_f64(),
+                control.as_hz_f64(),
+                num as f64 / den as f64,
+            )));
+        }
+        let period = u32::try_from(num / den).map_err(|_| {
+            EnvError::Schedule(format!(
+                "a control period of {} simulation ticks does not fit in u32",
+                num / den
+            ))
+        })?;
+        Ok(Self {
+            simulation: DomainCfg::new(1, 1),
+            observation: DomainCfg::new(1, period),
+            inference: DomainCfg::new(1, period),
+            training: None,
+        })
     }
 }
 
@@ -228,6 +269,42 @@ mod tests {
             training: Some(DomainCfg::new(64, 990).on(Device::Gpu(1))),
             ..domains((4096, 1), (512, 33), (256, 99))
         }
+    }
+
+    /// Packet M5/V11 oracle 1: one control step is one control period.
+    ///
+    /// The demo's own numbers -- a scene of `timestep="0.005"` under a deployment that declares
+    /// `rate.control = 50` -- plus the two edges: a timestep that does not divide the control
+    /// period is refused by name, and a scene already at the control rate needs no substep.
+    #[test]
+    fn a_control_period_is_a_whole_number_of_substeps() {
+        let at = |timestep: f64, hz: u64| {
+            BatchDomains::single_env_at(
+                TickRate::from_period_secs(timestep).expect("a positive timestep"),
+                TickRate::hz(hz),
+            )
+        };
+        // The demo: 200 Hz physics, 50 Hz control.
+        let demo = at(0.005, 50).expect("0.005 s divides a 20 ms control period");
+        assert_eq!(demo.inference.period, 4);
+        assert_eq!(
+            demo.observation.period, 4,
+            "one observation per control step"
+        );
+        assert_eq!(demo.simulation.period, 1, "the tick is still the tick");
+        Schedule::build(&demo).expect("the derived schedule is valid");
+        // Not a divisor: refused, and the message names both rates.
+        let err = at(0.006, 50)
+            .expect_err("6 ms does not divide 20 ms")
+            .to_string();
+        assert!(
+            err.contains("166.6") && err.contains("50"),
+            "the refusal must name both rates: {err}"
+        );
+        // Already at the control rate: one substep, which is what `single_env` means.
+        assert_eq!(at(0.02, 50).expect("20 ms is 20 ms").inference.period, 1);
+        // A control rate faster than the physics is the same refusal, not a zero period.
+        assert!(at(0.02, 100).is_err());
     }
 
     #[test]

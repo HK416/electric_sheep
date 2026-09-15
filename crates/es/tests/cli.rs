@@ -6505,6 +6505,21 @@ fn cube_in_the_bin(x: f64, y: f64, z: f64) -> bool {
     (0.09..0.19).contains(&x) && (-0.15..-0.05).contains(&y) && z < 0.09
 }
 
+/// The schedule the demo loops run on: one control step is one control period (packet M5/V11).
+///
+/// The same derivation `Collector::run` and `es_eval::runner` apply, so a test that drives
+/// `Env` directly steps the scene exactly as the collector and the evaluator do.
+fn demo_domains(
+    scene: &es_assets::scene::SceneDesc,
+    deploy: &es_ir::deployment::DeploymentIr,
+) -> es_env::scheduler::BatchDomains {
+    es_env::scheduler::BatchDomains::single_env_at(
+        es_core::TickRate::from_period_secs(scene.options.timestep).expect("the scene's timestep"),
+        deploy.rate.control,
+    )
+    .expect("the scene's timestep divides the control period")
+}
+
 /// The seed the dataset under diagnosis was collected with; V1c's `ds-train` is `--seed 1`.
 fn v10_seed() -> u64 {
     std::env::var("ES_V10_SEED")
@@ -6594,7 +6609,7 @@ fn recorded_actions_replay_to_the_same_outcome() {
             &task,
             &scene,
             es_physics_backend::MuJoCoCpuBackend::new(),
-            &es_env::scheduler::BatchDomains::single_env(),
+            &demo_domains(&scene, &deploy),
             seed,
         )
         .expect("the demo scene loads");
@@ -6788,7 +6803,7 @@ fn the_temporal_ensemble_survives_the_grasp_window() {
         &task,
         &scene,
         es_physics_backend::MuJoCoCpuBackend::new(),
-        &es_env::scheduler::BatchDomains::single_env(),
+        &demo_domains(&scene, &deploy),
         v10_seed(),
     )
     .expect("the demo scene loads");
