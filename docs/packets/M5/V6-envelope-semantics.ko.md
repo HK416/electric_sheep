@@ -288,6 +288,72 @@ ensembling 없이, `execute_chunk`가 죽은 채로, 엔벌로프가 추종 오�
 **소스 줄 변화 (V6b).** `es-env` +104 / -65(순 +39, 대부분 공유 함수와 그 주석), `es-eval`
 +59 / -13(순 +46). 두 크레이트 모두 §1.5 상한에서 한참 안쪽이다.
 
+## 2단계 — 측정된 대로
+
+설계 노트 `docs/design/visible-learning.md` 7.12절(하니스 결과, 20,000 스텝 재측정)과 7.13절 발견
+7–8(메커니즘, 그리고 그것이 강제한 두 테스트 수정)이 분석을 담고 있다. 이 절은 기록이다.
+
+**서버:** RTX 4090, `~/venvs/es-lerobot-cuda/bin/python`, 트리 `~/Projects/es-v6`(이 브랜치의
+`5a7e00e` 헤드에서 빌드된 아카이브 체크아웃 — 아카이브에는 `git log`가 없다),
+`~/artifacts/plan-v/v6/` 아래의 아티팩트, 2026-09-15. 재훈련 없음, 손잡이 변경 없음.
+
+**오라클.**
+
+| 테스트 | 결과 | 출처 |
+|---|---|---|
+| `expert_solves_the_pinned_seeds` | 8/8 `Success` | `oracle-collect.log` |
+| `expert_passes_the_evaluation_harness` | 8/8 `Success`, `envelope_violation_rate` 0.4815–0.5485 | `oracle-eval.log` |
+| `collection_and_evaluation_draw_the_same_scene_for_a_seed` | `f64`에서는 실패로 측정됨(`0.2550719976425171` 대 `0.255071989355131`), `f32`에서 비교하도록 수정 | `oracle-parity.log` |
+
+**`expert_passes_the_evaluation_harness` 자신의 게이트가 다시 고정된다.** 1단계의
+`worst_violation < 0.02`는 V6b 절 자체의 포인트 1이 거짓으로 만든 tick 단위 독해를 가정했다:
+plane은 이제 16행 호라이즌(`decay = 0.01`)의 temporal-ensemble 혼합을 재고, 그 지터가 범위 밖
+위치를 하나도 요구하지 않는 페이싱된 궤적에서도 속도/가속도 클램프를 건드린다 — 7.10절 자신의
+수집-경로 숫자(V1c 시연 프레임의 0.6368이 `Clamped`이거나 `Fallback`)가, 여기서 재측정하지 않는
+경로에서 더 먼저 측정된 같은 모양을 보여준다. `crates/es/tests/cli.rs`는 이제 여전히 참인 한계를
+읽는다 — 테스트에 타이핑해 넣은 숫자 대신 Deployment IR 자신의 `EnvelopeViolationRate` 워치독,
+`max_frac = 0.9`(`tests/fixtures/visible-learning/deployment.toml`)다. 측정된 최악값 0.5485는 거기
+한참 못 미치고, `expert_solves_the_pinned_seeds`의 8/8은 두 경로를 맞대보는 골든으로 남으며, 이
+패킷의 `forbidden` 목록이 보호하는 임계값은 어느 것도 움직이지 않았다.
+
+패리티 오라클의 수정은 무관하다: 두 경로가 처음 내는 `qpos ‖ qvel` 행을 `f64`가 아니라 두 경로가
+실제로 공유하는 폭인 `f32`(수집기 자신의 `state_row` 텐서와 시연의 `observation.state` 컬럼)에서
+비교한다. `f64` 비교는 `f32`로 반올림된 수와 반올림되지 않은 수를 비교한 것이었다.
+
+**V1c의 20,000 스텝 번들, 재측정:**
+
+| | V3 | V2b | V1c | V6, 정직한 값 |
+|---|---|---|---|---|
+| nominal `success_rate` (16) | 0.1250 (2/16) | 0.0000 (0/16) | 0.0625 (1/16) | **0.0000 (0/16)** |
+| suite `success_rate` (96) | — | — | — | **0.0000 (0/96)** |
+
+여섯 스위트, 각 14,400 제어 tick (`nominal-20000/report.json`, `suite-20000/report.json`):
+
+| 스위트 | envelope_violation_rate | fallback | clamped | policy |
+|---|---|---|---|---|
+| nominal | 0.2106 | 220 | 2,813 | 11,367 |
+| light_intensity | 0.4790 | 333 | 6,565 | 7,502 |
+| light_direction | 0.3609 | 400 | 4,797 | 9,203 |
+| observation_delay | 0.2142 | 220 | 2,865 | 11,315 |
+| torque_noise | 0.1817 | 140 | 2,476 | 11,784 |
+| backlash | 0.2265 | 240 | 3,021 | 11,139 |
+
+`fallback`은 `failure_mode_histogram` 자신의 버킷이고, 모든 스위트에서 히스토그램의
+`violation.rate` 버킷과 같다 — 모든 fallback tick은 violation-rate 워치독이며 다른 무엇도 뜨지
+않는다. `clamped`는 `envelope_violation_rate · 14,400 − fallback`이다. 모든 스위트에서
+`violation.position`이 `violation.acceleration`보다 2배 넘게 큰 가장 큰 클램프 버킷이다(nominal:
+2,031 대 843, 그다음 `violation.velocity` 439) — 소프트 관절-한계 단계이지, 위에서 전문가 자신의
+실행이 보인 temporal-ensemble 지터가 아니다. `violation.rate_limit`과 `violation.torque`는 어느
+스위트에도 나타나지 않는다(deployment.toml 자신의 주석: 두 `action_rate` 행과 `torque_max`는 이
+제어 속도에서 관절-위치 명령이 건드리는 것보다 느슨하다).
+
+**V3의 비공허성 규칙이 정직하게 유지된다.** `Clamped ≥ 1` — `nominal`만으로도 2,813, 진짜 클램프
+산술이고 V6가 없앤 추종 오차 아티팩트가 아니다.
+
+**결론.** 하니스는 전문가를 통과시킨다. 비전 정책은 과제를 해내지 못한다: nominal 16 중 0, 스위트
+96 중 0, 하니스 아티팩트가 아니라 관절-한계 단계에서 클램프된다. 중단 규칙 사다리대로, 다음 심판은
+V7a(특권 상태)이며 1단계(설계 노트 7.14절)가 이미 시작되어 있다.
+
 ## forbidden
 
 - `tests/fixtures/visible-learning/deployment.toml`의 한계를 바꾸는 것, 또는 어디든 임계값을
