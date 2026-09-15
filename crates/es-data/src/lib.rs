@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 
 pub use collect::{
     append_loop_step, distill, read_loop_steps, CollectReport, CollectSpec, Collector, FrameSink,
-    Intervener, Intervention, LoopKind, LoopStep, SplitSpec,
+    Intervener, Intervention, LoopKind, LoopStep, SplitSpec, ACTION_COMMANDED,
 };
 pub use identity::{BaseModel, DatasetIdentity, Split, TrainingIdentity};
 pub use intervention::{

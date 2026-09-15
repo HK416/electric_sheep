@@ -42,6 +42,8 @@ use crate::{write_file, DataError};
 pub const LOOP_FILE: &str = "loop.jsonl";
 /// Where [`distill`] writes the spec 19.3 identity.
 pub const TRAINING_IDENTITY_FILE: &str = "training_identity.json";
+/// The raw pre-plane command, beside `action` (spec 13.2).
+pub const ACTION_COMMANDED: &str = "action_commanded";
 
 pub(crate) fn hex(d: &[u8; 32]) -> String {
     d.iter().fold(String::new(), |mut s, b| {
@@ -416,16 +418,44 @@ impl Collector {
 
         for index in 0..spec.n_episodes {
             let mut sources: Vec<i64> = Vec::with_capacity(max_steps as usize);
+            let mut commanded: Vec<f64> = Vec::with_capacity(max_steps as usize * NJ);
             let mut human = vec![false; max_steps as usize + latency + execute + 1];
             let mut closed = None;
             let mut aborted = false;
             for frame in 0..max_steps {
                 wrapper.episode = index;
                 wrapper.frame = frame;
+                // "A caller that knows the real pose calls `observe_state` before the first
+                // `validate`" (`SafetyPlane::new`). `reset_latch` clears the latch but not the
+                // hold target, the velocity or the rate history, so without this the plane
+                // opens every episode after the first believing the arm is still where the
+                // previous episode's last command left it -- and clamps the demonstration back
+                // toward a pose that no longer exists (packet M5/V1c).
+                //
+                // Once per episode, not once per step: inside an episode the envelope is a
+                // bound on the commanded motion, which is what `ScriptedExpert` paces itself
+                // to. Re-seeding every step turns it into a bound on the following error
+                // instead -- which is what `es_eval::runner` does, and the disagreement
+                // between the two is design note section 7.10, not something this packet may
+                // settle (`deployment.toml` and the expert's pacing are both forbidden here).
+                //
+                // `frame` here is this loop's own counter, which really is 0 once per episode.
+                // The `frame` an *intervener* sees is not (`infer` runs on release, not on
+                // submit) — see `frame_zero_is_not_a_hook_an_intervener_may_reset_on`.
+                if frame == 0 {
+                    let state = env.backend().state();
+                    let (mut q, mut qd) = ([0.0; NJ], [0.0; NJ]);
+                    q.copy_from_slice(&state.qpos_of(0)[..NJ]);
+                    qd.copy_from_slice(&state.qvel_of(0)[..NJ]);
+                    planes[0].observe_state(&q, &qd);
+                }
                 let before = counters_of(&planes[0]);
                 let outcome = env
                     .step_with_policy(&mut runner, &mut wrapper, &mut planes, &mut [])
                     .map_err(|e| bad(&e))?;
+                // Provenance for the row `env.step` just recorded: what the plane was asked
+                // for, beside what it allowed (spec 13.2).
+                commanded.extend_from_slice(&runner.commanded()[..NJ]);
                 // An injection decided at tick `t` reaches the actuator at `t + latency` and
                 // drives `execute_chunk` ticks (design note section 5.1) -- so mark first,
                 // then classify this frame against the marks.
@@ -486,6 +516,7 @@ impl Collector {
                 )));
             }
             sources.truncate(n);
+            commanded.truncate(n * NJ);
             human.truncate(n);
             human.resize(n, false);
             intervention_frames += human.iter().filter(|h| **h).count() as u64;
@@ -495,8 +526,11 @@ impl Collector {
                 index,
                 &episode,
                 (nq, nv, nu),
-                &sources,
-                &human,
+                &Recorded {
+                    sources: &sources,
+                    human: &human,
+                    commanded: &commanded,
+                },
                 fps,
                 &task_name,
             ))?;
@@ -579,6 +613,10 @@ fn collect_features(
         "action".to_owned(),
         FeatureSpec::new(Dtype::Float32, [nu as u64]),
     );
+    f.insert(
+        ACTION_COMMANDED.to_owned(),
+        FeatureSpec::new(Dtype::Float32, [nu as u64]),
+    );
     f.insert("reward".to_owned(), FeatureSpec::new(Dtype::Float64, [1]));
     f.insert(INTERVENTION.to_owned(), FeatureSpec::new(Dtype::Int64, [1]));
     f.insert(
@@ -606,16 +644,25 @@ fn collect_features(
     (f, warnings)
 }
 
+/// The per-frame columns [`Collector::run`] accumulates itself, beside the ones the episode
+/// recorder already holds.
+struct Recorded<'a> {
+    sources: &'a [i64],
+    human: &'a [bool],
+    /// The pre-plane command of each frame, `n * nu` (spec 13.2).
+    commanded: &'a [f64],
+}
+
 /// One `es_env::Episode` as `LeRobot` columns (design note section 3).
 fn to_lerobot(
     index: u32,
     ep: &es_env::Episode,
     shape: (usize, usize, usize),
-    sources: &[i64],
-    human: &[bool],
+    frames: &Recorded<'_>,
     fps: f64,
     task: &str,
 ) -> Episode {
+    let (sources, human, commanded) = (frames.sources, frames.human, frames.commanded);
     let (nq, nv, nu) = shape;
     let n = ep.steps();
     let mut state = Vec::with_capacity(n * (nq + nv));
@@ -626,8 +673,15 @@ fn to_lerobot(
     let columns = BTreeMap::from([
         ("observation.state".to_owned(), Column::F32(state)),
         (
+            // `ep.ctrl` is the `SafeAction` the plane returned for that step, copied into
+            // `ctrl` by `DomainRunner::emit_actions` and into the episode by `Env::step`:
+            // what is executed is what is recorded (spec 13.2, `INV-12`).
             "action".to_owned(),
             Column::F32(ep.ctrl[..n * nu].iter().map(|v| *v as f32).collect()),
+        ),
+        (
+            ACTION_COMMANDED.to_owned(),
+            Column::F32(commanded[..n * nu].iter().map(|v| *v as f32).collect()),
         ),
         ("reward".to_owned(), Column::F64(ep.reward[..n].to_vec())),
         (

@@ -17,7 +17,7 @@ use es_data::collect::{
 };
 use es_data::intervention::{ActionSourceCode, InterventionSegment, InterventionSource};
 use es_data::{Column, LeRobotDataset};
-use es_data::{ACTION_SOURCE, INTERVENTION};
+use es_data::{ACTION_COMMANDED, ACTION_SOURCE, INTERVENTION};
 use es_env::Termination;
 use es_ir::deployment::{
     ActionContract, ActionSpace as DepSpace, Deadlines, DeploymentIr, ExecutionMode,
@@ -641,6 +641,13 @@ fn i64_column(ep: &es_data::Episode, name: &str) -> Vec<i64> {
     }
 }
 
+fn f32_column(ep: &es_data::Episode, name: &str) -> Vec<f32> {
+    match ep.columns.get(name) {
+        Some(Column::F32(v)) => v.clone(),
+        other => panic!("{name}: expected a float32 column, got {other:?}"),
+    }
+}
+
 // --- Tests ----------------------------------------------------------------------------------
 
 /// Spec 13.2: a collected dataset carries per-frame provenance, and the segments come back
@@ -1026,4 +1033,125 @@ fn clamped_expert_actions_are_recorded_clamped() {
         }
     }
     assert!(report.intervention_frames > 0);
+}
+
+/// Spec 13.2 and `INV-12`, packet M5/V1c: **what is executed is what is recorded**. `action`
+/// is the `SafeAction` the plane handed toward the actuator; `action_commanded` keeps the raw
+/// command it was asked for. With an intervener the envelope cannot follow, the two differ —
+/// and only the first one is inside the envelope.
+#[test]
+fn the_dataset_records_the_executed_action_beside_the_raw_command() {
+    const LIMIT: f32 = 0.3;
+    let root = scratch("loop-executed");
+    let mut b = bundle();
+    // Tighten the envelope -- never disable the plane (INV-12).
+    b.deployment.safety.position = vec![Limit::symmetric(f64::from(LIMIT)); NJ];
+    b.deployment.safety.position_soft_margin = vec![0.0; NJ];
+    // Deliberately over-fast: every tick asks for a pose the envelope refuses.
+    let mut over_fast =
+        |_: u32, _: u32, _: &ModelInfo, _: &[f64]| Intervention::Action([0.9_f64; NJ]);
+    collect_with(&root, &b, &mut over_fast, None);
+
+    let dataset = LeRobotDataset::open(&root).expect("the collected dataset opens");
+    let ep = dataset.read_episode(0).expect("episode reads back");
+    let action = f32_column(&ep, "action");
+    let commanded = f32_column(&ep, ACTION_COMMANDED);
+    assert_eq!(action.len(), commanded.len(), "one row each, same width");
+    assert_eq!(action.len(), ep.len() * NJ);
+
+    let differs = action
+        .iter()
+        .zip(&commanded)
+        .filter(|(a, c)| a.to_bits() != c.to_bits())
+        .count();
+    assert!(
+        differs > 0,
+        "the plane corrected nothing, so the two columns cannot be told apart: {action:?}"
+    );
+    for (i, v) in action.iter().enumerate() {
+        assert!(
+            v.abs() <= LIMIT + 1e-6,
+            "action[{i}] = {v} was recorded outside the envelope it passed through"
+        );
+    }
+    assert!(
+        commanded.iter().any(|v| v.abs() > LIMIT + 1e-6),
+        "the raw command was recorded already clamped, which loses the provenance"
+    );
+}
+
+/// The intervener hook runs inside `PolicyRuntime::infer`, which runs when a submitted
+/// observation is *released* — `expected_latency_ms` ticks later (§12.3). So `frame == 0` is
+/// **not** a hook an intervener may reset itself on: with any declared latency the first call of
+/// every episode is frame 1 or later, and a scripted driver keyed on frame 0 never resets at all.
+/// It looks correct only because a freshly constructed one starts reset, which is why
+/// `es loop collect --episodes N` solved episode 0 and nothing after it (design note section 7.6
+/// finding 5). `es loop collect --expert` keys on the episode index instead.
+#[test]
+fn frame_zero_is_not_a_hook_an_intervener_may_reset_on() {
+    let root = scratch("loop-latency-phase");
+    let mut b = bundle();
+    // One control tick of inference latency, which is what the demo's `learning.toml` declares.
+    b.learning.policy.contract.runtime.expected_latency_ms = 1000.0 / CONTROL_HZ as f32;
+    let mut seen: Vec<(u32, u32)> = Vec::new();
+    let mut record = |episode: u32, frame: u32, _: &ModelInfo, _: &[f64]| {
+        seen.push((episode, frame));
+        Intervention::Policy
+    };
+    collect_with(&root, &b, &mut record, None);
+
+    assert!(!seen.is_empty(), "the intervener was never called");
+    assert!(
+        seen.iter().all(|(_, frame)| *frame != 0),
+        "a declared latency must move the first call off frame 0: {seen:?}"
+    );
+    for episode in 0..2 {
+        assert!(
+            seen.iter().any(|(e, _)| *e == episode),
+            "episode {episode} never reached the intervener: {seen:?}"
+        );
+    }
+}
+
+/// The episode boundary carries nothing (spec 13.1). The fixture task resets to a constant, so
+/// with no randomization the second episode of one run is the first, row for row.
+///
+/// This is the regression for "`es loop collect --episodes N` only solves episode 0" (design
+/// note section 7.6 finding 5): what carried across was the Safety Plane's hold target, velocity
+/// and rate history, which the collector now re-seeds from the measured state every step.
+#[test]
+fn a_second_episode_repeats_the_first_exactly() {
+    let root = scratch("loop-episode-reset");
+    let mut b = bundle();
+    // Tight enough that where the plane thinks the robot is decides what it lets through --
+    // which is how carried-over plane state becomes a visible difference (INV-12: tightened,
+    // never disabled).
+    b.deployment.safety.velocity_max = vec![0.5; NJ];
+    // The fixture task draws `qpos[0]` uniformly per episode, which is the one thing that may
+    // legitimately differ between two episodes. Pin it, and then nothing may.
+    b.task.graph.insert(
+        NodeId(2),
+        TaskNode::ResetState {
+            target: "qpos[0]".to_owned(),
+            dist: Distribution::Constant(0.25),
+            stream: "reset.j0".to_owned(),
+        },
+    );
+    collect_with(&root, &b, &mut no_intervention, None);
+    let dataset = LeRobotDataset::open(&root).expect("the collected dataset opens");
+    let first = dataset.read_episode(0).expect("episode 0 reads back");
+    let second = dataset.read_episode(1).expect("episode 1 reads back");
+    assert_eq!(first.len(), second.len(), "same step budget");
+    for name in ["action", ACTION_COMMANDED, "observation.state"] {
+        assert_eq!(
+            f32_column(&first, name),
+            f32_column(&second, name),
+            "{name}: episode 1 differs from episode 0, so something survived the reset"
+        );
+    }
+    assert_eq!(
+        i64_column(&first, ACTION_SOURCE),
+        i64_column(&second, ACTION_SOURCE),
+        "the plane treated the two identical episodes differently"
+    );
 }
