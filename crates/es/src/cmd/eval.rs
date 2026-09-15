@@ -341,6 +341,8 @@ macro_rules! dispatch_nj_h {
             (6, 16) => run_typed::<6, 16>($($args),+),
             (6, 50) => run_typed::<6, 50>($($args),+),
             (7, 1) => run_typed::<7, 1>($($args),+),
+            // Unitree Go1, packet M6/B1: twelve joints, chunk 1.
+            (12, 1) => run_typed::<12, 1>($($args),+),
             (7, 8) => run_typed::<7, 8>($($args),+),
             (7, 16) => run_typed::<7, 16>($($args),+),
             (7, 50) => run_typed::<7, 50>($($args),+),
