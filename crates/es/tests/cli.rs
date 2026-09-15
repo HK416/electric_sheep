@@ -3081,9 +3081,20 @@ const OBSERVATION_HEADER: &str = "\
 /// held" is as close to the truth as IR-D gets. It is still narrower than the truth, which is
 /// why `expert_solves_the_pinned_seeds` checks y and z itself.
 fn add_gripper_open_term(task: &mut es_ir::task::TaskIr) {
-    /// A jaw holding the 30 mm cube stalls at about 0.30 however hard it is told to close, so
+    /// A jaw holding the 30 mm cube stalls at about 0.09 however hard it is told to close, so
     /// "the gripper is open" has to mean wider than that; the demonstration commands 0.9.
-    const GRIPPER_OPEN: f64 = 0.6;
+    ///
+    /// **Why 0.85 and not 0.6** (packet M5/V15, design note section 7.23). The episode ends the
+    /// instant this term goes true, so the threshold decides how much of the release survives
+    /// into the recorded demonstration. At 0.6 the expert's opening ramp -- paced to the
+    /// Deployment IR's envelope like every other joint -- was cut 14 control steps in, with the
+    /// *command* still at 0.616 of the 0.9 it was aiming at: every one of V14's 200
+    /// demonstrations contained exactly **one** frame commanded above 0.6 and none that reached
+    /// `grip_open`, so the policy's only wide-open jaw was the 53-frame approach at the other
+    /// end of the episode. 0.85 is reached only by a jaw that is both commanded to `grip_open`
+    /// and empty -- it cannot close on a 30 mm cube and read this -- so it ends the episode on a
+    /// finished release rather than on the first millimetre of one.
+    const GRIPPER_OPEN: f64 = 0.85;
 
     use es_ir::graph::{NodeId, PortRef};
     use es_ir::task::{CmpOp, JointQuantity, LogicOp, TaskNode, TerminationKind};
@@ -3829,6 +3840,11 @@ const SEEDS: [u64; 8] = [1, 2, 3, 5, 8, 13, 21, 34];
 /// tuning knob: lowering it to make a change pass is the same as editing a golden.
 const THRESHOLD: f64 = 0.875;
 
+/// How many frames of every demonstration must command the gripper open past the stall value
+/// (packet M5/V15). The same kind of pin as `THRESHOLD`: at the old 0.6 predicate threshold
+/// this was 1, which is what "the policy never opens the hand" looks like from the data's side.
+const RELEASE_FRAMES: usize = 5;
+
 /// Packet M5/V1 oracle 1 -- the expert's success rate over a pinned seed set.
 ///
 /// The threshold is a property of the expert, not a tuning knob: lowering it to make a change
@@ -3898,9 +3914,34 @@ fn expert_solves_the_pinned_seeds() {
         if inside {
             in_the_bin += 1;
         }
+
+        // Packet M5/V15: **the release has to be in the data.** The episode ends the instant
+        // the success predicate goes true, so a threshold set too low truncates the expert's
+        // opening ramp and the demonstration teaches a policy to hold. Counted on the recorded
+        // *commands*, over the frames that follow the last one commanding the jaw shut.
+        let action = match ep.columns.get("action") {
+            Some(es_data::Column::F32(v)) => v.clone(),
+            other => panic!("action: {other:?}"),
+        };
+        let nj = action.len() / ep.len();
+        let grip: Vec<f64> = (0..ep.len())
+            .map(|f| f64::from(action[f * nj + nj - 1]))
+            .collect();
+        let tail = grip.iter().rposition(|g| *g < 0.0).map_or(0, |k| k + 1);
+        let opening = grip[tail..].iter().filter(|g| **g > 0.6).count();
         println!(
-            "seed {seed}: {} steps, {line}   cube ({x:.3}, {y:.3}, {z:.3}) inside={inside}",
-            ep.len()
+            "seed {seed}: {} steps, {line}   cube ({x:.3}, {y:.3}, {z:.3}) inside={inside}   \
+             release: {} frames after the last closed command, {opening} of them above 0.6, \
+             peak {:.3}",
+            ep.len(),
+            grip.len() - tail,
+            grip[tail..].iter().fold(0.0f64, |a, g| a.max(*g)),
+        );
+        assert!(
+            opening >= RELEASE_FRAMES,
+            "seed {seed}'s demonstration ends {opening} frames into the release, below the \
+             {RELEASE_FRAMES} this test pins: the recorded actions do not contain a hand that \
+             opens, so nothing trained on them can learn to let go (packet M5/V15)"
         );
     }
 

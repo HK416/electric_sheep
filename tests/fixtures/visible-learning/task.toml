@@ -610,7 +610,7 @@ quantity = "Position"
 
 [body.graph.nodes.32.Compare]
 op = "Gt"
-rhs = 0.6
+rhs = 0.85
 
 [body.graph.nodes.32.Compare.ty]
 elem = "F32"

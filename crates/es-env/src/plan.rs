@@ -382,9 +382,10 @@ mod tests {
             }
             p
         };
-        // What the demonstration commands: the predicate's threshold is 0.6, because a jaw
-        // holding the cube stalls near 0.30 (design note section 7.5).
-        let (open, closed) = (0.9, 0.30);
+        // What the demonstration commands: the predicate's threshold is 0.85, because a jaw
+        // holding the 30 mm cube stalls near 0.09 and one that is merely *opening* is still in
+        // contact with it (design note sections 7.5 and 7.23).
+        let (open, closed, opening) = (0.9, 0.30, 0.6);
         let success = plan
             .terminations
             .iter()
@@ -401,6 +402,11 @@ mod tests {
             success.eval(&ports(0.14, 0.0, closed)),
             Some(0.0),
             "carried across the bin, still in the jaws"
+        );
+        assert_eq!(
+            success.eval(&ports(0.14, 0.0, opening)),
+            Some(0.0),
+            "the jaw is opening but has not let go yet"
         );
         assert_eq!(
             success.eval(&ports(0.24, 0.0, open)),
