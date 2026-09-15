@@ -65,6 +65,12 @@ The split is by suite and not by episode on purpose. Inside one suite the runner
 episode 5 of a suite is not reproducible without having run episodes 0..4. An evaluation with
 one suite gets no speedup from --jobs, and N is clamped to the suite count.
 
+Each worker's own subprocess (the torch runtime, and whatever math library backs it) is capped
+to cores/N threads unless the caller already exported OMP_NUM_THREADS, MKL_NUM_THREADS,
+OPENBLAS_NUM_THREADS or TORCH_NUM_THREADS, in which case that choice wins. Left uncapped, N
+workers each size their own pool to every core on the box: measured on a 16-core server,
+`--jobs 6` ran slower than `--jobs 1` for exactly that reason (design note section 7.11).
+
 A worker that fails stops the run with one error naming the shard, its exit code and its last
 line of stderr. A partial report is never written.
 
@@ -736,12 +742,49 @@ fn run(args: &[String]) -> Result<u8, CliError> {
 /// The children write their frames straight into the shared `--frames` directory: cell names
 /// are globally unique and shards own disjoint cells, so there is nothing to merge and nothing
 /// to collide.
+/// The env vars that size a CPU math-library thread pool to every core on the box by default.
+/// `TORCH_NUM_THREADS` is not an official `PyTorch` var but is harmless to set; `PyTorch`'s own
+/// intra-op pool falls back to `OMP_NUM_THREADS`/`MKL_NUM_THREADS` when neither
+/// `torch.set_num_threads` nor a build-time default has run yet, which is true at process start.
+const THREAD_ENV_VARS: [&str; 4] = [
+    "OMP_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "TORCH_NUM_THREADS",
+];
+
+/// One shard's fair share of the box's cores, floored at 1. Measured on the 16-core oracle
+/// server (design note section 7.11): six shards left uncapped each sized their own subprocess's
+/// thread pool to all 16 cores, and `--jobs 6` ran *slower* than `--jobs 1` for it.
+fn shard_thread_cap(jobs: u32, cores: usize) -> usize {
+    (cores / jobs.max(1) as usize).max(1)
+}
+
+/// Which of [`THREAD_ENV_VARS`] this shard should set, and to what -- skipping any the caller
+/// already chose a value for, since a value the user exported wins over every shard's guess
+/// (`already_set` reads the real environment in production; the test below stubs it).
+fn shard_thread_env(
+    jobs: u32,
+    cores: usize,
+    already_set: impl Fn(&str) -> bool,
+) -> Vec<(&'static str, String)> {
+    let cap = shard_thread_cap(jobs, cores).to_string();
+    THREAD_ENV_VARS
+        .into_iter()
+        .filter(|name| !already_set(name))
+        .map(|name| (name, cap.clone()))
+        .collect()
+}
+
 fn spawn_shards(a: &RunArgs, jobs: u32) -> Result<Vec<es_eval::Shard>, CliError> {
     let exe = std::env::current_exe()
         .map_err(|e| CliError::Runtime(format!("cannot find this executable to re-run it: {e}")))?;
     let dir = a.out.join("shards");
     std::fs::create_dir_all(&dir)
         .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
+
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    let thread_env = shard_thread_env(jobs, cores, |name| std::env::var_os(name).is_some());
 
     let mut running = Vec::new();
     for i in 0..jobs {
@@ -766,6 +809,9 @@ fn spawn_shards(a: &RunArgs, jobs: u32) -> Result<Vec<es_eval::Shard>, CliError>
             .stderr(std::process::Stdio::piped());
         if let Some(f) = &a.frames {
             cmd.arg("--frames").arg(f);
+        }
+        for (name, value) in &thread_env {
+            cmd.env(name, value);
         }
         let child = cmd
             .spawn()
@@ -1035,5 +1081,35 @@ mod tests {
         };
         assert!(text.contains("killed by a signal"), "{text}");
         assert!(text.contains("(no output)"), "{text}");
+    }
+
+    /// Six shards on a 16-core box get 2 cores each, one shard gets the whole box, and a shard
+    /// count above the core count still gets at least one (never a zero-thread pool).
+    #[test]
+    fn shard_thread_cap_divides_the_box_and_floors_at_one() {
+        assert_eq!(shard_thread_cap(6, 16), 2);
+        assert_eq!(shard_thread_cap(1, 16), 16);
+        assert_eq!(shard_thread_cap(32, 16), 1);
+    }
+
+    /// The fix caps a pool the user left unset; it does not override one they chose. Regression
+    /// for the oracle server measurement (design note section 7.11): uncapped, `--jobs 6` each
+    /// sized their own torch subprocess to all 16 cores and the run was slower than `--jobs 1`.
+    #[test]
+    fn shard_thread_env_skips_a_var_the_user_already_set() {
+        let env = shard_thread_env(6, 16, |name| name == "OMP_NUM_THREADS");
+        assert!(!env.iter().any(|(name, _)| *name == "OMP_NUM_THREADS"));
+        assert_eq!(env.len(), THREAD_ENV_VARS.len() - 1);
+        assert!(env
+            .iter()
+            .any(|(name, value)| *name == "MKL_NUM_THREADS" && value == "2"));
+    }
+
+    /// Nothing set by the caller: every var is capped to the same fair share.
+    #[test]
+    fn shard_thread_env_caps_every_var_by_default() {
+        let env = shard_thread_env(4, 16, |_| false);
+        assert_eq!(env.len(), THREAD_ENV_VARS.len());
+        assert!(env.iter().all(|(_, value)| value == "4"));
     }
 }

@@ -1294,19 +1294,118 @@ the bits: measured locally on the fixture, 40 steps at batch 4 give `initial_los
 numbers above stay reproducible; the documented convention for raising it is linear `--lr` scaling
 (`--batch 32 --lr 4e-4`).
 
-**6. Not measured yet.** Every timing claim for this section is phase 2, on the oracle server:
+**6. Measured (phase 2), on the oracle server, 2026-09-15.** `nvidia-smi` read 0% utilization / 55
+MiB used before every run below; the 16-core box was otherwise idle except where the run itself is
+the reason it was not (next point). V1c's `trained-20000.esb`, `build/` and `baked/` (section 7.10)
+are the fixture for every row; nothing here moved a number section 7.9 or 7.10 recorded.
 
-| what | Target | Status |
+| what | Target | Observed |
 | --- | --- | --- |
-| 6-suite 96-episode run at `--jobs 6` | ~5-6 min, from 28 min | **unverified** |
-| its `report.json` / `events.json` against the sequential run | byte-identical | **unverified** |
-| 20,000 steps at batch 8, `--resident-gpu` | faster than 11 min | **unverified** |
-| the same with `--amp bf16` | faster still, different bits | **unverified** |
+| 6-suite, 96 episodes, sequential (`--jobs 1`) | ~28 min (V3 baseline) | 25:56 (25:52 on an earlier, since-overwritten run of the same config -- consistent) |
+| 6-suite, 96 episodes, `--jobs 6`, before the fix below | ~5-6 min | not run to completion: ~5 frames/s combined against sequential's ~55, 35/96 cells at 85 min, killed rather than waited out (projected > 4 h) |
+| 6-suite, 96 episodes, `--jobs 6`, after the fix below | ~5-6 min | **5:49** |
+| nominal-only, 16 episodes, sequential, two independent runs | ~5 min | 4:16.49 / 4:16.68, byte-identical to each other (`report.json` and every frame) |
+| `report.json` / `events.json`, `--jobs 1` vs `--jobs 6` (fixed) | byte-identical | not bit-identical on the real backend -- see below; the `FakeBackend` oracle stays byte-identical |
+
+The nominal-only config is one suite; `crates/es/src/cmd/eval.rs` clamps
+`a.jobs.min(eval_ir.suites.len().max(1) as u32)`, so `--jobs 6` on it runs as `--jobs 1` by
+construction -- confirmed by reading the clamp, not by a separate timed run.
+
+**The first `--jobs 6` run was 5x *slower* than sequential.** Each shard is this same binary
+re-invoked (`spawn_shards`), and each shard's own `TorchRuntime` subprocess defaults its thread
+pool to every core on the box; six of them on 16 cores want on the order of 90 OS threads at once
+(`nlwp` 23 per subprocess measured directly), load average sustained ~47, and the box spent its
+time context-switching rather than computing -- 35 of 96 cells in 85 minutes, projected past four
+hours to finish. Fixed in `crates/es/src/cmd/eval.rs`: `spawn_shards` now sets each shard's
+`OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS` / `TORCH_NUM_THREADS` to
+`cores / jobs` (`shard_thread_cap`), skipping any the caller already exported
+(`shard_thread_env` -- passthrough wins), both unit-tested without spawning a real subprocess.
+After the fix, six shards measured 2-3 threads apiece (`nlwp` 3, ~136% CPU each), load average
+fell to ~5.5, and the run finished in 5:49 -- in the packet's targeted range, and confirmed by
+`nvidia-smi`/`uptime` before and after that nothing else on the box changed in between.
+
+**That fix costs the real backend's byte-identity, and the packet's forbidden list will not let
+it be closed here.** `sharding_the_cells_produces_a_byte_identical_report` (`FakeBackend`, no real
+floating point) passes, byte for byte, re-verified after the fix. On the real `mujoco-cpu` +
+`torch` stack, though, `--jobs 1`'s own subprocess is left uncapped (unchanged by this packet)
+while a `--jobs 6` shard is now capped to `cores/jobs` threads -- a different thread count than
+`--jobs 1` uses, and CPU-threaded reductions are not exactly associative. Measured: 6 of the
+merged report's 24 cells differ --
+
+| | `--jobs 1` | `--jobs 6` (fixed) |
+| --- | --- | --- |
+| `light_intensity` `episode_length` | 845.3125 | 845.25 |
+| `nominal` `failure_mode_histogram` `violation.position` | 2,592 | 2,430 |
+| `light_intensity` `failure_mode_histogram` `violation.position` | 1,677 | 1,936 |
+
+-- and `success_rate` and `envelope_violation_rate` are identical in every one of the 24 cells; a
+handful of individual frames differ later in an episode once a step's violation classification
+flips. Isolated before blaming the fix: two independent `--jobs 1` runs of the nominal-only config
+are byte-identical to each other (table above, frames included -- ruling out inherent nondeterminism
+run to run), and exporting `OMP_NUM_THREADS=16` (this box's core count) explicitly before a
+`--jobs 1` run reproduces the unset-default run byte for byte (ruling out "explicit vs. default"
+as the variable) -- so the divergence tracks thread *count*, not process separation. This is
+downstream of `MuJoCoCpuBackend`'s own declared `DeterminismTier::PhysicsMeaning` (section 9: tier
+3, not bitwise) and of CPU-threaded kernels generally, not a defect in the merge/shard logic.
+Closing it would mean capping `--jobs 1`'s own thread count too, at a value this packet has no
+basis to choose without risking the already-committed V1c/V2b/V3 numbers -- forbidden. Left as a
+documented, pre-existing limitation of the real backend.
+
+**Training, V2's knobs, all five rows, 20,000 steps at `--checkpoint-at 20000`:**
+
+| flags | wall-clock | `initial_loss` | `final_loss` |
+| --- | --- | --- | --- |
+| (a) default | 10:53.07 | 0.066787 | 0.017945 |
+| (b) `--resident-gpu` | 10:57.00 | 0.066568 | 0.017749 |
+| (c) `--resident-gpu --amp bf16` | 12:53.49 | 0.066955 | 0.018015 |
+| (d) `--resident-gpu --compile` | 10:00.07 | 0.066878 | 0.017895 |
+| (e) `--resident-gpu --batch 64 --lr 8e-4` | 1:24:31 | 0.050043 | **NaN** |
+
+(a) and (b) are **not** bit-identical at `--device cuda`: `cmp` disagrees on both `--loss-curve`
+and the checkpoint, diverging from the second optimizer step (the first matches: 0.4806089...
+both; the second is 0.48060897 vs 0.48060090, a relative difference around 1e-5, growing from
+there). This is ordinary CUDA kernel/algorithm-selection non-determinism -- `train_act.py` sets no
+`torch.use_deterministic_algorithms`, and a resident tensor's different memory layout can select a
+different cuDNN/cuBLAS kernel than a freshly-copied one. The design note's and packet's
+bit-identical claim is accurate for the device the unit oracle actually exercises (CPU, point 7
+below) and does not hold on CUDA; both are recorded, not reconciled, since reconciling it is
+outside this packet (no code here can add determinism-forcing to `train_act.py` without moving
+numbers that are also outside this packet's forbidden list).
+
+(c) is **slower** than (a)/(b), not faster: at `--batch 8` the module runs one sample at a time
+(section 7.11 point 5), so each forward is tiny and launch-overhead bound rather than compute
+bound, and bf16 autocast's per-op overhead does not pay for itself there. (d) is modestly faster
+(~8% over (a)/(b)) -- `torch.compile`'s fusion has something to work with even at this scale, once
+its warmup is amortized over 160,000 forward/backward calls. (e) followed the docstring's own
+`--batch N` / `--lr` linear-scaling convention (`--batch 64`, 8x, with `--lr 8e-4`, 8x) for the
+same 20,000 steps, and diverged to `NaN`; the convention does not hold for this model and this
+50-episode dataset at this multiplier, which is a finding about the convention and not a claim
+that (e) is equivalent to (a)-(d) (§12.4: nothing here quotes (e) as a `step/s` figure or a
+recommendation).
+
+**7. `cargo test -p es-policy --test ir_training -- --ignored --nocapture`, `ES_PYTHON` pointed at
+the CUDA training venv, in the server tree:**
+
+```
+RAN act_training_uses_baked_observations: loss 0.4456 -> 0.1828 over 40 steps (0.410x), chunk
+  [10, 6], max_abs vs a direct forward 0e0 (tol 1e-5), observation_hash
+  f4a50730ac95b91734c9678e75d9e6bc1845578bc2985e45b409e80f3355f6e0, torch 2.11.0+cu129
+RAN resident_gpu_does_not_move_the_loss: 40 bit-identical steps, 825 bytes of curve
+```
+
+`resident_gpu_does_not_move_the_loss` needed one more fix first: its last assertion checked for
+the literal substring `"resident_gpu":true`, which Python's default `json.dumps` never emits (it
+always spaces the colon: `"resident_gpu": true`) -- a pre-existing bug in the test itself, caught
+only now because running it for real needs `torch`, and CI skips it with a printed reason when the
+package is missing. Fixed in `crates/es-policy/tests/ir_training.rs`; the test runs at
+`--device cpu` (the default `train_act.py` falls back to, unchanged by this packet), which is
+exactly why its bit-identical claim does not contradict the CUDA divergence measured above --
+they are different devices.
 
 One local limitation worth recording so it is not rediscovered: `--compile` cannot be exercised on
 the Windows development box — `torch._inductor` reads its templates with the ANSI codepage and dies
-on a `UnicodeDecodeError` under a `cp949` locale. That is torch's bug, not this script's; the flag
-is wired and gets its measurement on the Linux server.
+on a `UnicodeDecodeError` under a `cp949` locale. That is torch's bug, not this script's; row (d)
+above is its measurement on the Linux server.
 
 ### 7.12 As built (V6): one envelope semantics, and the harness that now passes the expert
 

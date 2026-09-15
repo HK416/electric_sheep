@@ -157,13 +157,50 @@ python/es/train_act.py --module build --baked baked --out b.safetensors \
 
 | 항목 | Target | Status |
 | --- | --- | --- |
-| 6 스위트 96 에피소드 실행, `--jobs 6` | 28분에서 약 5-6분 | **unverified** |
-| `report.json` / `events.json`의 순차 실행 대비 | 바이트 동일 | **unverified** |
-| 배치 8로 20,000 스텝, `--resident-gpu` | 11분보다 빠르게 | **unverified** |
-| 20,000 스텝, `--resident-gpu --amp bf16` | 더 빠르게, 비트는 다름 | **unverified** |
+| 6 스위트 96 에피소드 실행, `--jobs 6` | 28분에서 약 5-6분 | **관측 2026-09-15: 5:49 (순차 25:56에서), 아래 수정 후** |
+| `report.json` / `events.json`의 순차 실행 대비 | 바이트 동일 | **관측 2026-09-15: 실제 백엔드에서는 비트 동일하지 않음 -- 아래 참조** |
+| 배치 8로 20,000 스텝, `--resident-gpu` | 11분보다 빠르게 | **관측 2026-09-15: 10:57 대 기본값 10:53 -- 더 빠르지 않음; CUDA에서 손실 곡선이 비트 동일하지 않음, 아래 참조** |
+| 20,000 스텝, `--resident-gpu --amp bf16` | 더 빠르게, 비트는 다름 | **관측 2026-09-15: 12:53 -- 기본값보다 느림, 아래 참조** |
 
-위의 모든 행은 서버에서 측정되어 설계 노트 섹션 7.11에 숫자가 적히기 전까지 `Status: unverified`로
-남는다. 1단계에서는 이 중 어느 것도 측정값으로 인용할 수 없다.
+전체 수치(nominal 단독 실행과 나머지 두 학습 행 포함)는 설계 노트 섹션 7.11에 있다. 측정 중 발견한
+두 가지는 이 패킷의 forbidden 목록이 수치 자체로 흡수하게 둘 수 없는 것들이다.
+
+**첫 `--jobs 6` 실행은 더 빠르기는커녕 순차보다 5배 느렸다.** 각 샤드 자신의 `TorchRuntime`
+서브프로세스는 스레드 풀을 박스의 모든 코어로 기본 설정한다. 16코어 서버에서 그런 여섯 개가 한꺼번에
+약 90개의 OS 스레드를 원한다(load average ~47). 박스는 계산이 아니라 컨텍스트 스위칭에 시간을 썼다.
+`crates/es/src/cmd/eval.rs`(`spawn_shards`)에서 수정: 호출자가 이미 값을 지정하지 않았다면(env
+passthrough가 우선) 각 샤드의 `OMP_NUM_THREADS` / `MKL_NUM_THREADS` / `OPENBLAS_NUM_THREADS` /
+`TORCH_NUM_THREADS`를 `cores / jobs`로 제한하며, `shard_thread_cap`/`shard_thread_env`는 독립적으로
+유닛 테스트된다. 수정 후 `--jobs 6`은 5:49를 측정했고, 이는 패킷이 목표한 범위 안이다.
+
+**그 수정은 실제 백엔드의 바이트 동일성을 대가로 치르며, 이 패킷의 forbidden 목록은 그것을 여기서
+닫도록 두지 않는다.** `sharding_the_cells_produces_a_byte_identical_report`(`FakeBackend`, 실제
+부동소수점 없음)는 수정 후 재검증해도 여전히 바이트 단위로 통과한다. 그러나 실제 `mujoco-cpu` +
+`torch` 스택에서는 `--jobs 1`의 자체 서브프로세스는 (이 패킷 이전과 마찬가지로) 제한되지 않은 채
+남아 있는 반면 `--jobs 6` 샤드는 이제 `cores/jobs` 스레드로 제한된다 -- 스레드 수가 다르고, CPU
+스레드 리덕션은 정확히 결합법칙을 만족하지 않는다. 측정 결과: 병합된 report의 24개 셀 중 6개가
+다르다(`failure_mode_histogram` 카운트와 한 스위트의 평균 `episode_length`). `success_rate`와
+`envelope_violation_rate`는 모든 셀에서 동일하며, 에피소드 후반부에서 한 스텝의 분류가 뒤바뀐 뒤로
+소수의 개별 프레임이 다르다. 수정 탓으로 돌리기 전에 분리해서 확인했다: 같은 설정의 독립된 두
+`--jobs 1` 실행은 서로 바이트 동일하고(프레임 포함), `--jobs 1` 실행 전에 `OMP_NUM_THREADS=16`(이
+박스의 코어 수)을 명시적으로 export해도 설정하지 않은 기본값 실행과 바이트 단위로 동일하다 -- 즉
+divergence는 프로세스 분리나 명시적/기본값 env가 아니라 스레드 *수*를 따라간다. 이는
+`MuJoCoCpuBackend` 자신이 선언한 `DeterminismTier::PhysicsMeaning`(설계 노트 섹션 9: tier 3, 비트
+단위 아님)과 CPU 스레드 커널 일반의 하류 결과이며, 샤딩 로직의 결함이 아니다. 이를 닫으려면
+`--jobs 1` 자체의 스레드 수도 제한해야 하는데, 이미 커밋된 V1c/V2b/V3 수치를 움직이지 않고 이
+패킷이 그 값을 고를 근거가 없다 -- 아래에서 forbidden. "수정됨"이 아니라 실제 백엔드의 기존
+한계로 문서화한 채로 둔다.
+
+**`--resident-gpu`는 CPU(오라클 자신의 장치, 이 패킷이 바꾸지 않음)에서는 기본값과 비트 동일하지만
+CUDA에서는 아니다.** `resident_gpu_does_not_move_the_loss`는 두 번째, 무관한 수정 후 40개의 비트
+동일 스텝으로 통과한다: 마지막 assertion이 리터럴 부분 문자열 `"resident_gpu":true`를 찾았는데,
+Python 기본 `json.dumps`는 이를 절대 내지 않는다(콜론 뒤에 항상 공백을 둔다:
+`"resident_gpu": true`) -- 테스트 자체의 기존 버그이며, 실제 `torch`가 필요해서 지금에서야
+발견됐다(`crates/es-policy/tests/ir_training.rs`). 서버에서 `--device cuda`로는 아래 실행 (a)와
+(b)가 첫 옵티마이저 스텝부터 갈라진다: `train_act.py`가 `torch.use_deterministic_algorithms`를
+설정하지 않으므로 흔한 CUDA 커널/알고리즘 선택 비결정성이다. 설계 노트의 "비트 동일" 주장은 유닛
+오라클이 확인하는 CPU 경로에서는 정확하지만 CUDA에서는 성립하지 않는다. 둘 다 화해시키지 않고
+그대로 기록한다.
 
 ## acceptance
 
