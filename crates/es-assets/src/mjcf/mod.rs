@@ -432,12 +432,39 @@ impl<'a> Parser<'a> {
                 other => return Err(attrs.bad("solver", other)),
             },
             iterations: attrs.int_or("iterations", defaults.iterations)?,
+            ls_iterations: attrs.int_or("ls_iterations", defaults.ls_iterations)?,
+            eulerdamp: defaults.eulerdamp,
             impratio: attrs.num_or("impratio", defaults.impratio)?,
         };
         self.scene.options = options;
         for child in node.children().filter(Node::is_element) {
             let line = self.line(child);
             let tag = child.tag_name().name().to_owned();
+            // `<flag>` is the one child with a represented attribute: `eulerdamp` changes how
+            // the Euler integrator applies joint damping (packet M6/B1). Every other flag is
+            // still reported, so enabling one silently is impossible.
+            if tag == "flag" {
+                // Read off the node: `<flag>` takes no default class, so `Attrs` would add
+                // nothing but a class lookup for a tag no `<default>` can name.
+                if let Some(value) = child.attribute("eulerdamp") {
+                    self.scene.options.eulerdamp = value != "disable";
+                }
+                let rest: Vec<&str> = child
+                    .attributes()
+                    .map(|a| a.name())
+                    .filter(|n| *n != "eulerdamp")
+                    .collect();
+                if !rest.is_empty() {
+                    self.warn(
+                        line,
+                        format!(
+                            "<option><flag> {} is not represented, ignored",
+                            rest.join(", ")
+                        ),
+                    );
+                }
+                continue;
+            }
             self.warn(line, format!("<option><{tag}> is not represented, ignored"));
         }
         attrs.report_unknown(&mut self.warnings);

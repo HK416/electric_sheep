@@ -370,8 +370,27 @@ pub struct PhysicsOptions {
     pub jacobian: Jacobian,
     pub solver: Solver,
     pub iterations: u32,
+    /// Solver line-search iterations. Carried because a policy trained under
+    /// `ls_iterations = 5` (`MuJoCo` Playground's locomotion setting) resolves contact
+    /// differently from one stepped at `MuJoCo`'s default 50, and a backend that dropped it
+    /// would change the physics silently (spec 17.2; packet M6/B1).
+    #[serde(default = "default_ls_iterations")]
+    pub ls_iterations: u32,
+    /// `<option><flag eulerdamp>`: `MuJoCo`'s default integrates joint damping implicitly under
+    /// the Euler integrator. MJX-trained models disable it, and the difference is visible in
+    /// `qpos` within a few steps, so it is a carried option rather than an ignored flag.
+    #[serde(default = "default_eulerdamp")]
+    pub eulerdamp: bool,
     /// Frictional-to-normal constraint impedance ratio.
     pub impratio: f64,
+}
+
+fn default_ls_iterations() -> u32 {
+    50
+}
+
+fn default_eulerdamp() -> bool {
+    true
 }
 
 impl Default for PhysicsOptions {
@@ -384,6 +403,8 @@ impl Default for PhysicsOptions {
             jacobian: Jacobian::Auto,
             solver: Solver::Newton,
             iterations: 100,
+            ls_iterations: default_ls_iterations(),
+            eulerdamp: default_eulerdamp(),
             impratio: 1.0,
         }
     }

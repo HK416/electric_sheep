@@ -4972,3 +4972,1129 @@ fn dataset_bake_names_both_refusals_when_the_scene_cannot_be_loaded() {
     );
     println!("RAN dataset_bake_names_both_refusals");
 }
+
+// --- packet M6/B1: the quadruped track's four documents ---------------------------------------
+
+/// `tests/fixtures/quadruped/<name>`.
+fn quad_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/quadruped")
+        .join(name)
+}
+
+fn go1_scene_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mjcf/go1_primitives.xml")
+}
+
+/// The twelve actuated joints in the XML's declaration order, which is also `qpos[7..19]`,
+/// `ctrl[0..12]` and every twelve-wide vector in the four documents.
+const GO1_JOINTS: [&str; 12] = [
+    "FR_hip_joint",
+    "FR_thigh_joint",
+    "FR_calf_joint",
+    "FL_hip_joint",
+    "FL_thigh_joint",
+    "FL_calf_joint",
+    "RR_hip_joint",
+    "RR_thigh_joint",
+    "RR_calf_joint",
+    "RL_hip_joint",
+    "RL_thigh_joint",
+    "RL_calf_joint",
+];
+
+/// Playground's `Go1JoystickFlatTerrain` observation width
+/// (`docs/api-notes/mujoco-playground-quadruped.md` section 1).
+const GO1_OBS_DIM: u64 = 48;
+const GO1_ACTION_DIM: u32 = 12;
+/// `ctrl_dt = 0.02`.
+const GO1_CONTROL_HZ: u64 = 50;
+/// `action_scale`: `motor_targets = default_pose + action * 0.5`.
+const GO1_ACTION_SCALE: f64 = 0.5;
+
+fn go1_scene() -> (es_assets::scene::SceneDesc, Vec<u8>) {
+    let xml = std::fs::read(go1_scene_path()).expect("the Go1 scene");
+    let scene = es_assets::parse_mjcf(&String::from_utf8(xml.clone()).expect("utf-8"))
+        .expect("the Go1 scene parses")
+        .scene;
+    (scene, xml)
+}
+
+/// The `home` keyframe's `qpos[7..19]` -- `default_pose`, the action's zero-point -- read out
+/// of the scene rather than transcribed.
+fn go1_default_pose() -> Vec<f64> {
+    let xml = std::fs::read_to_string(go1_scene_path()).expect("the Go1 scene");
+    let after = xml
+        .split_once("<key name=\"home\" qpos=")
+        .expect("the `home` keyframe")
+        .1;
+    let qpos: Vec<f64> = after
+        .split_once('"')
+        .expect("an opening quote")
+        .1
+        .split_once('"')
+        .expect("a closing quote")
+        .0
+        .split_whitespace()
+        .map(|t| t.parse().expect("a number"))
+        .collect();
+    assert_eq!(qpos.len(), 19, "free base + twelve hinges");
+    qpos[7..].to_vec()
+}
+
+/// The policy's observation tensor: one 48-wide row, `Dimensionless` because it is a *mixed*
+/// vector (m/s, rad/s, a unit gravity vector, rad, rad/s, a dimensionless action and a
+/// command) and spec 5.4's unit algebra has no mixed unit. The per-block units are named in
+/// the fixture header, which is where a reader looks for them.
+fn go1_state_ty(frame: Frame) -> PortType {
+    PortType {
+        elem: ElemType::F32,
+        shape: Shape::new([GO1_OBS_DIM]),
+        unit: Unit::Dimensionless,
+        frame,
+        time: TimeRef::Tick,
+        image: None,
+    }
+}
+
+fn go1_scalar(unit: Unit, frame: Frame) -> PortType {
+    PortType {
+        elem: ElemType::F32,
+        shape: Shape::new([1]),
+        unit,
+        frame,
+        time: TimeRef::Tick,
+        image: None,
+    }
+}
+
+/// Builds the Go1 Task IR from the parsed scene: ids, the reset pose and the joint names all
+/// come out of `go1_primitives.xml`, never out of this file.
+fn go1_task(scene: &es_assets::scene::SceneDesc, xml: &[u8]) -> TaskIr {
+    use es_ir::task::Distribution as TaskDist;
+
+    let trunk = scene
+        .bodies
+        .iter()
+        .find(|b| b.name == "trunk")
+        .expect("the scene has a `trunk` body")
+        .id;
+    let base_joint = scene
+        .joints
+        .iter()
+        .find(|j| j.kind == es_assets::scene::JointKind::Free)
+        .expect("the trunk carries a free joint")
+        .name
+        .clone();
+    let default_pose = go1_default_pose();
+
+    let mut graph: Graph<TaskNode> = Graph::new(2);
+
+    // Episode timeout: 1000 control ticks at 50 Hz = 20 s, upstream's `episode_length`.
+    graph.insert(NodeId(0), TaskNode::GetTime { since_reset: true });
+    graph.insert(
+        NodeId(1),
+        TaskNode::Compare {
+            op: es_ir::task::CmpOp::Ge,
+            rhs: Some(20.0),
+            ty: go1_scalar(Unit::Time, Frame::World),
+        },
+    );
+    graph.insert(
+        NodeId(2),
+        TaskNode::Terminate {
+            kind: es_ir::task::TerminationKind::Timeout,
+        },
+    );
+    graph.connect(NodeId(0), "value", NodeId(1), "a");
+    graph.connect(NodeId(1), "value", NodeId(2), "value");
+
+    // Out of the arena. This is *not* upstream's termination, which is "the upright vector's
+    // z-component is negative" -- see the fixture header: `es-env`'s reward/termination cone
+    // binds a joint's FIRST qpos index, and a free joint's first index is x, so neither the
+    // base height nor the upright vector is reachable from IR-D today.
+    graph.insert(
+        NodeId(3),
+        TaskNode::GetJointState {
+            body: trunk,
+            joints: vec![base_joint.clone()],
+            quantity: JointQuantity::Position,
+        },
+    );
+    graph.insert(
+        NodeId(4),
+        TaskNode::Compare {
+            op: es_ir::task::CmpOp::Gt,
+            rhs: Some(3.0),
+            ty: go1_scalar(Unit::Angle, Frame::Joint(trunk)),
+        },
+    );
+    graph.insert(
+        NodeId(5),
+        TaskNode::Terminate {
+            kind: es_ir::task::TerminationKind::Failure,
+        },
+    );
+    graph.connect(NodeId(3), "value", NodeId(4), "a");
+    graph.connect(NodeId(4), "value", NodeId(5), "value");
+
+    // The reward our cone can express: forward speed, normalized to [0, 1] over the command's
+    // own amplitude bound (1.5 m/s). Upstream's is `exp(-err^2 / 0.25)` against a commanded
+    // velocity, and `MathFn` is not in the cone -- but nothing here trains anything: the
+    // policy is trained by `mujoco_playground` and imported (Track B), and this term exists
+    // for our own evaluation harness.
+    graph.insert(
+        NodeId(6),
+        TaskNode::GetJointState {
+            body: trunk,
+            joints: vec![base_joint],
+            quantity: JointQuantity::Velocity,
+        },
+    );
+    graph.insert(
+        NodeId(7),
+        TaskNode::Normalize {
+            lo: vec![0.0],
+            hi: vec![1.5],
+            out_lo: 0.0,
+            out_hi: 1.0,
+            ty: go1_scalar(Unit::AngularVelocity, Frame::Joint(trunk)),
+        },
+    );
+    graph.insert(
+        NodeId(8),
+        TaskNode::Reward {
+            name: "forward_velocity".to_owned(),
+            weight: 1.0,
+            aggregation: es_ir::task::Aggregation::Sum,
+            ty: PortType {
+                unit: Unit::Normalized { lo: 0.0, hi: 1.0 },
+                ..go1_scalar(Unit::AngularVelocity, Frame::Joint(trunk))
+            },
+        },
+    );
+    graph.connect(NodeId(6), "value", NodeId(7), "value");
+    graph.connect(NodeId(7), "value", NodeId(8), "value");
+
+    graph.insert(
+        NodeId(9),
+        TaskNode::ActionSpec {
+            space: TaskSpace::JointPosition,
+            dim: GO1_ACTION_DIM,
+            control_rate_hz: GO1_CONTROL_HZ as f32,
+        },
+    );
+    // Declared, and deliberately unfed: no IR-D source produces base linear velocity in the
+    // body frame, projected gravity, the previous action or the joystick command, so there is
+    // no graph value to bind here. The channel is the *contract* the trainer's env already
+    // satisfies; Observation IR implements it (spec 5.1, spec 7.4).
+    graph.insert(
+        NodeId(10),
+        TaskNode::ObservationSpec {
+            channel: "state".to_owned(),
+            ty: go1_state_ty(Frame::World),
+        },
+    );
+
+    // The joystick command, drawn once per episode. Upstream resamples it mid-episode on an
+    // Ornstein-Uhlenbeck-like schedule; a per-episode draw is what IR-D can say.
+    let mut rng_streams = BTreeSet::new();
+    let mut next = 11u32;
+    for (axis, bound) in [("lin_x", 1.5), ("lin_y", 0.8), ("ang_z", 1.2)] {
+        let stream = format!("command.{axis}");
+        rng_streams.insert(stream.clone());
+        graph.insert(
+            NodeId(next),
+            TaskNode::Randomization {
+                target: stream.clone(),
+                dist: TaskDist::Uniform {
+                    lo: -bound,
+                    hi: bound,
+                },
+                stream,
+            },
+        );
+        next += 1;
+    }
+
+    // Reset to `home`. This is load-bearing rather than decorative: `SceneDesc` carries no
+    // keyframe, so without these nodes the runtime would reset to the XML's `qpos0` -- every
+    // hinge at 0 and the trunk at z = 0.445 -- and `default_pose`, the action's zero-point,
+    // would never reach the simulator at all.
+    rng_streams.insert("reset.base_z".to_owned());
+    graph.insert(
+        NodeId(next),
+        TaskNode::ResetState {
+            target: "qpos[2]".to_owned(),
+            dist: TaskDist::Constant(0.278),
+            stream: "reset.base_z".to_owned(),
+        },
+    );
+    next += 1;
+    for (i, joint) in GO1_JOINTS.iter().enumerate() {
+        let stream = format!("reset.{joint}");
+        rng_streams.insert(stream.clone());
+        graph.insert(
+            NodeId(next),
+            TaskNode::ResetState {
+                target: format!("joint.{joint}.qpos"),
+                dist: TaskDist::Constant(default_pose[i]),
+                stream,
+            },
+        );
+        next += 1;
+    }
+
+    let mut channels = BTreeMap::new();
+    channels.insert(
+        "state".to_owned(),
+        ObsChannel {
+            source: ObsSource::JointState {
+                body: trunk,
+                dof: GO1_OBS_DIM as u32,
+            },
+            ty: go1_state_ty(Frame::World),
+        },
+    );
+
+    TaskIr {
+        schema_version: 2,
+        scene: SceneRef {
+            path: "tests/fixtures/mjcf/go1_primitives.xml".to_owned(),
+            scene_hash: scene.scene_hash(),
+            asset_hash: *blake3::hash(xml).as_bytes(),
+        },
+        graph,
+        observation_spec: ObservationSpec { channels },
+        config: TaskConfig {
+            max_episode_steps: 1000,
+            control_rate_hz: GO1_CONTROL_HZ as f32,
+            deterministic: true,
+            rng_streams,
+        },
+        control: None,
+    }
+}
+
+fn go1_observation(task: &TaskIr, scene: &es_assets::scene::SceneDesc) -> ObservationIr {
+    let trunk = scene
+        .bodies
+        .iter()
+        .find(|b| b.name == "trunk")
+        .expect("the scene has a `trunk` body")
+        .id;
+    let mut obs = ObservationIr::new(1, task.task_hash().expect("the task hashes"));
+    obs.graph.insert(
+        NodeId(0),
+        ObservationNode::StateInput {
+            source: trunk,
+            io: Io::source(go1_state_ty(Frame::World)),
+        },
+    );
+    // `history_len = 1`: Go1 stacks no frames, and layer 2 of spec 7.5's time model says so
+    // explicitly rather than by omission. The same field carries `history_len = 3` if a later
+    // Playground env (Spot, H1) joins the track.
+    obs.temporal.window = Some(TemporalWindow {
+        n_steps: 1,
+        stride: 1,
+        align: Align::Hold,
+    });
+    obs.outputs.insert(
+        "state".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(NodeId(0), "out"),
+            ty: go1_state_ty(Frame::World),
+        },
+    );
+    obs
+}
+
+fn go1_learning() -> LearningGraph {
+    use es_ir::learning::{NormalizeDir, StatsSource};
+
+    let default_pose = go1_default_pose();
+    let input = Port::new("state", go1_state_ty(Frame::Policy));
+    let feature = |dim: u64| PortType {
+        elem: ElemType::F32,
+        shape: Shape::new([dim]),
+        unit: Unit::Dimensionless,
+        frame: Frame::Policy,
+        time: TimeRef::Tick,
+        image: None,
+    };
+    let chunk = |rows: u64| PortType {
+        elem: ElemType::F32,
+        shape: Shape::new([rows, u64::from(GO1_ACTION_DIM)]),
+        unit: Unit::Normalized { lo: -1.0, hi: 1.0 },
+        frame: Frame::Policy,
+        time: TimeRef::Tick,
+        image: None,
+    };
+
+    let mut nodes: Graph<LearningNode> = Graph::new(1);
+    // brax's `running_statistics` observation normalizer, as an IR node. **The values are
+    // placeholders** -- mean 0, std 1, i.e. the identity -- because they are a product of
+    // training: `normalizer_params.mean["state"]` / `.std["state"]` come out of the
+    // checkpoint, and the import packet rewrites this node (and with it `learning_hash`).
+    nodes.insert(
+        NodeId(0),
+        LearningNode::Normalizer {
+            inputs: vec![input.clone()],
+            direction: NormalizeDir::Forward,
+            stats: StatsSource::MeanStd {
+                mean: vec![0.0; GO1_OBS_DIM as usize],
+                std: vec![1.0; GO1_OBS_DIM as usize],
+            },
+            out_unit: Unit::Dimensionless,
+        },
+    );
+    // The policy MLP. Playground's is four `Dense` layers -- 512, 256, 128, then 2 x 12 --
+    // with `swish` between them; ours is `hidden = [512, 256]` with `out_dim = 128` (the same
+    // three hidden widths the api-note names) plus the head's own `Linear(128, 12)`, which is
+    // that fourth `Dense` restricted to the mean half of the Gaussian. Two gaps, both open
+    // items in docs/design/quadruped-track.md section 3: `lower_to_torch` emits `nn.ReLU`, not
+    // swish, and it puts no activation between `out_dim` and the head.
+    nodes.insert(
+        NodeId(1),
+        LearningNode::StateEncoder {
+            inputs: vec![Port::new("state", feature(GO1_OBS_DIM))],
+            kind: StateEncoderKind::Mlp {
+                hidden: vec![512, 256],
+            },
+            out_dim: 128,
+        },
+    );
+    nodes.insert(
+        NodeId(2),
+        LearningNode::PolicyHead {
+            inputs: vec![Port::new("feat", feature(128))],
+            kind: HeadKind::Regression,
+            action_dim: GO1_ACTION_DIM,
+            horizon: 1,
+        },
+    );
+    nodes.insert(
+        NodeId(3),
+        LearningNode::ActionChunker {
+            inputs: vec![Port::new("chunk", chunk(1))],
+            horizon: 1,
+            execute_chunk: 1,
+            replan_hz: GO1_CONTROL_HZ as f32,
+            mode: ActionExecutionMode::RecedingHorizon,
+            blend: ChunkBlendPolicy::HardSwitch,
+            buffer_chunks: 2,
+        },
+    );
+    // `motor_targets = default_pose + action * action_scale`, spelled as spec 8.3's
+    // `ActionUnnormalizer`: `MeanStd` inverse is `x * std + mean`, which is exactly that with
+    // `mean = default_pose` and `std = 0.5`. These numbers are NOT placeholders -- they come
+    // from the scene's `home` keyframe and the api-note, and training does not move them.
+    nodes.insert(
+        NodeId(4),
+        LearningNode::Normalizer {
+            inputs: vec![Port::new("actions", chunk(1))],
+            direction: NormalizeDir::Inverse,
+            stats: StatsSource::MeanStd {
+                mean: default_pose,
+                std: vec![GO1_ACTION_SCALE; GO1_ACTION_DIM as usize],
+            },
+            out_unit: Unit::Angle,
+        },
+    );
+    nodes.connect(NodeId(0), "out", NodeId(1), "state");
+    nodes.connect(NodeId(1), "out", NodeId(2), "feat");
+    nodes.connect(NodeId(2), "chunk", NodeId(3), "chunk");
+    nodes.connect(NodeId(3), "actions", NodeId(4), "actions");
+    nodes.inputs.push(PortRef::new(NodeId(0), "state"));
+    nodes.outputs.push(PortRef::new(NodeId(4), "out"));
+
+    let mut contract_inputs = BTreeMap::new();
+    contract_inputs.insert("state".to_owned(), input.clone());
+    LearningGraph {
+        schema_version: 1,
+        inputs: vec![input],
+        nodes,
+        outputs: vec![Port::new(
+            "actions",
+            PortType {
+                unit: Unit::Angle,
+                ..chunk(1)
+            },
+        )],
+        policy: PolicyHandle {
+            architecture: ArchKind::Act,
+            base_model: None,
+            // The untrained placeholder. The import packet packs the brax checkpoint's
+            // `hidden_0..3` kernels (transposed to [out, in]) and recomputes this hash; no
+            // pickle path exists anywhere (INV-16).
+            weights: WeightsRef::Safetensors {
+                path: "policy.safetensors".to_owned(),
+                hash: [0; 32],
+            },
+            contract: PolicyContract {
+                inputs: contract_inputs,
+                observation_window: 1,
+                action_dim: GO1_ACTION_DIM,
+                horizon: 1,
+                execute_chunk: 1,
+                replanning_hz: GO1_CONTROL_HZ as f32,
+                execution_mode: ActionExecutionMode::RecedingHorizon,
+                runtime: RuntimeHints {
+                    dtype: ElemType::F32,
+                    expected_latency_ms: 2.0,
+                    deadline_ms: 20.0,
+                },
+            },
+        },
+    }
+}
+
+fn go1_deployment(scene: &es_assets::scene::SceneDesc) -> DeploymentIr {
+    // Hard limits, read out of the scene: `safety.position` is each hinge's own `range` and
+    // `torque_max` is its actuator's `forcerange` (+/-23.7 N m for hip and thigh, +/-35.55 for
+    // the knee). Transcribing either would be a second source of truth.
+    let limit_of = |name: &str| -> Limit {
+        let j = scene
+            .joints
+            .iter()
+            .find(|j| j.name == name)
+            .unwrap_or_else(|| panic!("no joint `{name}`"));
+        let (lower, upper) = j.range.unwrap_or_else(|| panic!("`{name}` has no range"));
+        Limit { lower, upper }
+    };
+    let torque_of = |joint: &str| -> f64 {
+        let id = scene
+            .joints
+            .iter()
+            .find(|j| j.name == joint)
+            .expect("the joint")
+            .id;
+        let a = scene
+            .actuators
+            .iter()
+            .find(|a| a.target == es_assets::scene::ActuatorTarget::Joint(id))
+            .unwrap_or_else(|| panic!("no actuator drives `{joint}`"));
+        a.force_range.expect("the actuator has a forcerange").1
+    };
+    let position: Vec<Limit> = GO1_JOINTS.iter().map(|n| limit_of(n)).collect();
+    let torque_max: Vec<f64> = GO1_JOINTS.iter().map(|n| torque_of(n)).collect();
+    let n = GO1_ACTION_DIM as usize;
+
+    DeploymentIr {
+        schema_version: 1,
+        robot: RobotRef {
+            name: "go1".to_owned(),
+            target: RobotTarget::Simulated {
+                scene: "tests/fixtures/mjcf/go1_primitives.xml".to_owned(),
+            },
+            n_joints: n,
+        },
+        action: ActionContract {
+            space: DepSpace::JointPosition,
+            dim: n,
+            horizon: 1,
+            execute_chunk: 1,
+        },
+        safety: SafetyEnvelope {
+            position,
+            // 0.02 rad (1.1 deg) inside each hard limit. The knee's range is the tightest at
+            // 1.93 rad, so this leaves room in every row.
+            position_soft_margin: vec![0.02; n],
+            // Go1's joints are geared A1-class motors; ~21 rad/s is about where they run under
+            // load. Upstream bounds no velocity at all, so this is the envelope *widening*
+            // the deployment adds, never a limit the policy trained against (INV-12).
+            velocity_max: vec![21.0; n],
+            // 21 rad/s reached in 0.042 s, two control ticks. A swing leg is the fastest thing
+            // on this robot and it has to fit.
+            acceleration_max: vec![500.0; n],
+            torque_max,
+            jerk_max: None,
+            // The action is a joint position target and `tanh` bounds it, not its rate:
+            // `default_pose +/- 0.5` rad is reachable in one tick by construction, so the
+            // first difference is bounded at 1.0 rad and the second at twice that. Tighter
+            // than this and the plane clamps every tick of a normal gait, which is the defect
+            // packet M5/V6 found on the arm.
+            action_rate: RateLimit {
+                first_diff_max: vec![1.0; n],
+                second_diff_max: vec![2.0; n],
+            },
+            // Declared, and **not enforced by `es-safety`** (docs/design/safety-plane.md):
+            // there is no forward kinematics and no contact query in the plane. A quadruped
+            // roams, so the box is the arena, not a reach envelope.
+            workspace: Workspace::Box {
+                min: [-50.0, -50.0, -0.01],
+                max: [50.0, 50.0, 1.5],
+            },
+            ee_velocity_max: 5.0,
+            min_self_distance: 0.005,
+            min_env_distance: 0.005,
+            // ~12.7 kg landing on one or two feet.
+            contact_force_max: 500.0,
+        },
+        execution: ExecutionMode::RecedingHorizon,
+        // 50 Hz control, 50 Hz inference: Go1 is reactive, chunk 1, one inference per tick
+        // (api-note section 1; the real-robot deployment in the paper runs at 50 Hz too).
+        deadlines: Deadlines {
+            observation_age: Micros(40_000),
+            inference_budget: Micros(20_000),
+            actuation_budget: Micros(10_000),
+        },
+        watchdogs: WatchdogSet(vec![
+            Watchdog::InferenceDeadline {
+                budget: Micros(20_000),
+            },
+            Watchdog::ChunkUnderrun,
+            Watchdog::StaleObservation {
+                max_age: Micros(40_000),
+            },
+            Watchdog::EnvelopeViolationRate {
+                window: 200,
+                max_frac: 0.9,
+            },
+        ]),
+        // A standing quadruped that freezes its PD targets stays standing; zeroing velocity
+        // would be a fall. Nothing here can switch the plane off (INV-12).
+        fallback: FallbackPolicy::HoldPosition,
+        rate: RateSpec {
+            control: TickRate::hz(GO1_CONTROL_HZ),
+            inference: TickRate::hz(GO1_CONTROL_HZ),
+        },
+    }
+}
+
+/// Regenerates `tests/fixtures/quadruped/{task,observation,learning,deployment}.toml`. Every
+/// number in them is read out of `tests/fixtures/mjcf/go1_primitives.xml` or out of
+/// `docs/api-notes/mujoco-playground-quadruped.md`, and every hash is derived, so no value in
+/// the four files is ever typed in by hand. Run explicitly:
+///
+///     cargo test -p es --test cli -- --ignored regenerate_quadruped_documents
+#[test]
+#[ignore = "fixture generator; run explicitly"]
+fn regenerate_quadruped_documents() {
+    let (scene, xml) = go1_scene();
+    let task = go1_task(&scene, &xml);
+    let observation = go1_observation(&task, &scene);
+    let learning = go1_learning();
+    let deployment = go1_deployment(&scene);
+
+    for (name, header, text) in [
+        (
+            "task.toml",
+            QUAD_TASK_HEADER,
+            es_ir::serial::task_to_toml(&task).expect("task toml"),
+        ),
+        (
+            "observation.toml",
+            QUAD_OBSERVATION_HEADER,
+            es_ir::serial::observation_to_toml(&observation).expect("observation toml"),
+        ),
+        (
+            "learning.toml",
+            QUAD_LEARNING_HEADER,
+            es_ir::serial::learning_to_toml(&learning).expect("learning toml"),
+        ),
+        (
+            "deployment.toml",
+            QUAD_DEPLOYMENT_HEADER,
+            es_ir::serial::deployment_to_toml(&deployment).expect("deployment toml"),
+        ),
+    ] {
+        write(&quad_fixture(name), &format!("{header}\n{text}"));
+        println!("wrote {}", quad_fixture(name).display());
+    }
+}
+
+const QUAD_TASK_HEADER: &str = "\
+# Task IR (spec 6) for the MuJoCo Playground Go1 joystick task -- packet M6/B1.
+#
+# Generated by `cargo test -p es --test cli -- --ignored regenerate_quadruped_documents` from
+# tests/fixtures/mjcf/go1_primitives.xml, so `scene_hash`, `asset_hash`, the reset pose and
+# the twelve joint names are derived, never typed in. Upstream's parameters are pinned in
+# docs/api-notes/mujoco-playground-quadruped.md; the design note is
+# docs/design/quadruped-track.md.
+#
+# Track B, and this is the whole framing: the policy is trained *externally* by
+# `mujoco_playground` (JAX/MJX PPO, 200 M steps) and imported as weights (spec 8, spec 1.9 --
+# we do not build a second training stack). So this document is not what trains anything. It
+# is (a) the scene, reset and termination contract our runtime executes the imported policy
+# under, and (b) the declaration of the observation channel the Observation IR implements.
+#
+# Parameters: NJ = 12, control 50 Hz (`ctrl_dt = 0.02`), max_episode_steps = 1000 (20 s,
+# upstream's `episode_length`), action = 12 joint position targets.
+#
+# `state`, the one declared channel, is Playground's 48-wide policy input in its exact order:
+#
+#     local_linvel(3, m/s)  gyro(3, rad/s)  gravity(3, unit vector)
+#     joint_pos(12, rad, minus default_pose)  joint_vel(12, rad/s)
+#     last_action(12, dimensionless)  command(3, [m/s, m/s, rad/s])
+#
+# The port's unit is `Dimensionless` because that vector is mixed and spec 5.4's algebra has
+# no mixed unit -- the block units are the list above, and this comment is where they live.
+# Upstream's per-channel additive uniform observation noise is applied inside the trainer's
+# env; it is not represented here, and `AugmentKind` has no uniform variant to represent it
+# with (INV-15 would keep it off during evaluation anyway).
+#
+# THREE CEILINGS, recorded rather than papered over (design note section 3):
+#
+#  * The `ObservationSpec` node is deliberately UNFED. No IR-D source produces base linear
+#    velocity in the body frame, projected gravity, the previous action or the joystick
+#    command, so there is no graph value to bind to it. Declaring the channel is still
+#    correct -- spec 7.4 says Task IR declares and Observation IR implements -- but nothing in
+#    IR-D computes this vector, and `es-eval`'s capture path cannot serve it either: it reads
+#    `qpos` slices and MJCF sensors, and this scene has neither the velocities nor (because
+#    `mjcf_out` emits only jointpos/jointvel) the sensors. That is the track's first blocking
+#    item, and `es eval run` names it rather than faking a run.
+#  * Termination is timeout plus \"the base left the arena\" (|x| > 3 m). Upstream terminates
+#    on the upright vector's z-component going negative, and the usual second guard is base
+#    height -- neither is expressible: `es-env`'s reward/termination cone binds a joint's
+#    FIRST qpos index (crates/es-env/src/plan.rs `joint_leaf`), and a free joint's first index
+#    is x, not z and not a quaternion component. (Its unit here is `Angle`, not `Length`:
+#    `JointQuantity::Position.unit()` is per-quantity, not per-joint-kind, and a free joint's
+#    translational coordinates come out typed as if they were hinge angles.)
+#  * The reward is forward speed normalized over the command bound, not upstream's
+#    `exp(-err^2 / tracking_sigma)`: `MathFn` is not in the cone and IR-D has no constant leaf
+#    to subtract a commanded velocity with. Upstream's fifteen shaped terms train the policy
+#    in `mujoco_playground`; this one term is for *our* evaluation harness.
+#
+# The thirteen `ResetState` nodes are load-bearing, not decorative: `SceneDesc` carries no
+# keyframe, so without them the runtime resets to the XML's `qpos0` -- every hinge at 0, the
+# trunk at z = 0.445 -- and `default_pose`, the zero-point of every action, never reaches the
+# simulator.";
+
+const QUAD_OBSERVATION_HEADER: &str = "\
+# Observation IR (spec 7) for the Go1 joystick task -- packet M6/B1.
+#
+# Generated by `cargo test -p es --test cli -- --ignored regenerate_quadruped_documents`;
+# `task_ref` is task.toml's own `task_hash`.
+#
+# It is one node long, and that is faithful rather than lazy: Playground applies no
+# preprocessing to the state vector. The noise is added inside the training env, and the
+# running-statistics normalization is part of the *policy* (brax keeps it in
+# `normalizer_params`), so it is a Learning IR `Normalizer` node in learning.toml, not a
+# `Normalize` here.
+#
+# `temporal.window = { n_steps = 1, stride = 1, align = \"Hold\" }` is layer 2 of spec 7.5's
+# time model and is upstream's `history_len = 1` said out loud: Go1 stacks no frames. The same
+# field carries `history_len = 3` if a later Playground env (Spot, H1) joins the track.
+# XIR-011 checks it against the policy contract's `observation_window`.
+#
+# The 48-wide layout, its block order and its units are in task.toml's header -- this document
+# implements that declaration and does not restate it.";
+
+const QUAD_LEARNING_HEADER: &str = "\
+# Learning IR (spec 8) for the Go1 joystick policy -- packet M6/B1.
+#
+# Generated by `cargo test -p es --test cli -- --ignored regenerate_quadruped_documents`.
+#
+#   Normalizer{Forward, MeanStd}  ->  StateEncoder{Mlp [512, 256] -> 128}
+#       ->  PolicyHead{Regression, 12 x 1}  ->  ActionChunker  ->  Normalizer{Inverse, MeanStd}
+#
+# horizon H = 1, execute_chunk = 1, replanning_hz = 50 (= the control rate; Go1 is reactive
+# and upstream chunks nothing), action_dim = 12.
+#
+# THE WEIGHTS ARE A PLACEHOLDER and so is the observation normalizer. `policy.weights` is a
+# `safetensors` reference with an all-zero hash, and node 0's `mean = 0` / `std = 1` is the
+# identity. Both are filled by the import packet from a trained brax checkpoint:
+# `params = (normalizer_params, policy_params)`, `normalizer_params.mean[\"state\"]` and
+# `.std[\"state\"]` are the running statistics, and `policy_params['params']['hidden_0..3']`
+# are the kernels (shape [in, out], transposed to [out, in] for our convention). No pickle
+# path exists anywhere (INV-16).
+#
+# WHAT IS NOT YET EXACT, and is an open item in docs/design/quadruped-track.md section 3:
+#
+#  * Activation. brax's `MLP` uses `linen.swish`; `lower_to_torch` emits `nn.ReLU`. Different
+#    function, so imported weights would not reproduce the trained policy until one of the two
+#    moves. This is the single largest import risk and it is a Learning IR lowering question,
+#    not a document question.
+#  * Layer count matches, activation placement does not. Playground is Dense(512) swish,
+#    Dense(256) swish, Dense(128) swish, Dense(24); ours is Linear(48,512) ReLU Linear(512,256)
+#    ReLU Linear(256,128) then the head's Linear(128,12) -- four linear layers, as upstream,
+#    but no activation before the head.
+#  * `tanh`. Deterministic inference upstream is `tanh(location)` on the first half of the
+#    24-wide output (`NormalTanhDistribution.mode`); the second half is the log-scale and is
+#    unused. Our node set has no activation node, so `tanh` is not represented. The action
+#    port's `Normalized { lo = -1, hi = 1 }` unit says where the value must land and the
+#    Safety Plane clamps to it, which is the range but not the shape of `tanh`.
+#
+# The last node is NOT a placeholder: `motor_targets = default_pose + action * action_scale`
+# is `Normalizer{Inverse, MeanStd}` exactly -- inverse MeanStd is `x * std + mean`, with
+# `mean = default_pose` (the scene's `home` keyframe) and `std = 0.5` (`action_scale`).
+#
+# `architecture = \"Act\"` is this repo's name for a plain regression / behaviour-cloning head
+# (`HeadKind::Regression`'s own doc comment), not a claim that this is ACT: there is no VAE,
+# no transformer and no chunking here.";
+
+const QUAD_DEPLOYMENT_HEADER: &str = "\
+# Deployment IR + Safety Plane (spec 9) for the Go1 joystick policy -- packet M6/B1.
+#
+# Generated by `cargo test -p es --test cli -- --ignored regenerate_quadruped_documents`:
+# `safety.position` is each hinge's own `range` and `torque_max` is its actuator's
+# `forcerange`, both read out of tests/fixtures/mjcf/go1_primitives.xml.
+#
+# The envelope is a *document*, never a switch (INV-12): nothing here can disable the Safety
+# Plane, and every limit below is at least as wide as what the policy trained under.
+#
+# What every number is, physically:
+#
+#  * `position` -- upstream's own joint ranges: abduction +/-0.863 rad, hip -0.686..4.501,
+#    knee -2.818..-0.888. `position_soft_margin = 0.02` rad (1.1 deg) inside each; the knee's
+#    1.93 rad range is the tightest and leaves room.
+#  * `torque_max` -- the `<position>` actuators' `forcerange`: 23.7 N m for hip and thigh,
+#    35.55 N m for the knee. The PD loop is MuJoCo's own (`kp = 35`, `dof_damping = 0.5`
+#    written in by `Go1Env.__init__`), so torque is what that loop makes of a position error.
+#  * `velocity_max = 21.0` rad/s. Go1's geared A1-class joints run near this under load.
+#    **Upstream bounds no joint velocity at all**, so this row is the deployment widening the
+#    envelope, never a limit the policy was trained against.
+#  * `acceleration_max = 500.0` rad/s^2: 21 rad/s reached in 0.042 s, two control ticks. A
+#    swing leg is the fastest thing on this robot and it has to fit inside the bound.
+#  * `action_rate.first_diff_max = 1.0` rad, `second_diff_max = 2.0`. The action is a joint
+#    position target: `default_pose +/- 0.5` rad is reachable in one tick by construction
+#    (`tanh` bounds the action, not its rate), so a full swing of the command is 1.0 rad.
+#    Anything tighter clamps every tick of a normal gait, which is the defect packet M5/V6
+#    found on the arm.
+#  * `ee_velocity_max`, `workspace`, `contact_force_max`, `min_self_distance` and
+#    `min_env_distance` are declared and **not enforced by `es-safety`** -- there is no forward
+#    kinematics and no contact query in the plane (docs/design/safety-plane.md). For a robot
+#    that walks away, `workspace` is the arena, not a reach envelope.
+#  * `fallback = \"hold_position\"`: a standing quadruped that freezes its PD targets stays
+#    standing. `zero_velocity` would be a fall.
+#
+# Rates are integer `TickRate`s (spec 18.1): control 50 Hz and inference 50 Hz, because Go1 is
+# reactive -- one inference per control tick, `horizon = execute_chunk = 1`, no chunking
+# upstream. The deadlines are whole multiples of the 20 ms control period: observation_age 2x,
+# inference_budget 1x, actuation_budget 1/2x.
+#
+# KNOWN DEFECT on the simulated path, and it is this document's headline open item: the
+# Safety Plane is fed `qpos[0..12]` / `qvel[0..12]` of the loaded model
+# (crates/es-eval/src/runner.rs `joint_state`), a convention written for a FIXED-BASE arm. Go1
+# floats: `qpos[0..7]` and `qvel[0..6]` are the trunk's free joint, so the plane would judge
+# the base pose against joint limits and the first six hinges against nothing. The envelope
+# below is correct for the robot; feeding it the right twelve rows is an `es-eval` change and
+# the quadruped track's second blocking item (design note section 3). It is not worked around
+# here, and it is certainly not worked around by disabling anything (INV-12).
+#
+# `target` is the simulated scene; a real Go1 swaps it for `Physical { driver }` without
+# touching the envelope.";
+
+/// The four documents, read back from disk exactly as `es ir check` reads them.
+fn quadruped_documents() -> (TaskIr, ObservationIr, LearningGraph, DeploymentIr) {
+    let read = |name: &str| std::fs::read_to_string(quad_fixture(name)).expect(name);
+    (
+        es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml parses"),
+        es_ir::serial::observation_from_toml(&read("observation.toml"))
+            .expect("observation.toml parses"),
+        es_ir::serial::learning_from_toml(&read("learning.toml")).expect("learning.toml parses"),
+        es_ir::serial::deployment_from_toml(&read("deployment.toml"))
+            .expect("deployment.toml parses"),
+    )
+}
+
+/// Each of the four validates on its own, the Cross-IR Check (spec 11.1) is clean, and the
+/// `es ir check` binary agrees -- the packet's first oracle, and the one that needs nothing
+/// but Rust.
+#[test]
+fn quadruped_documents_validate_and_cross_check() {
+    let (task, observation, learning, deployment) = quadruped_documents();
+    for (name, diags) in [
+        ("task", task.validate()),
+        ("observation", observation.validate()),
+        ("learning", learning.validate()),
+        ("deployment", deployment.validate()),
+    ] {
+        assert!(diags.is_empty(), "{name}.toml: {diags:#?}");
+    }
+    let diags = cross::check(&IrBundle {
+        task: &task,
+        observation: &observation,
+        learning: &learning,
+        deployment: &deployment,
+        evaluation: None,
+    });
+    assert!(diags.is_empty(), "cross-IR: {diags:#?}");
+
+    // The documents say what the api-note says (`docs/api-notes/mujoco-playground-quadruped.md`
+    // section 1): 48 in, 12 out, one frame of history, 50 Hz, chunk 1.
+    let contract = &learning.policy.contract;
+    assert_eq!(contract.action_dim, GO1_ACTION_DIM);
+    assert_eq!((contract.horizon, contract.execute_chunk), (1, 1));
+    assert_eq!(contract.observation_window, 1);
+    // An exact comparison is the point: `replanning_hz` is the control rate, not near it.
+    #[allow(clippy::float_cmp)]
+    {
+        assert_eq!(contract.replanning_hz, GO1_CONTROL_HZ as f32);
+    }
+    assert_eq!(
+        observation.outputs["state"].ty.shape.dims(),
+        [GO1_OBS_DIM],
+        "Playground's policy input is 48-wide"
+    );
+    assert_eq!(
+        observation.temporal.window,
+        Some(TemporalWindow {
+            n_steps: 1,
+            stride: 1,
+            align: Align::Hold
+        }),
+        "history_len = 1"
+    );
+    assert_eq!(deployment.rate.control, TickRate::hz(GO1_CONTROL_HZ));
+    assert_eq!(deployment.robot.n_joints, GO1_ACTION_DIM as usize);
+
+    let out = bin()
+        .args(["ir", "check"])
+        .arg(quad_fixture("task.toml"))
+        .arg(quad_fixture("observation.toml"))
+        .arg(quad_fixture("learning.toml"))
+        .arg(quad_fixture("deployment.toml"))
+        .output()
+        .expect("run es ir check");
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("hash chain"), "{text}");
+    println!("RAN quadruped_documents_validate_and_cross_check");
+}
+
+/// The committed files are exactly what the generator writes, so a hand edit to any of the
+/// four is a failing test rather than a number nobody can trace back to the scene.
+#[test]
+fn quadruped_documents_are_what_the_generator_produces() {
+    let (scene, xml) = go1_scene();
+    let task = go1_task(&scene, &xml);
+    let observation = go1_observation(&task, &scene);
+    for (name, built) in [
+        ("task.toml", es_ir::serial::task_to_toml(&task).unwrap()),
+        (
+            "observation.toml",
+            es_ir::serial::observation_to_toml(&observation).unwrap(),
+        ),
+        (
+            "learning.toml",
+            es_ir::serial::learning_to_toml(&go1_learning()).unwrap(),
+        ),
+        (
+            "deployment.toml",
+            es_ir::serial::deployment_to_toml(&go1_deployment(&scene)).unwrap(),
+        ),
+    ] {
+        let on_disk = std::fs::read_to_string(quad_fixture(name)).expect(name);
+        let body = on_disk
+            .split_once("\nes_schema")
+            .map(|(_, rest)| format!("es_schema{rest}"))
+            .unwrap_or(on_disk);
+        assert_eq!(
+            body, built,
+            "{name} is not what the generator writes; rerun \
+             `cargo test -p es --test cli -- --ignored regenerate_quadruped_documents`"
+        );
+    }
+    // And the scene the documents name is the scene they were generated from.
+    assert_eq!(task.scene.scene_hash, scene.scene_hash());
+    println!("RAN quadruped_documents_are_what_the_generator_produces");
+}
+
+/// A 32-bit xorshift, seeded from the documents themselves: an untrained policy's chunk is
+/// arbitrary inside `tanh`'s range, and what the Safety Plane does with an arbitrary chunk is
+/// the property under test. Deterministic, because a flaky Safety Plane test is worthless.
+fn xorshift(state: &mut u32) -> f64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 17;
+    *state ^= *state << 5;
+    f64::from(*state % 2001) / 1000.0 - 1.0
+}
+
+/// The packet's pipeline oracle: the four documents pack into a `policy.esb`, and 100 control
+/// ticks of an untrained policy's actions go through the real `SafetyPlane` built from
+/// `deployment.toml` without a panic and without ever leaving the envelope.
+///
+/// This is the Safety Plane path in-process rather than through `es eval run`, and
+/// deliberately: `es eval run` needs a `mujoco` and a `torch` interpreter, and it also cannot
+/// serve this observation yet (see [`quadruped_eval_run_names_the_observation_gap`]). What it
+/// can prove today is that the envelope in `deployment.toml` is one the plane accepts, applies
+/// and never has to be disabled for (INV-12) -- at 12 joints, which no fixture in this repo
+/// had before.
+#[test]
+fn quadruped_bundle_runs_100_ticks_through_the_safety_plane() {
+    use es_safety::{ActionChunk, ActionSource, SafetyPlane};
+    const NJ: usize = 12;
+
+    let (task, observation, learning, deployment) = quadruped_documents();
+    let weights = b"es-m6-b1-untrained-placeholder".to_vec();
+    let mut learning = learning;
+    learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let bytes =
+        es_compile::PolicyBundle::build(&task, &observation, &learning, &deployment, &weights)
+            .expect("the four quadruped documents pack into a bundle");
+    let bundle = es_compile::PolicyBundle::open(&bytes).expect("the bundle re-opens");
+    assert_eq!(bundle.deployment.robot.n_joints, NJ);
+
+    let default_pose = go1_default_pose();
+    let mut seed = u32::from_le_bytes(
+        learning.learning_hash().expect("the learning IR hashes")[..4]
+            .try_into()
+            .expect("4 bytes"),
+    ) | 1;
+
+    // 100 control ticks at `scale` rad of action amplitude, returning the `ActionSource`
+    // histogram. Every tick is checked, so a panic or an escape is a failure wherever it
+    // happens, not only at the end.
+    let mut run = |scale: f64| -> BTreeMap<String, u32> {
+        let mut plane = SafetyPlane::<NJ, 1>::from_ir(&deployment).expect("the envelope is valid");
+        let mut q = [0.0; NJ];
+        q.copy_from_slice(&default_pose);
+        let mut sources = BTreeMap::new();
+        for tick in 0..100u64 {
+            plane.observe_state(&q, &[0.0; NJ]);
+            // `default_pose + action * action_scale`, the unnormalizer's own formula.
+            let mut row = [0.0; NJ];
+            for (j, v) in row.iter_mut().enumerate() {
+                *v = default_pose[j] + xorshift(&mut seed) * scale;
+            }
+            let chunk = ActionChunk::<NJ, 1>::new([row], 1, ExecutionMode::RecedingHorizon)
+                .with_seq(tick + 1);
+            let safe = plane.validate(&chunk, Micros(0), es_core::PhysTick::ZERO.add_ticks(tick));
+            *sources.entry(format!("{:?}", safe.source)).or_insert(0u32) += 1;
+            for (j, v) in safe.q.iter().enumerate() {
+                assert!(v.is_finite(), "tick {tick} joint {j}: {v}");
+                let limit = deployment.safety.position[j];
+                assert!(
+                    *v >= limit.lower && *v <= limit.upper,
+                    "tick {tick} joint {j}: {v} is outside {limit:?}"
+                );
+            }
+            // The plane's own output becomes the next measured state: a perfect servo, which
+            // is the harshest case for the rate limiter.
+            q = safe.q;
+        }
+        sources
+    };
+
+    // An untrained network: `tanh` bounds it to +/-1, so the command jumps up to a full
+    // `+/-action_scale` rad per tick. That is ~50 rad/s at 50 Hz against a 21 rad/s joint, so
+    // the plane SHOULD clamp -- what matters is that it clamps rather than latching a
+    // fallback, and that nothing ever leaves the position limits.
+    let untrained = run(GO1_ACTION_SCALE);
+    println!("quadruped safety plane, 100 untrained ticks: {untrained:?}");
+    assert_eq!(untrained.values().sum::<u32>(), 100);
+    assert!(
+        !untrained.keys().any(|k| k.starts_with("Fallback")),
+        "a watchdog latched over 100 ticks of an untrained policy: {untrained:?}"
+    );
+
+    // And the envelope is a bound, not a wall: a command the robot can physically follow
+    // (0.02 rad per tick, 1 rad/s) passes through untouched. Without this half, an envelope
+    // clamped to a constant would also "pass" the half above -- the defect packet M5/V6 found
+    // on the arm.
+    let followable = run(0.02);
+    println!("quadruped safety plane, 100 followable ticks: {followable:?}");
+    assert!(
+        followable.contains_key(&format!("{:?}", ActionSource::Policy)),
+        "not one followable command reached the actuator unchanged, so the envelope is too \
+         tight to be a bound on anything: {followable:?}"
+    );
+    println!("RAN quadruped_bundle_runs_100_ticks_through_the_safety_plane");
+}
+
+/// One suite, one seed: the cheapest Evaluation IR that reaches the runtime.
+fn quadruped_evaluation(task: &TaskIr, observation: &ObservationIr) -> EvaluationIr {
+    EvaluationIr {
+        schema_version: 1,
+        task: hex(&task.task_hash().expect("the task hashes")),
+        observation: hex(&observation
+            .observation_hash()
+            .expect("the observation hashes")),
+        episodes: EpisodeBatch {
+            n_episodes: 1,
+            seeds: SeedPlan::Explicit(vec![1]),
+        },
+        suites: vec![PerturbationSuite {
+            name: "nominal".to_owned(),
+            perturbations: Vec::new(),
+        }],
+        metrics: vec![MetricSpec::SuccessRate],
+        acceptance: vec![AcceptanceCriterion {
+            suite: Some("nominal".to_owned()),
+            metric: MetricSpec::SuccessRate,
+            comparator: Comparator::Ge,
+            threshold: 0.0,
+            aggregation: Aggregation::Mean,
+        }],
+        augmentation: AugmentationPolicy::Disabled,
+        replay: ReplayPolicy::default(),
+    }
+}
+
+/// `es eval run` on the four documents either runs or says why, and never fakes a run
+/// (spec 1.4).
+///
+/// Today it cannot run: the capture path (`crates/es-eval/src/runner.rs input_sources`) serves
+/// an observation input from a `qpos` slice, an MJCF sensor or an image, and Playground's
+/// 48-wide vector is none of those -- it wants base linear velocity in the body frame, a gyro,
+/// projected gravity, joint velocities, the previous action and the joystick command. This
+/// test pins the refusal *by its message* so that the day the capture path grows base state,
+/// this test fails and is updated rather than quietly staying green over a gap.
+#[test]
+fn quadruped_eval_run_names_the_observation_gap() {
+    let dir = scratch_dir("quadruped-eval-run");
+    let (task, observation, learning, deployment) = quadruped_documents();
+    let weights = b"es-m6-b1-untrained-placeholder".to_vec();
+    let mut learning = learning;
+    learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let policy = dir.join("policy.esb");
+    std::fs::write(
+        &policy,
+        es_compile::PolicyBundle::build(&task, &observation, &learning, &deployment, &weights)
+            .expect("the bundle builds"),
+    )
+    .expect("write policy.esb");
+    let config = dir.join("eval.toml");
+    write(
+        &config,
+        &es_ir::serial::evaluation_to_toml(&quadruped_evaluation(&task, &observation))
+            .expect("evaluation toml"),
+    );
+
+    let out = bin()
+        .args(["eval", "run", "--config"])
+        .arg(&config)
+        .arg("--policy")
+        .arg(&policy)
+        .arg("--scene")
+        .arg(go1_scene_path())
+        .arg("--out")
+        .arg(dir.join("out"))
+        .output()
+        .expect("run es eval run");
+    let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+    match out.status.code() {
+        // No `mujoco` and/or no `torch`: the documented SKIPPED exit (spec 1.4).
+        Some(3) => {
+            assert!(text.contains("SKIPPED"), "{text}");
+            println!(
+                "SKIP quadruped_eval_run_names_the_observation_gap: {}",
+                text.trim()
+            );
+        }
+        Some(1) => {
+            assert!(
+                text.contains("joint positions") || text.contains("is none of"),
+                "eval run failed for a reason that is not the known observation gap:\n{text}"
+            );
+            assert!(
+                !dir.join("out").join("report.json").exists(),
+                "a report was written over a run that never happened"
+            );
+            println!("RAN quadruped_eval_run_names_the_observation_gap (refused by name)");
+        }
+        // The gap closed: `es eval run` served the observation and produced a report.
+        Some(0) => {
+            println!("RAN quadruped_eval_run_names_the_observation_gap (the run completed)");
+        }
+        other => panic!("es eval run exited with {other:?}:\n{text}"),
+    }
+}

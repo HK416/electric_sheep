@@ -1,0 +1,32 @@
+{
+  "repo": "https://github.com/google-deepmind/mujoco_playground",
+  "path": "mujoco_playground/_src/locomotion/go1/xmls/go1_mjx_feetonly.xml",
+  "path_scene": "mujoco_playground/_src/locomotion/go1/xmls/scene_mjx_feetonly_flat_terrain.xml",
+  "commit": "124a73fa3303f75a62f8fe04d329b829ed0ebdfb",
+  "release": "mujoco_playground v0.2.0",
+  "blake3_go1_mjx_feetonly_xml": "b839f4f11570080ba00cf2f345835cb18d0154543c7b572279563d792949ba60",
+  "blake3_scene_flat_terrain_xml": "4e9d0fc0f4afa832cddfd84c3c516268a7959766f99a0e57ba128e352a2b26ad",
+  "menagerie_commit": "1b86ece576591213e2b666ebf59508454200ca97",
+  "license": "BSD-3-Clause",
+  "license_file": "go1_primitives.LICENSE",
+  "license_source": "unitree_go1/LICENSE of mujoco_menagerie at `menagerie_commit`, unmodified",
+  "license_note": "The robot model is mujoco_menagerie's unitree_go1 (BSD-3-Clause, HangZhou YuShu TECHNOLOGY CO.,LTD.). mujoco_playground's own edits to it, and the scene file, are Apache-2.0; both licences permit a modified redistribution in source form, and this file is that modification. The Unitree name is used to identify the model, never to endorse anything (BSD-3 clause 3).",
+  "derivative": "go1_primitives.xml",
+  "vendored": [
+    "go1_primitives.xml",
+    "go1_primitives.LICENSE",
+    "go1_primitives.PROVENANCE.json"
+  ],
+  "never_vendored": [
+    "mujoco_menagerie/unitree_go1/assets/**  (trunk.stl, hip.stl, thigh.stl, thigh_mirror.stl, calf.stl)"
+  ],
+  "derivation": [
+    "Carried over byte-for-byte from upstream go1_mjx_feetonly.xml: `<option iterations=\"1\" ls_iterations=\"5\" timestep=\"0.004\" integrator=\"Euler\">` with its `<flag eulerdamp=\"disable\"/>`; the whole `<default>` tree (classes go1, abduction, hip, knee, collision, hip_left1..3, hip_right1..3, thigh1..3, calf1..2, foot) apart from the one attribute listed under Substituted; the body tree trunk + {FR,FL,RR,RL}_{hip,thigh,calf} with every `pos`, `quat` and `<inertial>`; the free joint and the twelve hinges with their class-supplied `axis`, `range`, `armature`, `damping` and `frictionloss`; every collision geom (1 box + 2 cylinders on the trunk, 2 or 3 hip cylinders, 3 thigh capsules and 2 calf capsules per leg, and the four `class=\"foot\"` spheres, which are the only geoms with `conaffinity=1`); the four `<camera>`s; and the twelve `<position>` actuators with their class-supplied `kp=35`, `forcerange` and `inheritrange`.",
+    "Substituted -- the only change to the robot, and the reason this file exists: the 13 `class=\"visual\"` geoms that referenced the 5 Unitree STL meshes (trunk x1, hip x4, thigh x4 via thigh.stl and thigh_mirror.stl, calf x4) are boxes of comparable extent. The `visual` default class changed `type=\"mesh\"` to `type=\"box\"` and each geom gained a `size` (and, for thigh and calf, a `pos`); `contype=0 conaffinity=0 group=2 material=\"dark\"` are upstream's. None of the 13 can change the dynamics: they are non-colliding, and every body carries an explicit `<inertial>`, which MuJoCo prefers over geom-derived inertia. The five `<mesh>` assets, `meshdir` and the `.stl` paths went with them; `<material name=\"dark\">` stayed. A mesh geom is `PhysicsError::Unsupported` in crates/es-physics-backend/src/mjcf_out.rs, so a mesh-bearing model never reaches MuJoCo through this pipeline.",
+    "Inlined from scene_mjx_feetonly_flat_terrain.xml, which upstream `<include>`s this robot into and which our importer cannot follow (`<include>` is `MjcfError::Include`): the flat `floor` plane geom, byte-identical apart from its `material` (a checker texture, and there is no renderer in this packet's oracles), and the `home` keyframe, byte-identical -- `home`'s `qpos[7..]` is `default_pose`, the zero-point of the policy's action (docs/api-notes/mujoco-playground-quadruped.md section 1). The other four keyframes of that file (home_higher, footstand, handstand, pre_recovery) are not used by Go1JoystickFlatTerrain and are not inlined, and neither are `<statistic>`, `<visual>`, the skybox/groundplane textures or the `sensor_feet.xml` include.",
+    "Dropped: the whole `<sensor>` block (gyro, velocimeter, accelerometer, framepos, framezaxis, framexaxis, framelinvel, frameangvel, framequat, and the per-foot framelinvel/framepos), the five `<site>`s only that block referenced (imu, head, FR, FL, RR, RL), and the `spotlight` `<light>`. Sensors and sites carry no dynamics; crates/es-physics-backend/src/mjcf_out.rs emits only `jointpos`/`jointvel` sensors and no site at all, so a scene declaring any of the others is refused at load by `check_requirements` before MuJoCo ever sees it. (A second reason for the sites: crates/es-assets wants a 3-vector site `size` and upstream writes MJCF's scalar shorthand, `size=\"0.02\"`.) The Observation IR in tests/fixtures/quadruped/ therefore reads joint state, not MJCF sensors; restoring the block is a change to the backend's sensor mapping, not to this file.",
+    "Not represented by SceneDesc, and therefore reported as importer warnings rather than removed (crates/es-assets/src/mjcf/attrs.rs `report_unknown`, 69 of them): geom `group` and `priority`, material `rgba`, camera `mode`, `<keyframe>`, and `<position inheritrange>`. Two of those cost physics on the round trip through `mjcf_out`: dropping the floor's `priority=\"1\"` means MuJoCo mixes friction pairwise (max(1.0, 0.6) = 1.0) instead of letting the floor's 0.6 win, and dropping `inheritrange=\"1\"` leaves the actuators without the `ctrlrange` MuJoCo would have derived from the joint ranges. Neither moves a zero-action standing trajectory; both are open items in docs/design/quadruped-track.md section 3.",
+    "The file is flat: no `<include>`, no `<equality>`, no `<contact>`, no `<tendon>`, no `<sensor>`, no mesh and no heightfield."
+  ],
+  "oracle": "crates/es-assets/tests/go1_provenance.rs fetches both upstream files at `commit` (from $ES_PLAYGROUND_CACHE/<commit>/<file>, else `curl -fsSL` into target/), verifies their blake3 before parsing, and asserts the equalities above. crates/es-physics-backend/tests/go1_step.rs (#[ignore], needs ES_PYTHON with mujoco) asserts that our MuJoCo CPU backend and `mujoco` Python step this file the same way."
+}

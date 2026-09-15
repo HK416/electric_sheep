@@ -110,7 +110,8 @@ pub fn scene_to_mjcf(scene: &SceneDesc) -> Result<String, PhysicsError> {
     let _ = writeln!(
         out,
         "  <option timestep=\"{}\" gravity=\"{}\" integrator=\"{}\" cone=\"{}\" \
-         jacobian=\"{}\" solver=\"{}\" iterations=\"{}\" impratio=\"{}\"/>",
+         jacobian=\"{}\" solver=\"{}\" iterations=\"{}\" ls_iterations=\"{}\" \
+         impratio=\"{}\">{}</option>",
         num(options.timestep),
         vec3(options.gravity),
         match options.integrator {
@@ -134,7 +135,13 @@ pub fn scene_to_mjcf(scene: &SceneDesc) -> Result<String, PhysicsError> {
             Solver::Pgs => "PGS",
         },
         options.iterations,
-        num(options.impratio)
+        options.ls_iterations,
+        num(options.impratio),
+        if options.eulerdamp {
+            ""
+        } else {
+            "<flag eulerdamp=\"disable\"/>"
+        }
     );
     out.push_str("  <worldbody>\n");
     for root in roots {
