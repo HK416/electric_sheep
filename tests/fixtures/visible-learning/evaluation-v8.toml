@@ -17,10 +17,10 @@ metrics = [
     "envelope_violation_rate",
     "failure_mode_histogram",
 ]
-observation = "2dd0d4686038881be7976f4240dabc61a39662d2e45bd217214c151b29b4bd80"
+observation = "898898c7294b142de658616441326419081e0caa0d204609d5f55c143f23c484"
 replay = "failures_first"
 schema_version = 1
-task = "d7a7c061af7316efb81449f21b4729b11db4e9d78ea294929797f814ee82ee9a"
+task = "78814eb49b3f77adca829ab5b72ffd6bb2115f26ce162677266523ffd30d5594"
 
 [[body.acceptance]]
 aggregation = "mean"

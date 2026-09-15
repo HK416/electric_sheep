@@ -3003,7 +3003,7 @@ const TASK_HEADER: &str = "\
 # hash downstream of them are derived, never typed in.
 #
 # Parameters, fixed here so V2 and V3 cite them: NJ = 6, control rate 50 Hz,
-# max_episode_steps = 900 (18 s, against a scripted demonstration that takes about 7),
+# max_episode_steps = 1800 (36 s, against a scripted demonstration that takes about 7),
 # image 96x96 Rgb8 from the one fixed `overhead` camera.
 #
 # `sim_cube_pose` IS SIMULATOR-PRIVILEGED. A real SO-101 has no sensor that reports where the
@@ -3324,8 +3324,11 @@ fn regenerate_visible_learning_documents() {
     let (bin_lo, bin_hi) = (0.09, 0.19);
     let (cube_y_lo, cube_y_hi) = (-0.03, 0.05);
     // The episode budget: what the scripted demonstration needs at the 50 Hz control rate,
-    // with room for the settling the success predicate waits on (packet M5/V1).
-    let (max_steps, timeout_s) = (900u32, 18.0);
+    // with room for the settling the success predicate waits on (packet M5/V1), doubled by
+    // packet M5/V14 because V13's three carrying episodes were still holding the cube over
+    // the bin when 900 steps ran out, so the budget was hiding whether the policy ever
+    // releases (design note section 7.22).
+    let (max_steps, timeout_s) = (1800u32, 36.0);
 
     let xml_path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/mjcf/so101_pick_place.xml");

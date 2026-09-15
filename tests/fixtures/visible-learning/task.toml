@@ -5,7 +5,7 @@
 # hash downstream of them are derived, never typed in.
 #
 # Parameters, fixed here so V2 and V3 cite them: NJ = 6, control rate 50 Hz,
-# max_episode_steps = 900 (18 s, against a scripted demonstration that takes about 7),
+# max_episode_steps = 1800 (36 s, against a scripted demonstration that takes about 7),
 # image 96x96 Rgb8 from the one fixed `overhead` camera.
 #
 # `sim_cube_pose` IS SIMULATOR-PRIVILEGED. A real SO-101 has no sensor that reports where the
@@ -48,7 +48,7 @@ schema_version = 2
 [body.config]
 control_rate_hz = 50.0
 deterministic = true
-max_episode_steps = 900
+max_episode_steps = 1800
 rng_streams = [
     "cube.x",
     "cube.y",
@@ -507,7 +507,7 @@ quantity = "Position"
 
 [body.graph.nodes.20.Compare]
 op = "Ge"
-rhs = 18.0
+rhs = 36.0
 
 [body.graph.nodes.20.Compare.ty]
 elem = "F32"
