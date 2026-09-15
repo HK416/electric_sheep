@@ -4972,3 +4972,409 @@ fn dataset_bake_names_both_refusals_when_the_scene_cannot_be_loaded() {
     );
     println!("RAN dataset_bake_names_both_refusals");
 }
+
+// --- packet M5/V10: the scene diagnosis -------------------------------------------------------
+
+/// The bin's three-dimensional interior, which the Task IR's own predicate cannot check
+/// because a cone leaf is one scalar (design note section 5.4). Same numbers as
+/// `expert_solves_the_pinned_seeds`.
+fn cube_in_the_bin(x: f64, y: f64, z: f64) -> bool {
+    (0.09..0.19).contains(&x) && (-0.15..-0.05).contains(&y) && z < 0.09
+}
+
+/// The seed the dataset under diagnosis was collected with; V1c's `ds-train` is `--seed 1`.
+fn v10_seed() -> u64 {
+    std::env::var("ES_V10_SEED")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1)
+}
+
+/// Packet M5/V10 measurement 1 -- **do the recorded actions reproduce success?**
+///
+/// Every demonstration's recorded action sequence is replayed open-loop from the same reset,
+/// through the same physics and the same Safety Plane, and scored by the demonstration's own
+/// predicate. `action` is the executed `SafeAction` and `action_commanded` the raw pre-plane
+/// command (design note section 7.10), so replaying both separates "the data is sound" from
+/// "the executed-vs-commanded distinction loses the task".
+///
+/// A plain replay loop over `es_env::Env`, not a second `PolicyRuntime`: `INV-17` allows seven
+/// extension points and a recorded-action player is none of them. The plane still sees every
+/// row -- one row per control tick under a fresh `seq`, which is the cursor discipline
+/// `plane_chunk` produces for a one-row chunk -- so nothing is bypassed (`INV-12`).
+///
+/// **The server oracle.** It needs `MuJoCoCpuBackend` *and* a collected dataset, which is an
+/// input rather than a fixture: point `ES_V10_DATASET` at one (V1c's is
+/// `~/artifacts/plan-v/v1c/ds-train`). Without either it prints a reason and skips.
+#[test]
+fn recorded_actions_replay_to_the_same_outcome() {
+    use es_physics_core::PhysicsBackend as _;
+    use std::fmt::Write as _;
+
+    const NJ: usize = 6;
+    const H: usize = 16;
+
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP recorded_actions_replay_to_the_same_outcome: {reason}");
+        return;
+    }
+    let Ok(root) = std::env::var("ES_V10_DATASET") else {
+        println!(
+            "SKIP recorded_actions_replay_to_the_same_outcome: set ES_V10_DATASET to a \
+             demonstration dataset collected from this scene"
+        );
+        return;
+    };
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let task = es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml");
+    let deploy =
+        es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml");
+    let scene = es_assets::parse_mjcf(
+        &std::fs::read_to_string(demo_scene_path()).expect("the demo scene is in the repo"),
+    )
+    .expect("the demo scene parses")
+    .scene;
+
+    let dataset = es_data::LeRobotDataset::open(&root).expect("the demonstration dataset opens");
+    let n = dataset.episodes().len() as u32;
+    let demos: Vec<es_data::Episode> = (0..n)
+        .map(|i| dataset.read_episode(i).expect("episode reads back"))
+        .collect();
+    let f32col = |ep: &es_data::Episode, name: &str| -> Vec<f32> {
+        match ep.columns.get(name) {
+            Some(es_data::Column::F32(v)) => v.clone(),
+            other => panic!("{name}: {other:?}"),
+        }
+    };
+
+    // What the demonstrations themselves recorded: the last `observation.state` row of each
+    // episode is the `qpos ‖ qvel` the episode ended in, and the cube's free joint starts at
+    // qpos[6]. This is the ground truth the replay has to reproduce.
+    let mut recorded_in_bin = 0usize;
+    for ep in &demos {
+        let state = f32col(ep, "observation.state");
+        let width = state.len() / ep.len();
+        let last = &state[(ep.len() - 1) * width..];
+        if cube_in_the_bin(f64::from(last[6]), f64::from(last[7]), f64::from(last[8])) {
+            recorded_in_bin += 1;
+        }
+    }
+
+    let seed = v10_seed();
+    let dump_dir = std::env::var_os("ES_V10_DUMP").map(PathBuf::from);
+    if let Some(dir) = dump_dir.as_ref() {
+        std::fs::create_dir_all(dir).expect("create the dump directory");
+    }
+    let mut results = Vec::new();
+    for column in ["action", "action_commanded"] {
+        let mut env = es_env::Env::new(
+            &task,
+            &scene,
+            es_physics_backend::MuJoCoCpuBackend::new(),
+            &es_env::scheduler::BatchDomains::single_env(),
+            seed,
+        )
+        .expect("the demo scene loads");
+        let (nq, nu) = (env.model().nq as usize, env.model().nu as usize);
+        assert_eq!(nu, NJ, "the demo scene has {nu} actuators");
+        let mut plane =
+            es_safety::SafetyPlane::<NJ, H>::from_ir(&deploy).expect("the envelope builds");
+        let (mut ok, mut in_bin, mut corrected) = (0usize, 0usize, 0u64);
+        for (index, demo) in demos.iter().enumerate() {
+            let rows = f32col(demo, column);
+            let mut closed = None;
+            // Measurement 2's input: only this side knows the Task IR's randomization draw, so
+            // the mujoco probe is handed the reset state and the executed rows rather than
+            // guessing either. One file per episode, `ES_V10_DUMP` or nothing.
+            let mut dump = (column == "action" && dump_dir.is_some()).then(|| {
+                let state = env.backend().state();
+                let mut text = String::new();
+                for v in state.qpos_of(0).iter().chain(state.qvel_of(0)) {
+                    let _ = write!(text, "{v:.17e} ");
+                }
+                text.push('\n');
+                text
+            });
+            for t in 0..demo.len() {
+                let mut want = [0.0f64; NJ];
+                for (j, v) in want.iter_mut().enumerate() {
+                    *v = f64::from(rows[t * nu + j]);
+                }
+                {
+                    let state = env.backend().state();
+                    let (mut q, mut qd) = ([0.0; NJ], [0.0; NJ]);
+                    q.copy_from_slice(&state.qpos_of(0)[..NJ]);
+                    qd.copy_from_slice(&state.qvel_of(0)[..NJ]);
+                    plane.observe_state(&q, &qd);
+                }
+                let mut actions = [[0.0; NJ]; H];
+                actions[0] = want;
+                let chunk = es_safety::ActionChunk::new(actions, 1, ExecutionMode::RecedingHorizon)
+                    .with_seq(t as u64 + 1);
+                let safe = plane.validate(&chunk, Micros(0), env.tick());
+                if (0..NJ).any(|j| (safe.q[j] - want[j]).abs() > 1e-9) {
+                    corrected += 1;
+                }
+                let outcome = env.step(&safe.q).expect("the replay steps");
+                if let Some(text) = dump.as_mut() {
+                    let state = env.backend().state();
+                    let cube = &state.qpos_of(0)[6..9];
+                    for v in safe.q.iter().chain(cube) {
+                        let _ = write!(text, "{v:.17e} ");
+                    }
+                    text.push('\n');
+                }
+                if let Some(ep) = outcome.episodes.into_iter().next() {
+                    closed = Some(ep);
+                    break;
+                }
+            }
+            if let (Some(dir), Some(text)) = (dump_dir.as_ref(), dump) {
+                write(&dir.join(format!("ep-{index:03}.txt")), &text);
+            }
+            let episode = match closed {
+                Some(ep) => ep,
+                None => env
+                    .reset(None)
+                    .expect("the budget-exhausted episode closes")
+                    .into_iter()
+                    .next()
+                    .expect("one env"),
+            };
+            plane.begin_episode();
+            if episode.termination == es_env::Termination::Success {
+                ok += 1;
+            }
+            let at = (episode.steps() - 1) * nq;
+            let (x, y, z) = (
+                episode.qpos[at + 6],
+                episode.qpos[at + 7],
+                episode.qpos[at + 8],
+            );
+            let inside = cube_in_the_bin(x, y, z);
+            if inside {
+                in_bin += 1;
+            }
+            println!(
+                "{column} ep {index:>2}: {:>4}/{:<4} steps  {:?}  cube ({x:.3}, {y:.3}, {z:.3}) \
+                 inside={inside}",
+                episode.steps(),
+                demo.len(),
+                episode.termination
+            );
+        }
+        println!(
+            "{column}: success {ok}/{n}, cube in the bin {in_bin}/{n}, plane corrected \
+             {corrected} ticks"
+        );
+        results.push((ok, in_bin));
+    }
+
+    let (executed_ok, executed_in_bin) = results[0];
+    let (commanded_ok, commanded_in_bin) = results[1];
+    println!(
+        "RAN recorded_actions_replay_to_the_same_outcome: {n} demonstrations recorded \
+         {recorded_in_bin} cubes in the bin; replaying `action` reproduces {executed_in_bin} \
+         ({executed_ok} Success), replaying `action_commanded` reproduces {commanded_in_bin} \
+         ({commanded_ok} Success)"
+    );
+    assert_eq!(
+        executed_in_bin, recorded_in_bin,
+        "replaying the executed action open-loop does not reproduce the demonstration it was \
+         recorded from: the physics, the seeding or the executed-vs-commanded distinction moved \
+         between collection and replay (packet M5/V10 measurement 1)"
+    );
+}
+
+/// Packet M5/V10 measurement 3 -- **does the temporal ensemble survive the grasp window?**
+///
+/// One demonstration is driven through `es_env::plane_chunk` exactly as `es loop collect` and
+/// `es eval run` do (design note section 7.13): the expert's chunk is pushed every control tick
+/// and the Deployment IR's `TemporalEnsemble { decay }` blends the overlapping ones. A second
+/// buffer, fed the identical chunks under `HardSwitch`, is the *raw* command -- the newest
+/// chunk's own row for the tick -- so the difference between the two is the ensemble and
+/// nothing else.
+///
+/// The gripper is the joint this can break: the expert commands `grip_closed` the moment it
+/// enters `Stage::Close`, while up to `es_env::CHUNK_SLOTS` older chunks still ramp toward
+/// `grip_open`. If the blend cannot reach the closure the jaws need, every demonstration is a
+/// push rather than a grasp.
+///
+/// **The server oracle**, like the two expert ones: the SO-101 scene has no driver but
+/// `MuJoCoCpuBackend`.
+#[test]
+fn the_temporal_ensemble_survives_the_grasp_window() {
+    use es_physics_core::PhysicsBackend as _;
+
+    const NJ: usize = 6;
+    const H: usize = 16;
+
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP the_temporal_ensemble_survives_the_grasp_window: {reason}");
+        return;
+    }
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let task = es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml");
+    let learning =
+        es_ir::serial::learning_from_toml(&read("learning.toml")).expect("learning.toml");
+    let deploy =
+        es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml");
+    let scene = es_assets::parse_mjcf(
+        &std::fs::read_to_string(demo_scene_path()).expect("the demo scene is in the repo"),
+    )
+    .expect("the demo scene parses")
+    .scene;
+    let cube = scene
+        .joints
+        .iter()
+        .find(|j| j.kind == es_assets::scene::JointKind::Free)
+        .expect("the scene has one free-joint body to pick up")
+        .id;
+
+    let blend = match deploy.execution {
+        ExecutionMode::TemporalEnsemble { decay } => {
+            es_ir::learning::ChunkBlendPolicy::TemporalEnsemble {
+                weight_decay: decay as f32,
+            }
+        }
+        other => panic!("the demo's deployment declares {other:?}, not a temporal ensemble"),
+    };
+    let latency = es_env::latency_ticks(
+        learning.policy.contract.runtime.expected_latency_ms,
+        deploy.rate.control,
+    );
+
+    let mut cfg = es_env::expert::demo_cfg(cube);
+    // `es loop collect`'s own pacing (`crates/es/src/cmd/loop.rs`): the expert integrates its
+    // command over `execute_chunk` rows per replan.
+    cfg.pace_to(&deploy, deploy.action.execute_chunk as u32);
+    let (grip_open, grip_closed) = (cfg.grip_open, cfg.grip_closed);
+    let mut expert = es_env::ScriptedExpert::new(&scene, cfg).expect("the expert builds");
+    let mut env = es_env::Env::new(
+        &task,
+        &scene,
+        es_physics_backend::MuJoCoCpuBackend::new(),
+        &es_env::scheduler::BatchDomains::single_env(),
+        v10_seed(),
+    )
+    .expect("the demo scene loads");
+    let model = env.model().clone();
+    let nq = model.nq as usize;
+    let mut plane = es_safety::SafetyPlane::<NJ, H>::from_ir(&deploy).expect("the envelope");
+    let mut ensemble = es_env::ChunkBuffer::<NJ, H>::new(deploy.action.execute_chunk, blend);
+    let mut newest = es_env::ChunkBuffer::<NJ, H>::new(
+        deploy.action.execute_chunk,
+        es_ir::learning::ChunkBlendPolicy::HardSwitch,
+    );
+    let (mut feed, mut raw_feed) = (es_env::PlaneFeed::default(), es_env::PlaneFeed::default());
+
+    // Per tick: the stage, the raw newest-chunk row, the blended row, and the measured gripper
+    // joint.
+    let mut log: Vec<(es_env::Stage, [f64; NJ], [f64; NJ], f64)> = Vec::new();
+    let mut termination = es_env::Termination::Timeout;
+    for t in 0..u64::from(task.config.max_episode_steps) {
+        let (row, q, qd) = {
+            let state = env.backend().state();
+            let mut row = state.qpos_of(0).to_vec();
+            row.extend_from_slice(state.qvel_of(0));
+            let (mut q, mut qd) = ([0.0; NJ], [0.0; NJ]);
+            q.copy_from_slice(&row[..NJ]);
+            qd.copy_from_slice(&row[nq..nq + NJ]);
+            (row, q, qd)
+        };
+        let view = es_env::expert::state_of_row(&model, &row);
+        let stage = expert.stage();
+        let rows = expert
+            .chunk(&model, &view, 0)
+            .unwrap_or_else(|| panic!("the expert ran out of reach at tick {t}"));
+        // `es-data`'s intervener hook carries the chunk as an `f32` tensor, so the rows the
+        // buffer sees are `f32`-rounded on the collection path too.
+        let mut actions = [[0.0; NJ]; H];
+        let last = rows.last().cloned().unwrap_or_default();
+        for (k, out) in actions.iter_mut().enumerate() {
+            let r = rows.get(k).unwrap_or(&last);
+            for (j, v) in out.iter_mut().enumerate() {
+                *v = f64::from(r.get(j).copied().unwrap_or(0.0) as f32);
+            }
+        }
+        let chunk = es_safety::ActionChunk::new(actions, H, deploy.execution);
+        ensemble.push(&chunk, t + latency);
+        newest.push(&chunk, t + latency);
+        let (fed, blended) = es_env::plane_chunk(&mut ensemble, &mut feed, t, deploy.execution);
+        let (_, raw) = es_env::plane_chunk(
+            &mut newest,
+            &mut raw_feed,
+            t,
+            ExecutionMode::RecedingHorizon,
+        );
+        plane.observe_state(&q, &qd);
+        let safe = plane.validate(&fed, Micros(0), env.tick());
+        if let (Some(b), Some(r)) = (blended, raw) {
+            log.push((stage, r, b, q[NJ - 1]));
+        }
+        let outcome = env.step(&safe.q).expect("the demonstration steps");
+        if let Some(ep) = outcome.episodes.into_iter().next() {
+            termination = ep.termination;
+            break;
+        }
+    }
+
+    // The grasp window: the first tick in `Close` to the last tick that is not yet `Done`.
+    let first = log
+        .iter()
+        .position(|(s, ..)| *s == es_env::Stage::Close)
+        .expect("the expert reaches Stage::Close");
+    let end = log
+        .iter()
+        .rposition(|(s, ..)| *s != es_env::Stage::Done)
+        .unwrap_or(log.len() - 1);
+    let window = &log[first..=end];
+    println!(
+        "grasp window: ticks {first}..={end} of {}, termination {termination:?}",
+        log.len()
+    );
+    println!("joint   max|blend-raw|      raw min     blend min       raw max     blend max");
+    let mut worst = [0.0f64; NJ];
+    for (j, w) in worst.iter_mut().enumerate() {
+        let dev = window
+            .iter()
+            .map(|(_, r, b, _)| (b[j] - r[j]).abs())
+            .fold(0.0f64, f64::max);
+        *w = dev;
+        let rmin = window
+            .iter()
+            .map(|(_, r, ..)| r[j])
+            .fold(f64::MAX, f64::min);
+        let bmin = window
+            .iter()
+            .map(|(_, _, b, _)| b[j])
+            .fold(f64::MAX, f64::min);
+        let rmax = window
+            .iter()
+            .map(|(_, r, ..)| r[j])
+            .fold(f64::MIN, f64::max);
+        let bmax = window
+            .iter()
+            .map(|(_, _, b, _)| b[j])
+            .fold(f64::MIN, f64::max);
+        println!("{j:>5} {dev:>15.5} {rmin:>13.5} {bmin:>13.5} {rmax:>13.5} {bmax:>13.5}");
+    }
+    let measured = window.iter().map(|(.., m)| *m).fold(f64::MAX, f64::min);
+    println!(
+        "gripper: open {grip_open}, closed {grip_closed}; the blend's closure lags the raw \
+         command by {:.5} rad at worst, and the jaw joint measured {measured:.5} rad at its \
+         tightest",
+        worst[NJ - 1]
+    );
+    println!(
+        "RAN the_temporal_ensemble_survives_the_grasp_window: {termination:?}, worst per-joint \
+         blend deviation {:.5} rad (gripper {:.5})",
+        worst.iter().fold(0.0f64, |a, b| a.max(*b)),
+        worst[NJ - 1]
+    );
+    assert_eq!(
+        termination,
+        es_env::Termination::Success,
+        "the expert driven through the temporal ensemble did not solve the task"
+    );
+}
