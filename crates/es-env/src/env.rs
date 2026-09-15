@@ -3,7 +3,9 @@
 //! One `Env::step` advances the batch by one **control** step — `inference.period` simulation
 //! ticks (§12.1) — and runs §6.4's phase order: physics, then reward, then termination, then
 //! record. Envs that terminated are reset at the end of the same call, so an episode boundary
-//! is always a tick boundary.
+//! is always a tick boundary. The recorded row's *state* is the one the step was entered with
+//! — the state its `ctrl` was computed from — while its reward, termination and failure are
+//! the transition's (packet M5/V12).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -81,6 +83,9 @@ pub struct Env<B: PhysicsBackend> {
     reset_qpos: Vec<f64>,
     reset_qvel: Vec<f64>,
     last_ctrl: Vec<f64>,
+    /// Scratch, allocated once: the state one control step is entered with, which is the state
+    /// the recorded row carries (§13.2, packet M5/V12).
+    pre: PreStep,
     ports: BTreeMap<String, f64>,
     metrics: EnvMetrics,
 }
@@ -146,6 +151,7 @@ impl<B: PhysicsBackend> Env<B> {
             reset_qpos: vec![0.0; envs * shape.nq],
             reset_qvel: vec![0.0; envs * shape.nv],
             last_ctrl: vec![0.0; envs * shape.nu],
+            pre: PreStep::default(),
             ports: BTreeMap::new(),
             metrics: EnvMetrics::default(),
             model,
@@ -256,6 +262,13 @@ impl<B: PhysicsBackend> Env<B> {
         }
         self.last_ctrl.copy_from_slice(ctrl);
         self.backend.set_ctrl(ctrl)?;
+        // The row this step records is the state the step is *entered* with, because that is
+        // the state `ctrl` was computed from -- by `step_with_policy`'s observe-infer-act
+        // order here, by `es_eval::runner` at evaluation, and by LeRobot's own convention
+        // (`observation[t]` is what `action[t]` was chosen from). Recording the post-step
+        // state instead taught every policy `(s_t+1) -> a_t` while inference asks `(s_t)`,
+        // one control period of lag in every input (packet M5/V12, design note section 7.20).
+        self.pre.snapshot(&self.backend.state(), self.tick);
 
         let substeps = self.schedule.domains().inference.period;
         let started = Instant::now();
@@ -299,13 +312,14 @@ impl<B: PhysicsBackend> Env<B> {
             outcome.failures[i] = failure;
             outcome.dones[i] = termination.is_done();
 
-            let state = self.backend.state();
+            // State: what the step was entered with. Reward, termination and failure: what the
+            // transition produced, so `done` still marks the last frame of the episode.
             let row = StepRow {
-                tick: self.tick,
-                qpos: row_of(state.qpos, env, self.model.nq),
-                qvel: row_of(state.qvel, env, self.model.nv),
+                tick: self.pre.tick,
+                qpos: row_of(&self.pre.qpos, env, self.model.nq),
+                qvel: row_of(&self.pre.qvel, env, self.model.nv),
                 ctrl: row_of(&self.last_ctrl, env, self.model.nu),
-                sensordata: row_of(state.sensordata, env, self.model.nsensordata),
+                sensordata: row_of(&self.pre.sensordata, env, self.model.nsensordata),
                 reward,
                 termination,
                 failure,
@@ -463,6 +477,29 @@ impl<B: PhysicsBackend> Env<B> {
             physics_steps_per_sec: rate(self.metrics.physics_env_steps),
             actions_per_sec: rate(self.metrics.action_env_steps),
             ..self.metrics
+        }
+    }
+}
+
+/// The state a control step was entered with, copied out of the backend before it advances.
+#[derive(Clone, Debug, Default)]
+struct PreStep {
+    tick: PhysTick,
+    qpos: Vec<f64>,
+    qvel: Vec<f64>,
+    sensordata: Vec<f64>,
+}
+
+impl PreStep {
+    fn snapshot(&mut self, state: &StateView<'_>, tick: PhysTick) {
+        self.tick = tick;
+        for (dst, src) in [
+            (&mut self.qpos, state.qpos),
+            (&mut self.qvel, state.qvel),
+            (&mut self.sensordata, state.sensordata),
+        ] {
+            dst.clear();
+            dst.extend_from_slice(src);
         }
     }
 }
@@ -951,7 +988,28 @@ pub(crate) mod tests {
         assert_eq!(ep.sensordata.len(), 2);
         assert_eq!(ep.param_scales.len(), 1, "the mass scale was recorded");
         assert!(ep.param_scales.values().all(|v| (0.9..=1.1).contains(v)));
-        assert_eq!(ep.ticks, [PhysTick(20), PhysTick(40)]);
+        // The row is the state the step was entered with, so its tick is the step's first
+        // tick, not its last (packet M5/V12).
+        assert_eq!(ep.ticks, [PhysTick(0), PhysTick(20)]);
+    }
+
+    /// Packet M5/V12 oracle 1: `observation.state[t]` is the state `action[t]` was computed
+    /// from, which is the state the control step is entered with -- not the one it produced.
+    #[test]
+    fn the_recorded_row_is_the_state_the_action_was_computed_from() {
+        let task = pendulum_task(0, Some(Distribution::Constant(0.1)));
+        let mut env = env_of(&task, 1, 1);
+        let before = env.backend().state().qpos.to_vec();
+        env.step(&[0.3]).unwrap();
+        let after = env.backend().state().qpos.to_vec();
+        assert_ne!(
+            before, after,
+            "the fixture must move for this to mean anything"
+        );
+        let ep = env.recorder.open(0);
+        assert_eq!(ep.qpos, before, "the row is the pre-step state");
+        assert_ne!(ep.qpos, after, "the row is not the post-step state");
+        assert_eq!(ep.ctrl, vec![0.3], "with the ctrl that was applied to it");
     }
 
     #[test]
