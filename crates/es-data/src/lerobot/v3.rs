@@ -40,6 +40,9 @@ const DATA_PATH: &str = "data/chunk-{chunk_index:03d}/file-{file_index:03d}.parq
 const DATA_FILE: &str = "data/chunk-000/file-000.parquet";
 const EPISODES_FILE: &str = "meta/episodes/chunk-000/file-000.parquet";
 const TASKS_FILE: &str = "meta/tasks.parquet";
+const STATS_FILE: &str = "meta/stats.json";
+/// `lerobot.utils.constants.OBS_STATE`, the one column name the format fixes.
+const STATE: &str = "observation.state";
 
 /// The five names that are bookkeeping rather than learning features. Unlike v2.1, v3.0
 /// **requires** them in `info.json`'s `features` (api-note, "features -> the parquet schema").
@@ -50,6 +53,28 @@ const BOOKKEEPING: [&str; 5] = [
     "task_index",
     "timestamp",
 ];
+
+/// What a training run needs the export to leave out or cut down (packet `M5/V8`).
+///
+/// Both knobs exist because `lerobot` decides what a *policy* feature is from the feature
+/// name alone (`lerobot.utils.feature_utils.dataset_to_policy_features`): every column whose
+/// name starts with `action` becomes an ACTION feature and every `observation.*` a STATE or
+/// VISUAL one, so `action_commanded` and `action_source` would arrive at the policy as two
+/// more action heads, and `observation.state` arrives at its recorded width. Neither is a
+/// training decision the exporter may take on its own, so both are declared by the caller.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExportOptions {
+    /// Source columns to leave out of the export entirely.
+    pub drop: Vec<String>,
+    /// Keep only the leading `n` values of `observation.state`.
+    ///
+    /// `es loop collect` records env 0's whole `qpos` followed by its whole `qvel`
+    /// (`docs/api-notes/lerobot-dataset.md`), and a policy trained on all of it cannot be
+    /// served at inference: `es_eval`'s state capture reads `qpos` and there is no `qvel`
+    /// arm. The leading `n` are `qpos[..n]`, which is exactly what `Capture::Joints(n)` hands
+    /// the Observation IR.
+    pub state_dim: Option<usize>,
+}
 
 /// What the converter produced, for the CLI to print.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -95,8 +120,12 @@ macro_rules! next_col {
 enum Col {
     /// One of [`BOOKKEEPING`] — derived from position, never read from `Episode::columns`.
     Reserved(String),
-    /// A learning feature, `elems` values per frame.
-    Feature { name: String, elems: usize },
+    /// A learning feature, `elems` values per frame out of `source_elems` recorded ones.
+    Feature {
+        name: String,
+        elems: usize,
+        source_elems: usize,
+    },
     /// One PNG per frame, encoded from `dir/<NNNNNN>.bin`.
     Image {
         name: String,
@@ -117,6 +146,7 @@ pub fn export_v3(
     src: &LeRobotDataset,
     out: &Path,
     frames: Option<&Path>,
+    opts: &ExportOptions,
 ) -> Result<ExportReport, DataError> {
     let info = src.info();
     let metas = src.episodes().to_vec();
@@ -156,7 +186,30 @@ pub fn export_v3(
     let mut cameras: Vec<Col> = Vec::new();
 
     for (name, spec) in info.columnar() {
+        if opts.drop.iter().any(|d| d == name) {
+            continue;
+        }
         features.insert(name.clone(), spec.clone());
+    }
+    // The recorded width stays available after the declared one is cut down, because the
+    // parquet writer has to know how many values to skip per frame.
+    let source_elems: BTreeMap<String, usize> = features
+        .iter()
+        .map(|(n, s)| (n.clone(), s.elem_count() as usize))
+        .collect();
+    if let Some(dim) = opts.state_dim {
+        let spec = features.get_mut(STATE).ok_or_else(|| {
+            bad(format!(
+                "--state-dim: the source has no {STATE:?} column to cut down"
+            ))
+        })?;
+        let recorded = spec.elem_count() as usize;
+        if dim == 0 || dim > recorded {
+            return Err(bad(format!(
+                "--state-dim {dim}: {STATE:?} carries {recorded} value(s) per frame"
+            )));
+        }
+        spec.shape = vec![dim as u64];
     }
     for camera in info.cameras() {
         let Some(([height, width], dir)) = camera_source(info, camera, frames) else {
@@ -203,13 +256,15 @@ pub fn export_v3(
             Col::Feature {
                 name: name.clone(),
                 elems: spec.elem_count() as usize,
+                source_elems: source_elems.get(name).copied().unwrap_or(1),
             }
         };
         fields.push(field_of(name, spec, &col)?);
         plan.push(col);
     }
 
-    write_data(&out.join(DATA_FILE), fields, &plan, &episodes, &metas)?;
+    let stats = write_data(&out.join(DATA_FILE), fields, &plan, &episodes, &metas)?;
+    write_json(&out.join(STATS_FILE), &serde_json::Value::Object(stats))?;
     write_episodes(&out.join(EPISODES_FILE), &metas)?;
     write_tasks(&out.join(TASKS_FILE), src)?;
 
@@ -356,6 +411,37 @@ fn concat(episodes: &[Episode], name: &str) -> Result<Column, DataError> {
     out.ok_or_else(|| bad("no episodes"))
 }
 
+fn take<T: Clone>(v: &[T], from: usize, to: usize) -> Vec<T> {
+    v.chunks(from)
+        .flat_map(|c| c[..to.min(c.len())].to_vec())
+        .collect()
+}
+
+/// Keep the leading `to` of every `from`-wide frame. A no-op unless `--state-dim` cut a
+/// column down.
+fn narrow(col: Column, from: usize, to: usize) -> Column {
+    if from == to || from == 0 {
+        return col;
+    }
+    match &col {
+        Column::F32(v) => Column::F32(take(v, from, to)),
+        Column::F64(v) => Column::F64(take(v, from, to)),
+        Column::I64(v) => Column::I64(take(v, from, to)),
+        Column::Bool(v) => Column::Bool(take(v, from, to)),
+    }
+}
+
+/// Every value of a column as `f64`, for the statistics only — the parquet writer still writes
+/// the column's own physical type.
+fn as_f64(col: &Column) -> Vec<f64> {
+    match col {
+        Column::F32(v) => v.iter().map(|x| f64::from(*x)).collect(),
+        Column::F64(v) => v.clone(),
+        Column::I64(v) => v.iter().map(|x| *x as f64).collect(),
+        Column::Bool(v) => v.iter().map(|x| f64::from(u8::from(*x))).collect(),
+    }
+}
+
 /// `frame_index`, `episode_index`, `index` and `task_index`, derived from position.
 fn reserved_i64(name: &str, episodes: &[Episode]) -> Vec<i64> {
     let mut out = Vec::new();
@@ -373,14 +459,70 @@ fn reserved_i64(name: &str, episodes: &[Episode]) -> Vec<i64> {
     out
 }
 
+/// Per-feature `min`/`max`/`mean`/`std`/`count` over `rows` frames of `width` values each, in
+/// the shape `lerobot` 0.6.1's `io_utils.load_stats` casts and its normalizers index.
+///
+/// `std` is the **population** standard deviation, which is what
+/// `compute_stats.RunningQuantileStats.get_statistics` returns
+/// (`sqrt(E[x²] − E[x]²)`) and what `aggregate_stats` pools; it is computed in two passes here
+/// because that is strictly the more accurate way to get the same number.
+///
+/// The `qNN` quantile keys are **not** written. They are histogram estimates over 5000 bins in
+/// `LeRobot`'s own code, only `NormalizationMode.QUANTILES`/`QUANTILE10` read them, and ACT is
+/// `MEAN_STD` on every feature — inventing a second approximation of an approximation is worse
+/// than leaving the key out, exactly as section 7.7 argued for the file as a whole.
+fn feature_stats(values: &[f64], width: usize, nest: bool) -> serde_json::Value {
+    let width = width.max(1);
+    let rows = values.len() / width;
+    let mut min = vec![f64::INFINITY; width];
+    let mut max = vec![f64::NEG_INFINITY; width];
+    let mut sum = vec![0.0f64; width];
+    for row in values.chunks_exact(width) {
+        for (i, v) in row.iter().enumerate() {
+            min[i] = min[i].min(*v);
+            max[i] = max[i].max(*v);
+            sum[i] += *v;
+        }
+    }
+    let n = rows.max(1) as f64;
+    let mean: Vec<f64> = sum.iter().map(|s| s / n).collect();
+    let mut sq = vec![0.0f64; width];
+    for row in values.chunks_exact(width) {
+        for (i, v) in row.iter().enumerate() {
+            sq[i] += (*v - mean[i]) * (*v - mean[i]);
+        }
+    }
+    let std: Vec<f64> = sq.iter().map(|s| (s / n).sqrt()).collect();
+    // An image stat is `[C, 1, 1]` (`compute_stats._validate_stat_value` refuses anything
+    // else); every other feature is a flat `[width]`.
+    let shape = |v: Vec<f64>| -> serde_json::Value {
+        if nest {
+            serde_json::json!(v.into_iter().map(|x| [[x]]).collect::<Vec<_>>())
+        } else {
+            serde_json::json!(v)
+        }
+    };
+    serde_json::json!({
+        "min": shape(min),
+        "max": shape(max),
+        "mean": shape(mean),
+        "std": shape(std),
+        "count": [rows],
+    })
+}
+
 /// `data/chunk-000/file-000.parquet`: every episode, one row group.
+///
+/// Returns `meta/stats.json`'s body, computed from the same values in the same pass — the
+/// file is normalization statistics and a second traversal would be a second chance for the
+/// two to disagree.
 fn write_data(
     path: &Path,
     fields: Vec<TypePtr>,
     plan: &[Col],
     episodes: &[Episode],
     metas: &[EpisodeMeta],
-) -> Result<(), DataError> {
+) -> Result<serde_json::Map<String, serde_json::Value>, DataError> {
     let n: usize = metas.iter().map(|m| m.length as usize).sum();
     let schema = Type::group_type_builder("lerobot")
         .with_fields(fields)
@@ -391,6 +533,7 @@ fn write_data(
     let props = Arc::new(WriterProperties::builder().build());
     let mut writer = SerializedFileWriter::new(file, schema, props).map_err(|e| pq(path, e))?;
     let mut rg = writer.next_row_group().map_err(|e| pq(path, e))?;
+    let mut stats = serde_json::Map::new();
 
     for col in plan {
         match col {
@@ -399,25 +542,30 @@ fn write_data(
                 let mut w = next_col!(rg, path);
                 if name == "timestamp" {
                     let v: Vec<f64> = episodes.iter().flat_map(|e| e.timestamps.clone()).collect();
+                    stats.insert(name.clone(), feature_stats(&v, 1, false));
                     w.typed::<DoubleType>().write_batch(&v, Some(&def), None)
                 } else {
-                    w.typed::<Int64Type>().write_batch(
-                        &reserved_i64(name, episodes),
-                        Some(&def),
-                        None,
-                    )
+                    let v = reserved_i64(name, episodes);
+                    let as_f64: Vec<f64> = v.iter().map(|i| *i as f64).collect();
+                    stats.insert(name.clone(), feature_stats(&as_f64, 1, false));
+                    w.typed::<Int64Type>().write_batch(&v, Some(&def), None)
                 }
                 .map_err(|e| pq(path, e))?;
                 w.close().map_err(|e| pq(path, e))?;
             }
-            Col::Feature { name, elems } => {
-                let values = concat(episodes, name)?;
+            Col::Feature {
+                name,
+                elems,
+                source_elems,
+            } => {
+                let values = narrow(concat(episodes, name)?, *source_elems, *elems);
                 if values.len() != n * elems {
                     return Err(bad(format!(
                         "{name:?}: {} values for {n} frames of {elems}",
                         values.len()
                     )));
                 }
+                stats.insert(name.clone(), feature_stats(&as_f64(&values), *elems, false));
                 let (def, rep) = if *elems == 1 {
                     (vec![1i16; n], None)
                 } else {
@@ -442,6 +590,11 @@ fn write_data(
             } => {
                 let frame_bytes = *height as usize * *width as usize * 3;
                 let mut pngs = Vec::with_capacity(n);
+                // LeRobot reduces an image feature over `axis=(0, 2, 3)` and divides by 255,
+                // i.e. per channel over every pixel of every frame, in [0, 1]. Accumulated in
+                // `u64` over the raw bytes: exact, and no float ordering to reason about.
+                let (mut sum, mut sq) = ([0u64; 3], [0u64; 3]);
+                let (mut lo, mut hi) = ([255u8; 3], [0u8; 3]);
                 for frame in 0..n {
                     let src = dir.join(format!("{frame:06}.bin"));
                     let raw = read_file(&src)?;
@@ -452,8 +605,30 @@ fn write_data(
                             raw.len()
                         )));
                     }
+                    for (i, b) in raw.iter().enumerate() {
+                        let c = i % 3;
+                        sum[c] += u64::from(*b);
+                        sq[c] += u64::from(*b) * u64::from(*b);
+                        lo[c] = lo[c].min(*b);
+                        hi[c] = hi[c].max(*b);
+                    }
                     pngs.push(ByteArray::from(png_rgb(*width, *height, &raw).as_slice()));
                 }
+                let pixels = (n * frame_bytes / 3).max(1) as f64;
+                let nest = |v: [f64; 3]| serde_json::json!(v.map(|x| [[x]]));
+                let mean = sum.map(|s| s as f64 / pixels / 255.0);
+                stats.insert(
+                    name.clone(),
+                    serde_json::json!({
+                        "min": nest(lo.map(|b| f64::from(b) / 255.0)),
+                        "max": nest(hi.map(|b| f64::from(b) / 255.0)),
+                        "mean": nest(mean),
+                        "std": nest(std::array::from_fn(|c| {
+                            (sq[c] as f64 / pixels / 65025.0 - mean[c] * mean[c]).max(0.0).sqrt()
+                        })),
+                        "count": [n],
+                    }),
+                );
                 let mut w = next_col!(rg, path);
                 w.typed::<ByteArrayType>()
                     .write_batch(&pngs, Some(&vec![2i16; n]), None)
@@ -471,7 +646,7 @@ fn write_data(
     }
     rg.close().map_err(|e| pq(path, e))?;
     writer.close().map_err(|e| pq(path, e))?;
-    Ok(())
+    Ok(stats)
 }
 
 /// `meta/episodes/chunk-000/file-000.parquet`. Column names containing `/` are flat top-level

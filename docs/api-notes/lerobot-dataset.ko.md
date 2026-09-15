@@ -401,13 +401,48 @@ v2.1 필드인 `total_videos`와 `total_chunks`는 v3.0 필드가 *아니며* �
 
 조회가 위치 기반(`iloc`)이므로 행 순서는 `task_index`와 일치해야 한다.
 
-## `meta/stats.json`
+## `meta/stats.json` — `검증됨 / verified`
 
-**선택 사항.** 파일이 없으면 `load_stats`는 `None`을 돌려주고(`io_utils.py:161-175`) 읽기 경로에서
-그것을 요구하는 곳은 없다. 내용은 `{feature: {mean|std|min|max|count: [...]}}`이고 학습의 정규화가
-소비한다. `es dataset export --lerobot-v3`는 그것을 쓰지 않는다. LeRobot 호환성은 데이터셋을 *읽을 수
-있느냐*의 문제이고, 통계를 지어내는 것은 빼는 것보다 나쁘다. 내보낸 것으로 LeRobot 쪽에서 학습하려는
-사람이 있다면 그것이 후속 작업이다.
+**읽기에는 선택 사항, 학습에는 필수.** 파일이 없으면 `load_stats`는 `None`을 돌려주고
+(`io_utils.py:161-175`) 읽기 경로에서 그것을 요구하는 곳은 없다. 그러나 `lerobot-train`은 모든 정책
+피처를 `LeRobotDataset.meta.stats`로 정규화하므로, 이 파일이 없는 데이터셋으로는 학습할 수 없다.
+패킷 `M5/V8`이 이 절의 이전 판이 말한 그 후속 작업이고, `es dataset export --lerobot-v3`는 이제
+이것을 쓴다.
+
+**모양.** `{feature: {stat: 중첩 리스트}}`. `load_stats`는 `load_json` 다음
+`cast_stats_to_numpy`이고, 그것은 `flatten_dict` → `np.atleast_1d(np.array(v))` →
+`unflatten_dict`이다(`io_utils.py:148-158`). 따라서 어떤 JSON 숫자 트리든 받아들여지고, 정규화기가
+색인하는 것은 *리스트의 모양*이다. 세 가지 모양이 나오며
+`compute_stats._validate_stat_value`는 그 밖의 것을 받지 않는다.
+
+| 피처 | 통계 모양 | 예 |
+|---|---|---|
+| `shape: [n]`, `n > 1` | `[n]` | `"observation.state": {"mean": [숫자 6개]}` |
+| `shape: [1]`(스칼라 컬럼) | `[1]` | `"timestamp": {"mean": [0.42]}` |
+| `dtype: "image"`/`"video"` | `[3, 1, 1]`(또는 `[1,1,1]`) | `{"mean": [[[0.79]], [[0.76]], [[0.70]]]}` |
+| 전부 | `count`는 항상 `[1]` | |
+
+**키.** `min`, `max`, `mean`, `std`, `count`, 그리고 `q01`, `q10`, `q50`, `q90`, `q99`.
+`NormalizerProcessorStep`은 `MEAN_STD`에 `mean`/`std`, `MIN_MAX`에 `min`/`max`, `QUANTILES`에
+`q01`/`q99`, `QUANTILE10`에 `q10`/`q90`을 읽고, 자기 모드가 원하는 짝이 없으면 이름을 짚어
+예외를 던진다. **ACT는 `VISUAL`·`STATE`·`ACTION` 모두 `MEAN_STD`이므로**
+(`ACTConfig.normalization_mapping`, 0.6.1에서 측정), 익스포트는 앞의 다섯 개를 쓰고 **분위수는
+생략한다**. 분위수는 LeRobot 자신의 코드에서도 5000 구간 히스토그램 추정치이고
+(`RunningQuantileStats`), 근사의 근사를 하나 더 만드는 것은 정직하게 없는 키보다 나쁘다.
+
+**LeRobot이 계산하는 방식, 그리고 익스포트가 그것과 맞는 이유.** `compute_episode_stats`는 에피소드
+하나를 줄인다 — 벡터 컬럼은 `axis=0`, 이미지는 `axis=(0,2,3)`과 `/255`. `aggregate_stats`는
+에피소드들을 병렬 분산 공식(`(var_i + (mean_i − mean)²)`에 `count_i` 가중)으로 합치는데, 이것은
+*정확하다*. 합쳐진 평균과 모집단 표준편차는 전체 데이터셋을 한 번에 훑어 구한 값과 같고, 그것이
+`crates/es-data/src/lerobot/v3.rs`가 하는 일이다. `std`는 양쪽 다 모집단(`ddof = 0`)이다.
+
+**정직한 차이 하나: 이미지는 표본이다.** `sample_images`는 에피소드당
+`estimate_num_samples(n) = max(100, min(int(n**0.75), 10_000))` 프레임을 뽑고 300 px를 넘으면
+다운샘플한다. 그래서 긴 에피소드에서 LeRobot의 이미지 통계는 추정치이고 익스포트의 것은 모든
+프레임의 모든 픽셀에 대한 정확한 값이다. 이미지 피처의 `count`도 다르다 — LeRobot은 표본 프레임
+수를, 익스포트는 프레임 수를 센다. 표본이 전수가 될 만큼 짧은 데이터셋에서는 둘이 부동소수점
+정밀도까지 일치하며, `crates/es-data/tests/lerobot_v3.rs::lerobot_v3_stats`가 그 비교다.
+`2026-09-15` 측정: 모든 피처·모든 키에 걸쳐 최대 불일치 `5.5e-08`.
 
 ## 받아들여진 parquet 물리 인코딩
 

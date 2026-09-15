@@ -35,7 +35,7 @@ pub use intervention::{
     INTERVENTION,
 };
 pub use lerobot::{
-    export_v3, Column, Dtype, Episode, EpisodeMeta, ExportReport, FeatureSpec, Info,
+    export_v3, Column, Dtype, Episode, EpisodeMeta, ExportOptions, ExportReport, FeatureSpec, Info,
     LeRobotDataset, LeRobotWriter, Task, VideoRef,
 };
 

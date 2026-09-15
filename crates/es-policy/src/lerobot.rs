@@ -30,7 +30,7 @@ use es_ir::learning::{
     TensorPort, WeightsRef,
 };
 use es_ir::types::{ElemType, Frame, PortType, Shape, TimeRef, Unit};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::lower::torch::lowering_hash;
 use crate::lower::{LowerError, TorchModule};
@@ -38,7 +38,7 @@ use crate::runtime::PolicyError;
 use crate::weights::{parse_header, SafetensorsEntry, WEIGHT_PREFIX};
 
 /// One entry of `input_features` / `output_features`.
-#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Feature {
     /// `"VISUAL"`, `"STATE"` or `"ACTION"`.
     #[serde(rename = "type")]
@@ -53,7 +53,7 @@ pub struct Feature {
 /// deployment concern, and is ignored rather than guessed at. `serde` defaults mirror
 /// `lerobot.policies.act.configuration_act.ACTConfig`, so a config that omits a field still
 /// loads — see `docs/api-notes/lerobot-act.md`.
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ActConfig {
     #[serde(rename = "type")]
     pub kind: String,
@@ -290,31 +290,115 @@ pub fn remap_act_keys<'a>(
     out
 }
 
+/// One output tensor and the file its bytes are in: [`remap_checkpoint`] draws from two.
+type SourcedEntry<'a> = (String, &'a [u8], SafetensorsEntry);
+
+/// The three normalizers, from `LeRobot` 0.6.x's **separate processor state file**.
+///
+/// Two checkpoint layouts exist and both are in use (`docs/api-notes/lerobot-act.md`):
+///
+/// - the pinned upstream one (`lerobot/act_aloha_sim_transfer_cube_human`) carries the
+///   statistics inside `model.safetensors` as `normalize_inputs.buffer_<feature>.{mean,std}`,
+///   which [`prefix_table`] already maps;
+/// - anything `lerobot-train` 0.6.1 writes carries them in
+///   `policy_preprocessor_step_<n>_normalizer_processor.safetensors`, keyed
+///   `<feature>.{mean,std,min,max,count}` with no prefix at all, because 0.6.x moved
+///   normalization out of `ACTPolicy` into a processor pipeline.
+///
+/// The second file is the caller's `stats`. Its entries are only *added* where the first layout
+/// left a gap ([`remap_checkpoint`] uses `or_insert`), so a checkpoint carrying both is read the
+/// old way and neither layout needs a flag.
+fn normalizer_stats<'a>(
+    cfg: &ActConfig,
+    stats: Option<&'a [u8]>,
+) -> Result<Vec<SourcedEntry<'a>>, PolicyError> {
+    let Some(stats) = stats else {
+        return Ok(Vec::new());
+    };
+    let file = parse_header(stats)?;
+    let camera = cfg
+        .cameras()
+        .first()
+        .copied()
+        .unwrap_or_default()
+        .to_owned();
+    let mut out = Vec::new();
+    for (node, feature) in [
+        (NORM_STATE, "observation.state".to_owned()),
+        (NORM_IMAGE, camera),
+        (UNNORM_ACTION, "action".to_owned()),
+    ] {
+        for stat in ["mean", "std"] {
+            let key = format!("{feature}.{stat}");
+            let entry = file.get(&key).ok_or_else(|| {
+                PolicyError::Safetensors(format!(
+                    "the normalizer state file has no \"{key}\"; it holds {:?}",
+                    file.keys().take(8).collect::<Vec<_>>()
+                ))
+            })?;
+            out.push((
+                format!("{WEIGHT_PREFIX}{node}.{stat}"),
+                stats,
+                entry.clone(),
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// The `__metadata__` key under which [`remap_checkpoint`] records the config that decides the
+/// module.
+///
+/// Spec 8.3's node parameters do not carry ACT's architecture (the module docs say why), so the
+/// only honest place for it is *inside the checkpoint*: the bytes are hashed into
+/// `WeightsRef::hash` and therefore into `policy_hash`, so the IR still decides which module
+/// runs — transitively, through the hash it declares (spec 5.3). A bundle whose weights were
+/// swapped is refused before this is ever read.
+pub const ACT_CONFIG_KEY: &str = "es.lerobot.act.config";
+
+/// The ACT config a [`remap_checkpoint`] output carries, or `None` for any other checkpoint.
+pub fn embedded_config(bytes: &[u8]) -> Result<Option<ActConfig>, PolicyError> {
+    let Some(raw) = crate::weights::metadata(bytes, ACT_CONFIG_KEY)? else {
+        return Ok(None);
+    };
+    ActConfig::parse(&raw)
+        .map(Some)
+        .map_err(|e| PolicyError::Safetensors(format!("{ACT_CONFIG_KEY}: {e}")))
+}
+
 /// Rewrite a `LeRobot` checkpoint into our key scheme, dropping the training-only tensors.
 ///
 /// Byte-level: the header is rebuilt and each surviving tensor's bytes are copied verbatim, so
 /// no value is ever decoded, rounded or re-rounded. Output order is `BTreeMap` order, which
 /// makes the result a function of the input alone (spec 3.4) and its `blake3` a stable
 /// `WeightsRef::hash`.
-pub fn remap_checkpoint(cfg: &ActConfig, bytes: &[u8]) -> Result<Vec<u8>, PolicyError> {
+pub fn remap_checkpoint(
+    cfg: &ActConfig,
+    bytes: &[u8],
+    stats: Option<&[u8]>,
+) -> Result<Vec<u8>, PolicyError> {
     let file = parse_header(bytes)?;
     let map = remap_act_keys(cfg, file.keys().map(String::as_str));
-    let header_len =
-        u64::from_le_bytes(bytes[..8].try_into().map_err(|_| {
-            PolicyError::Safetensors("file is shorter than the 8-byte length".into())
-        })?) as usize;
-    let base = 8 + header_len;
 
-    let mut kept: BTreeMap<&str, &SafetensorsEntry> = BTreeMap::new();
+    // `(source file, its entry)` per output key, because the normalization statistics may come
+    // from a second file — see `normalizer_stats`.
+    let mut kept: BTreeMap<String, (&[u8], SafetensorsEntry)> = BTreeMap::new();
     for (from, to) in &map {
-        kept.insert(to.as_str(), &file[from]);
+        kept.insert(to.clone(), (bytes, file[from].clone()));
+    }
+    for (name, source, entry) in normalizer_stats(cfg, stats)? {
+        kept.entry(name).or_insert((source, entry));
     }
 
     let mut header = serde_json::Map::new();
     let mut data = Vec::with_capacity(bytes.len());
-    for (name, entry) in kept {
+    for (name, (source, entry)) in kept {
+        let header_len = u64::from_le_bytes(source[..8].try_into().map_err(|_| {
+            PolicyError::Safetensors("file is shorter than the 8-byte length".into())
+        })?) as usize;
+        let base = 8 + header_len;
         let (a, b) = entry.offsets;
-        let slice = bytes
+        let slice = source
             .get(base + a as usize..base + b as usize)
             .ok_or_else(|| {
                 PolicyError::Safetensors(format!("entry \"{name}\" runs past the end"))
@@ -322,7 +406,7 @@ pub fn remap_checkpoint(cfg: &ActConfig, bytes: &[u8]) -> Result<Vec<u8>, Policy
         let start = data.len();
         data.extend_from_slice(slice);
         header.insert(
-            name.to_owned(),
+            name,
             serde_json::json!({
                 "dtype": entry.dtype,
                 "shape": entry.shape,
@@ -331,6 +415,15 @@ pub fn remap_checkpoint(cfg: &ActConfig, bytes: &[u8]) -> Result<Vec<u8>, Policy
         );
     }
 
+    // The config travels with the weights (see `ACT_CONFIG_KEY`). `parse_header` skips
+    // `__metadata__`, so this adds no key any validator has to learn about.
+    header.insert(
+        "__metadata__".to_owned(),
+        serde_json::json!({
+            ACT_CONFIG_KEY: serde_json::to_string(cfg)
+                .map_err(|e| PolicyError::Safetensors(e.to_string()))?,
+        }),
+    );
     let header = serde_json::to_vec(&serde_json::Value::Object(header))
         .map_err(|e| PolicyError::Safetensors(e.to_string()))?;
     let mut out = (header.len() as u64).to_le_bytes().to_vec();
@@ -580,9 +673,14 @@ class EsPolicy(nn.Module):
         self.n{UNNORM_ACTION} = _ActNorm([{action}])
 
     def forward(self, **inputs):
-        # inputs: {state_in} [B, {state}], {img_in} [B, {image:?}], both unnormalized.
-        state = self.n{NORM_STATE}(inputs[{state_in:?}])
-        image = self.n{NORM_IMAGE}(inputs[{img_in:?}])
+        # inputs: {state_in} [B, {state}], {img_in} [B, {image:?}], both unnormalized --
+        # LeRobot normalizes inside the policy, from the buffers below, so the Observation IR
+        # must hand these over in raw units. One observation is accepted unbatched, which is
+        # what `es eval run` feeds (a spec 7.4 tensor carries no batch axis).
+        state = inputs[{state_in:?}]
+        image = inputs[{img_in:?}]
+        state = self.n{NORM_STATE}(state if state.dim() == 2 else state.unsqueeze(0))
+        image = self.n{NORM_IMAGE}(image if image.dim() == 4 else image.unsqueeze(0))
         batch = state.shape[0]
         # use_vae = {use_vae}: the CVAE encoder runs under `self.training` only, so at inference
         # the latent is zeros and all of its tensors are dropped from the checkpoint.
@@ -938,7 +1036,7 @@ mod tests {
             "normalize_inputs.buffer_observation_state.mean".to_owned(),
             (vec![3], vec![0.25, 0.5, 0.75]),
         );
-        let out = remap_checkpoint(&cfg(), &write_safetensors(&file)).unwrap();
+        let out = remap_checkpoint(&cfg(), &write_safetensors(&file), None).unwrap();
         let header = parse_header(&out).unwrap();
         assert_eq!(
             header.keys().collect::<Vec<_>>(),
@@ -954,7 +1052,7 @@ mod tests {
         // Deterministic (spec 3.4).
         assert_eq!(
             out,
-            remap_checkpoint(&cfg(), &write_safetensors(&file)).unwrap()
+            remap_checkpoint(&cfg(), &write_safetensors(&file), None).unwrap()
         );
     }
 }

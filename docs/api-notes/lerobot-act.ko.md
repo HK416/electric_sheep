@@ -246,3 +246,69 @@ RAN act_checkpoint: lerobot 0.6.1 torch 2.11.0+cpu shape [100, 14] max_abs 0e0 m
 
 **비트 단위로 동일함** — spec §8.9의 tier-4 `1e-5` 안에 여유롭게 들어가며, 테스트는
 허용오차가 아니라 비트 단위 결과를 단언(assert)하므로 향후의 발산이 그 안에 숨을 수 없다.
+
+## 9. 두 가지 체크포인트 레이아웃, 그리고 정규화 통계가 있는 곳 — `검증됨 / verified`
+
+위의 모든 내용은 `lerobot/act_aloha_sim_transfer_cube_human`에 대해 측정한 것이고, 그것은
+**0.6 이전 체크포인트를 다시 올린 것**이다. `lerobot-train` 0.6.1이 오늘 쓰는 체크포인트는 한 가지
+점에서 레이아웃이 다르며, 패킷 `M5/V8`이 그것에 정면으로 부딪혔다.
+
+0.6.x는 정규화를 `ACTPolicy` 밖 *프로세서 파이프라인*(`lerobot/processor/`)으로 옮겼다. 그래서
+`predict_action_chunk`는 이미 정규화된 입력을 받고 정규화된 액션을 돌려주며(1절의 발견),
+통계는 아예 `model.safetensors`에 없다. 새 체크포인트 디렉터리는 이렇다.
+
+```
+pretrained_model/
+  config.json
+  model.safetensors                                        # 텐서 234개, 정규화 버퍼 없음
+  train_config.json
+  policy_preprocessor.json                                 # 파이프라인, 단계별
+  policy_preprocessor_step_3_normalizer_processor.safetensors
+  policy_postprocessor.json
+  policy_postprocessor_step_0_unnormalizer_processor.safetensors
+```
+
+`policy_preprocessor.json`이 상태 파일의 이름을 가지고 있으므로, 단계 번호는 추측하지 않고 읽는다.
+
+```json
+{"steps": [ ..., {"registry_name": "normalizer_processor",
+                  "config": {"eps": 1e-08, "features": {...}, "norm_map": {...}},
+                  "state_file": "policy_preprocessor_step_3_normalizer_processor.safetensors"}]}
+```
+
+그 키는 **접두사가 전혀 없는 `<feature>.<stat>`**이고, 정책 입력이 아니라 데이터셋 피처마다 하나씩 있다.
+
+| 키 | 모양 |
+|---|---|
+| `observation.state.{mean,std,min,max}` | `[state_dim]` |
+| `observation.images.<name>.{mean,std,min,max}` | `[3, 1, 1]` |
+| `action.{mean,std,min,max}` | `[action_dim]` |
+| `<feature>.count` | `[1]`(이미지는 `[1, 1, 1]`) |
+| `reward`, `timestamp`, `index`, `frame_index`, `episode_index`, `task_index`도 있다 | |
+
+옛 레이아웃은 같은 텐서를 `normalize_inputs.buffer_observation_state.mean`,
+`normalize_inputs.buffer_<점을 밑줄로 바꾼 카메라 이름>.mean`,
+`unnormalize_outputs.buffer_action.mean`으로 부르며, 그것이 3절의 표다.
+
+**두 레이아웃 모두 읽힌다.** `es_policy::lerobot::remap_checkpoint`는 프로세서 상태 파일을 옵션으로
+받아 접두사 표가 찾지 못한 항목만 채운다. 그래서 옛 체크포인트는 전과 똑같이 읽히고, 새 체크포인트는
+노드 9/10/11을 두 번째 파일에서 얻는다. 버전으로 둘을 가르는 것은 없다. 실제로 중요한 질문은 "그 키가
+있느냐"이기 때문이다.
+
+`python/act_ref.py`도 같은 방식으로 둘을 읽으며, 그것이 §8.9 게이트의 두 편이 똑같이 정규화하게 만드는
+장치다.
+
+**레퍼런스에 필요한 것 하나 더.** `config.json`은 체크포인트가 *학습된* 장치를 기록하고
+(`"device": "cuda"`) `ACTPolicy.from_pretrained`가 그것을 따른다. 그래서 레퍼런스는 이제 `.to("cpu")`를
+강제한다. 우리 `TorchRuntime`은 CPU 서브프로세스이고, 장치가 다른 두 fp32 결과를 비교하는 것은 모듈이
+아니라 cuDNN의 커널 선택을 재는 일이 된다.
+
+**2026-09-15 측정**, 여기서 `lerobot-train` 0.6.1로 학습한 ACT(청크 16, 관절 6, 96×96)에 대해, 합성
+램프가 아니라 이 프로젝트 자신의 시연 데이터셋에서 꺼낸 프레임 위에서:
+
+```
+RAN act_checkpoint: lerobot 0.6.1 torch 2.11.0+cu129 observation .../v8/frame.json
+                    shape [16, 6] max_abs 0e0 max_rel 0e0
+```
+
+20,000 스텝과 100,000 스텝 체크포인트 양쪽에서 비트 단위로 동일하다.

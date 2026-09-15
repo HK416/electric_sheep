@@ -289,7 +289,19 @@ impl TorchRuntime {
         weights: &WeightsSource,
     ) -> Result<PolicyInfo, PolicyError> {
         let (path, bytes) = self.checkpoint(weights)?;
-        let got = weights_hash(&bytes);
+        self.start(module, policy, &path, &bytes)
+    }
+
+    /// Everything after the checkpoint is in hand, shared with [`PolicyRuntime::load`], which
+    /// has to look inside the bytes before it can choose the module.
+    fn start(
+        &mut self,
+        module: &TorchModule,
+        policy: &PolicyHandle,
+        path: &std::path::Path,
+        bytes: &[u8],
+    ) -> Result<PolicyInfo, PolicyError> {
+        let got = weights_hash(bytes);
         let expected = *policy.weights.hash();
         if got != expected {
             return Err(PolicyError::WeightsHash {
@@ -297,7 +309,7 @@ impl TorchRuntime {
                 got: hex(&got),
             });
         }
-        validate_keys(module, &parse_header(&bytes)?)?;
+        validate_keys(module, &parse_header(bytes)?)?;
 
         let mut process = Process::spawn()?;
         let reply: LoadReply = process.call(&Request::Load {
@@ -337,8 +349,18 @@ impl PolicyRuntime for TorchRuntime {
     ) -> Result<PolicyInfo, PolicyError> {
         // The checkpoint must be the one the IR names (spec 5.3) and must fit the lowered
         // graph (design note section 4). Both before Python sees it.
-        let module = lower_to_torch(graph)?;
-        self.load_lowered(&module, &graph.policy, weights)
+        let (path, bytes) = self.checkpoint(weights)?;
+        // An external `LeRobot` ACT carries its own architecture in the checkpoint, because
+        // spec 8.3's nodes cannot express a CVAE and a DETR decoder (`crate::lerobot`). Its
+        // `LearningGraph` is the spec 8.1 shape for exactly that case -- an opaque
+        // `PolicyHandle` and no preprocessor nodes -- so there is nothing for
+        // `lower_to_torch` to lower and the module comes from `lower_act`. Everything below
+        // is unchanged: the declared hash still decides which bytes these are.
+        let module = match crate::lerobot::embedded_config(&bytes)? {
+            Some(cfg) => crate::lerobot::lower_act(&cfg)?,
+            None => lower_to_torch(graph)?,
+        };
+        self.start(&module, &graph.policy, &path, &bytes)
     }
 
     fn infer(

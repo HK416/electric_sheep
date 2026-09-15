@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 pub use columns::Column;
 pub use meta::{Dtype, EpisodeMeta, FeatureSpec, Info, Task};
-pub use v3::{export_v3, ExportReport};
+pub use v3::{export_v3, ExportOptions, ExportReport};
 
 use crate::{read_file, write_file, DataError};
 

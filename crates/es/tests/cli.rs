@@ -3528,6 +3528,77 @@ fn regenerate_visible_learning_documents() {
             es_ir::serial::observation_to_toml(&obs).expect("observation toml")
         ),
     );
+    // --- observation-v8.toml, evaluation-v8.toml (packet M5/V8) ------------------------
+    //
+    // A second Observation IR on the same Task IR (spec 7: same `task_hash`, different
+    // `observation_hash`), for a policy that was designed and trained outside this project.
+    // Three differences, and each is forced by what LeRobot's ACT *is*:
+    //
+    //  * the privileged branch is gone. `lerobot.utils.feature_utils` gives a policy exactly
+    //    one `observation.state` feature, and a second state port has nowhere to land.
+    //  * the state `Normalize` is the **identity** — `Range{0..1}`, i.e. `(q - 0) / (1 - 0)`.
+    //    ACT carries its own statistics in the checkpoint
+    //    (`normalize_inputs.buffer_observation_state.{mean,std}`, fitted to the values it was
+    //    trained on) and applies them as the first operation of its forward pass, so the
+    //    conversion is already owned. Applying a *second*, unrelated affine map here would
+    //    only change what those statistics had to absorb — and it would have to be applied to
+    //    the exported dataset too, which means implementing `Op::Normalize` a second time,
+    //    which is the defect section 7.9 removed. The node stays because spec 5.4 (`XIR`'s
+    //    `TYPE-011`) requires a policy input to be `Normalized`, and the honest thing to say
+    //    is that the Observation IR's normalization decision here *is* the identity.
+    //  * the ports are named the way the checkpoint's `config.json` names its features, with
+    //    dots replaced by underscores, because the name is what `XIR-010` matches and what
+    //    reaches the lowered module as a `forward(**inputs)` keyword.
+    //
+    // The image branch is untouched, byte for byte: `Dequantize` then `Normalize{0..1}` is
+    // already exactly the [0, 1] float CHW tensor LeRobot's own loader produces from a PNG —
+    // and it, too, is the identity on that branch, which is why nothing had to change.
+    let mut v8 = obs.clone();
+    v8.outputs.remove(CUBE_POSE);
+    for node in [state_in, normalize] {
+        v8.graph.nodes.remove(&node);
+    }
+    v8.graph.edges.retain(|e| {
+        ![state_in, normalize].contains(&e.from.node) && ![state_in, normalize].contains(&e.to.node)
+    });
+    let mut joint = v8.outputs.remove("joint_state").expect("the state output");
+    let identity = es_ir::types::Unit::Normalized { lo: 0.0, hi: 1.0 };
+    let state_norm = joint.port.node;
+    match v8.graph.nodes.get_mut(&state_norm).expect("the state node") {
+        ObservationNode::Normalize { stats, io } => {
+            *stats = es_ir::observation::NormalizeStats::Range { lo: 0.0, hi: 1.0 };
+            io.output.unit = identity.clone();
+        }
+        other => panic!("the state output must come from a Normalize, not {other:?}"),
+    }
+    joint.ty.unit = identity;
+    v8.outputs.insert("observation_state".to_owned(), joint);
+    let image = v8.outputs.remove("rgb_overhead").expect("the image output");
+    v8.outputs
+        .insert("observation_images_rgb_overhead".to_owned(), image);
+    let diags = v8.validate();
+    assert!(diags.is_empty(), "{diags:?}");
+    write(
+        &vl_fixture("observation-v8.toml"),
+        &format!(
+            "{OBSERVATION_V8_HEADER}\n{}",
+            es_ir::serial::observation_to_toml(&v8).expect("observation-v8 toml")
+        ),
+    );
+    let evaluation_v8 = demo_evaluation_ir(
+        hex(&task.task_hash().expect("task hash")),
+        hex(&v8.observation_hash().expect("observation-v8 hash")),
+    );
+    let diags = evaluation_v8.validate();
+    assert!(diags.is_empty(), "{diags:?}");
+    write(
+        &vl_fixture("evaluation-v8.toml"),
+        &format!(
+            "{EVALUATION_V8_HEADER}\n{}",
+            es_ir::serial::evaluation_to_toml(&evaluation_v8).expect("evaluation-v8 toml")
+        ),
+    );
+
     // --- evaluation.toml ----------------------------------------------------------------
     let evaluation = demo_evaluation_ir(
         hex(&task.task_hash().expect("task hash")),
@@ -3544,12 +3615,66 @@ fn regenerate_visible_learning_documents() {
     );
 
     println!(
-        "task_hash {}\nobservation_hash {}\nevaluation_hash {}",
+        "task_hash {}\nobservation_hash {}\nevaluation_hash {}\nobservation_v8_hash \
+         {}\nevaluation_v8_hash {}",
         hex(&task.task_hash().expect("task hash")),
         hex(&obs.observation_hash().expect("observation hash")),
-        hex(&evaluation.evaluation_hash().expect("evaluation hash"))
+        hex(&evaluation.evaluation_hash().expect("evaluation hash")),
+        hex(&v8.observation_hash().expect("observation-v8 hash")),
+        hex(&evaluation_v8.evaluation_hash().expect("evaluation-v8 hash"))
     );
 }
+
+const OBSERVATION_V8_HEADER: &str = "\
+# Observation IR (spec 7) for the SO-101 cube-into-bin demo, for an **external** policy --
+# packet M5/V8.
+#
+# Generated by `cargo test -p es --test cli -- --ignored regenerate_visible_learning_documents`
+# from observation.toml, so no hash here is typed in. Same `task_ref`, different
+# `observation_hash`: spec 7 says one Task IR may carry several Observation IRs, and this is
+# what that is for.
+#
+# The policy this feeds is LeRobot's own ACT, trained by `lerobot-train` and imported with
+# `es policy import-lerobot` -- not an IR-owned graph. Three things follow, and each is forced
+# by what that checkpoint *is*:
+#
+#  1. **The state `Normalize` is the identity**: `Range{0..1}`, which is `(q - 0) / (1 - 0)`,
+#     so the policy is served the joint angles in radians as the scene reports them. ACT
+#     stores its own statistics in the checkpoint
+#     (`normalize_inputs.buffer_observation_state.{mean,std}`, fitted to the values it was
+#     trained on) and applies them as the first operation of its forward pass -- the
+#     conversion is already owned. A second, unrelated affine map here would only change what
+#     those statistics had to absorb, and it would have to be applied to the exported dataset
+#     as well, which means implementing `Op::Normalize` a second time. That is the defect
+#     section 7.9 removed. The node stays because spec 5.4 requires a policy input to be
+#     `Normalized`, `Dimensionless` or `Token` (`TYPE-011`, checked against the contract by
+#     the cross-IR pass), and what this port declares is exactly true: the Observation IR's
+#     normalization decision for an externally-normalizing policy is the identity, stated in
+#     the one node that decides it rather than left to a reader's inference.
+#  2. **There is one state port.** `lerobot.utils.feature_utils.dataset_to_policy_features`
+#     gives a policy exactly one `observation.state` feature, so V7a's simulator-privileged
+#     `sim_cube_pose` has nowhere to land and is dropped. V8 is the *vision* question, which
+#     is the one V7a set aside.
+#  3. **The port names are the checkpoint's feature names**, with dots replaced by
+#     underscores (a Python keyword argument may not contain one). `XIR-010` matches the
+#     Observation IR's output names against `PolicyContract::inputs` verbatim, and those come
+#     from `config.json`.
+#
+# The image branch is observation.toml's, byte for byte: `ImageInput` (U8 HWC, the renderer's
+# own tile) -> `Dequantize` (CHW F32, /255) -> `Normalize{0..1}`. That is already exactly the
+# tensor LeRobot's loader hands its policy from a PNG, so nothing had to be added -- and no
+# `Resize` or `Crop` was added either, so no intrinsics transform is owed (spec 7.2, INV-14).
+";
+
+const EVALUATION_V8_HEADER: &str = "\
+# Evaluation IR (spec 10) for the external-ACT demo -- packet M5/V8.
+#
+# Generated by `cargo test -p es --test cli -- --ignored regenerate_visible_learning_documents`.
+# Identical to evaluation.toml in every suite, perturbation, metric and acceptance threshold --
+# `success_rate >= 0.5` on seeds 101-116 and not one number lowered. The only thing that moves
+# is `observation`, which names observation-v8.toml because that is the Observation IR the
+# external policy is fed through (XIR-040).
+";
 
 const EVALUATION_HEADER: &str = "\
 # Evaluation IR (spec 10) for the SO-101 cube-into-bin demo -- plan V, packet M5/V3.
