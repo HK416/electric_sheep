@@ -29,11 +29,17 @@ crates/es-eval/tests/evaluation.rs
 crates/es/src/cmd/dataset.rs
 crates/es/tests/cli.rs
 crates/es-policy/src/lower/torch.rs
+crates/es-policy/src/lower/mod.rs
+crates/es-policy/src/weights.rs
 crates/es-policy/tests/ir_training.rs
 python/es/train_act.py
+python/es/README.md
+python/es/README.ko.md
 tests/fixtures/visible-learning/learning.toml
 docs/design/visible-learning.md
 docs/design/visible-learning.ko.md
+docs/packets/M5/V2-act-training.md
+docs/packets/M5/V2-act-training.ko.md
 docs/packets/M5/V2b-observation-bake.md
 docs/packets/M5/V2b-observation-bake.ko.md
 ```
@@ -164,7 +170,7 @@ impl ObservationBake {
 
 ```
 es dataset bake --policy <bundle.esb> --out <dir> [--frames <tiles>] <dataset-root>
-# <dir>/episode-000000.safetensors   { "<obs output>": [frames, ...], "action": [frames, dim] }
+# <dir>/episode_000000.safetensors   { "<obs output>": [frames, ...], "action": [frames, dim] }
 # <dir>/manifest.json                observation_hash, task_hash, compiler_hash,
 #                                    dataset_content_hash, episodes[], tensors{}, frames
 ```
@@ -199,3 +205,25 @@ es dataset bake --policy <bundle.esb> --out <dir> [--frames <tiles>] <dataset-ro
   않는다. acceptance에 미달한 측정은 미달했다고 보고한다.
 - V2가 쓰지 않은 무엇으로도 재학습하지 않는다: 같은 시드, 같은 배치, 같은 학습률, 같은 스텝 수.
   이 실험에서 움직이는 변수는 하나이고, 그것은 관측이다.
+
+### artifacts (오라클 서버, RTX 4090; 아래 무엇도 커밋되지 않는다)
+
+전부 오라클 서버의 `~/artifacts/plan-v/v2b/` 아래에 산다. 작은 것들은 요청자의
+`target/plan-v/v2b/`로 복사했다. 프레임·타일·체크포인트는 커밋하지 않는다(섹션 9: 증거는
+프레임이고 mp4는 그것의 한 가지 뷰다).
+
+| 산출물 | 어떻게 | 크기 / 값 |
+|---|---|---|
+| `untrained.esb` | `cargo test -p es --test cli dataset_bake_writes` 뒤 그 `policy.esb` | 27 KB; `learning.toml`의 `pretrained`가 `learning_hash`를 움직였으므로 다시 만들었다 |
+| `build/` | `es policy lower --policy untrained.esb` | `lowering_hash 956abb67…ec6d` — **V2의 것과 바이트 동일**, 아키텍처가 움직이지 않았다 |
+| `baked/` | `es dataset bake --policy untrained.esb --frames frames-train ds-train` | 50 에피소드, 17,697 프레임, 1.9 GB, `observation_hash f4a50730…55f6e0` |
+| `model-1000.safetensors` | `train_act.py --baked baked/ --batch 8 --lr 1e-4 --seed 0 --device cuda --checkpoint-at 1000,5000,20000` | 61 MB, blake3 `f9760461ac3a84be1b07ff79718bbc1f30a65999e14508c4c1e8ae90586d1de6` |
+| `model-5000.safetensors` | 같은 실행 | blake3 `fe8f5405f092696daa0cfbfff5a3e57fab3e111ac4b9784d5edc989193a3dc8f` |
+| `model-20000.safetensors` | 같은 실행 | blake3 `3f50335ecb29035cc7a9845ef20eea52229ea2dc642fb654443abd50fa2a92b9` |
+| `trained-20000.esb` | `es policy pack --policy untrained.esb --weights model-20000.safetensors` | `policy_hash a07b04fc99b55fa49e6213e3aa3af10be63a38ff3172277a4b64eafb5fe365be` |
+| `loss-curve.json` | `--loss-curve` | 스텝별 L1 손실 20,000개 |
+| `nominal-{1000,5000,20000}/` | `es eval run --config evaluation-nominal.toml --frames` | 각 16 셀, 13,788 / 13,748 / 14,400 프레임 |
+| `demo-{1000,5000,20000}.mp4` | `es video mosaic --grid 4x4` + `encode_video.py --fps 50` | 384x392 900 프레임; `mp4v` 13.0 / 11.6 / 11.4 MB, H.264 1.9 / 1.7 / 1.7 MB |
+
+blake3 값은 `es policy pack`이 출력한 `weights_hash`이고, 이는 체크포인트 파일의 `blake3`다
+(`crates/es-compile/src/bundle.rs`). 20,000 스텝 체크포인트는 커밋하지 **않는다**.

@@ -4,6 +4,13 @@ Design note: `docs/design/visible-learning.md` section 6; read section 2.5 first
 loop anywhere in the repo, and a bundle produced through `lower_act` **cannot be run by `es eval run`**,
 which is why this packet trains the IR-owned graph instead. Depends on V1 (the dataset).
 
+> **Superseded in part by `V2b-observation-bake.md`.** This packet's training read the LeRobot
+> parquet directly and re-implemented one Observation IR node in Python, which made every success
+> rate V3 measured a measurement of ACT fed an observation it was not trained on (design note
+> section 7.9). `train_act.py` now takes `--baked <dir>` from `es dataset bake`, not `--dataset`
+> and `--frames`, and V2's `the_loss_falls_and_the_packed_bundle_round_trips` is V2b's
+> `act_training_uses_baked_observations`. Everything below is the record of what V2 did.
+
 ## context
 
 ```

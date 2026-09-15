@@ -4,6 +4,13 @@
 전혀 없고, `lower_act`로 만든 번들은 **`es eval run`으로 실행할 수 없다**. 그래서 이 패킷은 대신 IR이
 소유한 그래프를 학습한다. V1 (데이터셋)에 의존.
 
+> **일부는 `V2b-observation-bake.ko.md`가 대체한다.** 이 패킷의 학습은 LeRobot parquet을 직접
+> 읽고 Observation IR 노드 하나를 파이썬으로 다시 구현했고, 그 탓에 V3가 측정한 모든 성공률이
+> 학습하지 않은 관측을 먹은 ACT의 측정이 되었다 (설계 노트 섹션 7.9). `train_act.py`는 이제
+> `--dataset`와 `--frames`가 아니라 `es dataset bake`의 `--baked <dir>`를 받고, V2의
+> `the_loss_falls_and_the_packed_bundle_round_trips`는 V2b의 `act_training_uses_baked_observations`다.
+> 아래는 전부 V2가 한 일의 기록이다.
+
 ## context
 
 ```

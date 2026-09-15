@@ -411,9 +411,23 @@ for e in range(episodes):
         state.append([0.30 * phase * (1 + (i % 3)) for i in range(state_w)])
         action.append([0.30 * phase * (1 + (i % 3)) for i in range(action_w)])
     column = lambda rows: pa.array(rows, type=pa.list_(pa.float32()))
+    # The five reserved scalar columns as well as the features: `es dataset bake` reads this
+    # through `es_data::LeRobotDataset`, which refuses a file with no `timestamp`
+    # (crates/es-data/src/lerobot/columns.rs). `compression="NONE"` for the same reason --
+    # es-data enables no parquet codec on purpose, and pyarrow defaults to snappy.
+    table = pa.table({
+        "observation.state": column(state),
+        "action": column(action),
+        "timestamp": pa.array([t / 50.0 for t in range(frames)], type=pa.float64()),
+        "frame_index": pa.array(list(range(frames)), type=pa.int64()),
+        "episode_index": pa.array([e] * frames, type=pa.int64()),
+        "index": pa.array([e * frames + t for t in range(frames)], type=pa.int64()),
+        "task_index": pa.array([0] * frames, type=pa.int64()),
+    })
     pq.write_table(
-        pa.table({"observation.state": column(state), "action": column(action)}),
+        table,
         os.path.join(root, "data", "chunk-000", "episode_%06d.parquet" % e),
+        compression="NONE",
     )
 for i in range(episodes * frames):
     tile = bytes(((j + 13 * i) % 256) for j in range(tile_bytes))
@@ -645,12 +659,14 @@ fn act_training_uses_baked_observations() {
     );
 
     println!(
-        "RAN ir_training: loss {initial:.4} -> {final_:.4} over {ORACLE_STEPS} steps \
-         ({:.3}x), chunk {:?}, max_abs vs a direct forward {:e} (tol {:e}), torch {}",
+        "RAN act_training_uses_baked_observations: loss {initial:.4} -> {final_:.4} over \
+         {ORACLE_STEPS} steps ({:.3}x), chunk {:?}, max_abs vs a direct forward {:e} \
+         (tol {:e}), observation_hash {}, torch {}",
         final_ / initial,
         chunk.shape,
         equivalence.max_abs,
         Tolerance::TIER4_FP32.abs,
+        report["observation_hash"].as_str().unwrap_or("?"),
         info.version
     );
 }

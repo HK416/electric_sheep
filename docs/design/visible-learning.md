@@ -907,6 +907,164 @@ measurement of ACT — it is a measurement of ACT fed an observation it was not 
 and 1.5 MB for an H.264 copy through the server's own `ffmpeg 7.0.2` over the same raw
 frames. The mp4 is not in the hash chain (section 9); the frames are.
 
+### 7.9 As built (V2b): the training set goes through the Observation IR
+
+Section 7.8's table was not a measurement of ACT. Open question 11 named why, section 7.6's
+finding 3 had predicted it a packet earlier, and V2b is the repair the finding already
+specified: "an `es` step that bakes the observation plan over a dataset, which is a packet and
+not a line."
+
+**The defect, stated once more as a root cause.** The symptom was one missing `Normalize`. The
+cause was that one Observation IR node had two implementations — `train_act.py`'s `dequantize`
+was `Op::Dequantize` written a second time in Python — and once a node can have two
+implementations, the *set* of nodes training applies is a second thing to keep in sync too.
+That is how the state branch's `Normalize{Range −1..1}` went missing without anyone deciding to
+drop it. Patching training to also normalize the state would have fixed the symptom and left
+the mechanism; there is no version of that fix that survives the demo's Observation IR growing
+a third node.
+
+**`es dataset bake --policy <bundle.esb> --out <dir> [--frames <tiles>] <root>`.** It runs every
+recorded frame through `es_eval::ObservationBake`, which is `capture` with a dataset row where
+the physics state was: the same `CpuPlan::compile(obs, PlanMode::Release)`, the same
+`input_sources` resolution, the same `f64 -> f32` input encoding, the same `plan.reset()` per
+episode. Not "the same logic" — the same functions, called from two places
+(`crates/es-eval/src/bake.rs`, `crates/es-eval/src/runner.rs`). It writes one safetensors per
+episode carrying `[frames, ...]`-shaped tensors under the Observation IR's **own output names**
+plus `action`, and a `manifest.json` with `observation_hash`, `task_hash`, `compiler_hash` and
+the dataset's content hash. `train_act.py` reads that and lost `read_dataset`, `read_frames`,
+`dequantize` and `plan_inputs` — 321 lines became 269, and the count that matters is that the
+number of Observation IR node implementations in this repository went from two to one.
+
+**Three things the plan above did not know.**
+
+**1. `input_sources` had to learn that there may be no model.** At inference an input resolves
+against `ModelInfo` first — a joint's `qpos` range, a sensor's range — and only then against the
+Task IR's `ObservationSpec`. A recorded dataset has no loaded model: it carries
+`observation.state` and tiles. Rather than write a second resolver, `input_sources` takes
+`Option<&ModelInfo>`, and with `None` the two model-indexed arms are simply unavailable, so an
+observation the bake cannot feed is *one error before the first frame* naming the port — the
+same discipline V3 gave the runner (finding 1 of section 7.8), for the same reason. The demo's
+`StateInput` names a body and resolves through `ObsSource::JointState { body, dof }` either way,
+which is why it bakes at all.
+
+**2. The oracle can be bit identity, and it needs no Python, no GPU and no physics backend.**
+`a_baked_frame_is_bit_identical_to_what_capture_serves` runs a real evaluation over a
+demo-shaped Observation IR (`StateInput -> Normalize{−1..1}` **and**
+`ImageInput -> Dequantize -> Normalize{0..1}`) with a frame source that records the `StateView`
+it was handed alongside the tile it served, and a `PolicyRuntime` that records every observation
+map it received. The same rows and tiles then go through `ObservationBake`, and every output
+tensor of every frame must be byte-equal — 50 frames x 2 ports in the fixture. There is no
+tolerance, because a tolerance would mean one of the two paths had grown a conversion of its
+own. It also asserts that both nodes *fire* (`(q + 1) / 2` on the state, a changed tile on the
+image), so it cannot pass by comparing two copies of the raw input, which is exactly how the old
+arrangement would have passed.
+
+**3. `pretrained` is rejected, and open question 6 closes with it.** V2 found the lowering
+ignored `VisionEncoder{pretrained}`. Honouring it is one line — `weights="DEFAULT"` in
+`_backbone` — and it is the wrong line: `EsPolicy()` would fetch ImageNet weights over the
+network at *every* construction, including inside `TorchRuntime::load` at inference, where
+`load_state_dict(strict=True)` overwrites all of them a moment later. A lowering that needs the
+network to instantiate contradicts §2.5, and weights nobody hashed are outside the chain (§5.3).
+So `lower_to_torch` returns `LowerError::Unsupported` naming the flag and both ways out, and the
+demo's `learning.toml` now says `pretrained = false` — which is what V2 was doing anyway. It
+moves `learning_hash` and `policy_hash`; `task_hash` and `observation_hash` do not move, so the
+baked set and `evaluation.toml` are untouched. `es_ir::learning::testing::act_like` keeps
+declaring `true`, because that is what ACT is; the two `es-policy` tests that lower it clear the
+flag through one shared helper.
+
+**What was measured, on the oracle server (RTX 4090, `~/venvs/es-lerobot-cuda`, torch 2.11.0+cu129
+for training, `~/venvs/es/bin/python` mujoco 3.13.0 for evaluation), 2026-09-15.** Every knob is
+V2's: the same 50-episode dataset and tiles, `--batch 8 --lr 1e-4 --seed 0`, checkpoints at
+1k/5k/20k. One variable moved, and it is the observation. The bake is 17,697 frames, 1.9 GB of
+safetensors, `observation_hash f4a50730…55f6e0` — the same hash `evaluation.toml` declares, so the
+baked set, the bundle and the evaluation document all name one Observation IR. The lowering is
+byte-identical to V2's (`lowering_hash 956abb67…ec6d`), which is the cleanest possible statement
+that the architecture did not move.
+
+Training loss, L1 over the action chunk, mean of the 100 steps ending at each mark, beside V2's:
+
+| step | 1 | 100 | 1,000 | 5,000 | 20,000 |
+|---|---|---|---|---|---|
+| V2 (raw state) | 0.7267 | 0.1825 | 0.0507 | 0.0309 | 0.0171 |
+| V2b (baked) | 0.7261 | 0.2085 | 0.0528 | 0.0325 | 0.0166 |
+
+They are the same curve, and that is the expected result: the state fix is an affine map of one
+input, which an optimizer absorbs. **The loss could never have detected this defect**, which is
+why the oracle for it is bit identity and not a threshold.
+
+Success rate, 16 held-out episodes on seeds 101-116, beside section 7.8's:
+
+| checkpoint | V3 nominal | V2b nominal | V2b mean episode length |
+|---|---|---|---|
+| 1,000 steps | 0.0625 (1/16) | 0.1250 (2/16) | 861.8 |
+| 5,000 steps | 0.0000 (0/16) | 0.0625 (1/16) | 859.3 |
+| 20,000 steps | 0.1250 (2/16) | 0.0000 (0/16) | 900.0 |
+
+Three successes out of 48 episodes either way. The sweep did not get better and it did not get
+worse; it moved around, which is what a table decided by something other than the policy looks
+like.
+
+and the 20,000-step checkpoint across the suite, 16 episodes each:
+
+| suite | V3 | V2b |
+|---|---|---|
+| nominal | 0.1250 | 0.0000 |
+| light_intensity | 0.0625 | 0.0000 |
+| light_direction | 0.1250 | 0.0000 |
+| observation_delay | 0.1250 | 0.0000 |
+| torque_noise | 0.0000 | 0.0000 |
+| backlash | 0.0000 | 0.0000 |
+
+Every V2b cell has `episode_length 900.00` and `envelope_violation_rate 1.0000`.
+
+**`evaluation.toml` asks for `success_rate >= 0.5`. The best cell measured `0.1250` and the
+20,000-step suite measured `0.0000`. It fails, and nothing was lowered to make it not fail.** V3's
+own non-vacuity gate fails on the 20,000-step bundle too: `visible_learning_demo_run` panics with
+*"non-vacuity: no suite produced a single Success episode"*, which is the gate doing its job.
+86,400 frames, 77,880 `Clamped`, 8,520 `Fallback` — and, exactly as in V3, **not one step in any
+run was `ActionSource::Policy`**, in the nominal sweep either (1k: 12,428 / 1,360 / 0; 5k: 12,388 /
+1,360 / 0; 20k: 12,980 / 1,420 / 0).
+
+**So the observation was not what was stopping the arm, and V2b's real result is the next defect,
+measured rather than guessed.** Three numbers say what is:
+
+1. **The policy imitates well.** On a baked training frame the chunk's first action tracks the
+   recorded action to within 0.02-0.16 rad per joint (t = 312 of episode 0: policy
+   `+0.801 −0.727 +0.718 +1.551 −0.008 −0.076`, recorded
+   `+0.773 −0.567 +0.661 +1.464 +0.000 −0.050`). Fed the observation it was trained on, ACT
+   reproduces the demonstration. That claim could not be made before this packet.
+2. **The violation is `Velocity`, on 90% of steps.** Decoding the `ViolationKind` bitsets in
+   `events.json`: `Velocity` 77,880 (0.901), `Acceleration` 76,868 (0.890), `RateLimit` 72,467
+   (0.839), `Position` 16,093 (0.186), `ViolationRate` 8,520 (0.099). The last one is the
+   watchdog that produces every `Fallback`.
+3. **The demonstrations' commands lead their own joint positions by four times the envelope's
+   per-step budget.** `SafetyPlane` clamps velocity as `(cmd − last_safe) / dt` against
+   `velocity_max = 3.0`, so a command may move `3.0 × 0.02 = 0.0600` rad per control step — and
+   the recorded `action` column's own step-to-step delta maxes at exactly `0.0600`, because
+   `es loop collect` records the **post-plane** command and the scripted expert saturates it.
+   Meanwhile `|action[t] − qpos[t]|`, the position servo's steady-state tracking error, is a
+   median **0.2413** rad and reaches 0.7831. ACT learns to emit `qpos + 0.24`; the plane will let
+   the command advance 0.06 per step; the gap is structural and never closes, so the arm is
+   velocity-clamped from the first step of every episode and the violation-rate watchdog latches
+   into `hold_position` about a tenth of the time.
+
+None of that is an Observation IR problem and none of it is fixable inside this packet:
+`es-safety`, `es-env` and the demo's `deployment.toml` are all in V2b's `forbidden` list, and
+INV-12 forbids the one shortcut. It is the next packet, and it is V1/V3-shaped — the
+demonstrations' action convention and the Deployment IR's envelope were never checked against each
+other. **Open question 12** below asks which end moves.
+
+The honest reading, then: section 7.8's table was a measurement of ACT fed an observation it was
+not trained on; this one is a measurement of the Safety Plane refusing a policy that faithfully
+imitates demonstrations recorded through a tighter interpretation of the same envelope. The demo
+still does not work, but it now fails for a reason with a number attached to it.
+
+**Video.** `es video mosaic --grid 4x4` over the 16 nominal cells and `python/es/encode_video.py
+--fps 50`, the same pipeline V3 used, over the retrained checkpoints: 900 frames of 384x392 each,
+`demo-{1000,5000,20000}.mp4` at 13.0 / 11.6 / 11.4 MB `mp4v` and 1.9 / 1.7 / 1.7 MB for the H.264
+copies through the server's `ffmpeg 7.0.2`. The mp4 is not in the hash chain (section 9); the
+frames are.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -1004,9 +1162,11 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
    H.264 copy of the same raw mosaic frames costs one pipe and is 7x smaller (1.5 MB against 10.5 MB for 18
    seconds). Nothing was installed and `encode_video.py` is unchanged; the H.264 file is a second view of
    the same frames, not a second pipeline.
-6. **Pretrained backbone.** Whether `_backbone("resnet18", 512)` loads ImageNet weights, and therefore
-   whether training needs the network, is unverified. Default: train from scratch on the demo's small image
-   if it does.
+6. **Pretrained backbone.** ~~Whether `_backbone("resnet18", 512)` loads ImageNet weights, and therefore
+   whether training needs the network, is unverified.~~ **Answered (V2, V2b).** It does not: no `weights=`
+   argument is passed, so training is from scratch and needs no network. V2 found the IR's
+   `pretrained = true` was being *ignored*; V2b makes `lower_to_torch` refuse it instead, and the demo's
+   `learning.toml` now declares `false` (section 7.9).
 7. **PNG.** Default: raw `.bin` + sidecar, the existing golden format (section 7.2). Add a PNG encoder only
    if a human wants to open frames in an image viewer.
 8. **CPU-only PyTorch on a 4090** (section 2.9). Default: accept it and state no training time. A human
@@ -1017,10 +1177,27 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
 10. **Gate 7.** Does closing plan V close §28.7 gate 7 as met with the SO-101 / cube-into-bin substitution
     recorded, or does gate 7 stay open for a Franka with two RGB views? Default: record it met, with the
     substitution and the `Target / Status: unverified` rows of section 1 named in the M5 review.
-11. **The state port is normalized at inference and not in training** (section 7.8). `train_act.py` feeds
-    the raw `observation.state` row; the Observation IR puts `Normalize{Range −1..1}` between `StateInput`
-    and the Learning IR input, so the policy sees `(q + 1) / 2` at evaluation and saw `q` while training.
-    Every success rate in section 7.8 is depressed by it. Default: make training bake the compiled
-    observation plan (the "real fix" section 7.6 finding 3 already names) and retrain — which is a V2-shaped
-    packet, not a line. The cheap alternative, dropping the state `Normalize` from the demo's Observation
-    IR, moves `observation_hash` and invalidates the packed bundles, so it is not cheaper.
+11. ~~**The state port is normalized at inference and not in training** (section 7.8).~~ **Answered
+    (V2b).** The default was taken: `es dataset bake` runs the dataset through the same Observation IR
+    executor `capture` uses, `train_act.py` reads the baked set, and the demo was retrained on it with
+    V2's exact knobs. `observation_hash` did not move, so the packed bundles and `evaluation.toml` stayed
+    valid — the cheap alternative (dropping the state `Normalize`) would have moved it. Section 7.9 has
+    the new table beside V3's.
+12. **The demonstrations' commands and the Deployment IR's envelope were never checked against each
+    other, and that is what stops the arm** (section 7.9). Measured: `SafetyPlane` lets a command
+    advance `velocity_max * dt = 3.0 * 0.02 = 0.0600` rad per control step, while the recorded
+    `action` column leads its own `qpos` by a median **0.2413** rad — the position servo's
+    steady-state tracking error, which ACT faithfully learns to emit. So a policy that imitates the
+    demonstrations perfectly is velocity-clamped from the first step of every episode,
+    `envelope_violation_rate` is `1.0`, and the violation-rate watchdog latches into
+    `hold_position` about a tenth of the time. Three ends could move and a human should pick one,
+    because they are not equivalent: **(a)** record `action` as the *next commanded position* rather
+    than the servo target, which is a V1 change and re-collects the dataset; **(b)** give the
+    Learning IR a delta action space so the policy emits `qpos + delta` and the plane sees a ramped
+    command, which is an IR change and moves `learning_hash`; **(c)** widen `velocity_max` for the
+    demo's Deployment IR to something the demonstrations actually fit, which is the INV-12-legal
+    move (widen the envelope, never disable the plane) but makes the demo's envelope no longer the
+    one the demonstrations were recorded through. Default, and the cheapest honest one: **(c) first,
+    to find out whether the policy can do the task at all**, then (a) or (b) to earn the tight
+    envelope back. V2b does none of them — it is forbidden from `es-safety`, `es-env` and
+    `deployment.toml` — and its contribution is that the number above exists.

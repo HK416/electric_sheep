@@ -294,7 +294,9 @@ fn rows(
             )))
         }
     };
-    if n == 0 || flat.len() % n != 0 {
+    // `flat.is_empty()` is not covered by the modulo: `0 % n == 0`, and `chunks_exact(0)`
+    // panics rather than yielding nothing.
+    if n == 0 || flat.is_empty() || flat.len() % n != 0 {
         return Err(CliError::Runtime(format!(
             "`{name}` holds {} values across {n} frames, which is not a whole row per frame",
             flat.len()

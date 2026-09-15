@@ -31,11 +31,17 @@ crates/es-eval/tests/evaluation.rs
 crates/es/src/cmd/dataset.rs
 crates/es/tests/cli.rs
 crates/es-policy/src/lower/torch.rs
+crates/es-policy/src/lower/mod.rs
+crates/es-policy/src/weights.rs
 crates/es-policy/tests/ir_training.rs
 python/es/train_act.py
+python/es/README.md
+python/es/README.ko.md
 tests/fixtures/visible-learning/learning.toml
 docs/design/visible-learning.md
 docs/design/visible-learning.ko.md
+docs/packets/M5/V2-act-training.md
+docs/packets/M5/V2-act-training.ko.md
 docs/packets/M5/V2b-observation-bake.md
 docs/packets/M5/V2b-observation-bake.ko.md
 ```
@@ -168,7 +174,7 @@ impl ObservationBake {
 
 ```
 es dataset bake --policy <bundle.esb> --out <dir> [--frames <tiles>] <dataset-root>
-# <dir>/episode-000000.safetensors   { "<obs output>": [frames, ...], "action": [frames, dim] }
+# <dir>/episode_000000.safetensors   { "<obs output>": [frames, ...], "action": [frames, dim] }
 # <dir>/manifest.json                observation_hash, task_hash, compiler_hash,
 #                                    dataset_content_hash, episodes[], tensors{}, frames
 ```
@@ -204,3 +210,26 @@ es dataset bake --policy <bundle.esb> --out <dir> [--frames <tiles>] <dataset-ro
   `ir_training.rs`. A measurement that fails its acceptance is reported as failing it.
 - Retraining with anything V2 did not use: same seed, same batch, same learning rate, same step
   counts. One variable moves in this experiment, and it is the observation.
+
+### artifacts (oracle server, RTX 4090; nothing below is committed)
+
+Everything lives under `~/artifacts/plan-v/v2b/` on the oracle server; the small ones were copied
+to the requester's `target/plan-v/v2b/`. Frames, tiles and checkpoints are not committed (section
+9: the frames are the evidence, the mp4 is a view of them).
+
+| Artifact | How | Size / value |
+|---|---|---|
+| `untrained.esb` | `cargo test -p es --test cli dataset_bake_writes`, then its `policy.esb` | 27 KB; rebuilt because `learning.toml`'s `pretrained` moved `learning_hash` |
+| `build/` | `es policy lower --policy untrained.esb` | `lowering_hash 956abb67…ec6d` — **byte-identical to V2's**, so the architecture did not move |
+| `baked/` | `es dataset bake --policy untrained.esb --frames frames-train ds-train` | 50 episodes, 17,697 frames, 1.9 GB, `observation_hash f4a50730…55f6e0` |
+| `model-1000.safetensors` | `train_act.py --baked baked/ --batch 8 --lr 1e-4 --seed 0 --device cuda --checkpoint-at 1000,5000,20000` | 61 MB, blake3 `f9760461ac3a84be1b07ff79718bbc1f30a65999e14508c4c1e8ae90586d1de6` |
+| `model-5000.safetensors` | the same run | blake3 `fe8f5405f092696daa0cfbfff5a3e57fab3e111ac4b9784d5edc989193a3dc8f` |
+| `model-20000.safetensors` | the same run | blake3 `3f50335ecb29035cc7a9845ef20eea52229ea2dc642fb654443abd50fa2a92b9` |
+| `trained-20000.esb` | `es policy pack --policy untrained.esb --weights model-20000.safetensors` | `policy_hash a07b04fc99b55fa49e6213e3aa3af10be63a38ff3172277a4b64eafb5fe365be` |
+| `loss-curve.json` | `--loss-curve` | 20,000 per-step L1 losses |
+| `nominal-{1000,5000,20000}/` | `es eval run --config evaluation-nominal.toml --frames` | 16 cells each, 13,788 / 13,748 / 14,400 frames |
+| `demo-{1000,5000,20000}.mp4` | `es video mosaic --grid 4x4` + `encode_video.py --fps 50` | 900 frames of 384x392; 13.0 / 11.6 / 11.4 MB `mp4v`, 1.9 / 1.7 / 1.7 MB H.264 |
+
+The blake3 values are the `weights_hash` `es policy pack` printed, which is `blake3` of the
+checkpoint file (`crates/es-compile/src/bundle.rs`). The 20,000-step checkpoint is **not**
+committed.

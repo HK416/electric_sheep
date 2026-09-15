@@ -42,12 +42,14 @@ video mosaic` itself is pure Rust. Needs a Python with `opencv-python`:
 ## `train_act.py`
 
 Also unrelated to the builder: `train_act.py` is the optimizer half of the spec 2.3 training
-split (M5 V2, design note `docs/design/visible-learning.md` sections 6, 7.6). It is the **only**
-Python in that packet — `es policy lower` and `es policy pack` are Rust and need no interpreter.
+split (M5 V2/V2b, design note `docs/design/visible-learning.md` sections 6, 7.6, 7.9). It is the
+**only** Python in that packet — `es policy lower`, `es dataset bake` and `es policy pack` are
+Rust and need no interpreter.
 
 ```
 es policy lower --policy untrained.esb --out build/
-<venv>/bin/python python/es/train_act.py --module build/ --dataset ds/ --out model.safetensors \
+es dataset bake --policy untrained.esb --out baked/ --frames tiles/ ds/
+<venv>/bin/python python/es/train_act.py --module build/ --baked baked/ --out model.safetensors \
     [--epochs N] [--batch N] [--lr F] [--seed N] [--device cuda] \
     [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json]
 es policy pack --policy untrained.esb --weights model.safetensors --out trained.esb
@@ -65,17 +67,18 @@ It writes safetensors keyed exactly as `build/contract.json` declares, so `es po
 check every key and shape before admitting it into a bundle (spec 25.1). No format that can
 execute code on load is read or written anywhere on this path (`INV-16`).
 
-Two things it needs to be told about, both recorded in the design note:
+Three things it needs to be told about, all recorded in the design note:
 
-- the dataset is read with `pyarrow` straight off disk, not through
-  `lerobot.datasets.LeRobotDataset`, which refuses this repo's `codebase_version: "v2.1"`;
-- pixels are the `<NNNNNN>.bin` tiles `es loop collect --frames` wrote, one per control step, in
-  dataset frame order. Without `--frames` an image port is fed zeros and said so in the output
-  JSON, because a silently-zero input is the failure mode that looks like a trained policy;
-- the HWC `u8` tile becomes a CHW `f32` input here rather than in the Observation IR's plan. That
-  is the one place in the repo where an IR node (`Op::Dequantize`) has a second implementation,
-  and it holds only while the demo's Observation IR is exactly `ImageInput -> Dequantize -> sink`;
+- **it implements no Observation IR node.** `--baked` is the output of `es dataset bake`, which ran
+  every recorded frame through the same `CpuPlan` `es eval run` runs at inference. V2 read the
+  parquet with `pyarrow` and re-implemented `Op::Dequantize` here, and fed the state port the raw
+  `observation.state` row while the Observation IR normalizes it — so the policy trained on one
+  observation and was evaluated on another (section 7.9, open question 11). That is why this file
+  now reads one format and nothing else;
+- a contract input with no baked tensor is a refusal, not a zero-filled port, which retires the
+  "silently zero" failure mode V2 had to warn about;
 - the lowered module is single-sample, so `--batch N` accumulates N samples into one optimizer
   step rather than running one batched forward.
 
-Needs a Python with `torch`, `torchvision` and `pyarrow`.
+Needs a Python with `torch` and `torchvision`. `pyarrow` is no longer read here — `es dataset
+bake` does the dataset reading, in Rust.
