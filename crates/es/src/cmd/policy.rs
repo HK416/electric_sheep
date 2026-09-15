@@ -303,14 +303,32 @@ fn import_lerobot(args: &[String]) -> Result<u8, CliError> {
         hash: weights_hash(&remapped),
     };
 
-    // Spec 8.1: the preprocessor is described in the IR and the network is opaque. Every node
-    // this demo's preprocessing needs is in the Observation IR, so nothing is left for the
-    // Learning IR's own graph to hold — and an empty graph is the honest way to say that the
-    // architecture is the checkpoint's, not ours.
+    // Spec 8.3, verbatim: "pi0 3.5B is not decomposed into nodes. It is referenced whole via
+    // `PolicyBundle`, but its input/output contract (spec 8.4) is type-checked." That is this
+    // situation — the spec's own risk register even names it as the fallback for "Learning IR
+    // cannot express real policies" — so the graph is one `PolicyBundle` node carrying the
+    // contract's ports, and no decomposition is invented.
+    //
+    // The graph *boundary* stays empty, and that is the deliberate part. Spec 5.4's "a network
+    // must not be fed raw" is enforced on `LearningGraph::inputs`, the ports that feed
+    // IR-described nodes; a whole-VLA reference has none, and its normalization is inside the
+    // referenced artefact — for ACT, `normalize_inputs`, which our lowering carries as nodes
+    // 9/10 and which is the first operation of the forward pass. What is type-checked is the
+    // contract, by `XIR-010` against the Observation IR's outputs, exactly as spec 8.3 says.
+    let mut nodes = Graph::new(1);
+    nodes.insert(
+        es_ir::graph::NodeId(0),
+        es_ir::learning::LearningNode::PolicyBundle {
+            inputs: policy.contract.inputs.values().cloned().collect(),
+            weights: policy.weights.clone(),
+            action_dim: policy.contract.action_dim,
+            horizon: policy.contract.horizon,
+        },
+    );
     let learning = LearningGraph {
         schema_version: 1,
         inputs: Vec::new(),
-        nodes: Graph::new(1),
+        nodes,
         outputs: Vec::new(),
         policy,
     };
