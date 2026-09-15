@@ -420,9 +420,9 @@ impl ExpertCfg {
     /// bound on the *command* and the arm is what has to follow it.
     ///
     /// `replan_every` is how many rows of each chunk actually execute before the caller asks
-    /// for another one: `es loop collect` runs inference at the deployment's `rate.inference`
-    /// and executes `action.execute_chunk` rows, while `es_eval::runner` calls the policy once
-    /// per **control** tick and therefore executes exactly one (packet M5/V6). Getting it
+    /// for another one: since packet M5/V17 that is the deployment's own re-plan period,
+    /// `min(rate.control / rate.inference, action.execute_chunk)`, on the collection path and
+    /// the evaluation path alike ([`replan_interval`](crate::replan_interval)). Getting it
     /// wrong is not a safety question -- the plane clamps either way -- but the expert's
     /// command integrator would run ahead of the arm and every tick would be corrected.
     pub fn pace_to(&mut self, deploy: &es_ir::deployment::DeploymentIr, replan_every: u32) {

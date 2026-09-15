@@ -3836,6 +3836,15 @@ fn demo_scene_path() -> PathBuf {
 /// expert fails is a harness no policy can pass (design note section 7.12).
 const SEEDS: [u64; 8] = [1, 2, 3, 5, 8, 13, 21, 34];
 
+/// Rows of each chunk the demo executes before the policy is asked again: the Deployment IR's
+/// `rate.control / rate.inference`, capped at `action.execute_chunk` (packet M5/V17). The one
+/// definition `es loop collect` and `es_eval::runner` both drive the expert with.
+fn demo_replan(deploy: &es_ir::deployment::DeploymentIr) -> u32 {
+    es_env::replan_interval(deploy.rate)
+        .expect("the demo's inference rate divides its control rate")
+        .min(deploy.action.execute_chunk as u64) as u32
+}
+
 /// Fraction of the pinned seeds that must end in `Success`. A property of the expert, not a
 /// tuning knob: lowering it to make a change pass is the same as editing a golden.
 const THRESHOLD: f64 = 0.875;
@@ -4029,10 +4038,10 @@ fn expert_passes_the_evaluation_harness() {
     let mut worst_violation = 0.0f64;
     for seed in SEEDS {
         let mut cfg = es_env::expert::demo_cfg(cube);
-        // `es_eval::runner` calls the policy once per control tick, so exactly one row of each
-        // chunk executes before the next one is asked for -- unlike `es loop collect`, which
-        // replans at the deployment's inference rate and executes `execute_chunk` rows.
-        cfg.pace_to(&deploy, 1);
+        // `es loop collect`'s own pacing, which since packet M5/V17 is also the evaluation
+        // runner's: both replan every `rate.control / rate.inference` control ticks and
+        // execute the chunk's rows in between.
+        cfg.pace_to(&deploy, demo_replan(&deploy));
         let expert = es_env::expert::ScriptedExpert::new(&scene, cfg).expect("the expert builds");
         let seen: SeenState = Rc::new(RefCell::new(None));
 
@@ -4283,6 +4292,177 @@ fn collection_and_evaluation_draw_the_same_scene_for_a_seed() {
         a[6],
         a[7],
         a[8]
+    );
+}
+
+/// Packet M5/V17 oracle (b) -- **the two paths execute the expert's chunks identically**, tick
+/// by tick, on one seed.
+///
+/// V6b made `es_eval::runner` feed the Safety Plane through the collector's own
+/// `es_env::plane_chunk`; what it left behind is that the evaluator asked for a fresh chunk
+/// every control tick while the collector asked once per control tick too -- both of them
+/// ignoring the Deployment IR's `rate.inference`. V17 gives both the one rule
+/// (`es_env::replan_interval`), and this is the test that the rule is *the same* rule: the
+/// same scripted expert, the same seed, the same envelope, and every control tick compared.
+///
+/// **What is compared, and at what tolerance.** The per-tick `qpos ‖ qvel` each path hands its
+/// own state hook -- the collector's `FrameSink` and the runner's frame source, both called at
+/// the top of a control step with the backend's `f64` state (packet M5/V12) -- as **raw `f64`
+/// bits**, not rounded. That is the executed action rows read through the physics: the state at
+/// tick `t + 1` is a deterministic function of the command executed at tick `t`, so a single
+/// differing row of a single executed chunk moves it. It is also why the expert is driven from
+/// that hook on both paths rather than from its policy input: the collector hands its policy an
+/// `f32` observation tensor and the runner an Observation IR plan output, and comparing the
+/// *execution* means holding the policy's input fixed.
+///
+/// The sibling `collection_and_evaluation_draw_the_same_scene_for_a_seed` pins the first row;
+/// this pins every row of a `STEPS`-tick episode. **The server oracle** -- it needs `mujoco`.
+#[test]
+fn collection_and_evaluation_execute_the_same_chunks_for_a_seed() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const NJ: usize = 6;
+    const H: usize = 16;
+    const SEED: u64 = 1;
+    /// Long enough to cover the expert's approach, the descent and the grasp, which is where
+    /// its chunks differ most from tick to tick.
+    const STEPS: u32 = 120;
+
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP collection_and_evaluation_execute_the_same_chunks_for_a_seed: {reason}");
+        return;
+    }
+    let dir = scratch_dir("chunk-parity");
+    let bundle_bytes = std::fs::read(write_demo_bundle(&dir)).expect("policy.esb");
+    let bundle = es_compile::PolicyBundle::open(&bundle_bytes).expect("the demo bundle opens");
+    let scene = es_assets::parse_mjcf(
+        &std::fs::read_to_string(demo_scene_path()).expect("the demo scene is in the repo"),
+    )
+    .expect("the demo scene parses")
+    .scene;
+    let cube = scene
+        .joints
+        .iter()
+        .find(|j| j.kind == es_assets::scene::JointKind::Free)
+        .expect("the scene has one free-joint body to pick up")
+        .id;
+    let deploy = &bundle.deployment;
+    let expert = || {
+        let mut cfg = es_env::expert::demo_cfg(cube);
+        cfg.pace_to(deploy, demo_replan(deploy));
+        es_env::expert::ScriptedExpert::new(&scene, cfg).expect("the expert builds")
+    };
+    let row_of = |state: &es_physics_core::backend::StateView<'_>| {
+        let mut row = state.qpos_of(0).to_vec();
+        row.extend_from_slice(state.qvel_of(0));
+        row
+    };
+
+    // --- the collection path ---------------------------------------------------------------
+    let collected: Rc<RefCell<Vec<Vec<f64>>>> = Rc::new(RefCell::new(Vec::new()));
+    let seen: SeenState = Rc::new(RefCell::new(None));
+    let mut policy = ExpertPolicy::<NJ, H> {
+        expert: expert(),
+        seen: Rc::clone(&seen),
+    };
+    {
+        let (trace, seen) = (Rc::clone(&collected), Rc::clone(&seen));
+        let mut sink = |model: &es_physics_core::backend::ModelInfo,
+                        state: &es_physics_core::backend::StateView<'_>| {
+            let row = row_of(state);
+            *seen.borrow_mut() = Some((model.clone(), row.clone()));
+            trace.borrow_mut().push(row);
+            Ok::<(), String>(())
+        };
+        es_data::Collector::run::<es_physics_backend::MuJoCoCpuBackend, _, NJ, H>(
+            &es_data::CollectSpec {
+                bundle: &bundle,
+                scene: &scene,
+                out_root: &dir.join("ds"),
+                traj_dir: None,
+                n_episodes: 1,
+                seed: SEED,
+                max_steps: STEPS,
+            },
+            &mut policy,
+            es_physics_backend::MuJoCoCpuBackend::new,
+            &mut |_, _, _, _| es_data::Intervention::Policy,
+            Some(&mut sink),
+        )
+        .expect("the demo collects one episode");
+    }
+
+    // --- the evaluation path -----------------------------------------------------------------
+    let evaluated: Rc<RefCell<Vec<Vec<f64>>>> = Rc::new(RefCell::new(Vec::new()));
+    let seen: SeenState = Rc::new(RefCell::new(None));
+    let mut policy = ExpertPolicy::<NJ, H> {
+        expert: expert(),
+        seen: Rc::clone(&seen),
+    };
+    let mut ir = demo_evaluation_ir(
+        hex(&bundle.task.task_hash().expect("task hash")),
+        hex(&bundle.observation.observation_hash().expect("obs hash")),
+    );
+    ir.episodes = es_ir::evaluation::EpisodeBatch {
+        n_episodes: 1,
+        seeds: es_ir::evaluation::SeedPlan::Explicit(vec![SEED]),
+    };
+    ir.suites.truncate(1);
+    assert_eq!(ir.suites[0].name, "nominal");
+    {
+        let (trace, seen) = (Rc::clone(&evaluated), Rc::clone(&seen));
+        let blank = vec![0u8; 96 * 96 * 3];
+        let mut frames =
+            move |_light: &es_eval::LightOverride,
+                  model: &es_physics_core::backend::ModelInfo,
+                  state: &es_physics_core::backend::StateView<'_>| {
+                let row = row_of(state);
+                *seen.borrow_mut() = Some((model.clone(), row.clone()));
+                trace.borrow_mut().push(row);
+                Ok::<Vec<u8>, String>(blank.clone())
+            };
+        es_eval::Evaluation::run_with_frames::<es_physics_backend::MuJoCoCpuBackend, _, NJ, H>(
+            &ir,
+            &bundle.task,
+            &scene,
+            &bundle.observation,
+            &mut policy,
+            deploy,
+            es_physics_backend::MuJoCoCpuBackend::new,
+            &es_eval::RunConfig {
+                max_steps: Some(STEPS),
+                ..es_eval::RunConfig::default()
+            },
+            Some(&mut frames),
+            None,
+        )
+        .expect("the demo evaluates one episode");
+    }
+
+    let (a, b) = (collected.borrow(), evaluated.borrow());
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "the two paths ran different numbers of control ticks for seed {SEED}"
+    );
+    assert_eq!(a.len(), STEPS as usize, "the episode ran the whole budget");
+    for (tick, (x, y)) in a.iter().zip(b.iter()).enumerate() {
+        for (i, (x, y)) in x.iter().zip(y).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "tick {tick}, element {i}: `es loop collect` is at {x} and `es eval run` at \
+                 {y}. The two paths executed different chunk rows, so they are not replanning \
+                 at the same cadence (packet M5/V17)"
+            );
+        }
+    }
+    println!(
+        "RAN collection_and_evaluation_execute_the_same_chunks_for_a_seed: {} control ticks \
+         bit-identical, one inference every {} of them",
+        a.len(),
+        demo_replan(deploy)
     );
 }
 
@@ -6406,7 +6586,7 @@ fn a_showcase_replay_reproduces_the_frames_the_policy_saw() {
     let traj_dir = dir.join("traj");
 
     let mut cfg = es_env::expert::demo_cfg(cube);
-    cfg.pace_to(&deploy, 1);
+    cfg.pace_to(&deploy, demo_replan(&deploy));
     let expert = es_env::expert::ScriptedExpert::new(&scene, cfg).expect("the expert builds");
     let seen: SeenState = Rc::new(RefCell::new(None));
     let mut policy = ExpertPolicy::<NJ, H> {
@@ -6846,8 +7026,8 @@ fn the_temporal_ensemble_survives_the_grasp_window() {
 
     let mut cfg = es_env::expert::demo_cfg(cube);
     // `es loop collect`'s own pacing (`crates/es/src/cmd/loop.rs`): the expert integrates its
-    // command over `execute_chunk` rows per replan.
-    cfg.pace_to(&deploy, deploy.action.execute_chunk as u32);
+    // command over the rows one chunk executes per replan.
+    cfg.pace_to(&deploy, demo_replan(&deploy));
     let (grip_open, grip_closed) = (cfg.grip_open, cfg.grip_closed);
     let mut expert = es_env::ScriptedExpert::new(&scene, cfg).expect("the expert builds");
     let mut env = es_env::Env::new(

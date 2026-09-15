@@ -348,10 +348,13 @@ fn build_expert(
         )));
     };
     let mut cfg = demo_cfg(joint.id);
-    // The collector replans at the deployment's inference rate and executes `execute_chunk`
-    // rows before the next chunk arrives; `es_eval::runner` replans every control tick and
-    // executes one. `ExpertCfg::pace_to` is the one definition both use (packet M5/V6).
-    cfg.pace_to(deploy, deploy.action.execute_chunk as u32);
+    // Both paths replan at the deployment's inference rate and execute the chunk's rows in
+    // between, so the rows that actually execute per chunk are the re-plan period -- one
+    // definition, one number, on collection and evaluation alike (packet M5/V17).
+    let replan = es_env::replan_interval(deploy.rate)
+        .map_err(|e| CliError::Runtime(e.to_string()))?
+        .min(deploy.action.execute_chunk as u64);
+    cfg.pace_to(deploy, replan as u32);
     ScriptedExpert::new(scene, cfg).map_err(|e| CliError::Runtime(e.to_string()))
 }
 

@@ -28,7 +28,7 @@ pub mod traj;
 
 pub use chunk_buffer::{plane_chunk, ChunkBuffer, PlaneFeed, CHUNK_SLOTS};
 pub use control::{ControlExecutor, StageOutcome, StageState};
-pub use domains::{DomainRunner, DomainSizing};
+pub use domains::{replan_interval, DomainRunner, DomainSizing};
 pub use env::{Env, EnvMetrics, StepOutcome};
 pub use episode::{Episode, EpisodeRecorder, Termination};
 pub use expert::{so101_ik, ExpertCfg, Links, ScriptedExpert, Stage};

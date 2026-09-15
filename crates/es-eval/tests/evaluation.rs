@@ -741,6 +741,145 @@ fn run_ok(ir: &EvaluationIr) -> EvaluationReport {
 
 // --- Tests --------------------------------------------------------------------------------
 
+/// A `PolicyRuntime` that counts the calls and commands nothing.
+///
+/// Zero rows still go through the Safety Plane -- counting is not a bypass (`INV-12`).
+struct CountingPolicy {
+    calls: u64,
+}
+
+impl PolicyRuntime for CountingPolicy {
+    fn load(
+        &mut self,
+        _graph: &LearningGraph,
+        _weights: &WeightsSource,
+    ) -> Result<PolicyInfo, PolicyError> {
+        Err(PolicyError::NotLoaded)
+    }
+
+    fn infer(
+        &mut self,
+        _inputs: &BTreeMap<String, Tensor>,
+    ) -> Result<BTreeMap<String, Tensor>, PolicyError> {
+        self.calls += 1;
+        Ok(BTreeMap::from([(
+            "action".to_owned(),
+            Tensor {
+                dtype: ElemType::F32,
+                shape: vec![H as u64, NJ as u64],
+                data: vec![0u8; H * NJ * 4],
+            },
+        )]))
+    }
+
+    fn info(&self) -> Option<&PolicyInfo> {
+        None
+    }
+
+    fn runtime_hash(&self) -> [u8; 32] {
+        [11; 32]
+    }
+}
+
+/// One `n_episodes = 1` nominal run of `steps` control steps at a declared inference rate,
+/// returning the policy calls it took and the `episode_length` the report measured.
+fn replan_run(inference: TickRate, steps: u32) -> Result<(u64, f64), EvalError> {
+    let mut ir = evaluation_ir(7, basic_metrics(), Vec::new());
+    ir.episodes = EpisodeBatch {
+        n_episodes: 1,
+        seeds: SeedPlan::Explicit(vec![7]),
+    };
+    ir.suites.truncate(1);
+    let deploy = DeploymentIr {
+        rate: RateSpec {
+            control: TickRate::hz(CONTROL_HZ),
+            inference,
+        },
+        ..deployment_ir()
+    };
+    // The fixture task stops at 12 steps; the cadence is what is under test, so the budget is
+    // raised to hold `steps` and `RunConfig::max_steps` closes the episode. Its
+    // `Terminate { Success }` fires on `j0 > 0.5` and its reset draws `j0` from `U(-1, 1)`, so
+    // the reset is pinned to zero as well -- the spring-damper decays toward zero under the
+    // zero command, and what is counted is then the cadence and not the draw.
+    let mut task = task_ir();
+    task.config.max_episode_steps = steps;
+    task.graph.insert(
+        NodeId(4),
+        TaskNode::ResetState {
+            target: "qpos[0]".to_owned(),
+            dist: Distribution::Constant(0.0),
+            stream: "reset.j0".to_owned(),
+        },
+    );
+    let obs = observation_ir(task.task_hash().expect("task hashes"), None);
+    let mut policy = CountingPolicy { calls: 0 };
+    let report = Evaluation::run_with_frames::<FakeBackend, _, NJ, H>(
+        &ir,
+        &task,
+        &scene(),
+        &obs,
+        &mut policy,
+        &deploy,
+        FakeBackend::new,
+        &RunConfig {
+            max_steps: Some(steps),
+            ..RunConfig::default()
+        },
+        None,
+        None,
+    )
+    .map(|(report, _lock)| report)?;
+    let length = report
+        .cells
+        .iter()
+        .find(|c| c.metric == MetricSpec::EpisodeLength)
+        .and_then(|c| match c.value {
+            es_ir::evaluation::MetricValue::Scalar(v) => Some(v),
+            _ => None,
+        })
+        .expect("episode_length is a reported metric");
+    Ok((policy.calls, length))
+}
+
+/// Packet M5/V17 oracle (a) -- **the evaluator infers at the rate the Deployment IR declares.**
+///
+/// `rate.control / rate.inference` control ticks pass between two policy calls, and the chunk
+/// drives the ticks in between through the `ChunkBuffer`. Until V17 `es_eval::runner` called
+/// `infer_chunk` on every control tick whatever the document said, so rows 1.. of every chunk
+/// were dead on that path and a policy trained for a 5 Hz re-plan was evaluated at 50 Hz
+/// (design note `docs/design/visible-learning.md` section 7.25).
+///
+/// The fixture's control rate is 100 Hz, so `rate.inference = 10 Hz` is the demo's own 10:1
+/// ratio (50 Hz control against 5 Hz inference) and `100 Hz` is one call per control tick.
+#[test]
+fn the_runner_infers_once_per_declared_replan_period() {
+    for (hz, expect) in [(10u64, 10u64), (CONTROL_HZ, 100)] {
+        let (calls, length) = replan_run(TickRate::hz(hz), 100).expect("the fixture evaluates");
+        assert_eq!(
+            length as u32, 100,
+            "the episode ran the whole budget at {hz} Hz"
+        );
+        assert_eq!(
+            calls, expect,
+            "100 control steps at rate.inference = {hz} Hz against a {CONTROL_HZ} Hz control \
+             rate is {expect} policy calls, not {calls}"
+        );
+    }
+}
+
+/// Packet M5/V17 oracle (a), second half -- a re-plan period that is not a whole number of
+/// control ticks is **refused by name**, not rounded.
+#[test]
+fn an_inference_rate_that_does_not_divide_the_control_rate_is_refused() {
+    let err = replan_run(TickRate::hz(30), 8).expect_err("100 / 30 is not a cadence");
+    let message = err.to_string();
+    assert!(matches!(err, EvalError::Env(_)), "{message}");
+    for part in ["rate.control", "rate.inference", "3.33"] {
+        assert!(message.contains(part), "{part} is not named in: {message}");
+    }
+}
+
 #[test]
 fn the_report_has_one_cell_per_suite_and_metric() {
     let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());

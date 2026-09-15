@@ -388,11 +388,14 @@ impl Collector {
             )));
         }
         let control = deploy.rate.control;
+        // `DomainRunner` reads both of the Deployment IR's rates: it replans every
+        // `rate.control / rate.inference` control ticks and the chunk drives the ticks in
+        // between (packet M5/V17). A rate that does not divide is refused here, by name.
         let mut runner = DomainRunner::<NJ, H>::new(
             env.schedule(),
             contract,
             chunk_blend(&bundle.learning),
-            control,
+            deploy.rate,
         )
         .map_err(|e| bad(&e))?;
         let latency = runner.inference().latency_ticks() as usize;

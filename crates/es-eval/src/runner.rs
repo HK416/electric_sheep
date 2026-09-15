@@ -412,6 +412,13 @@ impl Evaluation {
         // The Deployment IR decides, never a flag: `execution` carries both the mode the plane
         // reads and the blend the chunk buffer applies (spec 8.5, spec 9.2).
         let blend = blend_of(deploy.execution);
+        // The second rate the Deployment IR declares, honoured (packet M5/V17): the policy is
+        // asked for a chunk once every `rate.control / rate.inference` control ticks and that
+        // chunk drives the ticks in between through the buffer below -- the same rule
+        // `DomainRunner` applies on the collection path, so the two execute chunks
+        // identically (design note section 7.25). A rate that does not divide is refused by
+        // name rather than rounded.
+        let replan = es_env::replan_interval(deploy.rate).map_err(EvalError::Env)?;
         let mut perturbations: Option<PerturbationPlan> = None;
         let mut sources: Option<BTreeMap<String, Capture>> = None;
         let mut out = Shard::default();
@@ -473,6 +480,7 @@ impl Evaluation {
                     *seed,
                     idx as u64,
                     max_steps,
+                    replan,
                     control_us,
                     &ms_to_steps,
                     cfg.action_output.as_deref(),
@@ -667,6 +675,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     seed: u64,
     episode: u64,
     max_steps: u32,
+    replan: u64,
     control_us: u64,
     ms_to_steps: &dyn Fn(u32) -> usize,
     action_output: Option<&str>,
@@ -776,12 +785,17 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         } else {
             0
         }];
-        // One policy invocation per control tick, which is what `BatchDomains::single_env()`
-        // declares (inference period 1) and therefore what produced the demonstrations. The
-        // *execution* cadence is the buffer's: a chunk drives `action.execute_chunk` ticks,
-        // or the whole overlap under `TemporalEnsemble` (packet M5/V6b).
-        let chunk = infer_chunk::<NJ, H>(policy, observed, action_output, mode)?;
-        buffer.push(&chunk, u64::from(step));
+        // One policy invocation per **re-plan** period -- `rate.control / rate.inference`
+        // control ticks, the cadence both Deployment IR rates describe and the one
+        // `DomainRunner::infer_window` applies on the collection path (packet M5/V17). The
+        // chunk drives the ticks in between through the buffer: successive rows under a hard
+        // switch, the blend over whatever chunks still overlap under `TemporalEnsemble`.
+        // Before V17 this was every control tick, so row 0 of a fresh chunk was the only row
+        // that ever reached the plane (design note section 7.25).
+        if u64::from(step) % replan == 0 {
+            let chunk = infer_chunk::<NJ, H>(policy, observed, action_output, mode)?;
+            buffer.push(&chunk, u64::from(step));
+        }
         let (fed, _commanded) = plane_chunk(buffer, feed, u64::from(step), mode);
 
         // Before every `validate`, exactly like `es_data::Collector`, `es_ros2::hil` and

@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 
 use es_compile::{CpuPlan, Tensor};
 use es_core::{PhysTick, TickRate};
-use es_ir::deployment::{ExecutionMode, Micros};
+use es_ir::deployment::{ExecutionMode, Micros, RateSpec};
 use es_ir::learning::{ActionExecutionMode, ChunkBlendPolicy, PolicyContract};
 use es_ir::types::ElemType;
 use es_physics_core::backend::{ModelInfo, StateView};
@@ -38,6 +38,34 @@ use crate::chunk_buffer::{plane_chunk, ChunkBuffer, PlaneFeed};
 use crate::inference::{latency_ticks, AsyncInference, Submission};
 use crate::scheduler::Schedule;
 use crate::EnvError;
+
+/// Control ticks between two policy invocations: `rate.control / rate.inference` (§9.2, §12.1).
+///
+/// One inference produces one chunk and that chunk drives this many control ticks through the
+/// [`ChunkBuffer`] before the next one arrives. Before packet M5/V17 every path inferred once
+/// per *control* tick — `BatchDomains::single_env_at` fires the inference domain every control
+/// step — so `rate.inference` was a document nobody read and rows 1.. of every chunk were dead
+/// on both the collection and the evaluation path (design note section 7.25).
+///
+/// A rate that does not divide the control rate is refused by name rather than rounded, the
+/// same way [`BatchDomains::single_env_at`](crate::scheduler::BatchDomains::single_env_at)
+/// refuses a timestep that does not divide the control period: replanning every 3.5 control
+/// ticks is not a cadence (App. B.5).
+pub fn replan_interval(rate: RateSpec) -> Result<u64, EnvError> {
+    // control / inference as an exact rational: (cn/cd) / (in/id) = (cn*id) / (cd*in). Both
+    // rates are `NonZeroU64` pairs, so neither side can be zero.
+    let num = u128::from(rate.control.num()) * u128::from(rate.inference.den());
+    let den = u128::from(rate.control.den()) * u128::from(rate.inference.num());
+    if num % den != 0 {
+        return Err(EnvError::Schedule(format!(
+            "the deployment declares rate.control = {} Hz and rate.inference = {} Hz: one              re-plan period is {} control ticks, which is not a whole number",
+            rate.control.as_hz_f64(),
+            rate.inference.as_hz_f64(),
+            num as f64 / den as f64,
+        )));
+    }
+    Ok((num / den) as u64)
+}
 
 /// The latest observation of one env, and whether inference has seen it yet.
 #[derive(Clone, Debug)]
@@ -65,6 +93,8 @@ pub struct DomainRunner<const NJ: usize, const H: usize> {
     action_port: String,
     mode: ExecutionMode,
     control: TickRate,
+    /// Control ticks between two policy invocations (§9.2). `1` is "every control tick".
+    replan: u64,
     control_tick: u64,
     observations: u64,
     inference_calls: u64,
@@ -73,14 +103,18 @@ pub struct DomainRunner<const NJ: usize, const H: usize> {
 }
 
 impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
-    /// `control` is the control rate — the simulation rate divided by `inference.period` — and
-    /// it is what turns `RuntimeHints::expected_latency_ms` into whole ticks (§12.3).
+    /// `rate` is the Deployment IR's own: `rate.control` — the simulation rate divided by
+    /// `inference.period` — is what turns `RuntimeHints::expected_latency_ms` into whole ticks
+    /// (§12.3), and `rate.control / rate.inference` is how many control ticks one chunk drives
+    /// before the policy is asked again ([`replan_interval`], packet M5/V17).
     pub fn new(
         schedule: &Schedule,
         contract: &PolicyContract,
         blend: ChunkBlendPolicy,
-        control: TickRate,
+        rate: RateSpec,
     ) -> Result<Self, EnvError> {
+        let control = rate.control;
+        let replan = replan_interval(rate)?;
         if contract.action_dim as usize != NJ {
             return Err(EnvError::shape(
                 "action dim",
@@ -107,6 +141,7 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
             mode: execution_mode(contract.execution_mode, blend),
             schedule: schedule.clone(),
             control,
+            replan,
             control_tick: 0,
             observations: 0,
             inference_calls: 0,
@@ -230,7 +265,14 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
         policy: &mut dyn PolicyRuntime,
     ) -> Result<(), EnvError> {
         let period = u64::from(self.schedule.domains().inference.period);
-        if (sim_tick..sim_tick + period).any(|t| self.schedule.at(t).inference) {
+        // **The declared re-plan cadence** (§9.2, packet M5/V17): a chunk is asked for once
+        // every `rate.control / rate.inference` control ticks and drives its own rows in
+        // between through the buffer below. The schedule's inference domain fires every
+        // control step — that is what makes this window one control step long — so this is
+        // where the Deployment IR's second rate enters.
+        if self.control_tick % self.replan == 0
+            && (sim_tick..sim_tick + period).any(|t| self.schedule.at(t).inference)
+        {
             for env in 0..self.latest.len() {
                 if let Some(obs) = &mut self.latest[env] {
                     if !obs.submitted {
@@ -732,7 +774,7 @@ mod tests {
             env.schedule(),
             &contract(),
             ChunkBlendPolicy::TemporalEnsemble { weight_decay: 0.01 },
-            TickRate::hz(250),
+            deployment_ir().rate,
         )
         .expect("the contract matches NJ and H");
         let plane = SafetyPlane::<NJ, H>::from_ir(&deployment_ir()).expect("a valid envelope");
@@ -834,7 +876,7 @@ mod tests {
                 env.schedule(),
                 &contract(),
                 ChunkBlendPolicy::HardSwitch,
-                TickRate::hz(250),
+                deployment_ir().rate,
             )
             .unwrap();
             let mut planes = vec![SafetyPlane::<NJ, H>::from_ir(&deployment_ir()).unwrap(); 16];
@@ -879,7 +921,7 @@ mod tests {
             env.schedule(),
             &contract(),
             ChunkBlendPolicy::HardSwitch,
-            TickRate::hz(250),
+            deployment_ir().rate,
         )
         .unwrap();
         let mut planes = vec![SafetyPlane::<NJ, H>::from_ir(&ir).unwrap(); 16];
@@ -921,10 +963,11 @@ mod tests {
     fn the_contract_must_match_the_const_generics() {
         let s = crate::Schedule::build(&domains(4)).unwrap();
         let blend = ChunkBlendPolicy::HardSwitch;
-        let err = DomainRunner::<3, H>::new(&s, &contract(), blend, TickRate::hz(250)).unwrap_err();
+        let err =
+            DomainRunner::<3, H>::new(&s, &contract(), blend, deployment_ir().rate).unwrap_err();
         assert!(err.to_string().contains("action dim"), "{err}");
         let err =
-            DomainRunner::<NJ, 9>::new(&s, &contract(), blend, TickRate::hz(250)).unwrap_err();
+            DomainRunner::<NJ, 9>::new(&s, &contract(), blend, deployment_ir().rate).unwrap_err();
         assert!(err.to_string().contains("horizon"), "{err}");
     }
 
@@ -944,7 +987,7 @@ mod tests {
             env.schedule(),
             &contract(),
             ChunkBlendPolicy::HardSwitch,
-            TickRate::hz(250),
+            deployment_ir().rate,
         )
         .unwrap();
         let mut planes = vec![SafetyPlane::<NJ, H>::from_ir(&ir).unwrap(); 16];
@@ -1003,7 +1046,7 @@ mod tests {
             env.schedule(),
             &contract(),
             ChunkBlendPolicy::HardSwitch,
-            TickRate::hz(250),
+            deployment_ir().rate,
         )
         .unwrap();
         let mut planes = vec![SafetyPlane::<NJ, H>::from_ir(&deployment_ir()).unwrap(); 2];
