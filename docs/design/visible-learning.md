@@ -3511,10 +3511,12 @@ blocks a scored success. The gripper's peak `qpos` over exactly those ticks is:
 | *(training nominal-08, for scale)* | *0.844* | *success* |
 
 Three of the five never open past 0.41 rad — the old hold, unchanged. The fourth, nominal-05,
-opens to **0.817** and misses the cone by about **three milliradians** against the 0.820 that
-scored, then closes again to −0.009 rad by the end of the episode. So the release is now a
-thing the policy does, and what separates a release from a *scored* release is the last three
-milliradians of jaw travel and whether the jaw stays open.
+opens to **0.817** and misses the 0.85 threshold by about **33 milliradians** (the 0.820 in the row above is the
+last *pre-step* trajectory sample of an episode whose *post-step* state crossed 0.85 on its
+final tick: the predicate is judged post-step, the trajectory records pre-step, packet V12;
+orchestrator's check on `terms.py`: `all3 = 0` for every scored episode), then closes again to −0.009 rad by the end of the episode. So the release is now a
+thing the policy does, and what separates a release from a *scored* release is the last few
+centiradians of jaw travel and whether the jaw stays open.
 
 **What it cost: the envelope.** `envelope_violation_rate` went to **0.9985 / 0.9982** —
 `violation.acceleration` on 23,443 of 26,033 training ticks and 24,815 of 27,559 held-out
@@ -3537,7 +3539,7 @@ showcase videos, no second variable. **V15's checkpoint is still plan V's best p
 is now measurably better than it was reported to be** — every number in sections 7.19 – 7.24
 was taken with the chunk's later rows dead. What V17 leaves is a much narrower target than V16
 did: the cube reaches the bin on 5 of 16 held-out seeds, sits there settled for 90 % of the
-episode, and the jaw opens to within three milliradians of the predicate on one of them.
+episode, and the jaw opens to within about 33 milliradians of the predicate on one of them.
 Open question 22's (ii) — cue the release on something the observation carries — is the next
 variable, and it now has a specific thing to fix rather than a fixed point to escape.
 
@@ -3906,7 +3908,9 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     obstacle is no longer a fixed point. The cube is inside the bin's x span and settled for
     1,557 – 1,618 of 1,800 ticks in every held-out carrying episode, so the only term that ever
     blocks a scored success is the gripper, and the closest miss opens the jaw to 0.817 rad
-    against the 0.820 that scored — **three milliradians** — before closing again. **(ii) is
+    against the 0.85 the predicate asks — **about 33 milliradians** (the scored episodes'
+    last pre-step rows read 0.82 – 0.84 because the predicate is judged post-step) — before
+    closing again. **(ii) is
     now the next variable**: cue the release on something the observation carries, so the jaw
     opens the whole way and stays open. (i), a clock in the Observation IR, is unchanged in
     cost and is still the one that needs a data change beside it.
