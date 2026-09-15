@@ -7,7 +7,7 @@ has been imported yet. Pinned upstream facts live in
 @ `1b86ece`, brax 0.14.2); this note does not restate them, it says what we do about them.
 
 Spec sections this track leans on: §8 (Learning IR), §1.9 (what is never cut and what is cut
-first), §9 (Deployment IR and the Safety Plane), §17 (backends), §28 (why M6 exists).
+first), §9 (Deployment IR and the Safety Plane), §17 (backends), §28.9 (why M6 exists).
 
 ## 1. Why external RL and an import, rather than training here
 

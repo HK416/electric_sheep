@@ -66,7 +66,7 @@ comment invites it. No `Cargo.toml` change: the provenance test uses the system 
 - §18.1: control and inference rates are integer `TickRate`s; the deadlines are whole multiples
   of the control period.
 - §25.1: the provenance test verifies blake3 **before** parsing bytes off the network.
-- §28: the milestone this track belongs to.
+- §28.9: the milestone this track belongs to.
 
 ## oracle
 
