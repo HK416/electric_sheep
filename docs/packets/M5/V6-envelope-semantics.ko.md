@@ -219,6 +219,75 @@ impl ExpertCfg {
   `evaluation.toml`, `.eshil` 헤더가 유효한 채로 남는다.
 - `tests/fixtures/hil/v1_small.eshil`은 재생성하지 않으며 여전히 바이트 단위로 재생된다.
 
+## V6b — 구현 결과: 평가가 수집과 같은 방식으로 청크를 실행한다
+
+설계 노트 7.13절. 1단계 이후 오케스트레이터가 지시한 1b 단계로, 7.12절 발견 6이 남긴 것을 닫는다 —
+둘 중 하나라도 열어 둔 채 서버에서 재측정하면 다시 해야 하기 때문이다.
+
+**문제의 모양을 바꾸는 정정.** 7.12절 발견 6은 수집기가 "추론 속도로 재계획하고 열 행을 실행한다"고
+말했다. 그렇지 않다. `BatchDomains::single_env()`는 추론 주기를 1로 선언하므로 `es loop collect`는
+**매** 제어 tick마다 청크를 받는다. 거기서 `action.execute_chunk`와 `execution`을 의미 있게 만드는
+것은 `es_env::chunk_buffer::ChunkBuffer`다: 도착을 모두 저장하고, `span`이 한 청크가 몇 tick을
+구동할지 정하며, `action_at`이 **겹침을 혼합**한다 — `w_i = exp(-decay · i)`, ACT temporal
+ensembling이고 데모가 `learning.toml`과 `deployment.toml` 양쪽에 선언한 것이다.
+
+`es_eval::runner`에는 버퍼가 없었다. 매 원시 추론 결과를 새 `seq`로 plane에 넘겼으므로 plane의
+커서가 매 tick 리셋되었고 **모든 청크의 0행만 실행되었다**. 열다섯 청크의 지수 평균에 대고 훈련된
+정책이 자신의 원시 마지막 예측으로 평가되었다.
+
+**(a) 규칙 둘이 아니라 공유 함수 하나.** `DomainRunner::emit_actions`의 청크→plane 단계를
+`es_env::plane_chunk(buffer, feed, tick, mode)`로 옮기고, 비공개 `Submitted`를 `end_episode`를 가진
+공개 `PlaneFeed`로 승격했다. `es_eval::run_episode`는 모든 추론 결과를 **Deployment IR**로 만든
+`ChunkBuffer`(`action.execute_chunk`, 그리고 `execution` → `ChunkBlendPolicy`이므로
+`TemporalEnsemble { decay }`가 `TemporalEnsemble { weight_decay }`가 된다)에 밀어 넣고 같은 호출로
+plane에 공급한다. `infer_chunk`는 `seq` 인자를 잃었다: seq는 버퍼가 받아들인 결과당 한 번 찍히고,
+그것이 `SafetyPlane::accept`가 신선도를 판정하는 기준이다(§8.6). `DomainRunner::reset_env`도 이제
+`PlaneFeed::end_episode`를 부르므로 에피소드 경계는 양쪽에서 하나의 함수다. **CLI 플래그 없음.
+Deployment IR이 결정한다.**
+
+`es loop collect`는 비트 단위로 변하지 않았다 — 추출은 이동이고, `es-env`와 `es-data`의 스위트는
+V1c의 `a_second_episode_repeats_the_first_exactly`와
+`emit_actions_writes_the_planes_answer_and_records_the_command`를 포함해 그대로 통과한다.
+
+**남은 차이 하나, 숨기지 않고 이름을 붙여서.** 수집은 정책 계약의 `expected_latency_ms`(제어 1
+tick)를 모델링하므로 첫 청크가 tick 1에 적용되고 tick 0은 청크 언더런이다. 평가는 결과가 계산된
+tick에 적용한다. Deployment IR에는 지연 필드가 없고(`deadlines.inference_budget`은 워치독 경계이지
+스케줄이 아니다) `Evaluation::run`은 Learning IR을 받지 않는다. 900 스텝 에피소드당 한 프레임.
+
+**(b) `--seed S`는 하나의 장면을 가리킨다.** `Env::new`가 한 번 리셋하고(`(seed, env, episode)`의
+추첨 0, §6.3) 모든 에피소드는 정확히 한 번의 리셋으로 끝난다 — 종료 조건이면 `Env::step` 자신의
+리셋, 예산이 다하면 명시적 리셋. `run_episode`는 맨 앞에서 **또** 리셋했으므로 평가의 에피소드 `i`는
+추첨 `2i + 1`에서, 수집의 에피소드 `i`는 추첨 `i`에서 돌았다. 그 리셋을 없앴다. 아래쪽 리셋,
+`plan.reset()`, 셀마다의 `Env`는 그대로다.
+
+**추가된 오라클.**
+
+- `crates/es-eval/tests/evaluation.rs`: **`episode_zero_runs_on_the_first_randomization_draw`** —
+  로컬, 가짜 백엔드. `Env`에서 직접 기준값을 만들고 러너가 처음 제공하는 상태가 `Env::new` 자신의
+  추첨과 비트 단위로 같음을 단언한다. **두 번째 리셋을 되살리면 실패함을 측정했다**(`0.5904` 대
+  `0.8683`).
+- `crates/es-eval/tests/evaluation.rs`:
+  **`the_runner_feeds_the_plane_through_the_collectors_chunk_buffer`** — 호출 규율 스캔:
+  `buffer.push` 하나, `es_env::plane_chunk` 하나, `feed.end_episode` 하나, 그리고 정확히 하나의
+  `env.reset(None)`(아래쪽 것).
+- `crates/es-data/tests/loop_learning.rs`:
+  **`the_collector_resets_once_per_episode_and_never_before_the_first_observation`** — 같은 규칙의
+  반대편이라, 추가 리셋이 이쪽으로 옮겨 올 수 없다.
+- `crates/es/tests/cli.rs`: **`collection_and_evaluation_draw_the_same_scene_for_a_seed`** — 교차
+  경로 오라클. `es_data::Collector`와 `es_eval::Evaluation`을 데모 씬에서 시드 1로 돌려, 각자가
+  자기 정책에 처음 건네는 `qpos ‖ qvel`을 원시 `f64` 비트로 비교한다. SO-101 씬은
+  `MuJoCoCpuBackend` 말고 구동할 것이 없으므로 **서버 오라클**이다.
+
+**무효화되는 것.** 설계 노트 7.8–7.11절의 모든 평가 숫자 — V3·V2b·V1c의 성공률, 엔벌로프 위반율,
+`ActionSource` 히스토그램, 에피소드 길이, 두 번의 확대 엔벌로프 진단. 전부 청크 버퍼 없이, temporal
+ensembling 없이, `execute_chunk`가 죽은 채로, 엔벌로프가 추종 오차를 제한한 채로(V6), 큐브가 한
+추첨 어긋난 채로(V6b) 측정되었다. 수집과 훈련 숫자는 그대로 유효하다: 시연, 손실 곡선,
+`observation_hash`, `lowering_hash`, `dataset_schema_hash`, 체크포인트는 움직이지 않은 경로의
+산물이다.
+
+**소스 줄 변화 (V6b).** `es-env` +104 / -65(순 +39, 대부분 공유 함수와 그 주석), `es-eval`
++59 / -13(순 +46). 두 크레이트 모두 §1.5 상한에서 한참 안쪽이다.
+
 ## forbidden
 
 - `tests/fixtures/visible-learning/deployment.toml`의 한계를 바꾸는 것, 또는 어디든 임계값을

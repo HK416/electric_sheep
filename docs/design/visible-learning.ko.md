@@ -1317,7 +1317,10 @@ IR의 무작위화를 에피소드 카운터로 키잉하므로, 8 에피소드 
 된다), 그리고 상수 96×96 프레임 — 전문가는 관절을 읽고 픽셀을 결코 읽지 않으므로, 이것이 이
 오라클을 Vulkan 장치 없이 `mujoco`만으로 돌게 해 준다.
 
-**6. V6가 찾았지만 고치지 않은 두 비대칭. 둘 다 엔벌로프가 아니기 때문이다.**
+**6. V6가 찾았지만 고치지 않은 두 비대칭. 둘 다 엔벌로프가 아니기 때문이다.** (V6b, 7.13절에서
+닫혔다 — 그리고 아래 둘 중 첫째는 잘못 서술되어 있다. 수집기도 추론 속도로 재계획하지 *않는다*.
+매 tick 재계획하며 `ChunkBuffer`를 통해 temporal ensembling을 하고, 평가에는 그것이 아예 없었다.
+7.13절에 정정과 측정이 있다.)
 
 * **평가 러너는 매 제어 tick마다 재계획한다.** `run_episode`는 스텝마다 정책을 부르고 매번 새
   `seq`를 주므로 커서가 리셋되고 모든 청크의 0행만 실행된다 — `action.execute_chunk = 10`은 그
@@ -1357,6 +1360,79 @@ V6가 건드리지 않는다 — `torque_noise` / `backlash`는 팔을 자기 �
 **아직 측정되지 않은 것.** 위의 전부는 로컬이다. 서버 실행 — 데모 씬에서 평가 하니스를 통과하는
 전문가, 그다음 V1c의 20,000 스텝 번들을 `--jobs 6`으로 nominal과 6개 스위트에 대해 재측정(재훈련
 없음, 손잡이 변경 없음) — 은 2단계이고, 여기의 표는 그것으로 채운다.
+
+### 7.13 구현 결과 (V6b): 평가가 수집과 같은 방식으로 청크를 실행하고, 같은 장면을 뽑는다
+
+패킷 `docs/packets/M5/V6-envelope-semantics.md`의 V6b 절. 7.12절의 발견 6은 두 비대칭을 지목하고
+남겨 두었다. 오케스트레이터는 2단계 서버 실행 전에 둘 다 닫기로 했다. 열어 둔 채로 재측정하면
+다시 해야 하기 때문이다. **그리고 발견 6의 전반부는 틀렸으며, 진실은 그것이 주장한 것보다 나쁘다.**
+
+**1. 정정. 수집도 열 tick마다 재계획하지 않는다 — 매 tick 재계획하고 *앙상블*한다. 평가는 둘 다 하지
+않았다.** `BatchDomains::single_env()`는 추론 주기를 1로 선언하므로 `es loop collect`는 **매** 제어
+tick마다 관측을 제출하고 청크를 받는다. 거기서 `action.execute_chunk`와 `rate.inference`를 의미 있게
+만드는 것은 제출 주기가 아니라 `es_env::chunk_buffer::ChunkBuffer`다. 도착한 청크를 모두 저장하고,
+`span`이 한 청크가 몇 tick을 구동할 수 있는지 정하며(`execute_chunk`, `TemporalEnsemble`이면 전체
+호라이즌), `action_at`이 **겹치는 청크들을 혼합**한다 — `w_i = exp(-decay · i)`, 즉 ACT의 temporal
+ensembling이고, 이는 데모의 `learning.toml`(`mode = "TemporalEnsemble"`, `weight_decay = 0.01`)과
+`deployment.toml`(`[body.execution.temporal_ensemble] decay = 0.01`)이 둘 다 선언하는 바로 그것이다.
+
+`es_eval::runner`에는 버퍼가 아예 없었다. 매 추론 결과를 새 `seq`로 plane에 넘겼으므로 plane의
+커서가 매 tick 리셋되었고 **모든 청크의 0행만 실행되었다**. Deployment IR의
+`action.execute_chunk = 10`은 그 경로에서 죽어 있었고 `execution`도 마찬가지였다 — 열다섯 개
+청크의 지수 평균에 대고 훈련된 정책이 자신의 가공되지 않은 마지막 예측으로 평가된 것이다. 이는
+"열 배 자주"보다 훨씬 큰 훈련/시험 격차이고, V3·V2b·V1c의 모든 평가 숫자가 그 아래에서 측정되었다.
+
+**2. 수정은 규칙 둘이 아니라 공유 함수 하나다.** `DomainRunner::emit_actions`의 청크→plane 단계는
+이제 `chunk_buffer.rs`의 `es_env::plane_chunk(buffer, feed, tick, mode)`이고, `Submitted` 기록은
+공개 타입 `PlaneFeed`로 승격되었다. `es_eval::runner`가 같은 함수를 부른다: 모든 추론 결과를
+**Deployment IR**로 만든 `ChunkBuffer`(`action.execute_chunk`, 그리고 `execution`이 함의하는 혼합
+정책 — `TemporalEnsemble { decay }` → `ChunkBlendPolicy::TemporalEnsemble { weight_decay }`)에
+밀어 넣고, 거기서 plane에 공급한다. `infer_chunk`는 `seq` 인자를 잃었다 — seq는 *버퍼가 받아들인
+결과*당 한 번 찍히며, 그것이 `SafetyPlane::accept`가 신선도를 판정하는 기준이다(§8.6).
+`PlaneFeed::end_episode`가 양쪽의 에피소드 경계이고 `DomainRunner::reset_env`도 이제 그것을 부른다.
+Deployment IR이 결정하고, 플래그는 없다.
+
+`es loop collect`는 비트 단위로 변하지 않았다 — 추출은 이동이고, `es-env`와 `es-data`의 스위트는
+V1c의 `a_second_episode_repeats_the_first_exactly`와
+`emit_actions_writes_the_planes_answer_and_records_the_command`를 포함해 그대로 통과한다. 그것이
+요점이다: 공유 함수는 수집기의 것이고, 평가가 그리로 왔다.
+
+**3. 남은 차이 하나, 이름을 붙여서.** 수집은 정책 계약의 `expected_latency_ms`(20 ms 제어 주기에
+대해 15 ms = 1 tick)를 모델링하므로 첫 청크가 tick 1에 적용되고 tick 0은 청크 언더런이다 — 7.10절의
+"에피소드당 하나씩 50번의 폴백"이 그것이다. 평가는 결과가 계산된 tick에 적용한다. Deployment IR에는
+지연 필드가 없고(`deadlines.inference_budget`은 워치독 경계이지 스케줄이 아니다),
+`Evaluation::run`은 Learning IR을 받지 않으며, 그것을 위해 필드나 플래그를 만드는 것은 이 패킷의
+결정도 IR의 현재 형태도 아니다. 영향은 900 스텝 에피소드당 한 프레임이다. 여기 적어 두고, 다른
+어디서도 아닌 척하지 않는다.
+
+**4. 이제 `--seed S`는 하나의 장면을 가리킨다.** `Env::new`가 한 번 리셋하고 — `(seed, env,
+episode)`의 추첨 0(§6.3) — 모든 에피소드는 정확히 한 번의 리셋으로 끝난다(종료 조건이면
+`Env::step` 자신의 리셋, 스텝 예산이 다하면 명시적 리셋). `Collector::run`은 그것에 의존하고 루프
+앞에서 리셋하지 않는다. `run_episode`는 맨 앞에서 **또** 리셋했으므로 평가의 에피소드 `i`는 추첨
+`2i + 1`에서, 수집의 에피소드 `i`는 추첨 `i`에서 돌았다: `--seed 1`이 두 경로에서 큐브를 다른 곳에
+놓았고, 둘 다 유효한 자세라 조용히 그랬다. 그 리셋을 없앴다. 다른 것은 움직이지 않았다: 예산이 다한
+에피소드를 닫는 아래쪽 리셋도, `plan.reset()`도 그대로이고, 셀마다 새 `Env`를 받는 것도 그대로다.
+
+**5. 오라클.** `episode_zero_runs_on_the_first_randomization_draw`(`es-eval`, 로컬, 가짜 백엔드)는
+`Env`에서 직접 기준값을 만들고 러너가 처음 제공하는 상태가 `Env::new` 자신의 추첨과 비트 단위로
+같음을 단언한다 — **두 번째 리셋을 되살리면 실패함을 측정했다**(`0.5904` 대 `0.8683`).
+`the_runner_feeds_the_plane_through_the_collectors_chunk_buffer`(`es-eval`)와
+`the_collector_resets_once_per_episode_and_never_before_the_first_observation`(`es-data`)이 두
+호출 규율 스캔이며, V6가 시드에 대해 추가한 것과 같은 방식이다 — 추가 리셋이 반대쪽으로 옮겨 갈 수
+없게 한다. `collection_and_evaluation_draw_the_same_scene_for_a_seed`(`crates/es/tests/cli.rs`)가
+오케스트레이터가 요청한 교차 경로 오라클이다: `es_data::Collector`와 `es_eval::Evaluation`을 데모
+씬에서 시드 1로 돌려, 각자가 자기 정책에 처음 건네는 `qpos ‖ qvel`을 원시 `f64` 비트로 비교한다.
+SO-101 씬은 `MuJoCoCpuBackend` 말고 구동할 것이 없으므로 두 전문가 오라클 옆의 **서버 오라클**로
+이름을 남긴다.
+
+**6. 이것이 무효화하는 것.** 7.8·7.9·7.10·7.11절의 모든 평가 숫자 — V3·V2b·V1c의 성공률,
+엔벌로프 위반율, `ActionSource` 히스토그램, 에피소드 길이, 그리고 두 번의 확대 엔벌로프 진단. 전부
+청크 버퍼 없이, temporal ensembling 없이, `execute_chunk`가 죽은 채로, 엔벌로프가 추종 오차를
+제한한 채로(V6), 큐브가 시드 자신의 것에서 한 추첨 떨어진 채로(V6b) 측정되었다. **그 표들에서
+넘어오는 것은 없다.** 수집 숫자는 넘어온다: 시연, 손실 곡선, `observation_hash`,
+`lowering_hash`, `dataset_schema_hash`, 훈련된 체크포인트는 모두 수집 경로와 훈련 경로의
+산물이고 둘 다 움직이지 않았다. 2단계는 V1c의 커밋된 20,000 스텝 번들을 재측정한다 — 재훈련 없음,
+손잡이 변경 없음 — 그리고 그것이 플랜 V가 만든 첫 번째, 하니스가 아니라 정책을 재는 평가 표다.
 
 ## 8. 안전 오버레이 (V3)
 
@@ -1523,3 +1599,12 @@ V0 (장면 + IR)  ∥  V0b (루프 안의 렌더링)  ∥  V4 (영상 조립)
     가리킨다. 기본값: 둘 다 그대로 둔다. 어느 쪽을 고쳐도 플랜 V가 보고한 모든 평가 숫자가
     움직이고 둘 다 엔벌로프 문제가 아니다. 두 경로를 프레임 단위로 비교하고 싶은 사람은 재계획
     주기를 먼저 요청해야 한다 — 그쪽이 정책의 성공률을 깎고 있을 개연성이 있는 쪽이다.
+
+    **답함 (V6b, 7.13절), 그리고 질문은 과소평가되어 있었다.** 오케스트레이터가 2단계 실행 전에 둘
+    다 닫았다. 재계획 쪽은 *틀리기까지* 했다: 수집도 매 제어 tick 재계획한다
+    (`BatchDomains::single_env()`가 추론 주기를 1로 선언한다) — 수집에 있고 평가에 없던 것은
+    `ChunkBuffer`이고, `action.execute_chunk`와 ACT temporal ensembling이 사는 곳이 거기다. 평가는
+    매 원시 결과를 새 `seq`로 plane에 넘기고 0행만 실행했으므로, 열다섯 청크의 지수 평균에 대고
+    훈련된 정책이 자신의 원시 마지막 예측으로 평가되었다. `es_eval::runner`는 이제 수집기 자신의
+    함수인 `es_env::plane_chunk`를 통해 plane에 공급하며, 버퍼는 Deployment IR로 만든다. 이중
+    리셋은 사라졌다. 7.8–7.11절의 모든 평가 숫자가 무효이고, 모든 수집·훈련 숫자는 유효하다.

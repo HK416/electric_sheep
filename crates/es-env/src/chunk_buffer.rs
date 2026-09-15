@@ -15,6 +15,7 @@
 //!   plane produces the fallback (§8.6, §9.4). Fabricating an action here would put an
 //!   unchecked value on the actuator path, which `INV-12` forbids.
 
+use es_ir::deployment::ExecutionMode;
 use es_ir::learning::ChunkBlendPolicy;
 use es_safety::ActionChunk;
 
@@ -242,6 +243,93 @@ impl<const NJ: usize, const H: usize> ChunkBuffer<NJ, H> {
             }
         })
     }
+}
+
+/// What one env's [`SafetyPlane`](es_safety::SafetyPlane) was last handed (spec 8.6, spec 9.4).
+///
+/// `seq` advances **once per policy invocation result**, never once per control tick: the
+/// plane's `accept` refreshes `last_chunk_tick` only for a `seq` it has not seen, and that
+/// timestamp is what `ViolationKind::InferenceDeadline` measures. A fresh `seq` every tick
+/// makes a dead policy look alive.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PlaneFeed {
+    seq: u64,
+    /// [`ChunkBuffer::arrivals`] the last stamped chunk was built from.
+    arrivals: u64,
+}
+
+impl PlaneFeed {
+    /// The `seq` last handed to the plane.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+
+    /// The episode of this env ended: its chunks describe a state that no longer exists
+    /// (spec 13.1). Clears the buffer and bumps the `seq` with no rows behind it, so the next
+    /// [`plane_chunk`] makes the plane drop the chunk it still holds rather than keep
+    /// consuming it.
+    pub fn end_episode<const NJ: usize, const H: usize>(
+        &mut self,
+        buffer: &mut ChunkBuffer<NJ, H>,
+    ) {
+        self.seq += 1;
+        self.arrivals = buffer.arrivals();
+        buffer.clear();
+    }
+}
+
+/// The chunk to hand `SafetyPlane::validate` on this control tick, and the row it commands.
+///
+/// **The one place a buffered chunk becomes an actuator command** (packet M5/V6b): both
+/// [`DomainRunner::emit_actions`](crate::DomainRunner::emit_actions), which `es loop collect`
+/// drives, and `es_eval::runner`, which `es eval run` drives, call exactly this. Before V6b
+/// the evaluation path had no buffer at all -- it handed the plane each raw inference result
+/// under a fresh `seq`, so the plane's cursor reset every tick, only row 0 of every chunk ever
+/// executed, and the Deployment IR's `action.execute_chunk` and `execution` (including
+/// `TemporalEnsemble`) were dead on that path.
+///
+/// `None` as the second return is the underrun: nothing was commanded this tick, the plane is
+/// handed an empty chunk under the `seq` it already has, and its own `ChunkUnderrun` produces
+/// the fallback (spec 8.6, spec 9.4). Never a fabricated action (`INV-12`).
+pub fn plane_chunk<const NJ: usize, const H: usize>(
+    buffer: &mut ChunkBuffer<NJ, H>,
+    feed: &mut PlaneFeed,
+    tick: u64,
+    mode: ExecutionMode,
+) -> (ActionChunk<NJ, H>, Option<[f64; NJ]>) {
+    let row = buffer.next_action(tick);
+    let arrivals = buffer.arrivals();
+    let chunk = match row {
+        // A policy result the plane has not seen yet, and it covers this tick: stamp one fresh
+        // `seq` and hand over the rows it will drive until the next result. The lookahead is
+        // exact -- no chunk can reach the buffer without changing `arrivals`, which is what
+        // triggers the next rebuild -- so the plane's own cursor (spec 8.5) walks exactly the
+        // rows per-tick blending would have produced.
+        Some(first) if arrivals != feed.arrivals => {
+            let mut actions = [[0.0; NJ]; H];
+            actions[0] = first;
+            let mut valid = 1;
+            while valid < H {
+                match buffer.action_at(tick + valid as u64) {
+                    Some(r) => {
+                        actions[valid] = r;
+                        valid += 1;
+                    }
+                    None => break,
+                }
+            }
+            feed.seq += 1;
+            feed.arrivals = arrivals;
+            ActionChunk::new(actions, valid, mode).with_seq(feed.seq)
+        }
+        // No new result -- including the underrun case, where the buffer covers nothing.
+        // Resubmit the previous `seq`: `SafetyPlane::accept` copies nothing for a `seq` it has
+        // already seen, so these rows are never read, the plane keeps consuming the chunk it
+        // holds, and `last_chunk_tick` stays where the last real result put it. That is what
+        // lets `InferenceDeadline` fire when a policy stops producing (spec 9.4, P-M2-R3).
+        _ => ActionChunk::empty(mode).with_seq(feed.seq),
+    };
+    (chunk, row)
 }
 
 // The property under test is bitwise reproducibility, so exact comparisons are deliberate.

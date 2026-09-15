@@ -224,6 +224,79 @@ impl ExpertCfg {
   `evaluation.toml` and `.eshil` header stays valid.
 - `tests/fixtures/hil/v1_small.eshil` is not regenerated and still replays byte for byte.
 
+## V6b — as built: evaluation executes chunks the way collection does
+
+Design note section 7.13. Phase 1b, ordered by the orchestrator after phase 1, closing what
+section 7.12's finding 6 left open — because re-measuring on the server with either half open
+would have to be redone.
+
+**The correction that changes the shape of the problem.** Section 7.12's finding 6 said the
+collector "replans at the inference rate and executes ten rows". It does not.
+`BatchDomains::single_env()` declares an inference period of 1, so `es loop collect` receives a
+chunk on **every** control tick. What makes `action.execute_chunk` and `execution` mean something
+there is `es_env::chunk_buffer::ChunkBuffer`: it stores every arrival, `span` bounds how many ticks
+a chunk may drive, and `action_at` **blends the overlap** — `w_i = exp(-decay · i)`, ACT temporal
+ensembling, which the demo declares in both `learning.toml` and `deployment.toml`.
+
+`es_eval::runner` had no buffer. It handed the plane each raw inference result under a fresh `seq`,
+so the plane's cursor reset every tick and **only row 0 of every chunk ever executed**. A policy
+trained against a fifteen-chunk exponential average was evaluated on its raw last prediction.
+
+**(a) One shared function, not two rules.** `DomainRunner::emit_actions`' chunk-to-plane step moved
+into `es_env::plane_chunk(buffer, feed, tick, mode)`, with the private `Submitted` promoted to a
+public `PlaneFeed` carrying `end_episode`. `es_eval::run_episode` pushes every inference result into
+a `ChunkBuffer` built from the **Deployment IR** (`action.execute_chunk`; `execution` →
+`ChunkBlendPolicy`, so `TemporalEnsemble { decay }` becomes `TemporalEnsemble { weight_decay }`) and
+serves the plane through the same call. `infer_chunk` lost its `seq` argument: the seq is stamped
+once per result the buffer accepted, which is what `SafetyPlane::accept` judges freshness by (§8.6).
+`DomainRunner::reset_env` now calls `PlaneFeed::end_episode` too, so the episode boundary is one
+function on both sides. **No CLI flag; the Deployment IR decides.**
+
+`es loop collect` is bit-unchanged — the extraction is a move, and `es-env`'s and `es-data`'s
+suites, including V1c's `a_second_episode_repeats_the_first_exactly` and
+`emit_actions_writes_the_planes_answer_and_records_the_command`, pass untouched.
+
+**One remaining difference, named rather than hidden.** Collection models the policy contract's
+`expected_latency_ms` (one control tick), so its first chunk applies at tick 1 and tick 0 is a chunk
+underrun. Evaluation applies at the tick the result was computed from. The Deployment IR has no
+latency field — `deadlines.inference_budget` is a watchdog bound, not a schedule — and
+`Evaluation::run` is not given the Learning IR. One frame per 900-step episode.
+
+**(b) `--seed S` names one scene.** `Env::new` resets once (draw 0 of `(seed, env, episode)`, §6.3)
+and every episode ends with exactly one reset — `Env::step`'s own on a terminal condition, or the
+explicit one when the step budget runs out. `run_episode` reset **again** at the top, so evaluation's
+episode `i` ran on draw `2i + 1` while collection's ran on draw `i`. That reset is gone; the bottom
+one, `plan.reset()` and the per-cell `Env` are untouched.
+
+**Oracles added.**
+
+- `crates/es-eval/tests/evaluation.rs`: **`episode_zero_runs_on_the_first_randomization_draw`** —
+  local, fake backend. Builds the ground truth from `Env` directly and asserts the first state the
+  runner serves is `Env::new`'s own draw, bit for bit. **Measured to fail with the second reset
+  restored** (`0.5904` against `0.8683`).
+- `crates/es-eval/tests/evaluation.rs`:
+  **`the_runner_feeds_the_plane_through_the_collectors_chunk_buffer`** — the call-discipline scan:
+  one `buffer.push`, one `es_env::plane_chunk`, one `feed.end_episode`, and exactly one
+  `env.reset(None)` (the bottom one).
+- `crates/es-data/tests/loop_learning.rs`:
+  **`the_collector_resets_once_per_episode_and_never_before_the_first_observation`** — the other
+  half of the same rule, so the extra reset cannot move over here instead.
+- `crates/es/tests/cli.rs`: **`collection_and_evaluation_draw_the_same_scene_for_a_seed`** — the
+  cross-path oracle. Both `es_data::Collector` and `es_eval::Evaluation` on the demo scene with
+  seed 1, comparing the `qpos ‖ qvel` each first hands its policy as raw `f64` bits. A **server
+  oracle**: the SO-101 scene has no driver but `MuJoCoCpuBackend`.
+
+**What this invalidates.** Every evaluation number in design note sections 7.8–7.11 — V3's, V2b's
+and V1c's success rates, envelope-violation rates, `ActionSource` histograms, episode lengths and
+both widened-envelope diagnostics. All were measured with no chunk buffer, no temporal ensembling,
+`execute_chunk` dead, the envelope bounding the following error (V6) and the cube one draw off
+(V6b). The collection and training numbers carry forward untouched: the demonstrations, the loss
+curves, `observation_hash`, `lowering_hash`, `dataset_schema_hash` and the checkpoints are products
+of paths that did not move.
+
+**Source-line delta (V6b).** `es-env` +104 / -65 (net +39, most of it the shared function and its
+comment), `es-eval` +59 / -13 (net +46). Both crates stay far inside the §1.5 cap.
+
 ## forbidden
 
 - Changing any limit in `tests/fixtures/visible-learning/deployment.toml`, or any threshold

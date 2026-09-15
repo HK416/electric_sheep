@@ -25,7 +25,7 @@ pub mod render;
 pub mod rng;
 pub mod scheduler;
 
-pub use chunk_buffer::{ChunkBuffer, CHUNK_SLOTS};
+pub use chunk_buffer::{plane_chunk, ChunkBuffer, PlaneFeed, CHUNK_SLOTS};
 pub use control::{ControlExecutor, StageOutcome, StageState};
 pub use domains::{DomainRunner, DomainSizing};
 pub use env::{Env, EnvMetrics, StepOutcome};

@@ -12,7 +12,7 @@ use es_assets::scene::SceneDesc;
 use es_compile::{CpuPlan, Home, PlanMode, Tensor, TensorRef};
 use es_core::{PhysTick, StableId};
 use es_env::scheduler::BatchDomains;
-use es_env::{Env, EnvMetrics, Episode};
+use es_env::{plane_chunk, ChunkBuffer, Env, EnvMetrics, Episode, PlaneFeed};
 use es_ir::deployment::{DeploymentIr, ExecutionMode, Micros};
 use es_ir::evaluation::{
     AcceptanceResult, CellResult, EvaluationIr, EvaluationReport, MetricSpec, MetricValue, SeedPlan,
@@ -395,6 +395,9 @@ impl Evaluation {
         let control_us = deploy.rate.control_period().0;
         let ms_to_steps = |ms: u32| (u64::from(ms) * 1000 / control_us.max(1)) as usize;
 
+        // The Deployment IR decides, never a flag: `execution` carries both the mode the plane
+        // reads and the blend the chunk buffer applies (spec 8.5, spec 9.2).
+        let blend = blend_of(deploy.execution);
         let mut perturbations: Option<PerturbationPlan> = None;
         let mut sources: Option<BTreeMap<String, Capture>> = None;
         let mut out = Shard::default();
@@ -421,9 +424,17 @@ impl Evaluation {
                 .map_err(|e| EvalError::Safety(e.to_string()))?;
 
             let mut episodes = Vec::with_capacity(seeds.len());
-            // Monotonic per policy invocation and per cell: the plane treats a chunk as new
-            // iff its `seq` grew (spec 8.6), and the plane lives as long as the cell.
-            let mut seq = 0u64;
+            // The chunk buffer and the plane's feed live exactly as long as the plane does,
+            // and for the same reason: the `seq` the plane judges freshness by is monotonic
+            // per cell (spec 8.6). `PlaneFeed::end_episode` clears both between episodes.
+            //
+            // This is `es loop collect`'s own path -- `es_env::plane_chunk`, the one place a
+            // buffered chunk becomes an actuator command. Before V6b this loop handed the
+            // plane each raw inference result under a fresh `seq`, so only row 0 of every
+            // chunk executed and the Deployment IR's `action.execute_chunk` and `execution`
+            // were dead here (packet M5/V6b, design note section 7.13).
+            let mut buffer = ChunkBuffer::<NJ, H>::new(deploy.action.execute_chunk, blend);
+            let mut feed = PlaneFeed::default();
             for (idx, seed) in seeds.iter().enumerate() {
                 // One cell of the mosaic is one episode of one suite: `single_env()` makes
                 // them independent runs, so the grid is `suites x episodes` directories.
@@ -448,7 +459,8 @@ impl Evaluation {
                     &ms_to_steps,
                     cfg.action_output.as_deref(),
                     deploy.execution,
-                    &mut seq,
+                    &mut buffer,
+                    &mut feed,
                     frames.as_deref_mut(),
                     cell_frames.as_mut(),
                     &mut events,
@@ -637,7 +649,8 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     ms_to_steps: &dyn Fn(u32) -> usize,
     action_output: Option<&str>,
     mode: ExecutionMode,
-    seq: &mut u64,
+    buffer: &mut ChunkBuffer<NJ, H>,
+    feed: &mut PlaneFeed,
     mut frames: Option<&mut FrameSource<'_>>,
     mut cell_frames: Option<&mut CellFrames>,
     events: &mut Vec<StepEvent>,
@@ -652,11 +665,21 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         return Err(EvalError::JointMismatch { nu, nq, nv, nj: NJ });
     }
 
-    env.reset(None)?;
+    // **No `env.reset` here** (packet M5/V6b). `Env::new` already reset once, and every
+    // episode below ends with a reset — `Env::step`'s own on a terminal condition, or the
+    // explicit one at the bottom when the step budget runs out — so the env is always freshly
+    // drawn when this function is entered. Resetting again made evaluation's episode `i` see
+    // randomization draw `2i + 1` while `es loop collect`'s episode `i` sees draw `i`, so
+    // `--seed S` named a different scene on the two paths (§10.4, §6.3).
+    //
     // An episode is where an observation stream ends (spec 7.5 layer 1): without this, the
     // first frames of this episode would see the tail of the previous one, and cell 2 would
     // see cell 1 — making the §10.1 table depend on suite order (§10.4).
     plan.reset();
+    // The same boundary for the chunk buffer: a chunk predicted for the previous episode has
+    // no meaning in this one, and the plane must drop the one it still holds (spec 13.1).
+    // `DomainRunner::reset_env` is the collector's call to the identical function.
+    feed.end_episode(buffer);
     // A latch left over from the previous episode would poison the rest of the cell, and so
     // would a command chain still anchored on where the previous episode's last command left
     // the arm. `begin_episode` clears both; it is not disabling the plane (INV-12), since the
@@ -682,7 +705,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     let mut ctrl = vec![0.0; nu];
 
     let mut frame_idx: Option<u64> = None;
-    for _ in 0..max_steps {
+    for step in 0..max_steps {
         let dropped = step_state.drop_observation();
         if dropped && !ring.is_empty() {
             extra_age += 1;
@@ -724,8 +747,13 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         } else {
             0
         }];
-        *seq += 1;
-        let chunk = infer_chunk::<NJ, H>(policy, observed, action_output, mode, *seq)?;
+        // One policy invocation per control tick, which is what `BatchDomains::single_env()`
+        // declares (inference period 1) and therefore what produced the demonstrations. The
+        // *execution* cadence is the buffer's: a chunk drives `action.execute_chunk` ticks,
+        // or the whole overlap under `TemporalEnsemble` (packet M5/V6b).
+        let chunk = infer_chunk::<NJ, H>(policy, observed, action_output, mode)?;
+        buffer.push(&chunk, u64::from(step));
+        let (fed, _commanded) = plane_chunk(buffer, feed, u64::from(step), mode);
 
         // Before every `validate`, exactly like `es_data::Collector`, `es_ros2::hil` and
         // `es_runtime_embedded`: the plane decides that only the first call of an episode
@@ -735,7 +763,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         safety.observe_state(&q, &qd);
         safety.heartbeat(env.tick());
         let age = Micros(((ring.len().saturating_sub(1) as u64) + extra_age) * control_us);
-        let safe = safety.validate(&chunk, age, env.tick());
+        let safe = safety.validate(&fed, age, env.tick());
         // One record per frame that reached disk, carrying the plane's own verdict on the step
         // that frame was captured for (design note section 8). A step whose observation was
         // dropped rendered nothing, so it adds no record and the two stay the same length.
@@ -976,7 +1004,6 @@ fn infer_chunk<const NJ: usize, const H: usize>(
     inputs: &BTreeMap<String, Tensor>,
     action_output: Option<&str>,
     mode: ExecutionMode,
-    seq: u64,
 ) -> Result<ActionChunk<NJ, H>, EvalError> {
     let outputs = policy
         .infer(inputs)
@@ -1007,7 +1034,26 @@ fn infer_chunk<const NJ: usize, const H: usize>(
             *v = flat[r * NJ + j];
         }
     }
-    Ok(ActionChunk::new(actions, rows, mode).with_seq(seq))
+    // No `seq` here: `es_env::plane_chunk` stamps it, once per result the buffer accepted,
+    // which is what `SafetyPlane::accept` judges freshness by (spec 8.6).
+    Ok(ActionChunk::new(actions, rows, mode))
+}
+
+/// The chunk-blend policy the Deployment IR's execution mode implies (spec 8.5, spec 9.2).
+///
+/// `es loop collect` reads the same decay out of the Learning IR's `ActionChunker`; the two
+/// documents carry the same number for the demo, and the Deployment IR is what `es eval run`
+/// is given. Everything that is not an ensemble is a hard switch, which is what the buffer's
+/// `span` already assumes.
+fn blend_of(mode: ExecutionMode) -> es_ir::learning::ChunkBlendPolicy {
+    match mode {
+        ExecutionMode::TemporalEnsemble { decay } => {
+            es_ir::learning::ChunkBlendPolicy::TemporalEnsemble {
+                weight_decay: decay as f32,
+            }
+        }
+        _ => es_ir::learning::ChunkBlendPolicy::HardSwitch,
+    }
 }
 
 fn to_f64(t: &Tensor) -> Result<Vec<f64>, EvalError> {

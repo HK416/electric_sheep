@@ -1391,7 +1391,10 @@ seed with one episode each (a single 8-episode cell would be eight draws of *one
 `seeds[0]`), and a constant 96×96 frame, because the expert reads joints and never pixels and that
 is what lets this oracle need `mujoco` without also needing a Vulkan device.
 
-**6. Two asymmetries V6 found and did not fix, because neither is the envelope.**
+**6. Two asymmetries V6 found and did not fix, because neither is the envelope.** (Closed by V6b,
+section 7.13 — and the first of the two is stated wrongly below. The collector does *not* replan at
+the inference rate either; it replans every tick and temporal-ensembles through a `ChunkBuffer`,
+which evaluation had none of. Section 7.13 has the correction and the measurement.)
 
 * **The evaluation runner replans every control tick.** `run_episode` calls the policy once per
   step and gives the plane a fresh `seq` each time, so the cursor resets and only row 0 of every
@@ -1435,6 +1438,88 @@ not a number to force.
 harness on the demo scene, then V1c's 20,000-step bundle re-measured nominal and across the six
 suites with `--jobs 6`, no retraining, no knob moved — is phase 2, and the tables here will be
 filled from it.
+
+### 7.13 As built (V6b): evaluation executes chunks the way collection does, and draws the same scene
+
+Packet `docs/packets/M5/V6-envelope-semantics.md`, the V6b section. Section 7.12's finding 6
+named two asymmetries and left them; the orchestrator closed both before the phase-2 server run,
+because re-measuring with either open would have to be redone. **Finding 6's first half was also
+wrong, and the truth is worse than what it claimed.**
+
+**1. The correction. Collection does not replan every ten ticks either — it replans every tick
+and *ensembles*, and evaluation did neither.** `BatchDomains::single_env()` declares an inference
+period of 1, so `es loop collect` submits an observation and receives a chunk on **every** control
+tick. What makes `action.execute_chunk` and `rate.inference` mean something there is not the
+submit cadence but `es_env::chunk_buffer::ChunkBuffer`: every arrival is stored, `span` decides how
+many ticks a chunk may drive (`execute_chunk`, or the whole horizon under `TemporalEnsemble`), and
+`action_at` **blends the overlapping chunks** — `w_i = exp(-decay · i)`, ACT temporal ensembling,
+which is exactly what the demo's `learning.toml` (`mode = "TemporalEnsemble"`,
+`weight_decay = 0.01`) and `deployment.toml` (`[body.execution.temporal_ensemble] decay = 0.01`)
+both declare.
+
+`es_eval::runner` had no buffer at all. It handed the plane each raw inference result under a
+fresh `seq`, so the plane's cursor reset every tick and **only row 0 of every chunk ever
+executed**. The Deployment IR's `action.execute_chunk = 10` was dead on that path, and so was
+`execution` — a policy trained against a fifteen-chunk exponential average was evaluated on its
+raw last prediction. That is a far bigger train/test gap than "ten times more often", and it is
+the one every V3, V2b and V1c evaluation number was taken under.
+
+**2. The fix is one shared function, not two rules.** `DomainRunner::emit_actions`' chunk-to-plane
+step is now `es_env::plane_chunk(buffer, feed, tick, mode)` in `chunk_buffer.rs`, with the
+`Submitted` bookkeeping promoted to a public `PlaneFeed`. `es_eval::runner` calls the same
+function: it pushes every inference result into a `ChunkBuffer` built from the **Deployment IR**
+(`action.execute_chunk`, and the blend implied by `execution`, so `TemporalEnsemble { decay }`
+becomes `ChunkBlendPolicy::TemporalEnsemble { weight_decay }`), and serves the plane from it.
+`infer_chunk` lost its `seq` argument — the seq is stamped once per *result the buffer accepted*,
+which is what `SafetyPlane::accept` judges freshness by (§8.6). `PlaneFeed::end_episode` is the
+episode boundary on both sides; `DomainRunner::reset_env` now calls it too. The Deployment IR
+decides; there is no flag.
+
+`es loop collect` is bit-unchanged — the extraction is a move, and `es-env`'s and `es-data`'s
+suites, including V1c's `a_second_episode_repeats_the_first_exactly` and
+`emit_actions_writes_the_planes_answer_and_records_the_command`, pass untouched. That is the
+point: the shared function is the collector's, and evaluation came to it.
+
+**3. One remaining difference, named.** Collection models the policy contract's
+`expected_latency_ms` (15 ms against a 20 ms control period = one tick), so its first chunk applies
+at tick 1 and tick 0 is a chunk underrun — the "50 fallbacks, one per episode" of section 7.10.
+Evaluation applies at the tick the result was computed from. The Deployment IR has no latency
+field (`deadlines.inference_budget` is a watchdog bound, not a schedule), `Evaluation::run` is not
+given the Learning IR, and inventing a field or a flag for it is neither this packet's call nor the
+IR's current shape. The effect is one frame per 900-step episode. It is written down here and
+nowhere else pretends otherwise.
+
+**4. `--seed S` now names one scene.** `Env::new` resets once — draw 0 of `(seed, env, episode)`
+(§6.3) — and every episode ends with exactly one reset, `Env::step`'s own on a terminal condition
+or the explicit one when the step budget runs out. `Collector::run` relies on that and never resets
+before its loop. `run_episode` reset **again** at the top, so evaluation's episode `i` ran on draw
+`2i + 1` while collection's ran on draw `i`: `--seed 1` put the cube somewhere else on the two
+paths, silently, because both are valid poses. The reset is gone. Nothing else moved: the bottom
+reset that closes a budget-exhausted episode stays, `plan.reset()` stays, and cells still get a
+fresh `Env` each.
+
+**5. Oracles.** `episode_zero_runs_on_the_first_randomization_draw` (`es-eval`, local, fake
+backend) builds the ground truth from `Env` directly and asserts the first state the runner serves
+is `Env::new`'s own draw, bit for bit — **measured to fail with the second reset restored**
+(`0.5904` against `0.8683`). `the_runner_feeds_the_plane_through_the_collectors_chunk_buffer`
+(`es-eval`) and `the_collector_resets_once_per_episode_and_never_before_the_first_observation`
+(`es-data`) are the two call-discipline scans, in the style of the seeding one V6 added, so the
+extra reset cannot simply move to the other side. `collection_and_evaluation_draw_the_same_scene_
+for_a_seed` (`crates/es/tests/cli.rs`) is the cross-path oracle the orchestrator asked for: both
+`es_data::Collector` and `es_eval::Evaluation` on the demo scene with seed 1, comparing the `qpos ‖
+qvel` each first hands its policy as raw `f64` bits. It needs `MuJoCoCpuBackend` — the SO-101 scene
+has no other driver — so it is named here as a **server oracle** beside the two expert ones.
+
+**6. What this invalidates.** Every evaluation number in sections 7.8, 7.9, 7.10 and 7.11 — V3's,
+V2b's and V1c's success rates, envelope-violation rates, `ActionSource` histograms, episode lengths
+and the two widened-envelope diagnostics. All of them were measured with no chunk buffer, no
+temporal ensembling, `execute_chunk` dead, the envelope bounding the following error (V6), and the
+cube one draw away from the seed's own (V6b). **Nothing in those tables carries forward.** The
+collection numbers do: the demonstrations, the loss curves, `observation_hash`, `lowering_hash`,
+`dataset_schema_hash` and the trained checkpoints are all products of the collect and train paths,
+neither of which moved. Phase 2 re-measures V1c's committed 20,000-step bundle — no retraining, no
+knob moved — and that is the first evaluation table plan V has produced that measures the policy
+rather than the harness.
 
 ## 8. Safety overlay (V3)
 
@@ -1611,3 +1696,14 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     an envelope question. A human who wants the two paths comparable frame for frame should ask for
     the replan cadence first — it is the one that could plausibly be costing the policy its success
     rate.
+
+    **Answered (V6b, section 7.13), and the question was understated.** The orchestrator closed
+    both before the phase-2 run. The replan half was also *wrong*: collection replans every control
+    tick too (`BatchDomains::single_env()` declares an inference period of 1) — what it has and
+    evaluation did not is `ChunkBuffer`, which is where `action.execute_chunk` and ACT temporal
+    ensembling live. Evaluation handed the plane each raw result under a fresh `seq` and executed
+    row 0 only, so a policy trained against a fifteen-chunk exponential average was evaluated on
+    its raw last prediction. `es_eval::runner` now feeds the plane through `es_env::plane_chunk`,
+    the collector's own function, with the buffer built from the Deployment IR. The double reset is
+    gone. Every evaluation number in sections 7.8–7.11 is invalidated; every collection and
+    training number carries forward.

@@ -1286,6 +1286,107 @@ fn the_plane_is_never_disabled() {
     assert_eq!(validates, 1, "exactly one call site, in the step loop");
 }
 
+/// Packet M5/V6b (b): `--seed S` must name the same randomization draw here as it does in
+/// `es loop collect`, and the two paths only agree if neither resets before its first
+/// observation.
+///
+/// `Env::new` already resets once — that is randomization draw 0 of `(seed, env, episode)`
+/// (§6.3) — and every episode ends with a reset, `Env::step`'s own on a terminal condition or
+/// the explicit one when the step budget runs out. `run_episode` used to reset *again* at the
+/// top, so evaluation's episode `i` ran on draw `2i + 1` while collection's ran on draw `i`:
+/// the same `--seed 1` put the cube somewhere else on the two paths, and every A/B between a
+/// collected demonstration and an evaluated episode was comparing two different scenes.
+///
+/// The ground truth is built here, from `Env` directly, rather than transcribed.
+#[test]
+fn episode_zero_runs_on_the_first_randomization_draw() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    /// Any seed; the point is that both paths resolve it to the same draw.
+    const SEED: u64 = 20_260_915;
+
+    let task = task_ir();
+    let env = es_env::Env::new(
+        &task,
+        &scene(),
+        FakeBackend::new(),
+        &es_env::scheduler::BatchDomains::single_env(),
+        SEED,
+    )
+    .expect("the fixture env builds");
+    let draw0 = env.backend().state().qpos_of(0)[0];
+    drop(env);
+
+    let seen: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
+    let taken = Rc::clone(&seen);
+    let mut frames = move |light: &LightOverride,
+                           model: &ModelInfo,
+                           state: &StateView<'_>|
+          -> Result<Vec<u8>, String> {
+        taken.borrow_mut().push(state.qpos_of(0)[0]);
+        state_frames()(light, model, state)
+    };
+
+    let (mut ir, obs) = image_ir();
+    ir.episodes.n_episodes = 1;
+    ir.episodes.seeds = SeedPlan::Explicit(vec![SEED]);
+    run_obs_frames(&ir, &obs, 0.2, Some(&mut frames), None).expect("the fixture evaluation runs");
+
+    let seen = seen.borrow();
+    let first = *seen
+        .first()
+        .expect("the frame source served at least one step");
+    assert_eq!(
+        first.to_bits(),
+        draw0.to_bits(),
+        "episode 0 ran on a different randomization draw than `Env::new` produced: {first} vs          {draw0}. A second reset here is what made `--seed S` name one scene in `es loop          collect` and another in `es eval run` (packet M5/V6b)."
+    );
+    println!(
+        "RAN episode_zero_runs_on_the_first_randomization_draw: draw 0 = {draw0}, {} steps          observed",
+        seen.len()
+    );
+}
+
+/// Packet M5/V6b (a): the chunk a policy returns drives `action.execute_chunk` control ticks
+/// (or the whole overlap under `TemporalEnsemble`), because this crate feeds the plane through
+/// `es_env::plane_chunk` — the same function `DomainRunner::emit_actions` calls, which is what
+/// `es loop collect` drives.
+///
+/// Before V6b the loop handed the plane each raw inference result under a fresh `seq`, so the
+/// plane's cursor reset every tick, **only row 0 of every chunk ever executed**, and the
+/// Deployment IR's `action.execute_chunk` and `execution` were dead here. A source scan, in
+/// the style of the two beside it: the property is about which call site exists.
+#[test]
+fn the_runner_feeds_the_plane_through_the_collectors_chunk_buffer() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/runner.rs");
+    let text = std::fs::read_to_string(&path).expect("src/runner.rs");
+    assert_eq!(
+        text.matches("plane_chunk(buffer, feed,").count(),
+        1,
+        "one feed, in the step loop, and it is `es_env`'s"
+    );
+    assert_eq!(
+        text.matches("buffer.push(&chunk,").count(),
+        1,
+        "every inference result goes into the buffer, never straight to the plane"
+    );
+    assert_eq!(
+        text.matches("feed.end_episode(buffer)").count(),
+        1,
+        "one episode boundary, the same call `DomainRunner::reset_env` makes"
+    );
+    assert!(
+        !text.contains("env.reset(None)?;\n    // An episode is where"),
+        "the episode-start reset is what made evaluation draw ahead of collection"
+    );
+    assert_eq!(
+        text.matches("env.reset(None)").count(),
+        1,
+        "one reset, at the bottom, closing an episode whose step budget ran out"
+    );
+}
+
 /// Packet M5/V6: this crate's half of the one envelope semantics. The runner observes before
 /// **every** `validate` and opens every episode with `begin_episode`, exactly as
 /// `es_data::Collector` does -- what those two calls *mean* is `SafetyPlane`'s to decide

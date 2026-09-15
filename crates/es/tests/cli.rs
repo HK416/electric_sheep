@@ -3775,6 +3775,188 @@ fn expert_passes_the_evaluation_harness() {
     );
 }
 
+/// Packet M5/V6b (b) -- **`--seed S` names the same scene on both paths**, bit for bit.
+///
+/// The Task IR's `Randomization` node draws from `(seed, env, episode)` (§6.3), so episode 0 of
+/// seed `S` is one specific cube pose. `es loop collect` sees draw 0 of it. `es eval run` used
+/// to reset a second time at the top of `run_episode` and see draw 1, so every A/B between a
+/// collected demonstration and an evaluated episode compared two different scenes -- silently,
+/// because both are valid poses.
+///
+/// This runs both paths on the demo scene with the same seed and compares the `qpos` each one
+/// first hands its policy, as raw `f64` bits. The collector's policy is handed the `qpos ‖ qvel`
+/// row directly (`es_env::domains::state_row`, the plan-free path the demonstrations are
+/// collected through); the evaluation runner's frame source is handed the same `StateView`
+/// immediately before its policy is called. Two different hooks onto the same number.
+///
+/// **The server oracle** -- the SO-101 scene needs `MuJoCoCpuBackend`, like the two expert
+/// oracles above; without `mujoco` it prints a reason and skips. `es-eval`'s
+/// `episode_zero_runs_on_the_first_randomization_draw` and `es-data`'s
+/// `the_collector_resets_once_per_episode_and_never_before_the_first_observation` are the local
+/// halves that run in every CI tier.
+#[test]
+fn collection_and_evaluation_draw_the_same_scene_for_a_seed() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const NJ: usize = 6;
+    const H: usize = 16;
+    const SEED: u64 = 1;
+
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP collection_and_evaluation_draw_the_same_scene_for_a_seed: {reason}");
+        return;
+    }
+    let dir = scratch_dir("seed-parity");
+    let policy_path = write_demo_bundle(&dir);
+    let bundle_bytes = std::fs::read(&policy_path).expect("policy.esb");
+    let bundle = es_compile::PolicyBundle::open(&bundle_bytes).expect("the demo bundle opens");
+    let scene = es_assets::parse_mjcf(
+        &std::fs::read_to_string(demo_scene_path()).expect("the demo scene is in the repo"),
+    )
+    .expect("the demo scene parses")
+    .scene;
+
+    // --- the collection path: the first observation its policy is handed -------------------
+    let collected: Rc<RefCell<Option<Vec<f64>>>> = Rc::new(RefCell::new(None));
+    let mut recorder = FirstObservation {
+        seen: Rc::clone(&collected),
+    };
+    let out = dir.join("ds");
+    es_data::Collector::run::<es_physics_backend::MuJoCoCpuBackend, _, NJ, H>(
+        &es_data::CollectSpec {
+            bundle: &bundle,
+            scene: &scene,
+            out_root: &out,
+            n_episodes: 1,
+            seed: SEED,
+            max_steps: 4,
+        },
+        &mut recorder,
+        es_physics_backend::MuJoCoCpuBackend::new,
+        &mut |_, _, _, _| es_data::Intervention::Policy,
+        None,
+    )
+    .expect("the demo collects one short episode");
+
+    // --- the evaluation path: the state its frame source is handed first -------------------
+    let evaluated: Rc<RefCell<Option<Vec<f64>>>> = Rc::new(RefCell::new(None));
+    let taken = Rc::clone(&evaluated);
+    let blank = vec![0u8; 96 * 96 * 3];
+    let mut frames = move |_light: &es_eval::LightOverride,
+                           _model: &es_physics_core::backend::ModelInfo,
+                           state: &es_physics_core::backend::StateView<'_>| {
+        let mut slot = taken.borrow_mut();
+        if slot.is_none() {
+            let mut row = state.qpos_of(0).to_vec();
+            row.extend_from_slice(state.qvel_of(0));
+            *slot = Some(row);
+        }
+        Ok::<Vec<u8>, String>(blank.clone())
+    };
+    let mut ir = demo_evaluation_ir(
+        hex(&bundle.task.task_hash().expect("task hash")),
+        hex(&bundle.observation.observation_hash().expect("obs hash")),
+    );
+    ir.episodes = es_ir::evaluation::EpisodeBatch {
+        n_episodes: 1,
+        seeds: es_ir::evaluation::SeedPlan::Explicit(vec![SEED]),
+    };
+    ir.suites.truncate(1);
+    let mut policy = FirstObservation {
+        seen: Rc::new(RefCell::new(None)),
+    };
+    es_eval::Evaluation::run_with_frames::<es_physics_backend::MuJoCoCpuBackend, _, NJ, H>(
+        &ir,
+        &bundle.task,
+        &scene,
+        &bundle.observation,
+        &mut policy,
+        &bundle.deployment,
+        es_physics_backend::MuJoCoCpuBackend::new,
+        &es_eval::RunConfig {
+            max_steps: Some(4),
+            ..es_eval::RunConfig::default()
+        },
+        Some(&mut frames),
+        None,
+    )
+    .expect("the demo evaluates one short episode");
+
+    let a = collected.borrow().clone().expect("the collector observed");
+    let b = evaluated.borrow().clone().expect("the runner observed");
+    assert_eq!(a.len(), b.len(), "the two rows are different widths");
+    for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+        assert_eq!(
+            x.to_bits(),
+            y.to_bits(),
+            "element {i} of episode 0's first state differs between `es loop collect` ({x}) \
+             and `es eval run` ({y}) for seed {SEED}: the two paths are not drawing the same \
+             scene (packet M5/V6b)"
+        );
+    }
+    println!(
+        "RAN collection_and_evaluation_draw_the_same_scene_for_a_seed: {} values identical, \
+         cube at ({:.4}, {:.4}, {:.4})",
+        a.len(),
+        a[6],
+        a[7],
+        a[8]
+    );
+}
+
+/// A `PolicyRuntime` that records the first observation it is handed and commands nothing.
+///
+/// `infer` returning a zero chunk is not a bypass: the chunk still goes through the plane, and
+/// the run is four steps long because only the *first* state is under test.
+struct FirstObservation {
+    seen: std::rc::Rc<std::cell::RefCell<Option<Vec<f64>>>>,
+}
+
+impl es_policy::PolicyRuntime for FirstObservation {
+    fn load(
+        &mut self,
+        _graph: &es_ir::learning::LearningGraph,
+        _weights: &es_policy::WeightsSource,
+    ) -> Result<es_policy::PolicyInfo, es_policy::PolicyError> {
+        Err(es_policy::PolicyError::NotLoaded)
+    }
+
+    fn infer(
+        &mut self,
+        inputs: &std::collections::BTreeMap<String, es_compile::Tensor>,
+    ) -> Result<std::collections::BTreeMap<String, es_compile::Tensor>, es_policy::PolicyError>
+    {
+        let mut slot = self.seen.borrow_mut();
+        if slot.is_none() {
+            if let Some(t) = inputs.values().next() {
+                *slot = Some(
+                    t.data
+                        .chunks_exact(4)
+                        .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+                        .collect(),
+                );
+            }
+        }
+        Ok(std::collections::BTreeMap::from([(
+            "action".to_owned(),
+            es_compile::Tensor {
+                dtype: es_ir::types::ElemType::F64,
+                shape: vec![1, 6],
+                data: vec![0u8; 6 * 8],
+            },
+        )]))
+    }
+
+    fn info(&self) -> Option<&es_policy::PolicyInfo> {
+        None
+    }
+
+    fn runtime_hash(&self) -> [u8; 32] {
+        *blake3::hash(b"es::tests::FirstObservation").as_bytes()
+    }
+}
+
 /// [`es_env::expert::ScriptedExpert`] wearing the `PolicyRuntime` the evaluation runner drives.
 ///
 /// The expert needs the cube's free-joint `qpos`, which the demo's Observation IR does not

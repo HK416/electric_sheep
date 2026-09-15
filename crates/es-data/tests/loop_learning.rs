@@ -652,6 +652,43 @@ fn f32_column(ep: &es_data::Episode, name: &str) -> Vec<f32> {
 
 /// Spec 13.2: a collected dataset carries per-frame provenance, and the segments come back
 /// exactly as the intervener injected them.
+/// Packet M5/V6b (b): the collector's half of "`--seed S` names one scene".
+///
+/// `Env::new` resets once — randomization draw 0 of `(seed, env, episode)` (spec 6.3) — and
+/// every episode ends with exactly one reset, `Env::step`'s own on a terminal condition or the
+/// explicit one when the step budget runs out. So episode `i` runs on draw `i`. `es_eval`'s
+/// `run_episode` used to reset *again* at the top and ran episode `i` on draw `2i + 1`; V6b
+/// removed that reset there, and this pins the invariant on this side so the fix cannot be
+/// undone by moving the extra reset over here instead.
+///
+/// A source scan, in the style of `es_eval`'s own: the property is about which call sites
+/// exist, and a behavioural test here would only re-measure what `es_eval`'s
+/// `episode_zero_runs_on_the_first_randomization_draw` already measures.
+#[test]
+fn the_collector_resets_once_per_episode_and_never_before_the_first_observation() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/collect.rs");
+    let text = std::fs::read_to_string(&path).expect("src/collect.rs");
+    assert_eq!(
+        text.matches("Env::new(").count(),
+        1,
+        "one env per run, and its construction is the first draw"
+    );
+    assert_eq!(
+        text.matches(".reset(None)").count(),
+        1,
+        "one reset, closing an episode whose step budget ran out -- `Env::step` resets the \
+         terminal case itself, so a second call here would draw ahead of `es eval run` \
+         (packet M5/V6b)"
+    );
+    // And it is inside the `None =>` arm that closes an open episode, not before the loop.
+    let construction = text.find("Env::new(").expect("the construction");
+    let reset = text.find(".reset(None)").expect("the reset");
+    assert!(
+        reset > construction,
+        "nothing resets between `Env::new` and the episode loop"
+    );
+}
+
 #[test]
 fn collect_records_action_source_and_matching_intervention_segments() {
     let root = scratch("loop-collect");

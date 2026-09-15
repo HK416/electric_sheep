@@ -34,7 +34,7 @@ use es_physics_core::backend::{ModelInfo, StateView};
 use es_policy::PolicyRuntime;
 use es_safety::{ActionChunk, SafetyPlane};
 
-use crate::chunk_buffer::ChunkBuffer;
+use crate::chunk_buffer::{plane_chunk, ChunkBuffer, PlaneFeed};
 use crate::inference::{latency_ticks, AsyncInference, Submission};
 use crate::scheduler::Schedule;
 use crate::EnvError;
@@ -46,19 +46,6 @@ struct Latest {
     tick: u64,
     inputs: BTreeMap<String, Tensor>,
     submitted: bool,
-}
-
-/// What one env's [`SafetyPlane`] was last handed (§8.6, §9.4).
-///
-/// `seq` advances **once per policy invocation result**, never once per control tick: the
-/// plane's `accept` refreshes `last_chunk_tick` only for a `seq` it has not seen, and that
-/// timestamp is what `ViolationKind::InferenceDeadline` measures. A fresh `seq` every tick
-/// makes a dead policy look alive.
-#[derive(Clone, Copy, Debug, Default)]
-struct Submitted {
-    seq: u64,
-    /// [`ChunkBuffer::arrivals`] the submitted chunk was built from.
-    arrivals: u64,
 }
 
 /// Runs a [`Schedule`] over an [`Env`](crate::Env): camera selection, asynchronous inference,
@@ -73,7 +60,7 @@ pub struct DomainRunner<const NJ: usize, const H: usize> {
     inference: AsyncInference,
     buffers: Vec<ChunkBuffer<NJ, H>>,
     latest: Vec<Option<Latest>>,
-    submitted: Vec<Submitted>,
+    submitted: Vec<PlaneFeed>,
     obs_port: String,
     action_port: String,
     mode: ExecutionMode,
@@ -114,7 +101,7 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
             ),
             buffers: vec![ChunkBuffer::new(k, blend); envs],
             latest: vec![None; envs],
-            submitted: vec![Submitted::default(); envs],
+            submitted: vec![PlaneFeed::default(); envs],
             obs_port: "state".to_owned(),
             action_port: "action".to_owned(),
             mode: execution_mode(contract.execution_mode, blend),
@@ -294,41 +281,13 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
         }
         let period_us = self.control_period_us();
         for env in 0..envs {
-            let row = self.buffers[env].next_action(self.control_tick);
-            let arrivals = self.buffers[env].arrivals();
-            let chunk = match row {
-                // A policy result the plane has not seen yet, and it covers this tick: stamp
-                // one fresh `seq` and hand over the rows it will drive until the next result.
-                // The lookahead is exact — no chunk can reach the buffer without changing
-                // `arrivals`, which is what triggers the next rebuild — so the plane's own
-                // cursor (§8.5) walks exactly the rows per-tick blending would have produced.
-                Some(first) if arrivals != self.submitted[env].arrivals => {
-                    let mut actions = [[0.0; NJ]; H];
-                    actions[0] = first;
-                    let mut valid = 1;
-                    while valid < H {
-                        match self.buffers[env].action_at(self.control_tick + valid as u64) {
-                            Some(r) => {
-                                actions[valid] = r;
-                                valid += 1;
-                            }
-                            None => break,
-                        }
-                    }
-                    self.submitted[env].seq += 1;
-                    self.submitted[env].arrivals = arrivals;
-                    ActionChunk::new(actions, valid, self.mode).with_seq(self.submitted[env].seq)
-                }
-                // No new result — including the underrun case, where the buffer covers
-                // nothing. Resubmit the previous `seq`: `SafetyPlane::accept` copies nothing
-                // for a `seq` it has already seen, so these rows are never read, the plane
-                // keeps consuming the chunk it holds, and `last_chunk_tick` stays where the
-                // last real result put it. That is what lets `InferenceDeadline` fire when a
-                // policy stops producing (§9.4, P-M2-R3); once the held chunk is exhausted
-                // the plane's own `ChunkUnderrun` produces the fallback (§8.6). Never a
-                // fabricated action.
-                _ => ActionChunk::empty(self.mode).with_seq(self.submitted[env].seq),
-            };
+            // The one buffer -> plane step, shared with `es_eval::runner` (packet M5/V6b).
+            let (chunk, row) = plane_chunk(
+                &mut self.buffers[env],
+                &mut self.submitted[env],
+                self.control_tick,
+                self.mode,
+            );
             let age = self.latest[env]
                 .as_ref()
                 .map_or(self.control_tick + 1, |o| self.control_tick - o.tick);
@@ -345,19 +304,11 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
     /// The episode of `env` ended: its chunks and queued inference describe a state that no
     /// longer exists (§13.1).
     pub fn reset_env(&mut self, env: u32) {
-        let arrivals = self
-            .buffers
-            .get(env as usize)
-            .map_or(0, ChunkBuffer::arrivals);
-        if let Some(s) = self.submitted.get_mut(env as usize) {
-            // A new `seq` with no rows behind it: the next `emit_actions` makes the plane
-            // drop the chunk it still holds for the finished episode rather than keep
-            // consuming it (§13.1).
-            s.seq += 1;
-            s.arrivals = arrivals;
-        }
-        if let Some(b) = self.buffers.get_mut(env as usize) {
-            b.clear();
+        if let (Some(feed), Some(buffer)) = (
+            self.submitted.get_mut(env as usize),
+            self.buffers.get_mut(env as usize),
+        ) {
+            feed.end_episode(buffer);
         }
         if let Some(l) = self.latest.get_mut(env as usize) {
             *l = None;
