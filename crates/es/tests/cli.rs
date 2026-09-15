@@ -6585,9 +6585,14 @@ fn recorded_actions_replay_to_the_same_outcome() {
         }
     };
 
-    // What the demonstrations themselves recorded: the last `observation.state` row of each
-    // episode is the `qpos ‖ qvel` the episode ended in, and the cube's free joint starts at
-    // qpos[6]. This is the ground truth the replay has to reproduce.
+    // What the demonstrations themselves recorded: since packet M5/V12 a row is the state its
+    // action was computed *from*, so the last `observation.state` row is the `qpos ‖ qvel` of
+    // one control step before the episode ended, and the cube's free joint starts at qpos[6].
+    // The state after the last action is in no row -- an episode's terminal step resets the env
+    // inside `Env::step`, so it is not readable from the env afterwards either. Both sides of
+    // this comparison read the same index of their own recording, so the shift is common to
+    // both; and the task's success predicate requires the cube to have *settled* in the bin, so
+    // a cube that is in the bin at the end was already in it one step earlier.
     let mut recorded_in_bin = 0usize;
     for ep in &demos {
         let state = f32col(ep, "observation.state");
@@ -6694,6 +6699,8 @@ fn recorded_actions_replay_to_the_same_outcome() {
             if episode.termination == es_env::Termination::Success {
                 ok += 1;
             }
+            // The same index of the replay's own recording as `recorded_in_bin` reads of the
+            // demonstration's (M5/V12).
             let at = (episode.steps() - 1) * nq;
             let (x, y, z) = (
                 episode.qpos[at + 6],
