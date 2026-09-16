@@ -8,8 +8,9 @@
 # acceleration and the action-rate limits are chosen for the 50 Hz control tick and are the
 # knob V3 turns.
 #
-# What every number is, physically (packet M5/V6; no number below moved, the defect V6 fixed
-# was what the plane measures them *against*, not the limits themselves):
+# What every number is, physically (packet M5/V6; V6 moved no number -- the defect it fixed
+# was what the plane measures them *against*. Since then two numbers moved, each with its
+# own paragraph: the deadlines in M5/V17 and `acceleration_max` in M5/V18):
 #
 #  * The arm is six Feetech `STS3215` serial-bus servos, and the scene drives them as MuJoCo
 #    `position` actuators: `kp = 998.22`, `kv = 2.731`, `forcerange = +/-2.94 N m`
@@ -23,15 +24,29 @@
 #    ~4.4 rad/s unloaded; 3.0 rad/s is roughly two thirds of that, which is about where it
 #    runs holding the arm up. At 50 Hz that is `0.06` rad (3.4 deg) of commanded motion per
 #    control tick.
-#  * `acceleration_max = 20.0` rad/s^2: 3.0 rad/s is reached in 0.15 s, 7.5 control ticks.
-#    Feasible with margin -- the rotor alone (`armature = 0.028`) costs `0.028 * 20 = 0.56`
-#    N m, a fifth of the stall torque, and the links are grams -- which is the point: a
-#    command stream inside this bound is one the servo can actually follow, so the commanded
-#    and the measured trajectory stay close. At 50 Hz it allows `0.008` rad of change in the
-#    per-tick step, and it is the stage that binds.
+#  * `acceleration_max = 80.0` rad/s^2 (owner decision after packet M5/V18; 20.0 from V0 to
+#    V17). 3.0 rad/s is reached in 37.5 ms, under two control ticks, and at 50 Hz the bound
+#    allows `0.032` rad of change in the per-tick step. Physically: the rotor alone
+#    (`armature = 0.028`) costs `0.028 * 80 = 2.24` N m at peak acceleration, three quarters
+#    of the 2.94 N m stall torque, with the links at grams on top -- so the bound is inside
+#    what the STS3215 delivers unloaded, and the scene's `forcerange` still caps the torque
+#    the simulated servo can produce whatever the plane allows. Why it moved: at 20 the
+#    plane rate-limited 99.8 % of the policy's control ticks once chunks executed their own
+#    rows (M5/V17) and the `envelope_violation_rate` watchdog latched the fallback for a
+#    tenth of every run; V18's ablation of this one number (20 / 40 / 80, nothing else
+#    moved, no retraining) took held-out `success_rate` from 0.0625 to 0.625 at 40 and kept
+#    it at 80 while the violation rate fell 0.998 -> 0.90 -> 0.56 and the latch all but
+#    vanished (docs/design/visible-learning.md 7.26). The old margin argument -- "a command
+#    stream inside this bound is one the servo can follow" -- was true and too strict: it
+#    bounded the *policy's* command stream far below the servo, and the plane, not the
+#    policy, was what every evaluation from V13 to V17 measured. Note the expert paces itself
+#    to half the envelope (`es_env::expert::PACE`), so demonstrations collected after this
+#    change accelerate at up to 40 rad/s^2; the V14 data set was collected at 10.
 #  * `action_rate.first_diff_max = 0.08` (4.0 rad/s) and `second_diff_max = 0.04` rad
 #    (100 rad/s^2) are both looser than the two rows above at this control rate, so at 50 Hz
-#    neither ever fires. They are the rate backstop for a control rate this file does not
+#    neither ever fires -- as long as `velocity_max * 0.02 <= 0.08`, i.e. `velocity_max <=
+#    4.0`; V18 measured that widening `velocity_max` to 4.4 makes `first_diff_max` bind and
+#    scores worse, which is why velocity did not move with acceleration. They are the rate backstop for a control rate this file does not
 #    have: spec 9.3 bounds the *action's* first and second difference in action units, and
 #    that bound must not depend on `rate.control` being 50 Hz.
 #  * `position_soft_margin = 0.05` rad (2.9 deg) inside the scene's own joint ranges.
@@ -116,12 +131,12 @@ scene = "tests/fixtures/mjcf/so101_pick_place.xml"
 
 [body.safety]
 acceleration_max = [
-    20.0,
-    20.0,
-    20.0,
-    20.0,
-    20.0,
-    20.0,
+    80.0,
+    80.0,
+    80.0,
+    80.0,
+    80.0,
+    80.0,
 ]
 contact_force_max = 15.0
 ee_velocity_max = 0.6

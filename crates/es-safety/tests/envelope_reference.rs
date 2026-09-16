@@ -17,20 +17,26 @@ const NJ: usize = 6;
 const H: usize = 16;
 
 /// The demo's committed Deployment IR, read rather than transcribed: this oracle is about
-/// *those* numbers (`velocity_max` 3.0 rad/s, `acceleration_max` 20 rad/s^2, first/second
-/// action-rate differences 0.08/0.04 rad at 50 Hz), not about numbers a test invented.
-fn demo_plane() -> SafetyPlane<NJ, H> {
+/// *those* numbers (`velocity_max` 3.0 rad/s, `acceleration_max` 80 rad/s^2 since packet
+/// M5/V18 and 20 before it, first/second action-rate differences 0.08/0.04 rad at 50 Hz),
+/// not about numbers a test invented.
+fn demo_ir() -> es_ir::deployment::DeploymentIr {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../tests/fixtures/visible-learning/deployment.toml");
     let text = std::fs::read_to_string(&path).expect("the demo deployment is in the repo");
-    let ir = es_ir::serial::deployment_from_toml(&text).expect("deployment.toml parses");
-    SafetyPlane::from_ir(&ir).expect("the demo envelope builds a plane")
+    es_ir::serial::deployment_from_toml(&text).expect("deployment.toml parses")
+}
+
+fn demo_plane() -> SafetyPlane<NJ, H> {
+    SafetyPlane::from_ir(&demo_ir()).expect("the demo envelope builds a plane")
 }
 
 /// The control period the demo declares, seconds: `rate.control` is 50 Hz.
 const DT: f64 = 0.02;
-/// `acceleration_max * dt^2` -- the bound the pre-V6 evaluation path put on the *following
-/// error*, and the number design note section 7.10 measured the expert against.
+/// `acceleration_max * dt^2` at the V0-V17 value of 20 rad/s^2 -- the bound the pre-V6
+/// evaluation path put on the *following error*, and the number design note section 7.10
+/// measured the expert against. A historical scale, kept as one: the live per-tick bound is
+/// read from the document in the test that asserts it.
 const OLD_BOUND: f64 = 20.0 * DT * DT;
 
 /// `0.9 * min(velocity_max * dt, first_diff_max)` and `0.9 * min(acceleration_max * dt^2,
@@ -159,9 +165,11 @@ fn a_command_outside_the_envelope_is_still_clamped() {
     let out = plane.validate(&chunk(jump, 1), Micros(0), PhysTick(0));
     assert_eq!(out.source, ActionSource::Clamped);
     assert!(out.events.contains(ViolationKind::Acceleration));
-    // Bounded by the acceleration stage, which binds before velocity at these numbers.
+    // Bounded by the acceleration stage, which binds before velocity at these numbers:
+    // `acceleration_max * dt^2` (0.032 rad at 80 rad/s^2) against `velocity_max * dt` (0.06).
+    let bound = demo_ir().safety.acceleration_max[0] * DT * DT;
     assert!(
-        (out.q[0] - start[0]).abs() <= OLD_BOUND + 1e-12,
+        (out.q[0] - start[0]).abs() <= bound + 1e-12,
         "joint 0 moved {} in one tick",
         out.q[0] - start[0]
     );

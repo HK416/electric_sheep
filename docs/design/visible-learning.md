@@ -4130,3 +4130,15 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     produce the data, not the Deployment IR decision itself, which is the owner's per (a)'s own
     framing, and it still needs the torque-margin re-derivation section 7.26 spells out before
     40 or 80 is adopted for real.
+
+    **Decided (owner, 2026-09-16, after V18): `acceleration_max` moves to 80 rad/s² in
+    `tests/fixtures/visible-learning/deployment.toml`; `velocity_max` stays at 3.0.** The
+    fixture's own comment now carries the re-derivation: 80 rad/s² costs the rotor 2.24 N m at
+    peak, three quarters of the STS3215's stall torque, inside what the servo delivers unloaded,
+    and the scene's `forcerange` still caps the simulated torque whatever the plane allows. 80
+    rather than 40 because both suites pass at 80 and the watchdog latch all but vanishes
+    (53–93 ticks against 767–1,160), so evaluations from here on measure the policy and not the
+    plane. `deployment_hash` moves; V18's level-80 ablation is bit-identical in content to the
+    new document, so its numbers and V18b's level-80 sweep and showcase are the record for the
+    checked-in fixture. Demonstrations collected after this change accelerate at up to
+    40 rad/s² (the expert paces to half the envelope); the V14 data set was collected at 10.
