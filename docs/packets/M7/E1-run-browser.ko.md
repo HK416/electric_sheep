@@ -47,7 +47,23 @@
 8장의 필름스트립. 셀을 선택하면 E2의 리플레이가 착륙해 있을 경우 그것을 위해서도 선택된다
 (`selected_cell()` 접근자가 결합의 전부다).
 
-## context (허용 범위)
+## context
+
+`cargo xtask check-scope`가 읽는 글롭(파서는 정확히 `## context` 제목과 펜스 블록 또는 불릿 목록을 원한다), 그 아래는 같은 범위를 산문으로:
+
+```
+crates/es-editor/src/model/run_view.rs
+crates/es-editor/src/model/mod.rs
+crates/es-editor/src/lib.rs
+crates/es-editor/src/app.rs
+crates/es-editor/src/main.rs
+crates/es-editor/Cargo.toml
+tests/fixtures/visible-learning/run/**
+docs/design/editor-shell.md
+docs/design/editor-shell.ko.md
+docs/packets/M7/E1-run-browser.md
+docs/packets/M7/E1-run-browser.ko.md
+```
 
 `crates/es-editor/src/model/run_view.rs`(신규), `crates/es-editor/src/model/mod.rs`,
 `crates/es-editor/src/lib.rs`(재수출), `crates/es-editor/src/app.rs`(Run 탭과 디렉터리로

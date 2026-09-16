@@ -43,7 +43,23 @@
 서로 겹쳐 들어가지 않는 한 정확하고, 교차하는 곳에서만 틀린다; 업그레이드 경로는 R1의 BVH가
 그것을 값싸게 만들고 나면 저해상도에서의 픽셀 단위 `es_render::cpu::rasterize`다.
 
-## context (허용 범위)
+## context
+
+`cargo xtask check-scope`가 읽는 글롭(파서는 정확히 `## context` 제목과 펜스 블록 또는 불릿 목록을 원한다), 그 아래는 같은 범위를 산문으로:
+
+```
+crates/es-editor/src/model/replay_view.rs
+crates/es-editor/src/model/mod.rs
+crates/es-editor/src/lib.rs
+crates/es-editor/src/app.rs
+crates/es-editor/Cargo.toml
+tests/fixtures/visible-learning/run/traj/**
+tests/golden/editor/**
+docs/design/editor-shell.md
+docs/design/editor-shell.ko.md
+docs/packets/M7/E2-3d-replay.md
+docs/packets/M7/E2-3d-replay.ko.md
+```
 
 `crates/es-editor/src/model/replay_view.rs`(신규), `crates/es-editor/src/model/mod.rs`,
 `crates/es-editor/src/lib.rs`, `crates/es-editor/src/app.rs`(패널), `crates/es-editor/Cargo.toml`
