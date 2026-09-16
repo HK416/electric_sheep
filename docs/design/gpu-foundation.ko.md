@@ -129,8 +129,13 @@ ExecModes { denorm_flush_to_zero_f32, rounding_mode_rte_f32, signed_zero_inf_nan
 ## 버퍼와 파이프라인
 
 `gpu-allocator`가 디바이스 메모리를 소유한다; 버퍼는 `Storage` / `Uniform` /
-`Staging`(host-visible)을 갖는 `Buffer::new(gpu, bytes, Usage)`다. `upload` /
-`download`는 staging 버퍼와 일회성 커맨드 버퍼를 통해 복사한다. `Buffer`는 요청받은
+`Staging`(host-visible, `CpuToGpu`) / `Readback`(host-cached, `GpuToCpu`)을 갖는
+`Buffer::new(gpu, bytes, Usage)`다. `upload`는 `Staging` 버퍼와 일회성 커맨드 버퍼를 통해
+복사하고, `download`는 `Readback` 버퍼를 통해 복사한다(패킷 M7/R1b): write-combined인
+`CpuToGpu` 매핑을 읽는 속도는 두 오라클 GPU 모두에서 27–44 MiB/s여서 1280×720 3.6 MB 리드백이
+64–85 ms였고, 캐시된 매핑은 RTX 3060에서 2.9–3.3 GiB/s(1.1–1.2 ms)로 읽힌다
+(`docs/design/renderer.md` 8.4절에 두 GPU 모두). `GpuToCpu` 메모리가 없는 디바이스는
+다운로드를 `Staging`으로 되돌리고 stderr에 한 번 알린다. `Buffer`는 요청받은
 `bytes`를 실제로 할당된 것(`bytes.max(4)`에 할당자의 정렬 패딩을 더한 것)과 함께
 기록하며, `download`는 정확히 요청된 길이를 반환한다 — 패딩이 데이터인 양 돌려주는
 일은 없다.

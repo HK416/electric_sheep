@@ -15,8 +15,13 @@ pub enum Usage {
     Storage,
     /// Device-local uniform buffer: small read-only parameters.
     Uniform,
-    /// Host-visible staging buffer: uploads, downloads and readback.
+    /// Host-visible staging buffer for **uploads** (`CpuToGpu`: write-combined, fast to
+    /// write from the host, slow to read back).
     Staging,
+    /// Host-cached staging buffer for **downloads** (`GpuToCpu`, packet M7/R1b). Reading a
+    /// write-combined `Staging` mapping ran at 27-44 MiB/s on both oracle GPUs
+    /// (`docs/design/renderer.md` section 8.4); a cached mapping reads at memory speed.
+    Readback,
 }
 
 impl Usage {
@@ -25,7 +30,7 @@ impl Usage {
         match self {
             Self::Storage => vk::BufferUsageFlags::STORAGE_BUFFER | copy,
             Self::Uniform => vk::BufferUsageFlags::UNIFORM_BUFFER | copy,
-            Self::Staging => copy,
+            Self::Staging | Self::Readback => copy,
         }
     }
 
@@ -33,6 +38,7 @@ impl Usage {
         match self {
             Self::Storage | Self::Uniform => MemoryLocation::GpuOnly,
             Self::Staging => MemoryLocation::CpuToGpu,
+            Self::Readback => MemoryLocation::GpuToCpu,
         }
     }
 }
@@ -154,7 +160,19 @@ impl<'gpu> Buffer<'gpu> {
         let mut bytes = if let Some(src) = self.mapped() {
             src.to_vec()
         } else {
-            let mut staging = Buffer::new(self.gpu, size, Usage::Staging)?;
+            // A host-cached readback buffer (M7/R1b). Should a device offer no `GpuToCpu`
+            // memory, the write-combined upload staging still works, only slowly: fall back
+            // and say so once rather than fail the frame.
+            let mut staging = match Buffer::new(self.gpu, size, Usage::Readback) {
+                Ok(b) => b,
+                Err(e) => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| {
+                        eprintln!("es-gpu: no GpuToCpu memory for readback ({e}); downloads stage through CpuToGpu memory");
+                    });
+                    Buffer::new(self.gpu, size, Usage::Staging)?
+                }
+            };
             copy(self.gpu, self.handle, staging.handle, size)?;
             staging.download()?
         };

@@ -712,5 +712,17 @@ fn frame_profile() {
             bytes / 1024,
             got.len() as f64 / ms / 1048.576
         );
+        // And the path `Atlas::read_tile` actually takes (M7/R1b): a device-local buffer
+        // through `Buffer::download`, staged through host-cached memory since R1b.
+        let mut storage =
+            es_gpu::Buffer::new(&gpu, bytes, es_gpu::Usage::Storage).expect("storage buffer");
+        let t = std::time::Instant::now();
+        let got = storage.download().expect("device-local download");
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        println!(
+            "device-local download of {} KiB via Buffer::download: {ms:.3} ms ({:.0} MiB/s)",
+            bytes / 1024,
+            got.len() as f64 / ms / 1048.576
+        );
     }
 }

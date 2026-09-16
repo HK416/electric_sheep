@@ -257,6 +257,40 @@ fn patched_kernels_pass_spirv_val() {
 
 /// Review `docs/reviews/M4.md` S-12: `download` used to hand back the whole allocation,
 /// which `gpu-allocator` pads, so `download_f32().len()` could exceed the requested count.
+/// Packet M7/R1b: a device-local download stages through a host-cached (`GpuToCpu`) buffer
+/// and comes back byte for byte. The size is the 1280x720 RGBA8 atlas of the showcase, the
+/// readback R1 measured at 64-85 ms through write-combined memory.
+#[test]
+fn download_round_trips_through_a_cached_staging_buffer() {
+    let test = "download_round_trips_through_a_cached_staging_buffer";
+    let Some(gpu) = open_gpu(test) else {
+        return;
+    };
+    let bytes: usize = 1280 * 720 * 4;
+    let pattern: Vec<u8> = (0..bytes)
+        .map(|i| (i as u32).wrapping_mul(2_654_435_761) as u8)
+        .collect();
+    let mut storage = Buffer::new(&gpu, bytes as u64, Usage::Storage).expect("storage buffer");
+    storage.upload(&pattern).expect("upload");
+    // The first download in a process pays for the allocator's first host-cached block and
+    // the one-shot command pool; the timed one is the second, which is the steady state a
+    // frame loop sees.
+    let _warm = storage.download().expect("download");
+    let t = std::time::Instant::now();
+    let got = storage.download().expect("download");
+    let ms = t.elapsed().as_secs_f64() * 1e3;
+    assert_eq!(got.len(), bytes);
+    assert!(
+        got == pattern,
+        "the readback differs from what was uploaded"
+    );
+    println!(
+        "RAN device-local download of {} KiB through a GpuToCpu staging buffer: {ms:.3} ms ({:.0} MiB/s)",
+        bytes / 1024,
+        bytes as f64 / ms / 1048.576
+    );
+}
+
 #[test]
 fn download_returns_exactly_the_requested_length() {
     let test = "download_returns_exactly_the_requested_length";
@@ -265,7 +299,7 @@ fn download_returns_exactly_the_requested_length() {
     };
     // Three floats: below any plausible allocation alignment, so padding would show.
     let data = [1.0f32, 2.0, 3.0];
-    for usage in [Usage::Storage, Usage::Staging] {
+    for usage in [Usage::Storage, Usage::Staging, Usage::Readback] {
         let mut buffer = Buffer::from_f32(&gpu, &data, usage).expect("buffer");
         let got = buffer.download_f32().expect("download");
         assert_eq!(got.len(), data.len(), "{usage:?} download length");
