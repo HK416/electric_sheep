@@ -868,10 +868,10 @@ camera is in no scene and in no IR, and its frames are watched by people, not by
 `exp`/`ln` of the highlight. Measured on the SO-101 demo cell (V19b `nominal-00`, 224 ticks,
 1280×720, RTX 4090, `es video showcase`), with the readback of §8.4 still in every frame:
 
-| look | ms/frame, three runs of 224 frames |
+| look | ms/frame, interleaved runs of 224 frames |
 |---|---|
-| `lambert` | 6.8, 6.9, 6.6 |
-| `full` (`ssaa: 2`, shadows on) | 9.9, 10.0, 9.9 |
+| `lambert` | 6.7, 6.6 |
+| `full` (`ssaa: 2`, shadows on) | 10.1, 9.9, 9.9 |
 
 **+3.1 ms/frame, about +46%**, for 8× the rays — because the frame is not ray-bound. This is
 the whole-command wall clock divided by the frames (tessellate, upload, dispatch, readback,
@@ -884,3 +884,7 @@ of it, and `Full` at `ssaa: 2` makes that about 4.
 
 At 96×96 — the observation size — none of this applies: the observation path renders
 `Lambert` and only `Lambert` (§9.5), so its cost did not move by a nanosecond.
+
+These are the amended mix's numbers; it costs nothing to conserve energy (one subtract and
+one multiply replace one add), and the frame `show-full/000120.bin` has **no** saturated
+pixel where the additive form left the whole table at 255.
