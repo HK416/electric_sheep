@@ -2790,6 +2790,96 @@ comparison), a delta action space (§8.5, preceded by the `es-ir` split), and a 
 expert's trajectories. Either way, rungs 2, 5 and 6 of the ladder come first — if the harness
 cannot be trusted, neither conclusion is a measurement.
 
+### 28.10 M7 — Usability, Training Throughput, Render Quality (plan U)
+
+After M5 closed (`docs/reviews/M5.md`) the owner asked for four things on 2026-09-16: **make
+training easier to use**, **make `es-editor` friendlier**, **raise training speed and task
+accuracy together**, and **raise the quality of both render paths, RS and PT**. This subsection
+turns the four into a §1.2 packet ladder. §28.9's three rules (the harness passes the expert
+first · an invalidated measurement is marked, never deleted · no performance claim rests on a
+metric that does not reproduce) apply unchanged, and the M5 follow-ups R1–R10 that this
+subsection's oracles lean on (R2 latency in evaluation, R4 dataset provenance, R7 `Cargo.lock`)
+are pulled onto the ladder. M6 (quadruped) stays parked until the owner's go/park decision;
+this subsection does not replace it.
+
+**Where things stand, measured (2026-09-16, oracle server RTX 4090)**
+
+| Area | As built | Cost |
+|---|---|---|
+| Using training | The external ACT path is six commands — `export → lerobot-train → import-lerobot → eval run → showcase → encode` — some thirty flags, and hashes copied by hand (`docs/packets/M5/V19`'s server script). The IR path is `bake → lower → train_act.py → pack → eval`. There is no `es train` (§13.1) and §19.3's `training_hash` is all zeros except the `dataset` slot | nine scripts for a person to assemble one cycle |
+| Training speed | The lowering is single-sample (`unsqueeze(0)`), so `--batch 8` is eight forwards accumulated. 20,000 steps ≈ 11 min (kernel-launch bound); batch 64 with linear lr scaling is NaN (7.11). No pretrained-backbone path (L13) | one retrain 11 min; the external ACT's 100k steps 34 min |
+| Accuracy | IR-graph policy held-out 0.625 (V18b), external ACT 0.9375 (V19b), on the committed documents | — |
+| Editor | A bundle path in a text field → four tabs Graph/Telemetry/Images/Diagnostics, six edits over the Task IR. No view opens a run (`report.json`, `events.json`, `.estraj`, frames), no 3D view, no parameter inspector, no telemetry producer (a replay source only) | most of §23.3 is empty |
+| Render RS | A flat triangle scan, O(pixels × triangles), re-tessellated and re-uploaded every frame: **80 ms/frame** at 1280×720, one camera (2,978 triangles, 7.17). Lambert plus a constant ambient; no shadows, no highlights, no textures | a 1,407-frame showcase ≈ 2 min |
+| Render PT | Diffuse only, emissive triangles the only lights, ReSTIR combined with the biased `1/M` weight, à-trous without SVGF's V, no tone map → no `Rgb8` → the showcase is RS-only (7.17 item 5) | §15.3's SSIM contract unmeasured |
+
+**Three rules this subsection fixes.** They are the fences that keep the four goals off each
+other's feet.
+
+1. **The observation pixels of a committed document do not change unless the document does.**
+   A renderer improvement arrives as a new `RenderConfig` field whose default is today's output,
+   and the default path is pinned bit for bit by `tests/golden/render/` and
+   `tests/fixtures/visible-learning/frames`. A change that moves one byte is not a renderer
+   change but a **document change**, and it invalidates that document's checkpoints (§5.3, §15.3).
+2. **`es train` fills every §19.3 slot with a real value or marks it unset.** No fabricated
+   digest enters `training_hash` (the rule of `docs/design/learning-loop.md` section 1, promoted
+   to a command). When it calls an external trainer (`lerobot-train`), that trainer's config
+   file, version and seed go into `config.json` and `hardware.json`.
+3. **The editor decides nothing in `app.rs`** (`docs/design/editor-shell.md` section 2). The run
+   browser, the 3D replay, the inspector and the launch panel each get a headless view-model and
+   its tests first. What a display-less CI cannot judge is, per §1.4, design and not
+   implementation.
+
+**One sentence on accuracy.** The M5 review demoted the IR-graph policy to a lowering oracle.
+This subsection does not reverse that, but T3, T4 and T5 change the lowering itself (batch
+axis, schedule, pretrained backbone), so their result is re-measured **once** on the committed
+documents (V15's 200 demonstrations, the same Evaluation IR). Stop rule: if held-out does not
+exceed V18b's 0.625 after T5, IR-graph tuning ends here and the product is the external path's
+speed (T1, T2). If it does, the number goes into the as-built record from 7.30 on, beside V19b.
+
+**The packet ladder.** The three tracks touch disjoint crates (T: `es`, `es-policy`, `es-data`,
+`python/es`; E: `es-editor`, `es-telemetry`, one hook in `es-eval`; R: `es-render`,
+`es-env/render.rs`, `es/cmd/showcase.rs`), so within a wave they run in parallel. Each row is
+one §1.2 packet and each oracle is a runnable one-liner. Design notes:
+`docs/design/training-recipe.md` (T), `editor-shell.md` extended (E), `renderer.md` extended
+(R). Packets: `docs/packets/M7/`.
+
+| Wave | Packet | Question it answers | Oracle (one line) | Type |
+|---|---|---|---|---|
+| 1 | **T1 `es train`** | Does one document (`training.toml`: dataset, bundle or LeRobot policy type, steps/batch/lr/seed/schedule/checkpoint marks, device, interpreter) drive both the IR path and the external path with one command and write §19.3's `training/` with real values | `cargo test -p es --test cli train_`: the `--dry-run` command plan is byte-identical to a golden; the same recipe twice → one `training_hash`; the IR path at 40 steps on the fixture packs a bundle `TorchRuntime` opens (SKIP with a printed reason without `ES_PYTHON`) | B |
+| 1 | **E1 run browser** | Does opening `<run>/` show the cells × outcome × metrics table, a per-episode Safety Plane event timeline (stage, joint, tick) and a frame filmstrip | `cargo test -p es-editor`: `RunView::open` on the fixture run reproduces `report.json`'s numbers and the timeline buckets sum to `events.json`'s counts | B |
+| 1 | **E2 3D replay** | Can an `.estraj` be replayed inside the editor with no physics and no GPU (`TriScene::from_scene_with_poses` → project → depth sort → `egui::Mesh`, scrubber and play) | headless: the projected triangle set of tick t is a pure function of (trajectory, camera) — a sort-order golden; `app.rs` compiles only | B |
+| 1 | **R1 instance transforms + software two-level BVH** | With one BLAS per geom built once and only poses uploaded per frame (the TLAS rebuilt on the CPU each frame), how far does 80 ms fall, and does preserving the scan order keep the output bit-identical | every existing golden unchanged; BVH == flat scan bitwise (CPU and GPU, Cornell + SO-101 at three ticks); showcase ms/frame before and after recorded (target < 5 ms, `Target / Status: unverified`) | B |
+| 2 | **T3 batched lowering** (§28.9 rung 9) | When `lower_to_torch` emits a leading batch axis and `train_act.py` uses real batches, where does the training time go | `cargo test -p es-policy`: the batched module at N=1 vs single-sample ≤ tier-4 fp32 (CPU); `train()==eval()` stays bit-identical; 20k-step wall-clock before and after recorded (observation) | B |
+| 2 | **E3 inspector, search, open** | Is there a widget per `NodeSchema` `ParamType`, a node search, and opening by recent files and drag-and-drop | headless: the inspector model covers every `ParamType` and `SetParam` round-trips through it; zero new dependencies | B |
+| 2 | **R2 the RS look** | Can shadow rays, a hemisphere ambient, Blinn-Phong and SSAA be switched on (opt-in `Shading::Full`) while the default look stays unchanged | existing goldens unchanged; `cornell_rs_full_*` goldens generated by the CPU generator and matched by the GPU bitwise / ≤ 1 ULP; the `frames` fixture untouched | B |
+| 3 | **T2 `es loop cycle`** | Does collect → train → eval (→ showcase) run under one document and one `loop.jsonl` (§13.3) | `--dry-run` plan golden; a fixture cycle with the scripted expert → three `loop.jsonl` rows whose hashes chain (`ES_PYTHON`) | B |
+| 3 | **T4 lr schedule + large batch** | With warmup + cosine and a `scheduler.json`, does batch 64 stop diverging | scheduler unit golden (exact floats); server: batch 64 with the schedule has a finite loss at or below batch 8's at equal samples seen (observation, not a gate) | B/D |
+| 3 | **T5 pretrained backbone** (L13) | Does `pretrained = true` lower to torchvision's ImageNet ResNet18 weights (BSD-3, §29 licence row) with FrozenBN, and does `base_model.lock` pin their provenance | `train()==eval()` bit-identical; a `base_model.lock` hash mismatch is refused; a provenance test downloads and verifies the blake3 (ignored tier) | B |
+| 3 | **E4 live telemetry** | Does `es eval run --telemetry <addr>` publish `StepEvent`s and the §12.4 nine metrics through `es_telemetry::transport::Server`, and does the editor attach | loopback: N frames published → the client receives N in order; gate-9 overhead measured (observation) | B |
+| 3 | **R3 PT quality** | With NEE + MIS (emissive, directional, sky), an unbiased ReSTIR combination (pairwise MIS) and an `approx`-based tone map, does PT emit `Rgb8` and does §15.3's SSIM contract get measured | tone map CPU == GPU bitwise; `cornell_pt1spp` unchanged with NEE off; SSIM(RS full, converged PT) recorded (threshold fixed after measurement, `unverified`); `es video showcase --path pt` writes frames | B/C |
+| 4 | **T6 training augmentation** | Are random shift/crop and brightness recorded in `augmentation.json` and reproduced from the seed | seed → augmented tensor golden; `training_hash` moves with it | B |
+| 4 | **T7 latency in evaluation** (M5 R2, L22) | With a declared `expected_latency_ms`, is tick 0 a chunk underrun, and do the collection and evaluation traces agree to the last tick | `cargo test -p es-eval` | B |
+| 4 | **T8 episode seek** (§28.9 rung 10) | Does `--jobs` shard per episode so that the 16-episode nominal run parallelises too | state after a seek == replaying 0..n bitwise; nominal wall-clock before and after (observation) | B |
+| 4 | **E5 launch panel** | Does the editor spawn `es eval run` / `es train` as a child process and attach over `--telemetry` (§23.1: a client, not a host) | headless: the command line the panel model builds is a golden; the exit status is shown | B |
+| 4 | **R4 temporal accumulation + SVGF variance** | On the static showcase camera does frame accumulation stand in for spp, and does the variance term drive the filter width | accumulated N × 1 spp vs 1 × N spp within a stated tolerance; goldens | B |
+| 5 | **U-measurement** | The IR graph after T3–T5 retrained on V15's 200 demonstrations and re-measured on the committed documents; one `es loop cycle` wall-clock; showcase mp4s from R1–R3 (RS full, PT) | `report.json`, `training.lock` and ms/frame recorded in the as-built sections from 7.30 on, beside V18b and V19b | D |
+| 5 | **M7 review** | Has the record come back into the specification | `docs/reviews/M7.md` + `.ko.md`; `cargo xtask ci` green | A |
+
+**What is not on the ladder, and why.** **Mesh geoms** (the upstream SO-101 STLs) and **MJCF
+textures and materials** (builtin checker, `texrepeat`, `specular`, `shininess`) each need
+`es-assets` work — loading `Shape::Mesh`, fields on `Material` — and both move `scene_hash`,
+invalidating the committed checkpoints; they become R5 and R6 after the owner's decision.
+**MJWarp in evaluation** (§28.9 rung 11) opens only after T8 has parallelised the nominal run
+and the gain is still there, because a tier-3 backend changes the numbers. **The sensor realism
+pass** (§18.3) was never asked for. **M6** is parked.
+
+**Owner decisions.** (1) Allow one accuracy re-measurement of the IR graph (with the stop rule
+above) — default: allowed. (2) The hash consequence of R5/R6: accept re-collection and
+retraining or not. (3) The `lerobot` version `es train`'s external path pins (0.6.1,
+`docs/api-notes/lerobot-config.md`). (4) Committing `Cargo.lock` (M5 R7) — needed if
+`es train`'s `hardware.json` is to name a reproducible build.
+
 ---
 
 ## 29. Risks

@@ -2781,6 +2781,87 @@ IR의 히스토리 창으로 관측 스택 표현, 학습 환경과 우리 물�
 분할 선행), 전문가 궤적의 재설계. 어느 쪽이든 사다리의 2·5·6이 선행 조건이다 — 하네스를 신뢰할 수
 없으면 어느 쪽 결론도 측정이 아니다.
 
+### 28.10 M7 — 사용성·학습 처리량·렌더 품질 (plan U)
+
+M5가 닫힌 뒤(`docs/reviews/M5.ko.md`) 소유자가 2026-09-16에 네 가지를 요구했다: **학습을 더 쉽게
+쓰게**, **`es-editor`를 더 사용자 친화적으로**, **학습 속도와 태스크 정확도를 함께 높이고**,
+**RS·PT 두 렌더 경로의 품질을 높인다**. 이 절은 그 넷을 §1.2의 패킷 사다리로 옮긴 것이다.
+§28.9의 규칙 셋(하네스가 먼저 전문가를 통과한다 · 무효화된 측정은 지우지 않고 표시한다 · 재현되지
+않는 지표로 성능을 주장하지 않는다)은 그대로 적용되고, M5 리뷰의 후속 R1–R10 중 이 절의 오라클이
+기대는 것(R2 평가 지연 모델, R4 데이터셋 출처, R7 `Cargo.lock`)은 사다리에 끌어온다. M6(4족 보행)은
+소유자의 go/park 결정이 있을 때까지 보류이며 이 절은 그것을 대체하지 않는다.
+
+**현 상태, 실측(2026-09-16, 오라클 서버 RTX 4090)**
+
+| 영역 | as-built | 비용 |
+|---|---|---|
+| 학습 사용 | 외부 ACT 경로는 `export → lerobot-train → import-lerobot → eval run → showcase → encode` 여섯 명령, 플래그 30여 개, 해시를 손으로 옮겨 적는다(`docs/packets/M5/V19` 서버 스크립트). IR 경로는 `bake → lower → train_act.py → pack → eval`. `es train`(§13.1)은 없고 §19.3의 `training_hash`는 `dataset` 슬롯 외 전부 0 | 한 사이클을 사람이 조립하는 데 스크립트 아홉 개 |
+| 학습 속도 | 로워링이 단일 샘플(`unsqueeze(0)`)이어서 `--batch 8`은 forward 여덟 번의 누적. 20,000 스텝 ≈ 11분(커널 런치 바운드), 배치 64 + 선형 lr 스케일은 NaN(7.11). 사전학습 백본 경로 없음(L13) | 재학습 한 번 11분, 외부 ACT 100k는 34분 |
+| 정확도 | IR 그래프 정책 held-out 0.625(V18b), 외부 ACT 0.9375(V19b), 커밋된 문서에서 | — |
+| 에디터 | 번들 경로 텍스트 입력 → Graph/Telemetry/Images/Diagnostics 네 탭, Task IR 편집 여섯 동작. 런 결과(`report.json`·`events.json`·`.estraj`·프레임)를 여는 뷰 없음, 3D 뷰 없음, 파라미터 인스펙터 없음, 텔레메트리 프로듀서 없음(재생 소스만) | §23.3의 항목 대부분이 비어 있다 |
+| 렌더 RS | 삼각형 배열 평면 스캔 O(픽셀×삼각형), 매 프레임 재테셀레이션·재업로드: 1280×720 한 카메라 **80 ms/프레임**(2,978 삼각형, 7.17). Lambert + 상수 ambient, 그림자·하이라이트·텍스처 없음 | 쇼케이스 1,407프레임 ≈ 2분 |
+| 렌더 PT | 확산만, 방출 삼각형만 광원, ReSTIR 결합 가중 `1/M`(편향), à-trous만(SVGF의 V 없음), 톤맵 없음 → `Rgb8` 출력 불가 → 쇼케이스는 RS 전용(7.17 항목 5) | §15.3의 SSIM 계약 미측정 |
+
+**이 절이 고정하는 규칙 세 개.** 네 목표가 서로 밟지 않게 하는 경계다.
+
+1. **커밋된 문서의 관측 픽셀은 문서가 바뀌지 않는 한 바뀌지 않는다.** 렌더러 개선은 새 `RenderConfig`
+   필드(기본값 = 오늘의 출력)로 들어오고, 기본 경로는 `tests/golden/render/`와
+   `tests/fixtures/visible-learning/frames`가 비트 단위로 고정한다. 한 바이트라도 움직이는 변경은
+   렌더러 변경이 아니라 **문서 변경**이며 그 체크포인트를 무효화한다(§5.3, §15.3).
+2. **`es train`은 §19.3의 슬롯을 실제 값으로 채우거나 "unset"으로 표시한다.** 만들어 낸 다이제스트로
+   `training_hash`를 채우지 않는다(`docs/design/learning-loop.md` 1절의 규칙을 명령으로 승격).
+   외부 학습기(`lerobot-train`)를 부를 때도 그 설정 파일·버전·시드가 `config.json`·`hardware.json`에
+   들어간다.
+3. **에디터는 `app.rs`에서 아무것도 결정하지 않는다**(`docs/design/editor-shell.md` 2절). 런 브라우저,
+   3D 재생, 인스펙터, 실행 패널은 각각 헤드리스 뷰모델과 그 테스트를 먼저 갖는다. 디스플레이 없는
+   CI가 판정할 수 없는 것은 §1.4에 따라 구현이 아니라 설계다.
+
+**정확도에 대한 한 문장.** M5 리뷰는 IR 그래프 정책을 로워링 오라클로 내렸다. 이 절은 그 결정을
+뒤집지 않되, T3·T4·T5가 로워링 자체(배치 축·스케줄·사전학습 백본)를 바꾸므로 그 결과를 커밋된 문서로
+**한 번** 재측정한다(V15의 시연 200편, 같은 Evaluation IR). 중단 규칙: T5 뒤에도 held-out이 V18b의
+0.625를 넘지 못하면 IR 그래프 튜닝은 여기서 끝이고, 제품은 외부 경로의 속도(T1·T2)다. 넘으면
+그 수치를 7.30 이후의 as-built 절에 V19b 옆에 적는다.
+
+**패킷 사다리.** 세 트랙은 크레이트가 겹치지 않아(T: `es`·`es-policy`·`es-data`·`python/es`,
+E: `es-editor`·`es-telemetry`·`es-eval`의 훅 한 곳, R: `es-render`·`es-env/render.rs`·
+`es/cmd/showcase.rs`) 같은 파동(wave) 안에서 병렬로 간다. 각 행은 §1.2 패킷 하나이고 오라클은 실행
+가능한 한 줄이다. 디자인 노트: `docs/design/training-recipe.md`(T), `editor-shell.md` 확장(E),
+`renderer.md` 확장(R). 패킷: `docs/packets/M7/`.
+
+| 파동 | 패킷 | 답하는 질문 | 오라클 (한 줄) | 유형 |
+|---|---|---|---|---|
+| 1 | **T1 `es train`** | 문서 하나(`training.toml`: 데이터셋, 번들 또는 LeRobot 정책 종류, 스텝·배치·lr·시드·스케줄·체크포인트 지점, 디바이스, 인터프리터)로 IR 경로와 외부 경로를 한 명령으로 돌리고 §19.3 `training/`을 실제 값으로 쓰는가 | `cargo test -p es --test cli train_`: `--dry-run`의 명령 계획이 골든과 바이트 동일; 같은 레시피 두 번 → `training_hash` 하나; IR 경로 40스텝이 `TorchRuntime`이 여는 번들을 만든다(`ES_PYTHON` 없으면 이유를 찍고 SKIP) | B |
+| 1 | **E1 런 브라우저** | `<run>/`을 열면 셀×결과×지표 표, 에피소드별 Safety Plane 이벤트 타임라인(단계·관절·틱), 프레임 필름스트립이 보이는가 | `cargo test -p es-editor`: `RunView::open`이 픽스처 런의 `report.json` 숫자를 재현하고 타임라인 버킷 합이 `events.json`의 카운트와 같다 | B |
+| 1 | **E2 3D 재생** | `.estraj`를 물리·GPU 없이 에디터 안에서 재생할 수 있는가(`TriScene::from_scene_with_poses` → 투영 → 깊이 정렬 → `egui::Mesh`, 스크러버·재생) | 헤드리스: 틱 t의 투영 삼각형 집합은 (궤적, 카메라)의 순함수 — 정렬 순서 골든; `app.rs`는 컴파일만 | B |
+| 1 | **R1 인스턴스 변환 + 소프트웨어 2단계 BVH** | 지옴별 BLAS를 한 번 만들고 프레임마다 포즈만 올리면(TLAS는 CPU에서 매 프레임) 80 ms가 어디까지 내려가며, 스캔 순서를 보존해 출력이 한 비트도 안 바뀌는가 | 기존 골든 전부 불변; BVH == 평면 스캔 비트 동일(CPU·GPU, Cornell + SO-101 3틱); 쇼케이스 ms/프레임 전후 기록(목표 < 5 ms, `Target / Status: unverified`) | B |
+| 2 | **T3 배치 로워링** (§28.9 사다리 9) | `lower_to_torch`가 선두 배치 축을 내고 `train_act.py`가 진짜 배치를 쓰면 학습 시간이 어디로 가는가 | `cargo test -p es-policy`: 배치 모듈 N=1 vs 단일 샘플 ≤ tier-4 fp32(CPU); `train()==eval()` 비트 동일 유지; 20k 스텝 벽시계 전후 기록(관측) | B |
+| 2 | **E3 인스펙터·검색·열기** | `NodeSchema`의 `ParamType`마다 위젯이 있고, 노드 검색이 있고, 최근 파일·드래그 드롭으로 여는가 | 헤드리스: 인스펙터 모델이 모든 `ParamType`을 덮고 `SetParam`이 왕복한다; 새 의존성 0 | B |
+| 2 | **R2 RS 룩** | 그림자 광선·반구 ambient·Blinn-Phong·SSAA를 켤 수 있는가(옵트인 `Shading::Full`), 기본 룩은 불변인가 | 기존 골든 불변; `cornell_rs_full_*` 골든을 CPU 생성기가 만들고 GPU가 비트/≤1 ULP로 일치; `frames` 픽스처 불변 | B |
+| 3 | **T2 `es loop cycle`** | collect → train → eval (→ showcase)를 문서 하나·`loop.jsonl` 하나로 돌리는가(§13.3) | `--dry-run` 계획 골든; 스크립트 전문가로 픽스처 사이클 → `loop.jsonl` 세 행의 해시가 사슬을 이룬다(`ES_PYTHON`) | B |
+| 3 | **T4 lr 스케줄 + 큰 배치** | 웜업+코사인과 `scheduler.json`으로 배치 64가 발산하지 않는가 | 스케줄러 단위 골든(정확한 부동소수); 서버: 배치 64 + 스케줄의 손실이 유한하고 같은 샘플 수에서 배치 8 이하(관측, 게이트 아님) | B/D |
+| 3 | **T5 사전학습 백본** (L13) | `pretrained = true`가 torchvision ResNet18 ImageNet 가중치(BSD-3, §29 라이선스 행) + FrozenBN으로 로워링되고 `base_model.lock`이 그 출처를 고정하는가 | `train()==eval()` 비트 동일; `base_model.lock` 해시 불일치 거부; 출처 테스트가 내려받아 blake3 검증(ignored 티어) | B |
+| 3 | **E4 라이브 텔레메트리** | `es eval run --telemetry <addr>`가 `StepEvent`와 §12.4 9지표를 `es_telemetry::transport::Server`로 내보내고 에디터가 붙는가 | 루프백: N프레임 발행 → 클라이언트가 N개를 순서대로 수신; 게이트 9 오버헤드 실측(관측) | B |
+| 3 | **R3 PT 품질** | NEE + MIS(방출·방향광·하늘), 편향 없는 ReSTIR 결합(pairwise MIS), `approx` 기반 톤맵 → PT가 `Rgb8`를 내고 §15.3의 SSIM 계약이 측정되는가 | 톤맵 CPU==GPU 비트 동일; NEE off일 때 `cornell_pt1spp` 불변; SSIM(RS full, PT 수렴) 값 기록(임계값은 실측 뒤 고정, `unverified`); `es video showcase --path pt` 프레임 생성 | B/C |
+| 4 | **T6 학습 증강** | 랜덤 시프트/크롭·밝기 증강이 `augmentation.json`에 기록되고 시드로 재현되는가 | 시드 → 증강 텐서 골든; `training_hash`가 함께 움직인다 | B |
+| 4 | **T7 평가 지연 모델** (M5 R2, L22) | 선언된 `expected_latency_ms`에서 틱 0이 chunk underrun인가, 수집·평가 궤적이 마지막 틱까지 일치하는가 | `cargo test -p es-eval` | B |
+| 4 | **T8 에피소드 seek** (§28.9 사다리 10) | `--jobs`가 에피소드 단위로 갈라져 nominal 16편도 병렬이 되는가 | seek 뒤 상태 == 0..n 재생 비트 동일; nominal 벽시계 전후(관측) | B |
+| 4 | **E5 실행 패널** | 에디터가 `es eval run`/`es train`을 자식 프로세스로 띄우고 `--telemetry`로 붙는가(§23.1: 호스트 아님, 클라이언트) | 헤드리스: 패널 모델이 만든 명령줄 골든; 종료 코드 표시 | B |
+| 4 | **R4 시간 누적 + SVGF 분산** | 정지 카메라 쇼케이스에서 프레임 누적이 spp를 대신하고, 분산 항이 필터 폭을 이끄는가 | 누적 N×1spp vs 1×N spp가 정해진 허용치 안; 골든 | B |
+| 5 | **U-측정** | T3·T4·T5 뒤의 IR 그래프를 V15 시연 200편으로 재학습해 커밋된 문서로 재측정; `es loop cycle` 한 번의 벽시계; R1–R3의 쇼케이스 mp4(RS full·PT) | `report.json`·`training.lock`·ms/프레임을 7.30 이후 as-built 절에 V18b·V19b 옆에 적는다 | D |
+| 5 | **M7 리뷰** | 기록이 사양으로 돌아왔는가 | `docs/reviews/M7.md` + `.ko.md`; `cargo xtask ci` 녹색 | A |
+
+**사다리에 없는 것과 이유.** **메시 지옴 렌더**(SO-101 상류 STL)와 **MJCF 텍스처·재질**(builtin
+checker, `texrepeat`, `specular`·`shininess`)은 각각 `es-assets`의 `Shape::Mesh` 로딩과 `Material`
+필드를 요구하고, 둘 다 `scene_hash`를 움직여 커밋된 체크포인트를 무효화한다 — 소유자 결정 뒤 R5·R6로
+이어진다. **MJWarp을 평가에**(§28.9 사다리 11)는 티어 3 백엔드가 숫자를 바꾸므로 T8이 nominal을
+병렬화한 뒤 그 이득이 남아 있을 때 연다. **센서 리얼리즘 패스**(§18.3)는 요구된 적이 없다. **M6**은
+보류.
+
+**소유자 결정.** (1) IR 그래프 정확도 재측정을 한 번 허용(위 중단 규칙과 함께) — 기본값 허용.
+(2) R5·R6의 해시 결과: 재수집·재학습을 감수하는가. (3) `es train`의 외부 경로가 고정하는
+`lerobot` 버전(0.6.1, `docs/api-notes/lerobot-config.md`). (4) `Cargo.lock` 커밋(M5 R7) — `es train`의
+`hardware.json`이 재현 가능한 빌드를 가리키려면 필요하다.
+
 ---
 
 ## 29. 리스크
