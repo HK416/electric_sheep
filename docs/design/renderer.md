@@ -646,3 +646,29 @@ packet's scope, so it is packet **M7/R1b**. Until it lands: `Target / Status: un
 any 1280×720 frame-total below ~64 ms, and the §28.10 target of `< 5 ms/frame` is a target
 for R1b, not a claim of R1. At 96×96 — the size every observation frame is rendered at — the
 frame is already 2.2 ms on the 3060 and 4.2 ms on the 4090, of which readback is a third.
+
+**R1b landed** (`docs/packets/M7/R1b-readback.md`, commit `7c8fe39`): `Buffer::download` now
+stages through `Usage::Readback` (`MemoryLocation::GpuToCpu`, host-cached), and
+`frame_profile` times that path directly (`device-local download of 3600 KiB via
+Buffer::download`). Every render test and golden unchanged on both GPUs, the 96×96 replay of
+V19b `nominal-00` still **224 / 224 bit-identical** to the recorded frames.
+
+| 1280×720, median ms | RTX 3060 R1 | RTX 3060 R1b | RTX 4090 R1 | RTX 4090 R1b |
+|---|---|---|---|---|
+| readback | 85.082 | **7.229** | 63.830 | **3.001** |
+| frame total | 87.445 | **12.586** | 65.967 | **5.207** |
+| `Buffer::download`, 3,600 KiB | (86 ms path) | 1.228 (2.9 GiB/s) | (68 ms path) | 1.682 (2.1 GiB/s) |
+| `camera_frames_per_sec` (median frame) | 11.4 | 79 | 15.2 | 192 |
+| `pixels_per_sec` (median frame) | 1.05e7 | 7.3e7 | 1.40e7 | 1.77e8 |
+
+| 96×96, median ms | RTX 3060 R1 | RTX 3060 R1b | RTX 4090 R1 | RTX 4090 R1b |
+|---|---|---|---|---|
+| readback | 0.808 | 0.285 | 1.510 | 0.446 |
+| frame total | 2.168 | 4.296 (p95 15.5, a busy desktop) | 4.234 | **2.410** |
+
+**The showcase, RTX 4090, V19b `nominal-00` at 1280×720: 122.2 → 118.6 → 6.2 ms/frame** — the
+224-frame cell renders in 1.4 s where V9 measured 80 ms/frame; the 96×96 replay is 2.6 ms/frame.
+The §28.10 target of `< 5 ms/frame` at 1280×720 reads **5.2 ms** on the 4090's profile — not
+met, by 0.2 ms; the 3.0 ms readback that remains is mostly `Atlas::read_tile`'s host-side
+unpack of the packed `RGBA8` words into `Rgb8` bytes (the copy itself is 1.7 ms), which is
+where the next millisecond lives if anyone needs it. The 3060 does not reach it (12.6 ms).
