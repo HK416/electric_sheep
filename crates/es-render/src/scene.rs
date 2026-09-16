@@ -1,9 +1,10 @@
 //! `SceneDesc` -> triangles.
 //!
-//! There is no acceleration structure. Spec 15.4 wants one TLAS over the scene with a shared
-//! BLAS per repeated robot, but `es-gpu` exposes compute pipelines only — no ray-tracing
-//! extension, no acceleration-structure build — so both render paths scan a flat array in
-//! index order. That is the honest ceiling of this packet: a few hundred triangles.
+//! The acceleration structure is a software one: spec 15.4 wants one TLAS over the scene with
+//! a shared BLAS per repeated robot, but `es-gpu` exposes compute pipelines only — no
+//! ray-tracing extension, no acceleration-structure build — so both render paths traverse
+//! [`crate::bvh::Bvh`], built here on the CPU per frame (packet M7/R1), and its answer is the
+//! flat index-order scan's answer bit for bit.
 
 use es_assets::scene::{Body, Geom, SceneDesc, Shape};
 use es_core::StableId;
