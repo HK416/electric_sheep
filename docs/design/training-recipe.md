@@ -406,7 +406,7 @@ with the port-name message quoted in section 2 — the refusal working, and the 
 measured to diverge, so what is needed is a schedule, not a convention.* This section is that
 line turned into a document field, a function, a golden and four measured runs.
 
-**The three flags, and what is a document value.** `train_act.py` gains `--schedule
+**Five flags on the trainer, three fields in the document.** `train_act.py` gains `--schedule
 constant|warmup_cosine`, `--warmup-steps N`, `--lr-min F`, `--weight-decay F` (torch's own
 `1e-2`, **made explicit** so `optimizer.json` names a number the script was told rather than
 one it assumes) and `--grad-clip F` (`0` = off). The recipe names them in `[run]`:

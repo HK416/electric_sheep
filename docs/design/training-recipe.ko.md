@@ -392,7 +392,7 @@ ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python \
 것으로 측정되었으므로, 필요한 것은 관례가 아니라 스케줄이다.* 이 절은 그 한 줄을 문서 필드
 하나, 함수 하나, 골든 하나, 그리고 측정된 네 번의 실행으로 바꾼 것이다.
 
-**세 개의 플래그, 그리고 무엇이 문서 값인가.** `train_act.py`는 `--schedule
+**트레이너의 다섯 플래그, 문서의 세 필드.** `train_act.py`는 `--schedule
 constant|warmup_cosine`, `--warmup-steps N`, `--lr-min F`, `--weight-decay F`(torch 자신의
 `1e-2`를 **명시적으로** — `optimizer.json`이 스크립트가 가정한 수가 아니라 실제로 시킨 수를
 이름 붙일 수 있도록), `--grad-clip F`(`0`이면 끔)를 얻는다. 레시피는 `[run]`에서 그것들을
