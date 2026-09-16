@@ -461,6 +461,105 @@ fn cached_tessellation_is_bit_identical() {
     }
 }
 
+/// Packet M7/R1 oracle 3: over 10,000 deterministic rays per scene, the BVH descent returns
+/// the flat scan's `Option<Hit>` — bitwise on `t`, the same triangle index — and the any-hit
+/// descent returns the flat shadow scan's boolean.
+///
+/// Rays are counter-based (`es_render::rng`, spec 3.4: no global RNG): origins on a sphere
+/// around the scene's centre aimed back through a jittered point near it, so they cross the
+/// geometry from every direction rather than sampling one camera's frustum.
+#[test]
+fn bvh_traversal_is_the_flat_scan() {
+    use es_render::bvh::Bvh;
+    use es_render::rng;
+    for (name, tri) in [
+        (
+            "cornell",
+            TriScene::from_scene(&cornell_box()).expect("cornell"),
+        ),
+        ("so101", TriScene::from_scene(&so101()).expect("so101")),
+    ] {
+        // Scene bounds, to aim the rays at something.
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for t in &tri.tris {
+            for v in &t.v {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(v[k]);
+                    hi[k] = hi[k].max(v[k]);
+                }
+            }
+        }
+        let mid = [
+            (lo[0] + hi[0]) * 0.5,
+            (lo[1] + hi[1]) * 0.5,
+            (lo[2] + hi[2]) * 0.5,
+        ];
+        let radius = (0..3).fold(0.0f32, |m, k| m.max(hi[k] - lo[k])) + 1.0;
+
+        let bvh = Bvh::build(&tri.tris);
+        let (mut hits, mut shadows) = (0u32, 0u32);
+        for r in 0..10_000u32 {
+            let key = rng::key(0x5eed, 0, r, r ^ 0x9e37, 0, 0, 0);
+            let u = rng::uniform(key, 0) * 2.0 - 1.0;
+            let phi = rng::uniform(key, 1) * std::f32::consts::TAU;
+            let s = (1.0 - u * u).max(0.0).sqrt();
+            let o = [
+                mid[0] + radius * s * phi.cos(),
+                mid[1] + radius * s * phi.sin(),
+                mid[2] + radius * u,
+            ];
+            // Aim back through a point inside the scene box, so most rays actually hit.
+            let aim = [
+                lo[0] + (hi[0] - lo[0]) * rng::uniform(key, 2),
+                lo[1] + (hi[1] - lo[1]) * rng::uniform(key, 3),
+                lo[2] + (hi[2] - lo[2]) * rng::uniform(key, 4),
+            ];
+            let d = [aim[0] - o[0], aim[1] - o[1], aim[2] - o[2]];
+            let (near, far) = (0.01f32, 1e3f32);
+
+            let got = cpu::nearest_hit(&tri.tris, &bvh, o, d, near, far);
+            let want = cpu::nearest_hit_flat(&tri.tris, o, d, near, far);
+            match (got, want) {
+                (Some(a), Some(b)) => {
+                    assert_eq!(
+                        (a.t.to_bits(), a.tri),
+                        (b.t.to_bits(), b.tri),
+                        "{name} ray {r}: BVH {a:?} vs flat scan {b:?}"
+                    );
+                    hits += 1;
+                }
+                (None, None) => {}
+                (a, b) => panic!("{name} ray {r}: BVH {a:?} vs flat scan {b:?}"),
+            }
+            let got_any = cpu::any_hit(&tri.tris, &bvh, o, d, near, far);
+            assert_eq!(
+                got_any,
+                cpu::any_hit_flat(&tri.tris, o, d, near, far),
+                "{name} ray {r}: any-hit disagrees"
+            );
+            shadows += u32::from(got_any);
+        }
+        assert!(
+            hits > 1_000,
+            "{name}: only {hits} of 10000 rays hit anything"
+        );
+        assert!(
+            bvh.depth <= es_render::bvh::STACK,
+            "{name}: tree depth {} exceeds the {} traversal stack",
+            bvh.depth,
+            es_render::bvh::STACK
+        );
+        println!(
+            "{name}: {} triangles, {} nodes, max traversal depth {} (stack {}), \
+             10000 rays, {hits} nearest hits, {shadows} any-hits, all equal to the flat scan",
+            tri.tris.len(),
+            bvh.nodes.len(),
+            bvh.depth,
+            es_render::bvh::STACK
+        );
+    }
+}
+
 // --- profile (packet M7/R1 step 0) -----------------------------------------------------------
 
 /// The demo scene: the SO-101 pick-and-place cell `es video showcase` renders.
@@ -519,10 +618,11 @@ fn frame_profile() {
         let cfg = RenderConfig::rs(TileAtlasCfg::row(w, h, 1));
         let mut renderer = Renderer::new(&gpu, cfg).expect("renderer");
         let cams = [showcase_camera(w, h)];
+        let mut cache = es_render::SceneCache::default();
         let (mut tess, mut up, mut disp, mut read) = (vec![], vec![], vec![], vec![]);
         for _ in 0..100 {
             let t0 = std::time::Instant::now();
-            let tri = TriScene::from_scene_with_poses(&scene, &world).expect("tessellates");
+            let tri = cache.tri_scene(&scene, &world).expect("tessellates");
             let t1 = std::time::Instant::now();
             renderer.upload_tris(tri).expect("upload");
             let t2 = std::time::Instant::now();

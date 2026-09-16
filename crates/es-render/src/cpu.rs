@@ -20,6 +20,7 @@ use es_math::approx;
 use es_sensor::Channel;
 
 use crate::atlas::{Tile, TileData};
+use crate::bvh::{self, Bvh};
 use crate::rng;
 use crate::scene::{Tri, TriScene};
 use crate::view::{CameraView, RenderConfig, RenderPath, ViewParams};
@@ -125,11 +126,15 @@ fn intersect(tri: &Tri, o: [f32; 3], d: [f32; 3]) -> Option<f32> {
 /// Scan every triangle in ascending index order and keep the nearest hit strictly inside
 /// `(near, far)`. Ties go to the lower index, so the winner never depends on scheduling.
 ///
-/// `ponytail:` O(pixels x triangles), no spatial structure — the ceiling is a few hundred
-/// triangles. The upgrade path is spec 15.4's TLAS, which needs a Vulkan extension `es-gpu`
-/// does not expose; a per-tile triangle-bin compaction pass is the intermediate step and
-/// changes no output.
-pub fn nearest_hit(tris: &[Tri], o: [f32; 3], d: [f32; 3], near: f32, far: f32) -> Option<Hit> {
+/// Retained as [`nearest_hit`]'s oracle, not as a render path: `bvh_traversal_is_the_flat_scan`
+/// asserts the two agree on `Option<Hit>` bitwise over both scenes (packet M7/R1 oracle 3).
+pub fn nearest_hit_flat(
+    tris: &[Tri],
+    o: [f32; 3],
+    d: [f32; 3],
+    near: f32,
+    far: f32,
+) -> Option<Hit> {
     let mut best = far;
     let mut which = None;
     for (i, tri) in tris.iter().enumerate() {
@@ -143,9 +148,132 @@ pub fn nearest_hit(tris: &[Tri], o: [f32; 3], d: [f32; 3], near: f32, far: f32) 
     which.map(|tri| Hit { t: best, tri })
 }
 
-fn any_hit(tris: &[Tri], o: [f32; 3], d: [f32; 3], near: f32, far: f32) -> bool {
+/// [`nearest_hit_flat`] without the flat scan: `1 / d` once, then a stack-based descent of
+/// `bvh` in a fixed order — left child first, always, never ordered by the ray's sign.
+///
+/// **The hit rule is the flat scan's**, which is what makes the two agree bit for bit: nearest
+/// `t` with a strict `<`, ties broken by the lower *global* triangle index. A tie-break on the
+/// index rather than on the visit order is what buys the freedom to visit nodes in any order
+/// at all. The slab test is conservative (`bvh::LO`/`HI`, and every box padded outward), so
+/// the visited set is a superset of the triangles that can win; it may even differ by an ULP
+/// between the CPU and the GPU without changing the answer.
+#[allow(clippy::float_cmp)]
+pub fn nearest_hit(
+    tris: &[Tri],
+    bvh: &Bvh,
+    o: [f32; 3],
+    d: [f32; 3],
+    near: f32,
+    far: f32,
+) -> Option<Hit> {
+    let mut best = far;
+    let mut which: Option<u32> = None;
+    if bvh.nodes.is_empty() {
+        return None;
+    }
+    let inv = [rcp_safe(d[0]), rcp_safe(d[1]), rcp_safe(d[2])];
+    let mut stack = [0u32; bvh::STACK as usize];
+    let mut sp = 1usize;
+    while sp > 0 {
+        sp -= 1;
+        let ni = stack[sp] as usize;
+        let node = &bvh.nodes[ni];
+        if !slab(node, o, inv, near, best) {
+            continue;
+        }
+        if node.count == 0 {
+            stack[sp] = node.a;
+            stack[sp + 1] = ni as u32 + 1; // left child, popped first
+            sp += 2;
+            continue;
+        }
+        for k in 0..node.count as usize {
+            let i = bvh.prim[node.a as usize + k];
+            if let Some(t) = intersect(&tris[i as usize], o, d) {
+                if t > near && (t < best || matches!(which, Some(w) if t == best && i < w)) {
+                    best = t;
+                    which = Some(i);
+                }
+            }
+        }
+    }
+    which.map(|tri| Hit { t: best, tri })
+}
+
+/// [`any_hit`]'s oracle: the retained flat shadow scan.
+pub fn any_hit_flat(tris: &[Tri], o: [f32; 3], d: [f32; 3], near: f32, far: f32) -> bool {
     tris.iter()
         .any(|tri| intersect(tri, o, d).is_some_and(|t| t > near && t < far))
+}
+
+/// Is anything in `(near, far)`? A boolean does not depend on the visit order at all, so this
+/// is the same descent with an early return.
+pub fn any_hit(tris: &[Tri], bvh: &Bvh, o: [f32; 3], d: [f32; 3], near: f32, far: f32) -> bool {
+    if bvh.nodes.is_empty() {
+        return false;
+    }
+    let inv = [rcp_safe(d[0]), rcp_safe(d[1]), rcp_safe(d[2])];
+    let mut stack = [0u32; bvh::STACK as usize];
+    let mut sp = 1usize;
+    while sp > 0 {
+        sp -= 1;
+        let ni = stack[sp] as usize;
+        let node = &bvh.nodes[ni];
+        if !slab(node, o, inv, near, far) {
+            continue;
+        }
+        if node.count == 0 {
+            stack[sp] = node.a;
+            stack[sp + 1] = ni as u32 + 1;
+            sp += 2;
+            continue;
+        }
+        for k in 0..node.count as usize {
+            let i = bvh.prim[node.a as usize + k] as usize;
+            if intersect(&tris[i], o, d).is_some_and(|t| t > near && t < far) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `1 / x`, with the infinity clamped away. A finite reciprocal is what keeps `0 * inf` — the
+/// only NaN the slab test can produce, for a ray exactly parallel to a slab whose origin is
+/// exactly on it — out of both texts, so neither has to define a NaN-ordering convention that
+/// Rust's `min` and Slang's `min` disagree about.
+fn rcp_safe(x: f32) -> f32 {
+    if x.abs() > 1e-30 {
+        1.0 / x
+    } else if x < 0.0 {
+        -1e30
+    } else {
+        1e30
+    }
+}
+
+/// Ray-box overlap on `(near, far)`. `min`/`max` are exact, so only the two products round,
+/// and `bvh::LO`/`HI` cover that rounding in the conservative direction.
+fn slab(node: &bvh::Node, o: [f32; 3], inv: [f32; 3], near: f32, far: f32) -> bool {
+    let t0 = [
+        (node.min[0] - o[0]) * inv[0],
+        (node.min[1] - o[1]) * inv[1],
+        (node.min[2] - o[2]) * inv[2],
+    ];
+    let t1 = [
+        (node.max[0] - o[0]) * inv[0],
+        (node.max[1] - o[1]) * inv[1],
+        (node.max[2] - o[2]) * inv[2],
+    ];
+    let lo = near
+        .max(t0[0].min(t1[0]))
+        .max(t0[1].min(t1[1]))
+        .max(t0[2].min(t1[2]));
+    let hi = far
+        .min(t0[0].max(t1[0]))
+        .min(t0[1].max(t1[1]))
+        .min(t0[2].max(t1[2]));
+    lo * bvh::LO <= hi * bvh::HI
 }
 
 /// Normal of the hit triangle, flipped to face the incoming ray.
@@ -227,7 +355,7 @@ struct GBuffer {
     tri: Vec<u32>,
 }
 
-fn g_buffer(scene: &TriScene, vp: &ViewParams, w: u32, h: u32) -> GBuffer {
+fn g_buffer(scene: &TriScene, bvh: &Bvh, vp: &ViewParams, w: u32, h: u32) -> GBuffer {
     let n = (w as usize) * (h as usize);
     let mut g = GBuffer {
         depth: vec![vp.far; n],
@@ -239,7 +367,7 @@ fn g_buffer(scene: &TriScene, vp: &ViewParams, w: u32, h: u32) -> GBuffer {
         for px in 0..w {
             let i = (py * w + px) as usize;
             let d = primary_dir(vp, px, py);
-            let Some(hit) = nearest_hit(&scene.tris, vp.pos, d, vp.near, vp.far) else {
+            let Some(hit) = nearest_hit(&scene.tris, bvh, vp.pos, d, vp.near, vp.far) else {
                 continue;
             };
             let tri = &scene.tris[hit.tri as usize];
@@ -300,7 +428,8 @@ pub fn rasterize(
     let _ = view_index; // the `Rs` path draws no random numbers
     let vp = ViewParams::new(view);
     let (w, h) = (view.spec.width, view.spec.height);
-    let g = g_buffer(scene, &vp, w, h);
+    let bvh = Bvh::build(&scene.tris);
+    let g = g_buffer(scene, &bvh, &vp, w, h);
 
     let mut rgb = vec![0u8; (w as usize) * (h as usize) * 3];
     for py in 0..h {
@@ -375,7 +504,8 @@ pub fn path_trace(
 ) -> Frame {
     let vp = ViewParams::new(view);
     let (w, h) = (view.spec.width, view.spec.height);
-    let g = g_buffer(scene, &vp, w, h);
+    let bvh = Bvh::build(&scene.tris);
+    let g = g_buffer(scene, &bvh, &vp, w, h);
     let (spp, bounces) = (cfg.spp().max(1), cfg.bounces().max(1));
     let (restir, svgf) = match cfg.path {
         RenderPath::Pt { restir, svgf, .. } => (restir, svgf),
@@ -393,7 +523,7 @@ pub fn path_trace(
                 let mut d = primary_dir(&vp, px, py);
                 let mut near = vp.near;
                 for bounce in 0..bounces {
-                    let Some(hit) = nearest_hit(&scene.tris, o, d, near, vp.far) else {
+                    let Some(hit) = nearest_hit(&scene.tris, &bvh, o, d, near, vp.far) else {
                         acc = add(acc, mul(throughput, cfg.sky));
                         break;
                     };
@@ -414,7 +544,7 @@ pub fn path_trace(
     }
 
     if restir {
-        radiance = restir_di(scene, &vp, cfg, &g, w, h, view_index);
+        radiance = restir_di(scene, &bvh, &vp, cfg, &g, w, h, view_index);
     }
     if svgf {
         radiance = atrous(&radiance, &g, w, h, cfg.svgf_iterations);
@@ -512,6 +642,7 @@ fn di_contribution(
 /// frame the previous buffer is empty and the pass is a no-op.
 fn restir_di(
     scene: &TriScene,
+    bvh: &Bvh,
     vp: &ViewParams,
     cfg: &RenderConfig,
     g: &GBuffer,
@@ -572,6 +703,7 @@ fn restir_di(
                 let dist = approx::sqrt(dot(seg, seg));
                 if any_hit(
                     &scene.tris,
+                    bvh,
                     p,
                     scale(seg, 1.0 / dist),
                     0.0,
@@ -725,7 +857,8 @@ mod tests {
         let scene = crate::scene::TriScene::from_scene(&cornell_box()).unwrap();
         let vp = ViewParams::new(&view(8, 8));
         let d = primary_dir(&vp, 4, 4);
-        let hit = nearest_hit(&scene.tris, vp.pos, d, vp.near, vp.far).unwrap();
+        let bvh = Bvh::build(&scene.tris);
+        let hit = nearest_hit(&scene.tris, &bvh, vp.pos, d, vp.near, vp.far).unwrap();
         assert!(hit.t > 0.0 && hit.t < vp.far);
         // No other triangle is closer.
         for tri in &scene.tris {

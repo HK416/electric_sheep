@@ -35,6 +35,7 @@
 #![forbid(unsafe_code)]
 
 pub mod atlas;
+pub mod bvh;
 pub mod cornell;
 pub mod cpu;
 pub mod error;
