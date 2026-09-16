@@ -381,6 +381,86 @@ fn gpu_atlas_packs_several_cameras() {
     );
 }
 
+// --- cached tessellation and the BVH (packet M7/R1) ------------------------------------------
+
+/// Three "ticks" of body poses for `scene`: the home pose, then two hand-set rigid motions
+/// applied to every body. `.estraj` replay hands `from_scene_with_poses` exactly this shape of
+/// map, so re-posing here exercises the same path with no `es-env` dependency (layer 5).
+fn ticks(
+    scene: &es_assets::scene::SceneDesc,
+) -> Vec<std::collections::BTreeMap<es_core::StableId, es_math::Pose>> {
+    use es_math::{Pose, Quat, Vec3};
+    let mut out = vec![std::collections::BTreeMap::new()];
+    for (k, angle) in [(1.0, 0.37f64), (2.0, -0.91)] {
+        let mut m = std::collections::BTreeMap::new();
+        for (i, body) in scene.bodies.iter().enumerate() {
+            let s = (i as f64) * 0.013 + k * 0.05;
+            let (sin, cos) = (angle * 0.5).sin_cos();
+            m.insert(
+                body.id,
+                Pose::new(
+                    Vec3::new(s, -s * 0.5, s * 0.25),
+                    Quat::from_xyzw(sin * 0.6, sin * 0.8, 0.0, cos).normalize(),
+                ),
+            );
+        }
+        out.push(m);
+    }
+    out
+}
+
+/// Packet M7/R1 oracle 2: a `SceneCache` reused across ticks and scenes produces exactly the
+/// `TriScene` a per-call tessellation does — every `f32` bitwise, the light list, the names.
+///
+/// The cache is warmed on Cornell first and then used for the SO-101 cell, so the `Shape`
+/// guard (geom ids come from names, and two scenes can share one) is exercised too.
+#[test]
+fn cached_tessellation_is_bit_identical() {
+    let mut cache = es_render::SceneCache::default();
+    for scene in [cornell_box(), so101()] {
+        for (tick, world) in ticks(&scene).iter().enumerate() {
+            let cached = cache.tri_scene(&scene, world).expect("cached");
+            let fresh = TriScene::from_scene_with_poses(&scene, world).expect("fresh");
+            assert_eq!(
+                cached.names, fresh.names,
+                "{} tick {tick}: names",
+                scene.name
+            );
+            assert_eq!(
+                cached.lights, fresh.lights,
+                "{} tick {tick}: light list",
+                scene.name
+            );
+            assert_eq!(
+                cached.tris.len(),
+                fresh.tris.len(),
+                "{} tick {tick}: triangle count",
+                scene.name
+            );
+            // Bitwise on the floats, not `==` on `f32`: the point of the oracle is that no
+            // vertex, normal, albedo or emission moved by one ULP.
+            let (a, b) = (cached.to_floats(), fresh.to_floats());
+            let diff = a
+                .iter()
+                .zip(&b)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            assert_eq!(
+                diff,
+                0,
+                "{} tick {tick}: {diff} of {} floats differ",
+                scene.name,
+                a.len()
+            );
+        }
+        println!(
+            "cached == uncached, bitwise, 3 ticks of {} ({} geoms)",
+            scene.name,
+            scene.bodies.iter().map(|b| b.geoms.len()).sum::<usize>()
+        );
+    }
+}
+
 // --- profile (packet M7/R1 step 0) -----------------------------------------------------------
 
 /// The demo scene: the SO-101 pick-and-place cell `es video showcase` renders.

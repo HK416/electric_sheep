@@ -47,7 +47,7 @@ pub use atlas::{AtlasLayout, Tile, TileData};
 pub use cpu::Frame;
 pub use error::RenderError;
 pub use renderer::{Atlas, Renderer};
-pub use scene::{Tri, TriScene};
+pub use scene::{SceneCache, Tri, TriScene};
 pub use view::{
     CameraView, ImageSpec, Intrinsics, RenderConfig, RenderPath, TileAtlasCfg, ViewParams,
 };

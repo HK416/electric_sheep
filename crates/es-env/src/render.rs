@@ -212,8 +212,11 @@ fn quat_from_basis(x: Vec3, y: Vec3, z: Vec3) -> Quat {
 pub struct EnvRenderer<'gpu> {
     renderer: Renderer<'gpu>,
     cfg: EnvRendererCfg,
-    /// Kept whole: every frame re-poses the bodies and re-tessellates (design note 7.1).
+    /// Kept whole: every frame re-poses the bodies (design note 7.1).
     scene: SceneDesc,
+    /// The per-geom local tessellation, computed once and re-posed per frame (design note
+    /// `renderer.md` section 8.2). Bit-identical to tessellating every frame.
+    cache: es_render::SceneCache,
     frame: u64,
 }
 
@@ -232,6 +235,7 @@ impl<'gpu> EnvRenderer<'gpu> {
             renderer,
             cfg,
             scene: scene.clone(),
+            cache: es_render::SceneCache::default(),
             frame: 0,
         })
     }
@@ -259,7 +263,9 @@ impl<'gpu> EnvRenderer<'gpu> {
         env: u32,
     ) -> Result<Tile, EnvError> {
         let world = body_poses(model, state, env);
-        let tri = es_render::TriScene::from_scene_with_poses(&self.scene, &world)
+        let tri = self
+            .cache
+            .tri_scene(&self.scene, &world)
             .map_err(|e| EnvError::Unsupported(format!("tessellation: {e}")))?;
         let view = camera_view(&self.scene, &self.cfg, &world)?;
         self.renderer
