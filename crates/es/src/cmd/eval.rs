@@ -642,6 +642,12 @@ fn run(args: &[String]) -> Result<u8, CliError> {
     let cfg = RunConfig {
         created: now_unix(),
         traj_dir: Some(traj_dir.clone()),
+        // The bundle's own `expected_latency_ms`, carried across because this is the only
+        // place that has the `LearningGraph`: `Evaluation::run` is handed the four IRs it
+        // judges and never the graph (packet M7/T7). The evaluator then turns it into whole
+        // control ticks with `es_env::latency_ticks` -- the one latency model, the same one
+        // `es loop collect` drives `AsyncInference` with.
+        expected_latency_ms: bundle.learning.policy.contract.runtime.expected_latency_ms,
         ..RunConfig::default()
     };
     let nj = bundle.deployment.robot.n_joints;
