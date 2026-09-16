@@ -15,6 +15,18 @@ es-core = { workspace = true }
 es-ir = { workspace = true }
 es-compile = { workspace = true }
 es-telemetry = { workspace = true }
+# The Run tab (packet M7/E1) reads a finished run's own artifacts: `report.json` through
+# `es-ir`, `events.json` through `es_eval::runner::StepEvent`, and its `events` bitset through
+# `es_safety::EventSet`. Both are below layer 12; neither is re-implemented here.
+es-eval = { workspace = true }
+es-safety = { workspace = true }
+# The Replay panel (packet M7/E2) re-poses a recorded `.estraj` and projects it on the CPU:
+# the scene loader, the trajectory, the tessellation and the camera are all theirs. `es-env`
+# is taken **without** its `render` feature, so the editor links no Vulkan of its own.
+es-assets = { workspace = true }
+es-env = { workspace = true }
+es-math = { workspace = true }
+es-render = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 serde = { workspace = true }
@@ -23,6 +35,10 @@ toml = { workspace = true }
 
 [dev-dependencies]
 es-math = { workspace = true }
+# The `.estraj` fixture generator only: `es_env::Trajectory` is shaped by a `ModelInfo` and
+# filled from a `StateView`, and both are `es-physics-core`'s plain structs. The editor itself
+# never names them, so this stays out of the normal build.
+es-physics-core = { workspace = true }
 
 [lints]
 workspace = true

@@ -44,7 +44,24 @@ tested), the acceptance rows with pass/fail colour, and for the selected cell th
 frames sampled evenly. Selecting a cell also selects it for E2's replay if that packet has landed
 (a `selected_cell()` accessor is the whole coupling).
 
-## context (allowed scope)
+## context
+
+The globs `cargo xtask check-scope` reads (its parser wants a `## context` heading and a
+fenced block or a bullet list), then the same scope in prose:
+
+```
+crates/es-editor/src/model/run_view.rs
+crates/es-editor/src/model/mod.rs
+crates/es-editor/src/lib.rs
+crates/es-editor/src/app.rs
+crates/es-editor/src/main.rs
+crates/es-editor/Cargo.toml
+tests/fixtures/visible-learning/run/**
+docs/design/editor-shell.md
+docs/design/editor-shell.ko.md
+docs/packets/M7/E1-run-browser.md
+docs/packets/M7/E1-run-browser.ko.md
+```
 
 `crates/es-editor/src/model/run_view.rs` (new), `crates/es-editor/src/model/mod.rs`,
 `crates/es-editor/src/lib.rs` (re-exports), `crates/es-editor/src/app.rs` (the Run tab and the

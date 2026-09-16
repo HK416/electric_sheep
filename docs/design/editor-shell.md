@@ -205,3 +205,189 @@ is the part that would actually be hard to get right, is not something snarl doe
 - A parameter inspector panel. `Edit::SetParam` and `NodeSchema` are both in place and tested;
   the widget that fills a `ParamType` in is UI work with no model behind it left to design.
 - Editing Observation IR nodes, and the Control Graph (IR-C) — stage 3, M4.
+
+---
+
+## 10. The Run tab: a finished run, opened (§23.3, §10.5, M7/E1)
+
+Every `es eval run` / `es loop collect` writes `report.json`, `evaluation.lock`, `events.json`,
+`traj/<cell>.estraj` and — with `--frames` — `frames/<cell>/NNNNNN.bin`. Until now the only
+readers were `es video mosaic` and a person with `jq`. The **Run** tab opens the directory.
+
+`es-editor <run-dir>` and the File field take one path; a directory holding `report.json` is a
+run and anything else is a bundle (`RunView::is_run_dir`). Told apart by what is on disk, not
+by a flag: a run directory and a bundle directory cannot be confused, and a person who typed
+the wrong one gets the other view's error, not a mode.
+
+### `model/run_view.rs`
+
+| Call | Gives |
+|---|---|
+| `RunView::open(dir)` | the `EvaluationReport`, the `BTreeMap<String, Vec<es_eval::runner::StepEvent>>` of `events.json`, and a listing (never a load) of `traj/` and `frames/` |
+| `cells()` | one `CellRow` per **episode**: name, suite, seed, the suite's metrics by the report's own names, whether a trajectory and frames exist |
+| `columns()` / `sort_by(i)` | the table's headers, and a stable sort by any of them |
+| `timeline(cell)` | per tick the `EventSource` and the decoded `EventSet`, plus per-kind totals and each kind's first tick |
+| `Timeline::buckets(n)` | the same ticks folded into `n` columns, for drawing at any width |
+| `acceptance()` | `report.acceptance` verbatim |
+| `filmstrip(cell, 8)` / `frame(cell, i)` | at most eight evenly spread frame indices, and one decoded `Rgb8Image` |
+| `set_frames_root(dir)` / `frames_root()` | where `<cell>/NNNNNN.bin` is looked for; `<run>/frames` on open |
+| `selected_cell()` / `select(name)` | the selection, which is the whole coupling to the replay panel (§11) |
+
+**Two things are called a cell** and the file keeps them apart. `es_ir::evaluation::CellResult`
+is one *suite × metric* of the §10.1 table; a cell on disk — an `events.json` key, a
+`frames/<cell>/`, a `traj/<cell>.estraj` — is one *episode*, named `<suite>-<NN>` by
+`Evaluation::run_shard`. A `CellRow` is the episode and carries the metrics its suite measured,
+so the same three numbers appear on both rows of a two-episode suite. The alternative — a row
+per `CellResult` — is the report table, and it is not what someone who wants to watch episode
+`nominal-01` is looking for.
+
+**Metric names are the report's.** `columns()` is the union of the metric names the report
+carries, so a metric added to `MetricSpec` appears with no change here. Nothing is hard-coded,
+and a `Histogram` or an `Unavailable` value is shown as what it is, never as `0`.
+
+**Seeds come from `evaluation.lock`.** `report.json` carries none. The lock's `seeds[i]` is
+selected by the `NN` of the cell name, which is the episode index `run_shard` counts with.
+Without the lock the column is `--`: an invented seed is worse than a missing one.
+
+**The violation bits are decoded, not re-derived.** `StepEvent::events` is
+`es_safety::EventSet::bits()`. `EventSet` has no `from_bits` and `es-safety` is not this
+packet's to change, so `decode_events` re-inserts through `ViolationKind::index()` — the same
+table the encoder used — and a test round-trips all 14 kinds.
+
+**Buckets are contiguous, gapless and total**, which is what makes their per-kind counts sum
+back to the timeline's totals at any `n` (the oracle checks `n ∈ {1, 7, 64}`). A bucket shows
+the most severe source it covers (`Policy < Human < Clamped < Fallback`), so one clamped tick
+in a 400-tick episode is still a visible mark rather than a rounding loss.
+
+**A run records two clocks and the summary names both.** An `events.json` record is one
+*frame* — one control step — and carries the `PhysTick` that frame ran at; at the demo's rates
+that is four physics ticks per frame, so "first at tick 544" is nowhere on a 224-column strip.
+`Timeline::kind_rows()` returns `KindRow { kind, frames, first: FirstSeen { frame, tick } }` and
+`KindRow::label()` writes *"Velocity: 2 frame(s), first at frame 1 (tick 1)"* — the strip's own
+index first, the physics tick after it. The wording is in the model with a test, not in
+`app.rs`, because which clock a person is being shown is a decision (§28.10 rule 3).
+
+**Frames are wherever `--frames` pointed.** `es eval run --frames <dir>` writes a directory that
+is usually a *sibling* of the run, not `<run>/frames`, so a real run's table showed `frames 0`
+for every cell until the tab was pointed at it. `set_frames_root(dir)` moves the root and
+rebuilds the rows — which also means a report that stands alone gains its cells from an
+external frames directory — and `app.rs` gets one `Frames` field beside `Scene`, filled with
+`frames_root()` on open and applied when it loses focus.
+
+### What it deliberately does not do
+
+- **No live process.** The tab reads a finished directory. Attaching to a running
+  `es eval run` is E4's `--telemetry`, and it is a different transport.
+- **No editing of a run.** Nothing is written back: an artifact that the editor could rewrite
+  is an artifact the hash chain cannot vouch for (§5.3, §10.5).
+- **No caching.** `frame()` decodes what it is asked for; `app.rs` keeps the eight filmstrip
+  textures of the selected cell and drops them when the path changes.
+- **A partial run still opens.** Only `report.json` is required. What is missing is named in
+  the status line, because the run someone opens the editor for is often the one that did not
+  finish writing. A malformed `events.json`, though, is an error rather than a guess (§25.1).
+
+The fixture is `tests/fixtures/visible-learning/run/`: two suites × two episodes, four ticks
+each with two `Clamped` and one `Fallback` tick carrying real violation bits, one 96×96 frame
+per cell. It is written by the `#[ignore]`d `generate_fixture_run`, which builds an
+`EvaluationReport` and an `EvaluationLock` and hands them to `es_eval::runner::write_artifacts`
+and a `FrameSink` — so the bytes are the producing types' own. Only the frame `.bin` and its
+`layout.json` are written directly, because `es_eval`'s writer for them is private; the shape
+is that writer's documentation.
+
+---
+
+## 11. The Replay panel: an `.estraj` played in the editor (§23.3, M7/E2)
+
+§23.3 asks for an editor that "locally replicates the scene and receives only the pose/joints".
+A recorded trajectory is that stream, offline. `es video showcase` already proves a run can be
+re-rendered from the scene file and the `.estraj` alone — this does the same on the CPU, in an
+`egui` canvas, at interactive rate: **no physics, no GPU, no `ffmpeg`, no server**.
+
+It lives in the Run tab as a bottom panel (§10's table picks the episode, this plays it). The
+whole coupling is `RunView::selected_cell()`; the panel adds one text field, because a run
+directory does not carry its scene file — the same `--scene` the showcase takes. It opens at
+45% of the tab's height and never shrinks below 320 px, so the canvas is there the moment
+`Replay` is pressed rather than after the separator is found; dragging the separator still
+overrides both.
+
+### `model/replay_view.rs`
+
+| Call | Gives |
+|---|---|
+| `ReplayView::open(scene, traj)` | the `SceneDesc` (MJCF or URDF by extension, as `es backend`'s `load_scene`) and the `Trajectory`; tessellates tick 0 so an unsupported geom is an error here, not a blank canvas later |
+| `ticks()` / `qpos(t)` / `scene_at(t)` | the length, the joint state, and the tick's `TriScene` — the very call the showcase renders |
+| `project(t, &Camera)` | `Vec<Tri2d>`: three screen points, one flat `[u8; 3]`, a depth key and the source triangle index, **sorted back to front** |
+| `Camera::view()` | the `es_render::CameraView` those coordinates are in |
+| `Camera::orbit(dyaw, dpitch)` / `zoom(f)` | a new camera on the sphere about `look_at`; pure, `#[must_use]`, no interior state |
+| `advance(dt, rate_hz)` / `step(±n)` | playback, clamped at both ends; `playing`, `tick` and `speed` are the model's |
+
+**The projection is `es_render`'s own, inverted.** `ViewParams::new(&camera.view())` gives the
+renderer's `f32` camera; a world vertex goes through `es_render::cpu::quat_rotate_inv` and the
+same `fx, fy, cx, cy` that `cpu::primary_dir` casts rays with. Nothing here re-derives the
+convention (§3.1: `OpenCV` camera frame, image origin top-left).
+
+**The shading is `es_shade_lambert`, copied in four lines**, because `cpu::shade_lambert` is
+private: `ambient + max(dot(n, light), 0) * (1 - ambient)`, times albedo, plus emission, then
+`srgb_encode` (public) and the renderer's rounding. The multiply and the add are separate, not
+a `mul_add`: a fused one rounds once where the renderer rounds twice. `RenderConfig::rs` is
+built here purely so the light direction and the ambient floor are the renderer's constants and
+not a second copy of them. `flat_shade_matches_the_renderer` puts one triangle in front of one
+camera, rasterizes it with `es_render::cpu::rasterize`, and asserts the pixel under the
+projected centroid equals the colour — which pins the camera, the projection and the shading in
+one assertion.
+
+**Near-plane clipping, whole triangles.** A triangle with any vertex at or behind the near
+plane is dropped rather than divided by that `z`, which would project it through the eye onto
+the far side of the image. One that straddles the plane disappears instead of being split: a
+clipper that splits has to interpolate the vertices, and at the scale of this camera the arm is
+never half behind it.
+
+**`ponytail:` the painter's algorithm is the deliberate simplification.** Sorting whole
+triangles by centroid depth is exact for convex primitives that do not interpenetrate, and
+wrong exactly where they do — a gripper closed on a cube can show the wrong face. The upgrade
+path is `es_render::cpu::rasterize` per pixel at a low resolution, which R1's BVH is what makes
+affordable; the camera the model builds is already a `CameraView`, so that swap is one
+function. The sort is stable on the depth alone, so ties keep triangle order and the emitted
+sequence is a pure function of (trajectory, camera) — which is what makes
+`tests/golden/editor/replay_tick0_order.json` (2,754 indices at tick 0) a golden worth keeping.
+
+### `look_at` is repeated, not reused
+
+`es_env::render::look_at` is behind `es-env`'s `render` feature, and that feature pulls in
+`es-render` **and `es-gpu`**: enabling it in the editor would link Vulkan into a viewer that
+renders nothing on a GPU, which E2 forbids. Moving the function out from behind the feature is
+not a pure move either — it returns `es_render::CameraView` and calls
+`es_render::ImageSpec::pinhole`, both from an optional dependency. So `Camera::view` repeats
+the arithmetic (basis from forward × world-up, then Shepperd's quaternion) over the same
+`es-render` types, and the test above pins it against the renderer rather than against the
+copy's source. If `es-env` ever makes `es-render` non-optional, this becomes a one-line
+delegation.
+
+### The fixture trajectory
+
+`tests/fixtures/visible-learning/run/traj/nominal-00.estraj`: 48 ticks of
+`tests/fixtures/mjcf/so101_pick_place.xml`, 36 kB, written by the `#[ignore]`d
+`generate_fixture_traj`. **No physics backend is involved and none is needed.** `Trajectory` is
+shaped by an `es_physics_core::backend::ModelInfo` and filled from a `StateView`, both plain
+structs: the generator builds a `ModelInfo` with one body index per scene body and `nq`/`nv`
+summed from the joints in `MuJoCo`'s own layout, then per tick composes every body's world pose
+from the scene's parent chain with `shoulder_pan` swept from -0.6 to +0.6 rad (an MJCF hinge
+turns the child frame about its `axis` through its `anchor`: `body.pose * T(a) * R * T(-a)`),
+and pushes a `StateView` holding those poses. That is the same composition
+`es_render::scene::world_poses` does — private there, twelve lines here, in test code only.
+`es-physics-core` is a **dev-dependency** for exactly this reason: the editor itself never
+names those types.
+
+The trajectory is a synthetic home-pose sweep, not a policy rollout: what it has to exercise is
+that a recorded pose stream re-poses the scene and projects, and a real V19b `.estraj` (which
+the orchestrator opens) is the same bytes at a different arm.
+
+### Not here
+
+- **Per-pixel anything**: no depth buffer, no shadows, no textures. The upgrade path above.
+- **The run's own control rate.** The panel plays at 50 Hz, the demo deployment's
+  `rate.control`; a run directory carries no Deployment IR to read it from, and the wrong rate
+  only changes how fast the arm appears to move. A `--rate` would be a field on the panel the
+  moment a run writes its rate down.
+- **Camera presets and scene cameras.** `--camera NAME` (the showcase's other mode) needs the
+  scene's own camera list; the free camera is what a person dragging a mouse wants.

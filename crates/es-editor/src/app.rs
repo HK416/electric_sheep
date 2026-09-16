@@ -27,8 +27,10 @@ use es_ir::NodeId;
 
 use crate::model::edit::{self, Edit, EditIr, EditSession};
 use crate::model::graph_view::{CrossEdge, LayerView, LayeredGraph, NodeView};
-use crate::model::image_view::{BeforeAfter, ImagePair};
+use crate::model::image_view::{BeforeAfter, ImagePair, Rgb8Image};
 use crate::model::palette::Palette;
+use crate::model::replay_view::{Camera, Projected, ReplayView};
+use crate::model::run_view::{Bucket, RunView};
 use crate::model::telemetry_view::{Source, TelemetryModel};
 
 const NODE_W: f32 = 178.0;
@@ -41,6 +43,7 @@ const PUMP_BUDGET: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Graph,
+    Run,
     Telemetry,
     Images,
     Diagnostics,
@@ -78,6 +81,19 @@ pub struct EditorApp {
     path: String,
     status: String,
     opened: Option<Opened>,
+    /// An opened run directory (packet M7/E1). A path is one or the other, never both.
+    run: Option<RunView>,
+    /// Frames of the selected cell's filmstrip, keyed `<cell>#<index>`.
+    run_frames: BTreeMap<String, egui::TextureHandle>,
+    /// The scene the replay poses (packet M7/E2). A run directory does not carry one, so it
+    /// is typed in - the same `--scene` `es video showcase` takes.
+    scene_path: String,
+    /// Where the run's frames are (`es eval run --frames <dir>`); `<run>/frames` on open.
+    frames_path: String,
+    replay: Option<ReplayView>,
+    /// Which cell `replay` is playing, so switching rows is visible in the panel.
+    replay_cell: String,
+    camera: Camera,
     telemetry: TelemetryModel,
     source: Source,
     pan: Vec2,
@@ -108,6 +124,13 @@ impl EditorApp {
             path: String::new(),
             status: "no bundle open".to_owned(),
             opened: None,
+            run: None,
+            run_frames: BTreeMap::new(),
+            scene_path: String::new(),
+            frames_path: String::new(),
+            replay: None,
+            replay_cell: String::new(),
+            camera: SHOWCASE_CAMERA,
             telemetry: TelemetryModel::default(),
             source,
             pan: Vec2::new(60.0, 40.0),
@@ -171,16 +194,34 @@ impl EditorApp {
         };
     }
 
-    /// Open a bundle at startup (`es-editor <bundle.esb>`).
+    /// Open a bundle or a run directory at startup (`es-editor <bundle.esb|run-dir>`).
     #[must_use]
-    pub fn with_bundle(mut self, path: &str) -> Self {
+    pub fn with_path(mut self, path: &str) -> Self {
         path.clone_into(&mut self.path);
         self.open();
         self
     }
 
+    /// A directory that holds `report.json` is a finished run (spec 10.5), anything else is a
+    /// bundle: the two are told apart by what is on disk, not by a flag (packet M7/E1).
     fn open(&mut self) {
         let path = PathBuf::from(self.path.trim());
+        self.run = None;
+        self.run_frames.clear();
+        self.replay = None;
+        self.replay_cell.clear();
+        if RunView::is_run_dir(&path) {
+            match RunView::open(&path) {
+                Ok(run) => {
+                    self.status = format!("{}: {}", path.display(), run.status);
+                    self.frames_path = run.frames_root().display().to_string();
+                    self.run = Some(run);
+                    self.tab = Tab::Run;
+                }
+                Err(e) => self.status = e.to_string(),
+            }
+            return;
+        }
         match load(&path) {
             Err(e) => {
                 self.status = format!("{}: {e}", path.display());
@@ -229,15 +270,16 @@ impl eframe::App for EditorApp {
                 ui.label("File");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.path)
-                        .hint_text("bundle.esb, or a directory of the five .toml files")
+                        .hint_text("bundle.esb, a directory of the five .toml files, or a run")
                         .desired_width(380.0),
                 );
-                if ui.button("Open bundle...").clicked() {
+                if ui.button("Open...").clicked() {
                     self.open();
                 }
                 ui.separator();
                 for (tab, name) in [
                     (Tab::Graph, "Graph"),
+                    (Tab::Run, "Run"),
                     (Tab::Telemetry, "Telemetry"),
                     (Tab::Images, "Images"),
                     (Tab::Diagnostics, "Diagnostics"),
@@ -281,6 +323,7 @@ impl eframe::App for EditorApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Graph => self.graph_tab(ui),
+            Tab::Run => self.run_tab(ui),
             Tab::Telemetry => self.telemetry_tab(ui),
             Tab::Images => self.images_tab(ui),
             Tab::Diagnostics => self.diagnostics_tab(ui),
@@ -455,6 +498,248 @@ impl EditorApp {
         view.paint(&painter, *selected);
     }
 
+    /// The Run tab (packet M7/E1): the cell table, the acceptance verdict, and for the
+    /// selected cell its Safety Plane timeline and a filmstrip. Every number, every order and
+    /// every decoded byte is [`RunView`]'s; this turns them into widgets.
+    fn run_tab(&mut self, ui: &mut egui::Ui) {
+        if self.run.is_none() {
+            ui.label(
+                "Open a run directory - one holding report.json - to see its cells (spec 10.5).",
+            );
+            return;
+        }
+        // The replay of the selected cell shares the tab (packet M7/E2): the table picks the
+        // episode, the panel plays it. Nearly half the window by default, so the canvas is
+        // there without dragging the separator first; still resizable either way.
+        let height = (ui.available_height() * REPLAY_PANEL_FRACTION).max(REPLAY_PANEL_MIN);
+        egui::TopBottomPanel::bottom("replay")
+            .resizable(true)
+            .min_height(REPLAY_PANEL_MIN)
+            .default_height(height)
+            .show_inside(ui, |ui| self.replay_panel(ui));
+        egui::CentralPanel::default().show_inside(ui, |ui| self.run_table(ui));
+    }
+
+    fn run_table(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let Self {
+            run: Some(run),
+            run_frames,
+            ..
+        } = self
+        else {
+            return;
+        };
+        let columns = run.columns();
+        let mut sort = None;
+        let mut select = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("run-cells").striped(true).show(ui, |ui| {
+                for (i, name) in columns.iter().enumerate() {
+                    if ui.button(name).clicked() {
+                        sort = Some(i);
+                    }
+                }
+                ui.label("traj");
+                ui.label("frames");
+                ui.end_row();
+                let selected = run.selected_cell().map(|c| c.name.clone());
+                for row in run.cells() {
+                    let is_selected = selected.as_deref() == Some(row.name.as_str());
+                    if ui.selectable_label(is_selected, &row.name).clicked() {
+                        select = Some(row.name.clone());
+                    }
+                    ui.label(&row.suite);
+                    ui.label(row.seed.map_or_else(|| "--".to_owned(), |s| s.to_string()));
+                    for column in columns.iter().skip(3) {
+                        ui.label(row.metrics.get(column).map_or_else(dash, metric_text));
+                    }
+                    ui.label(if row.has_traj { "yes" } else { "--" });
+                    ui.label(row.frames.to_string());
+                    ui.end_row();
+                }
+            });
+
+            ui.separator();
+            ui.heading(if run.report.passed {
+                "Acceptance: passed (spec 10.2)"
+            } else {
+                "Acceptance: failed (spec 10.2)"
+            });
+            for line in run.acceptance() {
+                let (text, colour) = acceptance_row(line);
+                ui.colored_label(colour, text);
+            }
+
+            let Some(cell) = run.selected_cell().map(|c| c.name.clone()) else {
+                ui.separator();
+                ui.label("Select a cell for its Safety Plane timeline and frames (spec 23.3).");
+                return;
+            };
+            ui.separator();
+            let timeline = run.timeline(&cell);
+            ui.heading(format!("{cell}: {} tick(s)", timeline.rows.len()));
+            // One column per ~4 px of the strip; the model folds the ticks into them.
+            let n = (ui.available_width() / 4.0) as usize;
+            paint_timeline(ui, &timeline.buckets(n));
+            for kind in timeline.kind_rows() {
+                ui.label(kind.label());
+            }
+
+            ui.separator();
+            ui.heading("Frames");
+            ui.horizontal(|ui| {
+                for index in run.filmstrip(&cell, FILMSTRIP) {
+                    let key = format!("{cell}#{index}");
+                    let texture = run_frames.entry(key.clone()).or_insert_with(|| {
+                        let image = run.frame(&cell, index).unwrap_or(Rgb8Image {
+                            width: 1,
+                            height: 1,
+                            data: vec![0, 0, 0],
+                        });
+                        rgb_texture(&ctx, &key, &image)
+                    });
+                    ui.vertical(|ui| {
+                        ui.label(format!("{index}"));
+                        let scale = (160.0 / texture.size_vec2().x).max(1.0);
+                        ui.image(egui::load::SizedTexture::new(
+                            texture.id(),
+                            texture.size_vec2() * scale,
+                        ));
+                    });
+                }
+            });
+        });
+        if let Some(column) = sort {
+            run.sort_by(column);
+        }
+        if let Some(name) = select {
+            run.select(&name);
+        }
+    }
+
+    /// The Replay panel (packet M7/E2): the selected cell's `.estraj`, posed and projected by
+    /// [`ReplayView`] and painted as one mesh. The gestures map to the model's pure camera
+    /// functions and to `advance`; nothing is decided here.
+    fn replay_panel(&mut self, ui: &mut egui::Ui) {
+        let dt = f64::from(ui.input(|i| i.stable_dt));
+        let Self {
+            run,
+            replay,
+            replay_cell,
+            scene_path,
+            frames_path,
+            camera,
+            status,
+            ..
+        } = self;
+        let selected = run
+            .as_ref()
+            .and_then(RunView::selected_cell)
+            .filter(|c| c.has_traj)
+            .map(|c| c.name.clone());
+
+        ui.horizontal(|ui| {
+            ui.label("Scene");
+            ui.add(
+                egui::TextEdit::singleline(scene_path)
+                    .hint_text("the run's scene: .xml (MJCF) or .urdf")
+                    .desired_width(220.0),
+            );
+            // `es eval run --frames <dir>` writes wherever it was told, which is usually a
+            // sibling of the run directory; the model re-scans when this is applied.
+            ui.label("Frames");
+            let field = ui.add(
+                egui::TextEdit::singleline(frames_path)
+                    .hint_text("<run>/frames")
+                    .desired_width(220.0),
+            );
+            if field.lost_focus() {
+                if let Some(run) = run.as_mut() {
+                    run.set_frames_root(frames_path.trim());
+                    *status = format!("{}: {}", run.dir.display(), run.status);
+                }
+            }
+            let label = selected
+                .as_ref()
+                .map_or_else(|| "Replay".to_owned(), |name| format!("Replay {name}"));
+            if ui
+                .add_enabled(selected.is_some(), egui::Button::new(label))
+                .clicked()
+            {
+                let (Some(run), Some(cell)) = (run.as_ref(), selected.as_ref()) else {
+                    return;
+                };
+                match ReplayView::open(Path::new(scene_path.trim()), &run.traj_path(cell)) {
+                    Ok(view) => {
+                        *status = format!("{cell}: {} tick(s) replayed", view.ticks());
+                        cell.clone_into(replay_cell);
+                        *replay = Some(view);
+                    }
+                    Err(e) => *status = e.to_string(),
+                }
+            }
+            if let Some(view) = replay.as_mut() {
+                if ui
+                    .button(if view.playing { "Pause" } else { "Play" })
+                    .clicked()
+                {
+                    view.playing = !view.playing;
+                }
+                if ui.button("|<").clicked() {
+                    view.step(-1);
+                }
+                if ui.button(">|").clicked() {
+                    view.step(1);
+                }
+                ui.add(egui::Slider::new(&mut view.speed, 0.1..=4.0).text("x"));
+            }
+        });
+
+        let Some(view) = replay.as_mut() else {
+            ui.label(
+                "Select a cell that has a trajectory, give the scene file, and press Replay \
+                 (spec 23.3).",
+            );
+            return;
+        };
+        view.advance(dt, REPLAY_RATE_HZ);
+        let last = view.ticks().saturating_sub(1);
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{replay_cell}  tick {}/{last}  {:.2} s",
+                view.tick,
+                view.tick as f64 / REPLAY_RATE_HZ
+            ));
+            ui.add(egui::Slider::new(&mut view.tick, 0..=last).text("tick"));
+        });
+
+        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
+        camera.width = response.rect.width().max(1.0) as u32;
+        camera.height = response.rect.height().max(1.0) as u32;
+        if response.dragged() {
+            let drag = response.drag_delta();
+            *camera = camera.orbit(
+                f64::from(-drag.x) * ORBIT_PER_POINT,
+                f64::from(drag.y) * ORBIT_PER_POINT,
+            );
+        }
+        if response.hovered() {
+            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+            if scroll != 0.0 {
+                *camera = camera.zoom(f64::from(-scroll).mul_add(ZOOM_PER_POINT, 1.0));
+            }
+        }
+        painter.rect_filled(response.rect, 0.0, Color32::from_gray(18));
+        painter.add(egui::Shape::mesh(replay_mesh(
+            &view.project(view.tick, camera),
+            response.rect.min,
+        )));
+        if view.playing {
+            ui.ctx().request_repaint();
+        }
+    }
+
     fn telemetry_tab(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Performance (spec 12.4)");
@@ -542,12 +827,141 @@ impl EditorApp {
 
 fn texture(ctx: &egui::Context, pair: &ImagePair, before: bool) -> egui::TextureHandle {
     let img = if before { &pair.before } else { &pair.after };
+    let name = format!("{}-{}", pair.name, if before { "before" } else { "after" });
+    rgb_texture(ctx, &name, img)
+}
+
+fn rgb_texture(ctx: &egui::Context, name: &str, img: &Rgb8Image) -> egui::TextureHandle {
     let color = egui::ColorImage::from_rgb([img.width, img.height], &img.data);
-    ctx.load_texture(
-        format!("{}-{}", pair.name, if before { "before" } else { "after" }),
-        color,
-        egui::TextureOptions::NEAREST,
-    )
+    ctx.load_texture(name, color, egui::TextureOptions::NEAREST)
+}
+
+// --- the Run tab -------------------------------------------------------------------------------
+
+/// Frames the filmstrip shows, sampled evenly over the cell by [`RunView::filmstrip`].
+const FILMSTRIP: usize = 8;
+
+fn dash() -> String {
+    "--".to_owned()
+}
+
+/// A metric cell. A histogram has no single number and an unmeasured metric has none at all
+/// (spec 10.3): neither is rendered as `0`.
+fn metric_text(value: &es_ir::evaluation::MetricValue) -> String {
+    match value {
+        es_ir::evaluation::MetricValue::Scalar(v) => format!("{v:.4}"),
+        es_ir::evaluation::MetricValue::Histogram(h) => {
+            format!("histogram, {} cause(s)", h.len())
+        }
+        es_ir::evaluation::MetricValue::Unavailable { reason } => format!("-- ({reason})"),
+    }
+}
+
+fn acceptance_row(line: &es_ir::evaluation::AcceptanceResult) -> (String, Color32) {
+    match line {
+        es_ir::evaluation::AcceptanceResult::Determined {
+            criterion,
+            observed,
+            passed,
+        } => (
+            format!(
+                "{} {} {} ({}, {}): observed {observed:.4} -- {}",
+                criterion.metric.name(),
+                criterion.comparator.name(),
+                criterion.threshold,
+                criterion.aggregation.name(),
+                criterion.suite.as_deref().unwrap_or("every suite"),
+                if *passed { "pass" } else { "FAIL" }
+            ),
+            if *passed {
+                Color32::from_rgb(120, 200, 120)
+            } else {
+                Color32::from_rgb(230, 120, 110)
+            },
+        ),
+        es_ir::evaluation::AcceptanceResult::Unavailable { metric, reason } => (
+            format!("{}: not measured ({reason})", metric.name()),
+            Color32::from_gray(160),
+        ),
+    }
+}
+
+/// One colour per `EventSource`, violations as a tick beneath (spec 23.3).
+fn paint_timeline(ui: &mut egui::Ui, buckets: &[Bucket]) {
+    if buckets.is_empty() {
+        ui.label("no events.json: this run recorded no per-tick sources");
+        return;
+    }
+    let (response, painter) =
+        ui.allocate_painter(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+    let rect = response.rect;
+    let w = (rect.width() / buckets.len() as f32).max(1.0);
+    for (i, bucket) in buckets.iter().enumerate() {
+        let x = rect.left() + i as f32 * rect.width() / buckets.len() as f32;
+        painter.rect_filled(
+            Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(w, 18.0)),
+            0.0,
+            source_colour(bucket.source),
+        );
+        if !bucket.counts.is_empty() {
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(x, rect.top() + 21.0), Vec2::new(w, 8.0)),
+                0.0,
+                Color32::from_rgb(240, 200, 80),
+            );
+        }
+    }
+}
+
+// --- the Replay panel --------------------------------------------------------------------------
+
+/// Where the replay camera starts: the demo's showcase view (`es video showcase --eye`).
+const SHOWCASE_CAMERA: Camera = Camera {
+    eye: [0.55, -0.45, 0.42],
+    look_at: [0.12, -0.02, 0.08],
+    // 45 degrees, the showcase default. `to_radians` is not `const`.
+    fov_y: std::f64::consts::FRAC_PI_4,
+    width: 640,
+    height: 400,
+};
+
+/// The control rate a recorded `.estraj` tick is worth. 50 Hz is the demo deployment's
+/// `rate.control`; a run directory carries no Deployment IR to read it from, and playing at
+/// the wrong rate only changes how fast the arm appears to move.
+const REPLAY_RATE_HZ: f64 = 50.0;
+
+/// How much of the Run tab the replay panel takes when it first opens, and the least it ever
+/// takes: the 3D view has to be visible the moment `Replay` is pressed, not after the user
+/// finds the separator.
+const REPLAY_PANEL_FRACTION: f32 = 0.45;
+const REPLAY_PANEL_MIN: f32 = 320.0;
+
+/// Radians of orbit per point of drag, and zoom per point of scroll.
+const ORBIT_PER_POINT: f64 = 0.008;
+const ZOOM_PER_POINT: f64 = 0.002;
+
+/// One mesh for the whole frame: three vertices and one triangle per [`Tri2d`], already in
+/// paint order, so the painter's algorithm is just the order they are added in.
+fn replay_mesh(projected: &Projected, origin: Pos2) -> egui::Mesh {
+    let mut mesh = egui::Mesh::default();
+    for tri in projected {
+        let base = mesh.vertices.len() as u32;
+        let colour = Color32::from_rgb(tri.color[0], tri.color[1], tri.color[2]);
+        for p in tri.p {
+            mesh.colored_vertex(origin + Vec2::new(p[0], p[1]), colour);
+        }
+        mesh.add_triangle(base, base + 1, base + 2);
+    }
+    mesh
+}
+
+fn source_colour(source: es_eval::runner::EventSource) -> Color32 {
+    match source {
+        es_eval::runner::EventSource::Policy => Color32::from_rgb(70, 130, 180),
+        es_eval::runner::EventSource::Human => Color32::from_rgb(150, 150, 200),
+        es_eval::runner::EventSource::Clamped => Color32::from_rgb(220, 170, 60),
+        es_eval::runner::EventSource::Fallback => Color32::from_rgb(210, 90, 80),
+    }
 }
 
 fn paint_layer(

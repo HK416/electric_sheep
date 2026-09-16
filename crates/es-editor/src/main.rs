@@ -1,4 +1,4 @@
-//! `es-editor [bundle.esb]` — the editor shell of spec 23.
+//! `es-editor [bundle.esb|run-dir]` — the editor shell of spec 23.
 //!
 //! The window is the only thing this file owns. Everything it shows is
 //! [`es_editor::model`], which runs headless.
@@ -12,7 +12,7 @@ fn main() -> eframe::Result<()> {
     // change here and nowhere else.
     let mut app = EditorApp::new(replay(Vec::new()));
     if let Some(path) = std::env::args().nth(1) {
-        app = app.with_bundle(&path);
+        app = app.with_path(&path);
     }
     eframe::run_native(
         "Electric Sheep editor",
