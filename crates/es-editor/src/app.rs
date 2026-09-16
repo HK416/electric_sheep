@@ -513,7 +513,14 @@ impl EditorApp {
         });
         let Some((name, text)) = commit else { return };
         let Some(edit) = self.inspector.as_mut().and_then(|i| i.edit(&name, &text)) else {
-            self.status = format!("{name}: not a value");
+            // The reason is the field's, not a sentence invented here (spec 28.10 rule 3).
+            let why = self
+                .inspector
+                .as_ref()
+                .and_then(|i| i.field(&name))
+                .and_then(|f| f.error.clone())
+                .unwrap_or_default();
+            self.status = format!("{name}: {why}");
             return;
         };
         if let Some(session) = self.edit.as_mut() {
