@@ -4057,6 +4057,99 @@ frames. These, not section 7.28's, are the demo's videos: the policy in them is 
 section 7.27), the acceptance on the committed documents (this section) and the video. The review is
 `docs/reviews/M5.md`.
 
+### 7.30 As built (T7): the evaluator on a robot that exists, and what the demo's numbers become
+
+Packet `docs/packets/M7/T7-eval-latency.md`. V6b made both execution paths feed the Safety Plane
+through `es_env::plane_chunk` and V17 made both honour `rate.inference`; what was left is open
+question 24. `DomainRunner` submits an observation at control tick `t` and releases the chunk at
+`t + latency_ticks(expected_latency_ms, rate.control)`, so the collector's plane sees an empty
+buffer on tick 0 and answers with its own fallback, while `es_eval::runner` called the policy and
+executed row 0 in the same tick. "The two paths execute chunks identically" was true of the
+schedule and false of the trajectory. T7 makes it true of the trajectory.
+
+**What changed, in one paragraph.** The cell loop drives its policy calls through
+`es_env::AsyncInference`, constructed with the same pair `DomainRunner::new` passes
+(`latency_ticks(contract.runtime.expected_latency_ms, rate.control)`, the inference domain's
+batch), and pushes the released result into the `ChunkBuffer` at `apply_at = submit_tick +
+latency` — App. B.5's `computed_from + deterministic latency`, never the arrival tick. There is no
+second latency model: `latency_ticks` and `AsyncInference` are untouched in `es-env` and are what
+both paths call, and `git diff` for `crates/es-env` is empty. Nothing about the plane moved
+(INV-12): an underrun is the plane's own event, and it is counted, recorded and acted on exactly
+as it is in collection. The document's number reaches `es-eval` through
+`RunConfig::expected_latency_ms`, because `Evaluation::run` is handed the four IRs it judges and
+never the `LearningGraph`; `es eval run` fills it from the bundle it opened (one line, listed in
+the packet's context block). `expected_latency_ms = 0` stays legal, means zero ticks, and is
+exactly the loop that ran before.
+
+**The oracle that was missing.** `collection_and_evaluation_draw_the_same_trajectory`
+(`crates/es/tests/cli.rs`, `#[ignore]`, the oracle server) runs seed 1 of the demo scene through
+`es loop collect` and through `es_eval::Evaluation` with the same scripted expert and compares the
+two `.estraj` files — `qpos ‖ qvel` per tick, as raw `f64` bits, then the whole file. **Before the
+fix** it failed at tick 1, element 0: collection `1.4392937947180706 × 10⁻⁷` against evaluation
+`−4.3777706204127563 × 10⁻⁴` (the numbers open question 24 quoted, re-measured on this tree).
+After it, 120 of 120 ticks are identical and so are the body poses. The V17 sibling
+`collection_and_evaluation_ask_the_policy_at_the_same_cadence` now asserts the divergence is gone
+instead of printing it, and `expert_passes_the_evaluation_harness` runs the expert under the
+declared latency it always ran under in collection and still passes at 0.875.
+
+**The re-measurement** (no retraining, no re-import: V19b's own `w13-060000-a80.esb`, V18's own
+`trained-L80.esb`, the committed documents, `ES_PYTHON=~/venvs/es`, `--jobs 6`). Each row's
+"before" was **re-run on the merge base on the same box with the same venv and flags**, not copied
+from section 7.29 — and it reproduced section 7.29's committed numbers exactly, so every movement
+below is the latency model and nothing else. Artifacts under `~/artifacts/plan-v/m7-t7/`
+(`run.sh`, `control.sh`).
+
+| document | suite | `success_rate` | `envelope_violation_rate` | mean `episode_length` | fallback ticks | underrun ticks |
+|---|---|---|---|---|---|---|
+| V19b, held-out nominal | nominal | 0.9375 → **0.9375** | 0.2083 → **0.5455** | 323.8 → **556.8** | 0 → **160** | 0 → **160** |
+| V19b, six-suite sweep | nominal | 0.9375 → **0.9375** | 0.1849 → **0.5935** | 323.1 → **572.0** | 0 → **160** | 0 → **160** |
+| | light_intensity | 0.9375 → **0.9375** | 0.1771 → **0.5732** | 333.6 → **586.9** | 0 → **160** | 0 → **160** |
+| | light_direction | 0.8125 → **0.5625** | 0.3808 → **0.5600** | 582.2 → **1091.2** | 4 → **191** | 0 → **160** |
+| | observation_delay | 1.0000 → **1.0000** | 0.2852 → **0.5814** | 262.1 → **502.4** | 0 → **160** | 0 → **160** |
+| | torque_noise | 0.3125 → **0.0625** | 0.4997 → **0.5576** | 1379.2 → **1792.4** | 0 → **171** | 0 → **160** |
+| | backlash | 0.9375 → **0.8750** | 0.2537 → **0.5431** | 354.8 → **686.9** | 0 → **160** | 0 → **160** |
+| V18b IR-graph L80, held-out nominal | nominal | 0.6250 → **0.0625** | 0.5552 → **0.6985** | 936.2 → **1692.0** | 53 → **536** | 0 → **16** |
+
+**`passed` as found.** The external ACT still passes on both documents — `success_rate ≥ 0.5` on
+nominal, observed 0.9375 on the held-out run and on the sweep. **The IR-graph policy does not:**
+0.0625 against the same 0.5 threshold, `passed = false`. The threshold was not touched, in either
+direction.
+
+**Why the two policies get different latencies, which is the finding under the finding.** The
+number is each bundle's own. The fixture `learning.toml` declares `expected_latency_ms = 15`, one
+control tick at 50 Hz — that is what the IR-graph bundle carries and what `es loop collect`
+recorded the 200 demonstrations under. The imported ACT carries **200 ms**, ten control ticks,
+because `es policy import-lerobot` has no measurement to declare and states a *bound* instead:
+`declared_latency_ms = min(inference_budget, 1000 / replanning_hz) = min(240, 200)`
+(`crates/es/src/cmd/policy.rs`, and the doc comment there says so in as many words). Until T7 that
+number was inert on the evaluation path. It is now load-bearing, and for the ACT it happens to be
+exactly the re-plan period, so the pipeline is perfectly pipelined: the chunk computed from tick 0
+lands at tick 10 and drives ticks 10–19, the chunk from tick 10 lands at 20, and **only the first
+ten ticks of an episode underrun** — 160 over sixteen episodes, one 200 ms hold at the start and
+never again. The IR-graph policy's one tick gives one underrun per episode, 16 over sixteen.
+
+**What the movement means, and what it does not.** `envelope_violation_rate` roughly triples for
+the ACT (0.21 → 0.55) and episodes take about 1.7× as long. Nothing about the policy changed and
+nothing about the envelope changed: the commands are now 200 ms stale by the time they execute, so
+the plane rate-limits a command stream that is chasing a state the arm has already left, and the
+task takes longer to close. That is the honest number for the deployment as declared — the old one
+described a robot whose inference is instantaneous. The three suites that lost success
+(`light_direction` 0.81 → 0.56, `torque_noise` 0.31 → 0.06, `backlash` 0.94 → 0.88) are the three
+that were already the hard ones; a 200 ms open-loop hole is what turns "hard" into "fails".
+
+The IR-graph policy's collapse from 0.625 to 0.0625 on **one** tick of latency is the sharper
+result, and it is the one worth a human's attention: 520 of its 536 fallback ticks are the
+`EnvelopeViolationRate` watchdog latching (53 before), so a single tick of staleness pushes its
+command stream over `max_frac = 0.9` inside the 200-tick window often enough to hold the arm for
+whole stretches. Section 7.29's "the externally trained learner is better on every suite" survives
+this and gets wider; section 7.28's "the demo passes its own Evaluation IR on the checked-in
+documents" was measured for the IR-graph policy at zero latency and **does not survive** — that
+sentence is re-dated by this packet, not deleted (the rule section 7.26 set). The M5 acceptance
+that closed the milestone is V19b's, and it still holds.
+
+Two things a human may want to decide are in section 12: question 24 is answered here, and the
+new question 29 is `import-lerobot`'s invented latency now that it decides numbers.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -4471,6 +4564,14 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     of its own and re-dates the evaluation numbers once more; the alternative is to declare
     `expected_latency_ms = 0` for a simulated target and say so, which is a document change and
     a claim no real robot can honour.
+    **Answered (T7, section 7.30): the default was taken, and it re-dated the numbers.** The cell
+    loop now drives its policy calls through the same `es_env::AsyncInference` with the same
+    `latency_ticks` call, and the trajectory oracle the question asked for passes — 120 of 120
+    ticks bitwise, where before it failed at tick 1 with exactly the two values quoted above.
+    `expected_latency_ms = 0` stayed legal and still means zero ticks. What it cost: the external
+    ACT keeps `success_rate` 0.9375 and `passed = true` on both documents while its
+    `envelope_violation_rate` goes 0.21 → 0.55 and its episodes get 1.7× longer, and the IR-graph
+    policy falls 0.625 → 0.0625 and no longer passes. Section 7.30 has the table and the controls.
 25. **`envelope_violation_rate` is 0.998 under the declared cadence, and the watchdog latches**
     (section 7.25, V17). Executing a chunk's rows 0..9 in order asks for 0.02 – 0.03 rad of
     travel per control tick where the Deployment IR's `acceleration_max = 20 rad/s²` allows
@@ -4560,3 +4661,18 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     defensible: it is what §10.4 says). Default: **state the document beside every number**, which
     section 7.27 does, until the rule is decided; every trimmed-document table from V11 onward was
     measured this way and is internally consistent, but is not interchangeable with a sweep's row.
+29. **`import-lerobot` invents `expected_latency_ms`, and since T7 that invented number decides
+    the demo's numbers** (section 7.30). A `config.json` carries no latency measurement, so the
+    import declares the largest value the deployment tolerates —
+    `min(inference_budget, 1000 / replanning_hz)`, 200 ms for the demo — and says so in its own
+    doc comment. That was inert while evaluation had no latency model. It is now ten control
+    ticks of open loop at the start of every episode and 200 ms of staleness on every command, and
+    it is why the imported ACT is evaluated under a latency ten times the IR-graph policy's 15 ms
+    on the same scene and the same robot. Nothing here is wrong — the document decides, which is
+    the whole design — but the ACT's number was never measured. Three ends could move. **(a)**
+    `es bench` measures the checkpoint's real inference time on the reference device (§12.4) and
+    `import-lerobot` writes that; this is the honest answer and it is a packet. **(b)** The import
+    declares nothing and refuses to guess, which makes the document the human's to write. **(c)**
+    Keep the bound and state it beside every number, which section 7.30 does. Default: **(c) until
+    (a) exists**, because a bound is the conservative direction — a policy that passes under the
+    worst latency its deployment tolerates passes under the real one.
