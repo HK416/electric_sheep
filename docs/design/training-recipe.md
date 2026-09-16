@@ -57,6 +57,10 @@ seed          = 0
 checkpoint_at = [1000, 5000, 20000]
 device        = "cuda"
 interpreter   = "python"              # ES_PYTHON wins when it is set
+# optional, and absent means absent (section 10):
+# schedule     = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
+# weight_decay = 0.01                 # AdamW's; absent is torch's own 1e-2
+# grad_clip    = 1.0                  # gradient-norm clip; absent is off
 ```
 
 Every table is `deny_unknown_fields`: a typo is a refusal, not a silently ignored knob. The
@@ -153,8 +157,8 @@ digests:
 | | slot | written from | when |
 |---|---|---|---|
 | 1 | `config.json` | the recipe as canonical JSON, the resolved interpreter, the `<out>`-relative plan | pre-run |
-| 2 | `optimizer.json` | `AdamW` + `lr`; on the IR route also the betas/eps/weight decay `AdamW(params, lr=lr)` leaves at torch's defaults | pre-run |
-| 3 | `scheduler.json` | `{"kind":"constant","lr":…}` until T4 | pre-run |
+| 2 | `optimizer.json` | `AdamW` + `lr`; on the IR route also the betas/eps and the weight decay the trainer is told to use, plus `grad_clip` when `[run]` sets one (section 10) | pre-run |
+| 3 | `scheduler.json` | `{"kind":"constant","lr":…}`, or the `warmup_cosine` block `[run] schedule` names (section 10) | pre-run |
 | 4 | `seed.json` | `global` and `dataloader` from `[run] seed`; `augmentation` unset | pre-run |
 | 5 | `dataset.lock` | `es-data::identity`'s content/schema/split, the episode and frame counts, the recorded `es:task:` name | pre-run |
 | 6 | `base_model.lock` | `{"source":"none"}` (IR) or the declared `vision_backbone` + `pretrained_backbone_weights` (external) | pre-run |
@@ -189,7 +193,7 @@ in a `training.lock` this command writes, and the oracle asserts it.
 |---|---|---|
 | `seed.json.augmentation` | there is no augmentation | T6 |
 | `base_model.lock.weights_hash` and `.license` | a *declared* provenance: the backbone is LeRobot's ACT default unless `extra` overrides it, and nothing here has downloaded or verified those weights | T5 |
-| `optimizer.json.betas` / `.weight_decay` on the external route | `lerobot`'s optimizer block is not this side's to declare | T4 |
+| `optimizer.json.betas` / `.weight_decay` on the external route | `lerobot`'s optimizer block is not this side's to declare, and T4 therefore refuses `[run] schedule`, `weight_decay` and `grad_clip` on that route rather than declaring a schedule the run never applied (section 10) | T2 |
 | `metrics.json.loss` on the external route | `lerobot-train` reports its curve to its own logs, not to a file this command reads | T2 |
 | `hardware.json.driver` | `torch` reports the CUDA toolkit, not the driver | — |
 | `hardware.json.git_describe` | there is no build script and `Cargo.lock` is gitignored (M5 review S-8 / R7), so a build cannot be named yet; claiming a revision would be the fabrication §28.10 rule 2 forbids | M5 R7 |
@@ -252,6 +256,9 @@ name (an imported one) carries no claim and is not checked.
 | 3 | `cargo test -p es --test cli train_ir_path_packs_a_bundle_torch_opens -- --ignored` | `ES_PYTHON` with torch, MuJoCo |
 | 4 | `cargo test -p es --test cli train_refuses_by_name` | nothing |
 | — | `cargo test -p es-data --lib training` | nothing (the headless half: schema, plan, identity) |
+| 5 | `cargo test -p es-policy --test ir_training lr_schedule_matches_the_golden` | nothing; the interpreter half runs when `ES_PYTHON` is set and prints `SKIP` otherwise (section 10) |
+| 6 | `cargo test -p es --test cli train_identity_moves_with_the_schedule` | nothing |
+| 7 | `cargo test -p es-policy --test ir_training -- --ignored the_default_schedule_is_the_old_run` | `ES_PYTHON` with torch |
 
 Oracle 2 runs a real `es train` whose recipe names an interpreter that cannot exist, so the
 run always stops — and the identity it asserts is the one written before it stopped. That is
@@ -343,6 +350,26 @@ with the port-name message quoted in section 2 — the refusal working, and the 
    wants a literal `## context` heading and a fence or a bullet list
    (`xtask/src/scope.rs::parse_context_globs`), and `xtask/` is outside this packet's scope.
 
+**Packet M7/T4** (section 10) deviates in three further places.
+
+6. **The four measured rows were run through `train_act.py` directly, not through `es train`,
+   so what is kept per row is its JSON summary and its `--loss-curve`, not a `training.lock`.**
+   T4's packet asks for a lock per row. `--resident-gpu` is a trainer flag and deliberately not
+   a recipe field (it changes where a tensor lives, not what a run is, and section 2's rule is
+   that a recipe describes a run whose numbers are quoted), so a row measured through
+   `es train` would be a different run from T3's baseline it has to be comparable with. What is
+   kept instead: `~/artifacts/plan-v/m7-t4/{A,B,C,D}.json` and `*-curve.json`, plus one real
+   `es train` lock from oracle 3 re-run after this packet (`train-ir-training.lock`), whose
+   `scheduler.json` digest is the pre-T4 one.
+7. **`the_default_schedule_is_the_old_run` cannot compare against the previous script from
+   inside the repository**, because that file is not in the tree and a torch loss curve is not
+   a legitimate golden (this note's own section 9, and `ir_training.rs`'s header: two runs of
+   one optimizer do not agree across torch versions). The in-tree test compares the default
+   against every new flag at its default and pins the optimizer block; the comparison against
+   `main`'s own script is the server measurement in section 10.
+8. **The fixture recipe stays without a schedule**, which the packet left to this note to
+   decide — section 10's last subsection says why.
+
 ## 9. Open questions
 
 * **29.** `lerobot-train` at one seed does not produce bit-identical weights (section 7), so
@@ -358,3 +385,162 @@ with the port-name message quoted in section 2 — the refusal working, and the 
   a Task IR's `scene.path` are repository-relative. An installed `es` has no repository. The
   trainer's location probably wants to be a document value, or `train_act.py` wants to be data
   the binary carries — T3 touches that file anyway.
+* **33.** (32 is `visible-learning.md`'s.) `lr_curve_hash` is `null` when the interpreter cannot import `blake3` (section 10).
+  Every other digest in this repository is blake3 and computed in Rust; this one is computed
+  in Python because the trainer is the only thing that knows which rates it applied. Either
+  the trainer should write the applied rates to a file beside `--loss-curve` and let `es train`
+  hash them, or `blake3` should join `torch` as a declared dependency of the learning path
+  (`python/es/pyproject.toml` already declares it for the USD bake).
+* **34.** A schedule is refused on the lerobot route rather than translated (section 10). ACT's
+  own config carries `optimizer_lr` and `optimizer_weight_decay`
+  (`docs/api-notes/lerobot-config.md`, the "training-only" row), so a mapping from `[run]`
+  onto whatever `lerobot-train` 0.6.1 calls its schedule is possible and would make one
+  document describe both routes — which is the point of a recipe. It needs that side's flag
+  names pinned in the api-note first; until then `[policy] lerobot.extra` is the escape hatch.
+
+---
+
+## 10. The schedule (packet M7/T4)
+
+§28.9's "where the wall-clock goes" ends with one line about large batches: *linear scaling was
+measured to diverge, so what is needed is a schedule, not a convention.* This section is that
+line turned into a document field, a function, a golden and four measured runs.
+
+**The three flags, and what is a document value.** `train_act.py` gains `--schedule
+constant|warmup_cosine`, `--warmup-steps N`, `--lr-min F`, `--weight-decay F` (torch's own
+`1e-2`, **made explicit** so `optimizer.json` names a number the script was told rather than
+one it assumes) and `--grad-clip F` (`0` = off). The recipe names them in `[run]`:
+
+```toml
+[run]
+steps        = 20000
+batch        = 64
+lr           = 4e-4
+schedule     = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
+weight_decay = 0.01                   # optional; absent is torch's 1e-2
+grad_clip    = 1.0                    # optional; absent is off
+```
+
+`es train` puts them on the trainer's command line, writes `scheduler.json` as
+`{"kind":"warmup_cosine","lr":…,"lr_min":…,"warmup":…,"total_steps":…}` and `optimizer.json`
+with the weight decay and the clip, so `identity_hash` moves with every one of them. **The
+`total_steps` is part of the schedule and not decoration**: the cosine's period is the length
+of the run, so the same `warmup`/`lr_min` pair at 2,500 and at 20,000 steps are two different
+schedules — which is exactly what rows C and D below are.
+
+**The schedule is a plain function, not `torch.optim.lr_scheduler`.**
+
+```
+lr(step) = lr * step / warmup                                          step < warmup
+         = lr_min + (lr - lr_min) * 0.5 * (1 + cos(pi * (step - warmup) / (total - warmup)))
+```
+
+`python/es/train_act.py::lr_at` is those three lines and is called once per step. A torch
+scheduler's float sequence is an implementation detail of a torch version, and a run has to be
+reproducible from its `scheduler.json` across them — so the sequence is pinned here instead.
+`tests/golden/train/lr_warmup_cosine.json` holds the first 1,000 values for the row-D schedule
+(`total 20000, lr 4e-4, lr_min 1e-6, warmup 250`), generated once by the `#[ignore]`d
+`generate_lr_golden` from the script itself on the oracle server;
+`ir_training::lr_schedule_matches_the_golden` compares **a Rust re-implementation of the same
+three lines** to it bit for bit, and, when `ES_PYTHON` is set, the script's own `lr_at` too.
+The Rust half needs no interpreter, which is what lets CI judge the schedule at all.
+
+That the two agree bitwise across libms was the open risk — the cosine is the one transcendental
+here, and a golden produced by glibc's `cos` on the server is read by MSVC's `cos` on the
+Windows host. Measured: **1,000 of 1,000 values identical in `f64`**, warmup segment and cosine
+segment alike. The argument of the cosine stays in `[0, 0.119]` over the golden's range, where
+both libms are correctly rounded; a golden that covered the whole decay might not be so lucky,
+and that is the reason the test prints how many values differ rather than only asserting.
+
+**`constant` is the default, and the default is the old run.** Three separate statements, each
+with its own check:
+
+1. *nothing on the command line.* A recipe that names no schedule renders the plan it always
+   did, so `tests/golden/train/plan-ir.txt` is unchanged, byte for byte
+   (`cli::train_dry_run_plan_is_the_golden`).
+2. *nothing in the identity.* The new keys enter `scheduler.json` and `optimizer.json` only
+   when a recipe asks for them, so a pre-T4 recipe keeps its `identity_hash` — the run recorded
+   in section 7 is still the same run (`es-data::a_recipe_without_a_schedule_is_the_run_of_before`,
+   `cli::train_identity_moves_with_the_schedule`). Measured rather than argued: oracle 3 of
+   section 7 re-run on the server after this packet writes
+   `scheduler.json 8847154d…51afe7aa`, which is the digest that table already carried.
+3. *nothing in the arithmetic.* `lr_at` is not consulted under `constant`; the optimizer keeps
+   the step it was built with. `ir_training::the_default_schedule_is_the_old_run` runs 40 steps
+   on CPU with no new flag and 40 with every new flag at its documented default and compares
+   the two `--loss-curve` files as **bytes**, and asserts the reported optimizer block is the
+   one every measured run in these notes was taken under.
+
+The third is the one a test inside this repository cannot state completely, because the
+*previous* script is not in the tree. So it was measured against it once, on the server:
+`git show main:python/es/train_act.py` (main at `389ef88`, whose T-track files are identical to
+`374d42c`'s) run over the same module, the same baked set, the same seed and the same 40 steps
+as the oracle's own run — **the two loss curves are byte-identical**.
+
+**Refused on the lerobot route.** `[run] schedule`, `weight_decay` and `grad_clip` are
+`train_act.py`'s flags. `lerobot-train` carries its own optimizer and scheduler configuration,
+so accepting them there would write a `scheduler.json` — and therefore a `training_hash` — for
+a schedule the run never applied. The recipe refuses by name and points at
+`[policy] lerobot.extra` (open question 34).
+
+**`lr_curve_hash`.** The rates actually applied are hashed (blake3 over the `f64` values,
+little-endian) and reported in the run summary, so two runs of one schedule can be told apart
+by one word and a `constant` run's hash is checkably 40 copies of `--lr`. `blake3` is an
+optional import: the script's contract is "no package beyond torch", so an interpreter without
+it reports `null` rather than stopping a training run (open question 33). The oracle server's
+`es-lerobot-cuda` venv has no `pip`, so the runs below got it through `PYTHONPATH` pointing at
+a copy of the `blake3` package from the `es` venv beside it.
+
+### Measured — oracle server, RTX 4090, 2026-09-16
+
+The module is the demo's untrained bundle lowered by this tree's `es policy lower`
+(`lowering_hash 3d06811c…d8a2d394`, T3's), the data is V15's 200-demonstration baked set
+(36,960 samples, `observation_hash 899c16a9…`), and every run is `--seed 0 --device cuda
+--resident-gpu`, torch 2.11.0+cu129. The GPU was idle before the runs (`nvidia-smi`: 56 MiB,
+0 %), so no wait was needed.
+
+| run | batch | lr | schedule | steps | samples seen | wall clock | s / 1,000 steps | samples/s | `final_loss` | non-finite step |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A (baseline) | 8 | 1e-4 | constant | 20,000 | 160,000 | **1:47** (107 s) | 5.4 | 1,495 | 0.018901 | none |
+| B | 64 | 1e-4 | constant | 2,500 | 160,000 | **0:26** | 10.4 | 6,154 | 0.020714 | none |
+| C | 64 | 4e-4 | warmup_cosine, warmup 250, `lr_min` 1e-6 | 2,500 | 160,000 | **0:26** | 10.4 | 6,154 | **0.012060** | none |
+| D | 64 | 4e-4 | warmup_cosine, warmup 250, `lr_min` 1e-6 | 20,000 | 1,280,000 | **2:51** (171 s) | 8.6 | 7,485 | 0.004610 | none |
+
+Per §12.4 no `step/s` figure is quoted; the two rate columns are the run's own units. The short
+runs carry the same ~5 s of start-up (module build and the 3.9 GiB resident copy) over one
+eighth the steps, which is the whole of the difference between B/C's 10.4 and D's 8.6.
+
+**The packet's question, answered.** *At equal samples seen, does batch 64 with warmup and a
+cosine reach a loss at or below batch 8's?* **Yes, and by a third**: C is 0.012060 against A's
+0.018901 — 36 % lower — in **26 s against 107 s**. And the schedule is what did it, not the
+batch: B is the same 160,000 samples at the same 64 and the same lr as A, and it lands
+*above* A at 0.020714. "Not a convention but a schedule" is that pair of rows.
+
+**Nothing diverged, and what that is and is not evidence for.** No row has a non-finite step —
+the summary now reports `first_nonfinite_step`, so this is a number and not the absence of a
+crash. But C and D differ from `visible-learning.md` 7.11's NaN run in *two* ways: that one
+scaled the rate linearly to 8e-4 with no warmup, and these use 4e-4 with 250 steps of warmup
+and a decay. T3 already showed batch 64 at the unscaled 1e-4 is finite. So what is measured
+here is that **this combination is stable**, not that warmup alone rescues 8e-4; isolating that
+would be a fifth run and nothing downstream needs it.
+
+**D is not comparable to A as a fit** — it is eight times the data — and it is not evaluated
+here (that is wave 5's U-measurement). Its checkpoint is
+`~/artifacts/plan-v/m7-t4/model-D.safetensors` and its `lr_curve_hash` is
+`c01d5185b03a5bad9fbe1708b5582f504aabf90c745910713ca0ccaefc15365c`. `final_loss 0.004610` is
+the lowest an IR-graph run has recorded on these documents; whether a fit that low is a policy
+that succeeds is exactly the question §28.10's stop rule reserves for the re-measurement.
+
+**One number to read with care.** Row A is the same flags T3 measured at
+`learning-lowering.md` 5.2 and it reports `final_loss 0.018901` where that run reported
+0.019026, with the wall clock 107 s against 137 s. CUDA training does not reproduce run to run
+(§28.9 L10), so a 0.7 % difference between two identical invocations is the noise floor of
+every number in this table — which is why the comparisons above are 36 % and 76 % differences
+and not 1 % ones, and why the bitwise oracle for "the default is unmoved" is on CPU.
+
+### The fixture recipe is unchanged, deliberately
+
+`tests/fixtures/visible-learning/training.toml` still names no schedule. It is the committed
+recipe for the measured 20,000-step run at batch 8, and the plan golden beside it is the one
+`--dry-run` has to keep producing; showing the new field there would move both. The field is
+documented above and exercised by `cli::train_identity_moves_with_the_schedule`, which builds
+its own recipe.
