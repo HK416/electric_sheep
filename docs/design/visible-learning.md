@@ -3678,6 +3678,62 @@ before 40 or 80 is adopted as more than an ablation level. That re-derivation, a
 also needs (b)'s delta action space to hold up, is left to the owner along with the fixture
 change itself.
 
+### 7.28 As built (V18b + the fixture decision): the demo passes its own Evaluation IR on the checked-in documents
+
+Packet `docs/packets/M5/V18b-sweep-and-showcase.md`. Two things happened in one afternoon
+(2026-09-16). The owner decided open question 25: `acceleration_max` moved to 80 rad/s² in
+`tests/fixtures/visible-learning/deployment.toml` (commit `74b01a3`, the re-derivation in the
+fixture's own comment, `velocity_max` unchanged). And V18b ran the **whole** Evaluation IR — all
+six suites the fixture declares, held-out seeds 101–116, budget 1800 — at V18's levels 40 and 80,
+plus the V9 showcase pipeline at 80. Because V18's level-80 ablation copy and the committed
+fixture parse to the same document, `es ir check` prints the same `deployment_hash` for both
+(`f2f9a510…`; the level-40 copy is `38e56f4a…`), so the level-80 rows below are not an ablation
+any more: they are the record for the checked-in documents, with V15's unchanged 40,000-step
+checkpoint.
+
+**The full sweep at the adopted value** (`passed = true`; `evaluation_hash e52e8360…`, which does
+not cover the deployment; `execution_hash 52dfeba9…`):
+
+| suite | `success_rate` | `envelope_violation_rate` | mean `episode_length` | fallback ticks |
+|---|---|---|---|---|
+| nominal (gating) | **0.625** | 0.555 | 936 | 53 |
+| light_intensity | 0.625 | 0.542 | 889 | 29 |
+| light_direction | 0.500 | 0.662 | 1190 | 103 |
+| observation_delay | 0.0625 | 0.751 | 1719 | 395 |
+| torque_noise | 0.0625 | 0.670 | 1731 | 383 |
+| backlash | 0.625 | 0.694 | 1021 | 287 |
+
+Level 40, the alternative not taken, also passes (`nominal` 0.625) but is worse on every perturbed
+suite except backlash and keeps the watchdog latching (767 fallback ticks on nominal against 53).
+The two perturbations this checkpoint cannot survive — `observation_delay` and `torque_noise`, one
+success in sixteen at either level — are a property of the policy, not of the envelope. The
+held-out nominal numbers reproduce V18's own bit for bit at both levels (same `evaluation_hash
+40623e01…`, same report). The ten held-out successes at 80 are seeds 101, 102, 104, 105, 107, 108,
+110, 112, 113 and 116.
+
+**Videos.** Rendered with the V9 pipeline from the recorded `.estraj` trajectories, camera as in
+section 7.17: `v18b-L80-holdout-nominal-00.mp4` (seed 101, 206 control ticks, 1280×720 at
+30 fps), `v18b-L80-holdout-nominal-12.mp4` (seed 113, 183 ticks) and
+`v18b-L80-holdout-mosaic.mp4` (all sixteen held-out episodes as 4×4 tiles of the policy's own
+96×96 observation, 1,800 frames at 50 fps). Server `~/artifacts/plan-v/v18b/showcase/`, mirrored
+to `target/plan-v/v18b/showcase/` (untracked; the repository carries no video). The orchestrator
+checked sampled frames: the arm starts above the cube, closes on it, carries it over the bin and
+opens the jaw with the cube inside.
+
+**What this is and is not.** It is the first time plan V's own acceptance holds on the documents
+as committed: a policy trained here, run here, passing the Evaluation IR it was written against,
+with videos a person can watch. It is *not* yet the project's thesis (an externally trained policy
+reproduced bitwise — that is V19, section 7.27), and the policy is not deployable: it reads the
+simulation's privileged cube pose through the state port (V7a), which the provenance validator of
+§28.9 rung 14 exists to keep off a real robot. Every number from V13 to V17 was taken behind an
+envelope that clamped the policy on 99.8 % of its ticks; what changed between 0.0625 and 0.625 was
+the runtime and its document, never the weights.
+
+**One thing left open (question 26).** Reproducing level 40 while the level-80 render was running
+on the same GPU gave the same report and the same `evaluation_hash` but a different
+`execution_hash` (`745c9777…` against `c2322c2c…` when run alone). The numbers did not move; the
+provenance did. V18b did not chase it.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -4142,3 +4198,14 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     new document, so its numbers and V18b's level-80 sweep and showcase are the record for the
     checked-in fixture. Demonstrations collected after this change accelerate at up to
     40 rad/s² (the expert paces to half the envelope); the V14 data set was collected at 10.
+
+26. **`execution_hash` moved under GPU contention while every number stayed** (section 7.28,
+    V18b). Reproducing the level-40 held-out suite while a level-80 render ran on the same
+    RTX 4090 gave a report, an `evaluation_hash` and a `failure_mode_histogram` identical to
+    the solo run and a different `execution_hash` (`745c9777…` against `c2322c2c…`). Of the
+    nine slots §5.3 hashes, only `runtime` and `hardware_capability` are computed at run time,
+    so one of them read differently under load — a thread count, a device query, a capability
+    probe. Not a correctness question (the results are bit-identical) but a provenance one: two
+    identical runs should not carry two names. Default: **make the slot deterministic** — pin
+    what `hardware_capability` and `PolicyRuntime::runtime_hash` read to declared, not measured,
+    values, and add the solo/contended pair as an oracle. A packet for the M5 review's list.
