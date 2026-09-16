@@ -355,7 +355,8 @@ fn import_lerobot(args: &[String]) -> Result<u8, CliError> {
     };
     let budget_ms = deployment.deadlines.inference_budget.0 as f32 / 1000.0;
     policy.contract.runtime.deadline_ms = budget_ms;
-    policy.contract.runtime.expected_latency_ms = budget_ms;
+    policy.contract.runtime.expected_latency_ms =
+        declared_latency_ms(budget_ms, policy.contract.replanning_hz);
     policy.weights = WeightsRef::Safetensors {
         path: "policy.safetensors".to_owned(),
         hash: weights_hash(&remapped),
@@ -459,4 +460,52 @@ fn mismatch(path: &str, error: &PolicyError) -> String {
         "nothing was written: a checkpoint is never dropped, padded or reshaped to fit".to_owned(),
     );
     lines.join("\n")
+}
+
+/// What `import-lerobot` may honestly declare for `RuntimeHints::expected_latency_ms`.
+///
+/// `es_ir::learning::RuntimeHints` documents that field as "a measurement on the reference
+/// device of spec 0.3, not a promise", and a `config.json` carries no measurement, so what the
+/// import declares is a **bound**: the largest latency this deployment tolerates, which is the
+/// tighter of its `deadlines.inference_budget` and its own re-plan period (spec 8.4, `LRN-052`,
+/// which checks exactly `latency <= min(deadline, 1000 / replanning_hz)`).
+///
+/// Until packet M5/V19 this was the budget alone. That is the same number whenever the budget
+/// fits inside the re-plan period -- V8's 40 ms against 200 ms -- and a contradiction the
+/// moment it does not: V17 states a 240 ms `inference_budget` for the 5 Hz re-plan the same
+/// document declares, and `LRN-052` then refused every imported checkpoint for claiming a
+/// latency that deployment's own rate forbids. The refusal was about the invented number, not
+/// about the policy.
+///
+/// So `LRN-052` has nothing left to catch on this path, and that is the honest state of it: a
+/// rule cannot check a number the same command made up. A measured latency would come from
+/// `es bench` (spec 12.4) and is not something a checkpoint directory can supply.
+fn declared_latency_ms(budget_ms: f32, replanning_hz: f32) -> f32 {
+    budget_ms.min(1000.0 / replanning_hz)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::declared_latency_ms;
+
+    /// The two plan-V deployments, and the rule `LRN-052` applies to the result.
+    #[test]
+    fn the_declared_latency_is_the_tighter_of_the_budget_and_the_replan_period() {
+        // Compared as bits: every value here is exactly representable, and the point of the
+        // assertion is that the number did not move at all (clippy's `float_cmp`).
+        // V8's deployment: a 40 ms inference budget against a 200 ms re-plan period. The
+        // budget is the bound, and this is the value V8 imported.
+        assert_eq!(declared_latency_ms(40.0, 5.0).to_bits(), 40.0f32.to_bits());
+        // V17's: a 240 ms budget for the same 5 Hz re-plan. The period is the bound.
+        assert_eq!(
+            declared_latency_ms(240.0, 5.0).to_bits(),
+            200.0f32.to_bits()
+        );
+        // Whatever the two numbers are, the result never exceeds either -- which is what
+        // `LRN-052` checks (`crates/es-ir/src/learning.rs`: latency > min(deadline, replan)).
+        for (budget, hz) in [(40.0, 5.0), (240.0, 5.0), (20.0, 50.0), (1000.0, 1.0)] {
+            let latency = declared_latency_ms(budget, hz);
+            assert!(latency <= budget && latency <= 1000.0 / hz, "{budget} {hz}");
+        }
+    }
 }
