@@ -75,7 +75,7 @@ pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
     }
 }
 
-fn export(args: &[String]) -> Result<u8, CliError> {
+pub(crate) fn export(args: &[String]) -> Result<u8, CliError> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{HELP}");
         return Ok(0);
@@ -154,7 +154,7 @@ fn export(args: &[String]) -> Result<u8, CliError> {
 /// ran the compiled plan, which puts a `Normalize` on both. Two implementations of one node
 /// is the root cause, so the fix is that there is only one: everything between a recorded
 /// value and a baked tensor here is produced by `CpuPlan::run`.
-fn bake(args: &[String]) -> Result<u8, CliError> {
+pub(crate) fn bake(args: &[String]) -> Result<u8, CliError> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{HELP}");
         return Ok(0);

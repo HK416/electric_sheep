@@ -7205,3 +7205,361 @@ fn the_temporal_ensemble_survives_the_grasp_window() {
         "a joint's blended command does not span what the newest chunk asked for: {reaches:?}"
     );
 }
+
+// --- packet M7/T1: `es train` -----------------------------------------------------------
+
+/// `es train` is run from the repository root: the IR route's trainer is
+/// `python/es/train_act.py` and a Task IR's `scene.path` is repository-relative.
+fn train_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+}
+
+fn train_golden(name: &str) -> PathBuf {
+    train_root().join("tests/golden/train").join(name)
+}
+
+/// TOML basic strings take `\` as an escape, and `es` opens either separator on Windows.
+fn train_toml_path(p: &Path) -> String {
+    p.to_string_lossy().replace('\\', "/")
+}
+
+/// The two committed recipes, by the path `es train --recipe` is given from the root.
+const TRAIN_RECIPES: [(&str, &str); 2] = [
+    (
+        "tests/fixtures/visible-learning/training.toml",
+        "plan-ir.txt",
+    ),
+    (
+        "tests/fixtures/visible-learning/training-lerobot.toml",
+        "plan-lerobot.txt",
+    ),
+];
+
+/// `ES_PYTHON` is removed on purpose: it is the one machine-dependent word in the plan, so a
+/// golden that is a property of the recipe alone has to be taken without it.
+fn run_train(recipe: &str, out: &Path, extra: &[&str]) -> Output {
+    bin()
+        .current_dir(train_root())
+        .env_remove("ES_PYTHON")
+        .args(["train", "--recipe", recipe, "--out"])
+        .arg(out)
+        .args(extra)
+        .output()
+        .expect("run es train")
+}
+
+fn stderr_of(out: &Output) -> String {
+    String::from_utf8_lossy(&out.stderr).into_owned()
+}
+
+/// Regenerates `tests/golden/train/plan-*.txt`. Run once, explicitly; they are then read-only
+/// (spec 1.4), exactly like `generate_fixture_and_golden` in `tests/video.rs`.
+#[test]
+#[ignore = "golden generator; run explicitly"]
+fn generate_train_goldens() {
+    let dir = scratch_dir("train-goldens");
+    std::fs::create_dir_all(train_root().join("tests/golden/train")).expect("golden dir");
+    for (recipe, golden) in TRAIN_RECIPES {
+        let out = run_train(recipe, &dir.join(golden), &["--dry-run"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+        write(&train_golden(golden), &stdout(&out));
+    }
+}
+
+/// Oracle 1. The plan is a property of the recipe: same bytes on any machine, in any output
+/// directory, on either path separator -- which is what "paths relative to `<out>`" buys.
+#[test]
+fn train_dry_run_plan_is_the_golden() {
+    for (recipe, golden) in TRAIN_RECIPES {
+        let dir = scratch_dir("train-dry");
+        let out = run_train(recipe, &dir, &["--dry-run"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+        let want = std::fs::read_to_string(train_golden(golden))
+            .unwrap_or_else(|e| panic!("{}: {e}", train_golden(golden).display()));
+        assert_eq!(stdout(&out), want, "{recipe}: stdout is not the golden");
+        let written = std::fs::read_to_string(dir.join("training").join("plan.txt"))
+            .expect("--dry-run writes training/plan.txt");
+        assert_eq!(written, want, "{recipe}: plan.txt is not the golden");
+        // "writes nothing but plan.txt": no identity is claimed for a run that did not happen.
+        assert!(!dir.join("training.lock").exists());
+        assert!(!dir.join("training").join("config.json").exists());
+    }
+}
+
+/// A recipe for the IR route against a fixture dataset, with an interpreter that cannot
+/// exist -- so the run always stops at the trainer and the assertions are about the identity
+/// the run wrote *before* spending anything.
+fn train_fixture_recipe(bundle: &Path, root: &Path, tiles: &Path, seed: u64, lr: &str) -> String {
+    format!(
+        "kind = \"training\"\n\
+         [dataset]\n\
+         root = \"{}\"\n\
+         frames = \"{}\"\n\
+         [policy]\n\
+         bundle = \"{}\"\n\
+         [run]\n\
+         steps = 40\n\
+         batch = 2\n\
+         lr = {lr}\n\
+         seed = {seed}\n\
+         checkpoint_at = [40]\n\
+         device = \"cpu\"\n\
+         interpreter = \"es-no-such-interpreter\"\n",
+        train_toml_path(root),
+        train_toml_path(tiles),
+        train_toml_path(bundle),
+    )
+}
+
+fn train_lock(out: &Path) -> serde_json::Value {
+    serde_json::from_str(
+        &std::fs::read_to_string(out.join("training.lock"))
+            .unwrap_or_else(|e| panic!("{}: {e}", out.join("training.lock").display())),
+    )
+    .expect("training.lock is JSON")
+}
+
+/// Oracle 2. One recipe, one `identity_hash`, wherever it is run; `seed` and `lr` move it;
+/// every slot is the digest of a file that exists and parses, and none of them is zero.
+#[test]
+fn train_identity_is_a_function_of_the_recipe() {
+    let dir = scratch_dir("train-identity");
+    let bundle = write_demo_bundle(&dir);
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 2, 12);
+
+    let recipe = dir.join("training.toml");
+    write(
+        &recipe,
+        &train_fixture_recipe(&bundle, &root, &tiles, 0, "1e-4"),
+    );
+    let path = train_toml_path(&recipe);
+    let (a, b) = (dir.join("out-a"), dir.join("out-b"));
+    let run_a = run_train(&path, &a, &[]);
+    // Neither run can finish: the recipe's interpreter does not exist, and the identity is
+    // written before it is ever asked to (the pre-run/post-run split, design note section 3).
+    assert!(!run_a.status.success(), "{}", stdout(&run_a));
+    run_train(&path, &b, &[]);
+
+    let (la, lb) = (train_lock(&a), train_lock(&b));
+    assert_eq!(
+        la["identity_hash"], lb["identity_hash"],
+        "two output directories, two identities"
+    );
+    assert_eq!(
+        la["training_hash"],
+        serde_json::json!({"unset": true}),
+        "a run that did not train claimed a training_hash"
+    );
+
+    for name in es_data::training::FILES {
+        let text = std::fs::read_to_string(a.join("training").join(name))
+            .unwrap_or_else(|e| panic!("training/{name}: {e}"));
+        serde_json::from_str::<serde_json::Value>(&text)
+            .unwrap_or_else(|e| panic!("training/{name} is not canonical JSON: {e}"));
+        let digest = la["files"][name].as_str().expect(name);
+        assert_eq!(
+            digest,
+            hex(blake3::hash(text.as_bytes()).as_bytes()),
+            "training.lock's digest of {name} is not the digest of {name}"
+        );
+        assert_ne!(digest, hex(&[0u8; 32]), "{name} is an all-zero digest");
+    }
+
+    for (seed, lr) in [(1u64, "1e-4"), (0, "2e-4")] {
+        let other = dir.join(format!("recipe-{seed}-{lr}.toml"));
+        write(
+            &other,
+            &train_fixture_recipe(&bundle, &root, &tiles, seed, lr),
+        );
+        let out = dir.join(format!("out-{seed}-{lr}"));
+        run_train(&train_toml_path(&other), &out, &[]);
+        assert_ne!(
+            la["identity_hash"],
+            train_lock(&out)["identity_hash"],
+            "seed {seed} lr {lr} did not move identity_hash"
+        );
+    }
+}
+
+/// Oracle 4. Every refusal names the field that caused it (spec 17.2).
+#[test]
+fn train_refuses_by_name() {
+    let dir = scratch_dir("train-refuse");
+    let bundle = write_demo_bundle(&dir);
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 1, 12);
+    let base = train_fixture_recipe(&bundle, &root, &tiles, 0, "1e-4");
+
+    let refuse = |name: &str, body: &str, extra: &[&str]| -> String {
+        let recipe = dir.join(format!("{name}.toml"));
+        write(&recipe, body);
+        let out = run_train(&train_toml_path(&recipe), &dir.join(name), extra);
+        assert!(
+            !out.status.success(),
+            "{name} was accepted:\n{}",
+            stdout(&out)
+        );
+        stderr_of(&out)
+    };
+
+    // Both routes, and neither.
+    let both = base.replace(
+        "bundle = ",
+        "lerobot = { type = \"act\", chunk_size = 16, n_action_steps = 16 }\nbundle = ",
+    );
+    assert!(refuse("both", &both, &[]).contains("both"), "both");
+    let neither = base
+        .lines()
+        .filter(|l| !l.starts_with("bundle ="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(refuse("neither", &neither, &[]).contains("neither"));
+
+    // An image input with no pixels behind it.
+    let no_frames = base
+        .lines()
+        .filter(|l| !l.starts_with("frames ="))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let said = refuse("no-frames", &no_frames, &[]);
+    assert!(said.contains("frames"), "{said}");
+
+    // A dataset recorded under another Task IR (M5 review S-3/R4). `meta/tasks.jsonl` is the
+    // one place collection writes it, and `LeRobotDataset::open` reads it back verbatim.
+    let retired = "0".repeat(64);
+    write(
+        &root.join("meta").join("tasks.jsonl"),
+        &format!("{{\"task_index\":0,\"task\":\"es:task:{retired}\"}}\n"),
+    );
+    let said = refuse("retired", &base, &[]);
+    assert!(said.contains(&retired), "{said}");
+    assert!(said.contains("--allow-retired-task"), "{said}");
+    // Named, it is accepted -- and the run then stops at the interpreter instead, which is
+    // the other refusal the packet lists.
+    let said = refuse("allowed", &base, &["--allow-retired-task", &retired]);
+    assert!(!said.contains("M5 review S-3"), "{said}");
+    assert!(
+        said.contains("es-no-such-interpreter"),
+        "the refusal does not name the interpreter: {said}"
+    );
+}
+
+/// Oracle 3. 40 steps on the demo bundle and the bake fixture, then the bundle `es train`
+/// packed is opened by `TorchRuntime` and asked for a chunk.
+///
+/// `#[ignore]`d because it is the one `es train` oracle that needs torch; without `ES_PYTHON`
+/// it prints why and stops rather than pretending (spec 1.4).
+#[test]
+#[ignore = "needs ES_PYTHON with torch"]
+fn train_ir_path_packs_a_bundle_torch_opens() {
+    let Ok(python) = std::env::var("ES_PYTHON") else {
+        println!("SKIP train_ir_path_packs_a_bundle_torch_opens: ES_PYTHON is not set");
+        return;
+    };
+    if skip_without_bake_model("train_ir_path_packs_a_bundle_torch_opens") {
+        return;
+    }
+    let dir = scratch_dir("train-ir");
+    let bundle = write_demo_bundle(&dir);
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 4, 16);
+    let recipe = dir.join("training.toml");
+    write(
+        &recipe,
+        &train_fixture_recipe(&bundle, &root, &tiles, 0, "1e-4").replace(
+            "es-no-such-interpreter",
+            &train_toml_path(Path::new(&python)),
+        ),
+    );
+    let out = dir.join("out");
+    let run = bin()
+        .current_dir(train_root())
+        .args(["train", "--recipe", &train_toml_path(&recipe), "--out"])
+        .arg(&out)
+        .output()
+        .expect("run es train");
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&run),
+        stderr_of(&run)
+    );
+
+    // The bundle the run packed, opened the way `es eval run` opens one.
+    let packed = out.join("checkpoints").join("40.esb");
+    let bytes = std::fs::read(&packed).expect("checkpoints/40.esb");
+    let trained = es_compile::PolicyBundle::open(&bytes).expect("the packed bundle opens");
+    let mut runtime = es_policy::TorchRuntime::new();
+    let info = es_policy::PolicyRuntime::load(
+        &mut runtime,
+        &trained.learning,
+        &es_policy::WeightsSource::InMemory(trained.weights.clone()),
+    )
+    .expect("TorchRuntime::load accepts what es train packed");
+    let inputs: BTreeMap<String, es_compile::Tensor> = trained
+        .learning
+        .policy
+        .contract
+        .inputs
+        .iter()
+        .map(|(port, ty)| {
+            let dims = ty.ty.shape.dims().to_vec();
+            let n: u64 = dims.iter().product();
+            (
+                port.clone(),
+                es_compile::Tensor {
+                    dtype: ElemType::F32,
+                    shape: dims,
+                    data: (0..n)
+                        .flat_map(|i| ((i % 23) as f32 / 23.0).to_le_bytes())
+                        .collect(),
+                },
+            )
+        })
+        .collect();
+    let outputs = es_policy::PolicyRuntime::infer(&mut runtime, &inputs).expect("infer a chunk");
+    let chunk = outputs.values().next().expect("one output");
+    let values: Vec<f32> = chunk
+        .data
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    assert!(
+        !values.is_empty() && values.iter().all(|v| v.is_finite()),
+        "{values:?}"
+    );
+    assert!(info.action_dim > 0);
+
+    // `checkpoint.manifest` names that file, with the digest of its bytes.
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("training").join("checkpoint.manifest"))
+            .expect("checkpoint.manifest"),
+    )
+    .expect("checkpoint.manifest is JSON");
+    let row = &manifest["checkpoints"][0];
+    assert_eq!(row["step"].as_u64(), Some(40), "{manifest}");
+    assert_eq!(
+        row["bundle"].as_str(),
+        Some("checkpoints/40.esb"),
+        "{manifest}"
+    );
+    assert_eq!(
+        row["weights_blake3"].as_str(),
+        Some(hex(blake3::hash(&bytes).as_bytes()).as_str()),
+        "{manifest}"
+    );
+
+    let lock = train_lock(&out);
+    let training_hash = lock["training_hash"]
+        .as_str()
+        .expect("training_hash is set");
+    assert_ne!(
+        training_hash,
+        lock["identity_hash"].as_str().expect("identity_hash"),
+        "the post-run slots did not move training_hash"
+    );
+    assert_eq!(lock["checkpoints"][0]["step"].as_u64(), Some(40));
+    println!("RAN train_ir_path_packs_a_bundle_torch_opens: training_hash {training_hash}");
+}

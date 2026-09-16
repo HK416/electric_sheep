@@ -1,0 +1,5 @@
+# route: external
+es dataset export --lerobot-v3 runs/collect-001/ds --out ds-v3 --frames frames-in --drop action_commanded,action_source,intervention --state-dim 13
+python -m lerobot.scripts.lerobot_train --dataset.repo_id=es/train --dataset.root=ds-v3 --policy.type=act --policy.chunk_size=16 --policy.n_action_steps=16 --policy.device=cuda --policy.push_to_hub=false --policy.optimizer_lr=0.0001 --steps=20000 --batch_size=8 --seed=0 --save_freq=10000 --output_dir=lerobot --job_name=es-train --wandb.enable=false
+es policy import-lerobot --checkpoint lerobot/checkpoints/010000/pretrained_model --task tests/fixtures/visible-learning/task.toml --observation tests/fixtures/visible-learning/observation.toml --deployment tests/fixtures/visible-learning/deployment.toml --out checkpoints/10000.esb
+es policy import-lerobot --checkpoint lerobot/checkpoints/020000/pretrained_model --task tests/fixtures/visible-learning/task.toml --observation tests/fixtures/visible-learning/observation.toml --deployment tests/fixtures/visible-learning/deployment.toml --out checkpoints/20000.esb

@@ -83,7 +83,30 @@ interpreter = "python"                # overridden by ES_PYTHON when set
   refusal, surfaced here); an interpreter that cannot `import torch` (external path: `import
   lerobot`) — print the interpreter's own error.
 
-## context (allowed scope)
+## context
+
+`cargo xtask check-scope` reads the fence; the prose below it is the same list with the
+reason for each entry.
+
+```
+crates/es-data/src/training.rs
+crates/es-data/src/lib.rs
+crates/es/src/cmd/train.rs
+crates/es/src/cmd/mod.rs
+crates/es/src/main.rs
+crates/es/src/cmd/dataset.rs
+crates/es/src/cmd/policy.rs
+crates/es/tests/cli.rs
+tests/fixtures/visible-learning/training*.toml
+tests/golden/train/*.txt
+docs/design/training-recipe*.md
+docs/packets/M7/T1-es-train*.md
+python/es/train_act.py
+```
+
+`crates/es/src/cmd/{dataset,policy}.rs` are in the fence for the one edit the `forbidden`
+section allows them: making a step's function `pub(crate)` so `es train` can call it
+in-process.
 
 `crates/es-data/src/training.rs` (recipe schema, plan builder, identity assembly; new),
 `crates/es-data/src/lib.rs` (module + re-exports only), `crates/es/src/cmd/train.rs` (new),

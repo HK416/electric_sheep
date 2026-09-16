@@ -1,0 +1,29 @@
+# The IR route (packet M7/T1): the demo's Learning IR is the architecture, and
+# `python/es/train_act.py` optimizes the module `es policy lower` emits from it.
+#
+# `es train --recipe tests/fixtures/visible-learning/training.toml --out <dir> --dry-run`
+# prints the plan pinned by `tests/golden/train/plan-ir.txt`. The paths under `runs/` are the
+# shape `es loop collect --out runs/collect-001/ds --frames runs/collect-001/frames` writes;
+# nothing here needs to exist for `--dry-run`, which is what makes the golden judgeable
+# without a dataset, a bundle or Python.
+#
+# `steps` is the authority on how long the run is: it is always the last checkpoint mark,
+# because `train_act.py` caps its run at the largest of them.
+
+kind = "training"
+
+[dataset]
+root   = "runs/collect-001/ds"
+frames = "runs/collect-001/frames"
+
+[policy]
+bundle = "runs/collect-001/untrained.esb"
+
+[run]
+steps         = 20000
+batch         = 8
+lr            = 1e-4
+seed          = 0
+checkpoint_at = [1000, 5000, 20000]
+device        = "cuda"
+interpreter   = "python"
