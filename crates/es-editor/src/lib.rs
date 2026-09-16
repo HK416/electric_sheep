@@ -24,4 +24,5 @@ pub use model::edit::{Edit, EditSession};
 pub use model::graph_view::LayeredGraph;
 pub use model::image_view::{BeforeAfter, ImagePair, Rgb8Image};
 pub use model::palette::{Palette, Registries};
+pub use model::run_view::{CellRow, RunView, Timeline};
 pub use model::telemetry_view::TelemetryModel;

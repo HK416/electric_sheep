@@ -15,6 +15,11 @@ es-core = { workspace = true }
 es-ir = { workspace = true }
 es-compile = { workspace = true }
 es-telemetry = { workspace = true }
+# The Run tab (packet M7/E1) reads a finished run's own artifacts: `report.json` through
+# `es-ir`, `events.json` through `es_eval::runner::StepEvent`, and its `events` bitset through
+# `es_safety::EventSet`. Both are below layer 12; neither is re-implemented here.
+es-eval = { workspace = true }
+es-safety = { workspace = true }
 eframe = { workspace = true }
 egui = { workspace = true }
 serde = { workspace = true }

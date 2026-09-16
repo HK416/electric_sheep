@@ -205,3 +205,75 @@ is the part that would actually be hard to get right, is not something snarl doe
 - A parameter inspector panel. `Edit::SetParam` and `NodeSchema` are both in place and tested;
   the widget that fills a `ParamType` in is UI work with no model behind it left to design.
 - Editing Observation IR nodes, and the Control Graph (IR-C) — stage 3, M4.
+
+---
+
+## 10. The Run tab: a finished run, opened (§23.3, §10.5, M7/E1)
+
+Every `es eval run` / `es loop collect` writes `report.json`, `evaluation.lock`, `events.json`,
+`traj/<cell>.estraj` and — with `--frames` — `frames/<cell>/NNNNNN.bin`. Until now the only
+readers were `es video mosaic` and a person with `jq`. The **Run** tab opens the directory.
+
+`es-editor <run-dir>` and the File field take one path; a directory holding `report.json` is a
+run and anything else is a bundle (`RunView::is_run_dir`). Told apart by what is on disk, not
+by a flag: a run directory and a bundle directory cannot be confused, and a person who typed
+the wrong one gets the other view's error, not a mode.
+
+### `model/run_view.rs`
+
+| Call | Gives |
+|---|---|
+| `RunView::open(dir)` | the `EvaluationReport`, the `BTreeMap<String, Vec<es_eval::runner::StepEvent>>` of `events.json`, and a listing (never a load) of `traj/` and `frames/` |
+| `cells()` | one `CellRow` per **episode**: name, suite, seed, the suite's metrics by the report's own names, whether a trajectory and frames exist |
+| `columns()` / `sort_by(i)` | the table's headers, and a stable sort by any of them |
+| `timeline(cell)` | per tick the `EventSource` and the decoded `EventSet`, plus per-kind totals and each kind's first tick |
+| `Timeline::buckets(n)` | the same ticks folded into `n` columns, for drawing at any width |
+| `acceptance()` | `report.acceptance` verbatim |
+| `filmstrip(cell, 8)` / `frame(cell, i)` | at most eight evenly spread frame indices, and one decoded `Rgb8Image` |
+| `selected_cell()` / `select(name)` | the selection, which is the whole coupling to the replay panel (§11) |
+
+**Two things are called a cell** and the file keeps them apart. `es_ir::evaluation::CellResult`
+is one *suite × metric* of the §10.1 table; a cell on disk — an `events.json` key, a
+`frames/<cell>/`, a `traj/<cell>.estraj` — is one *episode*, named `<suite>-<NN>` by
+`Evaluation::run_shard`. A `CellRow` is the episode and carries the metrics its suite measured,
+so the same three numbers appear on both rows of a two-episode suite. The alternative — a row
+per `CellResult` — is the report table, and it is not what someone who wants to watch episode
+`nominal-01` is looking for.
+
+**Metric names are the report's.** `columns()` is the union of the metric names the report
+carries, so a metric added to `MetricSpec` appears with no change here. Nothing is hard-coded,
+and a `Histogram` or an `Unavailable` value is shown as what it is, never as `0`.
+
+**Seeds come from `evaluation.lock`.** `report.json` carries none. The lock's `seeds[i]` is
+selected by the `NN` of the cell name, which is the episode index `run_shard` counts with.
+Without the lock the column is `--`: an invented seed is worse than a missing one.
+
+**The violation bits are decoded, not re-derived.** `StepEvent::events` is
+`es_safety::EventSet::bits()`. `EventSet` has no `from_bits` and `es-safety` is not this
+packet's to change, so `decode_events` re-inserts through `ViolationKind::index()` — the same
+table the encoder used — and a test round-trips all 14 kinds.
+
+**Buckets are contiguous, gapless and total**, which is what makes their per-kind counts sum
+back to the timeline's totals at any `n` (the oracle checks `n ∈ {1, 7, 64}`). A bucket shows
+the most severe source it covers (`Policy < Human < Clamped < Fallback`), so one clamped tick
+in a 400-tick episode is still a visible mark rather than a rounding loss.
+
+### What it deliberately does not do
+
+- **No live process.** The tab reads a finished directory. Attaching to a running
+  `es eval run` is E4's `--telemetry`, and it is a different transport.
+- **No editing of a run.** Nothing is written back: an artifact that the editor could rewrite
+  is an artifact the hash chain cannot vouch for (§5.3, §10.5).
+- **No caching.** `frame()` decodes what it is asked for; `app.rs` keeps the eight filmstrip
+  textures of the selected cell and drops them when the path changes.
+- **A partial run still opens.** Only `report.json` is required. What is missing is named in
+  the status line, because the run someone opens the editor for is often the one that did not
+  finish writing. A malformed `events.json`, though, is an error rather than a guess (§25.1).
+
+The fixture is `tests/fixtures/visible-learning/run/`: two suites × two episodes, four ticks
+each with two `Clamped` and one `Fallback` tick carrying real violation bits, one 96×96 frame
+per cell. It is written by the `#[ignore]`d `generate_fixture_run`, which builds an
+`EvaluationReport` and an `EvaluationLock` and hands them to `es_eval::runner::write_artifacts`
+and a `FrameSink` — so the bytes are the producing types' own. Only the frame `.bin` and its
+`layout.json` are written directly, because `es_eval`'s writer for them is private; the shape
+is that writer's documentation.

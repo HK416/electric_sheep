@@ -1,0 +1,147 @@
+{
+  "schema_version": 1,
+  "evaluation_hash": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "execution_hash": [
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1,
+    1
+  ],
+  "cells": [
+    {
+      "suite": "nominal",
+      "metric": "success_rate",
+      "value": {
+        "scalar": 0.875
+      },
+      "n_episodes": 2
+    },
+    {
+      "suite": "nominal",
+      "metric": "episode_length",
+      "value": {
+        "scalar": 120.0
+      },
+      "n_episodes": 2
+    },
+    {
+      "suite": "nominal",
+      "metric": "envelope_violation_rate",
+      "value": {
+        "scalar": 0.0
+      },
+      "n_episodes": 2
+    },
+    {
+      "suite": "light",
+      "metric": "success_rate",
+      "value": {
+        "scalar": 0.5
+      },
+      "n_episodes": 2
+    },
+    {
+      "suite": "light",
+      "metric": "episode_length",
+      "value": {
+        "scalar": 150.0
+      },
+      "n_episodes": 2
+    },
+    {
+      "suite": "light",
+      "metric": "envelope_violation_rate",
+      "value": {
+        "scalar": 0.25
+      },
+      "n_episodes": 2
+    }
+  ],
+  "acceptance": [
+    {
+      "criterion": {
+        "suite": null,
+        "metric": "success_rate",
+        "comparator": "ge",
+        "threshold": 0.8,
+        "aggregation": "mean"
+      },
+      "observed": 0.6875,
+      "passed": false
+    },
+    {
+      "criterion": {
+        "suite": null,
+        "metric": "envelope_violation_rate",
+        "comparator": "le",
+        "threshold": 0.5,
+        "aggregation": "mean"
+      },
+      "observed": 0.125,
+      "passed": true
+    }
+  ],
+  "passed": false,
+  "episodes": []
+}

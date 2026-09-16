@@ -27,8 +27,9 @@ use es_ir::NodeId;
 
 use crate::model::edit::{self, Edit, EditIr, EditSession};
 use crate::model::graph_view::{CrossEdge, LayerView, LayeredGraph, NodeView};
-use crate::model::image_view::{BeforeAfter, ImagePair};
+use crate::model::image_view::{BeforeAfter, ImagePair, Rgb8Image};
 use crate::model::palette::Palette;
+use crate::model::run_view::{Bucket, RunView};
 use crate::model::telemetry_view::{Source, TelemetryModel};
 
 const NODE_W: f32 = 178.0;
@@ -41,6 +42,7 @@ const PUMP_BUDGET: usize = 256;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
     Graph,
+    Run,
     Telemetry,
     Images,
     Diagnostics,
@@ -78,6 +80,10 @@ pub struct EditorApp {
     path: String,
     status: String,
     opened: Option<Opened>,
+    /// An opened run directory (packet M7/E1). A path is one or the other, never both.
+    run: Option<RunView>,
+    /// Frames of the selected cell's filmstrip, keyed `<cell>#<index>`.
+    run_frames: BTreeMap<String, egui::TextureHandle>,
     telemetry: TelemetryModel,
     source: Source,
     pan: Vec2,
@@ -108,6 +114,8 @@ impl EditorApp {
             path: String::new(),
             status: "no bundle open".to_owned(),
             opened: None,
+            run: None,
+            run_frames: BTreeMap::new(),
             telemetry: TelemetryModel::default(),
             source,
             pan: Vec2::new(60.0, 40.0),
@@ -171,16 +179,31 @@ impl EditorApp {
         };
     }
 
-    /// Open a bundle at startup (`es-editor <bundle.esb>`).
+    /// Open a bundle or a run directory at startup (`es-editor <bundle.esb|run-dir>`).
     #[must_use]
-    pub fn with_bundle(mut self, path: &str) -> Self {
+    pub fn with_path(mut self, path: &str) -> Self {
         path.clone_into(&mut self.path);
         self.open();
         self
     }
 
+    /// A directory that holds `report.json` is a finished run (spec 10.5), anything else is a
+    /// bundle: the two are told apart by what is on disk, not by a flag (packet M7/E1).
     fn open(&mut self) {
         let path = PathBuf::from(self.path.trim());
+        self.run = None;
+        self.run_frames.clear();
+        if RunView::is_run_dir(&path) {
+            match RunView::open(&path) {
+                Ok(run) => {
+                    self.status = format!("{}: {}", path.display(), run.status);
+                    self.run = Some(run);
+                    self.tab = Tab::Run;
+                }
+                Err(e) => self.status = e.to_string(),
+            }
+            return;
+        }
         match load(&path) {
             Err(e) => {
                 self.status = format!("{}: {e}", path.display());
@@ -229,15 +252,16 @@ impl eframe::App for EditorApp {
                 ui.label("File");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.path)
-                        .hint_text("bundle.esb, or a directory of the five .toml files")
+                        .hint_text("bundle.esb, a directory of the five .toml files, or a run")
                         .desired_width(380.0),
                 );
-                if ui.button("Open bundle...").clicked() {
+                if ui.button("Open...").clicked() {
                     self.open();
                 }
                 ui.separator();
                 for (tab, name) in [
                     (Tab::Graph, "Graph"),
+                    (Tab::Run, "Run"),
                     (Tab::Telemetry, "Telemetry"),
                     (Tab::Images, "Images"),
                     (Tab::Diagnostics, "Diagnostics"),
@@ -281,6 +305,7 @@ impl eframe::App for EditorApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Graph => self.graph_tab(ui),
+            Tab::Run => self.run_tab(ui),
             Tab::Telemetry => self.telemetry_tab(ui),
             Tab::Images => self.images_tab(ui),
             Tab::Diagnostics => self.diagnostics_tab(ui),
@@ -455,6 +480,113 @@ impl EditorApp {
         view.paint(&painter, *selected);
     }
 
+    /// The Run tab (packet M7/E1): the cell table, the acceptance verdict, and for the
+    /// selected cell its Safety Plane timeline and a filmstrip. Every number, every order and
+    /// every decoded byte is [`RunView`]'s; this turns them into widgets.
+    fn run_tab(&mut self, ui: &mut egui::Ui) {
+        let ctx = ui.ctx().clone();
+        let Self {
+            run: Some(run),
+            run_frames,
+            ..
+        } = self
+        else {
+            ui.label(
+                "Open a run directory - one holding report.json - to see its cells (spec 10.5).",
+            );
+            return;
+        };
+        let columns = run.columns();
+        let mut sort = None;
+        let mut select = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("run-cells").striped(true).show(ui, |ui| {
+                for (i, name) in columns.iter().enumerate() {
+                    if ui.button(name).clicked() {
+                        sort = Some(i);
+                    }
+                }
+                ui.label("traj");
+                ui.label("frames");
+                ui.end_row();
+                let selected = run.selected_cell().map(|c| c.name.clone());
+                for row in run.cells() {
+                    let is_selected = selected.as_deref() == Some(row.name.as_str());
+                    if ui.selectable_label(is_selected, &row.name).clicked() {
+                        select = Some(row.name.clone());
+                    }
+                    ui.label(&row.suite);
+                    ui.label(row.seed.map_or_else(|| "--".to_owned(), |s| s.to_string()));
+                    for column in columns.iter().skip(3) {
+                        ui.label(row.metrics.get(column).map_or_else(dash, metric_text));
+                    }
+                    ui.label(if row.has_traj { "yes" } else { "--" });
+                    ui.label(row.frames.to_string());
+                    ui.end_row();
+                }
+            });
+
+            ui.separator();
+            ui.heading(if run.report.passed {
+                "Acceptance: passed (spec 10.2)"
+            } else {
+                "Acceptance: failed (spec 10.2)"
+            });
+            for line in run.acceptance() {
+                let (text, colour) = acceptance_row(line);
+                ui.colored_label(colour, text);
+            }
+
+            let Some(cell) = run.selected_cell().map(|c| c.name.clone()) else {
+                ui.separator();
+                ui.label("Select a cell for its Safety Plane timeline and frames (spec 23.3).");
+                return;
+            };
+            ui.separator();
+            let timeline = run.timeline(&cell);
+            ui.heading(format!("{cell}: {} tick(s)", timeline.rows.len()));
+            // One column per ~4 px of the strip; the model folds the ticks into them.
+            let n = (ui.available_width() / 4.0) as usize;
+            paint_timeline(ui, &timeline.buckets(n));
+            for (kind, count) in &timeline.totals {
+                ui.label(format!(
+                    "{kind:?}: {count} tick(s), first at tick {}",
+                    timeline.first.get(kind).copied().unwrap_or_default()
+                ));
+            }
+
+            ui.separator();
+            ui.heading("Frames");
+            ui.horizontal(|ui| {
+                for index in run.filmstrip(&cell, FILMSTRIP) {
+                    let key = format!("{cell}#{index}");
+                    let texture = run_frames.entry(key.clone()).or_insert_with(|| {
+                        let image = run.frame(&cell, index).unwrap_or(Rgb8Image {
+                            width: 1,
+                            height: 1,
+                            data: vec![0, 0, 0],
+                        });
+                        rgb_texture(&ctx, &key, &image)
+                    });
+                    ui.vertical(|ui| {
+                        ui.label(format!("{index}"));
+                        let scale = (160.0 / texture.size_vec2().x).max(1.0);
+                        ui.image(egui::load::SizedTexture::new(
+                            texture.id(),
+                            texture.size_vec2() * scale,
+                        ));
+                    });
+                }
+            });
+        });
+        if let Some(column) = sort {
+            run.sort_by(column);
+        }
+        if let Some(name) = select {
+            run.select(&name);
+        }
+    }
+
     fn telemetry_tab(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.heading("Performance (spec 12.4)");
@@ -542,12 +674,99 @@ impl EditorApp {
 
 fn texture(ctx: &egui::Context, pair: &ImagePair, before: bool) -> egui::TextureHandle {
     let img = if before { &pair.before } else { &pair.after };
+    let name = format!("{}-{}", pair.name, if before { "before" } else { "after" });
+    rgb_texture(ctx, &name, img)
+}
+
+fn rgb_texture(ctx: &egui::Context, name: &str, img: &Rgb8Image) -> egui::TextureHandle {
     let color = egui::ColorImage::from_rgb([img.width, img.height], &img.data);
-    ctx.load_texture(
-        format!("{}-{}", pair.name, if before { "before" } else { "after" }),
-        color,
-        egui::TextureOptions::NEAREST,
-    )
+    ctx.load_texture(name, color, egui::TextureOptions::NEAREST)
+}
+
+// --- the Run tab -------------------------------------------------------------------------------
+
+/// Frames the filmstrip shows, sampled evenly over the cell by [`RunView::filmstrip`].
+const FILMSTRIP: usize = 8;
+
+fn dash() -> String {
+    "--".to_owned()
+}
+
+/// A metric cell. A histogram has no single number and an unmeasured metric has none at all
+/// (spec 10.3): neither is rendered as `0`.
+fn metric_text(value: &es_ir::evaluation::MetricValue) -> String {
+    match value {
+        es_ir::evaluation::MetricValue::Scalar(v) => format!("{v:.4}"),
+        es_ir::evaluation::MetricValue::Histogram(h) => {
+            format!("histogram, {} cause(s)", h.len())
+        }
+        es_ir::evaluation::MetricValue::Unavailable { reason } => format!("-- ({reason})"),
+    }
+}
+
+fn acceptance_row(line: &es_ir::evaluation::AcceptanceResult) -> (String, Color32) {
+    match line {
+        es_ir::evaluation::AcceptanceResult::Determined {
+            criterion,
+            observed,
+            passed,
+        } => (
+            format!(
+                "{} {} {} ({}, {}): observed {observed:.4} -- {}",
+                criterion.metric.name(),
+                criterion.comparator.name(),
+                criterion.threshold,
+                criterion.aggregation.name(),
+                criterion.suite.as_deref().unwrap_or("every suite"),
+                if *passed { "pass" } else { "FAIL" }
+            ),
+            if *passed {
+                Color32::from_rgb(120, 200, 120)
+            } else {
+                Color32::from_rgb(230, 120, 110)
+            },
+        ),
+        es_ir::evaluation::AcceptanceResult::Unavailable { metric, reason } => (
+            format!("{}: not measured ({reason})", metric.name()),
+            Color32::from_gray(160),
+        ),
+    }
+}
+
+/// One colour per `EventSource`, violations as a tick beneath (spec 23.3).
+fn paint_timeline(ui: &mut egui::Ui, buckets: &[Bucket]) {
+    if buckets.is_empty() {
+        ui.label("no events.json: this run recorded no per-tick sources");
+        return;
+    }
+    let (response, painter) =
+        ui.allocate_painter(Vec2::new(ui.available_width(), 30.0), Sense::hover());
+    let rect = response.rect;
+    let w = (rect.width() / buckets.len() as f32).max(1.0);
+    for (i, bucket) in buckets.iter().enumerate() {
+        let x = rect.left() + i as f32 * rect.width() / buckets.len() as f32;
+        painter.rect_filled(
+            Rect::from_min_size(Pos2::new(x, rect.top()), Vec2::new(w, 18.0)),
+            0.0,
+            source_colour(bucket.source),
+        );
+        if !bucket.counts.is_empty() {
+            painter.rect_filled(
+                Rect::from_min_size(Pos2::new(x, rect.top() + 21.0), Vec2::new(w, 8.0)),
+                0.0,
+                Color32::from_rgb(240, 200, 80),
+            );
+        }
+    }
+}
+
+fn source_colour(source: es_eval::runner::EventSource) -> Color32 {
+    match source {
+        es_eval::runner::EventSource::Policy => Color32::from_rgb(70, 130, 180),
+        es_eval::runner::EventSource::Human => Color32::from_rgb(150, 150, 200),
+        es_eval::runner::EventSource::Clamped => Color32::from_rgb(220, 170, 60),
+        es_eval::runner::EventSource::Fallback => Color32::from_rgb(210, 90, 80),
+    }
 }
 
 fn paint_layer(
