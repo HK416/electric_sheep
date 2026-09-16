@@ -14,6 +14,7 @@ use es_gpu::{
 use es_sensor::Channel;
 
 use crate::atlas::{words_per_pixel, AtlasLayout, Tile, TileData};
+use crate::bvh::{Bvh, NODE_STRIDE};
 use crate::error::RenderError;
 use crate::scene::TriScene;
 use crate::view::{CameraView, RenderConfig, RenderPath, ViewParams, VIEW_STRIDE};
@@ -144,16 +145,39 @@ struct Pipelines<'gpu> {
     svgf: Option<ComputePipeline<'gpu>>,
 }
 
+/// Keep and grow, never shrink (packet M7/R1 step 2). A frame that needs fewer bytes than the
+/// last one reuses the buffer it has; `Buffer::new` is a `vkCreateBuffer` plus an allocation,
+/// and the scene size is constant across a replay, so this allocates once.
+///
+/// A free function, not a method: `self.gpu` and `&mut self.<field>` are disjoint borrows of
+/// `Renderer` only when they are named separately.
+fn grow<'gpu>(gpu: &'gpu Gpu, slot: &mut Buffer<'gpu>, bytes: u64) -> Result<(), RenderError> {
+    if slot.size() < bytes.max(4) {
+        *slot = Buffer::new(gpu, bytes.max(4), Usage::Storage)?;
+    }
+    Ok(())
+}
+
 /// The compute renderer (spec 15).
 pub struct Renderer<'gpu> {
     gpu: &'gpu Gpu,
     cfg: RenderConfig,
     layout: AtlasLayout,
     pipelines: Pipelines<'gpu>,
+    /// The triangles, then the BVH. Persistent across frames.
     tris: Buffer<'gpu>,
+    /// Persistent too: the globals, the per-view records and the `ReSTIR` light count.
+    params_buf: Buffer<'gpu>,
+    /// Primary-hit triangle index per pixel, read by the `ReSTIR` and `SVGF` passes and by
+    /// nothing on the host. Persistent, atlas-sized.
+    hit_tri: Buffer<'gpu>,
     tri_scene: TriScene,
     n_tri: u32,
     n_lights: u32,
+    /// Where the BVH starts inside `tris`, in floats, and how many nodes it has.
+    bvh_base: u32,
+    bvh_nodes: u32,
+    bvh_prim_base: u32,
     /// Previous-frame reservoirs for `ReSTIR` temporal reuse. Empty until the first render
     /// finishes, which is why the temporal pass is a no-op on frame 1 (see the design doc).
     prev_reservoirs: Option<Buffer<'gpu>>,
@@ -222,9 +246,14 @@ impl<'gpu> Renderer<'gpu> {
                 svgf,
             },
             tris: Buffer::new(gpu, 4, Usage::Storage)?,
+            params_buf: Buffer::new(gpu, 4, Usage::Storage)?,
+            hit_tri: Buffer::new(gpu, 4, Usage::Storage)?,
             tri_scene: TriScene::default(),
             n_tri: 0,
             n_lights: 0,
+            bvh_base: 0,
+            bvh_nodes: 0,
+            bvh_prim_base: 0,
             prev_reservoirs: None,
         })
     }
@@ -241,14 +270,23 @@ impl<'gpu> Renderer<'gpu> {
         &self.tri_scene
     }
 
-    /// Upload an already-tessellated scene. The CPU reference takes the same [`TriScene`],
-    /// which is how the two paths are guaranteed to see identical geometry.
+    /// Upload an already-tessellated scene, and the BVH over it.
+    ///
+    /// The CPU reference takes the same [`TriScene`] and builds the same [`Bvh`] from it,
+    /// which is how the two paths are guaranteed to see identical geometry *and* identical
+    /// traversal. The tree goes into the same buffer, after the triangles: `es-gpu` binds
+    /// seven descriptors to this kernel and the tree is not worth an eighth, a second
+    /// staging copy or a renumbering of every shader's bindings.
     pub fn upload_tris(&mut self, tri: TriScene) -> Result<(), RenderError> {
-        let floats = tri.to_floats();
+        let bvh = Bvh::build(&tri.tris);
+        let mut floats = tri.to_floats();
+        self.bvh_base = u32::try_from(floats.len()).unwrap_or(u32::MAX);
+        self.bvh_nodes = u32::try_from(bvh.nodes.len()).unwrap_or(u32::MAX);
+        self.bvh_prim_base = self.bvh_base + self.bvh_nodes * NODE_STRIDE as u32;
+        floats.extend(bvh.to_floats());
         let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let mut buffer = Buffer::new(self.gpu, bytes.len().max(4) as u64, Usage::Storage)?;
-        buffer.upload(&bytes)?;
-        self.tris = buffer;
+        grow(self.gpu, &mut self.tris, bytes.len() as u64)?;
+        self.tris.upload(&bytes)?;
         self.n_tri = u32::try_from(tri.tris.len()).unwrap_or(u32::MAX);
         self.n_lights = u32::try_from(tri.lights.len()).unwrap_or(u32::MAX);
         self.tri_scene = tri;
@@ -275,6 +313,9 @@ impl<'gpu> Renderer<'gpu> {
         p[14] = f32::from_bits(cfg.spp().max(1));
         p[15] = f32::from_bits(cfg.bounces().max(1));
         p[16] = f32::from_bits(self.n_lights);
+        p[17] = f32::from_bits(self.bvh_base);
+        p[18] = f32::from_bits(self.bvh_nodes);
+        p[19] = f32::from_bits(self.bvh_prim_base);
         for (i, cam) in cameras.iter().enumerate() {
             let base = PARAM_VIEW_BASE + i * VIEW_STRIDE;
             p[base..base + VIEW_STRIDE].copy_from_slice(&ViewParams::new(cam).to_floats());
@@ -323,9 +364,16 @@ impl<'gpu> Renderer<'gpu> {
 
         let params_f = self.params(cameras);
         let params_bytes: Vec<u8> = params_f.iter().flat_map(|f| f.to_le_bytes()).collect();
-        let mut params = self.new_buffer(params_f.len() as u64)?;
-        params.upload(&params_bytes)?;
+        grow(self.gpu, &mut self.params_buf, params_bytes.len() as u64)?;
+        self.params_buf.upload(&params_bytes)?;
+        grow(self.gpu, &mut self.hit_tri, px * 4)?;
+        let params = &self.params_buf;
+        let hit_tri = &self.hit_tri;
 
+        // The four channel buffers are still per-frame: `Atlas` owns them and hands them to
+        // the caller, and making it borrow the renderer instead would put a second lifetime
+        // on a type every GPU test names. At 0.33 ms of a 123 ms frame that is not where the
+        // time is (`docs/design/renderer.md` section 8.1).
         let color_words = match self.cfg.path {
             RenderPath::Rs => 1,
             RenderPath::Pt { .. } => 3,
@@ -334,13 +382,12 @@ impl<'gpu> Renderer<'gpu> {
         let depth = self.new_buffer(px)?;
         let seg = self.new_buffer(px)?;
         let normal = self.new_buffer(px * 3)?;
-        let hit_tri = self.new_buffer(px)?;
 
         self.pipelines.primary.reset_descriptors()?;
         let mut rec = CommandRecorder::new(self.gpu)?;
         rec.dispatch(
             &self.pipelines.primary,
-            &[&params, &self.tris, &color, &depth, &seg, &normal, &hit_tri],
+            &[params, &self.tris, &color, &depth, &seg, &normal, hit_tri],
             groups,
         )?;
 
@@ -370,25 +417,25 @@ impl<'gpu> Renderer<'gpu> {
             for p in passes {
                 p.reset_descriptors()?;
             }
-            let g = [&params, &self.tris];
+            let g = [params, &self.tris];
             rec.dispatch(
                 &passes[0],
                 &[
-                    g[0], g[1], &res_a, &res_a, &prev, &depth, &normal, &hit_tri, &color,
+                    g[0], g[1], &res_a, &res_a, &prev, &depth, &normal, hit_tri, &color,
                 ],
                 groups,
             )?;
             rec.dispatch(
                 &passes[1],
                 &[
-                    g[0], g[1], &res_b, &res_a, &prev, &depth, &normal, &hit_tri, &color,
+                    g[0], g[1], &res_b, &res_a, &prev, &depth, &normal, hit_tri, &color,
                 ],
                 groups,
             )?;
             rec.dispatch(
                 &passes[2],
                 &[
-                    g[0], g[1], &prev, &res_b, &prev, &depth, &normal, &hit_tri, &color,
+                    g[0], g[1], &prev, &res_b, &prev, &depth, &normal, hit_tri, &color,
                 ],
                 groups,
             )?;
@@ -417,7 +464,7 @@ impl<'gpu> Renderer<'gpu> {
                 };
                 rec.dispatch(
                     svgf,
-                    &[&params, &self.tris, src, dst, &depth, &normal, iter_buf],
+                    &[params, &self.tris, src, dst, &depth, &normal, iter_buf],
                     groups,
                 )?;
                 swapped = !swapped;
@@ -447,8 +494,6 @@ impl<'gpu> Renderer<'gpu> {
         put(Channel::Depth32 { unit_m: 1.0 }, depth);
         put(Channel::SegmentationId, seg);
         put(Channel::Normal, normal);
-        drop(hit_tri);
-        drop(params);
 
         Ok(Atlas {
             layout: self.layout,

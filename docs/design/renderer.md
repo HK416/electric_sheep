@@ -23,9 +23,10 @@ host round trip inside a frame. Two render paths, both **compute shaders**:
 
 `es-gpu` offers compute pipelines only — no graphics pipeline, no `VK_KHR_ray_tracing_
 pipeline`, no acceleration-structure extension (see `docs/design/gpu-foundation.md`). So the
-§15.4 TLAS/BLAS design is **not implemented**: both paths walk a flat triangle array in index
-order. That is the honest ceiling of this packet and it is why the scene size this crate is
-tested at is "a few hundred triangles", not a robot cell.
+§15.4 TLAS/BLAS design is **not implemented** as hardware. Since M7/R1 both paths traverse a
+software BVH built on the CPU per frame (section 8); before it they walked a flat triangle
+array in index order, which is why the goldens are "a few hundred triangles" scenes and why
+the hit rule is stated as a scan's.
 
 Not here, deliberately:
 
@@ -220,10 +221,10 @@ padded tiles are cleared by the same kernel. Per pixel:
 
 Three things about that loop:
 
-- **It has no binning stage.** `ponytail:` O(pixels × triangles) with no spatial structure —
-  the ceiling is a few hundred triangles per frame. The upgrade path is the §15.4 TLAS, which
-  needs a Vulkan extension `es-gpu` does not expose yet; a per-tile triangle-bin compaction
-  pass is the intermediate step and slots in between (2) and (3) without changing any output.
+- **The scan is now a BVH traversal** (M7/R1, section 8) that returns exactly the scan's
+  answer: nearest `t`, ties to the lower global index, compared on every candidate. Step (3)
+  above is the *rule*; the tree is how the candidates are found. The §15.4 two-level TLAS is
+  the upgrade path and needs no Vulkan extension either.
 - **The traversal order is the output's identity.** Ascending index, strict `<` on `t`, is a
   total order over hits, so the winner does not depend on thread scheduling. There is no depth
   buffer and no read-modify-write, hence no atomics (§3.4 forbids FP atomics anyway).
@@ -510,3 +511,138 @@ What this does **not** buy: bit equality *across devices*. §3.5 tier 1 needs th
 already an admission that the GPU and the CPU are two different implementations of the same
 text. The claim this crate makes is: same device, same binary → same bits; and CPU → GPU
 agreement at the stated tolerances.
+
+## 8. Where the frame goes, and the software BVH (M7/R1)
+
+`docs/packets/M7/R1-bvh.md`. §28.10 records **80 ms/frame** at 1280×720 for the SO-101 demo
+cell (`visible-learning.md` 7.17 item 4, one RTX 4090) and names two suspects: the scene is
+re-tessellated and re-uploaded into a freshly allocated buffer every frame, and the shader
+scans every triangle per pixel. Neither was measured. §1.4 says measure first.
+
+### 8.1 The baseline, measured
+
+`cargo test -p es-render --release -- --ignored --nocapture frame_profile` times four phases
+of one frame — tessellate, upload, dispatch+wait, readback — over 100 frames on the demo
+scene (`tests/fixtures/mjcf/so101_pick_place.xml`, **2,754** triangles after tessellation;
+§28.10's "2,978" is the earlier count) through `es video showcase`'s own camera
+(`--eye 0.66,-0.46,0.52 --look-at 0.14,-0.04,0.04 --fov 36`). `upload` is
+`Renderer::upload_tris`; `dispatch+wait` is `Renderer::render`, which also uploads the
+parameter buffer and blocks on the fence; `readback` is `Atlas::read_tile`.
+
+**Before, RTX 3060 (driver 591.12, Slang 2026.8), median / p95 ms:**
+
+| phase | 1280×720 | 96×96 |
+|---|---|---|
+| tessellate | 0.232 / 0.326 | 0.255 / 0.321 |
+| upload | 0.334 / 0.490 | 0.203 / 0.345 |
+| dispatch+wait | **38.633 / 41.374** | 0.913 / 1.354 |
+| readback | **83.575 / 86.850** | 1.135 / 1.311 |
+| frame total | 122.856 / 141.384 | 2.512 / 3.106 |
+| `camera_frames_per_sec` (median) | 8.1 | 398.1 |
+| `pixels_per_sec` (median) | 7.50e6 | 3.67e6 |
+
+Two conclusions, and one of them is not this packet's.
+
+1. **The scan is 38.6 ms of the 1280×720 frame** — 921,600 pixels × 2,754 triangles = 2.5 G
+   Möller–Trumbore tests. That is what a BVH removes, and it is the only one of the two
+   suspects §28.10 named that the measurement supports.
+2. **The readback is 83.6 ms, and it is not the renderer.** The same test reads a
+   host-visible buffer of the same size directly: **80.7 ms for 3,600 KiB, 44 MiB/s**.
+   `es_gpu::Buffer::download` on a device-local buffer allocates a `Usage::Staging`
+   (`MemoryLocation::CpuToGpu`) buffer, copies into it and then `to_vec()`s it — and
+   CpuToGpu memory is *write-combined*, so the host read is uncached. The fix is a
+   `GpuToCpu` readback buffer in `es-gpu`, which `crates/es-gpu/**` being out of this
+   packet's scope puts in the next one. Recorded here so it is not re-discovered.
+   `Target / Status: unverified` for any 1280×720 frame-total target below ~84 ms until that
+   lands.
+
+Tessellation is 0.23 ms and the upload 0.33 ms: together 0.5 % of the frame. They are still
+cached and made persistent, because they are cheap to fix and because at 96×96 — the size
+every observation frame in an evaluation is rendered at — 0.46 ms of a 2.5 ms frame is 18 %.
+
+### 8.2 What changed, and why not one output bit did
+
+Three edits, each pinned by a test that compares against the code it replaced.
+
+1. **`SceneCache`** (`scene.rs`) keeps every geom's *local* tessellation across frames — the
+   `approx::{sin, cos}` vertices `tessellate()` produces — and applies the pose per frame in
+   `f64` through the same `push_geom` as before: the same `pose.transform_point`, the same
+   `to_f32`, the same `face_normal`, the same push order. `cached_tessellation_is_bit_identical`
+   compares the cached and the uncached `TriScene` with `PartialEq` on Cornell and on the
+   SO-101 scene at three poses. `TriScene::from_scene_with_poses` is now one call into an
+   empty cache, so no caller changed meaning.
+2. **Persistent buffers** (`renderer.rs`): the triangle+BVH buffer, the params buffer and the
+   per-pixel `hit_tri` buffer are kept across frames and grown, never shrunk (`grow`). The
+   four channel buffers stay per frame because `Atlas` owns them and hands them to the caller.
+3. **A single-level BVH** (`bvh.rs`; `es_nearest` / `es_any_hit` in `common.slang`;
+   `nearest_hit` / `any_hit` in `cpu.rs`): median split on the centroid along the longest
+   axis of the centroid bounds, leaves of ≤ 4 triangles, nodes in a flat array uploaded
+   *after* the triangles in the same buffer (slots 17–19 of `params` carry the offsets, so no
+   descriptor moved). The traversal is a fixed-order descent with a 64-entry stack; the build
+   bounds the depth (11 for the 2,754-triangle scene, 6 for Cornell — printed by the test).
+
+**Why the BVH's answer is the flat scan's answer.** The flat scan's hit rule is "nearest `t`
+strictly inside `(near, far)`, ties to the lower global triangle index". The traversal keeps
+that rule literally — it compares `(t, index)` on every candidate, never trusting the visit
+order — so it returns the scan's winner as long as it *visits* every triangle the scan would
+accept. Two details make that certain rather than likely: every node box is padded outward
+by `PAD = 1e-4` m, because Möller–Trumbore can accept a ray that passes a hair outside a
+triangle's exact bounds; and the slab test uses Ize's robust factors (`1 ∓ 2^-22`) so its
+own rounding never rejects a node the ray enters. Both only *add* candidates, never remove
+one, and an extra candidate cannot change a `(t, index)` minimum. The intersection routine
+itself is untouched, so `t` is the same bits — which is why `Depth32` and `Normal` stayed at
+0 ULP against the CPU on both GPUs. `bvh_traversal_is_the_flat_scan` fires 10,000 rays per
+scene through both routines (the flat scan is kept as `nearest_hit_flat`): all equal, on
+Cornell and on SO-101, nearest and any-hit alike. The tree enters no hash: it is a search
+structure over data that is already hashed.
+
+The two-level TLAS/BLAS of §15.4 stays the upgrade path (`ponytail:` at `Bvh::build`): the
+per-frame `f64` posing is what keeps the vertices bit-identical to every committed golden,
+and a 3,000-triangle rebuild costs 0.1–0.2 ms.
+
+### 8.3 After, measured
+
+Same test, same scene, same cameras. Medians in ms (p95 in the raw tables under
+`~/artifacts/plan-v/m7-r1/` on the server; the local ones are in this section's history).
+
+| phase, 1280×720 | RTX 3060 before | RTX 3060 after | RTX 4090 before | RTX 4090 after |
+|---|---|---|---|---|
+| tessellate | 0.232 | 0.200 | 0.257 | 0.084 |
+| upload | 0.334 | 0.890 | 0.635 | 0.995 |
+| dispatch+wait | **38.633** | **0.981** | **6.934** | **1.108** |
+| readback | 83.575 | 85.082 | 64.183 | 63.830 |
+| frame total | 122.856 | 87.445 | 71.871 | 65.967 |
+| `render()` sustained, no readback | — | 0.925 | — | 1.076 |
+| `camera_frames_per_sec`, sustained | — | 1,081 | — | 929 |
+| `pixels_per_sec`, sustained | — | 9.97e8 | — | 8.56e8 |
+
+| phase, 96×96 | RTX 3060 before | RTX 3060 after | RTX 4090 before | RTX 4090 after |
+|---|---|---|---|---|
+| dispatch+wait | 0.913 | 0.354 | 3.506 | 1.451 |
+| readback | 1.135 | 0.808 | 1.741 | 1.510 |
+| frame total | 2.512 | 2.168 | 6.372 | 4.234 |
+| `camera_frames_per_sec` (median frame) | 398 | 461 | 157 | 236 |
+
+The scan went from 38.6 ms to 1.0 ms on the 3060 and from 6.9 ms to 1.1 ms on the 4090 —
+the 4090 was never scan-bound the way the laptop-class card was, which the baseline table
+alone could not have told. The `upload` row grew by ~0.6 ms on both cards: it now carries the
+BVH build (CPU) and the extra 2,047 nodes; a cost that is visible only because everything
+around it shrank.
+
+**The showcase, RTX 4090, V19b `nominal-00` (224 ticks, 1280×720):** 122.2 ms/frame before,
+118.6 ms/frame after. The 96×96 `overhead` replay of the same cell reproduces the recorded
+observation frames **224 / 224 bit-identical** through the BVH path (V9's oracle, re-run on
+this branch). Nothing about the picture moved; almost nothing about the wall-clock did either,
+because of what section 8.1 already said:
+
+### 8.4 What is left is the readback, and it is `es-gpu`'s
+
+At 1280×720 the frame is now **64–85 ms of readback around a 1 ms render**.
+`es_gpu::Buffer::download` stages a device-local buffer through `Usage::Staging`, which is
+`MemoryLocation::CpuToGpu` — host-visible, *write-combined*, uncached for host reads — and the
+test's direct read of such a buffer runs at 27–44 MiB/s. A readback buffer in
+`MemoryLocation::GpuToCpu` (host-cached) is the fix, and `crates/es-gpu/**` is outside this
+packet's scope, so it is packet **M7/R1b**. Until it lands: `Target / Status: unverified` for
+any 1280×720 frame-total below ~64 ms, and the §28.10 target of `< 5 ms/frame` is a target
+for R1b, not a claim of R1. At 96×96 — the size every observation frame is rendered at — the
+frame is already 2.2 ms on the 3060 and 4.2 ms on the 4090, of which readback is a third.

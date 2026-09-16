@@ -21,7 +21,7 @@ use std::time::Instant;
 use es_env::render::{camera_view, look_at};
 use es_env::traj::Trajectory;
 use es_env::EnvRendererCfg;
-use es_render::{Channel, RenderPath, Renderer, TriScene};
+use es_render::{Channel, RenderPath, Renderer, SceneCache};
 
 use crate::error::CliError;
 
@@ -261,6 +261,10 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
 
     let start = Instant::now();
     let mut frame = 0u64;
+    // The local tessellation of every geom, computed once and re-posed per tick. Bit-identical
+    // to tessellating per tick (`docs/design/renderer.md` section 8.2), which is what makes a
+    // re-render of a committed run reproduce it (packet M5/V9's bit-identity oracle).
+    let mut cache = SceneCache::default();
     for (name, path) in &files {
         let traj = Trajectory::read(path).map_err(|e| rt(e.to_string()))?;
         let ticks = traj.ticks();
@@ -273,7 +277,8 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
                 }
                 _ => unreachable!("one of the two camera forms was built above"),
             };
-            let tri = TriScene::from_scene_with_poses(&scene, &poses)
+            let tri = cache
+                .tri_scene(&scene, &poses)
                 .map_err(|e| rt(format!("tessellation: {e}")))?;
             renderer
                 .upload_tris(tri)

@@ -380,3 +380,337 @@ fn gpu_atlas_packs_several_cameras() {
         "tile 3 has no view"
     );
 }
+
+// --- cached tessellation and the BVH (packet M7/R1) ------------------------------------------
+
+/// Three "ticks" of body poses for `scene`: the home pose, then two hand-set rigid motions
+/// applied to every body. `.estraj` replay hands `from_scene_with_poses` exactly this shape of
+/// map, so re-posing here exercises the same path with no `es-env` dependency (layer 5).
+fn ticks(
+    scene: &es_assets::scene::SceneDesc,
+) -> Vec<std::collections::BTreeMap<es_core::StableId, es_math::Pose>> {
+    use es_math::{Pose, Quat, Vec3};
+    let mut out = vec![std::collections::BTreeMap::new()];
+    for (k, angle) in [(1.0, 0.37f64), (2.0, -0.91)] {
+        let mut m = std::collections::BTreeMap::new();
+        for (i, body) in scene.bodies.iter().enumerate() {
+            let s = (i as f64) * 0.013 + k * 0.05;
+            let (sin, cos) = (angle * 0.5).sin_cos();
+            m.insert(
+                body.id,
+                Pose::new(
+                    Vec3::new(s, -s * 0.5, s * 0.25),
+                    Quat::from_xyzw(sin * 0.6, sin * 0.8, 0.0, cos).normalize(),
+                ),
+            );
+        }
+        out.push(m);
+    }
+    out
+}
+
+/// Packet M7/R1 oracle 2: a `SceneCache` reused across ticks and scenes produces exactly the
+/// `TriScene` a per-call tessellation does — every `f32` bitwise, the light list, the names.
+///
+/// The cache is warmed on Cornell first and then used for the SO-101 cell, so the `Shape`
+/// guard (geom ids come from names, and two scenes can share one) is exercised too.
+#[test]
+fn cached_tessellation_is_bit_identical() {
+    let mut cache = es_render::SceneCache::default();
+    for scene in [cornell_box(), so101()] {
+        for (tick, world) in ticks(&scene).iter().enumerate() {
+            let cached = cache.tri_scene(&scene, world).expect("cached");
+            let fresh = TriScene::from_scene_with_poses(&scene, world).expect("fresh");
+            assert_eq!(
+                cached.names, fresh.names,
+                "{} tick {tick}: names",
+                scene.name
+            );
+            assert_eq!(
+                cached.lights, fresh.lights,
+                "{} tick {tick}: light list",
+                scene.name
+            );
+            assert_eq!(
+                cached.tris.len(),
+                fresh.tris.len(),
+                "{} tick {tick}: triangle count",
+                scene.name
+            );
+            // Bitwise on the floats, not `==` on `f32`: the point of the oracle is that no
+            // vertex, normal, albedo or emission moved by one ULP.
+            let (a, b) = (cached.to_floats(), fresh.to_floats());
+            let diff = a
+                .iter()
+                .zip(&b)
+                .filter(|(x, y)| x.to_bits() != y.to_bits())
+                .count();
+            assert_eq!(
+                diff,
+                0,
+                "{} tick {tick}: {diff} of {} floats differ",
+                scene.name,
+                a.len()
+            );
+        }
+        println!(
+            "cached == uncached, bitwise, 3 ticks of {} ({} geoms)",
+            scene.name,
+            scene.bodies.iter().map(|b| b.geoms.len()).sum::<usize>()
+        );
+    }
+}
+
+/// Packet M7/R1 oracle 3: over 10,000 deterministic rays per scene, the BVH descent returns
+/// the flat scan's `Option<Hit>` — bitwise on `t`, the same triangle index — and the any-hit
+/// descent returns the flat shadow scan's boolean.
+///
+/// Rays are counter-based (`es_render::rng`, spec 3.4: no global RNG): origins on a sphere
+/// around the scene's centre aimed back through a jittered point near it, so they cross the
+/// geometry from every direction rather than sampling one camera's frustum.
+#[test]
+fn bvh_traversal_is_the_flat_scan() {
+    use es_render::bvh::Bvh;
+    use es_render::rng;
+    for (name, tri) in [
+        (
+            "cornell",
+            TriScene::from_scene(&cornell_box()).expect("cornell"),
+        ),
+        ("so101", TriScene::from_scene(&so101()).expect("so101")),
+    ] {
+        // Scene bounds, to aim the rays at something.
+        let (mut lo, mut hi) = ([f32::MAX; 3], [f32::MIN; 3]);
+        for t in &tri.tris {
+            for v in &t.v {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(v[k]);
+                    hi[k] = hi[k].max(v[k]);
+                }
+            }
+        }
+        let mid = [
+            f32::midpoint(lo[0], hi[0]),
+            f32::midpoint(lo[1], hi[1]),
+            f32::midpoint(lo[2], hi[2]),
+        ];
+        let radius = (0..3).fold(0.0f32, |m, k| m.max(hi[k] - lo[k])) + 1.0;
+
+        let bvh = Bvh::build(&tri.tris);
+        let (mut hits, mut shadows) = (0u32, 0u32);
+        for r in 0..10_000u32 {
+            let key = rng::key(0x5eed, 0, r, r ^ 0x9e37, 0, 0, 0);
+            let cos_theta = rng::uniform(key, 0) * 2.0 - 1.0;
+            let phi = rng::uniform(key, 1) * std::f32::consts::TAU;
+            let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+            let origin = [
+                mid[0] + radius * sin_theta * phi.cos(),
+                mid[1] + radius * sin_theta * phi.sin(),
+                mid[2] + radius * cos_theta,
+            ];
+            // Aim back through a point inside the scene box, so most rays actually hit.
+            let aim = [
+                lo[0] + (hi[0] - lo[0]) * rng::uniform(key, 2),
+                lo[1] + (hi[1] - lo[1]) * rng::uniform(key, 3),
+                lo[2] + (hi[2] - lo[2]) * rng::uniform(key, 4),
+            ];
+            let dir = [aim[0] - origin[0], aim[1] - origin[1], aim[2] - origin[2]];
+            let (near, far) = (0.01f32, 1e3f32);
+
+            let got = cpu::nearest_hit(&tri.tris, &bvh, origin, dir, near, far);
+            let want = cpu::nearest_hit_flat(&tri.tris, origin, dir, near, far);
+            match (got, want) {
+                (Some(tree), Some(scan)) => {
+                    assert_eq!(
+                        (tree.t.to_bits(), tree.tri),
+                        (scan.t.to_bits(), scan.tri),
+                        "{name} ray {r}: BVH {tree:?} vs flat scan {scan:?}"
+                    );
+                    hits += 1;
+                }
+                (None, None) => {}
+                (tree, scan) => panic!("{name} ray {r}: BVH {tree:?} vs flat scan {scan:?}"),
+            }
+            let got_any = cpu::any_hit(&tri.tris, &bvh, origin, dir, near, far);
+            assert_eq!(
+                got_any,
+                cpu::any_hit_flat(&tri.tris, origin, dir, near, far),
+                "{name} ray {r}: any-hit disagrees"
+            );
+            shadows += u32::from(got_any);
+        }
+        assert!(
+            hits > 1_000,
+            "{name}: only {hits} of 10000 rays hit anything"
+        );
+        assert!(
+            bvh.depth <= es_render::bvh::STACK,
+            "{name}: tree depth {} exceeds the {} traversal stack",
+            bvh.depth,
+            es_render::bvh::STACK
+        );
+        println!(
+            "{name}: {} triangles, {} nodes, max traversal depth {} (stack {}), \
+             10000 rays, {hits} nearest hits, {shadows} any-hits, all equal to the flat scan",
+            tri.tris.len(),
+            bvh.nodes.len(),
+            bvh.depth,
+            es_render::bvh::STACK
+        );
+    }
+}
+
+// --- profile (packet M7/R1 step 0) -----------------------------------------------------------
+
+/// The demo scene: the SO-101 pick-and-place cell `es video showcase` renders.
+fn so101() -> es_assets::scene::SceneDesc {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/mjcf/so101_pick_place.xml");
+    let xml = std::fs::read_to_string(&path).expect("the SO-101 fixture");
+    es_assets::mjcf::parse_str(&xml)
+        .expect("the SO-101 fixture parses")
+        .scene
+}
+
+/// `es video showcase`'s free camera at the angle the acceptance uses, built here rather than
+/// imported: `es_env::render::look_at` is layer 9 and this crate is layer 5 (spec 4.2).
+fn showcase_camera(width: u32, height: u32) -> CameraView {
+    use es_math::{Pose, Quat, Vec3};
+    let eye = Vec3::new(0.66, -0.46, 0.52);
+    let target = Vec3::new(0.14, -0.04, 0.04);
+    let fwd = (target - eye).normalize();
+    let right = fwd.cross(Vec3::new(0.0, 0.0, 1.0)).normalize();
+    let down = fwd.cross(right);
+    // Shepperd's positive-trace branch; the showcase camera never looks along world up.
+    let den = (right.x + down.y + fwd.z + 1.0).sqrt() * 2.0;
+    let quat = Quat::from_xyzw(
+        (down.z - fwd.y) / den,
+        (fwd.x - right.z) / den,
+        (right.y - down.x) / den,
+        0.25 * den,
+    );
+    CameraView {
+        pose: Pose::new(eye, quat),
+        spec: es_render::ImageSpec::pinhole(width, height, 36f64.to_radians()),
+    }
+}
+
+fn median_p95(mut v: Vec<f64>) -> (f64, f64) {
+    v.sort_by(f64::total_cmp);
+    (v[v.len() / 2], v[(v.len() * 95) / 100])
+}
+
+/// The four phases of one frame, 100 frames, median and p95, at the two sizes that matter:
+/// the showcase (1280x720) and one observation frame (96x96).
+///
+/// `upload` is `Renderer::upload_tris`; `dispatch+wait` is `Renderer::render`, which also
+/// uploads the parameter buffer and blocks on the fence; `readback` is `Atlas::read_tile`.
+/// Reported with spec 12.4's `camera_frames_per_sec` and `pixels_per_sec`, never a single
+/// `step/s`. Run with
+/// `cargo test -p es-render --release -- --ignored --nocapture frame_profile`.
+#[test]
+#[ignore = "timing; run explicitly"]
+fn frame_profile() {
+    let test = "frame_profile";
+    let Some(gpu) = open(test) else { return };
+    let scene = so101();
+    let world = std::collections::BTreeMap::new();
+    let n_tri = TriScene::from_scene(&scene)
+        .expect("tessellates")
+        .tris
+        .len();
+    for (w, h) in [(1280u32, 720u32), (96, 96)] {
+        let cfg = RenderConfig::rs(TileAtlasCfg::row(w, h, 1));
+        let mut renderer = Renderer::new(&gpu, cfg).expect("renderer");
+        let cams = [showcase_camera(w, h)];
+        let mut cache = es_render::SceneCache::default();
+        renderer
+            .upload_tris(cache.tri_scene(&scene, &world).expect("tessellates"))
+            .expect("upload");
+
+        // Sustained rendering, no readback: 100 `render()` calls back to back, after a
+        // warm-up of 30. This is the renderer's own cost and the number that reproduces.
+        // The four-phase loop below spends most of its wall clock inside an uncached host
+        // read, and an idle GPU on this machine drops to P8 and **PCIe gen 1**
+        // (`nvidia-smi --query-gpu=pstate,pcie.link.gen.current`), which slows every phase
+        // of the next frame — so an end-to-end total measured on a cold card is a
+        // measurement of the driver's power policy, not of the renderer (spec 28.9 rule 3).
+        // The warm-up is what makes the before/after tables comparable.
+        let mut sustained = Vec::new();
+        for i in 0..130 {
+            let t = std::time::Instant::now();
+            let _ = renderer.render(&cams).expect("render");
+            if i >= 30 {
+                sustained.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+
+        let (mut tess, mut up, mut disp, mut read) = (vec![], vec![], vec![], vec![]);
+        for _ in 0..100 {
+            let t0 = std::time::Instant::now();
+            let tri = cache.tri_scene(&scene, &world).expect("tessellates");
+            let t1 = std::time::Instant::now();
+            renderer.upload_tris(tri).expect("upload");
+            let t2 = std::time::Instant::now();
+            let mut atlas = renderer.render(&cams).expect("render");
+            let t3 = std::time::Instant::now();
+            let tile = atlas.read_tile(0, Channel::Rgb8).expect("readback");
+            let t4 = std::time::Instant::now();
+            assert_eq!(tile.len(), (w as usize) * (h as usize) * 3);
+            let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+            tess.push(ms(t0, t1));
+            up.push(ms(t1, t2));
+            disp.push(ms(t2, t3));
+            read.push(ms(t3, t4));
+        }
+        let (smed, sp95) = median_p95(sustained);
+        let total: Vec<f64> = (0..tess.len())
+            .map(|i| tess[i] + up[i] + disp[i] + read[i])
+            .collect();
+        println!(
+            "\n{w}x{h}, {n_tri} triangles, 100 frames, {}",
+            gpu.capabilities().device_name
+        );
+        println!("| phase | median ms | p95 ms |");
+        println!("|---|---|---|");
+        println!("| render(), sustained, no readback | {smed:.3} | {sp95:.3} |");
+        for (name, v) in [
+            ("tessellate", &tess),
+            ("upload", &up),
+            ("dispatch+wait", &disp),
+            ("readback", &read),
+            ("frame total", &total),
+        ] {
+            let (med, p95) = median_p95(v.clone());
+            println!("| {name} | {med:.3} | {p95:.3} |");
+        }
+        let (med, _) = median_p95(total);
+        println!(
+            "camera_frames_per_sec {:.1}, pixels_per_sec {:.3e} (median frame)",
+            1e3 / med,
+            f64::from(w) * f64::from(h) * 1e3 / med
+        );
+        println!(
+            "sustained: camera_frames_per_sec {:.1}, pixels_per_sec {:.3e}",
+            1e3 / smed,
+            f64::from(w) * f64::from(h) * 1e3 / smed
+        );
+
+        // Where the readback goes. `Buffer::download` on device-local memory allocates a
+        // host-visible staging buffer, copies into it and reads it back with `to_vec`;
+        // host-visible memory is write-combined, so the *read* is most of the cost. This
+        // measures that read alone, on a buffer of the same size. `crates/es-gpu/**` is out
+        // of this packet's scope, so the number is recorded, not fixed.
+        let bytes = u64::from(w) * u64::from(h) * 4;
+        let mut staging =
+            es_gpu::Buffer::new(&gpu, bytes, es_gpu::Usage::Staging).expect("staging buffer");
+        let t = std::time::Instant::now();
+        let got = staging.download().expect("host-visible download");
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        println!(
+            "host-visible read of {} KiB: {ms:.3} ms ({:.0} MiB/s)",
+            bytes / 1024,
+            got.len() as f64 / ms / 1048.576
+        );
+    }
+}

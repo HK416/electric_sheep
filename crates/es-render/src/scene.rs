@@ -1,9 +1,10 @@
 //! `SceneDesc` -> triangles.
 //!
-//! There is no acceleration structure. Spec 15.4 wants one TLAS over the scene with a shared
-//! BLAS per repeated robot, but `es-gpu` exposes compute pipelines only — no ray-tracing
-//! extension, no acceleration-structure build — so both render paths scan a flat array in
-//! index order. That is the honest ceiling of this packet: a few hundred triangles.
+//! The acceleration structure is a software one: spec 15.4 wants one TLAS over the scene with
+//! a shared BLAS per repeated robot, but `es-gpu` exposes compute pipelines only — no
+//! ray-tracing extension, no acceleration-structure build — so both render paths traverse
+//! [`crate::bvh::Bvh`], built here on the CPU per frame (packet M7/R1), and its answer is the
+//! flat index-order scan's answer bit for bit.
 
 use es_assets::scene::{Body, Geom, SceneDesc, Shape};
 use es_core::StableId;
@@ -65,30 +66,17 @@ impl TriScene {
     /// A map rather than a `StateView`: this crate is layer 5 and the physics state is layer 3
     /// (spec 4.2), so the caller does the lookup and `es-render` gains no dependency.
     ///
-    /// Ceiling, stated rather than hidden (`docs/design/visible-learning.md` section 7.1): the
-    /// whole scene is re-tessellated per call, because the shaders scan a flat triangle array
-    /// with no per-body transform and spec 15.4's acceleration structure is not implemented
-    /// (see the crate docs). The honest limit is the same few hundred triangles.
+    /// One call, one tessellation of every geom. A caller that renders frame after frame of
+    /// the *same* scene should keep a [`SceneCache`] and call [`SceneCache::tri_scene`]
+    /// instead, which reuses the local tessellation and produces the same bits.
     pub fn from_scene_with_poses(
         scene: &SceneDesc,
         world: &BTreeMap<StableId, Pose>,
     ) -> Result<Self, RenderError> {
-        let statics = world_poses(scene);
-        let mut out = Self::default();
-        for body in &scene.bodies {
-            let body_pose = world
-                .get(&body.id)
-                .or_else(|| statics.get(&body.id))
-                .copied()
-                .unwrap_or(Pose::IDENTITY);
-            for geom in &body.geoms {
-                out.push_geom(geom, body_pose.compose(geom.pose))?;
-            }
-        }
-        Ok(out)
+        SceneCache::default().tri_scene(scene, world)
     }
 
-    fn push_geom(&mut self, geom: &Geom, pose: Pose) -> Result<(), RenderError> {
+    fn push_geom(&mut self, geom: &Geom, pose: Pose, local: &[[Vec3; 3]]) {
         let seg = u32::try_from(self.names.len() + 1).unwrap_or(u32::MAX);
         let albedo = [
             geom.rgba[0] as f32,
@@ -100,9 +88,8 @@ impl TriScene {
         } else {
             [0.0; 3]
         };
-        let local = tessellate(geom)?;
         self.names.insert(seg, geom.name.clone());
-        for [a, b, c] in local {
+        for &[a, b, c] in local {
             let v = [
                 to_f32(pose.transform_point(a)),
                 to_f32(pose.transform_point(b)),
@@ -123,7 +110,6 @@ impl TriScene {
                 seg,
             });
         }
-        Ok(())
     }
 
     /// Flat upload buffer, [`TRI_STRIDE`] floats per triangle, segmentation id bitcast into
@@ -141,6 +127,51 @@ impl TriScene {
             out.push(0.0);
         }
         out
+    }
+}
+
+/// The per-geom **local** tessellation, kept across frames (packet M7/R1 step 1).
+///
+/// [`tessellate`] is a pure function of `geom.shape`, and a replay re-poses the same geoms
+/// tick after tick, so recomputing it every frame recomputes the same `approx::{sin, cos}`
+/// vertices. The cache holds the local triangles; the pose is still applied per frame, in
+/// `f64`, by the same [`TriScene::push_geom`] — so a cached frame is **bit-identical** to an
+/// uncached one (`bvh_and_cache_tests::cached_tessellation_is_bit_identical`).
+///
+/// A struct, not a trait: `INV-17` allows seven extension points and this is none of them.
+/// `BTreeMap`, never `HashMap` (spec 3.4). The stored [`Shape`] is checked on every hit: geom
+/// ids come from names (`es_assets::scene::scene_id`), so two scenes can share one, and a
+/// stale entry would be a silently wrong mesh rather than a miss.
+#[derive(Clone, Debug, Default)]
+pub struct SceneCache {
+    local: BTreeMap<StableId, (Shape, Vec<[Vec3; 3]>)>,
+}
+
+impl SceneCache {
+    /// [`TriScene::from_scene_with_poses`], reusing whatever this cache already holds.
+    pub fn tri_scene(
+        &mut self,
+        scene: &SceneDesc,
+        world: &BTreeMap<StableId, Pose>,
+    ) -> Result<TriScene, RenderError> {
+        let statics = world_poses(scene);
+        let mut out = TriScene::default();
+        for body in &scene.bodies {
+            let body_pose = world
+                .get(&body.id)
+                .or_else(|| statics.get(&body.id))
+                .copied()
+                .unwrap_or(Pose::IDENTITY);
+            for geom in &body.geoms {
+                if !matches!(self.local.get(&geom.id), Some((s, _)) if *s == geom.shape) {
+                    let tris = tessellate(geom)?;
+                    self.local.insert(geom.id, (geom.shape, tris));
+                }
+                let local = &self.local[&geom.id].1;
+                out.push_geom(geom, body_pose.compose(geom.pose), local);
+            }
+        }
+        Ok(out)
     }
 }
 
