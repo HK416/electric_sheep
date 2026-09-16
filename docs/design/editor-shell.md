@@ -451,6 +451,13 @@ value is not a string is edited as the TOML it prints as; and an `Enum`'s varian
 whatever the *example* instance showed, so a value using a variant the schema never saw has it
 added to the combo rather than hidden.
 
+**An edit is meant to be watched.** The status line carries the IR's `*_hash` (its first four
+bytes, which is what a person compares at a glance) and the count of what it complains about,
+both taken from the session and both live; the Diagnostics tab shows the session's list rather
+than the opened bundle's whenever one is open, because `EditSession::apply` re-validates after
+every edit and the bundle's list is a snapshot of the files on disk. Changing a `Normalize`
+range moves all three at once.
+
 **The panel is rebuilt when the selection moves or the session does** — keyed on
 `(selected, history().len())`. Between those the widgets own their text, so typing survives a
 repaint; an undo behind the panel's back does not leave stale text in the boxes.

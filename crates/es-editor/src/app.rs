@@ -352,6 +352,19 @@ impl eframe::App for EditorApp {
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status);
+                // While editing, the hash of what is in memory and the count of what the IR
+                // complains about, both live: an edit that moves either is meant to be seen
+                // as it happens (spec 5.3, spec 23.4).
+                if let Some(session) = &self.edit {
+                    ui.separator();
+                    ui.label(format!(
+                        "{:?} hash {}",
+                        session.graph.kind(),
+                        short_hash(session.hash().as_ref())
+                    ));
+                    ui.separator();
+                    ui.label(format!("{} diagnostic(s)", session.diagnostics().len()));
+                }
                 ui.separator();
                 ui.label(format!("{} telemetry messages", self.telemetry.received));
             });
@@ -1029,16 +1042,22 @@ impl EditorApp {
     }
 
     fn diagnostics_tab(&mut self, ui: &mut egui::Ui) {
-        let Some(opened) = &self.opened else {
-            ui.label("Open a bundle to validate it.");
-            return;
+        // Editing has its own list, re-validated after every edit by `EditSession::apply`;
+        // the opened bundle's is a snapshot of the four IRs as they were read from disk.
+        let diagnostics: &[es_ir::Diagnostic] = match (&self.edit, &self.opened) {
+            (Some(session), _) => session.diagnostics(),
+            (None, Some(opened)) => &opened.graph.diagnostics,
+            (None, None) => {
+                ui.label("Open a bundle to validate it.");
+                return;
+            }
         };
-        if opened.graph.diagnostics.is_empty() {
+        if diagnostics.is_empty() {
             ui.label("No diagnostics: the four IRs validate and agree (spec 11.1).");
             return;
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
-            for d in &opened.graph.diagnostics {
+            for d in diagnostics {
                 ui.label(d.to_string());
             }
         });
@@ -1341,6 +1360,15 @@ const PIN_IN: Color32 = Color32::from_rgb(120, 170, 255);
 /// The ring around a search hit, and the colour of a field that does not parse.
 const HIT: Color32 = Color32::from_rgb(230, 190, 80);
 const BAD: Color32 = Color32::from_rgb(230, 120, 110);
+
+/// The first four bytes of a spec 5.3 content hash: enough to watch one change, and the
+/// prefix `es evidence verify` would print. A hash an IR cannot produce says so.
+fn short_hash(hash: Result<&[u8; 32], &es_ir::Diagnostic>) -> String {
+    match hash {
+        Ok([a, b, c, d, ..]) => format!("{a:02x}{b:02x}{c:02x}{d:02x}"),
+        Err(d) => format!("unavailable ({})", d.code),
+    }
+}
 
 /// A node body, selected or found versus plain.
 fn node_fill(lit: bool) -> Color32 {
