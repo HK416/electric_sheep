@@ -57,14 +57,32 @@ goes. Leave a `ponytail:` comment naming that upgrade at the build site.
 `camera_frames_per_sec` and `pixels_per_sec` for the two sizes; the target `< 5 ms/frame` at
 1280×720 stays `Target / Status: unverified` until the server number exists.
 
-## context (allowed scope)
+## context
 
-`crates/es-render/src/{scene.rs,renderer.rs,cpu.rs,lib.rs}`, `crates/es-render/src/bvh.rs` (new),
-`crates/es-render/slang/{common.slang,restir.slang,pt.slang,raster.slang}` (traversal only),
-`crates/es-render/tests/render.rs` (new tests; existing tests and the golden generator untouched),
-`crates/es-render/benches/` or the `#[ignore]`d timing test, `crates/es-env/src/render.rs` (use
-the cache; no behaviour change), `crates/es/src/cmd/showcase.rs` (use the cache; the per-frame
-loop otherwise unchanged), `docs/design/renderer*.md`, `docs/packets/M7/R1-bvh*.md`.
+```
+crates/es-render/src/scene.rs
+crates/es-render/src/renderer.rs
+crates/es-render/src/cpu.rs
+crates/es-render/src/lib.rs
+crates/es-render/src/bvh.rs
+crates/es-render/slang/common.slang
+crates/es-render/slang/restir.slang
+crates/es-render/slang/pt.slang
+crates/es-render/slang/raster.slang
+crates/es-render/tests/render.rs
+crates/es-render/benches/**
+crates/es-env/src/render.rs
+crates/es/src/cmd/showcase.rs
+docs/design/renderer.md
+docs/design/renderer.ko.md
+docs/packets/M7/R1-bvh.md
+docs/packets/M7/R1-bvh.ko.md
+```
+
+`bvh.rs` is new; the Slang files are **traversal only**; `render.rs` gains new tests and leaves
+the existing ones and the golden generator untouched; `es-env`'s and `es`'s edits are "use the
+cache" and nothing else. The list is one glob per line because `cargo xtask check-scope` parses
+this section and understands neither `{a,b}` braces nor prose.
 
 ## oracle
 
