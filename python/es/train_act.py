@@ -19,7 +19,12 @@ Usage:
 
 Prints one JSON line on stdout and nothing else:
 
-    {"initial_loss": f, "final_loss": f, "steps": n, ...}
+    {"initial_loss": f, "final_loss": f, "steps": n, "torch": "...",
+     "optimizer": {"kind": "AdamW", "lr": f, "betas": [f, f], ...}, ...}
+
+`es train` reads that line (packet M7/T1): `torch` goes into spec 19.3's `hardware.json`, and
+`optimizer` is compared against the `optimizer.json` it declared *before* the run, so the
+declaration is checked rather than believed. Nothing this script is told enters a hash slot.
 
 **It implements no Observation IR node, and that is the point of V2b.** `--baked` is the output
 of `es dataset bake --policy <bundle.esb> --frames <tiles> <dataset>`, which ran every recorded
@@ -351,6 +356,7 @@ def main(argv: list) -> int:
     # A single step's loss is noise; the reported pair is the mean of the first and last tenth
     # of the run, so "the loss fell" is a statement about the run and not about one draw.
     window = max(1, len(losses) // 10)
+    group = optimizer.param_groups[0]
     report = {
         "initial_loss": sum(losses[:window]) / window,
         "final_loss": sum(losses[-window:]) / window,
@@ -366,6 +372,19 @@ def main(argv: list) -> int:
         "channel_weight": [float(v) for v in weights.tolist()],
         "ports": sorted(shapes),
         "observation_hash": manifest.get("observation_hash"),
+        # For `es train`'s spec 19.3 slots (packet M7/T1): `optimizer.json` is written before
+        # the run starts, from the values `AdamW(params, lr=lr)` leaves at torch's defaults,
+        # and `hardware.json` records the library the run actually used. Reporting them here
+        # is what lets `es train` compare its declaration against reality instead of trusting
+        # it. Neither enters a hash slot from this side (spec 8.1).
+        "torch": torch.__version__,
+        "optimizer": {
+            "kind": "AdamW",
+            "lr": group["lr"],
+            "betas": list(group["betas"]),
+            "eps": group["eps"],
+            "weight_decay": group["weight_decay"],
+        },
     }
     sys.stdout.write(json.dumps(report) + "\n")
     return 0

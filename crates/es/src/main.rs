@@ -28,6 +28,7 @@ USAGE:
     es loop collect|intervene|distill ...   (see `es loop --help`)
     es import lerobot-config --config <config.json> [--stats ...] [--dataset ...] --out <dir>
     es dataset info <root>
+    es train --recipe <training.toml> [--out <dir>] [--dry-run]
     es policy lower --policy <in.esb> --out <dir>
     es policy pack --policy <in.esb> --weights <model.safetensors> --out <out.esb>
     es backend compare --scene <file.xml|urdf> --backends mujoco-cpu,mjwarp[,newton,physx]
@@ -61,6 +62,7 @@ fn dispatch(args: &[String]) -> Result<u8, CliError> {
         Some("mcp") => cmd::mcp::dispatch(&args[1..]),
         Some("import") => cmd::import::dispatch(&args[1..]),
         Some("dataset") => cmd::dataset::dispatch(&args[1..]),
+        Some("train") => cmd::train::dispatch(&args[1..]),
         Some("policy") => Ok(cmd::policy::dispatch(&args[1..]) as u8),
         Some("backend") => cmd::backend::dispatch(&args[1..]),
         Some("bench") => cmd::bench::dispatch(&args[1..]),

@@ -1,0 +1,37 @@
+# The external route (packet M7/T1, after M5/V8 and M5/V19): LeRobot's own ACT, LeRobot's own
+# trainer, this project's documents. The three IR files are the ones `es policy
+# import-lerobot` carries into every checkpoint bundle, and they are committed, so `--dry-run`
+# resolves the Observation IR here and derives `--state-dim` from it rather than being told.
+#
+# `observation-v8.toml`, not `observation.toml`: an external checkpoint's input names are its
+# dataset's feature names with the dots replaced by underscores (spec 8.4, XIR-010), and
+# `observation-v8.toml` is the committed Observation IR whose output ports carry exactly those
+# names. `observation.toml` names its ports `joint_state`/`rgb_overhead`/`sim_cube_pose`, which
+# is right for the IR route and which `import-lerobot` refuses here, by name.
+#
+# `chunk_size` and `n_action_steps` are both the Deployment IR's `action.horizon`: spec 9 owns
+# the execution cadence and the policy owns the prediction length, so an import whose chunk is
+# shorter than the horizon is refused rather than reshaped (`es policy import-lerobot`).
+#
+# `checkpoint_at` has to be a multiple series: `lerobot-train` saves at one `--save_freq`.
+
+kind = "training"
+
+[dataset]
+root   = "runs/collect-001/ds"
+frames = "runs/collect-001/frames"
+
+[policy]
+task        = "tests/fixtures/visible-learning/task.toml"
+observation = "tests/fixtures/visible-learning/observation-v8.toml"
+deployment  = "tests/fixtures/visible-learning/deployment.toml"
+lerobot     = { type = "act", chunk_size = 16, n_action_steps = 16, extra = [] }
+
+[run]
+steps         = 20000
+batch         = 8
+lr            = 1e-4
+seed          = 0
+checkpoint_at = [10000, 20000]
+device        = "cuda"
+interpreter   = "python"

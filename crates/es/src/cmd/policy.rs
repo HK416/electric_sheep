@@ -126,7 +126,7 @@ fn open_bundle(path: &str) -> Result<PolicyBundle, CliError> {
     PolicyBundle::open(&bytes).map_err(|e| CliError::Runtime(format!("{path}: {e}")))
 }
 
-fn lower(args: &[String]) -> Result<u8, CliError> {
+pub(crate) fn lower(args: &[String]) -> Result<u8, CliError> {
     let a = parse(args, &["--policy", "--out"])?;
     let bundle = open_bundle(&a["--policy"])?;
     let module = lower_to_torch(&bundle.learning)
@@ -160,7 +160,7 @@ fn lower(args: &[String]) -> Result<u8, CliError> {
     Ok(0)
 }
 
-fn pack(args: &[String]) -> Result<u8, CliError> {
+pub(crate) fn pack(args: &[String]) -> Result<u8, CliError> {
     let a = parse(args, &["--policy", "--weights", "--out"])?;
     let bundle = open_bundle(&a["--policy"])?;
     let module = lower_to_torch(&bundle.learning)
@@ -251,7 +251,7 @@ fn normalizer_state(dir: &str) -> Result<Option<Vec<u8>>, CliError> {
 /// invent a proprietary policy architecture", and the falsifiable form of that is a real
 /// `lerobot-train` ACT running through `es eval run`, the Safety Plane and the Evaluation IR
 /// with no change to any of them.
-fn import_lerobot(args: &[String]) -> Result<u8, CliError> {
+pub(crate) fn import_lerobot(args: &[String]) -> Result<u8, CliError> {
     let a = parse(
         args,
         &[

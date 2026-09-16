@@ -22,6 +22,7 @@ pub mod intervention;
 pub mod lerobot;
 pub mod lerobot_config;
 pub mod roboverse;
+pub mod training;
 
 use std::path::{Path, PathBuf};
 
@@ -38,6 +39,7 @@ pub use lerobot::{
     export_v3, Column, Dtype, Episode, EpisodeMeta, ExportOptions, ExportReport, FeatureSpec, Info,
     LeRobotDataset, LeRobotWriter, Task, VideoRef,
 };
+pub use training::{DatasetFacts, Plan, Recipe, Route, Step, StepKind, Training};
 
 /// Everything that can go wrong reading or writing a dataset.
 #[derive(Debug, thiserror::Error)]
