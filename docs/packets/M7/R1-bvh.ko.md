@@ -57,15 +57,32 @@
 `camera_frames_per_sec`과 `pixels_per_sec`을 보고한다; 1280×720에서의 목표
 `< 5 ms/frame`은 서버 수치가 나올 때까지 `Target / Status: unverified`로 남는다.
 
-## context (허용 범위)
+## context
 
-`crates/es-render/src/{scene.rs,renderer.rs,cpu.rs,lib.rs}`, `crates/es-render/src/bvh.rs`
-(신규), `crates/es-render/slang/{common.slang,restir.slang,pt.slang,raster.slang}`(순회만),
-`crates/es-render/tests/render.rs`(새 테스트; 기존 테스트와 골든 생성기는 그대로),
-`crates/es-render/benches/` 또는 `#[ignore]`가 붙은 타이밍 테스트,
-`crates/es-env/src/render.rs`(캐시를 쓴다; 동작 변화 없음), `crates/es/src/cmd/showcase.rs`
-(캐시를 쓴다; 프레임당 루프는 그 외에는 불변), `docs/design/renderer*.md`,
-`docs/packets/M7/R1-bvh*.md`.
+```
+crates/es-render/src/scene.rs
+crates/es-render/src/renderer.rs
+crates/es-render/src/cpu.rs
+crates/es-render/src/lib.rs
+crates/es-render/src/bvh.rs
+crates/es-render/slang/common.slang
+crates/es-render/slang/restir.slang
+crates/es-render/slang/pt.slang
+crates/es-render/slang/raster.slang
+crates/es-render/tests/render.rs
+crates/es-render/benches/**
+crates/es-env/src/render.rs
+crates/es/src/cmd/showcase.rs
+docs/design/renderer.md
+docs/design/renderer.ko.md
+docs/packets/M7/R1-bvh.md
+docs/packets/M7/R1-bvh.ko.md
+```
+
+`bvh.rs`는 신규다; Slang 파일들은 **순회만** 다룬다; `render.rs`는 새 테스트를 얻고 기존
+테스트와 골든 생성기는 그대로 둔다; `es-env`와 `es`의 수정은 "캐시를 쓴다"이고 그 이상은
+아니다. 목록이 한 줄에 글롭 하나씩인 이유는 `cargo xtask check-scope`가 이 절을 파싱하며
+`{a,b}` 중괄호도 산문도 이해하지 못하기 때문이다.
 
 ## oracle
 

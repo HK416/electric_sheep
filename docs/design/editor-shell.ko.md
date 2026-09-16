@@ -211,3 +211,194 @@ redo로 왕복시키고 IR, 레이아웃, 해시를 비교한다.
   테스트되어 있다; `ParamType`을 채워 넣는 위젯은 그 뒤에 설계할 모델이 남아
   있지 않은 UI 작업이다.
 - Observation IR 노드 편집, 그리고 Control Graph(IR-C) — 3단계, M4.
+
+---
+
+## 10. Run 탭: 끝난 실행을 연다 (§23.3, §10.5, M7/E1)
+
+모든 `es eval run` / `es loop collect`은 `report.json`, `evaluation.lock`, `events.json`,
+`traj/<cell>.estraj`을, 그리고 `--frames`와 함께라면 `frames/<cell>/NNNNNN.bin`을 쓴다.
+지금까지 이것들을 읽는 것은 `es video mosaic`과 `jq`를 쥔 사람뿐이었다. **Run** 탭이 그
+디렉터리를 연다.
+
+`es-editor <run-dir>`와 File 필드는 경로 하나를 받는다; `report.json`을 가진 디렉터리는
+실행이고 나머지는 번들이다(`RunView::is_run_dir`). 플래그가 아니라 디스크에 있는 것으로
+구분한다: 실행 디렉터리와 번들 디렉터리는 헷갈릴 수 없고, 잘못 입력한 사람은 모드가 아니라
+다른 뷰의 오류를 받는다.
+
+### `model/run_view.rs`
+
+| 호출 | 주는 것 |
+|---|---|
+| `RunView::open(dir)` | `EvaluationReport`, `events.json`의 `BTreeMap<String, Vec<es_eval::runner::StepEvent>>`, 그리고 `traj/`와 `frames/`의 목록(적재는 하지 않는다) |
+| `cells()` | **에피소드**당 `CellRow` 하나: 이름, 스위트, 시드, 리포트 자신의 이름으로 된 그 스위트의 메트릭, 궤적과 프레임의 존재 여부 |
+| `columns()` / `sort_by(i)` | 테이블 헤더, 그리고 그중 무엇으로든 안정 정렬 |
+| `timeline(cell)` | 틱마다 `EventSource`와 디코딩된 `EventSet`, 그리고 종류별 합계와 각 종류의 첫 틱 |
+| `Timeline::buckets(n)` | 같은 틱들을 `n`개의 열로 접은 것 — 어떤 너비에서도 그릴 수 있게 |
+| `acceptance()` | `report.acceptance` 그대로 |
+| `filmstrip(cell, 8)` / `frame(cell, i)` | 고르게 퍼진 최대 여덟 개의 프레임 인덱스, 그리고 디코딩된 `Rgb8Image` 하나 |
+| `set_frames_root(dir)` / `frames_root()` | `<cell>/NNNNNN.bin`을 찾을 위치; 열 때는 `<run>/frames` |
+| `selected_cell()` / `select(name)` | 선택. 이것이 리플레이 패널(§11)과의 결합 전부다 |
+
+**"cell"이라 불리는 것이 둘**이고 이 파일은 둘을 구분한다. `es_ir::evaluation::CellResult`는
+§10.1 표의 *스위트 × 메트릭* 하나이고, 디스크상의 cell — `events.json`의 키,
+`frames/<cell>/`, `traj/<cell>.estraj` — 은 `Evaluation::run_shard`가 `<suite>-<NN>`으로
+이름 붙인 *에피소드* 하나다. `CellRow`는 에피소드이며 자기 스위트가 측정한 메트릭을
+가지므로, 에피소드가 둘인 스위트의 두 행에는 같은 숫자 셋이 나타난다. 대안 — `CellResult`당
+한 행 — 은 리포트 표 그 자체이고, `nominal-01` 에피소드를 보고 싶은 사람이 찾는 것이 아니다.
+
+**메트릭 이름은 리포트의 것이다.** `columns()`는 리포트가 가진 메트릭 이름의 합집합이므로,
+`MetricSpec`에 메트릭이 추가되면 여기를 고치지 않아도 나타난다. 하드코딩은 없고,
+`Histogram`이나 `Unavailable` 값은 `0`이 아니라 그것 자체로 표시된다.
+
+**시드는 `evaluation.lock`에서 온다.** `report.json`은 시드를 담지 않는다. lock의
+`seeds[i]`는 cell 이름의 `NN`으로 고르며, 그것이 `run_shard`가 세는 에피소드 인덱스다.
+lock이 없으면 그 칸은 `--`다: 지어낸 시드는 없는 시드보다 나쁘다.
+
+**위반 비트는 다시 유도하지 않고 디코딩한다.** `StepEvent::events`는
+`es_safety::EventSet::bits()`다. `EventSet`에는 `from_bits`가 없고 `es-safety`는 이 패킷이
+고칠 것이 아니므로, `decode_events`는 인코더가 쓴 것과 같은 표인 `ViolationKind::index()`를
+통해 다시 넣고, 테스트가 14개 종류 전부를 왕복시킨다.
+
+**버킷은 연속적이고, 빈틈이 없고, 전체를 덮는다.** 그래서 어떤 `n`에서도 종류별 개수가
+타임라인 합계로 다시 더해진다(오라클은 `n ∈ {1, 7, 64}`를 확인한다). 한 버킷은 그것이 덮는
+가장 심각한 소스를 보여주므로(`Policy < Human < Clamped < Fallback`), 400틱 에피소드의 클램프
+한 틱도 반올림으로 사라지지 않고 보이는 자국으로 남는다.
+
+**실행은 두 개의 시계를 기록하고, 요약은 둘 다 적는다.** `events.json`의 레코드 하나는
+*프레임* 하나 — 제어 스텝 하나 — 이고 그 프레임이 돈 `PhysTick`을 싣는다. 데모의 주기에서는
+프레임당 물리 틱이 넷이므로, "first at tick 544"는 224칸짜리 스트립 어디에도 없다.
+`Timeline::kind_rows()`는 `KindRow { kind, frames, first: FirstSeen { frame, tick } }`을
+돌려주고 `KindRow::label()`이 *"Velocity: 2 frame(s), first at frame 1 (tick 1)"* 을 쓴다 —
+스트립 자신의 인덱스가 먼저, 물리 틱이 뒤에. `Timeline::heading(cell)`도 같은 단위를 센다
+(*"nominal-00: 224 frame(s)"*). 사람에게 어느 시계를 보여줄지는 결정이므로, 그 문구는
+`app.rs`가 아니라 테스트가 붙은 모델에 있다(§28.10 규칙 3).
+
+**프레임은 `--frames`가 가리킨 곳에 있다.** `es eval run --frames <dir>`는 지정받은 곳에 쓰고,
+그곳은 보통 `<run>/frames`가 아니라 실행 디렉터리의 *형제*다. 그래서 실제 실행의 표는 탭이
+그곳을 가리키기 전까지 모든 셀에 `frames 0`을 보여줬다. `set_frames_root(dir)`이 루트를 옮기고
+행을 다시 만든다 — 덕분에 홀로 있는 리포트도 외부 프레임 디렉터리에서 셀을 얻는다 — 그리고
+`app.rs`에는 `Scene` 옆에 `Frames` 필드 하나가 붙어, 열 때 `frames_root()`로 채워지고 포커스를
+잃을 때 적용된다.
+
+**표, acceptance 줄, 스트립, 필름스트립은 하나의 세로 스크롤 영역**이며
+(`auto_shrink([false, false])`라 리플레이 패널이 남긴 만큼을 채운다), 필름스트립은 자기만의
+가로 스크롤을 갖는다: 160 px 썸네일 여덟 개는 좁은 창보다 넓고, 잘린 프레임은 없는 프레임처럼
+보인다.
+
+### 의도적으로 하지 않는 것
+
+- **살아 있는 프로세스 없음.** 이 탭은 끝난 디렉터리를 읽는다. 돌고 있는 `es eval run`에
+  붙는 것은 E4의 `--telemetry`이고, 그것은 다른 전송이다.
+- **실행을 편집하지 않음.** 아무것도 되쓰지 않는다: 에디터가 다시 쓸 수 있는 아티팩트는
+  해시 체인이 보증할 수 없는 아티팩트다(§5.3, §10.5).
+- **캐시 없음.** `frame()`은 요청받은 것만 디코딩하고, `app.rs`는 선택된 cell의 필름스트립
+  텍스처 여덟 개만 들고 있다가 경로가 바뀌면 버린다.
+- **불완전한 실행도 열린다.** 필요한 것은 `report.json`뿐이다. 없는 것은 상태 줄에
+  이름으로 적힌다. 사람이 에디터로 여는 실행은 흔히 끝까지 쓰이지 못한 실행이기 때문이다.
+  다만 깨진 `events.json`은 추측이 아니라 오류다(§25.1).
+
+픽스처는 `tests/fixtures/visible-learning/run/`이다: 스위트 2 × 에피소드 2, 각각 4틱이며 그중
+`Clamped` 둘과 `Fallback` 하나가 실제 위반 비트를 싣고, cell당 96×96 프레임 하나가 있다.
+`#[ignore]`된 `generate_fixture_run`이 쓰며, 그것은 `EvaluationReport`와 `EvaluationLock`을
+만들어 `es_eval::runner::write_artifacts`와 `FrameSink`에 넘긴다 — 바이트가 그것을 만드는
+타입 자신의 것이 되도록. 프레임 `.bin`과 그 `layout.json`만 직접 쓰는데, `es_eval`의 해당
+작성기가 비공개이기 때문이다; 형식은 그 작성기의 문서 그대로다.
+
+---
+
+## 11. Replay 패널: 에디터 안에서 재생되는 `.estraj` (§23.3, M7/E2)
+
+§23.3은 "에디터가 장면을 로컬에 복제하고 포즈/관절만 받는" 것을 요구한다. 기록된 궤적이
+바로 그 스트림이며, 오프라인이다. `es video showcase`는 장면 파일과 `.estraj`만으로 실행을
+다시 렌더링할 수 있음을 이미 증명했다 — 이 패널은 같은 일을 CPU에서, `egui` 캔버스 안에서,
+상호작용 가능한 속도로 한다: **물리 없음, GPU 없음, `ffmpeg` 없음, 서버 없음.**
+
+Run 탭의 아래쪽 패널로 산다(§10의 표가 에피소드를 고르고, 이 패널이 그것을 재생한다).
+결합 전부는 `RunView::selected_cell()`이고, 패널은 텍스트 필드 하나를 더한다. 실행
+디렉터리는 자기 장면 파일을 담지 않기 때문이다 — showcase가 받는 바로 그 `--scene`이다.
+
+**높이는 위젯이 아니라 모델이 답한다.** `replay_view::panel_height(replay, available)`는
+아무것도 로드되지 않은 동안 `None`을 돌려주고 — 그때 패널은 컨트롤 줄들뿐이다 —
+`ReplayView::is_loaded()`가 참이 되면 탭의 45%를 돌려준다. 바닥은 320 px(볼 만한 캔버스),
+천장은 80%(위의 표가 사라지지 않게)다. 첫 판은 45%를 조건 없이 가져갔고, 빈 캔버스가 위의
+필름스트립을 잘랐다. `app.rs`는 두 상태에 각자의 패널 id(`replay-controls` / `replay-canvas`)를
+주는데, egui가 끌어서 바꾼 높이를 id별로 기억하고 두 상태는 각자의 높이를 원하기 때문이다;
+실행이 바뀌면 리플레이가 떨어지고 패널은 스스로 줄어든다.
+
+### `model/replay_view.rs`
+
+| 호출 | 주는 것 |
+|---|---|
+| `ReplayView::open(scene, traj)` | `SceneDesc`(`es backend`의 `load_scene`처럼 확장자로 MJCF/URDF 구분)와 `Trajectory`; 틱 0을 테셀레이션해 두므로 지원되지 않는 geom은 나중의 빈 캔버스가 아니라 여기서의 오류가 된다 |
+| `ticks()` / `qpos(t)` / `scene_at(t)` | 길이, 관절 상태, 그리고 그 틱의 `TriScene` — showcase가 렌더링하는 바로 그 호출 |
+| `project(t, &Camera)` | `Vec<Tri2d>`: 화면 점 셋, 평면 색 `[u8; 3]`, 깊이 키, 원본 삼각형 인덱스, **뒤에서 앞으로 정렬** |
+| `Camera::view()` | 그 좌표가 속한 `es_render::CameraView` |
+| `Camera::orbit(dyaw, dpitch)` / `zoom(f)` | `look_at`을 중심으로 한 구면 위의 새 카메라; 순수 함수, `#[must_use]`, 내부 상태 없음 |
+| `advance(dt, rate_hz)` / `step(±n)` | 재생. 양끝에서 고정되며 `playing`, `tick`, `speed`는 모델의 것이다 |
+
+**투영은 `es_render` 자신의 것을 뒤집은 것이다.** `ViewParams::new(&camera.view())`가 렌더러의
+`f32` 카메라를 주고, 월드 정점은 `es_render::cpu::quat_rotate_inv`와 `cpu::primary_dir`가
+광선을 쏠 때 쓰는 바로 그 `fx, fy, cx, cy`를 지난다. 여기서 규약을 다시 유도하는 것은 없다
+(§3.1: `OpenCV` 카메라 프레임, 이미지 원점 좌상단).
+
+**셰이딩은 `es_shade_lambert`를 네 줄로 옮긴 것**이다. `cpu::shade_lambert`가 비공개이기
+때문이다: `ambient + max(dot(n, light), 0) * (1 - ambient)`에 albedo를 곱하고 emission을
+더한 뒤, (공개된) `srgb_encode`와 렌더러의 반올림을 거친다. 곱셈과 덧셈은 분리되어 있고
+`mul_add`가 아니다: 융합 연산은 한 번 반올림하는데 렌더러는 두 번 반올림한다.
+`RenderConfig::rs`를 여기서 만드는 이유는 오로지 광원 방향과 앰비언트 바닥값이 렌더러의
+상수이고 그것의 두 번째 사본이 아니게 하기 위해서다. `flat_shade_matches_the_renderer`는
+카메라 하나 앞에 삼각형 하나를 두고 `es_render::cpu::rasterize`로 래스터화한 뒤, 투영된
+무게중심 아래의 픽셀이 그 색과 같다고 단언한다 — 카메라와 투영과 셰이딩을 한 번에 고정한다.
+
+**근평면 클리핑은 삼각형 단위다.** 정점 하나라도 근평면 위나 뒤에 있는 삼각형은 그 `z`로
+나누지 않고 버린다. 나누면 눈을 통과해 이미지 반대편으로 투영된다. 평면에 걸친 삼각형은
+쪼개지 않고 사라진다: 쪼개는 클리퍼는 정점을 보간해야 하는데, 이 카메라의 축척에서 팔이
+반쯤 뒤에 있는 일은 없다.
+
+**`ponytail:` 화가 알고리즘이 의도적인 단순화다.** 무게중심 깊이로 삼각형 전체를 정렬하는
+것은 서로 관통하지 않는 볼록 프리미티브에 대해 정확하고, 관통하는 바로 그곳에서 틀린다 —
+큐브를 문 그리퍼가 엉뚱한 면을 보일 수 있다. 업그레이드 경로는 낮은 해상도에서 픽셀당
+`es_render::cpu::rasterize`이며, R1의 BVH가 그것을 감당 가능하게 만든다; 모델이 만드는
+카메라가 이미 `CameraView`이므로 그 교체는 함수 하나짜리 변경이다. 정렬은 깊이만을 키로 한
+안정 정렬이라 동점은 삼각형 순서를 지키고, 그래서 방출되는 수열은 (궤적, 카메라)의 순수
+함수다 — `tests/golden/editor/replay_tick0_order.json`(틱 0의 인덱스 2,754개)이 지킬 만한
+골든인 이유다.
+
+### `look_at`은 재사용이 아니라 반복이다
+
+`es_env::render::look_at`은 `es-env`의 `render` 피처 뒤에 있고, 그 피처는 `es-render`와
+**`es-gpu`**를 함께 끌어온다: 에디터에서 그것을 켜면 GPU로 아무것도 렌더링하지 않는 뷰어에
+Vulkan을 링크하게 되는데, E2가 그것을 금지한다. 그 함수를 피처 밖으로 옮기는 것도 순수한
+이동이 아니다 — `es_render::CameraView`를 반환하고 `es_render::ImageSpec::pinhole`을
+호출하는데, 둘 다 선택적 의존성의 것이다. 그래서 `Camera::view`는 같은 `es-render` 타입 위에서
+그 산술(전방 × 월드 업으로 만든 기저, 그다음 Shepperd 쿼터니언)을 반복하고, 위의 테스트가
+그것을 사본의 출처가 아니라 렌더러에 대고 고정한다. `es-env`가 언젠가 `es-render`를 필수
+의존성으로 만들면, 이것은 한 줄짜리 위임이 된다.
+
+### 픽스처 궤적
+
+`tests/fixtures/visible-learning/run/traj/nominal-00.estraj`: `tests/fixtures/mjcf/
+so101_pick_place.xml`의 48틱, 36 kB이며 `#[ignore]`된 `generate_fixture_traj`가 쓴다.
+**물리 백엔드는 관여하지 않고 필요하지도 않다.** `Trajectory`는
+`es_physics_core::backend::ModelInfo`로 형태가 정해지고 `StateView`로 채워지는데 둘 다 평범한
+구조체다: 생성기는 장면 바디마다 인덱스 하나를 가진 `ModelInfo`를 만들고 `nq`/`nv`는 관절에서
+`MuJoCo` 자신의 배치대로 합산한 뒤, 틱마다 장면의 부모 사슬로 모든 바디의 월드 포즈를
+합성한다(`shoulder_pan`을 -0.6에서 +0.6 rad까지 쓸어가며; MJCF 힌지는 자식 프레임을 그
+`anchor`를 지나는 `axis`에 대해 돌린다: `body.pose * T(a) * R * T(-a)`). 그리고 그 포즈들을
+담은 `StateView`를 push한다. 이는 `es_render::scene::world_poses`가 하는 것과 같은 합성이며 —
+거기서는 비공개, 여기서는 열두 줄, 테스트 코드에만 있다. `es-physics-core`가 **dev-dependency**인
+이유가 정확히 이것이다: 에디터 자신은 그 타입들을 결코 부르지 않는다.
+
+이 궤적은 정책 롤아웃이 아니라 합성된 홈 포즈 스윕이다: 확인해야 할 것은 기록된 포즈
+스트림이 장면을 다시 포즈시키고 투영된다는 것이고, (오케스트레이터가 여는) 실제 V19b
+`.estraj`는 팔만 다를 뿐 같은 바이트다.
+
+### 여기 없는 것
+
+- **픽셀 단위의 무엇도**: 깊이 버퍼 없음, 그림자 없음, 텍스처 없음. 업그레이드 경로는 위에 있다.
+- **실행 자신의 제어 주기.** 패널은 데모 배포의 `rate.control`인 50 Hz로 재생한다; 실행
+  디렉터리에는 그것을 읽을 Deployment IR이 없고, 주기가 틀려도 팔이 움직여 보이는 속도만
+  달라진다. 실행이 자기 주기를 기록하는 순간 `--rate`는 패널의 필드가 된다.
+- **카메라 프리셋과 장면 카메라.** `--camera NAME`(showcase의 다른 모드)은 장면 자신의 카메라
+  목록이 필요하다; 마우스를 끄는 사람이 원하는 것은 자유 카메라다.

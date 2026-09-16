@@ -44,7 +44,24 @@ exact for the scene's convex primitives when they do not interpenetrate, and wro
 intersections; the upgrade path is a per-pixel `es_render::cpu::rasterize` at low resolution
 once R1's BVH makes that cheap.
 
-## context (allowed scope)
+## context
+
+The globs `cargo xtask check-scope` reads (its parser wants a `## context` heading and a
+fenced block or a bullet list), then the same scope in prose:
+
+```
+crates/es-editor/src/model/replay_view.rs
+crates/es-editor/src/model/mod.rs
+crates/es-editor/src/lib.rs
+crates/es-editor/src/app.rs
+crates/es-editor/Cargo.toml
+tests/fixtures/visible-learning/run/traj/**
+tests/golden/editor/**
+docs/design/editor-shell.md
+docs/design/editor-shell.ko.md
+docs/packets/M7/E2-3d-replay.md
+docs/packets/M7/E2-3d-replay.ko.md
+```
 
 `crates/es-editor/src/model/replay_view.rs` (new), `crates/es-editor/src/model/mod.rs`,
 `crates/es-editor/src/lib.rs`, `crates/es-editor/src/app.rs` (the panel), `crates/es-editor/Cargo.toml`

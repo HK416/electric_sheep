@@ -124,8 +124,13 @@ for kernels outside the deterministic contract (§3.2 exempts neural-network ker
 ## Buffers and pipelines
 
 `gpu-allocator` owns device memory; buffers are `Buffer::new(gpu, bytes, Usage)` with
-`Storage` / `Uniform` / `Staging` (host-visible). `upload` / `download` copy through a
-staging buffer and a one-shot command buffer. A `Buffer` records the `bytes` it was asked for
+`Storage` / `Uniform` / `Staging` (host-visible, `CpuToGpu`) / `Readback` (host-cached,
+`GpuToCpu`). `upload` copies through a `Staging` buffer and a one-shot command buffer;
+`download` copies through a `Readback` buffer (packet M7/R1b): reading a write-combined
+`CpuToGpu` mapping ran at 27–44 MiB/s on both oracle GPUs, so a 3.6 MB 1280×720 readback
+cost 64–85 ms, while the cached mapping reads at 2.9–3.3 GiB/s (1.1–1.2 ms) on the RTX 3060
+(`docs/design/renderer.md` section 8.4 has both GPUs). A device without `GpuToCpu` memory
+falls back to `Staging` for downloads and says so once on stderr. A `Buffer` records the `bytes` it was asked for
 alongside what was allocated (`bytes.max(4)`, then the allocator's alignment padding), and
 `download` returns exactly the requested length — the padding is never handed back as if it
 were data.

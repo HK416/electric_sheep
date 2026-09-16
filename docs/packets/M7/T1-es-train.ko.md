@@ -85,7 +85,30 @@ interpreter = "python"                # ES_PYTHON이 설정되면 그것으로 �
   경로의 거부이며 여기서 표면화된다); `import torch`를 할 수 없는 인터프리터(외부 경로에서는
   `import lerobot`) — 인터프리터 자신의 에러를 그대로 출력한다.
 
-## context (허용 범위)
+## context
+
+`cargo xtask check-scope`가 펜스를 읽는다; 그 아래 산문은 각 항목의 이유를 붙인 같은
+목록이다.
+
+```
+crates/es-data/src/training.rs
+crates/es-data/src/lib.rs
+crates/es/src/cmd/train.rs
+crates/es/src/cmd/mod.rs
+crates/es/src/main.rs
+crates/es/src/cmd/dataset.rs
+crates/es/src/cmd/policy.rs
+crates/es/tests/cli.rs
+tests/fixtures/visible-learning/training*.toml
+tests/golden/train/*.txt
+docs/design/training-recipe*.md
+docs/packets/M7/T1-es-train*.md
+python/es/train_act.py
+```
+
+`crates/es/src/cmd/{dataset,policy}.rs`는 `forbidden` 절이 그것들에게 허용하는 단 하나의
+수정을 위해 펜스에 있다: `es train`이 프로세스 내부에서 호출할 수 있도록 단계의 함수
+하나를 `pub(crate)`로 만드는 것.
 
 `crates/es-data/src/training.rs`(레시피 스키마, 플랜 빌더, 아이덴티티 조립; 신규),
 `crates/es-data/src/lib.rs`(모듈과 재수출만), `crates/es/src/cmd/train.rs`(신규),

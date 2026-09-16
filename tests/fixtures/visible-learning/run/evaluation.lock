@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "evaluation_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+  "execution_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+  "seeds": [
+    7,
+    8
+  ],
+  "backend": {
+    "name": "fixture",
+    "determinism": "bitwise",
+    "float": "fp64",
+    "max_envs": 1,
+    "gpu_resident": false,
+    "supports_reset_subset": true,
+    "supports_state_get_set": true,
+    "quirks": []
+  },
+  "created": 0
+}

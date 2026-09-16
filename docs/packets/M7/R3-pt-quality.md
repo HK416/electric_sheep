@@ -7,10 +7,10 @@ cuttable — so every step here is honest about what it skips), §28.10 rule 1. 
 extend: `docs/design/renderer.md` (+ `.ko.md`) sections 4, 4.2, 6 and a new section 10. Depends
 on **R1** (traversal) and **R2** (`Shading::Full` is the RS side of the SSIM comparison; the
 tone map is shared). References to read first: Pharr, Jakob, Humphreys, *Physically Based
-Rendering* 4th ed. §13.10 (light sampling, MIS with the balance/power heuristic); Bitterli et al.
+Rendering* 4th ed. chapter 13.10 (light sampling, MIS with the balance/power heuristic); Bitterli et al.
 2020 "Spatiotemporal reservoir resampling for real-time ray tracing with dynamic direct lighting"
-§4.3 (the unbiased `1/Z` combination) and Wyman et al. 2023 "A Gentle Introduction to ReSTIR"
-§5 (pairwise MIS weights); Reinhard et al. 2002 (the `x/(1+x)` operator).
+section 4.3 (the unbiased `1/Z` combination) and Wyman et al. 2023 "A Gentle Introduction to ReSTIR"
+section 5 (pairwise MIS weights); Reinhard et al. 2002 (the `x/(1+x)` operator).
 
 ## the question
 
