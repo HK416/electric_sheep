@@ -21,7 +21,7 @@ use std::time::Instant;
 use es_env::render::{camera_view, look_at};
 use es_env::traj::Trajectory;
 use es_env::EnvRendererCfg;
-use es_render::{Channel, RenderPath, Renderer, SceneCache};
+use es_render::{Channel, RenderPath, Renderer, SceneCache, Shading};
 
 use crate::error::CliError;
 
@@ -29,6 +29,7 @@ pub const HELP: &str = "\
 es video showcase --run <dir> --scene <file.xml|urdf> --out <dir>
                   (--eye X,Y,Z --look-at X,Y,Z [--fov 45] | --camera NAME)
                   [--width 1280] [--height 720] [--cell NAME]... [--stride N]
+                  [--look lambert|full]
 
 Re-renders a finished `es eval run` or `es loop collect` from the per-episode `.estraj` state
 trajectories it wrote, through a camera that is not in the scene and not in any IR -- so the
@@ -47,6 +48,10 @@ Nothing is resampled and no observation is involved: the showcase camera has its
     --cell NAME     render only this episode; repeatable, default every one in name order
     --stride N      render every Nth recorded tick (default 1)
     --fov D         vertical field of view in degrees (default 45)
+    --look NAME     `lambert` (default) is the look every committed document renders in;
+                    `full` adds shadows, a sky, highlights and 2x supersampling (M7/R2).
+                    It is a look for people, not for observations: the frames a policy
+                    reads are rendered by the observation path, which has no such flag
 
 Needs the `render` feature and a Vulkan device. Exit codes: 0 success, 1 runtime failure,
 2 usage error.
@@ -62,6 +67,7 @@ struct Opts {
     height: u32,
     cells: Vec<String>,
     stride: usize,
+    look: Shading,
 }
 
 enum Camera {
@@ -98,6 +104,9 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
     let (mut run, mut scene, mut out, mut eye, mut target) = (None, None, None, None, None);
     let (mut fov_deg, mut width, mut height, mut stride) = (45.0f64, 1280u32, 720u32, 1usize);
     let (mut cells, mut named) = (Vec::new(), None);
+    // `Lambert` by default, so V9's bit-identity oracle keeps meaning: a re-render of a
+    // committed run reproduces its recorded frames.
+    let mut look = Shading::Lambert;
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -121,6 +130,17 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
             "--stride" => stride = (num(val()?, "--stride")? as usize).max(1),
             "--camera" => named = Some(val()?.clone()),
             "--cell" => cells.push(val()?.clone()),
+            "--look" => {
+                look = match val()?.as_str() {
+                    "lambert" => Shading::Lambert,
+                    "full" => Shading::FULL,
+                    other => {
+                        return Err(usage(format!(
+                            "--look: expected lambert or full, got {other:?}"
+                        )))
+                    }
+                }
+            }
             other => return Err(usage(format!("unknown flag '{other}'"))),
         }
     }
@@ -157,6 +177,7 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
         height,
         cells,
         stride,
+        look,
     })
 }
 
@@ -245,7 +266,10 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
         .map_err(|e| rt(format!("no Vulkan device for es video showcase: {e}")))?;
     // The same function every other `Rs` render in this repository goes through, so the
     // showcase and the observation frames cannot drift apart (design note section 7.4).
-    let cfg = es_env::render::config(opts.width, opts.height, Channel::Rgb8, RenderPath::Rs);
+    let mut cfg = es_env::render::config(opts.width, opts.height, Channel::Rgb8, RenderPath::Rs);
+    // The only thing `--look` touches. `es_env::render::config` stays the one place a render
+    // path becomes a `RenderConfig`, and the observation path keeps its default (M7/R2).
+    cfg.shading = opts.look;
     let mut renderer = Renderer::new(&gpu, cfg).map_err(|e| rt(format!("renderer: {e}")))?;
 
     fs::create_dir_all(&opts.out).map_err(|e| rt(format!("{}: {e}", opts.out.display())))?;
@@ -297,9 +321,14 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
     }
     let secs = start.elapsed().as_secs_f64();
     println!(
-        "wrote {frame} frame(s) of {}x{} to {} in {secs:.1}s ({:.1} ms/frame)",
+        "wrote {frame} frame(s) of {}x{} ({}) to {} in {secs:.1}s ({:.1} ms/frame)",
         opts.width,
         opts.height,
+        if opts.look == Shading::Lambert {
+            "lambert"
+        } else {
+            "full"
+        },
         opts.out.display(),
         if frame == 0 {
             0.0

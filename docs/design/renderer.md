@@ -246,10 +246,30 @@ lambert  = ambient + max(0, dot(n, L)) * (1 - ambient)
 rgb_lin  = albedo * lambert
 ```
 
-No shadow ray in `Rs` — a shadow ray is a second scan of the whole triangle array per pixel,
-which doubles the cost of the default vision path for an effect the `Pt` path models properly.
-`ponytail:` no shadows in `Rs`; add a shadow scan when a golden shows the missing contact
-shadow actually hurts a policy.
+This is `Shading::Lambert`, the `#[derive(Default)]` default, and it is what every golden and
+every committed observation document pins, byte for byte. No shadow ray: when this was the
+only shading, a shadow ray meant a second scan of the whole triangle array per pixel, which
+doubled the cost of the default vision path for an effect the `Pt` path models properly.
+
+Since M7/R2 there is a second, **opt-in** shading — `Shading::Full`, one shadow ray through
+R1's any-hit traversal, a hemisphere ambient, a Blinn-Phong highlight and supersampling:
+
+```
+n        = geometric normal, flipped to face the ray
+vis      = shadows ? (any_hit(p + n * RAY_EPS, L, 0, SHADOW_FAR) ? 0 : 1) : 1
+diffuse  = max(0, dot(n, L)) * vis
+h        = normalize(L - d)
+spec     = specular * pow(max(0, dot(n, h)), shininess) * vis      // 0 when dot(n, h) <= 0
+hemi     = ground + (sky - ground) * ((n.z + 1) * 0.5)
+rgb_lin  = albedo * (hemi + diffuse * (1 - hemi)) + spec + emission   // per channel
+```
+
+then the same sRGB transfer below. `pow` is `es_exp(es_ln(x) * shininess)`, never `std` or
+`GLSL.std.450`. Nothing about `Lambert` moved to make room for it: one kernel branches on a
+flag read from the parameter buffer, and the new slots were appended after the existing ones.
+[§9](#9-the-rs-look-m7r2) has the whole of it — the accumulation order of the box filter, the
+parameter layout, why the observation path was not given the option, and what the GPU and the
+CPU do and do not agree about.
 
 `Rgb8` is `rgb_lin` encoded with the **exact piecewise sRGB transfer** (§3.1: sRGB is the
 default colour space):
@@ -672,3 +692,199 @@ The §28.10 target of `< 5 ms/frame` at 1280×720 reads **5.2 ms** on the 4090's
 met, by 0.2 ms; the 3.0 ms readback that remains is mostly `Atlas::read_tile`'s host-side
 unpack of the packed `RGBA8` words into `Rgb8` bytes (the copy itself is 1.7 ms), which is
 where the next millisecond lives if anyone needs it. The 3060 does not reach it (12.6 ms).
+
+## 9. The `Rs` look (M7/R2)
+
+`docs/packets/M7/R2-rs-look.md`. §28.10 records the `Rs` path as "Lambert plus a constant
+ambient; no shadows, no highlights, no textures" — honest, and it looks like 1995. The
+question the packet asks is whether it can have contact shadows, a sky, highlights and
+anti-aliasing **without changing a byte of what the committed observation documents render**
+(§28.10 rule 1).
+
+The answer is a `RenderConfig` field:
+
+```rust
+pub enum Shading {
+    #[default] Lambert,                       // §3.1, unchanged, every golden pins it
+    Full { shadows, specular, shininess, sky_rgb, ground_rgb, ssaa },
+}
+```
+
+`RenderConfig::rs()` keeps `Lambert`. `RenderConfig::rs_full()` is `Shading::FULL`, the
+opinionated preset: `shadows: true, specular: 0.25, shininess: 32.0, sky [0.55, 0.65, 0.85],
+ground [0.25, 0.22, 0.20], ssaa: 2`. `es video showcase --look lambert|full` selects it and
+defaults to `lambert`.
+
+### 9.1 The shading, exactly
+
+[§3.1](#31-shading) has the equations; this is what is behind them.
+
+- **The shadow ray is R1's any-hit traversal** (`cpu::any_hit` / `es_any_hit`), from
+  `p + n * RAY_EPS` towards the light on `(0, SHADOW_FAR)` with `SHADOW_FAR = 1e30`. The
+  light is *directional* — infinitely far — so the occluder may stand outside the camera's
+  far plane and the view frustum's `far` is the wrong bound. `1e30` rather than infinity
+  because `rcp_safe` clamps reciprocals to ±1e30 to keep `0 * inf` out of the slab test, and
+  an infinite `far` would put it back in.
+- **`vis` multiplies the diffuse *and* the specular term, never the ambient.** A surface in
+  shadow keeps its hemisphere ambient, which is what stops the shadowed floor of the Cornell
+  box from going black.
+- **Blinn-Phong, not Phong**: `h = normalize(L - d)`, where `d` is the view ray as the camera
+  built it — not normalised, `z = 1` in camera space. Normalising `d` first would be one more
+  `sqrt` per sub-sample for a highlight that is a look, not a measurement.
+- **`pow` is `es_exp(es_ln(x) * shininess)`**, guarded at `x <= 0` on both sides (§3.2
+  `DET-010`: no `std`, no `GLSL.std.450` on a path that generates a golden).
+- **The hemisphere is world-space**: `sky` at `n.z = +1`, `ground` at `n.z = -1`, lerped on
+  `(n.z + 1) * 0.5`. Written out as `ground + (sky - ground) * t` on both sides rather than
+  through `lerp`/`mix`, because HLSL's `lerp(x, y, s) = x + s * (y - x)` and GLSL's
+  `mix(x, y, a) = x * (1 - a) + y * a` are not the same expression and the two texts have to
+  round the same way.
+- **A ray that hits nothing still returns black**, not `sky_rgb`. `sky_rgb` is the *ambient*
+  from above, not a background: giving the background a colour would change what
+  `SegmentationId == 0` looks like and is a scene decision, not a shading one.
+- **The ambient and the diffuse mix is energy-conserving** — `hemi + diffuse * (1 - hemi)`,
+  per channel, the same shape `Lambert` uses for its constant ambient
+  (`ambient + ndl * (1 - ambient)`). A surface in full light returns exactly its albedo and a
+  shadowed one returns `albedo * hemi`, so nothing clips before the sRGB transfer.
+  **Amended at review**: the packet's original `albedo * (hemi + diffuse)` exceeds the albedo
+  on every lit surface — with `sky` at 0.85 and `ndl` at 0.87 the SO-101 table rendered pure
+  white — and that is a defect of the equation, not something a tone map should be asked to
+  hide. `spec` stays additive: a highlight is allowed to blow out, that is what a highlight
+  is.
+
+What `Full` is still not: no textures, no soft shadows (one ray, one directional light), no
+multiple lights, no tone map (that is R3's), no global illumination (that is `Pt`).
+
+**What the Cornell golden does not pin.** The box is a closed room, so every shadow ray from
+inside it hits the ceiling: under the preset `vis = 0` at every pixel of
+`cornell_rs_full_rgb8`, the `diffuse` term is zero, and the golden is byte-identical before
+and after the amendment above. It pins the hemisphere, the shadow ray and the box filter, and
+it is blind to the mix. Two tests cover what it cannot: `full_shading_is_energy_conserving`
+calls `shade_full` directly and asserts the lit surface returns its albedo and the shadowed
+one `albedo * hemi`, and `gpu_full_shading_matches_the_cpu` runs its GPU/CPU comparison a
+second time with `shadows: false`, which is the only way the device executes the lit branch
+on this scene at all.
+
+### 9.2 SSAA is a fixed-order box filter
+
+`ssaa: k` shades `k × k` sub-samples per pixel at `px + (sx + 0.5) / k`, and box-filters them:
+
+```
+acc = 0
+for sy in 0..k:            // row-major, sy outer, sx inner, one sequential +=
+    for sx in 0..k:
+        acc += shade(sub_sample(sx, sy))     // a sub-sample that hits nothing adds 0
+lin = acc * (1 / (k * k))  // one multiply, then the sRGB transfer
+```
+
+Spec §3.4 forbids an accumulation whose order depends on scheduling, so the order is written
+into both texts and the sum is sequential in `f32` — no pairwise tree, no atomic, no shared
+memory. It is **one kernel**: the supersampling happens inside the thread that owns the output
+pixel, not in a bigger atlas resolved by a second pass. That is also why no atlas, buffer or
+`Atlas::read_tile` shape changed: at `ssaa: 2` each thread casts 4 primary rays and 4 shadow
+rays instead of 1 and 0.
+
+`k = 1` puts the single sub-sample at `px + 0.5` — the pixel centre, bit for bit — so
+`primary_dir` is now `primary_dir_sub(.., 0, 0, 1.0)` and `Lambert` did not move.
+
+**The geometry channels are the centre ray's, under any shading.** `Depth32`,
+`SegmentationId` and `Normal` come from `es_primary_dir(vw, px)` exactly as they always did,
+and the tests assert they are bitwise what `Lambert` writes — on the CPU
+(`cpu_full_shading_reproduces_its_golden`) and on the GPU (`gpu_full_shading_matches_the_cpu`).
+This is a **deviation from the packet's wording**, which says they come from "the first
+sub-sample of each block". They cannot: at `ssaa: 2` the first sub-sample of a block sits at
+`px + 0.25`, and its depth is not the centre's. The centre ray is what makes the equality the
+packet actually demands true, and it keeps §15.3's `RS`/`PT` channel agreement (which is
+against `Pt`'s sample-0 primary hit, also a centre ray) intact for free.
+
+### 9.3 What the GPU and the CPU agree about
+
+Measured at 64×64 on the Cornell box, NVIDIA RTX 3060 (Slang 2026.8) and RTX 4090:
+
+| comparison | claim | measured |
+|---|---|---|
+| CPU `Full` `Rgb8` vs `cornell_rs_full_rgb8` | bit-identical (it generated it) | bit-identical |
+| CPU `Full` vs `Lambert`, depth/seg/normal | bit-identical | bit-identical |
+| GPU `Full` vs `Lambert`, depth/seg/normal | bit-identical | bit-identical |
+| GPU `Full` `Rgb8` vs CPU, preset | bit-identical **except at edge pixels** | 3 of 12,288 bytes, 1 of 4,096 pixels |
+| GPU `Full` `Rgb8` vs CPU, `shadows: false` | the same | 3 of 12,288 bytes, the same pixel |
+
+That last row is the one finding worth keeping. The differing pixel is (37, 49), where the
+short box's top face and its far face meet: one of its four sub-samples grazes the shared
+edge, the CPU gives the hit to the far face and the GPU to the top face, and the two faces
+have different hemisphere ambients — so a quarter of the pixel's colour changes, 5 to 9 levels
+of 255 (bluest, because `sky - ground` is largest in blue). It is a **coverage** tie, not a
+shading difference: `dot`'s summation order is not pinned across the two implementations
+(SPIR-V's `OpDot` may associate as it likes, even under `NoContraction`), and where a ray
+passes within an ULP of a triangle boundary the winner of "nearest hit, ties to the lower
+index" can differ. One sample per pixel never landed on such an edge in this scene; 2×2
+sub-samples do, at one pixel in four thousand.
+
+So `gpu_full_shading_matches_the_cpu` asserts the honest thing rather than a number that is
+true on one device: every differing pixel must be a pixel whose four sub-samples do **not**
+all hit the same triangle, must differ by at most 64 levels (255/4, the ceiling on what one
+sub-sample of four can move a channel by — a backstop; the sub-sample assertion is the
+discriminating one), and at most 0.1% of pixels may differ. A pixel whose four sub-samples
+agree on the triangle and still differs is a shading divergence and fails the test.
+
+The alternative — pinning `dot` by writing out `a.x*b.x + a.y*b.y + a.z*b.z` in
+`es_intersect` — would change the arithmetic of the *default* path's kernel, which this packet
+forbids. It is worth doing on its own, with the goldens re-verified afterwards.
+
+### 9.4 The parameter layout
+
+The shading block was appended **after** M4's globals, so no existing slot moved:
+
+| slot | meaning |
+|---|---|
+| 0..20 | M4's globals: triangle count, atlas shape, light, ambient, sky, seed, spp, bounces, light count, BVH base/nodes/prim-base |
+| 20 | shading: `0` = `Lambert`, `1` = `Full` |
+| 21 | shadows, `0`/`1` |
+| 22, 23 | specular, shininess |
+| 24..27, 27..30 | `sky_rgb`, `ground_rgb` |
+| 30 | `ssaa` |
+| 31.. | the per-view records, 16 floats each (`ES_PARAM_VIEW_BASE`) |
+
+`PARAM_VIEW_BASE` moved from 20 to 31 in `renderer.rs` and `common.slang` together; it is one
+constant on each side and every kernel reads views through `es_view(v)`. `Lambert` writes the
+flag and leaves 21..31 zero. `u32` values ride in the buffer as `f32::from_bits`, the same way
+the triangle count always has.
+
+### 9.5 Why the observation path did not get the knob
+
+`EnvRendererCfg` has no `shading` field and `es_env::render::config` does not set one: an
+observation renders `Lambert` and only `Lambert`. §28.10 rule 1 is why — the pixels a
+committed document describes belong to that document, and a flag that lets a caller re-render
+them differently is a flag that lets a caller silently invalidate a checkpoint. Offering the
+look on the observation path means moving `observation_hash`, re-collecting the dataset and
+retraining; that is a hash-aware packet with the owner's decision behind it, not a field.
+
+`es video showcase --look full` is exactly the case where none of that applies: the showcase
+camera is in no scene and in no IR, and its frames are watched by people, not by policies.
+
+### 9.6 Cost
+
+`Shading::Full` at `ssaa: 2` is 4 primary rays and up to 4 shadow rays per pixel where
+`Lambert` casts one primary ray — 8× the traversal work per shaded pixel, before the extra
+`exp`/`ln` of the highlight. Measured on the SO-101 demo cell (V19b `nominal-00`, 224 ticks,
+1280×720, RTX 4090, `es video showcase`), with the readback of §8.4 still in every frame:
+
+| look | ms/frame, interleaved runs of 224 frames |
+|---|---|
+| `lambert` | 6.7, 6.6 |
+| `full` (`ssaa: 2`, shadows on) | 10.1, 9.9, 9.9 |
+
+**+3.1 ms/frame, about +46%**, for 8× the rays — because the frame is not ray-bound. This is
+the whole-command wall clock divided by the frames (tessellate, upload, dispatch, readback,
+write to disk), on a card that had no other compute process on it (`nvidia-smi`: no compute
+apps, P8, 0%). Section 8.4 is why the multiplier is so much smaller than the ray count: most
+of a 1280×720 frame is the readback and the file write, and R1b's host-cached staging buffer
+is what brought this camera from §8.3's 118.6 ms to the 6–7 ms the `lambert` row measures
+(§8.4's R1b run recorded 6.2 on the same cell). The `Rs` scan itself was about 1 ms
+of it, and `Full` at `ssaa: 2` makes that about 4.
+
+At 96×96 — the observation size — none of this applies: the observation path renders
+`Lambert` and only `Lambert` (§9.5), so its cost did not move by a nanosecond.
+
+These are the amended mix's numbers; it costs nothing to conserve energy (one subtract and
+one multiply replace one add), and the frame `show-full/000120.bin` has **no** saturated
+pixel where the additive form left the whole table at 255.

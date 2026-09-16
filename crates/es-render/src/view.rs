@@ -168,6 +168,57 @@ pub enum RenderPath {
     // the same atlas. `es-splat` owns the asset side today.
 }
 
+/// How the [`RenderPath::Rs`] path shades a hit (packet M7/R2).
+///
+/// [`Shading::Lambert`] is the default and is what every golden in `tests/golden/render/` and
+/// every committed observation document pins, bit for bit: spec 28.10 rule 1 says a renderer
+/// improvement arrives as a field whose default is today's output. [`Shading::Full`] is the
+/// opt-in look — one shadow ray, a hemisphere ambient, a Blinn-Phong highlight and
+/// supersampling — and is read by the `Rs` path only; the `Pt` path models all of it properly
+/// and ignores this field.
+#[derive(Clone, Copy, Debug, PartialEq, Default)]
+pub enum Shading {
+    /// Flat Lambert + constant [`RenderConfig::ambient`], one sample per pixel.
+    #[default]
+    Lambert,
+    /// See `docs/design/renderer.md` section 9 for the equations and the accumulation order.
+    Full {
+        /// One shadow ray towards `light_dir` per shaded sub-sample (any-hit, R1's traversal).
+        shadows: bool,
+        /// Blinn-Phong specular weight in `[0, 1]`; `0.0` disables the highlight.
+        specular: f32,
+        /// Blinn-Phong exponent.
+        shininess: f32,
+        /// Hemisphere ambient: `sky_rgb` at `n.z = +1`, `ground_rgb` at `n.z = -1`, lerped on
+        /// `(n.z + 1) / 2`. Replaces the constant [`RenderConfig::ambient`].
+        sky_rgb: [f32; 3],
+        ground_rgb: [f32; 3],
+        /// Sub-samples per axis (`1` = off). Colour is the box filter of the `ssaa * ssaa`
+        /// sub-samples; the geometry channels stay the centre ray's, so they do not move.
+        ssaa: u32,
+    },
+}
+
+impl Shading {
+    /// The preset [`RenderConfig::rs_full`] and `es video showcase --look full` use.
+    pub const FULL: Self = Self::Full {
+        shadows: true,
+        specular: 0.25,
+        shininess: 32.0,
+        sky_rgb: [0.55, 0.65, 0.85],
+        ground_rgb: [0.25, 0.22, 0.20],
+        ssaa: 2,
+    };
+
+    /// Sub-samples per axis, at least 1.
+    pub(crate) fn ssaa(self) -> u32 {
+        match self {
+            Self::Lambert => 1,
+            Self::Full { ssaa, .. } => ssaa.max(1),
+        }
+    }
+}
+
 /// Tile packing, spec 15.2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TileAtlasCfg {
@@ -202,7 +253,11 @@ pub struct RenderConfig {
     /// World-space unit direction **towards** the one directional light.
     pub light_dir: Vec3,
     /// Ambient floor in `[0, 1]`, so a surface facing away from the light is not pure black.
+    /// [`Shading::Full`] replaces it with a hemisphere ambient.
     pub ambient: f32,
+    /// How the `Rs` path shades. The default is today's look, byte for byte (spec 28.10
+    /// rule 1).
+    pub shading: Shading,
     /// Linear radiance a ray that hits nothing returns (path tracer), in `[0, inf)`.
     pub sky: [f32; 3],
     /// Seed of the counter-based RNG (spec 3.4: addressed, never global).
@@ -220,9 +275,19 @@ impl RenderConfig {
             path: RenderPath::Rs,
             light_dir: Vec3::new(0.3, 0.4, 0.866_025_4).normalize(),
             ambient: 0.15,
+            shading: Shading::Lambert,
             sky: [0.0, 0.0, 0.0],
             seed: 0x5eed_1234,
             svgf_iterations: 4,
+        }
+    }
+
+    /// [`Self::rs`] with the opt-in [`Shading::FULL`] look (packet M7/R2). Nothing else moves:
+    /// same channels, same light, same atlas.
+    pub fn rs_full(atlas: TileAtlasCfg) -> Self {
+        Self {
+            shading: Shading::FULL,
+            ..Self::rs(atlas)
         }
     }
 

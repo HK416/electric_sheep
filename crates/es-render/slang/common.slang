@@ -23,7 +23,12 @@ static const float ES_INV_GAMMA = 0.41666666;
 
 static const uint ES_TRI_STRIDE = 20;
 static const uint ES_VIEW_STRIDE = 16;
-static const uint ES_PARAM_VIEW_BASE = 20;
+// Slots 0..20 are M4's globals, 20..31 packet M7/R2's shading block, then the per-view
+// records. Mirrors `renderer.rs`'s PARAM_VIEW_BASE.
+static const uint ES_PARAM_VIEW_BASE = 31;
+// How far a Full shadow ray looks: the light is directional, so the occluder may be outside
+// the camera's far plane. Mirrors `cpu::SHADOW_FAR`.
+static const float ES_SHADOW_FAR = 1e30;
 
 [[vk::binding(0, 0)]] StructuredBuffer<float> es_params;
 [[vk::binding(1, 0)]] StructuredBuffer<float> es_tris;
@@ -47,6 +52,14 @@ uint es_n_lights()     { return es_param_u(16); }
 uint es_bvh_base()      { return es_param_u(17); }
 uint es_bvh_nodes()     { return es_param_u(18); }
 uint es_bvh_prim_base() { return es_param_u(19); }
+// The Rs shading block (packet M7/R2): 0 = Lambert (the default look), 1 = Full.
+uint es_shading()       { return es_param_u(20); }
+bool es_shadows()       { return es_param_u(21) != 0; }
+float es_specular()     { return es_params[22]; }
+float es_shininess()    { return es_params[23]; }
+float3 es_sky_rgb()     { return float3(es_params[24], es_params[25], es_params[26]); }
+float3 es_ground_rgb()  { return float3(es_params[27], es_params[28], es_params[29]); }
+uint es_ssaa()          { return max(es_param_u(30), 1u); }
 uint es_atlas_w()      { return es_tiles_per_row() * es_tile_w(); }
 uint es_atlas_h()      { return es_rows() * es_tile_h(); }
 
@@ -281,13 +294,20 @@ float3 es_face_forward(float3 n, float3 d) {
     return dot(n, d) > 0.0 ? -n : n;
 }
 
-// Camera-space primary ray, NOT normalised: z == 1, so the ray parameter is the camera-space
-// depth in metres and Depth32's unit_m is 1 (spec 3.1, spec 7.2).
-float3 es_primary_dir(EsView vw, uint2 px) {
-    float3 d_cam = float3((float(px.x) + 0.5 - vw.cx) / vw.fx,
-                          (float(px.y) + 0.5 - vw.cy) / vw.fy,
+// Camera-space primary ray through sub-sample (sx, sy) of an ssaa x ssaa grid, inv_ssaa being
+// 1 / ssaa. NOT normalised: z == 1, so the ray parameter is the camera-space depth in metres
+// and Depth32's unit_m is 1 (spec 3.1, spec 7.2). The sample sits at px + (sx + 0.5) / ssaa,
+// so one sub-sample is the pixel centre, bit for bit.
+float3 es_primary_dir_sub(EsView vw, uint2 px, uint sx, uint sy, float inv_ssaa) {
+    float3 d_cam = float3((float(px.x) + (float(sx) + 0.5) * inv_ssaa - vw.cx) / vw.fx,
+                          (float(px.y) + (float(sy) + 0.5) * inv_ssaa - vw.cy) / vw.fy,
                           1.0);
     return es_qrot(vw.quat, d_cam);
+}
+
+// Through the pixel centre.
+float3 es_primary_dir(EsView vw, uint2 px) {
+    return es_primary_dir_sub(vw, px, 0, 0, 1.0);
 }
 
 // Flat + Lambert, one directional light, no shadow ray (the Pt path models occlusion).
@@ -316,6 +336,29 @@ uint es_pack_rgba8(float3 lin) {
 float3 es_normalize(float3 a) {
     float n = es_sqrt(dot(a, a));
     return n > 0.0 ? a * (1.0 / n) : float3(0.0, 0.0, 0.0);
+}
+
+// Shading::Full (packet M7/R2): one shadow ray, a hemisphere ambient, a Blinn-Phong
+// highlight. Line-for-line mirror of `cpu::shade_full`; the order below is the order there.
+// `n` is the world-space face-forwarded normal, `p` the hit point, `d` the (not normalised)
+// view ray. pow is exp(ln(x) * k), guarded at x <= 0 — never GLSL.std.450 (spec 3.2 DET-010).
+float3 es_shade_full(EsTri tr, float3 n, float3 p, float3 d) {
+    float3 light = es_light_dir();
+    float vis = 1.0;
+    if (es_shadows() && es_any_hit(p + n * ES_RAY_EPS, light, 0.0, ES_SHADOW_FAR)) { vis = 0.0; }
+    float diffuse = max(dot(n, light), 0.0) * vis;
+    float3 h = es_normalize(light - d);
+    float ndh = max(dot(n, h), 0.0);
+    float spec = ndh > 0.0 ? es_specular() * es_exp(es_ln(ndh) * es_shininess()) * vis : 0.0;
+    // Written out rather than `lerp`: HLSL's lerp and GLSL's mix are not the same expression,
+    // and the two texts have to round the same way.
+    float t = (n.z + 1.0) * 0.5;
+    float3 hemi = es_ground_rgb() + (es_sky_rgb() - es_ground_rgb()) * t;
+    // Energy-conserving, the same mix es_shade_lambert uses for its constant ambient (amended
+    // at review): hemi + diffuse * (1 - hemi) per channel, so a fully lit surface returns its
+    // albedo and a shadowed one albedo * hemi. spec stays additive.
+    float3 lit = hemi + diffuse * (1.0 - hemi);
+    return tr.albedo * lit + spec + tr.emission;
 }
 
 float es_luminance(float3 c) {

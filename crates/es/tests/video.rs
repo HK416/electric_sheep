@@ -718,3 +718,71 @@ fn encode_produces_a_playable_file() {
     assert_eq!(got["height"], printed["height"]);
     println!("RAN encode_video");
 }
+
+// --- es video showcase (packet M7/R2) ---------------------------------------------------------
+
+/// The `--look` flag is parsed, `lambert` and `full` are the only two values, and the default
+/// is `lambert` — so a re-render of a committed run still reproduces its recorded frames.
+///
+/// Parsing only: a real render needs a Vulkan device and a run directory. A build without the
+/// `render` feature links no renderer at all and says so on stderr, which is what this test
+/// then reports instead of pretending to have run.
+#[test]
+fn showcase_look_flag_is_parsed() {
+    let out = scratch_dir("showcase-look");
+    let base = |look: Option<&str>| {
+        let mut cmd = bin();
+        cmd.args(["video", "showcase"])
+            .args(["--run", out.join("no-such-run").to_str().unwrap()])
+            .args(["--scene", "tests/fixtures/mjcf/so101_pick_place.xml"])
+            .args(["--out", out.join("frames").to_str().unwrap()])
+            .args(["--eye", "0.66,-0.46,0.52"])
+            .args(["--look-at", "0.14,-0.04,0.04"]);
+        if let Some(look) = look {
+            cmd.args(["--look", look]);
+        }
+        cmd.current_dir(workspace_root())
+            .output()
+            .expect("run es video showcase")
+    };
+
+    let help = bin()
+        .args(["video", "showcase", "--help"])
+        .output()
+        .expect("run --help");
+    if stderr(&help).contains("needs the `render` feature") {
+        println!("SKIP showcase_look_flag_is_parsed: built without the `render` feature");
+        return;
+    }
+    assert!(
+        stdout(&help).contains("--look lambert|full"),
+        "the help text does not document --look:\n{}",
+        stdout(&help)
+    );
+
+    let bad = base(Some("cinematic"));
+    assert_eq!(bad.status.code(), Some(2), "--look cinematic must be usage");
+    assert!(
+        stderr(&bad).contains("--look: expected lambert or full"),
+        "{}",
+        stderr(&bad)
+    );
+
+    // Accepted: parsing gets past `--look` and the command fails later, on the run directory
+    // that is not there or on the missing Vulkan device — a runtime error, not a usage one.
+    for look in [None, Some("lambert"), Some("full")] {
+        let got = base(look);
+        assert_eq!(
+            got.status.code(),
+            Some(1),
+            "--look {look:?} should parse and then fail on the missing run: {}",
+            stderr(&got)
+        );
+        assert!(
+            !stderr(&got).contains("--look:"),
+            "--look {look:?} was rejected: {}",
+            stderr(&got)
+        );
+    }
+    println!("RAN showcase_look_flag_is_parsed: lambert (default), full, and a rejected value");
+}

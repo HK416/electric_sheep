@@ -23,12 +23,16 @@ use crate::atlas::{Tile, TileData};
 use crate::bvh::{self, Bvh};
 use crate::rng;
 use crate::scene::{Tri, TriScene};
-use crate::view::{CameraView, RenderConfig, RenderPath, ViewParams};
+use crate::view::{CameraView, RenderConfig, RenderPath, Shading, ViewParams};
 
 /// Below this determinant a triangle is edge-on to the ray and is skipped.
 const DET_EPS: f32 = 1e-8;
 /// Secondary rays start this far along the normal, to not re-hit the surface they left.
 const RAY_EPS: f32 = 1e-4;
+/// How far a [`Shading::Full`] shadow ray looks. The light is *directional* — infinitely far —
+/// so the occluder may sit outside the camera's far plane, and the camera's `far` is the wrong
+/// bound. Large and finite, because `rcp_safe` keeps the slab test's products finite.
+const SHADOW_FAR: f32 = 1e30;
 /// Direct-light candidates per pixel in the `ReSTIR` initial pass.
 const RESTIR_CANDIDATES: u32 = 8;
 /// `M` clamp on temporal reuse.
@@ -277,7 +281,7 @@ fn slab(node: &bvh::Node, o: [f32; 3], inv: [f32; 3], near: f32, far: f32) -> bo
 }
 
 /// Normal of the hit triangle, flipped to face the incoming ray.
-fn face_forward(tri: &Tri, d: [f32; 3]) -> [f32; 3] {
+pub fn face_forward(tri: &Tri, d: [f32; 3]) -> [f32; 3] {
     if dot(tri.n, d) > 0.0 {
         scale(tri.n, -1.0)
     } else {
@@ -287,10 +291,27 @@ fn face_forward(tri: &Tri, d: [f32; 3]) -> [f32; 3] {
 
 /// Camera-space primary ray direction, **not** normalised: `z == 1`, so the ray parameter is
 /// the camera-space depth in metres and `Depth32`'s `unit_m` is 1 (spec 3.1, spec 7.2).
+///
+/// Through the pixel centre: [`primary_dir_sub`] with one sub-sample puts the offset at
+/// exactly `0.5`, so this is the same float it always was.
 pub fn primary_dir(vp: &ViewParams, px: u32, py: u32) -> [f32; 3] {
+    primary_dir_sub(vp, px, py, 0, 0, 1.0)
+}
+
+/// [`primary_dir`] through sub-sample `(sx, sy)` of an `ssaa * ssaa` grid, `inv_ssaa` being
+/// `1 / ssaa` (packet M7/R2). The sample sits at `px + (sx + 0.5) / ssaa`, so a single
+/// sub-sample is the pixel centre and the geometry channels do not move.
+pub fn primary_dir_sub(
+    vp: &ViewParams,
+    px: u32,
+    py: u32,
+    sx: u32,
+    sy: u32,
+    inv_ssaa: f32,
+) -> [f32; 3] {
     let d_cam = [
-        (px as f32 + 0.5 - vp.cx) / vp.fx,
-        (py as f32 + 0.5 - vp.cy) / vp.fy,
+        (px as f32 + (sx as f32 + 0.5) * inv_ssaa - vp.cx) / vp.fx,
+        (py as f32 + (sy as f32 + 0.5) * inv_ssaa - vp.cy) / vp.fy,
         1.0,
     ];
     quat_rotate(vp.quat, d_cam)
@@ -314,6 +335,74 @@ fn shade_lambert(tri: &Tri, n: [f32; 3], cfg: &RenderConfig) -> [f32; 3] {
     add(scale(tri.albedo, lambert), tri.emission)
 }
 
+/// [`Shading::Full`]: one shadow ray, a hemisphere ambient, a Blinn-Phong highlight (packet
+/// M7/R2). `es_shade_full` in `common.slang` is the line-for-line mirror; the order below is
+/// the order there.
+///
+/// `n` is the world-space normal already face-forwarded, `p` the hit point, `d` the (not
+/// normalised) view ray. The shadow ray runs on `(0, SHADOW_FAR)` from `p + n * RAY_EPS`
+/// towards the light, so the surface cannot shadow itself. `pow` is `exp(ln(x) * k)` guarded at
+/// `x <= 0` — no `std`, no `GLSL.std.450` (spec 3.2 `DET-010`).
+///
+/// A [`Shading::Lambert`] config never reaches here; it is answered as itself so this is a
+/// total function on `cfg`.
+pub fn shade_full(
+    tris: &[Tri],
+    bvh: &Bvh,
+    tri: &Tri,
+    n: [f32; 3],
+    p: [f32; 3],
+    d: [f32; 3],
+    cfg: &RenderConfig,
+) -> [f32; 3] {
+    let Shading::Full {
+        shadows,
+        specular,
+        shininess,
+        sky_rgb,
+        ground_rgb,
+        ..
+    } = cfg.shading
+    else {
+        return shade_lambert(tri, n, cfg);
+    };
+    let light = [
+        cfg.light_dir.x as f32,
+        cfg.light_dir.y as f32,
+        cfg.light_dir.z as f32,
+    ];
+    let vis = if shadows && any_hit(tris, bvh, add(p, scale(n, RAY_EPS)), light, 0.0, SHADOW_FAR) {
+        0.0
+    } else {
+        1.0
+    };
+    let diffuse = dot(n, light).max(0.0) * vis;
+    let h = normalize(sub(light, d));
+    let ndh = dot(n, h).max(0.0);
+    let spec = if ndh > 0.0 {
+        specular * approx::exp(approx::ln(ndh) * shininess) * vis
+    } else {
+        0.0
+    };
+    // Written out rather than a `lerp`: HLSL's `lerp` and GLSL's `mix` are not the same
+    // expression, and the two texts have to round the same way.
+    // Not `f32::midpoint`: `common.slang` computes `(n.z + 1.0) * 0.5` and the two texts have
+    // to be the same two operations, not two functions that usually agree.
+    #[allow(clippy::manual_midpoint)]
+    let t = (n[2] + 1.0) * 0.5;
+    let hemi = add(ground_rgb, scale(sub(sky_rgb, ground_rgb), t));
+    // Energy-conserving, the same mix `shade_lambert` uses for its constant ambient (amended
+    // at review): `hemi + diffuse * (1 - hemi)` per channel, so a fully lit surface returns
+    // its albedo and a shadowed one `albedo * hemi`, and nothing clips to white before the
+    // sRGB transfer. `spec` stays additive: a highlight is allowed to blow out.
+    let lit = [
+        hemi[0] + diffuse * (1.0 - hemi[0]),
+        hemi[1] + diffuse * (1.0 - hemi[1]),
+        hemi[2] + diffuse * (1.0 - hemi[2]),
+    ];
+    add(add(mul(tri.albedo, lit), [spec; 3]), tri.emission)
+}
+
 /// Exact piecewise sRGB transfer (spec 3.1). `c^(1/2.4)` goes through `es_math::approx`, not
 /// `std`, so the CPU and the GPU agree bit for bit (spec 3.2 `DET-010`, spec 28.7 gate 3).
 pub fn srgb_encode(c: f32) -> f32 {
@@ -325,7 +414,7 @@ pub fn srgb_encode(c: f32) -> f32 {
     }
 }
 
-fn to_u8(c: f32) -> u8 {
+pub fn to_u8(c: f32) -> u8 {
     (255.0 * srgb_encode(c) + 0.5).floor().clamp(0.0, 255.0) as u8
 }
 
@@ -432,17 +521,59 @@ pub fn rasterize(
     let g = g_buffer(scene, &bvh, &vp, w, h);
 
     let mut rgb = vec![0u8; (w as usize) * (h as usize) * 3];
-    for py in 0..h {
-        for px in 0..w {
-            let i = (py * w + px) as usize;
-            if g.tri[i] == 0 {
-                continue;
+    match cfg.shading {
+        // Untouched since M4: the hit is the g-buffer's, one sample per pixel, and every
+        // golden pins the result (spec 28.10 rule 1).
+        Shading::Lambert => {
+            for py in 0..h {
+                for px in 0..w {
+                    let i = (py * w + px) as usize;
+                    if g.tri[i] == 0 {
+                        continue;
+                    }
+                    let d = primary_dir(&vp, px, py);
+                    let tri = &scene.tris[(g.tri[i] - 1) as usize];
+                    let lin = shade_lambert(tri, face_forward(tri, d), cfg);
+                    for c in 0..3 {
+                        rgb[i * 3 + c] = to_u8(lin[c]);
+                    }
+                }
             }
-            let d = primary_dir(&vp, px, py);
-            let tri = &scene.tris[(g.tri[i] - 1) as usize];
-            let lin = shade_lambert(tri, face_forward(tri, d), cfg);
-            for c in 0..3 {
-                rgb[i * 3 + c] = to_u8(lin[c]);
+        }
+        // The `Full` look traces its own rays: a sub-sample that the centre ray missed can
+        // still cover geometry, so the loop is over every pixel and not over the g-buffer.
+        // The `ssaa * ssaa` block is summed in **row-major order** (`sy` outer, `sx` inner,
+        // one sequential `+=`), then multiplied once by `1 / (ssaa * ssaa)` and only then
+        // encoded — the same order in `raster.slang` (spec 3.4: a fixed accumulation order).
+        // A sub-sample that hits nothing contributes linear zero, which is the background
+        // `Lambert` leaves too.
+        Shading::Full { .. } => {
+            let ssaa = cfg.shading.ssaa();
+            let inv_ssaa = 1.0 / ssaa as f32;
+            let norm = 1.0 / (ssaa * ssaa) as f32;
+            for py in 0..h {
+                for px in 0..w {
+                    let i = (py * w + px) as usize;
+                    let mut acc = [0.0f32; 3];
+                    for sy in 0..ssaa {
+                        for sx in 0..ssaa {
+                            let d = primary_dir_sub(&vp, px, py, sx, sy, inv_ssaa);
+                            let Some(hit) =
+                                nearest_hit(&scene.tris, &bvh, vp.pos, d, vp.near, vp.far)
+                            else {
+                                continue;
+                            };
+                            let tri = &scene.tris[hit.tri as usize];
+                            let n = face_forward(tri, d);
+                            let p = add(vp.pos, scale(d, hit.t));
+                            acc = add(acc, shade_full(&scene.tris, &bvh, tri, n, p, d, cfg));
+                        }
+                    }
+                    let lin = scale(acc, norm);
+                    for c in 0..3 {
+                        rgb[i * 3 + c] = to_u8(lin[c]);
+                    }
+                }
             }
         }
     }

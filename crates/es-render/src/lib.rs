@@ -50,7 +50,7 @@ pub use error::RenderError;
 pub use renderer::{Atlas, Renderer};
 pub use scene::{SceneCache, Tri, TriScene};
 pub use view::{
-    CameraView, ImageSpec, Intrinsics, RenderConfig, RenderPath, TileAtlasCfg, ViewParams,
+    CameraView, ImageSpec, Intrinsics, RenderConfig, RenderPath, Shading, TileAtlasCfg, ViewParams,
 };
 
 /// Re-exported so naming a channel does not oblige a caller to depend on `es-sensor` as well
