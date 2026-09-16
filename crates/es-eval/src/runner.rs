@@ -489,8 +489,7 @@ impl Evaluation {
             // episodes for the same reason the buffer does, and `AsyncInference::drop_env`
             // clears it at each boundary -- the collector's `DomainRunner::reset_env` makes
             // the identical call.
-            let mut inference =
-                AsyncInference::new(latency, domains.inference.batch);
+            let mut inference = AsyncInference::new(latency, domains.inference.batch);
             for (idx, seed) in seeds.iter().enumerate() {
                 // One cell of the mosaic is one episode of one suite: `single_env()` makes
                 // them independent runs, so the grid is `suites x episodes` directories.

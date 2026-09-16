@@ -1389,12 +1389,19 @@ fn tick_zero_is_a_chunk_underrun_under_a_declared_latency() {
         )
         .expect("the fixture evaluates under a declared latency");
 
-        assert_eq!(sink.events.len(), N_EPISODES as usize, "one cell per episode");
+        assert_eq!(
+            sink.events.len(),
+            N_EPISODES as usize,
+            "one cell per episode"
+        );
         for (name, records) in &sink.events {
             // Frame 0 of the cell, which is step 0 of the episode. Not `tick == 0`: the cell's
             // `Env` is not rebuilt between episodes, so its `PhysTick` keeps counting.
             let first = records.first().expect("every cell rendered frame 0");
-            assert_eq!(first.frame, 0, "{name}: the first record is the first frame");
+            assert_eq!(
+                first.frame, 0,
+                "{name}: the first record is the first frame"
+            );
             assert_eq!(
                 first.events & UNDERRUN != 0,
                 under,

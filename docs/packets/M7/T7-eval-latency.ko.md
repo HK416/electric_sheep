@@ -55,6 +55,7 @@ crates/es-env/src/domains.rs
 crates/es-env/src/inference.rs
 crates/es-env/src/lib.rs
 crates/es-env/tests/*.rs
+crates/es/src/cmd/eval.rs
 crates/es/tests/cli.rs
 docs/design/evaluation-execution.md
 docs/design/evaluation-execution.ko.md
@@ -70,6 +71,13 @@ docs/packets/M7/T7-eval-latency.ko.md
 단언하는 기존 테스트들이 갱신되고 노트에 이름이 적힌다), `crates/es-eval/tests/*.rs`,
 `docs/design/evaluation-execution*.md`, `docs/design/visible-learning*.md`(열린 질문 24, 새
 절), `docs/packets/M7/T7-eval-latency*.md`.
+
+`crates/es/src/cmd/eval.rs`는 패킷 진행 중 블록에 추가되었다(한 줄, 리포트에 명시):
+`Evaluation::run`은 자신이 심판하는 네 IR만 받을 뿐 `LearningGraph`는 **결코** 받지 않으므로
+(`crates/es-eval/src/runner.rs`의 `hash_chain`: "`run` is not given the `LearningGraph`"),
+계약의 `expected_latency_ms`가 `es-eval`로 들어갈 경로는 번들을 연 호출자뿐이다. 그 한 줄이
+없으면 `es eval run`은 계속 지연 0으로 평가하고 아래의 재측정은 아무것도 측정하지 못한다.
+`crates/es/src/**`의 다른 것은 건드리지 않는다.
 
 ## oracle
 
