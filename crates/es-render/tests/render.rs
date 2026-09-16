@@ -490,9 +490,9 @@ fn bvh_traversal_is_the_flat_scan() {
             }
         }
         let mid = [
-            (lo[0] + hi[0]) * 0.5,
-            (lo[1] + hi[1]) * 0.5,
-            (lo[2] + hi[2]) * 0.5,
+            f32::midpoint(lo[0], hi[0]),
+            f32::midpoint(lo[1], hi[1]),
+            f32::midpoint(lo[2], hi[2]),
         ];
         let radius = (0..3).fold(0.0f32, |m, k| m.max(hi[k] - lo[k])) + 1.0;
 
@@ -500,13 +500,13 @@ fn bvh_traversal_is_the_flat_scan() {
         let (mut hits, mut shadows) = (0u32, 0u32);
         for r in 0..10_000u32 {
             let key = rng::key(0x5eed, 0, r, r ^ 0x9e37, 0, 0, 0);
-            let u = rng::uniform(key, 0) * 2.0 - 1.0;
+            let cos_theta = rng::uniform(key, 0) * 2.0 - 1.0;
             let phi = rng::uniform(key, 1) * std::f32::consts::TAU;
-            let s = (1.0 - u * u).max(0.0).sqrt();
-            let o = [
-                mid[0] + radius * s * phi.cos(),
-                mid[1] + radius * s * phi.sin(),
-                mid[2] + radius * u,
+            let sin_theta = (1.0 - cos_theta * cos_theta).max(0.0).sqrt();
+            let origin = [
+                mid[0] + radius * sin_theta * phi.cos(),
+                mid[1] + radius * sin_theta * phi.sin(),
+                mid[2] + radius * cos_theta,
             ];
             // Aim back through a point inside the scene box, so most rays actually hit.
             let aim = [
@@ -514,27 +514,27 @@ fn bvh_traversal_is_the_flat_scan() {
                 lo[1] + (hi[1] - lo[1]) * rng::uniform(key, 3),
                 lo[2] + (hi[2] - lo[2]) * rng::uniform(key, 4),
             ];
-            let d = [aim[0] - o[0], aim[1] - o[1], aim[2] - o[2]];
+            let dir = [aim[0] - origin[0], aim[1] - origin[1], aim[2] - origin[2]];
             let (near, far) = (0.01f32, 1e3f32);
 
-            let got = cpu::nearest_hit(&tri.tris, &bvh, o, d, near, far);
-            let want = cpu::nearest_hit_flat(&tri.tris, o, d, near, far);
+            let got = cpu::nearest_hit(&tri.tris, &bvh, origin, dir, near, far);
+            let want = cpu::nearest_hit_flat(&tri.tris, origin, dir, near, far);
             match (got, want) {
-                (Some(a), Some(b)) => {
+                (Some(tree), Some(scan)) => {
                     assert_eq!(
-                        (a.t.to_bits(), a.tri),
-                        (b.t.to_bits(), b.tri),
-                        "{name} ray {r}: BVH {a:?} vs flat scan {b:?}"
+                        (tree.t.to_bits(), tree.tri),
+                        (scan.t.to_bits(), scan.tri),
+                        "{name} ray {r}: BVH {tree:?} vs flat scan {scan:?}"
                     );
                     hits += 1;
                 }
                 (None, None) => {}
-                (a, b) => panic!("{name} ray {r}: BVH {a:?} vs flat scan {b:?}"),
+                (tree, scan) => panic!("{name} ray {r}: BVH {tree:?} vs flat scan {scan:?}"),
             }
-            let got_any = cpu::any_hit(&tri.tris, &bvh, o, d, near, far);
+            let got_any = cpu::any_hit(&tri.tris, &bvh, origin, dir, near, far);
             assert_eq!(
                 got_any,
-                cpu::any_hit_flat(&tri.tris, o, d, near, far),
+                cpu::any_hit_flat(&tri.tris, origin, dir, near, far),
                 "{name} ray {r}: any-hit disagrees"
             );
             shadows += u32::from(got_any);
@@ -578,12 +578,17 @@ fn showcase_camera(width: u32, height: u32) -> CameraView {
     use es_math::{Pose, Quat, Vec3};
     let eye = Vec3::new(0.66, -0.46, 0.52);
     let target = Vec3::new(0.14, -0.04, 0.04);
-    let forward = (target - eye).normalize();
-    let x = forward.cross(Vec3::new(0.0, 0.0, 1.0)).normalize();
-    let y = forward.cross(x);
-    let z = forward;
-    let s = (x.x + y.y + z.z + 1.0).sqrt() * 2.0;
-    let quat = Quat::from_xyzw((y.z - z.y) / s, (z.x - x.z) / s, (x.y - y.x) / s, 0.25 * s);
+    let fwd = (target - eye).normalize();
+    let right = fwd.cross(Vec3::new(0.0, 0.0, 1.0)).normalize();
+    let down = fwd.cross(right);
+    // Shepperd's positive-trace branch; the showcase camera never looks along world up.
+    let den = (right.x + down.y + fwd.z + 1.0).sqrt() * 2.0;
+    let quat = Quat::from_xyzw(
+        (down.z - fwd.y) / den,
+        (fwd.x - right.z) / den,
+        (right.y - down.x) / den,
+        0.25 * den,
+    );
     CameraView {
         pose: Pose::new(eye, quat),
         spec: es_render::ImageSpec::pinhole(width, height, 36f64.to_radians()),

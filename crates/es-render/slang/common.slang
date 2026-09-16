@@ -174,7 +174,7 @@ static const uint ES_BVH_STACK = 64;
 static const uint ES_BVH_NODE_STRIDE = 8;
 // Ize 2013's robust slab factors, 1 -/+ 2^-22. See `crate::bvh::LO`.
 static const float ES_BVH_LO = 0.99999976;
-static const float ES_BVH_HI = 1.00000024;
+static const float ES_BVH_HI = 1.0000002;
 
 struct EsNode {
     float3 lo;

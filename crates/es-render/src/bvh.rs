@@ -44,7 +44,7 @@ const PAD: f32 = 1e-4;
 /// that enters it. Mirrored by `ES_BVH_LO` / `ES_BVH_HI` in `common.slang`.
 pub const LO: f32 = 0.999_999_76;
 /// See [`LO`].
-pub const HI: f32 = 1.000_000_24;
+pub const HI: f32 = 1.000_000_2;
 
 /// One node. A leaf has `count > 0` and `a` is its first slot in [`Bvh::prim`]; an inner node
 /// has `count == 0`, its left child at `self_index + 1` and its right child at `a`.
@@ -90,9 +90,9 @@ impl Bvh {
             .iter()
             .map(|(lo, hi)| {
                 [
-                    (lo[0] + hi[0]) * 0.5,
-                    (lo[1] + hi[1]) * 0.5,
-                    (lo[2] + hi[2]) * 0.5,
+                    f32::midpoint(lo[0], hi[0]),
+                    f32::midpoint(lo[1], hi[1]),
+                    f32::midpoint(lo[2], hi[2]),
                 ]
             })
             .collect();
@@ -258,11 +258,8 @@ mod tests {
         for n in bvh.nodes.iter().filter(|n| n.count > 0) {
             for k in 0..n.count as usize {
                 for v in &scene.tris[bvh.prim[n.a as usize + k] as usize].v {
-                    for c in 0..3 {
-                        assert!(
-                            v[c] >= n.min[c] && v[c] <= n.max[c],
-                            "vertex outside its leaf"
-                        );
+                    for ((x, lo), hi) in v.iter().zip(&n.min).zip(&n.max) {
+                        assert!(x >= lo && x <= hi, "vertex outside its leaf");
                     }
                 }
             }

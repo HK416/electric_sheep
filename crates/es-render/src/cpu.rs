@@ -640,6 +640,7 @@ fn di_contribution(
 /// beyond the `M` clamp. Temporal reuse reads the previous frame at the *same* pixel — no
 /// motion-vector reprojection — so it is correct only for a static camera, and on the first
 /// frame the previous buffer is empty and the pass is a no-op.
+#[allow(clippy::too_many_arguments)] // one more than seven: the BVH beside the triangles
 fn restir_di(
     scene: &TriScene,
     bvh: &Bvh,
