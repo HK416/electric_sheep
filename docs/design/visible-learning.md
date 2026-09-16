@@ -3996,6 +3996,67 @@ on the same GPU gave the same report and the same `evaluation_hash` but a differ
 `execution_hash` (`745c9777…` against `c2322c2c…` when run alone). The numbers did not move; the
 provenance did. V18b did not chase it.
 
+### 7.29 As built (V19b): the external ACT on the committed documents
+
+Packet `docs/packets/M5/V19b-external-act-committed-documents.md`. V19's numbers (section 7.27) were
+taken against the deployment as it stood on that branch's base — `acceleration_max = 20` — and the
+fixture moved to 80 in the meantime (section 7.28). This is the same 60,000-step checkpoint of the
+same LeRobot ACT (`~/artifacts/plan-v/v19/train-w13/checkpoints/060000`, trained on V15's 200
+demonstrations), re-imported by the merged tree's `es policy import-lerobot` against the committed
+`deployment.toml` and evaluated with nothing else changed: `task_hash eb6efefa…`, `observation_hash
+07fad282…` (V19's merged state port), `learning_hash 17613075…`, `policy_hash 308a1f53…`,
+`deployment_hash f2f9a510…` — the hash `es ir check` prints for the fixture in the tree. No
+retraining, no code change; orchestrator's run, `~/artifacts/plan-v/v19b/run.sh`.
+
+**The acceptance, on the documents as committed** (budget 1800, `ES_PYTHON=~/venvs/es`, `--jobs 4`
+for the two nominal runs and `--jobs 6` for the sweep):
+
+| document | suite | `success_rate` | `envelope_violation_rate` | mean `episode_length` | fallback ticks |
+|---|---|---|---|---|---|
+| nominal, training seeds 1–16 | nominal | **1.0000** (16/16) | 0.232 | 230 | 0 |
+| nominal, held-out seeds 101–116 | nominal | **0.9375** (15/16) | 0.208 | 324 | 0 |
+| six-suite sweep, held-out seeds | nominal | 0.9375 | 0.185 | 323 | 0 |
+| | light_intensity | 0.9375 | 0.177 | 334 | 0 |
+| | light_direction | 0.8125 | 0.381 | 582 | 4 |
+| | observation_delay | **1.0000** | 0.285 | 262 | 0 |
+| | torque_noise | 0.3125 | 0.500 | 1379 | 0 |
+| | backlash | 0.9375 | 0.254 | 355 | 0 |
+
+`passed = true` on all three documents. The one held-out failure on the nominal suite, `nominal-04`
+(seed 105), is a grasp miss: the jaw stays open for 1,475 of 1,800 ticks and the cube never leaves the
+table. Fifteen successes end in 198–304 control ticks, four to six seconds against the scripted
+demonstration's seven.
+
+**Against V19 at `acceleration_max = 20`, same checkpoint, same seeds:** held-out 13/16 → **15/16**,
+`envelope_violation_rate` 0.969 → **0.208**, watchdog-latched ticks 592–2,134 → **0**; the sweep's
+nominal 0.75 → 0.9375, `light_intensity` 0.375 → 0.9375, `light_direction` 0.625 → 0.8125,
+`observation_delay` 0.875 → 1.0, `torque_noise` 0.1875 → 0.3125, `backlash` 0.75 → 0.9375. Nothing
+about the policy changed. This is the same movement V18 measured for the IR-graph policy: the plane
+stepping out of a command stream it had been clamping on nineteen ticks in twenty. `torque_noise`
+remains the hard suite for a policy whose 96×96 frame cannot see torque, and `light_direction` is the
+only suite where the plane still falls back at all (4 ticks in 16 episodes).
+
+**Against the IR-graph policy on the same documents** (V18b, section 7.28: nominal 0.625 held-out,
+`light_intensity` 0.625, `observation_delay` 0.0625, `torque_noise` 0.0625): the externally designed and
+externally trained learner is better on every suite, by a wide margin on the two the IR-graph policy
+could not survive. Same 200 demonstrations, same harness, same documents. That is the owner's thesis
+measured rather than argued: the learning design comes from outside, and this project's job — run it
+with the declared semantics and reproduce it to the bit — is the part that is done. Two caveats
+carry forward unchanged from section 7.27's reviewer's note: 60,000 steps was picked on the held-out
+seeds (the sweep's nominal row is the same 0.9375 here, so the selection did not inflate the count),
+and the two policies differ in chunk length (16 against 10 rows, S-9 of the M5 review).
+
+**Videos.** `es video showcase` over the held-out run through V9's camera, cells `nominal-00` (seed
+101, 224 ticks) and `nominal-11` (seed 112, 234 ticks), 1280×720 at 50 fps; `es video mosaic --grid
+4x4` over the sixteen held-out observation streams with the Safety Plane overlay. Files
+`v19b-a80-holdout-nominal-00.mp4`, `v19b-a80-holdout-nominal-11.mp4`, `v19b-a80-holdout-mosaic.mp4`
+under `~/artifacts/plan-v/v19b/` and `target/plan-v/v19b/showcase/`; the orchestrator checked sampled
+frames. These, not section 7.28's, are the demo's videos: the policy in them is not ours.
+
+**What is closed with this.** The three things M5 was cut down to (section 7.28): the thesis (bitwise,
+section 7.27), the acceptance on the committed documents (this section) and the video. The review is
+`docs/reviews/M5.md`.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:

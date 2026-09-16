@@ -3735,6 +3735,61 @@ Evaluation IR **전체** — 픽스처가 선언한 여섯 스위트, 홀드아�
 `evaluation_hash`는 같은데 `execution_hash`만 달랐다(`745c9777…` 대 단독 실행의 `c2322c2c…`). 숫자는
 움직이지 않았고 출처만 움직였다. V18b는 추적하지 않았다.
 
+### 7.29 만든 대로 (V19b): 커밋된 문서 위의 외부 ACT
+
+패킷 `docs/packets/M5/V19b-external-act-committed-documents.md`. V19의 숫자(7.27절)는 그 브랜치의
+기준 시점 배포 — `acceleration_max = 20` — 로 잰 것이고 그사이 픽스처는 80으로 옮겨졌다(7.28절). 이것은
+같은 LeRobot ACT의 같은 60,000 step 체크포인트(`~/artifacts/plan-v/v19/train-w13/checkpoints/060000`,
+V15의 시연 200편으로 학습)를 머지된 트리의 `es policy import-lerobot`으로 커밋된 `deployment.toml`에
+대해 다시 임포트하고 다른 어떤 것도 바꾸지 않은 채 평가한 것이다: `task_hash eb6efefa…`,
+`observation_hash 07fad282…`(V19의 병합 상태 포트), `learning_hash 17613075…`, `policy_hash 308a1f53…`,
+`deployment_hash f2f9a510…` — 트리의 픽스처에 대해 `es ir check`가 찍는 해시. 재학습 없음, 코드 변경
+없음; 오케스트레이터의 실행, `~/artifacts/plan-v/v19b/run.sh`.
+
+**커밋된 문서 그대로의 수용 기준**(예산 1800, `ES_PYTHON=~/venvs/es`, nominal 두 실행은 `--jobs 4`,
+스윕은 `--jobs 6`):
+
+| 문서 | 스위트 | `success_rate` | `envelope_violation_rate` | 평균 `episode_length` | 폴백 틱 |
+|---|---|---|---|---|---|
+| nominal, 학습 시드 1–16 | nominal | **1.0000** (16/16) | 0.232 | 230 | 0 |
+| nominal, 홀드아웃 시드 101–116 | nominal | **0.9375** (15/16) | 0.208 | 324 | 0 |
+| 6스위트 스윕, 홀드아웃 시드 | nominal | 0.9375 | 0.185 | 323 | 0 |
+| | light_intensity | 0.9375 | 0.177 | 334 | 0 |
+| | light_direction | 0.8125 | 0.381 | 582 | 4 |
+| | observation_delay | **1.0000** | 0.285 | 262 | 0 |
+| | torque_noise | 0.3125 | 0.500 | 1379 | 0 |
+| | backlash | 0.9375 | 0.254 | 355 | 0 |
+
+세 문서 모두 `passed = true`. nominal 스위트의 유일한 홀드아웃 실패 `nominal-04`(시드 105)는 파지
+실패다: 집게가 1,800틱 중 1,475틱 동안 열린 채이고 큐브는 테이블을 떠나지 않는다. 성공 열다섯 편은
+198–304 제어 틱, 즉 4–6초에 끝나며 스크립트 시연은 7초다.
+
+**같은 체크포인트·같은 시드의 `acceleration_max = 20` V19와 비교:** 홀드아웃 13/16 → **15/16**,
+`envelope_violation_rate` 0.969 → **0.208**, 워치독 래치 틱 592–2,134 → **0**; 스윕의 nominal 0.75 →
+0.9375, `light_intensity` 0.375 → 0.9375, `light_direction` 0.625 → 0.8125, `observation_delay` 0.875 →
+1.0, `torque_noise` 0.1875 → 0.3125, `backlash` 0.75 → 0.9375. 정책은 아무것도 바뀌지 않았다. V18이 IR
+그래프 정책에서 잰 것과 같은 움직임이다: 스무 틱 중 열아홉을 깎던 플레인이 명령 스트림에서 비켜선
+것이다. `torque_noise`는 96×96 프레임이 토크를 볼 수 없는 정책에 여전히 어려운 스위트이고,
+`light_direction`은 플레인이 조금이라도 폴백하는 유일한 스위트다(16편에서 4틱).
+
+**같은 문서 위의 IR 그래프 정책과 비교**(V18b, 7.28절: 홀드아웃 nominal 0.625, `light_intensity` 0.625,
+`observation_delay` 0.0625, `torque_noise` 0.0625): 외부에서 설계되고 외부에서 학습된 학습기가 모든
+스위트에서 더 낫고, IR 그래프 정책이 견디지 못한 두 스위트에서는 큰 차이로 낫다. 같은 시연 200편, 같은
+하네스, 같은 문서. 그것이 논쟁이 아니라 측정으로 확인된 오너의 논지다: 학습 설계는 외부에서 오고, 이
+프로젝트의 일 — 선언된 의미로 돌리고 비트까지 재현하는 것 — 이 끝난 부분이다. 7.27절의 검토자 주석에서
+두 단서가 그대로 따라온다: 60,000 step은 홀드아웃 시드로 골랐고(여기서 스윕의 nominal 행도 같은
+0.9375라 선택이 수를 부풀리지는 않았다), 두 정책은 청크 길이가 다르다(16행 대 10행, M5 리뷰의 S-9).
+
+**영상.** 홀드아웃 실행에 V9 카메라로 `es video showcase`, 셀 `nominal-00`(시드 101, 224틱)과
+`nominal-11`(시드 112, 234틱), 1280×720 50 fps; 안전 플레인 오버레이를 얹은 홀드아웃 관측 스트림 16개의
+`es video mosaic --grid 4x4`. 파일 `v19b-a80-holdout-nominal-00.mp4`, `v19b-a80-holdout-nominal-11.mp4`,
+`v19b-a80-holdout-mosaic.mp4`는 `~/artifacts/plan-v/v19b/`와 `target/plan-v/v19b/showcase/`에;
+오케스트레이터가 표본 프레임을 확인했다. 7.28절이 아니라 이것이 시연의 영상이다: 그 안의 정책은 우리
+것이 아니다.
+
+**이것으로 닫히는 것.** M5가 잘려 남은 세 가지(7.28절): 논지(비트 동일, 7.27절), 커밋된 문서 위의 수용
+기준(이 절), 영상. 리뷰는 `docs/reviews/M5.ko.md`.
+
 ## 8. 안전 오버레이 (V3)
 
 렌더된 프레임마다 V3는 `events.json`에 레코드 하나를 붙인다:
