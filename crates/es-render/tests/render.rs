@@ -380,3 +380,123 @@ fn gpu_atlas_packs_several_cameras() {
         "tile 3 has no view"
     );
 }
+
+// --- profile (packet M7/R1 step 0) -----------------------------------------------------------
+
+/// The demo scene: the SO-101 pick-and-place cell `es video showcase` renders.
+fn so101() -> es_assets::scene::SceneDesc {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/mjcf/so101_pick_place.xml");
+    let xml = std::fs::read_to_string(&path).expect("the SO-101 fixture");
+    es_assets::mjcf::parse_str(&xml)
+        .expect("the SO-101 fixture parses")
+        .scene
+}
+
+/// `es video showcase`'s free camera at the angle the acceptance uses, built here rather than
+/// imported: `es_env::render::look_at` is layer 9 and this crate is layer 5 (spec 4.2).
+fn showcase_camera(width: u32, height: u32) -> CameraView {
+    use es_math::{Pose, Quat, Vec3};
+    let eye = Vec3::new(0.66, -0.46, 0.52);
+    let target = Vec3::new(0.14, -0.04, 0.04);
+    let forward = (target - eye).normalize();
+    let x = forward.cross(Vec3::new(0.0, 0.0, 1.0)).normalize();
+    let y = forward.cross(x);
+    let z = forward;
+    let s = (x.x + y.y + z.z + 1.0).sqrt() * 2.0;
+    let quat = Quat::from_xyzw((y.z - z.y) / s, (z.x - x.z) / s, (x.y - y.x) / s, 0.25 * s);
+    CameraView {
+        pose: Pose::new(eye, quat),
+        spec: es_render::ImageSpec::pinhole(width, height, 36f64.to_radians()),
+    }
+}
+
+fn median_p95(mut v: Vec<f64>) -> (f64, f64) {
+    v.sort_by(f64::total_cmp);
+    (v[v.len() / 2], v[(v.len() * 95) / 100])
+}
+
+/// The four phases of one frame, 100 frames, median and p95, at the two sizes that matter:
+/// the showcase (1280x720) and one observation frame (96x96).
+///
+/// `upload` is `Renderer::upload_tris`; `dispatch+wait` is `Renderer::render`, which also
+/// uploads the parameter buffer and blocks on the fence; `readback` is `Atlas::read_tile`.
+/// Reported with spec 12.4's `camera_frames_per_sec` and `pixels_per_sec`, never a single
+/// `step/s`. Run with
+/// `cargo test -p es-render --release -- --ignored --nocapture frame_profile`.
+#[test]
+#[ignore = "timing; run explicitly"]
+fn frame_profile() {
+    let test = "frame_profile";
+    let Some(gpu) = open(test) else { return };
+    let scene = so101();
+    let world = std::collections::BTreeMap::new();
+    let n_tri = TriScene::from_scene(&scene)
+        .expect("tessellates")
+        .tris
+        .len();
+    for (w, h) in [(1280u32, 720u32), (96, 96)] {
+        let cfg = RenderConfig::rs(TileAtlasCfg::row(w, h, 1));
+        let mut renderer = Renderer::new(&gpu, cfg).expect("renderer");
+        let cams = [showcase_camera(w, h)];
+        let (mut tess, mut up, mut disp, mut read) = (vec![], vec![], vec![], vec![]);
+        for _ in 0..100 {
+            let t0 = std::time::Instant::now();
+            let tri = TriScene::from_scene_with_poses(&scene, &world).expect("tessellates");
+            let t1 = std::time::Instant::now();
+            renderer.upload_tris(tri).expect("upload");
+            let t2 = std::time::Instant::now();
+            let mut atlas = renderer.render(&cams).expect("render");
+            let t3 = std::time::Instant::now();
+            let tile = atlas.read_tile(0, Channel::Rgb8).expect("readback");
+            let t4 = std::time::Instant::now();
+            assert_eq!(tile.len(), (w as usize) * (h as usize) * 3);
+            let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+            tess.push(ms(t0, t1));
+            up.push(ms(t1, t2));
+            disp.push(ms(t2, t3));
+            read.push(ms(t3, t4));
+        }
+        let total: Vec<f64> = (0..tess.len())
+            .map(|i| tess[i] + up[i] + disp[i] + read[i])
+            .collect();
+        println!(
+            "\n{w}x{h}, {n_tri} triangles, 100 frames, {}",
+            gpu.capabilities().device_name
+        );
+        println!("| phase | median ms | p95 ms |");
+        println!("|---|---|---|");
+        for (name, v) in [
+            ("tessellate", &tess),
+            ("upload", &up),
+            ("dispatch+wait", &disp),
+            ("readback", &read),
+            ("frame total", &total),
+        ] {
+            let (med, p95) = median_p95(v.clone());
+            println!("| {name} | {med:.3} | {p95:.3} |");
+        }
+        let (med, _) = median_p95(total);
+        println!(
+            "camera_frames_per_sec {:.1}, pixels_per_sec {:.3e} (median frame)",
+            1e3 / med,
+            f64::from(w) * f64::from(h) * 1e3 / med
+        );
+        // Where the readback goes. `Buffer::download` on device-local memory allocates a
+        // host-visible staging buffer, copies into it and reads it back with `to_vec`;
+        // host-visible memory is write-combined, so the *read* is most of the cost. This
+        // measures that read alone, on a buffer of the same size. `crates/es-gpu/**` is out
+        // of this packet's scope, so the number is recorded, not fixed.
+        let bytes = u64::from(w) * u64::from(h) * 4;
+        let mut staging =
+            es_gpu::Buffer::new(&gpu, bytes, es_gpu::Usage::Staging).expect("staging buffer");
+        let t = std::time::Instant::now();
+        let got = staging.download().expect("host-visible download");
+        let ms = t.elapsed().as_secs_f64() * 1e3;
+        println!(
+            "host-visible read of {} KiB: {ms:.3} ms ({:.0} MiB/s)",
+            bytes / 1024,
+            got.len() as f64 / ms / 1048.576
+        );
+    }
+}

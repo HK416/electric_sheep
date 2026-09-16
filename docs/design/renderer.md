@@ -510,3 +510,51 @@ What this does **not** buy: bit equality *across devices*. §3.5 tier 1 needs th
 already an admission that the GPU and the CPU are two different implementations of the same
 text. The claim this crate makes is: same device, same binary → same bits; and CPU → GPU
 agreement at the stated tolerances.
+
+## 8. Where the frame goes, and the software BVH (M7/R1)
+
+`docs/packets/M7/R1-bvh.md`. §28.10 records **80 ms/frame** at 1280×720 for the SO-101 demo
+cell (`visible-learning.md` 7.17 item 4, one RTX 4090) and names two suspects: the scene is
+re-tessellated and re-uploaded into a freshly allocated buffer every frame, and the shader
+scans every triangle per pixel. Neither was measured. §1.4 says measure first.
+
+### 8.1 The baseline, measured
+
+`cargo test -p es-render --release -- --ignored --nocapture frame_profile` times four phases
+of one frame — tessellate, upload, dispatch+wait, readback — over 100 frames on the demo
+scene (`tests/fixtures/mjcf/so101_pick_place.xml`, **2,754** triangles after tessellation;
+§28.10's "2,978" is the earlier count) through `es video showcase`'s own camera
+(`--eye 0.66,-0.46,0.52 --look-at 0.14,-0.04,0.04 --fov 36`). `upload` is
+`Renderer::upload_tris`; `dispatch+wait` is `Renderer::render`, which also uploads the
+parameter buffer and blocks on the fence; `readback` is `Atlas::read_tile`.
+
+**Before, RTX 3060 (driver 591.12, Slang 2026.8), median / p95 ms:**
+
+| phase | 1280×720 | 96×96 |
+|---|---|---|
+| tessellate | 0.232 / 0.326 | 0.255 / 0.321 |
+| upload | 0.334 / 0.490 | 0.203 / 0.345 |
+| dispatch+wait | **38.633 / 41.374** | 0.913 / 1.354 |
+| readback | **83.575 / 86.850** | 1.135 / 1.311 |
+| frame total | 122.856 / 141.384 | 2.512 / 3.106 |
+| `camera_frames_per_sec` (median) | 8.1 | 398.1 |
+| `pixels_per_sec` (median) | 7.50e6 | 3.67e6 |
+
+Two conclusions, and one of them is not this packet's.
+
+1. **The scan is 38.6 ms of the 1280×720 frame** — 921,600 pixels × 2,754 triangles = 2.5 G
+   Möller–Trumbore tests. That is what a BVH removes, and it is the only one of the two
+   suspects §28.10 named that the measurement supports.
+2. **The readback is 83.6 ms, and it is not the renderer.** The same test reads a
+   host-visible buffer of the same size directly: **80.7 ms for 3,600 KiB, 44 MiB/s**.
+   `es_gpu::Buffer::download` on a device-local buffer allocates a `Usage::Staging`
+   (`MemoryLocation::CpuToGpu`) buffer, copies into it and then `to_vec()`s it — and
+   CpuToGpu memory is *write-combined*, so the host read is uncached. The fix is a
+   `GpuToCpu` readback buffer in `es-gpu`, which `crates/es-gpu/**` being out of this
+   packet's scope puts in the next one. Recorded here so it is not re-discovered.
+   `Target / Status: unverified` for any 1280×720 frame-total target below ~84 ms until that
+   lands.
+
+Tessellation is 0.23 ms and the upload 0.33 ms: together 0.5 % of the frame. They are still
+cached and made persistent, because they are cheap to fix and because at 96×96 — the size
+every observation frame in an evaluation is rendered at — 0.46 ms of a 2.5 ms frame is 18 %.
