@@ -610,6 +610,13 @@ impl EditorApp {
         let mut view = CanvasView::of(session, origin, z);
 
         let mut pending: Option<Edit> = None;
+        // A plain click selects what is under it, and a click on the background clears the
+        // selection - the same hit test the drag uses, so a node that can be dragged can be
+        // clicked. `clicked()` is the primary button only, so the right-click that opens the
+        // add-node menu below leaves the selection alone.
+        if let (true, Some(pos)) = (response.clicked(), response.interact_pointer_pos()) {
+            *selected = view.hit(pos);
+        }
         if let (true, Some(pos)) = (response.drag_started(), response.interact_pointer_pos()) {
             let started = view.start_drag(pos);
             if let Drag::Node { id, .. } = &started {
@@ -1516,24 +1523,31 @@ impl CanvasView {
         None
     }
 
+    /// The node whose body is under `pos`, if any. One hit test, shared by the click that
+    /// selects and the drag that moves, so the two can never disagree about what was under
+    /// the pointer (packet M7/E3).
+    fn hit(&self, pos: Pos2) -> Option<NodeId> {
+        self.kinds
+            .keys()
+            .copied()
+            .find(|id| self.rect(*id).is_some_and(|rect| rect.contains(pos)))
+    }
+
     /// Output pin first (a wire is pulled from a producer), then the node body, then the
     /// background.
     fn start_drag(&self, pos: Pos2) -> Drag {
         if let Some(from) = self.port_at(pos, false) {
             return Drag::Link { from };
         }
-        for id in self.kinds.keys() {
-            if let Some(rect) = self.rect(*id) {
-                if rect.contains(pos) {
-                    return Drag::Node {
-                        id: *id,
-                        origin: self.positions.get(id).copied().unwrap_or_default(),
-                        grab: pos - rect.min,
-                    };
-                }
-            }
+        let Some(id) = self.hit(pos) else {
+            return Drag::Pan;
+        };
+        let rect = self.rect(id).unwrap_or(Rect::NOTHING);
+        Drag::Node {
+            id,
+            origin: self.positions.get(&id).copied().unwrap_or_default(),
+            grab: pos - rect.min,
         }
-        Drag::Pan
     }
 
     fn paint(&self, painter: &egui::Painter, selected: Option<NodeId>) {
@@ -1589,4 +1603,69 @@ fn save_paths(path: &Path, kind: es_ir::serial::IrKind) -> (PathBuf, PathBuf) {
         stem.with_extension("esgraph"),
         stem.with_extension("eslayout"),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CanvasView, Drag, NODE_H, NODE_W};
+
+    use std::path::Path;
+
+    use egui::{Pos2, Vec2};
+    use es_ir::serial::Layout;
+    use es_ir::NodeId;
+
+    use crate::model::edit::{EditIr, EditSession};
+
+    /// The canvas geometry over the demo bundle's Task IR with one node put somewhere known.
+    /// `CanvasView` is plain data - positions, rectangles and names - so it needs no display.
+    fn view_with_one_node_at(origin: Pos2, zoom: f32, pos: [f32; 2]) -> (CanvasView, NodeId) {
+        let path = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+            .join("tests/fixtures/visible-learning/task.toml");
+        let toml = std::fs::read_to_string(&path).expect("the demo bundle's task.toml");
+        let task = es_ir::serial::task_from_toml(&toml).expect("it parses");
+        let mut session = EditSession::new(EditIr::Task(task), Layout::default());
+        let (id, _) = session.graph.nodes()[0];
+        session.layout.positions.insert(id, pos);
+        (CanvasView::of(&session, origin, zoom), id)
+    }
+
+    /// Packet M7/E3: a plain click has to reach the inspector, and it does that through the
+    /// same hit test the drag uses. A node's body is hit, the background is not, and the two
+    /// callers agree.
+    #[test]
+    fn a_click_hits_the_node_under_it_and_nothing_on_the_background() {
+        for (origin, zoom) in [
+            (Pos2::ZERO, 1.0_f32),
+            (Pos2::new(7.0, 11.0), 2.0),
+            (Pos2::new(-40.0, 25.0), 0.5),
+        ] {
+            let at = [100.0_f32, 50.0_f32];
+            let (view, id) = view_with_one_node_at(origin, zoom, at);
+            let corner = origin + Vec2::new(at[0], at[1]) * zoom;
+            let centre = corner + Vec2::new(NODE_W, NODE_H) * zoom * 0.5;
+
+            assert_eq!(view.hit(centre), Some(id), "the body at {origin:?}/{zoom}");
+            assert_eq!(view.hit(corner + Vec2::splat(1.0)), Some(id), "just inside");
+            assert_eq!(view.hit(corner - Vec2::splat(1.0)), None, "just outside");
+            assert_eq!(view.hit(corner + Vec2::new(0.0, 4000.0)), None, "far below");
+            // Every other node is without a position, so nothing else can be hit.
+            assert_eq!(
+                view.hit(origin + Vec2::splat(-9999.0)),
+                None,
+                "empty canvas"
+            );
+
+            // The drag and the click read the same geometry: dragging from the centre grabs
+            // the node the click would have selected, and the background pans.
+            assert!(
+                matches!(view.start_drag(centre), Drag::Node { id: dragged, .. } if dragged == id),
+                "the drag grabs what the click selects"
+            );
+            assert!(matches!(
+                view.start_drag(corner - Vec2::splat(1.0)),
+                Drag::Pan
+            ));
+        }
+    }
 }

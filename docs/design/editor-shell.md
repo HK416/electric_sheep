@@ -451,6 +451,17 @@ value is not a string is edited as the TOML it prints as; and an `Enum`'s varian
 whatever the *example* instance showed, so a value using a variant the schema never saw has it
 added to the combo rather than hidden.
 
+**A plain click selects.** Stage 2 set `selected` only on `drag_started`, which was enough
+when selection existed to be deleted and dragged; with an inspector hanging off it, a node
+that had to be *dragged* before it could be read was the defect that blocked this packet's
+acceptance. A click now runs `CanvasView::hit` — the same hit test `start_drag` uses, so what
+can be dragged can be clicked — and a click on the background clears the selection. It is
+`clicked()`, the primary button only, so the right-click that opens the add-node menu leaves
+the selection alone. This is the one piece of `app.rs` with a test of its own
+(`a_click_hits_the_node_under_it_and_nothing_on_the_background`): `CanvasView` is positions,
+rectangles and names, so it needs no display, and the assertion that the click and the drag
+read one geometry is worth more than the section-2 rule of leaving `app.rs` unjudged.
+
 **An edit is meant to be watched.** The status line carries the IR's `*_hash` (its first four
 bytes, which is what a person compares at a glance) and the count of what it complains about,
 both taken from the session and both live; the Diagnostics tab shows the session's list rather
