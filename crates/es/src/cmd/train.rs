@@ -237,6 +237,13 @@ fn run(
         }
     }
 
+    // `train_act.py` writes its checkpoints and its loss curve where it is told and creates
+    // no directory: making them is the caller's job, and it is this caller.
+    for dir in ["weights", "metrics", "checkpoints"] {
+        let dir = out.join(dir);
+        std::fs::create_dir_all(&dir).map_err(|e| bad(format!("{}: {e}", dir.display())))?;
+    }
+
     // --- the plan ------------------------------------------------------------------------
     let mut checkpoints = Vec::new();
     let mut summary = Value::Null;
@@ -450,6 +457,8 @@ fn spawn(step: &Step, capture: bool) -> Result<Value, CliError> {
         let out = cmd.output().map_err(|e| bad(format!("{}{e}", named())))?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         print!("{text}");
+        // Captured means captured: a trainer that failed has to be able to say why.
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
         let last = text.lines().last().unwrap_or_default();
         (
             out.status.success(),
