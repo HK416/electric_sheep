@@ -6,7 +6,8 @@
 //
 // Bindings 0 and 1 are the same in every kernel of this crate:
 //   0  params  — globals then one 16-float record per view
-//   1  tris    — 20 floats per triangle
+//   1  tris    — 20 floats per triangle, then the BVH (nodes, then the triangle
+//                permutation) at the offsets slots 17..19 of `params` carry
 
 #ifndef ES_RENDER_COMMON_SLANG
 #define ES_RENDER_COMMON_SLANG
@@ -42,6 +43,10 @@ uint es_seed()         { return es_param_u(13); }
 uint es_spp()          { return es_param_u(14); }
 uint es_bounces()      { return es_param_u(15); }
 uint es_n_lights()     { return es_param_u(16); }
+// Where the BVH sits inside `es_tris`, in floats. Zero nodes means an empty scene.
+uint es_bvh_base()      { return es_param_u(17); }
+uint es_bvh_nodes()     { return es_param_u(18); }
+uint es_bvh_prim_base() { return es_param_u(19); }
 uint es_atlas_w()      { return es_tiles_per_row() * es_tile_w(); }
 uint es_atlas_h()      { return es_rows() * es_tile_h(); }
 
@@ -161,30 +166,112 @@ bool es_intersect(EsTri tr, float3 o, float3 d, out float t) {
     return true;
 }
 
-// Scan every triangle in ascending index order; nearest strictly inside (near, far) wins,
-// ties to the lower index. No atomics, no shared memory, no dependence on scheduling.
-// ponytail: O(pixels x triangles) — spec 15.4's TLAS is the upgrade path and needs a Vulkan
-// extension es-gpu does not expose.
+// --- BVH traversal (packet M7/R1) ----------------------------------------------------------
+// Mirror of `crate::cpu::{nearest_hit, any_hit}` and `crate::bvh`. The tree is built on the
+// host, once per uploaded scene, and lives at the end of `es_tris`.
+
+static const uint ES_BVH_STACK = 64;
+static const uint ES_BVH_NODE_STRIDE = 8;
+// Ize 2013's robust slab factors, 1 -/+ 2^-22. See `crate::bvh::LO`.
+static const float ES_BVH_LO = 0.99999976;
+static const float ES_BVH_HI = 1.0000002;
+
+struct EsNode {
+    float3 lo;
+    float3 hi;
+    uint a;      // leaf: first slot in the permutation; inner: the right child
+    uint count;  // 0 == inner, left child at self + 1
+};
+
+EsNode es_bvh_node(uint i) {
+    uint b = es_bvh_base() + i * ES_BVH_NODE_STRIDE;
+    EsNode n;
+    n.lo = float3(es_tris[b + 0], es_tris[b + 1], es_tris[b + 2]);
+    n.hi = float3(es_tris[b + 3], es_tris[b + 4], es_tris[b + 5]);
+    n.a = asuint(es_tris[b + 6]);
+    n.count = asuint(es_tris[b + 7]);
+    return n;
+}
+
+uint es_bvh_prim(uint k) { return asuint(es_tris[es_bvh_prim_base() + k]); }
+
+// 1/x with the infinity clamped away: `0 * inf` is the only NaN the slab test can make (a ray
+// exactly parallel to a slab whose origin is exactly on it), and Rust's `min` and Slang's
+// `min` order NaN differently. No NaN, no convention to agree on.
+float es_rcp_safe(float x) {
+    return abs(x) > 1e-30 ? 1.0 / x : (x < 0.0 ? -1e30 : 1e30);
+}
+
+// min/max are exact, so only the two products round, and ES_BVH_LO/HI cover that rounding in
+// the conservative direction: a node is never rejected for a ray that enters it.
+bool es_bvh_slab(EsNode n, float3 o, float3 inv, float near, float far) {
+    float3 t0 = (n.lo - o) * inv;
+    float3 t1 = (n.hi - o) * inv;
+    float lo = max(max(max(near, min(t0.x, t1.x)), min(t0.y, t1.y)), min(t0.z, t1.z));
+    float hi = min(min(min(far, max(t0.x, t1.x)), max(t0.y, t1.y)), max(t0.z, t1.z));
+    return lo * ES_BVH_LO <= hi * ES_BVH_HI;
+}
+
+// Nearest hit strictly inside (near, far), ties to the lower **global** triangle index — the
+// flat scan's rule exactly, which is why the tree's answer is the scan's answer whatever
+// order it visits nodes in. Descent order is fixed: left child first, never sorted by the
+// ray's sign. No atomics, no shared memory, no dependence on the workgroup count (spec 3.4).
 bool es_nearest(float3 o, float3 d, float near, float far, out float best_t, out uint best_i) {
     best_t = far;
     best_i = 0;
     bool any = false;
-    uint n = es_n_tri();
-    for (uint i = 0; i < n; ++i) {
-        float t;
-        if (es_intersect(es_tri(i), o, d, t)) {
-            if (t > near && t < best_t) { best_t = t; best_i = i; any = true; }
+    if (es_bvh_nodes() == 0) { return false; }
+    float3 inv = float3(es_rcp_safe(d.x), es_rcp_safe(d.y), es_rcp_safe(d.z));
+    uint stack[ES_BVH_STACK];
+    stack[0] = 0;
+    uint sp = 1;
+    while (sp > 0) {
+        sp -= 1;
+        uint ni = stack[sp];
+        EsNode node = es_bvh_node(ni);
+        if (!es_bvh_slab(node, o, inv, near, best_t)) { continue; }
+        if (node.count == 0) {
+            stack[sp] = node.a;
+            stack[sp + 1] = ni + 1;   // left child, popped first
+            sp += 2;
+            continue;
+        }
+        for (uint k = 0; k < node.count; ++k) {
+            uint i = es_bvh_prim(node.a + k);
+            float t;
+            if (es_intersect(es_tri(i), o, d, t)) {
+                if (t > near && (t < best_t || (any && t == best_t && i < best_i))) {
+                    best_t = t; best_i = i; any = true;
+                }
+            }
         }
     }
     return any;
 }
 
+// A boolean does not depend on the visit order at all: the same descent with an early return.
 bool es_any_hit(float3 o, float3 d, float near, float far) {
-    uint n = es_n_tri();
-    for (uint i = 0; i < n; ++i) {
-        float t;
-        if (es_intersect(es_tri(i), o, d, t)) {
-            if (t > near && t < far) { return true; }
+    if (es_bvh_nodes() == 0) { return false; }
+    float3 inv = float3(es_rcp_safe(d.x), es_rcp_safe(d.y), es_rcp_safe(d.z));
+    uint stack[ES_BVH_STACK];
+    stack[0] = 0;
+    uint sp = 1;
+    while (sp > 0) {
+        sp -= 1;
+        uint ni = stack[sp];
+        EsNode node = es_bvh_node(ni);
+        if (!es_bvh_slab(node, o, inv, near, far)) { continue; }
+        if (node.count == 0) {
+            stack[sp] = node.a;
+            stack[sp + 1] = ni + 1;
+            sp += 2;
+            continue;
+        }
+        for (uint k = 0; k < node.count; ++k) {
+            float t;
+            if (es_intersect(es_tri(es_bvh_prim(node.a + k)), o, d, t)) {
+                if (t > near && t < far) { return true; }
+            }
         }
     }
     return false;

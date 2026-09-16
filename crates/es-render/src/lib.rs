@@ -10,8 +10,8 @@
 //!
 //! `es-gpu` offers compute pipelines only — no graphics pipeline and no ray-tracing
 //! extension — so both paths are compute shaders and spec 15.4's TLAS/BLAS is *not*
-//! implemented: they scan a flat triangle array in index order. The honest ceiling is a few
-//! hundred triangles.
+//! implemented as hardware: they traverse a software [`bvh`] built on the CPU per frame
+//! (packet M7/R1), which returns exactly what the earlier flat index-order scan returned.
 //!
 //! The oracle is [`cpu`], a pure-Rust mirror of both shaders. It generates every golden in
 //! `tests/golden/render/`; the GPU never does (spec 1.4).
@@ -35,6 +35,7 @@
 #![forbid(unsafe_code)]
 
 pub mod atlas;
+pub mod bvh;
 pub mod cornell;
 pub mod cpu;
 pub mod error;
@@ -47,7 +48,7 @@ pub use atlas::{AtlasLayout, Tile, TileData};
 pub use cpu::Frame;
 pub use error::RenderError;
 pub use renderer::{Atlas, Renderer};
-pub use scene::{Tri, TriScene};
+pub use scene::{SceneCache, Tri, TriScene};
 pub use view::{
     CameraView, ImageSpec, Intrinsics, RenderConfig, RenderPath, TileAtlasCfg, ViewParams,
 };

@@ -1,0 +1,106 @@
+{
+  "light-00": [
+    {
+      "frame": 0,
+      "tick": 0,
+      "source": "Policy",
+      "events": 0
+    },
+    {
+      "frame": 1,
+      "tick": 1,
+      "source": "Policy",
+      "events": 0
+    },
+    {
+      "frame": 2,
+      "tick": 2,
+      "source": "Policy",
+      "events": 0
+    },
+    {
+      "frame": 3,
+      "tick": 3,
+      "source": "Policy",
+      "events": 0
+    }
+  ],
+  "light-01": [
+    {
+      "frame": 0,
+      "tick": 0,
+      "source": "Policy",
+      "events": 0
+    },
+    {
+      "frame": 1,
+      "tick": 1,
+      "source": "Policy",
+      "events": 0
+    },
+    {
+      "frame": 2,
+      "tick": 2,
+      "source": "Policy",
+      "events": 0
+    },
+    {
+      "frame": 3,
+      "tick": 3,
+      "source": "Fallback",
+      "events": 128
+    }
+  ],
+  "nominal-00": [
+    {
+      "frame": 0,
+      "tick": 0,
+      "source": "Policy",
+      "events": 0
+    },
+    {
+      "frame": 1,
+      "tick": 1,
+      "source": "Policy",
+      "events": 0
+    },
+    {
+      "frame": 2,
+      "tick": 2,
+      "source": "Policy",
+      "events": 0
+    },
+    {
+      "frame": 3,
+      "tick": 3,
+      "source": "Policy",
+      "events": 0
+    }
+  ],
+  "nominal-01": [
+    {
+      "frame": 0,
+      "tick": 0,
+      "source": "Policy",
+      "events": 0
+    },
+    {
+      "frame": 1,
+      "tick": 1,
+      "source": "Clamped",
+      "events": 4
+    },
+    {
+      "frame": 2,
+      "tick": 2,
+      "source": "Clamped",
+      "events": 12
+    },
+    {
+      "frame": 3,
+      "tick": 3,
+      "source": "Policy",
+      "events": 0
+    }
+  ]
+}
