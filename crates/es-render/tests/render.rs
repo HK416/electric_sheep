@@ -63,6 +63,30 @@ fn cpu_rs_full() -> Frame {
     cpu::rasterize(&scene(), &cornell_camera(TILE, TILE), &rs_full_cfg(), 0)
 }
 
+/// The `rs_full` preset with `shadows` and `ssaa` overridden — the two knobs the tests move.
+fn rs_full_with(shadows: bool, ssaa: u32) -> RenderConfig {
+    let mut cfg = rs_full_cfg();
+    let Shading::Full {
+        specular,
+        shininess,
+        sky_rgb,
+        ground_rgb,
+        ..
+    } = cfg.shading
+    else {
+        unreachable!("rs_full is Full")
+    };
+    cfg.shading = Shading::Full {
+        shadows,
+        specular,
+        shininess,
+        sky_rgb,
+        ground_rgb,
+        ssaa,
+    };
+    cfg
+}
+
 fn cpu_pt1() -> Frame {
     cpu::path_trace(&scene(), &cornell_camera(TILE, TILE), &pt_cfg(1, 2), 0)
 }
@@ -326,29 +350,7 @@ fn cpu_full_shading_reproduces_its_golden() {
 fn a_shadow_ray_darkens_only_occluded_pixels() {
     use es_render::bvh::Bvh;
     let (scene, cam) = (scene(), cornell_camera(TILE, TILE));
-    let with_shadows = |shadows: bool| {
-        let mut cfg = rs_full_cfg();
-        let Shading::Full {
-            specular,
-            shininess,
-            sky_rgb,
-            ground_rgb,
-            ..
-        } = cfg.shading
-        else {
-            unreachable!("rs_full is Full")
-        };
-        cfg.shading = Shading::Full {
-            shadows,
-            specular,
-            shininess,
-            sky_rgb,
-            ground_rgb,
-            ssaa: 1,
-        };
-        cfg
-    };
-    let (on, off) = (with_shadows(true), with_shadows(false));
+    let (on, off) = (rs_full_with(true, 1), rs_full_with(false, 1));
     let lit = cpu::rasterize(&scene, &cam, &off, 0);
     let shadowed = cpu::rasterize(&scene, &cam, &on, 0);
     let (a, b) = (
@@ -403,6 +405,108 @@ fn a_shadow_ray_darkens_only_occluded_pixels() {
     println!(
         "{changed} of {} pixels darkened, every one of them occluded",
         TILE * TILE
+    );
+}
+
+/// The shading mix is energy-conserving (amended at review): a surface in full light returns
+/// its albedo, a shadowed one returns `albedo * hemi`, and neither can exceed the albedo.
+///
+/// This is not covered by `cornell_rs_full_rgb8`: the Cornell box is a closed room, so every
+/// shadow ray hits the ceiling and the golden's `diffuse` term is zero at every pixel — the
+/// golden pins the hemisphere and the shadow, and *nothing* in it would notice the mix
+/// changing. Hence a direct test of `shade_full`, which is the function both texts mirror.
+#[test]
+fn full_shading_is_energy_conserving() {
+    use es_render::bvh::Bvh;
+    let mut cfg = rs_full_with(true, 1);
+    let Shading::Full {
+        sky_rgb,
+        ground_rgb,
+        shininess,
+        ..
+    } = cfg.shading
+    else {
+        unreachable!("rs_full is Full")
+    };
+    // No highlight: `spec` is additive on purpose and would mask the term under test.
+    cfg.shading = Shading::Full {
+        shadows: true,
+        specular: 0.0,
+        shininess,
+        sky_rgb,
+        ground_rgb,
+        ssaa: 1,
+    };
+    let light = [
+        cfg.light_dir.x as f32,
+        cfg.light_dir.y as f32,
+        cfg.light_dir.z as f32,
+    ];
+    let albedo = [0.725, 0.71, 0.68];
+    let tri = es_render::Tri {
+        v: [[0.0; 3]; 3],
+        n: light,
+        albedo,
+        emission: [0.0; 3],
+        seg: 1,
+    };
+    let hemi = {
+        // The same two operations `shade_full` and `common.slang` use, not `f32::midpoint`.
+        #[allow(clippy::manual_midpoint)]
+        let t = (light[2] + 1.0) * 0.5;
+        [0, 1, 2].map(|c| ground_rgb[c] + (sky_rgb[c] - ground_rgb[c]) * t)
+    };
+    // The old form `albedo * (hemi + diffuse)` clipped exactly here: hemi alone is 0.79 and
+    // the surface faces the light, so the sum passed 1 and every channel saturated.
+    assert!(
+        hemi[2] + 1.0 > 1.0,
+        "the case under test must be one the additive form would have clipped"
+    );
+
+    // Lit: nothing to occlude it (an empty scene), so `vis = 1` and `diffuse = dot(n, L) = 1`.
+    let empty: [es_render::Tri; 0] = [];
+    let lit = cpu::shade_full(
+        &empty,
+        &Bvh::build(&empty),
+        &tri,
+        light,
+        [0.0; 3],
+        [0.0, 0.0, 1.0],
+        &cfg,
+    );
+    for c in 0..3 {
+        assert!(
+            (lit[c] - albedo[c]).abs() <= 1e-6,
+            "a fully lit surface returned {} on channel {c}, not its albedo {}",
+            lit[c],
+            albedo[c]
+        );
+    }
+
+    // Shadowed: any point inside the closed Cornell room is, towards this light.
+    let sc = scene();
+    let bvh = Bvh::build(&sc.tris);
+    let dark = cpu::shade_full(
+        &sc.tris,
+        &bvh,
+        &tri,
+        light,
+        [1.5, 0.0, 1.0],
+        [0.0, 0.0, 1.0],
+        &cfg,
+    );
+    for c in 0..3 {
+        let want = albedo[c] * hemi[c];
+        assert!(
+            (dark[c] - want).abs() <= 1e-6,
+            "a shadowed surface returned {} on channel {c}, not albedo * hemi {want}",
+            dark[c]
+        );
+        assert!(dark[c] < lit[c], "the shadow must darken channel {c}");
+    }
+    println!(
+        "lit {lit:?} == albedo {albedo:?}; shadowed {dark:?} == albedo * hemi {:?}",
+        [0, 1, 2].map(|c| albedo[c] * hemi[c])
     );
 }
 
@@ -542,19 +646,13 @@ fn gpu_rasterizer_matches_the_cpu_goldens() {
     assert!(nulp <= 1, "Normal max ULP {nulp} exceeds 1");
 }
 
-/// Oracle 3, GPU half (packet M7/R2): the `Full` look on the device is the CPU reference's
-/// `Rgb8` bit for bit, and its geometry channels are the `Lambert` render's — same device,
-/// so "the centre ray is the centre ray" is checkable without a ULP budget.
-#[test]
-fn gpu_full_shading_matches_the_cpu() {
-    let test = "gpu_full_shading_matches_the_cpu";
-    let Some(gpu) = open(test) else { return };
+/// The `Full` `Rgb8` of one config on the device against the CPU reference, with the
+/// edge-pixel tolerance of `docs/design/renderer.md` section 9.3.
+fn gpu_full_rgb8_matches_the_cpu(gpu: &Gpu, cfg: &RenderConfig, label: &str) {
     let cams = [cornell_camera(TILE, TILE)];
-    let mut full = render_gpu(&gpu, rs_full_cfg(), &cams, 1);
-    let mut lambert = render_gpu(&gpu, rs_cfg(), &cams, 1);
-
+    let mut full = render_gpu(gpu, cfg.clone(), &cams, 1);
     let rgb = full.read_tile(0, Channel::Rgb8).expect("rgb");
-    let want = cpu_rs_full();
+    let want = cpu::rasterize(&scene(), &cams[0], cfg, 0);
     let want_rgb = want.tile(Channel::Rgb8).unwrap();
     let diff = rgb
         .as_u8()
@@ -592,12 +690,17 @@ fn gpu_full_shading_matches_the_cpu() {
                 .collect();
             assert!(
                 hits.iter().any(|h| *h != hits[0]),
-                "pixel ({px}, {py}) differs by {worst} but all four sub-samples hit {:?}:                  that is a shading divergence, not a coverage tie",
+                "{label}: pixel ({px}, {py}) differs by {worst} but all four sub-samples hit \
+                 {:?}: that is a shading divergence, not a coverage tie",
                 hits[0]
             );
+            // 255/4: the ceiling on what one sub-sample of four can move an 8-bit channel by,
+            // in the linear domain the box filter averages in. A backstop only — the
+            // discriminating assertion is the one above.
             assert!(
-                worst <= 16,
-                "pixel ({px}, {py}) is an edge pixel but differs by {worst} levels, more than                  one sub-sample of four can account for"
+                worst <= 64,
+                "{label}: pixel ({px}, {py}) is an edge pixel but differs by {worst} levels, \
+                 more than one sub-sample of four can account for"
             );
             edges += 1;
             println!("  edge pixel ({px}, {py}): sub-sample hits {hits:?}, worst {worst} levels");
@@ -606,13 +709,36 @@ fn gpu_full_shading_matches_the_cpu() {
     let n_px = (TILE * TILE) as usize;
     assert!(
         edges * 1000 <= n_px,
-        "{edges} of {n_px} pixels differ: more than the 0.1% of edge pixels the tie explains"
+        "{label}: {edges} of {n_px} pixels differ: more than the 0.1% of edge pixels the tie \
+         explains"
     );
     println!(
-        "Full Rgb8: {diff} of {} bytes differ from the CPU, in {edges} of {n_px} edge pixels",
+        "{label}: {diff} of {} bytes differ from the CPU, in {edges} of {n_px} edge pixels",
         rgb.len()
     );
+}
 
+/// Oracle 3, GPU half (packet M7/R2): the `Full` look on the device is the CPU reference's
+/// `Rgb8` bit for bit, and its geometry channels are the `Lambert` render's — same device,
+/// so "the centre ray is the centre ray" is checkable without a ULP budget.
+///
+/// Two configs, because the Cornell box is a closed room: under the preset every shadow ray
+/// is occluded, so `shadows: false` is the only way the device's `diffuse` term — the
+/// energy-conserving mix amended at review — is executed at all.
+#[test]
+fn gpu_full_shading_matches_the_cpu() {
+    let test = "gpu_full_shading_matches_the_cpu";
+    let Some(gpu) = open(test) else { return };
+    gpu_full_rgb8_matches_the_cpu(&gpu, &rs_full_cfg(), "Full Rgb8 (preset, all shadowed)");
+    gpu_full_rgb8_matches_the_cpu(
+        &gpu,
+        &rs_full_with(false, 2),
+        "Full Rgb8 (shadows off, lit)",
+    );
+
+    let cams = [cornell_camera(TILE, TILE)];
+    let mut full = render_gpu(&gpu, rs_full_cfg(), &cams, 1);
+    let mut lambert = render_gpu(&gpu, rs_cfg(), &cams, 1);
     for channel in [DEPTH, Channel::SegmentationId, Channel::Normal] {
         let (a, b) = (
             full.read_tile(0, channel).expect("full"),

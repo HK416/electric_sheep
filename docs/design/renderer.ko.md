@@ -158,7 +158,7 @@ diffuse  = max(0, dot(n, L)) * vis
 h        = normalize(L - d)
 spec     = specular * pow(max(0, dot(n, h)), shininess) * vis      // 0 when dot(n, h) <= 0
 hemi     = ground + (sky - ground) * ((n.z + 1) * 0.5)
-rgb_lin  = albedo * (hemi + diffuse) + spec + emission
+rgb_lin  = albedo * (hemi + diffuse * (1 - hemi)) + spec + emission   // per channel
 ```
 
 그다음은 아래의 동일한 sRGB 전달 함수다. `pow`는 `es_exp(es_ln(x) * shininess)`이며 `std`도
@@ -478,9 +478,26 @@ ground [0.25, 0.22, 0.20], ssaa: 2`. `es video showcase --look lambert|full`이 
 - **아무것도 맞히지 못한 광선은 여전히 검정을 반환한다**, `sky_rgb`가 아니라. `sky_rgb`는 배경이
   아니라 위쪽에서 오는 *앰비언트*다: 배경에 색을 주는 것은 `SegmentationId == 0`의 모습을 바꾸는
   일이고, 셰이딩 결정이 아니라 씬 결정이다.
+- **앰비언트와 디퓨즈의 혼합은 에너지 보존적이다** — 채널별 `hemi + diffuse * (1 - hemi)`,
+  `Lambert`가 상수 앰비언트에 쓰는 것과 같은 형태(`ambient + ndl * (1 - ambient)`)다. 빛을 온전히
+  받는 표면은 정확히 자기 albedo를 반환하고 그림자 속 표면은 `albedo * hemi`를 반환하므로, sRGB
+  변환 이전에 아무것도 클리핑되지 않는다. **리뷰에서 수정됨**: 패킷의 원래 식
+  `albedo * (hemi + diffuse)`는 빛을 받는 모든 표면에서 albedo를 넘는다 — `sky`가 0.85이고
+  `ndl`이 0.87이면 SO-101 테이블이 순백으로 렌더링되었다 — 그리고 그것은 톤 맵에게 감추라고 할
+  일이 아니라 식 자체의 결함이다. `spec`은 덧셈으로 남는다: 하이라이트는 날아가도 된다, 그것이
+  하이라이트다.
 
 `Full`이 여전히 아닌 것: 텍스처 없음, 소프트 섀도 없음(광선 하나, 방향광 하나), 다중 광원 없음,
 톤 맵 없음(그것은 R3), 전역 조명 없음(그것은 `Pt`).
+
+**코넬 골든이 고정하지 못하는 것.** 박스는 닫힌 방이므로 안에서 나가는 모든 그림자 광선은 천장을
+맞힌다: 프리셋에서는 `cornell_rs_full_rgb8`의 모든 픽셀이 `vis = 0`이고 `diffuse` 항은 0이며,
+골든은 위 수정 전후로 바이트까지 동일하다. 골든은 반구와 그림자 광선과 박스 필터를 고정하지만
+혼합에는 눈이 멀어 있다. 그것이 못 하는 것을 두 테스트가 덮는다:
+`full_shading_is_energy_conserving`은 `shade_full`을 직접 호출해 빛을 받는 표면이 albedo를,
+그림자 속 표면이 `albedo * hemi`를 반환함을 단언하고, `gpu_full_shading_matches_the_cpu`는
+GPU/CPU 비교를 `shadows: false`로 한 번 더 돌린다 — 이 씬에서 디바이스가 빛 분기를 실행하는
+유일한 방법이다.
 
 ### 9.2 SSAA는 순서가 고정된 박스 필터다
 
@@ -520,7 +537,8 @@ lin = acc * (1 / (k * k))  // 곱셈 한 번, 그다음에 sRGB 전달 함수
 | CPU `Full` `Rgb8` vs `cornell_rs_full_rgb8` | 비트 동일(그것이 생성했다) | 비트 동일 |
 | CPU `Full` vs `Lambert`, depth/seg/normal | 비트 동일 | 비트 동일 |
 | GPU `Full` vs `Lambert`, depth/seg/normal | 비트 동일 | 비트 동일 |
-| GPU `Full` `Rgb8` vs CPU | **엣지 픽셀을 제외하고** 비트 동일 | 12,288바이트 중 3바이트, 4,096픽셀 중 1픽셀 |
+| GPU `Full` `Rgb8` vs CPU, 프리셋 | **엣지 픽셀을 제외하고** 비트 동일 | 12,288바이트 중 3바이트, 4,096픽셀 중 1픽셀 |
+| GPU `Full` `Rgb8` vs CPU, `shadows: false` | 동일 | 12,288바이트 중 3바이트, 같은 픽셀 |
 
 간직할 가치가 있는 발견은 마지막 행이다. 차이 나는 픽셀은 (37, 49), 짧은 박스의 윗면과 먼 면이
 만나는 곳이다: 네 서브샘플 중 하나가 공유 모서리를 스치고, CPU는 먼 면에 GPU는 윗면에 히트를
@@ -533,7 +551,8 @@ lin = acc * (1 / (k * k))  // 곱셈 한 번, 그다음에 sRGB 전달 함수
 
 그래서 `gpu_full_shading_matches_the_cpu`는 한 디바이스에서만 참인 숫자 대신 정직한 것을 단언한다:
 차이 나는 모든 픽셀은 네 서브샘플이 **모두** 같은 삼각형을 맞히지는 않는 픽셀이어야 하고, 최대
-16단계까지만 차이 나야 하며, 차이 나는 픽셀은 전체의 0.1%를 넘을 수 없다. 네 서브샘플이 삼각형에
+64단계(255/4, 네 서브샘플 중 하나가 한 채널을 움직일 수 있는 상한 — 안전장치이며 판별하는 쪽은
+서브샘플 단언이다)까지만 차이 나야 하며, 차이 나는 픽셀은 전체의 0.1%를 넘을 수 없다. 네 서브샘플이 삼각형에
 합의하는데도 차이 나는 픽셀은 셰이딩 발산이며 테스트를 실패시킨다.
 
 대안 — `es_intersect`에서 `a.x*b.x + a.y*b.y + a.z*b.z`로 적어 `dot`을 고정하는 것 — 은 *기본*

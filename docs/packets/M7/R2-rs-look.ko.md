@@ -45,8 +45,10 @@ RS는 `albedo * (ambient + max(0, n·L) * (1 - ambient))`로 셰이딩한다: �
   이루어진다: `n`을 face-forward한다; `vis = shadows ? (any_hit(p + n*RAY_EPS, L) ? 0 : 1) :
   1`; `diffuse = max(0, n·L) * vis`; `h = normalize(L - d)`; `spec = specular * pow(max(0,
   n·h), shininess) * vis`, 여기서 `pow`는 `x <= 0`에서 가드된 `es_exp(es_ln(x) *
-  shininess)`다; `hemi = lerp(ground, sky, (n.z + 1) * 0.5)`; `rgb_lin = albedo * (hemi +
-  diffuse) + spec + emission`. 그다음 기존의 정확한 sRGB 변환과 `u8` 반올림. SSAA:
+  shininess)`다; `hemi = lerp(ground, sky, (n.z + 1) * 0.5)`; 채널별로 `rgb_lin = albedo *
+  (hemi + diffuse * (1 - hemi)) + spec + emission`(**리뷰에서 수정: 에너지 보존 혼합** —
+  덧셈 형태는 빛을 받는 모든 표면에서 albedo를 넘어 테이블을 순백으로 렌더링했다).
+  그다음 기존의 정확한 sRGB 변환과 `u8` 반올림. SSAA:
   슈퍼샘플된 선형 색은 **`ssaa × ssaa` 블록에 대해 행 우선 순서로** 평균된다(고정된 순차
   `+=` 다음 `1/(ssaa*ssaa)` 곱셈 한 번), 그러고 나서야 인코딩된다 — 양쪽 모두에서.
 * 파라미터 버퍼는 **끝에서** 자란다(새 슬롯은 기존 것 뒤에 오므로 `Lambert`의 인덱스는

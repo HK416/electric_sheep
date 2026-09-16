@@ -354,7 +354,11 @@ float3 es_shade_full(EsTri tr, float3 n, float3 p, float3 d) {
     // and the two texts have to round the same way.
     float t = (n.z + 1.0) * 0.5;
     float3 hemi = es_ground_rgb() + (es_sky_rgb() - es_ground_rgb()) * t;
-    return tr.albedo * (hemi + diffuse) + spec + tr.emission;
+    // Energy-conserving, the same mix es_shade_lambert uses for its constant ambient (amended
+    // at review): hemi + diffuse * (1 - hemi) per channel, so a fully lit surface returns its
+    // albedo and a shadowed one albedo * hemi. spec stays additive.
+    float3 lit = hemi + diffuse * (1.0 - hemi);
+    return tr.albedo * lit + spec + tr.emission;
 }
 
 float es_luminance(float3 c) {

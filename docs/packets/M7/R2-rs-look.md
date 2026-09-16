@@ -45,8 +45,9 @@ observation documents render?**
   with these functions: `n` face-forwarded; `vis = shadows ? (any_hit(p + n*RAY_EPS, L) ? 0 : 1)
   : 1`; `diffuse = max(0, n·L) * vis`; `h = normalize(L - d)`; `spec = specular * pow(max(0, n·h),
   shininess) * vis` with `pow` as `es_exp(es_ln(x) * shininess)` guarded at `x <= 0`;
-  `hemi = lerp(ground, sky, (n.z + 1) * 0.5)`; `rgb_lin = albedo * (hemi + diffuse) + spec +
-  emission`. Then the existing exact sRGB transfer and `u8` rounding. SSAA: the supersampled
+  `hemi = lerp(ground, sky, (n.z + 1) * 0.5)`; `rgb_lin = albedo * (hemi + diffuse * (1 - hemi))
+  + spec + emission` per channel (**amended at review: energy-conserving mix** — the additive
+  form exceeded the albedo on every lit surface and rendered the table pure white). Then the existing exact sRGB transfer and `u8` rounding. SSAA: the supersampled
   linear colour is averaged in **row-major order over the `ssaa × ssaa` block** (a fixed
   sequential `+=` then one multiply by `1/(ssaa*ssaa)`), and only then encoded — on both sides.
 * The params buffer grows at the **end** (new slots after the existing ones, so `Lambert`'s

@@ -391,10 +391,16 @@ pub fn shade_full(
     #[allow(clippy::manual_midpoint)]
     let t = (n[2] + 1.0) * 0.5;
     let hemi = add(ground_rgb, scale(sub(sky_rgb, ground_rgb), t));
-    add(
-        add(mul(tri.albedo, add(hemi, [diffuse; 3])), [spec; 3]),
-        tri.emission,
-    )
+    // Energy-conserving, the same mix `shade_lambert` uses for its constant ambient (amended
+    // at review): `hemi + diffuse * (1 - hemi)` per channel, so a fully lit surface returns
+    // its albedo and a shadowed one `albedo * hemi`, and nothing clips to white before the
+    // sRGB transfer. `spec` stays additive: a highlight is allowed to blow out.
+    let lit = [
+        hemi[0] + diffuse * (1.0 - hemi[0]),
+        hemi[1] + diffuse * (1.0 - hemi[1]),
+        hemi[2] + diffuse * (1.0 - hemi[2]),
+    ];
+    add(add(mul(tri.albedo, lit), [spec; 3]), tri.emission)
 }
 
 /// Exact piecewise sRGB transfer (spec 3.1). `c^(1/2.4)` goes through `es_math::approx`, not

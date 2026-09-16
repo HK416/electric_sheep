@@ -261,7 +261,7 @@ diffuse  = max(0, dot(n, L)) * vis
 h        = normalize(L - d)
 spec     = specular * pow(max(0, dot(n, h)), shininess) * vis      // 0 when dot(n, h) <= 0
 hemi     = ground + (sky - ground) * ((n.z + 1) * 0.5)
-rgb_lin  = albedo * (hemi + diffuse) + spec + emission
+rgb_lin  = albedo * (hemi + diffuse * (1 - hemi)) + spec + emission   // per channel
 ```
 
 then the same sRGB transfer below. `pow` is `es_exp(es_ln(x) * shininess)`, never `std` or
@@ -715,9 +715,28 @@ defaults to `lambert`.
 - **A ray that hits nothing still returns black**, not `sky_rgb`. `sky_rgb` is the *ambient*
   from above, not a background: giving the background a colour would change what
   `SegmentationId == 0` looks like and is a scene decision, not a shading one.
+- **The ambient and the diffuse mix is energy-conserving** — `hemi + diffuse * (1 - hemi)`,
+  per channel, the same shape `Lambert` uses for its constant ambient
+  (`ambient + ndl * (1 - ambient)`). A surface in full light returns exactly its albedo and a
+  shadowed one returns `albedo * hemi`, so nothing clips before the sRGB transfer.
+  **Amended at review**: the packet's original `albedo * (hemi + diffuse)` exceeds the albedo
+  on every lit surface — with `sky` at 0.85 and `ndl` at 0.87 the SO-101 table rendered pure
+  white — and that is a defect of the equation, not something a tone map should be asked to
+  hide. `spec` stays additive: a highlight is allowed to blow out, that is what a highlight
+  is.
 
 What `Full` is still not: no textures, no soft shadows (one ray, one directional light), no
 multiple lights, no tone map (that is R3's), no global illumination (that is `Pt`).
+
+**What the Cornell golden does not pin.** The box is a closed room, so every shadow ray from
+inside it hits the ceiling: under the preset `vis = 0` at every pixel of
+`cornell_rs_full_rgb8`, the `diffuse` term is zero, and the golden is byte-identical before
+and after the amendment above. It pins the hemisphere, the shadow ray and the box filter, and
+it is blind to the mix. Two tests cover what it cannot: `full_shading_is_energy_conserving`
+calls `shade_full` directly and asserts the lit surface returns its albedo and the shadowed
+one `albedo * hemi`, and `gpu_full_shading_matches_the_cpu` runs its GPU/CPU comparison a
+second time with `shadows: false`, which is the only way the device executes the lit branch
+on this scene at all.
 
 ### 9.2 SSAA is a fixed-order box filter
 
@@ -760,7 +779,8 @@ Measured at 64×64 on the Cornell box, NVIDIA RTX 3060 (Slang 2026.8) and RTX 40
 | CPU `Full` `Rgb8` vs `cornell_rs_full_rgb8` | bit-identical (it generated it) | bit-identical |
 | CPU `Full` vs `Lambert`, depth/seg/normal | bit-identical | bit-identical |
 | GPU `Full` vs `Lambert`, depth/seg/normal | bit-identical | bit-identical |
-| GPU `Full` `Rgb8` vs CPU | bit-identical **except at edge pixels** | 3 of 12,288 bytes, 1 of 4,096 pixels |
+| GPU `Full` `Rgb8` vs CPU, preset | bit-identical **except at edge pixels** | 3 of 12,288 bytes, 1 of 4,096 pixels |
+| GPU `Full` `Rgb8` vs CPU, `shadows: false` | the same | 3 of 12,288 bytes, the same pixel |
 
 That last row is the one finding worth keeping. The differing pixel is (37, 49), where the
 short box's top face and its far face meet: one of its four sub-samples grazes the shared
@@ -775,9 +795,10 @@ sub-samples do, at one pixel in four thousand.
 
 So `gpu_full_shading_matches_the_cpu` asserts the honest thing rather than a number that is
 true on one device: every differing pixel must be a pixel whose four sub-samples do **not**
-all hit the same triangle, must differ by at most 16 levels, and at most 0.1% of pixels may
-differ. A pixel whose four sub-samples agree on the triangle and still differs is a shading
-divergence and fails the test.
+all hit the same triangle, must differ by at most 64 levels (255/4, the ceiling on what one
+sub-sample of four can move a channel by — a backstop; the sub-sample assertion is the
+discriminating one), and at most 0.1% of pixels may differ. A pixel whose four sub-samples
+agree on the triangle and still differs is a shading divergence and fails the test.
 
 The alternative — pinning `dot` by writing out `a.x*b.x + a.y*b.y + a.z*b.z` in
 `es_intersect` — would change the arithmetic of the *default* path's kernel, which this packet
