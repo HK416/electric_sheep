@@ -178,7 +178,26 @@ ES_PYTHON=~/venvs/es/bin/python ./target/release/es eval run \
     --jobs 4 --out $A/e-s13-100000-holdout-a --frames $A/f-s13-100000-holdout-a
 ```
 
-`~/artifacts/plan-v/v19/{pa,pb,pc,pd}.sh` are these steps as they were run;
+Ablation 1 is the same sequence with `~/artifacts/plan-v/v15/ds-train` in step 1 and `w13` for
+`s13` throughout. The sweep and the videos, on the checkpoint that cleared the threshold:
+
+```sh
+# the six-suite sweep from the Evaluation IR, held-out seeds, with frames (the light suites
+# are refused without a renderer rather than skipped)
+./target/release/es eval run --config $A/evaluation-s13.toml --policy $A/w13-060000.esb \
+    --scene $SCENE --jobs 6 --out $A/suite-w13-060000 --frames $A/fsuite-w13-060000
+# two showcase mp4s through V9's camera, and the 4x4 mosaic with the Safety Plane overlay
+./target/release/es video showcase --run $A/e-w13-060000-holdout --scene $SCENE \
+    --eye 0.66,-0.46,0.52 --look-at 0.14,-0.04,0.04 --fov 36 \
+    --width 1280 --height 720 --cell nominal-00 --out $A/show60-nominal-00
+python/es/encode_video.py --frames $A/show60-nominal-00 --fps 50 --out $A/v19-60k-nominal-00.mp4
+./target/release/es video mosaic --frames $A/f-w13-060000-holdout \
+    --events $A/e-w13-060000-holdout/events.json --report $A/e-w13-060000-holdout/report.json \
+    --grid 4x4 --out $A/mosaic-w13-060000
+python/es/encode_video.py --frames $A/mosaic-w13-060000 --fps 50 --out $A/v19-60k-mosaic.mp4
+```
+
+`~/artifacts/plan-v/v19/{pa,pb,pb2,pc,pd,pe,pf,pg2,ph}.sh` are these steps as they were run;
 `probe.py`, `terms.py` and `summary.py` are V17's read-out scripts.
 
 ## acceptance
@@ -209,4 +228,66 @@ ES_PYTHON=~/venvs/es/bin/python ./target/release/es eval run \
 
 ## as built
 
-See section 7.27 of the design note. Filled in below after the run.
+Measured on the oracle server (RTX 4090, `~/venvs/es-lerobot-cuda` for training and the
+reference, `~/venvs/es` for evaluation, tree `~/Projects/es-v19`, artifacts
+`~/artifacts/plan-v/v19/`), 2026-09-16. Full write-up: design note **section 7.27**.
+
+**The verdict, and the acceptance the demo declares.** On the demonstrations collected against the
+predicate the Task IR currently carries, LeRobot's own ACT reaches **`success_rate = 0.8125`
+(13 / 16) on held-out seeds 101–116** at 60,000 steps, and the six-suite sweep from the Evaluation
+IR reports `passed: true` against the unchanged `nominal success_rate >= 0.5`. Plan V has a demo.
+Two showcase mp4s and a 4x4 mosaic are in `target/plan-v/v19/`.
+
+On the demonstrations **this packet named** (`~/artifacts/plan-v/v14/ds-train`) the same recipe
+scores **0 / 16** at every checkpoint, and the reason is measured rather than argued: V15 raised
+the success predicate's gripper term to `> 0.85` and **re-collected** the 200 demonstrations, so
+the 35,918-frame set the packet points at records a release that stops at a jaw of 0.573 rad —
+0.28 rad short of the term — while V15's 36,960-frame set ends at 0.832. Both runs are reported.
+
+| run | data | held-out `success_rate` |
+|---|---|---|
+| the packet's (`s13`), 20k / 50k / 100k | `v14/ds-train`, 35,918 frames | 0.0000 at every checkpoint |
+| **ablation 1 (`w13`), 60,000** | `v15/ds-train`, 36,960 frames | **0.8125 (13/16)** |
+| ablation 1, 40k / 50k / 100k | same | 0.6875 / 0.6250 / 0.0625 |
+| ablation 2 (`s6`), 100k | `v14/ds-train`, 6-dim state | trained, not evaluated |
+
+Acceptance, item by item:
+
+1. **Met, bitwise, eight times.** `max_abs 0e0`, `max_rel 0e0`, chunk `[16, 6]`, on a recorded
+   frame of this project's own dataset, at 20k / 50k / 100k of the packet's run and
+   20k / 40k / 50k / 60k / 100k of ablation 1. `lerobot 0.6.1`, `torch 2.11.0+cu129`.
+2. **Met.** Per-checkpoint tables for both runs, training seeds 1–16 and held-out 101–116, in
+   section 7.27. The held-out suite was repeated at the best checkpoint of each run
+   (`s13` 100,000 and `w13` 50,000 and 60,000) and every pair of `report.json` files is
+   **byte-identical** — the `w13` 50,000 pair across two different `--jobs` values.
+3. **Met, and the branch was taken.** Held-out `success_rate >= 0.5`, so the six-suite sweep ran
+   (nominal 0.7500, `observation_delay` 0.8750, `backlash` 0.7500, `light_direction` 0.6250,
+   `light_intensity` 0.3750, `torque_noise` 0.1875; `passed: true`), and `es video showcase` /
+   `es video mosaic` produced `v19-60k-nominal-00.mp4`, `v19-60k-nominal-11.mp4` and
+   `v19-60k-mosaic.mp4`, mirrored to `target/plan-v/v19/`.
+4. **Met.** `cargo xtask ci` green; the one Rust change carries
+   `the_declared_latency_is_the_tighter_of_the_budget_and_the_replan_period`.
+
+**Four things the packet did not know.**
+
+1. **`LRN-052` refused every imported checkpoint**, because `import-lerobot` wrote the Deployment
+   IR's 240 ms `inference_budget` into `expected_latency_ms`, which the IR documents as a
+   measurement and `LRN-052` bounds by the 200 ms re-plan period. Fixed as described in decision 3
+   above; V8's imported value does not move.
+2. **The dataset the packet names was superseded by V15**, and the difference decides the result.
+   Open question 26.
+3. **The schedule matters more than the total.** 20,000 steps releases nothing, 40,000 – 60,000
+   releases on 11 – 13 of 16 held-out seeds, 100,000 on 1. The release is a 19-frame tail of a
+   183-frame episode, so the fit for it is transient; evaluating only `--steps=100000` would have
+   reported 0.0625 and missed the demo.
+4. **A suite's numbers move when the other five suites are in the document** — 0.6250 standalone
+   against 0.5625 as the sweep's nominal row, reproduced byte for byte at three different `--jobs`
+   values, so it is the document and not the sharding. Open question 27.
+
+**Two ablations, and why each was run.** `w13` (the same ACT on V15's re-collected 200
+demonstrations) exists because finding 2 was a prediction and running it was the cheapest test of
+it. `s6` (V8's own six-dimensional joint-only state on the same export) exists to separate "the
+learner" from "what the learner may see"; it was trained to 100,000 steps and **not evaluated**,
+because the jaw ceiling of finding 2 applies to it unchanged and the box was needed for `w13`.
+Whether an external ACT needs the privileged cube pose is therefore still open, and its checkpoint
+is on the server.

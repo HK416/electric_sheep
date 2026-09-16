@@ -3541,6 +3541,258 @@ episode, and the jaw opens to within three milliradians of the predicate on one 
 Open question 22's (ii) — cue the release on something the observation carries — is the next
 variable, and it now has a specific thing to fix rather than a fixed point to escape.
 
+### 7.27 As built (V19): LeRobot's own ACT, and the demo works
+
+Packet `docs/packets/M5/V19-external-act-current-data.md`. V8 (section 7.16) asked whether a
+policy designed and trained **outside** this project runs here with identical semantics, and
+answered *yes, bitwise* for the semantics and 0/16, 0/16, 1/16 for the task. Every one of those
+numbers was taken on a harness since repaired three times — V11 (the demo ran at 200 Hz against a
+50 Hz Deployment IR), V12 (the observation was paired with the post-step state), V17 (every chunk
+row past row 0 was dead) — and on 50 demonstrations where there are now 200. **V19 changes one
+thing against V17: the learner.** Same Task IR, same Deployment IR and Safety Plane, same
+1,800-step budget, same seeds, same `success_rate >= 0.5`. `task_hash eb6efefa…` and
+`deployment_hash 5ee54574…` are V17's and do not move.
+
+**The verdict first.** On the demonstrations the current predicate was collected against,
+LeRobot's own ACT reaches **`success_rate = 0.8125` (13 / 16) on held-out seeds 101–116** at
+60,000 steps, against an acceptance threshold of 0.5 that was not touched, and the six-suite
+sweep from the Evaluation IR **passes**. This is the first time plan V has cleared the threshold,
+and the demo now exists as a video. On the demonstrations the packet named — V14's, collected
+against the *previous* predicate — the same recipe scores 0 / 16, and the measurement that
+explains the gap is in the data rather than in the policy.
+
+**The state feature is V17's two state ports, concatenated.** V17's policy reads the arm's six
+joint angles **and** V7a's simulator-privileged `sim_cube_pose`; V8's ACT read only the first,
+because `dataset_to_policy_features` gives a policy exactly one `observation.state` feature.
+Keeping V8's six would have moved the learner *and* what it may see, so the two are joined into
+the one feature LeRobot allows, in the order `qpos` already holds them: the export is
+`--state-dim 13` (`qpos[0..13]` — six angles, then the cube's seven-value free-joint pose), and
+the Observation IR is observation-v8's graph plus observation.toml's cube branch through an
+`ObservationNode::Concat` on axis 0, written by `python/es/make_v19_observation.py` from the two
+committed fixtures and never in place of them. Both branches normalize by the identity
+`Range{0..1}` for V8's reason — ACT's own `MEAN_STD` statistics are the first operation of its
+forward pass — and the `Concat` ports are `Frame::Policy`, the frame the IR already defines as
+compatible with any other, which is what a feature vector handed to a network is. No `es-ir`
+change: `Concat` has been an `ObservationNode` since M1 and `es-compile` lowers it to `Op::Join`.
+`observation_hash` is **`07fad282…`**, the third Observation IR on this Task IR (§7).
+
+**The thesis, and it is met.** `crates/es-policy/tests/act_checkpoint.rs` runs the real
+`lerobot.policies.act.modeling_act.ACTPolicy` and our `TorchRuntime` on the same recorded frame of
+this project's own dataset (frame 20 of the export: a 13-value state and a 96x96 tile), at every
+checkpoint evaluated — **eight** of them across the two exports (20k / 50k / 100k of the packet's
+run, 20k / 40k / 50k / 60k / 100k of ablation 1), `lerobot 0.6.1`, `torch 2.11.0+cu129`:
+
+| | chunk | `max_abs` | `max_rel` |
+|---|---|---|---|
+| every checkpoint, both exports | `[16, 6]` | **0e0** | **0e0** |
+
+Spec §8.9 tier 4 asks for `<= 1e-5`; the measurement is **zero**, on a policy with a CVAE, a DETR
+decoder and an ImageNet-pretrained backbone, none of which this project's Learning IR can
+describe. That is §8.1's promise discharged on an artefact we did not author, on the current
+documents and the current cadence.
+
+**One defect the run uncovered, in the import and not in the policy.**
+`es policy import-lerobot` wrote the Deployment IR's `deadlines.inference_budget` into **both**
+`RuntimeHints::deadline_ms` and `RuntimeHints::expected_latency_ms`. The second is documented in
+`es_ir::learning::RuntimeHints` as "a measurement on the reference device of §0.3, not a promise",
+and `LRN-052` checks `latency <= min(deadline, 1000 / replanning_hz)`. While the budget was V8's
+40 ms against a 200 ms re-plan period the two readings coincided; V17 stated a **240 ms** budget
+for the 5 Hz re-plan the same file declares, and `LRN-052` then refused *every* imported
+checkpoint — `measured latency 240.0 ms, budget 200.0 ms` — for claiming a latency that
+deployment's own rate forbids. The import now declares the **bound**, `min(budget, replan period)`
+(`declared_latency_ms`, with its unit test): V8's 40 ms is unchanged, V17's deployment gives
+200 ms, and the honest consequence is written where the number is made — `LRN-052` has nothing
+left to catch on this path, because a rule cannot check a number the same command invented. A
+measured latency would come from `es bench` (§12.4).
+
+**Training.** LeRobot's own trainer and ACT defaults (`resnet18` with `IMAGENET1K_V1`, `use_vae`,
+`latent_dim 32`, `dim_model 512`, 4 encoder / 1 decoder layers, `kl_weight 10.0`, `lr 1e-5`, all
+`MEAN_STD`), `--policy.chunk_size=16 --policy.n_action_steps=16` because the Deployment IR buffers
+a horizon of 16, `--steps=100000 --batch_size=8 --seed=0 --save_freq=10000`. 100,000 steps in
+2,239 – 2,773 s on the RTX 4090 shared with a second training and the evaluations; loss 6.3 (step
+200) → 0.115 (10k) → 0.053 (20k) → 0.038 (50k) → **0.028**, the same to three digits on both
+exports.
+
+#### The packet's run (`s13`): the dataset the packet named
+
+`~/artifacts/plan-v/v14/ds-train`, 200 episodes, 35,918 frames, export content hash `c08d1a39…`.
+Nominal suite, 1,800-step budget, `es eval run` under V17's cadence. "Carried" is the cube inside
+the three-dimensional bin volume, "released" the harness's older `gripper > 0.6` while it is
+there; both are read out of the `.estraj` by V17's `probe.py`.
+
+| checkpoint | suite | `success_rate` | lifted | **carried into the bin** | released (>0.6) | `envelope_violation_rate` | `episode_length` |
+|---|---|---|---|---|---|---|---|
+| 10,000 | held-out | 0.0000 | 12/16 | **12/16** | 1/16 | 0.9328 | 1800.0 |
+| 20,000 | training | 0.0000 | 11/16 | **10/16** | 7/16 | 0.9593 | 1800.0 |
+| 20,000 | held-out | 0.0000 | 7/16 | **7/16** | 5/16 | 0.9580 | 1800.0 |
+| 50,000 | training | 0.0000 | 14/16 | **14/16** | 0/16 | 0.9602 | 1800.0 |
+| 50,000 | held-out | 0.0000 | 10/16 | **9/16** | 0/16 | 0.9684 | 1800.0 |
+| 100,000 | training | 0.0000 | 12/16 | **12/16** | 0/16 | 0.9610 | 1800.0 |
+| 100,000 | held-out (twice) | 0.0000 | 9/16 | **9/16** | 0/16 | 0.9678 | 1800.0 |
+
+The two held-out runs at 100,000 produced **byte-identical `report.json`** files. Against V17's
+best on the same suite and budget, held-out: lifted 6/16 → **10/16**, carried 5/16 → **9/16**,
+`success_rate` 0.0625 → 0.0000.
+
+**Where those episodes end, and it is not in the air.** In every carrying episode the cube is
+lifted to z ~ 0.11 m, carried over the bin and left there: `z = 0.0279 m`, `|vz| = 0` for the
+whole remainder of the episode — the bin floor, and the same resting height the demonstrations
+themselves end at. The gripper sits at 0.19 – 0.31 rad, about 2.5x the 0.093 rad a jaw stalled on
+the 30 mm cube reads. **The cube is not held; it has been put down.** What the success cone reads
+is the jaw, and it needs `> 0.85`.
+
+**Why, measured on the data rather than argued.** V15 (section 7.23) raised that term from `> 0.6`
+to `> 0.85` and **re-collected** the 200 demonstrations, because the episode ends on the first tick
+the predicate fires and the threshold therefore decides how much of the release survives into the
+data. `~/artifacts/plan-v/v14/ds-train` (35,918 frames) is the **pre-V15** collection; V15's own
+`ds-train` (36,960 frames) is what V15 and V17 trained on. Over 40 episodes of each, the jaw angle
+recorded while the cube is inside the bin's x span:
+
+| demonstrations | frames | peak jaw while the cube is in the bin | final cube z |
+|---|---|---|---|
+| `v14/ds-train` (predicate `> 0.6`) | 35,918 | **0.572 – 0.576 rad** (median 0.573) | 0.0274 – 0.0278 |
+| `v15/ds-train` (predicate `> 0.85`) | 36,960 | **0.825 – 0.849 rad** (median 0.832) | 0.0279 |
+
+So the 35,918-frame set has a ceiling built into it: a *perfect* imitator opens the jaw to about
+0.573 rad and stops, 0.28 rad short of the term the Task IR now requires — and within a few
+milliradians of what this ACT actually does (peak 0.35 – 0.58 over the bin). The 0/16 above is not
+a policy failing to learn its demonstrations; it is a policy learning them, on a set collected
+against a predicate that no longer exists.
+
+#### Ablation 1 (`w13`): the same ACT on V15's re-collected demonstrations
+
+Run because the paragraph above is a prediction and the cheapest way to test a prediction is to
+make it. Identical in every other respect — same Observation IR (`07fad282…`), same Task and
+Deployment IR, same seeds, same recipe — against `v15/ds-train` (200 episodes, 36,960 frames,
+export content hash `55a958e1…`). At 60,000 steps: `learning_hash` and `policy_hash` are this
+run's; the bundle is `~/artifacts/plan-v/v19/w13-060000.esb`.
+
+| checkpoint | suite | `success_rate` | lifted | carried | released | `envelope_violation_rate` | `episode_length` |
+|---|---|---|---|---|---|---|---|
+| 20,000 | training | 0.0000 | 9/16 | 9/16 | 0/16 | 0.9721 | 1800.0 |
+| 20,000 | held-out | 0.0000 | 8/16 | 8/16 | 0/16 | 0.9679 | 1800.0 |
+| 40,000 | held-out | 0.6875 (11/16) | 11/16 | 11/16 | 11/16 | 0.9755 | 744.8 |
+| 50,000 | training | 0.5000 (8/16) | 9/16 | 8/16 | 8/16 | 0.9677 | 1025.9 |
+| 50,000 | held-out (twice) | 0.6250 (10/16) | 10/16 | 10/16 | 10/16 | 0.9687 | 831.9 |
+| **60,000** | **training** | **0.7500** (12/16) | 13/16 | 12/16 | 12/16 | 0.9509 | 644.9 |
+| **60,000** | **held-out (twice)** | **0.8125** (13/16) | 13/16 | **13/16** | **13/16** | 0.9692 | **539.9** |
+| 100,000 | training | 0.0000 | 8/16 | 8/16 | 0/16 | 0.9676 | 1800.0 |
+| 100,000 | held-out | 0.0625 (1/16) | 11/16 | 11/16 | 1/16 | 0.9506 | 1705.2 |
+
+Both repeated held-out runs came back **byte-identical**, and the 50,000 pair was repeated across
+different `--jobs` values (6 and 4) and still agreed byte for byte.
+
+Per episode at 60,000, held-out seeds 101–116 (`~/artifacts/plan-v/v19/e-w13-060000-holdout`):
+
+| cell | ticks | lift mm | lift @ | carry @ | release @ | final jaw | harness |
+|---|---|---|---|---|---|---|---|
+| nominal-00 | 248 | 127.6 | 105 | 163 | 242 | 0.801 | **success** |
+| nominal-01 | 218 | 124.9 | 107 | 166 | 203 | 0.848 | **success** |
+| nominal-03 | 234 | 130.1 | 121 | 180 | 222 | 0.836 | **success** |
+| nominal-04 | 286 | 138.8 | 110 | 196 | 278 | 0.834 | **success** |
+| nominal-05 | 229 | 129.6 | 128 | 195 | 223 | 0.802 | **success** |
+| nominal-06 | 248 | 133.7 | 109 | 183 | 239 | 0.843 | **success** |
+| nominal-07 | 226 | 132.6 | 104 | 182 | 219 | 0.830 | **success** |
+| nominal-08 | 246 | 134.6 | 127 | 195 | 241 | 0.799 | **success** |
+| nominal-10 | 229 | 124.4 | 115 | 164 | 213 | 0.846 | **success** |
+| nominal-11 | 254 | 124.3 | 127 | 183 | 239 | 0.847 | **success** |
+| nominal-12 | 297 | 165.6 | 136 | 230 | 280 | 0.840 | **success** |
+| nominal-13 | 274 | 145.0 | 131 | 210 | 259 | 0.849 | **success** |
+| nominal-15 | 250 | 123.8 | 138 | 193 | 245 | 0.808 | **success** |
+| nominal-02 / -09 / -14 | 1800 | 3.0 – 10.3 | — | — | — | −0.02 – 0.72 | timeout |
+
+Thirteen clean successes in **4.4 – 5.9 s** each, against a scripted demonstration that takes about
+7, and the three failures are all the same failure: the grasp misses and the cube never leaves the
+table (3 – 10 mm of lift). The final recorded jaw is 0.799 – 0.849 — the `.estraj` row is the
+**pre**-step state and the cone is judged on the post-step one, which is why 0.80 in the table is a
+`> 0.85` success; it is also, to three digits, the 0.825 – 0.849 the demonstrations end at. The
+policy reproduces its teacher's release, and the teacher's release is what the predicate was
+written for.
+
+**The schedule matters more than the total.** 20,000 steps releases nothing, 40,000 – 60,000
+releases on 11 – 13 of 16 held-out seeds, 100,000 releases on 1. The release is a 19-frame tail of
+a 183-frame episode (section 7.23), so the fit for it is transient and "train longer" is the wrong
+knob; both exports show the same shape, and the packet's own `--steps=100000` would have missed it
+had only the final checkpoint been evaluated. That is a general lesson about this dataset and not
+about ACT.
+
+**The six-suite sweep from the Evaluation IR, at 60,000, held-out seeds.** `passed: true` —
+the acceptance criterion (`nominal success_rate >= 0.5`) is met by the document's own judgement.
+
+| suite | `success_rate` | `envelope_violation_rate` | `episode_length` |
+|---|---|---|---|
+| nominal | **0.7500** | 0.9701 | 657.9 |
+| `light_intensity` | 0.3750 | 0.9763 | 1237.8 |
+| `light_direction` | 0.6250 | 0.9467 | 925.7 |
+| `observation_delay` | **0.8750** | 0.9586 | 490.7 |
+| `torque_noise` | 0.1875 | 0.9760 | 1580.8 |
+| `backlash` | 0.7500 | 0.9666 | 686.0 |
+
+The policy is robust to one and two control steps of observation delay (0.875, better than
+nominal) and to backlash, degrades by half under a light-intensity gain — it is a vision policy
+trained on one lighting condition — and is worst under `torque_noise` (0.1875), which perturbs the
+one thing the 96x96 frame cannot show.
+
+**The videos.** `es video showcase` over the 60,000 held-out run through V9's camera (eye
+`(0.66, −0.46, 0.52)`, look-at `(0.14, −0.04, 0.04)`, fovy 36°, 1280x720) for cells `nominal-00`
+and `nominal-11`, and `es video mosaic --grid 4x4` over the same run's observation tiles with the
+Safety Plane overlay, all encoded by `python/es/encode_video.py`:
+`v19-60k-nominal-00.mp4`, `v19-60k-nominal-11.mp4`, `v19-60k-mosaic.mp4`, mirrored to
+`target/plan-v/v19/` (the 50,000-step set is beside them). Per §5.3 the mp4 container is not in
+the hash chain; the frames are the evidence.
+
+#### Ablation 2 (`s6`): V8's own six-dimensional joint-only state
+
+Run to separate "the learner" from "what the learner may see", since V8's ACT had no cube pose and
+V17's IR-graph policy did. Trained to 100,000 steps on the 35,918-frame export (loss 6.615 →
+0.029, 2,767 s) and **not evaluated**: the box was needed for ablation 1, and the jaw ceiling
+measured above applies to it unchanged, so its evaluation would re-measure the same data defect
+with one input fewer. Whether an external ACT needs the privileged cube pose at all is therefore
+**not answered here** and is the cheapest remaining experiment: the checkpoint exists.
+
+#### What it still costs, and two things the run did not know
+
+`envelope_violation_rate` is 0.95 – 0.98 on every run of both exports, `violation.acceleration` on
+the large majority of control ticks, with the `EnvelopeViolationRate` watchdog latching the
+fallback for 592 – 2,134 ticks. That is V17's open question 25 unchanged in kind (0.998 there) and
+unchanged in cause: executing a chunk's rows 0..9 in order asks for more per-tick travel than
+`acceleration_max = 20 rad/s²` allows. It is worth stating plainly that **the demo succeeds while
+the plane clamps on nearly every tick** — these are not clean commands, they are the Safety Plane
+holding a jerky command stream inside an envelope that did not move (`INV-12`). No arm joint
+leaves its position bound except `wrist_flex` on ~0.1 % of ticks, and the gripper — pinned at its
+lower soft bound for half of every V14 episode — is at 0.0 %.
+
+1. **A 16-row chunk under a 10-tick re-plan is a different execution regime from V17's.** The
+   lowered ACT chunk is `[16, 6]` and `replan_interval` is ten control ticks, so **two chunks are
+   live at once** and the `TemporalEnsemble` averages row `k` of the new chunk with row `k + 10` of
+   the previous one. V17's IR-graph policy had a 10-row chunk, for which the same arithmetic
+   degenerates to a single member (section 7.25). Nothing is special-cased and the numbers are the
+   Deployment IR's own, but the comparison "IR-graph vs external ACT" carries this difference
+   inside it, and it is one unverified candidate for why 20,000 and 100,000 steps under-open the
+   jaw while 40,000 – 60,000 do not.
+2. **The nominal suite's numbers moved when the other five suites were in the document.** The
+   standalone nominal run at 50,000 scores 0.6250 and the nominal row of the six-suite sweep on the
+   same checkpoint scores 0.5625, with different cells succeeding. It is not `--jobs`: re-running
+   the standalone config at `--jobs 8` reproduced 0.6250 **byte for byte**, and the two repeats at
+   `--jobs 6` and `--jobs 4` also agree byte for byte. So something the trim changes — most likely
+   the document the streams are derived through — reaches the nominal suite's draws, and §10.4's
+   "adding a suite cannot move another's numbers" does not hold for this pair as measured. Every
+   number in this section is reported with the document it was measured under; that is open
+   question 27.
+
+**Reading against V8 and V17.** V8 concluded that the model was not the problem, because a real
+LeRobot ACT scored 1/16 where our IR-shaped graph scored 0–1/16. That conclusion was right about
+the model and wrong about what followed from it: the harness was broken in three ways and the
+training set was 50 episodes at the wrong cadence against a predicate that has since changed. With
+all three repairs and 200 demonstrations collected against the current predicate, the same
+external ACT scores **13/16 held-out** where the IR-shaped graph, on the same data and the same
+harness, scores 1/16 (V17). The two hypotheses V8 could not separate now separate: **the model was
+a problem, the harness was a problem, and the demonstrations were a problem** — and only fixing
+all three produced a demo. What V8 proved and V19 re-proves unchanged is the part that was never
+in doubt once measured: an ACT trained entirely outside this project, run through this project's
+Observation IR, Deployment IR, Safety Plane and evaluation, is bitwise the same function. The
+demo exists, and the policy in it is not ours.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -3972,3 +4224,31 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     at 0.71. Default: **(c) until a release is scored on held-out seeds**, then (a) — the number
     only became binding once the chunk's later rows started executing, and what it binds on is
     the same command stream every demonstration already contains.
+26. **Which 200 demonstrations are "the current demonstrations", and what does the export point
+    at** (section 7.27, V19). `~/artifacts/plan-v/v14/ds-train` (35,918 frames) was collected
+    against the success predicate's old `gripper > 0.6` term; V15 raised that term to `> 0.85` and
+    **re-collected** into `~/artifacts/plan-v/v15/ds-train` (36,960 frames), which is what V15 and
+    V17 trained on. Measured over 40 episodes of each, the peak jaw angle recorded while the cube
+    is inside the bin is **0.573 rad** in the first and **0.832 rad** in the second, so the older
+    set has a ceiling built into it: a perfect imitator of it cannot satisfy the predicate the
+    Task IR now carries. V19 trained the same external ACT on both and measured 0/16 and 13/16
+    held-out. Nothing in the tree marks one of the two as superseded — both are directories on the
+    oracle server, both are 200 episodes of the same scene, and the packet that opened V19 named
+    the wrong one. Default: **treat `v15/ds-train` as the demonstrations and record the predicate
+    each collection was taken under in the export's `es_provenance.json`**, so a training run
+    cannot silently be fitted to a retired predicate. The alternative — re-collect on every
+    predicate change and keep only the newest — is what V15 already did once by hand.
+27. **A suite's numbers move when the other suites are in the document** (section 7.27, V19).
+    `evaluation-v8.toml` trimmed to the nominal suite alone scores `success_rate = 0.6250` on the
+    60,000-step checkpoint's neighbour at 50,000, and the nominal row of the *same* checkpoint's
+    six-suite sweep scores `0.5625`, with different cells succeeding. It is not the sharding:
+    re-running the trimmed document at `--jobs 8` reproduced `0.6250` byte for byte against the
+    `--jobs 6` run, and a second `--jobs 4` repeat agreed byte for byte again. So the difference is
+    the document, and §10.4's "every suite draws from its own `stream`, so adding one of these rows
+    cannot move another's numbers" — which sections 7.8 onward have relied on — does not hold for
+    this pair as measured. What a human owes is a decision on whether a suite's draws are allowed
+    to depend on the Evaluation IR they travel in (defensible: `evaluation_hash` is in
+    `execution_hash`, so the two runs are honestly different executions) or must not (also
+    defensible: it is what §10.4 says). Default: **state the document beside every number**, which
+    section 7.27 does, until the rule is decided; every trimmed-document table from V11 onward was
+    measured this way and is internally consistent, but is not interchangeable with a sweep's row.
