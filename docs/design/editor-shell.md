@@ -113,8 +113,9 @@ stream is attached (§23.3), that frame replaces the gradient and nothing else c
 
 `eframe` / `egui` `0.32.3`, pinned in the workspace. Not the newest release (0.36.2): 0.32 is
 the last one whose MSRV matches the workspace `rust-version` (1.85). Features are minimal —
-`glow` + `default_fonts` + the two Linux windowing backends `x11` / `wayland`; no accesskit, no
-wgpu, no persistence — which keeps the incremental rebuild of this crate at ~2.4 s.
+`glow` + `default_fonts` + the two Linux windowing backends `x11` / `wayland`; no accesskit and
+no wgpu — which keeps the incremental rebuild of this crate at ~2.4 s. `persistence` is added
+by this crate alone, for the recent-files list (section 12).
 
 `x11` / `wayland` are required on Linux, not only for a runnable binary: with neither, winit
 0.30 stops at its own `compile_error!` ("The platform you're compiling for is not supported by
@@ -200,10 +201,8 @@ is the part that would actually be hard to get right, is not something snarl doe
 
 ### Not here
 
-- Search, minimap, multi-select, copy/paste, box-select (§23.4 lists search and large-graph
-  performance as stage-2 needs; the single-selection canvas is what the six edits need).
-- A parameter inspector panel. `Edit::SetParam` and `NodeSchema` are both in place and tested;
-  the widget that fills a `ParamType` in is UI work with no model behind it left to design.
+- Multi-select, copy/paste, box-select, minimap — section 12, which is where search and the
+  parameter inspector went (M7/E3) and where the four of them are argued out.
 - Editing Observation IR nodes, and the Control Graph (IR-C) — stage 3, M4.
 
 ---
@@ -404,3 +403,123 @@ the orchestrator opens) is the same bytes at a different arm.
   moment a run writes its rate down.
 - **Camera presets and scene cameras.** `--camera NAME` (the showcase's other mode) needs the
   scene's own camera list; the free camera is what a person dragging a mouse wants.
+
+---
+
+## 12. Editing like a person does: the inspector, search, and opening (§23.4, M7/E3)
+
+§23.4 names three things stage 2 needs that stage 2 did not have: **parameters**, **search**,
+and **large-graph performance**. Two of the three are here. `Edit::SetParam` and `NodeSchema`
+had been in place and tested since M4 with no widget behind them — a node's parameters could
+only be changed by editing TOML — and the only way to open anything was to type its path.
+
+Three model files, one rule each (§28.10 rule 3: nothing is decided in `app.rs`).
+
+| Model | Owns | Tested by |
+|---|---|---|
+| `model/inspector.rs` | which widget a `ParamType` gets, what a person's text means, whether it becomes an `Edit` | `every_param_type_has_one_widget`, `set_param_round_trips_through_the_inspector`, `a_bad_field_never_emits_an_edit` |
+| `model/search.rs` | what a query matches, in what order, which hit is next | `search_is_case_insensitive_and_ordered` |
+| `model/recent.rs` | what a path on disk is, and the last ten opened | `classify_tells_bundle_documents_and_run_apart`, `recent_is_capped_deduplicated_and_round_trips` |
+
+### The inspector
+
+`Inspector::for_node(session, node)` reads the node's `NodeSchema` from the session's own
+registries and its current parameters from **the same re-serialization `Edit::SetParam` does**
+before handing the table back to the factory — so what the panel shows and what a `SetParam`
+overwrites are one table, and there is no per-kind code here any more than in `edit.rs`
+(`docs/design/node-sdk.md`). A kind added to `es-ir` is inspectable with no change.
+
+**One widget per `ParamType`, and the match has no wildcard arm.** `Bool → checkbox`,
+`Int → drag int`, `Float → drag float`, `String → text`, `Enum(vs) → combo`,
+`Shape → text parsed as [a, b, …]`, `PortType → text parsed as inline TOML`. Adding a variant
+to `ParamType` must break this crate's *build*, because the alternative — a wildcard arm — is a
+parameter that silently cannot be edited. The seven `Widget`s are pairwise distinct so the
+table test is worth running.
+
+**`Field::parse` is the only place text becomes a value**, and an erroneous field never emits
+an edit: `Inspector::edit` records the reason on the field and returns `None`, so the session
+never hears about `"abc"` in an `Int` box. `Bool` and `Enum` cannot fail from the UI — a
+checkbox writes `true`/`false` and a combo writes a variant it was given — but they are
+fallible here rather than panicking on text that arrived some other way.
+
+**The fields are the schema's, restricted to the keys the node actually serialized.** An
+`Option` field holding `None` is not in the table, and `params_with` refuses a key the node
+does not have (`FACTORY-003`), so drawing it would be drawing a dead control. Two smaller
+consequences of `es-ir`'s `infer_param_type` having only one observed value to work from:
+`ParamType::String` is its catch-all (an array of floats, a datetime), so a field whose current
+value is not a string is edited as the TOML it prints as; and an `Enum`'s variant list is
+whatever the *example* instance showed, so a value using a variant the schema never saw has it
+added to the combo rather than hidden.
+
+**A plain click selects.** Stage 2 set `selected` only on `drag_started`, which was enough
+when selection existed to be deleted and dragged; with an inspector hanging off it, a node
+that had to be *dragged* before it could be read was the defect that blocked this packet's
+acceptance. A click now runs `CanvasView::hit` — the same hit test `start_drag` uses, so what
+can be dragged can be clicked — and a click on the background clears the selection. It is
+`clicked()`, the primary button only, so the right-click that opens the add-node menu leaves
+the selection alone. This is the one piece of `app.rs` with a test of its own
+(`a_click_hits_the_node_under_it_and_nothing_on_the_background`): `CanvasView` is positions,
+rectangles and names, so it needs no display, and the assertion that the click and the drag
+read one geometry is worth more than the section-2 rule of leaving `app.rs` unjudged.
+
+**An edit is meant to be watched.** The status line carries the IR's `*_hash` (its first four
+bytes, which is what a person compares at a glance) and the count of what it complains about,
+both taken from the session and both live; the Diagnostics tab shows the session's list rather
+than the opened bundle's whenever one is open, because `EditSession::apply` re-validates after
+every edit and the bundle's list is a snapshot of the files on disk. Changing a `Normalize`
+range moves all three at once.
+
+**The panel is rebuilt when the selection moves or the session does** — keyed on
+`(selected, history().len())`. Between those the widgets own their text, so typing survives a
+repaint; an undo behind the panel's back does not leave stale text in the boxes.
+
+### Search
+
+`Search::filter(query, &LayeredGraph)` is a case-insensitive substring over each node's kind
+tag, label and port names, in layer-then-`NodeId` order; an empty query matches **nothing**,
+because a box nobody has typed in has not found the whole graph. `advance()` cycles.
+
+There are two sources and one matcher. Read-only mode searches the four stacked IRs;
+`filter_session` searches the one IR being edited, which may already hold nodes the layered
+view was built before — searching the stale view instead would be one function fewer and
+wrong after the first `AddNode`. It reports the same `(layer, node)` pair, using the label the
+canvas paints, so `app.rs` resolves a hit the same way whichever half found it.
+
+Centring is the one thing left to `app.rs`, and it is the one line the packet promised:
+`pan = canvas/2 − (position + node/2) × zoom`. The hit is ringed in read-only mode and
+*selected* in edit mode — which also opens it in the inspector, so "find the node, change its
+range" is two gestures.
+
+### Opening
+
+`recent::classify(path)` is the single answer to what a path is: `Run` if
+`RunView::is_run_dir` says so (§10 reuses that one call, so the classification and the reader
+cannot drift), `Documents` for any other directory, `Bundle` for anything that is not a
+directory. A file that turns out not to be a `.esb` fails with the bundle reader's own error,
+which says more than "not a directory" would. The text field, the command line, the File
+menu's recent list and a dropped file (`ctx.input(|i| i.raw.dropped_files)`) all go through
+`EditorApp::open`, so there is one way in and one set of errors out.
+
+`Recent` keeps ten, most recent first, deduplicated on push, and is persisted through
+`eframe::App::save` under the key **`es-editor.recent`** — a JSON array of paths in
+`%APPDATA%\Electric Sheep editor\data\app.ron` on Windows,
+`~/.local/share/electricsheepeditor/app.ron` on Linux. That needs `eframe`'s `persistence`
+feature, which is the one feature this crate adds on top of the workspace's minimal set (§7);
+it brings `ron` and `home` behind `eframe` and no new dependency entry. A store written by
+another version is rebuilt through `push`, so a hand-edited file cannot smuggle in duplicates
+or an eleventh entry — and an unreadable one is an empty list, because a lost recent list is
+worth less than the editor starting.
+
+### Not here
+
+- **Multi-select, copy/paste and box-select.** All three are `Edit` *sequences*, not new
+  edits: the six edits already express them, and what would have to be designed is a selection
+  model and a clipboard the undo stack agrees with. Neither is what §23.4 asks stage 2 for.
+- **A minimap.** §23.4's third stage-2 need is large-graph *performance*, and search is the
+  half of it a person feels; a minimap is a second renderer of the same layout. When the
+  canvas is too slow to pan, the answer is culling in `CanvasView`, not a small copy of it.
+- **A file dialog.** `rfd` is a dependency, a native modal and a second way in; a text field,
+  a recent list and drag-and-drop cover the three ways a path actually arrives.
+- **Editing an Observation IR node's parameters.** No factory owns those kinds (`INV-17`), so
+  they have no `NodeSchema` and no inspector — the same boundary `Edit::SetParam` reports as
+  `FACTORY-001`.
