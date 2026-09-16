@@ -619,6 +619,27 @@ fn frame_profile() {
         let mut renderer = Renderer::new(&gpu, cfg).expect("renderer");
         let cams = [showcase_camera(w, h)];
         let mut cache = es_render::SceneCache::default();
+        renderer
+            .upload_tris(cache.tri_scene(&scene, &world).expect("tessellates"))
+            .expect("upload");
+
+        // Sustained rendering, no readback: 100 `render()` calls back to back, after a
+        // warm-up of 30. This is the renderer's own cost and the number that reproduces.
+        // The four-phase loop below spends most of its wall clock inside an uncached host
+        // read, and an idle GPU on this machine drops to P8 and **PCIe gen 1**
+        // (`nvidia-smi --query-gpu=pstate,pcie.link.gen.current`), which slows every phase
+        // of the next frame — so an end-to-end total measured on a cold card is a
+        // measurement of the driver's power policy, not of the renderer (spec 28.9 rule 3).
+        // The warm-up is what makes the before/after tables comparable.
+        let mut sustained = Vec::new();
+        for i in 0..130 {
+            let t = std::time::Instant::now();
+            let _ = renderer.render(&cams).expect("render");
+            if i >= 30 {
+                sustained.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+        }
+
         let (mut tess, mut up, mut disp, mut read) = (vec![], vec![], vec![], vec![]);
         for _ in 0..100 {
             let t0 = std::time::Instant::now();
@@ -637,6 +658,7 @@ fn frame_profile() {
             disp.push(ms(t2, t3));
             read.push(ms(t3, t4));
         }
+        let (smed, sp95) = median_p95(sustained);
         let total: Vec<f64> = (0..tess.len())
             .map(|i| tess[i] + up[i] + disp[i] + read[i])
             .collect();
@@ -646,6 +668,7 @@ fn frame_profile() {
         );
         println!("| phase | median ms | p95 ms |");
         println!("|---|---|---|");
+        println!("| render(), sustained, no readback | {smed:.3} | {sp95:.3} |");
         for (name, v) in [
             ("tessellate", &tess),
             ("upload", &up),
@@ -662,6 +685,12 @@ fn frame_profile() {
             1e3 / med,
             f64::from(w) * f64::from(h) * 1e3 / med
         );
+        println!(
+            "sustained: camera_frames_per_sec {:.1}, pixels_per_sec {:.3e}",
+            1e3 / smed,
+            f64::from(w) * f64::from(h) * 1e3 / smed
+        );
+
         // Where the readback goes. `Buffer::download` on device-local memory allocates a
         // host-visible staging buffer, copies into it and reads it back with `to_vec`;
         // host-visible memory is write-combined, so the *read* is most of the cost. This
