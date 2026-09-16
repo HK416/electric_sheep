@@ -29,8 +29,18 @@ pub struct Contract {
     pub weight_shapes: BTreeMap<String, Vec<u64>>,
     pub action_dim: u32,
     pub horizon: u32,
-    /// Graph input port -> the shape `forward(**inputs)` expects for it.
+    /// Graph input port -> the shape of **one sample** of it. Spec 5.2 keeps the batch out of
+    /// every declared shape, so this is the IR's shape verbatim; `batch_axis` says what the
+    /// module does with it.
     pub inputs: BTreeMap<String, Vec<u64>>,
+    /// The module's `forward` takes every input with a leading batch axis and returns every
+    /// output with one: `inputs[p]` is fed as `[N, ..inputs[p]]` (packet M7/T3).
+    ///
+    /// Always `true` for a module [`lower_to_torch`] produced. It is written down rather than
+    /// assumed because a reader that does not know the key treats the module as single-sample
+    /// and then fails on a shape, which is the failure one wants: silently feeding `[C, H, W]`
+    /// to a module expecting `[N, C, H, W]` is how a trainer optimizes the wrong function.
+    pub batch_axis: bool,
 }
 
 impl Contract {
@@ -46,6 +56,7 @@ impl Contract {
                 .iter()
                 .map(|p| (p.name.clone(), p.ty.shape.dims().to_vec()))
                 .collect(),
+            batch_axis: true,
         }
     }
 }

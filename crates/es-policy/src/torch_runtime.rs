@@ -42,6 +42,12 @@ enum Request<'a> {
     Load {
         source: &'a str,
         weights_path: &'a str,
+        /// Whether `forward` takes a leading batch axis, i.e. whether the module came from
+        /// [`lower_to_torch`] (packet M7/T3) rather than from `lerobot::lower_act`. The
+        /// reference process then feeds one sample as `[1, ..]` and strips the axis off every
+        /// output: spec 5.2 makes the inference domain's batch the runtime's business, and
+        /// this runtime's is one.
+        batch_axis: bool,
     },
     Infer {
         inputs: BTreeMap<String, WireTensor>,
@@ -289,7 +295,10 @@ impl TorchRuntime {
         weights: &WeightsSource,
     ) -> Result<PolicyInfo, PolicyError> {
         let (path, bytes) = self.checkpoint(weights)?;
-        self.start(module, policy, &path, &bytes)
+        // Not [`lower_to_torch`]'s module, so not its batch axis: `lower_act` emits ACT's own
+        // `forward`, which takes one observation batched or not and returns the chunk with no
+        // batch axis on it.
+        self.start(module, false, policy, &path, &bytes)
     }
 
     /// Everything after the checkpoint is in hand, shared with [`PolicyRuntime::load`], which
@@ -297,6 +306,7 @@ impl TorchRuntime {
     fn start(
         &mut self,
         module: &TorchModule,
+        batch_axis: bool,
         policy: &PolicyHandle,
         path: &std::path::Path,
         bytes: &[u8],
@@ -315,6 +325,7 @@ impl TorchRuntime {
         let reply: LoadReply = process.call(&Request::Load {
             source: &module.source,
             weights_path: &path.to_string_lossy(),
+            batch_axis,
         })?;
 
         let info = PolicyInfo {
@@ -356,11 +367,11 @@ impl PolicyRuntime for TorchRuntime {
         // `PolicyHandle` and no preprocessor nodes -- so there is nothing for
         // `lower_to_torch` to lower and the module comes from `lower_act`. Everything below
         // is unchanged: the declared hash still decides which bytes these are.
-        let module = match crate::lerobot::embedded_config(&bytes)? {
-            Some(cfg) => crate::lerobot::lower_act(&cfg)?,
-            None => lower_to_torch(graph)?,
+        let (module, batch_axis) = match crate::lerobot::embedded_config(&bytes)? {
+            Some(cfg) => (crate::lerobot::lower_act(&cfg)?, false),
+            None => (lower_to_torch(graph)?, true),
         };
-        self.start(&module, &graph.policy, &path, &bytes)
+        self.start(&module, batch_axis, &graph.policy, &path, &bytes)
     }
 
     fn infer(
@@ -509,10 +520,11 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&Request::Load {
                 source: "pass",
-                weights_path: "w.safetensors"
+                weights_path: "w.safetensors",
+                batch_axis: true
             })
             .unwrap(),
-            r#"{"cmd":"load","source":"pass","weights_path":"w.safetensors"}"#
+            r#"{"cmd":"load","source":"pass","weights_path":"w.safetensors","batch_axis":true}"#
         );
         let t = crate::equiv::action_chunk(1, 2, &[1.0, 2.0]);
         let inputs = [("x".to_owned(), WireTensor::encode(&t).unwrap())].into();

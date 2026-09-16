@@ -2,7 +2,7 @@
 
 Line-delimited JSON on stdin, one JSON object per line on stdout. Requests:
 
-    {"cmd": "load",  "source": str, "weights_path": str}
+    {"cmd": "load",  "source": str, "weights_path": str, "batch_axis": bool}
     {"cmd": "infer", "inputs": {name: {"shape": [int], "dtype": "F32", "data_b64": str}}}
     {"cmd": "quit"}
 
@@ -10,6 +10,12 @@ Every response is {"ok": true, ...} or {"ok": false, "error": str}.
 
 `source` is the file `es_policy::lower::torch` generated from the LearningGraph; it defines
 `class EsPolicy(nn.Module)` whose `forward(**inputs)` returns a dict of named tensors.
+
+`batch_axis` says that `forward` wants a leading batch axis on every input and puts one on
+every output (packet M7/T3, the shape `train_act.py` trains). Inference here is one sample, so
+this process feeds `[1, ..]` and strips the axis off again before replying: spec 5.2 gives the
+inference domain its own batch size and the module has no say in it. A `lerobot::lower_act`
+module sets it false -- it takes one observation and returns an unbatched chunk.
 
 Three things this script deliberately does not do:
 
@@ -103,17 +109,21 @@ def encode(tensor):
     }
 
 
-def infer(model, inputs):
+def infer(model, inputs, batch_axis):
     tensors = dict((name, decode(name, spec)) for name, spec in inputs.items())
+    if batch_axis:
+        tensors = dict((name, t.unsqueeze(0)) for name, t in tensors.items())
     with torch.inference_mode():
         outputs = model(**tensors)
     if not isinstance(outputs, dict):
         raise TypeError("forward returned %s, expected a dict" % type(outputs).__name__)
+    if batch_axis:
+        outputs = dict((name, value[0]) for name, value in outputs.items())
     return dict((name, encode(value)) for name, value in outputs.items())
 
 
 def main():
-    model = None
+    model, batch_axis = None, False
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -125,11 +135,12 @@ def main():
                 return
             if command == "load":
                 model = build(request["source"], request["weights_path"])
+                batch_axis = bool(request.get("batch_axis"))
                 reply = {"ok": True, "torch_version": torch.__version__, "protocol": PROTOCOL}
             elif command == "infer":
                 if model is None:
                     raise ValueError("no policy is loaded")
-                reply = {"ok": True, "outputs": infer(model, request["inputs"])}
+                reply = {"ok": True, "outputs": infer(model, request["inputs"], batch_axis)}
             else:
                 raise ValueError("unknown command %r" % (command,))
         except Exception as exc:  # Any failure is a typed error on the wire, never a dead pipe.
