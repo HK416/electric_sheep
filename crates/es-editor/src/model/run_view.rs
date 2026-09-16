@@ -142,6 +142,13 @@ pub fn severity(source: EventSource) -> u8 {
 }
 
 impl Timeline {
+    /// The strip's own heading: `"nominal-00: 224 frame(s)"`. Frames, not ticks — the rows are
+    /// `events.json` records, one per control step, and [`KindRow::label`] counts the same
+    /// thing. The unit is the model's to name (spec 28.10 rule 3).
+    pub fn heading(&self, cell: &str) -> String {
+        format!("{cell}: {} frame(s)", self.rows.len())
+    }
+
     /// The per-kind summary in `ViolationKind` order, ready to print.
     pub fn kind_rows(&self) -> Vec<KindRow> {
         self.totals
@@ -834,7 +841,9 @@ mod tests {
     #[test]
     fn a_kind_row_labels_the_frame_and_the_tick() {
         let view = RunView::open(&fixture()).expect("open the fixture run");
-        let rows = view.timeline("nominal-01").kind_rows();
+        let timeline = view.timeline("nominal-01");
+        assert_eq!(timeline.heading("nominal-01"), "nominal-01: 4 frame(s)");
+        let rows = timeline.kind_rows();
         assert_eq!(rows.len(), 2, "{rows:?}");
         let velocity = rows
             .iter()

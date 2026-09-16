@@ -57,6 +57,7 @@ crates/es-env/src/domains.rs
 crates/es-env/src/inference.rs
 crates/es-env/src/lib.rs
 crates/es-env/tests/*.rs
+crates/es/src/cmd/eval.rs
 crates/es/tests/cli.rs
 docs/design/evaluation-execution.md
 docs/design/evaluation-execution.ko.md
@@ -72,6 +73,13 @@ unchanged, and a test says so), `crates/es/tests/cli.rs` (the parity oracle; exi
 assert tick-0 execution are updated and named in the note), `crates/es-eval/tests/*.rs`,
 `docs/design/evaluation-execution*.md`, `docs/design/visible-learning*.md` (open question 24, new
 section), `docs/packets/M7/T7-eval-latency*.md`.
+
+`crates/es/src/cmd/eval.rs` was added to the block during the packet (one line, listed in the
+report): `Evaluation::run` is handed the four IRs it judges and **never** the `LearningGraph`
+(`crates/es-eval/src/runner.rs`, `hash_chain`: "`run` is not given the `LearningGraph`"), so the
+contract's `expected_latency_ms` has no route into `es-eval` except from the caller that opened
+the bundle. Without that line `es eval run` would keep evaluating at zero latency and the
+re-measurement below would measure nothing. Nothing else in `crates/es/src/**` is touched.
 
 ## oracle
 

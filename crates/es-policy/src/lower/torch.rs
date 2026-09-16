@@ -237,6 +237,9 @@ class _Denoiser(nn.Module):
         self.l1 = nn.Linear(cond, x_dim)
 
     def forward(self, x, cond, temb):
+        # The embedding is a function of the step alone, so it is one row for the whole batch;
+        # `expand` is a view, so every row reads the same numbers the unbatched cat read.
+        temb = temb.expand(x.shape[0], -1)
         return self.l1(torch.relu(self.l0(torch.cat([x, cond, temb], dim=-1))))
 ";
 
@@ -259,7 +262,10 @@ class _DdpmHead(nn.Module):
                 self.register_buffer("noise_%d" % t, torch.zeros(x_dim))
 
     def forward(self, cond, noise):
-        x = noise.reshape(-1)
+        # `[N, x_dim]`: the sampler's state is the flattened chunk, per sample. Every
+        # coefficient below is a Python float and every buffer is `[x_dim]`, so each line is
+        # the expression the unbatched loop ran, broadcast over the batch (packet M7/T3).
+        x = noise.reshape(noise.shape[0], -1)
         for i, t in enumerate(self.ts):
             eps = self.net(x, cond, _sinusoidal(float(t), self.cond))
             x0 = (x - self.sb[i] * eps) / self.sa[i]
@@ -268,7 +274,7 @@ class _DdpmHead(nn.Module):
             x = self.c0[i] * x0 + self.cx[i] * x + self.ce[i] * eps
             if self.sigma[i] != 0.0:
                 x = x + self.sigma[i] * getattr(self, "noise_%d" % t)
-        return x.reshape(self.horizon, self.action_dim)
+        return x.reshape(-1, self.horizon, self.action_dim)
 "#;
 
 /// The flow-matching head: Euler integration of `dx/dt = v_theta(x, cond, t)` from the noise at
@@ -283,12 +289,12 @@ class _FlowHead(nn.Module):
         self.n_steps = n_steps
 
     def forward(self, cond, noise):
-        x = noise.reshape(-1)
+        x = noise.reshape(noise.shape[0], -1)
         dt = 1.0 / self.n_steps
         for i in range(self.n_steps):
             v = self.net(x, cond, _sinusoidal(i / self.n_steps, self.cond))
             x = x + dt * v
-        return x.reshape(self.horizon, self.action_dim)
+        return x.reshape(-1, self.horizon, self.action_dim)
 ";
 
 /// A lowered graph: a complete `PyTorch` file plus the checkpoint contract it implies.
@@ -579,12 +585,13 @@ impl Lowering {
                 self.needs_torchvision = true;
                 self.member(id, &format!("_backbone({name:?}, {out_dim})"));
                 self.claim(id);
-                // The IR port is one image (spec 8.3 has no batch axis — spec 5.2 gives the
-                // inference domain its own batch size), so run it as a one-image batch, the
-                // same trade the token-less `TemporalEncoder` arm below makes. The backbone
-                // needs that axis either way: torchvision's `_forward_impl` ends in
-                // `torch.flatten(x, 1)`, and `nn.GroupNorm` reads dim 0 as the batch.
-                Ok(format!("self.n{k}({}.unsqueeze(0)).squeeze(0)", args[0]))
+                // `[N, C, H, W]` straight in: the IR port is one image (spec 8.3 has no batch
+                // axis — spec 5.2 gives each domain its own batch size), but the *module* has
+                // one, so the axis the backbone always needed is now the caller's and no
+                // longer faked per sample. torchvision's `_forward_impl` ends in
+                // `torch.flatten(x, 1)` and `nn.GroupNorm` reads dim 0 as the batch, so this
+                // is the shape both were written for.
+                Ok(format!("self.n{k}({})", args[0]))
             }
 
             LearningNode::StateEncoder { kind, out_dim, .. } => match kind {
@@ -674,9 +681,12 @@ impl Lowering {
                         ),
                     );
                     self.claim(id);
-                    // A pooled feature has no token axis; run it as a one-token sequence.
+                    // A pooled feature has no token axis; run it as a one-token sequence. The
+                    // layer is `batch_first=True`, so the token axis is 1 — which is the whole
+                    // difference the batch axis makes here: the sequence is now a real one
+                    // sitting beside a real batch, not a batch pretending to be a sequence.
                     Ok(if *token_count == 0 {
-                        format!("self.n{k}({}.unsqueeze(0)).squeeze(0)", args[0])
+                        format!("self.n{k}({}.unsqueeze(1)).squeeze(1)", args[0])
                     } else {
                         format!("self.n{k}({})", args[0])
                     })
@@ -694,7 +704,7 @@ impl Lowering {
                     let width = u64::from(*horizon) * u64::from(*action_dim);
                     self.linear(id, in_dim(node, 0, id)?, width);
                     Ok(format!(
-                        "self.n{k}({}).reshape({horizon}, {action_dim})",
+                        "self.n{k}({}).reshape(-1, {horizon}, {action_dim})",
                         args[0]
                     ))
                 }
@@ -788,7 +798,7 @@ impl Lowering {
             // Only `execute_chunk` is a tensor operation; the rest of the node is runtime
             // scheduling (spec 8.6) and is not observable in one `infer`.
             LearningNode::ActionChunker { execute_chunk, .. } => {
-                Ok(format!("{}[:{execute_chunk}]", args[0]))
+                Ok(format!("{}[:, :{execute_chunk}]", args[0]))
             }
 
             LearningNode::Normalizer {
@@ -966,7 +976,7 @@ mod tests {
         // Boundary inputs by name, the chunker's slice, and the declared output name.
         assert!(m.source.contains("inputs[\"rgb_front\"]"));
         assert!(m.source.contains("inputs[\"joint_state\"]"));
-        assert!(m.source.contains("[:20]"));
+        assert!(m.source.contains("[:, :20]"));
         assert!(m.source.contains("return {\"actions\": v5_actions}"));
         assert!(m.source.contains("import torchvision"));
     }
@@ -991,6 +1001,74 @@ mod tests {
                 assert!(!key.contains(stat), "contract declares `{key}`");
             }
         }
+    }
+
+    /// Packet M7/T3. Every port of the lowered module carries a **leading batch axis**, so a
+    /// trainer feeds `N` samples through one forward instead of accumulating `N` single-sample
+    /// forwards (spec 28.9 rung 9). It is a lowering decision and not an IR one: spec 5.2 keeps
+    /// the batch out of every declared shape, so `contract.json` still lists per-sample shapes
+    /// and says `batch_axis` beside them.
+    #[test]
+    fn the_module_has_a_batch_axis() {
+        for (name, g) in [("act", act()), ("ddpm", ddpm()), ("flow", flow())] {
+            let m = lower_to_torch(&g).unwrap();
+            // The idiom that used to fake the axis for one sample, in either direction.
+            assert!(!m.source.contains(".unsqueeze(0)"), "{name}: {}", m.source);
+            assert!(!m.source.contains(".squeeze(0)"), "{name}: {}", m.source);
+            let contract = crate::lower::Contract::new(&m, &g);
+            assert!(contract.batch_axis, "{name}");
+            // ...and the declared shapes stay per-sample, which is what the axis is *about*.
+            for (port, shape) in &contract.inputs {
+                let declared = g
+                    .inputs
+                    .iter()
+                    .find(|p| p.name == *port)
+                    .expect("the contract names the graph's own ports");
+                assert_eq!(shape, declared.ty.shape.dims(), "{name}: {port}");
+            }
+        }
+
+        let act = lower_to_torch(&act()).unwrap();
+        // The head reshapes with a leading -1 (H = 50, action_dim = 8) and the chunker slices
+        // the horizon, which is now axis 1.
+        assert!(act.source.contains(".reshape(-1, 50, 8)"), "{}", act.source);
+        assert!(act.source.contains("[:, :20]"), "{}", act.source);
+        // A pooled feature has no token axis, and `batch_first=True` puts the tokens on axis 1.
+        assert!(
+            act.source.contains(".unsqueeze(1)).squeeze(1)"),
+            "{}",
+            act.source
+        );
+        // The backbone takes the batch as it stands.
+        assert!(
+            act.source.contains("= self.n0(inputs[\"rgb_front\"])"),
+            "{}",
+            act.source
+        );
+
+        // The samplers keep the chunk flattened per sample and their per-step arithmetic
+        // untouched: only the state's shape moved.
+        for g in [ddpm(), flow()] {
+            let m = lower_to_torch(&g).unwrap();
+            assert!(
+                m.source.contains("x = noise.reshape(noise.shape[0], -1)"),
+                "{}",
+                m.source
+            );
+            assert!(
+                m.source
+                    .contains("x.reshape(-1, self.horizon, self.action_dim)"),
+                "{}",
+                m.source
+            );
+        }
+        let d = lower_to_torch(&ddpm()).unwrap();
+        assert!(
+            d.source
+                .contains("x = self.c0[i] * x0 + self.cx[i] * x + self.ce[i] * eps"),
+            "the DDPM step is a moved ULP if its expression moved: {}",
+            d.source
+        );
     }
 
     #[test]

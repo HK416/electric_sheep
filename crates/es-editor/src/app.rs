@@ -29,7 +29,7 @@ use crate::model::edit::{self, Edit, EditIr, EditSession};
 use crate::model::graph_view::{CrossEdge, LayerView, LayeredGraph, NodeView};
 use crate::model::image_view::{BeforeAfter, ImagePair, Rgb8Image};
 use crate::model::palette::Palette;
-use crate::model::replay_view::{Camera, Projected, ReplayView};
+use crate::model::replay_view::{self, Camera, Projected, ReplayView};
 use crate::model::run_view::{Bucket, RunView};
 use crate::model::telemetry_view::{Source, TelemetryModel};
 
@@ -509,14 +509,22 @@ impl EditorApp {
             return;
         }
         // The replay of the selected cell shares the tab (packet M7/E2): the table picks the
-        // episode, the panel plays it. Nearly half the window by default, so the canvas is
-        // there without dragging the separator first; still resizable either way.
-        let height = (ui.available_height() * REPLAY_PANEL_FRACTION).max(REPLAY_PANEL_MIN);
-        egui::TopBottomPanel::bottom("replay")
-            .resizable(true)
-            .min_height(REPLAY_PANEL_MIN)
-            .default_height(height)
-            .show_inside(ui, |ui| self.replay_panel(ui));
+        // episode, the panel plays it. The model decides how tall it is: its control rows
+        // until a replay is loaded, a canvas afterwards. Two panel ids, because egui
+        // remembers a panel's dragged height per id and the two states want their own.
+        match replay_view::panel_height(self.replay.as_ref(), ui.available_height()) {
+            Some(height) => {
+                egui::TopBottomPanel::bottom("replay-canvas")
+                    .resizable(true)
+                    .default_height(height)
+                    .show_inside(ui, |ui| self.replay_panel(ui));
+            }
+            None => {
+                egui::TopBottomPanel::bottom("replay-controls")
+                    .resizable(false)
+                    .show_inside(ui, |ui| self.replay_panel(ui));
+            }
+        }
         egui::CentralPanel::default().show_inside(ui, |ui| self.run_table(ui));
     }
 
@@ -533,83 +541,93 @@ impl EditorApp {
         let columns = run.columns();
         let mut sort = None;
         let mut select = None;
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            egui::Grid::new("run-cells").striped(true).show(ui, |ui| {
-                for (i, name) in columns.iter().enumerate() {
-                    if ui.button(name).clicked() {
-                        sort = Some(i);
+        // Everything below is one scroll area, so a short window clips nothing: the table, the
+        // acceptance rows, the strip and the filmstrip scroll together.
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                egui::Grid::new("run-cells").striped(true).show(ui, |ui| {
+                    for (i, name) in columns.iter().enumerate() {
+                        if ui.button(name).clicked() {
+                            sort = Some(i);
+                        }
                     }
-                }
-                ui.label("traj");
-                ui.label("frames");
-                ui.end_row();
-                let selected = run.selected_cell().map(|c| c.name.clone());
-                for row in run.cells() {
-                    let is_selected = selected.as_deref() == Some(row.name.as_str());
-                    if ui.selectable_label(is_selected, &row.name).clicked() {
-                        select = Some(row.name.clone());
-                    }
-                    ui.label(&row.suite);
-                    ui.label(row.seed.map_or_else(|| "--".to_owned(), |s| s.to_string()));
-                    for column in columns.iter().skip(3) {
-                        ui.label(row.metrics.get(column).map_or_else(dash, metric_text));
-                    }
-                    ui.label(if row.has_traj { "yes" } else { "--" });
-                    ui.label(row.frames.to_string());
+                    ui.label("traj");
+                    ui.label("frames");
                     ui.end_row();
-                }
-            });
+                    let selected = run.selected_cell().map(|c| c.name.clone());
+                    for row in run.cells() {
+                        let is_selected = selected.as_deref() == Some(row.name.as_str());
+                        if ui.selectable_label(is_selected, &row.name).clicked() {
+                            select = Some(row.name.clone());
+                        }
+                        ui.label(&row.suite);
+                        ui.label(row.seed.map_or_else(|| "--".to_owned(), |s| s.to_string()));
+                        for column in columns.iter().skip(3) {
+                            ui.label(row.metrics.get(column).map_or_else(dash, metric_text));
+                        }
+                        ui.label(if row.has_traj { "yes" } else { "--" });
+                        ui.label(row.frames.to_string());
+                        ui.end_row();
+                    }
+                });
 
-            ui.separator();
-            ui.heading(if run.report.passed {
-                "Acceptance: passed (spec 10.2)"
-            } else {
-                "Acceptance: failed (spec 10.2)"
-            });
-            for line in run.acceptance() {
-                let (text, colour) = acceptance_row(line);
-                ui.colored_label(colour, text);
-            }
-
-            let Some(cell) = run.selected_cell().map(|c| c.name.clone()) else {
                 ui.separator();
-                ui.label("Select a cell for its Safety Plane timeline and frames (spec 23.3).");
-                return;
-            };
-            ui.separator();
-            let timeline = run.timeline(&cell);
-            ui.heading(format!("{cell}: {} tick(s)", timeline.rows.len()));
-            // One column per ~4 px of the strip; the model folds the ticks into them.
-            let n = (ui.available_width() / 4.0) as usize;
-            paint_timeline(ui, &timeline.buckets(n));
-            for kind in timeline.kind_rows() {
-                ui.label(kind.label());
-            }
-
-            ui.separator();
-            ui.heading("Frames");
-            ui.horizontal(|ui| {
-                for index in run.filmstrip(&cell, FILMSTRIP) {
-                    let key = format!("{cell}#{index}");
-                    let texture = run_frames.entry(key.clone()).or_insert_with(|| {
-                        let image = run.frame(&cell, index).unwrap_or(Rgb8Image {
-                            width: 1,
-                            height: 1,
-                            data: vec![0, 0, 0],
-                        });
-                        rgb_texture(&ctx, &key, &image)
-                    });
-                    ui.vertical(|ui| {
-                        ui.label(format!("{index}"));
-                        let scale = (160.0 / texture.size_vec2().x).max(1.0);
-                        ui.image(egui::load::SizedTexture::new(
-                            texture.id(),
-                            texture.size_vec2() * scale,
-                        ));
-                    });
+                ui.heading(if run.report.passed {
+                    "Acceptance: passed (spec 10.2)"
+                } else {
+                    "Acceptance: failed (spec 10.2)"
+                });
+                for line in run.acceptance() {
+                    let (text, colour) = acceptance_row(line);
+                    ui.colored_label(colour, text);
                 }
+
+                let Some(cell) = run.selected_cell().map(|c| c.name.clone()) else {
+                    ui.separator();
+                    ui.label("Select a cell for its Safety Plane timeline and frames (spec 23.3).");
+                    return;
+                };
+                ui.separator();
+                let timeline = run.timeline(&cell);
+                ui.heading(timeline.heading(&cell));
+                // One column per ~4 px of the strip; the model folds the frames into them.
+                let n = (ui.available_width() / 4.0) as usize;
+                paint_timeline(ui, &timeline.buckets(n));
+                for kind in timeline.kind_rows() {
+                    ui.label(kind.label());
+                }
+
+                ui.separator();
+                ui.heading("Frames");
+                // Eight thumbnails are wider than a narrow window; scroll them sideways rather
+                // than cutting the last ones off.
+                egui::ScrollArea::horizontal()
+                    .id_salt("filmstrip")
+                    .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            for index in run.filmstrip(&cell, FILMSTRIP) {
+                                let key = format!("{cell}#{index}");
+                                let texture = run_frames.entry(key.clone()).or_insert_with(|| {
+                                    let image = run.frame(&cell, index).unwrap_or(Rgb8Image {
+                                        width: 1,
+                                        height: 1,
+                                        data: vec![0, 0, 0],
+                                    });
+                                    rgb_texture(&ctx, &key, &image)
+                                });
+                                ui.vertical(|ui| {
+                                    ui.label(format!("{index}"));
+                                    let scale = (160.0 / texture.size_vec2().x).max(1.0);
+                                    ui.image(egui::load::SizedTexture::new(
+                                        texture.id(),
+                                        texture.size_vec2() * scale,
+                                    ));
+                                });
+                            }
+                        });
+                    });
             });
-        });
         if let Some(column) = sort {
             run.sort_by(column);
         }
@@ -929,12 +947,6 @@ const SHOWCASE_CAMERA: Camera = Camera {
 /// `rate.control`; a run directory carries no Deployment IR to read it from, and playing at
 /// the wrong rate only changes how fast the arm appears to move.
 const REPLAY_RATE_HZ: f64 = 50.0;
-
-/// How much of the Run tab the replay panel takes when it first opens, and the least it ever
-/// takes: the 3D view has to be visible the moment `Replay` is pressed, not after the user
-/// finds the separator.
-const REPLAY_PANEL_FRACTION: f32 = 0.45;
-const REPLAY_PANEL_MIN: f32 = 320.0;
 
 /// Radians of orbit per point of drag, and zoom per point of scroll.
 const ORBIT_PER_POINT: f64 = 0.008;

@@ -4020,6 +4020,15 @@ fn expert_passes_the_evaluation_harness() {
         es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml");
     let deploy =
         es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml");
+    // The document's declared inference latency, which since packet M7/T7 the evaluator honours
+    // exactly as `es loop collect` always has: 15 ms is one control tick at 50 Hz, so tick 0 of
+    // every episode is a chunk underrun the plane answers for and the expert drives from tick 1.
+    let latency_ms = es_ir::serial::learning_from_toml(&read("learning.toml"))
+        .expect("learning.toml")
+        .policy
+        .contract
+        .runtime
+        .expected_latency_ms;
     let scene = es_assets::parse_mjcf(
         &std::fs::read_to_string(demo_scene_path()).expect("the demo scene is in the repo"),
     )
@@ -4081,7 +4090,10 @@ fn expert_passes_the_evaluation_harness() {
                 &mut policy,
                 &deploy,
                 es_physics_backend::MuJoCoCpuBackend::new,
-                &es_eval::RunConfig::default(),
+                &es_eval::RunConfig {
+                    expected_latency_ms: latency_ms,
+                    ..es_eval::RunConfig::default()
+                },
                 Some(&mut frames),
                 None,
             )
@@ -4306,15 +4318,15 @@ fn collection_and_evaluation_draw_the_same_scene_for_a_seed() {
 /// scripted expert, the same seed, the same documents, and the policy invoked
 /// `ceil(steps / replan)` times on each path.
 ///
-/// **What it also measures, and does not assert away.** The per-tick `qpos ‖ qvel` each path
-/// hands its own state hook -- the collector's `FrameSink` and the runner's frame source, both
-/// called at the top of a control step with the backend's `f64` state (packet M5/V12) -- is
-/// *not* bit-identical, and the first tick at which it diverges is printed. The cause is not
-/// the cadence: `es loop collect` applies the Learning IR's `RuntimeHints::expected_latency_ms`
-/// (15 ms, one control tick at 50 Hz) through `AsyncInference`, so its first chunk reaches the
-/// plane at tick 1 and tick 0 is a recorded underrun, while `es_eval::runner` has no latency
-/// model and executes row 0 at tick 0. V17 leaves inference-latency modelling as it is; design
-/// note section 7.25 records the gap.
+/// **What it also measures.** The per-tick `qpos ‖ qvel` each path hands its own state hook --
+/// the collector's `FrameSink` and the runner's frame source, both called at the top of a
+/// control step with the backend's `f64` state (packet M5/V12). Under V17 these were *not*
+/// bit-identical and the first divergent tick was only printed: `es loop collect` applied the
+/// Learning IR's `RuntimeHints::expected_latency_ms` (15 ms, one control tick at 50 Hz) through
+/// `AsyncInference`, so its first chunk reached the plane at tick 1 and tick 0 was a recorded
+/// underrun, while `es_eval::runner` had no latency model and executed row 0 at tick 0 (design
+/// note section 7.25, open question 24). Packet M7/T7 gave the evaluator that same model, so
+/// the traces now agree to the last tick and this asserts it.
 ///
 /// The sibling `collection_and_evaluation_draw_the_same_scene_for_a_seed` pins the first state.
 /// **The server oracle** -- it needs `mujoco`.
@@ -4439,6 +4451,7 @@ fn collection_and_evaluation_ask_the_policy_at_the_same_cadence() {
             es_physics_backend::MuJoCoCpuBackend::new,
             &es_eval::RunConfig {
                 max_steps: Some(STEPS),
+                expected_latency_ms: demo_latency_ms(&bundle),
                 ..es_eval::RunConfig::default()
             },
             Some(&mut frames),
@@ -4474,8 +4487,212 @@ fn collection_and_evaluation_ask_the_policy_at_the_same_cadence() {
     println!(
         "RAN collection_and_evaluation_ask_the_policy_at_the_same_cadence: {expected} policy \
          calls on each path over {STEPS} control ticks (one every {replan}); the state traces \
-         first differ at tick {diverged:?}, which is the collector's declared inference latency \
-         and not the cadence (design note section 7.25)"
+         first differ at tick {diverged:?} -- `None` since packet M7/T7 gave the evaluator the \
+         collector's own latency model (design note sections 7.25 and 7.30)"
+    );
+    assert_eq!(
+        diverged, None,
+        "the two state traces must agree to the last tick; the sibling \
+         `collection_and_evaluation_draw_the_same_trajectory` compares the `.estraj` files and \
+         names the values (packet M7/T7)"
+    );
+}
+
+/// The bundle's declared inference latency, which `es eval run` reads out of the same field
+/// (`crates/es/src/cmd/eval.rs`) and `DomainRunner::new` reads straight off the contract.
+///
+/// `Evaluation::run` is handed the four IRs it judges and never the `LearningGraph`, so the
+/// number crosses on `RunConfig`; there is still one latency *model*, `es_env::latency_ticks`,
+/// and both paths call it with this value and `rate.control` (packet M7/T7).
+fn demo_latency_ms(bundle: &es_compile::PolicyBundle) -> f32 {
+    bundle.learning.policy.contract.runtime.expected_latency_ms
+}
+
+/// Packet M7/T7 oracle 2 -- **the two paths draw the same trajectory**, not merely the same
+/// scene and the same cadence: the `.estraj` each one writes for one seed is equal tick by
+/// tick, to the last tick, as raw `f64` bits.
+///
+/// This is the oracle V6b and V17 were missing. V6b made both paths feed the plane through
+/// `es_env::plane_chunk` and V17 made both honour `rate.inference`, and the sibling
+/// `collection_and_evaluation_ask_the_policy_at_the_same_cadence` pinned the *schedule*; what
+/// was left was that `es loop collect` executed a chunk at `submit_tick + latency` while
+/// `es_eval::runner` executed row 0 in the tick it inferred. The `qpos ‖ qvel` traces of one
+/// seed therefore agreed at tick 0 and diverged at tick 1, which is what open question 24
+/// named and packet M7/T7 fixed. **Measured before the fix** -- SO-101 demo scene, seed 1, the
+/// scripted expert, `expected_latency_ms = 15` (one control tick at 50 Hz): see design note
+/// section 7.30.
+///
+/// Both files are written by `es_env::traj::Trajectory` from the state at the top of a control
+/// step, before `Env::step` (packet M5/V12), so the comparison is of the same instant on both
+/// paths and not of two conventions.
+///
+/// **The server oracle** -- the SO-101 scene needs `MuJoCoCpuBackend`; without `mujoco` it
+/// prints a reason and skips. Ignored by default because it runs two full episodes of physics:
+///
+/// ```text
+/// cargo test -p es --test cli collection_and_evaluation_draw_the_same_trajectory -- --ignored
+/// ```
+#[test]
+#[ignore = "runs two full demo episodes through MuJoCo; the T7 server oracle"]
+fn collection_and_evaluation_draw_the_same_trajectory() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const NJ: usize = 6;
+    const H: usize = 16;
+    const SEED: u64 = 1;
+    /// A whole number of re-plan periods, long enough to cover approach, descent and grasp.
+    const STEPS: u32 = 120;
+
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP collection_and_evaluation_draw_the_same_trajectory: {reason}");
+        return;
+    }
+    let dir = scratch_dir("traj-parity");
+    let bundle_bytes = std::fs::read(write_demo_bundle(&dir)).expect("policy.esb");
+    let bundle = es_compile::PolicyBundle::open(&bundle_bytes).expect("the demo bundle opens");
+    let scene = es_assets::parse_mjcf(
+        &std::fs::read_to_string(demo_scene_path()).expect("the demo scene is in the repo"),
+    )
+    .expect("the demo scene parses")
+    .scene;
+    let cube = scene
+        .joints
+        .iter()
+        .find(|j| j.kind == es_assets::scene::JointKind::Free)
+        .expect("the scene has one free-joint body to pick up")
+        .id;
+    let deploy = &bundle.deployment;
+    let replan = demo_replan(deploy);
+    let expert = || {
+        let mut cfg = es_env::expert::demo_cfg(cube);
+        cfg.pace_to(deploy, replan);
+        es_env::expert::ScriptedExpert::new(&scene, cfg).expect("the expert builds")
+    };
+    let seen: SeenState = Rc::new(RefCell::new(None));
+    let row_of = |state: &es_physics_core::backend::StateView<'_>| {
+        let mut row = state.qpos_of(0).to_vec();
+        row.extend_from_slice(state.qvel_of(0));
+        row
+    };
+
+    // --- the collection path ---------------------------------------------------------------
+    let collect_traj = dir.join("collect-traj");
+    {
+        let mut policy = ExpertPolicy::<NJ, H> {
+            expert: expert(),
+            seen: Rc::clone(&seen),
+            calls: Rc::default(),
+        };
+        let seen = Rc::clone(&seen);
+        let mut sink = |model: &es_physics_core::backend::ModelInfo,
+                        state: &es_physics_core::backend::StateView<'_>| {
+            *seen.borrow_mut() = Some((model.clone(), row_of(state)));
+            Ok::<(), String>(())
+        };
+        es_data::Collector::run::<es_physics_backend::MuJoCoCpuBackend, _, NJ, H>(
+            &es_data::CollectSpec {
+                bundle: &bundle,
+                scene: &scene,
+                out_root: &dir.join("ds"),
+                traj_dir: Some(collect_traj.clone()),
+                n_episodes: 1,
+                seed: SEED,
+                max_steps: STEPS,
+            },
+            &mut policy,
+            es_physics_backend::MuJoCoCpuBackend::new,
+            &mut |_, _, _, _| es_data::Intervention::Policy,
+            Some(&mut sink),
+        )
+        .expect("the demo collects one episode");
+    }
+
+    // --- the evaluation path -----------------------------------------------------------------
+    let eval_traj = dir.join("eval-traj");
+    {
+        let mut policy = ExpertPolicy::<NJ, H> {
+            expert: expert(),
+            seen: Rc::clone(&seen),
+            calls: Rc::default(),
+        };
+        let mut ir = demo_evaluation_ir(
+            hex(&bundle.task.task_hash().expect("task hash")),
+            hex(&bundle.observation.observation_hash().expect("obs hash")),
+        );
+        ir.episodes = es_ir::evaluation::EpisodeBatch {
+            n_episodes: 1,
+            seeds: es_ir::evaluation::SeedPlan::Explicit(vec![SEED]),
+        };
+        ir.suites.truncate(1);
+        assert_eq!(ir.suites[0].name, "nominal");
+        let seen = Rc::clone(&seen);
+        let blank = vec![0u8; 96 * 96 * 3];
+        let mut frames =
+            move |_light: &es_eval::LightOverride,
+                  model: &es_physics_core::backend::ModelInfo,
+                  state: &es_physics_core::backend::StateView<'_>| {
+                *seen.borrow_mut() = Some((model.clone(), row_of(state)));
+                Ok::<Vec<u8>, String>(blank.clone())
+            };
+        es_eval::Evaluation::run_with_frames::<es_physics_backend::MuJoCoCpuBackend, _, NJ, H>(
+            &ir,
+            &bundle.task,
+            &scene,
+            &bundle.observation,
+            &mut policy,
+            deploy,
+            es_physics_backend::MuJoCoCpuBackend::new,
+            &es_eval::RunConfig {
+                max_steps: Some(STEPS),
+                traj_dir: Some(eval_traj.clone()),
+                // The document's own number, the one `es loop collect` just ran under.
+                expected_latency_ms: demo_latency_ms(&bundle),
+                ..es_eval::RunConfig::default()
+            },
+            Some(&mut frames),
+            None,
+        )
+        .expect("the demo evaluates one episode");
+    }
+
+    // --- the comparison ------------------------------------------------------------------------
+    let a = es_env::Trajectory::read(&collect_traj.join("ep-000.estraj"))
+        .expect("the collector wrote an .estraj");
+    let b = es_env::Trajectory::read(&eval_traj.join("nominal-00.estraj"))
+        .expect("the evaluation wrote an .estraj");
+    assert_eq!(
+        (a.ticks(), b.ticks()),
+        (STEPS as usize, STEPS as usize),
+        "both paths ran the whole budget: collection {} ticks, evaluation {} ticks",
+        a.ticks(),
+        b.ticks()
+    );
+    for tick in 0..a.ticks() {
+        let (qa, qb) = (a.qpos(tick), b.qpos(tick));
+        let (va, vb) = (a.qvel(tick), b.qvel(tick));
+        for (i, (x, y)) in qa.iter().zip(qb).chain(va.iter().zip(vb)).enumerate() {
+            assert_eq!(
+                x.to_bits(),
+                y.to_bits(),
+                "tick {tick}, element {i} of `qpos ‖ qvel`: `es loop collect` has {x} and \
+                 `es eval run` {y} for seed {SEED}. The two paths must execute chunks \
+                 identically -- not only at the same cadence (packet M7/T7, open question 24)"
+            );
+        }
+    }
+    // The whole file, so the body poses `es video showcase` replays are pinned too.
+    assert_eq!(
+        blake3::hash(&a.to_bytes()),
+        blake3::hash(&b.to_bytes()),
+        "the two `.estraj` files differ outside `qpos ‖ qvel`"
+    );
+    println!(
+        "RAN collection_and_evaluation_draw_the_same_trajectory: {} ticks identical bitwise, \
+         expected_latency_ms = {} (one control tick at {} Hz)",
+        a.ticks(),
+        demo_latency_ms(&bundle),
+        deploy.rate.control.as_hz_f64()
     );
 }
 

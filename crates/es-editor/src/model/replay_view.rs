@@ -67,6 +67,32 @@ pub struct Camera {
 /// just short of it rather than failing there.
 const PITCH_LIMIT: f64 = 1.552; // ~88.9 degrees
 
+/// What the Replay panel takes of the Run tab once a replay is loaded: this fraction, never
+/// less than a canvas worth looking at, and never so much that the table above it is gone.
+const PANEL_FRACTION: f32 = 0.45;
+const PANEL_MIN: f32 = 320.0;
+const PANEL_CEILING: f32 = 0.8;
+
+/// The height the Replay panel should ask for inside a tab `available` points high, or `None`
+/// for "as tall as its own control rows".
+///
+/// `None` is the panel that has opened nothing: an empty canvas taking half the window is half
+/// the window wasted, and it was clipping the filmstrip above it. The question is answered
+/// from the model — is there a loaded [`ReplayView`] — and not from what is on screen
+/// (spec 28.10 rule 3).
+pub fn panel_height(replay: Option<&ReplayView>, available: f32) -> Option<f32> {
+    if !replay.is_some_and(ReplayView::is_loaded) {
+        return None;
+    }
+    // `max` then `min`, never `clamp`: on a window too short for the minimum the ceiling wins,
+    // and `clamp` with a lower bound above its upper bound panics.
+    Some(
+        (available * PANEL_FRACTION)
+            .max(PANEL_MIN)
+            .min(available * PANEL_CEILING),
+    )
+}
+
 impl Camera {
     /// `T_world_camera` and the pinhole `ImageSpec`, in the `OpenCV` frame of spec 3.1.
     ///
@@ -187,6 +213,12 @@ impl ReplayView {
 
     pub fn ticks(&self) -> usize {
         self.traj.ticks()
+    }
+
+    /// Whether there is anything to play. What the panel's height turns on
+    /// ([`panel_height`]): a trajectory with no ticks is not something to grow a canvas for.
+    pub fn is_loaded(&self) -> bool {
+        self.ticks() > 0
     }
 
     /// The joint state at `tick`, for the labels. Empty past the last tick.
@@ -771,6 +803,29 @@ mod tests {
         assert_eq!(view.tick, last - 3);
         view.step(-1000);
         assert_eq!(view.tick, 0);
+    }
+
+    /// The panel is its control rows until a replay is loaded, and a canvas afterwards.
+    #[test]
+    fn the_panel_only_grows_once_a_replay_is_loaded() {
+        #[track_caller]
+        fn close(got: Option<f32>, want: Option<f32>) {
+            match (got, want) {
+                (Some(g), Some(w)) => assert!((g - w).abs() < 1e-3, "{g} vs {w}"),
+                (None, None) => {}
+                _ => panic!("{got:?} vs {want:?}"),
+            }
+        }
+        close(panel_height(None, 900.0), None);
+
+        let view = replay();
+        assert!(view.is_loaded(), "the fixture has ticks");
+        // Nearly half the tab when there is room for it.
+        close(panel_height(Some(&view), 900.0), Some(405.0));
+        // Never less than a canvas worth looking at...
+        close(panel_height(Some(&view), 600.0), Some(320.0));
+        // ...and never so much that the table above is gone.
+        close(panel_height(Some(&view), 300.0), Some(240.0));
     }
 
     /// Orbit stays on the sphere and off its poles; zoom only scales the radius.

@@ -36,6 +36,7 @@ use es_physics_core::backend::{
 };
 use es_physics_core::caps::{BatchSupport, Capabilities, DeterminismTier, FloatPrecision};
 use es_policy::{PolicyError, PolicyInfo, PolicyRuntime, WeightsSource};
+use es_safety::ViolationKind;
 
 const NJ: usize = 2;
 const H: usize = 2;
@@ -1342,6 +1343,95 @@ fn events_json_has_one_record_per_frame() {
     // The spelling `es video mosaic` reads (`crates/es/src/cmd/video.rs`).
     assert!(text.contains("\"source\": \"Policy\""), "{text:.400}");
     assert!(text.contains("\"frame\": 0"), "{text:.400}");
+}
+
+/// Packet M7/T7 oracle 1 -- **tick 0 of every episode is a chunk underrun under a declared
+/// inference latency**, because the chunk computed from tick 0's observation is not executable
+/// until tick `latency`.
+///
+/// `es loop collect` has modelled this since M2: `DomainRunner` submits at tick `t` and the
+/// `ChunkBuffer` releases at `t + latency_ticks(expected_latency_ms, rate.control)`, so the
+/// plane sees an empty buffer on tick 0 and answers with its own fallback. `es_eval::runner`
+/// had no latency model and executed row 0 at tick 0, which is what made the two paths'
+/// trajectories for one seed diverge at tick 1 (design note `docs/design/visible-learning.md`
+/// open question 24, and `es`'s `collection_and_evaluation_draw_the_same_trajectory`).
+///
+/// Nothing here widens or bypasses the plane (INV-12): the underrun is the plane's own event,
+/// counted and recorded exactly as it is in collection. The fixture's `WatchdogSet` already
+/// arms `chunk_underrun`, and no envelope and no fixture's `expected_latency_ms` moves -- the
+/// run states the document's number at the call.
+#[test]
+fn tick_zero_is_a_chunk_underrun_under_a_declared_latency() {
+    /// One control period in milliseconds: `latency_ticks` rounds it to exactly one tick.
+    const ONE_PERIOD_MS: f32 = 1000.0 / CONTROL_HZ as f32;
+    const UNDERRUN: u32 = 1 << (ViolationKind::ChunkUnderrun as u32);
+
+    let (ir, obs) = image_ir();
+    for (ms, under) in [(0.0_f32, false), (ONE_PERIOD_MS, true)] {
+        let dir = scratch(if under { "underrun-1" } else { "underrun-0" });
+        let mut sink = FrameSink::new(&dir);
+        let mut frames = state_frames();
+        let mut policy = FakePolicy { target: 0.2 };
+        Evaluation::run_with_frames::<FakeBackend, _, NJ, H>(
+            &ir,
+            &task_ir(),
+            &scene(),
+            &obs,
+            &mut policy,
+            &deployment_ir(),
+            FakeBackend::new,
+            &RunConfig {
+                expected_latency_ms: ms,
+                ..RunConfig::default()
+            },
+            Some(&mut frames),
+            Some(&mut sink),
+        )
+        .expect("the fixture evaluates under a declared latency");
+
+        assert_eq!(
+            sink.events.len(),
+            N_EPISODES as usize,
+            "one cell per episode"
+        );
+        for (name, records) in &sink.events {
+            // Frame 0 of the cell, which is step 0 of the episode. Not `tick == 0`: the cell's
+            // `Env` is not rebuilt between episodes, so its `PhysTick` keeps counting.
+            let first = records.first().expect("every cell rendered frame 0");
+            assert_eq!(
+                first.frame, 0,
+                "{name}: the first record is the first frame"
+            );
+            assert_eq!(
+                first.events & UNDERRUN != 0,
+                under,
+                "{name}: tick 0 at expected_latency_ms = {ms} -- events {:#x}, source {:?}",
+                first.events,
+                first.source
+            );
+            if under {
+                assert_ne!(
+                    first.source,
+                    EventSource::Policy,
+                    "{name}: an underrun tick is driven by the plane's fallback, not the policy"
+                );
+                // And the very next tick is the chunk landing: this is one tick of latency,
+                // not a policy that never produced. (An episode of the fixture can terminate
+                // on its first step, in which case there is no next tick to check.)
+                if let Some(second) = records.get(1) {
+                    assert_eq!(second.events & UNDERRUN, 0, "{name}: tick 1 is served");
+                }
+            } else {
+                // `Policy` or `Clamped` -- either way a row was served and judged. Only
+                // `Fallback` means the plane had nothing, which is the case under test.
+                assert_ne!(
+                    first.source,
+                    EventSource::Fallback,
+                    "{name}: with no declared latency tick 0 executes row 0"
+                );
+            }
+        }
+    }
 }
 
 /// The overlay reads the Safety Plane, not the policy: a tightened envelope clamps the same

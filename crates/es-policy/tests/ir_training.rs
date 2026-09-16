@@ -922,7 +922,7 @@ model.eval()
 shapes = json.load(open(module_dir + "/contract.json"))["inputs"]
 observation = json.load(open(observation_path))
 inputs = {
-    port: torch.tensor(values, dtype=torch.float32).reshape(shapes[port])
+    port: torch.tensor(values, dtype=torch.float32).reshape([1] + shapes[port])
     for port, values in observation.items()
 }
 with torch.inference_mode():
@@ -1000,5 +1000,99 @@ for name, backbone in backbones:
 print(
     "%d backbone(s) bit-identical in train() and eval() on %s, %d state_dict keys, "
     "no running statistics" % (len(backbones), image, len(model.state_dict()))
+)
+"#;
+
+/// Packet M7/T3. The batch axis has to be an axis and nothing more: the same eight
+/// observations through the lowered module as one `[8, ..]` batch and as eight `[1, ..]` calls
+/// must be the same eight chunks.
+///
+/// Every node of the demo graph is per-sample by construction — `GroupNorm` normalizes over
+/// channel groups of the sample in front of it (packet M5/V13, which is *why* it is
+/// `GroupNorm`), `nn.Linear` is a row-wise affine, and the transformer sees a one-token
+/// sequence per row — so nothing in the architecture can make a row depend on its neighbours.
+/// What is left to differ is which matmul kernel torch dispatches on `[8, 512]` against
+/// `[1, 512]`, which is a floating-point difference and not a semantic one, so the bar is spec
+/// 8.9's tier-4 fp32 rather than bitwise. The measured difference is printed: a *large* one
+/// would mean a node that mixes rows, and that is the failure this exists to catch.
+#[test]
+#[ignore = "needs torch and torchvision"]
+fn the_batch_is_invariant() {
+    let python = match python_with_torch() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP batch_invariance: {why}");
+            return;
+        }
+    };
+    let dir = scratch_dir("batch-invariance");
+    let (path, _) = demo_bundle(&dir);
+    let (build, contract) = lowered(&dir, &path);
+    assert!(
+        contract.batch_axis,
+        "the contract must declare the axis this test is about"
+    );
+
+    let script = dir.join("batch_invariance.py");
+    std::fs::write(&script, BATCH_INVARIANCE_PY).expect("write the probe");
+    let out = run(
+        &python,
+        &[&script.to_string_lossy(), &build.to_string_lossy(), "8"],
+    );
+    let report: BTreeMap<String, serde_json::Value> = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("{e} in `{}`", String::from_utf8_lossy(&out.stdout)));
+    let max_abs = report["max_abs"].as_f64().expect("max_abs is a number");
+    assert!(
+        max_abs <= Tolerance::TIER4_FP32.abs,
+        "a batch of 8 and 8 single calls disagree by {max_abs:e}, over spec 8.9's tier-4 fp32 \
+         tolerance of {:e}: a node in the lowering mixes rows",
+        Tolerance::TIER4_FP32.abs
+    );
+    println!(
+        "RAN the_batch_is_invariant: max_abs {max_abs:e} (tol {:e}) over a batched chunk {}",
+        Tolerance::TIER4_FP32.abs,
+        report["shape"]
+    );
+}
+
+/// argv is `<module dir> <N>`; stdout is `{"max_abs": f, "shape": [..]}`.
+///
+/// The weights are the module's own fixed-seed initialisation rather than a checkpoint: what
+/// is compared is one function against itself at two batch sizes, and an untrained
+/// `EsPolicy()` is that function as surely as a trained one. No `torch_ref.py` either — this
+/// is a second implementation of the call, not the same one twice.
+const BATCH_INVARIANCE_PY: &str = r#"
+import json, sys
+import torch
+module_dir, n = sys.argv[1], int(sys.argv[2])
+namespace = {}
+exec(compile(open(module_dir + "/es_policy.py").read(), "<es-policy>", "exec"), namespace)
+torch.manual_seed(0)
+model = namespace["EsPolicy"]()
+model.eval()
+contract = json.load(open(module_dir + "/contract.json"))
+assert contract["batch_axis"], "the contract does not declare a batch axis"
+generator = torch.Generator().manual_seed(7)
+batch = {
+    port: torch.rand([n] + shape, generator=generator, dtype=torch.float32)
+    for port, shape in contract["inputs"].items()
+}
+with torch.inference_mode():
+    together = next(iter(model(**batch).values()))
+    apart = torch.cat(
+        [
+            next(iter(model(**{p: t[i : i + 1] for p, t in batch.items()}).values()))
+            for i in range(n)
+        ]
+    )
+assert together.shape[0] == n, "the module did not return a batch of %d: %s" % (
+    n,
+    list(together.shape),
+)
+assert together.shape == apart.shape, "%s vs %s" % (list(together.shape), list(apart.shape))
+sys.stdout.write(
+    json.dumps(
+        {"max_abs": float((together - apart).abs().max()), "shape": list(together.shape)}
+    )
 )
 "#;
