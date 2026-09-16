@@ -35,7 +35,10 @@ for suite in ir.suites                     # a row of the §10.1 table
           inputs  = capture(env.backend().state())      # §2.3
           if plan step-drops this frame: reuse the held observation, age it
           obs     = cpu_plan.run(inputs)                 # §11.3
-          chunk   = policy.infer(obs)
+          if tick % replan == 0: inference.submit(obs, tick)   # section 2.6, packets V17 / T7
+          for s in inference.poll(tick)                        # released after `latency` ticks
+              buffer.push(policy.infer(s.inputs), s.tick + latency)   # App. B.5
+          chunk   = plane_chunk(buffer, feed, tick)      # section 2.6, packet V6b — empty on an underrun
           action  = plane.validate(chunk, obs_age, tick) # INV-12, always runs
           ctrl    = plan.apply_per_step(action)          # delay, backlash, torque noise
           env.step(ctrl)
@@ -155,6 +158,55 @@ with `EvalError::JointMismatch` unless `model.nu == NJ` and the model carries at
 `qpos`/`qvel` entries. Nothing is broadcast and nothing is padded — a `ctrl` vector filled
 with copies of joint `NJ−1`, or a safety input padded with `0.0`, is a wrong number in the
 §10.1 table, which is worse than a refused run.
+
+### 2.6 Inference latency and the chunk buffer (packets M5/V6b, M5/V17, M7/T7)
+
+Three packets turned "the evaluator calls the policy" into "the evaluator runs the policy
+the way the deployment says it runs on the robot". They are one rule each, and each one is
+the *collector's* rule, reached by calling the collector's function rather than by
+restating it:
+
+| what | `es-env` function both paths call | packet |
+|---|---|---|
+| a chunk drives `action.execute_chunk` ticks | `es_env::plane_chunk` | M5/V6b |
+| the policy is asked once per `rate.control / rate.inference` | `es_env::replan_interval` | M5/V17 |
+| a chunk is executed at `computed_from + latency` | `es_env::AsyncInference` + `latency_ticks` | M7/T7 |
+
+The third is §8.6's normal case: inference latency larger than the control period is not an
+error, so the runtime models it. `AsyncInference` is a queue over *ticks*, never wall-clock
+(§12.3) — a submission at tick `t` is released at `t + latency_ticks(expected_latency_ms,
+rate.control)`, and the chunk it produces is pushed into the `ChunkBuffer` with `apply_at =
+t + latency` (App. B.5: `apply_at = computed_from + deterministic latency`, never the tick
+the result happened to come back on). A fast host and a slow host therefore replay
+identically, and so do the collection and evaluation paths.
+
+Three consequences worth stating plainly:
+
+- **Tick 0 of every episode is a chunk underrun.** Nothing has been computed yet, so
+  `plane_chunk` hands the plane an empty chunk and the plane answers with its own fallback
+  and its own `ViolationKind::ChunkUnderrun`. That is not a bypass or a widening (INV-12):
+  the underrun is the plane's event, it is counted in `chunk_underrun_rate`, and it shows in
+  `events.json` as `source: "Fallback"` on frame 0. `es loop collect` has looked exactly
+  like this since M2.
+- **The policy sees the observation of the tick it was submitted on**, not of the tick the
+  result is applied on. That is what the real pipeline does, and it is why the chunk is
+  stale by `latency` ticks by the time it executes.
+- **`expected_latency_ms = 0` stays legal** and means zero ticks: submit and poll happen in
+  the same tick and the loop is exactly what it was before T7. It is a document choice
+  (`RuntimeHints`), and a claim no real robot can honour.
+
+The number is the Learning IR's (`PolicyContract::runtime::expected_latency_ms`), and
+`Evaluation::run` is handed the four IRs it judges and never the `LearningGraph` — the same
+reason `hash_chain` takes `learning` and `policy` off the loaded `PolicyInfo`. So it crosses
+on `RunConfig::expected_latency_ms`, which `es eval run` fills from the bundle it opened.
+There is still exactly one latency *model*: `es_env::latency_ticks`, called by
+`DomainRunner::new` and by the cell loop with the same two arguments.
+
+The oracle is a trajectory, not a schedule: `collection_and_evaluation_draw_the_same_trajectory`
+(`crates/es/tests/cli.rs`) runs one seed through `es loop collect` and through
+`es_eval::Evaluation` and compares the two `.estraj` files bitwise to the last tick. Before
+T7 it failed at tick 1 — see `docs/design/visible-learning.md` section 7.30 for the measured
+values and for what the demo's numbers became.
 
 ## 3. Perturbation realisation (`perturb.rs`)
 

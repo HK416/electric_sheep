@@ -13,7 +13,7 @@ use es_compile::{CpuPlan, Home, PlanMode, Tensor, TensorRef};
 use es_core::{PhysTick, StableId, TickRate};
 use es_env::scheduler::BatchDomains;
 use es_env::traj::Trajectory;
-use es_env::{plane_chunk, ChunkBuffer, Env, EnvMetrics, Episode, PlaneFeed};
+use es_env::{plane_chunk, AsyncInference, ChunkBuffer, Env, EnvMetrics, Episode, PlaneFeed};
 use es_ir::deployment::{DeploymentIr, ExecutionMode, Micros};
 use es_ir::evaluation::{
     AcceptanceResult, CellResult, EvaluationIr, EvaluationReport, MetricSpec, MetricValue, SeedPlan,
@@ -36,7 +36,11 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 /// Knobs that are not part of the evaluation document: what the caller knows and the IR
 /// cannot (the dataset it trained on, the machine it ran on, when).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// Not `Eq`: `expected_latency_ms` is the document's own `f32` millisecond field, carried
+/// across unrounded and turned into whole ticks once, at the edge, by `es_env::latency_ticks`
+/// (spec 18.1). No float is compared or accumulated on any path that reads it.
+#[derive(Clone, Debug, PartialEq)]
 pub struct RunConfig {
     /// Episode step budget. `None` uses the task's `max_episode_steps`.
     pub max_steps: Option<u32>,
@@ -53,6 +57,20 @@ pub struct RunConfig {
     /// V9 did. Not part of the evaluation document and not in either artifact: it is the
     /// record of what the robot did, and the input `es video showcase` replays.
     pub traj_dir: Option<PathBuf>,
+    /// The Learning IR's `PolicyContract::runtime::expected_latency_ms` (spec 8.4), which
+    /// becomes whole control ticks of inference latency through
+    /// [`es_env::latency_ticks`] — the *same* function and the same argument
+    /// `DomainRunner::new` turns it into ticks with on the collection path (packet M7/T7).
+    ///
+    /// It is a document value, not a knob: it rides here only because [`Evaluation::run`] is
+    /// handed the four IRs it judges and never the `LearningGraph` (see `hash_chain` below,
+    /// which says the same thing about `learning` and `policy`), so the caller that opened
+    /// the bundle passes the number across. `es eval run` reads it out of the bundle.
+    ///
+    /// `0.0` — the default — means zero ticks: the chunk computed at tick `t` is executed at
+    /// tick `t`, which is a claim no real robot can honour and which every caller before T7
+    /// made implicitly (design note `docs/design/visible-learning.md` open question 24).
+    pub expected_latency_ms: f32,
 }
 
 impl Default for RunConfig {
@@ -68,6 +86,7 @@ impl Default for RunConfig {
             },
             hardware: HardwareCapability([0; 32]),
             traj_dir: None,
+            expected_latency_ms: 0.0,
         }
     }
 }
@@ -419,6 +438,16 @@ impl Evaluation {
         // identically (design note section 7.25). A rate that does not divide is refused by
         // name rather than rounded.
         let replan = es_env::replan_interval(deploy.rate).map_err(EvalError::Env)?;
+        // **The collector's own latency model** (packet M7/T7): `es_env::latency_ticks` with
+        // the contract's `expected_latency_ms` and the deployment's control rate, which is
+        // the argument pair `DomainRunner::new` passes on the collection path. A chunk
+        // computed from tick `t`'s observation is executed at `t + latency` -- App. B.5's
+        // `apply_at = computed_from + deterministic latency`, never the arrival tick -- so
+        // tick 0 of every episode reaches the plane with an empty buffer and the plane
+        // answers with its own `ChunkUnderrun` and its own fallback, exactly as it does for
+        // `es loop collect`. Before T7 this path executed row 0 at tick 0 and the two
+        // trajectories of one seed diverged from tick 1 (design note open question 24).
+        let latency = es_env::latency_ticks(cfg.expected_latency_ms, deploy.rate.control);
         let mut perturbations: Option<PerturbationPlan> = None;
         let mut sources: Option<BTreeMap<String, Capture>> = None;
         let mut out = Shard::default();
@@ -456,6 +485,11 @@ impl Evaluation {
             // were dead here (packet M5/V6b, design note section 7.13).
             let mut buffer = ChunkBuffer::<NJ, H>::new(deploy.action.execute_chunk, blend);
             let mut feed = PlaneFeed::default();
+            // One env, so the inference batch is the schedule's own `1`. It outlives the
+            // episodes for the same reason the buffer does, and `AsyncInference::drop_env`
+            // clears it at each boundary -- the collector's `DomainRunner::reset_env` makes
+            // the identical call.
+            let mut inference = AsyncInference::new(latency, domains.inference.batch);
             for (idx, seed) in seeds.iter().enumerate() {
                 // One cell of the mosaic is one episode of one suite: `single_env()` makes
                 // them independent runs, so the grid is `suites x episodes` directories.
@@ -487,6 +521,7 @@ impl Evaluation {
                     deploy.execution,
                     &mut buffer,
                     &mut feed,
+                    &mut inference,
                     frames.as_deref_mut(),
                     cell_frames.as_mut(),
                     traj.as_mut(),
@@ -682,6 +717,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     mode: ExecutionMode,
     buffer: &mut ChunkBuffer<NJ, H>,
     feed: &mut PlaneFeed,
+    inference: &mut AsyncInference,
     mut frames: Option<&mut FrameSource<'_>>,
     mut cell_frames: Option<&mut CellFrames>,
     mut traj: Option<&mut Trajectory>,
@@ -710,8 +746,11 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     plan.reset();
     // The same boundary for the chunk buffer: a chunk predicted for the previous episode has
     // no meaning in this one, and the plane must drop the one it still holds (spec 13.1).
-    // `DomainRunner::reset_env` is the collector's call to the identical function.
+    // `DomainRunner::reset_env` is the collector's call to the identical function -- and to
+    // `AsyncInference::drop_env` beside it, for the same reason one line down: a submission
+    // still in flight was computed from a state this episode no longer has (packet M7/T7).
     feed.end_episode(buffer);
+    inference.drop_env(0);
     // A latch left over from the previous episode would poison the rest of the cell, and so
     // would a command chain still anchored on where the previous episode's last command left
     // the arm. `begin_episode` clears both; it is not disabling the plane (INV-12), since the
@@ -792,9 +831,23 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         // switch, the blend over whatever chunks still overlap under `TemporalEnsemble`.
         // Before V17 this was every control tick, so row 0 of a fresh chunk was the only row
         // that ever reached the plane (design note section 7.25).
+        //
+        // The submission is queued and the *released* one is inferred, which is the
+        // collector's `DomainRunner::infer_window` phase for phase (packet M7/T7): under a
+        // declared latency the policy is handed the observation of the tick it was submitted
+        // on, not this tick's, and the chunk applies at `submit_tick + latency`. With
+        // `expected_latency_ms = 0` submit and poll happen in the same tick and this is
+        // exactly what the two lines it replaced did.
         if u64::from(step) % replan == 0 {
-            let chunk = infer_chunk::<NJ, H>(policy, observed, action_output, mode)?;
-            buffer.push(&chunk, u64::from(step));
+            inference.submit(0, u64::from(step), observed.clone());
+        }
+        for sub in inference.poll(u64::from(step)) {
+            let chunk = infer_chunk::<NJ, H>(policy, &sub.inputs, action_output, mode)?;
+            // App. B.5: `apply_at = computed_from + deterministic latency`, never the tick the
+            // result happened to come back on. `DomainRunner::infer_window` computes it with
+            // this same line.
+            let apply_at = sub.submit_tick.saturating_add(inference.latency_ticks());
+            buffer.push(&chunk, apply_at);
         }
         let (fed, _commanded) = plane_chunk(buffer, feed, u64::from(step), mode);
 

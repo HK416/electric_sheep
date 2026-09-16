@@ -36,7 +36,10 @@ for suite in ir.suites                     # a row of the §10.1 table
           inputs  = capture(env.backend().state())      # §2.3
           if plan step-drops this frame: reuse the held observation, age it
           obs     = cpu_plan.run(inputs)                 # §11.3
-          chunk   = policy.infer(obs)
+          if tick % replan == 0: inference.submit(obs, tick)   # section 2.6, packets V17 / T7
+          for s in inference.poll(tick)                        # released after `latency` ticks
+              buffer.push(policy.infer(s.inputs), s.tick + latency)   # App. B.5
+          chunk   = plane_chunk(buffer, feed, tick)      # section 2.6, packet V6b — empty on an underrun
           action  = plane.validate(chunk, obs_age, tick) # INV-12, always runs
           ctrl    = plan.apply_per_step(action)          # delay, backlash, torque noise
           env.step(ctrl)
@@ -156,6 +159,52 @@ observation은 0으로 채워지는 대신 이름으로 거부된다. 검은 프
 `EvalError::JointMismatch`로 거부한다. 아무것도 브로드캐스트되지 않고 아무것도 패딩되지
 않는다 — 관절 `NJ−1`의 복사본으로 채워진 `ctrl` 벡터나, `0.0`으로 패딩된 safety 입력은
 §10.1 표에 잘못된 숫자를 만들어내며, 이는 거부된 실행보다 나쁘다.
+
+### 2.6 추론 지연과 청크 버퍼 (패킷 M5/V6b, M5/V17, M7/T7)
+
+세 개의 패킷이 "평가기가 정책을 호출한다"를 "평가기가, 배포 문서가 로봇에서 그렇게
+돌아간다고 말하는 그대로 정책을 돌린다"로 바꿨다. 각각 규칙 하나씩이며, 셋 모두
+*수집기*의 규칙이다 — 규칙을 다시 적어서가 아니라 수집기의 함수를 호출해서 도달했다:
+
+| 무엇 | 양쪽 경로가 호출하는 `es-env` 함수 | 패킷 |
+|---|---|---|
+| 청크 하나가 `action.execute_chunk` 틱을 구동한다 | `es_env::plane_chunk` | M5/V6b |
+| 정책은 `rate.control / rate.inference`마다 한 번 호출된다 | `es_env::replan_interval` | M5/V17 |
+| 청크는 `computed_from + latency`에 실행된다 | `es_env::AsyncInference` + `latency_ticks` | M7/T7 |
+
+세 번째는 §8.6의 정상 케이스다: 제어 주기보다 큰 추론 지연은 오류가 아니므로 런타임이
+이를 모델링한다. `AsyncInference`는 벽시계가 아니라 *틱*에 대한 큐이며(§12.3), 틱 `t`의
+제출은 `t + latency_ticks(expected_latency_ms, rate.control)`에 방출되고, 그것이 만든
+청크는 `apply_at = t + latency`로 `ChunkBuffer`에 들어간다(App. B.5:
+`apply_at = computed_from + deterministic latency`이지 결과가 우연히 돌아온 틱이 아니다).
+따라서 빠른 호스트와 느린 호스트가 동일하게 재생되고, 수집 경로와 평가 경로도 그렇다.
+
+분명히 적어 둘 결과 셋:
+
+- **모든 에피소드의 틱 0은 청크 언더런이다.** 아직 계산된 것이 없으므로 `plane_chunk`는
+  plane에 빈 청크를 건네고, plane은 자신의 fallback과 자신의
+  `ViolationKind::ChunkUnderrun`으로 답한다. 이는 우회도 완화도 아니다(INV-12):
+  언더런은 plane 자신의 이벤트이고, `chunk_underrun_rate`에 집계되며, `events.json`의
+  프레임 0에 `source: "Fallback"`으로 나타난다. `es loop collect`는 M2 이래 정확히 이
+  모습이었다.
+- **정책은 결과가 적용되는 틱이 아니라 제출된 틱의 관측을 본다.** 실제 파이프라인이 하는
+  일이 그것이고, 그래서 청크는 실행될 무렵 `latency` 틱만큼 낡아 있다.
+- **`expected_latency_ms = 0`은 계속 합법이며** 0틱을 뜻한다: 제출과 poll이 같은 틱에
+  일어나고 루프는 T7 이전과 정확히 같다. 이는 문서의 선택(`RuntimeHints`)이고, 어떤 실제
+  로봇도 지킬 수 없는 주장이다.
+
+그 숫자는 Learning IR의 것(`PolicyContract::runtime::expected_latency_ms`)이고,
+`Evaluation::run`은 자신이 심판하는 네 IR만 받을 뿐 `LearningGraph`는 결코 받지 않는다 —
+`hash_chain`이 `learning`과 `policy`를 로드된 `PolicyInfo`에서 가져오는 것과 같은 이유다.
+그래서 `RunConfig::expected_latency_ms`로 건너오며, `es eval run`이 자신이 연 번들에서
+채운다. 지연 *모델*은 여전히 정확히 하나다: `es_env::latency_ticks`를 `DomainRunner::new`와
+셀 루프가 같은 두 인자로 호출한다.
+
+오라클은 스케줄이 아니라 궤적이다:
+`collection_and_evaluation_draw_the_same_trajectory`(`crates/es/tests/cli.rs`)가 한 시드를
+`es loop collect`와 `es_eval::Evaluation`으로 각각 돌리고 두 `.estraj` 파일을 마지막 틱까지
+비트 단위로 비교한다. T7 이전에는 틱 1에서 실패했다 — 측정된 값과 데모의 숫자가 어떻게
+되었는지는 `docs/design/visible-learning.md` 7.30절에 있다.
 
 ## 3. Perturbation 실현 (`perturb.rs`)
 
