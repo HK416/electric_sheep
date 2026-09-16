@@ -14,6 +14,11 @@
 //! Goldens are regenerated only by `cargo test -p es-render -- --ignored generate_goldens`,
 //! which runs the **CPU** path. Never the GPU path: a golden produced on one driver would
 //! bake that driver's arithmetic into the repository.
+//!
+//! `d`, `n`, `p`, `t` are ray, normal, point and ray parameter here as they are in `cpu.rs`
+//! and in the Slang; a test that re-derives a pixel by hand has to read like the code it
+//! checks, so the lint is off for this file too.
+#![allow(clippy::many_single_char_names)]
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -21,7 +26,8 @@ use std::path::PathBuf;
 use es_gpu::{Gpu, GpuOptions, SlangCompiler};
 use es_render::cornell::{cornell_box, cornell_camera};
 use es_render::{
-    cpu, Atlas, CameraView, Frame, RenderConfig, RenderPath, Renderer, Tile, TileAtlasCfg, TriScene,
+    cpu, Atlas, CameraView, Frame, RenderConfig, RenderPath, Renderer, Shading, Tile, TileAtlasCfg,
+    TriScene,
 };
 use es_sensor::Channel;
 
@@ -46,6 +52,15 @@ fn pt_cfg(spp: u32, bounces: u32) -> RenderConfig {
 
 fn cpu_rs() -> Frame {
     cpu::rasterize(&scene(), &cornell_camera(TILE, TILE), &rs_cfg(), 0)
+}
+
+/// The opt-in look of packet M7/R2: shadows, hemisphere ambient, Blinn-Phong, `ssaa: 2`.
+fn rs_full_cfg() -> RenderConfig {
+    RenderConfig::rs_full(TileAtlasCfg::row(TILE, TILE, 1))
+}
+
+fn cpu_rs_full() -> Frame {
+    cpu::rasterize(&scene(), &cornell_camera(TILE, TILE), &rs_full_cfg(), 0)
 }
 
 fn cpu_pt1() -> Frame {
@@ -126,36 +141,64 @@ struct Golden {
     name: &'static str,
     channel: Channel,
     dtype: &'static str,
+    /// Which render the tile comes from, and the `kernel` line of the sidecar.
+    source: Source,
+    kernel: &'static str,
 }
 
-const GOLDENS: [Golden; 4] = [
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Rs,
+    RsFull,
+    Pt,
+}
+
+const GOLDENS: [Golden; 5] = [
     Golden {
         name: "cornell_rs_rgb8",
         channel: Channel::Rgb8,
         dtype: "u8",
+        source: Source::Rs,
+        kernel: "raster.v1",
     },
     Golden {
         name: "cornell_rs_depth",
         channel: DEPTH,
         dtype: "f32",
+        source: Source::Rs,
+        kernel: "raster.v1",
     },
     Golden {
         name: "cornell_rs_seg",
         channel: Channel::SegmentationId,
         dtype: "u32",
+        source: Source::Rs,
+        kernel: "raster.v1",
     },
     Golden {
         name: "cornell_pt1spp",
         channel: Channel::PtRadiance,
         dtype: "f32",
+        source: Source::Pt,
+        kernel: "pt.v1 (1 spp, 2 bounces)",
+    },
+    // Packet M7/R2. Only `Rgb8`: `Full` writes the same depth/seg/normal buffers `Lambert`
+    // does (the centre ray's), and `cpu_full_shading_reproduces_its_golden` asserts it
+    // instead of committing three more files that would say the same thing.
+    Golden {
+        name: "cornell_rs_full_rgb8",
+        channel: Channel::Rgb8,
+        dtype: "u8",
+        source: Source::RsFull,
+        kernel: "raster.v1 (Shading::Full, ssaa 2)",
     },
 ];
 
-fn golden_tile(g: &Golden, rs: &Frame, pt: &Frame) -> Tile {
-    let frame = if g.channel == Channel::PtRadiance {
-        pt
-    } else {
-        rs
+fn golden_tile(g: &Golden, rs: &Frame, rs_full: &Frame, pt: &Frame) -> Tile {
+    let frame = match g.source {
+        Source::Rs => rs,
+        Source::RsFull => rs_full,
+        Source::Pt => pt,
     };
     frame.tile(g.channel).expect("channel rendered").clone()
 }
@@ -167,16 +210,16 @@ fn golden_tile(g: &Golden, rs: &Frame, pt: &Frame) -> Tile {
 fn generate_goldens() {
     let dir = golden_dir();
     std::fs::create_dir_all(&dir).expect("golden dir");
-    let (rs, pt) = (cpu_rs(), cpu_pt1());
+    let (rs, rs_full, pt) = (cpu_rs(), cpu_rs_full(), cpu_pt1());
     for g in &GOLDENS {
-        let tile = golden_tile(g, &rs, &pt);
+        let tile = golden_tile(g, &rs, &rs_full, &pt);
         std::fs::write(dir.join(format!("{}.bin", g.name)), tile.to_bytes()).expect("write bin");
         let sidecar = serde_json::json!({
             "name": g.name,
             "dtype": g.dtype,
             "layout": "row-major, little-endian, tightly packed",
             "shape": tile.shape,
-            "kernel": if g.channel == Channel::PtRadiance { "pt.v1 (1 spp, 2 bounces)" } else { "raster.v1" },
+            "kernel": g.kernel,
             "pins": "OpenCV camera frame and top-left image origin (spec 3.1); depth in metres, unit_m = 1",
             "oracle": "es_render::cpu, the pure-Rust mirror of the Slang kernels",
             "generator": "cargo test -p es-render -- --ignored generate_goldens",
@@ -196,16 +239,256 @@ fn generate_goldens() {
 
 #[test]
 fn cpu_reference_reproduces_the_goldens_bit_for_bit() {
-    let (rs, pt) = (cpu_rs(), cpu_pt1());
+    let (rs, rs_full, pt) = (cpu_rs(), cpu_rs_full(), cpu_pt1());
     for g in &GOLDENS {
         let path = golden_dir().join(format!("{}.bin", g.name));
         let expected = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("{}: {e} (run the generate_goldens test)", path.display()));
-        let got = golden_tile(g, &rs, &pt).to_bytes();
+        let got = golden_tile(g, &rs, &rs_full, &pt).to_bytes();
         assert_eq!(got.len(), expected.len(), "{} size", g.name);
         assert!(got == expected, "{} differs from its golden", g.name);
         println!("bit-equal CPU vs golden: {}", g.name);
     }
+}
+
+// --- the Rs look (packet M7/R2) ---------------------------------------------------------------
+
+/// The three geometry channels of two frames, bit for bit.
+fn same_geometry(a: &Frame, b: &Frame, what: &str) {
+    for channel in [DEPTH, Channel::SegmentationId, Channel::Normal] {
+        let (x, y) = (
+            a.tile(channel).expect("channel a"),
+            b.tile(channel).expect("channel b"),
+        );
+        assert!(
+            x.to_bytes() == y.to_bytes(),
+            "{what}: {channel:?} is not bit-identical"
+        );
+    }
+    println!("{what}: Depth32, SegmentationId and Normal all bit-identical");
+}
+
+/// Oracle 2, and spec 28.10 rule 1 stated at the API: the default look is `Lambert`, and a
+/// render through the new branch is the committed golden byte for byte.
+#[test]
+fn lambert_is_the_default_and_is_byte_identical() {
+    assert_eq!(Shading::default(), Shading::Lambert);
+    assert_eq!(rs_cfg().shading, Shading::Lambert);
+    assert_eq!(
+        RenderConfig::pt(rs_cfg().atlas, 1, 2).shading,
+        Shading::Lambert
+    );
+    assert_eq!(rs_full_cfg().shading, Shading::FULL);
+
+    let got = cpu_rs().tile(Channel::Rgb8).expect("rgb").to_bytes();
+    let want = std::fs::read(golden_dir().join("cornell_rs_rgb8.bin")).expect("the golden");
+    assert!(
+        got == want,
+        "the default look moved: Rgb8 differs from its golden"
+    );
+    println!("Shading::Lambert is the default and reproduces cornell_rs_rgb8 byte for byte");
+}
+
+/// Oracle 3, CPU half: the `Full` look reproduces its own golden, and its geometry channels
+/// are `Lambert`'s — they come from the centre ray whatever the shading is, which is why no
+/// second depth/seg/normal golden exists.
+#[test]
+fn cpu_full_shading_reproduces_its_golden() {
+    let full = cpu_rs_full();
+    let got = full.tile(Channel::Rgb8).expect("rgb").to_bytes();
+    let want = std::fs::read(golden_dir().join("cornell_rs_full_rgb8.bin"))
+        .expect("the golden (run the generate_goldens test)");
+    assert_eq!(got.len(), want.len(), "cornell_rs_full_rgb8 size");
+    assert!(got == want, "cornell_rs_full_rgb8 differs from its golden");
+
+    let lambert = cpu_rs();
+    same_geometry(&full, &lambert, "CPU Full vs Lambert");
+    let changed = got
+        .iter()
+        .zip(lambert.tile(Channel::Rgb8).unwrap().to_bytes())
+        .filter(|(a, b)| **a != *b)
+        .count();
+    assert!(
+        changed > got.len() / 10,
+        "only {changed} of {} bytes differ: the Full look is barely doing anything",
+        got.len()
+    );
+    println!(
+        "cornell_rs_full_rgb8 bit-equal to its golden; {changed} of {} bytes differ from Lambert",
+        got.len()
+    );
+}
+
+/// Oracle 4: a shadow ray can only darken, and only where something stands between the hit
+/// point and the light. `ssaa: 1` so one pixel is one ray and the claim is checkable per
+/// pixel.
+#[test]
+fn a_shadow_ray_darkens_only_occluded_pixels() {
+    use es_render::bvh::Bvh;
+    let (scene, cam) = (scene(), cornell_camera(TILE, TILE));
+    let with_shadows = |shadows: bool| {
+        let mut cfg = rs_full_cfg();
+        let Shading::Full {
+            specular,
+            shininess,
+            sky_rgb,
+            ground_rgb,
+            ..
+        } = cfg.shading
+        else {
+            unreachable!("rs_full is Full")
+        };
+        cfg.shading = Shading::Full {
+            shadows,
+            specular,
+            shininess,
+            sky_rgb,
+            ground_rgb,
+            ssaa: 1,
+        };
+        cfg
+    };
+    let (on, off) = (with_shadows(true), with_shadows(false));
+    let lit = cpu::rasterize(&scene, &cam, &off, 0);
+    let shadowed = cpu::rasterize(&scene, &cam, &on, 0);
+    let (a, b) = (
+        lit.tile(Channel::Rgb8).unwrap().as_u8().unwrap().to_vec(),
+        shadowed
+            .tile(Channel::Rgb8)
+            .unwrap()
+            .as_u8()
+            .unwrap()
+            .to_vec(),
+    );
+
+    let vp = es_render::ViewParams::new(&cam);
+    let bvh = Bvh::build(&scene.tris);
+    let light = [
+        on.light_dir.x as f32,
+        on.light_dir.y as f32,
+        on.light_dir.z as f32,
+    ];
+    let mut changed = 0;
+    for py in 0..TILE {
+        for px in 0..TILE {
+            let i = (py * TILE + px) as usize;
+            if a[i * 3..i * 3 + 3] == b[i * 3..i * 3 + 3] {
+                continue;
+            }
+            changed += 1;
+            for c in 0..3 {
+                assert!(
+                    b[i * 3 + c] <= a[i * 3 + c],
+                    "pixel ({px}, {py}) channel {c} got brighter with shadows on"
+                );
+            }
+            let d = cpu::primary_dir(&vp, px, py);
+            let hit = cpu::nearest_hit(&scene.tris, &bvh, vp.pos, d, vp.near, vp.far)
+                .unwrap_or_else(|| panic!("pixel ({px}, {py}) changed but hits nothing"));
+            let tri = &scene.tris[hit.tri as usize];
+            let n = cpu::face_forward(tri, d);
+            // The hit point pushed off the surface, exactly as `shade_full` does it.
+            let p = [
+                vp.pos[0] + d[0] * hit.t + n[0] * 1e-4,
+                vp.pos[1] + d[1] * hit.t + n[1] * 1e-4,
+                vp.pos[2] + d[2] * hit.t + n[2] * 1e-4,
+            ];
+            assert!(
+                cpu::any_hit(&scene.tris, &bvh, p, light, 0.0, 1e30),
+                "pixel ({px}, {py}) darkened but nothing occludes it"
+            );
+        }
+    }
+    assert!(changed > 0, "the shadow ray changed no pixel at all");
+    println!(
+        "{changed} of {} pixels darkened, every one of them occluded",
+        TILE * TILE
+    );
+}
+
+/// Oracle 5: `ssaa: 2` is the box filter of the four sub-samples summed in row-major order,
+/// on a one-triangle scene where the arithmetic can be written out by hand.
+#[test]
+fn ssaa_is_a_fixed_order_box_filter() {
+    use es_render::bvh::Bvh;
+    const N: u32 = 8;
+    let scene = TriScene {
+        tris: vec![es_render::Tri {
+            v: [[2.0, -1.0, 1.0], [2.0, 1.0, 1.0], [2.0, 0.0, 3.0]],
+            n: [-1.0, 0.0, 0.0],
+            albedo: [0.6, 0.5, 0.4],
+            emission: [0.0; 3],
+            seg: 1,
+        }],
+        lights: Vec::new(),
+        names: std::collections::BTreeMap::new(),
+    };
+    let cam = CameraView {
+        pose: cornell_camera(N, N).pose,
+        spec: es_render::ImageSpec::pinhole(N, N, 1.2),
+    };
+    let cfg = RenderConfig::rs_full(TileAtlasCfg::row(N, N, 1));
+    assert_eq!(
+        cfg.shading,
+        Shading::FULL,
+        "this test hand-computes the preset's four sub-samples"
+    );
+    let frame = cpu::rasterize(&scene, &cam, &cfg, 0);
+    let got = frame.tile(Channel::Rgb8).unwrap().as_u8().unwrap().to_vec();
+
+    let vp = es_render::ViewParams::new(&cam);
+    let bvh = Bvh::build(&scene.tris);
+    let (mut covered, mut partial) = (0, 0);
+    for py in 0..N {
+        for px in 0..N {
+            // The hand computation: row-major over the 2x2 block, one sequential `+=`, then
+            // one multiply by 1/4, then the sRGB encode.
+            let mut acc = [0.0f32; 3];
+            let mut hits = 0;
+            for sy in 0..2 {
+                for sx in 0..2 {
+                    let d = cpu::primary_dir_sub(&vp, px, py, sx, sy, 0.5);
+                    let Some(hit) = cpu::nearest_hit(&scene.tris, &bvh, vp.pos, d, vp.near, vp.far)
+                    else {
+                        continue;
+                    };
+                    hits += 1;
+                    let tri = &scene.tris[hit.tri as usize];
+                    let n = cpu::face_forward(tri, d);
+                    let p = [
+                        vp.pos[0] + d[0] * hit.t,
+                        vp.pos[1] + d[1] * hit.t,
+                        vp.pos[2] + d[2] * hit.t,
+                    ];
+                    let s = cpu::shade_full(&scene.tris, &bvh, tri, n, p, d, &cfg);
+                    for c in 0..3 {
+                        acc[c] += s[c];
+                    }
+                }
+            }
+            covered += usize::from(hits == 4);
+            partial += usize::from(hits > 0 && hits < 4);
+            let i = (py * N + px) as usize;
+            for c in 0..3 {
+                let want = cpu::to_u8(acc[c] * (1.0 / 4.0));
+                assert_eq!(
+                    got[i * 3 + c],
+                    want,
+                    "pixel ({px}, {py}) channel {c}: {hits} of 4 sub-samples hit"
+                );
+            }
+        }
+    }
+    assert!(
+        partial > 0 && covered > 0,
+        "the triangle must both fill and partly cover pixels for this to mean anything \
+         ({covered} full, {partial} partial)"
+    );
+    println!(
+        "{covered} fully covered and {partial} partially covered pixels of {}, all equal to the \
+         hand-computed row-major box filter",
+        N * N
+    );
 }
 
 // --- GPU -------------------------------------------------------------------------------------
@@ -257,6 +540,90 @@ fn gpu_rasterizer_matches_the_cpu_goldens() {
     );
     println!("Normal: max ULP {nulp}");
     assert!(nulp <= 1, "Normal max ULP {nulp} exceeds 1");
+}
+
+/// Oracle 3, GPU half (packet M7/R2): the `Full` look on the device is the CPU reference's
+/// `Rgb8` bit for bit, and its geometry channels are the `Lambert` render's — same device,
+/// so "the centre ray is the centre ray" is checkable without a ULP budget.
+#[test]
+fn gpu_full_shading_matches_the_cpu() {
+    let test = "gpu_full_shading_matches_the_cpu";
+    let Some(gpu) = open(test) else { return };
+    let cams = [cornell_camera(TILE, TILE)];
+    let mut full = render_gpu(&gpu, rs_full_cfg(), &cams, 1);
+    let mut lambert = render_gpu(&gpu, rs_cfg(), &cams, 1);
+
+    let rgb = full.read_tile(0, Channel::Rgb8).expect("rgb");
+    let want = cpu_rs_full();
+    let want_rgb = want.tile(Channel::Rgb8).unwrap();
+    let diff = rgb
+        .as_u8()
+        .unwrap()
+        .iter()
+        .zip(want_rgb.as_u8().unwrap())
+        .filter(|(a, b)| a != b)
+        .count();
+    let (gpu_px, cpu_px) = (rgb.as_u8().unwrap(), want_rgb.as_u8().unwrap());
+
+    // Every byte outside a geometry edge is bit-equal; a pixel the two disagree about must be
+    // a pixel whose four sub-samples do not all land on the same triangle. See
+    // `docs/design/renderer.md` section 9.3: `dot`'s summation order is not pinned across the
+    // two implementations, so a sub-sample ray that grazes a shared triangle edge can pick a
+    // different winner there, and the box filter then shows a quarter of a sample's shading.
+    let vp = es_render::ViewParams::new(&cams[0]);
+    let sc = scene();
+    let bvh = es_render::bvh::Bvh::build(&sc.tris);
+    let mut edges = 0;
+    for py in 0..TILE {
+        for px in 0..TILE {
+            let i = ((py * TILE + px) as usize) * 3;
+            if gpu_px[i..i + 3] == cpu_px[i..i + 3] {
+                continue;
+            }
+            let worst = (0..3)
+                .map(|c| u32::from(gpu_px[i + c].abs_diff(cpu_px[i + c])))
+                .max()
+                .unwrap_or(0);
+            let hits: Vec<Option<u32>> = (0..4)
+                .map(|k| {
+                    let d = cpu::primary_dir_sub(&vp, px, py, k % 2, k / 2, 0.5);
+                    cpu::nearest_hit(&sc.tris, &bvh, vp.pos, d, vp.near, vp.far).map(|h| h.tri)
+                })
+                .collect();
+            assert!(
+                hits.iter().any(|h| *h != hits[0]),
+                "pixel ({px}, {py}) differs by {worst} but all four sub-samples hit {:?}:                  that is a shading divergence, not a coverage tie",
+                hits[0]
+            );
+            assert!(
+                worst <= 16,
+                "pixel ({px}, {py}) is an edge pixel but differs by {worst} levels, more than                  one sub-sample of four can account for"
+            );
+            edges += 1;
+            println!("  edge pixel ({px}, {py}): sub-sample hits {hits:?}, worst {worst} levels");
+        }
+    }
+    let n_px = (TILE * TILE) as usize;
+    assert!(
+        edges * 1000 <= n_px,
+        "{edges} of {n_px} pixels differ: more than the 0.1% of edge pixels the tie explains"
+    );
+    println!(
+        "Full Rgb8: {diff} of {} bytes differ from the CPU, in {edges} of {n_px} edge pixels",
+        rgb.len()
+    );
+
+    for channel in [DEPTH, Channel::SegmentationId, Channel::Normal] {
+        let (a, b) = (
+            full.read_tile(0, channel).expect("full"),
+            lambert.read_tile(0, channel).expect("lambert"),
+        );
+        assert!(
+            a.to_bytes() == b.to_bytes(),
+            "{channel:?} differs between Full and Lambert on the GPU"
+        );
+        println!("GPU Full/Lambert bit-equal: {channel:?}");
+    }
 }
 
 #[test]

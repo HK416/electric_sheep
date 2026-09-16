@@ -17,10 +17,12 @@ use crate::atlas::{words_per_pixel, AtlasLayout, Tile, TileData};
 use crate::bvh::{Bvh, NODE_STRIDE};
 use crate::error::RenderError;
 use crate::scene::TriScene;
-use crate::view::{CameraView, RenderConfig, RenderPath, ViewParams, VIEW_STRIDE};
+use crate::view::{CameraView, RenderConfig, RenderPath, Shading, ViewParams, VIEW_STRIDE};
 
-/// Globals before the per-view records in the parameter buffer.
-const PARAM_VIEW_BASE: usize = 20;
+/// Globals before the per-view records in the parameter buffer. Slots 0..20 are M4's and
+/// never move; 20..31 are packet M7/R2's shading block, appended at the end (`common.slang`
+/// mirrors both numbers).
+const PARAM_VIEW_BASE: usize = 31;
 /// Floats per direct-lighting reservoir (mirrors `restir.slang`).
 const RES_STRIDE: u64 = 8;
 const WORKGROUP: u32 = 8;
@@ -316,6 +318,25 @@ impl<'gpu> Renderer<'gpu> {
         p[17] = f32::from_bits(self.bvh_base);
         p[18] = f32::from_bits(self.bvh_nodes);
         p[19] = f32::from_bits(self.bvh_prim_base);
+        // The `Rs` shading block (packet M7/R2). `Lambert` writes the flag and leaves the
+        // rest zero; the kernel reads none of it then.
+        if let Shading::Full {
+            shadows,
+            specular,
+            shininess,
+            sky_rgb,
+            ground_rgb,
+            ..
+        } = cfg.shading
+        {
+            p[20] = f32::from_bits(1);
+            p[21] = f32::from_bits(u32::from(shadows));
+            p[22] = specular;
+            p[23] = shininess;
+            p[24..27].copy_from_slice(&sky_rgb);
+            p[27..30].copy_from_slice(&ground_rgb);
+            p[30] = f32::from_bits(cfg.shading.ssaa());
+        }
         for (i, cam) in cameras.iter().enumerate() {
             let base = PARAM_VIEW_BASE + i * VIEW_STRIDE;
             p[base..base + VIEW_STRIDE].copy_from_slice(&ViewParams::new(cam).to_floats());
