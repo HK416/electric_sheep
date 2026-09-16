@@ -4148,7 +4148,7 @@ sentence is re-dated by this packet, not deleted (the rule section 7.26 set). Th
 that closed the milestone is V19b's, and it still holds.
 
 Two things a human may want to decide are in section 12: question 24 is answered here, and the
-new question 29 is `import-lerobot`'s invented latency now that it decides numbers.
+new question 32 is `import-lerobot`'s invented latency (29–31 are `docs/design/training-recipe.md` section 9's) now that it decides numbers.
 
 ## 8. Safety overlay (V3)
 
@@ -4661,7 +4661,7 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     defensible: it is what §10.4 says). Default: **state the document beside every number**, which
     section 7.27 does, until the rule is decided; every trimmed-document table from V11 onward was
     measured this way and is internally consistent, but is not interchangeable with a sweep's row.
-29. **`import-lerobot` invents `expected_latency_ms`, and since T7 that invented number decides
+32. **`import-lerobot` invents `expected_latency_ms`, and since T7 that invented number decides
     the demo's numbers** (section 7.30). A `config.json` carries no latency measurement, so the
     import declares the largest value the deployment tolerates —
     `min(inference_budget, 1000 / replanning_hz)`, 200 ms for the demo — and says so in its own
