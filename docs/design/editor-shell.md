@@ -230,6 +230,7 @@ the wrong one gets the other view's error, not a mode.
 | `Timeline::buckets(n)` | the same ticks folded into `n` columns, for drawing at any width |
 | `acceptance()` | `report.acceptance` verbatim |
 | `filmstrip(cell, 8)` / `frame(cell, i)` | at most eight evenly spread frame indices, and one decoded `Rgb8Image` |
+| `set_frames_root(dir)` / `frames_root()` | where `<cell>/NNNNNN.bin` is looked for; `<run>/frames` on open |
 | `selected_cell()` / `select(name)` | the selection, which is the whole coupling to the replay panel (§11) |
 
 **Two things are called a cell** and the file keeps them apart. `es_ir::evaluation::CellResult`
@@ -257,6 +258,21 @@ table the encoder used — and a test round-trips all 14 kinds.
 back to the timeline's totals at any `n` (the oracle checks `n ∈ {1, 7, 64}`). A bucket shows
 the most severe source it covers (`Policy < Human < Clamped < Fallback`), so one clamped tick
 in a 400-tick episode is still a visible mark rather than a rounding loss.
+
+**A run records two clocks and the summary names both.** An `events.json` record is one
+*frame* — one control step — and carries the `PhysTick` that frame ran at; at the demo's rates
+that is four physics ticks per frame, so "first at tick 544" is nowhere on a 224-column strip.
+`Timeline::kind_rows()` returns `KindRow { kind, frames, first: FirstSeen { frame, tick } }` and
+`KindRow::label()` writes *"Velocity: 2 frame(s), first at frame 1 (tick 1)"* — the strip's own
+index first, the physics tick after it. The wording is in the model with a test, not in
+`app.rs`, because which clock a person is being shown is a decision (§28.10 rule 3).
+
+**Frames are wherever `--frames` pointed.** `es eval run --frames <dir>` writes a directory that
+is usually a *sibling* of the run, not `<run>/frames`, so a real run's table showed `frames 0`
+for every cell until the tab was pointed at it. `set_frames_root(dir)` moves the root and
+rebuilds the rows — which also means a report that stands alone gains its cells from an
+external frames directory — and `app.rs` gets one `Frames` field beside `Scene`, filled with
+`frames_root()` on open and applied when it loses focus.
 
 ### What it deliberately does not do
 
@@ -289,7 +305,10 @@ re-rendered from the scene file and the `.estraj` alone — this does the same o
 
 It lives in the Run tab as a bottom panel (§10's table picks the episode, this plays it). The
 whole coupling is `RunView::selected_cell()`; the panel adds one text field, because a run
-directory does not carry its scene file — the same `--scene` the showcase takes.
+directory does not carry its scene file — the same `--scene` the showcase takes. It opens at
+45% of the tab's height and never shrinks below 320 px, so the canvas is there the moment
+`Replay` is pressed rather than after the separator is found; dragging the separator still
+overrides both.
 
 ### `model/replay_view.rs`
 

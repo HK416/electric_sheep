@@ -88,6 +88,8 @@ pub struct EditorApp {
     /// The scene the replay poses (packet M7/E2). A run directory does not carry one, so it
     /// is typed in - the same `--scene` `es video showcase` takes.
     scene_path: String,
+    /// Where the run's frames are (`es eval run --frames <dir>`); `<run>/frames` on open.
+    frames_path: String,
     replay: Option<ReplayView>,
     /// Which cell `replay` is playing, so switching rows is visible in the panel.
     replay_cell: String,
@@ -125,6 +127,7 @@ impl EditorApp {
             run: None,
             run_frames: BTreeMap::new(),
             scene_path: String::new(),
+            frames_path: String::new(),
             replay: None,
             replay_cell: String::new(),
             camera: SHOWCASE_CAMERA,
@@ -211,6 +214,7 @@ impl EditorApp {
             match RunView::open(&path) {
                 Ok(run) => {
                     self.status = format!("{}: {}", path.display(), run.status);
+                    self.frames_path = run.frames_root().display().to_string();
                     self.run = Some(run);
                     self.tab = Tab::Run;
                 }
@@ -505,10 +509,13 @@ impl EditorApp {
             return;
         }
         // The replay of the selected cell shares the tab (packet M7/E2): the table picks the
-        // episode, the panel plays it.
+        // episode, the panel plays it. Nearly half the window by default, so the canvas is
+        // there without dragging the separator first; still resizable either way.
+        let height = (ui.available_height() * REPLAY_PANEL_FRACTION).max(REPLAY_PANEL_MIN);
         egui::TopBottomPanel::bottom("replay")
             .resizable(true)
-            .default_height(320.0)
+            .min_height(REPLAY_PANEL_MIN)
+            .default_height(height)
             .show_inside(ui, |ui| self.replay_panel(ui));
         egui::CentralPanel::default().show_inside(ui, |ui| self.run_table(ui));
     }
@@ -575,11 +582,8 @@ impl EditorApp {
             // One column per ~4 px of the strip; the model folds the ticks into them.
             let n = (ui.available_width() / 4.0) as usize;
             paint_timeline(ui, &timeline.buckets(n));
-            for (kind, count) in &timeline.totals {
-                ui.label(format!(
-                    "{kind:?}: {count} tick(s), first at tick {}",
-                    timeline.first.get(kind).copied().unwrap_or_default()
-                ));
+            for kind in timeline.kind_rows() {
+                ui.label(kind.label());
             }
 
             ui.separator();
@@ -624,6 +628,7 @@ impl EditorApp {
             replay,
             replay_cell,
             scene_path,
+            frames_path,
             camera,
             status,
             ..
@@ -639,8 +644,22 @@ impl EditorApp {
             ui.add(
                 egui::TextEdit::singleline(scene_path)
                     .hint_text("the run's scene: .xml (MJCF) or .urdf")
-                    .desired_width(260.0),
+                    .desired_width(220.0),
             );
+            // `es eval run --frames <dir>` writes wherever it was told, which is usually a
+            // sibling of the run directory; the model re-scans when this is applied.
+            ui.label("Frames");
+            let field = ui.add(
+                egui::TextEdit::singleline(frames_path)
+                    .hint_text("<run>/frames")
+                    .desired_width(220.0),
+            );
+            if field.lost_focus() {
+                if let Some(run) = run.as_mut() {
+                    run.set_frames_root(frames_path.trim());
+                    *status = format!("{}: {}", run.dir.display(), run.status);
+                }
+            }
             let label = selected
                 .as_ref()
                 .map_or_else(|| "Replay".to_owned(), |name| format!("Replay {name}"));
@@ -910,6 +929,12 @@ const SHOWCASE_CAMERA: Camera = Camera {
 /// `rate.control`; a run directory carries no Deployment IR to read it from, and playing at
 /// the wrong rate only changes how fast the arm appears to move.
 const REPLAY_RATE_HZ: f64 = 50.0;
+
+/// How much of the Run tab the replay panel takes when it first opens, and the least it ever
+/// takes: the 3D view has to be visible the moment `Replay` is pressed, not after the user
+/// finds the separator.
+const REPLAY_PANEL_FRACTION: f32 = 0.45;
+const REPLAY_PANEL_MIN: f32 = 320.0;
 
 /// Radians of orbit per point of drag, and zoom per point of scroll.
 const ORBIT_PER_POINT: f64 = 0.008;

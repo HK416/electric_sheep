@@ -80,14 +80,44 @@ pub struct TickRow {
     pub events: EventSet,
 }
 
+/// Where a kind was first seen. Two numbers because a run records two clocks: `frame` indexes
+/// the records `events.json` holds, which is what the strip is drawn in, and `tick` is the
+/// `PhysTick` that frame carried — several physics ticks to one control step (spec 12.1), so
+/// the two differ by the ratio and only one of them is a position in the strip.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FirstSeen {
+    pub frame: u64,
+    pub tick: u64,
+}
+
+/// One line of the per-kind summary under the strip.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KindRow {
+    pub kind: ViolationKind,
+    /// Records that carried the kind — frames of the strip, not physics ticks.
+    pub frames: usize,
+    pub first: FirstSeen,
+}
+
+impl KindRow {
+    /// The label, decided here rather than in `app.rs`: both clocks, the strip's one first,
+    /// so "first at frame 136" can be found by eye on the strip above it.
+    pub fn label(&self) -> String {
+        format!(
+            "{:?}: {} frame(s), first at frame {} (tick {})",
+            self.kind, self.frames, self.first.frame, self.first.tick
+        )
+    }
+}
+
 /// One episode's Safety Plane history (spec 9.3, spec 9.4).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Timeline {
     pub rows: Vec<TickRow>,
-    /// How many ticks carried each kind. A kind nobody saw is absent, not zero.
+    /// How many records carried each kind. A kind nobody saw is absent, not zero.
     pub totals: BTreeMap<ViolationKind, usize>,
-    /// The tick each kind first appeared on — where to look, not how often.
-    pub first: BTreeMap<ViolationKind, u64>,
+    /// Where each kind first appeared — where to look, not how often.
+    pub first: BTreeMap<ViolationKind, FirstSeen>,
 }
 
 /// One column of the timeline strip: the ticks that fall in it, folded.
@@ -112,6 +142,18 @@ pub fn severity(source: EventSource) -> u8 {
 }
 
 impl Timeline {
+    /// The per-kind summary in `ViolationKind` order, ready to print.
+    pub fn kind_rows(&self) -> Vec<KindRow> {
+        self.totals
+            .iter()
+            .map(|(kind, frames)| KindRow {
+                kind: *kind,
+                frames: *frames,
+                first: self.first.get(kind).copied().unwrap_or_default(),
+            })
+            .collect()
+    }
+
     /// `n` columns over the whole episode, for drawing at any width. Empty for an episode
     /// with no events, and never more columns than there are ticks.
     pub fn buckets(&self, n: usize) -> Vec<Bucket> {
@@ -170,6 +212,12 @@ pub struct RunView {
     pub events: BTreeMap<String, Vec<StepEvent>>,
     /// What the directory did not hold, for the status line.
     pub status: String,
+    /// Where `<cell>/NNNNNN.bin` lives. `<run>/frames` by default, but
+    /// `es eval run --frames <dir>` writes wherever it was told, which is usually a sibling of
+    /// the run directory - so this is settable ([`Self::set_frames_root`]).
+    frames_root: PathBuf,
+    /// `evaluation.lock`'s seeds, kept for rebuilding the rows.
+    seeds: Vec<u64>,
     rows: Vec<CellRow>,
     selected: Option<String>,
 }
@@ -183,38 +231,67 @@ impl RunView {
     /// Reads `report.json` and whatever else is there. Only the report is required.
     pub fn open(dir: &Path) -> Result<Self, RunError> {
         let report: EvaluationReport = read_json(&dir.join("report.json"))?;
-        let mut missing = Vec::new();
         let events_path = dir.join("events.json");
         let events: BTreeMap<String, Vec<StepEvent>> = if events_path.is_file() {
             read_json(&events_path)?
         } else {
-            missing.push("events.json");
             BTreeMap::new()
         };
-        let seeds = read_seeds(dir);
-        let traj: Vec<String> = stems(&dir.join("traj"), Some("estraj"));
-        let frame_dirs: Vec<String> = stems(&dir.join("frames"), None);
+        let mut view = Self {
+            dir: dir.to_path_buf(),
+            report,
+            events,
+            status: String::new(),
+            frames_root: dir.join("frames"),
+            seeds: read_seeds(dir),
+            rows: Vec::new(),
+            selected: None,
+        };
+        view.rebuild();
+        Ok(view)
+    }
+
+    /// Points the filmstrip at another directory - what `es eval run --frames <dir>` wrote.
+    /// The rows are rebuilt, so a run whose frames live outside it gains their counts (and,
+    /// for a report that stands alone, their cells).
+    pub fn set_frames_root(&mut self, root: impl Into<PathBuf>) {
+        self.frames_root = root.into();
+        self.rebuild();
+    }
+
+    pub fn frames_root(&self) -> &Path {
+        &self.frames_root
+    }
+
+    /// Re-derives the rows and the status line from what is on disk now. Called by
+    /// [`Self::open`] and whenever the frames root moves; the sort order goes back to cell
+    /// name order, which is the order the table opens in.
+    fn rebuild(&mut self) {
+        let traj: Vec<String> = stems(&self.dir.join("traj"), Some("estraj"));
+        let frame_dirs: Vec<String> = stems(&self.frames_root, None);
+        let mut missing = Vec::new();
+        if self.events.is_empty() {
+            missing.push("events.json");
+        }
         if traj.is_empty() {
             missing.push("traj/");
         }
         if frame_dirs.is_empty() {
             missing.push("frames/");
         }
-
-        let rows = build_rows(dir, &report, &events, &seeds, &traj, &frame_dirs);
-        let status = if missing.is_empty() {
-            format!("{} cell(s), complete", rows.len())
+        self.rows = build_rows(
+            &self.frames_root,
+            &self.report,
+            &self.events,
+            &self.seeds,
+            &traj,
+            &frame_dirs,
+        );
+        self.status = if missing.is_empty() {
+            format!("{} cell(s), complete", self.rows.len())
         } else {
-            format!("{} cell(s); no {}", rows.len(), missing.join(", no "))
+            format!("{} cell(s); no {}", self.rows.len(), missing.join(", no "))
         };
-        Ok(Self {
-            dir: dir.to_path_buf(),
-            report,
-            events,
-            status,
-            rows,
-            selected: None,
-        })
     }
 
     pub fn cells(&self) -> &[CellRow] {
@@ -283,7 +360,10 @@ impl RunView {
             let events = decode_events(record.events);
             for kind in events.iter() {
                 *out.totals.entry(kind).or_default() += 1;
-                out.first.entry(kind).or_insert(record.tick.0);
+                out.first.entry(kind).or_insert(FirstSeen {
+                    frame: record.frame,
+                    tick: record.tick.0,
+                });
             }
             out.rows.push(TickRow {
                 frame: record.frame,
@@ -316,7 +396,7 @@ impl RunView {
     /// (`es_eval::runner`'s own directory shape). Nothing is cached: a filmstrip asks for
     /// eight of them and a 96x96 frame is 27 kB.
     pub fn frame(&self, cell: &str, index: usize) -> Option<Rgb8Image> {
-        let dir = self.dir.join("frames").join(cell);
+        let dir = self.frames_root.join(cell);
         let layout: FrameLayout = read_json(&dir.join("layout.json")).ok()?;
         let [rows, cols, chans] = layout.shape;
         let (rows, cols, chans) = (rows as usize, cols as usize, chans as usize);
@@ -421,7 +501,7 @@ mod ordered {
 
 /// One row per episode on disk, or — for a report that stands alone — one per suite.
 fn build_rows(
-    dir: &Path,
+    frames_root: &Path,
     report: &EvaluationReport,
     events: &BTreeMap<String, Vec<StepEvent>>,
     seeds: &[u64],
@@ -460,7 +540,7 @@ fn build_rows(
                 metrics,
                 n_episodes,
                 has_traj: traj.contains(&name),
-                frames: count_frames(&dir.join("frames").join(&name)),
+                frames: count_frames(&frames_root.join(&name)),
                 suite,
                 name,
             }
@@ -720,7 +800,8 @@ mod tests {
                     .iter()
                     .find(|r| r.events & (1 << kind.index()) != 0)
                     .expect("a kind that was totalled has a first tick");
-                assert_eq!(*first, seen.tick.0, "cell {cell} kind {kind:?}");
+                assert_eq!(first.tick, seen.tick.0, "cell {cell} kind {kind:?}");
+                assert_eq!(first.frame, seen.frame, "cell {cell} kind {kind:?}");
             }
             for n in [1usize, 7, 64] {
                 let buckets = timeline.buckets(n);
@@ -748,6 +829,25 @@ mod tests {
         );
     }
 
+    /// The per-kind summary labels both clocks, the strip's frame index first: a run records
+    /// several physics ticks per control frame, and only the frame is a place on the strip.
+    #[test]
+    fn a_kind_row_labels_the_frame_and_the_tick() {
+        let view = RunView::open(&fixture()).expect("open the fixture run");
+        let rows = view.timeline("nominal-01").kind_rows();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let velocity = rows
+            .iter()
+            .find(|r| r.kind == ViolationKind::Velocity)
+            .expect("the fixture clamps velocity");
+        assert_eq!((velocity.frames, velocity.first.frame), (2, 1));
+        assert_eq!(
+            velocity.label(),
+            "Velocity: 2 frame(s), first at frame 1 (tick 1)"
+        );
+        assert!(view.timeline("nominal-00").kind_rows().is_empty());
+    }
+
     /// The decoding is the encoding read backwards, for every kind (spec 9.3).
     #[test]
     fn every_violation_kind_round_trips_through_the_bits() {
@@ -757,6 +857,49 @@ mod tests {
             assert_eq!(decode_events(set.bits()), set, "{kind:?}");
         }
         assert!(decode_events(0).is_empty());
+    }
+
+    /// A real run keeps its frames where `--frames` pointed, which is usually not inside the
+    /// run directory: the filmstrip follows [`RunView::set_frames_root`] there.
+    #[test]
+    fn the_frames_root_can_point_outside_the_run() {
+        let outside = scratch("frames-elsewhere");
+        let cell = outside.join("nominal-00");
+        fs::create_dir_all(&cell).expect("cell dir");
+        for name in ["layout.json", "000000.bin"] {
+            fs::copy(
+                fixture().join("frames/nominal-00").join(name),
+                cell.join(name),
+            )
+            .expect("copy frame");
+        }
+
+        // A run directory whose own `frames/` is not there at all.
+        let dir = scratch("frames-none");
+        fs::copy(fixture().join("report.json"), dir.join("report.json")).expect("copy report");
+        let mut view = RunView::open(&dir).expect("open");
+        assert!(view.status.contains("no frames/"), "{}", view.status);
+        assert_eq!(view.cells().len(), 2, "one row per suite");
+        assert!(view.frame("nominal-00", 0).is_none());
+
+        view.set_frames_root(&outside);
+        assert_eq!(view.frames_root(), outside.as_path());
+        assert!(!view.status.contains("no frames/"), "{}", view.status);
+        let row = view
+            .cells()
+            .iter()
+            .find(|r| r.name == "nominal-00")
+            .expect("the frames directory named the cell");
+        assert_eq!(row.frames, 1);
+        assert_eq!(row.suite, "nominal", "the row still joins its suite");
+        assert_eq!(view.filmstrip("nominal-00", 8), vec![0]);
+        assert_eq!(
+            view.frame("nominal-00", 0).expect("frame 0").data.len(),
+            96 * 96 * 3
+        );
+        for dir in [outside, dir] {
+            fs::remove_dir_all(dir).ok();
+        }
     }
 
     /// Oracle 3: `report.json` alone opens, and says what is not there.

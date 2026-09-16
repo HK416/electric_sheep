@@ -237,6 +237,7 @@ redo로 왕복시키고 IR, 레이아웃, 해시를 비교한다.
 | `Timeline::buckets(n)` | 같은 틱들을 `n`개의 열로 접은 것 — 어떤 너비에서도 그릴 수 있게 |
 | `acceptance()` | `report.acceptance` 그대로 |
 | `filmstrip(cell, 8)` / `frame(cell, i)` | 고르게 퍼진 최대 여덟 개의 프레임 인덱스, 그리고 디코딩된 `Rgb8Image` 하나 |
+| `set_frames_root(dir)` / `frames_root()` | `<cell>/NNNNNN.bin`을 찾을 위치; 열 때는 `<run>/frames` |
 | `selected_cell()` / `select(name)` | 선택. 이것이 리플레이 패널(§11)과의 결합 전부다 |
 
 **"cell"이라 불리는 것이 둘**이고 이 파일은 둘을 구분한다. `es_ir::evaluation::CellResult`는
@@ -263,6 +264,21 @@ lock이 없으면 그 칸은 `--`다: 지어낸 시드는 없는 시드보다 �
 타임라인 합계로 다시 더해진다(오라클은 `n ∈ {1, 7, 64}`를 확인한다). 한 버킷은 그것이 덮는
 가장 심각한 소스를 보여주므로(`Policy < Human < Clamped < Fallback`), 400틱 에피소드의 클램프
 한 틱도 반올림으로 사라지지 않고 보이는 자국으로 남는다.
+
+**실행은 두 개의 시계를 기록하고, 요약은 둘 다 적는다.** `events.json`의 레코드 하나는
+*프레임* 하나 — 제어 스텝 하나 — 이고 그 프레임이 돈 `PhysTick`을 싣는다. 데모의 주기에서는
+프레임당 물리 틱이 넷이므로, "first at tick 544"는 224칸짜리 스트립 어디에도 없다.
+`Timeline::kind_rows()`는 `KindRow { kind, frames, first: FirstSeen { frame, tick } }`을
+돌려주고 `KindRow::label()`이 *"Velocity: 2 frame(s), first at frame 1 (tick 1)"* 을 쓴다 —
+스트립 자신의 인덱스가 먼저, 물리 틱이 뒤에. 사람에게 어느 시계를 보여줄지는 결정이므로,
+그 문구는 `app.rs`가 아니라 테스트가 붙은 모델에 있다(§28.10 규칙 3).
+
+**프레임은 `--frames`가 가리킨 곳에 있다.** `es eval run --frames <dir>`는 지정받은 곳에 쓰고,
+그곳은 보통 `<run>/frames`가 아니라 실행 디렉터리의 *형제*다. 그래서 실제 실행의 표는 탭이
+그곳을 가리키기 전까지 모든 셀에 `frames 0`을 보여줬다. `set_frames_root(dir)`이 루트를 옮기고
+행을 다시 만든다 — 덕분에 홀로 있는 리포트도 외부 프레임 디렉터리에서 셀을 얻는다 — 그리고
+`app.rs`에는 `Scene` 옆에 `Frames` 필드 하나가 붙어, 열 때 `frames_root()`로 채워지고 포커스를
+잃을 때 적용된다.
 
 ### 의도적으로 하지 않는 것
 
@@ -295,6 +311,8 @@ lock이 없으면 그 칸은 `--`다: 지어낸 시드는 없는 시드보다 �
 Run 탭의 아래쪽 패널로 산다(§10의 표가 에피소드를 고르고, 이 패널이 그것을 재생한다).
 결합 전부는 `RunView::selected_cell()`이고, 패널은 텍스트 필드 하나를 더한다. 실행
 디렉터리는 자기 장면 파일을 담지 않기 때문이다 — showcase가 받는 바로 그 `--scene`이다.
+탭 높이의 45%로 열리고 320 px 아래로는 줄지 않으므로, 구분선을 찾은 뒤가 아니라 `Replay`를
+누른 순간 캔버스가 거기 있다; 구분선을 끌면 둘 다 덮어쓴다.
 
 ### `model/replay_view.rs`
 
