@@ -264,8 +264,9 @@ in a 400-tick episode is still a visible mark rather than a rounding loss.
 that is four physics ticks per frame, so "first at tick 544" is nowhere on a 224-column strip.
 `Timeline::kind_rows()` returns `KindRow { kind, frames, first: FirstSeen { frame, tick } }` and
 `KindRow::label()` writes *"Velocity: 2 frame(s), first at frame 1 (tick 1)"* — the strip's own
-index first, the physics tick after it. The wording is in the model with a test, not in
-`app.rs`, because which clock a person is being shown is a decision (§28.10 rule 3).
+index first, the physics tick after it; `Timeline::heading(cell)` counts the same unit
+(*"nominal-00: 224 frame(s)"*). The wording is in the model with a test, not in `app.rs`,
+because which clock a person is being shown is a decision (§28.10 rule 3).
 
 **Frames are wherever `--frames` pointed.** `es eval run --frames <dir>` writes a directory that
 is usually a *sibling* of the run, not `<run>/frames`, so a real run's table showed `frames 0`
@@ -273,6 +274,11 @@ for every cell until the tab was pointed at it. `set_frames_root(dir)` moves the
 rebuilds the rows — which also means a report that stands alone gains its cells from an
 external frames directory — and `app.rs` gets one `Frames` field beside `Scene`, filled with
 `frames_root()` on open and applied when it loses focus.
+
+**The table, the acceptance rows, the strip and the filmstrip are one vertical scroll area**
+(`auto_shrink([false, false])`, so it fills whatever the replay panel leaves), and the
+filmstrip has its own horizontal one: eight 160-px thumbnails are wider than a narrow window,
+and a cut-off frame looks like a missing frame.
 
 ### What it deliberately does not do
 
@@ -305,10 +311,17 @@ re-rendered from the scene file and the `.estraj` alone — this does the same o
 
 It lives in the Run tab as a bottom panel (§10's table picks the episode, this plays it). The
 whole coupling is `RunView::selected_cell()`; the panel adds one text field, because a run
-directory does not carry its scene file — the same `--scene` the showcase takes. It opens at
-45% of the tab's height and never shrinks below 320 px, so the canvas is there the moment
-`Replay` is pressed rather than after the separator is found; dragging the separator still
-overrides both.
+directory does not carry its scene file — the same `--scene` the showcase takes.
+
+**How tall it is is the model's answer, not a widget's.**
+`replay_view::panel_height(replay, available)` returns `None` while nothing is loaded — the
+panel is then its control rows and nothing else — and 45% of the tab once
+`ReplayView::is_loaded()` holds, with a 320-px floor so the canvas is worth looking at and an
+80% ceiling so the table above it does not vanish. The first cut took the 45% unconditionally
+and an empty canvas clipped the filmstrip above it. `app.rs` gives the two states their own
+panel id (`replay-controls` / `replay-canvas`), because egui remembers a panel's dragged
+height per id and the two want their own; a run that changes drops the replay and the panel
+shrinks back by itself.
 
 ### `model/replay_view.rs`
 
