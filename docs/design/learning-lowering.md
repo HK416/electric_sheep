@@ -50,8 +50,8 @@ class EsPolicy(nn.Module):
 
     def forward(self, **inputs):
         v1_out = self.n1(inputs["joint_state"])
-        v4_chunk = self.n4(v1_out).reshape(3, 2)
-        v5_actions = v4_chunk[:3]
+        v4_chunk = self.n4(v1_out).reshape(-1, 3, 2)
+        v5_actions = v4_chunk[:, :3]
         return {"actions": v5_actions}
 ```
 
@@ -63,11 +63,15 @@ class EsPolicy(nn.Module):
   `BTreeMap` or a `Vec` built in that order, so **the same graph produces byte-identical
   source**. That is a unit test, not an aspiration: `lowering_hash = blake3("es.lowering.v1" ||
   source)` and two lowerings of the same graph must agree.
-- No batch axis. Spec 5.2 gives the Learning IR free batch semantics and spec 5.4 keeps the
-  batch axis out of every declared shape; the generated module is written for one sample and
-  torch's broadcasting makes a leading batch axis work anyway for the `Linear` path. The
-  reshape in `PolicyHead` uses `.reshape(H, A)`, which pins the no-batch convention. A batched
-  lowering is a later packet, not a flag.
+- **A leading batch axis, on every port** (packet M7/T3). `forward(**inputs)` takes each input
+  as `[N, ..declared shape]` and returns each output as `[N, ..]`: image ports `[N, C, H, W]`,
+  state `[N, D]`, noise `[N, ..]`, the chunk `[N, K, A]`. The reshape in `PolicyHead` is
+  `.reshape(-1, H, A)`, which pins the convention the way `.reshape(H, A)` used to pin its
+  opposite. Spec 5.2 gives the Learning IR free batch semantics and spec 5.4 keeps the batch
+  axis out of every declared shape, so this is a **lowering** decision and not an IR one: the
+  IR's shapes stay per-sample, `contract.json` repeats them per-sample, and the key
+  `"batch_axis": true` beside them says what the module does with them. Section 5.2 has the
+  before and after.
 
 ## 3. Node table
 
@@ -88,12 +92,12 @@ safetensors file before the first `forward`, and a missing key is an error, neve
 | `TemporalEncoder { None }` | — | `v = x` | none |
 | `TemporalEncoder { Transformer }` | `nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=out_dim, nhead=8, batch_first=True), 1)` | `v = self.nk(x)` | prefix |
 | `TemporalEncoder { TemporalConv, Gru, Mamba }` | — | — | `Unsupported` |
-| `PolicyHead { Regression }` | `Linear(in, horizon * action_dim)` | `v = self.nk(x).reshape(H, A)` | exact |
+| `PolicyHead { Regression }` | `Linear(in, horizon * action_dim)` | `v = self.nk(x).reshape(-1, H, A)` | exact |
 | `PolicyHead { Diffusion { Ddpm, Ddim } }` | `_DdpmHead` (section 8) | `v = self.nk(cond, noise)` | exact |
 | `PolicyHead { FlowMatching }` | `_FlowHead` (section 8) | `v = self.nk(cond, noise)` | exact |
 | `PolicyHead { Diffusion { DpmSolver }, Discrete, Energy }` | — | — | `Unsupported` |
 | `PolicyBundle` | — | — | `Unsupported` |
-| `ActionChunker` | — | `v = x[:K]` | none |
+| `ActionChunker` | — | `v = x[:, :K]` | none |
 | `Normalizer { MeanStd / MinMax }` | `register_buffer(..., persistent=False)` | `v = (x - mean) / std` or its inverse | none |
 | `Normalizer { Dataset }` | — | — | `Unsupported` |
 
@@ -105,8 +109,10 @@ Notes on the entries that are not obvious:
   is stated by shape and not by a flag, and the projection's keys appear in `weight_keys` only
   when it exists.
 - **`TemporalEncoder { Transformer }` on a pooled feature.** When `token_count == 0` the port is
-  `[dim]`, which has no token axis. The lowering inserts `unsqueeze(0)` before the encoder and
-  `squeeze(0)` after it, i.e. a one-token sequence. `nhead = 8` is fixed; spec 8.3's node
+  `[dim]`, which has no token axis. The lowering inserts `unsqueeze(1)` before the encoder and
+  `squeeze(1)` after it, i.e. a one-token sequence — axis 1 because the layer is
+  `batch_first=True` and axis 0 is now the batch (section 5.2; before the batch axis it was
+  `unsqueeze(0)`, a batch of one standing in for a sequence of one). `nhead = 8` is fixed; spec 8.3's node
   parameters do not carry it, so it is a lowering constant, and a checkpoint trained with a
   different head count will fail the shape check rather than silently reinterpret.
 - **`ActionChunker`.** Everything about it except `execute_chunk` — `replan_hz`, `mode`,
@@ -186,17 +192,26 @@ the tier-4 harness test exercises — has no torchvision dependency.
 touched by this — it is a lowering decision, so `lowering_hash` and `compiler_hash` move and
 `learning_hash` does not.
 
-The reason is this lowering's own shape. Spec 8.3's ports carry no batch axis (spec 5.2 gives
-the inference domain its own batch size), so a `VisionEncoder` lowers to
-`self.n{k}(x.unsqueeze(0)).squeeze(0)` — one image, always. A trainer batches by accumulating
-gradients over single-sample forwards, so torchvision's default `BatchNorm2d` fits **N = 1**
-statistics at every one of ResNet18's 20 layers — it is instance normalization with a batch
-counter — and then `torch_ref.py`'s `model.eval()` swaps in the running averages. The trained
-function and the deployed function are different functions, which no post-processing of the
-weights repairs: measured on V11's checkpoint, chunk L1 0.011 in `train()` against 0.031–0.039
-in `eval()`, with 0.048 for "hold the current pose", and recalibrating the running statistics
-over the whole training set in batches of 64 only reached 0.029 (design note
-`visible-learning.md` section 7.21).
+The reason it was found is this lowering's shape at the time. Until packet M7/T3 a
+`VisionEncoder` lowered to `self.n{k}(x.unsqueeze(0)).squeeze(0)` — one image, always — and a
+trainer batched by accumulating gradients over single-sample forwards, so torchvision's default
+`BatchNorm2d` fitted **N = 1** statistics at every one of ResNet18's 20 layers (instance
+normalization with a batch counter) and `torch_ref.py`'s `model.eval()` then swapped in the
+running averages. The trained function and the deployed function were different functions, which
+no post-processing of the weights repairs: measured on V11's checkpoint, chunk L1 0.011 in
+`train()` against 0.031–0.039 in `eval()`, with 0.048 for "hold the current pose", and
+recalibrating the running statistics over the whole training set in batches of 64 only reached
+0.029 (design note `visible-learning.md` section 7.21).
+
+**The batch axis of section 5.2 does not reopen this.** A real batch would give `BatchNorm2d`
+N = 8 statistics instead of N = 1, which is a better estimate of the wrong thing: `train()` would
+still normalize by the batch in front of it and `eval()` still by a running average, so the two
+would still be two functions and `the_backbone_computes_the_same_function_in_train_and_eval`
+would still fail. What the rule rests on is the half that does not depend on N — `GroupNorm` has
+no `training` branch — and that is why the oracle is an equality and not a tolerance. It also
+makes the batch axis cheap to trust in the other direction: `GroupNorm` normalizes within a
+sample, so adding rows cannot change a row, which is what `the_batch_is_invariant` measures
+(section 5.2).
 
 `GroupNorm` normalizes over channel groups of the sample in front of it. It has no `training`
 branch and no running buffers, so `train()` and `eval()` are bit-identical and the weight
@@ -216,6 +231,112 @@ layer-level authoring is PyTorch's job; the IR describes the interface. `Tempora
 { Transformer }` is therefore a single opaque `nn.TransformerEncoder` with a prefix claim, and a
 real LeRobot ACT checkpoint will need a key remap in the M1 gate packet (§8.9) — that remap is
 data, not code, and does not belong here.
+
+### 5.2 The batch axis
+
+**Rule.** Every port of the lowered module carries a leading batch axis. It is a lowering
+decision like section 5.1's, so `lowering_hash` and `compiler_hash` move and `learning_hash`
+does not.
+
+Packet M7/T3, spec 28.9's ladder rung 9. The module was written for one sample, so `--batch 8`
+in `train_act.py` was eight forwards accumulated into one optimizer step, and 20,000 steps took
+about eleven minutes on an RTX 4090 with no flag moving it — not `--resident-gpu`, not bf16, not
+`torch.compile` (`visible-learning.md` section 7.11). The measurement said kernel-launch bound,
+and the launches were in the lowering, not in the trainer.
+
+What moved is one expression per node and nothing else:
+
+| node | before | after |
+|---|---|---|
+| `VisionEncoder` | `self.nk(x.unsqueeze(0)).squeeze(0)` | `self.nk(x)` |
+| `TemporalEncoder{Transformer}`, `token_count == 0` | `self.nk(x.unsqueeze(0)).squeeze(0)` | `self.nk(x.unsqueeze(1)).squeeze(1)` |
+| `PolicyHead{Regression}` | `self.nk(x).reshape(H, A)` | `self.nk(x).reshape(-1, H, A)` |
+| `ActionChunker` | `x[:K]` | `x[:, :K]` |
+| `Diffusion` / `FlowMatching` | `x = noise.reshape(-1)` … `x.reshape(H, A)` | `x = noise.reshape(noise.shape[0], -1)` … `x.reshape(-1, H, A)` |
+| `Fusion`, `Normalizer`, `StateEncoder` | — | unchanged; `dim=-1` / `dim=-2` and broadcasting already meant the right thing |
+
+Four notes on that table.
+
+- The token-less transformer is the one place where the axis was not added but **corrected**.
+  `nn.TransformerEncoderLayer` is emitted `batch_first=True`, so axis 0 is the batch and axis 1
+  is the sequence; the old `unsqueeze(0)` gave it a batch of one carrying `dim`-many features
+  and let it read that as the sequence. One sample at a time, the two readings coincide. They
+  do not at N = 8, which is why this row is a fix and not a rewrite.
+- **The samplers' per-step arithmetic is unchanged expression for expression.** Only the state's
+  shape moved, from `[x_dim]` to `[N, x_dim]`; every coefficient is still a Python float and
+  every `noise_<t>` buffer still `[x_dim]`, so each line broadcasts to what it computed before.
+  The timestep embedding is a function of the step alone, so `_Denoiser.forward` expands it
+  across the batch before the `torch.cat` — a view, not an arithmetic operation. Spec 8.9's
+  tolerance on these heads is 1e-5 and a moved expression is a moved ULP, so the discipline is
+  the point: the tier-4 numbers in section 8.5 were re-measured, not re-baselined.
+- `contract.json` keeps the IR's **per-sample** shapes under `inputs` — spec 5.2 gives every
+  domain its own batch size and the IR declares none — and adds `"batch_axis": true` beside
+  them. A reader that does not know the key feeds one sample unbatched and fails on a shape,
+  which is the right failure; `train_act.py` refuses outright with the name of the command that
+  rewrites the module.
+- `torch_ref.py` feeds `[1, ..]` and strips the axis off every output, so `PolicyRuntime::infer`
+  is still one observation in, one chunk out. The flag rides on the `load` request because
+  `lerobot::lower_act`'s module is not this lowering's: it has its own `forward` and returns an
+  unbatched chunk, so it is loaded with `batch_axis = false` and the `act_checkpoint` oracle
+  still reads `max_abs 0e0`.
+
+`train_act.py` stacks `--batch N` samples into one forward and takes one `L1` mean over
+`[N, K, A]`. The permutation is still drawn once per epoch from the same generator, so batch `i`
+holds exactly the samples the accumulation loop would have visited; what does move is the sum
+order — a mean over the batch instead of a sum of per-sample means — so a loss curve from before
+this packet is comparable in shape and not bit for bit. `--resident-gpu`, `--amp`, `--compile`,
+`--channel-weight`, `--checkpoint-at` and `--loss-curve` keep their meanings, and
+`resident_gpu_does_not_move_the_loss` still compares two curves as bytes.
+
+**Two oracles.** `lower::torch::tests::the_module_has_a_batch_axis` needs no Python: for the
+ACT, Diffusion and FlowMatching fixtures the generated source carries no `.unsqueeze(0)` /
+`.squeeze(0)` idiom, the head reshapes with a leading `-1`, the chunker slices `[:, :K]` and the
+contract says `batch_axis`. `ir_training::the_batch_is_invariant` is the one that matters: eight
+distinct observations through the demo bundle's module as one `[8, ..]` batch and as eight
+`[1, ..]` calls, compared at spec 8.9's tier-4 fp32 tolerance. Nothing in the node set can mix
+rows — `GroupNorm` normalizes within a sample (section 5.1), `nn.Linear` is row-wise, the
+transformer sees one token per row — so the only thing left to differ is which matmul kernel
+torch dispatches on, and the measured difference is printed rather than asserted away.
+
+**Measured** (oracle server, RTX 4090, torch 2.11.0+cu129; 20,000 optimizer steps, batch 8,
+lr 1e-4, seed 0, `--device cuda --resident-gpu`, V15's 200-demonstration baked set, 36,960
+samples; before = `main` at the tip of wave 1, after = this packet):
+
+| | before | after |
+|---|---|---|
+| wall clock, 20,000 steps | 11:15 (675 s) | **2:17 (137 s)** |
+| seconds per 1,000 optimizer steps | 33.8 | **6.9** |
+| samples per second | 237 | **1,168** |
+| `final_loss` | 0.019108 | 0.019026 |
+| `initial_loss` | 0.061912 | 0.062453 |
+| `lowering_hash` | `70a8fec7…069cd3d2` | `3d06811c…d8a2d394` |
+| `learning_hash` | unchanged | unchanged |
+
+4.9x, and the loss lands in the same place: `final_loss` moves by 0.4 %, which is the sum-order
+difference and the changed `initial_loss` compounding through 20,000 AdamW steps, not a different
+objective. Per §12.4 no `step/s` figure is quoted — the two rates above are the run's own units.
+The checkpoint is `~/artifacts/plan-v/m7-t3/model-20000.safetensors`; evaluating it is wave 5's
+job, not this packet's.
+
+**Batch 64, same lr, as an observation only** (the lr schedule is packet M7/T4's and nothing here
+tunes it; the linear-scaling convention that diverged in `visible-learning.md` 7.11 is *not*
+re-run, this is 64 at the batch-8 lr):
+
+| batch | wall clock, 20,000 steps | s / 1,000 steps | samples/s | `final_loss` |
+|---|---|---|---|---|
+| 8 (the default) | 2:17 (137 s) | 6.9 | 1,168 | 0.019026 |
+| 64 | 3:07 (187 s) | 9.4 | **6,845** | 0.009286 |
+
+Two things to read off it and nothing else. The rate: 5.9x the samples per second for 1.4x the
+wall clock, so the GPU is still not saturated at batch 8 and the next lever is batch size, not
+another flag. And the stability: this run did **not** diverge, where 7.11's batch-64 run went
+`NaN` — but that run scaled the lr linearly to 8e-4 and this one did not move it at all, which
+is exactly the difference packet M7/T4 exists to study. The two `final_loss` values are not
+comparable as fits, because 20,000 steps at batch 64 is eight times the data.
+
+The remaining cost is now elsewhere. What rung 9 removed was the per-sample launch; what is left
+at batch 8 is one ResNet18 forward over eight 96×96 images and the AdamW step, and the samples/s
+column is the number to beat next.
 
 ## 6. Tier-4 tolerance (spec 8.9)
 
@@ -259,8 +380,9 @@ Nothing below is a "later, maybe". Each is deferred because its oracle is not in
 - **`LanguageEncoder`.** Needs a tokenizer and `transformers`; a Python dependency on the
   inference path that spec 2.4 wants confined to the learning path.
 - **`DiscreteHead`, `EnergyHead`.** No consumer yet.
-- **Batched lowering, ONNX export, `libtorch` FFI.** Spec 2.4 puts `OnnxRuntime` at M2 and
-  `VulkanRuntime` at M3. The subprocess is the M1 shape and is meant to be slow.
+- **ONNX export, `libtorch` FFI.** Spec 2.4 puts `OnnxRuntime` at M2 and `VulkanRuntime` at M3.
+  The subprocess is the M1 shape and is meant to be slow. (Batched lowering was on this list
+  until packet M7/T3 took it off — section 5.2.)
 - **Real LeRobot ACT checkpoint key remap.** The M1 gate (spec 8.9) needs it; it is a fixture,
   and fixtures belong with the gate.
 
@@ -268,7 +390,8 @@ Nothing below is a "later, maybe". Each is deferred because its oracle is not in
 
 Both heads are *iterative*: they start from noise and refine it into the action chunk. Spec 8.5
 says the output is a chunk `[H, A]`, so the sampler's state is that chunk flattened,
-`x_dim = H * A`, and `.reshape(H, A)` happens once at the end.
+`x_dim = H * A`, and `.reshape(-1, H, A)` happens once at the end. With the batch axis of
+section 5.2 the state is `[N, x_dim]`; every step below is the same expression over it.
 
 ### 8.1 Where the noise comes from
 
@@ -438,3 +561,13 @@ schedule plus matmul accumulation order; it does not grow with the step count in
 configurations because both schedulers contract towards the denoiser's output. The tests re-run
 each policy and assert the spec 8.9 bitwise row as well, which is where a hidden RNG would show
 up.
+
+**Re-measured after the batch axis** (packet M7/T3, oracle server, torch 2.11.0+cu129 — a
+different interpreter from the table above, so these are a second reading and not a diff of it):
+`torch_ddpm_matches_rust` 1.788e-7 / 1.450e-6, `torch_ddim_matches_rust` 1.490e-7 / 2.618e-6,
+`torch_flow_matching_matches_rust` 5.960e-8 / 3.269e-7, and `tests/torch_equivalence.rs`'s
+`torch_mlp_matches_rust` 5.960e-8 / 9.146e-7. Same order of magnitude, three orders under the
+1e-5 limit. The three `diffusers` rows **SKIPped**: that venv has no `diffusers` wheel, so the
+comparison against a real `scheduler.step` loop is still owed a run on an interpreter that has
+one, and until then the batched sampler's agreement with diffusers rests on the mirror in
+`reference.rs` alone.

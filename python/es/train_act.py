@@ -43,16 +43,22 @@ Two more things it deliberately does not do, both for the reason the rest of the
   * it does no pre- or post-processing. Normalization, chunking and unnormalizing are IR nodes
     and are already inside `es_policy.py` (spec 8.7) or inside the bake (spec 7.2).
 
-**The lowered module is single-sample.** `PolicyHead{Regression}` lowers to
-`.reshape(horizon, action_dim)` and `ActionChunker` to `[:execute_chunk]`, neither of which
-carries a batch axis -- spec 5.2 gives the inference domain its own batch size, so the IR has
-none. `--batch N` is therefore N samples accumulated into one optimizer step: the same gradient
-a batched forward would produce, one forward at a time.
+**The lowered module takes a batch axis** (packet M7/T3). `forward(**inputs)` wants every input
+with a leading `N` and returns the chunk as `[N, execute_chunk, action_dim]`, which
+`contract.json`'s `"batch_axis": true` declares; the shapes under `"inputs"` stay per-sample,
+because spec 5.2 keeps the batch out of the IR and gives each domain its own size. `--batch N`
+is therefore one forward over N stacked samples and one `L1` mean over `[N, K, A]` -- not N
+single-sample forwards accumulated, which is what it was through M5 and what made 20,000 steps
+kernel-launch bound (spec 28.9 rung 9). The sample order is unchanged: the permutation is still
+drawn once per epoch with the same generator, so batch `i` holds exactly the samples the
+accumulation loop would have visited. The *numbers* move by one sum order -- `mean` over the
+whole batch instead of a sum of per-sample means -- so a loss curve is comparable to M5's in
+shape, not bit for bit.
 
 **The three speed flags, and which of them move the numbers** (packet M5/V5):
 
   * `--resident-gpu` moves the whole baked set onto `--device` once, instead of copying one
-    sample per forward. It changes *where* a tensor lives and nothing else -- the batch order,
+    batch per step. It changes *where* a tensor lives and nothing else -- the batch order,
     the dtype and the arithmetic are untouched -- so the loss curve is **bit-identical** to the
     default path at the same `--seed`, which
     `crates/es-policy/tests/ir_training.rs::resident_gpu_does_not_move_the_loss` pins. It needs
@@ -77,11 +83,13 @@ Like `--batch` and `--lr` it enters no hash slot (spec 8.1), so it belongs in th
 which is where it is printed.
 
 `--batch` defaults to 8 and stays there: the design note's measured runs are at 8, and moving
-the default would silently invalidate them. Raising it is a different run, not a faster one --
-`--batch N` accumulates N samples per optimizer step, so N x fewer steps cover the same data,
-and the convention is to scale the step with it linearly: `--batch 32 --lr 4e-4` for the
-`--batch 8 --lr 1e-4` default. Neither the scaling nor the batch size enters a hash slot
-(spec 8.1); both belong in whatever records the training run.
+the default would silently invalidate them. Raising it is a different run, and now a cheaper
+one per sample -- `--batch N` covers N samples per optimizer step, so N x fewer steps cover the
+same data, and the convention is to scale the step with it linearly: `--batch 32 --lr 4e-4` for
+the `--batch 8 --lr 1e-4` default. That convention was measured to diverge at 64 (design note
+`visible-learning.md` section 7.11); a schedule is packet M7/T4's, not this script's. Neither
+the scaling nor the batch size enters a hash slot (spec 8.1); both belong in whatever records
+the training run.
 """
 
 from __future__ import annotations
@@ -265,20 +273,27 @@ def main(argv: list) -> int:
     device = torch.device(a.device)
     contract = json.loads((a.module / "contract.json").read_text(encoding="utf-8"))
     shapes = {port: [int(d) for d in shape] for port, shape in contract["inputs"].items()}
+    if not contract.get("batch_axis"):
+        raise SystemExit(
+            "%s/contract.json does not declare batch_axis: it was written by a lowering that "
+            "emits a single-sample module (before packet M7/T3). Re-run `es policy lower`."
+            % a.module
+        )
     model = build_policy(a.module).to(device)
 
     # The chunk width is the module's own: `ActionChunker` slices the head's horizon down to
-    # `execute_chunk`, and asking the module beats re-deriving it from the IR.
+    # `execute_chunk`, and asking the module beats re-deriving it from the IR. The probe is one
+    # sample *with* the batch axis, so axis 0 is the batch and axis 1 is the chunk.
     model.eval()
     with torch.no_grad():
         probe = {
-            port: torch.zeros(shape, dtype=torch.float32, device=device)
+            port: torch.zeros([1] + shape, dtype=torch.float32, device=device)
             for port, shape in shapes.items()
         }
         out = model(**probe)
         if len(out) != 1:
             raise SystemExit("the lowered graph has %d outputs; V2 trains one" % len(out))
-        chunk = int(next(iter(out.values())).shape[0])
+        chunk = int(next(iter(out.values())).shape[1])
 
     weights = torch.ones(contract["action_dim"], device=device)
     for item in a.channel_weight:
@@ -322,27 +337,31 @@ def main(argv: list) -> int:
     order, cursor = [], 0
     for step in range(total):
         optimizer.zero_grad(set_to_none=True)
-        accumulated = 0.0
+        # The same `a.batch` samples the accumulation loop would have visited, in the same
+        # order, drawn from the same generator -- and now stacked into one forward (M7/T3).
+        picked = []
         for _ in range(a.batch):
             if cursor >= len(order):
                 order = torch.randperm(len(samples), generator=generator).tolist()
                 cursor = 0
-            index, t, rows = samples[order[cursor]]
+            picked.append(samples[order[cursor]])
             cursor += 1
-            tensors = episodes[index]
-            inputs = {
-                port: tensors[port][t].to(device).reshape(shape) for port, shape in shapes.items()
-            }
-            target = tensors["action"][rows].to(device)
-            with amp:
-                predicted = next(iter(forward(**inputs).values()))
-                # `(|d| * w).mean()` over [chunk, action_dim]; with every weight 1 this is
-                # exactly `l1_loss`, so an unweighted run is bit-identical to V15's.
-                loss = ((predicted - target).abs() * weights).mean() / a.batch
-            loss.backward()
-            accumulated += float(loss.detach())
+        inputs = {
+            port: torch.stack([episodes[i][port][t] for i, t, _ in picked])
+            .to(device)
+            .reshape([len(picked)] + shape)
+            for port, shape in shapes.items()
+        }
+        target = torch.stack([episodes[i]["action"][rows] for i, _, rows in picked]).to(device)
+        with amp:
+            predicted = next(iter(forward(**inputs).values()))
+            # `(|d| * w).mean()` over [batch, chunk, action_dim]; with every weight 1 this is
+            # exactly `l1_loss`, and the batch mean is the average of the per-sample means the
+            # accumulation loop summed -- the same gradient, one sum order later.
+            loss = ((predicted - target).abs() * weights).mean()
+        loss.backward()
         optimizer.step()
-        losses.append(accumulated)
+        losses.append(float(loss.detach()))
         if marks and (step + 1) in marks:
             stem = str(a.out.with_suffix(""))
             write_safetensors(
@@ -363,6 +382,9 @@ def main(argv: list) -> int:
         "steps": len(losses),
         "samples": len(samples),
         "batch": a.batch,
+        # One forward over `batch` samples, not `batch` forwards accumulated (packet M7/T3).
+        # It is in the summary because it is what the loss numbers below are a sum order of.
+        "batch_axis": True,
         # Which of the three speed flags were on, because two of them change the bits and a
         # number whose mode is not recorded is a number nobody can reproduce.
         "resident_gpu": a.resident_gpu,

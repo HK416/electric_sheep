@@ -48,8 +48,8 @@ class EsPolicy(nn.Module):
 
     def forward(self, **inputs):
         v1_out = self.n1(inputs["joint_state"])
-        v4_chunk = self.n4(v1_out).reshape(3, 2)
-        v5_actions = v4_chunk[:3]
+        v4_chunk = self.n4(v1_out).reshape(-1, 3, 2)
+        v5_actions = v4_chunk[:, :3]
         return {"actions": v5_actions}
 ```
 
@@ -61,11 +61,14 @@ class EsPolicy(nn.Module):
   `Vec`이므로, **동일한 그래프는 바이트 단위로 동일한 소스를 만들어낸다**. 이것은 지향점이 아니라
   유닛 테스트다: `lowering_hash = blake3("es.lowering.v1" || source)`이며, 동일 그래프의 두
   lowering 결과는 반드시 일치해야 한다.
-- 배치 축이 없다. spec 5.2는 Learning IR에 자유로운 배치 시맨틱을 부여하고, spec 5.4는 선언된
-  모든 shape에서 배치 축을 제외한다; 생성된 모듈은 샘플 하나를 기준으로 작성되며, `Linear` 경로
-  에서는 torch의 브로드캐스팅 덕분에 선행 배치 축이 있어도 어차피 동작한다. `PolicyHead`의
-  reshape은 `.reshape(H, A)`를 쓰는데, 이것이 no-batch 컨벤션을 고정한다. 배치화된 lowering은
-  플래그가 아니라 이후의 별도 패킷이다.
+- **모든 포트에 선행 배치 축이 있다**(패킷 M7/T3). `forward(**inputs)`는 각 입력을
+  `[N, ..선언된 shape]`로 받고 각 출력을 `[N, ..]`로 돌려준다: 이미지 포트 `[N, C, H, W]`,
+  상태 `[N, D]`, 노이즈 `[N, ..]`, 청크 `[N, K, A]`. `PolicyHead`의 reshape은
+  `.reshape(-1, H, A)`이며, 예전에 `.reshape(H, A)`가 그 반대를 고정했던 것과 같은 방식으로
+  이 컨벤션을 고정한다. spec 5.2는 Learning IR에 자유로운 배치 시맨틱을 부여하고 spec 5.4는
+  선언된 모든 shape에서 배치 축을 제외하므로, 이것은 IR의 결정이 아니라 **lowering**의 결정이다:
+  IR의 shape은 샘플 단위로 유지되고, `contract.json`도 샘플 단위로 그대로 옮겨 적으며, 그 옆의
+  `"batch_axis": true` 키가 모듈이 그것을 어떻게 쓰는지 말한다. before/after는 5.2절에 있다.
 
 ## 3. 노드 표
 
@@ -86,12 +89,12 @@ class EsPolicy(nn.Module):
 | `TemporalEncoder { None }` | — | `v = x` | 없음 |
 | `TemporalEncoder { Transformer }` | `nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=out_dim, nhead=8, batch_first=True), 1)` | `v = self.nk(x)` | 접두사 |
 | `TemporalEncoder { TemporalConv, Gru, Mamba }` | — | — | `Unsupported` |
-| `PolicyHead { Regression }` | `Linear(in, horizon * action_dim)` | `v = self.nk(x).reshape(H, A)` | 정확 |
+| `PolicyHead { Regression }` | `Linear(in, horizon * action_dim)` | `v = self.nk(x).reshape(-1, H, A)` | 정확 |
 | `PolicyHead { Diffusion { Ddpm, Ddim } }` | `_DdpmHead` (8절) | `v = self.nk(cond, noise)` | 정확 |
 | `PolicyHead { FlowMatching }` | `_FlowHead` (8절) | `v = self.nk(cond, noise)` | 정확 |
 | `PolicyHead { Diffusion { DpmSolver }, Discrete, Energy }` | — | — | `Unsupported` |
 | `PolicyBundle` | — | — | `Unsupported` |
-| `ActionChunker` | — | `v = x[:K]` | 없음 |
+| `ActionChunker` | — | `v = x[:, :K]` | 없음 |
 | `Normalizer { MeanStd / MinMax }` | `register_buffer(..., persistent=False)` | `v = (x - mean) / std` 또는 그 역연산 | 없음 |
 | `Normalizer { Dataset }` | — | — | `Unsupported` |
 
@@ -102,8 +105,10 @@ class EsPolicy(nn.Module):
   `out_dim`과 다를 **때만** `Linear`로 투영한다. 조건부 가중치는 위험 요소이므로, 규칙은 플래그가
   아니라 shape으로 진술되며, 투영의 키는 그것이 존재할 때만 `weight_keys`에 나타난다.
 - **풀링된 피처 위의 `TemporalEncoder { Transformer }`.** `token_count == 0`이면 포트는 토큰
-  축이 없는 `[dim]`이 된다. lowering은 인코더 앞에 `unsqueeze(0)`을, 뒤에 `squeeze(0)`을
-  삽입한다. 즉 토큰 하나짜리 시퀀스로 취급한다. `nhead = 8`은 고정값이다; spec 8.3의 노드
+  축이 없는 `[dim]`이 된다. lowering은 인코더 앞에 `unsqueeze(1)`을, 뒤에 `squeeze(1)`을
+  삽입한다. 즉 토큰 하나짜리 시퀀스로 취급한다. 축이 1인 이유는 이 레이어가
+  `batch_first=True`이고 축 0이 이제 배치이기 때문이다(5.2절; 배치 축이 생기기 전에는
+  `unsqueeze(0)`이었다). `nhead = 8`은 고정값이다; spec 8.3의 노드
   파라미터에는 이 값이 실려 있지 않으므로 lowering 상수이며, 다른 head 개수로 학습된 체크포인트는
   조용히 재해석되지 않고 shape 검사에서 실패한다.
 - **`ActionChunker`.** `execute_chunk`를 제외한 나머지 — `replan_hz`, `mode`, `blend`,
@@ -181,17 +186,25 @@ ResNet은 정확히 99.9%만 맞고 그래서 오라클로서는 아예 없는 �
 않는다. 이것은 spec 8.3을 건드리지 않는다 — 로워링 결정이므로 `lowering_hash`와
 `compiler_hash`는 움직이고 `learning_hash`는 움직이지 않는다.
 
-이유는 이 로워링 자체의 형태에 있다. spec 8.3의 포트에는 배치 축이 없고(spec 5.2가 추론
-도메인에 자기 배치 크기를 준다), 그래서 `VisionEncoder`는
-`self.n{k}(x.unsqueeze(0)).squeeze(0)` — 항상 이미지 한 장 — 으로 내려간다. 트레이너는
-단일 샘플 forward의 그래디언트를 누적해서 배치를 만들므로, torchvision 기본값인
-`BatchNorm2d`는 ResNet18의 20개 층 전부에서 **N = 1** 통계를 적합한다(사실상 배치 카운터가
+이 문제가 발견된 이유는 당시 로워링의 형태에 있다. 패킷 M7/T3 전까지 `VisionEncoder`는
+`self.n{k}(x.unsqueeze(0)).squeeze(0)` — 항상 이미지 한 장 — 으로 내려갔고, 트레이너는
+단일 샘플 forward의 그래디언트를 누적해서 배치를 만들었으므로, torchvision 기본값인
+`BatchNorm2d`는 ResNet18의 20개 층 전부에서 **N = 1** 통계를 적합했다(사실상 배치 카운터가
 달린 instance normalization). 그리고 `torch_ref.py`의 `model.eval()`이 그 자리에 running
-평균을 끼워 넣는다. 학습된 함수와 배포된 함수가 서로 다른 함수이고, 가중치를 후처리해서
-고칠 수 있는 종류가 아니다: V11 체크포인트에서 측정한 chunk L1은 `train()`에서 0.011,
+평균을 끼워 넣었다. 학습된 함수와 배포된 함수가 서로 다른 함수였고, 가중치를 후처리해서
+고칠 수 있는 종류가 아니었다: V11 체크포인트에서 측정한 chunk L1은 `train()`에서 0.011,
 `eval()`에서 0.031–0.039, "현재 자세 유지" 기준선이 0.048이었고, 학습 세트 전체를 배치 64로
 돌려 running 통계를 재보정해도 0.029까지밖에 내려가지 않았다(설계 노트
 `visible-learning.ko.md` 7.21절).
+
+**5.2절의 배치 축이 이 결정을 다시 열지는 않는다.** 진짜 배치가 생기면 `BatchNorm2d`는
+N = 1 대신 N = 8 통계를 얻지만, 그것은 틀린 대상을 더 잘 추정하는 것일 뿐이다: `train()`은
+여전히 눈앞의 배치로 정규화하고 `eval()`은 여전히 running 평균으로 정규화하므로 둘은 여전히
+서로 다른 두 함수이고, `the_backbone_computes_the_same_function_in_train_and_eval`은 여전히
+실패한다. 이 규칙이 딛고 선 것은 N과 무관한 쪽 — `GroupNorm`에는 `training` 분기가 없다 —
+이며, 그래서 오라클이 허용오차가 아니라 등식인 것이다. 같은 성질이 반대 방향으로도 쓰인다:
+`GroupNorm`은 샘플 안에서 정규화하므로 행을 더 넣어도 한 행의 값이 바뀔 수 없고, 이것이
+`the_batch_is_invariant`가 측정하는 것이다(5.2절).
 
 `GroupNorm`은 눈앞의 샘플 하나를 채널 그룹 단위로 정규화한다. `training` 분기도 running
 버퍼도 없으므로 `train()`과 `eval()`이 비트 단위로 같고, 가중치 계약에서
@@ -211,6 +224,107 @@ ACT 자체의 transformer encoder/decoder는 노드 단위로 모델링되지 *�
 `TemporalEncoder { Transformer }`는 prefix claim을 가진 단일 opaque `nn.TransformerEncoder`이며,
 실제 LeRobot ACT 체크포인트는 M1 게이트 패킷(§8.9)에서 키 리맵이 필요할 것이다 — 그 리맵은
 코드가 아니라 데이터이며, 여기 속하지 않는다.
+
+### 5.2 배치 축
+
+**규칙.** 로워링된 모듈의 모든 포트는 선행 배치 축을 갖는다. 5.1절과 마찬가지로 로워링
+결정이므로 `lowering_hash`와 `compiler_hash`는 움직이고 `learning_hash`는 움직이지 않는다.
+
+패킷 M7/T3, spec 28.9 사다리의 9번째 단. 모듈이 샘플 하나를 기준으로 작성되어 있었으므로
+`train_act.py`의 `--batch 8`은 forward 8번을 누적해 옵티마이저 스텝 하나를 만드는 것이었고,
+20,000 스텝은 RTX 4090에서 약 11분이 걸렸으며 어떤 플래그도 그것을 움직이지 못했다 —
+`--resident-gpu`도, bf16도, `torch.compile`도(`visible-learning.ko.md` 7.11절). 측정은
+커널 런치 바운드라고 말했고, 그 런치는 트레이너가 아니라 로워링에 있었다.
+
+움직인 것은 노드당 표현식 하나씩이고 그 외에는 없다:
+
+| 노드 | before | after |
+|---|---|---|
+| `VisionEncoder` | `self.nk(x.unsqueeze(0)).squeeze(0)` | `self.nk(x)` |
+| `TemporalEncoder{Transformer}`, `token_count == 0` | `self.nk(x.unsqueeze(0)).squeeze(0)` | `self.nk(x.unsqueeze(1)).squeeze(1)` |
+| `PolicyHead{Regression}` | `self.nk(x).reshape(H, A)` | `self.nk(x).reshape(-1, H, A)` |
+| `ActionChunker` | `x[:K]` | `x[:, :K]` |
+| `Diffusion` / `FlowMatching` | `x = noise.reshape(-1)` … `x.reshape(H, A)` | `x = noise.reshape(noise.shape[0], -1)` … `x.reshape(-1, H, A)` |
+| `Fusion`, `Normalizer`, `StateEncoder` | — | 변경 없음; `dim=-1` / `dim=-2`와 브로드캐스팅이 이미 옳은 뜻이었다 |
+
+이 표에 대한 네 가지 주석.
+
+- 토큰 없는 transformer는 축이 추가된 것이 아니라 **교정된** 유일한 행이다.
+  `nn.TransformerEncoderLayer`는 `batch_first=True`로 생성되므로 축 0이 배치, 축 1이
+  시퀀스인데, 예전의 `unsqueeze(0)`은 `dim`개의 피처를 실은 크기 1의 배치를 주고 그것을
+  시퀀스로 읽게 했다. 한 번에 한 샘플이면 두 해석이 일치한다. N = 8에서는 일치하지 않으며,
+  그래서 이 행은 재작성이 아니라 수정이다.
+- **샘플러의 스텝별 산술은 표현식 단위로 그대로다.** 움직인 것은 상태의 shape뿐이며
+  (`[x_dim]` → `[N, x_dim]`), 모든 계수는 여전히 Python float이고 모든 `noise_<t>` 버퍼는
+  여전히 `[x_dim]`이므로 각 줄은 이전에 계산하던 것으로 브로드캐스트된다. 타임스텝 임베딩은
+  스텝만의 함수이므로 `_Denoiser.forward`가 `torch.cat` 전에 배치 크기로 expand한다 — 산술이
+  아니라 뷰다. spec 8.9가 이 헤드들에 주는 허용오차는 1e-5이고 옮겨진 표현식은 옮겨진 ULP이므로,
+  이 규율 자체가 핵심이다: 8.5절의 tier-4 수치는 기준선을 새로 잡은 것이 아니라 다시 측정한 것이다.
+- `contract.json`은 `inputs` 아래에 IR의 **샘플 단위** shape을 그대로 두고 — spec 5.2는 각
+  도메인에 자기 배치 크기를 주고 IR은 아무것도 선언하지 않는다 — 그 옆에 `"batch_axis": true`를
+  추가한다. 이 키를 모르는 리더는 샘플 하나를 배치 없이 먹이고 shape에서 실패하는데, 그것이 옳은
+  실패다; `train_act.py`는 모듈을 다시 쓰는 명령 이름과 함께 즉시 거부한다.
+- `torch_ref.py`는 `[1, ..]`을 먹이고 모든 출력에서 그 축을 떼어내므로, `PolicyRuntime::infer`는
+  여전히 관측 하나가 들어가고 청크 하나가 나온다. 플래그가 `load` 요청에 실리는 이유는
+  `lerobot::lower_act`의 모듈이 이 로워링의 것이 아니기 때문이다: 그쪽은 자기 `forward`를 갖고
+  배치 없는 청크를 반환하므로 `batch_axis = false`로 로드되며, `act_checkpoint` 오라클은 여전히
+  `max_abs 0e0`을 읽는다.
+
+`train_act.py`는 `--batch N`개의 샘플을 쌓아 한 번 forward하고 `[N, K, A]` 위에서 `L1` 평균을
+한 번 취한다. 퍼뮤테이션은 여전히 같은 제너레이터로 에폭당 한 번 뽑히므로 배치 `i`는 누적 루프가
+방문했을 바로 그 샘플들을 담는다; 움직이는 것은 합산 순서 — 샘플별 평균의 합이 아니라 배치 전체의
+평균 — 이므로, 이 패킷 이전의 loss 곡선은 모양으로는 비교 가능하지만 비트 단위로는 아니다.
+`--resident-gpu`, `--amp`, `--compile`, `--channel-weight`, `--checkpoint-at`, `--loss-curve`는
+의미가 그대로이고, `resident_gpu_does_not_move_the_loss`는 여전히 두 곡선을 바이트로 비교한다.
+
+**두 개의 오라클.** `lower::torch::tests::the_module_has_a_batch_axis`는 Python이 필요 없다:
+ACT·Diffusion·FlowMatching 픽스처에 대해 생성된 소스에 `.unsqueeze(0)` / `.squeeze(0)` 관용구가
+없고, 헤드는 선행 `-1`로 reshape하며, chunker는 `[:, :K]`로 자르고, contract는 `batch_axis`를
+말한다. 중요한 쪽은 `ir_training::the_batch_is_invariant`다: 서로 다른 관측 8개를 데모 번들의
+모듈에 `[8, ..]` 배치 하나로, 그리고 `[1, ..]` 호출 8번으로 통과시켜 spec 8.9의 tier-4 fp32
+허용오차로 비교한다. 노드 집합의 어떤 것도 행을 섞을 수 없으므로 — `GroupNorm`은 샘플 안에서
+정규화하고(5.1절), `nn.Linear`는 행 단위이며, transformer는 행마다 토큰 하나를 본다 — 남는 차이는
+torch가 어떤 matmul 커널로 디스패치하느냐뿐이고, 측정된 차이는 덮어두는 대신 출력된다.
+
+**측정**(오라클 서버, RTX 4090, torch 2.11.0+cu129; 20,000 옵티마이저 스텝, 배치 8, lr 1e-4,
+seed 0, `--device cuda --resident-gpu`, V15의 200 시연 bake 세트, 샘플 36,960개; before는 wave 1
+끝의 `main`, after는 이 패킷):
+
+| | before | after |
+|---|---|---|
+| 20,000 스텝 wall clock | 11:15 (675 s) | **2:17 (137 s)** |
+| 옵티마이저 스텝 1,000개당 초 | 33.8 | **6.9** |
+| 초당 샘플 | 237 | **1,168** |
+| `final_loss` | 0.019108 | 0.019026 |
+| `initial_loss` | 0.061912 | 0.062453 |
+| `lowering_hash` | `70a8fec7…069cd3d2` | `3d06811c…d8a2d394` |
+| `learning_hash` | 변화 없음 | 변화 없음 |
+
+4.9배이고, loss는 같은 자리에 떨어진다: `final_loss`는 0.4 % 움직이는데, 이는 합산 순서 차이와
+달라진 `initial_loss`가 20,000번의 AdamW 스텝을 거치며 누적된 결과이지 다른 목적함수가 아니다.
+§12.4에 따라 `step/s` 수치는 인용하지 않는다 — 위의 두 비율이 이 실행의 고유 단위다. 체크포인트는
+`~/artifacts/plan-v/m7-t3/model-20000.safetensors`에 있으며, 그것을 평가하는 것은 이 패킷이 아니라
+wave 5의 일이다.
+
+**배치 64, 같은 lr, 관찰용**(lr 스케줄은 패킷 M7/T4의 것이고 여기서는 아무것도 튜닝하지 않는다;
+`visible-learning.ko.md` 7.11절에서 발산했던 선형 스케일링 관례는 다시 돌리지 *않았고*, 이것은
+배치 8의 lr로 돌린 64다):
+
+| 배치 | 20,000 스텝 wall clock | 1,000 스텝당 초 | 초당 샘플 | `final_loss` |
+|---|---|---|---|---|
+| 8 (기본값) | 2:17 (137 s) | 6.9 | 1,168 | 0.019026 |
+| 64 | 3:07 (187 s) | 9.4 | **6,845** | 0.009286 |
+
+여기서 읽을 것은 두 가지뿐이다. 처리율: wall clock 1.4배에 초당 샘플 5.9배이므로, 배치 8에서는
+GPU가 아직 포화되지 않았고 다음 지렛대는 또 다른 플래그가 아니라 배치 크기다. 그리고 안정성: 이
+실행은 발산하지 **않았다**. 7.11절의 배치 64 실행은 `NaN`이었지만 — 그쪽은 lr을 8e-4로 선형
+스케일했고 이쪽은 전혀 건드리지 않았다. 이것이 바로 패킷 M7/T4가 존재하는 이유인 차이다. 두
+`final_loss`는 적합 결과로서 비교할 수 없다, 배치 64의 20,000 스텝은 데이터를 여덟 배 본
+것이기 때문이다.
+
+남은 비용은 이제 다른 곳에 있다. 9번째 단이 제거한 것은 샘플당 커널 런치이고, 배치 8에서 남은
+것은 96×96 이미지 8장에 대한 ResNet18 forward 한 번과 AdamW 스텝이다. 다음에 깰 숫자는 초당
+샘플 열이다.
 
 ## 6. Tier-4 허용오차 (spec 8.9)
 
@@ -256,8 +370,9 @@ dtype이 불일치하는 것은 큰 오차로 취급되지 않고, `max_abs = in
 - **`LanguageEncoder`.** 토크나이저와 `transformers`가 필요하다; 이는 추론 경로에 걸리는 Python
   의존성인데, spec 2.4는 그것을 학습 경로 안에만 가두고자 한다.
 - **`DiscreteHead`, `EnergyHead`.** 아직 이를 쓰는 소비자가 없다.
-- **배치화된 lowering, ONNX export, `libtorch` FFI.** spec 2.4는 `OnnxRuntime`을 M2에,
-  `VulkanRuntime`을 M3에 둔다. 서브프로세스가 M1의 형태이며, 원래 느리게 의도된 것이다.
+- **ONNX export, `libtorch` FFI.** spec 2.4는 `OnnxRuntime`을 M2에, `VulkanRuntime`을 M3에
+  둔다. 서브프로세스가 M1의 형태이며, 원래 느리게 의도된 것이다. (배치화된 lowering은 패킷
+  M7/T3이 이 목록에서 빼기 전까지 여기 있었다 — 5.2절.)
 - **실제 LeRobot ACT 체크포인트 키 리맵.** M1 게이트(spec 8.9)에 필요하다; 이것은 픽스처이며,
   픽스처는 게이트와 함께 있어야 한다.
 
@@ -265,7 +380,8 @@ dtype이 불일치하는 것은 큰 오차로 취급되지 않고, `max_abs = in
 
 두 헤드 모두 *반복적(iterative)*이다: 노이즈에서 시작해 그것을 action chunk로 정제해 나간다.
 spec 8.5는 출력이 청크 `[H, A]`라고 규정하므로, 샘플러의 상태는 그 청크를 평탄화한 것, 즉
-`x_dim = H * A`이며, `.reshape(H, A)`는 마지막에 한 번만 일어난다.
+`x_dim = H * A`이며, `.reshape(-1, H, A)`는 마지막에 한 번만 일어난다. 5.2절의 배치 축이
+생기면서 상태는 `[N, x_dim]`이 되었고, 아래의 모든 스텝은 그 위에서 동일한 표현식이다.
 
 ### 8.1 노이즈는 어디서 오는가
 
@@ -437,3 +553,12 @@ torch 2.14.0+cpu와 diffusers 0.40.0으로 측정한 값:
 수렴하기 때문에 스텝 수가 늘어나도 잔차가 커지지 않는다. 테스트는 각 정책을 재실행해
 spec 8.9의 비트 단위 일치 행도 함께 검증하며, 숨겨진 RNG가 있다면 바로 여기서
 드러난다.
+
+**배치 축 이후 재측정**(패킷 M7/T3, 오라클 서버, torch 2.11.0+cu129 — 위 표와는 다른 인터프리터
+이므로 표의 차분이 아니라 두 번째 측정값이다): `torch_ddpm_matches_rust` 1.788e-7 / 1.450e-6,
+`torch_ddim_matches_rust` 1.490e-7 / 2.618e-6, `torch_flow_matching_matches_rust`
+5.960e-8 / 3.269e-7, 그리고 `tests/torch_equivalence.rs`의 `torch_mlp_matches_rust`
+5.960e-8 / 9.146e-7. 자릿수가 같고 1e-5 한계보다 세 자리 아래다. `diffusers` 관련 세 행은
+**SKIP**되었다: 그 venv에 `diffusers` 휠이 없어 실제 `scheduler.step` 루프와의 비교는 그것을 가진
+인터프리터에서 다시 돌려야 하며, 그때까지 배치화된 샘플러의 diffusers 일치는 `reference.rs`의
+미러 하나에만 기대고 있다.
