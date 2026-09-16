@@ -3543,6 +3543,141 @@ episode, and the jaw opens to within about 33 milliradians of the predicate on o
 Open question 22's (ii) — cue the release on something the observation carries — is the next
 variable, and it now has a specific thing to fix rather than a fixed point to escape.
 
+### 7.26 As built (V18): the envelope ablation — an ablation, not a decision
+
+Packet `docs/packets/M5/V18-envelope-ablation.md`. Open question 25 named three ends that could
+move the `envelope_violation_rate 0.998` problem; option **(a)** — widen `acceleration_max` to
+what the STS3215 servo can actually deliver — is a Deployment IR decision the owner makes, and
+the owner asked for data before making it. This packet moves exactly one variable,
+`body.safety.acceleration_max` (all six joints), across four levels in *ablation copies* of
+`tests/fixtures/visible-learning/deployment.toml` that never touch the checked-in file: **20**
+(the current value, reproduced bit for bit as the baseline), **40**, **80**, and **80 with
+`velocity_max` also widened 3.0 → 4.4 rad/s** (the STS3215's unloaded rating, already cited in
+the fixture's own comment) — the fourth level to see whether velocity becomes the new binding
+constraint once acceleration is out of the way. Everything else is V17's own re-measurement:
+V15's `model-40000.safetensors` unchanged, the current Task/Observation/Learning documents, the
+1,800-step budget, nominal training seeds 1–16 and held-out seeds 101–116, one run per level
+(V17's bit-identical repeat is not needed here). No retraining, no checked-in fixture change —
+the ablation copies live under `~/artifacts/plan-v/v18/deployments/` and are patched into a
+scratch copy of the fixture only long enough to bake and pack a bundle, then the checked-in
+file is restored before the next level runs.
+
+**The baseline reproduces V17 exactly.** `es policy pack`'s own printed hashes are byte for
+byte V17's: `weights_hash 4b583636…`, `lowering_hash 70a8fec7…`, `task_hash eb6efefa…`,
+`observation_hash 899c16a9…`, `learning_hash 5dac0a46…`, `policy_hash 4dc23c92…`. Both suites'
+`evaluation_hash` match to the last bit (`b49fc549…` training, `40623e01…` held-out) and so does
+every number `report.json` carries: `success_rate` 0.1250 / 0.0625, `envelope_violation_rate`
+0.99854 / 0.99819, `episode_length` 1627.0625 / 1722.4375, and the full
+`failure_mode_histogram` (`fallback` 2547 / 2690, `violation.acceleration` 23443 / 24815,
+`violation.velocity` 13863 / 12661), all identical to section 7.25's table. The one hash that
+does **not** match is `execution_hash` (`c8400882…` here against V17's `20416dfd…`), and the
+reason is named rather than left as a mystery: `execution_hash`'s `runtime` slot is
+`PolicyRuntime::runtime_hash`, which for the torch backend is
+`blake3(backend, protocol, torch.__version__)`
+(`crates/es-policy/src/torch_runtime.rs:392-395`). V17 ran under
+`~/venvs/es` (torch `2.14.0+cpu`); this packet's server instructions name
+`~/venvs/es-lerobot-cuda` (torch `2.11.0+cu129`) — a different interpreter, a different
+`runtime_hash`, by design (spec 5.3: the chain names *which* runtime produced a result). The
+document, weight and policy identity and every measured number are unaffected.
+
+**The four levels.**
+
+| level | suite | `success_rate` | lifted | carried | released | harness-success | `envelope_violation_rate` | `violation.acceleration` | `violation.velocity` | `violation.rate_limit` | fallback (latched) | mean `episode_length` |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 20 (baseline) | training | 0.1250 | 6/16 | 5/16 | 2/16 | 2/16 | 0.99854 | 23443/26033 | 13863/26033 | 0 | 2547 | 1627.06 |
+| 20 (baseline) | held-out | 0.0625 | 6/16 | 5/16 | 2/16 | 1/16 | 0.99819 | 24815/27559 | 12661/27559 | 0 | 2690 | 1722.44 |
+| 40 | training | **0.4375** | 16/16 | 16/16 | 7/16 | 7/16 | 0.92439 | 15467/18173 | 7750/18173 | 0 | 1160 | 1135.81 |
+| 40 | held-out | **0.6250** | 15/16 | 15/16 | 11/16 | 10/16 | 0.90054 | 12784/15202 | 6105/15202 | 0 | 767 | 950.13 |
+| 80 | training | **0.6250** | 15/16 | 15/16 | 10/16 | 10/16 | 0.63672 | 8244/15784 | 5726/15784 | 0 | 93 | 986.50 |
+| 80 | held-out | **0.6250** | 14/16 | 14/16 | 11/16 | 10/16 | 0.55518 | 7027/14979 | 4865/14979 | 0 | 53 | 936.19 |
+| 80 + vel 4.4 | training | 0.1875 | 15/16 | 15/16 | 5/16 | 3/16 | 0.63213 | 14417/24087 | 8184/24087 | **1010** | 291 | 1505.44 |
+| 80 + vel 4.4 | held-out | 0.4375 | 15/16 | 15/16 | 10/16 | 7/16 | 0.60827 | 10953/18781 | 5150/18781 | **644** | 139 | 1173.81 |
+
+(`lifted`/`carried`/`released`/harness-success and the per-episode `release@` ticks are
+`probe.py`'s reconstruction from `.estraj`, mirrored in full at
+`target/plan-v/v18/probe-all.txt`; `harness-success` is `report.json`'s own `success_rate`,
+which is what the two agree on in every cell above. `probe.py`'s `verdict` is reconstructed
+from the **pre-step** state a trajectory row records — packet V12 — while the Task IR's
+predicate is judged on the **post-step** state, so a handful of `probe.py` rows print `timeout`
+for an episode `report.json` scored `success` a tick earlier or later than the row that would
+show it; the `report.json` column is the harness's own verdict and is what every scalar above
+is taken from.)
+
+**40 already clears the stop rule.** Held-out `success_rate` is **0.625** at
+`acceleration_max = 40`, well past the unchanged 0.5 acceptance threshold, on the very first
+level past the baseline. Widening further to 80 does not raise held-out `success_rate` again (0.625, the same
+16 seeds mostly overlapping) but keeps cutting the envelope cost: `envelope_violation_rate`
+falls from 0.998 (20) to 0.900–0.924 (40) to 0.555–0.637 (80), and the watchdog-latched fraction
+of the run falls from about a tenth (20) to 5–6 % (40) to well under 1 % (80). `episode_length`
+falls in step — episodes finish on a scored success rather than running out the 1,800-step
+budget. This is the same effect V17 measured going from an eight-deep ensemble to executing a
+chunk's own rows: a command stream inside the envelope it was generated for is one the plane
+does not have to keep correcting.
+
+**Widening `velocity_max` alongside `acceleration_max` makes it worse, not better — and the
+histogram says exactly why.** The fourth level's held-out `success_rate` (0.4375) is worse than
+plain level 80 (0.625) and its training `success_rate` (0.1875) is worse than level 40's
+(0.4375); `envelope_violation_rate` does not improve either (0.608–0.632 against level 80's
+0.555–0.637). The failure mode histogram carries a violation kind that appears at **no other
+level**: `violation.rate_limit` — `ViolationKind::RateLimit`, the `action_rate` first- and
+second-difference clamp (spec 9.3, `crates/es-safety/src/plane.rs:419-431`), separate from
+`ViolationKind::ViolationRate`, the `EnvelopeViolationRate` watchdog's own marker
+(`violation.rate`, which equals the fallback count in every row of the table above). The
+fixture's own comment on `action_rate.first_diff_max = 0.08` (4.0 rad/s) says it is "looser
+than the two rows
+above at this control rate, so at 50 Hz neither ever fires" — true exactly as long as
+`velocity_max * dt <= 0.08`, i.e. `velocity_max <= 4.0`. At `velocity_max = 3.0` that product is
+0.06 rad; raising `acceleration_max` to 40 or 80 alone never changes it, which is why levels 40
+and 80 both show zero `violation.rate_limit` ticks. At `velocity_max = 4.4` the product is
+0.088 rad, past the 0.08 rad bound, so the rate-limit clamp — a bound the file did not expect to
+bind at this control rate — starts firing on top of the acceleration and velocity clamps, on
+1010 of 24087 training ticks and 644 of 18781 held-out ticks, and the command stream it produces
+scores worse than either the unwidened-velocity level 80 or the less-widened level 40. Velocity
+does bind once acceleration is out of the way (`violation.velocity` is still 27–36 % of ticks at
+level 80), but widening it into the previously-slack `action_rate` bound is not free, and this
+ablation is the first measurement that shows it.
+
+**The baseline's release windows and the watchdog latch, measured (deliverable 2).** Of the
+four episodes V17's table names — training `nominal-08` (`release@410`), training `nominal-15`
+(`release@225`), held-out `nominal-05` (`release@1040`), held-out `nominal-12` (`release@280`)
+— the watchdog-latched (`Fallback`) stretches of `events.json` overlap the post-release window
+in three of the four:
+
+| episode | release tick | episode end | fallback ticks at/after release | overlaps? |
+|---|---|---|---|---|
+| training `nominal-08` | 410 | 601 | 20 (`479–492, 507, 522, 534, 567, 572, 587`) | **yes** |
+| training `nominal-15` | 225 | 230 | 0 | no |
+| held-out `nominal-05` | 1040 | 1799 | 77 (ten short stretches, `1057–1068` … `1700, 1713`) | **yes** |
+| held-out `nominal-12` | 280 | 558 | 34 (nine short stretches, `283` … `549–550`) | **yes** |
+
+`nominal-15`'s episode ends five ticks after the release and the watchdog never latches in that
+window; the other three keep alternating between `Clamped` and `Fallback` for tens to dozens of
+ticks after the cube is scored released, which is the same 0.998 envelope-violation story
+continuing to run *after* the predicate has already gone true — the harness's success verdict
+does not depend on what the plane does afterward, but a real robot's jaw would still be getting
+intermittently frozen and released while "done."
+
+**Verdict, and the cost for the owner.** This is an ablation, not a decision:
+`tests/fixtures/visible-learning/deployment.toml` is untouched, and no level here is promoted
+to a six-suite perturbation sweep or a showcase video — that would be the fixture decision the
+packet exists to inform, not to make. The measurement itself is unambiguous: raising
+`acceleration_max` alone from 20 to 40 rad/s² already clears the held-out acceptance threshold
+that has blocked every checkpoint since V13, and raising it further to 80 keeps buying back
+envelope headroom (`envelope_violation_rate` 0.998 → 0.90–0.92 → 0.56–0.64) without costing
+`success_rate`. Raising `velocity_max` in the same move does not help and measurably hurts,
+because it crosses a second, previously-slack limit (`action_rate.first_diff_max`) that a
+change to `acceleration_max` alone never touches. **If the owner takes (a), the data says: move
+`acceleration_max` only, and 40 already does the job that matters (crossing the acceptance
+threshold); 80 is available if the lower envelope-violation number is worth arguing for.** The
+cost is physical, not just numerical: the fixture's own comment derives 20 rad/s² from a rotor
+torque margin (`armature * acceleration = 0.028 * 20 = 0.56` N m, a fifth of stall) and from
+"the commanded and the measured trajectory stay close" — at 80 rad/s² that margin is
+`0.028 * 80 = 2.24` N m, most of the STS3215's 2.94 N m stall torque, and the claim that the
+plane's command tracks what the servo can actually do needs re-deriving, not just re-measuring,
+before 40 or 80 is adopted as more than an ablation level. That re-derivation, and whether it
+also needs (b)'s delta action space to hold up, is left to the owner along with the fixture
+change itself.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -3976,3 +4111,22 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     at 0.71. Default: **(c) until a release is scored on held-out seeds**, then (a) — the number
     only became binding once the chunk's later rows started executing, and what it binds on is
     the same command stream every demonstration already contains.
+
+    **A release is now scored on held-out seeds (V17), and (a) is measured, not adopted
+    (V18, section 7.26).** An ablation of `acceleration_max` alone — 20 (baseline), 40, 80 — in
+    scratch copies of `deployment.toml` that never touch the checked-in file, on V15's unchanged
+    checkpoint, no retraining: held-out `success_rate` reaches **0.625** already at 40 and stays
+    there at 80, while `envelope_violation_rate` keeps falling (0.998 → 0.90–0.92 → 0.56–0.64)
+    and the watchdog-latched fraction falls from about a tenth of the run to well under 1 %. A
+    fourth level widens `velocity_max` 3.0 → 4.4 rad/s at the same time as
+    `acceleration_max = 80`, to see whether velocity becomes the new binding constraint once
+    acceleration is out of the way (it does — `violation.velocity` is still 27–36 % of ticks at
+    `acceleration_max = 80` alone) — but widening `velocity_max` past 4.0 rad/s crosses
+    `action_rate.first_diff_max = 0.08` rad, a bound the fixture's own comment says never fires
+    at `velocity_max <= 3.0`, and the combined level scores *worse* than 80 alone on both
+    suites. So the answer to "one of
+    two ends could move" is narrower than either default: **`acceleration_max` alone, not
+    `velocity_max` alongside it.** The fixture is still unwidened — this was an ablation to
+    produce the data, not the Deployment IR decision itself, which is the owner's per (a)'s own
+    framing, and it still needs the torque-margin re-derivation section 7.26 spells out before
+    40 or 80 is adopted for real.
