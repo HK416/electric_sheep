@@ -7780,3 +7780,313 @@ fn train_ir_path_packs_a_bundle_torch_opens() {
     assert_eq!(lock["checkpoints"][0]["step"].as_u64(), Some(40));
     println!("RAN train_ir_path_packs_a_bundle_torch_opens: training_hash {training_hash}");
 }
+
+// --- packet M7/E4: `es eval run --telemetry` publishes, a client attaches --------------------
+
+use es_telemetry::{Client, Message, Payload, StreamId};
+
+/// The demo documents with `max_episode_steps` cut to 60, a conforming constant checkpoint in
+/// place of a trained one, and a one-suite, three-episode Evaluation IR: the smallest run that
+/// goes through the whole `es eval run` path -- `mujoco`, `torch`, one rendered 96x96 frame
+/// per control tick. `None`, with the reason printed, when this machine cannot run it.
+///
+/// Three episodes rather than one because [`eval_telemetry_never_blocks_the_run`] has to
+/// overflow the loopback socket buffers with image frames (about 100 kB of JSON each): 180
+/// ticks is some 18 MB, well past what Linux autotunes a loopback pair to.
+fn telemetry_run_inputs(test: &str, dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    if cfg!(not(feature = "render")) {
+        println!("SKIP {test}: built without the `render` feature");
+        return None;
+    }
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP {test}: {reason}");
+        return None;
+    }
+    if let Err(reason) = es_policy::torch_runtime::is_available() {
+        println!("SKIP {test}: {reason}");
+        return None;
+    }
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let mut task = es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml");
+    task.config.max_episode_steps = 60;
+    let task_hash = task.task_hash().expect("task hashes");
+    let mut obs =
+        es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml");
+    obs.task_ref = task_hash;
+    let obs_hash = obs.observation_hash().expect("observation hashes");
+    let mut learning =
+        es_ir::serial::learning_from_toml(&read("learning.toml")).expect("learning.toml");
+    let module = es_policy::lower_to_torch(&learning).expect("the demo graph lowers");
+    let weights = es_policy::weights::write_safetensors(&conforming_checkpoint(&module));
+    learning.policy.weights = WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let deploy =
+        es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml");
+    let bundle = es_compile::PolicyBundle::build(&task, &obs, &learning, &deploy, &weights)
+        .expect("the shortened demo documents pack");
+    let policy = dir.join("policy.esb");
+    std::fs::write(&policy, bundle).expect("write policy.esb");
+
+    let mut ir = demo_evaluation_ir(hex(&task_hash), hex(&obs_hash));
+    ir.suites.truncate(1);
+    assert_eq!(ir.suites[0].name, "nominal");
+    ir.episodes = EpisodeBatch {
+        n_episodes: 3,
+        seeds: SeedPlan::Explicit(vec![101, 102, 103]),
+    };
+    let config = dir.join("eval.toml");
+    write(
+        &config,
+        &es_ir::serial::evaluation_to_toml(&ir).expect("evaluation toml"),
+    );
+    Some((config, policy))
+}
+
+/// `es eval run --frames` on the inputs above, into `out`, plus whatever `extra` flags.
+fn telemetry_eval_run(config: &Path, policy: &Path, out: &Path, extra: &[&str]) -> Output {
+    let run = bin()
+        .args(["eval", "run", "--config"])
+        .arg(config)
+        .arg("--policy")
+        .arg(policy)
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .arg("--out")
+        .arg(out)
+        .arg("--frames")
+        .arg(out.join("frames"))
+        .args(extra)
+        .output()
+        .expect("run es eval run");
+    let text = format!("{}{}", stdout(&run), String::from_utf8_lossy(&run.stderr));
+    // Exit 1 is an acceptance criterion that did not hold, which an untrained policy earns;
+    // anything else is a real error.
+    assert!(
+        matches!(run.status.code(), Some(0 | 1)),
+        "exit {:?}\n{text}",
+        run.status.code()
+    );
+    run
+}
+
+/// A loopback port nobody is listening on, chosen here rather than by the run so the client
+/// can be connected and subscribed before the run's first cell.
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+/// Connects once the run has bound its server. The run binds before it opens the bundle,
+/// the scene or either Python interpreter, so this succeeds seconds before the first cell.
+fn connect_when_bound(addr: std::net::SocketAddr) -> Client {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match Client::connect(addr, None, "cli-test") {
+            Ok(client) => return client,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("the run never bound {addr}: {e}"),
+        }
+    }
+}
+
+fn read_bytes(path: &Path) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// Oracle 1. A client subscribed to streams 1-3 sees `cell.begin`/`cell.end` for every cell,
+/// one stream-2 frame per control tick with strictly increasing ticks inside each cell -- the
+/// same ticks `events.json` recorded -- and one `Metrics` frame per cell; and the run's
+/// `report.json` and `events.json` are byte-identical to a run without the flag.
+#[test]
+fn eval_telemetry_publishes_every_tick_in_order() {
+    const TEST: &str = "eval_telemetry_publishes_every_tick_in_order";
+    let dir = scratch_dir("eval-telemetry-order");
+    let Some((config, policy)) = telemetry_run_inputs(TEST, &dir) else {
+        return;
+    };
+    telemetry_eval_run(&config, &policy, &dir.join("plain"), &[]);
+
+    let port = free_loopback_port();
+    let addr = format!("127.0.0.1:{port}");
+    let socket: std::net::SocketAddr = addr.parse().expect("socket addr");
+    let received: std::sync::Arc<std::sync::Mutex<Vec<Message>>> = Default::default();
+    let reader = {
+        let received = std::sync::Arc::clone(&received);
+        std::thread::spawn(move || {
+            let mut client = connect_when_bound(socket);
+            client
+                .subscribe(vec![StreamId(1), StreamId(2), StreamId(3)])
+                .expect("subscribe");
+            // Drains until the run exits and the connection closes.
+            while let Ok(msg) = client.recv() {
+                received.lock().expect("received").push(msg);
+            }
+        })
+    };
+    let live = telemetry_eval_run(&config, &policy, &dir.join("live"), &["--telemetry", &addr]);
+    reader.join().expect("reader thread");
+    let text = stdout(&live);
+    assert!(text.contains(&format!("telemetry: {addr}")), "{text}");
+
+    for name in ["report.json", "events.json"] {
+        assert_eq!(
+            read_bytes(&dir.join("plain").join(name)),
+            read_bytes(&dir.join("live").join(name)),
+            "{name} differs with --telemetry"
+        );
+    }
+    let events: BTreeMap<String, Vec<es_eval::StepEvent>> = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("live/events.json")).expect("events"),
+    )
+    .expect("events.json parses");
+    let cells: Vec<&String> = events.keys().collect();
+    assert_eq!(cells, ["nominal-00", "nominal-01", "nominal-02"]);
+
+    let received = received.lock().expect("received");
+    let frames: Vec<&es_telemetry::Frame> = received
+        .iter()
+        .filter_map(|m| match m {
+            Message::Frame(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert!(!frames.is_empty(), "no frame arrived: {received:?}");
+
+    // Walk the stream in arrival order: a cell opens, its ticks follow, it closes with a
+    // metrics frame, and nothing is attributed to a cell that is not open.
+    let mut begun: Vec<String> = Vec::new();
+    let mut ended: Vec<String> = Vec::new();
+    let mut suites_ended = 0;
+    let mut open: Option<String> = None;
+    let mut ticks: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    let mut metrics_after_end = 0;
+    for f in &frames {
+        match (&f.stream, &f.payload) {
+            (StreamId(1), Payload::Event { kind, fields }) => match kind.as_str() {
+                "cell.begin" => {
+                    assert!(open.is_none(), "cell.begin while {open:?} is open");
+                    assert_eq!(fields["suite"], "nominal", "{fields:?}");
+                    assert!(fields.contains_key("seed"), "{fields:?}");
+                    open = Some(fields["cell"].clone());
+                    begun.push(fields["cell"].clone());
+                }
+                "cell.end" => {
+                    assert_eq!(open.as_deref(), Some(fields["cell"].as_str()), "{fields:?}");
+                    assert!(fields.contains_key("outcome"), "{fields:?}");
+                    ended.push(fields["cell"].clone());
+                    open = None;
+                }
+                "suite.end" => {
+                    assert_eq!(fields["suite"], "nominal", "{fields:?}");
+                    assert!(fields.contains_key("metric.success_rate"), "{fields:?}");
+                    suites_ended += 1;
+                }
+                other => panic!("unexpected stream-1 event {other}"),
+            },
+            (StreamId(2), Payload::Scalars(v)) => {
+                let cell = open.clone().expect("a tick outside any cell");
+                assert_eq!(v.len(), 4, "[step, tick, source, events]: {v:?}");
+                let tick = v[1] as u64;
+                let seen = ticks.entry(cell).or_default();
+                assert!(
+                    seen.last().is_none_or(|last| *last < tick),
+                    "ticks not strictly increasing: {seen:?} then {tick}"
+                );
+                seen.push(tick);
+            }
+            (StreamId(3), Payload::Metrics(m)) => {
+                // Right after a `cell.end`, with the fields the run can fill and never a zero
+                // standing in for a number nobody measured (spec 12.4).
+                assert!(open.is_none(), "metrics inside an open cell");
+                assert!(m.actions_per_sec.is_some(), "{m:?}");
+                assert!(m.chunk_underrun_rate.is_some(), "{m:?}");
+                assert!(m.p50_end_to_end_latency.is_none(), "{m:?}");
+                assert!(m.gpu_memory_peak.is_none(), "{m:?}");
+                metrics_after_end += 1;
+            }
+            (stream, payload) => panic!("unexpected frame on stream {stream:?}: {payload:?}"),
+        }
+    }
+    assert_eq!(
+        begun,
+        cells.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+    );
+    assert_eq!(ended, begun);
+    assert_eq!(suites_ended, 1);
+    assert_eq!(metrics_after_end, cells.len());
+    // One stream-2 frame per control tick, carrying the tick `events.json` recorded for that
+    // step -- the nominal suite drops no observation, so the two sequences are the same.
+    for (cell, records) in &events {
+        let want: Vec<u64> = records.iter().map(|r| r.tick.0).collect();
+        assert_eq!(ticks[cell], want, "cell {cell}");
+    }
+    println!(
+        "RAN {TEST}: {} frame(s) over {} cell(s)",
+        frames.len(),
+        cells.len()
+    );
+}
+
+/// Oracle 2. A client that subscribes to the image stream and then never reads: the run
+/// finishes, its report is unchanged, and the server counted dropped frames -- the producer
+/// never waited for the socket.
+#[test]
+fn eval_telemetry_never_blocks_the_run() {
+    const TEST: &str = "eval_telemetry_never_blocks_the_run";
+    let dir = scratch_dir("eval-telemetry-slow");
+    let Some((config, policy)) = telemetry_run_inputs(TEST, &dir) else {
+        return;
+    };
+    telemetry_eval_run(&config, &policy, &dir.join("plain"), &[]);
+
+    let port = free_loopback_port();
+    let addr = format!("127.0.0.1:{port}");
+    let socket: std::net::SocketAddr = addr.parse().expect("socket addr");
+    // Subscribes and returns the client without ever calling `recv`; the join below keeps it
+    // alive -- and its socket open, unread -- until the run is over.
+    let stalled = std::thread::spawn(move || {
+        let mut client = connect_when_bound(socket);
+        client
+            .subscribe(vec![StreamId(2), StreamId(4)])
+            .expect("subscribe");
+        client
+    });
+    let started = std::time::Instant::now();
+    let live = telemetry_eval_run(
+        &config,
+        &policy,
+        &dir.join("live"),
+        &["--telemetry", &addr, "--telemetry-image-every", "1"],
+    );
+    let elapsed = started.elapsed();
+    let _client = stalled.join().expect("stalled client thread");
+
+    assert_eq!(
+        read_bytes(&dir.join("plain/report.json")),
+        read_bytes(&dir.join("live/report.json")),
+        "report.json differs with a stalled client"
+    );
+    let text = stdout(&live);
+    let stats = text
+        .lines()
+        .find(|l| l.starts_with("telemetry:") && l.contains("dropped"))
+        .unwrap_or_else(|| panic!("no telemetry stats line:\n{text}"));
+    let words: Vec<&str> = stats.split_whitespace().collect();
+    let at = words
+        .iter()
+        .position(|w| *w == "dropped")
+        .expect("the word `dropped`");
+    let dropped: u64 = words[at - 1].parse().unwrap_or_else(|_| panic!("{stats}"));
+    assert!(
+        dropped > 0,
+        "a client that never reads must lose frames, not stall the run: {stats}"
+    );
+    println!("RAN {TEST}: {stats} ({elapsed:?})");
+}
