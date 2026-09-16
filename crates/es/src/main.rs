@@ -25,7 +25,7 @@ USAGE:
     es eval run --config <eval.toml> --policy <policy.esb> --scene <file.xml|urdf> [OPTIONS]
     es evidence verify <bundle.esb> [--against <other.esb>] [--json]
     es gap --sim <root> --real <root> [--out gap_report.json] [--max-samples N] [--threshold D]
-    es loop collect|intervene|distill ...   (see `es loop --help`)
+    es loop collect|intervene|distill|cycle ...   (see `es loop --help`)
     es import lerobot-config --config <config.json> [--stats ...] [--dataset ...] --out <dir>
     es dataset info <root>
     es train --recipe <training.toml> [--out <dir>] [--dry-run]

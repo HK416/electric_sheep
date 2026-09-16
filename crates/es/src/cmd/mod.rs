@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod bench;
 pub mod check_deps;
+pub mod cycle;
 pub mod dataset;
 pub mod eval;
 pub mod evidence;
