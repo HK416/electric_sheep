@@ -277,3 +277,98 @@ per cell. It is written by the `#[ignore]`d `generate_fixture_run`, which builds
 and a `FrameSink` — so the bytes are the producing types' own. Only the frame `.bin` and its
 `layout.json` are written directly, because `es_eval`'s writer for them is private; the shape
 is that writer's documentation.
+
+---
+
+## 11. The Replay panel: an `.estraj` played in the editor (§23.3, M7/E2)
+
+§23.3 asks for an editor that "locally replicates the scene and receives only the pose/joints".
+A recorded trajectory is that stream, offline. `es video showcase` already proves a run can be
+re-rendered from the scene file and the `.estraj` alone — this does the same on the CPU, in an
+`egui` canvas, at interactive rate: **no physics, no GPU, no `ffmpeg`, no server**.
+
+It lives in the Run tab as a bottom panel (§10's table picks the episode, this plays it). The
+whole coupling is `RunView::selected_cell()`; the panel adds one text field, because a run
+directory does not carry its scene file — the same `--scene` the showcase takes.
+
+### `model/replay_view.rs`
+
+| Call | Gives |
+|---|---|
+| `ReplayView::open(scene, traj)` | the `SceneDesc` (MJCF or URDF by extension, as `es backend`'s `load_scene`) and the `Trajectory`; tessellates tick 0 so an unsupported geom is an error here, not a blank canvas later |
+| `ticks()` / `qpos(t)` / `scene_at(t)` | the length, the joint state, and the tick's `TriScene` — the very call the showcase renders |
+| `project(t, &Camera)` | `Vec<Tri2d>`: three screen points, one flat `[u8; 3]`, a depth key and the source triangle index, **sorted back to front** |
+| `Camera::view()` | the `es_render::CameraView` those coordinates are in |
+| `Camera::orbit(dyaw, dpitch)` / `zoom(f)` | a new camera on the sphere about `look_at`; pure, `#[must_use]`, no interior state |
+| `advance(dt, rate_hz)` / `step(±n)` | playback, clamped at both ends; `playing`, `tick` and `speed` are the model's |
+
+**The projection is `es_render`'s own, inverted.** `ViewParams::new(&camera.view())` gives the
+renderer's `f32` camera; a world vertex goes through `es_render::cpu::quat_rotate_inv` and the
+same `fx, fy, cx, cy` that `cpu::primary_dir` casts rays with. Nothing here re-derives the
+convention (§3.1: `OpenCV` camera frame, image origin top-left).
+
+**The shading is `es_shade_lambert`, copied in four lines**, because `cpu::shade_lambert` is
+private: `ambient + max(dot(n, light), 0) * (1 - ambient)`, times albedo, plus emission, then
+`srgb_encode` (public) and the renderer's rounding. The multiply and the add are separate, not
+a `mul_add`: a fused one rounds once where the renderer rounds twice. `RenderConfig::rs` is
+built here purely so the light direction and the ambient floor are the renderer's constants and
+not a second copy of them. `flat_shade_matches_the_renderer` puts one triangle in front of one
+camera, rasterizes it with `es_render::cpu::rasterize`, and asserts the pixel under the
+projected centroid equals the colour — which pins the camera, the projection and the shading in
+one assertion.
+
+**Near-plane clipping, whole triangles.** A triangle with any vertex at or behind the near
+plane is dropped rather than divided by that `z`, which would project it through the eye onto
+the far side of the image. One that straddles the plane disappears instead of being split: a
+clipper that splits has to interpolate the vertices, and at the scale of this camera the arm is
+never half behind it.
+
+**`ponytail:` the painter's algorithm is the deliberate simplification.** Sorting whole
+triangles by centroid depth is exact for convex primitives that do not interpenetrate, and
+wrong exactly where they do — a gripper closed on a cube can show the wrong face. The upgrade
+path is `es_render::cpu::rasterize` per pixel at a low resolution, which R1's BVH is what makes
+affordable; the camera the model builds is already a `CameraView`, so that swap is one
+function. The sort is stable on the depth alone, so ties keep triangle order and the emitted
+sequence is a pure function of (trajectory, camera) — which is what makes
+`tests/golden/editor/replay_tick0_order.json` (2,754 indices at tick 0) a golden worth keeping.
+
+### `look_at` is repeated, not reused
+
+`es_env::render::look_at` is behind `es-env`'s `render` feature, and that feature pulls in
+`es-render` **and `es-gpu`**: enabling it in the editor would link Vulkan into a viewer that
+renders nothing on a GPU, which E2 forbids. Moving the function out from behind the feature is
+not a pure move either — it returns `es_render::CameraView` and calls
+`es_render::ImageSpec::pinhole`, both from an optional dependency. So `Camera::view` repeats
+the arithmetic (basis from forward × world-up, then Shepperd's quaternion) over the same
+`es-render` types, and the test above pins it against the renderer rather than against the
+copy's source. If `es-env` ever makes `es-render` non-optional, this becomes a one-line
+delegation.
+
+### The fixture trajectory
+
+`tests/fixtures/visible-learning/run/traj/nominal-00.estraj`: 48 ticks of
+`tests/fixtures/mjcf/so101_pick_place.xml`, 36 kB, written by the `#[ignore]`d
+`generate_fixture_traj`. **No physics backend is involved and none is needed.** `Trajectory` is
+shaped by an `es_physics_core::backend::ModelInfo` and filled from a `StateView`, both plain
+structs: the generator builds a `ModelInfo` with one body index per scene body and `nq`/`nv`
+summed from the joints in `MuJoCo`'s own layout, then per tick composes every body's world pose
+from the scene's parent chain with `shoulder_pan` swept from -0.6 to +0.6 rad (an MJCF hinge
+turns the child frame about its `axis` through its `anchor`: `body.pose * T(a) * R * T(-a)`),
+and pushes a `StateView` holding those poses. That is the same composition
+`es_render::scene::world_poses` does — private there, twelve lines here, in test code only.
+`es-physics-core` is a **dev-dependency** for exactly this reason: the editor itself never
+names those types.
+
+The trajectory is a synthetic home-pose sweep, not a policy rollout: what it has to exercise is
+that a recorded pose stream re-poses the scene and projects, and a real V19b `.estraj` (which
+the orchestrator opens) is the same bytes at a different arm.
+
+### Not here
+
+- **Per-pixel anything**: no depth buffer, no shadows, no textures. The upgrade path above.
+- **The run's own control rate.** The panel plays at 50 Hz, the demo deployment's
+  `rate.control`; a run directory carries no Deployment IR to read it from, and the wrong rate
+  only changes how fast the arm appears to move. A `--rate` would be a field on the panel the
+  moment a run writes its rate down.
+- **Camera presets and scene cameras.** `--camera NAME` (the showcase's other mode) needs the
+  scene's own camera list; the free camera is what a person dragging a mouse wants.

@@ -282,3 +282,93 @@ lock이 없으면 그 칸은 `--`다: 지어낸 시드는 없는 시드보다 �
 만들어 `es_eval::runner::write_artifacts`와 `FrameSink`에 넘긴다 — 바이트가 그것을 만드는
 타입 자신의 것이 되도록. 프레임 `.bin`과 그 `layout.json`만 직접 쓰는데, `es_eval`의 해당
 작성기가 비공개이기 때문이다; 형식은 그 작성기의 문서 그대로다.
+
+---
+
+## 11. Replay 패널: 에디터 안에서 재생되는 `.estraj` (§23.3, M7/E2)
+
+§23.3은 "에디터가 장면을 로컬에 복제하고 포즈/관절만 받는" 것을 요구한다. 기록된 궤적이
+바로 그 스트림이며, 오프라인이다. `es video showcase`는 장면 파일과 `.estraj`만으로 실행을
+다시 렌더링할 수 있음을 이미 증명했다 — 이 패널은 같은 일을 CPU에서, `egui` 캔버스 안에서,
+상호작용 가능한 속도로 한다: **물리 없음, GPU 없음, `ffmpeg` 없음, 서버 없음.**
+
+Run 탭의 아래쪽 패널로 산다(§10의 표가 에피소드를 고르고, 이 패널이 그것을 재생한다).
+결합 전부는 `RunView::selected_cell()`이고, 패널은 텍스트 필드 하나를 더한다. 실행
+디렉터리는 자기 장면 파일을 담지 않기 때문이다 — showcase가 받는 바로 그 `--scene`이다.
+
+### `model/replay_view.rs`
+
+| 호출 | 주는 것 |
+|---|---|
+| `ReplayView::open(scene, traj)` | `SceneDesc`(`es backend`의 `load_scene`처럼 확장자로 MJCF/URDF 구분)와 `Trajectory`; 틱 0을 테셀레이션해 두므로 지원되지 않는 geom은 나중의 빈 캔버스가 아니라 여기서의 오류가 된다 |
+| `ticks()` / `qpos(t)` / `scene_at(t)` | 길이, 관절 상태, 그리고 그 틱의 `TriScene` — showcase가 렌더링하는 바로 그 호출 |
+| `project(t, &Camera)` | `Vec<Tri2d>`: 화면 점 셋, 평면 색 `[u8; 3]`, 깊이 키, 원본 삼각형 인덱스, **뒤에서 앞으로 정렬** |
+| `Camera::view()` | 그 좌표가 속한 `es_render::CameraView` |
+| `Camera::orbit(dyaw, dpitch)` / `zoom(f)` | `look_at`을 중심으로 한 구면 위의 새 카메라; 순수 함수, `#[must_use]`, 내부 상태 없음 |
+| `advance(dt, rate_hz)` / `step(±n)` | 재생. 양끝에서 고정되며 `playing`, `tick`, `speed`는 모델의 것이다 |
+
+**투영은 `es_render` 자신의 것을 뒤집은 것이다.** `ViewParams::new(&camera.view())`가 렌더러의
+`f32` 카메라를 주고, 월드 정점은 `es_render::cpu::quat_rotate_inv`와 `cpu::primary_dir`가
+광선을 쏠 때 쓰는 바로 그 `fx, fy, cx, cy`를 지난다. 여기서 규약을 다시 유도하는 것은 없다
+(§3.1: `OpenCV` 카메라 프레임, 이미지 원점 좌상단).
+
+**셰이딩은 `es_shade_lambert`를 네 줄로 옮긴 것**이다. `cpu::shade_lambert`가 비공개이기
+때문이다: `ambient + max(dot(n, light), 0) * (1 - ambient)`에 albedo를 곱하고 emission을
+더한 뒤, (공개된) `srgb_encode`와 렌더러의 반올림을 거친다. 곱셈과 덧셈은 분리되어 있고
+`mul_add`가 아니다: 융합 연산은 한 번 반올림하는데 렌더러는 두 번 반올림한다.
+`RenderConfig::rs`를 여기서 만드는 이유는 오로지 광원 방향과 앰비언트 바닥값이 렌더러의
+상수이고 그것의 두 번째 사본이 아니게 하기 위해서다. `flat_shade_matches_the_renderer`는
+카메라 하나 앞에 삼각형 하나를 두고 `es_render::cpu::rasterize`로 래스터화한 뒤, 투영된
+무게중심 아래의 픽셀이 그 색과 같다고 단언한다 — 카메라와 투영과 셰이딩을 한 번에 고정한다.
+
+**근평면 클리핑은 삼각형 단위다.** 정점 하나라도 근평면 위나 뒤에 있는 삼각형은 그 `z`로
+나누지 않고 버린다. 나누면 눈을 통과해 이미지 반대편으로 투영된다. 평면에 걸친 삼각형은
+쪼개지 않고 사라진다: 쪼개는 클리퍼는 정점을 보간해야 하는데, 이 카메라의 축척에서 팔이
+반쯤 뒤에 있는 일은 없다.
+
+**`ponytail:` 화가 알고리즘이 의도적인 단순화다.** 무게중심 깊이로 삼각형 전체를 정렬하는
+것은 서로 관통하지 않는 볼록 프리미티브에 대해 정확하고, 관통하는 바로 그곳에서 틀린다 —
+큐브를 문 그리퍼가 엉뚱한 면을 보일 수 있다. 업그레이드 경로는 낮은 해상도에서 픽셀당
+`es_render::cpu::rasterize`이며, R1의 BVH가 그것을 감당 가능하게 만든다; 모델이 만드는
+카메라가 이미 `CameraView`이므로 그 교체는 함수 하나짜리 변경이다. 정렬은 깊이만을 키로 한
+안정 정렬이라 동점은 삼각형 순서를 지키고, 그래서 방출되는 수열은 (궤적, 카메라)의 순수
+함수다 — `tests/golden/editor/replay_tick0_order.json`(틱 0의 인덱스 2,754개)이 지킬 만한
+골든인 이유다.
+
+### `look_at`은 재사용이 아니라 반복이다
+
+`es_env::render::look_at`은 `es-env`의 `render` 피처 뒤에 있고, 그 피처는 `es-render`와
+**`es-gpu`**를 함께 끌어온다: 에디터에서 그것을 켜면 GPU로 아무것도 렌더링하지 않는 뷰어에
+Vulkan을 링크하게 되는데, E2가 그것을 금지한다. 그 함수를 피처 밖으로 옮기는 것도 순수한
+이동이 아니다 — `es_render::CameraView`를 반환하고 `es_render::ImageSpec::pinhole`을
+호출하는데, 둘 다 선택적 의존성의 것이다. 그래서 `Camera::view`는 같은 `es-render` 타입 위에서
+그 산술(전방 × 월드 업으로 만든 기저, 그다음 Shepperd 쿼터니언)을 반복하고, 위의 테스트가
+그것을 사본의 출처가 아니라 렌더러에 대고 고정한다. `es-env`가 언젠가 `es-render`를 필수
+의존성으로 만들면, 이것은 한 줄짜리 위임이 된다.
+
+### 픽스처 궤적
+
+`tests/fixtures/visible-learning/run/traj/nominal-00.estraj`: `tests/fixtures/mjcf/
+so101_pick_place.xml`의 48틱, 36 kB이며 `#[ignore]`된 `generate_fixture_traj`가 쓴다.
+**물리 백엔드는 관여하지 않고 필요하지도 않다.** `Trajectory`는
+`es_physics_core::backend::ModelInfo`로 형태가 정해지고 `StateView`로 채워지는데 둘 다 평범한
+구조체다: 생성기는 장면 바디마다 인덱스 하나를 가진 `ModelInfo`를 만들고 `nq`/`nv`는 관절에서
+`MuJoCo` 자신의 배치대로 합산한 뒤, 틱마다 장면의 부모 사슬로 모든 바디의 월드 포즈를
+합성한다(`shoulder_pan`을 -0.6에서 +0.6 rad까지 쓸어가며; MJCF 힌지는 자식 프레임을 그
+`anchor`를 지나는 `axis`에 대해 돌린다: `body.pose * T(a) * R * T(-a)`). 그리고 그 포즈들을
+담은 `StateView`를 push한다. 이는 `es_render::scene::world_poses`가 하는 것과 같은 합성이며 —
+거기서는 비공개, 여기서는 열두 줄, 테스트 코드에만 있다. `es-physics-core`가 **dev-dependency**인
+이유가 정확히 이것이다: 에디터 자신은 그 타입들을 결코 부르지 않는다.
+
+이 궤적은 정책 롤아웃이 아니라 합성된 홈 포즈 스윕이다: 확인해야 할 것은 기록된 포즈
+스트림이 장면을 다시 포즈시키고 투영된다는 것이고, (오케스트레이터가 여는) 실제 V19b
+`.estraj`는 팔만 다를 뿐 같은 바이트다.
+
+### 여기 없는 것
+
+- **픽셀 단위의 무엇도**: 깊이 버퍼 없음, 그림자 없음, 텍스처 없음. 업그레이드 경로는 위에 있다.
+- **실행 자신의 제어 주기.** 패널은 데모 배포의 `rate.control`인 50 Hz로 재생한다; 실행
+  디렉터리에는 그것을 읽을 Deployment IR이 없고, 주기가 틀려도 팔이 움직여 보이는 속도만
+  달라진다. 실행이 자기 주기를 기록하는 순간 `--rate`는 패널의 필드가 된다.
+- **카메라 프리셋과 장면 카메라.** `--camera NAME`(showcase의 다른 모드)은 장면 자신의 카메라
+  목록이 필요하다; 마우스를 끄는 사람이 원하는 것은 자유 카메라다.

@@ -5,5 +5,6 @@ pub mod edit;
 pub mod graph_view;
 pub mod image_view;
 pub mod palette;
+pub mod replay_view;
 pub mod run_view;
 pub mod telemetry_view;
