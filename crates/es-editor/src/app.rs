@@ -28,9 +28,12 @@ use es_ir::NodeId;
 use crate::model::edit::{self, Edit, EditIr, EditSession};
 use crate::model::graph_view::{CrossEdge, LayerView, LayeredGraph, NodeView};
 use crate::model::image_view::{BeforeAfter, ImagePair, Rgb8Image};
+use crate::model::inspector::{Field, Inspector, Widget};
 use crate::model::palette::Palette;
+use crate::model::recent::{self, Kind, Recent};
 use crate::model::replay_view::{self, Camera, Projected, ReplayView};
 use crate::model::run_view::{Bucket, RunView};
+use crate::model::search::Search;
 use crate::model::telemetry_view::{Source, TelemetryModel};
 
 const NODE_W: f32 = 178.0;
@@ -103,6 +106,12 @@ pub struct EditorApp {
     palette: Palette,
     drag: Option<Drag>,
     selected: Option<NodeId>,
+    /// The selected node's parameters (packet M7/E3). Rebuilt when [`EditorApp::inspector_key`]
+    /// moves, so that what is typed survives a repaint but never an edit.
+    inspector: Option<Inspector>,
+    inspector_key: (Option<NodeId>, usize),
+    search: Search,
+    recent: Recent,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -139,7 +148,23 @@ impl EditorApp {
             palette: Palette::default(),
             drag: None,
             selected: None,
+            inspector: None,
+            inspector_key: (None, 0),
+            search: Search::default(),
+            recent: Recent::default(),
         }
+    }
+
+    /// The recent list the previous run left in `eframe::Storage` (packet M7/E3). Called
+    /// before [`Self::with_path`], so a path on the command line joins the list rather than
+    /// replacing it.
+    #[must_use]
+    pub fn with_storage(mut self, storage: Option<&dyn eframe::Storage>) -> Self {
+        if let Some(storage) = storage {
+            self.recent =
+                Recent::from_json(&storage.get_string(recent::RECENT_KEY).unwrap_or_default());
+        }
+        self
     }
 
     /// Enters or leaves edit mode. Entering starts a session on the opened bundle's Task IR,
@@ -202,21 +227,24 @@ impl EditorApp {
         self
     }
 
-    /// A directory that holds `report.json` is a finished run (spec 10.5), anything else is a
-    /// bundle: the two are told apart by what is on disk, not by a flag (packet M7/E1).
+    /// Opens whatever [`recent::classify`] says the path is: a run directory, a `.esb`
+    /// container, or a directory of the five per-IR documents. The text field, the command
+    /// line, the recent list and a dropped file all arrive here (packets M7/E1, M7/E3).
     fn open(&mut self) {
         let path = PathBuf::from(self.path.trim());
         self.run = None;
         self.run_frames.clear();
         self.replay = None;
         self.replay_cell.clear();
-        if RunView::is_run_dir(&path) {
+        self.search.set_hits(Vec::new());
+        if recent::classify(&path) == Kind::Run {
             match RunView::open(&path) {
                 Ok(run) => {
                     self.status = format!("{}: {}", path.display(), run.status);
                     self.frames_path = run.frames_root().display().to_string();
                     self.run = Some(run);
                     self.tab = Tab::Run;
+                    self.recent.push(&path);
                 }
                 Err(e) => self.status = e.to_string(),
             }
@@ -248,6 +276,7 @@ impl EditorApp {
                     graph.diagnostics.len(),
                 );
                 self.edit = None;
+                self.recent.push(&path);
                 self.opened = Some(Opened {
                     graph,
                     task,
@@ -265,9 +294,16 @@ impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.telemetry.pump(&mut self.source, PUMP_BUDGET);
 
+        // A dropped file goes through the same function the text field does (packet M7/E3):
+        // one way in means one set of errors out.
+        if let Some(path) = ctx.input(|i| i.raw.dropped_files.iter().find_map(|f| f.path.clone())) {
+            self.path = path.display().to_string();
+            self.open();
+        }
+
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label("File");
+                self.file_menu(ui);
                 ui.add(
                     egui::TextEdit::singleline(&mut self.path)
                         .hint_text("bundle.esb, a directory of the five .toml files, or a run")
@@ -321,6 +357,14 @@ impl eframe::App for EditorApp {
             });
         });
 
+        // Side panels are declared before the central one. The inspector is only there in
+        // edit mode: a read-only graph has no parameter to set.
+        if self.tab == Tab::Graph && self.edit.is_some() {
+            egui::SidePanel::right("inspector")
+                .default_width(300.0)
+                .show(ctx, |ui| self.inspector_panel(ui));
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::Graph => self.graph_tab(ui),
             Tab::Run => self.run_tab(ui),
@@ -332,14 +376,164 @@ impl eframe::App for EditorApp {
         // Telemetry is a live stream; repaint even when no input arrives.
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
+
+    /// The recent list, under [`recent::RECENT_KEY`]. `eframe` keeps it in
+    /// `%APPDATA%/Electric Sheep editor/data/app.ron` on Windows and in
+    /// `~/.local/share/electricsheepeditor/app.ron` on Linux.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(recent::RECENT_KEY, self.recent.to_json());
+    }
 }
 
 impl EditorApp {
+    /// The File menu: the paths opened lately, most recent first (packet M7/E3). The list
+    /// itself is [`Recent`]'s; this draws it and hands a click back to [`Self::open`].
+    fn file_menu(&mut self, ui: &mut egui::Ui) {
+        let mut reopen: Option<PathBuf> = None;
+        ui.menu_button("File", |ui| {
+            ui.label("Recent");
+            if self.recent.paths.is_empty() {
+                ui.weak("nothing yet - type a path, or drop one on the window");
+            }
+            for path in &self.recent.paths {
+                if ui.button(path.display().to_string()).clicked() {
+                    reopen = Some(path.clone());
+                    ui.close_kind(egui::UiKind::Menu);
+                }
+            }
+        });
+        if let Some(path) = reopen {
+            self.path = path.display().to_string();
+            self.open();
+        }
+    }
+
+    /// The Graph toolbar's search box (packet M7/E3). [`Search`] decides what matches and in
+    /// what order; Enter and `Next` ask it for the following hit, and the only thing decided
+    /// here is where the canvas has to be panned to put that hit in the middle.
+    fn search_bar(&mut self, ui: &mut egui::Ui) {
+        let mut jump = false;
+        ui.horizontal(|ui| {
+            ui.label("Find");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.search.query)
+                    .hint_text("node kind, label or port")
+                    .desired_width(200.0),
+            );
+            if response.changed() {
+                let hits = match (&self.edit, &self.opened) {
+                    (Some(session), _) => Search::filter_session(&self.search.query, session),
+                    (None, Some(opened)) => Search::filter(&self.search.query, &opened.graph),
+                    (None, None) => Vec::new(),
+                };
+                self.search.set_hits(hits);
+            }
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                jump = true;
+                response.request_focus();
+            }
+            if ui.button("Next").clicked() {
+                jump = true;
+            }
+            ui.weak(self.search.summary());
+        });
+        if jump {
+            self.jump_to_hit(ui.available_size());
+        }
+    }
+
+    /// Puts the next hit in the middle of a `canvas`-sized view and selects it. Centring is
+    /// the whole of it: `pan` is what the painter adds to every position.
+    fn jump_to_hit(&mut self, canvas: Vec2) {
+        let Some((layer, node)) = self.search.advance() else {
+            return;
+        };
+        if let Some(pos) = self.node_pos(layer, node) {
+            self.pan = canvas * 0.5
+                - (Vec2::new(pos[0], pos[1]) + Vec2::new(NODE_W, NODE_H) * 0.5) * self.zoom;
+        }
+        if self.edit.is_some() {
+            self.selected = Some(node);
+        }
+    }
+
+    /// Where a hit sits: in the session's `.eslayout` while editing, in the layered view's own
+    /// layout otherwise.
+    fn node_pos(&self, layer: usize, node: NodeId) -> Option<[f32; 2]> {
+        if let Some(session) = &self.edit {
+            return session.layout.positions.get(&node).copied();
+        }
+        self.opened
+            .as_ref()?
+            .graph
+            .layers
+            .get(layer)?
+            .nodes
+            .iter()
+            .find(|n| n.id == node)?
+            .layout
+    }
+
+    /// The parameter inspector (packet M7/E3): one widget per field of the selected node.
+    /// [`Inspector`] decides which widget, what the text means and whether it becomes an
+    /// [`Edit`]; this draws and forwards.
+    fn inspector_panel(&mut self, ui: &mut egui::Ui) {
+        // Rebuilt when the selection moves or the session does - an undo behind the panel's
+        // back would otherwise leave stale text in the boxes. Between those, the widgets own
+        // their text, so typing survives a repaint.
+        let key = (
+            self.selected,
+            self.edit.as_ref().map_or(0, |s| s.history().len()),
+        );
+        if self.inspector_key != key {
+            self.inspector_key = key;
+            self.inspector = match (&self.edit, self.selected) {
+                (Some(session), Some(node)) => Inspector::for_node(session, node),
+                _ => None,
+            };
+        }
+        let Some(inspector) = &mut self.inspector else {
+            ui.heading("Inspector");
+            ui.weak("Select a node to edit its parameters.");
+            return;
+        };
+        ui.heading(format!("{} #{}", inspector.kind, inspector.node.0));
+        let mut commit: Option<(String, String)> = None;
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            for field in inspector.fields_mut() {
+                ui.label(&field.name);
+                if draw_field(ui, field) {
+                    commit = Some((field.name.clone(), field.text.clone()));
+                }
+                if let Some(error) = &field.error {
+                    ui.colored_label(BAD, error);
+                }
+                ui.add_space(4.0);
+            }
+        });
+        let Some((name, text)) = commit else { return };
+        let Some(edit) = self.inspector.as_mut().and_then(|i| i.edit(&name, &text)) else {
+            self.status = format!("{name}: not a value");
+            return;
+        };
+        if let Some(session) = self.edit.as_mut() {
+            self.status = match session.apply(edit) {
+                Ok(()) => format!("{} edits", session.history().len()),
+                Err(diags) => diags.first().map_or_else(
+                    || "edit refused".to_owned(),
+                    |d| format!("refused: {} {}", d.code, d.message),
+                ),
+            };
+        }
+    }
+
     fn graph_tab(&mut self, ui: &mut egui::Ui) {
+        self.search_bar(ui);
         if self.edit.is_some() {
             self.edit_canvas(ui);
             return;
         }
+        let hit = self.search.current();
         let Some(opened) = &self.opened else {
             ui.label("Open a bundle to see the layered graph (spec 23.2).");
             return;
@@ -357,8 +551,9 @@ impl EditorApp {
         let at = |p: [f32; 2]| origin + Vec2::new(p[0], p[1]) * zoom;
         let size = Vec2::new(NODE_W, NODE_H) * zoom;
 
-        for layer in &opened.graph.layers {
-            paint_layer(&painter, layer, &at, size, zoom);
+        for (i, layer) in opened.graph.layers.iter().enumerate() {
+            let highlight = hit.filter(|(l, _)| *l == i).map(|(_, node)| node);
+            paint_layer(&painter, layer, &at, size, zoom, highlight);
         }
         for edge in &opened.graph.cross_edges {
             paint_cross_edge(&painter, &opened.graph, edge, &at, size, zoom);
@@ -982,6 +1177,7 @@ fn paint_layer(
     at: &impl Fn([f32; 2]) -> Pos2,
     size: Vec2,
     zoom: f32,
+    highlight: Option<NodeId>,
 ) {
     let font = FontId::proportional(12.0 * zoom);
     let band = layer.nodes.iter().find_map(|n| n.layout);
@@ -1009,11 +1205,16 @@ fn paint_layer(
     for node in &layer.nodes {
         let Some(p) = node.layout else { continue };
         let rect = Rect::from_min_size(at(p), size);
-        painter.rect_filled(rect, 4.0, Color32::from_rgb(40, 44, 52));
+        let found = highlight == Some(node.id);
+        painter.rect_filled(rect, 4.0, node_fill(found));
         painter.rect_stroke(
             rect,
             4.0,
-            Stroke::new(1.0_f32, Color32::from_gray(90)),
+            if found {
+                Stroke::new(2.0_f32, HIT)
+            } else {
+                Stroke::new(1.0_f32, Color32::from_gray(90))
+            },
             egui::StrokeKind::Inside,
         );
         painter.text(
@@ -1130,6 +1331,67 @@ fn sidecar(path: &Path) -> Option<Layout> {
 
 const LINK: Color32 = Color32::from_rgb(200, 180, 90);
 const PIN_IN: Color32 = Color32::from_rgb(120, 170, 255);
+/// The ring around a search hit, and the colour of a field that does not parse.
+const HIT: Color32 = Color32::from_rgb(230, 190, 80);
+const BAD: Color32 = Color32::from_rgb(230, 120, 110);
+
+/// A node body, selected or found versus plain.
+fn node_fill(lit: bool) -> Color32 {
+    if lit {
+        Color32::from_rgb(60, 72, 96)
+    } else {
+        Color32::from_rgb(40, 44, 52)
+    }
+}
+
+/// One parameter's widget; `true` once the person is done with it (Enter, focus lost, a drag
+/// released, a variant picked). Which widget a field gets is [`Field::widget`]'s answer and
+/// what its text means is [`Field::parse`]'s - neither is decided here.
+fn draw_field(ui: &mut egui::Ui, field: &mut Field) -> bool {
+    match field.widget() {
+        Widget::Checkbox => {
+            let mut on = field.flag();
+            if ui.checkbox(&mut on, "").changed() {
+                field.set_flag(on);
+                return true;
+            }
+            false
+        }
+        widget @ (Widget::DragInt | Widget::DragFloat) => {
+            let mut value = field.number();
+            let speed = if widget == Widget::DragInt { 1.0 } else { 0.01 };
+            let response = ui.add(egui::DragValue::new(&mut value).speed(speed));
+            if response.changed() {
+                field.set_number(value);
+            }
+            response.drag_stopped() || response.lost_focus()
+        }
+        Widget::Combo(variants) => {
+            let mut picked = false;
+            egui::ComboBox::from_id_salt(field.name.clone())
+                .selected_text(field.text.clone())
+                .show_ui(ui, |ui| {
+                    for variant in &variants {
+                        let value = variant.clone();
+                        if ui
+                            .selectable_value(&mut field.text, value, variant)
+                            .clicked()
+                        {
+                            picked = true;
+                        }
+                    }
+                });
+            picked
+        }
+        widget @ (Widget::Text | Widget::ShapeText | Widget::TomlText) => ui
+            .add(
+                egui::TextEdit::singleline(&mut field.text)
+                    .hint_text(widget.hint())
+                    .desired_width(f32::INFINITY),
+            )
+            .lost_focus(),
+    }
+}
 
 /// One frame of canvas geometry, owned. Built from the session, used for hit-testing and
 /// painting, and rebuilt after an edit - so the mutation and the drawing never hold a borrow
@@ -1252,12 +1514,7 @@ impl CanvasView {
         let font = FontId::proportional(12.0 * self.zoom);
         for (id, kind) in &self.kinds {
             let Some(rect) = self.rect(*id) else { continue };
-            let fill = if selected == Some(*id) {
-                Color32::from_rgb(60, 72, 96)
-            } else {
-                Color32::from_rgb(40, 44, 52)
-            };
-            painter.rect_filled(rect, 4.0, fill);
+            painter.rect_filled(rect, 4.0, node_fill(selected == Some(*id)));
             painter.rect_stroke(
                 rect,
                 4.0,

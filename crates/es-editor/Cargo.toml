@@ -27,7 +27,11 @@ es-assets = { workspace = true }
 es-env = { workspace = true }
 es-math = { workspace = true }
 es-render = { workspace = true }
-eframe = { workspace = true }
+# `persistence` is the one feature added on top of the workspace's minimal set: it is what
+# gives `eframe::App::save` a `Storage`, and the recent-files list (packet M7/E3) is kept
+# there rather than in a config file of this crate's own invention. No new dependency entry -
+# the feature pulls `ron` and `home` in behind eframe, both already in its own tree.
+eframe = { workspace = true, features = ["persistence"] }
 egui = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
