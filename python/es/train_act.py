@@ -14,6 +14,8 @@ Usage:
 
     train_act.py --module <dir> --baked <dir> --out model.safetensors
                  [--epochs N] [--batch N] [--lr F] [--seed N] [--device cpu]
+                 [--schedule constant|warmup_cosine] [--warmup-steps N] [--lr-min F]
+                 [--weight-decay F] [--grad-clip F]
                  [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json]
                  [--resident-gpu] [--amp bf16] [--compile]
 
@@ -85,11 +87,35 @@ which is where it is printed.
 `--batch` defaults to 8 and stays there: the design note's measured runs are at 8, and moving
 the default would silently invalidate them. Raising it is a different run, and now a cheaper
 one per sample -- `--batch N` covers N samples per optimizer step, so N x fewer steps cover the
-same data, and the convention is to scale the step with it linearly: `--batch 32 --lr 4e-4` for
-the `--batch 8 --lr 1e-4` default. That convention was measured to diverge at 64 (design note
-`visible-learning.md` section 7.11); a schedule is packet M7/T4's, not this script's. Neither
-the scaling nor the batch size enters a hash slot (spec 8.1); both belong in whatever records
-the training run.
+same data. The convention of scaling the step linearly with it (`--batch 32 --lr 4e-4` for the
+`--batch 8 --lr 1e-4` default) was measured to diverge at 64 (design note
+`visible-learning.md` section 7.11), which is why `--schedule` exists below. Neither the
+scaling nor the batch size enters a hash slot (spec 8.1); both belong in whatever records the
+training run -- for `es train` that is spec 19.3's `optimizer.json` and `scheduler.json`.
+
+**The learning-rate schedule** (packet M7/T4). `--schedule constant` is the default and is the
+old run exactly: `lr_at` is not consulted, the optimizer keeps the step it was built with, and
+the loss curve of a run that passes no new flag is bit-identical to the one from before this
+packet. `--schedule warmup_cosine` applies
+
+    lr(step) = lr * step / warmup                                       step < warmup
+             = lr_min + (lr - lr_min) * 0.5 * (1 + cos(pi * (step - warmup)
+                                                       / (total - warmup)))   otherwise
+
+where `total` is the number of optimizer steps this invocation will run. It is the plain
+function `lr_at` below, called once per step and written into `param_groups`;
+`torch.optim.lr_scheduler` is deliberately not used, because its float sequence is an
+implementation detail of a torch version and the schedule has to be reproducible across them.
+`tests/golden/train/lr_warmup_cosine.json` pins the first 1,000 values, and
+`crates/es-policy/tests/ir_training.rs::lr_schedule_matches_the_golden` compares both this
+function and a Rust re-implementation of it against that file.
+
+`--weight-decay` is AdamW's, defaulting to torch's own `1e-2` **made explicit** so that
+`optimizer.json` can name a number this script actually passed rather than one it assumes.
+`--grad-clip F` clips the gradient norm to `F` before the step; `0` (the default) is off, and
+a run that clipped says so in its summary. The applied learning rates are hashed into
+`lr_curve_hash` (blake3 over the `f64` values, little-endian) so that two runs of one schedule
+can be told apart by one word.
 """
 
 from __future__ import annotations
@@ -97,11 +123,42 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import math
 import struct
 import sys
 from pathlib import Path
 
 import torch
+
+try:  # only `lr_curve_hash` needs it, and this script's contract is "no package beyond torch"
+    import blake3
+except ImportError:  # pragma: no cover - reported as an unset hash, never a stopped run
+    blake3 = None
+
+
+def lr_at(step: int, total: int, lr: float, lr_min: float, warmup: int) -> float:
+    """The `warmup_cosine` schedule of packet M7/T4, as a plain function of five numbers.
+
+    Not `torch.optim.lr_scheduler`: that sequence is an implementation detail of a torch
+    version, and this one is pinned bitwise by `tests/golden/train/lr_warmup_cosine.json`
+    against a Rust re-implementation of these same three lines. Keep the arithmetic in this
+    order -- the golden is `f64` and the order is what makes the two agree.
+    """
+    if warmup > 0 and step < warmup:
+        return lr * step / warmup
+    span = max(1, total - warmup)
+    return lr_min + (lr - lr_min) * 0.5 * (1.0 + math.cos(math.pi * (step - warmup) / span))
+
+
+def lr_curve_hash(applied: list) -> str:
+    """blake3 over the learning rates actually applied, as little-endian `f64`.
+
+    `None` when `blake3` is not importable: it is provenance, and a missing optional package
+    must not stop a training run that torch alone can finish.
+    """
+    if blake3 is None:
+        return None
+    return blake3.blake3(struct.pack("<%dd" % len(applied), *applied)).hexdigest()
 
 
 def build_policy(module_dir: Path):
@@ -234,6 +291,34 @@ def main(argv: list) -> int:
         "goes with --lr 4e-4",
     )
     p.add_argument(
+        "--schedule",
+        choices=["constant", "warmup_cosine"],
+        default="constant",
+        help="constant is the default and is the old run exactly: `lr_at` is not consulted "
+        "and the optimizer keeps the step it was built with",
+    )
+    p.add_argument(
+        "--warmup-steps",
+        type=int,
+        default=0,
+        help="linear warmup from 0 to --lr over this many steps, before the cosine",
+    )
+    p.add_argument(
+        "--lr-min", type=float, default=0.0, help="the floor the cosine decays to"
+    )
+    p.add_argument(
+        "--weight-decay",
+        type=float,
+        default=1e-2,
+        help="AdamW's; torch's own default, made explicit so optimizer.json can name it",
+    )
+    p.add_argument(
+        "--grad-clip",
+        type=float,
+        default=0.0,
+        help="clip the gradient norm to this before the step; 0 is off",
+    )
+    p.add_argument(
         "--channel-weight",
         action="append",
         default=[],
@@ -322,7 +407,7 @@ def main(argv: list) -> int:
     if total <= 0:
         raise SystemExit("nothing to optimize: %d samples, batch %d" % (len(samples), a.batch))
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=a.lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.weight_decay)
     generator = torch.Generator().manual_seed(a.seed)
     # `model` stays the thing whose `state_dict` is written: `torch.compile` returns a wrapper
     # whose parameter names are prefixed, and `checkpoint_tensors` would not recognise them.
@@ -333,9 +418,19 @@ def main(argv: list) -> int:
         else contextlib.nullcontext()
     )
     model.train()
-    losses = []
+    losses, applied_lr = [], []
     order, cursor = [], 0
     for step in range(total):
+        # `constant` writes back the number AdamW was built with, which is a no-op on the
+        # arithmetic -- that is what makes the default path the old run (packet M7/T4).
+        lr_now = (
+            a.lr
+            if a.schedule == "constant"
+            else lr_at(step, total, a.lr, a.lr_min, a.warmup_steps)
+        )
+        for group in optimizer.param_groups:
+            group["lr"] = lr_now
+        applied_lr.append(lr_now)
         optimizer.zero_grad(set_to_none=True)
         # The same `a.batch` samples the accumulation loop would have visited, in the same
         # order, drawn from the same generator -- and now stacked into one forward (M7/T3).
@@ -360,6 +455,8 @@ def main(argv: list) -> int:
             # accumulation loop summed -- the same gradient, one sum order later.
             loss = ((predicted - target).abs() * weights).mean()
         loss.backward()
+        if a.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip)
         optimizer.step()
         losses.append(float(loss.detach()))
         if marks and (step + 1) in marks:
@@ -380,6 +477,11 @@ def main(argv: list) -> int:
         "initial_loss": sum(losses[:window]) / window,
         "final_loss": sum(losses[-window:]) / window,
         "steps": len(losses),
+        # The step a divergence started at, rather than a NaN at the end of the run and no
+        # way to tell when it happened (packet M7/T4's acceptance asks for exactly this).
+        "first_nonfinite_step": next(
+            (i for i, v in enumerate(losses) if not math.isfinite(v)), None
+        ),
         "samples": len(samples),
         "batch": a.batch,
         # One forward over `batch` samples, not `batch` forwards accumulated (packet M7/T3).
@@ -390,6 +492,15 @@ def main(argv: list) -> int:
         "resident_gpu": a.resident_gpu,
         "amp": a.amp,
         "compiled": a.compile,
+        # The schedule, and the identity of the sequence it actually applied (packet M7/T4).
+        # `es train` writes the first five into spec 19.3's `scheduler.json` and
+        # `optimizer.json` *before* the run; these are what the run says it used.
+        "schedule": a.schedule,
+        "warmup_steps": a.warmup_steps,
+        "lr_min": a.lr_min,
+        "weight_decay": a.weight_decay,
+        "grad_clip": a.grad_clip,
+        "lr_curve_hash": lr_curve_hash(applied_lr),
         "chunk": chunk,
         "channel_weight": [float(v) for v in weights.tolist()],
         "ports": sorted(shapes),
@@ -402,7 +513,9 @@ def main(argv: list) -> int:
         "torch": torch.__version__,
         "optimizer": {
             "kind": "AdamW",
-            "lr": group["lr"],
+            # The step AdamW was *built* with, not `group["lr"]`: under a schedule the group
+            # holds the last applied rate, and what `optimizer.json` declares is the base.
+            "lr": a.lr,
             "betas": list(group["betas"]),
             "eps": group["eps"],
             "weight_decay": group["weight_decay"],
