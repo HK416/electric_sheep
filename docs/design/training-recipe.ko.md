@@ -700,3 +700,74 @@ RAN cycle_runs_the_expert_through_the_harness_first: expert gate success_rate 1,
 게이트는 시드 둘로 자른 하니스를 통과하고, 40스텝 정책은 통과하지 못한다 — 40스텝 정책이란
 그런 것이다. 그 비대칭이 이 오라클의 주제다: 게이트가 돌았고, **먼저** 돌았으며, 원장이
 `collect -> evaluate -> train -> evaluate`를 연결했다.
+
+### 11.8 측정 — 사이클 하나 전체, 오라클 서버, RTX 4090, 2026-09-21
+
+데모 자신의 문서들 위에서 돌린 `es loop cycle`: 프레임을 남긴 200 에피소드 전문가 수집,
+커밋된 `evaluation.toml` 위의 게이트, 20,000스텝 IR 경로(배치 8, lr 1e-4, seed 0,
+`extra = ["--resident-gpu"]`, `device = "cuda"`), 같은 `evaluation.toml`을 `--jobs 6`과
+프레임으로, 그리고 V19b의 카메라로 찍은 `nominal-00` 쇼케이스. 명령 하나, 문서 하나, 원장
+하나. `~/artifacts/plan-v/m7-t2/run.sh`가 그 호출이고, `cycle.log`가 stdout의 모든 줄에
+타임스탬프를 붙인다.
+
+| 단계 | 월클록 | 무엇이 돌았나 |
+|---|---|---|
+| `collect` | **5:00** | 200 에피소드, 103,881 프레임, `success 200 / failure 0 / timeout 0`. safety 4,245 clamped, 1,991 fallback |
+| `expert-gate`(`es eval run --expert`) | **2:21** | 6 스위트 × 16 에피소드, `--jobs 6`, 프레임. 69,380 프레임 |
+| `train`(T1의 IR 경로, 중첩) | **2:26** | 그중 `dataset bake` 0:24, `policy lower` 1초 미만, **`train_act.py` 2:00**(20,000스텝), `policy pack` ×3 약 1초 |
+| `eval` | **20:24** | 6 스위트 × 16 에피소드, `--jobs 6`, 프레임. 171,116 프레임 |
+| `showcase` | **0:08** | `nominal-00` 1,800 tick, 1280×720 lambert, 4.7 ms/frame |
+| **합계** | **30:19** | §28.9의 중단 규칙은 사이클 하나 30분 미만: **19초 차로 놓침** |
+
+`training_hash 6c81756c…`, `identity_hash 8914b1d6…`, `lowering_hash 3d06811c…`,
+`initial_loss 0.052309`에서 `final_loss 0.014186`. 판정된 체크포인트는
+`checkpoint.20000 = policy_hash ec8379a9…`이고 그것이 `evaluate` 단계의 `policy_hash`다 —
+실제 데이터 위의 체인 속성. `es_data::check_chain` 통과:
+`ledger: …/loop.jsonl (chained)`.
+
+**게이트는 통과했고, 정책은 통과하지 못했다.** 둘 다 원장에 나란히 있다:
+
+| 스위트 | 전문가 게이트 `success_rate` | 정책 `success_rate` | 정책 `envelope_violation_rate` |
+|---|---|---|---|
+| nominal | **1.000** | **0.000** | 0.949 |
+| light_intensity | 1.000 | 0.000 | 0.945 |
+| light_direction | 1.000 | 0.000 | 0.947 |
+| observation_delay | 1.000 | 0.000 | 0.904 |
+| torque_noise | 0.000 | 0.062 | 0.956 |
+| backlash | 1.000 | 0.000 | 0.937 |
+
+acceptance 기준은 `nominal success_rate >= 0.5`이므로 사이클은
+`FAILED suite=Some("nominal") metric=success_rate observed=0`과 함께 1로 끝난다. **그것은
+이 패킷의 결함이 아니라 측정이다** — T2의 주제는 문서 하나가 사이클을 돌리고 그것을 연결할
+수 있는가이고, 그렇게 했다. 정책의 수는 §28.10의 U-측정이 맡은 것이며, 전문가의 0.04 대비
+0.95라는 `envelope_violation_rate`가 어디를 볼지 말해 준다: 학습된 chunk가 스무 tick 중
+열아홉에서 Deployment IR의 envelope 바깥에 있고, 따라서 팔이 실제로 따르는 것은 Safety
+Plane이다. `final_loss 0.014186`인데 한 번도 성공하지 못하는 정책은 10절이 D행에 대해
+지적한 바로 그 불일치다 — 그만큼 낮은 fit이 아직 작동하는 정책은 아니다.
+
+**이 측정이 §28.9의 "월클록이 어디로 가는가"에 대해 말하는 세 가지.**
+
+1. **학습은 더 이상 지배적인 항이 아니다.** §28.9는 배치 8에서 20,000스텝에 10:53을
+   기록하고 배치 lowering의 샘플별 루프를 근본 원인으로 지목한다. T3가 그것을 제거했다
+   (`lowering_hash 3d06811c…`): 여덟 배의 데이터(50이 아니라 200 에피소드) 위에서 같은
+   20,000스텝이 이제 **2:00**이 걸린다. §28.9 사다리의 9번 칸은 끝났다.
+2. **평가가 지배적인 항이고, 그 월클록은 정책이 얼마나 좋은가의 함수다.** *같은* 하니스 —
+   6 스위트, 96 에피소드, `--jobs 6`, 프레임 — 가 전문가에게는 2:21, 정책에게는 **20:24**가
+   걸렸다. 그 사이에 코드는 하나도 없는데 8.7배 차이다. 성공한 에피소드는 큐브가 통에
+   들어가면 끝나고, 실패하는 에피소드는 1,800 tick을 모두 돈다. §28.9의 이 스위트에 대한
+   5:49는 가끔 성공하는 정책 위에서 측정된 것이므로 *최선*의 수이고, 새 사이클이 무는 것은
+   최악의 경우다. 이제 이 경로에서 유효한 유일한 지렛대는 에피소드 단위 샤딩
+   (§28.9 10번 칸 / T8)이다.
+3. **수집도 같은 세금을 낸다.** 이 실행의 첫 시도는
+   `~/artifacts/plan-v/v15/untrained.esb`를 썼는데, 그 `deployment_hash 3b2ad568…`은 커밋된
+   `f2f9a510…`(80)이 아니라 V18 이전의 envelope(`acceleration_max 20`)이다. 200 에피소드가
+   전부 timeout이 났고(`success 0 / timeout 200`, 360,000 스텝 중 284,163이 fallback) 수집에
+   **5분이 아니라 17분**이 걸렸다. 그 실행은 폐기하고, 커밋된 네 문서를 모두 나르는
+   `~/artifacts/plan-v/v18/untrained-L80.esb`로 다시 돌렸다. 기록해 둘 가치가 있는 이유는
+   **전문가 게이트가 바로 그것을 잡아냈을 것**이기 때문이다: 불일치를 발견했을 때 게이트는
+   이미 돌고 있었고, 전문가가 통과할 수 없는 하니스 위에서 학습을 거부했을 것이다 — 그것이
+   §28.9 규칙 1의 논지 전부이며, 첫 실제 실행에서 묻지도 않았는데 도착했다.
+
+`~/artifacts/plan-v/m7-t2/`에 보관: `loop.jsonl`, `training.lock`, `report-policy.json`,
+`report-expert-gate.json`, `cycle.log`, `cycle.toml`, `training.toml`, `run.sh`, 그리고
+`run/` 트리 전체(27 GB: 프레임, 트래젝터리, 체크포인트 번들 셋).

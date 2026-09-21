@@ -721,3 +721,75 @@ RAN cycle_runs_the_expert_through_the_harness_first: expert gate success_rate 1,
 The gate passes on the harness cut to two seeds; the 40-step policy does not, which is what a
 40-step policy is. That asymmetry is the oracle's subject: the gate ran, it ran **first**, and
 the ledger chained `collect -> evaluate -> train -> evaluate`.
+
+### 11.8 Measured — one whole cycle, oracle server, RTX 4090, 2026-09-21
+
+`es loop cycle` on the demo's own documents: 200 expert episodes with frames, the gate on the
+committed `evaluation.toml`, the IR route at 20,000 steps (batch 8, lr 1e-4, seed 0,
+`extra = ["--resident-gpu"]`, `device = "cuda"`), the same `evaluation.toml` at `--jobs 6`
+with frames, and the `nominal-00` showcase with V19b's camera. One command, one document, one
+ledger. `~/artifacts/plan-v/m7-t2/run.sh` is the invocation; `cycle.log` timestamps every line
+of its stdout.
+
+| Stage | Wall-clock | What ran |
+|---|---|---|
+| `collect` | **5:00** | 200 episodes, 103,881 frames, `success 200 / failure 0 / timeout 0`; safety 4,245 clamped, 1,991 fallback |
+| `expert-gate` (`es eval run --expert`) | **2:21** | 6 suites × 16 episodes, `--jobs 6`, frames; 69,380 frames |
+| `train` (T1's IR route, nested) | **2:26** | of which `dataset bake` 0:24, `policy lower` < 1 s, **`train_act.py` 2:00** (20,000 steps), `policy pack` ×3 ≈ 1 s |
+| `eval` | **20:24** | 6 suites × 16 episodes, `--jobs 6`, frames; 171,116 frames |
+| `showcase` | **0:08** | 1,800 ticks of `nominal-00` at 1280×720 lambert, 4.7 ms/frame |
+| **total** | **30:19** | §28.9's stop rule is one cycle under 30 minutes: **missed by 19 seconds** |
+
+`training_hash 6c81756c…`, `identity_hash 8914b1d6…`, `lowering_hash 3d06811c…`,
+`final_loss 0.014186` from `initial_loss 0.052309`. The judged checkpoint is
+`checkpoint.20000 = policy_hash ec8379a9…`, which is the `evaluate` step's `policy_hash` — the
+chain property, on real data. `es_data::check_chain` passed: `ledger: …/loop.jsonl (chained)`.
+
+**The gate passed; the policy did not.** Both are in the ledger, side by side:
+
+| Suite | expert gate `success_rate` | policy `success_rate` | policy `envelope_violation_rate` |
+|---|---|---|---|
+| nominal | **1.000** | **0.000** | 0.949 |
+| light_intensity | 1.000 | 0.000 | 0.945 |
+| light_direction | 1.000 | 0.000 | 0.947 |
+| observation_delay | 1.000 | 0.000 | 0.904 |
+| torque_noise | 0.000 | 0.062 | 0.956 |
+| backlash | 1.000 | 0.000 | 0.937 |
+
+The acceptance criterion is `nominal success_rate >= 0.5`, so the cycle exits 1 with
+`FAILED suite=Some("nominal") metric=success_rate observed=0`. **That is a measurement, not a
+defect of this packet** — T2's subject is whether one document can run the cycle and chain it,
+and it did. The policy's number is the one §28.10's U-measurement is for, and the
+`envelope_violation_rate` of 0.95 against the expert's 0.04 says where to look: the trained
+chunk is outside the Deployment IR's envelope on nineteen of every twenty ticks, so the Safety
+Plane is what the arm is actually following. `final_loss 0.014186` and a policy that never
+succeeds is the same disagreement section 10 flagged for row D — a fit that low is not yet a
+policy that works.
+
+**Three things this measurement says about §28.9's "where the wall-clock goes".**
+
+1. **Training is no longer the dominant term.** §28.9 records 10:53 for 20,000 steps at batch
+   8 and calls the per-sample loop in the batch lowering the root cause. T3 removed it
+   (`lowering_hash 3d06811c…`): the same 20,000 steps on eight times the data (200 episodes,
+   not 50) now take **2:00**. Rung 9 of §28.9's ladder is done.
+2. **Evaluation is, and its wall-clock is a function of how good the policy is.** The *same*
+   harness — six suites, 96 episodes, `--jobs 6`, frames — took 2:21 on the expert and
+   **20:24** on the policy, an 8.7× difference with no code between them. A successful episode
+   terminates when the cube lands in the bin; a failing one runs all 1,800 ticks. §28.9's
+   5:49 for this suite was measured on a policy that sometimes succeeds, so it is a
+   *best*-case number, and the worst case is what a fresh cycle pays. Episode-level sharding
+   (§28.9 rung 10 / T8) is now the only lever that matters on this path.
+3. **Collect pays the same tax.** The first attempt at this run used
+   `~/artifacts/plan-v/v15/untrained.esb`, whose `deployment_hash 3b2ad568…` is the pre-V18
+   envelope (`acceleration_max 20`) rather than the committed `f2f9a510…` (80). Every one of
+   the 200 episodes timed out (`success 0 / timeout 200`, 284,163 of 360,000 steps in
+   fallback) and collection took **17 minutes instead of 5**. The run was discarded and
+   re-run against `~/artifacts/plan-v/v18/untrained-L80.esb`, which carries all four committed
+   documents. It is worth recording because **the expert gate is exactly the thing that would
+   have caught it**: the gate was already running when the mismatch was spotted, and it would
+   have refused to train on a harness the expert could not pass — which is the whole argument
+   of §28.9 rule 1, arriving unprompted on its first real run.
+
+Kept under `~/artifacts/plan-v/m7-t2/`: `loop.jsonl`, `training.lock`, `report-policy.json`,
+`report-expert-gate.json`, `cycle.log`, `cycle.toml`, `training.toml`, `run.sh`, and the whole
+`run/` tree (27 GB: frames, trajectories and the three checkpoint bundles).
