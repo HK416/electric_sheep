@@ -27,8 +27,9 @@ pub mod training;
 use std::path::{Path, PathBuf};
 
 pub use collect::{
-    append_loop_step, distill, read_loop_steps, CollectReport, CollectSpec, Collector, FrameSink,
-    Intervener, Intervention, LoopKind, LoopStep, SplitSpec, ACTION_COMMANDED,
+    append_loop_step, check_chain, distill, last_evaluation_hash, read_loop_steps, CollectReport,
+    CollectSpec, Collector, FrameSink, Intervener, Intervention, LoopKind, LoopStep, SplitSpec,
+    ACTION_COMMANDED, CHECKPOINT,
 };
 pub use identity::{BaseModel, DatasetIdentity, Split, TrainingIdentity};
 pub use intervention::{
@@ -39,7 +40,9 @@ pub use lerobot::{
     export_v3, Column, Dtype, Episode, EpisodeMeta, ExportOptions, ExportReport, FeatureSpec, Info,
     LeRobotDataset, LeRobotWriter, Task, VideoRef,
 };
-pub use training::{DatasetFacts, Plan, Recipe, Route, Step, StepKind, Training};
+pub use training::{
+    Cycle, CyclePlan, CycleStep, DatasetFacts, Plan, Recipe, Route, Stage, Step, StepKind, Training,
+};
 
 /// Everything that can go wrong reading or writing a dataset.
 #[derive(Debug, thiserror::Error)]

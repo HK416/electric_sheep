@@ -187,7 +187,7 @@ ledger that makes that checkable is one append-only file per dataset root:
 
 ```rust
 pub struct LoopStep {
-    pub kind: LoopKind,                       // Collect | Intervene | Distill
+    pub kind: LoopKind,   // Collect | Intervene | Distill | Train | Evaluate
     pub inputs: BTreeMap<String, String>,     // name -> hex digest or path
     pub outputs: BTreeMap<String, String>,
     pub created: u64,                         // unix seconds
@@ -202,6 +202,8 @@ records:
 | `collect` | `task`, `observation`, `learning`, `deployment` (the bundle manifest's hashes), `seed`, `episodes` | `content`, `schema` |
 | `intervene` | `content` (before), `segments` (count) | `content` (after), `schema` |
 | `distill` | `content`/`schema` of each input root, `seed`, `ratios` | `content`, `schema`, `split`, `training_hash` |
+| `train` | `content`, `schema`, `split`, `identity_hash`, `dataset`, `expert_gate` | `training_hash`, `checkpoint.<mark>` per checkpoint |
+| `evaluate` | `evaluation_hash`, `policy_hash`, `deployment`, `observation`, `expert` | `report` (blake3 of `report.json`), `passed`, `success_rate` |
 
 The chain property is what a reviewer checks by eye and what the oracle checks in CI: step
 *n*'s input `content` is step *n-1*'s output `content`. A `distill` step is appended to
@@ -211,10 +213,46 @@ records that it was consumed, and the output's ledger records what it was made o
 `created` is the only non-reproducible value in the file, for the same reason `RunConfig`'s
 is (§10.4): provenance is not identity. Nothing in `loop.jsonl` feeds a hash.
 
-`loop.jsonl` deliberately does **not** record `policy_hash` of a *trained* checkpoint or
-`evaluation_hash`: neither is produced by these three commands. §13.3's discipline — hold
-`evaluation_hash` fixed while data and policy move — is enforced by `es eval compare`
-(already implemented), which is where a changed `evaluation_hash` invalidates a comparison.
+### 4.1 `train` and `evaluate` — the ledger reaches the end of §13.1's loop (packet M7/T2)
+
+Until M7/T2 the ledger stopped at `distill`: it never recorded that a dataset trained a policy
+or that a policy was judged, so §13.3's "iteration *n* is a function of iteration *n-1*" was
+checkable over data alone. `es loop cycle` adds the two remaining kinds, and adding *variants*
+(rather than fields) is why every line an older `es` wrote still reads back — serde matches on
+the tag and nothing else.
+
+* **`train`** records what the run read and what it produced. `checkpoint.<mark>` is one key
+  per checkpoint — `checkpoint.20000 -> <policy_hash>` — rather than one packed value, because
+  membership is the only question asked of it. `expert_gate` is present only when the cycle
+  ran one (`passed`, or `skipped (--skip-expert-gate)`): a cycle that trained without the
+  harness having passed the expert says so, rather than looking like one that did (§28.9
+  rule 1).
+* **`evaluate`** records which policy, under which conditions, and what came out.
+  `policy_hash` is §19.3's `H(training_hash, checkpoint_hash)` — the same number the `train`
+  step's `checkpoint.<mark>` carries, which is what makes the chain checkable. The **expert
+  gate** is an `evaluate` step too, distinguished by an `expert` input: it judges the scripted
+  demonstrator, not a checkpoint.
+
+Both are appended twice — to the dataset root's ledger (the thing that trained or was judged)
+and to `<out>/loop.jsonl` — by the same rule `distill` already follows.
+
+`es_data::check_chain(&[LoopStep])` is that property as a function:
+
+```
+train.inputs.content    == the content the collect/intervene/distill before it wrote
+evaluate.inputs.policy_hash ∈ { checkpoint.* of the train steps before it }
+```
+
+Both halves are **conditional on there being an earlier step to chain to** — a ledger holding
+only an `evaluate` (a bare `es eval run` against a bundle from elsewhere) claims no chain and
+breaks none — and the expert gate is skipped by name, not by position. A break is refused with
+both hashes and the marks in the message. `es loop cycle` calls it once the run is over, and
+`crates/es-data/src/collect.rs::loop_train_and_evaluate_steps_chain` is its oracle.
+
+§13.3's other half — hold `evaluation_hash` fixed while data and policy move — is
+`last_evaluation_hash(&steps)` plus a refusal in `es loop cycle`; `es eval compare` (already
+implemented) remains the place two reports are read side by side. See
+`docs/design/training-recipe.md` section 12.
 
 ---
 

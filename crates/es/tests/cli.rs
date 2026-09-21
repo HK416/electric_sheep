@@ -7599,6 +7599,208 @@ fn train_identity_is_a_function_of_the_recipe() {
     }
 }
 
+// --- packet M7/T2: `es loop cycle` ------------------------------------------------------
+
+const CYCLE_RECIPE: &str = "tests/fixtures/visible-learning/cycle.toml";
+
+/// `es loop cycle`, from the repository root, with `ES_PYTHON` removed for the same reason
+/// `run_train` removes it: the interpreter is the one machine-dependent word in the plan.
+fn run_cycle(recipe: &str, out: &Path, extra: &[&str]) -> Output {
+    bin()
+        .current_dir(train_root())
+        .env_remove("ES_PYTHON")
+        .args(["loop", "cycle", "--recipe", recipe, "--out"])
+        .arg(out)
+        .args(extra)
+        .output()
+        .expect("run es loop cycle")
+}
+
+/// Regenerates `tests/golden/train/plan-cycle.txt`. Run once, explicitly; it is then
+/// read-only (spec 1.4), exactly like `generate_train_goldens` beside it.
+#[test]
+#[ignore = "golden generator; run explicitly"]
+fn generate_cycle_golden() {
+    let dir = scratch_dir("cycle-golden");
+    let out = run_cycle(CYCLE_RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    write(&train_golden("plan-cycle.txt"), &stdout(&out));
+}
+
+/// Oracle 1. The stage plan is a property of the document: the same bytes on any machine, in
+/// any output directory, on either path separator -- and T1's plan nested under `train`, with
+/// the cycle's own collect output where the recipe's `[dataset]` used to be.
+#[test]
+fn cycle_dry_run_plan_is_the_golden() {
+    let dir = scratch_dir("cycle-dry");
+    let out = run_cycle(CYCLE_RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let golden = train_golden("plan-cycle.txt");
+    let want =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(stdout(&out), want, "the stage plan is not the golden");
+    // A run that did not happen writes nothing, not even a directory (the same rule
+    // `es train --dry-run` follows for `training.lock`).
+    assert!(!dir.join("loop.jsonl").exists());
+    assert!(!dir.join("train").exists());
+}
+
+/// Oracle 3. Spec 13.3's "if `evaluation_hash` changes, the comparison is invalid" as a
+/// refusal by name: both hashes are printed, and `--allow-new-evaluation` is the deliberate
+/// act that proceeds.
+#[test]
+fn cycle_refuses_a_moved_evaluation_hash() {
+    let dir = scratch_dir("cycle-eval-hash");
+    // A ledger from an earlier iteration, judged under other conditions.
+    let stale = "a".repeat(64);
+    write(
+        &dir.join("loop.jsonl"),
+        &format!(
+            "{{\"kind\":\"evaluate\",\"inputs\":{{\"evaluation_hash\":\"{stale}\"}},\
+             \"outputs\":{{\"passed\":\"true\"}},\"created\":0}}\n"
+        ),
+    );
+    let out = run_cycle(CYCLE_RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let said = stderr_of(&out);
+    let now = hex(&es_ir::serial::evaluation_from_toml(
+        &std::fs::read_to_string(vl_fixture("evaluation.toml")).expect("evaluation.toml"),
+    )
+    .expect("the demo Evaluation IR parses")
+    .evaluation_hash()
+    .expect("evaluation_hash"));
+    assert!(said.contains(&stale), "the old hash is not named: {said}");
+    assert!(said.contains(&now), "the new hash is not named: {said}");
+
+    // Named deliberately, the same document proceeds.
+    let out = run_cycle(CYCLE_RECIPE, &dir, &["--dry-run", "--allow-new-evaluation"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+}
+
+/// Oracle 4. One real cycle on the demo fixtures: a 2-episode expert collect, the harness on
+/// the expert *before* the 40-step IR-route training, then the trained checkpoint through the
+/// same harness -- with `loop.jsonl` holding `collect`, `evaluate` (the gate), `train`,
+/// `evaluate`, in that order, chained.
+///
+/// `#[ignore]`d because it needs `ES_PYTHON` (torch, mujoco) and a Vulkan device; without
+/// either it prints why and stops rather than pretending (spec 1.4).
+#[test]
+#[ignore = "needs ES_PYTHON with torch and mujoco, and a render build"]
+fn cycle_runs_the_expert_through_the_harness_first() {
+    let name = "cycle_runs_the_expert_through_the_harness_first";
+    let Ok(python) = std::env::var("ES_PYTHON") else {
+        println!("SKIP {name}: ES_PYTHON is not set");
+        return;
+    };
+    if !cfg!(feature = "render") {
+        println!("SKIP {name}: built without the `render` feature, so --frames writes nothing");
+        return;
+    }
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP {name}: {reason}");
+        return;
+    }
+    let dir = scratch_dir("cycle-expert-first");
+    let bundle = write_demo_bundle(&dir);
+    let p = |path: &Path| train_toml_path(path);
+
+    // The demo's own Evaluation IR, cut to one suite and two of the pinned seeds the expert
+    // solves -- the same document the gate and the policy are both judged against.
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let task = es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml");
+    let obs =
+        es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml");
+    let mut ir = demo_evaluation_ir(
+        hex(&task.task_hash().expect("task hash")),
+        hex(&obs.observation_hash().expect("observation hash")),
+    );
+    ir.episodes = es_ir::evaluation::EpisodeBatch {
+        n_episodes: 2,
+        seeds: es_ir::evaluation::SeedPlan::Explicit(vec![SEEDS[0], SEEDS[1]]),
+    };
+    ir.suites.truncate(1);
+    let eval_config = dir.join("evaluation.toml");
+    write(
+        &eval_config,
+        &es_ir::serial::evaluation_to_toml(&ir).expect("the Evaluation IR serialises"),
+    );
+
+    let recipe = dir.join("training.toml");
+    write(
+        &recipe,
+        &format!(
+            "kind = \"training\"\n\
+             [dataset]\nroot = \"unused\"\n\
+             [policy]\nbundle = \"{}\"\n\
+             [run]\nsteps = 40\nbatch = 2\nlr = 1e-4\nseed = 0\ncheckpoint_at = [40]\n\
+             device = \"cpu\"\ninterpreter = \"{}\"\n",
+            p(&bundle),
+            p(Path::new(&python)),
+        ),
+    );
+    let document = dir.join("cycle.toml");
+    write(
+        &document,
+        &format!(
+            "kind = \"cycle\"\nscene = \"{}\"\n\
+             [collect]\npolicy = \"{}\"\nexpert = \"so101-pick-place\"\nepisodes = 2\n\
+             seed = 1\nframes = true\n\
+             [train]\nrecipe = \"{}\"\n\
+             [eval]\nconfig = \"{}\"\njobs = 1\nframes = true\n",
+            p(&demo_scene_path()),
+            p(&bundle),
+            p(&recipe),
+            p(&eval_config),
+        ),
+    );
+
+    let out = dir.join("run");
+    let run = bin()
+        .current_dir(train_root())
+        .args(["loop", "cycle", "--recipe", &p(&document), "--out"])
+        .arg(&out)
+        .output()
+        .expect("run es loop cycle");
+    let (said, err) = (stdout(&run), stderr_of(&run));
+    // 0 or 1: the acceptance of a 40-step policy is a measurement, not this oracle's subject.
+    // Anything else means a stage failed, and the gate's refusal is exit 1 with its own line.
+    assert!(
+        matches!(run.status.code(), Some(0 | 1)),
+        "stdout:\n{said}\nstderr:\n{err}"
+    );
+    assert!(
+        !err.contains("did not pass the evaluation harness"),
+        "the expert failed the harness, so nothing was trained (spec 28.9 rule 1):\n{err}"
+    );
+
+    let ledger = es_data::read_loop_steps(&out).expect("the cycle's ledger reads back");
+    let kinds: Vec<es_data::LoopKind> = ledger.iter().map(|s| s.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            es_data::LoopKind::Collect,
+            es_data::LoopKind::Evaluate,
+            es_data::LoopKind::Train,
+            es_data::LoopKind::Evaluate
+        ],
+        "stdout:\n{said}"
+    );
+    es_data::check_chain(&ledger).expect("the ledger chains");
+    // The gate is the evaluate step that names an expert, and it came before the train step.
+    assert_eq!(ledger[1].inputs["expert"], "so101-pick-place");
+    assert_eq!(ledger[1].outputs["passed"], "true");
+    assert_eq!(ledger[2].inputs["expert_gate"], "passed");
+    assert_eq!(ledger[0].outputs["content"], ledger[2].inputs["content"]);
+    let judged = &ledger[3].inputs["policy_hash"];
+    assert_eq!(ledger[2].outputs["checkpoint.40"], *judged);
+    assert!(out.join("eval").join("report.json").exists());
+    assert!(out.join("eval-expert").join("report.json").exists());
+    println!(
+        "RAN {name}: expert gate success_rate {}, policy success_rate {} at policy_hash {judged}",
+        ledger[1].outputs["success_rate"], ledger[3].outputs["success_rate"]
+    );
+}
+
 /// Oracle 4. Every refusal names the field that caused it (spec 17.2).
 #[test]
 fn train_refuses_by_name() {
@@ -7779,6 +7981,362 @@ fn train_ir_path_packs_a_bundle_torch_opens() {
     );
     assert_eq!(lock["checkpoints"][0]["step"].as_u64(), Some(40));
     println!("RAN train_ir_path_packs_a_bundle_torch_opens: training_hash {training_hash}");
+}
+
+// --- packet M7/E4: `es eval run --telemetry` publishes, a client attaches --------------------
+
+use es_telemetry::{Client, Message, Payload, StreamId};
+
+/// The demo documents with `max_episode_steps` cut to 60, one `es train` step to get a
+/// checkpoint `TorchRuntime` will actually load, and a one-suite, three-episode Evaluation IR:
+/// the smallest run that goes through the whole `es eval run` path -- `mujoco`, `torch`, one
+/// rendered 96x96 frame per control tick. `None`, with the reason printed, when this machine
+/// cannot run it.
+///
+/// The training step is not about training: the demo graph's `VisionEncoder` and
+/// `TemporalEncoder` lower to opaque torch sub-modules (`nodes.N.*` prefix claims), and
+/// `load_state_dict(strict=True)` refuses a synthetic checkpoint over them -- so the only
+/// checkpoint this path can open is one the trainer itself wrote. One step at `batch = 2` on
+/// the bake fixture is the cheapest such bundle, and what the policy learned in it does not
+/// matter to a telemetry oracle.
+///
+/// Three episodes rather than one because [`eval_telemetry_never_blocks_the_run`] has to
+/// overflow the loopback socket buffers with image frames (about 100 kB of JSON each): 180
+/// ticks is some 18 MB, well past what a loopback pair autotunes to.
+fn telemetry_run_inputs(test: &str, dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    if cfg!(not(feature = "render")) {
+        println!("SKIP {test}: built without the `render` feature");
+        return None;
+    }
+    let Ok(python) = std::env::var("ES_PYTHON") else {
+        println!("SKIP {test}: ES_PYTHON is not set, so nothing can train a checkpoint");
+        return None;
+    };
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP {test}: {reason}");
+        return None;
+    }
+    if let Err(reason) = es_policy::torch_runtime::is_available() {
+        println!("SKIP {test}: {reason}");
+        return None;
+    }
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let mut task = es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml");
+    task.config.max_episode_steps = 60;
+    let task_hash = task.task_hash().expect("task hashes");
+    let mut obs =
+        es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml");
+    obs.task_ref = task_hash;
+    let obs_hash = obs.observation_hash().expect("observation hashes");
+    let mut learning =
+        es_ir::serial::learning_from_toml(&read("learning.toml")).expect("learning.toml");
+    let weights = b"es-e4-untrained-placeholder".to_vec();
+    learning.policy.weights = WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let deploy =
+        es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml");
+    let bundle = es_compile::PolicyBundle::build(&task, &obs, &learning, &deploy, &weights)
+        .expect("the shortened demo documents pack");
+    let untrained = dir.join("untrained.esb");
+    std::fs::write(&untrained, bundle).expect("write untrained.esb");
+
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 2, 12);
+    let recipe = dir.join("training.toml");
+    write(
+        &recipe,
+        &train_fixture_recipe(&untrained, &root, &tiles, 0, "1e-4")
+            .replace("steps = 40", "steps = 1")
+            .replace("checkpoint_at = [40]", "checkpoint_at = [1]")
+            .replace(
+                "es-no-such-interpreter",
+                &train_toml_path(Path::new(&python)),
+            ),
+    );
+    let trained = bin()
+        .current_dir(train_root())
+        .args(["train", "--recipe", &train_toml_path(&recipe), "--out"])
+        .arg(dir.join("train"))
+        .output()
+        .expect("run es train");
+    assert_eq!(
+        trained.status.code(),
+        Some(0),
+        "es train:\n{}\n{}",
+        stdout(&trained),
+        stderr_of(&trained)
+    );
+    let policy = dir.join("train").join("checkpoints").join("1.esb");
+    assert!(policy.is_file(), "{}", policy.display());
+
+    let mut ir = demo_evaluation_ir(hex(&task_hash), hex(&obs_hash));
+    ir.suites.truncate(1);
+    assert_eq!(ir.suites[0].name, "nominal");
+    ir.episodes = EpisodeBatch {
+        n_episodes: 3,
+        seeds: SeedPlan::Explicit(vec![101, 102, 103]),
+    };
+    let config = dir.join("eval.toml");
+    write(
+        &config,
+        &es_ir::serial::evaluation_to_toml(&ir).expect("evaluation toml"),
+    );
+    Some((config, policy))
+}
+
+/// `es eval run --frames` on the inputs above, into `out`, plus whatever `extra` flags.
+fn telemetry_eval_run(config: &Path, policy: &Path, out: &Path, extra: &[&str]) -> Output {
+    let run = bin()
+        .args(["eval", "run", "--config"])
+        .arg(config)
+        .arg("--policy")
+        .arg(policy)
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .arg("--out")
+        .arg(out)
+        .arg("--frames")
+        .arg(out.join("frames"))
+        .args(extra)
+        .output()
+        .expect("run es eval run");
+    let text = format!("{}{}", stdout(&run), String::from_utf8_lossy(&run.stderr));
+    // Exit 1 is an acceptance criterion that did not hold, which an untrained policy earns;
+    // anything else is a real error. A run that exited 1 for any other reason wrote no
+    // report, and saying so here beats a missing-file panic further down.
+    assert!(
+        matches!(run.status.code(), Some(0 | 1)) && out.join("report.json").is_file(),
+        "exit {:?}, report.json {}\n{text}",
+        run.status.code(),
+        out.join("report.json").is_file()
+    );
+    run
+}
+
+/// A loopback port nobody is listening on, chosen here rather than left to
+/// `--telemetry 127.0.0.1:0`, whose port only exists once the run prints it: the client has
+/// to be connected and subscribed before the first cell, and retrying a known address until
+/// the run binds it has no window at all. The run still prints the address it bound -- which
+/// is what makes `:0` usable by hand -- and the assertion below reads that line.
+fn free_loopback_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("local addr")
+        .port()
+}
+
+/// Connects once the run has bound its server. The run binds before it opens the bundle,
+/// the scene or either Python interpreter, so this succeeds seconds before the first cell.
+fn connect_when_bound(addr: std::net::SocketAddr) -> Client {
+    let deadline = std::time::Instant::now() + Duration::from_secs(60);
+    loop {
+        match Client::connect(addr, None, "cli-test") {
+            Ok(client) => return client,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(e) => panic!("the run never bound {addr}: {e}"),
+        }
+    }
+}
+
+fn read_bytes(path: &Path) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+}
+
+/// Oracle 1. A client subscribed to streams 1-3 sees `cell.begin`/`cell.end` for every cell,
+/// one stream-2 frame per control tick with strictly increasing ticks inside each cell -- the
+/// same ticks `events.json` recorded -- and one `Metrics` frame per cell; and the run's
+/// `report.json` and `events.json` are byte-identical to a run without the flag.
+#[test]
+fn eval_telemetry_publishes_every_tick_in_order() {
+    const TEST: &str = "eval_telemetry_publishes_every_tick_in_order";
+    let dir = scratch_dir("eval-telemetry-order");
+    let Some((config, policy)) = telemetry_run_inputs(TEST, &dir) else {
+        return;
+    };
+    telemetry_eval_run(&config, &policy, &dir.join("plain"), &[]);
+
+    let port = free_loopback_port();
+    let addr = format!("127.0.0.1:{port}");
+    let socket: std::net::SocketAddr = addr.parse().expect("socket addr");
+    let received: std::sync::Arc<std::sync::Mutex<Vec<Message>>> = std::sync::Arc::default();
+    let reader = {
+        let received = std::sync::Arc::clone(&received);
+        std::thread::spawn(move || {
+            let mut client = connect_when_bound(socket);
+            client
+                .subscribe(vec![StreamId(1), StreamId(2), StreamId(3)])
+                .expect("subscribe");
+            // Drains until the run exits and the connection closes.
+            while let Ok(msg) = client.recv() {
+                received.lock().expect("received").push(msg);
+            }
+        })
+    };
+    let live = telemetry_eval_run(&config, &policy, &dir.join("live"), &["--telemetry", &addr]);
+    reader.join().expect("reader thread");
+    let text = stdout(&live);
+    assert!(text.contains(&format!("telemetry: {addr}")), "{text}");
+
+    for name in ["report.json", "events.json"] {
+        assert_eq!(
+            read_bytes(&dir.join("plain").join(name)),
+            read_bytes(&dir.join("live").join(name)),
+            "{name} differs with --telemetry"
+        );
+    }
+    let events: BTreeMap<String, Vec<es_eval::StepEvent>> = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("live/events.json")).expect("events"),
+    )
+    .expect("events.json parses");
+    let cells: Vec<&String> = events.keys().collect();
+    assert_eq!(cells, ["nominal-00", "nominal-01", "nominal-02"]);
+
+    let received = received.lock().expect("received");
+    let frames: Vec<&es_telemetry::Frame> = received
+        .iter()
+        .filter_map(|m| match m {
+            Message::Frame(f) => Some(f),
+            _ => None,
+        })
+        .collect();
+    assert!(!frames.is_empty(), "no frame arrived: {received:?}");
+
+    // Walk the stream in arrival order: a cell opens, its ticks follow, it closes with a
+    // metrics frame, and nothing is attributed to a cell that is not open.
+    let mut begun: Vec<String> = Vec::new();
+    let mut ended: Vec<String> = Vec::new();
+    let mut suites_ended = 0;
+    let mut open: Option<String> = None;
+    let mut ticks: BTreeMap<String, Vec<(u64, u64)>> = BTreeMap::new();
+    let mut metrics_after_end = 0;
+    for f in &frames {
+        match (&f.stream, &f.payload) {
+            (StreamId(1), Payload::Event { kind, fields }) => match kind.as_str() {
+                "cell.begin" => {
+                    assert!(open.is_none(), "cell.begin while {open:?} is open");
+                    assert_eq!(fields["suite"], "nominal", "{fields:?}");
+                    assert!(fields.contains_key("seed"), "{fields:?}");
+                    open = Some(fields["cell"].clone());
+                    begun.push(fields["cell"].clone());
+                }
+                "cell.end" => {
+                    assert_eq!(open.as_deref(), Some(fields["cell"].as_str()), "{fields:?}");
+                    assert!(fields.contains_key("outcome"), "{fields:?}");
+                    ended.push(fields["cell"].clone());
+                    open = None;
+                }
+                "suite.end" => {
+                    assert_eq!(fields["suite"], "nominal", "{fields:?}");
+                    assert!(fields.contains_key("metric.success_rate"), "{fields:?}");
+                    suites_ended += 1;
+                }
+                other => panic!("unexpected stream-1 event {other}"),
+            },
+            (StreamId(2), Payload::Scalars(v)) => {
+                let cell = open.clone().expect("a tick outside any cell");
+                assert_eq!(v.len(), 4, "[frame, tick, source, events]: {v:?}");
+                let (frame, tick) = (v[0] as u64, v[1] as u64);
+                let seen = ticks.entry(cell).or_default();
+                assert!(
+                    seen.last().is_none_or(|(_, last)| *last < tick),
+                    "ticks not strictly increasing: {seen:?} then {tick}"
+                );
+                seen.push((frame, tick));
+            }
+            (StreamId(3), Payload::Metrics(m)) => {
+                // Right after a `cell.end`, with the fields the run can fill and never a zero
+                // standing in for a number nobody measured (spec 12.4).
+                assert!(open.is_none(), "metrics inside an open cell");
+                assert!(m.actions_per_sec.is_some(), "{m:?}");
+                assert!(m.chunk_underrun_rate.is_some(), "{m:?}");
+                assert!(m.p50_end_to_end_latency.is_none(), "{m:?}");
+                assert!(m.gpu_memory_peak.is_none(), "{m:?}");
+                metrics_after_end += 1;
+            }
+            (stream, payload) => panic!("unexpected frame on stream {stream:?}: {payload:?}"),
+        }
+    }
+    assert_eq!(
+        begun,
+        cells.iter().map(|s| (*s).clone()).collect::<Vec<_>>()
+    );
+    assert_eq!(ended, begun);
+    assert_eq!(suites_ended, 1);
+    assert_eq!(metrics_after_end, cells.len());
+    // One stream-2 frame per control tick, carrying the very record `events.json` got for
+    // that step -- the nominal suite drops no observation, so the two sequences are the same
+    // and the live viewer's rows are the finished run's rows.
+    for (cell, records) in &events {
+        let want: Vec<(u64, u64)> = records.iter().map(|r| (r.frame, r.tick.0)).collect();
+        assert_eq!(ticks[cell], want, "cell {cell}");
+    }
+    println!(
+        "RAN {TEST}: {} frame(s) over {} cell(s)",
+        frames.len(),
+        cells.len()
+    );
+}
+
+/// Oracle 2. A client that subscribes to the image stream and then never reads: the run
+/// finishes, its report is unchanged, and the server counted dropped frames -- the producer
+/// never waited for the socket.
+#[test]
+fn eval_telemetry_never_blocks_the_run() {
+    const TEST: &str = "eval_telemetry_never_blocks_the_run";
+    let dir = scratch_dir("eval-telemetry-slow");
+    let Some((config, policy)) = telemetry_run_inputs(TEST, &dir) else {
+        return;
+    };
+    telemetry_eval_run(&config, &policy, &dir.join("plain"), &[]);
+
+    let port = free_loopback_port();
+    let addr = format!("127.0.0.1:{port}");
+    let socket: std::net::SocketAddr = addr.parse().expect("socket addr");
+    // Subscribes and returns the client without ever calling `recv`; the join below keeps it
+    // alive -- and its socket open, unread -- until the run is over.
+    let stalled = std::thread::spawn(move || {
+        let mut client = connect_when_bound(socket);
+        client
+            .subscribe(vec![StreamId(2), StreamId(4)])
+            .expect("subscribe");
+        client
+    });
+    let started = std::time::Instant::now();
+    let live = telemetry_eval_run(
+        &config,
+        &policy,
+        &dir.join("live"),
+        &["--telemetry", &addr, "--telemetry-image-every", "1"],
+    );
+    let elapsed = started.elapsed();
+    let _client = stalled.join().expect("stalled client thread");
+
+    assert_eq!(
+        read_bytes(&dir.join("plain/report.json")),
+        read_bytes(&dir.join("live/report.json")),
+        "report.json differs with a stalled client"
+    );
+    let text = stdout(&live);
+    let stats = text
+        .lines()
+        .find(|l| l.starts_with("telemetry:") && l.contains("dropped"))
+        .unwrap_or_else(|| panic!("no telemetry stats line:\n{text}"));
+    let words: Vec<&str> = stats.split_whitespace().collect();
+    let at = words
+        .iter()
+        .position(|w| *w == "dropped")
+        .expect("the word `dropped`");
+    let dropped: u64 = words[at - 1].parse().unwrap_or_else(|_| panic!("{stats}"));
+    assert!(
+        dropped > 0,
+        "a client that never reads must lose frames, not stall the run: {stats}"
+    );
+    println!("RAN {TEST}: {stats} ({elapsed:?})");
 }
 
 // --- packet M7/T4: the learning-rate schedule -------------------------------------------

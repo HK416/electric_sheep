@@ -17,12 +17,14 @@ use crate::atlas::{words_per_pixel, AtlasLayout, Tile, TileData};
 use crate::bvh::{Bvh, NODE_STRIDE};
 use crate::error::RenderError;
 use crate::scene::TriScene;
-use crate::view::{CameraView, RenderConfig, RenderPath, Shading, ViewParams, VIEW_STRIDE};
+use crate::view::{
+    CameraView, RenderConfig, RenderPath, Shading, Tonemap, ViewParams, VIEW_STRIDE,
+};
 
 /// Globals before the per-view records in the parameter buffer. Slots 0..20 are M4's and
-/// never move; 20..31 are packet M7/R2's shading block, appended at the end (`common.slang`
-/// mirrors both numbers).
-const PARAM_VIEW_BASE: usize = 31;
+/// never move; 20..31 are packet M7/R2's shading block and 31..37 packet M7/R3's `Pt` block,
+/// each appended at the end (`common.slang` mirrors every number).
+const PARAM_VIEW_BASE: usize = 37;
 /// Floats per direct-lighting reservoir (mirrors `restir.slang`).
 const RES_STRIDE: u64 = 8;
 const WORKGROUP: u32 = 8;
@@ -145,6 +147,9 @@ struct Pipelines<'gpu> {
     primary: ComputePipeline<'gpu>,
     restir: Option<[ComputePipeline<'gpu>; 3]>,
     svgf: Option<ComputePipeline<'gpu>>,
+    /// Linear radiance -> `Rgb8` on the `Pt` path (packet M7/R3). Its own dispatch, recorded
+    /// last, so it reads what `ReSTIR` and `SVGF` left rather than what the tracer wrote.
+    tonemap: Option<ComputePipeline<'gpu>>,
 }
 
 /// Keep and grow, never shrink (packet M7/R1 step 2). A frame that needs fewer bytes than the
@@ -216,10 +221,10 @@ impl<'gpu> Renderer<'gpu> {
             ComputePipeline::new(gpu, &module, &bindings(n_bindings))
         };
 
-        let (primary, restir, svgf) = match cfg.path {
-            RenderPath::Rs => (compile("raster.slang", "main", 7)?, None, None),
+        let (primary, restir, svgf, tonemap) = match cfg.path {
+            RenderPath::Rs => (compile("raster.slang", "main", 7)?, None, None, None),
             RenderPath::Pt { restir, svgf, .. } => {
-                let pt = compile("pt.slang", "main", 7)?;
+                let pt = compile("pt.slang", "main", 8)?;
                 let r = if restir {
                     Some([
                         compile("restir.slang", "initial", 9)?,
@@ -234,7 +239,12 @@ impl<'gpu> Renderer<'gpu> {
                 } else {
                     None
                 };
-                (pt, r, s)
+                let t = if cfg.channels.contains(&Channel::Rgb8) {
+                    Some(compile("pt.slang", "tonemap", 8)?)
+                } else {
+                    None
+                };
+                (pt, r, s, t)
             }
         };
 
@@ -246,6 +256,7 @@ impl<'gpu> Renderer<'gpu> {
                 primary,
                 restir,
                 svgf,
+                tonemap,
             },
             tris: Buffer::new(gpu, 4, Usage::Storage)?,
             params_buf: Buffer::new(gpu, 4, Usage::Storage)?,
@@ -337,6 +348,16 @@ impl<'gpu> Renderer<'gpu> {
             p[27..30].copy_from_slice(&ground_rgb);
             p[30] = f32::from_bits(cfg.shading.ssaa());
         }
+        // The `Pt` block (packet M7/R3). At the defaults every one of these is what the
+        // pre-R3 kernel behaved as: no NEE, a directional light with zero radiance, exposure
+        // 1, Reinhard.
+        p[31] = f32::from_bits(u32::from(cfg.nee()));
+        p[32..35].copy_from_slice(&cfg.light_rgb);
+        p[35] = cfg.exposure;
+        p[36] = f32::from_bits(match cfg.tonemap {
+            Tonemap::Reinhard => 0,
+            Tonemap::Aces => 1,
+        });
         for (i, cam) in cameras.iter().enumerate() {
             let base = PARAM_VIEW_BASE + i * VIEW_STRIDE;
             p[base..base + VIEW_STRIDE].copy_from_slice(&ViewParams::new(cam).to_floats());
@@ -403,14 +424,30 @@ impl<'gpu> Renderer<'gpu> {
         let depth = self.new_buffer(px)?;
         let seg = self.new_buffer(px)?;
         let normal = self.new_buffer(px * 3)?;
+        // The `Pt` path's packed `RGBA8` target (packet M7/R3). Allocated whenever the path
+        // is `Pt`, because `pt.slang` declares the binding for both its entry points; only
+        // the `tonemap` dispatch writes it, and only when `Rgb8` was asked for.
+        let pt_rgb8 = match self.cfg.path {
+            RenderPath::Rs => None,
+            RenderPath::Pt { .. } => Some(self.new_buffer(px)?),
+        };
 
         self.pipelines.primary.reset_descriptors()?;
         let mut rec = CommandRecorder::new(self.gpu)?;
-        rec.dispatch(
-            &self.pipelines.primary,
-            &[params, &self.tris, &color, &depth, &seg, &normal, hit_tri],
-            groups,
-        )?;
+        match &pt_rgb8 {
+            Some(rgb8) => rec.dispatch(
+                &self.pipelines.primary,
+                &[
+                    params, &self.tris, &color, &depth, &seg, &normal, hit_tri, rgb8,
+                ],
+                groups,
+            )?,
+            None => rec.dispatch(
+                &self.pipelines.primary,
+                &[params, &self.tris, &color, &depth, &seg, &normal, hit_tri],
+                groups,
+            )?,
+        }
 
         // `ReSTIR` DI: initial -> temporal -> spatial, one buffer written per pass. `spatial`
         // writes into the persistent previous-frame buffer, which `temporal` has already
@@ -496,6 +533,19 @@ impl<'gpu> Renderer<'gpu> {
             scratch = Some((other, iters));
         }
 
+        // Recorded last, after the swap above, so it reads whichever buffer holds the final
+        // radiance (spec 3.4: the recorded order *is* the execution order).
+        if let (Some(tm), Some(rgb8)) = (&self.pipelines.tonemap, &pt_rgb8) {
+            tm.reset_descriptors()?;
+            rec.dispatch(
+                tm,
+                &[
+                    params, &self.tris, &color, &depth, &seg, &normal, hit_tri, rgb8,
+                ],
+                groups,
+            )?;
+        }
+
         rec.submit_and_wait()?;
         drop(scratch);
         drop(keep_alive);
@@ -510,7 +560,12 @@ impl<'gpu> Renderer<'gpu> {
         };
         match self.cfg.path {
             RenderPath::Rs => put(Channel::Rgb8, color),
-            RenderPath::Pt { .. } => put(Channel::PtRadiance, color),
+            RenderPath::Pt { .. } => {
+                put(Channel::PtRadiance, color);
+                if let Some(rgb8) = pt_rgb8 {
+                    put(Channel::Rgb8, rgb8);
+                }
+            }
         }
         put(Channel::Depth32 { unit_m: 1.0 }, depth);
         put(Channel::SegmentationId, seg);

@@ -23,7 +23,7 @@ use crate::atlas::{Tile, TileData};
 use crate::bvh::{self, Bvh};
 use crate::rng;
 use crate::scene::{Tri, TriScene};
-use crate::view::{CameraView, RenderConfig, RenderPath, Shading, ViewParams};
+use crate::view::{CameraView, RenderConfig, RenderPath, Shading, Tonemap, ViewParams};
 
 /// Below this determinant a triangle is edge-on to the ray and is skipped.
 const DET_EPS: f32 = 1e-8;
@@ -418,6 +418,44 @@ pub fn to_u8(c: f32) -> u8 {
     (255.0 * srgb_encode(c) + 0.5).floor().clamp(0.0, 255.0) as u8
 }
 
+/// Linear radiance -> display value, one channel (packet M7/R3).
+///
+/// Additions, multiplies and one division: **no transcendental at all**, which is why the
+/// CPU and the GPU are asserted bit-equal here rather than to a ULP budget.
+/// `es_tonemap` in `common.slang` is the line-for-line mirror.
+pub fn tonemap(c: f32, exposure: f32, map: Tonemap) -> f32 {
+    let x = c * exposure;
+    match map {
+        // Reinhard et al. 2002. Monotone on [0, inf), never reaches 1, so it never clips.
+        Tonemap::Reinhard => x / (1.0 + x),
+        // Narkowicz 2015's rational ACES fit. Clamped: the fit dips below 0 for x < 0 and
+        // creeps past 1 at the top of its range.
+        Tonemap::Aces => {
+            let num = x * (2.51 * x + 0.03);
+            let den = x * (2.43 * x + 0.59) + 0.14;
+            (num / den).clamp(0.0, 1.0)
+        }
+    }
+}
+
+/// One linear RGB triple through [`tonemap`] and then the exact sRGB transfer of
+/// [`to_u8`] — the `Pt` path's [`Channel::Rgb8`].
+pub fn tonemap_to_u8(lin: [f32; 3], exposure: f32, map: Tonemap) -> [u8; 3] {
+    [0, 1, 2].map(|c| to_u8(tonemap(lin[c], exposure, map)))
+}
+
+/// Power heuristic with `beta = 2` (PBR 4e 13.10), over two solid-angle pdfs. `0` when both
+/// are zero, so a strategy that cannot have produced the sample contributes nothing.
+fn power_heuristic(a: f32, b: f32) -> f32 {
+    let (a2, b2) = (a * a, b * b);
+    let d = a2 + b2;
+    if d > 0.0 {
+        a2 / d
+    } else {
+        0.0
+    }
+}
+
 // --- frames ---------------------------------------------------------------------------------
 
 /// One camera's channels. The GPU path returns the same shapes through `Atlas::read_tile`.
@@ -626,6 +664,111 @@ fn cosine_hemisphere(n: [f32; 3], key: u32) -> [f32; 3] {
     ))
 }
 
+/// Solid-angle pdf of the light-sampling strategy for `light`, seen from a shading point
+/// `dist` away along `dir` (packet M7/R3): uniform over the `n_lights` emissive triangles,
+/// then uniform over the chosen triangle's area, converted to solid angle by
+/// `d^2 / |cos_l|`. `0` when the strategy cannot produce that direction at all.
+fn light_pdf(light: &Tri, dir: [f32; 3], dist2: f32, n_lights: f32) -> f32 {
+    let cos_l = dot(light.n, scale(dir, -1.0)).abs();
+    let area = tri_area(light);
+    if cos_l > 0.0 && area > 0.0 && n_lights > 0.0 {
+        dist2 / (cos_l * area * n_lights)
+    } else {
+        0.0
+    }
+}
+
+/// Next-event estimation at one diffuse hit, MIS-weighted against the BSDF strategy
+/// (packet M7/R3; PBR 4e 13.10). Returns the radiance to add *before* the throughput is
+/// multiplied by the albedo — the `f = albedo / pi` here is this surface's BRDF.
+///
+/// Three light kinds, each a fixed amount of work for every pixel of a given render (spec
+/// 3.4 forbids a data-dependent loop bound; the three `if`s below are on *config*, uniform
+/// across the dispatch, not on the pixel):
+///
+/// 1. **emissive triangles** — one pick uniform over the light list, then one uniform point
+///    on that triangle, one shadow ray, power-heuristic MIS against the BSDF strategy;
+/// 2. **the directional light** — a delta distribution, so no MIS is possible or needed:
+///    one shadow ray and the full contribution;
+/// 3. **the sky** — a cosine-weighted hemisphere direction and a shadow ray that has to
+///    *escape*. Its pdf is the BSDF's, so the power heuristic gives exactly 1/2 to each and
+///    the pair is a two-sample estimate of the same integral.
+///
+/// `keys` are the three RNG streams of `rng::key`'s table: 4 (light pick), 5 (area sample),
+/// 6 (sky direction).
+///
+/// `last` is the bounce budget's final vertex, where **the MIS weights are dropped**: no
+/// BSDF continuation is traced from there, so the complementary `w_bsdf` share would be lost
+/// rather than estimated elsewhere, and NEE has to carry the whole term. With it, next-event
+/// estimation at `B` bounces is an estimator of exactly what the BSDF-only path tracer
+/// estimates at `B + 1` — which is what `nee_converges_to_the_same_image` compares, and
+/// without it the two differ by ~4% of the mean radiance on Cornell.
+#[allow(clippy::too_many_arguments)]
+fn nee_direct(
+    scene: &TriScene,
+    bvh: &Bvh,
+    cfg: &RenderConfig,
+    p: [f32; 3],
+    n: [f32; 3],
+    albedo: [f32; 3],
+    far: f32,
+    last: bool,
+    keys: [u32; 3],
+) -> [f32; 3] {
+    let f = scale(albedo, std::f32::consts::FRAC_1_PI);
+    let mut out = [0.0f32; 3];
+
+    if !scene.lights.is_empty() {
+        let n_lights = scene.lights.len() as f32;
+        let pick = rng::uniform(keys[0], 0);
+        let idx = ((pick * n_lights) as usize).min(scene.lights.len() - 1);
+        let light = &scene.tris[scene.lights[idx] as usize];
+        let (lp, _, _) = tri_point(light, rng::uniform(keys[1], 0), rng::uniform(keys[1], 1));
+        let seg = sub(lp, p);
+        let dist2 = dot(seg, seg);
+        let dist = approx::sqrt(dist2);
+        if dist > 0.0 {
+            let dir = scale(seg, 1.0 / dist);
+            let cos_s = dot(n, dir);
+            let p_light = light_pdf(light, dir, dist2, n_lights);
+            if cos_s > 0.0 && p_light > 0.0 {
+                let w = if last {
+                    1.0
+                } else {
+                    power_heuristic(p_light, cos_s * std::f32::consts::FRAC_1_PI)
+                };
+                // `dist * (1 - 1e-3)` so the shadow ray stops short of the light itself.
+                if !any_hit(&scene.tris, bvh, p, dir, 0.0, dist * (1.0 - 1e-3)) {
+                    out = add(out, scale(mul(f, light.emission), cos_s / p_light * w));
+                }
+            }
+        }
+    }
+
+    if cfg.light_rgb.iter().any(|c| *c > 0.0) {
+        let l = [
+            cfg.light_dir.x as f32,
+            cfg.light_dir.y as f32,
+            cfg.light_dir.z as f32,
+        ];
+        let cos_s = dot(n, l);
+        if cos_s > 0.0 && !any_hit(&scene.tris, bvh, p, l, 0.0, SHADOW_FAR) {
+            out = add(out, scale(mul(f, cfg.light_rgb), cos_s));
+        }
+    }
+
+    if cfg.sky.iter().any(|c| *c > 0.0) {
+        let d = cosine_hemisphere(n, keys[2]);
+        let cos_s = dot(n, d);
+        let pdf = cos_s * std::f32::consts::FRAC_1_PI;
+        if pdf > 0.0 && !any_hit(&scene.tris, bvh, p, d, 0.0, far) {
+            let w = if last { 1.0 } else { power_heuristic(pdf, pdf) };
+            out = add(out, scale(mul(f, cfg.sky), cos_s / pdf * w));
+        }
+    }
+    out
+}
+
 /// Path-trace one view (spec 15.3 `PT`, spec 1.9 item 2).
 pub fn path_trace(
     scene: &TriScene,
@@ -642,6 +785,8 @@ pub fn path_trace(
         RenderPath::Pt { restir, svgf, .. } => (restir, svgf),
         RenderPath::Rs => (false, false),
     };
+    let nee = cfg.nee();
+    let n_lights = scene.lights.len() as f32;
 
     let mut radiance = vec![0.0f32; (w as usize) * (h as usize) * 3];
     for py in 0..h {
@@ -653,17 +798,54 @@ pub fn path_trace(
                 let mut o = vp.pos;
                 let mut d = primary_dir(&vp, px, py);
                 let mut near = vp.near;
+                // Solid-angle pdf of the BSDF sample that produced the current ray. The
+                // camera ray has none — no light-sampling strategy could have generated it,
+                // so its MIS weight is 1 and `cornell_pt1spp` does not move.
+                let mut prev_pdf = 0.0f32;
                 for bounce in 0..bounces {
                     let Some(hit) = nearest_hit(&scene.tris, &bvh, o, d, near, vp.far) else {
-                        acc = add(acc, mul(throughput, cfg.sky));
+                        // The sky through the BSDF strategy. Its NEE counterpart draws from
+                        // the same cosine pdf, so the power heuristic splits it in half.
+                        let w = if nee && bounce > 0 {
+                            power_heuristic(prev_pdf, prev_pdf)
+                        } else {
+                            1.0
+                        };
+                        acc = add(acc, scale(mul(throughput, cfg.sky), w));
                         break;
                     };
                     let tri = &scene.tris[hit.tri as usize];
-                    acc = add(acc, mul(throughput, tri.emission));
-                    throughput = mul(throughput, tri.albedo);
+                    // An emissive hit reached by a BSDF bounce: the light-sampling strategy
+                    // could have produced it too, so it is MIS-weighted against that pdf.
+                    let w_em = if nee && bounce > 0 {
+                        let p_light = light_pdf(tri, d, hit.t * hit.t, n_lights);
+                        power_heuristic(prev_pdf, p_light)
+                    } else {
+                        1.0
+                    };
+                    acc = add(acc, scale(mul(throughput, tri.emission), w_em));
                     let n = face_forward(tri, d);
-                    o = add(add(o, scale(d, hit.t)), scale(n, RAY_EPS));
+                    let p = add(add(o, scale(d, hit.t)), scale(n, RAY_EPS));
+                    if nee {
+                        let key =
+                            |stream| rng::key(cfg.seed, view_index, px, py, s, bounce, stream);
+                        let direct = nee_direct(
+                            scene,
+                            &bvh,
+                            cfg,
+                            p,
+                            n,
+                            tri.albedo,
+                            vp.far,
+                            bounce + 1 == bounces,
+                            [key(4), key(5), key(6)],
+                        );
+                        acc = add(acc, mul(throughput, direct));
+                    }
+                    throughput = mul(throughput, tri.albedo);
+                    o = p;
                     d = cosine_hemisphere(n, rng::key(cfg.seed, view_index, px, py, s, bounce, 0));
+                    prev_pdf = dot(n, d) * std::f32::consts::FRAC_1_PI;
                     near = 0.0;
                 }
             }
@@ -686,6 +868,21 @@ pub fn path_trace(
         height: h,
         channels: BTreeMap::new(),
     };
+    // The tone-mapped `Rgb8` (packet M7/R3), before `radiance` is moved into the tile.
+    if cfg.channels.contains(&Channel::Rgb8) {
+        let mut rgb = vec![0u8; (w as usize) * (h as usize) * 3];
+        for i in 0..(w as usize) * (h as usize) {
+            let lin = [radiance[i * 3], radiance[i * 3 + 1], radiance[i * 3 + 2]];
+            rgb[i * 3..i * 3 + 3].copy_from_slice(&tonemap_to_u8(lin, cfg.exposure, cfg.tonemap));
+        }
+        frame.channels.insert(
+            Channel::Rgb8,
+            Tile {
+                shape: [h as usize, w as usize, 3],
+                data: TileData::U8(rgb),
+            },
+        );
+    }
     if cfg.channels.contains(&Channel::PtRadiance) {
         frame.channels.insert(
             Channel::PtRadiance,
@@ -722,6 +919,17 @@ impl Reservoir {
             self.v = v;
         }
     }
+}
+
+/// A spatial-reuse neighbour that passed the geometric similarity test: where its reservoir
+/// is, its own shading point (pairwise MIS evaluates *its* target function, not only the
+/// destination's) and which RNG slot its resampling draw takes.
+struct Neighbour {
+    index: usize,
+    p: [f32; 3],
+    n: [f32; 3],
+    albedo: [f32; 3],
+    slot: u32,
 }
 
 /// Uniform point on a triangle from two canonical randoms.
@@ -763,14 +971,22 @@ fn di_contribution(
     (radiance, luminance(radiance))
 }
 
-/// Minimal textbook `ReSTIR` DI: initial candidates, temporal reuse, spatial reuse, then shade.
+/// `ReSTIR` DI: initial candidates, temporal reuse, spatial reuse, then shade.
 ///
-/// Skipped, and this is the list spec 28.6 fills in: MIS weights (the reuse is the biased
-/// `1/M` combination, not GRIS pairwise MIS), the bias-correction visibility re-test on
-/// reuse, `ReSTIR` GI entirely, light types other than emissive triangles, and reservoir ageing
-/// beyond the `M` clamp. Temporal reuse reads the previous frame at the *same* pixel — no
-/// motion-vector reprojection — so it is correct only for a static camera, and on the first
-/// frame the previous buffer is empty and the pass is a no-op.
+/// **The spatial reuse is unbiased** since packet M7/R3: the biased `1/M` combination is
+/// replaced by pairwise MIS (Wyman et al. 2023 section 5), so a neighbour whose target
+/// function is zero at the destination's sample — a light below its horizon, say — takes
+/// zero weight instead of inflating the divisor. The visibility test moved with it, from the
+/// survivor of the initial pass to the *finally selected* sample at the destination: still
+/// one shadow ray per pixel, but now the estimator is `f_shadowed(y) * W(y)` with `W` built
+/// from the unshadowed target, which is unbiased (`docs/design/renderer.md` section 10).
+///
+/// Skipped, still: `ReSTIR` GI entirely (this is direct lighting only), light types other
+/// than emissive triangles, and reservoir ageing beyond the `M` clamp. Temporal reuse reads
+/// the previous frame at the *same* pixel — no motion-vector reprojection — so its two
+/// candidates share one domain and `1/M` is already the correct weight there; it is correct
+/// only for a static camera, and on the first frame the previous buffer is empty and the
+/// pass is a no-op.
 #[allow(clippy::too_many_arguments)] // one more than seven: the BVH beside the triangles
 fn restir_di(
     scene: &TriScene,
@@ -801,7 +1017,8 @@ fn restir_di(
         Some((p, n, tri.albedo))
     };
 
-    // Pass 1: candidates + one shadow ray on the survivor.
+    // Pass 1: RIS over `RESTIR_CANDIDATES` candidates. No shadow ray: visibility is tested
+    // once, at the end, on the sample the spatial pass actually selects.
     for py in 0..h {
         for px in 0..w {
             let i = (py * w + px) as usize;
@@ -828,22 +1045,6 @@ fn restir_di(
             } else {
                 0.0
             };
-            if r.w > 0.0 {
-                let light = &scene.tris[r.tri as usize];
-                let (lp, _, _) = tri_point(light, r.u, r.v);
-                let seg = sub(lp, p);
-                let dist = approx::sqrt(dot(seg, seg));
-                if any_hit(
-                    &scene.tris,
-                    bvh,
-                    p,
-                    scale(seg, 1.0 / dist),
-                    0.0,
-                    dist * (1.0 - 1e-3),
-                ) {
-                    r.w = 0.0;
-                }
-            }
             initial[i] = r;
         }
     }
@@ -851,7 +1052,17 @@ fn restir_di(
     // Pass 2 (temporal) is a no-op in the CPU reference: it has no previous frame to read.
     // The GPU renderer keeps one, and `Renderer::render` documents the same caveat.
 
-    // Pass 3: spatial reuse over fixed neighbours.
+    // Pass 3: spatial reuse over the four fixed neighbours, combined with **pairwise MIS**.
+    //
+    // For techniques {canonical c} u {neighbours 1..N} and any sample X, the weights
+    //
+    //   m_i(X) = (1/N) * (M_i p_i(X)) / (M_i p_i(X) + M_c p_c(X))
+    //   m_c(X) = (1/N) * sum_i (M_c p_c(X)) / (M_i p_i(X) + M_c p_c(X))
+    //
+    // sum to one term by term, so they are valid MIS weights; `p_i` is neighbour `i`'s own
+    // target function, evaluated at *its* shading point. The resampling weight of a
+    // candidate is then `m * p_destination(X) * W`, and the combined contribution weight is
+    // `w_sum / p_destination(Y)` with no `1/M` and no `1/Z` left to divide by.
     for py in 0..h {
         for px in 0..w {
             let i = (py * w + px) as usize;
@@ -859,23 +1070,11 @@ fn restir_di(
                 continue;
             };
             let key = rng::key(cfg.seed, view_index, px, py, 0, 0, 2);
-            let mut combined = Reservoir::default();
-            let mut m_sum = 0.0;
-            let fold = |src: &Reservoir, slot: u32, combined: &mut Reservoir, m: &mut f32| {
-                if src.m <= 0.0 {
-                    return;
-                }
-                let (_, p_hat) = di_contribution(scene, p, n, albedo, src);
-                combined.update(
-                    src.tri,
-                    src.u,
-                    src.v,
-                    p_hat * src.w * src.m,
-                    rng::uniform(key, slot),
-                );
-                *m += src.m;
-            };
-            fold(&initial[i], 0, &mut combined, &mut m_sum);
+
+            // The neighbours that pass the geometric similarity test, each with its own
+            // shading point: pairwise MIS needs their target functions, not just their
+            // reservoirs. Fixed offsets, ascending, so the set is a function of the grid.
+            let mut nbrs: Vec<Neighbour> = Vec::new();
             for (k, (dx, dy)) in RESTIR_NEIGHBOURS.iter().enumerate() {
                 let (nx, ny) = (px as i32 + dx, py as i32 + dy);
                 if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
@@ -887,20 +1086,96 @@ fn restir_di(
                 let nn = g.normal[i * 3] * g.normal[j * 3]
                     + g.normal[i * 3 + 1] * g.normal[j * 3 + 1]
                     + g.normal[i * 3 + 2] * g.normal[j * 3 + 2];
-                if dz > 0.1 * g.depth[i].abs() || nn < 0.906 {
+                if dz > 0.1 * g.depth[i].abs() || nn < 0.906 || initial[j].m <= 0.0 {
                     continue;
                 }
-                fold(&initial[j], k as u32 + 1, &mut combined, &mut m_sum);
+                let Some((pj, nj, aj)) = hit_of(j, nx as u32, ny as u32) else {
+                    continue;
+                };
+                nbrs.push(Neighbour {
+                    index: j,
+                    p: pj,
+                    n: nj,
+                    albedo: aj,
+                    slot: k as u32 + 1,
+                });
             }
-            combined.m = m_sum.min(RESTIR_M_CLAMP * (1.0 + RESTIR_NEIGHBOURS.len() as f32));
+            let n_nbr = nbrs.len() as f32;
+            let centre = initial[i];
+            let mut combined = Reservoir::default();
+            let mut m_sum = 0.0f32;
+
+            if centre.m > 0.0 {
+                let (_, p_c) = di_contribution(scene, p, n, albedo, &centre);
+                let mut m_c = 0.0f32;
+                for nb in &nbrs {
+                    let (_, p_j) = di_contribution(scene, nb.p, nb.n, nb.albedo, &centre);
+                    let (a, b) = (centre.m * p_c, initial[nb.index].m * p_j);
+                    if a + b > 0.0 {
+                        m_c += a / (a + b);
+                    }
+                }
+                // No neighbour to share with: the canonical technique is the only one, and
+                // its weight is 1 (which reproduces plain RIS at this pixel).
+                m_c = if n_nbr > 0.0 { m_c / n_nbr } else { 1.0 };
+                combined.update(
+                    centre.tri,
+                    centre.u,
+                    centre.v,
+                    m_c * p_c * centre.w,
+                    rng::uniform(key, 0),
+                );
+                m_sum += centre.m;
+            }
+            for nb in &nbrs {
+                let src = initial[nb.index];
+                let (_, p_at_src) = di_contribution(scene, nb.p, nb.n, nb.albedo, &src);
+                let (_, p_at_dst) = di_contribution(scene, p, n, albedo, &src);
+                let (a, b) = (src.m * p_at_src, centre.m * p_at_dst);
+                let m_i = if a + b > 0.0 {
+                    a / (a + b) / n_nbr
+                } else {
+                    0.0
+                };
+                combined.update(
+                    src.tri,
+                    src.u,
+                    src.v,
+                    m_i * p_at_dst * src.w,
+                    rng::uniform(key, nb.slot),
+                );
+                m_sum += src.m;
+            }
+
             let (radiance, p_hat) = di_contribution(scene, p, n, albedo, &combined);
-            combined.w = if p_hat > 0.0 && combined.m > 0.0 {
-                combined.w_sum / (combined.m * p_hat)
+            combined.w = if p_hat > 0.0 {
+                combined.w_sum / p_hat
             } else {
                 0.0
             };
+            combined.m = m_sum.min(RESTIR_M_CLAMP * (1.0 + RESTIR_NEIGHBOURS.len() as f32));
+            // The reservoir keeps the *unshadowed* `W`, so temporal reuse next frame is
+            // still reusing the quantity the target function is defined over. Only this
+            // pixel's output is shadowed, by one ray towards the sample finally selected.
             spatial[i] = combined;
-            let shaded = scale(radiance, combined.w);
+            let mut vis = combined.w;
+            if vis > 0.0 {
+                let light = &scene.tris[combined.tri as usize];
+                let (lp, _, _) = tri_point(light, combined.u, combined.v);
+                let seg = sub(lp, p);
+                let dist = approx::sqrt(dot(seg, seg));
+                if any_hit(
+                    &scene.tris,
+                    bvh,
+                    p,
+                    scale(seg, 1.0 / dist),
+                    0.0,
+                    dist * (1.0 - 1e-3),
+                ) {
+                    vis = 0.0;
+                }
+            }
+            let shaded = scale(radiance, vis);
             out[i * 3..i * 3 + 3]
                 .copy_from_slice(&add(shaded, scene.tris[(g.tri[i] - 1) as usize].emission));
         }
@@ -1054,6 +1329,7 @@ mod tests {
         cfg.path = RenderPath::Pt {
             spp: 1,
             bounces: 2,
+            nee: false,
             restir: true,
             svgf: true,
         };

@@ -523,3 +523,249 @@ worth less than the editor starting.
 - **Editing an Observation IR node's parameters.** No factory owns those kinds (`INV-17`), so
   they have no `NodeSchema` and no inspector — the same boundary `Edit::SetParam` reports as
   `FACTORY-001`.
+
+---
+
+## 13. A run watched while it runs: `--telemetry` and `--attach` (§23.1, §23.3, M7/E4)
+
+§10 opens a run that has finished. This is the same run before it has: `es eval run
+--telemetry 127.0.0.1:7777` publishes what it is doing, and `es-editor --attach
+127.0.0.1:7777` — or the Telemetry tab's **Attach** field and **Connect** button — reads it.
+§23.1: the editor hosts nothing; it is a client of a running process.
+
+### The shared type is E1's
+
+`model/live_run.rs` folds the four streams into `CellRow` and `Timeline`, which are
+`run_view.rs`'s own types. That is the whole design decision: **the Run tab has one table, one
+strip, one set of headers and one selection**, and it does not know which end its rows came
+from. `run_table` picks the rows in one `match` at the top
+
+| | finished (§10) | live (this section) |
+|---|---|---|
+| rows | `RunView::cells()` | `LiveRun::cells()` |
+| headers | `RunView::columns()` | `LiveRun::columns()` |
+| strip | `RunView::timeline(cell)` | `LiveRun::timeline(cell)` |
+| heading | `report.passed` | `LiveRun::status()` |
+| frames | `frames/<cell>/NNNNNN.bin` | the latest stream-4 image |
+
+and everything below it is the same code. The oracle
+(`live_run_folds_streams_into_run_rows`) is the equality itself: E1's committed fixture run is
+replayed as the messages a live run would have sent, and the resulting rows, headers and
+timelines must equal what `RunView::open` makes of the same directory. Two folds of the same
+`StepEvent` bits exist — `RunView::timeline` reads `events.json`, `LiveRun::timeline` reads the
+wire — because `run_view.rs` is not E4's file to change; the oracle is what stops them
+drifting.
+
+Two things a live run cannot have. There is no **acceptance verdict**: `report.json` is
+written after the last suite, so the heading is `LiveRun::status()` (*"live: nominal-01
+running, 2 of 3 cell(s) finished"*) and the acceptance list is empty. And there is no
+**sorting**: a live table is in cell-name order because its rows are still arriving, so
+clicking a header does nothing until the run is opened from disk. Selection works on both, and
+until someone clicks, the selected cell *is* the running one — so an attached editor draws the
+live strip with nobody touching it.
+
+### The four streams
+
+Named in `docs/design/telemetry-protocol.md` §9 ("Producers"), which is where the wire shape
+belongs. A stream id is data, not schema: `protocol.rs` is frozen at its version.
+
+| Stream | Payload | When |
+|---|---|---|
+| 1 | `Event { cell.begin \| cell.end \| suite.end }` | at each episode boundary, and once per suite |
+| 2 | `Scalars[frame, tick, source, violation bits]` | every control tick that captured an observation |
+| 3 | `Metrics(PerfMetrics)` | at each `cell.end` |
+| 4 | `Image { rgb8 }` | every `--telemetry-image-every N` ticks (default `0`, never) |
+
+Stream 2 is the `StepEvent` `events.json` records, as four numbers — the same record, not a
+second measurement, which is why the live rows can be *equal* to the finished ones rather than
+merely similar. `source` is `es_data::ActionSourceCode`'s numbering (`Policy 0, Clamped 1,
+Fallback 2, Human 3`), so the dataset column and the wire agree.
+
+### What the producer refuses to do
+
+- **Block.** Every frame goes out through `Server::publish`, which `try_send`s into each
+  client's 16-deep queue and *drops* on a full one (`telemetry-protocol.md` §6). The oracle
+  `eval_telemetry_never_blocks_the_run` attaches a client that never reads a byte, floods it
+  with images, and requires the run to finish with its report unchanged and the server's
+  dropped count above zero.
+- **Compute anything extra.** The sink is handed what the run already had: the `StepEvent` the
+  plane produced, the plan's own image buffer (borrowed, not copied), the counters, the
+  `CellResult`s `record_cell` returned. Without the flag nothing binds and nothing changes —
+  `report.json` and `events.json` are byte-identical, which the order oracle asserts by
+  comparing two runs.
+- **Publish from more than one process.** `--telemetry` needs `--jobs 1`: a `--jobs N` run's
+  cells happen in worker processes and only one of them could own the address. Refused by name
+  rather than half-published.
+
+`es-eval` gains no dependency on `es-telemetry` for any of this — both are layer 10 and §4.2
+forbids a same-layer dependency. The evaluator calls a closure (`es_eval::runner::RunSink`, a
+closure and not an eighth extension point, `INV-17`); `crates/es/src/cmd/eval.rs` — the one
+crate that links both — turns a `RunEvent` into a wire `Frame`.
+
+### Gate 9: what publishing costs the run (§28.7, §23.4)
+
+`es eval run` on the demo documents (one suite, three episodes of 60 control ticks, 96×96
+frames rendered every tick, 190 frames published), `--jobs 1`, three runs each way with one
+attached subscriber draining every stream, **interleaved** (plain, telemetry, plain, …) so a
+box that gets busier during the measurement moves both arms rather than one. Ubuntu, RTX 4090,
+16 cores, load average 2.9–5.1 and GPU 0–17 % throughout (a neighbouring agent's run):
+
+| | run 1 | run 2 | run 3 | median |
+|---|---|---|---|---|
+| `es eval run`, release | 4.876 s | 4.281 s | 4.266 s | **4.281 s** |
+| `es eval run --telemetry`, release | 4.477 s | 4.288 s | 4.255 s | **4.288 s** |
+| `es eval run`, debug | 6.610 s | 6.538 s | 6.530 s | **6.538 s** |
+| `es eval run --telemetry`, debug | 6.698 s | 6.583 s | 6.577 s | **6.583 s** |
+
+**Observed overhead: +0.16 % release, +0.69 % debug** against §23.3's *"< 1 %"* — the gate
+holds on both, and the debug figure is the conservative one because the cost is `serde_json`
+encoding, which an unoptimized build pays several times over. Run 1 of each arm carries the
+cold page cache; the later pairs differ by under 50 ms on a 4.3 s run, the same order as the
+box's own noise. The script, the drainer and the logs are in `~/artifacts/plan-v/m7-e4/` on
+the oracle server.
+
+The number is an observation of this run shape, not a general figure: 190 frames of JSON over
+a loopback socket beside a control tick that renders a frame and runs a torch forward pass.
+A training loop publishing at a higher rate, or a graph view subscribing to a tensor stream,
+is a different measurement — `Target / Status: unverified` for those.
+
+### Not here
+
+- **No producer outside `es eval run`.** `es loop collect` and `es train` publish nothing yet;
+  the sink is `Evaluation::run_shard_with_sink`'s argument and nothing else calls it.
+- **No reconnect.** A dropped connection is a dead `Source`: `try_recv` returns nothing
+  forever and the tab keeps what it has. Attaching again is the Connect button.
+- **No replay of a live run.** The Replay panel poses a `.estraj`, which a run writes at each
+  episode's end; watching a live one would be a second trajectory transport, not this.
+- **The image stream is off by default.** One 96×96 frame is 27 kB of pixels and about 100 kB
+  as JSON; publishing one every tick is the flood the backpressure oracle uses on purpose.
+
+---
+
+## 14. The Launch section: the editor starts a run (§23.1, §13.1, M7/E5)
+
+§13 watches a run someone else started. This starts it — and does **not** become its host.
+§23.1 is the whole design: the editor is a **client of a running process**. It builds a
+command line, hands it to `std::process::Command`, and then dials the same process over the
+same socket a person with a terminal would have. Nothing is evaluated or trained in the
+editor's address space, and there is no code path in which it could be.
+
+### What the section is
+
+`model/launch.rs`, a `LaunchModel`, and about 70 lines of `app.rs` that draw it. One kind
+selector (`es eval run` / `es train` / `es loop cycle`), one text box per flag, the rendered
+command line read-only, **Start**, **Kill**, a status line and the child's last 200 lines.
+
+Every decision is in the model and none in `app.rs` (§28.10 rule 3): which flags a kind has
+(`fields()`, `flags()`), what each is called (`LaunchField::flag`, which is literally the
+CLI's spelling), what the command line reads as (`command_line()`), what the exit code means
+(`exit_meaning`), which `es` this is (`es_binary()`), and how long to wait for the producer's
+socket (`ATTACH_TRIES` × `ATTACH_DELAY`). `app.rs` draws a `for` loop over `fields()`.
+
+### `argv()` carries no `argv[0]`
+
+`argv()` is a **pure function of the fields**: no environment, no filesystem, no
+normalisation. That is what lets the three renderings be golden files —
+`tests/golden/editor/launch-{eval,train,cycle}.txt`, one argument per line — because the
+program is exactly the part that differs per machine. The panel shows
+`binary().path` + `argv()`; the child is started from the `Vec<String>` itself, never from
+the displayed string, so the quoting in the display is for reading and nothing else.
+
+One rule for every flag: **an empty value is not rendered.** `--frames` and `--jobs` simply
+disappear when nobody typed them, and a *required* flag left empty reaches the CLI as a
+missing flag — which `es` refuses by name with exit 2. The alternative, passing `--config ""`,
+would make the editor invent an error message the CLI does not have.
+
+### `es_binary()` — one rule, and it says which part answered
+
+| order | rule | `reason` |
+|---|---|---|
+| 1 | `ES_BIN`, if set and not blank | `ES_BIN` |
+| 2 | `es` (`es.exe`) beside the editor's own executable | `beside the editor` |
+| 3 | bare `es`, for `PATH` to resolve | `on PATH` |
+
+Rule 2 is the one that matters day to day: `cargo build -p es` and `cargo build -p es-editor`
+put both binaries in the same `target/<profile>`, so an editor built from this tree starts the
+`es` built from this tree rather than whatever is installed. The reason is shown in the idle
+status line, because "which `es` did that" is the first question a surprising result raises.
+`resolve()` takes the environment as two arguments, so the order is judged by a test without
+setting process-wide state.
+
+### The exit codes, in the model
+
+`eval.rs`, `train.rs` and `cycle.rs` document the same four, and `exit_meaning` is the one
+place the editor repeats them.
+
+| code | meaning |
+|---|---|
+| 0 | passed |
+| 1 | failed, or a runtime error |
+| 2 | usage error |
+| 3 | **skipped**: a backend or runtime this machine does not have — *nothing ran* (§1.4) |
+| other | ended without one of the documented codes (killed, or a crash) |
+
+3 is the row that has to be in a table rather than in someone's head: it is not a failure, and
+a panel that coloured it like one would be lying about §1.4.
+
+**A killed child is reported as killed, not as failed.** The exit code cannot say so on its
+own: `TerminateProcess` exits 1 on Windows, which is indistinguishable from a real failure,
+and a signal leaves no code at all on Unix (reported as `-1`, the last row). So `kill()` sets
+a flag and the status line reads `exit 1: killed from here` — the panel must not tell someone
+their run failed when they themselves ended it.
+
+### Attach follows launch
+
+`attach()` is `None` until the child is `Running` and `None` for a command whose `argv()`
+carries no `--telemetry` — which today is every `es train` and every `es loop cycle`
+(§13's "not here": nothing outside `es eval run` publishes). Once there is an address,
+`attach_source()` dials it through E4's `telemetry_view::attach` and the result replaces the
+Telemetry tab's `Source`. The editor connects as a client; there is no second path.
+
+`es eval run --telemetry` binds its server *before it opens anything*, but "before" is still
+after process creation and argument parsing, so `dial()` retries: `ATTACH_TRIES` = 20 attempts
+`ATTACH_DELAY` = 100 ms apart, about two seconds, then one error naming the address and the
+budget. A malformed address is **not** retried — it cannot become an address by waiting. The
+retry is in the model on purpose; a panel deciding how long to wait is a decision in `app.rs`.
+
+### The child never touches the UI thread
+
+`stdout` and `stderr` are piped and read by one thread each into a single `mpsc` channel;
+`poll()` drains it into a 200-line ring and `try_wait()`s the child, once a frame. The UI
+thread reads no pipe, so a child that floods one cannot stall a repaint and a child that
+writes nothing cannot block one. The one place `poll()` does block is right after `try_wait()`
+reports an exit: the pipes are at EOF, the reader threads are finishing, and `recv()` until
+they drop their senders is what keeps the last lines — the usage error, the `SKIPPED` reason —
+from being lost to whichever frame the exit landed in.
+
+### Pre-filling, and what it will not overwrite
+
+`prefill()` fills only the **empty** fields, from what the session already knows: `--policy`
+from the open bundle's path, `--out` from the *parent* of an open run directory (the next run
+is a sibling of the one being looked at), `--scene` from the Replay panel's scene field, and
+`--telemetry` from the Telemetry tab's attach address, defaulting to `127.0.0.1:7777`. Opening
+a second bundle therefore never throws away a half-filled form.
+
+### Not here
+
+- **Pause, step, reset, hot-patch** (§23.3). They need a control protocol and the run speaks
+  none, so `kill()` is the only control this packet can offer honestly. Offering a Pause that
+  did nothing would be worse than not offering one.
+- **A job queue, or more than one child.** Start is disabled while one is running.
+- **Remote hosts.** The child is local, because `std::process::Command` is local.
+- **Environment editing beyond `ES_BIN`.** The child inherits the editor's environment; a
+  panel that edited `PATH` or `ES_PYTHON` would be a second, worse shell.
+- **Clearing an opened run on attach.** With a finished run directory open, the Run tab's
+  table keeps showing *it* while a newly launched run publishes — the same behaviour E4's
+  Connect button already has (`run_table` matches the opened run first). Consistency with E4
+  was chosen over inventing a rule here; it is listed for the M7 review.
+
+### Goldens
+
+`tests/golden/editor/launch-{eval,train,cycle}.txt` were generated once by the `#[ignore]`d
+`generate_launch_goldens` and are read-only afterwards (§1.4). The generator **refuses to run
+unless `ES_GENERATE_GOLDENS=1` is set**: `cargo test -- --include-ignored` sweeps up every
+ignored test in the workspace, and a generator that rewrote its own goldens under that sweep
+would turn "the goldens still match" into a tautology (an M7 review item). The refusal prints
+and returns rather than failing, so the sweep itself still passes, and it is deliberately not
+a `SKIP` line — nothing is missing from the machine, and `cargo xtask ci`'s oracle scan must
+not count it as a reference oracle.

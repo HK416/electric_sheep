@@ -29,12 +29,13 @@ use crate::model::edit::{self, Edit, EditIr, EditSession};
 use crate::model::graph_view::{CrossEdge, LayerView, LayeredGraph, NodeView};
 use crate::model::image_view::{BeforeAfter, ImagePair, Rgb8Image};
 use crate::model::inspector::{Field, Inspector, Widget};
+use crate::model::launch::{Kind as LaunchKind, LaunchModel, State as LaunchState};
 use crate::model::palette::Palette;
 use crate::model::recent::{self, Kind, Recent};
 use crate::model::replay_view::{self, Camera, Projected, ReplayView};
 use crate::model::run_view::{Bucket, RunView};
 use crate::model::search::Search;
-use crate::model::telemetry_view::{Source, TelemetryModel};
+use crate::model::telemetry_view::{self, Source, TelemetryModel};
 
 const NODE_W: f32 = 178.0;
 const NODE_H: f32 = 40.0;
@@ -42,6 +43,8 @@ const NODE_H: f32 = 40.0;
 const PORT_R: f32 = 7.0;
 /// Telemetry messages drained per frame (spec 23.3 runs the viewer on a budget).
 const PUMP_BUDGET: usize = 256;
+/// Width of the Launch section's flag labels, so the text boxes line up.
+const FLAG_LABEL: Vec2 = Vec2::new(184.0, 18.0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
@@ -99,6 +102,13 @@ pub struct EditorApp {
     camera: Camera,
     telemetry: TelemetryModel,
     source: Source,
+    /// The Telemetry tab's Connect field, and the token beside it (spec 25.1). Typed here,
+    /// parsed and dialled by `telemetry_view::attach` (packet M7/E4).
+    attach_addr: String,
+    attach_token: String,
+    /// The Run tab's Launch section (packet M7/E5): the command line the editor is about to
+    /// start, and the child once it has. Every string it draws is the model's.
+    launch: LaunchModel,
     pan: Vec2,
     zoom: f32,
     /// `Some` while the Graph tab is in edit mode (spec 23.4 stage 2).
@@ -142,6 +152,9 @@ impl EditorApp {
             camera: SHOWCASE_CAMERA,
             telemetry: TelemetryModel::default(),
             source,
+            attach_addr: String::new(),
+            attach_token: String::new(),
+            launch: LaunchModel::default(),
             pan: Vec2::new(60.0, 40.0),
             zoom: 1.0,
             edit: None,
@@ -219,6 +232,14 @@ impl EditorApp {
         };
     }
 
+    /// What the status bar says before anything is opened — `es-editor --attach`'s result
+    /// (packet M7/E4). Applied after [`Self::with_path`], since attaching is the later news.
+    #[must_use]
+    pub fn with_status(mut self, status: String) -> Self {
+        self.status = status;
+        self
+    }
+
     /// Open a bundle or a run directory at startup (`es-editor <bundle.esb|run-dir>`).
     #[must_use]
     pub fn with_path(mut self, path: &str) -> Self {
@@ -248,6 +269,7 @@ impl EditorApp {
                 }
                 Err(e) => self.status = e.to_string(),
             }
+            self.prefill_launch();
             return;
         }
         match load(&path) {
@@ -287,12 +309,33 @@ impl EditorApp {
                 });
             }
         }
+        self.prefill_launch();
+    }
+
+    /// Hands the session's paths to the Launch section (packet M7/E5). *Which* flag each one
+    /// fills, and whether it may overwrite what is already typed, is
+    /// [`LaunchModel::prefill`]'s decision and not this file's.
+    fn prefill_launch(&mut self) {
+        let bundle = self
+            .opened
+            .is_some()
+            .then(|| PathBuf::from(self.path.trim()));
+        let run_dir = self.run.as_ref().map(|run| run.dir.clone());
+        self.launch.prefill(
+            bundle.as_deref(),
+            run_dir.as_deref(),
+            &self.scene_path,
+            &self.attach_addr,
+        );
     }
 }
 
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.telemetry.pump(&mut self.source, PUMP_BUDGET);
+        // A launched child's lines and its exit code (packet M7/E5). Once a frame, never
+        // blocking: the reader threads are what touch the pipes.
+        self.launch.poll();
 
         // A dropped file goes through the same function the text field does (packet M7/E3):
         // one way in means one set of errors out.
@@ -724,9 +767,15 @@ impl EditorApp {
     /// selected cell its Safety Plane timeline and a filmstrip. Every number, every order and
     /// every decoded byte is [`RunView`]'s; this turns them into widgets.
     fn run_tab(&mut self, ui: &mut egui::Ui) {
-        if self.run.is_none() {
+        // The Launch section is above the table and there whether or not anything is open:
+        // starting a run is how the tab gets something to show (packet M7/E5).
+        egui::TopBottomPanel::top("launch")
+            .resizable(true)
+            .default_height(400.0)
+            .show_inside(ui, |ui| self.launch_panel(ui));
+        if self.run.is_none() && self.telemetry.live.is_empty() {
             ui.label(
-                "Open a run directory - one holding report.json - to see its cells (spec 10.5).",
+                "Open a run directory - one holding report.json - to see its cells (spec 10.5),                  or attach to a running `es eval run --telemetry <addr>` from the Telemetry tab.",
             );
             return;
         }
@@ -753,14 +802,41 @@ impl EditorApp {
     fn run_table(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let Self {
-            run: Some(run),
+            run,
             run_frames,
+            telemetry,
             ..
-        } = self
-        else {
-            return;
+        } = self;
+        // **One table, two ends** (design note section 13). A finished run's rows come off
+        // disk and a live one's off the wire, but both are `CellRow`s and a `Timeline`, so
+        // everything below this match is the same code for either -- and none of it decides
+        // anything: the rows, the headings and the strip are the models' (spec 28.10 rule 3).
+        let live = &telemetry.live;
+        let (columns, rows, selected, heading, acceptance) = match run.as_ref() {
+            Some(run) => (
+                run.columns(),
+                run.cells().to_vec(),
+                run.selected_cell().map(|c| c.name.clone()),
+                if run.report.passed {
+                    "Acceptance: passed (spec 10.2)".to_owned()
+                } else {
+                    "Acceptance: failed (spec 10.2)".to_owned()
+                },
+                run.acceptance().to_vec(),
+            ),
+            // A live run has no verdict yet: `report.json` is written after the last suite.
+            None => (
+                live.columns(),
+                live.cells(),
+                live.selected_cell(),
+                live.status(),
+                Vec::new(),
+            ),
         };
-        let columns = run.columns();
+        let timeline = selected.as_ref().map(|cell| match run.as_ref() {
+            Some(run) => run.timeline(cell),
+            None => live.timeline(cell),
+        });
         let mut sort = None;
         let mut select = None;
         // Everything below is one scroll area, so a short window clips nothing: the table, the
@@ -777,8 +853,7 @@ impl EditorApp {
                     ui.label("traj");
                     ui.label("frames");
                     ui.end_row();
-                    let selected = run.selected_cell().map(|c| c.name.clone());
-                    for row in run.cells() {
+                    for row in &rows {
                         let is_selected = selected.as_deref() == Some(row.name.as_str());
                         if ui.selectable_label(is_selected, &row.name).clicked() {
                             select = Some(row.name.clone());
@@ -795,24 +870,19 @@ impl EditorApp {
                 });
 
                 ui.separator();
-                ui.heading(if run.report.passed {
-                    "Acceptance: passed (spec 10.2)"
-                } else {
-                    "Acceptance: failed (spec 10.2)"
-                });
-                for line in run.acceptance() {
+                ui.heading(&heading);
+                for line in &acceptance {
                     let (text, colour) = acceptance_row(line);
                     ui.colored_label(colour, text);
                 }
 
-                let Some(cell) = run.selected_cell().map(|c| c.name.clone()) else {
+                let (Some(cell), Some(timeline)) = (selected.as_ref(), timeline.as_ref()) else {
                     ui.separator();
                     ui.label("Select a cell for its Safety Plane timeline and frames (spec 23.3).");
                     return;
                 };
                 ui.separator();
-                let timeline = run.timeline(&cell);
-                ui.heading(timeline.heading(&cell));
+                ui.heading(timeline.heading(cell));
                 // One column per ~4 px of the strip; the model folds the frames into them.
                 let n = (ui.available_width() / 4.0) as usize;
                 paint_timeline(ui, &timeline.buckets(n));
@@ -822,16 +892,40 @@ impl EditorApp {
 
                 ui.separator();
                 ui.heading("Frames");
+                // A live run has no filmstrip on disk: what it has is the observation frame
+                // the producer is publishing right now (stream 4), uploaded once per image
+                // rather than once per repaint.
+                let Some(run) = run.as_ref() else {
+                    if let Some(image) = live.image() {
+                        let key = format!("live#{}", live.images());
+                        if !run_frames.contains_key(&key) {
+                            run_frames.clear();
+                            run_frames.insert(key.clone(), rgb_texture(&ctx, &key, image));
+                        }
+                        if let Some(texture) = run_frames.get(&key) {
+                            let scale = (160.0 / texture.size_vec2().x).max(1.0);
+                            ui.image(egui::load::SizedTexture::new(
+                                texture.id(),
+                                texture.size_vec2() * scale,
+                            ));
+                        }
+                    } else {
+                        ui.label(
+                            "no observation image on the wire (es eval run                              --telemetry-image-every N publishes one every N ticks)",
+                        );
+                    }
+                    return;
+                };
                 // Eight thumbnails are wider than a narrow window; scroll them sideways rather
                 // than cutting the last ones off.
                 egui::ScrollArea::horizontal()
                     .id_salt("filmstrip")
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            for index in run.filmstrip(&cell, FILMSTRIP) {
+                            for index in run.filmstrip(cell, FILMSTRIP) {
                                 let key = format!("{cell}#{index}");
                                 let texture = run_frames.entry(key.clone()).or_insert_with(|| {
-                                    let image = run.frame(&cell, index).unwrap_or(Rgb8Image {
+                                    let image = run.frame(cell, index).unwrap_or(Rgb8Image {
                                         width: 1,
                                         height: 1,
                                         data: vec![0, 0, 0],
@@ -850,11 +944,101 @@ impl EditorApp {
                         });
                     });
             });
-        if let Some(column) = sort {
+        // Sorting is a finished run's: a live table is in cell-name order and its rows are
+        // still arriving. Selecting works on either.
+        if let (Some(column), Some(run)) = (sort, run.as_mut()) {
             run.sort_by(column);
         }
         if let Some(name) = select {
-            run.select(&name);
+            match run.as_mut() {
+                Some(run) => run.select(&name),
+                None => telemetry.live.select(&name),
+            }
+        }
+    }
+
+    /// The Launch section (packet M7/E5, spec 23.1): the editor is a **client**, so this
+    /// starts a child process and attaches to it — it hosts nothing.
+    ///
+    /// Wiring only. Which flags the chosen kind has, what each is called, what the command
+    /// line reads as, what the exit code means and how long to wait for the producer's socket
+    /// are all [`LaunchModel`]'s, under test (spec 28.10 rule 3). There is no Pause and no
+    /// Step: the run speaks no control protocol (spec 23.3), so Kill is the only control.
+    fn launch_panel(&mut self, ui: &mut egui::Ui) {
+        let mut start = false;
+        let running = matches!(self.launch.state(), LaunchState::Running { .. });
+        ui.horizontal(|ui| {
+            for kind in LaunchKind::ALL {
+                ui.selectable_value(&mut self.launch.kind, kind, kind.label());
+            }
+            ui.separator();
+            start = ui
+                .add_enabled(!running, egui::Button::new("Start"))
+                .clicked();
+            if ui.add_enabled(running, egui::Button::new("Kill")).clicked() {
+                self.launch.kill();
+            }
+            ui.separator();
+            ui.label(self.launch.status_line());
+        });
+        // One `horizontal` per flag rather than an `egui::Grid`: a grid caps a cell at the
+        // column width it measured last frame, which squeezes a `TextEdit` down to the
+        // default interact size and never lets it grow back.
+        for field in self.launch.fields() {
+            ui.horizontal(|ui| {
+                ui.add_sized(FLAG_LABEL, egui::Label::new(field.flag()));
+                ui.add(
+                    egui::TextEdit::singleline(self.launch.field_mut(*field))
+                        .hint_text(field.hint())
+                        .desired_width(620.0),
+                );
+            });
+        }
+        ui.horizontal(|ui| {
+            for flag in self.launch.flags() {
+                let label = flag.flag();
+                ui.checkbox(self.launch.flag_mut(*flag), label);
+            }
+        });
+        // The command line, read-only: what is about to run, in one place, so nobody has to
+        // guess which `es` or which flags the panel decided on.
+        let mut command = self.launch.command_line();
+        ui.add(
+            egui::TextEdit::singleline(&mut command)
+                .desired_width(f32::INFINITY)
+                .interactive(false),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("launch-lines")
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for line in self.launch.lines() {
+                    ui.monospace(line);
+                }
+            });
+        if start {
+            self.start_launch();
+        }
+    }
+
+    /// Start, then attach. In that order and only in that order: the editor dials a producer
+    /// that exists (spec 23.1), so the address comes from [`LaunchModel::attach_source`],
+    /// which answers `None` until the child is running and does its own bounded waiting for
+    /// the socket.
+    fn start_launch(&mut self) {
+        self.launch.start();
+        self.status = self.launch.status_line();
+        match self.launch.attach_source() {
+            Some(Ok(source)) => {
+                self.telemetry = TelemetryModel::default();
+                self.source = source;
+                self.status = format!("started and attached: {}", self.launch.status_line());
+            }
+            Some(Err(e)) => self.status = e,
+            // A command that publishes nothing (`es train`, `es loop cycle`) is watched
+            // through its output lines, which is all it offers.
+            None => {}
         }
     }
 
@@ -982,6 +1166,32 @@ impl EditorApp {
 
     fn telemetry_tab(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical().show(ui, |ui| {
+            // Spec 23.1: the editor attaches to a running process. The address and the token
+            // are typed here and dialled by the model, which owns every error string.
+            ui.horizontal(|ui| {
+                ui.label("Attach");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.attach_addr)
+                        .hint_text("127.0.0.1:7777")
+                        .desired_width(160.0),
+                );
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.attach_token)
+                        .hint_text("token (optional)")
+                        .password(true)
+                        .desired_width(160.0),
+                );
+                if ui.button("Connect").clicked() {
+                    match telemetry_view::attach(&self.attach_addr, &self.attach_token) {
+                        Ok(source) => {
+                            self.source = source;
+                            self.status = format!("attached to {}", self.attach_addr.trim());
+                        }
+                        Err(e) => self.status = e,
+                    }
+                }
+            });
+            ui.separator();
             ui.heading("Performance (spec 12.4)");
             egui::Grid::new("metrics").striped(true).show(ui, |ui| {
                 for (name, value) in self.telemetry.metric_rows() {

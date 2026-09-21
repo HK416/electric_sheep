@@ -5,6 +5,8 @@ pub mod edit;
 pub mod graph_view;
 pub mod image_view;
 pub mod inspector;
+pub mod launch;
+pub mod live_run;
 pub mod palette;
 pub mod recent;
 pub mod replay_view;

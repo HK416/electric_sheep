@@ -107,6 +107,74 @@ impl Default for RunConfig {
 pub type FrameSource<'a> =
     dyn FnMut(&LightOverride, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> + 'a;
 
+/// Where a run says, as it happens, what it just did (packet M7/E4).
+///
+/// A plain closure and not a trait (`INV-17` allows seven extension points and this is none
+/// of them), taking a *borrowed* description of one moment of the run. Nothing here knows
+/// about a socket or a wire frame: `es-telemetry` is layer 10 exactly like this crate and
+/// §4.2 forbids a same-layer dependency, so the caller — `es eval run`, which links both —
+/// turns a [`RunEvent`] into an `es_telemetry::protocol::Frame`. With no sink the run is
+/// byte-for-byte what it was before: `report.json` and `events.json` are written from the
+/// same numbers whether anyone is listening or not.
+pub type RunSink<'a> = dyn FnMut(RunEvent<'_>) + 'a;
+
+/// One moment of a running evaluation, for a [`RunSink`].
+///
+/// "Cell" here is the on-disk cell — one *episode* of one suite, named `<suite>-<NN>`, which
+/// is what `events.json`, `frames/<cell>/` and `traj/<cell>.estraj` all key on. The §10.1
+/// table's row is the *suite*, which is what [`RunEvent::SuiteEnd`] carries.
+#[derive(Debug)]
+pub enum RunEvent<'a> {
+    /// One episode starts, with the identity a viewer needs to name its row.
+    CellBegin {
+        cell: &'a str,
+        suite: &'a str,
+        seed: u64,
+        episode: u64,
+    },
+    /// The observation image this tick captured, borrowed from the plan's own input buffer —
+    /// the bytes the renderer wrote, not a second render and not a copy. `shape` is the
+    /// plan's declared `[h, w, c]`.
+    Observation {
+        cell: &'a str,
+        tick: PhysTick,
+        shape: &'a [u64],
+        bytes: &'a [u8],
+    },
+    /// One control tick that captured an observation, as the same [`StepEvent`] `events.json`
+    /// records for it — the plane's own verdict, not a re-derivation.
+    Tick { cell: &'a str, event: StepEvent },
+    /// The episode is over and its files are written.
+    CellEnd { cell: &'a str, end: CellEnd },
+    /// Every episode of one suite is done and [`record_cell`] has judged it: the §10.1 row,
+    /// before the report exists.
+    SuiteEnd {
+        suite: &'a str,
+        results: &'a [CellResult],
+    },
+}
+
+/// What one finished episode leaves behind, for the §12.4 metric set a live viewer shows.
+///
+/// Every number is one the run already had: nothing is measured for telemetry's sake, and a
+/// field the run cannot fill honestly is absent rather than zero (§12.4).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CellEnd {
+    /// Control ticks the episode ran.
+    pub steps: u64,
+    /// Policy invocations: one per re-plan period (§8.4), which is `steps / replan` rounded up
+    /// because the submission condition is `step % replan == 0`.
+    pub inferences: u64,
+    /// Frames written under `frames/<cell>/`; `0` without `--frames`.
+    pub frames: u64,
+    /// Whether a `traj/<cell>.estraj` was written beside them.
+    pub traj: bool,
+    /// `SafetyCounters::chunk_underrun_rate` as it stands at the end of this episode (§10.3).
+    pub chunk_underrun_rate: f64,
+    /// `es_env::Termination` as it spells itself.
+    pub outcome: String,
+}
+
 /// Where the emitted action came from, as `es video mosaic` spells it.
 ///
 /// The same four outcomes `es-data` writes into a dataset's `action_source` column
@@ -389,11 +457,53 @@ impl Evaluation {
         obs: &ObservationIr,
         policy: &mut dyn PolicyRuntime,
         deploy: &DeploymentIr,
+        new_backend: F,
+        cfg: &RunConfig,
+        frames: Option<&mut FrameSource<'_>>,
+        frames_dir: Option<&Path>,
+        shard: (u32, u32),
+    ) -> Result<Shard, EvalError>
+    where
+        B: PhysicsBackend,
+        F: FnMut() -> B,
+    {
+        Self::run_shard_with_sink::<B, F, NJ, H>(
+            ir,
+            task,
+            scene,
+            obs,
+            policy,
+            deploy,
+            new_backend,
+            cfg,
+            frames,
+            frames_dir,
+            shard,
+            None,
+        )
+    }
+
+    /// [`Self::run_shard`] with a [`RunSink`]: the same run, saying what it does as it does it
+    /// (packet M7/E4).
+    ///
+    /// A separate entry point rather than a twelfth argument on the old one so that every
+    /// caller that does not publish keeps compiling unchanged — and so that "no sink" is the
+    /// shape the sequential path still takes, which is what makes the artifacts identical
+    /// with and without `--telemetry`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_shard_with_sink<B, F, const NJ: usize, const H: usize>(
+        ir: &EvaluationIr,
+        task: &TaskIr,
+        scene: &SceneDesc,
+        obs: &ObservationIr,
+        policy: &mut dyn PolicyRuntime,
+        deploy: &DeploymentIr,
         mut new_backend: F,
         cfg: &RunConfig,
         mut frames: Option<&mut FrameSource<'_>>,
         frames_dir: Option<&Path>,
         shard: (u32, u32),
+        mut sink: Option<&mut RunSink<'_>>,
     ) -> Result<Shard, EvalError>
     where
         B: PhysicsBackend,
@@ -503,6 +613,14 @@ impl Evaluation {
                 // arm and the cube did, tick by tick, so the run can be re-rendered from an
                 // independent camera without re-running the physics (packet M5/V9).
                 let mut traj = cfg.traj_dir.as_ref().map(|_| Trajectory::new(env.model()));
+                if let Some(sink) = sink.as_deref_mut() {
+                    sink(RunEvent::CellBegin {
+                        cell: &name,
+                        suite: &suite.name,
+                        seed: *seed,
+                        episode: idx as u64,
+                    });
+                }
                 let episode = run_episode::<B, NJ, H>(
                     &mut env,
                     &mut plan,
@@ -526,9 +644,27 @@ impl Evaluation {
                     cell_frames.as_mut(),
                     traj.as_mut(),
                     &mut events,
+                    &name,
+                    sink.as_deref_mut(),
                 )?;
                 if let (Some(dir), Some(traj)) = (cfg.traj_dir.as_ref(), &traj) {
                     traj.write(&dir.join(format!("{name}.estraj")))?;
+                }
+                if let Some(sink) = sink.as_deref_mut() {
+                    // Announced only once the episode's own files are on disk, so a viewer
+                    // that reads them on hearing this finds them there.
+                    let steps = episode.steps() as u64;
+                    sink(RunEvent::CellEnd {
+                        cell: &name,
+                        end: CellEnd {
+                            steps,
+                            inferences: steps.div_ceil(replan.max(1)),
+                            frames: cell_frames.as_ref().map_or(0, |c| c.n),
+                            traj: cfg.traj_dir.is_some(),
+                            chunk_underrun_rate: safety.counters().chunk_underrun_rate(),
+                            outcome: format!("{:?}", episode.termination),
+                        },
+                    });
                 }
                 if frames_dir.is_some() {
                     out.events.insert(name, events);
@@ -545,6 +681,13 @@ impl Evaluation {
                 safety.counters(),
                 &env_metrics,
             ));
+            if let Some(sink) = sink.as_deref_mut() {
+                let results = &out.cells.last().expect("just pushed").results;
+                sink(RunEvent::SuiteEnd {
+                    suite: &suite.name,
+                    results,
+                });
+            }
         }
         Ok(out)
     }
@@ -722,6 +865,8 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     mut cell_frames: Option<&mut CellFrames>,
     mut traj: Option<&mut Trajectory>,
     events: &mut Vec<StepEvent>,
+    cell_name: &str,
+    mut sink: Option<&mut RunSink<'_>>,
 ) -> Result<Episode, EvalError> {
     let (nu, nq, nv) = {
         let m = env.model();
@@ -776,11 +921,16 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     let mut ctrl = vec![0.0; nu];
 
     let mut frame_idx: Option<u64> = None;
+    // Observations captured so far, which is what `CellFrames` counts when `--frames` is on
+    // and the same dense index a `StepEvent` calls its `frame` -- kept here too so a run
+    // that writes no frames still has the number (packet M7/E4).
+    let mut captured = 0u64;
     for step in 0..max_steps {
         let dropped = step_state.drop_observation();
-        if dropped && !ring.is_empty() {
-            extra_age += 1;
-        } else {
+        // Read before the ring is touched below: whether *this* step captured an observation
+        // is what decides both the disk record and the live one.
+        let captured_now = !dropped || ring.is_empty();
+        if captured_now {
             // Recorded where the frame is captured, not where the tick begins, so trajectory
             // index and frame index are the same number even under `observation_delay` --
             // which is what lets a replay be compared to the recorded frames (packet M5/V9).
@@ -797,6 +947,23 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
                 cell_frames.as_deref_mut(),
             )?;
             frame_idx = rendered;
+            captured += 1;
+            // The observation image on its way to the policy, borrowed where it already
+            // lives: the sink sees the plan's own input bytes, so a live viewer and the
+            // network see one frame, never two renders (packet M7/E4).
+            if let Some(sink) = sink.as_deref_mut() {
+                if let Some(i) = names
+                    .iter()
+                    .position(|(n, ..)| matches!(sources.get(n), Some(Capture::Image)))
+                {
+                    sink(RunEvent::Observation {
+                        cell: cell_name,
+                        tick: env.tick(),
+                        shape: &names[i].2,
+                        bytes: &bytes[i],
+                    });
+                }
+            }
             let inputs: BTreeMap<String, TensorRef<'_>> = names
                 .iter()
                 .zip(&bytes)
@@ -817,6 +984,8 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
                 ring[ring_cursor] = out;
                 ring_cursor = (ring_cursor + 1) % ring.len();
             }
+        } else {
+            extra_age += 1;
         }
         // The oldest frame in the ring is the delayed observation (§10.2 `observation_delay`).
         let observed = &ring[if ring.len() > obs_delay {
@@ -874,13 +1043,25 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         // One record per frame that reached disk, carrying the plane's own verdict on the step
         // that frame was captured for (design note section 8). A step whose observation was
         // dropped rendered nothing, so it adds no record and the two stay the same length.
-        if let Some(frame) = frame_idx.take() {
-            events.push(StepEvent {
-                frame,
-                tick: env.tick(),
-                source: safe.source.into(),
-                events: safe.events.bits(),
-            });
+        let record = StepEvent {
+            frame: captured.saturating_sub(1),
+            tick: env.tick(),
+            source: safe.source.into(),
+            events: safe.events.bits(),
+        };
+        if frame_idx.take().is_some() {
+            events.push(record);
+        }
+        // The same record, to whoever is watching -- on every captured tick, whether or not
+        // the frames reached disk (packet M7/E4). A step whose observation the perturbation
+        // dropped rendered nothing and records nothing, exactly as `events.json` has it.
+        if let Some(sink) = sink.as_deref_mut() {
+            if captured_now {
+                sink(RunEvent::Tick {
+                    cell: cell_name,
+                    event: record,
+                });
+            }
         }
 
         // `nu == NJ` was checked at run start, so this is a copy, not a broadcast.
