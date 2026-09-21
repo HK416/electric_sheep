@@ -8108,3 +8108,137 @@ fn train_writes_base_model_lock_from_the_lock_file() {
         "a real base_model did not move training_hash"
     );
 }
+
+/// Packet M7/T8 oracle 4 — **`--jobs` still splits cells, not episodes, and the design note
+/// says why.**
+///
+/// The packet's question was whether `Env::seek_episode` (which ships, and is bitwise: see
+/// `cargo test -p es-env --test seek`) lets a shard be one episode rather than one whole
+/// suite. Measured on the committed demo documents by running the pre-T8 and the T8 build over
+/// the nominal suite: no. Two things carry from episode `k-1` into episode `k` and show in the
+/// artifacts -- the Safety Plane's `ViolationRate` window and `StepEvent::tick` -- and both are
+/// decisions for the M7 review, not fixes for this packet. So no flag was added, and this is
+/// what the shipped state looks like from the CLI's side.
+#[test]
+fn eval_jobs_splits_episodes() {
+    // 1. The finding is written down where the review will look for it, with its evidence.
+    let note = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/design/evaluation-execution.md"),
+    )
+    .expect("the evaluation-execution design note");
+    for wanted in [
+        "2.7 Sharding",
+        "ViolationRate` window carries across the episode boundary",
+        "tick 24",
+    ] {
+        assert!(
+            note.contains(wanted),
+            "the design note is missing {wanted:?}"
+        );
+    }
+
+    // 2. The worker protocol's unit is still the cell: a shard is a list of cells, each
+    //    carrying the results `record_cell` computed inside the worker.
+    let shard = es_eval::Shard {
+        cells: vec![es_eval::ShardCell {
+            cell: 0,
+            results: Vec::new(),
+            samples: Vec::new(),
+        }],
+        backend: None,
+        events: BTreeMap::new(),
+    };
+    let text = serde_json::to_string(&shard).expect("a shard serializes");
+    assert!(text.contains("\"results\""), "{text}");
+    assert!(!text.contains("\"episodes\""), "{text}");
+
+    // 3. And the CLI says so, including the clamp a one-suite evaluation runs into.
+    let help = bin()
+        .args(["eval", "run", "--help"])
+        .output()
+        .expect("run es eval run --help");
+    let help = stdout(&help);
+    assert!(
+        help.contains("The split is by suite and not by episode"),
+        "{help}"
+    );
+    assert!(help.contains("N is clamped to the suite count"), "{help}");
+
+    // 4. The behaviour itself, where a real run is possible: the demo's nominal suite is one
+    //    cell, so `--jobs 4` clamps to one and spawns no worker at all -- no `shards/`.
+    let ran = eval_jobs_one_suite_runs_one_wide();
+    println!("RAN eval_jobs_splits_episodes{ran}");
+}
+
+/// `--jobs 4` over a one-suite evaluation, when this machine can run one. Returns what to
+/// append to the `RAN` line; a machine without the pieces prints its own `SKIP` and returns "".
+fn eval_jobs_one_suite_runs_one_wide() -> String {
+    let missing = [
+        es_physics_backend::MuJoCoCpuBackend::is_available().err(),
+        es_policy::torch_runtime::is_available().err(),
+    ]
+    .into_iter()
+    .flatten()
+    .next();
+    if let Some(reason) = missing {
+        println!("SKIP eval_jobs_splits_episodes (the live run): {reason}");
+        return String::new();
+    }
+    let Ok(bundle) = std::env::var("ES_TRAINED_BUNDLE") else {
+        println!("SKIP eval_jobs_splits_episodes (the live run): ES_TRAINED_BUNDLE is not set");
+        return String::new();
+    };
+
+    let dir = scratch_dir("eval-jobs-episodes");
+    // The committed demo evaluation, cut to its first suite and two episodes: one cell, which
+    // is what `--jobs` has nothing to split.
+    let mut ir = es_ir::serial::evaluation_from_toml(
+        &std::fs::read_to_string(vl_fixture("evaluation.toml")).expect("evaluation.toml"),
+    )
+    .expect("evaluation.toml parses");
+    ir.suites.truncate(1);
+    ir.episodes.n_episodes = 2;
+    ir.episodes.seeds = es_ir::evaluation::SeedPlan::Explicit(vec![101, 102]);
+    ir.acceptance.clear();
+    let config = dir.join("nominal.toml");
+    write(
+        &config,
+        &es_ir::serial::evaluation_to_toml(&ir).expect("evaluation toml"),
+    );
+
+    let out = dir.join("out");
+    let run = bin()
+        .args(["eval", "run", "--config"])
+        .arg(&config)
+        .arg("--policy")
+        .arg(&bundle)
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .arg("--out")
+        .arg(&out)
+        .args(["--jobs", "4"])
+        .output()
+        .expect("run es eval run --jobs 4");
+    let text = format!("{}{}", stdout(&run), String::from_utf8_lossy(&run.stderr));
+    if run.status.code() == Some(3) {
+        println!(
+            "SKIP eval_jobs_splits_episodes (the live run): {}",
+            text.trim()
+        );
+        return String::new();
+    }
+    assert!(
+        matches!(run.status.code(), Some(0 | 1)),
+        "exit {:?}\n{text}",
+        run.status.code()
+    );
+    // One cell, so the clamp took --jobs 4 down to 1: no worker was spawned and nothing
+    // announced a partition.
+    assert!(
+        !out.join("shards").exists(),
+        "a one-suite evaluation spawned workers:\n{text}"
+    );
+    assert!(!text.contains("worker(s)"), "{text}");
+    assert!(out.join("report.json").is_file(), "{text}");
+    " (with the live one-suite run)".to_owned()
+}

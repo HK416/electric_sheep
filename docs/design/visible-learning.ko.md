@@ -1189,6 +1189,15 @@ env별 에피소드 카운터를 증가시킨다(`crates/es-env/src/env.rs:224`)
 둘 중 하나다. 에피소드 카운터를 임의 위치로 옮기는 것은 `es-env` 변경이고, 이 패킷은 그것을 스스로
 금지한다.
 
+> **패킷 M7/T8이 다시 물었고, 답은 바뀌지 않았다.** 장애물의 절반은 사라졌다. `Env::seek_episode`가
+> 들어왔고, seek한 env는 데모 씬과 커밋된 Task IR에서 재생한 env와 비트 단위로 같다
+> (`cargo test -p es-env --test seek -- --ignored`, 오라클 서버 2026-09-21, `k ∈ {1, 3, 7}`,
+> `.estraj` 포함). 나머지 절반은 `es-env`의 문제가 아니다. 같은 커밋된 데모 문서 위에서 T8 이전
+> 빌드와 T8 빌드의 `es eval run`을 돌려 보니 산출물이 두 군데에서 움직였다. Safety Plane의
+> `ViolationRate` 링이 `begin_episode`를 넘어 살아남고, `StepEvent::tick`이 셀 전체에 누적되는
+> 물리 클럭이다. 그래서 단위는 셀로 남았고 플래그는 추가하지 않았다. 증거와 측정된 차이, 그리고
+> 리뷰가 내려야 할 두 결정은 `docs/design/evaluation-execution.ko.md` 2.7절에 있다.
+
 반면 **셀**은 진짜로 독립적이다. 자기 `Env`, 자기 `SafetyPlane`, 0에서 시작하는 `seq`, 첫 에피소드를
 포함한 모든 에피소드에서의 `plan.reset()`. 셀들이 공유하는 것은 두 가지뿐이다. 컴파일된 `CpuPlan`
 — 에피소드마다 reset되므로 새로 컴파일한 plan과 reset한 plan은 같은 plan이다 — 과 `PolicyRuntime`.
