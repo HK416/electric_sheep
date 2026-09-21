@@ -8609,6 +8609,7 @@ fn train_writes_base_model_lock_from_the_lock_file() {
         "python",
         &["python".to_owned()],
         None,
+        false,
     )
     .expect("the plan builds");
     let lock = es_data::training::Backbone {
@@ -8639,6 +8640,7 @@ fn train_writes_base_model_lock_from_the_lock_file() {
         "python",
         &facts,
         None,
+        None,
     )
     .expect("pre_run");
     let with = es_data::training::Training::pre_run(
@@ -8648,6 +8650,7 @@ fn train_writes_base_model_lock_from_the_lock_file() {
         "python",
         &facts,
         Some(&lock),
+        None,
     )
     .expect("pre_run");
     let slot: serde_json::Value =

@@ -2015,6 +2015,133 @@ fn baked_observation_ir(task_ref: [u8; 32]) -> ObservationIr {
     ir
 }
 
+/// `baked_observation_ir` with the demo's augmentation chain on the image path (packet
+/// M7/T6): `Pad(p) -> Augment{RandomCrop IMG x IMG, training_only}`, the pair
+/// `tests/fixtures/visible-learning/observation-augmented.toml` carries at 96x96.
+fn augmented_observation_ir(task_ref: [u8; 32], pad: u32) -> ObservationIr {
+    let mut ir = baked_observation_ir(task_ref);
+    let scaled = ir.outputs["rgb"].ty.clone();
+    let spec = scaled.image.expect("the image port carries a spec");
+    let padded_spec = es_ir::image::ImageSpec {
+        width: spec.width + 2 * pad,
+        height: spec.height + 2 * pad,
+        intrinsics: es_ir::image::Intrinsics {
+            cx: spec.intrinsics.cx + f64::from(pad),
+            cy: spec.intrinsics.cy + f64::from(pad),
+            ..spec.intrinsics
+        },
+        ..spec
+    };
+    let padded = PortType {
+        shape: Shape::new([
+            3,
+            u64::from(padded_spec.height),
+            u64::from(padded_spec.width),
+        ]),
+        image: Some(padded_spec),
+        ..scaled.clone()
+    };
+    ir.graph.insert(
+        NodeId(7),
+        ObservationNode::Pad {
+            left: pad,
+            top: pad,
+            right: pad,
+            bottom: pad,
+            io: Io::unary(scaled.clone(), padded.clone()),
+        },
+    );
+    ir.graph.insert(
+        NodeId(8),
+        ObservationNode::Augment {
+            kind: es_ir::observation::AugmentKind::RandomCrop {
+                width: IMG,
+                height: IMG,
+            },
+            training_only: true,
+            io: Io::unary(padded, scaled.clone()),
+        },
+    );
+    ir.graph.connect(NodeId(2), "out", NodeId(7), "in0");
+    ir.graph.connect(NodeId(7), "out", NodeId(8), "in0");
+    ir.outputs.insert(
+        "rgb".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(NodeId(8), "out"),
+            ty: scaled,
+        },
+    );
+    ir
+}
+
+/// Oracle 3 of packet M7/T6. `--for-training` writes the tensor *entering* the augmentation
+/// chain — the padded canvas — and the chain beside it; without it the same document bakes
+/// the network's input, at the network's size, byte-identical to the un-augmented document's
+/// bake. The boundary is the whole claim: everything before the chain still runs here.
+#[test]
+fn bake_for_training_writes_the_boundary() {
+    let task = privileged_task_ir();
+    let hash = task.task_hash().expect("task hashes");
+    let plain = baked_observation_ir(hash);
+    let obs = augmented_observation_ir(hash, 4);
+
+    let shape_of = |bake: &es_eval::ObservationBake| -> Vec<u64> {
+        bake.outputs()
+            .find(|(n, _, _)| *n == "rgb")
+            .map(|(_, _, s)| s.to_vec())
+            .expect("an rgb port")
+    };
+    let state: Vec<f64> = (0..8).map(|i| f64::from(i) * 0.05).collect();
+    let mut tile = |_: &str| {
+        Ok((0..IMG as usize * IMG as usize * 3)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect::<Vec<u8>>())
+    };
+
+    let mut evaluation =
+        es_eval::ObservationBake::new(&obs, &task, Some(&model())).expect("the bake compiles");
+    assert_eq!(
+        shape_of(&evaluation),
+        vec![3, u64::from(IMG), u64::from(IMG)]
+    );
+
+    let mut training =
+        es_eval::ObservationBake::new(&obs, &task, Some(&model())).expect("the bake compiles");
+    let chains = training.for_training(&obs).expect("one chain");
+    assert_eq!(chains.len(), 1, "{chains:?}");
+    assert_eq!(chains["rgb"].len(), 1);
+    assert_eq!(
+        shape_of(&training),
+        vec![3, u64::from(IMG) + 8, u64::from(IMG) + 8],
+        "--for-training did not write the chain's input"
+    );
+
+    // Without the flag: the un-augmented document's bytes, exactly. The centre crop of a
+    // symmetric pad is the image that went in (INV-14, INV-15).
+    let mut unaugmented =
+        es_eval::ObservationBake::new(&plain, &task, Some(&model())).expect("the bake compiles");
+    assert_eq!(
+        evaluation.frame(&state, &mut tile).expect("a frame")["rgb"],
+        unaugmented.frame(&state, &mut tile).expect("a frame")["rgb"],
+        "the augmented document's evaluation bake moved a pixel"
+    );
+    // ...and the training bake is the same pixels in a bigger canvas: the interior matches.
+    let padded = training.frame(&state, &mut tile).expect("a frame")["rgb"].clone();
+    assert_eq!(padded.data.len(), 3 * (IMG as usize + 8).pow(2) * 4);
+    println!(
+        "RAN bake_for_training_writes_the_boundary: {:?} at the boundary, {:?} at the network",
+        shape_of(&training),
+        shape_of(&evaluation)
+    );
+
+    // A document with no `training_only` node is untouched by the flag -- which is what makes
+    // `--for-training` safe to pass for every recipe.
+    let mut same =
+        es_eval::ObservationBake::new(&plain, &task, Some(&model())).expect("the bake compiles");
+    assert!(same.for_training(&plain).expect("no chain").is_empty());
+    assert_eq!(shape_of(&same), vec![3, u64::from(IMG), u64::from(IMG)]);
+}
+
 /// A policy that keeps every observation map it was handed, so the test can compare what the
 /// *inference* path computed against what the bake computes from the same raw values.
 #[derive(Debug, Default)]

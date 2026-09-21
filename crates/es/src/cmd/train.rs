@@ -158,19 +158,46 @@ fn lerobot_trainer(interpreter: &str) -> Vec<String> {
 /// run, which is what lets `--dry-run` be judged with neither dataset nor bundle on disk
 /// (packet M7/T1 oracle 1).
 pub(crate) fn plan_of(recipe: &Recipe, out: &Path) -> Result<Plan, CliError> {
+    plan_with(recipe, out, None)
+}
+
+/// [`plan_of`] for a caller that has already opened the policy's Observation IR.
+///
+/// It is the same plan plus the two flags packet M7/T6's `training_only` chain adds — the
+/// bake's `--for-training` and the trainer's `--augmentation`. The IR route only reaches
+/// this with `Some` on a real run, because `--dry-run` deliberately does not open the bundle.
+fn plan_with(
+    recipe: &Recipe,
+    out: &Path,
+    observation: Option<&ObservationIr>,
+) -> Result<Plan, CliError> {
     let route = recipe.route().map_err(|e| bad(e.to_string()))?;
     let interpreter = interpreter_of(recipe);
     let trainer = lerobot_trainer(&interpreter);
-    let external_obs = match route {
-        Route::External => Some(open_observation(recipe)?),
-        Route::Ir => None,
+    let external_obs = match (route, observation) {
+        (Route::External, None) => Some(open_observation(recipe)?),
+        _ => None,
+    };
+    let observation = observation.or(external_obs.as_ref());
+    let augmented = match observation {
+        Some(obs) => !es_compile::plan::augmentation_chains(obs)
+            .map_err(|d| {
+                bad(d
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"))
+            })?
+            .is_empty(),
+        None => false,
     };
     Plan::build(
         recipe,
         out,
         &interpreter,
         &trainer,
-        external_obs.as_ref().map(state_dim),
+        observation.map(state_dim),
+        augmented,
     )
     .map_err(|e| bad(e.to_string()))
 }
@@ -189,10 +216,9 @@ pub(crate) fn run(
     let recipe = recipe.clone();
     let route = recipe.route().map_err(|e| bad(e.to_string()))?;
     let interpreter = interpreter_of(&recipe);
-    let plan = plan_of(&recipe, out)?;
 
     if dry_run {
-        let text = plan.render(out);
+        let text = plan_of(&recipe, out)?.render(out);
         print!("{text}");
         let path = out.join("training").join("plan.txt");
         write_file(&path, text.as_bytes())?;
@@ -219,6 +245,10 @@ pub(crate) fn run(
         (None, Some(o)) => o,
         (None, None) => unreachable!("one of the two routes always resolves an Observation IR"),
     };
+    // The plan, now that the document the augmentation chain lives in is open (packet M7/T6).
+    // `--dry-run` above builds it without one on the IR route, which is what lets a plan be
+    // printed on a machine that has neither the bundle nor the dataset.
+    let plan = plan_with(&recipe, out, Some(observation))?;
     if has_image_input(observation) && recipe.dataset.frames.is_none() {
         return Err(bad(
             "the Observation IR has an image input and [dataset] `frames` is not set; a run \
@@ -277,9 +307,16 @@ pub(crate) fn run(
 
     // --- the identity, before a single GPU-second ----------------------------------------
     let training_dir = out.join("training");
-    let mut training =
-        Training::pre_run(&recipe, &plan, out, &interpreter, &facts, backbone.as_ref())
-            .map_err(|e| bad(e.to_string()))?;
+    let mut training = Training::pre_run(
+        &recipe,
+        &plan,
+        out,
+        &interpreter,
+        &facts,
+        backbone.as_ref(),
+        Some(observation),
+    )
+    .map_err(|e| bad(e.to_string()))?;
     training
         .write(&training_dir)
         .map_err(|e| bad(e.to_string()))?;

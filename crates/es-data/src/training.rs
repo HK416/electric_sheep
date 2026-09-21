@@ -24,8 +24,9 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use es_compile::plan::{augmentation_chains, AugmentStep};
 use es_ir::learning::{LearningGraph, LearningNode};
-use es_ir::observation::{ObservationIr, ObservationNode};
+use es_ir::observation::{AugmentKind, ObservationIr, ObservationNode};
 use es_ir::DatasetHash;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -152,6 +153,11 @@ pub struct Run {
     pub batch: u32,
     pub lr: f64,
     pub seed: u64,
+    /// The seed of the augmentation RNG (packet M7/T6), `[run] seed` when it is absent.
+    /// Separate because it is separable: re-drawing the augmentation of an otherwise
+    /// identical run is a different run, and spec 19.3 gives it its own `seed.json` slot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub augmentation_seed: Option<u64>,
     /// Optimizer steps to also keep a checkpoint at. `steps` is always one of them.
     #[serde(default)]
     pub checkpoint_at: Vec<u32>,
@@ -424,6 +430,45 @@ pub fn has_image_input(obs: &ObservationIr) -> bool {
         .any(|n| matches!(n, ObservationNode::ImageInput { .. }))
 }
 
+/// One `training_only` chain as JSON — the list `training/augmentation.json` carries and the
+/// list `es dataset bake --for-training` writes into its manifest, written once here so the
+/// trainer reads one shape from either file (packet M7/T6).
+///
+/// `node` is the Observation IR node id, and it is not decoration: it is the `node_index`
+/// coordinate of the augmentation RNG's key, so two ports' chains draw different streams at
+/// the same sample and step (`python/es/augment.py`, design note section 13).
+pub fn augmentation_json(chain: &[AugmentStep]) -> Value {
+    Value::Array(
+        chain
+            .iter()
+            .map(|step| {
+                let mut entry = match step.kind {
+                    AugmentKind::RandomCrop { width, height } => {
+                        json!({"kind": "RandomCrop", "width": width, "height": height})
+                    }
+                    AugmentKind::ColorJitter {
+                        brightness,
+                        contrast,
+                        saturation,
+                        hue,
+                    } => json!({
+                        "kind": "ColorJitter", "brightness": brightness, "contrast": contrast,
+                        "saturation": saturation, "hue": hue,
+                    }),
+                    AugmentKind::RandomErasing { probability } => {
+                        json!({"kind": "RandomErasing", "probability": probability})
+                    }
+                    AugmentKind::GaussianNoise { sigma } => {
+                        json!({"kind": "GaussianNoise", "sigma": sigma})
+                    }
+                };
+                entry["node"] = json!(step.node.0);
+                entry
+            })
+            .collect(),
+    )
+}
+
 /// Does the Learning IR declare a pretrained backbone? Then the recipe owes
 /// `[policy] base_model` (packet M7/T5).
 pub fn has_pretrained_backbone(learning: &LearningGraph) -> bool {
@@ -600,12 +645,18 @@ impl Plan {
     /// point beside the interpreter when there is one, otherwise the interpreter and
     /// `-m lerobot.scripts.lerobot_train`. Nothing on disk is read here, so `--dry-run` works
     /// on a machine that has neither the dataset nor the bundle.
+    /// `augmented` is whether the policy's Observation IR carries a `training_only` chain
+    /// (packet M7/T6). It is a *fact about the bundle*, not a recipe field: the bake is told
+    /// to write the chain's boundary and the trainer is told to apply it, or neither is and
+    /// the plan is the plan of before, word for word. `--dry-run` on the IR route does not
+    /// open the bundle, so it passes `false` and prints the un-augmented line.
     pub fn build(
         recipe: &Recipe,
         out: &Path,
         interpreter: &str,
         trainer: &[String],
         state_dim: Option<usize>,
+        augmented: bool,
     ) -> Result<Self, DataError> {
         let route = recipe.route()?;
         let marks = recipe.marks()?;
@@ -625,6 +676,9 @@ impl Plan {
                 if let Some(frames) = &recipe.dataset.frames {
                     bake.push(s("--frames"));
                     bake.push(frames.clone());
+                }
+                if augmented {
+                    bake.push(s("--for-training"));
                 }
                 bake.push(recipe.dataset.root.clone());
                 steps.push(Step {
@@ -686,6 +740,20 @@ impl Plan {
                             .base_model
                             .iter()
                             .flat_map(|path| [s("--init-backbone"), path.clone()]),
+                    )
+                    // The chain the bake left at the boundary (packet M7/T6). The file is
+                    // spec 19.3's own `augmentation.json`, so what the trainer applies and
+                    // what `identity_hash` names are one file, not two descriptions of one.
+                    .chain(
+                        augmented
+                            .then(|| {
+                                [
+                                    s("--augmentation"),
+                                    under(out, "training/augmentation.json"),
+                                ]
+                            })
+                            .into_iter()
+                            .flatten(),
                     )
                     // Last, because `[run] extra` is by definition what comes after everything
                     // this module derives (packet M7/T2).
@@ -1284,6 +1352,11 @@ pub struct Training {
 impl Training {
     /// The nine pre-run slots, from the recipe and the dataset alone. The three post-run ones
     /// are [`UNSET`] until [`Training::finish`].
+    ///
+    /// `observation` is the policy's Observation IR when the run has one on disk — the source
+    /// of `augmentation.json` and of `seed.json`'s augmentation slot (packet M7/T6). `None`
+    /// is the honest answer for a caller that has not opened it, and it writes the same two
+    /// slots this command wrote before the packet.
     pub fn pre_run(
         recipe: &Recipe,
         plan: &Plan,
@@ -1291,6 +1364,7 @@ impl Training {
         interpreter: &str,
         data: &DatasetFacts,
         backbone: Option<&Backbone>,
+        observation: Option<&ObservationIr>,
     ) -> Result<Self, DataError> {
         let run = &recipe.run;
         let route = plan.route;
@@ -1387,11 +1461,30 @@ impl Training {
                 }),
             },
         );
+        // Packet M7/T6: real when the document declares a chain, and `{"unset": true}` when it
+        // does not -- a run with nothing to randomise has no augmentation seed, and inventing
+        // one would move every measured run's `training_hash` for a number nothing read.
+        let chains = match observation {
+            Some(obs) => augmentation_chains(obs).map_err(|d| {
+                refuse(
+                    d.iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                )
+            })?,
+            None => BTreeMap::new(),
+        };
+        let augmentation_seed = run.augmentation_seed.unwrap_or(run.seed);
         put(
             "seed.json",
             json!({
                 "global": run.seed, "dataloader": run.seed,
-                "augmentation": {"unset": true},
+                "augmentation": if chains.is_empty() {
+                    json!({"unset": true})
+                } else {
+                    json!(augmentation_seed)
+                },
             }),
         );
         put(
@@ -1404,7 +1497,29 @@ impl Training {
             }),
         );
         put("base_model.lock", base_model);
-        put("augmentation.json", json!({"kind": "none"}));
+        // The slot the trainer is *given* (`--augmentation`), not a description of one: the
+        // chains here are the nodes `python/es/augment.py` applies, and the seed is the one it
+        // keys its counter RNG with. `{"kind": "none"}` stays the whole file for a document
+        // that declares no augmentation, so an unaugmented run's digest is the digest it had.
+        put(
+            "augmentation.json",
+            if chains.is_empty() {
+                json!({"kind": "none"})
+            } else {
+                let observation_hash = observation
+                    .expect("a chain came from a document")
+                    .observation_hash()
+                    .map_err(|e| refuse(format!("the Observation IR does not hash: {e}")))?;
+                json!({
+                    "kind": "observation-ir",
+                    "observation_hash": hex(&observation_hash),
+                    "seed": augmentation_seed,
+                    "chains": chains.iter()
+                        .map(|(port, chain)| (port.clone(), augmentation_json(chain)))
+                        .collect::<serde_json::Map<_, _>>(),
+                })
+            },
+        );
         put(
             "precision.json",
             json!({
@@ -1547,7 +1662,7 @@ device = "cuda"
     fn plan_of(text: &str, out: &str) -> (Recipe, Plan) {
         let recipe = Recipe::parse(text).expect("recipe parses");
         let trainer = vec![s("python"), s("-m"), s("lerobot.scripts.lerobot_train")];
-        let plan = Plan::build(&recipe, Path::new(out), "python", &trainer, Some(13))
+        let plan = Plan::build(&recipe, Path::new(out), "python", &trainer, Some(13), false)
             .expect("plan builds");
         (recipe, plan)
     }
@@ -1619,6 +1734,7 @@ device = "cuda"
             "python",
             &facts(),
             None,
+            None,
         )
         .unwrap();
         let b = Training::pre_run(
@@ -1627,6 +1743,7 @@ device = "cuda"
             Path::new("/tmp/b"),
             "python",
             &facts(),
+            None,
             None,
         )
         .unwrap();
@@ -1641,8 +1758,16 @@ device = "cuda"
                 .collect::<Vec<_>>()
                 .join("\n");
             let (r2, p2) = plan_of(&text, "/tmp/a");
-            let c =
-                Training::pre_run(&r2, &p2, Path::new("/tmp/a"), "python", &facts(), None).unwrap();
+            let c = Training::pre_run(
+                &r2,
+                &p2,
+                Path::new("/tmp/a"),
+                "python",
+                &facts(),
+                None,
+                None,
+            )
+            .unwrap();
             assert_ne!(a.hash().unwrap(), c.hash().unwrap(), "{edit}");
         }
     }
@@ -1657,6 +1782,7 @@ device = "cuda"
             Path::new("/tmp/x"),
             "python",
             &facts(),
+            None,
             None,
         )
         .unwrap();
@@ -1696,6 +1822,7 @@ device = "cuda"
             "python",
             &facts(),
             None,
+            None,
         )
         .unwrap();
         let before = t.hash().unwrap();
@@ -1733,6 +1860,7 @@ device = "cuda"
             "python",
             &facts(),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -1758,8 +1886,16 @@ device = "cuda"
             ),
             "{rendered}"
         );
-        let after =
-            Training::pre_run(&r2, &p2, Path::new("/tmp/a"), "python", &facts(), None).unwrap();
+        let after = Training::pre_run(
+            &r2,
+            &p2,
+            Path::new("/tmp/a"),
+            "python",
+            &facts(),
+            None,
+            None,
+        )
+        .unwrap();
         assert_eq!(
             after.file("scheduler.json"),
             "{\"kind\":\"warmup_cosine\",\"lr\":0.0001,\"lr_min\":1e-6,\"total_steps\":20000,\
@@ -1832,8 +1968,15 @@ fov = 36
         let out = Path::new(out);
         let recipe = cycle.training(Some(IR), out).expect("the recipe resolves");
         let trainer = vec![s("python"), s("-m"), s("lerobot.scripts.lerobot_train")];
-        let plan = Plan::build(&recipe, &out.join("train"), "python", &trainer, Some(13))
-            .expect("plan builds");
+        let plan = Plan::build(
+            &recipe,
+            &out.join("train"),
+            "python",
+            &trainer,
+            Some(13),
+            false,
+        )
+        .expect("plan builds");
         CyclePlan::build(&cycle, &recipe, plan, out).expect("the cycle plan builds")
     }
 
@@ -1968,6 +2111,7 @@ fov = 36
             "python",
             &facts(),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(none.file("base_model.lock"), "{\"source\":\"none\"}\n");
@@ -1988,6 +2132,7 @@ fov = 36
             "python",
             &facts(),
             Some(&lock),
+            None,
         )
         .unwrap();
         let written: Value = serde_json::from_str(with.file("base_model.lock")).unwrap();

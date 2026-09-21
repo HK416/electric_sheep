@@ -19,6 +19,7 @@
 
 use std::collections::BTreeMap;
 
+use es_compile::plan::{augmentation_chains, AugmentStep};
 use es_compile::{CpuPlan, Home, PlanMode, Tensor, TensorRef};
 use es_ir::observation::ObservationIr;
 use es_ir::task::TaskIr;
@@ -57,6 +58,48 @@ impl ObservationBake {
             .map_err(|d| EvalError::Plan(d.iter().map(ToString::to_string).collect()))?;
         let sources = input_sources(&plan, obs, task, model)?;
         Ok(Self { plan, sources })
+    }
+
+    /// `es dataset bake --for-training`: move every augmented port back to the tensor
+    /// *entering* its `training_only` chain, and return the chains (packet M7/T6, §7.3).
+    ///
+    /// The boundary is the whole point. The Release plan disables augmentation (INV-15), so a
+    /// bake without this writes the network's input and the trainer has nothing left to
+    /// randomise; with it, the bake writes what the chain would have consumed — the padded
+    /// `104x104` canvas for the demo's `Pad -> RandomCrop` — and `python/es/augment.py`
+    /// applies the chain per sample and per step. Neither side re-implements the other: the
+    /// nodes *before* the chain still run here, exactly as they do at inference.
+    ///
+    /// A document with no `training_only` node is unchanged by this call, which is what keeps
+    /// `--for-training` byte-identical to the bake of before for every committed recipe.
+    pub fn for_training(
+        &mut self,
+        obs: &ObservationIr,
+    ) -> Result<BTreeMap<String, Vec<AugmentStep>>, EvalError> {
+        let chains = augmentation_chains(obs)
+            .map_err(|d| EvalError::Plan(d.iter().map(ToString::to_string).collect()))?;
+        for (name, chain) in &chains {
+            let first = chain[0].node;
+            let feeding = obs
+                .graph
+                .edges
+                .iter()
+                .find(|e| e.to.node == first)
+                .map(|e| e.from.node)
+                .ok_or_else(|| {
+                    EvalError::Plan(format!(
+                        "the augmentation chain of \"{name}\" starts at a node with no input"
+                    ))
+                })?;
+            let buffer = self.plan.buffer_of(feeding).ok_or_else(|| {
+                EvalError::Plan(format!(
+                    "the tensor entering \"{name}\"'s augmentation chain is produced by no plan \
+                     step"
+                ))
+            })?;
+            self.plan.outputs.insert(name.clone(), buffer);
+        }
+        Ok(chains)
     }
 
     /// The episode boundary — exactly the `plan.reset()` `run_episode` does per episode, so a
