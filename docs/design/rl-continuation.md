@@ -93,6 +93,15 @@ randomization, so no new randomization mechanism is needed:
 - reward: `−‖cube_pos − gripper_pos‖` per step, `+1` on success;
 - success: distance `< 0.03` m; timeout 200 control steps.
 
+**Revised again 2026-09-21 by S4e:** the observation channels now say which joint *quantity*
+they carry. `joint_vel` is `JointState { body = shoulder_pan, dof = 6, quantity = Velocity }`
+and `gripper_pose` is `BodyPose(gripper)`, and `es-eval`'s one capture path serves both from
+the backend's own `qvel` and `xpos ‖ xquat` (`docs/design/evaluation-execution.md` 2.3). It
+names the block's first *joint* rather than the body `base` because `CpuPlan` allocates one
+input buffer per source id: two channels on `base` would be handed the same six numbers. The
+IRs accept that pair; the lowering cannot serve it yet, and `input_sources` refuses it by name
+rather than serving it wrong. Closing that is an `es-compile` packet, not this one.
+
 The Task IR (`tests/fixtures/rl/task-reach.toml`) spells this with existing nodes
 (`GetBodyPose`, `Arith`, `Norm`, `Compare`, `Reward`, `Terminate`). **Found by S4b
 (2026-09-21):** `es-env`'s reward/termination cone executed neither `GetBodyPose` nor `Norm`,
@@ -196,7 +205,7 @@ over in the test:
   effect on the hash. (`train_act.py` has the same latent issue; no test catches it there, and
   fixing it is not this packet's scope.)
 
-**Oracle 4 is deferred to S4d.** The reach task of section 5 needs `GetBodyPose` and `Norm` in a
+**Oracle 4 was deferred to S4d and is measured above, in the S4e row.** The reach task of section 5 needs `GetBodyPose` and `Norm` in a
 reward cone, and `es-env`'s `ScalarPlan` lowers neither — it lowers `GetJointState`,
 `GetSensor`, `GetTime`, `Arith`, `Compare`, `Normalize`, `Logic` and `Clamp`, every leaf binds a
 single scalar, and `es_ir_types::Expr` has no square root by design (its doc cites §6.6
@@ -205,6 +214,98 @@ single scalar, and `es_ir_types::Expr` has no square root by design (its doc cit
 success-rate row of this table is written there. What is measured above is the infrastructure —
 the recipe, the route, the trainer, the plane and the reproducibility — on documents that
 already execute.
+
+### S4e — the reach task trained and scored, oracle server (Linux, 16-core CPU), 2026-09-21
+
+Artifacts: `~/artifacts/plan-s/s4e/` (`run-4000/`, `run-10000/`, each with `eval-<mark>/`).
+Interpreter: `~/venvs/es-lerobot-cuda/bin/python`, torch 2.11.0+cu129, mujoco 3.13.0.
+Documents: `tests/fixtures/rl/` {`task-reach.toml`, `observation-reach.toml`,
+`learning-reach.toml`, `deployment-reach.toml`, `evaluation-reach.toml`}, recipe
+`tests/fixtures/rl/training-reach.toml`, bundle `runs/reach-001/untrained.esb`
+(`task_hash b5d3b813…`, `observation_hash 4ced8547…`, `learning_hash eb805f18…`,
+`deployment_hash 7af05d88…`, `lowering_hash dce8d352…`).
+
+**This is S4b's deferred oracle 4, and the reach task trains.** `envs = 16`, `horizon = 64`,
+`seed = 0`, CPU backend; scored by `es eval run` on `evaluation-reach.toml`, 16 held-out
+seeds 201–216, `nominal`:
+
+| budget (iterations) | `success_rate` | `episode_length` | rollout `return` | rollout `entropy` |
+|---|---|---|---|---|
+| 1,000 | 0.0000 | 200.0 | −4.38 | 5.48 |
+| 2,000 | 0.1875 | 171.0 | −4.68 | 5.31 |
+| 2,500 | 0.2500 | 168.9 | −3.73 | 4.93 |
+| 3,000 | 0.4375 | 136.6 | −3.64 | 4.63 |
+| **4,000** | **0.5625** | **129.4** | −4.74 | 4.87 |
+| 5,000 | 0.5000 | 135.0 | −3.82 | 5.04 |
+| 7,500 | 0.3125 | 149.0 | −4.84 | 6.00 |
+| 10,000 | 0.3125 | 157.3 | −4.92 | 6.06 |
+
+**The acceptance criterion is not met, and the reason is not the budget.** 0.8 was never
+reached; 0.5625 at 4,000 iterations is the peak, and past it the run *decays* — the same
+recipe at 10,000 iterations scores 0.3125, barely better than it did at 2,500, and the
+rollout entropy climbs back past where it started (5.52 at iteration 1, 4.87 at 4,000, 6.06
+at 10,000). A policy that is unlearning while its budget grows is not short of iterations.
+The three things to ablate, in the order this table suggests them: the constant learning rate
+(`schedule = "constant"` throughout), the entropy coefficient (0.005, which is what the rising
+entropy is paid for), and open question 2 below — **every single tick is clamped**, so every
+gradient is computed from the log-probability of an action the env never executed.
+
+Two budgets were run because the first one's curve was still climbing at its end: 4,000
+iterations (12.6 min wall clock, `training_hash 1933697d…`) and 10,000 (29.3 min,
+`training_hash 69665845…`). They are one curve and not two: at the same seed the longer run's
+iteration 4,000 reports the same `return` (−4.7397) and `entropy` (4.8692) as the shorter
+run's last, so the eight rows above interleave. The committed recipe names 4,000, the
+measured peak.
+
+The nine §12.4 metrics as `Rollout.metrics()` gives them (`metrics/env-metrics.json`, the
+10,000-iteration run). A domain this path never runs is `null`, not a fabricated zero, and
+there is deliberately no `step/s`:
+
+| metric | value |
+|---|---|
+| `physics_steps_per_sec` | 32,076 |
+| `actions_per_sec` | 8,019 |
+| `camera_frames_per_sec` | `null` — no renderer on this path (§4.3) |
+| `pixels_per_sec` | `null` — same |
+| `observation_gb_per_sec` | `null` — not instrumented by `Env` |
+| `policy_inferences_per_sec` | `null` — inference is in the trainer, not in `Env` |
+| `p50_end_to_end_latency` | `null` — synchronous rollout, no declared latency (section 3) |
+| `p95_end_to_end_latency` | `null` — same |
+| `gpu_memory_peak` | `null` — CPU backend |
+| `chunk_underrun_rate` | `null` — horizon 1, no chunk buffer |
+
+Everything else is `Target / Status: unverified`. 640,000 control ticks over 1,759.9 s for the
+10,000-iteration run; 256,000 over 755.2 s for the 4,000-iteration one.
+
+**The perturbed suites, at the peak checkpoint** (4,000; measurements, not gates, §10.4):
+
+| suite | `success_rate` | `episode_length` |
+|---|---|---|
+| `nominal` | 0.5625 | 129.4 |
+| `observation_delay` (20 ms, 40 ms) | 0.3125 | 170.3 |
+| `torque_noise` (5 %) | 0.5000 | 127.6 |
+| `backlash` (0–0.01 rad) | 0.5000 | 130.6 |
+
+One control step of delay costs a quarter of the successes; the two actuator suites cost one
+episode out of sixteen. That ordering is what a policy reading joint angles and two poses at
+50 Hz should feel, and it is the first row in this note that is about the *task* rather than
+about the trainer.
+
+**The plane still clamps every single tick.** `envelope_violation_rate` and
+`executed_ne_sampled_rate` read 1.00 in every iteration of both runs and in every evaluation
+cell — exactly what S4b measured on the demo task, now on a task whose reward moves and whose
+policy demonstrably learns. So it is not a symptom of a flat reward: it is what a Gaussian
+around a position-target head does against a per-tick velocity and acceleration envelope. Open
+question 2 is now the *first* thing to ablate rather than a later one.
+
+**Oracles.** 1 (`committed_task_hashes_are_unmoved_by_joint_quantity`) and 2
+(`capture_reads_qvel_and_body_pose`) pass anywhere; 3
+(`rollout_observes_the_reach_documents`) passes wherever `ES_PYTHON` has MuJoCo — the 26-wide
+port equals the backend's own `qpos[0..6]`, `qvel[0..6]`, cube `qpos[6..13]` and gripper
+`xpos ‖ xquat` lane for lane and bit for bit; 4 (`reach_documents_validate`,
+`train_reach_dry_run_plan`) pass anywhere. S4a's committed rollout golden
+(`tests/golden/rollout/so101_100steps.json`) is unmoved, which is the strongest statement that
+no existing channel's capture moved.
 
 ## 8. Open questions for a human
 

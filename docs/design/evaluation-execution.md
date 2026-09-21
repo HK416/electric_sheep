@@ -116,6 +116,9 @@ The `CpuPlan`'s input buffers are named by the `StableId` of the `ImageInput` se
 | `StateInput` whose id is in `ModelInfo::qpos` | that env's `qpos` slice | supported |
 | `StateInput` whose id is in `ModelInfo::sensor` | that env's `sensordata` slice | supported |
 | `StateInput` whose id is a Task IR `ObsSource::JointState { body, dof }` | the leading `dof` joint positions of env 0 | supported |
+| `StateInput` whose channel says `quantity = Velocity` and whose id is a **joint** | `dof` values from that joint's first dof, `qvel[start..start + dof]` | supported (packet M8/S4e) |
+| `StateInput` whose channel says `quantity = Velocity` and whose id is a **body** | the leading `dof` joint velocities of env 0 | supported (packet M8/S4e) |
+| `StateInput` whose channel is `ObsSource::BodyPose(b)`, `b` not a free joint | `xpos[row*3..][..3] ‖ xquat[row*4..][..4]`, the quaternion xyzw (§3.1) | supported (packet M8/S4e) |
 | anything else | — | `EvalError::Plan`, before the first episode |
 
 Every input is resolved **once**, before the first episode, by `input_sources`. An input is
@@ -128,6 +131,36 @@ The `JointState { body, dof }` row is the one reading available for that channel
 body and a DoF count, not joints, so capture takes the leading `dof` positions — the same
 convention `joint_state::<NJ>` already uses to feed the Safety Plane, and the reason
 `run_episode` refuses a model carrying fewer than `NJ` of them (§2.5).
+
+**Quantity and body pose (packet M8/S4e).** `ObsSource::JointState` carries the
+`JointQuantity` `GetJointState` has always carried; absent is `Position`, which is the
+canonical form every earlier document was hashed in, so no committed `task_hash` moves. The
+quantity is read *before* the `qpos` and `sensor` maps, so a `Position` channel resolves
+exactly as it did and a `Velocity` channel is never answered by a `qpos` range that happens to
+share its id. A velocity channel naming a **joint** starts at that joint's first dof and takes
+`dof` values from there — the offset is the one thing the documents cannot know, and the width
+is the one thing the model cannot; naming a **body** it takes the leading `dof` of the row, the
+mirror of `Joints`. `JointQuantity::Torque` is refused by name: `StateView` has no joint torque
+array.
+
+`ObsSource::BodyPose(b)` reads `b`'s row of `xpos` and `xquat`. A **free-joint** body never
+takes that arm: its pose is in `qpos`, the `Qpos` arm answers it first, and that is what keeps
+the demo's cube channel byte for byte what it was. The quaternion is written in the order
+`StateView` documents — xyzw (§3.1) — and is not reordered here; reordering is an Observation
+IR node's job, not capture's.
+
+**One buffer per source id.** `CpuPlan` names an input buffer `Home::Input(id.to_string())`, so
+two channels on one source id would be allocated one buffer between them and `exec::read_input`
+would hand both `StateInput` nodes the same tensor — a silent wrong number, which is what §10.1
+forbids. The Cross-IR check *accepts* the pair (`XIR-002` tells two channels on one id apart by
+their declared type, whose unit is `JointQuantity::unit()`); `input_sources` refuses it by name
+until the lowering can give them two buffers. That is why `tests/fixtures/rl/task-reach.toml`'s
+`joint_vel` names the block's first joint, `shoulder_pan`, and not the body `base`.
+
+Neither new kind has a model-free reading. `observation.state` in a recorded dataset is
+`qpos ‖ qvel`, but where the second half begins is `nq` — a property of the model that ran, not
+of the row — and `xpos`/`xquat` are not in the row at all. Both are named and refused in
+`bake.rs` rather than turned into a guessed offset.
 
 Without a frame source (`Evaluation::run`, or `es eval run` with no `--frames`) an image
 observation is refused by name rather than fed zeros. A cell that silently evaluated a
