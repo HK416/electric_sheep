@@ -1064,6 +1064,8 @@ pub enum ActionExecutionMode {
 
 `TemporalEnsemble` is what ACT actually uses, so it is treated as first-class. Weighted-averaging the multiple predictions at overlapping time points is describable at the IR level, and it must execute identically on real hardware and in simulation.
 
+**Execution semantics of the incremental action space (plan T, §28.12).** `ActionSpace::JointDelta` (new) and `EeDelta` say the policy output is an *increment on the current target*. The runtime integrates it in one place (`es-env`) — `target_t = target_{t−1} + Δ_t`, and the integration state resets at episode boundaries to the measured pose the plane seeds (§9.3) — and the Safety Plane validates the **absolute target** as it does today. The envelope does not change, and per-tick change shrinks because policy noise lands on the increment. An incremental policy's `Normalizer{Inverse}` statistics are in increment units (rad/tick), and the adapter document declares that (§14.4). Absolute-target policies (ACT, brax/rsl_rl's `default_pose + a·scale`) keep `JointPosition` as is — the increment is an addition, not a replacement.
+
 ### 8.6 Async Inference and Chunk Buffer
 
 Since inference latency being larger than the control cycle is the normal situation, the runtime treats this as first-class.
@@ -3071,6 +3073,34 @@ zero), from scratch with the same graph 0.083, from scratch 64×64 **0.417** (th
 claim ("continue an imported policy") is not demonstrated, and the cause is the source policy (the scene's contact set, the
 normalizer's saturation), not the runtime. The review's human decisions: the plane clamping every RL tick (S-3), the worker
 thread pool changing CPU numerics (S-1), `scene_hash` depending on libm (S-2), and where the next source policy is trained.
+
+### 28.12 M9 — Incremental Action Space (plan T)
+
+After M8 closed (`docs/reviews/M8.ko.md`) the owner decided on 2026-09-22: as the answer to the plane/RL problem (S-3), **run the
+incremental action space as a campaign**, but put two things ahead of it — the exploration-noise experiment (one variable at a
+time, §28.9 rule 3) and the `es-ir` split (§1.5). Grounds: half of real-world policies (Isaac Lab's relative joint action / IK
+delta, the HIL-SERL family's EE delta) are incremental spaces, and §8.5's `EeDelta` is name-only, so such policies cannot be
+imported; in RL, noise lands on the increment and the envelope is kept automatically. M8's remaining human decisions (S-1 worker
+pool, S-2 `scene_hash`, the next source policy's scene) stay open as they were.
+
+**The rules this section pins down.** (1) Increment is an addition, not a replacement: the `JointPosition` policy and its
+documents do not move a single byte (absent = default = today's hash). (2) Integration happens in one place, `es-env`, and
+collection/evaluation/the trainer (`Rollout`) use the same function; the plane validates the absolute target and `es-safety` is
+unchanged (INV-11–13). (3) One variable at a time: the noise experiment's (R1) table comes first, and T3 puts the
+incremental-mode row next to its best absolute-mode row. (4) No new trait (INV-17).
+
+| Wave | Packet | Question it answers | Oracle (one line) | Type |
+|---|---|---|---|---|
+| 0 | **R1 exploration noise** (`docs/packets/M8/P-M8-R1.md`) | Changing only `init_log_std`, the entropy coefficient, and the lr schedule, how far does the clamp rate fall from 1.00, and does the reach curve still hold after 4,000 iterations | server: 4 recipe variants × 4,000/10,000 iterations, seed 0 (best gets seed 1 added) → a table of `executed_ne_sampled_rate` and held-out `success_rate` (`rl-continuation.md` §7) | D |
+| 0 | **R6 `es-ir` split** (`P-M8-R6.md`) | Moving `graph`/`hash` (modules that don't know the IR structs) down into `es-ir-types` and re-exporting them, does `es-ir` land under the target with callers unchanged | `cargo xtask context-budget`: `es-ir` < 6,000; every committed hash unchanged (all existing pin tests still green); `cargo xtask layering` | B |
+| 1 | **T1 incremental semantics** | Does `JointDelta` appear in `es-ir-types` and the Deployment IR, does a single function in `es-env` integrate it, and does the plane receive the absolute target; are the `JointPosition` document's hash and bytes unchanged | `cargo test -p es-env delta_integrates_to_the_absolute_target`: the incremental column's integral is bitwise equal to the absolute column; the demo document's `.estraj` unchanged; `es-safety` diff 0 lines | B |
+| 1 | **T2 incremental source policy and import** | Does a policy trained by switching S2c's brax env to incremental actions get imported through the adapter's `[action] kind = "joint_delta"` and reproduce over 1,000 observations | server: brax reconstruction bitwise, JAX ≤ 1e-5; derived-scene success rate recorded | B/D |
+| 2 | **T3 incremental reach RL** | With the same budget and the same seeds, does PPO in the incremental space have a lower clamp rate and a higher held-out than the absolute space (R1's best) | server: 3 seeds, 4,000/10,000 iterations, one table (absolute best / incremental) — `success_rate`, `executed_ne_sampled_rate`, entropy | D |
+| 3 | **T4 measurement and review** | Is there grounds to fix §13.4's default RL action space to incremental | `docs/reviews/M9.md` + `.ko.md`; `cargo xtask ci` | A |
+
+**What is not on the ladder.** Real Isaac Lab relative-action policies become importable through T2's adapter, but the scene
+(`es-usd`) and the contact-set question (M8 S-5) remain, for the next campaign. `EeDelta`'s IK is not in this section —
+`JointDelta` comes first, and the EE space is separate, alongside §8.5's `EePose`.
 
 ---
 

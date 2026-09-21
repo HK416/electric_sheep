@@ -1067,6 +1067,12 @@ pub enum ActionExecutionMode {
 
 `TemporalEnsemble`은 ACT가 실제로 쓰는 방식이므로 1급으로 둔다. 겹치는 시점의 여러 예측을 가중 평균하는 것은 IR 수준에서 기술 가능하고, 실기와 시뮬에서 동일하게 실행되어야 한다.
 
+**증분 행동 공간의 실행 의미론(plan T, §28.12).** `ActionSpace::JointDelta`(신설)와 `EeDelta`는 정책 출력이 *현재 목표에 대한 증분*임을
+말한다. 런타임은 한 곳(`es-env`)에서 적분한다 — `target_t = target_{t−1} + Δ_t`, 적분 상태는 에피소드 경계에서 플레인이 시드하는 측정
+자세(§9.3)로 재설정된다 — 그리고 Safety Plane은 지금처럼 **절대 목표**를 검증한다. 엔벌로프는 바뀌지 않고, 정책 잡음이 증분에 걸리므로
+틱당 변화가 작아진다. 증분 정책의 `Normalizer{Inverse}` 통계는 증분 단위(rad/틱)이고 어댑터 문서가 그렇게 선언한다(§14.4). 절대 목표
+정책(ACT, brax·rsl_rl의 `default_pose + a·scale`)은 `JointPosition` 그대로다 — 증분은 대체가 아니라 추가다.
+
 ### 8.6 비동기 추론과 청크 버퍼
 
 추론 지연이 제어 주기보다 크다는 것이 정상 상황이므로, 런타임이 이를 1급으로 다룬다.
@@ -3006,6 +3012,31 @@ CPU 백엔드에서 두 번 비트 동일; S4e의 reach 학습은 4,000회에서
 않았으며 원인은 런타임이 아니라 원본 정책(장면의 접촉 집합, 정규화기의 포화)이다. 리뷰의 사람 결정: RL 롤아웃에서 플레인이 매 틱을
 clamp하는 문제(S-3), 워커 스레드 풀이 CPU 수치를 바꾸는 문제(S-1), `scene_hash`가 libm에 의존하는 문제(S-2), 다음 원본 정책을 어디서
 학습할지.
+
+### 28.12 M9 — 증분 행동 공간 (plan T)
+
+M8이 닫힌 뒤(`docs/reviews/M8.ko.md`) 소유자가 2026-09-22에 정했다: 플레인·RL 문제(S-3)의 답으로 **증분 행동 공간을 캠페인으로**,
+단 그 앞에 두 가지를 둔다 — 탐색 잡음 실험(변수 하나씩, §28.9 규칙 3)과 `es-ir` 분할(§1.5). 근거: 실제 정책의 절반(Isaac Lab의
+relative joint action·IK delta, HIL-SERL 계열의 EE delta)이 증분 공간이고 §8.5의 `EeDelta`는 이름만 있어 그런 정책은 가져올 수
+없다; RL에서는 잡음이 증분에 걸려 엔벌로프가 저절로 지켜진다. M8의 나머지 사람 결정(S-1 워커 풀, S-2 `scene_hash`, 다음 원본 정책의
+장면)은 그대로 열려 있다.
+
+**이 절이 고정하는 규칙.** (1) 증분은 추가이지 대체가 아니다: `JointPosition` 정책과 문서는 한 바이트도 움직이지 않는다(부재 = 기본값
+= 오늘의 해시). (2) 적분은 `es-env` 한 곳이고 수집·평가·트레이너(`Rollout`)가 같은 함수를 쓴다; 플레인은 절대 목표를 검증하며
+`es-safety`는 바뀌지 않는다(INV-11~13). (3) 한 번에 변수 하나: 잡음 실험(R1)의 표가 먼저 있고, T3는 그 최선의 절대 모드 행 옆에
+증분 모드 행을 놓는다. (4) 새 trait 없음(INV-17).
+
+| 파동 | 패킷 | 답하는 질문 | 오라클 (한 줄) | 유형 |
+|---|---|---|---|---|
+| 0 | **R1 탐색 잡음** (`docs/packets/M8/P-M8-R1.md`) | `init_log_std`·엔트로피 계수·lr 스케줄만 바꾸면 clamp율이 1.00에서 얼마로 내려가고 reach 곡선이 4,000회 뒤에도 유지되는가 | 서버: 레시피 변형 4종 × 4,000/10,000회, 시드 0(최선은 시드 1 추가) → `executed_ne_sampled_rate`·held-out `success_rate` 표 (`rl-continuation.md` 7절) | D |
+| 0 | **R6 `es-ir` 분할** (`P-M8-R6.md`) | `graph`·`hash`(IR 구조체를 모르는 모듈)를 `es-ir-types`로 내리고 re-export하면 호출자 무변경으로 `es-ir`이 목표 아래인가 | `cargo xtask context-budget`: `es-ir` < 6,000; 모든 커밋된 해시 불변(기존 핀 테스트 전부 녹색); `cargo xtask layering` | B |
+| 1 | **T1 증분 의미론** | `JointDelta`가 `es-ir-types`·Deployment IR에 생기고 `es-env`의 한 함수가 적분하며 플레인이 절대 목표를 받는가; `JointPosition` 문서의 해시·바이트가 불변인가 | `cargo test -p es-env delta_integrates_to_the_absolute_target`: 증분 열의 적분이 절대 열과 비트 동일; 데모 문서의 `.estraj` 불변; `es-safety` diff 0줄 | B |
+| 1 | **T2 증분 원본 정책과 가져오기** | S2c의 brax env를 증분 행동으로 바꿔 학습한 정책이 어댑터 `[action] kind = "joint_delta"`로 가져와져 1,000 관측 재현되는가 | 서버: brax 재구성 비트 동일, JAX ≤ 1e-5; 파생 장면 성공률 기록 | B/D |
+| 2 | **T3 증분 reach RL** | 같은 예산·같은 시드로 증분 공간의 PPO가 절대 공간(R1의 최선)보다 clamp율이 낮고 held-out이 높은가 | 서버: 시드 3개, 4,000/10,000회, 표 한 장(절대 최선 / 증분) — `success_rate`, `executed_ne_sampled_rate`, 엔트로피 | D |
+| 3 | **T4 측정·리뷰** | §13.4의 RL 기본 행동 공간을 증분으로 고칠 근거가 있는가 | `docs/reviews/M9.md` + `.ko.md`; `cargo xtask ci` | A |
+
+**사다리에 없는 것.** Isaac Lab의 실제 relative-action 정책은 T2의 어댑터가 받을 수 있게 되지만 장면(`es-usd`)과 접촉 집합 질문(M8
+S-5)이 남아 다음 캠페인이다. `EeDelta`의 IK는 이 절에 없다 — `JointDelta`가 먼저이고 EE 공간은 §8.5의 `EePose`와 함께 별도다.
 
 ---
 
