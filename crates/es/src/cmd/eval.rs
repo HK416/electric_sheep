@@ -53,19 +53,26 @@ under --out with one { frame, tick, source, events } record per frame. That is e
 `es video mosaic` reads. It needs the `render` feature and a Vulkan device; a build without
 the feature refuses the flag rather than running with no frames.
 
-With --jobs N (default 1) the evaluation's cells -- a cell being one suite, run as its whole
-episode list -- are partitioned round-robin over N worker processes: this same binary,
-re-invoked as `es eval run --shard i/N --shard-out <file>`. A worker runs the cells it owns
-and judges nothing; the parent merges them back into the cell order the sequential run would
-have written, and computes the report, the `evaluation_hash` and `evaluation.lock` itself. So
---jobs is a scheduling choice and not a different evaluation: at the same seeds the artifacts
-are byte-identical to --jobs 1 (`evaluation.lock`'s `created` timestamp excepted).
+With --jobs N (default 1) the evaluation's (suite, episode) units are partitioned round-robin
+over N worker processes: this same binary, re-invoked as `es eval run --shard i/N --shard-out
+<file>`. A worker runs the units it owns and judges nothing; the parent sums each suite's
+episodes back in episode order and computes the report, the `evaluation_hash` and
+`evaluation.lock` itself. So --jobs is a scheduling choice and not a different evaluation: at
+the same seeds, and **at the same worker thread count**, the artifacts are byte-identical to
+--jobs 1 (`evaluation.lock`'s `created` timestamp excepted). The thread count is the caveat and
+not a formality: the cap below is `cores/N`, a Torch CPU inference is not bitwise-reproducible
+across intra-op thread counts, and a `--jobs` large enough to push `cores/N` below what the
+policy's tensors parallelise over therefore moves the trajectory. Measured on the demo's
+nominal suite on a 16-core box: --jobs 2 and --jobs 4 are byte-identical to --jobs 1, --jobs 8
+is not, and --jobs 1 with OMP_NUM_THREADS=2 exported reproduces the --jobs 8 artifacts exactly
+(`docs/design/evaluation-execution.md` 2.7). Export the thread vars yourself to pin it.
 
-The split is by suite and not by episode on purpose. Inside one suite the runner keeps one
-`Env`, one `SafetyPlane` and one monotonic chunk sequence for all of the episodes, and
-`Env::reset` keys the task's randomization by an episode counter that cannot be seeked -- so
-episode 5 of a suite is not reproducible without having run episodes 0..4. An evaluation with
-one suite gets no speedup from --jobs, and N is clamped to the suite count.
+The split is by episode, so a one-suite evaluation parallelises too: the demo's 16-episode
+nominal suite runs 16-wide. Each unit builds its own `Env` -- seeked to its episode with
+`Env::seek_episode`, which draws exactly what replaying the resets before it would have drawn
+(spec 6.3) -- its own Safety Plane, chunk buffer and inference queue, so nothing crosses an
+episode boundary. --jobs 1 is that same partition with one worker and not a second code path.
+N is clamped to suites x episodes.
 
 Each worker's own subprocess (the torch runtime, and whatever math library backs it) is capped
 to cores/N threads unless the caller already exported OMP_NUM_THREADS, MKL_NUM_THREADS,
@@ -91,9 +98,9 @@ hands a policy privileged state.
     --traj <dir>       per-episode `.estraj` state trajectories (default <out>/traj)
     --backend <name>   physics backend; only `mujoco-cpu` is supported (default, spec 17.1)
     --runtime <name>   policy runtime; only `torch` is supported (default, spec 2.4)
-    --jobs <N>         worker processes for the cells (default 1); 0 is refused
-    --shard <i/N>      run only the cells of shard i (worker mode); needs --shard-out
-    --shard-out <file> where a worker writes its cells; implies no report and no lock
+    --jobs <N>         worker processes for the (suite, episode) units (default 1); 0 is refused
+    --shard <i/N>      run only the units of shard i (worker mode); needs --shard-out
+    --shard-out <file> where a worker writes its units; implies no report and no lock
     --telemetry <addr> publish the run live on this address (spec 23.1), e.g. 127.0.0.1:7777
     --telemetry-token <t>  required in every client's Hello (spec 25.1); none by default
     --telemetry-image-every <N>  publish the observation frame every N ticks (default 0, never)
@@ -107,7 +114,7 @@ non-blocking (spec 23.4 gate 9): a subscriber that stops reading loses frames an
 and the run never waits for a socket. What the run *computes* is untouched -- `report.json`
 and `events.json` are byte-identical with and without the flag.
 
---telemetry needs --jobs 1: the cells of a --jobs N run are separate processes and only one
+--telemetry needs --jobs 1: the units of a --jobs N run are separate processes and only one
 of them could own the address.
 
 Exit code: 0 when every acceptance result is Determined{passed: true}; 1 when any failed or
@@ -831,14 +838,20 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
     };
     let nj = bundle.deployment.robot.n_joints;
     let h = bundle.deployment.action.horizon;
-    // More workers than cells would start interpreters that own nothing; the partition N has
+    // More workers than units would start interpreters that own nothing; the partition N has
     // to be the one the workers are actually told, so it is clamped before either is decided.
-    let jobs = a.jobs.min(eval_ir.suites.len().max(1) as u32);
+    // The unit is the `(suite, episode)` pair since packet M7/R1, so a one-suite evaluation
+    // clamps to its episode count and not to 1. `n_episodes` is the count `es_eval` resolves
+    // the seed list to (spec 10.2): an explicit list is its own length, a `seed_base` is
+    // `n_episodes`.
+    let n_episodes = match &eval_ir.episodes.seeds {
+        es_ir::evaluation::SeedPlan::Explicit(list) => list.len(),
+        es_ir::evaluation::SeedPlan::Base(_) => eval_ir.episodes.n_episodes as usize,
+    };
+    let units = eval_ir.suites.len() * n_episodes;
+    let jobs = a.jobs.min(units.max(1) as u32);
     let mut shards = if jobs > 1 {
-        println!(
-            "es eval run --jobs {jobs}: {} cell(s) over {jobs} worker(s)",
-            eval_ir.suites.len()
-        );
+        println!("es eval run --jobs {jobs}: {units} unit(s) over {jobs} worker(s)");
         spawn_shards(&a, jobs)?
     } else {
         // The sink is a closure and not a trait object of this crate's invention (INV-17):
@@ -873,7 +886,7 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
             .map_err(|e| CliError::Runtime(format!("serializing shard {i}/{n}: {e}")))?;
         std::fs::write(path, text)
             .map_err(|e| CliError::Runtime(format!("{}: {e}", path.display())))?;
-        println!("shard {i}/{n}: {} cell(s)", shards[0].cells.len());
+        println!("shard {i}/{n}: {} unit(s)", shards[0].cells.len());
         return Ok(0);
     }
 

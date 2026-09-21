@@ -103,6 +103,13 @@ pub(crate) struct Publisher {
     stage_began: Instant,
     /// Observations seen in the open episode, for the image rate limit.
     observations: u64,
+    /// `es loop collect`'s first tick of the open episode (packet M7/R1). The collector keeps
+    /// one `Env` for the whole run, so its `CollectEvent::Tick` carries the env's cumulative
+    /// physics clock; `es eval run` publishes the episode's own (spec 10.5). Subtracting the
+    /// first tick of the episode here is what makes a live viewer see one clock on both
+    /// stages -- `es-data` is unchanged, and the dataset's own columns with it. A bare `u64`
+    /// because `PhysTick` lives in `es-core`, which this crate takes only as a dev-dependency.
+    episode_start: Option<u64>,
     /// The last step this run published. Kept whole rather than as its tick alone because the
     /// tick's type lives in `es-core`, which this crate takes only as a dev-dependency: a
     /// `StepEvent` is what `es-eval` hands over, so nothing here has to name it.
@@ -129,6 +136,7 @@ impl Publisher {
             began: Instant::now(),
             stage_began: Instant::now(),
             observations: 0,
+            episode_start: None,
             last: None,
         })
     }
@@ -291,6 +299,7 @@ impl Publisher {
             CollectEvent::EpisodeBegin { episode, seed } => {
                 self.began = Instant::now();
                 self.observations = 0;
+                self.episode_start = None;
                 self.event(
                     "episode.begin",
                     fields([("episode", episode.to_string()), ("seed", seed.to_string())]),
@@ -303,20 +312,26 @@ impl Publisher {
                 source,
                 events,
             } => {
-                let record = StepEvent {
+                // One clock on both stages (packet M7/R1): `es eval run`'s stream-2 `tick` is
+                // the episode's (spec 10.5) and the collector's `Env` runs every episode of
+                // the run, so its cumulative tick is turned into the episode's here -- at the
+                // publish site, where the two stages meet. Frame 0 of an episode is the
+                // episode's first tick, whatever the env's clock reads by then.
+                let mut record = StepEvent {
                     frame: u64::from(frame),
                     tick,
                     source: event_source(source),
                     events,
                 };
+                record.tick.0 -= *self.episode_start.get_or_insert(tick.0);
                 self.last = Some(record);
                 self.send(Frame {
-                    tick,
+                    tick: record.tick,
                     wall_ns: wall_ns(),
                     stream: STREAM_TICKS,
                     payload: Payload::Scalars(vec![
                         f64::from(frame),
-                        tick.0 as f64,
+                        record.tick.0 as f64,
                         f64::from(source_code(record.source)),
                         f64::from(events),
                     ]),

@@ -2515,9 +2515,11 @@ fn sharding_the_cells_produces_a_byte_identical_report() {
     );
 }
 
-/// A worker that died must not become a report over the suites that survived: a merge that
-/// does not cover every cell exactly once is refused, and the refusal names what it got
-/// (spec 10.4).
+/// A worker that died must not become a report over the episodes that survived: a merge that
+/// does not cover every `(cell, episode)` unit exactly once is refused, and the refusal names
+/// what it got (spec 10.4). Since packet M7/R1 the unit is the episode, so a lost worker now
+/// takes a *slice* of several cells with it rather than whole cells — which a report summing
+/// what is left would hide behind a correct `evaluation_hash`.
 #[test]
 fn a_merge_missing_a_cell_is_refused() {
     let (ir, obs) = four_suite_image_ir();
@@ -2552,7 +2554,11 @@ fn a_merge_missing_a_cell_is_refused() {
         .expect_err("a merge missing a cell is not a report");
     let message = err.to_string();
     assert!(matches!(err, EvalError::Shard(_)), "{message}");
-    assert!(message.contains("[0, 1, 3]"), "{message}");
+    // Shard 2 of 4 owned units 2, 6, 10, ... of the flattened `suites x seeds` list, which is
+    // `(0, 2)` first: the refusal lists what survived, and that unit is not in it.
+    assert!(message.contains("(cell, episode) units"), "{message}");
+    assert!(!message.contains("(0, 2)"), "{message}");
+    assert!(message.contains("(0, 0), (0, 1), (0, 3)"), "{message}");
 
     // The same four shards, all present, do produce one.
     assert!(
@@ -2574,64 +2580,18 @@ fn a_merge_missing_a_cell_is_refused() {
     );
 }
 
-/// Packet M7/T8 oracle 3 — **the `(cell, episode)` partition does not reproduce the
-/// sequential run, and this is the state that stops it.**
+/// Packet M7/R1 oracle 2 — **`events.json`'s `tick` is the episode's, not the env's**
+/// (spec 10.5, the sentence added 2026-09-21).
 ///
-/// `Env::seek_episode` makes an env's episode `k` reachable without replaying `0..k`
-/// (`cargo test -p es-env --test seek`), so the question the packet asked was whether a shard
-/// could be one episode rather than one whole suite. Measured on the committed demo documents
-/// by running the pre-T8 and the T8 build of `es eval run` over the nominal suite (oracle
-/// server, 2026-09-21, `docs/design/evaluation-execution.md` section 2.7): no. The artifacts
-/// moved, in two independent places, and this test pins both so that a change to either is
-/// loud rather than silent.
-///
-/// It is a tripwire and not a gate: when `begin_episode` starts clearing the window, or when
-/// `StepEvent::tick` becomes episode-relative, the matching assertion here fails and sends the
-/// reader back to section 2.7 — where the partition is written down as a small change on top
-/// of what shipped.
+/// Frame `n` of a cell already carries `frame: n`; an absolute physics tick is only meaningful
+/// inside one cell, and only while one `Env` runs every episode of it. Counting from the reset
+/// that opened the episode makes `events.json` independent of how the run was scheduled, which
+/// is what lets the `(cell, episode)` partition below be the same run
+/// (`docs/design/evaluation-execution.md` 2.7). `frame` is untouched.
 #[test]
-#[ignore = "oracle tier: the M7/T8 parity finding, pinned"]
-fn episode_shards_reproduce_the_sequential_run() {
-    // (1) The plane's spec 9.4 `ViolationRate` ring survives `begin_episode`, so episode `k`
-    //     is judged partly on episode `k-1`'s steps. A per-episode plane starts empty, which
-    //     reads 0.0 until the window fills -- 227 fewer `violation.rate` events over the
-    //     demo's four nominal episodes, and the trajectory parts company at tick 24.
-    const WINDOW: u32 = 8;
-    let mut deploy = deployment_ir();
-    deploy.watchdogs = WatchdogSet(vec![
-        Watchdog::ChunkUnderrun,
-        Watchdog::EnvelopeViolationRate {
-            window: WINDOW,
-            max_frac: 0.5,
-        },
-    ]);
-    let mut plane = es_safety::SafetyPlane::<NJ, H>::from_ir(&deploy).expect("the plane builds");
-    // Every step past the soft position limit, so every step is dirty and the ring fills.
-    let far = [100.0; NJ];
-    let chunk = es_safety::ActionChunk::new([far; H], H, ExecutionMode::RecedingHorizon);
-    for tick in 0..u64::from(WINDOW) {
-        plane.observe_state(&[0.0; NJ], &[0.0; NJ]);
-        plane.heartbeat(PhysTick(tick));
-        plane.validate(&chunk.with_seq(tick + 1), Micros(0), PhysTick(tick));
-    }
-    let filled = plane.counters().envelope_violation_rate();
-    assert!(
-        filled > 0.5,
-        "the fixture never filled the window: {filled}"
-    );
-    plane.begin_episode();
-    let after = plane.counters().envelope_violation_rate();
-    assert_eq!(
-        filled.to_bits(),
-        after.to_bits(),
-        "begin_episode now clears the ViolationRate window -- re-read \
-         docs/design/evaluation-execution.md section 2.7: the partition may be shippable"
-    );
-
-    // (2) `StepEvent::tick` is the *env's* cumulative physics clock, not the episode's, so a
-    //     per-episode env writes a different `events.json` whatever the plane does.
+fn tick_is_episode_relative() {
     let (ir, obs) = image_ir();
-    let dir = scratch("t8-tick");
+    let dir = scratch("tick-relative");
     let mut sink = FrameSink::new(&dir);
     run_deploy(
         &ir,
@@ -2642,23 +2602,188 @@ fn episode_shards_reproduce_the_sequential_run() {
         Some(&mut sink),
     )
     .expect("the one-suite image fixture runs");
-    let second = sink
-        .events
-        .get("nominal-01")
-        .expect("the fixture runs more than one episode");
+
+    let ticks = |cell: &str| -> Vec<u64> {
+        sink.events
+            .get(cell)
+            .unwrap_or_else(|| panic!("the fixture has no cell {cell}"))
+            .iter()
+            .map(|e| e.tick.0)
+            .collect()
+    };
+    let frames = |cell: &str| -> Vec<u64> {
+        sink.events
+            .get(cell)
+            .expect("the cell")
+            .iter()
+            .map(|e| e.frame)
+            .collect()
+    };
+
+    let first = ticks("nominal-00");
+    assert_eq!(first.first().copied(), Some(0), "episode 0 opens at tick 0");
+    // Every episode of the cell opens at 0, whatever the env's own clock reads by then.
+    for cell in sink.events.keys() {
+        assert_eq!(
+            ticks(cell).first().copied(),
+            Some(0),
+            "{cell} does not open at tick 0 -- the env's cumulative clock leaked into it"
+        );
+    }
+    // Episode 1 runs as long as episode 0 on this fixture, so its whole sequence is episode
+    // 0's: the clock restarts, it does not merely offset. (Later episodes draw different
+    // randomizations and terminate at different steps, which is the fixture, not the clock.)
+    assert_eq!(
+        ticks("nominal-01"),
+        first,
+        "episode 1's tick sequence is not episode 0's"
+    );
+    // `frame` is the dense index inside the cell and is not touched by any of this.
+    assert_eq!(
+        frames("nominal-01"),
+        frames("nominal-00"),
+        "episode 1's frames moved"
+    );
     assert!(
-        second[0].tick.0 > 0,
-        "StepEvent::tick is episode-relative now ({:?}) -- re-read \
-         docs/design/evaluation-execution.md section 2.7",
-        second[0].tick
+        first.len() > 1 && first[1] > first[0],
+        "the fixture ran one step; the tick sequence proves nothing: {first:?}"
+    );
+}
+
+/// Packet M7/R1 oracle 3 (packet M7/T8 oracle 3, flipped) — **the `(cell, episode)` partition
+/// *is* the sequential run, byte for byte.**
+///
+/// T8 asked whether a shard could be one episode rather than one whole suite, proved
+/// `Env::seek_episode` is the replay of `k` resets (`cargo test -p es-env --test seek`), and
+/// measured that the evaluator still said no: the Safety Plane's §9.4 `ViolationRate` ring
+/// carried episode `k-1`'s tail into episode `k` (first difference `nominal-01` tick 24), and
+/// `StepEvent::tick` was the cell's cumulative physics clock (`events.json` record 0, tick
+/// 7200). The owner decided both on 2026-09-21 (§28.11): `begin_episode` empties the ring
+/// (spec 9.4) and `tick` counts from the episode (spec 10.5). With both in, this is the gate
+/// they were the obstacle to.
+///
+/// Three runs of one four-suite, six-episode evaluation — the sequential entry point, then the
+/// unit partition over two and over four workers — and all three must agree byte for byte on
+/// `report.json`, `evaluation.lock`, `events.json`, every frame and **every `.estraj`**, which
+/// is the trajectory T8 watched part company at tick 24.
+///
+/// **On the fixture backend, and why.** The packet asks for this on the committed demo
+/// documents, which need `MuJoCo` and a Torch runtime; this crate has neither as a
+/// dev-dependency and its `Cargo.toml` is outside the packet's declared scope. So the
+/// demo-document half of the oracle lives where the pieces already are: `es eval run --jobs 1`
+/// against `--jobs 2` over the committed `evaluation.toml` in
+/// `crates/es/tests/cli.rs::eval_jobs_splits_episodes`, and the full nominal suite at
+/// `--jobs 1 / 2 / 4` on the oracle server
+/// (`~/artifacts/plan-v/m7-r1-episodes/r1-parity.sh`, `docs/design/evaluation-execution.md`
+/// 2.7). This one is the fast gate that runs on every machine.
+#[test]
+#[ignore = "oracle tier: the M7/R1 partition parity gate"]
+fn episode_shards_reproduce_the_sequential_run() {
+    let (ir, obs) = four_suite_image_ir();
+    let task = task_ir();
+    let deploy = deployment_ir();
+
+    // One run of `jobs` workers over the units, with the `.estraj` per episode `es eval run`
+    // always writes, returning the three artifacts, the frames and every trajectory's bytes.
+    let run = |jobs: u32, name: &str| -> (Artifacts, Vec<(String, Vec<u8>)>) {
+        let dir = scratch(name);
+        let traj_dir = dir.join("traj");
+        let cfg = RunConfig {
+            traj_dir: Some(traj_dir.clone()),
+            ..RunConfig::default()
+        };
+        let mut shards = Vec::new();
+        let mut events = FrameSink::new(&dir);
+        for i in 0..jobs {
+            // A fresh policy per shard, which is what a separate process gives.
+            let mut policy = FakePolicy { target: 0.2 };
+            let mut frames = state_frames();
+            let mut shard = Evaluation::run_shard::<FakeBackend, _, NJ, H>(
+                &ir,
+                &task,
+                &scene(),
+                &obs,
+                &mut policy,
+                &deploy,
+                FakeBackend::new,
+                &cfg,
+                Some(&mut frames),
+                Some(&dir),
+                (i, jobs),
+            )
+            .unwrap_or_else(|e| panic!("{name} shard {i}/{jobs}: {e}"));
+            events.events.append(&mut shard.events);
+            shards.push(shard);
+        }
+        let policy = FakePolicy { target: 0.2 };
+        let (report, lock) = Evaluation::merge(&ir, &task, &obs, &deploy, &policy, &cfg, &shards)
+            .unwrap_or_else(|e| panic!("{name} merge: {e}"));
+
+        let mut trajectories = Vec::new();
+        for entry in std::fs::read_dir(&traj_dir).expect("the trajectory directory") {
+            let path = entry.expect("entry").path();
+            trajectories.push((
+                path.file_name()
+                    .expect("name")
+                    .to_string_lossy()
+                    .into_owned(),
+                std::fs::read(&path).expect("estraj"),
+            ));
+        }
+        trajectories.sort();
+        (read_artifacts(&report, &lock, &events, &dir), trajectories)
+    };
+
+    let sequential = run(1, "r1-seq");
+    assert!(
+        sequential.1.len() == ir.suites.len() * N_EPISODES as usize,
+        "the fixture wrote {} trajectories over {} cells",
+        sequential.1.len(),
+        ir.suites.len() * N_EPISODES as usize
     );
 
+    for jobs in [2, 4] {
+        let got = run(jobs, &format!("r1-jobs-{jobs}"));
+        assert_eq!(
+            String::from_utf8_lossy(&got.0 .0),
+            String::from_utf8_lossy(&sequential.0 .0),
+            "--jobs {jobs} moved report.json"
+        );
+        assert_eq!(
+            got.0 .1, sequential.0 .1,
+            "--jobs {jobs} moved evaluation.lock"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&got.0 .2),
+            String::from_utf8_lossy(&sequential.0 .2),
+            "--jobs {jobs} moved events.json"
+        );
+        assert_eq!(
+            got.0 .3.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            sequential.0 .3.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            "--jobs {jobs} moved which frames exist"
+        );
+        assert_eq!(
+            got.0 .3, sequential.0 .3,
+            "--jobs {jobs} moved the frame bytes"
+        );
+        assert_eq!(
+            got.1.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            sequential.1.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+            "--jobs {jobs} moved which trajectories exist"
+        );
+        for ((name, got), (_, want)) in got.1.iter().zip(&sequential.1) {
+            assert_eq!(got, want, "--jobs {jobs} moved {name}");
+        }
+    }
+
     println!(
-        "RAN episode_shards_reproduce_the_sequential_run: not identical. Measured on the demo \
-         documents -- first difference at nominal-01/tick 0 (events.json tick 7200 against 0) \
-         and nominal-01/tick 24 (.estraj; violation.rate 2318 against 2091). Pinned here: the \
-         window survives begin_episode ({filled}), and this fixture's nominal-01 opens at env \
-         tick {}. The partition stays cell-level.",
-        second[0].tick.0
+        "RAN episode_shards_reproduce_the_sequential_run: identical. {} cells x {} episodes, \
+         count 1 against 2 and 4 -- report.json, evaluation.lock, events.json, {} frame file(s) \
+         and {} .estraj byte-identical.",
+        ir.suites.len(),
+        N_EPISODES,
+        sequential.0 .3.len(),
+        sequential.1.len()
     );
 }
