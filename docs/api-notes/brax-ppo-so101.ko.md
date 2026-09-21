@@ -150,9 +150,20 @@ E4는 두 번 읽어야 한다. 이것이 실행 자체를 가능하게 만든 �
 
 ## 4. 레시피
 
+서버에는 체크아웃이 없다(저장소 규칙: `git clone` 금지, `scp`만). 스크립트가 필요로 하는 두
+디렉터리를 저장소의 상대 배치 그대로 복사한다 — `so101_reach_env.py`가 씬을
+`../../../tests/fixtures/mjcf/so101_pick_place.xml`로 찾고, 파생 XML도 같은 경로로
+`include`하기 때문이다:
+
+```bash
+scp -r python/es/rl_source LJM@192.168.100.14:~/Projects/es-s2c/python/es/
+scp tests/fixtures/mjcf/so101_pick_place.xml \
+    LJM@192.168.100.14:~/Projects/es-s2c/tests/fixtures/mjcf/
+```
+
 ```bash
 ssh LJM@192.168.100.14
-cd ~/Projects/es-s2c/python/es/rl_source          # 저장소의 python/es/rl_source/ + 씬
+cd ~/Projects/es-s2c/python/es/rl_source
 export XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=.3
 export XLA_FLAGS=--xla_gpu_deterministic_ops=true
 

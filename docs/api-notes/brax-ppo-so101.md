@@ -153,9 +153,20 @@ reaches the table, itself, or the cube. Contact counts, by contrast, are what th
 
 ## 4. The recipe
 
+The server holds no checkout (repo rule: `scp`, never `git clone`). Mirror the two directories
+the scripts need, keeping the repo's relative layout — `so101_reach_env.py` resolves the scene
+as `../../../tests/fixtures/mjcf/so101_pick_place.xml`, and the derived XML `include`s it by the
+same path:
+
+```bash
+scp -r python/es/rl_source LJM@192.168.100.14:~/Projects/es-s2c/python/es/
+scp tests/fixtures/mjcf/so101_pick_place.xml \
+    LJM@192.168.100.14:~/Projects/es-s2c/tests/fixtures/mjcf/
+```
+
 ```bash
 ssh LJM@192.168.100.14
-cd ~/Projects/es-s2c/python/es/rl_source          # the repo's python/es/rl_source/ + the scene
+cd ~/Projects/es-s2c/python/es/rl_source
 export XLA_PYTHON_CLIENT_PREALLOCATE=false XLA_PYTHON_CLIENT_MEM_FRACTION=.3
 export XLA_FLAGS=--xla_gpu_deterministic_ops=true
 
