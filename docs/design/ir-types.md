@@ -100,6 +100,35 @@ not a silent hold. Joining two different `Window`s is also an error: the learnin
 carry a type hash identically across machines. `Normalized`'s two `f64`s go through the writer's
 float rule (−0.0 → 0.0, NaN rejected); no other float reaches the hash from this module.
 
+## The Task IR's sensor source (`ObsSource::Sensor`, packet M7/R5)
+
+```
+Sensor { id, format, render: SensorRender }
+SensorRender { path: Rs | Pt { spp, bounces }, exposure: f32, tonemap: Reinhard | Aces }
+```
+
+`render` says how the *simulation* produces the channel; `ImageSpec` says what the channel
+*is*. Keeping them apart is what lets `observation.toml` serve a rasterized and a path-traced
+task without a node changing, and it is why `render` is not an `ImageSpec` field — an
+`ImageSpec` describes a camera a real robot could also have, and "64 samples per pixel" is not
+something a real camera has.
+
+Two rules make the field free for every document that does not use it:
+
+- **`#[serde(default, skip_serializing_if = "SensorRender::is_default")]`**, so a document that
+  never mentions `render` round-trips to the same bytes.
+- **`ObsSource::canonical` writes the block only when it is not the default**, so `task_hash`
+  is a function of what a document *says*, not of what the type could say. An absent `render`
+  and an explicitly written default one are the same document and the same hash;
+  `crates/es-ir/tests/sensor_render.rs` asserts both against the committed
+  `task_hash eb6efefa…`.
+
+The same trick would work for any later field whose default is today's behaviour, and it is the
+IR-side reading of §28.10 rule 1. What it costs is that the canonical encoding is no longer a
+straight walk of the struct — a field added *inside* `SensorRender` without extending
+`SensorRender::canonical` would be invisible to the hash, which is why the second test in that
+file changes every knob one at a time and asserts the hash moves.
+
 ## Where the vocabulary lives (`es-ir-types`, layer 2)
 
 `es-ir` holds the five IRs, the graph skeleton and the graph canonicalizer; everything below

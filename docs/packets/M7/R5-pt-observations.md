@@ -86,8 +86,14 @@ crates/es/src/cmd/showcase.rs
 crates/es/tests/cli.rs
 crates/es/tests/video.rs
 tests/fixtures/visible-learning/task-pt.toml
+tests/fixtures/visible-learning/observation-pt.toml
 tests/fixtures/visible-learning/evaluation-pt.toml
 tests/fixtures/visible-learning/training-u4.toml
+crates/es-data/src/roboverse.rs
+crates/es-data/tests/lerobot_config.rs
+crates/es-data/tests/loop_learning.rs
+crates/es-editor/tests/common/mod.rs
+crates/es-runtime-embedded/tests/embedded.rs
 docs/ARCHITECTURE.ko.md
 docs/ARCHITECTURE.md
 docs/design/renderer.md
@@ -105,6 +111,20 @@ docs/packets/M7/R5-pt-observations.ko.md
 `es-env/src/render.rs` (`sensor_cfg`, the two pass-through fields), `es-env/tests`, the three
 CLI call sites, `cli.rs`/`video.rs` (PT collect/eval/showcase tests), the three new fixtures,
 the spec paragraph (both files, one commit), the three design notes, this packet.
+
+**Amended while building (M7/R5, recorded rather than taken quietly).** Two things the list
+above could not know:
+
+* A public struct **variant** cannot grow a field without every struct literal of it growing
+  one too, so the five neighbouring construction sites (`es-data/src/roboverse.rs`,
+  `es-data/tests/{lerobot_config,loop_learning}.rs`, `es-editor/tests/common/mod.rs`,
+  `es-runtime-embedded/tests/embedded.rs`) are in scope for exactly one line each:
+  `render: SensorRender::default()`. No other line of those files changed.
+* `observation-pt.toml` is a **fourth** fixture, not an optional one: `ObservationIr::task_ref`
+  is hash input and `XIR_001` requires it to equal the task's own hash, so a `Pt` Task IR
+  cannot reuse the committed Observation IR document even though its graph is byte-identical.
+  `evaluation-pt.toml` has to name that document's `observation_hash`, so the packet's
+  "the committed `evaluation.toml` naming `task-pt`'s hash" is one field short.
 
 ## oracle
 

@@ -1456,3 +1456,143 @@ which is a clean silhouette of the arm and the wake it drags behind it.
 - **Adaptive `max_history`.** The paper's `alpha` is fixed too; a per-pixel one driven by a
   temporal gradient is the next thing anyone would add, and it is another data-dependent
   quantity to make deterministic.
+
+## 12. The observation path gets a render path (M7/R5)
+
+Packet `docs/packets/M7/R5-pt-observations.md`. Everything above this section is about a
+renderer a *person* looks at. This one is about the renderer a *policy* looks at, and the
+question it answers is the owner's: **is there no PT-based training?** There was not, and the
+reason was not the path tracer — [section 10](#10-the-path-tracer-grows-up-m7r3) gave it NEE,
+a tone map and an `Rgb8` output — but that nothing could *ask* for it. The three places that
+build an `EnvRendererCfg` (`es loop collect --frames`, `es eval run --frames`, `es video
+showcase`) hard-coded `RenderPath::Rs`, and R3 deliberately kept the PT knobs off that config
+([section 9.5](#95-why-the-observation-path-did-not-get-the-knob)).
+
+### 12.1 The declaration is the Task IR's, and it is free until it is used
+
+`es_ir::task::ObsSource::Sensor` gains one field:
+
+```rust
+SensorRender { path: Rs | Pt { spp, bounces }, exposure: f32, tonemap: Reinhard | Aces }
+```
+
+Not an `ImageSpec` field and not an Observation IR one. What the sensor **is** — 96×96, Rgb,
+sRGB, these intrinsics — is `ImageSpec`'s; how the simulation **makes** it is the Task IR's.
+That split is what lets one Observation IR graph serve an `Rs` and a `Pt` task unchanged, and
+it is the reason `INV-14` is not in play here: nothing resizes, nothing rescales.
+
+**Absent = default = today's canonical form.** `ObsSource::canonical` writes the block only
+when `render != SensorRender::default()`, so the encoding of every committed document is the
+byte sequence it always was and `task_hash eb6efefa…` is unmoved —
+`crates/es-ir/tests/sensor_render.rs` asserts that number against the committed `task.toml`,
+and asserts that writing the default block out by hand (`render = { path = "rs", exposure =
+1.0, tonemap = "reinhard" }`) hashes to the same thing. §28.10 rule 1, applied to an IR field
+rather than to a pixel.
+
+A `Pt` sensor does move `task_hash`, which is the point: it is a different comparison
+(§13.3), so it gets its own documents rather than being quietly judged by the committed ones.
+
+### 12.2 The finding nobody wanted: a new Task IR drags a new Observation IR behind it
+
+The packet expected `task-pt.toml` and `evaluation-pt.toml`. It needs a third document, and
+the reason is structural rather than a matter of taste:
+
+* `ObservationIr::task_ref` is **hash input** (`crates/es-ir/src/observation.rs`), and
+* `XIR_001` requires `task_ref` to equal the task's own hash.
+
+So §7.4's "several Observation IRs share one `task_hash`" has no mirror image: **one
+Observation IR cannot serve two Task IRs.** `observation-pt.toml`'s graph is byte-identical to
+`observation.toml`'s — every node, every port, every intrinsic — and its `observation_hash` is
+nevertheless different. Anything that changes a Task IR at all therefore re-issues the whole
+downstream document set, which is a cost the hash chain charges by design and which this is
+the first packet to pay in full.
+
+### 12.3 One function, and `Rs` is bitwise today's
+
+`es_env::render::sensor_cfg(camera, spec, render, frames_dir) -> EnvRendererCfg` replaces the
+three hand-built configs. `Rs` maps to `EnvRendererCfg::rgb(...)` **field for field** — the
+oracle is an `assert_eq!` on the whole struct, so a field added to `EnvRendererCfg` and
+forgotten in `sensor_cfg` fails the test rather than a golden six months later — and its
+`RenderConfig` re-renders `tests/golden/render/so101_frame0` bitwise. `Pt` maps to R3's
+estimator (NEE on, `ReSTIR` and `SVGF` off) and to **no accumulation**: R4's `temporal` is
+left `None` on this path on purpose, so an observation frame stays a pure function of the pose
+and the collector/evaluator parity oracle (T7) holds for `Pt` exactly as for `Rs`.
+
+`EnvRendererCfg` grows `exposure` and `tonemap` as a consequence, and they are **pass-through
+fields the document set**, not CLI knobs. R3's refusal stands: `es video showcase --exposure`
+is still the free camera's, and `--task` — the new flag that makes the showcase's scene camera
+follow the sensor — *refuses* `--path`, `--spp`, `--bounces`, `--exposure`, `--tonemap`,
+`--look`, `--accumulate`, `--max-history`, `--width` and `--height` beside it rather than
+letting one of the two silently win.
+
+### 12.4 Cost, measured on two cards
+
+`pt_observation_cost_and_ssim` (`crates/es-env/tests/render_loop.rs`, `--ignored`): the
+committed `nominal-00.estraj` trajectory, 32 ticks sampled across it, 96×96, whole-frame wall
+clock (tessellate, upload, dispatch, readback), one `Renderer` kept across the ticks exactly as
+`EnvRenderer` keeps it.
+
+| render | RTX 3060 (local) | RTX 4090 (oracle server) |
+|---|---|---|
+| `Rs` — today's observation | 2.77 ms/frame | 2.90 ms/frame |
+| `Pt` NEE, 64 spp, 3 bounces | **127.53 ms/frame** | **57.50 ms/frame** |
+| ratio | 46.0× | 19.8× |
+
+**The packet's "~3 ms for a 96×96 frame at 64 spp on the oracle server" was wrong by 19×.** It
+is 57.5 ms, and the number it was probably remembering is the `Rs` row. At 200
+demonstrations × ~185 ticks that is 35 minutes of collection against V15's 5; at 96 evaluation
+episodes it is hours, not minutes. Nothing here is a reason not to do it — it is a reason to
+know what it costs before starting.
+
+The `Rs` row is almost entirely upload and readback
+([section 8.4](#84-what-is-left-is-the-readback-and-it-is-es-gpus)): a 96×96 rasterization is
+nothing, and the two cards agree to within 5 % because neither is working. The `Pt` row is the
+trace, and there the 4090 is 2.2× the 3060.
+
+### 12.5 The §15.3 SSIM number at observation resolution
+
+Same 32 ticks, `es_render::ssim` on the `Rs` and the `Pt` observation of each:
+
+**mean 0.3547, min 0.3035, max 0.4227** — and **identical to four decimals on both cards**,
+which is the determinism claim of §3.4 showing up as a side effect: the two GPUs produced the
+same bytes.
+
+[Section 10.4](#104-the-153-ssim-number-finally-exists-and-it-is-low) measured 0.2910 between
+`Rs Full` and `Pt` at 320×180 through the showcase camera and explained why a threshold set
+from it would be a threshold on the scene's lighting. This is the same story at the size that
+matters for learning, against the `Rs` **`Lambert`** observation rather than the `Full` look,
+and it does not change the conclusion. `Target / Status: unverified` for any §15.3 threshold
+still stands; what this adds is that the number does not improve when you stop looking at the
+pretty render and start looking at the one the policy reads.
+
+### 12.6 The exposure, which is a decision this packet had to make
+
+The packet's sketch of `task-pt.toml` pinned `spp` and `bounces` and left `exposure` at its
+default of 1.0. At 1.0 the path-traced observation is **mean byte 34** against the rasterized
+observation's 188: the demo cell has one 0.24 m emissive panel and no directional light on the
+`Pt` path, so the honest picture is a dark one. Training a policy on it would have measured a
+brightness difference and called it a render path.
+
+The sweep, one tick, every rung, SSIM against the `Rs` observation of the same tick:
+
+| exposure | 1 | 2 | 4 | 8 | 16 | 32 | **64** | 128 |
+|---|---|---|---|---|---|---|---|---|
+| mean byte | 34 | 49 | 69 | 94 | 123 | 154 | **184** | 209 |
+| SSIM vs `Rs` | 0.1798 | 0.2351 | 0.2866 | 0.3296 | 0.3608 | 0.3845 | **0.4143** | 0.4655 |
+
+`exposure = 64` is the rung whose mean byte (184) is closest to the rasterized observation's
+(188), so **`task-pt.toml` declares 64** and the deviation from the packet is recorded here.
+The SSIM column keeps climbing past it for the reason section 10.4 gives — Reinhard flattening
+everything — which is exactly why the exposure was chosen on the mean byte and not on it.
+
+### 12.7 What R5 skips
+
+- **A `Pt` sensor with the `Rs` light.** Section 10.4's option 2 (give the path tracer the
+  rasterizer's directional light and hemisphere so the SSIM is about the renderers and not the
+  lighting) is still not tuned. `light_rgb` and `sky` are reachable from Rust and not from a
+  document; putting them on `SensorRender` would be the obvious next field and nobody has
+  asked for it.
+- **Accumulation on the observation path**, deliberately (section 12.3).
+- **A second image channel.** `--frames` still renders exactly one, so "one sensor `Pt`, one
+  sensor `Rs`" is not expressible end to end even though the IR would carry it.
+- **Anything about the free camera.** `es video showcase --path pt` is unchanged.
