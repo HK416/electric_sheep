@@ -4573,6 +4573,30 @@ U2 and U4 keep their pre-R1 rows; only U3 — the row the demo's acceptance turn
 harness's own expert gate are re-run, which is the smallest measurement that says what the
 semantics change did to a number anyone reads.
 
+### 7.34 As built (M8/S4c): the RL track
+
+This note's demo is imitation learning from demonstrations; plan S (`docs/design/rl-continuation.md`)
+is the other way in — a PPO actor trained in another framework, imported, and continued by RL in
+our own simulation. Its measurement lives there, in section 7; these are its headline numbers,
+oracle server 2026-09-21, artifacts `~/artifacts/plan-s/s4c/`, one Evaluation IR
+(`tests/fixtures/rl/evaluation-reach.toml`, `evaluation_hash f15fe888…`) over all of them:
+
+| row | `success_rate`, `nominal`, 16 held-out seeds |
+|---|---|
+| the source policy in the scene it trained in (brax's own evaluation) | 1.00 |
+| the same policy imported, scored here | **0.0000** |
+| imported + PPO, 4,000 iterations, 3 seeds | **0.0000** |
+| the same graph from scratch, same budget, 3 seeds | 0.0833 (best seed 0.2500) |
+| the committed 64 × 64 graph from scratch, same budget, 3 seeds | **0.4167** (best seed 0.5625) |
+
+**Continuation did not help, and it did not do anything**: the imported network's `tanh` squash is
+saturated on our observations (the smallest of the six pre-squash values measured over 50 control
+ticks is 23.7, where f32's `d tanh/dx` is exactly 0.0), so 4,000 PPO iterations leave its six
+tensors bit-identical and all three seeds share one `policy_hash`. What moves is `log_std` — the
+one parameter not behind the squash. The demo's own conclusion (section 7.29) is untouched by
+this; what it adds is that the reach task's acceptance is not met by either route yet, and that
+the smallest graph is still the best of the three at this budget.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:

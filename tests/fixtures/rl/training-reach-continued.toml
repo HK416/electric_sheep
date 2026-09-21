@@ -1,0 +1,63 @@
+# The reach task continued from an imported brax policy (packet M8/S4c): the same PPO route
+# `training-reach.toml` runs, starting from the weights `es policy import-rl` wrote instead of
+# from torch's own initialization.
+#
+# Two things differ from `training-reach.toml`, and nothing else does -- the budget, the
+# algorithm block and the optimizer are identical on purpose, because the row this recipe
+# measures is only meaningful against a control that shares them:
+#
+#  * `[policy] bundle` is the *imported* bundle, so the graph trained is the source's --
+#    26 -> [256, 256] -> 6, swish, `activate_output = true` on the encoder, `tanh` squash --
+#    and not `learning-reach.toml`'s 64 x 64 relu.
+#  * `[init] policy` is that same bundle, so the run starts at its weights (S1). Without it
+#    the trainer random-initializes the graph, which is exactly the "from scratch, same
+#    architecture" control: `training-reach-scratch.toml` is this file minus the `[init]`
+#    table, and the two are otherwise byte-identical.
+#
+# `runs/reach-001/imported.esb` is built by the import S4c re-ran against the committed reach
+# documents, from S2c's checkpoint (`docs/api-notes/brax-ppo-so101.md` section 6):
+#
+#     python/es/import_rl.py --from mujoco-playground --checkpoint <s2c-run>/ --out <neutral>
+#     es policy import-rl --manifest <neutral>/import.json --weights <neutral>/weights.safetensors \
+#         --adapter tests/fixtures/rl/adapter-so101.toml --task tests/fixtures/rl/task-reach.toml \
+#         --deployment tests/fixtures/rl/deployment-reach.toml --out <bundle>
+#     cp <bundle>/policy.esb runs/reach-001/imported.esb
+#
+# THE ONE DEVIATION, and it is measured rather than assumed (`docs/design/rl-continuation.md`
+# section 7, "S4c"): brax's observation normalizer is folded into the first Dense of the
+# neutral export before the import, so the bundle carries the committed
+# `observation-reach.toml` (identity `Range{-1, 1}`, `observation_hash 4ced8547...`) rather
+# than a `Normalize{MeanStd}` of its own. The folded network is the same function of the raw
+# observation; without the fold `es eval run` refuses the bundle by name (`XIR-040`: an
+# Evaluation IR judges the documents it names), and no row of the table could be compared to
+# any other.
+#
+# Seeds 1 and 2 of the measurement are this file with `[run] seed` changed and nothing else.
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-001/imported.esb"
+
+[init]
+policy = "runs/reach-001/imported.esb"
+
+[rl]
+algo        = "ppo"
+envs        = 16
+horizon     = 64
+epochs      = 4
+minibatches = 4
+gamma       = 0.99
+lam         = 0.95
+clip        = 0.2
+entropy     = 0.005
+value_coef  = 0.5
+
+[run]
+steps         = 4000
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [1000, 2000, 3000]
+device        = "cpu"
+interpreter   = "python"

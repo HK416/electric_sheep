@@ -286,8 +286,6 @@ Task IR(`tests/fixtures/rl/task-reach.toml`)은 기존 노드(`GetBodyPose`, `Ar
 (`tests/golden/rollout/so101_100steps.json`)은 움직이지 않았고, 이는 기존 채널의 캡처가
 하나도 움직이지 않았다는 가장 강한 진술이다.
 
-## 8. 사람을 위한 열린 질문
-
 ### S2b — `es policy import-rl`, 오라클 서버 `renderer-14`(Linux, 16코어 CPU), 2026-09-21
 
 산출물: `~/artifacts/plan-s/s2b/` (`brax/`, `rsl-rl/`, `rl-games/`). 소스 체크포인트:
@@ -350,6 +348,157 @@ Task IR(`tests/fixtures/rl/task-reach.toml`)은 기존 노드(`GetBodyPose`, `Ar
 프레임워크의 네이티브 레이아웃에서 `import_rl.py --synth`가 생성한 것이고, 셋은 **바이트 동일한
 리맵 가중치**를 낸다. 세 리더를 직접 돌리지 않고 Rust 쪽이 그들에 대해 말할 수 있는 유일한
 것이다. 첫 번째 안의 `TorchRuntime` 열기는 `ES_PYTHON`이 없으면 이유를 찍고 건너뛴다.
+
+### S4c — 이어붙이기 전과 후, 오라클 서버 `renderer-14`(Linux, 16코어 CPU), 2026-09-21
+
+산출물: `~/artifacts/plan-s/s4c/` (`imported/`, `continued-seed{0,1,2}/`, `scratch-seed{0,1,2}/`,
+`scratch64-seed{1,2}/`, 각각 자기 `eval/`을 가진다. 그리고 `logs/`와
+`compare-imported-continued-seed0.txt`). 트리는 `~/Projects/es-s4c`의 `a977255` 더하기 이 패킷의
+레시피 두 개, `cargo build --release -p es`, `es_native`는 이 트리에 맞게 다시 빌드했다.
+인터프리터 `~/venvs/es-lerobot-cuda/bin/python`, torch 2.11.0+cu129, mujoco 3.13.0. 소스
+체크포인트는 `~/artifacts/plan-s/s2c/seed0-run1/` (`source.npz` blake3 `8c0faf01…`). 레시피:
+`tests/fixtures/rl/training-reach-continued.toml`, `…-scratch.toml`, `training-reach.toml`.
+
+**이 표의 모든 행을 채점하는 Evaluation IR은 하나다** — `tests/fixtures/rl/evaluation-reach.toml`,
+홀드아웃 시드 201–216 16개, `nominal`과 `observation_delay` / `torque_noise` / `backlash`,
+그리고 `es eval run`을 통해 적용되는 Deployment IR의 선언된 지연시간(섹션 3). 아래 인용된 모든
+리포트에 `evaluation_hash f15fe888…`이 찍혀 있고, 모든 번들은 `task_hash b5d3b813…`,
+`observation_hash 4ced8547…`, `deployment_hash 7af05d88…`을 지닌다. 행들은 정책에서만 다르고 그
+밖의 무엇에서도 다르지 않으며, 이것은 형식이 아니라 측정의 전제다(§13.3).
+
+**표를 이 모양으로 만든 거절, 그리고 S2b는 그 일이 일어나기 전에 그 문단을 이미 썼다.** main의
+문서들에 대해 다시 임포트하면 — S2b는 S4e 이전의 Task IR에 대해 임포트했다 — S2c 정책은
+`task b5d3b813…`(S4e의 것이자 Evaluation IR의 것)과 `observation 21861ea5…`(brax의 러닝 통계를
+실은 자기 자신의 `Normalize{MeanStd}`)으로 해시된다. `es eval run`은 그 번들을 백엔드를 열기도
+전에, 5 ms 만에, 이름을 대며 거절한다:
+
+```
+error: tests/fixtures/rl/evaluation-reach.toml does not judge …/imported/bundle/policy.esb:
+ERROR XIR-040  evaluation references a different Task or Observation IR
+
+  evaluation observation reference is 4ced8547, the bundle hashes to 21861ea5
+
+  hint: spec 10.4: equal evaluation_hash means equal conditions
+```
+
+이것은 올바른 동작이고, 그 결과 임포트된 정책에는 행이 아예 남지 않는다. Evaluation IR을 바꾸는
+것은 §13.3이 금지하는 일이고 이 패킷이 금지당한 일이다. **그래서 이 표가 택한 편차:** brax의 입력
+정규화기를 임포트 전에 중립 내보내기의 첫 Dense에 접어 넣는다 —
+`y = W0·((x − mean)/std) + b0 = (W0/std)·x + (b0 − (W0/std)·mean)`, 날것의 관측에 대한 같은
+함수다 — 그리고 `obs_mean` / `obs_std`가 `null`인 매니페스트로 임포트를 다시 돌린다. 이것을
+편의가 아니라 정직으로 만드는 것은 세 가지다:
+
+* 임포터가 만드는 항등 `Range{−1, 1}` Observation IR이 커밋된 `observation-reach.toml`과 **비트
+  단위로 같다**: 다시 돌린 임포트는 `observation_hash 4ced8547…`을 찍고, 그것은
+  `regenerate_reach_documents`가 쓴 바로 그 문서다. 두 반쪽은 맞추지 않았는데도 일치한다;
+* 접기는 주장이 아니라 검사다: S2c 자신의 1,000행 오라클(`oracle-1000.npz`)에서 날것 관측 위의
+  접힌 네트워크와 정규화된 관측 위의 원본은 스쿼시된 행동에서 최대 절대 **2.575e-5** 차이가
+  난다 — 계층 (b)의 1e-5 허용오차보다 크고, 이유는 섹션 4가 이미 말한 것이다: 큐브의 z 채널은
+  `obs_std`가 1.79e-4여서 `1/std`가 약 5,600이고 f32 반올림도 함께 증폭된다. 이것은 측정을 위한
+  고쳐 쓰기이지 동치성 주장이 아니다;
+* 증폭 자체는 아무것도 바뀌지 않는다. `crates/es-data/src/rl_import.rs`는 `MeanStd` 정규화기가
+  "그 스케일을 벗어난 것을 1/std로 증폭한다"고 경고한다. 접든 접지 않든 같은 곱이 같은 `tanh`에
+  도달하며 — 그것이 바로 이어붙인 행들이 곧 부딪히는 것이다.
+
+**표.** `success_rate`와 `episode_length`는 `nominal` 스위트의 것이고, 학습이 있는 모든 행은 시드
+세 개의 평균과 최소 / 최대다. `policy_hash`는 번들 자신의 것(§5.3)이지 `training.lock`의 §19.3
+`H(training_hash, checkpoint_hash)`가 아니다 — 그것은 다른 것에 대한 다른 다이제스트다:
+
+| 행 | 그래프, 초기화 | `success_rate` (nominal) | `episode_length` | 해시 |
+|---|---|---|---|---|
+| **source** — S2c 정책에 대한 brax 자신의 평가, `brax-ppo-so101.md` 5.2 / 5.5에서 인용(64 에피소드, 이 Evaluation IR이 **아니다**) | 26 → [256, 256] → 6, swish + `tanh` | 학습한 파생 MJX 장면에서 **1.00**; 커밋된 장면에서 **0.00** | — (최종 거리 8.4 mm / 173.9 mm) | `source.npz` blake3 `8c0faf01…`; `policy_hash`도 `execution_hash`도 없다 — 우리 런타임이 아니다 |
+| **imported** — 같은 정책을 `es policy import-rl`로, 학습 없음 | 같은 그래프, 소스의 가중치 | **0.0000** | 200.0 (16개 중 16개 타임아웃) | `policy_hash 8aa810a7…`, `weights_hash 210894c0…`, `execution_hash c42adcd4…` |
+| **continued** — `[init] = imported`, PPO 4,000 반복, 시드 0 / 1 / 2 | 같은 그래프, 임포트 초기화 | **0.0000** (0.0000 / 0.0000) | 200.0 | `policy_hash 29cfcd15…` — **세 시드가 하나의 해시**; `training_hash 65ae522a…` / `54a3b46a…` / `7822b3f3…`; `execution_hash d2667368…`, 이것도 셋이 하나 |
+| **from scratch, 같은 아키텍처** — `[init]` 없는 같은 레시피, 시드 0 / 1 / 2 | 같은 그래프, 무작위 초기화 | **0.0833** (0.0000 / **0.2500**) | 189.9 (169.8 / 200.0) | `policy_hash 44223c82…` / `1cf1dbd9…` / `3dd1728d…`; `training_hash 6e366f4c…` / `5705eead…` / `eef2c569…`; `execution_hash 280ac541…` / `1111350d…` / `80102aa5…` |
+| **from scratch, S4e의 그래프** — `training-reach.toml`, 시드 0 / 1 / 2 | 26 → [64, 64] → 6, relu | **0.4167** (0.3125 / **0.5625**) | 143.4 (129.4 / 153.6) | `policy_hash ea84966d…` / `a5321975…` / `7f736adb…`; `training_hash 1933697d…` / `17876c12…` / `d759d683…`; `execution_hash 9ff75635…` / `22b55e10…` / `d72bee1b…` |
+| **expert** | — | **생략** | — | reach에는 스크립트 전문가가 없다 — `--expert`는 데모의 집어-놓기 시연자를 몬다 — 그래서 이 작업에서 §28.9 규칙 1의 하네스 점검은 전문가 게이트가 아니라 S4e의 0.5625 행이다 |
+
+시드별로, 산포를 추론하지 않고 읽을 수 있도록:
+
+| 실행 | 시드 | `success_rate` | `episode_length` | 롤아웃 `return`, 처음 → 마지막 | 롤아웃 `entropy`, 처음 → 마지막 | 벽시계 |
+|---|---|---|---|---|---|---|
+| `continued-seed0` | 0 | 0.0000 | 200.0 | −9.56 → −13.84 | 5.53 → **13.55** | 10m49.7s |
+| `continued-seed1` | 1 | 0.0000 | 200.0 | −10.07 → −11.51 | 5.52 → **13.57** | 10m50.3s |
+| `continued-seed2` | 2 | 0.0000 | 200.0 | −9.87 → −13.34 | 5.51 → **13.59** | 10m52.5s |
+| `scratch-seed0` | 0 | 0.0000 | 200.0 | −14.15 → −6.58 | 5.52 → 7.57 | 11m38.9s |
+| `scratch-seed1` | 1 | 0.0000 | 200.0 | −13.58 → −10.83 | 5.51 → 7.52 | 11m13.9s |
+| `scratch-seed2` | 2 | 0.2500 | 169.8 | −15.24 → −3.77 | 5.51 → 6.07 | 12m10.9s |
+| `scratch64-seed0` = S4e의 `run-4000` | 0 | 0.5625 | 129.4 | −15.76 → −4.74 | 5.52 → 4.87 | 12.6분 (단독) |
+| `scratch64-seed1` | 1 | 0.3750 | 147.2 | −14.72 → −4.23 | 5.51 → 4.76 | 12m1.5s |
+| `scratch64-seed2` | 2 | 0.3125 | 153.6 | −12.32 → −3.84 | 5.51 → 4.05 | 12m12.7s |
+
+S4e의 것을 뺀 모든 실행은 16코어 상자에서 **두 개씩 동시에** 돌았고, 그것이 부풀린 것은 벽시계뿐
+이다. 스레드 수는 트레이너 자신의 것이고 시드는 레시피의 것이다. 평가는 각각 한 프로세스,
+11.3초. `envelope_violation_rate`와 `executed_ne_sampled_rate`는 여덟 실행의 모든 반복에서, 그리고
+모든 평가 셀에서 **1.00**이다 — S4b와 S4e에서 그랬던 그대로.
+
+**교란 스위트, 시드 세 개의 평균**(게이트가 아니라 측정, §10.4):
+
+| 행 | `nominal` | `observation_delay` | `torque_noise` | `backlash` |
+|---|---|---|---|---|
+| imported | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| continued | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| from scratch, 같은 아키텍처 | 0.0833 | 0.0000 | 0.0625 | 0.0625 |
+| from scratch, S4e의 그래프 | 0.4167 | 0.1667 | 0.5208 | 0.4583 |
+
+**`es eval compare imported/eval/report.json continued-seed0/eval/report.json`**, 그대로. 네 개의
+`failure_mode_histogram` 행에서 둘째 칸만 줄였다(첫째 칸을 그대로 반복한다):
+
+```
+SUITE                METRIC                                  A              B          DELTA  SIGNIFICANT
+nominal              success_rate                     0.000000       0.000000      +0.000000  n/a (aggregate-only report)
+nominal              envelope_violation_rate          1.000000       1.000000      +0.000000  n/a (aggregate-only report)
+nominal              episode_length                 200.000000     200.000000      +0.000000  n/a (aggregate-only report)
+nominal              failure_mode_histogram     {"fallback": 16, "timeout": 16, "violation.acceleration": 128, "violation.chunk_underrun": 16, "violation.position": 3184, "violation.velocity": 720} {the same}            n/a  n/a
+observation_delay    success_rate                     0.000000       0.000000      +0.000000  n/a (aggregate-only report)
+observation_delay    envelope_violation_rate          1.000000       1.000000      +0.000000  n/a (aggregate-only report)
+observation_delay    episode_length                 200.000000     200.000000      +0.000000  n/a (aggregate-only report)
+observation_delay    failure_mode_histogram     {the same six counts} {the same}            n/a  n/a
+torque_noise         success_rate                     0.000000       0.000000      +0.000000  n/a (aggregate-only report)
+torque_noise         envelope_violation_rate          1.000000       1.000000      +0.000000  n/a (aggregate-only report)
+torque_noise         episode_length                 200.000000     200.000000      +0.000000  n/a (aggregate-only report)
+torque_noise         failure_mode_histogram     {the same six counts} {the same}            n/a  n/a
+backlash             success_rate                     0.000000       0.000000      +0.000000  n/a (aggregate-only report)
+backlash             envelope_violation_rate          1.000000       1.000000      +0.000000  n/a (aggregate-only report)
+backlash             episode_length                 200.000000     200.000000      +0.000000  n/a (aggregate-only report)
+backlash             failure_mode_histogram     {the same six counts} {the same}            n/a  n/a
+
+A: passed=false   B: passed=false
+```
+
+모든 델타가 `+0.000000`이고 모든 히스토그램이 개수까지 같은 이유는 **두 정책이 같은 함수**이기
+때문이다. PPO 4,000 반복 뒤에도 이어붙인 네트워크의 텐서 여섯 개는 임포트된 것과 비트 단위로
+같다: `weights/model-1000.safetensors`와 `weights/model-4000.safetensors`는 모든 텐서에서
+`weights/init.safetensors`와 최대 절대 **0.0** 차이이고, 세 시드 모두 그렇다. 그래서 세 시드는
+하나의 `weights_hash 16ba065f…`, 하나의 `policy_hash`, 하나의 `execution_hash`를 공유한다. 그런데도
+imported 행과 continued 행들의 `execution_hash`는 *다르며*, 이것은 옳고 또 알아둘 가치가 있다:
+체인은 가중치 **파일**을 해시하고(§5.3, `policy = weights_hash`), 임포터의 safetensors와 트레이너의
+safetensors는 같은 숫자를 다른 바이트 배치로 담는다. 임포트된 정책은 또 `observation_delay`에서
+`nominal`과 똑같은 궤적을 걷는다 — `traj/nominal-00.estraj`와 `traj/observation_delay-00.estraj`는
+같은 바이트다 — 즉 관측을 한 틱, 두 틱 늦춰도 그것이 하는 일은 하나도 바뀌지 않는다.
+
+**왜 아무것도 움직이지 않았는가, 추론이 아니라 측정으로.** 임포트된 액터에 도달하는 그래디언트는
+정확히 0이다. 커밋된 reach 문서를 `es_native.Rollout`으로 홀드아웃 시드 201에서 스텝하며 각 관측을
+접힌 네트워크에 통과시키면, 처음 50 제어 틱에서 여섯 개 스쿼시 이전 값 중 **가장 작은 것**이
+**23.7**, 가장 큰 것이 **340.3**이다. f32에서 그 두 크기 모두에 대해 `d tanh/dx`는 **정확히
+0.0**이다. 즉 여섯 출력 전부가 매 틱 포화해 있고, 스쿼시 뒤의 모든 가중치는 0 그래디언트를 받고,
+PPO는 스쿼시 뒤에 있지 않은 단 하나의 파라미터 `log_std`를 갱신한다. 그것이 올라가면서 롤아웃
+엔트로피는 5.53에서 13.55까지 오르고, 그동안 크리틱은 움직일 수 없는 정책을 상대로 평소의 일을
+한다(`value_loss` 2.47 → 11.77, 정점은 19.5). `first_nonfinite_step`은 `null`이고 발산한 것은
+없다. 트레이너의 실패가 아니라, 포화한 스쿼시에 PPO가 하는 일이다.
+
+**이것이 말하는 것.** 이어붙이기는 도움이 되지 않았고, 발견은 그것이 *아무것도* 하지 않았다는
+것이다. 이 작업에서, 이 예산에서, 임포트된 brax 정책은 출발점으로서 무(無)보다 못하다. 4,000
+반복으로는 학습이 끝나지 않는 256 × 256 네트워크를 비용으로 치르고, 그래디언트를 0으로 만드는
+스쿼시를 보태기 때문이다. 나머지는 대조군이 말한다: 같은 그래프도 무작위 초기화에서는 얼어붙지
+않고 학습하며(`return` −14.15 → −6.58) 세 시드 중 하나는 0.2500에 도달한다. 그리고 커밋된 64 × 64
+relu 그래프, 셋 중 가장 작은 것이 이 예산에서 가장 낫다 — 시드 세 개 평균 0.4167 — 이는 S4e가
+측정한 단일 시드를 자기 산포의 가운데가 아니라 **꼭대기**(0.5625)에 놓기도 한다. 이 표가 제안하는
+순서대로 절제(ablation)할 것 세 가지: 이어붙인 정책의 `tanh` 스쿼시(열린 질문 3 — `Squash`가 IR
+파라미터가 아니라 로워링의 일이라면 이어붙이기가 그것을 떼어낼 수 있다), 접기가 드러낸 관측 스케일
+(학습 중에 한 번도 움직이지 않았다는 이유로 5,600배 증폭된 채널을 입력으로 가진 정책은 E4가
+잡았을 정책이다), 그리고 여전히 1.00으로 측정되고 이 노트의 다른 모든 행에서 여전히 앞서는 열린
+질문 2.
 
 ## 8. 임포터와 어댑터
 

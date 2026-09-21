@@ -307,8 +307,6 @@ port equals the backend's own `qpos[0..6]`, `qvel[0..6]`, cube `qpos[6..13]` and
 (`tests/golden/rollout/so101_100steps.json`) is unmoved, which is the strongest statement that
 no existing channel's capture moved.
 
-## 8. Open questions for a human
-
 ### S2b — `es policy import-rl`, oracle server `renderer-14` (Linux, 16-core CPU), 2026-09-21
 
 Artifacts: `~/artifacts/plan-s/s2b/` (`brax/`, `rsl-rl/`, `rl-games/`). Source checkpoint:
@@ -373,6 +371,161 @@ over 1,000× narrower than the widest) rather than a threshold tuned to one numb
 remapped weights**, which is the only thing the Rust side can say about the three readers
 without running them. The `TorchRuntime` open inside the first skips with a printed reason when
 `ES_PYTHON` is unset.
+
+### S4c — before and after continuation, oracle server `renderer-14` (Linux, 16-core CPU), 2026-09-21
+
+Artifacts: `~/artifacts/plan-s/s4c/` (`imported/`, `continued-seed{0,1,2}/`, `scratch-seed{0,1,2}/`,
+`scratch64-seed{1,2}/`, each with its own `eval/`, plus `logs/` and
+`compare-imported-continued-seed0.txt`). Tree `~/Projects/es-s4c` at `a977255` plus this packet's
+two recipes, `cargo build --release -p es`, `es_native` rebuilt for it. Interpreter
+`~/venvs/es-lerobot-cuda/bin/python`, torch 2.11.0+cu129, mujoco 3.13.0. Source checkpoint
+`~/artifacts/plan-s/s2c/seed0-run1/` (`source.npz` blake3 `8c0faf01…`). Recipes:
+`tests/fixtures/rl/training-reach-continued.toml`, `…-scratch.toml`, `training-reach.toml`.
+
+**One Evaluation IR judges every row of this table** — `tests/fixtures/rl/evaluation-reach.toml`,
+16 held-out seeds 201–216, `nominal` plus `observation_delay` / `torque_noise` / `backlash`, the
+Deployment IR's declared latency applying through `es eval run` (section 3). `evaluation_hash
+f15fe888…` is on every report quoted below, and every bundle carries `task_hash b5d3b813…`,
+`observation_hash 4ced8547…` and `deployment_hash 7af05d88…`. The rows differ in the policy and in
+nothing else, which is the measurement's precondition and not a formality (§13.3).
+
+**The refusal that shaped the table, and S2b wrote its paragraph before it happened.** Re-imported
+against main's documents — S2b imported against a pre-S4e Task IR — the S2c policy hashes `task
+b5d3b813…`, S4e's and the Evaluation IR's, and `observation 21861ea5…`, its own
+`Normalize{MeanStd}` carrying brax's running statistics. `es eval run` refuses that bundle by name,
+in 5 ms, before it opens a backend:
+
+```
+error: tests/fixtures/rl/evaluation-reach.toml does not judge …/imported/bundle/policy.esb:
+ERROR XIR-040  evaluation references a different Task or Observation IR
+
+  evaluation observation reference is 4ced8547, the bundle hashes to 21861ea5
+
+  hint: spec 10.4: equal evaluation_hash means equal conditions
+```
+
+That is correct behaviour, and it leaves an imported policy with no row at all: changing the
+Evaluation IR is what §13.3 forbids and what this packet was forbidden to do. **The deviation this
+table took instead:** brax's input normalizer is folded into the first Dense of the neutral export
+before the import — `y = W0·((x − mean)/std) + b0 = (W0/std)·x + (b0 − (W0/std)·mean)`, the same
+function of the raw observation — and the import is re-run from a manifest whose `obs_mean` /
+`obs_std` are `null`. Three things make that honest rather than convenient:
+
+* the importer's identity-`Range{−1, 1}` Observation IR **is** the committed
+  `observation-reach.toml`, bit for bit: the re-import prints `observation_hash 4ced8547…`, the
+  document `regenerate_reach_documents` wrote. The two halves agree without being made to;
+* the fold is checked, not asserted: on S2c's own 1,000-row oracle (`oracle-1000.npz`) the folded
+  network on raw observations and the original on normalized ones differ by **2.575e-5** max abs
+  in the squashed action — above tier (b)'s 1e-5 tolerance, for the reason section 4 already
+  gives: the cube's z channel has `obs_std` 1.79e-4, so `1/std` is ~5,600 and f32 rounding is
+  amplified with it. It is a measurement's rewrite, not an equivalence claim;
+* it changes nothing about the amplification itself. `crates/es-data/src/rl_import.rs` warns that
+  a `MeanStd` normalizer "amplifies anything off that scale by 1/std"; folded or not, the same
+  product reaches the same `tanh` — which is exactly what the continued rows then run into.
+
+**The table.** `success_rate` and `episode_length` are the `nominal` suite's; every training row is
+three seeds, mean with min / max; `policy_hash` is the bundle's own (§5.3), not `training.lock`'s
+§19.3 `H(training_hash, checkpoint_hash)`, which is a different digest of a different thing:
+
+| row | graph, init | `success_rate` (nominal) | `episode_length` | hashes |
+|---|---|---|---|---|
+| **source** — brax's own evaluation of the S2c policy, quoted from `brax-ppo-so101.md` 5.2 / 5.5 (64 episodes, **not** this Evaluation IR) | 26 → [256, 256] → 6, swish + `tanh` | **1.00** in the derived MJX scene it trained in; **0.00** on the committed scene | — (final distance 8.4 mm / 173.9 mm) | `source.npz` blake3 `8c0faf01…`; no `policy_hash` and no `execution_hash` — it is not our runtime |
+| **imported** — the same policy through `es policy import-rl`, no training | the same graph, the source's weights | **0.0000** | 200.0 (timeout, 16 of 16) | `policy_hash 8aa810a7…`, `weights_hash 210894c0…`, `execution_hash c42adcd4…` |
+| **continued** — `[init] = imported`, PPO 4,000 iterations, seeds 0 / 1 / 2 | the same graph, imported init | **0.0000** (0.0000 / 0.0000) | 200.0 | `policy_hash 29cfcd15…` — **one hash for all three seeds**; `training_hash 65ae522a…` / `54a3b46a…` / `7822b3f3…`; `execution_hash d2667368…`, also one for all three |
+| **from scratch, same architecture** — the same recipe without `[init]`, seeds 0 / 1 / 2 | the same graph, random init | **0.0833** (0.0000 / **0.2500**) | 189.9 (169.8 / 200.0) | `policy_hash 44223c82…` / `1cf1dbd9…` / `3dd1728d…`; `training_hash 6e366f4c…` / `5705eead…` / `eef2c569…`; `execution_hash 280ac541…` / `1111350d…` / `80102aa5…` |
+| **from scratch, S4e's graph** — `training-reach.toml`, seeds 0 / 1 / 2 | 26 → [64, 64] → 6, relu | **0.4167** (0.3125 / **0.5625**) | 143.4 (129.4 / 153.6) | `policy_hash ea84966d…` / `a5321975…` / `7f736adb…`; `training_hash 1933697d…` / `17876c12…` / `d759d683…`; `execution_hash 9ff75635…` / `22b55e10…` / `d72bee1b…` |
+| **expert** | — | **omitted** | — | there is no scripted expert for reach — `--expert` drives the demo's pick-and-place demonstrator — so §28.9 rule 1's harness check on this task is S4e's 0.5625 row and not an expert gate |
+
+Per seed, so the spread is read rather than inferred:
+
+| run | seed | `success_rate` | `episode_length` | rollout `return`, first → last | rollout `entropy`, first → last | wall clock |
+|---|---|---|---|---|---|---|
+| `continued-seed0` | 0 | 0.0000 | 200.0 | −9.56 → −13.84 | 5.53 → **13.55** | 10m49.7s |
+| `continued-seed1` | 1 | 0.0000 | 200.0 | −10.07 → −11.51 | 5.52 → **13.57** | 10m50.3s |
+| `continued-seed2` | 2 | 0.0000 | 200.0 | −9.87 → −13.34 | 5.51 → **13.59** | 10m52.5s |
+| `scratch-seed0` | 0 | 0.0000 | 200.0 | −14.15 → −6.58 | 5.52 → 7.57 | 11m38.9s |
+| `scratch-seed1` | 1 | 0.0000 | 200.0 | −13.58 → −10.83 | 5.51 → 7.52 | 11m13.9s |
+| `scratch-seed2` | 2 | 0.2500 | 169.8 | −15.24 → −3.77 | 5.51 → 6.07 | 12m10.9s |
+| `scratch64-seed0` = S4e's `run-4000` | 0 | 0.5625 | 129.4 | −15.76 → −4.74 | 5.52 → 4.87 | 12.6 min (alone) |
+| `scratch64-seed1` | 1 | 0.3750 | 147.2 | −14.72 → −4.23 | 5.51 → 4.76 | 12m1.5s |
+| `scratch64-seed2` | 2 | 0.3125 | 153.6 | −12.32 → −3.84 | 5.51 → 4.05 | 12m12.7s |
+
+Every run but S4e's ran **two at a time** on the 16-core box, which inflates its wall clock and
+nothing else: the thread count is the trainer's own and the seed is the recipe's. Each evaluation
+is one process, 11.3 s. `envelope_violation_rate` and `executed_ne_sampled_rate` read **1.00** in
+every iteration of all eight runs and in every evaluation cell, as they did in S4b and in S4e.
+
+**The perturbed suites, mean over the three seeds** (measurements, not gates, §10.4):
+
+| row | `nominal` | `observation_delay` | `torque_noise` | `backlash` |
+|---|---|---|---|---|
+| imported | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| continued | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+| from scratch, same architecture | 0.0833 | 0.0000 | 0.0625 | 0.0625 |
+| from scratch, S4e's graph | 0.4167 | 0.1667 | 0.5208 | 0.4583 |
+
+**`es eval compare imported/eval/report.json continued-seed0/eval/report.json`**, verbatim, with
+the four `failure_mode_histogram` rows' second cell abbreviated (it repeats the first):
+
+```
+SUITE                METRIC                                  A              B          DELTA  SIGNIFICANT
+nominal              success_rate                     0.000000       0.000000      +0.000000  n/a (aggregate-only report)
+nominal              envelope_violation_rate          1.000000       1.000000      +0.000000  n/a (aggregate-only report)
+nominal              episode_length                 200.000000     200.000000      +0.000000  n/a (aggregate-only report)
+nominal              failure_mode_histogram     {"fallback": 16, "timeout": 16, "violation.acceleration": 128, "violation.chunk_underrun": 16, "violation.position": 3184, "violation.velocity": 720} {the same}            n/a  n/a
+observation_delay    success_rate                     0.000000       0.000000      +0.000000  n/a (aggregate-only report)
+observation_delay    envelope_violation_rate          1.000000       1.000000      +0.000000  n/a (aggregate-only report)
+observation_delay    episode_length                 200.000000     200.000000      +0.000000  n/a (aggregate-only report)
+observation_delay    failure_mode_histogram     {the same six counts} {the same}            n/a  n/a
+torque_noise         success_rate                     0.000000       0.000000      +0.000000  n/a (aggregate-only report)
+torque_noise         envelope_violation_rate          1.000000       1.000000      +0.000000  n/a (aggregate-only report)
+torque_noise         episode_length                 200.000000     200.000000      +0.000000  n/a (aggregate-only report)
+torque_noise         failure_mode_histogram     {the same six counts} {the same}            n/a  n/a
+backlash             success_rate                     0.000000       0.000000      +0.000000  n/a (aggregate-only report)
+backlash             envelope_violation_rate          1.000000       1.000000      +0.000000  n/a (aggregate-only report)
+backlash             episode_length                 200.000000     200.000000      +0.000000  n/a (aggregate-only report)
+backlash             failure_mode_histogram     {the same six counts} {the same}            n/a  n/a
+
+A: passed=false   B: passed=false
+```
+
+Every delta is `+0.000000` and every histogram is identical to the count, because **the two
+policies are the same function**. After 4,000 PPO iterations the continued network's six tensors
+are bit-identical to the imported ones: `weights/model-1000.safetensors` and
+`weights/model-4000.safetensors` differ from `weights/init.safetensors` by **0.0** max abs in every
+tensor, in all three seeds, so the three seeds share one `weights_hash 16ba065f…`, one
+`policy_hash` and one `execution_hash`. The imported row and the continued rows nevertheless carry
+*different* `execution_hash`es, which is correct and worth knowing: the chain hashes the weights
+**file** (§5.3, `policy = weights_hash`), and the importer's safetensors and the trainer's carry
+the same numbers in a different byte layout. The imported policy also walks the identical
+trajectory under `observation_delay` as under `nominal` — `traj/nominal-00.estraj` and
+`traj/observation_delay-00.estraj` are the same bytes — so delaying its observation by one and two
+control steps changes nothing it does.
+
+**Why nothing moved, measured rather than reasoned.** The gradient that reaches the imported actor
+is exactly zero. Stepping the committed reach documents through `es_native.Rollout` on held-out
+seed 201 and pushing each observation through the folded network, the **smallest** of the six
+pre-squash values over the first 50 control ticks is **23.7** and the largest **340.3**; in f32,
+`d tanh/dx` at both of those magnitudes is **exactly 0.0**. So every one of the six outputs is
+saturated at every tick, every weight behind the squash gets a zero gradient, and PPO updates the
+one parameter that is not behind it: `log_std`, which climbs until the rollout entropy reads 13.55
+(from 5.53) while the critic does its ordinary work (`value_loss` 2.47 → 11.77 through a peak of
+19.5) against a policy that cannot move. `first_nonfinite_step` is `null`; nothing diverged. It is
+not a failure of the trainer — it is what PPO does to a saturated squash.
+
+**What it says.** Continuation did not help, and the finding is that it did not do *anything*: on
+this task, at this budget, an imported brax policy is worth less than nothing as a starting point.
+It costs a 256 × 256 network that 4,000 iterations do not finish training, and it contributes a
+squash that zeroes the gradient. The controls say the rest: the same graph from random init is not
+frozen — it learns (`return` −14.15 → −6.58) and one seed in three reaches 0.2500 — and the
+committed 64 × 64 relu graph, the smallest of the three, is the best of them at this budget, 0.4167
+mean over three seeds, which also places S4e's single measured seed at the **top** of its own
+spread (0.5625) rather than in the middle of it. Three things to ablate, in the order this table
+suggests them: the `tanh` squash on a continued policy (open question 3 — were `Squash` the
+lowering's business rather than an IR parameter, a continuation could drop it); the observation
+scale the fold exposes (a policy whose input carries a channel amplified 5,600× because it never
+moved in training is a policy E4 would have caught); and open question 2, still measured at 1.00
+and still ahead of both in every other row of this note.
 
 ## 8. The importer and the adapter
 
