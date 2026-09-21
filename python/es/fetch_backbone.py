@@ -44,12 +44,12 @@ import struct
 import sys
 from pathlib import Path
 
-# The weights this project is allowed to use, one row per architecture. Adding a row is a
-# licence decision (spec 29), which is why the table is explicit instead of `getattr`-ed.
-ARCHS = {
-    "resnet18": "ResNet18_Weights.IMAGENET1K_V1",
-    "resnet34": "ResNet34_Weights.IMAGENET1K_V1",
-}
+# The weights this project is allowed to use. One row, and a second one is a packet rather
+# than an edit: adding an architecture is a licence decision (spec 29) *and* a new pin, which
+# has to be measured on the oracle server and recorded in the design note. `es train` refuses
+# any `base_model` whose lock names a source outside `BASE_MODEL_SOURCE`, so the two sides of
+# this list cannot drift apart silently.
+ARCHS = {"resnet18": "ResNet18_Weights.IMAGENET1K_V1"}
 
 LICENSE = "BSD-3-Clause"
 LICENSE_URL = "https://github.com/pytorch/vision/blob/main/LICENSE"
