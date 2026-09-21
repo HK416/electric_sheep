@@ -29,6 +29,7 @@ pub use model::edit::{Edit, EditSession};
 pub use model::graph_view::LayeredGraph;
 pub use model::image_view::{BeforeAfter, ImagePair, Rgb8Image};
 pub use model::inspector::{Field, Inspector, Widget};
+pub use model::launch::{Kind as LaunchKind, LaunchModel};
 pub use model::live_run::LiveRun;
 pub use model::palette::{Palette, Registries};
 pub use model::recent::{classify, Kind, Recent};
