@@ -194,6 +194,22 @@ impl ObservationBake {
                          row carries qpos and qvel only"
                     )))
                 }
+                // Same rule, for the two arms packet M8/S4e adds. `observation.state` does
+                // append `qvel`, but where it starts is `nq` — a property of the model that
+                // ran, not of the row — and `xpos`/`xquat` are not in the row at all. Named
+                // and refused rather than offset by a guess.
+                Capture::Qvel(_) | Capture::JointsVel(_) => {
+                    return Err(EvalError::Plan(format!(
+                        "observation input \"{name}\" reads joint velocities; a recorded row \
+                         is qpos followed by qvel and does not say where the second half begins"
+                    )))
+                }
+                Capture::BodyPose(_) => {
+                    return Err(EvalError::Plan(format!(
+                        "observation input \"{name}\" reads a body's pose from xpos and xquat; \
+                         a recorded row carries qpos and qvel only"
+                    )))
+                }
             };
             bytes.push((name.clone(), desc.dtype, desc.shape.clone(), data));
         }
