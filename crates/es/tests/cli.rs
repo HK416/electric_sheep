@@ -3327,6 +3327,14 @@ fn regenerate_visible_learning_documents() {
     use es_ir::observation::{Io, ObservationNode};
     use es_ir::task::{CmpOp, TaskNode};
     use es_ir::types::{ElemType, Shape};
+    // Spec 1.4: goldens and fixtures are CI read-only, and `cargo test -- --include-ignored`
+    // runs every ignored test; a generator must refuse to run by accident (M7 review).
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!(
+            "SKIP regenerate_visible_learning_documents: set ES_GENERATE_GOLDENS=1 to regenerate"
+        );
+        return;
+    }
 
     // The bin's interior in x, which is what the success predicate can see, and the cube's
     // draw. The draw stops 30 mm short of the bin's near wall in y: closer than that, the
@@ -6195,6 +6203,12 @@ fn go1_deployment(scene: &es_assets::scene::SceneDesc) -> DeploymentIr {
 #[test]
 #[ignore = "fixture generator; run explicitly"]
 fn regenerate_quadruped_documents() {
+    // Spec 1.4: goldens and fixtures are CI read-only, and `cargo test -- --include-ignored`
+    // runs every ignored test; a generator must refuse to run by accident (M7 review).
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP regenerate_quadruped_documents: set ES_GENERATE_GOLDENS=1 to regenerate");
+        return;
+    }
     let (scene, xml) = go1_scene();
     let task = go1_task(&scene, &xml);
     let observation = go1_observation(&task, &scene);
@@ -7474,6 +7488,12 @@ fn stderr_of(out: &Output) -> String {
 #[test]
 #[ignore = "golden generator; run explicitly"]
 fn generate_train_goldens() {
+    // Spec 1.4: goldens and fixtures are CI read-only, and `cargo test -- --include-ignored`
+    // runs every ignored test; a generator must refuse to run by accident (M7 review).
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP generate_train_goldens: set ES_GENERATE_GOLDENS=1 to regenerate");
+        return;
+    }
     let dir = scratch_dir("train-goldens");
     std::fs::create_dir_all(train_root().join("tests/golden/train")).expect("golden dir");
     for (recipe, golden) in TRAIN_RECIPES {
@@ -7621,6 +7641,12 @@ fn run_cycle(recipe: &str, out: &Path, extra: &[&str]) -> Output {
 #[test]
 #[ignore = "golden generator; run explicitly"]
 fn generate_cycle_golden() {
+    // Spec 1.4: goldens and fixtures are CI read-only, and `cargo test -- --include-ignored`
+    // runs every ignored test; a generator must refuse to run by accident (M7 review).
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP generate_cycle_golden: set ES_GENERATE_GOLDENS=1 to regenerate");
+        return;
+    }
     let dir = scratch_dir("cycle-golden");
     let out = run_cycle(CYCLE_RECIPE, &dir, &["--dry-run"]);
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
@@ -8718,6 +8744,14 @@ fn generate_augmented_observation_fixture() {
     use es_ir::image::{ImageSpec, Intrinsics};
     use es_ir::observation::{AugmentKind, CropMode, Io, ObservationNode, ObservationOutput, OUT};
     use es_ir::types::Shape;
+    // Spec 1.4: goldens and fixtures are CI read-only, and `cargo test -- --include-ignored`
+    // runs every ignored test; a generator must refuse to run by accident (M7 review).
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!(
+            "SKIP generate_augmented_observation_fixture: set ES_GENERATE_GOLDENS=1 to regenerate"
+        );
+        return;
+    }
 
     let committed = std::fs::read_to_string(vl_fixture("observation.toml")).expect("read");
     let base = es_ir::serial::observation_from_toml(&committed).expect("observation.toml");
