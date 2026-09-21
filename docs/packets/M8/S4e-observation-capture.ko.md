@@ -60,6 +60,11 @@ crates/es-ir/src/**
 crates/es-ir/tests/**
 crates/es-eval/src/runner.rs
 crates/es-eval/tests/**
+crates/es-eval/src/bake.rs
+crates/es-data/src/roboverse.rs
+crates/es-data/tests/**
+crates/es-editor/tests/common/mod.rs
+crates/es-runtime-embedded/tests/embedded.rs
 crates/es-py/src/rollout.rs
 crates/es-py/tests/**
 crates/es/tests/cli.rs
