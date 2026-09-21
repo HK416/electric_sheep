@@ -196,6 +196,12 @@ impl EditorApp {
     /// the sentence a machine with no CJK font gets is a table entry, filled with the list of
     /// paths that were tried.
     pub fn apply_style(&mut self, ctx: &egui::Context) {
+        // The status line is the one sentence that outlives the frame that wrote it, so a
+        // language switch with nothing open has to re-read it; anything actually opened has
+        // already replaced it with news of its own.
+        if self.opened.is_none() && self.run.is_none() {
+            self.status = self.t("status.nothing_open").to_owned();
+        }
         let mut definitions = egui::FontDefinitions::default();
         if let Err(tried) = fonts::install(&mut definitions) {
             self.status = self.fill("status.font_missing", &[&tried.join(", ")]);
@@ -221,7 +227,6 @@ impl EditorApp {
                     .get_string(recent::TEXT_SIZE_KEY)
                     .unwrap_or_default(),
             );
-            self.status = self.t("status.nothing_open").to_owned();
         }
         self
     }
@@ -456,8 +461,10 @@ impl eframe::App for EditorApp {
                 }
                 // The two display settings, at the right-hand end: out of the way of the
                 // work, and on every screen rather than behind a menu someone has to find.
+                // Right to left, so the pair sits at the far end of the bar; the sizes are
+                // reversed with it so they still read S, M, L.
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    for size in fonts::TextSize::ALL {
+                    for size in fonts::TextSize::ALL.into_iter().rev() {
                         if ui
                             .selectable_label(
                                 self.settings.text_size == size,
@@ -815,16 +822,18 @@ impl EditorApp {
     }
 
     fn graph_tab(&mut self, ui: &mut egui::Ui) {
+        // Nothing open: the home screen, and no search box - there is nothing to find yet,
+        // and an empty control is one more thing to wonder about (packet M7/E6).
+        if self.edit.is_none() && self.opened.is_none() {
+            self.home(ui);
+            return;
+        }
         self.search_bar(ui);
         if self.edit.is_some() {
             self.edit_canvas(ui);
             return;
         }
         let hit = self.search.current();
-        if self.opened.is_none() {
-            self.home(ui);
-            return;
-        }
         let Some(opened) = &self.opened else {
             return;
         };
@@ -1113,7 +1122,7 @@ impl EditorApp {
                         ui.label(i18n::t(
                             lang,
                             if row.has_traj {
-                                "results.pass"
+                                "value.yes"
                             } else {
                                 "value.none"
                             },

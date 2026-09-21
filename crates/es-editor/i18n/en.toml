@@ -97,6 +97,7 @@
 "results.no_events" = "This run kept no per-step history."
 "value.histogram" = "{} cause(s)"
 "value.not_measured" = "not measured"
+"value.yes" = "yes"
 "value.none" = "--"
 
 # --- the metrics. Plain names; the hover is the raw one, straight off MetricSpec. --------

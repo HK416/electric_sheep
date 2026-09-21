@@ -96,6 +96,7 @@
 "results.no_events" = "이 실행은 걸음마다의 기록을 남기지 않았습니다."
 "value.histogram" = "원인 {}가지"
 "value.not_measured" = "재지 않음"
+"value.yes" = "있음"
 "value.none" = "--"
 
 # --- 지표. 쉬운 이름을 쓰고, 원래 이름은 마우스를 올리면 나온다. ----------------------------
