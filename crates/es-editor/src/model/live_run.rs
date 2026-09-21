@@ -85,7 +85,15 @@ impl LiveRun {
         match (frame.stream, &frame.payload) {
             (STREAM_EVENTS, Payload::Event { kind, fields }) => self.event(kind, fields),
             (STREAM_TICKS, Payload::Scalars(v)) => self.tick(v),
-            (STREAM_IMAGE, Payload::Image { w, h, format, bytes }) => {
+            (
+                STREAM_IMAGE,
+                Payload::Image {
+                    w,
+                    h,
+                    format,
+                    bytes,
+                },
+            ) => {
                 self.image = rgb8(*w, *h, format, bytes);
                 self.images += 1;
             }
@@ -321,12 +329,14 @@ mod tests {
     /// `report.json` for the suite rows, `evaluation.lock` for the seeds, and the directory
     /// listing for the counts a `cell.end` carries.
     fn messages_for(dir: &Path) -> Vec<Message> {
-        let report: es_ir::evaluation::EvaluationReport =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("report.json")).expect("report"))
-                .expect("report.json");
-        let events: BTreeMap<String, Vec<StepEvent>> =
-            serde_json::from_str(&std::fs::read_to_string(dir.join("events.json")).expect("events"))
-                .expect("events.json");
+        let report: es_ir::evaluation::EvaluationReport = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("report.json")).expect("report"),
+        )
+        .expect("report.json");
+        let events: BTreeMap<String, Vec<StepEvent>> = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("events.json")).expect("events"),
+        )
+        .expect("events.json");
         let lock: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(dir.join("evaluation.lock")).expect("lock"),
         )
@@ -368,13 +378,11 @@ mod tests {
                         ]),
                     ));
                 }
-                let frames = std::fs::read_dir(dir.join("frames").join(&cell))
-                    .map(|d| {
-                        d.flatten()
-                            .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
-                            .count()
-                    })
-                    .unwrap_or(0);
+                let frames = std::fs::read_dir(dir.join("frames").join(&cell)).map_or(0, |d| {
+                    d.flatten()
+                        .filter(|e| e.path().extension().is_some_and(|x| x == "bin"))
+                        .count()
+                });
                 let traj = dir.join("traj").join(format!("{cell}.estraj")).is_file();
                 out.push(event(
                     "cell.end",
@@ -443,7 +451,11 @@ mod tests {
                 row.name
             );
         }
-        assert!(live.status().contains("cell(s) finished"), "{}", live.status());
+        assert!(
+            live.status().contains("cell(s) finished"),
+            "{}",
+            live.status()
+        );
         println!(
             "RAN live_run_folds_streams_into_run_rows: {n} message(s), {} cell(s)",
             live.cells().len()
@@ -506,7 +518,11 @@ mod tests {
             ],
         ));
         assert_eq!(live.selected_cell().as_deref(), Some("nominal-00"));
-        assert!(live.status().contains("nominal-00 running"), "{}", live.status());
+        assert!(
+            live.status().contains("nominal-00 running"),
+            "{}",
+            live.status()
+        );
         live.ingest(&event(
             "cell.end",
             &[

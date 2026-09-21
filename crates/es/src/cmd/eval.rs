@@ -295,9 +295,11 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
             "--telemetry" => {
                 let v = val()?;
                 telemetry = Some(v.parse().map_err(|e| {
-                    CliError::Usage(format!("--telemetry {v:?} is not an address: {e}
+                    CliError::Usage(format!(
+                        "--telemetry {v:?} is not an address: {e}
 
-{RUN_HELP}"))
+{RUN_HELP}"
+                    ))
                 })?);
             }
             "--telemetry-token" => telemetry_token = Some(val()?.clone()),
@@ -420,7 +422,8 @@ fn run_typed<const NJ: usize, const H: usize>(
     cfg: &RunConfig,
     frames_dir: Option<&Path>,
     shard: (u32, u32),
-    mut sink: Option<&mut RunSink<'_>>,
+    // `mut` only under `render`, where the sink is offered to the frame-rendering call first.
+    #[cfg_attr(not(feature = "render"), allow(unused_mut))] mut sink: Option<&mut RunSink<'_>>,
 ) -> Result<es_eval::Shard, CliError> {
     let mut run = |frames: Option<&mut es_eval::runner::FrameSource<'_>>,
                    sink: Option<&mut RunSink<'_>>| {
@@ -457,7 +460,7 @@ fn run_typed<const NJ: usize, const H: usize>(
             };
         return run(Some(&mut source), sink.as_deref_mut());
     }
-    run(None, sink.as_deref_mut())
+    run(None, sink)
 }
 
 /// The renderer `--frames` needs, built from what the bundle's Task IR already declares.
@@ -822,7 +825,9 @@ fn wall_ns() -> u64 {
         .map_or(0, |d| d.as_nanos() as u64)
 }
 
-fn fields<const N: usize>(pairs: [(&str, String); N]) -> std::collections::BTreeMap<String, String> {
+fn fields<const N: usize>(
+    pairs: [(&str, String); N],
+) -> std::collections::BTreeMap<String, String> {
     pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
 }
 

@@ -523,3 +523,111 @@ worth less than the editor starting.
 - **Editing an Observation IR node's parameters.** No factory owns those kinds (`INV-17`), so
   they have no `NodeSchema` and no inspector — the same boundary `Edit::SetParam` reports as
   `FACTORY-001`.
+
+---
+
+## 13. A run watched while it runs: `--telemetry` and `--attach` (§23.1, §23.3, M7/E4)
+
+§10 opens a run that has finished. This is the same run before it has: `es eval run
+--telemetry 127.0.0.1:7777` publishes what it is doing, and `es-editor --attach
+127.0.0.1:7777` — or the Telemetry tab's **Attach** field and **Connect** button — reads it.
+§23.1: the editor hosts nothing; it is a client of a running process.
+
+### The shared type is E1's
+
+`model/live_run.rs` folds the four streams into `CellRow` and `Timeline`, which are
+`run_view.rs`'s own types. That is the whole design decision: **the Run tab has one table, one
+strip, one set of headers and one selection**, and it does not know which end its rows came
+from. `run_table` picks the rows in one `match` at the top
+
+| | finished (§10) | live (this section) |
+|---|---|---|
+| rows | `RunView::cells()` | `LiveRun::cells()` |
+| headers | `RunView::columns()` | `LiveRun::columns()` |
+| strip | `RunView::timeline(cell)` | `LiveRun::timeline(cell)` |
+| heading | `report.passed` | `LiveRun::status()` |
+| frames | `frames/<cell>/NNNNNN.bin` | the latest stream-4 image |
+
+and everything below it is the same code. The oracle
+(`live_run_folds_streams_into_run_rows`) is the equality itself: E1's committed fixture run is
+replayed as the messages a live run would have sent, and the resulting rows, headers and
+timelines must equal what `RunView::open` makes of the same directory. Two folds of the same
+`StepEvent` bits exist — `RunView::timeline` reads `events.json`, `LiveRun::timeline` reads the
+wire — because `run_view.rs` is not E4's file to change; the oracle is what stops them
+drifting.
+
+Two things a live run cannot have. There is no **acceptance verdict**: `report.json` is
+written after the last suite, so the heading is `LiveRun::status()` (*"live: nominal-01
+running, 2 of 3 cell(s) finished"*) and the acceptance list is empty. And there is no
+**sorting**: a live table is in cell-name order because its rows are still arriving, so
+clicking a header does nothing until the run is opened from disk. Selection works on both, and
+until someone clicks, the selected cell *is* the running one — so an attached editor draws the
+live strip with nobody touching it.
+
+### The four streams
+
+Named in `docs/design/telemetry-protocol.md` §9 ("Producers"), which is where the wire shape
+belongs. A stream id is data, not schema: `protocol.rs` is frozen at its version.
+
+| Stream | Payload | When |
+|---|---|---|
+| 1 | `Event { cell.begin \| cell.end \| suite.end }` | at each episode boundary, and once per suite |
+| 2 | `Scalars[frame, tick, source, violation bits]` | every control tick that captured an observation |
+| 3 | `Metrics(PerfMetrics)` | at each `cell.end` |
+| 4 | `Image { rgb8 }` | every `--telemetry-image-every N` ticks (default `0`, never) |
+
+Stream 2 is the `StepEvent` `events.json` records, as four numbers — the same record, not a
+second measurement, which is why the live rows can be *equal* to the finished ones rather than
+merely similar. `source` is `es_data::ActionSourceCode`'s numbering (`Policy 0, Clamped 1,
+Fallback 2, Human 3`), so the dataset column and the wire agree.
+
+### What the producer refuses to do
+
+- **Block.** Every frame goes out through `Server::publish`, which `try_send`s into each
+  client's 16-deep queue and *drops* on a full one (`telemetry-protocol.md` §6). The oracle
+  `eval_telemetry_never_blocks_the_run` attaches a client that never reads a byte, floods it
+  with images, and requires the run to finish with its report unchanged and the server's
+  dropped count above zero.
+- **Compute anything extra.** The sink is handed what the run already had: the `StepEvent` the
+  plane produced, the plan's own image buffer (borrowed, not copied), the counters, the
+  `CellResult`s `record_cell` returned. Without the flag nothing binds and nothing changes —
+  `report.json` and `events.json` are byte-identical, which the order oracle asserts by
+  comparing two runs.
+- **Publish from more than one process.** `--telemetry` needs `--jobs 1`: a `--jobs N` run's
+  cells happen in worker processes and only one of them could own the address. Refused by name
+  rather than half-published.
+
+`es-eval` gains no dependency on `es-telemetry` for any of this — both are layer 10 and §4.2
+forbids a same-layer dependency. The evaluator calls a closure (`es_eval::runner::RunSink`, a
+closure and not an eighth extension point, `INV-17`); `crates/es/src/cmd/eval.rs` — the one
+crate that links both — turns a `RunEvent` into a wire `Frame`.
+
+### Gate 9: what publishing costs the run (§28.7, §23.4)
+
+`es eval run` on the demo documents (one suite, three episodes of 60 control ticks, 96×96
+frames rendered every tick), `--jobs 1`, three runs each way, one attached subscriber draining
+every stream for the `--telemetry` runs. Ubuntu, RTX 4090, 16 cores, `cargo` debug build,
+`__LOAD__`:
+
+| | run 1 | run 2 | run 3 | median |
+|---|---|---|---|---|
+| `es eval run` | __P1__ s | __P2__ s | __P3__ s | __PM__ s |
+| `es eval run --telemetry` | __T1__ s | __T2__ s | __T3__ s | __TM__ s |
+
+**Observed overhead: __DELTA__** against §23.3's *"< 1 %"*. __VERDICT__
+
+The number is an observation of this run shape, not a general figure: 180 frames of JSON over
+a loopback socket beside a control tick that renders a frame and runs a torch forward pass.
+A training loop publishing at a higher rate, or a graph view subscribing to a tensor stream,
+is a different measurement — `Target / Status: unverified` for those.
+
+### Not here
+
+- **No producer outside `es eval run`.** `es loop collect` and `es train` publish nothing yet;
+  the sink is `Evaluation::run_shard_with_sink`'s argument and nothing else calls it.
+- **No reconnect.** A dropped connection is a dead `Source`: `try_recv` returns nothing
+  forever and the tab keeps what it has. Attaching again is the Connect button.
+- **No replay of a live run.** The Replay panel poses a `.estraj`, which a run writes at each
+  episode's end; watching a live one would be a second trajectory transport, not this.
+- **The image stream is off by default.** One 96×96 frame is 27 kB of pixels and about 100 kB
+  as JSON; publishing one every tick is the flood the backpressure oracle uses on purpose.

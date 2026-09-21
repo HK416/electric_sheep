@@ -7848,7 +7848,10 @@ fn telemetry_run_inputs(test: &str, dir: &Path) -> Option<(PathBuf, PathBuf)> {
         &train_fixture_recipe(&untrained, &root, &tiles, 0, "1e-4")
             .replace("steps = 40", "steps = 1")
             .replace("checkpoint_at = [40]", "checkpoint_at = [1]")
-            .replace("es-no-such-interpreter", &train_toml_path(Path::new(&python))),
+            .replace(
+                "es-no-such-interpreter",
+                &train_toml_path(Path::new(&python)),
+            ),
     );
     let trained = bin()
         .current_dir(train_root())
@@ -7958,7 +7961,7 @@ fn eval_telemetry_publishes_every_tick_in_order() {
     let port = free_loopback_port();
     let addr = format!("127.0.0.1:{port}");
     let socket: std::net::SocketAddr = addr.parse().expect("socket addr");
-    let received: std::sync::Arc<std::sync::Mutex<Vec<Message>>> = Default::default();
+    let received: std::sync::Arc<std::sync::Mutex<Vec<Message>>> = std::sync::Arc::default();
     let reader = {
         let received = std::sync::Arc::clone(&received);
         std::thread::spawn(move || {
@@ -8058,7 +8061,7 @@ fn eval_telemetry_publishes_every_tick_in_order() {
     }
     assert_eq!(
         begun,
-        cells.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+        cells.iter().map(|s| (*s).clone()).collect::<Vec<_>>()
     );
     assert_eq!(ended, begun);
     assert_eq!(suites_ended, 1);

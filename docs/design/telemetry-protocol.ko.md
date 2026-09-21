@@ -191,3 +191,40 @@ protobuf도, 스키마 컴파일러도, 소켓과 JSON 인코더 외의 어떤 �
   리미터(깊이 리미터가 아니라)로 바꾸는 것은 측정할 실제 프로듀서가 생긴 이후의 작업이다.
 - **재접속/재개 없음.** TCP 연결이 끊기면 클라이언트의 구독 상태를 잃는다; 재접속 후 처음부터
   다시 구독한다. `session_id` 기반의 재개는 존재하지 않는다.
+
+## 9. 이 저장소의 프로듀서 (패킷 M7/E4)
+
+§7은 *외부* 프로듀서가 무엇을 보내야 하는지를 말한다. 이것은 이 저장소 안의 프로듀서가 보내는
+것이다: `es eval run --telemetry <addr> [--telemetry-token <t>] [--telemetry-image-every <N>]`
+는 번들이나 씬, 두 파이썬 인터프리터 중 어느 것도 열기 전에 `Server`를 바인드하고 — 그래서
+출력된 주소로 붙는 뷰어가 첫 셀 전에 구독을 마친다 — 네 스트림으로 발행한다:
+
+| 스트림 | 페이로드 | 언제 |
+|---|---|---|
+| `1` | `Event { kind: "cell.begin" \| "cell.end" \| "suite.end", fields }` | `cell.begin`은 에피소드 시작(`cell`, `suite`, `seed`, `episode`), `cell.end`는 그 파일들이 쓰인 뒤(`cell`, `outcome`, `steps`, `frames`, `traj`), `suite.end`는 §10.1 행이 측정된 뒤(`suite`, `n_episodes`, `metric.<이름>`은 `MetricValue` 자신의 JSON) |
+| `2` | `Scalars([frame, tick, source, 위반 비트])` | 관측을 뚴 모든 제어 틱 |
+| `3` | `Metrics(PerfMetrics)` | `cell.end`마다: `actions_per_sec`, `policy_inferences_per_sec`, `chunk_underrun_rate`. 나머지는 전부 `None`이다 — 이 실행은 종단간 지연도 GPU 메모리도 측정하지 않고, §12.4는 0보다 빈칸을 원한다 |
+| `4` | `Image { format: "rgb8" }` | `--telemetry-image-every N` 틱마다; `0`(기본값)은 하나도 발행하지 않는다 |
+
+스트림 id는 **스키마가 아니라 데이터**다: `protocol.rs`는 그 어느 것도 이름짓지 않고, 모르는
+스트림을 받은 소비자는 그냥 무시하며(`es_editor::model::live_run`이 정확히 그렇게 한다), 다른
+프로듀서가 다른 번호를 골라도 여기서 깨지는 것은 없다. `Frame::stream`은 `u32`다.
+
+스트림 2는 한 샘플당 `es_eval::runner::StepEvent` 하나를 펼친 것이다: 셀 안의 프레임 인덱스,
+그것이 돌은 `PhysTick`, `es_data::ActionSourceCode`의 번호로 된 행동의 출처(`Policy 0, Clamped 1,
+Fallback 2, Human 3`), 그리고 `es_safety::EventSet::bits()`. 같은 스텝을 두 번 측정한 것이 아니라
+`events.json`이 받는 바로 그 기록이고, 그것이 에디터가 와이어로부터 끝난 실행의 행을 그대로
+다시 세울 수 있는 이유다(`docs/design/editor-shell.ko.md` §13).
+
+프로듀서가 지키는 규칙 둘과 와이어가 지킬 수 없는 규칙 하나:
+
+- **텔레메트리를 위해 계산하는 것은 없다.** 평가기는 이미 가지고 있던 것을 클로저에 건네고,
+  이미지 바이트는 다시 렌더하거나 복사하지 않고 플랜의 입력 버퍼에서 *빌린다*. `--telemetry`가
+  없으면 아무것도 바인드하지 않고 §10.5의 두 산출물은 바이트 단위로 같다.
+- **기다리는 것은 없다.** 발행은 §6의 논블로킹 팬아웃이므로, 리페인트에서 멈췄 에디터는 프레임을
+  잃고 실행은 그것을 모른다. `CLIENT_QUEUE_CAPACITY`가 측정이 아니라 추측이라는 §6의 메모는
+  그대로다 — M7/E4가 더한 것은 플로드사이드 비용의 측정(`editor-shell.ko.md` §13, 게이트 9)이지
+  튜닝된 큐가 아니다.
+- **토큰은 여전히 신뢰된 소켓 위의 평문이다**(§4). `--telemetry 127.0.0.1:7777`이 이것이 위하는
+  모양이다; 토큰을 달고 `0.0.0.0`에 바인드한다고 안전한 원격 채널이 되지는 않으며,
+  그것을 고치는 곳은 §6/§8의 TLS/QUIC 천장이다.

@@ -516,3 +516,107 @@ history().len())`를 키로. 그 사이에는 위젯이 자기 글자를 소유�
   최근 목록과 드래그 앤 드롭이 경로가 실제로 도착하는 세 경로를 덮는다.
 - **Observation IR 노드의 파라미터 편집.** 그 종류들을 소유하는 팩토리가 없으므로(`INV-17`)
   `NodeSchema`도 인스펙터도 없다 — `Edit::SetParam`이 `FACTORY-001`로 보고하는 그 경계다.
+
+---
+
+## 13. 돌아가는 동안 보는 실행: `--telemetry`와 `--attach` (§23.1, §23.3, M7/E4)
+
+§10은 끝난 실행을 엽다. 이것은 끝나기 전의 같은 실행이다: `es eval run --telemetry
+127.0.0.1:7777`이 지금 하는 일을 발행하고, `es-editor --attach 127.0.0.1:7777` — 또는
+Telemetry 탭의 **Attach** 필드와 **Connect** 버튼 — 이 그것을 읽는다. §23.1: 에디터는 아무것도
+호스팅하지 않고, 돌아가는 프로세스의 클라이언트다.
+
+### 공유하는 타입은 E1의 것이다
+
+`model/live_run.rs`는 네 스트림을 `CellRow`와 `Timeline`로 접는다. 둘 다 `run_view.rs`의
+타입이다. 그것이 설계 결정의 전부다: **Run 탭은 표 하나, 스트립 하나, 헤더 한 벌, 선택
+하나를** 가지고, 그 행이 어느 쪽에서 왔는지 알지 못한다. `run_table`은 맨 위 `match` 하나로
+행을 고르고
+
+| | 끝난 실행 (§10) | 살아 있는 실행 (이 절) |
+|---|---|---|
+| 행 | `RunView::cells()` | `LiveRun::cells()` |
+| 헤더 | `RunView::columns()` | `LiveRun::columns()` |
+| 스트립 | `RunView::timeline(cell)` | `LiveRun::timeline(cell)` |
+| 제목 | `report.passed` | `LiveRun::status()` |
+| 프레임 | `frames/<cell>/NNNNNN.bin` | 가장 최근의 4번 스트림 이미지 |
+
+그 아래는 전부 같은 코드다. 오라클(`live_run_folds_streams_into_run_rows`)은 바로 그
+동일성이다: E1의 커밋된 픽스처 실행을 살아 있는 실행이 보냈을 메시지로 재생하고, 그렇게 나온
+행·헤더·타임라인이 `RunView::open`이 같은 디렉터리로 만들어 내는 것과 같아야 한다. 같은
+`StepEvent` 비트를 접는 곳이 둘인 것 — `RunView::timeline`은 `events.json`을, `LiveRun::timeline`은
+와이어를 읽는다 — 은 `run_view.rs`가 E4가 고칠 파일이 아니기 때문이고, 둘이 조용히 엇갈리는 것을
+막는 것이 오라클이다.
+
+살아 있는 실행이 가질 수 없는 것이 둘 있다. **합격 판정**이 없다: `report.json`은 마지막 스위트
+뒤에 쓰이므로 제목은 `LiveRun::status()`(*"live: nominal-01 running, 2 of 3 cell(s)
+finished"*)이고 acceptance 목록은 비어 있다. 그리고 **정렬**이 없다: 살아 있는 표는 행이 아직
+도착하는 중이라 셀 이름 순서고, 헤더를 눌러도 디스크에서 열기 전에는 아무 일도 일어나지 않는다.
+선택은 양쪽 다 동작하고, 누군가 누를 때까지 선택된 셀은 *지금 돌아가는* 셀이다 — 붙은 에디터가
+아무도 건드리지 않아도 살아 있는 스트립을 그린다는 뜻이다.
+
+### 네 개의 스트림
+
+와이어 모양이 속한 곳인 `docs/design/telemetry-protocol.ko.md` §9("프로듀서")에서
+이름짓는다. 스트림 id는 스키마가 아니라 데이터다: `protocol.rs`는 그 버전에서 얼어 있다.
+
+| 스트림 | 페이로드 | 언제 |
+|---|---|---|
+| 1 | `Event { cell.begin \| cell.end \| suite.end }` | 에피소드 경계마다, 그리고 스위트당 한 번 |
+| 2 | `Scalars[frame, tick, source, 위반 비트]` | 관측을 뚴 모든 제어 틱 |
+| 3 | `Metrics(PerfMetrics)` | `cell.end`마다 |
+| 4 | `Image { rgb8 }` | `--telemetry-image-every N` 틱마다(기본 `0`, 안 보냄) |
+
+스트림 2는 `events.json`이 기록하는 바로 그 `StepEvent`를 네 개의 수로 보낸 것이다 — 두 번째
+측정이 아니라 같은 기록이고, 그래서 살아 있는 행이 끝난 행과 *같을* 수 있다. `source`는
+`es_data::ActionSourceCode`의 번호(`Policy 0, Clamped 1, Fallback 2, Human 3`)라, 데이터셋 컬럼과
+와이어가 같은 말을 한다.
+
+### 프로듀서가 하지 않는 것
+
+- **막히기.** 모든 프레임은 `Server::publish`로 나가고, 그것은 클라이언트마다의 16깊이 큐에
+  `try_send`하며 가득 찬 큐에서는 *버린다*(`telemetry-protocol.ko.md` §6). 오라클
+  `eval_telemetry_never_blocks_the_run`은 한 바이트도 읽지 않는 클라이언트를 붙이고 이미지로
+  쌓은 다음, 실행이 리포트가 바뀌지 않은 채 끝나고 서버의 dropped가 0보다 큼을 요구한다.
+- **더 계산하기.** 싱크에 건네지는 것은 실행이 이미 가지고 있던 것뿐이다: 플레인이 내놓은
+  `StepEvent`, 플랜의 이미지 버퍼(복사가 아니라 빌림), 카운터, `record_cell`이 돌려준
+  `CellResult`들. 플래그가 없으면 아무것도 바인드하지 않고 아무것도 달라지지 않는다 —
+  `report.json`과 `events.json`은 바이트 단위로 같고, 순서 오라클이 두 실행을 비교해 그것을
+  단언한다.
+- **두 프로세스 이상에서 발행하기.** `--telemetry`는 `--jobs 1`이 필요하다: `--jobs N` 실행의
+  셀은 워커 프로세스에서 일어나고 그중 하나만 주소를 가질 수 있다. 반쪽만 발행하는 대신
+  이름을 대며 거절한다.
+
+이 모든 것을 위해 `es-eval`은 `es-telemetry` 의존성을 얻지 않는다 — 둘 다 10층이고 §4.2는
+같은 층 의존을 금한다. 평가기는 클로저(`es_eval::runner::RunSink`, 여덟 번째 확장점이 아니라
+클로저다, `INV-17`)를 부르고, 둘을 모두 링크하는 유일한 곳인 `crates/es/src/cmd/eval.rs`가
+`RunEvent`를 와이어 `Frame`으로 바꿈다.
+
+### 게이트 9: 발행이 실행에 치르는 비용 (§28.7, §23.4)
+
+데모 문서로 돌린 `es eval run`(스위트 하나, 60 제어 틱짜리 에피소드 셋, 매 틱 96×96 프레임
+렌더링), `--jobs 1`, 양쪽 각각 세 번, `--telemetry` 실행에는 모든 스트림을 빨아들이는 구독자
+하나를 붙였다. Ubuntu, RTX 4090, 16 코어, `cargo` 디버그 빌드, `__LOAD__`:
+
+| | 1회 | 2회 | 3회 | 중앙값 |
+|---|---|---|---|---|
+| `es eval run` | __P1__ s | __P2__ s | __P3__ s | __PM__ s |
+| `es eval run --telemetry` | __T1__ s | __T2__ s | __T3__ s | __TM__ s |
+
+**관측된 오버헤드: __DELTA__**, §23.3의 *"< 1 %"*에 대해. __VERDICT_KO__
+
+이 수치는 일반적인 값이 아니라 이 실행 모양에 대한 관측이다: 프레임을 렌더하고 torch 순전파를
+돌리는 제어 틱 옆에서 루프백 소켓으로 180개의 JSON 프레임이 나간다. 더 높은 비율로 발행하는
+학습 루프나 텐서 스트림을 구독하는 그래프 뷰는 다른 측정이다 — 그쪽은 `Target / Status:
+unverified`다.
+
+### 여기 없는 것
+
+- **`es eval run` 밖의 프로듀서.** `es loop collect`와 `es train`은 아직 아무것도 발행하지
+  않는다; 싱크는 `Evaluation::run_shard_with_sink`의 인자이고 그것을 부르는 곳은 거기뿐이다.
+- **재접속.** 끊긴 연결은 죽은 `Source`다: `try_recv`는 영원히 아무것도 돌려주지 않고 탭은 가진
+  것을 유지한다. 다시 붙는 것은 Connect 버튼이다.
+- **살아 있는 실행의 리플레이.** Replay 패널은 에피소드가 끝날 때 쓰이는 `.estraj`를 자세로
+  되돌린다; 살아 있는 것을 보려면 두 번째 관절 전송이 필요하고, 그것은 이것이 아니다.
+- **이미지 스트림은 기본적으로 꺼져 있다.** 96×96 프레임 하나는 픽셀로 27 kB, JSON으로는 약
+  100 kB다; 매 틱 하나씩 발행하는 것이 백프레셔 오라클이 일부러 쓰는 홍수다.

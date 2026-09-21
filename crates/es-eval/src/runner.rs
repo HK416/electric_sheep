@@ -468,7 +468,17 @@ impl Evaluation {
         F: FnMut() -> B,
     {
         Self::run_shard_with_sink::<B, F, NJ, H>(
-            ir, task, scene, obs, policy, deploy, new_backend, cfg, frames, frames_dir, shard,
+            ir,
+            task,
+            scene,
+            obs,
+            policy,
+            deploy,
+            new_backend,
+            cfg,
+            frames,
+            frames_dir,
+            shard,
             None,
         )
     }
@@ -919,10 +929,8 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         let dropped = step_state.drop_observation();
         // Read before the ring is touched below: whether *this* step captured an observation
         // is what decides both the disk record and the live one.
-        let captured_now = !(dropped && !ring.is_empty());
-        if !captured_now {
-            extra_age += 1;
-        } else {
+        let captured_now = !dropped || ring.is_empty();
+        if captured_now {
             // Recorded where the frame is captured, not where the tick begins, so trajectory
             // index and frame index are the same number even under `observation_delay` --
             // which is what lets a replay be compared to the recorded frames (packet M5/V9).
@@ -976,6 +984,8 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
                 ring[ring_cursor] = out;
                 ring_cursor = (ring_cursor + 1) % ring.len();
             }
+        } else {
+            extra_age += 1;
         }
         // The oldest frame in the ring is the delayed observation (§10.2 `observation_delay`).
         let observed = &ring[if ring.len() > obs_delay {

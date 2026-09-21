@@ -197,3 +197,41 @@ frameworks already have on hand.
   real producer to measure against.
 - **No reconnect/resume.** A dropped TCP connection loses the client's subscription state; it
   reconnects and re-subscribes from scratch. There is no `session_id`-keyed resume.
+
+## 9. Producers in this repository (packet M7/E4)
+
+§7 says what a *foreign* producer must send. This is what the one in this repository sends:
+`es eval run --telemetry <addr> [--telemetry-token <t>] [--telemetry-image-every <N>]` binds a
+`Server` before it opens the bundle, the scene or either Python interpreter — so a viewer that
+attaches on the printed address is subscribed before the first cell — and publishes on four
+streams:
+
+| Stream | Payload | When |
+|---|---|---|
+| `1` | `Event { kind: "cell.begin" \| "cell.end" \| "suite.end", fields }` | `cell.begin` at each episode's start (`cell`, `suite`, `seed`, `episode`), `cell.end` once its files are written (`cell`, `outcome`, `steps`, `frames`, `traj`), `suite.end` once the §10.1 row is measured (`suite`, `n_episodes`, `metric.<name>` as the `MetricValue`'s own JSON) |
+| `2` | `Scalars([frame, tick, source, violation bits])` | every control tick that captured an observation |
+| `3` | `Metrics(PerfMetrics)` | at each `cell.end`: `actions_per_sec`, `policy_inferences_per_sec`, `chunk_underrun_rate`. Everything else is `None` — this run does not measure end-to-end latency or GPU memory, and §12.4 would rather have a hole than a zero |
+| `4` | `Image { format: "rgb8" }` | every `--telemetry-image-every N` ticks; `0` (the default) publishes none |
+
+Stream ids are **data, not schema**: nothing in `protocol.rs` names them, a consumer that does
+not recognize one ignores it (`es_editor::model::live_run` does exactly that), and a second
+producer choosing other numbers breaks nothing here. `Frame::stream` is a `u32`.
+
+Stream 2 is one `es_eval::runner::StepEvent` per sample, flattened: the frame index inside the
+cell, the `PhysTick` it ran at, the action's source as `es_data::ActionSourceCode`'s number
+(`Policy 0, Clamped 1, Fallback 2, Human 3`), and `es_safety::EventSet::bits()`. It is the
+record `events.json` gets, not a second measurement of the same step, which is what lets the
+editor rebuild a finished run's own rows from the wire (`docs/design/editor-shell.md` §13).
+
+Two rules the producer keeps and a third the wire cannot:
+
+- **Nothing is computed for telemetry's sake.** The evaluator hands a closure what it already
+  had; the image bytes are *borrowed* from the plan's own input buffer rather than rendered or
+  copied. With no `--telemetry` nothing binds and the two §10.5 artifacts are byte-identical.
+- **Nothing waits.** Publishing is §6's non-blocking fan-out, so an editor that stalls on a
+  repaint loses frames and the run does not notice. The §6 note about `CLIENT_QUEUE_CAPACITY`
+  being a guess still stands — what M7/E4 adds is a measurement of the producer-side cost
+  (`editor-shell.md` §13, gate 9), not a tuned queue.
+- **The token is still clear text on a trusted socket** (§4). `--telemetry 127.0.0.1:7777` is
+  the shape this is for; a bind on `0.0.0.0` with a token is not a secure remote channel, and
+  §6/§8's TLS/QUIC ceiling is where that gets fixed.
