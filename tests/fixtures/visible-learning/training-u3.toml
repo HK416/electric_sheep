@@ -1,0 +1,36 @@
+# M7/U row U3: `learning-pretrained.toml` (T5) with `observation-augmented.toml` (T6) -- both
+# arms at once, the last row of the re-measurement spec 28.10 allows.
+#
+# RUN, on the oracle server: `es train --recipe <this> --out ~/artifacts/plan-v/m7-u/U3/train`
+# from the repository root; `docs/design/visible-learning.md` section 7.31.
+#
+# The bundle is the committed `task.toml` and `deployment.toml` with `learning-pretrained.toml`
+# and `observation-augmented.toml` in place of their committed siblings, built the way U1's was
+# (see `training-u1.toml`'s header). `es train` bakes it with `--for-training` and passes
+# `--augmentation` on its own, because the augmentation chain is a property of the bundle's
+# Observation IR and not of this document (spec 5.1).
+#
+# One variable from U1 (the observation document) and one from U2 (the backbone), so the four
+# rows form a 2x2. `augmentation_seed` is absent, which means `[run] seed` = 0, which is T6's
+# and therefore U2's. Paths are the oracle server's.
+
+kind = "training"
+
+[dataset]
+root   = "/home/LJM/artifacts/plan-v/v15/ds-train"
+frames = "/home/LJM/artifacts/plan-v/v15/frames-train"
+
+[policy]
+bundle     = "/home/LJM/artifacts/plan-v/m7-u/U3/untrained-pretrained-augmented.esb"
+base_model = "/home/LJM/artifacts/plan-v/m7-t5/resnet18-imagenet1k-v1.safetensors"
+
+[run]
+steps         = 20000
+batch         = 64
+lr            = 4e-4
+seed          = 0
+checkpoint_at = [20000]
+device        = "cuda"
+interpreter   = "/home/LJM/venvs/es-lerobot-cuda/bin/python"
+schedule      = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
+extra         = ["--resident-gpu"]
