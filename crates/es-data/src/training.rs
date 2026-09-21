@@ -645,6 +645,7 @@ impl Plan {
     /// point beside the interpreter when there is one, otherwise the interpreter and
     /// `-m lerobot.scripts.lerobot_train`. Nothing on disk is read here, so `--dry-run` works
     /// on a machine that has neither the dataset nor the bundle.
+    ///
     /// `augmented` is whether the policy's Observation IR carries a `training_only` chain
     /// (packet M7/T6). It is a *fact about the bundle*, not a recipe field: the bake is told
     /// to write the chain's boundary and the trainer is told to apply it, or neither is and
