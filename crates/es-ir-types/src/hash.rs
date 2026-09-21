@@ -9,7 +9,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-pub use es_ir_types::canon::CanonWriter;
+pub use crate::canon::CanonWriter;
 
 use crate::codes;
 use crate::diag::Diagnostic;
@@ -228,7 +228,7 @@ fn encode<N: IrNode>(g: &Graph<N>, pos: &Pos, colour: &[Colour]) -> Result<Vec<u
     w.finish()
 }
 
-/// The canonical node order: the sort by colour. [`crate::norm::canon_graph`] relabels by it.
+/// The canonical node order: the sort by colour. `es-ir`'s `norm::canon_graph` relabels by it.
 ///
 /// Only the 1-WL colouring is used here, not the individualization [`canonical_hash`] goes on
 /// to do: this is a relabelling order, not an identity, so nodes left sharing a colour may come
@@ -263,7 +263,7 @@ pub fn canonical_hash<N: IrNode>(g: &Graph<N>) -> Result<[u8; 32], Diagnostic> {
 
 // The chain itself is digests only, so it lives in `es-ir-types` with the canonical encoder
 // (spec 1.5 context budget, `docs/packets/M4/P-M4-S16.md`); re-exported at its original path.
-pub use es_ir_types::chain::{ChangedComponent, DatasetHash, HardwareCapability, HashChain};
+pub use crate::chain::{ChangedComponent, DatasetHash, HardwareCapability, HashChain};
 
 #[cfg(test)]
 mod tests {

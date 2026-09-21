@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-pub use es_ir_types::NodeId;
+pub use crate::NodeId;
 
 use crate::codes;
 use crate::diag::Diagnostic;

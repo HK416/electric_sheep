@@ -3,6 +3,10 @@
 Spec refs: spec 5.4 (공통 타입 시스템), spec 5.2 (batch semantics), spec 3.1 (conventions),
 Appendix B.1. Packet: `docs/packets/M0/P18.md`.
 
+Since `docs/packets/M8/P-M8-R6.md` the crate also holds the graph skeleton and the canonical
+hash (`es-ir-types::graph`, `es-ir-types::hash`, moved down for the spec 1.5 context budget and
+re-exported unchanged as `es_ir::graph` / `es_ir::hash`); the IR node kinds stay in `es-ir`.
+
 ## `PortType`
 
 ```

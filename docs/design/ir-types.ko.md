@@ -5,6 +5,10 @@
 Spec refs: spec 5.4 (공통 타입 시스템), spec 5.2 (batch semantics), spec 3.1 (conventions),
 부록 B.1. Packet: `docs/packets/M0/P18.md`.
 
+`docs/packets/M8/P-M8-R6.md` 이후로 이 크레이트는 그래프 골격과 정규 해시도 담는다
+(`es-ir-types::graph`, `es-ir-types::hash`. spec 1.5 컨텍스트 예산 때문에 내려왔고
+`es_ir::graph` / `es_ir::hash`로 그대로 재수출된다). IR 노드 종류는 `es-ir`에 남는다.
+
 ## `PortType`
 
 ```

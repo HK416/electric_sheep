@@ -1,7 +1,11 @@
 # Graph canonicalization for `canonical_hash` — design
 
 Spec refs: spec 5.3 (hash chain), spec 11.2 (`*_hash`), Appendix B.7 (relabelling invariant).
-Packet: `docs/packets/M0/P-M0-R2.md`. Code: `crates/es-ir/src/hash.rs`.
+Packet: `docs/packets/M0/P-M0-R2.md`. Code: `crates/es-ir-types/src/hash.rs`.
+
+The module moved down from `es-ir` to `es-ir-types` in `docs/packets/M8/P-M8-R6.md` (spec 1.5
+context budget) and is re-exported unchanged as `es_ir::hash`, so every path in this note and
+every committed hash still reads the same.
 
 ## The problem
 

@@ -4,7 +4,8 @@
 //! `docs/packets/M0/P-M0-R4.md`.
 //!
 //! Split out of `es-ir` purely to keep both crates inside the spec 1.5 context budget. Nothing
-//! here knows what a graph *is*: no `Graph`, no `IrNode`, no IR node kinds. `es-ir` re-exports
+//! here knows what an *IR* is: [`graph`] and [`hash`] are the untyped skeleton and the canonical
+//! hash, but no IR node kind lives here (P-M8-R6). `es-ir` re-exports
 //! every item of this crate at its original path, so `es_ir::types::PortType` and
 //! `es_ir_types::types::PortType` name the same thing and no downstream crate had to change.
 //!
@@ -17,6 +18,8 @@ pub mod chain;
 pub mod codes;
 pub mod diag;
 pub mod expr;
+pub mod graph;
+pub mod hash;
 pub mod image;
 pub mod types;
 

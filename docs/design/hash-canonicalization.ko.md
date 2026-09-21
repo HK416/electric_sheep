@@ -3,7 +3,11 @@
 # `canonical_hash`를 위한 그래프 정규화 — 설계
 
 Spec refs: §5.3 (해시 체인), §11.2 (`*_hash`), Appendix B.7 (재라벨링 불변식).
-패킷: `docs/packets/M0/P-M0-R2.md`. 코드: `crates/es-ir/src/hash.rs`.
+패킷: `docs/packets/M0/P-M0-R2.md`. 코드: `crates/es-ir-types/src/hash.rs`.
+
+이 모듈은 `docs/packets/M8/P-M8-R6.md`에서 (spec 1.5 컨텍스트 예산 때문에) `es-ir`에서
+`es-ir-types`로 내려갔고 `es_ir::hash`로 그대로 재수출되므로, 이 문서의 모든 경로와
+커밋된 모든 해시는 변함이 없다.
 
 ## 문제
 
