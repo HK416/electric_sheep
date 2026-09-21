@@ -410,24 +410,23 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
         .map_err(|e| rt(format!("no Vulkan device for es video showcase: {e}")))?;
     // The same function every other `Rs` render in this repository goes through, so the
     // showcase and the observation frames cannot drift apart (design note section 7.4).
-    let mut cfg = match scene_cfg.as_ref().filter(|_| opts.sensor.is_some()) {
-        // The observation path's own config, knob for knob: this is what makes a replay of a
-        // path-traced run path-traced (packet M7/R5).
-        Some(cfg) => es_env::render::render_config(cfg),
-        None => {
-            let mut cfg = es_env::render::config(opts.width, opts.height, Channel::Rgb8, opts.path);
-            // All `--look`, `--exposure` and `--tonemap` touch. `es_env::render::config` stays
-            // the one place a render path becomes a `RenderConfig`, and the observation path
-            // keeps every default (M7/R2, M7/R3).
-            cfg.shading = opts.look;
-            cfg.exposure = opts.exposure;
-            cfg.tonemap = opts.tonemap;
-            // The history lives in the one `Renderer` below, which is kept across every tick
-            // of every episode -- so the accumulation is the showcase's own frames, in order
-            // (M7/R4).
-            cfg.temporal = opts.temporal;
-            cfg
-        }
+    // With `--task` the scene camera's config is the observation path's own, knob for knob:
+    // this is what makes a replay of a path-traced run path-traced (packet M7/R5).
+    let declared = scene_cfg.as_ref().filter(|_| opts.sensor.is_some());
+    let mut cfg = if let Some(cfg) = declared {
+        es_env::render::render_config(cfg)
+    } else {
+        let mut cfg = es_env::render::config(opts.width, opts.height, Channel::Rgb8, opts.path);
+        // All `--look`, `--exposure` and `--tonemap` touch. `es_env::render::config` stays the
+        // one place a render path becomes a `RenderConfig`, and the observation path keeps
+        // every default (M7/R2, M7/R3).
+        cfg.shading = opts.look;
+        cfg.exposure = opts.exposure;
+        cfg.tonemap = opts.tonemap;
+        // The history lives in the one `Renderer` below, which is kept across every tick of
+        // every episode -- so the accumulation is the showcase's own frames, in order (M7/R4).
+        cfg.temporal = opts.temporal;
+        cfg
     };
     if opts.temporal.is_some() {
         cfg.channels.insert(Channel::History);

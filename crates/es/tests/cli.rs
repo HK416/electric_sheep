@@ -9258,7 +9258,8 @@ const PT_EVALUATION_HEADER: &str = "\
 /// An untrained bundle from four documents named by path, with the placeholder weights
 /// `--expert` never loads (packet M7/R5).
 fn pack_untrained(task: &Path, observation: &Path, learning: &Path, deployment: &Path) -> Vec<u8> {
-    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{p:?}: {e}"));
+    let read =
+        |p: &Path| std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
     let mut learning_ir =
         es_ir::serial::learning_from_toml(&read(learning)).expect("the Learning IR parses");
     let weights = b"es-v1-expert-placeholder".to_vec();
@@ -9301,11 +9302,10 @@ fn write_demo_bundle_from(dir: &Path, task: &str, observation: &str, name: &str)
 #[test]
 #[ignore = "bundle builder for a measurement; run explicitly"]
 fn pack_untrained_bundle() {
-    let var = |k: &str| match std::env::var(k) {
-        Ok(v) => PathBuf::from(v),
-        Err(_) => {
-            panic!("{k} is unset; pack_untrained_bundle needs all five ES_PACK_* variables")
-        }
+    let var = |k: &str| {
+        PathBuf::from(std::env::var(k).unwrap_or_else(|e| {
+            panic!("{k}: {e}; pack_untrained_bundle needs all five ES_PACK_* variables")
+        }))
     };
     let Ok(out) = std::env::var("ES_PACK_OUT") else {
         println!("SKIP pack_untrained_bundle: ES_PACK_OUT unset");
@@ -9341,6 +9341,9 @@ fn pack_untrained_bundle() {
 #[test]
 #[cfg(feature = "render")]
 fn collect_renders_the_sensor_with_the_path_tracer() {
+    /// Long enough for the arm to move off its rest pose, short enough to be a test.
+    const TICKS: usize = 24;
+
     let test = "collect_renders_the_sensor_with_the_path_tracer";
     if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
         println!("SKIP {test}: {reason}");
@@ -9358,8 +9361,6 @@ fn collect_renders_the_sensor_with_the_path_tracer() {
         }
     };
 
-    /// Long enough for the arm to move off its rest pose, short enough to be a test.
-    const TICKS: usize = 24;
     let dir = scratch_dir("collect-pt");
     let collect = |bundle: &Path, tag: &str| -> PathBuf {
         let frames = dir.join(format!("frames-{tag}"));
