@@ -174,6 +174,16 @@ impl<B: PhysicsBackend> Env<B> {
         &self.backend
     }
 
+    /// The backend, to write state no reset distribution draws -- a placed object, a HIL
+    /// hand-off, or a test that has to put two bodies a known distance apart.
+    ///
+    /// Writing state behind the env's back does not move the tick, the episode counter or the
+    /// recorder: the caller is saying "the world is now this", and the next `step` records it
+    /// like any other state.
+    pub fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
     pub fn tick(&self) -> PhysTick {
         self.tick
     }
@@ -397,6 +407,11 @@ impl<B: PhysicsBackend> Env<B> {
                 Source::Qpos(i) => at(state.qpos, env, self.model.nq, i),
                 Source::Qvel(i) => at(state.qvel, env, self.model.nv, i),
                 Source::Sensor(i) => at(state.sensordata, env, self.model.nsensordata, i),
+                // `xpos` is `n_envs * nbody * 3`, env-major (§18.5): the body's row times
+                // three, plus the axis.
+                Source::Xpos { row, axis } => {
+                    at(state.xpos, env, self.model.nbody * 3, row * 3 + axis)
+                }
                 // Seconds are derived from a tick count at the edge, never accumulated (§18.1).
                 Source::Time { since_reset } => {
                     let ticks = if since_reset {
@@ -557,11 +572,16 @@ pub(crate) mod tests {
     use es_physics_core::caps::{BatchSupport, Capabilities, DeterminismTier, FloatPrecision};
     use std::collections::BTreeSet;
 
+    /// `target` carries no joint: it is there so a cone has two body positions to subtract
+    /// (packet M8/S4d), and a fixed body is exactly what a reach target is.
     const MJCF: &str = r#"<mujoco>
         <worldbody><body name="link">
             <joint name="hinge" type="hinge" axis="0 0 1"/>
             <joint name="slide" type="slide" axis="1 0 0"/>
             <geom name="ball" type="sphere" size="0.1"/>
+        </body>
+        <body name="target" pos="0.2 0 0.1">
+            <geom name="cube" type="box" size="0.05 0.05 0.05"/>
         </body></worldbody>
         <actuator><motor name="motor" joint="hinge"/></actuator>
         <sensor><jointpos name="angle" joint="hinge"/></sensor>
@@ -573,7 +593,9 @@ pub(crate) mod tests {
             .scene
     }
 
-    /// A `ModelInfo` matching [`fake_scene`]: two 1-dof joints, one actuator, one sensor.
+    /// A `ModelInfo` matching [`fake_scene`]: two 1-dof joints, one actuator, one sensor, and
+    /// the scene's bodies in scene order -- `world`, `link`, `target` -- which is the order
+    /// `MuJoCo` lays `xpos` out in too.
     pub(crate) fn fake_model() -> ModelInfo {
         let scene = fake_scene();
         let id = |name: &str| {
@@ -589,7 +611,13 @@ pub(crate) mod tests {
             nv: 2,
             nu: 1,
             nsensordata: 1,
-            nbody: 1,
+            nbody: scene.bodies.len() as u32,
+            body: scene
+                .bodies
+                .iter()
+                .enumerate()
+                .map(|(row, b)| (b.id, IndexRange::new(row as u32, 1)))
+                .collect(),
             n_envs: 1,
             qpos: [
                 (id("hinge"), IndexRange::new(0, 1)),
@@ -703,6 +731,9 @@ pub(crate) mod tests {
         qvel: Vec<f64>,
         sensordata: Vec<f64>,
         ctrl: Vec<f64>,
+        /// `n_envs * nbody * 3`. Nothing here integrates it -- a test writes the world the
+        /// cone is supposed to read (packet M8/S4d).
+        pub(crate) xpos: Vec<f64>,
         tick: PhysTick,
         /// Envs the next step reports as diverged.
         pub diverge: Vec<u32>,
@@ -732,6 +763,7 @@ pub(crate) mod tests {
                 qvel: Vec::new(),
                 sensordata: Vec::new(),
                 ctrl: Vec::new(),
+                xpos: Vec::new(),
                 tick: PhysTick::ZERO,
                 diverge: Vec::new(),
             }
@@ -757,6 +789,7 @@ pub(crate) mod tests {
             self.qvel = vec![0.0; n * info.nv as usize];
             self.sensordata = vec![0.0; n * info.nsensordata as usize];
             self.ctrl = vec![0.0; n * info.nu as usize];
+            self.xpos = vec![0.0; n * info.nbody as usize * 3];
             self.model = Some(info.clone());
             Ok(info)
         }
@@ -831,6 +864,7 @@ pub(crate) mod tests {
                 qpos: &self.qpos,
                 qvel: &self.qvel,
                 sensordata: &self.sensordata,
+                xpos: &self.xpos,
                 ..StateView::default()
             }
         }
