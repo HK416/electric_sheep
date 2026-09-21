@@ -115,6 +115,10 @@ fn expr_canonical(e: &Expr, w: &mut CanonWriter) {
             w.f64(*lo);
             w.f64(*hi);
         }
+        Expr::Sqrt(value) => {
+            w.str("Sqrt");
+            expr_canonical(value, w);
+        }
     }
 }
 
