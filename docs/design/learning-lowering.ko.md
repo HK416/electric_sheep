@@ -156,6 +156,11 @@ rsl_rl은 `ELU`), 상류는 마지막 은닉층에도 활성화를 넣으며, br
 `python/es/builder.py`의 `head(...)`는 `squash="None"`을 받는다; `Mlp`의 두 필드는 빌더가
 그대로 통과시키는 `kind` 값 안에 실리므로 별도의 키워드가 필요 없다.
 
+**측정.** `es-policy`의 `lower_mlp_activations_match_torch`가 `15 → [32, 32] → 6` 그래프의
+열여섯 가지 조합 전부를 직접 손으로 쓴 `crates/es-policy/python/mlp_activation_ref.py`와
+조합마다 관측 64개로 대조했고, 모두 CPU에서 **비트 단위로** 일치했다 — RTX 4090 머신,
+2026-09-21, torch 2.11.0+cu129, `~/venvs/es-lerobot-cuda`.
+
 ## 4. 가중치 네이밍
 
 safetensors 키 스킴은 다음과 같다

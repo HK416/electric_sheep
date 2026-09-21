@@ -163,6 +163,11 @@ range.
 `python/es/builder.py`'s `head(...)` takes `squash="None"`; the two `Mlp` fields ride inside
 the `kind` value the builder passes through verbatim, so they need no keyword of their own.
 
+**Measured.** `es-policy`'s `lower_mlp_activations_match_torch` ran all sixteen combinations of
+a `15 → [32, 32] → 6` graph against the hand-written `crates/es-policy/python/
+mlp_activation_ref.py`, 64 observations each, and every one agreed **bitwise** on CPU — the
+RTX 4090 box, 2026-09-21, torch 2.11.0+cu129, `~/venvs/es-lerobot-cuda`.
+
 ## 4. Weight naming
 
 The safetensors key scheme is

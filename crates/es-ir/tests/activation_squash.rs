@@ -150,6 +150,25 @@ fn committed_learning_hashes_are_unmoved_by_activation_and_squash() {
     );
 }
 
+/// The inspector's parameter table has to know the field exists even though a default node
+/// does not serialize it (packet M7/E3, `factory::optional_params`).
+#[test]
+fn the_policy_head_schema_declares_squash() {
+    let registry = es_ir::factory::LearningNodeRegistry::with_builtins();
+    let schema = registry.schema("PolicyHead").expect("a builtin schema");
+    let squash = schema
+        .params
+        .iter()
+        .find(|p| p.name == "squash")
+        .expect("the schema declares squash");
+    assert!(!squash.required, "squash is optional: absent = None");
+    assert_eq!(
+        squash.default,
+        Some(toml::Value::String("None".to_owned())),
+        "the starting point a fresh head offers is the default"
+    );
+}
+
 #[test]
 fn squash_is_refused_off_a_regression_head() {
     let committed = es_ir::serial::learning_from_toml(&fixture("learning.toml")).expect("parses");
