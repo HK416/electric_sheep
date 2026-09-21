@@ -7871,8 +7871,11 @@ fn telemetry_eval_run(config: &Path, policy: &Path, out: &Path, extra: &[&str]) 
     run
 }
 
-/// A loopback port nobody is listening on, chosen here rather than by the run so the client
-/// can be connected and subscribed before the run's first cell.
+/// A loopback port nobody is listening on, chosen here rather than left to
+/// `--telemetry 127.0.0.1:0`, whose port only exists once the run prints it: the client has
+/// to be connected and subscribed before the first cell, and retrying a known address until
+/// the run binds it has no window at all. The run still prints the address it bound -- which
+/// is what makes `:0` usable by hand -- and the assertion below reads that line.
 fn free_loopback_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind an ephemeral port")
@@ -7965,7 +7968,7 @@ fn eval_telemetry_publishes_every_tick_in_order() {
     let mut ended: Vec<String> = Vec::new();
     let mut suites_ended = 0;
     let mut open: Option<String> = None;
-    let mut ticks: BTreeMap<String, Vec<u64>> = BTreeMap::new();
+    let mut ticks: BTreeMap<String, Vec<(u64, u64)>> = BTreeMap::new();
     let mut metrics_after_end = 0;
     for f in &frames {
         match (&f.stream, &f.payload) {
@@ -7992,14 +7995,14 @@ fn eval_telemetry_publishes_every_tick_in_order() {
             },
             (StreamId(2), Payload::Scalars(v)) => {
                 let cell = open.clone().expect("a tick outside any cell");
-                assert_eq!(v.len(), 4, "[step, tick, source, events]: {v:?}");
-                let tick = v[1] as u64;
+                assert_eq!(v.len(), 4, "[frame, tick, source, events]: {v:?}");
+                let (frame, tick) = (v[0] as u64, v[1] as u64);
                 let seen = ticks.entry(cell).or_default();
                 assert!(
-                    seen.last().is_none_or(|last| *last < tick),
+                    seen.last().is_none_or(|(_, last)| *last < tick),
                     "ticks not strictly increasing: {seen:?} then {tick}"
                 );
-                seen.push(tick);
+                seen.push((frame, tick));
             }
             (StreamId(3), Payload::Metrics(m)) => {
                 // Right after a `cell.end`, with the fields the run can fill and never a zero
@@ -8021,10 +8024,11 @@ fn eval_telemetry_publishes_every_tick_in_order() {
     assert_eq!(ended, begun);
     assert_eq!(suites_ended, 1);
     assert_eq!(metrics_after_end, cells.len());
-    // One stream-2 frame per control tick, carrying the tick `events.json` recorded for that
-    // step -- the nominal suite drops no observation, so the two sequences are the same.
+    // One stream-2 frame per control tick, carrying the very record `events.json` got for
+    // that step -- the nominal suite drops no observation, so the two sequences are the same
+    // and the live viewer's rows are the finished run's rows.
     for (cell, records) in &events {
-        let want: Vec<u64> = records.iter().map(|r| r.tick.0).collect();
+        let want: Vec<(u64, u64)> = records.iter().map(|r| (r.frame, r.tick.0)).collect();
         assert_eq!(ticks[cell], want, "cell {cell}");
     }
     println!(

@@ -4,10 +4,13 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use es_compile::PolicyBundle;
+use es_eval::runner::{EventSource, RunEvent, RunSink};
 use es_eval::{Evaluation, RunConfig};
 use es_ir::evaluation::{AcceptanceResult, EvaluationReport, MetricValue};
 use es_physics_backend::MuJoCoCpuBackend;
 use es_policy::{PolicyRuntime, TorchRuntime, WeightsSource};
+use es_telemetry::protocol::{Frame, Payload, PerfMetrics, StreamId};
+use es_telemetry::transport::Server;
 
 use crate::error::CliError;
 
@@ -82,6 +85,21 @@ line of stderr. A partial report is never written.
     --jobs <N>         worker processes for the cells (default 1); 0 is refused
     --shard <i/N>      run only the cells of shard i (worker mode); needs --shard-out
     --shard-out <file> where a worker writes its cells; implies no report and no lock
+    --telemetry <addr> publish the run live on this address (spec 23.1), e.g. 127.0.0.1:7777
+    --telemetry-token <t>  required in every client's Hello (spec 25.1); none by default
+    --telemetry-image-every <N>  publish the observation frame every N ticks (default 0, never)
+
+With --telemetry <addr> the run binds an `es_telemetry::transport::Server` before it opens
+anything -- so a viewer can attach and be subscribed before the first cell -- and publishes,
+on four streams: 1 the `cell.begin` / `cell.end` / `suite.end` events, 2 one
+[frame, tick, source, violation bits] sample per control tick, 3 one `PerfMetrics` per
+finished episode, 4 the observation image every --telemetry-image-every ticks. Publishing is
+non-blocking (spec 23.4 gate 9): a subscriber that stops reading loses frames and is counted,
+and the run never waits for a socket. What the run *computes* is untouched -- `report.json`
+and `events.json` are byte-identical with and without the flag.
+
+--telemetry needs --jobs 1: the cells of a --jobs N run are separate processes and only one
+of them could own the address.
 
 Exit code: 0 when every acceptance result is Determined{passed: true}; 1 when any failed or
 is Unavailable (both printed); 2 on a usage error; 3 when the backend or runtime is
@@ -235,6 +253,12 @@ struct RunArgs {
     /// `(index, count)` when this process *is* a worker.
     shard: Option<(u32, u32)>,
     shard_out: Option<PathBuf>,
+    /// Where to publish the run live (packet M7/E4). `None` publishes nothing and binds
+    /// nothing.
+    telemetry: Option<std::net::SocketAddr>,
+    telemetry_token: Option<String>,
+    /// Control ticks between two observation images on stream 4; `0` publishes none.
+    telemetry_image_every: u64,
 }
 
 fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
@@ -242,6 +266,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
     let (mut backend, mut runtime) = ("mujoco-cpu".to_owned(), "torch".to_owned());
     let (mut frames, mut jobs, mut shard, mut shard_out) = (None, 1u32, None, None);
     let mut traj = None;
+    let (mut telemetry, mut telemetry_token, mut telemetry_image_every) = (None, None, 0u64);
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -267,6 +292,25 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
             }
             "--shard" => shard = Some(parse_shard(val()?)?),
             "--shard-out" => shard_out = Some(PathBuf::from(val()?)),
+            "--telemetry" => {
+                let v = val()?;
+                telemetry = Some(v.parse().map_err(|e| {
+                    CliError::Usage(format!("--telemetry {v:?} is not an address: {e}
+
+{RUN_HELP}"))
+                })?);
+            }
+            "--telemetry-token" => telemetry_token = Some(val()?.clone()),
+            "--telemetry-image-every" => {
+                let v = val()?;
+                telemetry_image_every = v.parse().map_err(|_| {
+                    CliError::Usage(format!(
+                        "--telemetry-image-every {v:?} is not a number
+
+{RUN_HELP}"
+                    ))
+                })?;
+            }
             other => {
                 return Err(CliError::Usage(format!(
                     "unknown flag '{other}'\n\n{RUN_HELP}"
@@ -294,6 +338,15 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
              {RUN_HELP}"
         )));
     }
+    // One process, one listener: the cells of a `--jobs N` run happen in N child processes,
+    // and a worker that inherited the address would fight the parent for the port.
+    if telemetry.is_some() && (jobs > 1 || shard.is_some()) {
+        return Err(CliError::Usage(format!(
+            "--telemetry publishes one process's run; use --jobs 1 (a --jobs N run's cells              happen in worker processes, which cannot share the address)
+
+{RUN_HELP}"
+        )));
+    }
     let req = |v: Option<String>, name: &str| {
         v.ok_or_else(|| CliError::Usage(format!("{name} is required\n\n{RUN_HELP}")))
     };
@@ -309,6 +362,9 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
         jobs,
         shard,
         shard_out,
+        telemetry,
+        telemetry_token,
+        telemetry_image_every,
     })
 }
 
@@ -364,9 +420,11 @@ fn run_typed<const NJ: usize, const H: usize>(
     cfg: &RunConfig,
     frames_dir: Option<&Path>,
     shard: (u32, u32),
+    mut sink: Option<&mut RunSink<'_>>,
 ) -> Result<es_eval::Shard, CliError> {
-    let mut run = |frames: Option<&mut es_eval::runner::FrameSource<'_>>| {
-        Evaluation::run_shard::<MuJoCoCpuBackend, _, NJ, H>(
+    let mut run = |frames: Option<&mut es_eval::runner::FrameSource<'_>>,
+                   sink: Option<&mut RunSink<'_>>| {
+        Evaluation::run_shard_with_sink::<MuJoCoCpuBackend, _, NJ, H>(
             eval_ir,
             &bundle.task,
             scene,
@@ -378,6 +436,7 @@ fn run_typed<const NJ: usize, const H: usize>(
             frames,
             frames_dir,
             shard,
+            sink,
         )
         .map_err(|e| CliError::Runtime(e.to_string()))
     };
@@ -396,9 +455,9 @@ fn run_typed<const NJ: usize, const H: usize>(
              state: &es_physics_core::backend::StateView<'_>| {
                 rig.frame(light, model, state)
             };
-        return run(Some(&mut source));
+        return run(Some(&mut source), sink.as_deref_mut());
     }
-    run(None)
+    run(None, sink.as_deref_mut())
 }
 
 /// The renderer `--frames` needs, built from what the bundle's Task IR already declares.
@@ -572,6 +631,213 @@ fn write_report_html(report: &EvaluationReport, path: &Path) -> Result<(), CliEr
     std::fs::write(path, html).map_err(|e| CliError::Runtime(format!("{}: {e}", path.display())))
 }
 
+// --- `--telemetry`: the run, published live (packet M7/E4) ----------------------------------
+
+/// The four stream ids of `docs/design/telemetry-protocol.md` "Producers". Data, not schema:
+/// `es_telemetry::protocol` is frozen at its version, and a stream id is a number on the wire
+/// that producer and consumer agree on in a design note.
+const STREAM_EVENTS: StreamId = StreamId(1);
+const STREAM_TICKS: StreamId = StreamId(2);
+const STREAM_METRICS: StreamId = StreamId(3);
+const STREAM_IMAGE: StreamId = StreamId(4);
+
+/// The one place an `es_eval::runner::RunEvent` becomes a wire [`Frame`].
+///
+/// It lives here and not in `es-eval` because both crates are layer 10 and spec 4.2 forbids a
+/// same-layer dependency: the evaluator calls a closure, `es` -- which links both -- builds
+/// the frames. Every `publish` is `Server::publish`, non-blocking by construction: a
+/// subscriber that stops reading has its frames dropped and counted, and the run never waits
+/// for a socket (spec 23.4 gate 9).
+struct Publisher {
+    server: Server,
+    /// Control ticks between two stream-4 images; `0` publishes none.
+    image_every: u64,
+    /// Wall clock of the open episode, for the spec 12.4 rates at its end.
+    began: std::time::Instant,
+    /// Observations seen in the open episode, for the image rate limit.
+    observations: u64,
+    /// The last step this run published. Kept whole rather than as its tick alone because the
+    /// tick's type lives in `es-core`, which this crate takes only as a dev-dependency: a
+    /// `StepEvent` is what `es-eval` hands over, so nothing here has to name it.
+    last: Option<es_eval::runner::StepEvent>,
+}
+
+impl Publisher {
+    fn new(server: Server, image_every: u64) -> Self {
+        Self {
+            server,
+            image_every,
+            began: std::time::Instant::now(),
+            observations: 0,
+            last: None,
+        }
+    }
+
+    /// Non-blocking by construction (`Server::publish`): this is the whole of what the run
+    /// pays for telemetry on the control path.
+    fn send(&self, frame: Frame) {
+        self.server.publish(frame);
+    }
+
+    fn event(&self, kind: &str, fields: std::collections::BTreeMap<String, String>) {
+        self.send(Frame {
+            // Where the run had got to when this happened; tick zero before the first step.
+            tick: self.last.map_or_else(Default::default, |e| e.tick),
+            wall_ns: wall_ns(),
+            stream: STREAM_EVENTS,
+            payload: Payload::Event {
+                kind: kind.to_owned(),
+                fields,
+            },
+        });
+    }
+
+    /// The `es_eval::runner::RunSink` body.
+    fn on(&mut self, event: RunEvent<'_>) {
+        match event {
+            RunEvent::CellBegin {
+                cell,
+                suite,
+                seed,
+                episode,
+            } => {
+                self.began = std::time::Instant::now();
+                self.observations = 0;
+                self.event(
+                    "cell.begin",
+                    fields([
+                        ("cell", cell.to_owned()),
+                        ("suite", suite.to_owned()),
+                        ("seed", seed.to_string()),
+                        ("episode", episode.to_string()),
+                    ]),
+                );
+            }
+            RunEvent::Observation {
+                cell: _,
+                tick,
+                shape,
+                bytes,
+            } => {
+                let n = self.observations;
+                self.observations += 1;
+                // Rate-limited on its own clock (spec 23.3): the state stream is every tick,
+                // the image stream every Nth, because one 96x96 frame is 27 kB of JSON.
+                if self.image_every == 0 || n % self.image_every != 0 {
+                    return;
+                }
+                // Exactly what the renderer wrote, when that is RGB8; anything else is not an
+                // `Rgb8` image and is not relabelled into one (INV-14).
+                let [h, w, c] = shape else { return };
+                if *c != 3 || bytes.len() != (h * w * c) as usize {
+                    return;
+                }
+                self.send(Frame {
+                    tick,
+                    wall_ns: wall_ns(),
+                    stream: STREAM_IMAGE,
+                    payload: Payload::Image {
+                        w: *w as u32,
+                        h: *h as u32,
+                        format: "rgb8".to_owned(),
+                        bytes: bytes.to_vec(),
+                    },
+                });
+            }
+            RunEvent::Tick { cell: _, event } => {
+                self.last = Some(event);
+                self.send(Frame {
+                    tick: event.tick,
+                    wall_ns: wall_ns(),
+                    stream: STREAM_TICKS,
+                    // The `StepEvent` `events.json` records, as four numbers: the frame
+                    // index, the physics tick, the action's source and the violation bits.
+                    payload: Payload::Scalars(vec![
+                        event.frame as f64,
+                        event.tick.0 as f64,
+                        f64::from(source_code(event.source)),
+                        f64::from(event.events),
+                    ]),
+                });
+            }
+            RunEvent::CellEnd { cell, end } => {
+                self.event(
+                    "cell.end",
+                    fields([
+                        ("cell", cell.to_owned()),
+                        ("outcome", end.outcome.clone()),
+                        ("steps", end.steps.to_string()),
+                        ("frames", end.frames.to_string()),
+                        ("traj", end.traj.to_string()),
+                    ]),
+                );
+                // The spec 12.4 set with only the fields this run measured. An unmeasured
+                // metric stays `None`: a zero would be a number nobody took.
+                let secs = self.began.elapsed().as_secs_f64();
+                let per_sec = |n: u64| (secs > 0.0).then(|| n as f64 / secs);
+                self.send(Frame {
+                    tick: self.last.map_or_else(Default::default, |e| e.tick),
+                    wall_ns: wall_ns(),
+                    stream: STREAM_METRICS,
+                    payload: Payload::Metrics(PerfMetrics {
+                        actions_per_sec: per_sec(end.steps),
+                        policy_inferences_per_sec: per_sec(end.inferences),
+                        chunk_underrun_rate: Some(end.chunk_underrun_rate),
+                        ..PerfMetrics::default()
+                    }),
+                });
+            }
+            RunEvent::SuiteEnd { suite, results } => {
+                let mut f = fields([("suite", suite.to_owned())]);
+                for r in results {
+                    f.insert("n_episodes".to_owned(), r.n_episodes.to_string());
+                    // The `MetricValue` itself, as JSON: a viewer rebuilds the report's own
+                    // value -- `Scalar`, `Histogram` or `Unavailable` -- instead of a string
+                    // that has already decided it is a number (spec 10.3).
+                    if let Ok(v) = serde_json::to_string(&r.value) {
+                        f.insert(format!("metric.{}", r.metric.name()), v);
+                    }
+                }
+                self.event("suite.end", f);
+            }
+        }
+    }
+
+    /// What the run published and what the subscribers lost, printed once at the end.
+    fn summary(&self, addr: std::net::SocketAddr) -> String {
+        let stats = self.server.stats();
+        let sent: u64 = stats.clients.values().map(|c| c.sent).sum();
+        let dropped: u64 = stats.clients.values().map(|c| c.dropped).sum();
+        format!(
+            "telemetry: {addr} closed after {sent} frame(s) delivered to {} client(s), \
+             {dropped} dropped",
+            stats.clients.len()
+        )
+    }
+}
+
+fn wall_ns() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+fn fields<const N: usize>(pairs: [(&str, String); N]) -> std::collections::BTreeMap<String, String> {
+    pairs.into_iter().map(|(k, v)| (k.to_owned(), v)).collect()
+}
+
+/// The wire code of an action's source: `es_data::ActionSourceCode::as_i64`'s table (spec
+/// 13.2), so the dataset column and the telemetry stream number the same four outcomes the
+/// same way.
+fn source_code(source: EventSource) -> u32 {
+    match source {
+        EventSource::Policy => 0,
+        EventSource::Clamped => 1,
+        EventSource::Fallback => 2,
+        EventSource::Human => 3,
+    }
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -607,6 +873,20 @@ fn run(args: &[String]) -> Result<u8, CliError> {
                 .to_owned(),
         ));
     }
+
+    // Bound **before** the bundle, the scene or either Python interpreter is opened (packet
+    // M7/E4): a viewer that attaches on the printed address is subscribed well before the
+    // first cell, which is the difference between watching a run and reading its tail.
+    let mut publisher = match a.telemetry {
+        Some(addr) => {
+            let server = Server::bind(addr, a.telemetry_token.clone())
+                .map_err(|e| CliError::Runtime(format!("--telemetry {addr}: {e}")))?;
+            // The *bound* address, so `--telemetry 127.0.0.1:0` names the port it got.
+            println!("telemetry: {}", server.local_addr());
+            Some(Publisher::new(server, a.telemetry_image_every))
+        }
+        None => None,
+    };
 
     let bytes =
         std::fs::read(&a.policy).map_err(|e| CliError::Runtime(format!("{}: {e}", a.policy)))?;
@@ -662,6 +942,18 @@ fn run(args: &[String]) -> Result<u8, CliError> {
         );
         spawn_shards(&a, jobs)?
     } else {
+        // The sink is a closure and not a trait object of this crate's invention (INV-17):
+        // `es-eval` calls it, `Publisher::on` turns what it says into wire frames.
+        let mut publish = |event: RunEvent<'_>| {
+            if let Some(p) = publisher.as_mut() {
+                p.on(event);
+            }
+        };
+        let sink: Option<&mut RunSink<'_>> = if a.telemetry.is_some() {
+            Some(&mut publish)
+        } else {
+            None
+        };
         vec![dispatch_nj_h!(
             nj,
             h,
@@ -671,7 +963,8 @@ fn run(args: &[String]) -> Result<u8, CliError> {
             &mut policy,
             &cfg,
             a.frames.as_deref(),
-            a.shard.unwrap_or((0, 1))
+            a.shard.unwrap_or((0, 1)),
+            sink
         )?]
     };
 
@@ -723,6 +1016,9 @@ fn run(args: &[String]) -> Result<u8, CliError> {
     }
 
     println!("trajectories: {}", traj_dir.display());
+    if let (Some(p), Some(addr)) = (&publisher, a.telemetry) {
+        println!("{}", p.summary(addr));
+    }
 
     let mut ok = true;
     for r in &report.acceptance {
