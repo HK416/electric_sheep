@@ -40,6 +40,7 @@ use crate::model::image_view::{BeforeAfter, ImagePair, Rgb8Image};
 use crate::model::inspector::{Field, Inspector, Widget};
 use crate::model::labels::{self, Browse, Step, Tab};
 use crate::model::launch::{Kind as LaunchKind, LaunchModel, State as LaunchState};
+use crate::model::live_run::cell_key;
 use crate::model::palette::Palette;
 use crate::model::recent::{self, Kind, Recent, Settings};
 use crate::model::replay_view::{self, Camera, ReplayView};
@@ -1079,6 +1080,9 @@ impl EditorApp {
         // everything below this match is the same code for either -- and none of it decides
         // anything: the rows, the headings and the strip are the models' (spec 28.10 rule 3).
         let live = &telemetry.live;
+        // Which end the rows came from, which is the only thing the "joined late" mark means
+        // anything for: a run read off disk is whole by the time it is opened.
+        let is_live = run.is_none();
         let (columns, rows, selected, heading, acceptance) = match run.as_ref() {
             Some(run) => (
                 run.columns(),
@@ -1144,6 +1148,13 @@ impl EditorApp {
                     ui.separator();
                 }
                 egui::Grid::new("run-cells").striped(true).show(ui, |ui| {
+                    // A cycle's rows come from several stages and two of them name their
+                    // episodes alike (packet M7/R12), so the stage is a column of its own. A
+                    // run that is one command has no stages and no column. It does not sort:
+                    // the rows are in the order the cycle ran them.
+                    if !stages.is_empty() {
+                        ui.label(i18n::t(lang, "column.stage"));
+                    }
                     // The header is the metric's plain name and the hover is the raw one the
                     // report carries; a column this build has no word for keeps its raw name,
                     // which is still better than an empty heading (packet M7/E6).
@@ -1158,9 +1169,24 @@ impl EditorApp {
                     ui.label(i18n::t(lang, "column.frames"));
                     ui.end_row();
                     for row in &rows {
-                        let is_selected = selected.as_deref() == Some(row.name.as_str());
-                        if ui.selectable_label(is_selected, &row.name).clicked() {
-                            select = Some(row.name.clone());
+                        // The row is the pair, not the name (packet M7/R12): selecting and
+                        // the strip below both go by the key the model builds.
+                        let key = cell_key(&row.stage, &row.name);
+                        if !stages.is_empty() {
+                            let plain = labels::stage_label(lang, &row.stage);
+                            let word = if plain.is_empty() { &row.stage } else { plain };
+                            ui.label(word).on_hover_text(&row.stage);
+                        }
+                        let is_selected = selected.as_deref() == Some(key.as_str());
+                        // A cell whose beginning this viewer missed says so beside its name:
+                        // what it shows is the part it heard, not the whole episode.
+                        let name = if is_live && live.joined_late(&key) {
+                            format!("{}  {}", row.name, i18n::t(lang, "results.joined_late"))
+                        } else {
+                            row.name.clone()
+                        };
+                        if ui.selectable_label(is_selected, name).clicked() {
+                            select = Some(key);
                         }
                         ui.label(&row.suite);
                         ui.label(row.seed.map_or_else(|| "--".to_owned(), |s| s.to_string()));

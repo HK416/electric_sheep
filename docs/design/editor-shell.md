@@ -1067,6 +1067,38 @@ the Run tab still has one table, one strip, one selection, and now does not know
 is an episode someone demonstrated or a cell someone judged.
 `live_run_folds_collect_episodes_like_cells` is that claim.
 
+### Three fold rules, after the local cycle demo (M7/R12, review R12 and R16)
+
+The demo of 2026-09-21 found the table keying its rows by cell name alone. Three rules, all in
+`model/live_run.rs`:
+
+- **A row is `(stage, cell)`, not a cell.** The expert gate and the policy evaluation both call
+  their first episode `nominal-00`, so on one socket the second landed in the first's row and
+  showed the gate's `success_rate 1.0` while the policy was still running. `cell_key(stage,
+  cell)` is the one place the pair becomes a key — `"<stage> / <cell>"`, and the bare cell name
+  when there is no stage, which is what leaves `RunView` and E4's oracle alone. Suite rows are
+  keyed the same way, because the gate's `suite.end` is not the evaluation's either. The
+  stage is the event's own `stage` field, else the last `stage.begin`, else empty; rows sort by
+  the stage's **arrival**, since `eval` sorts before `expert-gate` and that is not the order a
+  cycle runs them in.
+- **A sample with no open cell waits.** A viewer that attaches mid-episode hears stream-2
+  samples before anything names them. They are kept pending; the next `cell.end` /
+  `episode.end` claims them, builds the row out of its own fields (`frames` / `steps`,
+  `outcome`, `traj`) and marks it **joined late**. A `begin` that arrives first discards them:
+  they belong to a cell nobody will ever name, and guessing would file one episode's history
+  under another's name. Until an end event names it there is still no row —
+  `a_tick_outside_any_cell_is_dropped_not_guessed` keeps its meaning.
+- **"Joined late" is shown, not hidden.** `results.joined_late` in both string tables, beside
+  the cell name, and counted in `status()`. What that row shows is the part the viewer heard,
+  not the whole episode, and a person reading `frames` deserves to know which.
+
+`live_run_keys_rows_by_stage_and_cell` and `a_cell_that_began_before_attach_still_gets_a_row`
+are the two claims. The owner's check is the local cycle itself: `target/plan-u/demo/cycle.toml`
+driven by `target/plan-u/demo/drive-cycle.ps1` with the editor attached, which must show 12
+collect + 4 gate + 4 eval rows as **20 separate rows** — not CI-judgeable (§1.4), and no
+recorded frame capture of that demo exists to replay instead, only its ledger
+(`target/plan-u/demo/out/loop.jsonl`).
+
 ### The Training section, and why there is no plotting crate
 
 `model/train_view.rs` is the whole of it. It folds stream 5 into
