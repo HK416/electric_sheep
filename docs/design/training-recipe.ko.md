@@ -1085,3 +1085,194 @@ torch 2.11.0+cu129, V15의 200개 시연 위에서(`~/artifacts/plan-v/v15/ds-tr
 `observation.toml` 자리에 `observation-augmented.toml`), `training.toml`, `train.log`,
 그리고 `run/`(4.5 GB baked 세트, `module/`, `metrics/loss.json`, `training/`의 열두 슬롯,
 `training.lock`, `weights/model-20000.safetensors`, `checkpoints/20000.esb`).
+
+---
+
+## 14. 정책에서 시작하기 (패킷 M8/S1)
+
+모든 파인튜닝은, 그리고 그 뒤의 모든 RL 이어달리기는, 이미 존재하는 가중치에서 시작한다.
+이 패킷 전까지 레시피는 자기 *백본*이 어디서 왔는지는 말할 수 있었지만(11절) 자기 **정책**이
+어디서 왔는지는 말할 수 없었다: 실행을 이어받는 유일한 방법은 `train_act.py`에 체크포인트를
+손으로 건네주는 것이었고, 그러면 그런 일이 있었다는 기록이 어디에도 남지 않는다. 이 절은
+그것을 고치는 테이블이고, 그것을 관행이 아니라 출처 기록으로 만드는 락이다.
+
+### 14.1 레시피에 테이블 하나가 늘어난다
+
+```toml
+[init]
+policy = "runs/train-001/checkpoints/20000.esb"
+```
+
+맨 safetensors가 아니라 번들이고, 그것이 설계의 전부다: `.esb`는 자기 Task·Observation·
+Learning IR과 자기 §5.3 `policy_hash`를 지니고 다니므로, `init.lock`은 이 실행이 *어느 정책*을
+이어받았는지를 기록할 수 있다 — 단지 60 MB의 float를 읽었다가 아니라. `[init]`은 다른 모든
+테이블처럼 `deny_unknown_fields`이고, IR 경로의 것이다 — `lerobot` 경로에서는 이름으로
+거부된다. `lerobot-train`은 자기 `--policy.path`에서 시작하고, 둘 다 이름 붙인 레시피는 실행이
+결코 읽지 않은 텐서를 서술하는 락을 쓰게 되기 때문이다.
+
+`tests/fixtures/visible-learning/training-init.toml`이 커밋된 예이고
+`tests/golden/train/plan-init.txt`가 그 계획이다. 둘 다 **추가**다: `training.toml`,
+`training-lerobot.toml`과 그 두 골든은 손대지 않았고,
+`crates/es-data/tests/training_init.rs`가 첫 번째 것의 다이제스트 —
+`identity_hash a7531245…`, `training_hash 577a3f4a…` — 를 이 패킷이 한 줄을 바꾸기 *전에*
+측정해 못 박는다. 없는 슬롯은 그 전에 쓰인 모든 레시피를 있던 자리에 그대로 두어야 한다.
+
+### 14.2 세 개의 바구니, 그리고 존재하지 않는 네 번째
+
+번들을 연 뒤, 그 safetensors 헤더를 낮춰진 모듈의 계약과 비교한다 — `weight_keys`와
+`weight_shapes`, `es policy lower`가 `contract.json`에 쓰는 바로 그 두 목록이다:
+
+| 바구니 | 조건 | 일어나는 일 |
+|---|---|---|
+| **copied** | 모듈이 이 이름을, 이 모양으로 선언한다 | 텐서가 `<out>/weights/init.safetensors`에 쓰인다 |
+| **initialised** | 모듈이 이 이름을 선언하고 번들에는 그 텐서가 없다 | 낮추기가 뽑은 값이 그대로 남는다 |
+| **shape_mismatch** | 양쪽이 이름은 알고 모양이 다르다 | 기록되고, **복사되지 않는다** |
+
+모듈이 아예 선언하지 않은 텐서는 셋 중 어디에도 없다: 넣을 슬롯이 없고, "이것은 무시했다"를
+위한 네 번째 목록은 아무도 그것으로 아무 일도 하지 않는 목록이다.
+
+**모양이 다르면 결코 reshape하지 않는다.** 학습된 텐서를 reshape하는 것은 추측이고, 여기서
+추측의 실패 양상은 이 저장소가 가진 최악의 것이다: 여전히 학습되고, 여전히 수렴하며, 조용히
+틀린 정책. 그래서 대신 락에 들어가고, 읽는 사람이 그것을 보고 문서를 고친다.
+
+**`nodes.<k>.*` 접두 주장은 이름만으로 복사된다.** 그 키들은 torchvision이나 `torch.nn`의
+것이고 — `es_policy::weights::validate_keys`가 늘 그렇게 다뤄 왔다 — Rust 쪽에는 대조할
+선언된 모양이 없다. `train_act.py --init-weights`가 싣기 전에 모든 키를 실제 모듈과 대조하며,
+모양이 실제로 사는 곳이 거기다; 멤버가 아니거나 다른 모양의 멤버인 키는 무작위 텐서를 조용히
+남기는 `strict=False` 적재가 아니라 거기서의 거부다.
+
+복사된 텐서는 번들을 통째로 건네는 대신 파일로 쓴다. 트레이너가 싣는 것이 락이 복사했다고
+말한 것과 정확히 같아야 하기 때문이다. 교집합을 담은 파일은 목록과 어긋날 수 없고, 체크포인트
+전체 + 목록은 어긋날 수 있다.
+
+### 14.3 `training/init.lock`
+
+```json
+{"schema_version":1,
+ "source":"runs/train-001/checkpoints/20000.esb",
+ "policy_hash":"c109d783…","learning_hash":"fdb5178a…",
+ "copied":["nodes.1.0.bias","nodes.1.0.weight", "…"],
+ "initialised":["nodes.0.*"],
+ "shape_mismatch":[{"name":"nodes.1.2.weight","expected":[512,256],"found":[512,128]}]}
+```
+
+`source`는 **레시피가 쓴 그대로의** 경로이고, `policy_hash` / `learning_hash`는 번들 자신의
+매니페스트에서 나온다 — 그래서 락은 파일 경로가 아니라 정책을 식별하고, 다른 디렉터리로 옮긴
+번들도 여전히 같은 기반이다. 두 이름 목록은 정렬된다: 락의 다이제스트는 해시 슬롯이고,
+순회 순서에 의존하는 다이제스트는 슬롯이 아니다.
+
+**그것은 `identity_hash`와 `training_hash`에 들어가며, 실행 전에 쓰인다.** 이것은 고른 것이
+아니라 강제된 것이다: 실행이 무엇에서 시작하는지는 실행이 시작되기 전에 알려져 있고, §19.3의
+분할은 트레이너 이전에 알려진 모든 것을 `identity_hash`에 넣는다. 그래서 `es train`은 비교
+전체를 문서가 필요한 거부들 사이에서 한다 — 인터프리터를 찔러보기 전에, bake 전에, 단 1
+GPU-초를 쓰기 전에 — 패킷이 그것을 "`es policy lower` 뒤"라고 표현하더라도. 대조하는 모듈은
+같은 모듈이다: `lower_to_torch`는 Learning IR의 순수 함수이고, 여기서 내놓는 `weight_keys`와
+`weight_shapes`는 몇 초 뒤 lower 단계가 `contract.json`에 쓰는 바로 그것이다.
+
+**일탈: 다이제스트는 `config.json`에 산다.** §19.3은 파일 열둘을 이름 붙이고
+`es_data::identity::TrainingIdentity`는 필드 열둘을 가진다; 열세 번째 필드는 이 패킷이 소유하지
+않는 `es-data`의 identity 모듈에 대한 변경이다. 그래서 `Training::set_init`은
+`training/init.lock`을 실제 파일로 쓰고 *그와 함께* 그 blake3를 `config.json`의 `"init"` 아래에
+넣는다 — `TrainingIdentity.base_model.hash`가 `base_model.lock`과 이미 가지고 있는 바로 그
+관계이며, 그것도 파일 내용이 아니라 파일의 다이제스트다. 그 아래는 공짜로 따라온다:
+`identity_hash`, `training_hash`, 그리고 체크포인트마다의 §19.3
+`policy_hash = H(training_hash, checkpoint_hash)`. `[init]`이 없는 레시피는 이것을 결코 부르지
+않으므로 그 `config.json`은 늘 그랬던 바이트 그대로다 — 위의 못 박힌 다이제스트가 주장하는 것이
+바로 그것이다. 나중의 패킷이 `TrainingIdentity`를 열세 필드로 옮긴다면, 바뀌는 곳은 이 한 줄이다.
+
+`training.lock`의 `files` 맵은 `init.lock`이 있을 때 항목 하나를 얻고 없을 때 얻지 않으므로,
+락은 언제나 디스크 위의 파일들로부터 다시 계산될 수 있다.
+
+### 14.4 `[run] steps = 0` — 즉시 체크포인트
+
+실행의 마크는 `checkpoint_at`에 `steps`를 더한 것이고, `steps`는 언제나 그 마지막이다(2절).
+`steps = 0`은 단일 마크가 **0**인 유일한 실행이다: 옵티마이저 스텝 없이 쓰인 모듈의 초기 상태.
+`train_act.py`는 마크 0을 루프 안이 아니라 루프 앞에서 쓴다 — 루프의 `(step + 1) in marks`는
+결코 0을 낼 수 없다 — 그리고 그 위의 모양 프로브는 `model.eval()`과 `no_grad` 아래에서 돌기
+때문에, `--init-weights`가 모듈을 채운 시점과 `checkpoint_tensors`가 그것을 읽어내는 시점
+사이에 아무것도, BatchNorm의 running mean조차 움직이지 않는다.
+
+전부 덮는 번들에서의 0 스텝 실행을 **비트 단위 재포장**으로 만드는 것이 그것이고, 그것이 이
+패킷의 오라클이다. 또한 실제로 원하게 되는 것이기도 하다: 움직여 버린 문서에 맞춰 체크포인트를
+다시 포장하는 일이 파이프라인이 아니라 명령 하나가 된다. 그 옆의 `checkpoint_at`은 거부된다 —
+옵티마이저 스텝을 하나도 밟지 않는 실행에는 함께 멈출 스텝이 없다 — `lerobot` 경로의
+`steps = 0`도 마찬가지다. 거기서 `lerobot-train`은 단일 `--save_freq`에서 저장하고 저장할 스텝
+0이 없다.
+
+### 14.5 거부는 각각 이름으로
+
+11절이 주는 이유 그대로, 번호가 아니라 이름으로 한다: `es_data::training`도 `es train`도 숫자
+코드를 지녀 본 적이 없고, 메시지 몇 개를 위해 발명한 번호 체계는 사용자가 하나인 체계다.
+패킷은 `TRN-…`이라고 쓴다; 이 파일의 계보는 이름이다.
+
+| 거부 | 메시지가 이름 붙이는 것 |
+|---|---|
+| `lerobot` 경로의 `[init]` | 테이블, 경로, 그리고 lerobot 자신의 기반에 닿는 곳인 `--policy.path` |
+| 모듈과 텐서를 하나도 공유하지 않는 번들 | 없는 이름이 몇 개이고 모양이 어긋나는 것이 몇 개인지, 그리고 이것이 그렇지 않다고 말하는 문서 아래의 `steps` 스텝 밑바닥 학습이 되리라는 것 |
+| `checkpoint_at`과 함께 쓰인 `[run] steps = 0` | 마크들, 그리고 그런 실행의 유일한 마크는 0이라는 것 |
+| `lerobot` 경로의 `steps = 0` | `--save_freq`, 그리고 "즉시 체크포인트"는 IR 경로의 것이라는 것 |
+| init 번들 안의 `F32`가 아닌 텐서 | 그 텐서, 그 dtype, §8.4 |
+| (트레이너에서) 모듈의 멤버가 아니거나 다른 모양인 키 | 그 키, 그리고 파일이 `init.lock`이 복사했다고 적은 것만 담는다는 것 |
+
+### 14.6 오라클
+
+| # | 명령 | 필요 |
+|---|---|---|
+| 1 | `cargo test -p es-data --test training_init` | 없음 — 못, 슬롯, 그리고 파싱 거부들 |
+| 2 | `cargo test -p es --test cli train_init_partial_and_refused` | 없음 |
+| 3 | `cargo test -p es --test cli train_init_from_bundle_zero_steps -- --ignored` | torch가 있는 `ES_PYTHON`; 없으면 `SKIP`을 찍고 멈춘다 |
+| 4 | `cargo test -p es --test cli train_dry_run_plan_is_the_golden` | 없음 — 이제 레시피 셋, 골든 셋 |
+
+오라클 2가 Python을 필요로 하지 않는 이유는 11절의 거부 오라클이 그렇지 않은 이유와 같다:
+비교는 문서 둘의 성질이고, `es train`은 인터프리터를 찔러보기 전에 그것을 한다. 부분 복사
+경우는 `learning-pretrained.toml`의 그래프에서 `StateEncoder` 하나의 은닉 폭을 256에서 128로
+옮긴 번들에서 시작하며, 그 자신의 체크포인트는 정확한 키 열둘을 담고 접두 주장은 둘 다 담지
+않는다 — 그래서 세 바구니가 한꺼번에 비어 있지 않게 되고, 그것은 전부 복사로는 결코 시험되지
+않는다. "아무것도 공유하지 않는" 경우는 모든 노드 id를 10씩 옮기는데, 그것이 정말로 다르게
+배치된 그래프가 내놓는 모습이다.
+
+### 14.7 측정 — 오라클 서버, RTX 4090, 2026-09-21
+
+**U3의 20,000스텝 체크포인트를 0 스텝에서 다시 포장: 비트 단위 동일.** 레시피는
+`training-u3.toml`에서 `steps = 0`, `[init] policy`가 U3 자신의 `checkpoints/20000.esb`를
+가리키고, `schedule`은 없는 것이다(0 스텝 실행에 250스텝 warmup은 이름으로 거부된다). 같은
+번들, 같은 데이터셋, 같은 검증된 백본이므로 트레이너가 짓는 모듈은 U3가 학습시킨 모듈이다.
+`ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python`, torch 2.11.0+cu129, `device = "cuda"`.
+
+| 단계 | 벽시계 | 무엇이 돌았나 |
+|---|---|---|
+| init 비교 | < 1 s | 126 복사, 0 초기화, 모양 불일치 0 |
+| `dataset bake --for-training` | 약 8 s | 200 에피소드, 36,960 프레임, `rgb_overhead [3, 104, 104]` |
+| `policy lower` | < 1 s | `lowering_hash 41d11a06…`, 키 14개(정확한 키 12, 접두 주장 2) |
+| `train_act.py` | 약 21 s | 옵티마이저 스텝 0; `--init-backbone` 다음 `--init-weights`, 그다음 마크 0 |
+| `policy pack` | 약 1 s | `checkpoints/0.esb` |
+| **합계** | **약 0:40** | |
+
+`weights/model-0.safetensors`는 U3의 `weights/model-20000.safetensors`와 **바이트 단위로
+동일하고**(`sha256 2e0b2f05…`, `cmp`가 차이를 보고하지 않는다), 포장된 번들의 체크포인트도
+그렇다: 두 `checkpoint.manifest` 모두 `weights_blake3 9375650a…`를 담는다.
+
+**두 개의 `policy_hash`, 그리고 왜 다른가.** 패킷이 요구한 연쇄가 이것이다:
+
+| | U3 (20,000 스텝) | S1 (0 스텝, U3에서) |
+|---|---|---|
+| §19.3 `identity_hash` | `624674252273bb34…` | `4baf0a0ee41c8b36…` |
+| §19.3 `training_hash` | `a1bda64afbfd3e1d…` | `1c1c4c4d9a0c57cc…` |
+| §19.3 `policy_hash` = `H(training_hash, checkpoint)` | `30340aec73c6d1b5…` | `ba5d68788b1ca0e5…` |
+| 체크포인트 blake3 | `9375650a9e4e3752…` | **`9375650a9e4e3752…`** |
+| 번들의 §5.3 `policy_hash` | `c109d783bbfd6c5b…` | **`c109d783bbfd6c5b…`** |
+
+아래 두 행은 같고 위 세 행은 다르며, 그것이 정확히 옳다. §5.3의 `policy_hash`는 *정책*을 —
+네 IR 문서와 이 가중치를 — 이름 붙이고, S1이 만든 산출물은 비트 단위로 같은 정책이다.
+§19.3의 것은 *그것을 만든 실행*을 이름 붙이며, 이 둘은 서로 다른 실행이다: 하나는 옵티마이저
+스텝 20,000을 썼고 다른 하나는 하나도 쓰지 않았으며, 하나는 `init.lock`이 없고 다른 하나의
+것은 `2bbecb1f…`다. 둘이 같게 나오는 체계는 학습과 복사를 구분하지 못하는 체계다.
+
+`training/init.lock`은 `source`를 U3 경로로, `policy_hash c109d783…`과
+`learning_hash fdb5178a…`를 U3 자신의 매니페스트에서, 복사된 이름 126개와 빈 목록 둘을
+기록한다. 트레이너의 요약도 자기 쪽에서 같은 말을 한다: `"init_weights"`가 파일을 이름 붙이고
+`"initialised_from"`이 그것이 실은 같은 키 126개를 나열한다.
+
+`~/artifacts/plan-s/s1/`에 보관: `training-s1.toml`, `train.log`, 그리고 `run/`(baked 세트,
+`module/`, `training/`의 열두 슬롯과 `init.lock`, `training.lock`,
+`weights/init.safetensors`, `weights/model-0.safetensors`, `checkpoints/0.esb`).
