@@ -9,6 +9,12 @@ checkpoint only orbax can open. It is the "source framework" column of S4c's tab
 Success is per the task definition (`rl-continuation.md` section 5): gripper-to-cube distance
 < 0.03 m. Two readings are printed, because an episode is 200 steps with no early termination:
 `reached` (any step inside 0.03 m) and `final` (the last step is inside).
+
+The action kind comes from `meta.json`, so a `joint_delta` export is evaluated as one. For
+either kind the per-tick **command change** |target_t - target_{t-1}| is measured here (mean,
+p95, max, over every joint and tick): for a delta policy that is the increment the Safety
+Plane's clamp is compared against (packet M9/T3), and for a position policy it is what the
+same number looks like without an integrator.
 """
 
 from __future__ import annotations
@@ -43,6 +49,14 @@ def load_policy(npz_path: Path):
     return policy
 
 
+def _stats(x: np.ndarray) -> dict:
+    return {
+        "mean": float(x.mean()),
+        "p95": float(np.percentile(x, 95)),
+        "max": float(x.max()),
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="evaluate the exported SO-101 reach policy")
     ap.add_argument("--out", required=True, help="dir holding source.npz")
@@ -54,7 +68,13 @@ def main() -> None:
     out = Path(args.out).expanduser()
     meta = json.loads((out / "meta.json").read_text()) if (out / "meta.json").exists() else {}
     xml = args.xml or meta.get("scene", {}).get("used_xml")
-    env = reach.SO101Reach(xml)
+    action = meta.get("action", {})
+    kind = action.get("kind", "position_target")
+    env = reach.SO101Reach(
+        xml,
+        action="delta" if kind == "joint_delta" else "position",
+        delta_scale=action.get("delta_scale", reach.DELTA_SCALE),
+    )
     policy = jax.jit(jax.vmap(load_policy(out / "source.npz")))
     reset = jax.jit(jax.vmap(env.reset))
     step = jax.jit(jax.vmap(env.step))
@@ -63,8 +83,13 @@ def main() -> None:
     state = reset(keys)
     reached = np.zeros(args.episodes)
     returns = np.zeros(args.episodes)
+    prev = np.asarray(state.data.ctrl)
+    changes = []
     for _ in range(int(env._config.episode_length)):
         state = step(state, policy(state.obs))
+        ctrl = np.asarray(state.data.ctrl)
+        changes.append(np.abs(ctrl - prev))
+        prev = ctrl
         reached = np.maximum(reached, np.asarray(state.metrics["success"]))
         returns += np.asarray(state.reward)
     final = np.asarray(state.metrics["success"])
@@ -79,6 +104,11 @@ def main() -> None:
         "final_dist_mean_m": float(dist.mean()),
         "final_dist_max_m": float(dist.max()),
         "return_mean": float(returns.mean()),
+        "action_kind": kind,
+        # |target_t - target_{t-1}| in rad: over every (episode, tick, joint) triple, and then
+        # per tick as the largest of the six joints -- the number a per-tick clamp acts on.
+        "command_change_rad": _stats(np.asarray(changes)),
+        "command_change_rad_max_joint": _stats(np.asarray(changes).max(axis=2)),
     }
     (out / "eval.json").write_text(json.dumps(result, indent=2))
     print(json.dumps(result, indent=2))

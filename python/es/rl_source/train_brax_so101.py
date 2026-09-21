@@ -133,6 +133,13 @@ def main() -> None:
     ap.add_argument("--num-envs", type=int, default=4096)
     ap.add_argument("--out", required=True)
     ap.add_argument(
+        "--action",
+        choices=("position", "delta"),
+        default="position",
+        help="`delta`: the 6 numbers are per-tick joint increments (spec 8.5 JointDelta)",
+    )
+    ap.add_argument("--delta-scale", type=float, default=reach.DELTA_SCALE, help="rad per tick")
+    ap.add_argument(
         "--xml",
         default=str(Path(__file__).with_name("so101_reach_mjx.xml")),
         help="the MJX scene; the committed one is too slow to train on (see the api-note)",
@@ -144,8 +151,9 @@ def main() -> None:
     xml = reach.scene_path(args.xml)
     committed = reach.scene_path(None)
 
-    env = reach.SO101Reach(str(xml))
-    eval_env = reach.SO101Reach(str(xml))
+    kind = dict(action=args.action, delta_scale=args.delta_scale)
+    env = reach.SO101Reach(str(xml), **kind)
+    eval_env = reach.SO101Reach(str(xml), **kind)
     cfg = ppo_config(args.timesteps, args.seed, args.num_envs)
 
     network_factory = functools.partial(
@@ -228,7 +236,7 @@ def main() -> None:
     hi = mj.actuator_ctrlrange[:, 1]
     meta = {
         "framework": "brax",
-        "packet": "M8/S2c",
+        "packet": "M9/T2" if args.action == "delta" else "M8/S2c",
         "versions": versions(),
         "seed": args.seed,
         "timesteps": args.timesteps,
@@ -257,13 +265,34 @@ def main() -> None:
         ],
         "quaternion_order": "xyzw (spec 3.1); MuJoCo xquat is wxyz and is reordered",
         "joint_order": list(reach.JOINTS),
-        "action": {
-            "kind": "position_target",
-            "order": list(reach.JOINTS),
-            "offset": [float(v) for v in (hi + lo) / 2.0],
-            "scale": [float(v) for v in (hi - lo) / 2.0],
-            "formula": "ctrl = offset + scale * clip(a, -1, 1)",
-        },
+        # `offset`/`scale` are the unnormalizer the importer reads in both modes: the
+        # network's [-1, 1] output times `scale` plus `offset` is the number the actuator (or,
+        # for a delta, the integrator) is handed. For `joint_delta` that is an *increment* in
+        # rad per control tick, which is why the offset is zero and the scale is `delta_scale`.
+        "action": (
+            {
+                "kind": "joint_delta",
+                "order": list(reach.JOINTS),
+                "offset": [0.0] * 6,
+                "scale": [args.delta_scale] * 6,
+                "unit": "rad per control tick",
+                "delta_scale": args.delta_scale,
+                "formula": (
+                    "target = clip(prev_target + scale * clip(a, -1, 1), ctrl_lo, ctrl_hi); "
+                    "target_0 = the reset pose"
+                ),
+                "ctrl_lo": [float(v) for v in lo],
+                "ctrl_hi": [float(v) for v in hi],
+            }
+            if args.action == "delta"
+            else {
+                "kind": "position_target",
+                "order": list(reach.JOINTS),
+                "offset": [float(v) for v in (hi + lo) / 2.0],
+                "scale": [float(v) for v in (hi - lo) / 2.0],
+                "formula": "ctrl = offset + scale * clip(a, -1, 1)",
+            }
+        ),
         "scene": {
             "used_xml": str(xml),
             "blake3": blake3_hex(xml),
