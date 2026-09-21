@@ -29,6 +29,7 @@ use crate::model::edit::{self, Edit, EditIr, EditSession};
 use crate::model::graph_view::{CrossEdge, LayerView, LayeredGraph, NodeView};
 use crate::model::image_view::{BeforeAfter, ImagePair, Rgb8Image};
 use crate::model::inspector::{Field, Inspector, Widget};
+use crate::model::launch::{Kind as LaunchKind, LaunchModel, State as LaunchState};
 use crate::model::palette::Palette;
 use crate::model::recent::{self, Kind, Recent};
 use crate::model::replay_view::{self, Camera, Projected, ReplayView};
@@ -42,6 +43,8 @@ const NODE_H: f32 = 40.0;
 const PORT_R: f32 = 7.0;
 /// Telemetry messages drained per frame (spec 23.3 runs the viewer on a budget).
 const PUMP_BUDGET: usize = 256;
+/// Width of the Launch section's flag labels, so the text boxes line up.
+const FLAG_LABEL: Vec2 = Vec2::new(184.0, 18.0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
@@ -103,6 +106,9 @@ pub struct EditorApp {
     /// parsed and dialled by `telemetry_view::attach` (packet M7/E4).
     attach_addr: String,
     attach_token: String,
+    /// The Run tab's Launch section (packet M7/E5): the command line the editor is about to
+    /// start, and the child once it has. Every string it draws is the model's.
+    launch: LaunchModel,
     pan: Vec2,
     zoom: f32,
     /// `Some` while the Graph tab is in edit mode (spec 23.4 stage 2).
@@ -148,6 +154,7 @@ impl EditorApp {
             source,
             attach_addr: String::new(),
             attach_token: String::new(),
+            launch: LaunchModel::default(),
             pan: Vec2::new(60.0, 40.0),
             zoom: 1.0,
             edit: None,
@@ -262,6 +269,7 @@ impl EditorApp {
                 }
                 Err(e) => self.status = e.to_string(),
             }
+            self.prefill_launch();
             return;
         }
         match load(&path) {
@@ -301,12 +309,33 @@ impl EditorApp {
                 });
             }
         }
+        self.prefill_launch();
+    }
+
+    /// Hands the session's paths to the Launch section (packet M7/E5). *Which* flag each one
+    /// fills, and whether it may overwrite what is already typed, is
+    /// [`LaunchModel::prefill`]'s decision and not this file's.
+    fn prefill_launch(&mut self) {
+        let bundle = self
+            .opened
+            .is_some()
+            .then(|| PathBuf::from(self.path.trim()));
+        let run_dir = self.run.as_ref().map(|run| run.dir.clone());
+        self.launch.prefill(
+            bundle.as_deref(),
+            run_dir.as_deref(),
+            &self.scene_path,
+            &self.attach_addr,
+        );
     }
 }
 
 impl eframe::App for EditorApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.telemetry.pump(&mut self.source, PUMP_BUDGET);
+        // A launched child's lines and its exit code (packet M7/E5). Once a frame, never
+        // blocking: the reader threads are what touch the pipes.
+        self.launch.poll();
 
         // A dropped file goes through the same function the text field does (packet M7/E3):
         // one way in means one set of errors out.
@@ -738,6 +767,12 @@ impl EditorApp {
     /// selected cell its Safety Plane timeline and a filmstrip. Every number, every order and
     /// every decoded byte is [`RunView`]'s; this turns them into widgets.
     fn run_tab(&mut self, ui: &mut egui::Ui) {
+        // The Launch section is above the table and there whether or not anything is open:
+        // starting a run is how the tab gets something to show (packet M7/E5).
+        egui::TopBottomPanel::top("launch")
+            .resizable(true)
+            .default_height(400.0)
+            .show_inside(ui, |ui| self.launch_panel(ui));
         if self.run.is_none() && self.telemetry.live.is_empty() {
             ui.label(
                 "Open a run directory - one holding report.json - to see its cells (spec 10.5),                  or attach to a running `es eval run --telemetry <addr>` from the Telemetry tab.",
@@ -919,6 +954,91 @@ impl EditorApp {
                 Some(run) => run.select(&name),
                 None => telemetry.live.select(&name),
             }
+        }
+    }
+
+    /// The Launch section (packet M7/E5, spec 23.1): the editor is a **client**, so this
+    /// starts a child process and attaches to it — it hosts nothing.
+    ///
+    /// Wiring only. Which flags the chosen kind has, what each is called, what the command
+    /// line reads as, what the exit code means and how long to wait for the producer's socket
+    /// are all [`LaunchModel`]'s, under test (spec 28.10 rule 3). There is no Pause and no
+    /// Step: the run speaks no control protocol (spec 23.3), so Kill is the only control.
+    fn launch_panel(&mut self, ui: &mut egui::Ui) {
+        let mut start = false;
+        let running = matches!(self.launch.state(), LaunchState::Running { .. });
+        ui.horizontal(|ui| {
+            for kind in LaunchKind::ALL {
+                ui.selectable_value(&mut self.launch.kind, kind, kind.label());
+            }
+            ui.separator();
+            start = ui
+                .add_enabled(!running, egui::Button::new("Start"))
+                .clicked();
+            if ui.add_enabled(running, egui::Button::new("Kill")).clicked() {
+                self.launch.kill();
+            }
+            ui.separator();
+            ui.label(self.launch.status_line());
+        });
+        // One `horizontal` per flag rather than an `egui::Grid`: a grid caps a cell at the
+        // column width it measured last frame, which squeezes a `TextEdit` down to the
+        // default interact size and never lets it grow back.
+        for field in self.launch.fields() {
+            ui.horizontal(|ui| {
+                ui.add_sized(FLAG_LABEL, egui::Label::new(field.flag()));
+                ui.add(
+                    egui::TextEdit::singleline(self.launch.field_mut(*field))
+                        .hint_text(field.hint())
+                        .desired_width(620.0),
+                );
+            });
+        }
+        ui.horizontal(|ui| {
+            for flag in self.launch.flags() {
+                let label = flag.flag();
+                ui.checkbox(self.launch.flag_mut(*flag), label);
+            }
+        });
+        // The command line, read-only: what is about to run, in one place, so nobody has to
+        // guess which `es` or which flags the panel decided on.
+        let mut command = self.launch.command_line();
+        ui.add(
+            egui::TextEdit::singleline(&mut command)
+                .desired_width(f32::INFINITY)
+                .interactive(false),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("launch-lines")
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for line in self.launch.lines() {
+                    ui.monospace(line);
+                }
+            });
+        if start {
+            self.start_launch();
+        }
+    }
+
+    /// Start, then attach. In that order and only in that order: the editor dials a producer
+    /// that exists (spec 23.1), so the address comes from [`LaunchModel::attach_source`],
+    /// which answers `None` until the child is running and does its own bounded waiting for
+    /// the socket.
+    fn start_launch(&mut self) {
+        self.launch.start();
+        self.status = self.launch.status_line();
+        match self.launch.attach_source() {
+            Some(Ok(source)) => {
+                self.telemetry = TelemetryModel::default();
+                self.source = source;
+                self.status = format!("started and attached: {}", self.launch.status_line());
+            }
+            Some(Err(e)) => self.status = e,
+            // A command that publishes nothing (`es train`, `es loop cycle`) is watched
+            // through its output lines, which is all it offers.
+            None => {}
         }
     }
 

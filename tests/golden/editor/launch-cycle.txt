@@ -1,0 +1,11 @@
+loop
+cycle
+--recipe
+tests/fixtures/visible-learning/training.toml
+--out
+eval-out
+--from
+train
+--dry-run
+--allow-new-evaluation
+--skip-expert-gate
