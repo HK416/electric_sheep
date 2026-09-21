@@ -8730,24 +8730,21 @@ fn eval_jobs_splits_episodes() {
 
 /// `--jobs 4` over a one-suite evaluation, when this machine can run one. Returns what to
 /// append to the `RAN` line; a machine without the pieces prints its own `SKIP` and returns "".
+///
+/// Driven by `--expert` (packet M7/T2), so this needs `MuJoCo` and a renderer but no Torch and
+/// no trained bundle: what is under test is the partition, not the policy.
 fn eval_jobs_one_suite_runs_one_wide() -> String {
-    let missing = [
-        es_physics_backend::MuJoCoCpuBackend::is_available().err(),
-        es_policy::torch_runtime::is_available().err(),
-    ]
-    .into_iter()
-    .flatten()
-    .next();
-    if let Some(reason) = missing {
+    if cfg!(not(feature = "render")) {
+        println!("SKIP eval_jobs_splits_episodes (the live run): built without `render`");
+        return String::new();
+    }
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
         println!("SKIP eval_jobs_splits_episodes (the live run): {reason}");
         return String::new();
     }
-    let Ok(bundle) = std::env::var("ES_TRAINED_BUNDLE") else {
-        println!("SKIP eval_jobs_splits_episodes (the live run): ES_TRAINED_BUNDLE is not set");
-        return String::new();
-    };
 
     let dir = scratch_dir("eval-jobs-episodes");
+    let bundle = write_demo_bundle(&dir);
     // The committed demo evaluation, cut to its first suite and two episodes: one cell, which
     // is what `--jobs` has nothing to split.
     let mut ir = es_ir::serial::evaluation_from_toml(
@@ -8774,7 +8771,9 @@ fn eval_jobs_one_suite_runs_one_wide() -> String {
         .arg(demo_scene_path())
         .arg("--out")
         .arg(&out)
-        .args(["--jobs", "4"])
+        .arg("--frames")
+        .arg(out.join("frames"))
+        .args(["--expert", "so101-pick-place", "--jobs", "4"])
         .output()
         .expect("run es eval run --jobs 4");
     let text = format!("{}{}", stdout(&run), String::from_utf8_lossy(&run.stderr));
