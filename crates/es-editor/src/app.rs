@@ -1,8 +1,14 @@
-//! The egui shell: four tabs over [`crate::model`] (spec 23.2, spec 23.3).
+//! The egui shell: five tabs over [`crate::model`] (spec 23.2, spec 23.3).
 //!
 //! Thin on purpose. Nothing here decides *what* is drawn — the view-model did that, headless
 //! and under test. This file turns positions into rectangles, and it is the only part CI
 //! merely compiles rather than runs, because running it needs a display.
+//!
+//! That rule now covers the words too (packet M7/E6). Every visible string is
+//! [`crate::model::i18n`]'s, every column and flag is named by [`crate::model::labels`], the
+//! tabs are [`labels::Tab`], the home screen's five steps are [`labels::Step`], the font is
+//! [`crate::model::fonts`]'s and the Open dialog is [`crate::model::dialogs`]'s — so there is
+//! no sentence, no label and no font decision in this file to go stale untested.
 //!
 //! The **Graph** tab has two modes. Read-only (spec 23.4 stage 1) draws all four IRs stacked
 //! and moves nothing. `Edit` (stage 2) drives one [`EditSession`] over the Task IR: every
@@ -25,13 +31,17 @@ use es_ir::serial::{self, Layout};
 use es_ir::task::TaskIr;
 use es_ir::NodeId;
 
+use crate::model::dialogs;
 use crate::model::edit::{self, Edit, EditIr, EditSession};
+use crate::model::fonts;
 use crate::model::graph_view::{CrossEdge, LayerView, LayeredGraph, NodeView};
+use crate::model::i18n::{self, Lang};
 use crate::model::image_view::{BeforeAfter, ImagePair, Rgb8Image};
 use crate::model::inspector::{Field, Inspector, Widget};
+use crate::model::labels::{self, Browse, Step, Tab};
 use crate::model::launch::{Kind as LaunchKind, LaunchModel, State as LaunchState};
 use crate::model::palette::Palette;
-use crate::model::recent::{self, Kind, Recent};
+use crate::model::recent::{self, Kind, Recent, Settings};
 use crate::model::replay_view::{self, Camera, Projected, ReplayView};
 use crate::model::run_view::{Bucket, RunView};
 use crate::model::search::Search;
@@ -43,17 +53,12 @@ const NODE_H: f32 = 40.0;
 const PORT_R: f32 = 7.0;
 /// Telemetry messages drained per frame (spec 23.3 runs the viewer on a budget).
 const PUMP_BUDGET: usize = 256;
-/// Width of the Launch section's flag labels, so the text boxes line up.
-const FLAG_LABEL: Vec2 = Vec2::new(184.0, 18.0);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Tab {
-    Graph,
-    Run,
-    Telemetry,
-    Images,
-    Diagnostics,
-}
+/// Width of the Launch section's flag labels, so the text boxes line up. Wider than the
+/// flags it replaced: a plain name is longer than `--jobs` and may be Korean (packet M7/E6).
+const FLAG_LABEL: Vec2 = Vec2::new(210.0, 18.0);
+/// The home screen's three ways in. Large on purpose: they are the first thing someone who
+/// has never opened the editor has to find (packet M7/E6).
+const HOME_BUTTON: Vec2 = Vec2::new(240.0, 44.0);
 
 /// One opened bundle: the four IRs' view-model plus whatever the image tab could make of it.
 struct Opened {
@@ -122,6 +127,10 @@ pub struct EditorApp {
     inspector_key: (Option<NodeId>, usize),
     search: Search,
     recent: Recent,
+    /// The reader's language and text size (packet M7/E6), persisted beside the recent list.
+    /// Nothing else in this file may consult them: what they change is which *table*
+    /// [`i18n::t`] reads, never which sentence is written here.
+    settings: Settings,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -139,9 +148,9 @@ impl EditorApp {
     /// swapped without touching the editor: `es_telemetry::transport` plugs in here.
     pub fn new(source: Source) -> Self {
         Self {
-            tab: Tab::Graph,
+            tab: Tab::Design,
             path: String::new(),
-            status: "no bundle open".to_owned(),
+            status: i18n::t(Lang::default(), "status.nothing_open").to_owned(),
             opened: None,
             run: None,
             run_frames: BTreeMap::new(),
@@ -165,7 +174,35 @@ impl EditorApp {
             inspector_key: (None, 0),
             search: Search::default(),
             recent: Recent::default(),
+            settings: Settings::default(),
         }
+    }
+
+    /// The word `key` names, in the reader's language.
+    fn t(&self, key: &'static str) -> &'static str {
+        i18n::t(self.settings.lang, key)
+    }
+
+    /// [`i18n::fill`] in the reader's language: a template whose `{}` are filled in order.
+    fn fill(&self, key: &'static str, args: &[&str]) -> String {
+        i18n::fill(self.settings.lang, key, args)
+    }
+
+    /// Installs the system CJK face and the chosen text size (packet M7/E6).
+    ///
+    /// Called once from `main.rs` and again whenever either setting moves. Both answers are
+    /// [`fonts`]'s: which files to look in, in what order, where in the fallback chain the
+    /// face goes, and how big each style is. What is decided here is nothing at all — even
+    /// the sentence a machine with no CJK font gets is a table entry, filled with the list of
+    /// paths that were tried.
+    pub fn apply_style(&mut self, ctx: &egui::Context) {
+        let mut definitions = egui::FontDefinitions::default();
+        if let Err(tried) = fonts::install(&mut definitions) {
+            self.status = self.fill("status.font_missing", &[&tried.join(", ")]);
+        }
+        ctx.set_fonts(definitions);
+        let styles = fonts::text_styles(self.settings.text_size);
+        ctx.all_styles_mut(|style| style.text_styles.clone_from(&styles));
     }
 
     /// The recent list the previous run left in `eframe::Storage` (packet M7/E3). Called
@@ -176,6 +213,15 @@ impl EditorApp {
         if let Some(storage) = storage {
             self.recent =
                 Recent::from_json(&storage.get_string(recent::RECENT_KEY).unwrap_or_default());
+            // Two `get_string`s and no decision: what an empty or foreign value means is
+            // `Settings::from_codes`' (packet M7/E6).
+            self.settings = Settings::from_codes(
+                &storage.get_string(recent::LANG_KEY).unwrap_or_default(),
+                &storage
+                    .get_string(recent::TEXT_SIZE_KEY)
+                    .unwrap_or_default(),
+            );
+            self.status = self.t("status.nothing_open").to_owned();
         }
         self
     }
@@ -264,7 +310,7 @@ impl EditorApp {
                     self.status = format!("{}: {}", path.display(), run.status);
                     self.frames_path = run.frames_root().display().to_string();
                     self.run = Some(run);
-                    self.tab = Tab::Run;
+                    self.tab = Tab::Results;
                     self.recent.push(&path);
                 }
                 Err(e) => self.status = e.to_string(),
@@ -344,52 +390,102 @@ impl eframe::App for EditorApp {
             self.open();
         }
 
+        let mut restyle = false;
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 self.file_menu(ui);
+                let hint = self.t("open.hint");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.path)
-                        .hint_text("bundle.esb, a directory of the five .toml files, or a run")
+                        .hint_text(hint)
                         .desired_width(380.0),
                 );
-                if ui.button("Open...").clicked() {
+                if ui
+                    .button(self.t("open.open"))
+                    .on_hover_text(self.t("open.open.hint"))
+                    .clicked()
+                {
+                    self.open();
+                }
+                if let Some(picked) = self.browse(ui, Browse::Policy) {
+                    self.path = picked;
                     self.open();
                 }
                 ui.separator();
-                for (tab, name) in [
-                    (Tab::Graph, "Graph"),
-                    (Tab::Run, "Run"),
-                    (Tab::Telemetry, "Telemetry"),
-                    (Tab::Images, "Images"),
-                    (Tab::Diagnostics, "Diagnostics"),
-                ] {
-                    ui.selectable_value(&mut self.tab, tab, name);
+                // The tabs are named for what a person does in them; the hover carries the
+                // name they used to have and the spec section (packet M7/E6).
+                for tab in Tab::ALL {
+                    let (name, hint) = (self.t(tab.key()), self.t(tab.hint_key()));
+                    ui.selectable_value(&mut self.tab, tab, name)
+                        .on_hover_text(hint);
                 }
                 ui.separator();
                 let mut editing = self.edit.is_some();
-                if ui.toggle_value(&mut editing, "Edit").changed() {
-                    self.tab = Tab::Graph;
+                if ui
+                    .toggle_value(&mut editing, self.t("tab.edit"))
+                    .on_hover_text(self.t("tab.edit.hint"))
+                    .changed()
+                {
+                    self.tab = Tab::Design;
                     self.set_edit_mode(editing);
                 }
                 if self.edit.is_some() {
-                    if ui.button("Save").clicked() {
+                    if ui.button(self.t("edit.save")).clicked() {
                         self.save_edits();
                     }
                     let (undo, redo) = self
                         .edit
                         .as_ref()
                         .map_or((false, false), |s| (s.can_undo(), s.can_redo()));
-                    if ui.add_enabled(undo, egui::Button::new("Undo")).clicked() {
+                    if ui
+                        .add_enabled(undo, egui::Button::new(self.t("edit.undo")))
+                        .clicked()
+                    {
                         if let Some(s) = self.edit.as_mut() {
                             s.undo();
                         }
                     }
-                    if ui.add_enabled(redo, egui::Button::new("Redo")).clicked() {
+                    if ui
+                        .add_enabled(redo, egui::Button::new(self.t("edit.redo")))
+                        .clicked()
+                    {
                         if let Some(s) = self.edit.as_mut() {
                             s.redo();
                         }
                     }
                 }
+                // The two display settings, at the right-hand end: out of the way of the
+                // work, and on every screen rather than behind a menu someone has to find.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    for size in fonts::TextSize::ALL {
+                        if ui
+                            .selectable_label(
+                                self.settings.text_size == size,
+                                self.t(size.label_key()),
+                            )
+                            .clicked()
+                        {
+                            self.settings.text_size = size;
+                            restyle = true;
+                        }
+                    }
+                    ui.label(self.t("textsize.label"));
+                    ui.separator();
+                    // A language is named in its own language and never translated: that is
+                    // how someone who cannot read the current one finds theirs.
+                    for lang in Lang::ALL {
+                        if ui
+                            .selectable_label(
+                                self.settings.lang == lang,
+                                i18n::t(lang, lang.label_key()),
+                            )
+                            .clicked()
+                        {
+                            self.settings.lang = lang;
+                            restyle = true;
+                        }
+                    }
+                });
             });
         });
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
@@ -400,35 +496,45 @@ impl eframe::App for EditorApp {
                 // as it happens (spec 5.3, spec 23.4).
                 if let Some(session) = &self.edit {
                     ui.separator();
-                    ui.label(format!(
-                        "{:?} hash {}",
-                        session.graph.kind(),
-                        short_hash(session.hash().as_ref())
+                    ui.label(self.fill(
+                        "status.hash",
+                        &[
+                            &format!("{:?}", session.graph.kind()),
+                            &short_hash(session.hash().as_ref()),
+                        ],
                     ));
                     ui.separator();
-                    ui.label(format!("{} diagnostic(s)", session.diagnostics().len()));
+                    ui.label(self.fill(
+                        "status.diagnostics",
+                        &[&session.diagnostics().len().to_string()],
+                    ));
                 }
                 ui.separator();
-                ui.label(format!("{} telemetry messages", self.telemetry.received));
+                ui.label(self.fill("status.messages", &[&self.telemetry.received.to_string()]));
             });
         });
 
         // Side panels are declared before the central one. The inspector is only there in
         // edit mode: a read-only graph has no parameter to set.
-        if self.tab == Tab::Graph && self.edit.is_some() {
+        if self.tab == Tab::Design && self.edit.is_some() {
             egui::SidePanel::right("inspector")
                 .default_width(300.0)
                 .show(ctx, |ui| self.inspector_panel(ui));
         }
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
-            Tab::Graph => self.graph_tab(ui),
-            Tab::Run => self.run_tab(ui),
-            Tab::Telemetry => self.telemetry_tab(ui),
-            Tab::Images => self.images_tab(ui),
-            Tab::Diagnostics => self.diagnostics_tab(ui),
+            Tab::Design => self.graph_tab(ui),
+            Tab::Results => self.run_tab(ui),
+            Tab::Live => self.telemetry_tab(ui),
+            Tab::Sees => self.images_tab(ui),
+            Tab::Problems => self.diagnostics_tab(ui),
         });
 
+        // A language or a size that has just been clicked: the font chain and every text
+        // style are rebuilt from what `fonts` says, once, rather than every frame.
+        if restyle {
+            self.apply_style(ctx);
+        }
         // Telemetry is a live stream; repaint even when no input arrives.
         ctx.request_repaint_after(std::time::Duration::from_millis(100));
     }
@@ -438,6 +544,9 @@ impl eframe::App for EditorApp {
     /// `~/.local/share/electricsheepeditor/app.ron` on Linux.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         storage.set_string(recent::RECENT_KEY, self.recent.to_json());
+        let (lang, text_size) = self.settings.codes();
+        storage.set_string(recent::LANG_KEY, lang.to_owned());
+        storage.set_string(recent::TEXT_SIZE_KEY, text_size.to_owned());
     }
 }
 
@@ -446,10 +555,10 @@ impl EditorApp {
     /// itself is [`Recent`]'s; this draws it and hands a click back to [`Self::open`].
     fn file_menu(&mut self, ui: &mut egui::Ui) {
         let mut reopen: Option<PathBuf> = None;
-        ui.menu_button("File", |ui| {
-            ui.label("Recent");
+        ui.menu_button(self.t("menu.file"), |ui| {
+            ui.label(self.t("menu.recent"));
             if self.recent.paths.is_empty() {
-                ui.weak("nothing yet - type a path, or drop one on the window");
+                ui.weak(self.t("menu.recent_empty"));
             }
             for path in &self.recent.paths {
                 if ui.button(path.display().to_string()).clicked() {
@@ -464,16 +573,126 @@ impl EditorApp {
         }
     }
 
+    /// A **Browse...** button beside a path field (packet M7/E6): the OS's own dialog, which
+    /// is what someone who does not know the path expects. `Some` only when a path was
+    /// picked, so a cancelled dialog leaves the field exactly as it was.
+    ///
+    /// Which dialog, which filter and what the button is called are all
+    /// [`crate::model::labels`]'s and [`dialogs`]'s. A build without one (Linux, or
+    /// `--no-default-features`) draws the button disabled and says why on its hover, rather
+    /// than hiding it and leaving someone looking for it.
+    fn browse(&self, ui: &mut egui::Ui, browse: Browse) -> Option<String> {
+        let label = self.t(browse.label_key());
+        if !dialogs::AVAILABLE {
+            ui.add_enabled(false, egui::Button::new(label))
+                .on_disabled_hover_text(self.t("open.no_dialog.hint"));
+            return None;
+        }
+        ui.button(label)
+            .clicked()
+            .then(|| dialogs::pick(browse))
+            .flatten()
+            .map(|path| path.display().to_string())
+    }
+
+    /// The Browse button's own words, for the one place a destructured `self` puts
+    /// [`Self::browse`] out of reach (the Replay panel).
+    fn browse_label(&self, browse: Browse) -> &'static str {
+        self.t(browse.label_key())
+    }
+
+    /// The home screen (packet M7/E6, spec 13.1): three ways in, and what the work looks like.
+    ///
+    /// It is the Design tab with nothing open, because that is the screen someone lands on. The
+    /// five steps, their order, their sentences and where each button goes are [`Step`]'s -
+    /// this draws a grid over `Step::ALL` and decides none of it (spec 28.10 rule 3).
+    fn home(&mut self, ui: &mut egui::Ui) {
+        let mut open: Option<String> = None;
+        let mut go: Option<Tab> = None;
+        let mut reopen: Option<PathBuf> = None;
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_space(16.0);
+                ui.heading(self.t("home.welcome"));
+                ui.label(self.t("home.subtitle"));
+                ui.add_space(20.0);
+                ui.horizontal_wrapped(|ui| {
+                    for (label, hint, browse) in [
+                        (
+                            self.t("home.open_project"),
+                            self.t("home.open_project.hint"),
+                            Browse::Policy,
+                        ),
+                        (
+                            self.t("home.open_run"),
+                            self.t("home.open_run.hint"),
+                            Browse::Folder,
+                        ),
+                    ] {
+                        let button = egui::Button::new(label);
+                        let response = if dialogs::AVAILABLE {
+                            ui.add_sized(HOME_BUTTON, button).on_hover_text(hint)
+                        } else {
+                            ui.add_sized(HOME_BUTTON, button.sense(Sense::hover()))
+                                .on_hover_text(self.t("open.no_dialog.hint"))
+                        };
+                        if response.clicked() {
+                            open = dialogs::pick(browse).map(|p| p.display().to_string());
+                        }
+                    }
+                    ui.allocate_ui(HOME_BUTTON, |ui| {
+                        ui.menu_button(self.t("home.recent"), |ui| {
+                            if self.recent.paths.is_empty() {
+                                ui.weak(self.t("menu.recent_empty"));
+                            }
+                            for path in &self.recent.paths {
+                                if ui.button(path.display().to_string()).clicked() {
+                                    reopen = Some(path.clone());
+                                    ui.close_kind(egui::UiKind::Menu);
+                                }
+                            }
+                        });
+                    });
+                });
+
+                ui.add_space(24.0);
+                ui.heading(self.t("home.loop"));
+                ui.add_space(6.0);
+                egui::Grid::new("home-steps")
+                    .striped(true)
+                    .spacing([18.0, 10.0])
+                    .show(ui, |ui| {
+                        for step in Step::ALL {
+                            ui.strong(self.t(step.word_key()));
+                            ui.label(self.t(step.sentence_key()));
+                            if ui.button(self.t(step.tab().key())).clicked() {
+                                go = Some(step.tab());
+                            }
+                            ui.end_row();
+                        }
+                    });
+            });
+        if let Some(path) = open.or_else(|| reopen.map(|p| p.display().to_string())) {
+            self.path = path;
+            self.open();
+        }
+        if let Some(tab) = go {
+            self.tab = tab;
+        }
+    }
+
     /// The Graph toolbar's search box (packet M7/E3). [`Search`] decides what matches and in
     /// what order; Enter and `Next` ask it for the following hit, and the only thing decided
     /// here is where the canvas has to be panned to put that hit in the middle.
     fn search_bar(&mut self, ui: &mut egui::Ui) {
         let mut jump = false;
         ui.horizontal(|ui| {
-            ui.label("Find");
+            ui.label(self.t("find.label"));
+            let hint = self.t("find.hint");
             let response = ui.add(
                 egui::TextEdit::singleline(&mut self.search.query)
-                    .hint_text("node kind, label or port")
+                    .hint_text(hint)
                     .desired_width(200.0),
             );
             if response.changed() {
@@ -488,7 +707,7 @@ impl EditorApp {
                 jump = true;
                 response.request_focus();
             }
-            if ui.button("Next").clicked() {
+            if ui.button(self.t("find.next")).clicked() {
                 jump = true;
             }
             ui.weak(self.search.summary());
@@ -534,6 +753,7 @@ impl EditorApp {
     /// [`Inspector`] decides which widget, what the text means and whether it becomes an
     /// [`Edit`]; this draws and forwards.
     fn inspector_panel(&mut self, ui: &mut egui::Ui) {
+        let lang = self.settings.lang;
         // Rebuilt when the selection moves or the session does - an undo behind the panel's
         // back would otherwise leave stale text in the boxes. Between those, the widgets own
         // their text, so typing survives a repaint.
@@ -549,8 +769,8 @@ impl EditorApp {
             };
         }
         let Some(inspector) = &mut self.inspector else {
-            ui.heading("Inspector");
-            ui.weak("Select a node to edit its parameters.");
+            ui.heading(self.t("inspector.title"));
+            ui.weak(self.t("inspector.empty"));
             return;
         };
         ui.heading(format!("{} #{}", inspector.kind, inspector.node.0));
@@ -581,10 +801,14 @@ impl EditorApp {
         };
         if let Some(session) = self.edit.as_mut() {
             self.status = match session.apply(edit) {
-                Ok(()) => format!("{} edits", session.history().len()),
+                Ok(()) => i18n::fill(
+                    lang,
+                    "status.edits",
+                    &[&session.history().len().to_string()],
+                ),
                 Err(diags) => diags.first().map_or_else(
-                    || "edit refused".to_owned(),
-                    |d| format!("refused: {} {}", d.code, d.message),
+                    || i18n::fill(lang, "status.refused", &[]),
+                    |d| i18n::fill(lang, "status.refused", &[&d.code.to_string(), &d.message]),
                 ),
             };
         }
@@ -597,8 +821,11 @@ impl EditorApp {
             return;
         }
         let hit = self.search.current();
+        if self.opened.is_none() {
+            self.home(ui);
+            return;
+        }
         let Some(opened) = &self.opened else {
-            ui.label("Open a bundle to see the layered graph (spec 23.2).");
             return;
         };
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
@@ -627,6 +854,7 @@ impl EditorApp {
     /// [`EditSession::apply`], [`EditSession::undo`] or [`EditSession::redo`] call - this
     /// function decides nothing else, which is what keeps the untested half thin.
     fn edit_canvas(&mut self, ui: &mut egui::Ui) {
+        let lang = self.settings.lang;
         let Self {
             edit: Some(session),
             palette,
@@ -725,7 +953,7 @@ impl EditorApp {
         let ir = session.graph.kind();
         let menu_at = response.interact_pointer_pos().map(to_graph);
         response.context_menu(|ui| {
-            ui.label("Add node");
+            ui.label(i18n::t(lang, "edit.add_node"));
             for (category, entries) in palette.by_category() {
                 if entries.first().is_none_or(|e| e.ir != ir) {
                     continue;
@@ -747,11 +975,17 @@ impl EditorApp {
 
         if let Some(edit) = pending {
             match session.apply(edit) {
-                Ok(()) => *status = format!("{} edits", session.history().len()),
+                Ok(()) => {
+                    *status = i18n::fill(
+                        lang,
+                        "status.edits",
+                        &[&session.history().len().to_string()],
+                    );
+                }
                 Err(diags) => {
                     *status = diags.first().map_or_else(
-                        || "edit refused".to_owned(),
-                        |d| format!("refused: {} {}", d.code, d.message),
+                        || i18n::fill(lang, "status.refused", &[]),
+                        |d| i18n::fill(lang, "status.refused", &[&d.code.to_string(), &d.message]),
                     );
                 }
             }
@@ -774,9 +1008,7 @@ impl EditorApp {
             .default_height(400.0)
             .show_inside(ui, |ui| self.launch_panel(ui));
         if self.run.is_none() && self.telemetry.live.is_empty() {
-            ui.label(
-                "Open a run directory - one holding report.json - to see its cells (spec 10.5),                  or attach to a running `es eval run --telemetry <addr>` from the Telemetry tab.",
-            );
+            ui.label(self.t("results.empty"));
             return;
         }
         // The replay of the selected cell shares the tab (packet M7/E2): the table picks the
@@ -801,6 +1033,8 @@ impl EditorApp {
 
     fn run_table(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        // Captured before the destructure below, which borrows the rest of `self`.
+        let lang = self.settings.lang;
         let Self {
             run,
             run_frames,
@@ -817,11 +1051,15 @@ impl EditorApp {
                 run.columns(),
                 run.cells().to_vec(),
                 run.selected_cell().map(|c| c.name.clone()),
-                if run.report.passed {
-                    "Acceptance: passed (spec 10.2)".to_owned()
-                } else {
-                    "Acceptance: failed (spec 10.2)".to_owned()
-                },
+                i18n::t(
+                    lang,
+                    if run.report.passed {
+                        "results.passed"
+                    } else {
+                        "results.failed"
+                    },
+                )
+                .to_owned(),
                 run.acceptance().to_vec(),
             ),
             // A live run has no verdict yet: `report.json` is written after the last suite.
@@ -845,13 +1083,18 @@ impl EditorApp {
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Grid::new("run-cells").striped(true).show(ui, |ui| {
+                    // The header is the metric's plain name and the hover is the raw one the
+                    // report carries; a column this build has no word for keeps its raw name,
+                    // which is still better than an empty heading (packet M7/E6).
                     for (i, name) in columns.iter().enumerate() {
-                        if ui.button(name).clicked() {
+                        let plain = labels::column_label(lang, name);
+                        let heading = if plain.is_empty() { name } else { plain };
+                        if ui.button(heading).on_hover_text(name).clicked() {
                             sort = Some(i);
                         }
                     }
-                    ui.label("traj");
-                    ui.label("frames");
+                    ui.label(i18n::t(lang, "column.traj"));
+                    ui.label(i18n::t(lang, "column.frames"));
                     ui.end_row();
                     for row in &rows {
                         let is_selected = selected.as_deref() == Some(row.name.as_str());
@@ -861,37 +1104,49 @@ impl EditorApp {
                         ui.label(&row.suite);
                         ui.label(row.seed.map_or_else(|| "--".to_owned(), |s| s.to_string()));
                         for column in columns.iter().skip(3) {
-                            ui.label(row.metrics.get(column).map_or_else(dash, metric_text));
+                            ui.label(
+                                row.metrics
+                                    .get(column)
+                                    .map_or_else(|| dash(lang), |v| metric_text(lang, v)),
+                            );
                         }
-                        ui.label(if row.has_traj { "yes" } else { "--" });
+                        ui.label(i18n::t(
+                            lang,
+                            if row.has_traj {
+                                "results.pass"
+                            } else {
+                                "value.none"
+                            },
+                        ));
                         ui.label(row.frames.to_string());
                         ui.end_row();
                     }
                 });
 
                 ui.separator();
-                ui.heading(&heading);
+                ui.heading(&heading)
+                    .on_hover_text(i18n::t(lang, "results.acceptance.hint"));
                 for line in &acceptance {
-                    let (text, colour) = acceptance_row(line);
+                    let (text, colour) = acceptance_row(lang, line);
                     ui.colored_label(colour, text);
                 }
 
                 let (Some(cell), Some(timeline)) = (selected.as_ref(), timeline.as_ref()) else {
                     ui.separator();
-                    ui.label("Select a cell for its Safety Plane timeline and frames (spec 23.3).");
+                    ui.label(i18n::t(lang, "results.select_cell"));
                     return;
                 };
                 ui.separator();
                 ui.heading(timeline.heading(cell));
                 // One column per ~4 px of the strip; the model folds the frames into them.
                 let n = (ui.available_width() / 4.0) as usize;
-                paint_timeline(ui, &timeline.buckets(n));
+                paint_timeline(lang, ui, &timeline.buckets(n));
                 for kind in timeline.kind_rows() {
                     ui.label(kind.label());
                 }
 
                 ui.separator();
-                ui.heading("Frames");
+                ui.heading(i18n::t(lang, "results.frames"));
                 // A live run has no filmstrip on disk: what it has is the observation frame
                 // the producer is publishing right now (stream 4), uploaded once per image
                 // rather than once per repaint.
@@ -910,9 +1165,7 @@ impl EditorApp {
                             ));
                         }
                     } else {
-                        ui.label(
-                            "no observation image on the wire (es eval run                              --telemetry-image-every N publishes one every N ticks)",
-                        );
+                        ui.label(i18n::t(lang, "results.no_image"));
                     }
                     return;
                 };
@@ -965,17 +1218,24 @@ impl EditorApp {
     /// are all [`LaunchModel`]'s, under test (spec 28.10 rule 3). There is no Pause and no
     /// Step: the run speaks no control protocol (spec 23.3), so Kill is the only control.
     fn launch_panel(&mut self, ui: &mut egui::Ui) {
+        let lang = self.settings.lang;
         let mut start = false;
         let running = matches!(self.launch.state(), LaunchState::Running { .. });
         ui.horizontal(|ui| {
+            // The selector says what the command *does*; the hover says what it is, which is
+            // the command line itself (packet M7/E6).
             for kind in LaunchKind::ALL {
-                ui.selectable_value(&mut self.launch.kind, kind, kind.label());
+                ui.selectable_value(&mut self.launch.kind, kind, labels::kind_label(lang, kind))
+                    .on_hover_text(kind.label());
             }
             ui.separator();
             start = ui
-                .add_enabled(!running, egui::Button::new("Start"))
+                .add_enabled(!running, egui::Button::new(self.t("launch.start")))
                 .clicked();
-            if ui.add_enabled(running, egui::Button::new("Kill")).clicked() {
+            if ui
+                .add_enabled(running, egui::Button::new(self.t("launch.stop")))
+                .clicked()
+            {
                 self.launch.kill();
             }
             ui.separator();
@@ -984,24 +1244,43 @@ impl EditorApp {
         // One `horizontal` per flag rather than an `egui::Grid`: a grid caps a cell at the
         // column width it measured last frame, which squeezes a `TextEdit` down to the
         // default interact size and never lets it grow back.
+        let mut picked: Option<(crate::model::launch::LaunchField, String)> = None;
         for field in self.launch.fields() {
             ui.horizontal(|ui| {
-                ui.add_sized(FLAG_LABEL, egui::Label::new(field.flag()));
+                // The label is the plain name and the hover is the flag the CLI is given, so
+                // the panel still tells anyone who asks exactly what it will type.
+                ui.add_sized(
+                    FLAG_LABEL,
+                    egui::Label::new(labels::launch_label(lang, *field)),
+                )
+                .on_hover_text(field.flag());
                 ui.add(
                     egui::TextEdit::singleline(self.launch.field_mut(*field))
                         .hint_text(field.hint())
-                        .desired_width(620.0),
+                        .desired_width(540.0),
                 );
+                if let Some(browse) = labels::browses(*field) {
+                    if let Some(path) = self.browse(ui, browse) {
+                        picked = Some((*field, path));
+                    }
+                }
             });
+        }
+        if let Some((field, path)) = picked {
+            *self.launch.field_mut(field) = path;
         }
         ui.horizontal(|ui| {
             for flag in self.launch.flags() {
-                let label = flag.flag();
-                ui.checkbox(self.launch.flag_mut(*flag), label);
+                let label = labels::launch_flag_label(lang, *flag);
+                let raw = flag.flag();
+                ui.checkbox(self.launch.flag_mut(*flag), label)
+                    .on_hover_text(raw);
             }
         });
         // The command line, read-only: what is about to run, in one place, so nobody has to
-        // guess which `es` or which flags the panel decided on.
+        // guess which `es` or which flags the panel decided on. It is `es`'s own spelling and
+        // stays untranslated - this is the line a person would paste into a terminal.
+        ui.label(self.t("launch.command"));
         let mut command = self.launch.command_line();
         ui.add(
             egui::TextEdit::singleline(&mut command)
@@ -1047,6 +1326,8 @@ impl EditorApp {
     /// functions and to `advance`; nothing is decided here.
     fn replay_panel(&mut self, ui: &mut egui::Ui) {
         let dt = f64::from(ui.input(|i| i.stable_dt));
+        let lang = self.settings.lang;
+        let scene_browse = dialogs::AVAILABLE.then(|| self.browse_label(Browse::Scene));
         let Self {
             run,
             replay,
@@ -1064,18 +1345,25 @@ impl EditorApp {
             .map(|c| c.name.clone());
 
         ui.horizontal(|ui| {
-            ui.label("Scene");
+            ui.label(i18n::t(lang, "replay.scene"));
             ui.add(
                 egui::TextEdit::singleline(scene_path)
-                    .hint_text("the run's scene: .xml (MJCF) or .urdf")
+                    .hint_text(i18n::t(lang, "replay.scene.hint"))
                     .desired_width(220.0),
             );
+            if let Some(label) = scene_browse {
+                if ui.button(label).clicked() {
+                    if let Some(path) = dialogs::pick(Browse::Scene) {
+                        *scene_path = path.display().to_string();
+                    }
+                }
+            }
             // `es eval run --frames <dir>` writes wherever it was told, which is usually a
             // sibling of the run directory; the model re-scans when this is applied.
-            ui.label("Frames");
+            ui.label(i18n::t(lang, "replay.frames"));
             let field = ui.add(
                 egui::TextEdit::singleline(frames_path)
-                    .hint_text("<run>/frames")
+                    .hint_text(i18n::t(lang, "replay.frames.hint"))
                     .desired_width(220.0),
             );
             if field.lost_focus() {
@@ -1084,9 +1372,11 @@ impl EditorApp {
                     *status = format!("{}: {}", run.dir.display(), run.status);
                 }
             }
-            let label = selected
-                .as_ref()
-                .map_or_else(|| "Replay".to_owned(), |name| format!("Replay {name}"));
+            let replay_label = i18n::t(lang, "replay.replay");
+            let label = selected.as_ref().map_or_else(
+                || replay_label.to_owned(),
+                |name| format!("{replay_label} {name}"),
+            );
             if ui
                 .add_enabled(selected.is_some(), egui::Button::new(label))
                 .clicked()
@@ -1105,7 +1395,14 @@ impl EditorApp {
             }
             if let Some(view) = replay.as_mut() {
                 if ui
-                    .button(if view.playing { "Pause" } else { "Play" })
+                    .button(i18n::t(
+                        lang,
+                        if view.playing {
+                            "replay.pause"
+                        } else {
+                            "replay.play"
+                        },
+                    ))
                     .clicked()
                 {
                     view.playing = !view.playing;
@@ -1121,10 +1418,7 @@ impl EditorApp {
         });
 
         let Some(view) = replay.as_mut() else {
-            ui.label(
-                "Select a cell that has a trajectory, give the scene file, and press Replay \
-                 (spec 23.3).",
-            );
+            ui.label(i18n::t(lang, "replay.empty"));
             return;
         };
         view.advance(dt, REPLAY_RATE_HZ);
@@ -1169,19 +1463,21 @@ impl EditorApp {
             // Spec 23.1: the editor attaches to a running process. The address and the token
             // are typed here and dialled by the model, which owns every error string.
             ui.horizontal(|ui| {
-                ui.label("Attach");
+                ui.label(self.t("live.attach"))
+                    .on_hover_text(self.t("live.attach.hint"));
                 ui.add(
                     egui::TextEdit::singleline(&mut self.attach_addr)
-                        .hint_text("127.0.0.1:7777")
+                        .hint_text(crate::model::launch::DEFAULT_TELEMETRY)
                         .desired_width(160.0),
                 );
+                let token_hint = self.t("live.token");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.attach_token)
-                        .hint_text("token (optional)")
+                        .hint_text(token_hint)
                         .password(true)
                         .desired_width(160.0),
                 );
-                if ui.button("Connect").clicked() {
+                if ui.button(self.t("live.connect")).clicked() {
                     match telemetry_view::attach(&self.attach_addr, &self.attach_token) {
                         Ok(source) => {
                             self.source = source;
@@ -1192,18 +1488,27 @@ impl EditorApp {
                 }
             });
             ui.separator();
-            ui.heading("Performance (spec 12.4)");
+            ui.heading(self.t("live.performance"))
+                .on_hover_text(self.t("live.performance.hint"));
+            if self.telemetry.received == 0 {
+                ui.label(self.t("live.empty"));
+            }
             egui::Grid::new("metrics").striped(true).show(ui, |ui| {
                 for (name, value) in self.telemetry.metric_rows() {
-                    ui.label(name);
-                    ui.label(
-                        value.map_or_else(|| "-- (not measured)".to_owned(), |v| format!("{v:.3}")),
-                    );
+                    // The row is named by the metric it is, and hovers the raw spelling the
+                    // producer sends (packet M7/E6).
+                    let plain = labels::metric_by_name(name)
+                        .map_or(name, |m| labels::metric_label(self.settings.lang, m));
+                    ui.label(plain).on_hover_text(name);
+                    ui.label(value.map_or_else(
+                        || self.t("value.not_measured").to_owned(),
+                        |v| format!("{v:.3}"),
+                    ));
                     ui.end_row();
                 }
             });
             ui.separator();
-            ui.heading("Streams");
+            ui.heading(self.t("live.streams"));
             egui::Grid::new("streams").striped(true).show(ui, |ui| {
                 for (key, tick, value) in self.telemetry.latest() {
                     ui.label(format!("stream {}[{}]", key.stream.0, key.index));
@@ -1213,7 +1518,7 @@ impl EditorApp {
                 }
             });
             ui.separator();
-            ui.heading("Events");
+            ui.heading(self.t("live.events"));
             for e in self.telemetry.events.iter().rev().take(200) {
                 ui.label(format!("[{}] {} {:?}", e.tick, e.kind, e.fields));
             }
@@ -1222,27 +1527,33 @@ impl EditorApp {
 
     fn images_tab(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
+        let empty = self.t("sees.empty");
+        let (before, after) = (self.t("sees.before"), self.t("sees.after"));
+        let count = |pairs: usize, outputs: usize| {
+            i18n::fill(
+                self.settings.lang,
+                "sees.count",
+                &[&pairs.to_string(), &outputs.to_string()],
+            )
+        };
         let Some(opened) = &mut self.opened else {
-            ui.label("Open a bundle to see the pre/post preprocessing pair (spec 23.3).");
+            ui.label(empty);
             return;
         };
         if let Some(err) = &opened.image_error {
             ui.label(err.as_str());
         }
         let outputs = opened.observation.outputs.len();
-        ui.label(format!(
-            "{} of {outputs} observation outputs are images",
-            opened.pairs.len()
-        ));
+        ui.label(count(opened.pairs.len(), outputs));
         egui::ScrollArea::vertical().show(ui, |ui| {
             for pair in &opened.pairs {
-                let (before, after) = opened
+                let (pair_before, pair_after) = opened
                     .textures
                     .entry(pair.name.clone())
                     .or_insert_with(|| (texture(&ctx, pair, true), texture(&ctx, pair, false)));
                 ui.heading(&pair.name);
                 ui.horizontal(|ui| {
-                    for (label, tex) in [("before", &*before), ("after", &*after)] {
+                    for (label, tex) in [(before, &*pair_before), (after, &*pair_after)] {
                         ui.vertical(|ui| {
                             ui.label(label);
                             let scale = (240.0 / tex.size_vec2().x).max(1.0);
@@ -1265,12 +1576,12 @@ impl EditorApp {
             (Some(session), _) => session.diagnostics(),
             (None, Some(opened)) => &opened.graph.diagnostics,
             (None, None) => {
-                ui.label("Open a bundle to validate it.");
+                ui.label(self.t("problems.empty"));
                 return;
             }
         };
         if diagnostics.is_empty() {
-            ui.label("No diagnostics: the four IRs validate and agree (spec 11.1).");
+            ui.label(self.t("problems.none"));
             return;
         }
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -1297,23 +1608,27 @@ fn rgb_texture(ctx: &egui::Context, name: &str, img: &Rgb8Image) -> egui::Textur
 /// Frames the filmstrip shows, sampled evenly over the cell by [`RunView::filmstrip`].
 const FILMSTRIP: usize = 8;
 
-fn dash() -> String {
-    "--".to_owned()
+fn dash(lang: Lang) -> String {
+    i18n::t(lang, "value.none").to_owned()
 }
 
 /// A metric cell. A histogram has no single number and an unmeasured metric has none at all
 /// (spec 10.3): neither is rendered as `0`.
-fn metric_text(value: &es_ir::evaluation::MetricValue) -> String {
+fn metric_text(lang: Lang, value: &es_ir::evaluation::MetricValue) -> String {
     match value {
         es_ir::evaluation::MetricValue::Scalar(v) => format!("{v:.4}"),
         es_ir::evaluation::MetricValue::Histogram(h) => {
-            format!("histogram, {} cause(s)", h.len())
+            i18n::fill(lang, "value.histogram", &[&h.len().to_string()])
         }
-        es_ir::evaluation::MetricValue::Unavailable { reason } => format!("-- ({reason})"),
+        // The reason is the runner's own sentence and is shown verbatim: inventing a
+        // translation for it would be the editor guessing at what `es` meant.
+        es_ir::evaluation::MetricValue::Unavailable { reason } => {
+            format!("{} ({reason})", i18n::t(lang, "value.not_measured"))
+        }
     }
 }
 
-fn acceptance_row(line: &es_ir::evaluation::AcceptanceResult) -> (String, Color32) {
+fn acceptance_row(lang: Lang, line: &es_ir::evaluation::AcceptanceResult) -> (String, Color32) {
     match line {
         es_ir::evaluation::AcceptanceResult::Determined {
             criterion,
@@ -1321,13 +1636,20 @@ fn acceptance_row(line: &es_ir::evaluation::AcceptanceResult) -> (String, Color3
             passed,
         } => (
             format!(
-                "{} {} {} ({}, {}): observed {observed:.4} -- {}",
-                criterion.metric.name(),
+                "{} {} {} ({}, {}): {observed:.4} -- {}",
+                labels::metric_label(lang, criterion.metric),
                 criterion.comparator.name(),
                 criterion.threshold,
                 criterion.aggregation.name(),
-                criterion.suite.as_deref().unwrap_or("every suite"),
-                if *passed { "pass" } else { "FAIL" }
+                criterion.suite.as_deref().unwrap_or("*"),
+                i18n::t(
+                    lang,
+                    if *passed {
+                        "results.pass"
+                    } else {
+                        "results.fail"
+                    }
+                )
             ),
             if *passed {
                 Color32::from_rgb(120, 200, 120)
@@ -1336,16 +1658,20 @@ fn acceptance_row(line: &es_ir::evaluation::AcceptanceResult) -> (String, Color3
             },
         ),
         es_ir::evaluation::AcceptanceResult::Unavailable { metric, reason } => (
-            format!("{}: not measured ({reason})", metric.name()),
+            format!(
+                "{}: {} ({reason})",
+                labels::metric_label(lang, *metric),
+                i18n::t(lang, "results.not_measured")
+            ),
             Color32::from_gray(160),
         ),
     }
 }
 
 /// One colour per `EventSource`, violations as a tick beneath (spec 23.3).
-fn paint_timeline(ui: &mut egui::Ui, buckets: &[Bucket]) {
+fn paint_timeline(lang: Lang, ui: &mut egui::Ui, buckets: &[Bucket]) {
     if buckets.is_empty() {
-        ui.label("no events.json: this run recorded no per-tick sources");
+        ui.label(i18n::t(lang, "results.no_events"));
         return;
     }
     let (response, painter) =

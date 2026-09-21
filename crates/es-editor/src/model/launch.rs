@@ -156,8 +156,7 @@ impl LaunchField {
 }
 
 impl LaunchFlag {
-    pub const ALL: [LaunchFlag; 3] =
-        [Self::DryRun, Self::AllowNewEvaluation, Self::SkipExpertGate];
+    pub const ALL: [LaunchFlag; 3] = [Self::DryRun, Self::AllowNewEvaluation, Self::SkipExpertGate];
 
     pub fn flag(self) -> &'static str {
         match self {

@@ -85,9 +85,10 @@ pub fn system_cjk_font() -> Option<(String, Vec<u8>)> {
         if bytes.is_empty() {
             continue;
         }
-        let name = path
-            .file_name()
-            .map_or_else(|| (*pattern).to_owned(), |n| n.to_string_lossy().into_owned());
+        let name = path.file_name().map_or_else(
+            || (*pattern).to_owned(),
+            |n| n.to_string_lossy().into_owned(),
+        );
         return Some((name, bytes));
     }
     None
@@ -102,9 +103,10 @@ pub fn install(fonts: &mut FontDefinitions) -> Result<String, &'static [&'static
     let Some((name, bytes)) = system_cjk_font() else {
         return Err(CANDIDATES);
     };
-    fonts
-        .font_data
-        .insert(FAMILY.to_owned(), std::sync::Arc::new(FontData::from_owned(bytes)));
+    fonts.font_data.insert(
+        FAMILY.to_owned(),
+        std::sync::Arc::new(FontData::from_owned(bytes)),
+    );
     for family in [FontFamily::Proportional, FontFamily::Monospace] {
         fonts
             .families
@@ -225,7 +227,10 @@ pub fn text_styles(size: TextSize) -> BTreeMap<TextStyle, FontId> {
     let s = size.scale();
     let p = FontFamily::Proportional;
     BTreeMap::from([
-        (TextStyle::Small, FontId::new((BODY_PX - 3.0) * s, p.clone())),
+        (
+            TextStyle::Small,
+            FontId::new((BODY_PX - 3.0) * s, p.clone()),
+        ),
         (TextStyle::Body, FontId::new(BODY_PX * s, p.clone())),
         (TextStyle::Button, FontId::new(BODY_PX * s, p.clone())),
         (TextStyle::Heading, FontId::new(HEADING_PX * s, p)),
@@ -286,7 +291,11 @@ mod tests {
             );
             if installed {
                 assert_eq!(after.len(), before.len() + 1, "exactly one face was added");
-                assert_eq!(after.last().map(String::as_str), Some(FAMILY), "and it is last");
+                assert_eq!(
+                    after.last().map(String::as_str),
+                    Some(FAMILY),
+                    "and it is last"
+                );
             } else {
                 assert_eq!(after, before, "nothing found, nothing changed");
             }
@@ -310,8 +319,9 @@ mod tests {
     #[test]
     fn text_size_scales_every_style() {
         let m = text_styles(TextSize::M);
-        assert_eq!(m[&TextStyle::Body].size, BODY_PX);
-        assert_eq!(m[&TextStyle::Heading].size, HEADING_PX);
+        // The default size is the default: exact, because M's scale is exactly 1.
+        assert!((m[&TextStyle::Body].size - BODY_PX).abs() < f32::EPSILON);
+        assert!((m[&TextStyle::Heading].size - HEADING_PX).abs() < f32::EPSILON);
         let mut previous = 0.0;
         for size in TextSize::ALL {
             let styles = text_styles(size);
@@ -324,6 +334,10 @@ mod tests {
             }
             assert_eq!(TextSize::from_code(size.code()), size, "round-trips");
         }
-        assert_eq!(TextSize::from_code("huge"), TextSize::M, "anything else is M");
+        assert_eq!(
+            TextSize::from_code("huge"),
+            TextSize::M,
+            "anything else is M"
+        );
     }
 }

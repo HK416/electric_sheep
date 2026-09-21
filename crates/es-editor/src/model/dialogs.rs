@@ -79,15 +79,23 @@ mod tests {
     fn the_dialog_is_available_exactly_where_it_is_compiled_in() {
         assert_eq!(
             AVAILABLE,
-            cfg!(all(feature = "file-dialogs", any(windows, target_os = "macos"))),
+            cfg!(all(
+                feature = "file-dialogs",
+                any(windows, target_os = "macos")
+            )),
             "AVAILABLE is the cfg, not a guess"
         );
         if !AVAILABLE {
-            assert!(pick_file(Browse::Policy.filter()).is_none(), "the stub picks nothing");
+            assert!(
+                pick_file(Browse::Policy.filter()).is_none(),
+                "the stub picks nothing"
+            );
         }
         // Every field that offers a Browse button has something to filter on, or is a folder.
         for field in LaunchField::ALL {
-            let Some(browse) = browses(field) else { continue };
+            let Some(browse) = browses(field) else {
+                continue;
+            };
             if browse == Browse::Folder {
                 continue;
             }

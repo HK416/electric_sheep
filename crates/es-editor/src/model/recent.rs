@@ -122,9 +122,7 @@ impl Recent {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        classify, Kind, Recent, Settings, CAP, LANG_KEY, RECENT_KEY, TEXT_SIZE_KEY,
-    };
+    use super::{classify, Kind, Recent, Settings, CAP, LANG_KEY, RECENT_KEY, TEXT_SIZE_KEY};
 
     use crate::model::fonts::TextSize;
     use crate::model::i18n::Lang;

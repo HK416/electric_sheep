@@ -263,6 +263,15 @@ pub enum Browse {
 }
 
 impl Browse {
+    /// What the button beside the field says. A folder chooser and a file chooser are
+    /// different enough that a person should be told which one is about to open.
+    pub fn label_key(self) -> &'static str {
+        match self {
+            Browse::Folder => "open.browse_folder",
+            Browse::Policy | Browse::Toml | Browse::Scene => "open.browse",
+        }
+    }
+
     /// `(what the filter is called, the extensions it allows)`. The name is a raw one on
     /// purpose: a file dialog's filter row is where extensions belong.
     pub fn filter(self) -> (&'static str, &'static [&'static str]) {
@@ -361,7 +370,9 @@ mod tests {
         assert_eq!(browses(LaunchField::Policy), Some(Browse::Policy));
         assert_eq!(browses(LaunchField::Jobs), None, "a number is typed");
         for field in LaunchField::ALL {
-            let Some(browse) = browses(field) else { continue };
+            let Some(browse) = browses(field) else {
+                continue;
+            };
             let (name, extensions) = browse.filter();
             assert_eq!(
                 name.is_empty(),

@@ -160,6 +160,9 @@ mod tests {
         src.split('"').skip(1).step_by(2)
     }
 
+    /// The suffix that marks a value as hover text.
+    const HINT: &str = ".hint";
+
     /// Oracle 1 (packet M7/E6). The two tables carry the same keys, every key is used by the
     /// crate, every key-shaped literal in the crate is a key, and only a hover cites the spec.
     #[test]
@@ -169,8 +172,14 @@ mod tests {
         assert!(!en.is_empty(), "the English table parsed");
         let missing_ko: Vec<_> = en.difference(&ko).collect();
         let missing_en: Vec<_> = ko.difference(&en).collect();
-        assert!(missing_ko.is_empty(), "missing from ko.toml: {missing_ko:?}");
-        assert!(missing_en.is_empty(), "missing from en.toml: {missing_en:?}");
+        assert!(
+            missing_ko.is_empty(),
+            "missing from ko.toml: {missing_ko:?}"
+        );
+        assert!(
+            missing_en.is_empty(),
+            "missing from en.toml: {missing_en:?}"
+        );
 
         let sources = sources();
         let used: BTreeSet<&str> = sources.iter().flat_map(|s| literals(s)).collect();
@@ -188,20 +197,29 @@ mod tests {
             .iter()
             .copied()
             .filter(|lit| {
-                lit.contains('.')
-                    && !en.contains(lit)
-                    && lit.split('.').next().is_some_and(|p| prefixes.contains(p))
+                let mut segments = lit.split('.');
+                !en.contains(lit)
+                    && segments.next().is_some_and(|p| prefixes.contains(p))
+                    // Two or more non-empty segments: `metric.` is a prefix someone strips
+                    // off a telemetry field name, not a key that was mistyped.
+                    && segments.clone().count() >= 1
+                    && lit.split('.').all(|seg| !seg.is_empty())
                     && lit
                         .chars()
                         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || "._".contains(c))
             })
             .collect();
-        assert!(strays.is_empty(), "key-shaped but not in the tables: {strays:?}");
+        assert!(
+            strays.is_empty(),
+            "key-shaped but not in the tables: {strays:?}"
+        );
 
         // No visible string cites a spec section; a hover is the one place that may.
         for lang in Lang::ALL {
             let table = Strings::get(lang);
-            for key in en.iter().filter(|k| !k.ends_with(".hint")) {
+            // A hover is the one value that may cite the spec; `.hint` is a key suffix, not
+            // a file extension, so the path-aware comparison clippy suggests is wrong here.
+            for key in en.iter().filter(|k| !k.contains(HINT)) {
                 let value = table.t(key);
                 assert!(
                     !value.contains("spec "),
@@ -219,7 +237,11 @@ mod tests {
         const HOME: &str = concat!("home", ".", "recent");
         const ABSENT: &str = concat!("no", ".", "such", ".", "key");
         assert_ne!(t(Lang::En, HOME), t(Lang::Ko, HOME), "translated");
-        assert_eq!(t(Lang::En, ABSENT), ABSENT, "an unknown key shows as itself");
+        assert_eq!(
+            t(Lang::En, ABSENT),
+            ABSENT,
+            "an unknown key shows as itself"
+        );
         assert_eq!(Lang::from_code(Lang::Ko.code()), Lang::Ko);
         assert_eq!(Lang::from_code("de"), Lang::En, "anything else is English");
 
