@@ -1197,6 +1197,13 @@ env별 에피소드 카운터를 증가시킨다(`crates/es-env/src/env.rs:224`)
 > `ViolationRate` 링이 `begin_episode`를 넘어 살아남고, `StepEvent::tick`이 셀 전체에 누적되는
 > 물리 클럭이다. 그래서 단위는 셀로 남았고 플래그는 추가하지 않았다. 증거와 측정된 차이, 그리고
 > 리뷰가 내려야 할 두 결정은 `docs/design/evaluation-execution.ko.md` 2.7절에 있다.
+>
+> **그리고 바뀌었다 (패킷 M7/R1).** 오너가 2026-09-21에 둘 다 결정했다(spec 28.11):
+> `begin_episode`가 링을 비우고(spec 9.4), `StepEvent::tick`이 에피소드에서부터 센다
+> (spec 10.5). 둘이 들어온 뒤 `(cell, episode)` 분할은 커밋된 데모 문서 위에서 순차 실행과
+> 바이트 단위로 같고, `--jobs N`은 셀이 아니라 에피소드를 나누며, 스위트가 하나뿐인 평가도
+> 병렬화된다. 동일성 증거와 새 벽시계 표는 같은 2.7절에 있고, 의미론 변경이 이 노트 자신의
+> 숫자에 무엇을 했는지는 7.33절에 있다.
 
 반면 **셀**은 진짜로 독립적이다. 자기 `Env`, 자기 `SafetyPlane`, 0에서 시작하는 `seq`, 첫 에피소드를
 포함한 모든 에피소드에서의 `plan.reset()`. 셀들이 공유하는 것은 두 가지뿐이다. 컴파일된 `CpuPlan`
@@ -4154,6 +4161,40 @@ es eval run --config ~/artifacts/plan-v/m7-r5/eval-trainseeds-augmented-pt.toml 
 `success_rate`, `envelope_violation_rate`, `episode_length`, `passed`는 `~/artifacts/plan-v/m7-r5/U4/holdout/report.json`에 있고, 이 행의 `evaluation_hash`와 `execution_hash`도 같은 파일과 그 옆의 `evaluation.lock`에 있다. **평가 단계가 비싼 쪽이다**: 최대 1,800틱짜리 에피소드 96개 × 57.5 ms/frame은 분이 아니라 시간이고, 프로세스 하나가 이미 GPU를 93 %로 잡고 있으므로 `--jobs 6`이 `Rs` 경로에서만큼 벌어 주지 않는다. 원시 프레임 트리는 숫자를 읽은 뒤 지우라고 만든 것이다.
 
 **숫자가 오기 전에 그림이 이미 말하는 것.** `target/plan-u/r5/contact-sheet.png`는 시연 하나 전체(시드 1, 511틱)를 두 번 수집한 것으로 위가 `Rs`, 아래가 `Pt`이며, 두 실행 모두 같은 데이터셋 `content` 다이제스트 `ef2e904d…`를 보고한다 — 같은 상태를 두 가지로 그린 것이다. 64 spp에서 패스 트레이싱된 관측은 **눈에 띄게 거칠고**, 그 거칠기는 결정론적이므로(고정 `seed`, 픽셀로 주소 지정되는 샘플 키) 정책이 에포크를 거치며 평균 내어 없앨 수 있는 잡음이 아니라 포즈마다 고정된 텍스처다. U4가 U3 아래로 떨어진다면 가장 먼저 볼 것이 그것이고, `spp`가 `SensorRender`의 필드인 이유가 정확히 그것이다 — 다음 실행은 코드 한 줄 건드리지 않고 그것을 바꿀 수 있다.
+
+### 7.33 As built (M7/R1): 에피소드 경계 의미론 아래에서 다시 측정한 숫자
+
+패킷 `docs/packets/M7/P-M7-R1.md`; 메커니즘은 `docs/design/evaluation-execution.ko.md` 2.7절과 `docs/design/safety-plane.ko.md`의 "카운터"에 있다. **7.32절까지 이 노트의 모든 평가 수치는 윈도 이월(carry-over) 아래에서 측정된 것이다**: Safety Plane의 §9.4 `ViolationRate` 링이 `begin_episode`를 넘어 살아남았고, 그래서 에피소드 `k`의 틱 0에서 워치독은 에피소드 `k−1`의 dirty 스텝으로 가득 찬 윈도를 읽어 트립했으며, clamp 경로 대신 fallback 경로를 탔다 — envelope 위반율이 약 0.999인 데모에서는 첫 에피소드를 뺀 모든 에피소드의 처음 200틱 동안. 같은 기간 `StepEvent::tick`은 셀에 누적되는 물리 클럭이었다. 오너가 2026-09-21에 둘 다 결정했고(§28.11) R1이 그것을 넣었으므로, 그 행들은 **pre-R1 semantics**이며 삭제되지 않고 표시된 채로 남는다(§28.9 규칙 2). 이 절이 그 재측정이다.
+
+**재측정, 그리고 아무것도 움직이지 않았다.** 두 실행 모두 R1 빌드
+(`~/Projects/es-r1-episodes`, `cargo build --release -p es --features render`,
+`ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python`)로 오라클 서버에서 2026-09-21에 돌렸고, 산출물은
+`~/artifacts/plan-v/m7-r1-episodes/` 아래에 있다:
+
+| 행 | 문서 | pre-R1 의미론 | R1 아래 | `passed` |
+|---|---|---|---|---|
+| **U3 held-out** (16 시드 × 6 스위트, `--jobs 6`) | `evaluation-augmented.toml`, `evaluation_hash e5705cb0…` | `success_rate` **0.5625**, `envelope_violation_rate` 0.6668, `episode_length` 1092.1 | **같은 숫자** — `report.json`이 `~/artifacts/plan-v/m7-u/U3/holdout/report.json`과 바이트 단위로 같고, `execution_hash a2283994…`와 여섯 스위트의 히스토그램까지 모두 같다 | 둘 다 true |
+| **expert 게이트**, nominal (16 시드, `--jobs 6`, `--expert so101-pick-place`) | 커밋된 `evaluation.toml`의 nominal 스위트 | `success_rate` 1.0, `envelope_violation_rate` 0.0432, `episode_length` 507.25 (패킷 M7/T2의 `report-expert-gate.json`) | `success_rate` **1.0**, `envelope_violation_rate` **0.0432**, `episode_length` **507.2** | 둘 다 true |
+
+**왜 움직이지 않았고, 언제라면 움직였을까.** 링은 워치독 하나의 입력이고, 그 워치독은
+`envelope_violation_rate > max_frac`에서 발화한다. 데모는 `max_frac = 0.9`를 선언한다. U3는 셀
+위반율 0.667로, 스크립트 expert는 0.043으로 돈다. 그래서 에피소드 `k`의 틱 0에서 옛 plane이
+이월한 윈도와 새 plane의 빈 윈도는 **둘 다 트립 선 아래**다 — 같은 분기, 같은 액션, 같은 궤적.
+T8이 갈라짐을 측정한 정책 `v14/trained-20000.esb`는 **0.9998**로 돌았다. 그 이월된 윈도는 틱
+0에서 약 1.0을 읽어 트립했고, 빈 링이라면 clamp 경로를 탈 자리에서 fallback 경로를 탔다. 즉 이
+의미론 변경은 *이미* 워치독이 참는 것보다 더 자주 envelope 밖에 있는 정책에서만 보이고, 커밋된
+행 중에는 그런 것이 없다.
+
+무조건 움직인 것은 `events.json`의 시계다. U3의 `backlash-01`은 옛 의미론에서 `tick: 1408`에,
+`backlash-02`는 `tick: 8608`에 열렸고, 지금은 둘 다 `tick: 0`에 열린다. 어떤 지표도 `tick`을
+읽지 않으며, 그래서 리포트가 바뀌지 않았다.
+
+이것이 "pre-R1 semantics" 표시의 정직한 상태다. 그것은 숫자에 대한 정정이 아니라 *조건*에 대한
+표시다. 7.32까지의 모든 행은 측정된 그대로 유효하고, 앞으로 슬라이딩 위반율이 자기 `max_frac`을
+넘는 정책이 나오면 그것이 재측정이 필요한 행이다 — 그리고 그것은 이미 표에 있는
+`envelope_violation_rate` 열에서 독자가 확인할 수 있는 성질이다.
+
+**무엇을 다시 측정하지 않았고, 왜인가.** §28.10은 IR 그래프 정책의 재측정을 한 번 허용하고 그것이 U 웨이브였다. 이것은 다섯 번째 구성이 아니며 아무것도 재학습하지 않았다. U0, U1, U2, U4는 pre-R1 행을 유지한다. 데모의 수용 기준이 걸려 있는 행인 U3와 하네스 자신의 expert 게이트만 다시 돌렸고, 그것이 의미론 변경이 사람이 읽는 숫자에 무엇을 했는지 말해 주는 가장 작은 측정이다.
 
 ## 8. 안전 오버레이 (V3)
 
