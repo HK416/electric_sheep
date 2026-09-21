@@ -236,6 +236,11 @@ pub struct LaunchModel {
     child: Option<Child>,
     lines: Receiver<String>,
     ring: VecDeque<String>,
+    /// Whether [`Self::kill`] ended this child. `TerminateProcess` exits 1 on Windows and a
+    /// signal leaves no code at all on Unix, so the exit code alone cannot tell a killed run
+    /// from a failed one — and reporting "failed" for something the person themselves ended
+    /// would be the panel lying about the run.
+    killed: bool,
 }
 
 impl std::fmt::Debug for LaunchModel {
@@ -274,6 +279,7 @@ impl Default for LaunchModel {
             child: None,
             lines,
             ring: VecDeque::new(),
+            killed: false,
         }
     }
 }
@@ -448,6 +454,7 @@ impl LaunchModel {
             return;
         }
         self.ring.clear();
+        self.killed = false;
         let child = Command::new(program)
             .args(args)
             .stdout(Stdio::piped())
@@ -529,6 +536,7 @@ impl LaunchModel {
     pub fn kill(&mut self) {
         if let Some(child) = self.child.as_mut() {
             let _ = child.kill();
+            self.killed = true;
         }
     }
 
@@ -552,6 +560,9 @@ impl LaunchModel {
             ),
             State::Running { pid, since } => {
                 format!("running: pid {pid}, {:.1}s", since.elapsed().as_secs_f32())
+            }
+            State::Exited { code, .. } if self.killed => {
+                format!("exit {code}: killed from here")
             }
             State::Exited { code, .. } => format!("exit {code}: {}", exit_meaning(*code)),
             State::Failed(e) => format!("could not start: {e}"),
@@ -889,6 +900,12 @@ mod tests {
         assert!(matches!(m.state(), State::Running { .. }));
         m.kill();
         assert_ne!(poll_until_exit(&mut m), 0, "a killed child did not succeed");
+        // ... and is not reported as a failure, which its exit code alone would say.
+        assert!(
+            m.status_line().contains("killed from here"),
+            "{}",
+            m.status_line()
+        );
 
         // Starting something that is not a program is `Failed`, not an exit code: nothing ran.
         m.start_program(Path::new("no-such-binary-es-editor-test"), &[]);

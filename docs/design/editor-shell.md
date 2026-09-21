@@ -705,8 +705,13 @@ place the editor repeats them.
 | other | ended without one of the documented codes (killed, or a crash) |
 
 3 is the row that has to be in a table rather than in someone's head: it is not a failure, and
-a panel that coloured it like one would be lying about §1.4. A child killed by a signal has no
-code on Unix; it is reported as `-1`, which the last row covers.
+a panel that coloured it like one would be lying about §1.4.
+
+**A killed child is reported as killed, not as failed.** The exit code cannot say so on its
+own: `TerminateProcess` exits 1 on Windows, which is indistinguishable from a real failure,
+and a signal leaves no code at all on Unix (reported as `-1`, the last row). So `kill()` sets
+a flag and the status line reads `exit 1: killed from here` — the panel must not tell someone
+their run failed when they themselves ended it.
 
 ### Attach follows launch
 

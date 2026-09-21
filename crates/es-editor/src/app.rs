@@ -43,6 +43,8 @@ const NODE_H: f32 = 40.0;
 const PORT_R: f32 = 7.0;
 /// Telemetry messages drained per frame (spec 23.3 runs the viewer on a budget).
 const PUMP_BUDGET: usize = 256;
+/// Width of the Launch section's flag labels, so the text boxes line up.
+const FLAG_LABEL: Vec2 = Vec2::new(184.0, 18.0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Tab {
@@ -769,7 +771,7 @@ impl EditorApp {
         // starting a run is how the tab gets something to show (packet M7/E5).
         egui::TopBottomPanel::top("launch")
             .resizable(true)
-            .default_height(260.0)
+            .default_height(400.0)
             .show_inside(ui, |ui| self.launch_panel(ui));
         if self.run.is_none() && self.telemetry.live.is_empty() {
             ui.label(
@@ -976,41 +978,41 @@ impl EditorApp {
             if ui.add_enabled(running, egui::Button::new("Kill")).clicked() {
                 self.launch.kill();
             }
+            ui.separator();
+            ui.label(self.launch.status_line());
         });
-        egui::ScrollArea::vertical()
-            .id_salt("launch")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                egui::Grid::new("launch-fields")
-                    .striped(true)
-                    .show(ui, |ui| {
-                        for field in self.launch.fields() {
-                            ui.label(field.flag());
-                            ui.add(
-                                egui::TextEdit::singleline(self.launch.field_mut(*field))
-                                    .hint_text(field.hint())
-                                    .desired_width(420.0),
-                            );
-                            ui.end_row();
-                        }
-                    });
-                ui.horizontal(|ui| {
-                    for flag in self.launch.flags() {
-                        let label = flag.flag();
-                        ui.checkbox(self.launch.flag_mut(*flag), label);
-                    }
-                });
-                // The command line, read-only: what is about to run, in one place, so nobody
-                // has to guess which `es` or which flags the panel decided on.
-                let mut command = self.launch.command_line();
+        // One `horizontal` per flag rather than an `egui::Grid`: a grid caps a cell at the
+        // column width it measured last frame, which squeezes a `TextEdit` down to the
+        // default interact size and never lets it grow back.
+        for field in self.launch.fields() {
+            ui.horizontal(|ui| {
+                ui.add_sized(FLAG_LABEL, egui::Label::new(field.flag()));
                 ui.add(
-                    egui::TextEdit::multiline(&mut command)
-                        .desired_width(f32::INFINITY)
-                        .desired_rows(2)
-                        .interactive(false),
+                    egui::TextEdit::singleline(self.launch.field_mut(*field))
+                        .hint_text(field.hint())
+                        .desired_width(620.0),
                 );
-                ui.label(self.launch.status_line());
-                ui.separator();
+            });
+        }
+        ui.horizontal(|ui| {
+            for flag in self.launch.flags() {
+                let label = flag.flag();
+                ui.checkbox(self.launch.flag_mut(*flag), label);
+            }
+        });
+        // The command line, read-only: what is about to run, in one place, so nobody has to
+        // guess which `es` or which flags the panel decided on.
+        let mut command = self.launch.command_line();
+        ui.add(
+            egui::TextEdit::singleline(&mut command)
+                .desired_width(f32::INFINITY)
+                .interactive(false),
+        );
+        egui::ScrollArea::vertical()
+            .id_salt("launch-lines")
+            .auto_shrink([false, false])
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
                 for line in self.launch.lines() {
                     ui.monospace(line);
                 }
