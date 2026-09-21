@@ -343,6 +343,11 @@ impl Publisher {
     ///
     /// `shape` is the renderer's `[h, w, c]`; anything that is not three-channel `u8` is not
     /// an `Rgb8` image and is not relabelled into one (INV-14).
+    ///
+    /// Only the render build has a frame source to call this from (`es loop collect
+    /// --telemetry-image-every` says so and publishes none without `--frames`), so a build
+    /// without the feature never reaches it.
+    #[cfg_attr(not(feature = "render"), allow(dead_code))]
     pub(crate) fn observation(&mut self, shape: [usize; 3], bytes: &[u8]) {
         let [h, w, c] = shape;
         if c != 3 || bytes.len() != h * w * c {
