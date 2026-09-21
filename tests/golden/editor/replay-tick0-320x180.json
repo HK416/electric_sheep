@@ -1,0 +1,30 @@
+{
+  "camera": {
+    "eye": [
+      0.55,
+      -0.45,
+      0.42
+    ],
+    "fov_y": 0.7853981633974483,
+    "height": 180,
+    "look_at": [
+      0.12,
+      -0.02,
+      0.08
+    ],
+    "width": 320
+  },
+  "dtype": "u8",
+  "generator": "cargo test -p es-editor -- --ignored generate_raster_golden",
+  "layout": "row-major, tightly packed",
+  "name": "replay-tick0-320x180",
+  "oracle": "es_editor::model::replay_view::Raster::draw, the Replay panel itself",
+  "pins": "OpenCV camera frame, top-left image origin (spec 3.1); a per-pixel depth test on interpolated camera-space z, flat Lambert per triangle",
+  "shape": [
+    180,
+    320,
+    3
+  ],
+  "source": "tests/fixtures/mjcf/so101_pick_place.xml re-posed by tests/fixtures/visible-learning/run/traj/nominal-00.estraj, tick 0",
+  "spec": "docs/design/editor-shell.md"
+}
