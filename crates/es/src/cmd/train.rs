@@ -458,11 +458,6 @@ pub(crate) fn run(
     }
 
     // --- the plan ------------------------------------------------------------------------
-    // How long this run is, said once before the first step so a viewer can draw an ETA from
-    // the first progress line (packet M7/E7).
-    if let Some(p) = watch.publisher.as_deref_mut() {
-        p.train_begin(recipe.run.steps);
-    }
     let mut checkpoints = Vec::new();
     let mut summary = Value::Null;
     for step in &plan.steps {
@@ -477,7 +472,15 @@ pub(crate) fn run(
             StepKind::PolicyLower => {
                 crate::cmd::policy::lower(&step.args)?;
             }
-            StepKind::Trainer => summary = spawn(step, route == Route::Ir, &mut watch)?,
+            StepKind::Trainer => {
+                // How long this run is, said right before the trainer and not before the
+                // bake: a viewer that dials in during a long bake still hears the total
+                // before the first progress line, so it can draw an ETA (packet M7/E7).
+                if let Some(p) = watch.publisher.as_deref_mut() {
+                    p.train_begin(recipe.run.steps);
+                }
+                summary = spawn(step, route == Route::Ir, &mut watch)?;
+            }
             StepKind::PolicyPack => {
                 crate::cmd::policy::pack(&step.args)?;
                 checkpoints.push(published_row(step, out, &mut watch)?);
