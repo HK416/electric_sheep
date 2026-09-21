@@ -7,8 +7,9 @@
 //! **in-process** — they are functions in this module's siblings — and the only subprocess is
 //! the Python trainer, which is exactly where spec 2.3 draws the line.
 
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use es_compile::PolicyBundle;
 use es_data::training::{
@@ -20,11 +21,14 @@ use es_ir::observation::ObservationIr;
 use es_ir::serial::{observation_from_toml, task_from_toml};
 use serde_json::{json, Value};
 
+use crate::cmd::telemetry::{Publisher, TelemetryArgs, STAGE_TRAIN};
 use crate::error::CliError;
 use crate::util::hex;
 
 const HELP: &str = "\
 es train --recipe <training.toml> [--out <dir>] [--dry-run] [--allow-retired-task <hex>]
+         [--telemetry <addr>] [--telemetry-token <t>] [--telemetry-image-every <N>]
+         [--progress-every <N>] [--sample-every <N>]
 
 Runs one training document end to end and writes spec 19.3's `training/` from what the run
 actually used (spec 13.1: each step of the loop is a command *and* an artifact).
@@ -57,6 +61,27 @@ the repository root: the IR route's trainer is `python/es/train_act.py` and a Ta
               the hash being accepted (M5 review S-3/R4). Without it the mismatch is refused:
               demonstrations of one predicate and documents of another measure nothing.
 
+--telemetry <addr>
+              publish the run live on this address (spec 23.1), e.g. 127.0.0.1:7777. The
+              trainer's stdout is then read line by line rather than at exit, and what it
+              says goes out on stream 5 as [step, loss, lr, samples_per_s], with a
+              `checkpoint` event per packed mark on stream 1 and the sample image on stream 4.
+              The summary is still the trainer's last stdout line and still what
+              training.lock records.
+--telemetry-token <t>
+              required in every client's Hello (spec 25.1); none by default
+--progress-every <N>
+              ask the trainer for one progress line every N optimizer steps (default 10 with
+              --telemetry, 0 without)
+--sample-every <N>
+              ask the trainer to write one image input of the batch, after augmentation, as
+              Rgb8 beside metrics/ every N steps (default 0, never). --telemetry-image-every
+              is the same number under the spelling `es eval run` and the editor use.
+
+Both trainer flags are passed **only** with --telemetry, and neither enters the plan: they
+change nothing the run computes, so `training.lock`, the checkpoints and metrics/loss.json
+are byte-identical with and without them.
+
 ES_PYTHON overrides `[run] interpreter` when it is set.
 
 <out>/training.lock carries two digests: `identity_hash`, over the nine slots that are known
@@ -69,6 +94,8 @@ Exit codes: 0 success, 1 runtime failure, 2 usage error.
 
 pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
     let (mut recipe, mut out, mut retired) = (None, None, None);
+    let (mut addr, mut token, mut image_every) = (None, None, None);
+    let (mut progress_every, mut sample_every) = (None, None);
     let mut dry_run = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -84,6 +111,11 @@ pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
             "--recipe" => &mut recipe,
             "--out" => &mut out,
             "--allow-retired-task" => &mut retired,
+            "--telemetry" => &mut addr,
+            "--telemetry-token" => &mut token,
+            "--telemetry-image-every" => &mut image_every,
+            "--progress-every" => &mut progress_every,
+            "--sample-every" => &mut sample_every,
             other => {
                 return Err(CliError::Usage(format!(
                     "es train: unknown flag '{other}'\n\n{HELP}"
@@ -115,7 +147,86 @@ pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
             es_data::training::KIND
         )));
     }
-    run(&recipe, &out, dry_run, retired.as_deref())
+    // Bound before the bundle, the dataset or Python is opened, so a viewer that attaches on
+    // the printed address is subscribed before the first optimizer step (packet M7/E7).
+    let telemetry = TelemetryArgs {
+        addr: match &addr {
+            Some(v) => Some(TelemetryArgs::parse_addr(v, HELP)?),
+            None => None,
+        },
+        token,
+        image_every: match &image_every {
+            Some(v) => TelemetryArgs::parse_image_every(v, HELP)?,
+            None => 0,
+        },
+    };
+    let number = |flag: &str, v: &Option<String>| -> Result<Option<u64>, CliError> {
+        v.as_ref()
+            .map(|v| {
+                v.parse().map_err(|_| {
+                    CliError::Usage(format!("es train: {flag} {v:?} is not a number\n\n{HELP}"))
+                })
+            })
+            .transpose()
+    };
+    let watching = telemetry.addr.is_some();
+    let mut owned = telemetry.bind(STAGE_TRAIN)?;
+    let watch = TrainWatch {
+        // The trainer says nothing nobody is listening for: without `--telemetry` neither
+        // flag is passed and its command line is the one every measured run used.
+        progress_every: number("--progress-every", &progress_every)?.unwrap_or(if watching {
+            DEFAULT_PROGRESS_EVERY
+        } else {
+            0
+        }),
+        sample_every: number("--sample-every", &sample_every)?.unwrap_or(telemetry.image_every),
+        publisher: owned.as_mut(),
+    };
+    let code = run(&recipe, &out, dry_run, retired.as_deref(), watch)?;
+    if let Some(p) = &owned {
+        println!("{}", p.summary());
+    }
+    Ok(code)
+}
+
+/// Progress lines a `--telemetry` run asks for when nobody said. Ten steps is a curve that
+/// moves without a line per step on a 20,000-step run.
+pub(crate) const DEFAULT_PROGRESS_EVERY: u64 = 10;
+
+/// What `es train` publishes, and how often it asks the trainer to say something.
+///
+/// A `--telemetry`-less run carries the default: no publisher and two zeroes, which is the
+/// trainer command line of every measured run (packet M7/E7).
+#[derive(Default)]
+pub(crate) struct TrainWatch<'a> {
+    pub publisher: Option<&'a mut Publisher>,
+    pub progress_every: u64,
+    pub sample_every: u64,
+}
+
+impl TrainWatch<'_> {
+    /// The flags appended to `train_act.py`'s command line — **not** to the plan.
+    ///
+    /// The plan is `config.json`'s `plan` and therefore part of `identity_hash` (spec 19.3):
+    /// a flag that changes nothing the run computes must not move a run's identity, and a
+    /// `training.lock` that differed by whether someone was watching would make two identical
+    /// runs look like two runs. `--dry-run` prints the same plan either way.
+    fn trainer_flags(&self, ir_route: bool) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.publisher.is_none() || !ir_route {
+            return out;
+        }
+        for (flag, n) in [
+            ("--progress-every", self.progress_every),
+            ("--sample-every", self.sample_every),
+        ] {
+            if n > 0 {
+                out.push(flag.to_owned());
+                out.push(n.to_string());
+            }
+        }
+        out
+    }
 }
 
 fn bad(msg: impl Into<String>) -> CliError {
@@ -212,6 +323,7 @@ pub(crate) fn run(
     out: &Path,
     dry_run: bool,
     retired: Option<&str>,
+    mut watch: TrainWatch<'_>,
 ) -> Result<u8, CliError> {
     let recipe = recipe.clone();
     let route = recipe.route().map_err(|e| bad(e.to_string()))?;
@@ -360,14 +472,14 @@ pub(crate) fn run(
             StepKind::PolicyLower => {
                 crate::cmd::policy::lower(&step.args)?;
             }
-            StepKind::Trainer => summary = spawn(step, route == Route::Ir)?,
+            StepKind::Trainer => summary = spawn(step, route == Route::Ir, &mut watch)?,
             StepKind::PolicyPack => {
                 crate::cmd::policy::pack(&step.args)?;
-                checkpoints.push(manifest_row(step, out)?);
+                checkpoints.push(published_row(step, out, &mut watch)?);
             }
             StepKind::PolicyImportLerobot => {
                 crate::cmd::policy::import_lerobot(&step.args)?;
-                checkpoints.push(manifest_row(step, out)?);
+                checkpoints.push(published_row(step, out, &mut watch)?);
             }
         }
     }
@@ -550,11 +662,23 @@ print(json.dumps(d))
 
 /// Runs the one subprocess. `capture` is for `train_act.py`, whose whole report is a single
 /// JSON line on stdout; `lerobot-train` streams a progress log instead and inherits.
-fn spawn(step: &Step, capture: bool) -> Result<Value, CliError> {
+///
+/// With a publisher the captured path becomes a *streamed* one: the same stdout, read line by
+/// line so a `{"progress": ...}` line reaches a viewer while the run is still going. The
+/// summary is still the last line and still parsed the same way, which is what keeps
+/// `training.lock` byte-identical (packet M7/E7).
+fn spawn(step: &Step, capture: bool, watch: &mut TrainWatch<'_>) -> Result<Value, CliError> {
     let mut cmd = Command::new(&step.prefix[0]);
     cmd.args(&step.prefix[1..]).args(&step.args);
+    let extra = watch.trainer_flags(capture);
+    if !extra.is_empty() {
+        println!("  + {}", extra.join(" "));
+        cmd.args(&extra);
+    }
     let named = || format!("{}: ", step.prefix[0]);
-    let (ok, code, summary) = if capture {
+    let (ok, code, summary) = if capture && watch.publisher.is_some() {
+        stream(&mut cmd, watch).map_err(|e| bad(format!("{}{e}", named())))?
+    } else if capture {
         let out = cmd.output().map_err(|e| bad(format!("{}{e}", named())))?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
         print!("{text}");
@@ -578,6 +702,60 @@ fn spawn(step: &Step, capture: bool) -> Result<Value, CliError> {
             code.unwrap_or(-1)
         )))
     }
+}
+
+/// The trainer's stdout, line by line, published as it arrives.
+///
+/// stderr is inherited rather than piped: reading two pipes from one thread deadlocks when
+/// either fills, and the non-streamed path's `eprint!` of the captured stderr and this go to
+/// the same place. A line that is not one of the two the trainer publishes is printed and
+/// remembered as a candidate summary, so the last non-progress line is the report — exactly
+/// what `Command::output`'s `text.lines().last()` picks.
+fn stream(
+    cmd: &mut Command,
+    watch: &mut TrainWatch<'_>,
+) -> std::io::Result<(bool, Option<i32>, Value)> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("the trainer's stdout was not piped"))?;
+    let mut last = String::new();
+    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+        println!("{line}");
+        let parsed = serde_json::from_str::<Value>(&line).unwrap_or(Value::Null);
+        let publisher = watch.publisher.as_deref_mut();
+        match (publisher, parsed.get("progress"), parsed.get("sample")) {
+            (Some(p), Some(progress), _) => p.progress(progress),
+            (Some(p), None, Some(Value::String(path))) => p.sample(Path::new(path)),
+            _ => {}
+        }
+        if parsed.get("progress").is_none() && parsed.get("sample").is_none() {
+            last = line;
+        }
+    }
+    let status = child.wait()?;
+    Ok((
+        status.success(),
+        status.code(),
+        serde_json::from_str(&last).unwrap_or(Value::Null),
+    ))
+}
+
+/// [`manifest_row`], announced: a viewer learns that a mark was packed and which policy it
+/// is, at the moment the bundle exists on disk (packet M7/E7).
+fn published_row(step: &Step, out: &Path, watch: &mut TrainWatch<'_>) -> Result<Value, CliError> {
+    let row = manifest_row(step, out)?;
+    if let Some(p) = watch.publisher.as_deref_mut() {
+        p.checkpoint(
+            &row["step"].to_string(),
+            row["bundle_policy_hash"].as_str().unwrap_or("-"),
+        );
+    }
+    Ok(row)
 }
 
 /// One `checkpoint.manifest` row, read back from the bundle that was just written so the

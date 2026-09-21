@@ -20,7 +20,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use es_assets::scene::SceneDesc;
 use es_compile::{PolicyBundle, Tensor};
-use es_core::TickRate;
+use es_core::{PhysTick, TickRate};
 use es_env::scheduler::BatchDomains;
 use es_env::traj::Trajectory;
 use es_env::{DomainRunner, Env, Termination};
@@ -28,7 +28,7 @@ use es_ir::learning::{ChunkBlendPolicy, LearningGraph, LearningNode};
 use es_ir::types::ElemType;
 use es_physics_core::backend::{ModelInfo, PhysicsBackend, StateView};
 use es_policy::{PolicyError, PolicyInfo, PolicyRuntime, WeightsSource};
-use es_safety::SafetyPlane;
+use es_safety::{EventSet, SafetyPlane, ViolationKind};
 use serde::{Deserialize, Serialize};
 
 use crate::identity::{BaseModel, DatasetIdentity, Split, TrainingIdentity};
@@ -275,6 +275,39 @@ pub type Intervener<'a, const NJ: usize> =
 /// reference.
 pub type FrameSink<'a> = &'a mut dyn FnMut(&ModelInfo, &StateView<'_>) -> Result<(), String>;
 
+/// One moment of a running collection, for a [`CollectSink`] (packet M7/E7).
+///
+/// The shape [`es_eval::runner::RunEvent`] has for an evaluation, for the same reason: a
+/// collection that publishes what it is doing must publish what it *already had*, so a viewer
+/// sees the plane's own verdict and not a second derivation of it. `es-data` links no
+/// transport (layer 10 beside `es-telemetry`, spec 4.2 forbids the dependency); the caller
+/// turns these into wire frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollectEvent {
+    /// One episode starts, with the seed the whole run was drawn from.
+    EpisodeBegin { episode: u32, seed: u64 },
+    /// One control tick, as the dataset's own `action_source` column records it and with the
+    /// `es_safety::EventSet` bits of that step — the two counters' delta, which is exactly
+    /// the set the plane raised (one env, one `validate` per step).
+    Tick {
+        episode: u32,
+        frame: u32,
+        tick: PhysTick,
+        source: ActionSourceCode,
+        events: u32,
+    },
+    /// The episode is over and its rows are written.
+    EpisodeEnd {
+        episode: u32,
+        outcome: Termination,
+        steps: usize,
+    },
+}
+
+/// The collection sink: a closure, not an eighth extension point (`INV-17`). `None` is the
+/// run of before — nothing is computed for a sink that is not there.
+pub type CollectSink<'a> = &'a mut dyn FnMut(CollectEvent);
+
 /// What [`Collector::run`] is given that the bundle does not say.
 #[derive(Debug)]
 pub struct CollectSpec<'a> {
@@ -440,9 +473,30 @@ impl Collector {
     pub fn run<B, F, const NJ: usize, const H: usize>(
         spec: &CollectSpec<'_>,
         policy: &mut dyn PolicyRuntime,
+        new_backend: F,
+        intervener: Intervener<'_, NJ>,
+        frame_sink: Option<FrameSink<'_>>,
+    ) -> Result<CollectReport, DataError>
+    where
+        B: PhysicsBackend,
+        F: FnMut() -> B,
+    {
+        Self::run_with_sink::<B, F, NJ, H>(spec, policy, new_backend, intervener, frame_sink, None)
+    }
+
+    /// [`Self::run`] with a [`CollectSink`]: the same run, saying what it does as it does it
+    /// (packet M7/E7).
+    ///
+    /// With `None` this is the run of before, byte for byte — nothing is computed for a sink
+    /// that is not there, and the two per-step numbers a sink is given (the source code and
+    /// the violation bits) come out of counters this loop already snapshots.
+    pub fn run_with_sink<B, F, const NJ: usize, const H: usize>(
+        spec: &CollectSpec<'_>,
+        policy: &mut dyn PolicyRuntime,
         mut new_backend: F,
         intervener: Intervener<'_, NJ>,
         mut frame_sink: Option<FrameSink<'_>>,
+        mut sink: Option<CollectSink<'_>>,
     ) -> Result<CollectReport, DataError>
     where
         B: PhysicsBackend,
@@ -520,6 +574,12 @@ impl Collector {
         let mut rendered = 0u64;
 
         for index in 0..spec.n_episodes {
+            if let Some(sink) = sink.as_deref_mut() {
+                sink(CollectEvent::EpisodeBegin {
+                    episode: index,
+                    seed: spec.seed,
+                });
+            }
             let mut traj = spec.traj_dir.as_ref().map(|_| Trajectory::new(env.model()));
             let mut sources: Vec<i64> = Vec::with_capacity(max_steps as usize);
             let mut commanded: Vec<f64> = Vec::with_capacity(max_steps as usize * NJ);
@@ -560,6 +620,10 @@ impl Collector {
                     }
                 }
                 let before = counters_of(&planes[0]);
+                // Only when someone is watching: the per-kind array is 14 words and the
+                // stream-2 sample is the only reader of it (packet M7/E7).
+                let kinds_before = sink.as_ref().map(|_| planes[0].counters().violations);
+                let tick = env.tick();
                 let outcome = env
                     .step_with_policy(&mut runner, &mut wrapper, &mut planes, &mut [])
                     .map_err(|e| bad(&e))?;
@@ -578,7 +642,17 @@ impl Collector {
                     }
                 }
                 let after = counters_of(&planes[0]);
-                sources.push(classify(before, after, human[frame as usize]).as_i64());
+                let source = classify(before, after, human[frame as usize]);
+                sources.push(source.as_i64());
+                if let (Some(sink), Some(kinds_before)) = (sink.as_deref_mut(), kinds_before) {
+                    sink(CollectEvent::Tick {
+                        episode: index,
+                        frame,
+                        tick,
+                        source,
+                        events: raised(&kinds_before, &planes[0].counters().violations).bits(),
+                    });
+                }
                 if let Some(ep) = outcome.episodes.into_iter().next() {
                     closed = Some(ep);
                     break;
@@ -630,6 +704,13 @@ impl Collector {
             human.resize(n, false);
             intervention_frames += human.iter().filter(|h| **h).count() as u64;
             frames += n as u64;
+            if let Some(sink) = sink.as_deref_mut() {
+                sink(CollectEvent::EpisodeEnd {
+                    episode: index,
+                    outcome: episode.termination,
+                    steps: n,
+                });
+            }
             segments.extend(segments_of(index, &human, InterventionSource::Scripted));
             writer.write_episode(&to_lerobot(
                 index,
@@ -678,6 +759,21 @@ impl Collector {
             warnings,
         })
     }
+}
+
+/// The `EventSet` one step raised, as the delta of the plane's own per-kind counters.
+///
+/// One env means exactly one `validate` per step, so a kind whose count moved is a kind that
+/// step raised — the same bitset `SafeAction::events` carries, read from the side the
+/// collector can see (`es_env::DomainRunner::emit_actions` keeps the `SafeAction` itself).
+fn raised(before: &[u64; ViolationKind::COUNT], after: &[u64; ViolationKind::COUNT]) -> EventSet {
+    let mut set = EventSet::EMPTY;
+    for kind in ViolationKind::ALL {
+        if after[kind.index()] > before[kind.index()] {
+            set.insert(kind);
+        }
+    }
+    set
 }
 
 /// `(fallback_activations, clamped_steps)` — the two counters that say what the plane did.
