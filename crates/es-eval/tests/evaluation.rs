@@ -3079,3 +3079,85 @@ fn capture_reads_qvel_and_body_pose() {
     );
     println!("RAN capture_reads_qvel_and_body_pose: demo {demo:?}");
 }
+
+// --- M9 T1 oracle 3: no `JointPosition` run moved (spec 8.5, spec 28.12 rule 1) --------------
+
+/// The fixture evaluation's `.estraj` files and `events.json`, pinned by content hash.
+///
+/// `JointDelta` is an addition, so the one thing it may not do is change what an absolute
+/// deployment executes. The bytes below are the evaluation path's whole record for a
+/// `JointPosition` deployment -- every cell's state trajectory and every recorded plane
+/// verdict -- produced by `run_episode`, whose per-tick order packet M9/T1 touched
+/// (`observe_state` moved one line above `plane_chunk`) and whose `plane_chunk` gained the
+/// integrator argument pair. Both are no-ops on an absolute space, and this is what says so.
+///
+/// A deliberate change to the evaluation path moves these two numbers; regenerate them only
+/// with the reason written down, exactly as a golden file is regenerated.
+#[test]
+fn demo_trajectories_are_unmoved() {
+    let (ir, obs) = image_ir();
+    let dir = scratch("unmoved");
+    let traj_dir = dir.join("traj");
+    std::fs::create_dir_all(&traj_dir).expect("the scratch directory");
+    let mut sink = FrameSink::new(&dir);
+    let mut frames = state_frames();
+    let mut policy = FakePolicy { target: 0.2 };
+    let task = task_ir();
+    let cfg = RunConfig {
+        traj_dir: Some(traj_dir.clone()),
+        ..RunConfig::default()
+    };
+    assert_eq!(
+        deployment_ir().action.space,
+        DepSpace::JointPosition,
+        "the fixture deployment is the absolute one"
+    );
+    Evaluation::run_with_frames::<FakeBackend, _, NJ, H>(
+        &ir,
+        &task,
+        &scene(),
+        &obs,
+        &mut policy,
+        &deployment_ir(),
+        FakeBackend::new,
+        &cfg,
+        Some(&mut frames),
+        Some(&mut sink),
+    )
+    .expect("the fixture evaluation runs");
+
+    // Every `.estraj` in name order, hashed as one stream; the names are the cell names, so
+    // the order is the run's own.
+    let mut names: Vec<String> = std::fs::read_dir(&traj_dir)
+        .expect("the trajectory directory")
+        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+        .filter(|n| n.ends_with(".estraj"))
+        .collect();
+    names.sort();
+    assert_eq!(
+        names.len(),
+        ir.suites.len() * N_EPISODES as usize,
+        "one trajectory per cell"
+    );
+    let mut h = blake3::Hasher::new();
+    for name in &names {
+        h.update(name.as_bytes());
+        h.update(&std::fs::read(traj_dir.join(name)).expect("the trajectory"));
+    }
+    assert_eq!(
+        h.finalize().to_hex().to_string(),
+        "52869bb8e65fc8ffbd78398ffa0a9d601a2118a7c4b4e2b36733181714f0c716",
+        "a JointPosition state trajectory moved"
+    );
+
+    let events = dir.join("events.json");
+    sink.write_events(&events).expect("events.json");
+    assert_eq!(
+        blake3::hash(&std::fs::read(&events).expect("events.json"))
+            .to_hex()
+            .to_string(),
+        "c796b1434218f9102791911fea0b5f73866394ae10769c2c103ad716d44bd21e",
+        "a JointPosition plane verdict moved"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

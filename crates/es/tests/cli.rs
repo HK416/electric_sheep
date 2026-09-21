@@ -7340,12 +7340,24 @@ fn the_temporal_ensemble_survives_the_grasp_window() {
         let chunk = es_safety::ActionChunk::new(actions, H, deploy.execution);
         ensemble.push(&chunk, t + latency);
         newest.push(&chunk, t + latency);
-        let (fed, blended) = es_env::plane_chunk(&mut ensemble, &mut feed, t, deploy.execution);
+        // The demo is `JointPosition`, so `prev` is unread and both calls are what they were
+        // before packet M9/T1 added the integrator argument pair.
+        let prev = plane.last_safe_action();
+        let (fed, blended) = es_env::plane_chunk(
+            &mut ensemble,
+            &mut feed,
+            t,
+            deploy.execution,
+            deploy.action.space,
+            &prev,
+        );
         let (_, raw) = es_env::plane_chunk(
             &mut newest,
             &mut raw_feed,
             t,
             ExecutionMode::RecedingHorizon,
+            deploy.action.space,
+            &prev,
         );
         plane.observe_state(&q, &qd);
         let safe = plane.validate(&fed, Micros(0), env.tick());

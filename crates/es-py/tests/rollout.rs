@@ -490,3 +490,142 @@ fn rollout_observes_the_reach_documents() {
         cube.start + cube.len
     );
 }
+
+// --- packet M9/T1: an increment is the absolute target, integrated -----------------------------
+
+/// Oracle 4 of packet M9/T1: `Rollout` over `deployment-reach-delta.toml` fed increments is,
+/// bitwise, `Rollout` over `deployment-reach.toml` fed the integrated absolutes.
+///
+/// The two documents differ in one word — `action.space` — and the envelope, the rates, the
+/// watchdogs and the workspace are the same numbers, so anything that moves between the two
+/// runs is the integrator and nothing else. The absolute run computes the target the way a
+/// human would have to: the plane's **executed** action of the previous tick plus this tick's
+/// increment, seeded at the episode boundary from the measured pose `observe_state` seeds the
+/// command chain with (spec 9.3). That the delta run reproduces it bitwise is the claim.
+///
+/// The envelope is the reach document's own and the increments are a fifth of a radian, so it
+/// clamps constantly — which is the interesting half: a clamped increment has to integrate
+/// from what the arm was told to do, not from what the sample asked for.
+#[test]
+#[ignore = "needs MuJoCo through ES_PYTHON (spec 1.4's reference backend)"]
+fn rollout_integrates_delta() {
+    /// The reach Deployment IR declares horizon 1 (PPO acts on every control tick).
+    const RH: usize = 1;
+    const DELTA_SEED: u64 = 0;
+    const DELTA_STEPS: u64 = 60;
+    /// Reset both runs here, so the integrator's episode-boundary seed is on the trace.
+    const DELTA_RESET_AT: u64 = 30;
+
+    if let Err(why) = MuJoCoCpuBackend::is_available() {
+        println!("SKIP rollout_integrates_delta: {why}");
+        return;
+    }
+
+    let task_toml = read("tests/fixtures/rl/task-reach.toml");
+    let obs_toml = read("tests/fixtures/rl/observation-reach.toml");
+    let absolute_toml = read("tests/fixtures/rl/deployment-reach.toml");
+    let delta_toml = read("tests/fixtures/rl/deployment-reach-delta.toml");
+    let scene_xml = read("tests/fixtures/mjcf/so101_pick_place.xml");
+
+    let deploy = es_ir::serial::deployment_from_toml(&absolute_toml).expect("deployment-reach");
+    let delta_ir =
+        es_ir::serial::deployment_from_toml(&delta_toml).expect("deployment-reach-delta");
+    assert_eq!(
+        deploy.action.space,
+        es_ir::deployment::ActionSpace::JointPosition
+    );
+    assert_eq!(
+        delta_ir.action.space,
+        es_ir::deployment::ActionSpace::JointDelta
+    );
+    assert_eq!(deploy.safety, delta_ir.safety, "one envelope, two spaces");
+
+    let mut absolute = Rollout::<NJ, RH>::new(
+        &task_toml,
+        &obs_toml,
+        &absolute_toml,
+        &scene_xml,
+        DELTA_SEED,
+        N_ENVS,
+    )
+    .expect("the absolute rollout");
+    let mut delta = Rollout::<NJ, RH>::new(
+        &task_toml,
+        &obs_toml,
+        &delta_toml,
+        &scene_xml,
+        DELTA_SEED,
+        N_ENVS,
+    )
+    .expect("the delta rollout");
+
+    let n_envs = N_ENVS as usize;
+    // `SafetyPlane::observe_state` seeds `last_safe` from the measured joint state, clamped
+    // into the hard limits (`safety.position`). That is the value the first increment of an
+    // episode is added to, so the absolute run has to start from the same number.
+    let seed_of = |roll: &Rollout<NJ, RH>, env: usize| -> Vec<f64> {
+        roll.qpos(env)[..NJ]
+            .iter()
+            .enumerate()
+            .map(|(j, v)| {
+                v.clamp(
+                    deploy.safety.position[j].lower,
+                    deploy.safety.position[j].upper,
+                )
+            })
+            .collect()
+    };
+    let mut target: Vec<f64> = (0..n_envs).flat_map(|i| seed_of(&absolute, i)).collect();
+
+    let mut clamped = 0usize;
+    for step in 0..DELTA_STEPS {
+        if step == DELTA_RESET_AT {
+            absolute.reset(Some(&[0])).expect("reset");
+            delta.reset(Some(&[0])).expect("reset");
+            // An episode boundary re-arms the plane's seed, so the integrator restarts from
+            // the pose of the freshly drawn episode.
+            target[..NJ].copy_from_slice(&seed_of(&absolute, 0));
+        }
+        // The increments: the scripted control's own first difference, so the sequence is the
+        // one `rollout_matches_es_eval_loop` already drives, read as deltas.
+        let increments: Vec<f64> = (0..n_envs)
+            .flat_map(|e| (0..NJ).map(move |j| scripted(step + 1, e, j) - scripted(step, e, j)))
+            .collect();
+        let absolutes: Vec<f64> = target.iter().zip(&increments).map(|(t, d)| t + d).collect();
+
+        let a = absolute.act(&absolutes).expect("the absolute step");
+        let b = delta.act(&increments).expect("the delta step");
+        for (i, (x, y)) in a.executed.iter().zip(&b.executed).enumerate() {
+            assert_eq!(x.to_bits(), y.to_bits(), "step {step}, lane {i}: executed");
+            clamped += usize::from(x.to_bits() != absolutes[i].to_bits());
+        }
+        assert_eq!(a.events, b.events, "step {step}: plane events");
+        assert_eq!(a.rewards, b.rewards, "step {step}: rewards");
+        assert_eq!(a.dones, b.dones, "step {step}: dones");
+        for i in 0..n_envs {
+            assert_eq!(
+                absolute
+                    .qpos(i)
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                delta
+                    .qpos(i)
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+                "step {step}, env {i}: qpos"
+            );
+        }
+        // The integrator's own rule: the next increment lands on what was executed.
+        target.copy_from_slice(&a.executed);
+    }
+    assert!(
+        clamped > 0,
+        "the envelope never bit, so the clamped-increment half proved nothing"
+    );
+    println!(
+        "RAN rollout_integrates_delta: {DELTA_STEPS} steps x {N_ENVS} envs bitwise, \
+         {clamped} clamped lanes"
+    );
+}
