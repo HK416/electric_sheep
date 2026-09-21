@@ -9255,28 +9255,78 @@ const PT_EVALUATION_HEADER: &str = "\
 # does not.
 ";
 
-/// The demo's bundle built from a named Task IR + Observation IR pair, so the `Rs` and the
-/// `Pt` documents can be packed by the same three lines (packet M7/R5).
-fn write_demo_bundle_from(dir: &Path, task: &str, observation: &str, name: &str) -> PathBuf {
-    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
-    let mut learning =
-        es_ir::serial::learning_from_toml(&read("learning.toml")).expect("learning.toml");
+/// An untrained bundle from four documents named by path, with the placeholder weights
+/// `--expert` never loads (packet M7/R5).
+fn pack_untrained(task: &Path, observation: &Path, learning: &Path, deployment: &Path) -> Vec<u8> {
+    let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{p:?}: {e}"));
+    let mut learning_ir =
+        es_ir::serial::learning_from_toml(&read(learning)).expect("the Learning IR parses");
     let weights = b"es-v1-expert-placeholder".to_vec();
-    learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
+    learning_ir.policy.weights = es_ir::learning::WeightsRef::Safetensors {
         path: "policy.safetensors".to_owned(),
         hash: *blake3::hash(&weights).as_bytes(),
     };
-    let bytes = es_compile::PolicyBundle::build(
-        &es_ir::serial::task_from_toml(&read(task)).expect(task),
-        &es_ir::serial::observation_from_toml(&read(observation)).expect(observation),
-        &learning,
-        &es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml"),
+    es_compile::PolicyBundle::build(
+        &es_ir::serial::task_from_toml(&read(task)).expect("the Task IR parses"),
+        &es_ir::serial::observation_from_toml(&read(observation))
+            .expect("the Observation IR parses"),
+        &learning_ir,
+        &es_ir::serial::deployment_from_toml(&read(deployment)).expect("the Deployment IR parses"),
         &weights,
     )
-    .unwrap_or_else(|e| panic!("{task} + {observation} pack into a bundle: {e}"));
+    .unwrap_or_else(|e| panic!("the four documents pack into a bundle: {e}"))
+}
+
+/// The demo's bundle built from a named Task IR + Observation IR pair, so the `Rs` and the
+/// `Pt` documents can be packed by the same three lines (packet M7/R5).
+fn write_demo_bundle_from(dir: &Path, task: &str, observation: &str, name: &str) -> PathBuf {
+    let bytes = pack_untrained(
+        &vl_fixture(task),
+        &vl_fixture(observation),
+        &vl_fixture("learning.toml"),
+        &vl_fixture("deployment.toml"),
+    );
     let path = dir.join(name);
     std::fs::write(&path, bytes).expect("write bundle");
     path
+}
+
+/// Packs an untrained bundle from four documents this repository does not have to own, so a
+/// measurement can build the bundle it is about without a scratch tree of swapped fixtures
+/// (which is how M5/V18 and M7/U1 had to do it). `es policy pack` takes a bundle and weights,
+/// not four documents, and this packet is not the one that gives it a second mode.
+///
+///     ES_PACK_TASK=... ES_PACK_OBSERVATION=... ES_PACK_LEARNING=... ES_PACK_DEPLOYMENT=... \
+///     ES_PACK_OUT=out.esb cargo test -p es --test cli -- --ignored pack_untrained_bundle
+#[test]
+#[ignore = "bundle builder for a measurement; run explicitly"]
+fn pack_untrained_bundle() {
+    let var = |k: &str| match std::env::var(k) {
+        Ok(v) => PathBuf::from(v),
+        Err(_) => {
+            panic!("{k} is unset; pack_untrained_bundle needs all five ES_PACK_* variables")
+        }
+    };
+    let Ok(out) = std::env::var("ES_PACK_OUT") else {
+        println!("SKIP pack_untrained_bundle: ES_PACK_OUT unset");
+        return;
+    };
+    let bytes = pack_untrained(
+        &var("ES_PACK_TASK"),
+        &var("ES_PACK_OBSERVATION"),
+        &var("ES_PACK_LEARNING"),
+        &var("ES_PACK_DEPLOYMENT"),
+    );
+    std::fs::write(&out, &bytes).unwrap_or_else(|e| panic!("{out}: {e}"));
+    let opened = es_compile::PolicyBundle::open(&bytes).expect("the bundle opens");
+    let h = &opened.manifest.hashes;
+    println!(
+        "wrote {out}\ntask_hash {}\nobservation_hash {}\nlearning_hash {}\ndeployment_hash {}",
+        hex(&h.task.expect("task_hash")),
+        hex(&h.observation.expect("observation_hash")),
+        hex(&h.learning.expect("learning_hash")),
+        hex(&h.deployment.expect("deployment_hash")),
+    );
 }
 
 /// Packet M7/R5 oracle 3: `es loop collect --frames` renders the sensor the way the **Task
