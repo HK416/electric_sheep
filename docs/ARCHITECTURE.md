@@ -664,6 +664,8 @@ ResetState        initial state distribution
 Record            dataset recording target
 ```
 
+**A sensor's render path.** A `Sensor` source declares how the simulation produces it with `render = { path = "rs" | "pt", spp, bounces, exposure, tonemap }` (packet M7/R5). The default is `rs`, and **absent = default = today's canonical form**, so no committed `task_hash` moves; `pt` moves `task_hash` and is therefore a new document (§13.3). The Observation IR does not know about it — what the sensor *is* belongs to `ImageSpec`, how the simulation *makes* it belongs to the Task IR.
+
 `Parallel` does not exist. Parallelization is decided by the compiler. `Wait` / `Repeat` / `Condition` are replaced by IR-C or `Compare`+`Select`.
 
 ### 6.4 Execution Semantics
