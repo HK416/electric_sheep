@@ -141,7 +141,7 @@ by construction — the file cannot drift from the scene our runtime loads.
 E4 is the one to read twice. It is what makes the run possible at all (§3, the NaN), and a
 policy trained here has never felt the cube. When S4c replays it in our runtime on the committed
 scene, contact with the cube is new, and the cube being pushed away is expected, not a bug.
-§5.5 measures what all four cost the trained policy — the answer is "everything", and that is
+section 5.5 measures what all four cost the trained policy — the answer is "everything", and that is
 the honest starting point plan S's continuation is meant to repair.
 
 **Measured cost of the edits, on CPU, where it can be isolated:** stepping the *edited* model
