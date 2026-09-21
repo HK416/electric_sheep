@@ -187,6 +187,12 @@ pub enum Expr {
         lo: f64,
         hi: f64,
     },
+    /// Square root. **Not a `DET-010` transcendental** (spec 6.6): IEEE 754 requires `sqrt` to
+    /// be correctly rounded, so every target computes the same bits from the same input -- it
+    /// is one hardware instruction, like `Add` and `Mul`, and needs no `es-math::approx`
+    /// polynomial. It is here because `Norm { kind: L2 }` lowers to it and nothing else does
+    /// (`docs/design/batch-domains.md` section 6).
+    Sqrt(Box<Expr>),
 }
 
 impl Expr {
@@ -230,6 +236,12 @@ impl Expr {
             Self::Clamp { value, lo, hi } => {
                 let v = value.eval(ports)?;
                 (lo <= hi).then(|| v.clamp(*lo, *hi)).and_then(finite)
+            }
+            // A negative radicand is `None` for the same reason a division by zero is: the
+            // alternative is a `NaN`, and no hash encodes one.
+            Self::Sqrt(value) => {
+                let v = value.eval(ports)?;
+                (v >= 0.0).then(|| v.sqrt()).and_then(finite)
             }
         }
     }

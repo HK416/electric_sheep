@@ -10952,3 +10952,782 @@ fn train_rl_init_from_import() {
     );
     println!("RAN {TEST}: iteration 0 == [init] policy, bitwise");
 }
+
+// --- packet M8/S4d: the reach task's four documents -------------------------------------------
+
+/// `tests/fixtures/rl/<name>`.
+fn rl_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/rl")
+        .join(name)
+}
+
+/// The six actuated joints in the XML's declaration order, which is also `qpos[0..6]`,
+/// `qvel[0..6]` and `ctrl[0..6]`.
+const REACH_JOINTS: [&str; 6] = [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+];
+/// `joint_pos[6] || joint_vel[6] || cube_pose[7] || gripper_pose[7]`
+/// (`docs/design/rl-continuation.md` section 5).
+const REACH_OBS_DIM: u64 = 26;
+/// Success: the gripper body's origin within 30 mm of the cube body's.
+const REACH_SUCCESS_M: f64 = 0.03;
+/// 200 control steps at 50 Hz -- four seconds.
+const REACH_STEPS: u32 = 200;
+const REACH_CONTROL_HZ: u64 = 50;
+/// The span the distance is normalized over. **One metre on purpose:** the affine map is then
+/// the identity everywhere the arm can reach, so the reward term is exactly
+/// `-||cube - gripper||` in metres, bit for bit. The `Normalize` is there because a `Reward`
+/// must carry a policy-input unit (`TYPE-011`), not to rescale anything.
+const REACH_SPAN_M: f64 = 1.0;
+
+fn so101_scene() -> (es_assets::scene::SceneDesc, Vec<u8>) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/mjcf/so101_pick_place.xml");
+    let xml = std::fs::read(&path).expect("the demo scene");
+    let scene = es_assets::parse_mjcf(&String::from_utf8(xml.clone()).expect("utf-8"))
+        .expect("the demo scene parses")
+        .scene;
+    (scene, xml)
+}
+
+fn reach_vec(n: u64, unit: Unit, frame: Frame) -> PortType {
+    PortType {
+        elem: ElemType::F32,
+        shape: Shape::new([n]),
+        unit,
+        frame,
+        time: TimeRef::Tick,
+        image: None,
+    }
+}
+
+/// The reach task: the demo's scene, reset draws and action space, with one reward cone --
+/// `-||cube - gripper||`, plus a bonus on success -- and two `Terminate` predicates.
+///
+/// The `ResetState` and `Randomization` nodes are **the demo's own**, read out of its
+/// committed document rather than restated: the cube's per-episode draw is what makes 16
+/// held-out seeds 16 different problems, and a reach task has no reason to draw it otherwise.
+fn reach_task() -> TaskIr {
+    use es_ir::task::{Aggregation, ArithOp, CmpOp, NormKind, TerminationKind};
+
+    let (scene, xml) = so101_scene();
+    let body = |name: &str| {
+        scene
+            .bodies
+            .iter()
+            .find(|b| b.name == name)
+            .unwrap_or_else(|| panic!("the scene has a body named {name}"))
+            .id
+    };
+    let joint = |name: &str| {
+        scene
+            .joints
+            .iter()
+            .find(|j| j.name == name)
+            .unwrap_or_else(|| panic!("the scene has a joint named {name}"))
+            .id
+    };
+
+    let mut task = es_ir::serial::task_from_toml(
+        &std::fs::read_to_string(vl_fixture("task.toml")).expect("the demo task"),
+    )
+    .expect("the demo task parses");
+    let resets: Vec<TaskNode> = task
+        .graph
+        .nodes
+        .values()
+        .filter(|n| {
+            matches!(
+                n,
+                TaskNode::ResetState { .. } | TaskNode::Randomization { .. }
+            )
+        })
+        .cloned()
+        .collect();
+    task.graph.nodes.clear();
+    task.graph.edges.clear();
+    task.observation_spec.channels.clear();
+    task.config.max_episode_steps = REACH_STEPS;
+    task.scene.scene_hash = scene.scene_hash();
+    task.scene.asset_hash = *blake3::hash(&xml).as_bytes();
+
+    let (base, cube, gripper) = (body("base"), body("cube"), body("gripper"));
+    let joints6 = |unit: Unit| reach_vec(6, unit, Frame::Joint(base));
+    let pos3 = reach_vec(3, Unit::Length, Frame::World);
+    let quat4 = reach_vec(4, Unit::Quaternion, Frame::World);
+    let pose7 = reach_vec(7, Unit::Length, Frame::World);
+    let metres = reach_vec(1, Unit::Length, Frame::World);
+    let names = REACH_JOINTS.map(str::to_owned).to_vec();
+
+    let nodes = [
+        TaskNode::GetJointState {
+            body: base,
+            joints: names.clone(),
+            quantity: JointQuantity::Position,
+        },
+        TaskNode::ObservationSpec {
+            channel: "joint_pos".to_owned(),
+            ty: joints6(Unit::Angle),
+        },
+        TaskNode::GetJointState {
+            body: base,
+            joints: names,
+            quantity: JointQuantity::Velocity,
+        },
+        TaskNode::ObservationSpec {
+            channel: "joint_vel".to_owned(),
+            ty: joints6(Unit::AngularVelocity),
+        },
+        TaskNode::GetBodyPose {
+            body: cube,
+            relative_to: Frame::World,
+        },
+        TaskNode::Concat {
+            parts: vec![pos3.clone(), quat4.clone()],
+            axis: 0,
+        },
+        TaskNode::ObservationSpec {
+            channel: "cube_pose".to_owned(),
+            ty: pose7.clone(),
+        },
+        TaskNode::GetBodyPose {
+            body: gripper,
+            relative_to: Frame::World,
+        },
+        TaskNode::Concat {
+            parts: vec![pos3.clone(), quat4],
+            axis: 0,
+        },
+        TaskNode::ObservationSpec {
+            channel: "gripper_pose".to_owned(),
+            ty: pose7.clone(),
+        },
+        TaskNode::ActionSpec {
+            space: TaskSpace::JointPosition,
+            dim: 6,
+            control_rate_hz: REACH_CONTROL_HZ as f32,
+        },
+        // The cone spec 6.5 draws: two body positions, a lane-wise difference, an L2 norm.
+        TaskNode::Arith {
+            op: ArithOp::Sub,
+            ty: pos3,
+        },
+        TaskNode::Norm {
+            kind: NormKind::L2,
+            ty: reach_vec(3, Unit::Length, Frame::World),
+        },
+        TaskNode::Normalize {
+            lo: vec![0.0],
+            hi: vec![REACH_SPAN_M],
+            out_lo: 0.0,
+            out_hi: 1.0,
+            ty: metres.clone(),
+        },
+        TaskNode::Reward {
+            name: "reach_distance".to_owned(),
+            weight: -1.0,
+            aggregation: Aggregation::Sum,
+            ty: PortType {
+                unit: Unit::Normalized { lo: 0.0, hi: 1.0 },
+                ..metres.clone()
+            },
+        },
+        TaskNode::Compare {
+            op: CmpOp::Lt,
+            rhs: Some(REACH_SUCCESS_M),
+            ty: metres,
+        },
+        // The flag is `Bool`, which is what `boolish` makes of the `Compare`'s own type;
+        // the reward that scores it declares the same port.
+        TaskNode::Reward {
+            name: "reach_success".to_owned(),
+            weight: 1.0,
+            aggregation: Aggregation::Sum,
+            ty: PortType {
+                elem: ElemType::Bool,
+                ..reach_vec(1, Unit::Dimensionless, Frame::World)
+            },
+        },
+        TaskNode::Terminate {
+            kind: TerminationKind::Success,
+        },
+        TaskNode::GetTime { since_reset: true },
+        TaskNode::Compare {
+            op: CmpOp::Ge,
+            rhs: Some(f64::from(REACH_STEPS) / REACH_CONTROL_HZ as f64),
+            ty: reach_vec(1, Unit::Time, Frame::World),
+        },
+        TaskNode::Terminate {
+            kind: TerminationKind::Timeout,
+        },
+    ];
+    for (i, node) in nodes.into_iter().enumerate() {
+        task.graph.insert(NodeId(i as u32), node);
+    }
+    for (i, node) in resets.into_iter().enumerate() {
+        task.graph.insert(NodeId(21 + i as u32), node);
+    }
+    let n = NodeId;
+    for (from, from_port, to, to_port) in [
+        (0, "value", 1, "value"),
+        (2, "value", 3, "value"),
+        (4, "pos", 5, "in0"),
+        (4, "quat", 5, "in1"),
+        (5, "value", 6, "value"),
+        (7, "pos", 8, "in0"),
+        (7, "quat", 8, "in1"),
+        (8, "value", 9, "value"),
+        // The same two `pos` ports feed the reward cone: one read of the world, two readers.
+        (4, "pos", 11, "a"),
+        (7, "pos", 11, "b"),
+        (11, "value", 12, "value"),
+        (12, "value", 13, "value"),
+        (13, "value", 14, "value"),
+        (12, "value", 15, "a"),
+        (15, "value", 16, "value"),
+        (15, "value", 17, "value"),
+        (18, "value", 19, "a"),
+        (19, "value", 20, "value"),
+    ] {
+        task.graph.connect(n(from), from_port, n(to), to_port);
+    }
+
+    task.observation_spec.channels.extend([
+        (
+            "joint_pos".to_owned(),
+            ObsChannel {
+                source: ObsSource::JointState { body: base, dof: 6 },
+                ty: joints6(Unit::Angle),
+            },
+        ),
+        (
+            "joint_vel".to_owned(),
+            ObsChannel {
+                source: ObsSource::JointState {
+                    body: joint("shoulder_pan"),
+                    dof: 6,
+                },
+                ty: joints6(Unit::AngularVelocity),
+            },
+        ),
+        (
+            "cube_pose".to_owned(),
+            ObsChannel {
+                source: ObsSource::JointState {
+                    body: joint("cube_free"),
+                    dof: 7,
+                },
+                ty: pose7.clone(),
+            },
+        ),
+        (
+            "gripper_pose".to_owned(),
+            ObsChannel {
+                source: ObsSource::BodyPose(gripper),
+                ty: pose7,
+            },
+        ),
+    ]);
+    task
+}
+
+/// Four `StateInput`s in the layout order, concatenated to 26 and normalized once.
+fn reach_observation(task: &TaskIr) -> ObservationIr {
+    let channel = |name: &str| task.observation_spec.channels[name].clone();
+    let source_of = |name: &str| match channel(name).source {
+        ObsSource::JointState { body, .. } | ObsSource::BodyPose(body) => body,
+        other => panic!("{other:?} is not a state source"),
+    };
+    let order = ["joint_pos", "joint_vel", "cube_pose", "gripper_pose"];
+
+    let mut ir = ObservationIr::new(1, task.task_hash().expect("the reach task hashes"));
+    let mut parts = Vec::new();
+    for (i, name) in order.iter().enumerate() {
+        let ty = channel(name).ty;
+        ir.graph.insert(
+            NodeId(i as u32),
+            ObservationNode::StateInput {
+                source: source_of(name),
+                io: Io::source(ty.clone()),
+            },
+        );
+        parts.push(ty);
+    }
+    let wide = reach_vec(REACH_OBS_DIM, Unit::Dimensionless, Frame::World);
+    let normalized = PortType {
+        unit: action_unit(),
+        ..wide.clone()
+    };
+    let (cat, norm) = (NodeId(4), NodeId(5));
+    ir.graph.insert(
+        cat,
+        ObservationNode::Concat {
+            axis: 0,
+            time_align: None,
+            io: Io::new(parts, wide.clone()),
+        },
+    );
+    ir.graph.insert(
+        norm,
+        ObservationNode::Normalize {
+            stats: NormalizeStats::Range { lo: -1.0, hi: 1.0 },
+            io: Io::unary(wide, normalized.clone()),
+        },
+    );
+    for i in 0..order.len() {
+        ir.graph
+            .connect(NodeId(i as u32), "out", cat, &format!("in{i}"));
+    }
+    ir.graph.connect(cat, "out", norm, "in0");
+    ir.graph.outputs.push(PortRef::new(norm, "out"));
+    ir.temporal.window = Some(TemporalWindow {
+        n_steps: 1,
+        stride: 1,
+        align: Align::Hold,
+    });
+    ir.outputs = BTreeMap::from([(
+        "state".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(norm, "out"),
+            ty: normalized,
+        },
+    )]);
+    ir
+}
+
+/// The demo's envelope, executed one action at a time.
+fn reach_deployment() -> DeploymentIr {
+    let mut dep = es_ir::serial::deployment_from_toml(
+        &std::fs::read_to_string(vl_fixture("deployment.toml")).expect("the demo deployment"),
+    )
+    .expect("the demo deployment parses");
+    dep.action.horizon = 1;
+    dep.action.execute_chunk = 1;
+    dep.execution = ExecutionMode::RecedingHorizon;
+    dep.rate.inference = dep.rate.control;
+    for w in &mut dep.watchdogs.0 {
+        if let Watchdog::EnvelopeViolationRate { max_frac, .. } = w {
+            // INV-12: the watchdog stays on and every clamp is still counted; what moves is
+            // the number it is measured against. An untrained policy commands poses the arm
+            // is nowhere near, so the plane clamps nearly every tick by construction -- at
+            // 0.9 the fallback latches a second into training and freezes the arm.
+            *max_frac = 1.0;
+        }
+    }
+    dep
+}
+
+/// The demo's evaluation, on held-out seeds, with the suites a state policy can feel.
+fn reach_evaluation(task: &TaskIr, observation: &ObservationIr) -> EvaluationIr {
+    let mut ev = es_ir::serial::evaluation_from_toml(
+        &std::fs::read_to_string(vl_fixture("evaluation.toml")).expect("the demo evaluation"),
+    )
+    .expect("the demo evaluation parses");
+    ev.task = hex(&task.task_hash().expect("the reach task hashes"));
+    ev.observation = hex(&observation
+        .observation_hash()
+        .expect("the reach observation hashes"));
+    // The two light suites turn a renderer knob, and this policy has no camera.
+    ev.suites
+        .retain(|s| !s.name.starts_with("light_") && !s.name.starts_with("color_"));
+    ev.episodes = EpisodeBatch {
+        n_episodes: 16,
+        seeds: SeedPlan::Explicit((201..=216).collect()),
+    };
+    ev.acceptance = vec![AcceptanceCriterion {
+        suite: Some("nominal".to_owned()),
+        metric: MetricSpec::SuccessRate,
+        comparator: Comparator::Ge,
+        threshold: 0.8,
+        aggregation: Aggregation::Mean,
+    }];
+    ev
+}
+
+/// A Learning IR the reach documents do **not** ship: `cross::check` needs all four sides, and
+/// the policy is the packet after this one (S4, the PPO trainer). Nothing here is written to
+/// disk -- it exists so the three boundaries that touch the contract are checked against the
+/// shapes the four committed documents declare.
+fn reach_learning_stand_in() -> LearningGraph {
+    let state = Port::new(
+        "state",
+        PortType {
+            frame: Frame::Policy,
+            ..reach_vec(REACH_OBS_DIM, action_unit(), Frame::Policy)
+        },
+    );
+    let feature = |dim: u64| reach_vec(dim, Unit::Dimensionless, Frame::Policy);
+    let chunk = PortType {
+        shape: Shape::new([1, 6]),
+        ..reach_vec(1, action_unit(), Frame::Policy)
+    };
+
+    let mut nodes: Graph<LearningNode> = Graph::new(1);
+    nodes.insert(
+        NodeId(0),
+        LearningNode::StateEncoder {
+            inputs: vec![state.clone()],
+            kind: StateEncoderKind::Mlp {
+                hidden: vec![64, 64],
+            },
+            out_dim: 64,
+        },
+    );
+    nodes.insert(
+        NodeId(1),
+        LearningNode::PolicyHead {
+            inputs: vec![Port::new("feat", feature(64))],
+            kind: HeadKind::Regression,
+            action_dim: 6,
+            horizon: 1,
+        },
+    );
+    nodes.insert(
+        NodeId(2),
+        LearningNode::ActionChunker {
+            inputs: vec![Port::new("chunk", chunk.clone())],
+            horizon: 1,
+            execute_chunk: 1,
+            replan_hz: REACH_CONTROL_HZ as f32,
+            mode: ActionExecutionMode::RecedingHorizon,
+            blend: ChunkBlendPolicy::HardSwitch,
+            buffer_chunks: 2,
+        },
+    );
+    nodes.connect(NodeId(0), "out", NodeId(1), "feat");
+    nodes.connect(NodeId(1), "chunk", NodeId(2), "chunk");
+    nodes.inputs.push(PortRef::new(NodeId(0), "state"));
+    nodes.outputs.push(PortRef::new(NodeId(2), "out"));
+    LearningGraph {
+        schema_version: 1,
+        inputs: vec![state.clone()],
+        nodes,
+        outputs: vec![Port::new("actions", chunk)],
+        policy: PolicyHandle {
+            architecture: ArchKind::Act,
+            base_model: None,
+            weights: WeightsRef::Safetensors {
+                path: "policy.safetensors".to_owned(),
+                hash: [0; 32],
+            },
+            contract: PolicyContract {
+                inputs: BTreeMap::from([("state".to_owned(), state)]),
+                observation_window: 1,
+                action_dim: 6,
+                horizon: 1,
+                execute_chunk: 1,
+                replanning_hz: REACH_CONTROL_HZ as f32,
+                execution_mode: ActionExecutionMode::RecedingHorizon,
+                runtime: RuntimeHints {
+                    dtype: ElemType::F32,
+                    expected_latency_ms: 2.0,
+                    deadline_ms: 20.0,
+                },
+            },
+        },
+    }
+}
+
+const REACH_TASK_HEADER: &str = "\
+# Task IR (spec 6) for the SO-101 reach task -- packet M8/S4d, the first RL-continuation task.
+#
+# Generated by `cargo test -p es --test cli -- --ignored regenerate_reach_documents` from
+# tests/fixtures/mjcf/so101_pick_place.xml and from tests/fixtures/visible-learning/task.toml,
+# so no hash and no reset distribution in it is typed in by hand.
+#
+# What it asks for (docs/design/rl-continuation.md section 5): bring the gripper to the cube.
+# The reward is `-||cube_pos - gripper_pos||` in metres at every control step, plus `1` on the
+# step the distance first falls under 0.03 m; the episode ends there, or after 200 control
+# steps (4 s at 50 Hz). Nothing is picked up: this is the smallest task that needs a *body
+# position* in its reward, which is what packet M8/S4d makes executable.
+#
+# THE REWARD IS A NEGATED NORM, exactly. `Norm { kind: L2 }` lowers to `Sqrt` of the squares
+# summed in lane order (crates/es-env/src/plan.rs), `Sqrt` is the IEEE basic operation and not
+# a `DET-010` transcendental (spec 6.6), and the `Normalize` between the norm and the reward is
+# a *unit* conversion, not a rescaling: `[0, 1] -> [0, 1]` is the identity map, so the term is
+# the distance itself and the `Reward`'s own `weight = -1` is the minus sign. The clamp the
+# `Normalize` carries bites only past one metre, which is outside the arm's reach. Without it
+# the reward would carry `Unit::Length` and `TYPE-011` would refuse it, rightly: a reward is a
+# policy-facing number.
+#
+# The success term is a second `Reward` reading the same `Compare` the `Terminate` reads, so
+# the bonus and the episode end cannot disagree about what success is.
+#
+# The reset and randomization nodes ARE THE DEMO'S OWN, copied from task.toml rather than
+# restated: the arm's reset pose and the cube's per-episode draw (`cube.x`, `cube.y`) are what
+# make 16 held-out seeds 16 different problems.
+#
+# THE FOUR OBSERVATION CHANNELS and what an `ObsSource` can say about them (spec 7.4):
+#  * `joint_pos[6]`  -- `JointState { body = base, dof = 6 }`, the leading six of the state
+#    row, which is `qpos[0..6]`: the six joints in the XML's declaration order. This is the
+#    binding the demo's own `joint_state` channel uses.
+#  * `joint_vel[6]`  -- `qvel[0..6]`, the same six joints. `ObsSource` HAS NO VELOCITY SOURCE
+#    AND NO OFFSET, and the Cross-IR check keys a channel by its source id alone (`XIR-002`),
+#    so two joint channels cannot name the same id; this one names the block's first joint,
+#    `shoulder_pan`, and means `dof` dofs from there. `es-eval`'s capture path
+#    (crates/es-eval/src/runner.rs, `input_sources`) has no `qvel` reading at all, so this
+#    channel is served by the trainer reading the env, not by that path.
+#  * `cube_pose[7]`  -- the cube's free joint, `qpos[6..13]`: position and quaternion, exactly
+#    the demo's `sim_cube_pose` binding, and exact rather than a leading-`dof` guess.
+#  * `gripper_pose[7]` -- `BodyPose(gripper)`. The gripper has no joint of its own, so its
+#    pose is only in `xpos`/`xquat`; `input_sources` has no `BodyPose` reading either, and
+#    refuses it by name rather than serving something else.
+# All seven values of each pose carry `Unit::Length` for the reason the demo's header gives:
+# three of them are metres, the quaternion's four are dimensionless, and spec 5.4's algebra
+# has no mixed unit.
+#
+# `cube_pose` IS SIMULATOR-PRIVILEGED, like the demo's `sim_cube_pose`: no real SO-101 knows
+# where the cube is. The name has no `sim_` prefix here because this task is a training
+# environment for the RL continuation, not a hardware deployment -- a deployment aimed at
+# hardware must replace both pose channels with something a camera can produce.
+";
+
+const REACH_OBSERVATION_HEADER: &str = "\
+# Observation IR (spec 7) for the SO-101 reach task -- packet M8/S4d.
+#
+# Generated by `cargo test -p es --test cli -- --ignored regenerate_reach_documents`;
+# `task_ref` is task-reach.toml's own `task_hash`.
+#
+# Four `StateInput`s -> `Concat` -> one `Normalize`, in the layout order
+# `joint_pos[6] || joint_vel[6] || cube_pose[7] || gripper_pose[7]` = 26
+# (docs/design/rl-continuation.md section 5). The concatenated vector is `Dimensionless`
+# because it is a *mixed* one -- rad, rad/s, metres and a quaternion -- and spec 5.4's unit
+# algebra has no mixed unit; the per-block units are in task-reach.toml's header, which is
+# where a reader looks for them.
+#
+# The `Normalize { Range { -1, 1 } }` is what makes the tensor admissible as a policy input
+# (`OBS-040`, spec 5.4): the policy reads `Unit::Normalized { -1, 1 }`. Its range is the
+# identity on that interval and is not a per-channel standardization -- the running statistics
+# a PPO run accumulates belong to a Learning IR `Normalizer` node (the Go1 track's argument in
+# tests/fixtures/quadruped/observation.toml), not here.
+#
+# `temporal.window = { n_steps = 1, stride = 1, align = \"Hold\" }` is layer 2 of spec 7.5:
+# one frame, no stacking. `XIR-011` checks it against the policy contract's
+# `observation_window`.
+#
+# There is no image chain and no `ImageSpec`: this is a state policy, so there is no `Resize`,
+# no `Crop`, and nothing owes an intrinsics transform (spec 7.2, INV-14).
+";
+
+const REACH_DEPLOYMENT_HEADER: &str = "\
+# Deployment IR + Safety Plane (spec 9) for the SO-101 reach task -- packet M8/S4d.
+#
+# Generated by `cargo test -p es --test cli -- --ignored regenerate_reach_documents` from
+# tests/fixtures/visible-learning/deployment.toml: the envelope IS THE DEMO'S, joint for
+# joint, because it is the same arm in the same scene. That document's header is where every
+# number's physical argument lives -- the STS3215's 2.94 N m stall torque, 3.0 rad/s, the
+# 80 rad/s^2 that packet M5/V18 measured, the workspace box -- and none of them moved here.
+#
+# Three things did move, and all three are about *how a chunk is executed*, not about what is
+# safe:
+#  * `action.horizon = 1`, `execute_chunk = 1`, `execution = receding_horizon`. An RL policy
+#    emits one action per control step; there is no chunk to buffer and nothing to ensemble.
+#  * `rate.inference = rate.control = 50 Hz`. The policy runs every control tick, so the gap
+#    the `inference_deadline` watchdog measures is one control period, not the ten the demo's
+#    5 Hz replanning left.
+#  * `envelope_violation_rate.max_frac = 1.0`. INV-12 IS WHY THIS IS THE SHAPE OF THE CHANGE:
+#    the watchdog stays on, every clamp is still counted and still recorded as
+#    `action_source = Clamped`; what moves is the rate it latches the fallback at. An
+#    untrained policy -- and PPO starts untrained -- commands poses the arm is nowhere near,
+#    so the plane clamps nearly every tick by construction. At the demo's 0.9 the fallback
+#    latches a second into the first episode and freezes the arm, and a frozen arm teaches a
+#    policy nothing. Widening the number is the sanctioned move; disabling the plane is not.
+#
+# `target` is the simulated scene. A real SO-101 swaps it for `Physical { driver }` without
+# touching the envelope -- but not without replacing the two privileged pose channels first
+# (task-reach.toml's header).
+";
+
+const REACH_EVALUATION_HEADER: &str = "\
+# Evaluation IR (spec 10) for the SO-101 reach task -- packet M8/S4d.
+#
+# Generated by `cargo test -p es --test cli -- --ignored regenerate_reach_documents`; `task`
+# and `observation` are task-reach.toml's and observation-reach.toml's own hashes.
+#
+# 16 episodes on fixed seeds 201-216, outside both the 1-50 the demo's demonstrations were
+# collected on and the 101-116 its own evaluation uses, so a reach number is never a memory of
+# either run. Sixteen because `Evaluation::run` gives every episode its own env.
+#
+# The cube's initial pose is not a perturbation: task-reach.toml's `Randomization` node moves
+# the cube's free joint at every reset, in every suite, which is what spec 6.3 is for.
+#
+# The suites are the demo's minus the two light ones: `light_intensity` and `light_direction`
+# turn a renderer knob, and a policy that reads joint angles and two poses cannot feel it --
+# a row that is identical to `nominal` by construction is not a measurement. What is left
+# touches the actuator and the clock, which this policy does feel:
+#  * `observation_delay` -- one and two control steps at 50 Hz.
+#  * `torque_noise`, `backlash` -- the actuator is not ideal.
+#
+# `success_rate >= 0.8` on `nominal` is the acceptance criterion, and it is deliberately
+# harder than the demo's 0.5: reaching is a far easier task than picking and placing, and a
+# continuation that cannot reach four times out of five has not learned it. The perturbed
+# rows are measurements to report, not gates to pass (spec 10.4).
+";
+
+/// Regenerates `tests/fixtures/rl/{task,observation,deployment,evaluation}-reach.toml`. Run
+/// explicitly:
+///
+///     ES_GENERATE_GOLDENS=1 cargo test -p es --test cli -- --ignored regenerate_reach_documents
+#[test]
+#[ignore = "fixture generator; run explicitly"]
+fn regenerate_reach_documents() {
+    // Spec 1.4: goldens and fixtures are CI read-only, and `cargo test -- --include-ignored`
+    // runs every ignored test; a generator must refuse to run by accident (M7 review).
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP regenerate_reach_documents: set ES_GENERATE_GOLDENS=1 to regenerate");
+        return;
+    }
+    let task = reach_task();
+    let observation = reach_observation(&task);
+    let deployment = reach_deployment();
+    let evaluation = reach_evaluation(&task, &observation);
+    std::fs::create_dir_all(rl_fixture(".")).expect("tests/fixtures/rl");
+    for (name, header, text) in [
+        (
+            "task-reach.toml",
+            REACH_TASK_HEADER,
+            es_ir::serial::task_to_toml(&task).expect("task toml"),
+        ),
+        (
+            "observation-reach.toml",
+            REACH_OBSERVATION_HEADER,
+            es_ir::serial::observation_to_toml(&observation).expect("observation toml"),
+        ),
+        (
+            "deployment-reach.toml",
+            REACH_DEPLOYMENT_HEADER,
+            es_ir::serial::deployment_to_toml(&deployment).expect("deployment toml"),
+        ),
+        (
+            "evaluation-reach.toml",
+            REACH_EVALUATION_HEADER,
+            es_ir::serial::evaluation_to_toml(&evaluation).expect("evaluation toml"),
+        ),
+    ] {
+        write(&rl_fixture(name), &format!("{header}\n{text}"));
+        println!("wrote {}", rl_fixture(name).display());
+    }
+}
+
+/// Packet M8/S4d oracle 4: the four committed documents parse, validate, agree across every
+/// boundary the Cross-IR check can see, compile, and carry the 26-wide port the design note
+/// declares -- and they are exactly what the generator writes.
+#[test]
+fn reach_documents_validate() {
+    let read = |name: &str| std::fs::read_to_string(rl_fixture(name)).expect(name);
+    let task = es_ir::serial::task_from_toml(&read("task-reach.toml")).expect("the task parses");
+    let observation = es_ir::serial::observation_from_toml(&read("observation-reach.toml"))
+        .expect("the observation parses");
+    let deployment = es_ir::serial::deployment_from_toml(&read("deployment-reach.toml"))
+        .expect("the deployment parses");
+    let evaluation = es_ir::serial::evaluation_from_toml(&read("evaluation-reach.toml"))
+        .expect("the evaluation parses");
+
+    for (name, diags) in [
+        ("task", task.validate()),
+        ("observation", observation.validate()),
+        ("deployment", deployment.validate()),
+        ("evaluation", evaluation.validate()),
+    ] {
+        assert!(diags.is_empty(), "{name}-reach.toml: {diags:#?}");
+    }
+
+    // The Learning IR is the next packet's; the stand-in carries the contract the four
+    // documents imply, so every `XIR_*` boundary is checked rather than assumed.
+    let learning = reach_learning_stand_in();
+    let diags = cross::check(&IrBundle {
+        task: &task,
+        observation: &observation,
+        learning: &learning,
+        deployment: &deployment,
+        evaluation: Some(&evaluation),
+    });
+    assert!(diags.is_empty(), "cross-IR: {diags:#?}");
+
+    // The 26 of `docs/design/rl-continuation.md` section 5, and the blocks that make it up.
+    assert_eq!(
+        observation.outputs["state"].ty.shape.dims(),
+        [REACH_OBS_DIM],
+        "the policy's input is 26 wide"
+    );
+    let widths: Vec<u64> = ["joint_pos", "joint_vel", "cube_pose", "gripper_pose"]
+        .iter()
+        .map(|n| task.observation_spec.channels[*n].ty.shape.dims()[0])
+        .collect();
+    assert_eq!(widths, [6, 6, 7, 7]);
+    assert_eq!(widths.iter().sum::<u64>(), REACH_OBS_DIM);
+    assert_eq!(task.config.max_episode_steps, REACH_STEPS);
+
+    // The documents are what the generator writes: a hand edit to any of the four is a
+    // failing test, not a number nobody can trace back to the scene.
+    //
+    // ONE FIELD IS EXEMPT, and not because this packet wanted it that way. `scene_hash` is
+    // **not the same number on every OS** for this scene: `crates/es-assets/src/mjcf/orient.rs`
+    // turns an `euler=` attribute into a quaternion with `f64::sin_cos`, the platform's libm,
+    // and the SO-101 scene has two of them -- so Windows and Linux hash the same XML bytes to
+    // different digests (measured, packet M8/S4d; regenerating the *demo's* task.toml on Linux
+    // moves its `scene_hash` the same way). That is a spec 3.4 / `DET-010` defect on the asset
+    // path and it predates this packet; `asset_hash`, which is blake3 of the file, is checked
+    // instead, and the scene ref the committed document carries is what the rest is rebuilt
+    // against so the comparison measures this packet's documents and not that bug.
+    let (_, xml) = so101_scene();
+    assert_eq!(
+        task.scene.asset_hash,
+        *blake3::hash(&xml).as_bytes(),
+        "the document names a different file than the one it was generated from"
+    );
+    let mut built = reach_task();
+    built.scene = task.scene.clone();
+    let built_obs = reach_observation(&built);
+    for (name, text) in [
+        ("task-reach.toml", es_ir::serial::task_to_toml(&built)),
+        (
+            "observation-reach.toml",
+            es_ir::serial::observation_to_toml(&built_obs),
+        ),
+        (
+            "deployment-reach.toml",
+            es_ir::serial::deployment_to_toml(&reach_deployment()),
+        ),
+        (
+            "evaluation-reach.toml",
+            es_ir::serial::evaluation_to_toml(&reach_evaluation(&built, &built_obs)),
+        ),
+    ] {
+        let on_disk = read(name);
+        let body = on_disk
+            .split_once("\nes_schema")
+            .map(|(_, rest)| format!("es_schema{rest}"))
+            .unwrap_or(on_disk);
+        assert_eq!(
+            body,
+            text.expect("the document serializes"),
+            "{name} is not what the generator writes; rerun \
+             `ES_GENERATE_GOLDENS=1 cargo test -p es --test cli -- --ignored \
+             regenerate_reach_documents`"
+        );
+    }
+
+    // And the CLI agrees: `es task compile` accepts the pair.
+    let out = bin()
+        .args(["task", "compile"])
+        .arg(rl_fixture("task-reach.toml"))
+        .arg(rl_fixture("observation-reach.toml"))
+        .output()
+        .expect("run es task compile");
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("compiler_hash: "), "{text}");
+    assert!(text.contains("shape=[26]"), "{text}");
+    println!(
+        "RAN reach_documents_validate: task {} observation {}",
+        hex(&task.task_hash().expect("task hash")),
+        hex(&observation.observation_hash().expect("observation hash"))
+    );
+}

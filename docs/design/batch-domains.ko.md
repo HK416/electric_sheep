@@ -171,11 +171,33 @@ scale 대상은 *추첨되고, `EpisodeMeta.param_scales`에 기록될 뿐, back
 이미 존재하며 결정적이라고 이미 명세된 `Expr::eval`로 평가한다(고정된 연산
 순서, `NaN` 대신 `None`).
 
-원뿔에서 지원되는 것: `GetJointState`, `GetSensor`, `GetTime`, `GetContact`
-(잎, 이름 붙은 포트에 바인딩됨), `Arith`, `Compare`, `Clamp`. reward나
-terminate 원뿔 안의 그 외 모든 노드 종류는
-`EnvError::Unsupported("<kind> in a reward cone")`이다. 포트 이름은
-`joint.<id>.<quantity>[i]`, `sensor.<id>[i]`, `time`, `contact.<a>.<b>`이다.
+원뿔에서 지원되는 것: `GetJointState`, `GetSensor`, `GetTime`, `GetBodyPose`
+(잎, 이름 붙은 포트에 바인딩됨), `Arith`, `Compare`, `Clamp`, `Normalize`,
+`Logic`, `Norm { kind: L2 }`. reward나 terminate 원뿔 안의 그 외 모든 노드
+종류는 `EnvError::Unsupported("<kind> in a reward or termination cone")`이다 —
+이름을 불러 거절하지, 근사하지 않는다. 포트 이름은 그 잎이 읽는 상태
+인덱스에서 온다: `qpos[i]`, `qvel[i]`, `sensor[i]`, `xpos[i]`, `time`,
+`time.episode`.
+
+**레인(lane)** (패킷 M8/S4d). 낮추기는 `Expr` 하나가 아니라 *레인마다* `Expr`
+하나를 돌려준다. 스칼라 잎은 한 레인이고, `GetBodyPose { relative_to: World }`는
+세 레인이다 — `ModelInfo::body`가 주는 행에서 읽은 `StateView::xpos`의 월드
+위치이며, 덕분에 두 물체 사이의 거리를 드디어 적을 수 있다. 레인 수가 같은
+`Arith`는 레인별로 계산되고 한 레인짜리 피연산자는 반대쪽으로 브로드캐스트된다.
+`Norm { kind: L2 }`는 `n`개 레인을 제곱의 합의 `Sqrt`로 접으며, 그 합은
+**레인 순서로** 누산된다(`DET-020`). 그래서 결합 순서가 모든 백엔드, 모든
+실행에서 `Sqrt(((x*x + y*y) + z*z))`로 고정된다. `Compare`, `Clamp`,
+`Normalize`, `Logic`과 두 싱크는 정확히 한 레인을 요구하며, 벡터가 거기
+도달하면 조용히 첫 레인을 쓰는 대신 이름을 부르며 거절한다: 큐브의 `x`를
+거리인 양 점수화하는 것이야말로 이 규칙이 막으려는 버그다. 방향(quaternion)
+포트, `World`가 아닌 프레임, `L1` / `Linf`, 로드된 모델이 색인하지 않는 물체도
+각각 이름을 불러 거절한다.
+
+**`sqrt`는 `DET-010`의 초월함수가 아니다**(§6.6). IEEE 754는 제곱근을 올바르게
+반올림하도록 요구한다 — 하드웨어 명령 하나, 모든 타깃에서 같은 비트 — `exp`나
+`sin`과 달리 `es-math::approx`가 필요 없다. 그래서 `Expr::Sqrt`가
+`es-ir-types`에서 물체 거리 원뿔이 치르는 비용의 전부이며, 음수 피제곱근은
+다른 모든 비유한 결과와 마찬가지로 `NaN`이 아니라 `None`이다.
 
 보상 집계는 `Reward` 노드들에 대해 오름차순 `NodeId`로 `sum(weight * term)`을
 계산하는 것이다. `Mean`, `Min`, `Max`는 벡터 항의 원소들을 집계하며 여기서는
