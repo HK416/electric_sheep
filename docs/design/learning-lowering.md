@@ -82,7 +82,7 @@ safetensors file before the first `forward`, and a missing key is an error, neve
 | `LearningNode` | PyTorch | forward line | weights |
 |---|---|---|---|
 | `StateEncoder { Identity }` | — | `v = x` | none |
-| `StateEncoder { Mlp { hidden } }` | `nn.Sequential(Linear, ReLU, …, Linear)` | `v = self.nk(x)` | exact |
+| `StateEncoder { Mlp { hidden, activation, activate_output } }` | `nn.Sequential(Linear, act, …, Linear[, act])` | `v = self.nk(x)` | exact |
 | `VisionEncoder { ResNet18/34 }` | `torchvision.models.resnet{18,34}` with `fc = Linear(512, out_dim)` | `v = self.nk(x)` | prefix |
 | `VisionEncoder { other }` | — | — | `Unsupported` |
 | `LanguageEncoder` | — | — | `Unsupported` |
@@ -92,7 +92,7 @@ safetensors file before the first `forward`, and a missing key is an error, neve
 | `TemporalEncoder { None }` | — | `v = x` | none |
 | `TemporalEncoder { Transformer }` | `nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=out_dim, nhead=8, batch_first=True), 1)` | `v = self.nk(x)` | prefix |
 | `TemporalEncoder { TemporalConv, Gru, Mamba }` | — | — | `Unsupported` |
-| `PolicyHead { Regression }` | `Linear(in, horizon * action_dim)` | `v = self.nk(x).reshape(-1, H, A)` | exact |
+| `PolicyHead { Regression, squash }` | `Linear(in, horizon * action_dim)` | `v = [torch.tanh(]self.nk(x)[)].reshape(-1, H, A)` | exact |
 | `PolicyHead { Diffusion { Ddpm, Ddim } }` | `_DdpmHead` (section 8) | `v = self.nk(cond, noise)` | exact |
 | `PolicyHead { FlowMatching }` | `_FlowHead` (section 8) | `v = self.nk(cond, noise)` | exact |
 | `PolicyHead { Diffusion { DpmSolver }, Discrete, Energy }` | — | — | `Unsupported` |
@@ -128,6 +128,40 @@ Notes on the entries that are not obvious:
   which means the checkpoint cannot disagree with the IR about them. `StatsSource::Dataset`
   is `Unsupported` here because resolving a `dataset_hash` is `es-data`'s job (layer 10), and
   `es-policy` is layer 8.
+
+### 3.1 The activation, its placement, and the squash (packet M8/S2a)
+
+Three node parameters, no new node. `StateEncoderKind::Mlp` gained `activation: Activation`
+and `activate_output: bool`; `LearningNode::PolicyHead` gained `squash: Squash`. They close
+`quadruped-track.md` 3.4 items 1–3: upstream MLPs are not `ReLU` (brax is `swish`, rsl_rl is
+`ELU`), upstream activates the last hidden layer too, and brax's deterministic inference is
+`tanh(location)`.
+
+| parameter | values | lowered to |
+|---|---|---|
+| `activation` | `Relu` / `Elu` / `Swish` / `Tanh` | `nn.ReLU()` / `nn.ELU()` / `nn.SiLU()` / `nn.Tanh()` between the encoder's `nn.Linear`s |
+| `activate_output` | `false` / `true` | the same module appended after the **last** `nn.Linear` of the encoder |
+| `squash` | `None` / `Tanh` | `torch.tanh(...)` around the `Regression` head's output, **before** the reshape |
+
+**The hash rule.** Absent = the default (`Relu`, `false`, `None`) = today's canonical form, the
+rule packet M7/R5's `SensorRender` follows. `StateEncoderKind::canonical` writes the exact
+string `Mlp { hidden: [256] }` — what `format!("{kind:?}")` produced before the two fields
+existed — and appends them only when they are not the default; `PolicyHead`'s canonical appends
+`squash` only when it is not `None`. `es-ir`'s
+`committed_learning_hashes_are_unmoved_by_activation_and_squash` pins the demo's two
+`learning_hash`es as hex literals and checks that a document *spelling* the defaults hashes the
+same as one omitting them; `es-policy`'s `lower_mlp_activations_source` pins the committed
+`lowering_hash` (`3d06811c…d8a2d394`) against the same claim on the generated source.
+
+Two consequences worth stating. An activation carries no weights, so `weight_keys` and
+`weight_shapes` are identical for all sixteen combinations — a checkpoint trained under one
+activation loads under another, and only the numbers differ. And `squash` is defined on a
+`Regression` head alone: on any other head it is `LRN-031`, because a sampler's output comes
+out of a denoiser or a codebook, where `tanh` would change the distribution rather than the
+range.
+
+`python/es/builder.py`'s `head(...)` takes `squash="None"`; the two `Mlp` fields ride inside
+the `kind` value the builder passes through verbatim, so they need no keyword of their own.
 
 ## 4. Weight naming
 
