@@ -91,6 +91,16 @@ fn cpu_pt1() -> Frame {
     cpu::path_trace(&scene(), &cornell_camera(TILE, TILE), &pt_cfg(1, 2), 0)
 }
 
+/// The config `cornell_pt_nee_rgb8` is generated from (packet M7/R3): 4 spp, 3 bounces, NEE
+/// on, Reinhard, exposure 1 — every one of those the `RenderConfig` default except `nee`.
+fn pt_nee_cfg() -> RenderConfig {
+    RenderConfig::pt_nee(TileAtlasCfg::row(TILE, TILE, 1), 4, 3)
+}
+
+fn cpu_pt_nee() -> Frame {
+    cpu::path_trace(&scene(), &cornell_camera(TILE, TILE), &pt_nee_cfg(), 0)
+}
+
 /// `Some((gpu, _))` or a printed SKIP. `slangc` is checked too: without it no kernel compiles
 /// and the failure would look like a GPU bug.
 fn open(test: &str) -> Option<Gpu> {
@@ -175,9 +185,10 @@ enum Source {
     Rs,
     RsFull,
     Pt,
+    PtNee,
 }
 
-const GOLDENS: [Golden; 5] = [
+const GOLDENS: [Golden; 6] = [
     Golden {
         name: "cornell_rs_rgb8",
         channel: Channel::Rgb8,
@@ -216,13 +227,24 @@ const GOLDENS: [Golden; 5] = [
         source: Source::RsFull,
         kernel: "raster.v1 (Shading::Full, ssaa 2)",
     },
+    // Packet M7/R3: the first `Rgb8` the path tracer can produce. `PtRadiance` is not pinned
+    // a second time — `cornell_pt1spp` already pins the estimator, and this file pins what
+    // the tone map does to it.
+    Golden {
+        name: "cornell_pt_nee_rgb8",
+        channel: Channel::Rgb8,
+        dtype: "u8",
+        source: Source::PtNee,
+        kernel: "pt.v2 (4 spp, 3 bounces, NEE, Reinhard, exposure 1)",
+    },
 ];
 
-fn golden_tile(g: &Golden, rs: &Frame, rs_full: &Frame, pt: &Frame) -> Tile {
+fn golden_tile(g: &Golden, rs: &Frame, rs_full: &Frame, pt: &Frame, pt_nee: &Frame) -> Tile {
     let frame = match g.source {
         Source::Rs => rs,
         Source::RsFull => rs_full,
         Source::Pt => pt,
+        Source::PtNee => pt_nee,
     };
     frame.tile(g.channel).expect("channel rendered").clone()
 }
@@ -234,9 +256,9 @@ fn golden_tile(g: &Golden, rs: &Frame, rs_full: &Frame, pt: &Frame) -> Tile {
 fn generate_goldens() {
     let dir = golden_dir();
     std::fs::create_dir_all(&dir).expect("golden dir");
-    let (rs, rs_full, pt) = (cpu_rs(), cpu_rs_full(), cpu_pt1());
+    let (rs, rs_full, pt, pt_nee) = (cpu_rs(), cpu_rs_full(), cpu_pt1(), cpu_pt_nee());
     for g in &GOLDENS {
-        let tile = golden_tile(g, &rs, &rs_full, &pt);
+        let tile = golden_tile(g, &rs, &rs_full, &pt, &pt_nee);
         std::fs::write(dir.join(format!("{}.bin", g.name)), tile.to_bytes()).expect("write bin");
         let sidecar = serde_json::json!({
             "name": g.name,
@@ -263,12 +285,12 @@ fn generate_goldens() {
 
 #[test]
 fn cpu_reference_reproduces_the_goldens_bit_for_bit() {
-    let (rs, rs_full, pt) = (cpu_rs(), cpu_rs_full(), cpu_pt1());
+    let (rs, rs_full, pt, pt_nee) = (cpu_rs(), cpu_rs_full(), cpu_pt1(), cpu_pt_nee());
     for g in &GOLDENS {
         let path = golden_dir().join(format!("{}.bin", g.name));
         let expected = std::fs::read(&path)
             .unwrap_or_else(|e| panic!("{}: {e} (run the generate_goldens test)", path.display()));
-        let got = golden_tile(g, &rs, &rs_full, &pt).to_bytes();
+        let got = golden_tile(g, &rs, &rs_full, &pt, &pt_nee).to_bytes();
         assert_eq!(got.len(), expected.len(), "{} size", g.name);
         assert!(got == expected, "{} differs from its golden", g.name);
         println!("bit-equal CPU vs golden: {}", g.name);
@@ -824,6 +846,7 @@ fn gpu_restir_and_svgf_match_the_cpu_within_tolerance() {
     cfg.path = RenderPath::Pt {
         spp: 1,
         bounces: 2,
+        nee: false,
         restir: true,
         svgf: true,
     };
@@ -1050,6 +1073,322 @@ fn bvh_traversal_is_the_flat_scan() {
             bvh.depth,
             es_render::bvh::STACK
         );
+    }
+}
+
+// --- the tone map, NEE, the unbiased ReSTIR and SSIM (packet M7/R3) --------------------------
+
+/// The tile the convergence oracles work on. Small on purpose: a 4,096 spp reference is a
+/// CPU path trace and `cargo xtask ci` runs the suite in debug.
+const REF_TILE: u32 = 16;
+const REF_SPP: u32 = 4096;
+
+fn small_cam() -> CameraView {
+    cornell_camera(REF_TILE, REF_TILE)
+}
+
+/// A `Pt` config on the small tile emitting `PtRadiance` only — the tone map is a different
+/// oracle and its per-pixel loop is pure cost here.
+fn small_pt(spp: u32, bounces: u32, nee: bool) -> RenderConfig {
+    let atlas = TileAtlasCfg::row(REF_TILE, REF_TILE, 1);
+    let mut cfg = if nee {
+        RenderConfig::pt_nee(atlas, spp, bounces)
+    } else {
+        RenderConfig::pt(atlas, spp, bounces)
+    };
+    cfg.channels = BTreeSet::from([Channel::PtRadiance]);
+    cfg
+}
+
+fn radiance_of(cfg: &RenderConfig) -> Vec<f32> {
+    cpu::path_trace(&scene(), &small_cam(), cfg, 0)
+        .tile(Channel::PtRadiance)
+        .expect("radiance")
+        .as_f32()
+        .expect("f32")
+        .to_vec()
+}
+
+/// The converged image the two estimators must agree on. Computed once per test binary —
+/// oracles 3 and 4 both want it, and it is the expensive thing in this file.
+fn reference(nee: bool, bounces: u32) -> &'static Vec<f32> {
+    use std::sync::OnceLock;
+    static NEE3: OnceLock<Vec<f32>> = OnceLock::new();
+    static PLAIN4: OnceLock<Vec<f32>> = OnceLock::new();
+    static PLAIN2: OnceLock<Vec<f32>> = OnceLock::new();
+    match (nee, bounces) {
+        (true, _) => NEE3.get_or_init(|| radiance_of(&small_pt(REF_SPP, 3, true))),
+        (false, 4) => PLAIN4.get_or_init(|| radiance_of(&small_pt(REF_SPP, 4, false))),
+        (false, _) => PLAIN2.get_or_init(|| radiance_of(&small_pt(REF_SPP, 2, false))),
+    }
+}
+
+fn mean(v: &[f32]) -> f64 {
+    v.iter().map(|x| f64::from(*x)).sum::<f64>() / v.len() as f64
+}
+
+fn mean_abs_diff(a: &[f32], b: &[f32]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| f64::from(*x - *y).abs())
+        .sum::<f64>()
+        / a.len() as f64
+}
+
+fn rmse(a: &[f32], b: &[f32]) -> f64 {
+    (a.iter()
+        .zip(b)
+        .map(|(x, y)| {
+            let d = f64::from(*x) - f64::from(*y);
+            d * d
+        })
+        .sum::<f64>()
+        / a.len() as f64)
+        .sqrt()
+}
+
+/// Oracle 2, the half that needs no device: the tone map is monotone per channel, so a
+/// brighter linear radiance never encodes to a darker byte.
+fn tonemap_is_monotone() {
+    for map in [es_render::Tonemap::Reinhard, es_render::Tonemap::Aces] {
+        for exposure in [0.25f32, 1.0, 4.0] {
+            let mut last = 0u8;
+            let mut x = 0.0f32;
+            while x < 64.0 {
+                let got = cpu::tonemap_to_u8([x; 3], exposure, map)[0];
+                assert!(
+                    got >= last,
+                    "{map:?} at exposure {exposure}: {x} encoded to {got} after {last}"
+                );
+                last = got;
+                x += 1.0 / 512.0;
+            }
+            assert!(
+                last > 200,
+                "{map:?} at exposure {exposure} never got bright"
+            );
+        }
+    }
+    println!("tone map monotone on [0, 64) for both operators at three exposures");
+}
+
+/// Oracle 2: a `PtRadiance` tile through `Reinhard` and `Aces`, on the CPU and on the GPU,
+/// encodes to **bitwise equal** `Rgb8`. Not a ULP budget: neither operator contains a
+/// transcendental, so the only approximation left is the sRGB transfer both sides already
+/// share (spec 28.7 gate 3).
+#[test]
+fn tonemap_is_bitwise_on_both_sides() {
+    let test = "tonemap_is_bitwise_on_both_sides";
+    tonemap_is_monotone();
+    let Some(gpu) = open(test) else { return };
+    let cams = [cornell_camera(TILE, TILE)];
+    for map in [es_render::Tonemap::Reinhard, es_render::Tonemap::Aces] {
+        for exposure in [1.0f32, 8.0] {
+            // 1 spp / 2 bounces: `gpu_path_tracer_matches_the_cpu_reference_at_1spp` already
+            // pins that `PtRadiance` bit-equal, so any `Rgb8` difference here is the tone
+            // map's and nothing else's.
+            let mut cfg = pt_cfg(1, 2);
+            cfg.tonemap = map;
+            cfg.exposure = exposure;
+            let mut atlas = render_gpu(&gpu, cfg.clone(), &cams, 1);
+            let got = atlas.read_tile(0, Channel::Rgb8).expect("rgb8");
+            let want = cpu::path_trace(&scene(), &cams[0], &cfg, 0);
+            let want_rgb = want.tile(Channel::Rgb8).expect("rgb8");
+            let diff = got
+                .as_u8()
+                .unwrap()
+                .iter()
+                .zip(want_rgb.as_u8().unwrap())
+                .filter(|(a, b)| a != b)
+                .count();
+            println!(
+                "{map:?} at exposure {exposure}: {diff} of {} bytes differ",
+                got.len()
+            );
+            assert_eq!(diff, 0, "{map:?} at exposure {exposure} is not bitwise");
+        }
+    }
+}
+
+/// Oracle 3: NEE and the BSDF-only estimator are two estimators of the *same* integral, so
+/// they agree **in expectation** — the image means are within 1% of each other at 4,096 spp.
+///
+/// **Two deviations from the packet's wording**, both forced by what the two estimators
+/// actually are:
+///
+/// 1. NEE at `B` bounces is the BSDF-only tracer at `B + 1`, not at `B`. NEE's last vertex
+///    gathers light the BSDF-only path never reaches, because its continuation ray is never
+///    traced. So this compares NEE at 3 bounces with no-NEE at 4. Comparing both at 3 leaves
+///    a real +3.7% difference that is a *truncation* difference, not a bias.
+/// 2. The assertion is on the image means, not on the per-pixel mean absolute difference.
+///    At 4,096 spp each estimator still carries its own Monte-Carlo noise:
+///    `nee_at_low_spp_has_lower_variance` measures the BSDF-only RMSE at 16 spp as ~0.024,
+///    which is ~0.0015 at 4,096 — the size of the per-pixel difference this test prints.
+///    Testing expectation means averaging that noise away. The per-pixel figure is printed
+///    beside it and given a loose backstop, so a real estimator mismatch (a missing MIS
+///    weight, a wrong pdf) still fails loudly.
+#[test]
+fn nee_converges_to_the_same_image() {
+    let with = reference(true, 3);
+    let without = reference(false, 4);
+    let (m_on, m_off) = (mean(with), mean(without));
+    let d = mean_abs_diff(with, without);
+    let bias = m_on - m_off;
+    println!(
+        "NEE on (3 bounces) vs off (4 bounces), {REF_SPP} spp, {REF_TILE}x{REF_TILE}: mean \
+         radiance {m_off:.6} (off) vs {m_on:.6} (on), difference of means {bias:+.6} = \
+         {:+.3}%; per-pixel mean |difference| {d:.6} = {:.3}% of the mean (the Monte-Carlo \
+         floor)",
+        100.0 * bias / m_off,
+        100.0 * d / m_off
+    );
+    assert!(m_off > 0.0, "the reference image is black");
+    assert!(
+        bias.abs() < 0.01 * m_off,
+        "the two estimators disagree in expectation by {:+.3}% of the mean radiance",
+        100.0 * bias / m_off
+    );
+    assert!(
+        d < 0.10 * m_off,
+        "the per-pixel difference is {:.3}% of the mean: too large to be noise",
+        100.0 * d / m_off
+    );
+}
+
+/// Oracle 4: what NEE buys. Same 16 samples, same seed, same bounces — the RMSE against the
+/// converged image is smaller with NEE on.
+#[test]
+fn nee_at_low_spp_has_lower_variance() {
+    let converged = reference(true, 3);
+    let on = radiance_of(&small_pt(16, 3, true));
+    let off = radiance_of(&small_pt(16, 3, false));
+    let (a, b) = (rmse(&on, converged), rmse(&off, converged));
+    println!(
+        "16 spp RMSE against the {REF_SPP} spp reference: NEE on {a:.6}, NEE off {b:.6} \
+         ({:.2}x lower)",
+        b / a
+    );
+    assert!(a < b, "NEE did not reduce the RMSE ({a} vs {b})");
+}
+
+/// Oracle 5: the spatial reuse is unbiased. 256 independent 1 spp `ReSTIR` frames, averaged,
+/// against a 4,096 spp path trace of the *same* integral — direct lighting only, which is
+/// what `ReSTIR` DI estimates, so the reference is two bounces without NEE (primary emission
+/// plus one cosine-sampled bounce onto the light).
+#[test]
+fn restir_is_unbiased_within_tolerance() {
+    const SEEDS: u32 = 256;
+    let converged = reference(false, 2);
+    let mut acc = vec![0.0f64; converged.len()];
+    for s in 0..SEEDS {
+        let mut cfg = small_pt(1, 2, false);
+        cfg.path = RenderPath::Pt {
+            spp: 1,
+            bounces: 2,
+            nee: false,
+            restir: true,
+            svgf: false,
+        };
+        cfg.seed = 0x5eed_1234u32.wrapping_add(s.wrapping_mul(0x9e37_79b9));
+        for (a, x) in acc.iter_mut().zip(&radiance_of(&cfg)) {
+            *a += f64::from(*x);
+        }
+    }
+    let got: Vec<f32> = acc.iter().map(|x| (*x / f64::from(SEEDS)) as f32).collect();
+    let m = mean(converged);
+    let bias = mean(&got) - m;
+    println!(
+        "ReSTIR (spatial, unbiased 1/Z + pairwise MIS), {SEEDS} seeds x 1 spp vs {REF_SPP} \
+         spp direct: reference mean {m:.6}, ReSTIR mean {:.6}, bias {bias:+.6} = {:+.3}%",
+        mean(&got),
+        100.0 * bias / m
+    );
+    assert!(m > 0.0, "the reference image is black");
+    assert!(
+        bias.abs() < 0.01 * m,
+        "ReSTIR is biased by {:+.3}% of the mean radiance",
+        100.0 * bias / m
+    );
+}
+
+/// Oracle 6: the new golden is the CPU's bit for bit, and the device reproduces it.
+#[test]
+fn gpu_pt_nee_matches_the_cpu() {
+    let test = "gpu_pt_nee_matches_the_cpu";
+    // The CPU half runs everywhere, device or not.
+    let cpu_frame = cpu_pt_nee();
+    let cpu_rgb = cpu_frame.tile(Channel::Rgb8).expect("rgb8").to_bytes();
+    let want = std::fs::read(golden_dir().join("cornell_pt_nee_rgb8.bin"))
+        .expect("the golden (run the generate_goldens test)");
+    assert!(
+        cpu_rgb == want,
+        "cornell_pt_nee_rgb8 differs from its golden"
+    );
+    println!("bit-equal CPU vs golden: cornell_pt_nee_rgb8");
+
+    let Some(gpu) = open(test) else { return };
+    let cams = [cornell_camera(TILE, TILE)];
+    let mut atlas = render_gpu(&gpu, pt_nee_cfg(), &cams, 1);
+    let rad = atlas.read_tile(0, Channel::PtRadiance).expect("radiance");
+    let want_rad = cpu_frame
+        .tile(Channel::PtRadiance)
+        .expect("radiance")
+        .as_f32()
+        .unwrap();
+    let norm = max_normalized(rad.as_f32().unwrap(), want_rad);
+    let (ulp, _) = max_ulp(rad.as_f32().unwrap(), want_rad);
+    println!("PtRadiance 4 spp NEE: normalized max error {norm:e}, max ULP {ulp}");
+    assert!(norm <= 1e-5, "PtRadiance diverged by {norm:e}");
+
+    let rgb = atlas.read_tile(0, Channel::Rgb8).expect("rgb8");
+    let diff = rgb
+        .as_u8()
+        .unwrap()
+        .iter()
+        .zip(cpu_frame.tile(Channel::Rgb8).unwrap().as_u8().unwrap())
+        .filter(|(a, b)| a != b)
+        .count();
+    println!(
+        "Rgb8 4 spp NEE: {diff} of {} bytes differ from the CPU",
+        rgb.len()
+    );
+    assert!(
+        diff * 1000 <= rgb.len(),
+        "{diff} of {} bytes differ, more than the 0.1% a shadow-ray tie explains",
+        rgb.len()
+    );
+}
+
+/// Oracle 7: `ssim(a, a)` is exactly 1, and the score falls as the noise grows.
+#[test]
+#[allow(clippy::float_cmp)]
+fn ssim_is_one_for_identical_and_falls_with_noise() {
+    let base = cpu_rs_full()
+        .tile(Channel::Rgb8)
+        .expect("rgb8")
+        .as_u8()
+        .unwrap()
+        .to_vec();
+    assert_eq!(es_render::ssim(&base, &base, TILE, TILE), 1.0);
+    println!("ssim(a, a) = 1.0 exactly");
+
+    let mut last = 1.0;
+    for amp in [2.0f64, 4.0, 8.0, 16.0, 32.0] {
+        // One fixed unit-noise field scaled by `amp`, so a larger `amp` is strictly more
+        // noise at every pixel rather than a different draw.
+        let noisy: Vec<u8> = base
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let u = f64::from(es_render::rng::mix32(i as u32)) / f64::from(u32::MAX);
+                let n = (u * 2.0 - 1.0) * amp;
+                (f64::from(*v) + n).clamp(0.0, 255.0).round() as u8
+            })
+            .collect();
+        let s = es_render::ssim(&base, &noisy, TILE, TILE);
+        println!("ssim(a, a + {amp} * unit noise) = {s:.6}");
+        assert!(s < last, "SSIM did not fall at noise amplitude {amp}");
+        last = s;
     }
 }
 
