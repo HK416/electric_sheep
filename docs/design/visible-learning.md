@@ -4440,7 +4440,24 @@ is set from it.
 | row | Learning IR | Observation IR | Task IR | trained | held-out `success_rate` |
 |---|---|---|---|---|---|
 | **U3** | `learning-pretrained.toml` | `observation-augmented.toml` | `task.toml` (`Rs`) | `es train` | **0.5625** |
-| **U4** | `learning-pretrained.toml` | `observation-augmented-pt.toml` | `task-pt.toml` (`Pt`) | `es train` | `Target / Status: unverified` |
+| **U4** | `learning-pretrained.toml` | `observation-augmented-pt.toml` | `task-pt.toml` (`Pt`) | `es train` | **held-out 0.0 (0 of 16), `passed = false`**; train-seeds half `Target / Status: unverified` |
+
+**U4 landed (2026-09-21 12:28 server time, the held-out half).** Training: 20,000 steps, loss
+0.600 → 0.0045 (mean of the last 100 steps; U3's final was 0.0067). Held-out evaluation
+(`evaluation-augmented-pt`, 16 seeds × 6 suites, 169,612 PT frames, 2 h 57 min at `--jobs 6`):
+**nominal `success_rate` 0.0 — 0 of 16, `passed = false`** (acceptance ≥ 0.5); `light_intensity`
+0.0625, `light_direction` 0.0, `observation_delay` 0.0, `torque_noise` 0.0, `backlash` 0.0625;
+nominal `envelope_violation_rate` 0.0928, every nominal episode a timeout at 1,800 ticks.
+`evaluation_hash 343d84cd…`, `execution_hash 12dff382…`. Two readings, and the train-seeds half
+(running, `U4/trainseeds`) decides between them: (a) **memorisation of the per-pose grain** — the
+loss is *lower* than U3's while the policy does nothing useful on seeds it never saw, which is
+what a fixed per-pose texture used as a fingerprint looks like (the paragraph below; follow-up
+R13: more `spp`, or the `Rs` lighting on the `Pt` sensor); (b) **a collect/eval observation
+mismatch on the PT path** — ruled out only if the train-seeds evaluation succeeds where the
+held-out one did not. Note also that `nominal` and `light_direction` report byte-identical
+histograms: the light-direction perturbation moves the rasterizer's directional light, which the
+`Pt` sensor does not have (it is lit by scene emitters only), so on this document that suite is a
+second nominal run — a gap to close before the §15.3 decision.
 
 **U4 was still running when this packet closed, and the numbers are deliberately not guessed.**
 The job was launched on the oracle server (RTX 4090, idle card: `nvidia-smi` no compute process,

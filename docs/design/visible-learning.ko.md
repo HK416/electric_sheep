@@ -4126,7 +4126,21 @@ IR 위에서, 7.28절에는 없던 지연 모델 아래에서 성립하는 *같�
 | row | Learning IR | Observation IR | Task IR | 학습 | held-out `success_rate` |
 |---|---|---|---|---|---|
 | **U3** | `learning-pretrained.toml` | `observation-augmented.toml` | `task.toml` (`Rs`) | `es train` | **0.5625** |
-| **U4** | `learning-pretrained.toml` | `observation-augmented-pt.toml` | `task-pt.toml` (`Pt`) | `es train` | `Target / Status: unverified` |
+| **U4** | `learning-pretrained.toml` | `observation-augmented-pt.toml` | `task-pt.toml` (`Pt`) | `es train` | **held-out 0.0 (16편 중 0), `passed = false`**; train-seeds 절반은 `Target / Status: unverified` |
+
+**U4가 나왔다(2026-09-21 12:28 서버 시각, held-out 절반).** 학습: 20,000스텝, loss 0.600 → 0.0045
+(마지막 100스텝 평균; U3의 최종은 0.0067). Held-out 평가(`evaluation-augmented-pt`, 시드 16 × 스위트
+6, PT 프레임 169,612개, `--jobs 6`으로 2시간 57분): **nominal `success_rate` 0.0 — 16편 중 0,
+`passed = false`**(수용 기준 ≥ 0.5); `light_intensity` 0.0625, `light_direction` 0.0,
+`observation_delay` 0.0, `torque_noise` 0.0, `backlash` 0.0625; nominal `envelope_violation_rate`
+0.0928, nominal 에피소드 전부가 1,800틱 timeout. `evaluation_hash 343d84cd…`, `execution_hash
+12dff382…`. 읽는 법은 둘이고, train-seeds 절반(실행 중, `U4/trainseeds`)이 가른다: (a) **포즈별
+결의 암기** — loss는 U3보다 *낮은데* 못 본 시드에서는 아무것도 못 한다. 고정된 포즈별 텍스처를
+지문으로 쓴 정책이 딱 이렇게 보인다(아래 문단; 후속 R13: `spp`를 올리거나 `Pt` 센서에 `Rs`
+조명); (b) **PT 경로의 수집/평가 관측 불일치** — train-seeds 평가가 held-out과 달리 성공할 때만
+배제된다. 또 `nominal`과 `light_direction`의 히스토그램이 바이트 단위로 같다: 조명 방향 섭동은
+래스터라이저의 방향광을 움직이는데 `Pt` 센서에는 그것이 없다(장면 발광체로만 조명). 이 문서에서
+그 스위트는 두 번째 nominal 실행이며, §15.3 결정 전에 메워야 할 빈틈이다.
 
 **이 패킷이 닫힐 때 U4는 아직 돌고 있었고, 숫자는 의도적으로 추측하지 않았다.** 작업은 오라클 서버(RTX 4090, 유휴 카드: `nvidia-smi` 컴퓨트 프로세스 없음, 1분 부하 0.56)에서 2026-09-21 07:43에 `nohup ~/artifacts/plan-v/m7-r5/r5.sh &`로, 커밋 `16f1b6f`의 트리 `~/Projects/es-r5`에서 시작되었고 아래 세 단계를 연달아 실행한다. 산출물은 모두 **`~/artifacts/plan-v/m7-r5/`** 아래에 떨어지고, 각 단계가 `<stage>.start` / `.end`(유닉스 초), `<stage>.log`, `<stage>.done`을 쓰므로 어디까지 갔는지 읽을 수 있다:
 
