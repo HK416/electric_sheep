@@ -427,8 +427,7 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
                     .read_tile(0, Channel::History)
                     .map_err(|e| rt(format!("history readback: {e}")))?;
                 let out = history_dir.join(format!("{frame:06}.bin"));
-                fs::write(&out, n.to_bytes())
-                    .map_err(|e| rt(format!("{}: {e}", out.display())))?;
+                fs::write(&out, n.to_bytes()).map_err(|e| rt(format!("{}: {e}", out.display())))?;
             }
             frame += 1;
         }
