@@ -1778,3 +1778,530 @@ fn the_demo_lowering_hash_moves_only_for_the_pretrained_graph() {
 /// section 5.2's table).
 const FROM_SCRATCH_LOWERING_HASH: &str =
     "3d06811c52b6887f021440d4ce9a1a061e4eb27a0abb97c79822acd4d8a2d394";
+
+// --- packet M7/T6: the augmentation, in Rust and in Python -------------------------------
+
+fn augment_py() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../python/es/augment.py")
+}
+
+fn augment_golden() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/train/augment_seed0.json")
+}
+
+/// Murmur3's `fmix32` — `es_render::rng::mix32` and `python/es/augment.py`'s, the same ten
+/// lines of integer arithmetic in the third language that has to agree about them.
+///
+/// `es-policy` does not depend on `es-render` (layer 8 does not need layer 5 for a test), so
+/// this is a copy on purpose; what makes it honest is that the golden below was produced by
+/// the *Python* one and this has to reproduce it bitwise.
+fn mix32(mut z: u32) -> u32 {
+    z ^= z >> 16;
+    z = z.wrapping_mul(0x85eb_ca6b);
+    z ^= z >> 13;
+    z = z.wrapping_mul(0xc2b2_ae35);
+    z ^ (z >> 16)
+}
+
+/// `(augmentation_seed, sample_index, step, node_index)` — the stream one node draws from for
+/// one sample at one optimizer step (design note `training-recipe.md` section 13).
+fn aug_key(seed: u64, sample: u32, step: u32, node: u32) -> u32 {
+    let mut k = mix32(seed as u32);
+    k = mix32(k ^ ((seed >> 32) as u32));
+    k = mix32(k ^ sample);
+    k = mix32(k ^ step);
+    mix32(k ^ node)
+}
+
+/// Draw `i` of stream `k`, in `[0, 1)`: the top 24 bits, so the value is exact in `f32`.
+fn aug_uniform(k: u32, i: u32) -> f64 {
+    let bits = mix32(k ^ i.wrapping_mul(0x9e37_79b9));
+    f64::from(bits >> 8) * (1.0 / 16_777_216.0)
+}
+
+/// The Rust re-implementation of `python/es/augment.py::apply_chain`, node for node.
+///
+/// `values` is one sample, `shape` its `(channels, height, width)`; the return is the
+/// augmented sample and its shape. Every scalar is computed in `f64` and rounded to `f32`
+/// before it touches a value, which is what lets the two implementations agree without
+/// agreeing about widening.
+fn apply_chain(
+    chain: &[serde_json::Value],
+    mut values: Vec<f32>,
+    mut shape: (usize, usize, usize),
+    sample: u32,
+    step: u32,
+    seed: u64,
+) -> (Vec<f32>, (usize, usize, usize)) {
+    for node in chain {
+        let stream = aug_key(
+            seed,
+            sample,
+            step,
+            node["node"].as_u64().expect("node id") as u32,
+        );
+        let param = |key: &str| node[key].as_f64().unwrap_or_else(|| panic!("{key}"));
+        let (planes, height, width) = shape;
+        match node["kind"].as_str().expect("kind") {
+            "RandomCrop" => {
+                let (crop_w, crop_h) = (param("width") as usize, param("height") as usize);
+                let span = |u: f64, from: usize, to: usize| {
+                    ((u * (from - to + 1) as f64) as usize).min(from - to)
+                };
+                let left = span(aug_uniform(stream, 0), width, crop_w);
+                let top = span(aug_uniform(stream, 1), height, crop_h);
+                let mut out = Vec::with_capacity(planes * crop_h * crop_w);
+                for plane in 0..planes {
+                    for row in 0..crop_h {
+                        let at = plane * height * width + (row + top) * width + left;
+                        out.extend_from_slice(&values[at..at + crop_w]);
+                    }
+                }
+                values = out;
+                shape = (planes, crop_h, crop_w);
+            }
+            "ColorJitter" => {
+                for refused in ["saturation", "hue"] {
+                    // Exactly zero is the condition `augment.py` refuses on, so the
+                    // comparison here has to be the same exact one.
+                    assert!(
+                        param(refused) == 0.0,
+                        "the Rust half refuses what Python refuses"
+                    );
+                }
+                let gain =
+                    (1.0 + (2.0 * aug_uniform(stream, 0) - 1.0) * param("brightness")) as f32;
+                for value in &mut values {
+                    *value *= gain;
+                }
+                // The one reduction: f64, then rounded once to f32. Python's is torch's
+                // `.double().mean()`, whose summation order is its own — see section 13.
+                let mean = (values.iter().map(|v| f64::from(*v)).sum::<f64>() / values.len() as f64)
+                    as f32;
+                let contrast =
+                    (1.0 + (2.0 * aug_uniform(stream, 1) - 1.0) * param("contrast")) as f32;
+                for value in &mut values {
+                    *value = (*value - mean) * contrast + mean;
+                }
+            }
+            "GaussianNoise" => {
+                let sigma = param("sigma");
+                for (at, value) in values.iter_mut().enumerate() {
+                    let at = at as u32;
+                    // `1 - u` is in (0, 1], so the logarithm is always defined -- the same
+                    // guard `augment.py` uses, and it has to be the same one.
+                    let first = 1.0 - aug_uniform(stream, 2 * at);
+                    let second = aug_uniform(stream, 2 * at + 1);
+                    let radius = (-2.0 * first.ln()).sqrt();
+                    let angle = (2.0 * std::f64::consts::PI * second).cos();
+                    *value += (sigma * radius * angle) as f32;
+                }
+            }
+            other => panic!("the golden names {other}, which this oracle does not implement"),
+        }
+    }
+    (values, shape)
+}
+
+/// argv is `<augment.py> <request.json>`; stdout is `{"output": [[...], ...]}`.
+///
+/// The module is `exec`'d rather than imported for the reason the lr probe `exec`s
+/// `train_act.py`: this reads the file the repository ships, from wherever the test runs.
+const AUGMENT_PROBE_PY: &str = r#"
+import json, sys
+import torch
+namespace = {"__name__": "es_augment_probe"}
+source = open(sys.argv[1], encoding="utf-8").read()
+exec(compile(source, sys.argv[1], "exec"), namespace)
+request = json.loads(open(sys.argv[2], encoding="utf-8").read())
+shape = request["shape"]
+x = torch.tensor(request["input"], dtype=torch.float32).reshape(shape)
+rows = [x.clone() for _ in request["samples"]]
+out = namespace["apply_chain"](
+    request["chain"],
+    torch.stack(rows),
+    request["samples"],
+    request["step"],
+    request["seed"],
+)
+sys.stdout.write(json.dumps({"output": [row.reshape(-1).tolist() for row in out]}))
+"#;
+
+/// The request the golden was produced from, and the one the Python half is asked to repeat.
+fn augment_request(golden: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "shape": golden["shape"], "input": golden["input"], "chain": golden["chain"],
+        "samples": golden["samples"], "step": golden["step"], "seed": golden["seed"],
+    })
+}
+
+/// Generates `tests/golden/train/augment_seed0.json` from `python/es/augment.py`. Run once,
+/// explicitly, with `ES_PYTHON` **and** `ES_GENERATE_GOLDENS=1`; the file is then read-only
+/// (spec 1.4).
+///
+/// The second variable is not belt and braces: `cargo test -- --include-ignored` runs every
+/// `#[ignore]`d test in the workspace, and an M7 review found exactly that rewriting a golden
+/// nobody meant to touch. A generator has to refuse to run by accident.
+#[test]
+#[ignore = "golden generator; run explicitly with ES_PYTHON and ES_GENERATE_GOLDENS=1"]
+fn generate_augment_golden() {
+    assert_eq!(
+        std::env::var("ES_GENERATE_GOLDENS").as_deref(),
+        Ok("1"),
+        "refusing to rewrite a golden without ES_GENERATE_GOLDENS=1"
+    );
+    let python = python_with_torch().expect("the generator needs an interpreter");
+    let dir = scratch_dir("augment-golden");
+    let (c, h, w) = (3usize, 12usize, 12usize);
+    // A ramp with per-channel structure, in f32 from the start: every value the golden
+    // carries is exactly an f32, so reading it back on either side is lossless.
+    let input: Vec<f32> = (0..c * h * w)
+        .map(|i| ((i * 37 % 211) as f32) / 211.0)
+        .collect();
+    let chain = serde_json::json!([
+        {"node": 8, "kind": "RandomCrop", "width": 8, "height": 8},
+        {"node": 9, "kind": "ColorJitter", "brightness": 0.2, "contrast": 0.2,
+         "saturation": 0.0, "hue": 0.0},
+        {"node": 10, "kind": "GaussianNoise", "sigma": 0.05},
+    ]);
+    let mut golden = serde_json::json!({
+        "schema_version": 1,
+        "source": "python/es/augment.py::apply_chain",
+        "seed": 0, "step": 0, "samples": [0, 1, 2, 3, 4],
+        "shape": [c, h, w],
+        "chain": chain,
+        "input": input,
+    });
+    let request = dir.join("request.json");
+    std::fs::write(&request, augment_request(&golden).to_string()).expect("write the request");
+    let probe = run(
+        &python,
+        &[
+            "-c",
+            AUGMENT_PROBE_PY,
+            &augment_py().to_string_lossy(),
+            &request.to_string_lossy(),
+        ],
+    );
+    let reply: serde_json::Value = serde_json::from_slice(&probe.stdout).expect("the probe");
+    golden["output"] = reply["output"].clone();
+    std::fs::create_dir_all(augment_golden().parent().expect("a parent")).expect("golden dir");
+    std::fs::write(
+        augment_golden(),
+        serde_json::to_string_pretty(&golden).expect("serialize") + "\n",
+    )
+    .expect("write the golden");
+    println!(
+        "RAN generate_augment_golden: {} samples -> {}",
+        golden["samples"].as_array().expect("samples").len(),
+        augment_golden().display()
+    );
+}
+
+/// Oracle 1 of packet M7/T6. The Rust re-implementation above equals the golden bitwise at
+/// `f32`, with no interpreter; with `ES_PYTHON`, `python/es/augment.py` equals it too.
+///
+/// Both halves are exact comparisons. The draws are integer arithmetic, so they cannot
+/// legitimately differ at all; the values are `f32` results of scalars rounded from `f64`,
+/// which is the design that makes "exact" a reasonable thing to ask for across two languages
+/// and two libms (the same measurement T4 section 10 made for `cos`).
+#[test]
+fn augmentation_matches_the_golden() {
+    let text = std::fs::read_to_string(augment_golden())
+        .unwrap_or_else(|e| panic!("{}: {e}", augment_golden().display()));
+    let golden: serde_json::Value = serde_json::from_str(&text).expect("the golden is JSON");
+    let floats = |v: &serde_json::Value| -> Vec<f32> {
+        v.as_array()
+            .expect("an array")
+            .iter()
+            .map(|x| x.as_f64().expect("a number") as f32)
+            .collect()
+    };
+    let input = floats(&golden["input"]);
+    let dims = golden["shape"].as_array().expect("shape");
+    let shape = (
+        dims[0].as_u64().expect("c") as usize,
+        dims[1].as_u64().expect("h") as usize,
+        dims[2].as_u64().expect("w") as usize,
+    );
+    let chain = golden["chain"].as_array().expect("chain").clone();
+    let (seed, step) = (
+        golden["seed"].as_u64().expect("seed"),
+        golden["step"].as_u64().expect("step") as u32,
+    );
+    let samples: Vec<u32> = golden["samples"]
+        .as_array()
+        .expect("samples")
+        .iter()
+        .map(|s| s.as_u64().expect("a sample") as u32)
+        .collect();
+    let want: Vec<Vec<f32>> = golden["output"]
+        .as_array()
+        .expect("output")
+        .iter()
+        .map(floats)
+        .collect();
+    assert_eq!(want.len(), samples.len());
+
+    let mut differ = Vec::new();
+    for (row, sample) in samples.iter().enumerate() {
+        let (got, out_shape) = apply_chain(&chain, input.clone(), shape, *sample, step, seed);
+        assert_eq!(out_shape, (3, 8, 8), "the chain's output shape");
+        assert_eq!(got.len(), want[row].len(), "sample {sample}: length");
+        for (at, (mine, theirs)) in got.iter().zip(&want[row]).enumerate() {
+            if mine.to_bits() != theirs.to_bits() {
+                differ.push((*sample, at, *mine, *theirs));
+            }
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "the Rust re-implementation is not the golden at {} of {} values, first {:?}",
+        differ.len(),
+        want.len() * want[0].len(),
+        &differ[..differ.len().min(4)]
+    );
+    // Non-vacuity: the five samples must actually differ from one another, or the comparison
+    // above would pass on an implementation that ignores `sample_index` entirely.
+    assert!(
+        want.windows(2).all(|pair| pair[0] != pair[1]),
+        "two samples were augmented identically"
+    );
+
+    match python_with_torch() {
+        Err(why) => println!("SKIP the interpreter half of augmentation_matches_the_golden: {why}"),
+        Ok(python) => {
+            let dir = scratch_dir("augment-check");
+            let request = dir.join("request.json");
+            std::fs::write(&request, augment_request(&golden).to_string()).expect("the request");
+            let probe = run(
+                &python,
+                &[
+                    "-c",
+                    AUGMENT_PROBE_PY,
+                    &augment_py().to_string_lossy(),
+                    &request.to_string_lossy(),
+                ],
+            );
+            let reply: serde_json::Value =
+                serde_json::from_slice(&probe.stdout).expect("the probe replies JSON");
+            let from_python: Vec<Vec<f32>> = reply["output"]
+                .as_array()
+                .expect("output")
+                .iter()
+                .map(floats)
+                .collect();
+            assert_eq!(from_python.len(), want.len());
+            for (row, (a, b)) in from_python.iter().zip(&want).enumerate() {
+                for (at, (mine, theirs)) in a.iter().zip(b).enumerate() {
+                    assert_eq!(
+                        mine.to_bits(),
+                        theirs.to_bits(),
+                        "sample {row} value {at}: the script gives {mine:e}, the golden                          {theirs:e}"
+                    );
+                }
+            }
+            println!("RAN augmentation_matches_the_golden: interpreter half too, {python}");
+        }
+    }
+    println!(
+        "RAN augmentation_matches_the_golden: {} samples x {} values bitwise at f32",
+        want.len(),
+        want[0].len()
+    );
+}
+
+/// `demo_bundle` with `observation-augmented.toml` in place of `observation.toml` — the same
+/// Task, Learning and Deployment IR, so `learning_hash` is unmoved and only the observation
+/// changed (packet M7/T6).
+fn augmented_bundle(dir: &Path) -> PathBuf {
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let mut learning =
+        es_ir::serial::learning_from_toml(&read("learning.toml")).expect("learning.toml");
+    let weights = b"es-t6-untrained-placeholder".to_vec();
+    learning.policy.weights = WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let bytes = PolicyBundle::build(
+        &es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml"),
+        &es_ir::serial::observation_from_toml(&read("observation-augmented.toml"))
+            .expect("observation-augmented.toml"),
+        &learning,
+        &es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml"),
+        &weights,
+    )
+    .expect("the augmented documents pack into a bundle");
+    let path = dir.join("untrained-augmented.esb");
+    std::fs::write(&path, &bytes).expect("write the bundle");
+    path
+}
+
+/// Oracle 5 of packet M7/T6. The augmented document trains: the bake writes the boundary, the
+/// trainer applies the chain, the loss is finite, and two runs at one `augmentation_seed`
+/// give **byte-identical** loss curves while two seeds do not.
+///
+/// That pair is the whole claim of a counter-based RNG. A `torch.Generator` would pass the
+/// first half and fail to be reproducible anywhere else; what makes this meaningful is that
+/// the values are also the ones `augmentation_matches_the_golden` pins without an interpreter.
+#[test]
+#[ignore = "needs torch, torchvision and pyarrow"]
+fn augmented_training_runs() {
+    let python = match python_with_torch() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP augmented_training_runs: {why}");
+            return;
+        }
+    };
+    let dir = scratch_dir("augmented-train");
+    let bundle = augmented_bundle(&dir);
+    let opened = PolicyBundle::open(&std::fs::read(&bundle).expect("read")).expect("open");
+    let chains = es_compile::plan::augmentation_chains(&opened.observation).expect("one chain");
+    assert_eq!(chains.len(), 1, "{chains:?}");
+    let chain = &chains["rgb_overhead"];
+    assert_eq!(chain.len(), 2, "the fixture declares a crop and a jitter");
+
+    // The file `es train` writes, written here by hand because `es-data` is layer 10 and this
+    // crate is layer 8 (spec 4.2). `crates/es/tests/cli.rs` is where the *real* writer's
+    // shape is pinned; what this needs is a file `python/es/augment.py` can read.
+    let json_chain: Vec<serde_json::Value> = chain
+        .iter()
+        .map(|step| match step.kind {
+            es_ir::observation::AugmentKind::RandomCrop { width, height } => serde_json::json!({
+                "node": step.node.0, "kind": "RandomCrop", "width": width, "height": height,
+            }),
+            es_ir::observation::AugmentKind::ColorJitter {
+                brightness,
+                contrast,
+                saturation,
+                hue,
+            } => serde_json::json!({
+                "node": step.node.0, "kind": "ColorJitter", "brightness": brightness,
+                "contrast": contrast, "saturation": saturation, "hue": hue,
+            }),
+            other => panic!("the fixture grew a {other:?}"),
+        })
+        .collect();
+    let augmentation = |seed: u64| -> serde_json::Value {
+        serde_json::json!({
+            "kind": "observation-ir",
+            "observation_hash":
+                es_policy::weights::hex(&opened.observation.observation_hash().expect("hash")),
+            "seed": seed,
+            "chains": {"rgb_overhead": json_chain.clone()},
+        })
+    };
+
+    // The bake at the boundary: the image port is the `104x104` canvas the `Pad` produced,
+    // and the module still declares `3x96x96` -- which is what the chain brings it back to.
+    let (dataset, tiles, baked) = (dir.join("ds"), dir.join("tiles"), dir.join("baked"));
+    run(
+        &python,
+        &[
+            "-c",
+            MINI_DATASET_PY,
+            &dataset.to_string_lossy(),
+            &tiles.to_string_lossy(),
+        ],
+    );
+    let bake = es(&[
+        "dataset",
+        "bake",
+        "--policy",
+        &bundle.to_string_lossy(),
+        "--out",
+        &baked.to_string_lossy(),
+        "--frames",
+        &tiles.to_string_lossy(),
+        "--scene",
+        &demo_scene().to_string_lossy(),
+        "--for-training",
+        &dataset.to_string_lossy(),
+    ]);
+    assert_eq!(bake.status.code(), Some(0), "{}", text(&bake));
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(baked.join("manifest.json")).expect("the manifest"),
+    )
+    .expect("the manifest is JSON");
+    assert_eq!(
+        manifest["tensors"]["rgb_overhead"]["shape"],
+        serde_json::json!([3, 104, 104]),
+        "the bake did not write the chain's input"
+    );
+    assert_eq!(
+        manifest["augmentation"]["rgb_overhead"][0]["kind"],
+        "RandomCrop"
+    );
+
+    let (build, contract) = lowered(&dir, &bundle);
+    assert_eq!(
+        contract.inputs["rgb_overhead"],
+        vec![3, 96, 96],
+        "the module's input is the network's, not the boundary's"
+    );
+
+    let train = |tag: &str, seed: u64| -> (Vec<u8>, serde_json::Value) {
+        let config = dir.join(format!("{tag}-augmentation.json"));
+        std::fs::write(&config, augmentation(seed).to_string()).expect("write the config");
+        let curve = dir.join(format!("{tag}.json"));
+        let out = dir.join(format!("{tag}.safetensors"));
+        let done = run(
+            &python,
+            &[
+                &train_act_py().to_string_lossy(),
+                "--module",
+                &build.to_string_lossy(),
+                "--baked",
+                &baked.to_string_lossy(),
+                "--out",
+                &out.to_string_lossy(),
+                "--batch",
+                "4",
+                "--seed",
+                "0",
+                "--checkpoint-at",
+                &ORACLE_STEPS.to_string(),
+                "--loss-curve",
+                &curve.to_string_lossy(),
+                "--augmentation",
+                &config.to_string_lossy(),
+            ],
+        );
+        let report: serde_json::Value = serde_json::from_str(
+            String::from_utf8_lossy(&done.stdout)
+                .lines()
+                .last()
+                .unwrap_or_default(),
+        )
+        .expect("the trainer's summary line is JSON");
+        (
+            std::fs::read(&curve).unwrap_or_else(|e| panic!("{}: {e}", curve.display())),
+            report,
+        )
+    };
+
+    let (first, report) = train("seed0-a", 0);
+    let (again, _) = train("seed0-b", 0);
+    let (other, _) = train("seed1", 1);
+    assert_eq!(
+        first, again,
+        "two runs at one augmentation_seed gave different loss curves; the draws are not \
+         addressed by (seed, sample, step, node)"
+    );
+    assert_ne!(
+        first, other,
+        "two augmentation seeds gave one loss curve; nothing was augmented"
+    );
+    let losses: Vec<f64> = serde_json::from_slice(&first).expect("the curve is JSON");
+    assert_eq!(losses.len(), ORACLE_STEPS, "{report}");
+    assert!(losses.iter().all(|v| v.is_finite()), "{losses:?}");
+    assert_eq!(report["augmentation"]["rgb_overhead"][0], "RandomCrop");
+    assert_eq!(report["augmentation_seed"], 0);
+    println!(
+        "RAN augmented_training_runs: {} steps, loss {} -> {}, two seeds two curves",
+        losses.len(),
+        report["initial_loss"],
+        report["final_loss"]
+    );
+}

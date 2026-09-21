@@ -119,6 +119,18 @@ never touches the network. The file is `es train`'s `[policy] base_model`, whose
 checked against its lock file and against the repository's pin before this script saw it; its
 provenance is spec 19.3's `training/base_model.lock`, not anything here.
 
+**The augmentation** (packet M7/T6). `--augmentation <training/augmentation.json>` names the
+Observation IR's `training_only` chain per port and the seed to key it with; `python/es/
+augment.py` applies it, per sample and per optimizer step, to the tensor `es dataset bake
+--for-training` left at the chain's boundary. Nothing here decides *what* to apply: the
+document does, the bake wrote the tensor for it, and the evaluation path disables the whole
+chain structurally (INV-15), which is why a policy trained this way is still evaluated on the
+pixels the un-augmented document produces. The draws come from a counter-based mixer keyed
+`(seed, sample_index, step, node_index, draw)` -- never `torch.Generator`, whose stream is a
+torch-version detail -- so the loss curve of two runs at one seed is bit-identical and the
+Rust oracle can re-derive every value. Without the flag nothing is applied and the loop is
+the loop of before.
+
 `frozen` never appears on this command line. It is a field of the Learning IR, so the lowered
 module carries it as `requires_grad_(False)` and the optimizer is built over
 `[p for p in model.parameters() if p.requires_grad]`. A flag would be a second copy of an IR
@@ -145,6 +157,12 @@ import sys
 from pathlib import Path
 
 import torch
+
+# The sibling module, by path: this script is run as a file (`python python/es/train_act.py`),
+# not as part of the `es` package, and importing the package would pull in `es_native` --
+# a maturin build a trainer has no reason to need (packet M7/T6).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import augment as es_augment  # noqa: E402
 
 try:  # only `lr_curve_hash` needs it, and this script's contract is "no package beyond torch"
     import blake3
@@ -417,6 +435,14 @@ def main(argv: list) -> int:
         "also caps the run",
     )
     p.add_argument("--loss-curve", type=Path, help="write the per-step loss as JSON")
+    p.add_argument(
+        "--augmentation",
+        type=Path,
+        help="spec 19.3's training/augmentation.json: the Observation IR's `training_only` "
+        "chain per port, and the seed its counter RNG is keyed with. `es train` passes it "
+        "for a bundle whose document declares one, and `es dataset bake --for-training` is "
+        "what wrote the tensors it expects",
+    )
     a = p.parse_args(argv)
 
     torch.manual_seed(a.seed)
@@ -457,6 +483,20 @@ def main(argv: list) -> int:
                 % (len(weights), item)
             )
         weights[int(index)] = float(value)
+
+    # The chain the Observation IR declared and the bake left at the boundary (packet M7/T6).
+    # A port that is not in it is read exactly as before; a document that declares none makes
+    # this `{}` and the loop below is the loop of before, bit for bit.
+    chains, augmentation_seed = (
+        es_augment.read_chains(a.augmentation) if a.augmentation else ({}, 0)
+    )
+    unknown = sorted(set(chains) - set(shapes))
+    if unknown:
+        raise SystemExit(
+            "--augmentation names %s, and the module's inputs are %s. The chain and the "
+            "module come from one bundle; re-run `es policy lower` and `es dataset bake "
+            "--for-training` against the same one." % (unknown, sorted(shapes))
+        )
 
     manifest, episodes = read_baked(a.baked, shapes)
     if a.resident_gpu:
@@ -510,19 +550,28 @@ def main(argv: list) -> int:
         optimizer.zero_grad(set_to_none=True)
         # The same `a.batch` samples the accumulation loop would have visited, in the same
         # order, drawn from the same generator -- and now stacked into one forward (M7/T3).
-        picked = []
+        picked, picked_at = [], []
         for _ in range(a.batch):
             if cursor >= len(order):
                 order = torch.randperm(len(samples), generator=generator).tolist()
                 cursor = 0
             picked.append(samples[order[cursor]])
+            # The *global* sample index, which is the augmentation RNG's `sample_index`
+            # coordinate: the same sample at the same step always draws the same value, and
+            # the batch it happened to land in is not part of that (packet M7/T6).
+            picked_at.append(order[cursor])
             cursor += 1
-        inputs = {
-            port: torch.stack([episodes[i][port][t] for i, t, _ in picked])
-            .to(device)
-            .reshape([len(picked)] + shape)
-            for port, shape in shapes.items()
-        }
+        inputs = {}
+        for port, shape in shapes.items():
+            batch = torch.stack([episodes[i][port][t] for i, t, _ in picked]).to(device)
+            if port in chains:
+                # The bake wrote this port at the chain's input, so it is bigger than the
+                # contract's shape until the chain has run; the reshape below is what checks
+                # that the chain brought it back to what the module declares.
+                batch = es_augment.apply_chain(
+                    chains[port], batch, picked_at, step, augmentation_seed
+                )
+            inputs[port] = batch.reshape([len(picked)] + shape)
         target = torch.stack([episodes[i]["action"][rows] for i, _, rows in picked]).to(device)
         with amp:
             predicted = next(iter(forward(**inputs).values()))
@@ -578,6 +627,13 @@ def main(argv: list) -> int:
         "grad_clip": a.grad_clip,
         "lr_curve_hash": lr_curve_hash(applied_lr),
         "chunk": chunk,
+        # What was applied to which port, and the seed it was keyed with (packet M7/T6).
+        # `es train` declares the same chain in `training/augmentation.json` *before* the run;
+        # this is the trainer's own account of having applied it.
+        "augmentation": {
+            port: [node["kind"] for node in chain] for port, chain in chains.items()
+        },
+        "augmentation_seed": augmentation_seed if chains else None,
         # What the run started from and what it was allowed to move (packet M7/T5). The
         # provenance of the file itself is `es train`'s `training/base_model.lock`; this is
         # the trainer's own account of what it did with it.

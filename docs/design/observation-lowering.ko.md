@@ -68,9 +68,12 @@ CHW f32는 PyTorch가, 따라서 LeRobot이 정책에 공급하는 형태이며,
 | `Concat{axis}` | `concat` | §8 |
 | `Stack{axis}` | `stack` | §8 |
 | `TemporalWindowNode` | `history_push` + `window_gather` | §9 |
-| `Augment{training_only}` | — | identity pass-through, §9.1 |
-| 출력 elem ≠ `F32` | `cast_f32_to_f16` / `_bf16` | `half`, round-to-nearest-even |
-| `Pad`, `Undistort`, `Rectify`, `Warp`, `CameraProjection`, `ToGray`, `ChannelSelect`, `QuantizeU8`, `FrameStack`, `Delta`, `Mask`, `MultiViewPack`, `LanguageInput`, `Augment`(`training_only`이 아닌 것) | — | `COMPILE-002`, 이후 웨이브 |
+| `Augment{training_only}` | — 또는 `crop` | identity pass-through; 더 큰 입력 위의 `RandomCrop`은 중앙 크롭, §3.1 |
+| `Pad{l,t,r,b}` | — (`exec.rs`에 인라인) | replicate, CPU 전용, §3.1 |
+| 출력 elem ≠ `F32` | `pad` | **거부** — `COMPILE-006`. 커널 id가 없고(§3.1), 조용히 패딩하지 않는 GPU 플랜은 이 표가 주장하려는 비트 동일성을 깨뜨린다 | `crates/es-compile/tests/observation_gpu.rs::pad_is_refused_by_name_on_the_gpu_path`, 장치 불필요 |
+| `crop`(`training_only` `RandomCrop`에서 온 것) | 기존 `crop` 디스패치를 그대로 미러링: 사각형은 CPU 플랜이 컴파일 시점에 결정했다 | `crop` 행이 덮는다 |
+| `cast_f32_to_f16` / `_bf16` | `half`, round-to-nearest-even |
+| `Undistort`, `Rectify`, `Warp`, `CameraProjection`, `ToGray`, `ChannelSelect`, `QuantizeU8`, `FrameStack`, `Delta`, `Mask`, `MultiViewPack`, `LanguageInput`, `Augment`(`training_only`이 아닌 것) | — | `COMPILE-002`, 이후 웨이브 |
 
 ### `Augment`와 INV-15 (spec 7.3, spec 10.4)
 
@@ -89,6 +92,61 @@ identity인 경우가 *바로* "평가가 augmentation을 비활성화한다"가
 `observation_hash`가 저자가 결코 선언한 적 없는 그래프를 기술하게 될 것이다.
 따라서 `es-eval`은 더 이상 `training_only` 노드를 거부할 필요가 없다 — 계획이 이미
 그것을 비활성화했다 — 그리고 여전히 allow-list 밖의 다른 `Augment` 노드는 거부한다.
+
+### 3.1 Release 플랜 위의 `training_only`, 그리고 bake 경계 (패킷 M7/T6)
+
+위의 identity는 여전히 규칙이다; 패킷 M7/T6은 세부 규칙 하나, 노드 하나, 경계 하나를 더했고
+이 경로에서 그 밖에는 아무것도 움직이지 않았다. 그 전까지 커밋된 어떤 Observation IR에도
+`Augment` 노드가 없었으므로(유일한 grep 히트인 `tests/fixtures/quadruped/task.toml`은
+**Task** IR이다 — 확인했다) 골든도 움직이지 않았다.
+
+**세부 규칙.** 입력이 `w x h`보다 큰 `training_only` `Augment { RandomCrop { w, h } }`는
+결정론적 **중앙** 크롭으로 lowering된다: `((W - w) / 2, (H - h) / 2, w, h)`를 가진
+`Op::Crop` — `CropMode::Center`가 해석하는 바로 그 사각형, 같은 op, 그리고 같은
+`ImageSpec::cropped` intrinsics 변환(INV-14). 입력이 이미 `w x h`인 `RandomCrop`은 늘
+그랬던 대로 identity다. 무작위성은 이 경로에 없다: 오프셋은 중앙이고, 오직 트레이너만
+하나를 뽑는다.
+
+**`Pad`.** 이유 하나 때문에 replicate(에지 클램프)로 lowering된다: `Pad(p) -> RandomCrop`은
+DrQ의 random shift이고, 패딩된 캔버스가 트레이너가 오프셋을 뽑는 대상 텐서다. 대칭
+패딩에서 평가 경로의 합성 `Pad(p)` 다음 중앙 크롭은 **입력 이미지 그 자체, 비트 단위로**
+같다 —
+`crates/es-compile/tests/observation_cpu.rs::a_training_only_random_crop_is_a_centre_crop_in_release`
+가 패딩 없는 플랜의 바이트에 대고 바로 그것을 주장한다.
+
+이 노드에는 **커널 id가 없다**. `KERNEL_IDS`는 `compiler_hash` 이동을 *동반한* append-only이다
+— 해시가 그 표를 시퀀스로 덮으므로, 하나를 덧붙이면 저장소의 모든 플랜의 해시가, 따라서 T6이
+움직여서는 안 되는 커밋된 학습·평가 실행의 해시가 움직인다. 그래서 pad는
+`crates/es-compile/src/exec.rs`에서 인라인으로 실행되는 플랜 수준 op이고, **GPU lowering은
+그것을 이름으로 거부한다**(`COMPILE-006`, §11). 거기서 조용한 identity는 거부보다 나쁘다:
+CPU 플랜은 패딩하고 GPU 플랜은 하지 않게 되는데, 두 경로는 비트 단위로 같기 위해 존재한다.
+`Pad`에 Slang 커널을 주는 이후 패킷이 id를 덧붙이고 그 해시 이동을 의도적으로 감수한다.
+
+**경계.** `es_compile::plan::augmentation_chains(ir)`는 선언된 출력마다 그 출력에서 끝나는
+샘플별 노드의 연속 체인을 돌려준다. `es dataset bake --for-training`은 그런 포트를 각각 그
+체인에 *들어가는* 텐서에서 쓰고(`ObservationBake::for_training`) 체인을 `manifest.json`에
+기록한다; `python/es/augment.py`가 그것을 적용한다. 체인 위에 오는 노드 종류는 둘이다:
+
+| 노드 | 체인 위에서의 종류 | 이유 |
+|---|---|---|
+| `Augment { training_only: true }` | 자기 자신의 종류 | spec 7.3의 가족 |
+| `Crop { mode: CropMode::Random { w, h } }` | `RandomCrop { w, h }` | IR이 샘플별 오프셋을 표기하는 또 하나의 방식이며, IR이 기하를 전파해 주는 유일한 쪽 |
+
+두 번째는 패킷으로부터의 이탈이고, 강제된 것이다. `es-ir`의 `image_out`은 `Augment` 포트에서
+*들어오는* `ImageSpec`을 그대로 유지하므로, `Pad(4) -> Augment{RandomCrop 96x96}` 문서는
+출력에서 `96x96`을 광고하는데 전파는 `104x104`라고 말하고, `es_ir::cross`의 `TYPE-020`이
+번들이 만들어지기 전에 거부한다. `CropMode::Random`은 — IR 자신의 말로 "샘플별 오프셋이며
+명목 기하는 중앙의 것" — `ImageSpec::cropped`를 통해 전파되고 검증을 통과한다. `es-ir`은 이
+패킷이 건드릴 대상이 아니므로(패킷이 금지한다) 데모 문서는 `Crop{Random}`을 쓰고,
+`Augment{RandomCrop}` lowering은 그 옆에 구현되고 테스트된다. **M7 리뷰를 위한 열린 질문:**
+`image_out`이 `Augment { RandomCrop }`에도 `Crop { Random }`처럼 크롭된 기하를 주어야 하는가?
+그렇게 되기 전까지 두 표기는 번들 안에서 서로 교환 가능하지 않다.
+
+이름으로 거부되는 것, `COMPILE-007`: 그런 체인 위에 있지 *않은* `training_only` 노드(모든
+경로에서 identity가 되어, 저자가 선언한 증강이 조용히 일어나지 않게 된다), 그리고 둘 이상의
+노드가 읽는 체인 구성원(증강된 텐서는 트레이너 안에만 존재한다). 체인 위에 있지 않은
+`Crop { Random }`은 M1 이래의 동작 — 어디서나 중앙 크롭 — 을 그대로 유지하며, 그것이 기존의
+모든 플랜과 골든이 고정하고 있는 것이다.
 
 ### 모든 커널이 따르는 결정성 규칙 (spec 3.4)
 

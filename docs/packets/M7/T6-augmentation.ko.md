@@ -75,6 +75,7 @@ IR에는 증강 노드가 있지만 모든 경로가 그것들을 *무시한다*
 python/es/train_act.py
 python/es/augment.py
 crates/es-compile/src/plan.rs
+crates/es-compile/src/exec.rs
 crates/es-compile/src/gpu/**
 crates/es-compile/src/lib.rs
 crates/es-compile/tests/**
@@ -101,6 +102,11 @@ docs/packets/M7/T6-augmentation.ko.md
 (`augmentation_seed`, 두 슬롯), `es/src/cmd/train.rs`(번들의 Observation IR을 읽고,
 `augmentation.json`을 쓰고, 플래그를 전달한다), `es/src/cmd/dataset.rs`(bake 플래그), 테스트,
 픽스처, 골든, 두 설계 노트, 이 패킷.
+
+`crates/es-compile/src/exec.rs`는 구현 시점(2026-09-21)에 글롭에 추가되었다: `Op::Pad`는
+`CpuPlan::run`의 match가 있는 곳에서 실행되어야 하고, 대안이었던 `kernels.rs` 항목은
+`KERNEL_IDS`에 추가하는 일이라 저장소의 *모든* 플랜의 `compiler_hash`를, 따라서 이 패킷이
+움직여서는 안 되는 커밋된 해시들을 움직인다.
 
 ## 오라클
 

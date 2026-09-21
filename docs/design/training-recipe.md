@@ -877,3 +877,241 @@ the tree, so it is the *floor* the U-measurement improves on, not a verdict on t
 Kept under `~/artifacts/plan-v/m7-t2/`: `loop.jsonl`, `training.lock`, `report-policy.json`,
 `report-expert-gate.json`, `cycle.log`, `cycle.toml`, `training.toml`, `run.sh`, and the whole
 `run/` tree (27 GB: frames, trajectories and the three checkpoint bundles).
+
+## 13. The augmentation (packet M7/T6)
+
+Spec 7.3 has had an `Augment` node family since M1, and until this packet **every path ignored
+it**: the bake runs the Release plan, where a `training_only` node is an identity;
+`train_act.py` never saw the Observation IR; `augmentation.json` said `{"kind": "none"}` for
+every run that ever ran. This section is the boundary that makes the declared subgraph
+actually happen — in training only, from one seed, recorded as identity — while the evaluation
+path keeps producing the bytes it produced yesterday.
+
+### 13.1 The boundary, in one picture
+
+```
+ImageInput -> Dequantize -> Normalize -> Pad(4) -|- Crop{Random 96x96} -> Augment{ColorJitter} -> rgb_overhead
+                                                 |
+                                         the chain boundary
+```
+
+Everything left of the boundary is the Observation IR as it has always been, run by
+`CpuPlan` — one implementation, the same one inference runs (packet M5/V2b). Everything right
+of it is *per-sample*, so it cannot be baked once:
+
+* `es dataset bake --for-training` writes the port at the boundary — `[frames, 3, 104, 104]`
+  for the demo, not `[frames, 3, 96, 96]` — and records the chain in `manifest.json`;
+* `es train` writes the same chain, plus its seed, into spec 19.3's
+  `training/augmentation.json`, and passes it to the trainer as `--augmentation`;
+* `python/es/augment.py` applies it per sample and per optimizer step;
+* **evaluation applies none of it** (INV-15). The Release plan lowers the pad and the crop to
+  `Pad(4)` then the *centre* crop, whose composition on a symmetric pad is the un-augmented
+  image bit for bit — `crates/es/tests/cli.rs::dataset_bake_for_training_writes_the_chain`
+  compares the two bakes as whole files.
+
+`docs/design/observation-lowering.md` section 3.1 is the compiler half: which nodes are on a
+chain, what the Release plan does with them, and why the GPU path refuses `Pad` by name.
+
+### 13.2 The document and the recipe
+
+The recipe gains one optional field:
+
+```toml
+[run]
+seed              = 0
+augmentation_seed = 7    # optional; absent is `seed`
+```
+
+It is separate because it is separable — re-drawing the augmentation of an otherwise identical
+run is a different run, and spec 19.3 gives it its own `seed.json` slot. Both slots are real
+only when the policy's Observation IR declares a chain:
+
+| slot | no chain | with a chain |
+|---|---|---|
+| `seed.json.augmentation` | `{"unset": true}` | the number |
+| `augmentation.json` | `{"kind": "none"}` | `{"kind": "observation-ir", "observation_hash", "seed", "chains"}` |
+| bake step | as before | `... --for-training <root>` |
+| trainer step | as before | `... --augmentation <out>/training/augmentation.json` |
+
+So a recipe written before this packet has the same nine pre-run slots, the same
+`identity_hash` and the same rendered plan — `tests/golden/train/plan-ir.txt` is unmoved, and
+`train_identity_moves_with_augmentation` asserts the unaugmented half explicitly.
+
+One deliberate hole: `--dry-run` on the IR route does not open the bundle (that is what lets a
+plan be printed on a machine that has neither bundle nor dataset, packet M7/T1 oracle 1), so a
+dry run of an augmented recipe prints the plan *without* the two flags. The real run opens the
+bundle first and `config.json` records the line that actually ran.
+
+### 13.3 The RNG: addressed, not stepped
+
+Every draw is a pure function of where it is used (spec 3.4 forbids a global RNG). The mixer is
+Murmur3's `fmix32` — the ten lines of integer arithmetic `crates/es-render/src/rng.rs` already
+uses for the path tracer — and the key is five coordinates:
+
+| coordinate | type | where it comes from | what it separates |
+|---|---|---|---|
+| `augmentation_seed` | `u64`, folded as two `u32` | `[run] augmentation_seed`, else `[run] seed` | two runs of one recipe |
+| `sample_index` | `u32` | the trainer's own global sample index (`order[cursor]`, not the position in the batch) | two samples in one batch |
+| `step` | `u32` | the optimizer step | the same sample seen twice |
+| `node_index` | `u32` | the Observation IR **node id** | two nodes, and two ports' chains |
+| `draw` | `u32` | `0, 1, …` within one node | the crop's x from its y |
+
+`key(seed, sample, step, node)` is five `mix32` rounds; `uniform(key, i)` is one more, keeping
+the top 24 bits so the value is exact in `f32` and never reaches 1.0. **`torch.Generator` is
+not used anywhere in the augmentation**, and that is the point: its stream is an implementation
+detail of a torch version, so a run reproduced on another torch would silently see different
+augmentation and `augmentation.json` would describe something that did not happen.
+
+Two implementations exist and they agree bitwise at `f32`:
+`crates/es-policy/tests/ir_training.rs` re-derives the whole chain in Rust with no interpreter
+and compares against `tests/golden/train/augment_seed0.json`, which was generated once from
+`python/es/augment.py` itself.
+
+**Why bitwise is a reasonable thing to ask for here.** Every scalar is computed in `f64` and
+rounded to `f32` *before* it touches a tensor, so each per-element operation is a single IEEE
+`f32` op with both operands exactly representable — a kernel that widens an intermediate and
+rounds once gives the same bits as one that does not. The two places that could have gone
+wrong were measured, not assumed (the same discipline section 10 applied to `cos`):
+
+* **Box-Muller's `ln` and `cos`**, evaluated by torch's vectorised `f64` kernels on one side
+  and Rust's `std` on the other. A last-bit disagreement in `f64` is ~2⁻⁵³ relative, far below
+  an `f32` ulp, so the cast collapses it — and the golden says it collapses for all 960 values.
+* **The contrast mean**, the one reduction in the file: `x.double().mean()` in torch against a
+  sequential `f64` sum in Rust. Same argument, same measurement. It is the one place where a
+  *much* larger image could in principle drift — the ceiling is that the two summation orders
+  differ by ~2⁻⁵³ relative, which needs the f32 rounding to land exactly on a tie to show — and
+  if it ever does, the fix is to define the mean as an ordered `f32` sum in both.
+
+### 13.4 The four kinds, and what each one is
+
+| kind | status | what the trainer does |
+|---|---|---|
+| `RandomCrop { width, height }` | **implemented** | uniform integer offset in `[0, W-w] × [0, H-h]`, two draws; the Release plan's centre crop is the same rectangle with the offset fixed |
+| `ColorJitter { brightness, contrast }` | **implemented** | `x * (1 + u·b)`, then `(x - mean) * (1 + u·c) + mean`, `u ∈ [-1, 1]`, two draws |
+| `ColorJitter { saturation, hue }` | **refused by name** | both need a colour model this file does not have (`hue` is an HSV rotation). A non-zero value stops the run with the node named; a silently ignored parameter would be worse |
+| `GaussianNoise { sigma }` | **implemented** | additive, Box-Muller over two uniforms **per element**, `f64`, cast to `f32` once |
+| `RandomErasing { probability }` | **refused by name** | not implemented by this packet |
+
+`GaussianNoise` is the expensive one: two draws per element means a `2 × C × H × W` index
+tensor per sample per step. The demo's chain does not use it, so the measured run below pays
+nothing for it; a document that does should expect the augmentation to become a visible
+fraction of the step.
+
+### 13.5 The document for the U-measurement
+
+`tests/fixtures/visible-learning/observation-augmented.toml` is the committed
+`observation.toml` plus three nodes on the image path, regenerated by
+`cargo test -p es --test cli -- --ignored generate_augmented_observation_fixture`:
+
+| document | `observation_hash` |
+|---|---|
+| `observation.toml` (committed) | `899c16a90033eeb406f328060bbd54ef0632f943a2059db7b3f7c369ee218d81` |
+| `observation-augmented.toml` | `cc437a2418c36ac003c68258cc017a3783d9b2d876029463e87a9d38d194fb3e` |
+
+The output port carries exactly the `PortType` the committed document's does — `3×96×96`,
+`Normalized{0,1}`, the same `ImageSpec` — so `learning.toml` is untouched and `learning_hash`
+does not move. **But `evaluation.toml` names `observation`**, so an Evaluation IR pointed at a
+policy trained on this document is a *different* `evaluation_hash` (spec 13.3): the
+U-measurement has to write the augmented hash into its evaluation document and accept the new
+identity deliberately (`es loop cycle` refuses a moved `evaluation_hash` without
+`--allow-new-evaluation`, section 12.3). Nothing about the *pixels* an evaluation sees changes
+— that is what 13.1 guarantees — but the document that names them does.
+
+### 13.6 Deviations from the packet
+
+1. **`Crop { CropMode::Random }` is on the chain, and the demo document uses it instead of
+   `Augment { RandomCrop }`.** Forced, and the finding is worth the review's time:
+   `es-ir`'s `image_out` keeps the incoming `ImageSpec` on an `Augment` port, so
+   `Pad(4) -> Augment{RandomCrop 96x96}` advertises `96×96` where propagation says `104×104`,
+   and `es_ir::cross`'s `TYPE-020` refuses the bundle before it can be built. `es-ir` is
+   forbidden ground for this packet. `CropMode::Random` — "a per-sample offset whose nominal
+   geometry is the centred one", in the IR's own words — propagates through
+   `ImageSpec::cropped` and validates, so it is what the fixture uses, and the
+   `Augment{RandomCrop}` lowering is implemented and tested beside it for the day a document
+   can carry it. **Open question for the M7 review:** should `image_out` give an
+   `Augment { RandomCrop }` the cropped geometry the way `Crop { Random }` gets it?
+2. **`crates/es-compile/src/exec.rs` was added to the packet's `## context` globs.** `Op::Pad`
+   has to be executed where `CpuPlan::run`'s match is; the alternative, a `kernels.rs` entry,
+   appends to `KERNEL_IDS` and moves `compiler_hash` for every plan in the repository — a
+   golden move this packet forbids itself. The consequence is that `Pad` has no kernel id and
+   the GPU path refuses it by name (observation-lowering.md 3.1).
+3. **Oracle 3 is two tests, not one.** `es-eval` owns the bake and `es` owns the manifest —
+   `es-eval` is layer 10 and writes no files — so
+   `es-eval::bake_for_training_writes_the_boundary` asserts the boundary shapes and the
+   byte-identical evaluation frame, and `es::dataset_bake_for_training_writes_the_chain`
+   asserts `manifest.json` and compares the two bakes as whole safetensors files.
+4. **The trainer's `augmentation.json` writer lives in `es-data` and its reader in
+   `augment.py`.** `crates/es-policy/tests/ir_training.rs` writes its own copy of the file
+   (layer 8 cannot depend on layer 10), so the *shape* of the real one is pinned in
+   `crates/es/tests/cli.rs` instead. Both ends are asserted; they are just not asserted in one
+   place.
+
+### 13.7 The oracles
+
+| # | command | what it judges |
+|---|---|---|
+| 1 | `cargo test -p es-policy --test ir_training augmentation_matches_the_golden` | the Rust re-implementation equals `tests/golden/train/augment_seed0.json` bitwise at `f32`; with `ES_PYTHON`, `augment.py` equals it too |
+| 2 | `cargo test -p es-compile a_training_only_random_crop_is_a_centre_crop_in_release` | the padded, centre-cropped Release plan reproduces the un-augmented pixels, and the crop carries `Crop`'s intrinsics transform |
+| 3 | `cargo test -p es-eval bake_for_training_writes_the_boundary` / `cargo test -p es --test cli dataset_bake_for_training_writes_the_chain` | `104×104` at the boundary and the chain in the manifest; `96×96` and the un-augmented document's bytes without the flag |
+| 4 | `cargo test -p es --test cli train_identity_moves_with_augmentation` | both identity slots are real, both move, and the unaugmented recipe's are where they were |
+| 5 | `cargo test -p es-policy --test ir_training -- --ignored augmented_training_runs` | 40 steps on the augmented document; finite loss; two runs at one seed are byte-identical curves, two seeds are not |
+| 6 | `cargo xtask ci`, `cargo xtask check-scope docs/packets/M7/T6-augmentation.md` | goldens 0 changed, scope clean |
+
+The golden is generated by `generate_augment_golden`, which is `#[ignore]`d **and** refuses to
+run unless `ES_GENERATE_GOLDENS=1` is set — `cargo test -- --include-ignored` runs every
+ignored test in the workspace, and an M7 review found exactly that rewriting a golden nobody
+meant to touch.
+
+### 13.8 Measured — oracle server, RTX 4090, 2026-09-21
+
+The augmented document's 20,000-step run at section 10's row-D settings, through `es train`:
+batch 64, lr 4e-4, `warmup_cosine` warmup 250 `lr_min` 1e-6, seed 0, `--resident-gpu`,
+`device = "cuda"`, torch 2.11.0+cu129, on V15's 200 demonstrations
+(`~/artifacts/plan-v/v15/ds-train`, 36,960 samples). The GPU was idle before it (56 MiB, 0 %).
+One command; the bake is a step of it, and it is the `--for-training` bake.
+
+| step | wall-clock | what ran |
+|---|---|---|
+| `dataset bake --for-training` | **0:10** | 200 episodes, 36,960 frames, `rgb_overhead [3, 104, 104]`, 4.5 GB |
+| `policy lower` | < 1 s | `lowering_hash 3d06811c…`, T3's and T4's — the Learning IR did not move |
+| `train_act.py` | **4:21** (261 s) | 20,000 steps, 1,280,000 samples seen, resident copy 4,577.6 MiB |
+| `policy pack` | ~1 s | `checkpoints/20000.esb` |
+| **total** | **4:33** | |
+
+`identity_hash 2d8f6837…`, `training_hash 61e6c93a…`, checkpoint
+`policy_hash df985459…` (spec 19.3's `H(training_hash, checkpoint)`),
+`observation_hash cc437a24…`, `lr_curve_hash c01d5185…` — the same schedule as row D, which is
+what makes the two rows comparable. `initial_loss 0.049270`, **`final_loss 0.006664`**, no
+non-finite step. **Not evaluated here**: that is the U-measurement's, and it needs a new
+`evaluation_hash` (13.5).
+
+**Against row D, which is the same run without augmentation:**
+
+| | row D (section 10) | this run | |
+|---|---|---|---|
+| trainer wall-clock | 2:51 (171 s) | **4:21 (261 s)** | +53 % |
+| s / 1,000 steps | 8.6 | **13.0** | |
+| samples/s | 7,485 | **4,904** | |
+| `final_loss` | 0.004610 | **0.006664** | +45 % |
+| resident baked set | 3.9 GiB | **4.5 GiB** | `104²/96²` = 1.17× |
+
+Two numbers, and both are expected rather than disappointing.
+
+**The 90 seconds.** 4.5 ms per step, for a batch of 64 through a two-node chain — 64 Python
+slice-assignments for the crop and 64 × (a multiply, an `f64` mean and a fused affine) for the
+jitter. That is the cost of a per-sample Python loop, not of the arithmetic; the obvious
+lever, if it ever matters, is drawing the whole batch's offsets in one indexed gather rather
+than in a loop. It does not matter yet: 4:21 is well inside §28.9's budget and the evaluation
+step of a cycle is twenty minutes.
+
+**The higher loss is the point.** Augmentation makes the training distribution wider, so a fit
+on it *should* be worse at equal steps — the question augmentation exists to answer is what
+happens on the **evaluation** suites, where the un-augmented row D scored `final_loss 0.004610`
+and (in section 12.8, at batch 8) a `nominal success_rate` of 0. A lower training loss with a
+policy that never succeeds is exactly the disagreement §28.10's U-measurement is for, and this
+run is the arm of it that has seen more than one crop of each frame.
+
+Kept under `~/artifacts/plan-v/m7-t6/`: `untrained-augmented.esb` (the four committed
+documents with `observation-augmented.toml` in place of `observation.toml`), `training.toml`,
+`train.log`, and `run/` (4.5 GB baked set, `module/`, `metrics/loss.json`, `training/`'s twelve
+slots, `training.lock`, `weights/model-20000.safetensors`, `checkpoints/20000.esb`).

@@ -15,7 +15,8 @@ const HELP: &str = "\
 es dataset info <root>
 es dataset export --lerobot-v3 <root> --out <dir> [--frames <dir>] [--drop <a,b>]
                   [--state-dim <n>]
-es dataset bake --policy <bundle.esb> --out <dir> [--frames <dir>] [--scene <file.xml>] <root>
+es dataset bake --policy <bundle.esb> --out <dir> [--frames <dir>] [--scene <file.xml>]
+                [--for-training] <root>
 
 `info` opens a LeRobot dataset at <root>, and prints its features (as the spec 5.4 PortType
 they present at an Observation IR port), episode count, and the dataset identity's three
@@ -54,6 +55,12 @@ train_act.py --baked <dir>` is the consumer.
                 qpos part can be served back at inference (`es_eval`'s state capture reads
                 qpos; there is no qvel arm), so a policy trained on the whole row could
                 never be run.
+--for-training  For `bake`: write each port at the input of its `training_only` augmentation
+                chain rather than at the network's input, and record the chain in
+                manifest.json (spec 7.3, packet M7/T6). `es train` passes it for a bundle
+                whose Observation IR declares one, and `python/es/train_act.py
+                --augmentation` is what then applies it. For a document that declares no
+                augmentation the flag changes nothing.
 --scene <file>  For `bake`: the scene to load when a channel needs the model's `qpos`
                 ranges (a second JointState channel, packet M5/V7a) -- the same file
                 `es eval run --scene` and `es loop collect --scene` take. Without it the
@@ -160,6 +167,7 @@ pub(crate) fn bake(args: &[String]) -> Result<u8, CliError> {
         return Ok(0);
     }
     let (mut policy, mut out, mut frames, mut scene, mut root) = (None, None, None, None, None);
+    let mut for_training = false;
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
         let slot = match arg.as_str() {
@@ -167,6 +175,10 @@ pub(crate) fn bake(args: &[String]) -> Result<u8, CliError> {
             "--out" => &mut out,
             "--frames" => &mut frames,
             "--scene" => &mut scene,
+            "--for-training" => {
+                for_training = true;
+                continue;
+            }
             other if other.starts_with("--") => {
                 return Err(CliError::Usage(format!(
                     "es dataset bake: unexpected argument '{other}'\n\n{HELP}"
@@ -221,6 +233,16 @@ pub(crate) fn bake(args: &[String]) -> Result<u8, CliError> {
             ObservationBake::new(&bundle.observation, &bundle.task, Some(&model))
                 .map_err(|e| CliError::Runtime(e.to_string()))?
         }
+    };
+    // Packet M7/T6. With the flag, every port whose `training_only` chain is non-empty is
+    // written at the chain's *input* -- the tensor the trainer augments -- instead of at the
+    // network's input. Without it, and for a document that declares no augmentation, nothing
+    // moves and the bake is the bake of before, byte for byte.
+    let chains = if for_training {
+        plan.for_training(&bundle.observation)
+            .map_err(|e| CliError::Runtime(e.to_string()))?
+    } else {
+        BTreeMap::new()
     };
     // Every output is stacked into an F32 tensor, which is the one dtype `write_safetensors`
     // emits (spec 8.4's `runtime.dtype` on this path). A plan that ends in anything else is
@@ -306,7 +328,7 @@ pub(crate) fn bake(args: &[String]) -> Result<u8, CliError> {
     let identity =
         DatasetIdentity::compute(&dataset, &split).map_err(|e| CliError::Runtime(e.to_string()))?;
     let hashes = &bundle.manifest.hashes;
-    let manifest = serde_json::json!({
+    let mut manifest = serde_json::json!({
         "schema_version": 1,
         "observation_hash": hashes.observation.as_ref().map(hex),
         "task_hash": hashes.task.as_ref().map(hex),
@@ -319,6 +341,21 @@ pub(crate) fn bake(args: &[String]) -> Result<u8, CliError> {
             (name.clone(), serde_json::json!({ "dtype": "F32", "shape": shape }))
         }).collect::<serde_json::Map<_, _>>(),
     });
+    // Only when there is one, so a bake of a document that declares no augmentation writes
+    // the manifest it always wrote (packet M7/T6). What it says is what the shapes above
+    // already mean: this port was written at the chain's input, and here is the chain.
+    if !chains.is_empty() {
+        manifest["augmentation"] = chains
+            .iter()
+            .map(|(port, chain)| {
+                (
+                    port.clone(),
+                    es_data::training::augmentation_json(chain.as_slice()),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>()
+            .into();
+    }
     let path = out.join("manifest.json");
     let mut text =
         serde_json::to_string_pretty(&manifest).map_err(|e| CliError::Runtime(e.to_string()))?;

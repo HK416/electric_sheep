@@ -62,9 +62,10 @@ time, never a silent no-op.
 | `Concat{axis}` | `concat` | §8 |
 | `Stack{axis}` | `stack` | §8 |
 | `TemporalWindowNode` | `history_push` + `window_gather` | §9 |
-| `Augment{training_only}` | — | identity pass-through, §9.1 |
+| `Augment{training_only}` | — or `crop` | identity pass-through; a `RandomCrop` on a larger input is the centre crop, §3.1 |
+| `Pad{l,t,r,b}` | — (inline in `exec.rs`) | replicate, CPU only, §3.1 |
 | output elem ≠ `F32` | `cast_f32_to_f16` / `_bf16` | `half`, round-to-nearest-even |
-| `Pad`, `Undistort`, `Rectify`, `Warp`, `CameraProjection`, `ToGray`, `ChannelSelect`, `QuantizeU8`, `FrameStack`, `Delta`, `Mask`, `MultiViewPack`, `LanguageInput`, `Augment` (not `training_only`) | — | `COMPILE-002`, later waves |
+| `Undistort`, `Rectify`, `Warp`, `CameraProjection`, `ToGray`, `ChannelSelect`, `QuantizeU8`, `FrameStack`, `Delta`, `Mask`, `MultiViewPack`, `LanguageInput`, `Augment` (not `training_only`) | — | `COMPILE-002`, later waves |
 
 ### `Augment` and INV-15 (spec 7.3, spec 10.4)
 
@@ -83,6 +84,62 @@ auto-disable). The node is **not** removed from the graph: stripping it would ma
 `observation_hash` describe a graph the author never declared. `es-eval` therefore no longer
 has to refuse a `training_only` node — the plan has already disabled it — and still refuses
 any other `Augment` node outside its allow-list.
+
+### 3.1 `training_only` on the Release plan, and the bake boundary (packet M7/T6)
+
+The identity above is still the rule; packet M7/T6 added one refinement, one node and one
+boundary, and nothing else on this path moved. No committed Observation IR had an `Augment`
+node before it (the one grep hit, `tests/fixtures/quadruped/task.toml`, is a **Task** IR —
+verified), so no golden moved either.
+
+**The refinement.** A `training_only` `Augment { RandomCrop { w, h } }` whose input is larger
+than `w x h` lowers to the deterministic **centre** crop: `Op::Crop` with
+`((W - w) / 2, (H - h) / 2, w, h)` — the same rectangle `CropMode::Center` resolves to, the
+same op, and the same `ImageSpec::cropped` intrinsics transform (INV-14). A `RandomCrop` whose
+input already is `w x h` is the identity it always was. Randomness is not on this path: the
+offset is the centre, and only the trainer draws one.
+
+**`Pad`.** Lowered, replicate (edge-clamp), for one reason: `Pad(p) -> RandomCrop` is DrQ's
+random shift, and the padded canvas is the tensor the trainer draws an offset in. With a
+symmetric pad the evaluation composition `Pad(p)` then centre crop is the **input image, bit
+for bit** — `crates/es-compile/tests/observation_cpu.rs::a_training_only_random_crop_is_a_centre_crop_in_release`
+asserts exactly that against the un-padded plan's bytes.
+
+It has **no kernel id**. `KERNEL_IDS` is append-only *with* a `compiler_hash` move — the hash
+covers the table as a sequence, so appending moves the hash of every plan in the repository,
+including the committed training and evaluation runs T6 may not move. The pad is therefore a
+plan-level op executed inline in `crates/es-compile/src/exec.rs`, and **the GPU lowering
+refuses it by name** (`COMPILE-006`) rather than mirroring it (§11). A silent identity there
+would be worse than a refusal: the CPU plan would pad and the GPU plan would not, and the two
+exist to be bit-equal. A later packet that gives `Pad` a Slang kernel appends the id and takes
+the hash move deliberately.
+
+**The boundary.** `es_compile::plan::augmentation_chains(ir)` returns, per declared output,
+the contiguous chain of per-sample nodes ending at it. `es dataset bake --for-training` writes
+each such port at the tensor *entering* its chain (`ObservationBake::for_training`) and records
+the chain in `manifest.json`; `python/es/augment.py` applies it. Two node kinds are on a chain:
+
+| node | on the chain as | why |
+|---|---|---|
+| `Augment { training_only: true }` | its own kind | spec 7.3's family |
+| `Crop { mode: CropMode::Random { w, h } }` | `RandomCrop { w, h }` | the IR's other spelling of a per-sample offset, and the only one it propagates geometry for |
+
+The second is a deviation from the packet, and it is forced. `es-ir`'s `image_out` keeps the
+*incoming* `ImageSpec` on an `Augment` port, so a `Pad(4) -> Augment{RandomCrop 96x96}`
+document advertises `96x96` at its output while propagation says `104x104`, and
+`es_ir::cross`'s `TYPE-020` refuses the bundle before it can be built. `CropMode::Random` — "a
+per-sample offset whose nominal geometry is the centred one", in the IR's own words —
+propagates through `ImageSpec::cropped` and validates. `es-ir` is not this packet's to change
+(the packet forbids it), so the demo document uses `Crop{Random}` and the `Augment{RandomCrop}`
+lowering is implemented and tested beside it. **Open question for the M7 review:** should
+`image_out` give an `Augment { RandomCrop }` the cropped geometry, the way `Crop { Random }`
+gets it? Until it does, the two spellings are not interchangeable in a bundle.
+
+Refused by name, `COMPILE-007`: a `training_only` node that is *not* on such a chain (it would
+be an identity on every path, so the augmentation the author declared would silently never
+happen), and a chain member read by more than one node (the augmented tensor exists only
+inside the trainer). A `Crop { Random }` that is not on a chain keeps the behaviour it has had
+since M1 — the centre crop, everywhere — which is what every existing plan and golden pins.
 
 ### Determinism rules every kernel obeys (spec 3.4)
 
@@ -294,6 +351,8 @@ one, two to different sizes do not.
 | `normalize_mean_std` / `normalize_range` | element-wise; mean/std ride in the same `aux` buffer as the LUT, `lo`/`hi` are f32 **bit patterns** in the defines so a decimal round-trip cannot round twice. Not fused with its producer, for the reason `crop` is not | bit-equal to `normalize_imagenet_4x3` |
 | `concat` / `stack` | one dispatch per input, copying that input's `outer x chunk` elements into its fixed slot. Not elided into the producers: that is fusion. The Slang entries are `concat_copy` / `stack_copy` - `concat` and `stack` are taken by the Slang core module - while the kernel ids stay `concat.v1` / `stack.v1` | bit-equal to the CPU kernel |
 | `history_push` / `window_gather` | the rings live in device memory and survive across `run`s; `cursor`/`pushed` ride in a small `state` buffer uploaded per run, because a pipeline's defines are compile-time and a cursor is not. `window_gather` is an index remap | bit-equal to `history_window_n2_s1`; `GpuPlan::reset` equals `CpuPlan::reset` |
+| `pad` | **refused** — `COMPILE-006`. It has no kernel id (§3.1), and a GPU plan that silently did not pad would break the bit equality this table exists to claim | `crates/es-compile/tests/observation_gpu.rs::pad_is_refused_by_name_on_the_gpu_path`, no device needed |
+| `crop` (from a `training_only` `RandomCrop`) | the existing `crop` dispatch, mirrored with no change: the CPU plan resolved the rectangle at compile time | covered by the `crop` row |
 | `cast_f32_to_f16` / `_bf16` | element-wise, the `half` crate's round-to-nearest-even mirrored in integer ops. The narrowed **bits** go to a `uint` region, not an f16 buffer: the device is not opened with 16-bit storage, and the arena keeps the f32 so spec 11.5's per-node view survives | bit-equal to the CPU kernel |
 
 Five bindings serve every kernel - `arena` (f32 intermediates + f32 inputs), `words` (u8
