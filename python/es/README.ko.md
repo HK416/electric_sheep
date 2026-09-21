@@ -30,6 +30,45 @@ maturin develop --release --features python   # from this directory, once, to bu
 PYTHONPATH=python <venv>/Scripts/python.exe -m es.selfcheck
 ```
 
+## `es_native.Rollout` — Python에서 런타임을 스텝하기 (M8 S4a)
+
+확장이 나르는 두 번째 것이며 위 빌더와는 무관하다: rollout 바인딩. 트레이너
+(`train_ppo.py`, S4b)가 자기만의 시뮬레이터가 아니라 **우리** `Env`와 **우리**
+Safety Plane을 스텝하게 한다 (`docs/design/rl-continuation.md` 규칙 2). 샘플된 모든
+액션은 액추에이터에 닿기 전에 `SafetyPlane::validate`를 통과하며, 이를 우회하는 경로는
+없다 (`INV-12`).
+
+```python
+from es import es_native
+
+roll = es_native.Rollout(task_toml, observation_toml, deployment_toml, scene_xml, seed=7, n_envs=2)
+roll.model()                      # nq, nv, nu, n_envs, actuator/joint 이름, ctrlrange
+obs = roll.observe()              # {port: [n_envs * dim]} — Observation IR의 출력 포트
+executed, events, rewards, dones = roll.act(actions)   # actions: [n_envs * nu], 액추에이터 단위
+roll.reset([0])                   # env 하나; None이면 전체
+roll.tick(), roll.metrics()       # 제어 틱; spec 12.4의 아홉 필드, 미측정은 None
+```
+
+네 문서는 경로가 아니라 **텍스트**로 전달된다. 경계는 양방향으로 리스트를 나른다 —
+Rust 크레이트에 numpy는 없고, 변환은 트레이너 쪽에서 한다. `events`는 env별
+`EventSet::bits()`이므로, 실행된 액션이 샘플된 액션과 얼마나 자주 달라지는지 트레이너가
+측정할 수 있다. 설계 노트의 메서드 표는 `docs/design/python-builder.md`의
+"The rollout binding"에 있다.
+
+MuJoCo 참조 백엔드를 별도 프로세스로 실행하므로, 그 프로세스의 인터프리터에는 `mujoco`
+패키지가 필요하다 — `ES_PYTHON`이 이를 지정한다(이 인터프리터일 필요는 없다). 오라클 쌍:
+
+```
+ES_PYTHON=<venv>/bin/python cargo test -p es-py rollout_matches_es_eval_loop -- --ignored
+PYTHONPATH=python ES_PYTHON=<venv>/bin/python <venv>/bin/python -m es.selfcheck --env
+```
+
+둘 다 같은 스크립트된 제어 100 제어 스텝을 구동해
+`tests/golden/rollout/so101_100steps.json`과 비교한다 — 첫 번째는 추가로,
+`es_eval::runner::run_episode`가 하는 순서대로 손으로 쓴 `Env` + `CpuPlan` +
+`SafetyPlane` 루프와도 비교한다. `--env`는 `RAN ...` 또는 `SKIP <reason>`을 출력하며,
+확장이 빌드되지 않았거나 인터프리터에 `mujoco`가 없으면 실패가 아니라 스킵한다.
+
 ## `encode_video.py`
 
 위 빌더와는 무관하다: `encode_video.py`는 `es video mosaic`가 만든 raw 프레임 출력을

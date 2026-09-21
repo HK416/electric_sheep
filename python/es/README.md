@@ -27,6 +27,46 @@ maturin develop --release --features python   # from this directory, once, to bu
 PYTHONPATH=python <venv>/Scripts/python.exe -m es.selfcheck
 ```
 
+## `es_native.Rollout` — stepping the runtime from Python (M8 S4a)
+
+The second thing the extension carries, unrelated to the builders above: a rollout binding, so
+a trainer (`train_ppo.py`, S4b) steps **our** `Env` and **our** Safety Plane instead of a
+simulator of its own (`docs/design/rl-continuation.md` rule 2). Every sampled action goes
+through `SafetyPlane::validate` before it reaches an actuator; there is no path around it
+(`INV-12`).
+
+```python
+from es import es_native
+
+roll = es_native.Rollout(task_toml, observation_toml, deployment_toml, scene_xml, seed=7, n_envs=2)
+roll.model()                      # nq, nv, nu, n_envs, actuator/joint names, ctrlrange
+obs = roll.observe()              # {port: [n_envs * dim]} — the Observation IR's output ports
+executed, events, rewards, dones = roll.act(actions)   # actions: [n_envs * nu], actuator units
+roll.reset([0])                   # one env; None resets all
+roll.tick(), roll.metrics()       # control ticks; the nine spec 12.4 fields, None where unmeasured
+```
+
+The four documents are passed as **text**, not paths. Lists cross the boundary in both
+directions — no numpy in the Rust crate; the trainer converts on its side. `events` is
+`EventSet::bits()` per env, so a trainer can measure how often the executed action differs from
+the one it sampled. The design note's method table is in `docs/design/python-builder.md`
+("The rollout binding").
+
+It runs the MuJoCo reference backend out of process, so the interpreter it spawns needs the
+`mujoco` package — `ES_PYTHON` names it (any interpreter, not necessarily this one). The oracle
+pair:
+
+```
+ES_PYTHON=<venv>/bin/python cargo test -p es-py rollout_matches_es_eval_loop -- --ignored
+PYTHONPATH=python ES_PYTHON=<venv>/bin/python <venv>/bin/python -m es.selfcheck --env
+```
+
+Both drive the same 100 control steps of the same scripted control and compare against
+`tests/golden/rollout/so101_100steps.json` — the first also against a hand-rolled
+`Env` + `CpuPlan` + `SafetyPlane` loop written the way `es_eval::runner::run_episode` runs it.
+`--env` prints `RAN ...` or `SKIP <reason>`; it skips rather than fails when the extension was
+never built or the interpreter has no `mujoco`.
+
 ## `encode_video.py`
 
 Unrelated to the builder above: `encode_video.py` is a standalone script (M5 V4, design note

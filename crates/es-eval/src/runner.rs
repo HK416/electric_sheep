@@ -248,7 +248,11 @@ impl FrameSink {
 
 /// One cell's frame directory: the raw `.bin` sequence plus the `layout.json` that pins their
 /// shape, written as the frames are captured.
-struct CellFrames {
+///
+/// `pub` only because it is an argument of the now-public [`capture`] (packet M8/S4a); it is
+/// still built here and nowhere else, and a caller outside this crate can only pass `None`.
+#[derive(Debug)]
+pub struct CellFrames {
     dir: PathBuf,
     n: u64,
 }
@@ -1083,14 +1087,14 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
 ///
 /// Returns the descriptors and the owned bytes separately so the caller can build the
 /// borrowed `TensorRef`s over them, plus the index of the frame this step wrote, if any.
-type Captured = (Vec<(String, ElemType, Vec<u64>)>, Vec<Vec<u8>>, Option<u64>);
+pub type Captured = (Vec<(String, ElemType, Vec<u64>)>, Vec<Vec<u8>>, Option<u64>);
 
 /// Where one plan input's values come from (§7.4, §10.1).
 ///
 /// Resolved once, against the *documents* rather than guessed per step: an input is an image
 /// because the Observation IR says `ImageInput`, not because nothing else matched it.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum Capture {
+pub enum Capture {
     /// One joint's `qpos` range in the loaded model.
     Qpos(es_physics_core::backend::IndexRange),
     Sensor(es_physics_core::backend::IndexRange),
@@ -1109,7 +1113,7 @@ pub(crate) enum Capture {
 /// `model` is `None` when the frames are *recorded* rather than simulated (`crate::bake`): a
 /// dataset carries `observation.state` and tiles, so the two arms that index a loaded model
 /// have no reading there and the input is refused by name instead of guessed at.
-pub(crate) fn input_sources(
+pub fn input_sources(
     plan: &CpuPlan,
     obs: &ObservationIr,
     task: &TaskIr,
@@ -1181,7 +1185,7 @@ pub(crate) fn input_sources(
     Ok(out)
 }
 
-fn capture(
+pub fn capture(
     plan: &CpuPlan,
     sources: &BTreeMap<String, Capture>,
     model: &ModelInfo,
@@ -1299,7 +1303,7 @@ pub(crate) fn elem_bytes(e: ElemType) -> usize {
 
 /// The first `NJ` joint positions and velocities of env 0. Nothing is padded: `run_episode`
 /// refused the run unless the model carries at least `NJ` of each.
-fn joint_state<const NJ: usize>(state: &StateView<'_>) -> ([f64; NJ], [f64; NJ]) {
+pub fn joint_state<const NJ: usize>(state: &StateView<'_>) -> ([f64; NJ], [f64; NJ]) {
     let (mut q, mut qd) = ([0.0; NJ], [0.0; NJ]);
     q.copy_from_slice(&state.qpos_of(0)[..NJ]);
     qd.copy_from_slice(&state.qvel_of(0)[..NJ]);
