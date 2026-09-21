@@ -384,7 +384,7 @@ and the paint order is what breaks ties at equal depth — so the image is still
 of (trajectory, tick, camera, w, h). It also keeps `tests/golden/editor/replay_tick0_order.json`
 (2,754 indices at tick 0) meaningful, and `cargo xtask verify-goldens` treats deleting a golden
 as a violation, so retiring it would have cost more than the sort does (a stable sort of 2,754
-`f32` keys against a 3.7 ms frame).
+`f32` keys against a 5 ms frame).
 
 **The panel shows a texture, not a mesh.** `app.rs` uploads the raster as an `egui::ColorImage`
 once per tick or camera change — keyed on `(tick, Camera)`, which covers a resize because the
@@ -408,8 +408,9 @@ is the fixture at tick 0 from the showcase camera at 320 × 180, `Rgb8`, written
 first, so a drifted camera constant fails as itself and not as an unexplained pixel diff.
 
 **Measured** (this box, `replay_raster_is_fast_enough`, the demo scene's 2,754 triangles at
-960 × 540, median of 20): **3.7 ms release**, 67 ms debug. The target was 16 ms; the debug number
-is not it, and playback at 50 Hz was verified by hand on a debug build anyway.
+960 × 540, median of 20): **≈ 5 ms release** (4.8–5.0 ms over three runs, 3.8 ms best), ≈ 70 ms
+debug. The target was 16 ms; the debug number is not it, and playback at 50 Hz was verified by
+hand on a debug build anyway.
 
 ### `look_at` is repeated, not reused
 
@@ -447,7 +448,7 @@ the orchestrator opens) is the same bytes at a different arm.
 - **Anti-aliasing, shadows, textures, picking.** The depth buffer is one sample per pixel of
   the flat colour, and nothing else about the `Rs` look came with it.
 - **A GPU path in the editor.** E2's decision stands: the editor links no Vulkan. The CPU
-  raster is 3.7 ms at the largest frame it will draw, which is what makes that easy to keep.
+  raster is ≈ 5 ms at the largest frame it will draw, which is what makes that easy to keep.
 - **The run's own control rate.** The panel plays at 50 Hz, the demo deployment's
   `rate.control`; a run directory carries no Deployment IR to read it from, and the wrong rate
   only changes how fast the arm appears to move. A `--rate` would be a field on the panel the
