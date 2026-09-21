@@ -879,3 +879,92 @@ fn showcase_pt_flags_are_parsed() {
          --tonemap reinhard|aces"
     );
 }
+
+// --- es video showcase --accumulate (packet M7/R4) --------------------------------------------
+
+/// Oracle 7: `--accumulate` and `--max-history` parse, `--accumulate` without `--path pt` is a
+/// usage error rather than a silently ignored flag, and `--max-history 0` is rejected before it
+/// can divide anything.
+///
+/// Parsing only: a real render needs a Vulkan device and a run directory.
+#[test]
+fn showcase_accumulate_flags_are_parsed() {
+    let out = scratch_dir("showcase-accumulate");
+    let base = |extra: &[&str]| {
+        let mut cmd = bin();
+        cmd.args(["video", "showcase"])
+            .args(["--run", out.join("no-such-run").to_str().unwrap()])
+            .args(["--scene", "tests/fixtures/mjcf/so101_pick_place.xml"])
+            .args(["--out", out.join("frames").to_str().unwrap()])
+            .args(["--eye", "0.66,-0.46,0.52"])
+            .args(["--look-at", "0.14,-0.04,0.04"])
+            .args(extra);
+        cmd.current_dir(workspace_root())
+            .output()
+            .expect("run es video showcase")
+    };
+
+    let help = bin()
+        .args(["video", "showcase", "--help"])
+        .output()
+        .expect("run --help");
+    if stderr(&help).contains("needs the `render` feature") {
+        println!("SKIP showcase_accumulate_flags_are_parsed: built without the `render` feature");
+        return;
+    }
+    assert!(
+        stdout(&help).contains("--accumulate") && stdout(&help).contains("--max-history"),
+        "the help text does not document the accumulation flags:\n{}",
+        stdout(&help)
+    );
+
+    for (args, expected) in [
+        (vec!["--accumulate"], "--accumulate is a `pt` flag"),
+        (
+            vec!["--path", "pt", "--accumulate", "--max-history", "0"],
+            "--max-history must be greater than zero",
+        ),
+    ] {
+        let got = base(&args);
+        assert_eq!(got.status.code(), Some(2), "{args:?} must be usage");
+        assert!(
+            stderr(&got).contains(expected),
+            "{args:?}: {}",
+            stderr(&got)
+        );
+    }
+
+    // Accepted: parsing gets past both flags and the command fails later, on the run
+    // directory that is not there or on the missing Vulkan device.
+    for args in [
+        vec!["--path", "pt", "--accumulate"],
+        vec!["--path", "pt", "--accumulate", "--max-history", "32"],
+        vec![
+            "--path",
+            "pt",
+            "--spp",
+            "4",
+            "--accumulate",
+            "--max-history",
+            "8",
+            "--exposure",
+            "32",
+        ],
+    ] {
+        let got = base(&args);
+        assert_eq!(
+            got.status.code(),
+            Some(1),
+            "{args:?} should parse and then fail on the missing run: {}",
+            stderr(&got)
+        );
+        assert!(
+            !stderr(&got).contains("--accumulate") && !stderr(&got).contains("--max-history"),
+            "{args:?} was rejected: {}",
+            stderr(&got)
+        );
+    }
+    println!(
+        "RAN showcase_accumulate_flags_are_parsed: --accumulate, --max-history, and two rejections"
+    );
+}
