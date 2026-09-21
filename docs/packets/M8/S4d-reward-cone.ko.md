@@ -60,6 +60,7 @@ S4b의 보고서(2026-09-21)가 찾아냈다: 보상 `−‖cube_pos − gripper
 ```
 crates/es-ir-types/src/expr.rs
 crates/es-ir-types/tests/**
+crates/es-ir/src/control.rs
 crates/es-env/src/plan.rs
 crates/es-env/src/env.rs
 crates/es-env/tests/**

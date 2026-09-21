@@ -60,6 +60,7 @@ lowering byte-identical to today's?**
 ```
 crates/es-ir-types/src/expr.rs
 crates/es-ir-types/tests/**
+crates/es-ir/src/control.rs
 crates/es-env/src/plan.rs
 crates/es-env/src/env.rs
 crates/es-env/tests/**
