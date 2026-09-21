@@ -9,8 +9,12 @@
 //! sample is not on the determinism path, and the ring is for the *producer* side.
 
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 
-use es_telemetry::protocol::{Message, Payload, PerfMetrics, StreamId};
+use es_telemetry::protocol::{HelloAck, Message, Payload, PerfMetrics, StreamId, PROTOCOL_VERSION};
+use es_telemetry::transport::{Client, TransportError};
+
+use crate::model::live_run::{LiveRun, RUN_STREAMS};
 
 /// Where messages come from. `None` means "nothing right now", not "closed" — the app polls
 /// once a frame.
@@ -45,6 +49,9 @@ pub struct TelemetryModel {
     pub received: u64,
     /// `execution_hash` of the observed run (spec 5.3), once the server states it.
     pub execution_hash: Option<[u8; 32]>,
+    /// The Run tab's view of the same stream (packet M7/E4): an `es eval run --telemetry`
+    /// folded back into the `CellRow`s and `Timeline`s a finished run has.
+    pub live: LiveRun,
 }
 
 impl Default for TelemetryModel {
@@ -62,6 +69,7 @@ impl TelemetryModel {
             events: Vec::new(),
             received: 0,
             execution_hash: None,
+            live: LiveRun::default(),
         }
     }
 
@@ -83,6 +91,7 @@ impl TelemetryModel {
 
     pub fn ingest(&mut self, msg: &Message) {
         self.received += 1;
+        self.live.ingest(msg);
         let frame = match msg {
             Message::HelloAck(ack) => {
                 self.execution_hash = ack.execution_hash;
@@ -153,10 +162,45 @@ impl TelemetryModel {
 }
 
 /// A [`Source`] over a fixed message list — the canned stream the tests feed, and what
-/// `es-editor` runs on until `es_telemetry::transport` lands.
+/// `es-editor` shows until something is attached.
 pub fn replay(messages: Vec<Message>) -> Source {
     let mut it = messages.into_iter();
     Box::new(move || it.next())
+}
+
+/// Attaches to a running producer — `es eval run --telemetry <addr>` — and becomes a
+/// [`Source`] (spec 23.1: the editor is a client of a running process, it hosts nothing).
+///
+/// `addr` is `host:port` and an empty `token` is no token, which is the local-development
+/// shape spec 25.1 describes. Parsing lives here rather than in `app.rs` so that the field's
+/// errors are the model's, with a test (spec 28.10 rule 3).
+///
+/// The handshake's own `HelloAck` is handed back as the first message, so
+/// [`TelemetryModel::execution_hash`] is filled from the run's identity (spec 5.3) exactly as
+/// it is from a replayed stream. After that the closure is one non-blocking `try_recv` per
+/// call: `None` means "nothing right now", which is also what a closed connection looks like
+/// — the editor keeps what it has rather than clearing the tab.
+pub fn attach(addr: &str, token: &str) -> Result<Source, String> {
+    let socket: SocketAddr = addr
+        .trim()
+        .parse()
+        .map_err(|e| format!("{addr:?} is not a host:port address: {e}"))?;
+    let token = (!token.trim().is_empty()).then(|| token.trim().to_owned());
+    let mut client = Client::connect(socket, token, "es-editor").map_err(|e| match e {
+        TransportError::Rejected { reason } => format!("{addr} refused the connection: {reason}"),
+        other => format!("{addr}: {other}"),
+    })?;
+    client
+        .subscribe(RUN_STREAMS.to_vec())
+        .map_err(|e| format!("{addr}: subscribing: {e}"))?;
+    let mut ack = Some(Message::HelloAck(HelloAck {
+        version: PROTOCOL_VERSION,
+        session_id: client.session_id,
+        execution_hash: client.execution_hash,
+    }));
+    Ok(Box::new(move || {
+        ack.take().or_else(|| client.try_recv().ok())
+    }))
 }
 
 #[cfg(test)]
@@ -263,6 +307,47 @@ mod tests {
             index: 0,
         }];
         assert_eq!(*s, vec![(7, 7.0), (8, 8.0), (9, 9.0)]);
+    }
+
+    #[test]
+    fn attach_refuses_what_is_not_an_address_before_opening_a_socket() {
+        let Err(e) = attach("not-an-address", "") else {
+            panic!("no socket is opened for something that is not an address");
+        };
+        assert!(e.contains("host:port"), "{e}");
+    }
+
+    /// A real loopback round trip: the handshake's identity arrives as the first message, so
+    /// the tab shows the run's `execution_hash` without a second code path (spec 5.3).
+    #[test]
+    fn attach_speaks_to_a_server_and_hands_back_the_handshake() {
+        let addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("addr");
+        let server =
+            es_telemetry::transport::Server::bind(addr, Some("s3cret".to_owned())).expect("bind");
+        let bound = server.local_addr().to_string();
+
+        let Err(e) = attach(&bound, "wrong") else {
+            panic!("a bad token is refused (spec 25.1)");
+        };
+        assert!(e.contains("refused the connection"), "{e}");
+
+        let mut source = attach(&bound, "s3cret").expect("the right token connects");
+        let mut model = TelemetryModel::default();
+        assert_eq!(model.pump(&mut source, 8), 1, "the HelloAck");
+        assert_eq!(model.execution_hash, None, "the run states none");
+
+        // The subscription is the four run streams, so a published frame comes back.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while model.series.is_empty() && std::time::Instant::now() < deadline {
+            server.publish(es_telemetry::protocol::Frame {
+                tick: PhysTick(3),
+                wall_ns: 0,
+                stream: StreamId(2),
+                payload: Payload::Scalars(vec![0.0, 3.0, 0.0, 0.0]),
+            });
+            model.pump(&mut source, 8);
+        }
+        assert!(!model.series.is_empty(), "no frame arrived on stream 2");
     }
 
     #[test]
