@@ -8822,3 +8822,204 @@ fn generate_augmented_observation_fixture() {
         hex(&obs.observation_hash().expect("augmented hash")),
     );
 }
+
+/// `write_demo_bundle` with `observation-augmented.toml` in place of `observation.toml`.
+fn write_augmented_bundle(dir: &Path) -> PathBuf {
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let mut learning =
+        es_ir::serial::learning_from_toml(&read("learning.toml")).expect("learning.toml");
+    let weights = b"es-t6-augmented-placeholder".to_vec();
+    learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let bytes = es_compile::PolicyBundle::build(
+        &es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml"),
+        &es_ir::serial::observation_from_toml(&read("observation-augmented.toml"))
+            .expect("observation-augmented.toml"),
+        &learning,
+        &es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml"),
+        &weights,
+    )
+    .expect("the augmented demo documents pack into a bundle");
+    let path = dir.join("augmented.esb");
+    std::fs::write(&path, bytes).expect("write augmented.esb");
+    path
+}
+
+/// Oracle 4 of packet M7/T6. A bundle whose Observation IR declares a `training_only` chain
+/// writes a real `augmentation.json` and a real `seed.json.augmentation`, and both reach
+/// `identity_hash`; the un-augmented bundle writes the `{"kind": "none"}` it always wrote, so
+/// every measured run's identity is where it was.
+///
+/// Like the other `es train` tests here the recipe names an interpreter that cannot exist:
+/// every assertion is about the identity written *before* the run, which needs no Python.
+#[test]
+fn train_identity_moves_with_augmentation() {
+    let dir = scratch_dir("train-augment");
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 2, 12);
+    let plain_bundle = write_demo_bundle(&dir);
+    let bundle = write_augmented_bundle(&dir);
+
+    let go = |name: &str, body: &str| -> (serde_json::Value, PathBuf) {
+        let recipe = dir.join(format!("{name}.toml"));
+        write(&recipe, body);
+        let out = dir.join(name);
+        run_train(&train_toml_path(&recipe), &out, &[]);
+        (train_lock(&out), out)
+    };
+    let base = train_fixture_recipe(&bundle, &root, &tiles, 0, "1e-4");
+    let (augmented, augmented_out) = go("augmented", &base);
+    let (reseeded, _) = go(
+        "reseeded",
+        &base.replace("seed = 0", "seed = 0\naugmentation_seed = 7"),
+    );
+    let (plain, plain_out) = go(
+        "plain",
+        &train_fixture_recipe(&plain_bundle, &root, &tiles, 0, "1e-4"),
+    );
+
+    let slot = |out: &Path, name: &str| -> serde_json::Value {
+        let path = out.join("training").join(name);
+        serde_json::from_str(
+            &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+        )
+        .expect("a training slot is JSON")
+    };
+    let chain = slot(&augmented_out, "augmentation.json");
+    assert_eq!(chain["kind"], "observation-ir", "{chain}");
+    assert_eq!(chain["seed"], 0, "{chain}");
+    let nodes = chain["chains"]["rgb_overhead"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{chain}"));
+    assert_eq!(nodes.len(), 2, "{chain}");
+    assert_eq!(nodes[0]["kind"], "RandomCrop");
+    assert_eq!(nodes[0]["width"], 96);
+    assert_eq!(nodes[1]["kind"], "ColorJitter");
+    assert_eq!(nodes[1]["brightness"], 0.2);
+    // The node id is the RNG's `node_index` coordinate, so it is part of the file.
+    assert!(nodes.iter().all(|n| n["node"].is_number()), "{chain}");
+    assert_eq!(slot(&augmented_out, "seed.json")["augmentation"], 0);
+
+    // ...and the plan the run recorded is the one that carries the two flags.
+    let plan = slot(&augmented_out, "config.json")["plan"].to_string();
+    assert!(plan.contains("--for-training"), "{plan}");
+    assert!(
+        plan.contains("--augmentation training/augmentation.json"),
+        "{plan}"
+    );
+
+    // The un-augmented bundle is the run of before, slot for slot.
+    assert_eq!(
+        slot(&plain_out, "augmentation.json"),
+        serde_json::json!({"kind": "none"})
+    );
+    assert_eq!(
+        slot(&plain_out, "seed.json"),
+        serde_json::json!({"global": 0, "dataloader": 0, "augmentation": {"unset": true}})
+    );
+    let plain_plan = slot(&plain_out, "config.json")["plan"].to_string();
+    assert!(!plain_plan.contains("--for-training"), "{plain_plan}");
+    assert!(!plain_plan.contains("--augmentation"), "{plain_plan}");
+
+    assert_ne!(
+        augmented["identity_hash"], plain["identity_hash"],
+        "the augmented document did not move identity_hash"
+    );
+    assert_ne!(
+        augmented["identity_hash"], reseeded["identity_hash"],
+        "augmentation_seed did not move identity_hash"
+    );
+    assert_ne!(
+        augmented["files"]["augmentation.json"], plain["files"]["augmentation.json"],
+        "one augmentation.json digest for two documents"
+    );
+}
+
+/// Oracle 3 of packet M7/T6, the half that needs the real command: `--for-training` writes
+/// the image port at `104x104` and the chain into `manifest.json`, and the same bake without
+/// the flag writes the `96x96` the un-augmented document writes.
+///
+/// The shapes are the claim. `augmentation.json` tells the trainer what to apply; this is the
+/// tensor it applies it *to*, and if the two disagreed the reshape in `train_act.py` would be
+/// the only thing standing between a silent mis-crop and a training run.
+#[test]
+fn dataset_bake_for_training_writes_the_chain() {
+    if skip_without_bake_model("dataset_bake_for_training_writes_the_chain") {
+        return;
+    }
+    let dir = scratch_dir("bake-for-training");
+    let bundle = write_augmented_bundle(&dir);
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 1, 3);
+    let scene = demo_scene_path();
+
+    let bake = |out: &Path, flag: &[&str]| -> serde_json::Value {
+        let result = bin()
+            .args(["dataset", "bake", "--policy", bundle.to_str().unwrap()])
+            .args(["--out", out.to_str().unwrap()])
+            .args(["--frames", tiles.to_str().unwrap()])
+            .args(["--scene", scene.to_str().unwrap()])
+            .args(flag)
+            .arg(root.to_str().unwrap())
+            .output()
+            .expect("run es dataset bake");
+        assert_eq!(
+            result.status.code(),
+            Some(0),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        serde_json::from_str(
+            &std::fs::read_to_string(out.join("manifest.json")).expect("manifest.json"),
+        )
+        .expect("manifest.json parses")
+    };
+
+    let training = bake(&dir.join("training"), &["--for-training"]);
+    assert_eq!(
+        training["tensors"]["rgb_overhead"]["shape"],
+        serde_json::json!([3, 104, 104]),
+        "{training}"
+    );
+    assert_eq!(
+        training["augmentation"]["rgb_overhead"][0]["kind"], "RandomCrop",
+        "{training}"
+    );
+    assert_eq!(
+        training["augmentation"]["rgb_overhead"][1]["kind"], "ColorJitter",
+        "{training}"
+    );
+
+    let evaluation = bake(&dir.join("evaluation"), &[]);
+    assert_eq!(
+        evaluation["tensors"]["rgb_overhead"]["shape"],
+        serde_json::json!([3, 96, 96]),
+        "{evaluation}"
+    );
+    assert!(
+        evaluation.get("augmentation").is_none(),
+        "a bake without the flag recorded a chain: {evaluation}"
+    );
+    // ...and those are the bytes the un-augmented document bakes: `Pad(4)` then the centre
+    // crop is the image that went in (INV-14, INV-15).
+    let plain = write_demo_bundle(&dir);
+    let unaugmented = dir.join("unaugmented");
+    let result = bin()
+        .args(["dataset", "bake", "--policy", plain.to_str().unwrap()])
+        .args(["--out", unaugmented.to_str().unwrap()])
+        .args(["--frames", tiles.to_str().unwrap()])
+        .args(["--scene", scene.to_str().unwrap()])
+        .arg(root.to_str().unwrap())
+        .output()
+        .expect("run es dataset bake");
+    assert_eq!(result.status.code(), Some(0));
+    let episode = "episode_000000.safetensors";
+    assert_eq!(
+        std::fs::read(dir.join("evaluation").join(episode)).expect("the augmented bake"),
+        std::fs::read(unaugmented.join(episode)).expect("the un-augmented bake"),
+        "the augmented document's evaluation bake is not the un-augmented document's"
+    );
+}
