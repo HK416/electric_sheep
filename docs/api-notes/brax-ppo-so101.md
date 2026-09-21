@@ -138,10 +138,11 @@ by construction — the file cannot drift from the scene our runtime loads.
 | E3 | 5 rows, non-gripper links vs `cube` | elbow/wrist/camera-mount bumping the cube | the cube cannot be knocked by the arm's body |
 | E4 | 2 rows, `gripper` and `moving_jaw_so101_v1` vs `cube` | **the jaws touching the cube** | the cube is a target pose, not an object: it never moves, and the gripper passes through it |
 
-E4 is the one to read twice. It is what makes the run possible at all (§3, the NaN), and it is
-the largest behavioural gap: a policy trained here has never felt the cube. When S4c replays it
-in our runtime on the committed scene, contact with the cube is new, and the cube being pushed
-away is expected, not a bug.
+E4 is the one to read twice. It is what makes the run possible at all (§3, the NaN), and a
+policy trained here has never felt the cube. When S4c replays it in our runtime on the committed
+scene, contact with the cube is new, and the cube being pushed away is expected, not a bug.
+§5.5 measures what all four cost the trained policy — the answer is "everything", and that is
+the honest starting point plan S's continuation is meant to repair.
 
 **Measured cost of the edits, on CPU, where it can be isolated:** stepping the *edited* model
 and the *committed* model on MuJoCo CPU from the same state with the same 200 random control
@@ -244,7 +245,31 @@ TF32, and that path differs from a true float32 matmul by **1.515e-03**
 An importer comparing against TF32-computed actions cannot pass 1e-5 no matter how correct it
 is.
 
-### 5.5 Paths and hashes
+### 5.5 The sim-to-sim gap of §3.2, measured on the policy itself
+
+The same `source.npz`, the same 64 evaluation episodes, three scenes — this is the number S4c
+will otherwise discover the hard way:
+
+| scene the policy is evaluated in | contacts | `success_reached` | final distance, mean |
+|---|---|---|---|
+| derived (E1–E4 excluded) — what it trained in | 24 | **1.00** | 8.4 mm |
+| derived but with the arm-vs-`world` rows restored (E2 back) | 552 | **0.00** | 71.7 mm |
+| the committed scene, nothing excluded | 1,054 | **0.00** | 173.9 mm |
+
+Neither run diverged (no NaN; the returns are ordinary), so this is behaviour, not numerics:
+**the trained policy reaches the cube by passing through the table and through itself.** Put
+the contacts back and the arm is stopped 7 cm short with the table alone, 17 cm short with
+everything. Roughly half the error is E2 (table and bin) and the rest is E1/E3/E4.
+
+That is the honest state of the source policy: it is a valid, reproducible, exactly-importable
+function that solves its own environment, and it is *not* a policy that works in ours. For plan
+S that is arguably the right starting point — repairing it is exactly what "RL continuation in
+our simulator" is for, and the before/after row in S4c's table now has a real "before". It does
+mean S2b should not expect the imported policy to score on the committed scene, and S4b should
+expect the first continuation iterations to be a re-learning, not a fine-tune.
+(`~/artifacts/plan-s/s2c/seed0-run1-committed-scene/eval.json`, `…-keep-world/eval.json`.)
+
+### 5.6 Paths and hashes
 
 | what | where (server `renderer-14`) |
 |---|---|
