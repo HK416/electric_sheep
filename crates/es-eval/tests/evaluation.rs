@@ -2573,3 +2573,92 @@ fn a_merge_missing_a_cell_is_refused() {
         "a zero-count partition is not a partition"
     );
 }
+
+/// Packet M7/T8 oracle 3 — **the `(cell, episode)` partition does not reproduce the
+/// sequential run, and this is the state that stops it.**
+///
+/// `Env::seek_episode` makes an env's episode `k` reachable without replaying `0..k`
+/// (`cargo test -p es-env --test seek`), so the question the packet asked was whether a shard
+/// could be one episode rather than one whole suite. Measured on the committed demo documents
+/// by running the pre-T8 and the T8 build of `es eval run` over the nominal suite (oracle
+/// server, 2026-09-21, `docs/design/evaluation-execution.md` section 2.7): no. The artifacts
+/// moved, in two independent places, and this test pins both so that a change to either is
+/// loud rather than silent.
+///
+/// It is a tripwire and not a gate: when `begin_episode` starts clearing the window, or when
+/// `StepEvent::tick` becomes episode-relative, the matching assertion here fails and sends the
+/// reader back to section 2.7 — where the partition is written down as a small change on top
+/// of what shipped.
+#[test]
+#[ignore = "oracle tier: the M7/T8 parity finding, pinned"]
+fn episode_shards_reproduce_the_sequential_run() {
+    // (1) The plane's spec 9.4 `ViolationRate` ring survives `begin_episode`, so episode `k`
+    //     is judged partly on episode `k-1`'s steps. A per-episode plane starts empty, which
+    //     reads 0.0 until the window fills -- 227 fewer `violation.rate` events over the
+    //     demo's four nominal episodes, and the trajectory parts company at tick 24.
+    const WINDOW: u32 = 8;
+    let mut deploy = deployment_ir();
+    deploy.watchdogs = WatchdogSet(vec![
+        Watchdog::ChunkUnderrun,
+        Watchdog::EnvelopeViolationRate {
+            window: WINDOW,
+            max_frac: 0.5,
+        },
+    ]);
+    let mut plane = es_safety::SafetyPlane::<NJ, H>::from_ir(&deploy).expect("the plane builds");
+    // Every step past the soft position limit, so every step is dirty and the ring fills.
+    let far = [100.0; NJ];
+    let chunk = es_safety::ActionChunk::new([far; H], H, ExecutionMode::RecedingHorizon);
+    for tick in 0..u64::from(WINDOW) {
+        plane.observe_state(&[0.0; NJ], &[0.0; NJ]);
+        plane.heartbeat(PhysTick(tick));
+        plane.validate(&chunk.with_seq(tick + 1), Micros(0), PhysTick(tick));
+    }
+    let filled = plane.counters().envelope_violation_rate();
+    assert!(
+        filled > 0.5,
+        "the fixture never filled the window: {filled}"
+    );
+    plane.begin_episode();
+    let after = plane.counters().envelope_violation_rate();
+    assert_eq!(
+        filled.to_bits(),
+        after.to_bits(),
+        "begin_episode now clears the ViolationRate window -- re-read \
+         docs/design/evaluation-execution.md section 2.7: the partition may be shippable"
+    );
+
+    // (2) `StepEvent::tick` is the *env's* cumulative physics clock, not the episode's, so a
+    //     per-episode env writes a different `events.json` whatever the plane does.
+    let (ir, obs) = image_ir();
+    let dir = scratch("t8-tick");
+    let mut sink = FrameSink::new(&dir);
+    run_deploy(
+        &ir,
+        &obs,
+        0.2,
+        &deployment_ir(),
+        Some(&mut state_frames()),
+        Some(&mut sink),
+    )
+    .expect("the one-suite image fixture runs");
+    let second = sink
+        .events
+        .get("nominal-01")
+        .expect("the fixture runs more than one episode");
+    assert!(
+        second[0].tick.0 > 0,
+        "StepEvent::tick is episode-relative now ({:?}) -- re-read \
+         docs/design/evaluation-execution.md section 2.7",
+        second[0].tick
+    );
+
+    println!(
+        "RAN episode_shards_reproduce_the_sequential_run: not identical. Measured on the demo \
+         documents -- first difference at nominal-01/tick 0 (events.json tick 7200 against 0) \
+         and nominal-01/tick 24 (.estraj; violation.rate 2318 against 2091). Pinned here: the \
+         window survives begin_episode ({filled}), and this fixture's nominal-01 opens at env \
+         tick {}. The partition stays cell-level.",
+        second[0].tick.0
+    );
+}

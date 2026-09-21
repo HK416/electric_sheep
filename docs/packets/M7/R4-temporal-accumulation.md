@@ -61,6 +61,8 @@ crates/es-render/tests/render.rs
 tests/golden/render/cornell_pt_accum8_rgb8.*
 crates/es/src/cmd/showcase.rs
 crates/es/tests/video.rs
+crates/es-sensor/src/channel.rs
+crates/es-env/src/render.rs
 docs/design/renderer.md
 docs/design/renderer.ko.md
 docs/packets/M7/R4-temporal-accumulation.md
@@ -73,6 +75,13 @@ dispatch order), `atlas.rs` **only** if the `u32` channel needs a slot, `slang/{
 (`accumulate.slang` new: validity + sum + moments), `tests/render.rs`, the new golden (8 frames × 1 spp,
 NEE on, Reinhard — the CPU generator's bytes), `showcase.rs`/`video.rs` (the flags), the design
 note, this packet.
+
+**Two files the packet did not foresee, added at implementation time.** `Channel` is
+`es-sensor`'s (layer 3), not `es-render`'s — `es-render` re-exports it — so `Channel::History`
+is four match arms in `crates/es-sensor/src/channel.rs`, and one exhaustive `match` over
+`Channel` in `crates/es-env/src/render.rs` (`channel_format`) needs one arm to keep compiling.
+Neither is a PT knob in `EnvRendererCfg` and neither is reachable from the observation path;
+the `forbidden` list stands.
 
 ## oracle
 

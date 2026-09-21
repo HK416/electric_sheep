@@ -1,0 +1,6 @@
+train
+--recipe
+tests/fixtures/visible-learning/training.toml
+--out
+eval-out
+--dry-run

@@ -1,0 +1,15 @@
+{
+  "dtype": "u8",
+  "generator": "cargo test -p es-render -- --ignored generate_goldens",
+  "kernel": "pt.v2 (4 spp, 3 bounces, NEE, Reinhard, exposure 1)",
+  "layout": "row-major, little-endian, tightly packed",
+  "name": "cornell_pt_nee_rgb8",
+  "oracle": "es_render::cpu, the pure-Rust mirror of the Slang kernels",
+  "pins": "OpenCV camera frame and top-left image origin (spec 3.1); depth in metres, unit_m = 1",
+  "shape": [
+    64,
+    64,
+    3
+  ],
+  "spec": "docs/design/renderer.md"
+}

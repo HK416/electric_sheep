@@ -21,7 +21,7 @@ use std::time::Instant;
 use es_env::render::{camera_view, look_at};
 use es_env::traj::Trajectory;
 use es_env::EnvRendererCfg;
-use es_render::{Channel, RenderPath, Renderer, SceneCache, Shading};
+use es_render::{Channel, RenderPath, Renderer, SceneCache, Shading, Temporal, Tonemap};
 
 use crate::error::CliError;
 
@@ -30,6 +30,9 @@ es video showcase --run <dir> --scene <file.xml|urdf> --out <dir>
                   (--eye X,Y,Z --look-at X,Y,Z [--fov 45] | --camera NAME)
                   [--width 1280] [--height 720] [--cell NAME]... [--stride N]
                   [--look lambert|full]
+                  [--path rs|pt] [--spp N] [--bounces B]
+                  [--exposure E] [--tonemap reinhard|aces]
+                  [--accumulate [--max-history N]]
 
 Re-renders a finished `es eval run` or `es loop collect` from the per-episode `.estraj` state
 trajectories it wrote, through a camera that is not in the scene and not in any IR -- so the
@@ -52,6 +55,20 @@ Nothing is resampled and no observation is involved: the showcase camera has its
                     `full` adds shadows, a sky, highlights and 2x supersampling (M7/R2).
                     It is a look for people, not for observations: the frames a policy
                     reads are rendered by the observation path, which has no such flag
+    --path rs|pt    `rs` (default) is the rasterizer `--look` shades. `pt` is the path
+                    tracer (M7/R3): global illumination, next-event estimation on, ReSTIR
+                    and SVGF off, tone-mapped to Rgb8. Minutes per frame, not milliseconds
+    --spp N         samples per pixel on the `pt` path (default 64)
+    --bounces B     bounces per sample on the `pt` path (default 3)
+    --exposure E    linear multiplier before the tone map (default 1.0)
+    --tonemap NAME  `reinhard` (default) or `aces`; `pt` only
+    --accumulate    keep each pixel's samples across ticks (M7/R4); `pt` only. The camera
+                    does not move here, so a pixel the scene did not change keeps its
+                    history and `--spp N` converges like `N * frames` samples; where the
+                    arm moved, the history is dropped and the pixel starts over
+    --max-history N frames a pixel's history may hold with --accumulate (default 32).
+                    With --accumulate, <out>/history/NNNNNN.bin carries that length per
+                    pixel as u32: the mask of where the scene moved
 
 Needs the `render` feature and a Vulkan device. Exit codes: 0 success, 1 runtime failure,
 2 usage error.
@@ -68,6 +85,12 @@ struct Opts {
     cells: Vec<String>,
     stride: usize,
     look: Shading,
+    /// `Rs`, or the `Pt` path of packet M7/R3 with its own `spp`/`bounces`.
+    path: RenderPath,
+    exposure: f32,
+    tonemap: Tonemap,
+    /// Packet M7/R4's temporal accumulation, `--accumulate`.
+    temporal: Option<Temporal>,
 }
 
 enum Camera {
@@ -107,6 +130,12 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
     // `Lambert` by default, so V9's bit-identity oracle keeps meaning: a re-render of a
     // committed run reproduces its recorded frames.
     let mut look = Shading::Lambert;
+    // The `Pt` block (packet M7/R3). `Rs` by default for the same reason.
+    let (mut pt, mut spp, mut bounces) = (false, 64u32, 3u32);
+    let (mut exposure, mut tonemap) = (1.0f32, Tonemap::Reinhard);
+    // Packet M7/R4. `--accumulate` off by default: a re-render of a committed run reproduces
+    // its recorded frames, and that is a property of the defaults.
+    let (mut accumulate, mut max_history) = (false, 32u32);
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -141,8 +170,44 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
                     }
                 }
             }
+            "--path" => {
+                pt = match val()?.as_str() {
+                    "rs" => false,
+                    "pt" => true,
+                    other => {
+                        return Err(usage(format!("--path: expected rs or pt, got {other:?}")))
+                    }
+                }
+            }
+            "--spp" => spp = num(val()?, "--spp")? as u32,
+            "--bounces" => bounces = num(val()?, "--bounces")? as u32,
+            "--accumulate" => accumulate = true,
+            "--max-history" => max_history = num(val()?, "--max-history")? as u32,
+            "--exposure" => exposure = num(val()?, "--exposure")? as f32,
+            "--tonemap" => {
+                tonemap = match val()?.as_str() {
+                    "reinhard" => Tonemap::Reinhard,
+                    "aces" => Tonemap::Aces,
+                    other => {
+                        return Err(usage(format!(
+                            "--tonemap: expected reinhard or aces, got {other:?}"
+                        )))
+                    }
+                }
+            }
             other => return Err(usage(format!("unknown flag '{other}'"))),
         }
+    }
+    if spp == 0 || bounces == 0 {
+        return Err(usage("--spp and --bounces must both be greater than zero"));
+    }
+    if max_history == 0 {
+        return Err(usage("--max-history must be greater than zero"));
+    }
+    if accumulate && !pt {
+        return Err(usage(
+            "--accumulate is a `pt` flag: the rasterizer has no samples to accumulate",
+        ));
     }
     let (Some(run), Some(scene), Some(out)) = (run, scene, out) else {
         return Err(usage("--run, --scene and --out are all required"));
@@ -178,6 +243,23 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
         cells,
         stride,
         look,
+        // NEE on, ReSTIR and SVGF off: the showcase wants the converged picture, and
+        // ReSTIR's temporal reuse assumes a camera that does not move while this one
+        // re-renders a whole trajectory (`docs/design/renderer.md` section 4.2).
+        path: if pt {
+            RenderPath::Pt {
+                spp,
+                bounces,
+                nee: true,
+                restir: false,
+                svgf: false,
+            }
+        } else {
+            RenderPath::Rs
+        },
+        exposure,
+        tonemap,
+        temporal: accumulate.then_some(Temporal { max_history }),
     })
 }
 
@@ -266,10 +348,19 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
         .map_err(|e| rt(format!("no Vulkan device for es video showcase: {e}")))?;
     // The same function every other `Rs` render in this repository goes through, so the
     // showcase and the observation frames cannot drift apart (design note section 7.4).
-    let mut cfg = es_env::render::config(opts.width, opts.height, Channel::Rgb8, RenderPath::Rs);
-    // The only thing `--look` touches. `es_env::render::config` stays the one place a render
-    // path becomes a `RenderConfig`, and the observation path keeps its default (M7/R2).
+    let mut cfg = es_env::render::config(opts.width, opts.height, Channel::Rgb8, opts.path);
+    // All `--look`, `--exposure` and `--tonemap` touch. `es_env::render::config` stays the one
+    // place a render path becomes a `RenderConfig`, and the observation path keeps every
+    // default (M7/R2, M7/R3).
     cfg.shading = opts.look;
+    cfg.exposure = opts.exposure;
+    cfg.tonemap = opts.tonemap;
+    // The history lives in the one `Renderer` below, which is kept across every tick of every
+    // episode -- so the accumulation is the showcase's own frames, in order (M7/R4).
+    cfg.temporal = opts.temporal;
+    if opts.temporal.is_some() {
+        cfg.channels.insert(Channel::History);
+    }
     let mut renderer = Renderer::new(&gpu, cfg).map_err(|e| rt(format!("renderer: {e}")))?;
 
     fs::create_dir_all(&opts.out).map_err(|e| rt(format!("{}: {e}", opts.out.display())))?;
@@ -282,6 +373,22 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
         ),
     )
     .map_err(|e| rt(format!("{}: {e}", layout.display())))?;
+    // With --accumulate, the history length per pixel goes beside the frames in its own
+    // subdirectory (never among the `NNNNNN.bin` the encoder globs): it is the mask that says
+    // which pixels the scene moved under, and a person can look at it.
+    let history_dir = opts.out.join("history");
+    if opts.temporal.is_some() {
+        fs::create_dir_all(&history_dir)
+            .map_err(|e| rt(format!("{}: {e}", history_dir.display())))?;
+        fs::write(
+            history_dir.join("layout.json"),
+            format!(
+                "{{\"dtype\":\"u32\",\"shape\":[{},{},1]}}\n",
+                opts.height, opts.width
+            ),
+        )
+        .map_err(|e| rt(format!("{}: {e}", history_dir.display())))?;
+    }
 
     let start = Instant::now();
     let mut frame = 0u64;
@@ -315,6 +422,13 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
                 .map_err(|e| rt(format!("readback: {e}")))?;
             let out = opts.out.join(format!("{frame:06}.bin"));
             fs::write(&out, tile.to_bytes()).map_err(|e| rt(format!("{}: {e}", out.display())))?;
+            if opts.temporal.is_some() {
+                let n = atlas
+                    .read_tile(0, Channel::History)
+                    .map_err(|e| rt(format!("history readback: {e}")))?;
+                let out = history_dir.join(format!("{frame:06}.bin"));
+                fs::write(&out, n.to_bytes()).map_err(|e| rt(format!("{}: {e}", out.display())))?;
+            }
             frame += 1;
         }
         println!("{name}: {ticks} tick(s)");
@@ -324,10 +438,18 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
         "wrote {frame} frame(s) of {}x{} ({}) to {} in {secs:.1}s ({:.1} ms/frame)",
         opts.width,
         opts.height,
-        if opts.look == Shading::Lambert {
-            "lambert"
-        } else {
-            "full"
+        match opts.path {
+            RenderPath::Pt { spp, bounces, .. } => format!(
+                "pt {spp} spp, {bounces} bounces, {:?} at exposure {}{}",
+                opts.tonemap,
+                opts.exposure,
+                match opts.temporal {
+                    Some(t) => format!(", accumulating up to {} frames", t.max_history),
+                    None => String::new(),
+                }
+            ),
+            RenderPath::Rs if opts.look == Shading::Lambert => "lambert".to_owned(),
+            RenderPath::Rs => "full".to_owned(),
         },
         opts.out.display(),
         if frame == 0 {

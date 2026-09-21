@@ -42,6 +42,7 @@ pub mod error;
 pub mod renderer;
 pub mod rng;
 pub mod scene;
+pub mod ssim;
 pub mod view;
 
 pub use atlas::{AtlasLayout, Tile, TileData};
@@ -49,8 +50,10 @@ pub use cpu::Frame;
 pub use error::RenderError;
 pub use renderer::{Atlas, Renderer};
 pub use scene::{SceneCache, Tri, TriScene};
+pub use ssim::ssim;
 pub use view::{
-    CameraView, ImageSpec, Intrinsics, RenderConfig, RenderPath, Shading, TileAtlasCfg, ViewParams,
+    CameraView, ImageSpec, Intrinsics, RenderConfig, RenderPath, Shading, Temporal, TileAtlasCfg,
+    Tonemap, ViewParams,
 };
 
 /// Re-exported so naming a channel does not oblige a caller to depend on `es-sensor` as well
@@ -66,13 +69,16 @@ pub const RS_CHANNELS: [Channel; 4] = [
     Channel::SegmentationId,
 ];
 
-/// Channels the [`RenderPath::Pt`] path writes: linear radiance plus the three geometry
-/// channels spec 15.3 requires to be bit-identical with `Rs`.
-pub const PT_CHANNELS: [Channel; 4] = [
+/// Channels the [`RenderPath::Pt`] path writes: linear radiance, the tone-mapped `Rgb8` of
+/// packet M7/R3, the three geometry channels spec 15.3 requires to be bit-identical with
+/// `Rs`, and packet M7/R4's temporal history length.
+pub const PT_CHANNELS: [Channel; 6] = [
     Channel::PtRadiance,
+    Channel::Rgb8,
     Channel::Depth32 { unit_m: 1.0 },
     Channel::Normal,
     Channel::SegmentationId,
+    Channel::History,
 ];
 
 /// Whether `path` produces `channel`.

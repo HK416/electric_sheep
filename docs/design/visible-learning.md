@@ -1248,6 +1248,16 @@ counters behind `envelope_violation_rate` and `chunk_underrun_rate` are cell-lev
 episodes before its own (no speedup) or produce different numbers (not allowed). Seeking the
 episode counter is an `es-env` change, which this packet forbids itself.
 
+> **Revisited by packet M7/T8, and the answer did not change.** Half of the obstacle is gone:
+> `Env::seek_episode` ships, and a seeked env is bitwise the replayed one on the demo scene and
+> the committed Task IR (`cargo test -p es-env --test seek -- --ignored`, oracle server
+> 2026-09-21, `k ∈ {1, 3, 7}`, `.estraj` included). The other half is not an `es-env` question.
+> Running the pre-T8 and the T8 build of `es eval run` over the same committed demo documents
+> showed the artifacts move in two places — the Safety Plane's `ViolationRate` ring survives
+> `begin_episode`, and `StepEvent::tick` is the cell's cumulative physics clock — so the unit
+> stayed the cell and no flag was added. The evidence, the measured deltas and the two review
+> decisions are `docs/design/evaluation-execution.md` section 2.7.
+
 A **cell**, by contrast, is genuinely self-contained: its own `Env`, its own `SafetyPlane`, `seq`
 from 0, `plan.reset()` on every episode including its first. The two things cells share are the
 compiled `CpuPlan` — reset per episode, so a freshly compiled plan and a reset one are the same

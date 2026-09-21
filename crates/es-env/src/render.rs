@@ -78,21 +78,15 @@ pub fn render_config(cfg: &EnvRendererCfg) -> RenderConfig {
 /// is still exactly one place a render path becomes a [`RenderConfig`].
 pub fn config(width: u32, height: u32, channel: Channel, path: RenderPath) -> RenderConfig {
     let atlas = TileAtlasCfg::row(width, height, 1);
+    // Every other `RenderConfig` field stays at its constructor default, which is what spec
+    // 28.10 rule 1 asks of an observation path: packet M7/R2's `shading` and packet M7/R3's
+    // `nee`, `light_rgb`, `exposure` and `tonemap` are carried through untouched, so a
+    // committed observation document renders the same bytes it always did.
     let mut out = match path {
         RenderPath::Rs => RenderConfig::rs(atlas),
-        RenderPath::Pt {
-            spp,
-            bounces,
-            restir,
-            svgf,
-        } => {
+        RenderPath::Pt { spp, bounces, .. } => {
             let mut c = RenderConfig::pt(atlas, spp, bounces);
-            c.path = RenderPath::Pt {
-                spp,
-                bounces,
-                restir,
-                svgf,
-            };
+            c.path = path;
             c
         }
     };
@@ -400,7 +394,10 @@ fn channel_format(channel: Channel) -> ChannelFormat {
     match channel {
         Channel::Rgb8 | Channel::RgbF32Linear | Channel::PtRadiance => ChannelFormat::Rgb,
         Channel::Depth32 { .. } => ChannelFormat::Depth,
-        Channel::SegmentationId => ChannelFormat::Seg,
+        // `History` is packet M7/R4's renderer diagnostic, a u32 count per pixel. It is
+        // unreachable here: `EnvRendererCfg` names one channel and the observation path never
+        // names this one. It maps to the other single-u32 format so the match stays total.
+        Channel::SegmentationId | Channel::History => ChannelFormat::Seg,
         Channel::Normal => ChannelFormat::Normal,
         Channel::Flow => ChannelFormat::Flow,
     }

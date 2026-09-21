@@ -299,31 +299,42 @@ path, `PtRadiance` on the `Rs` path) is `RenderError::UnsupportedChannel`.
 
 ## 4. `Pt` — compute path tracer (§28.6, §1.9 item 2)
 
-`Pt { spp, bounces, restir, svgf }`. One thread per pixel, `spp` samples, `bounces` non-
-specular bounces, all diffuse. Writes `PtRadiance` (linear f32×3) plus the same
-`Depth32`/`SegmentationId`/`Normal` channels from the **primary hit of sample 0** — the ones
-§15.3 requires to match `Rs`.
+`Pt { spp, bounces, nee, restir, svgf }`. One thread per pixel, `spp` samples, `bounces` non-
+specular bounces, all diffuse. Writes `PtRadiance` (linear f32×3), the tone-mapped `Rgb8` of
+[§10](#10-the-path-tracer-grows-up-m7r3), and the same `Depth32`/`SegmentationId`/`Normal`
+channels from the **primary hit of sample 0** — the ones §15.3 requires to match `Rs`.
 
-The estimator, per sample:
+The estimator, per sample. `nee` is `false` by default and the whole right-hand column is
+then a multiply by `1.0`, which is why `cornell_pt1spp` is byte-identical either way:
 
 ```
 throughput = 1
 radiance   = 0
 ray        = primary
+prev_pdf   = 0                            // the camera ray: no light strategy made it
 for bounce in 0..bounces:
     hit = scan(ray)                       // same routine as Rs
-    if !hit: radiance += throughput * sky; break
-    radiance += throughput * emission(hit)
+    if !hit:
+        radiance += throughput * sky * w_sky      // w_sky = 1, or 1/2 under nee
+        break
+    radiance += throughput * emission(hit) * w_bsdf   // w_bsdf = 1, or the power
+                                                      // heuristic vs the light pdf
+    n = face_forward(hit)
+    p = hit_point + n * RAY_EPS
+    if nee:
+        radiance += throughput * nee_direct(p, n, albedo, last = bounce + 1 == bounces)
     throughput *= albedo(hit)             // cosine-weighted sampling cancels
                                           // the cos term and the 1/pi BRDF
     ray = cosine_hemisphere(n, rng)
+    prev_pdf = dot(n, ray) / pi
 radiance /= spp                           // accumulated in a fixed sample order
 ```
 
 Cosine-weighted hemisphere sampling makes the diffuse throughput update a plain multiply by
 albedo, so there is no division by a pdf and no chance of a 0/0. Russian roulette is **not**
 used: it would make the work per pixel data-dependent and the bounce count is fixed and small
-anyway.
+anyway — and neither does NEE introduce one: its three light kinds are three `if`s on
+*config*, uniform across the dispatch, so every pixel of a given render does the same work.
 
 `spp` accumulation is a plain sequential `+=` in ascending sample index — not a tree, not a
 `DeterministicAcc`. §18.4's binned accumulator is for reductions whose *order* is not fixed;
@@ -349,6 +360,24 @@ tracer" is `unverified`; it is not used for anything but rendering.
 
 `f32` in `[0, 1)` is `(x >> 8) as f32 * (1 / 16777216)` — exact on both sides, never 1.0.
 
+**The stream table.** `stream` is what separates independent uses at the same coordinates,
+and a new use takes a **new id** rather than reusing one at a different `index`: reusing one
+would silently correlate two draws that the estimator assumes are independent. The table is
+pinned in `crates/es-render/src/rng.rs` and here, and both are the contract:
+
+| id | use | drawn per |
+|---|---|---|
+| 0 | the cosine-weighted BSDF bounce direction | sample, bounce |
+| 1 | `ReSTIR` initial candidates (light pick, area sample, reservoir accept) | pixel |
+| 2 | `ReSTIR` spatial reuse (the reservoir accept per neighbour) | pixel |
+| 3 | `ReSTIR` temporal reuse (the reservoir accept) | pixel |
+| 4 | NEE: which emissive triangle (M7/R3) | sample, bounce |
+| 5 | NEE: the uniform point on that triangle | sample, bounce |
+| 6 | NEE: the cosine-weighted sky direction | sample, bounce |
+
+The NEE shadow test has no stream: it draws no random number. Streams 4–6 are only drawn
+when `nee` is on, so a `nee: false` render makes exactly the draws it made before M7/R3.
+
 ### 4.2 ReSTIR DI
 
 A textbook ReSTIR DI, on by `Pt { restir: true }`, off by default. Three passes, three
@@ -357,8 +386,9 @@ dependence on dispatch order within a pass):
 
 1. **Initial candidates.** `M = 8` uniform samples over the emissive triangles (a geom whose
    name ends in `_light`; its `Geom::rgba` RGB is the emitted radiance). Weighted reservoir
-   sampling on the unshadowed target function `p̂ = |albedo/π · Le · G|`, then **one** shadow
-   scan on the survivor. Un-shadowed survivors keep `W = 0`.
+   sampling on the unshadowed target function `p̂ = |albedo/π · Le · G|`. **No shadow ray
+   since M7/R3**: visibility is tested once, in the spatial pass, on the sample that pass
+   actually selects — see [§10.2](#102-restir-is-unbiased-now-and-here-is-the-number).
 2. **Temporal reuse**, one pass: combine with the reservoir the previous `render()` call left
    at the same pixel. No motion-vector reprojection — the previous reservoir is read at the
    *same* pixel, which is correct only for a static camera and static geometry. On the first
@@ -368,14 +398,17 @@ dependence on dispatch order within a pass):
    `(±3, 0), (0, ±3)`, each accepted only if its depth is within 10 % and its normal within
    25° (the standard geometric similarity test). Fixed offsets, not RNG-jittered: jitter buys
    less correlated noise and costs the ability to state that the result is a function of the
-   pixel grid alone.
+   pixel grid alone. The combination is **pairwise MIS** (M7/R3), not `1/M`, and the pass
+   ends with one shadow ray towards the sample it selected.
 
-Skipped, and this is the list §28.6 will have to fill in: MIS weights (the reservoirs use the
-biased `1/M` combination, not the GRIS/pairwise-MIS weights that make reuse unbiased), the
-bias-correction visibility re-test on reuse, ReSTIR **GI** entirely (this is direct lighting
-only; indirect bounces go through the plain path-traced estimator above), multiple light
-types (emissive triangles only — no environment map, no analytic lights), and any sort of
-reservoir ageing beyond `M`-clamping at 20.
+Skipped, still: ReSTIR **GI** entirely (this is direct lighting only; indirect bounces go
+through the path-traced estimator above), light types other than emissive triangles inside
+the reservoirs (the NEE path of [§10.1](#101-next-event-estimation-and-mis) has three, the
+reservoirs have one — no environment map, no analytic light in a reservoir), and any sort of
+reservoir ageing beyond `M`-clamping at 20. What is **no longer** skipped, and what §28.6
+asked for: the MIS weights that make reuse unbiased, and the bias-correction placement of
+the visibility test. [§10.2](#102-restir-is-unbiased-now-and-here-is-the-number) has the
+before/after number.
 
 ### 4.3 SVGF
 
@@ -385,17 +418,36 @@ On by `Pt { svgf: true }`, off by default. **One** à-trous pass set, `n` iterat
 normal:
 
 ```
-w = w_depth * w_normal
-w_depth  = exp(-|z_p - z_q| / (sigma_z * |grad z| + eps))
-w_normal = max(0, dot(n_p, n_q))^sigma_n
+w = w_depth * w_normal * w_luminance
+w_depth     = exp(-|z_p - z_q| / (sigma_z * |grad z| + eps))
+w_normal    = max(0, dot(n_p, n_q))^sigma_n
+w_luminance = exp(-|l_p - l_q| / (sigma_l * sqrt(var_p) + eps))     // M7/R4, sigma_l = 4
 ```
 
-Skipped: the **V** in SVGF. There is no temporal accumulation of colour, no per-pixel variance
-estimate, no variance-guided `w_luminance` term, no 7×7 variance prefilter for low-sample
-regions, no disocclusion handling, no history-length-driven kernel widening. What is left is
-an edge-aware à-trous filter — a real and useful denoiser, and not the algorithm in the SVGF
-paper. It is named `svgf` because §28.6 names it; the doc comment on the kernel says the same
-thing this paragraph does.
+**The `w_luminance` term exists since M7/R4 and is `1.0` without a history.** It needs a
+per-pixel variance, and a variance needs frames to estimate it from, so the term is on exactly
+when `RenderConfig::temporal` is `Some` — with `None` the weight is a multiply by exactly
+`1.0` and the filter's output is byte for byte what M4's was. The variance is filtered
+alongside the colour with the *squared* weights, so each iteration reads the variance of what
+it is actually reading. [§11](#11-temporal-accumulation-for-a-still-camera-m7r4) is the whole
+of it: the accumulation, the disocclusion rule, the moments and the numbers.
+
+Still skipped, and this is the honest list as of M7/R4:
+
+- **History-length-driven kernel widening.** The paper widens the kernel where the history is
+  short; here the kernel is always 5 taps at stride `1 << i`. The variance term already
+  widens the *effective* kernel where the estimate is uncertain, which is most of what the
+  widening buys, and a data-dependent tap count is a data-dependent loop bound (§3.4).
+- **Motion-vector reprojection.** §11's validity rule is a still camera's: no history is
+  resampled from a different pixel, ever.
+- **A variance *prefilter*.** The 7×7 estimate of §11 stands in for the moments while
+  `n < 4`; the paper also prefilters the variance *inside* the first à-trous iteration. Not
+  done — the estimate feeds the iterations unfiltered.
+- **`ReSTIR` GI**, and everything else [section 10.7](#107-what-r3-still-skips) lists.
+
+What was skipped before M7/R4 and is not any more: temporal accumulation of colour, the
+per-pixel variance estimate, the variance-guided luminance term, the short-history spatial
+estimate, and disocclusion handling.
 
 ## 5. CPU references (§1.4)
 
@@ -509,8 +561,12 @@ fix is a documented tolerance on depth — never a change to the goldens.
 
 RGB is *not* compared between paths: `Rs` is a one-bounce analytic shade and `Pt` is a Monte
 Carlo estimate of a different integral. An SSIM threshold between them (which §15.3 asks for)
-needs a converged PT render and an SSIM implementation; both are `unverified` here and belong
-with the §28.6 packet that makes the path tracer real.
+needs a converged PT render and an SSIM implementation. M7/R3 built both —
+`es_render::ssim` and a tone-mapped `Rgb8` from the `Pt` path — and
+[§10.4](#104-the-153-ssim-number-finally-exists-and-it-is-low) is the measurement. The
+**threshold is still not set**: the number turns out to say more about the two lighting
+models than about either renderer, and choosing a threshold from it is an owner decision, not
+a packet's.
 
 ## 7. Determinism (§3.4)
 
@@ -888,3 +944,515 @@ At 96×96 — the observation size — none of this applies: the observation pat
 These are the amended mix's numbers; it costs nothing to conserve energy (one subtract and
 one multiply replace one add), and the frame `show-full/000120.bin` has **no** saturated
 pixel where the additive form left the whole table at 255.
+
+## 10. The path tracer grows up (M7/R3)
+
+`docs/packets/M7/R3-pt-quality.md`. Before this packet the `Pt` path could not produce a
+picture: no next-event estimation (a bounce had to *land* on a light for anything to be lit),
+`ReSTIR` combined reservoirs with the biased `1/M`, and the output was linear radiance with
+no tone map, so `Channel::Rgb8` was not in `PT_CHANNELS` and `es video showcase` had no way
+to use it (`visible-learning.md` 7.17 item 5). Four additions, each behind a `RenderConfig`
+field whose default reproduces today's bytes (§28.10 rule 1) — `cargo xtask verify-goldens`
+reports **0 changed**, and the `tests/fixtures/visible-learning/frames` fixture is untouched
+because the observation path never sees any of these fields ([§9.5](#95-why-the-observation-path-did-not-get-the-knob)
+applies verbatim: `EnvRendererCfg` has no `nee`, no `exposure`, no `tonemap`).
+
+### 10.1 Next-event estimation and MIS
+
+`Pt { nee }`, default `false`. At every diffuse hit the estimator samples the lights directly
+and MIS-weights the result against the BSDF strategy with the **power heuristic**, β = 2 (PBR
+4e 13.10). Three light kinds, all through one code path on each side:
+
+| light | sampled as | MIS | shadow ray |
+|---|---|---|---|
+| emissive triangles (a geom named `*_light`) | one pick uniform over the light list, then a uniform point on that triangle; the solid-angle pdf is `d² / (\|cos_l\| · A · n_lights)` | yes, against `cos_s/π` | one, to `dist · (1 − 1e-3)` |
+| the directional light `light_dir`, radiance `light_rgb` (new, default `[0,0,0]`) | a delta: the direction *is* `light_dir` | no — no pdf to weight against | one, to `SHADOW_FAR` |
+| the sky `sky` (a miss still returns it) | a cosine-weighted hemisphere direction | yes, and the pdf is the BSDF's, so the heuristic gives each exactly 1/2 | one, and it has to **escape** |
+
+`light_rgb` defaults to zero so a `Pt` render that does not ask for a directional light gets
+one that contributes nothing; `sky` already defaulted to zero. Each of the three is an `if`
+on *config*, uniform across the dispatch, so the work per pixel is still fixed (§3.4 forbids
+a data-dependent loop bound, not a compile-time-uniform branch).
+
+**The last vertex drops the MIS weights, and this is the one non-obvious thing here.** At
+`bounce == bounces - 1` the continuation ray is sampled and never traced, so the
+complementary `w_bsdf` share of that vertex's direct lighting is not estimated anywhere. With
+the weights left in, NEE at `B` bounces is *darker* than the BSDF-only tracer at `B` by a
+measurable amount; with them dropped, NEE at `B` bounces is an estimator of exactly what the
+BSDF-only tracer estimates at `B + 1` — the same set of path lengths. Measured on Cornell,
+16×16, 4,096 spp:
+
+| comparison | difference of image means |
+|---|---|
+| NEE @ 3 bounces vs no-NEE @ 3 bounces, MIS at the last vertex | **+3.72 %** (a truncation difference, not a bias) |
+| NEE @ 3 bounces vs no-NEE @ 4 bounces, MIS dropped at the last vertex | **−0.45 %** |
+
+`nee_converges_to_the_same_image` asserts the second row under 1 %. It deviates from the
+packet twice, and both deviations are the same finding: it compares `B` against `B + 1`
+rather than `B` against `B`, and it asserts on the **image means** rather than the per-pixel
+mean absolute difference, because at 4,096 spp each estimator still carries ~0.0015 of its
+own noise and the per-pixel figure is 3.0 % of the mean no matter how right the estimators
+are. The per-pixel number is printed beside the assertion with a 10 % backstop, so a genuine
+mismatch — a missing weight, a wrong pdf — still fails loudly.
+
+**What NEE buys**, `nee_at_low_spp_has_lower_variance`, Cornell 16×16, 16 spp, 3 bounces,
+RMSE against the 4,096 spp NEE reference:
+
+| estimator | RMSE at 16 spp |
+|---|---|
+| NEE off | 0.024110 |
+| NEE on | **0.016565** (1.46× lower) |
+
+1.46× the RMSE is ~2.1× the samples for the same noise, on a scene whose single light is a
+large ceiling panel that a cosine bounce finds fairly often. A small light, which is where
+NEE usually wins by an order of magnitude, is not in any committed scene; that number is
+`Target / Status: unverified`.
+
+### 10.2 `ReSTIR` is unbiased now, and here is the number
+
+Two changes, both in the spatial pass:
+
+1. **Pairwise MIS** (Wyman et al. 2023 §5) replaces the biased `1/M`. For the canonical
+   (centre) technique `c` and `N` neighbours,
+   `m_i(X) = (1/N)·(M_i p̂_i(X)) / (M_i p̂_i(X) + M_c p̂_c(X))` and
+   `m_c(X) = (1/N)·Σ_i (M_c p̂_c(X)) / (M_i p̂_i(X) + M_c p̂_c(X))`, which sum to one term by
+   term for *any* `X`. The resampling weight of a candidate becomes `m · p̂_destination(X) · W`
+   and the combined contribution weight is `w_sum / p̂_destination(Y)` — no `1/M` and no `1/Z`
+   left to divide by, because the `m`s already carry the normalization. This is the packet's
+   `W = (1/p̂_y)·(w_sum/Z)` with `Z` folded into the per-candidate weights, which is the form
+   that also gives a neighbour who *could* have generated the sample more weight than one who
+   barely could, rather than only excluding those who could not. It costs three extra target
+   evaluations per neighbour (its own target at its own sample, and at the canonical sample)
+   and no extra rays; the neighbour's shading point comes from the g-buffer the same way the
+   centre's does.
+2. **The visibility test moved** from the survivor of the initial pass to the finally
+   selected sample at the destination. Same one shadow ray per pixel. It matters because
+   zeroing `W` at the *source* makes a neighbour's reservoir carry a visibility that was
+   decided at a different shading point; testing it at the destination makes the estimator
+   `f_shadowed(y) · W(y)` with `W` built from the unshadowed target, which is unbiased. The
+   reservoir stores the **unshadowed** `W`, so temporal reuse next frame still reuses the
+   quantity the target function is defined over.
+
+`restir_is_unbiased_within_tolerance`: 256 independent 1 spp `ReSTIR` frames (temporal off,
+spatial on), averaged, against a 4,096 spp path trace of the *same* integral — direct
+lighting only, which is two bounces without NEE, because that is what `ReSTIR` DI estimates.
+Cornell, 16×16, reference mean radiance 0.037287:
+
+| weighting | mean | bias | oracle |
+|---|---|---|---|
+| `1/M` + source-side visibility (**before M7/R3**) | 0.036631 | **−1.759 %** | fails |
+| `1/M` + destination-side visibility | 0.036616 | −1.798 % | fails |
+| pairwise MIS + destination-side visibility (**now**) | 0.037324 | **+0.099 %** | passes |
+
+The middle row is the attribution: essentially all of the bias was the `1/M` weight, and
+moving the visibility test contributes ~0.04 % — inside the noise of a 256-seed average. The
+packet's own `unverified` TODO now has a number on both sides of it.
+
+`gpu_restir_and_svgf_match_the_cpu_within_tolerance` keeps its 1e-5 normalized tolerance and
+still passes on both cards; it pins the GPU against the CPU, not against a golden, which is
+what made replacing the weighting legal at all.
+
+### 10.3 The tone map
+
+`RenderConfig::{exposure, tonemap}`, defaults `1.0` and `Tonemap::Reinhard`:
+
+```
+Reinhard(c) = (c·e) / (1 + c·e)                                    // Reinhard et al. 2002
+Aces(c)     = clamp( x(2.51x + 0.03) / (x(2.43x + 0.59) + 0.14) )  // Narkowicz 2015, x = c·e
+```
+
+then the existing exact piecewise sRGB transfer and the existing rounding. **Neither operator
+contains a transcendental** — additions, multiplies and one division per channel — so the
+oracle is not a ULP budget but bit equality: `tonemap_is_bitwise_on_both_sides` renders a
+64×64 Cornell `PtRadiance` tile at 1 spp (the configuration
+`gpu_path_tracer_matches_the_cpu_reference_at_1spp` already pins bit-equal, so any difference
+is the tone map's) through both operators at exposure 1 and 8, and compares the `Rgb8`:
+**0 of 12,288 bytes differ** in all four cases, on the RTX 3060 and on the RTX 4090. The
+same test asserts monotonicity on the CPU over `[0, 64)` at three exposures, which is the
+property that makes `Rgb8` a usable image rather than a lookup table.
+
+`Channel::Rgb8` therefore joins `PT_CHANNELS`. On the GPU it is a **separate dispatch**,
+`pt.slang`'s `tonemap` entry point, recorded last so it reads whatever `ReSTIR` and `SVGF`
+left in the radiance buffer rather than what the tracer wrote. On the CPU it is the last
+block of `cpu::path_trace`. One new golden, `cornell_pt_nee_rgb8` (4 spp, 3 bounces, NEE,
+Reinhard, exposure 1, generated by the CPU reference): the GPU reproduces it **bit for bit**
+on both cards, and the underlying `PtRadiance` agrees to 9.1e-7 normalized / 216 ULP — the
+ULP number is large and the normalized one is tiny for the reason §5.1 already gives, that
+most of the image is near zero.
+
+`Rs` `Full` is **not** given the tone map. It clamps, as it did in M7/R2, and its golden is
+untouched; the two operators are `pub` in `es_render::cpu` and a later packet can hand them
+to the rasterizer with its own golden.
+
+### 10.4 The §15.3 SSIM number finally exists, and it is low
+
+`es_render::ssim(a, b, w, h) -> f64` — the simple windowed form of Wang et al. 2004: an 8×8
+window slid one pixel at a time over the Rec.709 luma plane, uniform weights (not the 11×11
+Gaussian), `K1 = 0.01`, `K2 = 0.03`, `L = 255`, the mean of the per-window score, all in
+`f64`. `ssim(a, a)` is **exactly** `1.0`, not `1.0 ± 1e-12`: the variance, the covariance and
+the two means are written so that identical input makes the numerator and the denominator the
+same bits.
+
+`rs_pt_ssim` (an `--ignored` measurement, not an assertion) compares `Rs` `Full` at the R2
+preset (`ssaa 2`) against a converged `Pt` NEE render, sweeping the exposure:
+
+| exposure | Cornell 64×64 SSIM | Cornell PT mean byte | SO-101 320×180 SSIM | SO-101 PT mean byte |
+|---|---|---|---|---|
+| 0.5 | 0.2282 | 23 | 0.2207 | 14 |
+| **1** (default) | **0.3247** | 33 | **0.2910** | 23 |
+| 2 | 0.4246 | 47 | 0.3775 | 35 |
+| 4 | 0.5099 | 65 | 0.4742 | 50 |
+| 8 | 0.5646 | 87 | 0.5685 | 69 |
+| 16 | 0.5861 | 112 | 0.6470 | 92 |
+| 32 | 0.5865 | 140 | 0.7069 | 118 |
+| 64 | 0.5861 | 168 | 0.7562 | 145 |
+| 128 | 0.5912 | 193 | 0.8016 | 168 |
+
+(`Rs` `Full`'s own mean byte is **130** on Cornell and **173** on SO-101. Cornell is the CPU
+reference at 1,024 spp; SO-101 is the GPU in 16 chunks of 64 spp averaged on the host, so no
+single dispatch can trip a desktop driver watchdog — a different estimator from one 1,024 spp
+dispatch, equally unbiased, and the only one that runs on Windows.)
+
+**The threshold is not set here, and the table is why.** At the default exposure the two
+images are 0.29–0.32 similar, which looks like a failure and is not: `Rs` `Full` is a
+hemisphere ambient plus a directional light with no interreflection, and `Pt` is one 0.24 m
+emissive panel at ~1 W/sr/m² with global illumination and no directional light at all. They
+are pictures of *different lighting*, and most of the SSIM deficit is the brightness offset —
+the score climbs monotonically with exposure right up to the point where Reinhard has
+flattened everything. Three things follow, and they are decisions for the M7 review rather
+than for this packet:
+
+1. a §15.3 threshold set from these numbers would be a threshold on the scene's lighting
+   setup, not on the renderers;
+2. the honest comparison gives the `Pt` side the `Rs` side's lights — `light_rgb` set to the
+   directional light's radiance and `sky` to the hemisphere — which R3 made *possible*
+   (§10.1's light table) but did not tune;
+3. or §15.3's contract is restated as "the geometry channels are bit-identical and RGB is
+   whatever the lighting model says", which is what the code actually guarantees today.
+
+`Target / Status: unverified` for any §15.3 SSIM threshold until one of the three is chosen.
+
+### 10.5 `es video showcase --path pt`
+
+```
+es video showcase ... --path rs|pt [--spp 64] [--bounces 3] [--exposure 1.0]
+                      [--tonemap reinhard|aces]
+```
+
+`rs` stays the default, so V9's bit-identity oracle keeps meaning: a re-render of a committed
+run reproduces its recorded frames. `pt` runs with **NEE on, `ReSTIR` and `SVGF` off** —
+`ReSTIR`'s temporal reuse assumes a camera that does not move, and the showcase re-renders a
+whole trajectory. `es_env::render::config` is still the one place a render path becomes a
+`RenderConfig`; `--exposure` and `--tonemap` are set on the returned config beside `--look`,
+the same way M7/R2 set `shading`. There is no `--svgf` flag: nobody asked for one and the
+field is reachable from Rust.
+
+### 10.6 Cost, RTX 4090, V19b `nominal-00` (224 ticks, 1280×720)
+
+The same cell, the same camera (`--eye 0.66,-0.46,0.52 --look-at 0.14,-0.04,0.04 --fov 36`)
+and the same interleaved-runs method as [§9.6](#96-cost) — whole-command wall clock divided
+by the 224 frames, so tessellate, upload, dispatch, readback and the write to disk are all in
+it.
+
+**The card was not idle.** `nvidia-smi` reported 6–7 other compute processes throughout
+(another agent training); §9.6's numbers were taken on a card with none. The `lambert` row
+below is 3.0× §9.6's, which is the size of the contention, and every row carries it equally
+because the runs are interleaved. The absolute figures are therefore a **floor**, not the
+card's capability:
+
+| path | ms/frame, this run (loaded card) | §9.6, idle card |
+|---|---|---|
+| `Rs` `lambert` | 20.8, 20.0 | 6.7, 6.6 |
+| `Rs` `full` (`ssaa 2`) | 25.0, 26.3 | 10.1, 9.9, 9.9 |
+| `Pt` NEE, 64 spp, 3 bounces, Reinhard e=1 | **562.3, 561.2** | — |
+| `Pt` NEE, 64 spp, 3 bounces, Reinhard e=32 | 560.8 | — |
+| `Pt` NEE, 256 spp, 3 bounces, Reinhard e=32 | **2264.3** | — |
+
+Three things the table says. **The tone map is free**: 562.3 vs 560.8 ms/frame is the same
+number with a different `exposure`, which it should be — one dispatch of one multiply, one
+add and one divide per pixel over a frame that spends half a second in the tracer.
+**`spp` is linear**: 4× the samples is 4.03× the time (2264.3 / 561.2), so there is no
+per-frame overhead worth naming and a caller can read "how long do I have?" straight off.
+And **`Pt` is ~27.5× `Rs` `lambert`** at 64 spp on the same loaded card; on an idle one the
+ratio will be *larger*, because `lambert` at 6.7 ms is mostly readback and file write while
+`Pt` at 560 ms is almost entirely the tracer. Any idle-card `Pt` figure is
+`Target / Status: unverified` — the honest reading of this run is "the showcase's PT path is
+half a second a frame at 64 spp on a 4090, and 64 spp is visibly noisy; 256 spp at 2.3 s a
+frame is what the pictures under `~/artifacts/plan-v/m7-r3/show-pt-256/` look like."
+
+### 10.7 What R3 still skips
+
+The way [§4.2](#42-restir-di) lists its skips, and for the same reason — §1.9 item 2 makes
+the path tracer the second thing cut, so every step of it says what it is not:
+
+- **`ReSTIR` GI.** Still direct lighting only. Indirect bounces go through the path-traced
+  estimator, which is why `restir: true` and a high `spp` are two different tools rather than
+  one.
+- **`ReSTIR` over the other two light kinds.** The reservoirs hold emissive triangles only.
+  The directional light and the sky are NEE-only; a reservoir over a mixed light list needs
+  a light *type* in the reservoir stride, which is a buffer-layout change.
+- **Environment maps.** `sky` is one constant colour sampled with a cosine pdf. A real
+  environment map needs an image, an importance-sampling distribution built over it, and a
+  pdf that is not the BSDF's — at which point the MIS here starts to earn its keep.
+- **Glossy and specular BSDFs.** Everything is still Lambertian. `Shading::Full`'s
+  Blinn-Phong highlight has no `Pt` counterpart, there is no microfacet model, no Fresnel, no
+  refraction, no perfectly specular path. The MIS machinery is exactly the machinery a
+  microfacet BSDF would need, which is the point of building it now.
+- **Spectral anything.** Three channels, RGB, no wavelength, no dispersion, no colour
+  management beyond §3.1's sRGB transfer.
+- **Textures.** Still one flat albedo per geom (§0).
+- **Adaptive sampling, firefly clamping, Russian roulette.** All three make the work or the
+  estimator data-dependent, which §3.4 forbids on a path that has to reproduce bit for bit.
+  A converged image is `spp`, and `spp` is a fixed number.
+- **A tone map on the `Rs` path.** §10.3.
+- **The temporal `ReSTIR` pass is still unbiased-by-accident**: with no motion-vector
+  reprojection its two candidates share one shading point, so `1/M` *is* the correct MIS
+  weight there. Give it reprojection and it needs the same pairwise treatment the spatial
+  pass got.
+
+## 11. Temporal accumulation for a still camera (M7/R4)
+
+`docs/packets/M7/R4-temporal-accumulation.md`. The showcase camera does not move; the arm
+does. Before this packet every frame started from zero samples, so a 224-tick cell paid for
+224 independent renders of a scene that is 95 % the same picture each time. The packet asks
+whether `N` frames of 1 spp can *be* one frame of `N` spp on the pixels the scene did not
+change — not approximately, **bitwise** — and whether the per-pixel variance that falls out of
+it can finally drive [§4.3](#43-svgf)'s filter.
+
+```rust
+pub struct Temporal { pub max_history: u32 }
+pub struct RenderConfig { ..., pub temporal: Option<Temporal> }   // default None
+```
+
+`None` is the default and is today's bytes: `cargo xtask verify-goldens` reports **0 changed**
+and one added, and the `tests/fixtures/visible-learning/frames` fixture is untouched because
+the observation path never sets the field ([§9.5](#95-why-the-observation-path-did-not-get-the-knob)
+applies verbatim — `EnvRendererCfg` has no `temporal` either).
+
+### 11.1 The sample-indexing rule, which is what makes it exact
+
+Frame `f` of a camera slot draws its samples with `sample = f * spp + s` in `rng::key`, and
+the kernel's accumulator **starts at the history sum** rather than at zero:
+
+```
+acc = history_sum * k                       // k = 1 below the cap; see 11.3
+for s in 0..spp:  acc += <sample f*spp + s>  // the same left-to-right chain as one big frame
+sum := acc ;  n := n + 1
+out  = sum * (1 / (n * spp))                 // one divide, at the end
+```
+
+Both halves are necessary. The indexing makes `N` frames draw the same samples one
+`N * spp` frame draws, in the same order; starting the accumulator at the history sum makes
+the *additions* happen in one unbroken chain, because floating-point addition is not
+associative and `(a+b) + (c+d)` is not `((a+b)+c)+d`. `accumulation_of_n_frames_is_n_spp`
+asserts the consequence on Cornell, 64×64, NEE, 3 bounces:
+
+| comparison | `PtRadiance` | `Rgb8` |
+|---|---|---|
+| 8 frames × 1 spp vs 1 frame × 8 spp | **bitwise** | **bitwise** |
+| 8 frames × 4 spp vs 1 frame × 32 spp | **bitwise** | **bitwise** |
+
+`f` is the *slot's* frame counter, not the pixel's history length, and that is the one
+deviation from the packet's wording (`n * spp + s`). They are the same number everywhere the
+history was never dropped — the case the table above pins — and they differ exactly where a
+pixel restarted. Using the pixel's `n` there would make a pixel sitting at the `max_history`
+clamp redraw the samples it already holds every frame, which converges to a *one-frame*
+estimate instead of a converged one. The counter always moves forward; the average restarts.
+
+### 11.2 Validity: a still camera, a bitwise g-buffer, no reprojection
+
+A pixel keeps its history when **both** hold:
+
+1. the slot's `CameraView` is bitwise the previous frame's — the host compares the 16
+   `ViewParams` floats by bit pattern and writes the answer into the view record's pad slot
+   13, so a camera that moved by one ULP resets that camera's whole tile;
+2. the pixel's own **depth, camera-space normal and primitive id** are bitwise the previous
+   frame's.
+
+Otherwise `n := 0` for that pixel and it starts over. There is no motion-vector reprojection:
+history is never resampled from another pixel, so a moving camera gets nothing from this
+packet except a reset. That is the whole disocclusion rule, and it is a scene-moves /
+camera-still rule by construction.
+
+The primitive id is the **triangle** index, not the geom id, and that is stricter than it
+sounds: `history_drops_where_the_scene_moved` translates Cornell's tall block by 0.6 m after
+4 frames and finds 464 of 4,096 pixels dropped against 3,632 kept — and some of the 464 are
+pixels that stayed on the same flat face while the quad's diagonal moved underneath them.
+Keeping them would need a per-face id the tessellator does not carry; dropping them costs one
+frame of history at a silhouette-shaped boundary. A changed `CameraView` gives `1` everywhere,
+which the same test asserts.
+
+**What the rule does not catch, by design:** a pixel whose *lighting* changed while its
+geometry did not — the arm's shadow crossing the table. Its history is kept and it lags. §11.3
+is what bounds the lag.
+
+### 11.3 The cap is an exponential moving average, not a reset
+
+`max_history` caps `n`. At the cap the oldest frame's share is scaled out of the sum
+(`k = (max_history - 1) / max_history` applied to the sum and to both moments) instead of the
+history being thrown away, so the estimate becomes an exponential moving average with
+`alpha = 1 / max_history` and a pixel whose lighting changed catches up in ~`max_history`
+frames. Below the cap `k` is exactly `1.0` and the sum is exact, which is why §11.1's table is
+a bitwise claim for any `max_history >= 8`.
+
+Freezing the pixel at the cap instead would keep the sum exact forever and was rejected: the
+arm's shadow would never appear on the table.
+
+### 11.4 The variance, and what the mean of it does not say
+
+Per pixel the tracer keeps the first and second raw moments of the **per-frame** luminance
+(`l` is this frame's own contribution over `spp`, taken as the difference of the accumulator
+before and after the loop — exact to ~`n` ULP, and it feeds a weight, not an image):
+
+```
+var = max(0, E[l^2] - E[l]^2) / n                 // n >= 4: the moments
+var = <7x7 depth/normal-weighted spatial variance of the accumulated luminance> / n   // n < 4
+```
+
+The extra `/ n` is the packet's, not the paper's, and it is deliberate: what the filter needs
+is the variance of the **mean** the pixel holds, not the variance of one frame. Below `n = 4`
+the moments are too few to be worth anything and the paper's spatial estimate stands in,
+divided by `n` for the same reason, so the quantity is continuous across the switch and always
+means "how uncertain is this pixel".
+
+`variance_falls_with_history`, Cornell 64×64, 1 spp frames:
+
+| n | mean | median | p99 | max |
+|---|---|---|---|---|
+| 1 (spatial) | 3.42e-3 | 4.50e-4 | 1.08e-1 | 1.91e-1 |
+| 4 (moments) | 3.31e-4 | 2.45e-5 | 5.13e-3 | 2.44e-1 |
+| 16 (moments) | 4.54e-3 | **2.32e-5** | **1.15e-3** | 1.79e+1 |
+
+**The mean does not fall, and the oracle therefore asserts on the median and the p99** — a
+deviation from the packet's wording, with the measurement above as the reason. A 1 spp path
+trace has a heavy tail: one firefly pixel of 4,096 reaches a variance of 17.9 at `n = 16` and
+owns the mean by itself. The estimate of `sigma^2` from `n` frames also grows towards the
+truth as `n` grows (four frames usually miss the tail entirely), so the mean is measuring the
+estimator's own convergence, not the pixel's. The median and the p99 — what the filter
+actually experiences on a typical and on a bad pixel — fall monotonically, the p99 by 4.5×
+from `n = 4` to `n = 16`.
+
+### 11.5 The luminance weight
+
+`w_l = exp(-|l_p - l_q| / (sigma_l * sqrt(var_p) + eps))`, `sigma_l = 4`, `eps = 1e-10`,
+multiplied into `w_depth * w_normal`, and the variance filtered alongside the colour with the
+squared weights (`var_out = sum(w^2 var_q) / (sum w)^2`). `sqrt` is IEEE-exact and allowed;
+`exp` is `es_math::approx`'s, never the platform's (§3.4).
+
+`luminance_weight_narrows_the_filter_where_variance_is_low`, a synthetic 64×32 tile with flat
+geometry so the depth and normal weights are 1 everywhere — the left half carries 4-pixel
+stripes at variance 0, the right half is noise at variance 0.25. RMSE against the input after
+4 à-trous iterations:
+
+| half | with `w_l` | without |
+|---|---|---|
+| converged (var 0) | **0.000000** | 0.490636 |
+| noisy (var 0.25) | 0.285117 | 0.288394 |
+
+The converged half does not move at all and the noisy half is filtered as before, which is the
+entire point of the V in SVGF.
+
+### 11.6 What the device does, and where it stops agreeing bit for bit
+
+One persistent buffer per renderer, `HIST_STRIDE = 12` floats per atlas pixel (sum 3, the two
+moments, `n`, the previous depth, primitive id and normal, the variance), zeroed on
+allocation — device-local memory is uninitialised and a garbage `n` would reuse a sample that
+never existed, the same reason M4 zeroes the `ReSTIR` buffer. `pt.slang` does the validity
+test, the accumulation and the moments; the new `accumulate.slang` does the variance in its
+own dispatch, because the short-history fallback reads a 7×7 neighbourhood and every pixel's
+accumulated colour has to be written first. `Channel::History` (`u32`, the `n` after this
+frame) joins `PT_CHANNELS` — a diagnostic and a mask, not a schema change: no Observation IR
+node reads it, and it is `1` everywhere when `temporal` is `None`.
+
+`gpu_accumulation_matches_the_cpu`, RTX 3060 (driver 591.12, Slang 2026.8), 8 frames × 1 spp:
+
+| comparison | measured |
+|---|---|
+| CPU `Rgb8` vs the new golden `cornell_pt_accum8_rgb8` | bit-identical |
+| GPU `Channel::History` vs CPU | **bit-identical** (8 everywhere) |
+| GPU `PtRadiance` vs CPU | 5.79e-7 normalized, 89 ULP |
+| GPU `Rgb8` vs the golden | **0 of 12,288 bytes differ** |
+| GPU `PtRadiance` vs CPU, + variance-guided SVGF | **6.99e-5** normalized |
+| GPU `Rgb8` vs CPU, + variance-guided SVGF | 0 of 12,288 bytes differ |
+
+The `History` channel is bit-identical rather than "close" because it is integer logic over a
+g-buffer each side compares with **its own** previous frame, and each side is bit-identical to
+itself across frames ([§7](#7-determinism-34)).
+
+The last-but-one row is the one that needed a new tolerance: **1e-3 for the guided filter**,
+where the unguided one holds to 1e-5. `exp(-|l_p - l_q| / (sigma_l * sqrt(var) + 1e-10))` is a
+near-discontinuous function of its inputs wherever the variance is small, so the ~1e-7 the two
+path tracers already disagree by ([§10.3](#103-the-tone-map): 216 ULP) is amplified into a
+different tap weight at a few pixels. The picture is unaffected — the tone-mapped bytes are
+identical — which is why the `Rgb8` row is the assertion that means something and the
+normalized one is a bound with headroom.
+
+### 11.7 Cost and the showcase
+
+`es video showcase --path pt --accumulate [--max-history N]` (default 32). The history lives
+in the one `Renderer` the showcase already keeps across ticks, so the accumulation is the
+showcase's own frames in order. `--accumulate` is a `pt` flag: asking for it with `--path rs`
+is a usage error rather than a silently ignored option.
+
+RTX 4090, V19b `nominal-00`, 224 ticks at 1280×720, same camera, exposure and interleaved
+two-pass method as [section 10.6](#106-cost-rtx-4090-v19b-nominal-00-224-ticks-1280720) —
+whole-command wall clock over 224 frames, so tessellate, upload, dispatch, readback and the
+write to disk are all in it. **This card was idle** (`nvidia-smi`: 0 % utilization, no other
+compute process; 1-min load 0.00 before the run, 0.53 after), unlike section 10.6's, which is
+why its 64 spp row reads 254 ms here and 562 ms there.
+
+| render | ms/frame (pass 1, pass 2) |
+|---|---|
+| `Pt` NEE, 64 spp — R3's row | 254.0, 254.6 |
+| `Pt` NEE, 4 spp | 24.3, 23.6 |
+| `Pt` NEE, 4 spp, `--accumulate --max-history 32` | **29.2, 28.5** |
+| `Pt` NEE, 1,024 spp (the SSIM reference, 2 frames) | 4356.4 |
+
+**Accumulation costs 4.9 ms/frame** — the history read and write, the variance dispatch, and
+the `History` channel's own readback and file write, which a measurement does not have to pay
+for twice. Against the 64 spp row it buys 8.7×.
+
+What that buys in picture quality, SSIM against the 1,024 spp NEE reference of the same tick
+(tick 120), split by the `History` channel: **static** = the 838,797 pixels of 921,600 at the
+`max_history` cap, **arm** = the 56,669 with a history of 4 frames or less.
+
+| render | SSIM, static pixels | SSIM, arm pixels | whole frame | mean byte |
+|---|---|---|---|---|
+| `Pt` 64 spp | 0.4369 | **0.5224** | 0.4386 | 119.5 |
+| `Pt` 4 spp | 0.1623 | 0.1009 | 0.1544 | 81.5 |
+| `Pt` 4 spp accumulated | **0.7547** | 0.1130 | 0.6990 | 118.4 |
+
+The two halves of that table are the packet's answer and its cost, and both are worth saying
+out loud. On the pixels the scene did not change, 4 spp accumulated at **29 ms/frame is
+1.7× the SSIM of 64 spp at 254 ms/frame** — the background converges to something 8.7× cheaper
+and visibly better. On the pixels the arm moved through, it is the 4 spp image (0.1130 vs
+0.1009) and 64 spp is still 4.6× better: **the accumulation buys the background, and the
+subject of this scene is the arm.** A showcase that wants both wants either a higher `--spp`
+with `--accumulate` or the reprojection section 11.8 does not have. The mean byte says the same thing
+from the other side: 4 spp alone reads 81.5 against the reference's neighbourhood of 118–120,
+because Reinhard is concave and per-pixel noise therefore *darkens* a frame's mean; accumulate
+it and the mean comes back to 118.4.
+
+`target/plan-u/r4/` has the pictures: `pt-4-accum-000000/8/32/120.png` (the history filling
+in), `pt-64-tick120.png`, `ref-1024-tick120.png`, and `history-000120.png` — the mask itself,
+which is a clean silhouette of the arm and the wake it drags behind it.
+
+### 11.8 What R4 skips
+
+- **Reprojection, and therefore a moving camera.** The one big one. A camera that moves gets a
+  full reset every frame, so `--accumulate` buys nothing for a fly-through. The pieces it
+  would need are motion vectors (the renderer has the previous frame's poses, not a velocity
+  buffer), a bilinear history resample, and the pairwise MIS treatment the temporal `ReSTIR`
+  pass would need at the same time ([section 10.7](#107-what-r3-still-skips)'s last item).
+- **History-length-driven kernel widening**, and the variance prefilter —
+  [§4.3](#43-svgf)'s list.
+- **`ReSTIR` + `temporal` together.** `restir: true` replaces the radiance buffer with a
+  direct-lighting estimate *after* the accumulation wrote it, so the two are not combined.
+  Nothing stops a caller setting both; the result is `ReSTIR`'s image, unaccumulated, and the
+  `History` channel still counts frames. Combining them means accumulating reservoirs, which
+  is ReSTIR's own temporal pass, not this one.
+- **A per-face primitive id** (§11.2), and a *materially* keyed validity test: two triangles
+  of one flat face are different primitives here.
+- **Adaptive `max_history`.** The paper's `alpha` is fixed too; a per-pixel one driven by a
+  temporal gradient is the next thing anyone would add, and it is another data-dependent
+  quantity to make deterministic.

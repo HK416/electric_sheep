@@ -23,9 +23,20 @@ static const float ES_INV_GAMMA = 0.41666666;
 
 static const uint ES_TRI_STRIDE = 20;
 static const uint ES_VIEW_STRIDE = 16;
-// Slots 0..20 are M4's globals, 20..31 packet M7/R2's shading block, then the per-view
-// records. Mirrors `renderer.rs`'s PARAM_VIEW_BASE.
-static const uint ES_PARAM_VIEW_BASE = 31;
+// Slots 0..20 are M4's globals, 20..31 packet M7/R2's shading block, 31..37 packet M7/R3's
+// PT block, 37..39 packet M7/R4's temporal block, then the per-view records. Mirrors
+// `renderer.rs`'s PARAM_VIEW_BASE.
+static const uint ES_PARAM_VIEW_BASE = 39;
+// Floats per pixel of the temporal history (packet M7/R4). Mirrors `renderer.rs`'s
+// HIST_STRIDE and `cpu::History`: sum(3), m1, m2, n, depth, tri, normal(3), variance.
+static const uint ES_HIST_STRIDE = 12;
+// The a-trous filter's edge-stopping scales. ES_SVGF_SIGMA_L and ES_SVGF_VAR_EPS are packet
+// M7/R4's luminance weight; mirrors `cpu::SVGF_*`.
+static const float ES_SVGF_SIGMA_Z = 0.1;
+static const float ES_SVGF_SIGMA_L = 4.0;
+static const float ES_SVGF_VAR_EPS = 1e-10;
+static const uint ES_SVGF_MIN_HISTORY = 4;
+static const int ES_SVGF_SPATIAL_RADIUS = 3;
 // How far a Full shadow ray looks: the light is directional, so the occluder may be outside
 // the camera's far plane. Mirrors `cpu::SHADOW_FAR`.
 static const float ES_SHADOW_FAR = 1e30;
@@ -60,6 +71,17 @@ float es_shininess()    { return es_params[23]; }
 float3 es_sky_rgb()     { return float3(es_params[24], es_params[25], es_params[26]); }
 float3 es_ground_rgb()  { return float3(es_params[27], es_params[28], es_params[29]); }
 uint es_ssaa()          { return max(es_param_u(30), 1u); }
+// The Pt block (packet M7/R3). Defaults reproduce the pre-R3 output byte for byte: nee off,
+// a directional light with zero radiance, exposure 1, Reinhard.
+bool es_nee()           { return es_param_u(31) != 0; }
+float3 es_light_rgb()   { return float3(es_params[32], es_params[33], es_params[34]); }
+float es_exposure()     { return es_params[35]; }
+uint es_tonemap_kind()  { return es_param_u(36); }
+// The temporal block (packet M7/R4). `es_max_history() == 0` is no accumulation at all: one
+// frame standing alone, which is every golden but `cornell_pt_accum8_rgb8`.
+uint es_max_history()   { return es_param_u(37); }
+// Frames this slot has rendered since the last whole-slot reset: the sample base.
+uint es_frame()         { return es_param_u(38); }
 uint es_atlas_w()      { return es_tiles_per_row() * es_tile_w(); }
 uint es_atlas_h()      { return es_rows() * es_tile_h(); }
 
@@ -124,6 +146,13 @@ EsView es_view(uint v) {
     o.near = es_params[b + 11];
     o.far = es_params[b + 12];
     return o;
+}
+
+// Whether this view is bitwise the one the history was built with (packet M7/R4). The host
+// does the comparison -- it is the one that has both frames' `ViewParams` -- and writes the
+// answer into the view record's first pad slot. 0 resets the whole tile.
+bool es_view_history_valid(uint v) {
+    return asuint(es_params[ES_PARAM_VIEW_BASE + v * ES_VIEW_STRIDE + 13]) != 0;
 }
 
 float3 es_qrot(float4 q, float3 v) {
@@ -365,6 +394,17 @@ float es_luminance(float3 c) {
     return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
 }
 
+// The depth and normal edge-stopping weights of the a-trous filter and of packet M7/R4's
+// spatial variance estimate, returned separately so each caller multiplies them in its own
+// order (the filter's `wh * wz * wn` is the order its output bits were measured in).
+// Mirror of `cpu::edge_weights`.
+void es_edge_weights(float z_p, float z_q, float3 n_p, float3 n_q, out float wz, out float wn) {
+    wz = es_exp(-abs(z_p - z_q) / ES_SVGF_SIGMA_Z);
+    wn = max(dot(n_p, n_q), 0.0);
+    // n^32 by five squarings: no transcendental, the same ops as the Rust mirror.
+    for (uint s = 0; s < 5; ++s) { wn *= wn; }
+}
+
 // Duff et al., branchless orthonormal basis.
 void es_onb(float3 n, out float3 t, out float3 b) {
     float sgn = n.z >= 0.0 ? 1.0 : -1.0;
@@ -399,6 +439,106 @@ float3 es_tri_point(EsTri tr, float u, float v) {
 float es_tri_area(EsTri tr) {
     float3 c = cross(tr.v1 - tr.v0, tr.v2 - tr.v0);
     return 0.5 * es_sqrt(dot(c, c));
+}
+
+// --- tone map (packet M7/R3) ----------------------------------------------------------------
+// Mirror of `cpu::tonemap`. Additions, multiplies and one division: no transcendental at all,
+// so CPU == GPU is asserted bitwise rather than to a ULP budget.
+
+float es_tonemap(float c) {
+    float x = c * es_exposure();
+    if (es_tonemap_kind() == 0) {
+        return x / (1.0 + x);                        // Reinhard et al. 2002
+    }
+    float num = x * (2.51 * x + 0.03);               // Narkowicz 2015 ACES fit
+    float den = x * (2.43 * x + 0.59) + 0.14;
+    return clamp(num / den, 0.0, 1.0);
+}
+
+uint es_pack_tonemapped(float3 lin) {
+    return es_u8(es_tonemap(lin.x))
+         | (es_u8(es_tonemap(lin.y)) << 8)
+         | (es_u8(es_tonemap(lin.z)) << 16)
+         | 0xff000000u;
+}
+
+// --- next-event estimation (packet M7/R3) ---------------------------------------------------
+// Mirror of `cpu::{power_heuristic, light_pdf, nee_direct}`; PBR 4e chapter 13.10.
+
+// Power heuristic, beta = 2. Zero when both pdfs are zero.
+float es_power_heuristic(float a, float b) {
+    float a2 = a * a;
+    float b2 = b * b;
+    float d = a2 + b2;
+    return d > 0.0 ? a2 / d : 0.0;
+}
+
+// Solid-angle pdf of "pick one of n_lights emissive triangles uniformly, then a uniform point
+// on it". Zero when the strategy cannot produce that direction.
+float es_light_pdf(EsTri light, float3 dir, float dist2, float n_lights) {
+    float cos_l = abs(dot(light.n, -dir));
+    float area = es_tri_area(light);
+    return (cos_l > 0.0 && area > 0.0 && n_lights > 0.0)
+        ? dist2 / (cos_l * area * n_lights)
+        : 0.0;
+}
+
+// One NEE estimate at a diffuse hit: an emissive triangle (MIS), the directional light (a
+// delta, no MIS), and the sky (cosine pdf, so the power heuristic gives each half). `keys`
+// are RNG streams 4, 5, 6 of the table in `crates/es-render/src/rng.rs`. The three `if`s are
+// on config, uniform across the dispatch, so the work per pixel is still fixed (spec 3.4).
+//
+// `last` is the bounce budget's final vertex: no BSDF continuation is traced from there, so
+// the MIS weights are dropped and NEE carries the whole term (see `cpu::nee_direct`).
+float3 es_nee_direct(float3 p, float3 n, float3 albedo, float far, bool last, uint k_pick,
+                     uint k_area, uint k_sky) {
+    float3 f = albedo * ES_INV_PI;
+    float3 out_rgb = float3(0.0, 0.0, 0.0);
+
+    uint n_l = es_n_lights();
+    if (n_l > 0) {
+        float n_lights = float(n_l);
+        float pick = es_rng_uniform(k_pick, 0);
+        uint idx = min(uint(pick * n_lights), n_l - 1);
+        EsTri light = es_tri(es_light_tri(idx));
+        float3 lp = es_tri_point(light, es_rng_uniform(k_area, 0), es_rng_uniform(k_area, 1));
+        float3 seg = lp - p;
+        float dist2 = dot(seg, seg);
+        float dist = es_sqrt(dist2);
+        if (dist > 0.0) {
+            float3 dir = seg * (1.0 / dist);
+            float cos_s = dot(n, dir);
+            float p_light = es_light_pdf(light, dir, dist2, n_lights);
+            if (cos_s > 0.0 && p_light > 0.0) {
+                float w = last ? 1.0 : es_power_heuristic(p_light, cos_s * ES_INV_PI);
+                // `dist * (1 - 1e-3)` so the shadow ray stops short of the light itself.
+                if (!es_any_hit(p, dir, 0.0, dist * (1.0 - 1e-3))) {
+                    out_rgb += (f * light.emission) * (cos_s / p_light * w);
+                }
+            }
+        }
+    }
+
+    float3 lrgb = es_light_rgb();
+    if (lrgb.x > 0.0 || lrgb.y > 0.0 || lrgb.z > 0.0) {
+        float3 l = es_light_dir();
+        float cos_s = dot(n, l);
+        if (cos_s > 0.0 && !es_any_hit(p, l, 0.0, ES_SHADOW_FAR)) {
+            out_rgb += (f * lrgb) * cos_s;
+        }
+    }
+
+    float3 sky = es_sky();
+    if (sky.x > 0.0 || sky.y > 0.0 || sky.z > 0.0) {
+        float3 d = es_cosine_hemisphere(n, k_sky);
+        float cos_s = dot(n, d);
+        float pdf = cos_s * ES_INV_PI;
+        if (pdf > 0.0 && !es_any_hit(p, d, 0.0, far)) {
+            float w = last ? 1.0 : es_power_heuristic(pdf, pdf);
+            out_rgb += (f * sky) * (cos_s / pdf * w);
+        }
+    }
+    return out_rgb;
 }
 
 #endif

@@ -157,6 +157,10 @@ pub enum RenderPath {
     Pt {
         spp: u32,
         bounces: u32,
+        /// Next-event estimation with power-heuristic MIS (packet M7/R3,
+        /// `docs/design/renderer.md` section 10). `false` is today's estimator, byte for
+        /// byte — `cornell_pt1spp` pins it (spec 28.10 rule 1).
+        nee: bool,
         /// `ReSTIR` DI (spec 28.6). Replaces the path-traced image with a direct-lighting
         /// estimate; see `docs/design/renderer.md` for what that means and what is skipped.
         restir: bool,
@@ -219,6 +223,41 @@ impl Shading {
     }
 }
 
+/// How linear radiance becomes a display value before the sRGB transfer (packet M7/R3).
+///
+/// Both operators are additions, multiplies and one division per channel — **no
+/// transcendental**, so the CPU reference and the shader agree bit for bit and
+/// `tonemap_is_bitwise_on_both_sides` can assert exactly that (spec 3.2 `DET-010` is about
+/// what a transcendental would cost; here there is none to approximate).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Tonemap {
+    /// Reinhard et al. 2002: `c * e / (1 + c * e)`. Never clips, never reaches 1.
+    #[default]
+    Reinhard,
+    /// Narkowicz 2015's rational fit of the ACES filmic curve,
+    /// `x (2.51 x + 0.03) / (x (2.43 x + 0.59) + 0.14)`, clamped to `[0, 1]`.
+    Aces,
+}
+
+/// Temporal accumulation for a camera that does not move (packet M7/R4,
+/// `docs/design/renderer.md` section 11; Schied et al. 2017 section 4.1).
+///
+/// Read by the [`RenderPath::Pt`] path only, and `None` by default: every golden and the
+/// committed `frames` fixture are one frame standing alone (spec 28.10 rule 1).
+///
+/// A pixel keeps its radiance sum across frames while the camera and the pixel's own
+/// depth, normal and primitive id are **bitwise** what the previous frame had, so `N` frames
+/// of `spp` samples are bit for bit one frame of `N * spp`. There is no motion-vector
+/// reprojection: a moving camera resets the whole slot, by design.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Temporal {
+    /// Frames a pixel's history may hold, at least 1. Below the cap the accumulated sum is
+    /// exact; at it the oldest frame's share is scaled out, which makes the estimate an
+    /// exponential moving average with `alpha = 1 / max_history` and lets a pixel whose
+    /// *lighting* changed (but whose geometry did not) catch up in `max_history` frames.
+    pub max_history: u32,
+}
+
 /// Tile packing, spec 15.2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TileAtlasCfg {
@@ -252,6 +291,11 @@ pub struct RenderConfig {
     pub path: RenderPath,
     /// World-space unit direction **towards** the one directional light.
     pub light_dir: Vec3,
+    /// Linear radiance of that directional light, for the `Pt` path's next-event estimation
+    /// (packet M7/R3). Default `[0, 0, 0]`: a light with no radiance contributes nothing, so
+    /// the default `Pt` output is unchanged. The `Rs` path does not read it — `light_dir`
+    /// alone is what `Lambert` and `Full` shade with.
+    pub light_rgb: [f32; 3],
     /// Ambient floor in `[0, 1]`, so a surface facing away from the light is not pure black.
     /// [`Shading::Full`] replaces it with a hemisphere ambient.
     pub ambient: f32,
@@ -264,6 +308,15 @@ pub struct RenderConfig {
     pub seed: u32,
     /// A-trous iterations when `svgf` is on.
     pub svgf_iterations: u32,
+    /// Linear exposure multiplier applied before [`Self::tonemap`] on the `Pt` path's
+    /// [`Channel::Rgb8`] output. `1.0` is neutral.
+    pub exposure: f32,
+    /// Tone map applied before the sRGB transfer on the `Pt` path's [`Channel::Rgb8`]
+    /// output. The `Rs` path clamps, as it always did (packet M7/R2 is unchanged).
+    pub tonemap: Tonemap,
+    /// Accumulate the `Pt` path's samples across frames for a still camera (packet M7/R4).
+    /// `None` is one frame standing alone — today's bytes.
+    pub temporal: Option<Temporal>,
 }
 
 impl RenderConfig {
@@ -274,11 +327,15 @@ impl RenderConfig {
             channels: crate::RS_CHANNELS.iter().copied().collect(),
             path: RenderPath::Rs,
             light_dir: Vec3::new(0.3, 0.4, 0.866_025_4).normalize(),
+            light_rgb: [0.0, 0.0, 0.0],
             ambient: 0.15,
             shading: Shading::Lambert,
             sky: [0.0, 0.0, 0.0],
             seed: 0x5eed_1234,
             svgf_iterations: 4,
+            exposure: 1.0,
+            tonemap: Tonemap::Reinhard,
+            temporal: None,
         }
     }
 
@@ -291,17 +348,48 @@ impl RenderConfig {
         }
     }
 
-    /// Path-tracing config emitting `PtRadiance` plus the three geometry channels.
+    /// Path-tracing config emitting `PtRadiance` and `Rgb8` plus the three geometry channels.
+    ///
+    /// `nee` is `false` here and only here: `cornell_pt1spp` is this config, and spec 28.10
+    /// rule 1 says a renderer improvement arrives as a field whose default is today's output.
     pub fn pt(atlas: TileAtlasCfg, spp: u32, bounces: u32) -> Self {
         let mut cfg = Self::rs(atlas);
         cfg.path = RenderPath::Pt {
             spp,
             bounces,
+            nee: false,
             restir: false,
             svgf: false,
         };
         cfg.channels = crate::PT_CHANNELS.iter().copied().collect();
         cfg
+    }
+
+    /// [`Self::pt`] with next-event estimation on (packet M7/R3). Nothing else moves.
+    pub fn pt_nee(atlas: TileAtlasCfg, spp: u32, bounces: u32) -> Self {
+        let mut cfg = Self::pt(atlas, spp, bounces);
+        cfg.path = RenderPath::Pt {
+            spp,
+            bounces,
+            nee: true,
+            restir: false,
+            svgf: false,
+        };
+        cfg
+    }
+
+    /// Whether the `Pt` path does next-event estimation. Always `false` for `Rs`.
+    pub(crate) fn nee(&self) -> bool {
+        matches!(self.path, RenderPath::Pt { nee: true, .. })
+    }
+
+    /// Frames of history the `Pt` path may keep, or `None` for no accumulation at all
+    /// (packet M7/R4). Always `None` for `Rs`: the rasterizer has no samples to accumulate.
+    pub(crate) fn max_history(&self) -> Option<u32> {
+        match self.path {
+            RenderPath::Rs => None,
+            RenderPath::Pt { .. } => self.temporal.map(|t| t.max_history.max(1)),
+        }
     }
 
     pub(crate) fn spp(&self) -> u32 {

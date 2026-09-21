@@ -468,6 +468,32 @@ impl<B: PhysicsBackend> Env<B> {
         self.recorder.open(env)
     }
 
+    /// Sets `env`'s episode counter so that the **next** [`Self::reset`] draws episode
+    /// `episode` (§6.3: the randomization is keyed by `(seed, env, episode, stream)`;
+    /// §28.9 ladder 10).
+    ///
+    /// Touches nothing else: no reset, no backend call, no recorder state, and in particular
+    /// not the physics tick or the recorder's own episode id. [`Self::new`] draws episode 0 at
+    /// construction, so a caller of a fresh `Env` that wants episode `k` calls
+    /// `seek_episode(0, k)` and then `reset(Some(&[0]))`.
+    ///
+    /// Refused while an episode is open with steps recorded on it: a seek there would make
+    /// the next `reset` close and hand back an episode drawn from one distribution while its
+    /// successor is drawn from another, and the discard would be silent.
+    pub fn seek_episode(&mut self, env: u32, episode: u64) -> Result<(), EnvError> {
+        if env >= self.n_envs {
+            return Err(EnvError::Task(format!("env {env} is out of range")));
+        }
+        let steps = self.recorder.open(env).steps();
+        if steps > 0 {
+            return Err(EnvError::Task(format!(
+                "env {env} has an open episode with {steps} step(s) on it: seek before the                  reset that opens an episode, never over one that has already recorded"
+            )));
+        }
+        self.episode[env as usize] = episode;
+        Ok(())
+    }
+
     /// The §12.4 metrics measured so far. Domains this packet does not run (render, inference,
     /// VRAM) stay `None`.
     pub fn metrics(&self) -> EnvMetrics {
@@ -895,6 +921,31 @@ pub(crate) mod tests {
         assert_eq!(env.open_episode(0).steps(), 0, "a fresh episode is open");
         // Reset re-drew the constant, so the env is back at 2.0 rad.
         assert_eq!(env.backend().state().qpos_of(0)[0], 2.0);
+    }
+
+    /// Packet M7/T8 oracle 2. A seek over an episode that has already recorded steps would
+    /// make the next `reset` hand back an episode drawn from one distribution and open its
+    /// successor from another, with nothing said about it. The refusal names the env and the
+    /// step count so the caller knows what it was about to throw away.
+    #[test]
+    fn seek_refuses_an_open_episode() {
+        let task = pendulum_task(0, Some(Distribution::Constant(0.1)));
+        let mut env = env_of(&task, 2, 0);
+        // Before any step, a seek is fine: `Env::new`'s own reset left an empty episode open.
+        env.seek_episode(1, 7).expect("no steps recorded yet");
+        env.step(&[0.0, 0.0]).unwrap();
+        let err = env.seek_episode(1, 9).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("env 1"), "{text}");
+        assert!(text.contains("1 step(s)"), "{text}");
+        // Refused means refused: the counter did not move, so the next reset draws 7 still.
+        env.reset(Some(&[1])).unwrap();
+        assert_eq!(env.open_episode(1).steps(), 0);
+        assert!(env
+            .seek_episode(2, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("out of range"));
     }
 
     #[test]
