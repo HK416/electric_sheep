@@ -7,19 +7,17 @@
 //! belongs in `.eslayout` sidecars, not here (rule 7).
 //!
 //! Foundation (P18, P19, P27): [`types`], [`image`], [`diag`], [`codes`], [`graph`], [`hash`].
-//! The first four live in `es-ir-types` since P-M0-R4 (spec 1.5 context budget) and are
-//! re-exported here unchanged.
+//! All six live in `es-ir-types` (the first four since P-M0-R4, `graph` and `hash` since
+//! P-M8-R6, both for the spec 1.5 context budget) and are re-exported here unchanged.
 //! The five IRs (P20..P24) fill in [`task`], [`observation`], [`learning`], [`deployment`],
 //! [`evaluation`], and the boundary rules (P26) fill in [`cross`]. IR-C, the Task IR control
 //! graph (spec 6.2), is [`control`]; see `docs/design/control-graph.md`.
 
-pub mod graph;
-pub mod hash;
 pub mod norm;
 
 // Split out to `es-ir-types` for the spec 1.5 context budget (P-M0-R4), re-exported here so
-// every `es_ir::codes::..` / `es_ir::types::..` path still resolves.
-pub use es_ir_types::{codes, diag, image, types};
+// every `es_ir::codes::..` / `es_ir::graph::..` path still resolves.
+pub use es_ir_types::{codes, diag, graph, hash, image, types};
 
 pub mod control;
 pub mod cross;
