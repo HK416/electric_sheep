@@ -10207,7 +10207,11 @@ fn train_init_partial_and_refused() {
         let es_ir::learning::LearningNode::StateEncoder { kind, .. } = node else {
             panic!("node 1 is a StateEncoder");
         };
-        *kind = es_ir::learning::StateEncoderKind::Mlp { hidden: vec![128] };
+        *kind = es_ir::learning::StateEncoderKind::Mlp {
+            hidden: vec![128],
+            activation: es_ir::learning::Activation::Relu,
+            activate_output: false,
+        };
     });
     let (ok, said, out) = run("partial", &with_init(&base, &partial));
     // It stops at the interpreter, which is the refusal every other `es train` test stops at.
