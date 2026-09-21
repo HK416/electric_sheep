@@ -495,31 +495,53 @@ fn run_typed<const NJ: usize, const H: usize>(
 /// (`INV-14`).
 #[cfg(feature = "render")]
 fn renderer_cfg(bundle: &PolicyBundle) -> Result<es_env::EnvRendererCfg, CliError> {
-    let images: Vec<_> = bundle
-        .task
-        .observation_spec
-        .channels
-        .iter()
-        .filter_map(|(name, c)| c.ty.image.as_ref().map(|spec| (name, &c.ty.frame, spec)))
-        .collect();
-    let [(name, frame, spec)] = images.as_slice() else {
-        return Err(CliError::Runtime(format!(
-            "--frames needs exactly one image channel in the Task IR's ObservationSpec; it \
-             declares {}",
-            images.len()
-        )));
-    };
+    let (name, frame, spec, render) = image_channel(&bundle.task)?;
     let es_ir::types::Frame::Camera(camera) = frame else {
         return Err(CliError::Runtime(format!(
             "image channel {name:?} is not in a camera frame, so there is no camera to render \
              it from"
         )));
     };
-    Ok(es_env::EnvRendererCfg::rgb(
-        *camera,
-        spec.width,
-        spec.height,
-    ))
+    Ok(es_env::render::sensor_cfg(camera, &spec, &render, None))
+}
+
+/// The one image channel a `--frames` render is of: its name, frame, declared `ImageSpec` and
+/// the `render` its sensor declares (spec 7.4, packet M7/R5).
+///
+/// Lives here and is used by `es loop collect --frames` too, so the two commands cannot
+/// disagree about which channel is being rendered or about how. A channel whose source is not
+/// a sensor has no render declaration and gets the default one — the rasterizer, which is what
+/// it got before this field existed.
+#[cfg(feature = "render")]
+pub(crate) fn image_channel(
+    task: &es_ir::task::TaskIr,
+) -> Result<
+    (
+        String,
+        es_ir::types::Frame,
+        es_ir::image::ImageSpec,
+        es_ir::task::SensorRender,
+    ),
+    CliError,
+> {
+    let images: Vec<_> = task
+        .observation_spec
+        .channels
+        .iter()
+        .filter_map(|(name, c)| c.ty.image.map(|spec| (name, c, spec)))
+        .collect();
+    let [(name, channel, spec)] = images.as_slice() else {
+        return Err(CliError::Runtime(format!(
+            "--frames needs exactly one image channel in the Task IR's ObservationSpec; it \
+             declares {}",
+            images.len()
+        )));
+    };
+    let render = match channel.source {
+        es_ir::task::ObsSource::Sensor { render, .. } => render,
+        _ => es_ir::task::SensorRender::default(),
+    };
+    Ok(((*name).clone(), channel.ty.frame, *spec, render))
 }
 
 /// One camera, rendered under one episode's lighting (spec 10.2).
@@ -924,6 +946,34 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
         .map_err(|e| CliError::Runtime(format!("{}: {e}", a.config)))?;
     let eval_ir = es_ir::serial::evaluation_from_toml(&config_raw)
         .map_err(|e| CliError::Runtime(format!("{}: {e}", a.config)))?;
+    // Spec 13.3 / spec 10.4: an Evaluation IR names the documents it judges, and `es eval run`
+    // puts its `evaluation_hash` on the report. Running a bundle built from a different Task
+    // or Observation IR would therefore stamp the right hash on numbers from the wrong
+    // documents -- a moved render path is exactly that case (packet M7/R5). `PolicyBundle::open`
+    // has already checked the other four IRs against each other, so the only rules this can
+    // add are the Evaluation IR's own.
+    let diags: Vec<_> = es_ir::cross::check(&es_ir::cross::IrBundle {
+        task: &bundle.task,
+        observation: &bundle.observation,
+        learning: &bundle.learning,
+        deployment: &bundle.deployment,
+        evaluation: Some(&eval_ir),
+    })
+    .into_iter()
+    .filter(es_ir::diag::Diagnostic::is_error)
+    .collect();
+    if !diags.is_empty() {
+        return Err(CliError::Runtime(format!(
+            "{} does not judge {}:\n{}",
+            a.config,
+            a.policy,
+            diags
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+        )));
+    }
 
     if let Err(reason) = MuJoCoCpuBackend::is_available() {
         println!("SKIPPED (mujoco-cpu backend unavailable: {reason})");
