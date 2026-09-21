@@ -65,6 +65,8 @@ crates/es-render/tests/render.rs
 tests/golden/render/cornell_pt_accum8_rgb8.*
 crates/es/src/cmd/showcase.rs
 crates/es/tests/video.rs
+crates/es-sensor/src/channel.rs
+crates/es-env/src/render.rs
 docs/design/renderer.md
 docs/design/renderer.ko.md
 docs/packets/M7/R4-temporal-accumulation.md
@@ -77,6 +79,13 @@ docs/packets/M7/R4-temporal-accumulation.ko.md
 (`accumulate.slang` 신규: 유효성 + 합 + 모멘트), `tests/render.rs`, 새 골든(8프레임 × 1
 spp, NEE 켜짐, Reinhard — CPU 생성기의 바이트), `showcase.rs`/`video.rs`(플래그), 설계
 노트, 이 패킷.
+
+**패킷이 예상하지 못했던 두 파일, 구현 시점에 추가.** `Channel`은 `es-render`가 아니라
+`es-sensor`(layer 3)의 타입이고 `es-render`는 재수출만 한다. 그래서 `Channel::History`는
+`crates/es-sensor/src/channel.rs`의 match 4개이고, `crates/es-env/src/render.rs`의
+`channel_format`에 있는 `Channel` 전수 `match`가 컴파일되려면 arm 하나가 더 필요하다.
+둘 다 `EnvRendererCfg`에 PT 손잡이를 다는 일이 아니고 관측 경로에서 도달하지도 않는다.
+`forbidden` 목록은 그대로다.
 
 ## 오라클
 

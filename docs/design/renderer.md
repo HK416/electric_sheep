@@ -418,17 +418,36 @@ On by `Pt { svgf: true }`, off by default. **One** à-trous pass set, `n` iterat
 normal:
 
 ```
-w = w_depth * w_normal
-w_depth  = exp(-|z_p - z_q| / (sigma_z * |grad z| + eps))
-w_normal = max(0, dot(n_p, n_q))^sigma_n
+w = w_depth * w_normal * w_luminance
+w_depth     = exp(-|z_p - z_q| / (sigma_z * |grad z| + eps))
+w_normal    = max(0, dot(n_p, n_q))^sigma_n
+w_luminance = exp(-|l_p - l_q| / (sigma_l * sqrt(var_p) + eps))     // M7/R4, sigma_l = 4
 ```
 
-Skipped: the **V** in SVGF. There is no temporal accumulation of colour, no per-pixel variance
-estimate, no variance-guided `w_luminance` term, no 7×7 variance prefilter for low-sample
-regions, no disocclusion handling, no history-length-driven kernel widening. What is left is
-an edge-aware à-trous filter — a real and useful denoiser, and not the algorithm in the SVGF
-paper. It is named `svgf` because §28.6 names it; the doc comment on the kernel says the same
-thing this paragraph does.
+**The `w_luminance` term exists since M7/R4 and is `1.0` without a history.** It needs a
+per-pixel variance, and a variance needs frames to estimate it from, so the term is on exactly
+when `RenderConfig::temporal` is `Some` — with `None` the weight is a multiply by exactly
+`1.0` and the filter's output is byte for byte what M4's was. The variance is filtered
+alongside the colour with the *squared* weights, so each iteration reads the variance of what
+it is actually reading. [§11](#11-temporal-accumulation-for-a-still-camera-m7r4) is the whole
+of it: the accumulation, the disocclusion rule, the moments and the numbers.
+
+Still skipped, and this is the honest list as of M7/R4:
+
+- **History-length-driven kernel widening.** The paper widens the kernel where the history is
+  short; here the kernel is always 5 taps at stride `1 << i`. The variance term already
+  widens the *effective* kernel where the estimate is uncertain, which is most of what the
+  widening buys, and a data-dependent tap count is a data-dependent loop bound (§3.4).
+- **Motion-vector reprojection.** §11's validity rule is a still camera's: no history is
+  resampled from a different pixel, ever.
+- **A variance *prefilter*.** The 7×7 estimate of §11 stands in for the moments while
+  `n < 4`; the paper also prefilters the variance *inside* the first à-trous iteration. Not
+  done — the estimate feeds the iterations unfiltered.
+- **`ReSTIR` GI**, and everything else [section 10.7](#107-what-r3-still-skips) lists.
+
+What was skipped before M7/R4 and is not any more: temporal accumulation of colour, the
+per-pixel variance estimate, the variance-guided luminance term, the short-history spatial
+estimate, and disocclusion handling.
 
 ## 5. CPU references (§1.4)
 
@@ -1190,3 +1209,250 @@ the path tracer the second thing cut, so every step of it says what it is not:
   reprojection its two candidates share one shading point, so `1/M` *is* the correct MIS
   weight there. Give it reprojection and it needs the same pairwise treatment the spatial
   pass got.
+
+## 11. Temporal accumulation for a still camera (M7/R4)
+
+`docs/packets/M7/R4-temporal-accumulation.md`. The showcase camera does not move; the arm
+does. Before this packet every frame started from zero samples, so a 224-tick cell paid for
+224 independent renders of a scene that is 95 % the same picture each time. The packet asks
+whether `N` frames of 1 spp can *be* one frame of `N` spp on the pixels the scene did not
+change — not approximately, **bitwise** — and whether the per-pixel variance that falls out of
+it can finally drive [§4.3](#43-svgf)'s filter.
+
+```rust
+pub struct Temporal { pub max_history: u32 }
+pub struct RenderConfig { ..., pub temporal: Option<Temporal> }   // default None
+```
+
+`None` is the default and is today's bytes: `cargo xtask verify-goldens` reports **0 changed**
+and one added, and the `tests/fixtures/visible-learning/frames` fixture is untouched because
+the observation path never sets the field ([§9.5](#95-why-the-observation-path-did-not-get-the-knob)
+applies verbatim — `EnvRendererCfg` has no `temporal` either).
+
+### 11.1 The sample-indexing rule, which is what makes it exact
+
+Frame `f` of a camera slot draws its samples with `sample = f * spp + s` in `rng::key`, and
+the kernel's accumulator **starts at the history sum** rather than at zero:
+
+```
+acc = history_sum * k                       // k = 1 below the cap; see 11.3
+for s in 0..spp:  acc += <sample f*spp + s>  // the same left-to-right chain as one big frame
+sum := acc ;  n := n + 1
+out  = sum * (1 / (n * spp))                 // one divide, at the end
+```
+
+Both halves are necessary. The indexing makes `N` frames draw the same samples one
+`N * spp` frame draws, in the same order; starting the accumulator at the history sum makes
+the *additions* happen in one unbroken chain, because floating-point addition is not
+associative and `(a+b) + (c+d)` is not `((a+b)+c)+d`. `accumulation_of_n_frames_is_n_spp`
+asserts the consequence on Cornell, 64×64, NEE, 3 bounces:
+
+| comparison | `PtRadiance` | `Rgb8` |
+|---|---|---|
+| 8 frames × 1 spp vs 1 frame × 8 spp | **bitwise** | **bitwise** |
+| 8 frames × 4 spp vs 1 frame × 32 spp | **bitwise** | **bitwise** |
+
+`f` is the *slot's* frame counter, not the pixel's history length, and that is the one
+deviation from the packet's wording (`n * spp + s`). They are the same number everywhere the
+history was never dropped — the case the table above pins — and they differ exactly where a
+pixel restarted. Using the pixel's `n` there would make a pixel sitting at the `max_history`
+clamp redraw the samples it already holds every frame, which converges to a *one-frame*
+estimate instead of a converged one. The counter always moves forward; the average restarts.
+
+### 11.2 Validity: a still camera, a bitwise g-buffer, no reprojection
+
+A pixel keeps its history when **both** hold:
+
+1. the slot's `CameraView` is bitwise the previous frame's — the host compares the 16
+   `ViewParams` floats by bit pattern and writes the answer into the view record's pad slot
+   13, so a camera that moved by one ULP resets that camera's whole tile;
+2. the pixel's own **depth, camera-space normal and primitive id** are bitwise the previous
+   frame's.
+
+Otherwise `n := 0` for that pixel and it starts over. There is no motion-vector reprojection:
+history is never resampled from another pixel, so a moving camera gets nothing from this
+packet except a reset. That is the whole disocclusion rule, and it is a scene-moves /
+camera-still rule by construction.
+
+The primitive id is the **triangle** index, not the geom id, and that is stricter than it
+sounds: `history_drops_where_the_scene_moved` translates Cornell's tall block by 0.6 m after
+4 frames and finds 464 of 4,096 pixels dropped against 3,632 kept — and some of the 464 are
+pixels that stayed on the same flat face while the quad's diagonal moved underneath them.
+Keeping them would need a per-face id the tessellator does not carry; dropping them costs one
+frame of history at a silhouette-shaped boundary. A changed `CameraView` gives `1` everywhere,
+which the same test asserts.
+
+**What the rule does not catch, by design:** a pixel whose *lighting* changed while its
+geometry did not — the arm's shadow crossing the table. Its history is kept and it lags. §11.3
+is what bounds the lag.
+
+### 11.3 The cap is an exponential moving average, not a reset
+
+`max_history` caps `n`. At the cap the oldest frame's share is scaled out of the sum
+(`k = (max_history - 1) / max_history` applied to the sum and to both moments) instead of the
+history being thrown away, so the estimate becomes an exponential moving average with
+`alpha = 1 / max_history` and a pixel whose lighting changed catches up in ~`max_history`
+frames. Below the cap `k` is exactly `1.0` and the sum is exact, which is why §11.1's table is
+a bitwise claim for any `max_history >= 8`.
+
+Freezing the pixel at the cap instead would keep the sum exact forever and was rejected: the
+arm's shadow would never appear on the table.
+
+### 11.4 The variance, and what the mean of it does not say
+
+Per pixel the tracer keeps the first and second raw moments of the **per-frame** luminance
+(`l` is this frame's own contribution over `spp`, taken as the difference of the accumulator
+before and after the loop — exact to ~`n` ULP, and it feeds a weight, not an image):
+
+```
+var = max(0, E[l^2] - E[l]^2) / n                 // n >= 4: the moments
+var = <7x7 depth/normal-weighted spatial variance of the accumulated luminance> / n   // n < 4
+```
+
+The extra `/ n` is the packet's, not the paper's, and it is deliberate: what the filter needs
+is the variance of the **mean** the pixel holds, not the variance of one frame. Below `n = 4`
+the moments are too few to be worth anything and the paper's spatial estimate stands in,
+divided by `n` for the same reason, so the quantity is continuous across the switch and always
+means "how uncertain is this pixel".
+
+`variance_falls_with_history`, Cornell 64×64, 1 spp frames:
+
+| n | mean | median | p99 | max |
+|---|---|---|---|---|
+| 1 (spatial) | 3.42e-3 | 4.50e-4 | 1.08e-1 | 1.91e-1 |
+| 4 (moments) | 3.31e-4 | 2.45e-5 | 5.13e-3 | 2.44e-1 |
+| 16 (moments) | 4.54e-3 | **2.32e-5** | **1.15e-3** | 1.79e+1 |
+
+**The mean does not fall, and the oracle therefore asserts on the median and the p99** — a
+deviation from the packet's wording, with the measurement above as the reason. A 1 spp path
+trace has a heavy tail: one firefly pixel of 4,096 reaches a variance of 17.9 at `n = 16` and
+owns the mean by itself. The estimate of `sigma^2` from `n` frames also grows towards the
+truth as `n` grows (four frames usually miss the tail entirely), so the mean is measuring the
+estimator's own convergence, not the pixel's. The median and the p99 — what the filter
+actually experiences on a typical and on a bad pixel — fall monotonically, the p99 by 4.5×
+from `n = 4` to `n = 16`.
+
+### 11.5 The luminance weight
+
+`w_l = exp(-|l_p - l_q| / (sigma_l * sqrt(var_p) + eps))`, `sigma_l = 4`, `eps = 1e-10`,
+multiplied into `w_depth * w_normal`, and the variance filtered alongside the colour with the
+squared weights (`var_out = sum(w^2 var_q) / (sum w)^2`). `sqrt` is IEEE-exact and allowed;
+`exp` is `es_math::approx`'s, never the platform's (§3.4).
+
+`luminance_weight_narrows_the_filter_where_variance_is_low`, a synthetic 64×32 tile with flat
+geometry so the depth and normal weights are 1 everywhere — the left half carries 4-pixel
+stripes at variance 0, the right half is noise at variance 0.25. RMSE against the input after
+4 à-trous iterations:
+
+| half | with `w_l` | without |
+|---|---|---|
+| converged (var 0) | **0.000000** | 0.490636 |
+| noisy (var 0.25) | 0.285117 | 0.288394 |
+
+The converged half does not move at all and the noisy half is filtered as before, which is the
+entire point of the V in SVGF.
+
+### 11.6 What the device does, and where it stops agreeing bit for bit
+
+One persistent buffer per renderer, `HIST_STRIDE = 12` floats per atlas pixel (sum 3, the two
+moments, `n`, the previous depth, primitive id and normal, the variance), zeroed on
+allocation — device-local memory is uninitialised and a garbage `n` would reuse a sample that
+never existed, the same reason M4 zeroes the `ReSTIR` buffer. `pt.slang` does the validity
+test, the accumulation and the moments; the new `accumulate.slang` does the variance in its
+own dispatch, because the short-history fallback reads a 7×7 neighbourhood and every pixel's
+accumulated colour has to be written first. `Channel::History` (`u32`, the `n` after this
+frame) joins `PT_CHANNELS` — a diagnostic and a mask, not a schema change: no Observation IR
+node reads it, and it is `1` everywhere when `temporal` is `None`.
+
+`gpu_accumulation_matches_the_cpu`, RTX 3060 (driver 591.12, Slang 2026.8), 8 frames × 1 spp:
+
+| comparison | measured |
+|---|---|
+| CPU `Rgb8` vs the new golden `cornell_pt_accum8_rgb8` | bit-identical |
+| GPU `Channel::History` vs CPU | **bit-identical** (8 everywhere) |
+| GPU `PtRadiance` vs CPU | 5.79e-7 normalized, 89 ULP |
+| GPU `Rgb8` vs the golden | **0 of 12,288 bytes differ** |
+| GPU `PtRadiance` vs CPU, + variance-guided SVGF | **6.99e-5** normalized |
+| GPU `Rgb8` vs CPU, + variance-guided SVGF | 0 of 12,288 bytes differ |
+
+The `History` channel is bit-identical rather than "close" because it is integer logic over a
+g-buffer each side compares with **its own** previous frame, and each side is bit-identical to
+itself across frames ([§7](#7-determinism-34)).
+
+The last-but-one row is the one that needed a new tolerance: **1e-3 for the guided filter**,
+where the unguided one holds to 1e-5. `exp(-|l_p - l_q| / (sigma_l * sqrt(var) + 1e-10))` is a
+near-discontinuous function of its inputs wherever the variance is small, so the ~1e-7 the two
+path tracers already disagree by ([§10.3](#103-the-tone-map): 216 ULP) is amplified into a
+different tap weight at a few pixels. The picture is unaffected — the tone-mapped bytes are
+identical — which is why the `Rgb8` row is the assertion that means something and the
+normalized one is a bound with headroom.
+
+### 11.7 Cost and the showcase
+
+`es video showcase --path pt --accumulate [--max-history N]` (default 32). The history lives
+in the one `Renderer` the showcase already keeps across ticks, so the accumulation is the
+showcase's own frames in order. `--accumulate` is a `pt` flag: asking for it with `--path rs`
+is a usage error rather than a silently ignored option.
+
+RTX 4090, V19b `nominal-00`, 224 ticks at 1280×720, same camera, exposure and interleaved
+two-pass method as [section 10.6](#106-cost-rtx-4090-v19b-nominal-00-224-ticks-1280720) —
+whole-command wall clock over 224 frames, so tessellate, upload, dispatch, readback and the
+write to disk are all in it. **This card was idle** (`nvidia-smi`: 0 % utilization, no other
+compute process; 1-min load 0.00 before the run, 0.53 after), unlike section 10.6's, which is
+why its 64 spp row reads 254 ms here and 562 ms there.
+
+| render | ms/frame (pass 1, pass 2) |
+|---|---|
+| `Pt` NEE, 64 spp — R3's row | 254.0, 254.6 |
+| `Pt` NEE, 4 spp | 24.3, 23.6 |
+| `Pt` NEE, 4 spp, `--accumulate --max-history 32` | **29.2, 28.5** |
+| `Pt` NEE, 1,024 spp (the SSIM reference, 2 frames) | 4356.4 |
+
+**Accumulation costs 4.9 ms/frame** — the history read and write, the variance dispatch, and
+the `History` channel's own readback and file write, which a measurement does not have to pay
+for twice. Against the 64 spp row it buys 8.7×.
+
+What that buys in picture quality, SSIM against the 1,024 spp NEE reference of the same tick
+(tick 120), split by the `History` channel: **static** = the 838,797 pixels of 921,600 at the
+`max_history` cap, **arm** = the 56,669 with a history of 4 frames or less.
+
+| render | SSIM, static pixels | SSIM, arm pixels | whole frame | mean byte |
+|---|---|---|---|---|
+| `Pt` 64 spp | 0.4369 | **0.5224** | 0.4386 | 119.5 |
+| `Pt` 4 spp | 0.1623 | 0.1009 | 0.1544 | 81.5 |
+| `Pt` 4 spp accumulated | **0.7547** | 0.1130 | 0.6990 | 118.4 |
+
+The two halves of that table are the packet's answer and its cost, and both are worth saying
+out loud. On the pixels the scene did not change, 4 spp accumulated at **29 ms/frame is
+1.7× the SSIM of 64 spp at 254 ms/frame** — the background converges to something 8.7× cheaper
+and visibly better. On the pixels the arm moved through, it is the 4 spp image (0.1130 vs
+0.1009) and 64 spp is still 4.6× better: **the accumulation buys the background, and the
+subject of this scene is the arm.** A showcase that wants both wants either a higher `--spp`
+with `--accumulate` or the reprojection section 11.8 does not have. The mean byte says the same thing
+from the other side: 4 spp alone reads 81.5 against the reference's neighbourhood of 118–120,
+because Reinhard is concave and per-pixel noise therefore *darkens* a frame's mean; accumulate
+it and the mean comes back to 118.4.
+
+`target/plan-u/r4/` has the pictures: `pt-4-accum-000000/8/32/120.png` (the history filling
+in), `pt-64-tick120.png`, `ref-1024-tick120.png`, and `history-000120.png` — the mask itself,
+which is a clean silhouette of the arm and the wake it drags behind it.
+
+### 11.8 What R4 skips
+
+- **Reprojection, and therefore a moving camera.** The one big one. A camera that moves gets a
+  full reset every frame, so `--accumulate` buys nothing for a fly-through. The pieces it
+  would need are motion vectors (the renderer has the previous frame's poses, not a velocity
+  buffer), a bilinear history resample, and the pairwise MIS treatment the temporal `ReSTIR`
+  pass would need at the same time ([section 10.7](#107-what-r3-still-skips)'s last item).
+- **History-length-driven kernel widening**, and the variance prefilter —
+  [§4.3](#43-svgf)'s list.
+- **`ReSTIR` + `temporal` together.** `restir: true` replaces the radiance buffer with a
+  direct-lighting estimate *after* the accumulation wrote it, so the two are not combined.
+  Nothing stops a caller setting both; the result is `ReSTIR`'s image, unaccumulated, and the
+  `History` channel still counts frames. Combining them means accumulating reservoirs, which
+  is ReSTIR's own temporal pass, not this one.
+- **A per-face primitive id** (§11.2), and a *materially* keyed validity test: two triangles
+  of one flat face are different primitives here.
+- **Adaptive `max_history`.** The paper's `alpha` is fixed too; a per-pixel one driven by a
+  temporal gradient is the next thing anyone would add, and it is another data-dependent
+  quantity to make deterministic.
