@@ -1,0 +1,40 @@
+# A2 of packet M8/P-M8-R1's exploration-noise table: A1 with **one** further field moved,
+# `[rl] entropy` = 0.0 (A1 and the committed recipe both pay 0.005).
+#
+# Why. The entropy bonus is a term on the Gaussian's own differential entropy, which is a
+# function of `log_std` alone (`train_ppo.py`, `entropy = (log_std + 0.5*log(2*pi*e)).sum()`),
+# so it is a direct reward for widening sigma and nothing else pushes back once the policy's
+# advantage signal is flat. S4e measured exactly that: rollout entropy 5.52 at iteration 1,
+# 4.87 at the 4,000-iteration peak, 6.06 at 10,000 -- rising again past the peak, which is the
+# same span over which `success_rate` fell 0.5625 -> 0.3125. Setting the coefficient to zero
+# asks whether the decay is the bonus being paid.
+#
+# A1's `init_log_std` is kept because the pair is the hypothesis: a small starting sigma that
+# an entropy bonus immediately re-inflates is not a smaller sigma. Every other field is
+# `training-reach.toml`'s; the budget and the marks are the packet's (see `a1-log-std.toml`).
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-001/untrained.esb"
+
+[rl]
+algo         = "ppo"
+envs         = 16
+horizon      = 64
+epochs       = 4
+minibatches  = 4
+gamma        = 0.99
+lam          = 0.95
+clip         = 0.2
+entropy      = 0.0
+value_coef   = 0.5
+init_log_std = -2.5
+
+[run]
+steps         = 10000
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [4000, 10000]
+device        = "cpu"
+interpreter   = "python"

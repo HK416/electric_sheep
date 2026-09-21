@@ -632,6 +632,128 @@ the task in memory for its own cross-check, so the CLI tests substitute the one 
 differs (`ActionSpec.space`) into a scratch copy of `task-reach.toml`. Committing the pair is
 the next packet's to do if it wants one.
 
+### P-M8-R1 — exploration noise, oracle server (Linux, 16-core CPU), 2026-09-21 UTC
+
+Artifacts: `~/artifacts/plan-t/r1/` (`a1-seed0/`, `a2-seed0/`, `a3-seed0/`, `a4-seed0/`,
+`a4-seed1/`, `logs/`), each run carrying `metrics/loss-curve.json`, `metrics/env-metrics.json`,
+`checkpoints/{4000,10000}.esb`, `eval-4000/` and `eval-10000/`. Tree `~/Projects/es-r1-noise`
+(this branch, pushed as a tarball and deleted after the runs), `cargo build --release -p es`,
+`es_native` rebuilt for it. Interpreter `~/venvs/es-lerobot-cuda/bin/python`, torch
+2.11.0+cu129, mujoco 3.13.0. Recipes `tests/fixtures/rl/noise/{a1-log-std, a2-no-entropy,
+a3-cosine, a4-log-std-mid}.toml` — `training-reach.toml` with one field moved per row, seed 0,
+`steps = 10000`, `checkpoint_at = [4000, 10000]`, `envs = 16`, `horizon = 64`, CPU backend.
+**A0 is quoted from S4e** (`~/artifacts/plan-s/s4e/run-4000/`, `run-10000/`) and was not re-run.
+Every checkpoint is scored by `es eval run --config tests/fixtures/rl/evaluation-reach.toml`,
+the same `evaluation_hash f15fe888…`, 16 held-out seeds 201–216, and every bundle carries
+`task_hash b5d3b813…`, `observation_hash 4ced8547…`, `learning_hash eb805f18…` and
+`lowering_hash dce8d352…` — S4e's, unmoved, which is this table's precondition (§13.3).
+A1/A2 and A3/A4 each ran **two at a time** on the 16-core box under `nice -n 10`, which
+inflates their wall clocks and nothing else; A4 seed 1 ran alone. Each evaluation is one
+process, 10.9–11.8 s.
+
+**The table.** Three-value cells are iterations 1 / 4,000 / 10,000 of
+`metrics/loss-curve.json`; `success_rate` and `episode_length` are the `nominal` suite's at the
+two checkpoints:
+
+| id | `init_log_std` | `entropy` | `schedule` | `executed_ne_sampled_rate` | `envelope_violation_rate` | rollout entropy | rollout `return` | held-out `success_rate` | held-out `episode_length` | wall clock | `training_hash` |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| **A0** (S4e, quoted) | −0.5 | 0.005 | constant | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 | 5.517 / 4.869 / 6.056 | −15.765 / −4.740 / −4.916 | **0.5625** / 0.3125 | 129.4 / 157.3 | 12m38.0s (4,000) · 29m22.3s (10,000), both alone | `1933697d…` / `69665845…` |
+| **A1** | **−2.5** | 0.005 | constant | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 | −6.481 / −4.918 / −4.680 | −15.573 / −4.752 / −4.440 | 0.0000 / 0.0000 | 200.0 / 200.0 | 34m31.7s | `42632125…` |
+| **A2** | −2.5 | **0.0** | constant | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 | −6.482 / −10.335 / −13.405 | −15.573 / −4.379 / −3.582 | 0.0000 / 0.0000 | 200.0 / 200.0 | 33m29.7s | `bbfd1464…` |
+| **A3** | −2.5 | 0.0 | **`warmup_cosine`** (100, 3e-6) | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 | −6.486 / −9.651 / −11.219 | −15.573 / −4.545 / −4.033 | 0.0000 / 0.0000 | 200.0 / 200.0 | 28m2.6s | `74f7d6a3…` |
+| **A4** | **−1.5** | 0.0 | as A3 | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 | −0.486 / −6.195 / −8.591 | −15.622 / −4.268 / −3.512 | 0.3125 / **0.3750** | 155.3 / 137.9 | 31m10.5s | `e9556a2e…` |
+| **A4, seed 1** | −1.5 | 0.0 | as A3 | 1.00 / 1.00 / 1.00 | 1.00 / 1.00 / 1.00 | −0.486 / −6.634 / −10.071 | −14.705 / −3.728 / −5.475 | **0.0000** / **0.0000** | 200.0 / 200.0 | 25m28.1s (alone) | `31a2db0b…` |
+
+**The clamp rate does not fall, and that is the measurement.** At the three marks every row
+still reads exactly 1.00, so the table above is not rounding anything away. Counted over the
+whole run instead — 10,000 iterations × 1,024 rows = 10,240,000 sampled actions — the
+*absolute* number of rows the plane let through unchanged is:
+
+| id | σ = exp(`init_log_std`) | rows the plane did not clamp, of 10,240,000 | whole-run mean rate |
+|---|---|---|---|
+| A0 | 0.607 rad | **0** | 1.0 |
+| A1 | 0.082 rad | **8** | 0.99999921875 |
+| A2 | 0.082 rad | **181** | 0.99998232421875 |
+| A3 | 0.082 rad | **19** | 0.99999814453125 |
+| A4 | 0.223 rad | **1** | 0.99999990234375 |
+| A4, seed 1 | 0.223 rad | **8** | 0.99999921875 |
+
+Shrinking the Gaussian by a factor of 7.4 bought 8 unclamped ticks in ten million. The reason
+is in the shape of the action and not in the size of the noise: the action is an absolute joint
+**position target**, and `deployment-reach.toml` bounds how far that target may travel from the
+*measured* joint in one 50 Hz tick at `velocity_max = 3.0 rad/s` → 0.06 rad (with
+`action_rate.first_diff_max = 0.08` rad the looser of the two). What the plane clamps is
+therefore `μ − q`, the distance between the network's commanded pose and where the arm actually
+is, and σ only perturbs a quantity that is already outside the bound. **Open question 2 cannot
+be answered by turning the noise down** — at σ = 0 the rate would still be ~1.00 — so the
+choice left is the one the review names: train on the executed action (the estimator), widen or
+reshape the envelope, or make the head emit a delta rather than an absolute target.
+
+The nine §12.4 metrics as `Rollout.metrics()` gives them (`metrics/env-metrics.json`). A domain
+this path never runs is `null`, not a fabricated zero, and there is deliberately no `step/s`:
+
+| metric | A0 (S4e, 10,000) | A1 | A2 | A3 | A4 | A4, seed 1 |
+|---|---|---|---|---|---|---|
+| `physics_steps_per_sec` | 32,076 | 33,591 | 35,093 | 34,225 | 30,156 | 36,479 |
+| `actions_per_sec` | 8,019 | 8,398 | 8,773 | 8,556 | 7,539 | 9,120 |
+| `camera_frames_per_sec` | `null` — no renderer on this path (§4.3) | `null` | `null` | `null` | `null` | `null` |
+| `pixels_per_sec` | `null` — same | `null` | `null` | `null` | `null` | `null` |
+| `observation_gb_per_sec` | `null` — not instrumented by `Env` | `null` | `null` | `null` | `null` | `null` |
+| `policy_inferences_per_sec` | `null` — inference is in the trainer, not in `Env` | `null` | `null` | `null` | `null` | `null` |
+| `p50_end_to_end_latency` | `null` — synchronous rollout, no declared latency (section 3) | `null` | `null` | `null` | `null` | `null` |
+| `p95_end_to_end_latency` | `null` — same | `null` | `null` | `null` | `null` | `null` |
+| `gpu_memory_peak` | `null` — CPU backend | `null` | `null` | `null` | `null` | `null` |
+| `chunk_underrun_rate` | `null` — horizon 1, no chunk buffer | `null` | `null` | `null` | `null` | `null` |
+
+Everything else is `Target / Status: unverified`. 640,000 control ticks per run, over
+1,759.9 s (A0), 2,069.0 s (A1), 2,006.9 s (A2), 1,680.0 s (A3), 1,867.9 s (A4) and
+1,525.6 s (A4 seed 1) of `Rollout` time; the two-at-a-time rows are slower for that reason and
+not for a reason inside the trainer — A4 seed 1, alone on the box, is the fastest row in the
+table and is also the row that scores zero.
+
+**The perturbed suites for A4 seed 0, the only run with a success to perturb** (measurements,
+not gates, §10.4). Every other row — A1, A2, A3 and A4 at seed 1 — is 0.0000 in all four
+suites at both marks:
+
+| A4 | `nominal` | `observation_delay` | `torque_noise` | `backlash` |
+|---|---|---|---|---|
+| 4,000, seed 0 | 0.3125 | 0.0625 | 0.4375 | 0.2500 |
+| 10,000, seed 0 | 0.3750 | 0.0000 | 0.1875 | 0.2500 |
+| 10,000, seed 1 | 0.0000 | 0.0000 | 0.0000 | 0.0000 |
+
+**One sentence per variable.**
+
+* **`init_log_std` is the only knob that moved the success rate at all, and it did not move
+  the clamp rate.** A3 → A4 changes it and nothing else, −2.5 → −1.5, and the held-out
+  `success_rate` at 10,000 goes 0.0000 → 0.3750 while the clamp rate stays at 1.00 in both;
+  A1 → A0 changes it the other way, −2.5 → −0.5, and buys back the 0.5625 peak that no
+  small-σ row comes near. **The seed-1 re-run says how far that reading may be pushed and no
+  further:** the same recipe at seed 1 scores 0.0000 at both marks, so A4's 0.3750 is one draw
+  from a spread that includes zero, and the only claim the five runs support is the negative
+  one — at σ = exp(−2.5) the task is not learned at either budget, at any of the three
+  entropy/schedule settings.
+* **The entropy coefficient moves the rollout entropy and nothing a person cares about.**
+  A1 → A2 zeroes it and the entropy at 10,000 falls from −4.680 to −13.405 — the bonus was
+  indeed paying for σ to re-inflate, exactly as the S4e row guessed — but `success_rate` is
+  0.0000 on both sides of the change, so on this task the bonus was neither the cause of the
+  decay nor a cost worth removing on its own.
+* **The learning-rate schedule changes nothing at σ = exp(−2.5) and cannot be credited for
+  A4's shape.** A2 → A3 turns the cosine on alone and both score 0.0000 / 0.0000 (it is 5½
+  minutes faster, which is scheduling noise from sharing the box, not a property of the
+  schedule); A4 seed 0 holds past 4,000 rather than decaying as A0 does (0.3125 → 0.3750
+  against 0.5625 → 0.3125), but it differs from A0 in three fields at once **and its seed-1
+  twin does not hold anything** (0.0000 → 0.0000), so "the cosine stopped the decay" is *not*
+  a claim this table supports.
+
+**The acceptance criterion is still not met, no variant beats A0, and no variant holds past
+4,000 in a way a second seed agrees with** — the packet said to write that down if it
+happened, and it happened. 0.8 was never approached; A0's 0.5625 at 4,000 remains the best
+number on the reach task; A4's 0.3750 at 10,000 is the best of the four new recipes, ties A0's
+own decayed tail (0.3125) within one episode of sixteen, and is 0.0000 at seed 1. What the
+packet bought is not a better policy, it is the elimination of an explanation: the 1.00 is
+structural in the action space, not an artefact of a badly chosen exploration σ, and the next
+thing to move is the estimator, the envelope or the head — not the recipe.
+
 ## 8. The importer and the adapter
 
 Rule 3 of section 1 says the adapter declares and code never guesses. This is what that comes
