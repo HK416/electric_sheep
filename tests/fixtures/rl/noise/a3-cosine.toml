@@ -1,0 +1,44 @@
+# A3 of packet M8/P-M8-R1's exploration-noise table: A2 with **one** further field moved,
+# `[run] schedule` = `warmup_cosine` (A0-A2 run at a constant 3e-4 throughout).
+#
+# Why. S4e's run holds one learning rate for all 10,000 iterations, so the last update is as
+# large as the first: a policy that has found a solution keeps being pushed off it. The cosine
+# decays the step to `lr_min` = lr/100 = 3e-6 by the end of the run, which is what turns the
+# late iterations from search into refinement. `warmup = 100` is short on purpose -- warmup is
+# for a large batch's first steps, and this batch is 1,024 rows, not 4,096.
+#
+# The cosine's period is the length of the run (`docs/design/training-recipe.md` section 10:
+# `total_steps` is part of the schedule), so this schedule at `steps = 10000` is *not* the same
+# schedule at 4,000 -- the 4,000-iteration checkpoint of this run is a quarter of the way down
+# a 10,000-iteration cosine, not the end of a 4,000-iteration one. That is deliberate: the
+# packet compares two marks of one curve, as S4e did.
+#
+# A1's `init_log_std` and A2's zero entropy are kept, for the reason A2's header gives. Every
+# other field is `training-reach.toml`'s; the budget and the marks are the packet's.
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-001/untrained.esb"
+
+[rl]
+algo         = "ppo"
+envs         = 16
+horizon      = 64
+epochs       = 4
+minibatches  = 4
+gamma        = 0.99
+lam          = 0.95
+clip         = 0.2
+entropy      = 0.0
+value_coef   = 0.5
+init_log_std = -2.5
+
+[run]
+steps         = 10000
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [4000, 10000]
+device        = "cpu"
+interpreter   = "python"
+schedule      = { kind = "warmup_cosine", warmup = 100, lr_min = 3e-6 }

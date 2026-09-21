@@ -1,0 +1,44 @@
+# A1 of packet M8/P-M8-R1's exploration-noise table: `training-reach.toml` with **one**
+# field moved, `[rl] init_log_std` = -2.5 (the trainer's default is -0.5).
+#
+# Why this one first. S4b and S4e both measured `executed_ne_sampled_rate = 1.00` on every
+# tick of every iteration: at `init_log_std = -0.5` the Gaussian's sigma is about 0.6 rad per
+# 50 Hz control tick, and the action is a joint *position target* whose per-tick travel the
+# plane bounds at 3.0 rad/s -- 0.06 rad. A 0.6 rad perturbation is ten times the envelope, so
+# every sampled action is clamped by construction and every gradient is the log-probability of
+# an action the env never executed (`rl-continuation.md` open question 2). exp(-2.5) = 0.082
+# rad puts the noise back inside the same order as the envelope.
+#
+# `steps`/`checkpoint_at` are the packet's, not the committed recipe's: 10,000 iterations with
+# marks at 4,000 (S4e's measured peak) and 10,000 (where S4e decayed to 0.3125), so one run
+# scores both budgets. Everything else -- envs, horizon, epochs, minibatches, gamma, lam, clip,
+# entropy, value_coef, lr, seed, device -- is `training-reach.toml`'s, unchanged.
+#
+# This recipe is an input to a measurement, not a route under test: no golden names it, and
+# `train_rl_dry_run_plan` keeps running against `training-rl-demo.toml`.
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-001/untrained.esb"
+
+[rl]
+algo         = "ppo"
+envs         = 16
+horizon      = 64
+epochs       = 4
+minibatches  = 4
+gamma        = 0.99
+lam          = 0.95
+clip         = 0.2
+entropy      = 0.005
+value_coef   = 0.5
+init_log_std = -2.5
+
+[run]
+steps         = 10000
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [4000, 10000]
+device        = "cpu"
+interpreter   = "python"

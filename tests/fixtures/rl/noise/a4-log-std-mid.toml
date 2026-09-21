@@ -1,0 +1,38 @@
+# A4 of packet M8/P-M8-R1's exploration-noise table: A3 with **one** field moved back,
+# `[rl] init_log_std` = -1.5 rather than -2.5.
+#
+# Why. A1-A3 take one guess at how small sigma has to be; A4 is the bracket around it.
+# exp(-1.5) = 0.223 rad per tick against a 0.06 rad envelope is still above the plane's bound
+# and still above A1's 0.082, so if the clamp rate falls between A4 and A3 the fall is a
+# function of sigma and not of one lucky value, and if A4 reaches and A3 does not then -2.5
+# explores too little rather than the plane clamping too much. Either reading needs both rows.
+#
+# A2's zero entropy and A3's cosine are kept, so A4 differs from A3 in this one number.
+# Every other field is `training-reach.toml`'s; the budget and the marks are the packet's.
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-001/untrained.esb"
+
+[rl]
+algo         = "ppo"
+envs         = 16
+horizon      = 64
+epochs       = 4
+minibatches  = 4
+gamma        = 0.99
+lam          = 0.95
+clip         = 0.2
+entropy      = 0.0
+value_coef   = 0.5
+init_log_std = -1.5
+
+[run]
+steps         = 10000
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [4000, 10000]
+device        = "cpu"
+interpreter   = "python"
+schedule      = { kind = "warmup_cosine", warmup = 100, lr_min = 3e-6 }
