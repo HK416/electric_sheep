@@ -183,10 +183,10 @@ pub type Projected = Vec<Tri2d>;
 /// the panel is one texture and not a texture over a rectangle.
 pub const BACKGROUND: u8 = 18;
 
-/// The largest raster the panel draws, whatever its size in points. Above this a frame costs
-/// more than it shows: the picture is scaled to fill the panel either way.
-const MAX_WIDTH: u32 = 960;
-const MAX_HEIGHT: u32 = 540;
+/// What one frame may cost: a 960 x 540 raster's worth of pixels, whatever shape the panel
+/// is. Above it a frame costs more than it shows, and the picture is scaled to fill the panel
+/// either way.
+const MAX_PIXELS: f32 = 960.0 * 540.0;
 
 /// One drawn frame: `Rgb8` pixels and the camera-space depth each of them came from.
 ///
@@ -205,21 +205,23 @@ pub struct Raster {
 
 impl Raster {
     /// The raster size for a panel `points` big: its own resolution, scaled down *uniformly*
-    /// to fit [`MAX_WIDTH`] x [`MAX_HEIGHT`].
+    /// until it fits within [`MAX_PIXELS`].
     ///
-    /// Uniformly, because the picture is stretched back over the whole panel: capping the two
-    /// axes independently would squash a wide panel's view of the arm. A degenerate or
-    /// non-finite size is one pixel rather than zero -- `egui` hands out a collapsed panel
-    /// while the window is being dragged, and a zero-sized texture is a device error.
+    /// Uniformly, because the picture is stretched back over the whole panel and
+    /// `ImageSpec::pinhole` has square pixels: scaling both axes by one factor is the same
+    /// view at a different resolution, while capping them independently would squash it. The
+    /// budget is on the area and not on each axis for the same reason -- the Replay panel is
+    /// wide and short (roughly 1900 x 280 on a maximised window), and a per-axis cap would
+    /// spend a quarter of the budget it is allowed and show a quarter of the detail. A
+    /// degenerate or non-finite size is one pixel rather than zero: `egui` hands out a
+    /// collapsed panel while the window is being dragged, and a zero-sized texture is a
+    /// device error.
     #[must_use]
     pub fn size_for(points: [f32; 2]) -> (u32, u32) {
         // `max(1.0)` first: it also turns a NaN into 1.0, since NaN loses every comparison.
         let (w, h) = (points[0].max(1.0), points[1].max(1.0));
-        let scale = (MAX_WIDTH as f32 / w).min(MAX_HEIGHT as f32 / h).min(1.0);
-        (
-            ((w * scale) as u32).clamp(1, MAX_WIDTH),
-            ((h * scale) as u32).clamp(1, MAX_HEIGHT),
-        )
+        let scale = (MAX_PIXELS / (w * h)).sqrt().min(1.0);
+        (((w * scale) as u32).max(1), ((h * scale) as u32).max(1))
     }
 
     /// Draws `projected` into a `w` x `h` frame with a per-pixel depth test.
@@ -1153,13 +1155,20 @@ mod tests {
             "five degrees changed nothing"
         );
 
-        // The panel's size rule: the panel's own resolution, scaled down uniformly to fit.
+        // The panel's size rule: its own resolution while it is inside the budget, and
+        // scaled down uniformly once it is not.
         assert_eq!(Raster::size_for([640.0, 400.0]), (640, 400));
         assert_eq!(Raster::size_for([1920.0, 1080.0]), (960, 540));
-        // Wider than the cap's aspect -- the width binds, and the aspect is kept.
-        assert_eq!(Raster::size_for([1920.0, 600.0]), (960, 300));
-        // Taller -- the height binds.
-        assert_eq!(Raster::size_for([1080.0, 1080.0]), (540, 540));
+        // The budget is on the area, so a panel of another shape keeps its own aspect and
+        // spends all of it -- the Replay panel's own shape is wide and short.
+        for panel in [[1920.0, 600.0], [1080.0, 1080.0], [1897.0, 283.0]] {
+            let (w, h) = Raster::size_for(panel);
+            let (w, h) = (f64::from(w), f64::from(h));
+            assert!(w * h <= f64::from(MAX_PIXELS), "{panel:?} -> {w} x {h}");
+            assert!(w * h > f64::from(MAX_PIXELS) * 0.99, "{panel:?} is timid");
+            let (want, got) = (f64::from(panel[0]) / f64::from(panel[1]), w / h);
+            assert!((want - got).abs() < 0.01, "{panel:?} changed shape");
+        }
         // A collapsed panel is still one pixel, never zero.
         assert_eq!(Raster::size_for([0.0, 0.0]), (1, 1));
         assert_eq!(Raster::size_for([f32::NAN, 10.0]), (1, 10));
