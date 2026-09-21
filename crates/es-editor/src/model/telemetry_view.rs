@@ -188,9 +188,10 @@ pub fn replay(messages: Vec<Message>) -> Source {
 ///
 /// The handshake's own `HelloAck` is handed back as the first message, so
 /// [`TelemetryModel::execution_hash`] is filled from the run's identity (spec 5.3) exactly as
-/// it is from a replayed stream. After that the closure is one non-blocking `try_recv` per
-/// call: `None` means "nothing right now", which is also what a closed connection looks like
-/// — the editor keeps what it has rather than clearing the tab.
+/// it is from a replayed stream. After that the closure reads until one whole message is in
+/// hand or [`READS_PER_POLL`] reads have come back empty: `None` means "nothing right now",
+/// which is also what a closed connection looks like — the editor keeps what it has rather
+/// than clearing the tab over a dropped socket.
 pub fn attach(addr: &str, token: &str) -> Result<Source, String> {
     let socket: SocketAddr = addr
         .trim()
