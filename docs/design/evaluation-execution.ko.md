@@ -239,6 +239,13 @@ observation은 0으로 채워지는 대신 이름으로 거부된다. 검은 프
 비트 단위로 비교한다. T7 이전에는 틱 1에서 실패했다 — 측정된 값과 데모의 숫자가 어떻게
 되었는지는 `docs/design/visible-learning.md` 7.30절에 있다.
 
+**적분기 하나, chunk 행과 `validate` 사이에**(spec 8.5, packet M9/T1). 여기서
+`observe_state`가 `plane_chunk` 한 줄 위로 올라간 뒤로, cell 루프는 플레인이 마지막으로
+**실행한** 명령을 읽어 `es_env::chunk_buffer::absolute_target`에 건넨다. 그 함수는
+`JointPosition`이면 행을 복사하고 `JointDelta`면 더한다. 어느 쪽이든 플레인이 보는 것은
+절대 목표이며, `begin_episode`가 에피소드 첫 `observe_state`가 쓰는 시드를 다시 무장시키므로
+적분기는 에피소드 경계에서 재설정된다.
+
 ### 2.7 샤딩: 단위는 `(cell, episode)` 쌍이다 (패킷 M7/T8, M7/R1)
 
 `es eval run --jobs N`은 **`(cell, episode)` 단위**를 N개 워커 프로세스에 라운드로빈으로 분할한다

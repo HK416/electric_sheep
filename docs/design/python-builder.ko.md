@@ -122,6 +122,13 @@ rollout_matches_es_eval_loop -- --ignored`가 스크립트된 제어 100 스텝�
 `python -m es.selfcheck --env`는 같은 100 스텝을 pyclass로 구동해 같은 골든과
 비교하므로, Rust 구조체와 Python 클래스가 조용히 어긋날 수 없다.
 
+**`act`는 deployment의 `action.space`가 지칭하는 것을 받는다**(spec 8.5, packet M9/T1).
+`JointPosition`에서는 절대 관절 목표, `JointDelta`에서는 현재 목표에 대한 증분이며, 후자는
+샘플과 `validate` 사이에서 `es_env::chunk_buffer::absolute_target`이 플레인이 마지막으로
+실행한 명령 — 에피소드 첫 tick에서는 `observe_state`가 시드한 측정 자세 — 에 더한다. 따라서
+증분 deployment에서 트레이너의 가우시안은 증분 위에 정의되고, 플레인은 여전히 절대 목표를
+검증한다.
+
 ## 알려진 공백 (M2 W6 범위, M0/M1 회귀가 아니다)
 
 - `python/es/examples/pick_place.py`는 spec 14.2 스니펫의 노드 *shape*를

@@ -63,6 +63,45 @@ same policy (S4c) runs under the Deployment IR's declared latency through the or
 regimes is the T7 finding again, and it is what makes the evaluation number honest rather than
 the trainer's own. Open question 1 below.
 
+## 3a. Incremental actions (`ActionSpace::JointDelta`, packet M9/T1)
+
+A Deployment IR may declare `action.space = "joint_delta"`: the policy emits a *change* to the
+current joint target rather than the target itself. One function integrates it —
+`es_env::chunk_buffer::absolute_target` — and the three consumers that hand the plane a row
+(`DomainRunner::emit_actions` for collection, `es_eval::runner::run_episode` for evaluation,
+`Rollout::act` for the trainer) call it between the chunk row and `validate`. Four things
+follow, and they are the whole rule:
+
+* **The plane is untouched.** It goes on validating an *absolute* joint target, against the
+  same envelope, with the same signature (`INV-13`). `tests/fixtures/rl/deployment-reach-delta.toml`
+  is `deployment-reach.toml` with one word changed, and its `safety` block is identical.
+* **The increment is added to what was executed**, never to the raw row: `prev` is
+  `SafetyPlane::last_safe_action()`, read after `observe_state` and before `validate`. At the
+  first tick of an episode that value *is* the measured pose the plane seeded the command
+  chain with (§9.3), so the integrator resets at every episode boundary without owning a
+  second copy of the number. A clamped increment therefore cannot accumulate into a target the
+  arm can never reach — which is the failure this rule exists against.
+* **The units are increments.** A delta policy's `Normalizer { Inverse }` statistics are rad
+  per control tick, so its action port is `Unit::AngularVelocity`; `es_ir::cross` refuses
+  `Unit::Angle` there by name (`XIR-031`). The absolute-target unit on a `JointDelta`
+  deployment is the one mistake that would make the runtime add a position to a position.
+* **Absent is `JointPosition`**, and every committed document's `deployment_hash` is unmoved
+  (`cargo test -p es-ir committed_deployment_hashes_are_unmoved_by_joint_delta`). `JointDelta`
+  is last in both `ActionSpace` enums because the deployment hash writes the discriminant.
+
+Why an increment is worth having for PPO continuation: the policy's noise lands on the change
+rather than on the target, so the per-tick motion the `action_rate` watchdog measures is the
+policy's own output and not the distance between where the arm is and where an untrained
+network guessed. Nothing in the envelope widens to pay for it — §28.12 rule 1's point.
+
+The cost, named rather than hidden: on the buffered paths the delta arm hands the plane one
+row per control tick under a fresh `seq`, because a row the plane has already accepted cannot
+be re-integrated against the tick's executed value. A fresh `seq` every tick stamps
+`last_chunk_tick` every tick, so `ViolationKind::InferenceDeadline` cannot fire for a delta
+policy; a dead policy is still caught, one replan window later, by `ChunkUnderrun` and the
+same fallback. Buying the watchdog back needs a plane that can refresh rows without restamping
+freshness, and the plane was out of scope for T1 (`INV-11..13`).
+
 ## 4. Oracle tiers by source framework (S2b)
 
 | source | what is compared | tier |

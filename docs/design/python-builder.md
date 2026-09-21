@@ -111,6 +111,13 @@ runs it, and pins both to `tests/golden/rollout/so101_100steps.json`;
 `python -m es.selfcheck --env` drives the pyclass over the same 100 steps and compares against
 the same golden, so the Rust struct and the Python class cannot drift apart silently.
 
+**`act` takes what the deployment's `action.space` names** (spec 8.5, packet M9/T1):
+absolute joint targets under `JointPosition`, increments on the current target under
+`JointDelta`, which `es_env::chunk_buffer::absolute_target` adds to the plane's last executed
+command — the measured pose `observe_state` seeded, on the first tick of an episode — between
+the sample and `validate`. The trainer's Gaussian is therefore defined over increments for a
+delta deployment, and the plane still validates an absolute target.
+
 ## Known gaps (M2 W6 scope, not M0/M1 regressions)
 
 - `python/es/examples/pick_place.py` reproduces the spec 14.2 snippet's node *shape* faithfully;

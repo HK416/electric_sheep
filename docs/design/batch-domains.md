@@ -328,6 +328,18 @@ divides by.
 `es-compile`'s memory budget sizes these same buffers and cannot depend on `es-env` (§4.2).
 One formula, two callers (P-M2-R5).
 
+**An increment is integrated here, and nowhere else** (spec 8.5, packet M9/T1). A Deployment IR
+whose `action.space` is `JointDelta` says the row the buffer serves is a *change* to the
+current target, so `es_env::chunk_buffer::absolute_target` adds it to the Safety Plane's last
+**executed** command — which at the first tick of an episode is the measured pose
+`SafetyPlane::observe_state` seeded the command chain with — and the plane goes on validating
+an absolute target, unchanged. Integrating from the executed value rather than from the raw
+row is the whole rule: a clamped increment must not accumulate into a target the arm cannot
+reach. On that arm the chunk handed to the plane carries one row per control tick under a
+fresh `seq`, because a row the plane has already accepted cannot be re-integrated; the cost,
+named rather than hidden, is that `InferenceDeadline` cannot fire for a delta policy and a
+dead one is caught by `ChunkUnderrun` one replan window later instead.
+
 ## 12. What batch-independence actually means
 
 A 16-env run replays bitwise for a fixed `observation.batch`. Across different

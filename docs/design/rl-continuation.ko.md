@@ -58,6 +58,44 @@ PPO는 매 제어 스텝마다 horizon 1로 행동한다: 청크 버퍼도 없�
 선언된 지연시간 아래서 돈다; 두 체제 사이의 차이는 다시 T7의 발견이며, 그것이 평가 수치를
 트레이너 자신의 수치가 아니라 정직한 수치로 만드는 것이다. 아래 열린 질문 1.
 
+## 3a. 증분 행동 (`ActionSpace::JointDelta`, packet M9/T1)
+
+Deployment IR은 `action.space = "joint_delta"`를 선언할 수 있다: 정책이 목표 자체가 아니라
+현재 관절 목표에 대한 *변화량*을 내보낸다. 이를 적분하는 함수는 하나뿐이고 —
+`es_env::chunk_buffer::absolute_target` — 플레인에 행을 건네는 세 소비자(수집의
+`DomainRunner::emit_actions`, 평가의 `es_eval::runner::run_episode`, 트레이너의
+`Rollout::act`)가 chunk 행과 `validate` 사이에서 그것을 호출한다. 뒤따르는 네 가지가 규칙의
+전부다:
+
+* **플레인은 손대지 않는다.** 같은 엔벌로프에 대해, 같은 시그니처로(`INV-13`), 지금처럼
+  *절대* 관절 목표를 검증한다. `tests/fixtures/rl/deployment-reach-delta.toml`은
+  `deployment-reach.toml`에서 한 단어만 바뀐 문서이고 `safety` 블록은 동일하다.
+* **증분은 실행된 값에 더해진다.** 원시 행이 아니다: `prev`는
+  `SafetyPlane::last_safe_action()`이며, `observe_state` 뒤 `validate` 앞에서 읽는다.
+  에피소드의 첫 tick에서 그 값은 플레인이 명령 사슬을 시드한 측정 자세(§9.3) 그 자체이므로,
+  적분기는 그 숫자의 두 번째 사본을 소유하지 않고도 모든 에피소드 경계에서 재설정된다.
+  따라서 클램프된 증분이 팔이 결코 도달할 수 없는 목표로 누적될 수 없다 — 이 규칙이 막으려는
+  실패가 바로 그것이다.
+* **단위는 증분이다.** 증분 정책의 `Normalizer { Inverse }` 통계는 제어 tick당 rad이므로
+  행동 포트는 `Unit::AngularVelocity`다. `es_ir::cross`는 거기 `Unit::Angle`이 오면 이름을
+  불러 거절한다(`XIR-031`). `JointDelta` deployment에 절대 목표 단위가 오는 것이야말로
+  런타임이 위치에 위치를 더하게 만드는 유일한 실수다.
+* **없으면 `JointPosition`이고**, 커밋된 모든 문서의 `deployment_hash`는 움직이지 않는다
+  (`cargo test -p es-ir committed_deployment_hashes_are_unmoved_by_joint_delta`). deployment
+  hash가 판별자를 쓰기 때문에 `JointDelta`는 두 `ActionSpace` enum 모두에서 마지막이다.
+
+PPO 이어붙이기에서 증분이 가질 만한 이유: 정책의 잡음이 목표가 아니라 변화량에 걸리므로,
+`action_rate` 감시견이 재는 tick당 움직임이 팔의 현재 위치와 훈련되지 않은 네트워크의 추측
+사이의 거리가 아니라 정책 자신의 출력이 된다. 그 대가로 엔벌로프가 넓어지는 것은 아무것도
+없다 — §28.12 규칙 1의 요점이다.
+
+감추지 않고 적는 비용: 버퍼를 쓰는 경로에서 증분 갈래는 제어 tick당 한 행을 새 `seq`로
+플레인에 건넨다. 플레인이 이미 수락한 행은 그 tick의 실행값에 대해 다시 적분할 수 없기
+때문이다. 매 tick 새 `seq`는 매 tick `last_chunk_tick`을 찍으므로 증분 정책에서는
+`ViolationKind::InferenceDeadline`이 발화할 수 없다. 죽은 정책은 재계획 구간 하나만큼 뒤에
+`ChunkUnderrun`과 같은 폴백으로 여전히 잡힌다. 감시견을 되사려면 신선도를 다시 찍지 않고
+행을 갱신할 수 있는 플레인이 필요한데, 플레인은 T1의 범위 밖이었다(`INV-11..13`).
+
 ## 4. 소스 프레임워크별 오라클 계층 (S2b)
 
 | 소스 | 무엇을 비교하는가 | 계층 |
