@@ -376,3 +376,117 @@ fn rollout_matches_es_eval_loop() {
     );
     println!("RAN rollout_matches_es_eval_loop: {STEPS} steps x {N_ENVS} envs match the golden");
 }
+
+// --- packet M8/S4e: the reach documents' 26-wide port -----------------------------------------
+
+/// Packet M8/S4e oracle 3: `Rollout` over the four reach documents observes exactly the
+/// backend's own state, slice by slice and bitwise.
+///
+/// The claim is about *capture*, so the comparison is against `StateView` read in this test --
+/// `qpos[0..6]`, `qvel[0..6]`, the cube's `qpos[6..13]`, and the gripper body's
+/// `xpos ‖ xquat` (xyzw, spec 3.1) -- and not against a recorded trace. The Observation IR's
+/// one `Normalize { Range { -1, 1 } }` is applied here with the same two f32 operations the
+/// kernel applies (`(x - lo) / (hi - lo)`), so "bitwise" means bitwise and not "within 1e-9".
+#[test]
+#[ignore = "needs MuJoCo through ES_PYTHON (spec 1.4's reference backend)"]
+fn rollout_observes_the_reach_documents() {
+    use es_ir::task::ObsSource;
+
+    /// The reach Deployment IR declares horizon 1 (PPO acts on every control tick).
+    const RH: usize = 1;
+    const REACH_SEED: u64 = 0;
+
+    if let Err(why) = MuJoCoCpuBackend::is_available() {
+        println!("SKIP rollout_observes_the_reach_documents: {why}");
+        return;
+    }
+
+    let task_toml = read("tests/fixtures/rl/task-reach.toml");
+    let obs_toml = read("tests/fixtures/rl/observation-reach.toml");
+    let deploy_toml = read("tests/fixtures/rl/deployment-reach.toml");
+    let scene_xml = read("tests/fixtures/mjcf/so101_pick_place.xml");
+
+    let task = es_ir::serial::task_from_toml(&task_toml).expect("task-reach.toml");
+    let deploy = es_ir::serial::deployment_from_toml(&deploy_toml).expect("deployment-reach.toml");
+    let scene = es_assets::parse_mjcf(&scene_xml).expect("the scene").scene;
+    let id_of = |name: &str| match task.observation_spec.channels[name].source {
+        ObsSource::JointState { body, .. } | ObsSource::BodyPose(body) => body,
+        ref other => panic!("{name}: {other:?}"),
+    };
+    let (cube_joint, gripper) = (id_of("cube_pose"), id_of("gripper_pose"));
+
+    // A second env of the same documents at the same seed, to read the state the rollout's own
+    // env is in. This is what `rollout_matches_es_eval_loop` already proves is the same env.
+    let mut domains = BatchDomains::single_env_at(
+        TickRate::from_period_secs(scene.options.timestep).expect("physics rate"),
+        deploy.rate.control,
+    )
+    .expect("domains");
+    for d in [
+        &mut domains.simulation,
+        &mut domains.observation,
+        &mut domains.inference,
+    ] {
+        d.batch = N_ENVS;
+    }
+    let mut env: Env<MuJoCoCpuBackend> =
+        Env::new(&task, &scene, MuJoCoCpuBackend::new(), &domains, REACH_SEED).expect("env");
+    let mut roll = Rollout::<NJ, RH>::new(
+        &task_toml,
+        &obs_toml,
+        &deploy_toml,
+        &scene_xml,
+        REACH_SEED,
+        N_ENVS,
+    )
+    .expect("the reach documents build a rollout");
+
+    env.reset(None).expect("reset");
+    roll.reset(None).expect("reset");
+    let ports = roll.observe().expect("observe");
+    let state = env.backend().state();
+    let model = env.model();
+    let cube = model.qpos[&cube_joint];
+    let row = model.body[&gripper].start as usize;
+
+    let got = &ports["state"];
+    assert_eq!(
+        got.len(),
+        26 * N_ENVS as usize,
+        "one 26-wide row per env: {ports:?}"
+    );
+    for e in 0..N_ENVS as usize {
+        let view = env_view(&state, e);
+        let mut want: Vec<f64> = Vec::with_capacity(26);
+        want.extend_from_slice(&view.qpos[..NJ]);
+        want.extend_from_slice(&view.qvel[..NJ]);
+        want.extend_from_slice(&view.qpos[cube.as_range()]);
+        want.extend_from_slice(&view.xpos[row * 3..row * 3 + 3]);
+        want.extend_from_slice(&view.xquat[row * 4..row * 4 + 4]);
+        assert_eq!(want.len(), 26, "the four slices are 6 + 6 + 7 + 7");
+        // The plan's own two steps, in the plan's own order: f64 -> f32 on the way into the
+        // input buffer (`encode_state`), then `es_compile::kernels::normalize_range`, which
+        // is `(x - lo) / (hi - lo)` -- spelled here exactly as that kernel spells it.
+        let (lo, hi) = (-1.0_f32, 1.0_f32);
+        let span = hi - lo;
+        let want: Vec<f64> = want
+            .iter()
+            .map(|v| f64::from((*v as f32 - lo) / span))
+            .collect();
+        let got = &got[e * 26..(e + 1) * 26];
+        for (k, (a, b)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(
+                a.to_bits(),
+                b.to_bits(),
+                "env {e} lane {k}: the port carries {a}, the backend's own state says {b}\n\
+                 lanes 0..6 qpos, 6..12 qvel, 12..19 cube qpos, 19..26 gripper xpos ‖ xquat"
+            );
+        }
+    }
+    println!(
+        "RAN rollout_observes_the_reach_documents: {N_ENVS} envs x 26 lanes bitwise; cube \
+         qpos[{}..{}], gripper body row {row}",
+        cube.start,
+        cube.start + cube.len
+    );
+}
