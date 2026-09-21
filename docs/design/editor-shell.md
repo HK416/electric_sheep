@@ -328,7 +328,8 @@ shrinks back by itself.
 |---|---|
 | `ReplayView::open(scene, traj)` | the `SceneDesc` (MJCF or URDF by extension, as `es backend`'s `load_scene`) and the `Trajectory`; tessellates tick 0 so an unsupported geom is an error here, not a blank canvas later |
 | `ticks()` / `qpos(t)` / `scene_at(t)` | the length, the joint state, and the tick's `TriScene` — the very call the showcase renders |
-| `project(t, &Camera)` | `Vec<Tri2d>`: three screen points, one flat `[u8; 3]`, a depth key and the source triangle index, **sorted back to front** |
+| `project(t, &Camera)` | `Vec<Tri2d>`: three screen points, the camera-space `z` of each, one flat `[u8; 3]`, a centroid depth key and the source triangle index, **sorted back to front** |
+| `Raster::size_for(panel)` / `Raster::draw(&Projected, w, h)` | the raster's size for a panel that big, and the `Rgb8` + depth frame itself (M7/E8) |
 | `Camera::view()` | the `es_render::CameraView` those coordinates are in |
 | `Camera::orbit(dyaw, dpitch)` / `zoom(f)` | a new camera on the sphere about `look_at`; pure, `#[must_use]`, no interior state |
 | `advance(dt, rate_hz)` / `step(±n)` | playback, clamped at both ends; `playing`, `tick` and `speed` are the model's |
@@ -354,14 +355,61 @@ the far side of the image. One that straddles the plane disappears instead of be
 clipper that splits has to interpolate the vertices, and at the scale of this camera the arm is
 never half behind it.
 
-**`ponytail:` the painter's algorithm is the deliberate simplification.** Sorting whole
-triangles by centroid depth is exact for convex primitives that do not interpenetrate, and
-wrong exactly where they do — a gripper closed on a cube can show the wrong face. The upgrade
-path is `es_render::cpu::rasterize` per pixel at a low resolution, which R1's BVH is what makes
-affordable; the camera the model builds is already a `CameraView`, so that swap is one
-function. The sort is stable on the depth alone, so ties keep triangle order and the emitted
-sequence is a pure function of (trajectory, camera) — which is what makes
-`tests/golden/editor/replay_tick0_order.json` (2,754 indices at tick 0) a golden worth keeping.
+### The depth buffer (M7/E8)
+
+E2 shipped the painter's algorithm and marked it `ponytail:`. It was wrong in exactly the way
+the comment predicted: the SO-101 is links that interpenetrate at every joint, so sorting whole
+triangles by centroid depth drew the base plate over the shoulder, the gripper's fingers through
+the wrist, and the forearm through the near wall of the bin. Owner note, 2026-09-21: *the
+polygons look as if there were no depth buffer*. There now is one.
+
+`Raster::draw(&Projected, w, h) -> Raster { w, h, rgb: Vec<u8>, depth: Vec<f32> }` is a
+scanline rasteriser in ~40 lines: per triangle, the signed area from the three edge functions;
+per pixel of the bounding box, those same edge functions at the pixel **centre** (`px + 0.5`,
+the point `cpu::primary_dir` casts through) divided by that area. Dividing by the *signed* area
+flips all three barycentrics with the winding, so "all three ≥ 0" is one inside test for **both
+faces** — which is what the scene needs, since `TriScene`'s tessellation has no guaranteed
+winding and the `Rs` path shades both sides too. The shading is unchanged: the flat Lambert
+`Tri2d::color` that `project` already computed, and the same whole-triangle near-plane clip.
+
+**The depth is interpolated, and it is interpolated as `1/z`.** Screen space is linear in the
+reciprocal of camera-space depth, not in the depth, so `Tri2d` carries the `z` of each vertex,
+the rasteriser interpolates the three reciprocals barycentrically and inverts once. Interpolating
+`z` directly is metres wrong on the tabletop, which is the one triangle pair seen most nearly
+edge-on. The test is strictly nearer, so a shared edge — drawn twice, because the inside test
+keeps both sides of it — belongs to whichever triangle came first, and there is no seam.
+
+**The sort stays.** It no longer decides what is visible, but it is what fixes the paint order,
+and the paint order is what breaks ties at equal depth — so the image is still a pure function
+of (trajectory, tick, camera, w, h). It also keeps `tests/golden/editor/replay_tick0_order.json`
+(2,754 indices at tick 0) meaningful, and `cargo xtask verify-goldens` treats deleting a golden
+as a violation, so retiring it would have cost more than the sort does (a stable sort of 2,754
+`f32` keys against a 3.7 ms frame).
+
+**The panel shows a texture, not a mesh.** `app.rs` uploads the raster as an `egui::ColorImage`
+once per tick or camera change — keyed on `(tick, Camera)`, which covers a resize because the
+size is two of `Camera`'s fields — and stretches it over the canvas; `egui::Mesh` and
+`replay_mesh` are gone. The gestures, the scrubber and play/pause are untouched.
+
+**`size_for` budgets pixels, not axes — a deviation from the packet.** The packet says "the
+panel's size capped at 960×540". Taken per axis that is wrong here: the Replay panel is wide and
+short (≈ 1900 × 280 on a maximised window), a uniform downscale to fit 960 wide gives 960 × 143,
+and the panel is then a 2× upscale of a quarter of the pixels it was allowed — visibly blurrier
+than the mesh it replaced. `size_for` therefore scales the panel's own resolution uniformly until
+it fits **960 × 540 pixels of area**: 1920 × 1080 still gives exactly 960 × 540, and the real
+panel gives ≈ 1865 × 278 at the same cost. Uniform is not negotiable — `ImageSpec::pinhole` has
+square pixels (`fx == fy`), so one factor on both axes is the same view at another resolution,
+while two factors would squash it.
+
+**The golden is the picture, not the order.** `tests/golden/editor/replay-tick0-320x180.bin`
+is the fixture at tick 0 from the showcase camera at 320 × 180, `Rgb8`, written once by the
+`#[ignore]`d `generate_raster_golden` behind `ES_GENERATE_GOLDENS=1` and read-only after
+(spec 1.4). The `.json` beside it names the camera it was taken from and the test asserts that
+first, so a drifted camera constant fails as itself and not as an unexplained pixel diff.
+
+**Measured** (this box, `replay_raster_is_fast_enough`, the demo scene's 2,754 triangles at
+960 × 540, median of 20): **3.7 ms release**, 67 ms debug. The target was 16 ms; the debug number
+is not it, and playback at 50 Hz was verified by hand on a debug build anyway.
 
 ### `look_at` is repeated, not reused
 
@@ -396,7 +444,10 @@ the orchestrator opens) is the same bytes at a different arm.
 
 ### Not here
 
-- **Per-pixel anything**: no depth buffer, no shadows, no textures. The upgrade path above.
+- **Anti-aliasing, shadows, textures, picking.** The depth buffer is one sample per pixel of
+  the flat colour, and nothing else about the `Rs` look came with it.
+- **A GPU path in the editor.** E2's decision stands: the editor links no Vulkan. The CPU
+  raster is 3.7 ms at the largest frame it will draw, which is what makes that easy to keep.
 - **The run's own control rate.** The panel plays at 50 Hz, the demo deployment's
   `rate.control`; a run directory carries no Deployment IR to read it from, and the wrong rate
   only changes how fast the arm appears to move. A `--rate` would be a field on the panel the
