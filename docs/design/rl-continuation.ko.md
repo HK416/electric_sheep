@@ -188,7 +188,131 @@ Task IR(`tests/fixtures/rl/task-reach.toml`)은 기존 노드(`GetBodyPose`, `Ar
 성공률 행은 거기서 쓰인다. 위에서 측정된 것은 기반 구조다 — 레시피, 경로, 트레이너, 플레인,
 재현성 — 이미 실행되는 문서 위에서.
 
-## 8. 사람을 위한 열린 질문
+### S2b — `es policy import-rl`, 오라클 서버 `renderer-14`(Linux, 16코어 CPU), 2026-09-21
+
+산출물: `~/artifacts/plan-s/s2b/` (`brax/`, `rsl-rl/`, `rl-games/`). 소스 체크포인트:
+`~/artifacts/plan-s/s2c/seed0-run1/` (`source.npz`, `meta.json`, `oracle-1000.npz`).
+인터프리터: 오라클은 `~/venvs/es-lerobot-cuda/bin/python`(torch 2.11.0+cu129), 두 프레임워크
+체크포인트는 `~/venvs/es-rl-import/bin/python`(torch 2.14.0+cpu, numpy 2.5.3,
+**rsl-rl-lib 5.5.1**, **rl-games 1.6.5**). 문서:
+`tests/fixtures/rl/{task-reach,deployment-reach,adapter-so101}.toml`, `task_hash`
+`967ea2961d65f931…` — S4d가 커밋한 그대로의 reach Task IR이며 이 패킷은 건드리지 않았다.
+
+**S2c 정책은 임포트되고, 임포트는 아무것도 잃지 않는다.** 26 → [256, 256] → 6, swish, `tanh`:
+
+| 계층(`4절`) | 무엇을 비교하는가 | 측정 |
+|---|---|---|
+| (a) | 임포터의 numpy → torch 재구성 대 우리 런타임, 1,000 × 6 값 | **비트 동일** — 불일치 0개 |
+| (b) | 우리 런타임 대 JAX의 결정적 `tanh(loc)`, `obs_scaled` 위에서 | 최대 절대오차 **9.704e-7**(허용 1e-5) |
+
+| 슬롯 | 해시 |
+|---|---|
+| `weights_hash` | `37fc82a8811f07523c6de9dfcacf8220884c4e5b60189298568992d26acda6c5` |
+| `observation_hash` | `fe391bef976df15ae747922463ad855e8eb1c4447f8d08aeefee8d76a7b7bb73` |
+| `learning_hash` | `f5053f12c9227a658aecdf9f911a555616a0ff7761076572c1978434a5dd99d3` |
+| `policy_hash` | `1a18cc4bccb49aa48169b4ec8aa2f966411b461d48b28766637bf11ca5b0cd60` |
+| `deployment_hash` | `7af05d88891f5fe6e46717c29ccb46b97e917567e1860372f10301eb1c6fafe4` |
+
+계층 (b)는 패킷의 `U(−1, 1)` 추출이 아니라 `obs_scaled` 위에서 돈다. `brax-ppo-so101.md` 6절을
+따른 것으로, 스케일을 벗어난 입력은 좁은 채널을 지나며 모든 `swish`를 포화시키고 거기서는 어떤
+올바른 임포터도 1e-5를 통과할 수 없다. 균등 집합은 게이트가 아니라 포화 탐침으로 남는다.
+
+`observation_hash`는 `observation-reach.toml`의 것이 **아니다**. 임포터는 brax 자신의 러닝
+통계를 나르는 `Normalize{MeanStd}`를 내보내고, 커밋된 문서는 항등 `Range{−1, 1}`을 나른다. 둘
+다 같은 `task_hash`의 관측이며, 이것이 §7.4가 말하는 "여러 Observation IR이 하나의 Task IR을
+공유한다"이다. 동시에 임포트된 정책을 자기가 정규화되지 않은 문서로 그냥 채점할 수 없는 이유이기도
+하다.
+
+**`rsl_rl`과 `rl_games`는 자기 체크포인트 위에서 비트 동일하다.** 프레임워크 자신의 클래스가
+만들고 프레임워크가 저장하는 방식으로 저장한 무작위 가중치 액터(`import_rl.py --synth
+<framework> --native`), 26 → [8, 8] → 6, elu, squash 없음:
+
+| 프레임워크 | 버전 | 프레임워크 자신의 forward 대 재구성 | 재구성 대 우리 런타임 |
+|---|---|---|---|
+| `rsl_rl`(`actor_state_dict` 아래 `MLPModel`) | 5.5.1 | **비트 동일**, 최대 절대 0.0 | **비트 동일**, 6,000개 중 0개 |
+| `rl_games`(`model` 아래 `a2c_network`) | 1.6.5 | **비트 동일**, 최대 절대 0.0 | **비트 동일**, 6,000개 중 0개 |
+
+그 대가로 얻은 API 사실 두 가지. 둘 다 이제 `import_rl.py`의 독스트링에 있고 둘 다 패킷 초안에는
+없었다. **rsl-rl ≥ 5.0은 액터의 `nn.Sequential`을 `actor`가 아니라 `mlp`로 이름 짓는다**
+(`MLPModel.mlp`, `rsl_rl/models/mlp_model.py`; std는 `distribution.std_param` /
+`distribution.log_std_param`으로 옮겨갔다). 그리고 `rl_games`의 `BaseModel.build`는 키워드가
+아니라 **설정 딕셔너리 하나**를 받는다(`rl_games/algos_torch/models.py:29`). 두 레이아웃 모두
+읽으며, 5.0 이전의 `actor.<i>` / 최상위 `std` 형태도 여전히 받아들인다.
+
+**매핑 보고서는 실제 체크포인트에서 제 값을 한다.** `cube_pose`가 `severity = warning`으로
+돌아온다. 큐브의 z는 `obs_std`가 1.79e-4이고 이웃들은 ~1.0인데, E4가 큐브 높이를 건드리지 않아
+학습 내내 움직이지 않았기 때문이다. 이것은 brax의 1e-6 분산 바닥이 아니며(이 실행은 거기까지
+가지 않았다), 그래서 검사는 하나의 숫자에 맞춘 임계값이 아니라 상대적이다(가장 넓은 채널보다
+1,000배 넘게 좁은 성분).
+
+**CI 오라클에는 Python이 필요 없다.** `import_rl_synthetic_three_frameworks`(es)와
+`import_rl_refusals`(es-data)는 각 수 KB의 커밋된 픽스처 셋 위에서 돈다. 이 픽스처는 각
+프레임워크의 네이티브 레이아웃에서 `import_rl.py --synth`가 생성한 것이고, 셋은 **바이트 동일한
+리맵 가중치**를 낸다. 세 리더를 직접 돌리지 않고 Rust 쪽이 그들에 대해 말할 수 있는 유일한
+것이다. 첫 번째 안의 `TorchRuntime` 열기는 `ES_PYTHON`이 없으면 이유를 찍고 건너뛴다.
+
+## 8. 임포터와 어댑터
+
+1절의 규칙 3은 어댑터가 선언하고 코드는 결코 추측하지 않는다고 말한다. `es policy import-rl`의
+두 반쪽에서 그것이 무엇이 되는지가 이 절이다(스펙 §14.4, 패킷 M8/S2b).
+
+**분할.** `python/es/import_rl.py`가 pickle이나 orbax 체크포인트를 여는 유일한 장소다(INV-16):
+`rsl_rl`의 `.pt`와 `rl_games`의 `.pth`는 `torch.load`, orbax 디렉터리는
+`brax.training.checkpoint.load`, 커밋된 내보내기는 S2c의 `source.npz` + `meta.json`. 거기서
+나오는 것은 프레임워크 중립이고 불활성이다 — `weights.safetensors`와 `import.json` 매니페스트 —
+그 뒤는 전부 Rust이고 경로에 Python이 없다.
+
+**중립 형태, 그리고 네트워크를 어디서 자르는가.** *은닉* Dense마다 `mlp.<i>.weight|bias`
+`[out, in]`, 그다음 출력 Dense가 `head.weight|bias`. 세 프레임워크 모두 모든 은닉 층을
+활성화하고 출력 Dense는 선형으로 둔다. 그래서 `import.json`은 `activate_output = false`를
+읽는다. 우리 그래프는 같은 네트워크를 한 층 앞에서 자른다. `StateEncoder{Mlp}`는 마지막 *은닉*
+층에서 끝나며 — 그 층은 활성화되므로 S2a의 파라미터 `activate_output = true`를 나른다 —
+`PolicyHead{Regression}`이 출력 Dense이고 그 뒤에 소스의 `squash`가 온다. 같은 함수, 다른
+절단면이다. `crates/es-data/src/rl_import.rs::learning_graph`가 그 일을 하는 곳이고 그렇게
+말한다.
+
+**어댑터 문서**(`tests/fixtures/rl/adapter-so101.toml`)는 체크포인트가 우리 로봇에 대해 알 수
+없는 네 가지를 나르고, 전체가 `deny_unknown_fields`다. 아무도 읽지 않는 키는 아무도 선언하지
+않은 매핑이기 때문이다.
+
+| 블록 | 말하는 것 |
+|---|---|
+| `[robot] name` | 이 어댑터가 어느 로봇의 것인가 |
+| `[joints] source_order`, `units` | *우리* 액추에이터 이름으로 쓴 프레임워크의 행동 순서, 그리고 그것이 라디안이라는 것 |
+| `[action] kind`, 선택적 `scale` / `offset` | 위치 목표인가 토크인가, 그리고 `ctrl = offset + scale · a` |
+| `[[observation.channels]] source`, `slice`, `channel` | 평탄한 관측의 각 연속 블록이 어느 Task IR `ObservationSpec` 채널을 먹이는가 |
+
+어댑터의 `scale` / `offset`은 매니페스트의 것을 덮어쓴다. 불일치는 경고이며 조용한 해소가
+아니다. 해소된 쌍은 `mapping-report.json`에 쓰이고, `--reference` 오라클은 다시 결정하는 대신
+임포트가 실제로 쓴 숫자를 읽는다.
+
+**다섯 개의 거절.** 각각 아무것도 쓰지 않고 자기 코드의 이름을 댄다(심각도와 제목은 프로젝트의
+다른 모든 코드처럼 `crates/es-ir-types/src/codes.rs`에 있다):
+
+| 코드 | 언제 거절하는가 |
+|---|---|
+| `IMP-001` | 어댑터의 관절 수 ≠ Task IR의 `ActionSpec.dim`(또는 매니페스트의 `action_dim`) |
+| `IMP-002` | 장면에 액추에이터가 없는 관절 이름 — 장면은 Task IR 자신의 저장소 상대 `scene.path`에서 읽는다 |
+| `IMP-003` | `[joints] units = "deg"`; 조용한 도 → 라디안 변환이 바로 규칙 3이 금지하는 추측이다 |
+| `IMP-004` | `[action] kind`가 Task IR의 `ActionSpec.space`와 어긋난다 |
+| `IMP-005` | 채널 슬라이스가 `obs_dim`을 순서대로 정확히 덮지 않거나, `ObservationSpec`이 선언하지 않은 채널을 대거나, 너비가 어긋난다 |
+
+**출력.** `observation.toml`(채널마다 `StateInput` → `Concat` → 매니페스트의
+`Normalize{MeanStd}`, 소스에 정규화기가 없으면 항등 `Range{−1, 1}`), `learning.toml`(위 그래프
+→ `ActionChunker` → `mean = offset`, `std = scale`인 `Normalizer{Inverse, MeanStd}`, 그래서
+모듈의 출력은 액추에이터 단위다 — 2절), 가중치를 `lower_to_torch`가 선언하는 키로 리맵한
+`policy.esb`, 그리고 §14.4의 의미 매핑 보고서인 `mapping-report.json`: 관절마다 그리고 관측
+채널마다 한 행, 각각 소스 인덱스나 범위, 우리 이름, 단위, 심각도를 달고.
+
+**brax 임포트에서 `log_std`는 `null`이며 그것은 누락이 아니다.** brax의 두 번째 출력 절반은
+관측의 *함수*다(`std = softplus(x) + 0.001`, `brax/training/distribution.py:171`). 따라서
+가져올 상태 독립적인 값이 없다. 그 행들은 `import.json`의 `source_std` 아래 메타데이터로
+따라가고 아무것도 읽지 않는다. `rsl_rl`의 `std`와 `rl_games`의 `sigma`는 `[action_dim]`
+파라미터가 *맞고*, 그 둘은 진짜 `log_std`를 가져온다. `python/es/train_ppo.py --init-log-std`는
+`log_std`가 null이 아닐 때만 먹으며, 스칼라 하나를 받는다. 성분이 서로 다른 벡터는 임포터가 아니라
+사람의 선택이다.
+
+## 9. 사람을 위한 열린 질문
 
 1. 롤아웃이 Deployment IR의 선언된 지연시간을 모델링해야 하는가(트레이너 안의 청크 버퍼),
    아니면 정직함을 평가가 나르는 채로 동기적으로 남아야 하는가? 이 노트는 동기식을 고른다.
