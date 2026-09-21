@@ -769,3 +769,196 @@ would turn "the goldens still match" into a tautology (an M7 review item). The r
 and returns rather than failing, so the sweep itself still passes, and it is deliberately not
 a `SKIP` line — nothing is missing from the machine, and `cargo xtask ci`'s oracle scan must
 not count it as a reference oracle.
+
+---
+
+## 15. The editor for someone who is not an expert (§23.1, §23.2, §13.1, M7/E6)
+
+Sections 10–14 added everything an engineer needed and nothing anyone else did. A bare field
+asking for "bundle.esb, a directory of the five .toml files, or a run"; a launch panel whose
+labels were `--config` and `--out`; a results table headed `envelope_violation_rate`; help
+text citing "(spec 23.3)"; and a default font with no Hangul, so a Korean path rendered as
+boxes. Owner directive, 2026-09-21: *the editor is too hard for people without domain
+knowledge; improve the UI/UX, and pick a font so that multilingual text does not break.*
+
+Everything below is the same §28.10 rule 3 as the rest of the crate — **nothing is decided in
+`app.rs`** — applied to the words, the font and the dialog.
+
+### The string-table rule
+
+`crates/es-editor/i18n/en.toml` and `ko.toml`, flat keys quoted so TOML keeps them flat
+(`"home.open_project" = "…"`), `include_str!`d into `model/i18n.rs`: `Lang { En, Ko }`,
+`Strings::get(lang)`, `t(lang, key)`, and `fill(lang, key, args)` for the handful of
+templates that carry a number. A key missing at runtime renders as the key, because an editor
+that will not start is worse than one with a visible `tab.design` in it.
+
+`i18n_tables_are_complete_and_used` makes that unreachable in CI, and it is the packet's whole
+oracle-first claim about text: the two tables carry the same keys; every key appears as a
+literal somewhere in the crate; every key-shaped literal in the crate is a key; and **no
+value outside a `*.hint` contains "spec "**. The last is what moves "(spec 23.3)" out of the
+visible text and into the hover, where a raw metric name, a CLI flag and a section number all
+belong. A typo therefore fails twice — once as a stray literal, once as the real key going
+unused.
+
+The tables are also the **one place in the repository that may hold non-English source text**.
+`.githooks/pre-commit`'s `is_doc` gained the case `*/i18n/*.toml` and CLAUDE.md's Conventions
+paragraph says so in a sentence. Korean is nowhere else — not in a test, not in a comment.
+
+### The font rule
+
+`model/fonts.rs::system_cjk_font()` probes a fixed per-OS list with `std::fs` and returns the
+first file that exists:
+
+| OS | candidates, in order |
+|---|---|
+| Windows | `C:\Windows\Fonts\malgun.ttf`, `msyh.ttc`, `meiryo.ttc` |
+| macOS | `/System/Library/Fonts/AppleSDGothicNeo.ttc`, `PingFang.ttc`, `Supplemental/NotoSansCJK*.ttc` |
+| Linux | `/usr/share/fonts/**/NotoSansCJK*.{ttc,otf}`, `NanumGothic.ttf`, `DroidSansFallback*.ttf` |
+
+Three deliberate refusals. **Nothing is bundled**: a CJK face is 10–20 MB and licensed per
+family, and this repository's binary files are read-only goldens for a reason. **No
+font-discovery crate**: "does this path exist" is `std::fs` and a list, and a crate that
+enumerates every installed face solves a problem the editor does not have — the `*` and `**`
+in the Linux patterns are a 30-line matcher (`matches`, `walk`, bounded to four levels,
+entries sorted so a directory holding two matches resolves the same way every time).
+**Last fallback, never first**: `install` appends the face to the end of both `Proportional`
+and `Monospace`, so Latin keeps egui's own better-hinted glyphs and only what egui cannot
+draw falls through. `font_fallback_is_last` asserts the built `FontDefinitions` still *starts
+with* egui's own list in both families.
+
+A machine with none of them is an ordinary outcome, not an error: `install` returns
+`Err(candidates)`, the editor opens anyway, and the status bar reads `status.font_missing` —
+the list of paths tried, and the words `fonts-noto-cjk` for Debian and Ubuntu. Boxes with an
+explanation beat boxes without.
+
+Beside the font, `TextSize { S, M, L }` scales every `TextStyle` from a base of **15 px body /
+20 px heading** (egui's own default is 12.5 px, which is a choice made for the eyes of whoever
+wrote the toolkit). Both settings are persisted through `eframe::Storage` beside §12's recent
+list, under `es-editor.lang` and `es-editor.text-size` — `recent.rs` spells every storage key
+this crate writes, so two of them cannot collide, and `Settings::from_codes` takes plain
+strings so the parsing is judged headlessly and `app.rs` is left with two `get_string` calls.
+
+### The label tables
+
+`model/labels.rs`, every function total and **no wildcard arm** — a metric added to
+`MetricSpec` or a flag added to `LaunchField` must break this crate's build, because the
+alternative is a column nobody gets around to naming. `metric_and_launch_labels_are_total`
+walks `MetricSpec::ALL` (18), `LaunchField::ALL` (11), `LaunchFlag::ALL` (3), `Kind::ALL` and
+`Tab::ALL` in both languages and asserts the labels are pairwise distinct, contain no `_`, and
+are never the raw name.
+
+| raw | plain (en) | plain (ko) |
+|---|---|---|
+| `success_rate` | Success rate | 성공률 |
+| `intervention_rate` | Human takeovers | 사람이 넘겨받은 비율 |
+| `collision_rate` | Collisions | 충돌 비율 |
+| `envelope_violation_rate` | Safety limit hits | 안전 한계 위반 |
+| `action_smoothness` | Motion smoothness | 움직임의 매끄러움 |
+| `episode_length` | Episode length | 에피소드 길이 |
+| `failure_mode_histogram` | Failure causes | 실패 원인 |
+| `domain_gap` | Gap from the real world | 실제와의 차이 |
+| `chunk_underrun_rate` | Motion gaps | 동작이 끊긴 비율 |
+| `end_to_end_latency_p50` | Reaction time (typical) | 반응 시간 (보통) |
+| `end_to_end_latency_p95` | Reaction time (slowest 5%) | 반응 시간 (느린 5%) |
+| `physics_steps_per_sec` | Physics speed | 물리 계산 속도 |
+| `camera_frames_per_sec` | Camera speed | 카메라 속도 |
+| `pixels_per_sec` | Pixel throughput | 픽셀 처리량 |
+| `observation_gb_per_sec` | Sensor throughput | 센서 데이터 처리량 |
+| `policy_inferences_per_sec` | Policy speed | 정책 추론 속도 |
+| `actions_per_sec` | Action rate | 동작 출력 속도 |
+| `gpu_memory_peak` | Peak GPU memory | GPU 메모리 최대 사용량 |
+
+| raw | plain (en) | plain (ko) |
+|---|---|---|
+| `--config` | Evaluation settings | 평가 설정 |
+| `--policy` | Policy file | 정책 파일 |
+| `--scene` | Scene file | 장면 파일 |
+| `--out` | Output folder | 결과 폴더 |
+| `--frames` | Also save pictures | 사진도 저장할 폴더 |
+| `--jobs` | Parallel workers | 동시에 돌릴 개수 |
+| `--telemetry` | Watch live at | 실시간으로 볼 주소 |
+| `--telemetry-token` | Watch password | 관찰 암호 |
+| `--telemetry-image-every` | Send a picture every | 사진 보내는 간격 |
+| `--recipe` | Training settings | 학습 설정 |
+| `--from` | Start from step | 시작할 단계 |
+| `--dry-run` | Check only, do not run | 실행하지 말고 점검만 |
+| `--allow-new-evaluation` | Allow a new evaluation | 새 평가 기준 허용 |
+| `--skip-expert-gate` | Skip the expert check | 전문가 점검 건너뛰기 |
+
+The tabs go the same way — Graph → *Design* / 설계, Run → *Results* / 결과, Telemetry →
+*Live* / 관찰, Images → *What the policy sees* / 정책이 보는 것, Diagnostics → *Problems* /
+문제 — with the old name and the spec section in `Tab::hint_key`. `Tab` moved out of `app.rs`
+into `labels.rs` for that: a tab is now a name, a hover and a destination, which is model
+data, and moving it deleted the shell's own copy of the list.
+
+`metric_by_name` is the joint between the plain names and the raw strings a `report.json`
+column or a telemetry row arrives as. It carries the one alias the codebase has:
+`TelemetryModel::metric_rows` spells the latencies `p50_end_to_end_latency` the way
+`PerfMetrics`' fields are spelt, and `MetricSpec` spells them `end_to_end_latency_p50`.
+
+**What is not translated, on purpose.** The rendered command line (it is the line someone
+pastes into a terminal), `es`'s own stdout in the launch log, `EsBinary::reason`, an IR
+diagnostic's code and message, and the `reason` on an unavailable metric. Those belong to
+another crate and another packet; inventing Korean for them would be the editor guessing at
+what `es` meant. Three model strings this packet's scope did not reach —
+`RunView::status`, `LiveRun::status` and `Timeline::heading` — are still English for the same
+reason, and are listed for the M7 review.
+
+### The home model
+
+`labels::Step::ALL` is §13.1's loop in order — Design, Collect, Train, Evaluate, Watch — each
+with a workflow word (`word.*`), one sentence in plain words (`home.step.*`) and the tab its
+button goes to (`Step::tab()`; collect, train and evaluate all land on Results, because that
+is where the Start panel is). `home_screen_lists_the_five_steps_in_loop_order` asserts the
+order, that each sentence is a sentence in both languages, and that no two steps say the same
+thing. `app.rs` draws a grid over `Step::ALL` and a row of three buttons — *Open a project
+file…*, *Open a run result…*, *Recent* — and decides none of it.
+
+The home screen *is* the Design tab with nothing open, rather than a sixth tab: that is the
+screen someone lands on, and a tab you have to leave before you can start working is a worse
+first screen than the work itself. The search box is hidden there, since there is nothing to
+find yet.
+
+### The dialogs feature
+
+`rfd 0.17.2` is **the one dependency this packet adds** (MIT, native on both targets), taken
+`default-features = false` so no GTK or XDG-portal backend is pulled in. Its shape:
+
+```toml
+[features]
+default = ["file-dialogs"]
+file-dialogs = ["dep:rfd"]
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd = { workspace = true, optional = true }
+```
+
+Cargo has no per-target default feature, so `model/dialogs.rs` gates on
+`all(feature = "file-dialogs", any(windows, target_os = "macos"))` and every function has a
+`cfg`-off twin returning `None`. The effect the packet asked for holds exactly: Linux
+compiles the stub whether or not the feature is on and gains no new requirement,
+`--no-default-features` builds the stub everywhere, and **`app.rs` never names `rfd`** — it
+calls `dialogs::pick(browse)`, and *which* dialog a field wants is `labels::browses`.
+`dialogs::AVAILABLE` is that same `cfg` as a `const`, so a build without a dialog draws the
+button disabled with `open.no_dialog.hint` on its hover rather than hiding it; the typed
+path, the recent list and drag-and-drop are unchanged on every target, so nothing is *only*
+reachable through a dialog. This reverses §12's "not here" entry on file dialogs, which was
+written when the editor had no non-expert user in view.
+
+### Verified by hand
+
+Windows 11, `malgun.ttf` found and installed. Home screen in both languages; the E4 fixture
+bundle and the E5 fixture run opened; the Korean path `C:\Users\User\문서\테스트` typed into
+`--out` and rendered with no boxes, in the field *and* in the rendered command line; the
+Results header 안전 한계 위반 hovering `envelope_violation_rate`; text size L; and the
+language and the size surviving a restart through `eframe::Storage`. Screenshots:
+`target/plan-u/e6/`.
+
+### Not here
+
+- Localising `es`'s own CLI output, and the three model strings named above.
+- A third language. Adding one is one file plus one `Lang` variant; the oracle then holds it
+  to the same key set.
+- Per-OS font *configuration*. The candidate list is fixed on purpose: a settings screen for
+  fonts is a second problem, and the one thing a person needs — "why is my text boxes" — is
+  answered by the status bar.
