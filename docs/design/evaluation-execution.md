@@ -208,40 +208,62 @@ The oracle is a trajectory, not a schedule: `collection_and_evaluation_draw_the_
 T7 it failed at tick 1 — see `docs/design/visible-learning.md` section 7.30 for the measured
 values and for what the demo's numbers became.
 
-### 2.7 Sharding: the unit is the cell, and why it is not the episode (packet M7/T8)
+### 2.7 Sharding: the unit is the `(cell, episode)` pair (packets M7/T8, M7/R1)
 
-`es eval run --jobs N` partitions the **cells** round-robin over N worker processes
-(`Evaluation::run_shard(.., shard: (index, count))`, cell `c` to shard `c % count`), and
-`Evaluation::merge` puts them back in cell order and computes the report, the judgement and
-the hash chain once. The partition is fixed by the cell index alone, so it does not depend on
-how long a suite takes, on how many workers started, or on any iteration order (§3.4). A
-one-suite evaluation therefore gets no speedup at all: the demo's 16-episode `nominal` suite
-is one cell and runs one-wide however large `--jobs` is.
+`es eval run --jobs N` partitions the **`(cell, episode)` units** round-robin over N worker
+processes (`Evaluation::run_shard(.., shard: (index, count))`): unit `cell * n_episodes +
+episode` over the flattened `suites × seeds` list goes to shard `unit % count`. The partition
+is fixed by the two indices alone, so it does not depend on how long an episode takes, on how
+many workers actually started, or on any iteration order (§3.4). A one-suite evaluation
+parallelises: the demo's 16-episode `nominal` suite runs 16-wide.
 
-Packet M7/T8 asked whether the unit could be the `(cell, episode)` pair instead. The `Env`
-side of that is now settled and shipped:
+**One code path.** `--jobs 1` is the same partition with `count = 1`, and
+`Evaluation::run_with_frames` — the sequential entry point — is `run_shard` with `(0, 1)`. There
+is no cell-level partition left beside the episode-level one; byte-identity between `--jobs 1`
+and `--jobs N` is by construction and not by a second implementation (§3.5 tier 1).
 
-**`Env::seek_episode(env, episode)`** sets the counter the *next* `reset` draws from. It
-touches nothing else — no reset, no backend call, no recorder state, not the physics tick —
-and it is refused while an episode is open with steps recorded on it, so a seek is never a
-silent discard. §6.3 keys every reset and randomization draw by `(seed, env, episode, stream)`
-alone, and `MuJoCoCpuBackend::reset` runs `mj_resetData` before writing the state, so a seek
-*is* the replay. Measured (`cargo test -p es-env --test seek -- --ignored`, oracle server,
-2026-09-21): for `k ∈ {1, 3, 7}` on the demo scene and the committed Task IR, a fresh `Env`
-seeked to `k` and a fresh `Env` reset `k` times agree bitwise on `qpos`, `qvel`, the episode's
-`ParamScales` and the whole 45,784-byte `.estraj` of an expert-driven episode.
+**Every metric is computed in `merge`, and only there.** A worker judges nothing: each unit
+produces one `metrics::CellSummary` — the per-episode samples of the metrics that have one, the
+episode's `failure_mode_histogram` buckets, the three plane integers §10.3 divides (`steps`,
+`dirty_steps`, `ChunkUnderrun`) and the §12.4 raw env counters — and `merge` adds a cell's
+summaries **in ascending episode order** before computing the §10.1 row, the judgement and the
+hash chain once. So `report.json`, `events.json` and every `.estraj` come out of the same
+numbers whichever worker produced which episode (§10.4). What crosses the process boundary is
+deliberately *not* a `SafetyCounters`: that carries the §9.4 sliding ring, which is per episode
+and means nothing summed across one. `merge` refuses a unit set that is not exactly every
+`(cell, episode)` pair once — a report missing an episode because a worker was lost would
+otherwise wear a correct `evaluation_hash` over numbers nobody measured.
 
-**The evaluator side does not hold, and the partition is not shipped.** What a cell carries
-from episode `k-1` into episode `k`, beyond the `Env`: the `SafetyPlane` (`begin_episode`
-clears the latch and re-arms the seed, but **not** `SafetyCounters::window`, the sliding
-`ViolationRate` ring of §9.4), the `ChunkBuffer` + `PlaneFeed` and `AsyncInference` (all
-cleared per episode), the monotonic `seq` (only ordering is judged), and the plane's and env's
-counters (sums, which add). Two of those are visible in the artifacts, and both were measured
-by running the pre-T8 and the T8 build of `es eval run` over the same committed demo documents
-— nominal suite, seeds 101–104, `--frames`, `v14/trained-20000.esb`, oracle server,
-2026-09-21 (`~/artifacts/plan-v/m7-t8/run-parity.sh`, `pre-j1/` vs `post-j1/`):
+**What one unit owns.** Everything a cell used to keep across its episodes:
 
-| what | cell-level (pre) | per-episode (post) |
+| per unit | why it can be per unit |
+|---|---|
+| `Env` (`Env::new`, then `seek_episode(0, episode)`, then `reset(Some(&[0]))`) | §6.3 keys every reset and randomization draw by `(seed, env, episode, stream)` alone, and a seek *is* the replay — measured below |
+| `SafetyPlane` | `begin_episode` already cleared the latch and the seed, and since packet M7/R1 it empties the §9.4 `ViolationRate` ring too (`docs/design/safety-plane.md`, "Counters") |
+| `ChunkBuffer` + `PlaneFeed` | already cleared per episode by `PlaneFeed::end_episode` (§13.1) |
+| `AsyncInference` | already cleared per episode by `drop_env` (packet M7/T7) |
+| the chunk `seq` | monotonic per plane; only its *ordering* is judged (§8.6) |
+| `CpuPlan` state | already reset per episode (section 2.4) |
+| the plane's and env's counters | sums, and `merge` adds them in episode order |
+
+**`Env::seek_episode(env, episode)`** sets the counter the *next* `reset` draws from. It touches
+nothing else — no reset, no backend call, no recorder state, not the physics tick — and it is
+refused while an episode is open with steps recorded on it, so a seek is never a silent discard.
+`MuJoCoCpuBackend::reset` runs `mj_resetData` before writing the state, which is what makes this
+possible. Measured (`cargo test -p es-env --test seek -- --ignored`, oracle server, 2026-09-21):
+for `k ∈ {1, 3, 7}` on the demo scene and the committed Task IR, a fresh `Env` seeked to `k` and
+a fresh `Env` reset `k` times agree bitwise on `qpos`, `qvel`, the episode's `ParamScales` and
+the whole 45,784-byte `.estraj` of an expert-driven episode.
+
+#### What T8 measured, and what made it stop being true (§28.9 rule 2)
+
+T8 shipped `seek_episode` and did **not** ship the partition: two things carried from episode
+`k-1` into episode `k` and showed in the artifacts. The measurement stands as the record of why
+the decision was a decision and not a fix — nominal suite, seeds 101–104, `--frames`,
+`v14/trained-20000.esb`, oracle server, 2026-09-21
+(`~/artifacts/plan-v/m7-t8/run-parity.sh`, `pre-j1/` vs `post-j1/`):
+
+| what | cell-level (pre-R1 semantics) | per-episode |
 |---|---|---|
 | first differing `.estraj` | — | `nominal-01`, **tick 24** (`qpos[0]` 0.068231 → 0.071987) |
 | `events.json` first difference | `nominal-01` record 0, `tick: 7200` | same record, `tick: 0` |
@@ -251,67 +273,145 @@ by running the pre-T8 and the T8 build of `es eval run` over the same committed 
 | `envelope_violation_rate` | 0.9998611 | 0.9990278 |
 | `nominal-00` (episode 0) | — | byte-identical, all four artifacts |
 
-Two independent mechanisms, and only one of them is `es-safety`'s:
+Two independent mechanisms, and the owner decided both on 2026-09-21 (§28.11):
 
-1. **The `ViolationRate` window carries across the episode boundary.** The demo declares
+1. **The `ViolationRate` window carried across the episode boundary.** The demo declares
    `envelope_violation_rate = { max_frac = 0.9, window = 200 }` and runs at an envelope
-   violation rate of ~0.999, so at tick 0 of episode `k` the pre-T8 plane's ring is full of
-   episode `k-1`'s dirty steps, reads ~1.0, and trips the §9.4 watchdog. A per-episode plane
-   starts with an empty ring, which reads `0.0` until 200 steps are in it — so its first 200
-   ticks do not trip, take the clamp path instead of the fallback path, and the trajectory
-   diverges at tick 24. 227 fewer `violation.rate` events over four episodes.
-2. **`StepEvent::tick` is the cell's cumulative physics clock**, `Env::tick()`, which is 7200
-   at the start of `nominal-01` (1800 control steps × 4 substeps) and 0 for a per-episode env.
-   This one is `es-eval`'s record, not the plane's: it would still move `events.json` even if
-   the window were cleared.
+   violation rate of ~0.999, so at tick 0 of episode `k` the pre-R1 plane's ring was full of
+   episode `k-1`'s dirty steps, read ~1.0, and tripped the §9.4 watchdog. **`begin_episode` now
+   empties the ring** (§9.4): a window straddling an episode boundary is half of one stream and
+   half of another, which is §10.3's own "a full window or nothing" read of it and §13.1's read
+   of where a stream ends. It re-arms the watchdog, it does not disarm it (INV-12) — the
+   envelope, every watchdog and every summed counter are untouched.
+2. **`StepEvent::tick` was the cell's cumulative physics clock**, `Env::tick()`, which was 7200
+   at the start of `nominal-01` (1800 control steps × 4 substeps). **`tick` now counts from the
+   episode** (§10.5): frame `n` of a cell already carries `frame: n`, an absolute tick is only
+   meaningful inside one cell, and an episode-relative one makes `events.json` independent of
+   how the run was scheduled. `frame` is unchanged, and so is the schema.
 
-Per the packet, the finding stands and the flag that would have enabled the partition does not
-exist. Both questions are the M7 review's:
+Both are semantics changes, so **every evaluation number measured before 2026-09-21 was
+measured under the old ones** and is marked "pre-R1 semantics" where it is written down;
+`docs/design/visible-learning.md` 7.33 re-measures U3 and the expert gate under the new ones.
 
-- should `SafetyPlane::begin_episode` clear `SafetyCounters::window`? Clearing it is arguably
-  the correct reading of "an episode is where a stream ends" (§13.1, and the same argument
-  §2.4 makes for the observation plan), and it would be an INV-12-clean change — the envelope,
-  the watchdogs and the counters stay on, only the ring the watchdog reads is re-armed. It
-  moves every committed number in the table above, so it is a decision and not a fix.
-- should `StepEvent::tick` be the episode's tick rather than the env's? Frame `n` of a cell
-  already carries `frame: n`; the absolute tick is only meaningful inside one cell, and an
-  episode-relative tick would make `events.json` independent of how the run was scheduled.
+#### The partition is the sequential run (oracle 3, 2026-09-21)
 
-If both go that way the partition is a small change on top of what is here (`ShardCell` gains
-per-episode records, `record_cell` moves to `merge`, `run_shard` walks `suites × seeds` and
-seeks) and the wall-clock table below says what it would buy.
+On the committed demo documents — nominal suite, 4 episodes, seeds 101–104, `--frames`,
+oracle server, `~/artifacts/plan-v/m7-r1-episodes/r1-parity.sh`.
+
+**The bundle is not T8's.** `v14/trained-20000.esb` no longer judges the committed documents:
+its embedded Task and Observation IR hash to `78814eb4…` / `72b8609a…` against the committed
+`eb6efefa…` / `899c16a9…`, so `es eval run` refuses the pair by name (`XIR-040`, §10.4 —
+equal `evaluation_hash` means equal conditions). The documents moved under it between T8 and
+the U wave, and a bundle carries its own copy. These rows therefore use **U0's checkpoint**,
+`~/artifacts/plan-v/m7-u/U0/u0.esb` — the same 20,000-step ACT the U table's row U0 is, trained
+on and judging the committed `task.toml` / `observation.toml`. The wall-clock rows below use
+the same bundle, which is why they are not directly comparable to T8's numbers on `v14`:
+
+| compared | `--jobs 1` vs `--jobs 2` | `--jobs 1` vs `--jobs 4` |
+|---|---|---|
+| `report.json` | identical | identical |
+| `events.json` | identical | identical |
+| `traj/*.estraj` (4 files) | identical | identical |
+| `frames/**` (7,204 files) | identical | identical |
+
+`evaluation.lock` is excluded and only because of `created` (§10.4); every other field of it is
+in `report.json` and compared there. Two things in the artifacts say the semantics changed and
+not just the scheduling: every cell's `events.json` now opens at `tick: 0` (`nominal-01` record
+0 read `7200` under the old clock) and `violation.rate` is **absent** from
+`failure_mode_histogram` — the rate watchdog never trips once its ring starts each episode
+empty, where T8 counted 2,318 trips over the same four episodes.
+
+The same statement on the `es-eval` fixture backend, where it is a fast gate rather than a
+five-minute one, is `cargo test -p es-eval episode_shards_reproduce_the_sequential_run --
+--ignored` (four suites × six episodes, `count = 1` against 2 and 4).
 
 #### Wall-clock, nominal suite, 16 episodes (`Target / Status: measured`)
 
-Oracle server (Ryzen, 16 cores, RTX 4090), `--frames`, `v14/trained-20000.esb`, one suite,
-seeds 101–116. The 1-minute load average beside each row is the box's at the moment the run
-started; other agents share the machine.
+Oracle server (16 cores, RTX 4090), `--frames`, `~/artifacts/plan-v/m7-u/U0/u0.esb`, one suite,
+seeds 101–116. The 1-minute load average beside each row is the box's at the moment the run started;
+other agents share the machine, and each row waits for it to fall below 4 first (T8's gate,
+`~/artifacts/plan-v/m7-t8/run-parity.sh`).
 
-| build | `--jobs` | workers actually spawned | wall (pass 2) | load at start | pass 1 |
-|---|---|---|---|---|---|
-| cell-level (shipped) | 1 | 1 | 121.6 s | 0.55 | 120.3 s |
-| cell-level (shipped) | 4 | 1 (clamped to the suite count) | 117.3 s | 2.31 | 120.0 s |
-| cell-level (shipped) | 8 | 1 (clamped) | 120.6 s | 2.83 | 118.7 s |
-| per-episode (T8, not shipped) | 1 | 1 | 122.9 s | 2.89 | 124.2 s |
-| per-episode (T8, not shipped) | 4 | 4 | 60.6 s | 2.71 | 59.5 s |
-| per-episode (T8, not shipped) | 8 | 8 | 55.2 s | 2.96 | 55.2 s |
+| pass | `--jobs` | workers spawned | wall | 1-min load at start | GPU at start | artifacts vs `--jobs 1` |
+|---|---|---|---|---|---|---|
+| 1 | 1 | 1 | 1102.19 s | 1.55 | **93 %** | — |
+| 1 | 4 | 4 | **60.46 s** | 1.67 | 8 % | identical |
+| 1 | 8 | 8 | 64.89 s | 3.45 | 0 % | **differs — see below** |
+| 2 | 1 | 1 | 330.78 s | 3.76 | **100 %** | identical |
+| 3 | 1 | 1 | **125.72 s** | 7.71 | 0 % | — |
+| 3 | 4 | 4 | 77.33 s | 11.11 | 0 % | identical |
+| 3 | 8 | 8 | 50.71 s | 14.19 | 18 % | **differs — see below** |
 
-Two passes, the second with a "wait until the 1-minute load is below 4" gate before each row
-(pass 1 took three rows at a load of 3.6–6.0, the decay of the row before it). The two agree
-to within 3 s on every row, which is the noise floor here.
+**Read the GPU column before the wall column.** T8's gate is "wait until the 1-minute load is
+below 4", and it was not enough today: another agent's path-traced U4 evaluation held the GPU
+at 93–100 % while contributing almost nothing to the load, and every row here renders. Pass 1's
+and pass 2's `--jobs 1` rows were taken under that and are 9× and 2.7× their own uncontended
+value; they are kept because §28.9 rule 2 says an invalidated measurement is marked, not
+deleted. Pass 3 is three rows back to back with nothing between them, which is the fairest
+thing a shared box allows, and by then the contention had moved to the CPU (load 7.7 → 14.2
+across the three rows).
 
-What it says: the shipped partition is flat, exactly as `docs/design/visible-learning.md`
-section 7.11 predicted — a one-suite evaluation is one cell, `--jobs` clamps to 1, and the
-three cell-level rows differ only by noise. The per-episode partition is **2.0×** at four
-workers and **2.2×** at eight; the second step is small because the box has 16 cores, each
-worker's math-library pool is capped at `cores/N` (section 7.11 again), and every worker opens
-its own MuJoCo and torch subprocess. Per-episode `--jobs 1` costs about a second more than
-cell-level, inside the noise: sixteen `Env::new` + `mj_resetData` + plane constructions
-instead of one is what episode isolation costs when nothing is parallel, and it is small.
+What the rows support: **`--jobs 4` is 60.5 s against `--jobs 1`'s 125.7 s, 48 %** — and that
+60.46 s reproduces T8's own per-episode `--jobs 4` row (60.60 s, quiet box, `v14`) to 0.2 %, so
+the shipped partition performs exactly as T8 measured the unshipped one. `--jobs 8` is 50.7 s,
+40 %. The same-conditions pass-3 pair alone reads 77.3 / 125.7 = 62 %, with the load half again
+higher on the second row than the first. The honest summary is **2.0× at four workers and
+2.5× at eight, on a box that was never quiet**, against a cell-level partition that gave a
+one-suite evaluation no speedup at all.
 
-That is the whole prize in one number: ~2 min of nominal evaluation instead of ~2 min × the
-suites, or for the demo's six-suite sweep the same 2× again on top of the cell split. It is
-bought with the two review decisions above, not with this packet.
+#### `--jobs 8` is not artifact-identical, and the partition is not why (open question)
+
+Every `--jobs 8` row above differs from `--jobs 1`, and it differs from **`nominal-00` record
+81, tick 324** — episode 0 of the first cell, the one episode where `seek_episode` is a no-op
+and the partition changes nothing at all. The step is `Policy` in one run and `Clamped`
+(`ViolationKind::Velocity | Acceleration`) in the other: the *policy's output bits* differ, not
+the plane's reading of them. `--jobs 1`, `2` and `4` agree with each other.
+
+The cause is `shard_thread_env` (design note `visible-learning.md` 7.11): each worker's
+math-library pool is capped to `cores/N`, which on this 16-core box is **4 threads at `--jobs 4`
+and 2 at `--jobs 8`**, while `--jobs 1` spawns no worker and leaves Torch at its own default.
+Measured directly — `es eval run --jobs 1` with `OMP_NUM_THREADS` = `MKL_NUM_THREADS` =
+`OPENBLAS_NUM_THREADS` = `TORCH_NUM_THREADS` = 2 exported, 110.58 s — its `report.json`,
+`events.json` and all 16 `.estraj` are **byte-identical to the `--jobs 8` run** and differ from
+the uncapped `--jobs 1` run. Torch's CPU inference is not bitwise-reproducible across intra-op
+thread counts; 4, 8 and 16 threads happen to agree on these tensor sizes and 2 does not. (It
+also explains a number: the `--jobs 8` report reads `success_rate` 0.2500 /
+`envelope_violation_rate` 0.4409 / `episode_length` 1492.7, which is exactly row U0 of
+`visible-learning.md` 7.31 — measured at `--jobs 6`, cap 2.)
+
+This is **older than this packet** — the cap shipped with M5/V5 and the cell-level partition
+carried it unchanged — and it was invisible because the crate's own parity oracle runs a
+`FakePolicy` with no Torch in it, and because no parity run before this one used a `--jobs`
+whose `cores/N` fell below 4. It is a real hole in §10.4 all the same: **the worker thread count
+changes the policy runtime's numerics and is not in `execution_hash`** (§5.3 has a `runtime`
+slot, and it holds `PolicyRuntime::runtime_hash`, not the pool size). Three ways out, all of
+them decisions rather than fixes, so the M7 review picks one:
+
+1. **Pin the pool.** One thread count for every `--jobs`, `--jobs 1` included, put in
+   `execution_hash`. Costs throughput — 7.11 measured `--jobs 6` uncapped running *slower*
+   than `--jobs 1`, which is why the cap exists.
+2. **Say it in the hash.** Add the pool size to the runtime capability the chain covers, so two
+   reports that differ are visibly two conditions rather than one broken promise.
+3. **Say it in the help.** Narrow `es eval run`'s byte-identity claim to "at the same worker
+   thread count", which is what it has always meant. Done in this packet either way, because
+   the text as it stood was false.
+
+Until then `--jobs N` for `N ≤ cores / 4` is byte-identical to `--jobs 1` on this hardware, and
+the demo's `--jobs 6` sweeps are all at cap 2 and agree with each other.
+
+The metrics this run measures are `success_rate`, `episode_length`,
+`envelope_violation_rate` and `failure_mode_histogram` — the four the demo's Evaluation IR
+declares. The nine performance metrics of §12.4 are `Target / Status: unverified` here, and no
+`step/s` figure is reported for any of it.
+
+**One caveat on "byte-identical", and it predates this packet.** Two of §12.4's nine —
+`physics_steps_per_sec` and `actions_per_sec` — are the only ones `EnvMetrics` fills, and both
+are a count divided by `simulation_wall`, a **wall-clock** duration. A document that declares
+either puts a float in `report.json` that no two runs agree on, whatever `--jobs` says; that was
+already true when one `Env` served a whole cell, and the partition neither fixes nor worsens it
+(`CellSummary` sums the raw counters and the nanoseconds and recomputes the rate with
+`Env::metrics`'s own expression, so the number means the same thing it did). No committed
+document declares either, and the parity claims above are about the documents that do not.
 
 ## 3. Perturbation realisation (`perturb.rs`)
 

@@ -310,6 +310,22 @@ pub struct SafetyCounters {
 카운터는 단조 증가하는 `u64`이다. `reset_counters()` 외에는 public API의 어떤
 것도 이를 리셋하지 않으며, 이 함수는 래치는 건드리지 않는다.
 
+**ring은 에피소드 단위이고, 합계는 아니다** (§9.4, 패킷 M7/R1). `begin_episode`는 래치와
+시드 옆에서 `window`를 — 오직 `window`만을 — 비운다. 이유는 §10.3이 ring에 대해 정한
+규칙 그 자체다: watchdog은 *꽉 찬 윈도 아니면 아무것도* 판단하지 않으므로, 에피소드 경계를
+걸치는 윈도는 절반은 이 스트림, 절반은 저 스트림이고 에피소드 `k`가 에피소드 `k-1`의
+스텝으로 일부 판정된다. §13.1은 에피소드가 스트림이 끝나는 곳이라고 말하며, 이것은 관측
+plan(`CpuPlan::reset`)과 청크 버퍼(`PlaneFeed::end_episode`)가 이미 취하고 있는 것과 같은
+경계다. ring을 비우는 것은 watchdog을 **재장전**하는 것이지 해제하는 것이 아니다(INV-12):
+envelope, 모든 watchdog, 모든 합산 카운터는 그대로이고 다음 위반은 다시 래치된다.
+
+합계가 셀 단위로 남는 것은 의도다. `violations`, `steps`, `clamped_steps`, `dirty_steps`,
+`fallback_activations`는 `es-eval`이 셀 전체에 대해 `envelope_violation_rate`와
+`chunk_underrun_rate`로 나누는 값(§10.3)이므로, 에피소드 경계에서 이들을 0으로 만들면
+§10.1 표의 모든 행이 움직인다. `reset_counters()`가 여전히 유일한 0화 경로다. 이것을 하지
+않았을 때의 비용은 `docs/design/evaluation-execution.md` 2.7에 측정되어 있다 — 데모의 네
+에피소드에서 `violation.rate` 이벤트 227건, 그리고 틱 24에서 갈라진 궤적.
+
 ## 위반 시나리오 스위트 (§28.7 게이트 8)
 
 `tests/fixtures/safety/*.json`을 `tests/scenarios.rs`가 `NJ = 3`, `H = 4`,

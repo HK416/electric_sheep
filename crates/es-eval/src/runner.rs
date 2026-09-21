@@ -13,7 +13,7 @@ use es_compile::{CpuPlan, Home, PlanMode, Tensor, TensorRef};
 use es_core::{PhysTick, StableId, TickRate};
 use es_env::scheduler::BatchDomains;
 use es_env::traj::Trajectory;
-use es_env::{plane_chunk, AsyncInference, ChunkBuffer, Env, EnvMetrics, Episode, PlaneFeed};
+use es_env::{plane_chunk, AsyncInference, ChunkBuffer, Env, Episode, PlaneFeed};
 use es_ir::deployment::{DeploymentIr, ExecutionMode, Micros};
 use es_ir::evaluation::{
     AcceptanceResult, CellResult, EvaluationIr, EvaluationReport, MetricSpec, MetricValue, SeedPlan,
@@ -146,8 +146,10 @@ pub enum RunEvent<'a> {
     Tick { cell: &'a str, event: StepEvent },
     /// The episode is over and its files are written.
     CellEnd { cell: &'a str, end: CellEnd },
-    /// Every episode of one suite is done and [`record_cell`] has judged it: the §10.1 row,
-    /// before the report exists.
+    /// Every episode of one suite is done **on this shard** and its §10.1 row has been
+    /// computed, before the report exists. A worker that owns only a slice of the suite
+    /// cannot say what the row came to and stays quiet; `--telemetry` needs `--jobs 1`
+    /// anyway, so the only publisher is the one that owns every episode (packet M7/R1).
     SuiteEnd {
         suite: &'a str,
         results: &'a [CellResult],
@@ -207,6 +209,9 @@ impl From<ActionSource> for EventSource {
 pub struct StepEvent {
     /// Index of the frame this describes inside its cell, dense and ascending from 0.
     pub frame: u64,
+    /// Control tick **inside this episode**, counted from the reset that opened it (§10.5,
+    /// packet M7/R1) — not the env's cumulative physics clock, which depended on how many
+    /// episodes the same `Env` had already run and therefore on how the run was scheduled.
     pub tick: PhysTick,
     pub source: EventSource,
     /// `es_safety::EventSet::bits()` for this step: the `ViolationKind` bitset, `0` when the
@@ -323,29 +328,38 @@ pub struct EvaluationLock {
     pub created: u64,
 }
 
-/// One cell's contribution to the §10.1 table, exactly as `record_cell` produced it.
+/// One `(cell, episode)` unit's contribution to the §10.1 table — the unit of the partition
+/// and of the merge (packet M7/R1).
+///
+/// The metrics are **not** computed here: a cell's episodes can come off different workers, so
+/// judging one episode as if it were a cell would divide the wrong sums. What a worker produces
+/// is one [`metrics::CellSummary`] per episode, and [`Evaluation::merge`] adds a cell's
+/// together in ascending episode order and computes the §10.1 row once, from the same numbers
+/// whichever worker ran which episode (§10.4).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ShardCell {
     /// Index into `EvaluationIr::suites`. This is what puts a merged report back into the
     /// order the sequential run would have written it, whichever worker produced the cell and
     /// whichever finished first (§10.4).
     pub cell: u32,
-    /// One entry per declared metric, in `MetricSpec::ALL` order.
-    pub results: Vec<CellResult>,
-    /// The per-episode samples of the metrics that have one ([`metrics::per_episode`]), which
-    /// is what an `Aggregation` other than `Mean` needs and `CellResult` does not carry.
-    pub samples: Vec<(MetricSpec, Vec<f64>)>,
+    /// Index into the resolved seed list (§10.2): which episode of that suite this is.
+    pub episode: u64,
+    /// This one episode, reduced to what §10.3 measures of it.
+    pub summary: metrics::CellSummary,
 }
 
 /// What one worker of a `--jobs N` run hands back (design note `docs/design/visible-learning.md`
 /// section 7.11).
 ///
-/// A shard is a *partition of the cells*, never of the episodes: one cell owns one `Env`, one
-/// `SafetyPlane` and one monotonic `seq` for all of its episodes, and `Env::reset` keys the
-/// task's own randomization by an episode counter that cannot be seeked (§10.4). Splitting
-/// finer would change the run; splitting here does not.
+/// A shard is a partition of the `(cell, episode)` **units**: unit `cell * n_episodes +
+/// episode` goes to shard `unit % count`, and each unit builds its own `Env` — seeked to its
+/// episode with `Env::seek_episode`, which §6.3 makes the replay of it — its own `SafetyPlane`,
+/// `ChunkBuffer`, `PlaneFeed` and `AsyncInference`. `--jobs 1` is this same partition with
+/// `count = 1`, not a second implementation (packet M7/R1, design note
+/// `docs/design/evaluation-execution.md` 2.7).
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Shard {
+    /// The units this worker ran, in the order it ran them.
     pub cells: Vec<ShardCell>,
     /// The backend this worker actually opened; `None` when the shard owned no cell.
     pub backend: Option<BackendCaps>,
@@ -567,44 +581,61 @@ impl Evaluation {
         let mut out = Shard::default();
 
         for (cell, suite) in ir.suites.iter().enumerate() {
-            if cell as u32 % count != index {
-                continue;
-            }
-            let mut env: Env<B> = Env::new(task, scene, new_backend(), &domains, seeds[0])?;
-            if perturbations.is_none() {
-                perturbations = Some(PerturbationPlan::compile(
-                    ir,
-                    scene,
-                    env.model(),
-                    frames.is_some(),
-                )?);
-                sources = Some(input_sources(&plan, obs, task, Some(env.model()))?);
-                // Every cell opens the same backend on the same scene, so which cell this
-                // shard happened to reach first does not change the answer.
-                out.backend = Some(backend_caps(&env));
-            }
-            let perturbations = perturbations.as_ref().expect("just compiled");
-            let mut safety = SafetyPlane::<NJ, H>::from_ir(deploy)
-                .map_err(|e| EvalError::Safety(e.to_string()))?;
-
-            let mut episodes = Vec::with_capacity(seeds.len());
-            // The chunk buffer and the plane's feed live exactly as long as the plane does,
-            // and for the same reason: the `seq` the plane judges freshness by is monotonic
-            // per cell (spec 8.6). `PlaneFeed::end_episode` clears both between episodes.
-            //
-            // This is `es loop collect`'s own path -- `es_env::plane_chunk`, the one place a
-            // buffered chunk becomes an actuator command. Before V6b this loop handed the
-            // plane each raw inference result under a fresh `seq`, so only row 0 of every
-            // chunk executed and the Deployment IR's `action.execute_chunk` and `execution`
-            // were dead here (packet M5/V6b, design note section 7.13).
-            let mut buffer = ChunkBuffer::<NJ, H>::new(deploy.action.execute_chunk, blend);
-            let mut feed = PlaneFeed::default();
-            // One env, so the inference batch is the schedule's own `1`. It outlives the
-            // episodes for the same reason the buffer does, and `AsyncInference::drop_env`
-            // clears it at each boundary -- the collector's `DomainRunner::reset_env` makes
-            // the identical call.
-            let mut inference = AsyncInference::new(latency, domains.inference.batch);
+            // The §10.1 row's own accumulator, for the `RunEvent::SuiteEnd` below: only a
+            // shard that owns every episode of this cell can announce its results, and with
+            // `count = 1` that is every cell. `--telemetry` needs `--jobs 1` for the address
+            // anyway, so a worker never has a sink to announce into.
+            let mut whole_cell = metrics::CellSummary::default();
             for (idx, seed) in seeds.iter().enumerate() {
+                // **The unit is the `(cell, episode)` pair** (packet M7/R1): unit
+                // `cell * n_episodes + episode` over the flattened `suites x seeds` list goes
+                // to shard `unit % count`. Fixed by the two indices alone, so it depends
+                // neither on how long an episode takes nor on how many workers started
+                // (§3.4). `(0, 1)` is every unit, and it walks them in exactly the order the
+                // cell loop used to.
+                let unit = (cell * seeds.len() + idx) as u32;
+                if unit % count != index {
+                    continue;
+                }
+                // One `Env`, one `SafetyPlane`, one buffer, one feed and one inference queue
+                // **per episode**. `Env::new` draws episode 0 at construction, so a unit that
+                // wants episode `k` seeks the counter to `k` and resets once -- which §6.3
+                // makes the replay of `k` resets (`cargo test -p es-env --test seek`). What
+                // the cell used to carry across a boundary was the plane's sliding
+                // `ViolationRate` ring and the env's cumulative tick; `begin_episode` now
+                // empties the first (spec 9.4) and `StepEvent::tick` counts from the episode
+                // (§10.5), so there is nothing left for an episode to inherit.
+                let mut env: Env<B> = Env::new(task, scene, new_backend(), &domains, seeds[0])?;
+                env.seek_episode(0, idx as u64)?;
+                env.reset(Some(&[0]))?;
+                if perturbations.is_none() {
+                    perturbations = Some(PerturbationPlan::compile(
+                        ir,
+                        scene,
+                        env.model(),
+                        frames.is_some(),
+                    )?);
+                    sources = Some(input_sources(&plan, obs, task, Some(env.model()))?);
+                    // Every unit opens the same backend on the same scene, so which one this
+                    // shard happened to reach first does not change the answer.
+                    out.backend = Some(backend_caps(&env));
+                }
+                let perturbations = perturbations.as_ref().expect("just compiled");
+                let mut safety = SafetyPlane::<NJ, H>::from_ir(deploy)
+                    .map_err(|e| EvalError::Safety(e.to_string()))?;
+                // The chunk buffer and the plane's feed live exactly as long as the plane
+                // does, and for the same reason: the `seq` the plane judges freshness by is
+                // monotonic (spec 8.6) and only its ordering is judged.
+                //
+                // This is `es loop collect`'s own path -- `es_env::plane_chunk`, the one place
+                // a buffered chunk becomes an actuator command. Before V6b this loop handed
+                // the plane each raw inference result under a fresh `seq`, so only row 0 of
+                // every chunk executed and the Deployment IR's `action.execute_chunk` and
+                // `execution` were dead here (packet M5/V6b, design note section 7.13).
+                let mut buffer = ChunkBuffer::<NJ, H>::new(deploy.action.execute_chunk, blend);
+                let mut feed = PlaneFeed::default();
+                // One env, so the inference batch is the schedule's own `1`.
+                let mut inference = AsyncInference::new(latency, domains.inference.batch);
                 // One cell of the mosaic is one episode of one suite: `single_env()` makes
                 // them independent runs, so the grid is `suites x episodes` directories.
                 let name = format!("{}-{idx:02}", suite.name);
@@ -673,37 +704,47 @@ impl Evaluation {
                 if frames_dir.is_some() {
                     out.events.insert(name, events);
                 }
-                episodes.push(episode);
-            }
-
-            let env_metrics = env.metrics();
-            out.cells.push(record_cell(
-                ir,
-                cell as u32,
-                &suite.name,
-                &episodes,
-                safety.counters(),
-                &env_metrics,
-            ));
-            if let Some(sink) = sink.as_deref_mut() {
-                let results = &out.cells.last().expect("just pushed").results;
-                sink(RunEvent::SuiteEnd {
-                    suite: &suite.name,
-                    results,
+                // The episode's own numbers, read off its own plane and its own env. Summing
+                // them is `merge`'s job, and it sums in episode order whichever worker
+                // produced which (§10.4).
+                let summary = metrics::CellSummary::episode(
+                    &ir.metrics,
+                    &episode,
+                    safety.counters(),
+                    &env.metrics(),
+                );
+                whole_cell.add(&summary);
+                out.cells.push(ShardCell {
+                    cell: cell as u32,
+                    episode: idx as u64,
+                    summary,
                 });
+            }
+            // A shard that owns every episode of this cell can say what the row came to; one
+            // that owns a slice of it cannot, and says nothing.
+            if let Some(sink) = sink.as_deref_mut() {
+                if whole_cell.n_episodes as usize == seeds.len() && !seeds.is_empty() {
+                    let results = cell_results(ir, &suite.name, &whole_cell);
+                    sink(RunEvent::SuiteEnd {
+                        suite: &suite.name,
+                        results: &results,
+                    });
+                }
             }
         }
         Ok(out)
     }
 
-    /// The §10.5 artifacts, from every worker's cells put back in canonical order.
+    /// The §10.5 artifacts, from every worker's units put back in canonical order.
     ///
-    /// The judgement, the hash chain and both artifacts are computed **here and only here**,
-    /// from the same `judge` over the same `measured`/`samples` maps the sequential path
-    /// builds — so `--jobs N` cannot produce a report that `--jobs 1` would not have (§10.4).
+    /// **Every metric is computed here and only here** (packet M7/R1): a worker hands back one
+    /// [`metrics::CellSummary`] per episode, this adds a cell's together in ascending episode
+    /// order and computes the §10.1 row, the judgement, the hash chain and both artifacts from
+    /// the result — so a cell is the same row whichever worker ran which of its episodes, and
+    /// `--jobs N` cannot produce a report that `--jobs 1` would not have (§10.4).
     ///
-    /// A cell set that is not exactly `0..suites.len()`, each cell once, is refused. A report
-    /// missing a suite because a worker was lost would otherwise carry a correct
+    /// A unit set that is not exactly every `(cell, episode)` pair, each once, is refused. A
+    /// report missing an episode because a worker was lost would otherwise carry a correct
     /// `evaluation_hash` over numbers nobody measured.
     pub fn merge(
         ir: &EvaluationIr,
@@ -717,14 +758,18 @@ impl Evaluation {
         let plan = CpuPlan::compile(obs, PlanMode::Release)
             .map_err(|d| EvalError::Plan(d.iter().map(ToString::to_string).collect()))?;
 
-        // Stable, so the metric order inside a cell is untouched and only the cells move.
+        // Stable, so units of one cell keep the order their worker ran them in before the key
+        // below puts the whole list into `(cell, episode)` order.
         let mut merged: Vec<&ShardCell> = shards.iter().flat_map(|s| &s.cells).collect();
-        merged.sort_by_key(|c| c.cell);
-        let covered: Vec<u32> = merged.iter().map(|c| c.cell).collect();
-        if covered.iter().copied().ne(0..ir.suites.len() as u32) {
+        merged.sort_by_key(|c| (c.cell, c.episode));
+        let n_episodes = resolve_seeds(ir).len() as u64;
+        let covered: Vec<(u32, u64)> = merged.iter().map(|c| (c.cell, c.episode)).collect();
+        let wanted = (0..ir.suites.len() as u32).flat_map(|c| (0..n_episodes).map(move |e| (c, e)));
+        if covered.iter().copied().ne(wanted) {
             return Err(EvalError::Shard(format!(
-                "the merged workers cover cells {covered:?}; the evaluation has {} suites and \
-                 every cell must appear exactly once",
+                "the merged workers cover the (cell, episode) units {covered:?}; the evaluation \
+                 has {} suite(s) x {n_episodes} episode(s) and every unit must appear exactly \
+                 once",
                 ir.suites.len()
             )));
         }
@@ -732,14 +777,17 @@ impl Evaluation {
         let mut cells: Vec<CellResult> = Vec::new();
         let mut measured: BTreeMap<(String, MetricSpec), MetricValue> = BTreeMap::new();
         let mut samples: BTreeMap<(String, MetricSpec), Vec<f64>> = BTreeMap::new();
-        for c in merged {
-            let suite = &ir.suites[c.cell as usize].name;
-            for r in &c.results {
-                measured.insert((suite.clone(), r.metric), r.value.clone());
-                cells.push(r.clone());
+        for (cell, suite) in ir.suites.iter().enumerate() {
+            let mut summary = metrics::CellSummary::default();
+            for unit in merged.iter().filter(|u| u.cell as usize == cell) {
+                summary.add(&unit.summary);
             }
-            for (metric, v) in &c.samples {
-                samples.insert((suite.clone(), *metric), v.clone());
+            for r in cell_results(ir, &suite.name, &summary) {
+                measured.insert((suite.name.clone(), r.metric), r.value.clone());
+                cells.push(r);
+            }
+            for (metric, v) in &summary.samples {
+                samples.insert((suite.name.clone(), *metric), v.clone());
             }
         }
 
@@ -902,9 +950,18 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     inference.drop_env(0);
     // A latch left over from the previous episode would poison the rest of the cell, and so
     // would a command chain still anchored on where the previous episode's last command left
-    // the arm. `begin_episode` clears both; it is not disabling the plane (INV-12), since the
-    // envelope, watchdogs and counters are untouched and the next violation latches again.
+    // the arm, or a sliding `ViolationRate` window still full of its steps. `begin_episode`
+    // clears all three; it is not disabling the plane (INV-12), since the envelope, the
+    // watchdogs and every summed counter are untouched and the next violation latches again.
     safety.begin_episode();
+    // **The episode's own clock** (§10.5, packet M7/R1). `StepEvent::tick` and the live
+    // `Observation` event count from here, not from `Env::new`: the env is freshly reset at
+    // this point (see above), so this is tick 0 of the episode whatever the env did before.
+    // An absolute tick is only meaningful inside one cell and only while one `Env` runs every
+    // episode of it -- which is what makes `events.json` depend on how the run was scheduled,
+    // and what stopped the `(cell, episode)` partition
+    // (`docs/design/evaluation-execution.md` 2.7). `frame` is unchanged.
+    let start = env.tick().0;
 
     let mut overrides = ResetOverrides::default();
     perturbations.apply_at_reset(cell, seed, episode, &mut overrides);
@@ -962,7 +1019,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
                 {
                     sink(RunEvent::Observation {
                         cell: cell_name,
-                        tick: env.tick(),
+                        tick: PhysTick(env.tick().0 - start),
                         shape: &names[i].2,
                         bytes: &bytes[i],
                     });
@@ -1049,7 +1106,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         // dropped rendered nothing, so it adds no record and the two stay the same length.
         let record = StepEvent {
             frame: captured.saturating_sub(1),
-            tick: env.tick(),
+            tick: PhysTick(env.tick().0 - start),
             source: safe.source.into(),
             events: safe.events.bits(),
         };
@@ -1386,38 +1443,21 @@ fn to_f64(t: &Tensor) -> Result<Vec<f64>, EvalError> {
     }
 }
 
-/// Computes every declared metric for one cell. Every declared metric gets exactly one
-/// `CellResult`, measured or `MetricValue::Unavailable` — never a missing row.
-fn record_cell(
-    ir: &EvaluationIr,
-    cell: u32,
-    suite: &str,
-    episodes: &[Episode],
-    counters: &es_safety::SafetyCounters,
-    env_metrics: &EnvMetrics,
-) -> ShardCell {
-    let mut out = ShardCell {
-        cell,
-        results: Vec::new(),
-        samples: Vec::new(),
-    };
+/// Computes every declared metric for one cell from its summed episodes. Every declared metric
+/// gets exactly one `CellResult`, measured or `MetricValue::Unavailable` — never a missing row.
+fn cell_results(ir: &EvaluationIr, suite: &str, summary: &metrics::CellSummary) -> Vec<CellResult> {
     // `MetricSpec::ALL` order, not the document's, so the report is byte-stable whatever
     // order the author listed the metrics in.
-    for metric in MetricSpec::ALL {
-        if !ir.metrics.contains(&metric) {
-            continue;
-        }
-        out.results.push(CellResult {
+    MetricSpec::ALL
+        .into_iter()
+        .filter(|m| ir.metrics.contains(m))
+        .map(|metric| CellResult {
             suite: suite.to_owned(),
             metric,
-            value: metrics::compute(&metric, episodes, counters, env_metrics),
-            n_episodes: episodes.len() as u32,
-        });
-        if let Some(v) = metrics::per_episode(&metric, episodes) {
-            out.samples.push((metric, v));
-        }
-    }
-    out
+            value: metrics::compute(&metric, summary),
+            n_episodes: summary.n_episodes,
+        })
+        .collect()
 }
 
 /// §10.2 acceptance. A criterion with no `suite` applies to every suite; a criterion whose

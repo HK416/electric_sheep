@@ -301,6 +301,22 @@ pub struct SafetyCounters {
 Counters are monotone `u64`; nothing in the public API resets them except `reset_counters()`,
 which does not touch the latch.
 
+**The ring is per episode; the sums are not** (§9.4, packet M7/R1). `begin_episode` empties
+`window` — and only `window`, beside the latch and the seed. The reason is §10.3's own rule for
+the ring: the watchdog judges *a full window or nothing*, so a window straddling an episode
+boundary is half of one stream and half of another, and episode `k` is judged partly on episode
+`k-1`'s steps. §13.1 says an episode is where a stream ends, and this is the same boundary the
+observation plan (`CpuPlan::reset`) and the chunk buffer (`PlaneFeed::end_episode`) already
+take. Emptying the ring **re-arms** the watchdog, it does not disarm it (INV-12): the envelope,
+every watchdog and every summed counter are untouched and the next violation latches again.
+
+The sums stay the cell's on purpose. `violations`, `steps`, `clamped_steps`, `dirty_steps` and
+`fallback_activations` are what `es-eval` divides into `envelope_violation_rate` and
+`chunk_underrun_rate` over a whole cell (§10.3), so zeroing them at an episode boundary would
+move every §10.1 row; `reset_counters()` remains the only way to zero one. What this cost, when
+it was not done: `docs/design/evaluation-execution.md` 2.7 has the measurement — 227 `violation.rate`
+events over four demo episodes, and a trajectory that parted company at tick 24.
+
 ## Violation scenario suite (§28.7 gate 8)
 
 `tests/fixtures/safety/*.json`, replayed by `tests/scenarios.rs` against `NJ = 3`, `H = 4`,

@@ -9073,26 +9073,25 @@ fn dataset_bake_for_training_writes_the_chain() {
     );
 }
 
-/// Packet M7/T8 oracle 4 — **`--jobs` still splits cells, not episodes, and the design note
-/// says why.**
+/// Packet M7/R1 oracle 4 (packet M7/T8 oracle 4, flipped) — **`--jobs` splits episodes, so a
+/// one-suite evaluation parallelises.**
 ///
-/// The packet's question was whether `Env::seek_episode` (which ships, and is bitwise: see
-/// `cargo test -p es-env --test seek`) lets a shard be one episode rather than one whole
-/// suite. Measured on the committed demo documents by running the pre-T8 and the T8 build over
-/// the nominal suite: no. Two things carry from episode `k-1` into episode `k` and show in the
-/// artifacts -- the Safety Plane's `ViolationRate` window and `StepEvent::tick` -- and both are
-/// decisions for the M7 review, not fixes for this packet. So no flag was added, and this is
-/// what the shipped state looks like from the CLI's side.
+/// T8 asked whether `Env::seek_episode` (which ships, and is bitwise: see `cargo test -p es-env
+/// --test seek`) lets a shard be one episode rather than one whole suite, and measured on the
+/// committed demo documents that the evaluator still said no: the Safety Plane's
+/// `ViolationRate` window and `StepEvent::tick` both carried from episode `k-1` into episode
+/// `k`. The owner decided both on 2026-09-21 (spec 28.11); R1 shipped them, and this is what
+/// the CLI looks like with the partition in.
 #[test]
 fn eval_jobs_splits_episodes() {
-    // 1. The finding is written down where the review will look for it, with its evidence.
+    // 1. The decision and the measurement are written down where the reader will look.
     let note = std::fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/design/evaluation-execution.md"),
     )
     .expect("the evaluation-execution design note");
     for wanted in [
         "2.7 Sharding",
-        "ViolationRate` window carries across the episode boundary",
+        "the unit is the `(cell, episode)` pair",
         "tick 24",
     ] {
         assert!(
@@ -9101,45 +9100,49 @@ fn eval_jobs_splits_episodes() {
         );
     }
 
-    // 2. The worker protocol's unit is still the cell: a shard is a list of cells, each
-    //    carrying the results `record_cell` computed inside the worker.
+    // 2. The worker protocol's unit is the `(cell, episode)` pair: a shard is a list of
+    //    episodes, each carrying only its own summary. The metrics are the merge's.
     let shard = es_eval::Shard {
         cells: vec![es_eval::ShardCell {
             cell: 0,
-            results: Vec::new(),
-            samples: Vec::new(),
+            episode: 3,
+            summary: es_eval::metrics::CellSummary::default(),
         }],
         backend: None,
         events: BTreeMap::new(),
     };
     let text = serde_json::to_string(&shard).expect("a shard serializes");
-    assert!(text.contains("\"results\""), "{text}");
-    assert!(!text.contains("\"episodes\""), "{text}");
+    assert!(text.contains("\"episode\":3"), "{text}");
+    assert!(!text.contains("\"results\""), "{text}");
 
-    // 3. And the CLI says so, including the clamp a one-suite evaluation runs into.
+    // 3. And the CLI says so, including the clamp that is no longer the suite count.
     let help = bin()
         .args(["eval", "run", "--help"])
         .output()
         .expect("run es eval run --help");
     let help = stdout(&help);
-    assert!(
-        help.contains("The split is by suite and not by episode"),
-        "{help}"
-    );
-    assert!(help.contains("N is clamped to the suite count"), "{help}");
+    assert!(help.contains("The split is by episode"), "{help}");
+    assert!(help.contains("N is clamped to suites x episodes"), "{help}");
 
-    // 4. The behaviour itself, where a real run is possible: the demo's nominal suite is one
-    //    cell, so `--jobs 4` clamps to one and spawns no worker at all -- no `shards/`.
-    let ran = eval_jobs_one_suite_runs_one_wide();
+    // 4. The behaviour itself, where a real run is possible: one suite, two episodes, two
+    //    workers -- and the artifacts of the partitioned run are the sequential run's.
+    let ran = eval_jobs_one_suite_runs_two_wide();
     println!("RAN eval_jobs_splits_episodes{ran}");
 }
 
-/// `--jobs 4` over a one-suite evaluation, when this machine can run one. Returns what to
-/// append to the `RAN` line; a machine without the pieces prints its own `SKIP` and returns "".
+/// `--jobs 2` over a one-suite two-episode evaluation, when this machine can run one. Returns
+/// what to append to the `RAN` line; a machine without the pieces prints its own `SKIP` and
+/// returns "".
 ///
 /// Driven by `--expert` (packet M7/T2), so this needs `MuJoCo` and a renderer but no Torch and
-/// no trained bundle: what is under test is the partition, not the policy.
-fn eval_jobs_one_suite_runs_one_wide() -> String {
+/// no trained bundle: what is under test is the partition, not the policy. It is also packet
+/// M7/R1's oracle 3 on the **committed demo documents** rather than on the `es-eval` fixture
+/// backend — `report.json`, `events.json` and every `.estraj` byte-identical between `--jobs 1`
+/// and `--jobs 2` (`evaluation.lock`'s `created` excepted, which is why it is not compared).
+fn eval_jobs_one_suite_runs_two_wide() -> String {
+    // One run's stdout+stderr, and the named artifacts it wrote (`None` when the backend was
+    // unavailable and the run exited 3).
+    type RunOutcome = (String, Option<Vec<(String, Vec<u8>)>>);
     if cfg!(not(feature = "render")) {
         println!("SKIP eval_jobs_splits_episodes (the live run): built without `render`");
         return String::new();
@@ -9152,7 +9155,7 @@ fn eval_jobs_one_suite_runs_one_wide() -> String {
     let dir = scratch_dir("eval-jobs-episodes");
     let bundle = write_demo_bundle(&dir);
     // The committed demo evaluation, cut to its first suite and two episodes: one cell, which
-    // is what `--jobs` has nothing to split.
+    // `--jobs` used to have nothing to split.
     let mut ir = es_ir::serial::evaluation_from_toml(
         &std::fs::read_to_string(vl_fixture("evaluation.toml")).expect("evaluation.toml"),
     )
@@ -9167,43 +9170,115 @@ fn eval_jobs_one_suite_runs_one_wide() -> String {
         &es_ir::serial::evaluation_to_toml(&ir).expect("evaluation toml"),
     );
 
-    let out = dir.join("out");
-    let run = bin()
-        .args(["eval", "run", "--config"])
-        .arg(&config)
-        .arg("--policy")
-        .arg(&bundle)
-        .arg("--scene")
-        .arg(demo_scene_path())
-        .arg("--out")
-        .arg(&out)
-        .arg("--frames")
-        .arg(out.join("frames"))
-        .args(["--expert", "so101-pick-place", "--jobs", "4"])
-        .output()
-        .expect("run es eval run --jobs 4");
-    let text = format!("{}{}", stdout(&run), String::from_utf8_lossy(&run.stderr));
-    if run.status.code() == Some(3) {
+    // One run at `jobs`, returning its stdout+stderr and the artifacts it wrote.
+    let run = |jobs: &str, name: &str| -> RunOutcome {
+        let out = dir.join(name);
+        let result = bin()
+            .args(["eval", "run", "--config"])
+            .arg(&config)
+            .arg("--policy")
+            .arg(&bundle)
+            .arg("--scene")
+            .arg(demo_scene_path())
+            .arg("--out")
+            .arg(&out)
+            .arg("--frames")
+            .arg(out.join("frames"))
+            .args(["--expert", "so101-pick-place", "--jobs", jobs])
+            .output()
+            .expect("run es eval run");
+        let text = format!(
+            "{}{}",
+            stdout(&result),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        if result.status.code() == Some(3) {
+            return (text, None);
+        }
+        assert!(
+            matches!(result.status.code(), Some(0 | 1)),
+            "--jobs {jobs} exit {:?}\n{text}",
+            result.status.code()
+        );
+        // `report.json` and `events.json`, then every `.estraj`: everything `--jobs` is not
+        // allowed to move. `evaluation.lock` carries `created` and is excluded by spec 10.4.
+        let mut files = vec![
+            (
+                "report.json".to_owned(),
+                std::fs::read(out.join("report.json")).expect("report.json"),
+            ),
+            (
+                "events.json".to_owned(),
+                std::fs::read(out.join("events.json")).expect("events.json"),
+            ),
+        ];
+        for entry in std::fs::read_dir(out.join("traj")).expect("the traj directory") {
+            let path = entry.expect("entry").path();
+            files.push((
+                format!("traj/{}", path.file_name().expect("name").to_string_lossy()),
+                std::fs::read(&path).expect("estraj"),
+            ));
+        }
+        files.sort();
+        (text, Some(files))
+    };
+
+    let (one_text, one) = run("1", "out-jobs-1");
+    let Some(one) = one else {
         println!(
             "SKIP eval_jobs_splits_episodes (the live run): {}",
-            text.trim()
+            one_text.trim()
         );
         return String::new();
+    };
+    let (two_text, two) = run("2", "out-jobs-2");
+    let two = two.expect("the backend was available a moment ago");
+
+    // Two episodes, two workers: the clamp no longer takes `--jobs 2` down to 1.
+    assert!(
+        two_text.contains("2 unit(s) over 2 worker(s)"),
+        "a two-episode evaluation did not run two-wide:\n{two_text}"
+    );
+    assert!(
+        !one_text.contains("worker(s)"),
+        "--jobs 1 spawned a worker:\n{one_text}"
+    );
+    assert_eq!(
+        one.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        two.iter().map(|(n, _)| n).collect::<Vec<_>>(),
+        "--jobs 2 moved which artifacts exist"
+    );
+    assert!(
+        one.iter().any(|(n, _)| n.starts_with("traj/")),
+        "the run wrote no trajectory: {:?}",
+        one.iter().map(|(n, _)| n).collect::<Vec<_>>()
+    );
+    for ((name, a), (_, b)) in one.iter().zip(&two) {
+        assert_eq!(
+            a,
+            b,
+            "--jobs 2 moved {name}\n{}",
+            String::from_utf8_lossy(&a[..a.len().min(400)])
+        );
     }
-    assert!(
-        matches!(run.status.code(), Some(0 | 1)),
-        "exit {:?}\n{text}",
-        run.status.code()
-    );
-    // One cell, so the clamp took --jobs 4 down to 1: no worker was spawned and nothing
-    // announced a partition.
-    assert!(
-        !out.join("shards").exists(),
-        "a one-suite evaluation spawned workers:\n{text}"
-    );
-    assert!(!text.contains("worker(s)"), "{text}");
-    assert!(out.join("report.json").is_file(), "{text}");
-    " (with the live one-suite run)".to_owned()
+    format!(
+        " (with the live two-episode run: {} artifact(s) identical between --jobs 1 and --jobs 2)",
+        one.len()
+    )
+}
+
+/// `--jobs 0` is refused, and `--shard` without `--shard-out` with it: the usage errors the
+/// partition did not change (exit 2).
+#[test]
+fn eval_jobs_zero_and_a_bare_shard_are_refused() {
+    for args in [
+        vec!["eval", "run", "--jobs", "0"],
+        vec!["eval", "run", "--shard", "0/2"],
+    ] {
+        let out = bin().args(&args).output().expect("run es eval run");
+        let text = format!("{}{}", stdout(&out), String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {text}");
+    }
 }
 
 // --- packet M7/R5: the path-traced observation documents -----------------------------------

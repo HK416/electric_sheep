@@ -1257,6 +1257,14 @@ episode counter is an `es-env` change, which this packet forbids itself.
 > `begin_episode`, and `StepEvent::tick` is the cell's cumulative physics clock — so the unit
 > stayed the cell and no flag was added. The evidence, the measured deltas and the two review
 > decisions are `docs/design/evaluation-execution.md` section 2.7.
+>
+> **And then it did (packet M7/R1).** The owner decided both on 2026-09-21 (spec 28.11):
+> `begin_episode` empties the ring (spec 9.4) and `StepEvent::tick` counts from the episode
+> (spec 10.5). With both in, the `(cell, episode)` partition is byte-identical to the
+> sequential run on the committed demo documents, `--jobs N` splits episodes and not cells,
+> and a one-suite evaluation parallelises. The parity evidence and the new wall-clock table
+> are in the same section 2.7; what the semantics change did to this note's own numbers is
+> [section 7.33](#733-as-built-m7r1-the-numbers-re-measured-under-episode-boundary-semantics).
 
 A **cell**, by contrast, is genuinely self-contained: its own `Env`, its own `SafetyPlane`, `seq`
 from 0, `plan.reset()` on every episode including its first. The two things cells share are the
@@ -4516,6 +4524,54 @@ twice, `Rs` above and `Pt` below, both runs reporting the same dataset `content`
 pixel), so it is a fixed texture per pose rather than noise a policy could average away over
 epochs. If U4 lands below U3, that is the first thing to look at, and `spp` is a field of
 `SensorRender` precisely so the next run can move it without touching a line of code.
+
+### 7.33 As built (M7/R1): the numbers re-measured under episode-boundary semantics
+
+Packet `docs/packets/M7/P-M7-R1.md`; the mechanism is `docs/design/evaluation-execution.md`
+2.7 and `docs/design/safety-plane.md` "Counters". **Every evaluation number in this note up to
+and including section 7.32 was measured under window carry-over**: the Safety Plane's §9.4
+`ViolationRate` ring survived `begin_episode`, so at tick 0 of episode `k` the watchdog read a
+window full of episode `k−1`'s dirty steps, tripped, and took the fallback path instead of the
+clamp path — on the demo, whose envelope violation rate is ~0.999, for the first 200 ticks of
+every episode but the first. `StepEvent::tick` was the cell's cumulative physics clock over the
+same period. The owner decided both on 2026-09-21 (§28.11) and R1 shipped them, so those rows
+are **pre-R1 semantics** and stay in place, marked, rather than being deleted (§28.9 rule 2).
+This section is the re-measurement.
+
+**The re-measurement, and it moved nothing.** Both runs are the R1 build
+(`~/Projects/es-r1-episodes`, `cargo build --release -p es --features render`,
+`ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python`) on the oracle server, 2026-09-21, artifacts
+under `~/artifacts/plan-v/m7-r1-episodes/`:
+
+| row | document | pre-R1 semantics | under R1 | `passed` |
+|---|---|---|---|---|
+| **U3 held-out** (16 seeds × 6 suites, `--jobs 6`) | `evaluation-augmented.toml`, `evaluation_hash e5705cb0…` | `success_rate` **0.5625**, `envelope_violation_rate` 0.6668, `episode_length` 1092.1 | **the same numbers** — `report.json` is byte-identical to `~/artifacts/plan-v/m7-u/U3/holdout/report.json`, `execution_hash a2283994…` and all six suites' histograms included | true, both |
+| **expert gate**, nominal (16 seeds, `--jobs 6`, `--expert so101-pick-place`) | the committed `evaluation.toml`'s nominal suite | `success_rate` 1.0, `envelope_violation_rate` 0.0432, `episode_length` 507.25 (packet M7/T2's `report-expert-gate.json`) | `success_rate` **1.0**, `envelope_violation_rate` **0.0432**, `episode_length` **507.2** | true, both |
+
+**Why nothing moved, and when it would have.** The ring is the input to one watchdog, and that
+watchdog fires on `envelope_violation_rate > max_frac`. The demo declares `max_frac = 0.9`. U3
+runs at a *cell* violation rate of 0.667 and the scripted expert at 0.043, so at tick 0 of
+episode `k` the old plane's carried-over window and the new plane's empty one are **both below
+the trip line** — same branch, same action, same trajectory. The policy T8 measured the
+divergence on, `v14/trained-20000.esb`, ran at **0.9998**: its carried window read ~1.0 at tick
+0, tripped, and took the fallback path where an empty ring takes the clamp path. So the
+semantics change is visible exactly for a policy that is *already* outside its envelope more
+often than the watchdog tolerates — and none of the committed rows is.
+
+What did move, unconditionally, is `events.json`'s clock: U3's `backlash-01` opened at
+`tick: 1408` and `backlash-02` at `tick: 8608` under the old semantics, and both open at
+`tick: 0` now. No metric reads `tick`, which is why the report is unchanged.
+
+That is the honest state of the "pre-R1 semantics" mark: it is a mark on the *conditions*, not
+a correction to a number. Every row above 7.32 stands as measured, and a future policy whose
+sliding rate crosses its `max_frac` is the one that will need re-measuring — which is now a
+property a reader can check from the `envelope_violation_rate` column already in the table.
+
+**What is not re-measured, and why.** §28.10 allows the IR-graph policy to be re-measured once
+and that was the U wave; this is not a fifth configuration and nothing was retrained. U0, U1,
+U2 and U4 keep their pre-R1 rows; only U3 — the row the demo's acceptance turns on — and the
+harness's own expert gate are re-run, which is the smallest measurement that says what the
+semantics change did to a number anyone reads.
 
 ## 8. Safety overlay (V3)
 

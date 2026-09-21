@@ -6,11 +6,13 @@
 //! collisions, and the two must not be confusable.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use es_core::FailureKind;
 use es_env::{EnvMetrics, Episode, Termination};
 use es_ir::evaluation::{Aggregation, MetricSpec, MetricValue};
 use es_safety::{SafetyCounters, ViolationKind};
+use serde::{Deserialize, Serialize};
 
 fn unavailable(reason: &str) -> MetricValue {
     MetricValue::Unavailable {
@@ -18,45 +20,150 @@ fn unavailable(reason: &str) -> MetricValue {
     }
 }
 
-/// Computes one metric over the finished episodes of one cell.
+/// One cell, reduced to what §10.3 measures of it — and the unit the `(cell, episode)`
+/// partition adds up (packet M7/R1).
 ///
-/// `episodes` must already be in the cell's deterministic order — `(cell, seed)`, which the
-/// runner preserves by appending in episode order (§10.4).
-pub fn compute(
-    spec: &MetricSpec,
-    episodes: &[Episode],
-    counters: &SafetyCounters,
-    env: &EnvMetrics,
-) -> MetricValue {
+/// A cell's episodes may have run on different worker processes, so what crosses that boundary
+/// is this and not the live objects it was read off. In particular **not** a `SafetyCounters`:
+/// that carries the §9.4 sliding `ViolationRate` ring, which `SafetyPlane::begin_episode`
+/// empties because a window straddling an episode boundary is half of one stream and half of
+/// another (§13.1). The three integers below are the only plane numbers §10.3 divides, and
+/// they are sums, so they add.
+///
+/// [`Self::episode`] builds one episode's; [`Self::add`] folds the next one in. Adding in
+/// ascending episode order is what makes the merged cell the sequential cell: the sums are
+/// integer, but `samples` keeps the order `Aggregation` and `mean` see (§10.4).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct CellSummary {
+    /// Per-episode samples of every declared metric that has one ([`per_episode`]), in
+    /// `MetricSpec::ALL` order and, inside each, in episode order.
+    pub samples: Vec<(MetricSpec, Vec<f64>)>,
+    /// §10.3 `failure_mode_histogram`, summed over the episodes.
+    pub histogram: BTreeMap<String, u64>,
+    /// Steps the Safety Plane validated, and how many of them it changed: the denominator and
+    /// numerator of §10.3 `envelope_violation_rate`.
+    pub steps: u64,
+    pub dirty_steps: u64,
+    /// `ViolationKind::ChunkUnderrun` over the same steps: §10.3 `chunk_underrun_rate`'s
+    /// numerator (§8.6).
+    pub chunk_underruns: u64,
+    pub n_episodes: u32,
+    /// The §12.4 counters behind the two rates this build measures, summed over the cell's
+    /// envs. Integers and a nanosecond count, never a rate: averaging per-episode rates would
+    /// be a different number from the cell's (§18.1).
+    pub physics_env_steps: u64,
+    pub action_env_steps: u64,
+    pub simulation_wall_ns: u64,
+}
+
+impl CellSummary {
+    /// One finished episode's summary: its samples of the declared metrics, its histogram
+    /// buckets, and the plane's and env's numbers for that episode alone.
+    pub fn episode(
+        metrics: &[MetricSpec],
+        episode: &Episode,
+        counters: &SafetyCounters,
+        env: &EnvMetrics,
+    ) -> Self {
+        let one = std::slice::from_ref(episode);
+        let mut samples = Vec::new();
+        // `MetricSpec::ALL` order, not the document's, so the report is byte-stable whatever
+        // order the author listed the metrics in.
+        for metric in MetricSpec::ALL {
+            if !metrics.contains(&metric) {
+                continue;
+            }
+            if let Some(v) = per_episode(&metric, one) {
+                samples.push((metric, v));
+            }
+        }
+        Self {
+            samples,
+            histogram: failure_histogram(one, counters),
+            steps: counters.steps,
+            dirty_steps: counters.dirty_steps,
+            chunk_underruns: counters.count(ViolationKind::ChunkUnderrun),
+            n_episodes: 1,
+            physics_env_steps: env.physics_env_steps,
+            action_env_steps: env.action_env_steps,
+            simulation_wall_ns: u64::try_from(env.simulation_wall.as_nanos()).unwrap_or(u64::MAX),
+        }
+    }
+
+    /// Folds the next episode of the same cell in. The caller adds in ascending episode order.
+    pub fn add(&mut self, next: &Self) {
+        for (metric, values) in &next.samples {
+            match self.samples.iter_mut().find(|(m, _)| m == metric) {
+                Some((_, into)) => into.extend_from_slice(values),
+                None => self.samples.push((*metric, values.clone())),
+            }
+        }
+        for (bucket, n) in &next.histogram {
+            *self.histogram.entry(bucket.clone()).or_insert(0) += n;
+        }
+        self.steps += next.steps;
+        self.dirty_steps += next.dirty_steps;
+        self.chunk_underruns += next.chunk_underruns;
+        self.n_episodes += next.n_episodes;
+        self.physics_env_steps += next.physics_env_steps;
+        self.action_env_steps += next.action_env_steps;
+        self.simulation_wall_ns += next.simulation_wall_ns;
+    }
+
+    fn sample(&self, spec: MetricSpec) -> Option<&[f64]> {
+        self.samples
+            .iter()
+            .find(|(m, _)| *m == spec)
+            .map(|(_, v)| v.as_slice())
+    }
+
+    /// The §12.4 set for this cell: the raw counters added, and the two rates this build fills
+    /// recomputed from the sums with `Env::metrics`'s own expression.
+    ///
+    /// A field this build never measures stays `None`. Combining an instrumented one would
+    /// need a rule of its own, and guessing one here would be exactly the fabricated number
+    /// §12.4 forbids — so the field that gains a measurement gains its rule here too.
+    fn env_metrics(&self) -> EnvMetrics {
+        let secs = Duration::from_nanos(self.simulation_wall_ns).as_secs_f64();
+        let rate = |count: u64| (secs > 0.0).then(|| count as f64 / secs);
+        EnvMetrics {
+            physics_steps_per_sec: rate(self.physics_env_steps),
+            actions_per_sec: rate(self.action_env_steps),
+            physics_env_steps: self.physics_env_steps,
+            action_env_steps: self.action_env_steps,
+            simulation_wall: Duration::from_nanos(self.simulation_wall_ns),
+            ..EnvMetrics::default()
+        }
+    }
+}
+
+/// Computes one metric over one cell's summed episodes.
+pub fn compute(spec: &MetricSpec, cell: &CellSummary) -> MetricValue {
+    let env = cell.env_metrics();
     match spec {
-        MetricSpec::SuccessRate => per_episode(spec, episodes).map_or_else(
-            || unavailable("no episode finished in this cell"),
-            |v| MetricValue::Scalar(mean(&v)),
-        ),
-        MetricSpec::EpisodeLength | MetricSpec::ActionSmoothness => per_episode(spec, episodes)
-            .map_or_else(
+        MetricSpec::SuccessRate | MetricSpec::EpisodeLength | MetricSpec::ActionSmoothness => {
+            cell.sample(*spec).map_or_else(
                 || unavailable("no episode finished in this cell"),
-                |v| MetricValue::Scalar(mean(&v)),
-            ),
+                |v| MetricValue::Scalar(mean(v)),
+            )
+        }
         // §9.3 / §10.3: the fraction of steps the plane clamped, projected or fell back on,
         // over the whole cell. `SafetyCounters::envelope_violation_rate` is the *sliding*
         // fraction the §9.4 rate watchdog reads, which is a different question.
         MetricSpec::EnvelopeViolationRate => {
-            if counters.steps == 0 {
+            if cell.steps == 0 {
                 return unavailable("the Safety Plane validated no step");
             }
-            MetricValue::Scalar(counters.dirty_steps as f64 / counters.steps as f64)
+            MetricValue::Scalar(cell.dirty_steps as f64 / cell.steps as f64)
         }
         MetricSpec::ChunkUnderrunRate => {
-            if counters.steps == 0 {
+            if cell.steps == 0 {
                 unavailable("the Safety Plane validated no step")
             } else {
-                MetricValue::Scalar(counters.chunk_underrun_rate())
+                MetricValue::Scalar(cell.chunk_underruns as f64 / cell.steps as f64)
             }
         }
-        MetricSpec::FailureModeHistogram => {
-            MetricValue::Histogram(failure_histogram(episodes, counters))
-        }
+        MetricSpec::FailureModeHistogram => MetricValue::Histogram(cell.histogram.clone()),
         MetricSpec::InterventionRate => {
             unavailable("human intervention is a hardware/HIL signal (§24.2)")
         }
