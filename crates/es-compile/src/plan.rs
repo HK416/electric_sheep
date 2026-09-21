@@ -188,9 +188,19 @@ pub struct AugmentStep {
     pub kind: AugmentKind,
 }
 
-/// The contiguous chain of `training_only` `Augment` nodes ending at each declared output
-/// (spec 7.3, packet M7/T6) — the boundary between what `es dataset bake` writes and what the
-/// trainer applies.
+/// The contiguous chain of per-sample nodes ending at each declared output (spec 7.3, packet
+/// M7/T6) — the boundary between what `es dataset bake` writes and what the trainer applies.
+///
+/// Two node kinds are on it, and the second is a deviation the design note records:
+///
+/// * `Augment { training_only: true }` — spec 7.3's family;
+/// * `Crop { mode: CropMode::Random { .. } }` — the IR's *other* spelling of a per-sample
+///   offset ("the nominal geometry the type system carries is the centred one"). It is here
+///   because it is the only one the IR propagates geometry for: an `Augment` port keeps its
+///   incoming `ImageSpec`, so a `Pad(4) -> Augment{RandomCrop 96x96}` document is refused by
+///   `XIR`'s `TYPE-020` before a bundle can be built, and `es-ir` is not this packet's to
+///   change. Its Release lowering is unmoved — the centred rectangle, with `ImageSpec::cropped`
+///   applied by `es-ir` itself (INV-14).
 ///
 /// Only ports with a non-empty chain are returned. Refused by name, `COMPILE-007`:
 ///
@@ -208,20 +218,14 @@ pub fn augmentation_chains(
     for (name, out) in &ir.outputs {
         let mut chain = Vec::new();
         let mut at = out.port.node;
-        while let Some(ObservationNode::Augment {
-            kind,
-            training_only: true,
-            ..
-        }) = ir.graph.nodes.get(&at)
-        {
+        while let Some(kind) = ir.graph.nodes.get(&at).and_then(per_sample_kind) {
             if ir.graph.edges.iter().filter(|e| e.from.node == at).count() > 1 {
                 diags.push(
                     Diagnostic::new(
                         COMPILE_007,
                         format!(
-                            "the training_only {} feeding \"{name}\" is read by more than one \
-                             node",
-                            kind_name(*kind)
+                            "the per-sample {} feeding \"{name}\" is read by more than one node",
+                            kind_name(kind)
                         ),
                     )
                     .at(at)
@@ -232,10 +236,7 @@ pub fn augmentation_chains(
                 );
                 break;
             }
-            chain.push(AugmentStep {
-                node: at,
-                kind: *kind,
-            });
+            chain.push(AugmentStep { node: at, kind });
             claimed.insert(at);
             match ir.graph.edges.iter().find(|e| e.to.node == at) {
                 Some(edge) => at = edge.from.node,
@@ -274,6 +275,25 @@ pub fn augmentation_chains(
         Ok(chains)
     } else {
         Err(diags)
+    }
+}
+
+/// The per-sample kind a node is on the chain as, or `None` if it is not on one.
+fn per_sample_kind(node: &ObservationNode) -> Option<AugmentKind> {
+    match node {
+        ObservationNode::Augment {
+            kind,
+            training_only: true,
+            ..
+        } => Some(*kind),
+        ObservationNode::Crop {
+            mode: CropMode::Random { width, height },
+            ..
+        } => Some(AugmentKind::RandomCrop {
+            width: *width,
+            height: *height,
+        }),
+        _ => None,
     }
 }
 

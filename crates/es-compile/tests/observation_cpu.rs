@@ -831,4 +831,68 @@ fn the_augmentation_chain_is_found_or_refused_by_name() {
         diags.iter().any(|d| d.code.as_str() == "COMPILE-007"),
         "{diags:?}"
     );
+
+    // ...and the IR's *other* spelling of a per-sample offset is on the chain too: the demo's
+    // document uses it, because it is the one `es-ir` propagates geometry for (the deviation
+    // in design note `training-recipe.md` section 13). Its Release lowering is the centred
+    // rectangle it has always been.
+    let mut cropped = chain();
+    let out_ty = cropped.outputs["rgb_front"].ty.clone();
+    let spec = out_ty.image.expect("an image port");
+    let mut small_ty = out_ty.clone();
+    let rect = Rect {
+        x: (spec.width - 2) / 2,
+        y: (spec.height - 2) / 2,
+        width: 2,
+        height: 2,
+    };
+    small_ty.shape = Shape::new([3, 2, 2]);
+    small_ty.image = Some(spec.cropped(rect, true));
+    cropped.graph.insert(
+        NodeId(4),
+        ObservationNode::Crop {
+            mode: CropMode::Random {
+                width: 2,
+                height: 2,
+            },
+            rescale_intrinsics: true,
+            io: Io::unary(out_ty, small_ty.clone()),
+        },
+    );
+    cropped
+        .graph
+        .connect(NodeId(3), OUT, NodeId(4), &in_port(0));
+    cropped.graph.outputs.clear();
+    cropped.graph.outputs.push(PortRef::new(NodeId(4), OUT));
+    cropped.outputs.insert(
+        "rgb_front".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(NodeId(4), OUT),
+            ty: small_ty,
+        },
+    );
+    assert!(cropped.validate().is_empty(), "{:?}", cropped.validate());
+    let chains = es_compile::plan::augmentation_chains(&cropped).expect("one chain");
+    assert_eq!(
+        chains["rgb_front"],
+        vec![es_compile::plan::AugmentStep {
+            node: NodeId(4),
+            kind: es_ir::observation::AugmentKind::RandomCrop {
+                width: 2,
+                height: 2
+            },
+        }]
+    );
+    let plan = CpuPlan::compile(&cropped, PlanMode::Release).expect("compiles");
+    assert!(
+        plan.steps.iter().any(|s| s.op
+            == Op::Crop {
+                sw: 4,
+                sh: 3,
+                c: 3,
+                rect,
+            }),
+        "the Release plan is not the centred rectangle: {:?}",
+        plan.steps
+    );
 }

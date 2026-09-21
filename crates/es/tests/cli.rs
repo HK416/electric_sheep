@@ -8680,8 +8680,15 @@ const AUGMENTED_HEADER: &str = "\
 # from observation.toml, which is unchanged: this file is that document plus three nodes on
 # the image path, so `task_ref` and every state branch are copies.
 #
-#   node 1 Normalize -> node 7 Pad{4,4,4,4} -> node 8 Augment{RandomCrop 96x96, training_only}
+#   node 1 Normalize -> node 7 Pad{4,4,4,4} -> node 8 Crop{Random 96x96}
 #                    -> node 9 Augment{ColorJitter brightness 0.2 contrast 0.2, training_only}
+#
+# The crop is `Crop { CropMode::Random }` and not `Augment { RandomCrop }` because only the
+# first propagates geometry: an `Augment` port keeps its incoming ImageSpec, so the declared
+# output would disagree with propagation and XIR's TYPE-020 refuses the bundle. Both spell
+# the same thing -- a per-sample offset whose nominal rectangle is the centred one, which is
+# how es-ir documents CropMode::Random -- and the trainer treats them as one kind. See the
+# design note docs/design/training-recipe.md section 13.
 #
 # `Pad` grows the 96x96 canvas to 104x104 and moves the principal point with the old origin
 # (cx 48 -> 52); the `RandomCrop` takes it back to 96x96. **In training** the crop offset is
@@ -8709,7 +8716,7 @@ const AUGMENTED_HEADER: &str = "\
 fn generate_augmented_observation_fixture() {
     use es_ir::graph::{NodeId, PortRef};
     use es_ir::image::{ImageSpec, Intrinsics};
-    use es_ir::observation::{AugmentKind, Io, ObservationNode, ObservationOutput, OUT};
+    use es_ir::observation::{AugmentKind, CropMode, Io, ObservationNode, ObservationOutput, OUT};
     use es_ir::types::Shape;
 
     let committed = std::fs::read_to_string(vl_fixture("observation.toml")).expect("read");
@@ -8753,14 +8760,18 @@ fn generate_augmented_observation_fixture() {
             io: Io::unary(normalized.clone(), padded.clone()),
         },
     );
+    // `Crop { CropMode::Random }`, not `Augment { RandomCrop }`: the IR propagates geometry
+    // for the first and not for the second, and a document whose declared output disagrees
+    // with propagation is refused by `XIR`'s `TYPE-020` before a bundle can be built. Both
+    // mean "per-sample offset, centred nominally"; see the design note's section 13.
     obs.graph.insert(
         crop,
-        ObservationNode::Augment {
-            kind: AugmentKind::RandomCrop {
+        ObservationNode::Crop {
+            mode: CropMode::Random {
                 width: spec.width,
                 height: spec.height,
             },
-            training_only: true,
+            rescale_intrinsics: true,
             io: Io::unary(padded, normalized.clone()),
         },
     );
