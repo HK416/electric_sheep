@@ -5,11 +5,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Project status
 
 `docs/ARCHITECTURE.ko.md` (the v1.0 technical spec, ~3000 lines, in Korean) is the canonical
-source of truth; `docs/ARCHITECTURE.md` is its English translation. M0–M5 are implemented and reviewed (`docs/reviews/M0.md` .. `M5.md`; review
+source of truth; `docs/ARCHITECTURE.md` is its English translation. M0–M5 and M7 are implemented and reviewed (`docs/reviews/M0.md` .. `M5.md`, `M7.md`; review
 follow-ups are `docs/packets/<M>/P-<M>-R<n>.md` or the review's R-list). M5 (plan V, `docs/design/visible-learning.md`) proved the thesis: an
-externally trained LeRobot ACT runs bitwise through the runtime and passes the demo's Evaluation IR. The current campaign is **M7 plan U**
-(spec §28.10: `es train`, editor run browser/replay/inspector/telemetry, batched lowering + pretrained backbone, RS/PT render quality),
-packets in `docs/packets/M7/`; M6 (quadruped, `docs/design/quadruped-track.md`) is parked pending the owner's decision. GPU paths (es-gpu, es-render, Observation
+externally trained LeRobot ACT runs bitwise through the runtime and passes the demo's Evaluation IR. **M7 plan U** (spec §28.10, packets in
+`docs/packets/M7/`) closed 2026-09-21: `es train` / `es loop cycle`, the editor's run browser/replay/inspector/live telemetry/launch panel/plain-language UI,
+batched lowering + lr schedule + pretrained backbone + augmentation, and the RS/PT render quality ladder; on the committed documents the IR-graph policy
+U3 passes the demo's acceptance under the declared latency (held-out 0.5625). The next campaign waits on the human decisions in `docs/reviews/M7.md`
+(the stop rule's reading, episode-boundary semantics, the SSIM threshold). M6 (quadruped, `docs/design/quadruped-track.md`) is parked pending the owner's decision. GPU paths (es-gpu, es-render, Observation
 IR GPU lowering, MJWarp/Newton adapters) were verified on an RTX 4060 with the Vulkan SDK;
 the Python oracles (MuJoCo, PyTorch, LeRobot ACT checkpoint, diffusers) run from the project
 venv `.venv` (set `ES_PYTHON` to its interpreter). Still open: M3 W1 real-robot
