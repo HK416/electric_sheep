@@ -1,0 +1,249 @@
+# Observation IR (spec 7) for the increment-driven SO-101 reach task -- packet M9/T3.
+#
+# `observation-reach.toml`, node for node, with `task_ref` following `task-reach-delta.toml`'s
+# moved `task_hash`. An action space says nothing about what a sensor produces, so the four
+# `StateInput`s, the `Concat`, the `Normalize { Range { -1, 1 } }` and the one-frame temporal
+# window are that document's and its header is where they are argued.
+#
+# The `observation_hash` moves with `task_ref` and with nothing else, which is what makes the
+# T3 table's two rows comparable: the *policy input* is the same 26 numbers in the same order,
+# so the only difference between the absolute and the delta run is what the policy's output
+# means.
+
+es_schema = 1
+kind = "observation"
+
+[body]
+schema_version = 1
+task_ref = [
+    251,
+    80,
+    32,
+    252,
+    145,
+    12,
+    21,
+    136,
+    98,
+    135,
+    77,
+    206,
+    224,
+    25,
+    81,
+    23,
+    128,
+    177,
+    215,
+    129,
+    4,
+    84,
+    224,
+    134,
+    107,
+    101,
+    245,
+    198,
+    110,
+    99,
+    242,
+    119,
+]
+
+[body.graph]
+inputs = []
+schema_version = 1
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 0
+port = "out"
+
+[body.graph.edges.to]
+node = 4
+port = "in0"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 1
+port = "out"
+
+[body.graph.edges.to]
+node = 4
+port = "in1"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 2
+port = "out"
+
+[body.graph.edges.to]
+node = 4
+port = "in2"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 3
+port = "out"
+
+[body.graph.edges.to]
+node = 4
+port = "in3"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 4
+port = "out"
+
+[body.graph.edges.to]
+node = 5
+port = "in0"
+
+[body.graph.nodes.0.StateInput]
+source = "501f1cde65535d4d1900d14204382d3c"
+
+[body.graph.nodes.0.StateInput.io]
+inputs = []
+
+[body.graph.nodes.0.StateInput.io.output]
+elem = "F32"
+shape = [6]
+time = "Tick"
+unit = "Angle"
+
+[body.graph.nodes.0.StateInput.io.output.frame]
+Joint = "501f1cde65535d4d1900d14204382d3c"
+
+[body.graph.nodes.1.StateInput]
+source = "ac853792cadf00c5a52658a8279ba48f"
+
+[body.graph.nodes.1.StateInput.io]
+inputs = []
+
+[body.graph.nodes.1.StateInput.io.output]
+elem = "F32"
+shape = [6]
+time = "Tick"
+unit = "AngularVelocity"
+
+[body.graph.nodes.1.StateInput.io.output.frame]
+Joint = "501f1cde65535d4d1900d14204382d3c"
+
+[body.graph.nodes.2.StateInput]
+source = "3c949ea0617b793a8ff5fbb816c4b662"
+
+[body.graph.nodes.2.StateInput.io]
+inputs = []
+
+[body.graph.nodes.2.StateInput.io.output]
+elem = "F32"
+frame = "World"
+shape = [7]
+time = "Tick"
+unit = "Length"
+
+[body.graph.nodes.3.StateInput]
+source = "5dea9addd93bed6e5a3df0ab3e89afcd"
+
+[body.graph.nodes.3.StateInput.io]
+inputs = []
+
+[body.graph.nodes.3.StateInput.io.output]
+elem = "F32"
+frame = "World"
+shape = [7]
+time = "Tick"
+unit = "Length"
+
+[body.graph.nodes.4.Concat]
+axis = 0
+
+[[body.graph.nodes.4.Concat.io.inputs]]
+elem = "F32"
+shape = [6]
+time = "Tick"
+unit = "Angle"
+
+[body.graph.nodes.4.Concat.io.inputs.frame]
+Joint = "501f1cde65535d4d1900d14204382d3c"
+
+[[body.graph.nodes.4.Concat.io.inputs]]
+elem = "F32"
+shape = [6]
+time = "Tick"
+unit = "AngularVelocity"
+
+[body.graph.nodes.4.Concat.io.inputs.frame]
+Joint = "501f1cde65535d4d1900d14204382d3c"
+
+[[body.graph.nodes.4.Concat.io.inputs]]
+elem = "F32"
+frame = "World"
+shape = [7]
+time = "Tick"
+unit = "Length"
+
+[[body.graph.nodes.4.Concat.io.inputs]]
+elem = "F32"
+frame = "World"
+shape = [7]
+time = "Tick"
+unit = "Length"
+
+[body.graph.nodes.4.Concat.io.output]
+elem = "F32"
+frame = "World"
+shape = [26]
+time = "Tick"
+unit = "Dimensionless"
+
+[[body.graph.nodes.5.Normalize.io.inputs]]
+elem = "F32"
+frame = "World"
+shape = [26]
+time = "Tick"
+unit = "Dimensionless"
+
+[body.graph.nodes.5.Normalize.io.output]
+elem = "F32"
+frame = "World"
+shape = [26]
+time = "Tick"
+
+[body.graph.nodes.5.Normalize.io.output.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.graph.nodes.5.Normalize.stats.Range]
+hi = 1.0
+lo = -1.0
+
+[[body.graph.outputs]]
+node = 5
+port = "out"
+
+[body.outputs.state.port]
+node = 5
+port = "out"
+
+[body.outputs.state.ty]
+elem = "F32"
+frame = "World"
+shape = [26]
+time = "Tick"
+
+[body.outputs.state.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.temporal.history]
+
+[body.temporal.window]
+align = "Hold"
+n_steps = 1
+stride = 1

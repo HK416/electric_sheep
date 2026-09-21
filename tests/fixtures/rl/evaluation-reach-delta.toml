@@ -1,0 +1,91 @@
+# Evaluation IR (spec 10) for the increment-driven SO-101 reach task -- packet M9/T3.
+#
+# `evaluation-reach.toml` with `task` and `observation` following the moved hashes, and
+# **nothing else**: the same 16 held-out seeds 201-216, the same four suites, the same
+# `success_rate >= 0.8` on `nominal`. A row scored by this document and a row scored by
+# `evaluation-reach.toml` are therefore asked the same question -- which is the precondition
+# for putting them in one table (spec 28.9 rule 3).
+#
+# `XIR-040` is why this file exists rather than a `--task` flag: an Evaluation IR judges the
+# documents it names, and a delta bundle names the delta task.
+
+es_schema = 1
+kind = "evaluation"
+
+[body]
+augmentation = "disabled"
+metrics = [
+    "success_rate",
+    "episode_length",
+    "envelope_violation_rate",
+    "failure_mode_histogram",
+]
+observation = "8dea346b7eae7d771514461d23bed56c0655aaf9c9633311da0694548b0e8328"
+replay = "failures_first"
+schema_version = 1
+task = "fb5020fc910c158862874dcee019511780b1d7810454e0866b65f5c66e63f277"
+
+[[body.acceptance]]
+aggregation = "mean"
+comparator = "ge"
+metric = "success_rate"
+suite = "nominal"
+threshold = 0.8
+
+[body.episodes]
+n_episodes = 16
+
+[body.episodes.seeds]
+explicit = [
+    201,
+    202,
+    203,
+    204,
+    205,
+    206,
+    207,
+    208,
+    209,
+    210,
+    211,
+    212,
+    213,
+    214,
+    215,
+    216,
+]
+
+[[body.suites]]
+name = "nominal"
+perturbations = []
+
+[[body.suites]]
+name = "observation_delay"
+
+[[body.suites.perturbations]]
+stream = 2
+
+[body.suites.perturbations.kind.observation_delay]
+ms = [
+    20,
+    40,
+]
+
+[[body.suites]]
+name = "torque_noise"
+
+[[body.suites.perturbations]]
+stream = 3
+
+[body.suites.perturbations.kind.torque_noise]
+rel_sigma = 0.05
+
+[[body.suites]]
+name = "backlash"
+
+[[body.suites.perturbations]]
+stream = 4
+
+[body.suites.perturbations.kind.backlash.rad]
+hi = 0.01
+lo = 0.0

@@ -1,0 +1,65 @@
+# The increment-space reach task continued from the **imported delta policy** (packet M9/T3):
+# `training-reach-delta.toml`'s recipe started at the weights `es policy import-rl` wrote for
+# packet M9/T2's brax run instead of at torch's own initialization.
+#
+# Two things differ from `training-reach-delta.toml`, and nothing else does -- the budget, the
+# `[rl]` table and the optimizer are identical on purpose, because the row this recipe
+# measures is only meaningful against a control that shares them:
+#
+#  * `[policy] bundle` is the *imported* bundle, so the graph trained is the source's --
+#    26 -> [256, 256] -> 6, swish, `tanh` squash, `Normalizer { Inverse }` with mean 0 and
+#    std 0.05 -- and not `learning-reach-delta.toml`'s 64 x 64 relu.
+#  * `[init] policy` is that same bundle, so the run starts at its weights (packet M8/S1).
+#    Without it the trainer random-initializes the graph, which is the "from scratch, same
+#    architecture" control; `training-reach-delta.toml` is the from-scratch row of the T3
+#    table and carries the committed graph instead.
+#
+# `runs/reach-delta-001/imported.esb` is the import re-run against the **committed** delta
+# documents, from T2's checkpoint (`docs/api-notes/brax-ppo-so101.md` section 7):
+#
+#     python/es/import_rl.py --from mujoco-playground --checkpoint <t2-run>/ --out <neutral>
+#     es policy import-rl --manifest <neutral>/import.json \
+#         --weights <neutral>/weights.safetensors \
+#         --adapter tests/fixtures/rl/adapter-so101-delta.toml \
+#         --task tests/fixtures/rl/task-reach-delta.toml \
+#         --deployment tests/fixtures/rl/deployment-reach-delta.toml --out <bundle>
+#     cp <bundle>/policy.esb runs/reach-delta-001/imported.esb
+#
+# THE ONE DEVIATION IS S4c'S AND IS MEASURED RATHER THAN ASSUMED
+# (`docs/design/rl-continuation.md` section 7): brax's observation normalizer is folded into
+# the first Dense of the neutral export before the import, so the bundle carries the committed
+# `observation-reach-delta.toml` rather than a `Normalize { MeanStd }` of its own. The folded
+# network is the same function of the raw observation; without the fold `es eval run` refuses
+# the bundle by name (`XIR-040`: an Evaluation IR judges the documents it names), and no row
+# of the table could be compared to any other.
+#
+# Seeds 1 and 2 of the measurement are this file with `[run] seed` changed and nothing else.
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-delta-001/imported.esb"
+
+[init]
+policy = "runs/reach-delta-001/imported.esb"
+
+[rl]
+algo         = "ppo"
+envs         = 16
+horizon      = 64
+epochs       = 4
+minibatches  = 4
+gamma        = 0.99
+lam          = 0.95
+clip         = 0.2
+entropy      = 0.005
+value_coef   = 0.5
+init_log_std = -3.912023
+
+[run]
+steps         = 10000
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [4000, 10000]
+device        = "cpu"
+interpreter   = "python"
