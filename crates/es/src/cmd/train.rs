@@ -106,7 +106,16 @@ pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
         || PathBuf::from(recipe_path.file_stem().unwrap_or_default()),
         PathBuf::from,
     );
-    run(&recipe_path, &out, dry_run, retired.as_deref())
+    let recipe = Recipe::parse(&read(&recipe_path)?).map_err(|e| bad(e.to_string()))?;
+    if recipe.kind != es_data::training::KIND {
+        return Err(bad(format!(
+            "{}: kind = {:?}; `es train` reads a {:?} document",
+            recipe_path.display(),
+            recipe.kind,
+            es_data::training::KIND
+        )));
+    }
+    run(&recipe, &out, dry_run, retired.as_deref())
 }
 
 fn bad(msg: impl Into<String>) -> CliError {
@@ -140,41 +149,47 @@ fn lerobot_trainer(interpreter: &str) -> Vec<String> {
     ]
 }
 
-fn run(
-    recipe_path: &Path,
-    out: &Path,
-    dry_run: bool,
-    retired: Option<&str>,
-) -> Result<u8, CliError> {
-    let recipe = Recipe::parse(&read(recipe_path)?).map_err(|e| bad(e.to_string()))?;
-    if recipe.kind != es_data::training::KIND {
-        return Err(bad(format!(
-            "{}: kind = {:?}; `es train` reads a {:?} document",
-            recipe_path.display(),
-            recipe.kind,
-            es_data::training::KIND
-        )));
-    }
+/// The plan `es train --recipe` would run this recipe with, built without touching the
+/// dataset, the bundle or Python — what `--dry-run` prints and what `es loop cycle` nests
+/// under its own `train` line.
+///
+/// The external route carries no bundle, so its Observation IR is a file and can be read
+/// before anything else; the IR route's lives inside the bundle and is only opened for a real
+/// run, which is what lets `--dry-run` be judged with neither dataset nor bundle on disk
+/// (packet M7/T1 oracle 1).
+pub(crate) fn plan_of(recipe: &Recipe, out: &Path) -> Result<Plan, CliError> {
     let route = recipe.route().map_err(|e| bad(e.to_string()))?;
-    let interpreter = interpreter_of(&recipe);
+    let interpreter = interpreter_of(recipe);
     let trainer = lerobot_trainer(&interpreter);
-
-    // The external route carries no bundle, so its Observation IR is a file and can be read
-    // before anything else; the IR route's lives inside the bundle and is only opened for a
-    // real run, which is what lets `--dry-run` be judged with neither dataset nor bundle on
-    // disk (packet M7/T1 oracle 1).
     let external_obs = match route {
-        Route::External => Some(open_observation(&recipe)?),
+        Route::External => Some(open_observation(recipe)?),
         Route::Ir => None,
     };
-    let plan = Plan::build(
-        &recipe,
+    Plan::build(
+        recipe,
         out,
         &interpreter,
         &trainer,
         external_obs.as_ref().map(state_dim),
     )
-    .map_err(|e| bad(e.to_string()))?;
+    .map_err(|e| bad(e.to_string()))
+}
+
+/// One training run, from a recipe that is already parsed.
+///
+/// The parsed recipe rather than its path, because `es loop cycle` overrides the `[dataset]`
+/// slot with its own collect output before handing it over (packet M7/T2): the words the two
+/// commands run are the same words, and there is no second parser.
+pub(crate) fn run(
+    recipe: &Recipe,
+    out: &Path,
+    dry_run: bool,
+    retired: Option<&str>,
+) -> Result<u8, CliError> {
+    let recipe = recipe.clone();
+    let route = recipe.route().map_err(|e| bad(e.to_string()))?;
+    let interpreter = interpreter_of(&recipe);
+    let plan = plan_of(&recipe, out)?;
 
     if dry_run {
         let text = plan.render(out);
@@ -194,6 +209,10 @@ fn run(
             Some(PolicyBundle::open(&bytes).map_err(|e| bad(format!("{path}: {e}")))?)
         }
         Route::External => None,
+    };
+    let external_obs = match route {
+        Route::External => Some(open_observation(&recipe)?),
+        Route::Ir => None,
     };
     let observation = match (&bundle, &external_obs) {
         (Some(b), _) => &b.observation,

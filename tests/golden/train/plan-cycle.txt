@@ -1,0 +1,13 @@
+# cycle: collect -> expert-gate -> train -> eval -> showcase
+es loop collect --policy runs/collect-001/untrained.esb --scene tests/fixtures/mjcf/so101_pick_place.xml --episodes 200 --seed 1 --out collect/ds --frames collect/frames --expert so101-pick-place
+es eval run --config tests/fixtures/visible-learning/evaluation.toml --policy runs/collect-001/untrained.esb --scene tests/fixtures/mjcf/so101_pick_place.xml --out eval-expert --jobs 6 --frames eval-expert/frames --expert so101-pick-place
+es train --recipe tests/fixtures/visible-learning/training.toml --out train
+  # route: ir
+  es dataset bake --policy runs/collect-001/untrained.esb --out train/baked --frames collect/frames collect/ds
+  es policy lower --policy runs/collect-001/untrained.esb --out train/module
+  python python/es/train_act.py --module train/module --baked train/baked --out train/weights/model.safetensors --checkpoint-at 1000,5000,20000 --seed 0 --batch 8 --lr 0.0001 --device cuda --loss-curve train/metrics/loss.json
+  es policy pack --policy runs/collect-001/untrained.esb --weights train/weights/model-1000.safetensors --out train/checkpoints/1000.esb
+  es policy pack --policy runs/collect-001/untrained.esb --weights train/weights/model-5000.safetensors --out train/checkpoints/5000.esb
+  es policy pack --policy runs/collect-001/untrained.esb --weights train/weights/model-20000.safetensors --out train/checkpoints/20000.esb
+es eval run --config tests/fixtures/visible-learning/evaluation.toml --policy train/checkpoints/20000.esb --scene tests/fixtures/mjcf/so101_pick_place.xml --out eval --jobs 6 --frames eval/frames
+es video showcase --run eval --scene tests/fixtures/mjcf/so101_pick_place.xml --out showcase --cell nominal-00 --eye 0.66,-0.46,0.52 --look-at 0.14,-0.04,0.04 --fov 36 --width 1280 --height 720

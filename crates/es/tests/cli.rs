@@ -7599,6 +7599,208 @@ fn train_identity_is_a_function_of_the_recipe() {
     }
 }
 
+// --- packet M7/T2: `es loop cycle` ------------------------------------------------------
+
+const CYCLE_RECIPE: &str = "tests/fixtures/visible-learning/cycle.toml";
+
+/// `es loop cycle`, from the repository root, with `ES_PYTHON` removed for the same reason
+/// `run_train` removes it: the interpreter is the one machine-dependent word in the plan.
+fn run_cycle(recipe: &str, out: &Path, extra: &[&str]) -> Output {
+    bin()
+        .current_dir(train_root())
+        .env_remove("ES_PYTHON")
+        .args(["loop", "cycle", "--recipe", recipe, "--out"])
+        .arg(out)
+        .args(extra)
+        .output()
+        .expect("run es loop cycle")
+}
+
+/// Regenerates `tests/golden/train/plan-cycle.txt`. Run once, explicitly; it is then
+/// read-only (spec 1.4), exactly like `generate_train_goldens` beside it.
+#[test]
+#[ignore = "golden generator; run explicitly"]
+fn generate_cycle_golden() {
+    let dir = scratch_dir("cycle-golden");
+    let out = run_cycle(CYCLE_RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    write(&train_golden("plan-cycle.txt"), &stdout(&out));
+}
+
+/// Oracle 1. The stage plan is a property of the document: the same bytes on any machine, in
+/// any output directory, on either path separator -- and T1's plan nested under `train`, with
+/// the cycle's own collect output where the recipe's `[dataset]` used to be.
+#[test]
+fn cycle_dry_run_plan_is_the_golden() {
+    let dir = scratch_dir("cycle-dry");
+    let out = run_cycle(CYCLE_RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let golden = train_golden("plan-cycle.txt");
+    let want =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(stdout(&out), want, "the stage plan is not the golden");
+    // A run that did not happen writes nothing, not even a directory (the same rule
+    // `es train --dry-run` follows for `training.lock`).
+    assert!(!dir.join("loop.jsonl").exists());
+    assert!(!dir.join("train").exists());
+}
+
+/// Oracle 3. Spec 13.3's "if `evaluation_hash` changes, the comparison is invalid" as a
+/// refusal by name: both hashes are printed, and `--allow-new-evaluation` is the deliberate
+/// act that proceeds.
+#[test]
+fn cycle_refuses_a_moved_evaluation_hash() {
+    let dir = scratch_dir("cycle-eval-hash");
+    // A ledger from an earlier iteration, judged under other conditions.
+    let stale = "a".repeat(64);
+    write(
+        &dir.join("loop.jsonl"),
+        &format!(
+            "{{\"kind\":\"evaluate\",\"inputs\":{{\"evaluation_hash\":\"{stale}\"}},\
+             \"outputs\":{{\"passed\":\"true\"}},\"created\":0}}\n"
+        ),
+    );
+    let out = run_cycle(CYCLE_RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let said = stderr_of(&out);
+    let now = hex(&es_ir::serial::evaluation_from_toml(
+        &std::fs::read_to_string(vl_fixture("evaluation.toml")).expect("evaluation.toml"),
+    )
+    .expect("the demo Evaluation IR parses")
+    .evaluation_hash()
+    .expect("evaluation_hash"));
+    assert!(said.contains(&stale), "the old hash is not named: {said}");
+    assert!(said.contains(&now), "the new hash is not named: {said}");
+
+    // Named deliberately, the same document proceeds.
+    let out = run_cycle(CYCLE_RECIPE, &dir, &["--dry-run", "--allow-new-evaluation"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+}
+
+/// Oracle 4. One real cycle on the demo fixtures: a 2-episode expert collect, the harness on
+/// the expert *before* the 40-step IR-route training, then the trained checkpoint through the
+/// same harness -- with `loop.jsonl` holding `collect`, `evaluate` (the gate), `train`,
+/// `evaluate`, in that order, chained.
+///
+/// `#[ignore]`d because it needs `ES_PYTHON` (torch, mujoco) and a Vulkan device; without
+/// either it prints why and stops rather than pretending (spec 1.4).
+#[test]
+#[ignore = "needs ES_PYTHON with torch and mujoco, and a render build"]
+fn cycle_runs_the_expert_through_the_harness_first() {
+    let name = "cycle_runs_the_expert_through_the_harness_first";
+    let Ok(python) = std::env::var("ES_PYTHON") else {
+        println!("SKIP {name}: ES_PYTHON is not set");
+        return;
+    };
+    if !cfg!(feature = "render") {
+        println!("SKIP {name}: built without the `render` feature, so --frames writes nothing");
+        return;
+    }
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP {name}: {reason}");
+        return;
+    }
+    let dir = scratch_dir("cycle-expert-first");
+    let bundle = write_demo_bundle(&dir);
+    let p = |path: &Path| train_toml_path(path);
+
+    // The demo's own Evaluation IR, cut to one suite and two of the pinned seeds the expert
+    // solves -- the same document the gate and the policy are both judged against.
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let task = es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml");
+    let obs =
+        es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml");
+    let mut ir = demo_evaluation_ir(
+        hex(&task.task_hash().expect("task hash")),
+        hex(&obs.observation_hash().expect("observation hash")),
+    );
+    ir.episodes = es_ir::evaluation::EpisodeBatch {
+        n_episodes: 2,
+        seeds: es_ir::evaluation::SeedPlan::Explicit(vec![SEEDS[0], SEEDS[1]]),
+    };
+    ir.suites.truncate(1);
+    let eval_config = dir.join("evaluation.toml");
+    write(
+        &eval_config,
+        &es_ir::serial::evaluation_to_toml(&ir).expect("the Evaluation IR serialises"),
+    );
+
+    let recipe = dir.join("training.toml");
+    write(
+        &recipe,
+        &format!(
+            "kind = \"training\"\n\
+             [dataset]\nroot = \"unused\"\n\
+             [policy]\nbundle = \"{}\"\n\
+             [run]\nsteps = 40\nbatch = 2\nlr = 1e-4\nseed = 0\ncheckpoint_at = [40]\n\
+             device = \"cpu\"\ninterpreter = \"{}\"\n",
+            p(&bundle),
+            p(Path::new(&python)),
+        ),
+    );
+    let document = dir.join("cycle.toml");
+    write(
+        &document,
+        &format!(
+            "kind = \"cycle\"\nscene = \"{}\"\n\
+             [collect]\npolicy = \"{}\"\nexpert = \"so101-pick-place\"\nepisodes = 2\n\
+             seed = 1\nframes = true\n\
+             [train]\nrecipe = \"{}\"\n\
+             [eval]\nconfig = \"{}\"\njobs = 1\nframes = true\n",
+            p(&demo_scene_path()),
+            p(&bundle),
+            p(&recipe),
+            p(&eval_config),
+        ),
+    );
+
+    let out = dir.join("run");
+    let run = bin()
+        .current_dir(train_root())
+        .args(["loop", "cycle", "--recipe", &p(&document), "--out"])
+        .arg(&out)
+        .output()
+        .expect("run es loop cycle");
+    let (said, err) = (stdout(&run), stderr_of(&run));
+    // 0 or 1: the acceptance of a 40-step policy is a measurement, not this oracle's subject.
+    // Anything else means a stage failed, and the gate's refusal is exit 1 with its own line.
+    assert!(
+        matches!(run.status.code(), Some(0 | 1)),
+        "stdout:\n{said}\nstderr:\n{err}"
+    );
+    assert!(
+        !err.contains("did not pass the evaluation harness"),
+        "the expert failed the harness, so nothing was trained (spec 28.9 rule 1):\n{err}"
+    );
+
+    let ledger = es_data::read_loop_steps(&out).expect("the cycle's ledger reads back");
+    let kinds: Vec<es_data::LoopKind> = ledger.iter().map(|s| s.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            es_data::LoopKind::Collect,
+            es_data::LoopKind::Evaluate,
+            es_data::LoopKind::Train,
+            es_data::LoopKind::Evaluate
+        ],
+        "stdout:\n{said}"
+    );
+    es_data::check_chain(&ledger).expect("the ledger chains");
+    // The gate is the evaluate step that names an expert, and it came before the train step.
+    assert_eq!(ledger[1].inputs["expert"], "so101-pick-place");
+    assert_eq!(ledger[1].outputs["passed"], "true");
+    assert_eq!(ledger[2].inputs["expert_gate"], "passed");
+    assert_eq!(ledger[0].outputs["content"], ledger[2].inputs["content"]);
+    let judged = &ledger[3].inputs["policy_hash"];
+    assert_eq!(ledger[2].outputs["checkpoint.40"], *judged);
+    assert!(out.join("eval").join("report.json").exists());
+    assert!(out.join("eval-expert").join("report.json").exists());
+    println!(
+        "RAN {name}: expert gate success_rate {}, policy success_rate {} at policy_hash {judged}",
+        ledger[1].outputs["success_rate"], ledger[3].outputs["success_rate"]
+    );
+}
+
 /// Oracle 4. Every refusal names the field that caused it (spec 17.2).
 #[test]
 fn train_refuses_by_name() {
