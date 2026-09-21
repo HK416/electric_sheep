@@ -13,6 +13,16 @@ name = "es_native"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# Layer 11 may depend on anything below it (spec 4.2). The rollout binding (packet M8/S4a)
+# is what needs the runtime half: `es-env` (9) owns the env, `es-eval` (10) the observation
+# capture it shares with `es eval run`, `es-safety` (8) the plane, `es-physics-backend` (4)
+# the MuJoCo reference backend.
+es-core = { workspace = true }
+es-physics-core = { workspace = true }
+es-physics-backend = { workspace = true }
+es-safety = { workspace = true }
+es-env = { workspace = true }
+es-eval = { workspace = true }
 es-ir = { workspace = true }
 es-ir-types = { workspace = true }
 es-compile = { workspace = true }
@@ -20,6 +30,7 @@ es-assets = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+thiserror = { workspace = true }
 pyo3 = { workspace = true, optional = true }
 
 # Off by default so `cargo build`/`cargo test --workspace` never require a Python dev
