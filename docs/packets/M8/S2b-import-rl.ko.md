@@ -62,6 +62,7 @@
 python/es/import_rl.py
 crates/es-data/src/rl_import.rs
 crates/es-data/src/lib.rs
+crates/es-ir-types/src/codes.rs
 crates/es-data/tests/**
 crates/es/src/cmd/policy.rs
 crates/es/tests/cli.rs
