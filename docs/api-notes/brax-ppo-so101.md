@@ -354,3 +354,124 @@ float32 implementations of the same matmul differ by ~1e-1 on the few rows that 
 saturated. `check_export.py` reports both and gates on the scaled one — a deviation from the
 packet's acceptance, taken because the alternative is an oracle that no correct importer can
 pass. S2b should compare against `obs_scaled` and treat the uniform set as a saturation probe.
+
+## 7. The delta env — `--action delta` (packet M9/T2)
+
+Everything in sections 1–6 holds unchanged: same pins, same derived scene (blake3
+`d193fb75…`, committed scene `94d7fa5f…`), same 26-dimensional observation, same reward,
+success, timeout and randomization, same PPO configuration, same export format. This section is
+the **one** difference and its measurements. Server `renderer-14`, 2026-09-21 (UTC), venv
+`~/venvs/es-rl`, artifacts `~/artifacts/plan-t/t2/seed0-run{1,2}/`.
+
+### 7.1 The one change
+
+```
+target_t = clip(target_{t−1} + delta_scale · clip(a, −1, 1), ctrl_lo, ctrl_hi)
+target_0 = the reset pose
+```
+
+`delta_scale = 0.05` rad per control tick — at 50 Hz that is 2.5 rad/s, just under the
+deployment envelope's 3.0 rad/s, so the increment itself is inside what the Safety Plane
+allows and what the plane clamps is the *integrated* target against the position limits.
+
+Two decisions worth reading twice:
+
+1. **The integrator state is `data.ctrl`, not a new entry in `state.info`.** Playground's
+   `BraxAutoResetWrapper` restores `first_state.data` where `done` and does **not** touch
+   `info`, so a target kept in `info` would leak across the episode boundary — exactly the bug
+   M9/T1 forbids in our runtime. `mjx_env.step` writes the commanded `ctrl` into `data`, so
+   `state.data.ctrl` *is* the previous command and the reset restores `target_0` for free. The
+   env therefore carries no second piece of state, and `reset` seeds `ctrl` with the reset pose
+   (`qpos0` of the six actuated joints, which is zero for this arm) rather than with zeros.
+2. **The stored target is the clipped one.** The clip is the source-side stand-in for the
+   plane's clamp (T1: the integrator advances from the *executed* target, never the raw row),
+   so a policy that pushes at +1 into a joint limit does not accumulate a target the arm can
+   never reach and then have to unwind. `SO101Reach.command` is the one place either mode
+   computes a target, and `so101_reach_env.py --action delta` self-checks it: one `+0.5`
+   increment moves the target by `0.5 · delta_scale`, and a run of `+1` stops on `ctrlrange`.
+
+`meta.json` gains `action = { kind = "joint_delta", offset = [0]×6, scale = [0.05]×6,
+unit = "rad per control tick", delta_scale = 0.05, formula = …, ctrl_lo, ctrl_hi }`.
+`offset`/`scale` keep their section 6 meaning — they are the `Normalizer{Inverse}` the importer
+builds — so for a delta policy the unnormalizer maps `[−1, 1]` onto ±0.05 rad **of increment**
+and the offset is zero. The `position_target` block is unchanged and `--action position` (the
+default) reproduces section 5 exactly.
+
+### 7.2 Training — `~/artifacts/plan-t/t2/seed0-run1/`
+
+2,000,000 timesteps, seed 0, 4,096 envs, `XLA_FLAGS=--xla_gpu_deterministic_ops=true`,
+**561.3 s** wall clock with the second determinism run training concurrently on the same card
+(run 2: 560.3 s). The GPU was ours this time; the 16-core CPU was shared with other agents'
+jobs (load average 16–22), which is where the 134 s to the first eval row went.
+
+| step | reward (episode sum) | steps inside 0.03 m, of 200 | Σ distance |
+|---|---|---|---|
+| 0 | −69.69 | 0.00 | 69.69 |
+| 245,760 | −32.46 | 0.00 | 32.46 |
+| 491,520 | 121.05 | 132.55 | 11.50 |
+| 737,280 | 73.88 | 97.03 | 23.16 |
+| 983,040 | 172.84 | 177.06 | 4.23 |
+| 1,228,800 | **178.65** | **181.78** | 3.13 |
+| 1,474,560 | 165.82 | 170.50 | 4.68 |
+| 1,720,320 | 163.82 | 169.05 | 5.23 |
+| 1,966,080 | 174.00 | 177.77 | 3.77 |
+| 2,211,840 | 121.23 | 132.39 | 11.16 |
+
+The exported policy is the last row, and the last row is a wobble: its *final* accuracy is the
+best of the run (3.2 mm, §7.3) and what it lost is approach speed — 132 of 200 steps inside the
+ball instead of 182. A delta action cannot jump: from the reset pose to the cube is ~1.2 rad on
+the shoulder, i.e. ≥ 24 ticks at the cap, and every one of those ticks pays the distance
+penalty. That is why `return_mean` below is 126.8 where §5.2's position policy scored 188.1,
+and it is a property of the action space, not of the training.
+
+### 7.3 Evaluation in the source framework — `seed0-run1/eval.json`
+
+`eval_brax_so101.py --episodes 64`, the deterministic policy rebuilt **from `source.npz`**,
+fresh per-episode cube draws, `--action` read from `meta.json`:
+
+| metric | delta (this section) | position (§5.2) |
+|---|---|---|
+| `success_reached` (any step inside 0.03 m) | **1.00** (64/64) — target 0.8 | 1.00 |
+| `success_final` (last step inside) | **1.00** | 1.00 |
+| final distance, mean / max | **3.20 mm / 6.72 mm** | 8.41 / 14.65 mm |
+| return, mean | 126.81 | 188.11 |
+
+The per-tick **command change** `|target_t − target_{t−1}|`, over all 64 × 200 × 6 values — the
+distribution M9/T3 compares our runtime's clamp rate against:
+
+| | mean | p95 | max |
+|---|---|---|---|
+| per joint and tick | **0.01006 rad** | **0.03219 rad** | **0.04991 rad** |
+| per tick, largest of the six joints | 0.02090 rad | 0.04303 rad | 0.04991 rad |
+
+The max is `delta_scale` to four digits — `tanh` saturates, so the cap is reached and never
+exceeded — and the mean is a fifth of it: the policy spends most of the episode holding still
+near the cube, not travelling. Nothing in this run was clipped by `ctrl_lo`/`ctrl_hi`: the
+largest observed increment equals the largest the action can ask for.
+
+### 7.4 Determinism, and `check_export.py`
+
+Two runs, same seed, same flag, concurrent on one card — `source.npz` **bitwise identical**:
+
+```
+blake3 473b4fde657c2029283a2127dc9ba38128d47f4e93d3d0c05aea218d7914bb55   seed0-run1
+blake3 473b4fde657c2029283a2127dc9ba38128d47f4e93d3d0c05aea218d7914bb55   seed0-run2
+```
+
+`check_export.py --out …/seed0-run1` (numpy against JAX, §5.4's oracle):
+
+| obs set | max abs error | note |
+|---|---|---|
+| `obs_scaled` (in-distribution) | **9.537e-07** | the gate, tolerance 1e-5 — passes |
+| `obs` (`U(−1, 1)`) | 1.353e-05 | 32.1 % of rows saturate tanh (§5.4: 80.2 %) |
+
+`meta.json → oracle.tf32_delta` is **1.056e-03** for this policy — the same 1e-3 hardware-path
+gap §5.4 records, and the same reason an importer must compare against the `highest`-precision
+`actions_scaled`.
+
+| what | where (server `renderer-14`) |
+|---|---|
+| artifacts | `~/artifacts/plan-t/t2/seed0-run1/`, `…/seed0-run2/` |
+| orbax checkpoints | `…/seed0-run1/checkpoints/000002211840/` (9 checkpoints, 5.5 MB) |
+| logs | `~/artifacts/plan-t/t2/logs/run{1,2}.log` |
+| mirrored sources | `~/Projects/es-t2/` (deleted at the end of the packet) |
