@@ -544,7 +544,7 @@ RGB is *not* compared between paths: `Rs` is a one-bounce analytic shade and `Pt
 Carlo estimate of a different integral. An SSIM threshold between them (which §15.3 asks for)
 needs a converged PT render and an SSIM implementation. M7/R3 built both —
 `es_render::ssim` and a tone-mapped `Rgb8` from the `Pt` path — and
-[§10.4](#104-the-1531-ssim-number-finally-exists-and-it-is-low) is the measurement. The
+[§10.4](#104-the-153-ssim-number-finally-exists-and-it-is-low) is the measurement. The
 **threshold is still not set**: the number turns out to say more about the two lighting
 models than about either renderer, and choosing a threshold from it is an owner decision, not
 a packet's.
@@ -935,9 +935,8 @@ no tone map, so `Channel::Rgb8` was not in `PT_CHANNELS` and `es video showcase`
 to use it (`visible-learning.md` 7.17 item 5). Four additions, each behind a `RenderConfig`
 field whose default reproduces today's bytes (§28.10 rule 1) — `cargo xtask verify-goldens`
 reports **0 changed**, and the `tests/fixtures/visible-learning/frames` fixture is untouched
-because the observation path never sees any of these fields ([§9.5](#95-why-the-observation-
-path-did-not-get-the-knob) applies verbatim: `EnvRendererCfg` has no `nee`, no `exposure`,
-no `tonemap`).
+because the observation path never sees any of these fields ([§9.5](#95-why-the-observation-path-did-not-get-the-knob)
+applies verbatim: `EnvRendererCfg` has no `nee`, no `exposure`, no `tonemap`).
 
 ### 10.1 Next-event estimation and MIS
 

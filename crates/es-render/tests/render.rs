@@ -1298,8 +1298,8 @@ fn restir_is_unbiased_within_tolerance() {
     let m = mean(converged);
     let bias = mean(&got) - m;
     println!(
-        "ReSTIR (spatial, unbiased 1/Z + pairwise MIS), {SEEDS} seeds x 1 spp vs {REF_SPP} \
-         spp direct: reference mean {m:.6}, ReSTIR mean {:.6}, bias {bias:+.6} = {:+.3}%",
+        "ReSTIR (spatial, pairwise MIS), {SEEDS} seeds x 1 spp vs {REF_SPP} spp direct: \
+         reference mean {m:.6}, ReSTIR mean {:.6}, bias {bias:+.6} = {:+.3}%",
         mean(&got),
         100.0 * bias / m
     );
