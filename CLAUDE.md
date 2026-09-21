@@ -10,7 +10,9 @@ follow-ups are `docs/packets/<M>/P-<M>-R<n>.md` or the review's R-list). M5 (pla
 externally trained LeRobot ACT runs bitwise through the runtime and passes the demo's Evaluation IR. **M7 plan U** (spec §28.10, packets in
 `docs/packets/M7/`) closed 2026-09-21: `es train` / `es loop cycle`, the editor's run browser/replay/inspector/live telemetry/launch panel/plain-language UI,
 batched lowering + lr schedule + pretrained backbone + augmentation, and the RS/PT render quality ladder; on the committed documents the IR-graph policy
-U3 passes the demo's acceptance under the declared latency (held-out 0.5625). The next campaign waits on the human decisions in `docs/reviews/M7.md`
+U3 passes the demo's acceptance under the declared latency (held-out 0.5625); the addendum in `docs/reviews/M7.md` records the three
+follow-ups E7 (collect/train/cycle publish telemetry, the editor draws the loss curve), E8 (replay depth buffer) and R5 (a Task IR
+sensor declares `render = { path = "pt", … }`; absent = default = today's hash). The next campaign waits on the human decisions in `docs/reviews/M7.md`
 (the stop rule's reading, episode-boundary semantics, the SSIM threshold). M6 (quadruped, `docs/design/quadruped-track.md`) is parked pending the owner's decision. GPU paths (es-gpu, es-render, Observation
 IR GPU lowering, MJWarp/Newton adapters) were verified on an RTX 4060 with the Vulkan SDK;
 the Python oracles (MuJoCo, PyTorch, LeRobot ACT checkpoint, diffusers) run from the project
