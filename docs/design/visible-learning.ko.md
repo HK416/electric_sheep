@@ -4126,7 +4126,7 @@ IR 위에서, 7.28절에는 없던 지연 모델 아래에서 성립하는 *같�
 | row | Learning IR | Observation IR | Task IR | 학습 | held-out `success_rate` |
 |---|---|---|---|---|---|
 | **U3** | `learning-pretrained.toml` | `observation-augmented.toml` | `task.toml` (`Rs`) | `es train` | **0.5625** |
-| **U4** | `learning-pretrained.toml` | `observation-augmented-pt.toml` | `task-pt.toml` (`Pt`) | `es train` | **held-out 0.0 (16편 중 0), `passed = false`**; train-seeds 절반은 `Target / Status: unverified` |
+| **U4** | `learning-pretrained.toml` | `observation-augmented-pt.toml` | `task-pt.toml` (`Pt`) | `es train` | **held-out 0.0 (16편 중 0), `passed = false`**; train-seeds 0.0625(16편 중 1) |
 
 **U4가 나왔다(2026-09-21 12:28 서버 시각, held-out 절반).** 학습: 20,000스텝, loss 0.600 → 0.0045
 (마지막 100스텝 평균; U3의 최종은 0.0067). Held-out 평가(`evaluation-augmented-pt`, 시드 16 × 스위트
@@ -4141,6 +4141,17 @@ IR 위에서, 7.28절에는 없던 지연 모델 아래에서 성립하는 *같�
 배제된다. 또 `nominal`과 `light_direction`의 히스토그램이 바이트 단위로 같다: 조명 방향 섭동은
 래스터라이저의 방향광을 움직이는데 `Pt` 센서에는 그것이 없다(장면 발광체로만 조명). 이 문서에서
 그 스위트는 두 번째 nominal 실행이며, §15.3 결정 전에 메워야 할 빈틈이다.
+
+**train-seeds 절반(12:28 → 12:59, nominal 시드 16): `success_rate` 0.0625 — 16편 중 1, `passed =
+false`; U3는 자기 학습 시드에서 0.5625였다**(`evaluation_hash cb6c7522…`). 즉 PT 정책은 학습에 쓴
+시드에서도 일반화하지 못한다: 자기 행동이 시범 경로를 벗어나는 순간 포즈가 새것이 되고 결 지문은
+쓸모가 없어진다. 읽기 (a)다. (b)가 이 숫자로 배제되지는 않지만, 오라클 3(PT 수집 두 번이 비트 동일)과
+두 단계가 같은 `sensor_cfg`를 쓴다는 점이 그 가능성을 낮춘다; 직접 확인 — 평가 시점에 데이터셋의 한
+tick을 렌더해 바이트를 비교 — 이 R13의 첫 단계다. 재수집 없이 가장 싼 다음 실험: 같은 PT 데이터셋에
+`training_only` 잡음 증강을 넣어 재학습해 결이 지문으로 쓰이지 못하게 하기; 그다음 `Pt` 센서의
+프레임별 `svgf` 디노이즈나 `Rs` 조명(방향광의 NEE는 잡음이 없다); `spp` 증가는 마지막(두 배마다
+세 시간짜리 평가가 두 배). 원시 프레임 트리와 서버 트리 `es-r5`는 이 숫자를 읽은 뒤 지웠고
+`U4/{train,holdout,trainseeds}`는 남긴다.
 
 **이 패킷이 닫힐 때 U4는 아직 돌고 있었고, 숫자는 의도적으로 추측하지 않았다.** 작업은 오라클 서버(RTX 4090, 유휴 카드: `nvidia-smi` 컴퓨트 프로세스 없음, 1분 부하 0.56)에서 2026-09-21 07:43에 `nohup ~/artifacts/plan-v/m7-r5/r5.sh &`로, 커밋 `16f1b6f`의 트리 `~/Projects/es-r5`에서 시작되었고 아래 세 단계를 연달아 실행한다. 산출물은 모두 **`~/artifacts/plan-v/m7-r5/`** 아래에 떨어지고, 각 단계가 `<stage>.start` / `.end`(유닉스 초), `<stage>.log`, `<stage>.done`을 쓰므로 어디까지 갔는지 읽을 수 있다:
 

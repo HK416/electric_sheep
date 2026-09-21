@@ -4440,7 +4440,7 @@ is set from it.
 | row | Learning IR | Observation IR | Task IR | trained | held-out `success_rate` |
 |---|---|---|---|---|---|
 | **U3** | `learning-pretrained.toml` | `observation-augmented.toml` | `task.toml` (`Rs`) | `es train` | **0.5625** |
-| **U4** | `learning-pretrained.toml` | `observation-augmented-pt.toml` | `task-pt.toml` (`Pt`) | `es train` | **held-out 0.0 (0 of 16), `passed = false`**; train-seeds half `Target / Status: unverified` |
+| **U4** | `learning-pretrained.toml` | `observation-augmented-pt.toml` | `task-pt.toml` (`Pt`) | `es train` | **held-out 0.0 (0 of 16), `passed = false`**; train-seeds 0.0625 (1 of 16) |
 
 **U4 landed (2026-09-21 12:28 server time, the held-out half).** Training: 20,000 steps, loss
 0.600 → 0.0045 (mean of the last 100 steps; U3's final was 0.0067). Held-out evaluation
@@ -4458,6 +4458,19 @@ held-out one did not. Note also that `nominal` and `light_direction` report byte
 histograms: the light-direction perturbation moves the rasterizer's directional light, which the
 `Pt` sensor does not have (it is lit by scene emitters only), so on this document that suite is a
 second nominal run — a gap to close before the §15.3 decision.
+
+**The train-seeds half (12:28 → 12:59, 16 nominal seeds): `success_rate` 0.0625 — 1 of 16,
+`passed = false`; U3 scored 0.5625 on its training seeds** (`evaluation_hash cb6c7522…`). So the
+PT policy does not generalise even to the seeds it trained on: once its own actions leave the
+demonstration's path the poses are new and a grain fingerprint is useless, which is reading (a).
+Reading (b) is not excluded by this number, but oracle 3 (two PT collects bitwise identical) and
+`sensor_cfg` being the one builder both stages use make it unlikely; the direct check — render one
+dataset tick at evaluation time and compare bytes — is the first step of R13. Cheapest next
+experiment, no re-collection: retrain on the same PT dataset with a `training_only` noise
+augmentation so the grain is not a usable fingerprint; then per-frame `svgf` denoising on the `Pt`
+sensor or the `Rs` lighting on it (NEE on a directional light is noise-free); more `spp` last, since
+each doubling doubles a three-hour evaluation. The raw frame trees and the server tree `es-r5` were
+deleted after these numbers were read; `U4/{train,holdout,trainseeds}` stay.
 
 **U4 was still running when this packet closed, and the numbers are deliberately not guessed.**
 The job was launched on the oracle server (RTX 4090, idle card: `nvidia-smi` no compute process,
