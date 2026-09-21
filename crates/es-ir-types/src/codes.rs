@@ -28,6 +28,16 @@ pub const GRAPH_010: &str = "GRAPH-010";
 pub const HASH_001: &str = "HASH-001";
 pub const HASH_002: &str = "HASH-002";
 
+// --- RL policy import (spec 14.4) ---------------------------------------------------------
+/// The dictionary is the single place a code's severity and title live, so the five refusals
+/// `es_data::rl_import` names are entries here like every other code — the check itself is in
+/// `es-data`, which is where the adapter document is read (packet M8/S2b).
+pub const IMP_001: &str = "IMP-001";
+pub const IMP_002: &str = "IMP-002";
+pub const IMP_003: &str = "IMP-003";
+pub const IMP_004: &str = "IMP-004";
+pub const IMP_005: &str = "IMP-005";
+
 // --- Task (spec 7.4) ----------------------------------------------------------------------
 pub const TASK_001: &str = "TASK-001";
 pub const TASK_002: &str = "TASK-002";
@@ -192,6 +202,11 @@ pub const CODES: &[CodeEntry] = &[
     e(GRAPH_010, Error, "unknown port name", "11.1"),
     e(HASH_001, Error, "value is not encodable in canonical form", "5.3"),
     e(HASH_002, Error, "graph too symmetric to canonicalize", "5.3"),
+    e(IMP_001, Error, "adapter joint count disagrees with the Task IR ActionSpec dim", "14.4"),
+    e(IMP_002, Error, "adapter names a joint the scene has no actuator for", "14.4"),
+    e(IMP_003, Error, "adapter joint units are not radians", "14.4"),
+    e(IMP_004, Error, "adapter action kind disagrees with the Task IR ActionSpec space", "14.4"),
+    e(IMP_005, Error, "observation channels do not tile the source observation exactly or name an undeclared channel", "14.4"),
     e(LRN_001, Error, "schema version disagrees with the graph", "8.2"),
     e(LRN_002, Error, "wrong number of input ports for this node kind", "8.3"),
     e(LRN_010, Error, "graph boundary does not match the declared tensor ports", "8.2"),
@@ -294,6 +309,11 @@ mod tests {
             GRAPH_010,
             HASH_001,
             HASH_002,
+            IMP_001,
+            IMP_002,
+            IMP_003,
+            IMP_004,
+            IMP_005,
             TASK_001,
             TASK_002,
             CTRL_001,

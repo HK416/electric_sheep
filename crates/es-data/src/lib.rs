@@ -21,6 +21,7 @@ pub mod identity;
 pub mod intervention;
 pub mod lerobot;
 pub mod lerobot_config;
+pub mod rl_import;
 pub mod roboverse;
 pub mod training;
 

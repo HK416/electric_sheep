@@ -1,0 +1,41 @@
+{
+  "framework": "rsl-rl",
+  "versions": {
+    "synthetic": "no framework was installed to produce this"
+  },
+  "obs_dim": 26,
+  "action_dim": 6,
+  "hidden": [
+    8,
+    8
+  ],
+  "activation": "elu",
+  "activate_output": false,
+  "squash": "none",
+  "obs_mean": null,
+  "obs_std": null,
+  "normalizer": null,
+  "log_std": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "source_std": {
+    "kind": "std",
+    "value": [
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "action_scale": null,
+  "action_offset": null,
+  "joint_order": null,
+  "synthetic": "python/es/import_rl.py --synth rsl-rl"
+}
