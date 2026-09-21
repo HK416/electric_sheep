@@ -46,6 +46,7 @@ use crate::model::replay_view::{self, Camera, Projected, ReplayView};
 use crate::model::run_view::{Bucket, RunView};
 use crate::model::search::Search;
 use crate::model::telemetry_view::{self, Source, TelemetryModel};
+use crate::model::train_view::{Plot, Series};
 
 const NODE_W: f32 = 178.0;
 const NODE_H: f32 = 40.0;
@@ -1106,9 +1107,37 @@ impl EditorApp {
         let mut select = None;
         // Everything below is one scroll area, so a short window clips nothing: the table, the
         // acceptance rows, the strip and the filmstrip scroll together.
+        let stages: Vec<(String, Option<f64>, bool)> = live
+            .stages()
+            .iter()
+            .map(|s| (s.name.clone(), s.seconds, s.running()))
+            .collect();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
+                // A cycle publishes every stage on one socket (packet M7/E7), so the strip
+                // above the table says which one these rows came from. A run that is one
+                // command publishes no stage and the strip is not drawn at all.
+                if !stages.is_empty() {
+                    ui.heading(i18n::t(lang, "results.stages"));
+                    ui.horizontal_wrapped(|ui| {
+                        for (name, seconds, running) in &stages {
+                            let plain = labels::stage_label(lang, name);
+                            let word = if plain.is_empty() { name } else { plain };
+                            let text = match seconds {
+                                Some(s) => format!("{word}  {s:.1}s"),
+                                None => word.to_owned(),
+                            };
+                            let colour = if *running {
+                                Color32::from_rgb(240, 200, 80)
+                            } else {
+                                ui.visuals().text_color()
+                            };
+                            ui.colored_label(colour, text).on_hover_text(name);
+                        }
+                    });
+                    ui.separator();
+                }
                 egui::Grid::new("run-cells").striped(true).show(ui, |ui| {
                     // The header is the metric's plain name and the hover is the raw one the
                     // report carries; a column this build has no word for keeps its raw name,
@@ -1536,6 +1565,8 @@ impl EditorApp {
                 }
             });
             ui.separator();
+            self.training_section(ui);
+            ui.separator();
             ui.heading(self.t("live.streams"));
             egui::Grid::new("streams").striped(true).show(ui, |ui| {
                 for (key, tick, value) in self.telemetry.latest() {
@@ -1550,6 +1581,112 @@ impl EditorApp {
             for e in self.telemetry.events.iter().rev().take(200) {
                 ui.label(format!("[{}] {} {:?}", e.tick, e.kind, e.fields));
             }
+        });
+    }
+
+    /// The Live tab's Training section (packet M7/E7): the learning curve, the learning rate,
+    /// the checkpoint marks and the tensor the network is fitting.
+    ///
+    /// Wiring only. The curve's scale, its normalisation, the marks' positions and the ETA are
+    /// [`crate::model::train_view::TrainView`]'s and are judged headlessly; this maps a
+    /// rectangle and paints a polyline. **There is no plotting crate** — two `line_segment`
+    /// runs over points already in the unit square is the whole of it (spec 28.10 rule 3).
+    fn training_section(&mut self, ui: &mut egui::Ui) {
+        let lang = self.settings.lang;
+        let ctx = ui.ctx().clone();
+        ui.heading(self.t("live.training"))
+            .on_hover_text(self.t("live.training.hint"));
+        if self.telemetry.train.is_empty() {
+            ui.label(self.t("live.training.empty"));
+            return;
+        }
+        let train = &self.telemetry.train;
+        // Where the run has got to, how fast, and how much is left -- the model's numbers,
+        // formatted by the tables (packet M7/E6).
+        ui.horizontal_wrapped(|ui| {
+            if let Some(step) = train.step() {
+                ui.label(match train.total() {
+                    Some(total) => {
+                        i18n::fill(lang, "live.step", &[&step.to_string(), &total.to_string()])
+                    }
+                    None => i18n::fill(lang, "live.step_only", &[&step.to_string()]),
+                });
+            }
+            if let Some(eta) = train.total().and_then(|t| train.eta(t)) {
+                ui.label(i18n::fill(
+                    lang,
+                    "live.eta",
+                    &[&format!("{:.0}s", eta.as_secs_f64())],
+                ));
+            }
+            if let Some(rate) = train.throughput() {
+                ui.label(i18n::fill(
+                    lang,
+                    "live.throughput",
+                    &[&format!("{rate:.0}")],
+                ));
+            }
+            if !train.checkpoints().is_empty() {
+                ui.label(i18n::fill(
+                    lang,
+                    "live.checkpoints",
+                    &[&train.checkpoints().len().to_string()],
+                ))
+                .on_hover_text(
+                    train
+                        .checkpoints()
+                        .iter()
+                        .map(|(step, hash)| format!("{step}: {hash}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                );
+            }
+        });
+        let mut log = train.log_scale;
+        ui.checkbox(&mut log, self.t("live.log_scale"));
+        let loss = train.plot(Series::Loss, log);
+        let lr = train.plot(Series::Lr, false);
+        let (sample, samples) = (train.sample().cloned(), train.samples());
+        self.telemetry.train.log_scale = log;
+
+        ui.horizontal_top(|ui| {
+            ui.vertical(|ui| {
+                ui.set_max_width((ui.available_width() - 180.0).max(240.0));
+                for (key, plot, colour) in [
+                    ("live.loss", loss, Color32::from_rgb(120, 200, 255)),
+                    ("live.lr", lr, Color32::from_rgb(200, 160, 255)),
+                ] {
+                    ui.label(i18n::t(lang, key));
+                    match plot {
+                        Some(plot) => paint_curve(ui, &plot, colour),
+                        None => {
+                            ui.label(i18n::t(lang, "results.no_events"));
+                        }
+                    }
+                }
+            });
+            // What the network is looking at, beside the curve: the batch's own image input
+            // after augmentation, uploaded once per sample rather than once per repaint.
+            ui.vertical(|ui| {
+                ui.label(i18n::t(lang, "live.sample"))
+                    .on_hover_text(i18n::t(lang, "live.sample.hint"));
+                let Some(image) = sample else {
+                    ui.label(i18n::t(lang, "live.sample.empty"));
+                    return;
+                };
+                let key = format!("sample#{samples}");
+                if !self.run_frames.contains_key(&key) {
+                    self.run_frames
+                        .insert(key.clone(), rgb_texture(&ctx, &key, &image));
+                }
+                if let Some(texture) = self.run_frames.get(&key) {
+                    let scale = (160.0 / texture.size_vec2().x).max(1.0);
+                    ui.image(egui::load::SizedTexture::new(
+                        texture.id(),
+                        texture.size_vec2() * scale,
+                    ));
+                }
+            });
         });
     }
 
@@ -1721,6 +1858,44 @@ fn paint_timeline(lang: Lang, ui: &mut egui::Ui, buckets: &[Bucket]) {
             );
         }
     }
+}
+
+/// One curve, painted (packet M7/E7). **No plotting crate**: the points arrive in the unit
+/// square from [`crate::model::train_view::TrainView::plot`], and this maps them onto a
+/// rectangle, joins them, and draws a vertical line where a checkpoint was packed. The two
+/// numbers beside it are the range the model normalised against, in the series' own units.
+fn paint_curve(ui: &mut egui::Ui, plot: &Plot, colour: Color32) {
+    let (response, painter) =
+        ui.allocate_painter(Vec2::new(ui.available_width(), 90.0), Sense::hover());
+    let rect = response.rect.shrink(4.0);
+    let at = |p: &[f32; 2]| {
+        Pos2::new(
+            rect.left() + p[0] * rect.width(),
+            rect.bottom() - p[1] * rect.height(),
+        )
+    };
+    painter.rect_filled(rect, 2.0, ui.visuals().extreme_bg_color);
+    for x in &plot.marks {
+        let x = rect.left() + x * rect.width();
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(1.0_f32, Color32::from_rgb(240, 200, 80)),
+        );
+    }
+    for pair in plot.points.windows(2) {
+        painter.line_segment([at(&pair[0]), at(&pair[1])], Stroke::new(1.5_f32, colour));
+    }
+    let text = |pos: Pos2, anchor: Align2, value: f32| {
+        painter.text(
+            pos,
+            anchor,
+            format!("{value:.4}"),
+            FontId::monospace(10.0),
+            ui.visuals().weak_text_color(),
+        );
+    };
+    text(rect.left_top(), Align2::LEFT_TOP, plot.max);
+    text(rect.left_bottom(), Align2::LEFT_BOTTOM, plot.min);
 }
 
 // --- the Replay panel --------------------------------------------------------------------------

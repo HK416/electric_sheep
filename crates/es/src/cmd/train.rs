@@ -458,6 +458,11 @@ pub(crate) fn run(
     }
 
     // --- the plan ------------------------------------------------------------------------
+    // How long this run is, said once before the first step so a viewer can draw an ETA from
+    // the first progress line (packet M7/E7).
+    if let Some(p) = watch.publisher.as_deref_mut() {
+        p.train_begin(recipe.run.steps);
+    }
     let mut checkpoints = Vec::new();
     let mut summary = Value::Null;
     for step in &plan.steps {

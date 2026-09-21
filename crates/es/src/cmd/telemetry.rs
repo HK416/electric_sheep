@@ -393,6 +393,18 @@ impl Publisher {
         });
     }
 
+    /// How long this training run is, before the first optimizer step.
+    ///
+    /// The document's own `[run] steps` and not a number the trainer invents: it is what the
+    /// plan's `--checkpoint-at` caps the run at, and it is knowable before Python starts, so
+    /// an editor that attaches can draw an ETA from the first progress line onward.
+    pub(crate) fn train_begin(&self, total_steps: u32) {
+        self.event(
+            "train.begin",
+            fields([("total_steps", total_steps.to_string())]),
+        );
+    }
+
     /// A checkpoint mark was packed: the step and the bundle's own spec 5.3 `policy_hash`.
     pub(crate) fn checkpoint(&self, step: &str, policy_hash: &str) {
         self.event(

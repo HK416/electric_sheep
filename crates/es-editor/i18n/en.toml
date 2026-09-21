@@ -72,6 +72,8 @@
 "word.train" = "Train"
 "word.evaluate" = "Evaluate"
 "word.watch" = "Watch"
+"word.expert_gate" = "Check the demonstration"
+"word.showcase" = "Make a video"
 
 # --- finding a block --------------------------------------------------------------------
 "find.label" = "Find"
@@ -163,6 +165,21 @@
 "live.streams" = "Signals"
 "live.events" = "Events"
 "live.empty" = "Nothing is attached. Type the address a run publishes on and press Connect, or press Start on the Results tab."
+"live.training" = "Learning"
+"live.training.hint" = "The learning curve of a running es train, every --progress-every steps on stream 5 (spec 23.3, spec 19.3)"
+"live.training.empty" = "Nothing is learning right now. Start a training run, or the whole loop, and its curve appears here."
+"live.loss" = "How wrong it is"
+"live.lr" = "How big a step it takes"
+"live.log_scale" = "Squash the tall part"
+"live.step" = "Step {} of {}"
+"live.step_only" = "Step {}"
+"live.eta" = "About {} left"
+"live.throughput" = "{} examples a second"
+"live.checkpoints" = "Saved {} time(s)"
+"live.sample" = "What the network is looking at"
+"live.sample.hint" = "One image input of the current batch, after augmentation, de-normalised for display only (spec 23.3)"
+"live.sample.empty" = "No picture yet. Ask the run for one with --telemetry-image-every."
+"results.stages" = "Steps of this run"
 
 # --- what the policy sees ---------------------------------------------------------------
 "sees.empty" = "Open a project file to see what the robot's camera gives the policy."

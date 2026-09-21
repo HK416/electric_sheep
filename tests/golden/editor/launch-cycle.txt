@@ -6,6 +6,12 @@ tests/fixtures/visible-learning/training.toml
 eval-out
 --from
 train
+--telemetry
+127.0.0.1:7777
+--telemetry-token
+s3cret
+--telemetry-image-every
+10
 --dry-run
 --allow-new-evaluation
 --skip-expert-gate
