@@ -157,7 +157,7 @@ es policy import-lerobot --checkpoint lerobot/checkpoints/010000/pretrained_mode
 | 3 | `scheduler.json` | `{"kind":"constant","lr":…}`, 또는 `[run] schedule`이 이름 붙인 `warmup_cosine` 블록(10절) | 사전 |
 | 4 | `seed.json` | `[run] seed`에서 온 `global`·`dataloader`, `augmentation`은 unset | 사전 |
 | 5 | `dataset.lock` | `es-data::identity`의 content/schema/split, 에피소드·프레임 수, 기록된 `es:task:` 이름 | 사전 |
-| 6 | `base_model.lock` | `{"source":"none"}`(IR) 또는 선언된 `vision_backbone` + `pretrained_backbone_weights`(외부) | 사전 |
+| 6 | `base_model.lock` | `[policy] base_model`의 *검증된* 출처(IR, 11절), 그것이 없으면 `{"source":"none"}`, 또는 선언된 `vision_backbone` + `pretrained_backbone_weights`(외부) | 사전 |
 | 7 | `augmentation.json` | T6까지 `{"kind":"none"}` | 사전 |
 | 8 | `precision.json` | `fp32`, `amp off`, IR 경로에서 `gradient_accumulation` = `[run] batch` | 사전 |
 | 9 | `topology.json` | `{"world_size":1}` | 사전 |
@@ -187,7 +187,7 @@ es policy import-lerobot --checkpoint lerobot/checkpoints/010000/pretrained_mode
 | unset | 이유 | 주인 |
 |---|---|---|
 | `seed.json.augmentation` | 증강이 없다 | T6 |
-| `base_model.lock.weights_hash`·`.license` | *선언된* 출처다. `extra`가 덮지 않는 한 백본은 LeRobot ACT의 기본값이고, 여기서는 그 가중치를 내려받지도 검증하지도 않았다 | T5 |
+| `base_model.lock.weights_hash`·`.license`, **외부 경로에서만** | *선언된* 출처다. `extra`가 덮지 않는 한 백본은 LeRobot ACT의 기본값이고, 여기서는 그 가중치를 내려받지도 검증하지도 않았다. IR 경로의 것은 검증된다(11절) | — |
 | 외부 경로의 `optimizer.json.betas`·`.weight_decay` | `lerobot`의 옵티마이저 블록은 이쪽이 선언할 것이 아니다. 그래서 T4는 그 경로에서 `[run] schedule`·`weight_decay`·`grad_clip`을 아예 거절한다 — 돌지도 않은 스케줄을 선언하는 대신에(10절) | T2 |
 | 외부 경로의 `metrics.json.loss` | `lerobot-train`은 곡선을 자기 로그에 적지, 이 명령이 읽는 파일에 적지 않는다 | T2 |
 | `hardware.json.driver` | `torch`는 CUDA 툴킷을 보고하지 드라이버를 보고하지 않는다 | — |
@@ -527,9 +527,87 @@ U-측정이다). 체크포인트는 `~/artifacts/plan-v/m7-t4/model-D.safetensor
 만들어 내야 하는 것이다. 새 필드를 거기서 보이면 둘 다 움직인다. 필드는 위에 문서화되어 있고,
 자기 레시피를 직접 만드는 `cli::train_identity_moves_with_the_schedule`이 그것을 실행한다.
 
+## 11. 사전학습된 backbone과 `base_model.lock` (패킷 M7/T5)
+
+spec 19.3은 사전학습된 backbone의 출처가 "결과에 직접 영향을 주므로 프로버넌스에 포함되어야
+하며, 라이선스 추적의 근거이기도 하다"고 말한다. 이 패킷 이전까지 IR 경로의 슬롯은
+`{"source":"none"}`이었고 외부 경로의 것은 두 필드가 `unset`인 *선언*이었다. 이제 IR 경로에서
+그것은 **검증된** 기록이며, 이 절이 검증된다는 것이 무슨 뜻인지 적는다.
+
+레시피가 필드 하나를 얻는다:
+
+```toml
+[policy]
+bundle     = "runs/collect-001/untrained.esb"
+base_model = "~/artifacts/plan-v/m7-t5/resnet18-imagenet1k-v1.safetensors"
+```
+
+Learning IR이 `VisionEncoder { pretrained = true }`를 선언하는 번들은 이것을 요구하고, 그렇지
+않은 번들은 이것을 거부하며, `lerobot` 경로에서는 아예 거부된다 — 거기서 backbone은 `lerobot`
+자신의 것이고 `[policy] lerobot.extra`를 통해 닿는다. 첫 쌍의 양방향 모두 기본값이 아니라
+거부이며, 이유는 같다: ImageNet을 원하는데 받지 못한 번들은 그렇지 않다고 말하는 문서 아래에서
+처음부터 학습할 것이고, 아무도 읽지 않는 가중치를 이름 대는 레시피는 실행이 갖지 않은 출처를
+`base_model.lock`에 넣게 된다 — §28.10 규칙 2가 금지하는 날조다.
+
+**단 1 GPU-초도 쓰이기 전에 세 주장이 일치해야 한다.** `Backbone::verify`는 파일과 그 옆의
+`<stem>.lock.json`을 읽고, 이 순서로 확인한다:
+
+| 확인 대상 | 거부되는 경우 | 왜 이 순서인가 |
+|---|---|---|
+| lock이 이 바이트를 서술하는가 | `lock.blake3 != blake3(file)` | 이 lock 파일이 애초에 이 아티팩트에 관한 것인가 |
+| source | `lock.source`가 `torchvision.models.ResNet18_Weights.IMAGENET1K_V1`가 아님 | 라이선스 결정은 *이름 붙은* source에 관한 것이다(§29 행, 오너 2026-09-15) |
+| 라이선스 | `lock.license`가 비어 있음 | §19.3은 이 파일을 라이선스 추적의 근거로 삼는다; 빈 슬롯은 아무것도 추적하지 않는다 |
+| 고정값 | `blake3(file) != RESNET18_IMAGENET1K_V1_BLAKE3` | 앞의 셋은 lock이 이 바이트에 대한 잘 형성된 기록인지 묻고, 이것은 이 바이트가 저장소가 실제로 측정한 아티팩트인지 묻는다 |
+
+고정값은 `8511928e…9e801899`, `crates/es-data/src/training.rs`의 `pub const` 하나다. 45MB
+파일은 결코 커밋되지 않는다 — 오라클 서버의 `~/artifacts/plan-v/m7-t5/`에 있다 — 그래서 그
+상수가 저장소가 그것에 대해 아는 전부이며, 이는 `tests/fixtures/mjcf/*.PROVENANCE.json`이 이
+프로젝트의 장면이 파생된 업스트림 MJCF를 고정하는 방식과 같다. 그 문자열의 사본은 정확히
+하나다: `python/es/fetch_backbone.py`는 자기 것을 갖는 대신 `--expect`로 그것을 *받고*,
+`crates/es-policy/tests/backbone_provenance.rs`는 `training.rs`에서 텍스트로 읽어 낸다 —
+`es-data`는 레이어 10이고 `es-policy`는 레이어 8이므로(§4.2) 상수를 위로 import할 수 없기
+때문이다. `fetch_backbone.py --repin`이 그것을 옮기는 의도적인 방법이고, 상수와 두 설계 노트가
+같은 커밋에서 함께 움직여야 한다고 stderr로 말한다.
+
+**슬롯에 무엇이 들어가고, 무엇이 의도적으로 들어가지 않는가.** `base_model.lock`은 `source`,
+`url`, `sha256_upstream`, `blake3`, `dropped`, `license`, `license_url`을 싣는다 — *가중치*를
+식별하는 필드들이다. 아티팩트 옆의 lock 파일은 그것을 받아온 `torch`와 `torchvision`도
+기록하지만 그것들은 **복사되지 않는다**: 같은 업스트림 파일을 받아오는 두 머신은 바이트 단위로
+동일한 텐서와 서로 다른 버전 문자열을 쓰므로(측정: torchvision 0.26.0+cu129와 0.29.0+cpu가
+같은 blake3를 낸다), 그것을 실으면 받아온 머신이 `identity_hash`에 들어가고 한 레시피가 두
+identity를 갖게 된다. 받아온 환경은 아티팩트 자신의 lock 파일과 실행의 `hardware.json`에 속한다.
+
+따라서 `TrainingIdentity.base_model`은 이 경로에서 실제 `source`와 실제 `license`를 갖게 되며,
+이것이 §19.3이 요구한 바다: base model의 라이선스 말고는 아무것도 바꾸지 않은 실행은 다른
+실행이다.
+
+**트레이너의 줄은 `--init-backbone <path>`를 얻고, 그 외에는 아무것도 얻지 않는다.** `frozen`은
+Learning IR의 필드이므로 lowering된 모듈이 그것을 `requires_grad_(False)`로 싣고 `train_act.py`는
+여전히 gradient를 요구하는 파라미터 위에 `AdamW`를 만든다 — `learning-lowering.md` 5.3절 참고.
+`--frozen` 플래그는 명령줄 위의 IR 결정 사본이 될 것이고, 그러면 계획 골든이 `--dry-run`이 열지
+않는 번들에 의존하게 된다.
+
+### 거부는 번호가 아니라 이름으로 한다
+
+패킷은 `TRAIN-0xx`라고 쓴다. `es_data::training`도 `es train`도 숫자 코드를 가진 적이 없다 —
+거기의 모든 거부는 필드와 파일을 이름으로 대며, §17.2의 요구는 거부가 식별 가능해야 한다는
+것이지 열거되어야 한다는 것이 아니다. 메시지 다섯 개를 위해 고안된 번호 체계는 사용자가
+하나뿐인 체계다. 그 다섯은: 자기 가중치를 서술하지 않는 lock 파일(두 다이제스트와 lock의 경로를
+이름으로 댄다), 고정된 것이 아닌 아티팩트(두 다이제스트와 옮길 상수를 이름으로 댄다), 빈
+라이선스(파일과 §19.3을 이름으로 댄다), `base_model` 없는 `pretrained = true`(플래그와 fetch
+명령을 이름으로 댄다), `pretrained = true` 없는 `base_model`(플래그와 주장될 뻔한 것을 이름으로
+댄다). 다섯 모두 `cli::train_refuses_a_mismatched_base_model`이다.
+
+### 여기서도 픽스처 레시피는 그대로다
+
+`tests/fixtures/visible-learning/training.toml`은 `base_model`을 이름 붙이지 않는다. 그 번들이
+처음부터 학습하는 쪽이고, 그 옆의 계획 골든은 계속 렌더링되어야 하기 때문이다. 실험의 사전학습
+쪽은 `tests/fixtures/visible-learning/learning-pretrained.toml`이고, 그것을 가리키는 레시피는
+U-측정의 것이지 커밋된 픽스처가 아니다.
+
 ---
 
-## 11. 사이클 (패킷 M7/T2)
+## 12. 사이클 (패킷 M7/T2)
 
 §13.1은 루프를 그린다 — 수집, 학습, 평가, 관찰 — 그리고 T1이 그중 한 칸을 명령 하나로
 만들었다. 나머지 셋은 사람이 경로와 해시를 손으로 꿰는 네 개의 명령으로 남아 있었고,
@@ -542,7 +620,7 @@ es loop cycle --recipe <cycle.toml> [--out <dir>] [--dry-run] [--from <stage>]
               [--allow-new-evaluation] [--skip-expert-gate]
 ```
 
-### 11.1 문서는 단계를 이름 붙일 뿐, 다시 서술하지 않는다
+### 12.1 문서는 단계를 이름 붙일 뿐, 다시 서술하지 않는다
 
 ```toml
 kind  = "cycle"
@@ -588,7 +666,7 @@ height  = 720
 얇은 이유는 T1과 같다: 문서와 계획과 원장 단계는 `es_data::training`과
 `es_data::collect`에 있고, 그것들은 헤드리스이며 단위 테스트되어 있다.
 
-### 11.2 단계 계획은 골든이다
+### 12.2 단계 계획은 골든이다
 
 `--dry-run`은 단계마다 한 줄을 출력한다. `<out>` 아래의 모든 경로는 그것에 상대적으로,
 모든 구분자는 `/`로, T1의 계획은 `train` 줄 아래에 들여쓰기로 — 학습 계획을 레시피만의
@@ -610,7 +688,7 @@ es video showcase --run eval --scene .../so101_pick_place.xml --out showcase --c
 디스크의 어떤 것도 읽지 않는다 — 데이터셋도, 번들도, Python도 — 그것이 그 어느 것도 없는
 기계의 CI에서 판정 가능하게 만드는 것이다. 일어나지 않은 실행은 디렉터리조차 쓰지 않는다.
 
-### 11.3 두 개의 거부가 이 명령의 요점이다
+### 12.3 두 개의 거부가 이 명령의 요점이다
 
 **하니스는 전문가를 먼저 통과시킨다**(§28.9 규칙 1, M5-R1). `[collect] expert`가 설정되면
 사이클은 *같은* `[eval] config`로 `es eval run`을 통해 전문가를 돌린다 — 무엇이든 학습되기
@@ -629,7 +707,7 @@ es video showcase --run eval --scene .../so101_pick_place.xml --out showcase --c
 새 비교를 시작하는 의도적 행위다. 반복 2부터는 끝에서 두 리포트에 `es eval compare`가 돈다:
 새 것이 덮어쓰기 전에 이전 `report.json`을 `report-prev.json`으로 옮긴다.
 
-### 11.4 `--from <stage>`는 재개하되, 먼저 검사한다
+### 12.4 `--from <stage>`는 재개하되, 먼저 검사한다
 
 `--from collect|train|eval|showcase`는 앞선 단계를 건너뛰고 그 출력을 `<out>` 아래에서
 읽는다. 그것들이 없거나 원장과 어긋나면 거부한다: 데이터셋을 다시 계산한 `content`를 원장의
@@ -637,7 +715,7 @@ es video showcase --run eval --scene .../so101_pick_place.xml --out showcase --c
 `--from showcase`면 `eval/report.json`을. 단계들이 한 사이클이 아닌 재개된 사이클이야말로
 이것이 막으려는 실패 양상이다.
 
-### 11.5 원장이 루프의 끝까지 닿는다
+### 12.5 원장이 루프의 끝까지 닿는다
 
 `loop.jsonl`은 `train`·`evaluate` 단계와 `es_data::check_chain`을 얻는다. 둘 다
 `docs/design/learning-loop.ko.md` 4.1절에 서술되어 있고, 거기가 그것들의 집이다. 사이클은
@@ -648,7 +726,7 @@ es video showcase --run eval --scene .../so101_pick_place.xml --out showcase --c
 collect  ->  evaluate (전문가 게이트)  ->  train  ->  evaluate (정책)
 ```
 
-### 11.6 패킷으로부터의 일탈 — `es eval run --expert`
+### 12.6 패킷으로부터의 일탈 — `es eval run --expert`
 
 패킷은 `eval.rs`를 **오직** 진입점을 `pub(crate)`로 노출하기 위해서만 건드리도록 허용한다.
 구현은 플래그도 하나 추가했다: `es eval run --expert <name>`은 번들의 가중치 대신 스크립트된
@@ -680,7 +758,7 @@ collect  ->  evaluate (전문가 게이트)  ->  train  ->  evaluate (정책)
 collect`가 이미 가진 intervener 훅), 아니면 게이트가 그 휴리스틱을 기록으로 남긴 채
 받아들이거나.
 
-### 11.7 오라클
+### 12.7 오라클
 
 | # | 명령 | 필요한 것 |
 |---|---|---|
@@ -701,7 +779,7 @@ RAN cycle_runs_the_expert_through_the_harness_first: expert gate success_rate 1,
 그런 것이다. 그 비대칭이 이 오라클의 주제다: 게이트가 돌았고, **먼저** 돌았으며, 원장이
 `collect -> evaluate -> train -> evaluate`를 연결했다.
 
-### 11.8 측정 — 사이클 하나 전체, 오라클 서버, RTX 4090, 2026-09-21
+### 12.8 측정 — 사이클 하나 전체, 오라클 서버, RTX 4090, 2026-09-21
 
 데모 자신의 문서들 위에서 돌린 `es loop cycle`: 프레임을 남긴 200 에피소드 전문가 수집,
 커밋된 `evaluation.toml` 위의 게이트, 20,000스텝 IR 경로(배치 8, lr 1e-4, seed 0,
@@ -743,7 +821,9 @@ acceptance 기준은 `nominal success_rate >= 0.5`이므로 사이클은
 0.95라는 `envelope_violation_rate`가 어디를 볼지 말해 준다: 학습된 chunk가 스무 tick 중
 열아홉에서 Deployment IR의 envelope 바깥에 있고, 따라서 팔이 실제로 따르는 것은 Safety
 Plane이다. `final_loss 0.014186`인데 한 번도 성공하지 못하는 정책은 10절이 D행에 대해
-지적한 바로 그 불일치다 — 그만큼 낮은 fit이 아직 작동하는 정책은 아니다.
+지적한 바로 그 불일치다 — 그만큼 낮은 fit이 아직 작동하는 정책은 아니다. 이 실행은
+`base_model`(11절)을 쓰지 않았고 T6의 augmentation도 트리에 없었으므로, IR 경로에 대한
+판결이 아니라 U-측정이 개선해 나갈 *바닥*이다.
 
 **이 측정이 §28.9의 "월클록이 어디로 가는가"에 대해 말하는 세 가지.**
 

@@ -260,7 +260,7 @@ evaluate.inputs.policy_hash ∈ { 그 앞 train 단계들의 checkpoint.* }
 §13.3의 나머지 절반 — 데이터와 정책이 움직이는 동안 `evaluation_hash`를 고정하는 것 —
 은 `last_evaluation_hash(&steps)`와 `es loop cycle`의 거부다. 두 리포트를 나란히 읽는
 자리는 여전히 이미 구현된 `es eval compare`다. `docs/design/training-recipe.ko.md`
-11절을 보라.
+12절을 보라.
 
 ---
 

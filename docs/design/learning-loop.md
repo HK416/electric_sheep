@@ -252,7 +252,7 @@ both hashes and the marks in the message. `es loop cycle` calls it once the run 
 §13.3's other half — hold `evaluation_hash` fixed while data and policy move — is
 `last_evaluation_hash(&steps)` plus a refusal in `es loop cycle`; `es eval compare` (already
 implemented) remains the place two reports are read side by side. See
-`docs/design/training-recipe.md` section 11.
+`docs/design/training-recipe.md` section 12.
 
 ---
 

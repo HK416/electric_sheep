@@ -15,7 +15,7 @@ Usage:
     train_act.py --module <dir> --baked <dir> --out model.safetensors
                  [--epochs N] [--batch N] [--lr F] [--seed N] [--device cpu]
                  [--schedule constant|warmup_cosine] [--warmup-steps N] [--lr-min F]
-                 [--weight-decay F] [--grad-clip F]
+                 [--weight-decay F] [--grad-clip F] [--init-backbone weights.safetensors]
                  [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json]
                  [--resident-gpu] [--amp bf16] [--compile]
 
@@ -110,6 +110,22 @@ implementation detail of a torch version and the schedule has to be reproducible
 `crates/es-policy/tests/ir_training.rs::lr_schedule_matches_the_golden` compares both this
 function and a Rust re-implementation of it against that file.
 
+**The pretrained backbone** (packet M7/T5). `--init-backbone <file>` loads a safetensors file
+whose keys are the backbone's own `state_dict` names into every lowered backbone before the first step, mapping
+`<key>` to `n<node>.<key>`; `fc` is skipped because the lowering replaced it, and any other
+key that is unknown or the wrong shape stops the run. It is a *checkpoint like any other* --
+this script still reads and writes nothing that can execute code on load (INV-16), and still
+never touches the network. The file is `es train`'s `[policy] base_model`, whose blake3 was
+checked against its lock file and against the repository's pin before this script saw it; its
+provenance is spec 19.3's `training/base_model.lock`, not anything here.
+
+`frozen` never appears on this command line. It is a field of the Learning IR, so the lowered
+module carries it as `requires_grad_(False)` and the optimizer is built over
+`[p for p in model.parameters() if p.requires_grad]`. A flag would be a second copy of an IR
+decision, and two copies of one fact are one fact and one bug. With nothing frozen the list
+is every parameter in the same order, so the default path is bit-identical to the run before
+this packet.
+
 `--weight-decay` is AdamW's, defaulting to torch's own `1e-2` **made explicit** so that
 `optimizer.json` can name a number this script actually passed rather than one it assumes.
 `--grad-clip F` clips the gradient norm to `F` before the step; `0` (the default) is off, and
@@ -159,6 +175,48 @@ def lr_curve_hash(applied: list) -> str:
     if blake3 is None:
         return None
     return blake3.blake3(struct.pack("<%dd" % len(applied), *applied)).hexdigest()
+
+
+def init_backbone(model, tensors: dict) -> list:
+    """Load `--init-backbone`'s tensors into every lowered `ResNet` backbone (M7/T5).
+
+    The file holds the backbone's own `state_dict` key names (the provider's, not this project's), so the mapping is
+    `n<node>.<key>`; `fc` is skipped by name because the lowering replaced it with
+    `Linear(512, out_dim)`, and any *other* key that is unknown or the wrong shape is a
+    refusal -- it would mean this file is not this backbone, and a partly-initialised encoder
+    is the failure mode that still trains and still looks fine.
+    """
+    members = [(n, m) for n, m in model.named_children() if type(m).__name__ == "ResNet"]
+    if not members:
+        raise SystemExit(
+            "--init-backbone: the lowered module has no `ResNet` backbone to initialise. "
+            "Its Learning IR needs a `VisionEncoder { pretrained = true }`; `es train` "
+            "refuses this pairing before it gets here."
+        )
+    fit = {k: v for k, v in tensors.items() if not k.startswith("fc.")}
+    report = []
+    for name, member in members:
+        own = member.state_dict()
+        unknown = sorted(set(fit) - set(own))
+        wrong = sorted(k for k in fit if k in own and tuple(own[k].shape) != tuple(fit[k].shape))
+        if unknown or wrong:
+            raise SystemExit(
+                "--init-backbone: the file does not fit %s: %d unknown key(s) %s, "
+                "%d shape disagreement(s) %s"
+                % (name, len(unknown), unknown[:4], len(wrong), wrong[:4])
+            )
+        member.load_state_dict(fit, strict=False)
+        report.append(
+            {
+                "member": name,
+                "loaded": len(fit),
+                # `fc` and nothing else: named, so a reader never has to guess which tensors
+                # of this backbone the run started from and which it drew at random.
+                "from_scratch": sorted(set(own) - set(fit)),
+                "frozen": not any(p.requires_grad for p in member.parameters()),
+            }
+        )
+    return report
 
 
 def build_policy(module_dir: Path):
@@ -326,6 +384,13 @@ def main(argv: list) -> int:
         help="scale one action channel's absolute error, e.g. --channel-weight 5=5; an index "
         "because channel names are the scene's knowledge, not this script's. Repeatable",
     )
+    p.add_argument(
+        "--init-backbone",
+        type=Path,
+        help="a safetensors file whose keys are a backbone's own `state_dict` names to load into every lowered "
+        "backbone before the first step; `es train` passes the `base_model` its recipe "
+        "names, after verifying its blake3 against the lock file and the pin",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
     p.add_argument(
@@ -365,6 +430,9 @@ def main(argv: list) -> int:
             % a.module
         )
     model = build_policy(a.module).to(device)
+    # Before the probe and before the optimizer: the ImageNet tensors are the module's
+    # initial state, exactly as a resumed checkpoint's would be (packet M7/T5).
+    backbones = init_backbone(model, read_safetensors(a.init_backbone)) if a.init_backbone else []
 
     # The chunk width is the module's own: `ActionChunker` slices the head's horizon down to
     # `execute_chunk`, and asking the module beats re-deriving it from the IR. The probe is one
@@ -407,7 +475,15 @@ def main(argv: list) -> int:
     if total <= 0:
         raise SystemExit("nothing to optimize: %d samples, batch %d" % (len(samples), a.batch))
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=a.lr, weight_decay=a.weight_decay)
+    # `requires_grad` is where the Learning IR's `frozen` arrives: the lowering emits
+    # `requires_grad_(False)` on a `VisionEncoder { frozen = true }`, so `nodes.<k>.*` is out
+    # of the optimizer without any flag on this command line carrying a copy of the IR's
+    # decision (packet M7/T5). With no frozen node this is every parameter, in the same
+    # order, so the default path is the run of before, bit for bit.
+    trainable = [p for p in model.parameters() if p.requires_grad]
+    if not trainable:
+        raise SystemExit("every parameter is frozen; there is nothing to optimize")
+    optimizer = torch.optim.AdamW(trainable, lr=a.lr, weight_decay=a.weight_decay)
     generator = torch.Generator().manual_seed(a.seed)
     # `model` stays the thing whose `state_dict` is written: `torch.compile` returns a wrapper
     # whose parameter names are prefixed, and `checkpoint_tensors` would not recognise them.
@@ -456,7 +532,7 @@ def main(argv: list) -> int:
             loss = ((predicted - target).abs() * weights).mean()
         loss.backward()
         if a.grad_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), a.grad_clip)
+            torch.nn.utils.clip_grad_norm_(trainable, a.grad_clip)
         optimizer.step()
         losses.append(float(loss.detach()))
         if marks and (step + 1) in marks:
@@ -502,6 +578,15 @@ def main(argv: list) -> int:
         "grad_clip": a.grad_clip,
         "lr_curve_hash": lr_curve_hash(applied_lr),
         "chunk": chunk,
+        # What the run started from and what it was allowed to move (packet M7/T5). The
+        # provenance of the file itself is `es train`'s `training/base_model.lock`; this is
+        # the trainer's own account of what it did with it.
+        "init_backbone": str(a.init_backbone) if a.init_backbone else None,
+        "backbones": backbones,
+        "trainable_parameters": sum(p.numel() for p in trainable),
+        "frozen_parameters": sum(
+            p.numel() for p in model.parameters() if not p.requires_grad
+        ),
         "channel_weight": [float(v) for v in weights.tolist()],
         "ports": sorted(shapes),
         "observation_hash": manifest.get("observation_hash"),

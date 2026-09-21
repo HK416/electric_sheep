@@ -24,6 +24,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use es_ir::learning::{LearningGraph, LearningNode};
 use es_ir::observation::{ObservationIr, ObservationNode};
 use es_ir::DatasetHash;
 use serde::{Deserialize, Serialize};
@@ -44,6 +45,25 @@ pub const TRAIN_ACT: &str = "python/es/train_act.py";
 
 /// The columns `lerobot` would turn into extra action heads (packet M5/V8, V19).
 pub const EXPORT_DROP: &str = "action_commanded,action_source,intervention";
+
+/// The one pretrained backbone this repository has approved (spec 29 licence row, owner
+/// decision 2026-09-15: torchvision's `ImageNet` `ResNet18` weights, BSD-3).
+pub const BASE_MODEL_SOURCE: &str = "torchvision.models.ResNet18_Weights.IMAGENET1K_V1";
+
+/// **The pin** (packet M7/T5): the blake3 of the `resnet18-imagenet1k-v1.safetensors`
+/// `python/es/fetch_backbone.py` writes, and the only `base_model` `es train` accepts.
+///
+/// The 45 MB file is not committed — it lives at `~/artifacts/plan-v/m7-t5/` on the oracle
+/// server — so this string is what the repository knows about it, the way
+/// `tests/fixtures/mjcf/*.PROVENANCE.json` pins the upstream MJCF it is derived from. It is
+/// also the single copy: `crates/es-policy/tests/backbone_provenance.rs` reads it out of this
+/// file rather than keeping a second one, and `fetch_backbone.py` is *given* it with
+/// `--expect` rather than holding its own.
+///
+/// Measured identical under torchvision 0.26.0+cu129 and 0.29.0+cpu, which is what makes it a
+/// property of the weights and not of the interpreter that fetched them.
+pub const RESNET18_IMAGENET1K_V1_BLAKE3: &str =
+    "8511928e7ca6e3b07355e8b66284294ba692093fd0dfe246cdf96a6c9e801899";
 
 /// The twelve files of spec 19.3's `training/`, in the order `TrainingIdentity` hashes them.
 pub const FILES: [&str; 12] = [
@@ -94,6 +114,12 @@ pub struct DatasetRef {
 pub struct PolicyRef {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<String>,
+    /// The `resnet18-imagenet1k-v1.safetensors` a `VisionEncoder { pretrained: true }` is
+    /// initialised from (packet M7/T5), with its `.lock.json` beside it. Required by such a
+    /// bundle and refused by any other, so the recipe and the IR cannot disagree about
+    /// whether this run started from `ImageNet`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lerobot: Option<Lerobot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -204,6 +230,15 @@ impl Recipe {
         // Unconditionally, not behind the route test: a schedule that cannot run is refused
         // on both routes, and on this one for a second reason as well.
         let schedule_args = recipe.schedule_args()?;
+        if route == Route::External && recipe.policy.base_model.is_some() {
+            return Err(refuse(
+                "[policy] `base_model` is the IR route's: it initialises a \
+                 `VisionEncoder { pretrained = true }` in this project's Learning IR, and \
+                 `lerobot`'s ACT builds its own backbone from its own \
+                 `pretrained_backbone_weights`. Reach lerobot's through \
+                 `[policy] lerobot.extra`",
+            ));
+        }
         if route == Route::External && !schedule_args.is_empty() {
             return Err(refuse(
                 "[run] `schedule`, `weight_decay` and `grad_clip` are the IR route's: they \
@@ -389,6 +424,111 @@ pub fn has_image_input(obs: &ObservationIr) -> bool {
         .any(|n| matches!(n, ObservationNode::ImageInput { .. }))
 }
 
+/// Does the Learning IR declare a pretrained backbone? Then the recipe owes
+/// `[policy] base_model` (packet M7/T5).
+pub fn has_pretrained_backbone(learning: &LearningGraph) -> bool {
+    learning
+        .nodes
+        .nodes
+        .values()
+        .any(|n| matches!(n, LearningNode::VisionEncoder { pretrained, .. } if *pretrained))
+}
+
+/// `<weights>.lock.json` as `python/es/fetch_backbone.py` writes it, reduced to the fields
+/// that identify **the weights** (spec 19.3's `base_model.lock`).
+///
+/// The lock file beside the artifact also records the `torch` and `torchvision` that fetched
+/// it; those are deliberately not here. Two machines fetching the same upstream file write
+/// byte-identical tensors and different version strings, and carrying the strings into
+/// `base_model.lock` would put the fetching machine into `identity_hash` — so one recipe
+/// would have two identities depending on where its backbone was produced.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Backbone {
+    /// `torchvision.models.ResNet18_Weights.IMAGENET1K_V1`.
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub url: String,
+    /// torchvision's own hash of the `.pth` it downloaded.
+    #[serde(default)]
+    pub sha256_upstream: String,
+    /// blake3 of the safetensors file — the pin.
+    #[serde(default)]
+    pub blake3: String,
+    /// The key the artifact does not carry, named rather than left to be noticed.
+    #[serde(default)]
+    pub dropped: String,
+    #[serde(default)]
+    pub license: String,
+    #[serde(default)]
+    pub license_url: String,
+}
+
+impl Backbone {
+    /// Reads `weights` and the `.lock.json` beside it, and refuses by name unless the three
+    /// claims agree: the file's blake3, the lock file's, and [`RESNET18_IMAGENET1K_V1_BLAKE3`].
+    ///
+    /// A licence field that is empty is a refusal of its own: spec 19.3 makes this file the
+    /// basis for licence tracking, and a provenance record with nothing in that slot tracks
+    /// nothing.
+    pub fn verify(weights: &Path) -> Result<Self, DataError> {
+        let bytes = std::fs::read(weights)
+            .map_err(|e| refuse(format!("[policy] `base_model` {}: {e}", weights.display())))?;
+        let digest = hex(blake3::hash(&bytes).as_bytes());
+        let lock_path = weights.with_extension("lock.json");
+        let text = std::fs::read_to_string(&lock_path).map_err(|e| {
+            refuse(format!(
+                "{}: {e}\nEvery `base_model` travels with the lock file \
+                 `python/es/fetch_backbone.py` writes beside it; it is where the licence and \
+                 the upstream URL come from (spec 19.3)",
+                lock_path.display()
+            ))
+        })?;
+        let lock: Self = serde_json::from_str(&text)
+            .map_err(|e| refuse(format!("{}: {e}", lock_path.display())))?;
+
+        if lock.blake3 != digest {
+            return Err(refuse(format!(
+                "{} does not hash to what {} claims:\n  file  {digest}\n  lock  {}",
+                weights.display(),
+                lock_path.display(),
+                lock.blake3
+            )));
+        }
+        if lock.source != BASE_MODEL_SOURCE {
+            return Err(refuse(format!(
+                "{} names the source {:?}; the one this repository has approved is {:?} \
+                 (spec 29 licence row)",
+                lock_path.display(),
+                lock.source,
+                BASE_MODEL_SOURCE
+            )));
+        }
+        if lock.license.trim().is_empty() {
+            return Err(refuse(format!(
+                "{}: `license` is empty. Spec 19.3 makes base_model.lock the basis for \
+                 licence tracking, and a run whose backbone carries no licence cannot be \
+                 shipped anywhere",
+                lock_path.display()
+            )));
+        }
+        // Last, because the three above ask whether the lock file is a well-formed provenance
+        // record for these bytes and this one asks whether these bytes are the artifact the
+        // repository has actually measured. Both matter; they are different questions.
+        if digest != RESNET18_IMAGENET1K_V1_BLAKE3 {
+            return Err(refuse(format!(
+                "[policy] `base_model` {} is not the pinned backbone:\n  file    \
+                 {digest}\n  pinned  {RESNET18_IMAGENET1K_V1_BLAKE3}\nThe pin is \
+                 `RESNET18_IMAGENET1K_V1_BLAKE3` in crates/es-data/src/training.rs. Re-fetch \
+                 with `python/es/fetch_backbone.py --arch resnet18 --out <dir>`, or move the \
+                 pin deliberately (`--repin`) together with the design note",
+                weights.display()
+            )));
+        }
+        Ok(lock)
+    }
+}
+
 /// The camera directory `es dataset export --frames` looks in, for a feature key like
 /// `observation.images.rgb_overhead` (`lerobot::v3::camera_source`).
 pub fn camera_suffix(feature: &str) -> &str {
@@ -536,6 +676,19 @@ impl Plan {
                     // Appended, and only when the recipe asks for them (packet M7/T4): a
                     // recipe that names no schedule renders the plan it always did.
                     .chain(recipe.schedule_args()?)
+                    // Likewise for the pretrained backbone (packet M7/T5). `frozen` is *not*
+                    // here: it is a field of the IR, so the lowered module carries it and the
+                    // trainer reads it off `requires_grad` -- a copy of it on this line would
+                    // be a second thing that can disagree with the Learning IR.
+                    .chain(
+                        recipe
+                            .policy
+                            .base_model
+                            .iter()
+                            .flat_map(|path| [s("--init-backbone"), path.clone()]),
+                    )
+                    // Last, because `[run] extra` is by definition what comes after everything
+                    // this module derives (packet M7/T2).
                     .chain(run.extra.iter().cloned())
                     .collect(),
                     step: None,
@@ -1137,6 +1290,7 @@ impl Training {
         out: &Path,
         interpreter: &str,
         data: &DatasetFacts,
+        backbone: Option<&Backbone>,
     ) -> Result<Self, DataError> {
         let run = &recipe.run;
         let route = plan.route;
@@ -1173,7 +1327,14 @@ impl Training {
             }),
         };
         let base_model = match route {
-            Route::Ir => json!({"source": "none"}),
+            // Packet M7/T5: a *verified* provenance. `es train` hashed the file, agreed with
+            // the lock beside it and with the pin, and what goes into the slot is what the
+            // lock said about the weights -- not about the machine that fetched them.
+            Route::Ir => match backbone {
+                Some(lock) => serde_json::to_value(lock)
+                    .map_err(|e| refuse(format!("base_model.lock does not serialise: {e}")))?,
+                None => json!({"source": "none"}),
+            },
             // A *declared* provenance: `lerobot`'s ACT builds `vision_backbone` with these
             // weights unless `extra` overrides it (docs/api-notes/lerobot-config.md). The
             // weights' own digest and licence are packet T5's; claiming them here would be
@@ -1259,7 +1420,10 @@ impl Training {
             files,
             dataset: data.hashes,
             base_source,
-            base_license: s("unset"),
+            // The licence slot of `TrainingIdentity`, real at last on the IR route: spec 19.3
+            // makes the backbone's licence part of the run's identity, so a run that changed
+            // nothing but the licence of its base model is a different run.
+            base_license: backbone.map_or_else(|| s("unset"), |b| b.license.clone()),
         })
     }
 
@@ -1289,9 +1453,10 @@ impl Training {
 
     /// Spec 19.3's twelve slots, each the blake3 of the file that holds it.
     ///
-    /// `base_model` carries the declared provenance strings and the digest of
-    /// `base_model.lock` itself; the backbone weights' own hash is inside that file, unset
-    /// until packet T5.
+    /// `base_model` carries the provenance strings and the digest of `base_model.lock`
+    /// itself; the backbone weights' own blake3 is inside that file — real on the IR route
+    /// when the recipe names one (packet M7/T5), still a *declared* string on the external
+    /// route, where nothing on this side downloaded or verified `lerobot`'s backbone.
     pub fn identity(&self) -> TrainingIdentity {
         TrainingIdentity {
             config: self.digest("config.json"),
@@ -1447,10 +1612,24 @@ device = "cuda"
     fn the_identity_is_a_function_of_the_recipe_and_not_of_out() {
         let (recipe, plan_a) = plan_of(IR, "/tmp/a");
         let (_, plan_b) = plan_of(IR, "/tmp/b");
-        let a =
-            Training::pre_run(&recipe, &plan_a, Path::new("/tmp/a"), "python", &facts()).unwrap();
-        let b =
-            Training::pre_run(&recipe, &plan_b, Path::new("/tmp/b"), "python", &facts()).unwrap();
+        let a = Training::pre_run(
+            &recipe,
+            &plan_a,
+            Path::new("/tmp/a"),
+            "python",
+            &facts(),
+            None,
+        )
+        .unwrap();
+        let b = Training::pre_run(
+            &recipe,
+            &plan_b,
+            Path::new("/tmp/b"),
+            "python",
+            &facts(),
+            None,
+        )
+        .unwrap();
         assert_eq!(a.hash().unwrap(), b.hash().unwrap());
 
         // ... and it moves with the two knobs the packet names.
@@ -1462,7 +1641,8 @@ device = "cuda"
                 .collect::<Vec<_>>()
                 .join("\n");
             let (r2, p2) = plan_of(&text, "/tmp/a");
-            let c = Training::pre_run(&r2, &p2, Path::new("/tmp/a"), "python", &facts()).unwrap();
+            let c =
+                Training::pre_run(&r2, &p2, Path::new("/tmp/a"), "python", &facts(), None).unwrap();
             assert_ne!(a.hash().unwrap(), c.hash().unwrap(), "{edit}");
         }
     }
@@ -1471,7 +1651,15 @@ device = "cuda"
     #[test]
     fn every_slot_is_a_real_digest_of_a_real_file() {
         let (recipe, plan) = plan_of(EXTERNAL, "/tmp/x");
-        let t = Training::pre_run(&recipe, &plan, Path::new("/tmp/x"), "python", &facts()).unwrap();
+        let t = Training::pre_run(
+            &recipe,
+            &plan,
+            Path::new("/tmp/x"),
+            "python",
+            &facts(),
+            None,
+        )
+        .unwrap();
         for name in FILES {
             serde_json::from_str::<Value>(t.file(name))
                 .unwrap_or_else(|e| panic!("{name} is not canonical JSON: {e}"));
@@ -1501,8 +1689,15 @@ device = "cuda"
     #[test]
     fn finishing_moves_the_hash() {
         let (recipe, plan) = plan_of(IR, "/tmp/x");
-        let mut t =
-            Training::pre_run(&recipe, &plan, Path::new("/tmp/x"), "python", &facts()).unwrap();
+        let mut t = Training::pre_run(
+            &recipe,
+            &plan,
+            Path::new("/tmp/x"),
+            "python",
+            &facts(),
+            None,
+        )
+        .unwrap();
         let before = t.hash().unwrap();
         t.finish(
             &json!({"checkpoints": []}),
@@ -1531,8 +1726,15 @@ device = "cuda"
                 "{flag} is on a plan that asked for none"
             );
         }
-        let before =
-            Training::pre_run(&recipe, &plan, Path::new("/tmp/a"), "python", &facts()).unwrap();
+        let before = Training::pre_run(
+            &recipe,
+            &plan,
+            Path::new("/tmp/a"),
+            "python",
+            &facts(),
+            None,
+        )
+        .unwrap();
         assert_eq!(
             before.file("scheduler.json"),
             "{\"kind\":\"constant\",\"lr\":0.0001}\n"
@@ -1556,7 +1758,8 @@ device = "cuda"
             ),
             "{rendered}"
         );
-        let after = Training::pre_run(&r2, &p2, Path::new("/tmp/a"), "python", &facts()).unwrap();
+        let after =
+            Training::pre_run(&r2, &p2, Path::new("/tmp/a"), "python", &facts(), None).unwrap();
         assert_eq!(
             after.file("scheduler.json"),
             "{\"kind\":\"warmup_cosine\",\"lr\":0.0001,\"lr_min\":1e-6,\"total_steps\":20000,\
@@ -1718,6 +1921,83 @@ fov = 36
             "{}",
             plan.render(Path::new("/tmp/x"))
         );
+    }
+
+    /// Packet M7/T5. `[policy] base_model` is the IR route's, it puts `--init-backbone` on
+    /// the trainer's line, and a recipe that names none renders the plan it always did.
+    #[test]
+    fn base_model_is_the_ir_routes_and_reaches_the_trainer() {
+        let (_, plan) = plan_of(IR, "/tmp/a");
+        assert!(
+            !plan.render(Path::new("/tmp/a")).contains("--init-backbone"),
+            "a recipe that named no base_model got one"
+        );
+
+        let named = IR.replace(
+            "bundle = \"untrained.esb\"",
+            "bundle = \"untrained.esb\"\nbase_model = \"backbones/resnet18.safetensors\"",
+        );
+        let (_, plan) = plan_of(&named, "/tmp/a");
+        let rendered = plan.render(Path::new("/tmp/a"));
+        assert!(
+            rendered.contains("--init-backbone backbones/resnet18.safetensors"),
+            "{rendered}"
+        );
+        // `frozen` is the IR's and stays there: the lowered module carries it.
+        assert!(
+            !rendered.contains("--frozen") && !rendered.contains("--freeze"),
+            "{rendered}"
+        );
+
+        let external = EXTERNAL.replace(
+            "task = \"task.toml\"",
+            "task = \"task.toml\"\nbase_model = \"backbones/resnet18.safetensors\"",
+        );
+        let e = Recipe::parse(&external).expect_err("refused");
+        assert!(e.to_string().contains("base_model"), "{e}");
+    }
+
+    /// The verified lock is what `base_model.lock` holds, and it moves `training_hash`.
+    #[test]
+    fn a_verified_backbone_fills_the_base_model_slot() {
+        let (recipe, plan) = plan_of(IR, "/tmp/a");
+        let none = Training::pre_run(
+            &recipe,
+            &plan,
+            Path::new("/tmp/a"),
+            "python",
+            &facts(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(none.file("base_model.lock"), "{\"source\":\"none\"}\n");
+
+        let lock = Backbone {
+            source: s(BASE_MODEL_SOURCE),
+            url: s("https://download.pytorch.org/models/resnet18-f37072fd.pth"),
+            sha256_upstream: s("f37072fd"),
+            blake3: s(RESNET18_IMAGENET1K_V1_BLAKE3),
+            dropped: s("*.num_batches_tracked"),
+            license: s("BSD-3-Clause"),
+            license_url: s("https://github.com/pytorch/vision/blob/main/LICENSE"),
+        };
+        let with = Training::pre_run(
+            &recipe,
+            &plan,
+            Path::new("/tmp/a"),
+            "python",
+            &facts(),
+            Some(&lock),
+        )
+        .unwrap();
+        let written: Value = serde_json::from_str(with.file("base_model.lock")).unwrap();
+        assert_eq!(written["blake3"], RESNET18_IMAGENET1K_V1_BLAKE3);
+        assert_eq!(written["license"], "BSD-3-Clause");
+        // The fetching machine's torch version is deliberately absent: it would make one
+        // recipe have two identities depending on where its backbone was produced.
+        assert!(written.get("torch").is_none(), "{written}");
+        assert_eq!(with.identity().base_model.license, "BSD-3-Clause");
+        assert_ne!(none.hash().unwrap(), with.hash().unwrap());
     }
 
     #[test]

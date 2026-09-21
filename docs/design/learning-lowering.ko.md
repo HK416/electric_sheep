@@ -326,6 +326,103 @@ GPU가 아직 포화되지 않았고 다음 지렛대는 또 다른 플래그가
 것은 96×96 이미지 8장에 대한 ResNet18 forward 한 번과 AdamW 스텝이다. 다음에 깰 숫자는 초당
 샘플 열이다.
 
+### 5.3 `pretrained`
+
+**규칙.** *사전학습된 backbone은 다른 무엇과도 같은 체크포인트다 — 생성 시점의 네트워크가
+아니라 `es policy pack` / `es train`을 통해 들어오며, 그 프로버넌스는 `base_model.lock`이다.*
+
+패킷 M7/T5; spec 8.3, 2.5, 5.3, 19.3, 29. `VisionEncoder { pretrained: true }`는 M5 내내
+거부되었고(7.6절, 미해결 질문 6), 그 거부의 두 가지 반론은 어느 쪽도 완화되지 않았으므로 다시
+적어 둘 가치가 있다:
+
+1. 플래그를 존중한다는 것은 `weights="DEFAULT"`를 뜻했고, 그러면 `EsPolicy()`가 *생성할
+   때마다* 네트워크로 ImageNet 가중치를 받아오게 된다 — 추론 시점의 `TorchRuntime::load`
+   안에서도 그러하며, 거기서는 `load_state_dict(strict=True)`가 잠시 뒤 그 전부를 덮어쓴다.
+   인스턴스화에 네트워크가 필요한 lowering은 spec 2.5에 어긋난다;
+2. 아무도 해시하지 않은 가중치는 체인 밖에 있다(spec 5.3).
+
+둘 다 플래그가 아니라 **텐서가 어디서 오는가**에 관한 것이다. 그래서 이제 플래그는
+lowering되고, 텐서는 다른 곳에서 온다:
+
+```python
+def _frozen_backbone(name, out_dim, frozen):
+    import torchvision
+    from torchvision.ops.misc import FrozenBatchNorm2d
+
+    m = getattr(torchvision.models, name)(weights=None, norm_layer=FrozenBatchNorm2d)
+    m.fc = nn.Linear(m.fc.in_features, out_dim)
+    if frozen:
+        m.requires_grad_(False)
+    return m
+```
+
+`weights=None`이며, `es policy lower`의 오라클은 생성된 소스에 `"DEFAULT"`도, `IMAGENET1K`도,
+`ResNet18_Weights`도, `download`도 없음을 단언한다
+(`lower::torch::tests::a_pretrained_backbone_lowers_frozen`, Python 불필요).
+
+**텐서는 실제로 어디서 오는가.** `python/es/fetch_backbone.py --arch resnet18 --out <dir>`는
+Python이 일급 의존성인 학습 경로(spec 2.3)에서 torchvision의 ImageNet ResNet18을 **한 번**
+인스턴스화하고 두 파일을 쓴다: `resnet18-imagenet1k-v1.safetensors`(torchvision 자신의 키
+이름 아래의 모든 float `state_dict` 텐서)와 `resnet18-imagenet1k-v1.lock.json`. pickle 읽기는
+torchvision 자신의 다운로더 안에서 일어난다; `es`는 결코 `.pth`를 열지 않으며, INV-16은 *이
+프로젝트의* 로더가 무엇을 받아들이는가에 관한 것이고 그것들은 safetensors를 받아들인다. 그
+다음부터 텐서는 평범한 체크포인트다: `es train`이 검증하고, `train_act.py --init-backbone`이
+첫 스텝 전에 `nodes.<k>.` 아래로 적재하며, `es policy pack --weights`는 학습된 체크포인트를
+받아들이는 것과 똑같이 그것들을 받아들인다.
+
+**`FrozenBatchNorm2d`, 그래서 V13의 규칙이 살아남는다.** `lerobot.rs`는 이미 LeRobot ACT의
+backbone을 이렇게 lowering하며(V8/V19), 그 이유는 여기에도 그대로 적용된다: ImageNet의
+BatchNorm affine 파라미터와 실행 통계량이 *상수*가 되고, 상수로만 이루어진 모듈에는
+`training` 분기가 없다. 그래서 `train()`과 `eval()`은 비트 단위로 하나의 함수이며, 이는 5.1절이
+`GroupNorm`에 요구한 바로 그 성질이다 — 두 분기가 서로 다른 경로로 같은 성질에 도달하고,
+`ir_training::the_pretrained_backbone_has_no_training_mode`가 실제 아티팩트에 대해 그것을
+단언한다. `num_batches_tracked`는 구조적으로 없다: `FrozenBatchNorm2d`에는 그런 버퍼가 없고,
+그것은 가중치가 아니라 int64 카운터이며, 이 프로젝트가 읽는 safetensors 레이아웃은 F32뿐이다
+— 그래서 `fetch_backbone.py`가 그것을 버리고 lock 파일이 버려진 것을 이름으로 적는다.
+
+**`frozen`은 lowering되지, 전달되지 않는다.** `frozen: true`는 `m.requires_grad_(False)`를
+내보내고, `train_act.py`는 `[p for p in model.parameters() if p.requires_grad]` 위에 `AdamW`를
+만든다. 그것을 위한 트레이너 플래그는 **의도적으로 없다**: `frozen`은 Learning IR의 필드이고,
+명령줄 위의 사본은 IR과 어긋날 수 있는 두 번째 것이 된다 — 그것이 애초에 V2b가 거부한
+실패다. 아무것도 얼지 않았다면 그 목록은 같은 순서의 모든 파라미터이므로, 기본 경로는 이
+패킷 이전의 실행과 비트 단위로 동일하다.
+`ir_training::frozen_excludes_the_backbone_from_the_optimizer`는 weight decay 0.1로 20스텝을
+돌리고 — 옵티마이저에 *남아 있는* 파라미터라면 gradient가 없어도 느낄 감쇠다 — 모든 backbone
+텐서를 아티팩트와 비트 단위로 비교한다.
+
+**이 패킷이 내리고 묻는 대신 기록하는 두 결정.**
+
+- `pretrained: false, frozen: true`는 이제 **거부된다**. 옵티마이저에서 제외된, 처음부터
+  학습하는 backbone은 아무도 고르지 않은 무작위 사영이며 그것을 학습시킬 것은 아무것도 없다.
+  존중하거나 거부하거나 — 말없이 버리는 것이 V2b가 다룬 문제였다. 커밋된 `learning.toml`은
+  `frozen = false`이므로 어떤 픽스처도 움직이지 않는다.
+- 거부는 **코드가 아니라 이름으로** 한다. 패킷은 `TRAIN-0xx`라고 쓰지만, `es-data`의 training
+  모듈과 `es train`은 숫자 코드를 가진 적이 없다 — 거기의 모든 거부는 필드와 파일을 이름으로
+  댄다. 메시지 다섯 개를 위해 고안된 번호 체계는 사용자가 하나뿐인 체계이므로, 이 다섯은
+  이웃들이 하는 방식대로 `base_model`, lock 파일, 고정값, 라이선스, `pretrained = true`를
+  이름으로 댄다.
+
+**해시 결과**, 데모 자신의 문서에서 측정:
+
+| | `learning.toml` | `learning-pretrained.toml` |
+|---|---|---|
+| `learning_hash` | `5dac0a46…6dc446f0` | `fdb5178a…64ac699e` |
+| `policy_hash` | `c94c2732…2bd84a07` | `d5e152b9…9ebc0976` |
+| `lowering_hash` | `3d06811c…d8a2d394` | `41d11a06…b06a6841` |
+| `task_hash` / `observation_hash` | `eb6efefa…` / `899c16a9…` | **불변** |
+
+여기서 세 가지를 읽는다. `learning_hash`가 움직이는 것은 `pretrained`가 spec 8.3의 노드
+필드이고 언제나 그랬기 때문이다 — 이 패킷이 한 일이 아니다. `lowering_hash`는 사전학습된
+그래프에 대해서**만** 움직인다: `_frozen_backbone`은 `_backbone` 대신이 아니라 그 옆에
+내보내지므로, 사전학습 인코더가 없는 그래프는 `visible-learning.md` 7절의 모든 숫자가 측정된
+바로 그 소스로 바이트 단위 동일하게 lowering되며,
+`ir_training::the_demo_lowering_hash_moves_only_for_the_pretrained_graph`가 그 리터럴을
+고정한다. 그리고 `task_hash` / `observation_hash`는 움직이지 않으므로, 두 문서는 baked
+observation 집합과 `evaluation.toml`을 공유하고 U-측정의 변수는 정확히 하나다.
+
+열두 번째 결과는 spec 19.3의 것이다: `training_hash`가 **0도 `unset`도 아닌** `base_model`
+슬롯을 얻는다 — source, URL, 업스트림 sha256, blake3, 라이선스. `training-recipe.md` 4절 참고.
+
 ## 6. Tier-4 허용오차 (spec 8.9)
 
 spec 8.9의 표는 `PolicyRuntime` 쌍에 대한 것이다:

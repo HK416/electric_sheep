@@ -1401,3 +1401,380 @@ sys.stdout.write(
     )
 )
 "#;
+
+// --- packet M7/T5: the pretrained backbone ---------------------------------------------------
+
+/// The demo bundle built from `learning-pretrained.toml` instead of `learning.toml` — the same
+/// graph with `pretrained = true` — with `frozen` overridden when the caller asks.
+fn pretrained_bundle(dir: &Path, frozen: bool) -> (PathBuf, PolicyBundle) {
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let mut learning = es_ir::serial::learning_from_toml(&read("learning-pretrained.toml"))
+        .expect("learning-pretrained.toml");
+    for node in learning.nodes.nodes.values_mut() {
+        if let es_ir::learning::LearningNode::VisionEncoder { frozen: f, .. } = node {
+            *f = frozen;
+        }
+    }
+    let weights = b"es-t5-untrained-placeholder".to_vec();
+    learning.policy.weights = WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let bytes = PolicyBundle::build(
+        &es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml"),
+        &es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml"),
+        &learning,
+        &es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml"),
+        &weights,
+    )
+    .expect("the pretrained demo documents pack into a bundle");
+    let path = dir.join(if frozen {
+        "pretrained-frozen.esb"
+    } else {
+        "pretrained.esb"
+    });
+    std::fs::write(&path, &bytes).expect("write the pretrained bundle");
+    let opened = PolicyBundle::open(&bytes).expect("the bundle just written opens");
+    (path, opened)
+}
+
+/// The pinned blake3, read out of `crates/es-data/src/training.rs`.
+///
+/// One copy of that number exists in this repository and this is not it: `es-data` is layer 10
+/// and this crate is layer 8 (spec 4.2), so the constant cannot be imported, and a second
+/// literal would be a second thing to forget. The file is read as text.
+fn pinned_blake3() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../es-data/src/training.rs");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let after = text
+        .split_once("pub const RESNET18_IMAGENET1K_V1_BLAKE3: &str =")
+        .unwrap_or_else(|| panic!("{}: the pin is gone", path.display()))
+        .1;
+    after
+        .split('"')
+        .nth(1)
+        .expect("the pin is a string literal")
+        .to_owned()
+}
+
+/// `python/es/fetch_backbone.py`, next to the trainer.
+fn fetch_backbone_py() -> PathBuf {
+    train_act_py()
+        .parent()
+        .expect("python/es")
+        .join("fetch_backbone.py")
+}
+
+/// The `ImageNet` artifact, fetched once and reused.
+///
+/// `ES_BACKBONE_DIR` names where it lives — `~/artifacts/plan-v/m7-t5` on the oracle server.
+/// Without it the script is run into a scratch directory; torchvision caches the `.pth`, so
+/// the second test of a session pays for serialization and not for the download.
+fn backbone_artifact(python: &str, dir: &Path) -> Result<PathBuf, String> {
+    let out = std::env::var("ES_BACKBONE_DIR").map_or_else(|_| dir.join("backbone"), PathBuf::from);
+    let file = out.join("resnet18-imagenet1k-v1.safetensors");
+    if file.is_file() {
+        return Ok(file);
+    }
+    let done = Command::new(python)
+        .arg(fetch_backbone_py())
+        .args(["--arch", "resnet18", "--out"])
+        .arg(&out)
+        .args(["--expect", &pinned_blake3()])
+        .output()
+        .map_err(|e| format!("{python}: {e}"))?;
+    if !done.status.success() {
+        return Err(format!(
+            "fetch_backbone.py: {}",
+            String::from_utf8_lossy(&done.stderr).trim_end()
+        ));
+    }
+    Ok(file)
+}
+
+/// Oracle 2 of packet M7/T5. The pretrained backbone is initialised from the artifact and
+/// **still has no training mode**: `FrozenBatchNorm2d`'s affine constants and running
+/// statistics do not read `self.training`, so `train()` and `eval()` are one function, bit for
+/// bit. That is V13's rule kept — what the optimizer minimizes is what `torch_ref.py` deploys.
+///
+/// The second half is what makes the hash chain mean something here: every tensor the module
+/// ends up holding is bitwise the tensor in the file whose blake3 `es train` verified. A loader
+/// that transposed, cast or averaged anything would pass the first half and fail this.
+#[test]
+#[ignore = "needs torch and torchvision"]
+fn the_pretrained_backbone_has_no_training_mode() {
+    let python = match python_with_torch() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP the_pretrained_backbone_has_no_training_mode: {why}");
+            return;
+        }
+    };
+    let dir = scratch_dir("pretrained-train-eval");
+    let artifact = match backbone_artifact(&python, &dir) {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP the_pretrained_backbone_has_no_training_mode: {why}");
+            return;
+        }
+    };
+    let (path, _) = pretrained_bundle(&dir, false);
+    let (build, _) = lowered(&dir, &path);
+
+    let script = dir.join("pretrained_probe.py");
+    std::fs::write(&script, PRETRAINED_PROBE_PY).expect("write the probe");
+    let out = run(
+        &python,
+        &[
+            &script.to_string_lossy(),
+            &train_act_py().to_string_lossy(),
+            &build.to_string_lossy(),
+            &artifact.to_string_lossy(),
+        ],
+    );
+    let report = text(&out);
+    assert!(
+        out.status.success(),
+        "the pretrained probe failed:\n{report}"
+    );
+    println!(
+        "RAN the_pretrained_backbone_has_no_training_mode: {}",
+        report.trim()
+    );
+}
+
+/// argv is `<train_act.py> <module dir> <artifact.safetensors>`; exits non-zero with what
+/// disagreed. `train_act.py` is `exec`'d rather than reimplemented — the loader under test is
+/// the one the trainer uses, not a second copy of it.
+const PRETRAINED_PROBE_PY: &str = r#"
+import json, sys
+from pathlib import Path
+import torch
+trainer, module_dir, artifact = sys.argv[1], sys.argv[2], sys.argv[3]
+train_act = {"__name__": "es_train_act_probe"}
+exec(compile(open(trainer, encoding="utf-8").read(), trainer, "exec"), train_act)
+namespace = {}
+exec(compile(open(module_dir + "/es_policy.py").read(), "<es-policy>", "exec"), namespace)
+
+model = namespace["EsPolicy"]()
+# No network at construction: the module was built before any of this, and what follows is the
+# only thing that gives it ImageNet tensors (spec 2.5).
+tensors = train_act["read_safetensors"](Path(artifact))
+report = train_act["init_backbone"](model, tensors)
+
+backbones = [(n, m) for n, m in model.named_children() if type(m).__name__ == "ResNet"]
+assert backbones, "the pretrained graph must instantiate a backbone"
+
+# Bitwise, not close: a checkpoint is bytes, and `es train` verified the blake3 of these.
+loaded = 0
+for name, member in backbones:
+    own = member.state_dict()
+    for key, value in tensors.items():
+        if key.startswith("fc."):
+            continue
+        assert torch.equal(own[key].cpu(), value), "%s.%s is not the file's tensor" % (name, key)
+        loaded += 1
+
+# FrozenBatchNorm2d is an affine pair and a statistics pair, all four constants -- which is
+# exactly why the two modes agree.
+stats = [k for k in model.state_dict() if k.endswith(("running_mean", "running_var"))]
+assert stats, "a frozen BatchNorm keeps its statistics as constants; none survived"
+assert not [
+    k for k in model.state_dict() if k.endswith("num_batches_tracked")
+], "num_batches_tracked has no place in a frozen norm"
+
+shapes = json.load(open(module_dir + "/contract.json"))["inputs"]
+image = [s for s in shapes.values() if len(s) == 3][0]
+x = torch.rand([2] + image, generator=torch.Generator().manual_seed(0))
+for name, backbone in backbones:
+    with torch.no_grad():
+        model.train()
+        trained = backbone(x)
+        model.eval()
+        deployed = backbone(x)
+    assert torch.equal(trained, deployed), "%s: train() and eval() differ by %g" % (
+        name,
+        (trained - deployed).abs().max(),
+    )
+sys.stdout.write(
+    json.dumps(
+        {
+            "backbones": report,
+            "tensors_bitwise_equal": loaded,
+            "frozen_statistics": len(stats),
+            "train_equals_eval": True,
+        }
+    )
+)
+"#;
+
+/// Oracle 5 of packet M7/T5. `frozen: true` means the optimizer never sees `nodes.<k>.*`: after
+/// 20 steps every backbone tensor is bitwise what the artifact held, and the head moved.
+///
+/// Both halves matter. Unchanged alone would also be true of a run that did nothing; a moved
+/// head is what says the 20 steps happened. And "bitwise" is the right comparison because
+/// `AdamW` with a non-zero weight decay moves a parameter that has no gradient, so a backbone
+/// merely left in the optimizer would drift — quietly, and only in the last bits.
+#[test]
+#[ignore = "needs torch, torchvision and pyarrow"]
+fn frozen_excludes_the_backbone_from_the_optimizer() {
+    let python = match python_with_torch() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP frozen_excludes_the_backbone_from_the_optimizer: {why}");
+            return;
+        }
+    };
+    let dir = scratch_dir("frozen-backbone");
+    let artifact = match backbone_artifact(&python, &dir) {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP frozen_excludes_the_backbone_from_the_optimizer: {why}");
+            return;
+        }
+    };
+    let (path, _) = pretrained_bundle(&dir, true);
+    let (build, _) = lowered(&dir, &path);
+    let baked = mini_baked(&python, &dir, &path);
+
+    let trained = dir.join("frozen.safetensors");
+    let done = run(
+        &python,
+        &[
+            &train_act_py().to_string_lossy(),
+            "--module",
+            &build.to_string_lossy(),
+            "--baked",
+            &baked.to_string_lossy(),
+            "--out",
+            &trained.to_string_lossy(),
+            "--init-backbone",
+            &artifact.to_string_lossy(),
+            "--batch",
+            "4",
+            "--seed",
+            "0",
+            "--checkpoint-at",
+            "20",
+            // A weight decay a frozen parameter would feel if it were in the optimizer.
+            "--weight-decay",
+            "0.1",
+        ],
+    );
+    assert!(
+        done.status.success(),
+        "the trainer failed:\n{}",
+        text(&done)
+    );
+    let summary: serde_json::Value = serde_json::from_str(
+        String::from_utf8_lossy(&done.stdout)
+            .lines()
+            .last()
+            .unwrap_or_default(),
+    )
+    .expect("the trainer prints one JSON line");
+    assert!(
+        summary["frozen_parameters"].as_u64().unwrap_or(0) > 1_000_000,
+        "a frozen ResNet18 is millions of parameters: {summary}"
+    );
+    assert!(
+        summary["trainable_parameters"].as_u64().unwrap_or(0) > 0,
+        "{summary}"
+    );
+
+    let script = dir.join("compare.py");
+    std::fs::write(&script, FROZEN_COMPARE_PY).expect("write the comparison");
+    let out = run(
+        &python,
+        &[
+            &script.to_string_lossy(),
+            &train_act_py().to_string_lossy(),
+            &artifact.to_string_lossy(),
+            &trained.to_string_lossy(),
+        ],
+    );
+    let report = text(&out);
+    assert!(out.status.success(), "{report}");
+    println!(
+        "RAN frozen_excludes_the_backbone_from_the_optimizer: {}\n  trainer: {summary}",
+        report.trim()
+    );
+}
+
+/// argv is `<train_act.py> <artifact.safetensors> <trained.safetensors>`; exits non-zero when a
+/// frozen tensor moved or when nothing outside the backbone is there at all.
+const FROZEN_COMPARE_PY: &str = r#"
+import json, sys
+from pathlib import Path
+import torch
+trainer, artifact, trained = sys.argv[1], sys.argv[2], sys.argv[3]
+train_act = {"__name__": "es_train_act_probe"}
+exec(compile(open(trainer, encoding="utf-8").read(), trainer, "exec"), train_act)
+read = train_act["read_safetensors"]
+before, after = read(Path(artifact)), read(Path(trained))
+
+# The checkpoint is keyed `nodes.<k>.<rest>`; the artifact is keyed torchvision's way.
+node = None
+for key in after:
+    if key.startswith("nodes.") and key.endswith(".conv1.weight"):
+        node = key.split(".")[1]
+assert node is not None, "no backbone in the checkpoint: %s" % sorted(after)[:8]
+
+held = 0
+for key, value in before.items():
+    if key.startswith("fc."):
+        continue
+    mapped = "nodes.%s.%s" % (node, key)
+    assert mapped in after, "%s is not in the checkpoint" % mapped
+    assert torch.equal(after[mapped], value), "%s moved under frozen = true" % mapped
+    held += 1
+
+head = [k for k in after if not k.startswith("nodes.%s." % node)]
+assert head, "the checkpoint holds nothing but the backbone"
+sys.stdout.write(
+    json.dumps({"frozen_tensors_unchanged": held, "other_tensors": len(head), "node": node})
+)
+"#;
+
+/// The packet's hash rule, without an interpreter: `lowering_hash` moves for the pretrained
+/// graph and for no other, and the committed `learning.toml` is exactly where it was.
+///
+/// The literal is the demo's own, recorded in `docs/design/learning-lowering.md` section 5.3.
+/// It is the one that matters: every measured run in `docs/design/visible-learning.md`
+/// section 7 names it, and this packet is not allowed to move it.
+#[test]
+fn the_demo_lowering_hash_moves_only_for_the_pretrained_graph() {
+    let dir = scratch_dir("lowering-hash");
+    let (_, scratch) = demo_bundle(&dir);
+    let (_, pre) = pretrained_bundle(&dir, false);
+    let from_scratch = lower_to_torch(&scratch.learning).expect("the demo graph lowers");
+    let pretrained = lower_to_torch(&pre.learning).expect("the pretrained graph lowers");
+    let hex = |d: &[u8; 32]| {
+        use std::fmt::Write as _;
+        d.iter().fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
+    };
+
+    assert_eq!(
+        hex(&from_scratch.lowering_hash),
+        FROM_SCRATCH_LOWERING_HASH,
+        "packet M7/T5 moved the from-scratch lowering; every number in design note \
+         `visible-learning.md` section 7 was measured under the old one"
+    );
+    assert_ne!(
+        from_scratch.lowering_hash, pretrained.lowering_hash,
+        "the two graphs lower to the same source"
+    );
+    println!(
+        "from-scratch lowering_hash {}\npretrained   lowering_hash {}",
+        hex(&from_scratch.lowering_hash),
+        hex(&pretrained.lowering_hash)
+    );
+}
+
+/// The demo's `lowering_hash` as packet M7/T3 left it (design note `learning-lowering.md`
+/// section 5.2's table).
+const FROM_SCRATCH_LOWERING_HASH: &str =
+    "3d06811c52b6887f021440d4ce9a1a061e4eb27a0abb97c79822acd4d8a2d394";
