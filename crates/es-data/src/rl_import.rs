@@ -612,7 +612,13 @@ fn joint_unit(space: ActionSpace) -> &'static str {
 fn source_name(source: &ObsSource) -> String {
     match source {
         ObsSource::Sensor { id, .. } => format!("Sensor({id})"),
-        ObsSource::JointState { body, dof } => format!("JointState({body}, dof {dof})"),
+        ObsSource::JointState {
+            body,
+            dof,
+            quantity,
+        } => {
+            format!("JointState({body}, dof {dof}, {quantity:?})")
+        }
         ObsSource::BodyPose(id) => format!("BodyPose({id})"),
         ObsSource::Language => "Language".to_owned(),
     }
