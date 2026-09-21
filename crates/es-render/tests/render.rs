@@ -1392,6 +1392,140 @@ fn ssim_is_one_for_identical_and_falls_with_noise() {
     }
 }
 
+/// The §15.3 `RS`/`PT` colour similarity, measured for the first time (packet M7/R3): `Rs`
+/// `Full` at the R2 preset (`ssaa 2`) against a converged `Pt` NEE render, on Cornell and on
+/// the SO-101 cell through V9's showcase camera.
+///
+/// Not an assertion. Spec 15.3 asks for an SSIM *threshold* and this is the measurement that
+/// number has to be set from; asserting one here would be asserting a number nobody has
+/// looked at yet. The figures land in `docs/design/renderer.md` section 10 and the raw tiles
+/// under `target/plan-u/r3/` for a human to look at. Run with
+/// `cargo test -p es-render --release -- --ignored --nocapture rs_pt_ssim`.
+///
+/// The SO-101 half needs a device: 320x180 at 1,024 spp is minutes of CPU. It is split into
+/// chunks of 64 spp with different seeds and averaged on the host, so no single dispatch can
+/// trip a driver watchdog — a different estimator from one 1,024 spp dispatch, equally
+/// unbiased, and the only one that runs on a desktop Windows box.
+#[test]
+#[ignore = "measurement; run explicitly"]
+fn rs_pt_ssim() {
+    const W: u32 = 320;
+    const H: u32 = 180;
+    const CHUNKS: u32 = 16;
+    const CHUNK_SPP: u32 = 64;
+    let out = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/plan-u/r3");
+    std::fs::create_dir_all(&out).expect("output dir");
+    let dump = |name: &str, bytes: &[u8], w: u32, h: u32| {
+        let path = out.join(format!("{name}.bin"));
+        std::fs::write(&path, bytes).expect("write");
+        std::fs::write(
+            out.join(format!("{name}.json")),
+            format!("{{\"dtype\":\"u8\",\"shape\":[{h},{w},3]}}\n"),
+        )
+        .expect("write");
+        println!("wrote {}", path.display());
+    };
+
+    // Exposure sweep, because a single exposure conflates two different things: the two
+    // paths model *different lighting* (`Rs Full` is a hemisphere ambient plus a directional
+    // light with no interreflection; `Pt` is one emissive panel with global illumination) and
+    // SSIM punishes a brightness offset as hard as a structural one. Sweeping says what the
+    // best any exposure can do is, which is the number a structural threshold belongs on.
+    let sweep = |label: &str, rs: &[u8], radiance: &[f32], w: u32, h: u32| -> [Vec<u8>; 2] {
+        let mut best = (0.0f64, 1.0f32);
+        let mut kept = [Vec::new(), Vec::new()];
+        for exposure in [0.5f32, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0] {
+            let pt: Vec<u8> = radiance
+                .chunks_exact(3)
+                .flat_map(|p| {
+                    cpu::tonemap_to_u8([p[0], p[1], p[2]], exposure, es_render::Tonemap::Reinhard)
+                })
+                .collect();
+            let s = es_render::ssim(rs, &pt, w, h);
+            let mean = pt.iter().map(|b| u32::from(*b)).sum::<u32>() / pt.len() as u32;
+            println!(
+                "| {label} {w}x{h} | Reinhard, exposure {exposure} | SSIM {s:.4} | mean byte \
+                 {mean} |"
+            );
+            if s > best.0 {
+                best = (s, exposure);
+            }
+            // The default exposure, and the one whose mean byte is closest to the
+            // rasterizer's — the two a person would want to look at.
+            if exposure.to_bits() == 1.0f32.to_bits() {
+                kept[0] = pt;
+            } else if exposure.to_bits() == 32.0f32.to_bits() {
+                kept[1] = pt;
+            }
+        }
+        println!(
+            "| {label} {w}x{h} | **best** at exposure {} | **SSIM {:.4}** |",
+            best.1, best.0
+        );
+        kept
+    };
+
+    // Cornell, on the CPU: small enough that the reference stays the golden generator's.
+    let cam = cornell_camera(TILE, TILE);
+    let rs = cpu::rasterize(&scene(), &cam, &rs_full_cfg(), 0);
+    let mut pt_cfg = RenderConfig::pt_nee(TileAtlasCfg::row(TILE, TILE, 1), 1024, 3);
+    pt_cfg.channels = BTreeSet::from([Channel::PtRadiance]);
+    let pt = cpu::path_trace(&scene(), &cam, &pt_cfg, 0);
+    let a = rs.tile(Channel::Rgb8).unwrap().as_u8().unwrap().to_vec();
+    let radiance = pt.tile(Channel::PtRadiance).unwrap().as_f32().unwrap();
+    let [b1, b32] = sweep("cornell", &a, radiance, TILE, TILE);
+    dump("cornell_rs_full", &a, TILE, TILE);
+    dump("cornell_pt_nee_1024_e1", &b1, TILE, TILE);
+    dump("cornell_pt_nee_1024_e32", &b32, TILE, TILE);
+
+    let test = "rs_pt_ssim (SO-101 half)";
+    let Some(gpu) = open(test) else { return };
+    let cam = showcase_camera(W, H);
+    let tri = TriScene::from_scene(&so101()).expect("so101 tessellates");
+
+    let mut rs_cfg = RenderConfig::rs_full(TileAtlasCfg::row(W, H, 1));
+    rs_cfg.channels = BTreeSet::from([Channel::Rgb8]);
+    let mut renderer = Renderer::new(&gpu, rs_cfg).expect("renderer");
+    renderer.upload_tris(tri.clone()).expect("upload");
+    let rs_bytes = renderer
+        .render(&[cam])
+        .expect("render")
+        .read_tile(0, Channel::Rgb8)
+        .expect("rgb8")
+        .as_u8()
+        .unwrap()
+        .to_vec();
+
+    // Accumulate linear radiance over the chunks, then tone-map once on the host through the
+    // same `cpu::tonemap_to_u8` the kernel mirrors.
+    let mut acc = vec![0.0f64; (W as usize) * (H as usize) * 3];
+    for c in 0..CHUNKS {
+        let mut cfg = RenderConfig::pt_nee(TileAtlasCfg::row(W, H, 1), CHUNK_SPP, 3);
+        cfg.channels = BTreeSet::from([Channel::PtRadiance]);
+        cfg.seed = 0x5eed_1234u32.wrapping_add(c.wrapping_mul(0x9e37_79b9));
+        let mut r = Renderer::new(&gpu, cfg).expect("renderer");
+        r.upload_tris(tri.clone()).expect("upload");
+        let tile = r
+            .render(&[cam])
+            .expect("render")
+            .read_tile(0, Channel::PtRadiance)
+            .expect("radiance");
+        for (a, x) in acc.iter_mut().zip(tile.as_f32().unwrap()) {
+            *a += f64::from(*x);
+        }
+        println!("  chunk {}/{CHUNKS} done", c + 1);
+    }
+    let mean_radiance: Vec<f32> = acc
+        .iter()
+        .map(|x| (*x / f64::from(CHUNKS)) as f32)
+        .collect();
+    println!("so101: {} spp total", CHUNKS * CHUNK_SPP);
+    let [pt1, pt32] = sweep("so101", &rs_bytes, &mean_radiance, W, H);
+    dump("so101_rs_full", &rs_bytes, W, H);
+    dump("so101_pt_nee_e1", &pt1, W, H);
+    dump("so101_pt_nee_e32", &pt32, W, H);
+}
+
 // --- profile (packet M7/R1 step 0) -----------------------------------------------------------
 
 /// The demo scene: the SO-101 pick-and-place cell `es video showcase` renders.
