@@ -32,6 +32,10 @@ pub enum Channel {
     Flow,
     /// Point/splat radiance (unverified: assumed 3 x f32 RGB; no alpha channel modeled here).
     PtRadiance,
+    /// Temporal history length in frames, 1 x u32 (packet M7/R4): how many accumulated frames
+    /// the path tracer's estimate at this pixel rests on. A renderer diagnostic and a mask —
+    /// no Observation IR node reads it.
+    History,
 }
 
 /// A channel's scalar storage type. Mirrors the subset of `ImageSpec::ImageDType` (spec 7.2:
@@ -49,7 +53,7 @@ impl Channel {
     pub fn dtype(self) -> ChannelDType {
         match self {
             Self::Rgb8 => ChannelDType::U8,
-            Self::SegmentationId => ChannelDType::U32,
+            Self::SegmentationId | Self::History => ChannelDType::U32,
             Self::RgbF32Linear
             | Self::Depth32 { .. }
             | Self::Normal
@@ -63,14 +67,14 @@ impl Channel {
     pub fn n_components(self) -> u8 {
         match self {
             Self::Rgb8 | Self::RgbF32Linear | Self::Normal | Self::PtRadiance => 3,
-            Self::Depth32 { .. } | Self::SegmentationId => 1,
+            Self::Depth32 { .. } | Self::SegmentationId | Self::History => 1,
             Self::Flow => 2,
         }
     }
 
     /// Unit name as a plain string, the vocabulary `es-ir` matches on (see module docs).
     /// Fixed set: `"srgb"`, `"linear_rgb"`, `"m"`, `"unit_normal"`, `"id"`, `"px_flow"`,
-    /// `"radiance"`.
+    /// `"radiance"`, `"frames"`.
     #[must_use]
     pub fn unit(self) -> &'static str {
         match self {
@@ -81,6 +85,7 @@ impl Channel {
             Self::SegmentationId => "id",
             Self::Flow => "px_flow",
             Self::PtRadiance => "radiance",
+            Self::History => "frames",
         }
     }
 
@@ -95,6 +100,7 @@ impl Channel {
             Self::SegmentationId => (4, 0),
             Self::Flow => (5, 0),
             Self::PtRadiance => (6, 0),
+            Self::History => (7, 0),
         }
     }
 }

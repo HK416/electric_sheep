@@ -24,8 +24,19 @@ static const float ES_INV_GAMMA = 0.41666666;
 static const uint ES_TRI_STRIDE = 20;
 static const uint ES_VIEW_STRIDE = 16;
 // Slots 0..20 are M4's globals, 20..31 packet M7/R2's shading block, 31..37 packet M7/R3's
-// PT block, then the per-view records. Mirrors `renderer.rs`'s PARAM_VIEW_BASE.
-static const uint ES_PARAM_VIEW_BASE = 37;
+// PT block, 37..39 packet M7/R4's temporal block, then the per-view records. Mirrors
+// `renderer.rs`'s PARAM_VIEW_BASE.
+static const uint ES_PARAM_VIEW_BASE = 39;
+// Floats per pixel of the temporal history (packet M7/R4). Mirrors `renderer.rs`'s
+// HIST_STRIDE and `cpu::History`: sum(3), m1, m2, n, depth, tri, normal(3), variance.
+static const uint ES_HIST_STRIDE = 12;
+// The a-trous filter's edge-stopping scales. ES_SVGF_SIGMA_L and ES_SVGF_VAR_EPS are packet
+// M7/R4's luminance weight; mirrors `cpu::SVGF_*`.
+static const float ES_SVGF_SIGMA_Z = 0.1;
+static const float ES_SVGF_SIGMA_L = 4.0;
+static const float ES_SVGF_VAR_EPS = 1e-10;
+static const uint ES_SVGF_MIN_HISTORY = 4;
+static const int ES_SVGF_SPATIAL_RADIUS = 3;
 // How far a Full shadow ray looks: the light is directional, so the occluder may be outside
 // the camera's far plane. Mirrors `cpu::SHADOW_FAR`.
 static const float ES_SHADOW_FAR = 1e30;
@@ -66,6 +77,11 @@ bool es_nee()           { return es_param_u(31) != 0; }
 float3 es_light_rgb()   { return float3(es_params[32], es_params[33], es_params[34]); }
 float es_exposure()     { return es_params[35]; }
 uint es_tonemap_kind()  { return es_param_u(36); }
+// The temporal block (packet M7/R4). `es_max_history() == 0` is no accumulation at all: one
+// frame standing alone, which is every golden but `cornell_pt_accum8_rgb8`.
+uint es_max_history()   { return es_param_u(37); }
+// Frames this slot has rendered since the last whole-slot reset: the sample base.
+uint es_frame()         { return es_param_u(38); }
 uint es_atlas_w()      { return es_tiles_per_row() * es_tile_w(); }
 uint es_atlas_h()      { return es_rows() * es_tile_h(); }
 
@@ -130,6 +146,13 @@ EsView es_view(uint v) {
     o.near = es_params[b + 11];
     o.far = es_params[b + 12];
     return o;
+}
+
+// Whether this view is bitwise the one the history was built with (packet M7/R4). The host
+// does the comparison -- it is the one that has both frames' `ViewParams` -- and writes the
+// answer into the view record's first pad slot. 0 resets the whole tile.
+bool es_view_history_valid(uint v) {
+    return asuint(es_params[ES_PARAM_VIEW_BASE + v * ES_VIEW_STRIDE + 13]) != 0;
 }
 
 float3 es_qrot(float4 q, float3 v) {
@@ -369,6 +392,17 @@ float3 es_shade_full(EsTri tr, float3 n, float3 p, float3 d) {
 
 float es_luminance(float3 c) {
     return 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+}
+
+// The depth and normal edge-stopping weights of the a-trous filter and of packet M7/R4's
+// spatial variance estimate, returned separately so each caller multiplies them in its own
+// order (the filter's `wh * wz * wn` is the order its output bits were measured in).
+// Mirror of `cpu::edge_weights`.
+void es_edge_weights(float z_p, float z_q, float3 n_p, float3 n_q, out float wz, out float wn) {
+    wz = es_exp(-abs(z_p - z_q) / ES_SVGF_SIGMA_Z);
+    wn = max(dot(n_p, n_q), 0.0);
+    // n^32 by five squarings: no transcendental, the same ops as the Rust mirror.
+    for (uint s = 0; s < 5; ++s) { wn *= wn; }
 }
 
 // Duff et al., branchless orthonormal basis.

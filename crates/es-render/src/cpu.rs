@@ -23,7 +23,9 @@ use crate::atlas::{Tile, TileData};
 use crate::bvh::{self, Bvh};
 use crate::rng;
 use crate::scene::{Tri, TriScene};
-use crate::view::{CameraView, RenderConfig, RenderPath, Shading, Tonemap, ViewParams};
+use crate::view::{
+    CameraView, RenderConfig, RenderPath, Shading, Tonemap, ViewParams, VIEW_STRIDE,
+};
 
 /// Below this determinant a triangle is edge-on to the ray and is skipped.
 const DET_EPS: f32 = 1e-8;
@@ -44,6 +46,15 @@ const RESTIR_NEIGHBOURS: [(i32, i32); 4] = [(3, 0), (-3, 0), (0, 3), (0, -3)];
 const SVGF_SIGMA_Z: f32 = 0.1;
 /// 5-tap B-spline wavelet row.
 const SVGF_H: [f32; 5] = [1.0 / 16.0, 4.0 / 16.0, 6.0 / 16.0, 4.0 / 16.0, 1.0 / 16.0];
+/// Luminance edge-stopping scale (packet M7/R4; Schied et al. 2017 section 4.3).
+const SVGF_SIGMA_L: f32 = 4.0;
+/// Keeps the luminance weight's denominator off zero where the variance is zero.
+const SVGF_VAR_EPS: f32 = 1e-10;
+/// Frames of history below which the moments are too few to trust and the 7x7 spatial
+/// estimate stands in (Schied et al. 2017 section 4.2).
+const SVGF_MIN_HISTORY: u32 = 4;
+/// Radius of that spatial estimate: 7x7.
+const SVGF_SPATIAL_RADIUS: i32 = 3;
 
 // --- small vector helpers (mirrored by Slang's builtin float3 ops) -------------------------
 
@@ -769,15 +780,36 @@ fn nee_direct(
     out
 }
 
-/// Path-trace one view (spec 15.3 `PT`, spec 1.9 item 2).
+/// Path-trace one view (spec 15.3 `PT`, spec 1.9 item 2), with no history: one frame
+/// standing alone, which is what every golden but `cornell_pt_accum8_rgb8` pins.
 pub fn path_trace(
     scene: &TriScene,
     view: &CameraView,
     cfg: &RenderConfig,
     view_index: u32,
 ) -> Frame {
+    path_trace_accum(scene, view, cfg, view_index, &mut History::default())
+}
+
+/// [`path_trace`] keeping [`crate::Temporal`]'s per-pixel history in `history` (packet
+/// M7/R4). Call it once per frame with the same `history` and the same camera and the
+/// samples accumulate; `cfg.temporal` at `None` makes every frame start over, which is
+/// [`path_trace`] exactly.
+///
+/// The mirror of `pt.slang`'s `main` plus `accumulate.slang`: the accumulator **starts** at
+/// the history sum and the frame's samples are added onto it in the loop's own order, so
+/// `N` frames of `spp` samples are bit for bit one frame of `N * spp` — see
+/// `accumulation_of_n_frames_is_n_spp`.
+pub fn path_trace_accum(
+    scene: &TriScene,
+    view: &CameraView,
+    cfg: &RenderConfig,
+    view_index: u32,
+    history: &mut History,
+) -> Frame {
     let vp = ViewParams::new(view);
     let (w, h) = (view.spec.width, view.spec.height);
+    let n_px = (w as usize) * (h as usize);
     let bvh = Bvh::build(&scene.tris);
     let g = g_buffer(scene, &bvh, &vp, w, h);
     let (spp, bounces) = (cfg.spp().max(1), cfg.bounces().max(1));
@@ -788,12 +820,58 @@ pub fn path_trace(
     let nee = cfg.nee();
     let n_lights = scene.lights.len() as f32;
 
-    let mut radiance = vec![0.0f32; (w as usize) * (h as usize) * 3];
+    // The slot is kept only for a camera that is bitwise the one the history was built with
+    // (no reprojection: a moved camera invalidates every pixel at once).
+    let max_history = cfg.max_history();
+    let bits = view_bits(&vp);
+    if max_history.is_none() || history.view != Some(bits) || history.n.len() != n_px {
+        history.reset(n_px);
+    }
+    history.view = Some(bits);
+    let max_h = max_history.unwrap_or(1).max(1);
+    // The sample base of this frame. It is the slot's frame counter, which *is* the pixel's
+    // history length everywhere the history was never dropped — the case the bitwise oracle
+    // pins. Where it was dropped the pixel restarts its average but keeps drawing forward, so
+    // a pixel at the `max_history` clamp never redraws the samples it already holds.
+    let base = history.frame;
+
+    let mut radiance = vec![0.0f32; n_px * 3];
     for py in 0..h {
         for px in 0..w {
             let i = (py * w + px) as usize;
-            let mut acc = [0.0f32; 3];
+            // Disocclusion: the history survives only where this pixel's primary hit is
+            // bitwise the previous frame's.
+            let n_prev = if history.n[i] > 0 && history.same_geometry(i, &g) {
+                history.n[i]
+            } else {
+                0
+            };
+            // At the cap the oldest frame's share is scaled out of the sum rather than the
+            // whole history being thrown away: an exponential moving average with
+            // `alpha = 1 / max_history`, and the exact sum below the cap.
+            let keep = n_prev.min(max_h - 1);
+            let k = if keep == n_prev {
+                1.0
+            } else {
+                keep as f32 / n_prev as f32
+            };
+            let mut acc = if keep == 0 {
+                [0.0f32; 3]
+            } else {
+                scale(
+                    [
+                        history.sum[i * 3],
+                        history.sum[i * 3 + 1],
+                        history.sum[i * 3 + 2],
+                    ],
+                    k,
+                )
+            };
+            let acc0 = acc;
             for s in 0..spp {
+                // The sample index of packet M7/R4: frame `base` draws `base * spp + s`, so
+                // `N` frames of `spp` draw what one frame of `N * spp` draws, in order.
+                let s = base.wrapping_mul(spp).wrapping_add(s);
                 let mut throughput = [1.0f32; 3];
                 let mut o = vp.pos;
                 let mut d = primary_dir(&vp, px, py);
@@ -849,18 +927,56 @@ pub fn path_trace(
                     near = 0.0;
                 }
             }
-            // Sequential accumulation in ascending sample order: the order is fixed by the
-            // loop, so the cheap sum is also the reproducible one (spec 18.4 is for
-            // reductions whose order is not).
-            radiance[i * 3..i * 3 + 3].copy_from_slice(&scale(acc, 1.0 / spp as f32));
+            // Sequential accumulation in ascending sample order, and one divide at the end:
+            // the order is fixed by the loop, so the cheap sum is also the reproducible one
+            // (spec 18.4 is for reductions whose order is not). `n` is 1 without a history,
+            // which is `1 / spp` — today's bytes.
+            let n = keep + 1;
+            // This frame's own contribution, for the luminance moments. Taken as a difference
+            // rather than a second accumulator so the sum above stays one unbroken chain; it
+            // is exact to ~n ULP, and it feeds a variance estimate, not an image.
+            let l = luminance(scale(sub(acc, acc0), 1.0 / spp as f32));
+            let (m1, m2) = if keep == 0 {
+                (0.0, 0.0)
+            } else {
+                (history.moments[i * 2] * k, history.moments[i * 2 + 1] * k)
+            };
+            history.moments[i * 2] = m1 + l;
+            history.moments[i * 2 + 1] = m2 + l * l;
+            history.sum[i * 3..i * 3 + 3].copy_from_slice(&acc);
+            history.n[i] = n;
+            history.depth[i] = g.depth[i];
+            history.tri[i] = g.tri[i];
+            history.normal[i * 3..i * 3 + 3].copy_from_slice(&g.normal[i * 3..i * 3 + 3]);
+            radiance[i * 3..i * 3 + 3].copy_from_slice(&scale(acc, 1.0 / (n * spp) as f32));
         }
+    }
+    history.frame = base.wrapping_add(1);
+    // The variance of the accumulated estimate, which the a-trous pass reads. Computed
+    // whenever a history is kept, so `variance_falls_with_history` can read it with the
+    // filter off.
+    if max_history.is_some() {
+        history.variance = variance_estimate(&radiance, history, &g, w, h);
     }
 
     if restir {
         radiance = restir_di(scene, &bvh, &vp, cfg, &g, w, h, view_index);
     }
     if svgf {
-        radiance = atrous(&radiance, &g, w, h, cfg.svgf_iterations);
+        let variance = max_history.map(|_| history.variance.as_slice());
+        let (color, var) = atrous(
+            &radiance,
+            variance,
+            &g.depth,
+            &g.normal,
+            w,
+            h,
+            cfg.svgf_iterations,
+        );
+        radiance = color;
+        if max_history.is_some() {
+            history.variance = var;
+        }
     }
 
     let mut frame = Frame {
@@ -892,8 +1008,160 @@ pub fn path_trace(
             },
         );
     }
+    // The history length after this frame (packet M7/R4): 1 everywhere without a history,
+    // which is the truth — the estimate rests on this frame and nothing else.
+    if cfg.channels.contains(&Channel::History) {
+        frame.channels.insert(
+            Channel::History,
+            Tile {
+                shape: [h as usize, w as usize, 1],
+                data: TileData::U32(history.n.clone()),
+            },
+        );
+    }
     geometry_channels(&g, cfg, w, h, &mut frame);
     frame
+}
+
+// --- the temporal history (packet M7/R4) -----------------------------------------------------
+
+/// One camera slot's accumulated frames: what `path_trace_accum` carries from frame to frame,
+/// and the mirror of the 12-float-per-pixel buffer `renderer.rs` keeps on the device.
+///
+/// Nothing in here is a *setting* — [`crate::Temporal`] is. This is the state, and it is
+/// owned by the caller so that the reference stays a pure function of its inputs.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct History {
+    /// The `ViewParams` floats, bitwise, of the camera the history was built with.
+    view: Option<[u32; VIEW_STRIDE]>,
+    /// Frames the slot has rendered since the last whole-slot reset: the sample base.
+    frame: u32,
+    /// Running radiance sum, 3 per pixel, in the kernel's own accumulation order.
+    sum: Vec<f32>,
+    /// First and second raw moments of the per-frame luminance, 2 per pixel.
+    moments: Vec<f32>,
+    /// History length per pixel — the `n` of [`Channel::History`].
+    n: Vec<u32>,
+    /// The previous frame's primary hit: what the disocclusion test compares, bitwise.
+    depth: Vec<f32>,
+    normal: Vec<f32>,
+    tri: Vec<u32>,
+    /// Variance of the accumulated estimate, 1 per pixel: what the a-trous pass reads.
+    variance: Vec<f32>,
+}
+
+impl History {
+    /// History length per pixel after the last frame.
+    #[must_use]
+    pub fn n(&self) -> &[u32] {
+        &self.n
+    }
+
+    /// Variance of the accumulated estimate per pixel after the last frame.
+    #[must_use]
+    pub fn variance(&self) -> &[f32] {
+        &self.variance
+    }
+
+    /// Frames accumulated since the last whole-slot reset.
+    #[must_use]
+    pub fn frames(&self) -> u32 {
+        self.frame
+    }
+
+    fn reset(&mut self, n_px: usize) {
+        self.view = None;
+        self.frame = 0;
+        self.sum = vec![0.0; n_px * 3];
+        self.moments = vec![0.0; n_px * 2];
+        self.n = vec![0; n_px];
+        self.depth = vec![0.0; n_px];
+        self.normal = vec![0.0; n_px * 3];
+        self.tri = vec![0; n_px];
+        self.variance = vec![0.0; n_px];
+    }
+
+    /// Bitwise, never `==`: a depth that moved by one ULP is a different surface as far as
+    /// this test is concerned, and saying so costs nothing (spec 3.4).
+    fn same_geometry(&self, i: usize, g: &GBuffer) -> bool {
+        self.depth[i].to_bits() == g.depth[i].to_bits()
+            && self.tri[i] == g.tri[i]
+            && (0..3).all(|c| self.normal[i * 3 + c].to_bits() == g.normal[i * 3 + c].to_bits())
+    }
+}
+
+fn view_bits(vp: &ViewParams) -> [u32; VIEW_STRIDE] {
+    let mut out = [0u32; VIEW_STRIDE];
+    for (slot, f) in out.iter_mut().zip(vp.to_floats()) {
+        *slot = f.to_bits();
+    }
+    out
+}
+
+/// Variance of the accumulated estimate, per pixel (packet M7/R4; Schied et al. 2017 section
+/// 4.2). Mirror of `accumulate.slang`.
+///
+/// With `n >= 4` frames it comes from the moments: `var(l) = E[l^2] - E[l]^2` over the
+/// per-frame luminances, divided by `n` once more because what the filter needs is the
+/// variance of the *mean* of those `n` frames, which is what the pixel holds. Below 4 the
+/// moments are too few to be worth anything and the paper's 7x7 depth/normal-weighted spatial
+/// estimate stands in, divided by `n` for the same reason — so the quantity is continuous
+/// across the switch and always means "how uncertain is this pixel".
+fn variance_estimate(radiance: &[f32], history: &History, g: &GBuffer, w: u32, h: u32) -> Vec<f32> {
+    let mut out = vec![0.0f32; (w as usize) * (h as usize)];
+    for py in 0..h {
+        for px in 0..w {
+            let i = (py * w + px) as usize;
+            let n = history.n[i];
+            if n == 0 {
+                continue;
+            }
+            let inv_n = 1.0 / n as f32;
+            out[i] = if n >= SVGF_MIN_HISTORY {
+                let m1 = history.moments[i * 2] * inv_n;
+                let m2 = history.moments[i * 2 + 1] * inv_n;
+                (m2 - m1 * m1).max(0.0) * inv_n
+            } else {
+                let (mut sw, mut swl, mut swl2) = (0.0f32, 0.0f32, 0.0f32);
+                for dy in -SVGF_SPATIAL_RADIUS..=SVGF_SPATIAL_RADIUS {
+                    for dx in -SVGF_SPATIAL_RADIUS..=SVGF_SPATIAL_RADIUS {
+                        let (nx, ny) = (px as i32 + dx, py as i32 + dy);
+                        if nx < 0 || ny < 0 || nx >= w as i32 || ny >= h as i32 {
+                            continue;
+                        }
+                        let j = (ny as u32 * w + nx as u32) as usize;
+                        let (wz, wn) = edge_weights(&g.depth, &g.normal, i, j);
+                        let weight = wz * wn;
+                        let l =
+                            luminance([radiance[j * 3], radiance[j * 3 + 1], radiance[j * 3 + 2]]);
+                        sw += weight;
+                        swl += weight * l;
+                        swl2 += weight * l * l;
+                    }
+                }
+                let inv = if sw > 0.0 { 1.0 / sw } else { 0.0 };
+                let mean = swl * inv;
+                (swl2 * inv - mean * mean).max(0.0) * inv_n
+            };
+        }
+    }
+    out
+}
+
+/// The depth and normal edge-stopping weights, returned separately so each caller multiplies
+/// them in its own order — the a-trous filter's `wh * wz * wn` is the order its output bits
+/// were measured in and must not move.
+fn edge_weights(depth: &[f32], normal: &[f32], i: usize, j: usize) -> (f32, f32) {
+    let wz = approx::exp(-(depth[i] - depth[j]).abs() / SVGF_SIGMA_Z);
+    let mut wn = (normal[i * 3] * normal[j * 3]
+        + normal[i * 3 + 1] * normal[j * 3 + 1]
+        + normal[i * 3 + 2] * normal[j * 3 + 2])
+        .max(0.0);
+    // n^32 by five squarings: no transcendental, exact same ops in Slang.
+    for _ in 0..5 {
+        wn *= wn;
+    }
+    (wz, wn)
 }
 
 // --- `ReSTIR` DI ------------------------------------------------------------------------------
@@ -1186,22 +1454,47 @@ fn restir_di(
 
 // --- SVGF (the a-trous half) -----------------------------------------------------------------
 
-/// Edge-aware a-trous wavelet filter, `iterations` passes at stride `1 << i`.
+/// Edge-aware a-trous wavelet filter, `iterations` passes at stride `1 << i`, edge-stopping
+/// on depth, normal and — when `variance` is `Some` (packet M7/R4) — luminance.
 ///
-/// This is **not** SVGF: there is no temporal accumulation, no per-pixel variance estimate,
-/// no variance-guided luminance weight, no variance prefilter, no disocclusion handling and
-/// no history-driven kernel widening. It is named for spec 28.6's deliverable; what it
-/// actually is, is an edge-stopping a-trous filter.
-fn atrous(color: &[f32], g: &GBuffer, w: u32, h: u32, iterations: u32) -> Vec<f32> {
+/// `variance` is the per-pixel variance of the accumulated estimate ([`History::variance`]).
+/// With it the filter is variance-guided the way Schied et al. 2017 section 4.3 is: the
+/// luminance weight `exp(-|l_p - l_q| / (sigma_l * sqrt(var_p) + eps))` narrows the kernel
+/// wherever the estimate has converged, and the variance is filtered alongside the colour
+/// with the squared weights so the next iteration sees the variance of what it is reading.
+/// Without it — `temporal: None` — the weight is exactly `1.0` and the output is byte for
+/// byte what M4's filter produced.
+///
+/// Still **not** the whole of SVGF: no history-length-driven kernel widening, and the
+/// temporal half is `path_trace_accum`'s, not this function's. See
+/// `docs/design/renderer.md` sections 4.3 and 11.
+pub fn atrous(
+    color: &[f32],
+    variance: Option<&[f32]>,
+    depth: &[f32],
+    normal: &[f32],
+    w: u32,
+    h: u32,
+    iterations: u32,
+) -> (Vec<f32>, Vec<f32>) {
     let mut src = color.to_vec();
     let mut dst = src.clone();
+    let mut vsrc = variance.map(<[f32]>::to_vec).unwrap_or_default();
+    let mut vdst = vsrc.clone();
+    let guided = !vsrc.is_empty();
     for it in 0..iterations {
         let stride = 1i32 << it;
         for py in 0..h {
             for px in 0..w {
                 let i = (py * w + px) as usize;
                 let mut sum = [0.0f32; 3];
-                let mut wsum = 0.0f32;
+                let (mut wsum, mut vsum) = (0.0f32, 0.0f32);
+                let l_p = luminance([src[i * 3], src[i * 3 + 1], src[i * 3 + 2]]);
+                let sigma_l = if guided {
+                    SVGF_SIGMA_L * approx::sqrt(vsrc[i]) + SVGF_VAR_EPS
+                } else {
+                    0.0
+                };
                 for ky in 0..5i32 {
                     for kx in 0..5i32 {
                         let nx = px as i32 + (kx - 2) * stride;
@@ -1211,30 +1504,37 @@ fn atrous(color: &[f32], g: &GBuffer, w: u32, h: u32, iterations: u32) -> Vec<f3
                         }
                         let j = (ny as u32 * w + nx as u32) as usize;
                         let wh = SVGF_H[kx as usize] * SVGF_H[ky as usize];
-                        let wz = approx::exp(-(g.depth[i] - g.depth[j]).abs() / SVGF_SIGMA_Z);
-                        let mut wn = (g.normal[i * 3] * g.normal[j * 3]
-                            + g.normal[i * 3 + 1] * g.normal[j * 3 + 1]
-                            + g.normal[i * 3 + 2] * g.normal[j * 3 + 2])
-                            .max(0.0);
-                        // n^32 by five squarings: no transcendental, exact same ops in Slang.
-                        for _ in 0..5 {
-                            wn *= wn;
-                        }
-                        let weight = wh * wz * wn;
+                        let (wz, wn) = edge_weights(depth, normal, i, j);
+                        let wl = if guided {
+                            let l_q = luminance([src[j * 3], src[j * 3 + 1], src[j * 3 + 2]]);
+                            approx::exp(-(l_p - l_q).abs() / sigma_l)
+                        } else {
+                            1.0
+                        };
+                        let weight = wh * wz * wn * wl;
                         sum = add(
                             sum,
                             scale([src[j * 3], src[j * 3 + 1], src[j * 3 + 2]], weight),
                         );
                         wsum += weight;
+                        if guided {
+                            vsum += weight * weight * vsrc[j];
+                        }
                     }
                 }
                 let inv = if wsum > 0.0 { 1.0 / wsum } else { 0.0 };
                 dst[i * 3..i * 3 + 3].copy_from_slice(&scale(sum, inv));
+                if guided {
+                    vdst[i] = vsum * inv * inv;
+                }
             }
         }
         std::mem::swap(&mut src, &mut dst);
+        if guided {
+            std::mem::swap(&mut vsrc, &mut vdst);
+        }
     }
-    src
+    (src, vsrc)
 }
 
 #[cfg(test)]

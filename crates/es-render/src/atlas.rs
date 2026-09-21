@@ -101,7 +101,7 @@ impl AtlasLayout {
 /// 32-bit words one pixel of `channel` occupies on the device. See [`AtlasLayout::device_bytes`].
 pub fn words_per_pixel(channel: Channel) -> u32 {
     match channel {
-        Channel::Rgb8 | Channel::Depth32 { .. } | Channel::SegmentationId => 1,
+        Channel::Rgb8 | Channel::Depth32 { .. } | Channel::SegmentationId | Channel::History => 1,
         Channel::Flow => 2,
         Channel::RgbF32Linear | Channel::Normal | Channel::PtRadiance => 3,
     }

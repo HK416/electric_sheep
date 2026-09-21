@@ -239,6 +239,25 @@ pub enum Tonemap {
     Aces,
 }
 
+/// Temporal accumulation for a camera that does not move (packet M7/R4,
+/// `docs/design/renderer.md` section 11; Schied et al. 2017 section 4.1).
+///
+/// Read by the [`RenderPath::Pt`] path only, and `None` by default: every golden and the
+/// committed `frames` fixture are one frame standing alone (spec 28.10 rule 1).
+///
+/// A pixel keeps its radiance sum across frames while the camera and the pixel's own
+/// depth, normal and primitive id are **bitwise** what the previous frame had, so `N` frames
+/// of `spp` samples are bit for bit one frame of `N * spp`. There is no motion-vector
+/// reprojection: a moving camera resets the whole slot, by design.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Temporal {
+    /// Frames a pixel's history may hold, at least 1. Below the cap the accumulated sum is
+    /// exact; at it the oldest frame's share is scaled out, which makes the estimate an
+    /// exponential moving average with `alpha = 1 / max_history` and lets a pixel whose
+    /// *lighting* changed (but whose geometry did not) catch up in `max_history` frames.
+    pub max_history: u32,
+}
+
 /// Tile packing, spec 15.2.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TileAtlasCfg {
@@ -295,6 +314,9 @@ pub struct RenderConfig {
     /// Tone map applied before the sRGB transfer on the `Pt` path's [`Channel::Rgb8`]
     /// output. The `Rs` path clamps, as it always did (packet M7/R2 is unchanged).
     pub tonemap: Tonemap,
+    /// Accumulate the `Pt` path's samples across frames for a still camera (packet M7/R4).
+    /// `None` is one frame standing alone — today's bytes.
+    pub temporal: Option<Temporal>,
 }
 
 impl RenderConfig {
@@ -313,6 +335,7 @@ impl RenderConfig {
             svgf_iterations: 4,
             exposure: 1.0,
             tonemap: Tonemap::Reinhard,
+            temporal: None,
         }
     }
 
@@ -358,6 +381,15 @@ impl RenderConfig {
     /// Whether the `Pt` path does next-event estimation. Always `false` for `Rs`.
     pub(crate) fn nee(&self) -> bool {
         matches!(self.path, RenderPath::Pt { nee: true, .. })
+    }
+
+    /// Frames of history the `Pt` path may keep, or `None` for no accumulation at all
+    /// (packet M7/R4). Always `None` for `Rs`: the rasterizer has no samples to accumulate.
+    pub(crate) fn max_history(&self) -> Option<u32> {
+        match self.path {
+            RenderPath::Rs => None,
+            RenderPath::Pt { .. } => self.temporal.map(|t| t.max_history.max(1)),
+        }
     }
 
     pub(crate) fn spp(&self) -> u32 {

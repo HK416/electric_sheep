@@ -394,7 +394,10 @@ fn channel_format(channel: Channel) -> ChannelFormat {
     match channel {
         Channel::Rgb8 | Channel::RgbF32Linear | Channel::PtRadiance => ChannelFormat::Rgb,
         Channel::Depth32 { .. } => ChannelFormat::Depth,
-        Channel::SegmentationId => ChannelFormat::Seg,
+        // `History` is packet M7/R4's renderer diagnostic, a u32 count per pixel. It is
+        // unreachable here: `EnvRendererCfg` names one channel and the observation path never
+        // names this one. It maps to the other single-u32 format so the match stays total.
+        Channel::SegmentationId | Channel::History => ChannelFormat::Seg,
         Channel::Normal => ChannelFormat::Normal,
         Channel::Flow => ChannelFormat::Flow,
     }
