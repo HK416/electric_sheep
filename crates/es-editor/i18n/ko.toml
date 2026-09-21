@@ -124,6 +124,7 @@
 "launch.kind.train" = "학습하기"
 "launch.kind.cycle" = "전체 흐름"
 "launch.start" = "시작"
+"launch.missing" = "먼저 채워 주세요:"
 "launch.stop" = "중지"
 "launch.command" = "이렇게 실행됩니다"
 "launch.config" = "평가 설정"

@@ -19,8 +19,10 @@ use std::io::{BufRead, BufReader, Read};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
+
+use es_telemetry::transport::Client;
 
 use crate::model::telemetry_view::{self, Source};
 
@@ -37,6 +39,12 @@ pub const RING: usize = 200;
 /// than that and shorter than someone's patience.
 pub const ATTACH_TRIES: usize = 20;
 pub const ATTACH_DELAY: Duration = Duration::from_millis(100);
+
+/// How long [`LaunchModel::poll`] waits for the reader threads' last lines once the child has
+/// exited. Short on purpose: a grandchild that inherited the pipes (a `--jobs` worker, the
+/// physics subprocess) can hold them open after the child is gone, and the UI thread must not
+/// wait on it - whatever arrives later is drained by the next frames.
+pub const EXIT_DRAIN: Duration = Duration::from_millis(50);
 
 /// The default publish address (`eval.rs`'s help uses it as its example), used when the
 /// Telemetry tab has nothing typed in it yet.
@@ -261,6 +269,15 @@ pub struct LaunchModel {
     /// from a failed one — and reporting "failed" for something the person themselves ended
     /// would be the panel lying about the run.
     killed: bool,
+    /// The dial to the child's `--telemetry` address, on its own thread
+    /// ([`dial_in_background`]); `None` when there is nothing to attach to or the answer has
+    /// arrived.
+    attaching: Option<Receiver<Result<Client, String>>>,
+    /// The dial's answer, until [`Self::take_attached`] takes it.
+    attached: Option<Result<Client, String>>,
+    /// How the dial retries; the defaults are [`ATTACH_TRIES`] and [`ATTACH_DELAY`].
+    pub attach_tries: usize,
+    pub attach_delay: Duration,
 }
 
 impl std::fmt::Debug for LaunchModel {
@@ -300,6 +317,10 @@ impl Default for LaunchModel {
             lines,
             ring: VecDeque::new(),
             killed: false,
+            attaching: None,
+            attached: None,
+            attach_tries: ATTACH_TRIES,
+            attach_delay: ATTACH_DELAY,
         }
     }
 }
@@ -309,6 +330,21 @@ impl LaunchModel {
 
     /// The value-taking flags of the current kind, in order. `app.rs` draws one text box per
     /// entry and knows nothing about which flags a command has.
+    /// The fields the command refuses to run without, still empty. `es` would say the same
+    /// (exit 2, `--config is required`) a second later; saying it before Start is what a
+    /// person needs, and the list is the model's so the panel decides nothing (rule 3).
+    pub fn missing_required(&self) -> Vec<LaunchField> {
+        let required: &[F] = match self.kind {
+            Kind::Eval => &[F::Config, F::Policy, F::Scene],
+            Kind::Train | Kind::Cycle => &[F::Recipe],
+        };
+        required
+            .iter()
+            .copied()
+            .filter(|f| self.field(*f).trim().is_empty())
+            .collect()
+    }
+
     pub fn fields(&self) -> &'static [LaunchField] {
         match self.kind {
             Kind::Eval => EVAL_FIELDS,
@@ -475,6 +511,8 @@ impl LaunchModel {
         }
         self.ring.clear();
         self.killed = false;
+        self.attaching = None;
+        self.attached = None;
         let child = Command::new(program)
             .args(args)
             .stdout(Stdio::piped())
@@ -503,12 +541,33 @@ impl LaunchModel {
         };
         self.lines = rx;
         self.child = Some(child);
+        // The dial starts now and answers through `poll`; never on this thread, because on a
+        // machine where a refused connect takes seconds (Windows) twenty tries would hold the
+        // UI for most of a minute - which is exactly what happened before this existed.
+        self.attaching = self.attach().map(|addr| {
+            dial_in_background(
+                addr,
+                self.field(F::TelemetryToken).to_owned(),
+                self.attach_tries,
+                self.attach_delay,
+            )
+        });
     }
 
     /// Drains whatever the reader threads have queued and asks the child whether it is still
     /// there. Called once a frame; never blocks while the child runs.
     pub fn poll(&mut self) {
         self.drain();
+        if let Some(rx) = &self.attaching {
+            match rx.try_recv() {
+                Ok(answer) => {
+                    self.attached = Some(answer);
+                    self.attaching = None;
+                }
+                Err(TryRecvError::Disconnected) => self.attaching = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
         let Some(child) = self.child.as_mut() else {
             return;
         };
@@ -522,12 +581,15 @@ impl LaunchModel {
             }
         };
         self.child = None;
-        // The pipes are at EOF now, so the reader threads are finishing; block until they
-        // drop their senders so the child's last lines — the usage error, the `SKIPPED`
-        // reason — are not lost to whichever frame the exit landed in.
-        while let Ok(line) = self.lines.recv() {
+        // The pipes are at EOF now, so the reader threads are finishing; wait for their last
+        // lines - the usage error, the `SKIPPED` reason - but only [`EXIT_DRAIN`] long: a
+        // grandchild holding the pipe would otherwise hold the UI thread with it, and the
+        // next frames' `drain` picks up whatever comes later.
+        while let Ok(line) = self.lines.recv_timeout(EXIT_DRAIN) {
             self.push(line);
         }
+        // A dial still in flight was for a producer that no longer exists.
+        self.attaching = None;
         self.state = State::Exited {
             // A child killed by a signal has no code (Unix); `-1` is not one of the four
             // documented codes, and `exit_meaning` says so.
@@ -605,19 +667,15 @@ impl LaunchModel {
         argv.get(i + 1).cloned()
     }
 
-    /// [`Self::attach`]'s address, dialled. `None` when there is nothing to attach to.
-    ///
-    /// The retry is here and not in `app.rs` (spec 28.10 rule 3): a producer binds before it
-    /// opens anything, but "before" is still some milliseconds after the process started, and
-    /// the panel must not decide how many.
-    pub fn attach_source(&self) -> Option<Result<Source, String>> {
-        let addr = self.attach()?;
-        Some(dial(
-            &addr,
-            self.field(F::TelemetryToken),
-            ATTACH_TRIES,
-            ATTACH_DELAY,
-        ))
+    /// The dial's answer, once: `Some(Ok(source))` when the producer answered, `Some(Err(why))`
+    /// when it gave up, `None` while it is still trying or when there was nothing to attach
+    /// to. The dial itself runs on its own thread from [`Self::start`], so a producer that is
+    /// slow to bind never holds the UI thread; the retry count is the model's, not `app.rs`'s
+    /// (spec 28.10 rule 3).
+    pub fn take_attached(&mut self) -> Option<Result<Source, String>> {
+        self.attached
+            .take()
+            .map(|answer| answer.map(telemetry_view::source_of))
     }
 }
 
@@ -637,7 +695,7 @@ fn reader(pipe: impl Read + Send + 'static, tx: mpsc::Sender<String>) {
 ///
 /// A malformed address is not retried — waiting `tries * delay` for a typo to fix itself is
 /// time nobody has. Every other failure is, and the last one is what the caller is told.
-pub fn dial(addr: &str, token: &str, tries: usize, delay: Duration) -> Result<Source, String> {
+pub fn dial(addr: &str, token: &str, tries: usize, delay: Duration) -> Result<Client, String> {
     addr.trim()
         .parse::<SocketAddr>()
         .map_err(|e| format!("{addr:?} is not a host:port address: {e}"))?;
@@ -647,8 +705,8 @@ pub fn dial(addr: &str, token: &str, tries: usize, delay: Duration) -> Result<So
         if i > 0 {
             std::thread::sleep(delay);
         }
-        match telemetry_view::attach(addr, token) {
-            Ok(source) => return Ok(source),
+        match telemetry_view::connect(addr, token) {
+            Ok(client) => return Ok(client),
             Err(e) => last = e,
         }
     }
@@ -656,6 +714,21 @@ pub fn dial(addr: &str, token: &str, tries: usize, delay: Duration) -> Result<So
         "nothing answered at {addr} in {tries} tries over {:?}: {last}",
         delay * tries as u32
     ))
+}
+
+/// [`dial`] on its own thread; the answer arrives on the receiver, which
+/// [`LaunchModel::poll`] reads without blocking.
+pub fn dial_in_background(
+    addr: String,
+    token: String,
+    tries: usize,
+    delay: Duration,
+) -> Receiver<Result<Client, String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(dial(&addr, &token, tries, delay));
+    });
+    rx
 }
 
 /// **One rule** for which `es` this is: `ES_BIN` if it is set, else the `es` beside the
@@ -954,7 +1027,7 @@ mod tests {
     fn launch_attaches_only_after_running() {
         let mut m = fixture(Kind::Eval);
         assert_eq!(m.attach(), None, "nothing to attach to while Idle");
-        assert!(m.attach_source().is_none());
+        assert!(m.take_attached().is_none());
 
         let (program, args) = sleeper();
         m.start_program(&program, &args);
@@ -987,6 +1060,83 @@ mod tests {
         let addr = listener.local_addr().expect("its number");
         drop(listener);
         addr
+    }
+
+    /// Start returns at once: the dial is a background thread, so the panel stays live even on
+    /// a machine where a refused connect takes seconds (Windows: about 2 s), and the answer
+    /// arrives through `take_attached` with the address in it.
+    #[test]
+    fn start_returns_at_once_and_the_dial_answers_later() {
+        let mut m = fixture(Kind::Eval);
+        let addr = free_port().to_string();
+        *m.field_mut(F::Telemetry) = addr.clone();
+        m.attach_tries = 2;
+        m.attach_delay = Duration::from_millis(20);
+        let (program, args) = sleeper();
+        let started = Instant::now();
+        m.start_program(&program, &args);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "start held the caller for {:?}",
+            started.elapsed()
+        );
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let answer = loop {
+            m.poll();
+            if let Some(answer) = m.take_attached() {
+                break answer;
+            }
+            assert!(Instant::now() < deadline, "the dial never answered");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let why = answer.err().expect("nothing listens there");
+        assert!(why.contains(&addr) && why.contains("2 tries"), "{why}");
+        assert!(m.take_attached().is_none(), "an answer is handed over once");
+        m.kill();
+        poll_until_exit(&mut m);
+    }
+
+    /// A grandchild that inherited the pipes (a `--jobs` worker, the physics subprocess) may
+    /// outlive the child; the exit is still reported within a frame or two, not when the
+    /// grandchild finally lets go of the pipe.
+    #[test]
+    fn poll_does_not_wait_for_a_grandchild_holding_the_pipe() {
+        let mut m = fixture(Kind::Train);
+        let (program, args) = shell(if cfg!(windows) {
+            "start /B ping -n 6 127.0.0.1 & exit 0"
+        } else {
+            "sleep 5 & exit 0"
+        });
+        let started = Instant::now();
+        m.start_program(&program, &args);
+        assert_eq!(poll_until_exit(&mut m), 0);
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "waited {:?} on a grandchild's pipe",
+            started.elapsed()
+        );
+    }
+
+    /// Start is refused by name before `es` refuses it by exit code: the empty required
+    /// fields, per kind, in the order the panel lists them.
+    #[test]
+    fn missing_required_names_the_empty_fields() {
+        let mut m = fixture(Kind::Eval);
+        assert!(
+            m.missing_required().is_empty(),
+            "the fixture fills every required field"
+        );
+        m.field_mut(F::Policy).clear();
+        m.field_mut(F::Scene).clear();
+        assert_eq!(m.missing_required(), vec![F::Policy, F::Scene]);
+        let mut m = LaunchModel {
+            kind: Kind::Train,
+            ..Default::default()
+        };
+        assert_eq!(m.missing_required(), vec![F::Recipe]);
+        m.kind = Kind::Cycle;
+        *m.field_mut(F::Recipe) = "cycle.toml".to_owned();
+        assert!(m.missing_required().is_empty());
     }
 
     /// Oracle 3b: the retry gives a producer time to bind, and gives up with one error.

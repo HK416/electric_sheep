@@ -387,6 +387,24 @@ impl eframe::App for EditorApp {
         // A launched child's lines and its exit code (packet M7/E5). Once a frame, never
         // blocking: the reader threads are what touch the pipes.
         self.launch.poll();
+        // The status bar said "running" when the run started; once it is not, say so there
+        // too rather than leaving a finished run looking alive.
+        if !matches!(self.launch.state(), LaunchState::Running { .. })
+            && self.status.contains("running: pid")
+        {
+            self.status = self.launch.status_line();
+        }
+        // The dial's answer, if it arrived this frame (packet M7/E5, un-blocked after E6).
+        if let Some(attached) = self.launch.take_attached() {
+            match attached {
+                Ok(source) => {
+                    self.telemetry = TelemetryModel::default();
+                    self.source = source;
+                    self.status = format!("started and attached: {}", self.launch.status_line());
+                }
+                Err(e) => self.status = e,
+            }
+        }
 
         // A dropped file goes through the same function the text field does (packet M7/E3):
         // one way in means one set of errors out.
@@ -1238,8 +1256,12 @@ impl EditorApp {
                     .on_hover_text(kind.label());
             }
             ui.separator();
+            let missing = self.launch.missing_required();
             start = ui
-                .add_enabled(!running, egui::Button::new(self.t("launch.start")))
+                .add_enabled(
+                    !running && missing.is_empty(),
+                    egui::Button::new(self.t("launch.start")),
+                )
                 .clicked();
             if ui
                 .add_enabled(running, egui::Button::new(self.t("launch.stop")))
@@ -1248,7 +1270,16 @@ impl EditorApp {
                 self.launch.kill();
             }
             ui.separator();
-            ui.label(self.launch.status_line());
+            if missing.is_empty() {
+                ui.label(self.launch.status_line());
+            } else {
+                // What to fill in, by the panel's own words for the fields (packet M7/E6).
+                let names: Vec<&str> = missing
+                    .iter()
+                    .map(|f| labels::launch_label(lang, *f))
+                    .collect();
+                ui.label(format!("{} {}", self.t("launch.missing"), names.join(", ")));
+            }
         });
         // One `horizontal` per flag rather than an `egui::Grid`: a grid caps a cell at the
         // column width it measured last frame, which squeezes a `TextEdit` down to the
@@ -1310,24 +1341,12 @@ impl EditorApp {
         }
     }
 
-    /// Start, then attach. In that order and only in that order: the editor dials a producer
-    /// that exists (spec 23.1), so the address comes from [`LaunchModel::attach_source`],
-    /// which answers `None` until the child is running and does its own bounded waiting for
-    /// the socket.
+    /// Start; the attach follows through [`LaunchModel::take_attached`] in `update`, when
+    /// the dial the model runs on its own thread has answered. Never here: on a machine where
+    /// a refused connect takes seconds, a dial on this thread held the whole window.
     fn start_launch(&mut self) {
         self.launch.start();
         self.status = self.launch.status_line();
-        match self.launch.attach_source() {
-            Some(Ok(source)) => {
-                self.telemetry = TelemetryModel::default();
-                self.source = source;
-                self.status = format!("started and attached: {}", self.launch.status_line());
-            }
-            Some(Err(e)) => self.status = e,
-            // A command that publishes nothing (`es train`, `es loop cycle`) is watched
-            // through its output lines, which is all it offers.
-            None => {}
-        }
     }
 
     /// The Replay panel (packet M7/E2): the selected cell's `.estraj`, posed and projected by

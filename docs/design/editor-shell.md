@@ -718,24 +718,43 @@ their run failed when they themselves ended it.
 `attach()` is `None` until the child is `Running` and `None` for a command whose `argv()`
 carries no `--telemetry` — which today is every `es train` and every `es loop cycle`
 (§13's "not here": nothing outside `es eval run` publishes). Once there is an address,
-`attach_source()` dials it through E4's `telemetry_view::attach` and the result replaces the
-Telemetry tab's `Source`. The editor connects as a client; there is no second path.
+`start()` dials it through E4's `telemetry_view::connect` **on a thread of its own**
+(`dial_in_background`), `poll()` collects the answer, and `take_attached()` hands the connected
+client back as the Telemetry tab's `Source`. The editor connects as a client; there is no second
+path.
 
 `es eval run --telemetry` binds its server *before it opens anything*, but "before" is still
 after process creation and argument parsing, so `dial()` retries: `ATTACH_TRIES` = 20 attempts
-`ATTACH_DELAY` = 100 ms apart, about two seconds, then one error naming the address and the
-budget. A malformed address is **not** retried — it cannot become an address by waiting. The
-retry is in the model on purpose; a panel deciding how long to wait is a decision in `app.rs`.
+`ATTACH_DELAY` = 100 ms apart, then one error naming the address and the budget. A malformed
+address is **not** retried — it cannot become an address by waiting. The retry is in the model
+on purpose; a panel deciding how long to wait is a decision in `app.rs`.
+
+**Why the dial is a thread (found after E6).** The first version dialled on the UI thread and
+called two seconds "bounded". On Windows a `connect` to a closed local port is refused only
+after about two seconds, so twenty attempts held the window for most of a minute — and the
+common way to get there was pressing Start with a required field empty: `es` exits 2 at once,
+nothing ever listens, and the editor sat in `TcpStream::connect`. Three things changed: the
+dial runs on its own thread and `start()` returns at once
+(`start_returns_at_once_and_the_dial_answers_later`); `es_telemetry::Client::connect` bounds
+both legs (`CLIENT_CONNECT_TIMEOUT` 1 s, `CLIENT_HANDSHAKE_TIMEOUT` 2 s, a listener that
+accepts and says nothing included — `a_client_gives_up_on_a_listener_that_never_answers`);
+and Start is disabled, with the empty fields named in the panel's own words, until
+`missing_required()` is empty (`missing_required_names_the_empty_fields`). The Telemetry tab's
+Connect button still dials on the UI thread — one attempt, bounded by the same timeouts.
 
 ### The child never touches the UI thread
 
 `stdout` and `stderr` are piped and read by one thread each into a single `mpsc` channel;
 `poll()` drains it into a 200-line ring and `try_wait()`s the child, once a frame. The UI
 thread reads no pipe, so a child that floods one cannot stall a repaint and a child that
-writes nothing cannot block one. The one place `poll()` does block is right after `try_wait()`
-reports an exit: the pipes are at EOF, the reader threads are finishing, and `recv()` until
-they drop their senders is what keeps the last lines — the usage error, the `SKIPPED` reason —
-from being lost to whichever frame the exit landed in.
+writes nothing cannot block one. The one place `poll()` waits is right after `try_wait()`
+reports an exit: the pipes are at EOF, the reader threads are finishing, and waiting for their
+last lines is what keeps the usage error or the `SKIPPED` reason from being lost to whichever
+frame the exit landed in — but only `EXIT_DRAIN` = 50 ms long. A grandchild that inherited the
+pipes (a `--jobs` worker, the physics subprocess) can hold them open after the child is gone,
+and the first version's unbounded `recv()` would have held the UI thread with it
+(`poll_does_not_wait_for_a_grandchild_holding_the_pipe`); whatever arrives later is drained by
+the next frames.
 
 ### Pre-filling, and what it will not overwrite
 

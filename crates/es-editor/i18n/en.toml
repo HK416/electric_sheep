@@ -125,6 +125,7 @@
 "launch.kind.train" = "Train"
 "launch.kind.cycle" = "The whole loop"
 "launch.start" = "Start"
+"launch.missing" = "Fill in first:"
 "launch.stop" = "Stop"
 "launch.command" = "What will run"
 "launch.config" = "Evaluation settings"

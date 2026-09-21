@@ -49,6 +49,12 @@ pub const CLIENT_QUEUE_CAPACITY: usize = 16;
 /// sends `Hello` must not be able to pin a server thread forever.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// The client side (M7/E5 follow-up): how long [`Client::connect`] waits for the TCP connect
+/// and then for the `HelloAck`. Both legs are bounded so that a caller on a UI thread is never
+/// pinned by a port that drops packets or by a listener that accepts and says nothing.
+pub const CLIENT_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+pub const CLIENT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Default for [`ServerConfig::max_clients`] (spec 25.1): an accept-loop connection cap so an
 /// unbounded number of peers cannot spawn an unbounded number of threads.
 pub const DEFAULT_MAX_CLIENTS: usize = 64;
@@ -434,7 +440,9 @@ impl Client {
         token: Option<String>,
         client_name: impl Into<String>,
     ) -> Result<Client, TransportError> {
-        let mut stream = TcpStream::connect(addr)?;
+        let mut stream = TcpStream::connect_timeout(&addr, CLIENT_CONNECT_TIMEOUT)?;
+        // Bounded: a listener that accepts and never answers must not hold the caller.
+        stream.set_read_timeout(Some(CLIENT_HANDSHAKE_TIMEOUT))?;
         write_message(
             &mut stream,
             &Message::Hello(Hello {
@@ -444,7 +452,10 @@ impl Client {
             }),
         )?;
         let mut buf = Vec::new();
-        match read_message(&mut stream, &mut buf)? {
+        let reply = read_message(&mut stream, &mut buf)?;
+        // `recv` blocks for the next message by contract; only the handshake is bounded.
+        stream.set_read_timeout(None)?;
+        match reply {
             Message::HelloAck(ack) => Ok(Client {
                 stream,
                 buf,
@@ -683,6 +694,31 @@ mod tests {
     /// read from, and without spawning a thread — so `threads_live` never exceeds the cap by
     /// more than a small constant, even while the first batch is still waiting out its
     /// handshake deadline.
+    /// `Client::connect` is bounded on both legs: a listener that accepts and never answers
+    /// gives an error within the client handshake timeout instead of pinning the caller (the
+    /// editor dials from a helper thread now, but a bound is a bound; M7/E5 follow-up).
+    #[test]
+    fn a_client_gives_up_on_a_listener_that_never_answers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hold = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            thread::sleep(CLIENT_HANDSHAKE_TIMEOUT + Duration::from_secs(1));
+            drop(stream);
+        });
+        let started = Instant::now();
+        assert!(
+            Client::connect(addr, None, "test").is_err(),
+            "nothing answered, so this cannot be a client"
+        );
+        assert!(
+            started.elapsed() < CLIENT_HANDSHAKE_TIMEOUT + Duration::from_secs(1),
+            "gave up only after {:?}",
+            started.elapsed()
+        );
+        hold.join().unwrap();
+    }
+
     #[test]
     fn connections_past_the_cap_get_bye_without_spawning_a_thread() {
         let cfg = ServerConfig {

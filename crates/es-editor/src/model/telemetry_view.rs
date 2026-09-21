@@ -193,6 +193,14 @@ pub fn replay(messages: Vec<Message>) -> Source {
 /// which is also what a closed connection looks like — the editor keeps what it has rather
 /// than clearing the tab over a dropped socket.
 pub fn attach(addr: &str, token: &str) -> Result<Source, String> {
+    connect(addr, token).map(source_of)
+}
+
+/// The blocking half of [`attach`] - the TCP connect, the handshake and the subscription -
+/// which a caller may run off the UI thread. Both legs are bounded by `es_telemetry`'s client
+/// timeouts, so on a machine where a refused connect takes seconds (Windows) the caller waits
+/// for that bound and not forever.
+pub fn connect(addr: &str, token: &str) -> Result<Client, String> {
     let socket: SocketAddr = addr
         .trim()
         .parse()
@@ -205,12 +213,17 @@ pub fn attach(addr: &str, token: &str) -> Result<Source, String> {
     client
         .subscribe(RUN_STREAMS.to_vec())
         .map_err(|e| format!("{addr}: subscribing: {e}"))?;
+    Ok(client)
+}
+
+/// The non-blocking half: a connected client as the [`Source`] the tab pumps.
+pub fn source_of(mut client: Client) -> Source {
     let mut ack = Some(Message::HelloAck(HelloAck {
         version: PROTOCOL_VERSION,
         session_id: client.session_id,
         execution_hash: client.execution_hash,
     }));
-    Ok(Box::new(move || {
+    Box::new(move || {
         if let Some(ack) = ack.take() {
             return Some(ack);
         }
@@ -226,7 +239,7 @@ pub fn attach(addr: &str, token: &str) -> Result<Source, String> {
             }
         }
         None
-    }))
+    })
 }
 
 #[cfg(test)]
