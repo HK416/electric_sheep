@@ -13,8 +13,9 @@ use std::process::{Command, Stdio};
 
 use es_compile::PolicyBundle;
 use es_data::training::{
-    camera_suffix, has_image_input, has_pretrained_backbone, init_from, init_weights, state_dim,
-    Backbone, DatasetFacts, Plan, Recipe, Route, Step, StepKind, Training, TRAIN_ACT,
+    camera_suffix, has_image_input, has_pretrained_backbone, init_from, init_weights, rollout_docs,
+    state_dim, Backbone, DatasetFacts, Plan, Recipe, Route, Step, StepKind, Training, TRAIN_ACT,
+    TRAIN_PPO,
 };
 use es_data::{DatasetIdentity, LeRobotDataset, Split};
 use es_ir::observation::ObservationIr;
@@ -39,6 +40,20 @@ two it names decides the route:
 
   bundle   es dataset bake -> es policy lower -> python/es/train_act.py -> es policy pack
   lerobot  es dataset export -> lerobot-train -> es policy import-lerobot
+
+An `[rl]` table beside `[policy] bundle` picks a third route -- PPO against the Task IR's
+reward instead of recorded demonstrations (spec 13.4):
+
+  rl       es policy lower -> python/es/train_ppo.py -> es policy pack
+
+There is no bake, because there is no dataset: `[dataset]` is optional and training/
+dataset.lock reads {\"unset\": true}. `[run] steps` is the iteration count, `[run] batch` is
+refused by name (a PPO batch is [rl] envs * horizon, derived), and the Task, Observation and
+Deployment IR come out of the bundle -- written to <out>/docs/ and handed to the trainer as
+--rollout-docs, so the env stepped is the one the policy was declared against. Every sampled
+action goes through the Safety Plane before the actuator; there is no path around it
+(INV-12). The value MLP and the Gaussian's log_std are training-only state: they live in
+<out>/training/value.safetensors and are never packed into a bundle.
 
 A bundle whose Learning IR declares `VisionEncoder { pretrained = true }` also needs
 `[policy] base_model = \"<dir>/resnet18-imagenet1k-v1.safetensors\"`, the artifact
@@ -219,14 +234,24 @@ impl TrainWatch<'_> {
     /// a flag that changes nothing the run computes must not move a run's identity, and a
     /// `training.lock` that differed by whether someone was watching would make two identical
     /// runs look like two runs. `--dry-run` prints the same plan either way.
-    fn trainer_flags(&self, ir_route: bool) -> Vec<String> {
+    fn trainer_flags(&self, route: Route) -> Vec<String> {
         let mut out = Vec::new();
-        if self.publisher.is_none() || !ir_route {
+        if self.publisher.is_none() || !route.captures_trainer_stdout() {
             return out;
         }
         for (flag, n) in [
             ("--progress-every", self.progress_every),
-            ("--sample-every", self.sample_every),
+            // A rollout has no image batch to draw one from: `--sample-every` is
+            // `train_act.py`'s, and passing it to `train_ppo.py` would name a flag that
+            // trainer does not have (packet M8/S4b).
+            (
+                "--sample-every",
+                if route == Route::Rl {
+                    0
+                } else {
+                    self.sample_every
+                },
+            ),
         ] {
             if n > 0 {
                 out.push(flag.to_owned());
@@ -349,7 +374,7 @@ pub(crate) fn run(
 
     // --- the refusals that need the documents -------------------------------------------
     let bundle = match route {
-        Route::Ir => {
+        Route::Ir | Route::Rl => {
             let path = recipe.policy.bundle.clone().unwrap_or_default();
             let bytes = std::fs::read(&path).map_err(|e| bad(format!("{path}: {e}")))?;
             Some(PolicyBundle::open(&bytes).map_err(|e| bad(format!("{path}: {e}")))?)
@@ -358,7 +383,7 @@ pub(crate) fn run(
     };
     let external_obs = match route {
         Route::External => Some(open_observation(&recipe)?),
-        Route::Ir => None,
+        Route::Ir | Route::Rl => None,
     };
     let observation = match (&bundle, &external_obs) {
         (Some(b), _) => &b.observation,
@@ -369,11 +394,33 @@ pub(crate) fn run(
     // `--dry-run` above builds it without one on the IR route, which is what lets a plan be
     // printed on a machine that has neither the bundle nor the dataset.
     let plan = plan_with(&recipe, out, Some(observation))?;
-    if has_image_input(observation) && recipe.dataset.frames.is_none() {
-        return Err(bad(
-            "the Observation IR has an image input and [dataset] `frames` is not set; a run \
-             with a zero-filled image channel trains a policy that looks fine",
-        ));
+    match route {
+        // Refused here rather than by `Rollout::observe` on the first step of the first
+        // iteration: a renderer is not something `es_native.Rollout` links (spec 4.3), so a
+        // recipe that asks for pixels is asking for a run that cannot start -- and finding
+        // that out after the lowering and the interpreter probe is the kind of thing this
+        // command exists to stop (packet M8/S4b).
+        Route::Rl if has_image_input(observation) => {
+            return Err(bad(
+                "the policy's Observation IR has an image input and `[rl]` steps the env \
+                 through `es_native.Rollout`, which links no renderer. Train an RL policy \
+                 against a state-only Observation IR of the same task",
+            ))
+        }
+        Route::Rl => {}
+        _ if has_image_input(observation)
+            && recipe
+                .dataset
+                .as_ref()
+                .and_then(|d| d.frames.as_ref())
+                .is_none() =>
+        {
+            return Err(bad(
+                "the Observation IR has an image input and [dataset] `frames` is not set; a \
+                 run with a zero-filled image channel trains a policy that looks fine",
+            ))
+        }
+        _ => {}
     }
     // Packet M7/T5: the recipe and the Learning IR must agree about where this run starts.
     // Either disagreement writes a `base_model.lock` that does not describe the run -- a
@@ -440,9 +487,36 @@ pub(crate) fn run(
         (None, None) => unreachable!("the external route requires [policy] task"),
     };
 
-    let dataset = LeRobotDataset::open(&recipe.dataset.root).map_err(|e| bad(e.to_string()))?;
-    let facts = dataset_facts(&dataset)?;
-    check_task(&facts, &task_hash, retired)?;
+    // An RL run has no dataset to open, and says so rather than inventing one: `dataset.lock`
+    // reads `{"unset": true}` and is hashed as such (spec 28.10 rule 2, packet M8/S4b). The
+    // `check_task` comparison goes with it -- there are no demonstrations whose `task_hash`
+    // could disagree with the documents, because the rollout *is* the documents.
+    let (facts, opened) = if route == Route::Rl {
+        (
+            DatasetFacts {
+                hashes: es_ir::DatasetHash {
+                    content: [0; 32],
+                    schema: [0; 32],
+                    split: [0; 32],
+                },
+                episodes: 0,
+                frames: 0,
+                recorded_task: None,
+                split_source: "unset",
+            },
+            None,
+        )
+    } else {
+        let root = recipe
+            .dataset
+            .as_ref()
+            .map(|d| d.root.clone())
+            .unwrap_or_default();
+        let dataset = LeRobotDataset::open(&root).map_err(|e| bad(e.to_string()))?;
+        let facts = dataset_facts(&dataset)?;
+        check_task(&facts, &task_hash, retired)?;
+        (facts, Some(dataset))
+    };
 
     // --- the identity, before a single GPU-second ----------------------------------------
     let training_dir = out.join("training");
@@ -476,10 +550,12 @@ pub(crate) fn run(
 
     // The external route's exporter wants one directory per camera and `es loop collect
     // --frames` writes a flat one; packet M5/V19 bridged the two with `mkdir` and `ln -s`.
-    if route == Route::External {
-        if let Some(flat) = &recipe.dataset.frames {
-            mirror_frames(Path::new(flat), &dataset, &out.join("frames-in"))?;
-        }
+    if let (Route::External, Some(dataset), Some(flat)) = (
+        route,
+        &opened,
+        recipe.dataset.as_ref().and_then(|d| d.frames.as_ref()),
+    ) {
+        mirror_frames(Path::new(flat), dataset, &out.join("frames-in"))?;
     }
 
     // `train_act.py` writes its checkpoints and its loss curve where it is told and creates
@@ -496,6 +572,42 @@ pub(crate) fn run(
             Path::new(&init_weights(out)),
             &es_policy::weights::write_safetensors(&init.weights),
         )?;
+    }
+    // The three documents the rollout is built from, taken out of the bundle rather than off
+    // the recipe (packet M8/S4b): `es_native.Rollout` reads them as text, and a trainer
+    // stepping an env declared by anything but the policy's own bundle is the disagreement
+    // this writes out of existence. The scene is not among them -- the Task IR's `scene.path`
+    // names it, and the trainer resolves it relative to the repository root, which is where
+    // `es train` is run from.
+    if route == Route::Rl {
+        let bundle = bundle.as_ref().expect("the rl route opened its bundle");
+        let docs = PathBuf::from(rollout_docs(out));
+        for (name, text) in [
+            ("task.toml", es_ir::serial::task_to_toml(&bundle.task)),
+            (
+                "observation.toml",
+                es_ir::serial::observation_to_toml(&bundle.observation),
+            ),
+            (
+                "deployment.toml",
+                es_ir::serial::deployment_to_toml(&bundle.deployment),
+            ),
+        ] {
+            let text = text.map_err(|e| bad(format!("{name} does not serialise: {e}")))?;
+            write_file(&docs.join(name), text.as_bytes())?;
+        }
+        // And the scene beside them, copied rather than referenced, so `--rollout-docs` is
+        // one self-contained directory and the trainer parses no TOML to find an XML file.
+        // `scene.path` is repository-relative and `es train` runs from the repository root.
+        let scene = &bundle.task.scene.path;
+        let bytes = std::fs::read(scene).map_err(|e| {
+            bad(format!(
+                "{scene}: {e}\nThe Task IR's `scene.path` is repository-relative; run `es \
+                 train` from the repository root."
+            ))
+        })?;
+        write_file(&docs.join("scene.xml"), &bytes)?;
+        println!("rollout docs:  {}", docs.display());
     }
 
     // --- the plan ------------------------------------------------------------------------
@@ -520,7 +632,7 @@ pub(crate) fn run(
                 if let Some(p) = watch.publisher.as_deref_mut() {
                     p.train_begin(recipe.run.steps);
                 }
-                summary = spawn(step, route == Route::Ir, &mut watch)?;
+                summary = spawn(step, route, &mut watch)?;
             }
             StepKind::PolicyPack => {
                 crate::cmd::policy::pack(&step.args)?;
@@ -537,7 +649,7 @@ pub(crate) fn run(
     let manifest = json!({"schema_version": 1, "checkpoints": checkpoints});
     training.finish(
         &manifest,
-        &metrics(out, &summary),
+        &metrics(out, &summary, route),
         &hardware(&hardware_probe, route, &recipe.run.device, &interpreter),
     );
     training
@@ -716,10 +828,11 @@ print(json.dumps(d))
 /// line so a `{"progress": ...}` line reaches a viewer while the run is still going. The
 /// summary is still the last line and still parsed the same way, which is what keeps
 /// `training.lock` byte-identical (packet M7/E7).
-fn spawn(step: &Step, capture: bool, watch: &mut TrainWatch<'_>) -> Result<Value, CliError> {
+fn spawn(step: &Step, route: Route, watch: &mut TrainWatch<'_>) -> Result<Value, CliError> {
+    let capture = route.captures_trainer_stdout();
     let mut cmd = Command::new(&step.prefix[0]);
     cmd.args(&step.prefix[1..]).args(&step.args);
-    let extra = watch.trainer_flags(capture);
+    let extra = watch.trainer_flags(route);
     if !extra.is_empty() {
         println!("  + {}", extra.join(" "));
         cmd.args(&extra);
@@ -834,10 +947,32 @@ fn manifest_row(step: &Step, out: &Path) -> Result<Value, CliError> {
     }))
 }
 
-fn metrics(out: &Path, summary: &Value) -> Value {
-    let curve: Option<Value> = std::fs::read_to_string(out.join("metrics/loss.json"))
+fn metrics(out: &Path, summary: &Value, route: Route) -> Value {
+    // The RL route's curve is per iteration and carries nine fields per row, not one loss
+    // per optimizer step, so it is a different file rather than the same name holding two
+    // shapes (packet M8/S4b).
+    let name = match route {
+        Route::Rl => "metrics/loss-curve.json",
+        _ => "metrics/loss.json",
+    };
+    let mut curve: Option<Value> = std::fs::read_to_string(out.join(name))
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok());
+    // `metrics.json` is a `training_hash` slot, so what goes in it has to be what the run
+    // *computed* -- and `samples_per_sec` is a measurement of the machine, not of the run.
+    // The same recipe on a faster box is the same run, and leaving a wall-clock number in
+    // here would make `training_hash` unreproducible by construction, which is the one thing
+    // spec 3.5 tier 1 asks of it. The number stays in `metrics/loss-curve.json` on disk,
+    // where a person reads it, and the machine it describes is `hardware.json`'s (M8/S4b).
+    if route == Route::Rl {
+        if let Some(Value::Array(rows)) = &mut curve {
+            for row in rows {
+                if let Some(row) = row.as_object_mut() {
+                    row.remove("samples_per_sec");
+                }
+            }
+        }
+    }
     match (curve, summary) {
         (None, Value::Null) => json!({
             "loss": {"unset": true},
@@ -865,7 +1000,11 @@ fn hardware(probe: &Value, route: Route, device: &str, interpreter: &str) -> Val
         "git_describe": {"unset": true},
         "es_version": env!("CARGO_PKG_VERSION"),
         "interpreter": interpreter,
-        "trainer": match route { Route::Ir => TRAIN_ACT, Route::External => "lerobot-train" },
+        "trainer": match route {
+            Route::Ir => TRAIN_ACT,
+            Route::Rl => TRAIN_PPO,
+            Route::External => "lerobot-train",
+        },
     })
 }
 

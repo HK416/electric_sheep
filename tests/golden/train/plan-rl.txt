@@ -1,0 +1,5 @@
+# route: rl
+es policy lower --policy runs/rl-001/untrained.esb --out module
+python python/es/train_ppo.py --module module --rollout-docs docs --out weights/model.safetensors --value-out training/value.safetensors --checkpoint-at 50,200 --iterations 200 --seed 0 --lr 0.0003 --device cpu --loss-curve metrics/loss-curve.json --envs 8 --horizon 64 --epochs 4 --minibatches 4 --gamma 0.99 --lam 0.95 --clip 0.2 --entropy 0.005 --value-coef 0.5
+es policy pack --policy runs/rl-001/untrained.esb --weights weights/model-50.safetensors --out checkpoints/50.esb
+es policy pack --policy runs/rl-001/untrained.esb --weights weights/model-200.safetensors --out checkpoints/200.esb

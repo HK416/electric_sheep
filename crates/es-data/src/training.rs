@@ -93,7 +93,10 @@ fn refuse(msg: impl Into<String>) -> DataError {
 #[serde(deny_unknown_fields)]
 pub struct Recipe {
     pub kind: String,
-    pub dataset: DatasetRef,
+    /// Required by the two routes that read demonstrations, optional beside `[rl]`: PPO's
+    /// data is the rollout it generates, so there is nothing on disk to name (packet M8/S4b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<DatasetRef>,
     pub policy: PolicyRef,
     pub run: Run,
     /// `[init] policy = "<bundle.esb>"` — the policy this run starts from (packet M8/S1).
@@ -101,6 +104,10 @@ pub struct Recipe {
     /// `identity_hash` every recipe written before the packet had.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub init: Option<InitRef>,
+    /// `[rl]` — the reinforcement-learning route (packet M8/S4b). Absent is absent: every
+    /// recipe written before this packet parses, plans and hashes exactly as it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rl: Option<Rl>,
 }
 
 /// `[init]` — one field, because one is the whole question (packet M8/S1).
@@ -117,7 +124,49 @@ pub struct InitRef {
     pub policy: String,
 }
 
+/// `[rl]` — PPO over rollouts in our own `Env` (packet M8/S4b, spec 13.4).
+///
+/// **What is not here is the point** (`docs/design/rl-continuation.md` rule 1). PPO is a
+/// trainer, not an IR: the value head, the state-independent `log_std`, GAE and the entropy
+/// coefficient live in `python/es/train_ppo.py` and in spec 19.3's `training/`, and they move
+/// `training_hash` and never `learning_hash`. The deployed graph is whatever `[policy] bundle`
+/// already says it is, and this table does not touch it.
+///
+/// `[run] steps` is the iteration count beside this table, `[run] batch` is refused by name
+/// (PPO's batch is `envs * horizon`, derived, not declared), and `[dataset]` is optional
+/// because a rollout generates its own data.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Rl {
+    /// `"ppo"`, and nothing else yet. Named rather than assumed, so a second algorithm is a
+    /// value here and not a new table.
+    pub algo: String,
+    /// Environments stepped in lockstep — the simulation batch (spec 5.2).
+    pub envs: u32,
+    /// Control steps per env per iteration. One iteration collects `envs * horizon` rows.
+    pub horizon: u32,
+    /// Passes over each iteration's rows.
+    pub epochs: u32,
+    /// Minibatches per epoch; it has to divide `envs * horizon`.
+    pub minibatches: u32,
+    /// Discount.
+    pub gamma: f64,
+    /// GAE's `lambda`.
+    pub lam: f64,
+    /// The clipped objective's `epsilon`.
+    pub clip: f64,
+    /// Entropy bonus coefficient.
+    pub entropy: f64,
+    /// Value-loss coefficient.
+    pub value_coef: f64,
+    /// The Gaussian's initial `log_std`, which is training-only state and never enters a
+    /// document or a bundle. Absent is the importer's own when `[init]` carries one, and
+    /// `-0.5` otherwise — the trainer decides, because it is the side that can see both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init_log_std: Option<f64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DatasetRef {
     /// A `LeRobot` v2.1 root, as `es loop collect` writes it.
@@ -168,8 +217,12 @@ pub struct Lerobot {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Run {
+    /// Optimizer steps on the two demonstration routes; **PPO iterations** beside `[rl]`.
     pub steps: u32,
-    pub batch: u32,
+    /// Samples per optimizer step. Required by the two demonstration routes and refused by
+    /// name beside `[rl]`, where the batch is `envs * horizon` and is therefore derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch: Option<u32>,
     pub lr: f64,
     pub seed: u64,
     /// The seed of the augmentation RNG (packet M7/T6), `[run] seed` when it is absent.
@@ -233,6 +286,10 @@ pub enum Route {
     Ir,
     /// `export -> lerobot-train -> import-lerobot`: the architecture is `lerobot`'s.
     External,
+    /// `lower -> train_ppo.py -> pack`: the same Learning IR, optimized against a reward
+    /// instead of demonstrations (packet M8/S4b). No bake, because there is no dataset to
+    /// bake: the rollout is the data.
+    Rl,
 }
 
 impl Route {
@@ -240,7 +297,15 @@ impl Route {
         match self {
             Self::Ir => "ir",
             Self::External => "external",
+            Self::Rl => "rl",
         }
+    }
+
+    /// Does this route run a trainer whose stdout is one JSON line (and, when someone is
+    /// watching, `{"progress": ...}` lines before it)? Both of ours do; `lerobot-train`
+    /// streams a log and inherits instead.
+    pub fn captures_trainer_stdout(self) -> bool {
+        matches!(self, Self::Ir | Self::Rl)
     }
 }
 
@@ -255,6 +320,45 @@ impl Recipe {
         // Unconditionally, not behind the route test: a schedule that cannot run is refused
         // on both routes, and on this one for a second reason as well.
         let schedule_args = recipe.schedule_args()?;
+        recipe.rl_args()?;
+        match (route, recipe.run.batch) {
+            // Refused **by name**, not silently ignored: PPO's batch is `envs * horizon` and
+            // is therefore derived. A recipe that declared one would put a number into
+            // `precision.json` that nothing in the run ever used (spec 28.10 rule 2).
+            (Route::Rl, Some(batch)) => {
+                return Err(refuse(format!(
+                    "[run] `batch` is {batch} and this recipe has an `[rl]` table; a PPO \
+                     iteration's batch is `envs * horizon` ({} here), which is derived from \
+                     [rl] and not declared. Delete `[run] batch`",
+                    recipe
+                        .rl
+                        .as_ref()
+                        .map_or(0, |rl| u64::from(rl.envs) * u64::from(rl.horizon)),
+                )))
+            }
+            (Route::Ir | Route::External, None) => {
+                return Err(refuse(
+                    "[run] `batch` is required: it is how many samples one optimizer step \
+                     covers. Only an `[rl]` recipe leaves it out, because a rollout's batch \
+                     is `envs * horizon`",
+                ))
+            }
+            _ => {}
+        }
+        if route != Route::Rl && recipe.dataset.is_none() {
+            return Err(refuse(
+                "[dataset] `root` is required: this route trains on recorded demonstrations \
+                 and has to be told where they are. Only an `[rl]` recipe leaves it out, \
+                 because its data is the rollout it generates",
+            ));
+        }
+        if recipe.rl.is_some() && recipe.policy.lerobot.is_some() {
+            return Err(refuse(
+                "[rl] is the IR route's: it optimizes the graph `[policy] bundle` names \
+                 against a reward, and `lerobot-train` is an imitation trainer over a \
+                 dataset. A recipe describes one route",
+            ));
+        }
         if route == Route::External && recipe.policy.base_model.is_some() {
             return Err(refuse(
                 "[policy] `base_model` is the IR route's: it initialises a \
@@ -357,6 +461,93 @@ impl Recipe {
         Ok(args)
     }
 
+    /// The `[rl]` table validated, as `train_ppo.py`'s flags (packet M8/S4b).
+    ///
+    /// Empty when there is no `[rl]`, which is what keeps every pre-S4b plan and its golden
+    /// byte-identical. Every bound here is a refusal rather than a clamp: a coefficient
+    /// silently moved is a run nobody can reproduce from its own recipe.
+    pub fn rl_args(&self) -> Result<Vec<String>, DataError> {
+        let Some(rl) = &self.rl else {
+            return Ok(Vec::new());
+        };
+        if rl.algo != "ppo" {
+            return Err(refuse(format!(
+                "[rl] `algo` is {:?}; this packet implements \"ppo\"",
+                rl.algo
+            )));
+        }
+        for (field, value) in [("envs", rl.envs), ("horizon", rl.horizon)] {
+            if value == 0 {
+                return Err(refuse(format!("[rl] `{field}` is 0")));
+            }
+        }
+        for (field, value) in [("epochs", rl.epochs), ("minibatches", rl.minibatches)] {
+            if value == 0 {
+                return Err(refuse(format!("[rl] `{field}` is 0")));
+            }
+        }
+        let rows = u64::from(rl.envs) * u64::from(rl.horizon);
+        if rows % u64::from(rl.minibatches) != 0 {
+            return Err(refuse(format!(
+                "[rl] `minibatches` is {} and an iteration collects {rows} rows \
+                 (`envs` {} * `horizon` {}); it has to divide them, because a trailing short \
+                 minibatch would weight the last rows of every epoch differently",
+                rl.minibatches, rl.envs, rl.horizon
+            )));
+        }
+        for (field, value) in [("gamma", rl.gamma), ("lam", rl.lam)] {
+            if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                return Err(refuse(format!(
+                    "[rl] `{field}` is {value}; it is in [0, 1]"
+                )));
+            }
+        }
+        if !rl.clip.is_finite() || rl.clip <= 0.0 {
+            return Err(refuse(format!(
+                "[rl] `clip` is {}; the clipped objective's epsilon is positive",
+                rl.clip
+            )));
+        }
+        for (field, value) in [("entropy", rl.entropy), ("value_coef", rl.value_coef)] {
+            if !value.is_finite() || value < 0.0 {
+                return Err(refuse(format!("[rl] `{field}` is {value}")));
+            }
+        }
+        if let Some(log_std) = rl.init_log_std {
+            if !log_std.is_finite() {
+                return Err(refuse(format!("[rl] `init_log_std` is {log_std}")));
+            }
+        }
+        let mut args = vec![
+            s("--envs"),
+            rl.envs.to_string(),
+            s("--horizon"),
+            rl.horizon.to_string(),
+            s("--epochs"),
+            rl.epochs.to_string(),
+            s("--minibatches"),
+            rl.minibatches.to_string(),
+            s("--gamma"),
+            rl.gamma.to_string(),
+            s("--lam"),
+            rl.lam.to_string(),
+            s("--clip"),
+            rl.clip.to_string(),
+            s("--entropy"),
+            rl.entropy.to_string(),
+            s("--value-coef"),
+            rl.value_coef.to_string(),
+        ];
+        // Only when the recipe names one: absent means the trainer decides between the
+        // importer's own `log_std` and the constant, and a flag carrying a default would
+        // take that decision away from the side that can see both.
+        if let Some(log_std) = rl.init_log_std {
+            args.push(s("--init-log-std"));
+            args.push(log_std.to_string());
+        }
+        Ok(args)
+    }
+
     /// `bundle` xor `lerobot`, and the external route needs the three documents the import
     /// will carry into the bundle.
     pub fn route(&self) -> Result<Route, DataError> {
@@ -370,6 +561,7 @@ impl Recipe {
                 "[policy] sets neither `bundle` nor `lerobot`; one of them names the policy \
                  to train",
             )),
+            (Some(_), None) if self.rl.is_some() => Ok(Route::Rl),
             (Some(_), None) => Ok(Route::Ir),
             (None, Some(_)) => {
                 for (flag, value) in [
@@ -400,7 +592,7 @@ impl Recipe {
     /// a re-pack of the policy it started from; without one it is the untrained module, which
     /// is a real thing to want and a refusal nobody could defend.
     pub fn marks(&self) -> Result<Vec<u32>, DataError> {
-        if self.run.batch == 0 {
+        if self.run.batch == Some(0) {
             return Err(refuse("[run] `batch` is 0"));
         }
         if !self.run.lr.is_finite() || self.run.lr <= 0.0 {
@@ -420,10 +612,20 @@ impl Recipe {
         marks.push(self.run.steps);
         marks.sort_unstable();
         marks.dedup();
-        if let Some(bad) = marks.iter().find(|m| **m == 0 || **m > self.run.steps) {
+        // Mark 0 is "before the first update". On the two demonstration routes that state
+        // only exists for a `steps = 0` run, which is handled above; an `[rl]` run passes
+        // through it on the way to iteration 1, and it is the state a continuation run is
+        // judged against -- `checkpoints/0.esb` has to be `[init] policy` bit for bit
+        // (packet M8/S4b oracle 3). So it is a legal mark here and nowhere else.
+        let floor = u32::from(self.rl.is_none());
+        if let Some(bad) = marks.iter().find(|m| **m < floor || **m > self.run.steps) {
             return Err(refuse(format!(
-                "[run] `checkpoint_at` holds {bad}, which is not an optimizer step of a \
-                 {}-step run",
+                "[run] `checkpoint_at` holds {bad}, which is not an {} of a {}-step run",
+                if self.rl.is_some() {
+                    "iteration, or 0 for the state before the first one,"
+                } else {
+                    "optimizer step"
+                },
                 self.run.steps
             )));
         }
@@ -818,6 +1020,30 @@ pub fn ir_checkpoint(out: &Path, step: u32) -> String {
     under(out, &format!("weights/model-{step}.safetensors"))
 }
 
+/// The trainer of the RL route, relative to the repository root (packet M8/S4b).
+pub const TRAIN_PPO: &str = "python/es/train_ppo.py";
+
+/// `<out>/docs` — the bundle's Task, Observation and Deployment IR, written back out as the
+/// three `.toml` files `es_native.Rollout` is constructed from (packet M8/S4b).
+///
+/// The trainer is handed a directory rather than three paths because the three documents are
+/// one thing: they come out of one bundle, and a run that mixed a task from one with a
+/// deployment from another would be stepping an env nothing declared. The scene is not among
+/// them — the Task IR's `scene.path` already names it, and a second copy on the command line
+/// is a second thing that can disagree with the document.
+pub fn rollout_docs(out: &Path) -> String {
+    under(out, "docs")
+}
+
+/// `<out>/training/value.safetensors` — the value MLP, for resumption (spec 19.3, S4b).
+///
+/// Under `training/` and never under `checkpoints/`: it is training-only state, like the
+/// optimizer's moments, and `es policy pack` would refuse it anyway because the lowered
+/// module declares no such tensor (`docs/design/rl-continuation.md` rule 1).
+pub fn value_weights(out: &Path) -> String {
+    under(out, "training/value.safetensors")
+}
+
 /// `<out>/weights/init.safetensors` — the tensors [`init_from`] copied out of `[init] policy`,
 /// and the file the trainer is handed as `--init-weights` (packet M8/S1).
 ///
@@ -858,6 +1084,7 @@ impl Plan {
 
         match route {
             Route::Ir => {
+                let dataset = recipe.dataset.clone().unwrap_or_default();
                 let bundle = recipe.policy.bundle.clone().unwrap_or_default();
                 let mut bake = vec![
                     s("--policy"),
@@ -865,14 +1092,14 @@ impl Plan {
                     s("--out"),
                     under(out, "baked"),
                 ];
-                if let Some(frames) = &recipe.dataset.frames {
+                if let Some(frames) = &dataset.frames {
                     bake.push(s("--frames"));
                     bake.push(frames.clone());
                 }
                 if augmented {
                     bake.push(s("--for-training"));
                 }
-                bake.push(recipe.dataset.root.clone());
+                bake.push(dataset.root.clone());
                 steps.push(Step {
                     kind: StepKind::DatasetBake,
                     prefix: es(&["es", "dataset", "bake"]),
@@ -910,7 +1137,7 @@ impl Plan {
                         s("--seed"),
                         run.seed.to_string(),
                         s("--batch"),
-                        run.batch.to_string(),
+                        run.batch.unwrap_or_default().to_string(),
                         s("--lr"),
                         run.lr.to_string(),
                         s("--device"),
@@ -979,7 +1206,87 @@ impl Plan {
                     });
                 }
             }
+            // `lower -> train_ppo.py -> pack` (packet M8/S4b). No bake: the rollout is the
+            // data, so there is nothing on disk to run through the Observation IR ahead of
+            // time -- `es_native.Rollout` runs the same `CpuPlan` per step instead.
+            Route::Rl => {
+                let bundle = recipe.policy.bundle.clone().unwrap_or_default();
+                steps.push(Step {
+                    kind: StepKind::PolicyLower,
+                    prefix: es(&["es", "policy", "lower"]),
+                    args: vec![
+                        s("--policy"),
+                        bundle.clone(),
+                        s("--out"),
+                        under(out, "module"),
+                    ],
+                    step: None,
+                });
+                let marks_arg = marks
+                    .iter()
+                    .map(u32::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                steps.push(Step {
+                    kind: StepKind::Trainer,
+                    prefix: vec![s(interpreter), s(TRAIN_PPO)],
+                    args: vec![
+                        s("--module"),
+                        under(out, "module"),
+                        // The three documents the bundle carries, written back out by the
+                        // shell: `Rollout` takes them as text, and taking them from the
+                        // bundle is what stops a run from stepping an env that the policy
+                        // being trained was not declared against.
+                        s("--rollout-docs"),
+                        rollout_docs(out),
+                        s("--out"),
+                        under(out, "weights/model.safetensors"),
+                        s("--value-out"),
+                        value_weights(out),
+                        s("--checkpoint-at"),
+                        marks_arg,
+                        s("--iterations"),
+                        run.steps.to_string(),
+                        s("--seed"),
+                        run.seed.to_string(),
+                        s("--lr"),
+                        run.lr.to_string(),
+                        s("--device"),
+                        run.device.clone(),
+                        s("--loss-curve"),
+                        under(out, "metrics/loss-curve.json"),
+                    ]
+                    .into_iter()
+                    .chain(recipe.rl_args()?)
+                    .chain(recipe.schedule_args()?)
+                    .chain(
+                        recipe
+                            .init
+                            .iter()
+                            .flat_map(|_| [s("--init-weights"), init_weights(out)]),
+                    )
+                    .chain(run.extra.iter().cloned())
+                    .collect(),
+                    step: None,
+                });
+                for mark in &marks {
+                    steps.push(Step {
+                        kind: StepKind::PolicyPack,
+                        prefix: es(&["es", "policy", "pack"]),
+                        args: vec![
+                            s("--policy"),
+                            bundle.clone(),
+                            s("--weights"),
+                            ir_checkpoint(out, *mark),
+                            s("--out"),
+                            under(out, &format!("checkpoints/{mark}.esb")),
+                        ],
+                        step: Some(*mark),
+                    });
+                }
+            }
             Route::External => {
+                let dataset = recipe.dataset.clone().unwrap_or_default();
                 let lerobot = recipe.policy.lerobot.clone().unwrap_or_else(|| Lerobot {
                     kind: String::new(),
                     chunk_size: 0,
@@ -994,11 +1301,11 @@ impl Plan {
                 })?;
                 let mut export = vec![
                     s("--lerobot-v3"),
-                    recipe.dataset.root.clone(),
+                    dataset.root.clone(),
                     s("--out"),
                     under(out, "ds-v3"),
                 ];
-                if recipe.dataset.frames.is_some() {
+                if dataset.frames.is_some() {
                     // Not the recipe's path: `export` wants one directory per camera and
                     // `es loop collect --frames` writes a flat one, so the shell mirrors the
                     // tiles into `<out>/frames-in/<camera>` first. Packet M5/V19 did that by
@@ -1028,7 +1335,7 @@ impl Plan {
                     s("--policy.push_to_hub=false"),
                     format!("--policy.optimizer_lr={}", run.lr),
                     format!("--steps={}", run.steps),
-                    format!("--batch_size={}", run.batch),
+                    format!("--batch_size={}", run.batch.unwrap_or_default()),
                     format!("--seed={}", run.seed),
                     format!("--save_freq={}", recipe.save_freq()?),
                     format!("--output_dir={}", under(out, "lerobot")),
@@ -1296,10 +1603,7 @@ impl Cycle {
             Some(text) => Recipe::parse(text)?,
             None => Recipe {
                 kind: s(KIND),
-                dataset: self.train.dataset.clone().unwrap_or(DatasetRef {
-                    root: String::new(),
-                    frames: None,
-                }),
+                dataset: Some(self.train.dataset.clone().unwrap_or_default()),
                 policy: self.train.policy.clone().ok_or_else(|| {
                     refuse(
                         "[train] names neither `recipe` nor `policy`: one of them says what is \
@@ -1313,15 +1617,20 @@ impl Cycle {
                 // one reaches `[init]` through `[train] recipe`, where the whole recipe --
                 // and its `init.lock` -- is one document (packet M8/S1).
                 init: None,
+                // A cycle collects demonstrations and trains on them; `[rl]` generates its
+                // own data and has no collect stage to chain to. Reached, like `[init]`,
+                // through `[train] recipe`, where the whole recipe is one document.
+                rl: None,
             },
         };
+        let dataset = recipe.dataset.get_or_insert_with(DatasetRef::default);
         if let Some(collect) = &self.collect {
-            recipe.dataset.root = under(out, "collect/ds");
-            recipe.dataset.frames = collect.frames.then(|| under(out, "collect/frames"));
+            dataset.root = under(out, "collect/ds");
+            dataset.frames = collect.frames.then(|| under(out, "collect/frames"));
         } else if let Some(root) = &self.dataset {
-            recipe.dataset.root.clone_from(root);
+            dataset.root.clone_from(root);
         }
-        if recipe.dataset.root.is_empty() {
+        if dataset.root.is_empty() {
             return Err(refuse(
                 "[train] is inline with no `[train.dataset] root`, and the cycle collects \
                  nothing to put there",
@@ -1586,6 +1895,21 @@ impl Training {
         // reports when the run ends. `lerobot`'s own optimizer block is not this side's to
         // declare, so it stays unset (T4 owns the optimizer and the schedule).
         let optimizer = match route {
+            // `train_ppo.py` builds `Adam`, not `AdamW`: PPO's reference implementations use
+            // it, and decoupled weight decay on a policy that is already entropy-regularised
+            // is a second regulariser nobody asked for. Its decay is therefore torch's
+            // `Adam` default -- zero -- unless the recipe names one (packet M8/S4b).
+            Route::Rl => {
+                let mut optimizer = json!({
+                    "kind": "Adam", "lr": run.lr, "betas": [0.9, 0.999], "eps": 1e-8,
+                    "weight_decay": run.weight_decay.unwrap_or(0.0),
+                    "declared_by": "train_ppo.py",
+                });
+                if let Some(clip) = run.grad_clip {
+                    optimizer["grad_clip"] = json!(clip);
+                }
+                optimizer
+            }
             Route::Ir => {
                 let mut optimizer = json!({
                     "kind": "AdamW", "lr": run.lr, "betas": [0.9, 0.999], "eps": 1e-8,
@@ -1607,6 +1931,10 @@ impl Training {
             }),
         };
         let base_model = match route {
+            // A PPO run starts from `[init]` or from the lowering's own draw, and either way
+            // not from ImageNet: `[policy] base_model` needs a `VisionEncoder`, and the RL
+            // route's graph reads state.
+            Route::Rl => json!({"source": "none"}),
             // Packet M7/T5: a *verified* provenance. `es train` hashed the file, agreed with
             // the lock beside it and with the pin, and what goes into the slot is what the
             // lock said about the weights -- not about the machine that fetched them.
@@ -1693,15 +2021,24 @@ impl Training {
                 },
             }),
         );
-        put(
-            "dataset.lock",
-            json!({
-                "root": recipe.dataset.root, "episodes": data.episodes, "frames": data.frames,
-                "content": hex(&data.hashes.content), "schema": hex(&data.hashes.schema),
-                "split": hex(&data.hashes.split), "split_source": data.split_source,
-                "recorded_task": data.recorded_task,
-            }),
-        );
+        // `{"unset": true}`, and hashed as such, for a run whose data is the rollout it
+        // generates (spec 28.10 rule 2: real or unset, never fabricated). A zero digest here
+        // would claim a dataset of thirty-two zero bytes, and a synthesised one would claim a
+        // dataset that does not exist (packet M8/S4b).
+        match &recipe.dataset {
+            Some(dataset) if route != Route::Rl => put(
+                "dataset.lock",
+                json!({
+                    "root": dataset.root, "episodes": data.episodes, "frames": data.frames,
+                    "content": hex(&data.hashes.content), "schema": hex(&data.hashes.schema),
+                    "split": hex(&data.hashes.split), "split_source": data.split_source,
+                    "recorded_task": data.recorded_task,
+                }),
+            ),
+            // `canon_json` of this is [`UNSET`] byte for byte, which is what makes the slot
+            // the same "this run does not know" every other unset slot is.
+            _ => put("dataset.lock", json!({"unset": true})),
+        }
         put("base_model.lock", base_model);
         // The slot the trainer is *given* (`--augmentation`), not a description of one: the
         // chains here are the nodes `python/es/augment.py` applies, and the seed is the one it
@@ -1730,7 +2067,11 @@ impl Training {
             "precision.json",
             json!({
                 "dtype": "fp32", "amp": "off",
-                "gradient_accumulation": match route { Route::Ir => run.batch, Route::External => 1 },
+                "gradient_accumulation": match route {
+                    Route::Ir => run.batch.unwrap_or_default(),
+                    // One optimizer step per minibatch, nothing accumulated across them.
+                    Route::External | Route::Rl => 1,
+                },
             }),
         );
         put("topology.json", json!({"world_size": 1}));
@@ -2228,10 +2569,13 @@ fov = 36
         let recipe = cycle
             .training(Some(IR), Path::new("/tmp/run"))
             .expect("resolves");
-        assert!(recipe.dataset.root.ends_with("collect/ds"), "{recipe:?}");
+        let dataset = recipe
+            .dataset
+            .as_ref()
+            .expect("the IR route names a dataset");
+        assert!(dataset.root.ends_with("collect/ds"), "{recipe:?}");
         assert!(
-            recipe
-                .dataset
+            dataset
                 .frames
                 .as_deref()
                 .unwrap()

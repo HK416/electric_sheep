@@ -1313,3 +1313,129 @@ trainer's summary agrees from its side: `"init_weights"` names the file and
 Kept under `~/artifacts/plan-s/s1/`: `training-s1.toml`, `train.log`, and `run/` (the baked
 set, `module/`, `training/`'s twelve slots plus `init.lock`, `training.lock`,
 `weights/init.safetensors`, `weights/model-0.safetensors`, `checkpoints/0.esb`).
+
+## 15. The RL route (packet M8/S4b)
+
+Sections 1–14 describe one shape of training: a dataset of demonstrations, an optimizer that
+fits them, and a `dataset.lock` that says which demonstrations. PPO has none of that. Its data
+is the rollout it generates, its signal is the Task IR's reward, and the thing it needs from
+this command is not a bake but an env. So `[rl]` is a third route beside `ir` and `external`,
+and almost all of it is the two routes' machinery reused rather than a second `es train`.
+
+### 15.1 The recipe gains one table
+
+```toml
+kind = "training"
+
+[policy]
+bundle = "runs/rl-001/untrained.esb"
+
+[rl]
+algo        = "ppo"
+envs        = 8       # the simulation batch
+horizon     = 64      # control steps per env per iteration
+epochs      = 4       # passes over each iteration's rows
+minibatches = 4       # per epoch; has to divide envs * horizon
+gamma       = 0.99
+lam         = 0.95    # GAE
+clip        = 0.2
+entropy     = 0.005
+value_coef  = 0.5
+# init_log_std = -0.5   # optional; absent is -0.5, or the importer's own via [init]
+
+[run]
+steps         = 200   # PPO iterations
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [50]
+device        = "cpu"
+```
+
+`tests/fixtures/rl/training-rl-demo.toml` is the committed example and
+`tests/golden/train/plan-rl.txt` its plan. Both are **additions**: the four recipes and three
+goldens that existed before this packet are untouched, and so is every hash they carry.
+
+Three fields behave differently here, and each is a refusal rather than a silent reading:
+
+* **`[dataset]` is optional.** There is nothing on disk to name, so `training/dataset.lock`
+  reads `{"unset": true}` and is hashed as such — never a zero digest and never a fabricated
+  one (§28.10 rule 2). On the other two routes a missing `[dataset]` is still refused by name.
+* **`[run] batch` is refused by name.** A PPO iteration's batch is `envs * horizon`, derived.
+  A second copy of it in the recipe is a number that could disagree with the one the run used,
+  and the refusal says what the derived value would have been.
+* **`[run] checkpoint_at` may hold `0`.** Mark 0 is "before the first update" — the state a
+  continuation run is judged against. On the two demonstration routes that state only exists
+  for a `steps = 0` run (section 14); an `[rl]` run passes through it on the way to iteration 1.
+
+Everything else in `[run]` keeps its meaning: `steps` is the iteration count, and `seed`,
+`device`, `lr`, `grad_clip`, `weight_decay`, `schedule` and `extra` reach `train_ppo.py` as the
+same flags they reach `train_act.py` as.
+
+### 15.2 The plan
+
+```
+# route: rl
+es policy lower --policy runs/rl-001/untrained.esb --out module
+python python/es/train_ppo.py --module module --rollout-docs docs \
+    --out weights/model.safetensors --value-out training/value.safetensors \
+    --checkpoint-at 50,200 --iterations 200 --seed 0 --lr 0.0003 --device cpu \
+    --loss-curve metrics/loss-curve.json --envs 8 --horizon 64 --epochs 4 \
+    --minibatches 4 --gamma 0.99 --lam 0.95 --clip 0.2 --entropy 0.005 --value-coef 0.5
+es policy pack --policy runs/rl-001/untrained.esb --weights weights/model-50.safetensors --out checkpoints/50.esb
+es policy pack --policy runs/rl-001/untrained.esb --weights weights/model-200.safetensors --out checkpoints/200.esb
+```
+
+No bake, because there is no dataset: `es_native.Rollout` runs the policy's own `CpuPlan` once
+per control step, which is the same plan `es eval run` runs at inference. The lowering and the
+pack steps are the IR route's, word for word — the same `es policy lower`, the same trust
+boundary in `es policy pack`, the same `checkpoints/<mark>.esb`.
+
+**`--rollout-docs` is a directory, and `es train` writes it.** Before the plan runs, the shell
+takes the Task, Observation and Deployment IR *out of the bundle*, serialises them back to
+`<out>/docs/{task,observation,deployment}.toml`, and copies the scene the Task IR names to
+`<out>/docs/scene.xml`. The trainer is then handed one self-contained directory. Two things
+follow, and both are the point: the env stepped is the one the policy was declared against
+(not whatever a recipe field happened to name), and `--dry-run` still opens no bundle, so the
+golden stays judgeable on a machine that has only the repository.
+
+### 15.3 What `training/` holds for an RL run
+
+The twelve slots are the twelve slots. Four of them read differently:
+
+| slot | RL route |
+|---|---|
+| `config.json` | carries the `[rl]` table verbatim, because it serialises the whole recipe |
+| `dataset.lock` | `{"unset": true}` |
+| `optimizer.json` | `Adam`, `declared_by: train_ppo.py` — not `AdamW`; decay defaults to torch's `0.0` |
+| `base_model.lock` | `{"source": "none"}`; `[policy] base_model` needs a `VisionEncoder` |
+
+Plus one file that is **not** a slot: `training/value.safetensors`, the value MLP and the
+Gaussian's `log_std`. It is written for resumption and never packed into a bundle — and could
+not be, because the lowered module declares no such tensor and `es policy pack` refuses a key
+it does not know. That is the structural half of `rl-continuation.md`'s rule 1: PPO is a
+trainer, not an IR.
+
+`metrics/loss-curve.json` is one object per iteration with `loss`, `policy_loss`, `value_loss`,
+`entropy`, `return`, `episode_len`, `envelope_violation_rate`, `executed_ne_sampled_rate` and
+`samples_per_sec`. The last of those is dropped from `metrics.json` on the way into
+`training_hash`: it is a measurement of the machine, and the same recipe on a faster box is the
+same run. The number stays in the file on disk, where a person reads it, and the machine it
+describes is `hardware.json`'s. `metrics/env-metrics.json` beside it carries the nine §12.4
+fields as `Rollout::metrics()` gives them, for the same reason and with the same treatment —
+a domain the path never runs stays `null` rather than a fabricated zero, and there is
+deliberately no single `step/s`.
+
+### 15.4 The plane is on, and what it did is a column
+
+Every sampled action goes through `SafetyPlane::validate` before it reaches an actuator, and
+there is no flag on either side of the process boundary that changes that (INV-12). What the
+plane did is not hidden either: `envelope_violation_rate` is how often it raised an event and
+`executed_ne_sampled_rate` how often what reached the actuator was not what was sampled. On the
+demo task both read `1.00` — see `rl-continuation.md` section 7, where that number is the
+finding rather than a footnote.
+
+`tests/fixtures/rl/deployment-rl.toml` widens exactly one watchdog for this,
+`envelope_violation_rate.max_frac` 0.9 → 1.0, and moves three fields that horizon-1 control
+forces (`action.horizon`, `action.execute_chunk`, `rate.inference`). Every safety limit is the
+demo's own number, unchanged. Widening the envelope is the sanctioned move; disabling the plane
+is not.
