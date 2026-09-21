@@ -51,6 +51,12 @@ crates/es-policy/src/lower/torch.rs
 crates/es-policy/tests/**
 crates/es-policy/python/**
 python/es/builder.py
+crates/es-ir-types/src/codes.rs
+crates/es-data/src/lerobot_config.rs
+crates/es-policy/src/reference.rs
+crates/es-editor/tests/common/mod.rs
+crates/es-runtime-embedded/tests/embedded.rs
+crates/es/tests/cli.rs
 docs/design/learning-lowering.md
 docs/design/learning-lowering.ko.md
 docs/packets/M8/S2a-activation-squash.md
