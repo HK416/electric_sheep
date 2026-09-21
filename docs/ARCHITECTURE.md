@@ -3057,6 +3057,21 @@ that decision (2026-09-21). (2) S2c's source framework is brax PPO (MuJoCo Playg
 pinned) — Isaac is second. (3) S4c's continuation budget (steps, wall-clock) is set after
 S4b's measurement.
 
+**M8 result (2026-09-22, `docs/reviews/M8.md`).** Every row of the ladder closed, with **S4d** (the reward cone: `Expr::Sqrt`,
+`Source::Xpos` lanes, `Norm{L2}`) and **S4e** (the observation capture: `JointState.quantity`, `Capture::Qvel/BodyPose`) added to
+wave 3 for the gap S4b found. The four rules held and `es-safety` changed by one line (the window). Measured (oracle server): R1's
+`(cell, episode)` partition is bit-identical at jobs 1·2·4 on the committed documents and the 16-episode nominal suite drops from
+125.7 s to 60.5 s (48 %); U3 re-measures byte-identical (the window only matters near `max_frac 0.9`); S2c trained a reach policy
+with brax PPO on our scene (a derived MJX scene with 35 contact pairs excluded) to 1.00 — and **0.00 on the committed scene** (it
+reaches through the table); S2b reproduces brax bitwise against its reconstruction, 9.7e-7 against JAX, rsl_rl and rl_games
+bitwise; S1 re-packs U3 at 0 steps bitwise; S4b is bitwise across two runs on the CPU backend; S4e's reach training peaks at
+held-out **0.5625** at 4,000 iterations (target 0.8 not reached, decaying after); **S4c**: imported 0.00, continued 0.00 (the
+weights are bit-identical after 4,000 iterations — the tanh saturates on the committed observations and the gradient is exactly
+zero), from scratch with the same graph 0.083, from scratch 64×64 **0.417** (three seeds). Passed as engineering; the campaign's
+claim ("continue an imported policy") is not demonstrated, and the cause is the source policy (the scene's contact set, the
+normalizer's saturation), not the runtime. The review's human decisions: the plane clamping every RL tick (S-3), the worker
+thread pool changing CPU numerics (S-1), `scene_hash` depending on libm (S-2), and where the next source policy is trained.
+
 ---
 
 ## 29. Risks

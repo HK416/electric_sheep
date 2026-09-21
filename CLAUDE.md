@@ -12,8 +12,13 @@ externally trained LeRobot ACT runs bitwise through the runtime and passes the d
 batched lowering + lr schedule + pretrained backbone + augmentation, and the RS/PT render quality ladder; on the committed documents the IR-graph policy
 U3 passes the demo's acceptance under the declared latency (held-out 0.5625); the addendum in `docs/reviews/M7.md` records the three
 follow-ups E7 (collect/train/cycle publish telemetry, the editor draws the loss curve), E8 (replay depth buffer) and R5 (a Task IR
-sensor declares `render = { path = "pt", … }`; absent = default = today's hash). The next campaign waits on the human decisions in `docs/reviews/M7.md`
-(the stop rule's reading, episode-boundary semantics, the SSIM threshold). M6 (quadruped, `docs/design/quadruped-track.md`) is parked pending the owner's decision. GPU paths (es-gpu, es-render, Observation
+sensor declares `render = { path = "pt", … }`; absent = default = today's hash). **M8 plan S** (spec §28.11, packets in `docs/packets/M8/`, `docs/design/rl-continuation.md`) closed 2026-09-22: the episode-boundary
+decision (yes/yes) shipped the `(cell, episode)` partition (2× evaluation, nothing moved); `es policy import-rl` brings a brax/rsl_rl/rl_games
+PPO actor into a bundle (bitwise / 9.7e-7); `[init] policy` + `init.lock`; `[rl]` PPO through `es_native.Rollout` with the Safety Plane on,
+bitwise on the CPU backend; the reach task trains from scratch to 0.42 (three seeds) but the imported brax policy scores 0.00 here and
+continuation cannot move it (saturated tanh, zero gradient). The next campaign waits on the human decisions in `docs/reviews/M8.md`
+(the plane in RL rollouts, the worker thread pool in `execution_hash`, `scene_hash` across platforms, where the next source policy is trained)
+and the older ones in `docs/reviews/M7.md` (the stop rule's reading, the SSIM threshold). M6 (quadruped, `docs/design/quadruped-track.md`) is parked pending the owner's decision. GPU paths (es-gpu, es-render, Observation
 IR GPU lowering, MJWarp/Newton adapters) were verified on an RTX 4060 with the Vulkan SDK;
 the Python oracles (MuJoCo, PyTorch, LeRobot ACT checkpoint, diffusers) run from the project
 venv `.venv` (set `ES_PYTHON` to its interpreter). Still open: M3 W1 real-robot
