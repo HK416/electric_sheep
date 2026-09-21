@@ -1,0 +1,41 @@
+# The reach task trained from scratch on the *imported* architecture (packet M8/S4c): the
+# control row for `training-reach-continued.toml`. It is that file minus the `[init]` table
+# and nothing else, so the only thing that differs between the two measurements is where the
+# weights start -- the graph, the budget, the algorithm block, the optimizer and the seeds are
+# shared.
+#
+# `[policy] bundle` still names the imported bundle, because the graph being trained is the
+# source's 26 -> [256, 256] -> 6 swish network. Its weights are *not* read: `es train` random-
+# initializes the lowered module unless `[init] policy` says otherwise, so the bundle here is
+# an architecture and a set of documents, not a starting point. See
+# `training-reach-continued.toml`'s header for how `runs/reach-001/imported.esb` is built.
+#
+# The third control of the table is `training-reach.toml` itself -- the same budget on the
+# committed 64 x 64 relu graph.
+#
+# Seeds 1 and 2 of the measurement are this file with `[run] seed` changed and nothing else.
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-001/imported.esb"
+
+[rl]
+algo        = "ppo"
+envs        = 16
+horizon     = 64
+epochs      = 4
+minibatches = 4
+gamma       = 0.99
+lam         = 0.95
+clip        = 0.2
+entropy     = 0.005
+value_coef  = 0.5
+
+[run]
+steps         = 4000
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [1000, 2000, 3000]
+device        = "cpu"
+interpreter   = "python"
