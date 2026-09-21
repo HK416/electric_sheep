@@ -193,7 +193,7 @@ warning: camera "cam_front": info.json declares a video feature and read_episode
 
 ```rust
 pub struct LoopStep {
-    pub kind: LoopKind,                       // Collect | Intervene | Distill
+    pub kind: LoopKind,   // Collect | Intervene | Distill | Train | Evaluate
     pub inputs: BTreeMap<String, String>,     // name -> hex digest or path
     pub outputs: BTreeMap<String, String>,
     pub created: u64,                         // unix seconds
@@ -208,6 +208,8 @@ pub struct LoopStep {
 | `collect` | `task`, `observation`, `learning`, `deployment`(번들 매니페스트의 해시), `seed`, `episodes` | `content`, `schema` |
 | `intervene` | `content`(이전), `segments`(개수) | `content`(이후), `schema` |
 | `distill` | 각 입력 root의 `content`/`schema`, `seed`, `ratios` | `content`, `schema`, `split`, `training_hash` |
+| `train` | `content`, `schema`, `split`, `identity_hash`, `dataset`, `expert_gate` | `training_hash`, 체크포인트마다 `checkpoint.<mark>` |
+| `evaluate` | `evaluation_hash`, `policy_hash`, `deployment`, `observation`, `expert` | `report`(`report.json`의 blake3), `passed`, `success_rate` |
 
 이 체인 속성은 리뷰어가 눈으로 확인하는 것이자 CI의 오라클이 검사하는 것이다:
 단계 *n*의 입력 `content`는 단계 *n-1*의 출력 `content`다. `distill` 단계는
@@ -219,11 +221,46 @@ pub struct LoopStep {
 것과 같은 이유다(§10.4): 출처(provenance)는 정체성(identity)이 아니다.
 `loop.jsonl` 안의 어떤 것도 해시로 들어가지 않는다.
 
-`loop.jsonl`은 *학습된* 체크포인트의 `policy_hash`나 `evaluation_hash`를
-의도적으로 기록하지 **않는다**: 이 세 명령 어느 것도 그것들을 만들지 않기 때문이다.
-§13.3의 규율 — 데이터와 정책이 움직이는 동안 `evaluation_hash`를 고정하는 것 —
-은 이미 구현된 `es eval compare`가 강제하며, 바뀐 `evaluation_hash`가 비교를 무효화하는
-곳이 바로 거기다.
+### 4.1 `train`과 `evaluate` — 원장이 §13.1 루프의 끝까지 닿는다 (패킷 M7/T2)
+
+M7/T2 이전까지 원장은 `distill`에서 멈춰 있었다: 데이터셋이 정책을 학습시켰다는 것도,
+정책이 판정받았다는 것도 기록하지 않았고, 따라서 §13.3의 "반복 *n*은 반복 *n-1*의
+함수다"는 데이터에 대해서만 검사 가능했다. `es loop cycle`이 남은 두 종류를 추가한다.
+필드가 아니라 *변형(variant)*을 추가한 것이 옛 `es`가 쓴 모든 줄이 여전히 읽히는
+이유다 — serde는 태그만 보고 그 외에는 아무것도 보지 않는다.
+
+* **`train`**은 실행이 무엇을 읽었고 무엇을 만들었는지를 기록한다. `checkpoint.<mark>`는
+  하나로 묶은 값이 아니라 체크포인트마다 키 하나다 — `checkpoint.20000 -> <policy_hash>` —
+  그것에 묻는 유일한 질문이 멤버십이기 때문이다. `expert_gate`는 사이클이 게이트를
+  실행했을 때만 있다(`passed`, 또는 `skipped (--skip-expert-gate)`): 하니스가 전문가를
+  통과시킨 적 없이 학습한 사이클은 그렇게 한 것처럼 보이는 대신 그렇게 말한다
+  (§28.9 규칙 1).
+* **`evaluate`**는 어떤 정책이, 어떤 조건에서, 무엇을 냈는지를 기록한다. `policy_hash`는
+  §19.3의 `H(training_hash, checkpoint_hash)`이며 — `train` 단계의 `checkpoint.<mark>`가
+  나르는 바로 그 수 — 그것이 체인을 검사 가능하게 만든다. **전문가 게이트** 역시
+  `evaluate` 단계이고, `expert` 입력으로 구별된다: 체크포인트가 아니라 스크립트된
+  시연자를 판정하기 때문이다.
+
+둘 다 두 번 추가된다 — 데이터셋 root의 원장(학습시킨 것, 또는 판정받은 것)과
+`<out>/loop.jsonl`에 — `distill`이 이미 따르는 규칙 그대로다.
+
+`es_data::check_chain(&[LoopStep])`가 그 속성을 함수로 만든 것이다:
+
+```
+train.inputs.content    == 그 앞의 collect/intervene/distill이 쓴 content
+evaluate.inputs.policy_hash ∈ { 그 앞 train 단계들의 checkpoint.* }
+```
+
+두 절반 모두 **연결할 앞선 단계가 있을 때만** 성립한다 — `evaluate`만 담긴 원장(다른
+곳에서 온 번들에 대한 맨몸의 `es eval run`)은 어떤 체인도 주장하지 않으므로 어떤 체인도
+깨지 않는다 — 그리고 전문가 게이트는 위치가 아니라 이름으로 건너뛴다. 체인이 끊기면 두
+해시와 mark를 메시지에 담아 거부한다. `es loop cycle`은 실행이 끝난 뒤 한 번 호출하고,
+`crates/es-data/src/collect.rs::loop_train_and_evaluate_steps_chain`이 그 오라클이다.
+
+§13.3의 나머지 절반 — 데이터와 정책이 움직이는 동안 `evaluation_hash`를 고정하는 것 —
+은 `last_evaluation_hash(&steps)`와 `es loop cycle`의 거부다. 두 리포트를 나란히 읽는
+자리는 여전히 이미 구현된 `es eval compare`다. `docs/design/training-recipe.ko.md`
+12절을 보라.
 
 ---
 

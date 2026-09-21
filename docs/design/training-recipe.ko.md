@@ -604,3 +604,250 @@ Learning IR의 필드이므로 lowering된 모듈이 그것을 `requires_grad_(F
 처음부터 학습하는 쪽이고, 그 옆의 계획 골든은 계속 렌더링되어야 하기 때문이다. 실험의 사전학습
 쪽은 `tests/fixtures/visible-learning/learning-pretrained.toml`이고, 그것을 가리키는 레시피는
 U-측정의 것이지 커밋된 픽스처가 아니다.
+
+---
+
+## 12. 사이클 (패킷 M7/T2)
+
+§13.1은 루프를 그린다 — 수집, 학습, 평가, 관찰 — 그리고 T1이 그중 한 칸을 명령 하나로
+만들었다. 나머지 셋은 사람이 경로와 해시를 손으로 꿰는 네 개의 명령으로 남아 있었고,
+`loop.jsonl`은 `distill`에서 멈춰 있었다: 데이터셋이 정책을 학습시켰다는 것도, 정책이
+판정받았다는 것도 기록하지 않았다. `es loop cycle`은 그 칸 전체를 문서 하나와 원장 하나
+아래에 둔다.
+
+```
+es loop cycle --recipe <cycle.toml> [--out <dir>] [--dry-run] [--from <stage>]
+              [--allow-new-evaluation] [--skip-expert-gate]
+```
+
+### 12.1 문서는 단계를 이름 붙일 뿐, 다시 서술하지 않는다
+
+```toml
+kind  = "cycle"
+scene = "tests/fixtures/mjcf/so101_pick_place.xml"
+
+[collect]                        # 선택적. 재사용하려면 대신 `dataset = "<root>"`
+policy   = "runs/collect-001/untrained.esb"
+expert   = "so101-pick-place"    # 학습된 정책 자신의 롤아웃이면 생략
+episodes = 200
+seed     = 1
+frames   = true
+
+[train]
+recipe = "tests/fixtures/visible-learning/training.toml"   # T1의 레시피, 경로 또는 인라인
+
+[eval]
+config     = "tests/fixtures/visible-learning/evaluation.toml"
+checkpoint = "last"              # 또는 레시피의 `checkpoint_at`이 쓰는 mark
+jobs       = 6
+frames     = true
+
+[showcase]                       # 선택적. `render` 피처가 필요하다
+cell    = "nominal-00"
+eye     = [0.66, -0.46, 0.52]
+look_at = [0.14, -0.04, 0.04]
+fov     = 36
+width   = 1280
+height  = 720
+```
+
+2절이 레시피에 대해 말한 규칙이 여기에도 그대로 적용된다: **사이클은 단계가 이미 소유한
+파라미터를 나르지 않는다**. `[train]`은 T1의 레시피를 경로로 가리킬 뿐 그 필드의 사본이
+아니고, `[eval]`은 Evaluation IR을 경로로 가리키므로 `evaluation_hash`는 그 문서 자신의
+것이지 그것을 다시 그린 것이 아니다. 사이클이 *덮어쓰는* 유일한 것은 학습 레시피의
+`[dataset] root`/`frames`다: 그것들은 이 사이클의 수집 출력이 된다. 다른 디렉터리를 읽은
+학습을 가진 사이클은 아무것도 연결하지 않기 때문이다(§13.3). 그 덮어쓰기는 파일을 고쳐
+쓰는 대신 중첩된 계획에서 보인다.
+
+**모든 단계는 그 명령이 이미 그러한 함수다** — `cmd::r#loop::collect`, `cmd::eval::run`,
+`cmd::train::run`, `cmd::showcase::run` — 자기 계획이 출력하는 바로 그 단어로 in-process
+호출되므로, 출력된 줄과 실행된 단계가 어긋날 수 없다. 그것들이 이미 띄우는 것(물리
+서브프로세스, 트레이너, `--jobs` 워커)만이 프로세스다. `crates/es/src/cmd/cycle.rs`가
+얇은 이유는 T1과 같다: 문서와 계획과 원장 단계는 `es_data::training`과
+`es_data::collect`에 있고, 그것들은 헤드리스이며 단위 테스트되어 있다.
+
+### 12.2 단계 계획은 골든이다
+
+`--dry-run`은 단계마다 한 줄을 출력한다. `<out>` 아래의 모든 경로는 그것에 상대적으로,
+모든 구분자는 `/`로, T1의 계획은 `train` 줄 아래에 들여쓰기로 — 학습 계획을 레시피만의
+속성으로 만드는 바로 그 세 규칙이다(3절):
+
+```
+# cycle: collect -> expert-gate -> train -> eval -> showcase
+es loop collect --policy runs/collect-001/untrained.esb --scene .../so101_pick_place.xml --episodes 200 --seed 1 --out collect/ds --frames collect/frames --expert so101-pick-place
+es eval run --config .../evaluation.toml --policy runs/collect-001/untrained.esb --scene .../so101_pick_place.xml --out eval-expert --jobs 6 --frames eval-expert/frames --expert so101-pick-place
+es train --recipe .../training.toml --out train
+  # route: ir
+  es dataset bake --policy runs/collect-001/untrained.esb --out train/baked --frames collect/frames collect/ds
+  ...
+es eval run --config .../evaluation.toml --policy train/checkpoints/20000.esb --scene .../so101_pick_place.xml --out eval --jobs 6 --frames eval/frames
+es video showcase --run eval --scene .../so101_pick_place.xml --out showcase --cell nominal-00 --eye 0.66,-0.46,0.52 --look-at 0.14,-0.04,0.04 --fov 36 --width 1280 --height 720
+```
+
+`tests/golden/train/plan-cycle.txt`가 그것을 바이트 단위로 고정한다. 그것을 만드는 데
+디스크의 어떤 것도 읽지 않는다 — 데이터셋도, 번들도, Python도 — 그것이 그 어느 것도 없는
+기계의 CI에서 판정 가능하게 만드는 것이다. 일어나지 않은 실행은 디렉터리조차 쓰지 않는다.
+
+### 12.3 두 개의 거부가 이 명령의 요점이다
+
+**하니스는 전문가를 먼저 통과시킨다**(§28.9 규칙 1, M5-R1). `[collect] expert`가 설정되면
+사이클은 *같은* `[eval] config`로 `es eval run`을 통해 전문가를 돌린다 — 무엇이든 학습되기
+**전에** — 그리고 전문가의 acceptance가 실패하면 사이클을 멈춘다. 전문가가 통과하지 못하는
+하니스는 어떤 정책도 통과하지 못하는 하니스이고, GPU 한 시간은 그것을 알아내는 비싼
+방법이다. 게이트의 리포트는 정책의 것 옆 `<out>/eval-expert/`에 보관된다. 증거는 그 뒤에
+오는 실행보다 오래 살아남아야 하기 때문이다. `--skip-expert-gate`는 그래도 실행하며 원장에
+일탈을 기록하므로(`expert_gate = "skipped (--skip-expert-gate)"`), 게이트 없이 학습한
+사이클이 게이트를 통과한 사이클처럼 보이지 않는다.
+
+**움직인 `evaluation_hash`는 이름을 들어 거부된다**(§13.3). `<out>`은 반복 2에서 재사용되므로
+`<out>/loop.jsonl`이 이미 `evaluate` 단계를 담고 있을 수 있다. 새 것의 `evaluation_hash`가
+다르다면 원장이 초대하는 비교는 비교가 아니다 — §13.3의 "데이터·정책만 바꾸면서 평가 조건을
+고정하는 것이 규율" — 그래서 사이클은 **두 해시를 모두 출력하며** GPU에 손대기 전에 거부한다
+(평가 조건은 문서의 속성이므로 `--dry-run`에서도 검사가 돈다). `--allow-new-evaluation`이
+새 비교를 시작하는 의도적 행위다. 반복 2부터는 끝에서 두 리포트에 `es eval compare`가 돈다:
+새 것이 덮어쓰기 전에 이전 `report.json`을 `report-prev.json`으로 옮긴다.
+
+### 12.4 `--from <stage>`는 재개하되, 먼저 검사한다
+
+`--from collect|train|eval|showcase`는 앞선 단계를 건너뛰고 그 출력을 `<out>` 아래에서
+읽는다. 그것들이 없거나 원장과 어긋나면 거부한다: 데이터셋을 다시 계산한 `content`를 원장의
+`collect` 단계와, 디스크의 체크포인트 번들과 `training.lock` 안의 그 `policy_hash`를,
+`--from showcase`면 `eval/report.json`을. 단계들이 한 사이클이 아닌 재개된 사이클이야말로
+이것이 막으려는 실패 양상이다.
+
+### 12.5 원장이 루프의 끝까지 닿는다
+
+`loop.jsonl`은 `train`·`evaluate` 단계와 `es_data::check_chain`을 얻는다. 둘 다
+`docs/design/learning-loop.ko.md` 4.1절에 서술되어 있고, 거기가 그것들의 집이다. 사이클은
+각각을 데이터셋 root의 원장과 `<out>/loop.jsonl`에 추가하고, 실행이 끝난 뒤 `check_chain`을
+한 번 호출한다. 실제 사이클 하나의 원장은 순서대로:
+
+```
+collect  ->  evaluate (전문가 게이트)  ->  train  ->  evaluate (정책)
+```
+
+### 12.6 패킷으로부터의 일탈 — `es eval run --expert`
+
+패킷은 `eval.rs`를 **오직** 진입점을 `pub(crate)`로 노출하기 위해서만 건드리도록 허용한다.
+구현은 플래그도 하나 추가했다: `es eval run --expert <name>`은 번들의 가중치 대신 스크립트된
+시연자가 운전하게 한다(`crates/es/src/cmd/loop.rs`의 `ExpertPolicy`·`SeenState`,
+`crates/es/src/cmd/eval.rs`를 통해 연결). 이것은 변명 대신 일탈로 기록한다. 다만 그것 없이는
+게이트가 존재할 수 없다: 패킷 자신의 spec이 게이트를 "같은 `[eval].config`로 `es eval run`을
+통해 전문가를 돌린다"라고 말하는데, T2 이전에는 `es eval run`을 정책의 가중치 외의 것에
+돌릴 방법이 없었다. 스캐폴드 자체는 새롭지 않다 — `expert_passes_the_evaluation_harness`는
+패킷 M5/V6 이래로 전문가로 하니스를 운전해 왔고, T2는 그것을 테스트 파일에서 그것이 필요한
+명령으로 승격시켰을 뿐이다. `ExpertPolicy`는 INV-17의 일곱 중 하나인 `PolicyRuntime`의
+구현이지, 여덟 번째 확장점이 아니다.
+
+플래그 *없이* 실행할 때 달라지는 것: 없다. 기존 eval 테스트는 전부 그대로이고, 그것을
+넘기지 않는 모든 경로에서 `--expert`는 `None`이며, `TorchRuntime` 로드는 그것이 `Some`일
+때만 건너뛴다(전문가는 가중치를 로드하지 않는다 — `es loop collect --expert`가 이미 하는
+것과 같은 거래다). `--frames` 없는 `--expert`는 usage 오류다. 전문가는 프레임 소스에게
+건네지는 상태에서 큐브의 pose를 읽고, 이 경로에서 정책에게 특권적 상태를 주는 것은 그것
+말고 없기 때문이다.
+
+**리뷰가 볼 것 하나.** 전문가의 `reset`이 기준으로 삼는 에피소드 경계는 **정확한 0 속도
+휴리스틱**으로 검출된다: `Env::reset`은 Task IR의 `Randomization` 노드가 큐브의 pose를 쓰기
+전에 `qpos`/`qvel`을 0으로 채우고, 에피소드의 첫 tick은 항상 프레임 소스에 도달하므로(거기서는
+관측 링이 비어 있어 `observation_delay`가 그것을 버릴 수 없다), 모든 속도가 *정확히* `0.0`인
+상태는 그 tick이고 다른 어떤 tick도 아니다. `Seen::episodes`의 `ponytail:` 주석이 그 천장을
+이름 붙인다. 모든 속도가 정확히 0인 에피소드 중간 상태는 전문가의 스테이지 머신을 재시작시킬
+텐데, 그것은 게이트를 조용히 통과시키는 대신 그 에피소드를 시끄럽게 실패시킨다 — 게이트가
+틀리기에 안전한 방향이다 — 그러나 진짜 빈틈은 러너에 에피소드 훅이 아예 없다는 것이다.
+**이것은 M7 리뷰 항목이다**: `es_eval::Evaluation`이 에피소드 경계 콜백을 얻거나(`es loop
+collect`가 이미 가진 intervener 훅), 아니면 게이트가 그 휴리스틱을 기록으로 남긴 채
+받아들이거나.
+
+### 12.7 오라클
+
+| # | 명령 | 필요한 것 |
+|---|---|---|
+| 1 | `cargo test -p es --test cli cycle_dry_run_plan_is_the_golden` | 없음 |
+| 2 | `cargo test -p es-data loop_train_and_evaluate_steps_chain` | 없음 |
+| 3 | `cargo test -p es --test cli cycle_refuses_a_moved_evaluation_hash` | 없음 |
+| 4 | `cargo test -p es --test cli cycle_runs_the_expert_through_the_harness_first -- --ignored` | `ES_PYTHON`(torch, mujoco), `--features render` |
+| 5 | `cargo xtask ci`; `cargo xtask check-scope docs/packets/M7/T2-loop-cycle.md` | 없음 |
+
+오라클 서버(RTX 4090, `ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python`, `--features render`)의
+오라클 4, 33.27초:
+
+```
+RAN cycle_runs_the_expert_through_the_harness_first: expert gate success_rate 1, policy success_rate 0 at policy_hash b58893a9a48a9da2020a4414baa87db3517bc7f3fc7ac93130d31041510fd95f
+```
+
+게이트는 시드 둘로 자른 하니스를 통과하고, 40스텝 정책은 통과하지 못한다 — 40스텝 정책이란
+그런 것이다. 그 비대칭이 이 오라클의 주제다: 게이트가 돌았고, **먼저** 돌았으며, 원장이
+`collect -> evaluate -> train -> evaluate`를 연결했다.
+
+### 12.8 측정 — 사이클 하나 전체, 오라클 서버, RTX 4090, 2026-09-21
+
+데모 자신의 문서들 위에서 돌린 `es loop cycle`: 프레임을 남긴 200 에피소드 전문가 수집,
+커밋된 `evaluation.toml` 위의 게이트, 20,000스텝 IR 경로(배치 8, lr 1e-4, seed 0,
+`extra = ["--resident-gpu"]`, `device = "cuda"`), 같은 `evaluation.toml`을 `--jobs 6`과
+프레임으로, 그리고 V19b의 카메라로 찍은 `nominal-00` 쇼케이스. 명령 하나, 문서 하나, 원장
+하나. `~/artifacts/plan-v/m7-t2/run.sh`가 그 호출이고, `cycle.log`가 stdout의 모든 줄에
+타임스탬프를 붙인다.
+
+| 단계 | 월클록 | 무엇이 돌았나 |
+|---|---|---|
+| `collect` | **5:00** | 200 에피소드, 103,881 프레임, `success 200 / failure 0 / timeout 0`. safety 4,245 clamped, 1,991 fallback |
+| `expert-gate`(`es eval run --expert`) | **2:21** | 6 스위트 × 16 에피소드, `--jobs 6`, 프레임. 69,380 프레임 |
+| `train`(T1의 IR 경로, 중첩) | **2:26** | 그중 `dataset bake` 0:24, `policy lower` 1초 미만, **`train_act.py` 2:00**(20,000스텝), `policy pack` ×3 약 1초 |
+| `eval` | **20:24** | 6 스위트 × 16 에피소드, `--jobs 6`, 프레임. 171,116 프레임 |
+| `showcase` | **0:08** | `nominal-00` 1,800 tick, 1280×720 lambert, 4.7 ms/frame |
+| **합계** | **30:19** | §28.9의 중단 규칙은 사이클 하나 30분 미만: **19초 차로 놓침** |
+
+`training_hash 6c81756c…`, `identity_hash 8914b1d6…`, `lowering_hash 3d06811c…`,
+`initial_loss 0.052309`에서 `final_loss 0.014186`. 판정된 체크포인트는
+`checkpoint.20000 = policy_hash ec8379a9…`이고 그것이 `evaluate` 단계의 `policy_hash`다 —
+실제 데이터 위의 체인 속성. `es_data::check_chain` 통과:
+`ledger: …/loop.jsonl (chained)`.
+
+**게이트는 통과했고, 정책은 통과하지 못했다.** 둘 다 원장에 나란히 있다:
+
+| 스위트 | 전문가 게이트 `success_rate` | 정책 `success_rate` | 정책 `envelope_violation_rate` |
+|---|---|---|---|
+| nominal | **1.000** | **0.000** | 0.949 |
+| light_intensity | 1.000 | 0.000 | 0.945 |
+| light_direction | 1.000 | 0.000 | 0.947 |
+| observation_delay | 1.000 | 0.000 | 0.904 |
+| torque_noise | 0.000 | 0.062 | 0.956 |
+| backlash | 1.000 | 0.000 | 0.937 |
+
+acceptance 기준은 `nominal success_rate >= 0.5`이므로 사이클은
+`FAILED suite=Some("nominal") metric=success_rate observed=0`과 함께 1로 끝난다. **그것은
+이 패킷의 결함이 아니라 측정이다** — T2의 주제는 문서 하나가 사이클을 돌리고 그것을 연결할
+수 있는가이고, 그렇게 했다. 정책의 수는 §28.10의 U-측정이 맡은 것이며, 전문가의 0.04 대비
+0.95라는 `envelope_violation_rate`가 어디를 볼지 말해 준다: 학습된 chunk가 스무 tick 중
+열아홉에서 Deployment IR의 envelope 바깥에 있고, 따라서 팔이 실제로 따르는 것은 Safety
+Plane이다. `final_loss 0.014186`인데 한 번도 성공하지 못하는 정책은 10절이 D행에 대해
+지적한 바로 그 불일치다 — 그만큼 낮은 fit이 아직 작동하는 정책은 아니다. 이 실행은
+`base_model`(11절)을 쓰지 않았고 T6의 augmentation도 트리에 없었으므로, IR 경로에 대한
+판결이 아니라 U-측정이 개선해 나갈 *바닥*이다.
+
+**이 측정이 §28.9의 "월클록이 어디로 가는가"에 대해 말하는 세 가지.**
+
+1. **학습은 더 이상 지배적인 항이 아니다.** §28.9는 배치 8에서 20,000스텝에 10:53을
+   기록하고 배치 lowering의 샘플별 루프를 근본 원인으로 지목한다. T3가 그것을 제거했다
+   (`lowering_hash 3d06811c…`): 여덟 배의 데이터(50이 아니라 200 에피소드) 위에서 같은
+   20,000스텝이 이제 **2:00**이 걸린다. §28.9 사다리의 9번 칸은 끝났다.
+2. **평가가 지배적인 항이고, 그 월클록은 정책이 얼마나 좋은가의 함수다.** *같은* 하니스 —
+   6 스위트, 96 에피소드, `--jobs 6`, 프레임 — 가 전문가에게는 2:21, 정책에게는 **20:24**가
+   걸렸다. 그 사이에 코드는 하나도 없는데 8.7배 차이다. 성공한 에피소드는 큐브가 통에
+   들어가면 끝나고, 실패하는 에피소드는 1,800 tick을 모두 돈다. §28.9의 이 스위트에 대한
+   5:49는 가끔 성공하는 정책 위에서 측정된 것이므로 *최선*의 수이고, 새 사이클이 무는 것은
+   최악의 경우다. 이제 이 경로에서 유효한 유일한 지렛대는 에피소드 단위 샤딩
+   (§28.9 10번 칸 / T8)이다.
+3. **수집도 같은 세금을 낸다.** 이 실행의 첫 시도는
+   `~/artifacts/plan-v/v15/untrained.esb`를 썼는데, 그 `deployment_hash 3b2ad568…`은 커밋된
+   `f2f9a510…`(80)이 아니라 V18 이전의 envelope(`acceleration_max 20`)이다. 200 에피소드가
+   전부 timeout이 났고(`success 0 / timeout 200`, 360,000 스텝 중 284,163이 fallback) 수집에
+   **5분이 아니라 17분**이 걸렸다. 그 실행은 폐기하고, 커밋된 네 문서를 모두 나르는
+   `~/artifacts/plan-v/v18/untrained-L80.esb`로 다시 돌렸다. 기록해 둘 가치가 있는 이유는
+   **전문가 게이트가 바로 그것을 잡아냈을 것**이기 때문이다: 불일치를 발견했을 때 게이트는
+   이미 돌고 있었고, 전문가가 통과할 수 없는 하니스 위에서 학습을 거부했을 것이다 — 그것이
+   §28.9 규칙 1의 논지 전부이며, 첫 실제 실행에서 묻지도 않았는데 도착했다.
+
+`~/artifacts/plan-v/m7-t2/`에 보관: `loop.jsonl`, `training.lock`, `report-policy.json`,
+`report-expert-gate.json`, `cycle.log`, `cycle.toml`, `training.toml`, `run.sh`, 그리고
+`run/` 트리 전체(27 GB: 프레임, 트래젝터리, 체크포인트 번들 셋).

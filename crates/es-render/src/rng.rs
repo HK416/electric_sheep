@@ -22,7 +22,20 @@ pub const fn mix32(mut z: u32) -> u32 {
 }
 
 /// Stream key for one path-tracer sample. `stream` separates independent uses at the same
-/// coordinates (0 = bounce direction, 1 = light selection, 2 = light position).
+/// coordinates; the table is pinned here and in `docs/design/renderer.md` section 10, and a
+/// new use takes a **new** id rather than reusing one at a different `index`:
+///
+/// | id | use |
+/// |---|---|
+/// | 0 | the cosine-weighted BSDF bounce direction |
+/// | 1 | `ReSTIR` initial candidates (light pick, area sample and the reservoir accept) |
+/// | 2 | `ReSTIR` spatial reuse (the reservoir accept per neighbour) |
+/// | 3 | `ReSTIR` temporal reuse (the reservoir accept) |
+/// | 4 | NEE: which emissive triangle (packet M7/R3) |
+/// | 5 | NEE: the uniform point on that triangle |
+/// | 6 | NEE: the cosine-weighted sky direction |
+///
+/// The NEE shadow test has no stream: it draws no random number.
 pub fn key(seed: u32, view: u32, px: u32, py: u32, sample: u32, bounce: u32, stream: u32) -> u32 {
     let mut k = mix32(seed ^ view);
     k = mix32(k ^ (px.wrapping_mul(73_856_093) ^ py.wrapping_mul(19_349_663)));

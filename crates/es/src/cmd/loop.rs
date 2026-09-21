@@ -14,9 +14,10 @@ use es_data::collect::{CollectSpec, Collector, Intervention, SplitSpec};
 use es_data::{CollectReport, InterventionSegment};
 use es_env::expert::{demo_cfg, ScriptedExpert};
 use es_env::Termination;
+use es_ir::types::ElemType;
 use es_physics_backend::MuJoCoCpuBackend;
 use es_physics_core::backend::ModelInfo;
-use es_policy::{PolicyRuntime, TorchRuntime, WeightsSource};
+use es_policy::{PolicyInfo, PolicyRuntime, TorchRuntime, WeightsSource};
 
 /// The one scripted expert the CLI knows: SO-101, cube into the bin
 /// (`docs/design/visible-learning.md` section 5).
@@ -32,6 +33,8 @@ es loop collect --policy <policy.esb> --scene <file.xml|urdf> --episodes <N> --s
 es loop intervene --dataset <root> --segments <segments.json>
 es loop distill --in <root> [--in <root>...] [--train 0.8] [--val 0.1] [--test 0.1]
                 [--seed <S>] --out <root>
+es loop cycle --recipe <cycle.toml> [--out <dir>] [--dry-run] [--from <stage>]
+              [--allow-new-evaluation] [--skip-expert-gate]     (see `es loop cycle --help`)
 
 The three steps of the spec 13.1 learning loop that produce datasets.
 
@@ -73,8 +76,13 @@ distill    Merges datasets (episodes re-indexed, intervention labels remapped), 
            split.json and a loop step. The training run itself is PyTorch-side and is not
            run here, so every TrainingIdentity slot but `dataset` is an all-zero digest.
 
+cycle      Runs collect -> train -> eval -> showcase from one document, appending a step per
+           stage to one ledger (spec 13.1, spec 13.3). It re-implements no stage: each one is
+           the command above, called in-process with the words its own plan prints.
+
 Every step appends a LoopStep to <root>/loop.jsonl so the loop is reproducible (spec 13.3);
-a distill step is appended to each input root as well as to the output root.
+a distill step is appended to each input root as well as to the output root, and a cycle's
+train and evaluate steps to the dataset root and to its own <out>.
 
 Exit codes: 0 success, 1 runtime failure, 2 usage error, 3 skipped (nothing ran).
 ";
@@ -82,6 +90,8 @@ Exit codes: 0 success, 1 runtime failure, 2 usage error, 3 skipped (nothing ran)
 pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
     match args.first().map(String::as_str) {
         Some("collect") => collect(&args[1..]),
+        // The whole loop under one document (packet M7/T2); its own help.
+        Some("cycle") => crate::cmd::cycle::run(&args[1..]),
         Some("intervene") => intervene(&args[1..]),
         Some("distill") => distill(&args[1..]),
         Some("--help" | "-h") | None => {
@@ -322,6 +332,146 @@ impl PolicyRuntime for NoPolicy {
     }
 }
 
+// --- the expert as a `PolicyRuntime` (packet M7/T2, spec 28.9 rule 1) -----------------------
+
+/// The loaded model and the raw `qpos ‖ qvel` row the evaluation's frame source last saw.
+///
+/// `es loop collect` hands the expert its state through the intervener hook, which carries the
+/// episode index; `es_eval::Evaluation` has no such hook and calls `PolicyRuntime::infer` with
+/// the observation tensors alone — and the demo's Observation IR carries no cube pose. The
+/// frame source is handed the full `StateView` immediately before the policy is called, so the
+/// row travels through here. That is the scaffold `expert_passes_the_evaluation_harness` has
+/// used since packet M5/V6, promoted from the test file to the command that needs it.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SeenState(std::rc::Rc<std::cell::RefCell<Seen>>);
+
+#[derive(Debug, Default)]
+pub(crate) struct Seen {
+    model: Option<ModelInfo>,
+    row: Vec<f64>,
+    /// How many episodes have begun. `Env::reset` fills `qpos` and `qvel` with zeros before
+    /// the Task IR's `Randomization` node writes the cube's pose, and an episode's first tick
+    /// always reaches the frame source (the observation ring is empty there, so
+    /// `observation_delay` cannot drop it) — so a state whose every velocity is *exactly*
+    /// zero is that tick and no other, and counting them is an episode boundary the runner
+    /// never had to be asked for.
+    ///
+    /// ponytail: an exact-zero test, not a threshold. A mid-episode state with every velocity
+    /// exactly 0.0 would restart the expert's stage machine, which fails that episode loudly
+    /// rather than passing the gate quietly — the safe direction for a gate to be wrong in.
+    episodes: u64,
+}
+
+impl SeenState {
+    /// Only the render build has a frame source to call this from (`es eval run --expert`
+    /// refuses without one), so a build without the feature never reaches it.
+    #[cfg_attr(not(feature = "render"), allow(dead_code))]
+    pub(crate) fn capture(
+        &self,
+        model: &ModelInfo,
+        state: &es_physics_core::backend::StateView<'_>,
+    ) {
+        let mut seen = self.0.borrow_mut();
+        if state.qvel_of(0).iter().all(|v| *v == 0.0) {
+            seen.episodes += 1;
+        }
+        seen.row.clear();
+        seen.row.extend_from_slice(state.qpos_of(0));
+        seen.row.extend_from_slice(state.qvel_of(0));
+        seen.model = Some(model.clone());
+    }
+}
+
+/// [`ScriptedExpert`] wearing the `PolicyRuntime` the evaluation runner drives.
+///
+/// Not a new extension point (`INV-17`): `PolicyRuntime` is one of the seven and this is an
+/// impl of it. The joint count and chunk horizon are runtime fields rather than const
+/// generics because the runtime is built before the bundle's `(NJ, H)` pair picks a typed
+/// path, and the tensor it returns is shaped, not typed.
+pub(crate) struct ExpertPolicy {
+    expert: ScriptedExpert,
+    seen: SeenState,
+    nj: usize,
+    horizon: usize,
+    /// The episode this instance last reset for.
+    episode: u64,
+}
+
+impl PolicyRuntime for ExpertPolicy {
+    fn load(
+        &mut self,
+        _graph: &es_ir::learning::LearningGraph,
+        _weights: &WeightsSource,
+    ) -> Result<PolicyInfo, es_policy::PolicyError> {
+        Err(es_policy::PolicyError::Backend(
+            "es eval run --expert loads no policy".to_owned(),
+        ))
+    }
+
+    fn infer(
+        &mut self,
+        _inputs: &std::collections::BTreeMap<String, es_compile::Tensor>,
+    ) -> Result<std::collections::BTreeMap<String, es_compile::Tensor>, es_policy::PolicyError>
+    {
+        let seen = self.seen.0.borrow();
+        let model = seen.model.as_ref().ok_or_else(|| {
+            es_policy::PolicyError::Backend(
+                "no state captured yet: es eval run --expert needs --frames".to_owned(),
+            )
+        })?;
+        if self.episode != seen.episodes {
+            self.episode = seen.episodes;
+            self.expert.reset();
+        }
+        let state = es_env::expert::state_of_row(model, &seen.row);
+        // Out of reach ends the demonstration in `es loop collect`; here the arm holds, so the
+        // episode runs out its budget and is scored a failure rather than an error (spec 17.2).
+        let rows = self
+            .expert
+            .chunk(model, &state, 0)
+            .unwrap_or_else(|| vec![state.qpos_of(0)[..self.nj].to_vec(); self.horizon]);
+        let mut data = Vec::with_capacity(self.horizon * self.nj * 8);
+        for r in rows.iter().take(self.horizon) {
+            for j in 0..self.nj {
+                data.extend_from_slice(&r.get(j).copied().unwrap_or(0.0).to_le_bytes());
+            }
+        }
+        Ok(std::collections::BTreeMap::from([(
+            "action".to_owned(),
+            es_compile::Tensor {
+                dtype: ElemType::F64,
+                shape: vec![self.horizon as u64, self.nj as u64],
+                data,
+            },
+        )]))
+    }
+
+    fn info(&self) -> Option<&PolicyInfo> {
+        None
+    }
+
+    fn runtime_hash(&self) -> [u8; 32] {
+        *blake3::hash(b"es-env::ScriptedExpert").as_bytes()
+    }
+}
+
+/// The expert `es eval run --expert <name>` drives with, paced by the same Deployment IR the
+/// collection path paces it with.
+pub(crate) fn expert_policy(
+    name: &str,
+    scene: &SceneDesc,
+    deploy: &es_ir::deployment::DeploymentIr,
+    seen: &SeenState,
+) -> Result<ExpertPolicy, CliError> {
+    Ok(ExpertPolicy {
+        expert: build_expert(name, scene, deploy)?,
+        seen: seen.clone(),
+        nj: deploy.robot.n_joints,
+        horizon: deploy.action.horizon,
+        episode: 0,
+    })
+}
+
 /// The scripted expert for `--expert <name>`, built from the scene it will drive.
 ///
 /// The cube is the scene's one free-joint body: a demonstration that picks something up needs
@@ -358,7 +508,7 @@ fn build_expert(
     ScriptedExpert::new(scene, cfg).map_err(|e| CliError::Runtime(e.to_string()))
 }
 
-fn collect(args: &[String]) -> Result<u8, CliError> {
+pub(crate) fn collect(args: &[String]) -> Result<u8, CliError> {
     let pairs = parse(
         args,
         &[

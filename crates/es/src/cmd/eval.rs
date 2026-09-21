@@ -77,7 +77,17 @@ workers each size their own pool to every core on the box: measured on a 16-core
 A worker that fails stops the run with one error naming the shard, its exit code and its last
 line of stderr. A partial report is never written.
 
+With --expert <name> the scripted demonstrator drives instead of the bundle's weights, which
+is spec 28.9 rule 1 made runnable: a harness the expert cannot pass is a harness no policy can
+pass, and `es loop cycle` runs exactly this before it trains anything. --policy is still
+required -- the bundle carries the Task, Observation and Deployment IR the run judges against
+-- but its weights are never loaded and no Torch runtime is needed. It needs --frames: the
+expert reads the cube's pose out of the state the frame source is handed, which is the same
+scaffold the `expert_passes_the_evaluation_harness` oracle uses, and nothing else on this path
+hands a policy privileged state.
+
     --out <dir>        output directory (default: ./eval-out)
+    --expert <name>    drive with the scripted expert instead of the policy's weights
     --frames <dir>     render every step here (needs the `render` feature)
     --traj <dir>       per-episode `.estraj` state trajectories (default <out>/traj)
     --backend <name>   physics backend; only `mujoco-cpu` is supported (default, spec 17.1)
@@ -156,7 +166,7 @@ fn print_row(suite: &str, metric: &str, a: &str, b: &str, delta: &str, sig: &str
     println!("{suite:<20} {metric:<26} {a:>14} {b:>14} {delta:>14}  {sig}");
 }
 
-fn compare(args: &[String]) -> Result<u8, CliError> {
+pub(crate) fn compare(args: &[String]) -> Result<u8, CliError> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{HELP}");
         return Ok(0);
@@ -243,6 +253,8 @@ struct RunArgs {
     scene: String,
     out: PathBuf,
     frames: Option<PathBuf>,
+    /// The scripted demonstrator, driving instead of the bundle's weights (spec 28.9 rule 1).
+    expert: Option<String>,
     /// Where the per-episode `.estraj` state trajectories go; `<out>/traj` unless named.
     traj: Option<PathBuf>,
     backend: String,
@@ -265,7 +277,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
     let (mut config, mut policy, mut scene, mut out) = (None, None, None, None);
     let (mut backend, mut runtime) = ("mujoco-cpu".to_owned(), "torch".to_owned());
     let (mut frames, mut jobs, mut shard, mut shard_out) = (None, 1u32, None, None);
-    let mut traj = None;
+    let (mut traj, mut expert) = (None, None);
     let (mut telemetry, mut telemetry_token, mut telemetry_image_every) = (None, None, 0u64);
 
     let mut it = args.iter();
@@ -281,6 +293,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
             "--scene" => scene = Some(val()?.clone()),
             "--out" => out = Some(PathBuf::from(val()?)),
             "--frames" => frames = Some(PathBuf::from(val()?)),
+            "--expert" => expert = Some(val()?.clone()),
             "--traj" => traj = Some(PathBuf::from(val()?)),
             "--backend" => backend.clone_from(val()?),
             "--runtime" => runtime.clone_from(val()?),
@@ -358,6 +371,7 @@ fn parse_run_args(args: &[String]) -> Result<RunArgs, CliError> {
         scene: req(scene, "--scene")?,
         out: out.unwrap_or_else(|| PathBuf::from("eval-out")),
         frames,
+        expert,
         traj,
         backend,
         runtime,
@@ -424,6 +438,7 @@ fn run_typed<const NJ: usize, const H: usize>(
     shard: (u32, u32),
     // `mut` only under `render`, where the sink is offered to the frame-rendering call first.
     #[cfg_attr(not(feature = "render"), allow(unused_mut))] mut sink: Option<&mut RunSink<'_>>,
+    seen: Option<&super::r#loop::SeenState>,
 ) -> Result<es_eval::Shard, CliError> {
     let mut run = |frames: Option<&mut es_eval::runner::FrameSource<'_>>,
                    sink: Option<&mut RunSink<'_>>| {
@@ -456,10 +471,19 @@ fn run_typed<const NJ: usize, const H: usize>(
             |light: &es_eval::LightOverride,
              model: &es_physics_core::backend::ModelInfo,
              state: &es_physics_core::backend::StateView<'_>| {
+                // `--expert`: the raw `qpos ‖ qvel` row on its way past, because the runner
+                // hands the frame source the full state immediately before it calls the
+                // policy and the demo's Observation IR carries no cube pose.
+                if let Some(seen) = seen {
+                    seen.capture(model, state);
+                }
                 rig.frame(light, model, state)
             };
         return run(Some(&mut source), sink.as_deref_mut());
     }
+    // No renderer, no frame source, so no state reaches an expert -- which is why `es eval
+    // run` refuses `--expert` without `--frames` before it opens anything.
+    let _ = &seen;
     run(None, sink)
 }
 
@@ -849,7 +873,7 @@ fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-fn run(args: &[String]) -> Result<u8, CliError> {
+pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{RUN_HELP}");
         return Ok(0);
@@ -905,20 +929,46 @@ fn run(args: &[String]) -> Result<u8, CliError> {
         println!("SKIPPED (mujoco-cpu backend unavailable: {reason})");
         return Ok(3);
     }
-    if let Err(reason) = es_policy::torch_runtime::is_available() {
-        println!("SKIPPED (torch runtime unavailable: {reason})");
-        return Ok(3);
+    // `--expert` drives every tick itself, so the bundle's weights are never loaded and the
+    // Torch runtime is not needed at all -- the same trade `es loop collect --expert` makes.
+    if a.expert.is_none() {
+        if let Err(reason) = es_policy::torch_runtime::is_available() {
+            println!("SKIPPED (torch runtime unavailable: {reason})");
+            return Ok(3);
+        }
+    }
+    if a.expert.is_some() && a.frames.is_none() {
+        return Err(CliError::Usage(format!(
+            "--expert needs --frames: the expert is handed its state through the run's frame \
+             source, and nothing else on this path gives a policy the cube's pose\n\n{RUN_HELP}"
+        )));
     }
 
     let scene = super::backend::load_scene(&a.scene)?;
 
-    let mut policy = TorchRuntime::new();
-    policy
-        .load(
-            &bundle.learning,
-            &WeightsSource::InMemory(bundle.weights.clone()),
-        )
-        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let mut torch = TorchRuntime::new();
+    // The episode counter the expert's `reset` keys off, shared with the frame source below.
+    let seen = super::r#loop::SeenState::default();
+    let mut expert = match &a.expert {
+        Some(name) => Some(super::r#loop::expert_policy(
+            name,
+            &scene,
+            &bundle.deployment,
+            &seen,
+        )?),
+        None => None,
+    };
+    let policy: &mut dyn PolicyRuntime = if let Some(e) = &mut expert {
+        e
+    } else {
+        torch
+            .load(
+                &bundle.learning,
+                &WeightsSource::InMemory(bundle.weights.clone()),
+            )
+            .map_err(|e| CliError::Runtime(e.to_string()))?;
+        &mut torch
+    };
 
     // Always recorded, never a flag to remember: a run that cannot say what the arm did is a
     // run nobody can re-render or audit, and an episode of it is under a megabyte (packet
@@ -965,11 +1015,12 @@ fn run(args: &[String]) -> Result<u8, CliError> {
             &bundle,
             &eval_ir,
             &scene,
-            &mut policy,
+            policy,
             &cfg,
             a.frames.as_deref(),
             a.shard.unwrap_or((0, 1)),
-            sink
+            sink,
+            a.expert.is_some().then_some(&seen)
         )?]
     };
 
@@ -994,7 +1045,7 @@ fn run(args: &[String]) -> Result<u8, CliError> {
         &bundle.task,
         &bundle.observation,
         &bundle.deployment,
-        &policy,
+        policy,
         &cfg,
         &shards,
     )
@@ -1131,6 +1182,9 @@ fn spawn_shards(a: &RunArgs, jobs: u32) -> Result<Vec<es_eval::Shard>, CliError>
             .stderr(std::process::Stdio::piped());
         if let Some(f) = &a.frames {
             cmd.arg("--frames").arg(f);
+        }
+        if let Some(e) = &a.expert {
+            cmd.arg("--expert").arg(e);
         }
         // Cell names are globally unique and shards own disjoint cells, so the trajectories
         // share one directory exactly as the frames do, with nothing to merge.
