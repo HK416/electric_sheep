@@ -7785,19 +7785,31 @@ fn train_ir_path_packs_a_bundle_torch_opens() {
 
 use es_telemetry::{Client, Message, Payload, StreamId};
 
-/// The demo documents with `max_episode_steps` cut to 60, a conforming constant checkpoint in
-/// place of a trained one, and a one-suite, three-episode Evaluation IR: the smallest run that
-/// goes through the whole `es eval run` path -- `mujoco`, `torch`, one rendered 96x96 frame
-/// per control tick. `None`, with the reason printed, when this machine cannot run it.
+/// The demo documents with `max_episode_steps` cut to 60, one `es train` step to get a
+/// checkpoint `TorchRuntime` will actually load, and a one-suite, three-episode Evaluation IR:
+/// the smallest run that goes through the whole `es eval run` path -- `mujoco`, `torch`, one
+/// rendered 96x96 frame per control tick. `None`, with the reason printed, when this machine
+/// cannot run it.
+///
+/// The training step is not about training: the demo graph's `VisionEncoder` and
+/// `TemporalEncoder` lower to opaque torch sub-modules (`nodes.N.*` prefix claims), and
+/// `load_state_dict(strict=True)` refuses a synthetic checkpoint over them -- so the only
+/// checkpoint this path can open is one the trainer itself wrote. One step at `batch = 2` on
+/// the bake fixture is the cheapest such bundle, and what the policy learned in it does not
+/// matter to a telemetry oracle.
 ///
 /// Three episodes rather than one because [`eval_telemetry_never_blocks_the_run`] has to
 /// overflow the loopback socket buffers with image frames (about 100 kB of JSON each): 180
-/// ticks is some 18 MB, well past what Linux autotunes a loopback pair to.
+/// ticks is some 18 MB, well past what a loopback pair autotunes to.
 fn telemetry_run_inputs(test: &str, dir: &Path) -> Option<(PathBuf, PathBuf)> {
     if cfg!(not(feature = "render")) {
         println!("SKIP {test}: built without the `render` feature");
         return None;
     }
+    let Ok(python) = std::env::var("ES_PYTHON") else {
+        println!("SKIP {test}: ES_PYTHON is not set, so nothing can train a checkpoint");
+        return None;
+    };
     if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
         println!("SKIP {test}: {reason}");
         return None;
@@ -7816,8 +7828,7 @@ fn telemetry_run_inputs(test: &str, dir: &Path) -> Option<(PathBuf, PathBuf)> {
     let obs_hash = obs.observation_hash().expect("observation hashes");
     let mut learning =
         es_ir::serial::learning_from_toml(&read("learning.toml")).expect("learning.toml");
-    let module = es_policy::lower_to_torch(&learning).expect("the demo graph lowers");
-    let weights = es_policy::weights::write_safetensors(&conforming_checkpoint(&module));
+    let weights = b"es-e4-untrained-placeholder".to_vec();
     learning.policy.weights = WeightsRef::Safetensors {
         path: "policy.safetensors".to_owned(),
         hash: *blake3::hash(&weights).as_bytes(),
@@ -7826,8 +7837,34 @@ fn telemetry_run_inputs(test: &str, dir: &Path) -> Option<(PathBuf, PathBuf)> {
         es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml");
     let bundle = es_compile::PolicyBundle::build(&task, &obs, &learning, &deploy, &weights)
         .expect("the shortened demo documents pack");
-    let policy = dir.join("policy.esb");
-    std::fs::write(&policy, bundle).expect("write policy.esb");
+    let untrained = dir.join("untrained.esb");
+    std::fs::write(&untrained, bundle).expect("write untrained.esb");
+
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 2, 12);
+    let recipe = dir.join("training.toml");
+    write(
+        &recipe,
+        &train_fixture_recipe(&untrained, &root, &tiles, 0, "1e-4")
+            .replace("steps = 40", "steps = 1")
+            .replace("checkpoint_at = [40]", "checkpoint_at = [1]")
+            .replace("es-no-such-interpreter", &train_toml_path(Path::new(&python))),
+    );
+    let trained = bin()
+        .current_dir(train_root())
+        .args(["train", "--recipe", &train_toml_path(&recipe), "--out"])
+        .arg(dir.join("train"))
+        .output()
+        .expect("run es train");
+    assert_eq!(
+        trained.status.code(),
+        Some(0),
+        "es train:\n{}\n{}",
+        stdout(&trained),
+        stderr_of(&trained)
+    );
+    let policy = dir.join("train").join("checkpoints").join("1.esb");
+    assert!(policy.is_file(), "{}", policy.display());
 
     let mut ir = demo_evaluation_ir(hex(&task_hash), hex(&obs_hash));
     ir.suites.truncate(1);
@@ -7862,11 +7899,13 @@ fn telemetry_eval_run(config: &Path, policy: &Path, out: &Path, extra: &[&str]) 
         .expect("run es eval run");
     let text = format!("{}{}", stdout(&run), String::from_utf8_lossy(&run.stderr));
     // Exit 1 is an acceptance criterion that did not hold, which an untrained policy earns;
-    // anything else is a real error.
+    // anything else is a real error. A run that exited 1 for any other reason wrote no
+    // report, and saying so here beats a missing-file panic further down.
     assert!(
-        matches!(run.status.code(), Some(0 | 1)),
-        "exit {:?}\n{text}",
-        run.status.code()
+        matches!(run.status.code(), Some(0 | 1)) && out.join("report.json").is_file(),
+        "exit {:?}, report.json {}\n{text}",
+        run.status.code(),
+        out.join("report.json").is_file()
     );
     run
 }
