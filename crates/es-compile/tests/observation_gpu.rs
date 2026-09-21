@@ -832,3 +832,57 @@ fn cpu_and_gpu_agree_on_join_range_and_narrowing() {
         println!("join/range/narrowing CPU vs GPU: bit-equal (f32, f16, bf16)");
     });
 }
+
+/// Packet M7/T6. `Pad` is lowered on the CPU reference path and has **no** GPU kernel: the
+/// mirror would need a `KERNEL_IDS` entry, and appending one moves `compiler_hash` for every
+/// plan in the repository. The GPU lowering therefore refuses it by name rather than
+/// silently producing a plan that does not pad — the two paths exist to be bit-equal, and a
+/// silent identity here would be exactly the drift the mirror is built to prevent.
+///
+/// No device: `pipeline_plan` is a pure function of the CPU plan, so CI gates this anywhere.
+#[test]
+fn pad_is_refused_by_name_on_the_gpu_path() {
+    let mut ir = image_ir(8, 6, &Tail::Dequantize);
+    let t_deq = ir.outputs["out"].ty.clone();
+    let deq = t_deq.image.expect("an image port");
+    let padded = ImageSpec {
+        width: deq.width + 2,
+        height: deq.height + 2,
+        intrinsics: Intrinsics {
+            cx: deq.intrinsics.cx + 1.0,
+            cy: deq.intrinsics.cy + 1.0,
+            ..deq.intrinsics
+        },
+        ..deq
+    };
+    let t_pad = ty(
+        ElemType::F32,
+        [3, u64::from(padded.height), u64::from(padded.width)],
+        Unit::Pixel,
+        padded,
+    );
+    ir.graph.insert(
+        NodeId(2),
+        ObservationNode::Pad {
+            left: 1,
+            top: 1,
+            right: 1,
+            bottom: 1,
+            io: Io::unary(t_deq, t_pad.clone()),
+        },
+    );
+    ir.graph.connect(NodeId(1), OUT, NodeId(2), &in_port(0));
+    ir.graph.outputs.clear();
+    ir.outputs.clear();
+    finish(&mut ir, NodeId(2), t_pad);
+
+    CpuPlan::compile(&ir, PlanMode::Release).expect("the CPU plan pads");
+    let diags = GpuPlan::pipeline_plan(&ir, PlanMode::Release).expect_err("the GPU path refuses");
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.code.as_str() == "COMPILE-006" && d.message.contains("Pad")),
+        "{diags:?}"
+    );
+    println!("RAN pad_is_refused_by_name_on_the_gpu_path: {}", diags[0]);
+}

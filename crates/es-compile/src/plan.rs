@@ -11,7 +11,7 @@ use es_ir::diag::Diagnostic;
 use es_ir::graph::{IrNode, NodeId, PortRef};
 use es_ir::image::{ChannelFormat, ImageSpec, Rect};
 use es_ir::observation::{
-    CropMode, NormalizeStats, ObservationIr, ObservationNode, ResizeFilter, OUT,
+    AugmentKind, CropMode, NormalizeStats, ObservationIr, ObservationNode, ResizeFilter, OUT,
 };
 use es_ir::types::{Align, ElemType};
 use es_ir::CanonWriter;
@@ -25,6 +25,8 @@ pub const COMPILE_002: &str = "COMPILE-002";
 pub const COMPILE_003: &str = "COMPILE-003";
 pub const COMPILE_004: &str = "COMPILE-004";
 pub const COMPILE_005: &str = "COMPILE-005";
+/// A `training_only` `Augment` node the trainer could not be told to apply (packet M7/T6).
+pub const COMPILE_007: &str = "COMPILE-007";
 
 /// Spec 11.5. Both modes keep every intermediate addressable and neither aliases the arena:
 /// the CPU path exists *to have* node boundaries (design note §10). The mode still reaches
@@ -97,6 +99,17 @@ pub enum Op {
         c: usize,
         rect: Rect,
     },
+    /// Replicate (edge-clamp) padding. It has no kernel id and no GPU mirror on purpose —
+    /// see `docs/design/observation-lowering.md` section 3.
+    Pad {
+        sw: usize,
+        sh: usize,
+        c: usize,
+        left: usize,
+        top: usize,
+        right: usize,
+        bottom: usize,
+    },
     NormalizeMeanStd {
         plane: usize,
         mean: Vec<f32>,
@@ -158,6 +171,119 @@ pub struct CpuPlan {
     /// Non-fatal IR diagnostics kept with the plan — `OBS-034` for a deliberate
     /// `rescale_intrinsics = false`, most of all.
     pub warnings: Vec<Diagnostic>,
+    /// The `ImageSpec` on each node's `out` port, as the *plan* sees it.
+    ///
+    /// `ObservationIr::propagate_image_specs` less one refinement: a `training_only`
+    /// `RandomCrop` that lowered to the centre crop carries `ImageSpec::cropped` here, so the
+    /// intrinsics transform INV-14 owes a crop is applied by the node that does the cropping.
+    /// The IR keeps the incoming spec on an `Augment` port (packet M7/T6 may not edit
+    /// `es-ir`); see `docs/design/observation-lowering.md` section 3.
+    pub image_specs: BTreeMap<NodeId, ImageSpec>,
+}
+
+/// One `training_only` `Augment` node of a chain, in the order the trainer applies them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AugmentStep {
+    pub node: NodeId,
+    pub kind: AugmentKind,
+}
+
+/// The contiguous chain of `training_only` `Augment` nodes ending at each declared output
+/// (spec 7.3, packet M7/T6) — the boundary between what `es dataset bake` writes and what the
+/// trainer applies.
+///
+/// Only ports with a non-empty chain are returned. Refused by name, `COMPILE-007`:
+///
+/// * a `training_only` node that is not on such a chain — a non-augment node between it and
+///   the network input would make it an identity on *every* path, silently dropping the
+///   augmentation the author declared;
+/// * a chain member whose output is read by more than one node — the augmented tensor exists
+///   only inside the trainer, so a second consumer would read a tensor no path produces.
+pub fn augmentation_chains(
+    ir: &ObservationIr,
+) -> Result<BTreeMap<String, Vec<AugmentStep>>, Vec<Diagnostic>> {
+    let mut chains: BTreeMap<String, Vec<AugmentStep>> = BTreeMap::new();
+    let mut claimed: std::collections::BTreeSet<NodeId> = std::collections::BTreeSet::new();
+    let mut diags = Vec::new();
+    for (name, out) in &ir.outputs {
+        let mut chain = Vec::new();
+        let mut at = out.port.node;
+        while let Some(ObservationNode::Augment {
+            kind,
+            training_only: true,
+            ..
+        }) = ir.graph.nodes.get(&at)
+        {
+            if ir.graph.edges.iter().filter(|e| e.from.node == at).count() > 1 {
+                diags.push(
+                    Diagnostic::new(
+                        COMPILE_007,
+                        format!(
+                            "the training_only {} feeding \"{name}\" is read by more than one \
+                             node",
+                            kind_name(*kind)
+                        ),
+                    )
+                    .at(at)
+                    .with_hint(
+                        "an augmented tensor exists only inside the trainer; give the second \
+                         consumer the un-augmented port",
+                    ),
+                );
+                break;
+            }
+            chain.push(AugmentStep {
+                node: at,
+                kind: *kind,
+            });
+            claimed.insert(at);
+            match ir.graph.edges.iter().find(|e| e.to.node == at) {
+                Some(edge) => at = edge.from.node,
+                None => break,
+            }
+        }
+        chain.reverse();
+        if !chain.is_empty() {
+            chains.insert(name.clone(), chain);
+        }
+    }
+    for (id, node) in &ir.graph.nodes {
+        if matches!(
+            node,
+            ObservationNode::Augment {
+                training_only: true,
+                ..
+            }
+        ) && !claimed.contains(id)
+        {
+            diags.push(
+                Diagnostic::new(
+                    COMPILE_007,
+                    "this training_only Augment node is not on the chain of augmentations that \
+                     ends at a declared output",
+                )
+                .at(*id)
+                .with_hint(
+                    "the trainer applies the augmentations a network input ends in; one behind \
+                     another node would be an identity on every path",
+                ),
+            );
+        }
+    }
+    if diags.is_empty() {
+        Ok(chains)
+    } else {
+        Err(diags)
+    }
+}
+
+fn kind_name(kind: AugmentKind) -> &'static str {
+    match kind {
+        AugmentKind::RandomCrop { .. } => "RandomCrop",
+        AugmentKind::ColorJitter { .. } => "ColorJitter",
+        AugmentKind::RandomErasing { .. } => "RandomErasing",
+        AugmentKind::GaussianNoise { .. } => "GaussianNoise",
+    }
 }
 
 fn channel_count(f: ChannelFormat) -> usize {
@@ -195,7 +321,7 @@ impl CpuPlan {
         if diags.iter().any(Diagnostic::is_error) {
             return Err(diags);
         }
-        let specs = ir.propagate_image_specs()?;
+        let mut specs = ir.propagate_image_specs()?;
         let order = ir.graph.topo_order().map_err(|d| vec![d])?;
 
         let mut plan = Self {
@@ -207,6 +333,7 @@ impl CpuPlan {
             outputs: BTreeMap::new(),
             rings: BTreeMap::new(),
             warnings: Vec::new(),
+            image_specs: BTreeMap::new(),
         };
         // node -> the buffer its `out` port lives in.
         let mut produced: BTreeMap<NodeId, BufferId> = BTreeMap::new();
@@ -214,8 +341,12 @@ impl CpuPlan {
         for id in order {
             let node = &ir.graph.nodes[&id];
             let feeds = Self::feeds(ir, id, &produced, &mut diags);
-            plan.lower(ir, id, node, &specs, &feeds, &mut produced, &mut diags);
+            plan.lower(ir, id, node, &mut specs, &feeds, &mut produced, &mut diags);
         }
+        plan.image_specs = specs
+            .iter()
+            .map(|(port, spec)| (port.node, *spec))
+            .collect();
 
         for (name, out) in &ir.outputs {
             match produced.get(&out.port.node) {
@@ -320,7 +451,7 @@ impl CpuPlan {
         ir: &ObservationIr,
         id: NodeId,
         node: &ObservationNode,
-        specs: &BTreeMap<PortRef, ImageSpec>,
+        specs: &mut BTreeMap<PortRef, ImageSpec>,
         feeds: &[BufferId],
         produced: &mut BTreeMap<NodeId, BufferId>,
         diags: &mut Vec<Diagnostic>,
@@ -418,6 +549,40 @@ impl CpuPlan {
                 }
                 let out = self.alloc_arena(id, ElemType::F32, shape);
                 self.emit(produced, id, feeds, Op::Crop { sw, sh, c, rect }, out);
+            }
+            // `Pad` is lowered for one reason (packet M7/T6): `Pad -> RandomCrop(training_only)`
+            // is DrQ's random shift, and the padded canvas is the tensor the trainer draws its
+            // offset in. Replicate is the only mode — the IR's `Pad` carries no mode field and
+            // `es-ir` is not this packet's to change (design note section 3).
+            ObservationNode::Pad {
+                left,
+                top,
+                right,
+                bottom,
+                ..
+            } => {
+                let Some((c, sh, sw)) = src_geom else {
+                    diags.push(unsupported("Pad without an image input", id));
+                    return;
+                };
+                if feeds
+                    .first()
+                    .is_some_and(|b| self.buffers[b.0].dtype != ElemType::F32)
+                {
+                    diags.push(unsupported("Pad of a u8 HWC image", id));
+                    return;
+                }
+                let out = self.alloc_arena(id, ElemType::F32, shape);
+                let op = Op::Pad {
+                    sw,
+                    sh,
+                    c,
+                    left: *left as usize,
+                    top: *top as usize,
+                    right: *right as usize,
+                    bottom: *bottom as usize,
+                };
+                self.emit(produced, id, feeds, op, out);
             }
             ObservationNode::Normalize { stats, .. } => {
                 let elems = shape.iter().product::<u64>() as usize;
@@ -531,7 +696,19 @@ impl CpuPlan {
             // no step and its consumers read the upstream buffer. A node that is *not*
             // `training_only` would have to run here, and cannot: `COMPILE-002`. (Augmentation
             // kernels, and with them a training plan mode, are a later packet.)
-            ObservationNode::Augment { training_only, .. } => {
+            //
+            // One refinement (packet M7/T6): a `training_only` `RandomCrop` whose input is
+            // larger than its window lowers to the **deterministic centre crop**, through
+            // `Crop`'s own op and `Crop`'s own intrinsics transform. Without it a
+            // `Pad -> RandomCrop` pair would hand the network a padded image in evaluation and
+            // a cropped one in training; with it, a symmetric pad's evaluation pixels are the
+            // un-padded image's, bit for bit. Randomness is still not on this path: the offset
+            // is the centre, and only the trainer draws one.
+            ObservationNode::Augment {
+                kind,
+                training_only,
+                ..
+            } => {
                 if !*training_only {
                     diags.push(unsupported("Augment outside training_only", id));
                     return;
@@ -540,7 +717,42 @@ impl CpuPlan {
                     diags.push(unsupported("Augment without an input", id));
                     return;
                 };
-                produced.insert(id, src);
+                let window = match kind {
+                    AugmentKind::RandomCrop { width, height } => Some((*width, *height)),
+                    _ => None,
+                };
+                match (window, src_geom) {
+                    (Some((w, h)), Some((c, sh, sw))) if (w as usize, h as usize) != (sw, sh) => {
+                        if w as usize > sw || h as usize > sh {
+                            diags.push(
+                                Diagnostic::new(
+                                    COMPILE_003,
+                                    format!("RandomCrop {w}x{h} leaves a {sw}x{sh} image"),
+                                )
+                                .at(id),
+                            );
+                            return;
+                        }
+                        let src_port = PortRef::new(self.buffers[src.0].node, OUT);
+                        let src_spec = specs[&src_port];
+                        let rect = crop_rect(
+                            CropMode::Center {
+                                width: w,
+                                height: h,
+                            },
+                            &src_spec,
+                        );
+                        let out = self.alloc_arena(id, ElemType::F32, shape);
+                        self.emit(produced, id, feeds, Op::Crop { sw, sh, c, rect }, out);
+                        specs.insert(PortRef::new(id, OUT), src_spec.cropped(rect, true));
+                    }
+                    (Some(_), None) => {
+                        diags.push(unsupported("RandomCrop without an image input", id));
+                    }
+                    _ => {
+                        produced.insert(id, src);
+                    }
+                }
             }
             other => diags.push(unsupported(other.kind(), id)),
         }

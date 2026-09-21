@@ -162,6 +162,32 @@ impl CpuPlan {
                 Op::Crop { sw, sh, c, rect } => {
                     kernels::crop(&f32_in[0], *sw, *sh, *c, *rect, dst);
                 }
+                // Replicate padding, written here rather than in `kernels` because it has no
+                // kernel id: `KERNEL_IDS` is append-only *with* a `compiler_hash` move, and a
+                // packet that may not move a committed hash cannot append to it (packet M7/T6,
+                // design note `observation-lowering.md` section 3). Same fixed loop order as
+                // every kernel beside it.
+                Op::Pad {
+                    sw,
+                    sh,
+                    c,
+                    left,
+                    top,
+                    right,
+                    bottom,
+                } => {
+                    let (dw, dh) = (sw + left + right, sh + top + bottom);
+                    let src = &f32_in[0];
+                    for ch in 0..*c {
+                        for y in 0..dh {
+                            let sy = y.saturating_sub(*top).min(sh - 1);
+                            for x in 0..dw {
+                                let sx = x.saturating_sub(*left).min(sw - 1);
+                                dst[ch * dh * dw + y * dw + x] = src[ch * sh * sw + sy * sw + sx];
+                            }
+                        }
+                    }
+                }
                 Op::NormalizeMeanStd { plane, mean, std } => {
                     kernels::normalize_mean_std(&f32_in[0], *plane, mean, std, dst);
                 }

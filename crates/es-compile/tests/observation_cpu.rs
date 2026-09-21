@@ -13,7 +13,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use es_compile::{kernels, CpuPlan, PlanMode, TensorRef};
+use es_compile::{kernels, CpuPlan, Op, PlanMode, Tensor, TensorRef};
 use es_core::StableId;
 use es_ir::graph::{NodeId, PortRef};
 use es_ir::image::{
@@ -595,4 +595,240 @@ proptest! {
             cropped.intrinsics
         );
     }
+}
+
+// --- packet M7/T6: the training_only chain, and what the Release plan does with it ---------
+
+/// `chain()` with `Pad(pad) -> Augment{RandomCrop w x h, training_only}` appended, the
+/// fixture's shape at the fixture's scale: the chain ends at the declared output.
+fn padded_random_crop(pad: u32, w: u32, h: u32) -> ObservationIr {
+    let mut ir = chain();
+    let out_ty = ir.outputs["rgb_front"].ty.clone();
+    let spec = out_ty.image.expect("the image port carries a spec");
+    let padded_spec = ImageSpec {
+        width: spec.width + 2 * pad,
+        height: spec.height + 2 * pad,
+        intrinsics: Intrinsics {
+            cx: spec.intrinsics.cx + f64::from(pad),
+            cy: spec.intrinsics.cy + f64::from(pad),
+            ..spec.intrinsics
+        },
+        ..spec
+    };
+    let mut padded_ty = out_ty.clone();
+    padded_ty.shape = Shape::new([
+        3,
+        u64::from(padded_spec.height),
+        u64::from(padded_spec.width),
+    ]);
+    padded_ty.image = Some(padded_spec);
+    let mut cropped_ty = out_ty.clone();
+    cropped_ty.shape = Shape::new([3, u64::from(h), u64::from(w)]);
+    cropped_ty.image = Some(padded_spec.cropped(
+        Rect {
+            x: (padded_spec.width - w) / 2,
+            y: (padded_spec.height - h) / 2,
+            width: w,
+            height: h,
+        },
+        true,
+    ));
+
+    ir.graph.insert(
+        NodeId(4),
+        ObservationNode::Pad {
+            left: pad,
+            top: pad,
+            right: pad,
+            bottom: pad,
+            io: Io::unary(out_ty, padded_ty.clone()),
+        },
+    );
+    ir.graph.insert(
+        NodeId(5),
+        ObservationNode::Augment {
+            kind: es_ir::observation::AugmentKind::RandomCrop {
+                width: w,
+                height: h,
+            },
+            training_only: true,
+            io: Io::unary(padded_ty, cropped_ty.clone()),
+        },
+    );
+    ir.graph.connect(NodeId(3), OUT, NodeId(4), &in_port(0));
+    ir.graph.connect(NodeId(4), OUT, NodeId(5), &in_port(0));
+    ir.graph.outputs.clear();
+    ir.graph.outputs.push(PortRef::new(NodeId(5), OUT));
+    ir.outputs.insert(
+        "rgb_front".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(NodeId(5), OUT),
+            ty: cropped_ty,
+        },
+    );
+    ir
+}
+
+fn run_chain(ir: &ObservationIr) -> Tensor {
+    let mut plan = CpuPlan::compile(ir, PlanMode::Release).expect("compiles");
+    let px = gradient_8x6();
+    let inputs = BTreeMap::from([(
+        sensor().to_string(),
+        TensorRef::new(ElemType::U8, [6, 8, 3], &px),
+    )]);
+    plan.run(&inputs).expect("runs")["rgb_front"].clone()
+}
+
+/// Oracle 2 of packet M7/T6. `Pad(p) -> RandomCrop{w,h}(training_only)` with a symmetric pad
+/// hands the network the un-augmented document's pixels, bit for bit, and the crop carries
+/// `Crop`'s intrinsics transform (INV-14): pad moves the principal point by `+p`, the centre
+/// crop moves it back. A `RandomCrop` whose input already is `w x h` stays the identity it
+/// was, so INV-15's structure is untouched for every document that has no pad.
+#[test]
+fn a_training_only_random_crop_is_a_centre_crop_in_release() {
+    let plain = chain();
+    let ir = padded_random_crop(2, 4, 3);
+    assert!(ir.validate().is_empty(), "{:?}", ir.validate());
+
+    assert_eq!(
+        run_chain(&ir),
+        run_chain(&plain),
+        "the padded, centre-cropped Release plan does not reproduce the un-augmented pixels"
+    );
+
+    let plan = CpuPlan::compile(&ir, PlanMode::Release).expect("compiles");
+    // Two steps more than the plain plan: the pad and the centre crop. The crop is a real
+    // step, with the centred rectangle -- which for a symmetric pad is `(p, p)`.
+    assert_eq!(plan.steps.len(), 5);
+    let crop = plan
+        .steps
+        .iter()
+        .find(|s| s.node == NodeId(5))
+        .expect("the RandomCrop lowered to a step");
+    assert_eq!(
+        crop.op,
+        Op::Crop {
+            sw: 8,
+            sh: 7,
+            c: 3,
+            rect: Rect {
+                x: 2,
+                y: 2,
+                width: 4,
+                height: 3,
+            },
+        }
+    );
+    // INV-14: the spec the plan carries out of the crop is the spec that went into the pad.
+    let before = CpuPlan::compile(&plain, PlanMode::Release)
+        .expect("compiles")
+        .image_specs[&NodeId(3)];
+    assert_eq!(plan.image_specs[&NodeId(5)], before);
+
+    // ...and with no pad the node is the identity pass-through it has always been.
+    let mut identity = chain();
+    let out_ty = identity.outputs["rgb_front"].ty.clone();
+    identity.graph.insert(
+        NodeId(4),
+        ObservationNode::Augment {
+            kind: es_ir::observation::AugmentKind::RandomCrop {
+                width: 4,
+                height: 3,
+            },
+            training_only: true,
+            io: Io::unary(out_ty.clone(), out_ty.clone()),
+        },
+    );
+    identity
+        .graph
+        .connect(NodeId(3), OUT, NodeId(4), &in_port(0));
+    identity.graph.outputs.clear();
+    identity.graph.outputs.push(PortRef::new(NodeId(4), OUT));
+    identity.outputs.insert(
+        "rgb_front".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(NodeId(4), OUT),
+            ty: out_ty,
+        },
+    );
+    let plan = CpuPlan::compile(&identity, PlanMode::Release).expect("compiles");
+    assert_eq!(plan.steps.len(), 3, "a same-size RandomCrop emitted a step");
+    assert_eq!(run_chain(&identity), run_chain(&plain));
+}
+
+/// `Pad` is replicate: the border repeats the edge pixel, and the interior is the input.
+// A pad copies bytes, so exact equality is the property under test.
+#[allow(clippy::float_cmp)]
+#[test]
+fn pad_replicates_the_edge() {
+    let ir = padded_random_crop(2, 8, 7);
+    let padded = run_chain(&ir);
+    let plain = run_chain(&chain());
+    assert_eq!(padded.shape, vec![3, 7, 8]);
+    let at = |t: &Tensor, c: usize, y: usize, x: usize, w: usize| -> f32 {
+        let i = (c * t.shape[1] as usize * w + y * w + x) * 4;
+        f32::from_le_bytes([t.data[i], t.data[i + 1], t.data[i + 2], t.data[i + 3]])
+    };
+    for c in 0..3 {
+        for y in 0..3 {
+            for x in 0..4 {
+                assert_eq!(
+                    at(&padded, c, y + 2, x + 2, 8),
+                    at(&plain, c, y, x, 4),
+                    "the interior moved at {c} {y} {x}"
+                );
+            }
+        }
+        // Corners and edges replicate.
+        assert_eq!(at(&padded, c, 0, 0, 8), at(&plain, c, 0, 0, 4));
+        assert_eq!(at(&padded, c, 6, 7, 8), at(&plain, c, 2, 3, 4));
+        assert_eq!(at(&padded, c, 0, 3, 8), at(&plain, c, 0, 1, 4));
+    }
+}
+
+/// The boundary rule (packet M7/T6): the chain is the contiguous run of `training_only`
+/// nodes ending at a declared output. Anything else is refused by name, because the trainer
+/// would otherwise be told to apply less than the author declared.
+#[test]
+fn the_augmentation_chain_is_found_or_refused_by_name() {
+    let plain = chain();
+    assert!(
+        es_compile::plan::augmentation_chains(&plain)
+            .expect("no augmentation")
+            .is_empty(),
+        "a document with no Augment node has no chain"
+    );
+
+    let ir = padded_random_crop(2, 4, 3);
+    let chains = es_compile::plan::augmentation_chains(&ir).expect("one chain");
+    assert_eq!(chains.len(), 1);
+    assert_eq!(chains["rgb_front"].len(), 1);
+    assert_eq!(chains["rgb_front"][0].node, NodeId(5));
+
+    // A `training_only` node behind a non-augment node is not on the chain: it would be an
+    // identity on *every* path, and nothing would ever apply it.
+    let mut buried = padded_random_crop(2, 4, 3);
+    let out_ty = buried.outputs["rgb_front"].ty.clone();
+    buried.graph.insert(
+        NodeId(6),
+        ObservationNode::Normalize {
+            stats: NormalizeStats::Range { lo: 0.0, hi: 1.0 },
+            io: Io::unary(out_ty.clone(), out_ty.clone()),
+        },
+    );
+    buried.graph.connect(NodeId(5), OUT, NodeId(6), &in_port(0));
+    buried.graph.outputs.clear();
+    buried.graph.outputs.push(PortRef::new(NodeId(6), OUT));
+    buried.outputs.insert(
+        "rgb_front".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(NodeId(6), OUT),
+            ty: out_ty,
+        },
+    );
+    let diags = es_compile::plan::augmentation_chains(&buried).expect_err("refused");
+    assert!(
+        diags.iter().any(|d| d.code.as_str() == "COMPILE-007"),
+        "{diags:?}"
+    );
 }

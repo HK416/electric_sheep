@@ -214,6 +214,18 @@ pub(crate) fn lower(cpu: &CpuPlan, ir: &ObservationIr) -> Result<Lowered, Vec<Di
                 def(&mut d, "ES_RH", rect.height as usize);
                 ("crop.v1", "crop")
             }
+            // Refused by name, not mirrored (packet M7/T6): a Slang kernel needs an entry in
+            // `KERNEL_IDS`, and appending one moves `compiler_hash` for every plan in the
+            // repository — including the committed training and evaluation runs T6 may not
+            // move. A silent identity here would be worse than a refusal: the CPU plan pads
+            // and this one would not, and the two paths exist to be bit-equal.
+            Op::Pad { .. } => {
+                return Err(unsupported(
+                    "Pad has no GPU kernel: it is lowered on the CPU reference path only \
+                     (design note section 3). Bake with the CPU plan, or drop the Pad node \
+                     from the document this GPU plan compiles",
+                ))
+            }
             Op::NormalizeMeanStd { plane, mean, std } => {
                 def(&mut d, "ES_SRC", src_at(step.inputs[0]));
                 def(&mut d, "ES_PLANE", *plane);
