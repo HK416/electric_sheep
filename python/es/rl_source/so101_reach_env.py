@@ -10,6 +10,11 @@ our own trainer (S4b) and one Evaluation IR (S4c):
             world-frame `pos[3] || quat[4]` with the quaternion in **xyzw** order (spec 3.1;
             MuJoCo's `xquat` is wxyz and is reordered here), gripper = the *body* `gripper`;
   * action  6 normalized position targets, `ctrl = centre + half_range * clip(a, -1, 1)`;
+            with `--action delta` the same 6 numbers are per-tick *increments* instead:
+            `target_t = clip(target_{t-1} + delta_scale * clip(a, -1, 1), ctrlrange)`, with
+            `target_0` the reset pose (packet M9/T2, spec 8.5 `JointDelta`). The integrator
+            state is `data.ctrl` itself, so brax's auto-reset restores `target_0` at the
+            episode boundary without a second piece of state;
   * reward  -dist + 1 on success, `dist = ||cube_pos - gripper_body_pos||` (positions only);
             success = dist < 0.03 m; episode = 200 control steps.
 
@@ -47,6 +52,7 @@ JOINTS = (
 CUBE_X = (0.21, 0.27)  # task.toml node 29, stream `cube.x`, target `qpos[6]`
 CUBE_Y = (-0.03, 0.05)  # task.toml node 30, stream `cube.y`, target `qpos[7]`
 SCENE_NAME = "so101_pick_place.xml"
+DELTA_SCALE = 0.05  # rad per control tick, the `--action delta` increment unit
 
 OBS_DIM = 26
 QUAT_XYZW = np.array([1, 2, 3, 0])  # MuJoCo stores wxyz
@@ -84,8 +90,19 @@ def default_config() -> config_dict.ConfigDict:
 class SO101Reach(mjx_env.MjxEnv):
     """Reach the cube with the gripper frame."""
 
-    def __init__(self, xml_path=None, config=None, config_overrides=None):
+    def __init__(
+        self,
+        xml_path=None,
+        config=None,
+        config_overrides=None,
+        action="position",
+        delta_scale=DELTA_SCALE,
+    ):
         super().__init__(config or default_config(), config_overrides)
+        if action not in ("position", "delta"):
+            raise ValueError(f"--action is position or delta, not {action!r}")
+        self._action = action
+        self._delta_scale = float(delta_scale)
         self._xml_path = str(scene_path(xml_path))
         mj_model = mujoco.MjModel.from_xml_path(self._xml_path)
         mj_model.opt.timestep = self._config.sim_dt
@@ -105,7 +122,11 @@ class SO101Reach(mjx_env.MjxEnv):
         lo, hi = mj_model.actuator_ctrlrange[:, 0], mj_model.actuator_ctrlrange[:, 1]
         self._act_offset = jp.asarray((hi + lo) / 2.0)
         self._act_scale = jp.asarray((hi - lo) / 2.0)
+        self._ctrl_lo = jp.asarray(lo)
+        self._ctrl_hi = jp.asarray(hi)
         self._init_q = jp.asarray(mj_model.qpos0)
+        # target_0 for the delta action: the reset pose, in actuator order.
+        self._init_ctrl = jp.asarray(np.asarray(mj_model.qpos0)[self._qpos_adr])
 
     # -- task -----------------------------------------------------------------
 
@@ -138,15 +159,28 @@ class SO101Reach(mjx_env.MjxEnv):
             self._mj_model,
             qpos=qpos,
             qvel=jp.zeros(self._mjx_model.nv),
-            ctrl=jp.zeros(self._mjx_model.nu),
+            ctrl=self._init_ctrl if self._action == "delta" else jp.zeros(self._mjx_model.nu),
         )
         data = mjx.forward(self._mjx_model, data)
         obs = self._obs(data)
         metrics = {"dist": self._dist(obs), "success": jp.zeros(())}
         return mjx_env.State(data, obs, jp.zeros(()), jp.zeros(()), metrics, {"rng": rng})
 
+    def command(self, prev: jax.Array, action: jax.Array) -> jax.Array:
+        """The absolute position target this action asks for, given the previous one.
+
+        `delta` is spec 8.5's `JointDelta`: the network's 6 numbers are increments over the
+        *previous command*, and the clip is what our Safety Plane does to the integrated
+        target -- the stored target is the clipped one, so a saturated increment cannot
+        accumulate into a target the robot can never reach (packet M9/T1).
+        """
+        a = jp.clip(action, -1.0, 1.0)
+        if self._action == "delta":
+            return jp.clip(prev + self._delta_scale * a, self._ctrl_lo, self._ctrl_hi)
+        return self._act_offset + self._act_scale * a
+
     def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
-        ctrl = self._act_offset + self._act_scale * jp.clip(action, -1.0, 1.0)
+        ctrl = self.command(state.data.ctrl, action)
         data = mjx_env.step(self._mjx_model, state.data, ctrl, self.n_substeps)
         obs = self._obs(data)
         dist = self._dist(obs)
@@ -201,9 +235,9 @@ def _bench(xml: str | None, num_envs: int, steps: int = 100) -> None:
     )
 
 
-def _self_check(xml: str | None, num_steps: int) -> None:
+def _self_check(xml: str | None, num_steps: int, action: str, delta_scale: float) -> None:
     t0 = time.time()
-    env = SO101Reach(xml)
+    env = SO101Reach(xml, action=action, delta_scale=delta_scale)
     m = env.mj_model
     print(f"scene {env.xml_path}", flush=True)
     print(
@@ -229,6 +263,17 @@ def _self_check(xml: str | None, num_steps: int) -> None:
     got_hi = np.asarray(env._act_offset + env._act_scale * jp.ones(m.nu))
     got_lo = np.asarray(env._act_offset - env._act_scale * jp.ones(m.nu))
     assert np.allclose(got_hi, hi, atol=1e-6) and np.allclose(got_lo, lo, atol=1e-6)
+
+    prev_ctrl = np.asarray(env._init_ctrl, dtype=np.float64)
+    if env._action == "delta":
+        # One increment is `delta_scale * a` from the previous target, and a saturated run of
+        # +1 stops at the ctrlrange instead of integrating away from it.
+        half = np.asarray(env.command(jp.asarray(prev_ctrl), 0.5 * jp.ones(m.nu)))
+        assert np.allclose(half, prev_ctrl + 0.5 * env._delta_scale, atol=1e-6), half
+        q = jp.asarray(prev_ctrl)
+        for _ in range(int(np.ceil((hi - prev_ctrl).max() / env._delta_scale)) + 1):
+            q = env.command(q, jp.ones(m.nu))
+        assert np.allclose(np.asarray(q), hi, atol=1e-6), q
 
     # MJX vs MuJoCo CPU over one 200-step episode, same start state, same ctrl sequence.
     # When `--xml` is a derived scene, the committed scene is stepped on CPU too, so the
@@ -259,7 +304,11 @@ def _self_check(xml: str | None, num_steps: int) -> None:
     trace = {}
     for i, a in enumerate(actions):
         state = step(state, jp.asarray(a))
-        ctrl = np.asarray(env._act_offset + env._act_scale * np.clip(a, -1, 1))
+        if env._action == "delta":
+            prev_ctrl = np.asarray(env.command(jp.asarray(prev_ctrl), jp.asarray(a)), np.float64)
+            ctrl = prev_ctrl
+        else:
+            ctrl = np.asarray(env._act_offset + env._act_scale * np.clip(a, -1, 1))
         data.ctrl[:] = ctrl
         for _ in range(env.n_substeps):
             mujoco.mj_step(m, data)
@@ -296,8 +345,10 @@ if __name__ == "__main__":
     ap.add_argument("--xml", default=None)
     ap.add_argument("--steps", type=int, default=200, help="control steps compared vs CPU")
     ap.add_argument("--bench", type=int, default=0, help="batched throughput, N envs")
+    ap.add_argument("--action", choices=("position", "delta"), default="position")
+    ap.add_argument("--delta-scale", type=float, default=DELTA_SCALE)
     args = ap.parse_args()
     if args.bench:
         _bench(args.xml, args.bench)
     else:
-        _self_check(args.xml, args.steps)
+        _self_check(args.xml, args.steps, args.action, args.delta_scale)

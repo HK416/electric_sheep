@@ -85,6 +85,11 @@ pub struct ImportManifest {
     /// Whatever the source stored in place of a log-std, as metadata.
     #[serde(default)]
     pub source_std: Option<serde_json::Value>,
+    /// What the source framework says its action vector *is* (`"position_target"`,
+    /// `"joint_delta"`, `"torque"`), when its exporter recorded it. `None` is not a licence to
+    /// guess: it means only the adapter declares, and the adapter always has to.
+    #[serde(default)]
+    pub action_kind: Option<String>,
     #[serde(default)]
     pub action_scale: Option<Vec<f64>>,
     #[serde(default)]
@@ -192,6 +197,8 @@ pub enum ImportError {
         "{IMP_004}: [action] kind = \"{kind}\" but the Task IR's ActionSpec declares {space:?}"
     )]
     ActionKind { kind: String, space: ActionSpace },
+    #[error("{IMP_004}: the checkpoint's manifest says action.kind = \"{manifest}\" and the adapter declares \"{adapter}\". The adapter says what the source's numbers mean for *our* robot; it cannot re-interpret what they are. Fix whichever is wrong -- an increment imported as a position target drives the arm to 0.05 rad and stays there")]
+    ManifestActionKind { adapter: String, manifest: String },
     #[error("{IMP_005}: {detail}")]
     Channels { detail: String },
     #[error("import.json: {0}")]
@@ -330,6 +337,7 @@ pub fn convert(
     }
     let expected = match space {
         ActionSpace::JointPosition => "position_target",
+        ActionSpace::JointDelta => "joint_delta",
         ActionSpace::JointTorque => "torque",
         _ => "",
     };
@@ -338,6 +346,16 @@ pub fn convert(
             kind: adapter.action.kind.clone(),
             space,
         });
+    }
+    // The same `IMP-004` from the other side: the source recorded what its numbers are, and
+    // the adapter said it again. Two declarations that disagree are not a tie to break.
+    if let Some(kind) = &manifest.action_kind {
+        if *kind != adapter.action.kind {
+            return Err(ImportError::ManifestActionKind {
+                adapter: adapter.action.kind.clone(),
+                manifest: kind.clone(),
+            });
+        }
     }
     if let Some(order) = &manifest.joint_order {
         if order != &joints.source_order {
@@ -605,6 +623,10 @@ fn pick(
 fn joint_unit(space: ActionSpace) -> &'static str {
     match space {
         ActionSpace::JointTorque => "N m",
+        // An increment, not a pose: the same radians, added by `es-env` to the previous
+        // command once per control tick (spec 8.5, packet M9/T1). The mapping report says so
+        // because what a human checks against the datasheet here is a rate.
+        ActionSpace::JointDelta => "rad per control tick",
         _ => "rad",
     }
 }
@@ -785,7 +807,10 @@ fn learning_graph(
     let chunk = |unit: Unit| policy_ty(Shape::new([1, dim]), unit);
     let out_unit = match action.space {
         DeployedSpace::JointTorque => Unit::Torque,
-        DeployedSpace::JointVelocity => Unit::AngularVelocity,
+        // An increment is rad *per control tick*, and `es_ir::cross` refuses `Unit::Angle` on
+        // a `JointDelta` deployment by name (`XIR-031`): the documents would read as a
+        // position policy and the runtime would add a position to a position.
+        DeployedSpace::JointVelocity | DeployedSpace::JointDelta => Unit::AngularVelocity,
         _ => Unit::Angle,
     };
 

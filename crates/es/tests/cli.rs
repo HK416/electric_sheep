@@ -30,8 +30,8 @@ use es_ir::image::{
 };
 use es_ir::learning::{
     ActionExecutionMode, Activation, ArchKind, ChunkBlendPolicy, FusionKind, HeadKind,
-    LearningGraph, LearningNode, PolicyContract, PolicyHandle, RuntimeHints, Squash,
-    StateEncoderKind, TemporalKind, VisionBackbone, WeightsRef,
+    LearningGraph, LearningNode, NormalizeDir, PolicyContract, PolicyHandle, RuntimeHints, Squash,
+    StateEncoderKind, StatsSource, TemporalKind, VisionBackbone, WeightsRef,
 };
 use es_ir::observation::{
     Io, NormalizeStats, ObservationIr, ObservationNode, ObservationOutput, ResizeFilter,
@@ -11925,7 +11925,7 @@ fn import_fixture(framework: &str, name: &str) -> String {
 
 /// Runs `es policy import-rl` from the repository root (the Task IR's `scene.path` is
 /// repository-relative) and returns the process output.
-fn run_import_rl(framework: &str, adapter: &Path, out: &Path) -> Output {
+fn run_import_rl(framework: &str, docs: &Documents, adapter: &Path, out: &Path) -> Output {
     bin()
         .current_dir(train_root())
         .args([
@@ -11938,14 +11938,51 @@ fn run_import_rl(framework: &str, adapter: &Path, out: &Path) -> Output {
             "--adapter",
             &train_toml_path(adapter),
             "--task",
-            &train_toml_path(&rl_fixture("task-reach.toml")),
+            &train_toml_path(&docs.task),
             "--deployment",
-            &train_toml_path(&rl_fixture("deployment-reach.toml")),
+            &train_toml_path(&docs.deployment),
             "--out",
         ])
         .arg(out)
         .output()
         .expect("run es policy import-rl")
+}
+
+/// The Task and Deployment IR an import targets, and the adapter that matches them.
+struct Documents {
+    task: PathBuf,
+    deployment: PathBuf,
+    adapter: PathBuf,
+}
+
+/// The committed reach pair, in `JointPosition` (packet M8/S2b) or in `JointDelta` (M9/T2).
+///
+/// There is no committed delta *Task* IR: T1 committed `deployment-reach-delta.toml` and
+/// mutates the task in memory for its own cross-check, so the one line that differs is
+/// substituted here, in `dir`, next to the assertions that depend on it. Everything else --
+/// the scene (repository-relative, and the CLI runs from the repository root), the
+/// `ObservationSpec`, the reward -- is `task-reach.toml`'s.
+fn reach_documents(dir: &Path, delta: bool) -> Documents {
+    if !delta {
+        return Documents {
+            task: rl_fixture("task-reach.toml"),
+            deployment: rl_fixture("deployment-reach.toml"),
+            adapter: rl_fixture("adapter-so101.toml"),
+        };
+    }
+    let source = std::fs::read_to_string(rl_fixture("task-reach.toml")).expect("task-reach.toml");
+    let task_toml = source.replace("space = \"JointPosition\"", "space = \"JointDelta\"");
+    assert_ne!(
+        task_toml, source,
+        "task-reach.toml no longer declares ActionSpec space = JointPosition"
+    );
+    let task = dir.join("task-reach-delta.toml");
+    std::fs::write(&task, task_toml).expect("write the delta Task IR");
+    Documents {
+        task,
+        deployment: rl_fixture("deployment-reach-delta.toml"),
+        adapter: rl_fixture("adapter-so101-delta.toml"),
+    }
 }
 
 /// One observation through the lowered module, as `es eval run` would feed it.
@@ -11982,12 +12019,13 @@ fn infer_state(runtime: &mut es_policy::TorchRuntime, state: &[f32]) -> Vec<f32>
 #[test]
 fn import_rl_synthetic_three_frameworks() {
     let dir = scratch_dir("import-rl");
+    let documents = reach_documents(&dir, false);
     let adapter = rl_fixture("adapter-so101.toml");
     let mut weights = Vec::new();
 
     for framework in ["playground", "rsl-rl", "rl-games"] {
         let out = dir.join(framework);
-        let run = run_import_rl(framework, &adapter, &out);
+        let run = run_import_rl(framework, &documents, &adapter, &out);
         assert_eq!(
             run.status.code(),
             Some(0),
@@ -12069,6 +12107,103 @@ fn import_rl_synthetic_three_frameworks() {
     println!("RAN import_rl_synthetic_three_frameworks: three fixtures, one bundle in torch");
 }
 
+/// Oracle 3 of packet M9/T2. The synthetic `playground-delta` fixture is the same network as
+/// `playground/` exported by a source whose six numbers are per-tick joint increments, and the
+/// only thing that differs is what everybody *says* about them: `import.json` carries
+/// `action_kind = "joint_delta"`, the adapter declares the same with the increment unit, and
+/// the Task and Deployment IR it targets declare `JointDelta`.
+///
+/// What is checked is that the four agree or the import refuses: the bundle's deployed action
+/// space is `JointDelta` and its `Normalizer{Inverse}` is in rad per control tick (offset 0,
+/// scale `delta_scale`), and each of the two ways to pair a delta source with a position
+/// document is refused by name. `IMP-004` from the manifest's side is `es-data`'s
+/// `import_rl_refuses_a_manifest_that_disagrees_about_the_action_kind`.
+#[test]
+fn import_rl_delta_fixture() {
+    let dir = scratch_dir("import-rl-delta");
+    let delta = reach_documents(&dir, true);
+    let position = reach_documents(&dir, false);
+    let out = dir.join("delta");
+    let run = run_import_rl("playground-delta", &delta, &delta.adapter, &out);
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{}\n{}",
+        stdout(&run),
+        stderr_of(&run)
+    );
+
+    let bytes = std::fs::read(out.join("policy.esb")).expect("policy.esb");
+    let bundle = PolicyBundle::open(&bytes).expect("the delta bundle opens");
+    assert_eq!(
+        bundle.deployment.action.space,
+        DepSpace::JointDelta,
+        "the imported bundle must deploy an increment"
+    );
+    assert_eq!(bundle.learning.policy.contract.action_dim, 6);
+
+    // The unnormalizer is what makes the number an increment rather than a pose: an offset of
+    // zero (an increment's neutral value is "do not move" -- a centre here would be a policy
+    // that drifts when it outputs nothing) and a scale in rad per control tick.
+    let (mean, std) = bundle
+        .learning
+        .nodes
+        .nodes
+        .values()
+        .find_map(|n| match n {
+            LearningNode::Normalizer {
+                direction: NormalizeDir::Inverse,
+                stats: StatsSource::MeanStd { mean, std },
+                ..
+            } => Some((mean.clone(), std.clone())),
+            _ => None,
+        })
+        .expect("the imported graph ends in a Normalizer{Inverse, MeanStd}");
+    assert_eq!(mean, vec![0.0; 6], "an increment has no centre");
+    assert_eq!(std, vec![0.05; 6], "rad per control tick, from the adapter");
+
+    // Three declarations -- the manifest's, the adapter's and the Task IR's -- and every way
+    // two of them can disagree is one `IMP-004` that writes nothing. (A manifest with no
+    // `action_kind` at all, like the `playground` fixture S2b committed, is not a
+    // disagreement: the adapter alone declares, and it always has to.)
+    for (case, documents, adapter) in [
+        (
+            "the source says increment, the adapter says position target",
+            &position,
+            &position.adapter,
+        ),
+        (
+            "the adapter says increment, the Task IR says position",
+            &position,
+            &delta.adapter,
+        ),
+        (
+            "the adapter says position target, the Task IR says increment",
+            &delta,
+            &position.adapter,
+        ),
+    ] {
+        let bad = dir.join(format!("bad-{}", case.len()));
+        let run = run_import_rl("playground-delta", documents, adapter, &bad);
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "{case}: must be refused, not imported:\n{}",
+            stdout(&run)
+        );
+        assert!(
+            stderr_of(&run).contains("IMP-004"),
+            "{case}: the refusal must name its code:\n{}",
+            stderr_of(&run)
+        );
+        assert!(
+            !bad.join("policy.esb").exists(),
+            "{case}: a refusal must leave no half-written bundle behind"
+        );
+    }
+    println!("RAN import_rl_delta_fixture: a JointDelta bundle and three IMP-004 refusals");
+}
+
 /// `name -> (shape, values)` out of a safetensors blob written by `import_rl.py --reference`.
 fn oracle_tensors(path: &Path) -> BTreeMap<String, (Vec<u64>, Vec<f32>)> {
     let blob = std::fs::read(path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
@@ -12090,11 +12225,15 @@ fn oracle_tensors(path: &Path) -> BTreeMap<String, (Vec<u64>, Vec<f32>)> {
         .collect()
 }
 
-/// Oracle 3 of packet M8/S2b, on the real S2c checkpoint (server only).
+/// Oracle 3 of packet M8/S2b, on the real S2c checkpoint (server only), and oracle 2 of
+/// packet M9/T2 on the delta one -- `ES_S2B_SOURCE` decides which, because the checkpoint's
+/// own manifest says what its six numbers are and the documents follow.
 ///
 ///     ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python \
 ///     ES_S2B_SOURCE=~/artifacts/plan-s/s2c/seed0-run1 \
 ///     cargo test -p es --test cli -- --ignored import_rl_reproduces_the_source_policy
+///
+///     ES_S2B_SOURCE=~/artifacts/plan-t/t2/seed0-run1   # the same oracle, JointDelta
 ///
 /// Two tiers, both from `docs/design/rl-continuation.md` section 4:
 ///
@@ -12151,6 +12290,17 @@ fn import_rl_reproduces_the_source_policy() {
         ])
     );
 
+    // The documents this checkpoint is imported under follow what it says its action is: a
+    // `joint_delta` source gets the delta Task/Deployment pair and the delta adapter (packet
+    // M9/T2), a position one gets the pair S2b committed. Choosing here rather than by an
+    // environment variable is the same rule the importer enforces -- nobody guesses, and a
+    // mismatch between the two would be refused rather than papered over.
+    let declared: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(neutral.join("import.json")).expect("import.json"),
+    )
+    .expect("import.json is JSON");
+    let documents = reach_documents(&dir, declared["action_kind"] == "joint_delta");
+
     // 2. the Rust half: two documents, a bundle and the mapping report.
     let out = dir.join("bundle");
     let run = bin()
@@ -12163,11 +12313,11 @@ fn import_rl_reproduces_the_source_policy() {
             "--weights",
             &train_toml_path(&neutral.join("weights.safetensors")),
             "--adapter",
-            &train_toml_path(&rl_fixture("adapter-so101.toml")),
+            &train_toml_path(&documents.adapter),
             "--task",
-            &train_toml_path(&rl_fixture("task-reach.toml")),
+            &train_toml_path(&documents.task),
             "--deployment",
-            &train_toml_path(&rl_fixture("deployment-reach.toml")),
+            &train_toml_path(&documents.deployment),
             "--out",
         ])
         .arg(&out)
@@ -12208,7 +12358,7 @@ fn import_rl_reproduces_the_source_policy() {
     // runtime's output is in actuator units because the `Normalizer{Inverse}` is part of the
     // deployed function (`docs/design/rl-continuation.md` section 2).
     let adapter = es_data::rl_import::Adapter::parse(
-        &std::fs::read_to_string(rl_fixture("adapter-so101.toml")).expect("the adapter"),
+        &std::fs::read_to_string(&documents.adapter).expect("the adapter"),
     )
     .expect("the adapter parses");
     let scale = adapter.action.scale.clone().expect("the adapter's scale");
@@ -12241,10 +12391,12 @@ fn import_rl_reproduces_the_source_policy() {
         }
     }
     println!(
-        "{NAME}: {rows} rows x {action_dim}\n  (a) reconstruction vs our runtime: {mismatches} \
+        "{NAME}: {} , {rows} rows x {action_dim}\n  (a) reconstruction vs our runtime: \
+         {mismatches} \
          mismatching values (max abs {worst_bits:.3e})\n  (b) our runtime vs JAX actions_scaled: \
          max abs error {worst_jax:.3e} (tier 4, tolerance 1e-5)\n  weights_hash {}\n  \
          policy_hash {}",
+        documents.task.display(),
         hex(bundle.learning.policy.weights.hash()),
         bundle
             .manifest
@@ -12282,6 +12434,9 @@ fn import_rl_matches_the_reconstruction() {
     };
     let neutral = PathBuf::from(neutral);
     let dir = scratch_dir("import-rl-framework");
+    // rsl_rl and rl_games record no action kind, so the position pair is the one their
+    // adapter targets (a delta source would say so in its manifest -- M9/T2).
+    let documents = reach_documents(&dir, false);
     let out = dir.join("bundle");
     let run = bin()
         .current_dir(train_root())
@@ -12293,11 +12448,11 @@ fn import_rl_matches_the_reconstruction() {
             "--weights",
             &train_toml_path(&neutral.join("weights.safetensors")),
             "--adapter",
-            &train_toml_path(&rl_fixture("adapter-so101.toml")),
+            &train_toml_path(&documents.adapter),
             "--task",
-            &train_toml_path(&rl_fixture("task-reach.toml")),
+            &train_toml_path(&documents.task),
             "--deployment",
-            &train_toml_path(&rl_fixture("deployment-reach.toml")),
+            &train_toml_path(&documents.deployment),
             "--out",
         ])
         .arg(&out)

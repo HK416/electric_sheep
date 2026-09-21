@@ -566,6 +566,72 @@ scale the fold exposes (a policy whose input carries a channel amplified 5,600×
 moved in training is a policy E4 would have caught); and open question 2, still measured at 1.00
 and still ahead of both in every other row of this note.
 
+### T2 — the delta source policy, oracle server `renderer-14`, 2026-09-21
+
+Artifacts: `~/artifacts/plan-t/t2/seed0-run{1,2}/`. Venv `~/venvs/es-rl` (the §1 pins of
+`docs/api-notes/brax-ppo-so101.md`, unchanged). Full detail and the training curve are that
+note's section 7; these are the rows plan T is measured on.
+
+The same brax stack, the same derived scene and the same 2 M-step budget, with the action read
+as a per-tick increment (`target_t = clip(target_{t−1} + 0.05 · clip(a, −1, 1), ctrlrange)`,
+`target_0` = the reset pose):
+
+| row | delta | position (S2c) |
+|---|---|---|
+| `source.npz` bitwise across two same-seed runs | **yes** (`473b4fde…`) | yes (`8c0faf01…`) |
+| `success_reached` over 64 episodes, source framework | **1.00** (64/64) | 1.00 |
+| final distance, mean / max | **3.20 / 6.72 mm** | 8.41 / 14.65 mm |
+| return, mean | 126.81 | 188.11 |
+| `check_export.py`, in-distribution max abs error | 9.537e-07 | 1.580e-06 |
+| wall clock, 2 M steps, 4,096 envs | 561.3 s | 540.6 s |
+
+The return is lower and the policy is *better*: a delta action cannot jump to the target, so the
+first ~24 ticks of every episode pay the distance penalty while the arm travels. Success and
+final accuracy are what the task asks for, and both improved.
+
+**The per-tick command change, the number T3 compares the clamp rate against** —
+`|target_t − target_{t−1}|` over 64 × 200 × 6 values:
+
+| | mean | p95 | max |
+|---|---|---|---|
+| per joint and tick | 0.01006 rad | 0.03219 rad | 0.04991 rad |
+| per tick, largest of the six joints | 0.02090 rad | 0.04303 rad | 0.04991 rad |
+
+0.05 rad/tick at 50 Hz is 2.5 rad/s against the envelope's 3.0 rad/s, and the observed maximum
+is the cap to four digits: the increment itself never asks for more than the plane allows, so
+what T3 will see clamped is the *integrated* target against the position limits, not the step.
+
+**The import, same server and day** (`ES_S2B_SOURCE=~/artifacts/plan-t/t2/seed0-run1`,
+`ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python`, torch 2.11.0+cu129,
+`cargo test --release -p es --test cli -- --ignored import_rl_reproduces_the_source_policy`).
+`import.json` carries `action_kind = "joint_delta"`, `adapter-so101-delta.toml` declares the
+same with the increment unit, and the Task and Deployment IR declare `JointDelta`:
+
+| tier (section 4) | what is compared | measured |
+|---|---|---|
+| (a) | the importer's numpy → torch reconstruction vs our runtime, 1,000 × 6 values | **bitwise** — 0 mismatching values |
+| (b) | our runtime vs JAX's deterministic `tanh(loc)` on `obs_scaled` | **3.297e-7** max abs error (tolerance 1e-5) |
+
+| slot | hash |
+|---|---|
+| `weights_hash` | `c0199681d71b042332c2211590aef2a3c6a8020e965eb375652ec3dcb453c884` |
+| `observation_hash` | `598ad2414fc5c9ffd414bc00658d029326ecde569a84909c0f47e53e34d35cc8` |
+| `learning_hash` | `a408abec926306134b3df604ba813770d96bfc2fead3c9829d681d9beb9e6ded` |
+| `policy_hash` | `17226acd48abd7288c1306cee492229fab38f874e1de52305e315e6ddb90b42a` |
+| `deployment_hash` | `9c81278b496e51cba2aec3852f6543852c084906e2d9d48b934e37a60f0f993d` (`deployment-reach-delta.toml`) |
+
+The emitted Learning IR is the section 1 shape with one difference: the `Normalizer{Inverse}`
+statistics are `mean = 0`, `std = 0.05` and its output port is `Unit::AngularVelocity` — rad per
+control tick, which `XIR-031` requires of a `JointDelta` deployment and refuses `Unit::Angle`
+for. The same oracle on the S2c **position** checkpoint is unmoved (`weights_hash
+37fc82a8…`, `policy_hash 1a18cc4b…`, tier (b) 9.704e-7), so the action kind changed what the
+numbers mean and nothing else.
+
+There is no committed delta *Task* IR: T1 committed `deployment-reach-delta.toml` and mutates
+the task in memory for its own cross-check, so the CLI tests substitute the one line that
+differs (`ActionSpec.space`) into a scratch copy of `task-reach.toml`. Committing the pair is
+the next packet's to do if it wants one.
+
 ## 8. The importer and the adapter
 
 Rule 3 of section 1 says the adapter declares and code never guesses. This is what that comes

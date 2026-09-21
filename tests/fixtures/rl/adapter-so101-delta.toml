@@ -1,0 +1,62 @@
+# The SO-101 import adapter, delta flavour -- packet M9/T2, spec 14.4, spec 8.5.
+#
+# Identical to `adapter-so101.toml` except for the `[action]` block: the source's six numbers
+# are per-tick *increments* over the previous command, not absolute position targets. That one
+# sentence is the whole difference, and it is said here rather than inferred from the weights
+# -- which is the point of the file (`docs/design/rl-continuation.md` rule 3: the importer
+# never guesses). It targets `deployment-reach-delta.toml` (M9/T1) and a Task IR whose
+# `ActionSpec` declares `JointDelta` -- there is no committed delta Task IR yet, so the CLI
+# test substitutes that one line into `task-reach.toml`. Pointed at the position documents it
+# is refused by name (`IMP-004`), and so is the position adapter pointed at these.
+
+[robot]
+name = "so101"
+
+[joints]
+source_order = [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+]
+units = "rad"
+
+[action]
+kind = "joint_delta"
+# THE INCREMENT UNIT. `delta = offset + scale * a`, in **radians per control tick**: the
+# network's [-1, 1] output times 0.05 rad, and `es-env` adds that to the previous absolute
+# target (M9/T1). At the deployment's 50 Hz that is 2.5 rad/s, under the envelope's 3.0 rad/s,
+# so the plane clamps the integrated *position*, not the increment.
+#
+# The offset is zero and not a centre: an increment's neutral value is "do not move", and a
+# non-zero offset here would be a policy that drifts when it outputs nothing. The source
+# records the same numbers (`meta.json -> action.scale`, `brax-ppo-so101.md` section 7); a
+# disagreement is a warning row in the mapping report, and a disagreement about `kind` is a
+# refusal.
+offset = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+scale = [0.05, 0.05, 0.05, 0.05, 0.05, 0.05]
+
+[[observation.channels]]
+source = "qpos[0:6]"
+slice = [0, 6]
+channel = "joint_pos"
+
+[[observation.channels]]
+source = "qvel[0:6]"
+slice = [6, 12]
+channel = "joint_vel"
+
+# pos[3] || quat[4], the quaternion in xyzw (spec 3.1). MuJoCo's `xquat` is wxyz and the source
+# env reorders it before it reaches the network, so our `GetBodyPose` channel and the source's
+# block are the same seven numbers in the same order.
+[[observation.channels]]
+source = "qpos[6:13]"
+slice = [12, 19]
+channel = "cube_pose"
+
+[[observation.channels]]
+source = "xpos/xquat(gripper)"
+slice = [19, 26]
+channel = "gripper_pose"
