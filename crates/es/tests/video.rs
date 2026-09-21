@@ -786,3 +786,96 @@ fn showcase_look_flag_is_parsed() {
     }
     println!("RAN showcase_look_flag_is_parsed: lambert (default), full, and a rejected value");
 }
+
+// --- es video showcase --path pt (packet M7/R3) ----------------------------------------------
+
+/// Oracle 8: `--path pt` and its four knobs parse, the two enumerated ones reject a value
+/// they do not name, and `--spp 0` is a usage error rather than a division by zero later.
+///
+/// Parsing only, as above: a real render needs a Vulkan device and a run directory.
+#[test]
+fn showcase_pt_flags_are_parsed() {
+    let out = scratch_dir("showcase-pt");
+    let base = |extra: &[&str]| {
+        let mut cmd = bin();
+        cmd.args(["video", "showcase"])
+            .args(["--run", out.join("no-such-run").to_str().unwrap()])
+            .args(["--scene", "tests/fixtures/mjcf/so101_pick_place.xml"])
+            .args(["--out", out.join("frames").to_str().unwrap()])
+            .args(["--eye", "0.66,-0.46,0.52"])
+            .args(["--look-at", "0.14,-0.04,0.04"])
+            .args(extra);
+        cmd.current_dir(workspace_root())
+            .output()
+            .expect("run es video showcase")
+    };
+
+    let help = bin()
+        .args(["video", "showcase", "--help"])
+        .output()
+        .expect("run --help");
+    if stderr(&help).contains("needs the `render` feature") {
+        println!("SKIP showcase_pt_flags_are_parsed: built without the `render` feature");
+        return;
+    }
+    assert!(
+        stdout(&help).contains("--path rs|pt") && stdout(&help).contains("--tonemap"),
+        "the help text does not document the PT flags:\n{}",
+        stdout(&help)
+    );
+
+    for (args, expected) in [
+        (vec!["--path", "raytrace"], "--path: expected rs or pt"),
+        (
+            vec!["--path", "pt", "--tonemap", "filmic"],
+            "--tonemap: expected reinhard or aces",
+        ),
+        (vec!["--path", "pt", "--spp", "0"], "--spp"),
+        (vec!["--path", "pt", "--bounces", "0"], "--bounces"),
+    ] {
+        let got = base(&args);
+        assert_eq!(got.status.code(), Some(2), "{args:?} must be usage");
+        assert!(
+            stderr(&got).contains(expected),
+            "{args:?}: {}",
+            stderr(&got)
+        );
+    }
+
+    // Accepted: parsing gets past every flag and the command fails later, on the run
+    // directory that is not there or on the missing Vulkan device — a runtime error.
+    for args in [
+        vec!["--path", "pt"],
+        vec!["--path", "pt", "--spp", "8"],
+        vec![
+            "--path",
+            "pt",
+            "--spp",
+            "64",
+            "--bounces",
+            "3",
+            "--exposure",
+            "1.5",
+            "--tonemap",
+            "aces",
+        ],
+        vec!["--path", "pt", "--tonemap", "reinhard"],
+    ] {
+        let got = base(&args);
+        assert_eq!(
+            got.status.code(),
+            Some(1),
+            "{args:?} should parse and then fail on the missing run: {}",
+            stderr(&got)
+        );
+        assert!(
+            !stderr(&got).contains("expected"),
+            "{args:?} was rejected: {}",
+            stderr(&got)
+        );
+    }
+    println!(
+        "RAN showcase_pt_flags_are_parsed: --path rs|pt, --spp, --bounces, --exposure, \
+         --tonemap reinhard|aces"
+    );
+}
