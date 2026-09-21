@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use es_compile::PolicyBundle;
+use es_data::rl_import::{Adapter, ImportManifest};
 use es_ir::graph::Graph;
 use es_ir::learning::{ActionExecutionMode, LearningGraph, WeightsRef};
 use es_ir::serial::{deployment_from_toml, observation_from_toml, task_from_toml};
@@ -30,6 +31,9 @@ es policy lower --policy <in.esb> --out <dir>
 es policy pack  --policy <in.esb> --weights <model.safetensors> --out <out.esb>
 es policy import-lerobot --checkpoint <dir> --task <t.toml> --observation <o.toml>
                          --deployment <d.toml> --out <out.esb>
+es policy import-rl --manifest <import.json> --weights <w.safetensors>
+                    --adapter <adapter.toml> --task <t.toml> --deployment <d.toml>
+                    --out <dir>
 
 The Rust half of the spec 2.3 training split. No subcommand needs Python.
 
@@ -68,6 +72,24 @@ import-lerobot
         says owns it; chunk_size must already equal the deployment's horizon, and a
         checkpoint that disagrees is named and refused rather than reshaped.
 
+import-rl
+        Admits a PPO actor trained by brax / MuJoCo Playground, rsl_rl or rl_games
+        (spec 14.4 \"RL policy import\", packet M8/S2b). `python/es/import_rl.py` has
+        already turned the checkpoint into <w.safetensors> with framework-neutral keys
+        and an <import.json> manifest -- the pickle and the orbax reader live there and
+        only there (INV-16). This half reads those two plus a per-robot **adapter
+        document**, and writes under <dir>:
+          observation.toml     StateInput per adapter channel -> Concat -> Normalize
+          learning.toml        StateEncoder{Mlp} -> PolicyHead{Regression, squash}
+                               -> ActionChunker -> Normalizer{Inverse}
+          policy.esb           the bundle, weights remapped onto the lowered keys
+          mapping-report.json  spec 14.4's Semantic Mapping Report: one row per joint
+                               and per observation channel
+        Nothing is guessed: joint order, units, action kind and the observation layout
+        come from the adapter or the import is refused by name (`IMP-001` .. `IMP-005`).
+        The Task IR's own `scene.path` is opened, repository-relative, for the actuator
+        names `IMP-002` checks against.
+
 Exit codes: 0 success, 1 runtime failure, 2 usage error.
 ";
 
@@ -76,6 +98,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         Some("lower") => lower(&args[1..]),
         Some("pack") => pack(&args[1..]),
         Some("import-lerobot") => import_lerobot(&args[1..]),
+        Some("import-rl") => import_rl(&args[1..]),
         Some("--help" | "-h") | None => {
             println!("{HELP}");
             return 0;
@@ -421,6 +444,157 @@ pub(crate) fn import_lerobot(args: &[String]) -> Result<u8, CliError> {
         learning.policy.contract.execute_chunk,
         learning.policy.contract.replanning_hz
     );
+    for (slot, value) in [
+        ("task", reopened.manifest.hashes.task),
+        ("observation", reopened.manifest.hashes.observation),
+        ("learning", reopened.manifest.hashes.learning),
+        ("policy", reopened.manifest.hashes.policy),
+        ("deployment", reopened.manifest.hashes.deployment),
+    ] {
+        if let Some(h) = value {
+            println!("{slot}_hash: {}", hex(&h));
+        }
+    }
+    Ok(0)
+}
+
+/// `es policy import-rl` — a PPO actor trained elsewhere, under our documents (spec 14.4).
+///
+/// The division of labour is the packet's (M8/S2b): Python opened the checkpoint and left a
+/// neutral `safetensors` + `import.json`, a human wrote the adapter, and this reads the three
+/// and builds the two documents, the bundle and the Semantic Mapping Report. Every mapping
+/// decision is the adapter's; every refusal names its `IMP-0xx` code and writes nothing.
+pub(crate) fn import_rl(args: &[String]) -> Result<u8, CliError> {
+    let a = parse(
+        args,
+        &[
+            "--manifest",
+            "--weights",
+            "--adapter",
+            "--task",
+            "--deployment",
+            "--out",
+        ],
+    )?;
+    let read = |flag: &str| -> Result<String, CliError> {
+        std::fs::read_to_string(&a[flag])
+            .map_err(|e| CliError::Runtime(format!("{}: {e}", a[flag])))
+    };
+    let named = |flag: &str, e: es_data::rl_import::ImportError| {
+        CliError::Runtime(format!("{}: {e}", a[flag]))
+    };
+
+    let manifest =
+        ImportManifest::parse(&read("--manifest")?).map_err(|e| named("--manifest", e))?;
+    let adapter = Adapter::parse(&read("--adapter")?).map_err(|e| named("--adapter", e))?;
+    let task = task_from_toml(&read("--task")?)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", a["--task"])))?;
+    let deployment = deployment_from_toml(&read("--deployment")?)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", a["--deployment"])))?;
+    let weights = std::fs::read(&a["--weights"])
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", a["--weights"])))?;
+
+    // `IMP-002` checks the adapter's joint names against the actuators the scene actually has,
+    // so the scene is read here rather than guessed at. Repository-relative, the same contract
+    // `es train` states for the same field.
+    let scene_path = task.scene.path.clone();
+    let xml = std::fs::read_to_string(&scene_path).map_err(|e| {
+        CliError::Runtime(format!(
+            "{scene_path}: {e}\nThe Task IR's `scene.path` is repository-relative; run \
+             `es policy import-rl` from the repository root."
+        ))
+    })?;
+    let scene = es_assets::parse_mjcf(&xml)
+        .map_err(|e| CliError::Runtime(format!("{scene_path}: {e}")))?
+        .scene;
+    let actuators: Vec<String> = scene.actuators.iter().map(|x| x.name.clone()).collect();
+
+    let imported = match es_data::rl_import::convert(
+        &manifest,
+        &adapter,
+        &task,
+        &deployment,
+        &weights,
+        &actuators,
+    ) {
+        Ok(imported) => imported,
+        Err(e) => {
+            // Decided before the first file, like `es import roboverse`: a refusal leaves no
+            // half-written output directory behind.
+            eprintln!("error: {e}");
+            return Ok(1);
+        }
+    };
+
+    let mut learning = imported.learning;
+    learning.policy.weights = WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: weights_hash(&imported.weights),
+    };
+    let bundle = PolicyBundle::build(
+        &task,
+        &imported.observation,
+        &learning,
+        &deployment,
+        &imported.weights,
+    )
+    .map_err(|e| CliError::Runtime(format!("building the bundle: {e}")))?;
+
+    let dir = PathBuf::from(&a["--out"]);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
+    let write = |name: &str, body: &[u8]| -> Result<(), CliError> {
+        let path = dir.join(name);
+        std::fs::write(&path, body)
+            .map_err(|e| CliError::Runtime(format!("{}: {e}", path.display())))
+    };
+    write(
+        "observation.toml",
+        es_ir::serial::observation_to_toml(&imported.observation)
+            .map_err(|e| CliError::Runtime(e.to_string()))?
+            .as_bytes(),
+    )?;
+    write(
+        "learning.toml",
+        es_ir::serial::learning_to_toml(&learning)
+            .map_err(|e| CliError::Runtime(e.to_string()))?
+            .as_bytes(),
+    )?;
+    write("policy.esb", &bundle)?;
+    write(
+        "mapping-report.json",
+        serde_json::to_string_pretty(&imported.report)
+            .map_err(|e| CliError::Runtime(format!("mapping-report.json: {e}")))?
+            .as_bytes(),
+    )?;
+
+    // Reopened rather than trusted, like `pack` and `import-lerobot`.
+    let reopened = PolicyBundle::open(&bundle)
+        .map_err(|e| CliError::Runtime(format!("the bundle just written does not open: {e}")))?;
+    for w in &imported.report.warnings {
+        println!("warning: {w}");
+    }
+    println!("out:           {}", dir.display());
+    println!(
+        "source:        {} ({} joints, {} channels, obs_dim {}, hidden {:?}, {} + {})",
+        imported.report.framework,
+        imported.report.joints.len(),
+        imported.report.channels.len(),
+        imported.report.obs_dim,
+        imported.report.hidden,
+        imported.report.activation,
+        imported.report.squash,
+    );
+    println!(
+        "log_std:       {}",
+        imported.report.log_std.as_ref().map_or_else(
+            || "null (the source carries no state-independent log-std; \
+                 `train_ppo.py --init-log-std` is not fed from this import)"
+                .to_owned(),
+            |v| format!("{v:?} (training-only; it never enters the bundle)"),
+        )
+    );
+    println!("weights_hash:  {}", hex(learning.policy.weights.hash()));
     for (slot, value) in [
         ("task", reopened.manifest.hashes.task),
         ("observation", reopened.manifest.hashes.observation),

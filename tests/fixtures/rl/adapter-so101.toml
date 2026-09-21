@@ -1,0 +1,76 @@
+# The SO-101 import adapter -- packet M8/S2b, spec 14.4.
+#
+# `es policy import-rl` reads a framework-neutral `import.json` and this document, and builds
+# an Observation IR, a Learning IR and a bundle out of the two. Everything a source checkpoint
+# does not say about *our* robot is said here, by a human, once: which joints the framework's
+# action vector is in, what its units are, whether its numbers are position targets or
+# torques, and which Task IR observation channel each slice of the flat observation feeds.
+#
+# THE RULE THIS FILE EXISTS FOR (docs/design/rl-continuation.md rule 3): the importer never
+# guesses. A field that is absent here and absent from the manifest is a named refusal
+# (`IMP-001` .. `IMP-005`), not a default. Unknown fields are refused too -- a typo'd key that
+# was silently ignored would be a mapping nobody declared.
+#
+# It targets tests/fixtures/rl/task-reach.toml and tests/fixtures/rl/deployment-reach.toml:
+# six SO-101 actuators, `joint_position` space, and the 26-dimensional observation
+# `joint_pos[6] || joint_vel[6] || cube_pose[7] || gripper_pose[7]`.
+
+[robot]
+name = "so101"
+
+[joints]
+# The framework's own action order. brax's `so101_reach_env.py` uses the XML's actuator
+# declaration order, which is also the order `ActionSpec` and the Safety Plane's per-joint
+# limit vectors are in; a source that ordered them differently would permute this list, and
+# that permutation is exactly what a reader of the mapping report needs to see.
+source_order = [
+    "shoulder_pan",
+    "shoulder_lift",
+    "elbow_flex",
+    "wrist_flex",
+    "wrist_roll",
+    "gripper",
+]
+units = "rad"
+
+[action]
+kind = "position_target"
+# `ctrl = offset + scale * a`, per actuator `ctrlrange` (centre and half-range) of
+# tests/fixtures/mjcf/so101_pick_place.xml. The manifest carries the same numbers when the
+# source framework recorded them (S2c's `meta.json` does); declaring them here makes the
+# import independent of that, and a disagreement is reported as a warning row rather than
+# silently resolved.
+#
+# The long tails are not decoration: these are `(hi + lo) / 2` and `(hi - lo) / 2` evaluated in
+# f64, copied from the generated `learning-state.toml`. Rounding them to the decimal a human
+# would type makes them disagree with the checkpoint's own numbers in the last bits, which is
+# a warning on every real import and an action that is not quite the one the source trained.
+offset = [0.0, 0.0, 0.0, 0.0, 0.048679999999999835, 0.7854]
+scale = [1.91986, 1.74533, 1.69, 1.65806, 2.79253, 0.9599300000000001]
+
+# One row per contiguous block of the source's flat observation vector. The blocks must tile
+# `obs_dim` exactly, in order, and every `channel` must be one the Task IR's `ObservationSpec`
+# declares at the same width (`IMP-005`). `source` is the name of the vector the framework read
+# the block out of; it is recorded in the mapping report for a human and is not interpreted.
+[[observation.channels]]
+source = "qpos[0:6]"
+slice = [0, 6]
+channel = "joint_pos"
+
+[[observation.channels]]
+source = "qvel[0:6]"
+slice = [6, 12]
+channel = "joint_vel"
+
+# pos[3] || quat[4], the quaternion in xyzw (spec 3.1). MuJoCo's `xquat` is wxyz and the source
+# env reorders it before it reaches the network, so our `GetBodyPose` channel and the source's
+# block are the same seven numbers in the same order.
+[[observation.channels]]
+source = "qpos[6:13]"
+slice = [12, 19]
+channel = "cube_pose"
+
+[[observation.channels]]
+source = "xpos/xquat(gripper)"
+slice = [19, 26]
+channel = "gripper_pose"
