@@ -594,6 +594,7 @@ fn bundle_with_camera() -> PolicyBundle {
             source: ObsSource::Sensor {
                 id: sensor,
                 format: ChannelFormat::Rgb,
+                render: es_ir::task::SensorRender::default(),
             },
             ty: PortType {
                 elem: ElemType::U8,

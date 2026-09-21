@@ -712,6 +712,7 @@ pub fn convert(task: &RoboVerseTask) -> Result<Converted, ConvertError> {
                 source: ObsSource::Sensor {
                     id: sensor,
                     format: ChannelFormat::Rgb,
+                    render: es_ir::task::SensorRender::default(),
                 },
                 ty,
             },
