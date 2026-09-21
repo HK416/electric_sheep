@@ -235,3 +235,78 @@ Two rules the producer keeps and a third the wire cannot:
 - **The token is still clear text on a trusted socket** (§4). `--telemetry 127.0.0.1:7777` is
   the shape this is for; a bind on `0.0.0.0` with a token is not a secure remote channel, and
   §6/§8's TLS/QUIC ceiling is where that gets fixed.
+
+### 9.1 The whole loop, on one address (packet M7/E7)
+
+After E4 only `es eval run` published. Three more producers now do, and one of them is a
+*cycle* — so a person who presses Start on the whole loop watches it rather than watching log
+lines. The frame construction lives in one file, `crates/es/src/cmd/telemetry.rs`, which is
+the only place in the repository that turns anything into a `Frame`.
+
+**Every stream-1 event carries a `stage` field**: `collect`, `expert-gate`, `train`, `eval`,
+`showcase` or `cycle`. That is what makes one socket enough. `es loop cycle --telemetry` binds
+**once**, before its first stage, and hands the same publisher to every in-process stage
+(`cmd::r#loop::collect`, `cmd::eval::run`, `cmd::train::run` each take an
+`Option<&mut Publisher>`); the standalone commands bind their own and name themselves. A
+cycle's stages are bracketed by `stage.begin { name }` and
+`stage.end { name, seconds, code }`, so the editor's strip is the plan's own order with the
+wall-clock each stage took.
+
+The address is the **cycle's, not a stage's**: the stages are in-process calls, so
+`--telemetry` is on no line of `es loop cycle --dry-run`'s plan and `plan-cycle.txt` is
+unmoved (`cycle_telemetry_is_one_address`).
+
+| Stream | Payload | Sent by | When |
+|---|---|---|---|
+| `1` | `Event { kind, fields }` | all | `cell.begin` / `cell.end` / `suite.end` (eval, §9), `episode.begin { episode, seed }` / `episode.end { episode, outcome, steps }` (collect), `train.begin { total_steps }` and `checkpoint { step, policy_hash }` (train), `stage.begin` / `stage.end` (cycle). Every one of them also carries `stage` |
+| `2` | `Scalars([frame, tick, source, violation bits])` | eval, collect | every control tick |
+| `3` | `Metrics(PerfMetrics)` | eval | at each `cell.end` |
+| `4` | `Image { format: "rgb8" }` | eval, collect, train | every `--telemetry-image-every` ticks; for a training run that is the **sample image** every `--sample-every` optimizer steps |
+| `5` | `Scalars([step, loss, lr, samples_per_s])` | train | every `--progress-every` optimizer steps |
+
+Stream 5 is the one new id and it is still data, not schema: `protocol.rs` is frozen at its
+version, and a consumer that does not know 5 ignores it.
+
+**Collection publishes what it already had.** `Collector::run_with_sink` calls one closure
+(`es_data::collect::CollectSink`, a closure and not an eighth extension point, `INV-17`) with
+the episode boundaries and, per control tick, the `action_source` the dataset's own column
+records plus the `EventSet` bits of that step. The bits are the **delta of the plane's own
+per-kind counters** across the step: one env means exactly one `validate` per step, so a kind
+whose count moved is a kind that step raised — the same bitset `SafeAction::events` carries,
+read from the side the collector can see (`es_env::DomainRunner::emit_actions` keeps the
+`SafeAction` itself). That array is only read when a sink is there, and the dataset under
+`--out` is byte-identical with and without the flag
+(`collect_telemetry_publishes_every_episode` compares every file of both trees).
+
+**Training publishes its own stdout.** `train_act.py --progress-every N` prints one
+`{"progress": {…}}` line every `N` optimizer steps and `--sample-every N` writes
+`sample-<step>.bin` + `.json` beside `--loss-curve` and prints `{"sample": "<path>"}`. The
+summary stays the **last** line and stays byte-identical, and `es train` still parses it the
+same way — with `--telemetry` it reads stdout through `Stdio::piped` + `BufReader::lines`
+instead of at exit, and stderr is inherited rather than piped, because reading two pipes from
+one thread deadlocks when either fills.
+
+Three rules this producer keeps:
+
+- **The two trainer flags are never in the plan.** `config.json` carries the plan and
+  `identity_hash` covers `config.json` (§19.3), so a flag that changes nothing the run
+  computes must not move a run's identity — a `training.lock` that differed by whether
+  somebody was watching would make two identical runs look like two runs. They are appended
+  to the trainer's argv at spawn time and printed on their own line. `train_telemetry_streams_the_curve`
+  compares `training.lock`, `training/config.json`, `metrics/loss.json` and the packed
+  `checkpoints/40.esb` byte for byte against a run without the flag.
+- **No stream-3 frame.** §12.4's `PerfMetrics` has no training slot, and `protocol.rs` is
+  frozen; mapping training samples/s onto `actions_per_sec` would be a lie about which
+  quantity was measured. The throughput is the fourth scalar of stream 5 and nowhere else.
+- **A training frame's `tick` is zero.** An optimizer step is not a physics tick, and the step
+  is the first scalar of the payload.
+
+**The sample image is for display and says so.** It is one image input of the current batch,
+*after* augmentation — the tensor the network is actually fitting — mapped to `Rgb8` with
+`clamp(v, 0, 1) * 255`, which is the exact inverse of the demo's chain (`Dequantize` ÷255 then
+`Normalize{Range 0..1}`, the identity). Neither `contract.json` nor the bake's `manifest.json`
+carries a normalisation's numbers, so the mapping is **recorded in the sidecar** rather than
+assumed: a document normalising by mean/std would show through as a washed-out picture with
+`"mapping": "clamp(v, 0, 1) * 255"` beside it, rather than as a wrong one nobody can question.
+Undoing an arbitrary chain would need the chain, and that is a manifest change this packet
+does not make.

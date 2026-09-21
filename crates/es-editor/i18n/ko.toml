@@ -71,6 +71,8 @@
 "word.train" = "학습"
 "word.evaluate" = "평가"
 "word.watch" = "관찰"
+"word.expert_gate" = "시범 점검"
+"word.showcase" = "영상 만들기"
 
 # --- 블록 찾기 ----------------------------------------------------------------------------
 "find.label" = "찾기"
@@ -162,6 +164,21 @@
 "live.streams" = "신호"
 "live.events" = "사건"
 "live.empty" = "연결된 것이 없습니다. 실행이 값을 내보내는 주소를 적고 연결을 누르거나, 결과 탭에서 시작을 누르세요."
+"live.training" = "배우는 중"
+"live.training.hint" = "실행 중인 es train의 학습 곡선. --progress-every 걸음마다 5번 신호로 옵니다 (spec 23.3, spec 19.3)"
+"live.training.empty" = "지금 배우고 있는 것이 없습니다. 학습이나 전체 과정을 시작하면 여기에 곡선이 그려집니다."
+"live.loss" = "얼마나 틀리는지"
+"live.lr" = "한 번에 얼마나 고치는지"
+"live.log_scale" = "높은 쪽을 눌러 보기"
+"live.step" = "{} / {} 걸음"
+"live.step_only" = "{} 걸음"
+"live.eta" = "약 {} 남음"
+"live.throughput" = "초당 {}개"
+"live.checkpoints" = "{}번 저장함"
+"live.sample" = "신경망이 보고 있는 것"
+"live.sample.hint" = "지금 묶음의 이미지 입력 하나. 증강을 거친 뒤, 보여 주기 위해서만 원래 밝기로 되돌린 것입니다 (spec 23.3)"
+"live.sample.empty" = "아직 사진이 없습니다. --telemetry-image-every로 보내 달라고 하세요."
+"results.stages" = "이 실행의 단계"
 
 # --- 정책이 보는 것 --------------------------------------------------------------------------
 "sees.empty" = "프로젝트 파일을 열면 로봇의 카메라가 정책에 무엇을 건네는지 보여 줍니다."

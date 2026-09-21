@@ -3,4 +3,10 @@ train
 tests/fixtures/visible-learning/training.toml
 --out
 eval-out
+--telemetry
+127.0.0.1:7777
+--telemetry-token
+s3cret
+--telemetry-image-every
+10
 --dry-run

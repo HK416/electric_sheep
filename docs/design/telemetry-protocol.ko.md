@@ -228,3 +228,72 @@ Fallback 2, Human 3`), 그리고 `es_safety::EventSet::bits()`. 같은 스텝을
 - **토큰은 여전히 신뢰된 소켓 위의 평문이다**(§4). `--telemetry 127.0.0.1:7777`이 이것이 위하는
   모양이다; 토큰을 달고 `0.0.0.0`에 바인드한다고 안전한 원격 채널이 되지는 않으며,
   그것을 고치는 곳은 §6/§8의 TLS/QUIC 천장이다.
+
+### 9.1 한 주소 위의 전체 루프 (패킷 M7/E7)
+
+E4 뒤로는 `es eval run`만이 발행했다. 이제 세 프로듀서가 더 발행하고, 그중 하나는 *사이클*이다 —
+전체 루프에서 시작을 누른 사람이 로그 줄이 아니라 실행 자체를 본다. 프레임을 만드는 자리는
+`crates/es/src/cmd/telemetry.rs` 한 파일이며, 저장소에서 무언가를 `Frame`으로 바꾸는 곳은 거기뿐이다.
+
+**모든 스트림 1 이벤트는 `stage` 필드를 지닌다**: `collect`, `expert-gate`, `train`, `eval`,
+`showcase`, `cycle`. 소켓 하나로 충분한 이유가 그것이다. `es loop cycle --telemetry`는 첫 단계
+전에 **한 번** 바인드하고 같은 퍼블리셔를 프로세스 안의 모든 단계에 넘긴다
+(`cmd::r#loop::collect`, `cmd::eval::run`, `cmd::train::run`이 각각 `Option<&mut Publisher>`를
+받는다). 독립 명령은 자기 것을 바인드하고 자기 이름을 붙인다. 사이클의 단계는
+`stage.begin { name }`과 `stage.end { name, seconds, code }`로 감싸이므로, 에디터의 스트립은
+계획이 가진 순서 그대로이고 각 단계가 쓴 벽시계 시간을 함께 지닌다.
+
+주소는 **사이클의 것이지 단계의 것이 아니다**: 단계는 프로세스 안의 호출이므로
+`es loop cycle --dry-run`이 찍는 계획의 어느 줄에도 `--telemetry`는 없고 `plan-cycle.txt`는
+움직이지 않는다(`cycle_telemetry_is_one_address`).
+
+| 스트림 | 페이로드 | 보내는 쪽 | 언제 |
+|---|---|---|---|
+| `1` | `Event { kind, fields }` | 전부 | `cell.begin` / `cell.end` / `suite.end`(평가, §9), `episode.begin { episode, seed }` / `episode.end { episode, outcome, steps }`(수집), `train.begin { total_steps }`와 `checkpoint { step, policy_hash }`(학습), `stage.begin` / `stage.end`(사이클). 모두 `stage`도 함께 지닌다 |
+| `2` | `Scalars([frame, tick, source, violation bits])` | 평가, 수집 | 제어 틱마다 |
+| `3` | `Metrics(PerfMetrics)` | 평가 | `cell.end`마다 |
+| `4` | `Image { format: "rgb8" }` | 평가, 수집, 학습 | `--telemetry-image-every` 틱마다. 학습에서는 `--sample-every` 옵티마이저 스텝마다의 **샘플 이미지** |
+| `5` | `Scalars([step, loss, lr, samples_per_s])` | 학습 | `--progress-every` 옵티마이저 스텝마다 |
+
+스트림 5가 새로 생긴 유일한 id이고 그것도 여전히 스키마가 아니라 데이터다: `protocol.rs`는 자기
+버전에 고정되어 있고, 5를 모르는 소비자는 그냥 무시한다.
+
+**수집은 이미 가지고 있던 것을 발행한다.** `Collector::run_with_sink`는 클로저 하나
+(`es_data::collect::CollectSink` — 여덟 번째 확장점이 아니라 클로저다, `INV-17`)를 에피소드
+경계마다, 그리고 제어 틱마다 데이터셋의 `action_source` 열이 기록하는 바로 그 값과 그 스텝의
+`EventSet` 비트와 함께 부른다. 비트는 그 스텝을 사이에 둔 **플레인 자신의 종류별 카운터 차이**다:
+env가 하나이므로 스텝당 `validate`는 정확히 한 번이고, 수가 움직인 종류가 그 스텝이 올린 종류다 —
+`SafeAction::events`가 지니는 것과 같은 비트셋을, 수집기가 볼 수 있는 쪽에서 읽은 것이다
+(`SafeAction` 자체는 `es_env::DomainRunner::emit_actions`가 가지고 있다). 그 배열은 싱크가 있을
+때만 읽히고, `--out` 아래 데이터셋은 플래그가 있든 없든 바이트 단위로 같다
+(`collect_telemetry_publishes_every_episode`가 두 트리의 모든 파일을 비교한다).
+
+**학습은 자기 stdout을 발행한다.** `train_act.py --progress-every N`은 `N` 옵티마이저 스텝마다
+`{"progress": {…}}` 한 줄을 찍고, `--sample-every N`은 `--loss-curve` 옆에
+`sample-<step>.bin` + `.json`을 쓰고 `{"sample": "<경로>"}`를 찍는다. 요약은 여전히 **마지막**
+줄이고 바이트 단위로 같으며, `es train`은 그것을 같은 방법으로 읽는다 — `--telemetry`가 있으면
+종료 시점이 아니라 `Stdio::piped` + `BufReader::lines`로 읽고, stderr는 파이프가 아니라 상속한다.
+한 스레드로 파이프 둘을 읽으면 어느 한쪽이 차는 순간 교착하기 때문이다.
+
+이 프로듀서가 지키는 규칙 셋:
+
+- **트레이너의 두 플래그는 계획에 들어가지 않는다.** `config.json`이 계획을 지니고
+  `identity_hash`가 `config.json`을 덮으므로(§19.3), 실행이 계산하는 것을 바꾸지 않는 플래그가
+  실행의 정체성을 움직여서는 안 된다 — 누가 보고 있었느냐에 따라 달라지는 `training.lock`은
+  똑같은 두 실행을 서로 다른 둘로 보이게 만든다. 두 플래그는 spawn 시점에 트레이너의 argv에
+  덧붙고 자기 줄에 찍힌다. `train_telemetry_streams_the_curve`가 `training.lock`,
+  `training/config.json`, `metrics/loss.json`, 포장된 `checkpoints/40.esb`를 플래그 없는 실행과
+  바이트 단위로 비교한다.
+- **스트림 3 프레임은 없다.** §12.4의 `PerfMetrics`에는 학습 자리가 없고 `protocol.rs`는 고정되어
+  있다. 학습의 samples/s를 `actions_per_sec`에 실으면 어떤 양을 쟀는지에 대한 거짓말이 된다.
+  처리량은 스트림 5의 네 번째 스칼라이고 다른 어디에도 없다.
+- **학습 프레임의 `tick`은 0이다.** 옵티마이저 스텝은 물리 틱이 아니고, 스텝은 페이로드의 첫
+  스칼라다.
+
+**샘플 이미지는 보여 주기 위한 것이고 그렇다고 말한다.** 지금 묶음의 이미지 입력 하나를, 증강을
+*거친 뒤* — 신경망이 실제로 맞추고 있는 텐서 — `clamp(v, 0, 1) * 255`로 `Rgb8`에 옮긴 것이다.
+이 매핑은 데모의 체인(`Dequantize` ÷255 다음 `Normalize{Range 0..1}`, 즉 항등)의 정확한 역이다.
+`contract.json`도 베이크의 `manifest.json`도 정규화의 수를 지니지 않으므로, 매핑은 가정되지 않고
+**사이드카에 기록된다**: 평균/표준편차로 정규화하는 문서라면 `"mapping": "clamp(v, 0, 1) * 255"`가
+옆에 붙은 채 색이 바랜 그림으로 드러나지, 아무도 의심할 수 없는 틀린 그림으로 드러나지 않는다.
+임의의 체인을 되돌리려면 체인이 필요하고, 그것은 이 패킷이 하지 않는 매니페스트 변경이다.

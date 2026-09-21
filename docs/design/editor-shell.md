@@ -1033,3 +1033,128 @@ language and the size surviving a restart through `eframe::Storage`. Screenshots
 - Per-OS font *configuration*. The candidate list is fixed on purpose: a settings screen for
   fonts is a second problem, and the one thing a person needs — "why is my text boxes" — is
   answered by the status bar.
+
+---
+
+## 16. The whole loop, live: the curve and what the network sees (§23.1, §23.3, §13.1, M7/E7)
+
+§13 watched an evaluation. This watches the *loop*: collection, the expert gate, training and
+the evaluation, published by the commands that do them and drawn by the tabs that already
+exist. Owner note, 2026-09-21, after the local cycle demo: *show loss-curve-like data in the
+editor*, and *the training process has no rendered view — that is a pity.*
+
+### One address, four stages
+
+`es loop cycle --telemetry <addr>` binds **one** socket before its first stage and hands the
+same publisher to every in-process stage; every stream-1 event carries a `stage` field, and
+`stage.begin` / `stage.end` bracket each one with its wall-clock. So the editor attaches once
+and sees the whole loop. The wire shape, the stage names and the five streams are in
+`docs/design/telemetry-protocol.md` §9.1, which is where the wire belongs.
+
+| Stream | What the editor does with it |
+|---|---|
+| 1 | `LiveRun`: `cell.*` and `episode.*` become rows, `stage.*` becomes the strip; `TrainView`: `train.begin` and `checkpoint` |
+| 2 | `LiveRun::timeline` — the safety strip of the selected row |
+| 3 | `TelemetryModel::metrics` — the §12.4 table |
+| 4 | the run's camera image, **or** a training run's sample tensor |
+| 5 | `TrainView` — the loss, the learning rate and the throughput |
+
+**A collected episode is a row of the same table.** `LiveRun` folds `episode.begin` /
+`episode.end` into the same `CellRow` an evaluation's cell becomes: the name is
+`episode-<NN>`, the `suite` column holds the stage it came from, and the strip is the same
+fold of the same `StepEvent` bits. That is §13's "one table, two ends" extended to a third:
+the Run tab still has one table, one strip, one selection, and now does not know whether a row
+is an episode someone demonstrated or a cell someone judged.
+`live_run_folds_collect_episodes_like_cells` is that claim.
+
+### The Training section, and why there is no plotting crate
+
+`model/train_view.rs` is the whole of it. It folds stream 5 into
+`Curve { step, loss, lr }`, keeps `checkpoints: Vec<(u32, String)>`, the last sample image and
+the trainer's own `samples_per_s`, and answers `eta(total_steps)`.
+
+`plot(series, log)` is what makes the drawing a non-decision: it returns
+**points in the unit square**, the `min`/`max` they were normalised against *in the series'
+own units*, and the checkpoint marks as `x`. `app.rs` maps a rectangle and calls
+`line_segment` over the windows — about thirty lines, no dependency, and nothing in the shell
+that a test cannot reach. Two deliberate rules inside it:
+
+- **Log scale drops what cannot be logged.** A loss of exactly `0` has no log; it is removed
+  from the plotted set rather than clamped to a number it is not, and the reported range stays
+  in the series' own units so the two axis labels read as losses and not as exponents.
+- **A flat curve is drawn down the middle**, not divided by zero.
+
+`eta` is measured from the **producer's** clock — the `wall_ns` on the first and last progress
+frames, over the steps between them. An editor that attached late, or whose window manager
+stopped repainting it, must not invent a speed the run does not have. It is `None` before two
+points and `None` once the total is reached: a finished run has no estimate. The total is the
+recipe's own `[run] steps`, stated once as `train.begin { total_steps }` before Python starts,
+so the estimate exists from the first progress line.
+
+### The sample image: the tensor, not the render
+
+Beside the curve is **one image input of the current batch, after augmentation** — the thing
+the network is being fitted to, not a fresh render of the scene. `train_act.py --sample-every
+N` writes it beside the loss curve as `Rgb8` and prints its path; `es train` reads the file
+and publishes it on stream 4. The de-normalisation is `clamp(v, 0, 1) * 255`, the exact
+inverse of the demo's chain, and it is **written into the sidecar** rather than assumed,
+because neither the contract nor the bake manifest carries a normalisation's numbers
+(telemetry-protocol §9.1 states the ceiling).
+
+That is the answer to the owner's second sentence. The training process still has no *rendered*
+view — there is no rollout during training — but it is no longer blind: the curve falls, the
+marks appear where checkpoints were packed, and the picture beside it is what the network is
+looking at while it does.
+
+### The launch panel starts the loop and attaches to it
+
+All three kinds now carry the three telemetry fields (`--telemetry`, `--telemetry-token`,
+`--telemetry-image-every`), because all three publish. §14's "`attach()` is `None` for every
+`es train` and every `es loop cycle`" is therefore no longer true: pressing **Start** on the
+whole loop dials the cycle's one address by itself, exactly as pressing it on an evaluation
+has since E5. `--telemetry-image-every` is one number with one meaning per stage — the
+observation image every N control ticks in collect and the evaluations, the sample tensor
+every N optimizer steps in training.
+
+`tests/golden/editor/launch-{train,cycle}.txt` were regenerated once with
+`ES_GENERATE_GOLDENS=1`; they change **only** by the three telemetry fields the fixture form
+fills, and `launch-eval.txt` is untouched.
+
+### Gate 9: what publishing costs a collection and a training run (§28.7, §23.4)
+
+The same shape as §13's: three runs each way, **interleaved** (plain, telemetry, plain, …), one
+attached subscriber draining every stream, release build, Ubuntu, RTX 4090.
+
+| | `es train`, 2,000 steps | `es loop collect`, 8 episodes |
+|---|---|---|
+| overhead of `--telemetry` | **`Target / Status: unverified`** | **`Target / Status: unverified`** |
+
+**The first attempt does not count, and why is worth keeping.** `es train` ran three times each
+way on the demo bake (2,000 steps, batch 8, `--resident-gpu`, `cuda`) and the wall-clocks came
+out 102.8 / 103.9 / 111.6 s plain against 103.8 / 107.0 / 109.9 s with `--telemetry
+--progress-every 10 --sample-every 100`. **But the subscriber was not there for most of it.**
+E4's drainer (`e4-drain.py`) leaves the 5-second connect timeout on the socket, and an
+evaluation publishes something every tick so it never fired; a *training* run is silent for the
+whole `es dataset bake` — about a minute — before its first progress line, so the drainer hit
+`TimeoutError` and died, and the run's own closing line reads `closed after 0 frame(s)
+delivered to 0 client(s)`. The numbers above are therefore a measurement of publishing into an
+empty fan-out, not of gate 9's shape, and they are not quoted as one.
+
+Redoing it is two lines: `sock.settimeout(None)` after the handshake in
+`~/artifacts/plan-v/m7-e7/e7-drain.py`, then
+`bash ~/artifacts/plan-v/m7-e7/e7-gate9-train.sh` and `…/e7-gate9-collect.sh` (both written,
+both ~11 minutes). The scripts, the recipe and the first attempt's logs are in
+`~/artifacts/plan-v/m7-e7/` on the oracle server. Until that runs, the cost of publishing a
+training run and a collection is **unverified** — E4's `+0.16 % release` is a measurement of a
+different run shape and says nothing about these two.
+
+### Not here
+
+- **Per-node activation statistics** (§23.3). The lowered module has no hook for them, and a
+  number this file invented would not be the module's.
+- **A rollout during training.** The trainer trains; a policy being watched act is an
+  evaluation, which is the stage after it.
+- **Pause, step, or steer the trainer.** It speaks no control protocol — the same refusal §14
+  makes for a run, for the same reason. Kill is the only control.
+- **A second tab.** Training is a section of the Live tab, because "what is happening right
+  now" is one question and one place.

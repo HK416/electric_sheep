@@ -10,7 +10,9 @@ use std::path::PathBuf;
 
 use es_assets::scene::{JointKind, SceneDesc};
 use es_compile::PolicyBundle;
-use es_data::collect::{CollectSpec, Collector, Intervention, SplitSpec};
+use es_data::collect::{
+    CollectEvent, CollectSink, CollectSpec, Collector, Intervention, SplitSpec,
+};
 use es_data::{CollectReport, InterventionSegment};
 use es_env::expert::{demo_cfg, ScriptedExpert};
 use es_env::Termination;
@@ -23,6 +25,7 @@ use es_policy::{PolicyInfo, PolicyRuntime, TorchRuntime, WeightsSource};
 /// (`docs/design/visible-learning.md` section 5).
 const EXPERT_NAME: &str = "so101-pick-place";
 
+use crate::cmd::telemetry::{Publisher, TelemetryArgs, STAGE_COLLECT};
 use crate::error::CliError;
 use crate::util::hex;
 
@@ -30,6 +33,7 @@ const HELP: &str = "\
 es loop collect --policy <policy.esb> --scene <file.xml|urdf> --episodes <N> --seed <S>
                 --out <root> [--backend mujoco-cpu] [--runtime torch] [--max-steps <N>]
                 [--expert so101-pick-place] [--frames <dir>] [--traj <dir>]
+                [--telemetry <addr>] [--telemetry-token <t>] [--telemetry-image-every <N>]
 es loop intervene --dataset <root> --segments <segments.json>
 es loop distill --in <root> [--in <root>...] [--train 0.8] [--val 0.1] [--test 0.1]
                 [--seed <S>] --out <root>
@@ -59,6 +63,13 @@ collect    Opens the policy bundle (spec 9.6), rolls out <N> episodes through th
            required -- the bundle carries the Task, Observation and Deployment IR the
            collector reads -- but its weights are never loaded. A waypoint the arm cannot
            reach ends that episode as a failed demonstration (spec 17.2), written, not dropped.
+           With --telemetry <addr> the collection publishes what it is doing, on the streams
+           `es eval run --telemetry` uses (packet M7/E7): 1 the episode.begin / episode.end
+           events, 2 one [frame, tick, source, violation bits] sample per control tick -- the
+           plane's own verdict, the same the dataset's action_source column records -- and 4
+           the rendered observation every --telemetry-image-every ticks, which needs --frames.
+           Publishing is non-blocking and computes nothing extra: the dataset under --out is
+           byte-identical with and without the flag.
 
 intervene  Applies intervention segments to a dataset that is already on disk. <segments.json>
            is a JSON array of
@@ -80,6 +91,10 @@ cycle      Runs collect -> train -> eval -> showcase from one document, appendin
            stage to one ledger (spec 13.1, spec 13.3). It re-implements no stage: each one is
            the command above, called in-process with the words its own plan prints.
 
+    --telemetry <addr> publish the run live on this address (spec 23.1), e.g. 127.0.0.1:7777
+    --telemetry-token <t>  required in every client's Hello (spec 25.1); none by default
+    --telemetry-image-every <N>  publish the observation image every N ticks (default 0, never)
+
 Every step appends a LoopStep to <root>/loop.jsonl so the loop is reproducible (spec 13.3);
 a distill step is appended to each input root as well as to the output root, and a cycle's
 train and evaluate steps to the dataset root and to its own <out>.
@@ -89,7 +104,7 @@ Exit codes: 0 success, 1 runtime failure, 2 usage error, 3 skipped (nothing ran)
 
 pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
     match args.first().map(String::as_str) {
-        Some("collect") => collect(&args[1..]),
+        Some("collect") => collect(&args[1..], None),
         // The whole loop under one document (packet M7/T2); its own help.
         Some("cycle") => crate::cmd::cycle::run(&args[1..]),
         Some("intervene") => intervene(&args[1..]),
@@ -208,7 +223,19 @@ fn collect_typed<const NJ: usize, const H: usize>(
     policy: &mut dyn PolicyRuntime,
     mut expert: Option<&mut ScriptedExpert>,
     frames: Option<&std::path::Path>,
+    publisher: Option<&mut Publisher>,
 ) -> Result<CollectReport, CliError> {
+    // One publisher, two hooks: the collector's own sink says what the plane did and the
+    // frame sink has the pixels. A `RefCell` because both closures live at once and the run
+    // is single-threaded -- neither hook can be entered from inside the other (packet M7/E7).
+    let publishing = publisher.is_some();
+    let publisher = publisher.map(std::cell::RefCell::new);
+    let mut publish = |event: CollectEvent| {
+        if let Some(p) = &publisher {
+            p.borrow_mut().on_collect(event);
+        }
+    };
+    let sink: Option<CollectSink<'_>> = publishing.then_some(&mut publish);
     // Teleop is real-robot I/O (M3 W1) and stays off this path; the one scripted intervener
     // the CLI offers is `--expert`. `es loop intervene` labels afterwards.
     //
@@ -253,18 +280,23 @@ fn collect_typed<const NJ: usize, const H: usize>(
             .map_err(|e| CliError::Runtime(e.to_string()))?;
         std::fs::create_dir_all(dir)
             .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
-        let mut sink = |model: &ModelInfo, state: &es_physics_core::backend::StateView<'_>| {
-            renderer
-                .frame(model, state, 0)
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        };
-        return Collector::run::<MuJoCoCpuBackend, _, NJ, H>(
+        let mut frame_sink =
+            |model: &ModelInfo, state: &es_physics_core::backend::StateView<'_>| {
+                let tile = renderer.frame(model, state, 0).map_err(|e| e.to_string())?;
+                // The tile the run already rendered, borrowed, not a second render (packet
+                // M7/E7); the publisher decides whether this is one of the published ones.
+                if let (Some(p), Some(bytes)) = (&publisher, tile.as_u8()) {
+                    p.borrow_mut().observation(tile.shape, bytes);
+                }
+                Ok(())
+            };
+        return Collector::run_with_sink::<MuJoCoCpuBackend, _, NJ, H>(
             spec,
             policy,
             MuJoCoCpuBackend::new,
             &mut hook,
-            Some(&mut sink),
+            Some(&mut frame_sink),
+            sink,
         )
         .map_err(|e| CliError::Runtime(e.to_string()));
     }
@@ -277,12 +309,13 @@ fn collect_typed<const NJ: usize, const H: usize>(
                 .to_owned(),
         ));
     }
-    Collector::run::<MuJoCoCpuBackend, _, NJ, H>(
+    Collector::run_with_sink::<MuJoCoCpuBackend, _, NJ, H>(
         spec,
         policy,
         MuJoCoCpuBackend::new,
         &mut hook,
         None,
+        sink,
     )
     .map_err(|e| CliError::Runtime(e.to_string()))
 }
@@ -500,7 +533,12 @@ fn build_expert(
     ScriptedExpert::new(scene, cfg).map_err(|e| CliError::Runtime(e.to_string()))
 }
 
-pub(crate) fn collect(args: &[String]) -> Result<u8, CliError> {
+/// One collection.
+///
+/// `cycle` is `es loop cycle`'s own publisher (packet M7/E7): a cycle binds one socket before
+/// its first stage, so `--telemetry` is not on the argv of a nested `es loop collect` and
+/// this command binds nothing for it.
+pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, CliError> {
     let pairs = parse(
         args,
         &[
@@ -515,6 +553,9 @@ pub(crate) fn collect(args: &[String]) -> Result<u8, CliError> {
             "--expert",
             "--frames",
             "--traj",
+            "--telemetry",
+            "--telemetry-token",
+            "--telemetry-image-every",
         ],
     )?;
     let expert_name = one(&pairs, "--expert").map(ToOwned::to_owned);
@@ -540,6 +581,30 @@ pub(crate) fn collect(args: &[String]) -> Result<u8, CliError> {
         return Err(CliError::Usage(format!(
             "unknown --runtime '{runtime}': only torch is supported\n\n{HELP}"
         )));
+    }
+
+    // Bound before the bundle, the scene or the Torch runtime is opened, so a viewer that
+    // attaches on the printed address is subscribed before the first episode (packet M7/E7).
+    let telemetry = TelemetryArgs {
+        addr: match one(&pairs, "--telemetry") {
+            Some(v) => Some(TelemetryArgs::parse_addr(v, HELP)?),
+            None => None,
+        },
+        token: one(&pairs, "--telemetry-token").map(ToOwned::to_owned),
+        image_every: match one(&pairs, "--telemetry-image-every") {
+            Some(v) => TelemetryArgs::parse_image_every(v, HELP)?,
+            None => 0,
+        },
+    };
+    let mut owned = telemetry.bind(STAGE_COLLECT)?;
+    let publisher: Option<&mut Publisher> = cycle.or(owned.as_mut());
+    // Said once, rather than by a stream that never carries an image: nothing renders without
+    // `--frames`, so there is no observation to publish.
+    if publisher.is_some() && frames.is_none() && telemetry.image_every > 0 {
+        println!(
+            "telemetry: --telemetry-image-every is set and --frames is not, so no observation \
+             image is published (nothing renders)"
+        );
     }
 
     let bytes = std::fs::read(&policy_path)
@@ -590,7 +655,15 @@ pub(crate) fn collect(args: &[String]) -> Result<u8, CliError> {
     };
     let nj = bundle.deployment.robot.n_joints;
     let h = bundle.deployment.action.horizon;
-    let report = dispatch_nj_h!(nj, h, &spec, policy, expert.as_mut(), frames.as_deref())?;
+    let report = dispatch_nj_h!(
+        nj,
+        h,
+        &spec,
+        policy,
+        expert.as_mut(),
+        frames.as_deref(),
+        publisher
+    )?;
 
     for w in &report.warnings {
         println!("warning: {w}");
@@ -624,6 +697,10 @@ pub(crate) fn collect(args: &[String]) -> Result<u8, CliError> {
     );
     println!("content: {}", hex(&report.content));
     println!("schema:  {}", hex(&report.schema));
+    // Only the command that bound the socket closes the account of it.
+    if let Some(p) = &owned {
+        println!("{}", p.summary());
+    }
     Ok(0)
 }
 

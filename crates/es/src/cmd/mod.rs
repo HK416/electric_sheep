@@ -19,5 +19,6 @@ pub mod policy;
 #[cfg(feature = "render")]
 pub mod showcase;
 pub mod task;
+pub mod telemetry;
 pub mod train;
 pub mod video;

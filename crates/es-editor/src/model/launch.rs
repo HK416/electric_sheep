@@ -190,8 +190,25 @@ const EVAL_FIELDS: &[F] = &[
     F::TelemetryToken,
     F::TelemetryImageEvery,
 ];
-const TRAIN_FIELDS: &[F] = &[F::Recipe, F::Out];
-const CYCLE_FIELDS: &[F] = &[F::Recipe, F::Out, F::From];
+// The three telemetry fields are on every kind since packet M7/E7: `es train` and `es loop
+// cycle` publish now, so Start on the whole loop attaches by itself exactly as Start on an
+// evaluation has since E5. For a training run `--telemetry-image-every` is how often the
+// trainer is asked for the tensor it is fitting; for the other two it is the observation.
+const TRAIN_FIELDS: &[F] = &[
+    F::Recipe,
+    F::Out,
+    F::Telemetry,
+    F::TelemetryToken,
+    F::TelemetryImageEvery,
+];
+const CYCLE_FIELDS: &[F] = &[
+    F::Recipe,
+    F::Out,
+    F::From,
+    F::Telemetry,
+    F::TelemetryToken,
+    F::TelemetryImageEvery,
+];
 const EVAL_FLAGS: &[L] = &[];
 const TRAIN_FLAGS: &[L] = &[L::DryRun];
 const CYCLE_FLAGS: &[L] = &[L::DryRun, L::AllowNewEvaluation, L::SkipExpertGate];
@@ -657,7 +674,9 @@ impl LaunchModel {
     ///
     /// `None` until the child is `Running` — the editor is a client (spec 23.1) and a client
     /// dials a producer that exists — and `None` for a command that carries no `--telemetry`,
-    /// which is every `es train` and `es loop cycle` there is today.
+    /// which is any kind whose `--telemetry` field was emptied. Since packet M7/E7 all three
+    /// carry one by default, so Start on the whole loop attaches to the cycle's one socket
+    /// the way Start on an evaluation always has.
     pub fn attach(&self) -> Option<String> {
         if !matches!(self.state, State::Running { .. }) {
             return None;
@@ -903,6 +922,14 @@ mod tests {
                 "eval-out",
                 "--from",
                 "train",
+                // Since packet M7/E7 a cycle publishes too, so the three telemetry fields are
+                // on this kind as well and the fixture fills all of them.
+                "--telemetry",
+                DEFAULT_TELEMETRY,
+                "--telemetry-token",
+                "s3cret",
+                "--telemetry-image-every",
+                "10",
             ]
         );
 
@@ -1040,12 +1067,18 @@ mod tests {
         poll_until_exit(&mut m);
         assert_eq!(m.attach(), None, "and none once it has exited");
 
-        // `es train` and `es loop cycle` do not publish at all (design note section 13,
-        // "Not here"), so neither kind can produce an address.
+        // Since packet M7/E7 `es train` and `es loop cycle` publish too, so every kind has an
+        // address while it runs -- and none once its `--telemetry` field is emptied.
         for kind in [Kind::Train, Kind::Cycle] {
             let mut m = fixture(kind);
             m.start_program(&program, &args);
-            assert_eq!(m.attach(), None, "{kind:?} carries no --telemetry");
+            assert_eq!(
+                m.attach().as_deref(),
+                Some(DEFAULT_TELEMETRY),
+                "{kind:?} publishes now"
+            );
+            m.field_mut(F::Telemetry).clear();
+            assert_eq!(m.attach(), None, "{kind:?} with the field emptied");
             m.kill();
             poll_until_exit(&mut m);
         }

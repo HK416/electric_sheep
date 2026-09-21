@@ -124,6 +124,24 @@ impl Step {
     }
 }
 
+// --- the stages of a cycle -----------------------------------------------------------------
+
+/// The plain word for one stage of `es loop cycle`, as the wire names it (packet M7/E7).
+///
+/// Three of the five are already the workflow's own words, so they share [`Step`]'s keys
+/// rather than getting a second set that could drift from them. A name this build has no word
+/// for renders as the producer's own, which is better than an empty chip.
+pub fn stage_label(lang: Lang, name: &str) -> &'static str {
+    match name {
+        "collect" => t(lang, "word.collect"),
+        "expert-gate" => t(lang, "word.expert_gate"),
+        "train" => t(lang, "word.train"),
+        "eval" => t(lang, "word.evaluate"),
+        "showcase" => t(lang, "word.showcase"),
+        _ => "",
+    }
+}
+
 // --- metrics -----------------------------------------------------------------------------
 
 /// The key of a metric's plain name. Total over `MetricSpec::ALL` and deliberately without a
@@ -364,6 +382,18 @@ mod tests {
             Some(MetricSpec::EndToEndLatencyP95)
         );
         assert_eq!(metric_by_name("step_per_sec"), None);
+
+        // A cycle's five stages have a plain word each, and an unknown one says nothing
+        // rather than guessing (packet M7/E7).
+        for lang in Lang::ALL {
+            for stage in ["collect", "expert-gate", "train", "eval", "showcase"] {
+                assert!(
+                    !super::stage_label(lang, stage).is_empty(),
+                    "{stage} in {lang:?}"
+                );
+            }
+            assert!(super::stage_label(lang, "invented-by-a-future-run").is_empty());
+        }
 
         // A folder-valued flag offers a folder chooser and a file-valued one a file chooser.
         assert_eq!(browses(LaunchField::Out), Some(Browse::Folder));

@@ -21,12 +21,19 @@ use es_data::{DatasetIdentity, LeRobotDataset, Split};
 use es_ir::evaluation::{AcceptanceResult, EvaluationReport};
 use serde_json::Value;
 
+use crate::cmd::telemetry::{
+    TelemetryArgs, STAGE_COLLECT, STAGE_CYCLE, STAGE_EVAL, STAGE_EXPERT_GATE, STAGE_SHOWCASE,
+    STAGE_TRAIN,
+};
+use crate::cmd::train::TrainWatch;
 use crate::error::CliError;
 use crate::util::hex;
 
 pub const HELP: &str = "\
 es loop cycle --recipe <cycle.toml> [--out <dir>] [--dry-run] [--from <stage>]
               [--allow-new-evaluation] [--skip-expert-gate]
+              [--telemetry <addr>] [--telemetry-token <t>] [--telemetry-image-every <N>]
+              [--progress-every <N>]
 
 Runs spec 13.1's loop -- collect, train, evaluate, showcase -- from one document, and appends
 every stage to `loop.jsonl` with the hashes spec 13.3 wants: the dataset a policy was trained
@@ -60,6 +67,16 @@ Two refusals are the point of the command:
               training plan nested under `train` -- and run nothing.
 --from <stage>  collect | train | eval | showcase: resume an interrupted cycle, refusing if
               the earlier stages' outputs are missing or disagree with the ledger.
+--telemetry <addr>
+              publish the whole cycle live on this address (spec 23.1). **One socket, bound
+              once**, before the first stage: every stage speaks on it and every event carries
+              the stage it came from, bracketed by `stage.begin` / `stage.end`. The address is
+              the cycle's, not a stage's, so it is on no line of the plan.
+--telemetry-token <t>   required in every client's Hello (spec 25.1); none by default
+--telemetry-image-every <N>
+              how often a picture goes out: the observation image every N control ticks in
+              collect and the evaluations, and the training sample every N optimizer steps.
+--progress-every <N>    the trainer's progress lines, in optimizer steps (default 10)
 
 Exit codes: 0 success, 1 the expert gate or the final acceptance failed (both printed) or a
 runtime failure, 2 usage error, 3 skipped (a backend or runtime this machine does not have).
@@ -75,6 +92,7 @@ fn read(path: &Path) -> Result<String, CliError> {
 
 pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
     let (mut document, mut out, mut from) = (None, None, None);
+    let (mut addr, mut token, mut image_every, mut progress_every) = (None, None, None, None);
     let (mut dry_run, mut allow_new, mut skip_gate) = (false, false, false);
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -98,6 +116,10 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
             "--recipe" => &mut document,
             "--out" => &mut out,
             "--from" => &mut from,
+            "--telemetry" => &mut addr,
+            "--telemetry-token" => &mut token,
+            "--telemetry-image-every" => &mut image_every,
+            "--progress-every" => &mut progress_every,
             other => {
                 return Err(CliError::Usage(format!(
                     "es loop cycle: unknown flag '{other}'\n\n{HELP}"
@@ -154,6 +176,30 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
         return Ok(0);
     }
 
+    // **One socket for the whole cycle** (packet M7/E7), bound before the first stage opens
+    // anything. The stages are in-process calls, so they are handed this publisher rather
+    // than a `--telemetry` on their argv -- which is why the address is on no plan line.
+    let telemetry = TelemetryArgs {
+        addr: match &addr {
+            Some(v) => Some(TelemetryArgs::parse_addr(v, HELP)?),
+            None => None,
+        },
+        token,
+        image_every: match &image_every {
+            Some(v) => TelemetryArgs::parse_image_every(v, HELP)?,
+            None => 0,
+        },
+    };
+    let progress_every = match &progress_every {
+        Some(v) => v.parse().map_err(|_| {
+            CliError::Usage(format!(
+                "es loop cycle: --progress-every {v:?} is not a number\n\n{HELP}"
+            ))
+        })?,
+        None => crate::cmd::train::DEFAULT_PROGRESS_EVERY,
+    };
+    let mut publisher = telemetry.bind(STAGE_CYCLE)?;
+
     std::fs::create_dir_all(&out).map_err(|e| bad(format!("{}: {e}", out.display())))?;
     let dataset_root = PathBuf::from(&plan.dataset_root);
     if let Some(stage) = from {
@@ -173,16 +219,21 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
             continue;
         }
         println!("$ {}", one_line(step));
+        // Every event of this stage carries its name, and `stage.begin` / `stage.end` bracket
+        // it with the wall-clock the table in the design note is made of.
+        if let Some(p) = publisher.as_mut() {
+            p.stage_begin(stage_name(step.stage));
+        }
         match step.stage {
             Stage::Collect => {
-                let c = crate::cmd::r#loop::collect(&step.args)?;
+                let c = crate::cmd::r#loop::collect(&step.args, publisher.as_mut())?;
                 if c != 0 {
                     return Ok(c);
                 }
                 mirror_collect(&dataset_root, &out)?;
             }
             Stage::ExpertGate => {
-                let c = crate::cmd::eval::run(&step.args)?;
+                let c = crate::cmd::eval::run(&step.args, publisher.as_mut())?;
                 if c == 3 {
                     return Ok(3);
                 }
@@ -207,7 +258,14 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
                 gate = Some("passed".to_owned());
             }
             Stage::Train => {
-                crate::cmd::train::run(&recipe, &out.join("train"), false, None)?;
+                let watch = TrainWatch {
+                    publisher: publisher.as_mut(),
+                    progress_every,
+                    // One number for "how often a picture": control ticks in collect and the
+                    // evaluations, optimizer steps here.
+                    sample_every: telemetry.image_every,
+                };
+                crate::cmd::train::run(&recipe, &out.join("train"), false, None, watch)?;
                 let step = train_step(&out.join("train"), &dataset_root, gate.as_deref())?;
                 append_both(&out, &dataset_root, &step)?;
             }
@@ -220,7 +278,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
                     std::fs::rename(&report, &previous)
                         .map_err(|e| bad(format!("{}: {e}", previous.display())))?;
                 }
-                let c = crate::cmd::eval::run(&step.args)?;
+                let c = crate::cmd::eval::run(&step.args, publisher.as_mut())?;
                 if c == 3 {
                     return Ok(3);
                 }
@@ -238,13 +296,31 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
             }
             Stage::Showcase => showcase(&step.args)?,
         }
+        if let Some(p) = publisher.as_mut() {
+            p.stage_end(code);
+        }
     }
 
     let ledger = out.join(es_data::collect::LOOP_FILE);
     es_data::check_chain(&read_loop_steps(&out).map_err(|e| bad(e.to_string()))?)
         .map_err(|e| bad(e.to_string()))?;
     println!("\nledger: {} (chained)", ledger.display());
+    if let Some(p) = &publisher {
+        println!("{}", p.summary());
+    }
     Ok(code)
+}
+
+/// The `stage` field a stage's events carry. `Stage::as_str` is the plan's own word for it,
+/// and the wire wants a `'static` one, so the two are matched here rather than allocated.
+fn stage_name(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Collect => STAGE_COLLECT,
+        Stage::ExpertGate => STAGE_EXPERT_GATE,
+        Stage::Train => STAGE_TRAIN,
+        Stage::Eval => STAGE_EVAL,
+        Stage::Showcase => STAGE_SHOWCASE,
+    }
 }
 
 // --- the stages that are not a plain call ----------------------------------------------------

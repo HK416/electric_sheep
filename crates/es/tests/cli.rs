@@ -9586,3 +9586,496 @@ fn generate_pt_fixtures() {
         hex(&evaluation.evaluation_hash().expect("evaluation hash"))
     );
 }
+
+// --- packet M7/E7: collection and training publish, one address for a cycle ------------------
+
+/// Every regular file under `root`, relative path -> bytes, for a byte-identity assertion over
+/// a whole directory. `loop.jsonl` is dropped: its `created` is a wall clock, and spec 13.3
+/// says provenance is not identity.
+fn tree_of(root: &Path) -> BTreeMap<String, Vec<u8>> {
+    fn walk(dir: &Path, base: &Path, out: &mut BTreeMap<String, Vec<u8>>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, base, out);
+            } else if let Ok(bytes) = std::fs::read(&path) {
+                let name = path
+                    .strip_prefix(base)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                out.insert(name, bytes);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out.remove("loop.jsonl");
+    out
+}
+
+/// Subscribes on `addr` once the producer has bound it and drains every stream until the run
+/// closes the connection; the handle gives the messages back.
+fn drain_from(addr: std::net::SocketAddr) -> std::thread::JoinHandle<Vec<Message>> {
+    std::thread::spawn(move || {
+        let mut client = connect_when_bound(addr);
+        client
+            .subscribe(vec![
+                StreamId(1),
+                StreamId(2),
+                StreamId(3),
+                StreamId(4),
+                StreamId(5),
+            ])
+            .expect("subscribe");
+        let mut received = Vec::new();
+        while let Ok(msg) = client.recv() {
+            received.push(msg);
+        }
+        received
+    })
+}
+
+fn frames_of(messages: &[Message]) -> Vec<&es_telemetry::Frame> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::Frame(f) => Some(f),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every stream-1 event of `kind`, as its field map.
+fn events_of<'a>(
+    frames: &'a [&es_telemetry::Frame],
+    kind: &str,
+) -> Vec<&'a BTreeMap<String, String>> {
+    frames
+        .iter()
+        .filter_map(|f| match (&f.stream, &f.payload) {
+            (StreamId(1), Payload::Event { kind: k, fields }) if k == kind => Some(fields),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `Scalars` payload on one stream, in arrival order.
+fn scalars_on<'a>(frames: &'a [&es_telemetry::Frame], stream: u32) -> Vec<&'a Vec<f64>> {
+    frames
+        .iter()
+        .filter_map(|f| match (&f.stream, &f.payload) {
+            (s, Payload::Scalars(v)) if s.0 == stream => Some(v),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Oracle 1 (packet M7/E7). `es train --telemetry --progress-every 10` on the bake fixture:
+/// four stream-5 frames with strictly increasing steps and one `checkpoint` event at the mark
+/// -- and `training.lock`, the checkpoint bundle and `metrics/loss.json` byte-identical to the
+/// same run without the flag.
+#[test]
+fn train_telemetry_streams_the_curve() {
+    const TEST: &str = "train_telemetry_streams_the_curve";
+    let Ok(python) = std::env::var("ES_PYTHON") else {
+        println!("SKIP {TEST}: ES_PYTHON is not set, so nothing can train");
+        return;
+    };
+    if skip_without_bake_model(TEST) {
+        return;
+    }
+    let dir = scratch_dir("train-telemetry");
+    let bundle = write_demo_bundle(&dir);
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 4, 16);
+    let recipe = dir.join("training.toml");
+    write(
+        &recipe,
+        &train_fixture_recipe(&bundle, &root, &tiles, 0, "1e-4").replace(
+            "es-no-such-interpreter",
+            &train_toml_path(Path::new(&python)),
+        ),
+    );
+    let train = |out: &Path, extra: &[&str]| {
+        let run = bin()
+            .current_dir(train_root())
+            .args(["train", "--recipe", &train_toml_path(&recipe), "--out"])
+            .arg(out)
+            .args(extra)
+            .output()
+            .expect("run es train");
+        assert_eq!(
+            run.status.code(),
+            Some(0),
+            "stdout:\n{}\nstderr:\n{}",
+            stdout(&run),
+            stderr_of(&run)
+        );
+        run
+    };
+    let plain = dir.join("plain");
+    train(&plain, &[]);
+
+    let port = free_loopback_port();
+    let addr = format!("127.0.0.1:{port}");
+    let reader = drain_from(addr.parse().expect("socket addr"));
+    let live = dir.join("live");
+    let run = train(
+        &live,
+        &[
+            "--telemetry",
+            &addr,
+            "--progress-every",
+            "10",
+            "--sample-every",
+            "20",
+        ],
+    );
+    let received = reader.join().expect("reader thread");
+    let text = stdout(&run);
+    assert!(text.contains(&format!("telemetry: {addr}")), "{text}");
+
+    // What the run wrote, unmoved by having been watched -- `config.json` included, because
+    // it carries the plan and the plan must not gain the two trainer flags.
+    for name in [
+        "training.lock",
+        "metrics/loss.json",
+        "checkpoints/40.esb",
+        "training/config.json",
+    ] {
+        assert_eq!(
+            read_bytes(&plain.join(name)),
+            read_bytes(&live.join(name)),
+            "{name} differs with --telemetry"
+        );
+    }
+
+    let frames = frames_of(&received);
+    let curve = scalars_on(&frames, 5);
+    let steps: Vec<f64> = curve.iter().map(|v| v[0]).collect();
+    assert_eq!(steps, vec![10.0, 20.0, 30.0, 40.0], "{curve:?}");
+    for v in &curve {
+        assert_eq!(v.len(), 4, "[step, loss, lr, samples_per_s]: {v:?}");
+        assert!(v[1].is_finite() && v[1] >= 0.0, "loss {v:?}");
+        assert!((v[2] - 1e-4).abs() < 1e-9, "lr {v:?}");
+        assert!(v[3] > 0.0, "samples_per_s {v:?}");
+    }
+    // What the network is fitting, after augmentation, as `Rgb8` -- two of them at 40 steps
+    // every 20, and the tensor's own shape, not the renderer's.
+    let samples: Vec<(u32, u32)> = frames
+        .iter()
+        .filter_map(|f| match (&f.stream, &f.payload) {
+            (
+                StreamId(4),
+                Payload::Image {
+                    w,
+                    h,
+                    format,
+                    bytes,
+                },
+            ) => {
+                assert_eq!(format, "rgb8", "the sample is Rgb8");
+                assert_eq!(bytes.len() as u32, w * h * 3, "{w}x{h}");
+                Some((*w, *h))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(samples.len(), 2, "40 steps every 20: {samples:?}");
+    // The file the trainer wrote is beside the curve and says what it holds.
+    let meta: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(live.join("metrics/sample-40.json")).expect("sample-40.json"),
+    )
+    .expect("the sidecar is JSON");
+    assert_eq!(meta["shape"][2].as_u64(), Some(3), "{meta}");
+    assert_eq!(meta["step"].as_u64(), Some(40), "{meta}");
+    assert!(meta["mapping"].is_string(), "{meta}");
+    // ...and `--sample-every` is not part of what the run computed: the plain run wrote none.
+    assert!(!plain.join("metrics/sample-40.bin").exists());
+
+    let marks = events_of(&frames, "checkpoint");
+    assert_eq!(marks.len(), 1, "one mark at 40: {marks:?}");
+    assert_eq!(marks[0]["step"], "40", "{marks:?}");
+    assert_eq!(marks[0]["stage"], "train", "{marks:?}");
+    assert_eq!(
+        marks[0]["policy_hash"].len(),
+        64,
+        "the bundle's own policy_hash: {marks:?}"
+    );
+    println!("RAN {TEST}: {} curve point(s), 1 checkpoint", curve.len());
+}
+
+/// Oracle 2 (packet M7/E7). `es loop collect --frames --telemetry`: an `episode.begin` and an
+/// `episode.end` per episode, one stream-2 frame per control tick, at least one image -- and
+/// the dataset directory byte-identical to a run without the flag.
+#[test]
+fn collect_telemetry_publishes_every_episode() {
+    const TEST: &str = "collect_telemetry_publishes_every_episode";
+    if cfg!(not(feature = "render")) {
+        println!("SKIP {TEST}: built without the `render` feature");
+        return;
+    }
+    if skip_without_bake_model(TEST) {
+        return;
+    }
+    let dir = scratch_dir("collect-telemetry");
+    let policy = write_demo_bundle(&dir);
+    let collect = |out: &Path, extra: &[&str]| {
+        bin()
+            .args([
+                "loop",
+                "collect",
+                "--expert",
+                "so101-pick-place",
+                "--policy",
+            ])
+            .arg(&policy)
+            .arg("--scene")
+            .arg(demo_scene_path())
+            .args([
+                "--episodes",
+                "2",
+                "--seed",
+                "4",
+                "--max-steps",
+                "40",
+                "--out",
+            ])
+            .arg(out)
+            .arg("--frames")
+            .arg(out.join("frames"))
+            .args(extra)
+            .output()
+            .expect("run es loop collect")
+    };
+    let plain = dir.join("plain");
+    let first = collect(&plain, &[]);
+    if first.status.code() == Some(3) {
+        println!("SKIP {TEST}: {}", stdout(&first).trim());
+        return;
+    }
+    assert_eq!(
+        first.status.code(),
+        Some(0),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&first),
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let port = free_loopback_port();
+    let addr = format!("127.0.0.1:{port}");
+    let reader = drain_from(addr.parse().expect("socket addr"));
+    let live = dir.join("live");
+    let run = collect(
+        &live,
+        &["--telemetry", &addr, "--telemetry-image-every", "5"],
+    );
+    let received = reader.join().expect("reader thread");
+    assert_eq!(run.status.code(), Some(0), "{}", stdout(&run));
+
+    // Every file the dataset is made of, byte for byte -- `frames/` is under `--out` too, so
+    // the rendered tiles are compared with it.
+    let (before, after) = (tree_of(&plain), tree_of(&live));
+    assert_eq!(
+        before.keys().collect::<Vec<_>>(),
+        after.keys().collect::<Vec<_>>(),
+        "the two runs wrote different files"
+    );
+    for (name, bytes) in &before {
+        assert_eq!(bytes, &after[name], "{name} differs with --telemetry");
+    }
+
+    let frames = frames_of(&received);
+    let begun = events_of(&frames, "episode.begin");
+    let ended = events_of(&frames, "episode.end");
+    assert_eq!(begun.len(), 2, "{begun:?}");
+    assert_eq!(ended.len(), 2, "{ended:?}");
+    for (i, fields) in begun.iter().enumerate() {
+        assert_eq!(fields["episode"], i.to_string(), "{fields:?}");
+        assert_eq!(fields["seed"], "4", "{fields:?}");
+        assert_eq!(fields["stage"], "collect", "{fields:?}");
+    }
+    for fields in &ended {
+        assert!(fields.contains_key("outcome"), "{fields:?}");
+        assert!(
+            fields["steps"].parse::<u64>().expect("steps") > 0,
+            "{fields:?}"
+        );
+    }
+    // One sample per control tick, with the four numbers `es eval run` sends.
+    let ticks = scalars_on(&frames, 2);
+    let steps: u64 = ended
+        .iter()
+        .map(|f| f["steps"].parse::<u64>().expect("steps"))
+        .sum();
+    assert_eq!(ticks.len() as u64, steps, "one sample per control tick");
+    for v in &ticks {
+        assert_eq!(v.len(), 4, "[frame, tick, source, events]: {v:?}");
+        assert!((0.0..=3.0).contains(&v[2]), "source code {v:?}");
+    }
+    let images = frames
+        .iter()
+        .filter(|f| {
+            matches!(
+                (&f.stream, &f.payload),
+                (StreamId(4), Payload::Image { .. })
+            )
+        })
+        .count();
+    assert!(images > 0, "no observation image on stream 4");
+    println!(
+        "RAN {TEST}: {} tick(s), {images} image(s) over {} episode(s)",
+        ticks.len(),
+        begun.len()
+    );
+}
+
+/// Oracle 3 (packet M7/E7). The address is the *cycle's*, not a stage's: `--dry-run` prints
+/// the same plan with and without it, and no stage line carries `--telemetry`.
+#[test]
+fn cycle_telemetry_is_one_address() {
+    const TEST: &str = "cycle_telemetry_is_one_address";
+    let dir = scratch_dir("cycle-telemetry-plan");
+    let plain = run_cycle(CYCLE_RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(plain.status.code(), Some(0), "{}", stderr_of(&plain));
+    let watched = run_cycle(
+        CYCLE_RECIPE,
+        &dir,
+        &[
+            "--dry-run",
+            "--telemetry",
+            "127.0.0.1:7777",
+            "--progress-every",
+            "10",
+        ],
+    );
+    assert_eq!(watched.status.code(), Some(0), "{}", stderr_of(&watched));
+    let text = stdout(&plain);
+    assert_eq!(
+        text,
+        stdout(&watched),
+        "--telemetry moved the plan; the address is the cycle's, not a stage's"
+    );
+    assert!(!text.contains("--telemetry"), "{text}");
+    println!("RAN {TEST}: the plan is unmoved by --telemetry");
+}
+
+/// The cycle document `cycle_telemetry_delivers_every_stage` runs: the demo's own Evaluation
+/// IR cut to one suite and two pinned seeds, a 40-step IR-route training and a 2-episode
+/// expert collect -- the shape `cycle_runs_the_expert_through_the_harness_first` established,
+/// written here so this oracle owns its own fixture.
+fn cycle_live_document(dir: &Path, python: &str) -> PathBuf {
+    let bundle = write_demo_bundle(dir);
+    let p = |path: &Path| train_toml_path(path);
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let task = es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml");
+    let obs =
+        es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml");
+    let mut ir = demo_evaluation_ir(
+        hex(&task.task_hash().expect("task hash")),
+        hex(&obs.observation_hash().expect("observation hash")),
+    );
+    ir.episodes = es_ir::evaluation::EpisodeBatch {
+        n_episodes: 2,
+        seeds: es_ir::evaluation::SeedPlan::Explicit(vec![SEEDS[0], SEEDS[1]]),
+    };
+    ir.suites.truncate(1);
+    let eval_config = dir.join("evaluation.toml");
+    write(
+        &eval_config,
+        &es_ir::serial::evaluation_to_toml(&ir).expect("the Evaluation IR serialises"),
+    );
+    let recipe = dir.join("training.toml");
+    write(
+        &recipe,
+        &format!(
+            "kind = \"training\"\n\
+             [dataset]\nroot = \"unused\"\n\
+             [policy]\nbundle = \"{}\"\n\
+             [run]\nsteps = 40\nbatch = 2\nlr = 1e-4\nseed = 0\ncheckpoint_at = [40]\n\
+             device = \"cpu\"\ninterpreter = \"{}\"\n",
+            p(&bundle),
+            p(Path::new(python)),
+        ),
+    );
+    let document = dir.join("cycle.toml");
+    write(
+        &document,
+        &format!(
+            "kind = \"cycle\"\nscene = \"{}\"\n\
+             [collect]\npolicy = \"{}\"\nexpert = \"so101-pick-place\"\nepisodes = 2\n\
+             seed = 1\nframes = true\n\
+             [train]\nrecipe = \"{}\"\n\
+             [eval]\nconfig = \"{}\"\njobs = 1\nframes = true\n",
+            p(&demo_scene_path()),
+            p(&bundle),
+            p(&recipe),
+            p(&eval_config),
+        ),
+    );
+    document
+}
+
+/// Oracle 3's live half (packet M7/E7): the four stages of one cycle, in order, on one socket.
+///
+/// `#[ignore]`d for the same reason `cycle_runs_the_expert_through_the_harness_first` is -- it
+/// needs `ES_PYTHON` and a render build -- and it is that oracle with a subscriber attached.
+#[test]
+#[ignore = "needs ES_PYTHON with torch and mujoco, and a render build"]
+fn cycle_telemetry_delivers_every_stage() {
+    const TEST: &str = "cycle_telemetry_delivers_every_stage";
+    let Ok(python) = std::env::var("ES_PYTHON") else {
+        println!("SKIP {TEST}: ES_PYTHON is not set");
+        return;
+    };
+    if cfg!(not(feature = "render")) {
+        println!("SKIP {TEST}: built without the `render` feature");
+        return;
+    }
+    if skip_without_bake_model(TEST) {
+        return;
+    }
+    let dir = scratch_dir("cycle-telemetry-live");
+    let document = cycle_live_document(&dir, &python);
+    let port = free_loopback_port();
+    let addr = format!("127.0.0.1:{port}");
+    let reader = drain_from(addr.parse().expect("socket addr"));
+    let out = bin()
+        .current_dir(train_root())
+        .args(["loop", "cycle", "--recipe"])
+        .arg(&document)
+        .arg("--out")
+        .arg(dir.join("run"))
+        .args(["--telemetry", &addr, "--progress-every", "10"])
+        .output()
+        .expect("run es loop cycle --telemetry");
+    let received = reader.join().expect("reader thread");
+    let text = format!("{}{}", stdout(&out), stderr_of(&out));
+    if out.status.code() == Some(3) {
+        println!("SKIP {TEST}: {}", text.trim());
+        return;
+    }
+    let frames = frames_of(&received);
+    let stages: Vec<String> = events_of(&frames, "stage.begin")
+        .iter()
+        .map(|f| f["name"].clone())
+        .collect();
+    assert_eq!(
+        stages,
+        ["collect", "expert-gate", "train", "eval"],
+        "one socket, four stages, in order\n{text}"
+    );
+    assert!(
+        !events_of(&frames, "episode.begin").is_empty(),
+        "collect published no episode\n{text}"
+    );
+    assert!(
+        !scalars_on(&frames, 5).is_empty(),
+        "training published no curve\n{text}"
+    );
+    println!("RAN {TEST}: {stages:?} on one address");
+}

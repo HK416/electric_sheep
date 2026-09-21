@@ -18,6 +18,7 @@ Usage:
                  [--weight-decay F] [--grad-clip F] [--init-backbone weights.safetensors]
                  [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json]
                  [--resident-gpu] [--amp bf16] [--compile]
+                 [--progress-every N] [--sample-every N]
 
 Prints one JSON line on stdout and nothing else:
 
@@ -138,6 +139,17 @@ decision, and two copies of one fact are one fact and one bug. With nothing froz
 is every parameter in the same order, so the default path is bit-identical to the run before
 this packet.
 
+**What a watcher sees** (packet M7/E7). `--progress-every N` prints, every `N` optimizer steps,
+one JSON line `{"progress": {"step", "loss", "lr", "samples_per_s", "elapsed_s"}}`; `--sample-every
+N` writes `<--loss-curve's directory>/sample-<step>.bin` + `.json` holding **one image input of
+that step's batch, after augmentation**, as `Rgb8` -- the tensor the network is fitting, mapped
+for display only -- and prints `{"sample": "<path>"}`. Both go to stdout *before* the summary,
+which stays the last line and stays byte-identical; `es train --telemetry` reads the lines and
+publishes them, and `es eval run`'s rule holds here too: nothing is computed for a watcher that
+is not there. **Without the two flags this file is the run of before, bit for bit** -- no line is
+printed, no tensor is copied off the device, and `es train` does not pass them, so no measured
+run's plan or `training.lock` moves.
+
 `--weight-decay` is AdamW's, defaulting to torch's own `1e-2` **made explicit** so that
 `optimizer.json` can name a number this script actually passed rather than one it assumes.
 `--grad-clip F` clips the gradient norm to `F` before the step; `0` (the default) is off, and
@@ -154,6 +166,7 @@ import json
 import math
 import struct
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -161,8 +174,16 @@ import torch
 # The sibling module, by path: this script is run as a file (`python python/es/train_act.py`),
 # not as part of the `es` package, and importing the package would pull in `es_native` --
 # a maturin build a trainer has no reason to need (packet M7/T6).
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-import augment as es_augment  # noqa: E402
+#
+# `__file__` is absent when this file is `exec`d rather than run, which is how
+# `ir_training.rs::lr_schedule_matches_the_golden` reads `lr_at` and `lr_curve_hash` out of it
+# (packet M7/T4). Nothing that probe calls needs the sibling, so its absence there is an
+# ordinary outcome and not a stopped import -- a real run always has `__file__`.
+try:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import augment as es_augment  # noqa: E402
+except NameError:  # pragma: no cover - the `exec`d probe, never a run
+    es_augment = None
 
 try:  # only `lr_curve_hash` needs it, and this script's contract is "no package beyond torch"
     import blake3
@@ -324,6 +345,54 @@ def read_baked(baked: Path, ports: dict) -> tuple:
     return manifest, episodes
 
 
+def image_port(shapes: dict):
+    """The port `--sample-every` shows, or `None` when the module takes no image.
+
+    The first port, in name order, whose contract shape is three-dimensional with a 3 on the
+    channel axis -- `[3, h, w]` as the demo's `Dequantize` leaves it, or `[h, w, 3]`. Name
+    order and not "the biggest", because which picture a person is shown must not depend on
+    the resolution someone chose.
+    """
+    for port in sorted(shapes):
+        shape = shapes[port]
+        if len(shape) == 3 and (shape[0] == 3 or shape[2] == 3):
+            return port
+    return None
+
+
+def write_sample(directory: Path, step: int, tensor, port: str) -> Path:
+    """One image input of the current batch, after augmentation, as `Rgb8` beside the curve.
+
+    `tensor` is `[C, H, W]` or `[H, W, C]` -- one sample, already off the batch axis -- in the
+    range the bake left it: the demo's chain is `Dequantize` (/255) then
+    `Normalize{Range 0..1}`, which is the identity, so `clamp(v, 0, 1) * 255` is exactly the
+    inverse. That mapping is *recorded in the sidecar* rather than assumed, because neither
+    `contract.json` nor the bake's `manifest.json` carries the chain's numbers: a document
+    normalising by mean/std would need them, and would show through this as a washed-out
+    picture rather than as a wrong one (design note `editor-shell.md` section 16).
+    """
+    # `movedim`, not `permute`: `train_act_defines_no_layer` forbids the latter by name
+    # because it was half of `Op::Dequantize` written out here (packet M5/V2b). This moves a
+    # channel axis for a picture and touches no port the module reads.
+    hwc = tensor.movedim(0, -1) if tensor.shape[0] == 3 else tensor
+    pixels = (hwc.detach().float().cpu().clamp(0.0, 1.0) * 255.0).to(torch.uint8).contiguous()
+    h, w, _ = pixels.shape
+    path = directory / ("sample-%d.bin" % step)
+    path.write_bytes(bytes(pixels.reshape(-1).tolist()))
+    path.with_suffix(".json").write_text(
+        json.dumps(
+            {
+                "shape": [int(h), int(w), 3],
+                "port": port,
+                "step": step,
+                "mapping": "clamp(v, 0, 1) * 255",
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def make_samples(episodes: list, chunk: int) -> list:
     """One sample per frame: `(episode, t, [row indices of the next `chunk` actions])`.
 
@@ -436,6 +505,21 @@ def main(argv: list) -> int:
     )
     p.add_argument("--loss-curve", type=Path, help="write the per-step loss as JSON")
     p.add_argument(
+        "--progress-every",
+        type=int,
+        default=0,
+        help="print one {\"progress\": {...}} line every N optimizer steps; 0 (the default) "
+        "prints none and is the run of before, bit for bit",
+    )
+    p.add_argument(
+        "--sample-every",
+        type=int,
+        default=0,
+        help="write one image input of the batch, after augmentation, as Rgb8 beside "
+        "--loss-curve every N steps and print its path; 0 (the default) writes none. Needs "
+        "--loss-curve, which is what says where",
+    )
+    p.add_argument(
         "--augmentation",
         type=Path,
         help="spec 19.3's training/augmentation.json: the Observation IR's `training_only` "
@@ -536,6 +620,12 @@ def main(argv: list) -> int:
     model.train()
     losses, applied_lr = [], []
     order, cursor = [], 0
+    # What a watcher is shown (packet M7/E7), decided once: the port, the directory and the
+    # two periods. All four are inert when neither flag was passed, so the loop below is the
+    # loop of before.
+    watch_port = image_port(shapes) if a.sample_every > 0 else None
+    watch_dir = a.loss_curve.parent if a.loss_curve else None
+    started = time.perf_counter()
     for step in range(total):
         # `constant` writes back the number AdamW was built with, which is a no-op on the
         # arithmetic -- that is what makes the default path the old run (packet M7/T4).
@@ -584,6 +674,30 @@ def main(argv: list) -> int:
             torch.nn.utils.clip_grad_norm_(trainable, a.grad_clip)
         optimizer.step()
         losses.append(float(loss.detach()))
+        # Rate-limited, never per step: one line per `--progress-every` and one picture per
+        # `--sample-every`, both after the optimizer has moved so the numbers describe a step
+        # that happened. Flushed, because the reader is a pipe (packet M7/E7).
+        if a.progress_every > 0 and (step + 1) % a.progress_every == 0:
+            elapsed = time.perf_counter() - started
+            sys.stdout.write(
+                json.dumps(
+                    {
+                        "progress": {
+                            "step": step + 1,
+                            "loss": losses[-1],
+                            "lr": lr_now,
+                            "samples_per_s": (step + 1) * a.batch / elapsed if elapsed > 0 else 0.0,
+                            "elapsed_s": elapsed,
+                        }
+                    }
+                )
+                + "\n"
+            )
+            sys.stdout.flush()
+        if watch_port and watch_dir and (step + 1) % a.sample_every == 0:
+            path = write_sample(watch_dir, step + 1, inputs[watch_port][0], watch_port)
+            sys.stdout.write(json.dumps({"sample": str(path)}) + "\n")
+            sys.stdout.flush()
         if marks and (step + 1) in marks:
             stem = str(a.out.with_suffix(""))
             write_safetensors(

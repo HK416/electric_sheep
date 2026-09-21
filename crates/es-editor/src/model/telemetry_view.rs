@@ -15,6 +15,7 @@ use es_telemetry::protocol::{HelloAck, Message, Payload, PerfMetrics, StreamId, 
 use es_telemetry::transport::{Client, TransportError};
 
 use crate::model::live_run::{LiveRun, RUN_STREAMS};
+use crate::model::train_view::TrainView;
 
 /// Where messages come from. `None` means "nothing right now", not "closed" — the app polls
 /// once a frame.
@@ -63,6 +64,9 @@ pub struct TelemetryModel {
     /// The Run tab's view of the same stream (packet M7/E4): an `es eval run --telemetry`
     /// folded back into the `CellRow`s and `Timeline`s a finished run has.
     pub live: LiveRun,
+    /// The Live tab's Training section (packet M7/E7): the same stream's learning curve, its
+    /// checkpoint marks and the tensor the network is fitting.
+    pub train: TrainView,
 }
 
 impl Default for TelemetryModel {
@@ -81,6 +85,7 @@ impl TelemetryModel {
             received: 0,
             execution_hash: None,
             live: LiveRun::default(),
+            train: TrainView::default(),
         }
     }
 
@@ -103,6 +108,7 @@ impl TelemetryModel {
     pub fn ingest(&mut self, msg: &Message) {
         self.received += 1;
         self.live.ingest(msg);
+        self.train.ingest(msg);
         let frame = match msg {
             Message::HelloAck(ack) => {
                 self.execution_hash = ack.execution_hash;

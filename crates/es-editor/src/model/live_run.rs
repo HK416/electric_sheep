@@ -29,8 +29,16 @@ pub const STREAM_TICKS: StreamId = StreamId(2);
 pub const STREAM_METRICS: StreamId = StreamId(3);
 pub const STREAM_IMAGE: StreamId = StreamId(4);
 
-/// Every stream a viewer of a run wants, for `Client::subscribe`.
-pub const RUN_STREAMS: [StreamId; 4] = [STREAM_EVENTS, STREAM_TICKS, STREAM_METRICS, STREAM_IMAGE];
+/// Every stream a viewer of a run wants, for `Client::subscribe`. Stream 5 is the training
+/// curve (packet M7/E7, `crate::model::train_view`): one subscription covers a whole cycle,
+/// because a cycle publishes every stage on one socket.
+pub const RUN_STREAMS: [StreamId; 5] = [
+    STREAM_EVENTS,
+    STREAM_TICKS,
+    STREAM_METRICS,
+    STREAM_IMAGE,
+    crate::model::train_view::STREAM_TRAIN,
+];
 
 /// One episode as the wire described it.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -51,6 +59,27 @@ struct LiveSuite {
     n_episodes: u32,
 }
 
+/// One stage of `es loop cycle`, as `stage.begin` / `stage.end` bracketed it (packet M7/E7).
+///
+/// The strip above the Run tab's table is this list: a cycle publishes collect, the expert
+/// gate, training and the evaluation on **one** socket, and the stage is what tells a row of
+/// one from a row of another.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StageRow {
+    /// The producer's own word: `collect`, `expert-gate`, `train`, `eval`, `showcase`.
+    pub name: String,
+    /// Wall-clock the stage took, once it has ended.
+    pub seconds: Option<f64>,
+    /// The exit code the stage returned; `None` while it is still running.
+    pub code: Option<u8>,
+}
+
+impl StageRow {
+    pub fn running(&self) -> bool {
+        self.code.is_none()
+    }
+}
+
 /// A run being watched: the same rows and the same timeline the Run tab draws for a finished
 /// one.
 #[derive(Clone, Debug, Default)]
@@ -68,6 +97,9 @@ pub struct LiveRun {
     image: Option<Rgb8Image>,
     images: u64,
     selected: Option<String>,
+    /// The cycle's stages, in the order they began (packet M7/E7). Empty for a run that is
+    /// one command rather than a cycle — which is what makes the strip hide itself.
+    stages: Vec<StageRow>,
 }
 
 impl LiveRun {
@@ -122,6 +154,42 @@ impl LiveRun {
                     cell.outcome = Some(get("outcome"));
                 }
                 self.open = None;
+            }
+            // An episode of `es loop collect` is a row of the same table (packet M7/E7). It
+            // has no suite of its own, so the stage it came from is the column's value: a
+            // cycle's Run tab then reads "collect / episode-00" beside "nominal / nominal-00".
+            "episode.begin" => {
+                let name = episode_cell(&get("episode"));
+                let cell = self.cells.entry(name.clone()).or_default();
+                cell.suite = get("stage");
+                cell.seed = fields.get("seed").and_then(|s| s.parse().ok());
+                self.open = Some(name);
+            }
+            "episode.end" => {
+                let name = episode_cell(&get("episode"));
+                if let Some(cell) = self.cells.get_mut(&name) {
+                    // A collection writes rows, not frames: the count a person wants beside
+                    // the episode is the steps it recorded.
+                    cell.frames = fields
+                        .get("steps")
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(0);
+                    cell.has_traj = true;
+                    cell.outcome = Some(get("outcome"));
+                }
+                self.open = None;
+            }
+            "stage.begin" => self.stages.push(StageRow {
+                name: get("name"),
+                seconds: None,
+                code: None,
+            }),
+            "stage.end" => {
+                let name = get("name");
+                if let Some(row) = self.stages.iter_mut().rev().find(|s| s.name == name) {
+                    row.seconds = fields.get("seconds").and_then(|s| s.parse().ok());
+                    row.code = fields.get("code").and_then(|s| s.parse().ok()).or(Some(0));
+                }
             }
             "suite.end" => {
                 let suite = self.suites.entry(get("suite")).or_default();
@@ -234,6 +302,11 @@ impl LiveRun {
         self.images
     }
 
+    /// The cycle's stages, in the order they began. Empty for a run that is one command.
+    pub fn stages(&self) -> &[StageRow] {
+        &self.stages
+    }
+
     pub fn select(&mut self, name: &str) {
         self.selected = Some(name.to_owned());
     }
@@ -273,10 +346,19 @@ fn event_source(code: u32) -> EventSource {
     }
 }
 
+/// The Run tab's name for one collected episode. Zero-padded so the `BTreeMap`'s key order is
+/// the episode order, which is the same rule `<suite>-<NN>` follows for an evaluation's cells.
+fn episode_cell(index: &str) -> String {
+    match index.parse::<u32>() {
+        Ok(n) => format!("episode-{n:02}"),
+        Err(_) => format!("episode-{index}"),
+    }
+}
+
 /// An `Image` payload as the image tab's own type, or `None` when it is not what it says it
 /// is. Only `rgb8` is decoded: the producer sends the renderer's bytes unconverted (INV-14),
 /// and guessing at any other layout here would be a second preprocessing implementation.
-fn rgb8(w: u32, h: u32, format: &str, bytes: &[u8]) -> Option<Rgb8Image> {
+pub(crate) fn rgb8(w: u32, h: u32, format: &str, bytes: &[u8]) -> Option<Rgb8Image> {
     let (width, height) = (w as usize, h as usize);
     if format != "rgb8" || bytes.len() != width * height * 3 {
         return None;
@@ -504,6 +586,80 @@ mod tests {
             },
         ));
         assert!(live.image().is_none());
+    }
+
+    /// Oracle 4 (packet M7/E7). A collection's episodes become rows of the Run tab's one
+    /// table, exactly as an evaluation's cells do — same `CellRow`, same order, same strip —
+    /// and a cycle's stage strip is the order its stages began in.
+    #[test]
+    fn live_run_folds_collect_episodes_like_cells() {
+        let mut live = LiveRun::default();
+        live.ingest(&event("stage.begin", &[("name", "collect".to_owned())]));
+        for episode in 0..2u32 {
+            live.ingest(&event(
+                "episode.begin",
+                &[
+                    ("episode", episode.to_string()),
+                    ("seed", "4".to_owned()),
+                    ("stage", "collect".to_owned()),
+                ],
+            ));
+            for tick in 0..3u64 {
+                live.ingest(&frame(
+                    STREAM_TICKS,
+                    tick,
+                    Payload::Scalars(vec![tick as f64, tick as f64, 1.0, 2.0]),
+                ));
+            }
+            live.ingest(&event(
+                "episode.end",
+                &[
+                    ("episode", episode.to_string()),
+                    ("outcome", "Success".to_owned()),
+                    ("steps", "3".to_owned()),
+                ],
+            ));
+        }
+        live.ingest(&event(
+            "stage.end",
+            &[
+                ("name", "collect".to_owned()),
+                ("seconds", "12.500".to_owned()),
+                ("code", "0".to_owned()),
+            ],
+        ));
+        live.ingest(&event("stage.begin", &[("name", "train".to_owned())]));
+
+        let rows = live.cells();
+        assert_eq!(
+            rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+            ["episode-00", "episode-01"],
+            "zero-padded, so the table's order is the episode order"
+        );
+        assert!(rows
+            .iter()
+            .all(|r| r.suite == "collect" && r.seed == Some(4)));
+        assert!(rows.iter().all(|r| r.frames == 3 && r.has_traj));
+        // The strip is the evaluation's own fold of the same bits: one row per tick, the
+        // clamped source and the violation the plane raised.
+        let timeline = live.timeline("episode-00");
+        assert_eq!(timeline.rows.len(), 3);
+        assert_eq!(timeline.rows[0].source, EventSource::Clamped);
+        assert!(!timeline.totals.is_empty(), "the events bits decoded");
+        // A collection has no suite row, so the table keeps the three identity columns.
+        assert_eq!(live.columns(), ["cell", "suite", "seed"]);
+
+        let stages = live.stages();
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].name, "collect");
+        assert_eq!(stages[0].seconds, Some(12.5));
+        assert!(!stages[0].running());
+        assert!(stages[1].running(), "train has not ended");
+        println!(
+            "RAN live_run_folds_collect_episodes_like_cells: {} row(s), {} stage(s)",
+            rows.len(),
+            stages.len()
+        );
     }
 
     #[test]
