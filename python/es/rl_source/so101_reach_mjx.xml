@@ -1,0 +1,73 @@
+<!--
+  The committed SO-101 scene, narrowed for MJX. Packet M8/S2c.
+
+  It `include`s tests/fixtures/mjcf/so101_pick_place.xml and adds one element, `<contact>`, so
+  this file cannot drift from the scene our own runtime loads: every body, geom, joint,
+  actuator, site, camera *and every `<option>` setting* (integrator="implicitfast",
+  cone="elliptic", solver Newton, iterations=10, ls_iterations=50, timestep, impratio) is the
+  committed one. The whole edit is the 35 `<exclude>` rows below, and each is one row of the
+  sim-to-sim gap table in docs/api-notes/brax-ppo-so101.md.
+
+  Why they are here (all measured on the 4090, 2026-09-21; the api-note carries the table):
+
+  * Cost. The committed scene puts 1,054 potential contacts and a 5,292 x 12 constraint
+    Jacobian into MJX's static allocation. MuJoCo's Newton solver forms a dense njmax x njmax
+    matrix per env, so the batch step time and the memory go as njmax^2..njmax^3: 4,096 envs
+    ran at 736 env-steps/s with the arm pairs kept (and 8,192 envs could not allocate 4.1 GiB).
+    With these rows: 24 contacts, 84 x 12, 10,620 env-steps/s at 4,096 envs.
+  * Stability. Keeping the gripper-vs-cube pairs makes the untrained (flailing) policy push a
+    0.75 mm jaw sphere through the 25 mm cube inside one 5 ms substep; the cube's free joint
+    then diverges to NaN within ~20 control steps, in float32 and float64 alike, under CG and
+    under Newton with more iterations. PPO starts from that flailing policy, so the run dies at
+    iteration 0. Excluding the pair makes the cube a target pose the arm reaches, not an object
+    it hits -- which is what "reach" means here -- and the divergence disappears entirely
+    (measured |qvel|max 4.3 rad/s over 200 random full-range control steps).
+
+  What is kept: the cube against the table and the bin (it rests and can be nudged by them),
+  and every adjacent arm link pair MuJoCo itself resolves. What is dropped: arm link vs arm
+  link, arm link vs table/bin, and every arm link -- including both jaws -- vs the cube.
+
+  Playground's own MJX scenes narrow contacts the same way, with contype/conaffinity masks
+  (franka_emika_panda/xmls/mjx_single_cube.xml); `<exclude>` is the form available to a file
+  that includes a scene it must not edit.
+-->
+<mujoco model="so101_reach_mjx">
+  <include file="../../../tests/fixtures/mjcf/so101_pick_place.xml"/>
+  <contact>
+    <exclude body1="shoulder" body2="upper_arm"/>
+    <exclude body1="shoulder" body2="lower_arm"/>
+    <exclude body1="shoulder" body2="wrist"/>
+    <exclude body1="shoulder" body2="gripper"/>
+    <exclude body1="shoulder" body2="camera_mount"/>
+    <exclude body1="shoulder" body2="moving_jaw_so101_v1"/>
+    <exclude body1="upper_arm" body2="lower_arm"/>
+    <exclude body1="upper_arm" body2="wrist"/>
+    <exclude body1="upper_arm" body2="gripper"/>
+    <exclude body1="upper_arm" body2="camera_mount"/>
+    <exclude body1="upper_arm" body2="moving_jaw_so101_v1"/>
+    <exclude body1="lower_arm" body2="wrist"/>
+    <exclude body1="lower_arm" body2="gripper"/>
+    <exclude body1="lower_arm" body2="camera_mount"/>
+    <exclude body1="lower_arm" body2="moving_jaw_so101_v1"/>
+    <exclude body1="wrist" body2="gripper"/>
+    <exclude body1="wrist" body2="camera_mount"/>
+    <exclude body1="wrist" body2="moving_jaw_so101_v1"/>
+    <exclude body1="gripper" body2="camera_mount"/>
+    <exclude body1="gripper" body2="moving_jaw_so101_v1"/>
+    <exclude body1="camera_mount" body2="moving_jaw_so101_v1"/>
+    <exclude body1="world" body2="shoulder"/>
+    <exclude body1="world" body2="upper_arm"/>
+    <exclude body1="world" body2="lower_arm"/>
+    <exclude body1="world" body2="wrist"/>
+    <exclude body1="world" body2="gripper"/>
+    <exclude body1="world" body2="camera_mount"/>
+    <exclude body1="world" body2="moving_jaw_so101_v1"/>
+    <exclude body1="shoulder" body2="cube"/>
+    <exclude body1="upper_arm" body2="cube"/>
+    <exclude body1="lower_arm" body2="cube"/>
+    <exclude body1="wrist" body2="cube"/>
+    <exclude body1="camera_mount" body2="cube"/>
+    <exclude body1="gripper" body2="cube"/>
+    <exclude body1="moving_jaw_so101_v1" body2="cube"/>
+  </contact>
+</mujoco>
