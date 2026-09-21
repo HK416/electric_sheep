@@ -145,6 +145,12 @@ pub struct Run {
     /// Gradient-norm clip. Absent is off, and `optimizer.json` then names no clip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grad_clip: Option<f64>,
+    /// Passed to whichever trainer the route runs, verbatim, after everything this module
+    /// derives (and after `[policy.lerobot] extra` on the external route). `--resident-gpu`
+    /// is the one packet M7/T3 measured; a flag that changes the bits is a deliberate,
+    /// recorded act, which is why it lives in the recipe and enters `identity_hash`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra: Vec<String>,
 }
 
 /// `[run] schedule = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }` (packet M7/T4,
@@ -530,6 +536,7 @@ impl Plan {
                     // Appended, and only when the recipe asks for them (packet M7/T4): a
                     // recipe that names no schedule renders the plan it always did.
                     .chain(recipe.schedule_args()?)
+                    .chain(run.extra.iter().cloned())
                     .collect(),
                     step: None,
                 });
@@ -605,7 +612,7 @@ impl Plan {
                     s("--job_name=es-train"),
                     s("--wandb.enable=false"),
                 ];
-                train.extend(lerobot.extra.iter().cloned());
+                train.extend(lerobot.extra.iter().chain(&run.extra).cloned());
                 steps.push(Step {
                     kind: StepKind::Trainer,
                     prefix: trainer.to_vec(),
@@ -659,6 +666,432 @@ impl Plan {
         }
         text
     }
+}
+
+// --- the cycle (packet M7/T2) -----------------------------------------------------------------
+
+/// `kind = "cycle"`.
+pub const CYCLE_KIND: &str = "cycle";
+
+/// `cycle.toml` — collect, train, evaluate and showcase under one document and one ledger
+/// (spec 13.1, spec 13.3).
+///
+/// It names the stages; it does not re-describe them. `[train]` is T1's recipe by path or
+/// inline, `[eval]` is an Evaluation IR by path, and the words each stage runs with are the
+/// flags those commands already take (design note `docs/design/training-recipe.md`, "the
+/// cycle").
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Cycle {
+    pub kind: String,
+    pub scene: String,
+    /// An existing dataset root to train on, instead of `[collect]`. Exactly one of the two.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collect: Option<CollectRef>,
+    pub train: TrainRef,
+    pub eval: EvalRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub showcase: Option<ShowcaseRef>,
+}
+
+/// `[collect]` — what `es loop collect` is told.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CollectRef {
+    /// The bundle whose Deployment IR is the plane (`es loop collect --policy`).
+    pub policy: String,
+    /// The scripted demonstrator, or absent for a trained policy's own rollouts. Setting it
+    /// is what arms the expert gate of spec 28.9 rule 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expert: Option<String>,
+    pub episodes: u32,
+    #[serde(default)]
+    pub seed: u64,
+    /// Render the Task IR's image channel beside the dataset (`es loop collect --frames`).
+    #[serde(default)]
+    pub frames: bool,
+}
+
+/// `[train]` — T1's recipe by path (`recipe`) or inline (`dataset`/`policy`/`run`).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TrainRef {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dataset: Option<DatasetRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<PolicyRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<Run>,
+}
+
+/// `[eval]` — what `es eval run` is told, for the expert gate and for the trained policy
+/// alike. One config, because a gate the expert passed under other conditions gates nothing.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EvalRef {
+    pub config: String,
+    /// `"last"` or one of the recipe's checkpoint marks.
+    #[serde(default = "default_checkpoint")]
+    pub checkpoint: String,
+    #[serde(default = "one_job")]
+    pub jobs: u32,
+    /// Render the observation frames the run needs. An Observation IR with an image input is
+    /// refused without them, and the expert gate reads its own state through the same source.
+    #[serde(default)]
+    pub frames: bool,
+}
+
+fn default_checkpoint() -> String {
+    "last".to_owned()
+}
+
+fn one_job() -> u32 {
+    1
+}
+
+/// `[showcase]` — the human-facing re-render of one evaluated episode (packet M5/V9).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShowcaseRef {
+    /// A cell of the evaluation, `<suite>-<NN>`, as its `.estraj` is named.
+    pub cell: String,
+    pub eye: [f64; 3],
+    pub look_at: [f64; 3],
+    #[serde(default = "default_fov")]
+    pub fov: f64,
+    #[serde(default = "default_width")]
+    pub width: u32,
+    #[serde(default = "default_height")]
+    pub height: u32,
+}
+
+fn default_fov() -> f64 {
+    45.0
+}
+
+fn default_width() -> u32 {
+    1280
+}
+
+fn default_height() -> u32 {
+    720
+}
+
+/// One stage of the cycle. The order here is the order they run in and the order `--from`
+/// compares against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Stage {
+    Collect,
+    /// Spec 28.9 rule 1: the same harness, on the expert, before anything trains.
+    ExpertGate,
+    Train,
+    Eval,
+    Showcase,
+}
+
+impl Stage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Collect => "collect",
+            Self::ExpertGate => "expert-gate",
+            Self::Train => "train",
+            Self::Eval => "eval",
+            Self::Showcase => "showcase",
+        }
+    }
+
+    /// The four `--from` names. The expert gate is not one of them: it belongs to the collect
+    /// stage's data, and resuming *at* it would train on a dataset nothing judged.
+    pub fn parse(name: &str) -> Option<Self> {
+        [Self::Collect, Self::Train, Self::Eval, Self::Showcase]
+            .into_iter()
+            .find(|s| s.as_str() == name)
+    }
+}
+
+/// One stage as the command that runs it: the same words the plan prints and the same words
+/// the in-process entry point is handed, so a printed line and an executed stage cannot drift.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CycleStep {
+    pub stage: Stage,
+    /// `["es", "loop", "collect"]` and so on — printed, never spawned as a process.
+    pub prefix: Vec<String>,
+    pub args: Vec<String>,
+}
+
+/// The whole cycle as commands, with T1's plan nested under `train`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CyclePlan {
+    pub steps: Vec<CycleStep>,
+    pub train: Plan,
+    /// The checkpoint mark `[eval] checkpoint` resolved to.
+    pub mark: u32,
+    /// Where the dataset the cycle trains on lives.
+    pub dataset_root: String,
+}
+
+impl Cycle {
+    pub fn parse(text: &str) -> Result<Self, DataError> {
+        let cycle: Self = es_ir::serial::parse_toml(text)
+            .map_err(|e| refuse(format!("the cycle does not parse: {e}")))?;
+        if cycle.kind != CYCLE_KIND {
+            return Err(refuse(format!(
+                "kind = {:?}; `es loop cycle` reads a {CYCLE_KIND:?} document",
+                cycle.kind
+            )));
+        }
+        match (&cycle.collect, &cycle.dataset) {
+            (Some(_), Some(_)) => Err(refuse(
+                "the cycle sets both `[collect]` and `dataset`; one collects the data and the \
+                 other reuses a root that already holds it. Delete one",
+            )),
+            (None, None) => Err(refuse(
+                "the cycle sets neither `[collect]` nor `dataset`; there is nothing to train on",
+            )),
+            _ => Ok(cycle),
+        }
+    }
+
+    /// The dataset root this cycle trains on; `<out>/collect/ds` when it collects its own.
+    pub fn dataset_root(&self, out: &Path) -> String {
+        match &self.dataset {
+            Some(root) => root.clone(),
+            None => under(out, "collect/ds"),
+        }
+    }
+
+    /// T1's recipe for this cycle: the document `[train] recipe` names (read by the caller —
+    /// this module opens no path it was not handed) or the inline tables, with the dataset
+    /// slot **overridden by the cycle's own collect output**. A cycle that trained on another
+    /// directory's data would chain nothing (spec 13.3).
+    pub fn training(&self, recipe_text: Option<&str>, out: &Path) -> Result<Recipe, DataError> {
+        let mut recipe = match recipe_text {
+            Some(text) => Recipe::parse(text)?,
+            None => Recipe {
+                kind: s(KIND),
+                dataset: self.train.dataset.clone().unwrap_or(DatasetRef {
+                    root: String::new(),
+                    frames: None,
+                }),
+                policy: self.train.policy.clone().ok_or_else(|| {
+                    refuse(
+                        "[train] names neither `recipe` nor `policy`: one of them says what is \
+                         trained",
+                    )
+                })?,
+                run: self.train.run.clone().ok_or_else(|| {
+                    refuse("[train] is inline and has no `run` block: steps, batch, lr, seed")
+                })?,
+            },
+        };
+        if let Some(collect) = &self.collect {
+            recipe.dataset.root = under(out, "collect/ds");
+            recipe.dataset.frames = collect.frames.then(|| under(out, "collect/frames"));
+        } else if let Some(root) = &self.dataset {
+            recipe.dataset.root.clone_from(root);
+        }
+        if recipe.dataset.root.is_empty() {
+            return Err(refuse(
+                "[train] is inline with no `[train.dataset] root`, and the cycle collects \
+                 nothing to put there",
+            ));
+        }
+        recipe.route()?;
+        recipe.marks()?;
+        Ok(recipe)
+    }
+
+    /// The checkpoint `[eval]` judges: `"last"` is the recipe's largest mark, and anything
+    /// else has to be one of them — a checkpoint that is not on disk cannot be evaluated.
+    pub fn mark(&self, recipe: &Recipe) -> Result<u32, DataError> {
+        let marks = recipe.marks()?;
+        if self.eval.checkpoint == "last" {
+            return Ok(*marks.last().expect("marks always holds run.steps"));
+        }
+        let want: u32 = self.eval.checkpoint.parse().map_err(|_| {
+            refuse(format!(
+                "[eval] `checkpoint` is {:?}; it is \"last\" or one of the recipe's marks \
+                 {marks:?}",
+                self.eval.checkpoint
+            ))
+        })?;
+        if !marks.contains(&want) {
+            return Err(refuse(format!(
+                "[eval] `checkpoint` is {want}, which the recipe does not write: its marks are \
+                 {marks:?}"
+            )));
+        }
+        Ok(want)
+    }
+}
+
+impl CyclePlan {
+    /// Every stage's command line, from the cycle, the resolved T1 recipe and its plan.
+    /// Nothing on disk is read here, so `--dry-run` works on a machine that has neither the
+    /// dataset, the bundle nor Python.
+    pub fn build(
+        cycle: &Cycle,
+        recipe: &Recipe,
+        train: Plan,
+        out: &Path,
+    ) -> Result<Self, DataError> {
+        let mark = cycle.mark(recipe)?;
+        let dataset_root = cycle.dataset_root(out);
+        let es = |a: &[&str]| -> Vec<String> { a.iter().map(|w| s(*w)).collect() };
+        let mut steps = Vec::new();
+
+        if let Some(collect) = &cycle.collect {
+            let mut args = vec![
+                s("--policy"),
+                collect.policy.clone(),
+                s("--scene"),
+                cycle.scene.clone(),
+                s("--episodes"),
+                collect.episodes.to_string(),
+                s("--seed"),
+                collect.seed.to_string(),
+                s("--out"),
+                dataset_root.clone(),
+            ];
+            if collect.frames {
+                args.push(s("--frames"));
+                args.push(under(out, "collect/frames"));
+            }
+            if let Some(expert) = &collect.expert {
+                args.push(s("--expert"));
+                args.push(expert.clone());
+            }
+            steps.push(CycleStep {
+                stage: Stage::Collect,
+                prefix: es(&["es", "loop", "collect"]),
+                args,
+            });
+            // Spec 28.9 rule 1. The expert's own report is kept beside the policy's, under its
+            // own directory: a harness the expert fails is a harness no policy can pass, and
+            // the evidence for that has to survive the run that comes after it.
+            if let Some(expert) = &collect.expert {
+                steps.push(CycleStep {
+                    stage: Stage::ExpertGate,
+                    prefix: es(&["es", "eval", "run"]),
+                    args: eval_args(cycle, &collect.policy, "eval-expert", out)
+                        .into_iter()
+                        .chain([s("--expert"), expert.clone()])
+                        .collect(),
+                });
+            }
+        }
+
+        steps.push(CycleStep {
+            stage: Stage::Train,
+            prefix: es(&["es", "train"]),
+            args: vec![
+                s("--recipe"),
+                // The cycle's own word, verbatim (T1's rule 2), or `(inline)` when the tables
+                // are in this document. The dataset override is visible in the nested plan
+                // below rather than in a rewritten path.
+                cycle.train.recipe.clone().unwrap_or_else(|| s("(inline)")),
+                s("--out"),
+                under(out, "train"),
+            ],
+        });
+
+        let checkpoint = under(out, &format!("train/checkpoints/{mark}.esb"));
+        steps.push(CycleStep {
+            stage: Stage::Eval,
+            prefix: es(&["es", "eval", "run"]),
+            args: eval_args(cycle, &checkpoint, "eval", out),
+        });
+
+        if let Some(show) = &cycle.showcase {
+            steps.push(CycleStep {
+                stage: Stage::Showcase,
+                prefix: es(&["es", "video", "showcase"]),
+                args: vec![
+                    s("--run"),
+                    under(out, "eval"),
+                    s("--scene"),
+                    cycle.scene.clone(),
+                    s("--out"),
+                    under(out, "showcase"),
+                    s("--cell"),
+                    show.cell.clone(),
+                    s("--eye"),
+                    triple(show.eye),
+                    s("--look-at"),
+                    triple(show.look_at),
+                    s("--fov"),
+                    show.fov.to_string(),
+                    s("--width"),
+                    show.width.to_string(),
+                    s("--height"),
+                    show.height.to_string(),
+                ],
+            });
+        }
+
+        Ok(Self {
+            steps,
+            train,
+            mark,
+            dataset_root,
+        })
+    }
+
+    /// One line per stage, T1's plan indented under the `train` line, every path under `<out>`
+    /// written relative to it and every separator a `/` — the same three rules that make the
+    /// training plan a property of the recipe alone (design note section 3).
+    pub fn render(&self, out: &Path) -> String {
+        let prefix = format!("{}/", out.to_string_lossy().replace('\\', "/"));
+        let rel = |w: &String| w.replace('\\', "/").replace(&prefix, "");
+        let stages: Vec<&str> = self.steps.iter().map(|s| s.stage.as_str()).collect();
+        let mut text = format!("# cycle: {}\n", stages.join(" -> "));
+        for step in &self.steps {
+            let words: Vec<String> = step.prefix.iter().chain(&step.args).map(rel).collect();
+            text.push_str(&words.join(" "));
+            text.push('\n');
+            if step.stage == Stage::Train {
+                // Nested, and relative to the *cycle's* `<out>`: the training plan reaches out
+                // of `<out>/train` into the collect output, so rendering it against its own
+                // directory would leave an absolute path in the golden.
+                for line in self.train.render(out).lines() {
+                    text.push_str("  ");
+                    text.push_str(line);
+                    text.push('\n');
+                }
+            }
+        }
+        text
+    }
+}
+
+/// `es eval run`'s words for one policy, shared by the expert gate and the trained policy so
+/// that the two runs differ in exactly one thing: what is driving.
+fn eval_args(cycle: &Cycle, policy: &str, out_dir: &str, out: &Path) -> Vec<String> {
+    let mut args = vec![
+        s("--config"),
+        cycle.eval.config.clone(),
+        s("--policy"),
+        s(policy),
+        s("--scene"),
+        cycle.scene.clone(),
+        s("--out"),
+        under(out, out_dir),
+        s("--jobs"),
+        cycle.eval.jobs.to_string(),
+    ];
+    if cycle.eval.frames {
+        args.push(s("--frames"));
+        args.push(under(out, &format!("{out_dir}/frames")));
+    }
+    args
+}
+
+fn triple(v: [f64; 3]) -> String {
+    format!("{},{},{}", v[0], v[1], v[2])
 }
 
 // --- spec 19.3's `training/` -------------------------------------------------------------------
@@ -1165,6 +1598,126 @@ device = "cuda"
         ))
         .expect_err("refused");
         assert!(e.to_string().contains("IR route's"), "{e}");
+    }
+
+    // --- the cycle (packet M7/T2) -----------------------------------------------------------
+
+    const CYCLE: &str = r#"
+kind = "cycle"
+scene = "scene.xml"
+[collect]
+policy = "untrained.esb"
+expert = "so101-pick-place"
+episodes = 200
+seed = 1
+frames = true
+[train]
+recipe = "training.toml"
+[eval]
+config = "evaluation.toml"
+jobs = 6
+frames = true
+[showcase]
+cell = "nominal-00"
+eye = [0.66, -0.46, 0.52]
+look_at = [0.14, -0.04, 0.04]
+fov = 36
+"#;
+
+    fn cycle_plan(text: &str, out: &str) -> CyclePlan {
+        let cycle = Cycle::parse(text).expect("the cycle parses");
+        let out = Path::new(out);
+        let recipe = cycle.training(Some(IR), out).expect("the recipe resolves");
+        let trainer = vec![s("python"), s("-m"), s("lerobot.scripts.lerobot_train")];
+        let plan = Plan::build(&recipe, &out.join("train"), "python", &trainer, Some(13))
+            .expect("plan builds");
+        CyclePlan::build(&cycle, &recipe, plan, out).expect("the cycle plan builds")
+    }
+
+    /// The cycle's collect output is what the training recipe reads, whatever the recipe's own
+    /// `[dataset]` says: otherwise the ledger chains nothing (spec 13.3).
+    #[test]
+    fn the_collect_output_overrides_the_recipes_dataset() {
+        let cycle = Cycle::parse(CYCLE).expect("parses");
+        let recipe = cycle
+            .training(Some(IR), Path::new("/tmp/run"))
+            .expect("resolves");
+        assert!(recipe.dataset.root.ends_with("collect/ds"), "{recipe:?}");
+        assert!(
+            recipe
+                .dataset
+                .frames
+                .as_deref()
+                .unwrap()
+                .ends_with("collect/frames"),
+            "{recipe:?}"
+        );
+        // "last" is the recipe's largest mark; a mark it does not write is refused by name.
+        assert_eq!(cycle.mark(&recipe).unwrap(), 20000);
+        let other = CYCLE.replace("jobs = 6", "jobs = 6\ncheckpoint = \"7000\"");
+        let e = Cycle::parse(&other)
+            .unwrap()
+            .mark(&recipe)
+            .expect_err("refused");
+        assert!(e.to_string().contains("7000"), "{e}");
+    }
+
+    /// The rendered cycle holds no absolute path, on either separator, and the training plan
+    /// is nested under its own stage.
+    #[test]
+    fn the_cycle_render_is_relative_to_out() {
+        let a = cycle_plan(CYCLE, "/tmp/scratch-a").render(Path::new("/tmp/scratch-a"));
+        let b = cycle_plan(CYCLE, "/var/other-b").render(Path::new("/var/other-b"));
+        assert_eq!(a, b, "the plan is a property of the document, not of --out");
+        assert!(!a.contains("scratch-a"), "{a}");
+        assert!(
+            a.contains("# cycle: collect -> expert-gate -> train -> eval -> showcase"),
+            "{a}"
+        );
+        assert!(a.contains("es loop collect --policy untrained.esb"), "{a}");
+        assert!(a.contains("--expert so101-pick-place"), "{a}");
+        assert!(
+            a.contains("\n  # route: ir\n"),
+            "the T1 plan is nested: {a}"
+        );
+        assert!(a.contains("  es dataset bake"), "{a}");
+        assert!(a.contains("--policy train/checkpoints/20000.esb"), "{a}");
+        assert!(
+            a.contains("--eye 0.66,-0.46,0.52 --look-at 0.14,-0.04,0.04"),
+            "{a}"
+        );
+    }
+
+    /// A cycle names one source of data.
+    #[test]
+    fn a_cycle_collects_or_reuses_but_not_both() {
+        let both = CYCLE.replace("[collect]", "dataset = \"runs/ds\"\n[collect]");
+        let e = Cycle::parse(&both).expect_err("refused");
+        assert!(e.to_string().contains("both"), "{e}");
+        let block = CYCLE
+            .split_once("[collect]\n")
+            .and_then(|(_, rest)| rest.split_once("[train]"))
+            .map(|(block, _)| block.to_owned())
+            .expect("the fixture has a [collect] block");
+        let neither = CYCLE.replace(&format!("[collect]\n{block}"), "");
+        let e = Cycle::parse(&neither).expect_err("refused");
+        assert!(e.to_string().contains("neither"), "{e}");
+    }
+
+    /// `[run] extra` reaches the trainer's command line on the IR route.
+    #[test]
+    fn a_trainer_flag_from_the_recipe_is_on_the_command_line() {
+        let text = IR.replace(
+            "device = \"cuda\"",
+            "device = \"cuda\"\nextra = [\"--resident-gpu\"]",
+        );
+        let (_, plan) = plan_of(&text, "/tmp/x");
+        assert!(
+            plan.render(Path::new("/tmp/x"))
+                .contains("--loss-curve metrics/loss.json --resident-gpu"),
+            "{}",
+            plan.render(Path::new("/tmp/x"))
+        );
     }
 
     #[test]

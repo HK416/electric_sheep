@@ -1,0 +1,42 @@
+# One iteration of spec 13.1's loop for the SO-101 cube-into-bin demo (packet M7/T2).
+#
+# `es loop cycle --recipe tests/fixtures/visible-learning/cycle.toml --out <dir> --dry-run`
+# prints the stage plan pinned by `tests/golden/train/plan-cycle.txt`. Nothing here needs to
+# exist for `--dry-run` -- the training recipe is read (it is the nested plan) and the
+# Evaluation IR is read (its `evaluation_hash` is the spec 13.3 refusal), and neither the
+# dataset, the bundle nor Python is opened -- which is what makes the golden judgeable in CI.
+#
+# The two documents the cycle names are the committed ones: `training.toml` is T1's IR-route
+# recipe and `evaluation.toml` is the demo's Evaluation IR. The recipe's own `[dataset]` paths
+# are overridden by this cycle's collect output, which is why the nested plan below reads
+# `collect/ds` and not `runs/collect-001/ds`.
+
+kind  = "cycle"
+scene = "tests/fixtures/mjcf/so101_pick_place.xml"
+
+[collect]
+policy   = "runs/collect-001/untrained.esb"
+# Set, so the expert gate runs: the same harness, on the demonstrator, before anything trains
+# (spec 28.9 rule 1). The seed is deliberately outside the evaluation's 101-116.
+expert   = "so101-pick-place"
+episodes = 200
+seed     = 1
+frames   = true
+
+[train]
+recipe = "tests/fixtures/visible-learning/training.toml"
+
+[eval]
+config     = "tests/fixtures/visible-learning/evaluation.toml"
+checkpoint = "last"
+jobs       = 6
+frames     = true
+
+# The camera of packet M5/V9's showcase: outside the scene, outside every IR, watching the bin.
+[showcase]
+cell    = "nominal-00"
+eye     = [0.66, -0.46, 0.52]
+look_at = [0.14, -0.04, 0.04]
+fov     = 36
+width   = 1280
+height  = 720
