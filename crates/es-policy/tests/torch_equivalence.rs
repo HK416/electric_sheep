@@ -14,8 +14,9 @@ use std::collections::BTreeMap;
 use es_compile::Tensor;
 use es_ir::graph::{Graph, NodeId, PortRef};
 use es_ir::learning::{
-    ActionExecutionMode, ArchKind, ChunkBlendPolicy, HeadKind, LearningGraph, LearningNode,
-    PolicyContract, PolicyHandle, RuntimeHints, StateEncoderKind, TensorPort, WeightsRef,
+    ActionExecutionMode, Activation, ArchKind, ChunkBlendPolicy, HeadKind, LearningGraph,
+    LearningNode, PolicyContract, PolicyHandle, RuntimeHints, Squash, StateEncoderKind, TensorPort,
+    WeightsRef,
 };
 use es_ir::types::{ElemType, Frame, PortType, Shape, TimeRef, Unit};
 use es_ir::Diagnostic;
@@ -61,6 +62,8 @@ fn mlp_graph(weights: WeightsRef) -> LearningGraph {
             inputs: vec![state.clone()],
             kind: StateEncoderKind::Mlp {
                 hidden: vec![FEAT as u32],
+                activation: Activation::Relu,
+                activate_output: false,
             },
             out_dim: FEAT as u32,
         },
@@ -72,6 +75,7 @@ fn mlp_graph(weights: WeightsRef) -> LearningGraph {
             kind: HeadKind::Regression,
             action_dim: ACTION_DIM as u32,
             horizon: HORIZON as u32,
+            squash: Squash::None,
         },
     );
     g.insert(

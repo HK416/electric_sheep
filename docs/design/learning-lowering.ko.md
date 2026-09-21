@@ -79,7 +79,7 @@ class EsPolicy(nn.Module):
 | `LearningNode` | PyTorch | forward 라인 | 가중치 |
 |---|---|---|---|
 | `StateEncoder { Identity }` | — | `v = x` | 없음 |
-| `StateEncoder { Mlp { hidden } }` | `nn.Sequential(Linear, ReLU, …, Linear)` | `v = self.nk(x)` | 정확 |
+| `StateEncoder { Mlp { hidden, activation, activate_output } }` | `nn.Sequential(Linear, act, …, Linear[, act])` | `v = self.nk(x)` | 정확 |
 | `VisionEncoder { ResNet18/34 }` | `torchvision.models.resnet{18,34}`, `fc = Linear(512, out_dim)`로 교체 | `v = self.nk(x)` | 접두사 |
 | `VisionEncoder { other }` | — | — | `Unsupported` |
 | `LanguageEncoder` | — | — | `Unsupported` |
@@ -89,7 +89,7 @@ class EsPolicy(nn.Module):
 | `TemporalEncoder { None }` | — | `v = x` | 없음 |
 | `TemporalEncoder { Transformer }` | `nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=out_dim, nhead=8, batch_first=True), 1)` | `v = self.nk(x)` | 접두사 |
 | `TemporalEncoder { TemporalConv, Gru, Mamba }` | — | — | `Unsupported` |
-| `PolicyHead { Regression }` | `Linear(in, horizon * action_dim)` | `v = self.nk(x).reshape(-1, H, A)` | 정확 |
+| `PolicyHead { Regression, squash }` | `Linear(in, horizon * action_dim)` | `v = [torch.tanh(]self.nk(x)[)].reshape(-1, H, A)` | 정확 |
 | `PolicyHead { Diffusion { Ddpm, Ddim } }` | `_DdpmHead` (8절) | `v = self.nk(cond, noise)` | 정확 |
 | `PolicyHead { FlowMatching }` | `_FlowHead` (8절) | `v = self.nk(cond, noise)` | 정확 |
 | `PolicyHead { Diffusion { DpmSolver }, Discrete, Energy }` | — | — | `Unsupported` |
@@ -123,6 +123,43 @@ class EsPolicy(nn.Module):
   나타나지 않으며, 따라서 가중치 키 집합에도 나타나지 않는다: 값은 IR에서 오므로, 체크포인트가
   IR과 이 값에 대해 불일치할 수가 없다. `StatsSource::Dataset`이 여기서 `Unsupported`인 이유는
   `dataset_hash` 해석이 `es-data`(레이어 10)의 소관이고 `es-policy`는 레이어 8이기 때문이다.
+
+### 3.1 활성화 함수, 그 위치, 그리고 squash (패킷 M8/S2a)
+
+새 노드가 아니라 노드 파라미터 세 개다. `StateEncoderKind::Mlp`에 `activation: Activation`과
+`activate_output: bool`이, `LearningNode::PolicyHead`에 `squash: Squash`가 생겼다. 이것으로
+`quadruped-track.md` 3.4절의 1–3번이 닫힌다: 상류의 MLP는 `ReLU`가 아니고(brax는 `swish`,
+rsl_rl은 `ELU`), 상류는 마지막 은닉층에도 활성화를 넣으며, brax의 결정론적 추론은
+`tanh(location)`이다.
+
+| 파라미터 | 값 | lowering 결과 |
+|---|---|---|
+| `activation` | `Relu` / `Elu` / `Swish` / `Tanh` | 인코더의 `nn.Linear` 사이에 `nn.ReLU()` / `nn.ELU()` / `nn.SiLU()` / `nn.Tanh()` |
+| `activate_output` | `false` / `true` | 인코더의 **마지막** `nn.Linear` 뒤에 같은 모듈을 하나 더 |
+| `squash` | `None` / `Tanh` | `Regression` head 출력에 `torch.tanh(...)`, reshape **이전에** |
+
+**해시 규칙.** 부재 = 기본값(`Relu`, `false`, `None`) = 오늘의 정규형이며, 이는 패킷 M7/R5의
+`SensorRender`가 따르는 규칙 그대로다. `StateEncoderKind::canonical`은 두 필드가 존재하기
+전에 `format!("{kind:?}")`가 만들던 문자열 `Mlp { hidden: [256] }`를 그대로 쓰고, 기본값이
+아닐 때만 뒤에 덧붙인다; `PolicyHead`의 정규형도 `squash`가 `None`이 아닐 때만 덧붙인다.
+`es-ir`의 `committed_learning_hashes_are_unmoved_by_activation_and_squash`가 데모의 두
+`learning_hash`를 16진 리터럴로 고정하고, 기본값을 *명시적으로 적은* 문서가 생략한 문서와 같은
+해시를 내는지 확인한다; `es-policy`의 `lower_mlp_activations_source`는 생성된 소스에 대해 같은
+주장을 커밋된 `lowering_hash`(`3d06811c…d8a2d394`)로 고정한다.
+
+말해 둘 결과가 둘 있다. 활성화 함수는 가중치를 갖지 않으므로 열여섯 가지 조합 모두에서
+`weight_keys`와 `weight_shapes`가 동일하다 — 한 활성화로 학습한 체크포인트가 다른 활성화에서도
+로드되고, 달라지는 것은 숫자뿐이다. 그리고 `squash`는 오직 `Regression` head에만 정의된다:
+다른 head에서는 `LRN-031`이다. 샘플러의 출력은 디노이저나 코드북에서 나오며, 거기서 `tanh`는
+범위가 아니라 분포를 바꾸기 때문이다.
+
+`python/es/builder.py`의 `head(...)`는 `squash="None"`을 받는다; `Mlp`의 두 필드는 빌더가
+그대로 통과시키는 `kind` 값 안에 실리므로 별도의 키워드가 필요 없다.
+
+**측정.** `es-policy`의 `lower_mlp_activations_match_torch`가 `15 → [32, 32] → 6` 그래프의
+열여섯 가지 조합 전부를 직접 손으로 쓴 `crates/es-policy/python/mlp_activation_ref.py`와
+조합마다 관측 64개로 대조했고, 모두 CPU에서 **비트 단위로** 일치했다 — RTX 4090 머신,
+2026-09-21, torch 2.11.0+cu129, `~/venvs/es-lerobot-cuda`.
 
 ## 4. 가중치 네이밍
 

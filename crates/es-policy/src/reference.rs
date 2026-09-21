@@ -18,9 +18,9 @@ use std::collections::BTreeMap;
 
 use es_ir::graph::{Graph, NodeId, PortRef};
 use es_ir::learning::{
-    ActionExecutionMode, ArchKind, BetaSchedule, DiffusionScheduler, HeadKind, LearningGraph,
-    LearningNode, PolicyContract, PolicyHandle, PredictionType, RuntimeHints, StateEncoderKind,
-    TensorPort, VarianceType, WeightsRef,
+    ActionExecutionMode, Activation, ArchKind, BetaSchedule, DiffusionScheduler, HeadKind,
+    LearningGraph, LearningNode, PolicyContract, PolicyHandle, PredictionType, RuntimeHints,
+    Squash, StateEncoderKind, TensorPort, VarianceType, WeightsRef,
 };
 use es_ir::types::{ElemType, Frame, PortType, Shape, TimeRef, Unit};
 
@@ -173,7 +173,11 @@ pub fn sampler_graph(kind: HeadKind, weights: WeightsRef) -> LearningGraph {
         NodeId(0),
         LearningNode::StateEncoder {
             inputs: vec![state.clone()],
-            kind: StateEncoderKind::Mlp { hidden: vec![] },
+            kind: StateEncoderKind::Mlp {
+                hidden: vec![],
+                activation: Activation::Relu,
+                activate_output: false,
+            },
             out_dim: COND as u32,
         },
     );
@@ -184,6 +188,7 @@ pub fn sampler_graph(kind: HeadKind, weights: WeightsRef) -> LearningGraph {
             kind,
             action_dim: ACTION_DIM as u32,
             horizon: HORIZON as u32,
+            squash: Squash::None,
         },
     );
     g.connect(NodeId(0), "out", NodeId(1), "feat");
