@@ -108,6 +108,95 @@ deviate (MJX support for `implicitfast`/`elliptic`/`condim 6`), the deviation is
 
 *(filled by the packets; every row names server, date and path)*
 
+### S4b — the PPO trainer, oracle server (Linux, 16-core CPU), 2026-09-21
+
+Artifacts: `~/artifacts/plan-s/s4b/` (`untrained.esb`, `run.toml`, `run/`).
+Interpreter: `~/venvs/es-lerobot-cuda/bin/python`, torch 2.11.0+cu129, mujoco 3.13.0.
+Documents: `tests/fixtures/visible-learning/task.toml` + `tests/fixtures/rl/`
+{`observation-state.toml`, `learning-state.toml`, `deployment-rl.toml`}, recipe
+`tests/fixtures/rl/training-rl-demo.toml`.
+
+**The route runs, and it is reproducible.** `envs = 8`, `horizon = 64`, 200 iterations,
+`seed = 0`, CPU backend:
+
+| | |
+|---|---|
+| wall clock | **20.8 s** total (`es train`), 18.4 s inside the trainer |
+| per iteration | 92 ms (512 rows: 8 envs x 64 control steps) |
+| control ticks | 12,800 |
+| `identity_hash` | `c07c90aa09b48000…` |
+| `training_hash` | `40da99eaa163a3c7…` |
+| `dataset.lock` | `{"unset": true}` |
+
+The nine §12.4 metrics as `Rollout.metrics()` gives them (`metrics/env-metrics.json`). A domain
+this path never runs is `null`, not a fabricated zero, and there is deliberately no `step/s`:
+
+| metric | value |
+|---|---|
+| `physics_steps_per_sec` | 45,713 |
+| `actions_per_sec` | 11,428 |
+| `camera_frames_per_sec` | `null` — no renderer on this path (§4.3) |
+| `pixels_per_sec` | `null` — same |
+| `observation_gb_per_sec` | `null` — not instrumented by `Env` |
+| `policy_inferences_per_sec` | `null` — inference is in the trainer, not in `Env` |
+| `p50_end_to_end_latency` | `null` — synchronous rollout, no declared latency (section 3) |
+| `p95_end_to_end_latency` | `null` — same |
+| `gpu_memory_peak` | `null` — CPU backend |
+| `chunk_underrun_rate` | `null` — horizon 1, no chunk buffer |
+
+Everything else is `Target / Status: unverified`.
+
+**The critic learns; the actor has nothing to learn here.** `value_loss` falls 72.0 → 10.5 over
+the 200 iterations (iteration 0 / 49 / 99 / 149 / 199: 72.0, 43.6, 29.7, 15.7, 10.5) and
+`return` does not move (−42.98 → −46.39, inside the noise of a segment sum). That is the
+expected result and not a defect of the trainer: the document under test is the **demo** task,
+whose reward is a `Normalize` of the cube's x position, and nothing a 6-DoF arm does in 64
+control steps from a random pose moves that cube. The task PPO can actually improve on is the
+reach task, and it is S4d's — see below.
+
+**The plane clamps every single tick.** `envelope_violation_rate` and
+`executed_ne_sampled_rate` both read **1.00** in every one of the 200 iterations. This is the
+finding of the measurement, not a footnote:
+
+* It is structural, not anomalous. The action is a joint **position target**; the plane bounds
+  how far that target may move from the measured joint per control tick (velocity 3.0 rad/s,
+  acceleration 80 rad/s² at 50 Hz). A Gaussian around an untrained network's output commands
+  poses the arm is nowhere near, so every tick is clamped by construction — the same reason the
+  demo's own `deployment.toml` header gives for widening this watchdog from 0.05 to 0.9 at V0.
+* It is why `deployment-rl.toml` widens `max_frac` 0.9 → 1.0. At 0.9 the watchdog latches the
+  fallback within the first seconds of iteration 0, and every later iteration would optimize
+  against a held arm rather than against itself. Widening the envelope is the sanctioned move;
+  disabling the plane is not (INV-12), and every clamp is still counted and still reported.
+* It makes open question 2 concrete rather than hypothetical. **At 1.00 the policy is trained
+  entirely on log-probabilities of actions the env never executed.** Whether to train on the
+  executed action instead is now a question with a measured number behind it, and it is the
+  first thing to ablate once a task with a moving reward exists.
+
+**Oracles.** 1 (`train_rl_dry_run_plan`, the plan golden plus five refusals) passes anywhere; 2
+(`train_rl_two_runs_are_bitwise`, `envs = 4`, `horizon = 16`, 3 iterations, twice) and 3
+(`train_rl_init_from_import`, iteration 0 equals `[init] policy` tensor for tensor) pass on the
+server under `ES_PYTHON`. Two defects they found, both fixed in the trainer rather than papered
+over in the test:
+
+* `samples_per_sec` is dropped from `metrics.json` on the way into `training_hash`. It is a
+  measurement of the machine; leaving it in made two runs of one recipe produce two
+  `training_hash`es, which is exactly what §3.5 tier 1 forbids. It stays in
+  `metrics/loss-curve.json` on disk.
+* the trainer's summary reports *whether* it wrote a value file and loaded init weights, not
+  *where*. An absolute path there is the output directory the caller chose, and it had the same
+  effect on the hash. (`train_act.py` has the same latent issue; no test catches it there, and
+  fixing it is not this packet's scope.)
+
+**Oracle 4 is deferred to S4d.** The reach task of section 5 needs `GetBodyPose` and `Norm` in a
+reward cone, and `es-env`'s `ScalarPlan` lowers neither — it lowers `GetJointState`,
+`GetSensor`, `GetTime`, `Arith`, `Compare`, `Normalize`, `Logic` and `Clamp`, every leaf binds a
+single scalar, and `es_ir_types::Expr` has no square root by design (its doc cites §6.6
+`DET-010`). So −‖cube_pos − gripper_pos‖ has no form to lower *into*, independently of
+`es-env`. Packet **S4d** owns that cone extension and the four `*-reach.toml` documents, and the
+success-rate row of this table is written there. What is measured above is the infrastructure —
+the recipe, the route, the trainer, the plane and the reproducibility — on documents that
+already execute.
+
 ## 8. Open questions for a human
 
 1. Should rollouts model the Deployment IR's declared latency (a chunk buffer in the trainer),

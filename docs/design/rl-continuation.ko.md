@@ -103,6 +103,88 @@ Task IR(`tests/fixtures/rl/task-reach.toml`)은 기존 노드(`GetBodyPose`, `Ar
 
 *(패킷들이 채운다; 모든 행은 서버, 날짜, 경로를 이름 짓는다)*
 
+### S4b — PPO 트레이너, 오라클 서버(Linux, 16코어 CPU), 2026-09-21
+
+산출물: `~/artifacts/plan-s/s4b/` (`untrained.esb`, `run.toml`, `run/`).
+인터프리터: `~/venvs/es-lerobot-cuda/bin/python`, torch 2.11.0+cu129, mujoco 3.13.0.
+문서: `tests/fixtures/visible-learning/task.toml` + `tests/fixtures/rl/`
+{`observation-state.toml`, `learning-state.toml`, `deployment-rl.toml`}, 레시피
+`tests/fixtures/rl/training-rl-demo.toml`.
+
+**경로는 돌고, 재현 가능하다.** `envs = 8`, `horizon = 64`, 200 반복, `seed = 0`, CPU 백엔드:
+
+| | |
+|---|---|
+| 벽시계 | **20.8초** 전체(`es train`), 트레이너 내부 18.4초 |
+| 반복당 | 92 ms (512행 = env 8 x 제어 스텝 64) |
+| 제어 틱 | 12,800 |
+| `identity_hash` | `c07c90aa09b48000…` |
+| `training_hash` | `40da99eaa163a3c7…` |
+| `dataset.lock` | `{"unset": true}` |
+
+`Rollout.metrics()`가 주는 그대로의 §12.4 아홉 지표(`metrics/env-metrics.json`). 이 경로가
+돌리지 않는 도메인은 지어낸 0이 아니라 `null`이고, 단일 `step/s`는 의도적으로 없다.
+
+| 지표 | 값 |
+|---|---|
+| `physics_steps_per_sec` | 45,713 |
+| `actions_per_sec` | 11,428 |
+| `camera_frames_per_sec` | `null` — 이 경로에 렌더러 없음(§4.3) |
+| `pixels_per_sec` | `null` — 위와 같음 |
+| `observation_gb_per_sec` | `null` — `Env`가 계측하지 않음 |
+| `policy_inferences_per_sec` | `null` — 추론은 `Env`가 아니라 트레이너 안에 있음 |
+| `p50_end_to_end_latency` | `null` — 동기 롤아웃, 선언된 지연시간 없음(3절) |
+| `p95_end_to_end_latency` | `null` — 위와 같음 |
+| `gpu_memory_peak` | `null` — CPU 백엔드 |
+| `chunk_underrun_rate` | `null` — horizon 1, 청크 버퍼 없음 |
+
+나머지는 모두 `Target / Status: unverified`.
+
+**비평가는 배우고, 행위자는 여기서 배울 것이 없다.** `value_loss`는 200 반복에 걸쳐 72.0 → 10.5로
+떨어지고(반복 0 / 49 / 99 / 149 / 199: 72.0, 43.6, 29.7, 15.7, 10.5) `return`은 움직이지
+않는다(−42.98 → −46.39, 구간 합의 잡음 범위 안). 이는 기대된 결과이지 트레이너의 결함이 아니다.
+시험 대상 문서는 **데모** 작업이고, 그 보상은 큐브 x 위치의 `Normalize`인데, 무작위 자세에서
+64 제어 스텝 동안 6자유도 팔이 하는 어떤 일도 그 큐브를 옮기지 못한다. PPO가 실제로 개선할 수
+있는 작업은 reach 작업이고, 그것은 S4d의 몫이다 — 아래를 보라.
+
+**플레인은 매 틱을 클램프한다.** `envelope_violation_rate`와 `executed_ne_sampled_rate`가 200
+반복 전부에서 **1.00**으로 읽힌다. 이것이 이 측정의 발견이며 각주가 아니다.
+
+* 이상 현상이 아니라 구조적이다. 행동은 관절 **위치 목표**이고, 플레인은 그 목표가 제어 틱마다
+  측정된 관절에서 얼마나 멀어질 수 있는지를 제한한다(50 Hz에서 속도 3.0 rad/s, 가속도
+  80 rad/s²). 학습되지 않은 신경망 출력 주위의 가우시안은 팔이 근처에도 없는 자세를 명령하므로,
+  매 틱이 구성상 클램프된다. 데모 자신의 `deployment.toml` 헤더가 V0에서 이 워치독을 0.05에서
+  0.9로 넓힌 이유와 같다.
+* 그래서 `deployment-rl.toml`이 `max_frac`을 0.9 → 1.0으로 넓힌다. 0.9에서는 워치독이 반복 0의
+  첫 몇 초 안에 폴백을 래치하고, 이후 모든 반복은 자기 자신이 아니라 붙들린 팔에 대해 최적화하게
+  된다. 엔벨로프를 넓히는 것은 허용된 수이고 플레인을 끄는 것은 아니다(INV-12). 모든 클램프는
+  여전히 세어지고 여전히 보고된다.
+* 열린 질문 2를 가설이 아니라 구체적인 것으로 만든다. **1.00에서 정책은 env가 실행한 적 없는
+  행동의 로그확률만으로 학습된다.** 대신 실행된 행동으로 학습할지는 이제 측정된 숫자가 뒷받침하는
+  질문이고, 보상이 움직이는 작업이 생기는 즉시 가장 먼저 제거 실험할 대상이다.
+
+**오라클.** 1(`train_rl_dry_run_plan`, 계획 골든과 다섯 거절)은 어디서나 통과한다. 2
+(`train_rl_two_runs_are_bitwise`, `envs = 4`, `horizon = 16`, 3 반복, 두 번)와 3
+(`train_rl_init_from_import`, 반복 0이 `[init] policy`와 텐서 단위로 일치)은 서버에서
+`ES_PYTHON` 아래 통과한다. 그 과정에서 찾은 결함 둘은 테스트를 덮는 대신 트레이너에서 고쳤다.
+
+* `samples_per_sec`는 `training_hash`로 가는 길에 `metrics.json`에서 빠진다. 그것은 기계에 대한
+  측정이고, 남겨 두면 같은 레시피의 두 실행이 두 `training_hash`를 만들었다. §3.5 계층 1이 금지하는
+  바로 그것이다. 디스크의 `metrics/loss-curve.json`에는 그대로 남는다.
+* 트레이너 요약은 가치 파일을 썼는지와 init 가중치를 읽었는지를 *여부*로 보고하고 *위치*로 보고하지
+  않는다. 거기에 절대 경로가 있으면 그것은 호출자가 고른 출력 디렉터리이고, 해시에 같은 영향을
+  준다. (`train_act.py`에도 같은 잠복 문제가 있다. 거기서는 잡는 테스트가 없고, 고치는 것은 이
+  패킷의 범위가 아니다.)
+
+**오라클 4는 S4d로 미룬다.** 5절의 reach 작업은 보상 cone 안에서 `GetBodyPose`와 `Norm`을
+필요로 하는데, `es-env`의 `ScalarPlan`은 둘 다 lowering하지 않는다. 그것이 lowering하는 것은
+`GetJointState`, `GetSensor`, `GetTime`, `Arith`, `Compare`, `Normalize`, `Logic`, `Clamp`이고,
+모든 잎은 스칼라 하나를 바인딩하며, `es_ir_types::Expr`에는 설계상 제곱근이 없다(그 문서가 §6.6
+`DET-010`을 인용한다). 따라서 −‖cube_pos − gripper_pos‖는 `es-env`와 무관하게 lowering해 들어갈
+형태 자체가 없다. 패킷 **S4d**가 그 cone 확장과 네 개의 `*-reach.toml` 문서를 소유하며, 이 표의
+성공률 행은 거기서 쓰인다. 위에서 측정된 것은 기반 구조다 — 레시피, 경로, 트레이너, 플레인,
+재현성 — 이미 실행되는 문서 위에서.
+
 ## 8. 사람을 위한 열린 질문
 
 1. 롤아웃이 Deployment IR의 선언된 지연시간을 모델링해야 하는가(트레이너 안의 청크 버퍼),

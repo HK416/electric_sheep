@@ -129,3 +129,71 @@ measured runs are at 8 — raise it with a linearly scaled `--lr` (`--batch 32 -
 
 Needs a Python with `torch` and `torchvision`. `pyarrow` is no longer read here — `es dataset
 bake` does the dataset reading, in Rust.
+
+## `train_ppo.py`
+
+The sibling of `train_act.py` and the other half of the spec 2.3 split: PPO against the Task
+IR's reward, over rollouts in **our** `Env` and through **our** Safety Plane (M8/S4b, design
+note `docs/design/rl-continuation.md`). Like `train_act.py` it owns the optimizer and nothing
+above it, it `exec`s the `es_policy.py` that `es policy lower` wrote, and it **defines no
+layer** for the policy — the architecture comes from the Learning IR or it does not come.
+
+Normally you never call it: `es train` does, from an `[rl]` recipe.
+
+```
+es train --recipe tests/fixtures/rl/training-rl-demo.toml --out runs/rl-001
+```
+
+By hand, the plan `--dry-run` prints:
+
+```
+es policy lower --policy untrained.esb --out build/
+<venv>/bin/python python/es/train_ppo.py --module build/ --rollout-docs docs/ \
+    --out weights/model.safetensors --value-out training/value.safetensors \
+    --iterations 200 --envs 8 --horizon 64 --epochs 4 --minibatches 4 \
+    --gamma 0.99 --lam 0.95 --clip 0.2 --entropy 0.005 --value-coef 0.5 \
+    [--init-log-std -0.5] [--init-weights init.safetensors] \
+    [--lr 3e-4] [--seed 0] [--device cpu] [--grad-clip F] \
+    [--checkpoint-at 0,50,200] [--loss-curve metrics/loss-curve.json] [--progress-every N]
+es policy pack --policy untrained.esb --weights weights/model-200.safetensors --out trained.esb
+```
+
+`--rollout-docs` is **one directory**, not four paths: `task.toml`, `observation.toml`,
+`deployment.toml` and `scene.xml`, as `es train` writes them out of the policy bundle. They
+come from one bundle on purpose — a trainer stepping an env declared by anything but the
+policy's own documents measures a different thing than the evaluation will.
+
+What it defines, and what it deliberately does not:
+
+- **the Gaussian** is around the module's own output, in actuator units:
+  `a = mu + exp(log_std) * eps`, with `log_std` state-independent and training-only. This is
+  rsl_rl's model, not brax's `NormalTanhDistribution`; the difference is recorded in the design
+  note's section 2 and is why a brax import is reproduced exactly by S2b but *continued* under
+  our distribution;
+- **the value MLP** (two hidden layers of 64, tanh) over the concatenation of the Observation
+  IR's output ports. It is not an IR node and never becomes one: PPO needs a baseline, the
+  baseline is not deployed, and a `LearningNode` for it would put a tensor into `policy_hash`
+  that no deployment ever evaluates. It goes to `--value-out` — under `training/`, never into a
+  bundle, and `es policy pack` would refuse the keys anyway;
+- **no simulator of its own.** Every step is `es_native.Rollout`, so every sampled action goes
+  through `SafetyPlane::validate` before the actuator and there is no flag here that changes
+  that (`INV-12`). How often the plane clamped is a column of the loss curve, not a secret:
+  `envelope_violation_rate` and `executed_ne_sampled_rate`;
+- **no format that can execute code on load** (`INV-16`). The safetensors reader and writer are
+  `train_act.py`'s own two functions, imported rather than copied.
+
+Determinism is the point of the CPU path: `torch.use_deterministic_algorithms(True)`, one
+seeded generator for the action noise and one for the minibatch order, and the env's RNG seeded
+through `Rollout(seed=...)`. Two runs of one recipe give bitwise-equal checkpoints and one
+`training_hash` — `crates/es/tests/cli.rs::train_rl_two_runs_are_bitwise` is the oracle.
+
+Needs a Python with `torch`, `mujoco` **and the `es_native` extension** (the `maturin develop`
+line at the top of this file); `ES_PYTHON` names it. The oracles:
+
+```
+ES_PYTHON=<venv>/bin/python cargo test -p es --test cli train_rl
+```
+
+`train_rl_dry_run_plan` runs anywhere; `train_rl_two_runs_are_bitwise` and
+`train_rl_init_from_import` print `SKIP <reason>` when `ES_PYTHON` is unset or cannot import
+what the route needs, and run for real when it can.

@@ -130,3 +130,70 @@ es policy pack --policy untrained.esb --weights model.safetensors --out trained.
 
 `torch`와 `torchvision`이 설치된 Python이 필요하다. `pyarrow`는 더 이상 여기서 읽지 않는다 —
 데이터셋 읽기는 `es dataset bake`가 Rust로 한다.
+
+## `train_ppo.py`
+
+`train_act.py`의 형제이자 spec 2.3 분할의 나머지 절반이다. Task IR의 보상에 대해 PPO를 돌리되,
+롤아웃은 **우리** `Env`에서, **우리** Safety Plane을 통과해서 한다 (M8/S4b, 설계 노트
+`docs/design/rl-continuation.md`). `train_act.py`와 마찬가지로 옵티마이저만 소유하고 그 위의
+어떤 것도 소유하지 않으며, `es policy lower`가 쓴 `es_policy.py`를 `exec`하고, 정책을 위한
+**레이어를 하나도 정의하지 않는다**. 아키텍처는 Learning IR에서 오거나 오지 않는다.
+
+보통은 직접 부를 일이 없다. `[rl]` 레시피로부터 `es train`이 부른다.
+
+```
+es train --recipe tests/fixtures/rl/training-rl-demo.toml --out runs/rl-001
+```
+
+손으로 부른다면, `--dry-run`이 인쇄하는 계획은 이렇다.
+
+```
+es policy lower --policy untrained.esb --out build/
+<venv>/bin/python python/es/train_ppo.py --module build/ --rollout-docs docs/ \
+    --out weights/model.safetensors --value-out training/value.safetensors \
+    --iterations 200 --envs 8 --horizon 64 --epochs 4 --minibatches 4 \
+    --gamma 0.99 --lam 0.95 --clip 0.2 --entropy 0.005 --value-coef 0.5 \
+    [--init-log-std -0.5] [--init-weights init.safetensors] \
+    [--lr 3e-4] [--seed 0] [--device cpu] [--grad-clip F] \
+    [--checkpoint-at 0,50,200] [--loss-curve metrics/loss-curve.json] [--progress-every N]
+es policy pack --policy untrained.esb --weights weights/model-200.safetensors --out trained.esb
+```
+
+`--rollout-docs`는 네 개의 경로가 아니라 **디렉터리 하나**다. `task.toml`, `observation.toml`,
+`deployment.toml`, `scene.xml`이고, `es train`이 정책 번들에서 꺼내 쓴다. 한 번들에서 나오는 것이
+의도다. 정책 자신의 문서가 아닌 무언가가 선언한 env를 스텝하는 트레이너는 평가가 측정할 것과
+다른 것을 측정한다.
+
+무엇을 정의하고, 무엇을 의도적으로 정의하지 않는가:
+
+- **가우시안**은 모듈 자신의 출력 주위에, 액추에이터 단위로 놓인다.
+  `a = mu + exp(log_std) * eps`이고 `log_std`는 상태 독립이며 학습 전용이다. 이것은 rsl_rl의
+  모델이지 brax의 `NormalTanhDistribution`이 아니다. 그 차이는 설계 노트 2절에 기록되어 있고,
+  brax import가 S2b에서 정확히 재현되면서도 *이어서 학습*할 때는 우리 분포를 따르는 이유다;
+- **가치 MLP** (은닉 64 두 층, tanh)는 Observation IR 출력 포트들의 연결 위에 놓인다. 그것은 IR
+  노드가 아니고 앞으로도 되지 않는다. PPO에는 baseline이 필요하고, baseline은 배포되지 않으며,
+  그것을 위한 `LearningNode`는 어떤 배포도 평가하지 않는 텐서를 `policy_hash`에 넣게 된다.
+  `--value-out`으로 나가며, `training/` 아래에 있고 번들에는 들어가지 않는다. 어차피
+  `es policy pack`이 그 키들을 거절한다;
+- **자기 자신의 시뮬레이터는 없다.** 모든 스텝은 `es_native.Rollout`이고, 따라서 샘플된 모든
+  행동은 액추에이터에 닿기 전에 `SafetyPlane::validate`를 지나며, 여기에 그것을 바꾸는 플래그는
+  없다(`INV-12`). 플레인이 얼마나 자주 클램프했는지는 비밀이 아니라 손실 곡선의 열이다.
+  `envelope_violation_rate`와 `executed_ne_sampled_rate`;
+- **로드 시 코드를 실행할 수 있는 포맷은 읽지도 쓰지도 않는다**(`INV-16`). safetensors 리더와
+  라이터는 `train_act.py`의 함수 둘을 복사하지 않고 import해서 쓴다.
+
+CPU 경로에서는 결정성이 핵심이다. `torch.use_deterministic_algorithms(True)`, 행동 잡음용 시드된
+생성기 하나와 미니배치 순서용 하나, 그리고 `Rollout(seed=...)`을 통해 시드된 env의 RNG. 한
+레시피의 두 실행은 비트 단위로 같은 체크포인트와 하나의 `training_hash`를 준다 —
+`crates/es/tests/cli.rs::train_rl_two_runs_are_bitwise`가 그 오라클이다.
+
+`torch`, `mujoco`, 그리고 **`es_native` 확장**이 있는 Python이 필요하다(이 문서 위쪽의
+`maturin develop` 한 줄). `ES_PYTHON`이 그것을 가리킨다. 오라클은 이렇다.
+
+```
+ES_PYTHON=<venv>/bin/python cargo test -p es --test cli train_rl
+```
+
+`train_rl_dry_run_plan`은 어디서나 돌고, `train_rl_two_runs_are_bitwise`와
+`train_rl_init_from_import`는 `ES_PYTHON`이 없거나 필요한 것을 import하지 못하면
+`SKIP <이유>`를 인쇄하고, 가능하면 실제로 돈다.

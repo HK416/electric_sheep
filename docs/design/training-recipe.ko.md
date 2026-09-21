@@ -1276,3 +1276,124 @@ GPU-초를 쓰기 전에 — 패킷이 그것을 "`es policy lower` 뒤"라고 �
 `~/artifacts/plan-s/s1/`에 보관: `training-s1.toml`, `train.log`, 그리고 `run/`(baked 세트,
 `module/`, `training/`의 열두 슬롯과 `init.lock`, `training.lock`,
 `weights/init.safetensors`, `weights/model-0.safetensors`, `checkpoints/0.esb`).
+
+## 15. RL 경로 (패킷 M8/S4b)
+
+1~14절은 학습의 한 가지 모양을 설명한다. 시연 데이터셋, 그것을 맞추는 옵티마이저, 그리고 어느
+시연이었는지 말하는 `dataset.lock`. PPO에는 그 셋이 모두 없다. 데이터는 스스로 만들어내는
+롤아웃이고, 신호는 Task IR의 보상이며, 이 명령에서 필요한 것은 bake가 아니라 env다. 그래서
+`[rl]`은 `ir`과 `external` 옆의 세 번째 경로이고, 그 대부분은 두 번째 `es train`이 아니라 기존
+두 경로의 기계장치를 재사용한 것이다.
+
+### 15.1 레시피가 테이블 하나를 얻는다
+
+```toml
+kind = "training"
+
+[policy]
+bundle = "runs/rl-001/untrained.esb"
+
+[rl]
+algo        = "ppo"
+envs        = 8       # 시뮬레이션 배치
+horizon     = 64      # 반복당 env당 제어 스텝
+epochs      = 4       # 반복이 모은 행에 대한 패스 수
+minibatches = 4       # epoch당. envs * horizon을 나누어떨어져야 한다
+gamma       = 0.99
+lam         = 0.95    # GAE
+clip        = 0.2
+entropy     = 0.005
+value_coef  = 0.5
+# init_log_std = -0.5   # 선택. 없으면 -0.5, 또는 [init]을 통한 importer 자신의 값
+
+[run]
+steps         = 200   # PPO 반복 횟수
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [50]
+device        = "cpu"
+```
+
+`tests/fixtures/rl/training-rl-demo.toml`이 커밋된 예시이고 `tests/golden/train/plan-rl.txt`가
+그 계획이다. 둘 다 **추가**다. 이 패킷 이전에 있던 네 레시피와 세 골든은 손대지 않았고, 그것들이
+지니는 모든 해시도 그대로다.
+
+여기서 다르게 동작하는 필드가 셋이고, 각각은 조용히 읽히는 대신 이름을 대고 거절한다.
+
+* **`[dataset]`은 선택 항목이다.** 디스크에 이름 붙일 것이 없으므로 `training/dataset.lock`은
+  `{"unset": true}`를 담고 그대로 해싱된다. 영(zero) 다이제스트도, 지어낸 값도 아니다
+  (§28.10 규칙 2). 다른 두 경로에서 `[dataset]`이 없으면 여전히 이름을 대고 거절한다.
+* **`[run] batch`는 이름을 대고 거절한다.** PPO 반복의 배치는 `envs * horizon`이고 유도된다.
+  레시피에 그 사본을 하나 더 두는 것은 실제 사용된 값과 어긋날 수 있는 숫자이고, 거절 메시지는
+  유도된 값이 무엇이었을지를 말해 준다.
+* **`[run] checkpoint_at`은 `0`을 담을 수 있다.** 마크 0은 "첫 갱신 이전"이며, 이어서 학습하는
+  실행이 판정받는 상태다. 시연 기반 두 경로에서 그 상태는 `steps = 0` 실행에만 존재하지만
+  (14절), `[rl]` 실행은 반복 1로 가는 길에 그 상태를 지나간다.
+
+`[run]`의 나머지는 의미가 그대로다. `steps`는 반복 횟수이고, `seed`, `device`, `lr`,
+`grad_clip`, `weight_decay`, `schedule`, `extra`는 `train_act.py`에 닿던 것과 같은 플래그로
+`train_ppo.py`에 닿는다.
+
+### 15.2 계획
+
+```
+# route: rl
+es policy lower --policy runs/rl-001/untrained.esb --out module
+python python/es/train_ppo.py --module module --rollout-docs docs \
+    --out weights/model.safetensors --value-out training/value.safetensors \
+    --checkpoint-at 50,200 --iterations 200 --seed 0 --lr 0.0003 --device cpu \
+    --loss-curve metrics/loss-curve.json --envs 8 --horizon 64 --epochs 4 \
+    --minibatches 4 --gamma 0.99 --lam 0.95 --clip 0.2 --entropy 0.005 --value-coef 0.5
+es policy pack --policy runs/rl-001/untrained.esb --weights weights/model-50.safetensors --out checkpoints/50.esb
+es policy pack --policy runs/rl-001/untrained.esb --weights weights/model-200.safetensors --out checkpoints/200.esb
+```
+
+bake가 없다. 데이터셋이 없기 때문이다. `es_native.Rollout`이 제어 스텝마다 정책 자신의
+`CpuPlan`을 한 번 돌리고, 그것은 `es eval run`이 추론 시점에 돌리는 바로 그 plan이다. lower와
+pack 단계는 IR 경로의 것을 글자 그대로 쓴다. 같은 `es policy lower`, `es policy pack`의 같은
+신뢰 경계, 같은 `checkpoints/<mark>.esb`.
+
+**`--rollout-docs`는 디렉터리이고, 그것을 쓰는 것은 `es train`이다.** 계획이 돌기 전에 셸이
+Task·Observation·Deployment IR을 *번들에서 꺼내* `<out>/docs/{task,observation,deployment}.toml`로
+다시 직렬화하고, Task IR이 가리키는 씬을 `<out>/docs/scene.xml`로 복사한다. 그러면 트레이너는
+자족적인 디렉터리 하나를 받는다. 여기서 두 가지가 따라오고 둘 다 핵심이다. 스텝되는 env는 정책이
+선언된 그 env이며(레시피 필드가 어쩌다 가리킨 것이 아니라), `--dry-run`은 여전히 번들을 열지
+않으므로 골든은 저장소만 있는 기계에서도 판정 가능한 채로 남는다.
+
+### 15.3 RL 실행의 `training/`에 무엇이 들어가는가
+
+열두 슬롯은 그대로 열두 슬롯이다. 그중 넷이 다르게 읽힌다.
+
+| 슬롯 | RL 경로 |
+|---|---|
+| `config.json` | 레시피 전체를 직렬화하므로 `[rl]` 테이블을 그대로 싣는다 |
+| `dataset.lock` | `{"unset": true}` |
+| `optimizer.json` | `Adam`, `declared_by: train_ppo.py`. `AdamW`가 아니고 decay 기본값은 torch의 `0.0` |
+| `base_model.lock` | `{"source": "none"}`. `[policy] base_model`은 `VisionEncoder`를 필요로 한다 |
+
+여기에 슬롯이 **아닌** 파일이 하나 더해진다. `training/value.safetensors`, 곧 가치 MLP와
+가우시안의 `log_std`다. 이어서 학습하기 위해 기록되며 번들로 packing되지 않는다. 그리고 될 수도
+없다. lowering된 모듈이 그런 텐서를 선언하지 않고 `es policy pack`은 모르는 키를 거절하기
+때문이다. 그것이 `rl-continuation.md` 규칙 1의 구조적 절반이다. PPO는 트레이너이지 IR이 아니다.
+
+`metrics/loss-curve.json`은 반복마다 객체 하나이며 `loss`, `policy_loss`, `value_loss`,
+`entropy`, `return`, `episode_len`, `envelope_violation_rate`, `executed_ne_sampled_rate`,
+`samples_per_sec`를 담는다. 마지막 것은 `training_hash`로 들어가는 길에 `metrics.json`에서
+빠진다. 그것은 기계에 대한 측정이고, 더 빠른 상자에서 돌린 같은 레시피는 같은 실행이기
+때문이다. 그 숫자는 사람이 읽는 디스크상의 파일에 남고, 그것이 묘사하는 기계는 `hardware.json`의
+몫이다. 그 옆의 `metrics/env-metrics.json`은 `Rollout::metrics()`가 주는 그대로 §12.4의 아홉
+필드를 담으며, 같은 이유로 같은 취급을 받는다. 이 경로가 돌리지 않는 도메인은 지어낸 0이 아니라
+`null`로 남고, 단일 `step/s`는 의도적으로 없다.
+
+### 15.4 플레인은 켜져 있고, 그것이 한 일은 열(column)이다
+
+샘플링된 모든 행동은 액추에이터에 닿기 전에 `SafetyPlane::validate`를 지나가며, 프로세스 경계
+어느 쪽에도 그것을 바꾸는 플래그는 없다(INV-12). 플레인이 한 일도 숨겨지지 않는다.
+`envelope_violation_rate`는 이벤트를 얼마나 자주 올렸는지이고 `executed_ne_sampled_rate`는
+액추에이터에 닿은 것이 샘플된 것과 얼마나 자주 달랐는지다. 데모 작업에서 둘 다 `1.00`으로
+읽힌다. `rl-continuation.md` 7절을 보라. 거기서 그 숫자는 각주가 아니라 발견이다.
+
+`tests/fixtures/rl/deployment-rl.toml`은 이를 위해 워치독 하나만 넓힌다
+(`envelope_violation_rate.max_frac` 0.9 → 1.0). 그리고 horizon 1 제어가 강제하는 세 필드를
+옮긴다(`action.horizon`, `action.execute_chunk`, `rate.inference`). 모든 안전 한계는 데모 자신의
+숫자 그대로다. 엔벨로프를 넓히는 것은 허용된 수이고, 플레인을 끄는 것은 아니다.
