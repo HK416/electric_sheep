@@ -1053,6 +1053,12 @@ sys.stdout.write(
 #[test]
 #[ignore = "golden generator; run explicitly with ES_PYTHON"]
 fn generate_lr_golden() {
+    // Spec 1.4: goldens and fixtures are CI read-only, and `cargo test -- --include-ignored`
+    // runs every ignored test; a generator must refuse to run by accident (M7 review).
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP generate_lr_golden: set ES_GENERATE_GOLDENS=1 to regenerate");
+        return;
+    }
     let python = python_with_torch().expect("the generator needs an interpreter");
     let (total, lr, lr_min, warmup, count) = (20000u32, 4e-4, 1e-6, 250u32, 1000usize);
     let probe = run(

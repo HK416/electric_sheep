@@ -130,6 +130,12 @@ fn run_mosaic(m: &Mosaic) -> Output {
 #[test]
 #[ignore = "fixture/golden generator; run explicitly"]
 fn generate_fixture_and_golden() {
+    // Spec 1.4: goldens and fixtures are CI read-only, and `cargo test -- --include-ignored`
+    // runs every ignored test; a generator must refuse to run by accident (M7 review).
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP generate_fixture_and_golden: set ES_GENERATE_GOLDENS=1 to regenerate");
+        return;
+    }
     let frames_root = fixture_frames_dir();
     std::fs::create_dir_all(&frames_root).expect("frames dir");
     let mut sources: BTreeMap<String, Vec<&str>> = BTreeMap::new();

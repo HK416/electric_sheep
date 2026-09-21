@@ -250,6 +250,12 @@ fn an_absent_body_keeps_its_scene_pose() {
 #[test]
 #[ignore = "golden generator; run explicitly"]
 fn generate_so101_golden() {
+    // Spec 1.4: goldens and fixtures are CI read-only, and `cargo test -- --include-ignored`
+    // runs every ignored test; a generator must refuse to run by accident (M7 review).
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP generate_so101_golden: set ES_GENERATE_GOLDENS=1 to regenerate");
+        return;
+    }
     let tile = cpu_tile(&scene());
     tile.write_to(&golden_dir(), GOLDEN).expect("write golden");
     println!(
