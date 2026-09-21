@@ -3921,6 +3921,8 @@ U0–U3가 돌아간 평가기가 내놓는 숫자에 대고 보면 U3는 V18b�
 | **U2** | `learning.toml` | `observation-augmented.toml` | T6의 자체 실행, 재학습 안 함 | 0.1875 | 0.0625 | 0.4279 | false |
 | **U3** | `learning-pretrained.toml` | `observation-augmented.toml` | `es train` | **0.5625** | **0.5625** | 0.6668 | **true** |
 
+패킷 M7/R5가 다섯 번째 행 **U4** — 관측을 래스터화 대신 패스 트레이싱한 U3 — 를 [section 7.32](#732-as-built-m7r5-row-u4--같은-정책을-패스-트레이싱된-관측-위에서)에 더한다. *다른* 문서 집합이므로(`Pt` 센서는 `task_hash`를 움직인다) 체인이 아니라 판단으로 이 표를 늘린다. U2/U3이 U0/U1을 늘리는 것과 정확히 같다.
+
 **여섯 스위트 스윕, held-out 시드** (`success_rate` / `envelope_violation_rate` / 평균
 `episode_length`. `nominal` 행이 위 표의 held-out 열이다 — 커밋된 `evaluation.toml`은 문서
 하나이고 그 nominal 스위트가 곧 held-out 측정이기 때문이다):
@@ -4096,6 +4098,62 @@ U1 → U3는 nominal에서 +0.5625다. 이것은 7.29절을 뒤집지 **않는�
 스위트에서 낫고, 거기 도달하는 데 2×2가 필요하지도 않았다. 그리고 7.28절을 다시 열지도
 않는다 — 그 문장은 7.30절이 다시 날짜를 매긴 채로 남는다. U3가 세우는 것은 *다른* Observation
 IR 위에서, 7.28절에는 없던 지연 모델 아래에서 성립하는 *같은* 주장이다.
+
+### 7.32 As built (M7/R5): row U4 — 같은 정책을 패스 트레이싱된 관측 위에서
+
+패킷 `docs/packets/M7/R5-pt-observations.md`; 렌더러 쪽은 `renderer.ko.md` section 12이다. 이제 Task IR의 센서가 자기를 어떤 렌더러가 그리는지 말할 수 있으므로, U3의 구성을 한 가지만 바꿔서 — 96×96 프레임이 어떻게 만들어졌는지 — 다시 돌리고 `success_rate`를 그 옆에서 읽을 수 있다.
+
+**문서들.** `task-pt.toml`은 커밋된 `task.toml`에 `rgb_overhead` 센서의 `render = { path = "pt", spp = 64, bounces = 3, exposure = 64, tonemap = "reinhard" }`를 더한 것이고 **그 외에는 아무것도 아니다**; 커밋된 `task_hash eb6efefa…`는 움직이지 않는다. 부재하거나 기본값인 `render`가 바이트 단위로 오늘의 정규형이기 때문이다(`cargo test -p es-ir committed_task_hash_is_unmoved_by_sensor_render`).
+
+| 문서 | 해시 | 비고 |
+|---|---|---|
+| `task-pt.toml` | **`d546b808…`** | 커밋된 태스크, 센서 하나가 `Pt` |
+| `observation-pt.toml` | `7caac85d…` | `observation.toml`의 그래프, `task_ref` 재지정 |
+| `evaluation-pt.toml` | **`dafc8ce6…`** | `evaluation.toml`의 held-out 16 시드 × 6 스위트 |
+| `observation-augmented-pt.toml` (서버) | `e5e72c5a…` | T6의 그래프, `task_ref` 재지정 |
+| U4의 Evaluation IR (서버) | *아래 참조* | 이 행 자신의 `evaluation_hash` |
+
+**왜 셋이 아니라 다섯인가.** `ObservationIr::task_ref`는 해시 입력이고 `XIR_001`이 그것을 태스크 자신의 해시와 같게 요구하므로 **하나의 관측 IR이 두 Task IR을 섬길 수 없다**(`renderer.ko.md` 12.2). §7.4의 "여러 관측 IR이 하나의 `task_hash`를 공유한다"에는 거울상이 없고, 따라서 `Pt` 태스크는 그래프의 모든 노드가 복사본임에도 하류 문서 집합 전체를 다시 발행한다. 렌더러 변경에 대해 해시 체인이 매기는 값이고, 이 패킷이 그것을 지불한 첫 패킷이다.
+
+**노출은 패킷의 기본값이 아니라 결정이다.** 중립인 `exposure = 1.0`에서 패스 트레이싱된 관측의 평균 바이트는 래스터화된 관측의 188 대비 34다 — 데모 셀에는 발광 패널 하나뿐이고 `Pt` 경로에는 방향광이 없다. `64`는 평균 바이트(184)가 래스터라이저의 것과 맞는 스윕 단이므로, U4는 밝기 차이가 아니라 렌더 경로를 측정한다(`renderer.ko.md` 12.6).
+
+**비용, 측정됨**(`renderer.ko.md` 12.4): 96×96, 64 spp, 3 bounces, 업로드와 리드백을 포함한 프레임 전체 — **RTX 4090에서 57.50 ms/frame**, **RTX 3060에서 127.53 ms/frame**, `Rs`의 2.90 / 2.77 대비. 패킷의 "오라클 서버에서 ~3 ms"는 19배 틀렸고, 그것이 5분짜리 수집과 36분짜리 수집의 차이다.
+
+**SSIM, 측정됨**(`renderer.ko.md` 12.5): 커밋된 `nominal-00.estraj`의 같은 32틱에 대해 관측 해상도에서 `Rs` 대 `Pt` — **평균 0.3547, 최소 0.3035, 최대 0.4227**, 두 카드에서 소수 넷째 자리까지 동일. 정책이 실제로 읽는 크기에서 얻은 첫 §15.3 숫자이고, section 10.4의 결론을 바꾸지 않는다: 여기서 임계값을 세우지 않는다.
+
+#### 그 행
+
+| row | Learning IR | Observation IR | Task IR | 학습 | held-out `success_rate` |
+|---|---|---|---|---|---|
+| **U3** | `learning-pretrained.toml` | `observation-augmented.toml` | `task.toml` (`Rs`) | `es train` | **0.5625** |
+| **U4** | `learning-pretrained.toml` | `observation-augmented-pt.toml` | `task-pt.toml` (`Pt`) | `es train` | `Target / Status: unverified` |
+
+**이 패킷이 닫힐 때 U4는 아직 돌고 있었고, 숫자는 의도적으로 추측하지 않았다.** 작업은 오라클 서버(RTX 4090, 유휴 카드: `nvidia-smi` 컴퓨트 프로세스 없음, 1분 부하 0.56)에서 2026-09-21 07:43에 `nohup ~/artifacts/plan-v/m7-r5/r5.sh &`로, 커밋 `16f1b6f`의 트리 `~/Projects/es-r5`에서 시작되었고 아래 세 단계를 연달아 실행한다. 산출물은 모두 **`~/artifacts/plan-v/m7-r5/`** 아래에 떨어지고, 각 단계가 `<stage>.start` / `.end`(유닉스 초), `<stage>.log`, `<stage>.done`을 쓰므로 어디까지 갔는지 읽을 수 있다:
+
+```
+# 1. 패스 트레이싱된 프레임으로 전문가 시연 200개 (57.5 ms/frame로 약 36분)
+es loop collect --policy ~/artifacts/plan-v/m7-r5/untrained-pt.esb \
+  --scene tests/fixtures/mjcf/so101_pick_place.xml --episodes 200 --seed 1 \
+  --expert so101-pick-place --out ~/artifacts/plan-v/m7-r5/ds-train-pt \
+  --frames ~/artifacts/plan-v/m7-r5/frames-train-pt
+
+# 2. 그 프레임 위에서 U3의 설정 (약 4분; tests/fixtures/visible-learning/training-u4.toml)
+es train --recipe tests/fixtures/visible-learning/training-u4.toml \
+  --out ~/artifacts/plan-v/m7-r5/U4/train
+
+# 3. held-out 16 시드 × 6 스위트, 그다음 학습 시드 16개
+es eval run --config ~/artifacts/plan-v/m7-r5/evaluation-augmented-pt.toml \
+  --policy ~/artifacts/plan-v/m7-r5/U4/train/checkpoints/20000.esb \
+  --scene tests/fixtures/mjcf/so101_pick_place.xml \
+  --out ~/artifacts/plan-v/m7-r5/U4/holdout --jobs 6 \
+  --frames ~/artifacts/plan-v/m7-r5/U4/frames-holdout
+es eval run --config ~/artifacts/plan-v/m7-r5/eval-trainseeds-augmented-pt.toml ... \
+  --out ~/artifacts/plan-v/m7-r5/U4/trainseeds --jobs 6 ...
+```
+
+`success_rate`, `envelope_violation_rate`, `episode_length`, `passed`는 `~/artifacts/plan-v/m7-r5/U4/holdout/report.json`에 있고, 이 행의 `evaluation_hash`와 `execution_hash`도 같은 파일과 그 옆의 `evaluation.lock`에 있다. **평가 단계가 비싼 쪽이다**: 최대 1,800틱짜리 에피소드 96개 × 57.5 ms/frame은 분이 아니라 시간이고, 프로세스 하나가 이미 GPU를 93 %로 잡고 있으므로 `--jobs 6`이 `Rs` 경로에서만큼 벌어 주지 않는다. 원시 프레임 트리는 숫자를 읽은 뒤 지우라고 만든 것이다.
+
+**숫자가 오기 전에 그림이 이미 말하는 것.** `target/plan-u/r5/contact-sheet.png`는 시연 하나 전체(시드 1, 511틱)를 두 번 수집한 것으로 위가 `Rs`, 아래가 `Pt`이며, 두 실행 모두 같은 데이터셋 `content` 다이제스트 `ef2e904d…`를 보고한다 — 같은 상태를 두 가지로 그린 것이다. 64 spp에서 패스 트레이싱된 관측은 **눈에 띄게 거칠고**, 그 거칠기는 결정론적이므로(고정 `seed`, 픽셀로 주소 지정되는 샘플 키) 정책이 에포크를 거치며 평균 내어 없앨 수 있는 잡음이 아니라 포즈마다 고정된 텍스처다. U4가 U3 아래로 떨어진다면 가장 먼저 볼 것이 그것이고, `spp`가 `SensorRender`의 필드인 이유가 정확히 그것이다 — 다음 실행은 코드 한 줄 건드리지 않고 그것을 바꿀 수 있다.
 
 ## 8. 안전 오버레이 (V3)
 

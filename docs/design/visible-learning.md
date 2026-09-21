@@ -4198,6 +4198,11 @@ re-archived at **`7c9d954`** (T6 landed in between), `cargo build --release --fe
 | **U2** | `learning.toml` | `observation-augmented.toml` | T6's own run, not re-run | 0.1875 | 0.0625 | 0.4279 | false |
 | **U3** | `learning-pretrained.toml` | `observation-augmented.toml` | `es train` | **0.5625** | **0.5625** | 0.6668 | **true** |
 
+Packet M7/R5 adds a fifth row, **U4** — U3 again with the observations path-traced rather than
+rasterized — in [section 7.32](#732-as-built-m7r5-row-u4--the-same-policy-on-path-traced-observations).
+It is a *different* set of documents (a `Pt` sensor moves `task_hash`), so it extends the table
+by judgement and not by the chain, exactly as U2/U3 extend U0/U1.
+
 **The six-suite sweep, held-out seeds** (`success_rate` / `envelope_violation_rate` / mean
 `episode_length`; the `nominal` row is the held-out column above, because the committed
 `evaluation.toml` is one document and its nominal suite *is* the held-out measurement):
@@ -4385,6 +4390,102 @@ overturn section 7.29: the external ACT is still better on every suite, and it d
 2×2 to get there. And it does not re-open section 7.28 — that sentence stays re-dated by
 section 7.30; what U3 establishes is the *same* claim on a *different* Observation IR, under a
 latency model 7.28 did not have.
+
+### 7.32 As built (M7/R5): row U4 — the same policy on path-traced observations
+
+Packet `docs/packets/M7/R5-pt-observations.md`; the renderer side is `renderer.md` section 12.
+A Task IR sensor can now say which renderer draws it, so U3's configuration can be run again
+with one thing changed — how the 96×96 frames were made — and `success_rate` read beside it.
+
+**The documents.** `task-pt.toml` is the committed `task.toml` with
+`render = { path = "pt", spp = 64, bounces = 3, exposure = 64, tonemap = "reinhard" }` on the
+`rgb_overhead` sensor and **nothing else**; the committed `task_hash eb6efefa…` is unmoved,
+because an absent or default `render` is byte for byte today's canonical form
+(`cargo test -p es-ir committed_task_hash_is_unmoved_by_sensor_render`).
+
+| document | hash | note |
+|---|---|---|
+| `task-pt.toml` | **`d546b808…`** | the committed task, `Pt` on its one sensor |
+| `observation-pt.toml` | `7caac85d…` | `observation.toml`'s graph, `task_ref` retargeted |
+| `evaluation-pt.toml` | **`dafc8ce6…`** | `evaluation.toml`'s 16 held-out seeds × 6 suites |
+| `observation-augmented-pt.toml` (server) | `e5e72c5a…` | T6's graph, `task_ref` retargeted |
+| U4's Evaluation IR (server) | *see below* | the row's own `evaluation_hash` |
+
+**Why there are five and not three.** `ObservationIr::task_ref` is hash input and `XIR_001`
+requires it to equal the task's own hash, so **one Observation IR cannot serve two Task IRs**
+(`renderer.md` 12.2). §7.4's "several Observation IRs share one `task_hash`" has no mirror
+image, and a `Pt` task therefore re-issues the whole downstream document set even though every
+node of the graph is a copy. That is the hash chain charging for a renderer change, and this is
+the first packet to pay it.
+
+**The exposure is a decision, not the packet's default.** At the neutral `exposure = 1.0` the
+path-traced observation has mean byte 34 against the rasterized observation's 188 — the demo
+cell has one emissive panel and no directional light on the `Pt` path. `64` is the sweep rung
+whose mean byte (184) matches the rasterizer's, so U4 measures a render path and not a
+brightness difference (`renderer.md` 12.6).
+
+**Cost, measured** (`renderer.md` 12.4): 96×96, 64 spp, 3 bounces, whole frame including
+upload and readback — **57.50 ms/frame on the RTX 4090** and **127.53 ms/frame on an RTX
+3060**, against `Rs`'s 2.90 / 2.77. The packet's "~3 ms on the oracle server" was wrong by 19×,
+which is the difference between a 5-minute collection and a 36-minute one.
+
+**SSIM, measured** (`renderer.md` 12.5): `Rs` against `Pt` on the same 32 ticks of the
+committed `nominal-00.estraj`, at observation resolution — **mean 0.3547, min 0.3035, max
+0.4227**, identical to four decimals on both cards. It is the first §15.3 number taken at the
+size a policy actually reads, and it does not move the conclusion of section 10.4: no threshold
+is set from it.
+
+#### The row
+
+| row | Learning IR | Observation IR | Task IR | trained | held-out `success_rate` |
+|---|---|---|---|---|---|
+| **U3** | `learning-pretrained.toml` | `observation-augmented.toml` | `task.toml` (`Rs`) | `es train` | **0.5625** |
+| **U4** | `learning-pretrained.toml` | `observation-augmented-pt.toml` | `task-pt.toml` (`Pt`) | `es train` | `Target / Status: unverified` |
+
+**U4 was still running when this packet closed, and the numbers are deliberately not guessed.**
+The job was launched on the oracle server (RTX 4090, idle card: `nvidia-smi` no compute process,
+1-min load 0.56) at 2026-09-21 07:43 as
+`nohup ~/artifacts/plan-v/m7-r5/r5.sh &`, from the tree `~/Projects/es-r5` at commit
+`16f1b6f`, and it runs the three stages below back to back. Everything it produces lands under
+**`~/artifacts/plan-v/m7-r5/`**, and each stage writes `<stage>.start` / `.end` (unix seconds),
+`<stage>.log` and `<stage>.done`, so a reader can tell where it got to:
+
+```
+# 1. 200 expert demonstrations with path-traced frames (~36 min at 57.5 ms/frame)
+es loop collect --policy ~/artifacts/plan-v/m7-r5/untrained-pt.esb \
+  --scene tests/fixtures/mjcf/so101_pick_place.xml --episodes 200 --seed 1 \
+  --expert so101-pick-place --out ~/artifacts/plan-v/m7-r5/ds-train-pt \
+  --frames ~/artifacts/plan-v/m7-r5/frames-train-pt
+
+# 2. U3's settings, on those frames (~4 min; tests/fixtures/visible-learning/training-u4.toml)
+es train --recipe tests/fixtures/visible-learning/training-u4.toml \
+  --out ~/artifacts/plan-v/m7-r5/U4/train
+
+# 3. the 16 held-out seeds x 6 suites, then the 16 training seeds
+es eval run --config ~/artifacts/plan-v/m7-r5/evaluation-augmented-pt.toml \
+  --policy ~/artifacts/plan-v/m7-r5/U4/train/checkpoints/20000.esb \
+  --scene tests/fixtures/mjcf/so101_pick_place.xml \
+  --out ~/artifacts/plan-v/m7-r5/U4/holdout --jobs 6 \
+  --frames ~/artifacts/plan-v/m7-r5/U4/frames-holdout
+es eval run --config ~/artifacts/plan-v/m7-r5/eval-trainseeds-augmented-pt.toml ... \
+  --out ~/artifacts/plan-v/m7-r5/U4/trainseeds --jobs 6 ...
+```
+
+`success_rate`, `envelope_violation_rate`, `episode_length` and `passed` are
+`~/artifacts/plan-v/m7-r5/U4/holdout/report.json`; the row's `evaluation_hash` and
+`execution_hash` are in the same file and in `evaluation.lock` beside it. The **evaluation stage
+is the expensive one**: 96 episodes of up to 1,800 ticks at 57.5 ms/frame is hours, not minutes,
+and `--jobs 6` buys less than it does on the `Rs` path because one process already holds the GPU
+at 93 %. The raw frame trees are meant to be deleted once the numbers are read.
+
+**What the picture already says, before the number arrives.**
+`target/plan-u/r5/contact-sheet.png` is one whole demonstration (seed 1, 511 ticks) collected
+twice, `Rs` above and `Pt` below, both runs reporting the same dataset `content` digest
+`ef2e904d…` — the same states, drawn two ways. At 64 spp the path-traced observation is
+**visibly grainy**, and the grain is deterministic (fixed `seed`, sample keys addressed by
+pixel), so it is a fixed texture per pose rather than noise a policy could average away over
+epochs. If U4 lands below U3, that is the first thing to look at, and `spp` is a field of
+`SensorRender` precisely so the next run can move it without touching a line of code.
 
 ## 8. Safety overlay (V3)
 
