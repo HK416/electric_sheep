@@ -10,13 +10,53 @@
 //! * [`Recent`] — the last ten, most recent first, no duplicates. `app.rs` persists it through
 //!   `eframe::App::save` into `eframe::Storage` under [`RECENT_KEY`]; on Windows that file is
 //!   `%APPDATA%\Electric Sheep editor\data\app.ron`.
+//! * [`Settings`] — the reader's language and text size (packet M7/E6), persisted beside the
+//!   list: this file is where every storage key the editor writes is spelt, so two of them
+//!   cannot collide.
 
 use std::path::{Path, PathBuf};
 
+use crate::model::fonts::TextSize;
+use crate::model::i18n::Lang;
 use crate::model::run_view::RunView;
 
 /// The `eframe::Storage` key the recent list is stored under.
 pub const RECENT_KEY: &str = "es-editor.recent";
+
+/// The reader's language, as [`Lang::code`] spells it (packet M7/E6). Kept here rather than
+/// in `i18n.rs` so that every key the editor persists is in one file and cannot collide.
+pub const LANG_KEY: &str = "es-editor.lang";
+
+/// How big the text is, as [`TextSize::code`] spells it (packet M7/E6).
+pub const TEXT_SIZE_KEY: &str = "es-editor.text-size";
+
+/// The two display settings, read from and written to `eframe::Storage` beside the list.
+///
+/// Both fall back to their default when the store is missing, empty or written by another
+/// version: someone who has never opened the settings gets English at the default size, and
+/// a store nobody can parse costs them nothing.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Settings {
+    pub lang: Lang,
+    pub text_size: TextSize,
+}
+
+impl Settings {
+    /// What [`LANG_KEY`] and [`TEXT_SIZE_KEY`] held, in that order. Plain strings rather than
+    /// an `eframe::Storage`, so the parsing is judged headlessly and `app.rs` is left with
+    /// two `get_string` calls and no decision (spec 28.10 rule 3).
+    pub fn from_codes(lang: &str, text_size: &str) -> Self {
+        Self {
+            lang: Lang::from_code(lang),
+            text_size: TextSize::from_code(text_size),
+        }
+    }
+
+    /// The pair to write back, in the same order.
+    pub fn codes(self) -> (&'static str, &'static str) {
+        (self.lang.code(), self.text_size.code())
+    }
+}
 
 /// How many paths the list keeps. Ten is a menu someone can read at a glance.
 pub const CAP: usize = 10;
@@ -82,7 +122,10 @@ impl Recent {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, Kind, Recent, CAP};
+    use super::{classify, Kind, Recent, Settings, CAP, LANG_KEY, RECENT_KEY, TEXT_SIZE_KEY};
+
+    use crate::model::fonts::TextSize;
+    use crate::model::i18n::Lang;
 
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -124,6 +167,28 @@ mod tests {
         assert_eq!(classify(&tmp), Kind::Documents);
         assert_eq!(classify(Path::new("no/such/path")), Kind::Bundle);
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// The two display settings round-trip through what is persisted, and a store written by
+    /// another version - or by nobody - falls back rather than refusing to open (M7/E6).
+    #[test]
+    fn settings_round_trip_and_an_unreadable_store_falls_back() {
+        for lang in Lang::ALL {
+            for text_size in TextSize::ALL {
+                let settings = Settings { lang, text_size };
+                let (a, b) = settings.codes();
+                assert_eq!(Settings::from_codes(a, b), settings);
+            }
+        }
+        assert_eq!(Settings::from_codes("", ""), Settings::default());
+        assert_eq!(
+            Settings::from_codes("klingon", "enormous"),
+            Settings::default(),
+            "anything unrecognised is English at the default size"
+        );
+        assert_eq!(Settings::default().lang, Lang::En);
+        assert_ne!(LANG_KEY, TEXT_SIZE_KEY);
+        assert_ne!(LANG_KEY, RECENT_KEY);
     }
 
     /// Oracle 4b: capped at ten, deduplicated to the front, and the JSON round-trips.

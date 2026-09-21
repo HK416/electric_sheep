@@ -1,0 +1,178 @@
+# Every word the editor shows, in English (packet M7/E6).
+#
+# Flat keys, quoted so TOML keeps them flat, grouped by a dotted prefix. `ko.toml` holds the
+# same key set and `i18n_tables_are_complete_and_used` fails if the two ever drift, if a key
+# here is never used by the crate, or if a `t("...")` names a key that is not here.
+#
+# A `*.hint` value is hover text: it is the one place a raw name, a flag or a spec section may
+# appear, because that is what a hover is for. No other value cites the spec.
+
+# --- the top bar ------------------------------------------------------------------------
+"menu.file" = "File"
+"menu.recent" = "Recent"
+"menu.recent_empty" = "Nothing yet - open something, or drop it on the window."
+"open.hint" = "a project file, a folder of settings, or a run result"
+"open.open" = "Open"
+"open.open.hint" = "Open the path in the box: a .esb bundle, a directory of the five .toml documents, or a run directory holding report.json (spec 9.6, spec 14.3, spec 10.5)"
+"open.browse" = "Browse..."
+"open.browse_folder" = "Choose folder..."
+"open.no_dialog.hint" = "This build has no native file dialog: type the path, or drop the file on the window"
+"lang.en" = "English"
+"lang.ko" = "Korean"
+"textsize.label" = "Text size"
+"textsize.s" = "S"
+"textsize.m" = "M"
+"textsize.l" = "L"
+
+# --- the tabs. The hover carries the name the tab used to have, and its spec section. -----
+"tab.design" = "Design"
+"tab.design.hint" = "Graph - the four IRs stacked, read-only or edited (spec 23.2, spec 23.4)"
+"tab.results" = "Results"
+"tab.results.hint" = "Run - a finished run's cells, and the Start panel that begins one (spec 10.5, spec 23.1)"
+"tab.live" = "Live"
+"tab.live.hint" = "Telemetry - what a running process is publishing right now (spec 23.3)"
+"tab.sees" = "What the policy sees"
+"tab.sees.hint" = "Images - the observation frame before and after preprocessing (spec 23.3, spec 7)"
+"tab.problems" = "Problems"
+"tab.problems.hint" = "Diagnostics - what the IRs complain about (spec 11.1)"
+"tab.edit" = "Edit"
+"tab.edit.hint" = "Edit mode - one EditSession over the Task IR (spec 23.4 stage 2)"
+"edit.save" = "Save"
+"edit.undo" = "Undo"
+"edit.redo" = "Redo"
+"edit.add_node" = "Add a block"
+
+# --- the status bar ---------------------------------------------------------------------
+"status.nothing_open" = "Nothing open yet."
+"status.messages" = "{} messages received"
+"status.hash" = "{} fingerprint {}"
+"status.diagnostics" = "{} problem(s)"
+"status.edits" = "{} change(s)"
+"status.refused" = "Refused: {} {}"
+"status.font_missing" = "No Korean, Japanese or Chinese font on this machine, so that text shows as boxes. Tried: {}. On Debian or Ubuntu, install fonts-noto-cjk."
+
+# --- the home screen --------------------------------------------------------------------
+"home.welcome" = "Electric Sheep"
+"home.subtitle" = "Teach a robot a task, then check what it learned."
+"home.open_project" = "Open a project file..."
+"home.open_project.hint" = "A .esb bundle, or a folder holding task.toml, observation.toml, learning.toml, deployment.toml and evaluation.toml"
+"home.open_run" = "Open a run result..."
+"home.open_run.hint" = "A folder holding report.json, written by es eval run --out (spec 10.5)"
+"home.recent" = "Recent"
+"home.loop" = "How the work goes"
+"home.step.design" = "Describe the task, what the robot senses, and what counts as success."
+"home.step.collect" = "Gather demonstrations, so the robot has something to learn from."
+"home.step.train" = "Train a policy on what was collected, and watch the loss come down."
+"home.step.evaluate" = "Run the policy against the acceptance tests and read the verdict."
+"home.step.watch" = "Watch a run as it happens, and replay the episodes that went wrong."
+
+# --- the workflow's five words ----------------------------------------------------------
+"word.design" = "Design"
+"word.collect" = "Collect"
+"word.train" = "Train"
+"word.evaluate" = "Evaluate"
+"word.watch" = "Watch"
+
+# --- finding a block --------------------------------------------------------------------
+"find.label" = "Find"
+"find.hint" = "a block's name or a connection"
+"find.next" = "Next"
+
+# --- the Results tab --------------------------------------------------------------------
+"results.empty" = "Nothing to show yet. Open a run result from the Design tab's home screen, or press Start above to begin one."
+"column.cell" = "Case"
+"column.suite" = "Group"
+"column.seed" = "Seed"
+"column.traj" = "Motion saved"
+"column.frames" = "Pictures"
+"results.passed" = "Accepted"
+"results.failed" = "Not accepted"
+"results.acceptance.hint" = "The acceptance criteria of the Evaluation IR, each metric against its threshold (spec 10.2)"
+"results.pass" = "ok"
+"results.fail" = "FAILED"
+"results.not_measured" = "not measured"
+"results.select_cell" = "Pick a case above to see its safety history and its pictures."
+"results.frames" = "Pictures"
+"results.no_image" = "Nothing is being sent. Ask the run for pictures with --telemetry-image-every."
+"results.no_events" = "This run kept no per-step history."
+"value.histogram" = "{} cause(s)"
+"value.not_measured" = "not measured"
+"value.yes" = "yes"
+"value.none" = "--"
+
+# --- the metrics. Plain names; the hover is the raw one, straight off MetricSpec. --------
+"metric.success_rate" = "Success rate"
+"metric.intervention_rate" = "Human takeovers"
+"metric.collision_rate" = "Collisions"
+"metric.envelope_violation_rate" = "Safety limit hits"
+"metric.action_smoothness" = "Motion smoothness"
+"metric.episode_length" = "Episode length"
+"metric.failure_mode_histogram" = "Failure causes"
+"metric.domain_gap" = "Gap from the real world"
+"metric.chunk_underrun_rate" = "Motion gaps"
+"metric.end_to_end_latency_p50" = "Reaction time (typical)"
+"metric.end_to_end_latency_p95" = "Reaction time (slowest 5%)"
+"metric.physics_steps_per_sec" = "Physics speed"
+"metric.camera_frames_per_sec" = "Camera speed"
+"metric.pixels_per_sec" = "Pixel throughput"
+"metric.observation_gb_per_sec" = "Sensor throughput"
+"metric.policy_inferences_per_sec" = "Policy speed"
+"metric.actions_per_sec" = "Action rate"
+"metric.gpu_memory_peak" = "Peak GPU memory"
+
+# --- the Start panel. The hover is the flag the CLI is actually given. --------------------
+"launch.kind.eval" = "Evaluate"
+"launch.kind.train" = "Train"
+"launch.kind.cycle" = "The whole loop"
+"launch.start" = "Start"
+"launch.stop" = "Stop"
+"launch.command" = "What will run"
+"launch.config" = "Evaluation settings"
+"launch.policy" = "Policy file"
+"launch.scene" = "Scene file"
+"launch.out" = "Output folder"
+"launch.frames" = "Also save pictures"
+"launch.jobs" = "Parallel workers"
+"launch.telemetry" = "Watch live at"
+"launch.telemetry_token" = "Watch password"
+"launch.telemetry_image_every" = "Send a picture every"
+"launch.recipe" = "Training settings"
+"launch.from" = "Start from step"
+"launch.dry_run" = "Check only, do not run"
+"launch.allow_new_evaluation" = "Allow a new evaluation"
+"launch.skip_expert_gate" = "Skip the expert check"
+
+# --- the Replay panel -------------------------------------------------------------------
+"replay.scene" = "Scene"
+"replay.scene.hint" = "the run's scene file: .xml (MJCF) or .urdf"
+"replay.frames" = "Pictures"
+"replay.frames.hint" = "where es eval run --frames wrote them; <run>/frames by default"
+"replay.replay" = "Replay"
+"replay.play" = "Play"
+"replay.pause" = "Pause"
+"replay.empty" = "Pick a case that saved its motion, give the scene file, then press Replay."
+
+# --- the Live tab -----------------------------------------------------------------------
+"live.attach" = "Watch"
+"live.attach.hint" = "the address the run publishes on: es eval run --telemetry 127.0.0.1:7777 (spec 23.3, spec 25.1)"
+"live.token" = "password (optional)"
+"live.connect" = "Connect"
+"live.performance" = "Speed"
+"live.performance.hint" = "The nine-metric performance set; never a single step/s figure (spec 12.4)"
+"live.streams" = "Signals"
+"live.events" = "Events"
+"live.empty" = "Nothing is attached. Type the address a run publishes on and press Connect, or press Start on the Results tab."
+
+# --- what the policy sees ---------------------------------------------------------------
+"sees.empty" = "Open a project file to see what the robot's camera gives the policy."
+"sees.count" = "{} of {} outputs are pictures"
+"sees.before" = "as the camera sees it"
+"sees.after" = "as the policy sees it"
+
+# --- problems ----------------------------------------------------------------------------
+"problems.empty" = "Open a project file and it will be checked."
+"problems.none" = "Nothing wrong: every part checks out and they agree with each other."
+
+# --- the inspector ------------------------------------------------------------------------
+"inspector.title" = "Settings"
+"inspector.empty" = "Pick a block to change its settings."

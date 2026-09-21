@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # pre-commit hook: reject non-Latin letters in staged non-documentation files.
-# Documentation (*.md, *.txt, *.rst, anything under docs/) may be multilingual.
+# Documentation (*.md, *.txt, *.rst, anything under docs/) may be multilingual, and so may a
+# crate's UI string table (crates/*/i18n/*.toml): its whole purpose is to hold the text a
+# person reads in their own language, which is why no other file needs to.
 # See .githooks/ (run: git config core.hooksPath .githooks) and CLAUDE.md "Conventions".
 set -euo pipefail
 
@@ -11,7 +13,7 @@ status=0
 
 is_doc() {
 	case "$1" in
-		*.md|*.txt|*.rst|docs/*|*/docs/*) return 0 ;;
+		*.md|*.txt|*.rst|docs/*|*/docs/*|*/i18n/*.toml) return 0 ;;
 		*) return 1 ;;
 	esac
 }

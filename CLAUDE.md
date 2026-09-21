@@ -146,7 +146,9 @@ unverified`, and use the 9-metric set, never a single `step/s` figure (§12.4).
 - **Language.** Source code and commit messages are English only. Documentation
   (`*.md`, `*.txt`, `*.rst`, anything under `docs/`) may be multilingual — Korean is fine
   there (e.g. `docs/ARCHITECTURE.ko.md` is the canonical Korean spec by design; `docs/ARCHITECTURE.md`
-  will be its English translation).
+  will be its English translation). A crate's UI string tables (`crates/*/i18n/*.toml`) may
+  likewise hold non-English text — they exist so that the text a person reads lives in one
+  place and no source file has to.
 - **Commit format.** Conventional Commits: `<type>[(scope)][!]: <summary>`. Allowed types:
   `feat`, `fix`, `refactor`, `docs`, `init`, `test`, `chore`, `build`, `ci`, `perf`, `style`.
 - **No trailers/footers.** Do not append `Co-Authored-By:`, `Claude-Session:`,

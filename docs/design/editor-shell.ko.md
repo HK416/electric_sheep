@@ -753,3 +753,186 @@ EOF이고, 리더 스레드들은 끝나는 중이며, 그들이 센더를 떨�
 동어반복으로 만들 것이다(M7 리뷰 항목). 거부는 실패가 아니라 출력하고 돌아오는 것이어서 쓸기
 자체는 여전히 통과하고, 의도적으로 `SKIP` 줄이 아니다 — 기계에 빠진 것은 없고, `cargo xtask ci`의
 오라클 스캔이 그것을 레퍼런스 오라클로 세어서는 안 된다.
+
+---
+
+## 15. 전문가가 아닌 사람을 위한 에디터 (§23.1, §23.2, §13.1, M7/E6)
+
+§10–§14는 엔지니어에게 필요한 것은 다 붙였지만 그 외의 사람에게 필요한 것은 하나도 붙이지
+않았다. "bundle.esb, 다섯 개의 .toml이 든 폴더, 또는 실행"을 달라는 맨 입력칸, 라벨이 `--config`와
+`--out`인 시작 패널, `envelope_violation_rate`가 머리글인 결과 표, "(spec 23.3)"을 인용하는 도움말,
+그리고 한글이 없는 기본 글꼴 — 그래서 한국어 경로는 네모로 보였다. 2026-09-21 오너 지시:
+*도메인 지식이 없는 사람에게 에디터가 너무 어렵다. UI/UX를 개선하고, 다국어 텍스트가 깨지지
+않도록 글꼴을 고르라.*
+
+아래는 전부 이 크레이트의 나머지와 같은 §28.10 규칙 3 — **`app.rs`에서는 아무것도 결정하지
+않는다** — 을 문구와 글꼴과 대화상자에 적용한 것이다.
+
+### 문자열 표 규칙
+
+`crates/es-editor/i18n/en.toml`과 `ko.toml`. TOML이 평평하게 유지하도록 키를 따옴표로 감싸고
+(`"home.open_project" = "…"`), `model/i18n.rs`에 `include_str!`로 들어간다: `Lang { En, Ko }`,
+`Strings::get(lang)`, `t(lang, key)`, 그리고 숫자를 품는 몇 안 되는 템플릿을 위한
+`fill(lang, key, args)`. 실행 중에 없는 키는 키 자체로 그려진다. 화면에 `tab.design`이 보이는
+에디터가, 아예 뜨지 않는 에디터보다는 낫기 때문이다.
+
+`i18n_tables_are_complete_and_used`가 CI에서 그것을 도달 불가능하게 만들며, 이것이 텍스트에
+대한 이 패킷의 오라클 우선 주장 전부다: 두 표의 키 집합이 같고, 모든 키가 크레이트 어딘가에
+리터럴로 나타나며, 크레이트 안의 키 모양 리터럴은 모두 키이고, **`*.hint`가 아닌 값에는
+"spec "이 들어가지 않는다**. 마지막 규칙이 "(spec 23.3)"을 보이는 텍스트에서 호버로 옮긴다.
+원시 지표 이름, CLI 플래그, 절 번호가 있을 곳은 호버다. 오타는 그래서 두 번 실패한다 — 떠도는
+리터럴로 한 번, 진짜 키가 쓰이지 않은 것으로 또 한 번.
+
+이 두 표는 저장소에서 **영어가 아닌 소스 텍스트를 담아도 되는 유일한 곳**이기도 하다.
+`.githooks/pre-commit`의 `is_doc`에 `*/i18n/*.toml` 경우가 추가되었고, CLAUDE.md의 Conventions
+문단이 그 사실을 한 문장으로 적는다. 한국어는 그 밖 어디에도 없다 — 테스트에도, 주석에도.
+
+### 글꼴 규칙
+
+`model/fonts.rs::system_cjk_font()`는 고정된 OS별 목록을 `std::fs`로 훑어 처음 존재하는 파일을
+돌려준다:
+
+| OS | 후보, 순서대로 |
+|---|---|
+| Windows | `C:\Windows\Fonts\malgun.ttf`, `msyh.ttc`, `meiryo.ttc` |
+| macOS | `/System/Library/Fonts/AppleSDGothicNeo.ttc`, `PingFang.ttc`, `Supplemental/NotoSansCJK*.ttc` |
+| Linux | `/usr/share/fonts/**/NotoSansCJK*.{ttc,otf}`, `NanumGothic.ttf`, `DroidSansFallback*.ttf` |
+
+의도적인 거절이 셋이다. **아무것도 동봉하지 않는다**: CJK 글꼴 한 벌은 10–20 MB이고 패밀리마다
+라이선스가 다르며, 이 저장소의 바이너리 파일은 이유가 있어 읽기 전용 골든이다. **글꼴 탐색
+크레이트를 쓰지 않는다**: "이 경로가 있는가"는 `std::fs`와 목록이고, 설치된 모든 글꼴을 열거하는
+크레이트는 이 에디터에 없는 문제를 푼다 — 리눅스 패턴의 `*`와 `**`는 30줄짜리 매처(`matches`,
+`walk`, 네 단계로 제한, 항목을 정렬해서 후보가 둘인 디렉터리도 늘 같은 것으로 풀린다)다.
+**언제나 마지막 대체, 결코 처음이 아니다**: `install`은 글꼴을 `Proportional`과 `Monospace`
+양쪽의 **끝**에 덧붙인다. 그래서 라틴 문자는 힌팅이 더 나은 egui 자신의 글리프를 유지하고,
+egui가 그리지 못하는 문자만 아래로 떨어진다. `font_fallback_is_last`는 만들어진
+`FontDefinitions`가 두 패밀리 모두에서 여전히 egui 자신의 목록으로 *시작하는지*를 단언한다.
+
+후보가 하나도 없는 기계는 오류가 아니라 평범한 결과다: `install`이 `Err(candidates)`를 돌려주고,
+에디터는 그래도 열리며, 상태 표시줄이 `status.font_missing`을 읽는다 — 찾아본 경로 목록과,
+데비안·우분투용 `fonts-noto-cjk`라는 말. 설명이 있는 네모가 설명 없는 네모보다 낫다.
+
+글꼴 옆에서 `TextSize { S, M, L }`가 **본문 15 px / 제목 20 px**를 기준으로 모든 `TextStyle`을
+한꺼번에 키우고 줄인다(egui 자신의 기본값은 12.5 px인데, 그건 툴킷을 만든 사람의 눈에 맞춘
+선택이다). 두 설정 모두 §12의 최근 목록 옆에서 `eframe::Storage`에 `es-editor.lang`과
+`es-editor.text-size`로 보존된다 — 이 크레이트가 쓰는 모든 저장 키를 `recent.rs`가 적어 두므로
+둘이 충돌할 수 없고, `Settings::from_codes`가 평범한 문자열을 받으므로 파싱은 화면 없이
+판정되며 `app.rs`에는 `get_string` 두 번만 남는다.
+
+### 라벨 표
+
+`model/labels.rs`. 모든 함수가 전역적이고 **와일드카드 갈래가 없다** — `MetricSpec`에 지표가,
+`LaunchField`에 플래그가 하나 추가되면 이 크레이트의 빌드가 깨져야 한다. 그 대안은 아무도 끝내
+이름 붙이지 않는 열이기 때문이다. `metric_and_launch_labels_are_total`이 두 언어에서
+`MetricSpec::ALL`(18개), `LaunchField::ALL`(11개), `LaunchFlag::ALL`(3개), `Kind::ALL`,
+`Tab::ALL`을 돌며 라벨이 서로 다르고, `_`를 담지 않고, 원시 이름과 절대 같지 않음을 단언한다.
+
+| 원시 이름 | 쉬운 이름 (en) | 쉬운 이름 (ko) |
+|---|---|---|
+| `success_rate` | Success rate | 성공률 |
+| `intervention_rate` | Human takeovers | 사람이 넘겨받은 비율 |
+| `collision_rate` | Collisions | 충돌 비율 |
+| `envelope_violation_rate` | Safety limit hits | 안전 한계 위반 |
+| `action_smoothness` | Motion smoothness | 움직임의 매끄러움 |
+| `episode_length` | Episode length | 에피소드 길이 |
+| `failure_mode_histogram` | Failure causes | 실패 원인 |
+| `domain_gap` | Gap from the real world | 실제와의 차이 |
+| `chunk_underrun_rate` | Motion gaps | 동작이 끊긴 비율 |
+| `end_to_end_latency_p50` | Reaction time (typical) | 반응 시간 (보통) |
+| `end_to_end_latency_p95` | Reaction time (slowest 5%) | 반응 시간 (느린 5%) |
+| `physics_steps_per_sec` | Physics speed | 물리 계산 속도 |
+| `camera_frames_per_sec` | Camera speed | 카메라 속도 |
+| `pixels_per_sec` | Pixel throughput | 픽셀 처리량 |
+| `observation_gb_per_sec` | Sensor throughput | 센서 데이터 처리량 |
+| `policy_inferences_per_sec` | Policy speed | 정책 추론 속도 |
+| `actions_per_sec` | Action rate | 동작 출력 속도 |
+| `gpu_memory_peak` | Peak GPU memory | GPU 메모리 최대 사용량 |
+
+| 원시 이름 | 쉬운 이름 (en) | 쉬운 이름 (ko) |
+|---|---|---|
+| `--config` | Evaluation settings | 평가 설정 |
+| `--policy` | Policy file | 정책 파일 |
+| `--scene` | Scene file | 장면 파일 |
+| `--out` | Output folder | 결과 폴더 |
+| `--frames` | Also save pictures | 사진도 저장할 폴더 |
+| `--jobs` | Parallel workers | 동시에 돌릴 개수 |
+| `--telemetry` | Watch live at | 실시간으로 볼 주소 |
+| `--telemetry-token` | Watch password | 관찰 암호 |
+| `--telemetry-image-every` | Send a picture every | 사진 보내는 간격 |
+| `--recipe` | Training settings | 학습 설정 |
+| `--from` | Start from step | 시작할 단계 |
+| `--dry-run` | Check only, do not run | 실행하지 말고 점검만 |
+| `--allow-new-evaluation` | Allow a new evaluation | 새 평가 기준 허용 |
+| `--skip-expert-gate` | Skip the expert check | 전문가 점검 건너뛰기 |
+
+탭도 같은 길을 간다 — Graph → *Design* / 설계, Run → *Results* / 결과, Telemetry →
+*Live* / 관찰, Images → *What the policy sees* / 정책이 보는 것, Diagnostics → *Problems* /
+문제 — 옛 이름과 명세 절은 `Tab::hint_key`에 들어간다. 그 때문에 `Tab`이 `app.rs`에서
+`labels.rs`로 옮겨졌다: 탭은 이제 이름 하나, 호버 하나, 목적지 하나이고 그것은 모델 데이터이며,
+옮기면서 셸이 들고 있던 목록 사본이 사라졌다.
+
+`metric_by_name`은 쉬운 이름과, `report.json`의 열이나 텔레메트리 행이 들고 오는 원시 문자열
+사이의 이음매다. 코드베이스에 하나 있는 별칭도 여기가 감당한다:
+`TelemetryModel::metric_rows`는 지연 시간을 `PerfMetrics`의 필드 철자대로
+`p50_end_to_end_latency`라 적고, `MetricSpec`은 `end_to_end_latency_p50`이라 적는다.
+
+**일부러 번역하지 않은 것.** 그려진 명령줄(터미널에 그대로 붙여 넣는 줄이다), 시작 로그에 찍히는
+`es` 자신의 표준 출력, `EsBinary::reason`, IR 진단의 코드와 메시지, 측정되지 않은 지표의
+`reason`. 그것들은 다른 크레이트와 다른 패킷의 것이고, 한국어를 지어내는 것은 `es`가 무슨 뜻이었는지
+에디터가 추측하는 일이다. 이 패킷의 범위가 닿지 않은 모델 문자열 셋 — `RunView::status`,
+`LiveRun::status`, `Timeline::heading` — 도 같은 이유로 아직 영어이며, M7 리뷰 항목으로 적어 둔다.
+
+### 첫 화면 모델
+
+`labels::Step::ALL`은 §13.1의 순환을 순서대로 담는다 — 설계, 수집, 학습, 평가, 관찰. 각각
+작업의 낱말(`word.*`), 쉬운 말 한 문장(`home.step.*`), 그리고 버튼이 데려갈 탭(`Step::tab()`;
+수집·학습·평가는 모두 결과 탭으로 간다. 시작 패널이 거기 있기 때문이다)을 갖는다.
+`home_screen_lists_the_five_steps_in_loop_order`가 순서를, 두 언어 모두에서 각 문장이 문장임을,
+그리고 두 단계가 같은 말을 하지 않음을 단언한다. `app.rs`는 `Step::ALL` 위에 격자를 그리고 버튼
+셋 — *프로젝트 파일 열기…*, *실행 결과 열기…*, *최근 항목* — 을 놓을 뿐 아무것도 결정하지 않는다.
+
+첫 화면은 여섯 번째 탭이 아니라 **아무것도 열지 않은 설계 탭 자체**다. 사람이 처음 닿는 화면이
+거기이고, 일을 시작하려면 먼저 떠나야 하는 탭은 그 일 자체보다 나쁜 첫 화면이다. 거기서는 검색
+상자도 감춘다. 아직 찾을 것이 없기 때문이다.
+
+### 대화상자 기능
+
+`rfd 0.17.2`가 **이 패킷이 더하는 단 하나의 의존성**이다(MIT, 두 타깃 모두에서 네이티브).
+GTK나 XDG 포털 백엔드가 딸려 오지 않도록 `default-features = false`로 받는다. 모양은 이렇다:
+
+```toml
+[features]
+default = ["file-dialogs"]
+file-dialogs = ["dep:rfd"]
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd = { workspace = true, optional = true }
+```
+
+카고에는 타깃별 기본 기능이 없으므로 `model/dialogs.rs`가
+`all(feature = "file-dialogs", any(windows, target_os = "macos"))`로 가르고, 모든 함수에
+`None`을 돌려주는 `cfg` 반대편 쌍이 있다. 패킷이 요구한 효과가 정확히 성립한다: 리눅스는 기능이
+켜져 있든 아니든 스텁을 컴파일하고 새 요구 사항이 생기지 않으며, `--no-default-features`는 어느
+타깃에서나 스텁을 빌드하고, **`app.rs`는 `rfd`를 이름조차 부르지 않는다** — `dialogs::pick(browse)`를
+부를 뿐이고, 어떤 필드가 *어떤* 대화상자를 원하는지는 `labels::browses`가 정한다.
+`dialogs::AVAILABLE`은 그 `cfg`를 그대로 `const`로 만든 것이라, 대화상자가 없는 빌드는 버튼을
+숨기는 대신 흐리게 그리고 `open.no_dialog.hint`를 호버에 단다. 직접 적는 경로, 최근 목록,
+끌어다 놓기는 모든 타깃에서 그대로이므로 대화상자로*만* 닿을 수 있는 것은 없다. 이것은 §12의
+"여기 없는 것"에 있던 파일 대화상자 항목을 뒤집는다. 그 항목은 에디터에 비전문가 사용자가
+보이지 않던 때 쓰인 것이다.
+
+### 손으로 확인한 것
+
+Windows 11, `malgun.ttf`를 찾아 설치. 두 언어의 첫 화면, E4 고정물 번들과 E5 고정물 실행을 열기,
+한국어 경로 `C:\Users\User\문서\테스트`를 `--out`에 적어 넣어 입력칸에서도 그려진 명령줄에서도
+네모 없이 보이는 것, 결과 머리글 안전 한계 위반에 마우스를 올려 `envelope_violation_rate`가
+나오는 것, 글자 크기 크게, 그리고 언어와 크기가 `eframe::Storage`를 통해 재시작을 넘겨 살아남는
+것. 스크린샷: `target/plan-u/e6/`.
+
+### 여기 없는 것
+
+- `es` 자신의 CLI 출력 현지화, 그리고 위에 적은 모델 문자열 셋.
+- 세 번째 언어. 하나 더하는 일은 파일 하나와 `Lang` 변형 하나이고, 그러면 오라클이 같은 키
+  집합으로 그것을 붙든다.
+- OS별 글꼴 *설정*. 후보 목록이 고정인 것은 의도다. 글꼴 설정 화면은 두 번째 문제이고, 사람에게
+  정말 필요한 한 가지 — "왜 내 글자가 네모지"— 는 상태 표시줄이 답한다.

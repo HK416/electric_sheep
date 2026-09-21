@@ -39,6 +39,11 @@ fn main() -> eframe::Result<()> {
             // `cc.storage` is the previous session's recent list (packet M7/E3), read before
             // a path on the command line is opened so that path joins the list.
             let mut app = EditorApp::new(source).with_storage(cc.storage);
+            // The system CJK face and the persisted text size, before anything is drawn: a
+            // Korean label or a Korean path in a field renders as boxes without it (packet
+            // M7/E6). Which font, where in the fallback chain, and what a machine with none
+            // is told are all `model/fonts.rs`'s and the string tables'.
+            app.apply_style(&cc.egui_ctx);
             if let Some(path) = &path {
                 app = app.with_path(path);
             }

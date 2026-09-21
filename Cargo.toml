@@ -61,6 +61,10 @@ eframe = { version = "0.32.3", default-features = false, features = [
     "wayland",
 ] }
 egui = { version = "0.32.3", default-features = false }
+# The editor's native Open dialog (packet M7/E6), taken without default features so that no
+# GTK or XDG-portal backend is pulled in: es-editor declares it for Windows and macOS only,
+# where it is the OS's own dialog and nothing else.
+rfd = { version = "0.17.2", default-features = false }
 # abi3-py312: one compiled extension works on any CPython >= 3.12 (stable ABI), matching the
 # project's pinned Python 3.12 (spec 14.2). `extension-module` is what maturin needs to build a
 # loadable `.pyd`/`.so`; it is only pulled in behind es-py's own `python` feature (see

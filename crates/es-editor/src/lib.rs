@@ -15,6 +15,12 @@
 //! The split is deliberate: [`model`] is headless and fully tested, [`app`] is a thin egui
 //! layer over it that CI only compiles. See `docs/design/editor-shell.md`.
 //!
+//! It is also meant to be usable by someone who is not an engineer (packet M7/E6): every
+//! visible string is a key in [`model::i18n`]'s two tables rather than a literal in
+//! [`app`], every column and flag has a plain name in [`model::labels`] with the raw one a
+//! hover away, the system's own CJK font is found by [`model::fonts`] so Korean renders, and
+//! the Open dialog is wrapped in [`model::dialogs`] behind a target-specific feature.
+//!
 //! A run can be watched as it happens as well as read after the fact:
 //! `es-editor --attach <addr>` is a client of `es eval run --telemetry <addr>`, and
 //! [`model::live_run::LiveRun`] folds that stream into the same [`CellRow`]/[`Timeline`] the
