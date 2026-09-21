@@ -687,11 +687,94 @@ impl SceneRef {
     }
 }
 
+/// Which renderer produces a [`ObsSource::Sensor`] channel (spec 15.3, packet M7/R5).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "path", rename_all = "lowercase")]
+pub enum SensorPath {
+    /// The rasterizer: today's observation path, and the default.
+    #[default]
+    Rs,
+    /// The path tracer, at this many samples and bounces per pixel.
+    Pt { spp: u32, bounces: u32 },
+}
+
+/// How linear radiance becomes a display value, mirroring `es_render::Tonemap` (which is
+/// layer 5 and out of reach here, spec 4.2). `Pt` only: the `Rs` path clamps.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Tonemap {
+    #[default]
+    Reinhard,
+    Aces,
+}
+
+/// How the simulation *produces* one sensor channel (packet M7/R5).
+///
+/// Not an `ImageSpec` field and not an Observation IR one: what the sensor **is** —
+/// resolution, colour space, intrinsics — is `ImageSpec`'s, and how the simulation **makes**
+/// it is the Task IR's. One Observation IR therefore serves an `Rs` and a `Pt` task alike.
+///
+/// [`Self::default`] is the rasterizer at neutral exposure, and [`ObsSource::canonical`]
+/// writes the block **only when it is not the default**, so an absent or default `render` is
+/// byte for byte today's canonical form and no committed `task_hash` moves (spec 28.10
+/// rule 1). A `Pt` sensor does move it, and is therefore a new document (spec 13.3).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SensorRender {
+    #[serde(flatten)]
+    pub path: SensorPath,
+    /// Linear multiplier applied before [`Self::tonemap`].
+    pub exposure: f32,
+    pub tonemap: Tonemap,
+}
+
+impl Default for SensorRender {
+    fn default() -> Self {
+        Self {
+            path: SensorPath::Rs,
+            exposure: 1.0,
+            tonemap: Tonemap::Reinhard,
+        }
+    }
+}
+
+impl SensorRender {
+    /// Whether this is the block an absent `render` means. The serde `skip_serializing_if`
+    /// and the canonical-form rule are the same predicate, so a document that omits it and a
+    /// document that writes it out cannot disagree.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    fn canonical(&self, w: &mut CanonWriter) {
+        match self.path {
+            SensorPath::Rs => w.str("rs"),
+            SensorPath::Pt { spp, bounces } => {
+                w.str("pt");
+                w.u32(spp);
+                w.u32(bounces);
+            }
+        }
+        w.f32(self.exposure);
+        wdbg(w, &self.tonemap);
+    }
+}
+
 /// Where one declared observation channel comes from (spec 7.4).
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ObsSource {
-    Sensor { id: StableId, format: ChannelFormat },
-    JointState { body: StableId, dof: u32 },
+    Sensor {
+        id: StableId,
+        format: ChannelFormat,
+        /// Absent = [`SensorRender::default`] = today's canonical form (packet M7/R5).
+        #[serde(default, skip_serializing_if = "SensorRender::is_default")]
+        render: SensorRender,
+    },
+    JointState {
+        body: StableId,
+        dof: u32,
+    },
     BodyPose(StableId),
     Language,
 }
@@ -699,10 +782,15 @@ pub enum ObsSource {
 impl ObsSource {
     fn canonical(&self, w: &mut CanonWriter) {
         match self {
-            Self::Sensor { id, format } => {
+            Self::Sensor { id, format, render } => {
                 w.str("Sensor");
                 wid(w, id);
                 wdbg(w, format);
+                // Only when it is not the default: see [`SensorRender`].
+                if !render.is_default() {
+                    w.str("render");
+                    render.canonical(w);
+                }
             }
             Self::JointState { body, dof } => {
                 w.str("JointState");

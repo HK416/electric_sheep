@@ -86,8 +86,14 @@ crates/es/src/cmd/showcase.rs
 crates/es/tests/cli.rs
 crates/es/tests/video.rs
 tests/fixtures/visible-learning/task-pt.toml
+tests/fixtures/visible-learning/observation-pt.toml
 tests/fixtures/visible-learning/evaluation-pt.toml
 tests/fixtures/visible-learning/training-u4.toml
+crates/es-data/src/roboverse.rs
+crates/es-data/tests/lerobot_config.rs
+crates/es-data/tests/loop_learning.rs
+crates/es-editor/tests/common/mod.rs
+crates/es-runtime-embedded/tests/embedded.rs
 docs/ARCHITECTURE.ko.md
 docs/ARCHITECTURE.md
 docs/design/renderer.md
@@ -105,6 +111,20 @@ docs/packets/M7/R5-pt-observations.ko.md
 `es-env/src/render.rs`(`sensor_cfg`, 두 패스스루 필드), `es-env/tests`, 세 CLI 호출 지점,
 `cli.rs`/`video.rs`(PT 수집/평가/쇼케이스 테스트), 세 개의 새 픽스처, 스펙 문구(두 파일,
 한 커밋), 세 설계 노트, 이 패킷.
+
+**만들면서 수정됨(M7/R5, 조용히 넘어가지 않고 기록한다).** 위 목록이 알 수 없었던 두 가지:
+
+* 공개 구조체 **변형(variant)**은 그것의 모든 구조체 리터럴이 함께 자라지 않으면 필드를
+  늘릴 수 없다. 그래서 이웃한 다섯 생성 지점(`es-data/src/roboverse.rs`,
+  `es-data/tests/{lerobot_config,loop_learning}.rs`, `es-editor/tests/common/mod.rs`,
+  `es-runtime-embedded/tests/embedded.rs`)이 각각 정확히 한 줄
+  (`render: SensorRender::default()`)만큼 범위에 들어온다. 그 파일들의 다른 줄은 바뀌지
+  않았다.
+* `observation-pt.toml`은 선택이 아니라 **네 번째** 픽스처다: `ObservationIr::task_ref`가
+  해시 입력이고 `XIR_001`이 그것을 태스크 자신의 해시와 같게 요구하므로, `Pt` Task IR은
+  그래프가 바이트 단위로 동일하더라도 커밋된 관측 IR 문서를 재사용할 수 없다.
+  `evaluation-pt.toml`은 그 문서의 `observation_hash`를 가리켜야 하므로, 패킷의 "커밋된
+  `evaluation.toml`이 `task-pt`의 해시를 가리키는 것"은 필드 하나가 모자란다.
 
 ## 오라클
 

@@ -189,6 +189,7 @@ fn task_ir() -> TaskIr {
                 source: ObsSource::Sensor {
                     id: cam_id(),
                     format: ChannelFormat::Rgb,
+                    render: es_ir::task::SensorRender::default(),
                 },
                 ty: raw,
             },

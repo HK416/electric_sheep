@@ -84,6 +84,7 @@ fn task_and_deployment(conv: &Converted) -> (TaskIr, DeploymentIr) {
                     source: ObsSource::Sensor {
                         id: *sensor,
                         format: ChannelFormat::Rgb,
+                        render: es_ir::task::SensorRender::default(),
                     },
                     ty: io.output.clone(),
                 });

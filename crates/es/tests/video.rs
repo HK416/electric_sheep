@@ -974,3 +974,134 @@ fn showcase_accumulate_flags_are_parsed() {
         "RAN showcase_accumulate_flags_are_parsed: --accumulate, --max-history, and two rejections"
     );
 }
+
+// --- es video showcase --task (packet M7/R5) -------------------------------------------------
+
+/// Packet M7/R5 oracle 5: with `--task`, the scene camera renders the way the **document**
+/// says, so a replay of a path-traced run is path-traced.
+///
+/// Two halves. The first runs everywhere: `--task` needs `--camera`, and a flag the document
+/// would decide is refused beside it rather than one of the two silently winning. The second
+/// re-renders the committed `.estraj` trajectory through `task.toml` and `task-pt.toml` and
+/// compares the pixels; it needs a Vulkan device and prints `SKIP` without one.
+#[test]
+fn showcase_scene_camera_follows_the_sensor_path() {
+    let test = "showcase_scene_camera_follows_the_sensor_path";
+    let root = workspace_root();
+    let out = scratch_dir("showcase-task");
+    let run = root.join("tests/fixtures/visible-learning/run");
+    let task = |name: &str| {
+        root.join("tests/fixtures/visible-learning")
+            .join(name)
+            .to_str()
+            .expect("utf-8 path")
+            .to_owned()
+    };
+    let showcase = |args: &[&str]| {
+        bin()
+            .args(["video", "showcase"])
+            .args(["--run", run.to_str().unwrap()])
+            .args(["--scene", "tests/fixtures/mjcf/so101_pick_place.xml"])
+            .args(args)
+            .current_dir(&root)
+            .output()
+            .expect("run es video showcase")
+    };
+
+    let help = bin()
+        .args(["video", "showcase", "--help"])
+        .output()
+        .expect("run --help");
+    if stderr(&help).contains("needs the `render` feature") {
+        println!("SKIP {test}: built without the `render` feature");
+        return;
+    }
+    assert!(stdout(&help).contains("--task T.toml"), "{}", stdout(&help));
+
+    // A free camera is in no document.
+    let free = showcase(&[
+        "--out",
+        out.join("free").to_str().unwrap(),
+        "--eye",
+        "0.66,-0.46,0.52",
+        "--look-at",
+        "0.14,-0.04,0.04",
+        "--task",
+        &task("task-pt.toml"),
+    ]);
+    assert_eq!(free.status.code(), Some(2), "{}", stderr(&free));
+    assert!(
+        stderr(&free).contains("--task goes with --camera"),
+        "{}",
+        stderr(&free)
+    );
+
+    // The document decides, or the flags do, and never half of each.
+    let clash = out.join("clash");
+    let (clash, pt_task) = (
+        clash.to_str().expect("utf-8 path").to_owned(),
+        task("task-pt.toml"),
+    );
+    for flag in [
+        vec!["--path", "pt"],
+        vec!["--spp", "8"],
+        vec!["--exposure", "4"],
+        vec!["--look", "full"],
+        vec!["--width", "96"],
+    ] {
+        let mut args = vec!["--out", &clash, "--camera", "overhead"];
+        args.extend(flag.iter().copied());
+        args.extend(["--task", &pt_task]);
+        let got = showcase(&args);
+        assert_eq!(got.status.code(), Some(2), "{flag:?}: {}", stderr(&got));
+        assert!(
+            stderr(&got).contains(flag[0]) && stderr(&got).contains("--task and"),
+            "{flag:?}: {}",
+            stderr(&got)
+        );
+    }
+
+    // --- the render ---------------------------------------------------------------------
+    let render = |name: &str, tag: &str| -> Option<PathBuf> {
+        let dir = out.join(tag);
+        let got = showcase(&[
+            "--out",
+            dir.to_str().unwrap(),
+            "--camera",
+            "overhead",
+            "--task",
+            &task(name),
+            "--stride",
+            "40",
+        ]);
+        let text = format!("{}{}", stdout(&got), stderr(&got));
+        if got.status.code() != Some(0) {
+            println!("SKIP {test} (the render half): {}", text.trim());
+            return None;
+        }
+        Some(dir)
+    };
+    let Some(rs) = render("task.toml", "rs") else {
+        return;
+    };
+    let pt = render("task-pt.toml", "pt").expect("the Rs render worked, so the device is there");
+
+    // The document's own size, not the 1280x720 default: `--task` decided it.
+    let layout: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(pt.join("layout.json")).expect("layout.json"),
+    )
+    .expect("layout.json parses");
+    assert_eq!(layout["shape"], serde_json::json!([96, 96, 3]), "{layout}");
+
+    let frame = |dir: &Path| std::fs::read(dir.join("000000.bin")).expect("frame 0");
+    let (a, b) = (frame(&rs), frame(&pt));
+    assert_eq!(a.len(), 96 * 96 * 3);
+    assert_eq!(b.len(), a.len());
+    assert!(b.iter().any(|x| *x != 0), "the path-traced replay is black");
+    assert_ne!(
+        a, b,
+        "the path-traced replay reproduced the rasterizer's pixels"
+    );
+    let mean = |v: &[u8]| v.iter().map(|x| u32::from(*x)).sum::<u32>() / v.len() as u32;
+    println!("RAN {test}: mean byte Rs {} / Pt {}", mean(&a), mean(&b));
+}

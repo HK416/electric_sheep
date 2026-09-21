@@ -27,7 +27,7 @@ use crate::error::CliError;
 
 pub const HELP: &str = "\
 es video showcase --run <dir> --scene <file.xml|urdf> --out <dir>
-                  (--eye X,Y,Z --look-at X,Y,Z [--fov 45] | --camera NAME)
+                  (--eye X,Y,Z --look-at X,Y,Z [--fov 45] | --camera NAME [--task T.toml])
                   [--width 1280] [--height 720] [--cell NAME]... [--stride N]
                   [--look lambert|full]
                   [--path rs|pt] [--spp N] [--bounces B]
@@ -48,6 +48,10 @@ Nothing is resampled and no observation is involved: the showcase camera has its
     --camera NAME   a camera the scene declares, instead: with the run's own observation
                     --width/--height this reproduces the recorded observation frames bit for
                     bit, which is how a replay is checked against the run it replays
+    --task T.toml   the run's Task IR, with --camera: the size and the render path are then
+                    the document's own sensor declaration (M7/R5), so a path-traced run
+                    replays path-traced. Every flag below describes the free camera and is a
+                    usage error beside --task, because the document decides
     --cell NAME     render only this episode; repeatable, default every one in name order
     --stride N      render every Nth recorded tick (default 1)
     --fov D         vertical field of view in degrees (default 45)
@@ -91,6 +95,10 @@ struct Opts {
     tonemap: Tonemap,
     /// Packet M7/R4's temporal accumulation, `--accumulate`.
     temporal: Option<Temporal>,
+    /// `--task`: the sensor the scene camera *is*, as the Task IR declares it (packet M7/R5).
+    /// `Some` means the document decides the size and the render path, and `width`/`height`
+    /// above are already the declared ones.
+    sensor: Option<(es_ir::image::ImageSpec, es_ir::task::SensorRender)>,
 }
 
 enum Camera {
@@ -136,6 +144,10 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
     // Packet M7/R4. `--accumulate` off by default: a re-render of a committed run reproduces
     // its recorded frames, and that is a property of the defaults.
     let (mut accumulate, mut max_history) = (false, 32u32);
+    // Packet M7/R5: `--task`, and whether any flag the document would otherwise decide was
+    // typed. One flag was: the two cannot both be honoured, so the pair is refused by name
+    // rather than one of them silently winning.
+    let (mut task, mut look_flags) = (None, Vec::new());
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -147,8 +159,25 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
             v.parse::<f64>()
                 .map_err(|_| usage(format!("{flag}: {v:?} is not a number")))
         };
+        // Everything the Task IR would otherwise decide, remembered by name (packet M7/R5).
+        if matches!(
+            a.as_str(),
+            "--look"
+                | "--path"
+                | "--spp"
+                | "--bounces"
+                | "--accumulate"
+                | "--max-history"
+                | "--exposure"
+                | "--tonemap"
+                | "--width"
+                | "--height"
+        ) {
+            look_flags.push(a.clone());
+        }
         match a.as_str() {
             "--run" => run = Some(PathBuf::from(val()?)),
+            "--task" => task = Some(PathBuf::from(val()?)),
             "--scene" => scene = Some(val()?.clone()),
             "--out" => out = Some(PathBuf::from(val()?)),
             "--eye" => eye = Some(vec3(val()?, "--eye")?),
@@ -198,6 +227,33 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
             other => return Err(usage(format!("unknown flag '{other}'"))),
         }
     }
+    // The document decides, or the flags do, and never half of each (packet M7/R5).
+    let sensor = match &task {
+        None => None,
+        Some(path) => {
+            if named.is_none() {
+                return Err(usage(
+                    "--task goes with --camera: a free camera is in no document, and the \
+                     document has nothing to say about it",
+                ));
+            }
+            if !look_flags.is_empty() {
+                return Err(usage(format!(
+                    "--task and {}: with a Task IR the sensor's own declaration decides the \
+                     scene camera's size and render path, so those flags would have to be \
+                     ignored to honour it",
+                    look_flags.join(", ")
+                )));
+            }
+            let text = fs::read_to_string(path)
+                .map_err(|e| usage(format!("--task {}: {e}", path.display())))?;
+            let ir = es_ir::serial::task_from_toml(&text)
+                .map_err(|e| usage(format!("--task {}: {e}", path.display())))?;
+            let (_, _, spec, render) = crate::cmd::eval::image_channel(&ir)?;
+            (width, height) = (spec.width, spec.height);
+            Some((spec, render))
+        }
+    };
     if spp == 0 || bounces == 0 {
         return Err(usage("--spp and --bounces must both be greater than zero"));
     }
@@ -260,6 +316,7 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
         exposure,
         tonemap,
         temporal: accumulate.then_some(Temporal { max_history }),
+        sensor,
     })
 }
 
@@ -340,7 +397,12 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
                         scene.cameras.iter().map(|c| &c.name).collect::<Vec<_>>()
                     ))
                 })?;
-            scene_cfg = Some(EnvRendererCfg::rgb(cam.id, opts.width, opts.height));
+            // With `--task`, the scene camera is the *sensor* and its declaration is the
+            // whole config (packet M7/R5); without one it is today's `Rs` camera.
+            scene_cfg = Some(match &opts.sensor {
+                Some((spec, render)) => es_env::render::sensor_cfg(cam.id, spec, render, None),
+                None => EnvRendererCfg::rgb(cam.id, opts.width, opts.height),
+            });
         }
     }
 
@@ -348,16 +410,24 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
         .map_err(|e| rt(format!("no Vulkan device for es video showcase: {e}")))?;
     // The same function every other `Rs` render in this repository goes through, so the
     // showcase and the observation frames cannot drift apart (design note section 7.4).
-    let mut cfg = es_env::render::config(opts.width, opts.height, Channel::Rgb8, opts.path);
-    // All `--look`, `--exposure` and `--tonemap` touch. `es_env::render::config` stays the one
-    // place a render path becomes a `RenderConfig`, and the observation path keeps every
-    // default (M7/R2, M7/R3).
-    cfg.shading = opts.look;
-    cfg.exposure = opts.exposure;
-    cfg.tonemap = opts.tonemap;
-    // The history lives in the one `Renderer` below, which is kept across every tick of every
-    // episode -- so the accumulation is the showcase's own frames, in order (M7/R4).
-    cfg.temporal = opts.temporal;
+    // With `--task` the scene camera's config is the observation path's own, knob for knob:
+    // this is what makes a replay of a path-traced run path-traced (packet M7/R5).
+    let declared = scene_cfg.as_ref().filter(|_| opts.sensor.is_some());
+    let mut cfg = if let Some(cfg) = declared {
+        es_env::render::render_config(cfg)
+    } else {
+        let mut cfg = es_env::render::config(opts.width, opts.height, Channel::Rgb8, opts.path);
+        // All `--look`, `--exposure` and `--tonemap` touch. `es_env::render::config` stays the
+        // one place a render path becomes a `RenderConfig`, and the observation path keeps
+        // every default (M7/R2, M7/R3).
+        cfg.shading = opts.look;
+        cfg.exposure = opts.exposure;
+        cfg.tonemap = opts.tonemap;
+        // The history lives in the one `Renderer` below, which is kept across every tick of
+        // every episode -- so the accumulation is the showcase's own frames, in order (M7/R4).
+        cfg.temporal = opts.temporal;
+        cfg
+    };
     if opts.temporal.is_some() {
         cfg.channels.insert(Channel::History);
     }

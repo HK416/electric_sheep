@@ -1,0 +1,48 @@
+# M7/R5 row U4: U3's configuration on the **path-traced** documents -- `task-pt.toml` (the
+# sensor declares `render = { path = "pt", spp = 64, bounces = 3, exposure = 64 }`) with
+# `learning-pretrained.toml` (T5) and the augmented Observation IR (T6).
+#
+# RUN, on the oracle server: `es train --recipe <this> --out ~/artifacts/plan-v/m7-r5/U4/train`
+# from the repository root; `docs/design/visible-learning.md` section 7.32.
+#
+# Everything but the renderer is U3's, on purpose: same 200 demonstrations at the same seeds,
+# same 20,000 steps, same batch 64 / lr 4e-4 / warmup_cosine(250, 1e-6) / seed 0, same
+# ImageNet backbone, same `--resident-gpu`. The one variable is how the 96x96 frames the
+# demonstrations carry were made, so `success_rate` beside U3's 0.5625 is a statement about
+# the render path and nothing else.
+#
+# The dataset is **not** V15's: `v15/ds-train` carries rasterized frames, and a policy trained
+# on those and evaluated on path-traced ones would be measuring a domain gap nobody declared.
+# `m7-r5/ds-train-pt` is the same 200 episodes at the same seeds, collected again with
+# `--frames` under `task-pt.toml`.
+#
+# The bundle is `task-pt.toml` + `observation-augmented-pt.toml` + `learning-pretrained.toml`
+# + `deployment.toml`, packed by `cargo test -p es --test cli -- --ignored
+# pack_untrained_bundle` with the four `ES_PACK_*` paths. `observation-augmented-pt.toml` is
+# the committed `observation-augmented.toml` with `task_ref` pointed at task-pt.toml: the
+# graph is byte-identical, but `task_ref` is hash input and `XIR_001` requires it to match,
+# so a new Task IR always drags a new Observation IR document behind it (packet M7/R5).
+#
+# `augmentation_seed` is absent, which means `[run] seed` = 0, which is T6's and U3's.
+# Paths are the oracle server's (RTX 4090).
+
+kind = "training"
+
+[dataset]
+root   = "/home/LJM/artifacts/plan-v/m7-r5/ds-train-pt"
+frames = "/home/LJM/artifacts/plan-v/m7-r5/frames-train-pt"
+
+[policy]
+bundle     = "/home/LJM/artifacts/plan-v/m7-r5/untrained-pretrained-augmented-pt.esb"
+base_model = "/home/LJM/artifacts/plan-v/m7-t5/resnet18-imagenet1k-v1.safetensors"
+
+[run]
+steps         = 20000
+batch         = 64
+lr            = 4e-4
+seed          = 0
+checkpoint_at = [20000]
+device        = "cuda"
+interpreter   = "/home/LJM/venvs/es-lerobot-cuda/bin/python"
+schedule      = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
+extra         = ["--resident-gpu"]

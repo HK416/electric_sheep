@@ -107,6 +107,22 @@ join은 조용한 hold가 아니라 오류다. 서로 다른 두 `Window`를 결
 writer의 float 규칙(−0.0 → 0.0, NaN은 거부됨)을 거친다; 이 모듈로부터 해시에
 도달하는 다른 float은 없다.
 
+## Task IR의 센서 소스 (`ObsSource::Sensor`, 패킷 M7/R5)
+
+```
+Sensor { id, format, render: SensorRender }
+SensorRender { path: Rs | Pt { spp, bounces }, exposure: f32, tonemap: Reinhard | Aces }
+```
+
+`render`는 *시뮬레이션*이 그 채널을 어떻게 만드는지 말하고, `ImageSpec`은 그 채널이 *무엇*인지 말한다. 둘을 갈라 두는 것이 `observation.toml`이 노드 하나 바꾸지 않고 래스터화 태스크와 패스 트레이싱 태스크를 모두 섬길 수 있게 하고, `render`가 `ImageSpec`의 필드가 아닌 이유이기도 하다 — `ImageSpec`은 실제 로봇도 가질 수 있는 카메라를 기술하는데, "픽셀당 64 샘플"은 실제 카메라가 가진 것이 아니다.
+
+이 필드를 쓰지 않는 모든 문서에 대해 그것을 공짜로 만드는 규칙이 둘 있다:
+
+- **`#[serde(default, skip_serializing_if = "SensorRender::is_default")]`**. `render`를 한 번도 언급하지 않는 문서는 같은 바이트로 왕복한다.
+- **`ObsSource::canonical`은 기본값이 아닐 때만 블록을 쓴다.** 그래서 `task_hash`는 타입이 말할 수 있는 것이 아니라 문서가 *말한* 것의 함수다. 부재하는 `render`와 명시적으로 써 넣은 기본값 `render`는 같은 문서이고 같은 해시다; `crates/es-ir/tests/sensor_render.rs`가 커밋된 `task_hash eb6efefa…`에 대해 둘 다 단언한다.
+
+기본값이 오늘의 동작인 어떤 후속 필드에도 같은 수법이 통하고, 이것이 §28.10 규칙 1의 IR 쪽 해석이다. 대가는 정규 인코딩이 더 이상 구조체를 곧이곧대로 순회하는 것이 아니라는 점이다 — `SensorRender` *안에* 필드를 추가하면서 `SensorRender::canonical`을 늘리지 않으면 그 필드는 해시에 보이지 않는다. 그 파일의 두 번째 테스트가 노브를 하나씩 바꿔 가며 해시가 움직이는지 단언하는 이유가 그것이다.
+
 ## 어휘가 사는 곳 (`es-ir-types`, layer 2)
 
 `es-ir`은 다섯 개의 IR과 그래프 뼈대, 그래프 정규화기를 담는다; 그 아래에서 그래프가

@@ -665,6 +665,8 @@ ResetState        초기 상태 분포
 Record            데이터셋 기록 대상
 ```
 
+**센서의 렌더 경로.** `Sensor` 소스는 `render = { path = "rs" | "pt", spp, bounces, exposure, tonemap }`로 시뮬레이션이 그 센서를 어떻게 만드는지 선언한다(패킷 M7/R5). 기본값은 `rs`이며 **부재 = 기본값 = 오늘의 정규형**이라 커밋된 `task_hash`는 움직이지 않는다; `pt`는 `task_hash`를 움직이므로 새 문서다(§13.3). 관측 IR은 이것을 모른다 — 센서가 *무엇*인지는 `ImageSpec`이, 시뮬레이션이 그것을 *어떻게* 만드는지는 Task IR이 말한다.
+
 `Parallel`은 존재하지 않는다. 병렬화는 컴파일러가 결정한다. `Wait`·`Repeat`·`Condition`은 IR-C 또는 `Compare`+`Select`로 대체된다.
 
 ### 6.4 실행 의미론

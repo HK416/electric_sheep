@@ -180,35 +180,27 @@ macro_rules! dispatch_nj_h {
 /// One image channel: `MultiViewPack` is rejected upstream anyway, and a second camera would be
 /// a second frame directory this flag does not have a name for. The `ImageSpec` is the Task
 /// IR's, so a scene whose camera does not produce what the IR declares is refused by
-/// `EnvRenderer::check` rather than silently rendered at the wrong size (`INV-14`).
+/// `EnvRenderer::check` rather than silently rendered at the wrong size (`INV-14`), and the
+/// render path is the channel's own `render` declaration (packet M7/R5) -- there is no flag
+/// for it, because the document decides.
 #[cfg(feature = "render")]
 fn renderer_cfg(
     bundle: &PolicyBundle,
     frames: &std::path::Path,
 ) -> Result<es_env::EnvRendererCfg, CliError> {
-    let images: Vec<_> = bundle
-        .task
-        .observation_spec
-        .channels
-        .iter()
-        .filter_map(|(name, c)| c.ty.image.as_ref().map(|spec| (name, &c.ty.frame, spec)))
-        .collect();
-    let [(name, frame, spec)] = images.as_slice() else {
-        return Err(CliError::Runtime(format!(
-            "--frames needs exactly one image channel in the Task IR's ObservationSpec; it \
-             declares {}",
-            images.len()
-        )));
-    };
+    let (name, frame, spec, render) = crate::cmd::eval::image_channel(&bundle.task)?;
     let es_ir::types::Frame::Camera(camera) = frame else {
         return Err(CliError::Runtime(format!(
             "image channel {name:?} is not in a camera frame, so there is no camera to render \
              it from"
         )));
     };
-    let mut cfg = es_env::EnvRendererCfg::rgb(*camera, spec.width, spec.height);
-    cfg.frames_dir = Some(frames.to_path_buf());
-    Ok(cfg)
+    Ok(es_env::render::sensor_cfg(
+        camera,
+        &spec,
+        &render,
+        Some(frames.to_path_buf()),
+    ))
 }
 
 fn collect_typed<const NJ: usize, const H: usize>(
