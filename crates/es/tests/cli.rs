@@ -10385,3 +10385,570 @@ fn train_init_from_bundle_zero_steps() {
         train_lock(&out)["checkpoints"][0]["policy_hash"]
     );
 }
+
+// --- packet M8/S4b: the `[rl]` route and `python/es/train_ppo.py` --------------------------
+
+/// Workspace-root path of one of the RL fixture documents.
+fn rl_fixture(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/rl")
+        .join(name)
+}
+
+/// The demo scene's six `ctrlrange`s, read out of the parsed MJCF rather than transcribed --
+/// the same rule `deployment.toml`'s `safety.position` follows.
+fn demo_ctrlrange() -> Vec<(f64, f64)> {
+    let xml = std::fs::read_to_string(demo_scene_path()).expect("the demo scene");
+    let scene = es_assets::parse_mjcf(&xml)
+        .expect("the demo scene parses")
+        .scene;
+    scene
+        .actuators
+        .iter()
+        .map(|a| {
+            a.ctrl_range
+                .expect("every sts3215 actuator declares a ctrlrange")
+        })
+        .collect()
+}
+
+/// The Learning IR an RL run optimizes: the state-only Observation IR's two ports, an MLP
+/// each, and a horizon-1 regression head whose output is unnormalized into actuator units.
+///
+/// It is `learning.toml`'s graph with the vision branch dropped and three things changed, and
+/// every one of them is forced by `rl-continuation.md` rather than chosen here:
+///
+///  * `horizon = 1` / `execute_chunk = 1` -- PPO acts on every control tick (section 3), so
+///    the deployment, the chunker and the head all carry the same 1.
+///  * a `Normalizer { Inverse, MeanStd }` at the end, with `mean` the centre of each
+///    actuator's `ctrlrange` and `std` its half-range (section 5). That makes the module's
+///    output **actuator units**, which is what `Rollout::act` takes and therefore what the
+///    trainer's Gaussian is defined around (section 2). Training does not move these numbers:
+///    they are the scene's, not the data's.
+///  * `hidden = [64, 64]` with the S2a defaults (`Relu`, no output activation). A PPO actor
+///    is small on purpose; the 256-wide demo encoder is sized for imitating from pixels.
+fn rl_learning() -> LearningGraph {
+    use es_ir::learning::{NormalizeDir, StatsSource};
+
+    let feature = |dim: u64| PortType {
+        elem: ElemType::F32,
+        shape: Shape::new([dim]),
+        unit: Unit::Dimensionless,
+        frame: Frame::Policy,
+        time: TimeRef::Tick,
+        image: None,
+    };
+    let chunk = |unit: Unit| PortType {
+        elem: ElemType::F32,
+        shape: Shape::new([1, 6]),
+        unit,
+        frame: Frame::Policy,
+        time: TimeRef::Tick,
+        image: None,
+    };
+    let normalized = |lo: f64, hi: f64, dim: u64| PortType {
+        elem: ElemType::F32,
+        shape: Shape::new([dim]),
+        unit: Unit::Normalized { lo, hi },
+        frame: Frame::Policy,
+        time: TimeRef::Tick,
+        image: None,
+    };
+    // The two ports `tests/fixtures/rl/observation-state.toml` produces, at the types that
+    // document declares -- the demo's own, because it is the demo's document with the camera
+    // branch removed.
+    let joint = Port::new("joint_state", normalized(-1.0, 1.0, 6));
+    let cube = Port::new("sim_cube_pose", normalized(-0.3, 0.3, 7));
+
+    let encoder = |input: Port| LearningNode::StateEncoder {
+        inputs: vec![input],
+        kind: StateEncoderKind::Mlp {
+            hidden: vec![64, 64],
+            activation: Activation::Relu,
+            activate_output: false,
+        },
+        out_dim: 64,
+    };
+    let mut nodes: Graph<LearningNode> = Graph::new(1);
+    nodes.insert(NodeId(0), encoder(joint.clone()));
+    nodes.insert(NodeId(1), encoder(cube.clone()));
+    nodes.insert(
+        NodeId(2),
+        LearningNode::Fusion {
+            inputs: vec![
+                Port::new("state", feature(64)),
+                Port::new("cube", feature(64)),
+            ],
+            kind: FusionKind::Concat,
+            out_dim: 128,
+            token_count: 0,
+        },
+    );
+    nodes.insert(
+        NodeId(3),
+        LearningNode::PolicyHead {
+            inputs: vec![Port::new("feat", feature(128))],
+            kind: HeadKind::Regression,
+            action_dim: 6,
+            horizon: 1,
+            // The head's output is squashed into [-1, 1] before the unnormalizer, so the
+            // Gaussian's mean is always inside the actuator's own range and the plane is
+            // clamping the *sample*, not a mean that left the envelope (packet M8/S2a).
+            squash: Squash::Tanh,
+        },
+    );
+    nodes.insert(
+        NodeId(4),
+        LearningNode::ActionChunker {
+            inputs: vec![Port::new(
+                "chunk",
+                chunk(Unit::Normalized { lo: -1.0, hi: 1.0 }),
+            )],
+            horizon: 1,
+            execute_chunk: 1,
+            replan_hz: 50.0,
+            mode: ActionExecutionMode::RecedingHorizon,
+            blend: ChunkBlendPolicy::HardSwitch,
+            buffer_chunks: 2,
+        },
+    );
+    let range = demo_ctrlrange();
+    nodes.insert(
+        NodeId(5),
+        LearningNode::Normalizer {
+            inputs: vec![Port::new(
+                "actions",
+                chunk(Unit::Normalized { lo: -1.0, hi: 1.0 }),
+            )],
+            direction: NormalizeDir::Inverse,
+            stats: StatsSource::MeanStd {
+                mean: range.iter().map(|(lo, hi)| (lo + hi) / 2.0).collect(),
+                std: range.iter().map(|(lo, hi)| (hi - lo) / 2.0).collect(),
+            },
+            out_unit: Unit::Angle,
+        },
+    );
+    nodes.connect(NodeId(0), "out", NodeId(2), "state");
+    nodes.connect(NodeId(1), "out", NodeId(2), "cube");
+    nodes.connect(NodeId(2), "out", NodeId(3), "feat");
+    nodes.connect(NodeId(3), "chunk", NodeId(4), "chunk");
+    nodes.connect(NodeId(4), "actions", NodeId(5), "actions");
+    nodes.inputs.push(PortRef::new(NodeId(0), "joint_state"));
+    nodes.inputs.push(PortRef::new(NodeId(1), "sim_cube_pose"));
+    nodes.outputs.push(PortRef::new(NodeId(5), "out"));
+
+    let mut contract_inputs = BTreeMap::new();
+    contract_inputs.insert("joint_state".to_owned(), joint.clone());
+    contract_inputs.insert("sim_cube_pose".to_owned(), cube.clone());
+    LearningGraph {
+        schema_version: 1,
+        inputs: vec![joint, cube],
+        nodes,
+        outputs: vec![Port::new("actions", chunk(Unit::Angle))],
+        policy: PolicyHandle {
+            architecture: ArchKind::Act,
+            base_model: None,
+            weights: WeightsRef::Safetensors {
+                path: "policy.safetensors".to_owned(),
+                hash: [0; 32],
+            },
+            contract: PolicyContract {
+                inputs: contract_inputs,
+                action_dim: 6,
+                horizon: 1,
+                execute_chunk: 1,
+                observation_window: 1,
+                replanning_hz: 50.0,
+                execution_mode: ActionExecutionMode::RecedingHorizon,
+                runtime: RuntimeHints {
+                    // Horizon 1 and synchronous: the rollout declares no latency, and the
+                    // evaluation of the same policy is what runs under one (section 3).
+                    expected_latency_ms: 0.0,
+                    deadline_ms: 20.0,
+                    dtype: ElemType::F32,
+                },
+            },
+        },
+    }
+}
+
+/// Regenerates `tests/fixtures/rl/learning-state.toml`. Run once, explicitly; it is then
+/// read-only (spec 1.4), like every other generated fixture in this repository.
+#[test]
+#[ignore = "fixture generator; run explicitly"]
+fn generate_rl_learning_document() {
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP generate_rl_learning_document: set ES_GENERATE_GOLDENS=1");
+        return;
+    }
+    let header = "\
+# Learning IR (spec 8) for the demo task under PPO -- packet M8/S4b.
+#
+# Generated by `ES_GENERATE_GOLDENS=1 cargo test -p es --test cli -- --ignored
+# generate_rl_learning_document` from tests/fixtures/mjcf/so101_pick_place.xml, so the
+# unnormalizer's mean and std are the scene's own `ctrlrange`s and are never typed in.
+#
+#   StateEncoder{Mlp [64, 64]}  -.
+#                                Fusion{Concat} -> PolicyHead{Regression, tanh, 1 x 6}
+#   StateEncoder{Mlp [64, 64]}  -'                  -> ActionChunker -> Normalizer{Inverse}
+#
+# It reads tests/fixtures/rl/observation-state.toml's two ports -- the demo's Observation IR
+# with the camera branch removed -- and its output is in **actuator units**, which is what
+# `es_native.Rollout::act` takes and therefore what `train_ppo.py`'s Gaussian is defined
+# around (docs/design/rl-continuation.md section 2).
+#
+# The value network and the Gaussian's `log_std` are NOT here and never will be: PPO is a
+# trainer, not an IR (rule 1). They live in `training/value.safetensors` and move
+# `training_hash`, never `learning_hash`.
+";
+    let text = es_ir::serial::learning_to_toml(&rl_learning()).expect("the RL graph serialises");
+    write(
+        &rl_fixture("learning-state.toml"),
+        &format!("{header}{text}"),
+    );
+}
+
+/// The bundle an `[rl]` recipe names: the demo Task IR, the state-only Observation IR, the
+/// horizon-1 Learning IR and the RL Deployment IR, packed with placeholder weights.
+fn write_rl_bundle(dir: &Path, name: &str) -> PathBuf {
+    let bytes = pack_untrained(
+        &vl_fixture("task.toml"),
+        &rl_fixture("observation-state.toml"),
+        &rl_fixture("learning-state.toml"),
+        &rl_fixture("deployment-rl.toml"),
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("write the rl bundle");
+    path
+}
+
+/// `name -> the tensor's raw bytes`, for comparing two safetensors files whose headers were
+/// written by two different writers.
+fn tensor_bytes(blob: &[u8]) -> BTreeMap<String, Vec<u8>> {
+    let header = es_policy::weights::parse_header(blob).expect("safetensors");
+    let base = 8 + u64::from_le_bytes(blob[..8].try_into().expect("the length prefix")) as usize;
+    header
+        .iter()
+        .map(|(name, entry)| {
+            let (a, b) = (entry.offsets.0 as usize, entry.offsets.1 as usize);
+            (name.clone(), blob[base + a..base + b].to_vec())
+        })
+        .collect()
+}
+
+/// The committed `[rl]` recipe with `[policy] bundle` pointed at a real one and the budget
+/// cut to whatever the caller can afford to run twice.
+fn rl_recipe(bundle: &Path, iterations: u32, envs: u32, horizon: u32, marks: &str) -> String {
+    let text = std::fs::read_to_string(rl_fixture("training-rl-demo.toml")).expect("the recipe");
+    let body = text.split_once("kind = ").expect("the recipe has a body").1;
+    format!("kind = {body}")
+        .replace(
+            "bundle = \"runs/rl-001/untrained.esb\"",
+            &format!("bundle = \"{}\"", train_toml_path(bundle)),
+        )
+        .replace("envs        = 8", &format!("envs        = {envs}"))
+        .replace("horizon     = 64", &format!("horizon     = {horizon}"))
+        .replace(
+            "steps         = 200",
+            &format!("steps         = {iterations}"),
+        )
+        .replace(
+            "checkpoint_at = [50]",
+            &format!("checkpoint_at = [{marks}]"),
+        )
+        .replace(
+            "interpreter   = \"python\"",
+            "interpreter   = \"es-no-such-interpreter\"",
+        )
+}
+
+/// Oracle 1. The `[rl]` plan is a property of the recipe -- same bytes on any machine, in any
+/// output directory -- and the two fields the route does not have are refused **by name**.
+///
+/// No bundle and no Python: `--dry-run` on this route opens neither, which is what lets the
+/// golden be judged on a machine that has only the repository.
+#[test]
+fn train_rl_dry_run_plan() {
+    const RECIPE: &str = "tests/fixtures/rl/training-rl-demo.toml";
+    let dir = scratch_dir("train-rl-dry");
+    let out = run_train(RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let golden = train_golden("plan-rl.txt");
+    let want =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(stdout(&out), want, "{RECIPE}: stdout is not the golden");
+    let written = std::fs::read_to_string(dir.join("training").join("plan.txt"))
+        .expect("--dry-run writes training/plan.txt");
+    assert_eq!(written, want, "{RECIPE}: plan.txt is not the golden");
+    // The route is `rl`, there is no bake, and the trainer is the PPO one.
+    assert!(want.starts_with("# route: rl\n"), "{want}");
+    assert!(!want.contains("es dataset bake"), "{want}");
+    assert!(want.contains("python/es/train_ppo.py"), "{want}");
+    assert!(want.contains("--rollout-docs docs"), "{want}");
+    // No identity is claimed for a run that did not happen.
+    assert!(!dir.join("training.lock").exists());
+
+    let text = std::fs::read_to_string(rl_fixture("training-rl-demo.toml")).expect("the recipe");
+    let refused = |body: &str, wanted: &str| {
+        let recipe = dir.join("refused.toml");
+        write(&recipe, body);
+        let done = run_train(&train_toml_path(&recipe), &dir.join("refused"), &[]);
+        let said = format!("{}{}", stdout(&done), stderr_of(&done));
+        assert!(!done.status.success(), "accepted:\n{body}");
+        assert!(said.contains(wanted), "wanted {wanted:?}, said:\n{said}");
+    };
+    // `[run] batch` beside `[rl]`: refused by name, with the derived number in the message,
+    // rather than silently ignored into `precision.json`.
+    refused(
+        &text.replace(
+            "steps         = 200",
+            "steps         = 200\nbatch         = 8",
+        ),
+        "`batch` is 8 and this recipe has an `[rl]` table",
+    );
+    // ... and the mirror of it: the two demonstration routes still owe a batch.
+    refused(
+        &std::fs::read_to_string(vl_fixture("training.toml"))
+            .expect("training.toml")
+            .replace("batch         = 8\n", ""),
+        "[run] `batch` is required",
+    );
+    // `[dataset]` is *accepted* absent here, which the golden above already proves, and a
+    // `[dataset]`-less recipe on the IR route is still the old refusal.
+    refused(
+        &std::fs::read_to_string(vl_fixture("training.toml"))
+            .expect("training.toml")
+            .replace("[dataset]", "[unused]"),
+        "unknown field",
+    );
+    // A second algorithm is a value, not a table: it is refused until it is implemented.
+    refused(
+        &text.replace("algo        = \"ppo\"", "algo        = \"sac\""),
+        "[rl] `algo` is \"sac\"",
+    );
+    // A minibatch count that does not divide `envs * horizon` would weight the last rows of
+    // every epoch differently, so it is named rather than rounded.
+    refused(
+        &text.replace("minibatches = 4", "minibatches = 7"),
+        "it has to divide them",
+    );
+}
+
+/// Regenerates `tests/golden/train/plan-rl.txt`.
+#[test]
+#[ignore = "golden generator; run explicitly"]
+fn generate_rl_plan_golden() {
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP generate_rl_plan_golden: set ES_GENERATE_GOLDENS=1 to regenerate");
+        return;
+    }
+    let dir = scratch_dir("train-rl-golden");
+    let out = run_train(
+        "tests/fixtures/rl/training-rl-demo.toml",
+        &dir,
+        &["--dry-run"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    write(&train_golden("plan-rl.txt"), &stdout(&out));
+}
+
+/// Runs one real `[rl]` recipe end to end under `ES_PYTHON`, or says why it did not.
+///
+/// `ES_PYTHON` has to name an interpreter with **torch, mujoco and the `es_native`
+/// extension**: the trainer steps `es_native.Rollout`, which runs the `MuJoCo` reference
+/// backend out of process. `python/es/README.md` has the one `maturin develop` line that
+/// builds it.
+fn run_rl_train(recipe: &str, dir: &Path, name: &str) -> Option<(PathBuf, String)> {
+    let Ok(python) = std::env::var("ES_PYTHON") else {
+        println!("SKIP {name}: ES_PYTHON is not set");
+        return None;
+    };
+    let path = dir.join(format!("{name}.toml"));
+    write(&path, recipe);
+    let out = dir.join(name);
+    let done = bin()
+        .current_dir(train_root())
+        .args(["train", "--recipe", &train_toml_path(&path), "--out"])
+        .arg(&out)
+        .output()
+        .expect("run es train");
+    let said = format!("{}{}", stdout(&done), stderr_of(&done));
+    if !done.status.success() {
+        // A missing package is a skip with the interpreter's own words, never a green test
+        // (spec 1.4): every other Python oracle in this repository reports it the same way.
+        if said.contains("cannot import") || said.contains("es_native is not importable") {
+            println!("SKIP {name}: {python} cannot import what the rl route needs\n{said}");
+            return None;
+        }
+        panic!("es train failed:\n{said}");
+    }
+    Some((out, said))
+}
+
+/// Oracle 2. Two runs of one `[rl]` recipe on the CPU backend are bitwise equal -- every
+/// checkpoint, the `training_hash` and the loss curve -- and the run records what it does not
+/// know rather than inventing it.
+///
+/// This is spec 3.5 tier 1 for a *trainer*: the env's RNG, the action noise and the minibatch
+/// order are all seeded and local, so the only thing that could move the bits is a
+/// non-deterministic kernel, and `torch.use_deterministic_algorithms(True)` turns that into
+/// an error rather than a different number.
+#[test]
+fn train_rl_two_runs_are_bitwise() {
+    const TEST: &str = "train_rl_two_runs_are_bitwise";
+    let dir = scratch_dir("train-rl-bitwise");
+    let bundle = write_rl_bundle(&dir, "untrained.esb");
+    let recipe = rl_recipe(&bundle, 3, 4, 16, "0,3").replace(
+        "interpreter   = \"es-no-such-interpreter\"",
+        "interpreter   = \"python\"",
+    );
+    let Some((a, _)) = run_rl_train(&recipe, &dir, "run-a") else {
+        return;
+    };
+    let (b, _) = run_rl_train(&recipe, &dir, "run-b").expect("the first run resolved ES_PYTHON");
+
+    for mark in ["0", "3"] {
+        let name = format!("checkpoints/{mark}.esb");
+        let (x, y) = (
+            std::fs::read(a.join(&name)).expect(&name),
+            std::fs::read(b.join(&name)).expect(&name),
+        );
+        assert_eq!(
+            hex(blake3::hash(&x).as_bytes()),
+            hex(blake3::hash(&y).as_bytes()),
+            "{name} is not bitwise between two runs of one recipe"
+        );
+    }
+    assert_eq!(
+        train_lock(&a)["training_hash"],
+        train_lock(&b)["training_hash"],
+        "two identical runs have two training_hashes"
+    );
+    // `dataset.lock` reads `unset` -- the file, hashed as such, not a zero digest.
+    let lock = std::fs::read_to_string(a.join("training").join("dataset.lock")).expect("lock");
+    assert_eq!(lock, "{\"unset\":true}\n", "dataset.lock is {lock}");
+    // The value network is written for resumption and is *not* in any bundle: the lowered
+    // module declares no such tensor, so `es policy pack` could not have taken it.
+    assert!(a.join("training").join("value.safetensors").is_file());
+
+    let curve: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(a.join("metrics").join("loss-curve.json")).expect("curve"),
+    )
+    .expect("the curve is JSON");
+    let rows = curve.as_array().expect("the curve is an array");
+    assert_eq!(rows.len(), 3, "one row per iteration: {curve}");
+    for field in [
+        "loss",
+        "policy_loss",
+        "value_loss",
+        "entropy",
+        "return",
+        "episode_len",
+        "envelope_violation_rate",
+        "executed_ne_sampled_rate",
+        "samples_per_sec",
+    ] {
+        assert!(
+            rows[0][field].is_number(),
+            "loss-curve.json has no {field}: {curve}"
+        );
+    }
+    println!("RAN {TEST}: 3 iterations twice, bitwise");
+}
+
+/// Oracle 3. A run that starts from `[init] policy` *is* that policy at iteration 0.
+///
+/// `[run] checkpoint_at = [0]` writes the module's state before the first update, so
+/// `checkpoints/0.esb` has to carry the tensors the source bundle carried, bit for bit -- the
+/// S1 identity, now through the PPO trainer. The source here is a bundle this test packs
+/// itself from the same documents with drawn weights; swapping it for S2b's synthetic
+/// playground import is the fixture change that packet owns.
+#[test]
+fn train_rl_init_from_import() {
+    const TEST: &str = "train_rl_init_from_import";
+    let dir = scratch_dir("train-rl-init");
+    let bundle = write_rl_bundle(&dir, "untrained.esb");
+
+    // A real checkpoint for *this* graph's own lowering: every key the module declares,
+    // filled with a value derived from the key so no two tensors are equal.
+    let learning = es_ir::serial::learning_from_toml(
+        &std::fs::read_to_string(rl_fixture("learning-state.toml")).expect("learning-state"),
+    )
+    .expect("learning-state.toml");
+    let module = es_policy::lower_to_torch(&learning).expect("the RL graph lowers");
+    let tensors: es_policy::weights::Checkpoint = module
+        .weight_shapes
+        .iter()
+        .map(|(key, shape)| {
+            let n: u64 = shape.iter().product();
+            let seed = f32::from(u8::try_from(key.len()).unwrap_or(7));
+            let values = (0..n).map(|i| seed + i as f32 * 0.25).collect();
+            (key.clone(), (shape.clone(), values))
+        })
+        .collect();
+    let weights = es_policy::weights::write_safetensors(&tensors);
+    let source = dir.join("source.esb");
+    std::fs::write(
+        &source,
+        es_compile::PolicyBundle::build(
+            &es_ir::serial::task_from_toml(
+                &std::fs::read_to_string(vl_fixture("task.toml")).expect("task"),
+            )
+            .expect("task.toml"),
+            &es_ir::serial::observation_from_toml(
+                &std::fs::read_to_string(rl_fixture("observation-state.toml")).expect("obs"),
+            )
+            .expect("observation-state.toml"),
+            &{
+                let mut g = learning.clone();
+                g.policy.weights = es_ir::learning::WeightsRef::Safetensors {
+                    path: "policy.safetensors".to_owned(),
+                    hash: *blake3::hash(&weights).as_bytes(),
+                };
+                g
+            },
+            &es_ir::serial::deployment_from_toml(
+                &std::fs::read_to_string(rl_fixture("deployment-rl.toml")).expect("deployment"),
+            )
+            .expect("deployment-rl.toml"),
+            &weights,
+        )
+        .expect("the source documents pack"),
+    )
+    .expect("write source.esb");
+
+    // `steps = 1` and a mark at 0: one iteration so the run is real, and the mark that is
+    // written before it so the comparison is against the state the run started from.
+    let recipe = rl_recipe(&bundle, 1, 4, 16, "0")
+        .replace(
+            "interpreter   = \"es-no-such-interpreter\"",
+            "interpreter   = \"python\"",
+        )
+        .replace(
+            "[run]\n",
+            &format!("[init]\npolicy = \"{}\"\n[run]\n", train_toml_path(&source)),
+        );
+    let Some((out, said)) = run_rl_train(&recipe, &dir, "init") else {
+        return;
+    };
+
+    // Every tensor the module declares was copied, so iteration 0 is the source exactly.
+    let lock = init_lock(&out);
+    assert!(
+        names(&lock, "copied").len() == module.weight_shapes.len(),
+        "the source shares every tensor with the module\n{lock}"
+    );
+    let packed = std::fs::read(out.join("checkpoints").join("0.esb")).expect("0.esb");
+    let opened = es_compile::PolicyBundle::open(&packed).expect("0.esb opens");
+    // Tensor by tensor, not file byte by file byte: the source was written by
+    // `es_policy::weights::write_safetensors` and this one by `train_ppo.py`, and the two
+    // spell one header's keys in two orders (`data_offsets` first vs `dtype` first). What
+    // "bitwise" means for a checkpoint is the *tensors*, and those are compared raw here --
+    // no tolerance, no epsilon.
+    assert_eq!(
+        tensor_bytes(&opened.weights),
+        tensor_bytes(&weights),
+        "iteration 0 is not the policy this run started from, bit for bit\n{said}"
+    );
+    println!("RAN {TEST}: iteration 0 == [init] policy, bitwise");
+}

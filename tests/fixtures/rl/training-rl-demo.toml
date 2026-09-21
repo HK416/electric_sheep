@@ -1,0 +1,56 @@
+# The RL route (packet M8/S4b): PPO against the Task IR's reward, over rollouts in our own
+# `Env` and through our own Safety Plane.
+#
+# `es train --recipe tests/fixtures/rl/training-rl-demo.toml --out <dir> --dry-run` prints the
+# plan pinned by `tests/golden/train/plan-rl.txt`. As with the recipes under
+# `tests/fixtures/visible-learning/`, nothing here needs to exist for `--dry-run`: the path
+# under `runs/` is the shape `es policy pack` writes, and that is what makes the golden
+# judgeable without a bundle and without Python.
+#
+# Three things are absent on purpose, and each of them is a refusal if you put it back:
+#
+#  * **`[dataset]`.** PPO's data is the rollout it generates, so there is nothing on disk to
+#    name. `training/dataset.lock` reads `{"unset": true}` and is hashed as such -- never a
+#    zero digest and never a fabricated one (spec 28.10 rule 2).
+#  * **`[run] batch`.** A PPO iteration's batch is `[rl] envs * horizon` = 512 rows, derived
+#    rather than declared. A second copy of it here is a number that could disagree with the
+#    one the run used, so it is refused by name.
+#  * **the value head and `log_std`.** They are training-only state and live in
+#    `training/value.safetensors` (`docs/design/rl-continuation.md` rule 1). They move
+#    `training_hash` and never `learning_hash`, which is why nothing in this document or in
+#    the bundle mentions them.
+#
+# The task, the observation and the deployment all come out of `[policy] bundle` -- the demo
+# Task IR, `observation-state.toml` (the demo's, camera branch removed) and
+# `deployment-rl.toml` (the demo's, horizon 1 and a widened violation-rate watchdog). `es
+# train` writes them back out under `<out>/docs/` beside the scene and hands the directory to
+# the trainer, so the env stepped is the one the policy was declared against.
+#
+# `[run] steps` is the PPO iteration count. `envs = 8`, `horizon = 64` is the budget packet
+# S4b measured on the oracle server; `docs/design/rl-continuation.md` section 7 carries the
+# wall-clock and the nine spec 12.4 metrics it took.
+
+kind = "training"
+
+[policy]
+bundle = "runs/rl-001/untrained.esb"
+
+[rl]
+algo        = "ppo"
+envs        = 8
+horizon     = 64
+epochs      = 4
+minibatches = 4
+gamma       = 0.99
+lam         = 0.95
+clip        = 0.2
+entropy     = 0.005
+value_coef  = 0.5
+
+[run]
+steps         = 200
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [50]
+device        = "cpu"
+interpreter   = "python"
