@@ -82,6 +82,7 @@
 # --- 결과 탭 ------------------------------------------------------------------------------
 "results.empty" = "아직 보여 줄 것이 없습니다. 설계 탭의 첫 화면에서 실행 결과를 열거나, 위의 시작을 눌러 새로 실행하세요."
 "column.cell" = "항목"
+"column.stage" = "단계"
 "column.suite" = "묶음"
 "column.seed" = "난수 씨앗"
 "column.traj" = "움직임 기록"
@@ -92,6 +93,7 @@
 "results.pass" = "통과"
 "results.fail" = "실패"
 "results.not_measured" = "재지 않음"
+"results.joined_late" = "(도중에 붙음)"
 "results.select_cell" = "위에서 항목을 고르면 안전 기록과 사진을 볼 수 있습니다."
 "results.frames" = "사진"
 "results.no_image" = "보내오는 화면이 없습니다. --telemetry-image-every로 사진을 보내 달라고 하세요."

@@ -1034,6 +1034,35 @@ Windows 11, `malgun.ttf`를 찾아 설치. 두 언어의 첫 화면, E4 고정�
 누군가 시범 보인 에피소드인지 누군가 판정한 셀인지 모른다.
 `live_run_folds_collect_episodes_like_cells`가 그 주장이다.
 
+### 로컬 사이클 시연 뒤에 정한 접기 규칙 셋 (M7/R12, 리뷰 R12와 R16)
+
+2026-09-21 시연에서 표가 행을 셀 이름만으로 구분하고 있었다. 규칙은 셋이고 모두
+`model/live_run.rs`에 있다.
+
+- **행은 셀이 아니라 `(단계, 셀)`이다.** 전문가 관문과 정책 평가는 첫 에피소드를 둘 다
+  `nominal-00`이라고 부른다. 그래서 소켓 하나 위에서 뒤엣것이 앞엣것의 행에 들어가, 정책이
+  아직 돌고 있는데도 관문의 `success_rate 1.0`이 보였다. `cell_key(stage, cell)`이 그 쌍을
+  키로 만드는 단 한 곳이다 — `"<단계> / <셀>"`, 단계가 없으면 셀 이름 그대로. 그래서
+  `RunView`와 E4의 오라클은 건드리지 않는다. 스위트 행도 같은 방식으로 키를 매긴다. 관문의
+  `suite.end`는 평가의 것이 아니기 때문이다. 단계는 이벤트 자신의 `stage` 필드, 없으면 마지막
+  `stage.begin`, 그것도 없으면 빈 문자열이다. 행은 단계가 **도착한 순서**로 정렬한다.
+  `eval`이 `expert-gate`보다 앞서 정렬되지만 사이클이 그 순서로 돌지는 않기 때문이다.
+- **열린 셀이 없는 표본은 기다린다.** 에피소드 도중에 붙은 뷰어는 아무것도 이름을 붙여 주기 전에
+  스트림 2 표본을 듣는다. 그 표본은 대기열에 둔다. 다음 `cell.end` / `episode.end`가 그것을
+  가져가고, 자기 필드(`frames` / `steps`, `outcome`, `traj`)로 행을 만들고 **도중에 붙음**으로
+  표시한다. `begin`이 먼저 오면 버린다. 아무도 이름을 붙이지 않을 셀의 것이고, 짐작하면 한
+  에피소드의 기록이 다른 에피소드의 이름 아래 놓인다. 끝 이벤트가 이름을 대기 전까지는 행이
+  없다 — `a_tick_outside_any_cell_is_dropped_not_guessed`의 뜻은 그대로다.
+- **"도중에 붙음"은 감추지 않고 보여 준다.** 두 문자열 표의 `results.joined_late`를 셀 이름
+  옆에 그리고, `status()`가 그 수를 센다. 그 행이 보여 주는 것은 뷰어가 들은 부분이지 에피소드
+  전체가 아니고, `frames`를 읽는 사람은 그 차이를 알 자격이 있다.
+
+`live_run_keys_rows_by_stage_and_cell`과 `a_cell_that_began_before_attach_still_gets_a_row`가
+그 두 주장이다. 소유자의 확인은 로컬 사이클 자체다: `target/plan-u/demo/cycle.toml`을
+`target/plan-u/demo/drive-cycle.ps1`로 돌리고 에디터를 붙였을 때 수집 12 + 관문 4 + 평가 4가
+**행 20개**로 따로 보여야 한다. CI가 판정할 수 없고(§1.4), 대신 재생할 그 시연의 프레임 기록도
+남아 있지 않다. 남은 것은 원장(`target/plan-u/demo/out/loop.jsonl`)뿐이다.
+
 ### Training 절, 그리고 플로팅 크레이트가 없는 이유
 
 `model/train_view.rs`가 전부다. 스트림 5를 `Curve { step, loss, lr }`로 접고,

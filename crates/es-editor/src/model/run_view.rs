@@ -56,6 +56,10 @@ pub struct CellRow {
     /// The on-disk cell name, `<suite>-<NN>` for a run that wrote frames or trajectories, and
     /// the bare suite name for a report that stands alone.
     pub name: String,
+    /// The stage of `es loop cycle` this cell ran in, for a run heard on the wire (packet
+    /// M7/R12). Always empty here: a run read off disk is one run, and the directory says
+    /// nothing about the cycle that may have produced it.
+    pub stage: String,
     pub suite: String,
     /// The seed this episode ran under, when `evaluation.lock` is beside the report (spec
     /// 10.5). `report.json` alone does not carry seeds, and an invented one is worse than
@@ -543,6 +547,7 @@ fn build_rows(
                 n_episodes = n_episodes.max(cell.n_episodes);
             }
             CellRow {
+                stage: String::new(),
                 seed: episode_index(&name, &suite).and_then(|i| seeds.get(i).copied()),
                 metrics,
                 n_episodes,

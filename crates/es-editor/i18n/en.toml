@@ -83,6 +83,7 @@
 # --- the Results tab --------------------------------------------------------------------
 "results.empty" = "Nothing to show yet. Open a run result from the Design tab's home screen, or press Start above to begin one."
 "column.cell" = "Case"
+"column.stage" = "Step"
 "column.suite" = "Group"
 "column.seed" = "Seed"
 "column.traj" = "Motion saved"
@@ -93,6 +94,7 @@
 "results.pass" = "ok"
 "results.fail" = "FAILED"
 "results.not_measured" = "not measured"
+"results.joined_late" = "(joined part-way)"
 "results.select_cell" = "Pick a case above to see its safety history and its pictures."
 "results.frames" = "Pictures"
 "results.no_image" = "Nothing is being sent. Ask the run for pictures with --telemetry-image-every."

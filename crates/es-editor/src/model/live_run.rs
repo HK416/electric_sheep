@@ -40,9 +40,31 @@ pub const RUN_STREAMS: [StreamId; 5] = [
     crate::model::train_view::STREAM_TRAIN,
 ];
 
+/// The row's identity (packet M7/R12): the stage a cell ran in and the cell's own name. A
+/// cycle publishes every stage on one socket and two stages name their episodes alike — the
+/// expert gate's `nominal-00` is not the evaluation's — so the name alone is not a row.
+///
+/// The one place the key is built, because `app.rs` rebuilds it from a [`CellRow`] to select a
+/// row or ask for its timeline. A run read off disk has no stage, and its key is its cell name
+/// unchanged, which is what keeps `RunView` and E4's oracle out of this.
+pub fn cell_key(stage: &str, cell: &str) -> String {
+    if stage.is_empty() {
+        cell.to_owned()
+    } else {
+        format!("{stage} / {cell}")
+    }
+}
+
 /// One episode as the wire described it.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct LiveCell {
+    /// The cell's own name, without the stage: what the table's first column shows.
+    name: String,
+    /// The stage it ran in, empty for a run that is one command.
+    stage: String,
+    /// Where that stage arrived in the cycle — `eval` sorts before `expert-gate`, which is not
+    /// the order a cycle runs them in.
+    order: usize,
     suite: String,
     seed: Option<u64>,
     records: Vec<StepEvent>,
@@ -50,6 +72,8 @@ struct LiveCell {
     has_traj: bool,
     /// The `cell.end` outcome (`Success`, `Timeout`, ...); `None` while it is still running.
     outcome: Option<String>,
+    /// The viewer attached after this cell had begun, so the row was made by its end event.
+    joined_late: bool,
 }
 
 /// One suite's row of the spec 10.1 table, as `suite.end` stated it.
@@ -84,13 +108,20 @@ impl StageRow {
 /// one.
 #[derive(Clone, Debug, Default)]
 pub struct LiveRun {
-    /// Keyed by cell name, which is also the order the table shows them in — the same order
-    /// `RunView` sorts its rows into on open.
+    /// Keyed by [`cell_key`], so a stage's rows are contiguous and in cell-name order inside
+    /// it — the order `RunView` sorts its rows into, once [`Self::cells`] has put the stages
+    /// back in the order they arrived.
     cells: BTreeMap<String, LiveCell>,
+    /// One suite row per `(stage, suite)`, keyed by [`cell_key`] too: the expert gate's
+    /// `suite.end` is not the evaluation's, even when both suites are called `nominal`.
     suites: BTreeMap<String, LiveSuite>,
     /// The episode currently running, which is what a stream-2 sample belongs to: the wire
     /// carries numbers, and `cell.begin` / `cell.end` are what name them.
     open: Option<String>,
+    /// Samples that arrived with no open cell: a viewer that attached mid-episode heard them
+    /// before anything named the cell. Claimed by the next end event, discarded by the next
+    /// begin (packet M7/R12).
+    pending: Vec<StepEvent>,
     /// The latest observation image (stream 4), when the producer was asked for one, and how
     /// many have arrived — the sequence number a viewer keys its texture on, so one image is
     /// uploaded once and not once per repaint.
@@ -135,50 +166,29 @@ impl LiveRun {
 
     fn event(&mut self, kind: &str, fields: &BTreeMap<String, String>) {
         let get = |k: &str| fields.get(k).cloned().unwrap_or_default();
+        let count = |k: &str| fields.get(k).and_then(|s| s.parse().ok()).unwrap_or(0);
         match kind {
-            "cell.begin" => {
-                let name = get("cell");
-                let cell = self.cells.entry(name.clone()).or_default();
-                cell.suite = get("suite");
-                cell.seed = fields.get("seed").and_then(|s| s.parse().ok());
-                self.open = Some(name);
-            }
-            "cell.end" => {
-                let name = get("cell");
-                if let Some(cell) = self.cells.get_mut(&name) {
-                    cell.frames = fields
-                        .get("frames")
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    cell.has_traj = fields.get("traj").is_some_and(|s| s == "true");
-                    cell.outcome = Some(get("outcome"));
-                }
-                self.open = None;
-            }
+            "cell.begin" => self.begin(fields, get("cell"), get("suite")),
+            "cell.end" => self.end(
+                fields,
+                get("cell"),
+                get("suite"),
+                count("frames"),
+                fields.get("traj").is_some_and(|s| s == "true"),
+            ),
             // An episode of `es loop collect` is a row of the same table (packet M7/E7). It
             // has no suite of its own, so the stage it came from is the column's value: a
             // cycle's Run tab then reads "collect / episode-00" beside "nominal / nominal-00".
-            "episode.begin" => {
-                let name = episode_cell(&get("episode"));
-                let cell = self.cells.entry(name.clone()).or_default();
-                cell.suite = get("stage");
-                cell.seed = fields.get("seed").and_then(|s| s.parse().ok());
-                self.open = Some(name);
-            }
-            "episode.end" => {
-                let name = episode_cell(&get("episode"));
-                if let Some(cell) = self.cells.get_mut(&name) {
-                    // A collection writes rows, not frames: the count a person wants beside
-                    // the episode is the steps it recorded.
-                    cell.frames = fields
-                        .get("steps")
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(0);
-                    cell.has_traj = true;
-                    cell.outcome = Some(get("outcome"));
-                }
-                self.open = None;
-            }
+            "episode.begin" => self.begin(fields, episode_cell(&get("episode")), get("stage")),
+            // A collection writes rows, not frames: the count a person wants beside the
+            // episode is the steps it recorded.
+            "episode.end" => self.end(
+                fields,
+                episode_cell(&get("episode")),
+                get("stage"),
+                count("steps"),
+                true,
+            ),
             "stage.begin" => self.stages.push(StageRow {
                 name: get("name"),
                 seconds: None,
@@ -192,7 +202,8 @@ impl LiveRun {
                 }
             }
             "suite.end" => {
-                let suite = self.suites.entry(get("suite")).or_default();
+                let key = cell_key(&self.stage_of(fields), &get("suite"));
+                let suite = self.suites.entry(key).or_default();
                 suite.n_episodes = fields
                     .get("n_episodes")
                     .and_then(|s| s.parse().ok())
@@ -213,31 +224,115 @@ impl LiveRun {
         }
     }
 
+    /// The stage an event belongs to: its own field when it has one — a cycle puts it on every
+    /// stream-1 event — else the stage that last began, else empty for a run that is one
+    /// command.
+    fn stage_of(&self, fields: &BTreeMap<String, String>) -> String {
+        match fields.get("stage") {
+            Some(stage) if !stage.is_empty() => stage.clone(),
+            _ => self
+                .stages
+                .last()
+                .map(|s| s.name.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Where a stage arrived in the cycle. A stage no `stage.begin` has named yet sorts after
+    /// the ones that have, which is also where it will land once its own `stage.begin` does.
+    fn stage_order(&self, stage: &str) -> usize {
+        self.stages
+            .iter()
+            .rposition(|s| s.name == stage)
+            .unwrap_or(self.stages.len())
+    }
+
+    /// Opens a row. `cell.begin` and `episode.begin` differ only in what they call the cell
+    /// and what goes in its suite column.
+    fn begin(&mut self, fields: &BTreeMap<String, String>, name: String, suite: String) {
+        // Samples still waiting for a name belong to a cell nobody will ever name: in a
+        // well-ordered stream there are none, and guessing them into this cell would put one
+        // episode's history under another's name.
+        self.pending.clear();
+        let stage = self.stage_of(fields);
+        let order = self.stage_order(&stage);
+        let key = cell_key(&stage, &name);
+        let cell = self.cells.entry(key.clone()).or_insert_with(|| LiveCell {
+            name,
+            stage,
+            order,
+            ..LiveCell::default()
+        });
+        cell.suite = suite;
+        cell.seed = fields.get("seed").and_then(|s| s.parse().ok());
+        self.open = Some(key);
+    }
+
+    /// Closes a row, or makes one: an end event for a cell this viewer never saw begin is a
+    /// cell that began before it attached, so the row is built from the event's own fields and
+    /// takes the samples that were waiting (packet M7/R12).
+    fn end(
+        &mut self,
+        fields: &BTreeMap<String, String>,
+        name: String,
+        suite: String,
+        frames: usize,
+        has_traj: bool,
+    ) {
+        let stage = self.stage_of(fields);
+        let order = self.stage_order(&stage);
+        let key = cell_key(&stage, &name);
+        let pending = std::mem::take(&mut self.pending);
+        let cell = self.cells.entry(key).or_insert_with(|| LiveCell {
+            name,
+            stage,
+            order,
+            suite,
+            records: pending,
+            joined_late: true,
+            ..LiveCell::default()
+        });
+        cell.frames = frames;
+        cell.has_traj = has_traj;
+        cell.outcome = Some(fields.get("outcome").cloned().unwrap_or_default());
+        self.open = None;
+    }
+
     /// One `[frame, tick, source, violation bits]` sample, attributed to the open episode.
     fn tick(&mut self, v: &[f64]) {
-        let ([frame, tick, source, events], Some(open)) = (v, self.open.as_ref()) else {
+        let [frame, tick, source, events] = v else {
             return;
         };
-        let Some(cell) = self.cells.get_mut(open) else {
-            return;
-        };
-        cell.records.push(StepEvent {
+        let record = StepEvent {
             frame: *frame as u64,
             tick: PhysTick(*tick as u64),
             source: event_source(*source as u32),
             events: *events as u32,
-        });
+        };
+        let open = match self.open.as_deref() {
+            Some(key) => self.cells.get_mut(key),
+            None => None,
+        };
+        match open {
+            Some(cell) => cell.records.push(record),
+            None => self.pending.push(record),
+        }
     }
 
-    /// One row per episode, in cell-name order — [`crate::model::run_view::RunView::cells`]'s
-    /// own shape and order, so the table does not know which end it came from.
+    /// One row per `(stage, cell)`, in stage-arrival then cell-name order —
+    /// [`crate::model::run_view::RunView::cells`]'s own shape, and its order for a run that has
+    /// no stages, so the table does not know which end it came from.
     pub fn cells(&self) -> Vec<CellRow> {
-        self.cells
-            .iter()
-            .map(|(name, c)| {
-                let suite = self.suites.get(&c.suite);
+        let mut rows: Vec<&LiveCell> = self.cells.values().collect();
+        // The map's own order is already cell-name order inside a stage; a stable sort by the
+        // stage's arrival then puts the stages in the order the cycle ran them.
+        rows.sort_by_key(|c| c.order);
+        rows.into_iter()
+            .map(|c| {
+                let suite = self.suites.get(&cell_key(&c.stage, &c.suite));
                 CellRow {
-                    name: name.clone(),
+                    name: c.name.clone(),
+                    stage: c.stage.clone(),
                     suite: c.suite.clone(),
                     seed: c.seed,
                     metrics: suite.map(|s| s.metrics.clone()).unwrap_or_default(),
@@ -247,6 +342,28 @@ impl LiveRun {
                 }
             })
             .collect()
+    }
+
+    /// Whether the row keyed by [`cell_key`] was made by its end event — the cell was already
+    /// running when this viewer attached, so what it shows is only the part it heard.
+    pub fn joined_late(&self, key: &str) -> bool {
+        self.cell(key).is_some_and(|c| c.joined_late)
+    }
+
+    /// The row `key` names. `key` is [`cell_key`]'s, which is what `app.rs` holds; a bare cell
+    /// name still finds the row while only one stage has run a cell by that name, which is
+    /// every run that is one command.
+    ///
+    /// ponytail: the bare-name path is a linear scan of the rows a run has (tens), and an
+    /// ambiguous name finds nothing rather than the wrong stage's row. Key the names too if a
+    /// run ever has enough rows for the scan to show.
+    fn cell(&self, key: &str) -> Option<&LiveCell> {
+        if let Some(cell) = self.cells.get(key) {
+            return Some(cell);
+        }
+        let mut named = self.cells.values().filter(|c| c.name == key);
+        let only = named.next()?;
+        named.next().is_none().then_some(only)
     }
 
     /// The table's headers: the three identity columns, then one per metric seen so far. The
@@ -270,7 +387,7 @@ impl LiveRun {
     /// change; the oracle pins the two equal for the same run, so they cannot drift quietly.
     pub fn timeline(&self, cell: &str) -> Timeline {
         let mut out = Timeline::default();
-        let Some(live) = self.cells.get(cell) else {
+        let Some(live) = self.cell(cell) else {
             return out;
         };
         for record in &live.records {
@@ -324,12 +441,21 @@ impl LiveRun {
     /// no verdict, because `report.json` is written after the last suite (spec 10.5).
     pub fn status(&self) -> String {
         let done = self.cells.values().filter(|c| c.outcome.is_some()).count();
+        let late = self.cells.values().filter(|c| c.joined_late).count();
+        let late = if late == 0 {
+            String::new()
+        } else {
+            format!(", {late} joined late")
+        };
         match &self.open {
             Some(cell) => format!(
-                "live: {cell} running, {done} of {} cell(s) finished",
+                "live: {cell} running, {done} of {} cell(s) finished{late}",
                 self.cells.len()
             ),
-            None => format!("live: {done} of {} cell(s) finished", self.cells.len()),
+            None => format!(
+                "live: {done} of {} cell(s) finished{late}",
+                self.cells.len()
+            ),
         }
     }
 }
@@ -693,5 +819,157 @@ mod tests {
         assert_eq!(live.selected_cell(), None, "no cell is running any more");
         live.select("nominal-00");
         assert_eq!(live.selected_cell().as_deref(), Some("nominal-00"));
+    }
+
+    /// Ticks with nothing interesting in them, for a cell that is only being counted.
+    fn ticks(live: &mut LiveRun, n: u64) {
+        for tick in 0..n {
+            live.ingest(&frame(
+                STREAM_TICKS,
+                tick,
+                Payload::Scalars(vec![tick as f64, tick as f64, 0.0, 0.0]),
+            ));
+        }
+    }
+
+    /// Oracle 1 (packet M7/R12; review R16). A cycle publishes the expert gate and the policy
+    /// evaluation on one socket and both call their first episode `nominal-00`. The row's
+    /// identity is the pair, so the gate's `success_rate` stays in the gate's row and the
+    /// evaluation's row is still empty while it runs.
+    #[test]
+    fn live_run_keys_rows_by_stage_and_cell() {
+        let mut live = LiveRun::default();
+        live.ingest(&event("stage.begin", &[("name", "expert-gate".to_owned())]));
+        live.ingest(&event(
+            "cell.begin",
+            &[
+                ("cell", "nominal-00".to_owned()),
+                ("suite", "nominal".to_owned()),
+                ("seed", "1".to_owned()),
+                ("stage", "expert-gate".to_owned()),
+            ],
+        ));
+        ticks(&mut live, 3);
+        live.ingest(&event(
+            "cell.end",
+            &[
+                ("cell", "nominal-00".to_owned()),
+                ("outcome", "Success".to_owned()),
+                ("frames", "3".to_owned()),
+                ("traj", "true".to_owned()),
+                ("stage", "expert-gate".to_owned()),
+            ],
+        ));
+        live.ingest(&event(
+            "suite.end",
+            &[
+                ("suite", "nominal".to_owned()),
+                ("n_episodes", "4".to_owned()),
+                (
+                    "metric.success_rate",
+                    serde_json::to_string(&MetricValue::Scalar(1.0)).expect("a metric value"),
+                ),
+                ("stage", "expert-gate".to_owned()),
+            ],
+        ));
+        live.ingest(&event(
+            "stage.end",
+            &[("name", "expert-gate".to_owned()), ("code", "0".to_owned())],
+        ));
+        live.ingest(&event("stage.begin", &[("name", "eval".to_owned())]));
+        live.ingest(&event(
+            "cell.begin",
+            &[
+                ("cell", "nominal-00".to_owned()),
+                ("suite", "nominal".to_owned()),
+                ("seed", "1".to_owned()),
+                ("stage", "eval".to_owned()),
+            ],
+        ));
+        ticks(&mut live, 2);
+
+        let rows = live.cells();
+        assert_eq!(rows.len(), 2, "one row per (stage, cell): {rows:?}");
+        assert_eq!(
+            rows.iter().map(|r| r.stage.as_str()).collect::<Vec<_>>(),
+            ["expert-gate", "eval"],
+            "the order the stages arrived in, not the order their names sort in"
+        );
+        assert!(rows.iter().all(|r| r.name == "nominal-00"));
+        assert_eq!(
+            rows[0].metrics.get("success_rate"),
+            Some(&MetricValue::Scalar(1.0)),
+            "the gate's own suite row"
+        );
+        assert!(
+            rows[1].metrics.is_empty(),
+            "the evaluation has measured nothing yet: {:?}",
+            rows[1].metrics
+        );
+        assert!(
+            live.status().contains("eval / nominal-00 running"),
+            "{}",
+            live.status()
+        );
+        assert_eq!(
+            live.timeline(&cell_key("expert-gate", "nominal-00"))
+                .rows
+                .len(),
+            3
+        );
+        assert_eq!(live.timeline(&cell_key("eval", "nominal-00")).rows.len(), 2);
+        println!(
+            "RAN live_run_keys_rows_by_stage_and_cell: {} row(s), {} stage(s)",
+            rows.len(),
+            live.stages().len()
+        );
+    }
+
+    /// Oracle 2 (packet M7/R12). A viewer that attached after `cell.begin` had gone by still
+    /// gets the row: samples with no open cell wait, and the `cell.end` that names them makes
+    /// the row out of its own fields and marks it joined late.
+    #[test]
+    fn a_cell_that_began_before_attach_still_gets_a_row() {
+        let mut live = LiveRun::default();
+        ticks(&mut live, 3);
+        assert!(live.is_empty(), "nothing has named a cell yet");
+
+        live.ingest(&event(
+            "cell.end",
+            &[
+                ("cell", "nominal-01".to_owned()),
+                ("outcome", "Timeout".to_owned()),
+                ("frames", "3".to_owned()),
+                ("traj", "true".to_owned()),
+            ],
+        ));
+        let rows = live.cells();
+        assert_eq!(rows.len(), 1, "the end event names the row: {rows:?}");
+        assert_eq!(rows[0].name, "nominal-01");
+        assert_eq!(rows[0].frames, 3);
+        assert!(rows[0].has_traj);
+        assert!(live.joined_late(&cell_key("", "nominal-01")));
+        assert_eq!(
+            live.timeline("nominal-01").rows.len(),
+            3,
+            "the waiting samples are this cell's"
+        );
+        assert!(live.status().contains("1 joined late"), "{}", live.status());
+
+        live.ingest(&event(
+            "cell.begin",
+            &[
+                ("cell", "nominal-02".to_owned()),
+                ("suite", "nominal".to_owned()),
+            ],
+        ));
+        assert!(
+            !live.joined_late("nominal-02"),
+            "a cell the viewer saw begin is an ordinary row"
+        );
+        println!(
+            "RAN a_cell_that_began_before_attach_still_gets_a_row: {} row(s)",
+            live.cells().len()
+        );
     }
 }
