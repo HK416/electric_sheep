@@ -12,8 +12,8 @@ use std::process::Command;
 
 use es_compile::PolicyBundle;
 use es_data::training::{
-    camera_suffix, has_image_input, state_dim, DatasetFacts, Plan, Recipe, Route, Step, StepKind,
-    Training, TRAIN_ACT,
+    camera_suffix, has_image_input, has_pretrained_backbone, state_dim, Backbone, DatasetFacts,
+    Plan, Recipe, Route, Step, StepKind, Training, TRAIN_ACT,
 };
 use es_data::{DatasetIdentity, LeRobotDataset, Split};
 use es_ir::observation::ObservationIr;
@@ -35,6 +35,13 @@ two it names decides the route:
 
   bundle   es dataset bake -> es policy lower -> python/es/train_act.py -> es policy pack
   lerobot  es dataset export -> lerobot-train -> es policy import-lerobot
+
+A bundle whose Learning IR declares `VisionEncoder { pretrained = true }` also needs
+`[policy] base_model = \"<dir>/resnet18-imagenet1k-v1.safetensors\"`, the artifact
+`python/es/fetch_backbone.py` writes. Its blake3 is checked against the lock file beside it
+*and* against the pin this build carries, its licence is copied into
+training/base_model.lock, and the tensors reach the trainer as `--init-backbone` -- never
+over the network at construction (spec 2.5, 19.3).
 
 Every `es` step above runs in-process; only the trainer is a subprocess. Run `es train` from
 the repository root: the IR route's trainer is `python/es/train_act.py` and a Task IR's
@@ -199,6 +206,43 @@ fn run(
              with a zero-filled image channel trains a policy that looks fine",
         ));
     }
+    // Packet M7/T5: the recipe and the Learning IR must agree about where this run starts.
+    // Either disagreement writes a `base_model.lock` that does not describe the run -- a
+    // bundle that wants ImageNet and gets none trains from scratch under a document saying
+    // otherwise, and a recipe that names weights the module never loads claims a provenance
+    // out of thin air (spec 28.10 rule 2).
+    let backbone = match (
+        bundle
+            .as_ref()
+            .map(|b| has_pretrained_backbone(&b.learning)),
+        &recipe.policy.base_model,
+    ) {
+        (Some(true), None) => {
+            return Err(bad(
+                "the bundle's Learning IR declares `VisionEncoder { pretrained = true }` and \
+                 [policy] `base_model` names no weights to start from. The ImageNet tensors \
+                 enter through a checkpoint, never over the network at construction (spec \
+                 2.5): fetch them with `python/es/fetch_backbone.py --arch resnet18 --out \
+                 <dir>` and point `base_model` at the safetensors file it writes.",
+            ))
+        }
+        (Some(false), Some(path)) => {
+            return Err(bad(format!(
+                "[policy] `base_model` names {path}, and the bundle's Learning IR has no \
+                 `VisionEncoder {{ pretrained = true }}` to load it into. Nothing would read \
+                 those weights, and `training/base_model.lock` would claim a provenance this \
+                 run does not have.",
+            )))
+        }
+        (Some(true), Some(path)) => {
+            Some(Backbone::verify(Path::new(path)).map_err(|e| bad(e.to_string()))?)
+        }
+        _ => None,
+    };
+    if let Some(lock) = &backbone {
+        println!("base_model:    {} ({})", lock.source, lock.license);
+    }
+
     let task_hash = match (&bundle, &recipe.policy.task) {
         (Some(b), _) => b.task.task_hash().map_err(|e| bad(e.to_string()))?,
         (None, Some(path)) => task_from_toml(&read(Path::new(path))?)
@@ -214,8 +258,9 @@ fn run(
 
     // --- the identity, before a single GPU-second ----------------------------------------
     let training_dir = out.join("training");
-    let mut training = Training::pre_run(&recipe, &plan, out, &interpreter, &facts)
-        .map_err(|e| bad(e.to_string()))?;
+    let mut training =
+        Training::pre_run(&recipe, &plan, out, &interpreter, &facts, backbone.as_ref())
+            .map_err(|e| bad(e.to_string()))?;
     training
         .write(&training_dir)
         .map_err(|e| bad(e.to_string()))?;
@@ -541,9 +586,10 @@ fn hardware(probe: &Value, route: Route, device: &str, interpreter: &str) -> Val
     })
 }
 
-/// `optimizer.json` declares the betas and weight decay `train_act.py`'s `AdamW(params,
-/// lr=lr)` leaves at torch's defaults. If torch ever moves them the declaration is stale, so
-/// the trainer reports what it built and the two are compared out loud.
+/// `optimizer.json` declares the betas and eps `train_act.py`'s `AdamW` leaves at torch's
+/// defaults, beside the lr and weight decay the recipe tells it to use (packet M7/T4). If
+/// torch ever moves a default the declaration is stale, so the trainer reports what it built
+/// and the two are compared out loud.
 fn warn_on_optimizer(training: &Training, summary: &Value) {
     let Some(reported) = summary.get("optimizer") else {
         return;
@@ -557,8 +603,7 @@ fn warn_on_optimizer(training: &Training, summary: &Value) {
     if !same {
         println!(
             "warning: the trainer reports {reported} and optimizer.json declares {declared}; \
-             training_hash names the declaration, so it is now stale (packet T4 owns the \
-             optimizer block)"
+             training_hash names the declaration, so it is now stale"
         );
     }
 }

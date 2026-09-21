@@ -7780,3 +7780,331 @@ fn train_ir_path_packs_a_bundle_torch_opens() {
     assert_eq!(lock["checkpoints"][0]["step"].as_u64(), Some(40));
     println!("RAN train_ir_path_packs_a_bundle_torch_opens: training_hash {training_hash}");
 }
+
+// --- packet M7/T4: the learning-rate schedule -------------------------------------------
+
+/// Oracle 3. The schedule is a document value, so it moves `identity_hash`; `scheduler.json`
+/// and `optimizer.json` carry what the trainer was told, and `config.json`'s plan carries the
+/// flags it would have been told with.
+///
+/// Like `train_identity_is_a_function_of_the_recipe`, the recipe names an interpreter that
+/// cannot exist: every assertion here is about the identity written *before* the run, which
+/// is the half of the split that needs no Python.
+#[test]
+fn train_identity_moves_with_the_schedule() {
+    let dir = scratch_dir("train-schedule");
+    let bundle = write_demo_bundle(&dir);
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 2, 12);
+    let base = train_fixture_recipe(&bundle, &root, &tiles, 0, "1e-4");
+
+    let go = |name: &str, body: &str| -> (serde_json::Value, PathBuf) {
+        let recipe = dir.join(format!("{name}.toml"));
+        write(&recipe, body);
+        let out = dir.join(name);
+        run_train(&train_toml_path(&recipe), &out, &[]);
+        (train_lock(&out), out)
+    };
+    let scheduled = |warmup: u32| {
+        base.replace(
+            "device = ",
+            &format!(
+                "schedule = {{ kind = \"warmup_cosine\", warmup = {warmup}, lr_min = 1e-6 }}\n\
+                 grad_clip = 1.0\ndevice = "
+            ),
+        )
+    };
+
+    let (plain, plain_out) = go("plain", &base);
+    let (ten, ten_out) = go("warmup-10", &scheduled(10));
+    let (twenty, _) = go("warmup-20", &scheduled(20));
+    assert_ne!(
+        plain["identity_hash"], ten["identity_hash"],
+        "a schedule did not move identity_hash"
+    );
+    assert_ne!(
+        ten["identity_hash"], twenty["identity_hash"],
+        "`warmup` did not move identity_hash"
+    );
+
+    let slot = |out: &Path, name: &str| -> String {
+        let path = out.join("training").join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    };
+    let json = |out: &Path, name: &str| -> serde_json::Value {
+        serde_json::from_str(&slot(out, name)).expect("a training slot is JSON")
+    };
+    let scheduler = json(&ten_out, "scheduler.json");
+    assert_eq!(scheduler["kind"], "warmup_cosine", "{scheduler}");
+    assert_eq!(scheduler["warmup"], 10, "{scheduler}");
+    assert_eq!(scheduler["lr_min"], 1e-6, "{scheduler}");
+    // The cosine's period is the length of the run, so `steps` is part of the schedule.
+    assert_eq!(scheduler["total_steps"], 40, "{scheduler}");
+    let optimizer = json(&ten_out, "optimizer.json");
+    assert_eq!(optimizer["grad_clip"], 1.0, "{optimizer}");
+    assert_eq!(optimizer["weight_decay"], 0.01, "{optimizer}");
+
+    // ...and the flags are on the line the trainer would have been run with.
+    let plan = json(&ten_out, "config.json")["plan"].to_string();
+    assert!(
+        plan.contains("--schedule warmup_cosine --warmup-steps 10 --lr-min 0.000001 --grad-clip 1"),
+        "{plan}"
+    );
+
+    // The recipe that names no schedule is the run of before, hash included: the same nine
+    // pre-run slots it had before this packet existed (design note `training-recipe.md` 10).
+    assert_eq!(
+        slot(&plain_out, "scheduler.json"),
+        "{\"kind\":\"constant\",\"lr\":0.0001}\n"
+    );
+    assert!(
+        !slot(&plain_out, "optimizer.json").contains("grad_clip"),
+        "a run with no clip declared one"
+    );
+}
+
+// --- packet M7/T5: the pretrained backbone ----------------------------------------------
+
+/// `write_demo_bundle`'s graph with `pretrained = true` on its `VisionEncoder` — the shape
+/// `tests/fixtures/visible-learning/learning-pretrained.toml` has, built here so the test
+/// does not also depend on the file's weights placeholder.
+fn write_pretrained_bundle(dir: &Path) -> PathBuf {
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let mut learning = es_ir::serial::learning_from_toml(&read("learning-pretrained.toml"))
+        .expect("learning-pretrained.toml");
+    let weights = b"es-t5-pretrained-placeholder".to_vec();
+    learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let bytes = es_compile::PolicyBundle::build(
+        &es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml"),
+        &es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml"),
+        &learning,
+        &es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml"),
+        &weights,
+    )
+    .expect("the pretrained demo documents pack into a bundle");
+    let path = dir.join("pretrained.esb");
+    std::fs::write(&path, bytes).expect("write pretrained.esb");
+    path
+}
+
+/// A `base_model` pair on disk: the safetensors `bytes` and the lock file beside it, with
+/// `edit` applied to the lock before it is written.
+fn write_base_model(
+    dir: &Path,
+    name: &str,
+    bytes: &str,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> PathBuf {
+    let weights = dir.join(format!("{name}.safetensors"));
+    write(&weights, bytes);
+    let mut lock = serde_json::json!({
+        "source": es_data::training::BASE_MODEL_SOURCE,
+        "torchvision": "0.26.0+cu129",
+        "url": "https://download.pytorch.org/models/resnet18-f37072fd.pth",
+        "sha256_upstream":
+            "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec",
+        "blake3": hex(blake3::hash(bytes.as_bytes()).as_bytes()),
+        "dropped": "*.num_batches_tracked",
+        "license": "BSD-3-Clause",
+        "license_url": "https://github.com/pytorch/vision/blob/main/LICENSE",
+    });
+    edit(&mut lock);
+    write(
+        &dir.join(format!("{name}.lock.json")),
+        &(lock.to_string() + "\n"),
+    );
+    weights
+}
+
+/// Oracle 4 of packet M7/T5, first half. Every way a `base_model` can be wrong is refused by
+/// the name of what is wrong, and nothing is trained.
+///
+/// The recipe names an interpreter that cannot exist, exactly as the other `es train` tests
+/// do, so nothing here needs Python: every refusal below happens before the trainer is
+/// reached, and the one accepted case stops at the interpreter instead.
+#[test]
+fn train_refuses_a_mismatched_base_model() {
+    let dir = scratch_dir("train-base-model");
+    let bundle = write_pretrained_bundle(&dir);
+    let plain = write_demo_bundle(&dir);
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 1, 12);
+
+    // The pin is what the repository claims the real artifact hashes to; nothing here has
+    // 45 MB of ImageNet, so the *pinned* case is the oracle-3 artifact's job and what this
+    // test judges is every way the three claims can disagree.
+    let wrong = write_base_model(&dir, "wrong", "not the pinned backbone", |_| {});
+    let lying = write_base_model(&dir, "lying", "not the pinned backbone", |lock| {
+        lock["blake3"] = serde_json::json!("0".repeat(64));
+    });
+    let unlicensed = write_base_model(&dir, "unlicensed", "not the pinned backbone", |lock| {
+        lock["license"] = serde_json::json!("");
+    });
+
+    let recipe_with = |name: &str, bundle: &Path, base: Option<&Path>| -> String {
+        let mut body = train_fixture_recipe(bundle, &root, &tiles, 0, "1e-4");
+        if let Some(base) = base {
+            body = body.replace(
+                "[run]",
+                &format!("base_model = \"{}\"\n[run]", train_toml_path(base)),
+            );
+        }
+        let recipe = dir.join(format!("{name}.toml"));
+        write(&recipe, &body);
+        train_toml_path(&recipe)
+    };
+    let refuse = |name: &str, bundle: &Path, base: Option<&Path>| -> String {
+        let out = run_train(&recipe_with(name, bundle, base), &dir.join(name), &[]);
+        assert!(
+            !out.status.success(),
+            "{name} was accepted:\n{}",
+            stdout(&out)
+        );
+        stderr_of(&out)
+    };
+
+    // 1. The lock file disagrees with the bytes beside it.
+    let said = refuse("lying", &bundle, Some(&lying));
+    assert!(said.contains("does not hash to what"), "{said}");
+    assert!(said.contains("lying.lock.json"), "{said}");
+
+    // 2. The bytes disagree with the pin, which is the claim the repository makes.
+    let said = refuse("wrong", &bundle, Some(&wrong));
+    assert!(said.contains("not the pinned backbone"), "{said}");
+    assert!(
+        said.contains(es_data::training::RESNET18_IMAGENET1K_V1_BLAKE3),
+        "the refusal does not name the pin: {said}"
+    );
+
+    // 3. A provenance record with an empty licence tracks nothing (spec 19.3).
+    let said = refuse("unlicensed", &bundle, Some(&unlicensed));
+    assert!(said.contains("license") && said.contains("19.3"), "{said}");
+
+    // 4. A pretrained bundle with no `base_model` at all: the tensors would come from
+    //    nowhere, and the only other way to get them is the network (spec 2.5).
+    let said = refuse("no-base", &bundle, None);
+    assert!(said.contains("pretrained = true"), "{said}");
+    assert!(said.contains("base_model"), "{said}");
+
+    // 5. ...and the reverse: weights nothing in the graph would ever read.
+    let said = refuse("no-encoder", &plain, Some(&wrong));
+    assert!(said.contains("base_model"), "{said}");
+    assert!(said.contains("pretrained = true"), "{said}");
+
+    // 6. The missing lock file is named, not the weights.
+    let orphan = dir.join("orphan.safetensors");
+    write(&orphan, "");
+    let said = refuse("orphan", &bundle, Some(&orphan));
+    assert!(said.contains("orphan.lock.json"), "{said}");
+}
+
+/// Oracle 4 of packet M7/T5, second half. A `base_model` that passes writes spec 19.3's
+/// `base_model.lock` from the lock file — real values, not `{"source": "none"}` — and puts
+/// `--init-backbone` on the trainer's line.
+///
+/// The pin cannot be met without the 45 MB artifact, which is not committed and is oracle 3's
+/// subject. So the two halves are judged where each is observable with no artifact on disk:
+/// the flag through `--dry-run`, which reads no file, and the slot through the same headless
+/// `Training::pre_run` the shell calls, given the lock the shell would have verified. Nothing
+/// is faked — what is not exercised here is `Backbone::verify`'s success path, and that is
+/// exactly what oracle 3 and the server run of oracle 5 cover.
+#[test]
+fn train_writes_base_model_lock_from_the_lock_file() {
+    let dir = scratch_dir("train-base-lock");
+    let bundle = write_pretrained_bundle(&dir);
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 1, 12);
+    let base = dir.join("resnet18-imagenet1k-v1.safetensors");
+
+    let recipe = dir.join("training.toml");
+    write(
+        &recipe,
+        &train_fixture_recipe(&bundle, &root, &tiles, 0, "1e-4").replace(
+            "[run]",
+            &format!("base_model = \"{}\"\n[run]", train_toml_path(&base)),
+        ),
+    );
+    // `--dry-run` reads no file, so the plan is observable here with no artifact on disk.
+    let out = run_train(&train_toml_path(&recipe), &dir.join("dry"), &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let plan = stdout(&out);
+    assert!(
+        plan.contains(&format!("--init-backbone {}", train_toml_path(&base))),
+        "{plan}"
+    );
+    // `frozen` is the IR's and never reaches the command line (design note 5.3).
+    assert!(
+        !plan.contains("--frozen") && !plan.contains("--freeze"),
+        "{plan}"
+    );
+
+    // And the slot the verified lock produces, through the same function the shell calls.
+    let parsed =
+        es_data::training::Recipe::parse(&std::fs::read_to_string(&recipe).expect("the recipe"))
+            .expect("the recipe parses");
+    let built = es_data::training::Plan::build(
+        &parsed,
+        &dir.join("dry"),
+        "python",
+        &["python".to_owned()],
+        None,
+    )
+    .expect("the plan builds");
+    let lock = es_data::training::Backbone {
+        source: es_data::training::BASE_MODEL_SOURCE.to_owned(),
+        url: "https://download.pytorch.org/models/resnet18-f37072fd.pth".to_owned(),
+        sha256_upstream: "f37072fd47e89c5e827621c5baffa7500819f7896bbacec160b1a16c560e07ec"
+            .to_owned(),
+        blake3: es_data::training::RESNET18_IMAGENET1K_V1_BLAKE3.to_owned(),
+        dropped: "*.num_batches_tracked".to_owned(),
+        license: "BSD-3-Clause".to_owned(),
+        license_url: "https://github.com/pytorch/vision/blob/main/LICENSE".to_owned(),
+    };
+    let facts = es_data::training::DatasetFacts {
+        hashes: es_ir::DatasetHash {
+            content: [1; 32],
+            schema: [2; 32],
+            split: [3; 32],
+        },
+        episodes: 1,
+        frames: 12,
+        recorded_task: None,
+        split_source: "all-train",
+    };
+    let without = es_data::training::Training::pre_run(
+        &parsed,
+        &built,
+        &dir.join("dry"),
+        "python",
+        &facts,
+        None,
+    )
+    .expect("pre_run");
+    let with = es_data::training::Training::pre_run(
+        &parsed,
+        &built,
+        &dir.join("dry"),
+        "python",
+        &facts,
+        Some(&lock),
+    )
+    .expect("pre_run");
+    let slot: serde_json::Value =
+        serde_json::from_str(with.file("base_model.lock")).expect("base_model.lock is JSON");
+    assert_eq!(
+        slot["blake3"],
+        es_data::training::RESNET18_IMAGENET1K_V1_BLAKE3
+    );
+    assert_eq!(slot["license"], "BSD-3-Clause");
+    assert_eq!(slot["source"], es_data::training::BASE_MODEL_SOURCE);
+    // Spec 19.3: the licence is part of the run's identity, so the slot is not decoration.
+    assert_eq!(with.identity().base_model.license, "BSD-3-Clause");
+    assert_ne!(
+        without.hash().expect("hash"),
+        with.hash().expect("hash"),
+        "a real base_model did not move training_hash"
+    );
+}
