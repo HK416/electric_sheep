@@ -217,6 +217,36 @@ pub(crate) fn diffusion_schedule(p: &DiffusionParams) -> Schedule {
 
 /// The sampler runtime the generated file needs: a sinusoidal timestep embedding and the one
 /// denoising network both heads share. Emitted only when a sampler head is present.
+/// `VisionEncoder { pretrained: true }` (packet M7/T5).
+///
+/// Emitted beside `_backbone`, never instead of it: a graph with no pretrained encoder must
+/// lower to the byte-identical source V13 measured, because `lowering_hash` is the `compiler`
+/// slot of `execution_hash` (spec 5.3).
+const FROZEN_BACKBONE_PY: &str = r"
+
+def _frozen_backbone(name, out_dim, frozen):
+    # Referenced, never re-implemented: torchvision is the provider. `weights=None` is not an
+    # oversight -- it is the packet: a module that fetches ImageNet weights to instantiate
+    # needs the network to exist (spec 2.5) and carries tensors nobody hashed (spec 5.3). The
+    # ImageNet tensors arrive the way every other weight does, through the checkpoint:
+    # `es train` loads them from the `base_model` its recipe names and records their
+    # provenance in `training/base_model.lock` (spec 19.3).
+    # `FrozenBatchNorm2d` is `lerobot.rs`'s precedent for exactly these weights: affine
+    # constants and fixed running statistics, so the module has no training mode and
+    # `train()` and `eval()` are one function (the V13 rule, kept).
+    import torchvision
+    from torchvision.ops.misc import FrozenBatchNorm2d
+
+    m = getattr(torchvision.models, name)(weights=None, norm_layer=FrozenBatchNorm2d)
+    m.fc = nn.Linear(m.fc.in_features, out_dim)
+    if frozen:
+        # The IR's `frozen`, honoured here rather than on a trainer's command line: it is a
+        # property of the module the optimizer is handed, and a second copy of it in a recipe
+        # is a second thing that can disagree with the IR.
+        m.requires_grad_(False)
+    return m
+";
+
 const SAMPLER_PY: &str = r"
 
 def _sinusoidal(t, dim):
@@ -449,6 +479,7 @@ struct Lowering {
     keys: Vec<String>,
     shapes: BTreeMap<String, Vec<u64>>,
     needs_torchvision: bool,
+    needs_frozen_backbone: bool,
     needs_sampler: bool,
     needs_ddpm: bool,
     needs_flow: bool,
@@ -558,6 +589,7 @@ impl Lowering {
                 backbone,
                 out_dim,
                 pretrained,
+                frozen,
                 ..
             } => {
                 let name = match backbone {
@@ -565,25 +597,44 @@ impl Lowering {
                     VisionBackbone::ResNet34 => "resnet34",
                     other => return Err(unsupported("VisionEncoder", other)),
                 };
-                // Refused rather than ignored (design note section 7.6, open question 6).
-                // Honouring it is `weights="DEFAULT"` in `_backbone` -- one line, and the wrong
-                // one: it makes `EsPolicy()` fetch ImageNet weights over the network at every
-                // construction, including inside `TorchRuntime::load` at inference, where
-                // `load_state_dict(strict=True)` overwrites every one of them a moment later. A
-                // lowering that needs the network to instantiate contradicts spec 2.5, and
-                // weights nobody hashed are outside the chain (spec 5.3).
-                if *pretrained {
+                // A backbone that was never trained and is not trained now is a random
+                // projection nobody chose. V2b's rule applies to this combination as it did to
+                // `pretrained`: honour it or refuse it, never drop it silently.
+                if !*pretrained && *frozen {
                     return Err(LowerError::Unsupported(
-                        "VisionEncoder{pretrained = true}: this lowering initializes the \
-                         backbone from scratch and has no network-free way to obtain ImageNet \
-                         weights, nor a hash slot that would cover them (spec 2.5, 5.3). Set \
-                         pretrained = false, or pack the initial weights into the bundle's own \
-                         checkpoint (WeightsRef) and load them through `es policy pack`."
+                        "VisionEncoder{pretrained = false, frozen = true}: a from-scratch \
+                         backbone excluded from the optimizer is a random projection, and \
+                         nothing would ever train it. Set pretrained = true (the ImageNet \
+                         tensors then arrive through the recipe's `base_model`, packet M7/T5) \
+                         or frozen = false."
                             .to_owned(),
                     ));
                 }
-                self.needs_torchvision = true;
-                self.member(id, &format!("_backbone({name:?}, {out_dim})"));
+                // Packet M7/T5. `pretrained` used to be refused here: honouring it was
+                // `weights="DEFAULT"`, which makes `EsPolicy()` fetch ImageNet weights over
+                // the network at every construction -- including inside `TorchRuntime::load`
+                // at inference, where `load_state_dict(strict=True)` overwrites every one of
+                // them a moment later -- and weights nobody hashed are outside the chain
+                // (spec 2.5, 5.3). Both objections are about *where the tensors come from*,
+                // not about the flag: they now come from a named, hashed, licensed artifact
+                // through `es train --recipe`'s `base_model` and `training/base_model.lock`
+                // (spec 19.3), so the module still instantiates with `weights=None`.
+                if *pretrained {
+                    self.needs_frozen_backbone = true;
+                    self.member(
+                        id,
+                        &format!(
+                            "_frozen_backbone({name:?}, {out_dim}, {})",
+                            py_bool(*frozen)
+                        ),
+                    );
+                } else {
+                    self.needs_torchvision = true;
+                    self.member(id, &format!("_backbone({name:?}, {out_dim})"));
+                }
+                // The claim covers `FrozenBatchNorm2d`'s buffers as well as the parameters:
+                // the running statistics are frozen constants of this module and travel in
+                // the checkpoint like every other tensor under the prefix.
                 self.claim(id);
                 // `[N, C, H, W]` straight in: the IR port is one image (spec 8.3 has no batch
                 // axis — spec 5.2 gives each domain its own batch size), but the *module* has
@@ -870,6 +921,9 @@ impl Lowering {
                  \x20   return m\n",
             );
         }
+        if self.needs_frozen_backbone {
+            source.push_str(FROZEN_BACKBONE_PY);
+        }
         if self.needs_sampler {
             source.push_str(SAMPLER_PY);
         }
@@ -908,6 +962,16 @@ pub(crate) fn lowering_hash(source: &str) -> [u8; 32] {
     h.update(LOWERING_TAG.as_bytes());
     h.update(source.as_bytes());
     *h.finalize().as_bytes()
+}
+
+/// A Python literal for a flag, because `{bool}` renders Rust's spelling and Python's is
+/// capitalised.
+fn py_bool(value: bool) -> &'static str {
+    if value {
+        "True"
+    } else {
+        "False"
+    }
 }
 
 /// A Python float list. `serde_json` renders f64 shortest-round-trip, which is both exact and
@@ -1114,35 +1178,93 @@ mod tests {
         );
     }
 
-    /// V2's open question 6, answered by refusal (packet M5/V2b).
+    /// V2's open question 6, answered by refusal (packet M5/V2b) and re-answered by packet
+    /// M7/T5: the flag lowers now, because `ImageNet` tensors enter through a checkpoint
+    /// instead of over the network.
     ///
-    /// The lowering used to read `pretrained` and drop it, so the IR said "pretrained" and the
-    /// module trained from scratch. Either is defensible; disagreeing silently is not.
+    /// What the refusal protected is kept as an assertion: nothing in the generated source may
+    /// reach for a download at construction (spec 2.5).
     #[test]
-    fn a_pretrained_vision_encoder_is_refused_not_ignored() {
-        let mut g = act();
-        let LearningNode::VisionEncoder { pretrained, .. } =
-            g.nodes.nodes.get_mut(&NodeId(0)).unwrap()
-        else {
-            unreachable!()
-        };
-        *pretrained = true;
-        let err = lower_to_torch(&g).unwrap_err();
+    fn a_pretrained_backbone_lowers_frozen() {
+        let m = lower_to_torch(&pretrained(true, false)).unwrap();
+
+        // No network at construction, in any of the spellings torchvision accepts.
+        assert!(m.source.contains("weights=None"), "{}", m.source);
+        for forbidden in ["\"DEFAULT\"", "IMAGENET1K", "ResNet18_Weights", "download"] {
+            assert!(
+                !m.source.contains(forbidden),
+                "`{forbidden}`:\n{}",
+                m.source
+            );
+        }
+        // `lerobot.rs`'s precedent: frozen affine constants, so there is no training mode.
+        assert!(m.source.contains("FrozenBatchNorm2d"), "{}", m.source);
+        assert!(!m.source.contains("nn.BatchNorm"), "{}", m.source);
+        // The prefix claim covers the frozen buffers as well as the parameters.
+        assert!(m.weight_keys.contains(&"nodes.0.*".to_owned()));
+        assert!(!m.weight_shapes.contains_key("nodes.0.*"));
+
+        // `pretrained: false` is untouched, byte for byte: V13's GroupNorm arm and its
+        // `lowering_hash` are what every measured run in the design note was taken under.
+        let scratch = lower_to_torch(&act()).unwrap();
+        assert!(scratch
+            .source
+            .contains("norm_layer=lambda c: nn.GroupNorm(32, c)"));
+        assert!(!scratch.source.contains("FrozenBatchNorm2d"));
+        // A different source is a different `lowering_hash`, which is the packet's rule: it
+        // moves for `pretrained: true` graphs and for no others.
+        assert_ne!(m.lowering_hash, scratch.lowering_hash);
+        assert_eq!(
+            scratch.lowering_hash,
+            lower_to_torch(&act()).unwrap().lowering_hash
+        );
+    }
+
+    /// `frozen: true` is honoured by the module itself — `requires_grad_(False)` on the
+    /// backbone it just built — so the trainer reads the IR's decision off the module and no
+    /// command line carries it (design note section 5.3).
+    #[test]
+    fn frozen_is_lowered_not_dropped() {
+        let frozen = lower_to_torch(&pretrained(true, true)).unwrap();
+        assert!(
+            frozen
+                .source
+                .contains("_frozen_backbone(\"resnet18\", 512, True)")
+                && frozen.source.contains("m.requires_grad_(False)"),
+            "{}",
+            frozen.source
+        );
+        let tuned = lower_to_torch(&pretrained(true, false)).unwrap();
+        assert!(tuned
+            .source
+            .contains("_frozen_backbone(\"resnet18\", 512, False)"));
+        assert_ne!(frozen.lowering_hash, tuned.lowering_hash);
+
+        // A frozen backbone that was never trained is a random projection nobody chose:
+        // refused rather than silently honoured or silently dropped (packet M5/V2b's rule).
+        let err = lower_to_torch(&pretrained(false, true)).unwrap_err();
         let LowerError::Unsupported(message) = &err else {
             panic!("expected Unsupported, got {err}");
         };
         assert!(
-            message.starts_with("VisionEncoder{pretrained = true}") && message.contains("spec 2.5"),
+            message.starts_with("VisionEncoder{pretrained = false, frozen = true}"),
             "{message}"
         );
-        // And the flag is the only thing standing in the way: cleared, the same graph lowers.
-        let LearningNode::VisionEncoder { pretrained, .. } =
-            g.nodes.nodes.get_mut(&NodeId(0)).unwrap()
+    }
+
+    /// The ACT fixture with `pretrained` / `frozen` set on its `VisionEncoder`.
+    fn pretrained(pretrained: bool, frozen: bool) -> LearningGraph {
+        let mut g = act();
+        let LearningNode::VisionEncoder {
+            pretrained: p,
+            frozen: f,
+            ..
+        } = g.nodes.nodes.get_mut(&NodeId(0)).unwrap()
         else {
             unreachable!()
         };
-        *pretrained = false;
-        assert!(lower_to_torch(&g).is_ok());
+        (*p, *f) = (pretrained, frozen);
+        g
     }
 
     // --- sampler heads (design note section 8) ----------------------------------------------

@@ -1003,6 +1003,311 @@ print(
 )
 "#;
 
+// --- packet M7/T4: the learning-rate schedule ------------------------------------------------
+
+/// `tests/golden/train/lr_warmup_cosine.json`: the first 1,000 values of the demo's own
+/// large-batch schedule, generated once by [`generate_lr_golden`] from the script's `lr_at`.
+fn lr_golden() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/train/lr_warmup_cosine.json")
+}
+
+/// A re-implementation of `python/es/train_act.py::lr_at`, expression for expression.
+///
+/// This is what pins the schedule **without** an interpreter: the golden was produced by the
+/// script, and this function has to reproduce it bit for bit in `f64`. Keep the two in the
+/// same order — `lr * step / warmup`, and `lr_min + (lr - lr_min) * 0.5 * (1 + cos(...))` —
+/// because a re-association is a different number in the last bit, which is the whole point.
+fn lr_at(step: u32, total: u32, lr: f64, lr_min: f64, warmup: u32) -> f64 {
+    if warmup > 0 && step < warmup {
+        return lr * f64::from(step) / f64::from(warmup);
+    }
+    let span = total.saturating_sub(warmup).max(1);
+    lr_min
+        + (lr - lr_min)
+            * 0.5
+            * (1.0 + (std::f64::consts::PI * f64::from(step - warmup) / f64::from(span)).cos())
+}
+
+/// argv is `<train_act.py> <total> <lr> <lr_min> <warmup> <count>`; stdout is
+/// `{"values": [..], "lr_curve_hash": "…" | null}`.
+///
+/// The script is `exec`'d rather than imported so that this reads the file the repository
+/// ships, from wherever the test runs. `__name__` is set because the file ends in the usual
+/// `if __name__ == "__main__"` guard.
+const LR_PROBE_PY: &str = r#"
+import json, sys
+namespace = {"__name__": "es_train_act_probe"}
+source = open(sys.argv[1], encoding="utf-8").read()
+exec(compile(source, sys.argv[1], "exec"), namespace)
+total, lr, lr_min, warmup, count = (
+    int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+)
+values = [namespace["lr_at"](s, total, lr, lr_min, warmup) for s in range(count)]
+sys.stdout.write(
+    json.dumps({"values": values, "lr_curve_hash": namespace["lr_curve_hash"](values)})
+)
+"#;
+
+/// Regenerates the lr golden from the script itself. Run once, explicitly, on a machine with
+/// `ES_PYTHON`; the file is then read-only (spec 1.4), like every other golden here.
+#[test]
+#[ignore = "golden generator; run explicitly with ES_PYTHON"]
+fn generate_lr_golden() {
+    let python = python_with_torch().expect("the generator needs an interpreter");
+    let (total, lr, lr_min, warmup, count) = (20000u32, 4e-4, 1e-6, 250u32, 1000usize);
+    let probe = run(
+        &python,
+        &[
+            "-c",
+            LR_PROBE_PY,
+            &train_act_py().to_string_lossy(),
+            &total.to_string(),
+            &lr.to_string(),
+            &lr_min.to_string(),
+            &warmup.to_string(),
+            &count.to_string(),
+        ],
+    );
+    let reply: serde_json::Value = serde_json::from_slice(&probe.stdout).expect("the probe");
+    let golden = serde_json::json!({
+        "schema_version": 1,
+        "source": "python/es/train_act.py::lr_at",
+        "total": total, "lr": lr, "lr_min": lr_min, "warmup": warmup,
+        "values": reply["values"],
+    });
+    std::fs::create_dir_all(lr_golden().parent().expect("a parent")).expect("golden dir");
+    std::fs::write(
+        lr_golden(),
+        serde_json::to_string_pretty(&golden).expect("serialize") + "\n",
+    )
+    .expect("write the golden");
+    println!(
+        "RAN generate_lr_golden: {count} values -> {}",
+        lr_golden().display()
+    );
+}
+
+/// Oracle 1 of packet M7/T4. The Rust re-implementation above equals the golden bitwise, and
+/// with an interpreter the script's own `lr_at` equals it bitwise too.
+///
+/// Both halves are exact `f64` comparisons on purpose. A schedule is five numbers and three
+/// operations; if two implementations of it disagree in the last bit, one of them has been
+/// re-associated, and a training run is then not reproducible from its `scheduler.json`.
+#[test]
+fn lr_schedule_matches_the_golden() {
+    let text = std::fs::read_to_string(lr_golden())
+        .unwrap_or_else(|e| panic!("{}: {e}", lr_golden().display()));
+    let golden: serde_json::Value = serde_json::from_str(&text).expect("the golden is JSON");
+    let number = |key: &str| golden[key].as_f64().unwrap_or_else(|| panic!("{key}"));
+    let count = |key: &str| golden[key].as_u64().unwrap_or_else(|| panic!("{key}")) as u32;
+    let (total, warmup) = (count("total"), count("warmup"));
+    let (lr, lr_min) = (number("lr"), number("lr_min"));
+    let want: Vec<f64> = golden["values"]
+        .as_array()
+        .expect("values")
+        .iter()
+        .map(|v| v.as_f64().expect("a value"))
+        .collect();
+    assert!(want.len() >= 1000, "the golden is {} values", want.len());
+
+    let mut differ = Vec::new();
+    for (step, want) in want.iter().enumerate() {
+        let got = lr_at(step as u32, total, lr, lr_min, warmup);
+        if got.to_bits() != want.to_bits() {
+            differ.push((step, got, *want));
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "the Rust re-implementation is not the golden at {} of {} steps, first {:?}",
+        differ.len(),
+        want.len(),
+        &differ[..differ.len().min(4)]
+    );
+    // The schedule is what the lowering's own oracle assumes: it starts at 0, peaks at `lr`
+    // at the end of the warmup and decays. Cheap, and it catches a golden regenerated from a
+    // formula that happens to agree with a broken re-implementation.
+    assert_eq!(want[0].to_bits(), 0.0f64.to_bits());
+    assert_eq!(want[warmup as usize].to_bits(), lr.to_bits());
+    assert!(want[warmup as usize + 1] < lr && want[999] > lr_min);
+
+    match python_with_torch() {
+        Err(why) => println!("SKIP the interpreter half of lr_schedule_matches_the_golden: {why}"),
+        Ok(python) => {
+            let probe = run(
+                &python,
+                &[
+                    "-c",
+                    LR_PROBE_PY,
+                    &train_act_py().to_string_lossy(),
+                    &total.to_string(),
+                    &lr.to_string(),
+                    &lr_min.to_string(),
+                    &warmup.to_string(),
+                    &want.len().to_string(),
+                ],
+            );
+            let reply: serde_json::Value =
+                serde_json::from_slice(&probe.stdout).expect("the probe replies JSON");
+            let from_python: Vec<f64> = reply["values"]
+                .as_array()
+                .expect("values")
+                .iter()
+                .map(|v| v.as_f64().expect("a value"))
+                .collect();
+            assert_eq!(from_python.len(), want.len());
+            for (step, (a, b)) in from_python.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "step {step}: the script gives {a:e}, the golden {b:e}"
+                );
+            }
+            // ...and `lr_curve_hash` is blake3 over those same values as little-endian f64,
+            // which is what makes the number in a run summary checkable from the outside.
+            let hashed: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let here = blake3::hash(&hashed).to_hex().to_string();
+            match reply["lr_curve_hash"].as_str() {
+                Some(there) => assert_eq!(there, here, "lr_curve_hash disagrees"),
+                None => println!("SKIP lr_curve_hash: `blake3` is not importable by {python}"),
+            }
+            println!("RAN lr_schedule_matches_the_golden: interpreter half too, {here}");
+        }
+    }
+    println!(
+        "RAN lr_schedule_matches_the_golden: {} values bitwise, warmup {warmup} of {total}, \
+         lr {lr:e} -> {lr_min:e}",
+        want.len()
+    );
+}
+
+/// Oracle 2 of packet M7/T4. `--schedule constant` is the default **and** it is the run of
+/// before: passing every new flag at its documented default gives a byte-identical loss
+/// curve, the optimizer block is the one the measured runs were taken under, and the applied
+/// learning rate never moves off `--lr`.
+///
+/// What this cannot check from inside the repository is equality with the *previous* script,
+/// because that file is not in the tree. That comparison is the server measurement in
+/// `docs/design/training-recipe.md` section 10: `git archive main` into a scratch directory,
+/// the same 40 steps, and the two curves compared as bytes.
+#[test]
+#[ignore = "needs torch, torchvision and pyarrow"]
+fn the_default_schedule_is_the_old_run() {
+    let python = match python_with_torch() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP the_default_schedule_is_the_old_run: {why}");
+            return;
+        }
+    };
+    let dir = scratch_dir("default-schedule");
+    let (path, _bundle) = demo_bundle(&dir);
+    let (build, _contract) = lowered(&dir, &path);
+    let baked = mini_baked(&python, &dir, &path);
+
+    let train = |tag: &str, extra: &[&str]| -> (Vec<u8>, serde_json::Value) {
+        let curve = dir.join(format!("{tag}.json"));
+        let out = dir.join(format!("{tag}.safetensors"));
+        let mut args = vec![
+            train_act_py().to_string_lossy().into_owned(),
+            "--module".to_owned(),
+            build.to_string_lossy().into_owned(),
+            "--baked".to_owned(),
+            baked.to_string_lossy().into_owned(),
+            "--out".to_owned(),
+            out.to_string_lossy().into_owned(),
+            "--batch".to_owned(),
+            "4".to_owned(),
+            "--seed".to_owned(),
+            "0".to_owned(),
+            "--checkpoint-at".to_owned(),
+            ORACLE_STEPS.to_string(),
+            "--loss-curve".to_owned(),
+            curve.to_string_lossy().into_owned(),
+        ];
+        args.extend(extra.iter().map(|w| (*w).to_owned()));
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let done = run(&python, &borrowed);
+        let line = String::from_utf8_lossy(&done.stdout)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_owned();
+        (
+            std::fs::read(&curve).unwrap_or_else(|e| panic!("{}: {e}", curve.display())),
+            serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e} in `{line}`")),
+        )
+    };
+
+    let (default, report) = train("default", &[]);
+    let (explicit, _) = train(
+        "explicit",
+        &[
+            "--schedule",
+            "constant",
+            "--warmup-steps",
+            "0",
+            "--lr-min",
+            "0",
+            "--weight-decay",
+            "0.01",
+            "--grad-clip",
+            "0",
+        ],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&explicit),
+        String::from_utf8_lossy(&default),
+        "the new flags at their defaults moved the loss curve"
+    );
+
+    // The knobs themselves, and not only their agreement with each other: this is the
+    // assertion that fails if a default is ever edited (packet M7/T4's `forbidden`).
+    assert_eq!(
+        report["optimizer"],
+        serde_json::json!({
+            "kind": "AdamW", "lr": 1e-4, "betas": [0.9, 0.999], "eps": 1e-8,
+            "weight_decay": 0.01,
+        }),
+        "the default optimizer moved: every measured run in the design notes was at this one"
+    );
+    assert_eq!(report["schedule"], "constant");
+    assert_eq!(report["batch"], 4, "the flag this test passes");
+    assert_eq!(report["grad_clip"], 0.0);
+    assert_eq!(report["first_nonfinite_step"], serde_json::Value::Null);
+
+    // The applied rate never moved off `--lr`, stated as the hash the summary reports.
+    let flat: Vec<u8> = std::iter::repeat_n(1e-4f64.to_le_bytes(), ORACLE_STEPS)
+        .flatten()
+        .collect();
+    let constant = blake3::hash(&flat).to_hex().to_string();
+    match report["lr_curve_hash"].as_str() {
+        Some(reported) => assert_eq!(
+            reported, constant,
+            "a constant schedule applied something other than {ORACLE_STEPS} copies of --lr"
+        ),
+        None => println!("SKIP the lr_curve_hash half: `blake3` is not importable by {python}"),
+    }
+
+    // ...and a schedule that is not constant *is* a different run, so the equality above is
+    // a property of the default and not of a flag that does nothing.
+    let (cosine, cosine_report) = train(
+        "cosine",
+        &["--schedule", "warmup_cosine", "--warmup-steps", "10"],
+    );
+    assert_ne!(
+        String::from_utf8_lossy(&cosine),
+        String::from_utf8_lossy(&default),
+        "--schedule warmup_cosine did not move the loss at all"
+    );
+    println!(
+        "RAN the_default_schedule_is_the_old_run: {ORACLE_STEPS} steps, default curve \
+         {} bytes, lr_curve_hash {}\n  default: {report}\n  cosine:  {cosine_report}",
+        default.len(),
+        report["lr_curve_hash"]
+    );
+}
+
 /// Packet M7/T3. The batch axis has to be an axis and nothing more: the same eight
 /// observations through the lowered module as one `[8, ..]` batch and as eight `[1, ..]` calls
 /// must be the same eight chunks.
@@ -1096,3 +1401,380 @@ sys.stdout.write(
     )
 )
 "#;
+
+// --- packet M7/T5: the pretrained backbone ---------------------------------------------------
+
+/// The demo bundle built from `learning-pretrained.toml` instead of `learning.toml` — the same
+/// graph with `pretrained = true` — with `frozen` overridden when the caller asks.
+fn pretrained_bundle(dir: &Path, frozen: bool) -> (PathBuf, PolicyBundle) {
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let mut learning = es_ir::serial::learning_from_toml(&read("learning-pretrained.toml"))
+        .expect("learning-pretrained.toml");
+    for node in learning.nodes.nodes.values_mut() {
+        if let es_ir::learning::LearningNode::VisionEncoder { frozen: f, .. } = node {
+            *f = frozen;
+        }
+    }
+    let weights = b"es-t5-untrained-placeholder".to_vec();
+    learning.policy.weights = WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let bytes = PolicyBundle::build(
+        &es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml"),
+        &es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml"),
+        &learning,
+        &es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml"),
+        &weights,
+    )
+    .expect("the pretrained demo documents pack into a bundle");
+    let path = dir.join(if frozen {
+        "pretrained-frozen.esb"
+    } else {
+        "pretrained.esb"
+    });
+    std::fs::write(&path, &bytes).expect("write the pretrained bundle");
+    let opened = PolicyBundle::open(&bytes).expect("the bundle just written opens");
+    (path, opened)
+}
+
+/// The pinned blake3, read out of `crates/es-data/src/training.rs`.
+///
+/// One copy of that number exists in this repository and this is not it: `es-data` is layer 10
+/// and this crate is layer 8 (spec 4.2), so the constant cannot be imported, and a second
+/// literal would be a second thing to forget. The file is read as text.
+fn pinned_blake3() -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../es-data/src/training.rs");
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let after = text
+        .split_once("pub const RESNET18_IMAGENET1K_V1_BLAKE3: &str =")
+        .unwrap_or_else(|| panic!("{}: the pin is gone", path.display()))
+        .1;
+    after
+        .split('"')
+        .nth(1)
+        .expect("the pin is a string literal")
+        .to_owned()
+}
+
+/// `python/es/fetch_backbone.py`, next to the trainer.
+fn fetch_backbone_py() -> PathBuf {
+    train_act_py()
+        .parent()
+        .expect("python/es")
+        .join("fetch_backbone.py")
+}
+
+/// The `ImageNet` artifact, fetched once and reused.
+///
+/// `ES_BACKBONE_DIR` names where it lives — `~/artifacts/plan-v/m7-t5` on the oracle server.
+/// Without it the script is run into a scratch directory; torchvision caches the `.pth`, so
+/// the second test of a session pays for serialization and not for the download.
+fn backbone_artifact(python: &str, dir: &Path) -> Result<PathBuf, String> {
+    let out = std::env::var("ES_BACKBONE_DIR").map_or_else(|_| dir.join("backbone"), PathBuf::from);
+    let file = out.join("resnet18-imagenet1k-v1.safetensors");
+    if file.is_file() {
+        return Ok(file);
+    }
+    let done = Command::new(python)
+        .arg(fetch_backbone_py())
+        .args(["--arch", "resnet18", "--out"])
+        .arg(&out)
+        .args(["--expect", &pinned_blake3()])
+        .output()
+        .map_err(|e| format!("{python}: {e}"))?;
+    if !done.status.success() {
+        return Err(format!(
+            "fetch_backbone.py: {}",
+            String::from_utf8_lossy(&done.stderr).trim_end()
+        ));
+    }
+    Ok(file)
+}
+
+/// Oracle 2 of packet M7/T5. The pretrained backbone is initialised from the artifact and
+/// **still has no training mode**: `FrozenBatchNorm2d`'s affine constants and running
+/// statistics do not read `self.training`, so `train()` and `eval()` are one function, bit for
+/// bit. That is V13's rule kept — what the optimizer minimizes is what `torch_ref.py` deploys.
+///
+/// The second half is what makes the hash chain mean something here: every tensor the module
+/// ends up holding is bitwise the tensor in the file whose blake3 `es train` verified. A loader
+/// that transposed, cast or averaged anything would pass the first half and fail this.
+#[test]
+#[ignore = "needs torch and torchvision"]
+fn the_pretrained_backbone_has_no_training_mode() {
+    let python = match python_with_torch() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP the_pretrained_backbone_has_no_training_mode: {why}");
+            return;
+        }
+    };
+    let dir = scratch_dir("pretrained-train-eval");
+    let artifact = match backbone_artifact(&python, &dir) {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP the_pretrained_backbone_has_no_training_mode: {why}");
+            return;
+        }
+    };
+    let (path, _) = pretrained_bundle(&dir, false);
+    let (build, _) = lowered(&dir, &path);
+
+    let script = dir.join("pretrained_probe.py");
+    std::fs::write(&script, PRETRAINED_PROBE_PY).expect("write the probe");
+    let out = run(
+        &python,
+        &[
+            &script.to_string_lossy(),
+            &train_act_py().to_string_lossy(),
+            &build.to_string_lossy(),
+            &artifact.to_string_lossy(),
+        ],
+    );
+    let report = text(&out);
+    assert!(
+        out.status.success(),
+        "the pretrained probe failed:\n{report}"
+    );
+    println!(
+        "RAN the_pretrained_backbone_has_no_training_mode: {}",
+        report.trim()
+    );
+}
+
+/// argv is `<train_act.py> <module dir> <artifact.safetensors>`; exits non-zero with what
+/// disagreed. `train_act.py` is `exec`'d rather than reimplemented — the loader under test is
+/// the one the trainer uses, not a second copy of it.
+const PRETRAINED_PROBE_PY: &str = r#"
+import json, sys
+from pathlib import Path
+import torch
+trainer, module_dir, artifact = sys.argv[1], sys.argv[2], sys.argv[3]
+train_act = {"__name__": "es_train_act_probe"}
+exec(compile(open(trainer, encoding="utf-8").read(), trainer, "exec"), train_act)
+namespace = {}
+exec(compile(open(module_dir + "/es_policy.py").read(), "<es-policy>", "exec"), namespace)
+
+model = namespace["EsPolicy"]()
+# No network at construction: the module was built before any of this, and what follows is the
+# only thing that gives it ImageNet tensors (spec 2.5).
+tensors = train_act["read_safetensors"](Path(artifact))
+report = train_act["init_backbone"](model, tensors)
+
+backbones = [(n, m) for n, m in model.named_children() if type(m).__name__ == "ResNet"]
+assert backbones, "the pretrained graph must instantiate a backbone"
+
+# Bitwise, not close: a checkpoint is bytes, and `es train` verified the blake3 of these.
+loaded = 0
+for name, member in backbones:
+    own = member.state_dict()
+    for key, value in tensors.items():
+        if key.startswith("fc."):
+            continue
+        assert torch.equal(own[key].cpu(), value), "%s.%s is not the file's tensor" % (name, key)
+        loaded += 1
+
+# FrozenBatchNorm2d is an affine pair and a statistics pair, all four constants -- which is
+# exactly why the two modes agree.
+stats = [k for k in model.state_dict() if k.endswith(("running_mean", "running_var"))]
+assert stats, "a frozen BatchNorm keeps its statistics as constants; none survived"
+assert not [
+    k for k in model.state_dict() if k.endswith("num_batches_tracked")
+], "num_batches_tracked has no place in a frozen norm"
+
+shapes = json.load(open(module_dir + "/contract.json"))["inputs"]
+image = [s for s in shapes.values() if len(s) == 3][0]
+x = torch.rand([2] + image, generator=torch.Generator().manual_seed(0))
+for name, backbone in backbones:
+    with torch.no_grad():
+        model.train()
+        trained = backbone(x)
+        model.eval()
+        deployed = backbone(x)
+    assert torch.equal(trained, deployed), "%s: train() and eval() differ by %g" % (
+        name,
+        (trained - deployed).abs().max(),
+    )
+sys.stdout.write(
+    json.dumps(
+        {
+            "backbones": report,
+            "tensors_bitwise_equal": loaded,
+            "frozen_statistics": len(stats),
+            "train_equals_eval": True,
+        }
+    )
+)
+"#;
+
+/// Oracle 5 of packet M7/T5. `frozen: true` means the optimizer never sees `nodes.<k>.*`: after
+/// 20 steps every backbone tensor is bitwise what the artifact held, and the head moved.
+///
+/// Both halves matter. Unchanged alone would also be true of a run that did nothing; a moved
+/// head is what says the 20 steps happened. And "bitwise" is the right comparison because
+/// `AdamW` with a non-zero weight decay moves a parameter that has no gradient, so a backbone
+/// merely left in the optimizer would drift — quietly, and only in the last bits.
+#[test]
+#[ignore = "needs torch, torchvision and pyarrow"]
+fn frozen_excludes_the_backbone_from_the_optimizer() {
+    let python = match python_with_torch() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP frozen_excludes_the_backbone_from_the_optimizer: {why}");
+            return;
+        }
+    };
+    let dir = scratch_dir("frozen-backbone");
+    let artifact = match backbone_artifact(&python, &dir) {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP frozen_excludes_the_backbone_from_the_optimizer: {why}");
+            return;
+        }
+    };
+    let (path, _) = pretrained_bundle(&dir, true);
+    let (build, _) = lowered(&dir, &path);
+    let baked = mini_baked(&python, &dir, &path);
+
+    let trained = dir.join("frozen.safetensors");
+    let done = run(
+        &python,
+        &[
+            &train_act_py().to_string_lossy(),
+            "--module",
+            &build.to_string_lossy(),
+            "--baked",
+            &baked.to_string_lossy(),
+            "--out",
+            &trained.to_string_lossy(),
+            "--init-backbone",
+            &artifact.to_string_lossy(),
+            "--batch",
+            "4",
+            "--seed",
+            "0",
+            "--checkpoint-at",
+            "20",
+            // A weight decay a frozen parameter would feel if it were in the optimizer.
+            "--weight-decay",
+            "0.1",
+        ],
+    );
+    assert!(
+        done.status.success(),
+        "the trainer failed:\n{}",
+        text(&done)
+    );
+    let summary: serde_json::Value = serde_json::from_str(
+        String::from_utf8_lossy(&done.stdout)
+            .lines()
+            .last()
+            .unwrap_or_default(),
+    )
+    .expect("the trainer prints one JSON line");
+    assert!(
+        summary["frozen_parameters"].as_u64().unwrap_or(0) > 1_000_000,
+        "a frozen ResNet18 is millions of parameters: {summary}"
+    );
+    assert!(
+        summary["trainable_parameters"].as_u64().unwrap_or(0) > 0,
+        "{summary}"
+    );
+
+    let script = dir.join("compare.py");
+    std::fs::write(&script, FROZEN_COMPARE_PY).expect("write the comparison");
+    let out = run(
+        &python,
+        &[
+            &script.to_string_lossy(),
+            &train_act_py().to_string_lossy(),
+            &artifact.to_string_lossy(),
+            &trained.to_string_lossy(),
+        ],
+    );
+    let report = text(&out);
+    assert!(out.status.success(), "{report}");
+    println!(
+        "RAN frozen_excludes_the_backbone_from_the_optimizer: {}\n  trainer: {summary}",
+        report.trim()
+    );
+}
+
+/// argv is `<train_act.py> <artifact.safetensors> <trained.safetensors>`; exits non-zero when a
+/// frozen tensor moved or when nothing outside the backbone is there at all.
+const FROZEN_COMPARE_PY: &str = r#"
+import json, sys
+from pathlib import Path
+import torch
+trainer, artifact, trained = sys.argv[1], sys.argv[2], sys.argv[3]
+train_act = {"__name__": "es_train_act_probe"}
+exec(compile(open(trainer, encoding="utf-8").read(), trainer, "exec"), train_act)
+read = train_act["read_safetensors"]
+before, after = read(Path(artifact)), read(Path(trained))
+
+# The checkpoint is keyed `nodes.<k>.<rest>`; the artifact is keyed torchvision's way.
+node = None
+for key in after:
+    if key.startswith("nodes.") and key.endswith(".conv1.weight"):
+        node = key.split(".")[1]
+assert node is not None, "no backbone in the checkpoint: %s" % sorted(after)[:8]
+
+held = 0
+for key, value in before.items():
+    if key.startswith("fc."):
+        continue
+    mapped = "nodes.%s.%s" % (node, key)
+    assert mapped in after, "%s is not in the checkpoint" % mapped
+    assert torch.equal(after[mapped], value), "%s moved under frozen = true" % mapped
+    held += 1
+
+head = [k for k in after if not k.startswith("nodes.%s." % node)]
+assert head, "the checkpoint holds nothing but the backbone"
+sys.stdout.write(
+    json.dumps({"frozen_tensors_unchanged": held, "other_tensors": len(head), "node": node})
+)
+"#;
+
+/// The packet's hash rule, without an interpreter: `lowering_hash` moves for the pretrained
+/// graph and for no other, and the committed `learning.toml` is exactly where it was.
+///
+/// The literal is the demo's own, recorded in `docs/design/learning-lowering.md` section 5.3.
+/// It is the one that matters: every measured run in `docs/design/visible-learning.md`
+/// section 7 names it, and this packet is not allowed to move it.
+#[test]
+fn the_demo_lowering_hash_moves_only_for_the_pretrained_graph() {
+    let dir = scratch_dir("lowering-hash");
+    let (_, scratch) = demo_bundle(&dir);
+    let (_, pre) = pretrained_bundle(&dir, false);
+    let from_scratch = lower_to_torch(&scratch.learning).expect("the demo graph lowers");
+    let pretrained = lower_to_torch(&pre.learning).expect("the pretrained graph lowers");
+    let hex = |d: &[u8; 32]| {
+        use std::fmt::Write as _;
+        d.iter().fold(String::new(), |mut acc, b| {
+            let _ = write!(acc, "{b:02x}");
+            acc
+        })
+    };
+
+    assert_eq!(
+        hex(&from_scratch.lowering_hash),
+        FROM_SCRATCH_LOWERING_HASH,
+        "packet M7/T5 moved the from-scratch lowering; every number in design note \
+         `visible-learning.md` section 7 was measured under the old one"
+    );
+    assert_ne!(
+        from_scratch.lowering_hash, pretrained.lowering_hash,
+        "the two graphs lower to the same source"
+    );
+    println!(
+        "from-scratch lowering_hash {}\npretrained   lowering_hash {}",
+        hex(&from_scratch.lowering_hash),
+        hex(&pretrained.lowering_hash)
+    );
+}
+
+/// The demo's `lowering_hash` as packet M7/T3 left it (design note `learning-lowering.md`
+/// section 5.2's table).
+const FROM_SCRATCH_LOWERING_HASH: &str =
+    "3d06811c52b6887f021440d4ce9a1a061e4eb27a0abb97c79822acd4d8a2d394";

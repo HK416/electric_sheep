@@ -338,6 +338,106 @@ The remaining cost is now elsewhere. What rung 9 removed was the per-sample laun
 at batch 8 is one ResNet18 forward over eight 96×96 images and the AdamW step, and the samples/s
 column is the number to beat next.
 
+### 5.3 `pretrained`
+
+**Rule.** *A pretrained backbone is a checkpoint like any other — it enters through
+`es policy pack` / `es train`, never through the network at construction — and its provenance is
+`base_model.lock`.*
+
+Packet M7/T5; spec 8.3, 2.5, 5.3, 19.3, 29. `VisionEncoder { pretrained: true }` was refused
+through M5 (section 7.6, open question 6), and the two objections in that refusal are worth
+restating because neither has been softened:
+
+1. honouring the flag meant `weights="DEFAULT"`, so `EsPolicy()` would fetch ImageNet weights
+   over the network *at every construction* — including inside `TorchRuntime::load` at
+   inference, where `load_state_dict(strict=True)` overwrites all of them a moment later. A
+   lowering that needs the network to instantiate contradicts spec 2.5;
+2. weights nobody hashed are outside the chain (spec 5.3).
+
+Both are about **where the tensors come from**, not about the flag. So the flag lowers now and
+the tensors come from somewhere else:
+
+```python
+def _frozen_backbone(name, out_dim, frozen):
+    import torchvision
+    from torchvision.ops.misc import FrozenBatchNorm2d
+
+    m = getattr(torchvision.models, name)(weights=None, norm_layer=FrozenBatchNorm2d)
+    m.fc = nn.Linear(m.fc.in_features, out_dim)
+    if frozen:
+        m.requires_grad_(False)
+    return m
+```
+
+`weights=None`, and `es policy lower`'s oracle asserts that the generated source contains no
+`"DEFAULT"`, no `IMAGENET1K`, no `ResNet18_Weights` and no `download`
+(`lower::torch::tests::a_pretrained_backbone_lowers_frozen`, no Python needed).
+
+**Where the tensors do come from.** `python/es/fetch_backbone.py --arch resnet18 --out <dir>`
+instantiates torchvision's ImageNet ResNet18 **once**, on the learning path where Python is a
+first-class dependency (spec 2.3), and writes two files: `resnet18-imagenet1k-v1.safetensors`
+(every float `state_dict` tensor under torchvision's own key names) and
+`resnet18-imagenet1k-v1.lock.json`. The pickle read happens inside torchvision's own
+downloader; `es` never opens a `.pth`, and INV-16 is about what *this project's* loaders
+accept — they accept safetensors. From there the tensors are an ordinary checkpoint:
+`es train` verifies them, `train_act.py --init-backbone` loads them under `nodes.<k>.` before
+the first step, and `es policy pack --weights` would accept them the same way it accepts a
+trained one.
+
+**`FrozenBatchNorm2d`, so V13's rule survives.** `lerobot.rs` already lowers LeRobot's ACT
+backbone this way (V8/V19), for the reason that applies here too: ImageNet's BatchNorm affine
+parameters and running statistics become *constants*, and a module of constants has no
+`training` branch. So `train()` and `eval()` are one function, bitwise, which is exactly what
+section 5.1 demanded of `GroupNorm` — the two arms reach the same property by different
+routes, and `ir_training::the_pretrained_backbone_has_no_training_mode` asserts it on the real
+artifact. `num_batches_tracked` is absent by construction: `FrozenBatchNorm2d` has no such
+buffer, it is an int64 counter rather than a weight, and the safetensors layout this project
+reads is F32 — so `fetch_backbone.py` drops it and the lock file names it as dropped.
+
+**`frozen` is lowered, not passed.** `frozen: true` emits `m.requires_grad_(False)`, and
+`train_act.py` builds `AdamW` over `[p for p in model.parameters() if p.requires_grad]`. There
+is deliberately **no trainer flag** for it: `frozen` is a field of the Learning IR, and a copy
+of it on a command line would be a second thing that can disagree with the IR — which is the
+failure V2b refused in the first place. With nothing frozen the list is every parameter in the
+same order, so the default path is bit-identical to the run before this packet.
+`ir_training::frozen_excludes_the_backbone_from_the_optimizer` runs 20 steps with a weight
+decay of 0.1 — a decay a parameter *left in* the optimizer would feel even with no gradient —
+and compares every backbone tensor against the artifact's bitwise.
+
+**Two decisions this packet made and is recording rather than asking about.**
+
+- `pretrained: false, frozen: true` is now **refused**. A from-scratch backbone excluded from
+  the optimizer is a random projection nobody chose, and nothing would ever train it. Honour
+  it or refuse it; dropping it silently is what V2b was about. The committed `learning.toml`
+  is `frozen = false`, so no fixture moves.
+- The refusals are **by name, not by code**. The packet writes `TRAIN-0xx`; `es-data`'s
+  training module and `es train` have never carried numeric codes — every refusal there names
+  the field and the file. A numbering scheme invented for five messages would be a scheme with
+  one user, so these five name `base_model`, the lock file, the pin, the licence and
+  `pretrained = true` the way their neighbours do.
+
+**The hash consequence**, measured on the demo's own documents:
+
+| | `learning.toml` | `learning-pretrained.toml` |
+|---|---|---|
+| `learning_hash` | `5dac0a46…6dc446f0` | `fdb5178a…64ac699e` |
+| `policy_hash` | `c94c2732…2bd84a07` | `d5e152b9…9ebc0976` |
+| `lowering_hash` | `3d06811c…d8a2d394` | `41d11a06…b06a6841` |
+| `task_hash` / `observation_hash` | `eb6efefa…` / `899c16a9…` | **unchanged** |
+
+Read three things off it. `learning_hash` moves because `pretrained` is a spec 8.3 node field
+and always was — that is not this packet's doing. `lowering_hash` moves **only** for the
+pretrained graph: `_frozen_backbone` is emitted beside `_backbone`, never instead of it, so a
+graph with no pretrained encoder lowers to the byte-identical source every number in
+`visible-learning.md` section 7 was measured under, and
+`ir_training::the_demo_lowering_hash_moves_only_for_the_pretrained_graph` pins that literal.
+And `task_hash` / `observation_hash` do not move, so the two documents share a baked
+observation set and an `evaluation.toml` and the U-measurement has exactly one variable.
+
+The twelfth consequence is spec 19.3's: `training_hash` gains a **non-zero, non-`unset`**
+`base_model` slot — the source, the URL, the upstream sha256, the blake3, the licence — see
+`training-recipe.md` section 4.
+
 ## 6. Tier-4 tolerance (spec 8.9)
 
 Spec 8.9's table is about pairs of `PolicyRuntime`s:

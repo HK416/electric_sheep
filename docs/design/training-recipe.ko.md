@@ -55,6 +55,10 @@ seed          = 0
 checkpoint_at = [1000, 5000, 20000]
 device        = "cuda"
 interpreter   = "python"              # ES_PYTHON이 설정되어 있으면 그쪽이 이긴다
+# 선택 항목이고, 없으면 진짜로 없는 것이다(10절):
+# schedule     = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
+# weight_decay = 0.01                 # AdamW의 것. 없으면 torch 자신의 1e-2
+# grad_clip    = 1.0                  # 그래디언트 노름 클립. 없으면 끔
 ```
 
 모든 테이블이 `deny_unknown_fields`다. 오타는 조용히 무시되는 손잡이가 아니라 거절이다.
@@ -149,11 +153,11 @@ es policy import-lerobot --checkpoint lerobot/checkpoints/010000/pretrained_mode
 | | 슬롯 | 출처 | 시점 |
 |---|---|---|---|
 | 1 | `config.json` | 정규 JSON으로 쓴 레시피, 해석된 인터프리터, `<out>` 상대 계획 | 사전 |
-| 2 | `optimizer.json` | `AdamW` + `lr`. IR 경로에서는 `AdamW(params, lr=lr)`가 torch 기본값으로 두는 betas/eps/weight decay도 | 사전 |
-| 3 | `scheduler.json` | T4까지 `{"kind":"constant","lr":…}` | 사전 |
+| 2 | `optimizer.json` | `AdamW` + `lr`. IR 경로에서는 betas/eps와 트레이너에게 실제로 시킨 weight decay도, 그리고 `[run]`이 클립을 두면 `grad_clip`까지(10절) | 사전 |
+| 3 | `scheduler.json` | `{"kind":"constant","lr":…}`, 또는 `[run] schedule`이 이름 붙인 `warmup_cosine` 블록(10절) | 사전 |
 | 4 | `seed.json` | `[run] seed`에서 온 `global`·`dataloader`, `augmentation`은 unset | 사전 |
 | 5 | `dataset.lock` | `es-data::identity`의 content/schema/split, 에피소드·프레임 수, 기록된 `es:task:` 이름 | 사전 |
-| 6 | `base_model.lock` | `{"source":"none"}`(IR) 또는 선언된 `vision_backbone` + `pretrained_backbone_weights`(외부) | 사전 |
+| 6 | `base_model.lock` | `[policy] base_model`의 *검증된* 출처(IR, 11절), 그것이 없으면 `{"source":"none"}`, 또는 선언된 `vision_backbone` + `pretrained_backbone_weights`(외부) | 사전 |
 | 7 | `augmentation.json` | T6까지 `{"kind":"none"}` | 사전 |
 | 8 | `precision.json` | `fp32`, `amp off`, IR 경로에서 `gradient_accumulation` = `[run] batch` | 사전 |
 | 9 | `topology.json` | `{"world_size":1}` | 사전 |
@@ -183,8 +187,8 @@ es policy import-lerobot --checkpoint lerobot/checkpoints/010000/pretrained_mode
 | unset | 이유 | 주인 |
 |---|---|---|
 | `seed.json.augmentation` | 증강이 없다 | T6 |
-| `base_model.lock.weights_hash`·`.license` | *선언된* 출처다. `extra`가 덮지 않는 한 백본은 LeRobot ACT의 기본값이고, 여기서는 그 가중치를 내려받지도 검증하지도 않았다 | T5 |
-| 외부 경로의 `optimizer.json.betas`·`.weight_decay` | `lerobot`의 옵티마이저 블록은 이쪽이 선언할 것이 아니다 | T4 |
+| `base_model.lock.weights_hash`·`.license`, **외부 경로에서만** | *선언된* 출처다. `extra`가 덮지 않는 한 백본은 LeRobot ACT의 기본값이고, 여기서는 그 가중치를 내려받지도 검증하지도 않았다. IR 경로의 것은 검증된다(11절) | — |
+| 외부 경로의 `optimizer.json.betas`·`.weight_decay` | `lerobot`의 옵티마이저 블록은 이쪽이 선언할 것이 아니다. 그래서 T4는 그 경로에서 `[run] schedule`·`weight_decay`·`grad_clip`을 아예 거절한다 — 돌지도 않은 스케줄을 선언하는 대신에(10절) | T2 |
 | 외부 경로의 `metrics.json.loss` | `lerobot-train`은 곡선을 자기 로그에 적지, 이 명령이 읽는 파일에 적지 않는다 | T2 |
 | `hardware.json.driver` | `torch`는 CUDA 툴킷을 보고하지 드라이버를 보고하지 않는다 | — |
 | `hardware.json.git_describe` | 빌드 스크립트가 없고 `Cargo.lock`이 gitignore다(M5 리뷰 S-8 / R7). 빌드를 이름 붙일 수 없는데 리비전을 주장하면 §28.10 규칙 2가 금지하는 날조다 | M5 R7 |
@@ -244,6 +248,9 @@ T4에서 고칠 일이지 실행을 버릴 이유가 아니다.
 | 3 | `cargo test -p es --test cli train_ir_path_packs_a_bundle_torch_opens -- --ignored` | torch가 있는 `ES_PYTHON`, MuJoCo |
 | 4 | `cargo test -p es --test cli train_refuses_by_name` | 없음 |
 | — | `cargo test -p es-data --lib training` | 없음(헤드리스 절반: 스키마·계획·아이덴티티) |
+| 5 | `cargo test -p es-policy --test ir_training lr_schedule_matches_the_golden` | 없음. 인터프리터 절반은 `ES_PYTHON`이 있으면 돌고 없으면 `SKIP`을 찍는다(10절) |
+| 6 | `cargo test -p es --test cli train_identity_moves_with_the_schedule` | 없음 |
+| 7 | `cargo test -p es-policy --test ir_training -- --ignored the_default_schedule_is_the_old_run` | torch가 있는 `ES_PYTHON` |
 
 오라클 2는 존재할 수 없는 인터프리터를 가리키는 레시피로 실제 `es train`을 돌린다. 실행은 항상
 멈추고, 단언하는 아이덴티티는 멈추기 전에 쓰인 그것이다. 사전/사후 분할을 실행 가능한 문장으로
@@ -332,6 +339,24 @@ ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python \
    펜스 또는 불릿 목록을 원하며(`xtask/src/scope.rs::parse_context_globs`), `xtask/`는 이
    패킷의 범위 밖이다.
 
+**패킷 M7/T4**(10절)는 세 곳에서 더 벗어난다.
+
+6. **측정된 네 행은 `es train`이 아니라 `train_act.py`를 직접 돌린 것이므로, 행마다 남는 것은
+   `training.lock`이 아니라 JSON 요약과 `--loss-curve`다.** T4 패킷은 행마다 lock을 요구한다.
+   `--resident-gpu`는 트레이너의 플래그이고 의도적으로 레시피 필드가 아니다(텐서가 어디 사는지를
+   바꿀 뿐 실행이 무엇인지를 바꾸지 않으며, 2절의 규칙은 레시피가 수치를 인용할 실행을
+   기술한다는 것이다). 그래서 `es train`으로 측정한 행은 비교 대상인 T3의 기준선과 다른 실행이
+   된다. 대신 남긴 것: `~/artifacts/plan-v/m7-t4/{A,B,C,D}.json`과 `*-curve.json`, 그리고 이
+   패킷 이후 다시 돌린 오라클 3의 진짜 `es train` lock 하나(`train-ir-training.lock`) — 그
+   `scheduler.json` 다이제스트는 T4 이전의 것이다.
+7. **`the_default_schedule_is_the_old_run`은 저장소 안에서 이전 스크립트와 비교할 수 없다.**
+   그 파일이 트리에 없고, torch 손실 곡선은 정당한 골든이 아니기 때문이다(이 노트의 9절,
+   그리고 `ir_training.rs`의 머리말: 한 옵티마이저의 두 실행은 torch 버전을 가로질러 일치하지
+   않는다). 트리 안의 테스트는 기본값과 "새 플래그를 전부 기본값으로 명시한 것"을 비교하고
+   옵티마이저 블록을 고정한다. `main` 자신의 스크립트와의 비교는 10절의 서버 측정이다.
+8. **픽스처 레시피는 스케줄 없이 그대로 둔다.** 패킷이 이 노트에 판단을 맡긴 부분이고, 10절의
+   마지막 소절이 이유를 적는다.
+
 ## 9. 열린 질문
 
 * **29.** `lerobot-train`은 한 시드에서 비트 동일한 가중치를 내지 않으므로(7절), 한 기계에서
@@ -346,3 +371,236 @@ ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python \
   `es train`은 저장소 루트에서 실행해야 한다. 설치된 `es`에는 저장소가 없다. 트레이너의 위치는
   아마 문서 값이어야 하거나, `train_act.py`가 바이너리가 싣고 다니는 데이터여야 한다 — T3가
   어차피 그 파일을 건드린다.
+* **33.** (32는 `visible-learning.md`의 것이다.) 인터프리터가 `blake3`를 임포트하지 못하면
+  `lr_curve_hash`는 `null`이다(10절). 이 저장소의 다른 모든 다이제스트는 blake3이고 Rust에서
+  계산되는데, 이것만 Python에서 계산된다 — 어떤 학습률을 실제로 적용했는지 아는 것이 트레이너
+  뿐이기 때문이다. 트레이너가 적용한 학습률을 `--loss-curve` 옆 파일로 쓰고 `es train`이 해시를
+  계산하거나, `blake3`가 `torch`처럼 학습 경로의 선언된 의존성이 되어야 한다
+  (`python/es/pyproject.toml`은 USD bake를 위해 이미 그것을 선언한다).
+* **34.** lerobot 경로에서는 스케줄을 번역하지 않고 거절한다(10절). ACT의 설정 자체는
+  `optimizer_lr`과 `optimizer_weight_decay`를 갖고 있으므로
+  (`docs/api-notes/lerobot-config.md`의 "training-only" 행), `[run]`을 `lerobot-train` 0.6.1이
+  자기 스케줄을 부르는 이름들로 사상하는 것은 가능하고, 그러면 한 문서가 두 경로를 모두
+  기술하게 된다 — 레시피의 요점이 바로 그것이다. 다만 저쪽 플래그 이름을 api-note에 먼저
+  고정해야 하고, 그전까지는 `[policy] lerobot.extra`가 탈출구다.
+
+---
+
+## 10. 스케줄 (패킷 M7/T4)
+
+§28.9의 "월클록은 어디로 가는가"는 큰 배치에 대해 한 줄로 끝난다. *선형 스케일링은 발산하는
+것으로 측정되었으므로, 필요한 것은 관례가 아니라 스케줄이다.* 이 절은 그 한 줄을 문서 필드
+하나, 함수 하나, 골든 하나, 그리고 측정된 네 번의 실행으로 바꾼 것이다.
+
+**트레이너의 다섯 플래그, 문서의 세 필드.** `train_act.py`는 `--schedule
+constant|warmup_cosine`, `--warmup-steps N`, `--lr-min F`, `--weight-decay F`(torch 자신의
+`1e-2`를 **명시적으로** — `optimizer.json`이 스크립트가 가정한 수가 아니라 실제로 시킨 수를
+이름 붙일 수 있도록), `--grad-clip F`(`0`이면 끔)를 얻는다. 레시피는 `[run]`에서 그것들을
+이름 붙인다.
+
+```toml
+[run]
+steps        = 20000
+batch        = 64
+lr           = 4e-4
+schedule     = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
+weight_decay = 0.01                   # 선택. 없으면 torch의 1e-2
+grad_clip    = 1.0                    # 선택. 없으면 끔
+```
+
+`es train`은 그것들을 트레이너의 명령줄에 올리고, `scheduler.json`을
+`{"kind":"warmup_cosine","lr":…,"lr_min":…,"warmup":…,"total_steps":…}`로,
+`optimizer.json`을 weight decay와 클립과 함께 쓴다. 따라서 `identity_hash`는 그 하나하나와
+함께 움직인다. **`total_steps`는 장식이 아니라 스케줄의 일부다**: 코사인의 주기가 곧 실행의
+길이이므로, 같은 `warmup`/`lr_min` 쌍이라도 2,500 스텝과 20,000 스텝은 서로 다른 스케줄이다 —
+아래의 C행과 D행이 정확히 그것이다.
+
+**스케줄은 `torch.optim.lr_scheduler`가 아니라 평범한 함수다.**
+
+```
+lr(step) = lr * step / warmup                                          step < warmup
+         = lr_min + (lr - lr_min) * 0.5 * (1 + cos(pi * (step - warmup) / (total - warmup)))
+```
+
+`python/es/train_act.py::lr_at`이 그 세 줄이고 매 스텝 한 번 호출된다. torch 스케줄러가 내는
+float 수열은 torch 버전의 구현 세부사항인데, 실행은 자신의 `scheduler.json`으로부터 버전을
+가로질러 재현되어야 한다 — 그래서 수열을 여기에 고정한다.
+`tests/golden/train/lr_warmup_cosine.json`은 D행 스케줄(`total 20000, lr 4e-4, lr_min 1e-6,
+warmup 250`)의 처음 1,000개 값을 담고, 오라클 서버에서 스크립트 자신으로부터 `#[ignore]`된
+`generate_lr_golden`이 한 번 생성했다. `ir_training::lr_schedule_matches_the_golden`은 **같은
+세 줄의 Rust 재구현**을 그것과 비트 단위로 비교하고, `ES_PYTHON`이 설정되어 있으면 스크립트
+자신의 `lr_at`도 비교한다. Rust 쪽은 인터프리터가 필요 없고, 그것이 CI가 스케줄을 판정할 수
+있게 해 준다.
+
+두 쪽이 libm을 가로질러 비트 단위로 일치하는가가 열린 위험이었다 — 여기서 초월함수는 코사인
+하나뿐이고, 서버의 glibc `cos`가 만든 골든을 Windows 호스트의 MSVC `cos`가 읽는다. 측정:
+**1,000개 중 1,000개가 `f64`로 동일**, warmup 구간도 코사인 구간도. 골든 범위에서 코사인의
+인자는 `[0, 0.119]`에 머무르고 그 구간에서는 두 libm 모두 올바르게 반올림한다. 감쇠 전체를
+덮는 골든이라면 그렇게 운이 좋지 않을 수 있고, 테스트가 단지 단언하는 대신 몇 개가 다른지를
+출력하는 이유가 그것이다.
+
+**`constant`이 기본값이고, 기본값은 예전의 그 실행이다.** 서로 다른 세 진술이고, 각각 자기
+검사를 갖는다.
+
+1. *명령줄에 아무것도 없다.* 스케줄을 이름 붙이지 않은 레시피는 늘 렌더링하던 계획을 그대로
+   렌더링하므로 `tests/golden/train/plan-ir.txt`는 바이트 하나 움직이지 않는다
+   (`cli::train_dry_run_plan_is_the_golden`).
+2. *정체성에 아무것도 없다.* 새 키들은 레시피가 요구할 때만 `scheduler.json`과
+   `optimizer.json`에 들어가므로, T4 이전의 레시피는 자기 `identity_hash`를 유지한다 — 7절에
+   기록된 실행은 여전히 같은 실행이다
+   (`es-data::a_recipe_without_a_schedule_is_the_run_of_before`,
+   `cli::train_identity_moves_with_the_schedule`). 주장이 아니라 측정이다. 이 패킷 이후 서버에서
+   다시 돌린 7절의 오라클 3은 `scheduler.json 8847154d…51afe7aa`를 쓰는데, 그 표가 이미 담고
+   있던 바로 그 다이제스트다.
+3. *산술에 아무것도 없다.* `constant`에서는 `lr_at`을 아예 참조하지 않고 옵티마이저는 자신이
+   생성될 때 받은 스텝을 유지한다. `ir_training::the_default_schedule_is_the_old_run`은 CPU에서
+   새 플래그 없이 40스텝, 새 플래그를 전부 기본값으로 명시하고 40스텝을 돌려 두 `--loss-curve`
+   파일을 **바이트로** 비교하고, 보고된 옵티마이저 블록이 이 노트의 모든 측정이 취해진 그
+   블록임을 단언한다.
+
+세 번째는 이 저장소 *안의* 테스트가 완전히 진술할 수 없다. *이전* 스크립트가 트리에 없기
+때문이다. 그래서 서버에서 한 번 그것과 맞대어 측정했다. `git show main:python/es/train_act.py`
+(main은 `389ef88`, T 트랙 파일들은 `374d42c`의 것과 동일)를 오라클 자신의 실행과 같은 모듈,
+같은 bake, 같은 시드, 같은 40스텝으로 돌렸고 — **두 손실 곡선은 바이트 동일**하다.
+
+**lerobot 경로에서는 거절.** `[run] schedule`·`weight_decay`·`grad_clip`은 `train_act.py`의
+플래그다. `lerobot-train`은 자기 옵티마이저와 스케줄러 설정을 들고 다니므로, 그쪽에서 이것들을
+받아들이면 실행이 적용한 적 없는 스케줄로 `scheduler.json`을 — 따라서 `training_hash`를 — 쓰게
+된다. 레시피는 이름을 대고 거절하며 `[policy] lerobot.extra`를 가리킨다(열린 질문 34).
+
+**`lr_curve_hash`.** 실제로 적용된 학습률들을 해시해(f64 리틀엔디언 위의 blake3) 실행 요약에
+보고한다. 그래서 한 스케줄의 두 실행을 한 단어로 구별할 수 있고, `constant` 실행의 해시가
+`--lr` 40개의 복사본임을 검사할 수 있다. `blake3`는 선택적 임포트다. 스크립트의 계약이
+"torch 이상의 패키지는 없다"이므로, 그것이 없는 인터프리터는 학습 실행을 멈추는 대신 `null`을
+보고한다(열린 질문 33). 오라클 서버의 `es-lerobot-cuda` venv에는 `pip`이 없어서, 아래 실행들은
+옆의 `es` venv에서 `blake3` 패키지를 복사해 `PYTHONPATH`로 가리켜 얻었다.
+
+### 측정 — 오라클 서버, RTX 4090, 2026-09-16
+
+모듈은 이 트리의 `es policy lower`가 내린 데모의 미훈련 번들이고
+(`lowering_hash 3d06811c…d8a2d394`, T3의 것), 데이터는 V15의 200 시연 bake 세트
+(36,960 샘플, `observation_hash 899c16a9…`)이며, 모든 실행은 `--seed 0 --device cuda
+--resident-gpu`, torch 2.11.0+cu129이다. 실행 전 GPU는 비어 있었고(`nvidia-smi`: 56 MiB, 0 %)
+기다릴 필요가 없었다.
+
+| 실행 | batch | lr | 스케줄 | 스텝 | 본 샘플 | 월클록 | 1,000스텝당 초 | 초당 샘플 | `final_loss` | 비유한 스텝 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| A (기준선) | 8 | 1e-4 | constant | 20,000 | 160,000 | **1:47** (107 s) | 5.4 | 1,495 | 0.018901 | 없음 |
+| B | 64 | 1e-4 | constant | 2,500 | 160,000 | **0:26** | 10.4 | 6,154 | 0.020714 | 없음 |
+| C | 64 | 4e-4 | warmup_cosine, warmup 250, `lr_min` 1e-6 | 2,500 | 160,000 | **0:26** | 10.4 | 6,154 | **0.012060** | 없음 |
+| D | 64 | 4e-4 | warmup_cosine, warmup 250, `lr_min` 1e-6 | 20,000 | 1,280,000 | **2:51** (171 s) | 8.6 | 7,485 | 0.004610 | 없음 |
+
+§12.4에 따라 `step/s` 수치는 인용하지 않는다. 두 비율 열은 그 실행 자신의 단위다. 짧은 실행도
+같은 약 5초의 시작 비용(모듈 구축과 3.9 GiB 상주 복사)을 1/8의 스텝 수에 나누어 지므로,
+B·C의 10.4와 D의 8.6 차이는 전부 그것이다.
+
+**패킷의 질문, 답.** *같은 샘플 수를 본 시점에서 배치 64는 warmup과 코사인으로 배치 8의 손실
+이하에 도달하는가?* **그렇다, 그것도 3분의 1만큼**: C는 0.012060으로 A의 0.018901보다 36 %
+낮고, **107초가 아니라 26초**다. 그리고 그것을 해낸 것은 배치가 아니라 스케줄이다. B는 같은
+160,000 샘플을 같은 64로, A와 같은 lr로 본 실행인데 A보다 *위인* 0.020714에 앉는다. "관례가
+아니라 스케줄"이 바로 그 두 행이다.
+
+**아무것도 발산하지 않았고, 그것이 무엇의 증거이고 무엇의 증거가 아닌가.** 어떤 행에도 비유한
+스텝이 없다 — 요약이 이제 `first_nonfinite_step`을 보고하므로 이것은 충돌의 부재가 아니라
+하나의 수다. 그러나 C·D는 `visible-learning.md` 7.11의 NaN 실행과 *두 가지*가 다르다. 그쪽은
+warmup 없이 학습률을 8e-4로 선형 스케일했고, 이쪽은 4e-4에 250스텝의 warmup과 감쇠를 쓴다.
+T3는 스케일하지 않은 1e-4에서의 배치 64가 유한함을 이미 보였다. 따라서 여기서 측정된 것은
+**이 조합이 안정적이라는 것**이지 warmup만으로 8e-4가 구제된다는 것이 아니다. 그것을 분리하려면
+다섯 번째 실행이 필요하고, 하류의 무엇도 그것을 필요로 하지 않는다.
+
+**D는 A와 적합도로 비교할 수 없고**(데이터가 여덟 배다) 여기서 평가하지 않는다(그것은 5차의
+U-측정이다). 체크포인트는 `~/artifacts/plan-v/m7-t4/model-D.safetensors`이고 `lr_curve_hash`는
+`c01d5185b03a5bad9fbe1708b5582f504aabf90c745910713ca0ccaefc15365c`다. `final_loss 0.004610`은
+이 문서들 위에서 IR 그래프 실행이 기록한 가장 낮은 값이다. 그만큼 낮은 적합이 성공하는 정책인지
+아닌지가 바로 §28.10의 중단 규칙이 재측정을 위해 남겨 둔 질문이다.
+
+**조심해서 읽을 수 하나.** A행은 `learning-lowering.md` 5.2에서 T3가 측정한 것과 같은
+플래그인데 `final_loss 0.018901`을 보고한다 — 그 실행은 0.019026이었고 월클록도 137초 대
+107초다. CUDA 학습은 실행 간에 재현되지 않으므로(§28.9 L10) 동일한 두 호출 사이의 0.7 % 차이는
+이 표 모든 수의 잡음 바닥이다. 위의 비교가 1 %가 아니라 36 %·76 % 차이인 이유, 그리고 "기본값은
+움직이지 않았다"의 비트 단위 오라클이 CPU에 있는 이유가 그것이다.
+
+### 픽스처 레시피는 의도적으로 그대로다
+
+`tests/fixtures/visible-learning/training.toml`은 여전히 스케줄을 이름 붙이지 않는다. 그것은
+배치 8에서 측정된 20,000스텝 실행의 커밋된 레시피이고, 그 옆의 계획 골든은 `--dry-run`이 계속
+만들어 내야 하는 것이다. 새 필드를 거기서 보이면 둘 다 움직인다. 필드는 위에 문서화되어 있고,
+자기 레시피를 직접 만드는 `cli::train_identity_moves_with_the_schedule`이 그것을 실행한다.
+
+## 11. 사전학습된 backbone과 `base_model.lock` (패킷 M7/T5)
+
+spec 19.3은 사전학습된 backbone의 출처가 "결과에 직접 영향을 주므로 프로버넌스에 포함되어야
+하며, 라이선스 추적의 근거이기도 하다"고 말한다. 이 패킷 이전까지 IR 경로의 슬롯은
+`{"source":"none"}`이었고 외부 경로의 것은 두 필드가 `unset`인 *선언*이었다. 이제 IR 경로에서
+그것은 **검증된** 기록이며, 이 절이 검증된다는 것이 무슨 뜻인지 적는다.
+
+레시피가 필드 하나를 얻는다:
+
+```toml
+[policy]
+bundle     = "runs/collect-001/untrained.esb"
+base_model = "~/artifacts/plan-v/m7-t5/resnet18-imagenet1k-v1.safetensors"
+```
+
+Learning IR이 `VisionEncoder { pretrained = true }`를 선언하는 번들은 이것을 요구하고, 그렇지
+않은 번들은 이것을 거부하며, `lerobot` 경로에서는 아예 거부된다 — 거기서 backbone은 `lerobot`
+자신의 것이고 `[policy] lerobot.extra`를 통해 닿는다. 첫 쌍의 양방향 모두 기본값이 아니라
+거부이며, 이유는 같다: ImageNet을 원하는데 받지 못한 번들은 그렇지 않다고 말하는 문서 아래에서
+처음부터 학습할 것이고, 아무도 읽지 않는 가중치를 이름 대는 레시피는 실행이 갖지 않은 출처를
+`base_model.lock`에 넣게 된다 — §28.10 규칙 2가 금지하는 날조다.
+
+**단 1 GPU-초도 쓰이기 전에 세 주장이 일치해야 한다.** `Backbone::verify`는 파일과 그 옆의
+`<stem>.lock.json`을 읽고, 이 순서로 확인한다:
+
+| 확인 대상 | 거부되는 경우 | 왜 이 순서인가 |
+|---|---|---|
+| lock이 이 바이트를 서술하는가 | `lock.blake3 != blake3(file)` | 이 lock 파일이 애초에 이 아티팩트에 관한 것인가 |
+| source | `lock.source`가 `torchvision.models.ResNet18_Weights.IMAGENET1K_V1`가 아님 | 라이선스 결정은 *이름 붙은* source에 관한 것이다(§29 행, 오너 2026-09-15) |
+| 라이선스 | `lock.license`가 비어 있음 | §19.3은 이 파일을 라이선스 추적의 근거로 삼는다; 빈 슬롯은 아무것도 추적하지 않는다 |
+| 고정값 | `blake3(file) != RESNET18_IMAGENET1K_V1_BLAKE3` | 앞의 셋은 lock이 이 바이트에 대한 잘 형성된 기록인지 묻고, 이것은 이 바이트가 저장소가 실제로 측정한 아티팩트인지 묻는다 |
+
+고정값은 `8511928e…9e801899`, `crates/es-data/src/training.rs`의 `pub const` 하나다. 45MB
+파일은 결코 커밋되지 않는다 — 오라클 서버의 `~/artifacts/plan-v/m7-t5/`에 있다 — 그래서 그
+상수가 저장소가 그것에 대해 아는 전부이며, 이는 `tests/fixtures/mjcf/*.PROVENANCE.json`이 이
+프로젝트의 장면이 파생된 업스트림 MJCF를 고정하는 방식과 같다. 그 문자열의 사본은 정확히
+하나다: `python/es/fetch_backbone.py`는 자기 것을 갖는 대신 `--expect`로 그것을 *받고*,
+`crates/es-policy/tests/backbone_provenance.rs`는 `training.rs`에서 텍스트로 읽어 낸다 —
+`es-data`는 레이어 10이고 `es-policy`는 레이어 8이므로(§4.2) 상수를 위로 import할 수 없기
+때문이다. `fetch_backbone.py --repin`이 그것을 옮기는 의도적인 방법이고, 상수와 두 설계 노트가
+같은 커밋에서 함께 움직여야 한다고 stderr로 말한다.
+
+**슬롯에 무엇이 들어가고, 무엇이 의도적으로 들어가지 않는가.** `base_model.lock`은 `source`,
+`url`, `sha256_upstream`, `blake3`, `dropped`, `license`, `license_url`을 싣는다 — *가중치*를
+식별하는 필드들이다. 아티팩트 옆의 lock 파일은 그것을 받아온 `torch`와 `torchvision`도
+기록하지만 그것들은 **복사되지 않는다**: 같은 업스트림 파일을 받아오는 두 머신은 바이트 단위로
+동일한 텐서와 서로 다른 버전 문자열을 쓰므로(측정: torchvision 0.26.0+cu129와 0.29.0+cpu가
+같은 blake3를 낸다), 그것을 실으면 받아온 머신이 `identity_hash`에 들어가고 한 레시피가 두
+identity를 갖게 된다. 받아온 환경은 아티팩트 자신의 lock 파일과 실행의 `hardware.json`에 속한다.
+
+따라서 `TrainingIdentity.base_model`은 이 경로에서 실제 `source`와 실제 `license`를 갖게 되며,
+이것이 §19.3이 요구한 바다: base model의 라이선스 말고는 아무것도 바꾸지 않은 실행은 다른
+실행이다.
+
+**트레이너의 줄은 `--init-backbone <path>`를 얻고, 그 외에는 아무것도 얻지 않는다.** `frozen`은
+Learning IR의 필드이므로 lowering된 모듈이 그것을 `requires_grad_(False)`로 싣고 `train_act.py`는
+여전히 gradient를 요구하는 파라미터 위에 `AdamW`를 만든다 — `learning-lowering.md` 5.3절 참고.
+`--frozen` 플래그는 명령줄 위의 IR 결정 사본이 될 것이고, 그러면 계획 골든이 `--dry-run`이 열지
+않는 번들에 의존하게 된다.
+
+### 거부는 번호가 아니라 이름으로 한다
+
+패킷은 `TRAIN-0xx`라고 쓴다. `es_data::training`도 `es train`도 숫자 코드를 가진 적이 없다 —
+거기의 모든 거부는 필드와 파일을 이름으로 대며, §17.2의 요구는 거부가 식별 가능해야 한다는
+것이지 열거되어야 한다는 것이 아니다. 메시지 다섯 개를 위해 고안된 번호 체계는 사용자가
+하나뿐인 체계다. 그 다섯은: 자기 가중치를 서술하지 않는 lock 파일(두 다이제스트와 lock의 경로를
+이름으로 댄다), 고정된 것이 아닌 아티팩트(두 다이제스트와 옮길 상수를 이름으로 댄다), 빈
+라이선스(파일과 §19.3을 이름으로 댄다), `base_model` 없는 `pretrained = true`(플래그와 fetch
+명령을 이름으로 댄다), `pretrained = true` 없는 `base_model`(플래그와 주장될 뻔한 것을 이름으로
+댄다). 다섯 모두 `cli::train_refuses_a_mismatched_base_model`이다.
+
+### 여기서도 픽스처 레시피는 그대로다
+
+`tests/fixtures/visible-learning/training.toml`은 `base_model`을 이름 붙이지 않는다. 그 번들이
+처음부터 학습하는 쪽이고, 그 옆의 계획 골든은 계속 렌더링되어야 하기 때문이다. 실험의 사전학습
+쪽은 `tests/fixtures/visible-learning/learning-pretrained.toml`이고, 그것을 가리키는 레시피는
+U-측정의 것이지 커밋된 픽스처가 아니다.
