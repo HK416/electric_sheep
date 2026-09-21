@@ -22,11 +22,16 @@ use crate::view::{
 };
 
 /// Globals before the per-view records in the parameter buffer. Slots 0..20 are M4's and
-/// never move; 20..31 are packet M7/R2's shading block and 31..37 packet M7/R3's `Pt` block,
-/// each appended at the end (`common.slang` mirrors every number).
-const PARAM_VIEW_BASE: usize = 37;
+/// never move; 20..31 are packet M7/R2's shading block, 31..37 packet M7/R3's `Pt` block and
+/// 37..39 packet M7/R4's temporal block, each appended at the end (`common.slang` mirrors
+/// every number).
+const PARAM_VIEW_BASE: usize = 39;
 /// Floats per direct-lighting reservoir (mirrors `restir.slang`).
 const RES_STRIDE: u64 = 8;
+/// Floats per pixel of the temporal history (mirrors `common.slang`'s `ES_HIST_STRIDE` and
+/// `cpu::History`): the radiance sum, the two luminance moments, the history length, the
+/// previous depth, primitive id and normal, and the variance.
+const HIST_STRIDE: u64 = 12;
 const WORKGROUP: u32 = 8;
 const PROFILE: &str = "glsl_450";
 
@@ -120,7 +125,7 @@ impl Atlas<'_> {
                             ((w >> 16) & 0xff) as u8,
                         ]);
                     }
-                    Channel::SegmentationId => u32_out.push(word(src)),
+                    Channel::SegmentationId | Channel::History => u32_out.push(word(src)),
                     _ => {
                         for c in 0..per_px {
                             f32_out.push(f32::from_bits(word(src + c)));
@@ -136,7 +141,7 @@ impl Atlas<'_> {
         let shape = [th, tw, comps];
         let data = match channel {
             Channel::Rgb8 => TileData::U8(u8_out),
-            Channel::SegmentationId => TileData::U32(u32_out),
+            Channel::SegmentationId | Channel::History => TileData::U32(u32_out),
             _ => TileData::F32(f32_out),
         };
         Ok(Tile { shape, data })
@@ -147,6 +152,9 @@ struct Pipelines<'gpu> {
     primary: ComputePipeline<'gpu>,
     restir: Option<[ComputePipeline<'gpu>; 3]>,
     svgf: Option<ComputePipeline<'gpu>>,
+    /// The variance estimate of packet M7/R4, between the tracer and the filter. Present
+    /// exactly when `cfg.temporal` is.
+    accumulate: Option<ComputePipeline<'gpu>>,
     /// Linear radiance -> `Rgb8` on the `Pt` path (packet M7/R3). Its own dispatch, recorded
     /// last, so it reads what `ReSTIR` and `SVGF` left rather than what the tracer wrote.
     tonemap: Option<ComputePipeline<'gpu>>,
@@ -188,6 +196,16 @@ pub struct Renderer<'gpu> {
     /// Previous-frame reservoirs for `ReSTIR` temporal reuse. Empty until the first render
     /// finishes, which is why the temporal pass is a no-op on frame 1 (see the design doc).
     prev_reservoirs: Option<Buffer<'gpu>>,
+    /// The temporal history of packet M7/R4, `HIST_STRIDE` floats per atlas pixel, kept
+    /// across `render` calls. A 4-byte placeholder while `cfg.temporal` is `None`.
+    history: Buffer<'gpu>,
+    /// Atlas pixels `history` was allocated and zeroed for.
+    history_px: u64,
+    /// The views the history was built with, bitwise. A view that moved invalidates its whole
+    /// tile — there is no reprojection (`docs/design/renderer.md` section 11).
+    prev_views: Vec<[u32; VIEW_STRIDE]>,
+    /// Frames rendered since the history was allocated: the sample base `frame * spp + s`.
+    frame: u32,
 }
 
 impl std::fmt::Debug for Renderer<'_> {
@@ -221,10 +239,10 @@ impl<'gpu> Renderer<'gpu> {
             ComputePipeline::new(gpu, &module, &bindings(n_bindings))
         };
 
-        let (primary, restir, svgf, tonemap) = match cfg.path {
-            RenderPath::Rs => (compile("raster.slang", "main", 7)?, None, None, None),
+        let (primary, restir, svgf, tonemap, accumulate) = match cfg.path {
+            RenderPath::Rs => (compile("raster.slang", "main", 7)?, None, None, None, None),
             RenderPath::Pt { restir, svgf, .. } => {
-                let pt = compile("pt.slang", "main", 8)?;
+                let pt = compile("pt.slang", "main", 10)?;
                 let r = if restir {
                     Some([
                         compile("restir.slang", "initial", 9)?,
@@ -235,16 +253,21 @@ impl<'gpu> Renderer<'gpu> {
                     None
                 };
                 let s = if svgf {
-                    Some(compile("svgf.slang", "main", 7)?)
+                    Some(compile("svgf.slang", "main", 9)?)
                 } else {
                     None
                 };
                 let t = if cfg.channels.contains(&Channel::Rgb8) {
-                    Some(compile("pt.slang", "tonemap", 8)?)
+                    Some(compile("pt.slang", "tonemap", 10)?)
                 } else {
                     None
                 };
-                (pt, r, s, t)
+                let a = if cfg.max_history().is_some() {
+                    Some(compile("accumulate.slang", "main", 7)?)
+                } else {
+                    None
+                };
+                (pt, r, s, t, a)
             }
         };
 
@@ -256,6 +279,7 @@ impl<'gpu> Renderer<'gpu> {
                 primary,
                 restir,
                 svgf,
+                accumulate,
                 tonemap,
             },
             tris: Buffer::new(gpu, 4, Usage::Storage)?,
@@ -268,6 +292,10 @@ impl<'gpu> Renderer<'gpu> {
             bvh_nodes: 0,
             bvh_prim_base: 0,
             prev_reservoirs: None,
+            history: Buffer::new(gpu, 4, Usage::Storage)?,
+            history_px: 0,
+            prev_views: Vec::new(),
+            frame: 0,
         })
     }
 
@@ -306,7 +334,7 @@ impl<'gpu> Renderer<'gpu> {
         Ok(())
     }
 
-    fn params(&self, cameras: &[CameraView]) -> Vec<f32> {
+    fn params(&self, cameras: &[CameraView], history_valid: &[bool]) -> Vec<f32> {
         let cfg = &self.cfg;
         let mut p = vec![0.0f32; PARAM_VIEW_BASE + cameras.len() * VIEW_STRIDE];
         p[0] = f32::from_bits(self.n_tri);
@@ -358,11 +386,60 @@ impl<'gpu> Renderer<'gpu> {
             Tonemap::Reinhard => 0,
             Tonemap::Aces => 1,
         });
+        // The temporal block (packet M7/R4). Zero is no accumulation at all, which is the
+        // pre-R4 kernel byte for byte.
+        p[37] = f32::from_bits(cfg.max_history().unwrap_or(0));
+        p[38] = f32::from_bits(self.frame);
         for (i, cam) in cameras.iter().enumerate() {
             let base = PARAM_VIEW_BASE + i * VIEW_STRIDE;
             p[base..base + VIEW_STRIDE].copy_from_slice(&ViewParams::new(cam).to_floats());
+            // Pad slot 13 of the view record carries the still-camera test: the host owns it
+            // because only the host has both frames' `ViewParams`.
+            p[base + 13] =
+                f32::from_bits(u32::from(history_valid.get(i).copied().unwrap_or(false)));
         }
         p
+    }
+
+    /// Per view: is this camera bitwise the one the history at its tile was built with? Also
+    /// (re)allocates and zeroes the history buffer when the atlas size changed, and advances
+    /// the slot's frame counter (packet M7/R4).
+    fn prepare_history(
+        &mut self,
+        cameras: &[CameraView],
+        px: u64,
+    ) -> Result<Vec<bool>, RenderError> {
+        let Some(_) = self.cfg.max_history() else {
+            self.frame = 0;
+            return Ok(vec![false; cameras.len()]);
+        };
+        let bytes = px * HIST_STRIDE * 4;
+        if self.history_px != px {
+            // Device-local memory is uninitialised; an `n` of garbage would reuse a sample
+            // that never existed (the same reason the `ReSTIR` buffer is zeroed).
+            self.history = Buffer::new(self.gpu, bytes.max(4), Usage::Storage)?;
+            self.history.upload(&vec![0u8; bytes as usize])?;
+            self.history_px = px;
+            self.prev_views.clear();
+            self.frame = 0;
+        }
+        let now: Vec<[u32; VIEW_STRIDE]> = cameras
+            .iter()
+            .map(|cam| {
+                let mut bits = [0u32; VIEW_STRIDE];
+                for (slot, f) in bits.iter_mut().zip(ViewParams::new(cam).to_floats()) {
+                    *slot = f.to_bits();
+                }
+                bits
+            })
+            .collect();
+        let valid = now
+            .iter()
+            .enumerate()
+            .map(|(i, bits)| self.prev_views.get(i) == Some(bits))
+            .collect();
+        self.prev_views = now;
+        Ok(valid)
     }
 
     fn validate(&self, cameras: &[CameraView]) -> Result<(), RenderError> {
@@ -404,7 +481,8 @@ impl<'gpu> Renderer<'gpu> {
             1,
         ];
 
-        let params_f = self.params(cameras);
+        let history_valid = self.prepare_history(cameras, px)?;
+        let params_f = self.params(cameras, &history_valid);
         let params_bytes: Vec<u8> = params_f.iter().flat_map(|f| f.to_le_bytes()).collect();
         grow(self.gpu, &mut self.params_buf, params_bytes.len() as u64)?;
         self.params_buf.upload(&params_bytes)?;
@@ -431,22 +509,45 @@ impl<'gpu> Renderer<'gpu> {
             RenderPath::Rs => None,
             RenderPath::Pt { .. } => Some(self.new_buffer(px)?),
         };
+        // The `History` channel of packet M7/R4: the `n` this frame ended at, one word per
+        // pixel. Written by the tracer whether or not a history is kept — without one it is
+        // 1, which is the truth.
+        let pt_history = match self.cfg.path {
+            RenderPath::Rs => None,
+            RenderPath::Pt { .. } => Some(self.new_buffer(px)?),
+        };
+        let history = &self.history;
 
         self.pipelines.primary.reset_descriptors()?;
         let mut rec = CommandRecorder::new(self.gpu)?;
-        match &pt_rgb8 {
-            Some(rgb8) => rec.dispatch(
+        match (&pt_rgb8, &pt_history) {
+            (Some(rgb8), Some(hist_out)) => rec.dispatch(
                 &self.pipelines.primary,
                 &[
-                    params, &self.tris, &color, &depth, &seg, &normal, hit_tri, rgb8,
+                    params, &self.tris, &color, &depth, &seg, &normal, hit_tri, rgb8, history,
+                    hist_out,
                 ],
                 groups,
             )?,
-            None => rec.dispatch(
+            _ => rec.dispatch(
                 &self.pipelines.primary,
                 &[params, &self.tris, &color, &depth, &seg, &normal, hit_tri],
                 groups,
             )?,
+        }
+
+        // The variance estimate, after every pixel's accumulated colour is written (its
+        // short-history fallback reads a 7x7 neighbourhood) and before the filter reads it.
+        let mut variance = None;
+        if let Some(accumulate) = &self.pipelines.accumulate {
+            accumulate.reset_descriptors()?;
+            let var = self.new_buffer(px)?;
+            rec.dispatch(
+                accumulate,
+                &[params, &self.tris, history, &color, &depth, &normal, &var],
+                groups,
+            )?;
+            variance = Some(var);
         }
 
         // `ReSTIR` DI: initial -> temporal -> spatial, one buffer written per pass. `spatial`
@@ -502,11 +603,17 @@ impl<'gpu> Renderer<'gpu> {
             keep_alive.push(res_b);
         }
 
-        // SVGF a-trous, ping-ponging between `color` and a scratch buffer.
+        // SVGF a-trous, ping-ponging between `color` and a scratch buffer — and, since packet
+        // M7/R4, between two variance buffers alongside it with the squared weights.
         let mut scratch = None;
         if let Some(svgf) = &self.pipelines.svgf {
             svgf.reset_descriptors()?;
             let mut other = self.new_buffer(px * 3)?;
+            let mut var_a = match variance.take() {
+                Some(v) => v,
+                None => self.new_buffer(px)?,
+            };
+            let mut var_b = self.new_buffer(px)?;
             let mut iters = Vec::new();
             for it in 0..self.cfg.svgf_iterations {
                 let mut b = self.new_buffer(1)?;
@@ -520,27 +627,38 @@ impl<'gpu> Renderer<'gpu> {
                 } else {
                     (&color, &other)
                 };
+                let (vsrc, vdst) = if swapped {
+                    (&var_b, &var_a)
+                } else {
+                    (&var_a, &var_b)
+                };
                 rec.dispatch(
                     svgf,
-                    &[params, &self.tris, src, dst, &depth, &normal, iter_buf],
+                    &[
+                        params, &self.tris, src, dst, &depth, &normal, iter_buf, vsrc, vdst,
+                    ],
                     groups,
                 )?;
                 swapped = !swapped;
             }
             if swapped {
                 std::mem::swap(&mut color, &mut other);
+                std::mem::swap(&mut var_a, &mut var_b);
             }
-            scratch = Some((other, iters));
+            scratch = Some((other, iters, var_a, var_b));
         }
 
         // Recorded last, after the swap above, so it reads whichever buffer holds the final
         // radiance (spec 3.4: the recorded order *is* the execution order).
-        if let (Some(tm), Some(rgb8)) = (&self.pipelines.tonemap, &pt_rgb8) {
+        if let (Some(tm), Some(rgb8), Some(hist_out)) =
+            (&self.pipelines.tonemap, &pt_rgb8, &pt_history)
+        {
             tm.reset_descriptors()?;
             rec.dispatch(
                 tm,
                 &[
-                    params, &self.tris, &color, &depth, &seg, &normal, hit_tri, rgb8,
+                    params, &self.tris, &color, &depth, &seg, &normal, hit_tri, rgb8, history,
+                    hist_out,
                 ],
                 groups,
             )?;
@@ -548,8 +666,10 @@ impl<'gpu> Renderer<'gpu> {
 
         rec.submit_and_wait()?;
         drop(scratch);
+        drop(variance);
         drop(keep_alive);
         self.prev_reservoirs = reservoirs;
+        self.frame = self.frame.wrapping_add(1);
 
         let mut channels: BTreeMap<Channel, Buffer<'gpu>> = BTreeMap::new();
         let wanted: BTreeSet<Channel> = self.cfg.channels.clone();
@@ -564,6 +684,9 @@ impl<'gpu> Renderer<'gpu> {
                 put(Channel::PtRadiance, color);
                 if let Some(rgb8) = pt_rgb8 {
                     put(Channel::Rgb8, rgb8);
+                }
+                if let Some(hist_out) = pt_history {
+                    put(Channel::History, hist_out);
                 }
             }
         }
