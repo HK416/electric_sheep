@@ -80,6 +80,11 @@ jobs:
           # goldens, so without it `gen_goldens` SKIPs and their provenance is unchecked.
           python -m pip install torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cpu
           python -m pip install diffusers==0.40.0 newton==1.6.0 warp-lang==1.17.0
+          # es-policy's ir_training oracles (`lr_schedule_matches_the_golden`,
+          # `augmentation_matches_the_golden`) write their fixture dataset through pyarrow and
+          # probe for `torch, torchvision, pyarrow` before running; without it they SKIP and
+          # the check below fails the job. 25.0.1 is what the oracle venvs carry.
+          python -m pip install pyarrow==25.0.1
           # es-ros2 golden provenance (docs/design/ros2-boundary.md section 8,
           # docs/packets/M3/P-M3-W1-R4.md): without these, `gen_goldens` and the rosbags/OpenCV
           # half of `gen_camera_goldens` SKIP and 32 checked-in goldens go unchecked.
