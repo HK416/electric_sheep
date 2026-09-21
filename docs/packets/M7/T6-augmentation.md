@@ -75,6 +75,7 @@ The globs `cargo xtask check-scope` reads, then the same scope in prose:
 python/es/train_act.py
 python/es/augment.py
 crates/es-compile/src/plan.rs
+crates/es-compile/src/exec.rs
 crates/es-compile/src/gpu/**
 crates/es-compile/src/lib.rs
 crates/es-compile/tests/**
@@ -101,6 +102,11 @@ mirror/refusal), `es-eval/src/bake.rs` (`--for-training`), `es-data/src/training
 (`augmentation_seed`, the two slots), `es/src/cmd/train.rs` (reads the bundle's Observation IR,
 writes `augmentation.json`, passes the flag), `es/src/cmd/dataset.rs` (the bake flag), tests, the
 fixture, the golden, the two design notes, this packet.
+
+`crates/es-compile/src/exec.rs` was added to the globs at implementation time (2026-09-21):
+`Op::Pad` has to be executed where `CpuPlan::run`'s match is, and the alternative -- a
+`kernels.rs` entry -- would have appended to `KERNEL_IDS`, which moves `compiler_hash` for
+*every* plan in the repository and with it committed hashes this packet may not move.
 
 ## oracle
 

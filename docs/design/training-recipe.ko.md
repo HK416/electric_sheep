@@ -851,3 +851,237 @@ Plane이다. `final_loss 0.014186`인데 한 번도 성공하지 못하는 정�
 `~/artifacts/plan-v/m7-t2/`에 보관: `loop.jsonl`, `training.lock`, `report-policy.json`,
 `report-expert-gate.json`, `cycle.log`, `cycle.toml`, `training.toml`, `run.sh`, 그리고
 `run/` 트리 전체(27 GB: 프레임, 트래젝터리, 체크포인트 번들 셋).
+
+## 13. 증강 (패킷 M7/T6)
+
+spec 7.3는 M1 이래로 `Augment` 노드 가족을 가지고 있었고, 이 패킷 전까지 **모든 경로가 그것을
+무시했다**: bake는 Release 플랜을 돌리는데 거기서 `training_only` 노드는 identity이고,
+`train_act.py`는 Observation IR을 본 적이 없으며, `augmentation.json`은 지금까지 돌아간 모든
+실행에 대해 `{"kind": "none"}`이라고 말했다. 이 절은 선언된 서브그래프가 실제로 일어나게
+만드는 경계다 — 학습에서만, 하나의 시드로부터, 아이덴티티로 기록되어 — 그러는 동안 평가
+경로는 어제 내던 바이트를 그대로 낸다.
+
+### 13.1 경계, 그림 하나로
+
+```
+ImageInput -> Dequantize -> Normalize -> Pad(4) -|- Crop{Random 96x96} -> Augment{ColorJitter} -> rgb_overhead
+                                                 |
+                                               체인 경계
+```
+
+경계 왼쪽은 늘 그랬던 Observation IR이고 `CpuPlan`이 돌린다 — 구현은 하나, 추론이 돌리는
+바로 그것이다(패킷 M5/V2b). 오른쪽은 *샘플별*이므로 한 번 구워둘 수 없다:
+
+* `es dataset bake --for-training`은 그 포트를 경계에서 쓴다 — 데모에서는
+  `[frames, 3, 96, 96]`이 아니라 `[frames, 3, 104, 104]` — 그리고 체인을 `manifest.json`에
+  기록한다;
+* `es train`은 같은 체인과 그 시드를 spec 19.3의 `training/augmentation.json`에 쓰고,
+  `--augmentation`으로 트레이너에 넘긴다;
+* `python/es/augment.py`가 샘플마다, 옵티마이저 스텝마다 그것을 적용한다;
+* **평가는 그중 아무것도 적용하지 않는다**(INV-15). Release 플랜은 pad와 crop을 `Pad(4)`
+  다음 *중앙* 크롭으로 lowering하고, 대칭 패딩에서 그 합성은 증강되지 않은 이미지와 비트
+  단위로 같다 — `crates/es/tests/cli.rs::dataset_bake_for_training_writes_the_chain`이 두
+  bake를 파일 통째로 비교한다.
+
+`docs/design/observation-lowering.ko.md` 3.1절이 컴파일러 쪽 절반이다: 어떤 노드가 체인 위에
+오는지, Release 플랜이 그것들로 무엇을 하는지, 그리고 왜 GPU 경로가 `Pad`를 이름으로
+거부하는지.
+
+### 13.2 문서와 레시피
+
+레시피에 선택적 필드 하나가 생긴다:
+
+```toml
+[run]
+seed              = 0
+augmentation_seed = 7    # 선택; 없으면 `seed`
+```
+
+분리되어 있는 이유는 분리 가능하기 때문이다 — 나머지가 동일한 실행에서 증강만 다시 뽑는 것은
+다른 실행이고, spec 19.3은 그것에 고유한 `seed.json` 슬롯을 준다. 두 슬롯은 정책의
+Observation IR이 체인을 선언할 때에만 실제 값이 된다:
+
+| 슬롯 | 체인 없음 | 체인 있음 |
+|---|---|---|
+| `seed.json.augmentation` | `{"unset": true}` | 그 숫자 |
+| `augmentation.json` | `{"kind": "none"}` | `{"kind": "observation-ir", "observation_hash", "seed", "chains"}` |
+| bake 스텝 | 이전과 같음 | `... --for-training <root>` |
+| 트레이너 스텝 | 이전과 같음 | `... --augmentation <out>/training/augmentation.json` |
+
+그래서 이 패킷 이전에 쓰인 레시피는 같은 아홉 개의 사전 슬롯, 같은 `identity_hash`, 같은
+렌더된 플랜을 가진다 — `tests/golden/train/plan-ir.txt`는 움직이지 않았고,
+`train_identity_moves_with_augmentation`이 증강되지 않은 절반을 명시적으로 주장한다.
+
+의도적인 구멍 하나: IR 경로에서 `--dry-run`은 번들을 열지 않으므로(그것이 번들도 데이터셋도
+없는 기계에서 플랜을 출력할 수 있게 하는 것이다, 패킷 M7/T1 오라클 1) 증강된 레시피의 dry
+run은 두 플래그가 *없는* 플랜을 출력한다. 실제 실행은 번들을 먼저 열고, `config.json`은 실제로
+돌아간 줄을 기록한다.
+
+### 13.3 RNG: 주소로 지정되며, 진행되지 않는다
+
+모든 추첨은 그것이 쓰이는 자리의 순수 함수다(spec 3.4는 전역 RNG를 금지한다). 믹서는
+Murmur3의 `fmix32` — `crates/es-render/src/rng.rs`가 이미 패스 트레이서에 쓰는 정수 연산 열
+줄 — 이고 키는 좌표 다섯 개다:
+
+| 좌표 | 타입 | 어디서 오는가 | 무엇을 분리하는가 |
+|---|---|---|---|
+| `augmentation_seed` | `u64`, `u32` 둘로 접어 넣음 | `[run] augmentation_seed`, 없으면 `[run] seed` | 한 레시피의 두 실행 |
+| `sample_index` | `u32` | 트레이너 자신의 전역 샘플 인덱스(`order[cursor]`, 배치 안의 위치가 아니다) | 한 배치 안의 두 샘플 |
+| `step` | `u32` | 옵티마이저 스텝 | 같은 샘플을 두 번 볼 때 |
+| `node_index` | `u32` | Observation IR **노드 id** | 두 노드, 그리고 두 포트의 체인 |
+| `draw` | `u32` | 한 노드 안에서 `0, 1, …` | 크롭의 x와 y |
+
+`key(seed, sample, step, node)`는 `mix32` 다섯 라운드이고, `uniform(key, i)`는 한 라운드 더로
+상위 24비트를 취해 값이 `f32`에서 정확하고 결코 1.0에 닿지 않게 한다. **증강 어디에서도
+`torch.Generator`를 쓰지 않으며**, 그것이 핵심이다: 그 스트림은 torch 버전의 구현 세부이므로
+다른 torch에서 재현한 실행은 조용히 다른 증강을 보게 되고 `augmentation.json`은 일어나지 않은
+일을 기술하게 된다.
+
+구현은 둘이고 `f32`에서 비트 단위로 일치한다:
+`crates/es-policy/tests/ir_training.rs`가 인터프리터 없이 체인 전체를 Rust로 다시 유도해
+`tests/golden/train/augment_seed0.json`과 비교하며, 그 골든은 `python/es/augment.py` 자신으로
+한 번 생성되었다.
+
+**여기서 비트 단위가 합리적인 요구인 이유.** 모든 스칼라는 `f64`로 계산되어 텐서에 닿기
+*전에* `f32`로 반올림되므로, 원소별 연산은 두 피연산자가 모두 정확히 표현 가능한 단일 IEEE
+`f32` 연산이다 — 중간값을 넓혀 한 번 반올림하는 커널과 그러지 않는 커널이 같은 비트를 낸다.
+잘못될 수 있었던 두 자리는 가정이 아니라 측정되었다(10절이 `cos`에 적용한 그 규율):
+
+* **Box-Muller의 `ln`과 `cos`** — 한쪽은 torch의 벡터화된 `f64` 커널, 다른 쪽은 Rust의
+  `std`. `f64`에서의 마지막 비트 불일치는 상대적으로 ~2⁻⁵³로 `f32` ulp보다 훨씬 아래이므로
+  캐스트가 그것을 흡수한다 — 그리고 골든은 960개 값 전부에서 흡수된다고 말한다.
+* **contrast의 평균** — 이 파일의 유일한 리덕션: torch의 `x.double().mean()` 대 Rust의 순차
+  `f64` 합. 같은 논증, 같은 측정. 원리적으로 *훨씬* 큰 이미지에서 어긋날 수 있는 유일한
+  자리이고 — 천장은 두 합산 순서가 상대적으로 ~2⁻⁵³ 다르다는 것, 그것이 드러나려면 f32
+  반올림이 정확히 경계에 떨어져야 한다 — 만약 그런 일이 생기면 고치는 방법은 평균을 양쪽에서
+  순서가 정해진 `f32` 합으로 정의하는 것이다.
+
+### 13.4 네 종류와 각각의 상태
+
+| 종류 | 상태 | 트레이너가 하는 일 |
+|---|---|---|
+| `RandomCrop { width, height }` | **구현됨** | `[0, W-w] × [0, H-h]`에서 균일 정수 오프셋, 추첨 둘; Release 플랜의 중앙 크롭은 오프셋을 고정한 같은 사각형이다 |
+| `ColorJitter { brightness, contrast }` | **구현됨** | `x * (1 + u·b)`, 그다음 `(x - mean) * (1 + u·c) + mean`, `u ∈ [-1, 1]`, 추첨 둘 |
+| `ColorJitter { saturation, hue }` | **이름으로 거부** | 둘 다 이 파일이 가지고 있지 않은 색 모델이 필요하다(`hue`는 HSV 회전). 0이 아닌 값은 노드 이름과 함께 실행을 멈춘다; 조용히 무시되는 파라미터가 더 나쁘다 |
+| `GaussianNoise { sigma }` | **구현됨** | 가산, **원소마다** 균일 추첨 둘로 Box-Muller, `f64`, `f32`로 한 번 캐스트 |
+| `RandomErasing { probability }` | **이름으로 거부** | 이 패킷이 구현하지 않는다 |
+
+`GaussianNoise`가 비싼 쪽이다: 원소당 추첨 둘이면 샘플마다 스텝마다 `2 × C × H × W` 인덱스
+텐서가 필요하다. 데모의 체인은 그것을 쓰지 않으므로 아래의 측정된 실행은 비용을 전혀 치르지
+않는다; 쓰는 문서라면 증강이 스텝의 눈에 띄는 비율이 될 것을 예상해야 한다.
+
+### 13.5 U-측정을 위한 문서
+
+`tests/fixtures/visible-learning/observation-augmented.toml`은 커밋된 `observation.toml`에
+이미지 경로 위 노드 셋을 더한 것이고,
+`cargo test -p es --test cli -- --ignored generate_augmented_observation_fixture`로 재생성된다:
+
+| 문서 | `observation_hash` |
+|---|---|
+| `observation.toml`(커밋됨) | `899c16a90033eeb406f328060bbd54ef0632f943a2059db7b3f7c369ee218d81` |
+| `observation-augmented.toml` | `cc437a2418c36ac003c68258cc017a3783d9b2d876029463e87a9d38d194fb3e` |
+
+출력 포트는 커밋된 문서의 것과 정확히 같은 `PortType`을 지닌다 — `3×96×96`,
+`Normalized{0,1}`, 같은 `ImageSpec` — 그래서 `learning.toml`은 손대지 않았고
+`learning_hash`는 움직이지 않는다. **그러나 `evaluation.toml`은 `observation`을 명명하므로**,
+이 문서로 학습된 정책을 겨냥한 Evaluation IR은 *다른* `evaluation_hash`다(spec 13.3):
+U-측정은 증강된 해시를 자신의 평가 문서에 써넣고 새 아이덴티티를 의도적으로 받아들여야 한다
+(`es loop cycle`은 `--allow-new-evaluation` 없이는 움직인 `evaluation_hash`를 거부한다,
+12.3절). 평가가 보는 *픽셀*에 대해서는 아무것도 바뀌지 않는다 — 그것이 13.1이 보장하는
+바다 — 그러나 그것을 명명하는 문서는 바뀐다.
+
+### 13.6 패킷과 달라진 점
+
+1. **`Crop { CropMode::Random }`이 체인 위에 있고, 데모 문서는 `Augment { RandomCrop }`
+   대신 그것을 쓴다.** 강제된 것이며, 이 발견은 리뷰의 시간을 쓸 가치가 있다: `es-ir`의
+   `image_out`은 `Augment` 포트에서 들어오는 `ImageSpec`을 유지하므로
+   `Pad(4) -> Augment{RandomCrop 96x96}`은 전파가 `104×104`라고 말하는 자리에서 `96×96`을
+   광고하고, `es_ir::cross`의 `TYPE-020`이 번들이 만들어지기 전에 거부한다. `es-ir`은 이
+   패킷에게 금지된 땅이다. `CropMode::Random`은 — IR 자신의 말로 "샘플별 오프셋이며 명목
+   기하는 중앙의 것" — `ImageSpec::cropped`를 통해 전파되고 검증되므로 픽스처가 그것을 쓰고,
+   `Augment{RandomCrop}` lowering은 문서가 그것을 담을 수 있게 되는 날을 위해 그 옆에
+   구현되고 테스트된다. **M7 리뷰를 위한 열린 질문:** `image_out`이
+   `Augment { RandomCrop }`에도 `Crop { Random }`이 받는 크롭된 기하를 주어야 하는가?
+2. **`crates/es-compile/src/exec.rs`가 패킷의 `## context` 글롭에 추가되었다.** `Op::Pad`는
+   `CpuPlan::run`의 match가 있는 곳에서 실행되어야 한다; 대안인 `kernels.rs` 항목은
+   `KERNEL_IDS`에 덧붙이는 일이고 저장소의 모든 플랜의 `compiler_hash`를 움직인다 — 이 패킷이
+   스스로 금지한 골든 이동이다. 그 결과로 `Pad`에는 커널 id가 없고 GPU 경로는 그것을 이름으로
+   거부한다(observation-lowering.ko.md 3.1).
+3. **오라클 3은 테스트 하나가 아니라 둘이다.** `es-eval`이 bake를 소유하고 `es`가 manifest를
+   소유한다 — `es-eval`은 레이어 10이고 파일을 쓰지 않는다 — 그래서
+   `es-eval::bake_for_training_writes_the_boundary`가 경계 모양과 바이트 동일한 평가 프레임을
+   주장하고, `es::dataset_bake_for_training_writes_the_chain`이 `manifest.json`을 주장하며 두
+   bake를 safetensors 파일 통째로 비교한다.
+4. **`augmentation.json`의 작성자는 `es-data`에, 독자는 `augment.py`에 있다.**
+   `crates/es-policy/tests/ir_training.rs`는 그 파일의 자기 사본을 쓰므로(레이어 8은 레이어
+   10에 의존할 수 없다) 실제 파일의 *모양*은 대신 `crates/es/tests/cli.rs`에서 고정된다. 양
+   끝이 모두 주장되지만, 한 자리에서 주장되지는 않는다.
+
+### 13.7 오라클
+
+| # | 커맨드 | 무엇을 판정하는가 |
+|---|---|---|
+| 1 | `cargo test -p es-policy --test ir_training augmentation_matches_the_golden` | Rust 재구현이 `tests/golden/train/augment_seed0.json`과 `f32`에서 비트 단위로 같다; `ES_PYTHON`이 있으면 `augment.py`도 같다 |
+| 2 | `cargo test -p es-compile a_training_only_random_crop_is_a_centre_crop_in_release` | 패딩 후 중앙 크롭한 Release 플랜이 증강되지 않은 픽셀을 재현하고, 크롭이 `Crop`의 intrinsics 변환을 지닌다 |
+| 3 | `cargo test -p es-eval bake_for_training_writes_the_boundary` / `cargo test -p es --test cli dataset_bake_for_training_writes_the_chain` | 경계에서 `104×104`와 manifest 안의 체인; 플래그가 없으면 `96×96`과 증강되지 않은 문서의 바이트 |
+| 4 | `cargo test -p es --test cli train_identity_moves_with_augmentation` | 아이덴티티 슬롯 둘 다 실제 값이고 둘 다 움직이며, 증강되지 않은 레시피의 것은 원래 자리에 있다 |
+| 5 | `cargo test -p es-policy --test ir_training -- --ignored augmented_training_runs` | 증강된 문서에서 40스텝; 유한한 loss; 한 시드에서의 두 실행은 바이트 동일한 곡선, 두 시드는 아니다 |
+| 6 | `cargo xtask ci`, `cargo xtask check-scope docs/packets/M7/T6-augmentation.md` | 골든 변경 0건, 범위 위반 없음 |
+
+골든은 `generate_augment_golden`이 생성하며, 그것은 `#[ignore]`가 붙어 있고 **동시에**
+`ES_GENERATE_GOLDENS=1`이 설정되지 않으면 실행을 거부한다 — `cargo test -- --include-ignored`는
+워크스페이스의 모든 ignored 테스트를 돌리고, M7 리뷰가 바로 그것이 아무도 건드릴 생각이 없던
+골든을 다시 쓰는 것을 발견했다.
+
+### 13.8 측정 — 오라클 서버, RTX 4090, 2026-09-21
+
+증강된 문서의 20,000스텝 실행을 10절의 행-D 설정으로, `es train`을 통해: 배치 64, lr 4e-4,
+`warmup_cosine` warmup 250 `lr_min` 1e-6, 시드 0, `--resident-gpu`, `device = "cuda"`,
+torch 2.11.0+cu129, V15의 200개 시연 위에서(`~/artifacts/plan-v/v15/ds-train`, 36,960 샘플).
+실행 전 GPU는 유휴 상태였다(56 MiB, 0 %). 커맨드는 하나이고, bake는 그 스텝 중 하나이며,
+그것이 `--for-training` bake다.
+
+| 스텝 | 벽시계 | 무엇이 돌았나 |
+|---|---|---|
+| `dataset bake --for-training` | **0:10** | 200 에피소드, 36,960 프레임, `rgb_overhead [3, 104, 104]`, 4.5 GB |
+| `policy lower` | < 1 s | `lowering_hash 3d06811c…`, T3와 T4의 것 — Learning IR은 움직이지 않았다 |
+| `train_act.py` | **4:21** (261 s) | 20,000 스텝, 본 샘플 1,280,000, resident 복사본 4,577.6 MiB |
+| `policy pack` | ~1 s | `checkpoints/20000.esb` |
+| **합계** | **4:33** | |
+
+`identity_hash 2d8f6837…`, `training_hash 61e6c93a…`, 체크포인트
+`policy_hash df985459…`(spec 19.3의 `H(training_hash, checkpoint)`),
+`observation_hash cc437a24…`, `lr_curve_hash c01d5185…` — 행 D와 같은 스케줄이며, 그것이 두
+행을 비교 가능하게 만든다. `initial_loss 0.049270`, **`final_loss 0.006664`**, 비유한 스텝
+없음. **여기서 평가하지 않았다**: 그것은 U-측정의 몫이고, 새 `evaluation_hash`가 필요하다
+(13.5).
+
+**증강이 없는 같은 실행인 행 D와 비교하면:**
+
+| | 행 D (10절) | 이 실행 | |
+|---|---|---|---|
+| 트레이너 벽시계 | 2:51 (171 s) | **4:21 (261 s)** | +53 % |
+| s / 1,000 스텝 | 8.6 | **13.0** | |
+| samples/s | 7,485 | **4,904** | |
+| `final_loss` | 0.004610 | **0.006664** | +45 % |
+| resident baked set | 3.9 GiB | **4.5 GiB** | `104²/96²` = 1.17배 |
+
+숫자 둘, 그리고 둘 다 실망이 아니라 예상된 것이다.
+
+**그 90초.** 스텝당 4.5 ms, 배치 64가 노드 둘짜리 체인을 통과하는 비용 — 크롭을 위한 Python
+슬라이스 대입 64번과 지터를 위한 64 × (곱하기 하나, `f64` 평균 하나, 어파인 하나). 이것은
+산술의 비용이 아니라 샘플별 Python 루프의 비용이다; 언젠가 문제가 된다면 명백한 지렛대는
+배치 전체의 오프셋을 루프가 아니라 인덱스 gather 하나로 뽑는 것이다. 아직은 문제가 아니다:
+4:21은 §28.9의 예산 안쪽이고 사이클의 평가 스텝은 20분이다.
+
+**loss가 더 높은 것이 핵심이다.** 증강은 학습 분포를 넓히므로 같은 스텝에서의 적합은 *더
+나빠야* 한다 — 증강이 답하려고 존재하는 질문은 **평가** 스위트에서 무슨 일이 일어나는가이고,
+거기서 증강 없는 행 D는 `final_loss 0.004610`을 기록했으며 (12.8절에서, 배치 8로)
+`nominal success_rate` 0을 기록했다. 더 낮은 학습 loss와 결코 성공하지 않는 정책은 정확히
+§28.10의 U-측정이 겨냥하는 그 불일치이고, 이 실행은 각 프레임의 크롭을 하나 넘게 본 쪽의
+팔이다.
+
+`~/artifacts/plan-v/m7-t6/`에 보관: `untrained-augmented.esb`(커밋된 네 문서에서
+`observation.toml` 자리에 `observation-augmented.toml`), `training.toml`, `train.log`,
+그리고 `run/`(4.5 GB baked 세트, `module/`, `metrics/loss.json`, `training/`의 열두 슬롯,
+`training.lock`, `weights/model-20000.safetensors`, `checkpoints/20000.esb`).
