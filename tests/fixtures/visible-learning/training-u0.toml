@@ -1,0 +1,35 @@
+# M7/U row U0: the committed `learning.toml` and the committed `observation.toml`, at T4's
+# row-D settings (`docs/design/training-recipe.md` section 10) -- what T3 and T4 alone do to
+# the demo's own IR-graph policy.
+#
+# NOT RE-RUN, deliberately: the packet (`docs/packets/M7/U-measurement.md`) forbids retraining
+# U0. The checkpoint evaluated as U0 is T4's own row D,
+# `~/artifacts/plan-v/m7-t4/model-D.safetensors` (`lr_curve_hash c01d5185...`), produced by
+# `~/artifacts/plan-v/m7-t4/run.sh` calling `python/es/train_act.py` directly against a module
+# whose `lowering_hash 3d06811c...d8a2d394` is the one the bundle below lowers to. This file is
+# that run written as an `es train` document -- the `[run]` block is row D's, flag for flag --
+# so the row is reproducible from the repository; it was checked with `--dry-run` and not run.
+#
+# The paths are the oracle server's (RTX 4090), which is the tree every M7 number was taken on;
+# `docs/design/visible-learning.md` section 7.31 records what ran where. `untrained-L80.esb` is
+# the bundle carrying the four committed documents (`training-recipe.md` section 12.8).
+
+kind = "training"
+
+[dataset]
+root   = "/home/LJM/artifacts/plan-v/v15/ds-train"
+frames = "/home/LJM/artifacts/plan-v/v15/frames-train"
+
+[policy]
+bundle = "/home/LJM/artifacts/plan-v/v18/untrained-L80.esb"
+
+[run]
+steps         = 20000
+batch         = 64
+lr            = 4e-4
+seed          = 0
+checkpoint_at = [20000]
+device        = "cuda"
+interpreter   = "/home/LJM/venvs/es-lerobot-cuda/bin/python"
+schedule      = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
+extra         = ["--resident-gpu"]

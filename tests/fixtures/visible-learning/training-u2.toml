@@ -1,0 +1,39 @@
+# M7/U row U2: the committed `learning.toml` with T6's `observation-augmented.toml` --
+# T3 + T4 + the training augmentation (`RandomCrop` then `ColorJitter` on `rgb_overhead`,
+# `augmentation_seed` = `[run] seed` = 0).
+#
+# NOT RE-TRAINED: T6's own acceptance run is this configuration, so U2 evaluates its
+# checkpoint (`~/artifacts/plan-v/m7-t6/run/checkpoints/20000.esb`, `training_hash 61e6c93a...`,
+# `final_loss 0.006664`) rather than paying for a second identical one. This file is that run's
+# recipe, copied from `~/artifacts/plan-v/m7-t6/training.toml` word for word -- including the
+# absent `checkpoint_at`, because `steps` is the authority on the length of a run and is always
+# its last mark, so the trainer's line reads `--checkpoint-at 20000` either way.
+#
+# The bundle is the committed four documents with `observation-augmented.toml` in
+# `observation.toml`'s place. Its `observation_hash` is a different document
+# (`cc437a24...` against the committed `899c16a9...`), so the Evaluation IR that names it is a
+# different `evaluation_hash` (spec 13.3): U2 and U3 are a new comparison, and the documents
+# they were judged by are `~/artifacts/plan-v/m7-u/evaluation-augmented.toml` and
+# `eval-trainseeds-augmented.toml` -- the committed ones with that one field replaced.
+#
+# `[run]` is T4's row D, as U0's is, so the augmentation is the only variable between them.
+# Paths are the oracle server's (RTX 4090), the tree every M7 number was taken on.
+
+kind = "training"
+
+[dataset]
+root = "/home/LJM/artifacts/plan-v/v15/ds-train"
+frames = "/home/LJM/artifacts/plan-v/v15/frames-train"
+
+[policy]
+bundle = "/home/LJM/artifacts/plan-v/m7-t6/untrained-augmented.esb"
+
+[run]
+steps = 20000
+batch = 64
+lr = 4e-4
+seed = 0
+schedule = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
+device = "cuda"
+interpreter = "/home/LJM/venvs/es-lerobot-cuda/bin/python"
+extra = ["--resident-gpu"]

@@ -3885,6 +3885,218 @@ IR-그래프 정책이 지연 **1틱**에 0.625에서 0.0625로 무너진 것이
 사람이 결정하고 싶을 만한 것 둘은 12절에 있다: 질문 24는 여기서 답했고, 새 질문 32는 이제
 숫자를 결정하게 된 `import-lerobot`의 지어낸 지연이다.
 
+### 7.31 만든 대로 (M7/U): T3–T6 이후의 IR 그래프 재측정, 그리고 중단 규칙이 말하는 것
+
+패킷 `docs/packets/M7/U-measurement.md`. §28.10은 IR-그래프 정책을 커밋된 문서 위에서 **한 번**
+재측정하도록 허용한다. T3(배치 축), T4(배치 64에서의 웜업+코사인), T5(ImageNet 백본),
+T6(학습 증강)이 모두 그 아래의 로워링이나 트레이너를 움직였기 때문이다. 이 절이 그 측정이다:
+설정 네 가지, V15의 같은 시연 200편, 넷 모두 T4의 row-D 설정으로 20,000 옵티마이저 스텝
+(배치 64, lr 4e-4, `warmup_cosine` 웜업 250, `lr_min` 1e-6, 시드 0, `--resident-gpu`,
+`device = "cuda"`), T7의 지연 모델 아래에서. 아무것도 튜닝하지 않았다. 발산한 행은 숫자가 들어
+있는 행이다.
+
+**중단 규칙, 적용. 그리고 한 줄로 끝나는 답이 아니다.** §28.10이 고정한 규칙은 *T5 뒤에도
+held-out이 V18b의 0.625를 넘지 못하면 IR 그래프 튜닝은 여기서 끝이고 제품은 외부 경로의
+속도다.* **U1 — T5 뒤 — 은 0.0000**이다. 학습이 발산했기 때문이다(아래). **U3 — T5와 T6 뒤 —
+은 0.5625**이고 0.5625 < 0.625이므로 **문자 그대로 읽으면 중단 규칙은 발동한다.** 같은 조건끼리
+읽으면 반대를 말하고, 사람이 둘 중 하나를 골라야 한다. V18b의 0.625는 평가 지연 0에서 측정된
+값이고, 7.30절은 같은 체크포인트를 그 문서가 선언한 지연 아래에서 다시 재어 **0.0625**를 얻었다.
+U0–U3가 돌아간 평가기가 내놓는 숫자에 대고 보면 U3는 V18b의 9배이고, **T7의 지연 모델 아래에서
+데모의 수용을 통과한 최초의 IR-그래프 정책**이다(`passed = true`, held-out과 학습 시드 양쪽).
+두 가지가 그것을 누그러뜨린다: U3의 Observation IR은 *다른 문서*이고(아래 해시 항목), 0.5625는
+여전히 외부 ACT의 0.9375(7.30절)보다 낮다. 패킷은 다섯 번째 설정을 금지하므로, 이 노트는 두
+읽기를 모두 적고 §28.10이 어느 쪽을 뜻했는지는 M7 리뷰가 결정한다.
+
+**네 행.** 아래 모든 숫자는 `es eval run --jobs 6 --frames`, 커밋된 `evaluation.toml`
+(held-out 시드 101–116 16편 × 여섯 스위트)와 `~/artifacts/plan-v/v15/eval-trainseeds.toml`
+(nominal, 학습 시드 1–16), 오라클 서버(RTX 4090, 16코어)에서 나왔다. U0/U1과 쇼케이스는
+커밋 **`3e6a2e8`**의 `~/Projects/es-u`에서, U2/U3는 같은 경로를 **`7c9d954`**(그 사이에 T6이
+들어왔다)로 다시 푼 트리에서 돌았다. `cargo build --release --features render`,
+`ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python`(torch 2.11.0+cu129).
+
+| 행 | Learning IR | Observation IR | 학습 | held-out `success_rate` | 학습 시드 | held-out `envelope_violation_rate` | `passed` |
+|---|---|---|---|---|---|---|---|
+| **U0** | `learning.toml` | `observation.toml` | T4 row D, 재학습 안 함 | 0.2500 | 0.1250 | 0.4409 | false |
+| **U1** | `learning-pretrained.toml` | `observation.toml` | `es train`, **발산** | **0.0000** | 0.0000 | 1.0000 | false |
+| **U2** | `learning.toml` | `observation-augmented.toml` | T6의 자체 실행, 재학습 안 함 | 0.1875 | 0.0625 | 0.4279 | false |
+| **U3** | `learning-pretrained.toml` | `observation-augmented.toml` | `es train` | **0.5625** | **0.5625** | 0.6668 | **true** |
+
+**여섯 스위트 스윕, held-out 시드** (`success_rate` / `envelope_violation_rate` / 평균
+`episode_length`. `nominal` 행이 위 표의 held-out 열이다 — 커밋된 `evaluation.toml`은 문서
+하나이고 그 nominal 스위트가 곧 held-out 측정이기 때문이다):
+
+| 스위트 | U0 | U1 | U2 | U3 |
+|---|---|---|---|---|
+| nominal | 0.2500 / 0.4409 / 1492.7 | 0.0 / 1.0 / 1800.0 | 0.1875 / 0.4279 / 1525.4 | **0.5625** / 0.6668 / 1092.1 |
+| light_intensity | 0.0625 / 0.4542 / 1699.4 | 0.0 / 1.0 / 1800.0 | 0.0000 / 0.4392 / 1800.0 | **0.6250** / 0.6236 / 921.1 |
+| light_direction | 0.0625 / 0.4865 / 1711.8 | 0.0 / 1.0 / 1800.0 | 0.0000 / 0.4178 / 1800.0 | 0.1875 / 0.7265 / 1634.6 |
+| observation_delay | 0.0625 / 0.5550 / 1721.8 | 0.0 / 1.0 / 1800.0 | 0.0000 / 0.5294 / 1800.0 | 0.2500 / 0.6506 / 1502.2 |
+| torque_noise | 0.0000 / 0.6193 / 1800.0 | 0.0 / 1.0 / 1800.0 | 0.0625 / 0.7975 / 1709.8 | 0.0000 / 0.7157 / 1800.0 |
+| backlash | 0.0625 / 0.4114 / 1699.4 | 0.0 / 1.0 / 1800.0 | 0.0000 / 0.4081 / 1800.0 | 0.4375 / 0.7031 / 1244.0 |
+
+`torque_noise`는 이 표의 어떤 IR-그래프 정책도 살아남지 못하는 스위트이고, 7.28절과 7.30절이
+IR 그래프에 대해서도 외부 ACT에 대해서도 이미 기록한 것이다: 96×96 프레임은 토크를 볼 수 없다.
+
+**두 evaluation 해시, 그리고 왜 둘인가.** U0/U1은 커밋된 `evaluation.toml`
+— `evaluation_hash e52e8360…`(V18b 자신의 것) — 과 `v15/eval-trainseeds.toml`(`b49fc549…`)로
+판정했다. U2/U3는 그럴 수 없다: 그들의 Observation IR은 `observation-augmented.toml`,
+`observation_hash cc437a24…`(커밋된 것은 `899c16a9…`)이고, Evaluation IR은 자신이 판정하는
+observation을 이름으로 가리킨다. 그래서 그들의 문서는 커밋된 둘에서 그 필드 하나만 바꾼 것이며
+(`~/artifacts/plan-v/m7-u/evaluation-augmented.toml`, `eval-trainseeds-augmented.toml`; 필드를
+되돌린 `diff`는 비어 있다), 해시는 **`e5705cb0…`**와 **`10af1061…`**이다. §13.3: **U2/U3는 새
+비교다.** 시드·스위트·섭동 파라미터·예산·수용 기준은 U0/U1의 것과 같은 바이트이므로 읽는
+사람의 판단으로는 비교할 수 있다. 사슬은 비교하지 않으며, 위 어떤 행도 그 경계를 넘어 사슬로
+이어졌다고 주장하지 않는다. 짚어 둘 결과 둘: `es eval compare`는 `evaluation_hash`가 다른 두
+리포트 쌍을 **아무 말 없이** 받는다(`es loop cycle`은 바로 그것을 거부한다 —
+`training-recipe.md` 12.3). 이것이 질문 36이다. 그리고 `execution_hash`는 문서별이 아니라
+*정책별*이다 — U0의 held-out 실행과 학습-시드 실행이 모두 `fee0e20b…`를 보고한다 — §5.3의
+사슬에 evaluation 슬롯이 없기 때문이다.
+
+행별로: U0 `execution_hash fee0e20b…`, U1 `d85f108b…`, U2 `37e4909f…`, U3 `a2283994…`.
+
+**각 번들이 무엇인가.**
+
+| 행 | `learning_hash` | `observation_hash` | `lowering_hash` | `policy_hash`(§5.3) | 번들 |
+|---|---|---|---|---|---|
+| U0 | `5dac0a46…` | `899c16a9…` | `3d06811c…` | `f9fb5260…` | `m7-u/U0/u0.esb` |
+| U1 | `fdb5178a…` | `899c16a9…` | `41d11a06…` | `e77fbc91…` | `m7-u/U1/train/checkpoints/20000.esb` |
+| U2 | `5dac0a46…` | `cc437a24…` | `3d06811c…` | `b6ab2413…` | `m7-t6/run/checkpoints/20000.esb` |
+| U3 | `fdb5178a…` | `cc437a24…` | `41d11a06…` | `c109d783…` | `m7-u/U3/train/checkpoints/20000.esb` |
+
+넷 모두 `task_hash eb6efefa…`, `deployment_hash f2f9a510…` — 커밋된 문서다. 두 `learning_hash`와
+두 `lowering_hash`는 `learning-lowering.md` 5.3이 기록한 그 쌍 그대로 움직이지 않았고, 증강된
+observation은 둘 다 움직이지 않는다. 그래서 이 2×2가 2×2다.
+
+**`expected_latency_ms`는 모든 행에서 15.0**이다(질문 32). 픽스처 `learning.toml` 자신이 선언한
+숫자이고 50 Hz에서 제어 한 틱이며, `es policy pack`은 문서의 값을 그대로 옮길 뿐 지어내지
+않는다 — 질문 32가 말하는 지어냄은 이 경로에 없는 `import-lerobot`의 것이다. 증거는 리포트
+안에 있다: 모든 실행이 16 에피소드에서 정확히 **`violation.chunk_underrun` 16틱**, 에피소드당
+한 틱을 센다. 한 틱 지연이 만드는 값이다(7.30절의 ACT는 200 ms에서 열 틱을 낸다).
+
+**U0는 재학습하지 않았다.** 패킷이 요구한 대로, T4의 row-D 체크포인트
+(`~/artifacts/plan-v/m7-t4/model-D.safetensors`, `lr_curve_hash c01d5185…`, `final_loss
+0.004610`)를 커밋된 네 문서를 담은 번들 `~/artifacts/plan-v/v18/untrained-L80.esb`에
+`es policy pack`으로 넣은 것이다. 이 트리에서 그 번들을 다시 로워링하면
+`lowering_hash 3d06811c…d8a2d394` — T4가 학습한 모듈과 바이트 단위로 같은 것 — 이 찍히므로,
+체크포인트는 자신이 판정받는 문서에 맞는다. `tests/fixtures/visible-learning/training-u0.toml`은
+그 실행을 `es train` 레시피로 적은 것이고 `--dry-run`으로만 확인했으며 실행하지 않았다.
+
+**U1은 발산했고, 그것이 그 행이다.** `es train --recipe training-u1.toml`(identity_hash
+`ae3bd4b0…`, training_hash `e2a9c789…`)은 `first_nonfinite_step 4517`에 도달했다: 손실은
+4,510 스텝까지 0.0419 → 0.0151로 떨어졌다가 4,516에서 0.303으로 튀었고 4,517부터 20,000까지
+NaN이었다. 스케줄은 T4의 row D가 적용한 것과 정확히 같게 적용되었고(`lr_curve_hash c01d5185…`,
+같은 다이제스트 — 즉 같은 20,000개의 `f64`), row D와 다른 것은 ImageNet 초기화뿐이다. 따라서
+20,000 스텝 체크포인트는 NaN 가중치이고, 그것을 평가한 결과가 0.0000 행들이다: Safety Plane이
+명령된 **28,800틱 중 28,784틱**을 `violation.non_finite`로 거부했고 팔은 모든 스위트에서, 두
+문서 모두에서 움직이지 않았다. `envelope_violation_rate 1.0`이 그것이다. **다른 학습률로 다시
+시도하지 않았다** — 패킷이 금지한다 — 그러니 이 행은 "이 조합은 발산한다"로 읽어야 하고,
+이는 `training-recipe.md` 10절이 row D에 붙인 단서("여기서 측정된 것은 *이* 조합이 안정하다는
+것")와 정확히 같다. U3는 같은 백본을 같은 학습률로, T6의 증강과 함께 돌린 것이고 발산하지
+**않는다**(`final_loss 0.006383`, `first_nonfinite_step null`). 이 노트에서 가장 뜻밖의 줄이고
+질문 35다.
+
+**U2도 재학습하지 않았다**: T6의 수용 실행이 곧 U2의 설정이므로, 이 패킷은 똑같은 두 번째
+실행에 GPU를 쓰는 대신 그 체크포인트(`training_hash 61e6c93a…`, `final_loss 0.006664`)를
+평가했다. `training-u2.toml`이 그 실행의 레시피를 그대로 옮긴 것이다.
+
+**U3의 학습**, 이 패킷이 만든 유일한 벽시계: `es train` 전체 — `--for-training` 베이크
+(36,960 샘플, `[3, 104, 104]`, `Pad(4) → RandomCrop{96,96}` 경계), 로워링, 20,000 스텝, 팩 —
+**4:11(251초)**, 유휴 카드에서(`nvidia-smi`: 컴퓨트 프로세스 없음, 1분 부하 3.20 → 1.03).
+U1은 같은 조건에서 **2:57(177초)**였다(부하 2.66 → 1.11). 차이는 더 큰 베이크 텐서와 샘플별
+증강이다. 둘 다 §19.3의 열두 슬롯을 모두 채운 `training.lock`을 썼고, 거기에는 실제
+`base_model` 슬롯(`torchvision.models.ResNet18_Weights.IMAGENET1K_V1`, BSD-3-Clause)이 들어
+있다. 기록해 둘 T1/T6 성질 하나: `es train --dry-run`은 `--for-training`도 `--augmentation`도
+찍지 않는다. dry run은 번들을 열지 않고 증강 체인은 번들의 Observation IR의 성질이기 때문이다 —
+계획은 레시피만의 함수로 남고(`training-recipe.md` 3절), 그 플래그들은 실행이 로그에 남긴
+계획에 나타난다.
+
+**`es eval compare U0/report.json U1/report.json`**, 도구 자신의 출력(`failure_mode_histogram`
+행은 폭 때문에 뺐다. 네 비교 전문은 `~/artifacts/plan-v/m7-u/compare-U0-U1.txt`,
+`compare-U0-U2.txt`, `compare-U1-U3.txt`, `compare-U2-U3.txt`):
+
+```
+SUITE                METRIC                                  A              B          DELTA  SIGNIFICANT
+nominal              success_rate                     0.250000       0.000000      -0.250000  n/a (aggregate-only report)
+nominal              envelope_violation_rate          0.440941       1.000000      +0.559059  n/a (aggregate-only report)
+nominal              episode_length                1492.687500    1800.000000    +307.312500  n/a (aggregate-only report)
+light_intensity      success_rate                     0.062500       0.000000      -0.062500  n/a (aggregate-only report)
+light_intensity      envelope_violation_rate          0.454231       1.000000      +0.545769  n/a (aggregate-only report)
+light_intensity      episode_length                1699.437500    1800.000000    +100.562500  n/a (aggregate-only report)
+light_direction      success_rate                     0.062500       0.000000      -0.062500  n/a (aggregate-only report)
+light_direction      envelope_violation_rate          0.486473       1.000000      +0.513527  n/a (aggregate-only report)
+light_direction      episode_length                1711.812500    1800.000000     +88.187500  n/a (aggregate-only report)
+observation_delay    success_rate                     0.062500       0.000000      -0.062500  n/a (aggregate-only report)
+observation_delay    envelope_violation_rate          0.555011       1.000000      +0.444989  n/a (aggregate-only report)
+observation_delay    episode_length                1721.812500    1800.000000     +78.187500  n/a (aggregate-only report)
+torque_noise         success_rate                     0.000000       0.000000      +0.000000  n/a (aggregate-only report)
+torque_noise         envelope_violation_rate          0.619340       1.000000      +0.380660  n/a (aggregate-only report)
+torque_noise         episode_length                1800.000000    1800.000000      +0.000000  n/a (aggregate-only report)
+backlash             success_rate                     0.062500       0.000000      -0.062500  n/a (aggregate-only report)
+backlash             envelope_violation_rate          0.411423       1.000000      +0.588577  n/a (aggregate-only report)
+backlash             episode_length                1699.437500    1800.000000    +100.562500  n/a (aggregate-only report)
+
+A: passed=false   B: passed=false
+```
+
+`U1 → U3`는 같은 표에서 부호가 전부 뒤집힌 것이다 — `nominal +0.5625`, `light_intensity
++0.6250`, `backlash +0.4375`, `envelope_violation_rate −0.3332`, `episode_length −707.9`,
+그리고 `A: passed=false   B: passed=true`. `U0 → U2`(증강 단독, 해시 경계를 넘는 비교)는
+평평하거나 약간 음수다: `nominal −0.0625`, 네 스위트 −0.0625, `torque_noise +0.0625`.
+`SIGNIFICANT` 열은 모든 비교의 모든 행에서 `n/a (aggregate-only report)`다. `report.json`이
+셀 집계를 담고 에피소드별 결과를 담지 않기 때문이고, 도구는 자신이 받은 것으로는 유의성을
+검정할 수 없다고 말하고 있는 것이다 — 정직하며, 위 어떤 차이도 유의하다고 부르지 않는 이유다.
+
+**사이클 벽시계는 인용이지 재실행이 아니다**(`training-recipe.md` 12.8절): 데모 자신의 문서
+위에서 `es loop cycle` 한 번이 2026-09-21에 **30:19** — collect 5:00, 전문가 게이트 2:21,
+train 2:26, eval 20:24, showcase 0:08 — 로 §28.9의 "한 사이클 30분 이내"를 19초 차이로
+놓쳤다. 그 실행은 T3과 T4가 들어온 뒤에 측정된 것이고, 그것이 패킷이 인용의 조건으로 건 것이다.
+T5나 T6가 그 단계들을 바꾸지 않는다: U3의 학습(4:11 대 그 사이클의 2:26)은 `train` 행을 2분
+미만 움직이고, `eval` 행은 정책이 얼마나 자주 성공하는지의 함수다 — 열여섯 중 아홉을 성공하는
+정책은 에피소드를 일찍 끝낸다. 이 패킷 자신의 여섯 스위트 벽시계는 그것을 **분리하지 못하며**,
+그것으로 오인되지 않도록만 적어 둔다: 네 실행은 한 박스를 나눠 쓰는 쌍으로 나갔고(U0 9:23 옆에
+U1 9:24, U2 8:19 옆에 U3 8:19), 각 쌍의 숫자는 16코어에서 `--jobs 6` 두 실행 사이의 경합이지
+어느 정책의 고유 비용이 아니다.
+
+**쇼케이스.** U0의 held-out `nominal-00`(시드 101)은 U0의 네 성공 가운데 **하나가 아니다** —
+1,800틱을 다 돌고 타임아웃한다 — 그러나 U0가 모든 nominal 에피소드에서 실패하지는 않으므로
+패킷이 정한 V19b 궤적으로의 후퇴는 쓰지 않았고, 이 프레임들은 U0 자신의 것이다: 그 안의 정책은
+큐브를 향해 뻗지만 태스크를 닫지 못한다. R1의 카메라
+(`--eye 0.66,-0.46,0.52 --look-at 0.14,-0.04,0.04 --fov 36`), 1280×720, 각 1,800프레임,
+ms/프레임은 명령 자신의 요약 줄에서:
+
+| 렌더 | ms/프레임 | 1분 부하 전 → 후 | 옆에 둘 값 |
+|---|---|---|---|
+| `--look full` (R2) | **9.9** | 4.47 → 3.70 | `renderer.md` 9.6의 유휴 카드 10.1 / 9.9 / 9.9 |
+| `--path pt --spp 64 --exposure 32` (R3) | **262.5** | 3.70 → 0.04 | `renderer.md` 11.7의 유휴 카드 254.0 / 254.6 |
+| `--path pt --spp 4 --accumulate --max-history 32 --exposure 32` (R4) | **29.8** | 0.04 → 0.23 | `renderer.md` 11.7의 29.2 / 28.5 |
+
+`nvidia-smi`는 전후 모두 다른 컴퓨트 프로세스를 보고하지 않았다. 첫 행은 시작할 때 부하가
+패킷의 기준 4를 **넘었고**(병렬로 돌던 평가 둘의 꼬리) 18초 뒤 끝날 때는 밑이었다. 그럼에도
+`renderer.md` 9.6의 유휴 카드 숫자를 재현하며, 경로 추적 두 행은 모두 부하 4 아래에서
+측정되었다. 각각 같은 원본 프레임에서 두 번 인코딩했다: `python/es/encode_video.py --fps 50`
+(mp4v, `cv2`/`numpy` 때문에 `~/venvs/es/bin/python`)와 서버의 정적
+`~/.local/bin/ffmpeg 7.0.2`를 통한 H.264 사본 — 파이프 하나, 5배 작음, 질문 5가 정리한 관행.
+
+| 파일 | 서버 `~/artifacts/plan-v/m7-u/showcase/` | 로컬 |
+|---|---|---|
+| RS `full` | `u0-nominal-00-rs-full{,-h264}.mp4` | `target/plan-u/m7-u/u0-nominal-00-rs-full-h264.mp4` |
+| PT 64 spp | `u0-nominal-00-pt-64{,-h264}.mp4` | `target/plan-u/m7-u/u0-nominal-00-pt-64-h264.mp4` |
+| PT 4 spp 누적 | `u0-nominal-00-pt-4-accum{,-h264}.mp4` | `target/plan-u/m7-u/u0-nominal-00-pt-4-accum-h264.mp4` |
+
+원본 프레임 디렉터리 — 렌더 셋과 평가 `--frames` 트리 여덟, 50 GB — 는 실행 뒤 지웠고 1.5 GB가
+남았다: 여덟 실행 전부의 `report.json`·`evaluation.lock`·`events.json`·`traj/`, U1과 U3의
+`training.lock`과 체크포인트 번들, 레시피 넷, 증강된 evaluation 문서 둘, `es eval compare`
+출력 넷, mp4 여섯, 그리고 `~/artifacts/plan-v/m7-u/U0/keep/` 아래 U0의 held-out `nominal-00`
+`.estraj`와 관측 프레임.
+
+**이 절이 정리하는 것과 정리하지 못하는 것.** 이것은 §28.10이 허용한 그 한 번의 재측정이고,
+M7이 만든 네 레버 중 `success_rate`를 조금이라도 움직이는 조합은 **증강 + ImageNet 백본의
+결합뿐**이라고 말한다: U0 → U2(증강 단독)는 평평하고, U0 → U1(백본 단독)은 발산하며,
+U1 → U3는 nominal에서 +0.5625다. 이것은 7.29절을 뒤집지 **않는다**: 외부 ACT는 여전히 모든
+스위트에서 낫고, 거기 도달하는 데 2×2가 필요하지도 않았다. 그리고 7.28절을 다시 열지도
+않는다 — 그 문장은 7.30절이 다시 날짜를 매긴 채로 남는다. U3가 세우는 것은 *다른* Observation
+IR 위에서, 7.28절에는 없던 지연 모델 아래에서 성립하는 *같은* 주장이다.
+
 ## 8. 안전 오버레이 (V3)
 
 렌더된 프레임마다 V3는 `events.json`에 레코드 하나를 붙인다:
@@ -4362,3 +4574,24 @@ V0 (장면 + IR)  ∥  V0b (루프 안의 렌더링)  ∥  V4 (영상 조립)
     그것을 명시한다. 7.30절이 그렇게 한다. 기본값: **(a)가 생길 때까지 (c)** — 경계값은
     보수적인 방향이기 때문이다. 배포가 감내하는 최악의 지연에서 통과하는 정책은 실제 지연에서도
     통과한다.
+35. **사전학습 백본이 row D의 학습률에서 발산하고, 증강이 그것을 구한다** (7.31절). U1과 U3는
+    문서 하나 — Observation IR — 만 다른데, U1은 `first_nonfinite_step 4517`에 닿고 U3는
+    20,000 스텝을 `final_loss 0.006383`으로 끝낸다. 적용된 학습률은 양쪽에서 같은 `f64`들이다
+    (`lr_curve_hash c01d5185…`, T4의 row D). 즉 `lr = 4e-4`는 트레이너의 성질도 스케줄의
+    성질도 아니고 *(스케줄, 초기화) 쌍*의 성질이며, 이 프로젝트가 커밋한 두 Learning IR 문서
+    가운데 하나는 작동한다고 보여진 학습률을 아직 갖고 있지 않다. 움직일 수 있는 끝이 셋이다.
+    **(a)** 패킷 하나가 사전학습 쪽의 학습률을 따로 측정한다 — 이 패킷이 금지당한 다섯 번째
+    설정이다 — 그리고 레시피 픽스처가 학습률을 하나가 아니라 둘 담는다. **(b)** T4가 추가했고
+    측정된 실행이 한 번도 쓰지 않은 `grad_clip`을 사전학습 쪽에서 켠다. 여섯 스텝 만에
+    0.0151 → 0.303 → NaN으로 가는 손실은 노름 클립이 존재하는 이유인 모양이다. **(c)** 아무것도
+    움직이지 않고 노트가 그 발산을 있는 그대로의 행으로 싣는다. 기본값: **(c)**. 데모의 결론 —
+    7.29절의 것 — 이 여기에 걸려 있지 않기 때문이다. 다만 (b)는 레시피의 필드 하나이고 M7
+    사다리 전체에서 가장 싼 실험일 것이다.
+36. **`es eval compare`가 움직인 `evaluation_hash`를 넘어 말없이 비교한다** (7.31절). §13.3은
+    움직인 evaluation 문서는 새 비교라고 말하고, `es loop cycle`은 두 해시를 모두 찍으며
+    이름으로 거부한다(`training-recipe.md` 12.3). 같은 절이 독자에게 가리키는 비교 도구는
+    확인하지 않으므로, `es eval compare U0/report.json U2/report.json`은 서로 다른 두 문서를
+    가로질러 델타 열을 찍으면서 아무 말도 하지 않는다. 기본값: **거부가 아니라 두 해시를
+    이름으로 적은 경고 한 줄**. 그 비교가 바로 사람이 원하는 것일 때가 있고(이 노트의 U0 → U2
+    행이 그렇다) 도구의 일은 자기가 무엇을 보여 주는지 말하는 것이다. 이것은 M7 리뷰 항목이지
+    이 패킷이 할 수 있는 변경이 아니다.

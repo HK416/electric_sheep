@@ -2880,6 +2880,25 @@ retraining or not. (3) The `lerobot` version `es train`'s external path pins (0.
 `docs/api-notes/lerobot-config.md`). (4) Committing `Cargo.lock` (M5 R7) — needed if
 `es train`'s `hardware.json` is to name a reproducible build.
 
+**M7 outcome (2026-09-21, `docs/reviews/M7.md`).** Every row of the ladder closed — T1–T8, E1–E5,
+R1(+R1b)–R4, U — and, on the owner's directive, **E6** outside the ladder (plain words, `i18n` string
+tables, a system CJK font fallback, a home screen, native file dialogs). The three rules above held:
+not one committed observation pixel moved (every renderer improvement is an opt-in `RenderConfig`
+field), `es train` wrote no invented digest, and every editor panel had a headless view-model first.
+Measured (RTX 4090): 20,000 steps 675 s → 137 s (T3); batch 64 + warmup-cosine 36 % below batch 8's
+loss at equal samples, 26 s against 107 s (T4); one cycle (collect 200 → expert gate → train →
+evaluate → showcase) 30:19 (T2, of which evaluation 20:24); one 1280×720 frame 80 → 5.2 ms with every
+bit unchanged (R1), the `Full` look 9.9 ms (R2), PT NEE 64 spp 262 ms and 4 spp accumulated 29.8 ms
+(R3, R4), ReSTIR bias −1.76 % → +0.10 %; live telemetry +0.16 % (E4). **The re-measurement (U)**: on
+the committed documents under T7's latency model, U0 (T3+T4) held-out 0.25, U1 (pretrained) diverged
+(NaN at step 4,517), U2 (augmented) 0.1875, **U3 (pretrained + augmented) 0.5625 — the first IR-graph
+policy to pass the demo's acceptance** (V18b re-measures at 0.0625 on the same evaluator). The stop
+rule above fires on the literal reading (0.5625 < 0.625) and not on the like-for-like one; which to
+take is the review's first human decision. T8's episode partition measured 2.0×/2.2× and did not ship:
+the Safety Plane's violation-rate window carries across episode boundaries and `StepEvent::tick` is the
+cell's cumulative clock, so committed numbers move — also a human decision. Follow-up packets R1–R10
+are in the review.
+
 ---
 
 ## 29. Risks
