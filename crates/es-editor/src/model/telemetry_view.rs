@@ -37,6 +37,17 @@ pub struct Event {
 /// Default history depth per series, and event-log depth.
 pub const DEFAULT_CAP: usize = 4096;
 
+/// Reads one [`attach`]ed [`Source`] call may make before it answers "nothing right now".
+///
+/// `Client::try_recv` reads at most one 4 kB chunk per call and reports `WouldBlock` both for
+/// *nothing yet* and for *this message is still arriving*. One read per call would drain 4 kB
+/// per repaint — at ten repaints a second, less than half of what a run publishes, and an
+/// image frame alone is tens of kilobytes — so the producer would drop the rest on the floor
+/// (`docs/design/telemetry-protocol.md` §6). Sixty-four reads is "enough to finish a frame";
+/// when there is genuinely nothing on the socket they are 64 non-blocking reads that return
+/// immediately, once per repaint.
+const READS_PER_POLL: usize = 64;
+
 #[derive(Debug)]
 pub struct TelemetryModel {
     cap: usize,
@@ -199,7 +210,21 @@ pub fn attach(addr: &str, token: &str) -> Result<Source, String> {
         execution_hash: client.execution_hash,
     }));
     Ok(Box::new(move || {
-        ack.take().or_else(|| client.try_recv().ok())
+        if let Some(ack) = ack.take() {
+            return Some(ack);
+        }
+        for _ in 0..READS_PER_POLL {
+            match client.try_recv() {
+                Ok(msg) => return Some(msg),
+                // Either nothing has arrived or a message is half here; the only way to tell
+                // them apart is to read again (see [`READS_PER_POLL`]).
+                Err(TransportError::WouldBlock) => {}
+                // A closed or broken connection is "nothing right now" forever: the tab keeps
+                // what it has rather than clearing itself over a dropped socket.
+                Err(_) => return None,
+            }
+        }
+        None
     }))
 }
 
@@ -348,6 +373,31 @@ mod tests {
             model.pump(&mut source, 8);
         }
         assert!(!model.series.is_empty(), "no frame arrived on stream 2");
+
+        // One `Source` call finishes a whole message, not 4 kB of one: a 32x32 image is some
+        // 13 kB of JSON, and a viewer that took four repaints over it would have the rest
+        // dropped by the producer's bounded queue.
+        server.publish(es_telemetry::protocol::Frame {
+            tick: PhysTick(4),
+            wall_ns: 0,
+            stream: StreamId(4),
+            payload: Payload::Image {
+                w: 32,
+                h: 32,
+                format: "rgb8".to_owned(),
+                bytes: vec![3u8; 32 * 32 * 3],
+            },
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while model.live.image().is_none() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                model.pump(&mut source, 1) <= 1,
+                "one message per pump was asked for"
+            );
+        }
+        let image = model.live.image().expect("the image frame arrived whole");
+        assert_eq!((image.width, image.height), (32, 32));
     }
 
     #[test]

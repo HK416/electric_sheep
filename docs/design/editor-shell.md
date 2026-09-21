@@ -605,18 +605,26 @@ crate that links both — turns a `RunEvent` into a wire `Frame`.
 ### Gate 9: what publishing costs the run (§28.7, §23.4)
 
 `es eval run` on the demo documents (one suite, three episodes of 60 control ticks, 96×96
-frames rendered every tick), `--jobs 1`, three runs each way, one attached subscriber draining
-every stream for the `--telemetry` runs. Ubuntu, RTX 4090, 16 cores, `cargo` debug build,
-`__LOAD__`:
+frames rendered every tick, 190 frames published), `--jobs 1`, three runs each way with one
+attached subscriber draining every stream, **interleaved** (plain, telemetry, plain, …) so a
+box that gets busier during the measurement moves both arms rather than one. Ubuntu, RTX 4090,
+16 cores, load average 2.9–5.1 and GPU 0–17 % throughout (a neighbouring agent's run):
 
 | | run 1 | run 2 | run 3 | median |
 |---|---|---|---|---|
-| `es eval run` | __P1__ s | __P2__ s | __P3__ s | __PM__ s |
-| `es eval run --telemetry` | __T1__ s | __T2__ s | __T3__ s | __TM__ s |
+| `es eval run`, release | 4.876 s | 4.281 s | 4.266 s | **4.281 s** |
+| `es eval run --telemetry`, release | 4.477 s | 4.288 s | 4.255 s | **4.288 s** |
+| `es eval run`, debug | 6.610 s | 6.538 s | 6.530 s | **6.538 s** |
+| `es eval run --telemetry`, debug | 6.698 s | 6.583 s | 6.577 s | **6.583 s** |
 
-**Observed overhead: __DELTA__** against §23.3's *"< 1 %"*. __VERDICT__
+**Observed overhead: +0.16 % release, +0.69 % debug** against §23.3's *"< 1 %"* — the gate
+holds on both, and the debug figure is the conservative one because the cost is `serde_json`
+encoding, which an unoptimized build pays several times over. Run 1 of each arm carries the
+cold page cache; the later pairs differ by under 50 ms on a 4.3 s run, the same order as the
+box's own noise. The script, the drainer and the logs are in `~/artifacts/plan-v/m7-e4/` on
+the oracle server.
 
-The number is an observation of this run shape, not a general figure: 180 frames of JSON over
+The number is an observation of this run shape, not a general figure: 190 frames of JSON over
 a loopback socket beside a control tick that renders a frame and runs a torch forward pass.
 A training loop publishing at a higher rate, or a graph view subscribing to a tensor stream,
 is a different measurement — `Target / Status: unverified` for those.
