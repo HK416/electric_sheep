@@ -3,7 +3,8 @@
 
     import_rl.py --from mujoco-playground|rsl-rl|rl-games --checkpoint <path>
                  [--activation relu|elu|swish|tanh] --out <dir>
-    import_rl.py --synth mujoco-playground|rsl-rl|rl-games [--native] --out <dir>
+    import_rl.py --synth mujoco-playground|rsl-rl|rl-games [--native]
+                 [--action position|delta] --out <dir>
     import_rl.py --reference --import <dir> [--resolved mapping-report.json]
                  [--npz oracle-1000.npz] [--rows N] [--seed N] --out oracle.safetensors
 
@@ -59,6 +60,9 @@ FRAMEWORKS = ("mujoco-playground", "rsl-rl", "rl-games")
 ACTIVATIONS = ("relu", "elu", "swish", "tanh")
 SYNTH_HIDDEN = (8, 8)
 SYNTH_OBS, SYNTH_ACTION = 26, 6
+# The increment `python/es/rl_source/train_brax_so101.py --action delta` records, in rad per
+# control tick (`docs/api-notes/brax-ppo-so101.md` section 7).
+DELTA_SCALE = 0.05
 
 
 def fail(message: str) -> SystemExit:
@@ -135,6 +139,11 @@ def read_playground(path: Path, activation: str | None) -> tuple[dict, dict]:
             "kernel": std_k.T.tolist(),
             "bias": std_b.tolist(),
         },
+        # The source says what its six numbers *are*; the adapter says it again for our
+        # robot, and `es policy import-rl` refuses the two disagreeing (IMP-004). Absent (a
+        # checkpoint whose exporter never recorded it) is not a guess either -- it is `null`,
+        # and then the adapter alone decides.
+        "action_kind": action.get("kind"),
         "action_scale": action.get("scale"),
         "action_offset": action.get("offset"),
         "joint_order": meta.get("joint_order"),
@@ -243,6 +252,7 @@ def read_rsl_rl(path: Path, activation: str | None) -> tuple[dict, dict]:
         "normalizer": "EmpiricalNormalization: (x - mean) / sqrt(var)" if obs_mean else None,
         "log_std": log_std,
         "source_std": None if std is None else {"kind": "std", "value": f32(std).tolist()},
+        "action_kind": None,
         "action_scale": None,
         "action_offset": None,
         "joint_order": None,
@@ -288,6 +298,7 @@ def read_rl_games(path: Path, activation: str | None) -> tuple[dict, dict]:
         "normalizer": None if obs_var is None else "RunningMeanStd: (x - mean)/sqrt(var + 1e-5)",
         "log_std": None if sigma is None else f32(sigma).tolist(),
         "source_std": None if sigma is None else {"kind": "log_std", "value": f32(sigma).tolist()},
+        "action_kind": None,
         "action_scale": None,
         "action_offset": None,
         "joint_order": None,
@@ -521,6 +532,10 @@ def do_synth(args) -> None:
     reason, when the framework is not installed. The fixtures committed to this repository are
     the fallback, so CI needs neither package.
     """
+    if args.action != "position" and args.synth != "mujoco-playground":
+        # rsl_rl and rl_games record no action metadata at all, so there is nothing for
+        # `--action` to put in the manifest and the adapter would be the only declaration.
+        raise fail(f"--action {args.action} is only meaningful with --synth mujoco-playground")
     out = Path(args.out).expanduser()
     out.mkdir(parents=True, exist_ok=True)
     rng = np.random.default_rng(20260921)
@@ -585,6 +600,17 @@ def do_synth(args) -> None:
                     "activate_output": False,
                     "squash": "tanh",
                     "joint_order": None,
+                    "action": (
+                        {
+                            "kind": "joint_delta",
+                            "unit": "rad per control tick",
+                            "delta_scale": DELTA_SCALE,
+                            "offset": [0.0] * SYNTH_ACTION,
+                            "scale": [DELTA_SCALE] * SYNTH_ACTION,
+                        }
+                        if args.action == "delta"
+                        else {}
+                    ),
                 },
                 indent=2,
             )
@@ -621,7 +647,8 @@ def do_synth(args) -> None:
     # generator happened to have. `synthetic` is the provenance line a reader needs instead.
     manifest = json.loads((out / "import.json").read_text())
     manifest["versions"] = {"synthetic": "no framework was installed to produce this"}
-    manifest["synthetic"] = f"python/es/import_rl.py --synth {args.synth}"
+    flags = f" --action {args.action}" if args.action != "position" else ""
+    manifest["synthetic"] = f"python/es/import_rl.py --synth {args.synth}{flags}"
     (out / "import.json").write_text(json.dumps(manifest, indent=2) + "\n")
 
 
@@ -688,6 +715,13 @@ def main() -> int:
         "--native",
         action="store_true",
         help="build and save the checkpoint with the framework's own API, when installed",
+    )
+    ap.add_argument(
+        "--action",
+        choices=("position", "delta"),
+        default="position",
+        help="--synth: whether the synthetic source's action is a position target or a "
+        "per-tick joint increment (spec 8.5 JointDelta)",
     )
     ap.add_argument("--reference", action="store_true")
     ap.add_argument("--import", dest="import_dir")
