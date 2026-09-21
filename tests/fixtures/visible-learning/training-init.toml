@@ -1,0 +1,38 @@
+# The IR route continuing a policy (packet M8/S1): `[init] policy` names a bundle, and
+# `[run] steps = 0` re-packs it.
+#
+# `es train --recipe tests/fixtures/visible-learning/training-init.toml --out <dir> --dry-run`
+# prints the plan pinned by `tests/golden/train/plan-init.txt`. As with `training.toml`
+# beside it, nothing here needs to exist for `--dry-run`: the paths under `runs/` are the
+# shape `es loop collect` and a previous `es train` write, and that is what makes the golden
+# judgeable without a dataset, a bundle or Python.
+#
+# `steps = 0` means "checkpoint immediately": the trainer writes the module's initial state --
+# the tensors `[init] policy` supplied, plus whatever the lowering drew for the rest -- as
+# `weights/model-0.safetensors`, and `es policy pack` turns it into `checkpoints/0.esb`. With
+# an `[init]` bundle that shares every tensor, the result is that bundle's weights again, bit
+# for bit; that identity is the oracle of this packet. It is also a real thing to want: a
+# checkpoint re-packed against a document that has moved on is one command, not a pipeline.
+#
+# `checkpoint_at` is absent, and has to be: a run that takes no optimizer step has no step to
+# also checkpoint at. Its one mark is 0.
+
+kind = "training"
+
+[dataset]
+root   = "runs/collect-001/ds"
+frames = "runs/collect-001/frames"
+
+[policy]
+bundle = "runs/collect-001/untrained.esb"
+
+[init]
+policy = "runs/train-001/checkpoints/20000.esb"
+
+[run]
+steps       = 0
+batch       = 8
+lr          = 1e-4
+seed        = 0
+device      = "cuda"
+interpreter = "python"

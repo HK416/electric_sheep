@@ -96,6 +96,25 @@ pub struct Recipe {
     pub dataset: DatasetRef,
     pub policy: PolicyRef,
     pub run: Run,
+    /// `[init] policy = "<bundle.esb>"` — the policy this run starts from (packet M8/S1).
+    /// Absent is absent: no `training/init.lock`, no `--init-weights`, and the same
+    /// `identity_hash` every recipe written before the packet had.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init: Option<InitRef>,
+}
+
+/// `[init]` — one field, because one is the whole question (packet M8/S1).
+///
+/// The bundle named here is opened, its safetensors compared to the lowered module's
+/// contract, and the tensors whose name *and* shape match are what the trainer starts from.
+/// Everything else about the run — the dataset, the architecture, the optimizer — is still
+/// `[dataset]`, `[policy]` and `[run]`: this table says where the numbers come from, not what
+/// they are.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitRef {
+    /// A `.esb` bundle, as `es policy pack` or `es train` writes one.
+    pub policy: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -245,6 +264,21 @@ impl Recipe {
                  `[policy] lerobot.extra`",
             ));
         }
+        if route == Route::External && recipe.init.is_some() {
+            return Err(refuse(
+                "[init] `policy` is the IR route's: this side copies the tensors of a bundle \
+                 into the module `es policy lower` emitted, and `lerobot-train` starts from \
+                 its own `--policy.path`. Mixing the two would write an `init.lock` \
+                 describing tensors the run never loaded",
+            ));
+        }
+        if route == Route::External && recipe.run.steps == 0 {
+            return Err(refuse(
+                "[run] `steps` is 0 on the lerobot route; `lerobot-train` saves at a \
+                 `--save_freq` and has no step 0 to save at. \"Checkpoint immediately\" is \
+                 the IR route's, where the trainer writes the module's initial state",
+            ));
+        }
         if route == Route::External && !schedule_args.is_empty() {
             return Err(refuse(
                 "[run] `schedule`, `weight_decay` and `grad_clip` are the IR route's: they \
@@ -360,15 +394,27 @@ impl Recipe {
     ///
     /// `train_act.py` caps its run at the largest mark, so making `steps` a mark is what
     /// keeps `run.steps` the authority on how long the run is.
+    ///
+    /// `steps = 0` is the one run with a mark of 0: **checkpoint immediately**, the module's
+    /// initial state written without an optimizer step (packet M8/S1). With `[init]` that is
+    /// a re-pack of the policy it started from; without one it is the untrained module, which
+    /// is a real thing to want and a refusal nobody could defend.
     pub fn marks(&self) -> Result<Vec<u32>, DataError> {
-        if self.run.steps == 0 {
-            return Err(refuse("[run] `steps` is 0; there is nothing to train"));
-        }
         if self.run.batch == 0 {
             return Err(refuse("[run] `batch` is 0"));
         }
         if !self.run.lr.is_finite() || self.run.lr <= 0.0 {
             return Err(refuse(format!("[run] `lr` is {}", self.run.lr)));
+        }
+        if self.run.steps == 0 {
+            if !self.run.checkpoint_at.is_empty() {
+                return Err(refuse(format!(
+                    "[run] `steps` is 0 and `checkpoint_at` is {:?}; a run that takes no \
+                     optimizer step has no step to also checkpoint at. Its one mark is 0",
+                    self.run.checkpoint_at
+                )));
+            }
+            return Ok(vec![0]);
         }
         let mut marks: Vec<u32> = self.run.checkpoint_at.clone();
         marks.push(self.run.steps);
@@ -574,6 +620,141 @@ impl Backbone {
     }
 }
 
+// --- starting from a policy (packet M8/S1) -----------------------------------------------
+
+/// `training/init.lock`, the thirteenth file of `<out>/training/` — written only by a recipe
+/// that names `[init] policy`, and its digest is what enters `config.json` and therefore
+/// `identity_hash` / `training_hash`.
+pub const INIT_LOCK: &str = "init.lock";
+
+/// What [`init_from`] decided: the lock to record and the tensors to hand the trainer.
+#[derive(Clone, Debug)]
+pub struct Init {
+    /// `training/init.lock`'s body, sorted names.
+    pub lock: Value,
+    /// The copied tensors, ready for `es_policy::weights::write_safetensors`.
+    pub weights: es_policy::weights::Checkpoint,
+    /// `copied.len()`, so the shell can print it without re-reading the lock.
+    pub copied: usize,
+    pub initialised: usize,
+}
+
+/// Compare `[init] policy`'s bundle to the module `target` lowers to, and copy what fits.
+///
+/// Three buckets and no fourth (the packet's schema): **copied** is a tensor whose name and
+/// shape the lowered module declares, **initialised** is a name the module declares and the
+/// bundle does not carry, and **`shape_mismatch`** is a name both know at two shapes — recorded
+/// and *not* copied, because reshaping a trained tensor is guessing and the failure mode of a
+/// guess here is a policy that still trains and still looks fine.
+///
+/// A `nodes.<k>.*` prefix claim covers a sub-module whose parameter names belong to
+/// torchvision or `torch.nn` (`es_policy::weights::validate_keys`). Its tensors are copied by
+/// name alone, because there is no declared shape on this side to check them against;
+/// `train_act.py --init-weights` checks each one against the real module before loading it,
+/// which is where the shape actually lives.
+///
+/// Zero copied is a refusal. A warm start that shares nothing with what it starts from is not
+/// a warm start, and letting it through would write a provenance record whose whole content
+/// is "none of this was used".
+pub fn init_from(source: &str, bundle: &[u8], target: &LearningGraph) -> Result<Init, DataError> {
+    let opened = es_compile::PolicyBundle::open(bundle)
+        .map_err(|e| refuse(format!("[init] `policy` {source}: {e}")))?;
+    let header = es_policy::weights::parse_header(&opened.weights)
+        .map_err(|e| refuse(format!("[init] `policy` {source}: {e}")))?;
+    let module = es_policy::lower_to_torch(target)
+        .map_err(|e| refuse(format!("the bundle being trained does not lower: {e}")))?;
+
+    let claims: Vec<&str> = module
+        .weight_keys
+        .iter()
+        .filter_map(|k| k.strip_suffix('*'))
+        .collect();
+    // Safetensors is eight bytes of header length, the header, then the data segment; an
+    // entry's offsets are relative to the end of the header. `parse_header` succeeded, so
+    // these eight bytes are there and the segment behind them is long enough.
+    let data_at = 8 + u64::from_le_bytes(
+        opened.weights[..8]
+            .try_into()
+            .expect("parse_header already read these eight bytes"),
+    ) as usize;
+
+    let (mut copied, mut mismatch) = (Vec::new(), Vec::new());
+    let mut weights = es_policy::weights::Checkpoint::new();
+    for (name, entry) in &header {
+        let declared = module.weight_shapes.get(name);
+        if declared.is_none() && !claims.iter().any(|p| name.starts_with(p)) {
+            // A tensor the module does not declare at all: not copied, and not one of the
+            // three buckets either -- the module has no slot to put it in.
+            continue;
+        }
+        if let Some(want) = declared {
+            if entry.shape != *want {
+                mismatch.push(json!({
+                    "name": name, "expected": want, "found": entry.shape,
+                }));
+                continue;
+            }
+        }
+        if entry.dtype != "F32" {
+            return Err(refuse(format!(
+                "[init] `policy` {source}: {name} is {}, and every tensor on this path is \
+                 F32 (spec 8.4). A second dtype here would be a second reader of one format",
+                entry.dtype
+            )));
+        }
+        let (a, b) = entry.offsets;
+        let bytes = &opened.weights[data_at + a as usize..data_at + b as usize];
+        let values = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        weights.insert(name.clone(), (entry.shape.clone(), values));
+        copied.push(name.clone());
+    }
+
+    let initialised: Vec<String> = module
+        .weight_keys
+        .iter()
+        .filter(|key| match key.strip_suffix('*') {
+            Some(prefix) => !header.keys().any(|k| k.starts_with(prefix)),
+            None => !header.contains_key(*key),
+        })
+        .cloned()
+        .collect();
+
+    if copied.is_empty() {
+        return Err(refuse(format!(
+            "[init] `policy` {source} shares no tensor with the module this recipe trains: \
+             {} name(s) the module declares are absent from the bundle and {} more disagree \
+             about a shape. Starting from a policy that shares nothing is a mistake, not a \
+             warm start -- the run would be `steps` steps from scratch under a document \
+             saying otherwise",
+            initialised.len(),
+            mismatch.len()
+        )));
+    }
+
+    // `copied` and `initialised` come out of a BTreeMap and a key list that is already
+    // sorted, but say it rather than rely on it: the lock's digest is a hash slot.
+    copied.sort();
+    let mut initialised = initialised;
+    initialised.sort();
+    Ok(Init {
+        copied: copied.len(),
+        initialised: initialised.len(),
+        lock: json!({
+            "schema_version": 1,
+            "source": source,
+            "policy_hash": opened.manifest.hashes.policy.as_ref().map(hex),
+            "learning_hash": opened.manifest.hashes.learning.as_ref().map(hex),
+            "copied": copied,
+            "initialised": initialised,
+            "shape_mismatch": mismatch,
+        }),
+        weights,
+    })
+}
+
 /// The camera directory `es dataset export --frames` looks in, for a feature key like
 /// `observation.images.rgb_overhead` (`lerobot::v3::camera_source`).
 pub fn camera_suffix(feature: &str) -> &str {
@@ -635,6 +816,16 @@ pub fn lerobot_checkpoint(out: &Path, step: u32) -> String {
 /// into the stem.
 pub fn ir_checkpoint(out: &Path, step: u32) -> String {
     under(out, &format!("weights/model-{step}.safetensors"))
+}
+
+/// `<out>/weights/init.safetensors` — the tensors [`init_from`] copied out of `[init] policy`,
+/// and the file the trainer is handed as `--init-weights` (packet M8/S1).
+///
+/// It is written, rather than the bundle handed over directly, because what the trainer loads
+/// has to be exactly what `init.lock` says was copied: a file holding the intersection cannot
+/// disagree with the list, and a whole checkpoint plus a list can.
+pub fn init_weights(out: &Path) -> String {
+    under(out, "weights/init.safetensors")
 }
 
 impl Plan {
@@ -741,6 +932,16 @@ impl Plan {
                             .base_model
                             .iter()
                             .flat_map(|path| [s("--init-backbone"), path.clone()]),
+                    )
+                    // Beside it, and for the same reason (packet M8/S1): the module's initial
+                    // state is a checkpoint, not a construction-time download. The file is
+                    // the *intersection* `init_from` wrote, so the trainer loads exactly the
+                    // names `training/init.lock` lists as copied.
+                    .chain(
+                        recipe
+                            .init
+                            .iter()
+                            .flat_map(|_| [s("--init-weights"), init_weights(out)]),
                     )
                     // The chain the bake left at the boundary (packet M7/T6). The file is
                     // spec 19.3's own `augmentation.json`, so what the trainer applies and
@@ -1108,6 +1309,10 @@ impl Cycle {
                 run: self.train.run.clone().ok_or_else(|| {
                     refuse("[train] is inline and has no `run` block: steps, batch, lr, seed")
                 })?,
+                // An inline `[train]` names no policy to start from: a cycle that continues
+                // one reaches `[init]` through `[train] recipe`, where the whole recipe --
+                // and its `init.lock` -- is one document (packet M8/S1).
+                init: None,
             },
         };
         if let Some(collect) = &self.collect {
@@ -1543,6 +1748,33 @@ impl Training {
         })
     }
 
+    /// The thirteenth slot (packet M8/S1): `training/init.lock`, and its digest inside
+    /// `config.json`.
+    ///
+    /// **Why the digest lives in `config.json`.** Spec 19.3 names twelve files and
+    /// `TrainingIdentity` has twelve fields; a thirteenth field would be a change to
+    /// `es_data::identity`, which this packet does not own. `config.json` is the "this is the
+    /// run as configured" slot, and a run that starts from a policy is configured by that
+    /// lock as much as by its recipe — so the lock's digest goes in there, the way
+    /// `TrainingIdentity.base_model.hash` is the digest of `base_model.lock` rather than the
+    /// file's contents. `identity_hash`, `training_hash` and §19.3's
+    /// `policy_hash = H(training_hash, checkpoint_hash)` all follow from it, and a recipe
+    /// without `[init]` never calls this, so its `config.json` is byte-for-byte the one it
+    /// always was.
+    ///
+    /// Called before [`Training::hash`] is read for the first time, i.e. while the identity
+    /// is still the pre-run one: what a run starts from is known before it starts.
+    pub fn set_init(&mut self, lock: &Value) -> Result<(), DataError> {
+        let text = canon_json(lock);
+        let digest = hex(blake3::hash(text.as_bytes()).as_bytes());
+        let mut config: Value = serde_json::from_str(self.file("config.json"))
+            .map_err(|e| refuse(format!("config.json does not parse: {e}")))?;
+        config["init"] = json!(digest);
+        self.files.insert(s("config.json"), canon_json(&config));
+        self.files.insert(s(INIT_LOCK), text);
+        Ok(())
+    }
+
     /// The three post-run slots, from what the run actually produced.
     pub fn finish(&mut self, checkpoints: &Value, metrics: &Value, hardware: &Value) {
         self.files
@@ -1559,11 +1791,14 @@ impl Training {
         *blake3::hash(self.file(name).as_bytes()).as_bytes()
     }
 
-    /// Every file's digest, for `training.lock`.
+    /// Every file's digest, for `training.lock` — the twelve, and `init.lock` when the run
+    /// has one (packet M8/S1).
     pub fn digests(&self) -> BTreeMap<String, String> {
         FILES
             .iter()
-            .map(|n| (s(*n), hex(&self.digest(n))))
+            .copied()
+            .chain(self.files.contains_key(INIT_LOCK).then_some(INIT_LOCK))
+            .map(|n| (s(n), hex(&self.digest(n))))
             .collect()
     }
 
@@ -1598,9 +1833,13 @@ impl Training {
         self.identity().training_hash()
     }
 
-    /// Writes the twelve files under `<dir>`.
+    /// Writes the twelve files under `<dir>`, and `init.lock` beside them when there is one.
     pub fn write(&self, dir: &Path) -> Result<(), DataError> {
-        for name in FILES {
+        for name in FILES
+            .iter()
+            .copied()
+            .chain(self.files.contains_key(INIT_LOCK).then_some(INIT_LOCK))
+        {
             crate::write_file(&dir.join(name), self.file(name).as_bytes())?;
         }
         Ok(())

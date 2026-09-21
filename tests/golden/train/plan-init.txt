@@ -1,0 +1,5 @@
+# route: ir
+es dataset bake --policy runs/collect-001/untrained.esb --out baked --frames runs/collect-001/frames runs/collect-001/ds
+es policy lower --policy runs/collect-001/untrained.esb --out module
+python python/es/train_act.py --module module --baked baked --out weights/model.safetensors --checkpoint-at 0 --seed 0 --batch 8 --lr 0.0001 --device cuda --loss-curve metrics/loss.json --init-weights weights/init.safetensors
+es policy pack --policy runs/collect-001/untrained.esb --weights weights/model-0.safetensors --out checkpoints/0.esb
