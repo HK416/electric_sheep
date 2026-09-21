@@ -10956,12 +10956,6 @@ fn train_rl_init_from_import() {
 // --- packet M8/S4d: the reach task's four documents -------------------------------------------
 
 /// `tests/fixtures/rl/<name>`.
-fn rl_fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/rl")
-        .join(name)
-}
-
 /// The six actuated joints in the XML's declaration order, which is also `qpos[0..6]`,
 /// `qvel[0..6]` and `ctrl[0..6]`.
 const REACH_JOINTS: [&str; 6] = [
@@ -11375,6 +11369,8 @@ fn reach_learning_stand_in() -> LearningGraph {
             inputs: vec![state.clone()],
             kind: StateEncoderKind::Mlp {
                 hidden: vec![64, 64],
+                activation: es_ir::learning::Activation::Relu,
+                activate_output: false,
             },
             out_dim: 64,
         },
@@ -11386,6 +11382,7 @@ fn reach_learning_stand_in() -> LearningGraph {
             kind: HeadKind::Regression,
             action_dim: 6,
             horizon: 1,
+            squash: es_ir::learning::Squash::None,
         },
     );
     nodes.insert(
