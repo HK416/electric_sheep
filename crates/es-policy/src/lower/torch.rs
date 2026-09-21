@@ -15,9 +15,9 @@ use std::fmt::Write as _;
 
 use es_ir::graph::{IrNode, NodeId};
 use es_ir::learning::{
-    BetaSchedule, DiffusionScheduler, FusionKind, HeadKind, LearningGraph, LearningNode,
-    NormalizeDir, PredictionType, StateEncoderKind, StatsSource, TemporalKind, VarianceType,
-    VisionBackbone,
+    Activation, BetaSchedule, DiffusionScheduler, FusionKind, HeadKind, LearningGraph,
+    LearningNode, NormalizeDir, PredictionType, Squash, StateEncoderKind, StatsSource,
+    TemporalKind, VarianceType, VisionBackbone,
 };
 use es_ir::types::ElemType;
 use es_ir::Diagnostic;
@@ -26,6 +26,18 @@ use crate::weights::WEIGHT_PREFIX;
 
 /// Domain separator for [`TorchModule::lowering_hash`].
 const LOWERING_TAG: &str = "es.lowering.torch.v1";
+
+/// The `torch.nn` module one [`Activation`] lowers to (packet M8/S2a). `Relu` is what the
+/// lowering emitted before the parameter existed, so a default `Mlp` produces byte-identical
+/// source and `lowering_hash` does not move.
+fn activation_module(activation: Activation) -> &'static str {
+    match activation {
+        Activation::Relu => "nn.ReLU()",
+        Activation::Elu => "nn.ELU()",
+        Activation::Swish => "nn.SiLU()",
+        Activation::Tanh => "nn.Tanh()",
+    }
+}
 
 /// Attention heads in a lowered `TemporalEncoder { Transformer }`. Spec 8.3's node parameters
 /// do not carry a head count, so it is a lowering constant; a checkpoint that disagrees fails
@@ -647,19 +659,29 @@ impl Lowering {
 
             LearningNode::StateEncoder { kind, out_dim, .. } => match kind {
                 StateEncoderKind::Identity => Ok(args[0].clone()),
-                StateEncoderKind::Mlp { hidden, .. } => {
+                StateEncoderKind::Mlp {
+                    hidden,
+                    activation,
+                    activate_output,
+                } => {
                     let mut dims = vec![in_dim(node, 0, id)?];
                     dims.extend(hidden.iter().map(|h| u64::from(*h)));
                     dims.push(u64::from(*out_dim));
+                    let act = activation_module(*activation);
                     let mut layers = Vec::new();
                     for (i, w) in dims.windows(2).enumerate() {
                         if i > 0 {
-                            layers.push("nn.ReLU()".to_owned());
+                            layers.push(act.to_owned());
                         }
                         layers.push(format!("nn.Linear({}, {})", w[0], w[1]));
                         let at = layers.len() - 1;
                         self.exact(id, &format!("{at}.weight"), vec![w[1], w[0]]);
                         self.exact(id, &format!("{at}.bias"), vec![w[1]]);
+                    }
+                    // After the *last* Linear too, when the node asks for it: an activation
+                    // carries no weights, so no key or shape moves either way (packet M8/S2a).
+                    if *activate_output {
+                        layers.push(act.to_owned());
                     }
                     self.member(id, &format!("nn.Sequential({})", layers.join(", ")));
                     Ok(format!("self.n{k}({})", args[0]))
@@ -749,15 +771,19 @@ impl Lowering {
                 kind,
                 action_dim,
                 horizon,
+                squash,
                 ..
             } => match kind {
                 HeadKind::Regression => {
                     let width = u64::from(*horizon) * u64::from(*action_dim);
                     self.linear(id, in_dim(node, 0, id)?, width);
-                    Ok(format!(
-                        "self.n{k}({}).reshape(-1, {horizon}, {action_dim})",
-                        args[0]
-                    ))
+                    // Before the reshape, so the squash is a function of the head's output and
+                    // not of the chunk's layout (packet M8/S2a).
+                    let out = match squash {
+                        Squash::None => format!("self.n{k}({})", args[0]),
+                        Squash::Tanh => format!("torch.tanh(self.n{k}({}))", args[0]),
+                    };
+                    Ok(format!("{out}.reshape(-1, {horizon}, {action_dim})"))
                 }
                 HeadKind::Diffusion {
                     n_steps,

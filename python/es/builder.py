@@ -568,14 +568,17 @@ class Learning:
             {"inputs": [{"name": "in0", "ty": _port_type()}], "kind": kind, "n_frames": 1, "out_dim": 1, "token_count": 0},
         )
 
-    def head(self, kind: str, horizon: int, action_dim: int = 7) -> int:
+    def head(self, kind: str, horizon: int, action_dim: int = 7, squash: str = "None") -> int:
+        # `squash` is `Squash::None` by default, which is the value an absent field means, so
+        # writing it out changes no hash (packet M8/S2a). `"Tanh"` is refused off a
+        # `"Regression"` head with `LRN-031`.
         self._last_head_horizon = horizon
         self._head_action_dim = action_dim
         return self.add(
             "PolicyHead",
             {
                 "inputs": [{"name": "in0", "ty": _feature_ty(self._fusion_out)}],
-                "kind": kind, "action_dim": action_dim, "horizon": horizon,
+                "kind": kind, "action_dim": action_dim, "horizon": horizon, "squash": squash,
             },
         )
 
