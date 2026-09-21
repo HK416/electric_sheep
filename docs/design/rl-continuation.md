@@ -527,6 +527,41 @@ scale the fold exposes (a policy whose input carries a channel amplified 5,600×
 moved in training is a policy E4 would have caught); and open question 2, still measured at 1.00
 and still ahead of both in every other row of this note.
 
+### T2 — the delta source policy, oracle server `renderer-14`, 2026-09-21
+
+Artifacts: `~/artifacts/plan-t/t2/seed0-run{1,2}/`. Venv `~/venvs/es-rl` (the §1 pins of
+`docs/api-notes/brax-ppo-so101.md`, unchanged). Full detail and the training curve are that
+note's section 7; these are the rows plan T is measured on.
+
+The same brax stack, the same derived scene and the same 2 M-step budget, with the action read
+as a per-tick increment (`target_t = clip(target_{t−1} + 0.05 · clip(a, −1, 1), ctrlrange)`,
+`target_0` = the reset pose):
+
+| row | delta | position (S2c) |
+|---|---|---|
+| `source.npz` bitwise across two same-seed runs | **yes** (`473b4fde…`) | yes (`8c0faf01…`) |
+| `success_reached` over 64 episodes, source framework | **1.00** (64/64) | 1.00 |
+| final distance, mean / max | **3.20 / 6.72 mm** | 8.41 / 14.65 mm |
+| return, mean | 126.81 | 188.11 |
+| `check_export.py`, in-distribution max abs error | 9.537e-07 | 1.580e-06 |
+| wall clock, 2 M steps, 4,096 envs | 561.3 s | 540.6 s |
+
+The return is lower and the policy is *better*: a delta action cannot jump to the target, so the
+first ~24 ticks of every episode pay the distance penalty while the arm travels. Success and
+final accuracy are what the task asks for, and both improved.
+
+**The per-tick command change, the number T3 compares the clamp rate against** —
+`|target_t − target_{t−1}|` over 64 × 200 × 6 values:
+
+| | mean | p95 | max |
+|---|---|---|---|
+| per joint and tick | 0.01006 rad | 0.03219 rad | 0.04991 rad |
+| per tick, largest of the six joints | 0.02090 rad | 0.04303 rad | 0.04991 rad |
+
+0.05 rad/tick at 50 Hz is 2.5 rad/s against the envelope's 3.0 rad/s, and the observed maximum
+is the cap to four digits: the increment itself never asks for more than the plane allows, so
+what T3 will see clamped is the *integrated* target against the position limits, not the step.
+
 ## 8. The importer and the adapter
 
 Rule 3 of section 1 says the adapter declares and code never guesses. This is what that comes
