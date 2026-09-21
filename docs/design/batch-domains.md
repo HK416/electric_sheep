@@ -158,10 +158,30 @@ lowers the *scalar cone* feeding each sink into an `es_ir::task::Expr` once, at 
 (`plan.rs`), then evaluates it per env per tick with `Expr::eval`, which already exists and is
 already specified as deterministic (fixed op order, `None` instead of `NaN`).
 
-Supported in a cone: `GetJointState`, `GetSensor`, `GetTime`, `GetContact` (leaves, bound to
-named ports), `Arith`, `Compare`, `Clamp`. Every other node kind in a reward or terminate cone
-is `EnvError::Unsupported("<kind> in a reward cone")`. Port names are
-`joint.<id>.<quantity>[i]`, `sensor.<id>[i]`, `time`, `contact.<a>.<b>`.
+Supported in a cone: `GetJointState`, `GetSensor`, `GetTime` and `GetBodyPose` (leaves, bound
+to named ports), `Arith`, `Compare`, `Clamp`, `Normalize`, `Logic` and `Norm { kind: L2 }`.
+Every other node kind in a reward or terminate cone is
+`EnvError::Unsupported("<kind> in a reward or termination cone")` — named, never approximated.
+A port is named for the state index its leaf reads: `qpos[i]`, `qvel[i]`, `sensor[i]`,
+`xpos[i]`, `time`, `time.episode`.
+
+**Lanes** (packet M8/S4d). Lowering returns one `Expr` *per lane*, not one `Expr`. A scalar
+leaf is one lane; `GetBodyPose { relative_to: World }` is three — the body's world position
+out of `StateView::xpos`, at the row `ModelInfo::body` gives it, so the distance between two
+bodies is spellable at last. `Arith` between equal lane counts is lane-wise and a one-lane
+operand broadcasts over the other side; `Norm { kind: L2 }` collapses `n` lanes to `Sqrt` of
+the squares summed **in lane order** (`DET-020`), which fixes the association as
+`Sqrt(((x*x + y*y) + z*z))` on every backend and every run. `Compare`, `Clamp`, `Normalize`,
+`Logic` and both sinks require exactly one lane, and a vector reaching them is a named error
+rather than a silent first lane: scoring a cube's `x` as if it were a distance is the bug this
+rule exists to prevent. The orientation port, any frame but `World`, `L1` / `Linf`, and a body
+the loaded model does not index are each refused by name too.
+
+**`sqrt` is not a `DET-010` transcendental** (§6.6). IEEE 754 requires a correctly rounded
+square root — one hardware instruction, the same bits on every target — unlike `exp` or `sin`,
+which need `es-math::approx`. `Expr::Sqrt` is therefore the whole cost of the body-distance
+cone in `es-ir-types`, and a negative radicand is `None` like every other non-finite result,
+never a `NaN`.
 
 Reward aggregation is `sum(weight * term)` over `Reward` nodes in ascending `NodeId`; `Mean`,
 `Min`, `Max` aggregate the elements of a vector term and are single-element no-ops here.
