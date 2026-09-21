@@ -33,7 +33,7 @@ use es_env::scheduler::BatchDomains;
 use es_env::{Env, EnvMetrics};
 use es_eval::runner::{capture, input_sources, joint_state, Capture};
 use es_eval::LightOverride;
-use es_ir::deployment::{ExecutionMode, Micros};
+use es_ir::deployment::{ActionSpace, ExecutionMode, Micros};
 use es_ir::types::ElemType;
 use es_physics_backend::MuJoCoCpuBackend;
 use es_physics_core::backend::{PhysicsBackend, StateView};
@@ -111,6 +111,10 @@ pub struct Rollout<const NJ: usize, const H: usize> {
     /// `StableId`s and index ranges, and a trainer needs the names a human wrote.
     scene: SceneDesc,
     mode: ExecutionMode,
+    /// What a sampled row means (spec 8.5). `JointPosition` is a target;
+    /// [`ActionSpace::JointDelta`] is an increment `absolute_target` adds to the plane's last
+    /// executed command (packet M9/T1).
+    space: ActionSpace,
     n_envs: usize,
     /// The **control** tick, which is the plane's clock (packet M5/V17) and what `now` is
     /// stamped with. `Env::tick` counts simulation ticks, `inference.period` per control step.
@@ -200,6 +204,7 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
             sources,
             scene,
             mode: deploy.execution,
+            space: deploy.action.space,
             n_envs: n_envs as usize,
             step: 0,
             seq: 0,
@@ -270,7 +275,10 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
     /// One control step: the plane validates every env's sampled action, `Env::step` executes
     /// what the plane returned.
     ///
-    /// `actions` is `[n_envs * NJ]` in actuator units. The per-env order is
+    /// `actions` is `[n_envs * NJ]` in the unit the deployment's `action.space` names --
+    /// absolute targets under `JointPosition`, increments on the current target under
+    /// `JointDelta`, which `es_env::chunk_buffer::absolute_target` integrates against the
+    /// plane's last executed command (spec 8.5, packet M9/T1). The per-env order is
     /// `run_episode`'s — `observe_state`, `heartbeat`, `validate` — and `Env::step` is handed
     /// `SafeAction::q` and nothing else: there is no path around the plane (`INV-12`).
     pub fn act(&mut self, actions: &[f64]) -> Result<Act, RolloutError> {
@@ -294,6 +302,15 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
                 plane.heartbeat(now);
                 let mut rows = [[0.0; NJ]; H];
                 rows[0].copy_from_slice(&actions[i * NJ..(i + 1) * NJ]);
+                // Read after `observe_state`, so the first tick of an episode integrates from
+                // the measured pose the plane just seeded and every later tick from what the
+                // arm was actually told to do -- never from the raw sample, which is what
+                // keeps a clamped increment from accumulating (spec 8.5).
+                rows[0] = es_env::chunk_buffer::absolute_target(
+                    self.space,
+                    &plane.last_safe_action(),
+                    &rows[0],
+                );
                 // One fresh row per control tick under its own `seq`: the plane accepts a
                 // chunk it has not seen and its cursor starts at row 0 (§8.6). The
                 // observation is this tick's, so its age is zero.

@@ -14,7 +14,7 @@ use es_core::{PhysTick, StableId, TickRate};
 use es_env::scheduler::BatchDomains;
 use es_env::traj::Trajectory;
 use es_env::{plane_chunk, AsyncInference, ChunkBuffer, Env, Episode, PlaneFeed};
-use es_ir::deployment::{DeploymentIr, ExecutionMode, Micros};
+use es_ir::deployment::{ActionSpace, DeploymentIr, ExecutionMode, Micros};
 use es_ir::evaluation::{
     AcceptanceResult, CellResult, EvaluationIr, EvaluationReport, MetricSpec, MetricValue, SeedPlan,
 };
@@ -672,6 +672,7 @@ impl Evaluation {
                     &ms_to_steps,
                     cfg.action_output.as_deref(),
                     deploy.execution,
+                    deploy.action.space,
                     &mut buffer,
                     &mut feed,
                     &mut inference,
@@ -910,6 +911,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     ms_to_steps: &dyn Fn(u32) -> usize,
     action_output: Option<&str>,
     mode: ExecutionMode,
+    space: ActionSpace,
     buffer: &mut ChunkBuffer<NJ, H>,
     feed: &mut PlaneFeed,
     inference: &mut AsyncInference,
@@ -1079,14 +1081,23 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
             let apply_at = sub.submit_tick.saturating_add(inference.latency_ticks());
             buffer.push(&chunk, apply_at);
         }
-        let (fed, _commanded) = plane_chunk(buffer, feed, u64::from(step), mode);
-
         // Before every `validate`, exactly like `es_data::Collector`, `es_ros2::hil` and
         // `es_runtime_embedded`: the plane decides that only the first call of an episode
         // seeds the command chain, so the envelope bounds the plane's own commands and not
         // the servo's following error (packet M5/V6, design note section 7.12).
+        //
+        // **Above `plane_chunk` since packet M9/T1** (it stood one line below). The two touch
+        // nothing in common -- one moves the plane's seed, the other the buffer's cursor -- so
+        // no `JointPosition` step moved; and the integrator below needs the seeded pose on the
+        // first tick of an episode rather than the previous episode's last command.
         let (q, qd) = joint_state::<NJ>(&env.backend().state());
         safety.observe_state(&q, &qd);
+        // The integrator state of packet M9/T1 is the plane's own last executed command
+        // (`es_env::chunk_buffer::absolute_target`): the pose just seeded, on the first tick of
+        // an episode; what the arm was last told to do, after that. Unread for every absolute
+        // space, so `JointPosition` runs exactly as it did.
+        let prev = safety.last_safe_action();
+        let (fed, _commanded) = plane_chunk(buffer, feed, u64::from(step), mode, space, &prev);
         // **The plane's clock is the control tick, not the simulation tick** (packet M5/V17).
         // `SafetyPlane` turns a tick difference into microseconds with the Deployment IR's
         // *control* period (`es_safety::config`, `period_us = rate.control_period()`), so a
