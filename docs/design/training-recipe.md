@@ -544,3 +544,180 @@ recipe for the measured 20,000-step run at batch 8, and the plan golden beside i
 `--dry-run` has to keep producing; showing the new field there would move both. The field is
 documented above and exercised by `cli::train_identity_moves_with_the_schedule`, which builds
 its own recipe.
+
+---
+
+## 11. The cycle (packet M7/T2)
+
+§13.1 draws the loop — collect, train, evaluate, watch — and T1 made one rung of it a
+command. The other three stayed four commands whose paths and hashes a person threaded by
+hand, and `loop.jsonl` stopped at `distill`: it never recorded that a dataset trained a policy
+or that a policy was judged. `es loop cycle` is the whole rung under one document and one
+ledger.
+
+```
+es loop cycle --recipe <cycle.toml> [--out <dir>] [--dry-run] [--from <stage>]
+              [--allow-new-evaluation] [--skip-expert-gate]
+```
+
+### 11.1 The document names the stages; it does not re-describe them
+
+```toml
+kind  = "cycle"
+scene = "tests/fixtures/mjcf/so101_pick_place.xml"
+
+[collect]                        # optional; `dataset = "<root>"` instead, to reuse one
+policy   = "runs/collect-001/untrained.esb"
+expert   = "so101-pick-place"    # omit for a trained policy's own rollouts
+episodes = 200
+seed     = 1
+frames   = true
+
+[train]
+recipe = "tests/fixtures/visible-learning/training.toml"   # T1's, by path or inline
+
+[eval]
+config     = "tests/fixtures/visible-learning/evaluation.toml"
+checkpoint = "last"              # or a mark the recipe's `checkpoint_at` writes
+jobs       = 6
+frames     = true
+
+[showcase]                       # optional; needs the `render` feature
+cell    = "nominal-00"
+eye     = [0.66, -0.46, 0.52]
+look_at = [0.14, -0.04, 0.04]
+fov     = 36
+width   = 1280
+height  = 720
+```
+
+The rule section 2 states for the recipe holds here too: **a cycle carries no parameter a
+stage already owns**. `[train]` is T1's recipe by path — not a copy of its fields — and
+`[eval]` is an Evaluation IR by path, so `evaluation_hash` is the document's own and not a
+rendering of it. The one thing the cycle *does* override is the training recipe's
+`[dataset] root`/`frames`: they become this cycle's collect output, because a cycle whose
+training read some other directory chains nothing (§13.3). That override is visible in the
+nested plan rather than in a rewritten file.
+
+**Every stage is the function the command already is** — `cmd::r#loop::collect`,
+`cmd::eval::run`, `cmd::train::run`, `cmd::showcase::run` — called in-process with the same
+words the plan prints, so a printed line and an executed stage cannot drift. Only what those
+already spawn (the physics subprocess, the trainer, `--jobs` workers) is a process.
+`crates/es/src/cmd/cycle.rs` is thin for T1's reason: the document, the plan and the ledger
+steps are `es_data::training` and `es_data::collect`, which are headless and unit-tested.
+
+### 11.2 The stage plan is a golden
+
+`--dry-run` prints one line per stage, every path under `<out>` written relative to it, every
+separator a `/`, and T1's plan indented under the `train` line — the same three rules that
+make the training plan a property of the recipe alone (section 3):
+
+```
+# cycle: collect -> expert-gate -> train -> eval -> showcase
+es loop collect --policy runs/collect-001/untrained.esb --scene .../so101_pick_place.xml --episodes 200 --seed 1 --out collect/ds --frames collect/frames --expert so101-pick-place
+es eval run --config .../evaluation.toml --policy runs/collect-001/untrained.esb --scene .../so101_pick_place.xml --out eval-expert --jobs 6 --frames eval-expert/frames --expert so101-pick-place
+es train --recipe .../training.toml --out train
+  # route: ir
+  es dataset bake --policy runs/collect-001/untrained.esb --out train/baked --frames collect/frames collect/ds
+  ...
+es eval run --config .../evaluation.toml --policy train/checkpoints/20000.esb --scene .../so101_pick_place.xml --out eval --jobs 6 --frames eval/frames
+es video showcase --run eval --scene .../so101_pick_place.xml --out showcase --cell nominal-00 --eye 0.66,-0.46,0.52 --look-at 0.14,-0.04,0.04 --fov 36 --width 1280 --height 720
+```
+
+`tests/golden/train/plan-cycle.txt` pins it byte for byte. Nothing on disk is read to build
+it — not the dataset, not the bundle, not Python — which is what makes it judgeable in CI on a
+machine that has none of them. A run that did not happen writes nothing, not even a directory.
+
+### 11.3 Two refusals are the point of the command
+
+**The harness passes the expert first** (§28.9 rule 1, M5-R1). With `[collect] expert` set,
+the cycle runs the expert through `es eval run` on the *same* `[eval] config` **before**
+anything trains, and a failed acceptance stops the cycle. A harness the expert cannot pass is
+a harness no policy can pass, and a GPU-hour of training is an expensive way to discover that.
+The gate's report is kept beside the policy's, under `<out>/eval-expert/`, because the
+evidence has to survive the run that comes after it. `--skip-expert-gate` runs anyway and
+records the deviation in the ledger (`expert_gate = "skipped (--skip-expert-gate)"`), so a
+cycle that trained without the gate does not look like one that passed it.
+
+**A moved `evaluation_hash` is refused by name** (§13.3). `<out>` is reused for iteration 2,
+so `<out>/loop.jsonl` may already hold an `evaluate` step. If the new one's `evaluation_hash`
+differs, the comparison the ledger invites is not one — §13.3's "keeping the evaluation
+conditions fixed while changing only data·policy is the discipline" — and the cycle refuses
+with **both hashes printed**, before a GPU is touched (the check runs under `--dry-run` too,
+because the evaluation conditions are a property of the document). `--allow-new-evaluation` is
+the deliberate act that starts a new comparison. From iteration 2 on, `es eval compare` runs
+on the two reports at the end: the previous `report.json` is moved to `report-prev.json`
+before the new one overwrites it.
+
+### 11.4 `--from <stage>` resumes, and checks before it does
+
+`--from collect|train|eval|showcase` skips the earlier stages and reads their outputs from
+under `<out>`. It refuses if they are missing or disagree with the ledger: the dataset's
+recomputed `content` against the ledger's `collect` step, the checkpoint bundle on disk and
+its `policy_hash` in `training.lock`, and `eval/report.json` for `--from showcase`. A resumed
+cycle whose stages are not one cycle is the failure mode this exists to prevent.
+
+### 11.5 The ledger reaches the end of the loop
+
+`loop.jsonl` gains `train` and `evaluate` steps and `es_data::check_chain`; both are described
+in `docs/design/learning-loop.md` section 4.1, which is their home. The cycle appends each to
+the dataset root's ledger and to `<out>/loop.jsonl`, and calls `check_chain` once the run is
+over. One real cycle's ledger, in order:
+
+```
+collect  ->  evaluate (the expert gate)  ->  train  ->  evaluate (the policy)
+```
+
+### 11.6 Deviation from the packet — `es eval run --expert`
+
+The packet allows touching `eval.rs` **only** to expose its entry as `pub(crate)`. The
+implementation also added a flag: `es eval run --expert <name>`, which drives the scripted
+demonstrator instead of the bundle's weights (`ExpertPolicy` and `SeenState` in
+`crates/es/src/cmd/loop.rs`, wired through `crates/es/src/cmd/eval.rs`). This is recorded as a
+deviation rather than argued away, but the gate cannot exist without it: the packet's own
+spec says the gate is "the expert through `es eval run` on the same `[eval].config`", and
+before T2 there was no way to run `es eval run` on anything but a policy's weights. The
+scaffold itself is not new — `expert_passes_the_evaluation_harness` has driven the harness
+with the expert since packet M5/V6; T2 promoted it out of the test file into the command that
+needs it. `ExpertPolicy` is an impl of `PolicyRuntime`, one of INV-17's seven, not an eighth
+extension point.
+
+What it changes for a run *without* the flag: nothing. Every existing eval test is unchanged,
+`--expert` is `None` on every path that does not pass it, and the `TorchRuntime` load is
+skipped only when it is `Some` (the expert loads no weights, the same trade `es loop collect
+--expert` already makes). `--expert` without `--frames` is a usage error, because the expert
+reads the cube's pose out of the state the frame source is handed and nothing else on this
+path gives a policy privileged state.
+
+**The one thing to review.** The episode boundary the expert's `reset` keys off is detected by
+an **exact-zero-velocity heuristic**: `Env::reset` zeroes `qpos`/`qvel` before the Task IR's
+`Randomization` node writes the cube's pose, and an episode's first tick always reaches the
+frame source (the observation ring is empty there, so `observation_delay` cannot drop it), so
+a state whose every velocity is exactly `0.0` is that tick and no other. The `ponytail:`
+comment on `Seen::episodes` names the ceiling. A mid-episode state with every velocity exactly
+zero would restart the expert's stage machine, which fails that episode loudly rather than
+passing the gate quietly — the safe direction for a gate to be wrong in — but the runner
+having no episode hook at all is the real gap. **This is an M7 review item**: either
+`es_eval::Evaluation` grows an episode-boundary callback (the intervener hook `es loop
+collect` already has), or the gate accepts the heuristic on the record.
+
+### 11.7 The oracles
+
+| # | Command | Needs |
+|---|---|---|
+| 1 | `cargo test -p es --test cli cycle_dry_run_plan_is_the_golden` | nothing |
+| 2 | `cargo test -p es-data loop_train_and_evaluate_steps_chain` | nothing |
+| 3 | `cargo test -p es --test cli cycle_refuses_a_moved_evaluation_hash` | nothing |
+| 4 | `cargo test -p es --test cli cycle_runs_the_expert_through_the_harness_first -- --ignored` | `ES_PYTHON` (torch, mujoco), `--features render` |
+| 5 | `cargo xtask ci`; `cargo xtask check-scope docs/packets/M7/T2-loop-cycle.md` | nothing |
+
+Oracle 4 on the oracle server (RTX 4090, `ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python`,
+`--features render`; 33.27 s):
+
+```
+RAN cycle_runs_the_expert_through_the_harness_first: expert gate success_rate 1, policy success_rate 0 at policy_hash b58893a9a48a9da2020a4414baa87db3517bc7f3fc7ac93130d31041510fd95f
+```
+
+The gate passes on the harness cut to two seeds; the 40-step policy does not, which is what a
+40-step policy is. That asymmetry is the oracle's subject: the gate ran, it ran **first**, and
+the ledger chained `collect -> evaluate -> train -> evaluate`.
