@@ -4160,6 +4160,232 @@ that closed the milestone is V19b's, and it still holds.
 Two things a human may want to decide are in section 12: question 24 is answered here, and the
 new question 32 is `import-lerobot`'s invented latency (29–31 are `docs/design/training-recipe.md` section 9's) now that it decides numbers.
 
+### 7.31 As built (M7/U): the IR graph re-measured after T3–T6, and what the stop rule says
+
+Packet `docs/packets/M7/U-measurement.md`. §28.10 allows the IR-graph policy to be re-measured
+**once** on the committed documents, because T3 (the batch axis), T4 (warmup + cosine at batch
+64), T5 (the ImageNet backbone) and T6 (training augmentation) all moved the lowering or the
+trainer under it. This is that measurement: four configurations, V15's same 200 demonstrations,
+20,000 optimizer steps at T4's row-D settings for every one of them (batch 64, lr 4e-4,
+`warmup_cosine` warmup 250, `lr_min` 1e-6, seed 0, `--resident-gpu`, `device = "cuda"`), under
+T7's latency model. Nothing was tuned; a row that diverged is a row with a number in it.
+
+**The stop rule, applied, and it is not a one-line answer.** §28.10 fixes it as: *if held-out
+does not exceed V18b's 0.625 after T5, IR-graph tuning ends here and the product is the external
+route's speed.* **U1 — after T5 — is 0.0000**, because the run diverged (below). **U3 — after
+T5 and T6 — is 0.5625**, and 0.5625 < 0.625, so **on the literal reading the stop rule fires.**
+The like-for-like reading says the opposite and a human has to choose between them: V18b's 0.625
+was taken at zero evaluation latency, and section 7.30 re-measured that same checkpoint under
+the latency its own document declares and got **0.0625**. Against the number produced by the
+evaluator U0–U3 ran on, U3 is 9× V18b and is **the first IR-graph policy to pass the demo's
+acceptance under T7's latency model** (`passed = true`, held-out and training seeds both). Two
+things temper that: U3's Observation IR is a *different document* (see the hash note below), and
+0.5625 is still below the external ACT's 0.9375 at zero latency / its own 0.9375 under T7
+(section 7.30). The packet forbids a fifth configuration, so this note states both readings and
+the M7 review decides which one §28.10 meant.
+
+**The four rows.** Every number below is `es eval run --jobs 6 --frames`, the committed
+`evaluation.toml` (16 held-out seeds 101–116 × six suites) and `~/artifacts/plan-v/v15/eval-trainseeds.toml`
+(nominal, training seeds 1–16), on the oracle server (RTX 4090, 16 cores). U0/U1 and the
+showcase ran from `~/Projects/es-u` at commit **`3e6a2e8`**; U2/U3 from the same path
+re-archived at **`7c9d954`** (T6 landed in between), `cargo build --release --features render`,
+`ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python` (torch 2.11.0+cu129).
+
+| row | Learning IR | Observation IR | trained | held-out `success_rate` | training seeds | held-out `envelope_violation_rate` | `passed` |
+|---|---|---|---|---|---|---|---|
+| **U0** | `learning.toml` | `observation.toml` | T4 row D, not re-run | 0.2500 | 0.1250 | 0.4409 | false |
+| **U1** | `learning-pretrained.toml` | `observation.toml` | `es train`, **diverged** | **0.0000** | 0.0000 | 1.0000 | false |
+| **U2** | `learning.toml` | `observation-augmented.toml` | T6's own run, not re-run | 0.1875 | 0.0625 | 0.4279 | false |
+| **U3** | `learning-pretrained.toml` | `observation-augmented.toml` | `es train` | **0.5625** | **0.5625** | 0.6668 | **true** |
+
+**The six-suite sweep, held-out seeds** (`success_rate` / `envelope_violation_rate` / mean
+`episode_length`; the `nominal` row is the held-out column above, because the committed
+`evaluation.toml` is one document and its nominal suite *is* the held-out measurement):
+
+| suite | U0 | U1 | U2 | U3 |
+|---|---|---|---|---|
+| nominal | 0.2500 / 0.4409 / 1492.7 | 0.0 / 1.0 / 1800.0 | 0.1875 / 0.4279 / 1525.4 | **0.5625** / 0.6668 / 1092.1 |
+| light_intensity | 0.0625 / 0.4542 / 1699.4 | 0.0 / 1.0 / 1800.0 | 0.0000 / 0.4392 / 1800.0 | **0.6250** / 0.6236 / 921.1 |
+| light_direction | 0.0625 / 0.4865 / 1711.8 | 0.0 / 1.0 / 1800.0 | 0.0000 / 0.4178 / 1800.0 | 0.1875 / 0.7265 / 1634.6 |
+| observation_delay | 0.0625 / 0.5550 / 1721.8 | 0.0 / 1.0 / 1800.0 | 0.0000 / 0.5294 / 1800.0 | 0.2500 / 0.6506 / 1502.2 |
+| torque_noise | 0.0000 / 0.6193 / 1800.0 | 0.0 / 1.0 / 1800.0 | 0.0625 / 0.7975 / 1709.8 | 0.0000 / 0.7157 / 1800.0 |
+| backlash | 0.0625 / 0.4114 / 1699.4 | 0.0 / 1.0 / 1800.0 | 0.0000 / 0.4081 / 1800.0 | 0.4375 / 0.7031 / 1244.0 |
+
+`torque_noise` is the suite no IR-graph policy in this table survives, which is what sections
+7.28 and 7.30 already recorded of the IR graph and of the external ACT alike: a 96×96 frame
+cannot see torque.
+
+**Both evaluation hashes, and why there are two.** U0/U1 were judged by the committed
+`evaluation.toml` — `evaluation_hash e52e8360…` (V18b's own) — and by
+`v15/eval-trainseeds.toml`, `b49fc549…`. U2/U3 cannot be: their Observation IR is
+`observation-augmented.toml`, `observation_hash cc437a24…` against the committed `899c16a9…`,
+and an Evaluation IR names the observation it judges. So their documents are the committed two
+with that single field replaced (`~/artifacts/plan-v/m7-u/evaluation-augmented.toml`,
+`eval-trainseeds-augmented.toml`; a `diff` with the field put back is empty), and their hashes
+are **`e5705cb0…`** and **`10af1061…`**. §13.3: **U2/U3 are a new comparison.** Their seeds,
+suites, perturbation parameters, budget and acceptance are the same bytes as U0/U1's, so a
+reader may compare them by judgement; the chain does not, and no row above is claimed to be
+chained to another across that boundary. Two consequences worth naming: `es eval compare`
+accepts a pair of reports whose `evaluation_hash` differs **without saying so** (`es loop cycle`
+refuses exactly that — `training-recipe.md` 12.3), which is open question 36; and
+`execution_hash` is one per *policy*, not per document — U0's held-out and training-seed runs
+both report `fee0e20b…` — because §5.3's chain has no evaluation slot.
+
+Per row: U0 `execution_hash fee0e20b…`, U1 `d85f108b…`, U2 `37e4909f…`, U3 `a2283994…`.
+
+**What each bundle is.**
+
+| row | `learning_hash` | `observation_hash` | `lowering_hash` | `policy_hash` (§5.3) | bundle |
+|---|---|---|---|---|---|
+| U0 | `5dac0a46…` | `899c16a9…` | `3d06811c…` | `f9fb5260…` | `m7-u/U0/u0.esb` |
+| U1 | `fdb5178a…` | `899c16a9…` | `41d11a06…` | `e77fbc91…` | `m7-u/U1/train/checkpoints/20000.esb` |
+| U2 | `5dac0a46…` | `cc437a24…` | `3d06811c…` | `b6ab2413…` | `m7-t6/run/checkpoints/20000.esb` |
+| U3 | `fdb5178a…` | `cc437a24…` | `41d11a06…` | `c109d783…` | `m7-u/U3/train/checkpoints/20000.esb` |
+
+`task_hash eb6efefa…` and `deployment_hash f2f9a510…` — the committed documents — on all four.
+The two `learning_hash` values and the two `lowering_hash` values are exactly the pair
+`learning-lowering.md` 5.3 recorded, unmoved; the augmented observation moves neither, which is
+why the 2×2 is a 2×2.
+
+**`expected_latency_ms` is 15.0 on every row** (open question 32). It is the fixture
+`learning.toml`'s own declared number, one control tick at 50 Hz, and `es policy pack` carries
+the document's value across rather than inventing one — the invention open question 32 is about
+belongs to `import-lerobot`, which is not on this route. The evidence is in the reports: every
+run counts exactly **16 `violation.chunk_underrun` ticks over 16 episodes**, one tick per
+episode, which is what a one-tick latency produces (section 7.30's ACT, at 200 ms, pays ten).
+
+**U0 was not retrained**, as the packet requires: it is T4's row-D checkpoint
+(`~/artifacts/plan-v/m7-t4/model-D.safetensors`, `lr_curve_hash c01d5185…`, `final_loss
+0.004610`) packed into `~/artifacts/plan-v/v18/untrained-L80.esb` — the bundle carrying the four
+committed documents — with `es policy pack`. The re-lowering of that bundle on this tree prints
+`lowering_hash 3d06811c…d8a2d394`, byte for byte the module T4 trained against, so the
+checkpoint fits the documents it is being judged under. `tests/fixtures/visible-learning/training-u0.toml`
+is that run written as an `es train` recipe and was checked with `--dry-run`, not run.
+
+**U1 diverged, and that is the row.** `es train --recipe training-u1.toml` (identity_hash
+`ae3bd4b0…`, training_hash `e2a9c789…`) reached `first_nonfinite_step 4517`: the loss fell
+0.0419 → 0.0151 by step 4,510, spiked to 0.303 at 4,516 and was NaN from 4,517 to 20,000. The
+schedule was applied exactly as T4's row D applied it — `lr_curve_hash c01d5185…`, the same
+digest, so the rates are the same 20,000 `f64`s — and the only difference from row D is the
+ImageNet initialisation. The 20,000-step checkpoint is therefore NaN weights, and evaluating it
+is what the 0.0000 rows are: the Safety Plane refused all **28,784 of 28,800** commanded ticks
+as `violation.non_finite` and the arm never moved, in every suite, on both documents.
+`envelope_violation_rate 1.0` is that. **Nothing was retried at another learning rate** — the
+packet forbids it, and the reviewer should read the row as "this combination diverges", exactly
+the caveat `training-recipe.md` section 10 attached to row D ("what is measured here is that
+*this* combination is stable"). U3 is the same backbone at the same rate with T6's augmentation
+and it does **not** diverge (`final_loss 0.006383`, `first_nonfinite_step null`), which is the
+most surprising line in this note and open question 35.
+
+**U2 was not retrained either**: T6's acceptance run *is* U2's configuration, so this packet
+evaluated its checkpoint (`training_hash 61e6c93a…`, `final_loss 0.006664`) rather than paying
+for an identical second one. `training-u2.toml` is that run's recipe, copied word for word.
+
+**U3's training**, the one wall-clock this packet produced: `es train` end to end — bake with
+`--for-training` (36,960 samples at `[3, 104, 104]`, the `Pad(4) → RandomCrop{96,96}` boundary),
+lower, 20,000 steps, pack — in **4:11 (251 s)** on an idle card (`nvidia-smi`: no compute
+process; 1-min load 3.20 before, 1.03 after). U1's was **2:57 (177 s)** under the same
+conditions (load 2.66 before, 1.11 after); the difference is the larger baked tensors and the
+per-sample augmentation. Both wrote `training.lock` with all twelve §19.3 slots, including a
+real `base_model` slot (`torchvision.models.ResNet18_Weights.IMAGENET1K_V1`, BSD-3-Clause).
+One T1/T6 property worth recording: `es train --dry-run` prints neither `--for-training` nor
+`--augmentation`, because a dry run opens no bundle and the augmentation chain is a property of
+the bundle's Observation IR — the plan stays a function of the recipe alone (section 3 of
+`training-recipe.md`), and the flags appear in the executed plan the run logs.
+
+**`es eval compare U0/report.json U1/report.json`**, the tool's own output (the
+`failure_mode_histogram` rows are dropped here for width; the full four comparisons are
+`~/artifacts/plan-v/m7-u/compare-U0-U1.txt`, `compare-U0-U2.txt`, `compare-U1-U3.txt`,
+`compare-U2-U3.txt`):
+
+```
+SUITE                METRIC                                  A              B          DELTA  SIGNIFICANT
+nominal              success_rate                     0.250000       0.000000      -0.250000  n/a (aggregate-only report)
+nominal              envelope_violation_rate          0.440941       1.000000      +0.559059  n/a (aggregate-only report)
+nominal              episode_length                1492.687500    1800.000000    +307.312500  n/a (aggregate-only report)
+light_intensity      success_rate                     0.062500       0.000000      -0.062500  n/a (aggregate-only report)
+light_intensity      envelope_violation_rate          0.454231       1.000000      +0.545769  n/a (aggregate-only report)
+light_intensity      episode_length                1699.437500    1800.000000    +100.562500  n/a (aggregate-only report)
+light_direction      success_rate                     0.062500       0.000000      -0.062500  n/a (aggregate-only report)
+light_direction      envelope_violation_rate          0.486473       1.000000      +0.513527  n/a (aggregate-only report)
+light_direction      episode_length                1711.812500    1800.000000     +88.187500  n/a (aggregate-only report)
+observation_delay    success_rate                     0.062500       0.000000      -0.062500  n/a (aggregate-only report)
+observation_delay    envelope_violation_rate          0.555011       1.000000      +0.444989  n/a (aggregate-only report)
+observation_delay    episode_length                1721.812500    1800.000000     +78.187500  n/a (aggregate-only report)
+torque_noise         success_rate                     0.000000       0.000000      +0.000000  n/a (aggregate-only report)
+torque_noise         envelope_violation_rate          0.619340       1.000000      +0.380660  n/a (aggregate-only report)
+torque_noise         episode_length                1800.000000    1800.000000      +0.000000  n/a (aggregate-only report)
+backlash             success_rate                     0.062500       0.000000      -0.062500  n/a (aggregate-only report)
+backlash             envelope_violation_rate          0.411423       1.000000      +0.588577  n/a (aggregate-only report)
+backlash             episode_length                1699.437500    1800.000000    +100.562500  n/a (aggregate-only report)
+
+A: passed=false   B: passed=false
+```
+
+`U1 → U3` is the same table with every sign reversed — `nominal +0.5625`, `light_intensity
++0.6250`, `backlash +0.4375`, `envelope_violation_rate −0.3332`, `episode_length −707.9`, and
+`A: passed=false   B: passed=true`. `U0 → U2` (augmentation alone, across the hash boundary) is
+flat to slightly negative: `nominal −0.0625`, four suites −0.0625, `torque_noise +0.0625`. The
+`SIGNIFICANT` column reads `n/a (aggregate-only report)` on every row of every comparison,
+because `report.json` carries cell aggregates and not per-episode outcomes; the tool is saying
+it cannot test significance from what it was given, which is honest and is also why no
+difference above is called significant.
+
+**The cycle's wall-clock is cited, not re-run** (`training-recipe.md` section 12.8): one whole
+`es loop cycle` on the demo's own documents took **30:19** on 2026-09-21 — collect 5:00,
+expert gate 2:21, train 2:26, eval 20:24, showcase 0:08 — missing §28.9's "one cycle under 30
+minutes" by 19 seconds. That run was taken after T3 and T4 had landed, which is the condition
+the packet sets for citing it, and nothing in T5 or T6 changes a stage of it: U3's training
+(4:11 against that cycle's 2:26) would move the `train` row by under two minutes and the
+`eval` row is a function of how often the policy succeeds — a policy that succeeds nine times
+in sixteen ends its episodes early. This packet's own six-suite wall-clocks do **not** isolate
+that, and are recorded only so they are not mistaken for it: the four runs went out in pairs
+sharing one box (U0 9:23 beside U1 9:24; U2 8:19 beside U3 8:19), so each pair's number is
+contention between two `--jobs 6` runs on 16 cores, not either policy's own cost.
+
+**The showcase.** U0's held-out `nominal-00` (seed 101) is **not** one of U0's four successes —
+it runs the full 1,800 ticks and times out — but U0 does not fail every nominal episode, so the
+packet's fallback to V19b's trajectory was not taken and these are U0's own frames: the policy
+in them reaches for the cube and does not close the task. R1's camera
+(`--eye 0.66,-0.46,0.52 --look-at 0.14,-0.04,0.04 --fov 36`), 1280×720, 1,800 frames each,
+ms/frame off the command's own summary line:
+
+| render | ms/frame | 1-min load before → after | beside |
+|---|---|---|---|
+| `--look full` (R2) | **9.9** | 4.47 → 3.70 | `renderer.md` 9.6's idle-card 10.1 / 9.9 / 9.9 |
+| `--path pt --spp 64 --exposure 32` (R3) | **262.5** | 3.70 → 0.04 | `renderer.md` 11.7's idle-card 254.0 / 254.6 |
+| `--path pt --spp 4 --accumulate --max-history 32 --exposure 32` (R4) | **29.8** | 0.04 → 0.23 | `renderer.md` 11.7's 29.2 / 28.5 |
+
+`nvidia-smi` reported no other compute process before or after. The first row's load was
+**above** the packet's threshold of 4 when it started (the tail of the two parallel evaluations)
+and below it 18 seconds later when it finished; it reproduces `renderer.md` 9.6's idle-card
+number anyway, and the two path-traced rows were both taken under load 4. Each was encoded
+twice from the same raw frames: `python/es/encode_video.py --fps 50` (mp4v, `~/venvs/es/bin/python`
+for `cv2`/`numpy`) and a second H.264 copy through the server's static
+`~/.local/bin/ffmpeg 7.0.2` — one pipe, 5× smaller, the practice open question 5 settled.
+
+| file | server `~/artifacts/plan-v/m7-u/showcase/` | local |
+|---|---|---|
+| RS `full` | `u0-nominal-00-rs-full{,-h264}.mp4` | `target/plan-u/m7-u/u0-nominal-00-rs-full-h264.mp4` |
+| PT 64 spp | `u0-nominal-00-pt-64{,-h264}.mp4` | `target/plan-u/m7-u/u0-nominal-00-pt-64-h264.mp4` |
+| PT 4 spp accumulated | `u0-nominal-00-pt-4-accum{,-h264}.mp4` | `target/plan-u/m7-u/u0-nominal-00-pt-4-accum-h264.mp4` |
+
+The raw frame directories — the three renders and all eight evaluation `--frames` trees, 50 GB
+— were deleted after the run, leaving 1.5 GB: `report.json`, `evaluation.lock`, `events.json`
+and `traj/` for all eight runs, `training.lock` and the checkpoint bundles for U1 and U3, the
+four recipes, the two augmented evaluation documents, the four `es eval compare` outputs, the
+six mp4s, and U0's held-out `nominal-00` `.estraj` and observation frames under
+`~/artifacts/plan-v/m7-u/U0/keep/`.
+
+**What this section does and does not settle.** It is the one re-measurement §28.10 allows, and
+it says that of the four levers M7 built, **augmentation plus an ImageNet backbone together**
+are the only combination that moves `success_rate` at all: U0 → U2 (augmentation alone) is
+flat, U0 → U1 (backbone alone) diverges, and U1 → U3 is +0.5625 on nominal. It does **not**
+overturn section 7.29: the external ACT is still better on every suite, and it did not need a
+2×2 to get there. And it does not re-open section 7.28 — that sentence stays re-dated by
+section 7.30; what U3 establishes is the *same* claim on a *different* Observation IR, under a
+latency model 7.28 did not have.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
@@ -4686,3 +4912,26 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     Keep the bound and state it beside every number, which section 7.30 does. Default: **(c) until
     (a) exists**, because a bound is the conservative direction — a policy that passes under the
     worst latency its deployment tolerates passes under the real one.
+35. **The pretrained backbone diverges at row D's learning rate, and the augmentation rescues it**
+    (section 7.31). U1 and U3 differ in one document — the Observation IR — and U1 reaches
+    `first_nonfinite_step 4517` while U3 finishes 20,000 steps at `final_loss 0.006383`. The
+    rates applied are the same `f64`s in both (`lr_curve_hash c01d5185…`, T4's row D). So
+    `lr = 4e-4` is not a property of the trainer or of the schedule but of the *pair* (schedule,
+    initialisation), and one of this project's two committed Learning IR documents has no
+    learning rate that has been shown to work. Three ends could move. **(a)** A packet measures
+    the pretrained arm's own rate — the fifth configuration this one was forbidden to run — and
+    the recipe fixtures carry two rates rather than one. **(b)** `grad_clip`, which T4 added and
+    no measured run has used, is turned on for the pretrained arm; a loss that goes 0.0151 →
+    0.303 → NaN over six steps is the shape a norm clip exists for. **(c)** Nothing moves and the
+    note carries the divergence as the row it is. Default: **(c)**, because the demo's
+    conclusion — section 7.29's — does not depend on it; but (b) is one field in a recipe and
+    would be the cheapest experiment in M7's whole ladder.
+36. **`es eval compare` compares reports across a moved `evaluation_hash` silently**
+    (section 7.31). §13.3 says a moved evaluation document is a new comparison, and `es loop
+    cycle` refuses one by name with both hashes printed (`training-recipe.md` 12.3). The
+    comparison tool the same section points a reader at does not check, so `es eval compare
+    U0/report.json U2/report.json` prints a delta column across two different documents with
+    nothing said. Default: **print a warning line naming both hashes** rather than refuse —
+    the comparison is sometimes exactly what a human wants (it is what this note's U0 → U2 row
+    is) and the tool's job is to say what it is showing. That is an M7 review item, not a change
+    this packet is allowed to make.

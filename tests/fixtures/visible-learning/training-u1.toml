@@ -1,0 +1,39 @@
+# M7/U row U1: `learning-pretrained.toml` (T5's ImageNet ResNet18 initialisation,
+# `frozen = false`) and the committed `observation.toml`, at T4's row-D settings -- T3 + T4 +
+# T5. This is the row the section 28.10 stop rule is read off.
+#
+# RUN, on the oracle server: `es train --recipe <this> --out ~/artifacts/plan-v/m7-u/U1/train`
+# from the repository root, `docs/design/visible-learning.md` section 7.31.
+#
+# `untrained-pretrained.esb` is the committed four documents with `learning-pretrained.toml` in
+# `learning.toml`'s place: there is no CLI that packs a bundle from four files, so it was built
+# the way M5/V18 built its ablated levels -- swap the document in a scratch tree, run
+# `cargo test -p es --features render --test cli dataset_bake_writes_safetensors_and_a_manifest`
+# (whose `write_demo_bundle` reads the fixture directory), take its `policy.esb`, restore the
+# document. `learning_hash fdb5178a...64ac699e`, `lowering_hash 41d11a06...b06a6841`,
+# `task_hash` / `observation_hash` / `deployment_hash` unmoved from the committed set.
+#
+# `base_model` is T5's artifact; its blake3 is checked against the lock file beside it and
+# against the pin in `crates/es-data/src/training.rs` before a GPU-second is spent.
+# Paths are the oracle server's (RTX 4090).
+
+kind = "training"
+
+[dataset]
+root   = "/home/LJM/artifacts/plan-v/v15/ds-train"
+frames = "/home/LJM/artifacts/plan-v/v15/frames-train"
+
+[policy]
+bundle     = "/home/LJM/artifacts/plan-v/m7-u/U1/untrained-pretrained.esb"
+base_model = "/home/LJM/artifacts/plan-v/m7-t5/resnet18-imagenet1k-v1.safetensors"
+
+[run]
+steps         = 20000
+batch         = 64
+lr            = 4e-4
+seed          = 0
+checkpoint_at = [20000]
+device        = "cuda"
+interpreter   = "/home/LJM/venvs/es-lerobot-cuda/bin/python"
+schedule      = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
+extra         = ["--resident-gpu"]
