@@ -58,6 +58,7 @@ pub const LRN_021: &str = "LRN-021";
 pub const LRN_022: &str = "LRN-022";
 pub const LRN_023: &str = "LRN-023";
 pub const LRN_030: &str = "LRN-030";
+pub const LRN_031: &str = "LRN-031";
 pub const LRN_052: &str = "LRN-052";
 
 // --- Deployment (spec 9.2 .. 9.4, spec 11.6) ----------------------------------------------
@@ -200,6 +201,7 @@ pub const CODES: &[CodeEntry] = &[
     e(LRN_022, Error, "observation_window disagrees with the temporal node", "7.5"),
     e(LRN_023, Error, "contract field that must be positive is 0", "8.4"),
     e(LRN_030, Error, "normalizer direction disagrees with the units it produces", "8.3"),
+    e(LRN_031, Error, "squash is declared on a head that has no point estimate", "8.3"),
     e(LRN_052, Error, "inference latency exceeds the control period", "8.4"),
     e(OBS_021, Error, "color space mismatch", "7.2"),
     e(OBS_034, Error, "intrinsics were not updated for the resize", "7.2"),
@@ -315,6 +317,7 @@ mod tests {
             LRN_022,
             LRN_023,
             LRN_030,
+            LRN_031,
             LRN_052,
             DEP_001,
             DEP_010,

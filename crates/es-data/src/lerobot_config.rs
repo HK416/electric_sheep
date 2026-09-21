@@ -21,10 +21,10 @@ use es_ir::image::{
     Rect, ShutterModel,
 };
 use es_ir::learning::{
-    ActionExecutionMode, ArchKind, BetaSchedule, ChunkBlendPolicy, DiffusionScheduler, FusionKind,
-    HeadKind, LearningGraph, LearningNode, NormalizeDir, PolicyContract, PolicyHandle,
-    PredictionType, RuntimeHints, StateEncoderKind, StatsSource, TemporalKind, VarianceType,
-    VisionBackbone, WeightsRef,
+    ActionExecutionMode, Activation, ArchKind, BetaSchedule, ChunkBlendPolicy, DiffusionScheduler,
+    FusionKind, HeadKind, LearningGraph, LearningNode, NormalizeDir, PolicyContract, PolicyHandle,
+    PredictionType, RuntimeHints, Squash, StateEncoderKind, StatsSource, TemporalKind,
+    VarianceType, VisionBackbone, WeightsRef,
 };
 use es_ir::observation::{
     self, AugmentKind, History, Io, NormalizeStats, ObservationIr, ObservationNode,
@@ -747,7 +747,11 @@ fn build_learning(
         state_id,
         LearningNode::StateEncoder {
             inputs: vec![state_in.clone()],
-            kind: StateEncoderKind::Mlp { hidden: vec![feat] },
+            kind: StateEncoderKind::Mlp {
+                hidden: vec![feat],
+                activation: Activation::Relu,
+                activate_output: false,
+            },
             out_dim: feat,
         },
     );
@@ -855,6 +859,7 @@ fn build_learning(
             kind: head_kind,
             action_dim,
             horizon,
+            squash: Squash::None,
         },
     );
     g.connect(temporal_id, "out", head_id, "feat");

@@ -29,9 +29,9 @@ use es_ir::image::{
     ShutterModel,
 };
 use es_ir::learning::{
-    ActionExecutionMode, ArchKind, ChunkBlendPolicy, FusionKind, HeadKind, LearningGraph,
-    LearningNode, PolicyContract, PolicyHandle, RuntimeHints, StateEncoderKind, TemporalKind,
-    VisionBackbone, WeightsRef,
+    ActionExecutionMode, Activation, ArchKind, ChunkBlendPolicy, FusionKind, HeadKind,
+    LearningGraph, LearningNode, PolicyContract, PolicyHandle, RuntimeHints, Squash,
+    StateEncoderKind, TemporalKind, VisionBackbone, WeightsRef,
 };
 use es_ir::observation::{
     Io, NormalizeStats, ObservationIr, ObservationNode, ObservationOutput, ResizeFilter,
@@ -365,7 +365,11 @@ fn learning_graph() -> LearningGraph {
         NodeId(1),
         LearningNode::StateEncoder {
             inputs: vec![state.clone()],
-            kind: StateEncoderKind::Mlp { hidden: vec![256] },
+            kind: StateEncoderKind::Mlp {
+                hidden: vec![256],
+                activation: Activation::Relu,
+                activate_output: false,
+            },
             out_dim: feat,
         },
     );
@@ -398,6 +402,7 @@ fn learning_graph() -> LearningGraph {
             kind: HeadKind::Regression,
             action_dim: DOF,
             horizon: HORIZON,
+            squash: Squash::None,
         },
     );
     g.insert(
@@ -5993,6 +5998,8 @@ fn go1_learning() -> LearningGraph {
             inputs: vec![Port::new("state", feature(GO1_OBS_DIM))],
             kind: StateEncoderKind::Mlp {
                 hidden: vec![512, 256],
+                activation: Activation::Relu,
+                activate_output: false,
             },
             out_dim: 128,
         },
@@ -6004,6 +6011,7 @@ fn go1_learning() -> LearningGraph {
             kind: HeadKind::Regression,
             action_dim: GO1_ACTION_DIM,
             horizon: 1,
+            squash: Squash::None,
         },
     );
     nodes.insert(

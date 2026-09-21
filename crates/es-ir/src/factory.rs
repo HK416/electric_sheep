@@ -27,7 +27,7 @@ use crate::diag::Diagnostic;
 use crate::graph::{IrNode, Port};
 use crate::learning::{
     ActionExecutionMode, ChunkBlendPolicy, FusionKind, HeadKind, LearningNode, NormalizeDir,
-    StateEncoderKind, StatsSource, TemporalKind, VisionBackbone, WeightsRef,
+    Squash, StateEncoderKind, StatsSource, TemporalKind, VisionBackbone, WeightsRef,
 };
 use crate::task::{
     ActionSpace, Aggregation, ArithOp, CmpOp, Distribution, JointQuantity, LogicOp, MathFunc,
@@ -358,6 +358,7 @@ fn example_learning_node(kind: &str) -> Option<LearningNode> {
             kind: HeadKind::Regression,
             action_dim: 4,
             horizon: 1,
+            squash: Squash::None,
         },
         "PolicyBundle" => LearningNode::PolicyBundle {
             inputs: vec![],
@@ -388,6 +389,29 @@ fn example_learning_node(kind: &str) -> Option<LearningNode> {
         },
         _ => return None,
     })
+}
+
+/// Parameters an example instance does not serialize, because `skip_serializing_if` is what
+/// "absent = the default = today's canonical form" is built out of (packet M8/S2a). They are
+/// the only *optional* builtin parameters, so [`param_schemas`] — which reads a serialized
+/// instance — cannot see them and they are declared here instead.
+///
+/// `StateEncoder`'s `activation` and `activate_output` are **not** here: they are fields of
+/// the `Mlp` variant, i.e. part of the `kind` parameter's value, not parameters of the node
+/// (see `docs/design/learning-lowering.md` section 3.1).
+fn optional_params(kind: &str) -> Vec<ParamSchema> {
+    match kind {
+        // A unit-variant enum serializes as its name, which `infer_param_type` reads as a
+        // `String`; declaring it as one keeps this entry identical to what reflection would
+        // have produced had the field been written out.
+        "PolicyHead" => vec![ParamSchema {
+            name: "squash".to_owned(),
+            ty: ParamType::String,
+            required: false,
+            default: Some(toml::Value::String("None".to_owned())),
+        }],
+        _ => Vec::new(),
+    }
 }
 
 /// Infers the coarse shape an editor needs from one observed value. This is deliberately not a
@@ -510,7 +534,9 @@ impl LearningNodeFactory for BuiltinLearningNodes {
 
     fn schema(&self, kind: &str) -> Option<NodeSchema> {
         let kind = *BUILTIN_LEARNING_KINDS.iter().find(|&&k| k == kind)?;
-        Some(node_schema(kind, &example_learning_node(kind)?))
+        let mut schema = node_schema(kind, &example_learning_node(kind)?);
+        schema.params.extend(optional_params(kind));
+        Some(schema)
     }
 }
 

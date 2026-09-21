@@ -27,9 +27,9 @@ use es_ir::image::{
     ShutterModel,
 };
 use es_ir::learning::{
-    ActionExecutionMode, ArchKind, ChunkBlendPolicy, FusionKind, HeadKind, LearningGraph,
-    LearningNode, PolicyContract, PolicyHandle, RuntimeHints, StateEncoderKind, TemporalKind,
-    VisionBackbone, WeightsRef,
+    ActionExecutionMode, Activation, ArchKind, ChunkBlendPolicy, FusionKind, HeadKind,
+    LearningGraph, LearningNode, PolicyContract, PolicyHandle, RuntimeHints, Squash,
+    StateEncoderKind, TemporalKind, VisionBackbone, WeightsRef,
 };
 use es_ir::observation::{
     AugmentKind, Io, NormalizeStats, ObservationIr, ObservationNode, ObservationOutput,
@@ -361,7 +361,11 @@ fn learning_graph() -> LearningGraph {
         NodeId(1),
         LearningNode::StateEncoder {
             inputs: vec![state.clone()],
-            kind: StateEncoderKind::Mlp { hidden: vec![256] },
+            kind: StateEncoderKind::Mlp {
+                hidden: vec![256],
+                activation: Activation::Relu,
+                activate_output: false,
+            },
             out_dim: feat,
         },
     );
@@ -394,6 +398,7 @@ fn learning_graph() -> LearningGraph {
             kind: HeadKind::Regression,
             action_dim: DOF,
             horizon: HORIZON,
+            squash: Squash::None,
         },
     );
     g.insert(

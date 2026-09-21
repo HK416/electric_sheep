@@ -44,10 +44,90 @@ pub enum VisionBackbone {
     Custom { hash: [u8; 32] },
 }
 
+/// The non-linearity a lowered `Mlp` puts between its layers (spec 8.3, packet M8/S2a).
+///
+/// brax's MLP is `swish`, `rsl_rl`'s is `ELU`, and the lowering emitted `ReLU` before this
+/// parameter existed — so [`Self::Relu`] is the default and an absent `activation` is byte
+/// for byte today's canonical form (see [`StateEncoderKind::canonical`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Activation {
+    #[default]
+    Relu,
+    Elu,
+    /// `SiLU`, `x * sigmoid(x)` — `linen.swish`, `nn.SiLU`.
+    Swish,
+    Tanh,
+}
+
+impl Activation {
+    /// Whether this is the activation an absent `activation` means.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn is_default(&self) -> bool {
+        *self == Self::Relu
+    }
+}
+
+/// Whether a `Regression` head squashes its output into `[-1, 1]` (spec 8.3, packet M8/S2a).
+///
+/// brax's deterministic inference is `tanh(location)`; without this the action port's
+/// `Normalized { lo = -1, hi = 1 }` unit and the Safety Plane's clamp give the *range* of
+/// `tanh` but not its shape (`quadruped-track.md` 3.4 item 3). Default [`Self::None`] = today's
+/// canonical form.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Squash {
+    #[default]
+    None,
+    Tanh,
+}
+
+impl Squash {
+    /// Whether this is the squash an absent `squash` means.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn is_default(&self) -> bool {
+        *self == Self::None
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StateEncoderKind {
     Identity,
-    Mlp { hidden: Vec<u32> },
+    Mlp {
+        hidden: Vec<u32>,
+        /// Absent = [`Activation::Relu`] = today's canonical form (packet M8/S2a).
+        #[serde(default, skip_serializing_if = "Activation::is_default")]
+        activation: Activation,
+        /// Whether [`Self::Mlp::activation`] also follows the **last** `Linear`, the one that
+        /// feeds the head. Upstream MLPs (brax, `rsl_rl`) activate every hidden layer including
+        /// the last; ours did not. Absent = `false` = today's canonical form.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        activate_output: bool,
+    },
+}
+
+impl StateEncoderKind {
+    /// The canonical bytes of this kind.
+    ///
+    /// Written by hand rather than as `format!("{self:?}")` for one reason: the default
+    /// `Mlp` must hash exactly as it did before `activation` and `activate_output` existed,
+    /// i.e. as the string `Mlp { hidden: [256] }`, or every committed `learning_hash` moves.
+    /// The two parameters are appended only when they are not the default — the same rule
+    /// `SensorRender` follows in `task.rs` (packet M7/R5).
+    fn canonical(&self, w: &mut CanonWriter) {
+        match self {
+            Self::Identity => w.str("Identity"),
+            Self::Mlp {
+                hidden,
+                activation,
+                activate_output,
+            } => {
+                w.str(&format!("Mlp {{ hidden: {hidden:?} }}"));
+                if !activation.is_default() || *activate_output {
+                    w.str(&format!("{activation:?}"));
+                    w.bool(*activate_output);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -248,6 +328,10 @@ pub enum LearningNode {
         kind: HeadKind,
         action_dim: u32,
         horizon: u32,
+        /// Absent = [`Squash::None`] = today's canonical form (packet M8/S2a). Only a
+        /// `Regression` head has an output to squash; anything else is `LRN-031`.
+        #[serde(default, skip_serializing_if = "Squash::is_default")]
+        squash: Squash,
     },
     /// A large VLA referenced whole (spec 8.3). pi0 is not decomposed into nodes; only its
     /// interface is type-checked.
@@ -445,7 +529,7 @@ impl IrNode for LearningNode {
                 w.u32(*token_count);
             }
             Self::StateEncoder { kind, out_dim, .. } => {
-                w.str(&format!("{kind:?}"));
+                kind.canonical(w);
                 w.u32(*out_dim);
             }
             Self::LanguageEncoder {
@@ -488,11 +572,16 @@ impl IrNode for LearningNode {
                 kind,
                 action_dim,
                 horizon,
+                squash,
                 ..
             } => {
                 w.str(&format!("{kind:?}"));
                 w.u32(*action_dim);
                 w.u32(*horizon);
+                // Only when it is not the default: see [`Squash`].
+                if !squash.is_default() {
+                    w.str(&format!("{squash:?}"));
+                }
             }
             Self::PolicyBundle {
                 weights,
@@ -686,7 +775,33 @@ impl LearningGraph {
         self.check_boundary(&mut diags);
         self.check_contract(&mut diags);
         self.check_normalizers(&mut diags);
+        self.check_squash(&mut diags);
         diags
+    }
+
+    /// Spec 8.3: only a `Regression` head produces the point estimate a squash is defined on.
+    /// A sampler head's output comes out of a denoiser or a codebook, where `tanh` would
+    /// change the distribution rather than the range (packet M8/S2a).
+    fn check_squash(&self, diags: &mut Vec<Diagnostic>) {
+        for (id, node) in &self.nodes.nodes {
+            let LearningNode::PolicyHead { kind, squash, .. } = node else {
+                continue;
+            };
+            if squash.is_default() || matches!(kind, HeadKind::Regression) {
+                continue;
+            }
+            // The variant name alone: a `Diffusion` head's `Debug` is seven scheduler fields.
+            let debug = format!("{kind:?}");
+            let head = debug.split(' ').next().unwrap_or(&debug);
+            diags.push(
+                Diagnostic::new(
+                    codes::LRN_031,
+                    format!("{squash:?} squash on a {head} head"),
+                )
+                .at(*id)
+                .with_hint("squash is defined on Regression only; leave it None"),
+            );
+        }
     }
 
     fn check_arity(&self, diags: &mut Vec<Diagnostic>) {
@@ -1061,7 +1176,11 @@ pub mod testing {
             NodeId(1),
             LearningNode::StateEncoder {
                 inputs: vec![state.clone()],
-                kind: StateEncoderKind::Mlp { hidden: vec![256] },
+                kind: StateEncoderKind::Mlp {
+                    hidden: vec![256],
+                    activation: Activation::Relu,
+                    activate_output: false,
+                },
                 out_dim: feat,
             },
         );
@@ -1091,6 +1210,7 @@ pub mod testing {
                 kind: HeadKind::Regression,
                 action_dim,
                 horizon,
+                squash: Squash::None,
             },
         );
         g.insert(

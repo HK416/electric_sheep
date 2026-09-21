@@ -647,7 +647,7 @@ impl Lowering {
 
             LearningNode::StateEncoder { kind, out_dim, .. } => match kind {
                 StateEncoderKind::Identity => Ok(args[0].clone()),
-                StateEncoderKind::Mlp { hidden } => {
+                StateEncoderKind::Mlp { hidden, .. } => {
                     let mut dims = vec![in_dim(node, 0, id)?];
                     dims.extend(hidden.iter().map(|h| u64::from(*h)));
                     dims.push(u64::from(*out_dim));
