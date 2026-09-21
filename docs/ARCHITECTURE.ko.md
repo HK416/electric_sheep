@@ -707,6 +707,8 @@ phase 간 역방향 의존은 컴파일 에러다. 모든 노드는 활성 `EnvM
 | `DET-030` | `Reduce(unordered=true)`는 결정적 모드에서 거부 |
 | `DET-040` | 외부 백엔드 사용 시 계층 1 선언 불가 |
 
+**`sqrt`는 초월함수가 아니다(패킷 M8/S4d, 2026-09-21).** IEEE 754는 제곱근을 정확히 반올림하도록 요구하므로 `f64::sqrt`는 모든 플랫폼에서 비트 동일한 기본 산술 연산이고 `DET-010`의 대상이 아니다. 보상·종료 콘의 `Norm{L2}`는 `Expr::Sqrt`로 로워링되며, `exp`·`log`·삼각함수는 여전히 `MathFn{approx = true}`뿐이다.
+
 ---
 
 ## 7. Observation IR
@@ -2979,6 +2981,7 @@ S1: `es-data/training.rs`·`es/cmd/train.rs`; S4a: `es-py`), 각 행은 §1.2 �
 | 2 | **S2b `es policy import-rl`** | brax·rsl_rl·rl_games의 액터가 어댑터 문서를 거쳐 번들이 되고, 무작위 관측 1,000개에서 원 프레임워크를 재현하는가 — torch 출신(rsl_rl·rl_games)은 비트 동일, JAX 출신(brax)은 §8.9 계층 4(≤ 1e-5)에 최대 오차를 기록 | `cargo test -p es --test cli import_rl_`: 합성 체크포인트 3종 → 문서·번들·`import.json`; 서버 `--ignored`: S2c 체크포인트, 1,000 관측 — torch 재구성 대 우리 런타임 f32 비트 동일, JAX 대 우리 런타임 최대 절대오차 ≤ 1e-5, 해시 기록; 어댑터 불일치 5종이 `IMP-0xx`로 거부 | B |
 | 2 | **S1 `[init] policy`** | 이름·모양이 맞는 텐서가 복사되고 나머지가 초기화되며 `init.lock`이 그것을 적는가 | `cargo test -p es --test cli train_init_`: U3 체크포인트에서 0스텝 → 가중치 비트 동일, `policy_hash` 사슬 유지; 이름 불일치가 lock에 나열 | B |
 | 3 | **S4b PPO 트레이너** | `es train --recipe`의 `[rl]`이 `train_ppo.py`로 롤아웃(§13.4)·GAE·클립 목적·엔트로피를 돌리고 §19.3을 채우는가; CPU 백엔드에서 두 번 비트 동일한가 | `cargo test -p es --test cli train_rl_`: `--dry-run` 계획 골든; `tests/fixtures/rl/task-reach.toml`에서 시드 0 두 번 → 체크포인트 비트 동일(`ES_PYTHON`); 목표 리턴 도달(관측, 서버) | B |
+| 3 | **S4d 보상 콘이 몸체에 닿는다** | `GetBodyPose`·`Norm{L2}`·`Expr::Sqrt`가 `es-env`의 스칼라 콘에 들어가 reach의 `−‖cube − gripper‖`가 실행되는가(S4b가 2026-09-21에 찾은 간극); 커밋된 `task.toml`의 로워링은 불변인가 | `cargo test -p es-env body_norm_cone_lowers_and_the_demo_task_is_unmoved`; `--ignored`: `task-reach.toml`의 보상이 백엔드 자신의 `xpos`로 계산한 거리와 비트 동일 | B |
 | 3 | **S4c 이어하기 측정** | 가져온 정책(S2b)에서 `[init]`으로 시작해 우리 시뮬에서 PPO를 이어 돌리면 같은 Evaluation IR의 성공률이 오르는가 | `es eval run` 전/후 → `visible-learning.md` 7.33 표(이어하기 전·후·처음부터, 시드 3개); `es eval compare` | D |
 | 4 | **M8 리뷰** | 기록이 사양으로 돌아왔는가 | `docs/reviews/M8.md` + `.ko.md`; `cargo xtask ci` 녹색 | A |
 

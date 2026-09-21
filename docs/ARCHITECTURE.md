@@ -706,6 +706,8 @@ The supported functions correspond 1:1 to the §6.3 nodes. Loops, variable assig
 | `DET-030` | `Reduce(unordered=true)` rejected in deterministic mode |
 | `DET-040` | Tier 1 declaration not possible when using an external backend |
 
+**`sqrt` is not a transcendental (packet M8/S4d, 2026-09-21).** IEEE 754 requires a correctly rounded square root, so `f64::sqrt` is a basic arithmetic operation that is bit-identical on every platform and is not what `DET-010` names. A reward or termination cone's `Norm{L2}` lowers to `Expr::Sqrt`; `exp`, `log` and the trigonometric functions remain `MathFn{approx = true}` only.
+
 ---
 ## 7. Observation IR
 
@@ -3037,6 +3039,7 @@ Waves 1–3 run in parallel because the crates don't overlap (R: `es-safety`, `e
 | 2 | **S2b `es policy import-rl`** | Do brax, rsl_rl, and rl_games actors become bundles through the adapter document and reproduce the source framework on 1,000 random observations — bit-identical for torch sources (rsl_rl, rl_games), §8.9 tier 4 (≤ 1e-5) with the max error recorded for the JAX source (brax) | `cargo test -p es --test cli import_rl_`: three synthetic checkpoints → document, bundle, `import.json`; server `--ignored`: the S2c checkpoint, 1,000 observations — the torch reconstruction vs our runtime bit-identical in f32, JAX vs our runtime max abs error ≤ 1e-5, hashes recorded; five kinds of adapter mismatch rejected as `IMP-0xx` | B |
 | 2 | **S1 `[init] policy`** | Are tensors whose name and shape match copied, is the rest initialized, and does `init.lock` record it | `cargo test -p es --test cli train_init_`: zero steps from the U3 checkpoint → weights bit-identical, the `policy_hash` chain preserved; name mismatches listed in the lock | B |
 | 3 | **S4b PPO trainer** | Does `es train --recipe`'s `[rl]` run rollout (§13.4), GAE, the clipped objective, and entropy through `train_ppo.py` and fill §19.3; is it bit-identical run twice on the CPU backend | `cargo test -p es --test cli train_rl_`: `--dry-run` plan golden; `tests/fixtures/rl/task-reach.toml` at seed 0 twice → checkpoint bit-identical (`ES_PYTHON`); target return reached (observation, server) | B |
+| 3 | **S4d the reward cone reaches a body** | Do `GetBodyPose`, `Norm{L2}` and `Expr::Sqrt` enter `es-env`'s scalar cone so the reach reward `−‖cube − gripper‖` executes (the gap S4b found on 2026-09-21), with the committed `task.toml`'s lowering unmoved | `cargo test -p es-env body_norm_cone_lowers_and_the_demo_task_is_unmoved`; `--ignored`: `task-reach.toml`'s reward is bit-identical to the distance computed from the backend's own `xpos` | B |
 | 3 | **S4c continuation measurement** | Starting from the imported policy (S2b) via `[init]` and continuing PPO in our sim, does the success rate rise on the same Evaluation IR | `es eval run` before/after → `visible-learning.md` 7.33 table (before continuation, after continuation, from scratch, three seeds); `es eval compare` | D |
 | 4 | **M8 review** | Has the record come back into the specification | `docs/reviews/M8.md` + `.ko.md`; `cargo xtask ci` green | A |
 

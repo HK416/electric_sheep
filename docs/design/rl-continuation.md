@@ -82,15 +82,24 @@ randomization, so no new randomization mechanism is needed:
 
 - scene: `tests/fixtures/mjcf/so101_pick_place.xml`, 50 Hz control over 200 Hz physics (the demo's
   V11 cadence, `n_substeps = 4`);
-- observation (15): `joint_pos[6] ‖ joint_vel[6] ‖ (cube_pos − gripper_pos)[3]`, gripper =
-  body `gripper` (site `gripperframe` on the brax side, the same point);
+- observation (26): `joint_pos[6] ‖ joint_vel[6] ‖ cube_pose[7] ‖ gripper_pose[7]`, each pose
+  the body's world-frame `pos[3] ‖ quat[4]` (quaternion xyzw, §3.1; MuJoCo's `xquat` is wxyz
+  and the source side reorders), gripper = body `gripper`. The poses go in whole because the
+  Observation IR cannot slice a state port (`ChannelSelect` is not lowered) and the Task IR's
+  observation capture binds a `GetBodyPose` channel as the demo's `sim_cube_pose` does (7);
+  the network learns the subtraction. Revised 2026-09-21 from the 15-dim difference layout.
 - action (6): position targets, normalized `[-1, 1]` over each actuator's `ctrlrange`
   (`Normalizer{Inverse, MeanStd}` with `mean = centre`, `std = half-range`);
 - reward: `−‖cube_pos − gripper_pos‖` per step, `+1` on success;
 - success: distance `< 0.03` m; timeout 200 control steps.
 
 The Task IR (`tests/fixtures/rl/task-reach.toml`) spells this with existing nodes
-(`GetBodyPose`, `Arith`, `Norm`, `Compare`, `Reward`, `Terminate`). If the brax env has to
+(`GetBodyPose`, `Arith`, `Norm`, `Compare`, `Reward`, `Terminate`). **Found by S4b
+(2026-09-21):** `es-env`'s reward/termination cone executed neither `GetBodyPose` nor `Norm`,
+and `Expr` had no square root, so the reward was spellable but not executable. Packet **S4d**
+extends the cone (`Source::Xpos` lanes, lane-wise `Arith`, `Norm{L2}` → `Expr::Sqrt`, an IEEE
+basic operation and not a `DET-010` transcendental — §6.6) and owns the four reach documents;
+S4b lands the trainer against the committed demo documents and its reach oracle waits on S4d. If the brax env has to
 deviate (MJX support for `implicitfast`/`elliptic`/`condim 6`), the deviation is a named row in
 `docs/api-notes/brax-ppo-so101.md` and is part of the sim-to-sim gap the S4c table measures.
 

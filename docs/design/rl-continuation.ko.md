@@ -77,15 +77,18 @@ IR(S4c)이 채점한다. 커밋된 SO-101 장면과 그 에피소드별 큐브 �
 
 - 장면: `tests/fixtures/mjcf/so101_pick_place.xml`, 200 Hz 물리 위의 50 Hz 제어(데모의 V11
   카덴스, `n_substeps = 4`);
-- 관측(15): `joint_pos[6] ‖ joint_vel[6] ‖ (cube_pos − gripper_pos)[3]`, 그리퍼 = 바디
-  `gripper`(brax 쪽에서는 사이트 `gripperframe`, 같은 점);
+- 관측(26): `joint_pos[6] ‖ joint_vel[6] ‖ cube_pose[7] ‖ gripper_pose[7]`, 각 포즈는 몸체의 월드
+  프레임 `pos[3] ‖ quat[4]`(쿼터니언 xyzw, §3.1; MuJoCo의 `xquat`은 wxyz라 원본 쪽이 재배열), 그리퍼 =
+  몸체 `gripper`. 관측 IR이 상태 포트를 자르지 못하고(`ChannelSelect`는 로워링되지 않는다) Task IR의
+  관측 캡처가 데모의 `sim_cube_pose`처럼 `GetBodyPose` 채널을 7로 묶기 때문에 포즈를 통째로 싣고,
+  뺄셈은 네트워크가 배운다. 2026-09-21 15차원 차분 배치에서 개정;
 - 행동(6): 위치 목표, 각 액추에이터의 `ctrlrange` 위에서 `[-1, 1]`로 정규화됨
   (`Normalizer{Inverse, MeanStd}`, `mean = centre`, `std = half-range`);
 - 보상: 스텝마다 `−‖cube_pos − gripper_pos‖`, 성공 시 `+1`;
 - 성공: 거리 `< 0.03` m; 타임아웃 200 제어 스텝.
 
 Task IR(`tests/fixtures/rl/task-reach.toml`)은 기존 노드(`GetBodyPose`, `Arith`, `Norm`,
-`Compare`, `Reward`, `Terminate`)로 이것을 적는다. brax env가 벗어나야 한다면(`implicitfast`/
+`Compare`, `Reward`, `Terminate`)로 이것을 적는다. **S4b가 찾았다(2026-09-21):** `es-env`의 보상·종료 콘은 `GetBodyPose`도 `Norm`도 실행하지 않았고 `Expr`에는 제곱근이 없어, 보상은 적을 수는 있어도 실행할 수는 없었다. 패킷 **S4d**가 콘을 넓히고(`Source::Xpos` 레인, 레인별 `Arith`, `Norm{L2}` → `Expr::Sqrt` — IEEE 기본 연산이지 `DET-010`의 초월함수가 아니다, §6.6) reach 문서 네 개를 소유한다; S4b는 커밋된 데모 문서로 트레이너를 싣고 reach 오라클은 S4d를 기다린다. brax env가 벗어나야 한다면(`implicitfast`/
 `elliptic`/`condim 6`에 대한 MJX 지원), 그 벗어남은 `docs/api-notes/brax-ppo-so101.md`의 이름
 붙은 행이고 S4c 표가 재는 sim-to-sim 간극의 일부다.
 
