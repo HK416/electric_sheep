@@ -15,7 +15,7 @@
 //!   plane produces the fallback (§8.6, §9.4). Fabricating an action here would put an
 //!   unchecked value on the actuator path, which `INV-12` forbids.
 
-use es_ir::deployment::ExecutionMode;
+use es_ir::deployment::{ActionSpace, ExecutionMode};
 use es_ir::learning::ChunkBlendPolicy;
 use es_safety::ActionChunk;
 
@@ -278,6 +278,37 @@ impl PlaneFeed {
     }
 }
 
+/// The absolute joint target one policy output commands (spec 8.5, packet M9/T1).
+///
+/// Every space but [`ActionSpace::JointDelta`] *is* the target already, so the row is copied
+/// and `JointPosition` behaviour is bit for bit what it was. `JointDelta` says the row is an
+/// increment on the current target: `target_t = target_{t-1} + row_t`.
+///
+/// **`prev` is the plane's own last executed command** (`SafetyPlane::last_safe_action`), not
+/// the previous raw row. Two things follow, and they are the whole rule:
+///
+/// - At the first tick of an episode that value *is* the measured pose
+///   `SafetyPlane::observe_state` seeded the command chain with (spec 9.3), because
+///   `begin_episode` re-arms the seed and every consumer observes before it validates. So the
+///   integrator is reset at every episode boundary without owning a second copy of the number
+///   that could drift from the plane's.
+/// - After a clamp the increment applies to what the arm was *told to do*, not to what the
+///   policy asked for, so a saturated joint does not accumulate into a target it can never
+///   reach.
+///
+/// This is the only place an increment becomes an absolute target: [`plane_chunk`] calls it
+/// for the collection and evaluation paths, `es_py::Rollout::act` for the trainer.
+pub fn absolute_target<const NJ: usize>(
+    space: ActionSpace,
+    prev: &[f64; NJ],
+    row: &[f64; NJ],
+) -> [f64; NJ] {
+    match space {
+        ActionSpace::JointDelta => std::array::from_fn(|i| prev[i] + row[i]),
+        _ => *row,
+    }
+}
+
 /// The chunk to hand `SafetyPlane::validate` on this control tick, and the row it commands.
 ///
 /// **The one place a buffered chunk becomes an actuator command** (packet M5/V6b): both
@@ -291,14 +322,48 @@ impl PlaneFeed {
 /// `None` as the second return is the underrun: nothing was commanded this tick, the plane is
 /// handed an empty chunk under the `seq` it already has, and its own `ChunkUnderrun` produces
 /// the fallback (spec 8.6, spec 9.4). Never a fabricated action (`INV-12`).
+///
+/// `space` and `prev` are [`absolute_target`]'s: for every absolute space `prev` is unread and
+/// the chunk below is the one this function always built. For [`ActionSpace::JointDelta`] the
+/// served row is an increment and the plane must see the integrated absolute, which it can
+/// only do through a chunk it has not accepted yet -- so the delta arm stamps **one row per
+/// control tick under a fresh `seq`**, the shape `es_py::Rollout::act` already hands the plane.
+/// The second return is the integrated absolute, so `commanded` provenance stays "what the
+/// plane was asked for" (spec 13.2) and the dataset keeps recording absolute commands.
+///
+/// The cost of that arm, named rather than hidden: a fresh `seq` every tick stamps the plane's
+/// `last_chunk_tick` every tick, so `ViolationKind::InferenceDeadline` cannot fire for a delta
+/// policy and a dead one is caught one replan window later by `ChunkUnderrun` instead. The
+/// alternative -- integrating the whole lookahead once per arrival -- would let a clamped
+/// increment accumulate across that same window, which is the failure spec 8.5 wrote this rule
+/// against. Buying the watchdog back needs a plane that can refresh rows without restamping
+/// freshness, and the plane is not this packet's to touch (INV-13).
 pub fn plane_chunk<const NJ: usize, const H: usize>(
     buffer: &mut ChunkBuffer<NJ, H>,
     feed: &mut PlaneFeed,
     tick: u64,
     mode: ExecutionMode,
+    space: ActionSpace,
+    prev: &[f64; NJ],
 ) -> (ActionChunk<NJ, H>, Option<[f64; NJ]>) {
     let row = buffer.next_action(tick);
     let arrivals = buffer.arrivals();
+    if space == ActionSpace::JointDelta {
+        let Some(increment) = row else {
+            // The underrun is the underrun whatever the space: an empty chunk under the `seq`
+            // the plane already has, and the plane's own fallback (INV-12).
+            return (ActionChunk::empty(mode).with_seq(feed.seq), None);
+        };
+        let q = absolute_target(space, prev, &increment);
+        let mut actions = [[0.0; NJ]; H];
+        actions[0] = q;
+        feed.seq += 1;
+        feed.arrivals = arrivals;
+        return (
+            ActionChunk::new(actions, 1, mode).with_seq(feed.seq),
+            Some(q),
+        );
+    }
     let chunk = match row {
         // A policy result the plane has not seen yet, and it covers this tick: stamp one fresh
         // `seq` and hand over the rows it will drive until the next result. The lookahead is

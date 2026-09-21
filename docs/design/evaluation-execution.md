@@ -241,6 +241,13 @@ The oracle is a trajectory, not a schedule: `collection_and_evaluation_draw_the_
 T7 it failed at tick 1 — see `docs/design/visible-learning.md` section 7.30 for the measured
 values and for what the demo's numbers became.
 
+**One integrator, between the chunk row and `validate`** (spec 8.5, packet M9/T1). Since
+`observe_state` moved one line above `plane_chunk` here, the cell loop reads the plane's last
+**executed** command and hands it to `es_env::chunk_buffer::absolute_target`, which copies the
+row for `JointPosition` and adds it for `JointDelta`: the plane sees an absolute target either
+way, and the integrator resets at the episode boundary because `begin_episode` re-arms the
+seed the first `observe_state` of the episode writes.
+
 ### 2.7 Sharding: the unit is the `(cell, episode)` pair (packets M7/T8, M7/R1)
 
 `es eval run --jobs N` partitions the **`(cell, episode)` units** round-robin over N worker

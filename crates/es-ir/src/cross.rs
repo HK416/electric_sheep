@@ -27,7 +27,7 @@ use crate::graph::IrNode;
 use crate::learning::{ActionExecutionMode, LearningGraph};
 use crate::observation::{ObservationIr, ObservationNode};
 use crate::task::{ActionSpace as TaskSpace, ObsSource, TaskIr, TaskNode};
-use crate::types::TimeRef;
+use crate::types::{TimeRef, Unit};
 
 // The `XIR-0xx` codes this module reports (severity and title in `codes.rs`):
 // XIR-001 observation IR belongs to a different Task IR (spec 7.4)
@@ -40,7 +40,8 @@ use crate::types::TimeRef;
 // XIR-023 `replanning_hz` is not an integer divisor of the control rate (spec 8.4)
 // XIR-024 `runtime.deadline_ms` does not fit the deployment inference budget (spec 8.4, spec 9.4)
 // XIR-030 task `ActionSpec::dim` disagrees with `action_dim` (spec 8.4, spec 8.5)
-// XIR-031 task `ActionSpec::space` disagrees with the deployed action space (spec 8.5)
+// XIR-031 task `ActionSpec::space` disagrees with the deployed action space, or a `JointDelta`
+//         deployment's action port is not in increment units (spec 8.5)
 // XIR-032 task `ActionSpec::control_rate_hz` disagrees with `Deployment.rate.control` (spec 9.2)
 // XIR-040 Evaluation IR references a different Task or Observation IR (spec 10.4)
 // XIR-050 `INV-15`: an augmentation node would stay on during evaluation (spec 7.3, spec 10.4)
@@ -333,6 +334,31 @@ fn learning_deployment(b: &IrBundle, out: &mut Vec<Diagnostic>) {
         );
     }
 
+    // **An increment is not a target** (spec 8.5, plan T). A `JointDelta` deployment says the
+    // number the runtime integrates is rad *per control tick*, so the Learning IR's
+    // `Normalizer { Inverse }` statistics -- and therefore the action port it produces -- are
+    // in that unit and not in the absolute-target unit. `Unit::Angle` on a `JointDelta`
+    // deployment is the one mistake worth a compile error: the documents would read as a
+    // position policy, the runtime would add a position to a position, and the arm would
+    // command twice its target on the first tick. Refused here, by port name.
+    if b.deployment.action.space == DepSpace::JointDelta {
+        for port in &b.learning.outputs {
+            if port.ty.unit != Unit::AngularVelocity {
+                out.push(
+                    Diagnostic::new(
+                        codes::XIR_031,
+                        format!(
+                            "deployment executes JointDelta and the action port \"{}\" is in \
+                             {:?}; an increment is Unit::AngularVelocity (rad per control tick)",
+                            port.name, port.ty.unit
+                        ),
+                    )
+                    .with_hint("spec 8.5: the action space fixes the unit the actuator receives"),
+                );
+            }
+        }
+    }
+
     let control_hz = b.deployment.rate.control.as_hz_f64();
     let ratio = control_hz / f64::from(c.replanning_hz);
     if !(c.replanning_hz > 0.0 && ratio >= 1.0 && (ratio - ratio.round()).abs() < 1e-6) {
@@ -399,6 +425,7 @@ fn maps_to(task: TaskSpace, deployed: DepSpace) -> bool {
             | (TaskSpace::EePose, DepSpace::EePose)
             | (TaskSpace::EeDelta, DepSpace::EeDelta)
             | (TaskSpace::Gripper, DepSpace::Gripper)
+            | (TaskSpace::JointDelta, DepSpace::JointDelta)
             // A composite action is assembled from several declarations; the Task IR
             // declares one of them, so any space may feed it.
             | (_, DepSpace::Composite)

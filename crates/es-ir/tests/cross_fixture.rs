@@ -919,3 +919,107 @@ fn cross_allow_list_names_an_unknown_node() {
     f.seal();
     assert_code(&f, codes::XIR_051);
 }
+
+// --- M9 T1: `ActionSpace::JointDelta` is an addition (spec 8.5, spec 28.12 rule 1-2) ---------
+
+/// The committed documents, and the one rule that keeps them where they are.
+///
+/// `DeploymentIr::deployment_hash` writes `self.action.space as u8`, so a variant inserted
+/// anywhere but the end of the enum renumbers `EePose`, `Gripper` and `Composite` and moves
+/// every `deployment_hash` written since M2. The four hashes below are what pins that; the
+/// delta document beside them is the other half of the rule -- same envelope, different
+/// execution semantics, different hash (spec 5.3).
+///
+/// Also here, because it is the same question asked of the Learning IR: a `JointDelta`
+/// deployment whose action port is in the absolute-target unit is refused **by name**.
+#[test]
+fn committed_deployment_hashes_are_unmoved_by_joint_delta() {
+    let read = |rel: &str| {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel);
+        let toml = std::fs::read_to_string(&path).expect("the committed document");
+        es_ir::serial::deployment_from_toml(&toml).expect("it parses")
+    };
+
+    for (rel, want) in [
+        (
+            "tests/fixtures/quadruped/deployment.toml",
+            "e254b5ecb090ec55b14195c2128c1afd532c68ab7e4660f923c4a2ec2ebe25b5",
+        ),
+        (
+            "tests/fixtures/rl/deployment-reach.toml",
+            "7af05d88891f5fe6e46717c29ccb46b97e917567e1860372f10301eb1c6fafe4",
+        ),
+        (
+            "tests/fixtures/rl/deployment-rl.toml",
+            "7af05d88891f5fe6e46717c29ccb46b97e917567e1860372f10301eb1c6fafe4",
+        ),
+        (
+            "tests/fixtures/visible-learning/deployment.toml",
+            "f2f9a510438f05066a3f1c328ac36d1c82a2bf61b6971d2eca280343caa4b64f",
+        ),
+    ] {
+        let ir = read(rel);
+        assert_eq!(ir.action.space, DepSpace::JointPosition, "{rel}");
+        assert_eq!(
+            hex(&ir.deployment_hash().expect("canonical")),
+            want,
+            "{rel}"
+        );
+    }
+
+    let absolute = read("tests/fixtures/rl/deployment-reach.toml");
+    let delta = read("tests/fixtures/rl/deployment-reach-delta.toml");
+    assert_eq!(delta.action.space, DepSpace::JointDelta);
+    assert_eq!(
+        delta.safety, absolute.safety,
+        "the delta document's envelope is the absolute one's"
+    );
+    assert!(
+        delta.validate().is_empty(),
+        "a JointDelta deployment validates: {:?}",
+        delta.validate()
+    );
+    assert_ne!(
+        hex(&delta.deployment_hash().expect("canonical")),
+        hex(&absolute.deployment_hash().expect("canonical")),
+        "an increment deployment is not the absolute one"
+    );
+
+    // The XIR half. `Normalizer{Inverse}` statistics for a delta policy are rad per control
+    // tick, so the port it produces is `AngularVelocity`; `Angle` there would mean the
+    // documents read as a position policy while the runtime adds a position to a position.
+    let refused_by_name = |space: DepSpace, unit: Unit| {
+        let mut f = Fixture::new();
+        f.deployment.action.space = space;
+        for node in f.task.graph.nodes.values_mut() {
+            if let TaskNode::ActionSpec { space: s, .. } = node {
+                *s = match space {
+                    DepSpace::JointDelta => TaskSpace::JointDelta,
+                    _ => TaskSpace::JointPosition,
+                };
+            }
+        }
+        f.seal();
+        for port in &mut f.learning.outputs {
+            port.ty.unit = unit.clone();
+        }
+        f.diags()
+            .iter()
+            .any(|d| d.code.as_str() == codes::XIR_031 && d.message.contains("AngularVelocity"))
+    };
+
+    assert!(
+        !refused_by_name(DepSpace::JointPosition, Unit::Angle),
+        "an absolute deployment is not asked about increment units"
+    );
+    assert!(
+        refused_by_name(DepSpace::JointDelta, Unit::Angle),
+        "JointDelta with an absolute-target action port is refused by name"
+    );
+    assert!(
+        !refused_by_name(DepSpace::JointDelta, Unit::AngularVelocity),
+        "rad per control tick is what an increment is"
+    );
+}
