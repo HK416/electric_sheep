@@ -26,9 +26,12 @@ use std::path::PathBuf;
 use es_assets::scene::SceneDesc;
 use es_core::StableId;
 use es_ir::image::{CameraModel, ChannelFormat, ColorSpace, DistortionModel, ImageSpec};
+use es_ir::task::{SensorPath, SensorRender};
 use es_math::{Pose, Quat, Vec3};
 use es_physics_core::backend::{ModelInfo, StateView};
-use es_render::{CameraView, Channel, RenderConfig, RenderPath, Renderer, Tile, TileAtlasCfg};
+use es_render::{
+    CameraView, Channel, RenderConfig, RenderPath, Renderer, Tile, TileAtlasCfg, Tonemap,
+};
 
 use crate::EnvError;
 
@@ -40,7 +43,7 @@ use crate::EnvError;
 const MJCF_TO_OPENCV: Quat = Quat::from_xyzw(1.0, 0.0, 0.0, 0.0);
 
 /// What to render, per env step.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct EnvRendererCfg {
     /// The scene camera to render from (`SceneDesc::cameras`).
     pub camera: StableId,
@@ -48,6 +51,11 @@ pub struct EnvRendererCfg {
     pub height: u32,
     pub channel: Channel,
     pub path: RenderPath,
+    /// Linear multiplier before [`Self::tonemap`] on the `Pt` path's `Rgb8` output — a
+    /// **pass-through of what the sensor declared** (packet M7/R5), never a CLI knob. `1.0`,
+    /// the `RenderConfig` default, is what every `Rs` sensor carries.
+    pub exposure: f32,
+    pub tonemap: Tonemap,
     /// When set, every [`EnvRenderer::frame`] also writes `<dir>/<NNNNNN>.bin` + `.json`.
     pub frames_dir: Option<PathBuf>,
 }
@@ -61,8 +69,49 @@ impl EnvRendererCfg {
             height,
             channel: Channel::Rgb8,
             path: RenderPath::Rs,
+            exposure: 1.0,
+            tonemap: Tonemap::Reinhard,
             frames_dir: None,
         }
+    }
+}
+
+/// The renderer a Task IR sensor asks for (spec 6, spec 15.3; packet M7/R5).
+///
+/// The one place a declared sensor becomes an [`EnvRendererCfg`], so collection, evaluation
+/// and the showcase cannot render the same document three different ways. `spec` is the
+/// declared [`ImageSpec`] and is **read, never rewritten** — the size is the document's and
+/// `EnvRenderer::check` still refuses a camera that produces something else (`INV-14`).
+///
+/// [`SensorPath::Rs`] maps to exactly [`EnvRendererCfg::rgb`], field for field, which is what
+/// keeps every committed frame and every render golden bitwise (spec 28.10 rule 1). `Pt` maps
+/// to R3's estimator — NEE on, `ReSTIR` and `SVGF` off — and to **no accumulation** (R4): an
+/// observation frame is a pure function of the pose it was rendered from, which is what the
+/// collector/evaluator parity oracle needs.
+pub fn sensor_cfg(
+    camera: StableId,
+    spec: &ImageSpec,
+    render: &SensorRender,
+    frames_dir: Option<PathBuf>,
+) -> EnvRendererCfg {
+    EnvRendererCfg {
+        path: match render.path {
+            SensorPath::Rs => RenderPath::Rs,
+            SensorPath::Pt { spp, bounces } => RenderPath::Pt {
+                spp,
+                bounces,
+                nee: true,
+                restir: false,
+                svgf: false,
+            },
+        },
+        exposure: render.exposure,
+        tonemap: match render.tonemap {
+            es_ir::task::Tonemap::Reinhard => Tonemap::Reinhard,
+            es_ir::task::Tonemap::Aces => Tonemap::Aces,
+        },
+        frames_dir,
+        ..EnvRendererCfg::rgb(camera, spec.width, spec.height)
     }
 }
 
@@ -70,7 +119,12 @@ impl EnvRendererCfg {
 /// CPU reference (`es_render::cpu`) cannot drift apart — every golden and the GPU/CPU
 /// comparison depend on them being the same config.
 pub fn render_config(cfg: &EnvRendererCfg) -> RenderConfig {
-    config(cfg.width, cfg.height, cfg.channel, cfg.path)
+    let mut out = config(cfg.width, cfg.height, cfg.channel, cfg.path);
+    // The sensor's own two pass-through fields (packet M7/R5). Both default to what
+    // `RenderConfig` already carried, so an `Rs` sensor is byte for byte today's config.
+    out.exposure = cfg.exposure;
+    out.tonemap = cfg.tonemap;
+    out
 }
 
 /// [`render_config`] without an [`EnvRendererCfg`], for a camera that is not a scene camera

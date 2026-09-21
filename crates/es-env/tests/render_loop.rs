@@ -20,7 +20,9 @@ use std::path::PathBuf;
 
 use es_assets::scene::SceneDesc;
 use es_core::StableId;
-use es_env::render::{body_poses, camera_view, check_image_spec, image_spec, render_config};
+use es_env::render::{
+    body_poses, camera_view, check_image_spec, image_spec, render_config, sensor_cfg,
+};
 use es_env::{EnvError, EnvRenderer, EnvRendererCfg};
 use es_gpu::{Gpu, GpuOptions, SlangCompiler};
 use es_ir::image::{ChannelFormat, ColorSpace, ImageDType};
@@ -284,6 +286,210 @@ fn cpu_frame_matches_the_golden() {
         "the overhead camera rendered nothing"
     );
     println!("bit-equal CPU vs golden: {GOLDEN}");
+}
+
+/// Packet M7/R5's measurement: what a path-traced observation costs beside the rasterized
+/// one, and how similar the two pictures are (spec 15.3).
+///
+/// Not an assertion -- spec 15.3 asks for an SSIM *threshold* and `renderer.md` 10.4 records
+/// why nobody has set one. This is that number at **observation** resolution, on the same 32
+/// ticks of the committed `.estraj` trajectory, so the two renderers are given the identical
+/// scene and the difference is theirs alone. Run with
+/// `cargo test -p es-env --features render --test render_loop --release -- --ignored
+/// --nocapture pt_observation_cost_and_ssim`; the frames land under `target/plan-u/r5/`.
+#[test]
+#[ignore = "measurement; run explicitly"]
+fn pt_observation_cost_and_ssim() {
+    use std::time::Instant;
+
+    const TICKS: usize = 32;
+    let test = "pt_observation_cost_and_ssim";
+    let Some(gpu) = open(test) else { return };
+    let scene = scene();
+    let traj = es_env::traj::Trajectory::read(
+        &repo_root().join("tests/fixtures/visible-learning/run/traj/nominal-00.estraj"),
+    )
+    .expect("the committed trajectory");
+    let stride = (traj.ticks() / TICKS).max(1);
+    let ticks: Vec<usize> = (0..TICKS)
+        .map(|i| i * stride)
+        .take_while(|t| *t < traj.ticks())
+        .collect();
+    assert!(!ticks.is_empty(), "the committed trajectory is empty");
+
+    let declared = es_ir::serial::task_from_toml(
+        &std::fs::read_to_string(repo_root().join("tests/fixtures/visible-learning/task-pt.toml"))
+            .expect("task-pt.toml"),
+    )
+    .expect("task-pt.toml parses");
+    let render = match &declared.observation_spec.channels["rgb_overhead"].source {
+        es_ir::task::ObsSource::Sensor { render, .. } => *render,
+        other => panic!("{other:?}"),
+    };
+    let spec = image_spec(&scene, &cfg(&scene)).expect("the overhead camera resolves");
+
+    // One renderer per path, kept across the ticks, exactly as `EnvRenderer` keeps it.
+    let shot = |render: &es_ir::task::SensorRender, label: &str| -> (Vec<Vec<u8>>, f64) {
+        let cfg = sensor_cfg(overhead(&scene), &spec, render, None);
+        let mut renderer = es_render::Renderer::new(&gpu, render_config(&cfg)).expect("renderer");
+        let mut cache = es_render::SceneCache::default();
+        let mut frames = Vec::new();
+        let start = Instant::now();
+        for tick in &ticks {
+            let world = traj.poses(*tick);
+            let tri = cache.tri_scene(&scene, &world).expect("tessellates");
+            let view = camera_view(&scene, &cfg, &world).expect("the camera resolves");
+            renderer.upload_tris(tri).expect("upload");
+            frames.push(
+                renderer
+                    .render(&[view])
+                    .expect("render")
+                    .read_tile(0, Channel::Rgb8)
+                    .expect("rgb8")
+                    .to_bytes(),
+            );
+        }
+        let ms = start.elapsed().as_secs_f64() * 1000.0 / ticks.len() as f64;
+        println!("| {label} | {ms:.2} ms/frame | {} tick(s) |", ticks.len());
+        (frames, ms)
+    };
+
+    let (rs, rs_ms) = shot(
+        &es_ir::task::SensorRender::default(),
+        "Rs (today's observation)",
+    );
+    let (pt, pt_ms) = shot(
+        &render,
+        &format!("Pt {:?} exposure {}", render.path, render.exposure),
+    );
+
+    let mean = |v: &[u8]| v.iter().map(|b| u32::from(*b)).sum::<u32>() / v.len() as u32;
+    let ssim: Vec<f64> = rs
+        .iter()
+        .zip(&pt)
+        .map(|(a, b)| es_render::ssim(a, b, W, H))
+        .collect();
+    let avg = ssim.iter().sum::<f64>() / ssim.len() as f64;
+    println!(
+        "SSIM over {} ticks at {W}x{H}: mean {avg:.4}, min {:.4}, max {:.4}",
+        ssim.len(),
+        ssim.iter().copied().fold(f64::INFINITY, f64::min),
+        ssim.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+    );
+    println!(
+        "mean byte: Rs {} / Pt {}; cost ratio Pt/Rs {:.1}x",
+        mean(&rs[0]),
+        mean(&pt[0]),
+        pt_ms / rs_ms
+    );
+
+    // The exposure sweep the fixture's own value was chosen from: one tick, every exposure,
+    // mean byte and SSIM against the rasterized observation of the same tick.
+    let world = traj.poses(ticks[0]);
+    for exposure in [1.0f32, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0] {
+        let one = es_ir::task::SensorRender { exposure, ..render };
+        let cfg = sensor_cfg(overhead(&scene), &spec, &one, None);
+        let mut r = es_render::Renderer::new(&gpu, render_config(&cfg)).expect("renderer");
+        let tri = TriScene::from_scene_with_poses(&scene, &world).expect("tessellates");
+        r.upload_tris(tri).expect("upload");
+        let bytes = r
+            .render(&[camera_view(&scene, &cfg, &world).expect("camera")])
+            .expect("render")
+            .read_tile(0, Channel::Rgb8)
+            .expect("rgb8")
+            .to_bytes();
+        println!(
+            "| exposure {exposure} | mean byte {} | SSIM {:.4} | (Rs mean byte {}) |",
+            mean(&bytes),
+            es_render::ssim(&rs[0], &bytes, W, H),
+            mean(&rs[0])
+        );
+    }
+
+    // The frames a person looks at: the contact sheet is made from these.
+    let out = repo_root().join("target/plan-u/r5");
+    std::fs::create_dir_all(&out).expect("output dir");
+    for (i, (a, b)) in rs.iter().zip(&pt).enumerate() {
+        std::fs::write(out.join(format!("rs-{i:03}.bin")), a).expect("write");
+        std::fs::write(out.join(format!("pt-{i:03}.bin")), b).expect("write");
+    }
+    std::fs::write(
+        out.join("layout.json"),
+        format!("{{\"dtype\":\"u8\",\"shape\":[{H},{W},3]}}\n"),
+    )
+    .expect("write");
+    println!("wrote {} frame pair(s) to {}", rs.len(), out.display());
+}
+
+/// Packet M7/R5 oracle 2: the config a **default** sensor asks for is the config the three
+/// call sites hand-built until now, field for field — and it renders the committed golden
+/// bitwise.
+///
+/// Field for field and not "the fields I remembered": `assert_eq!` on the whole struct is what
+/// makes a later field added to `EnvRendererCfg` and forgotten in `sensor_cfg` fail here.
+#[test]
+fn sensor_cfg_rs_is_todays_config() {
+    let scene = scene();
+    let today = cfg(&scene);
+    let spec = image_spec(&scene, &today).expect("the overhead camera resolves");
+    let from_sensor = sensor_cfg(
+        overhead(&scene),
+        &spec,
+        &es_ir::task::SensorRender::default(),
+        None,
+    );
+    assert_eq!(from_sensor, today, "a default sensor is not today's config");
+
+    // ... including the `RenderConfig` it becomes, which is what the pixels are a function of.
+    let want = std::fs::read(golden_dir().join(format!("{GOLDEN}.bin"))).expect("the golden");
+    let f = fixed(&scene);
+    let world = body_poses(&f.model, &f.state(), 0);
+    let tri = TriScene::from_scene_with_poses(&scene, &world).expect("the fixture tessellates");
+    let view = camera_view(&scene, &from_sensor, &world).expect("the overhead camera resolves");
+    let got = cpu::rasterize(&tri, &view, &render_config(&from_sensor), 0)
+        .tile(Channel::Rgb8)
+        .expect("Rgb8 was requested")
+        .to_bytes();
+    assert!(
+        got == want,
+        "{GOLDEN} differs when the config comes from the sensor"
+    );
+
+    // A `Pt` sensor changes the path and nothing else about the camera or the size.
+    let pt = sensor_cfg(
+        overhead(&scene),
+        &spec,
+        &es_ir::task::SensorRender {
+            path: es_ir::task::SensorPath::Pt {
+                spp: 64,
+                bounces: 3,
+            },
+            exposure: 32.0,
+            tonemap: es_ir::task::Tonemap::Aces,
+        },
+        None,
+    );
+    assert_eq!(
+        pt.path,
+        es_render::RenderPath::Pt {
+            spp: 64,
+            bounces: 3,
+            nee: true,
+            restir: false,
+            svgf: false
+        }
+    );
+    assert_eq!((pt.camera, pt.width, pt.height), (today.camera, W, H));
+    assert_eq!(pt.channel, Channel::Rgb8);
+    let rc = render_config(&pt);
+    assert_eq!(rc.exposure.to_bits(), 32.0f32.to_bits());
+    assert_eq!(rc.tonemap, es_render::Tonemap::Aces);
+    // R4's accumulation is not on the observation path: every frame stands alone.
+    assert!(
+        rc.temporal.is_none(),
+        "an observation frame must not accumulate"
+    );
+    println!("RAN sensor_cfg_rs_is_todays_config");
 }
 
 #[test]
