@@ -1565,6 +1565,17 @@ and it does not change the conclusion. `Target / Status: unverified` for any §1
 still stands; what this adds is that the number does not improve when you stop looking at the
 pretty render and start looking at the one the policy reads.
 
+`target/plan-u/r5/contact-sheet.png` is one whole expert demonstration (seed 1, 511 ticks, eight
+ticks shown) collected twice — once under `task.toml` and once under `task-pt.toml` — with the
+`Rs` row above the `Pt` row. Both runs report the same dataset `content` digest
+`ef2e904d…`, so the two rows really are the same states, and the only difference is how they
+were drawn. What a person sees in it is the thing no number above says: **at 64 spp the
+path-traced observation is visibly grainy.** The grain is deterministic (fixed `seed`, sample
+keys addressed by pixel), so it is a fixed pattern per pose rather than noise a policy could
+average away over epochs — it is closer to a texture than to augmentation, and it is the most
+likely reason for whatever [visible-learning 7.32](visible-learning.md)'s row U4 turns out to
+say.
+
 ### 12.6 The exposure, which is a decision this packet had to make
 
 The packet's sketch of `task-pt.toml` pinned `spp` and `bounces` and left `exposure` at its
