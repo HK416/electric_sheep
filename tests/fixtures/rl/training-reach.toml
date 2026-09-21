@@ -1,0 +1,63 @@
+# The RL route on the reach task (packet M8/S4e): PPO against `task-reach.toml`'s reward --
+# `-||cube_pos - gripper_pos||` with a bonus on success -- over rollouts in our own `Env` and
+# through our own Safety Plane.
+#
+# `es train --recipe tests/fixtures/rl/training-reach.toml --out <dir> --dry-run` prints the
+# plan pinned by `tests/golden/train/plan-reach.txt`; as with every other recipe here, nothing
+# it names has to exist for `--dry-run`.
+#
+# The bundle is the four reach documents plus `learning-reach.toml`, packed with placeholder
+# weights:
+#
+#     ES_PACK_TASK=tests/fixtures/rl/task-reach.toml \
+#     ES_PACK_OBSERVATION=tests/fixtures/rl/observation-reach.toml \
+#     ES_PACK_LEARNING=tests/fixtures/rl/learning-reach.toml \
+#     ES_PACK_DEPLOYMENT=tests/fixtures/rl/deployment-reach.toml \
+#     ES_PACK_OUT=runs/reach-001/untrained.esb \
+#     cargo test -p es --test cli -- --ignored pack_untrained_bundle
+#
+# What differs from `training-rl-demo.toml`, and why:
+#
+#  * **`envs = 16`** rather than 8. The reach reward moves -- the demo's does not (section 7's
+#    S4b row) -- so the gradient is worth the wider batch: 16 x 64 = 1,024 rows an iteration.
+#  * **`steps = 4000`** -- 4.1M control ticks, 12.6 minutes on the oracle server. The episode
+#    is 200 control steps, so a rollout of 64 is about a third of one and an episode spans
+#    three iterations. THE NUMBER IS THE MEASURED PEAK AND NOT A ROUND ONE: packet M8/S4e ran
+#    the same recipe out to 10,000 iterations and scored every quarter of it, and
+#    `success_rate` on `nominal` climbs 0.00 -> 0.19 -> 0.44 -> **0.5625** at 4,000 and then
+#    decays -- 0.50 at 5,000, 0.3125 at 7,500 and at 10,000, with the rollout entropy rising
+#    5.52 -> 4.87 -> 6.06 over the same span. More budget is not what this task is short of
+#    (docs/design/rl-continuation.md section 7).
+#  * **`checkpoint_at`** marks the quarters, so the curve can be scored at a budget shorter
+#    than the whole run without rerunning it.
+#
+# Everything else is `training-rl-demo.toml`'s, including the three things that are absent on
+# purpose and are each a refusal if you put them back: `[dataset]` (PPO's data is the rollout
+# it generates), `[run] batch` (derived: `envs * horizon`), and the value head and `log_std`
+# (training-only state, `training/value.safetensors`, `training_hash` and never
+# `learning_hash`).
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-001/untrained.esb"
+
+[rl]
+algo        = "ppo"
+envs        = 16
+horizon     = 64
+epochs      = 4
+minibatches = 4
+gamma       = 0.99
+lam         = 0.95
+clip        = 0.2
+entropy     = 0.005
+value_coef  = 0.5
+
+[run]
+steps         = 4000
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [1000, 2000, 3000]
+device        = "cpu"
+interpreter   = "python"

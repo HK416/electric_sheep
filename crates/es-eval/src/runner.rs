@@ -1160,6 +1160,20 @@ pub enum Capture {
     /// which is why `run_episode` refuses a model carrying fewer than `NJ` of them — and the
     /// only reading available, because that channel names a body and a count, not joints.
     Joints(usize),
+    /// A `quantity = Velocity` channel whose id **is** a joint of the loaded model: `dof`
+    /// velocities from that joint's first dof (packet M8/S4e). The channel names the block's
+    /// first joint and how wide the block is; the model says where that joint's dofs start,
+    /// which is the one thing the documents cannot know.
+    Qvel(es_physics_core::backend::IndexRange),
+    /// The leading `dof` joint velocities of env 0 — the mirror of [`Self::Joints`], for a
+    /// `Velocity` channel that names a body rather than a joint.
+    JointsVel(usize),
+    /// An `ObsSource::BodyPose(b)` channel: body `b`'s row of `xpos` and `xquat`, read as
+    /// `pos[3] ‖ quat[4]` with the quaternion in the order `StateView` documents — xyzw
+    /// (spec 3.1). A **free-joint** body never reaches this arm: its pose is in `qpos` and
+    /// the [`Self::Qpos`] arm answers it first, which is what serves the demo's
+    /// `sim_cube_pose`.
+    BodyPose(usize),
     /// An `ObservationNode::ImageInput`: the frame source's bytes, unconverted.
     Image,
 }
@@ -1176,7 +1190,7 @@ pub fn input_sources(
     task: &TaskIr,
     model: Option<&ModelInfo>,
 ) -> Result<BTreeMap<String, Capture>, EvalError> {
-    use es_ir::task::ObsSource;
+    use es_ir::task::{JointQuantity, ObsSource};
 
     let state_channels = task
         .observation_spec
@@ -1194,16 +1208,97 @@ pub fn input_sources(
             obs.graph.nodes.values().any(
                 |n| matches!(n, ObservationNode::ImageInput { sensor, .. } if *sensor == source),
             );
-        let joints = task
+        // Every channel that names this plan input. `CpuPlan` allocates **one** input buffer
+        // per source id (`Home::Input(id.to_string())`), so a second channel on the same id
+        // would be handed the first one's bytes with no error anywhere — which is exactly the
+        // silent wrong number §10.1 forbids. The IRs can express the pair (a joint block read
+        // at two quantities, packet M8/S4e); the lowering cannot serve it yet, so it is
+        // refused here, by name, where the wrongness would happen.
+        let claimed: Vec<(&String, &ObsSource)> = task
             .observation_spec
             .channels
-            .values()
-            .find_map(|c| match c.source {
-                ObsSource::JointState { body, dof } if body == source => Some(dof as usize),
-                _ => None,
-            });
+            .iter()
+            .filter(|(_, c)| {
+                matches!(c.source,
+                    ObsSource::JointState { body, .. } | ObsSource::BodyPose(body)
+                        if body == source)
+            })
+            .map(|(n, c)| (n, &c.source))
+            .collect();
+        if claimed.len() > 1 {
+            let names: Vec<&str> = claimed.iter().map(|(n, _)| n.as_str()).collect();
+            return Err(EvalError::Plan(format!(
+                "observation input \"{name}\" is named by {} channels ({}); the observation \
+                 plan allocates one input buffer per source id, so they would be served the \
+                 same bytes",
+                claimed.len(),
+                names.join(", ")
+            )));
+        }
+        let declared = claimed.first().map(|(_, s)| *s);
+        // A channel the model's own maps cannot answer says so itself: a velocity, or the
+        // pose of a body that has no joint. Both are read before the `qpos` / `sensor` arms
+        // so that a `Position` channel resolves exactly as it did before this packet.
+        let velocity = match declared {
+            Some(ObsSource::JointState {
+                dof,
+                quantity: JointQuantity::Velocity,
+                ..
+            }) => Some(*dof),
+            Some(ObsSource::JointState {
+                quantity: q @ JointQuantity::Torque,
+                ..
+            }) => {
+                return Err(EvalError::Plan(format!(
+                    "observation input \"{name}\" declares quantity {q:?}; StateView carries \
+                     qpos, qvel and sensordata, and no joint torque array"
+                )))
+            }
+            _ => None,
+        };
+        let body_pose = match declared {
+            // A **free-joint** body's pose is in `qpos`, and the arm below answers it — which
+            // is what serves the demo's cube. Every other body is only in `xpos` / `xquat`.
+            Some(ObsSource::BodyPose(b)) if !model.is_some_and(|m| m.qpos.contains_key(b)) => {
+                Some(*b)
+            }
+            _ => None,
+        };
+        let joints = match declared {
+            Some(ObsSource::JointState { dof, .. }) => Some(*dof as usize),
+            _ => None,
+        };
         let how = if is_image {
             Capture::Image
+        } else if let Some(dof) = velocity {
+            let Some(m) = model else {
+                return Err(EvalError::Plan(format!(
+                    "observation input \"{name}\" is a joint **velocity** channel, and there \
+                     is no loaded model here (the frames are recorded): a dataset row carries \
+                     observation.state, not qvel"
+                )));
+            };
+            match m.dof.get(&source) {
+                // The channel names the block's first joint and how wide the block is; the
+                // model says where that joint's dofs start.
+                Some(r) => Capture::Qvel(es_physics_core::backend::IndexRange::new(r.start, dof)),
+                None => Capture::JointsVel(dof as usize),
+            }
+        } else if let Some(b) = body_pose {
+            let Some(m) = model else {
+                return Err(EvalError::Plan(format!(
+                    "observation input \"{name}\" is a BodyPose channel, and there is no \
+                     loaded model here (the frames are recorded): a dataset row carries \
+                     observation.state, not xpos and xquat"
+                )));
+            };
+            let row = m.body.get(&b).ok_or_else(|| {
+                EvalError::Plan(format!(
+                    "observation input \"{name}\" is a BodyPose channel naming a body that is \
+                     not in the loaded model"
+                ))
+            })?;
+            Capture::BodyPose(row.start as usize)
         } else if let Some(r) = model.and_then(|m| m.qpos.get(&source)) {
             Capture::Qpos(*r)
         } else if let Some(r) = model.and_then(|m| m.sensor.get(&source)) {
@@ -1234,7 +1329,8 @@ pub fn input_sources(
             };
             return Err(EvalError::Plan(format!(
                 "observation input \"{name}\" is none of: {model}an ImageInput of the \
-                 Observation IR, or a JointState channel of the Task IR's ObservationSpec"
+                 Observation IR, or a JointState or BodyPose channel of the Task IR's \
+                 ObservationSpec"
             )));
         };
         out.insert(name.clone(), how);
@@ -1275,6 +1371,47 @@ pub fn capture(
                     )));
                 }
                 q[..dof].to_vec()
+            }
+            Capture::Qvel(r) => {
+                let qd = state.qvel_of(0);
+                let end = (r.start + r.len) as usize;
+                if qd.len() < end {
+                    return Err(EvalError::Plan(format!(
+                        "observation input \"{name}\" wants qvel[{}..{end}]; the model carries \
+                         {}",
+                        r.start,
+                        qd.len()
+                    )));
+                }
+                qd[r.as_range()].to_vec()
+            }
+            Capture::JointsVel(dof) => {
+                let qd = state.qvel_of(0);
+                if qd.len() < dof {
+                    return Err(EvalError::Plan(format!(
+                        "observation input \"{name}\" wants {dof} joint velocities; the model \
+                         carries {}",
+                        qd.len()
+                    )));
+                }
+                qd[..dof].to_vec()
+            }
+            // `pos[3] ‖ quat[4]`, the quaternion in `StateView`'s own order: xyzw (spec 3.1).
+            // Env 0's row, like every other arm here; `es_py::rollout` hands this function a
+            // one-env view of the env it means.
+            Capture::BodyPose(row) => {
+                let (p, q) = (row * 3, row * 4);
+                if state.xpos.len() < p + 3 || state.xquat.len() < q + 4 {
+                    return Err(EvalError::Plan(format!(
+                        "observation input \"{name}\" wants body row {row} of xpos/xquat; the \
+                         state carries {} and {}",
+                        state.xpos.len(),
+                        state.xquat.len()
+                    )));
+                }
+                let mut v = state.xpos[p..p + 3].to_vec();
+                v.extend_from_slice(&state.xquat[q..q + 4]);
+                v
             }
             Capture::Image => {
                 // Without a frame source there is no renderer in this build (§4.3, es-render is

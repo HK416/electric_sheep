@@ -774,9 +774,30 @@ pub enum ObsSource {
     JointState {
         body: StableId,
         dof: u32,
+        /// Which joint quantity the channel carries, mirroring
+        /// [`TaskNode::GetJointState`]'s own field (spec 6.3).
+        ///
+        /// Absent = [`JointQuantity::Position`] = today's canonical form (packet M8/S4e,
+        /// the rule packet M7/R5 set for [`SensorRender`]), so no committed `task_hash`
+        /// moves. A `Velocity` channel does move it, and is therefore a new document
+        /// (spec 13.3).
+        #[serde(default = "joint_position", skip_serializing_if = "is_joint_position")]
+        quantity: JointQuantity,
     },
     BodyPose(StableId),
     Language,
+}
+
+fn joint_position() -> JointQuantity {
+    JointQuantity::Position
+}
+
+/// Whether this is the quantity an absent `quantity` means. The serde `skip_serializing_if`
+/// and the canonical-form rule are the same predicate, so a document that omits it and a
+/// document that writes it out cannot disagree.
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's `skip_serializing_if` wants `&T`
+fn is_joint_position(q: &JointQuantity) -> bool {
+    matches!(q, JointQuantity::Position)
 }
 
 impl ObsSource {
@@ -792,10 +813,18 @@ impl ObsSource {
                     render.canonical(w);
                 }
             }
-            Self::JointState { body, dof } => {
+            Self::JointState {
+                body,
+                dof,
+                quantity,
+            } => {
                 w.str("JointState");
                 wid(w, body);
                 w.u32(*dof);
+                // Only when it is not the default: see the field's own note.
+                if !is_joint_position(quantity) {
+                    wdbg(w, quantity);
+                }
             }
             Self::BodyPose(id) => {
                 w.str("BodyPose");
@@ -1226,7 +1255,11 @@ pub mod testing {
         channels.insert(
             "joint_state".to_owned(),
             ObsChannel {
-                source: ObsSource::JointState { body: arm, dof },
+                source: ObsSource::JointState {
+                    body: arm,
+                    dof,
+                    quantity: JointQuantity::Position,
+                },
                 ty: joint_ty,
             },
         );

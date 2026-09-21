@@ -198,6 +198,7 @@ fn task_ir() -> TaskIr {
                 source: ObsSource::JointState {
                     body: robot_id(),
                     dof: DOF,
+                    quantity: JointQuantity::Position,
                 },
                 ty: joints,
             },
@@ -3304,6 +3305,7 @@ fn add_privileged_cube_pose(
             source: ObsSource::JointState {
                 body: joint,
                 dof: 7,
+                quantity: JointQuantity::Position,
             },
             ty: pose.clone(),
         },
@@ -5890,6 +5892,7 @@ fn go1_task(scene: &es_assets::scene::SceneDesc, xml: &[u8]) -> TaskIr {
             source: ObsSource::JointState {
                 body: trunk,
                 dof: GO1_OBS_DIM as u32,
+                quantity: JointQuantity::Position,
             },
             ty: go1_state_ty(Frame::World),
         },
@@ -10809,7 +10812,27 @@ fn train_rl_dry_run_plan() {
     );
 }
 
-/// Regenerates `tests/golden/train/plan-rl.txt`.
+/// Packet M8/S4e oracle 4: the reach recipe's plan is a golden of its own.
+///
+/// The same property `train_rl_dry_run_plan` asserts for the demo recipe, on the document the
+/// reach measurement is actually run from -- so a change to `envs`, `horizon` or the budget is
+/// a failing test rather than a number in `rl-continuation.md` nobody can trace to a recipe.
+#[test]
+fn train_reach_dry_run_plan() {
+    const RECIPE: &str = "tests/fixtures/rl/training-reach.toml";
+    let dir = scratch_dir("train-reach-dry");
+    let out = run_train(RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let golden = train_golden("plan-reach.txt");
+    let want =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(stdout(&out), want, "{RECIPE}: stdout is not the golden");
+    assert!(want.starts_with("# route: rl\n"), "{want}");
+    assert!(want.contains("--envs 16 --horizon 64"), "{want}");
+    assert!(want.contains("--iterations 4000"), "{want}");
+}
+
+/// Regenerates `tests/golden/train/plan-rl.txt` and `plan-reach.txt`.
 #[test]
 #[ignore = "golden generator; run explicitly"]
 fn generate_rl_plan_golden() {
@@ -10817,14 +10840,15 @@ fn generate_rl_plan_golden() {
         println!("SKIP generate_rl_plan_golden: set ES_GENERATE_GOLDENS=1 to regenerate");
         return;
     }
-    let dir = scratch_dir("train-rl-golden");
-    let out = run_train(
-        "tests/fixtures/rl/training-rl-demo.toml",
-        &dir,
-        &["--dry-run"],
-    );
-    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
-    write(&train_golden("plan-rl.txt"), &stdout(&out));
+    for (recipe, golden) in [
+        ("tests/fixtures/rl/training-rl-demo.toml", "plan-rl.txt"),
+        ("tests/fixtures/rl/training-reach.toml", "plan-reach.txt"),
+    ] {
+        let dir = scratch_dir("train-rl-golden");
+        let out = run_train(recipe, &dir, &["--dry-run"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+        write(&train_golden(golden), &stdout(&out));
+    }
 }
 
 /// Runs one real `[rl]` recipe end to end under `ES_PYTHON`, or says why it did not.
@@ -11271,16 +11295,26 @@ fn reach_task() -> TaskIr {
         (
             "joint_pos".to_owned(),
             ObsChannel {
-                source: ObsSource::JointState { body: base, dof: 6 },
+                source: ObsSource::JointState {
+                    body: base,
+                    dof: 6,
+                    quantity: JointQuantity::Position,
+                },
                 ty: joints6(Unit::Angle),
             },
         ),
         (
             "joint_vel".to_owned(),
             ObsChannel {
+                // The block's first joint and six velocities from there. It is **not**
+                // `base`, and that is the lowering's constraint, not the IR's: `CpuPlan`
+                // names one input buffer per source id, so two channels on `base` would be
+                // handed one buffer and `joint_vel` would silently repeat `joint_pos`
+                // (packet M8/S4e; `es_eval::runner::input_sources` refuses the pair by name).
                 source: ObsSource::JointState {
                     body: joint("shoulder_pan"),
                     dof: 6,
+                    quantity: JointQuantity::Velocity,
                 },
                 ty: joints6(Unit::AngularVelocity),
             },
@@ -11291,6 +11325,7 @@ fn reach_task() -> TaskIr {
                 source: ObsSource::JointState {
                     body: joint("cube_free"),
                     dof: 7,
+                    quantity: JointQuantity::Position,
                 },
                 ty: pose7.clone(),
             },
@@ -11419,11 +11454,14 @@ fn reach_evaluation(task: &TaskIr, observation: &ObservationIr) -> EvaluationIr 
     ev
 }
 
-/// A Learning IR the reach documents do **not** ship: `cross::check` needs all four sides, and
-/// the policy is the packet after this one (S4, the PPO trainer). Nothing here is written to
-/// disk -- it exists so the three boundaries that touch the contract are checked against the
-/// shapes the four committed documents declare.
-fn reach_learning_stand_in() -> LearningGraph {
+/// The reach task's Learning IR, `tests/fixtures/rl/learning-reach.toml` (packet M8/S4e).
+///
+/// One 26-wide port, one MLP, a horizon-1 regression head and a `Normalizer { Inverse }` whose
+/// statistics are the scene's own `ctrlrange`s -- so the module's output is in **actuator
+/// units**, which is what `es_native.Rollout::act` takes and therefore what `train_ppo.py`'s
+/// Gaussian is defined around (`docs/design/rl-continuation.md` section 2). No `Fusion`: the
+/// reach Observation IR concatenates its four channels itself and hands the policy one tensor.
+fn reach_learning() -> LearningGraph {
     let state = Port::new(
         "state",
         PortType {
@@ -11457,7 +11495,10 @@ fn reach_learning_stand_in() -> LearningGraph {
             kind: HeadKind::Regression,
             action_dim: 6,
             horizon: 1,
-            squash: es_ir::learning::Squash::None,
+            // Squashed into [-1, 1] before the unnormalizer, for the reason
+            // `learning-state.toml` gives: the Gaussian's mean is then always inside the
+            // actuator's own range and the plane clamps the *sample*, not the mean.
+            squash: Squash::Tanh,
         },
     );
     nodes.insert(
@@ -11472,15 +11513,33 @@ fn reach_learning_stand_in() -> LearningGraph {
             buffer_chunks: 2,
         },
     );
+    let range = demo_ctrlrange();
+    nodes.insert(
+        NodeId(3),
+        LearningNode::Normalizer {
+            inputs: vec![Port::new("actions", chunk.clone())],
+            direction: es_ir::learning::NormalizeDir::Inverse,
+            stats: es_ir::learning::StatsSource::MeanStd {
+                mean: range.iter().map(|(lo, hi)| (lo + hi) / 2.0).collect(),
+                std: range.iter().map(|(lo, hi)| (hi - lo) / 2.0).collect(),
+            },
+            out_unit: Unit::Angle,
+        },
+    );
     nodes.connect(NodeId(0), "out", NodeId(1), "feat");
     nodes.connect(NodeId(1), "chunk", NodeId(2), "chunk");
+    nodes.connect(NodeId(2), "actions", NodeId(3), "actions");
     nodes.inputs.push(PortRef::new(NodeId(0), "state"));
-    nodes.outputs.push(PortRef::new(NodeId(2), "out"));
+    nodes.outputs.push(PortRef::new(NodeId(3), "out"));
+    let actions = PortType {
+        unit: Unit::Angle,
+        ..chunk.clone()
+    };
     LearningGraph {
         schema_version: 1,
         inputs: vec![state.clone()],
         nodes,
-        outputs: vec![Port::new("actions", chunk)],
+        outputs: vec![Port::new("actions", actions)],
         policy: PolicyHandle {
             architecture: ArchKind::Act,
             base_model: None,
@@ -11507,7 +11566,8 @@ fn reach_learning_stand_in() -> LearningGraph {
 }
 
 const REACH_TASK_HEADER: &str = "\
-# Task IR (spec 6) for the SO-101 reach task -- packet M8/S4d, the first RL-continuation task.
+# Task IR (spec 6) for the SO-101 reach task -- packet M8/S4d, the first RL-continuation task;
+# the observation channels say their quantity since packet M8/S4e.
 #
 # Generated by `cargo test -p es --test cli -- --ignored regenerate_reach_documents` from
 # tests/fixtures/mjcf/so101_pick_place.xml and from tests/fixtures/visible-learning/task.toml,
@@ -11539,17 +11599,24 @@ const REACH_TASK_HEADER: &str = "\
 #  * `joint_pos[6]`  -- `JointState { body = base, dof = 6 }`, the leading six of the state
 #    row, which is `qpos[0..6]`: the six joints in the XML's declaration order. This is the
 #    binding the demo's own `joint_state` channel uses.
-#  * `joint_vel[6]`  -- `qvel[0..6]`, the same six joints. `ObsSource` HAS NO VELOCITY SOURCE
-#    AND NO OFFSET, and the Cross-IR check keys a channel by its source id alone (`XIR-002`),
-#    so two joint channels cannot name the same id; this one names the block's first joint,
-#    `shoulder_pan`, and means `dof` dofs from there. `es-eval`'s capture path
-#    (crates/es-eval/src/runner.rs, `input_sources`) has no `qvel` reading at all, so this
-#    channel is served by the trainer reading the env, not by that path.
+#  * `joint_vel[6]`  -- `JointState { body = shoulder_pan, dof = 6, quantity = Velocity }`,
+#    which is `qvel[0..6]`: the same six joints. Packet M8/S4e gave `ObsSource::JointState`
+#    the quantity `GetJointState` has always carried (absent = `Position` = the canonical form
+#    every earlier document was hashed in), and `input_sources` now reads it -- a channel that
+#    names a joint starts at that joint's first dof and takes `dof` values from there.
+#    IT NAMES `shoulder_pan` AND NOT `base`, and that is the lowering's limit and not the IR's:
+#    `CpuPlan` allocates one input buffer per source id, so a position channel and a velocity
+#    channel on `base` would be served the same six numbers. The Cross-IR check accepts the
+#    pair (it tells two channels on one id apart by their declared type, which is the unit of
+#    their quantity); `es_eval::runner::input_sources` refuses it by name until the lowering
+#    can give them two buffers.
 #  * `cube_pose[7]`  -- the cube's free joint, `qpos[6..13]`: position and quaternion, exactly
 #    the demo's `sim_cube_pose` binding, and exact rather than a leading-`dof` guess.
-#  * `gripper_pose[7]` -- `BodyPose(gripper)`. The gripper has no joint of its own, so its
-#    pose is only in `xpos`/`xquat`; `input_sources` has no `BodyPose` reading either, and
-#    refuses it by name rather than serving something else.
+#  * `gripper_pose[7]` -- `BodyPose(gripper)`. The gripper has no joint of its own, so its pose
+#    is only in `xpos`/`xquat`, and packet M8/S4e reads it from there: `xpos[row*3..][..3] ||
+#    xquat[row*4..][..4]`, the quaternion in the order `StateView` documents -- xyzw (spec 3.1).
+#    A free-joint body never takes that arm: its pose is in `qpos` and the `Qpos` arm answers
+#    it first, which is what keeps the demo's cube channel byte for byte what it was.
 # All seven values of each pose carry `Unit::Length` for the reason the demo's header gives:
 # three of them are metres, the quaternion's four are dimensionless, and spec 5.4's algebra
 # has no mixed unit.
@@ -11642,6 +11709,30 @@ const REACH_EVALUATION_HEADER: &str = "\
 # rows are measurements to report, not gates to pass (spec 10.4).
 ";
 
+const REACH_LEARNING_HEADER: &str =
+    "# Learning IR (spec 8) for the SO-101 reach task under PPO -- packet M8/S4e.
+#
+# Generated by `ES_GENERATE_GOLDENS=1 cargo test -p es --test cli -- --ignored
+# regenerate_reach_documents` from tests/fixtures/mjcf/so101_pick_place.xml, so the
+# unnormalizer's mean and std are the scene's own `ctrlrange`s and are never typed in.
+#
+#   StateEncoder{Mlp [64, 64]} -> PolicyHead{Regression, tanh, 1 x 6}
+#                                   -> ActionChunker -> Normalizer{Inverse}
+#
+# ONE ENCODER, NO FUSION. observation-reach.toml concatenates its four channels itself and
+# hands the policy a single 26-wide `state` port, so there is nothing here to fuse -- which is
+# the difference from learning-state.toml, whose Observation IR produces two ports.
+#
+# The output is in **actuator units**: `Normalizer { Inverse, MeanStd }` with `mean` the centre
+# of each actuator's `ctrlrange` and `std` its half-range. That is what `es_native.Rollout::act`
+# takes and therefore what `train_ppo.py`'s Gaussian is defined around
+# (docs/design/rl-continuation.md section 2).
+#
+# The value network and the Gaussian's `log_std` are NOT here and never will be: PPO is a
+# trainer, not an IR (rule 1). They live in `training/value.safetensors` and move
+# `training_hash`, never `learning_hash`.
+";
+
 /// Regenerates `tests/fixtures/rl/{task,observation,deployment,evaluation}-reach.toml`. Run
 /// explicitly:
 ///
@@ -11665,6 +11756,11 @@ fn regenerate_reach_documents() {
             "task-reach.toml",
             REACH_TASK_HEADER,
             es_ir::serial::task_to_toml(&task).expect("task toml"),
+        ),
+        (
+            "learning-reach.toml",
+            REACH_LEARNING_HEADER,
+            es_ir::serial::learning_to_toml(&reach_learning()).expect("learning toml"),
         ),
         (
             "observation-reach.toml",
@@ -11700,19 +11796,19 @@ fn reach_documents_validate() {
         .expect("the deployment parses");
     let evaluation = es_ir::serial::evaluation_from_toml(&read("evaluation-reach.toml"))
         .expect("the evaluation parses");
+    let learning = es_ir::serial::learning_from_toml(&read("learning-reach.toml"))
+        .expect("the learning parses");
 
     for (name, diags) in [
         ("task", task.validate()),
         ("observation", observation.validate()),
         ("deployment", deployment.validate()),
         ("evaluation", evaluation.validate()),
+        ("learning", learning.validate()),
     ] {
         assert!(diags.is_empty(), "{name}-reach.toml: {diags:#?}");
     }
 
-    // The Learning IR is the next packet's; the stand-in carries the contract the four
-    // documents imply, so every `XIR_*` boundary is checked rather than assumed.
-    let learning = reach_learning_stand_in();
     let diags = cross::check(&IrBundle {
         task: &task,
         observation: &observation,
@@ -11759,6 +11855,10 @@ fn reach_documents_validate() {
     let built_obs = reach_observation(&built);
     for (name, text) in [
         ("task-reach.toml", es_ir::serial::task_to_toml(&built)),
+        (
+            "learning-reach.toml",
+            es_ir::serial::learning_to_toml(&reach_learning()),
+        ),
         (
             "observation-reach.toml",
             es_ir::serial::observation_to_toml(&built_obs),

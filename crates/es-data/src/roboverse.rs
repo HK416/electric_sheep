@@ -655,7 +655,11 @@ pub fn convert(task: &RoboVerseTask) -> Result<Converted, ConvertError> {
         channels.insert(
             channel_name,
             ObsChannel {
-                source: ObsSource::JointState { body, dof },
+                source: ObsSource::JointState {
+                    body,
+                    dof,
+                    quantity: JointQuantity::Position,
+                },
                 ty,
             },
         );

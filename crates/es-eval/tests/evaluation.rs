@@ -412,6 +412,7 @@ fn task_ir() -> TaskIr {
                     source: ObsSource::JointState {
                         body: scene().bodies[0].id,
                         dof: 1,
+                        quantity: JointQuantity::Position,
                     },
                     ty: joint_ty(Unit::Angle),
                 },
@@ -1892,6 +1893,7 @@ fn privileged_task_ir() -> TaskIr {
             source: ObsSource::JointState {
                 body: joint_id("j1"),
                 dof: 1,
+                quantity: JointQuantity::Position,
             },
             ty: PortType {
                 frame: Frame::Joint(joint_id("j1")),
@@ -2786,4 +2788,294 @@ fn episode_shards_reproduce_the_sequential_run() {
         sequential.0 .3.len(),
         sequential.1.len()
     );
+}
+
+// --- packet M8/S4e: joint velocities and a body's pose ----------------------------------------
+
+/// One `StateInput` per channel, in the order the channels are named.
+///
+/// Deliberately not `baked_observation_ir`'s shape: this fixture is about *capture*, so the
+/// graph is the thinnest thing that gives every channel its own plan input buffer.
+fn state_only_observation_ir(task: &TaskIr, order: &[&str]) -> ObservationIr {
+    let mut ir = ObservationIr::new(1, task.task_hash().expect("the task hashes"));
+    for (i, name) in order.iter().enumerate() {
+        let ch = &task.observation_spec.channels[*name];
+        let source = match ch.source {
+            ObsSource::JointState { body, .. } | ObsSource::BodyPose(body) => body,
+            ref other => panic!("{other:?} is not a state source"),
+        };
+        ir.graph.insert(
+            NodeId(i as u32),
+            ObservationNode::StateInput {
+                source,
+                io: es_ir::observation::Io::source(ch.ty.clone()),
+            },
+        );
+        ir.graph.outputs.push(PortRef::new(NodeId(i as u32), "out"));
+        ir.outputs.insert(
+            (*name).to_owned(),
+            es_ir::observation::ObservationOutput {
+                port: PortRef::new(NodeId(i as u32), "out"),
+                ty: ch.ty.clone(),
+            },
+        );
+    }
+    ir
+}
+
+/// Packet M8/S4e oracle 2: `Capture::Qvel`, `Capture::JointsVel` and `Capture::BodyPose` land
+/// the right numbers in the right ports, the quaternion is xyzw, the model-free path refuses
+/// both new kinds by name -- and the committed demo's resolution does not move.
+#[test]
+fn capture_reads_qvel_and_body_pose() {
+    use es_eval::runner::{capture, input_sources, Capture};
+    use es_physics_core::backend::IndexRange;
+
+    let s = scene();
+    let body = s.bodies[0].id;
+    let vec_ty = |n: u64, unit: Unit, frame: Frame| PortType {
+        elem: ElemType::F32,
+        shape: Shape::new([n]),
+        unit,
+        frame,
+        time: TimeRef::Tick,
+        image: None,
+    };
+
+    // A two-joint arm on one body, read three ways. `j1` is the *second* joint, so a velocity
+    // channel naming it must start at `qvel[1]` and not at `qvel[0]` -- which is the whole
+    // difference between the `Qvel` arm and the `JointsVel` one.
+    let mut task = task_ir();
+    task.observation_spec.channels.clear();
+    for (name, source, ty) in [
+        (
+            "joint_pos",
+            ObsSource::JointState {
+                body,
+                dof: 2,
+                quantity: JointQuantity::Position,
+            },
+            vec_ty(2, Unit::Angle, Frame::Joint(body)),
+        ),
+        (
+            "joint_vel",
+            ObsSource::JointState {
+                body: joint_id("j1"),
+                dof: 1,
+                quantity: JointQuantity::Velocity,
+            },
+            vec_ty(1, Unit::AngularVelocity, Frame::Joint(joint_id("j1"))),
+        ),
+        (
+            "link_pose",
+            ObsSource::BodyPose(s.bodies[1].id),
+            vec_ty(7, Unit::Length, Frame::World),
+        ),
+    ] {
+        task.observation_spec
+            .channels
+            .insert(name.to_owned(), es_ir::task::ObsChannel { source, ty });
+    }
+    let order = ["joint_pos", "joint_vel", "link_pose"];
+    let obs = state_only_observation_ir(&task, &order);
+    assert!(obs.validate().is_empty(), "{:#?}", obs.validate());
+    let plan = es_compile::plan::CpuPlan::compile(&obs, es_compile::plan::PlanMode::Debug)
+        .expect("the state graph lowers");
+
+    // Body 1 is row 1 of `xpos`/`xquat`; body 0 has no pose channel here.
+    let mut model = model();
+    model.nbody = 2;
+    model.body = [
+        (s.bodies[0].id, IndexRange::new(0, 1)),
+        (s.bodies[1].id, IndexRange::new(1, 1)),
+    ]
+    .into();
+
+    let sources = input_sources(&plan, &obs, &task, Some(&model)).expect("every input resolves");
+    let key_of = |name: &str| match task.observation_spec.channels[name].source {
+        ObsSource::JointState { body, .. } | ObsSource::BodyPose(body) => body.to_string(),
+        ref other => panic!("{other:?}"),
+    };
+    let of = |name: &str| sources[&key_of(name)];
+    assert!(matches!(of("joint_pos"), Capture::Joints(2)), "joint_pos");
+    assert!(
+        matches!(of("joint_vel"), Capture::Qvel(r) if r == IndexRange::new(1, 1)),
+        "joint_vel is {:?}",
+        of("joint_vel")
+    );
+    assert!(matches!(of("link_pose"), Capture::BodyPose(1)), "link_pose");
+
+    // Distinct values everywhere, so a wrong slice cannot look right by accident.
+    let qpos = [1.0, 2.0];
+    let qvel = [3.0, 4.0];
+    let xpos = [10.0, 11.0, 12.0, 20.0, 21.0, 22.0];
+    // Body 1's orientation, in `StateView`'s own order: x, y, z, w (spec 3.1).
+    // Exactly representable in f32, which the port is: the comparison is bitwise.
+    let xquat = [0.0, 0.0, 0.0, 1.0, 0.125, 0.25, 0.375, 0.5];
+    let state = StateView {
+        n_envs: 1,
+        tick: PhysTick(0),
+        qpos: &qpos,
+        qvel: &qvel,
+        act: &[],
+        sensordata: &[0.0],
+        xpos: &xpos,
+        xquat: &xquat,
+    };
+    let (descs, bytes, _) = capture(
+        &plan,
+        &sources,
+        &model,
+        &state,
+        None,
+        &LightOverride::default(),
+        None,
+    )
+    .expect("the capture reads every port");
+    let read = |name: &str| -> Vec<f64> {
+        let key = key_of(name);
+        let i = descs
+            .iter()
+            .position(|(n, _, _)| *n == key)
+            .unwrap_or_else(|| panic!("{name} is not in the capture"));
+        bytes[i]
+            .chunks_exact(4)
+            .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+            .collect()
+    };
+    assert_eq!(read("joint_pos"), vec![1.0, 2.0], "qpos[0..2]");
+    assert_eq!(read("joint_vel"), vec![4.0], "qvel[1..2], j1's own dof");
+    assert_eq!(
+        read("link_pose"),
+        vec![20.0, 21.0, 22.0, 0.125, 0.25, 0.375, 0.5],
+        "xpos[3..6] || xquat[4..8], the quaternion xyzw"
+    );
+
+    // A velocity channel naming a **body** takes the leading `dof` of the row instead -- the
+    // mirror of `Joints`. On its own task because this scene has only two body ids.
+    let mut leading = task.clone();
+    leading.observation_spec.channels.clear();
+    leading.observation_spec.channels.insert(
+        "body_vel".to_owned(),
+        es_ir::task::ObsChannel {
+            source: ObsSource::JointState {
+                body: s.bodies[1].id,
+                dof: 2,
+                quantity: JointQuantity::Velocity,
+            },
+            ty: vec_ty(2, Unit::AngularVelocity, Frame::World),
+        },
+    );
+    let lead_obs = state_only_observation_ir(&leading, &["body_vel"]);
+    let lead_plan =
+        es_compile::plan::CpuPlan::compile(&lead_obs, es_compile::plan::PlanMode::Debug)
+            .expect("it lowers");
+    let lead = input_sources(&lead_plan, &lead_obs, &leading, Some(&model)).expect("it resolves");
+    assert!(
+        matches!(lead[&s.bodies[1].id.to_string()], Capture::JointsVel(2)),
+        "body_vel is {:?}",
+        lead[&s.bodies[1].id.to_string()]
+    );
+    let (_, lead_bytes, _) = capture(
+        &lead_plan,
+        &lead,
+        &model,
+        &state,
+        None,
+        &LightOverride::default(),
+        None,
+    )
+    .expect("the leading-dof velocity arm reads");
+    assert_eq!(
+        lead_bytes[0]
+            .chunks_exact(4)
+            .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+            .collect::<Vec<f64>>(),
+        vec![3.0, 4.0],
+        "qvel[0..2]"
+    );
+
+    // Two channels on one id: the observation plan allocates one buffer per source id, so the
+    // pair is refused by name rather than served the same numbers twice (packet M8/S4e).
+    let mut both = task.clone();
+    both.observation_spec
+        .channels
+        .get_mut("joint_vel")
+        .expect("joint_vel")
+        .source = ObsSource::JointState {
+        body,
+        dof: 2,
+        quantity: JointQuantity::Velocity,
+    };
+    let two = state_only_observation_ir(&both, &["joint_pos"]);
+    let two_plan = es_compile::plan::CpuPlan::compile(&two, es_compile::plan::PlanMode::Debug)
+        .expect("it lowers");
+    let said = input_sources(&two_plan, &two, &both, Some(&model))
+        .expect_err("one buffer cannot serve two channels")
+        .to_string();
+    assert!(said.contains("is named by 2 channels"), "{said}");
+
+    // Model-free (recorded frames): both new kinds are refused **by name**, never guessed.
+    for (name, want) in [
+        ("joint_vel", "joint **velocity** channel"),
+        ("link_pose", "BodyPose channel"),
+    ] {
+        let mut one = task.clone();
+        one.observation_spec.channels.retain(|k, _| k == name);
+        let obs = state_only_observation_ir(&one, &[name]);
+        let plan = es_compile::plan::CpuPlan::compile(&obs, es_compile::plan::PlanMode::Debug)
+            .expect("it lowers");
+        let said = input_sources(&plan, &obs, &one, None)
+            .expect_err("a recorded row carries neither")
+            .to_string();
+        assert!(said.contains(want), "{name}: {said}");
+    }
+
+    // And the committed demo's resolution is exactly what it was: an image, the arm's leading
+    // six positions, and the cube's own `qpos` range. Pinned here, against the documents.
+    let vl = |n: &str| {
+        std::fs::read_to_string(
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/visible-learning")
+                .join(n),
+        )
+        .unwrap_or_else(|e| panic!("{n}: {e}"))
+    };
+    let demo_task = es_ir::serial::task_from_toml(&vl("task.toml")).expect("task.toml");
+    let demo_obs =
+        es_ir::serial::observation_from_toml(&vl("observation.toml")).expect("observation.toml");
+    let demo_plan =
+        es_compile::plan::CpuPlan::compile(&demo_obs, es_compile::plan::PlanMode::Debug)
+            .expect("the demo observation lowers");
+    let id_of = |n: &str| match demo_task.observation_spec.channels[n].source {
+        ObsSource::JointState { body, .. } | ObsSource::BodyPose(body) => body,
+        ObsSource::Sensor { id, .. } => id,
+        ObsSource::Language => panic!("{n} is a language channel"),
+    };
+    let (cube, arm, camera) = (
+        id_of("sim_cube_pose"),
+        id_of("joint_state"),
+        id_of("rgb_overhead"),
+    );
+    let demo_model = ModelInfo {
+        nq: 13,
+        nv: 12,
+        qpos: [(cube, IndexRange::new(6, 7))].into(),
+        ..ModelInfo::default()
+    };
+    let demo = input_sources(&demo_plan, &demo_obs, &demo_task, Some(&demo_model))
+        .expect("the demo documents resolve");
+    assert!(matches!(demo[&camera.to_string()], Capture::Image));
+    assert!(matches!(demo[&arm.to_string()], Capture::Joints(6)));
+    assert!(
+        matches!(demo[&cube.to_string()], Capture::Qpos(r) if r == IndexRange::new(6, 7)),
+        "the demo's cube channel is {:?}",
+        demo[&cube.to_string()]
+    );
+    assert_eq!(
+        demo.len(),
+        3,
+        "the demo declares three plan inputs: {demo:?}"
+    );
+    println!("RAN capture_reads_qvel_and_body_pose: demo {demo:?}");
 }

@@ -200,6 +200,7 @@ fn task_ir() -> TaskIr {
                 source: ObsSource::JointState {
                     body: robot_id(),
                     dof: DOF,
+                    quantity: JointQuantity::Position,
                 },
                 ty: joints,
             },

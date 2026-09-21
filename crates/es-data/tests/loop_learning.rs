@@ -367,6 +367,7 @@ fn task_ir() -> TaskIr {
                     source: ObsSource::JointState {
                         body: scene().bodies[0].id,
                         dof: 1,
+                        quantity: JointQuantity::Position,
                     },
                     ty: joint_ty(Unit::Angle),
                 },

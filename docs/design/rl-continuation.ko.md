@@ -87,6 +87,15 @@ IR(S4c)이 채점한다. 커밋된 SO-101 장면과 그 에피소드별 큐브 �
 - 보상: 스텝마다 `−‖cube_pos − gripper_pos‖`, 성공 시 `+1`;
 - 성공: 거리 `< 0.03` m; 타임아웃 200 제어 스텝.
 
+**2026-09-21 S4e가 다시 개정:** 이제 관측 채널은 자신이 나르는 관절 *수량*을 말한다.
+`joint_vel`은 `JointState { body = shoulder_pan, dof = 6, quantity = Velocity }`이고
+`gripper_pose`는 `BodyPose(gripper)`이며, `es-eval`의 유일한 캡처 경로가 백엔드 자신의
+`qvel`과 `xpos ‖ xquat`에서 둘 다 낸다(`docs/design/evaluation-execution.md` 2.3). body
+`base`가 아니라 블록의 첫 *관절*을 지칭하는 이유는 `CpuPlan`이 source id마다 입력 버퍼를
+하나만 잡기 때문이다: `base`를 지칭하는 두 채널은 같은 여섯 숫자를 받게 된다. IR들은 그
+쌍을 받아들이지만 로워링이 아직 못 내므로, `input_sources`가 틀리게 내는 대신 이름으로
+거부한다. 그것을 닫는 일은 `es-compile` 패킷이지 이 패킷이 아니다.
+
 Task IR(`tests/fixtures/rl/task-reach.toml`)은 기존 노드(`GetBodyPose`, `Arith`, `Norm`,
 `Compare`, `Reward`, `Terminate`)로 이것을 적는다. **S4b가 찾았다(2026-09-21):** `es-env`의 보상·종료 콘은 `GetBodyPose`도 `Norm`도 실행하지 않았고 `Expr`에는 제곱근이 없어, 보상은 적을 수는 있어도 실행할 수는 없었다. 패킷 **S4d**가 콘을 넓히고(`Source::Xpos` 레인, 레인별 `Arith`, `Norm{L2}` → `Expr::Sqrt` — IEEE 기본 연산이지 `DET-010`의 초월함수가 아니다, §6.6) reach 문서 네 개를 소유한다; S4b는 커밋된 데모 문서로 트레이너를 싣고 reach 오라클은 S4d를 기다린다. brax env가 벗어나야 한다면(`implicitfast`/
 `elliptic`/`condim 6`에 대한 MJX 지원), 그 벗어남은 `docs/api-notes/brax-ppo-so101.md`의 이름
@@ -179,7 +188,7 @@ Task IR(`tests/fixtures/rl/task-reach.toml`)은 기존 노드(`GetBodyPose`, `Ar
   준다. (`train_act.py`에도 같은 잠복 문제가 있다. 거기서는 잡는 테스트가 없고, 고치는 것은 이
   패킷의 범위가 아니다.)
 
-**오라클 4는 S4d로 미룬다.** 5절의 reach 작업은 보상 cone 안에서 `GetBodyPose`와 `Norm`을
+**오라클 4는 S4d로 미뤘고, 위의 S4e 행에서 측정되었다.** 5절의 reach 작업은 보상 cone 안에서 `GetBodyPose`와 `Norm`을
 필요로 하는데, `es-env`의 `ScalarPlan`은 둘 다 lowering하지 않는다. 그것이 lowering하는 것은
 `GetJointState`, `GetSensor`, `GetTime`, `Arith`, `Compare`, `Normalize`, `Logic`, `Clamp`이고,
 모든 잎은 스칼라 하나를 바인딩하며, `es_ir_types::Expr`에는 설계상 제곱근이 없다(그 문서가 §6.6
@@ -187,6 +196,95 @@ Task IR(`tests/fixtures/rl/task-reach.toml`)은 기존 노드(`GetBodyPose`, `Ar
 형태 자체가 없다. 패킷 **S4d**가 그 cone 확장과 네 개의 `*-reach.toml` 문서를 소유하며, 이 표의
 성공률 행은 거기서 쓰인다. 위에서 측정된 것은 기반 구조다 — 레시피, 경로, 트레이너, 플레인,
 재현성 — 이미 실행되는 문서 위에서.
+
+### S4e — reach 작업이 학습되고 채점되다, 오라클 서버(Linux, 16코어 CPU), 2026-09-21
+
+산출물: `~/artifacts/plan-s/s4e/` (`run-4000/`, `run-10000/`, 각각 `eval-<mark>/` 포함).
+인터프리터: `~/venvs/es-lerobot-cuda/bin/python`, torch 2.11.0+cu129, mujoco 3.13.0.
+문서: `tests/fixtures/rl/` {`task-reach.toml`, `observation-reach.toml`,
+`learning-reach.toml`, `deployment-reach.toml`, `evaluation-reach.toml`}, 레시피
+`tests/fixtures/rl/training-reach.toml`, 번들 `runs/reach-001/untrained.esb`
+(`task_hash b5d3b813…`, `observation_hash 4ced8547…`, `learning_hash eb805f18…`,
+`deployment_hash 7af05d88…`, `lowering_hash dce8d352…`).
+
+**이것이 S4b가 미뤄둔 오라클 4이고, reach 작업은 학습된다.** `envs = 16`, `horizon = 64`,
+`seed = 0`, CPU 백엔드; `evaluation-reach.toml`에 대해 `es eval run`이 채점, 홀드아웃 시드
+201–216 16개, `nominal`:
+
+| 예산(반복) | `success_rate` | `episode_length` | 롤아웃 `return` | 롤아웃 `entropy` |
+|---|---|---|---|---|
+| 1,000 | 0.0000 | 200.0 | −4.38 | 5.48 |
+| 2,000 | 0.1875 | 171.0 | −4.68 | 5.31 |
+| 2,500 | 0.2500 | 168.9 | −3.73 | 4.93 |
+| 3,000 | 0.4375 | 136.6 | −3.64 | 4.63 |
+| **4,000** | **0.5625** | **129.4** | −4.74 | 4.87 |
+| 5,000 | 0.5000 | 135.0 | −3.82 | 5.04 |
+| 7,500 | 0.3125 | 149.0 | −4.84 | 6.00 |
+| 10,000 | 0.3125 | 157.3 | −4.92 | 6.06 |
+
+**수용 기준은 충족되지 않았고, 그 이유는 예산이 아니다.** 0.8에는 한 번도 닿지 않았다.
+4,000 반복에서의 0.5625가 정점이고, 그 너머에서 실행은 *퇴화한다* — 같은 레시피가 10,000
+반복에서 0.3125를 받는데, 이는 2,500 반복 때보다 겨우 나은 수치이며, 롤아웃 엔트로피는
+출발점보다도 높이 올라간다(반복 1에서 5.52, 4,000에서 4.87, 10,000에서 6.06). 예산이
+늘어나는 동안 잊어가는 정책은 반복이 모자란 것이 아니다. 이 표가 제안하는 순서대로 세 가지를
+어블레이션해야 한다: 상수 학습률(`schedule = "constant"` 내내), 엔트로피 계수(0.005 —
+올라가는 엔트로피는 그 대가다), 그리고 아래 열린 질문 2 — **모든 틱이 클램프된다**, 그래서
+모든 기울기가 env가 결코 실행하지 않은 행동의 로그 확률로부터 계산된다.
+
+예산을 둘 돌린 이유는 첫 번째의 곡선이 끝에서도 오르고 있었기 때문이다: 4,000 반복(벽시계
+12.6분, `training_hash 1933697d…`)과 10,000 반복(29.3분, `training_hash 69665845…`). 둘은
+두 곡선이 아니라 하나다: 같은 시드에서 긴 실행의 반복 4,000이 짧은 실행의 마지막과 같은
+`return`(−4.7397)과 `entropy`(4.8692)를 보고하므로, 위 여덟 행은 서로 끼워 맞춰진다.
+커밋된 레시피는 측정된 정점인 4,000을 이름 짓는다.
+
+`Rollout.metrics()`가 주는 대로의 §12.4 아홉 지표(`metrics/env-metrics.json`, 10,000 반복
+실행). 이 경로가 결코 돌리지 않는 도메인은 날조된 0이 아니라 `null`이고, `step/s`는 일부러
+없다:
+
+| 지표 | 값 |
+|---|---|
+| `physics_steps_per_sec` | 32,076 |
+| `actions_per_sec` | 8,019 |
+| `camera_frames_per_sec` | `null` — 이 경로에 렌더러 없음(§4.3) |
+| `pixels_per_sec` | `null` — 같음 |
+| `observation_gb_per_sec` | `null` — `Env`가 계측하지 않음 |
+| `policy_inferences_per_sec` | `null` — 추론은 `Env`가 아니라 트레이너 안에 있음 |
+| `p50_end_to_end_latency` | `null` — 동기 롤아웃, 선언된 지연시간 없음(3절) |
+| `p95_end_to_end_latency` | `null` — 같음 |
+| `gpu_memory_peak` | `null` — CPU 백엔드 |
+| `chunk_underrun_rate` | `null` — horizon 1, 청크 버퍼 없음 |
+
+나머지는 모두 `Target / Status: unverified`. 10,000 반복 실행은 1,759.9초에 제어 틱 640,000회,
+4,000 반복 실행은 755.2초에 256,000회.
+
+**정점 체크포인트(4,000)에서의 교란 스위트** (게이트가 아니라 측정이다, §10.4):
+
+| 스위트 | `success_rate` | `episode_length` |
+|---|---|---|
+| `nominal` | 0.5625 | 129.4 |
+| `observation_delay` (20 ms, 40 ms) | 0.3125 | 170.3 |
+| `torque_noise` (5 %) | 0.5000 | 127.6 |
+| `backlash` (0–0.01 rad) | 0.5000 | 130.6 |
+
+제어 한 스텝의 지연이 성공의 4분의 1을 앗아가고, 액추에이터 쪽 두 스위트는 16개 중 하나를
+앗아간다. 그 순서는 50 Hz에서 관절 각도와 포즈 둘을 읽는 정책이 느껴야 할 바로 그것이며,
+이 노트에서 트레이너가 아니라 *작업*에 관한 첫 번째 행이다.
+
+**플레인은 여전히 모든 틱을 클램프한다.** `envelope_violation_rate`와
+`executed_ne_sampled_rate`는 두 실행의 모든 반복에서, 그리고 모든 평가 셀에서 1.00을
+읽는다 — S4b가 데모 작업에서 측정한 것과 정확히 같으며, 이제는 보상이 움직이고 정책이
+실증적으로 학습하는 작업 위에서다. 그러니 그것은 평평한 보상의 증상이 아니다: 위치 목표
+헤드 주위의 가우시안이 틱마다의 속도·가속도 봉투에 맞설 때 벌어지는 일이다. 열린 질문 2는
+이제 나중이 아니라 *첫 번째로* 어블레이션할 것이다.
+
+**오라클.** 1(`committed_task_hashes_are_unmoved_by_joint_quantity`)과
+2(`capture_reads_qvel_and_body_pose`)는 어디서나 통과한다;
+3(`rollout_observes_the_reach_documents`)은 `ES_PYTHON`에 MuJoCo가 있는 곳에서 통과한다 —
+26폭 포트가 백엔드 자신의 `qpos[0..6]`, `qvel[0..6]`, 큐브 `qpos[6..13]`, 그리퍼
+`xpos ‖ xquat`과 레인별로 비트까지 같다; 4(`reach_documents_validate`,
+`train_reach_dry_run_plan`)는 어디서나 통과한다. S4a의 커밋된 롤아웃 골든
+(`tests/golden/rollout/so101_100steps.json`)은 움직이지 않았고, 이는 기존 채널의 캡처가
+하나도 움직이지 않았다는 가장 강한 진술이다.
 
 ## 8. 사람을 위한 열린 질문
 

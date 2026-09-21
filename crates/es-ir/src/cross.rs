@@ -115,11 +115,12 @@ fn task_observation(b: &IrBundle, out: &mut Vec<Diagnostic>) {
     let channels = &b.task.observation_spec.channels;
     for (id, node) in &b.observation.graph.nodes {
         let Some(key) = node_key(node) else { continue };
-        let declared = channels
+        let declared: Vec<_> = channels
             .iter()
-            .find(|(_, ch)| channel_key(&ch.source) == key);
-        match declared {
-            None => out.push(
+            .filter(|(_, ch)| channel_key(&ch.source) == key)
+            .collect();
+        match declared.as_slice() {
+            [] => out.push(
                 Diagnostic::new(
                     codes::XIR_002,
                     format!("{} reads {:?}, which no channel declares", node.kind(), key),
@@ -128,11 +129,45 @@ fn task_observation(b: &IrBundle, out: &mut Vec<Diagnostic>) {
                 .with_hint("spec 7.4: Task IR declares the channel, Observation IR implements it"),
             ),
             // Task declares, Observation implements: the declared type is what flows in.
-            Some((name, ch)) => {
+            [(name, ch)] => {
                 if let Err(d) = ch.ty.compatible(&node.io().output) {
                     out.push(d.at(*id).with_hint(format!(
                         "spec 7.4: channel \"{name}\" is declared with a different type"
                     )));
+                }
+            }
+            // Several channels name one source id: one joint block read at two quantities,
+            // a position channel and a velocity one (packet M8/S4e). `StateInput` carries no
+            // quantity of its own, so what tells them apart is the declared **type** — and
+            // `JointQuantity::unit()` is exactly that type's unit, so the pair is keyed by
+            // `(id, quantity)` after all. Two channels a node's type cannot tell apart are
+            // refused by name rather than resolved by map order.
+            many => {
+                let fits: Vec<_> = many
+                    .iter()
+                    .filter(|(_, ch)| ch.ty.compatible(&node.io().output).is_ok())
+                    .collect();
+                if fits.len() != 1 {
+                    let names: Vec<&str> = many.iter().map(|(n, _)| n.as_str()).collect();
+                    out.push(
+                        Diagnostic::new(
+                            codes::XIR_002,
+                            format!(
+                                "{} reads {:?}, which {} channels declare ({}), and its type \
+                                 matches {} of them",
+                                node.kind(),
+                                key,
+                                many.len(),
+                                names.join(", "),
+                                fits.len()
+                            ),
+                        )
+                        .at(*id)
+                        .with_hint(
+                            "spec 7.4: two channels on one source id are told apart by the \
+                             quantity they declare, which is the unit of their type",
+                        ),
+                    );
                 }
             }
         }

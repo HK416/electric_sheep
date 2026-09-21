@@ -118,6 +118,9 @@ allow-list 항목은 노드의 `NodeId`를 10진수(`"7"`)로 매칭한다. `es-
 | id가 `ModelInfo::qpos`에 있는 `StateInput` | 해당 env의 `qpos` 슬라이스 | 지원됨 |
 | id가 `ModelInfo::sensor`에 있는 `StateInput` | 해당 env의 `sensordata` 슬라이스 | 지원됨 |
 | id가 Task IR의 `ObsSource::JointState { body, dof }`인 `StateInput` | env 0의 앞쪽 `dof`개 관절 위치 | 지원됨 |
+| 채널이 `quantity = Velocity`이고 id가 **관절**인 `StateInput` | 그 관절의 첫 dof부터 `dof`개, 즉 `qvel[start..start + dof]` | 지원됨 (패킷 M8/S4e) |
+| 채널이 `quantity = Velocity`이고 id가 **body**인 `StateInput` | env 0의 앞쪽 `dof`개 관절 속도 | 지원됨 (패킷 M8/S4e) |
+| 채널이 `ObsSource::BodyPose(b)`이고 `b`가 자유 관절이 아닌 `StateInput` | `xpos[row*3..][..3] ‖ xquat[row*4..][..4]`, 쿼터니언은 xyzw (§3.1) | 지원됨 (패킷 M8/S4e) |
 | 그 외 | — | 첫 에피소드 이전에 `EvalError::Plan` |
 
 모든 입력은 첫 에피소드 이전에 `input_sources`가 **한 번만** 해석한다. 입력이 이미지인
@@ -130,6 +133,36 @@ allow-list 항목은 노드의 `NodeId`를 10진수(`"7"`)로 매칭한다. `es-
 DoF 개수를 지칭하므로 캡처는 앞쪽 `dof`개 위치를 가져간다 — `joint_state::<NJ>`가 Safety
 Plane에 먹이기 위해 이미 쓰는 것과 같은 규약이며, `run_episode`가 `NJ`개보다 적게 지닌
 모델을 거부하는 이유(§2.5)이기도 하다.
+
+**수량과 body 포즈 (패킷 M8/S4e).** `ObsSource::JointState`는 `GetJointState`가 늘 지녀온
+`JointQuantity`를 지닌다. 없으면 `Position`이며, 그것이 이전의 모든 문서가 해시된 정규
+형식이므로 커밋된 `task_hash`는 하나도 움직이지 않는다. 수량은 `qpos`와 `sensor` 맵보다
+*먼저* 읽히므로, `Position` 채널은 이 패킷 이전과 정확히 같게 해석되고 `Velocity` 채널이
+id가 우연히 겹치는 `qpos` 범위로 답해지는 일은 없다. **관절**을 지칭하는 속도 채널은 그
+관절의 첫 dof에서 시작해 `dof`개를 가져간다 — 오프셋은 문서가 알 수 없는 유일한 것이고
+폭은 모델이 알 수 없는 유일한 것이다. **body**를 지칭하면 행의 앞쪽 `dof`개를 가져가며,
+이는 `Joints`의 거울상이다. `JointQuantity::Torque`는 이름으로 거부된다: `StateView`에는
+관절 토크 배열이 없다.
+
+`ObsSource::BodyPose(b)`는 `b`의 `xpos`/`xquat` 행을 읽는다. **자유 관절** body는 결코 그
+갈래를 타지 않는다: 그 포즈는 `qpos`에 있고 `Qpos` 갈래가 먼저 답하며, 그것이 데모의 큐브
+채널을 바이트 단위로 그대로 유지하는 것이다. 쿼터니언은 `StateView`가 문서화한 순서 —
+xyzw (§3.1) — 그대로 쓰이고 여기서 재배열되지 않는다. 재배열은 Observation IR 노드의
+일이지 캡처의 일이 아니다.
+
+**source id 하나에 버퍼 하나.** `CpuPlan`은 입력 버퍼의 이름을
+`Home::Input(id.to_string())`로 짓는다. 그래서 한 source id를 지칭하는 두 채널은 버퍼 하나를
+나눠 갖게 되고 `exec::read_input`은 두 `StateInput` 노드에 같은 텐서를 건네게 된다 —
+§10.1이 금지하는 조용히 틀린 숫자다. Cross-IR 검사는 그 쌍을 *받아들인다*(`XIR-002`는 한
+id의 두 채널을 선언된 타입으로 구분하며, 그 타입의 단위가 곧 `JointQuantity::unit()`이다).
+`input_sources`는 로워링이 버퍼 둘을 줄 수 있게 될 때까지 그 쌍을 이름으로 거부한다.
+`tests/fixtures/rl/task-reach.toml`의 `joint_vel`이 body `base`가 아니라 블록의 첫 관절
+`shoulder_pan`을 지칭하는 이유가 이것이다.
+
+두 새 종류 모두 모델 없는 해석이 없다. 기록된 데이터셋의 `observation.state`는
+`qpos ‖ qvel`이지만 후반부가 어디서 시작하는지는 `nq` — 실행된 모델의 성질이지 행의 성질이
+아니다 — 이고, `xpos`/`xquat`는 애초에 행에 없다. 둘 다 추측된 오프셋으로 바뀌는 대신
+`bake.rs`에서 이름 지어 거부된다.
 
 프레임 소스가 없으면(`Evaluation::run`, 또는 `--frames` 없는 `es eval run`) 이미지
 observation은 0으로 채워지는 대신 이름으로 거부된다. 검은 프레임에 대해 정책을 조용히
