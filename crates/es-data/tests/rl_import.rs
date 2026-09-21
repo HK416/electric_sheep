@@ -32,12 +32,19 @@ const ACTUATORS: [&str; 6] = [
 
 /// Runs the conversion with `adapter` in place of the committed one and returns what it said.
 fn run(adapter_toml: &str) -> Result<String, String> {
-    let manifest = ImportManifest::parse(&read("import/playground/import.json")).expect("manifest");
+    run_manifest("playground", adapter_toml)
+}
+
+/// The same, against one of the committed `import/` fixtures by directory name.
+fn run_manifest(dir: &str, adapter_toml: &str) -> Result<String, String> {
+    let manifest =
+        ImportManifest::parse(&read(&format!("import/{dir}/import.json"))).expect("manifest");
     let adapter = Adapter::parse(adapter_toml).map_err(|e| e.to_string())?;
     let task = task_from_toml(&read("task-reach.toml")).expect("task-reach.toml");
     let deployment =
         deployment_from_toml(&read("deployment-reach.toml")).expect("deployment-reach.toml");
-    let weights = std::fs::read(fixture("import/playground/weights.safetensors")).expect("weights");
+    let weights =
+        std::fs::read(fixture(&format!("import/{dir}/weights.safetensors"))).expect("weights");
     let actuators: Vec<String> = ACTUATORS.iter().map(|s| (*s).to_owned()).collect();
     match convert(
         &manifest,
@@ -109,6 +116,22 @@ fn import_rl_refusals() {
     refused(
         &base.replace("channel = \"gripper_pose\"", "channel = \"tool_pose\""),
         "IMP-005",
+    );
+}
+
+/// `IMP-004` from the side the five refusals above do not cover: the *source* recorded what
+/// its six numbers are and the adapter disagrees. Nothing here can break the tie -- an
+/// increment imported as a position target is an arm that drives to 0.05 rad and stops.
+#[test]
+fn import_rl_refuses_a_manifest_that_disagrees_about_the_action_kind() {
+    let said = run_manifest("playground-delta", &read("adapter-so101.toml"))
+        .expect_err("a manifest that says joint_delta under a position adapter must be refused");
+    assert!(
+        said.starts_with("IMP-004")
+            && said.contains("joint_delta")
+            && said.contains("position_target"),
+        "the refusal must name the code and both readings:
+{said}"
     );
 }
 
