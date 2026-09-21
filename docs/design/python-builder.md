@@ -57,6 +57,60 @@ formulas (`_feature_ty`, `_chunk_ty`) do this by mirroring the relevant `es-ir` 
 one commented with the Rust function it has to stay in sync with. This is ordinary front-end
 work, not a workaround: an LLM generator or a graph editor would need the identical inference.
 
+## The rollout binding (M8 S4a, spec 13.4)
+
+`es-py` gained a second, unrelated half: `es_native.Rollout`, so `train_ppo.py` can step our
+`Env` and the Safety Plane instead of a simulator of its own (`rl-continuation.md` rule 2). The
+layering is the builder's, one layer shorter — there is no fluent Python surface, because a
+trainer is not an authoring tool:
+
+```
+python/es/train_ppo.py     the trainer (S4b) — torch, GAE, the optimizer
+        |  lists of floats over the pyo3 boundary
+crates/es-py/src/pybind.rs `Rollout` pyclass — a fixed (n_joints, horizon) dispatch table
+        |  plain Rust calls, no Python involved
+crates/es-py/src/rollout.rs `Rollout<NJ, H>` — Env + one SafetyPlane and one CpuPlan per env
+```
+
+| method | what it is |
+|---|---|
+| `Rollout(task, observation, deployment, scene_xml, seed, n_envs)` | the four documents as **text**; builds `Env<MuJoCoCpuBackend>` with `BatchDomains::single_env_at`'s control period and the batch set to `n_envs` |
+| `reset(envs=None)` | `Env::reset`, then `begin_episode` on those planes and `CpuPlan::reset` on those rings |
+| `observe() -> {port: [n_envs * dim]}` | `es_eval::runner::capture` + `CpuPlan::run`, per env, row-major |
+| `act([n_envs * nu]) -> (executed, events, rewards, dones)` | per env `observe_state → heartbeat → validate`, then one `Env::step` with the plane's output; `events` is `EventSet::bits()` |
+| `model() -> dict` | `nq`, `nv`, `nu`, `n_envs`, actuator and joint names in index order, `ctrlrange` |
+| `tick() -> int` | control ticks — the plane's clock, not `Env::tick`'s simulation tick |
+| `metrics() -> dict` | the nine spec 12.4 fields plus `chunk_underrun_rate`, `None` where nothing measured them |
+
+Three decisions worth writing down:
+
+- **Lists, not numpy.** The boundary carries Python lists both ways and `es-py` grows no array
+  dependency. `train_ppo.py` already imports torch and converts on its side; adding `numpy` to
+  a layer-11 crate would put a second array ABI in the runtime so that one caller could skip
+  one `torch.tensor(...)` call.
+- **No second observation capture.** `es_eval::runner`'s `capture` / `input_sources` /
+  `joint_state` became `pub` (no logic change) and the binding calls them. A capture written
+  again here is how a trainer and an evaluation start reading two different observations off
+  one state. The one thing added is a per-env `StateView` — those helpers read env 0, because
+  they were written for the single-env evaluation path — so a batch of `n` reaches them
+  unchanged. An image input still needs a renderer and `es-py` links none, so `capture`
+  refuses it by name; `crates/es-py/tests/fixtures/observation-state.toml` is the demo's
+  observation with the camera branch removed, generated from it, never typed in.
+- **A fixed `(n_joints, horizon)` table, not a type-erased plane.** `SafetyPlane<NJ, H>` is
+  const-generic and a document only reveals its numbers at run time; the pyclass enumerates the
+  pairs this repo uses, exactly as `es eval run`'s `dispatch_nj_h!` does. A trait object would
+  be an eighth extension point (`INV-17`). Horizon 1 is the trainer's sense of the word — one
+  row per control tick under a fresh `seq`, no chunk buffer, no declared latency
+  (`rl-continuation.md` section 3) — while `H` stays the deployment's own, because
+  `SafetyPlane::from_ir` refuses an envelope whose width is not its.
+
+The oracle is one trace, driven twice: `cargo test -p es-py rollout_matches_es_eval_loop --
+--ignored` runs 100 control steps of a scripted control through `Rollout` and through a
+hand-rolled `Env` + `CpuPlan` + `SafetyPlane` loop written the way `es_eval::runner::run_episode`
+runs it, and pins both to `tests/golden/rollout/so101_100steps.json`;
+`python -m es.selfcheck --env` drives the pyclass over the same 100 steps and compares against
+the same golden, so the Rust struct and the Python class cannot drift apart silently.
+
 ## Known gaps (M2 W6 scope, not M0/M1 regressions)
 
 - `python/es/examples/pick_place.py` reproduces the spec 14.2 snippet's node *shape* faithfully;
