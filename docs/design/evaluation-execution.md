@@ -208,6 +208,111 @@ The oracle is a trajectory, not a schedule: `collection_and_evaluation_draw_the_
 T7 it failed at tick 1 — see `docs/design/visible-learning.md` section 7.30 for the measured
 values and for what the demo's numbers became.
 
+### 2.7 Sharding: the unit is the cell, and why it is not the episode (packet M7/T8)
+
+`es eval run --jobs N` partitions the **cells** round-robin over N worker processes
+(`Evaluation::run_shard(.., shard: (index, count))`, cell `c` to shard `c % count`), and
+`Evaluation::merge` puts them back in cell order and computes the report, the judgement and
+the hash chain once. The partition is fixed by the cell index alone, so it does not depend on
+how long a suite takes, on how many workers started, or on any iteration order (§3.4). A
+one-suite evaluation therefore gets no speedup at all: the demo's 16-episode `nominal` suite
+is one cell and runs one-wide however large `--jobs` is.
+
+Packet M7/T8 asked whether the unit could be the `(cell, episode)` pair instead. The `Env`
+side of that is now settled and shipped:
+
+**`Env::seek_episode(env, episode)`** sets the counter the *next* `reset` draws from. It
+touches nothing else — no reset, no backend call, no recorder state, not the physics tick —
+and it is refused while an episode is open with steps recorded on it, so a seek is never a
+silent discard. §6.3 keys every reset and randomization draw by `(seed, env, episode, stream)`
+alone, and `MuJoCoCpuBackend::reset` runs `mj_resetData` before writing the state, so a seek
+*is* the replay. Measured (`cargo test -p es-env --test seek -- --ignored`, oracle server,
+2026-09-21): for `k ∈ {1, 3, 7}` on the demo scene and the committed Task IR, a fresh `Env`
+seeked to `k` and a fresh `Env` reset `k` times agree bitwise on `qpos`, `qvel`, the episode's
+`ParamScales` and the whole 45,784-byte `.estraj` of an expert-driven episode.
+
+**The evaluator side does not hold, and the partition is not shipped.** What a cell carries
+from episode `k-1` into episode `k`, beyond the `Env`: the `SafetyPlane` (`begin_episode`
+clears the latch and re-arms the seed, but **not** `SafetyCounters::window`, the sliding
+`ViolationRate` ring of §9.4), the `ChunkBuffer` + `PlaneFeed` and `AsyncInference` (all
+cleared per episode), the monotonic `seq` (only ordering is judged), and the plane's and env's
+counters (sums, which add). Two of those are visible in the artifacts, and both were measured
+by running the pre-T8 and the T8 build of `es eval run` over the same committed demo documents
+— nominal suite, seeds 101–104, `--frames`, `v14/trained-20000.esb`, oracle server,
+2026-09-21 (`~/artifacts/plan-v/m7-t8/run-parity.sh`, `pre-j1/` vs `post-j1/`):
+
+| what | cell-level (pre) | per-episode (post) |
+|---|---|---|
+| first differing `.estraj` | — | `nominal-01`, **tick 24** (`qpos[0]` 0.068231 → 0.071987) |
+| `events.json` first difference | `nominal-01` record 0, `tick: 7200` | same record, `tick: 0` |
+| `violation.rate` | 2318 | 2091 |
+| `fallback` | 5740 | 5678 |
+| `violation.position` / `.velocity` / `.acceleration` | 423 / 498 / 1456 | 261 / 421 / 1512 |
+| `envelope_violation_rate` | 0.9998611 | 0.9990278 |
+| `nominal-00` (episode 0) | — | byte-identical, all four artifacts |
+
+Two independent mechanisms, and only one of them is `es-safety`'s:
+
+1. **The `ViolationRate` window carries across the episode boundary.** The demo declares
+   `envelope_violation_rate = { max_frac = 0.9, window = 200 }` and runs at an envelope
+   violation rate of ~0.999, so at tick 0 of episode `k` the pre-T8 plane's ring is full of
+   episode `k-1`'s dirty steps, reads ~1.0, and trips the §9.4 watchdog. A per-episode plane
+   starts with an empty ring, which reads `0.0` until 200 steps are in it — so its first 200
+   ticks do not trip, take the clamp path instead of the fallback path, and the trajectory
+   diverges at tick 24. 227 fewer `violation.rate` events over four episodes.
+2. **`StepEvent::tick` is the cell's cumulative physics clock**, `Env::tick()`, which is 7200
+   at the start of `nominal-01` (1800 control steps × 4 substeps) and 0 for a per-episode env.
+   This one is `es-eval`'s record, not the plane's: it would still move `events.json` even if
+   the window were cleared.
+
+Per the packet, the finding stands and the flag that would have enabled the partition does not
+exist. Both questions are the M7 review's:
+
+- should `SafetyPlane::begin_episode` clear `SafetyCounters::window`? Clearing it is arguably
+  the correct reading of "an episode is where a stream ends" (§13.1, and the same argument
+  §2.4 makes for the observation plan), and it would be an INV-12-clean change — the envelope,
+  the watchdogs and the counters stay on, only the ring the watchdog reads is re-armed. It
+  moves every committed number in the table above, so it is a decision and not a fix.
+- should `StepEvent::tick` be the episode's tick rather than the env's? Frame `n` of a cell
+  already carries `frame: n`; the absolute tick is only meaningful inside one cell, and an
+  episode-relative tick would make `events.json` independent of how the run was scheduled.
+
+If both go that way the partition is a small change on top of what is here (`ShardCell` gains
+per-episode records, `record_cell` moves to `merge`, `run_shard` walks `suites × seeds` and
+seeks) and the wall-clock table below says what it would buy.
+
+#### Wall-clock, nominal suite, 16 episodes (`Target / Status: measured`)
+
+Oracle server (Ryzen, 16 cores, RTX 4090), `--frames`, `v14/trained-20000.esb`, one suite,
+seeds 101–116. The 1-minute load average beside each row is the box's at the moment the run
+started; other agents share the machine.
+
+| build | `--jobs` | workers actually spawned | wall (pass 2) | load at start | pass 1 |
+|---|---|---|---|---|---|
+| cell-level (shipped) | 1 | 1 | 121.6 s | 0.55 | 120.3 s |
+| cell-level (shipped) | 4 | 1 (clamped to the suite count) | 117.3 s | 2.31 | 120.0 s |
+| cell-level (shipped) | 8 | 1 (clamped) | 120.6 s | 2.83 | 118.7 s |
+| per-episode (T8, not shipped) | 1 | 1 | 122.9 s | 2.89 | 124.2 s |
+| per-episode (T8, not shipped) | 4 | 4 | 60.6 s | 2.71 | 59.5 s |
+| per-episode (T8, not shipped) | 8 | 8 | 55.2 s | 2.96 | 55.2 s |
+
+Two passes, the second with a "wait until the 1-minute load is below 4" gate before each row
+(pass 1 took three rows at a load of 3.6–6.0, the decay of the row before it). The two agree
+to within 3 s on every row, which is the noise floor here.
+
+What it says: the shipped partition is flat, exactly as `docs/design/visible-learning.md`
+section 7.11 predicted — a one-suite evaluation is one cell, `--jobs` clamps to 1, and the
+three cell-level rows differ only by noise. The per-episode partition is **2.0×** at four
+workers and **2.2×** at eight; the second step is small because the box has 16 cores, each
+worker's math-library pool is capped at `cores/N` (section 7.11 again), and every worker opens
+its own MuJoCo and torch subprocess. Per-episode `--jobs 1` costs about a second more than
+cell-level, inside the noise: sixteen `Env::new` + `mj_resetData` + plane constructions
+instead of one is what episode isolation costs when nothing is parallel, and it is small.
+
+That is the whole prize in one number: ~2 min of nominal evaluation instead of ~2 min × the
+suites, or for the demo's six-suite sweep the same 2× again on top of the cell split. It is
+bought with the two review decisions above, not with this packet.
+
 ## 3. Perturbation realisation (`perturb.rs`)
 
 `PerturbationPlan::compile(&EvaluationIr, &SceneDesc, &ModelInfo, has_renderer)` resolves
