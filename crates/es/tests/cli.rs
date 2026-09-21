@@ -30,8 +30,8 @@ use es_ir::image::{
 };
 use es_ir::learning::{
     ActionExecutionMode, Activation, ArchKind, ChunkBlendPolicy, FusionKind, HeadKind,
-    LearningGraph, LearningNode, NormalizeDir, PolicyContract, PolicyHandle, RuntimeHints,
-    Squash, StateEncoderKind, StatsSource, TemporalKind, VisionBackbone, WeightsRef,
+    LearningGraph, LearningNode, NormalizeDir, PolicyContract, PolicyHandle, RuntimeHints, Squash,
+    StateEncoderKind, StatsSource, TemporalKind, VisionBackbone, WeightsRef,
 };
 use es_ir::observation::{
     Io, NormalizeStats, ObservationIr, ObservationNode, ObservationOutput, ResizeFilter,
@@ -11924,10 +11924,8 @@ fn import_fixture(framework: &str, name: &str) -> String {
 }
 
 /// Runs `es policy import-rl` from the repository root (the Task IR's `scene.path` is
-/// repository-relative) and returns the process output. `documents` names the Task and
-/// Deployment IR pair the import targets: `"reach"` for the position pair, `"reach-delta"`
-/// for the `JointDelta` one (packet M9/T2).
-fn run_import_rl(framework: &str, documents: &str, adapter: &Path, out: &Path) -> Output {
+/// repository-relative) and returns the process output.
+fn run_import_rl(framework: &str, docs: &Documents, adapter: &Path, out: &Path) -> Output {
     bin()
         .current_dir(train_root())
         .args([
@@ -11940,14 +11938,51 @@ fn run_import_rl(framework: &str, documents: &str, adapter: &Path, out: &Path) -
             "--adapter",
             &train_toml_path(adapter),
             "--task",
-            &train_toml_path(&rl_fixture(&format!("task-{documents}.toml"))),
+            &train_toml_path(&docs.task),
             "--deployment",
-            &train_toml_path(&rl_fixture(&format!("deployment-{documents}.toml"))),
+            &train_toml_path(&docs.deployment),
             "--out",
         ])
         .arg(out)
         .output()
         .expect("run es policy import-rl")
+}
+
+/// The Task and Deployment IR an import targets, and the adapter that matches them.
+struct Documents {
+    task: PathBuf,
+    deployment: PathBuf,
+    adapter: PathBuf,
+}
+
+/// The committed reach pair, in `JointPosition` (packet M8/S2b) or in `JointDelta` (M9/T2).
+///
+/// There is no committed delta *Task* IR: T1 committed `deployment-reach-delta.toml` and
+/// mutates the task in memory for its own cross-check, so the one line that differs is
+/// substituted here, in `dir`, next to the assertions that depend on it. Everything else --
+/// the scene (repository-relative, and the CLI runs from the repository root), the
+/// `ObservationSpec`, the reward -- is `task-reach.toml`'s.
+fn reach_documents(dir: &Path, delta: bool) -> Documents {
+    if !delta {
+        return Documents {
+            task: rl_fixture("task-reach.toml"),
+            deployment: rl_fixture("deployment-reach.toml"),
+            adapter: rl_fixture("adapter-so101.toml"),
+        };
+    }
+    let source = std::fs::read_to_string(rl_fixture("task-reach.toml")).expect("task-reach.toml");
+    let task_toml = source.replace("space = \"JointPosition\"", "space = \"JointDelta\"");
+    assert_ne!(
+        task_toml, source,
+        "task-reach.toml no longer declares ActionSpec space = JointPosition"
+    );
+    let task = dir.join("task-reach-delta.toml");
+    std::fs::write(&task, task_toml).expect("write the delta Task IR");
+    Documents {
+        task,
+        deployment: rl_fixture("deployment-reach-delta.toml"),
+        adapter: rl_fixture("adapter-so101-delta.toml"),
+    }
 }
 
 /// One observation through the lowered module, as `es eval run` would feed it.
@@ -11984,12 +12019,13 @@ fn infer_state(runtime: &mut es_policy::TorchRuntime, state: &[f32]) -> Vec<f32>
 #[test]
 fn import_rl_synthetic_three_frameworks() {
     let dir = scratch_dir("import-rl");
+    let documents = reach_documents(&dir, false);
     let adapter = rl_fixture("adapter-so101.toml");
     let mut weights = Vec::new();
 
     for framework in ["playground", "rsl-rl", "rl-games"] {
         let out = dir.join(framework);
-        let run = run_import_rl(framework, "reach", &adapter, &out);
+        let run = run_import_rl(framework, &documents, &adapter, &out);
         assert_eq!(
             run.status.code(),
             Some(0),
@@ -12085,13 +12121,10 @@ fn import_rl_synthetic_three_frameworks() {
 #[test]
 fn import_rl_delta_fixture() {
     let dir = scratch_dir("import-rl-delta");
+    let delta = reach_documents(&dir, true);
+    let position = reach_documents(&dir, false);
     let out = dir.join("delta");
-    let run = run_import_rl(
-        "playground-delta",
-        "reach-delta",
-        &rl_fixture("adapter-so101-delta.toml"),
-        &out,
-    );
+    let run = run_import_rl("playground-delta", &delta, &delta.adapter, &out);
     assert_eq!(
         run.status.code(),
         Some(0),
@@ -12129,31 +12162,46 @@ fn import_rl_delta_fixture() {
     assert_eq!(mean, vec![0.0; 6], "an increment has no centre");
     assert_eq!(std, vec![0.05; 6], "rad per control tick, from the adapter");
 
-    // Neither pairing of a delta source with a position document may pass, and each refusal
-    // names `IMP-004` and writes nothing.
-    for (framework, documents, adapter) in [
-        ("playground-delta", "reach", "adapter-so101.toml"),
-        ("playground", "reach-delta", "adapter-so101-delta.toml"),
+    // Three declarations -- the manifest's, the adapter's and the Task IR's -- and every way
+    // two of them can disagree is one `IMP-004` that writes nothing. (A manifest with no
+    // `action_kind` at all, like the `playground` fixture S2b committed, is not a
+    // disagreement: the adapter alone declares, and it always has to.)
+    for (case, documents, adapter) in [
+        (
+            "the source says increment, the adapter says position target",
+            &position,
+            &position.adapter,
+        ),
+        (
+            "the adapter says increment, the Task IR says position",
+            &position,
+            &delta.adapter,
+        ),
+        (
+            "the adapter says position target, the Task IR says increment",
+            &delta,
+            &position.adapter,
+        ),
     ] {
-        let bad = dir.join(format!("bad-{framework}-{documents}"));
-        let run = run_import_rl(framework, documents, &rl_fixture(adapter), &bad);
+        let bad = dir.join(format!("bad-{}", case.len()));
+        let run = run_import_rl("playground-delta", documents, adapter, &bad);
         assert_eq!(
             run.status.code(),
             Some(1),
-            "{framework} under {documents} must be refused:\n{}",
+            "{case}: must be refused, not imported:\n{}",
             stdout(&run)
         );
         assert!(
             stderr_of(&run).contains("IMP-004"),
-            "the refusal must name its code:\n{}",
+            "{case}: the refusal must name its code:\n{}",
             stderr_of(&run)
         );
         assert!(
             !bad.join("policy.esb").exists(),
-            "a refusal must leave no half-written bundle behind"
+            "{case}: a refusal must leave no half-written bundle behind"
         );
     }
-    println!("RAN import_rl_delta_fixture: a JointDelta bundle and two IMP-004 refusals");
+    println!("RAN import_rl_delta_fixture: a JointDelta bundle and three IMP-004 refusals");
 }
 
 /// `name -> (shape, values)` out of a safetensors blob written by `import_rl.py --reference`.
@@ -12251,11 +12299,7 @@ fn import_rl_reproduces_the_source_policy() {
         &std::fs::read_to_string(neutral.join("import.json")).expect("import.json"),
     )
     .expect("import.json is JSON");
-    let (documents, adapter_name) = if declared["action_kind"] == "joint_delta" {
-        ("reach-delta", "adapter-so101-delta.toml")
-    } else {
-        ("reach", "adapter-so101.toml")
-    };
+    let documents = reach_documents(&dir, declared["action_kind"] == "joint_delta");
 
     // 2. the Rust half: two documents, a bundle and the mapping report.
     let out = dir.join("bundle");
@@ -12269,11 +12313,11 @@ fn import_rl_reproduces_the_source_policy() {
             "--weights",
             &train_toml_path(&neutral.join("weights.safetensors")),
             "--adapter",
-            &train_toml_path(&rl_fixture(adapter_name)),
+            &train_toml_path(&documents.adapter),
             "--task",
-            &train_toml_path(&rl_fixture(&format!("task-{documents}.toml"))),
+            &train_toml_path(&documents.task),
             "--deployment",
-            &train_toml_path(&rl_fixture(&format!("deployment-{documents}.toml"))),
+            &train_toml_path(&documents.deployment),
             "--out",
         ])
         .arg(&out)
@@ -12314,7 +12358,7 @@ fn import_rl_reproduces_the_source_policy() {
     // runtime's output is in actuator units because the `Normalizer{Inverse}` is part of the
     // deployed function (`docs/design/rl-continuation.md` section 2).
     let adapter = es_data::rl_import::Adapter::parse(
-        &std::fs::read_to_string(rl_fixture(adapter_name)).expect("the adapter"),
+        &std::fs::read_to_string(&documents.adapter).expect("the adapter"),
     )
     .expect("the adapter parses");
     let scale = adapter.action.scale.clone().expect("the adapter's scale");
@@ -12347,11 +12391,12 @@ fn import_rl_reproduces_the_source_policy() {
         }
     }
     println!(
-        "{NAME}: {documents}, {rows} rows x {action_dim}\n  (a) reconstruction vs our runtime: \
+        "{NAME}: {} , {rows} rows x {action_dim}\n  (a) reconstruction vs our runtime: \
          {mismatches} \
          mismatching values (max abs {worst_bits:.3e})\n  (b) our runtime vs JAX actions_scaled: \
          max abs error {worst_jax:.3e} (tier 4, tolerance 1e-5)\n  weights_hash {}\n  \
          policy_hash {}",
+        documents.task.display(),
         hex(bundle.learning.policy.weights.hash()),
         bundle
             .manifest
@@ -12389,6 +12434,9 @@ fn import_rl_matches_the_reconstruction() {
     };
     let neutral = PathBuf::from(neutral);
     let dir = scratch_dir("import-rl-framework");
+    // rsl_rl and rl_games record no action kind, so the position pair is the one their
+    // adapter targets (a delta source would say so in its manifest -- M9/T2).
+    let documents = reach_documents(&dir, false);
     let out = dir.join("bundle");
     let run = bin()
         .current_dir(train_root())
@@ -12400,11 +12448,11 @@ fn import_rl_matches_the_reconstruction() {
             "--weights",
             &train_toml_path(&neutral.join("weights.safetensors")),
             "--adapter",
-            &train_toml_path(&rl_fixture(adapter_name)),
+            &train_toml_path(&documents.adapter),
             "--task",
-            &train_toml_path(&rl_fixture(&format!("task-{documents}.toml"))),
+            &train_toml_path(&documents.task),
             "--deployment",
-            &train_toml_path(&rl_fixture(&format!("deployment-{documents}.toml"))),
+            &train_toml_path(&documents.deployment),
             "--out",
         ])
         .arg(&out)

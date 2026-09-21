@@ -4,10 +4,10 @@
 # are per-tick *increments* over the previous command, not absolute position targets. That one
 # sentence is the whole difference, and it is said here rather than inferred from the weights
 # -- which is the point of the file (`docs/design/rl-continuation.md` rule 3: the importer
-# never guesses). It targets `tests/fixtures/rl/task-reach-delta.toml` and
-# `deployment-reach-delta.toml`, whose `ActionSpec`/`action.space` say `joint_delta`; pointed
-# at the position documents it is refused by name (`IMP-004`), and so is the position adapter
-# pointed at these.
+# never guesses). It targets `deployment-reach-delta.toml` (M9/T1) and a Task IR whose
+# `ActionSpec` declares `JointDelta` -- there is no committed delta Task IR yet, so the CLI
+# test substitutes that one line into `task-reach.toml`. Pointed at the position documents it
+# is refused by name (`IMP-004`), and so is the position adapter pointed at these.
 
 [robot]
 name = "so101"
