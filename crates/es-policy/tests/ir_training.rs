@@ -1003,6 +1003,311 @@ print(
 )
 "#;
 
+// --- packet M7/T4: the learning-rate schedule ------------------------------------------------
+
+/// `tests/golden/train/lr_warmup_cosine.json`: the first 1,000 values of the demo's own
+/// large-batch schedule, generated once by [`generate_lr_golden`] from the script's `lr_at`.
+fn lr_golden() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/train/lr_warmup_cosine.json")
+}
+
+/// A re-implementation of `python/es/train_act.py::lr_at`, expression for expression.
+///
+/// This is what pins the schedule **without** an interpreter: the golden was produced by the
+/// script, and this function has to reproduce it bit for bit in `f64`. Keep the two in the
+/// same order — `lr * step / warmup`, and `lr_min + (lr - lr_min) * 0.5 * (1 + cos(...))` —
+/// because a re-association is a different number in the last bit, which is the whole point.
+fn lr_at(step: u32, total: u32, lr: f64, lr_min: f64, warmup: u32) -> f64 {
+    if warmup > 0 && step < warmup {
+        return lr * f64::from(step) / f64::from(warmup);
+    }
+    let span = total.saturating_sub(warmup).max(1);
+    lr_min
+        + (lr - lr_min)
+            * 0.5
+            * (1.0 + (std::f64::consts::PI * f64::from(step - warmup) / f64::from(span)).cos())
+}
+
+/// argv is `<train_act.py> <total> <lr> <lr_min> <warmup> <count>`; stdout is
+/// `{"values": [..], "lr_curve_hash": "…" | null}`.
+///
+/// The script is `exec`'d rather than imported so that this reads the file the repository
+/// ships, from wherever the test runs. `__name__` is set because the file ends in the usual
+/// `if __name__ == "__main__"` guard.
+const LR_PROBE_PY: &str = r#"
+import json, sys
+namespace = {"__name__": "es_train_act_probe"}
+source = open(sys.argv[1], encoding="utf-8").read()
+exec(compile(source, sys.argv[1], "exec"), namespace)
+total, lr, lr_min, warmup, count = (
+    int(sys.argv[2]), float(sys.argv[3]), float(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6])
+)
+values = [namespace["lr_at"](s, total, lr, lr_min, warmup) for s in range(count)]
+sys.stdout.write(
+    json.dumps({"values": values, "lr_curve_hash": namespace["lr_curve_hash"](values)})
+)
+"#;
+
+/// Regenerates the lr golden from the script itself. Run once, explicitly, on a machine with
+/// `ES_PYTHON`; the file is then read-only (spec 1.4), like every other golden here.
+#[test]
+#[ignore = "golden generator; run explicitly with ES_PYTHON"]
+fn generate_lr_golden() {
+    let python = python_with_torch().expect("the generator needs an interpreter");
+    let (total, lr, lr_min, warmup, count) = (20000u32, 4e-4, 1e-6, 250u32, 1000usize);
+    let probe = run(
+        &python,
+        &[
+            "-c",
+            LR_PROBE_PY,
+            &train_act_py().to_string_lossy(),
+            &total.to_string(),
+            &lr.to_string(),
+            &lr_min.to_string(),
+            &warmup.to_string(),
+            &count.to_string(),
+        ],
+    );
+    let reply: serde_json::Value = serde_json::from_slice(&probe.stdout).expect("the probe");
+    let golden = serde_json::json!({
+        "schema_version": 1,
+        "source": "python/es/train_act.py::lr_at",
+        "total": total, "lr": lr, "lr_min": lr_min, "warmup": warmup,
+        "values": reply["values"],
+    });
+    std::fs::create_dir_all(lr_golden().parent().expect("a parent")).expect("golden dir");
+    std::fs::write(
+        lr_golden(),
+        serde_json::to_string_pretty(&golden).expect("serialize") + "\n",
+    )
+    .expect("write the golden");
+    println!(
+        "RAN generate_lr_golden: {count} values -> {}",
+        lr_golden().display()
+    );
+}
+
+/// Oracle 1 of packet M7/T4. The Rust re-implementation above equals the golden bitwise, and
+/// with an interpreter the script's own `lr_at` equals it bitwise too.
+///
+/// Both halves are exact `f64` comparisons on purpose. A schedule is five numbers and three
+/// operations; if two implementations of it disagree in the last bit, one of them has been
+/// re-associated, and a training run is then not reproducible from its `scheduler.json`.
+#[test]
+fn lr_schedule_matches_the_golden() {
+    let text = std::fs::read_to_string(lr_golden())
+        .unwrap_or_else(|e| panic!("{}: {e}", lr_golden().display()));
+    let golden: serde_json::Value = serde_json::from_str(&text).expect("the golden is JSON");
+    let number = |key: &str| golden[key].as_f64().unwrap_or_else(|| panic!("{key}"));
+    let count = |key: &str| golden[key].as_u64().unwrap_or_else(|| panic!("{key}")) as u32;
+    let (total, warmup) = (count("total"), count("warmup"));
+    let (lr, lr_min) = (number("lr"), number("lr_min"));
+    let want: Vec<f64> = golden["values"]
+        .as_array()
+        .expect("values")
+        .iter()
+        .map(|v| v.as_f64().expect("a value"))
+        .collect();
+    assert!(want.len() >= 1000, "the golden is {} values", want.len());
+
+    let mut differ = Vec::new();
+    for (step, want) in want.iter().enumerate() {
+        let got = lr_at(step as u32, total, lr, lr_min, warmup);
+        if got.to_bits() != want.to_bits() {
+            differ.push((step, got, *want));
+        }
+    }
+    assert!(
+        differ.is_empty(),
+        "the Rust re-implementation is not the golden at {} of {} steps, first {:?}",
+        differ.len(),
+        want.len(),
+        &differ[..differ.len().min(4)]
+    );
+    // The schedule is what the lowering's own oracle assumes: it starts at 0, peaks at `lr`
+    // at the end of the warmup and decays. Cheap, and it catches a golden regenerated from a
+    // formula that happens to agree with a broken re-implementation.
+    assert_eq!(want[0].to_bits(), 0.0f64.to_bits());
+    assert_eq!(want[warmup as usize].to_bits(), lr.to_bits());
+    assert!(want[warmup as usize + 1] < lr && want[999] > lr_min);
+
+    match python_with_torch() {
+        Err(why) => println!("SKIP the interpreter half of lr_schedule_matches_the_golden: {why}"),
+        Ok(python) => {
+            let probe = run(
+                &python,
+                &[
+                    "-c",
+                    LR_PROBE_PY,
+                    &train_act_py().to_string_lossy(),
+                    &total.to_string(),
+                    &lr.to_string(),
+                    &lr_min.to_string(),
+                    &warmup.to_string(),
+                    &want.len().to_string(),
+                ],
+            );
+            let reply: serde_json::Value =
+                serde_json::from_slice(&probe.stdout).expect("the probe replies JSON");
+            let from_python: Vec<f64> = reply["values"]
+                .as_array()
+                .expect("values")
+                .iter()
+                .map(|v| v.as_f64().expect("a value"))
+                .collect();
+            assert_eq!(from_python.len(), want.len());
+            for (step, (a, b)) in from_python.iter().zip(&want).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "step {step}: the script gives {a:e}, the golden {b:e}"
+                );
+            }
+            // ...and `lr_curve_hash` is blake3 over those same values as little-endian f64,
+            // which is what makes the number in a run summary checkable from the outside.
+            let hashed: Vec<u8> = want.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let here = blake3::hash(&hashed).to_hex().to_string();
+            match reply["lr_curve_hash"].as_str() {
+                Some(there) => assert_eq!(there, here, "lr_curve_hash disagrees"),
+                None => println!("SKIP lr_curve_hash: `blake3` is not importable by {python}"),
+            }
+            println!("RAN lr_schedule_matches_the_golden: interpreter half too, {here}");
+        }
+    }
+    println!(
+        "RAN lr_schedule_matches_the_golden: {} values bitwise, warmup {warmup} of {total}, \
+         lr {lr:e} -> {lr_min:e}",
+        want.len()
+    );
+}
+
+/// Oracle 2 of packet M7/T4. `--schedule constant` is the default **and** it is the run of
+/// before: passing every new flag at its documented default gives a byte-identical loss
+/// curve, the optimizer block is the one the measured runs were taken under, and the applied
+/// learning rate never moves off `--lr`.
+///
+/// What this cannot check from inside the repository is equality with the *previous* script,
+/// because that file is not in the tree. That comparison is the server measurement in
+/// `docs/design/training-recipe.md` section 10: `git archive main` into a scratch directory,
+/// the same 40 steps, and the two curves compared as bytes.
+#[test]
+#[ignore = "needs torch, torchvision and pyarrow"]
+fn the_default_schedule_is_the_old_run() {
+    let python = match python_with_torch() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP the_default_schedule_is_the_old_run: {why}");
+            return;
+        }
+    };
+    let dir = scratch_dir("default-schedule");
+    let (path, _bundle) = demo_bundle(&dir);
+    let (build, _contract) = lowered(&dir, &path);
+    let baked = mini_baked(&python, &dir, &path);
+
+    let train = |tag: &str, extra: &[&str]| -> (Vec<u8>, serde_json::Value) {
+        let curve = dir.join(format!("{tag}.json"));
+        let out = dir.join(format!("{tag}.safetensors"));
+        let mut args = vec![
+            train_act_py().to_string_lossy().into_owned(),
+            "--module".to_owned(),
+            build.to_string_lossy().into_owned(),
+            "--baked".to_owned(),
+            baked.to_string_lossy().into_owned(),
+            "--out".to_owned(),
+            out.to_string_lossy().into_owned(),
+            "--batch".to_owned(),
+            "4".to_owned(),
+            "--seed".to_owned(),
+            "0".to_owned(),
+            "--checkpoint-at".to_owned(),
+            ORACLE_STEPS.to_string(),
+            "--loss-curve".to_owned(),
+            curve.to_string_lossy().into_owned(),
+        ];
+        args.extend(extra.iter().map(|w| (*w).to_owned()));
+        let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+        let done = run(&python, &borrowed);
+        let line = String::from_utf8_lossy(&done.stdout)
+            .lines()
+            .last()
+            .unwrap_or_default()
+            .to_owned();
+        (
+            std::fs::read(&curve).unwrap_or_else(|e| panic!("{}: {e}", curve.display())),
+            serde_json::from_str(&line).unwrap_or_else(|e| panic!("{e} in `{line}`")),
+        )
+    };
+
+    let (default, report) = train("default", &[]);
+    let (explicit, _) = train(
+        "explicit",
+        &[
+            "--schedule",
+            "constant",
+            "--warmup-steps",
+            "0",
+            "--lr-min",
+            "0",
+            "--weight-decay",
+            "0.01",
+            "--grad-clip",
+            "0",
+        ],
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&explicit),
+        String::from_utf8_lossy(&default),
+        "the new flags at their defaults moved the loss curve"
+    );
+
+    // The knobs themselves, and not only their agreement with each other: this is the
+    // assertion that fails if a default is ever edited (packet M7/T4's `forbidden`).
+    assert_eq!(
+        report["optimizer"],
+        serde_json::json!({
+            "kind": "AdamW", "lr": 1e-4, "betas": [0.9, 0.999], "eps": 1e-8,
+            "weight_decay": 0.01,
+        }),
+        "the default optimizer moved: every measured run in the design notes was at this one"
+    );
+    assert_eq!(report["schedule"], "constant");
+    assert_eq!(report["batch"], 4, "the flag this test passes");
+    assert_eq!(report["grad_clip"], 0.0);
+    assert_eq!(report["first_nonfinite_step"], serde_json::Value::Null);
+
+    // The applied rate never moved off `--lr`, stated as the hash the summary reports.
+    let flat: Vec<u8> = std::iter::repeat_n(1e-4f64.to_le_bytes(), ORACLE_STEPS)
+        .flatten()
+        .collect();
+    let constant = blake3::hash(&flat).to_hex().to_string();
+    match report["lr_curve_hash"].as_str() {
+        Some(reported) => assert_eq!(
+            reported, constant,
+            "a constant schedule applied something other than {ORACLE_STEPS} copies of --lr"
+        ),
+        None => println!("SKIP the lr_curve_hash half: `blake3` is not importable by {python}"),
+    }
+
+    // ...and a schedule that is not constant *is* a different run, so the equality above is
+    // a property of the default and not of a flag that does nothing.
+    let (cosine, cosine_report) = train(
+        "cosine",
+        &["--schedule", "warmup_cosine", "--warmup-steps", "10"],
+    );
+    assert_ne!(
+        String::from_utf8_lossy(&cosine),
+        String::from_utf8_lossy(&default),
+        "--schedule warmup_cosine did not move the loss at all"
+    );
+    println!(
+        "RAN the_default_schedule_is_the_old_run: {ORACLE_STEPS} steps, default curve \
+         {} bytes, lr_curve_hash {}\n  default: {report}\n  cosine:  {cosine_report}",
+        default.len(),
+        report["lr_curve_hash"]
+    );
+}
+
 /// Packet M7/T3. The batch axis has to be an axis and nothing more: the same eight
 /// observations through the lowered module as one `[8, ..]` batch and as eight `[1, ..]` calls
 /// must be the same eight chunks.

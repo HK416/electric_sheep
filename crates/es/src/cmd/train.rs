@@ -541,9 +541,10 @@ fn hardware(probe: &Value, route: Route, device: &str, interpreter: &str) -> Val
     })
 }
 
-/// `optimizer.json` declares the betas and weight decay `train_act.py`'s `AdamW(params,
-/// lr=lr)` leaves at torch's defaults. If torch ever moves them the declaration is stale, so
-/// the trainer reports what it built and the two are compared out loud.
+/// `optimizer.json` declares the betas and eps `train_act.py`'s `AdamW` leaves at torch's
+/// defaults, beside the lr and weight decay the recipe tells it to use (packet M7/T4). If
+/// torch ever moves a default the declaration is stale, so the trainer reports what it built
+/// and the two are compared out loud.
 fn warn_on_optimizer(training: &Training, summary: &Value) {
     let Some(reported) = summary.get("optimizer") else {
         return;
@@ -557,8 +558,7 @@ fn warn_on_optimizer(training: &Training, summary: &Value) {
     if !same {
         println!(
             "warning: the trainer reports {reported} and optimizer.json declares {declared}; \
-             training_hash names the declaration, so it is now stale (packet T4 owns the \
-             optimizer block)"
+             training_hash names the declaration, so it is now stale"
         );
     }
 }

@@ -7780,3 +7780,85 @@ fn train_ir_path_packs_a_bundle_torch_opens() {
     assert_eq!(lock["checkpoints"][0]["step"].as_u64(), Some(40));
     println!("RAN train_ir_path_packs_a_bundle_torch_opens: training_hash {training_hash}");
 }
+
+// --- packet M7/T4: the learning-rate schedule -------------------------------------------
+
+/// Oracle 3. The schedule is a document value, so it moves `identity_hash`; `scheduler.json`
+/// and `optimizer.json` carry what the trainer was told, and `config.json`'s plan carries the
+/// flags it would have been told with.
+///
+/// Like `train_identity_is_a_function_of_the_recipe`, the recipe names an interpreter that
+/// cannot exist: every assertion here is about the identity written *before* the run, which
+/// is the half of the split that needs no Python.
+#[test]
+fn train_identity_moves_with_the_schedule() {
+    let dir = scratch_dir("train-schedule");
+    let bundle = write_demo_bundle(&dir);
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 2, 12);
+    let base = train_fixture_recipe(&bundle, &root, &tiles, 0, "1e-4");
+
+    let go = |name: &str, body: &str| -> (serde_json::Value, PathBuf) {
+        let recipe = dir.join(format!("{name}.toml"));
+        write(&recipe, body);
+        let out = dir.join(name);
+        run_train(&train_toml_path(&recipe), &out, &[]);
+        (train_lock(&out), out)
+    };
+    let scheduled = |warmup: u32| {
+        base.replace(
+            "device = ",
+            &format!(
+                "schedule = {{ kind = \"warmup_cosine\", warmup = {warmup}, lr_min = 1e-6 }}\n\
+                 grad_clip = 1.0\ndevice = "
+            ),
+        )
+    };
+
+    let (plain, plain_out) = go("plain", &base);
+    let (ten, ten_out) = go("warmup-10", &scheduled(10));
+    let (twenty, _) = go("warmup-20", &scheduled(20));
+    assert_ne!(
+        plain["identity_hash"], ten["identity_hash"],
+        "a schedule did not move identity_hash"
+    );
+    assert_ne!(
+        ten["identity_hash"], twenty["identity_hash"],
+        "`warmup` did not move identity_hash"
+    );
+
+    let slot = |out: &Path, name: &str| -> String {
+        let path = out.join("training").join(name);
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+    };
+    let json = |out: &Path, name: &str| -> serde_json::Value {
+        serde_json::from_str(&slot(out, name)).expect("a training slot is JSON")
+    };
+    let scheduler = json(&ten_out, "scheduler.json");
+    assert_eq!(scheduler["kind"], "warmup_cosine", "{scheduler}");
+    assert_eq!(scheduler["warmup"], 10, "{scheduler}");
+    assert_eq!(scheduler["lr_min"], 1e-6, "{scheduler}");
+    // The cosine's period is the length of the run, so `steps` is part of the schedule.
+    assert_eq!(scheduler["total_steps"], 40, "{scheduler}");
+    let optimizer = json(&ten_out, "optimizer.json");
+    assert_eq!(optimizer["grad_clip"], 1.0, "{optimizer}");
+    assert_eq!(optimizer["weight_decay"], 0.01, "{optimizer}");
+
+    // ...and the flags are on the line the trainer would have been run with.
+    let plan = json(&ten_out, "config.json")["plan"].to_string();
+    assert!(
+        plan.contains("--schedule warmup_cosine --warmup-steps 10 --lr-min 0.000001 --grad-clip 1"),
+        "{plan}"
+    );
+
+    // The recipe that names no schedule is the run of before, hash included: the same nine
+    // pre-run slots it had before this packet existed (design note `training-recipe.md` 10).
+    assert_eq!(
+        slot(&plain_out, "scheduler.json"),
+        "{\"kind\":\"constant\",\"lr\":0.0001}\n"
+    );
+    assert!(
+        !slot(&plain_out, "optimizer.json").contains("grad_clip"),
+        "a run with no clip declared one"
+    );
+}

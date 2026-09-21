@@ -133,6 +133,36 @@ pub struct Run {
     /// Overridden by `ES_PYTHON` when it is set (the same override every other oracle uses).
     #[serde(default = "default_interpreter")]
     pub interpreter: String,
+    /// The learning-rate schedule (packet M7/T4). Absent is `constant`, and absent means
+    /// **absent**: no flag on the trainer's command line and the same `scheduler.json` as
+    /// before T4, so a recipe written for the measured runs keeps its `identity_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule: Option<Schedule>,
+    /// `AdamW`'s weight decay. Absent is torch's own `1e-2`, which is what `optimizer.json`
+    /// has always declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weight_decay: Option<f64>,
+    /// Gradient-norm clip. Absent is off, and `optimizer.json` then names no clip.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grad_clip: Option<f64>,
+}
+
+/// `[run] schedule = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }` (packet M7/T4,
+/// spec 19.3's `scheduler.json`).
+///
+/// The shape of the schedule is the trainer's — `python/es/train_act.py::lr_at`, pinned by
+/// `tests/golden/train/lr_warmup_cosine.json` — and this is the document that names it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Schedule {
+    /// `constant` or `warmup_cosine`.
+    pub kind: String,
+    /// Optimizer steps of linear warmup from 0 to `[run] lr`.
+    #[serde(default)]
+    pub warmup: u32,
+    /// The floor the cosine decays to.
+    #[serde(default)]
+    pub lr_min: f64,
 }
 
 fn default_interpreter() -> String {
@@ -163,9 +193,87 @@ impl Recipe {
     pub fn parse(text: &str) -> Result<Self, DataError> {
         let recipe: Self = es_ir::serial::parse_toml(text)
             .map_err(|e| refuse(format!("the recipe does not parse: {e}")))?;
-        recipe.route()?;
+        let route = recipe.route()?;
         recipe.marks()?;
+        // Unconditionally, not behind the route test: a schedule that cannot run is refused
+        // on both routes, and on this one for a second reason as well.
+        let schedule_args = recipe.schedule_args()?;
+        if route == Route::External && !schedule_args.is_empty() {
+            return Err(refuse(
+                "[run] `schedule`, `weight_decay` and `grad_clip` are the IR route's: they \
+                 are `python/es/train_act.py`'s flags, and `lerobot-train` carries its own \
+                 optimizer and scheduler configuration. Declaring one here would put a \
+                 schedule into `scheduler.json` that the run never applied; reach lerobot's \
+                 own through `[policy] lerobot.extra`",
+            ));
+        }
         Ok(recipe)
+    }
+
+    /// The trainer flags `[run] schedule`, `weight_decay` and `grad_clip` add (packet M7/T4).
+    ///
+    /// Empty when the recipe sets none of them — which is what keeps the command plan, and
+    /// its golden, byte-identical for a recipe written before this packet.
+    pub fn schedule_args(&self) -> Result<Vec<String>, DataError> {
+        let run = &self.run;
+        let mut args = Vec::new();
+        match run.schedule.as_ref().map(|s| (s.kind.as_str(), s)) {
+            None => {}
+            Some(("constant", schedule)) => {
+                if schedule.warmup != 0 || schedule.lr_min != 0.0 {
+                    return Err(refuse(
+                        "[run] `schedule.kind` is \"constant\" and it sets `warmup` or \
+                         `lr_min`; a constant schedule has neither. \
+                         `kind = \"warmup_cosine\"` is the one that does",
+                    ));
+                }
+            }
+            Some(("warmup_cosine", schedule)) => {
+                if schedule.warmup >= run.steps {
+                    return Err(refuse(format!(
+                        "[run] `schedule.warmup` is {} and the run is {} steps: the learning \
+                         rate would never leave the ramp",
+                        schedule.warmup, run.steps
+                    )));
+                }
+                if !schedule.lr_min.is_finite() || !(0.0..run.lr).contains(&schedule.lr_min) {
+                    return Err(refuse(format!(
+                        "[run] `schedule.lr_min` is {} and `lr` is {}: the floor of the \
+                         cosine has to be finite, not negative, and below the peak",
+                        schedule.lr_min, run.lr
+                    )));
+                }
+                args.extend([
+                    s("--schedule"),
+                    s("warmup_cosine"),
+                    s("--warmup-steps"),
+                    schedule.warmup.to_string(),
+                    s("--lr-min"),
+                    schedule.lr_min.to_string(),
+                ]);
+            }
+            Some((other, _)) => {
+                return Err(refuse(format!(
+                    "[run] `schedule.kind` is {other:?}; it is \"constant\" or \
+                     \"warmup_cosine\""
+                )))
+            }
+        }
+        for (field, value) in [
+            ("weight-decay", run.weight_decay),
+            ("grad-clip", run.grad_clip),
+        ] {
+            let Some(value) = value else { continue };
+            if !value.is_finite() || value < 0.0 {
+                return Err(refuse(format!(
+                    "[run] `{}` is {value}",
+                    field.replace('-', "_")
+                )));
+            }
+            args.push(format!("--{field}"));
+            args.push(value.to_string());
+        }
+        Ok(args)
     }
 
     /// `bundle` xor `lerobot`, and the external route needs the three documents the import
@@ -417,7 +525,12 @@ impl Plan {
                         run.device.clone(),
                         s("--loss-curve"),
                         under(out, "metrics/loss.json"),
-                    ],
+                    ]
+                    .into_iter()
+                    // Appended, and only when the recipe asks for them (packet M7/T4): a
+                    // recipe that names no schedule renders the plan it always did.
+                    .chain(recipe.schedule_args()?)
+                    .collect(),
                     step: None,
                 });
                 for mark in &marks {
@@ -606,10 +719,21 @@ impl Training {
         // reports when the run ends. `lerobot`'s own optimizer block is not this side's to
         // declare, so it stays unset (T4 owns the optimizer and the schedule).
         let optimizer = match route {
-            Route::Ir => json!({
-                "kind": "AdamW", "lr": run.lr, "betas": [0.9, 0.999],
-                "eps": 1e-8, "weight_decay": 0.01, "declared_by": "train_act.py",
-            }),
+            Route::Ir => {
+                let mut optimizer = json!({
+                    "kind": "AdamW", "lr": run.lr, "betas": [0.9, 0.999], "eps": 1e-8,
+                    // Torch's own default until packet M7/T4, and now the number the trainer
+                    // is *told* to use -- the same value, declared instead of assumed.
+                    "weight_decay": run.weight_decay.unwrap_or(0.01),
+                    "declared_by": "train_act.py",
+                });
+                if let Some(clip) = run.grad_clip {
+                    // Only when there is one: no clip is the absence of a clip, and a key
+                    // that appeared unconditionally would move every pre-T4 identity_hash.
+                    optimizer["grad_clip"] = json!(clip);
+                }
+                optimizer
+            }
             Route::External => json!({
                 "kind": "AdamW", "lr": run.lr, "betas": {"unset": true},
                 "weight_decay": {"unset": true}, "declared_by": "lerobot-train",
@@ -656,7 +780,19 @@ impl Training {
             }),
         );
         put("optimizer.json", optimizer);
-        put("scheduler.json", json!({"kind": "constant", "lr": run.lr}));
+        // `total_steps` is part of the schedule and not decoration: the cosine's period is
+        // the length of the run, so two runs of one `warmup`/`lr_min` pair at different
+        // `steps` are two schedules (packet M7/T4).
+        put(
+            "scheduler.json",
+            match run.schedule.as_ref().filter(|s| s.kind == "warmup_cosine") {
+                None => json!({"kind": "constant", "lr": run.lr}),
+                Some(schedule) => json!({
+                    "kind": "warmup_cosine", "lr": run.lr, "lr_min": schedule.lr_min,
+                    "warmup": schedule.warmup, "total_steps": run.steps,
+                }),
+            },
+        );
         put(
             "seed.json",
             json!({
@@ -941,6 +1077,94 @@ device = "cuda"
             &json!({"device": "cpu"}),
         );
         assert_ne!(before, t.hash().unwrap());
+    }
+
+    /// Packet M7/T4. The schedule is absent until a recipe asks for it: no flag on the
+    /// trainer's line, the `scheduler.json` of before, and therefore the same
+    /// `identity_hash` — the property that keeps the measured runs reproducible.
+    #[test]
+    fn a_recipe_without_a_schedule_is_the_run_of_before() {
+        let (recipe, plan) = plan_of(IR, "/tmp/a");
+        let rendered = plan.render(Path::new("/tmp/a"));
+        for flag in [
+            "--schedule",
+            "--warmup-steps",
+            "--lr-min",
+            "--weight-decay",
+            "--grad-clip",
+        ] {
+            assert!(
+                !rendered.contains(flag),
+                "{flag} is on a plan that asked for none"
+            );
+        }
+        let before =
+            Training::pre_run(&recipe, &plan, Path::new("/tmp/a"), "python", &facts()).unwrap();
+        assert_eq!(
+            before.file("scheduler.json"),
+            "{\"kind\":\"constant\",\"lr\":0.0001}\n"
+        );
+        assert!(before
+            .file("optimizer.json")
+            .contains("\"weight_decay\":0.01"));
+        assert!(!before.file("optimizer.json").contains("grad_clip"));
+
+        let asked = IR.replace(
+            "device = \"cuda\"",
+            "schedule = { kind = \"warmup_cosine\", warmup = 250, lr_min = 1e-6 }\n\
+             weight_decay = 0.05\ngrad_clip = 1.0\ndevice = \"cuda\"",
+        );
+        let (r2, p2) = plan_of(&asked, "/tmp/a");
+        let rendered = p2.render(Path::new("/tmp/a"));
+        assert!(
+            rendered.contains(
+                "--schedule warmup_cosine --warmup-steps 250 --lr-min 0.000001 \
+                 --weight-decay 0.05 --grad-clip 1"
+            ),
+            "{rendered}"
+        );
+        let after = Training::pre_run(&r2, &p2, Path::new("/tmp/a"), "python", &facts()).unwrap();
+        assert_eq!(
+            after.file("scheduler.json"),
+            "{\"kind\":\"warmup_cosine\",\"lr\":0.0001,\"lr_min\":1e-6,\"total_steps\":20000,\
+             \"warmup\":250}\n"
+        );
+        assert!(after.file("optimizer.json").contains("\"grad_clip\":1.0"));
+        assert_ne!(before.hash().unwrap(), after.hash().unwrap());
+    }
+
+    /// Each of the three is refused by the name of the field that is wrong.
+    #[test]
+    fn a_schedule_that_cannot_run_is_refused_by_name() {
+        let with =
+            |body: &str| IR.replace("device = \"cuda\"", &format!("{body}\ndevice = \"cuda\""));
+        for (body, word) in [
+            ("schedule = { kind = \"cosine\" }", "schedule.kind"),
+            (
+                "schedule = { kind = \"warmup_cosine\", warmup = 20000 }",
+                "schedule.warmup",
+            ),
+            (
+                "schedule = { kind = \"warmup_cosine\", warmup = 10, lr_min = 1.0 }",
+                "schedule.lr_min",
+            ),
+            (
+                "schedule = { kind = \"constant\", warmup = 10 }",
+                "constant",
+            ),
+            ("grad_clip = -1.0", "grad_clip"),
+        ] {
+            let e = Recipe::parse(&with(body)).expect_err("refused");
+            assert!(e.to_string().contains(word), "{body}: {e}");
+        }
+        // The external route has its own optimizer and scheduler: declaring one here would
+        // put a schedule into `scheduler.json` that the run never applied.
+        let e = Recipe::parse(&EXTERNAL.replace(
+            "device = \"cuda\"",
+            "schedule = { kind = \"warmup_cosine\", warmup = 10 }\ndevice = \"cuda\"",
+        ))
+        .expect_err("refused");
+        assert!(e.to_string().contains("IR route's"), "{e}");
     }
 
     #[test]
