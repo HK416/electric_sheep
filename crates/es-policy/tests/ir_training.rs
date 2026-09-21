@@ -1821,75 +1821,86 @@ fn aug_uniform(k: u32, i: u32) -> f64 {
 
 /// The Rust re-implementation of `python/es/augment.py::apply_chain`, node for node.
 ///
-/// `x` is one sample, `(c, h, w)` its shape; the return is the augmented sample and its
-/// shape. Every scalar is computed in `f64` and rounded to `f32` before it touches a value,
-/// which is what lets the two implementations agree without agreeing about widening.
+/// `values` is one sample, `shape` its `(channels, height, width)`; the return is the
+/// augmented sample and its shape. Every scalar is computed in `f64` and rounded to `f32`
+/// before it touches a value, which is what lets the two implementations agree without
+/// agreeing about widening.
 fn apply_chain(
     chain: &[serde_json::Value],
-    mut x: Vec<f32>,
+    mut values: Vec<f32>,
     mut shape: (usize, usize, usize),
     sample: u32,
     step: u32,
     seed: u64,
 ) -> (Vec<f32>, (usize, usize, usize)) {
     for node in chain {
-        let k = aug_key(
+        let stream = aug_key(
             seed,
             sample,
             step,
             node["node"].as_u64().expect("node id") as u32,
         );
-        let f = |key: &str| node[key].as_f64().unwrap_or_else(|| panic!("{key}"));
-        let (c, h, w) = shape;
+        let param = |key: &str| node[key].as_f64().unwrap_or_else(|| panic!("{key}"));
+        let (planes, height, width) = shape;
         match node["kind"].as_str().expect("kind") {
             "RandomCrop" => {
-                let (cw, ch) = (f("width") as usize, f("height") as usize);
-                let ox = ((aug_uniform(k, 0) * (w - cw + 1) as f64) as usize).min(w - cw);
-                let oy = ((aug_uniform(k, 1) * (h - ch + 1) as f64) as usize).min(h - ch);
-                let mut out = Vec::with_capacity(c * ch * cw);
-                for plane in 0..c {
-                    for y in 0..ch {
-                        let row = plane * h * w + (y + oy) * w + ox;
-                        out.extend_from_slice(&x[row..row + cw]);
+                let (crop_w, crop_h) = (param("width") as usize, param("height") as usize);
+                let span = |u: f64, from: usize, to: usize| {
+                    ((u * (from - to + 1) as f64) as usize).min(from - to)
+                };
+                let left = span(aug_uniform(stream, 0), width, crop_w);
+                let top = span(aug_uniform(stream, 1), height, crop_h);
+                let mut out = Vec::with_capacity(planes * crop_h * crop_w);
+                for plane in 0..planes {
+                    for row in 0..crop_h {
+                        let at = plane * height * width + (row + top) * width + left;
+                        out.extend_from_slice(&values[at..at + crop_w]);
                     }
                 }
-                x = out;
-                shape = (c, ch, cw);
+                values = out;
+                shape = (planes, crop_h, crop_w);
             }
             "ColorJitter" => {
-                assert_eq!(
-                    f("saturation"),
-                    0.0,
-                    "the Rust half refuses what Python does"
-                );
-                assert_eq!(f("hue"), 0.0, "the Rust half refuses what Python does");
-                let gain = (1.0 + (2.0 * aug_uniform(k, 0) - 1.0) * f("brightness")) as f32;
-                for v in &mut x {
-                    *v *= gain;
+                for refused in ["saturation", "hue"] {
+                    // Exactly zero is the condition `augment.py` refuses on, so the
+                    // comparison here has to be the same exact one.
+                    assert!(
+                        param(refused) == 0.0,
+                        "the Rust half refuses what Python refuses"
+                    );
+                }
+                let gain =
+                    (1.0 + (2.0 * aug_uniform(stream, 0) - 1.0) * param("brightness")) as f32;
+                for value in &mut values {
+                    *value *= gain;
                 }
                 // The one reduction: f64, then rounded once to f32. Python's is torch's
                 // `.double().mean()`, whose summation order is its own — see section 13.
-                let mean = (x.iter().map(|v| f64::from(*v)).sum::<f64>() / x.len() as f64) as f32;
-                let gain_c = (1.0 + (2.0 * aug_uniform(k, 1) - 1.0) * f("contrast")) as f32;
-                for v in &mut x {
-                    *v = (*v - mean) * gain_c + mean;
+                let mean = (values.iter().map(|v| f64::from(*v)).sum::<f64>() / values.len() as f64)
+                    as f32;
+                let contrast =
+                    (1.0 + (2.0 * aug_uniform(stream, 1) - 1.0) * param("contrast")) as f32;
+                for value in &mut values {
+                    *value = (*value - mean) * contrast + mean;
                 }
             }
             "GaussianNoise" => {
-                let sigma = f("sigma");
-                for (e, v) in x.iter_mut().enumerate() {
-                    let e = e as u32;
-                    let u1 = 1.0 - aug_uniform(k, 2 * e);
-                    let u2 = aug_uniform(k, 2 * e + 1);
-                    let radius = (-2.0 * u1.ln()).sqrt();
-                    let angle = (2.0 * std::f64::consts::PI * u2).cos();
-                    *v += (sigma * radius * angle) as f32;
+                let sigma = param("sigma");
+                for (at, value) in values.iter_mut().enumerate() {
+                    let at = at as u32;
+                    // `1 - u` is in (0, 1], so the logarithm is always defined -- the same
+                    // guard `augment.py` uses, and it has to be the same one.
+                    let first = 1.0 - aug_uniform(stream, 2 * at);
+                    let second = aug_uniform(stream, 2 * at + 1);
+                    let radius = (-2.0 * first.ln()).sqrt();
+                    let angle = (2.0 * std::f64::consts::PI * second).cos();
+                    *value += (sigma * radius * angle) as f32;
                 }
             }
             other => panic!("the golden names {other}, which this oracle does not implement"),
         }
     }
-    (x, shape)
+    (values, shape)
 }
 
 /// argv is `<augment.py> <request.json>`; stdout is `{"output": [[...], ...]}`.
@@ -2037,9 +2048,9 @@ fn augmentation_matches_the_golden() {
         let (got, out_shape) = apply_chain(&chain, input.clone(), shape, *sample, step, seed);
         assert_eq!(out_shape, (3, 8, 8), "the chain's output shape");
         assert_eq!(got.len(), want[row].len(), "sample {sample}: length");
-        for (i, (g, w)) in got.iter().zip(&want[row]).enumerate() {
-            if g.to_bits() != w.to_bits() {
-                differ.push((*sample, i, *g, *w));
+        for (at, (mine, theirs)) in got.iter().zip(&want[row]).enumerate() {
+            if mine.to_bits() != theirs.to_bits() {
+                differ.push((*sample, at, *mine, *theirs));
             }
         }
     }
@@ -2082,11 +2093,11 @@ fn augmentation_matches_the_golden() {
                 .collect();
             assert_eq!(from_python.len(), want.len());
             for (row, (a, b)) in from_python.iter().zip(&want).enumerate() {
-                for (i, (x, y)) in a.iter().zip(b).enumerate() {
+                for (at, (mine, theirs)) in a.iter().zip(b).enumerate() {
                     assert_eq!(
-                        x.to_bits(),
-                        y.to_bits(),
-                        "sample {row} value {i}: the script gives {x:e}, the golden {y:e}"
+                        mine.to_bits(),
+                        theirs.to_bits(),
+                        "sample {row} value {at}: the script gives {mine:e}, the golden                          {theirs:e}"
                     );
                 }
             }
