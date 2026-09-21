@@ -27,7 +27,7 @@ use std::collections::BTreeMap;
 
 use es_compile::{CpuPlan, Tensor};
 use es_core::{PhysTick, TickRate};
-use es_ir::deployment::{ExecutionMode, Micros, RateSpec};
+use es_ir::deployment::{ActionSpace, ExecutionMode, Micros, RateSpec};
 use es_ir::learning::{ActionExecutionMode, ChunkBlendPolicy, PolicyContract};
 use es_ir::types::ElemType;
 use es_physics_core::backend::{ModelInfo, StateView};
@@ -100,6 +100,10 @@ pub struct DomainRunner<const NJ: usize, const H: usize> {
     inference_calls: u64,
     /// The pre-plane command of the last [`emit_actions`](Self::emit_actions), `n_envs * NJ`.
     commanded: Vec<f64>,
+    /// What the policy's rows mean (spec 8.5). `JointPosition` -- the default, and what every
+    /// committed deployment declares -- is a target; `JointDelta` is an increment
+    /// [`absolute_target`](crate::chunk_buffer::absolute_target) integrates.
+    space: ActionSpace,
 }
 
 impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
@@ -146,6 +150,7 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
             observations: 0,
             inference_calls: 0,
             commanded: vec![0.0; envs * NJ],
+            space: ActionSpace::JointPosition,
         })
     }
 
@@ -155,6 +160,14 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
     pub fn with_ports(mut self, observation: &str, action: &str) -> Self {
         observation.clone_into(&mut self.obs_port);
         action.clone_into(&mut self.action_port);
+        self
+    }
+
+    /// Declares the Deployment IR's `action.space` (spec 8.5). Absent is `JointPosition`, so
+    /// a caller that never calls this runs exactly as it did.
+    #[must_use]
+    pub fn with_action_space(mut self, space: ActionSpace) -> Self {
+        self.space = space;
         self
     }
 
@@ -331,11 +344,20 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
         let period_us = self.control_period_us();
         for env in 0..envs {
             // The one buffer -> plane step, shared with `es_eval::runner` (packet M5/V6b).
+            //
+            // `last_safe_action` is the integrator state of packet M9/T1: the plane's own last
+            // executed command, which at the first tick of an episode is the measured pose
+            // `observe_state` seeded the chain with (spec 9.3). Read before `validate`, so a
+            // `JointDelta` increment lands on what the arm was told to do and not on what the
+            // policy asked for. Unread for every absolute space.
+            let prev = planes[env].last_safe_action();
             let (chunk, row) = plane_chunk(
                 &mut self.buffers[env],
                 &mut self.submitted[env],
                 self.control_tick,
                 self.mode,
+                self.space,
+                &prev,
             );
             let age = self.latest[env]
                 .as_ref()
@@ -589,6 +611,7 @@ mod tests {
     };
     use es_ir::learning::{LearningGraph, RuntimeHints};
     use es_ir::task::{Distribution, JointQuantity, TaskNode};
+    use es_physics_core::backend::PhysicsBackend as _;
     use es_policy::{PolicyError, PolicyInfo, WeightsSource};
     use es_safety::ViolationKind;
 
@@ -1110,5 +1133,297 @@ mod tests {
             all.observation_bytes_per_sec() / g.observation_bytes_per_sec(),
             8
         );
+    }
+
+    // --- M9 T1: `JointDelta` on the collection path (spec 8.5) ------------------------------
+
+    /// The pose every episode of the delta fixture starts from, and therefore the value the
+    /// first increment is added to. A negative power of two, because the claim below is
+    /// *bitwise*: `(x + d) - d == x` only holds for a sum that never rounds.
+    const SEED_QPOS: f64 = 0.125;
+
+    /// The scripted absolute target for control tick `t`: `0.125 + (t % 7 + 1) / 64`, which is
+    /// exact in `f32` (the policy output's dtype) and in `f64`, and whose first difference
+    /// changes sign.
+    fn scripted(t: u64) -> f64 {
+        SEED_QPOS + f64::from((t % 7) as u32 + 1) / 64.0
+    }
+
+    /// The increment that walks the scripted sequence: `s(t) - s(t-1)`, and at tick 0 the step
+    /// from the seeded pose, which is what the plane's command chain starts on.
+    fn increment(t: u64) -> f64 {
+        scripted(t) - if t == 0 { SEED_QPOS } else { scripted(t - 1) }
+    }
+
+    /// Emits, on call `n`, the rows for control ticks `n .. n + H`: the scripted absolute
+    /// targets, or their first differences. With `expected_latency_ms = 0` and one policy
+    /// invocation per control tick, call `n` *is* tick `n`, and under `HardSwitch` the newest
+    /// chunk's row 0 is what the buffer serves.
+    #[derive(Debug)]
+    struct Scripted {
+        calls: u64,
+        delta: bool,
+        /// When set, row 0 of call `n` is this instead — the integrated absolute a delta run
+        /// produced, replayed through a `JointPosition` deployment.
+        replay: Option<Vec<f64>>,
+    }
+
+    impl PolicyRuntime for Scripted {
+        fn load(
+            &mut self,
+            _graph: &LearningGraph,
+            _weights: &WeightsSource,
+        ) -> Result<PolicyInfo, PolicyError> {
+            Err(PolicyError::Unavailable(
+                "scripted policy loads nothing".into(),
+            ))
+        }
+
+        fn infer(
+            &mut self,
+            _inputs: &BTreeMap<String, Tensor>,
+        ) -> Result<BTreeMap<String, Tensor>, PolicyError> {
+            let n = self.calls;
+            self.calls += 1;
+            let mut data = Vec::new();
+            for h in 0..H as u64 {
+                let at = (n + h) as usize;
+                let v = match &self.replay {
+                    Some(rows) => rows[at.min(rows.len() - 1)],
+                    None if self.delta => increment(n + h),
+                    None => scripted(n + h),
+                };
+                data.extend_from_slice(&(v as f32).to_le_bytes());
+            }
+            Ok([(
+                "action".to_owned(),
+                Tensor {
+                    dtype: ElemType::F32,
+                    shape: vec![1, H as u64, NJ as u64],
+                    data,
+                },
+            )]
+            .into_iter()
+            .collect())
+        }
+
+        fn info(&self) -> Option<&PolicyInfo> {
+            None
+        }
+
+        fn runtime_hash(&self) -> [u8; 32] {
+            [9; 32]
+        }
+    }
+
+    /// One env, one policy invocation per control tick, no declared latency, hard switch: the
+    /// smallest configuration in which "the row the buffer serves at tick `t`" is a scripted
+    /// number rather than a blend of several.
+    fn delta_domains() -> BatchDomains {
+        BatchDomains {
+            simulation: DomainCfg::new(1, 1),
+            observation: DomainCfg::new(1, 4),
+            inference: DomainCfg::new(1, 4),
+            training: None,
+        }
+    }
+
+    fn delta_task() -> es_ir::task::TaskIr {
+        use es_ir::graph::NodeId;
+        let mut t = task_with(&[
+            TaskNode::GetJointState {
+                body: fake_scene().bodies[0].id,
+                joints: vec!["hinge".to_owned()],
+                quantity: JointQuantity::Position,
+            },
+            TaskNode::Reward {
+                name: "angle".to_owned(),
+                weight: 1.0,
+                aggregation: es_ir::task::Aggregation::Sum,
+                ty: es_ir::types::PortType {
+                    elem: ElemType::F32,
+                    shape: es_ir::types::Shape::new([1]),
+                    unit: es_ir::types::Unit::Angle,
+                    frame: es_ir::types::Frame::World,
+                    time: es_ir::types::TimeRef::Tick,
+                    image: None,
+                },
+            },
+            TaskNode::ResetState {
+                target: "qpos[0]".to_owned(),
+                dist: Distribution::Constant(SEED_QPOS),
+                stream: "reset.hinge".to_owned(),
+            },
+        ]);
+        t.graph.connect(NodeId(0), "value", NodeId(1), "value");
+        t
+    }
+
+    /// What one scripted run left behind, per control tick.
+    struct Trace {
+        /// Pre-plane: the absolute target `emit_actions` handed `validate`.
+        commanded: Vec<f64>,
+        /// Post-plane: `SafeAction::q`, read off the plane's own hold target.
+        executed: Vec<f64>,
+        qpos: Vec<f64>,
+        events: Vec<u32>,
+        clamped: u64,
+    }
+
+    /// `es loop collect`'s own loop, minus the dataset: observe the state into the plane, then
+    /// one `step_with_policy` (which is `emit_actions` -> `validate` -> `Env::step`).
+    fn scripted_run(
+        space: ActionSpace,
+        first_diff_max: f64,
+        replay: Option<Vec<f64>>,
+        steps: usize,
+    ) -> Trace {
+        let mut ir = deployment_ir();
+        ir.action.space = space;
+        ir.safety.action_rate.first_diff_max = vec![first_diff_max; NJ];
+        let mut contract = contract();
+        contract.runtime.expected_latency_ms = 0.0;
+
+        let task = delta_task();
+        let mut env = Env::new(
+            &task,
+            &fake_scene(),
+            FakeBackend::new(),
+            &delta_domains(),
+            5,
+        )
+        .expect("the fixture compiles");
+        let mut runner = DomainRunner::<NJ, H>::new(
+            env.schedule(),
+            &contract,
+            ChunkBlendPolicy::HardSwitch,
+            ir.rate,
+        )
+        .expect("the contract matches NJ and H")
+        .with_action_space(space);
+        let mut planes = vec![SafetyPlane::<NJ, H>::from_ir(&ir).expect("a valid envelope"); 1];
+        let mut policy = Scripted {
+            calls: 0,
+            delta: space == ActionSpace::JointDelta,
+            replay,
+        };
+        let mut trace = Trace {
+            commanded: Vec::with_capacity(steps),
+            executed: Vec::with_capacity(steps),
+            qpos: Vec::with_capacity(steps),
+            events: Vec::with_capacity(steps),
+            clamped: 0,
+        };
+        for _ in 0..steps {
+            // Every consumer observes before every `validate` and the plane seeds on the
+            // first call of an episode (packet M5/V6). That seeded pose is the integrator's
+            // reset value, which is why the loop here is the collector's and not a shortcut.
+            {
+                let state = env.backend().state();
+                let (mut q, mut qd) = ([0.0; NJ], [0.0; NJ]);
+                q.copy_from_slice(&state.qpos_of(0)[..NJ]);
+                qd.copy_from_slice(&state.qvel_of(0)[..NJ]);
+                planes[0].observe_state(&q, &qd);
+            }
+            let before = planes[0].counters().violations;
+            env.step_with_policy(&mut runner, &mut policy, &mut planes, &mut [])
+                .expect("a control step");
+            trace.commanded.push(runner.commanded()[0]);
+            trace.executed.push(planes[0].last_safe_action()[0]);
+            trace.qpos.push(env.backend().state().qpos_of(0)[0]);
+            let after = planes[0].counters().violations;
+            trace
+                .events
+                .push(after.iter().zip(before).map(|(a, b)| (a - b) as u32).sum());
+        }
+        trace.clamped = planes[0].counters().clamped_steps;
+        assert!(policy.calls > 0, "the scripted policy was actually run");
+        trace
+    }
+
+    /// Oracle 2 of packet M9/T1.
+    ///
+    /// Two claims, and the second is the one the rule exists for:
+    ///
+    /// 1. With an envelope nothing touches, a scripted absolute sequence through a
+    ///    `JointPosition` deployment and its first-difference sequence through a `JointDelta`
+    ///    one produce **bitwise** the same commands, the same executed actions, the same
+    ///    `qpos` and the same plane events. An increment is not a new controller.
+    /// 2. With an envelope that bites, the increment is added to what the plane *executed* and
+    ///    never to the raw row: replaying the delta run's own targets through a
+    ///    `JointPosition` deployment reproduces it bitwise, while the raw-row integration --
+    ///    which is exactly the scripted absolute sequence -- does not.
+    #[test]
+    fn delta_integrates_to_the_absolute_target() {
+        const STEPS: usize = 40;
+        // 1. The envelope the fixture already declares is 1e3 rad per step: nothing bites.
+        let wide = 1.0e3;
+        let absolute = scripted_run(ActionSpace::JointPosition, wide, None, STEPS);
+        let delta = scripted_run(ActionSpace::JointDelta, wide, None, STEPS);
+        assert_eq!(absolute.clamped, 0, "the wide envelope must not bite");
+        assert_eq!(delta.clamped, 0);
+        for t in 0..STEPS {
+            assert_eq!(
+                delta.commanded[t].to_bits(),
+                absolute.commanded[t].to_bits(),
+                "commanded, tick {t}"
+            );
+            assert_eq!(
+                delta.executed[t].to_bits(),
+                absolute.executed[t].to_bits(),
+                "executed, tick {t}"
+            );
+            assert_eq!(
+                delta.qpos[t].to_bits(),
+                absolute.qpos[t].to_bits(),
+                "qpos {t}"
+            );
+        }
+        assert_eq!(delta.events, absolute.events, "plane events");
+        // The scripted sequence is what both of them executed, so the comparison is not two
+        // runs of the same degenerate constant.
+        assert_eq!(absolute.executed[0].to_bits(), scripted(0).to_bits());
+        assert!(absolute.executed.windows(2).any(|w| w[0] != w[1]));
+
+        // 2. A rate limit narrower than the scripted increment: every step clamps.
+        let bites = 1.0 / 256.0;
+        let clamped = scripted_run(ActionSpace::JointDelta, bites, None, STEPS);
+        assert!(
+            clamped.clamped > 0,
+            "the envelope has to bite for this half"
+        );
+        // The integrator's own arithmetic, asserted against the recorded numbers: the target
+        // of tick `t` is the *executed* action of tick `t-1` plus tick `t`'s increment.
+        let mut differs = 0;
+        for t in 1..STEPS {
+            let d = f64::from(increment(t as u64) as f32);
+            assert_eq!(
+                clamped.commanded[t].to_bits(),
+                (clamped.executed[t - 1] + d).to_bits(),
+                "tick {t} must integrate from the executed value"
+            );
+            differs += usize::from(clamped.commanded[t].to_bits() != scripted(t as u64).to_bits());
+        }
+        // The raw-row integration is exactly the scripted absolute sequence, and it is a
+        // different run: without the clamp feeding back into `prev` these would coincide.
+        assert!(
+            differs > STEPS / 2,
+            "only {differs} of {STEPS} ticks left the raw-row target"
+        );
+        // And the same numbers through a `JointPosition` deployment are the same run: what
+        // the plane validates is an absolute target either way.
+        let replayed = scripted_run(
+            ActionSpace::JointPosition,
+            bites,
+            Some(clamped.commanded.clone()),
+            STEPS,
+        );
+        for t in 0..STEPS {
+            assert_eq!(
+                replayed.executed[t].to_bits(),
+                clamped.executed[t].to_bits(),
+                "replay, tick {t}"
+            );
+        }
     }
 }

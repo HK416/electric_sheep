@@ -116,6 +116,10 @@ pub enum ActionSpace {
     EePose,
     EeDelta,
     Gripper,
+    /// An increment on the current joint target, integrated by `es-env` (spec 8.5, plan T).
+    /// **Last on purpose**, the same reason as in `es_ir::deployment::ActionSpace`: the
+    /// deployment hash writes that enum's discriminant, and the two are read as one pair.
+    JointDelta,
 }
 
 /// Sampling distribution for randomization and reset (spec 6.3).

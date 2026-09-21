@@ -537,7 +537,11 @@ impl Collector {
             chunk_blend(&bundle.learning),
             deploy.rate,
         )
-        .map_err(|e| bad(&e))?;
+        .map_err(|e| bad(&e))?
+        // The deployment's action space decides whether a chunk row is a target or an
+        // increment the runner integrates before the plane sees it (packet M9/T1, spec 8.5);
+        // absent, `JointPosition`, is the runner's own default.
+        .with_action_space(deploy.action.space);
         let latency = runner.inference().latency_ticks() as usize;
         let execute = (contract.execute_chunk as usize).clamp(1, H.max(1));
         let mut planes = vec![SafetyPlane::<NJ, H>::from_ir(deploy).map_err(|e| bad(&e))?];
