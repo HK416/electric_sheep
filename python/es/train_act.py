@@ -16,7 +16,8 @@ Usage:
                  [--epochs N] [--batch N] [--lr F] [--seed N] [--device cpu]
                  [--schedule constant|warmup_cosine] [--warmup-steps N] [--lr-min F]
                  [--weight-decay F] [--grad-clip F] [--init-backbone weights.safetensors]
-                 [--checkpoint-at 1000,5000,20000] [--loss-curve curve.json]
+                 [--init-weights init.safetensors]
+                 [--checkpoint-at 0 | 1000,5000,20000] [--loss-curve curve.json]
                  [--resident-gpu] [--amp bf16] [--compile]
                  [--progress-every N] [--sample-every N]
 
@@ -258,6 +259,38 @@ def init_backbone(model, tensors: dict) -> list:
     return report
 
 
+def init_weights(model, tensors: dict) -> list:
+    """Load `--init-weights`'s tensors into the lowered module (M8/S1).
+
+    The file is keyed exactly as `contract.json` declares and `checkpoint_tensors` writes --
+    `nodes.<node_id>.<rest>` -- so this is that function read backwards. `es train` already
+    chose the names: it compared the source bundle to the contract and wrote the intersection,
+    and `training/init.lock` lists it. So a key here that the module does not have, or has at
+    another shape, means the two sides disagree about what was copied, and that is a refusal
+    rather than a `strict=False` load that silently keeps a random tensor.
+    """
+    own = model.state_dict()
+    named = {}
+    for key, tensor in tensors.items():
+        head, _, tail = key.partition(".")
+        node, _, rest = tail.partition(".")
+        name = "n" + node + ("." + rest if rest else "")
+        if head != "nodes" or name not in own:
+            raise SystemExit(
+                "--init-weights: %r is not a member of this module. The file `es train` "
+                "writes holds exactly the keys `training/init.lock` lists as copied; this "
+                "one was produced against another module." % key
+            )
+        if tuple(own[name].shape) != tuple(tensor.shape):
+            raise SystemExit(
+                "--init-weights: %s is %s here and %s in the file"
+                % (key, tuple(own[name].shape), tuple(tensor.shape))
+            )
+        named[name] = tensor
+    model.load_state_dict(named, strict=False)
+    return sorted(tensors)
+
+
 def build_policy(module_dir: Path):
     """`exec` the generated module. This is the only code this script executes that it did not
     ship with, and it came from `es policy lower`, not from a checkpoint."""
@@ -478,6 +511,14 @@ def main(argv: list) -> int:
         "backbone before the first step; `es train` passes the `base_model` its recipe "
         "names, after verifying its blake3 against the lock file and the pin",
     )
+    p.add_argument(
+        "--init-weights",
+        type=Path,
+        help="a safetensors file keyed as `contract.json` declares, loaded into the module "
+        "before the first step; `es train` writes the tensors its `[init] policy` bundle "
+        "shares with this module and lists them in `training/init.lock`. Every key in it "
+        "must be a member of this module, at this shape, or the load is refused",
+    )
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", default="cpu")
     p.add_argument(
@@ -543,6 +584,10 @@ def main(argv: list) -> int:
     # Before the probe and before the optimizer: the ImageNet tensors are the module's
     # initial state, exactly as a resumed checkpoint's would be (packet M7/T5).
     backbones = init_backbone(model, read_safetensors(a.init_backbone)) if a.init_backbone else []
+    # After the backbone, so a recipe that names both starts from the policy wherever the two
+    # overlap: `[init] policy` is a trained checkpoint and `base_model` is ImageNet, and the
+    # later of the two is the one the run actually continues (packet M8/S1).
+    initialised = init_weights(model, read_safetensors(a.init_weights)) if a.init_weights else []
 
     # The chunk width is the module's own: `ActionChunker` slices the head's horizon down to
     # `execute_chunk`, and asking the module beats re-deriving it from the IR. The probe is one
@@ -596,7 +641,11 @@ def main(argv: list) -> int:
     marks = sorted({int(s) for s in a.checkpoint_at.split(",") if s.strip()})
     per_epoch = len(samples) // max(1, a.batch)
     total = max(marks) if marks else per_epoch * a.epochs
-    if total <= 0:
+    # `--checkpoint-at 0` is "checkpoint immediately" and is the one run of length zero
+    # (packet M8/S1): the module's initial state, written without an optimizer step. Every
+    # other zero is still the old refusal -- a run with no marks and no samples to fill an
+    # epoch optimizes nothing and should say so.
+    if total <= 0 and marks != [0]:
         raise SystemExit("nothing to optimize: %d samples, batch %d" % (len(samples), a.batch))
 
     # `requires_grad` is where the Learning IR's `frozen` arrives: the lowering emits
@@ -625,6 +674,13 @@ def main(argv: list) -> int:
     # loop of before.
     watch_port = image_port(shapes) if a.sample_every > 0 else None
     watch_dir = a.loss_curve.parent if a.loss_curve else None
+    # Mark 0 is the state *before* the first step, so it is written before the loop and not
+    # inside it. The probe above ran under `model.eval()` and `no_grad`, so nothing -- not
+    # even a BatchNorm running mean -- has moved since the module was built and the tensors
+    # `--init-weights` put into it, which is what makes a zero-step run a bitwise re-pack.
+    stem = str(a.out.with_suffix(""))
+    if 0 in marks:
+        write_safetensors(Path("%s-0%s" % (stem, a.out.suffix)), checkpoint_tensors(model))
     started = time.perf_counter()
     for step in range(total):
         # `constant` writes back the number AdamW was built with, which is a no-op on the
@@ -699,7 +755,6 @@ def main(argv: list) -> int:
             sys.stdout.write(json.dumps({"sample": str(path)}) + "\n")
             sys.stdout.flush()
         if marks and (step + 1) in marks:
-            stem = str(a.out.with_suffix(""))
             write_safetensors(
                 Path("%s-%d%s" % (stem, step + 1, a.out.suffix)), checkpoint_tensors(model)
             )
@@ -753,6 +808,11 @@ def main(argv: list) -> int:
         # the trainer's own account of what it did with it.
         "init_backbone": str(a.init_backbone) if a.init_backbone else None,
         "backbones": backbones,
+        # The policy this run continued, and the names it loaded (packet M8/S1). The
+        # provenance of the file is `es train`'s `training/init.lock`; this is the trainer's
+        # own account of having loaded exactly what that lock lists.
+        "init_weights": str(a.init_weights) if a.init_weights else None,
+        "initialised_from": initialised,
         "trainable_parameters": sum(p.numel() for p in trainable),
         "frozen_parameters": sum(
             p.numel() for p in model.parameters() if not p.requires_grad
