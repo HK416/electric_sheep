@@ -27,7 +27,7 @@ the same camera, the same shading and a golden that pins the pixels?**
   ~3,000-triangle scene at 960×540 is a few million edge tests, which is milliseconds.
 * **The panel shows a texture.** `app.rs` uploads the `Raster` as an `egui::ColorImage` texture
   once per tick change (or camera change) and draws it scaled to the panel; the raster's
-  resolution is the panel's size capped at 960×540 (`Raster::size_for(panel)`, a model function).
+  resolution is the panel's size capped at 960×540 (`Raster::size_for(panel)`, a model function). *Amended at review:* the cap is on the **area** (960×540 pixels), scaled uniformly — the panel is wide and short, and a per-axis cap spent a quarter of the budget.
   The orbit/zoom gestures, the scrubber, play/pause are untouched. `egui::Mesh` and the sort go;
   the `ponytail:` comment goes with them.
 * **Golden.** `tests/golden/editor/replay-tick0-320x180.bin` (+ `.json` with the camera): the

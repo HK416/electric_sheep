@@ -42,7 +42,7 @@ use crate::model::labels::{self, Browse, Step, Tab};
 use crate::model::launch::{Kind as LaunchKind, LaunchModel, State as LaunchState};
 use crate::model::palette::Palette;
 use crate::model::recent::{self, Kind, Recent, Settings};
-use crate::model::replay_view::{self, Camera, Projected, ReplayView};
+use crate::model::replay_view::{self, Camera, ReplayView};
 use crate::model::run_view::{Bucket, RunView};
 use crate::model::search::Search;
 use crate::model::telemetry_view::{self, Source, TelemetryModel};
@@ -104,6 +104,9 @@ pub struct EditorApp {
     replay: Option<ReplayView>,
     /// Which cell `replay` is playing, so switching rows is visible in the panel.
     replay_cell: String,
+    /// The last frame the panel rasterised and what it was drawn for, `(tick, camera)`
+    /// (packet M7/E8). Dropped whenever `replay` is.
+    replay_texture: Option<((usize, Camera), egui::TextureHandle)>,
     camera: Camera,
     telemetry: TelemetryModel,
     source: Source,
@@ -158,6 +161,7 @@ impl EditorApp {
             frames_path: String::new(),
             replay: None,
             replay_cell: String::new(),
+            replay_texture: None,
             camera: SHOWCASE_CAMERA,
             telemetry: TelemetryModel::default(),
             source,
@@ -308,6 +312,7 @@ impl EditorApp {
         self.run_frames.clear();
         self.replay = None;
         self.replay_cell.clear();
+        self.replay_texture = None;
         self.search.set_hits(Vec::new());
         if recent::classify(&path) == Kind::Run {
             match RunView::open(&path) {
@@ -1360,6 +1365,7 @@ impl EditorApp {
             run,
             replay,
             replay_cell,
+            replay_texture,
             scene_path,
             frames_path,
             camera,
@@ -1417,6 +1423,7 @@ impl EditorApp {
                         *status = format!("{cell}: {} tick(s) replayed", view.ticks());
                         cell.clone_into(replay_cell);
                         *replay = Some(view);
+                        *replay_texture = None;
                     }
                     Err(e) => *status = e.to_string(),
                 }
@@ -1461,8 +1468,8 @@ impl EditorApp {
         });
 
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
-        camera.width = response.rect.width().max(1.0) as u32;
-        camera.height = response.rect.height().max(1.0) as u32;
+        (camera.width, camera.height) =
+            replay_view::Raster::size_for([response.rect.width(), response.rect.height()]);
         if response.dragged() {
             let drag = response.drag_delta();
             *camera = camera.orbit(
@@ -1476,11 +1483,39 @@ impl EditorApp {
                 *camera = camera.zoom(f64::from(-scroll).mul_add(ZOOM_PER_POINT, 1.0));
             }
         }
-        painter.rect_filled(response.rect, 0.0, Color32::from_gray(18));
-        painter.add(egui::Shape::mesh(replay_mesh(
-            &view.project(view.tick, camera),
-            response.rect.min,
-        )));
+        painter.rect_filled(
+            response.rect,
+            0.0,
+            Color32::from_gray(replay_view::BACKGROUND),
+        );
+        // One CPU frame per tick or camera change, never per repaint: the raster is the same
+        // bytes until one of them moves, and re-drawing 2,700 triangles for a picture that
+        // did not change would burn a core holding still.
+        let key = (view.tick, *camera);
+        if replay_texture.as_ref().is_none_or(|(k, _)| *k != key) {
+            let raster = replay_view::Raster::draw(
+                &view.project(view.tick, camera),
+                camera.width,
+                camera.height,
+            );
+            let image =
+                egui::ColorImage::from_rgb([raster.w as usize, raster.h as usize], &raster.rgb);
+            *replay_texture = Some((
+                key,
+                ui.ctx()
+                    .load_texture("replay", image, egui::TextureOptions::LINEAR),
+            ));
+        }
+        if let Some((_, texture)) = replay_texture.as_ref() {
+            // Stretched over the whole panel: `size_for` kept the aspect, so this only ever
+            // scales the picture up, and never by much.
+            painter.image(
+                texture.id(),
+                response.rect,
+                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                Color32::WHITE,
+            );
+        }
         if view.playing {
             ui.ctx().request_repaint();
         }
@@ -1743,21 +1778,6 @@ const REPLAY_RATE_HZ: f64 = 50.0;
 /// Radians of orbit per point of drag, and zoom per point of scroll.
 const ORBIT_PER_POINT: f64 = 0.008;
 const ZOOM_PER_POINT: f64 = 0.002;
-
-/// One mesh for the whole frame: three vertices and one triangle per [`Tri2d`], already in
-/// paint order, so the painter's algorithm is just the order they are added in.
-fn replay_mesh(projected: &Projected, origin: Pos2) -> egui::Mesh {
-    let mut mesh = egui::Mesh::default();
-    for tri in projected {
-        let base = mesh.vertices.len() as u32;
-        let colour = Color32::from_rgb(tri.color[0], tri.color[1], tri.color[2]);
-        for p in tri.p {
-            mesh.colored_vertex(origin + Vec2::new(p[0], p[1]), colour);
-        }
-        mesh.add_triangle(base, base + 1, base + 2);
-    }
-    mesh
-}
 
 fn source_colour(source: es_eval::runner::EventSource) -> Color32 {
     match source {
