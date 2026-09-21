@@ -1213,6 +1213,17 @@ pub enum FallbackPolicy {
 
 **It is turned on identically even in sim.** If the Safety Plane is off during learning but turned on at deployment, you learn only just before deployment that the policy was trained in a way that violates safety constraints. **The envelope violation rate during sim learning is a first-class metric of the Evaluation IR** (§10.3).
 
+**An episode is the unit of work (packet M7/R1, owner decision 2026-09-21).**
+`SafetyPlane::begin_episode`, besides the latch and the seed, clears the sliding window of
+`EnvelopeViolationRate` (`SafetyCounters::window`). Tick 0 of episode `k` is not judged as
+the tail of episode `k−1`, and the watchdog reads `0.0` until the window fills again
+(§10.3's "a full window, or no verdict"). The envelope, the watchdog, and the cumulative
+counters are unchanged (INV-12), and `validate`'s signature is unchanged too (INV-13). This
+is the condition that also makes §10.4's "`--jobs N` produces no report that `--jobs 1`
+would not" hold for the `(cell, episode)` partition, and every evaluation number committed
+before 2026-09-21 was measured under the window's carry-over semantics — mark it as such, do
+not delete it (§28.9 rule 2).
+
 ### 9.5 Equivalence of sim and real hardware
 
 | | Sim | Real hardware |
@@ -1381,6 +1392,14 @@ es eval run --config eval/pick_cube.yaml --policy policy.esb
 ```
 
 `es eval compare A.json B.json` outputs the per-suite differences of the two policies and statistical significance.
+
+**`events.json`'s `tick` is an episode-relative clock (packet M7/R1).** It counts from 0 at
+that episode's `begin_episode`, not the cell's cumulative physics tick. Since `frame` is
+already a dense index within the episode, the absolute tick was only meaningful within a
+single cell, and only a relative tick makes `events.json` independent of how the run was
+scheduled. So `es eval run --jobs N` may shard workers by `(cell, episode)` rather than by
+cell (§10.4), and `report.json`, `events.json`, and `.estraj` are bit-identical to `--jobs
+1` (the sole exception is `evaluation.lock`'s `created`).
 
 ---
 ## 11. Unified Compiler
@@ -1644,6 +1663,50 @@ iteration 3:
 
 **Keeping the evaluation conditions fixed while changing only data·policy is the discipline.** If `evaluation_hash` changes, the comparison is invalid, and the tool warns about this.
 
+### 13.4 Continuing Reinforcement Learning
+
+§13.1's loop began as imitation learning (demonstrate → train), but most 2026 robot policies
+are trained with PPO in a different simulator and then deployed (MuJoCo Playground and Isaac
+Lab). Having that policy **run bit-identically** on this runtime (§8.9), **score in our
+sim** through the Evaluation IR (an honest sim-to-sim number), and **keep training in our
+sim** from those weights is plan S (§28.11). This section pins that semantics.
+
+**PPO is a trainer on top of the Learning IR, not an IR.** The deployed graph is written
+entirely in §8.3's nodes — for a state policy, `Normalizer{Forward, MeanStd}` →
+`StateEncoder{Mlp}` → `PolicyHead{Regression, horizon 1}` → `Normalizer{Inverse}`. The value
+head, the log std, GAE, the optimizer, and the entropy coefficient are training-only and
+live solely in `python/es/train_ppo.py` and §19.3's `training/`. They are nowhere in the
+document and do not move `learning_hash`. Task IR has no RL (rule 6): reward and termination
+are exactly §6.3's `Reward` and `Terminate` sinks, and the trainer only reads them, never
+defines them.
+
+**The rollout is `es-env`'s simulation batch domain** (§5.2, §12.1). The trainer steps N
+envs through `Env::reset`/`Env::step` and reads reward and termination from `StepOutcome`;
+it never calls another simulator directly. **The Safety Plane stays on during rollout too**
+(§9.4, INV-12): the policy's sample is the action, what the plane emits reaches the
+actuator, and the rollout records both (§13.2's `action_source`). Sample ≠ execution is not
+an error but a rate the report shows — that rate is exactly the `envelope_violation_rate`
+§9.4 calls a first-class metric, and whether it falls during training is the answer to "does
+the policy learn within the constraints."
+
+**"Start from this policy" is written into the lock.** `training.toml`'s `[init] policy =
+"<bundle>"` copies tensors whose name and shape match and initializes the rest, and
+`training/init.lock` records the copied names, the initialized names, and the source
+`policy_hash` (the same shape as §19.3's `base_model.lock`). Zero-step training returns the
+source's weights bit-identically — that is the oracle.
+
+**Determinism.** On the CPU backend (`mujoco-cpu`) and a fixed seed, the same recipe run
+twice is bit-identical through the checkpoint (§3.5 tier 1, torch CPU deterministic
+kernels). The GPU backends (MJWarp, Newton) are declared tier 3 (§3.4, §17.3), and numbers
+measured under them are marked as such. Throughput is stated only in §12.4's nine metrics,
+and anything not measured is `Target / Status: unverified`.
+
+**Importing does not guess** (§14.4). Joint order, units, position target vs. torque, and
+the layout of observation channels are declared by a robot-specific **adapter document**,
+and a mismatch is rejected as a named error (`IMP-0xx`). The source framework's
+`.pt`/`.pth`/orbax files are opened only by the training-path Python (INV-16); the Rust
+runtime sees only `safetensors` and the manifest beside it.
+
 ---
 ## 14. Authoring Frontend
 
@@ -1741,6 +1804,18 @@ Gymnasium spec           ┘                        └─► severity=error →
 ```
 
 **LeRobot conversion is the top-priority conversion target for v1.0.** Reading the `lerobot/act_*`, `lerobot/smolvla_base`, and `lerobot/pi05_base` configs into Learning IR lets existing users bring their own policies as-is and layer Electric Sheep's evaluation, safety, and reproducibility layers on top. **This is the lowest barrier to adoption.**
+
+**Importing an RL policy (plan S, §13.4, §28.11).** `es policy import-rl --from
+mujoco-playground | rsl-rl | rl-games` moves the PPO actor MLP into `StateEncoder{Mlp}` +
+`PolicyHead{Regression}`, the observation running mean and standard deviation into
+Observation IR's `Normalize` node, and the action scale and offset into
+`Normalizer{Inverse}`. The activation function (swish, ELU, ReLU) and the output squash
+(`tanh`) are parameters of the node, and absent = default = today's canonical form, so the
+committed `learning_hash` does not move. Only the front half of the conversion
+(`python/es/import_rl.py`: pickle, orbax → `safetensors` + `import.json`) is Python; the
+back half (document generation, bundle packing) is `es`. The Semantic Mapping Report is the
+crosscheck table against the adapter document, and `severity=error` blocks execution as
+above.
 
 ### 14.5 LLM Generation
 
@@ -2901,6 +2976,83 @@ the Safety Plane's violation-rate window carries across episode boundaries and `
 cell's cumulative clock, so committed numbers move — also a human decision. Follow-up packets R1–R10
 are in the review.
 
+### 28.11 M8 — Continuing Reinforcement Learning of External Policies (plan S)
+
+After M7 closed (`docs/reviews/M7.ko.md`) the owner decided on 2026-09-21: **continuing the
+reinforcement learning of a policy trained elsewhere first**, the editor's easy UI deferred
+until more ideas gather, M6 (quadruped) still parked. Of the review's human decisions, this
+section takes **the episode boundary (S-1, S-2)**, pinned to §9.4, §10.5 in the same commit
+as this section (both "yes"; the grounds are §13.1's "an episode is where the stream ends"
+and §10.4's schedule independence; demonstration numbers already committed are marked as
+measured under the old semantics per §28.9 rule 2 and re-measured in the same packet). The
+stop rule's (§28.10) reading and §15.3's SSIM threshold remain the owner's. §28.9's rule set
+and §28.10's rule set apply unchanged.
+
+**The claim.** The project's thesis was "our runtime reproduces, with the same semantics, a
+policy designed and trained externally" (§8, §1.9), and M5 proved it with imitation learning
+(LeRobot ACT). Plan S proves the same thesis once more with **a different policy family (PPO
+MLP) and a different training signal (reward)**, and goes one step further: it **keeps
+training the reproduced policy in our sim**, and records the success rate before and after
+continuation in the same table, from the same Evaluation IR. That table is M8's deliverable.
+
+**Where things stand, as-built (2026-09-21)**
+
+| Area | What exists | What is missing |
+|---|---|---|
+| Importing | `es import lerobot-config`, `es policy import-lerobot` (ACT checkpoint → bundle, bit-identical oracle); `Normalizer{Forward/Inverse, MeanStd}`, `StateEncoder{Mlp}`, `PolicyHead{Regression}` nodes; the brax parameter format survey in `docs/api-notes/mujoco-playground-quadruped.md`; the three gaps in `quadruped-track.md` 3.4 (activation fixed to ReLU, no activation before the head, `tanh` absent) | an RL checkpoint parser (brax/orbax, rsl_rl, rl_games), activation and squash parameters, adapter documents, `es policy import-rl` |
+| Training | `es train` (imitation: the IR path `train_act.py`, the external path `lerobot-train`), real values in §19.3's slots, `base_model.lock`, the schedule, augmentation, and pretrained backbone | an RL trainer, `[init] policy`, `init.lock`, a rollout path (`es-py` has no `Env`/`SafetyPlane` bindings — only the four builders) |
+| Evaluation | the six-suite Evaluation IR, `--jobs` (per cell), `Env::seek_episode` (T8, bit-identical) | the `(cell, episode)` partition (T8b, waiting on the episode-boundary decision — resolved in this section) |
+| Source policy | None. jax, brax, playground, and rsl_rl are not installed on the server. Playground has no SO-101 task (only quadrupeds like Go1, Panda, etc.) | an SO-101 source checkpoint — train one directly on the 4090 in the source framework to pin the recipe |
+
+**Four rules this section pins down.**
+
+1. **RL is a trainer, not an IR** (§13.4). The deployed graph is nothing but §8.3's nodes;
+   the value head, the log std, and GAE live only in `training/`. Task IR has no RL (rule
+   6).
+2. **The rollout is `es-env` and the Safety Plane stays on** (§13.4, INV-12). The moment a
+   trainer calls another simulator directly, that number is no longer sim-to-sim.
+3. **The adapter declares, the code does not guess** (§14.4). Joint order, units, position
+   vs. torque, and observation layout are a robot-specific document, and a mismatch is a
+   named error. Pickle is opened only in Python (INV-16).
+4. **No new trait** (INV-17). The trainer is a module of `es-data`, `es`, `python/es`, and
+   `es-py`'s bindings are pyclasses, not an extension point. Throughput is `Target / Status:
+   unverified` until measured.
+
+**The packet ladder.** Wave 0 is what this campaign leans on among M7 review's follow-ups.
+Waves 1–3 run in parallel because the crates don't overlap (R: `es-safety`, `es-eval`,
+`es/cmd/eval.rs`; E: `es-editor`; S2a: `es-ir`, `es-policy/lower`; S2c:
+`python/es/rl_source` and the server; S1: `es-data/training.rs`, `es/cmd/train.rs`; S4a:
+`es-py`), and each row is one §1.2 packet whose oracle is a runnable one-liner. Packets:
+`docs/packets/M7/P-M7-R1.md`, `P-M7-R12.md`, `docs/packets/M8/S*.md`. Design notes:
+`docs/design/rl-continuation.md` (new), `evaluation-execution.md` extended (R1),
+`editor-shell.md` extended (R12).
+
+| Wave | Packet | Question it answers | Oracle (one line) | Type |
+|---|---|---|---|---|
+| 0 | **R1 episode boundary + T8b partition** (`P-M7-R1`) | If `begin_episode` clears the window and `tick` is episode-relative, is the `(cell, episode)` partition bit-identical to sequential execution, and does the 16-episode nominal run halve | `cargo test -p es-safety window_is_cleared_at_begin_episode`; T8 oracle 3 goes from a tripwire to a parity assertion (`--ignored`, server); the committed `evaluation.toml` at jobs 1 and 4 → per-cell `report.json`, `events.json`, `.estraj` bit-identical, jobs 4 wall-clock ≤ 55% of jobs 1 (nine metrics); a U3 held-out re-measurement row | B |
+| 0 | **R12/R16 live table** (`P-M7-R12`) | Are rows keyed by `(stage, cell)`, and does a cell that started before attach still get a row | `cargo test -p es-editor live_run_`: the gate's `nominal-00` followed by the evaluation's `nominal-00` are two rows; a stream with no `cell.begin` gets a "joined late" row; the fixture-fold oracle unchanged | B |
+| 1 | **S2a activation and squash** | Do `StateEncoder{Mlp}` gain `activation` (relu, elu, swish, tanh) and `PolicyHead{Regression}` gain `squash` (none, tanh), with absent = default = today's hash | `cargo test -p es-ir committed_learning_hash_is_unmoved_by_activation`; `cargo test -p es-policy lower_mlp_activations` (torch reference vs. lowering, 4×2 combinations, ≤ tier-4) | B |
+| 1 | **S2c source policy** | Does a reach policy trained with brax PPO on our `so101` scene (MJX) end up as a reproducible recipe and checkpoint | server: `python/es/rl_source/train_brax_so101.py --seed 0` twice → the same orbax parameter hash (mark `unverified` if it is); pins and numbers in `docs/api-notes/brax-ppo-so101.md` | D |
+| 1 | **S4a `es-py` rollout bindings** | Can a Python trainer step our env through `es_native.Env`/`es_native.SafetyPlane` and pass through the plane | `python/es/selfcheck.py --env`: the fixture scene's 100-step `qpos` trajectory is bit-identical to the `es-env` test golden; the plane's `validate` emits the same `events` bits as Rust | B |
+| 2 | **S2b `es policy import-rl`** | Do brax, rsl_rl, and rl_games actors become bundles through the adapter document and reproduce the source framework on 1,000 random observations — bit-identical for torch sources (rsl_rl, rl_games), §8.9 tier 4 (≤ 1e-5) with the max error recorded for the JAX source (brax) | `cargo test -p es --test cli import_rl_`: three synthetic checkpoints → document, bundle, `import.json`; server `--ignored`: the S2c checkpoint, 1,000 observations — the torch reconstruction vs our runtime bit-identical in f32, JAX vs our runtime max abs error ≤ 1e-5, hashes recorded; five kinds of adapter mismatch rejected as `IMP-0xx` | B |
+| 2 | **S1 `[init] policy`** | Are tensors whose name and shape match copied, is the rest initialized, and does `init.lock` record it | `cargo test -p es --test cli train_init_`: zero steps from the U3 checkpoint → weights bit-identical, the `policy_hash` chain preserved; name mismatches listed in the lock | B |
+| 3 | **S4b PPO trainer** | Does `es train --recipe`'s `[rl]` run rollout (§13.4), GAE, the clipped objective, and entropy through `train_ppo.py` and fill §19.3; is it bit-identical run twice on the CPU backend | `cargo test -p es --test cli train_rl_`: `--dry-run` plan golden; `tests/fixtures/rl/task-reach.toml` at seed 0 twice → checkpoint bit-identical (`ES_PYTHON`); target return reached (observation, server) | B |
+| 3 | **S4c continuation measurement** | Starting from the imported policy (S2b) via `[init]` and continuing PPO in our sim, does the success rate rise on the same Evaluation IR | `es eval run` before/after → `visible-learning.md` 7.33 table (before continuation, after continuation, from scratch, three seeds); `es eval compare` | D |
+| 4 | **M8 review** | Has the record come back into the specification | `docs/reviews/M8.md` + `.ko.md`; `cargo xtask ci` green | A |
+
+**What is not on the ladder, and why.** **Real checkpoints of Isaac Lab policies (rsl_rl,
+rl_games)** stay in this section only as far as the parser and synthetic fixtures — Isaac
+scenes must go through `es-usd`, and, like MuJoCo, there is no source policy, so S2c opens a
+second source only after pinning the recipe with brax. **The import wizard UI (S3)** was
+deferred by the owner. **MJWarp rollout** is the throughput packet that comes after S4b
+establishes bit-identity on CPU, and those numbers are tier 3. **RL-only Task IR nodes**
+(observation noise, curriculum) run into rule 1.
+
+**Owner decisions.** (1) Both episode-boundary questions are "yes" — this section records
+that decision (2026-09-21). (2) S2c's source framework is brax PPO (MuJoCo Playground 0.2.0
+pinned) — Isaac is second. (3) S4c's continuation budget (steps, wall-clock) is set after
+S4b's measurement.
+
 ---
 
 ## 29. Risks
@@ -2986,6 +3138,10 @@ are in the review.
 45. **Adoption starts from "layering on top."** Telemetry → evaluation → observation → safety → learning → the whole (§27.2)
 46. LeRobot compatibility is the top-priority interoperability target
 47. It is not a certification body but an evidence collection and traceability tool
+
+**Episodes and reinforcement learning (2026-09-21, §9.4·§10.5·§13.4)**
+48. **An episode is the unit of work.** `EnvelopeViolationRate`'s window and `events.json`'s `tick` start at `begin_episode`
+49. **RL is a trainer on top of the Learning IR.** The deployed graph has no value head, the rollout is `es-env`, and the Safety Plane stays on
 
 ### A.2 Deferred / Requiring Validation
 

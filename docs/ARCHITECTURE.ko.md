@@ -1217,6 +1217,13 @@ pub enum FallbackPolicy {
 
 **시뮬에서도 동일하게 켜진다.** 학습 중 Safety Plane이 꺼져 있다가 배포 때 켜지면, 정책이 안전 제약을 위반하는 방식으로 학습된 것을 배포 직전에 알게 된다. **시뮬 학습 중 envelope 위반율이 Evaluation IR의 1급 지표다**(§10.3).
 
+**에피소드가 작업 단위다(패킷 M7/R1, 소유자 결정 2026-09-21).** `SafetyPlane::begin_episode`는 래치와 시드에 더해
+`EnvelopeViolationRate`의 슬라이딩 창(`SafetyCounters::window`)을 비운다. 에피소드 `k`의 tick 0은 에피소드 `k−1`의
+꼬리로 판정되지 않으며, 창이 다시 찰 때까지 워치독은 `0.0`을 읽는다(§10.3의 "찬 창 아니면 판정 없음"). 엔벌로프·워치독·
+누적 카운터는 그대로이고(INV-12), `validate`의 시그니처도 그대로다(INV-13). 이것이 §10.4의 "`--jobs N`은 `--jobs 1`이 내지
+않을 리포트를 내지 않는다"를 `(cell, episode)` 분할에서도 성립시키는 조건이며, 2026-09-21 이전에 커밋된 평가 숫자는 모두
+창 이월 의미론에서 잰 것이다 — 지우지 않고 그렇게 표시한다(§28.9 규칙 2).
+
 ### 9.5 시뮬과 실기의 동일성
 
 | | 시뮬 | 실기 |
@@ -1385,6 +1392,11 @@ es eval run --config eval/pick_cube.yaml --policy policy.esb
 ```
 
 `es eval compare A.json B.json`이 두 정책의 스위트별 차이와 통계적 유의성을 출력한다.
+
+**`events.json`의 `tick`은 에피소드 상대 시계다(패킷 M7/R1).** 셀의 누적 물리 틱이 아니라 그 에피소드의 `begin_episode`에서
+0부터 센다. `frame`이 이미 에피소드 안의 조밀 인덱스이므로 절대 틱은 셀 하나 안에서만 의미가 있었고, 상대 틱이어야
+`events.json`이 실행이 어떻게 스케줄됐는지에 독립이다. 그래서 `es eval run --jobs N`은 셀이 아니라 `(cell, episode)`를 워커에
+나눠도 되고(§10.4), `report.json`·`events.json`·`.estraj`는 `--jobs 1`과 비트 동일하다(`evaluation.lock`의 `created`만 예외).
 
 ---
 
@@ -1649,6 +1661,37 @@ iteration 3:
 
 **평가 조건을 고정한 채 데이터·정책만 바꾸는 것이 규율이다.** `evaluation_hash`가 바뀌면 비교가 무효이고, 도구가 이를 경고한다.
 
+### 13.4 강화학습 이어하기
+
+§13.1의 루프는 모방학습(시연 → 학습)으로 시작했지만, 2026년의 로봇 정책 다수는 다른 시뮬레이터에서 PPO로 학습된 뒤
+배포된다(MuJoCo Playground·Isaac Lab). 그 정책이 이 런타임에서 **비트 동일하게 돌고**(§8.9), Evaluation IR로 **우리 시뮬에서
+점수를 받고**(정직한 sim-to-sim 수치), 그 가중치에서 **우리 시뮬로 계속 학습하는** 것이 plan S(§28.11)다. 이 절이 그 의미론을
+고정한다.
+
+**PPO는 Learning IR 위의 트레이너이지 IR이 아니다.** 배포되는 그래프는 §8.3의 노드만으로 적힌다 — 상태 정책이라면
+`Normalizer{Forward, MeanStd}` → `StateEncoder{Mlp}` → `PolicyHead{Regression, horizon 1}` → `Normalizer{Inverse}`. 가치 헤드,
+로그 표준편차, GAE, 옵티마이저, 엔트로피 계수는 학습 전용이며 `python/es/train_ppo.py`와 §19.3의 `training/`에만 산다. 문서
+어디에도 없고 `learning_hash`를 움직이지 않는다. Task IR에는 RL이 없다(규칙 6): 보상·종료는 §6.3의 `Reward`·`Terminate`
+싱크 그대로이고, 트레이너는 그것을 읽을 뿐 정의하지 않는다.
+
+**롤아웃은 `es-env`의 시뮬레이션 배치 도메인이다**(§5.2, §12.1). 트레이너는 `Env::reset`/`Env::step`으로 N개 env를 밟고
+보상·종료를 `StepOutcome`에서 읽는다; 다른 시뮬레이터를 직접 부르지 않는다. **Safety Plane은 롤아웃에서도 켜져 있다**(§9.4,
+INV-12): 정책의 샘플이 액션이고, 플레인이 내보낸 것이 액추에이터에 닿으며, 롤아웃은 둘 다 기록한다(§13.2의
+`action_source`). 샘플 ≠ 실행은 오류가 아니라 리포트에 보이는 비율이다 — 그 비율이 곧 §9.4가 1급 지표라 부른
+`envelope_violation_rate`이고, 학습 중 그것이 내려가는지가 "정책이 제약 안에서 배우는가"의 답이다.
+
+**"이 정책에서 시작"은 lock에 적힌다.** `training.toml`의 `[init] policy = "<bundle>"`은 이름과 모양이 맞는 텐서를 복사하고
+나머지를 초기화하며, `training/init.lock`이 복사된 이름·초기화된 이름·출처 `policy_hash`를 적는다(§19.3의
+`base_model.lock`과 같은 형태). 0스텝 학습은 출처의 가중치를 비트 동일하게 돌려준다 — 그것이 오라클이다.
+
+**결정성.** CPU 백엔드(`mujoco-cpu`)와 고정 시드에서 같은 레시피 두 번은 체크포인트까지 비트 동일하다(§3.5 계층 1, torch
+CPU 결정적 커널). GPU 백엔드(MJWarp·Newton)는 §3.4·§17.3의 계층 3이며, 그 아래서 잰 수치는 그렇게 표시한다.
+처리량은 §12.4의 9지표로만 말하고, 잰 적 없는 것은 `Target / Status: unverified`다.
+
+**가져오기는 추측하지 않는다**(§14.4). 관절 순서·단위·위치 목표 대 토크·관측 채널의 배치는 로봇별 **어댑터 문서**가 선언하고,
+맞지 않는 것은 이름 붙은 오류(`IMP-0xx`)로 거부된다. 원 프레임워크의 `.pt`/`.pth`/orbax는 학습 경로 Python에서만 열린다
+(INV-16); Rust 런타임은 `safetensors`와 그 옆의 매니페스트만 본다.
+
 ---
 
 ## 14. 저작 프론트엔드
@@ -1747,6 +1790,13 @@ Gymnasium spec         ┘                        └─► severity=error → �
 ```
 
 **LeRobot 변환이 v1.0의 최우선 변환 타깃이다.** `lerobot/act_*`, `lerobot/smolvla_base`, `lerobot/pi05_base` 설정을 Learning IR로 읽어들이면, 기존 사용자가 자기 정책을 그대로 가져와 Electric Sheep의 평가·안전·재현 계층을 얹을 수 있다. **이것이 채택의 가장 낮은 문턱이다.**
+
+**RL 정책 가져오기(plan S, §13.4, §28.11).** `es policy import-rl --from mujoco-playground | rsl-rl | rl-games`는 PPO 액터
+MLP를 `StateEncoder{Mlp}` + `PolicyHead{Regression}`으로, 관측 러닝 평균·표준편차를 Observation IR의 `Normalize` 노드로,
+액션 스케일·오프셋을 `Normalizer{Inverse}`로 옮긴다. 활성 함수(swish·ELU·ReLU)와 출력 스쿼시(`tanh`)는 노드의
+파라미터이며 부재 = 기본값 = 오늘의 정규형이라 커밋된 `learning_hash`는 움직이지 않는다. 변환의 앞 절반
+(`python/es/import_rl.py`: pickle·orbax → `safetensors` + `import.json`)만 Python이고, 뒤 절반(문서 생성·번들 패킹)은 `es`다.
+Semantic Mapping Report는 어댑터 문서와의 대조표이고 `severity=error`는 위와 같이 실행을 막는다.
 
 ### 14.5 LLM 생성
 
@@ -2879,6 +2929,67 @@ V18b는 0.0625). 위의 중단 규칙은 문자 그대로 읽으면 발동하고
 Safety Plane의 위반율 윈도가 에피소드 경계를 넘어 이월되고 `StepEvent::tick`이 셀 누적 시계여서 커밋된 숫자가
 움직인다 — 이것도 사람 결정이다. 후속 패킷 R1–R10은 리뷰에 있다.
 
+### 28.11 M8 — 외부 정책의 강화학습 이어하기 (plan S)
+
+M7이 닫힌 뒤(`docs/reviews/M7.ko.md`) 소유자가 2026-09-21에 정했다: **다른 곳에서 학습된 정책의 강화학습 이어하기를
+먼저**, 에디터의 쉬운 UI는 아이디어가 더 모일 때까지 보류, M6(4족)은 계속 보류. 리뷰의 사람 결정 중 이 절이 받는 것은
+**에피소드 경계(S-1·S-2)**로, 이 절과 같은 커밋으로 §9.4·§10.5에 고정했다(둘 다 "예"; 근거는 §13.1의 "에피소드는 스트림이
+끝나는 곳"과 §10.4의 스케줄 독립성; 커밋된 시연 숫자는 §28.9 규칙 2대로 옛 의미론으로 잰 것이라 표시하고 같은 패킷에서
+다시 잰다). 중단 규칙(§28.10)의 읽기와 §15.3의 SSIM 문턱값은 여전히 소유자의 것이다. §28.9의 규칙 셋과 §28.10의 규칙 셋은
+그대로 적용된다.
+
+**주장.** 프로젝트의 논지는 "외부에서 설계·학습된 정책을 우리 런타임이 같은 의미론으로 재현한다"(§8, §1.9)였고 M5가 그것을
+모방학습(LeRobot ACT)으로 증명했다. plan S는 같은 논지를 **다른 정책 계열(PPO MLP)·다른 학습 신호(보상)**로 한 번 더
+증명하고 한 걸음 더 간다: 재현된 정책을 **우리 시뮬에서 계속 학습**시켜, 이어하기 전후의 성공률을 같은 Evaluation IR로
+같은 표에 적는다. 그 표가 M8의 산출물이다.
+
+**현 상태, as-built(2026-09-21)**
+
+| 영역 | 있는 것 | 없는 것 |
+|---|---|---|
+| 가져오기 | `es import lerobot-config`, `es policy import-lerobot`(ACT 체크포인트 → 번들, 비트 동일 오라클); `Normalizer{Forward/Inverse, MeanStd}`, `StateEncoder{Mlp}`, `PolicyHead{Regression}` 노드; `docs/api-notes/mujoco-playground-quadruped.md`의 brax 파라미터 형식 조사; `quadruped-track.md` 3.4의 세 간극(활성 함수 ReLU 고정·헤드 앞 활성 없음·`tanh` 부재) | RL 체크포인트 파서(brax/orbax·rsl_rl·rl_games), 활성 함수·스쿼시 파라미터, 어댑터 문서, `es policy import-rl` |
+| 학습 | `es train`(모방: IR 경로 `train_act.py`, 외부 경로 `lerobot-train`), §19.3 슬롯 실제 값, `base_model.lock`, 스케줄·증강·사전학습 백본 | RL 트레이너, `[init] policy`, `init.lock`, 롤아웃 경로(`es-py`에 `Env`·`SafetyPlane` 바인딩 없음 — 빌더 4종뿐) |
+| 평가 | 6스위트 Evaluation IR, `--jobs`(셀 단위), `Env::seek_episode`(T8, 비트 동일) | `(cell, episode)` 분할(T8b, 에피소드 경계 결정 대기 — 이 절에서 해소) |
+| 원본 정책 | 없음. 서버에 jax·brax·playground·rsl_rl 미설치. Playground에 SO-101 과제 없음(4족 Go1·Panda 등만) | SO-101 원본 체크포인트 — 원 프레임워크로 4090에서 직접 학습해 레시피를 고정한다 |
+
+**이 절이 고정하는 규칙 네 개.**
+
+1. **RL은 IR이 아니라 트레이너다**(§13.4). 배포 그래프는 §8.3의 노드뿐이고 가치 헤드·로그 표준편차·GAE는 `training/`에만
+   산다. Task IR에 RL은 없다(규칙 6).
+2. **롤아웃은 `es-env`이고 Safety Plane은 켜져 있다**(§13.4, INV-12). 트레이너가 다른 시뮬레이터를 직접 부르는 순간 그 수치는
+   sim-to-sim이 아니다.
+3. **어댑터가 선언하고 코드는 추측하지 않는다**(§14.4). 관절 순서·단위·위치/토크·관측 배치는 로봇별 문서이고 불일치는 이름
+   붙은 오류다. pickle은 Python에서만 열린다(INV-16).
+4. **새 trait 없음**(INV-17). 트레이너는 `es-data`/`es`/`python/es`의 모듈이고 `es-py`의 바인딩은 pyclass이지 확장점이 아니다.
+   처리량은 잴 때까지 `Target / Status: unverified`.
+
+**패킷 사다리.** 파동 0은 M7 리뷰의 후속 중 이 캠페인이 기대는 것이다. 파동 1–3은 크레이트가 겹치지 않아 병렬이며
+(R: `es-safety`·`es-eval`·`es/cmd/eval.rs`; E: `es-editor`; S2a: `es-ir`·`es-policy/lower`; S2c: `python/es/rl_source`·서버;
+S1: `es-data/training.rs`·`es/cmd/train.rs`; S4a: `es-py`), 각 행은 §1.2 패킷 하나이고 오라클은 실행 가능한 한 줄이다.
+패킷: `docs/packets/M7/P-M7-R1.md`·`P-M7-R12.md`, `docs/packets/M8/S*.md`. 디자인 노트: `docs/design/rl-continuation.md`(신설),
+`evaluation-execution.md` 확장(R1), `editor-shell.md` 확장(R12).
+
+| 파동 | 패킷 | 답하는 질문 | 오라클 (한 줄) | 유형 |
+|---|---|---|---|---|
+| 0 | **R1 에피소드 경계 + T8b 분할** (`P-M7-R1`) | `begin_episode`가 창을 비우고 `tick`이 에피소드 상대이면 `(cell, episode)` 분할이 순차 실행과 비트 동일한가, 그리고 nominal 16편이 반으로 줄어드는가 | `cargo test -p es-safety window_is_cleared_at_begin_episode`; T8 오라클 3이 tripwire에서 패리티 단언으로(`--ignored`, 서버); 커밋된 `evaluation.toml`을 jobs 1·4로 → 셀별 `report.json`·`events.json`·`.estraj` 비트 동일, jobs 4 벽시계 ≤ jobs 1의 55 %(9지표); U3 held-out 재측정 행 | B |
+| 0 | **R12·R16 라이브 표** (`P-M7-R12`) | 행의 키가 `(stage, cell)`이고 attach 전에 시작된 셀도 행을 얻는가 | `cargo test -p es-editor live_run_`: 게이트 `nominal-00` 뒤 평가 `nominal-00`이 두 행; `cell.begin` 없는 스트림이 "늦게 합류" 행; 픽스처 폴드 오라클 불변 | B |
+| 1 | **S2a 활성 함수·스쿼시** | `StateEncoder{Mlp}`에 `activation`(relu·elu·swish·tanh), `PolicyHead{Regression}`에 `squash`(none·tanh)가 생기면서 부재 = 기본값 = 오늘의 해시인가 | `cargo test -p es-ir committed_learning_hash_is_unmoved_by_activation`; `cargo test -p es-policy lower_mlp_activations`(torch 참조 대 로워링, 4×2 조합, ≤ tier-4) | B |
+| 1 | **S2c 원본 정책** | 우리 `so101` 장면(MJX)에서 brax PPO로 학습한 도달(reach) 정책이 재현 가능한 레시피와 체크포인트로 남는가 | 서버: `python/es/rl_source/train_brax_so101.py --seed 0` 두 번 → 같은 orbax 파라미터 해시(`unverified`면 그렇게 표시); `docs/api-notes/brax-ppo-so101.md`에 핀·수치 | D |
+| 1 | **S4a `es-py` 롤아웃 바인딩** | Python 트레이너가 `es_native.Env`·`es_native.SafetyPlane`으로 우리 env를 밟고 플레인을 통과시킬 수 있는가 | `python/es/selfcheck.py --env`: 픽스처 장면 100스텝의 `qpos` 궤적이 `es-env` 테스트 골든과 비트 동일; 플레인의 `validate`가 Rust와 같은 `events` 비트 | B |
+| 2 | **S2b `es policy import-rl`** | brax·rsl_rl·rl_games의 액터가 어댑터 문서를 거쳐 번들이 되고, 무작위 관측 1,000개에서 원 프레임워크를 재현하는가 — torch 출신(rsl_rl·rl_games)은 비트 동일, JAX 출신(brax)은 §8.9 계층 4(≤ 1e-5)에 최대 오차를 기록 | `cargo test -p es --test cli import_rl_`: 합성 체크포인트 3종 → 문서·번들·`import.json`; 서버 `--ignored`: S2c 체크포인트, 1,000 관측 — torch 재구성 대 우리 런타임 f32 비트 동일, JAX 대 우리 런타임 최대 절대오차 ≤ 1e-5, 해시 기록; 어댑터 불일치 5종이 `IMP-0xx`로 거부 | B |
+| 2 | **S1 `[init] policy`** | 이름·모양이 맞는 텐서가 복사되고 나머지가 초기화되며 `init.lock`이 그것을 적는가 | `cargo test -p es --test cli train_init_`: U3 체크포인트에서 0스텝 → 가중치 비트 동일, `policy_hash` 사슬 유지; 이름 불일치가 lock에 나열 | B |
+| 3 | **S4b PPO 트레이너** | `es train --recipe`의 `[rl]`이 `train_ppo.py`로 롤아웃(§13.4)·GAE·클립 목적·엔트로피를 돌리고 §19.3을 채우는가; CPU 백엔드에서 두 번 비트 동일한가 | `cargo test -p es --test cli train_rl_`: `--dry-run` 계획 골든; `tests/fixtures/rl/task-reach.toml`에서 시드 0 두 번 → 체크포인트 비트 동일(`ES_PYTHON`); 목표 리턴 도달(관측, 서버) | B |
+| 3 | **S4c 이어하기 측정** | 가져온 정책(S2b)에서 `[init]`으로 시작해 우리 시뮬에서 PPO를 이어 돌리면 같은 Evaluation IR의 성공률이 오르는가 | `es eval run` 전/후 → `visible-learning.md` 7.33 표(이어하기 전·후·처음부터, 시드 3개); `es eval compare` | D |
+| 4 | **M8 리뷰** | 기록이 사양으로 돌아왔는가 | `docs/reviews/M8.md` + `.ko.md`; `cargo xtask ci` 녹색 | A |
+
+**사다리에 없는 것과 이유.** **Isaac Lab 정책(rsl_rl·rl_games)의 실제 체크포인트**는 파서와 합성 픽스처까지만 이 절에
+있다 — Isaac 장면은 `es-usd`를 거쳐야 하고 원본 정책이 없기는 MuJoCo와 같아서, S2c가 brax로 레시피를 고정한 뒤 두 번째
+원본으로 연다. **가져오기 마법사 UI(S3)**는 소유자가 보류했다. **MJWarp 롤아웃**은 S4b가 CPU에서 비트 동일을 세운 뒤의
+처리량 패킷이며 그 수치는 계층 3이다. **RL 전용 Task IR 노드**(관측 잡음·커리큘럼)는 규칙 1에 걸린다.
+
+**소유자 결정.** (1) 에피소드 경계 둘 다 "예" — 이 절이 그 결정을 기록한다(2026-09-21). (2) S2c의 원본 프레임워크는 brax
+PPO(MuJoCo Playground 0.2.0 핀) — Isaac은 두 번째. (3) S4c의 이어하기 예산(스텝·벽시계)은 S4b의 실측 뒤 정한다.
+
 ---
 
 ## 29. 리스크
@@ -2965,6 +3076,10 @@ Safety Plane의 위반율 윈도가 에피소드 경계를 넘어 이월되고 `
 45. **채택은 "얹기"부터 시작한다.** 텔레메트리 → 평가 → 관측 → 안전 → 학습 → 전체(§27.2)
 46. LeRobot 호환이 최우선 상호운용 타깃
 47. 인증 기관이 아니라 증거 수집·추적 도구다
+
+**에피소드와 강화학습(2026-09-21, §9.4·§10.5·§13.4)**
+48. **에피소드는 작업 단위다.** `EnvelopeViolationRate`의 창과 `events.json`의 `tick`은 `begin_episode`에서 시작한다
+49. **RL은 Learning IR 위의 트레이너다.** 배포 그래프에 가치 헤드는 없고, 롤아웃은 `es-env`이며 Safety Plane은 켜져 있다
 
 ### A.2 보류·검증 필요
 
