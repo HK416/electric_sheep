@@ -92,6 +92,15 @@ pub enum ActionSpace {
     EeDelta,
     Gripper,
     Composite,
+    /// An increment on the current joint target: `target_t = target_{t-1} + row_t`, integrated
+    /// in one place on the runtime side (`es_env::chunk_buffer::absolute_target`), so the
+    /// plane still validates an **absolute** target and the envelope is unchanged (spec 8.5).
+    ///
+    /// **Last on purpose.** [`DeploymentIr::deployment_hash`] writes `self.action.space as u8`,
+    /// so a variant inserted above this line would renumber `EePose`, `Gripper` and
+    /// `Composite` and move every `deployment_hash` written since M2
+    /// (`cargo test -p es-ir committed_deployment_hashes_are_unmoved_by_joint_delta`).
+    JointDelta,
 }
 
 /// Shape of the action chunk arriving at the Safety Plane (spec 8.5, spec 8.6).
@@ -561,9 +570,11 @@ impl DeploymentIr {
             ));
         }
         let expected = match a.space {
-            ActionSpace::JointPosition | ActionSpace::JointVelocity | ActionSpace::JointTorque => {
-                Some(n)
-            }
+            ActionSpace::JointPosition
+            | ActionSpace::JointVelocity
+            | ActionSpace::JointTorque
+            // An increment is one number per joint, exactly as the absolute target is.
+            | ActionSpace::JointDelta => Some(n),
             ActionSpace::EePose | ActionSpace::EeDelta => Some(6),
             ActionSpace::Gripper | ActionSpace::Composite => None,
         };
