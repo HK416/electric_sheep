@@ -161,7 +161,7 @@ digests:
 | 3 | `scheduler.json` | `{"kind":"constant","lr":…}`, or the `warmup_cosine` block `[run] schedule` names (section 10) | pre-run |
 | 4 | `seed.json` | `global` and `dataloader` from `[run] seed`; `augmentation` unset | pre-run |
 | 5 | `dataset.lock` | `es-data::identity`'s content/schema/split, the episode and frame counts, the recorded `es:task:` name | pre-run |
-| 6 | `base_model.lock` | `{"source":"none"}` (IR) or the declared `vision_backbone` + `pretrained_backbone_weights` (external) | pre-run |
+| 6 | `base_model.lock` | the *verified* provenance of `[policy] base_model` (IR, section 11), `{"source":"none"}` when there is none, or the declared `vision_backbone` + `pretrained_backbone_weights` (external) | pre-run |
 | 7 | `augmentation.json` | `{"kind":"none"}` until T6 | pre-run |
 | 8 | `precision.json` | `fp32`, `amp off`, `gradient_accumulation` = `[run] batch` on the IR route | pre-run |
 | 9 | `topology.json` | `{"world_size":1}` | pre-run |
@@ -192,7 +192,7 @@ in a `training.lock` this command writes, and the oracle asserts it.
 | unset | why | owner |
 |---|---|---|
 | `seed.json.augmentation` | there is no augmentation | T6 |
-| `base_model.lock.weights_hash` and `.license` | a *declared* provenance: the backbone is LeRobot's ACT default unless `extra` overrides it, and nothing here has downloaded or verified those weights | T5 |
+| `base_model.lock.weights_hash` and `.license`, **on the external route only** | a *declared* provenance: the backbone is LeRobot's ACT default unless `extra` overrides it, and nothing here has downloaded or verified those weights. The IR route's is verified (section 11) | — |
 | `optimizer.json.betas` / `.weight_decay` on the external route | `lerobot`'s optimizer block is not this side's to declare, and T4 therefore refuses `[run] schedule`, `weight_decay` and `grad_clip` on that route rather than declaring a schedule the run never applied (section 10) | T2 |
 | `metrics.json.loss` on the external route | `lerobot-train` reports its curve to its own logs, not to a file this command reads | T2 |
 | `hardware.json.driver` | `torch` reports the CUDA toolkit, not the driver | — |
@@ -544,3 +544,86 @@ recipe for the measured 20,000-step run at batch 8, and the plan golden beside i
 `--dry-run` has to keep producing; showing the new field there would move both. The field is
 documented above and exercised by `cli::train_identity_moves_with_the_schedule`, which builds
 its own recipe.
+
+## 11. The pretrained backbone and `base_model.lock` (packet M7/T5)
+
+Spec 19.3 says the provenance of a pretrained backbone "directly affects the results, it must
+be included in the provenance; it is also the basis for license tracking". Until this packet
+the IR route's slot was `{"source":"none"}` and the external route's was a *declaration* with
+two `unset` fields. It is now a **verified** record on the IR route, and this is the paragraph
+that says what verified means.
+
+The recipe gains one field:
+
+```toml
+[policy]
+bundle     = "runs/collect-001/untrained.esb"
+base_model = "~/artifacts/plan-v/m7-t5/resnet18-imagenet1k-v1.safetensors"
+```
+
+It is required by a bundle whose Learning IR declares `VisionEncoder { pretrained = true }`,
+refused by one that does not, and refused outright on the `lerobot` route — there the backbone
+is `lerobot`'s own and reached through `[policy] lerobot.extra`. Both directions of the first
+pair are refusals rather than defaults, and for the same reason: a bundle that wants ImageNet
+and gets none would train from scratch under a document saying otherwise, and a recipe naming
+weights nothing reads would put a provenance into `base_model.lock` that the run does not have
+— the fabrication §28.10 rule 2 forbids.
+
+**Three claims have to agree before a single GPU-second is spent.** `Backbone::verify` reads
+the file and `<stem>.lock.json` beside it, then checks, in this order:
+
+| checked | refused when | why this order |
+|---|---|---|
+| the lock describes these bytes | `lock.blake3 != blake3(file)` | is this lock file about this artifact at all |
+| the source | `lock.source` is not `torchvision.models.ResNet18_Weights.IMAGENET1K_V1` | the licence decision is about a *named* source (§29 row, owner 2026-09-15) |
+| the licence | `lock.license` is empty | §19.3 makes this file the basis for licence tracking; an empty slot tracks nothing |
+| the pin | `blake3(file) != RESNET18_IMAGENET1K_V1_BLAKE3` | the first three ask whether the lock is a well-formed record of these bytes; this one asks whether these bytes are the artifact the repository has measured |
+
+The pin is `8511928e…9e801899`, one `pub const` in `crates/es-data/src/training.rs`. The 45 MB
+file is never committed — it lives at `~/artifacts/plan-v/m7-t5/` on the oracle server — so the
+constant is what the repository knows about it, the way `tests/fixtures/mjcf/*.PROVENANCE.json`
+pins the upstream MJCF this project's scene is derived from. There is exactly one copy of the
+string: `python/es/fetch_backbone.py` is *given* it with `--expect` rather than holding its
+own, and `crates/es-policy/tests/backbone_provenance.rs` reads it out of `training.rs` as text
+because `es-data` is layer 10 and `es-policy` is layer 8 (§4.2) and the constant cannot be
+imported upward. `fetch_backbone.py --repin` is the deliberate way to move it, and it says on
+stderr that the constant and the two design notes have to move in the same commit.
+
+**What goes into the slot, and what deliberately does not.** `base_model.lock` carries
+`source`, `url`, `sha256_upstream`, `blake3`, `dropped`, `license` and `license_url` — the
+fields that identify *the weights*. The lock file beside the artifact also records the `torch`
+and `torchvision` that fetched it, and those are **not** copied in: two machines fetching the
+same upstream file write byte-identical tensors and different version strings (measured:
+torchvision 0.26.0+cu129 and 0.29.0+cpu produce the same blake3), so carrying them would put
+the fetching machine into `identity_hash` and one recipe would have two identities. The
+fetching environment belongs in the artifact's own lock file and in the run's `hardware.json`.
+
+`TrainingIdentity.base_model` therefore ends up with a real `source` and a real `license` on
+this route, which is what §19.3 asked for: a run that changed nothing but the licence of its
+base model is a different run.
+
+**The trainer's line gains `--init-backbone <path>` and nothing else.** `frozen` is a field of
+the Learning IR, so the lowered module carries it as `requires_grad_(False)` and `train_act.py`
+builds `AdamW` over the parameters that still require a gradient — see
+`learning-lowering.md` section 5.3. A `--frozen` flag would be a second copy of an IR decision
+on a command line, and the plan golden would then depend on a bundle that `--dry-run` does not
+open.
+
+### The refusals, and why they are named rather than numbered
+
+The packet writes `TRAIN-0xx`. Neither `es_data::training` nor `es train` has ever carried
+numeric codes — every refusal there names the field and the file, and §17.2's requirement is
+that a refusal be identifiable, not that it be enumerated. A numbering scheme invented for
+five messages is a scheme with one user. The five are: the lock file that does not describe
+its weights (names both digests and the lock's path), the artifact that is not the pinned one
+(names both digests and the constant to move), the empty licence (names the file and §19.3),
+`pretrained = true` with no `base_model` (names the flag and the fetch command), and
+`base_model` with no `pretrained = true` (names the flag and what would be claimed). All five
+are `cli::train_refuses_a_mismatched_base_model`.
+
+### The fixture recipe is unchanged here too
+
+`tests/fixtures/visible-learning/training.toml` names no `base_model`, because its bundle is
+the from-scratch one and the plan golden beside it must keep rendering. The pretrained arm of
+the experiment is `tests/fixtures/visible-learning/learning-pretrained.toml`, and the recipe
+that points at it is the U-measurement's, not a committed fixture.

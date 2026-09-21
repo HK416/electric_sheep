@@ -1,0 +1,453 @@
+# Learning IR (spec 8) for the SO-101 cube-into-bin demo, with an ImageNet-pretrained
+# backbone -- packet M7/T5.
+#
+# `learning.toml` beside this file is the same graph with `pretrained = false`, and it is not
+# touched by this packet: every number in `docs/design/visible-learning.md` section 7 was
+# measured under it. This document is the U-measurement's other arm -- one flag apart, so the
+# comparison has exactly one variable. Its `learning_hash` is recorded in
+# `docs/design/learning-lowering.md` section 5.3.
+#
+# --- what follows is `learning.toml`'s own header, unchanged ---
+#
+# Learning IR (spec 8) for the SO-101 cube-into-bin demo -- plan V, packet M5/V0.
+#
+# The ACT-*shaped* Learning IR policy, not LeRobot's ACT (design note section 6.1): it has
+# no VAE and no DETR decoder, because `TemporalEncoder { Transformer }` carries only a width.
+# `lower_to_torch` lowers every node here, so the module PyTorch optimizes in V2 is the module
+# `es eval run` infers with.
+#
+#   VisionEncoder{ResNet18} -.
+#                             Fusion{Concat} -> TemporalEncoder{Transformer}
+#   StateEncoder{Mlp[256]}  -'                    -> PolicyHead{Regression} -> ActionChunker
+#
+# horizon H = 16, execute_chunk = 10, replanning_hz = 5 (= 50 Hz / 10, the integer relation
+# XIR-023 requires), action_dim = 6, TemporalEnsemble. (6, 16) is already a row of the
+# const-generic dispatch tables in crates/es/src/cmd/eval.rs and crates/es/src/cmd/loop.rs.
+#
+# `weights` is a `safetensors` reference with an all-zero hash: V2 packs the trained weights
+# and recomputes it. No pickle path exists anywhere (INV-16).
+#
+# Packet M5/V7a adds a third input, `sim_cube_pose`, and IT IS SIMULATOR-PRIVILEGED: a real
+# SO-101 has no sensor that reports where the cube is. It is stage 1 of the demo -- ask whether
+# the policy can do the task *given* the cube's pose, before asking whether a from-scratch
+# ResNet18 can find a 25 mm cube in a 96x96 frame (design note section 7.14). Nothing validates
+# the mark; the `sim_` prefix is the whole of it, carried from the Task IR channel through the
+# Observation IR output port to the policy contract. The graph is therefore
+#
+#   VisionEncoder{ResNet18}  -.
+#   StateEncoder{Mlp[256]}    +- Fusion{Concat} -> TemporalEncoder{Transformer}
+#   StateEncoder{Mlp[256]}   -'                      -> PolicyHead{Regression} -> ActionChunker
+#
+# and the deployment aimed at hardware is the one that drops the third branch.
+
+es_schema = 1
+kind = "learning"
+
+[body]
+schema_version = 1
+
+[[body.inputs]]
+name = "rgb_overhead"
+
+[body.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [
+    3,
+    96,
+    96,
+]
+time = "Tick"
+
+[body.inputs.ty.unit.Normalized]
+hi = 1.0
+lo = 0.0
+
+[[body.inputs]]
+name = "joint_state"
+
+[body.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [6]
+time = "Tick"
+
+[body.inputs.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[[body.inputs]]
+name = "sim_cube_pose"
+
+[body.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [7]
+time = "Tick"
+
+[body.inputs.ty.unit.Normalized]
+hi = 0.3
+lo = -0.3
+
+[body.nodes]
+schema_version = 1
+
+[[body.nodes.edges]]
+
+[body.nodes.edges.from]
+node = 0
+port = "out"
+
+[body.nodes.edges.to]
+node = 2
+port = "image"
+
+[[body.nodes.edges]]
+
+[body.nodes.edges.from]
+node = 1
+port = "out"
+
+[body.nodes.edges.to]
+node = 2
+port = "state"
+
+[[body.nodes.edges]]
+
+[body.nodes.edges.from]
+node = 6
+port = "out"
+
+[body.nodes.edges.to]
+node = 2
+port = "cube"
+
+[[body.nodes.edges]]
+
+[body.nodes.edges.from]
+node = 2
+port = "out"
+
+[body.nodes.edges.to]
+node = 3
+port = "seq"
+
+[[body.nodes.edges]]
+
+[body.nodes.edges.from]
+node = 3
+port = "out"
+
+[body.nodes.edges.to]
+node = 4
+port = "feat"
+
+[[body.nodes.edges]]
+
+[body.nodes.edges.from]
+node = 4
+port = "chunk"
+
+[body.nodes.edges.to]
+node = 5
+port = "chunk"
+
+[[body.nodes.inputs]]
+node = 0
+port = "rgb_overhead"
+
+[[body.nodes.inputs]]
+node = 1
+port = "joint_state"
+
+[[body.nodes.inputs]]
+node = 6
+port = "sim_cube_pose"
+
+[body.nodes.nodes.0.VisionEncoder]
+backbone = "ResNet18"
+# Fine-tuned, not frozen: the whole question this document exists to measure is whether an
+# ImageNet *initialisation* closes the gap to LeRobot's ACT, and LeRobot's ACT fine-tunes its
+# backbone. `frozen = true` is the other arm of the same experiment and is one edit away; the
+# lowering honours either, and a from-scratch backbone that is also frozen is refused.
+frozen = false
+out_dim = 512
+# `true`, and it lowers now (packet M7/T5). The ImageNet tensors are not fetched when the
+# module is built -- `weights=None`, spec 2.5 -- they arrive through `es train`'s
+# `[policy] base_model`, whose blake3 is verified against `resnet18-imagenet1k-v1.lock.json`
+# and against the pin in `crates/es-data/src/training.rs`, and whose provenance is written
+# into spec 19.3's `training/base_model.lock`.
+#
+# The flag moves `learning_hash` and `policy_hash` and, through the generated source, the
+# `lowering_hash` too; `task_hash` and `observation_hash` do not move, so the baked
+# observation set and `evaluation.toml` are shared with `learning.toml` and the two can be
+# measured against each other with nothing else differing.
+pretrained = true
+token_count = 0
+
+[[body.nodes.nodes.0.VisionEncoder.inputs]]
+name = "rgb_overhead"
+
+[body.nodes.nodes.0.VisionEncoder.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [
+    3,
+    96,
+    96,
+]
+time = "Tick"
+
+[body.nodes.nodes.0.VisionEncoder.inputs.ty.unit.Normalized]
+hi = 1.0
+lo = 0.0
+
+[body.nodes.nodes.1.StateEncoder]
+out_dim = 512
+
+[[body.nodes.nodes.1.StateEncoder.inputs]]
+name = "joint_state"
+
+[body.nodes.nodes.1.StateEncoder.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [6]
+time = "Tick"
+
+[body.nodes.nodes.1.StateEncoder.inputs.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.nodes.nodes.1.StateEncoder.kind.Mlp]
+hidden = [256]
+
+[body.nodes.nodes.2.Fusion]
+kind = "Concat"
+out_dim = 512
+token_count = 0
+
+[[body.nodes.nodes.2.Fusion.inputs]]
+name = "image"
+
+[body.nodes.nodes.2.Fusion.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [512]
+time = "Tick"
+unit = "Dimensionless"
+
+[[body.nodes.nodes.2.Fusion.inputs]]
+name = "state"
+
+[body.nodes.nodes.2.Fusion.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [512]
+time = "Tick"
+unit = "Dimensionless"
+
+[[body.nodes.nodes.2.Fusion.inputs]]
+name = "cube"
+
+[body.nodes.nodes.2.Fusion.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [512]
+time = "Tick"
+unit = "Dimensionless"
+
+[body.nodes.nodes.3.TemporalEncoder]
+kind = "Transformer"
+n_frames = 1
+out_dim = 512
+token_count = 0
+
+[[body.nodes.nodes.3.TemporalEncoder.inputs]]
+name = "seq"
+
+[body.nodes.nodes.3.TemporalEncoder.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [512]
+time = "Tick"
+unit = "Dimensionless"
+
+[body.nodes.nodes.4.PolicyHead]
+action_dim = 6
+horizon = 16
+kind = "Regression"
+
+[[body.nodes.nodes.4.PolicyHead.inputs]]
+name = "feat"
+
+[body.nodes.nodes.4.PolicyHead.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [512]
+time = "Tick"
+unit = "Dimensionless"
+
+[body.nodes.nodes.5.ActionChunker]
+buffer_chunks = 2
+execute_chunk = 10
+horizon = 16
+mode = "TemporalEnsemble"
+replan_hz = 5.0
+
+[body.nodes.nodes.5.ActionChunker.blend.TemporalEnsemble]
+weight_decay = 0.009999999776482582
+
+[[body.nodes.nodes.5.ActionChunker.inputs]]
+name = "chunk"
+
+[body.nodes.nodes.5.ActionChunker.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [
+    16,
+    6,
+]
+time = "Tick"
+
+[body.nodes.nodes.5.ActionChunker.inputs.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+# The privileged branch (packet M5/V7a). Its own encoder rather than a wider `joint_state`:
+# the arm's six angles come off real encoders and the cube's seven numbers come off nothing a
+# robot carries, so they stay two ports all the way from the Task IR channel to here -- which
+# is also what lets the vision packet drop this one without moving `joint_state`'s hash.
+[body.nodes.nodes.6.StateEncoder]
+out_dim = 512
+
+[[body.nodes.nodes.6.StateEncoder.inputs]]
+name = "sim_cube_pose"
+
+[body.nodes.nodes.6.StateEncoder.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [7]
+time = "Tick"
+
+[body.nodes.nodes.6.StateEncoder.inputs.ty.unit.Normalized]
+hi = 0.3
+lo = -0.3
+
+[body.nodes.nodes.6.StateEncoder.kind.Mlp]
+hidden = [256]
+
+[[body.nodes.outputs]]
+node = 5
+port = "actions"
+
+[[body.outputs]]
+name = "actions"
+
+[body.outputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [
+    10,
+    6,
+]
+time = "Tick"
+
+[body.outputs.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.policy]
+architecture = "Act"
+
+[body.policy.contract]
+action_dim = 6
+execute_chunk = 10
+execution_mode = "TemporalEnsemble"
+horizon = 16
+observation_window = 1
+replanning_hz = 5.0
+
+[body.policy.contract.inputs.joint_state]
+name = "joint_state"
+
+[body.policy.contract.inputs.joint_state.ty]
+elem = "F32"
+frame = "Policy"
+shape = [6]
+time = "Tick"
+
+[body.policy.contract.inputs.joint_state.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.policy.contract.inputs.sim_cube_pose]
+name = "sim_cube_pose"
+
+[body.policy.contract.inputs.sim_cube_pose.ty]
+elem = "F32"
+frame = "Policy"
+shape = [7]
+time = "Tick"
+
+[body.policy.contract.inputs.sim_cube_pose.ty.unit.Normalized]
+hi = 0.3
+lo = -0.3
+
+[body.policy.contract.inputs.rgb_overhead]
+name = "rgb_overhead"
+
+[body.policy.contract.inputs.rgb_overhead.ty]
+elem = "F32"
+frame = "Policy"
+shape = [
+    3,
+    96,
+    96,
+]
+time = "Tick"
+
+[body.policy.contract.inputs.rgb_overhead.ty.unit.Normalized]
+hi = 1.0
+lo = 0.0
+
+[body.policy.contract.runtime]
+deadline_ms = 40.0
+dtype = "F32"
+expected_latency_ms = 15.0
+
+[body.policy.weights.Safetensors]
+hash = [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+]
+path = "policy.safetensors"
