@@ -337,6 +337,7 @@ pub fn convert(
     }
     let expected = match space {
         ActionSpace::JointPosition => "position_target",
+        ActionSpace::JointDelta => "joint_delta",
         ActionSpace::JointTorque => "torque",
         _ => "",
     };
@@ -622,6 +623,10 @@ fn pick(
 fn joint_unit(space: ActionSpace) -> &'static str {
     match space {
         ActionSpace::JointTorque => "N m",
+        // An increment, not a pose: the same radians, added by `es-env` to the previous
+        // command once per control tick (spec 8.5, packet M9/T1). The mapping report says so
+        // because what a human checks against the datasheet here is a rate.
+        ActionSpace::JointDelta => "rad per control tick",
         _ => "rad",
     }
 }
@@ -802,7 +807,10 @@ fn learning_graph(
     let chunk = |unit: Unit| policy_ty(Shape::new([1, dim]), unit);
     let out_unit = match action.space {
         DeployedSpace::JointTorque => Unit::Torque,
-        DeployedSpace::JointVelocity => Unit::AngularVelocity,
+        // An increment is rad *per control tick*, and `es_ir::cross` refuses `Unit::Angle` on
+        // a `JointDelta` deployment by name (`XIR-031`): the documents would read as a
+        // position policy and the runtime would add a position to a position.
+        DeployedSpace::JointVelocity | DeployedSpace::JointDelta => Unit::AngularVelocity,
         _ => Unit::Angle,
     };
 
