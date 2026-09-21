@@ -21,7 +21,7 @@ use std::time::Instant;
 use es_env::render::{camera_view, look_at};
 use es_env::traj::Trajectory;
 use es_env::EnvRendererCfg;
-use es_render::{Channel, RenderPath, Renderer, SceneCache, Shading};
+use es_render::{Channel, RenderPath, Renderer, SceneCache, Shading, Tonemap};
 
 use crate::error::CliError;
 
@@ -30,6 +30,8 @@ es video showcase --run <dir> --scene <file.xml|urdf> --out <dir>
                   (--eye X,Y,Z --look-at X,Y,Z [--fov 45] | --camera NAME)
                   [--width 1280] [--height 720] [--cell NAME]... [--stride N]
                   [--look lambert|full]
+                  [--path rs|pt] [--spp N] [--bounces B]
+                  [--exposure E] [--tonemap reinhard|aces]
 
 Re-renders a finished `es eval run` or `es loop collect` from the per-episode `.estraj` state
 trajectories it wrote, through a camera that is not in the scene and not in any IR -- so the
@@ -52,6 +54,13 @@ Nothing is resampled and no observation is involved: the showcase camera has its
                     `full` adds shadows, a sky, highlights and 2x supersampling (M7/R2).
                     It is a look for people, not for observations: the frames a policy
                     reads are rendered by the observation path, which has no such flag
+    --path rs|pt    `rs` (default) is the rasterizer `--look` shades. `pt` is the path
+                    tracer (M7/R3): global illumination, next-event estimation on, ReSTIR
+                    and SVGF off, tone-mapped to Rgb8. Minutes per frame, not milliseconds
+    --spp N         samples per pixel on the `pt` path (default 64)
+    --bounces B     bounces per sample on the `pt` path (default 3)
+    --exposure E    linear multiplier before the tone map (default 1.0)
+    --tonemap NAME  `reinhard` (default) or `aces`; `pt` only
 
 Needs the `render` feature and a Vulkan device. Exit codes: 0 success, 1 runtime failure,
 2 usage error.
@@ -68,6 +77,10 @@ struct Opts {
     cells: Vec<String>,
     stride: usize,
     look: Shading,
+    /// `Rs`, or the `Pt` path of packet M7/R3 with its own `spp`/`bounces`.
+    path: RenderPath,
+    exposure: f32,
+    tonemap: Tonemap,
 }
 
 enum Camera {
@@ -107,6 +120,9 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
     // `Lambert` by default, so V9's bit-identity oracle keeps meaning: a re-render of a
     // committed run reproduces its recorded frames.
     let mut look = Shading::Lambert;
+    // The `Pt` block (packet M7/R3). `Rs` by default for the same reason.
+    let (mut pt, mut spp, mut bounces) = (false, 64u32, 3u32);
+    let (mut exposure, mut tonemap) = (1.0f32, Tonemap::Reinhard);
 
     let mut it = args.iter();
     while let Some(a) = it.next() {
@@ -141,8 +157,34 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
                     }
                 }
             }
+            "--path" => {
+                pt = match val()?.as_str() {
+                    "rs" => false,
+                    "pt" => true,
+                    other => {
+                        return Err(usage(format!("--path: expected rs or pt, got {other:?}")))
+                    }
+                }
+            }
+            "--spp" => spp = num(val()?, "--spp")? as u32,
+            "--bounces" => bounces = num(val()?, "--bounces")? as u32,
+            "--exposure" => exposure = num(val()?, "--exposure")? as f32,
+            "--tonemap" => {
+                tonemap = match val()?.as_str() {
+                    "reinhard" => Tonemap::Reinhard,
+                    "aces" => Tonemap::Aces,
+                    other => {
+                        return Err(usage(format!(
+                            "--tonemap: expected reinhard or aces, got {other:?}"
+                        )))
+                    }
+                }
+            }
             other => return Err(usage(format!("unknown flag '{other}'"))),
         }
+    }
+    if spp == 0 || bounces == 0 {
+        return Err(usage("--spp and --bounces must both be greater than zero"));
     }
     let (Some(run), Some(scene), Some(out)) = (run, scene, out) else {
         return Err(usage("--run, --scene and --out are all required"));
@@ -178,6 +220,22 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
         cells,
         stride,
         look,
+        // NEE on, ReSTIR and SVGF off: the showcase wants the converged picture, and
+        // ReSTIR's temporal reuse assumes a camera that does not move while this one
+        // re-renders a whole trajectory (`docs/design/renderer.md` section 4.2).
+        path: if pt {
+            RenderPath::Pt {
+                spp,
+                bounces,
+                nee: true,
+                restir: false,
+                svgf: false,
+            }
+        } else {
+            RenderPath::Rs
+        },
+        exposure,
+        tonemap,
     })
 }
 
@@ -266,10 +324,13 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
         .map_err(|e| rt(format!("no Vulkan device for es video showcase: {e}")))?;
     // The same function every other `Rs` render in this repository goes through, so the
     // showcase and the observation frames cannot drift apart (design note section 7.4).
-    let mut cfg = es_env::render::config(opts.width, opts.height, Channel::Rgb8, RenderPath::Rs);
-    // The only thing `--look` touches. `es_env::render::config` stays the one place a render
-    // path becomes a `RenderConfig`, and the observation path keeps its default (M7/R2).
+    let mut cfg = es_env::render::config(opts.width, opts.height, Channel::Rgb8, opts.path);
+    // All `--look`, `--exposure` and `--tonemap` touch. `es_env::render::config` stays the one
+    // place a render path becomes a `RenderConfig`, and the observation path keeps every
+    // default (M7/R2, M7/R3).
     cfg.shading = opts.look;
+    cfg.exposure = opts.exposure;
+    cfg.tonemap = opts.tonemap;
     let mut renderer = Renderer::new(&gpu, cfg).map_err(|e| rt(format!("renderer: {e}")))?;
 
     fs::create_dir_all(&opts.out).map_err(|e| rt(format!("{}: {e}", opts.out.display())))?;
@@ -324,10 +385,13 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
         "wrote {frame} frame(s) of {}x{} ({}) to {} in {secs:.1}s ({:.1} ms/frame)",
         opts.width,
         opts.height,
-        if opts.look == Shading::Lambert {
-            "lambert"
-        } else {
-            "full"
+        match opts.path {
+            RenderPath::Pt { spp, bounces, .. } => format!(
+                "pt {spp} spp, {bounces} bounces, {:?} at exposure {}",
+                opts.tonemap, opts.exposure
+            ),
+            RenderPath::Rs if opts.look == Shading::Lambert => "lambert".to_owned(),
+            RenderPath::Rs => "full".to_owned(),
         },
         opts.out.display(),
         if frame == 0 {
