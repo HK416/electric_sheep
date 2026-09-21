@@ -299,3 +299,135 @@ fn every_fallback_and_watchdog_kind_is_covered() {
         );
     }
 }
+
+// --- packet M7/R1: the `ViolationRate` ring is per episode (spec 9.4) ------------------------
+
+/// The `violation_rate` scenario's deployment: a 3-joint rig whose spec 9.4 rate watchdog
+/// reads a 4-step window at `max_frac = 0.5`, and whose soft position limit any large command
+/// trips. The fixture is the data; this only borrows its document.
+fn violation_rate_deployment() -> DeploymentIr {
+    let path = fixture_dir().join("violation_rate.json");
+    let sc: Scenario = serde_json::from_str(
+        &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+    )
+    .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    sc.deployment
+}
+
+/// A chunk every row of which is far outside the soft position limit, so every step it drives
+/// is clamped and therefore dirty.
+fn dirty_chunk<const NJ: usize, const H: usize>(
+    deploy: &DeploymentIr,
+    seq: u64,
+) -> ActionChunk<NJ, H> {
+    ActionChunk::new([[100.0; NJ]; H], H, deploy.execution).with_seq(seq)
+}
+
+/// Drives `steps` dirty steps through a fresh plane and hands back the plane and the sliding
+/// rate it reads at the end.
+fn fill_the_ring<const NJ: usize, const H: usize>(
+    deploy: &DeploymentIr,
+    steps: u64,
+) -> (SafetyPlane<NJ, H>, f64) {
+    let mut plane = SafetyPlane::<NJ, H>::from_ir(deploy).expect("the plane builds");
+    plane.observe_state(&[0.0; NJ], &[0.0; NJ]);
+    for tick in 0..steps {
+        plane.heartbeat(PhysTick(tick));
+        plane.validate(&dirty_chunk(deploy, tick + 1), Micros(0), PhysTick(tick));
+    }
+    let rate = plane.counters().envelope_violation_rate();
+    (plane, rate)
+}
+
+/// Packet M7/R1 oracle 1 — **`begin_episode` empties the `ViolationRate` ring, and nothing
+/// else** (spec 9.4, the sentence added 2026-09-21).
+///
+/// The ring is the watchdog's sliding input and spec 10.3 judges a full window or nothing, so
+/// a window that straddles an episode boundary is half of one stream and half of another
+/// (spec 13.1). Every *sum* is the cell's and survives: INV-12 is "no path disables the
+/// plane", and re-arming a watchdog is not disarming it.
+#[test]
+fn window_is_cleared_at_begin_episode() {
+    const NJ: usize = 3;
+    const H: usize = 4;
+    let deploy = violation_rate_deployment();
+    let (mut plane, filled) = fill_the_ring::<NJ, H>(&deploy, 8);
+    assert!(filled > 0.0, "the fixture never filled the ring: {filled}");
+
+    let before = *plane.counters();
+    plane.begin_episode();
+    let after = plane.counters();
+
+    assert_eq!(
+        after.envelope_violation_rate().to_bits(),
+        0.0f64.to_bits(),
+        "begin_episode left {} in the ring",
+        after.envelope_violation_rate()
+    );
+    // Every summed counter is the cell's, not the episode's (INV-12): none of them moves.
+    assert_eq!(after.steps, before.steps, "steps");
+    assert_eq!(after.clamped_steps, before.clamped_steps, "clamped_steps");
+    assert_eq!(after.dirty_steps, before.dirty_steps, "dirty_steps");
+    assert_eq!(
+        after.fallback_activations, before.fallback_activations,
+        "fallback_activations"
+    );
+    for kind in ViolationKind::ALL {
+        assert_eq!(
+            after.count(kind),
+            before.count(kind),
+            "violations[{kind:?}]"
+        );
+    }
+    assert!(!plane.is_latched(), "begin_episode left the latch engaged");
+    // `chunk_underrun_rate` is a whole-run ratio of the sums, so it is untouched too.
+    assert_eq!(
+        after.chunk_underrun_rate().to_bits(),
+        before.chunk_underrun_rate().to_bits(),
+        "chunk_underrun_rate"
+    );
+}
+
+/// The same statement as a scenario: a plane that tripped `ViolationRate` in episode `k-1`
+/// does not trip on tick 0 of episode `k`.
+///
+/// Without the ring clear, tick 0 of the new episode reads a full window of the previous
+/// episode's dirty steps, trips the watchdog and takes the fallback path — which is exactly
+/// the divergence packet M7/T8 measured at `nominal-01` tick 24
+/// (`docs/design/evaluation-execution.md` 2.7).
+#[test]
+fn a_tripped_rate_watchdog_does_not_cross_the_episode_boundary() {
+    const NJ: usize = 3;
+    const H: usize = 4;
+    let deploy = violation_rate_deployment();
+    let (mut plane, _) = fill_the_ring::<NJ, H>(&deploy, 4);
+    // Episode k-1 ends on a tripped watchdog. A trip is self-limiting -- its own step is not
+    // counted into the ring (spec 18.5, P-M3-W1-R7), so the rate oscillates around `max_frac`
+    // and the trip is every other step; this walks to one rather than assuming which.
+    let mut tripped = false;
+    for tick in 4..20 {
+        let out = plane.validate(&dirty_chunk(&deploy, tick + 1), Micros(0), PhysTick(tick));
+        if out.events.contains(ViolationKind::ViolationRate) {
+            tripped = true;
+            break;
+        }
+    }
+    assert!(tripped, "the fixture never tripped the rate watchdog");
+
+    plane.begin_episode();
+    plane.observe_state(&[0.0; NJ], &[0.0; NJ]);
+    plane.heartbeat(PhysTick(0));
+    let first = plane.validate(&dirty_chunk(&deploy, 10), Micros(0), PhysTick(0));
+    assert!(
+        !first.events.contains(ViolationKind::ViolationRate),
+        "tick 0 of episode k was judged on episode k-1's steps: {:?}",
+        first.events.iter().collect::<Vec<_>>()
+    );
+    // The step is still clamped and still counted: only the sliding rate was re-armed.
+    assert!(
+        first.events.contains(ViolationKind::Position),
+        "{:?}",
+        first.events.iter().collect::<Vec<_>>()
+    );
+    assert!(plane.counters().count(ViolationKind::Position) > 0);
+}

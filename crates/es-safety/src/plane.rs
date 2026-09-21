@@ -166,15 +166,27 @@ impl<const NJ: usize, const H: usize> SafetyPlane<NJ, H> {
         self.state.estop_latched = false;
     }
 
-    /// Starts a new episode on the same plane: clears the latch and re-arms the seed, so the
-    /// next [`Self::observe_state`] puts the command chain back on the robot's measured pose.
+    /// Starts a new episode on the same plane: clears the latch, re-arms the seed — so the
+    /// next [`Self::observe_state`] puts the command chain back on the robot's measured pose —
+    /// and empties the `ViolationRate` ring (spec 9.4).
     ///
-    /// Not a way to weaken anything (INV-12): the envelope, the watchdogs and the counters
-    /// are untouched, and the next violation latches again. Without it a second episode opens
-    /// believing the arm is still where the previous episode's last command left it.
+    /// Three things and no fourth. The ring is the one *sliding* input the spec 9.4 watchdog
+    /// reads, and spec 10.3 says it judges a full window or nothing: a window straddling an
+    /// episode boundary is half of one stream and half of another, so episode `k` would be
+    /// judged partly on episode `k-1`'s steps (spec 13.1: an episode is where a stream ends,
+    /// the same rule the observation plan and the chunk buffer already follow). Emptying it
+    /// re-arms the watchdog; it does not disarm it.
+    ///
+    /// Not a way to weaken anything (INV-12): the envelope, the watchdogs and every *summed*
+    /// counter — `violations`, `steps`, `clamped_steps`, `dirty_steps`,
+    /// `fallback_activations`, which are the cell's, not the episode's — are untouched, and
+    /// the next violation latches again. [`Self::reset_counters`] stays the only way to zero
+    /// a sum. Without this a second episode opens believing the arm is still where the
+    /// previous episode's last command left it, and carrying the previous episode's rate.
     pub fn begin_episode(&mut self) {
         self.state.estop_latched = false;
         self.state.seeded = false;
+        self.counters.window.clear();
     }
 
     /// Zeroes the statistics. Does not touch the latch or the envelope.
