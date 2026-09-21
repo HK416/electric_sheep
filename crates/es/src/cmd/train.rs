@@ -13,8 +13,8 @@ use std::process::{Command, Stdio};
 
 use es_compile::PolicyBundle;
 use es_data::training::{
-    camera_suffix, has_image_input, has_pretrained_backbone, state_dim, Backbone, DatasetFacts,
-    Plan, Recipe, Route, Step, StepKind, Training, TRAIN_ACT,
+    camera_suffix, has_image_input, has_pretrained_backbone, init_from, init_weights, state_dim,
+    Backbone, DatasetFacts, Plan, Recipe, Route, Step, StepKind, Training, TRAIN_ACT,
 };
 use es_data::{DatasetIdentity, LeRobotDataset, Split};
 use es_ir::observation::ObservationIr;
@@ -46,6 +46,14 @@ A bundle whose Learning IR declares `VisionEncoder { pretrained = true }` also n
 *and* against the pin this build carries, its licence is copied into
 training/base_model.lock, and the tensors reach the trainer as `--init-backbone` -- never
 over the network at construction (spec 2.5, 19.3).
+
+An optional `[init] policy = \"<bundle.esb>\"` says which policy this run starts from (IR route
+only). Its safetensors is compared to the lowered module's contract, the tensors whose name
+and shape match are copied into <out>/weights/init.safetensors and reach the trainer as
+--init-weights, and what was copied, initialised or left behind over a shape is recorded in
+<out>/training/init.lock -- a slot of the run's identity, like base_model.lock. Sharing no
+tensor at all is refused. `[run] steps = 0` is legal beside it and means \"checkpoint
+immediately\": the module's initial state is written as 0.esb without an optimizer step.
 
 Every `es` step above runs in-process; only the trainer is a subprocess. Run `es train` from
 the repository root: the IR route's trainer is `python/es/train_act.py` and a Task IR's
@@ -404,6 +412,25 @@ pub(crate) fn run(
         println!("base_model:    {} ({})", lock.source, lock.license);
     }
 
+    // Packet M8/S1: what this run starts from, decided here -- before the probe, before the
+    // bake, before a single GPU-second -- because `init.lock` enters `identity_hash`, and the
+    // identity of a run exists before the run does. `[init]` is refused on the lerobot route,
+    // so the bundle is always open by now.
+    let init = match (&recipe.init, &bundle) {
+        (Some(from), Some(target)) => {
+            let bytes = std::fs::read(&from.policy)
+                .map_err(|e| bad(format!("[init] `policy` {}: {e}", from.policy)))?;
+            let built = init_from(&from.policy, &bytes, &target.learning)
+                .map_err(|e| bad(e.to_string()))?;
+            println!(
+                "init:          {} tensor(s) copied from {}, {} initialised",
+                built.copied, from.policy, built.initialised
+            );
+            Some(built)
+        }
+        _ => None,
+    };
+
     let task_hash = match (&bundle, &recipe.policy.task) {
         (Some(b), _) => b.task.task_hash().map_err(|e| bad(e.to_string()))?,
         (None, Some(path)) => task_from_toml(&read(Path::new(path))?)
@@ -429,6 +456,11 @@ pub(crate) fn run(
         Some(observation),
     )
     .map_err(|e| bad(e.to_string()))?;
+    if let Some(init) = &init {
+        training
+            .set_init(&init.lock)
+            .map_err(|e| bad(e.to_string()))?;
+    }
     training
         .write(&training_dir)
         .map_err(|e| bad(e.to_string()))?;
@@ -455,6 +487,15 @@ pub(crate) fn run(
     for dir in ["weights", "metrics", "checkpoints"] {
         let dir = out.join(dir);
         std::fs::create_dir_all(&dir).map_err(|e| bad(format!("{}: {e}", dir.display())))?;
+    }
+    // The intersection `init_from` kept, as the file the trainer's `--init-weights` names.
+    // Written after `weights/` exists and before the plan runs, because the trainer is one of
+    // the plan's steps and this is its input (packet M8/S1).
+    if let Some(init) = &init {
+        write_file(
+            Path::new(&init_weights(out)),
+            &es_policy::weights::write_safetensors(&init.weights),
+        )?;
     }
 
     // --- the plan ------------------------------------------------------------------------

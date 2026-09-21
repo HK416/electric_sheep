@@ -1115,3 +1115,201 @@ Kept under `~/artifacts/plan-v/m7-t6/`: `untrained-augmented.esb` (the four comm
 documents with `observation-augmented.toml` in place of `observation.toml`), `training.toml`,
 `train.log`, and `run/` (4.5 GB baked set, `module/`, `metrics/loss.json`, `training/`'s twelve
 slots, `training.lock`, `weights/model-20000.safetensors`, `checkpoints/20000.esb`).
+
+---
+
+## 14. Starting from a policy (packet M8/S1)
+
+Every fine-tune, and every RL continuation after it, starts from weights that already exist.
+Until this packet a recipe could say where its *backbone* came from (section 11) and nothing
+about where its **policy** came from: the only way to continue a run was to hand
+`train_act.py` a checkpoint by hand, which leaves no record anywhere that it happened. This
+section is the table that fixes that, and the lock that makes it provenance rather than a
+convention.
+
+### 14.1 The recipe gains one table
+
+```toml
+[init]
+policy = "runs/train-001/checkpoints/20000.esb"
+```
+
+A bundle, not a bare safetensors, and that is the whole design: a `.esb` carries its own Task,
+Observation and Learning IR and its own §5.3 `policy_hash`, so `init.lock` can record *which
+policy* this run continued and not merely which 60 MB of floats it read. `[init]` is
+`deny_unknown_fields` like every other table, and it is the IR route's — on the `lerobot`
+route it is refused by name, because `lerobot-train` starts from its own `--policy.path` and a
+recipe naming both would write a lock describing tensors the run never loaded.
+
+`tests/fixtures/visible-learning/training-init.toml` is the committed example and
+`tests/golden/train/plan-init.txt` its plan. Both are **additions**: `training.toml`,
+`training-lerobot.toml` and their two goldens are untouched, and
+`crates/es-data/tests/training_init.rs` pins the first one's digests —
+`identity_hash a7531245…`, `training_hash 577a3f4a…` — measured before this packet changed a
+line. A slot that is absent has to leave every recipe written before it exactly where it was.
+
+### 14.2 Three buckets, and the fourth that does not exist
+
+After the bundle is opened, its safetensors header is compared to the lowered module's
+contract — `weight_keys` and `weight_shapes`, the same two lists `es policy lower` writes into
+`contract.json`:
+
+| bucket | condition | what happens |
+|---|---|---|
+| **copied** | the module declares this name, at this shape | the tensor is written into `<out>/weights/init.safetensors` |
+| **initialised** | the module declares this name and the bundle has no tensor for it | the lowering's own draw stands |
+| **shape_mismatch** | both know the name, at two shapes | recorded, **not** copied |
+
+A tensor the module does not declare at all is in none of the three: there is no slot to put it
+in, and a fourth list for "we ignored this" would be a list nobody acts on.
+
+**A shape that disagrees is never reshaped.** Reshaping a trained tensor is guessing, and the
+failure mode of a guess here is the worst one this repository has: a policy that still trains,
+still converges and is quietly wrong. It goes into the lock instead, so a reader sees it and
+fixes the document.
+
+**A `nodes.<k>.*` prefix claim is copied by name alone.** Those keys belong to torchvision or
+`torch.nn` — `es_policy::weights::validate_keys` has always treated them that way — so there is
+no declared shape on the Rust side to check them against. `train_act.py --init-weights` checks
+every key against the real module before loading it, which is where the shape actually lives; a
+key that is not a member, or is a member at another shape, is a refusal there rather than a
+`strict=False` load that silently keeps a random tensor.
+
+The copied tensors are written to a file rather than the bundle being handed over whole,
+because what the trainer loads has to be exactly what the lock says was copied. A file holding
+the intersection cannot disagree with the list; a whole checkpoint plus a list can.
+
+### 14.3 `training/init.lock`
+
+```json
+{"schema_version":1,
+ "source":"runs/train-001/checkpoints/20000.esb",
+ "policy_hash":"c109d783…","learning_hash":"fdb5178a…",
+ "copied":["nodes.1.0.bias","nodes.1.0.weight", "…"],
+ "initialised":["nodes.0.*"],
+ "shape_mismatch":[{"name":"nodes.1.2.weight","expected":[512,256],"found":[512,128]}]}
+```
+
+`source` is the path **as the recipe wrote it**, and `policy_hash` / `learning_hash` come out
+of the bundle's own manifest — so the lock identifies the policy, not the file path, and a
+bundle moved to another directory is still the same base. Both name lists are sorted: the
+lock's digest is a hash slot, and a digest that depends on iteration order is not one.
+
+**It enters `identity_hash` and `training_hash`, and it is written before the run.** That is
+forced rather than chosen: what a run starts from is known before it starts, and §19.3's split
+puts everything known before the trainer into `identity_hash`. `es train` therefore does the
+whole comparison among the refusals that need the documents — before the interpreter is
+probed, before the bake, before a single GPU-second — even though the packet phrases it as
+"after `es policy lower`". The module it compares against is the same module: `lower_to_torch`
+is a pure function of the Learning IR, so the `weight_keys` and `weight_shapes` it yields here
+are the ones the lower step writes into `contract.json` seconds later.
+
+**Deviation: the digest lives in `config.json`.** §19.3 names twelve files and
+`es_data::identity::TrainingIdentity` has twelve fields; a thirteenth field is a change to
+`es-data`'s identity module, which this packet does not own. So `Training::set_init` writes
+`training/init.lock` as a real file *and* puts its blake3 into `config.json` under `"init"` —
+exactly the relationship `TrainingIdentity.base_model.hash` already has with `base_model.lock`,
+which is the digest of the file and not its contents. Everything downstream follows for free:
+`identity_hash`, `training_hash`, and §19.3's `policy_hash = H(training_hash, checkpoint_hash)`
+per checkpoint. A recipe without `[init]` never calls it, so its `config.json` is byte-for-byte
+the one it always was — which is what the pinned digests above assert. If a later packet moves
+`TrainingIdentity` to thirteen fields, this is the one line that changes.
+
+`training.lock`'s `files` map gains an `init.lock` entry when there is one and does not when
+there is not, so the lock can always be recomputed from the files on disk.
+
+### 14.4 `[run] steps = 0` — checkpoint immediately
+
+The marks of a run are `checkpoint_at` plus `steps`, and `steps` is always the last of them
+(section 2). `steps = 0` is the one run whose single mark is **0**: the module's initial state,
+written without an optimizer step. `train_act.py` writes mark 0 before the loop rather than
+inside it — the loop's `(step + 1) in marks` can never produce 0 — and the shape probe above it
+runs under `model.eval()` and `no_grad`, so nothing, not even a BatchNorm running mean, moves
+between `--init-weights` filling the module and `checkpoint_tensors` reading it back.
+
+That is what makes a zero-step run from a full-coverage bundle a **bitwise re-pack**, which is
+this packet's oracle. It is also a real thing to want: re-packing a checkpoint against a
+document that has moved on is then one command instead of a pipeline. `checkpoint_at` beside it
+is refused — a run that takes no optimizer step has no step to also stop at — and so is
+`steps = 0` on the `lerobot` route, where `lerobot-train` saves at a single `--save_freq` and
+has no step 0 to save at.
+
+### 14.5 The refusals, each by name
+
+Named and not numbered, for the reason section 11 gives: neither `es_data::training` nor
+`es train` has ever carried numeric codes, and a numbering scheme invented for a handful of
+messages is a scheme with one user. The packet writes `TRN-…`; the file's series is names.
+
+| refusal | the message names |
+|---|---|
+| `[init]` on the `lerobot` route | the table, the route, and `--policy.path` as where lerobot's own base is reached |
+| a bundle sharing no tensor with the module | how many names are absent and how many disagree about a shape, and that this would be `steps` steps from scratch under a document saying otherwise |
+| `[run] steps = 0` with `checkpoint_at` | the marks, and that the one mark of such a run is 0 |
+| `steps = 0` on the `lerobot` route | `--save_freq`, and that "checkpoint immediately" is the IR route's |
+| a non-`F32` tensor in the init bundle | the tensor, its dtype and §8.4 |
+| (in the trainer) a key that is not a member of the module, or is at another shape | the key, and that the file holds exactly what `init.lock` lists as copied |
+
+### 14.6 The oracles
+
+| # | command | needs |
+|---|---|---|
+| 1 | `cargo test -p es-data --test training_init` | nothing — the pin, the slot, and the parse refusals |
+| 2 | `cargo test -p es --test cli train_init_partial_and_refused` | nothing |
+| 3 | `cargo test -p es --test cli train_init_from_bundle_zero_steps -- --ignored` | `ES_PYTHON` with torch; prints `SKIP` and stops without it |
+| 4 | `cargo test -p es --test cli train_dry_run_plan_is_the_golden` | nothing — now three recipes, three goldens |
+
+Oracle 2 needs no Python for the reason section 11's refusal oracle does not: the comparison is
+a property of two documents, and `es train` does it before the interpreter is probed. Its
+partial case starts from a bundle built on `learning-pretrained.toml`'s graph with one
+`StateEncoder`'s hidden width moved from 256 to 128, whose own checkpoint carries the twelve
+exact keys and neither prefix claim — so all three buckets are non-empty at once, which a full
+copy never exercises. Its "shares nothing" case shifts every node id by ten, which is what a
+genuinely differently-laid-out graph produces.
+
+### 14.7 Measured — oracle server, RTX 4090, 2026-09-21
+
+**U3's 20,000-step checkpoint, re-packed from zero steps: bitwise.** The recipe is
+`training-u3.toml` with `steps = 0`, `[init] policy` pointing at U3's own
+`checkpoints/20000.esb`, and no `schedule` (a warmup of 250 over a run of 0 is refused by
+name). Same bundle, same dataset, same verified backbone, so the module the trainer builds is
+the module U3 trained. `ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python`, torch 2.11.0+cu129,
+`device = "cuda"`.
+
+| step | wall-clock | what ran |
+|---|---|---|
+| the init comparison | < 1 s | 126 copied, 0 initialised, 0 shape mismatches |
+| `dataset bake --for-training` | ~8 s | 200 episodes, 36,960 frames, `rgb_overhead [3, 104, 104]` |
+| `policy lower` | < 1 s | `lowering_hash 41d11a06…`, 14 keys (12 exact, 2 prefix claims) |
+| `train_act.py` | ~21 s | 0 optimizer steps; `--init-backbone` then `--init-weights`, then mark 0 |
+| `policy pack` | ~1 s | `checkpoints/0.esb` |
+| **total** | **~0:40** | |
+
+`weights/model-0.safetensors` is **byte-identical** to U3's `weights/model-20000.safetensors`
+(`sha256 2e0b2f05…`, `cmp` reports no difference), and so is the packed bundle's checkpoint:
+both `checkpoint.manifest`s carry `weights_blake3 9375650a…`.
+
+**The two `policy_hash`es, and why they differ.** This is the chain the packet asks for:
+
+| | U3 (20,000 steps) | S1 (0 steps, from U3) |
+|---|---|---|
+| §19.3 `identity_hash` | `624674252273bb34…` | `4baf0a0ee41c8b36…` |
+| §19.3 `training_hash` | `a1bda64afbfd3e1d…` | `1c1c4c4d9a0c57cc…` |
+| §19.3 `policy_hash` = `H(training_hash, checkpoint)` | `30340aec73c6d1b5…` | `ba5d68788b1ca0e5…` |
+| checkpoint blake3 | `9375650a9e4e3752…` | **`9375650a9e4e3752…`** |
+| bundle's §5.3 `policy_hash` | `c109d783bbfd6c5b…` | **`c109d783bbfd6c5b…`** |
+
+The bottom two rows are equal and the top three are not, and that is exactly right. §5.3's
+`policy_hash` names *the policy* — the four IR documents and these weights — and the artifact
+S1 produced is the same policy, bit for bit. §19.3's names *the run that produced it*, and
+these are two different runs: one spent 20,000 optimizer steps and the other spent none, one
+has no `init.lock` and the other's is `2bbecb1f…`. A scheme where they came out equal would be
+one that cannot tell training from copying.
+
+`training/init.lock` records `source` as the U3 path, `policy_hash c109d783…` and
+`learning_hash fdb5178a…` from U3's own manifest, 126 copied names, and two empty lists. The
+trainer's summary agrees from its side: `"init_weights"` names the file and
+`"initialised_from"` lists the same 126 keys it loaded.
+
+Kept under `~/artifacts/plan-s/s1/`: `training-s1.toml`, `train.log`, and `run/` (the baked
+set, `module/`, `training/`'s twelve slots plus `init.lock`, `training.lock`,
+`weights/init.safetensors`, `weights/model-0.safetensors`, `checkpoints/0.esb`).

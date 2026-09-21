@@ -7463,8 +7463,8 @@ fn train_toml_path(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
-/// The two committed recipes, by the path `es train --recipe` is given from the root.
-const TRAIN_RECIPES: [(&str, &str); 2] = [
+/// The three committed recipes, by the path `es train --recipe` is given from the root.
+const TRAIN_RECIPES: [(&str, &str); 3] = [
     (
         "tests/fixtures/visible-learning/training.toml",
         "plan-ir.txt",
@@ -7472,6 +7472,12 @@ const TRAIN_RECIPES: [(&str, &str); 2] = [
     (
         "tests/fixtures/visible-learning/training-lerobot.toml",
         "plan-lerobot.txt",
+    ),
+    // Packet M8/S1: `[init] policy` and `steps = 0`. Its plan is one trainer flag and one
+    // pack line away from `plan-ir.txt`, which is the point of pinning it beside it.
+    (
+        "tests/fixtures/visible-learning/training-init.toml",
+        "plan-init.txt",
     ),
 ];
 
@@ -10086,4 +10092,292 @@ fn cycle_telemetry_delivers_every_stage() {
         "training published no curve\n{text}"
     );
     println!("RAN {TEST}: {stages:?} on one address");
+}
+
+// --- packet M8/S1: `[init] policy` ---------------------------------------------------------
+
+/// A bundle carrying `learning-pretrained.toml`'s graph with `edit` applied, and a real
+/// safetensors checkpoint generated from *that graph's own* lowering: every exact key the
+/// module declares, filled with a value derived from the key so no two tensors are equal.
+///
+/// The prefix claims (`nodes.0.*`, `nodes.3.*`) are deliberately absent. They belong to
+/// torchvision and `torch.nn`, this test has no torch, and a checkpoint that does not carry
+/// them is exactly the bundle that makes `initialised` non-empty — which is the half of
+/// `init.lock` a full copy never exercises.
+fn write_init_source(
+    dir: &Path,
+    name: &str,
+    rename: impl Fn(&str) -> String,
+    edit: impl FnOnce(&mut es_ir::learning::LearningGraph),
+) -> PathBuf {
+    let read = |n: &str| std::fs::read_to_string(vl_fixture(n)).expect(n);
+    let mut learning = es_ir::serial::learning_from_toml(&read("learning-pretrained.toml"))
+        .expect("learning-pretrained.toml");
+    edit(&mut learning);
+    let module = es_policy::lower_to_torch(&learning).expect("the edited graph lowers");
+    let tensors: es_policy::weights::Checkpoint = module
+        .weight_shapes
+        .iter()
+        .map(|(key, shape)| {
+            let n: u64 = shape.iter().product();
+            let seed = f32::from(u8::try_from(key.len()).unwrap_or(7));
+            let values = (0..n).map(|i| seed + i as f32 * 0.5).collect();
+            (rename(key), (shape.clone(), values))
+        })
+        .collect();
+    let weights = es_policy::weights::write_safetensors(&tensors);
+    learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let bytes = es_compile::PolicyBundle::build(
+        &es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml"),
+        &es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml"),
+        &learning,
+        &es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml"),
+        &weights,
+    )
+    .expect("the edited documents pack into a bundle");
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).expect("write the init source bundle");
+    path
+}
+
+/// The recipe of [`train_fixture_recipe`] with `[init] policy` in front of `[run]`.
+fn with_init(recipe: &str, source: &Path) -> String {
+    recipe.replace(
+        "[run]\n",
+        &format!("[init]\npolicy = \"{}\"\n[run]\n", train_toml_path(source)),
+    )
+}
+
+fn init_lock(out: &Path) -> serde_json::Value {
+    let path = out.join("training").join("init.lock");
+    serde_json::from_str(
+        &std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+    )
+    .expect("init.lock is JSON")
+}
+
+fn names(lock: &serde_json::Value, field: &str) -> Vec<String> {
+    lock[field]
+        .as_array()
+        .unwrap_or_else(|| panic!("init.lock has no {field}"))
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// Oracle 3. A bundle that shares part of the module warm-starts that part and says so; one
+/// that shares nothing is refused; `[init]` on the lerobot route is refused.
+///
+/// No Python: the comparison is a property of two documents, and `es train` does it among the
+/// refusals that need the documents — before the interpreter is probed, before the bake, and
+/// before a single GPU-second — because `init.lock` enters `identity_hash` and the identity
+/// of a run exists before the run does.
+#[test]
+fn train_init_partial_and_refused() {
+    let dir = scratch_dir("train-init-partial");
+    let bundle = write_demo_bundle(&dir);
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 1, 12);
+    let base = train_fixture_recipe(&bundle, &root, &tiles, 0, "1e-4");
+
+    let run = |name: &str, body: &str| -> (bool, String, PathBuf) {
+        let recipe = dir.join(format!("{name}.toml"));
+        write(&recipe, body);
+        let out = dir.join(name);
+        let done = run_train(&train_toml_path(&recipe), &out, &[]);
+        (
+            done.status.success(),
+            format!("{}{}", stdout(&done), stderr_of(&done)),
+            out,
+        )
+    };
+
+    // The intersection. The source is `learning-pretrained.toml`'s graph -- a different
+    // `learning_hash` -- with one `StateEncoder`'s hidden width moved from 256 to 128, so its
+    // three tensors disagree about a shape while everything else still fits.
+    let partial = write_init_source(&dir, "partial.esb", str::to_owned, |graph| {
+        let node = graph
+            .nodes
+            .nodes
+            .get_mut(&es_ir::NodeId(1))
+            .expect("node 1 is the joint StateEncoder");
+        let es_ir::learning::LearningNode::StateEncoder { kind, .. } = node else {
+            panic!("node 1 is a StateEncoder");
+        };
+        *kind = es_ir::learning::StateEncoderKind::Mlp { hidden: vec![128] };
+    });
+    let (ok, said, out) = run("partial", &with_init(&base, &partial));
+    // It stops at the interpreter, which is the refusal every other `es train` test stops at.
+    assert!(!ok, "the fixture interpreter exists: {said}");
+    assert!(said.contains("es-no-such-interpreter"), "{said}");
+    let lock = init_lock(&out);
+    assert_eq!(lock["source"], train_toml_path(&partial));
+    assert!(lock["policy_hash"].is_string(), "{lock}");
+    assert!(lock["learning_hash"].is_string(), "{lock}");
+
+    let copied = names(&lock, "copied");
+    let initialised = names(&lock, "initialised");
+    let mismatch: Vec<String> = lock["shape_mismatch"]
+        .as_array()
+        .expect("shape_mismatch")
+        .iter()
+        .map(|m| m["name"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    assert!(copied.contains(&"nodes.4.weight".to_owned()), "{lock}");
+    assert!(copied.contains(&"nodes.2.weight".to_owned()), "{lock}");
+    // The opaque sub-modules: the source carries no tensor under either claim, so the module
+    // draws them, and the lock names the claim rather than pretending to enumerate it.
+    assert_eq!(initialised, ["nodes.0.*", "nodes.3.*"], "{lock}");
+    assert_eq!(
+        mismatch,
+        ["nodes.1.0.bias", "nodes.1.0.weight", "nodes.1.2.weight"],
+        "a 128-wide hidden layer was copied into a 256-wide one\n{lock}"
+    );
+    assert!(
+        !copied.iter().any(|k| mismatch.contains(k)),
+        "a tensor is both copied and a shape mismatch\n{lock}"
+    );
+    // The lock is a slot of the identity: `training.lock` carries its digest beside the
+    // twelve, and it is the digest of the file on disk.
+    let text = std::fs::read_to_string(out.join("training").join("init.lock")).expect("init.lock");
+    assert_eq!(
+        train_lock(&out)["files"]["init.lock"]
+            .as_str()
+            .expect("slot"),
+        hex(blake3::hash(text.as_bytes()).as_bytes())
+    );
+    // ... and it moves the identity. The same recipe without `[init]` is a different run.
+    let (_, _, plain) = run("plain", &base);
+    assert_ne!(
+        train_lock(&out)["identity_hash"],
+        train_lock(&plain)["identity_hash"],
+        "[init] did not move identity_hash"
+    );
+    assert!(!plain.join("training").join("init.lock").exists());
+    assert!(train_lock(&plain)["files"]["init.lock"].is_null());
+
+    // Nothing in common: a warm start that shares nothing is a mistake, not a warm start.
+    // Every node id is shifted by ten, which is what a genuinely differently-laid-out graph
+    // produces -- no key is one the module declares and none falls under a prefix claim.
+    let alien = write_init_source(
+        &dir,
+        "alien.esb",
+        |key| key.replacen("nodes.", "nodes.1", 1),
+        |_| {},
+    );
+    let (ok, said, _) = run("alien", &with_init(&base, &alien));
+    assert!(!ok, "a bundle sharing no tensor was accepted: {said}");
+    assert!(said.contains("shares no tensor"), "{said}");
+    assert!(said.contains("warm start"), "{said}");
+
+    // The external route has its own `--policy.path`, and mixing the two fabricates a
+    // provenance: `init.lock` would describe tensors `lerobot-train` never loaded.
+    let external = with_init(
+        &std::fs::read_to_string(train_root().join(TRAIN_RECIPES[1].0))
+            .expect("the lerobot recipe"),
+        &partial,
+    );
+    let (ok, said, _) = run("external", &external);
+    assert!(!ok, "[init] was accepted on the lerobot route: {said}");
+    assert!(said.contains("[init]"), "{said}");
+    assert!(said.contains("IR route"), "{said}");
+}
+
+/// Oracle 2. Forty steps produce a bundle; a second recipe starting from that bundle with
+/// `steps = 0` produces a checkpoint whose every tensor is bitwise the first one's.
+///
+/// `#[ignore]`d for the same reason `train_ir_path_packs_a_bundle_torch_opens` is: it is the
+/// arm of this packet that needs torch, and without `ES_PYTHON` it says so rather than
+/// pretending (spec 1.4).
+#[test]
+#[ignore = "needs ES_PYTHON with torch"]
+fn train_init_from_bundle_zero_steps() {
+    const NAME: &str = "train_init_from_bundle_zero_steps";
+    let Ok(python) = std::env::var("ES_PYTHON") else {
+        println!("SKIP {NAME}: ES_PYTHON is not set");
+        return;
+    };
+    if skip_without_bake_model(NAME) {
+        return;
+    }
+    let dir = scratch_dir("train-init-zero");
+    let bundle = write_demo_bundle(&dir);
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 4, 16);
+    let real = |body: &str| -> String {
+        body.replace(
+            "es-no-such-interpreter",
+            &train_toml_path(Path::new(&python)),
+        )
+    };
+    let go = |name: &str, body: &str| -> PathBuf {
+        let recipe = dir.join(format!("{name}.toml"));
+        write(&recipe, body);
+        let out = dir.join(name);
+        let done = bin()
+            .current_dir(train_root())
+            .args(["train", "--recipe", &train_toml_path(&recipe), "--out"])
+            .arg(&out)
+            .output()
+            .expect("run es train");
+        assert_eq!(
+            done.status.code(),
+            Some(0),
+            "{name}\nstdout:\n{}\nstderr:\n{}",
+            stdout(&done),
+            stderr_of(&done)
+        );
+        out
+    };
+
+    // A. Forty real steps.
+    let base = real(&train_fixture_recipe(&bundle, &root, &tiles, 0, "1e-4"));
+    let trained = go("trained", &base).join("checkpoints").join("40.esb");
+
+    // B. Zero steps from A: "checkpoint immediately".
+    let zero = base
+        .replace("steps = 40", "steps = 0")
+        .replace("checkpoint_at = [40]\n", "");
+    let out = go("zero", &with_init(&zero, &trained));
+
+    let opened = |p: &Path| {
+        let bytes = std::fs::read(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        es_compile::PolicyBundle::open(&bytes).unwrap_or_else(|e| panic!("{}: {e}", p.display()))
+    };
+    let a = opened(&trained);
+    let b = opened(&out.join("checkpoints").join("0.esb"));
+    assert_eq!(
+        es_policy::weights::parse_header(&a.weights).expect("A's header"),
+        es_policy::weights::parse_header(&b.weights).expect("B's header"),
+        "the re-packed checkpoint has another shape"
+    );
+    assert_eq!(
+        blake3::hash(&a.weights),
+        blake3::hash(&b.weights),
+        "zero steps from a checkpoint did not reproduce it bitwise"
+    );
+
+    // Every tensor of A reached the module, and nothing was drawn.
+    let lock = init_lock(&out);
+    let copied = names(&lock, "copied");
+    let header = es_policy::weights::parse_header(&a.weights).expect("A's header");
+    assert_eq!(
+        copied,
+        header.keys().cloned().collect::<Vec<_>>(),
+        "init.lock does not list every tensor of the bundle it started from"
+    );
+    assert!(names(&lock, "initialised").is_empty(), "{lock}");
+    assert!(
+        lock["shape_mismatch"].as_array().expect("array").is_empty(),
+        "{lock}"
+    );
+    println!(
+        "RAN {NAME}: {} tensor(s) copied, weights {} reproduced bitwise at policy_hash {}",
+        copied.len(),
+        hex(blake3::hash(&a.weights).as_bytes()),
+        train_lock(&out)["checkpoints"][0]["policy_hash"]
+    );
 }
