@@ -196,6 +196,7 @@ fn task_ir() -> TaskIr {
                 source: ObsSource::JointState {
                     body: robot_id(),
                     dof: DOF,
+                    quantity: JointQuantity::Position,
                 },
                 ty: joints,
             },
@@ -864,6 +865,7 @@ fn cross_envelope_is_wider_than_the_robot() {
     channel.source = ObsSource::JointState {
         body: robot_id(),
         dof: 6,
+        quantity: JointQuantity::Position,
     };
     f.seal();
     assert_code(&f, codes::DEP_031);

@@ -25,8 +25,8 @@ use es_ir::image::ChannelFormat;
 use es_ir::learning::ActionExecutionMode;
 use es_ir::observation::ObservationNode;
 use es_ir::task::{
-    ActionSpace as TaskSpace, ObsChannel, ObsSource, ObservationSpec, SceneRef, TaskConfig, TaskIr,
-    TaskNode,
+    ActionSpace as TaskSpace, JointQuantity, ObsChannel, ObsSource, ObservationSpec, SceneRef,
+    TaskConfig, TaskIr, TaskNode,
 };
 use es_ir::Diagnostic;
 
@@ -93,7 +93,11 @@ fn task_and_deployment(conv: &Converted) -> (TaskIr, DeploymentIr) {
                 let dof = io.output.shape.dims()[0] as u32;
                 state_dim = dof;
                 channels.entry(source.to_string()).or_insert(ObsChannel {
-                    source: ObsSource::JointState { body: *source, dof },
+                    source: ObsSource::JointState {
+                        body: *source,
+                        dof,
+                        quantity: JointQuantity::Position,
+                    },
                     ty: io.output.clone(),
                 });
             }
