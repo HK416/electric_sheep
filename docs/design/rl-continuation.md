@@ -601,6 +601,37 @@ final accuracy are what the task asks for, and both improved.
 is the cap to four digits: the increment itself never asks for more than the plane allows, so
 what T3 will see clamped is the *integrated* target against the position limits, not the step.
 
+**The import, same server and day** (`ES_S2B_SOURCE=~/artifacts/plan-t/t2/seed0-run1`,
+`ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python`, torch 2.11.0+cu129,
+`cargo test --release -p es --test cli -- --ignored import_rl_reproduces_the_source_policy`).
+`import.json` carries `action_kind = "joint_delta"`, `adapter-so101-delta.toml` declares the
+same with the increment unit, and the Task and Deployment IR declare `JointDelta`:
+
+| tier (section 4) | what is compared | measured |
+|---|---|---|
+| (a) | the importer's numpy → torch reconstruction vs our runtime, 1,000 × 6 values | **bitwise** — 0 mismatching values |
+| (b) | our runtime vs JAX's deterministic `tanh(loc)` on `obs_scaled` | **3.297e-7** max abs error (tolerance 1e-5) |
+
+| slot | hash |
+|---|---|
+| `weights_hash` | `c0199681d71b042332c2211590aef2a3c6a8020e965eb375652ec3dcb453c884` |
+| `observation_hash` | `598ad2414fc5c9ffd414bc00658d029326ecde569a84909c0f47e53e34d35cc8` |
+| `learning_hash` | `a408abec926306134b3df604ba813770d96bfc2fead3c9829d681d9beb9e6ded` |
+| `policy_hash` | `17226acd48abd7288c1306cee492229fab38f874e1de52305e315e6ddb90b42a` |
+| `deployment_hash` | `9c81278b496e51cba2aec3852f6543852c084906e2d9d48b934e37a60f0f993d` (`deployment-reach-delta.toml`) |
+
+The emitted Learning IR is the section 1 shape with one difference: the `Normalizer{Inverse}`
+statistics are `mean = 0`, `std = 0.05` and its output port is `Unit::AngularVelocity` — rad per
+control tick, which `XIR-031` requires of a `JointDelta` deployment and refuses `Unit::Angle`
+for. The same oracle on the S2c **position** checkpoint is unmoved (`weights_hash
+37fc82a8…`, `policy_hash 1a18cc4b…`, tier (b) 9.704e-7), so the action kind changed what the
+numbers mean and nothing else.
+
+There is no committed delta *Task* IR: T1 committed `deployment-reach-delta.toml` and mutates
+the task in memory for its own cross-check, so the CLI tests substitute the one line that
+differs (`ActionSpec.space`) into a scratch copy of `task-reach.toml`. Committing the pair is
+the next packet's to do if it wants one.
+
 ## 8. The importer and the adapter
 
 Rule 3 of section 1 says the adapter declares and code never guesses. This is what that comes

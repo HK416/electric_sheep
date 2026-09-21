@@ -571,6 +571,36 @@ relu 그래프, 셋 중 가장 작은 것이 이 예산에서 가장 낫다 — 
 자리까지 그 상한이다. 즉 증분 자체는 플레인이 허용하는 것 이상을 요구하지 않으며, T3이 보게 될
 클램프는 스텝이 아니라 **적분된** 목표와 위치 한계의 문제다.
 
+**임포트, 같은 서버 같은 날**(`ES_S2B_SOURCE=~/artifacts/plan-t/t2/seed0-run1`,
+`ES_PYTHON=~/venvs/es-lerobot-cuda/bin/python`, torch 2.11.0+cu129,
+`cargo test --release -p es --test cli -- --ignored import_rl_reproduces_the_source_policy`).
+`import.json`이 `action_kind = "joint_delta"`를 싣고, `adapter-so101-delta.toml`이 증분 단위와
+함께 같은 것을 선언하며, Task IR과 Deployment IR이 `JointDelta`를 선언한다:
+
+| 티어(4절) | 비교 대상 | 측정값 |
+|---|---|---|
+| (a) | 임포터의 numpy → torch 재구성 대 우리 런타임, 1,000 × 6 값 | **비트 단위 일치** — 불일치 0개 |
+| (b) | 우리 런타임 대 JAX의 결정적 `tanh(loc)`, `obs_scaled` | **3.297e-7** 최대 절대 오차(허용 1e-5) |
+
+| 슬롯 | 해시 |
+|---|---|
+| `weights_hash` | `c0199681d71b042332c2211590aef2a3c6a8020e965eb375652ec3dcb453c884` |
+| `observation_hash` | `598ad2414fc5c9ffd414bc00658d029326ecde569a84909c0f47e53e34d35cc8` |
+| `learning_hash` | `a408abec926306134b3df604ba813770d96bfc2fead3c9829d681d9beb9e6ded` |
+| `policy_hash` | `17226acd48abd7288c1306cee492229fab38f874e1de52305e315e6ddb90b42a` |
+| `deployment_hash` | `9c81278b496e51cba2aec3852f6543852c084906e2d9d48b934e37a60f0f993d` (`deployment-reach-delta.toml`) |
+
+산출되는 Learning IR은 1절의 형태 그대로이고 차이는 하나다: `Normalizer{Inverse}`의 통계가
+`mean = 0`, `std = 0.05`이고 출력 포트 단위가 `Unit::AngularVelocity` — 틱당 라디안이다.
+`XIR-031`이 `JointDelta` 배치에 이를 요구하고 `Unit::Angle`을 이름으로 거부한다. 같은 오라클을
+S2c의 **위치** 체크포인트에 돌리면 결과가 그대로다(`weights_hash 37fc82a8…`,
+`policy_hash 1a18cc4b…`, 티어 (b) 9.704e-7). 즉 행동 종류가 바꾼 것은 그 숫자들의 의미뿐이다.
+
+커밋된 델타 *Task* IR은 없다. T1이 커밋한 것은 `deployment-reach-delta.toml`이고 자기 교차
+검사에서는 태스크를 메모리에서 바꾼다. 그래서 CLI 테스트는 `task-reach.toml`의 스크래치
+사본에 다른 한 줄(`ActionSpec.space`)만 치환해 넣는다. 그 쌍을 커밋하는 것은 필요하다면 다음
+패킷의 몫이다.
+
 ## 8. 임포터와 어댑터
 
 1절의 규칙 3은 어댑터가 선언하고 코드는 결코 추측하지 않는다고 말한다. `es policy import-rl`의
