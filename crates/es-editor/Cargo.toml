@@ -10,6 +10,17 @@ description = "es-editor -- read-only layered graph view, telemetry and before/a
 name = "es-editor"
 path = "src/main.rs"
 
+[features]
+# The native Open dialog (packet M7/E6). Default, but `rfd` is only *declared* for Windows and
+# macOS, and `model/dialogs.rs` gates on `all(feature = "file-dialogs", any(windows, macos))` -
+# cargo has no per-target default feature, and this is the same effect: Linux compiles the
+# `None` stub whether or not the feature is on, and gains no GTK or portal requirement.
+default = ["file-dialogs"]
+file-dialogs = ["dep:rfd"]
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd = { workspace = true, optional = true }
+
 [dependencies]
 es-core = { workspace = true }
 es-ir = { workspace = true }

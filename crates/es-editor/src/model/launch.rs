@@ -101,8 +101,26 @@ pub enum LaunchFlag {
 }
 
 impl LaunchField {
-    /// The flag as the CLI spells it. This is also the field's label: the panel says what it
-    /// is going to type, not a paraphrase of it.
+    /// Every field, whichever kind renders it. What the panel *shows* is
+    /// [`crate::model::labels::launch_label`], which is judged total over this
+    /// (packet M7/E6).
+    pub const ALL: [LaunchField; 11] = [
+        Self::Config,
+        Self::Policy,
+        Self::Scene,
+        Self::Out,
+        Self::Frames,
+        Self::Jobs,
+        Self::Telemetry,
+        Self::TelemetryToken,
+        Self::TelemetryImageEvery,
+        Self::Recipe,
+        Self::From,
+    ];
+
+    /// The flag as the CLI spells it. Once the field's label, now its hover: the panel says
+    /// what the field means and keeps the spelling it is going to type one hover away
+    /// (packet M7/E6).
     pub fn flag(self) -> &'static str {
         match self {
             Self::Config => "--config",
@@ -138,6 +156,9 @@ impl LaunchField {
 }
 
 impl LaunchFlag {
+    pub const ALL: [LaunchFlag; 3] =
+        [Self::DryRun, Self::AllowNewEvaluation, Self::SkipExpertGate];
+
     pub fn flag(self) -> &'static str {
         match self {
             Self::DryRun => "--dry-run",

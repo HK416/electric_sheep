@@ -1,0 +1,176 @@
+# 편집기가 보여 주는 모든 문구의 한국어판 (작업 패킷 M7/E6).
+#
+# `en.toml`과 키 집합이 정확히 같아야 하며, 어긋나면 `i18n_tables_are_complete_and_used`가
+# 실패한다. 파일 이름·해시·플래그 같은 기술 식별자는 번역하지 않고 그대로 둔다.
+#
+# `*.hint` 값은 마우스를 올렸을 때 나오는 설명이다. 원래 이름과 명세 절 번호가 나와도 되는
+# 곳은 여기뿐이다.
+
+# --- 위쪽 막대 ---------------------------------------------------------------------------
+"menu.file" = "파일"
+"menu.recent" = "최근 항목"
+"menu.recent_empty" = "아직 없습니다 - 무언가를 열거나 창에 끌어다 놓으세요."
+"open.hint" = "프로젝트 파일, 설정이 든 폴더, 또는 실행 결과"
+"open.open" = "열기"
+"open.open.hint" = "상자에 적힌 경로를 엽니다: .esb 묶음, 다섯 개의 .toml 문서가 든 폴더, 또는 report.json이 있는 실행 폴더 (spec 9.6, spec 14.3, spec 10.5)"
+"open.browse" = "찾아보기..."
+"open.browse_folder" = "폴더 고르기..."
+"open.no_dialog.hint" = "이 빌드에는 파일 선택 창이 없습니다. 경로를 직접 적거나 파일을 창에 끌어다 놓으세요"
+"lang.en" = "English"
+"lang.ko" = "한국어"
+"textsize.label" = "글자 크기"
+"textsize.s" = "작게"
+"textsize.m" = "보통"
+"textsize.l" = "크게"
+
+# --- 탭. 마우스를 올리면 원래 이름과 명세 절이 나온다. ------------------------------------
+"tab.design" = "설계"
+"tab.design.hint" = "Graph - 네 개의 IR을 층층이 쌓아 보여 줍니다 (spec 23.2, spec 23.4)"
+"tab.results" = "결과"
+"tab.results.hint" = "Run - 끝난 실행의 항목들과, 새 실행을 시작하는 패널 (spec 10.5, spec 23.1)"
+"tab.live" = "관찰"
+"tab.live.hint" = "Telemetry - 지금 돌고 있는 과정이 보내오는 값 (spec 23.3)"
+"tab.sees" = "정책이 보는 것"
+"tab.sees.hint" = "Images - 전처리 전후의 관측 화면 (spec 23.3, spec 7)"
+"tab.problems" = "문제"
+"tab.problems.hint" = "Diagnostics - IR이 지적하는 것들 (spec 11.1)"
+"tab.edit" = "고치기"
+"tab.edit.hint" = "편집 모드 - Task IR 위의 EditSession 하나 (spec 23.4 stage 2)"
+"edit.save" = "저장"
+"edit.undo" = "되돌리기"
+"edit.redo" = "다시 실행"
+"edit.add_node" = "블록 추가"
+
+# --- 아래쪽 상태 막대 ----------------------------------------------------------------------
+"status.nothing_open" = "아직 아무것도 열지 않았습니다."
+"status.messages" = "메시지 {}개 받음"
+"status.hash" = "{} 지문 {}"
+"status.diagnostics" = "문제 {}개"
+"status.edits" = "{}번 고침"
+"status.refused" = "거절됨: {} {}"
+"status.font_missing" = "이 컴퓨터에 한국어·일본어·중국어 글꼴이 없어 해당 글자가 네모로 보입니다. 찾아본 곳: {}. 데비안이나 우분투라면 fonts-noto-cjk를 설치하세요."
+
+# --- 첫 화면 ------------------------------------------------------------------------------
+"home.welcome" = "Electric Sheep"
+"home.subtitle" = "로봇에게 일을 가르치고, 무엇을 배웠는지 확인하세요."
+"home.open_project" = "프로젝트 파일 열기..."
+"home.open_project.hint" = ".esb 묶음, 또는 task.toml, observation.toml, learning.toml, deployment.toml, evaluation.toml이 든 폴더"
+"home.open_run" = "실행 결과 열기..."
+"home.open_run.hint" = "es eval run --out이 남긴 report.json이 있는 폴더 (spec 10.5)"
+"home.recent" = "최근 항목"
+"home.loop" = "작업은 이렇게 흘러갑니다"
+"home.step.design" = "무슨 일을 시킬지, 로봇이 무엇을 보고 느낄지, 무엇을 성공으로 칠지 적습니다."
+"home.step.collect" = "시범을 모읍니다. 로봇이 보고 배울 것이 있어야 합니다."
+"home.step.train" = "모은 것으로 정책을 학습시키고, 오차가 줄어드는지 지켜봅니다."
+"home.step.evaluate" = "학습한 정책을 합격 기준에 걸어 보고 판정을 읽습니다."
+"home.step.watch" = "실행되는 모습을 지켜보고, 잘못된 에피소드를 다시 돌려 봅니다."
+
+# --- 작업 흐름의 다섯 마디 -----------------------------------------------------------------
+"word.design" = "설계"
+"word.collect" = "수집"
+"word.train" = "학습"
+"word.evaluate" = "평가"
+"word.watch" = "관찰"
+
+# --- 블록 찾기 ----------------------------------------------------------------------------
+"find.label" = "찾기"
+"find.hint" = "블록 이름이나 연결 이름"
+"find.next" = "다음"
+
+# --- 결과 탭 ------------------------------------------------------------------------------
+"results.empty" = "아직 보여 줄 것이 없습니다. 설계 탭의 첫 화면에서 실행 결과를 열거나, 위의 시작을 눌러 새로 실행하세요."
+"column.cell" = "항목"
+"column.suite" = "묶음"
+"column.seed" = "난수 씨앗"
+"column.traj" = "움직임 기록"
+"column.frames" = "사진"
+"results.passed" = "합격"
+"results.failed" = "불합격"
+"results.acceptance.hint" = "Evaluation IR의 합격 기준. 지표마다 기준값과 견줍니다 (spec 10.2)"
+"results.pass" = "통과"
+"results.fail" = "실패"
+"results.not_measured" = "재지 않음"
+"results.select_cell" = "위에서 항목을 고르면 안전 기록과 사진을 볼 수 있습니다."
+"results.frames" = "사진"
+"results.no_image" = "보내오는 화면이 없습니다. --telemetry-image-every로 사진을 보내 달라고 하세요."
+"results.no_events" = "이 실행은 걸음마다의 기록을 남기지 않았습니다."
+"value.histogram" = "원인 {}가지"
+"value.not_measured" = "재지 않음"
+"value.none" = "--"
+
+# --- 지표. 쉬운 이름을 쓰고, 원래 이름은 마우스를 올리면 나온다. ----------------------------
+"metric.success_rate" = "성공률"
+"metric.intervention_rate" = "사람이 넘겨받은 비율"
+"metric.collision_rate" = "충돌 비율"
+"metric.envelope_violation_rate" = "안전 한계 위반"
+"metric.action_smoothness" = "움직임의 매끄러움"
+"metric.episode_length" = "에피소드 길이"
+"metric.failure_mode_histogram" = "실패 원인"
+"metric.domain_gap" = "실제와의 차이"
+"metric.chunk_underrun_rate" = "동작이 끊긴 비율"
+"metric.end_to_end_latency_p50" = "반응 시간 (보통)"
+"metric.end_to_end_latency_p95" = "반응 시간 (느린 5%)"
+"metric.physics_steps_per_sec" = "물리 계산 속도"
+"metric.camera_frames_per_sec" = "카메라 속도"
+"metric.pixels_per_sec" = "픽셀 처리량"
+"metric.observation_gb_per_sec" = "센서 데이터 처리량"
+"metric.policy_inferences_per_sec" = "정책 추론 속도"
+"metric.actions_per_sec" = "동작 출력 속도"
+"metric.gpu_memory_peak" = "GPU 메모리 최대 사용량"
+
+# --- 시작 패널. 마우스를 올리면 실제로 넘어가는 플래그가 나온다. ----------------------------
+"launch.kind.eval" = "평가하기"
+"launch.kind.train" = "학습하기"
+"launch.kind.cycle" = "전체 흐름"
+"launch.start" = "시작"
+"launch.stop" = "중지"
+"launch.command" = "이렇게 실행됩니다"
+"launch.config" = "평가 설정"
+"launch.policy" = "정책 파일"
+"launch.scene" = "장면 파일"
+"launch.out" = "결과 폴더"
+"launch.frames" = "사진도 저장할 폴더"
+"launch.jobs" = "동시에 돌릴 개수"
+"launch.telemetry" = "실시간으로 볼 주소"
+"launch.telemetry_token" = "관찰 암호"
+"launch.telemetry_image_every" = "사진 보내는 간격"
+"launch.recipe" = "학습 설정"
+"launch.from" = "시작할 단계"
+"launch.dry_run" = "실행하지 말고 점검만"
+"launch.allow_new_evaluation" = "새 평가 기준 허용"
+"launch.skip_expert_gate" = "전문가 점검 건너뛰기"
+
+# --- 다시 보기 패널 -------------------------------------------------------------------------
+"replay.scene" = "장면"
+"replay.scene.hint" = "이 실행이 쓴 장면 파일: .xml (MJCF) 또는 .urdf"
+"replay.frames" = "사진"
+"replay.frames.hint" = "es eval run --frames가 저장한 곳. 기본값은 <run>/frames"
+"replay.replay" = "다시 보기"
+"replay.play" = "재생"
+"replay.pause" = "멈춤"
+"replay.empty" = "움직임을 저장한 항목을 고르고 장면 파일을 적은 뒤 다시 보기를 누르세요."
+
+# --- 관찰 탭 --------------------------------------------------------------------------------
+"live.attach" = "지켜보기"
+"live.attach.hint" = "실행이 값을 내보내는 주소: es eval run --telemetry 127.0.0.1:7777 (spec 23.3, spec 25.1)"
+"live.token" = "암호 (없어도 됨)"
+"live.connect" = "연결"
+"live.performance" = "속도"
+"live.performance.hint" = "아홉 가지 성능 지표. step/s 한 숫자로는 절대 말하지 않습니다 (spec 12.4)"
+"live.streams" = "신호"
+"live.events" = "사건"
+"live.empty" = "연결된 것이 없습니다. 실행이 값을 내보내는 주소를 적고 연결을 누르거나, 결과 탭에서 시작을 누르세요."
+
+# --- 정책이 보는 것 --------------------------------------------------------------------------
+"sees.empty" = "프로젝트 파일을 열면 로봇의 카메라가 정책에 무엇을 건네는지 보여 줍니다."
+"sees.count" = "사진인 출력이 {}개입니다 (전체 {}개)"
+"sees.before" = "카메라가 본 그대로"
+"sees.after" = "정책이 받는 모습"
+
+# --- 문제 ------------------------------------------------------------------------------------
+"problems.empty" = "프로젝트 파일을 열면 곧바로 검사합니다."
+"problems.none" = "이상 없습니다. 모든 부분이 맞고 서로 어긋나지도 않습니다."
+
+# --- 설정 패널 --------------------------------------------------------------------------------
+"inspector.title" = "설정"
+"inspector.empty" = "블록을 고르면 그 설정을 바꿀 수 있습니다."
