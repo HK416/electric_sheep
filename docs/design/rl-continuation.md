@@ -754,6 +754,74 @@ packet bought is not a better policy, it is the elimination of an explanation: t
 structural in the action space, not an artefact of a badly chosen exploration σ, and the next
 thing to move is the estimator, the envelope or the head — not the recipe.
 
+### T3 — the increment space beside the absolute one, oracle server (Linux, 16-core CPU), 2026-09-22 UTC
+
+Artifacts: `~/artifacts/plan-t/t3/` (`delta-scratch-seed{0,1,2}/`, `delta-continued-seed{0,1,2}/`,
+`import-before/`, `imported/`, `neutral-folded/`, `recipes/`, `logs/`). Documents: the delta trio
+`tests/fixtures/rl/{task,observation,evaluation}-reach-delta.toml` (task-reach with
+`ActionSpec.space = JointDelta`, the other two following the moved `task_hash`), `learning-reach-delta.toml`
+(the 64×64 relu graph with its action port in `AngularVelocity` and `Normalizer{Inverse}` 0 / 0.05 rad
+per tick), `deployment-reach-delta.toml` (T1), recipes `training-reach-delta.toml` and
+`training-reach-delta-continued.toml` (A0's `[rl]` values with `init_log_std = ln(0.02) = −3.912`, a unit
+conversion — σ = 0.02 rad per tick = 0.4 × `delta_scale` — not a new knob). The imported delta policy is
+T2's `~/artifacts/plan-t/t2/seed0-run1/` re-imported against this task with brax's normalizer folded
+into the first Dense, as S4c did. Written by the orchestrator from the artifacts after the agent
+running the packet was cut off by API outages; every number below is read from `report.json` /
+`metrics/loss-curve.json` on the server.
+
+**Held-out `success_rate`, `nominal`, 16 seeds (201–216), mean and per seed.** The absolute rows are
+quoted (S4e seed 0; S4c `scratch64` seeds 1–2 at 4,000); the absolute 10,000 mark for seeds 1–2 was
+aborted on the server and is `Target / Status: unverified`.
+
+| row | at 4,000 | at 10,000 | nominal `envelope_violation_rate` (eval) | `episode_length` at 4,000 |
+|---|---|---|---|---|
+| absolute A0 (`training-reach.toml`) | **0.4167** (0.5625 / 0.3125 / 0.3750) | 0.3125 (seed 0) | 1.00 | 143.4 |
+| delta, from scratch | 0.1042 (0.0 / 0.0 / 0.3125) | 0.0833 (0.0 / 0.25 / 0.0) | 0.880 / 0.995 / 0.993 | 183.8 |
+| delta, imported, before training | 0.0 | — | 0.845 | 200.0 |
+| delta, `[init]` = the import | 0.0 (0.0 / 0.0 / 0.0) | 0.0 (0.0 / 0.0 / 0.0) | 0.845 | 200.0 |
+
+**Rollout statistics** (`metrics/loss-curve.json`, iterations 1 / 4,000 / 10,000):
+
+| run | `executed_ne_sampled_rate` | `envelope_violation_rate` | entropy | `return` |
+|---|---|---|---|---|
+| delta-scratch seed 0 | 0.994 / 1.00 / 1.00 | 0.801 / 0.997 / 1.00 | −14.95 / −14.07 / −6.92 | −15.73 / −9.33 / −5.89 |
+| delta-scratch seed 1 | 0.992 / 1.00 / 1.00 | 0.771 / 0.998 / 1.00 | −14.96 / −13.51 / −9.26 | −14.31 / −4.76 / −6.92 |
+| delta-scratch seed 2 | 0.992 / 1.00 / 1.00 | 0.783 / 0.996 / 1.00 | −14.96 / −14.00 / −9.66 | −11.79 / −6.32 / −5.22 |
+| delta-continued seed 0 | 1.00 / 1.00 / 1.00 | 0.969 / 1.00 / 1.00 | −14.95 / −8.81 / −2.85 | −8.38 / −11.12 / −9.46 |
+| delta-continued seed 1 | 1.00 / 1.00 / 1.00 | 0.981 / 1.00 / 1.00 | −14.95 / −8.82 / −2.65 | −8.80 / −11.77 / −8.85 |
+| delta-continued seed 2 | 1.00 / 1.00 / 1.00 | 0.973 / 1.00 / 1.00 | −14.96 / −7.26 / +1.12 | −8.53 / −17.04 / −10.21 |
+
+**`es eval compare` absolute seed 0 vs delta-scratch seed 0, both at 4,000** (`nominal`): `success_rate`
+0.5625 → 0.0 (−0.5625), `envelope_violation_rate` 1.00 → 0.880, `episode_length` 129.4 → 200.0; every
+perturbed suite the same direction; both `passed = false`. Failure histograms, `nominal`, at 4,000:
+
+| policy | `violation.position` | `violation.velocity` | `violation.acceleration` | success |
+|---|---|---|---|---|
+| absolute A0 seed 0 | 2,053 | 2,055 | 1,882 | 9 |
+| delta-scratch seed 2 | 2,303 | 0 | 984 | 5 |
+| delta import, before training | 2,672 | 0 | 79 | 0 |
+| delta-continued seed 0 | 2,672 | 0 | 80 | 0 |
+
+**What it says.** The increment space did what §8.5 promised on the rate bounds — `violation.velocity`
+is zero everywhere, the 0.05 rad increments never exceed `velocity_max`·dt — and it did not lower the
+clamp rate, because the clamp moved to the **position soft envelope**. The integrator seeds every tick
+from the plane's executed target (§8.5, "integrate from the executed value, never the raw row"), so a
+policy that pushes into a soft position limit is pushed back and pushes again on the next tick: a
+permanent `violation.position`, zero net motion, and a constant action → reward pairing PPO cannot learn
+from. From scratch that is 0.10 at 4,000 against the absolute space's 0.42 (three seeds each); the
+imported delta policy is M8's S-5 again — trained in the derived scene where the table has no contact,
+it drives the gripper into the workspace our envelope forbids — and continuation from it stays at 0.0
+while its entropy climbs (−14.9 → −2.8) with nothing learning. **The sentence the M9 review needs:**
+the tables give no reason to make the increment §13.4's default action space for RL; the increment
+stays what §8.5 made it (an addition the importer needs for real relative-action policies), and the
+lever both campaigns point at is the envelope's meaning for a learning policy — the position soft
+margin for this task, the executed-action estimator, or an increment integrated over the *measured*
+joint — each a Deployment IR / spec decision (INV-12: widen, never disable), not a trainer change.
+Wall-clocks: two to three trainings concurrent, ≈ 30 min per 10,000-iteration run; the nine §12.4
+metrics as `Rollout.metrics()` reports them are in each run's `metrics/env-metrics.json`, the rest
+`Target / Status: unverified`. Not measured here: the first-iteration actor gradient norm (S-13's
+detector does not exist yet).
+
 ## 8. The importer and the adapter
 
 Rule 3 of section 1 says the adapter declares and code never guesses. This is what that comes

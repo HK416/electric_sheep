@@ -16,9 +16,12 @@ sensor declares `render = { path = "pt", … }`; absent = default = today's hash
 decision (yes/yes) shipped the `(cell, episode)` partition (2× evaluation, nothing moved); `es policy import-rl` brings a brax/rsl_rl/rl_games
 PPO actor into a bundle (bitwise / 9.7e-7); `[init] policy` + `init.lock`; `[rl]` PPO through `es_native.Rollout` with the Safety Plane on,
 bitwise on the CPU backend; the reach task trains from scratch to 0.42 (three seeds) but the imported brax policy scores 0.00 here and
-continuation cannot move it (saturated tanh, zero gradient). The next campaign waits on the human decisions in `docs/reviews/M8.md`
-(the plane in RL rollouts, the worker thread pool in `execution_hash`, `scene_hash` across platforms, where the next source policy is trained)
-and the older ones in `docs/reviews/M7.md` (the stop rule's reading, the SSIM threshold). M6 (quadruped, `docs/design/quadruped-track.md`) is parked pending the owner's decision. GPU paths (es-gpu, es-render, Observation
+continuation cannot move it (saturated tanh, zero gradient). **M9 plan T** (spec §28.12, `docs/packets/M9/`) closed 2026-09-22: `es-ir` split under the line target; `ActionSpace::JointDelta` with one
+`es-env` integrator and the plane untouched; a brax increment policy imported bitwise; measured, the increment space clamps as much as the
+absolute one (on the position envelope instead of the rate bounds) and learns less (0.10 vs 0.42 at 4,000 iterations), so §13.4's default stays
+`JointPosition`. The next campaign waits on the human decisions in `docs/reviews/M9.md` (the envelope's meaning for a learning policy, the
+buffered-path watchdog for delta policies) and `docs/reviews/M8.md` (the worker thread pool in `execution_hash`, `scene_hash` across
+platforms, where the next source policy is trained), and the older ones in `docs/reviews/M7.md` (the stop rule's reading, the SSIM threshold). M6 (quadruped, `docs/design/quadruped-track.md`) is parked pending the owner's decision. GPU paths (es-gpu, es-render, Observation
 IR GPU lowering, MJWarp/Newton adapters) were verified on an RTX 4060 with the Vulkan SDK;
 the Python oracles (MuJoCo, PyTorch, LeRobot ACT checkpoint, diffusers) run from the project
 venv `.venv` (set `ES_PYTHON` to its interpreter). Still open: M3 W1 real-robot

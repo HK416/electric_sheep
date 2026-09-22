@@ -4597,6 +4597,16 @@ one parameter not behind the squash. The demo's own conclusion (section 7.29) is
 this; what it adds is that the reach task's acceptance is not met by either route yet, and that
 the smallest graph is still the best of the three at this budget.
 
+### 7.35 As built (M9/T3): the increment space beside the absolute one
+
+Plan T (§28.12) asked whether PPO in a `JointDelta` action space clamps less and learns more than
+in the absolute space. Measured (`docs/design/rl-continuation.md` section 7, "T3"): held-out reach
+`success_rate` at 4,000 iterations, three seeds — absolute **0.4167**, increment from scratch
+**0.1042**, the imported brax increment policy **0.0** before and after continuation. The increment
+removed every `violation.velocity` and moved the clamp to `violation.position`: the integrated target
+sits against the soft position envelope and is clamped on every tick. No change to §13.4's default
+action space; the open lever is the envelope's meaning for a learning policy (M9 review S-7).
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:

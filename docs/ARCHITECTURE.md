@@ -3102,6 +3102,19 @@ incremental-mode row next to its best absolute-mode row. (4) No new trait (INV-1
 (`es-usd`) and the contact-set question (M8 S-5) remain, for the next campaign. `EeDelta`'s IK is not in this section —
 `JointDelta` comes first, and the EE space is separate, alongside §8.5's `EePose`.
 
+**M9 result (2026-09-22, `docs/reviews/M9.md`).** Every row of the ladder closed. R1: moving `init_log_std`, the entropy coefficient
+and the schedule one at a time leaves the clamp rate at 1.00 (8 unclamped rows in 10.24 M) — an absolute-target policy steps outside
+the plane's rate bounds whatever the noise around it. R6: `graph` and `hash` moved down to `es-ir-types`, `es-ir` 6,148 → 5,755 lines,
+no caller changed, no hash moved. T1: `JointDelta` and one `es-env` integrator (state = the plane's `last_safe_action`), `es-safety`
+diff empty, demo trajectories bit-identical, `Rollout` with increments ≡ the absolute integration bitwise. T2: a brax increment policy
+at 1.00 (derived scene), bitwise across two runs, imported bitwise / 3.3e-7 against JAX. **T3**: the increment space from scratch
+held-out **0.104** (three seeds) against the absolute space's **0.417**; the imported increment policy **0.0** before and after
+continuation; the clamp rate still 1.00 — velocity violations gone, the **position soft envelope** now clamps every tick (the integrated
+target sits against a limit, is pushed back and pushes again). §13.4's default RL action space stays `JointPosition`; the increment
+remains what §8.5 made it, an addition the importer needs. What the two campaigns point at together is **the envelope's meaning for a
+policy that is still learning** (M9 S-7): the position soft margin for this task, an estimator trained on the executed action, or an
+increment integrated over the measured joint — each a Deployment IR / spec sentence and the owner's decision (INV-12: widen, never disable).
+
 ---
 
 ## 29. Risks

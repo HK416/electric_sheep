@@ -721,6 +721,76 @@ rad으로 묶는다(`action_rate.first_diff_max = 0.08` rad은 둘 중 느슨한
 공간에 구조적으로 박힌 것이고, 다음에 움직일 것은 레시피가 아니라 추정량, 엔벨로프, 또는
 헤드다.
 
+### T3 — 절대 공간 곁의 증분 공간, 오라클 서버(Linux, 16코어 CPU), 2026-09-22 UTC
+
+산출물: `~/artifacts/plan-t/t3/` (`delta-scratch-seed{0,1,2}/`, `delta-continued-seed{0,1,2}/`,
+`import-before/`, `imported/`, `neutral-folded/`, `recipes/`, `logs/`). 문서: 델타 삼종
+`tests/fixtures/rl/{task,observation,evaluation}-reach-delta.toml`(task-reach에
+`ActionSpec.space = JointDelta`를 얹은 것, 나머지 둘은 옮겨간 `task_hash`를 따른다),
+`learning-reach-delta.toml`(64×64 relu 그래프, 행동 포트는 `AngularVelocity`이고
+`Normalizer{Inverse}`는 틱당 0 / 0.05 rad), `deployment-reach-delta.toml`(T1), 레시피
+`training-reach-delta.toml`과 `training-reach-delta-continued.toml`(A0의 `[rl]` 값에
+`init_log_std = ln(0.02) = −3.912`만 더한 것 — 단위 변환일 뿐이다 — σ = 틱당 0.02 rad =
+0.4 × `delta_scale`이고 새 손잡이가 아니다). 임포트된 델타 정책은 T2의
+`~/artifacts/plan-t/t2/seed0-run1/`을 이 작업에 대해 다시 임포트한 것이며, S4c가 했던 대로
+brax의 정규화기를 첫 Dense에 접어 넣었다. 패킷을 실행하던 에이전트가 API 장애로 끊긴 뒤,
+오케스트레이터가 산출물로부터 이 절을 썼다; 아래 모든 수치는 서버의 `report.json` /
+`metrics/loss-curve.json`에서 읽은 것이다.
+
+**홀드아웃 `success_rate`, `nominal`, 시드 201–216 16개, 평균과 시드별.** 절대 공간 행들은
+인용이다(S4e 시드 0; S4c `scratch64` 시드 1–2, 4,000에서); 시드 1–2의 절대 공간 10,000 지점은
+서버에서 중단되어 `Target / Status: unverified`다.
+
+| 행 | 4,000에서 | 10,000에서 | nominal `envelope_violation_rate`(평가) | 4,000에서 `episode_length` |
+|---|---|---|---|---|
+| 절대 A0(`training-reach.toml`) | **0.4167** (0.5625 / 0.3125 / 0.3750) | 0.3125 (시드 0) | 1.00 | 143.4 |
+| 델타, from scratch | 0.1042 (0.0 / 0.0 / 0.3125) | 0.0833 (0.0 / 0.25 / 0.0) | 0.880 / 0.995 / 0.993 | 183.8 |
+| 델타, imported, 학습 전 | 0.0 | — | 0.845 | 200.0 |
+| 델타, `[init]` = 임포트 | 0.0 (0.0 / 0.0 / 0.0) | 0.0 (0.0 / 0.0 / 0.0) | 0.845 | 200.0 |
+
+**롤아웃 통계**(`metrics/loss-curve.json`, 반복 1 / 4,000 / 10,000):
+
+| 실행 | `executed_ne_sampled_rate` | `envelope_violation_rate` | 엔트로피 | `return` |
+|---|---|---|---|---|
+| delta-scratch 시드 0 | 0.994 / 1.00 / 1.00 | 0.801 / 0.997 / 1.00 | −14.95 / −14.07 / −6.92 | −15.73 / −9.33 / −5.89 |
+| delta-scratch 시드 1 | 0.992 / 1.00 / 1.00 | 0.771 / 0.998 / 1.00 | −14.96 / −13.51 / −9.26 | −14.31 / −4.76 / −6.92 |
+| delta-scratch 시드 2 | 0.992 / 1.00 / 1.00 | 0.783 / 0.996 / 1.00 | −14.96 / −14.00 / −9.66 | −11.79 / −6.32 / −5.22 |
+| delta-continued 시드 0 | 1.00 / 1.00 / 1.00 | 0.969 / 1.00 / 1.00 | −14.95 / −8.81 / −2.85 | −8.38 / −11.12 / −9.46 |
+| delta-continued 시드 1 | 1.00 / 1.00 / 1.00 | 0.981 / 1.00 / 1.00 | −14.95 / −8.82 / −2.65 | −8.80 / −11.77 / −8.85 |
+| delta-continued 시드 2 | 1.00 / 1.00 / 1.00 | 0.973 / 1.00 / 1.00 | −14.96 / −7.26 / +1.12 | −8.53 / −17.04 / −10.21 |
+
+**`es eval compare` 절대 시드 0 대 delta-scratch 시드 0, 둘 다 4,000에서**(`nominal`):
+`success_rate` 0.5625 → 0.0(−0.5625), `envelope_violation_rate` 1.00 → 0.880, `episode_length`
+129.4 → 200.0; 교란 스위트 전부 같은 방향; 둘 다 `passed = false`. 실패 히스토그램, `nominal`,
+4,000에서:
+
+| 정책 | `violation.position` | `violation.velocity` | `violation.acceleration` | 성공 |
+|---|---|---|---|---|
+| 절대 A0 시드 0 | 2,053 | 2,055 | 1,882 | 9 |
+| delta-scratch 시드 2 | 2,303 | 0 | 984 | 5 |
+| delta import, 학습 전 | 2,672 | 0 | 79 | 0 |
+| delta-continued 시드 0 | 2,672 | 0 | 80 | 0 |
+
+**이것이 말하는 것.** 증분 공간은 속도 상한에 대해 §8.5가 약속한 일을 해냈다 —
+`violation.velocity`는 어디서나 0이고, 0.05 rad 증분은 `velocity_max`·dt를 결코 넘지 않는다 —
+그러나 클램프 비율은 낮추지 못했는데, 클램프가 **위치 soft 엔벌로프**로 옮겨 갔기 때문이다.
+적분기는 매 틱을 플레인의 실행된 목표에서 시작하므로(§8.5, "실행된 값에서 적분하라, 원시
+행에서가 아니라"), soft 위치 한계로 밀고 들어가는 정책은 되밀리고 다음 틱에 다시 밀어붙인다:
+영구적인 `violation.position`, 순 이동량 0, 그리고 PPO가 배울 수 없는 상수 행동 → 보상
+짝이다. From scratch는 4,000에서 0.10으로 절대 공간의 0.42(각각 시드 세 개)에 맞서고 있다;
+임포트된 델타 정책은 다시 M8의 S-5다 — 테이블에 접촉이 없는 파생 씬에서 학습되었으므로 우리
+엔벌로프가 금지하는 작업공간으로 그리퍼를 몰아넣는다 — 그리고 거기서 이어지는 학습은 0.0에
+머무르고, 그동안 엔트로피는 오르지만(−14.9 → −2.8) 아무것도 배우지 않는다. **M9 리뷰가
+필요로 하는 문장:** 이 표들은 증분을 §13.4의 RL 기본 행동 공간으로 삼을 이유를 주지 않는다;
+증분은 §8.5가 만들어 둔 그대로 남고(임포터가 진짜 상대-행동 정책을 위해 필요로 하는 추가물),
+두 캠페인이 함께 가리키는 지렛대는 학습 정책에 대한 엔벌로프의 의미다 — 이 작업의 위치
+soft margin, 실행된-행동 추정량, 또는 *측정된* 관절에 대해 적분된 증분 — 이 각각은
+Deployment IR / 스펙 결정이지(INV-12: 넓히기만 하고 결코 끄지 않는다) 트레이너 변경이
+아니다. 벽시계: 두세 개 학습이 동시에 돌았고, 10,000 반복 실행당 대략 30분; `Rollout.metrics()`가
+보고하는 §12.4 아홉 지표는 각 실행의 `metrics/env-metrics.json`에 있고, 나머지는
+`Target / Status: unverified`다. 여기서 측정되지 않은 것: 첫 반복의 액터 그래디언트
+노름(S-13의 탐지기는 아직 존재하지 않는다).
+
 ## 8. 임포터와 어댑터
 
 1절의 규칙 3은 어댑터가 선언하고 코드는 결코 추측하지 않는다고 말한다. `es policy import-rl`의
