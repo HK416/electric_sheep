@@ -1,5 +1,9 @@
 # RoboVerse / MetaSim task config — shape and provenance
 
+Where the code lives: since packet `docs/packets/M10/W3a-es-import-split.md` the converter is
+`crates/es-import/src/roboverse.rs` (crate `es-import`, layer 9, spec §4.2); `es-data` re-exports
+it as `es_data::roboverse`, so both paths name the same module.
+
 **Pinned version: NONE.** No `metasim` / `roboverse_pack` package is installed in this
 workspace; nothing here was read from a running MetaSim. Fields below are marked `verified
 (fetched)` when they came from `https://roboverse.wiki/metasim/concept/config.html` on
@@ -8,10 +12,10 @@ directly reachable — GitHub raw/blob URLs for `metasim/cfg/scenario.py` 404'd)
 `unverified` otherwise (reconstructed from the RoboVerse README, arXiv:2504.18904's abstract,
 and spec §0.3/§14.4's one-line description: "simulator-agnostic config, 276 tasks"). A human
 must pin a `roboverse_pack`/`metasim` version and correct this file — and
-`crates/es-data/src/roboverse.rs` if the shape differs — before anything here is ground truth
+`crates/es-import/src/roboverse.rs` if the shape differs — before anything here is ground truth
 (spec §1.7).
 
-`crates/es-data/src/roboverse.rs` accepts **JSON only**, not MetaSim's native Python
+`crates/es-import/src/roboverse.rs` accepts **JSON only**, not MetaSim's native Python
 `ScenarioCfg`/`TaskCfg` dataclasses and not YAML. A human (or a thin Python script, one call
 to `dataclasses.asdict` + `json.dump`) exports the scenario/task config to JSON before this
 converter sees it; that step is out of scope here and is not implemented in this crate

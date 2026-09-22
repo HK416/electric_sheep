@@ -1,4 +1,4 @@
-//! Oracle 2 of packet M8/S2b: the five named refusals of `es_data::rl_import`.
+//! Oracle 2 of packet M8/S2b: the five named refusals of `es_import::rl_import`.
 //!
 //! Spec 13.4's rule is that the import never guesses, and the falsifiable form of that is this
 //! file: five ways an adapter can disagree with the Task IR it targets, five `IMP-0xx` codes,
@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use es_data::rl_import::{convert, Adapter, ImportManifest};
+use es_import::rl_import::{convert, Adapter, ImportManifest};
 use es_ir::serial::{deployment_from_toml, task_from_toml};
 
 fn fixture(name: &str) -> PathBuf {

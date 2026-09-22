@@ -44,30 +44,71 @@ impl Status {
     }
 }
 
-/// Net `{`/`}` on a line, ignoring braces inside `"..."` string literals and
-/// after a `//` line comment marker. Not a full lexer (raw strings, block
-/// comments, and char-literal braces aren't special-cased) but good enough to
-/// find the end of an inline test module.
-fn brace_delta(line: &str) -> i32 {
+/// String-literal state carried from one line to the next: a `"..."` literal
+/// continued with a trailing `\`, or a raw string `r"…"` / `r#"…"#` (any hash
+/// count) whose body spans lines. Both are common in test fixtures (TOML, JSON)
+/// and both hold braces.
+#[derive(Default)]
+struct Lex {
+    in_string: bool,
+    /// `Some(n)`: inside a raw string opened with `n` hashes.
+    raw: Option<usize>,
+}
+
+/// Net `{`/`}` on a line, ignoring braces inside string literals (see [`Lex`]),
+/// inside single-char literals (`'{'`, `'"'`) and after a `//` line comment
+/// marker. Not a full lexer (block comments, escaped char literals such as
+/// `'\"'`, and `br"…"` aren't special-cased) but good enough to find the end of
+/// an inline test module.
+fn brace_delta(line: &str, lex: &mut Lex) -> i32 {
     let mut delta = 0i32;
-    let mut in_string = false;
+    let mut prev = ' ';
     let mut chars = line.chars().peekable();
     while let Some(c) = chars.next() {
-        if in_string {
+        if let Some(hashes) = lex.raw {
+            if c == '"' {
+                let mut n = 0;
+                while n < hashes && chars.next_if_eq(&'#').is_some() {
+                    n += 1;
+                }
+                if n == hashes {
+                    lex.raw = None;
+                }
+            }
+            continue;
+        }
+        if lex.in_string {
             if c == '\\' {
                 chars.next();
             } else if c == '"' {
-                in_string = false;
+                lex.in_string = false;
             }
             continue;
         }
         match c {
             '/' if chars.peek() == Some(&'/') => break,
-            '"' => in_string = true,
+            '"' => lex.in_string = true,
+            '\'' => {
+                // `'x'` is a char literal; `'a` (no closing quote) is a lifetime.
+                let mut look = chars.clone();
+                if look.next().is_some() && look.next() == Some('\'') {
+                    chars = look;
+                }
+            }
+            'r' if !(prev.is_alphanumeric() || prev == '_') => {
+                let mut n = 0;
+                while chars.next_if_eq(&'#').is_some() {
+                    n += 1;
+                }
+                if chars.next_if_eq(&'"').is_some() {
+                    lex.raw = Some(n);
+                }
+            }
             '{' => delta += 1,
             '}' => delta -= 1,
             _ => {}
         }
+        prev = c;
     }
     delta
 }
@@ -102,9 +143,10 @@ fn count_file(text: &str) -> (usize, usize) {
             if j < lines.len() && MOD_OPEN.is_match(lines[j].trim()) {
                 let mut depth = 0i32;
                 let mut seen_open = false;
+                let mut lex = Lex::default();
                 let mut k = j;
                 while k < lines.len() {
-                    let d = brace_delta(lines[k]);
+                    let d = brace_delta(lines[k], &mut lex);
                     depth += d;
                     seen_open |= depth > 0;
                     k += 1;
@@ -265,6 +307,36 @@ mod tests {
 
 fn after() {}
 "#;
+        let (code, total) = count_file(src);
+        assert_eq!(code, 1); // only `fn after() {}`
+        assert_eq!(total, 3); // the two surrounding blank lines still count
+    }
+
+    /// Three fixture shapes that each used to end the module early or late: a raw string
+    /// spanning lines with unbalanced braces in its body (its inner `"` must not close it —
+    /// only `"#` does), a `"..."` literal continued with a trailing `\` whose next line holds
+    /// a `}` (`crates/es-data/src/training.rs`'s shape), and a `'}'` char literal.
+    #[test]
+    fn multi_line_strings_and_char_literals_do_not_confuse_brace_matching() {
+        let src = r##"
+#[cfg(test)]
+mod tests {
+    const IR: &str = r#"
+[task]
+sensor = { name = "cam", render = { path = "pt" }
+"#;
+
+    #[test]
+    fn it_works() {
+        let both = "lerobot = { type = \"act\", \
+                    n_action_steps = 1 }";
+        let close = '}';
+        assert!(IR.contains("path") && both.ends_with(close));
+    }
+}
+
+fn after() {}
+"##;
         let (code, total) = count_file(src);
         assert_eq!(code, 1); // only `fn after() {}`
         assert_eq!(total, 3); // the two surrounding blank lines still count

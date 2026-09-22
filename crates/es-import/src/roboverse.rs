@@ -2,7 +2,7 @@
 //! conversion, spec §0.3 "`RoboVerse` / `MetaSim`: simulator-agnostic config, 276 tasks", spec §6
 //! Task IR, spec §7.4 Observation IR declaration link, spec §25.2 derivative-work provenance).
 //!
-//! Mirrors `crates/es-data/src/lerobot_config.rs`'s shape: a plain serde config type, a
+//! Mirrors `crates/es-import/src/lerobot_config.rs`'s shape: a plain serde config type, a
 //! `convert` entry point that never panics on an unmapped feature, and every guess this crate
 //! makes written down in `docs/api-notes/roboverse.md` rather than assumed silently. Accepts
 //! **JSON only** — `MetaSim`'s native config is a Python `ScenarioCfg`/`TaskCfg` dataclass pair;

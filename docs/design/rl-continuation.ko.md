@@ -1,5 +1,9 @@
 # 가져온 정책의 강화학습 이어하기 (plan S, §13.4, §14.4, §28.11)
 
+코드 위치: 패킷 `docs/packets/M10/W3a-es-import-split.md` 이후 가져오기 모듈은
+`crates/es-import/src/rl_import.rs`(crate `es-import`, layer 9, spec §4.2)에 있다; `es-data`가
+이를 `es_data::rl_import`로 재수출하므로 두 경로는 같은 모듈을 가리킨다.
+
 M8 캠페인을 위한 설계 노트. 스펙 절: §13.4(트레이너의 의미론), §14.4(가져오기), §28.11(사다리),
 §8.3/§8.9(노드와 동등성 계층), §9.4(플레인은 롤아웃 중에도 켜져 있다), §19.3(`training/` 슬롯),
 §12.4(아홉 개 지표). 패킷: `docs/packets/M8/S*.md`. 한국어 자매 문서: `rl-continuation.ko.md`.
@@ -434,7 +438,7 @@ ERROR XIR-040  evaluation references a different Task or Observation IR
   난다 — 계층 (b)의 1e-5 허용오차보다 크고, 이유는 섹션 4가 이미 말한 것이다: 큐브의 z 채널은
   `obs_std`가 1.79e-4여서 `1/std`가 약 5,600이고 f32 반올림도 함께 증폭된다. 이것은 측정을 위한
   고쳐 쓰기이지 동치성 주장이 아니다;
-* 증폭 자체는 아무것도 바뀌지 않는다. `crates/es-data/src/rl_import.rs`는 `MeanStd` 정규화기가
+* 증폭 자체는 아무것도 바뀌지 않는다. `crates/es-import/src/rl_import.rs`는 `MeanStd` 정규화기가
   "그 스케일을 벗어난 것을 1/std로 증폭한다"고 경고한다. 접든 접지 않든 같은 곱이 같은 `tanh`에
   도달하며 — 그것이 바로 이어붙인 행들이 곧 부딪히는 것이다.
 
@@ -808,7 +812,7 @@ Deployment IR / 스펙 결정이지(INV-12: 넓히기만 하고 결코 끄지 �
 읽는다. 우리 그래프는 같은 네트워크를 한 층 앞에서 자른다. `StateEncoder{Mlp}`는 마지막 *은닉*
 층에서 끝나며 — 그 층은 활성화되므로 S2a의 파라미터 `activate_output = true`를 나른다 —
 `PolicyHead{Regression}`이 출력 Dense이고 그 뒤에 소스의 `squash`가 온다. 같은 함수, 다른
-절단면이다. `crates/es-data/src/rl_import.rs::learning_graph`가 그 일을 하는 곳이고 그렇게
+절단면이다. `crates/es-import/src/rl_import.rs::learning_graph`가 그 일을 하는 곳이고 그렇게
 말한다.
 
 **어댑터 문서**(`tests/fixtures/rl/adapter-so101.toml`)는 체크포인트가 우리 로봇에 대해 알 수

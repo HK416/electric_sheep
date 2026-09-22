@@ -4,7 +4,7 @@
 //! Each converted Task IR / Observation IR pair must validate on its own and must agree on
 //! the Task <-> Observation boundary of `es_ir::cross::check` (spec §7.4). `cross::check`
 //! takes a full five-IR `IrBundle`, so this file closes the loop with a deliberately trivial
-//! Learning IR / Deployment IR (mirrors `crates/es-data/tests/lerobot_config.rs`'s
+//! Learning IR / Deployment IR (mirrors `crates/es-import/tests/lerobot_config.rs`'s
 //! `task_and_deployment` helper) — only the Task <-> Observation boundary (`XIR-001`,
 //! `XIR-002`) is asserted clean; the other boundaries are free to disagree with these
 //! placeholders.
@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 
 use es_core::time::TickRate;
-use es_data::roboverse::{convert, RoboVerseTask, Severity};
+use es_import::roboverse::{convert, RoboVerseTask, Severity};
 use es_ir::cross::{self, IrBundle};
 use es_ir::deployment::{
     ActionContract, ActionSpace as DepSpace, Deadlines, DeploymentIr, ExecutionMode,
@@ -210,7 +210,9 @@ fn task_hash_and_observation_hash_are_stable_across_runs() {
 
 // --- `control_rate_hz` (P-M4-S9-S10, review S-10) -------------------------------------------
 
-fn reach_with_control_rate(v: serde_json::Value) -> Result<es_data::roboverse::Converted, String> {
+fn reach_with_control_rate(
+    v: serde_json::Value,
+) -> Result<es_import::roboverse::Converted, String> {
     let mut json: serde_json::Value = serde_json::from_str(REACH_JSON).expect("fixture parses");
     json["control_rate_hz"] = v;
     let task = RoboVerseTask::parse(&json.to_string()).expect("task parses");

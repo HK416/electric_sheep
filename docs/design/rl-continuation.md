@@ -1,5 +1,9 @@
 # RL continuation of imported policies (plan S, §13.4, §14.4, §28.11)
 
+Where the code lives: since packet `docs/packets/M10/W3a-es-import-split.md` the importer is
+`crates/es-import/src/rl_import.rs` (crate `es-import`, layer 9, spec §4.2); `es-data` re-exports
+it as `es_data::rl_import`, so both paths name the same module.
+
 Design note for the M8 campaign. Spec sections: §13.4 (the trainer's semantics), §14.4 (the
 import), §28.11 (the ladder), §8.3/§8.9 (the nodes and the equivalence tiers), §9.4 (the plane is
 on during rollouts), §19.3 (the `training/` slots), §12.4 (nine metrics). Packets:
@@ -458,7 +462,7 @@ function of the raw observation — and the import is re-run from a manifest who
   in the squashed action — above tier (b)'s 1e-5 tolerance, for the reason section 4 already
   gives: the cube's z channel has `obs_std` 1.79e-4, so `1/std` is ~5,600 and f32 rounding is
   amplified with it. It is a measurement's rewrite, not an equivalence claim;
-* it changes nothing about the amplification itself. `crates/es-data/src/rl_import.rs` warns that
+* it changes nothing about the amplification itself. `crates/es-import/src/rl_import.rs` warns that
   a `MeanStd` normalizer "amplifies anything off that scale by 1/std"; folded or not, the same
   product reaches the same `tanh` — which is exactly what the continued rows then run into.
 
@@ -840,7 +844,7 @@ every hidden layer and leave the output Dense linear, so `import.json` reads
 `StateEncoder{Mlp}` ends at the last *hidden* layer — and therefore carries
 `activate_output = true`, the S2a parameter, because that layer *is* activated — and
 `PolicyHead{Regression}` is the output Dense, with the source's `squash` after it. Same
-function, different cut; `crates/es-data/src/rl_import.rs::learning_graph` is where it happens
+function, different cut; `crates/es-import/src/rl_import.rs::learning_graph` is where it happens
 and says so.
 
 **The adapter document** (`tests/fixtures/rl/adapter-so101.toml`) carries the four things a

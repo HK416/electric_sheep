@@ -991,7 +991,7 @@ fn stats_source(
 /// The pair is built to pass [`ObservationIr::validate`], [`LearningGraph::validate`] and the
 /// Observation↔Learning half of `es_ir::cross::check` on its own; a full `IrBundle` also needs
 /// a Task IR and a Deployment IR, which a bare policy config does not carry (see
-/// `crates/es-data/tests/lerobot_config.rs` for a minimal synthetic pair that closes that
+/// `crates/es-import/tests/lerobot_config.rs` for a minimal synthetic pair that closes that
 /// loop for testing).
 pub fn convert(
     cfg: &LeRobotPolicyConfig,

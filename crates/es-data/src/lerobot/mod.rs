@@ -5,7 +5,7 @@
 //! as a [`VideoRef`] naming the mp4 and the frame within it.
 
 mod columns;
-pub mod meta;
+pub use es_import::lerobot::meta;
 pub mod v3;
 
 use std::collections::BTreeMap;

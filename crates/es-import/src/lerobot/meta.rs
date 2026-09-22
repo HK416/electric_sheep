@@ -9,11 +9,18 @@ use std::fmt::Write as _;
 use es_ir::{ElemType, Frame, PortType, Shape, TimeRef, Unit};
 use serde::{Deserialize, Serialize};
 
-use crate::DataError;
+/// `meta/info.json` says something this module does not model: an unsupported `dtype`, a
+/// path template with an unknown placeholder. `es_data::DataError` wraps it transparently, so
+/// through `es-data` it reads exactly as that crate's own `Unsupported`.
+#[derive(Debug, thiserror::Error)]
+pub enum MetaError {
+    #[error("unsupported LeRobot dataset: {0}")]
+    Unsupported(String),
+}
 
 /// Bookkeeping columns that are not learning features. They live as plain parquet primitives
 /// rather than as per-frame lists, and three of the five are pure functions of position, so
-/// they never reach [`crate::Episode::columns`].
+/// they never reach `es_data::Episode::columns`.
 pub const RESERVED: [&str; 5] = [
     "episode_index",
     "frame_index",
@@ -41,7 +48,7 @@ pub enum Dtype {
 
 impl Dtype {
     /// Does this feature occupy a parquet column? `video`/`image` frames live in mp4 files
-    /// and are surfaced as [`crate::VideoRef`]s instead.
+    /// and are surfaced as `es_data::VideoRef`s instead.
     pub fn is_columnar(self) -> bool {
         matches!(
             self,
@@ -91,7 +98,7 @@ impl FeatureSpec {
     /// (the dataset declares none, and `Policy` is the spec's "no frame checking" frame),
     /// and `image` is `None` because an [`es_ir::ImageSpec`] cannot be reconstructed from
     /// `info.json`.
-    pub fn port_type(&self) -> Result<PortType, DataError> {
+    pub fn port_type(&self) -> Result<PortType, MetaError> {
         let elem = match self.dtype {
             Dtype::Float32 => ElemType::F32,
             Dtype::Float64 => ElemType::F64,
@@ -99,7 +106,7 @@ impl FeatureSpec {
             Dtype::Bool => ElemType::Bool,
             Dtype::Video | Dtype::Image => ElemType::U8,
             Dtype::Str => {
-                return Err(DataError::Unsupported(
+                return Err(MetaError::Unsupported(
                     "string features have no PortType".into(),
                 ))
             }
@@ -134,13 +141,13 @@ pub struct Info {
     pub video_path: Option<String>,
     pub features: BTreeMap<String, FeatureSpec>,
     /// `robot_type`, `total_videos`, `splits`, … — preserved, never interpreted. `splits` in
-    /// particular is *not* read: splits are owned by [`crate::Split`] (spec 19.2).
+    /// particular is *not* read: splits are owned by `es_data::Split` (spec 19.2).
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 impl Info {
-    /// A minimal `info.json` for [`crate::LeRobotWriter`]; totals are recomputed by
+    /// A minimal `info.json` for `es_data::LeRobotWriter`; totals are recomputed by
     /// `finish()`, so the values here are placeholders.
     pub fn new(fps: f64, features: BTreeMap<String, FeatureSpec>) -> Self {
         let has_video = features.values().any(|f| f.dtype.is_video());
@@ -167,12 +174,12 @@ impl Info {
     }
 
     /// `data_path` rendered for one episode, relative to the dataset root.
-    pub fn data_path(&self, episode: u32) -> Result<String, DataError> {
+    pub fn data_path(&self, episode: u32) -> Result<String, MetaError> {
         render(&self.data_path, self.chunk_of(episode), episode, None)
     }
 
     /// `video_path` rendered for one episode and camera, relative to the dataset root.
-    pub fn video_path(&self, episode: u32, video_key: &str) -> Result<Option<String>, DataError> {
+    pub fn video_path(&self, episode: u32, video_key: &str) -> Result<Option<String>, MetaError> {
         let Some(t) = &self.video_path else {
             return Ok(None);
         };
@@ -218,7 +225,7 @@ fn render(
     chunk: u32,
     episode: u32,
     video_key: Option<&str>,
-) -> Result<String, DataError> {
+) -> Result<String, MetaError> {
     let mut out = String::with_capacity(template.len() + 16);
     let mut rest = template;
     while let Some(open) = rest.find('{') {
@@ -226,7 +233,7 @@ fn render(
         let after = &rest[open + 1..];
         let close = after
             .find('}')
-            .ok_or_else(|| DataError::Unsupported(format!("unterminated `{{` in {template:?}")))?;
+            .ok_or_else(|| MetaError::Unsupported(format!("unterminated `{{` in {template:?}")))?;
         let field = &after[..close];
         rest = &after[close + 1..];
 
@@ -237,7 +244,7 @@ fn render(
                     .and_then(|s| s.strip_suffix('d'))
                     .and_then(|s| s.parse::<usize>().ok())
                     .ok_or_else(|| {
-                        DataError::Unsupported(format!("unsupported format spec {spec:?}"))
+                        MetaError::Unsupported(format!("unsupported format spec {spec:?}"))
                     })?;
                 (name, width)
             }
@@ -247,10 +254,10 @@ fn render(
             "episode_chunk" => write!(out, "{chunk:0pad$}").expect("String never fails"),
             "episode_index" => write!(out, "{episode:0pad$}").expect("String never fails"),
             "video_key" => out.push_str(video_key.ok_or_else(|| {
-                DataError::Unsupported("{video_key} outside a video path".into())
+                MetaError::Unsupported("{video_key} outside a video path".into())
             })?),
             other => {
-                return Err(DataError::Unsupported(format!(
+                return Err(MetaError::Unsupported(format!(
                     "unknown path placeholder {{{other}}}"
                 )))
             }
@@ -283,11 +290,11 @@ mod tests {
     #[test]
     fn unknown_placeholder_is_rejected_not_guessed() {
         let err = render("data/{robot_type}/x", 0, 0, None).unwrap_err();
-        assert!(matches!(err, DataError::Unsupported(_)), "{err}");
+        assert!(matches!(err, MetaError::Unsupported(_)), "{err}");
         let err = render("data/{episode_index:x}", 0, 0, None).unwrap_err();
-        assert!(matches!(err, DataError::Unsupported(_)), "{err}");
+        assert!(matches!(err, MetaError::Unsupported(_)), "{err}");
         let err = render("data/{episode_index", 0, 0, None).unwrap_err();
-        assert!(matches!(err, DataError::Unsupported(_)), "{err}");
+        assert!(matches!(err, MetaError::Unsupported(_)), "{err}");
     }
 
     #[test]
