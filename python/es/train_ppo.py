@@ -40,7 +40,7 @@ documents is measuring a different thing than the evaluation will.
     rather than hidden: `envelope_violation_rate` is how often it raised an event and
     `executed_ne_sampled_rate` is how often what reached the actuator was not what was
     sampled. **`--estimator` says which of the two the gradient is computed at** (packet
-    M9/R5, design note section 2): `sampled` is the default and every row measured before
+    M9/R5, design note section 2a): `sampled` is the default and every row measured before
     that packet, and `executed` puts the plane inside the environment -- the action stored in
     the rollout buffer is the one `Rollout.act` returned and the log-probability, both the
     stored one and the ratio in the update, is evaluated there. Rewards, dones, values and

@@ -11009,10 +11009,10 @@ fn train_rl_estimator_dry_run_plan() {
     );
     // A third estimator is a value, not a table -- and an unimplemented one is refused with
     // the word the recipe used, the way `[rl] algo` is.
-    let said = es_data::Recipe::parse(&spell("executed_mean"))
-        .err()
-        .map(|e| e.to_string())
-        .unwrap_or_else(|| panic!("an unknown estimator parsed"));
+    let Err(refused) = es_data::Recipe::parse(&spell("executed_mean")) else {
+        panic!("an unknown estimator parsed");
+    };
+    let said = refused.to_string();
     assert!(said.contains("executed_mean"), "{said}");
 }
 
@@ -11154,22 +11154,24 @@ fn train_rl_two_runs_are_bitwise() {
         "value_coef  = 0.5",
         "value_coef  = 0.5\nestimator   = \"executed\"",
     );
-    let (c, _) = run_rl_train(&executed, &dir, "run-c").expect("the first run resolved ES_PYTHON");
-    let (d, _) = run_rl_train(&executed, &dir, "run-d").expect("the first run resolved ES_PYTHON");
+    let (run_c, _) =
+        run_rl_train(&executed, &dir, "run-c").expect("the first run resolved ES_PYTHON");
+    let (run_d, _) =
+        run_rl_train(&executed, &dir, "run-d").expect("the first run resolved ES_PYTHON");
     for mark in ["0", "3"] {
         let name = format!("checkpoints/{mark}.esb");
-        let (x, y) = (
-            std::fs::read(c.join(&name)).expect(&name),
-            std::fs::read(d.join(&name)).expect(&name),
+        let (left, right) = (
+            std::fs::read(run_c.join(&name)).expect(&name),
+            std::fs::read(run_d.join(&name)).expect(&name),
         );
         assert_eq!(
-            hex(blake3::hash(&x).as_bytes()),
-            hex(blake3::hash(&y).as_bytes()),
+            hex(blake3::hash(&left).as_bytes()),
+            hex(blake3::hash(&right).as_bytes()),
             "{name} is not bitwise between two runs of one `estimator = \"executed\"` recipe"
         );
     }
     assert_ne!(
-        train_lock(&c)["training_hash"],
+        train_lock(&run_c)["training_hash"],
         train_lock(&a)["training_hash"],
         "the estimator is not in training_hash: two different trainings claim one identity"
     );
