@@ -4317,6 +4317,37 @@ against another measures nothing (M5 review S-3). Pass `--allow-retired-task eb6
 accept it deliberately."* W0b가 가르친 것은 없다; 그 거부는 M5의 것이고, 이 저장소가 일부러
 옮긴 해시에 대해 처음으로 발화한 것이다.
 
+**3단계 — U3 재학습, 그리고 이 체인에서 애초에 비트 단위가 아니었던 한 층.**
+`training-u3.toml`의 설정(배치 64, lr 4e-4, `warmup_cosine` 250 / 1e-6, 시드 0,
+`--resident-gpu`, `device = "cuda"`)으로 세 번, 각자 다시 패킹한 번들에 대해 `es train`을
+처음부터 끝까지, 유휴 카드에서:
+
+| 런 | 트리 | 문서 | 데이터셋 | 벽시계 | `weights/model-20000.safetensors` |
+|---|---|---|---|---|---|
+| **U3-pre** | `13c1e45` | W0b 이전 | `w0b/pre/ds-train` | 4:56 | `d95c0db2…` |
+| **U3-post** | 이 트리 | W0b | `w0b/v15/ds-train` | 5:00 | `b87c277d…` |
+| V15 자신의 데이터 위의 U3 | 이 트리 | W0b, `--allow-retired-task eb6efefa…` | `plan-v/v15/ds-train` | 4:11 | `e7d11394…` |
+| M7/U의 커밋된 U3(7.31절) | M7 | W0b 이전 | `plan-v/v15/ds-train` | 4:11 | `2e0b2f05…` |
+
+1행과 2행은 2단계가 측정한 비트 단위로 같은 데이터셋 쌍 위에서, 같은 시드로, 같은 기계에서,
+몇 분 차이로 학습했다. **두 체크포인트는 비트 단위로 같지 않고, W0b가 그 이유가 아니다**:
+두 손실 곡선은 첫 네 최적화 스텝까지 *정확히* 일치하고 다섯 번째에서 **8 ULP**만큼
+갈라진다(0.47351330518722534 → 0.47351306676864624) — 다른 배치가 아니라 카드 위의 float32
+리덕션 순서다. 그 8 ULP에서 두 런은 갈라진다: 20,000스텝에서 126개 텐서 중 46개가 다르고,
+가장 큰 절대 차이는 백본의 `layer4.1.conv2.weight`에서 0.353이다. 9절의 표는 이미 "학습된
+가중치: **재현되지 않음**"이라고 말하고 있었다; 이것이 그 행을 데이터를 비트 단위로 고정한 채
+측정한 것이며, 그래서 §28.13 규칙 1은 여기서 실제로 비트 단위인 층들 — 문서, 데이터셋,
+207,762개 프레임, `lowering_hash` — 에서 확인하고 체크포인트에서는 확인하지 않는다.
+
+3행은 같은 이야기를 반대편에서 한다. 같은 36,960프레임짜리 V15 데이터셋은, 네 마일스톤 뒤에
+`task_hash`가 옮겨진 채로도, M7/U의 **첫 다섯 손실을 정확히** 재현하고(0.630703866481781, …)
+여섯 번째에서 **2 ULP**만큼 갈라진다. 베이킹, 배치 순서, ImageNet 초기화, lr 스케줄은 M7/U
+때와 같은 함수다: 여기의 모든 런이 M7/U 자신의 `lowering_hash 41d11a06…`을 찍고, pre 런의
+`training.lock`은 `augmentation.json`, `optimizer.json`, `precision.json`, `scheduler.json`,
+`seed.json`, `topology.json`을 M7/U와 똑같은 다이제스트로 해시한다. W0b가 옮긴 것은
+`config.json`과 `dataset.lock`, 그리고 그 둘을 감싸는 `identity_hash` / `training_hash` —
+문서 해시를 인용하는 슬롯들이다.
+
 ## 8. 안전 오버레이 (V3)
 
 렌더된 프레임마다 V3는 `events.json`에 레코드 하나를 붙인다:

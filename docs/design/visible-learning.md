@@ -4668,6 +4668,38 @@ measures nothing (M5 review S-3). Pass `--allow-retired-task eb6efefa…` to acc
 deliberately."* Nothing in W0b taught it that; the refusal is M5's, firing for the first time on
 a hash this repository moved on purpose.
 
+**Stage 3 — U3 retrained, and the one level of this chain that was never bitwise.** Three runs
+of `training-u3.toml`'s settings (batch 64, lr 4e-4, `warmup_cosine` 250 / 1e-6, seed 0,
+`--resident-gpu`, `device = "cuda"`), each `es train` end to end against its own re-packed
+bundle, on an idle card:
+
+| run | tree | documents | dataset | wall | `weights/model-20000.safetensors` |
+|---|---|---|---|---|---|
+| **U3-pre** | `13c1e45` | pre-W0b | `w0b/pre/ds-train` | 4:56 | `d95c0db2…` |
+| **U3-post** | this | W0b | `w0b/v15/ds-train` | 5:00 | `b87c277d…` |
+| U3 on V15's own data | this | W0b, `--allow-retired-task eb6efefa…` | `plan-v/v15/ds-train` | 4:11 | `e7d11394…` |
+| M7/U's committed U3 (section 7.31) | M7 | pre-W0b | `plan-v/v15/ds-train` | 4:11 | `2e0b2f05…` |
+
+Rows 1 and 2 are trained on the bit-identical pair stage 2 measured, at the same seed, on the
+same box, minutes apart. **Their checkpoints are not bit-identical, and W0b is not why:** the two
+loss curves agree *exactly* for the first four optimizer steps and part at the fifth by **8
+ULPs** (0.47351330518722534 → 0.47351306676864624) — a float32 reduction order on the card, not
+a different batch. From those 8 ULPs the runs diverge: at 20,000 steps 46 of 126 tensors differ,
+worst max-abs 0.353 in the backbone's `layer4.1.conv2.weight`. Section 9's table already says
+"the trained weights: **not** reproducible"; this is that row measured, with the data held
+bit-identical so nothing else can be blamed, and it is why §28.13 rule 1 is checked here at the
+levels that *are* bitwise — the documents, the dataset, the 207,762 frames, `lowering_hash` — and
+not at the checkpoint.
+
+Row 3 says the same thing from the other side. The same 36,960-frame V15 dataset, four
+milestones later and with `task_hash` moved, reproduces M7/U's **first five losses exactly**
+(0.630703866481781, …) and parts at the sixth by **2 ULPs**. The bake, the batch order, the
+ImageNet initialisation and the lr schedule are the same function they were in M7/U: every run
+here prints `lowering_hash 41d11a06…`, M7/U's own, and the pre run's `training.lock` hashes
+`augmentation.json`, `optimizer.json`, `precision.json`, `scheduler.json`, `seed.json` and
+`topology.json` to M7/U's exact digests. What W0b moved is `config.json`, `dataset.lock` and the
+`identity_hash` / `training_hash` around them — the slots that quote a document hash.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
