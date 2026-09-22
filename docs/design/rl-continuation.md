@@ -826,6 +826,59 @@ metrics as `Rollout.metrics()` reports them are in each run's `metrics/env-metri
 `Target / Status: unverified`. Not measured here: the first-iteration actor gradient norm (S-13's
 detector does not exist yet).
 
+### W0b — A0 re-measured under the platform-stable `scene_hash`, oracle server (Linux, 16-core CPU), 2026-09-22 UTC
+
+Packet `docs/packets/M10/W0b-scene-hash-libm.md`. The MJCF/URDF importers stopped calling the
+host's libm for `euler=`, `axisangle=`, `zaxis=` and `rpy` and now go through
+`es_math::approx::{sin_cos_f64, acos_f64}`, so `scene_hash` is one number on Windows and Linux
+(§3.2's `f64` paragraph). That moves every SO-101 `task_hash`, and the reach documents with it:
+`task-reach.toml` `b5d3b813…` → **`43a62f3f…`**, `observation-reach.toml` `4ced8547…` →
+**`ecabac79…`**, `evaluation-reach.toml` `f15fe888…` → **`66ef84a5…`**; `learning-reach.toml`
+`eb805f18…` and `deployment-reach.toml` `7af05d88…` do not move, because neither reads a scene.
+The full old → new table is the packet's note section.
+
+**A0 re-run from scratch under the moved hashes: bit for bit, all three seeds.** An untrained
+bundle packed from the four regenerated reach documents, `training-reach.toml` at seeds 0, 1 and
+2 (`[run] seed` overridden in server-side copies; nothing else touched), 4,000 iterations each on
+the CPU backend, then `es eval run` on the regenerated `evaluation-reach.toml`:
+
+| seed | `weights/model-4000.safetensors` | tensors differing from S4e / S4c | `nominal` `success_rate` | `episode_length` |
+|---|---|---|---|---|
+| 0 | `d79c5c3a…` | **0 / 8** | 0.5625 | 129.4375 |
+| 1 | `935ca7b8…` | **0 / 8** | 0.3750 | 147.1875 |
+| 2 | `35fc351a…` | **0 / 8** | 0.3125 | 153.6250 |
+
+Mean **0.4167**, the number section 7's S4e and S4c rows and `visible-learning.md` 7.34 and 7.35
+already carry. Every cell of every `report.json` is identical to the committed one — all four
+suites, both metrics, `observation_delay` 0.3125 / 0.0625 / 0.1250 and `torque_noise` 0.5000 /
+0.4375 / 0.6250 included. **This is the strongest form of §28.13 rule 1 available anywhere in
+this repository**: PPO on the CPU backend is bitwise (`train_rl_two_runs_are_bitwise`), so a
+hash fix that moved nothing else has to reproduce the checkpoint byte for byte, and it does —
+on a tree four milestones after the one S4e and S4c ran on. `visible-learning.md` 7.36 carries
+the demo's half, where CUDA ACT training is not bitwise and the claim has to be made one level
+up and one level down instead.
+
+**The two hashes that do move, and why each moves.** `evaluation_hash` `f15fe888…` →
+`66ef84a5…` is the fix itself, through `task` and `observation`. `execution_hash` moves twice
+over: seed 0 `9ff75635…` → `145bc81a…`, seed 1 `22b55e10…` → `7883ef24…`, seed 2 `d72bee1b…` →
+`63f91704…` — once for the documents and once because W0a put the policy runtime's intra-op
+thread count into `runtime_hash`. `evaluation.lock` now prints it: **`runtime_threads: 8`**,
+torch's own default on this box's 8 physical cores, where `--jobs 1`'s `cores/N` cap of 16 does
+not bind. S4e's and S4c's locks predate the field and read `None`. Two reports at two thread
+counts are two conditions (`evaluation-execution.md` 2.7); here the count is the same and only
+its being *recorded* is new.
+
+**Wall clocks and a scheduling note.** Seeds 0 / 1 / 2 trained in **637 s / 618 s / 637 s** and
+scored in 11 / 11 / 10 s, run one at a time (stage total 1,925 s). They were first launched
+three concurrent, as the packet asked: `es train` does not cap the trainer's thread pool the way
+`es eval run --jobs` caps the evaluator's, so three runs put 3 × 8 torch threads on 16 cores and
+had written no checkpoint after **60 minutes**, against S4e's 755 s alone. The runs were killed
+and re-run sequentially; the thread count is torch's default either way, so this is a scheduling
+choice and not a different measurement — which the bit-identical checkpoints above then confirm
+rather than assume. Artifacts `~/artifacts/plan-w/w0b/reach/seed{0,1,2}/`, `training_hash`
+`2dfbc7c8…` / `6bf728e7…` / `e3d030e8…`. The nine §12.4 metrics are in each run's
+`metrics/env-metrics.json`; everything else is `Target / Status: unverified`.
+
 ## 8. The importer and the adapter
 
 Rule 3 of section 1 says the adapter declares and code never guesses. This is what that comes
