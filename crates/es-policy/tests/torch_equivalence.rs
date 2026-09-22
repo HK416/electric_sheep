@@ -362,7 +362,10 @@ fn torch_runtime_hash_covers_the_thread_count() {
     let one = load(1);
     let two = load(2);
     assert_eq!(one, load(1), "the same count is the same runtime");
-    assert_ne!(one, two, "a different count is a different runtime (spec 5.3)");
+    assert_ne!(
+        one, two,
+        "a different count is a different runtime (spec 5.3)"
+    );
     println!(
         "RAN torch_runtime_hash_covers_the_thread_count: 1 thread {one:02x?} != 2 threads {two:02x?}"
     );
