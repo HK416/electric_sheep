@@ -40,7 +40,11 @@ except ImportError as exc:  # Reported as a protocol response, not a traceback o
     sys.stdout.flush()
     raise SystemExit(1)
 
-PROTOCOL = 1
+# 2 (packet M10/W0a): the load reply carries `threads`, the intra-op pool as torch resolved it
+# from OMP_NUM_THREADS / MKL_NUM_THREADS / its default. Torch's CPU inference is not bitwise
+# across thread counts, so the count is a runtime condition and `runtime_hash` covers it
+# (spec 5.3).
+PROTOCOL = 2
 # The protocol and the safetensors files it reads are f32 only (spec 8.4 `runtime.dtype`).
 DTYPE = "F32"
 
@@ -136,7 +140,12 @@ def main():
             if command == "load":
                 model = build(request["source"], request["weights_path"])
                 batch_axis = bool(request.get("batch_axis"))
-                reply = {"ok": True, "torch_version": torch.__version__, "protocol": PROTOCOL}
+                reply = {
+                    "ok": True,
+                    "torch_version": torch.__version__,
+                    "protocol": PROTOCOL,
+                    "threads": torch.get_num_threads(),
+                }
             elif command == "infer":
                 if model is None:
                     raise ValueError("no policy is loaded")

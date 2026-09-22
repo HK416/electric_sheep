@@ -2453,6 +2453,39 @@ fn sharded(ir: &EvaluationIr, obs: &ObservationIr, jobs: u32, dir: &std::path::P
     read_artifacts(&report, &lock, &events, dir)
 }
 
+/// Packet M10/W0a: `evaluation.lock` names the policy runtime's intra-op thread count when
+/// the runtime has one (spec 5.3). `merge` leaves it `None` — a `FakePolicy` has no pool and
+/// `PolicyRuntime` has no accessor for one (INV-17) — and the field is then absent from the
+/// bytes, so the committed placeholder lock, written before the field existed, still reads,
+/// and every byte-identity claim in this file is unchanged by the field.
+#[test]
+fn the_lock_carries_the_runtime_thread_count_when_there_is_one() {
+    let placeholder = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/visible-learning/run/evaluation.lock");
+    let text = std::fs::read_to_string(&placeholder).expect("the committed placeholder lock");
+    let mut lock: es_eval::EvaluationLock = serde_json::from_str(&text).expect("still reads");
+    assert_eq!(lock.runtime_threads, None);
+    assert!(!serde_json::to_string(&lock)
+        .unwrap()
+        .contains("runtime_threads"));
+
+    lock.runtime_threads = Some(2);
+    let json = serde_json::to_string(&lock).unwrap();
+    assert!(json.contains("\"runtime_threads\":2"), "{json}");
+    let back: es_eval::EvaluationLock = serde_json::from_str(&json).unwrap();
+    assert_eq!(back, lock);
+
+    let (ir, obs) = four_suite_image_ir();
+    let dir = scratch("lock-threads");
+    let merged: es_eval::EvaluationLock =
+        serde_json::from_slice(&sharded(&ir, &obs, 1, &dir).1).expect("the merged lock");
+    assert_eq!(
+        merged.runtime_threads, None,
+        "a runtime with no pool reports none"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// The headline of the packet: `--jobs 4` is a scheduling choice, not a different evaluation.
 ///
 /// Three runs of one four-suite image evaluation — the sequential entry point, one worker, and

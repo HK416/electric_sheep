@@ -430,6 +430,48 @@ export하고 돌린 `es eval run --jobs 1`(110.58 s)의 `report.json`, `events.j
 그때까지 이 하드웨어에서 `N ≤ cores / 4`인 `--jobs N`은 `--jobs 1`과 바이트 단위로 같고, 데모의
 `--jobs 6` 스윕은 모두 cap 2이며 서로 일치한다.
 
+**결정 (M10/W0a, 2026-09-22): 옵션 2 — 해시에 말한다.** 소유자가 2026-09-22에 골랐고(§28.13
+규칙 1; M8 리뷰 S-1), 옵션 3은 함께 따라왔다. `python/torch_ref.py`는 `load`에
+`threads = torch.get_num_threads()`로 답한다(프로토콜 2, 그래서 더 오래된 스크립트의 응답은 그
+번호로 거부된다). `TorchRuntime::runtime_hash`는 `blake3(RUNTIME_TAG ‖ "torch" ‖ protocol ‖
+version ‖ threads as u32 LE)`다. `evaluation.lock`은 그 수를 `runtime_threads`로 평문에 싣는다 —
+풀이 없는 런타임에는 `None`이고 바이트에서 빠지므로, 이 크레이트 자신의 `FakePolicy` 오라클과
+커밋된 자리표시 lock이 보는 것은 그대로이고 위의 바이트 동일성 주장은 하나도 움직이지 않았다.
+접근자는 `TorchRuntime::threads()`이며 타입에 있고 `PolicyRuntime`에는 없다(INV-17). `--jobs N`
+실행의 부모는 추론하지 않지만 `merge`가 해시하고 lock이 인용하는 런타임은 부모의 것이므로,
+`es eval run`은 부모의 참조 프로세스를 워커가 받는 것과 같은 네 변수 아래에서 띄우고, 그것은
+숫자를 만든 바로 그 수를 보고한다. `--jobs 1`은 아무것도 export하지 않고 주변 풀을 그대로
+물려받는다. **풀에 대해서는 아무것도 바뀌지 않았다**: `shard_thread_env`, `cores / N` cap,
+`--jobs 1`의 동작은 전과 같고, 커밋된 숫자는 하나도 움직이지 않았다. 도움말은 이제 "같은
+정책 런타임 스레드 수에서 — `evaluation.lock`이 기록하고 `execution_hash`가 덮는"이라고 말한다.
+
+측정(오라클 3; 오라클 서버, `nproc` 16, `--frames`, U0의 번들, 커밋된 `task.toml` /
+`observation.toml`, 위와 똑같이 nominal 스위트로 자른 `evaluation.toml`, 시드 101–116, CPU 큐를
+잡고 박스는 그 외 유휴 — 시작 시 1분 부하 0.28; `~/artifacts/plan-w/w0a/{j1,j8,omp2-j1}/`):
+
+| 행 | `evaluation_hash` | `execution_hash` | `runtime_threads` | blake3(`report.json`) | 벽시계 |
+|---|---|---|---|---|---|
+| `--jobs 1` | `40623e01…` | `60b86f13…` | **8** | `0326d5c9…` | 118.05 s |
+| `--jobs 8` | `40623e01…` | `d7bdb984…` | 2 | `191d4314…` | 46.93 s |
+| `--jobs 1`, 스레드 변수 넷을 2로 export | `40623e01…` | `d7bdb984…` | 2 | `191d4314…` | 103.13 s |
+
+전체 다이제스트: `evaluation_hash`
+`40623e0183cdaf56d0c93adf81035b528fb338e68e2314632f3b9c64e33a5ce3`; `execution_hash` 1행
+`60b86f13289db36987450bd098bb662d0b6b3f6440d812b1bc66c93d801c0c2c`, 2–3행
+`d7bdb9845453227d576ebe617e4a53ca488fcd494a05721a3b123db0e0aa5353`; `report.json` 1행
+`0326d5c93f90a228294466382599e1b48d058009f1541791a13517f55f5ab450`, 2–3행
+`191d4314c417d0ccf25b02632f5783fa07a3258cad4447ccbe365382a531b1f3`. `evaluation_hash`는 세 행
+모두 하나의 숫자다 — 같은 문서다. 2행과 3행은 벽시계를 빼고 모든 열에서 일치하고, 표 밖에서도
+`events.json`, 16개 `.estraj` 전부, 23,899개 프레임 파일 전부가 일치한다. 1행은 그 둘과
+`execution_hash`, `runtime_threads`, 리포트에서 다르다 — `success_rate` 0.0625 /
+`envelope_violation_rate` 0.4297 / `episode_length` 1701.3 대 cap 2 행들의 0.2500 / 0.4409 /
+1492.7, 후자는 다시 `visible-learning.ko.md` 7.31의 U0 행이다. 위의 발견은 이제 체인에 보인다.
+두 스레드 수에서 얻은 두 리포트는 두 `execution_hash`를 달고 lock에 그 이유를 적는다. 숫자가
+바로잡는 세부 하나: 이 박스에서 Torch의 기본 풀은 16이 아니라 **8**이다 —
+`torch.get_num_threads()`는 물리 코어를 따르고 `nproc`은 SMT 스레드를 센다 — 그래서 위 문단이
+16으로 여겼던 제한 없는 수는 8이었고, `--jobs 2`의 cap 8이 *곧* 제한 없는 풀이며, "4·8·16이
+일치한다"는 "4와 8이 일치하고 2는 아니다"로 읽는다.
+
 이 실행이 측정하는 지표는 데모의 Evaluation IR이 선언한 네 가지 — `success_rate`,
 `episode_length`, `envelope_violation_rate`, `failure_mode_histogram` — 다. §12.4의 아홉 성능
 지표는 여기서 모두 `Target / Status: unverified`이고, 무엇에 대해서도 `step/s` 수치는 보고되지

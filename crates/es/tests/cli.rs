@@ -1377,6 +1377,7 @@ fn run_artifacts(f: &Fixture, chain: &HashChain) -> (EvaluationReport, Evaluatio
             quirks: Vec::new(),
         },
         created: 0,
+        runtime_threads: None,
     };
     (report, lock)
 }

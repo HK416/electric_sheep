@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::lower::{lower_to_torch, TorchModule};
 use crate::runtime::{
-    runtime_hash_of, InferenceBackend, PolicyError, PolicyInfo, PolicyRuntime, WeightsSource,
+    InferenceBackend, PolicyError, PolicyInfo, PolicyRuntime, WeightsSource, RUNTIME_TAG,
 };
 use crate::weights::{hex, parse_header, validate_keys, weights_hash};
 
@@ -33,7 +33,9 @@ use crate::weights::{hex, parse_header, validate_keys, weights_hash};
 pub const SCRIPT: &str = include_str!("../python/torch_ref.py");
 
 /// Bumped whenever the wire format changes. Part of [`PolicyRuntime::runtime_hash`].
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 (packet M10/W0a): the load reply carries the intra-op thread count.
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// One request to the reference process.
 #[derive(Debug, Serialize)]
@@ -65,6 +67,25 @@ struct WireTensor {
 #[derive(Debug, Deserialize)]
 struct LoadReply {
     torch_version: String,
+    protocol: u32,
+    /// `torch.get_num_threads()`: the intra-op pool the process actually runs with. Not
+    /// bitwise across counts, so it is a condition of the run (spec 5.3, packet M10/W0a).
+    threads: u32,
+}
+
+impl LoadReply {
+    /// The script is embedded, so the two sides cannot drift in one build; this refuses a
+    /// reply from any other script by its number rather than by a missing field later.
+    fn check_protocol(&self) -> Result<(), PolicyError> {
+        if self.protocol == PROTOCOL_VERSION {
+            Ok(())
+        } else {
+            Err(PolicyError::Protocol(format!(
+                "torch_ref.py speaks protocol {}, this runtime speaks {PROTOCOL_VERSION}",
+                self.protocol
+            )))
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,11 +203,13 @@ struct Process {
 }
 
 impl Process {
-    fn spawn() -> Result<Self, PolicyError> {
+    /// `env` is exported to the child on top of this process's own environment.
+    fn spawn(env: &[(String, String)]) -> Result<Self, PolicyError> {
         let mut tried = Vec::new();
         for python in python_candidates() {
             match Command::new(&python)
                 .args(["-c", SCRIPT])
+                .envs(env.iter().map(|(k, v)| (k, v)))
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 // Every Python-side failure comes back on stdout as JSON, so stderr carries
@@ -252,11 +275,34 @@ pub struct TorchRuntime {
     info: Option<PolicyInfo>,
     /// A file this runtime wrote for [`WeightsSource::InMemory`], to delete on drop.
     scratch: Option<PathBuf>,
+    /// Exported to the reference process on top of this process's environment.
+    env: Vec<(String, String)>,
+    /// The intra-op thread count the reference process reported at its handshake.
+    threads: Option<u32>,
 }
 
 impl TorchRuntime {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A runtime whose reference process is spawned with `env` exported — the thread-pool
+    /// variables, in practice, so a parent that never infers can still report the count its
+    /// workers ran at (packet M10/W0a). Nothing in this process's own environment changes.
+    pub fn with_env<K: Into<String>, V: Into<String>>(
+        env: impl IntoIterator<Item = (K, V)>,
+    ) -> Self {
+        let mut rt = Self::default();
+        rt.env = env.into_iter().map(|(k, v)| (k.into(), v.into())).collect();
+        rt
+    }
+
+    /// The intra-op thread count the reference process runs with, as it reported at the
+    /// handshake; `None` before a load. Part of [`PolicyRuntime::runtime_hash`] and written
+    /// to `evaluation.lock` in plain text (spec 5.3). On this type and not on the trait: a
+    /// runtime with no pool has nothing to report (INV-17).
+    pub fn threads(&self) -> Option<u32> {
+        self.threads
     }
 
     /// Materialize the checkpoint: the Python side reads a path, so in-memory bytes are spilled
@@ -321,12 +367,13 @@ impl TorchRuntime {
         }
         validate_keys(module, &parse_header(bytes)?)?;
 
-        let mut process = Process::spawn()?;
+        let mut process = Process::spawn(&self.env)?;
         let reply: LoadReply = process.call(&Request::Load {
             source: &module.source,
             weights_path: &path.to_string_lossy(),
             batch_axis,
         })?;
+        reply.check_protocol()?;
 
         let info = PolicyInfo {
             backend: InferenceBackend::Torch,
@@ -338,6 +385,7 @@ impl TorchRuntime {
         };
         self.process = Some(process);
         self.info = Some(info.clone());
+        self.threads = Some(reply.threads);
         Ok(info)
     }
 }
@@ -398,11 +446,20 @@ impl PolicyRuntime for TorchRuntime {
         self.info.as_ref()
     }
 
-    /// Before a load there is no `torch` version to hash, so this covers the protocol alone.
-    /// An `execution_hash` is only meaningful once a policy is loaded (spec 5.3).
+    /// `blake3(RUNTIME_TAG || "torch" || protocol || version || threads as u32 LE)` — the
+    /// shape `runtime_hash_of` gives every backend plus the intra-op thread count, because
+    /// Torch's CPU inference is not bitwise across counts (spec 5.3, packet M10/W0a). Before
+    /// a load there is no `torch` version and no count to hash, so this covers the protocol
+    /// alone; an `execution_hash` is only meaningful once a policy is loaded.
     fn runtime_hash(&self) -> [u8; 32] {
         let version = self.info.as_ref().map_or("", |i| i.version.as_str());
-        runtime_hash_of(InferenceBackend::Torch, PROTOCOL_VERSION, version)
+        let mut h = blake3::Hasher::new();
+        h.update(RUNTIME_TAG.as_bytes());
+        h.update(InferenceBackend::Torch.name().as_bytes());
+        h.update(&PROTOCOL_VERSION.to_le_bytes());
+        h.update(version.as_bytes());
+        h.update(&self.threads.unwrap_or(0).to_le_bytes());
+        *h.finalize().as_bytes()
     }
 }
 
@@ -461,8 +518,11 @@ mod tests {
     #[test]
     fn a_successful_reply_decodes() {
         let reply: LoadReply =
-            parse_response(r#"{"ok":true,"torch_version":"2.14.0+cpu"}"#).unwrap();
+            parse_response(r#"{"ok":true,"torch_version":"2.14.0+cpu","protocol":2,"threads":4}"#)
+                .unwrap();
         assert_eq!(reply.torch_version, "2.14.0+cpu");
+        assert_eq!(reply.threads, 4);
+        reply.check_protocol().unwrap();
 
         let reply: InferReply = parse_response(
             r#"{"ok":true,"outputs":{"actions":{"shape":[1,2],"dtype":"F32","data_b64":"AACAPwAAAEA="}}}"#,
@@ -488,12 +548,32 @@ mod tests {
         );
     }
 
+    /// Packet M10/W0a: an older script's reply is refused by its protocol number, not by the
+    /// field it lacks.
+    #[test]
+    fn an_older_script_is_refused_by_name() {
+        let reply = LoadReply {
+            torch_version: "2.14.0+cpu".to_owned(),
+            protocol: 1,
+            threads: 1,
+        };
+        assert_eq!(
+            reply.check_protocol().unwrap_err(),
+            PolicyError::Protocol(
+                "torch_ref.py speaks protocol 1, this runtime speaks 2".to_owned()
+            )
+        );
+        assert!(SCRIPT.contains("PROTOCOL = 2"));
+    }
+
     #[test]
     fn malformed_replies_are_protocol_errors() {
         for line in [
             "not json at all",
             r#"{"torch_version":"2"}"#,
             r#"{"ok":true,"torch_version":2}"#,
+            // Protocol 1's reply: no thread count.
+            r#"{"ok":true,"torch_version":"2.14.0+cpu","protocol":1}"#,
         ] {
             assert!(
                 matches!(
@@ -554,10 +634,31 @@ mod tests {
     fn inference_before_a_load_is_not_loaded() {
         let mut rt = TorchRuntime::new();
         assert!(rt.info().is_none());
+        assert!(rt.threads().is_none());
         assert_eq!(
             rt.infer(&BTreeMap::new()).unwrap_err(),
             PolicyError::NotLoaded
         );
+    }
+
+    /// The thread count is a hash input (spec 5.3) and nothing else about the digest moved:
+    /// an unloaded runtime still hashes the protocol alone, deterministically.
+    #[test]
+    fn runtime_hash_covers_the_thread_count_without_python() {
+        let base = TorchRuntime::new().runtime_hash();
+        assert_eq!(base, TorchRuntime::new().runtime_hash());
+        let at = |threads: u32| {
+            let mut rt = TorchRuntime::new();
+            rt.threads = Some(threads);
+            rt.runtime_hash()
+        };
+        assert_ne!(at(1), at(2));
+        assert_eq!(at(2), at(2));
+        assert_ne!(at(1), base);
+        // The env override is kept for the child; nothing is reported until it answers.
+        let rt = TorchRuntime::with_env([("OMP_NUM_THREADS", "1")]);
+        assert_eq!(rt.env, vec![("OMP_NUM_THREADS".to_owned(), "1".to_owned())]);
+        assert_eq!(rt.runtime_hash(), base);
     }
 
     #[test]

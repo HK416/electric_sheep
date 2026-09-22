@@ -326,6 +326,13 @@ pub struct EvaluationLock {
     pub seeds: Vec<u64>,
     pub backend: BackendCaps,
     pub created: u64,
+    /// The policy runtime's intra-op thread count, in plain text beside the `execution_hash`
+    /// that covers it (§5.3, packet M10/W0a): Torch's CPU inference is not bitwise across
+    /// counts, so two reports taken at two counts are two conditions. `None` for a runtime
+    /// with no pool, and absent from the bytes then — `merge` writes `None` and the caller
+    /// that built the runtime fills it in (`PolicyRuntime` has no such accessor: INV-17).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_threads: Option<u32>,
 }
 
 /// One `(cell, episode)` unit's contribution to the §10.1 table — the unit of the partition
@@ -835,6 +842,7 @@ impl Evaluation {
                     quirks: Vec::new(),
                 }),
             created: cfg.created,
+            runtime_threads: None,
         };
         Ok((report, lock))
     }
