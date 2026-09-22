@@ -4421,9 +4421,12 @@ W0a를 확인해 주는 `execution_hash` 하나를 눈에 보이는 김에 적�
 `a2283994…`에 대해 `350bcd43…`이다. 같은 문서, 같은 가중치, 같은 셀 — 그런데 `execution_hash`가
 다르다. `runtime_hash`가 이제 `evaluation.lock`이 찍는 인트라옵 스레드 2개를 덮기 때문이다.
 
-**5단계 — reach 과제 재측정**은 다른 노트의 몫이다: `docs/design/rl-continuation.md` 7절의
-"W0b". 이 노트가 지닐 수 없는 비트 단위 주장을 그 행이 지닌다. CPU 백엔드 위의 PPO는
-재현되고, CUDA 위의 ACT 학습은 그렇지 않기 때문이다.
+**5단계 — reach 과제 재측정**은 다른 노트의 몫이고(`docs/design/rl-continuation.md` 7절의
+"W0b"), 이 노트가 지닐 수 없는 비트 단위 주장을 그 행이 지닌다. CPU 백엔드 위의 PPO는
+재현되고 CUDA 위의 ACT 학습은 그렇지 않기 때문이다: 옮겨진 해시 아래에서 시드 0·1·2로 처음부터
+학습한 reach 과제는 S4e·S4c의 것과 **바이트 단위로 같은** `model-4000.safetensors`를 내놓고,
+모든 시드에서 8개 텐서 중 0개가 다르며, `report.json`도 모든 셀이 동일하다 — 0.5625 / 0.3750 /
+0.3125, 평균 **0.4167**, 곧 커밋된 숫자다.
 
 **벽시계와 산출물.** 전부 `~/artifacts/plan-w/w0b/` 아래, 각 단계마다 자신의 `.start` /
 `.end` / `.done` / `.log`가 있다: `--features render` 릴리스 빌드 26초; 1단계 47초 + 26초;

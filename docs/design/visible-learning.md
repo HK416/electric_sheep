@@ -4776,9 +4776,13 @@ One `execution_hash` detail confirms W0a while it is in view: the old-hash run a
 `a2283994…`. Same documents, same weights, same cells — and a different `execution_hash`,
 because `runtime_hash` now covers the 2 intra-op threads that `evaluation.lock` prints.
 
-**Stage 5 — the reach task re-measured** belongs to the other note:
-`docs/design/rl-continuation.md` section 7, "W0b". It is the row that carries the bitwise claim
-this one cannot, because PPO on the CPU backend *is* reproducible where CUDA ACT training is not.
+**Stage 5 — the reach task re-measured** belongs to the other note
+(`docs/design/rl-continuation.md` section 7, "W0b") and it carries the bitwise claim this one
+cannot, because PPO on the CPU backend *is* reproducible where CUDA ACT training is not: the
+reach task trained from scratch at seeds 0, 1 and 2 under the moved hashes gives
+`model-4000.safetensors` **byte-identical** to S4e's and S4c's, 0 of 8 tensors differing on
+every seed, and a `report.json` identical in every cell — 0.5625 / 0.3750 / 0.3125, mean
+**0.4167**, the committed number.
 
 **Wall clocks and artifacts.** Everything under `~/artifacts/plan-w/w0b/`, each stage with its
 own `.start` / `.end` / `.done` / `.log`: release build with `--features render` 26 s; stage 1
