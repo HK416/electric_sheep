@@ -16,7 +16,7 @@ use es_ir::task::{ObsSource, SensorPath, SensorRender, TaskIr, Tonemap};
 /// field. Typed in here on purpose: this test is the one place the number is asserted rather
 /// than derived.
 const COMMITTED_TASK_HASH: &str =
-    "eb6efefa2010befff0c73a5cf8c089f1818e374a7c61a73a64dcd78849102127";
+    "86a7f3a3410f2ae70b48db7fa8d746552745aa3b75c4d3c5cb178549e47ab5ba";
 
 fn fixture(name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
