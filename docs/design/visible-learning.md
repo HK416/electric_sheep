@@ -4700,6 +4700,55 @@ here prints `lowering_hash 41d11a06…`, M7/U's own, and the pre run's `training
 `topology.json` to M7/U's exact digests. What W0b moved is `config.json`, `dataset.lock` and the
 `identity_hash` / `training_hash` around them — the slots that quote a document hash.
 
+**Stage 4 — U3 re-scored.** The regenerated `~/artifacts/plan-w/w0b/evaluation-augmented.toml`
+(`007aac67…`) and `eval-trainseeds-augmented.toml` (`31f64001…`) are M7/U's own two documents
+with the `task` and `observation` lines replaced and nothing else — `diff` is two lines each.
+`--jobs 6`, `eval-u23.sh`'s own value, so the torch cap is 16/6 = **2 intra-op threads**, which
+`evaluation.lock` now records in plain text since W0a (`runtime_threads: 2`; M7/U's locks predate
+the field and read `None`, which is also why every `execution_hash` below differs from M7/U's for
+a second reason that is not W0b — `runtime_hash` covers the thread count now).
+
+**The expert gate passes under the moved hashes**, run first as §28.9 rule 1 requires: 16/16 on
+`nominal` and on four of the six suites, `envelope_violation_rate` 0.0432, `passed = true`,
+112 s. (`torque_noise` 0/16 — the acceptance is the nominal suite's alone, and section 7.31
+already records that nothing in this table survives torque noise.) `runtime_threads` is `None`
+there because `--expert` loads no policy runtime.
+
+`success_rate` / `envelope_violation_rate` / `episode_length`, 16 held-out seeds 101–116:
+
+| suite | M7/U's U3 (7.31) | **U3′** — V15's data, today's tree | **U3″** — today's own 200 demonstrations |
+|---|---|---|---|
+| nominal | 0.5625 / 0.6668 / 1092.1 | **0.8750** / 0.5574 / 525.6 | **0.0000** / 0.0958 / 1800.0 |
+| light_intensity | 0.6250 / 0.6236 / 921.1 | 0.8125 / 0.6147 / 552.6 | 0.0000 / 0.1775 / 1800.0 |
+| light_direction | 0.1875 / 0.7265 / 1634.6 | 0.5625 / 0.7063 / 977.4 | 0.0625 / 0.1501 / 1694.3 |
+| observation_delay | 0.2500 / 0.6506 / 1502.2 | 0.8125 / 0.7086 / 621.6 | 0.0000 / 0.2175 / 1800.0 |
+| torque_noise | 0.0000 / 0.7157 / 1800.0 | 0.0000 / 0.6313 / 1800.0 | 0.0000 / 0.5234 / 1800.0 |
+| backlash | 0.4375 / 0.7031 / 1244.0 | 0.6875 / 0.7548 / 898.4 | 0.0000 / 0.1935 / 1800.0 |
+| training seeds 1–16, nominal | 0.5625 | **0.9375** | 0.1250 |
+| `passed` | true | **true** | **false** |
+
+Wall clocks: expert gate 112 s; U3′ holdout 149 s, train seeds 19 s; U3″ holdout 285 s, train
+seeds 54 s — each alone on the box, where section 7.31's 8:19 was two `--jobs 6` runs sharing it,
+and a policy that finishes in 526 ticks ends its episodes early besides.
+
+**Two rows there deserve a reviewer and neither of them is a hash.**
+
+**U3″ is 0.0000, and the arithmetic says why.** `training-u3.toml` fixes 20,000 optimizer steps
+at batch 64 — 1,280,000 samples, which is **34.6 epochs** of V15's 36,960 frames and **12.3
+epochs** of today's 103,881. The step count was tuned (T4 row D) against a dataset 2.8× smaller,
+and the packet forbade retuning anything. The policy's own numbers agree with that reading
+rather than with a broken pipeline: `envelope_violation_rate` 0.0958 on nominal against U3′'s
+0.5574, and every episode running the full 1,800 ticks — an arm that barely moves, not one that
+fights its envelope. **`es loop cycle`'s committed recipe is therefore under-trained for the data
+its own collect stage now produces**, which is an open question for the M10 review and not
+something W0b was allowed to fix.
+
+**U3′ is 0.8750 where section 7.31 recorded 0.5625, on what is very nearly the same input**, and
+this note will not attribute that to the hash fix. Two things separate the two runs: the
+checkpoint (stage 3's 8-ULP divergence, which is the trainer and not the documents) and four
+milestones of tree — M7/R1's episode-boundary partition, M8, M9 and W0a all landed in between.
+Stage 4c holds the weights fixed to tell those apart.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
