@@ -12,6 +12,11 @@
 //!     ES_PYTHON=$HOME/venvs/es/bin/python cargo test -p es-physics-backend \
 //!       --test mesh_box -- --nocapture
 
+// Exactness is the property under test where `==` appears: MuJoCo's counts are integers that
+// cross as `f64`, and `legacy` against `exact` has to agree bit for bit or not at all. Every
+// comparison that is a measurement rather than a count goes through `rel` and a tolerance.
+#![allow(clippy::float_cmp)]
+
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::PathBuf;
