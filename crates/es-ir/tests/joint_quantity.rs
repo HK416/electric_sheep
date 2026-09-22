@@ -14,9 +14,9 @@ use es_ir::task::{JointQuantity, ObsSource, TaskIr};
 /// `tests/fixtures/visible-learning/task.toml`'s `task_hash`, the same literal
 /// `sensor_render.rs` pins, typed in on purpose.
 const COMMITTED_TASK_HASH: &str =
-    "eb6efefa2010befff0c73a5cf8c089f1818e374a7c61a73a64dcd78849102127";
+    "86a7f3a3410f2ae70b48db7fa8d746552745aa3b75c4d3c5cb178549e47ab5ba";
 /// `tests/fixtures/visible-learning/task-pt.toml`'s.
-const COMMITTED_PT_HASH: &str = "d546b80804dd035ed6c696ddc251f8ce2d68d1a3964407d00f76af746c95e2fa";
+const COMMITTED_PT_HASH: &str = "02036847170efb5db3935ceb4f1c407a8531b643829786ef4795af18c024fb63";
 
 fn fixture(dir: &str, name: &str) -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))

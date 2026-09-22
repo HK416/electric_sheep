@@ -21,6 +21,25 @@ coefficients *and* evaluation order.
 - **No `fast-math`, no table lookups, no branch on device properties.**
 - **Target ≤ 2 ULP** over the primary domain of each function.
 
+## `f64` on the offline asset path (packet M10/W0b)
+
+`es_math::approx::sin_cos_f64` and `acos_f64` are the one exception to "input/output is
+`f32`", and they are not members of the polynomial family above: they are thin wrappers over
+the pure-Rust `libm` crate (a port of musl's libm, `no_std` — the route `es-safety` took for
+`sqrt`, `embedded-runtime.md` 3.2). They exist because the importers (`es-assets` MJCF /
+URDF) turn `euler=`, `axisangle=`, `zaxis=`, `fromto=` and `rpy` into quaternions whose bits
+enter `scene_hash` (§5.3), and `f64::sin_cos` / `f64::acos` there are the host's: the same
+`so101_pick_place.xml` hashed to two digests on Windows and Linux (M8 S-2). The Windows CRT
+and `libm` agree on the SO-101 scene's two `euler` half-angles and disagree on `acos` for the
+`fromto` capsules, so the Windows hash moved too (`4e0c2a8f…` → `882e7d0b…`); `go1_primitives.xml`,
+which spells every orientation with `xyaxes` (`sqrt` only), did not. Contract: `f64`, CPU-only,
+no Slang mirror, no ULP claim beyond `libm`'s own, **offline asset path only** — a kernel
+may not call them, `DET-010` still names the host's functions, and `f64::sqrt` stays (IEEE,
+correctly rounded). `approx_f64_bit_patterns_are_pinned` pins the bit patterns of the three
+inputs the SO-101 scene and a control exercise, and `crates/es-assets/tests/scene_hash_pins.rs`
+pins the five scene digests; both are asserted on the Windows tree and on the Linux oracle
+server.
+
 ## Range reduction
 
 | fn | primary domain | reduction |

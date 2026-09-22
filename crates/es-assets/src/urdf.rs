@@ -21,6 +21,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use es_core::StableId;
+use es_math::approx::sin_cos_f64;
 use es_math::{Inertia, Pose, Quat, Vec3};
 use roxmltree::{Document, Node};
 use thiserror::Error;
@@ -711,11 +712,12 @@ fn parse_vec3(text: &str) -> Result<Vec3, ()> {
 
 /// URDF roll-pitch-yaw: a fixed-axis (extrinsic) rotation about X, then Y, then Z, i.e.
 /// `q = qz * qy * qx`. URDF is already Z-up SI (spec 3.1), so this is the only conversion
-/// needed — no axis remapping.
+/// needed — no axis remapping. The bits enter `scene_hash`, so the trigonometry is
+/// `es_math::approx`'s `f64` port and not the host's (spec 3.2, `mjcf/orient.rs`).
 fn quat_from_rpy(rpy: Vec3) -> Quat {
-    let (sr, cr) = (rpy.x * 0.5).sin_cos();
-    let (sp, cp) = (rpy.y * 0.5).sin_cos();
-    let (sy, cy) = (rpy.z * 0.5).sin_cos();
+    let (sr, cr) = sin_cos_f64(rpy.x * 0.5);
+    let (sp, cp) = sin_cos_f64(rpy.y * 0.5);
+    let (sy, cy) = sin_cos_f64(rpy.z * 0.5);
     Quat::from_xyzw(
         sr * cp * cy - cr * sp * sy,
         cr * sp * cy + sr * cp * sy,
