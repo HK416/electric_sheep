@@ -328,3 +328,42 @@ fn torch_mlp_matches_rust() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// Packet M10/W0a oracle 1 (spec 5.3): the intra-op thread count the reference process runs
+/// with is what `torch.get_num_threads()` resolved from the environment it was spawned into,
+/// the runtime reports it, and `runtime_hash` covers it — two counts are two conditions.
+#[test]
+fn torch_runtime_hash_covers_the_thread_count() {
+    if let Err(why) = es_policy::torch_runtime::is_available() {
+        println!("SKIPPED torch_runtime_hash_covers_the_thread_count: {why}");
+        return;
+    }
+    assert_eq!(es_policy::torch_runtime::PROTOCOL_VERSION, 2);
+
+    let mut rng = Rng(0x1234_5678_9abc_def1);
+    let bytes = write_safetensors(&checkpoint(&mut rng));
+    let graph = mlp_graph(WeightsRef::Safetensors {
+        path: "w.safetensors".to_owned(),
+        hash: *blake3::hash(&bytes).as_bytes(),
+    });
+    let load = |threads: u32| {
+        let mut rt = TorchRuntime::with_env([("OMP_NUM_THREADS", threads.to_string())]);
+        assert_eq!(rt.threads(), None, "nothing is reported before a load");
+        rt.load(&graph, &es_policy::WeightsSource::InMemory(bytes.clone()))
+            .expect("torch is available, so the load must succeed");
+        assert_eq!(
+            rt.threads(),
+            Some(threads),
+            "the child reports the count it runs with"
+        );
+        rt.runtime_hash()
+    };
+
+    let one = load(1);
+    let two = load(2);
+    assert_eq!(one, load(1), "the same count is the same runtime");
+    assert_ne!(one, two, "a different count is a different runtime (spec 5.3)");
+    println!(
+        "RAN torch_runtime_hash_covers_the_thread_count: 1 thread {one:02x?} != 2 threads {two:02x?}"
+    );
+}
