@@ -439,16 +439,16 @@ float controls        (capability 확인 + execution mode 명시)
 |---|---|
 | 0 | `es-math` |
 | 1 | `es-core` (ECS, 잡, 시간, 실패 시맨틱) |
-| 2 | `es-gpu`, `es-assets`, `es-usd` |
+| 2 | `es-gpu`, `es-assets`, `es-ir-types` (IR 중립 타입·코드·그래프·해시), `es-usd` |
 | 3 | `es-actuator`, `es-sensor`, `es-physics-core` |
 | 4 | `es-physics-backend` (MJWarp/Newton/PhysX 어댑터), `es-physics-cpu`, `es-physics-gpu` |
 | 5 | `es-render`, `es-splat` (3DGS) |
 | 6 | **`es-ir`** (5종 IR 스키마·타입 시스템·정규화·해시·검증) |
 | 7 | **`es-compile`** (스케줄링, lowering, 백엔드 코드젠) |
 | 8 | **`es-policy`** (PolicyRuntime: Torch/ONNX/Vulkan), **`es-safety`** (Safety Plane) |
-| 9 | `es-env` (실행 오케스트레이션, 배치 도메인) |
+| 9 | `es-env` (실행 오케스트레이션, 배치 도메인), `es-import` (외부 정책·설정 임포터: LeRobot config, RoboVerse, RL 액터) |
 | 10 | `es-data`, `es-telemetry`, `es-eval` |
-| 11 | `es-ros2`, `es-py`, `es-script`, `es-transport` |
+| 11 | `es-ros2`, `es-py`, `es-script`, `es-transport`, `es-tools` (아티팩트를 읽는 `es` 동사들: video, showcase, backend, evidence, gap, bench) |
 | 12 | `es-editor` |
 
 **규칙 (CI 강제)**
@@ -553,6 +553,8 @@ execution_hash = H(
 ```
 
 **`execution_hash`가 §3.5 계층 1의 조건이다.** 그리고 무엇이 바뀌었을 때 어느 해시가 바뀌는지가 명확하므로, "실질적 변경"의 영향 범위를 기계적으로 판정할 수 있다(§27.1).
+
+**`runtime_hash`는 정책 런타임의 intra-op 스레드 수를 덮는다(패킷 M10/W0a, 2026-09-22; M8 S-1).** Torch의 CPU 추론은 스레드 수에 따라 비트가 다르므로 `TorchRuntime::runtime_hash`는 서브프로세스가 핸드셰이크에서 보고한 스레드 수를 해시하고 `evaluation.lock`이 그 수를 평문으로 기록한다: 다른 스레드 수에서 얻은 두 보고서는 깨진 약속 하나가 아니라 눈에 보이는 두 조건이다. 풀은 고정하지 않는다 — `--jobs N`은 여전히 워커마다 `cores / N`으로 제한하고 `--jobs 1`은 주변 풀을 물려받는다.
 
 `dataset_hash`가 셋으로 나뉘는 이유: 같은 데이터셋이라도 **분할이 다르면 학습 샘플 구성이 달라진다.** train/val/test split을 해시하지 않으면 재현이 성립하지 않는다.
 
@@ -665,7 +667,7 @@ ResetState        초기 상태 분포
 Record            데이터셋 기록 대상
 ```
 
-**센서의 렌더 경로.** `Sensor` 소스는 `render = { path = "rs" | "pt", spp, bounces, exposure, tonemap }`로 시뮬레이션이 그 센서를 어떻게 만드는지 선언한다(패킷 M7/R5). 기본값은 `rs`이며 **부재 = 기본값 = 오늘의 정규형**이라 커밋된 `task_hash`는 움직이지 않는다; `pt`는 `task_hash`를 움직이므로 새 문서다(§13.3). 관측 IR은 이것을 모른다 — 센서가 *무엇*인지는 `ImageSpec`이, 시뮬레이션이 그것을 *어떻게* 만드는지는 Task IR이 말한다.
+**센서의 렌더 경로.** `Sensor` 소스는 `render = { path = "rs" | "pt", spp, bounces, exposure, tonemap }`로 시뮬레이션이 그 센서를 어떻게 만드는지 선언한다(패킷 M7/R5). 기본값은 `rs`이며 **부재 = 기본값 = 오늘의 정규형**이라 커밋된 `task_hash`는 움직이지 않는다; `pt`는 `task_hash`를 움직이므로 새 문서다(§13.3). 관측 IR은 이것을 모른다 — 센서가 *무엇*인지는 `ImageSpec`이, 시뮬레이션이 그것을 *어떻게* 만드는지는 Task IR이 말한다. `render.seed = "fixed" | "tick"`(패킷 M10/W1a)은 패스 트레이서가 어떤 샘플 키 시드를 쓰는지 말한다: `fixed`(부재 = 기본값 = 오늘의 바이트)는 잡음을 픽셀만으로 키잉해 그레인이 포즈별 고정 텍스처가 되고, `tick`은 에피소드 상대 틱을 시드에 섞어 같은 포즈라도 두 틱의 그레인이 다르며, 수집기와 평가기는 같은 `(에피소드, 틱)`에서 여전히 비트 동일하다.
 
 `Parallel`은 존재하지 않는다. 병렬화는 컴파일러가 결정한다. `Wait`·`Repeat`·`Condition`은 IR-C 또는 `Compare`+`Select`로 대체된다.
 
@@ -708,6 +710,8 @@ phase 간 역방향 의존은 컴파일 에러다. 모든 노드는 활성 `EnvM
 | `DET-040` | 외부 백엔드 사용 시 계층 1 선언 불가 |
 
 **`sqrt`는 초월함수가 아니다(패킷 M8/S4d, 2026-09-21).** IEEE 754는 제곱근을 정확히 반올림하도록 요구하므로 `f64::sqrt`는 모든 플랫폼에서 비트 동일한 기본 산술 연산이고 `DET-010`의 대상이 아니다. 보상·종료 콘의 `Norm{L2}`는 `Expr::Sqrt`로 로워링되며, `exp`·`log`·삼각함수는 여전히 `MathFn{approx = true}`뿐이다.
+
+**오프라인 에셋 경로의 `f64`(패킷 M10/W0b, 2026-09-22).** 임포터(`es-assets`의 MJCF / URDF)는 `euler=`·`axisangle=`·`zaxis=`·`rpy`를 쿼터니언으로 바꾸고 그 비트가 `scene_hash`(§5.3)에 들어가므로 호스트 `libm`을 부를 수 없다: 거기서 허용되는 삼각함수는 `es_math::approx::sin_cos_f64`·`acos_f64` — 순수 Rust `libm` 포트(musl), 비트는 플랫폼이 아니라 크레이트가 고정, Slang 미러 없음 — 뿐이다. `f64`·CPU 전용이며 커널 경로 밖이다; `DET-010`이 이름하는 것은 호스트 함수이지 이것이 아니다.
 
 ---
 
@@ -3047,6 +3051,38 @@ S-5)이 남아 다음 캠페인이다. `EeDelta`의 IK는 이 절에 없다 — 
 목표가 한계에 붙어 매 틱 밀리고 잘림). §13.4의 RL 기본 행동 공간은 `JointPosition`으로 유지하고, 증분은 §8.5대로 가져오기를 위한 추가로
 남는다. 두 캠페인이 함께 가리키는 것은 **학습 중인 정책에 대한 엔벌로프의 의미**(M9 S-7): 이 과제의 위치 소프트 마진, 실행된 행동으로
 학습하는 추정기, 또는 측정 관절 위에서 적분하는 증분 — 각각 Deployment IR·스펙 문장이며 소유자의 결정이다(INV-12: 넓히되 끄지 않는다).
+
+### 28.13 M10 — 기록의 부채와 첫 실제 장면 (plan W)
+
+M9가 닫힌 뒤(`docs/reviews/M9.ko.md`) 소유자가 2026-09-22에 인수인계 순서를 받아들이고 넷을 정했다: `scene_hash` 수정(M8 S-2)은 SO-101의
+모든 해시를 움직이며 **기록은 새 해시 아래서 재수집·재학습·재채점한다**; 워커 스레드 풀(M8 S-1)은 고정하지 않고 **해시에 기록한다**;
+다섯 항목은 이 절 아래 하나의 캠페인으로 돈다; 오라클 서버는 **자원마다 하나씩**(GPU 큐와 CPU 큐) 돌리고 부하 아래의 wall-clock은 그렇게
+표기한다. 근거: 두 캠페인이 "원본 정책이 우리에게 없는 장면에서 학습됐다"는 문장으로 끝났고(M8 S-5, M9 S-8), 다음의 정직한 이어하기
+숫자는 맞는 장면 위의 실제 외부 정책이 필요하며 — 그것은 메시 geom이 필요하다 — 그동안 해시 체인은 알려진 구멍 둘을, PT 관측 경로는
+설명되지 않은 0.0(M7 R13)을 안고 있다.
+
+**이 절이 고정하는 규칙.** (1) 해시 수정은 해시만 옮긴다: 옮겨진 해시 아래 같은 플랫폼에서 다시 잰 모든 수치는 커밋된 것과 비트
+동일하거나, 편차를 ULP로 이름 붙여 기록한다(§28.9 규칙 2). (2) 메시는 추가다: 프리미티브 전용 장면의 `scene_hash`는 움직이지 않고,
+디코딩된 메시는 `SceneDesc`에 실리며, 리졸버는 trait이 아니라 함수다(INV-17). (3) 시드 스트림은 문서 필드다: 부재 = 기본값 = 오늘의
+바이트(§28.10 규칙 1), 수집기와 평가기는 같은 `(에피소드, 틱)`에서 비트 동일하다. (4) 한 번에 변수 하나, reach 숫자마다 시드 셋(M9
+S-5). (5) 새 trait 없음(INV-17); `es-safety` 불변(INV-11~13).
+
+| 파동 | 패킷 | 답하는 질문 | 오라클 (한 줄) | 유형 |
+|---|---|---|---|---|
+| 0 | **W0a 스레드 풀을 해시에** (`docs/packets/M10/W0a-thread-pool-hash.md`) | `runtime_hash`가 정책 런타임의 intra-op 스레드 수에 따라 바뀌고 다른 것은 움직이지 않는가 | `cargo test -p es-policy torch_runtime_hash_covers_the_thread_count`; 서버: 데모 nominal 스위트를 `--jobs 1`, `--jobs 8`, `OMP_NUM_THREADS=2 --jobs 1`로 — `evaluation_hash`는 셋 다 같고 `execution_hash`·보고서 바이트는 뒤의 둘만 같다 | B/D |
+| 0 | **W0b 호스트 libm 없는 `scene_hash`** (`W0b-scene-hash-libm.md`) | 에셋 경로의 삼각함수 호출 셋을 `es_math::approx::{sin_cos_f64, acos_f64}`로 돌리면 `scene_hash`가 Windows와 Linux에서 한 숫자인가 — 그리고 옮겨진 해시 아래의 재수집·재학습·재채점이 커밋된 모든 수치를 재현하는가 | 장면 다섯의 `scene_hash` Linux == Windows, `quadruped/task.toml` 불변; 서버: V15 재수집, U3 재학습·채점, reach A0 시드 셋 — 커밋된 수치 옆에 비트 동일하거나 편차에 이름 | B/D |
+| 1 | **W1a 틱별 PT 시드** (`W1a-pt-seed-tick.md`, M7 R13) | `render.seed = "tick"`이면 PT 정책이 그레인 외우기를 멈추는가 — U3의 0.5625, U4의 0.0 옆의 U5 행 | `cargo test -p es-env pt_seed_varies_per_tick_and_is_reproducible`; 커밋된 task 해시 불변; 서버: 200 수집 → 학습 → held-out·train-seed 평가 | B/D |
+| 1 | **P-M9-R5 실행된 행동 추정기** (`docs/packets/M9/P-M9-R5.md`) | 플레인이 실행한 행동으로 학습하면 reach가 4,000회 뒤에도 유지되고 10,000회에서 시드 셋으로 A0를 이기는가 | `train_rl_estimator_dry_run_plan`; 서버: 시드 3 × 4,000 / 10,000, A0 옆 | B/D |
+| 1 | **W3a `es-import` 분할** (`W3a-es-import-split.md`) | 임포터 셋을 레이어 9 크레이트로 내리고 re-export하면 호출자 무변경으로 `es-data`가 목표 아래인가 | `cargo xtask context-budget`: `es-data` < 6,000; 워크스페이스 테스트 녹색; `cargo xtask layering` | B |
+| 1 | **W2a 메시 에셋** (`W2a-mesh-assets.md`) | MJCF 메시 geom이 적재(STL / OBJ)·콘텐츠 해시·MuJoCo 시뮬레이션되고 프리미티브 전용 장면의 `scene_hash`는 불변인가 | `cargo test -p es-assets --test mesh_load`; MuJoCo: 메시 상자가 프리미티브 상자처럼 놓인다; 상위 SO-101이 메시 19개와 함께 적재·해시된다 | B |
+| 2 | **W2b 메시 렌더** (`W2b-mesh-render.md`) | 래스터라이저·패스 트레이서·CPU 레퍼런스가 같은 메시 삼각형을 그리는가 | CPU 레퍼런스의 `mesh_box` 골든이 GPU 둘에서 비트 동일 재현; 기존 골든 전부 불변 | B |
+| 2 | **W3b `es-tools` 분할** (`W3b-es-tools-split.md`) | 아티팩트 동사들을 레이어 11 크레이트로 옮기면 `cli.rs` 무변경으로 `es`가 목표 아래인가 | `context-budget`: `es` < 6,000; `cargo test -p es --test cli` 무변경 | B |
+| 3 | **M10 리뷰** | 기록이 명세로 돌아왔는가 | `docs/reviews/M10.md` + `.ko.md`; `cargo xtask ci` | A |
+
+**사다리에 없는 것.** MJCF 텍스처·머티리얼(M7 R6), `<mesh scale>` 베이킹과 `file=` 방출(W2a는 앞것을 이름으로 거부하고 뒷것 대신
+인라인 정점을 방출한다), MJWarp의 `ContactMesh`(거기서는 미검증) — 각각 W2a가 이름 붙이는 후속이다. 맞는 장면 위의 다음 원본 정책
+(메시 로더를 거친 MuJoCo Playground의 Panda)은 다음 캠페인이다; W2a는 그 전제이지 측정이 아니다. 버퍼 경로 워치독(M9 S-1),
+`hardware_capability` 슬롯(L24), M6는 그대로다.
 
 ---
 

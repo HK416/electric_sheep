@@ -439,16 +439,16 @@ Piercing all layers:  hash · version · provenance · telemetry · replay · ev
 |---|---|
 | 0 | `es-math` |
 | 1 | `es-core` (ECS, jobs, time, failure semantics) |
-| 2 | `es-gpu`, `es-assets`, `es-usd` |
+| 2 | `es-gpu`, `es-assets`, `es-ir-types` (the IR-neutral types, codes, graph and hash), `es-usd` |
 | 3 | `es-actuator`, `es-sensor`, `es-physics-core` |
 | 4 | `es-physics-backend` (MJWarp/Newton/PhysX adapters), `es-physics-cpu`, `es-physics-gpu` |
 | 5 | `es-render`, `es-splat` (3DGS) |
 | 6 | **`es-ir`** (the 5 IR schemas, type system, normalization, hash, validation) |
 | 7 | **`es-compile`** (scheduling, lowering, backend codegen) |
 | 8 | **`es-policy`** (PolicyRuntime: Torch/ONNX/Vulkan), **`es-safety`** (Safety Plane) |
-| 9 | `es-env` (execution orchestration, batch domain) |
+| 9 | `es-env` (execution orchestration, batch domain), `es-import` (external policy and config importers: LeRobot config, RoboVerse, RL actors) |
 | 10 | `es-data`, `es-telemetry`, `es-eval` |
-| 11 | `es-ros2`, `es-py`, `es-script`, `es-transport` |
+| 11 | `es-ros2`, `es-py`, `es-script`, `es-transport`, `es-tools` (the `es` verbs that read artifacts: video, showcase, backend, evidence, gap, bench) |
 | 12 | `es-editor` |
 
 **Rules (CI-enforced)**
@@ -552,6 +552,8 @@ execution_hash = H(
 ```
 
 **`execution_hash` is the condition for §3.5 Tier 1.** And because it is clear which hash changes when something changes, the impact scope of a "substantive change" can be judged mechanically (§27.1).
+
+**`runtime_hash` covers the policy runtime's intra-op thread count (packet M10/W0a, 2026-09-22; M8 S-1).** Torch's CPU inference is not bitwise across thread counts, so `TorchRuntime::runtime_hash` hashes the count the subprocess reports at its handshake and `evaluation.lock` records it in plain text: two reports taken at different counts are visibly two conditions, not one broken promise. The pool is not pinned — `--jobs N` still caps each worker at `cores / N` and `--jobs 1` inherits the ambient pool.
 
 Why `dataset_hash` is split into three: even for the same dataset, **a different split produces a different training sample composition.** If the train/val/test split is not hashed, reproduction does not hold.
 
@@ -664,7 +666,7 @@ ResetState        initial state distribution
 Record            dataset recording target
 ```
 
-**A sensor's render path.** A `Sensor` source declares how the simulation produces it with `render = { path = "rs" | "pt", spp, bounces, exposure, tonemap }` (packet M7/R5). The default is `rs`, and **absent = default = today's canonical form**, so no committed `task_hash` moves; `pt` moves `task_hash` and is therefore a new document (§13.3). The Observation IR does not know about it — what the sensor *is* belongs to `ImageSpec`, how the simulation *makes* it belongs to the Task IR.
+**A sensor's render path.** A `Sensor` source declares how the simulation produces it with `render = { path = "rs" | "pt", spp, bounces, exposure, tonemap }` (packet M7/R5). The default is `rs`, and **absent = default = today's canonical form**, so no committed `task_hash` moves; `pt` moves `task_hash` and is therefore a new document (§13.3). The Observation IR does not know about it — what the sensor *is* belongs to `ImageSpec`, how the simulation *makes* it belongs to the Task IR. `render.seed = "fixed" | "tick"` (packet M10/W1a) says which sample-key seed the path tracer uses: `fixed` (absent = default = today's bytes) keys the noise by pixel alone, so the grain is a fixed texture per pose; `tick` mixes the episode-relative tick into the seed, so the same pose at two ticks carries different grain, and the collector and the evaluator still agree bit for bit at the same `(episode, tick)`.
 
 `Parallel` does not exist. Parallelization is decided by the compiler. `Wait` / `Repeat` / `Condition` are replaced by IR-C or `Compare`+`Select`.
 
@@ -707,6 +709,8 @@ The supported functions correspond 1:1 to the §6.3 nodes. Loops, variable assig
 | `DET-040` | Tier 1 declaration not possible when using an external backend |
 
 **`sqrt` is not a transcendental (packet M8/S4d, 2026-09-21).** IEEE 754 requires a correctly rounded square root, so `f64::sqrt` is a basic arithmetic operation that is bit-identical on every platform and is not what `DET-010` names. A reward or termination cone's `Norm{L2}` lowers to `Expr::Sqrt`; `exp`, `log` and the trigonometric functions remain `MathFn{approx = true}` only.
+
+**`f64` on the offline asset path (packet M10/W0b, 2026-09-22).** The importers (`es-assets` MJCF / URDF) turn `euler=`, `axisangle=`, `zaxis=` and `rpy` into quaternions whose bits enter `scene_hash` (§5.3), so they cannot call the host's `libm`: the only trigonometric functions allowed there are `es_math::approx::sin_cos_f64` and `acos_f64` — the pure-Rust `libm` port (musl), bits fixed by the crate and not by the platform, no Slang mirror. They are `f64`, CPU-only and off the kernel path; `DET-010` names the host's functions, not these.
 
 ---
 ## 7. Observation IR
@@ -3114,6 +3118,41 @@ target sits against a limit, is pushed back and pushes again). §13.4's default 
 remains what §8.5 made it, an addition the importer needs. What the two campaigns point at together is **the envelope's meaning for a
 policy that is still learning** (M9 S-7): the position soft margin for this task, an estimator trained on the executed action, or an
 increment integrated over the measured joint — each a Deployment IR / spec sentence and the owner's decision (INV-12: widen, never disable).
+
+### 28.13 M10 — The Record's Debts and the First Real Scene (plan W)
+
+After M9 closed (`docs/reviews/M9.md`) the owner accepted, on 2026-09-22, the handover order and took four decisions: the
+`scene_hash` fix (M8 S-2) moves every SO-101 hash and **the record is re-collected, retrained and re-scored under the new
+hashes**; the worker thread pool (M8 S-1) is **written into the hash**, not pinned; the five items run as one campaign under this
+section; and the oracle server runs its jobs **one per resource** (a GPU queue and a CPU queue), wall-clocks under load marked as
+such. Grounds: two campaigns have ended on the sentence "the source policy was trained in a scene we do not have" (M8 S-5, M9
+S-8), and the next honest continuation number needs a real external policy on a matching scene — which needs mesh geoms — while
+the hash chain still carries two known holes and the PT observation path an unexplained 0.0 (M7 R13).
+
+**The rules this section pins down.** (1) A hash fix moves hashes and nothing else: every number re-measured on the same
+platform under a moved hash is bit-identical to the committed one, or the deviation is named in ULPs and recorded (§28.9 rule 2).
+(2) A mesh is an addition: the primitives-only scenes' `scene_hash` do not move, the decoded meshes ride on `SceneDesc`, and the
+resolver is a function, not a trait (INV-17). (3) The seed stream is a document field: absent = default = today's bytes (§28.10
+rule 1), and the collector and the evaluator agree bit for bit at the same `(episode, tick)`. (4) One variable at a time and
+three seeds per reach number (M9 S-5). (5) No new trait (INV-17); `es-safety` unchanged (INV-11–13).
+
+| Wave | Packet | Question it answers | Oracle (one line) | Type |
+|---|---|---|---|---|
+| 0 | **W0a the thread pool in the hash** (`docs/packets/M10/W0a-thread-pool-hash.md`) | Does `runtime_hash` change with the policy runtime's intra-op thread count, and does nothing else move | `cargo test -p es-policy torch_runtime_hash_covers_the_thread_count`; server: the demo's nominal suite at `--jobs 1`, `--jobs 8`, `OMP_NUM_THREADS=2 --jobs 1` — `evaluation_hash` equal in all three, `execution_hash` and report bytes equal for the last two only | B/D |
+| 0 | **W0b `scene_hash` without the host libm** (`W0b-scene-hash-libm.md`) | With the asset path's three trigonometric calls routed through `es_math::approx::{sin_cos_f64, acos_f64}`, is `scene_hash` one number on Windows and Linux — and do re-collection, retraining and re-scoring under the moved hashes reproduce every committed number | the five scenes' `scene_hash` Linux == Windows, `quadruped/task.toml` unmoved; server: V15 re-collected, U3 retrained and scored, reach A0 on three seeds — beside the committed numbers, bit for bit or the deviation named | B/D |
+| 1 | **W1a the per-tick PT seed** (`W1a-pt-seed-tick.md`, M7 R13) | With `render.seed = "tick"`, does the PT policy stop memorising the grain — row U5 beside U3's 0.5625 and U4's 0.0 | `cargo test -p es-env pt_seed_varies_per_tick_and_is_reproducible`; committed task hashes unmoved; server: collect 200 → train → held-out and train-seed evaluation | B/D |
+| 1 | **P-M9-R5 the executed-action estimator** (`docs/packets/M9/P-M9-R5.md`) | Trained on the action the plane executed, does reach hold past 4,000 iterations and beat A0 at 10,000 on three seeds | `train_rl_estimator_dry_run_plan`; server: 3 seeds × 4,000 / 10,000 beside A0 | B/D |
+| 1 | **W3a the `es-import` split** (`W3a-es-import-split.md`) | Moving the three importers down to a layer-9 crate with re-exports, is `es-data` under the target with no caller changed | `cargo xtask context-budget`: `es-data` < 6,000; workspace tests green; `cargo xtask layering` | B |
+| 1 | **W2a mesh assets** (`W2a-mesh-assets.md`) | Does an MJCF mesh geom load (STL / OBJ), hash by content and simulate on MuJoCo, with the primitives-only scenes' `scene_hash` unmoved | `cargo test -p es-assets --test mesh_load`; MuJoCo: a mesh box rests like the primitive box; upstream SO-101 with its 19 meshes loads and hashes | B |
+| 2 | **W2b mesh render** (`W2b-mesh-render.md`) | Do the rasterizer, the path tracer and the CPU reference draw the same mesh triangles | `mesh_box` goldens from the CPU reference, reproduced bit for bit on two GPUs; every existing golden unmoved | B |
+| 2 | **W3b the `es-tools` split** (`W3b-es-tools-split.md`) | Moving the artifact verbs to a layer-11 crate, is `es` under the target with `cli.rs` unchanged | `context-budget`: `es` < 6,000; `cargo test -p es --test cli` unchanged | B |
+| 3 | **M10 review** | Has the record come back into the specification | `docs/reviews/M10.md` + `.ko.md`; `cargo xtask ci` | A |
+
+**What is not on the ladder, and why.** MJCF textures and materials (M7 R6), `<mesh scale>` baking and `file=` emission (W2a
+refuses the first by name and emits inline vertices instead of the second), MJWarp's `ContactMesh` (unverified there) — each a
+follow-up W2a names. The next source policy on a matching scene (MuJoCo Playground's Panda through the mesh loader) is the next
+campaign; W2a is its prerequisite, not its measurement. The buffered-path watchdog (M9 S-1), the `hardware_capability` slot
+(L24) and M6 stay where they were.
 
 ---
 
