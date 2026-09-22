@@ -192,3 +192,105 @@ fn every_render_field_is_hash_input() {
         assert_eq!(hash_of(&back), hash);
     }
 }
+
+// --- packet M10/W1a: the sample-key seed stream ---------------------------------------------
+
+/// The `task_hash` of `tests/fixtures/visible-learning/task-pt.toml`, recorded in
+/// `docs/design/visible-learning.md` 7.32 and named by `evaluation-pt.toml`. Typed in for the
+/// same reason as [`COMMITTED_TASK_HASH`]: a field appended to `SensorRender` must move
+/// neither committed document.
+const COMMITTED_PT_TASK_HASH: &str =
+    "02036847170efb5db3935ceb4f1c407a8531b643829786ef4795af18c024fb63";
+
+/// `text` with `seed = "fixed"` written into the sensor's `render` table, so the claim is
+/// about what a person could type and not only about what `Default` returns.
+fn with_explicit_fixed_seed(text: &str) -> String {
+    let marker = "[body.observation_spec.channels.rgb_overhead.source.Sensor.render]";
+    let mut out = String::new();
+    let mut in_render = false;
+    for line in text.lines() {
+        out.push_str(line);
+        out.push('\n');
+        if line.trim() == marker {
+            in_render = true;
+        } else if in_render && line.trim().starts_with("bounces = ") {
+            out.push_str("seed = \"fixed\"\n");
+            in_render = false;
+        }
+    }
+    assert!(!in_render, "the render table has no `bounces` key");
+    out
+}
+
+/// Packet M10/W1a oracle 1: `SensorRender::seed` is a new field and **not** a new document.
+///
+/// `Fixed` is the default, absent and spelled out are the same bytes, and `Tick` is what moves
+/// the hash — spec 28.10 rule 1 applied one more time, and what lets `task-pt-tick.toml` exist
+/// beside `task-pt.toml` without invalidating row U4's numbers.
+#[test]
+fn committed_task_hashes_are_unmoved_by_seed_stream() {
+    use es_ir::task::SeedStream;
+
+    assert_eq!(SeedStream::default(), SeedStream::Fixed);
+    assert_eq!(SensorRender::default().seed, SeedStream::Fixed);
+
+    for (name, pinned) in [
+        ("task.toml", COMMITTED_TASK_HASH),
+        ("task-pt.toml", COMMITTED_PT_TASK_HASH),
+    ] {
+        let text = fixture(name);
+        let ir = es_ir::serial::task_from_toml(&text).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(hash_of(&ir), pinned, "{name}: the committed task_hash moved");
+        assert_eq!(
+            render_of(&ir).seed,
+            SeedStream::Fixed,
+            "{name}: an absent `seed` is `Fixed`"
+        );
+
+        // Absent = default = today's canonical form, in the text as well as in the type. Only
+        // `task-pt.toml` has a `render` table to write it into; `task.toml` has none, and the
+        // `if not default` rule in `ObsSource::canonical` is what the assertion above covers.
+        if name == "task-pt.toml" {
+            let explicit = es_ir::serial::task_from_toml(&with_explicit_fixed_seed(&text))
+                .expect("an explicit `seed = \"fixed\"` parses");
+            assert_eq!(render_of(&explicit).seed, SeedStream::Fixed);
+            assert_eq!(
+                hash_of(&explicit),
+                pinned,
+                "{name}: an explicitly written `seed = \"fixed\"` moved the hash"
+            );
+            assert!(explicit.validate().is_empty(), "{:?}", explicit.validate());
+        }
+
+        // ... and `Tick` does move it, so a per-tick seed is a new comparison (spec 13.3).
+        let ticked = with_render(
+            &ir,
+            SensorRender {
+                seed: SeedStream::Tick,
+                ..render_of(&ir)
+            },
+        );
+        let moved = hash_of(&ticked);
+        assert_ne!(moved, pinned, "{name}: `seed = \"tick\"` must move the hash");
+        assert!(ticked.validate().is_empty(), "{:?}", ticked.validate());
+        // Round trip: the document a generator writes parses back to the same hash.
+        let round = es_ir::serial::task_from_toml(
+            &es_ir::serial::task_to_toml(&ticked).expect("the ticked task serializes"),
+        )
+        .expect("it parses again");
+        assert_eq!(render_of(&round).seed, SeedStream::Tick);
+        assert_eq!(hash_of(&round), moved);
+        println!("{name}: seed = \"tick\" hashes {moved}");
+    }
+
+    // An unknown stream is refused by name rather than silently defaulted: a typo in a
+    // document must not quietly render today's bytes under a hash that claims otherwise.
+    let bad = with_explicit_fixed_seed(&fixture("task-pt.toml")).replace("\"fixed\"", "\"frame\"");
+    let err = es_ir::serial::task_from_toml(&bad).expect_err("an unknown seed stream is refused");
+    let text = format!("{err:?}");
+    assert!(
+        text.contains("frame"),
+        "the refusal does not name the value: {text}"
+    );
+    println!("RAN committed_task_hashes_are_unmoved_by_seed_stream");
+}

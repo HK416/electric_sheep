@@ -708,6 +708,37 @@ pub enum Tonemap {
     Aces,
 }
 
+/// Which seed the path tracer's sample keys are addressed from (packet M10/W1a, spec 6).
+///
+/// The observation path never accumulates, so a `Pt` frame's sample keys are a pure function
+/// of `(pixel, pose)` and 64 spp leaves a **fixed grain per pose** — a texture a policy can
+/// use as a fingerprint instead of learning the task (`docs/reviews/M7.md` R13,
+/// `docs/design/visible-learning.md` 7.32).
+///
+/// [`Self::Fixed`] is the default, absent is the default, and the default is today's bytes
+/// (spec 28.10 rule 1). It is not a quality knob: `Tick` renders the same estimator at the
+/// same `spp`, only keyed differently.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SeedStream {
+    /// One seed for the whole run: a pose always carries the same grain.
+    #[default]
+    Fixed,
+    /// The **episode-relative** tick is mixed into the seed, so the same pose at two ticks
+    /// carries different grain while the collector and the evaluator still agree bit for bit
+    /// at the same `(episode, tick)` (spec 3.4: the draw stays addressed, never stepped).
+    Tick,
+}
+
+impl SeedStream {
+    /// Whether this is the stream an absent `seed` means — the `skip_serializing_if` and the
+    /// canonical-form rule are the same predicate.
+    #[allow(clippy::trivially_copy_pass_by_ref)]
+    pub fn is_fixed(&self) -> bool {
+        matches!(self, Self::Fixed)
+    }
+}
+
 /// How the simulation *produces* one sensor channel (packet M7/R5).
 ///
 /// Not an `ImageSpec` field and not an Observation IR one: what the sensor **is** —
@@ -726,6 +757,11 @@ pub struct SensorRender {
     /// Linear multiplier applied before [`Self::tonemap`].
     pub exposure: f32,
     pub tonemap: Tonemap,
+    /// `Pt` only: which seed the sample keys are addressed from (packet M10/W1a). Absent =
+    /// [`SeedStream::Fixed`] = today's bytes, so appending it moved no committed `task_hash`
+    /// (`cargo test -p es-ir committed_task_hashes_are_unmoved_by_seed_stream`).
+    #[serde(default, skip_serializing_if = "SeedStream::is_fixed")]
+    pub seed: SeedStream,
 }
 
 impl Default for SensorRender {
@@ -734,6 +770,7 @@ impl Default for SensorRender {
             path: SensorPath::Rs,
             exposure: 1.0,
             tonemap: Tonemap::Reinhard,
+            seed: SeedStream::Fixed,
         }
     }
 }
@@ -758,6 +795,12 @@ impl SensorRender {
         }
         w.f32(self.exposure);
         wdbg(w, &self.tonemap);
+        // Appended, and written **only** when it is not the default: the two committed
+        // documents (`task.toml`, `task-pt.toml`) keep their canonical bytes and their
+        // `task_hash`es, and `seed = "tick"` is a new document (spec 13.3, 28.10 rule 1).
+        if !self.seed.is_fixed() {
+            wdbg(w, &self.seed);
+        }
     }
 }
 
