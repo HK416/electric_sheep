@@ -431,6 +431,13 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
     if opts.temporal.is_some() {
         cfg.channels.insert(Channel::History);
     }
+    // The declared seed stream, and the seed it mixes into (packet M10/W1a). A free `--eye`
+    // camera has no document and therefore no stream; `--accumulate` averages frames drawn
+    // from one seed, so the two do not combine and the stream wins only where there is one.
+    let (seed_stream, base_seed) = (
+        declared.map_or(es_ir::task::SeedStream::Fixed, |c| c.seed_stream),
+        cfg.seed,
+    );
     let mut renderer = Renderer::new(&gpu, cfg).map_err(|e| rt(format!("renderer: {e}")))?;
 
     fs::create_dir_all(&opts.out).map_err(|e| rt(format!("{}: {e}", opts.out.display())))?;
@@ -481,6 +488,16 @@ fn render(opts: &Opts) -> Result<u8, CliError> {
             let tri = cache
                 .tri_scene(&scene, &poses)
                 .map_err(|e| rt(format!("tessellation: {e}")))?;
+            // One `.estraj` is one episode, so the trajectory's own row index **is** the
+            // episode-relative tick the run rendered under (packet M10/W1a) -- which is what
+            // makes a replay of a `seed = "tick"` run reproduce its frames.
+            if seed_stream == es_ir::task::SeedStream::Tick {
+                renderer.set_seed(es_env::render::frame_seed(
+                    seed_stream,
+                    base_seed,
+                    u32::try_from(tick).unwrap_or(u32::MAX),
+                ));
+            }
             renderer
                 .upload_tris(tri)
                 .map_err(|e| rt(format!("scene upload: {e}")))?;

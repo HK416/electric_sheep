@@ -575,6 +575,10 @@ struct LightRig<'gpu> {
         es_assets::scene::SceneDesc,
         es_render::Renderer<'gpu>,
     )>,
+    /// `RenderConfig::seed` as `render_config` builds it, and the frames rendered since this
+    /// episode's tick 0 — the `Tick` seed stream's clock (packet M10/W1a).
+    base_seed: u32,
+    episode_frame: u32,
 }
 
 #[cfg(feature = "render")]
@@ -586,9 +590,11 @@ impl<'gpu> LightRig<'gpu> {
     ) -> Self {
         Self {
             gpu,
+            base_seed: es_env::render::render_config(&cfg).seed,
             scene,
             cfg,
             lit: None,
+            episode_frame: 0,
         }
     }
 
@@ -607,7 +613,24 @@ impl<'gpu> LightRig<'gpu> {
                 es_render::Renderer::new(self.gpu, rc).map_err(|e| format!("renderer: {e}"))?;
             self.lit = Some((*light, scene, renderer));
         }
+        // Tick 0 of the episode (packet M10/W1a). Since the `(cell, episode)` partition
+        // (packet M8/S1) the runner builds **one `Env` per episode**, freshly reset, so the
+        // backend clock reads 0 at an episode's first captured step and nowhere else -- which
+        // is the same instant `es loop collect` calls `EnvRenderer::begin_episode` at, and
+        // what makes the two stages render the same grain at the same `(episode, tick)`.
+        if state.tick.0 == 0 {
+            self.episode_frame = 0;
+        }
+        let ticked = (self.cfg.seed_stream == es_ir::task::SeedStream::Tick).then(|| {
+            es_env::render::frame_seed(self.cfg.seed_stream, self.base_seed, self.episode_frame)
+        });
+        self.episode_frame += 1;
         let (_, scene, renderer) = self.lit.as_mut().expect("just built");
+        // `Fixed` is left alone rather than re-set to the same number, so the default path
+        // does not even touch the config (the same rule `EnvRenderer::frame` follows).
+        if let Some(seed) = ticked {
+            renderer.set_seed(seed);
+        }
         let world = es_env::render::body_poses(model, state, 0);
         let tri = es_render::TriScene::from_scene_with_poses(scene, &world)
             .map_err(|e| format!("tessellation: {e}"))?;

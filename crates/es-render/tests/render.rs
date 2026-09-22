@@ -848,6 +848,68 @@ fn gpu_path_tracer_matches_the_cpu_reference_at_1spp() {
     );
 }
 
+/// Packet M10/W1a oracle 3: `Renderer::set_seed` moves the sample keys and nothing else.
+///
+/// The same scene, the same camera, the same estimator at 1 spp under a seed nobody has used:
+/// the GPU still equals the CPU reference bit for bit (so `set_seed` is a *parameter* and not
+/// a second code path), the pixels differ from the default seed's (so the grain really moved),
+/// and putting the default back returns the goldens' own bytes.
+#[test]
+fn gpu_path_tracer_matches_the_cpu_reference_after_set_seed() {
+    let test = "gpu_path_tracer_matches_the_cpu_reference_after_set_seed";
+    let Some(gpu) = open(test) else { return };
+    let cams = [cornell_camera(TILE, TILE)];
+    // `es_env::render::frame_seed`'s own arithmetic at tick 1, so the number this test pins is
+    // the number the observation path will render under.
+    let moved = es_render::rng::mix32(pt_cfg(1, 2).seed ^ 1);
+    assert_ne!(moved, pt_cfg(1, 2).seed, "the mixer is not the identity");
+
+    let mut renderer = Renderer::new(&gpu, pt_cfg(1, 2)).expect("renderer");
+    renderer.upload_tris(scene()).expect("upload");
+    let default_bytes = renderer
+        .render(&cams)
+        .expect("render")
+        .read_tile(0, Channel::PtRadiance)
+        .expect("radiance")
+        .to_bytes();
+    assert_eq!(
+        default_bytes,
+        cpu_pt1().tile(Channel::PtRadiance).unwrap().to_bytes(),
+        "the untouched seed is not the golden one"
+    );
+
+    renderer.set_seed(moved);
+    assert_eq!(renderer.seed(), moved);
+    let got = renderer
+        .render(&cams)
+        .expect("render")
+        .read_tile(0, Channel::PtRadiance)
+        .expect("radiance")
+        .to_bytes();
+    let mut cfg = pt_cfg(1, 2);
+    cfg.seed = moved;
+    let want = cpu::path_trace(&scene(), &cams[0], &cfg, 0);
+    assert!(
+        got == want.tile(Channel::PtRadiance).unwrap().to_bytes(),
+        "the GPU and the CPU reference disagree after set_seed"
+    );
+    assert!(got != default_bytes, "set_seed did not move the grain");
+
+    // ... and back: a `Fixed` sensor renders exactly what it always did.
+    renderer.set_seed(pt_cfg(1, 2).seed);
+    let back = renderer
+        .render(&cams)
+        .expect("render")
+        .read_tile(0, Channel::PtRadiance)
+        .expect("radiance")
+        .to_bytes();
+    assert!(back == default_bytes, "the default seed did not come back");
+    println!(
+        "RAN {test}: seed {moved:#010x} differs, {:#010x} returns",
+        pt_cfg(1, 2).seed
+    );
+}
+
 /// Spec 15.3: the render paths agree on depth, segmentation and normal, bit for bit.
 #[test]
 fn gpu_pt_and_rs_agree_on_geometry() {

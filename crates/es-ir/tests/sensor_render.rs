@@ -240,7 +240,11 @@ fn committed_task_hashes_are_unmoved_by_seed_stream() {
     ] {
         let text = fixture(name);
         let ir = es_ir::serial::task_from_toml(&text).unwrap_or_else(|e| panic!("{name}: {e:?}"));
-        assert_eq!(hash_of(&ir), pinned, "{name}: the committed task_hash moved");
+        assert_eq!(
+            hash_of(&ir),
+            pinned,
+            "{name}: the committed task_hash moved"
+        );
         assert_eq!(
             render_of(&ir).seed,
             SeedStream::Fixed,
@@ -271,7 +275,10 @@ fn committed_task_hashes_are_unmoved_by_seed_stream() {
             },
         );
         let moved = hash_of(&ticked);
-        assert_ne!(moved, pinned, "{name}: `seed = \"tick\"` must move the hash");
+        assert_ne!(
+            moved, pinned,
+            "{name}: `seed = \"tick\"` must move the hash"
+        );
         assert!(ticked.validate().is_empty(), "{:?}", ticked.validate());
         // Round trip: the document a generator writes parses back to the same hash.
         let round = es_ir::serial::task_from_toml(

@@ -466,6 +466,7 @@ fn sensor_cfg_rs_is_todays_config() {
             },
             exposure: 32.0,
             tonemap: es_ir::task::Tonemap::Aces,
+            seed: es_ir::task::SeedStream::Fixed,
         },
         None,
     );
@@ -650,4 +651,109 @@ fn gpu_frame_matches_the_cpu_frame() {
         "frame 1 on disk differs from the tile"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- packet M10/W1a: the per-tick seed stream ------------------------------------------------
+
+/// The `Pt` sensor `task-pt.toml` declares, at the `seed` stream asked for.
+fn pt_sensor(seed: es_ir::task::SeedStream) -> es_ir::task::SensorRender {
+    es_ir::task::SensorRender {
+        path: es_ir::task::SensorPath::Pt {
+            spp: 64,
+            bounces: 3,
+        },
+        exposure: 64.0,
+        tonemap: es_ir::task::Tonemap::Reinhard,
+        seed,
+    }
+}
+
+/// Packet M10/W1a oracle 2: `seed = "tick"` moves the grain, and only the grain.
+///
+/// Three claims, on the demo scene at one pinned pose (so the *only* thing that changes
+/// between two frames is the tick):
+///
+/// 1. under `Tick`, tick 0 and tick 1 of the same pose are **different bytes** — the fixed
+///    per-pose texture of `docs/reviews/M7.md` R13 is gone;
+/// 2. the same `(pose, tick)` rendered twice is **bit-identical** — the draw is still
+///    addressed and not stepped (spec 3.4), which is what lets the collector and the evaluator
+///    agree at the same `(episode, tick)`;
+/// 3. under `Fixed`, every frame is the bytes rendered before this packet existed — pinned
+///    here by rendering the same config through `es_render::Renderer` with the seed slot never
+///    touched, so the claim does not depend on a golden file.
+#[test]
+fn pt_seed_varies_per_tick_and_is_reproducible() {
+    let test = "pt_seed_varies_per_tick_and_is_reproducible";
+    let Some(gpu) = open(test) else { return };
+    let scene = scene();
+    let f = fixed(&scene);
+    let spec = image_spec(&scene, &cfg(&scene)).expect("the overhead camera resolves");
+    let id = overhead(&scene);
+
+    // Three frames of one pose through `EnvRenderer`, from the episode's tick 0.
+    let shots = |seed, n: usize| -> Vec<Vec<u8>> {
+        let mut r = EnvRenderer::new(&gpu, &scene, sensor_cfg(id, &spec, &pt_sensor(seed), None))
+            .expect("renderer");
+        r.begin_episode();
+        (0..n)
+            .map(|i| {
+                let t = r
+                    .frame(&f.model, &f.state(), 0)
+                    .unwrap_or_else(|e| panic!("frame {i}: {e}"))
+                    .to_bytes();
+                assert_eq!(r.episode_frame(), i as u32 + 1);
+                t
+            })
+            .collect()
+    };
+
+    let ticked = shots(es_ir::task::SeedStream::Tick, 3);
+    let diff = |a: &[u8], b: &[u8]| a.iter().zip(b).filter(|(x, y)| x != y).count();
+    assert!(
+        ticked[0] != ticked[1] && ticked[1] != ticked[2] && ticked[0] != ticked[2],
+        "the same pose carries the same grain at three ticks: the seed did not move"
+    );
+    println!(
+        "{test}: Tick ticks 0/1 differ in {} of {} bytes, 1/2 in {}",
+        diff(&ticked[0], &ticked[1]),
+        ticked[0].len(),
+        diff(&ticked[1], &ticked[2])
+    );
+
+    // The same (pose, tick) again: a second renderer, a second episode, the same three
+    // frames. This is the collector/evaluator parity claim, made locally.
+    let again = shots(es_ir::task::SeedStream::Tick, 3);
+    for (i, (a, b)) in ticked.iter().zip(&again).enumerate() {
+        assert!(a == b, "tick {i} is not reproducible");
+    }
+
+    // A `Fixed` sensor stands still, and stands exactly where it did before this packet: the
+    // renderer built straight from the same `RenderConfig`, with nothing ever calling
+    // `set_seed`, is what "before the change" means.
+    let fixed_shots = shots(es_ir::task::SeedStream::Fixed, 2);
+    assert!(
+        fixed_shots[0] == fixed_shots[1],
+        "a Fixed sensor moved between two ticks"
+    );
+    let unmoved = {
+        let c = sensor_cfg(id, &spec, &pt_sensor(es_ir::task::SeedStream::Fixed), None);
+        let mut r = es_render::Renderer::new(&gpu, render_config(&c)).expect("renderer");
+        let world = body_poses(&f.model, &f.state(), 0);
+        r.upload_tris(TriScene::from_scene_with_poses(&scene, &world).expect("tessellates"))
+            .expect("upload");
+        r.render(&[camera_view(&scene, &c, &world).expect("camera")])
+            .expect("render")
+            .read_tile(0, Channel::Rgb8)
+            .expect("rgb8")
+            .to_bytes()
+    };
+    assert!(
+        fixed_shots[0] == unmoved,
+        "a Fixed sensor no longer renders the bytes it rendered before packet M10/W1a"
+    );
+    assert!(
+        ticked[0] != unmoved,
+        "tick 0 of the Tick stream is the Fixed frame: the mixer is the identity at 0"
+    );
+    println!("RAN {test}: Fixed unmoved, Tick moves every tick and repeats");
 }
