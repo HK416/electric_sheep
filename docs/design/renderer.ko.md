@@ -1022,3 +1022,36 @@ SensorRender { path: Rs | Pt { spp, bounces }, exposure: f32, tonemap: Reinhard 
 - **관측 경로에서의 누적**, 의도적으로 (section 12.3).
 - **두 번째 이미지 채널.** `--frames`는 여전히 정확히 하나만 렌더하므로, IR이 담을 수 있음에도 "센서 하나는 `Pt`, 하나는 `Rs`"는 끝까지 표현되지 않는다.
 - **자유 카메라에 관한 어떤 것도.** `es video showcase --path pt`는 그대로다.
+
+### 12.8 샘플 시드가 에피소드의 틱을 따라 움직일 수 있다 (M10/W1a)
+
+R5는 아무도 요청하지 않은 성질을 남겼다. `RenderConfig::seed`는 상수 `0x5eed_1234`이고 관측 경로에는 누적이 없으므로(section 12.3) 호출마다 `frame == 0`이며, 샘플 키 `rng::key(seed, view, px, py, sample, bounce, stream)`는 **(픽셀, 포즈)의 순수 함수**다. 64 spp에서 그것은 정책이 에폭에 걸쳐 평균 내어 없앨 수 있는 잡음이 아니라, 포즈가 입고 있는 고정된 텍스처 — 그 포즈를 방문할 때마다 똑같은 것 — 이다. U4 행(`visible-learning.md` 7.32)은 래스터화된 U3보다 *더 낮은* 손실까지 학습하고도 held-out 16개 중 0개, 자기 학습 시드 16개 중 1개를 기록했다. 텍스처를 지문으로 쓰면 그렇게 보인다(`docs/reviews/M7.md` R13).
+
+**선언.** `SensorRender`가 필드 하나를 얻는다: `seed = "fixed" | "tick"`(§6). `fixed`가 기본값이고, 부재가 기본값이며, 기본값은 오늘의 바이트다 — 그래서 `task.toml`(`86a7f3a3…`)과 `task-pt.toml`(`02036847…`)의 `task_hash`는 움직이지 않고 U4 행의 숫자는 측정된 그 문서들에 관한 것으로 남는다(`cargo test -p es-ir committed_task_hashes_are_unmoved_by_seed_stream`, §28.10 규칙 1). `tick`은 해시를 움직이므로 새 문서 `task-pt-tick.toml`(`51b60dad…`)이 되고, section 12.2가 말하는 이유로 그 뒤에 자기 관측 IR과 평가 IR을 끌고 온다.
+
+**메커니즘은 곱셈 하나다.** `es_env::render::frame_seed`가 그 산술이 사는 유일한 곳이다:
+
+```rust
+match stream {
+    SeedStream::Fixed => base,                                  // 건드리지 않음, 오늘의 바이트
+    SeedStream::Tick  => es_render::rng::mix32(base ^ tick),    // Murmur3 fmix32,
+}                                                               // 샘플 키 자신의 믹서
+```
+
+그리고 `Renderer::set_seed`가 다음 `render` 전에 파라미터 버퍼의 슬롯 `p[13]`을 다시 쓴다. 아무것도 재빌드하지 않는다 — 시드는 파이프라인의 일부가 아니라 *파라미터*다 — 그리고 CPU 레퍼런스가 같은 `RenderConfig::seed`를 읽으므로 시드가 바뀌어도 CPU/GPU 동일성은 그대로다(`cargo test -p es-render gpu_path_tracer_matches_the_cpu_reference_after_set_seed`). 데모의 96×96 센서에서 측정: 고정된 포즈 하나의 틱 0과 틱 1은 **27,648바이트 중 26,927바이트**가 다르고, 같은 `(포즈, 틱)`을 두 번 렌더하면 비트 동일하다(`cargo test -p es-env --features render pt_seed_varies_per_tick_and_is_reproducible`).
+
+**어떤 틱이고, 각 단계는 그것을 어디서 얻는가.** 에피소드 상대 **렌더 인덱스**다: 에피소드를 여는 리셋에서 0, 렌더된 제어 스텝마다 +1. env의 누적 물리 시계가 아니다 — 그것은 같은 `Env`가 이미 몇 에피소드를 돌았는지에, 따라서 런이 어떻게 스케줄되었는지에 의존하며, M7/R1이 `StepEvent::tick`을 꺼낸 바로 그 함정이다. 문서를 렌더하는 세 단계는 그것을 서로 다른 세 곳에서 읽지만, 각각이 같은 그 인덱스이므로 일치한다:
+
+| 단계 | 틱 0이 오는 곳 |
+|---|---|
+| `es loop collect --frames` | 에피소드의 첫 제어 스텝 전에 방출되는 `CollectEvent::EpisodeBegin`이 `EnvRenderer::begin_episode`를 호출한다 |
+| `es eval run --frames` | 백엔드 시계가 0을 읽는 순간. `(cell, episode)` 분할(M8/S1) 이후 셀당 정확히 한 번 일어난다: 러너가 **에피소드마다 `Env` 하나**를 만든다 |
+| `es video showcase --task` | `.estraj`의 행 인덱스 — 궤적 하나가 에피소드 하나이므로 행이 곧 런이 렌더한 틱이다 |
+
+마지막 행이 `seed = "tick"` 런의 리플레이가 프레임을 다시 노이즈 내는 대신 재현하게 만드는 것이다.
+
+**12.8이 건너뛰는 것.**
+
+- **누적, 여전히**(12.3). `Temporal`은 하나의 시드에서 뽑은 프레임들을 평균한다; 둘은 결합하지 않으며, `Renderer::set_seed`는 그것을 막는 대신 문서에 적는다 — 관측 경로에는 충돌할 누적이 없다.
+- **`observation_delay` 아래의 정렬.** 평가기는 제어 스텝이 아니라 *렌더*를 센다. 그래서 관측을 떨어뜨리는 스위트는 같은 스텝의 수집기보다 시드를 느리게 전진시킨다. 내부적으로 일관되고 재현 가능하지만 같은 번호 매김은 아니며, 데모의 수집은 관측을 떨어뜨리지 않는다.
+- **스트림 id.** 틱은 `rng::key`의 자기 좌표를 받는 대신 시드에 섞인다. 좌표가 더 단정한 설계였겠지만 Slang 쪽(`rng.slang`)을 맞물려 고쳐야 했을 것이다; 시드를 섞는 것은 비용이 없고, 다른 `RenderConfig::seed`로 같은 장면을 렌더하는 것과 비트 동일하며, 그것은 CPU 레퍼런스가 이미 할 줄 아는 일이다.
