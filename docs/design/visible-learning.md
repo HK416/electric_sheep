@@ -4749,6 +4749,33 @@ checkpoint (stage 3's 8-ULP divergence, which is the trainer and not the documen
 milestones of tree — M7/R1's episode-boundary partition, M8, M9 and W0a all landed in between.
 Stage 4c holds the weights fixed to tell those apart.
 
+**Stage 4c — the comparison that moves only the hashes, and it is identical.** Section 7.31's own
+U3 checkpoint, on today's binary, judged twice: once by its own bundle against M7/U's
+`evaluation-augmented.toml` (`e5705cb0…`, `task eb6efefa…`), and once with the same
+`model-20000.safetensors` re-packed by `es policy pack` into this tree's bundle and judged by
+ours (`007aac67…`, `task 86a7f3a3…`). 222 s and 223 s.
+
+* **old-hash against new-hash: every cell identical**, all six suites, all four metrics,
+  including the `failure_mode_histogram` counts. **That is §28.13 rule 1 on the evaluator**:
+  the same weights in the same scene produce the same 96 episodes under a `task_hash` this
+  packet moved.
+* **Today's binary against M7/U's committed `report.json`: every cell identical too** — 0.5625 /
+  0.6668 / 1092.1 on nominal and the other five suites to the last digit. So the four
+  milestones between M7/U and now moved nothing in this evaluation either, and section 7.31's
+  table stands exactly as written.
+
+Both of those follow from one measurement, and together they say where U3′'s 0.8750 came from:
+**not the hashes and not the tree, but the checkpoint.** Two `es train` runs on bit-identical
+data at the same seed, parting at the fifth optimizer step by 8 ULPs, score 0.5625 and 0.8750 on
+the same 16 held-out seeds. That is worth an open question of its own — the demo's `success_rate`
+is far more sensitive to the trainer's float32 reduction order than any table in this note has so
+far implied, and no row here is reproducible to better than that.
+
+One `execution_hash` detail confirms W0a while it is in view: the old-hash run above carries
+`evaluation_hash e5705cb0…`, M7/U's exactly, and `execution_hash 350bcd43…` against M7/U's
+`a2283994…`. Same documents, same weights, same cells — and a different `execution_hash`,
+because `runtime_hash` now covers the 2 intra-op threads that `evaluation.lock` prints.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
