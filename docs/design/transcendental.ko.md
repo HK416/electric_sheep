@@ -22,6 +22,24 @@ physics / observation / reward 커널은 `f32::sin` 등을 직접 호출하는 �
 - **`fast-math` 금지, 테이블 조회 금지, 디바이스 속성에 따른 분기 금지.**
 - **각 함수의 주 정의역(primary domain)에서 목표는 ≤ 2 ULP.**
 
+## 오프라인 에셋 경로의 `f64` (패킷 M10/W0b)
+
+`es_math::approx::sin_cos_f64`와 `acos_f64`는 "입출력은 `f32`"의 유일한 예외이며, 위의
+다항식 계열에 속하지 않는다. 순수 Rust `libm` 크레이트(musl libm의 포팅, `no_std` —
+`es-safety`가 `sqrt`에 택한 경로, `embedded-runtime.md` 3.2)를 얇게 감싼 것이다. 이것이
+존재하는 이유는 임포터(`es-assets` MJCF / URDF)가 `euler=`, `axisangle=`, `zaxis=`,
+`fromto=`, `rpy`를 쿼터니언으로 바꾸고 그 비트가 `scene_hash`(§5.3)에 들어가는데, 거기서
+쓰던 `f64::sin_cos` / `f64::acos`는 호스트의 것이었기 때문이다: 같은 `so101_pick_place.xml`이
+Windows와 Linux에서 다른 두 다이제스트로 해시됐다(M8 S-2). Windows CRT와 `libm`은 SO-101
+장면의 두 `euler` 반각에서는 일치하고 `fromto` 캡슐의 `acos`에서는 갈리므로 Windows 해시도
+움직였다(`4e0c2a8f…` → `882e7d0b…`); 모든 방향을 `xyaxes`(`sqrt`뿐)로 쓰는
+`go1_primitives.xml`은 움직이지 않았다. 계약: `f64`, CPU 전용, Slang 미러 없음, `libm` 자체의
+것 이상의 ULP 주장 없음, **오프라인 에셋 경로 전용** — 커널은 호출할 수 없고, `DET-010`은
+여전히 호스트의 함수를 가리키며, `f64::sqrt`는 그대로다(IEEE, 올바른 반올림).
+`approx_f64_bit_patterns_are_pinned`가 SO-101 장면이 쓰는 두 입력과 대조군 하나의 비트
+패턴을 고정하고, `crates/es-assets/tests/scene_hash_pins.rs`가 다섯 장면의 다이제스트를
+고정한다; 둘 다 Windows 트리와 Linux 오라클 서버에서 단언된다.
+
 ## 범위 축소 (Range reduction)
 
 | fn | 주 정의역 | 축소 방법 |

@@ -26,7 +26,7 @@
 # THE ONE DEVIATION, and it is measured rather than assumed (`docs/design/rl-continuation.md`
 # section 7, "S4c"): brax's observation normalizer is folded into the first Dense of the
 # neutral export before the import, so the bundle carries the committed
-# `observation-reach.toml` (identity `Range{-1, 1}`, `observation_hash 4ced8547...`) rather
+# `observation-reach.toml` (identity `Range{-1, 1}`, `observation_hash ecabac79...`) rather
 # than a `Normalize{MeanStd}` of its own. The folded network is the same function of the raw
 # observation; without the fold `es eval run` refuses the bundle by name (`XIR-040`: an
 # Evaluation IR judges the documents it names), and no row of the table could be compared to

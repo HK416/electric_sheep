@@ -4,9 +4,13 @@
 //! `zaxis` — and `MuJoCo` takes the first one present. `quat` is wxyz there and xyzw here, which
 //! is the single most common way an importer goes quietly wrong.
 //!
-//! `sin`/`cos` here are `std`'s: this is an offline import path, not a physics, observation or
-//! reward kernel, so the spec 3.2 restriction to `es_math::approx` does not apply.
+//! The trigonometry here is `es_math::approx::{sin_cos_f64, acos_f64}` and not `std`'s: this is
+//! an offline import path, not a kernel, but the quaternion's bits enter `scene_hash` (spec
+//! 5.3), and the host's libm gave the SO-101 scene two digests for one file (Windows against
+//! Linux, M8 S-2). The spec 3.2 restriction applies for that reason — the `f64` paragraph
+//! there names these two functions. `sqrt` stays `f64::sqrt` (IEEE, correctly rounded).
 
+use es_math::approx::{acos_f64, sin_cos_f64};
 use es_math::{Quat, Vec3};
 
 use super::attrs::Attrs;
@@ -53,7 +57,7 @@ pub(crate) fn read(attrs: &Attrs<'_>, angle_scale: f64, eulerseq: &str) -> Resul
 /// Rotation of `angle` rad about `axis`.
 pub(crate) fn axis_angle(axis: Vec3, angle: f64) -> Quat {
     let axis = axis.normalize();
-    let (s, c) = (angle * 0.5).sin_cos();
+    let (s, c) = sin_cos_f64(angle * 0.5);
     Quat::from_xyzw(axis.x * s, axis.y * s, axis.z * s, c).normalize()
 }
 
@@ -72,7 +76,7 @@ pub(crate) fn from_zaxis(dir: Vec3) -> Option<Quat> {
         // Antiparallel: a half turn about any axis orthogonal to +Z.
         return Some(Quat::from_xyzw(1.0, 0.0, 0.0, 0.0).normalize());
     }
-    Some(axis_angle(up.cross(z), dot.clamp(-1.0, 1.0).acos()))
+    Some(axis_angle(up.cross(z), acos_f64(dot.clamp(-1.0, 1.0))))
 }
 
 /// Frame whose x axis is `x` and whose y axis is `y` after Gram-Schmidt, as `MuJoCo` does.

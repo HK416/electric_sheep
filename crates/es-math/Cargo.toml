@@ -8,6 +8,10 @@ license.workspace = true
 [dependencies]
 serde = { workspace = true }
 wide = { workspace = true }
+# The `f64` trigonometry on the offline asset path (spec 3.2, packet M10/W0b): a pure-Rust
+# port of musl's libm, so the bits are the crate's and not the host's. `no_std` by birth, the
+# route `es-safety` took for `sqrt` (embedded-runtime.md 3.2).
+libm = { version = "0.2", default-features = false }
 
 [dev-dependencies]
 proptest = { workspace = true }
