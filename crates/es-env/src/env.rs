@@ -258,6 +258,12 @@ impl<B: PhysicsBackend> Env<B> {
             ..StateView::default()
         };
         self.backend.reset(envs, Some(&state))?;
+        // `self.tick` is a cache of the backend's clock, and `step` is not the only thing that
+        // moves it: the batch shares one clock and a whole-batch reset rewinds it. Re-read it
+        // here, or the next episode's first `tick()` reports the previous episode's -- which
+        // `es loop collect --telemetry` latches as the episode's origin before subtracting it
+        // from a smaller number (packet M10/R1, spec 10.5).
+        self.tick = self.backend.state().tick;
         Ok(closed)
     }
 
