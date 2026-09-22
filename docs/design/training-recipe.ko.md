@@ -1305,6 +1305,7 @@ clip        = 0.2
 entropy     = 0.005
 value_coef  = 0.5
 # init_log_std = -0.5   # 선택. 없으면 -0.5, 또는 [init]을 통한 importer 자신의 값
+# estimator  = "executed"  # 선택. 없으면 "sampled" (패킷 M9/R5)
 
 [run]
 steps         = 200   # PPO 반복 횟수
@@ -1333,6 +1334,15 @@ device        = "cpu"
 `[run]`의 나머지는 의미가 그대로다. `steps`는 반복 횟수이고, `seed`, `device`, `lr`,
 `grad_clip`, `weight_decay`, `schedule`, `extra`는 `train_act.py`에 닿던 것과 같은 플래그로
 `train_ppo.py`에 닿는다.
+
+**`estimator` (패킷 M9/R5, 선택).** `"sampled"` — 기본값이자 그 패킷 이전에 측정된 모든 행 —
+은 PPO의 로그 확률을 가우시안 자신의 샘플에서 계산하고, `"executed"`는 `Rollout::act`가
+돌려준 행동에서 계산한다. 매 틱이 클램프되는 작업에서 그것은 환경이 실제로 실행한 유일한
+행동이다(`rl-continuation.md` 2절과 7절). 트레이너에는 `--estimator executed`로 닿으며, argv의
+맨 끝에 **레시피가 요청할 때만** 붙는다. 없는 것과 `estimator = "sampled"`를 적어 놓은 것은
+똑같이 직렬화되므로, 이 패킷 이전에 쓰인 모든 레시피와 계획 골든은 측정될 때의
+`training_hash`를 그대로 지닌다. 구현되지 않은 값은 `algo`와 같은 방식으로 이름을 대고
+거절한다. 플레인도, 엔벨로프도, 기록되는 것도 이 필드로 움직이지 않는다 — 15.4절을 보라.
 
 ### 15.2 계획
 
@@ -1392,6 +1402,11 @@ Task·Observation·Deployment IR을 *번들에서 꺼내* `<out>/docs/{task,obse
 `envelope_violation_rate`는 이벤트를 얼마나 자주 올렸는지이고 `executed_ne_sampled_rate`는
 액추에이터에 닿은 것이 샘플된 것과 얼마나 자주 달랐는지다. 데모 작업에서 둘 다 `1.00`으로
 읽힌다. `rl-continuation.md` 7절을 보라. 거기서 그 숫자는 각주가 아니라 발견이다.
+
+`[rl] estimator`는 그 열을 바꾸지 않는다. `executed_ne_sampled_rate`는 어느 추정량에서도
+플레인의 출력을 **샘플**과 계속 비교한다. 그것은 그래디언트를 어느 행동에서 취했는가가 아니라
+엔벨로프에 관한 사실이기 때문이다. `"executed"`가 바꾸는 것은 프로세스 경계 이쪽의 트레이너
+산술이고, Deployment IR의 어떤 것도 아니다(INV-11..13).
 
 `tests/fixtures/rl/deployment-rl.toml`은 이를 위해 워치독 하나만 넓힌다
 (`envelope_violation_rate.max_frac` 0.9 → 1.0). 그리고 horizon 1 제어가 강제하는 세 필드를

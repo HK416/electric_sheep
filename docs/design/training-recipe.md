@@ -1342,6 +1342,7 @@ clip        = 0.2
 entropy     = 0.005
 value_coef  = 0.5
 # init_log_std = -0.5   # optional; absent is -0.5, or the importer's own via [init]
+# estimator  = "executed"  # optional; absent is "sampled" (packet M9/R5)
 
 [run]
 steps         = 200   # PPO iterations
@@ -1370,6 +1371,17 @@ Three fields behave differently here, and each is a refusal rather than a silent
 Everything else in `[run]` keeps its meaning: `steps` is the iteration count, and `seed`,
 `device`, `lr`, `grad_clip`, `weight_decay`, `schedule` and `extra` reach `train_ppo.py` as the
 same flags they reach `train_act.py` as.
+
+**`estimator` (packet M9/R5, optional).** `"sampled"` — the default and every row measured
+before that packet — computes PPO's log-probability at the Gaussian's own sample;
+`"executed"` computes it at the action `Rollout::act` returned, which on a task that clamps
+every tick is the only action the environment ever ran (`rl-continuation.md` sections 2 and
+7). It reaches the trainer as `--estimator executed`, appended at the end of the argv and
+**only when the recipe asks for it**: absent and `estimator = "sampled"` spelled out
+serialise identically, so every recipe and plan golden written before the packet keeps the
+`training_hash` it was measured under. An unimplemented value is refused by name, the way
+`algo` is. Nothing about the plane, the envelope or what is recorded moves with it — see
+15.4.
 
 ### 15.2 The plan
 
@@ -1433,6 +1445,12 @@ plane did is not hidden either: `envelope_violation_rate` is how often it raised
 `executed_ne_sampled_rate` how often what reached the actuator was not what was sampled. On the
 demo task both read `1.00` — see `rl-continuation.md` section 7, where that number is the
 finding rather than a footnote.
+
+`[rl] estimator` does not change that column. `executed_ne_sampled_rate` keeps comparing the
+plane's output with the **sample** under either estimator, because it is a fact about the
+envelope and not about which action the gradient was taken at; what `"executed"` changes is
+the trainer's arithmetic, on this side of the process boundary, and nothing in the Deployment
+IR (INV-11..13).
 
 `tests/fixtures/rl/deployment-rl.toml` widens exactly one watchdog for this,
 `envelope_violation_rate.max_frac` 0.9 → 1.0, and moves three fields that horizon-1 control
