@@ -464,6 +464,7 @@ mod tests {
             cameras: Vec::new(),
             assets: Vec::new(),
             options: es_assets::scene::PhysicsOptions::default(),
+            meshes: BTreeMap::new(),
         }
     }
 

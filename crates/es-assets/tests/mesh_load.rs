@@ -258,8 +258,8 @@ fn missing_file_names_the_path() {
 #[test]
 fn bad_index_is_an_error() {
     // OBJ: 1-based index past the end of `v`.
-    let text = es_assets::obj::parse("v 0 0 0\nv 1 0 0\nv 1 1 0\nf 1 2 4\n")
-        .expect_err("index 4 of 3");
+    let text =
+        es_assets::obj::parse("v 0 0 0\nv 1 0 0\nv 1 1 0\nf 1 2 4\n").expect_err("index 4 of 3");
     assert!(text.contains('4'), "{text}");
     // OBJ: index 0 does not exist in a 1-based scheme.
     assert!(es_assets::obj::parse("v 0 0 0\nf 0 0 0\n").is_err());

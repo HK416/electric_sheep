@@ -308,7 +308,11 @@ fn mjwarp(feature: TaskFeature) -> Mapping {
         TaskFeature::Spec17(Spec17Row::JointArmature)
         | TaskFeature::Capability(Feature::JointArmature) => Mapping::native("armature"),
         TaskFeature::Spec17(Spec17Row::SensorContactForce) => Mapping::blocked(EMITTER),
-        TaskFeature::Capability(Feature::ContactCondim6) => Mapping::unverified(),
+        // `ContactCondim6`, and the inline `<asset><mesh>` mujoco-cpu gained in packet
+        // M10/W2a: neither was run through MJWarp's own engine, so this column claims neither.
+        TaskFeature::Capability(Feature::ContactCondim6 | Feature::ContactMesh) => {
+            Mapping::unverified()
+        }
         TaskFeature::Capability(capability) => {
             // Everything else the emitter can write has MuJoCo meaning on this backend too.
             if crate::mujoco::capabilities().has(capability) {

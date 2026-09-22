@@ -16,6 +16,8 @@
 //! `x in [-1.2, 4] , y in [-2, 2] , z in [0, 4]` and the camera sits just inside the open
 //! `x = -1.2` end looking along +X.
 
+use std::collections::BTreeMap;
+
 use es_assets::scene::{scene_id, Body, Geom, PhysicsOptions, SceneDesc, Shape};
 use es_math::{Pose, Quat, Vec3};
 
@@ -90,6 +92,7 @@ pub fn cornell_box() -> SceneDesc {
         cameras: Vec::new(),
         assets: Vec::new(),
         options: PhysicsOptions::default(),
+        meshes: BTreeMap::new(),
     }
 }
 
