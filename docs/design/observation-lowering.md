@@ -435,7 +435,11 @@ fails if a byte differs, so provenance is machine-checked whenever torch is inst
 (`ES_PYTHON` points at it) and prints `SKIPPED` when it is not. Replacing a golden means
 running the script at `tests/golden/observation` and gating the commit with
 `GOLDEN_UPDATE=1 cargo xtask verify-goldens` — a deliberate act with a spec change behind it,
-never a way to make a test pass.
+never a way to make a test pass. The script writes every text file with `newline="
+"`:
+the goldens are LF (`.gitattributes` `eol=lf`) and Python's text mode would otherwise emit
+CRLF on Windows, where the sidecars -- not the `.bin` files -- then differ by one byte per
+line (packet M10/R1).
 
 Comparison is byte-for-byte unless the sidecar declares a `tolerance_ulp`; only
 `srgb_to_linear_lut256` does, at 7 ULP, for the reason in §6.

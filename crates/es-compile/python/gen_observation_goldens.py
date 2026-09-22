@@ -73,7 +73,12 @@ def write(out: Path, name: str, tensor: torch.Tensor, kernel: str, pins: str, or
     }
     if tolerance_ulp:
         sidecar["tolerance_ulp"] = tolerance_ulp
-    (out / f"{name}.json").write_text(json.dumps(sidecar, indent=2) + "\n", encoding="utf-8")
+    # Text mode translates "\n" to the host newline; the committed goldens are LF
+    # (`.gitattributes` `eol=lf`), so this write pins LF and the generator reproduces them
+    # byte for byte on Windows too (packet M10/R1, spec 1.4).
+    (out / f"{name}.json").write_text(
+        json.dumps(sidecar, indent=2) + "\n", encoding="utf-8", newline="\n",
+    )
 
 
 def main(out: Path) -> None:

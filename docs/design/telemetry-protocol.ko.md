@@ -266,7 +266,12 @@ env가 하나이므로 스텝당 `validate`는 정확히 한 번이고, 수가 �
 `SafeAction::events`가 지니는 것과 같은 비트셋을, 수집기가 볼 수 있는 쪽에서 읽은 것이다
 (`SafeAction` 자체는 `es_env::DomainRunner::emit_actions`가 가지고 있다). 그 배열은 싱크가 있을
 때만 읽히고, `--out` 아래 데이터셋은 플래그가 있든 없든 바이트 단위로 같다
-(`collect_telemetry_publishes_every_episode`가 두 트리의 모든 파일을 비교한다).
+(`collect_telemetry_publishes_every_episode`가 두 트리의 모든 파일을 비교한다). 발행자는
+스트림 2의 `tick`을 에피소드 기준으로 옮긴다(§10.5, 패킷 M7/R1) — 에피소드의 첫 틱을 걸어두고
+빼는 방식이므로 `Env::tick()`이 env의 *현재* 시계여야 한다: 패킷 M10/R1 이전에는 `Env::step`만
+갱신하는 캐시였기 때문에, `--max-steps`로 끝난 에피소드 뒤 — 백엔드의 시계를 되감는 전체 배치
+`Env::reset` — 걸어둔 원점이 이전 에피소드의 것이 되어 다음 뺄셈이 언더플로했다. 이제
+`Env::reset`이 시계를 다시 읽고, 빼는 자리는 그대로다.
 
 **학습은 자기 stdout을 발행한다.** `train_act.py --progress-every N`은 `N` 옵티마이저 스텝마다
 `{"progress": {…}}` 한 줄을 찍고, `--sample-every N`은 `--loss-curve` 옆에

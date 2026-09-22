@@ -258,6 +258,12 @@ impl<B: PhysicsBackend> Env<B> {
             ..StateView::default()
         };
         self.backend.reset(envs, Some(&state))?;
+        // `self.tick` is a cache of the backend's clock, and `step` is not the only thing that
+        // moves it: the batch shares one clock and a whole-batch reset rewinds it. Re-read it
+        // here, or the next episode's first `tick()` reports the previous episode's -- which
+        // `es loop collect --telemetry` latches as the episode's origin before subtracting it
+        // from a smaller number (packet M10/R1, spec 10.5).
+        self.tick = self.backend.state().tick;
         Ok(closed)
     }
 
@@ -817,6 +823,12 @@ pub(crate) mod tests {
                 }
                 self.sensordata[*env as usize] = self.qpos[q];
             }
+            // The batch shares one clock, so only a whole-batch reset rewinds it -- the
+            // `MuJoCoCpuBackend` semantics this double has to mirror for the tick cache to be
+            // testable here (packet M10/R1).
+            if envs.is_none() {
+                self.tick = PhysTick::ZERO;
+            }
             Ok(())
         }
 
@@ -927,6 +939,33 @@ pub(crate) mod tests {
         assert_eq!(env.tick(), PhysTick(100 * 20));
         assert_eq!(traces[0].len(), 100);
         assert!(traces[0].iter().all(|r| r.is_finite()));
+    }
+
+    /// `Env::tick()` is a cache of the backend's clock, and `step` is not the only thing that
+    /// moves that clock: a whole-batch reset rewinds it. Left stale, the next episode's first
+    /// tick reports the previous episode's, which `es loop collect --telemetry` latches as the
+    /// episode's origin and then subtracts from a smaller number (packet M10/R1, spec 10.5).
+    #[test]
+    fn a_whole_batch_reset_resyncs_the_cached_tick() {
+        let task = pendulum_task(0, Some(Distribution::Constant(0.3)));
+        let mut env = env_of(&task, 2, 1234);
+        run(&mut env, 2, 5);
+        assert_eq!(env.tick(), PhysTick(5 * 20));
+
+        env.reset(None).expect("whole-batch reset");
+        assert_eq!(
+            env.tick(),
+            env.backend().state().tick,
+            "the cached tick is the backend's clock, not what the last step left"
+        );
+        assert_eq!(env.tick(), PhysTick::ZERO);
+
+        // A subset reset shares the batch's clock and does not rewind it, so the cache must
+        // not jump backwards either.
+        run(&mut env, 2, 3);
+        env.reset(Some(&[1])).expect("subset reset");
+        assert_eq!(env.tick(), PhysTick(3 * 20));
+        assert_eq!(env.tick(), env.backend().state().tick);
     }
 
     #[test]
