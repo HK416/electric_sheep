@@ -4255,6 +4255,88 @@ brax 증분 정책은 이어붙이기 전후 모두 **0.0**. 증분은 `violatio
 클램프된다. §13.4의 기본 행동 공간에는 변화가 없다; 열린 지렛대는 학습 정책에 대한 엔벌로프의
 의미다(M9 리뷰의 S-7).
 
+### 7.37 만든 대로 (M10/W1a): 그레인이 움직이는 같은 정책, U5 행
+
+패킷 `docs/packets/M10/W1a-pt-seed-tick.md`; 렌더러 쪽은 `renderer.md` section 12.8이다.
+U4 행(7.32절)은 패스 트레이싱된 ACT를 래스터화된 U3보다 **더 낮은** 손실 — 0.0067 대 0.0045 —
+까지 학습시키고도 held-out 16개 중 0개, 자기 학습 시드 16개 중 1개를 기록했다. 후속 R13이 첫
+용의자를 지목했다: 관측 경로에는 누적이 없으므로 64 spp에서 패스 트레이서의 샘플 키는
+`(픽셀, 포즈)`의 순수 함수이고 모든 포즈가 고정된 그레인을 입는다. 이 패킷은 그것을 논쟁 대신
+검사 가능하게 만든다. 필드 하나 — `render.seed = "tick"` — 가 에피소드 상대 틱을 시드에 섞어
+같은 포즈라도 틱이 다르면 다른 그레인을 지니게 하고, 수집기와 평가기는 같은 `(에피소드, 틱)`에서
+여전히 비트 동일하다. 나머지는 전부 U4의 것이고, U4의 것은 U3의 것이었다.
+
+**문서들.** `task-pt-tick.toml`은 재생성된 `task-pt.toml`에 한 줄 — 센서의 `render` 테이블에
+`seed = "tick"` — 을 더한 것이고 그 외에는 아무것도 아니다; 주석을 걷어낸 `diff`가 그 한 줄이다.
+커밋된 `task.toml`(`86a7f3a3…`)과 `task-pt.toml`(`02036847…`)은 움직이지 않으며
+`cargo test -p es-ir committed_task_hashes_are_unmoved_by_seed_stream`이 고정한다.
+
+| 문서 | 해시 | 비고 |
+|---|---|---|
+| `task-pt-tick.toml` | **`51b60dad…`** | `task-pt.toml` + `seed = "tick"` |
+| `observation-pt-tick.toml` | `9bb3ed9f…` | `observation.toml`의 그래프, `task_ref` 재조준 |
+| `evaluation-pt-tick.toml` | `86cb3cf8…` | `evaluation.toml`의 held-out 시드 16개 × 스위트 6개 |
+| `observation-augmented-pt-tick.toml` (서버) | `4e1d6482…` | T6의 그래프, `task_ref` 재조준 |
+| U5의 평가 IR (서버) | *아래 참조* | 이 행의 `evaluation_hash` |
+
+또 다섯이고, 7.32절이 치러야 했던 것과 같은 이유다: `task_ref`는 해시 입력이고 `XIR_001`이 관측
+IR 하나를 Task IR 하나에 묶으므로, 그래프의 모든 노드가 복사본이어도 새 Task IR은 하위 문서 집합
+전체를 다시 발행한다(`renderer.md` 12.2).
+
+**어떤 틱인가.** 에피소드 상대 렌더 인덱스 — 에피소드를 여는 리셋에서 0, 렌더된 제어 스텝마다
++1 — 이며, `es loop collect`는 `CollectEvent::EpisodeBegin`에서, `es eval run`은 백엔드 시계가
+0을 읽는 것에서(M8/S1 이후 러너는 에피소드마다 `Env` 하나를 만든다), `es video showcase`는
+`.estraj`의 행 인덱스에서 읽는다. 전체 서술은 `renderer.md` 12.8의 표이고, 여기서의 요점은 셋이
+모두 같은 숫자라는 것 — 비싼 것이 하나라도 돌기 전에 아래의 패리티 단계가 확인하는 것이 그것이다.
+
+#### 행
+
+| 행 | Task IR | 시드 스트림 | 학습 | held-out `success_rate` |
+|---|---|---|---|---|
+| **U3** | `task.toml` (`Rs`) | — | `es train` | **0.5625** |
+| **U4** | `task-pt.toml` (`Pt`) | `fixed` | `es train` | **0.0 (16 중 0)**; 학습 시드 0.0625 (16 중 1) |
+| **U5** | `task-pt-tick.toml` (`Pt`) | `tick` | `es train` | *대기 중 — 아래의 런* |
+
+**런.** 오라클 서버(RTX 4090)에서 GPU 큐 락 `~/artifacts/plan-w/queue/gpu.lock` 뒤에서 트리
+`~/Projects/es-w1a`로부터 `nohup sh ~/artifacts/plan-w/w1a/w1a.sh &`로 띄웠다. 모든 산출물은
+**`~/artifacts/plan-w/w1a/`** 아래에 놓이고, 각 단계가 `<stage>.start` / `.end`(유닉스 초),
+`<stage>.log`, `<stage>.done`을 쓴다.
+
+```
+# 0. 관문: 에피소드 하나를 수집하고 같은 시드를 평가한다, 둘 다 --frames로.
+#    틱 0 프레임이 다르면 스크립트는 여기서 멈추고 나머지는 측정하지 않는다 --
+#    U4의 해석 (b), 수집/평가 관측 불일치가 살아 있는 쪽이 된다.
+es loop collect ... --episodes 1 --seed 1 --max-steps 120 --frames .../parity/frames-collect
+es eval run --config .../eval-parity-pt-tick.toml --expert so101-pick-place \
+  --frames .../parity/frames-eval          # cmp frames-collect/000000.bin frames-eval/*/000000.bin
+
+# 1. 틱별로 시드된 패스 트레이싱 프레임과 함께 전문가 시연 200개 (~36분)
+es loop collect --policy .../untrained-pt-tick.esb --scene so101_pick_place.xml \
+  --episodes 200 --seed 1 --expert so101-pick-place \
+  --out .../ds-train-pt-tick --frames .../frames-train-pt-tick
+
+# 2. 그 프레임 위에서 U4의 설정 (~4분; tests/fixtures/visible-learning/training-u5.toml)
+es train --recipe tests/fixtures/visible-learning/training-u5.toml --out .../U5/train
+
+# 3. held-out 시드 16개 x 스위트 6개, 그다음 학습 시드 16개
+es eval run --config .../evaluation-augmented-pt-tick.toml \
+  --policy .../U5/train/checkpoints/20000.esb --out .../U5/holdout --jobs 6 --frames ...
+es eval run --config .../eval-trainseeds-augmented-pt-tick.toml ... --out .../U5/trainseeds ...
+```
+
+`success_rate`, `envelope_violation_rate`, `episode_length`, `passed`는
+`~/artifacts/plan-w/w1a/U5/holdout/report.json`에 있다; 이 행의 `evaluation_hash`와
+`execution_hash`는 같은 파일과 그 곁의 `evaluation.lock`에 있다. 원시 프레임 트리는 숫자를 읽은
+뒤 삭제한다.
+
+**답이 도착하기 전에 적어 두는, 그 답의 의미.** U5가 U3의 0.5625 근처에 내려앉으면 R13이 옳았고
+그레인이 원인이었다: 고치는 데 선언된 필드 하나면 되고 `Pt` 관측 경로는 있는 그대로 쓸 만해진다.
+U5가 U4의 0.0 근처에 내려앉고 *게다가* 패리티 관문을 통과했다면 7.32절의 두 해석 중 어느 것도
+살아남지 못하고 `Pt` 경로는 세 번째 이유로 실패하는 것이다 — 다음 용의자는 조명
+(`renderer.md` 10.4 선택지 2: `Pt` 센서에는 방향광이 없고, 그래서 U4에서 `light_direction`이
+`nominal`과 바이트 동일한 히스토그램을 보고했다)과 추정기 자체다. 그 사이 어디쯤이 가장 쓸모없는
+결과이고 `spp`를 움직여야 하는데, 한 번 두 배로 늘릴 때마다 세 시간짜리 평가가 두 배가 된다.
+
 ## 8. 안전 오버레이 (V3)
 
 렌더된 프레임마다 V3는 `events.json`에 레코드 하나를 붙인다:

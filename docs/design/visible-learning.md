@@ -4607,6 +4607,92 @@ removed every `violation.velocity` and moved the clamp to `violation.position`: 
 sits against the soft position envelope and is clamped on every tick. No change to §13.4's default
 action space; the open lever is the envelope's meaning for a learning policy (M9 review S-7).
 
+### 7.37 As built (M10/W1a): row U5 — the same policy with the grain moving
+
+Packet `docs/packets/M10/W1a-pt-seed-tick.md`; the renderer side is `renderer.md` section 12.8.
+Row U4 (section 7.32) trained a path-traced ACT to a **lower** loss than the rasterized U3 —
+0.0045 against 0.0067 — and then scored 0 of 16 held-out and 1 of 16 on its own training
+seeds. Follow-up R13 named the first suspect: the observation path never accumulates, so at
+64 spp the path tracer's sample keys are a pure function of `(pixel, pose)` and every pose
+wears a fixed grain. This packet makes that testable rather than arguable. One field —
+`render.seed = "tick"` — mixes the episode-relative tick into the seed, so the same pose
+carries different grain at different ticks while the collector and the evaluator still agree
+bit for bit at the same `(episode, tick)`. Everything else is U4's, which was U3's.
+
+**The documents.** `task-pt-tick.toml` is the regenerated `task-pt.toml` plus one line —
+`seed = "tick"` in the sensor's `render` table — and nothing else; a `diff` with the comments
+stripped is that one line. The committed `task.toml` (`86a7f3a3…`) and `task-pt.toml`
+(`02036847…`) are unmoved, pinned by `cargo test -p es-ir
+committed_task_hashes_are_unmoved_by_seed_stream`.
+
+| document | hash | note |
+|---|---|---|
+| `task-pt-tick.toml` | **`51b60dad…`** | `task-pt.toml` + `seed = "tick"` |
+| `observation-pt-tick.toml` | `9bb3ed9f…` | `observation.toml`'s graph, `task_ref` retargeted |
+| `evaluation-pt-tick.toml` | `86cb3cf8…` | `evaluation.toml`'s 16 held-out seeds × 6 suites |
+| `observation-augmented-pt-tick.toml` (server) | `4e1d6482…` | T6's graph, `task_ref` retargeted |
+| U5's Evaluation IR (server) | *see below* | the row's own `evaluation_hash` |
+
+Five again, and for the same reason section 7.32 had to pay it: `task_ref` is hash input and
+`XIR_001` ties one Observation IR to one Task IR, so a new Task IR re-issues the whole
+downstream set even though every node of the graph is a copy (`renderer.md` 12.2).
+
+**Which tick.** The episode-relative render index — 0 at the reset that opens an episode, +1
+per rendered control step — read by `es loop collect` from `CollectEvent::EpisodeBegin`, by
+`es eval run` from the backend clock reading 0 (since M8/S1 the runner builds one `Env` per
+episode), and by `es video showcase` from the `.estraj` row index. The table in `renderer.md`
+12.8 is the full statement; the point here is that all three are the same number, which is
+what the parity stage below checks before anything expensive runs.
+
+#### The row
+
+| row | Task IR | seed stream | trained | held-out `success_rate` |
+|---|---|---|---|---|
+| **U3** | `task.toml` (`Rs`) | — | `es train` | **0.5625** |
+| **U4** | `task-pt.toml` (`Pt`) | `fixed` | `es train` | **0.0 (0 of 16)**; train-seeds 0.0625 (1 of 16) |
+| **U5** | `task-pt-tick.toml` (`Pt`) | `tick` | `es train` | *pending — the run below* |
+
+**The run.** Launched on the oracle server (RTX 4090) as `nohup sh
+~/artifacts/plan-w/w1a/w1a.sh &` from the tree `~/Projects/es-w1a`, behind the GPU queue lock
+`~/artifacts/plan-w/queue/gpu.lock`. Everything lands under **`~/artifacts/plan-w/w1a/`** and
+each stage writes `<stage>.start` / `.end` (unix seconds), `<stage>.log` and `<stage>.done`.
+
+```
+# 0. the gate: one episode collected and the same seed evaluated, both with --frames.
+#    If the tick-0 frames differ the script stops here and the rest is not measured --
+#    U4's reading (b), a collect/eval observation mismatch, would be the live one.
+es loop collect ... --episodes 1 --seed 1 --max-steps 120 --frames .../parity/frames-collect
+es eval run --config .../eval-parity-pt-tick.toml --expert so101-pick-place \
+  --frames .../parity/frames-eval          # cmp frames-collect/000000.bin frames-eval/*/000000.bin
+
+# 1. 200 expert demonstrations with per-tick-seeded path-traced frames (~36 min)
+es loop collect --policy .../untrained-pt-tick.esb --scene so101_pick_place.xml \
+  --episodes 200 --seed 1 --expert so101-pick-place \
+  --out .../ds-train-pt-tick --frames .../frames-train-pt-tick
+
+# 2. U4's settings, on those frames (~4 min; tests/fixtures/visible-learning/training-u5.toml)
+es train --recipe tests/fixtures/visible-learning/training-u5.toml --out .../U5/train
+
+# 3. the 16 held-out seeds x 6 suites, then the 16 training seeds
+es eval run --config .../evaluation-augmented-pt-tick.toml \
+  --policy .../U5/train/checkpoints/20000.esb --out .../U5/holdout --jobs 6 --frames ...
+es eval run --config .../eval-trainseeds-augmented-pt-tick.toml ... --out .../U5/trainseeds ...
+```
+
+`success_rate`, `envelope_violation_rate`, `episode_length` and `passed` are
+`~/artifacts/plan-w/w1a/U5/holdout/report.json`; the row's `evaluation_hash` and
+`execution_hash` are in the same file and in `evaluation.lock` beside it. The raw frame trees
+are deleted once the numbers are read.
+
+**What the answer will mean, written before it arrives.** If U5 lands near U3's 0.5625, R13
+was right and the grain was the cause: the fix is one declared field and the `Pt` observation
+path becomes usable as it stands. If U5 lands near U4's 0.0 *and* the parity gate passed, then
+neither of section 7.32's two readings survives and the `Pt` path is failing for a third
+reason — the next suspects being the lighting (`renderer.md` 10.4 option 2: the `Pt` sensor has
+no directional light, which is why `light_direction` reported a byte-identical histogram to
+`nominal` in U4) and the estimator itself. Somewhere in between is the least useful outcome
+and would need `spp` moved, which doubles a three-hour evaluation each time.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
