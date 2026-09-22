@@ -637,6 +637,7 @@ mod tests {
                 quirks: Vec::new(),
             },
             created: 0,
+            runtime_threads: None,
         };
         es_eval::runner::write_artifacts(&report(), &lock, &dir).expect("artifacts");
 
