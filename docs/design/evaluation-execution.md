@@ -439,6 +439,50 @@ them decisions rather than fixes, so the M7 review picks one:
 Until then `--jobs N` for `N ≤ cores / 4` is byte-identical to `--jobs 1` on this hardware, and
 the demo's `--jobs 6` sweeps are all at cap 2 and agree with each other.
 
+**Decision (M10/W0a, 2026-09-22): option 2 — say it in the hash.** The owner chose it on
+2026-09-22 (§28.13 rule 1; M8 review S-1), and option 3 came with it. `python/torch_ref.py`
+answers `load` with `threads = torch.get_num_threads()` (protocol 2, so an older script's reply
+is refused by its number); `TorchRuntime::runtime_hash` is `blake3(RUNTIME_TAG ‖ "torch" ‖
+protocol ‖ version ‖ threads as u32 LE)`; `evaluation.lock` carries the count in plain text as
+`runtime_threads` — `None`, and absent from the bytes, for a runtime with no pool, which is what
+this crate's own `FakePolicy` oracles and the committed placeholder lock see, so none of the
+byte-identity claims above moved. The accessor is `TorchRuntime::threads()`, on the type and not
+on `PolicyRuntime` (INV-17). The parent of a `--jobs N` run never infers, but its runtime is the
+one `merge` hashes and the lock quotes, so `es eval run` spawns the parent's reference process
+under the same four variables the workers get, and it reports the count that produced the
+numbers; `--jobs 1` exports nothing and inherits the ambient pool. **Nothing about the pool
+moved**: `shard_thread_env`, the `cores / N` cap and `--jobs 1`'s behaviour are as they were,
+and no committed number moved. The help now says "at the same policy-runtime thread count,
+which `evaluation.lock` records and `execution_hash` covers".
+
+Measured (oracle 3; oracle server, 16 `nproc`, `--frames`, U0's bundle, the committed
+`task.toml` / `observation.toml`, `evaluation.toml` cut to the nominal suite exactly as above,
+seeds 101–116, the CPU queue held and the box otherwise idle — 1-minute load 0.28 at the start;
+`~/artifacts/plan-w/w0a/{j1,j8,omp2-j1}/`):
+
+| row | `evaluation_hash` | `execution_hash` | `runtime_threads` | blake3(`report.json`) | wall |
+|---|---|---|---|---|---|
+| `--jobs 1` | `40623e01…` | `60b86f13…` | **8** | `0326d5c9…` | 118.05 s |
+| `--jobs 8` | `40623e01…` | `d7bdb984…` | 2 | `191d4314…` | 46.93 s |
+| `--jobs 1`, the four thread variables exported at 2 | `40623e01…` | `d7bdb984…` | 2 | `191d4314…` | 103.13 s |
+
+Full digests: `evaluation_hash`
+`40623e0183cdaf56d0c93adf81035b528fb338e68e2314632f3b9c64e33a5ce3`; `execution_hash` row 1
+`60b86f13289db36987450bd098bb662d0b6b3f6440d812b1bc66c93d801c0c2c`, rows 2–3
+`d7bdb9845453227d576ebe617e4a53ca488fcd494a05721a3b123db0e0aa5353`; `report.json` row 1
+`0326d5c93f90a228294466382599e1b48d058009f1541791a13517f55f5ab450`, rows 2–3
+`191d4314c417d0ccf25b02632f5783fa07a3258cad4447ccbe365382a531b1f3`. `evaluation_hash` is one
+number in all three rows — the same documents. Rows 2 and 3 agree in every column but
+wall-clock, and beyond the table in `events.json`, all 16 `.estraj` and all 23,899 frame files.
+Row 1 differs from them in `execution_hash`, `runtime_threads` and the report — `success_rate`
+0.0625 / `envelope_violation_rate` 0.4297 / `episode_length` 1701.3 against the cap-2 rows'
+0.2500 / 0.4409 / 1492.7, which is row U0 of `visible-learning.md` 7.31 again. The finding
+above is now visible in the chain: two reports at two counts carry two `execution_hash`es and
+say why in the lock. One detail the numbers correct: Torch's default pool on this box is **8**,
+not 16 — `torch.get_num_threads()` follows the physical cores and `nproc` counts SMT threads —
+so the uncapped count the paragraph above took for 16 was 8, `--jobs 2`'s cap of 8 *is* the
+uncapped pool, and "4, 8 and 16 agree" reads "4 and 8 agree, 2 does not".
+
 The metrics this run measures are `success_rate`, `episode_length`,
 `envelope_violation_rate` and `failure_mode_histogram` — the four the demo's Evaluation IR
 declares. The nine performance metrics of §12.4 are `Target / Status: unverified` here, and no
