@@ -4607,6 +4607,67 @@ removed every `violation.velocity` and moved the clamp to `violation.position`: 
 sits against the soft position envelope and is clamped on every tick. No change to §13.4's default
 action space; the open lever is the envelope's meaning for a learning policy (M9 review S-7).
 
+### 7.36 As built (M10/W0b): the record re-measured under the platform-stable `scene_hash`
+
+Packet `docs/packets/M10/W0b-scene-hash-libm.md`, oracle server (RTX 4090, 16 cores),
+2026-09-22. `crates/es-assets/src/mjcf/orient.rs` and `urdf.rs` turned `euler=`, `axisangle=`,
+`zaxis=` and `rpy` into quaternions with the *host's* libm, so the same `so101_pick_place.xml`
+hashed to two `scene_hash`es on Windows and Linux (M8 review S-2) and `reach_documents_validate`
+had to exempt the field. The three calls now go through `es_math::approx::{sin_cos_f64,
+acos_f64}`, the pure-Rust `libm` port (§3.2's `f64` paragraph); `crates/es-assets/tests/
+scene_hash_pins.rs` pins four hex digests typed in by hand and the `cli.rs` tests assert
+`task.scene.scene_hash == scene.scene_hash()` instead of overwriting it. The owner's decision on
+the review question was to **re-collect, retrain and re-score under the moved hashes**, and this
+is that measurement. The old → new table for every digest is the packet's note section.
+
+**The decisive oracle passed on both platforms, and the platform that moved is Windows.** On the
+server the pinned digests are the Windows tree's, character for character — `so101_pick_place.xml`
+`882e7d0b…`, `orientations.xml` `958ceaae…`, `arm2.xml` `4602d675…`, `arm2.urdf` `4708aba6…`,
+the quadruped control `3c9348ea…` unmoved — and `es-math`'s three `to_bits()` constants, the
+regenerated `es-ir` pins, `reach_documents_validate`,
+`quadruped_documents_are_what_the_generator_produces`, `visible_learning_documents_compile` and
+`rl_state_observation_is_what_the_generator_writes` are green there (47 s + 26 s;
+`~/artifacts/plan-w/w0b/stage1.log`, `stage1b.log`). Then the control the packet did not ask for
+and the note needs: **the tree at `13c1e45`, W0b's parent, built on the same server, regenerates
+`task.toml` with `scene_hash 882e7d0b…` — the *new* value.** glibc's `sincos`/`acos` and the
+`libm` port agree bit for bit on this scene's inputs; the Windows CRT was the outlier and the
+committed `4e0c2a8f…` was its number alone. So **every measurement plan V, M7, M8 and M9 took on
+the oracle server was already taken under today's `scene_hash`**. What moved is the document, not
+the physics — which is what the rest of this row then measures rather than assumes.
+
+**Stage 2 — the collection is bit for bit, and it is measured against the right baseline.** The
+packet named `~/artifacts/plan-v/v15/ds-train` as the baseline; that artifact cannot be
+reproduced by this tree and W0b is not why. V15 collected 200 episodes of median 183 frames,
+36,960 in total; the identical command on today's tree collects 200 episodes of median 520,
+103,881 in total — V11's "one control step is one control period" (section 7.19) and everything
+after it, and section 7.32 already recorded the same 511-tick seed 1 at M7/R5. Both are the same
+200 `Success` demonstrations of the same expert on the same seeds; they are not the same
+recording. So the baseline that isolates W0b is the pre-W0b tree, on Linux, run twice:
+
+| `es loop collect --episodes 200 --seed 1 --expert so101-pick-place --frames` | `13c1e45` (pre) | this tree |
+|---|---|---|
+| terminations | 200 success / 0 failure / 0 timeout | identical |
+| frames | 103,881 | 103,881 |
+| dataset `content` | `ca915df2…` | **`ca915df2…`** |
+| `schema` / `split` | `1f5ddafc…` / `872fe162…` | identical |
+| `frames-train`, 207,762 files | — | **byte-identical** (`diff -r`) |
+| every `data/chunk-000/episode_*.parquet` | — | **byte-identical** |
+| wall clock | 303 s | 296 s |
+
+`ds-train` differs in exactly three places, and every one of them *is* a recorded hash:
+`loop.jsonl`'s `inputs.task` / `inputs.observation`, `meta/episodes.jsonl`'s 200 `es:task:…`
+URIs, and `meta/tasks.jsonl`'s one (plus `created`, a timestamp). That is §28.13 rule 1 measured
+rather than asserted: the fix moved hashes and nothing else. Logs `stage2-compare.log`,
+`stage2b-compare.log`, `stage2b-regen.log`.
+
+**`es train` refuses the M5-era dataset under the moved `task_hash`, by name, and that is the
+chain working.** Pointed at `~/artifacts/plan-v/v15/ds-train` with the re-packed bundle it stops
+before baking: *"the dataset was collected under task_hash eb6efefa… and this recipe's Task IR is
+86a7f3a3…. A policy trained on demonstrations of one predicate and judged against another
+measures nothing (M5 review S-3). Pass `--allow-retired-task eb6efefa…` to accept it
+deliberately."* Nothing in W0b taught it that; the refusal is M5's, firing for the first time on
+a hash this repository moved on purpose.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:

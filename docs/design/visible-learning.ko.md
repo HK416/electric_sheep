@@ -4255,6 +4255,68 @@ brax 증분 정책은 이어붙이기 전후 모두 **0.0**. 증분은 `violatio
 클램프된다. §13.4의 기본 행동 공간에는 변화가 없다; 열린 지렛대는 학습 정책에 대한 엔벌로프의
 의미다(M9 리뷰의 S-7).
 
+### 7.36 만든 대로 (M10/W0b): 플랫폼에 흔들리지 않는 `scene_hash` 아래에서 다시 측정한 기록
+
+패킷 `docs/packets/M10/W0b-scene-hash-libm.md`, 오라클 서버(RTX 4090, 16코어), 2026-09-22.
+`crates/es-assets/src/mjcf/orient.rs`와 `urdf.rs`는 `euler=`, `axisangle=`, `zaxis=`, `rpy`를
+*호스트의* libm으로 쿼터니언으로 바꾸고 있었고, 그래서 같은 `so101_pick_place.xml`이 Windows와
+Linux에서 서로 다른 `scene_hash`로 해시되었으며(M8 리뷰 S-2) `reach_documents_validate`는 그
+필드를 예외로 둘 수밖에 없었다. 이제 그 세 호출은 순수 러스트 `libm` 포트인
+`es_math::approx::{sin_cos_f64, acos_f64}`를 지난다(§3.2의 `f64` 단락).
+`crates/es-assets/tests/scene_hash_pins.rs`가 손으로 적어 넣은 16진 다이제스트 넷을 고정하고,
+`cli.rs`의 테스트들은 `scene_hash`를 덮어쓰는 대신 `task.scene.scene_hash ==
+scene.scene_hash()`를 단언한다. 리뷰 질문에 대한 소유자의 결정은 **옮겨진 해시 아래에서 다시
+수집하고 다시 학습하고 다시 채점하라**였고, 이것이 그 측정이다. 옮겨진 모든 다이제스트의
+옛 → 새 표는 패킷의 노트 절에 있다.
+
+**결정적 오라클은 두 플랫폼 모두에서 통과했고, 움직인 쪽은 Windows다.** 서버에서 고정된
+다이제스트들은 Windows 트리의 것과 한 글자도 다르지 않다 — `so101_pick_place.xml`
+`882e7d0b…`, `orientations.xml` `958ceaae…`, `arm2.xml` `4602d675…`, `arm2.urdf` `4708aba6…`,
+그리고 대조군인 4족 `3c9348ea…`는 불변. `es-math`의 `to_bits()` 상수 셋, 재생성된 `es-ir`의
+핀들, `reach_documents_validate`,
+`quadruped_documents_are_what_the_generator_produces`, `visible_learning_documents_compile`,
+`rl_state_observation_is_what_the_generator_writes`도 거기서 모두 녹색이다(47초 + 26초;
+`~/artifacts/plan-w/w0b/stage1.log`, `stage1b.log`). 그리고 패킷이 요구하지 않았지만 이 노트에
+필요한 대조군: **W0b의 부모인 `13c1e45` 트리를 같은 서버에서 빌드해 `task.toml`을 재생성하면
+`scene_hash 882e7d0b…`, 곧 *새* 값이 나온다.** glibc의 `sincos`/`acos`와 `libm` 포트는 이 씬의
+입력들에 대해 비트 단위로 일치하며, 예외였던 것은 Windows CRT이고 커밋되어 있던 `4e0c2a8f…`는
+그쪽 혼자의 숫자였다. 그러므로 **플랜 V와 M7, M8, M9가 오라클 서버에서 한 모든 측정은 이미
+오늘의 `scene_hash` 아래에서 이루어진 것이다.** 움직인 것은 문서이지 물리가 아니다 — 이 행의
+나머지는 그것을 가정하지 않고 측정한다.
+
+**2단계 — 수집은 비트 단위로 같고, 올바른 기준선에 대고 측정했다.** 패킷은
+`~/artifacts/plan-v/v15/ds-train`을 기준선으로 지목했지만 그 산출물은 이 트리로 재현되지
+않으며 W0b가 그 이유가 아니다. V15는 중앙값 183프레임짜리 에피소드 200개, 총 36,960프레임을
+수집했다; 오늘 트리에서 같은 명령은 중앙값 520, 총 103,881프레임을 수집한다 — V11의 "제어
+스텝 하나가 제어 주기 하나"(7.19절)와 그 이후의 모든 것이며, 7.32절이 이미 M7/R5에서 같은
+511틱짜리 시드 1을 적어 두었다. 둘 다 같은 시드에서 같은 전문가가 만든 같은 200개의
+`Success` 시연이다; 다만 같은 녹음이 아니다. 그래서 W0b를 분리해 내는 기준선은 Linux 위의
+W0b 이전 트리이고, 두 번 돌렸다:
+
+| `es loop collect --episodes 200 --seed 1 --expert so101-pick-place --frames` | `13c1e45`(이전) | 이 트리 |
+|---|---|---|
+| 종료 | 성공 200 / 실패 0 / 타임아웃 0 | 동일 |
+| 프레임 | 103,881 | 103,881 |
+| 데이터셋 `content` | `ca915df2…` | **`ca915df2…`** |
+| `schema` / `split` | `1f5ddafc…` / `872fe162…` | 동일 |
+| `frames-train`, 207,762개 파일 | — | **바이트 단위 동일**(`diff -r`) |
+| 모든 `data/chunk-000/episode_*.parquet` | — | **바이트 단위 동일** |
+| 벽시계 | 303초 | 296초 |
+
+`ds-train`이 다른 곳은 정확히 세 군데이고, 그 셋은 모두 *기록된 해시*다: `loop.jsonl`의
+`inputs.task` / `inputs.observation`, `meta/episodes.jsonl`의 `es:task:…` URI 200개,
+`meta/tasks.jsonl`의 하나(그리고 타임스탬프인 `created`). 이것이 단언이 아니라 측정으로 본
+§28.13 규칙 1이다: 수정은 해시를 옮겼고 그 밖의 무엇도 옮기지 않았다. 로그는
+`stage2-compare.log`, `stage2b-compare.log`, `stage2b-regen.log`.
+
+**`es train`은 옮겨진 `task_hash` 아래에서 M5 시절의 데이터셋을 이름을 대며 거부하고, 그것이
+체인이 일하고 있다는 뜻이다.** 다시 패킹한 번들과 함께 `~/artifacts/plan-v/v15/ds-train`을
+가리키면 베이킹 전에 멈춘다: *"the dataset was collected under task_hash eb6efefa… and this
+recipe's Task IR is 86a7f3a3…. A policy trained on demonstrations of one predicate and judged
+against another measures nothing (M5 review S-3). Pass `--allow-retired-task eb6efefa…` to
+accept it deliberately."* W0b가 가르친 것은 없다; 그 거부는 M5의 것이고, 이 저장소가 일부러
+옮긴 해시에 대해 처음으로 발화한 것이다.
+
 ## 8. 안전 오버레이 (V3)
 
 렌더된 프레임마다 V3는 `events.json`에 레코드 하나를 붙인다:
