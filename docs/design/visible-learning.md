@@ -4776,6 +4776,32 @@ One `execution_hash` detail confirms W0a while it is in view: the old-hash run a
 `a2283994…`. Same documents, same weights, same cells — and a different `execution_hash`,
 because `runtime_hash` now covers the 2 intra-op threads that `evaluation.lock` prints.
 
+**Stage 5 — the reach task re-measured** belongs to the other note:
+`docs/design/rl-continuation.md` section 7, "W0b". It is the row that carries the bitwise claim
+this one cannot, because PPO on the CPU backend *is* reproducible where CUDA ACT training is not.
+
+**Wall clocks and artifacts.** Everything under `~/artifacts/plan-w/w0b/`, each stage with its
+own `.start` / `.end` / `.done` / `.log`: release build with `--features render` 26 s; stage 1
+47 s + 26 s; stage 2 316 s (collect 296 s); stage 2b 352 s (pre-W0b build + collect 303 s);
+stage 3 301 s; stage 3b 548 s (U3-pre 296 s, V15's data 251 s); stage 4 624 s; stage 4c 449 s.
+Kept: `v15/{ds-train,frames-train}` and `pre/{ds-train,frames-train}` (the bit-for-bit pair,
+3.3 GB each), `U3/{train-pre,train-recollected,train-committed-ds}` minus their baked tensor
+trees, all seven `report.json` / `evaluation.lock` / `events.json` / `traj/` sets, the two
+regenerated evaluation documents, `reach/`, the stage scripts and `bin/es`. Deleted after the
+numbers were read: the evaluation `--frames` trees and the three `baked/` directories (40 GB →
+7.9 GB). The nine §12.4 metrics are `Target / Status: unverified` on this path; nothing here is
+a throughput claim.
+
+**What this row settles, and what it opens.** Settled: `scene_hash` is one number on Windows and
+Linux, the platform that was wrong was Windows, and the fix moved hashes and nothing else —
+measured at the collection (207,762 frames byte-identical, one `content` digest), at the module
+(`lowering_hash` unmoved), and at the evaluator (stage 4c, every cell identical both ways).
+Opened, and neither is W0b's to close: **(a)** the committed 20,000-step recipe is 12.3 epochs of
+the data `es loop collect` now produces where it was 34.6 of V15's, and the policy it trains
+scores 0.0000; **(b)** two `es train` runs on bit-identical data at one seed part by 8 ULPs at
+step 5 and score 0.5625 and 0.8750, so the demo's headline number is reproducible only to about
+±0.3 unless the trainer is pinned. Both belong to the M10 review.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:

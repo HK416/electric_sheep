@@ -4421,6 +4421,31 @@ W0a를 확인해 주는 `execution_hash` 하나를 눈에 보이는 김에 적�
 `a2283994…`에 대해 `350bcd43…`이다. 같은 문서, 같은 가중치, 같은 셀 — 그런데 `execution_hash`가
 다르다. `runtime_hash`가 이제 `evaluation.lock`이 찍는 인트라옵 스레드 2개를 덮기 때문이다.
 
+**5단계 — reach 과제 재측정**은 다른 노트의 몫이다: `docs/design/rl-continuation.md` 7절의
+"W0b". 이 노트가 지닐 수 없는 비트 단위 주장을 그 행이 지닌다. CPU 백엔드 위의 PPO는
+재현되고, CUDA 위의 ACT 학습은 그렇지 않기 때문이다.
+
+**벽시계와 산출물.** 전부 `~/artifacts/plan-w/w0b/` 아래, 각 단계마다 자신의 `.start` /
+`.end` / `.done` / `.log`가 있다: `--features render` 릴리스 빌드 26초; 1단계 47초 + 26초;
+2단계 316초(수집 296초); 2b 단계 352초(W0b 이전 빌드 + 수집 303초); 3단계 301초; 3b 단계
+548초(U3-pre 296초, V15 데이터 251초); 4단계 624초; 4c 단계 449초. 남긴 것:
+`v15/{ds-train,frames-train}`와 `pre/{ds-train,frames-train}`(비트 단위로 같은 쌍, 각 3.3 GB),
+베이킹된 텐서 트리를 뺀 `U3/{train-pre,train-recollected,train-committed-ds}`, 일곱 벌의
+`report.json` / `evaluation.lock` / `events.json` / `traj/`, 재생성한 평가 문서 둘, `reach/`,
+단계 스크립트들과 `bin/es`. 숫자를 읽은 뒤 지운 것: 평가의 `--frames` 트리들과 세 개의
+`baked/` 디렉터리(40 GB → 7.9 GB). 이 경로에서 §12.4의 아홉 지표는 `Target / Status:
+unverified`이고, 여기 어떤 숫자도 처리량 주장이 아니다.
+
+**이 행이 매듭짓는 것과 여는 것.** 매듭지은 것: `scene_hash`는 Windows와 Linux에서 하나의
+숫자이고, 틀렸던 쪽은 Windows였으며, 수정은 해시를 옮겼고 그 밖의 무엇도 옮기지 않았다 —
+수집에서(프레임 207,762개 바이트 단위 동일, `content` 다이제스트 하나), 모듈에서
+(`lowering_hash` 불변), 평가기에서(4c 단계, 양방향 모든 셀 동일) 측정했다. 연 것, 그리고 둘 다
+W0b가 닫을 것이 아니다: **(a)** 커밋된 20,000스텝 레시피는 V15 데이터로는 34.6 에폭이었는데
+`es loop collect`가 지금 만드는 데이터로는 12.3 에폭이고, 그것으로 학습한 정책은 0.0000을
+받는다; **(b)** 비트 단위로 같은 데이터 위에서 한 시드로 돌린 `es train` 두 번이 5스텝째에
+8 ULP로 갈라져 0.5625와 0.8750을 받는다 — 학습기를 고정하지 않는 한 데모의 대표 숫자는 약
+±0.3까지만 재현된다. 둘 다 M10 리뷰의 몫이다.
+
 ## 8. 안전 오버레이 (V3)
 
 렌더된 프레임마다 V3는 `events.json`에 레코드 하나를 붙인다:
