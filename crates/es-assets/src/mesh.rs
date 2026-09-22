@@ -53,22 +53,25 @@ pub fn load(scene: &mut SceneDesc, base_dir: &Path) -> Result<(), MeshError> {
             path: asset.path.clone(),
             reason,
         };
+        // The extension decides before anything is read, so a `.dae` reports "no reader"
+        // rather than whatever the file system says about it.
         let extension = path
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
+        if extension != "stl" && extension != "obj" {
+            return Err(MeshError::Unsupported {
+                name: asset.name.clone(),
+                path: asset.path.clone(),
+            });
+        }
         let bytes = std::fs::read(&path).map_err(|e| fail(format!("{}: {e}", path.display())))?;
-        let decoded = match extension.as_str() {
-            "stl" => crate::stl::parse(&bytes),
-            "obj" => std::str::from_utf8(&bytes)
+        let decoded = if extension == "stl" {
+            crate::stl::parse(&bytes)
+        } else {
+            std::str::from_utf8(&bytes)
                 .map_err(|e| format!("OBJ is not UTF-8: {e}"))
-                .and_then(crate::obj::parse),
-            _ => {
-                return Err(MeshError::Unsupported {
-                    name: asset.name.clone(),
-                    path: asset.path.clone(),
-                })
-            }
+                .and_then(crate::obj::parse)
         };
         let (positions, indices) = decoded.map_err(|reason| MeshError::Malformed {
             name: asset.name.clone(),

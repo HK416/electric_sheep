@@ -9,6 +9,7 @@
     "franka_emika_panda/panda.xml",
     "franka_emika_panda/assets/**  (8 STL collision meshes, 59 OBJ visual meshes)"
   ],
+  "oracle": "crates/es-assets/tests/panda_provenance.rs::panda_meshes_load_and_hash (--ignored) fetches each file at `commit` into target/menagerie/<commit>/, verifies its blake3 before parsing it (spec 25.1), and decodes every mesh with es_assets::stl / es_assets::obj: 136,590 triangles. Readers and hashes only -- panda.xml carries a <tendon><fixed> coupling the finger joints and an <equality><joint> mirroring them, and crates/es-physics-backend/src/mjcf_out.rs refuses a tendon by name, so nothing here reaches MuJoCo. link5 has no STL: its collision shape is the three link5_collision_*.obj among the visual meshes. No <mesh> in this model sets a non-default scale / refpos / refquat.",
   "blake3": {
     "finger_0.obj": "259dcd897afd4dfb7d8fca5a7403c937ca6ba23ae57759acf4340eb2895ddd54",
     "finger_1.obj": "ea64e5a0e5ff4c065387a30a7983a75058ee8b9a65b98b8388fc9deee7909f3d",

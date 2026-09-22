@@ -83,7 +83,9 @@ pub fn capabilities() -> Capabilities {
             ),
             BackendQuirk::new(
                 Feature::ContactMesh,
-                "collision detection uses the convex hull of the mesh, never its concave                  surface (MuJoCo 3.13, docs/api-notes/mujoco.md); the renderer draws the                  surface, so what is drawn and what is collided with differ for a concave mesh",
+                "collision detection uses the convex hull of the mesh, never its concave \
+                 surface (MuJoCo 3.13, docs/api-notes/mujoco.md); the renderer draws the \
+                 surface, so what is drawn and what is collided with differ for a concave mesh",
             ),
             BackendQuirk::new(
                 Feature::SensorJointPos,
