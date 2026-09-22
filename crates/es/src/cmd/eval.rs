@@ -515,44 +515,14 @@ fn renderer_cfg(bundle: &PolicyBundle) -> Result<es_env::EnvRendererCfg, CliErro
     Ok(es_env::render::sensor_cfg(camera, &spec, &render, None))
 }
 
-/// The one image channel a `--frames` render is of: its name, frame, declared `ImageSpec` and
-/// the `render` its sensor declares (spec 7.4, packet M7/R5).
+/// The one image channel a `--frames` render is of (spec 7.4, packet M7/R5).
 ///
-/// Lives here and is used by `es loop collect --frames` too, so the two commands cannot
-/// disagree about which channel is being rendered or about how. A channel whose source is not
-/// a sensor has no render declaration and gets the default one — the rasterizer, which is what
-/// it got before this field existed.
+/// Lives in `es-tools` since packet `docs/packets/M10/W3b-es-tools-split.md`, because
+/// `es video showcase` needs it too; re-exported here so `es loop collect --frames` still
+/// reaches it at `crate::cmd::eval::image_channel` and the three commands cannot disagree
+/// about which channel is being rendered or about how.
 #[cfg(feature = "render")]
-pub(crate) fn image_channel(
-    task: &es_ir::task::TaskIr,
-) -> Result<
-    (
-        String,
-        es_ir::types::Frame,
-        es_ir::image::ImageSpec,
-        es_ir::task::SensorRender,
-    ),
-    CliError,
-> {
-    let images: Vec<_> = task
-        .observation_spec
-        .channels
-        .iter()
-        .filter_map(|(name, c)| c.ty.image.map(|spec| (name, c, spec)))
-        .collect();
-    let [(name, channel, spec)] = images.as_slice() else {
-        return Err(CliError::Runtime(format!(
-            "--frames needs exactly one image channel in the Task IR's ObservationSpec; it \
-             declares {}",
-            images.len()
-        )));
-    };
-    let render = match channel.source {
-        es_ir::task::ObsSource::Sensor { render, .. } => render,
-        _ => es_ir::task::SensorRender::default(),
-    };
-    Ok(((*name).clone(), channel.ty.frame, *spec, render))
-}
+pub(crate) use es_tools::image_channel;
 
 /// One camera, rendered under one episode's lighting (spec 10.2).
 ///

@@ -36,6 +36,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("es-ros2", 11),
     ("es-py", 11),
     ("es-script", 11),
+    ("es-tools", 11),
     ("es-transport", 11),
     ("es-editor", 12),
 ];

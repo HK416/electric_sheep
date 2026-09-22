@@ -62,7 +62,7 @@ pub fn dispatch(args: &[String]) -> i32 {
 /// `es video showcase`, or the reason this build cannot run it.
 #[cfg(feature = "render")]
 fn showcase(args: &[String]) -> i32 {
-    match crate::cmd::showcase::run(args) {
+    match crate::showcase::run(args) {
         Ok(code) => i32::from(code),
         Err(crate::error::CliError::Usage(m)) => {
             eprintln!("{m}");

@@ -1,0 +1,34 @@
+[package]
+name = "es-tools"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "es-tools -- the `es` verbs that read finished artifacts (spec 4.2, 26.2)"
+
+[features]
+# `es video showcase` (packet M5/V9) is the one verb here that opens a Vulkan device. Off by
+# default so the default build of `es` links no Vulkan at all -- the same trade `es-env`'s own
+# `render` feature makes; `es`'s `render` feature forwards to this one.
+render = ["es-env/render", "dep:es-gpu", "dep:es-render"]
+
+[dependencies]
+es-assets = { workspace = true }
+es-compile = { workspace = true }
+es-data = { workspace = true }
+es-env = { workspace = true }
+es-eval = { workspace = true }
+es-ir = { workspace = true }
+es-physics-backend = { workspace = true }
+es-physics-core = { workspace = true }
+es-telemetry = { workspace = true }
+es-gpu = { workspace = true, optional = true }
+es-render = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+blake3 = { workspace = true }
+# `es evidence keygen/sign/verify --trust` (spec 25.1): same pin as es-eval's `ed25519-dalek`.
+ed25519-dalek = "3.0.0"
+
+[lints]
+workspace = true

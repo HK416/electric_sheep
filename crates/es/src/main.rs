@@ -4,10 +4,13 @@
 //! error diagnostics or a runtime failure, 2 on a usage error.
 
 mod cmd;
-mod error;
-mod util;
 
 use std::process::ExitCode;
+
+// `CliError` and `hex` moved to `es-tools` with the verbs that use them most (packet
+// `docs/packets/M10/W3b-es-tools-split.md`); re-homed here under their old paths so every
+// `crate::error::` / `crate::util::` in `cmd/*` still resolves.
+pub use es_tools::{error, util};
 
 use error::CliError;
 
