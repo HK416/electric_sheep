@@ -249,7 +249,7 @@ pub fn run(args: &[String]) -> Result<u8, CliError> {
                 .map_err(|e| usage(format!("--task {}: {e}", path.display())))?;
             let ir = es_ir::serial::task_from_toml(&text)
                 .map_err(|e| usage(format!("--task {}: {e}", path.display())))?;
-            let (_, _, spec, render) = crate::cmd::eval::image_channel(&ir)?;
+            let (_, _, spec, render) = crate::image_channel(&ir)?;
             (width, height) = (spec.width, spec.height);
             Some((spec, render))
         }
@@ -368,7 +368,7 @@ fn select(opts: &Opts) -> Result<Vec<(String, PathBuf)>, CliError> {
 fn render(opts: &Opts) -> Result<u8, CliError> {
     let rt = |m: String| CliError::Runtime(m);
     let files = select(opts)?;
-    let scene = crate::cmd::backend::load_scene(&opts.scene)?;
+    let scene = crate::backend::load_scene(&opts.scene)?;
 
     // A free camera is fixed for the whole run; a scene camera may be bolted to a moving
     // body (a wrist camera), so it is resolved per tick from that tick's own poses.

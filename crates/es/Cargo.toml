@@ -18,8 +18,9 @@ es-script-llm = ["es-script/llm"]
 # packet M5/V3). Off by default so the default build of the CLI links no Vulkan at all -- the
 # same trade `es-env`'s own `render` feature makes. `es-render` is direct because a light
 # perturbation sets `RenderConfig::light_dir`, which `EnvRendererCfg` does not carry
-# (packet M5/V3, design note section 7.8).
-render = ["es-env/render", "dep:es-gpu", "dep:es-render"]
+# (packet M5/V3, design note section 7.8). `es-tools/render` is `es video showcase`, which
+# moved out with the rest of the artifact verbs (packet M10/W3b).
+render = ["es-tools/render", "es-env/render", "dep:es-gpu", "dep:es-render"]
 
 [dependencies]
 es-ir = { workspace = true }
@@ -35,18 +36,21 @@ es-env = { workspace = true }
 es-safety = { workspace = true }
 es-policy = { workspace = true }
 es-script = { workspace = true }
+# `es video|showcase|backend|evidence|gap|bench` plus `CliError` / `hex` (packet M10/W3b).
+es-tools = { workspace = true }
 es-gpu = { workspace = true, optional = true }
 es-render = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
 blake3 = { workspace = true }
-# `es evidence keygen/sign/verify --trust` (spec 25.1): same pin as es-eval's `ed25519-dalek`.
-ed25519-dalek = "3.0.0"
 
 [dev-dependencies]
 es-core = { workspace = true }
 es-math = { workspace = true }
+# `tests/cli.rs` signs an evidence bundle to check `es evidence verify --trust`; the verb
+# itself moved to `es-tools` (packet M10/W3b), so this is a dev dependency now.
+ed25519-dalek = "3.0.0"
 
 [lints]
 workspace = true
