@@ -173,7 +173,7 @@ fn mesh_box_rests_like_the_primitive_box() {
     assert_eq!(f["warnings"], 0.0, "MuJoCo raised a runtime warning");
 }
 
-/// MuJoCo derives mass and inertia from `density` and the geom's volume, so the two bodies
+/// `MuJoCo` derives mass and inertia from `density` and the geom's volume, so the two bodies
 /// agree exactly as far as their volumes do -- and their volumes differ by one thing only.
 ///
 /// `MESH_F32_GAP` is that thing: the primitive's half-extent is the `f64` 0.05 the MJCF says,
@@ -202,7 +202,7 @@ fn mesh_box_mass_and_inertia_match_the_primitive() {
     }
 }
 
-/// The packet left this unverified: does MuJoCo 3.13's default `<mesh inertia="legacy">` agree
+/// The packet left this unverified: does `MuJoCo` 3.13's default `<mesh inertia="legacy">` agree
 /// with `"exact"` on a convex closed box? Measured here rather than assumed -- `legacy`
 /// overcounts the volume of a *concave* mesh, and the box gives it nothing to overcount.
 #[test]
