@@ -10947,7 +10947,77 @@ fn train_rl_delta_dry_run_plan() {
     assert!(!plain.contains("--init-log-std"), "{plain}");
 }
 
-/// Regenerates `tests/golden/train/plan-rl.txt`, `plan-reach.txt` and `plan-reach-delta.txt`.
+/// Packet M9/R5 oracle 1: the executed-estimator recipe's plan is a golden of its own, and
+/// the default spells out to nothing.
+///
+/// Three claims, because `training/config.json` carries the recipe's own JSON *and* the plan
+/// lines, so the field is hashed twice: the flag is appended last and only when the recipe
+/// asks for it, `estimator = "sampled"` spelled out serialises exactly like absence (which is
+/// what leaves `training-reach.toml`'s `training_hash` where it was), and a value nothing
+/// implements is refused by name rather than defaulted.
+#[test]
+fn train_rl_estimator_dry_run_plan() {
+    const RECIPE: &str = "tests/fixtures/rl/training-reach-executed.toml";
+    let dir = scratch_dir("train-reach-executed-dry");
+    let out = run_train(RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let golden = train_golden("plan-reach-executed.txt");
+    let want =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(stdout(&out), want, "{RECIPE}: stdout is not the golden");
+    assert!(want.starts_with("# route: rl\n"), "{want}");
+    // Appended at the end of the trainer's argv, which is what keeps every plan written
+    // before this packet byte-identical.
+    let line = want
+        .lines()
+        .find(|l| l.contains("train_ppo.py"))
+        .expect("the plan runs the PPO trainer");
+    assert!(line.ends_with(" --estimator executed"), "{line}");
+    // ... and the recipe this one is a single line away from does not carry the flag at all.
+    let plain = std::fs::read_to_string(train_golden("plan-reach.txt")).expect("plan-reach.txt");
+    assert!(!plain.contains("--estimator"), "{plain}");
+    // The rest of the two plans is the same trainer line: one variable (spec 28.9 rule 3).
+    assert_eq!(
+        line.replace(" --estimator executed", ""),
+        plain
+            .lines()
+            .find(|l| l.contains("train_ppo.py"))
+            .expect("plan-reach.txt runs the PPO trainer")
+            .replace("reach-001", "reach-executed-001"),
+        "the two plans differ by more than the estimator"
+    );
+
+    let text = std::fs::read_to_string(rl_fixture("training-reach.toml")).expect("the recipe");
+    let spell = |value: &str| {
+        text.replace(
+            "value_coef  = 0.5",
+            &format!("value_coef  = 0.5\nestimator   = \"{value}\""),
+        )
+    };
+    let absent = es_data::Recipe::parse(&text).expect("training-reach.toml parses");
+    let spelled = es_data::Recipe::parse(&spell("sampled")).expect("the default parses");
+    assert_eq!(
+        serde_json::to_value(&absent).expect("the recipe serialises"),
+        serde_json::to_value(&spelled).expect("the recipe serialises"),
+        "`estimator = \"sampled\"` does not serialise like absence: config.json carries the \
+         recipe, so every measured row's training_hash just moved"
+    );
+    assert_eq!(
+        absent.rl_args().expect("the args"),
+        spelled.rl_args().expect("the args"),
+        "the default reached the trainer's argv"
+    );
+    // A third estimator is a value, not a table -- and an unimplemented one is refused with
+    // the word the recipe used, the way `[rl] algo` is.
+    let said = es_data::Recipe::parse(&spell("executed_mean"))
+        .err()
+        .map(|e| e.to_string())
+        .unwrap_or_else(|| panic!("an unknown estimator parsed"));
+    assert!(said.contains("executed_mean"), "{said}");
+}
+
+/// Regenerates `tests/golden/train/plan-rl.txt`, `plan-reach.txt`, `plan-reach-delta.txt` and
+/// `plan-reach-executed.txt`.
 #[test]
 #[ignore = "golden generator; run explicitly"]
 fn generate_rl_plan_golden() {
@@ -10961,6 +11031,10 @@ fn generate_rl_plan_golden() {
         (
             "tests/fixtures/rl/training-reach-delta.toml",
             "plan-reach-delta.txt",
+        ),
+        (
+            "tests/fixtures/rl/training-reach-executed.toml",
+            "plan-reach-executed.txt",
         ),
     ] {
         let dir = scratch_dir("train-rl-golden");
@@ -11071,7 +11145,35 @@ fn train_rl_two_runs_are_bitwise() {
             "loss-curve.json has no {field}: {curve}"
         );
     }
-    println!("RAN {TEST}: 3 iterations twice, bitwise");
+
+    // Packet M9/R5 oracle 2: the same property with the executed estimator. It moves which
+    // action the gradient is evaluated at, not where any number comes from, so two runs of it
+    // are bitwise for the same reason -- and because it is a hashed field, its run is not the
+    // sampled one's.
+    let executed = recipe.replace(
+        "value_coef  = 0.5",
+        "value_coef  = 0.5\nestimator   = \"executed\"",
+    );
+    let (c, _) = run_rl_train(&executed, &dir, "run-c").expect("the first run resolved ES_PYTHON");
+    let (d, _) = run_rl_train(&executed, &dir, "run-d").expect("the first run resolved ES_PYTHON");
+    for mark in ["0", "3"] {
+        let name = format!("checkpoints/{mark}.esb");
+        let (x, y) = (
+            std::fs::read(c.join(&name)).expect(&name),
+            std::fs::read(d.join(&name)).expect(&name),
+        );
+        assert_eq!(
+            hex(blake3::hash(&x).as_bytes()),
+            hex(blake3::hash(&y).as_bytes()),
+            "{name} is not bitwise between two runs of one `estimator = \"executed\"` recipe"
+        );
+    }
+    assert_ne!(
+        train_lock(&c)["training_hash"],
+        train_lock(&a)["training_hash"],
+        "the estimator is not in training_hash: two different trainings claim one identity"
+    );
+    println!("RAN {TEST}: 3 iterations twice per estimator, bitwise");
 }
 
 /// Oracle 3. A run that starts from `[init] policy` *is* that policy at iteration 0.
