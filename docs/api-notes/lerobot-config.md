@@ -1,5 +1,9 @@
 # LeRobot policy `config.json` — shape and normalization stats
 
+Where the code lives: since packet `docs/packets/M10/W3a-es-import-split.md` the converter is
+`crates/es-import/src/lerobot_config.rs` (crate `es-import`, layer 9, spec §4.2); `es-data`
+re-exports it as `es_data::lerobot_config`, so both paths name the same module.
+
 **Pinned version: `lerobot` 0.6.1 for ACT only** — see the ACT section below and
 `docs/api-notes/lerobot-act.md`, which was written against a real checkpoint. Everything else
 on this page predates that and is still **`unverified`**: no real `diffusion` `config.json` and
@@ -11,10 +15,10 @@ reconstructed from memory of LeRobot around the `v0.1`/`v0.2` `lerobot-train` er
 the same generation as `docs/api-notes/lerobot-dataset.md`'s `codebase_version: "v2.1"`
 datasets) and is **`unverified`** unless a line says otherwise. Spec §1.7 names exactly this
 failure mode (환각 API): a human must pin a `lerobot` version and correct this file — and
-`crates/es-data/src/lerobot_config.rs` if the shape actually differs — before anything here
+`crates/es-import/src/lerobot_config.rs` if the shape actually differs — before anything here
 is treated as ground truth.
 
-Only the fields `crates/es-data/src/lerobot_config.rs` reads are modeled as struct fields;
+Only the fields `crates/es-import/src/lerobot_config.rs` reads are modeled as struct fields;
 everything else lands in a `#[serde(flatten)] extra: BTreeMap<String, Value>` bag and is
 reported back as a conversion warning rather than silently dropped or rejected.
 
@@ -27,7 +31,7 @@ Every policy config is a JSON object with a `"type"` discriminator:
 { "type": "diffusion", ... }
 ```
 
-`crates/es-data/src/lerobot_config.rs` recognizes exactly `"act"` and `"diffusion"`; any
+`crates/es-import/src/lerobot_config.rs` recognizes exactly `"act"` and `"diffusion"`; any
 other value (`"smolvla"`, `"pi0"`, `"vqbet"`, …) is `ConfigError::Unsupported(type)` rather
 than a guess (spec §14.4: severity=error blocks execution rather than fabricating a mapping).
 
@@ -145,7 +149,7 @@ dataset identity). This packet is the first consumer:
 }
 ```
 
-`crates/es-data::lerobot_config::Stats` models this as `BTreeMap<String, FeatureStats>` with
+`crates/es-import::lerobot_config::Stats` models this as `BTreeMap<String, FeatureStats>` with
 `FeatureStats { mean: Vec<f64>, std: Vec<f64>, min: Vec<f64> (default empty), max: Vec<f64>
 (default empty) }` — flat, not the nested per-pixel-position array a video feature's stats
 may actually carry (`unverified` whether image stats are per-channel `[3]` or per-pixel
@@ -165,7 +169,7 @@ standard non-dataset default for an arbitrary joint-state vector.
 
 LeRobot's `config.json` and `stats.json` carry no unit or coordinate-frame metadata for
 `observation.state` / `action` (spec §5.4's `Unit`/`Frame` have no LeRobot counterpart).
-`crates/es-data/src/lerobot_config.rs` assumes joint-position control (`Unit::Angle` before
+`crates/es-import/src/lerobot_config.rs` assumes joint-position control (`Unit::Angle` before
 normalization, `es_ir::task::ActionSpace::JointPosition`/`es_ir::deployment::ActionSpace::
 JointPosition` in the test fixture) and says so in a returned warning — this is the single
 most common LeRobot setup (`so100`, ALOHA) but is a guess the compiler cannot check without a

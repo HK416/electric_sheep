@@ -2,6 +2,10 @@
 
 # RoboVerse / MetaSim 태스크 config — shape와 출처(provenance)
 
+코드 위치: 패킷 `docs/packets/M10/W3a-es-import-split.md` 이후 변환기는
+`crates/es-import/src/roboverse.rs`(crate `es-import`, layer 9, spec §4.2)에 있다; `es-data`가
+이를 `es_data::roboverse`로 재수출하므로 두 경로는 같은 모듈을 가리킨다.
+
 **고정 버전: 없음.** 이 워크스페이스에는 `metasim` / `roboverse_pack` 패키지가 설치되어
 있지 않다; 여기 있는 어떤 것도 실행 중인 MetaSim으로부터 읽은 것이 아니다. 아래 필드는
 2026-09-13에 `https://roboverse.wiki/metasim/concept/config.html`에서 (WebFetch로) 가져온
@@ -10,10 +14,10 @@
 URL이 404를 반환했다) — 그 외에는 `unverified`다 (RoboVerse README, arXiv:2504.18904의
 초록, spec §0.3/§14.4의 한 줄 설명 "simulator-agnostic config, 276 tasks"로부터
 재구성됨). 사람이 `roboverse_pack`/`metasim` 버전을 고정하고 이 파일을 — 그리고 shape가
-다르다면 `crates/es-data/src/roboverse.rs`도 — 바로잡아야, 비로소 여기 있는 내용이 근거로
+다르다면 `crates/es-import/src/roboverse.rs`도 — 바로잡아야, 비로소 여기 있는 내용이 근거로
 취급될 수 있다 (spec §1.7).
 
-`crates/es-data/src/roboverse.rs`는 **JSON만** 받아들이며, MetaSim 고유의 Python
+`crates/es-import/src/roboverse.rs`는 **JSON만** 받아들이며, MetaSim 고유의 Python
 `ScenarioCfg`/`TaskCfg` 데이터클래스도, YAML도 받지 않는다. 사람이(또는
 `dataclasses.asdict` + `json.dump`를 한 번 호출하는 얇은 Python 스크립트가) 이 컨버터가
 보기 전에 시나리오/태스크 config를 JSON으로 내보낸다; 그 단계는 여기 범위 밖이며 이

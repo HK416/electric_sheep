@@ -2,6 +2,10 @@
 
 # LeRobot 정책 `config.json` — shape와 정규화 통계
 
+코드 위치: 패킷 `docs/packets/M10/W3a-es-import-split.md` 이후 변환기는
+`crates/es-import/src/lerobot_config.rs`(crate `es-import`, layer 9, spec §4.2)에 있다; `es-data`가
+이를 `es_data::lerobot_config`로 재수출하므로 두 경로는 같은 모듈을 가리킨다.
+
 **고정 버전: ACT에 한해 `lerobot` 0.6.1** — 아래 ACT 절과, 실제 체크포인트에 대해 작성된
 `docs/api-notes/lerobot-act.md`를 참고. 이 페이지의 나머지는 그보다 이전이며 여전히
 **`unverified`**다: 실제 `diffusion` `config.json`도, 실제 `meta/stats.json`도 읽어본 적이
@@ -13,10 +17,10 @@
 `docs/api-notes/lerobot-dataset.md`의 `codebase_version: "v2.1"` 데이터셋과 같은 세대)
 LeRobot에 대한 기억으로부터 재구성한 것이며, 줄에 달리 적혀 있지 않은 한 **`unverified`**다.
 spec §1.7은 정확히 이 실패 모드(환각 API)를 지목한다: 사람이 `lerobot` 버전을 고정하고 이
-파일을 — 그리고 shape가 실제로 다르다면 `crates/es-data/src/lerobot_config.rs`도 —
+파일을 — 그리고 shape가 실제로 다르다면 `crates/es-import/src/lerobot_config.rs`도 —
 바로잡아야, 비로소 여기 있는 내용이 근거로 취급될 수 있다.
 
-`crates/es-data/src/lerobot_config.rs`가 읽는 필드만 구조체 필드로 모델링되어 있다; 나머지는
+`crates/es-import/src/lerobot_config.rs`가 읽는 필드만 구조체 필드로 모델링되어 있다; 나머지는
 전부 `#[serde(flatten)] extra: BTreeMap<String, Value>` 가방에 담기며, 조용히 버려지거나
 거부되는 대신 변환 경고로 다시 보고된다.
 
@@ -29,7 +33,7 @@ spec §1.7은 정확히 이 실패 모드(환각 API)를 지목한다: 사람이
 { "type": "diffusion", ... }
 ```
 
-`crates/es-data/src/lerobot_config.rs`는 정확히 `"act"`와 `"diffusion"`만 인식한다; 그
+`crates/es-import/src/lerobot_config.rs`는 정확히 `"act"`와 `"diffusion"`만 인식한다; 그
 외의 값(`"smolvla"`, `"pi0"`, `"vqbet"` 등)은 추측이 아니라 `ConfigError::Unsupported(type)`이다
 (spec §14.4: severity=error는 매핑을 지어내는 대신 실행을 차단한다).
 
@@ -147,7 +151,7 @@ center crop을 실행하도록 정의되어 있다. `cross_fixture` 스타일 Au
 }
 ```
 
-`crates/es-data::lerobot_config::Stats`는 이를 `BTreeMap<String, FeatureStats>`로,
+`crates/es-import::lerobot_config::Stats`는 이를 `BTreeMap<String, FeatureStats>`로,
 `FeatureStats { mean: Vec<f64>, std: Vec<f64>, min: Vec<f64> (기본값 빈 배열), max: Vec<f64>
 (기본값 빈 배열) }`로 모델링한다 — 평평한 구조이며, 비디오 feature의 통계치가 실제로 담을
 수도 있는 픽셀 위치별 중첩 배열이 아니다 (이미지 통계가 채널별 `[3]`인지 픽셀별
@@ -167,7 +171,7 @@ ImageNet 상수(`mean = [0.485, 0.456, 0.406]`, `std = [0.229, 0.224, 0.225]` �
 
 LeRobot의 `config.json`과 `stats.json`은 `observation.state` / `action`에 대한 단위나
 좌표계 메타데이터를 전혀 담지 않는다 (spec §5.4의 `Unit`/`Frame`에는 LeRobot에 대응하는
-것이 없다). `crates/es-data/src/lerobot_config.rs`는 관절 위치 제어를 가정하고
+것이 없다). `crates/es-import/src/lerobot_config.rs`는 관절 위치 제어를 가정하고
 (정규화 이전에는 `Unit::Angle`, 테스트 픽스처에서는
 `es_ir::task::ActionSpace::JointPosition`/`es_ir::deployment::ActionSpace::JointPosition`),
 반환되는 경고에서 그렇게 밝힌다 — 이것이 가장 흔한 LeRobot 구성(`so100`, ALOHA)이지만,

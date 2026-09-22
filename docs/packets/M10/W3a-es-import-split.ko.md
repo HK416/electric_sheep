@@ -53,6 +53,12 @@ docs/design/policy-bundle.md
 docs/design/policy-bundle.ko.md
 docs/design/python-builder.md
 docs/design/python-builder.ko.md
+docs/design/rl-continuation.md
+docs/design/rl-continuation.ko.md
+docs/api-notes/lerobot-config.md
+docs/api-notes/lerobot-config.ko.md
+docs/api-notes/roboverse.md
+docs/api-notes/roboverse.ko.md
 docs/packets/M10/W3a-es-import-split.md
 docs/packets/M10/W3a-es-import-split.ko.md
 ```
