@@ -261,6 +261,28 @@ pub fn rsqrt(x: f32) -> f32 {
     1.0 / x.sqrt()
 }
 
+// --- `f64` on the offline asset path (spec 3.2, packet M10/W0b) ------------------------------
+//
+// The importers (`es-assets` MJCF / URDF) turn `euler=`, `axisangle=`, `zaxis=` and `rpy` into
+// quaternions whose bits enter `scene_hash` (spec 5.3), so they cannot call the host's libm:
+// the same XML hashed differently on Windows and Linux (M8 S-2). These two are thin wrappers
+// over the pure-Rust `libm` port (musl), so the bits are fixed by the crate and not by the
+// platform. They are `f64`, CPU-only, have no Slang mirror and are not the <= 2 ULP polynomial
+// family above; nothing on a kernel path may call them. `sqrt` stays `f64::sqrt` (IEEE,
+// correctly rounded).
+
+/// `(sin x, cos x)` in `f64`, bits fixed by the `libm` crate — offline asset path only.
+#[must_use]
+pub fn sin_cos_f64(x: f64) -> (f64, f64) {
+    libm::sincos(x)
+}
+
+/// `acos x` in `f64`, bits fixed by the `libm` crate — offline asset path only.
+#[must_use]
+pub fn acos_f64(x: f64) -> f64 {
+    libm::acos(x)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::float_cmp)]
@@ -435,5 +457,32 @@ mod tests {
     fn subnormal_ln() {
         let tiny = f32::from_bits(1);
         assert!(ulp(ln(tiny), f64::from(tiny).ln() as f32) <= 2);
+    }
+
+    /// Packet M10/W0b oracle 1: the `f64` asset-path bits are the crate's, not the host's.
+    /// The first two inputs are the SO-101 scene's two half-angles (`euler="1.57 0 0"` and
+    /// `euler="-0.55 0 0"`, radians), the third a control on which the Windows CRT already
+    /// disagrees with `libm` (its `sin` is `…3bcd`); the same constants are asserted on Linux.
+    #[test]
+    fn approx_f64_bit_patterns_are_pinned() {
+        let bits = |(s, c): (f64, f64)| (s.to_bits(), c.to_bits());
+        assert_eq!(
+            bits(sin_cos_f64(1.57 * 0.5)),
+            (0x3fe6_9e4f_d79a_c743, 0x3fe6_a2ec_b934_b59a)
+        );
+        assert_eq!(
+            bits(sin_cos_f64(-0.55 * 0.5)),
+            (0xbfd1_6106_6763_8cf6, 0x3fee_cc2f_ed95_1b99)
+        );
+        assert_eq!(
+            bits(sin_cos_f64(core::f64::consts::FRAC_PI_4)),
+            (0x3fe6_a09e_667f_3bcc, 0x3fe6_a09e_667f_3bcd)
+        );
+        assert_eq!(acos_f64(1.0).to_bits(), 0);
+        assert_eq!(acos_f64(0.5).to_bits(), 0x3ff0_c152_382d_7366);
+        assert_eq!(
+            acos_f64(0.0).to_bits(),
+            core::f64::consts::FRAC_PI_2.to_bits()
+        );
     }
 }
