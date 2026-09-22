@@ -128,3 +128,41 @@ Touching the `f32` `approx` family or `crates/es-math/slang/**`; any `tests/gold
 generator exists; changing physics, the emitter, or any number's meaning; `tests/fixtures/
 quadruped/task.toml`'s hash moving; `es-render`, `es-env`, `es-physics-*` (W2a owns the next
 `es-assets` change and starts after this merges).
+
+## note — old → new, every digest this packet moved
+
+Measured 2026-09-22 (`cargo run -p es -- ir validate` on the documents at `13c1e45`, the
+packet's parent, and on the same documents as committed here; the two server-side documents
+with the oracle server's own binary). **Which platform moved is Windows**: built on the oracle
+server, the tree at `13c1e45` already hashed `so101_pick_place.xml` to `882e7d0b…`, the *new*
+value — glibc's `sincos`/`acos` and the `libm` port agree bit for bit on this scene's inputs,
+and the committed `4e0c2a8f…` was the Windows CRT's number alone.
+
+| document | field | old | new |
+|---|---|---|---|
+| `mjcf/so101_pick_place.xml`, as all four SO-101 Task IRs record it | `scene_hash` | `4e0c2a8f…` | `882e7d0b…` |
+| `visible-learning/task.toml` | `task_hash` | `eb6efefa…` | `86a7f3a3…` |
+| `visible-learning/task-pt.toml` | `task_hash` | `d546b808…` | `02036847…` |
+| `rl/task-reach.toml` | `task_hash` | `b5d3b813…` | `43a62f3f…` |
+| `rl/task-reach-delta.toml` | `task_hash` | `fb5020fc…` | `1e13a2b0…` |
+| `visible-learning/observation.toml` | `observation_hash` | `899c16a9…` | `8a528bc0…` |
+| `visible-learning/observation-pt.toml` | `observation_hash` | `7caac85d…` | `73101631…` |
+| `visible-learning/observation-v8.toml` | `observation_hash` | `c69a8e11…` | `3009284b…` |
+| `visible-learning/observation-augmented.toml` | `observation_hash` | `cc437a24…` | `bb9c4a7a…` |
+| `rl/observation-reach.toml` | `observation_hash` | `4ced8547…` | `ecabac79…` |
+| `rl/observation-reach-delta.toml` | `observation_hash` | `8dea346b…` | `6a35d96b…` |
+| `rl/observation-state.toml` | `observation_hash` | `a520c170…` | `a1527a30…` |
+| `visible-learning/evaluation.toml` | `evaluation_hash` | `e52e8360…` | `15d320fd…` |
+| `visible-learning/evaluation-pt.toml` | `evaluation_hash` | `dafc8ce6…` | `1cf73432…` |
+| `visible-learning/evaluation-v8.toml` | `evaluation_hash` | `a3ce10ac…` | `9c4c1cb1…` |
+| `rl/evaluation-reach.toml` | `evaluation_hash` | `f15fe888…` | `66ef84a5…` |
+| `rl/evaluation-reach-delta.toml` | `evaluation_hash` | `6399a496…` | `618ef75a…` |
+| server `m7-u/evaluation-augmented.toml` | `evaluation_hash` | `e5705cb0…` | `007aac67…` |
+| server `m7-u/eval-trainseeds-augmented.toml` | `evaluation_hash` | `10af1061…` | `31f64001…` |
+| **`quadruped/task.toml`** (the control, `xyaxes` only) | `task_hash` | `13c88f7a…` | **unmoved** |
+| **`mjcf/go1_primitives.xml`** (the control) | `scene_hash` | `3c9348ea…` | **unmoved** |
+
+Unmoved by construction, and checked: `learning_hash` (`5dac0a46…`, `fdb5178a…`, `eb805f18…`),
+`deployment_hash` (`f2f9a510…`, `7af05d88…`), `lowering_hash` (`3d06811c…`, `41d11a06…`,
+`dce8d352…`) — none of the three reads a scene. The measurements are
+`docs/design/visible-learning.md` 7.36 and `docs/design/rl-continuation.md` section 7, "W0b".
