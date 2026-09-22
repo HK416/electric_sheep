@@ -4255,6 +4255,200 @@ brax 증분 정책은 이어붙이기 전후 모두 **0.0**. 증분은 `violatio
 클램프된다. §13.4의 기본 행동 공간에는 변화가 없다; 열린 지렛대는 학습 정책에 대한 엔벌로프의
 의미다(M9 리뷰의 S-7).
 
+### 7.36 만든 대로 (M10/W0b): 플랫폼에 흔들리지 않는 `scene_hash` 아래에서 다시 측정한 기록
+
+패킷 `docs/packets/M10/W0b-scene-hash-libm.md`, 오라클 서버(RTX 4090, 16코어), 2026-09-22.
+`crates/es-assets/src/mjcf/orient.rs`와 `urdf.rs`는 `euler=`, `axisangle=`, `zaxis=`, `rpy`를
+*호스트의* libm으로 쿼터니언으로 바꾸고 있었고, 그래서 같은 `so101_pick_place.xml`이 Windows와
+Linux에서 서로 다른 `scene_hash`로 해시되었으며(M8 리뷰 S-2) `reach_documents_validate`는 그
+필드를 예외로 둘 수밖에 없었다. 이제 그 세 호출은 순수 러스트 `libm` 포트인
+`es_math::approx::{sin_cos_f64, acos_f64}`를 지난다(§3.2의 `f64` 단락).
+`crates/es-assets/tests/scene_hash_pins.rs`가 손으로 적어 넣은 16진 다이제스트 넷을 고정하고,
+`cli.rs`의 테스트들은 `scene_hash`를 덮어쓰는 대신 `task.scene.scene_hash ==
+scene.scene_hash()`를 단언한다. 리뷰 질문에 대한 소유자의 결정은 **옮겨진 해시 아래에서 다시
+수집하고 다시 학습하고 다시 채점하라**였고, 이것이 그 측정이다. 옮겨진 모든 다이제스트의
+옛 → 새 표는 패킷의 노트 절에 있다.
+
+**결정적 오라클은 두 플랫폼 모두에서 통과했고, 움직인 쪽은 Windows다.** 서버에서 고정된
+다이제스트들은 Windows 트리의 것과 한 글자도 다르지 않다 — `so101_pick_place.xml`
+`882e7d0b…`, `orientations.xml` `958ceaae…`, `arm2.xml` `4602d675…`, `arm2.urdf` `4708aba6…`,
+그리고 대조군인 4족 `3c9348ea…`는 불변. `es-math`의 `to_bits()` 상수 셋, 재생성된 `es-ir`의
+핀들, `reach_documents_validate`,
+`quadruped_documents_are_what_the_generator_produces`, `visible_learning_documents_compile`,
+`rl_state_observation_is_what_the_generator_writes`도 거기서 모두 녹색이다(47초 + 26초;
+`~/artifacts/plan-w/w0b/stage1.log`, `stage1b.log`). 그리고 패킷이 요구하지 않았지만 이 노트에
+필요한 대조군: **W0b의 부모인 `13c1e45` 트리를 같은 서버에서 빌드해 `task.toml`을 재생성하면
+`scene_hash 882e7d0b…`, 곧 *새* 값이 나온다.** glibc의 `sincos`/`acos`와 `libm` 포트는 이 씬의
+입력들에 대해 비트 단위로 일치하며, 예외였던 것은 Windows CRT이고 커밋되어 있던 `4e0c2a8f…`는
+그쪽 혼자의 숫자였다. 그러므로 **플랜 V와 M7, M8, M9가 오라클 서버에서 한 모든 측정은 이미
+오늘의 `scene_hash` 아래에서 이루어진 것이다.** 움직인 것은 문서이지 물리가 아니다 — 이 행의
+나머지는 그것을 가정하지 않고 측정한다.
+
+**2단계 — 수집은 비트 단위로 같고, 올바른 기준선에 대고 측정했다.** 패킷은
+`~/artifacts/plan-v/v15/ds-train`을 기준선으로 지목했지만 그 산출물은 이 트리로 재현되지
+않으며 W0b가 그 이유가 아니다. V15는 중앙값 183프레임짜리 에피소드 200개, 총 36,960프레임을
+수집했다; 오늘 트리에서 같은 명령은 중앙값 520, 총 103,881프레임을 수집한다 — V11의 "제어
+스텝 하나가 제어 주기 하나"(7.19절)와 그 이후의 모든 것이며, 7.32절이 이미 M7/R5에서 같은
+511틱짜리 시드 1을 적어 두었다. 둘 다 같은 시드에서 같은 전문가가 만든 같은 200개의
+`Success` 시연이다; 다만 같은 녹음이 아니다. 그래서 W0b를 분리해 내는 기준선은 Linux 위의
+W0b 이전 트리이고, 두 번 돌렸다:
+
+| `es loop collect --episodes 200 --seed 1 --expert so101-pick-place --frames` | `13c1e45`(이전) | 이 트리 |
+|---|---|---|
+| 종료 | 성공 200 / 실패 0 / 타임아웃 0 | 동일 |
+| 프레임 | 103,881 | 103,881 |
+| 데이터셋 `content` | `ca915df2…` | **`ca915df2…`** |
+| `schema` / `split` | `1f5ddafc…` / `872fe162…` | 동일 |
+| `frames-train`, 207,762개 파일 | — | **바이트 단위 동일**(`diff -r`) |
+| 모든 `data/chunk-000/episode_*.parquet` | — | **바이트 단위 동일** |
+| 벽시계 | 303초 | 296초 |
+
+`ds-train`이 다른 곳은 정확히 세 군데이고, 그 셋은 모두 *기록된 해시*다: `loop.jsonl`의
+`inputs.task` / `inputs.observation`, `meta/episodes.jsonl`의 `es:task:…` URI 200개,
+`meta/tasks.jsonl`의 하나(그리고 타임스탬프인 `created`). 이것이 단언이 아니라 측정으로 본
+§28.13 규칙 1이다: 수정은 해시를 옮겼고 그 밖의 무엇도 옮기지 않았다. 로그는
+`stage2-compare.log`, `stage2b-compare.log`, `stage2b-regen.log`.
+
+**`es train`은 옮겨진 `task_hash` 아래에서 M5 시절의 데이터셋을 이름을 대며 거부하고, 그것이
+체인이 일하고 있다는 뜻이다.** 다시 패킹한 번들과 함께 `~/artifacts/plan-v/v15/ds-train`을
+가리키면 베이킹 전에 멈춘다: *"the dataset was collected under task_hash eb6efefa… and this
+recipe's Task IR is 86a7f3a3…. A policy trained on demonstrations of one predicate and judged
+against another measures nothing (M5 review S-3). Pass `--allow-retired-task eb6efefa…` to
+accept it deliberately."* W0b가 가르친 것은 없다; 그 거부는 M5의 것이고, 이 저장소가 일부러
+옮긴 해시에 대해 처음으로 발화한 것이다.
+
+**3단계 — U3 재학습, 그리고 이 체인에서 애초에 비트 단위가 아니었던 한 층.**
+`training-u3.toml`의 설정(배치 64, lr 4e-4, `warmup_cosine` 250 / 1e-6, 시드 0,
+`--resident-gpu`, `device = "cuda"`)으로 세 번, 각자 다시 패킹한 번들에 대해 `es train`을
+처음부터 끝까지, 유휴 카드에서:
+
+| 런 | 트리 | 문서 | 데이터셋 | 벽시계 | `weights/model-20000.safetensors` |
+|---|---|---|---|---|---|
+| **U3-pre** | `13c1e45` | W0b 이전 | `w0b/pre/ds-train` | 4:56 | `d95c0db2…` |
+| **U3-post** | 이 트리 | W0b | `w0b/v15/ds-train` | 5:00 | `b87c277d…` |
+| V15 자신의 데이터 위의 U3 | 이 트리 | W0b, `--allow-retired-task eb6efefa…` | `plan-v/v15/ds-train` | 4:11 | `e7d11394…` |
+| M7/U의 커밋된 U3(7.31절) | M7 | W0b 이전 | `plan-v/v15/ds-train` | 4:11 | `2e0b2f05…` |
+
+1행과 2행은 2단계가 측정한 비트 단위로 같은 데이터셋 쌍 위에서, 같은 시드로, 같은 기계에서,
+몇 분 차이로 학습했다. **두 체크포인트는 비트 단위로 같지 않고, W0b가 그 이유가 아니다**:
+두 손실 곡선은 첫 네 최적화 스텝까지 *정확히* 일치하고 다섯 번째에서 **8 ULP**만큼
+갈라진다(0.47351330518722534 → 0.47351306676864624) — 다른 배치가 아니라 카드 위의 float32
+리덕션 순서다. 그 8 ULP에서 두 런은 갈라진다: 20,000스텝에서 126개 텐서 중 46개가 다르고,
+가장 큰 절대 차이는 백본의 `layer4.1.conv2.weight`에서 0.353이다. 9절의 표는 이미 "학습된
+가중치: **재현되지 않음**"이라고 말하고 있었다; 이것이 그 행을 데이터를 비트 단위로 고정한 채
+측정한 것이며, 그래서 §28.13 규칙 1은 여기서 실제로 비트 단위인 층들 — 문서, 데이터셋,
+207,762개 프레임, `lowering_hash` — 에서 확인하고 체크포인트에서는 확인하지 않는다.
+
+3행은 같은 이야기를 반대편에서 한다. 같은 36,960프레임짜리 V15 데이터셋은, 네 마일스톤 뒤에
+`task_hash`가 옮겨진 채로도, M7/U의 **첫 다섯 손실을 정확히** 재현하고(0.630703866481781, …)
+여섯 번째에서 **2 ULP**만큼 갈라진다. 베이킹, 배치 순서, ImageNet 초기화, lr 스케줄은 M7/U
+때와 같은 함수다: 여기의 모든 런이 M7/U 자신의 `lowering_hash 41d11a06…`을 찍고, pre 런의
+`training.lock`은 `augmentation.json`, `optimizer.json`, `precision.json`, `scheduler.json`,
+`seed.json`, `topology.json`을 M7/U와 똑같은 다이제스트로 해시한다. W0b가 옮긴 것은
+`config.json`과 `dataset.lock`, 그리고 그 둘을 감싸는 `identity_hash` / `training_hash` —
+문서 해시를 인용하는 슬롯들이다.
+
+**4단계 — U3 재채점.** 재생성한 `~/artifacts/plan-w/w0b/evaluation-augmented.toml`(`007aac67…`)과
+`eval-trainseeds-augmented.toml`(`31f64001…`)은 M7/U 자신의 두 문서에서 `task`와 `observation`
+줄만 바꾼 것이다 — `diff`가 각각 두 줄이다. `--jobs 6`, 곧 `eval-u23.sh` 자신의 값이므로 torch
+상한은 16/6 = **인트라옵 스레드 2개**이고, W0a 이후 `evaluation.lock`이 그것을 평문으로
+적는다(`runtime_threads: 2`; M7/U의 락은 그 필드보다 앞서므로 `None`이다 — 아래의 모든
+`execution_hash`가 M7/U의 것과 다른 두 번째 이유이며 그것도 W0b가 아니다. 이제 `runtime_hash`가
+스레드 수를 덮는다).
+
+**전문가 게이트는 옮겨진 해시 아래에서 통과한다.** §28.9 규칙 1대로 가장 먼저 돌렸다:
+`nominal`과 여섯 스위트 중 넷에서 16/16, `envelope_violation_rate` 0.0432, `passed = true`,
+112초. (`torque_noise` 0/16 — 수용 기준은 nominal 스위트 하나뿐이고, 이 표의 어떤 정책도 토크
+잡음을 견디지 못한다는 것은 7.31절이 이미 적어 두었다.) 거기서 `runtime_threads`가 `None`인
+것은 `--expert`가 정책 런타임을 전혀 열지 않기 때문이다.
+
+`success_rate` / `envelope_violation_rate` / `episode_length`, 홀드아웃 시드 101–116:
+
+| 스위트 | M7/U의 U3(7.31) | **U3′** — V15의 데이터, 오늘의 트리 | **U3″** — 오늘 수집한 시연 200개 |
+|---|---|---|---|
+| nominal | 0.5625 / 0.6668 / 1092.1 | **0.8750** / 0.5574 / 525.6 | **0.0000** / 0.0958 / 1800.0 |
+| light_intensity | 0.6250 / 0.6236 / 921.1 | 0.8125 / 0.6147 / 552.6 | 0.0000 / 0.1775 / 1800.0 |
+| light_direction | 0.1875 / 0.7265 / 1634.6 | 0.5625 / 0.7063 / 977.4 | 0.0625 / 0.1501 / 1694.3 |
+| observation_delay | 0.2500 / 0.6506 / 1502.2 | 0.8125 / 0.7086 / 621.6 | 0.0000 / 0.2175 / 1800.0 |
+| torque_noise | 0.0000 / 0.7157 / 1800.0 | 0.0000 / 0.6313 / 1800.0 | 0.0000 / 0.5234 / 1800.0 |
+| backlash | 0.4375 / 0.7031 / 1244.0 | 0.6875 / 0.7548 / 898.4 | 0.0000 / 0.1935 / 1800.0 |
+| 학습 시드 1–16, nominal | 0.5625 | **0.9375** | 0.1250 |
+| `passed` | true | **true** | **false** |
+
+벽시계: 전문가 게이트 112초; U3′ 홀드아웃 149초, 학습 시드 19초; U3″ 홀드아웃 285초, 학습
+시드 54초 — 각각 기계를 혼자 쓴 것이고, 7.31절의 8분 19초는 `--jobs 6` 두 런이 한 상자를
+나눠 쓴 값이다. 게다가 526틱에 끝내는 정책은 에피소드도 일찍 끝낸다.
+
+**저 표에서 리뷰어가 볼 만한 행이 둘 있고, 둘 다 해시가 아니다.**
+
+**U3″는 0.0000이고, 그 이유는 산수가 말해 준다.** `training-u3.toml`은 배치 64로 20,000
+최적화 스텝을 고정한다 — 표본 1,280,000개이고, V15의 36,960프레임으로는 **34.6 에폭**,
+오늘의 103,881프레임으로는 **12.3 에폭**이다. 스텝 수는 2.8배 작은 데이터셋에 맞춰 조정된
+것이고(T4 row D), 이 패킷은 무엇도 다시 조정할 수 없었다. 정책 자신의 숫자도 파이프라인이
+망가졌다는 쪽이 아니라 이 읽기를 뒷받침한다: nominal에서 `envelope_violation_rate`가 U3′의
+0.5574에 대해 0.0958이고, 모든 에피소드가 1,800틱을 꽉 채운다 — 엔벌로프와 싸우는 팔이 아니라
+거의 움직이지 않는 팔이다. **그러므로 `es loop cycle`의 커밋된 레시피는 자신의 collect 단계가
+지금 만들어 내는 데이터에 대해 학습이 모자란다** — M10 리뷰를 위한 열린 질문이지 W0b가 고쳐도
+되는 것이 아니다.
+
+**U3′는 7.31절이 0.5625로 적은 자리에서 0.8750이고**, 입력은 거의 같다. 이 노트는 그것을 해시
+수정 덕으로 돌리지 않는다. 두 런을 가르는 것은 둘이다: 체크포인트(3단계의 8 ULP 분기, 곧
+문서가 아니라 학습기)와 네 마일스톤어치의 트리 — 그 사이에 M7/R1의 에피소드 경계 분할, M8,
+M9, W0a가 모두 들어왔다. 4c 단계가 가중치를 고정해 둘을 가른다.
+
+**4c 단계 — 해시만 움직이는 비교, 그리고 그것은 동일하다.** 7.31절 자신의 U3 체크포인트를
+오늘의 바이너리로 두 번 채점했다: 한 번은 자기 번들 그대로 M7/U의
+`evaluation-augmented.toml`(`e5705cb0…`, `task eb6efefa…`)에 대해, 한 번은 같은
+`model-20000.safetensors`를 `es policy pack`으로 이 트리의 번들에 다시 넣어 우리
+문서(`007aac67…`, `task 86a7f3a3…`)에 대해. 222초와 223초.
+
+* **옛 해시 대 새 해시: 모든 셀이 동일하다** — 여섯 스위트, 네 지표, `failure_mode_histogram`의
+  개수까지. **이것이 평가기 위의 §28.13 규칙 1이다**: 같은 씬 속 같은 가중치가, 이 패킷이 옮긴
+  `task_hash` 아래에서 같은 96개 에피소드를 만든다.
+* **오늘의 바이너리 대 M7/U의 커밋된 `report.json`: 이것도 모든 셀이 동일하다** — nominal에서
+  0.5625 / 0.6668 / 1092.1, 나머지 다섯 스위트도 마지막 자리까지. 그러니 M7/U와 오늘 사이의 네
+  마일스톤도 이 평가에서 아무것도 옮기지 않았고, 7.31절의 표는 쓰인 그대로 유효하다.
+
+둘 다 한 번의 측정에서 나오고, 합치면 U3′의 0.8750이 어디서 왔는지 말해 준다: **해시도 아니고
+트리도 아니고 체크포인트다.** 비트 단위로 같은 데이터 위에서 같은 시드로 돌린 `es train` 두
+번이, 다섯 번째 최적화 스텝에서 8 ULP로 갈라져, 같은 홀드아웃 시드 16개에서 0.5625와 0.8750을
+받는다. 그 자체로 열린 질문 하나의 값어치가 있다 — 데모의 `success_rate`는 지금까지 이 노트의
+어떤 표가 암시한 것보다 학습기의 float32 리덕션 순서에 훨씬 민감하고, 여기 어느 행도 그보다 더
+정밀하게 재현되지 않는다.
+
+W0a를 확인해 주는 `execution_hash` 하나를 눈에 보이는 김에 적어 둔다: 위의 옛 해시 런은
+`evaluation_hash e5705cb0…`, 곧 M7/U의 것 그대로를 지니지만 `execution_hash`는 M7/U의
+`a2283994…`에 대해 `350bcd43…`이다. 같은 문서, 같은 가중치, 같은 셀 — 그런데 `execution_hash`가
+다르다. `runtime_hash`가 이제 `evaluation.lock`이 찍는 인트라옵 스레드 2개를 덮기 때문이다.
+
+**5단계 — reach 과제 재측정**은 다른 노트의 몫이고(`docs/design/rl-continuation.md` 7절의
+"W0b"), 이 노트가 지닐 수 없는 비트 단위 주장을 그 행이 지닌다. CPU 백엔드 위의 PPO는
+재현되고 CUDA 위의 ACT 학습은 그렇지 않기 때문이다: 옮겨진 해시 아래에서 시드 0·1·2로 처음부터
+학습한 reach 과제는 S4e·S4c의 것과 **바이트 단위로 같은** `model-4000.safetensors`를 내놓고,
+모든 시드에서 8개 텐서 중 0개가 다르며, `report.json`도 모든 셀이 동일하다 — 0.5625 / 0.3750 /
+0.3125, 평균 **0.4167**, 곧 커밋된 숫자다.
+
+**벽시계와 산출물.** 전부 `~/artifacts/plan-w/w0b/` 아래, 각 단계마다 자신의 `.start` /
+`.end` / `.done` / `.log`가 있다: `--features render` 릴리스 빌드 26초; 1단계 47초 + 26초;
+2단계 316초(수집 296초); 2b 단계 352초(W0b 이전 빌드 + 수집 303초); 3단계 301초; 3b 단계
+548초(U3-pre 296초, V15 데이터 251초); 4단계 624초; 4c 단계 449초. 남긴 것:
+`v15/{ds-train,frames-train}`와 `pre/{ds-train,frames-train}`(비트 단위로 같은 쌍, 각 3.3 GB),
+베이킹된 텐서 트리를 뺀 `U3/{train-pre,train-recollected,train-committed-ds}`, 일곱 벌의
+`report.json` / `evaluation.lock` / `events.json` / `traj/`, 재생성한 평가 문서 둘, `reach/`,
+단계 스크립트들과 `bin/es`. 숫자를 읽은 뒤 지운 것: 평가의 `--frames` 트리들과 세 개의
+`baked/` 디렉터리(40 GB → 7.9 GB). 이 경로에서 §12.4의 아홉 지표는 `Target / Status:
+unverified`이고, 여기 어떤 숫자도 처리량 주장이 아니다.
+
+**이 행이 매듭짓는 것과 여는 것.** 매듭지은 것: `scene_hash`는 Windows와 Linux에서 하나의
+숫자이고, 틀렸던 쪽은 Windows였으며, 수정은 해시를 옮겼고 그 밖의 무엇도 옮기지 않았다 —
+수집에서(프레임 207,762개 바이트 단위 동일, `content` 다이제스트 하나), 모듈에서
+(`lowering_hash` 불변), 평가기에서(4c 단계, 양방향 모든 셀 동일) 측정했다. 연 것, 그리고 둘 다
+W0b가 닫을 것이 아니다: **(a)** 커밋된 20,000스텝 레시피는 V15 데이터로는 34.6 에폭이었는데
+`es loop collect`가 지금 만드는 데이터로는 12.3 에폭이고, 그것으로 학습한 정책은 0.0000을
+받는다; **(b)** 비트 단위로 같은 데이터 위에서 한 시드로 돌린 `es train` 두 번이 5스텝째에
+8 ULP로 갈라져 0.5625와 0.8750을 받는다 — 학습기를 고정하지 않는 한 데모의 대표 숫자는 약
+±0.3까지만 재현된다. 둘 다 M10 리뷰의 몫이다.
+
 ### 7.37 만든 대로 (M10/W1a): 그레인이 움직이는 같은 정책, U5 행
 
 패킷 `docs/packets/M10/W1a-pt-seed-tick.md`; 렌더러 쪽은 `renderer.md` section 12.8이다.

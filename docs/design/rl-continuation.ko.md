@@ -795,6 +795,58 @@ Deployment IR / 스펙 결정이지(INV-12: 넓히기만 하고 결코 끄지 �
 `Target / Status: unverified`다. 여기서 측정되지 않은 것: 첫 반복의 액터 그래디언트
 노름(S-13의 탐지기는 아직 존재하지 않는다).
 
+### W0b — 플랫폼에 흔들리지 않는 `scene_hash` 아래에서 다시 측정한 A0, 오라클 서버(Linux, 16코어 CPU), 2026-09-22 UTC
+
+패킷 `docs/packets/M10/W0b-scene-hash-libm.md`. MJCF/URDF 임포터가 `euler=`, `axisangle=`,
+`zaxis=`, `rpy`에 대해 호스트의 libm을 부르지 않고 `es_math::approx::{sin_cos_f64, acos_f64}`를
+지나게 되었고, 그래서 `scene_hash`는 Windows와 Linux에서 하나의 숫자다(§3.2의 `f64` 단락).
+그것이 모든 SO-101 `task_hash`를 옮기고 reach 문서들도 함께 옮긴다: `task-reach.toml`
+`b5d3b813…` → **`43a62f3f…`**, `observation-reach.toml` `4ced8547…` → **`ecabac79…`**,
+`evaluation-reach.toml` `f15fe888…` → **`66ef84a5…`**; `learning-reach.toml` `eb805f18…`과
+`deployment-reach.toml` `7af05d88…`은 씬을 읽지 않으므로 움직이지 않는다. 전체 옛 → 새 표는
+패킷의 노트 절에 있다.
+
+**옮겨진 해시 아래에서 A0를 처음부터 다시 돌렸고, 세 시드 모두 비트 단위로 같다.** 재생성한
+reach 문서 넷으로 패킹한 미학습 번들, 시드 0·1·2의 `training-reach.toml`(서버 쪽 사본에서
+`[run] seed`만 덮어썼고 그 밖에는 손대지 않았다), 각각 CPU 백엔드에서 4,000 반복, 그다음
+재생성한 `evaluation-reach.toml`로 `es eval run`:
+
+| 시드 | `weights/model-4000.safetensors` | S4e / S4c와 다른 텐서 수 | `nominal` `success_rate` | `episode_length` |
+|---|---|---|---|---|
+| 0 | `d79c5c3a…` | **0 / 8** | 0.5625 | 129.4375 |
+| 1 | `935ca7b8…` | **0 / 8** | 0.3750 | 147.1875 |
+| 2 | `35fc351a…` | **0 / 8** | 0.3125 | 153.6250 |
+
+평균 **0.4167**, 곧 7절의 S4e·S4c 행과 `visible-learning.md` 7.34·7.35가 이미 지닌 숫자다.
+모든 `report.json`의 모든 셀이 커밋된 것과 동일하다 — 네 스위트, 두 지표,
+`observation_delay` 0.3125 / 0.0625 / 0.1250과 `torque_noise` 0.5000 / 0.4375 / 0.6250까지.
+**이것이 이 저장소 어디에서도 가능한 §28.13 규칙 1의 가장 강한 형태다**: CPU 백엔드 위의 PPO는
+비트 단위이므로(`train_rl_two_runs_are_bitwise`), 그 밖의 무엇도 옮기지 않은 해시 수정이라면
+체크포인트를 바이트 단위로 재현해야 하고, 실제로 재현한다 — S4e와 S4c가 돌던 트리에서 네
+마일스톤이 지난 트리 위에서. `visible-learning.md` 7.36이 데모 쪽 절반을 지닌다. 거기서는
+CUDA 위의 ACT 학습이 비트 단위가 아니어서 주장을 한 층 위와 한 층 아래에서 해야 한다.
+
+**움직이는 두 해시와, 각각이 움직이는 이유.** `evaluation_hash` `f15fe888…` → `66ef84a5…`는
+`task`와 `observation`을 통한 이 수정 자체다. `execution_hash`는 두 겹으로 움직인다: 시드 0
+`9ff75635…` → `145bc81a…`, 시드 1 `22b55e10…` → `7883ef24…`, 시드 2 `d72bee1b…` →
+`63f91704…` — 한 번은 문서 때문에, 한 번은 W0a가 정책 런타임의 인트라옵 스레드 수를
+`runtime_hash`에 넣었기 때문에. `evaluation.lock`이 이제 그것을 찍는다:
+**`runtime_threads: 8`**, 이 상자의 물리 코어 8개에 대한 torch 자신의 기본값이고, `--jobs 1`의
+`cores/N` 상한 16은 여기서 구속하지 않는다. S4e와 S4c의 락은 그 필드보다 앞서므로 `None`이다.
+스레드 수가 둘이면 조건도 둘이지만(`evaluation-execution.md` 2.7), 여기서는 수가 같고 그것이
+*기록된다*는 점만 새롭다.
+
+**벽시계와 스케줄링 한 마디.** 시드 0 / 1 / 2는 **637초 / 618초 / 637초**에 학습하고 11 / 11 /
+10초에 채점했으며, 한 번에 하나씩 돌렸다(단계 총 1,925초). 처음에는 패킷이 요구한 대로 셋을
+동시에 띄웠다: `es train`은 `es eval run --jobs`가 평가기의 풀을 제한하는 식으로 학습기의
+스레드 풀을 제한하지 않으므로, 세 런이 16코어 위에 3 × 8 torch 스레드를 올렸고 **60분** 동안
+체크포인트를 하나도 쓰지 못했다 — 혼자 돌 때 755초였던 S4e에 대해서. 그 런들을 죽이고 순차로
+다시 돌렸다; 스레드 수는 어느 쪽이든 torch의 기본값이므로 이것은 스케줄링 선택이지 다른 측정이
+아니다 — 위의 비트 단위로 같은 체크포인트들이 그것을 가정이 아니라 확인해 준다. 산출물은
+`~/artifacts/plan-w/w0b/reach/seed{0,1,2}/`, `training_hash` `2dfbc7c8…` / `6bf728e7…` /
+`e3d030e8…`. §12.4의 아홉 지표는 각 런의 `metrics/env-metrics.json`에 있고, 나머지는
+`Target / Status: unverified`다.
+
 ## 8. 임포터와 어댑터
 
 1절의 규칙 3은 어댑터가 선언하고 코드는 결코 추측하지 않는다고 말한다. `es policy import-rl`의

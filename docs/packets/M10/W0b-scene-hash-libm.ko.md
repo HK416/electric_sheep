@@ -109,3 +109,41 @@ docs/packets/M10/W0b-scene-hash-libm.ko.md
 (단락은 들어가 있다); 생성기가 있는 커밋 문서를 손으로 고치는 것; 물리·이미터·수치의 의미 변경;
 `tests/fixtures/quadruped/task.toml` 해시 이동; `es-render`, `es-env`, `es-physics-*`(다음 `es-assets` 변경은
 W2a 것이며 이 패킷 머지 뒤 시작한다).
+
+## 노트 — 이 패킷이 옮긴 모든 다이제스트, 옛 → 새
+
+2026-09-22 측정(패킷의 부모인 `13c1e45`의 문서와 여기 커밋된 같은 문서에 대해
+`cargo run -p es -- ir validate`; 서버 쪽 문서 둘은 오라클 서버의 바이너리로).
+**움직인 쪽은 Windows다**: 오라클 서버에서 빌드한 `13c1e45` 트리는 이미
+`so101_pick_place.xml`을 `882e7d0b…`, 즉 *새* 값으로 해시했다 — glibc의 `sincos`/`acos`와
+`libm` 포트는 이 씬의 입력들에 대해 비트 단위로 일치하며, 커밋되어 있던 `4e0c2a8f…`는
+Windows CRT 혼자만의 숫자였다.
+
+| 문서 | 필드 | 옛 | 새 |
+|---|---|---|---|
+| `mjcf/so101_pick_place.xml`, SO-101 Task IR 네 개가 적어 두는 값 | `scene_hash` | `4e0c2a8f…` | `882e7d0b…` |
+| `visible-learning/task.toml` | `task_hash` | `eb6efefa…` | `86a7f3a3…` |
+| `visible-learning/task-pt.toml` | `task_hash` | `d546b808…` | `02036847…` |
+| `rl/task-reach.toml` | `task_hash` | `b5d3b813…` | `43a62f3f…` |
+| `rl/task-reach-delta.toml` | `task_hash` | `fb5020fc…` | `1e13a2b0…` |
+| `visible-learning/observation.toml` | `observation_hash` | `899c16a9…` | `8a528bc0…` |
+| `visible-learning/observation-pt.toml` | `observation_hash` | `7caac85d…` | `73101631…` |
+| `visible-learning/observation-v8.toml` | `observation_hash` | `c69a8e11…` | `3009284b…` |
+| `visible-learning/observation-augmented.toml` | `observation_hash` | `cc437a24…` | `bb9c4a7a…` |
+| `rl/observation-reach.toml` | `observation_hash` | `4ced8547…` | `ecabac79…` |
+| `rl/observation-reach-delta.toml` | `observation_hash` | `8dea346b…` | `6a35d96b…` |
+| `rl/observation-state.toml` | `observation_hash` | `a520c170…` | `a1527a30…` |
+| `visible-learning/evaluation.toml` | `evaluation_hash` | `e52e8360…` | `15d320fd…` |
+| `visible-learning/evaluation-pt.toml` | `evaluation_hash` | `dafc8ce6…` | `1cf73432…` |
+| `visible-learning/evaluation-v8.toml` | `evaluation_hash` | `a3ce10ac…` | `9c4c1cb1…` |
+| `rl/evaluation-reach.toml` | `evaluation_hash` | `f15fe888…` | `66ef84a5…` |
+| `rl/evaluation-reach-delta.toml` | `evaluation_hash` | `6399a496…` | `618ef75a…` |
+| 서버 `m7-u/evaluation-augmented.toml` | `evaluation_hash` | `e5705cb0…` | `007aac67…` |
+| 서버 `m7-u/eval-trainseeds-augmented.toml` | `evaluation_hash` | `10af1061…` | `31f64001…` |
+| **`quadruped/task.toml`**(대조군, `xyaxes`뿐) | `task_hash` | `13c88f7a…` | **불변** |
+| **`mjcf/go1_primitives.xml`**(대조군) | `scene_hash` | `3c9348ea…` | **불변** |
+
+구성상 움직일 수 없고, 실제로 확인한 것들: `learning_hash`(`5dac0a46…`, `fdb5178a…`,
+`eb805f18…`), `deployment_hash`(`f2f9a510…`, `7af05d88…`), `lowering_hash`(`3d06811c…`,
+`41d11a06…`, `dce8d352…`) — 셋 다 씬을 읽지 않는다. 측정은
+`docs/design/visible-learning.md` 7.36과 `docs/design/rl-continuation.md` 7절 "W0b"에 있다.

@@ -4607,6 +4607,205 @@ removed every `violation.velocity` and moved the clamp to `violation.position`: 
 sits against the soft position envelope and is clamped on every tick. No change to §13.4's default
 action space; the open lever is the envelope's meaning for a learning policy (M9 review S-7).
 
+### 7.36 As built (M10/W0b): the record re-measured under the platform-stable `scene_hash`
+
+Packet `docs/packets/M10/W0b-scene-hash-libm.md`, oracle server (RTX 4090, 16 cores),
+2026-09-22. `crates/es-assets/src/mjcf/orient.rs` and `urdf.rs` turned `euler=`, `axisangle=`,
+`zaxis=` and `rpy` into quaternions with the *host's* libm, so the same `so101_pick_place.xml`
+hashed to two `scene_hash`es on Windows and Linux (M8 review S-2) and `reach_documents_validate`
+had to exempt the field. The three calls now go through `es_math::approx::{sin_cos_f64,
+acos_f64}`, the pure-Rust `libm` port (§3.2's `f64` paragraph); `crates/es-assets/tests/
+scene_hash_pins.rs` pins four hex digests typed in by hand and the `cli.rs` tests assert
+`task.scene.scene_hash == scene.scene_hash()` instead of overwriting it. The owner's decision on
+the review question was to **re-collect, retrain and re-score under the moved hashes**, and this
+is that measurement. The old → new table for every digest is the packet's note section.
+
+**The decisive oracle passed on both platforms, and the platform that moved is Windows.** On the
+server the pinned digests are the Windows tree's, character for character — `so101_pick_place.xml`
+`882e7d0b…`, `orientations.xml` `958ceaae…`, `arm2.xml` `4602d675…`, `arm2.urdf` `4708aba6…`,
+the quadruped control `3c9348ea…` unmoved — and `es-math`'s three `to_bits()` constants, the
+regenerated `es-ir` pins, `reach_documents_validate`,
+`quadruped_documents_are_what_the_generator_produces`, `visible_learning_documents_compile` and
+`rl_state_observation_is_what_the_generator_writes` are green there (47 s + 26 s;
+`~/artifacts/plan-w/w0b/stage1.log`, `stage1b.log`). Then the control the packet did not ask for
+and the note needs: **the tree at `13c1e45`, W0b's parent, built on the same server, regenerates
+`task.toml` with `scene_hash 882e7d0b…` — the *new* value.** glibc's `sincos`/`acos` and the
+`libm` port agree bit for bit on this scene's inputs; the Windows CRT was the outlier and the
+committed `4e0c2a8f…` was its number alone. So **every measurement plan V, M7, M8 and M9 took on
+the oracle server was already taken under today's `scene_hash`**. What moved is the document, not
+the physics — which is what the rest of this row then measures rather than assumes.
+
+**Stage 2 — the collection is bit for bit, and it is measured against the right baseline.** The
+packet named `~/artifacts/plan-v/v15/ds-train` as the baseline; that artifact cannot be
+reproduced by this tree and W0b is not why. V15 collected 200 episodes of median 183 frames,
+36,960 in total; the identical command on today's tree collects 200 episodes of median 520,
+103,881 in total — V11's "one control step is one control period" (section 7.19) and everything
+after it, and section 7.32 already recorded the same 511-tick seed 1 at M7/R5. Both are the same
+200 `Success` demonstrations of the same expert on the same seeds; they are not the same
+recording. So the baseline that isolates W0b is the pre-W0b tree, on Linux, run twice:
+
+| `es loop collect --episodes 200 --seed 1 --expert so101-pick-place --frames` | `13c1e45` (pre) | this tree |
+|---|---|---|
+| terminations | 200 success / 0 failure / 0 timeout | identical |
+| frames | 103,881 | 103,881 |
+| dataset `content` | `ca915df2…` | **`ca915df2…`** |
+| `schema` / `split` | `1f5ddafc…` / `872fe162…` | identical |
+| `frames-train`, 207,762 files | — | **byte-identical** (`diff -r`) |
+| every `data/chunk-000/episode_*.parquet` | — | **byte-identical** |
+| wall clock | 303 s | 296 s |
+
+`ds-train` differs in exactly three places, and every one of them *is* a recorded hash:
+`loop.jsonl`'s `inputs.task` / `inputs.observation`, `meta/episodes.jsonl`'s 200 `es:task:…`
+URIs, and `meta/tasks.jsonl`'s one (plus `created`, a timestamp). That is §28.13 rule 1 measured
+rather than asserted: the fix moved hashes and nothing else. Logs `stage2-compare.log`,
+`stage2b-compare.log`, `stage2b-regen.log`.
+
+**`es train` refuses the M5-era dataset under the moved `task_hash`, by name, and that is the
+chain working.** Pointed at `~/artifacts/plan-v/v15/ds-train` with the re-packed bundle it stops
+before baking: *"the dataset was collected under task_hash eb6efefa… and this recipe's Task IR is
+86a7f3a3…. A policy trained on demonstrations of one predicate and judged against another
+measures nothing (M5 review S-3). Pass `--allow-retired-task eb6efefa…` to accept it
+deliberately."* Nothing in W0b taught it that; the refusal is M5's, firing for the first time on
+a hash this repository moved on purpose.
+
+**Stage 3 — U3 retrained, and the one level of this chain that was never bitwise.** Three runs
+of `training-u3.toml`'s settings (batch 64, lr 4e-4, `warmup_cosine` 250 / 1e-6, seed 0,
+`--resident-gpu`, `device = "cuda"`), each `es train` end to end against its own re-packed
+bundle, on an idle card:
+
+| run | tree | documents | dataset | wall | `weights/model-20000.safetensors` |
+|---|---|---|---|---|---|
+| **U3-pre** | `13c1e45` | pre-W0b | `w0b/pre/ds-train` | 4:56 | `d95c0db2…` |
+| **U3-post** | this | W0b | `w0b/v15/ds-train` | 5:00 | `b87c277d…` |
+| U3 on V15's own data | this | W0b, `--allow-retired-task eb6efefa…` | `plan-v/v15/ds-train` | 4:11 | `e7d11394…` |
+| M7/U's committed U3 (section 7.31) | M7 | pre-W0b | `plan-v/v15/ds-train` | 4:11 | `2e0b2f05…` |
+
+Rows 1 and 2 are trained on the bit-identical pair stage 2 measured, at the same seed, on the
+same box, minutes apart. **Their checkpoints are not bit-identical, and W0b is not why:** the two
+loss curves agree *exactly* for the first four optimizer steps and part at the fifth by **8
+ULPs** (0.47351330518722534 → 0.47351306676864624) — a float32 reduction order on the card, not
+a different batch. From those 8 ULPs the runs diverge: at 20,000 steps 46 of 126 tensors differ,
+worst max-abs 0.353 in the backbone's `layer4.1.conv2.weight`. Section 9's table already says
+"the trained weights: **not** reproducible"; this is that row measured, with the data held
+bit-identical so nothing else can be blamed, and it is why §28.13 rule 1 is checked here at the
+levels that *are* bitwise — the documents, the dataset, the 207,762 frames, `lowering_hash` — and
+not at the checkpoint.
+
+Row 3 says the same thing from the other side. The same 36,960-frame V15 dataset, four
+milestones later and with `task_hash` moved, reproduces M7/U's **first five losses exactly**
+(0.630703866481781, …) and parts at the sixth by **2 ULPs**. The bake, the batch order, the
+ImageNet initialisation and the lr schedule are the same function they were in M7/U: every run
+here prints `lowering_hash 41d11a06…`, M7/U's own, and the pre run's `training.lock` hashes
+`augmentation.json`, `optimizer.json`, `precision.json`, `scheduler.json`, `seed.json` and
+`topology.json` to M7/U's exact digests. What W0b moved is `config.json`, `dataset.lock` and the
+`identity_hash` / `training_hash` around them — the slots that quote a document hash.
+
+**Stage 4 — U3 re-scored.** The regenerated `~/artifacts/plan-w/w0b/evaluation-augmented.toml`
+(`007aac67…`) and `eval-trainseeds-augmented.toml` (`31f64001…`) are M7/U's own two documents
+with the `task` and `observation` lines replaced and nothing else — `diff` is two lines each.
+`--jobs 6`, `eval-u23.sh`'s own value, so the torch cap is 16/6 = **2 intra-op threads**, which
+`evaluation.lock` now records in plain text since W0a (`runtime_threads: 2`; M7/U's locks predate
+the field and read `None`, which is also why every `execution_hash` below differs from M7/U's for
+a second reason that is not W0b — `runtime_hash` covers the thread count now).
+
+**The expert gate passes under the moved hashes**, run first as §28.9 rule 1 requires: 16/16 on
+`nominal` and on four of the six suites, `envelope_violation_rate` 0.0432, `passed = true`,
+112 s. (`torque_noise` 0/16 — the acceptance is the nominal suite's alone, and section 7.31
+already records that nothing in this table survives torque noise.) `runtime_threads` is `None`
+there because `--expert` loads no policy runtime.
+
+`success_rate` / `envelope_violation_rate` / `episode_length`, 16 held-out seeds 101–116:
+
+| suite | M7/U's U3 (7.31) | **U3′** — V15's data, today's tree | **U3″** — today's own 200 demonstrations |
+|---|---|---|---|
+| nominal | 0.5625 / 0.6668 / 1092.1 | **0.8750** / 0.5574 / 525.6 | **0.0000** / 0.0958 / 1800.0 |
+| light_intensity | 0.6250 / 0.6236 / 921.1 | 0.8125 / 0.6147 / 552.6 | 0.0000 / 0.1775 / 1800.0 |
+| light_direction | 0.1875 / 0.7265 / 1634.6 | 0.5625 / 0.7063 / 977.4 | 0.0625 / 0.1501 / 1694.3 |
+| observation_delay | 0.2500 / 0.6506 / 1502.2 | 0.8125 / 0.7086 / 621.6 | 0.0000 / 0.2175 / 1800.0 |
+| torque_noise | 0.0000 / 0.7157 / 1800.0 | 0.0000 / 0.6313 / 1800.0 | 0.0000 / 0.5234 / 1800.0 |
+| backlash | 0.4375 / 0.7031 / 1244.0 | 0.6875 / 0.7548 / 898.4 | 0.0000 / 0.1935 / 1800.0 |
+| training seeds 1–16, nominal | 0.5625 | **0.9375** | 0.1250 |
+| `passed` | true | **true** | **false** |
+
+Wall clocks: expert gate 112 s; U3′ holdout 149 s, train seeds 19 s; U3″ holdout 285 s, train
+seeds 54 s — each alone on the box, where section 7.31's 8:19 was two `--jobs 6` runs sharing it,
+and a policy that finishes in 526 ticks ends its episodes early besides.
+
+**Two rows there deserve a reviewer and neither of them is a hash.**
+
+**U3″ is 0.0000, and the arithmetic says why.** `training-u3.toml` fixes 20,000 optimizer steps
+at batch 64 — 1,280,000 samples, which is **34.6 epochs** of V15's 36,960 frames and **12.3
+epochs** of today's 103,881. The step count was tuned (T4 row D) against a dataset 2.8× smaller,
+and the packet forbade retuning anything. The policy's own numbers agree with that reading
+rather than with a broken pipeline: `envelope_violation_rate` 0.0958 on nominal against U3′'s
+0.5574, and every episode running the full 1,800 ticks — an arm that barely moves, not one that
+fights its envelope. **`es loop cycle`'s committed recipe is therefore under-trained for the data
+its own collect stage now produces**, which is an open question for the M10 review and not
+something W0b was allowed to fix.
+
+**U3′ is 0.8750 where section 7.31 recorded 0.5625, on what is very nearly the same input**, and
+this note will not attribute that to the hash fix. Two things separate the two runs: the
+checkpoint (stage 3's 8-ULP divergence, which is the trainer and not the documents) and four
+milestones of tree — M7/R1's episode-boundary partition, M8, M9 and W0a all landed in between.
+Stage 4c holds the weights fixed to tell those apart.
+
+**Stage 4c — the comparison that moves only the hashes, and it is identical.** Section 7.31's own
+U3 checkpoint, on today's binary, judged twice: once by its own bundle against M7/U's
+`evaluation-augmented.toml` (`e5705cb0…`, `task eb6efefa…`), and once with the same
+`model-20000.safetensors` re-packed by `es policy pack` into this tree's bundle and judged by
+ours (`007aac67…`, `task 86a7f3a3…`). 222 s and 223 s.
+
+* **old-hash against new-hash: every cell identical**, all six suites, all four metrics,
+  including the `failure_mode_histogram` counts. **That is §28.13 rule 1 on the evaluator**:
+  the same weights in the same scene produce the same 96 episodes under a `task_hash` this
+  packet moved.
+* **Today's binary against M7/U's committed `report.json`: every cell identical too** — 0.5625 /
+  0.6668 / 1092.1 on nominal and the other five suites to the last digit. So the four
+  milestones between M7/U and now moved nothing in this evaluation either, and section 7.31's
+  table stands exactly as written.
+
+Both of those follow from one measurement, and together they say where U3′'s 0.8750 came from:
+**not the hashes and not the tree, but the checkpoint.** Two `es train` runs on bit-identical
+data at the same seed, parting at the fifth optimizer step by 8 ULPs, score 0.5625 and 0.8750 on
+the same 16 held-out seeds. That is worth an open question of its own — the demo's `success_rate`
+is far more sensitive to the trainer's float32 reduction order than any table in this note has so
+far implied, and no row here is reproducible to better than that.
+
+One `execution_hash` detail confirms W0a while it is in view: the old-hash run above carries
+`evaluation_hash e5705cb0…`, M7/U's exactly, and `execution_hash 350bcd43…` against M7/U's
+`a2283994…`. Same documents, same weights, same cells — and a different `execution_hash`,
+because `runtime_hash` now covers the 2 intra-op threads that `evaluation.lock` prints.
+
+**Stage 5 — the reach task re-measured** belongs to the other note
+(`docs/design/rl-continuation.md` section 7, "W0b") and it carries the bitwise claim this one
+cannot, because PPO on the CPU backend *is* reproducible where CUDA ACT training is not: the
+reach task trained from scratch at seeds 0, 1 and 2 under the moved hashes gives
+`model-4000.safetensors` **byte-identical** to S4e's and S4c's, 0 of 8 tensors differing on
+every seed, and a `report.json` identical in every cell — 0.5625 / 0.3750 / 0.3125, mean
+**0.4167**, the committed number.
+
+**Wall clocks and artifacts.** Everything under `~/artifacts/plan-w/w0b/`, each stage with its
+own `.start` / `.end` / `.done` / `.log`: release build with `--features render` 26 s; stage 1
+47 s + 26 s; stage 2 316 s (collect 296 s); stage 2b 352 s (pre-W0b build + collect 303 s);
+stage 3 301 s; stage 3b 548 s (U3-pre 296 s, V15's data 251 s); stage 4 624 s; stage 4c 449 s.
+Kept: `v15/{ds-train,frames-train}` and `pre/{ds-train,frames-train}` (the bit-for-bit pair,
+3.3 GB each), `U3/{train-pre,train-recollected,train-committed-ds}` minus their baked tensor
+trees, all seven `report.json` / `evaluation.lock` / `events.json` / `traj/` sets, the two
+regenerated evaluation documents, `reach/`, the stage scripts and `bin/es`. Deleted after the
+numbers were read: the evaluation `--frames` trees and the three `baked/` directories (40 GB →
+7.9 GB). The nine §12.4 metrics are `Target / Status: unverified` on this path; nothing here is
+a throughput claim.
+
+**What this row settles, and what it opens.** Settled: `scene_hash` is one number on Windows and
+Linux, the platform that was wrong was Windows, and the fix moved hashes and nothing else —
+measured at the collection (207,762 frames byte-identical, one `content` digest), at the module
+(`lowering_hash` unmoved), and at the evaluator (stage 4c, every cell identical both ways).
+Opened, and neither is W0b's to close: **(a)** the committed 20,000-step recipe is 12.3 epochs of
+the data `es loop collect` now produces where it was 34.6 of V15's, and the policy it trains
+scores 0.0000; **(b)** two `es train` runs on bit-identical data at one seed part by 8 ULPs at
+step 5 and score 0.5625 and 0.8750, so the demo's headline number is reproducible only to about
+±0.3 unless the trainer is pinned. Both belong to the M10 review.
+
 ### 7.37 As built (M10/W1a): row U5 — the same policy with the grain moving
 
 Packet `docs/packets/M10/W1a-pt-seed-tick.md`; the renderer side is `renderer.md` section 12.8.
