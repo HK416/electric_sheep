@@ -4883,6 +4883,22 @@ es eval run --config .../eval-trainseeds-augmented-pt-tick.toml ... --out .../U5
 `execution_hash` are in the same file and in `evaluation.lock` beside it. The raw frame trees
 are deleted once the numbers are read.
 
+**Stage 0 passed, and it closes section 7.32's reading (b).** Seed 1, `--expert`, both stages
+under `task-pt-tick.toml`: the tick-0 frame is `md5 76ac50e6…` on both sides, and so are ticks
+1 and 2 — **three bit-identical frames**, for exactly as long as the two stages stand in the
+same state. Tick 3 differs, and the `.estraj` says why: the states themselves have parted by
+then, which is the pre-existing collect/eval divergence under `--expert` and not a rendering
+one (it would move the `Fixed` frames of U4 identically). So at an identical `(pose, tick)` the
+collector and the evaluator produce identical bytes on the `Pt` path with the seed moving —
+U4's alternative reading, "a collect/eval observation mismatch", is not what row U5 is
+measuring against.
+
+The gate earned its place on the first attempt for a different reason: the parity Evaluation IR
+named the *augmented* Observation IR while the parity bundle carried the plain one, and
+`XIR-040` refused to judge it (`evaluation observation reference is 4e1d6482, the bundle hashes
+to 9bb3ed9f`). The hash chain caught a mis-paired document before a 36-minute collection ran on
+it, which is §10.4's "equal `evaluation_hash` means equal conditions" doing its job.
+
 **What the answer will mean, written before it arrives.** If U5 lands near U3's 0.5625, R13
 was right and the grain was the cause: the fix is one declared field and the `Pt` observation
 path becomes usable as it stands. If U5 lands near U4's 0.0 *and* the parity gate passed, then
