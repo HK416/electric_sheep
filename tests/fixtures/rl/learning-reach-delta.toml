@@ -1,0 +1,256 @@
+# Learning IR (spec 8) for the increment-driven SO-101 reach task -- packet M9/T3.
+#
+# `learning-reach.toml`'s graph -- one 26-wide state port, `Mlp [64, 64]` relu, a horizon-1
+# `Regression` head squashed by `tanh`, `ActionChunker`, `Normalizer { Inverse }` -- with the
+# unnormalizer reading the **increment** unit instead of the actuator's range:
+#
+#   * `mean = 0`. An increment's neutral value is "do not move"; a centre here would be a
+#     policy that drifts whenever it outputs nothing.
+#   * `std = 0.05`, radians per control tick -- `adapter-so101-delta.toml`'s own `scale`, so
+#     the graph a T3 run trains from scratch and the graph T2's import emits speak in the
+#     same numbers. At 50 Hz that is 2.5 rad/s under the envelope's 3.0.
+#   * the action port is `Unit::AngularVelocity`. `es_ir::cross` refuses `Unit::Angle` on a
+#     `JointDelta` deployment by name (`XIR-031`): the documents would read as a position
+#     policy and the runtime would add a position to a position.
+#
+# The value network and the Gaussian's `log_std` are not here for `learning-reach.toml`'s
+# reason: PPO is a trainer, not an IR.
+
+es_schema = 1
+kind = "learning"
+
+[body]
+schema_version = 1
+
+[[body.inputs]]
+name = "state"
+
+[body.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [26]
+time = "Tick"
+
+[body.inputs.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.nodes]
+schema_version = 1
+
+[[body.nodes.edges]]
+
+[body.nodes.edges.from]
+node = 0
+port = "out"
+
+[body.nodes.edges.to]
+node = 1
+port = "feat"
+
+[[body.nodes.edges]]
+
+[body.nodes.edges.from]
+node = 1
+port = "chunk"
+
+[body.nodes.edges.to]
+node = 2
+port = "chunk"
+
+[[body.nodes.edges]]
+
+[body.nodes.edges.from]
+node = 2
+port = "actions"
+
+[body.nodes.edges.to]
+node = 3
+port = "actions"
+
+[[body.nodes.inputs]]
+node = 0
+port = "state"
+
+[body.nodes.nodes.0.StateEncoder]
+out_dim = 64
+
+[[body.nodes.nodes.0.StateEncoder.inputs]]
+name = "state"
+
+[body.nodes.nodes.0.StateEncoder.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [26]
+time = "Tick"
+
+[body.nodes.nodes.0.StateEncoder.inputs.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.nodes.nodes.0.StateEncoder.kind.Mlp]
+hidden = [
+    64,
+    64,
+]
+
+[body.nodes.nodes.1.PolicyHead]
+action_dim = 6
+horizon = 1
+kind = "Regression"
+squash = "Tanh"
+
+[[body.nodes.nodes.1.PolicyHead.inputs]]
+name = "feat"
+
+[body.nodes.nodes.1.PolicyHead.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [64]
+time = "Tick"
+unit = "Dimensionless"
+
+[body.nodes.nodes.2.ActionChunker]
+blend = "HardSwitch"
+buffer_chunks = 2
+execute_chunk = 1
+horizon = 1
+mode = "RecedingHorizon"
+replan_hz = 50.0
+
+[[body.nodes.nodes.2.ActionChunker.inputs]]
+name = "chunk"
+
+[body.nodes.nodes.2.ActionChunker.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [
+    1,
+    6,
+]
+time = "Tick"
+
+[body.nodes.nodes.2.ActionChunker.inputs.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.nodes.nodes.3.Normalizer]
+direction = "Inverse"
+out_unit = "AngularVelocity"
+
+[[body.nodes.nodes.3.Normalizer.inputs]]
+name = "actions"
+
+[body.nodes.nodes.3.Normalizer.inputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [
+    1,
+    6,
+]
+time = "Tick"
+
+[body.nodes.nodes.3.Normalizer.inputs.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.nodes.nodes.3.Normalizer.stats.MeanStd]
+mean = [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+]
+std = [
+    0.05,
+    0.05,
+    0.05,
+    0.05,
+    0.05,
+    0.05,
+]
+
+[[body.nodes.outputs]]
+node = 3
+port = "out"
+
+[[body.outputs]]
+name = "actions"
+
+[body.outputs.ty]
+elem = "F32"
+frame = "Policy"
+shape = [
+    1,
+    6,
+]
+time = "Tick"
+unit = "AngularVelocity"
+
+[body.policy]
+architecture = "Act"
+
+[body.policy.contract]
+action_dim = 6
+execute_chunk = 1
+execution_mode = "RecedingHorizon"
+horizon = 1
+observation_window = 1
+replanning_hz = 50.0
+
+[body.policy.contract.inputs.state]
+name = "state"
+
+[body.policy.contract.inputs.state.ty]
+elem = "F32"
+frame = "Policy"
+shape = [26]
+time = "Tick"
+
+[body.policy.contract.inputs.state.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.policy.contract.runtime]
+deadline_ms = 20.0
+dtype = "F32"
+expected_latency_ms = 2.0
+
+[body.policy.weights.Safetensors]
+hash = [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+]
+path = "policy.safetensors"

@@ -1,0 +1,5 @@
+# route: rl
+es policy lower --policy runs/reach-delta-001/untrained.esb --out module
+python python/es/train_ppo.py --module module --rollout-docs docs --out weights/model.safetensors --value-out training/value.safetensors --checkpoint-at 4000,10000 --iterations 10000 --seed 0 --lr 0.0003 --device cpu --loss-curve metrics/loss-curve.json --envs 16 --horizon 64 --epochs 4 --minibatches 4 --gamma 0.99 --lam 0.95 --clip 0.2 --entropy 0.005 --value-coef 0.5 --init-log-std -3.912023
+es policy pack --policy runs/reach-delta-001/untrained.esb --weights weights/model-4000.safetensors --out checkpoints/4000.esb
+es policy pack --policy runs/reach-delta-001/untrained.esb --weights weights/model-10000.safetensors --out checkpoints/10000.esb

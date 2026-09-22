@@ -1,0 +1,63 @@
+# The reach task by PPO in the **increment** space (packet M9/T3): `training-reach.toml`'s
+# recipe against `task-reach-delta.toml` / `deployment-reach-delta.toml` and the graph whose
+# action port is in rad per control tick (`learning-reach-delta.toml`).
+#
+# `es train --recipe tests/fixtures/rl/training-reach-delta.toml --out <dir> --dry-run` prints
+# the plan pinned by `tests/golden/train/plan-reach-delta.txt`; nothing it names has to exist
+# for `--dry-run`.
+#
+# The bundle is the delta trio plus `learning-reach-delta.toml`, packed with placeholder
+# weights:
+#
+#     ES_PACK_TASK=tests/fixtures/rl/task-reach-delta.toml \
+#     ES_PACK_OBSERVATION=tests/fixtures/rl/observation-reach-delta.toml \
+#     ES_PACK_LEARNING=tests/fixtures/rl/learning-reach-delta.toml \
+#     ES_PACK_DEPLOYMENT=tests/fixtures/rl/deployment-reach-delta.toml \
+#     ES_PACK_OUT=runs/reach-delta-001/untrained.esb \
+#     cargo test -p es --test cli -- --ignored pack_untrained_bundle
+#
+# THE ONE FIELD THAT DIFFERS FROM `training-reach.toml`'S `[rl]` TABLE IS A UNIT CONVERSION,
+# NOT A NEW KNOB. `train_ppo.py`'s Gaussian is defined around the module's output, and that
+# output changed units with the action space: absolute targets are radians, increments are
+# radians per control tick. A0's `init_log_std = -0.5` is sigma = 0.607 rad, which is 0.4 in
+# the network's own [-1, 1] units (the unnormalizer's std is the actuator half-range); the
+# same 0.4 through the increment unnormalizer is 0.4 * 0.05 = 0.02 rad per tick, so
+# `init_log_std = ln(0.02) = -3.912023`. Leaving -0.5 here would be a policy whose noise moves
+# a joint 0.607 rad **every tick** -- ten times the envelope's 0.06 rad per tick -- which is a
+# different experiment and not this one. Packet M8/P-M8-R1 measured that sigma does not move
+# the clamp rate in the absolute space, so the conversion is not an attempt to fix anything by
+# tuning it; it is what "the same recipe" means once the unit moves.
+#
+# The budget is the R1 table's -- 10,000 iterations, scored at 4,000 and at 10,000 -- so the
+# delta rows and the quoted A0 rows are read at the same two marks.
+#
+# Everything else is `training-reach.toml`'s, including the three things that are absent on
+# purpose: `[dataset]`, `[run] batch` and the value head / `log_std` (training-only state).
+#
+# Seeds 1 and 2 of the measurement are this file with `[run] seed` changed and nothing else.
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-delta-001/untrained.esb"
+
+[rl]
+algo         = "ppo"
+envs         = 16
+horizon      = 64
+epochs       = 4
+minibatches  = 4
+gamma        = 0.99
+lam          = 0.95
+clip         = 0.2
+entropy      = 0.005
+value_coef   = 0.5
+init_log_std = -3.912023
+
+[run]
+steps         = 10000
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [4000, 10000]
+device        = "cpu"
+interpreter   = "python"

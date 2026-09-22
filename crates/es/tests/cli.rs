@@ -10844,7 +10844,35 @@ fn train_reach_dry_run_plan() {
     assert!(want.contains("--iterations 4000"), "{want}");
 }
 
-/// Regenerates `tests/golden/train/plan-rl.txt` and `plan-reach.txt`.
+/// Packet M9/T3 oracle 1: the increment-space recipe's plan is a golden of its own.
+///
+/// It is `plan-reach.txt`'s with three numbers moved -- the budget, the marks and the
+/// `--init-log-std` the unit conversion needs -- and a different bundle, which is exactly the
+/// claim the T3 table makes about its own rows: one variable, and the recipe says which.
+#[test]
+fn train_rl_delta_dry_run_plan() {
+    const RECIPE: &str = "tests/fixtures/rl/training-reach-delta.toml";
+    let dir = scratch_dir("train-reach-delta-dry");
+    let out = run_train(RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let golden = train_golden("plan-reach-delta.txt");
+    let want =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(stdout(&out), want, "{RECIPE}: stdout is not the golden");
+    assert!(want.starts_with("# route: rl\n"), "{want}");
+    assert!(want.contains("--envs 16 --horizon 64"), "{want}");
+    assert!(want.contains("--iterations 10000"), "{want}");
+    // The Gaussian is defined around the module's output, and that output is in rad per
+    // control tick here: ln(0.02) against `training-reach.toml`'s implicit -0.5 (= 0.607 rad).
+    assert!(want.contains("--init-log-std -3.912023"), "{want}");
+    assert!(want.contains("--checkpoint-at 4000,10000"), "{want}");
+    // ... and the absolute recipe does not carry the flag at all, which is what makes the
+    // difference between the two rows one conversion rather than two knobs.
+    let plain = std::fs::read_to_string(train_golden("plan-reach.txt")).expect("plan-reach.txt");
+    assert!(!plain.contains("--init-log-std"), "{plain}");
+}
+
+/// Regenerates `tests/golden/train/plan-rl.txt`, `plan-reach.txt` and `plan-reach-delta.txt`.
 #[test]
 #[ignore = "golden generator; run explicitly"]
 fn generate_rl_plan_golden() {
@@ -10855,6 +10883,10 @@ fn generate_rl_plan_golden() {
     for (recipe, golden) in [
         ("tests/fixtures/rl/training-rl-demo.toml", "plan-rl.txt"),
         ("tests/fixtures/rl/training-reach.toml", "plan-reach.txt"),
+        (
+            "tests/fixtures/rl/training-reach-delta.toml",
+            "plan-reach-delta.txt",
+        ),
     ] {
         let dir = scratch_dir("train-rl-golden");
         let out = run_train(recipe, &dir, &["--dry-run"]);
@@ -11090,6 +11122,11 @@ const REACH_CONTROL_HZ: u64 = 50;
 /// `-||cube - gripper||` in metres, bit for bit. The `Normalize` is there because a `Reward`
 /// must carry a policy-input unit (`TYPE-011`), not to rescale anything.
 const REACH_SPAN_M: f64 = 1.0;
+/// The increment a `JointDelta` reach policy's `[-1, 1]` output is scaled by, in **radians per
+/// control tick** -- `adapter-so101-delta.toml`'s own `scale` (packet M9/T2). At 50 Hz that is
+/// 2.5 rad/s against the envelope's 3.0, so the plane clamps the integrated position and never
+/// the increment itself.
+const REACH_DELTA_SCALE: f64 = 0.05;
 
 fn so101_scene() -> (es_assets::scene::SceneDesc, Vec<u8>) {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -11354,6 +11391,27 @@ fn reach_task() -> TaskIr {
 }
 
 /// Four `StateInput`s in the layout order, concatenated to 26 and normalized once.
+/// The same task with `ActionSpec.space = JointDelta` and **nothing else changed** (packet
+/// M9/T3).
+///
+/// One field is the whole document: an increment changes what the policy emits and neither the
+/// scene, the reset draws, the reward cone nor the termination predicates. The `task_hash`
+/// moves because spec 5.3 hashes the space, which is why the delta Observation and Evaluation
+/// IR are regenerated beside it rather than reused -- `task_ref` follows the moved hash.
+fn with_joint_delta(task: &TaskIr) -> TaskIr {
+    let mut delta = task.clone();
+    let mut found = false;
+    for node in delta.graph.nodes.values_mut() {
+        if let TaskNode::ActionSpec { space, .. } = node {
+            assert_eq!(*space, TaskSpace::JointPosition, "the reach task moved");
+            *space = TaskSpace::JointDelta;
+            found = true;
+        }
+    }
+    assert!(found, "the reach task has an ActionSpec");
+    delta
+}
+
 fn reach_observation(task: &TaskIr) -> ObservationIr {
     let channel = |name: &str| task.observation_spec.channels[name].clone();
     let source_of = |name: &str| match channel(name).source {
@@ -11474,6 +11532,23 @@ fn reach_evaluation(task: &TaskIr, observation: &ObservationIr) -> EvaluationIr 
 /// Gaussian is defined around (`docs/design/rl-continuation.md` section 2). No `Fusion`: the
 /// reach Observation IR concatenates its four channels itself and hands the policy one tensor.
 fn reach_learning() -> LearningGraph {
+    reach_learning_in(false)
+}
+
+/// The same graph with the action port in the **increment** unit,
+/// `tests/fixtures/rl/learning-reach-delta.toml` (packet M9/T3).
+///
+/// Two fields move and nothing else does, which is what makes the delta row a one-variable
+/// comparison: the `Normalizer { Inverse }` statistics become `mean = 0` / `std = 0.05` rad
+/// per control tick -- the adapter's own numbers (`adapter-so101-delta.toml`), an increment's
+/// neutral value being "do not move" rather than the centre of a range -- and the port they
+/// produce carries `Unit::AngularVelocity`, which `XIR-031` requires of a `JointDelta`
+/// deployment and refuses `Unit::Angle` for.
+fn reach_learning_delta() -> LearningGraph {
+    reach_learning_in(true)
+}
+
+fn reach_learning_in(delta: bool) -> LearningGraph {
     let state = Port::new(
         "state",
         PortType {
@@ -11526,16 +11601,26 @@ fn reach_learning() -> LearningGraph {
         },
     );
     let range = demo_ctrlrange();
+    let (mean, std) = if delta {
+        (vec![0.0; 6], vec![REACH_DELTA_SCALE; 6])
+    } else {
+        (
+            range.iter().map(|(lo, hi)| (lo + hi) / 2.0).collect(),
+            range.iter().map(|(lo, hi)| (hi - lo) / 2.0).collect(),
+        )
+    };
+    let out_unit = if delta {
+        Unit::AngularVelocity
+    } else {
+        Unit::Angle
+    };
     nodes.insert(
         NodeId(3),
         LearningNode::Normalizer {
             inputs: vec![Port::new("actions", chunk.clone())],
             direction: es_ir::learning::NormalizeDir::Inverse,
-            stats: es_ir::learning::StatsSource::MeanStd {
-                mean: range.iter().map(|(lo, hi)| (lo + hi) / 2.0).collect(),
-                std: range.iter().map(|(lo, hi)| (hi - lo) / 2.0).collect(),
-            },
-            out_unit: Unit::Angle,
+            stats: es_ir::learning::StatsSource::MeanStd { mean, std },
+            out_unit: out_unit.clone(),
         },
     );
     nodes.connect(NodeId(0), "out", NodeId(1), "feat");
@@ -11544,7 +11629,7 @@ fn reach_learning() -> LearningGraph {
     nodes.inputs.push(PortRef::new(NodeId(0), "state"));
     nodes.outputs.push(PortRef::new(NodeId(3), "out"));
     let actions = PortType {
-        unit: Unit::Angle,
+        unit: out_unit,
         ..chunk.clone()
     };
     LearningGraph {
@@ -11745,8 +11830,144 @@ const REACH_LEARNING_HEADER: &str =
 # `training_hash`, never `learning_hash`.
 ";
 
-/// Regenerates `tests/fixtures/rl/{task,observation,deployment,evaluation}-reach.toml`. Run
-/// explicitly:
+const REACH_DELTA_TASK_HEADER: &str = "\
+# Task IR (spec 6) for the SO-101 reach task driven by **increments** -- packet M9/T3.
+#
+# `task-reach.toml` with `ActionSpec.space = JointDelta` and nothing else changed. It is
+# generated by the same `regenerate_reach_documents` run and from the same `reach_task()`, so
+# the scene, the reset draws, the four observation channels, the reward cone and the two
+# termination predicates are that document's, value for value; its header is where all of them
+# are argued and this one does not restate them.
+#
+# The `task_hash` moves, because spec 5.3 hashes the action space -- which is the reason the
+# trio exists at all. `es_ir::cross`'s `maps_to` requires a task that says `JointDelta` beside
+# a deployment that says it (`XIR-030`), so `deployment-reach-delta.toml` (M9/T1) could not be
+# used with `task-reach.toml`, and `observation-reach-delta.toml` and
+# `evaluation-reach-delta.toml` follow the moved hash.
+#
+# What an increment means for the runtime is `deployment-reach-delta.toml`'s header and
+# `docs/design/rl-continuation.md` section 3a: `es-env` integrates `target_t = target_{t-1} +
+# row_t` from the plane's last executed command, the Safety Plane goes on validating an
+# absolute joint target against the same envelope, and the Learning IR's action port is in
+# rad per control tick (`learning-reach-delta.toml`, `XIR-031`).
+";
+
+const REACH_DELTA_OBSERVATION_HEADER: &str = "\
+# Observation IR (spec 7) for the increment-driven SO-101 reach task -- packet M9/T3.
+#
+# `observation-reach.toml`, node for node, with `task_ref` following `task-reach-delta.toml`'s
+# moved `task_hash`. An action space says nothing about what a sensor produces, so the four
+# `StateInput`s, the `Concat`, the `Normalize { Range { -1, 1 } }` and the one-frame temporal
+# window are that document's and its header is where they are argued.
+#
+# The `observation_hash` moves with `task_ref` and with nothing else, which is what makes the
+# T3 table's two rows comparable: the *policy input* is the same 26 numbers in the same order,
+# so the only difference between the absolute and the delta run is what the policy's output
+# means.
+";
+
+const REACH_DELTA_EVALUATION_HEADER: &str = "\
+# Evaluation IR (spec 10) for the increment-driven SO-101 reach task -- packet M9/T3.
+#
+# `evaluation-reach.toml` with `task` and `observation` following the moved hashes, and
+# **nothing else**: the same 16 held-out seeds 201-216, the same four suites, the same
+# `success_rate >= 0.8` on `nominal`. A row scored by this document and a row scored by
+# `evaluation-reach.toml` are therefore asked the same question -- which is the precondition
+# for putting them in one table (spec 28.9 rule 3).
+#
+# `XIR-040` is why this file exists rather than a `--task` flag: an Evaluation IR judges the
+# documents it names, and a delta bundle names the delta task.
+";
+
+const REACH_DELTA_LEARNING_HEADER: &str = "\
+# Learning IR (spec 8) for the increment-driven SO-101 reach task -- packet M9/T3.
+#
+# `learning-reach.toml`'s graph -- one 26-wide state port, `Mlp [64, 64]` relu, a horizon-1
+# `Regression` head squashed by `tanh`, `ActionChunker`, `Normalizer { Inverse }` -- with the
+# unnormalizer reading the **increment** unit instead of the actuator's range:
+#
+#   * `mean = 0`. An increment's neutral value is \"do not move\"; a centre here would be a
+#     policy that drifts whenever it outputs nothing.
+#   * `std = 0.05`, radians per control tick -- `adapter-so101-delta.toml`'s own `scale`, so
+#     the graph a T3 run trains from scratch and the graph T2's import emits speak in the
+#     same numbers. At 50 Hz that is 2.5 rad/s under the envelope's 3.0.
+#   * the action port is `Unit::AngularVelocity`. `es_ir::cross` refuses `Unit::Angle` on a
+#     `JointDelta` deployment by name (`XIR-031`): the documents would read as a position
+#     policy and the runtime would add a position to a position.
+#
+# The value network and the Gaussian's `log_std` are not here for `learning-reach.toml`'s
+# reason: PPO is a trainer, not an IR.
+";
+
+/// Every committed reach document as `(file name, header, body)` -- what
+/// `regenerate_reach_documents` writes and what `reach_documents_validate` compares against
+/// disk, from one list so the two cannot drift apart.
+///
+/// `deployment-reach.toml` is the demo's envelope executed one action at a time and
+/// `deployment-reach-delta.toml` is that document with one word changed; the delta deployment
+/// is packet M9/T1's and is not regenerated here.
+fn reach_document_set(task: &TaskIr) -> Vec<(&'static str, &'static str, String)> {
+    let observation = reach_observation(task);
+    let delta_task = with_joint_delta(task);
+    let delta_observation = reach_observation(&delta_task);
+    let toml = |r: Result<String, _>| r.expect("the document serializes");
+    vec![
+        (
+            "task-reach.toml",
+            REACH_TASK_HEADER,
+            toml(es_ir::serial::task_to_toml(task)),
+        ),
+        (
+            "learning-reach.toml",
+            REACH_LEARNING_HEADER,
+            toml(es_ir::serial::learning_to_toml(&reach_learning())),
+        ),
+        (
+            "observation-reach.toml",
+            REACH_OBSERVATION_HEADER,
+            toml(es_ir::serial::observation_to_toml(&observation)),
+        ),
+        (
+            "deployment-reach.toml",
+            REACH_DEPLOYMENT_HEADER,
+            toml(es_ir::serial::deployment_to_toml(&reach_deployment())),
+        ),
+        (
+            "evaluation-reach.toml",
+            REACH_EVALUATION_HEADER,
+            toml(es_ir::serial::evaluation_to_toml(&reach_evaluation(
+                task,
+                &observation,
+            ))),
+        ),
+        (
+            "task-reach-delta.toml",
+            REACH_DELTA_TASK_HEADER,
+            toml(es_ir::serial::task_to_toml(&delta_task)),
+        ),
+        (
+            "learning-reach-delta.toml",
+            REACH_DELTA_LEARNING_HEADER,
+            toml(es_ir::serial::learning_to_toml(&reach_learning_delta())),
+        ),
+        (
+            "observation-reach-delta.toml",
+            REACH_DELTA_OBSERVATION_HEADER,
+            toml(es_ir::serial::observation_to_toml(&delta_observation)),
+        ),
+        (
+            "evaluation-reach-delta.toml",
+            REACH_DELTA_EVALUATION_HEADER,
+            toml(es_ir::serial::evaluation_to_toml(&reach_evaluation(
+                &delta_task,
+                &delta_observation,
+            ))),
+        ),
+    ]
+}
+
+/// Regenerates `tests/fixtures/rl/{task,observation,deployment,evaluation}-reach.toml`, the
+/// Learning IR beside them and the `-delta` trio (packet M9/T3). Run explicitly:
 ///
 ///     ES_GENERATE_GOLDENS=1 cargo test -p es --test cli -- --ignored regenerate_reach_documents
 #[test]
@@ -11758,38 +11979,8 @@ fn regenerate_reach_documents() {
         println!("SKIP regenerate_reach_documents: set ES_GENERATE_GOLDENS=1 to regenerate");
         return;
     }
-    let task = reach_task();
-    let observation = reach_observation(&task);
-    let deployment = reach_deployment();
-    let evaluation = reach_evaluation(&task, &observation);
     std::fs::create_dir_all(rl_fixture(".")).expect("tests/fixtures/rl");
-    for (name, header, text) in [
-        (
-            "task-reach.toml",
-            REACH_TASK_HEADER,
-            es_ir::serial::task_to_toml(&task).expect("task toml"),
-        ),
-        (
-            "learning-reach.toml",
-            REACH_LEARNING_HEADER,
-            es_ir::serial::learning_to_toml(&reach_learning()).expect("learning toml"),
-        ),
-        (
-            "observation-reach.toml",
-            REACH_OBSERVATION_HEADER,
-            es_ir::serial::observation_to_toml(&observation).expect("observation toml"),
-        ),
-        (
-            "deployment-reach.toml",
-            REACH_DEPLOYMENT_HEADER,
-            es_ir::serial::deployment_to_toml(&deployment).expect("deployment toml"),
-        ),
-        (
-            "evaluation-reach.toml",
-            REACH_EVALUATION_HEADER,
-            es_ir::serial::evaluation_to_toml(&evaluation).expect("evaluation toml"),
-        ),
-    ] {
+    for (name, header, text) in reach_document_set(&reach_task()) {
         write(&rl_fixture(name), &format!("{header}\n{text}"));
         println!("wrote {}", rl_fixture(name).display());
     }
@@ -11864,55 +12055,140 @@ fn reach_documents_validate() {
     );
     let mut built = reach_task();
     built.scene = task.scene.clone();
-    let built_obs = reach_observation(&built);
-    for (name, text) in [
-        ("task-reach.toml", es_ir::serial::task_to_toml(&built)),
-        (
-            "learning-reach.toml",
-            es_ir::serial::learning_to_toml(&reach_learning()),
-        ),
-        (
-            "observation-reach.toml",
-            es_ir::serial::observation_to_toml(&built_obs),
-        ),
-        (
-            "deployment-reach.toml",
-            es_ir::serial::deployment_to_toml(&reach_deployment()),
-        ),
-        (
-            "evaluation-reach.toml",
-            es_ir::serial::evaluation_to_toml(&reach_evaluation(&built, &built_obs)),
-        ),
-    ] {
+    for (name, _, text) in reach_document_set(&built) {
         let on_disk = read(name);
         let body = on_disk
             .split_once("\nes_schema")
             .map(|(_, rest)| format!("es_schema{rest}"))
             .unwrap_or(on_disk);
         assert_eq!(
-            body,
-            text.expect("the document serializes"),
+            body, text,
             "{name} is not what the generator writes; rerun \
              `ES_GENERATE_GOLDENS=1 cargo test -p es --test cli -- --ignored \
              regenerate_reach_documents`"
         );
     }
 
+    // --- the increment trio (packet M9/T3) -------------------------------------------------
+    //
+    // The same four checks on the documents a `JointDelta` run is scored by, plus the two
+    // that say they are the *same question asked of a different action space*: the task
+    // differs from `task-reach.toml` in exactly one word, and the evaluation differs from
+    // `evaluation-reach.toml` in exactly the two hashes it names.
+    let delta_task = es_ir::serial::task_from_toml(&read("task-reach-delta.toml"))
+        .expect("the delta task parses");
+    let delta_observation =
+        es_ir::serial::observation_from_toml(&read("observation-reach-delta.toml"))
+            .expect("the delta observation parses");
+    let delta_deployment =
+        es_ir::serial::deployment_from_toml(&read("deployment-reach-delta.toml"))
+            .expect("the delta deployment parses");
+    let delta_evaluation =
+        es_ir::serial::evaluation_from_toml(&read("evaluation-reach-delta.toml"))
+            .expect("the delta evaluation parses");
+    let delta_learning = es_ir::serial::learning_from_toml(&read("learning-reach-delta.toml"))
+        .expect("the delta learning parses");
+    for (name, diags) in [
+        ("task", delta_task.validate()),
+        ("observation", delta_observation.validate()),
+        ("evaluation", delta_evaluation.validate()),
+        ("learning", delta_learning.validate()),
+    ] {
+        assert!(diags.is_empty(), "{name}-reach-delta.toml: {diags:#?}");
+    }
+    let diags = cross::check(&IrBundle {
+        task: &delta_task,
+        observation: &delta_observation,
+        learning: &delta_learning,
+        deployment: &delta_deployment,
+        evaluation: Some(&delta_evaluation),
+    });
+    assert!(diags.is_empty(), "cross-IR (delta): {diags:#?}");
+
+    // One word, and the hash is the only thing that follows from it.
+    assert_eq!(
+        read("task-reach-delta.toml")
+            .split_once("\nes_schema")
+            .expect("a body")
+            .1
+            .replace("\"JointDelta\"", "\"JointPosition\""),
+        read("task-reach.toml")
+            .split_once("\nes_schema")
+            .expect("a body")
+            .1,
+        "task-reach-delta.toml differs from task-reach.toml in more than the action space"
+    );
+    assert_ne!(
+        delta_task.task_hash().expect("hash"),
+        task.task_hash().expect("hash"),
+        "spec 5.3 hashes the action space"
+    );
+    // The same question: the same held-out seeds, the same suites, the same acceptance.
+    assert_eq!(delta_evaluation.episodes, evaluation.episodes);
+    assert_eq!(delta_evaluation.acceptance, evaluation.acceptance);
+    assert_eq!(
+        delta_evaluation
+            .suites
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<Vec<_>>(),
+        evaluation
+            .suites
+            .iter()
+            .map(|s| s.name.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        delta_evaluation.task,
+        hex(&delta_task.task_hash().expect("hash"))
+    );
+    assert_eq!(
+        delta_evaluation.observation,
+        hex(&delta_observation.observation_hash().expect("hash"))
+    );
+    // `XIR-031`'s two halves: the increment graph says rad per control tick, and the absolute
+    // graph on this deployment is refused by name rather than run.
+    assert_eq!(delta_learning.outputs[0].ty.unit, Unit::AngularVelocity);
+    let refused = cross::check(&IrBundle {
+        task: &delta_task,
+        observation: &delta_observation,
+        learning: &learning,
+        deployment: &delta_deployment,
+        evaluation: Some(&delta_evaluation),
+    });
+    assert!(
+        refused
+            .iter()
+            .any(|d| d.code.as_str() == es_ir::codes::XIR_031),
+        "learning-reach.toml on a JointDelta deployment must be refused: {refused:#?}"
+    );
+
     // And the CLI agrees: `es task compile` accepts the pair.
-    let out = bin()
-        .args(["task", "compile"])
-        .arg(rl_fixture("task-reach.toml"))
-        .arg(rl_fixture("observation-reach.toml"))
-        .output()
-        .expect("run es task compile");
-    let text = stdout(&out);
-    assert_eq!(out.status.code(), Some(0), "{text}");
-    assert!(text.contains("compiler_hash: "), "{text}");
-    assert!(text.contains("shape=[26]"), "{text}");
+    for (t, o) in [
+        ("task-reach.toml", "observation-reach.toml"),
+        ("task-reach-delta.toml", "observation-reach-delta.toml"),
+    ] {
+        let out = bin()
+            .args(["task", "compile"])
+            .arg(rl_fixture(t))
+            .arg(rl_fixture(o))
+            .output()
+            .expect("run es task compile");
+        let text = stdout(&out);
+        assert_eq!(out.status.code(), Some(0), "{t}: {text}");
+        assert!(text.contains("compiler_hash: "), "{text}");
+        assert!(text.contains("shape=[26]"), "{text}");
+    }
     println!(
-        "RAN reach_documents_validate: task {} observation {}",
+        "RAN reach_documents_validate: task {} observation {} / delta task {} observation {} \
+         learning {}",
         hex(&task.task_hash().expect("task hash")),
-        hex(&observation.observation_hash().expect("observation hash"))
+        hex(&observation.observation_hash().expect("observation hash")),
+        hex(&delta_task.task_hash().expect("task hash")),
+        hex(&delta_observation
+            .observation_hash()
+            .expect("observation hash")),
+        hex(&delta_learning.learning_hash().expect("learning hash")),
     );
 }
 
@@ -11962,26 +12238,20 @@ struct Documents {
 /// substituted here, in `dir`, next to the assertions that depend on it. Everything else --
 /// the scene (repository-relative, and the CLI runs from the repository root), the
 /// `ObservationSpec`, the reward -- is `task-reach.toml`'s.
-fn reach_documents(dir: &Path, delta: bool) -> Documents {
-    if !delta {
+fn reach_documents(_dir: &Path, delta: bool) -> Documents {
+    if delta {
+        // Committed since packet M9/T3; before it this function substituted the one line that
+        // differs into a scratch copy, which is what T2's deviation 1 recorded.
         return Documents {
-            task: rl_fixture("task-reach.toml"),
-            deployment: rl_fixture("deployment-reach.toml"),
-            adapter: rl_fixture("adapter-so101.toml"),
+            task: rl_fixture("task-reach-delta.toml"),
+            deployment: rl_fixture("deployment-reach-delta.toml"),
+            adapter: rl_fixture("adapter-so101-delta.toml"),
         };
     }
-    let source = std::fs::read_to_string(rl_fixture("task-reach.toml")).expect("task-reach.toml");
-    let task_toml = source.replace("space = \"JointPosition\"", "space = \"JointDelta\"");
-    assert_ne!(
-        task_toml, source,
-        "task-reach.toml no longer declares ActionSpec space = JointPosition"
-    );
-    let task = dir.join("task-reach-delta.toml");
-    std::fs::write(&task, task_toml).expect("write the delta Task IR");
     Documents {
-        task,
-        deployment: rl_fixture("deployment-reach-delta.toml"),
-        adapter: rl_fixture("adapter-so101-delta.toml"),
+        task: rl_fixture("task-reach.toml"),
+        deployment: rl_fixture("deployment-reach.toml"),
+        adapter: rl_fixture("adapter-so101.toml"),
     }
 }
 
