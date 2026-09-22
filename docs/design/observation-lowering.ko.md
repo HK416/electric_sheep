@@ -455,7 +455,10 @@ workspace에서 아무것도 import하지 않으며, 이것이 고정된 버전�
 `SKIPPED`를 출력한다. golden을 교체하는 것은 `tests/golden/observation`에서 스크립트를
 실행하고 `GOLDEN_UPDATE=1 cargo xtask verify-goldens`로 커밋을 게이트하는 것을
 뜻한다 — 그 뒤에 spec 변경이 있는 의도적인 행위이며, 테스트를 통과시키기 위한 방편이
-결코 아니다.
+결코 아니다. 이 스크립트는 모든 텍스트 파일을 `newline="
+"`으로 쓴다: golden은 LF이고
+(`.gitattributes` `eol=lf`) 파이썬의 텍스트 모드는 Windows에서 CRLF를 내보내므로, 그렇게
+하지 않으면 `.bin`이 아니라 사이드카가 줄마다 1바이트씩 달라진다(패킷 M10/R1).
 
 사이드카가 `tolerance_ulp`를 선언하지 않는 한 비교는 바이트 단위다; `srgb_to_linear_lut256`만이
 §6의 이유로 7 ULP에서 그렇게 한다.

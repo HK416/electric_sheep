@@ -276,7 +276,13 @@ whose count moved is a kind that step raised — the same bitset `SafeAction::ev
 read from the side the collector can see (`es_env::DomainRunner::emit_actions` keeps the
 `SafeAction` itself). That array is only read when a sink is there, and the dataset under
 `--out` is byte-identical with and without the flag
-(`collect_telemetry_publishes_every_episode` compares every file of both trees).
+(`collect_telemetry_publishes_every_episode` compares every file of both trees). The
+publisher rebases stream 2's `tick` onto the episode (§10.5, packet M7/R1) by latching the
+first tick of each episode and subtracting it, which needs `Env::tick()` to be the env's
+*current* clock: until packet M10/R1 it was a cache only `Env::step` refreshed, so after an
+episode that ended on `--max-steps` -- a whole-batch `Env::reset`, which rewinds the
+backend's clock -- the latched origin was the previous episode's and the next subtraction
+underflowed; `Env::reset` now re-reads the clock and the rebase site is unchanged.
 
 **Training publishes its own stdout.** `train_act.py --progress-every N` prints one
 `{"progress": {…}}` line every `N` optimizer steps and `--sample-every N` writes
