@@ -1,0 +1,25 @@
+[package]
+name = "es-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+es-core = { workspace = true }
+es-ir = { workspace = true }
+es-math = { workspace = true }
+# `rl_import` lowers the imported actor through es-policy (layer 8) to prove it round-trips.
+# es-import is layer 9 (spec 4.2), so this is the highest crate it may see; es-data (layer 10)
+# depends on it, never the other way round.
+es-policy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+blake3 = { workspace = true }
+
+[dev-dependencies]
+es-compile = { workspace = true }
+
+[lints]
+workspace = true

@@ -11,9 +11,9 @@ use std::collections::BTreeSet;
 
 use es_compile::{CpuPlan, PlanMode};
 use es_core::time::TickRate;
-use es_data::lerobot::Info;
-use es_data::lerobot_config::LeRobotPolicyConfig::Act;
-use es_data::lerobot_config::{ConfigError, Converted, LeRobotPolicyConfig, Stats};
+use es_import::lerobot::Info;
+use es_import::lerobot_config::LeRobotPolicyConfig::Act;
+use es_import::lerobot_config::{ConfigError, Converted, LeRobotPolicyConfig, Stats};
 use es_ir::cross::{self, IrBundle};
 use es_ir::deployment::{
     ActionContract, ActionSpace as DepSpace, Deadlines, DeploymentIr, ExecutionMode,
@@ -214,14 +214,14 @@ fn assert_clean(conv: &Converted) {
 #[test]
 fn act_config_converts_and_validates_clean() {
     let cfg = LeRobotPolicyConfig::parse(ACT_JSON).unwrap();
-    let conv = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
+    let conv = es_import::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
     assert_clean(&conv);
 }
 
 #[test]
 fn diffusion_config_converts_and_validates_clean() {
     let cfg = LeRobotPolicyConfig::parse(DIFFUSION_JSON).unwrap();
-    let conv = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
+    let conv = es_import::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
     assert_clean(&conv);
 }
 
@@ -231,7 +231,7 @@ fn diffusion_config_converts_and_validates_clean() {
 #[test]
 fn the_diffusion_scheduler_config_passes_through() {
     let cfg = LeRobotPolicyConfig::parse(DIFFUSION_JSON).unwrap();
-    let conv = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
+    let conv = es_import::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
     let kind = conv
         .learning
         .nodes
@@ -265,7 +265,7 @@ fn n_obs_steps_above_one_yields_history_and_window() {
     };
     c.n_obs_steps = 2;
     let cfg = Act(c);
-    let conv = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
+    let conv = es_import::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
     assert_clean(&conv);
     let window = conv.observation.temporal.window.expect("window is set");
     assert_eq!(window.n_steps, 2);
@@ -284,7 +284,7 @@ fn n_obs_steps_above_one_yields_history_and_window() {
 #[test]
 fn diffusion_crop_yields_a_crop_node_with_rescaled_intrinsics() {
     let cfg = LeRobotPolicyConfig::parse(DIFFUSION_JSON).unwrap();
-    let conv = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
+    let conv = es_import::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
     let crops: Vec<_> = conv
         .observation
         .graph
@@ -350,7 +350,7 @@ fn diffusion_crop_yields_a_crop_node_with_rescaled_intrinsics() {
 fn every_converted_observation_compiles_to_a_plan() {
     for json in [ACT_JSON, DIFFUSION_JSON] {
         let cfg = LeRobotPolicyConfig::parse(json).unwrap();
-        let conv = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
+        let conv = es_import::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
         for mode in [PlanMode::Debug, PlanMode::Release] {
             let plan = CpuPlan::compile(&conv.observation, mode)
                 .unwrap_or_else(|d| panic!("{:#?}", errors(&d)));
@@ -364,7 +364,7 @@ fn every_converted_observation_compiles_to_a_plan() {
 fn an_unbounded_state_dim_is_rejected() {
     let json = ACT_JSON.replace(r#""shape": [8] }"#, r#""shape": [70000] }"#);
     let cfg = LeRobotPolicyConfig::parse(&json).unwrap();
-    let err = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap_err();
+    let err = es_import::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap_err();
     assert!(matches!(err, ConfigError::OutOfRange(_)), "{err}");
 }
 
@@ -380,7 +380,7 @@ fn unknown_policy_type_is_an_error() {
 #[test]
 fn unknown_field_is_a_warning_not_an_error() {
     let cfg = LeRobotPolicyConfig::parse(ACT_JSON).unwrap();
-    let conv = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
+    let conv = es_import::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
     assert!(
         conv.warnings.iter().any(|w| w.contains("optimizer_lr")),
         "{:#?}",
@@ -392,8 +392,8 @@ fn unknown_field_is_a_warning_not_an_error() {
 fn conversion_is_deterministic() {
     for json in [ACT_JSON, DIFFUSION_JSON] {
         let cfg = LeRobotPolicyConfig::parse(json).unwrap();
-        let a = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
-        let b = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
+        let a = es_import::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
+        let b = es_import::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
         assert_eq!(
             a.observation.observation_hash().unwrap(),
             b.observation.observation_hash().unwrap()
@@ -408,7 +408,7 @@ fn conversion_is_deterministic() {
 #[test]
 fn missing_dataset_info_warns_about_replanning_hz() {
     let cfg = LeRobotPolicyConfig::parse(ACT_JSON).unwrap();
-    let conv = es_data::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
+    let conv = es_import::lerobot_config::convert(&cfg, Some(&stats()), None).unwrap();
     assert!(conv.warnings.iter().any(|w| w.contains("replanning_hz")));
     assert!((conv.learning.policy.contract.replanning_hz - 10.0).abs() < 1e-6);
 }
@@ -417,6 +417,6 @@ fn missing_dataset_info_warns_about_replanning_hz() {
 fn dataset_info_supplies_replanning_hz() {
     let cfg = LeRobotPolicyConfig::parse(ACT_JSON).unwrap();
     let info = Info::new(30.0, BTreeMap::new());
-    let conv = es_data::lerobot_config::convert(&cfg, Some(&stats()), Some(&info)).unwrap();
+    let conv = es_import::lerobot_config::convert(&cfg, Some(&stats()), Some(&info)).unwrap();
     assert!((conv.learning.policy.contract.replanning_hz - 30.0).abs() < 1e-6);
 }

@@ -20,12 +20,13 @@ pub mod collect;
 pub mod identity;
 pub mod intervention;
 pub mod lerobot;
-pub mod lerobot_config;
-pub mod rl_import;
-pub mod roboverse;
 pub mod training;
 
 use std::path::{Path, PathBuf};
+
+// The three importers (and `lerobot::meta`) live in `es-import` (layer 9) since packet
+// `docs/packets/M10/W3a-es-import-split.md`; re-exported here so every caller's path holds.
+pub use es_import::{lerobot_config, rl_import, roboverse};
 
 pub use collect::{
     append_loop_step, check_chain, distill, last_evaluation_hash, read_loop_steps, CollectReport,
@@ -67,10 +68,14 @@ pub enum DataError {
         source: parquet::errors::ParquetError,
     },
     /// The file parses but says something this crate does not implement (an unsupported
-    /// `dtype`, a compression codec whose `parquet` feature is off, a path template with an
-    /// unknown placeholder). See `docs/api-notes/lerobot-dataset.md`.
+    /// column type, a compression codec whose `parquet` feature is off). See
+    /// `docs/api-notes/lerobot-dataset.md`.
     #[error("unsupported LeRobot dataset: {0}")]
     Unsupported(String),
+    /// The same refusal raised by `meta/info.json`'s schema in `es-import` (an unsupported
+    /// `dtype`, a path template with an unknown placeholder); displayed identically.
+    #[error(transparent)]
+    Meta(#[from] es_import::lerobot::meta::MetaError),
     /// The file parses but contradicts itself (a column length that disagrees with the
     /// episode length, a ragged list, an episode index with no metadata entry).
     #[error("inconsistent LeRobot dataset: {0}")]
