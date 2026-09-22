@@ -26,7 +26,7 @@ use std::path::PathBuf;
 use es_assets::scene::SceneDesc;
 use es_core::StableId;
 use es_ir::image::{CameraModel, ChannelFormat, ColorSpace, DistortionModel, ImageSpec};
-use es_ir::task::{SensorPath, SensorRender};
+use es_ir::task::{SeedStream, SensorPath, SensorRender};
 use es_math::{Pose, Quat, Vec3};
 use es_physics_core::backend::{ModelInfo, StateView};
 use es_render::{
@@ -56,6 +56,10 @@ pub struct EnvRendererCfg {
     /// the `RenderConfig` default, is what every `Rs` sensor carries.
     pub exposure: f32,
     pub tonemap: Tonemap,
+    /// Which seed the `Pt` path's sample keys are addressed from — the third pass-through of
+    /// what the sensor declared (packet M10/W1a). [`SeedStream::Fixed`] never touches
+    /// `RenderConfig::seed`, so an `Rs` sensor and a `Fixed` `Pt` sensor render today's bytes.
+    pub seed_stream: SeedStream,
     /// When set, every [`EnvRenderer::frame`] also writes `<dir>/<NNNNNN>.bin` + `.json`.
     pub frames_dir: Option<PathBuf>,
 }
@@ -71,8 +75,29 @@ impl EnvRendererCfg {
             path: RenderPath::Rs,
             exposure: 1.0,
             tonemap: Tonemap::Reinhard,
+            seed_stream: SeedStream::Fixed,
             frames_dir: None,
         }
+    }
+}
+
+/// The seed the frame at `tick` renders with (packet M10/W1a, spec 6).
+///
+/// The one place the `Tick` stream's arithmetic lives, so the collector, the evaluator and
+/// `es video showcase` cannot key the same document three different ways — and so the CPU
+/// reference, which reads `RenderConfig::seed` like the GPU does, stays comparable.
+///
+/// `tick` is the **episode-relative** render index: 0 at the reset that opens an episode, +1
+/// per rendered control step. It is not the env's cumulative physics clock, which depends on
+/// how many episodes the same `Env` has already run and therefore on how the run was
+/// scheduled (the reason `StepEvent::tick` was made episode-relative in packet M7/R1).
+///
+/// The mixer is `es_render::rng::mix32`, the same Murmur3 finalizer the sample keys are built
+/// from, so a tick's seed is as decorrelated from its neighbour's as two pixels are.
+pub fn frame_seed(stream: SeedStream, base: u32, tick: u32) -> u32 {
+    match stream {
+        SeedStream::Fixed => base,
+        SeedStream::Tick => es_render::rng::mix32(base ^ tick),
     }
 }
 
@@ -86,8 +111,10 @@ impl EnvRendererCfg {
 /// [`SensorPath::Rs`] maps to exactly [`EnvRendererCfg::rgb`], field for field, which is what
 /// keeps every committed frame and every render golden bitwise (spec 28.10 rule 1). `Pt` maps
 /// to R3's estimator — NEE on, `ReSTIR` and `SVGF` off — and to **no accumulation** (R4): an
-/// observation frame is a pure function of the pose it was rendered from, which is what the
-/// collector/evaluator parity oracle needs.
+/// observation frame is a pure function of the pose and the episode-relative tick it was
+/// rendered at, which is what the collector/evaluator parity oracle needs. Under the default
+/// [`SeedStream::Fixed`] the tick drops out and it is a pure function of the pose alone, as it
+/// was before packet M10/W1a.
 pub fn sensor_cfg(
     camera: StableId,
     spec: &ImageSpec,
@@ -110,6 +137,7 @@ pub fn sensor_cfg(
             es_ir::task::Tonemap::Reinhard => Tonemap::Reinhard,
             es_ir::task::Tonemap::Aces => Tonemap::Aces,
         },
+        seed_stream: render.seed,
         frames_dir,
         ..EnvRendererCfg::rgb(camera, spec.width, spec.height)
     }
@@ -266,6 +294,11 @@ pub struct EnvRenderer<'gpu> {
     /// `renderer.md` section 8.2). Bit-identical to tessellating every frame.
     cache: es_render::SceneCache,
     frame: u64,
+    /// `RenderConfig::seed` as [`render_config`] built it — what a `Fixed` sensor renders
+    /// under and what the `Tick` stream mixes the tick into (packet M10/W1a).
+    base_seed: u32,
+    /// Frames rendered since [`Self::begin_episode`], the `tick` of [`frame_seed`].
+    episode_frame: u32,
 }
 
 impl<'gpu> EnvRenderer<'gpu> {
@@ -274,8 +307,10 @@ impl<'gpu> EnvRenderer<'gpu> {
         scene: &SceneDesc,
         cfg: EnvRendererCfg,
     ) -> Result<Self, EnvError> {
-        let renderer = Renderer::new(gpu, render_config(&cfg))
-            .map_err(|e| EnvError::Unsupported(format!("renderer: {e}")))?;
+        let rc = render_config(&cfg);
+        let base_seed = rc.seed;
+        let renderer =
+            Renderer::new(gpu, rc).map_err(|e| EnvError::Unsupported(format!("renderer: {e}")))?;
         // Fail at construction rather than on the first frame: a camera the scene does not
         // have is a configuration error, not a run-time one.
         camera_view(scene, &cfg, &BTreeMap::new())?;
@@ -285,7 +320,23 @@ impl<'gpu> EnvRenderer<'gpu> {
             scene: scene.clone(),
             cache: es_render::SceneCache::default(),
             frame: 0,
+            base_seed,
+            episode_frame: 0,
         })
+    }
+
+    /// A new episode begins: the [`SeedStream::Tick`] clock counts from zero again (packet
+    /// M10/W1a).
+    ///
+    /// The caller says so rather than this type guessing, because only the caller knows where
+    /// an episode ends — the env's own tick runs across episodes in `es loop collect`, and a
+    /// renderer that counted its own frames would key episode 2's reset pose differently from
+    /// episode 1's and break the collector/evaluator parity the whole stream exists for.
+    ///
+    /// Under the default [`SeedStream::Fixed`] this changes nothing at all, so a caller that
+    /// never calls it renders exactly today's bytes.
+    pub fn begin_episode(&mut self) {
+        self.episode_frame = 0;
     }
 
     /// The renderer's `ImageSpec` subset, in Observation IR terms.
@@ -303,7 +354,9 @@ impl<'gpu> EnvRenderer<'gpu> {
     ///
     /// Determinism (spec 3.5): same state, same device, same bits — the tessellation is a pure
     /// function of the poses, and the kernels carry the deterministic execution modes
-    /// `es-gpu` compiled them with (spec 3.4).
+    /// `es-gpu` compiled them with (spec 3.4). Under [`SeedStream::Tick`] "same state" reads
+    /// "same state **at the same episode-relative tick**": the sample keys move with
+    /// [`Self::episode_frame`], which is what [`Self::begin_episode`] restarts.
     pub fn frame(
         &mut self,
         model: &ModelInfo,
@@ -316,6 +369,15 @@ impl<'gpu> EnvRenderer<'gpu> {
             .tri_scene(&self.scene, &world)
             .map_err(|e| EnvError::Unsupported(format!("tessellation: {e}")))?;
         let view = camera_view(&self.scene, &self.cfg, &world)?;
+        // The sample keys of this tick (packet M10/W1a). `Fixed` is left alone rather than
+        // re-set to the same number, so the default path does not even touch the config.
+        if self.cfg.seed_stream == SeedStream::Tick {
+            self.renderer.set_seed(frame_seed(
+                self.cfg.seed_stream,
+                self.base_seed,
+                self.episode_frame,
+            ));
+        }
         self.renderer
             .upload_tris(tri)
             .map_err(|e| EnvError::Unsupported(format!("scene upload: {e}")))?;
@@ -331,12 +393,18 @@ impl<'gpu> EnvRenderer<'gpu> {
                 .map_err(|e| EnvError::Unsupported(format!("frame write: {e}")))?;
         }
         self.frame += 1;
+        self.episode_frame += 1;
         Ok(tile)
     }
 
     /// Frames produced so far — the next one's `<NNNNNN>` stem.
     pub fn frames(&self) -> u64 {
         self.frame
+    }
+
+    /// Frames produced since [`Self::begin_episode`] — the tick the next frame keys on.
+    pub fn episode_frame(&self) -> u32 {
+        self.episode_frame
     }
 
     pub fn cfg(&self) -> &EnvRendererCfg {

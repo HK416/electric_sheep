@@ -311,6 +311,25 @@ impl<'gpu> Renderer<'gpu> {
         &self.tri_scene
     }
 
+    /// Rewrites [`RenderConfig::seed`] for the next [`Self::render`] (packet M10/W1a).
+    ///
+    /// The seed is a *parameter* — slot `p[13]`, read by `rng::key` — and not part of any
+    /// pipeline, so this rebuilds nothing and costs nothing. The CPU reference reads the same
+    /// field of the same [`RenderConfig`], which is what keeps the two paths comparable after
+    /// a caller has moved it.
+    ///
+    /// Not to be used with accumulation on: [`Temporal`](crate::view::Temporal) averages
+    /// frames that were drawn from one seed, and this is the observation path's knob, where
+    /// there is none.
+    pub fn set_seed(&mut self, seed: u32) {
+        self.cfg.seed = seed;
+    }
+
+    /// The seed the next [`Self::render`] will draw with.
+    pub fn seed(&self) -> u32 {
+        self.cfg.seed
+    }
+
     /// Upload an already-tessellated scene, and the BVH over it.
     ///
     /// The CPU reference takes the same [`TriScene`] and builds the same [`Bvh`] from it,

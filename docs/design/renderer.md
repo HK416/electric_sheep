@@ -1607,3 +1607,72 @@ everything — which is exactly why the exposure was chosen on the mean byte and
 - **A second image channel.** `--frames` still renders exactly one, so "one sensor `Pt`, one
   sensor `Rs`" is not expressible end to end even though the IR would carry it.
 - **Anything about the free camera.** `es video showcase --path pt` is unchanged.
+
+### 12.8 The sample seed can move with the episode's tick (M10/W1a)
+
+R5 left a property nobody had asked for. `RenderConfig::seed` is the constant `0x5eed_1234`,
+the observation path has no accumulation (section 12.3), so `frame == 0` on every call and the
+sample keys `rng::key(seed, view, px, py, sample, bounce, stream)` are a **pure function of
+(pixel, pose)**. At 64 spp that is not noise a policy averages away over epochs: it is a fixed
+texture the pose wears, the same one every time that pose is visited. Row U4
+(`visible-learning.md` 7.32) trained to a *lower* loss than the rasterized U3 and scored 0 of
+16 held-out and 1 of 16 on its own training seeds — what using the texture as a fingerprint
+looks like (`docs/reviews/M7.md` R13).
+
+**The declaration.** `SensorRender` gains one field, `seed = "fixed" | "tick"` (§6). `fixed`
+is the default, absent is the default, and the default is today's bytes — so `task.toml`
+(`86a7f3a3…`) and `task-pt.toml` (`02036847…`) keep their `task_hash`es and row U4's numbers
+stay about the documents they were measured on (`cargo test -p es-ir
+committed_task_hashes_are_unmoved_by_seed_stream`, §28.10 rule 1). `tick` moves the hash and
+is therefore a new document, `task-pt-tick.toml` (`51b60dad…`), with its own Observation and
+Evaluation IR behind it for the reason section 12.2 gives.
+
+**The mechanism is one multiplication.** `es_env::render::frame_seed` is the only place the
+arithmetic lives:
+
+```rust
+match stream {
+    SeedStream::Fixed => base,                                  // untouched, today's bytes
+    SeedStream::Tick  => es_render::rng::mix32(base ^ tick),    // Murmur3 fmix32, the
+}                                                               // sample keys' own mixer
+```
+
+and `Renderer::set_seed` rewrites slot `p[13]` of the parameter buffer before the next
+`render`. It rebuilds nothing — the seed is a *parameter*, not part of any pipeline — and the
+CPU reference reads the same `RenderConfig::seed`, so CPU/GPU parity survives a seed change
+unchanged (`cargo test -p es-render
+gpu_path_tracer_matches_the_cpu_reference_after_set_seed`). Measured on the demo's 96×96
+sensor: ticks 0 and 1 of one pinned pose differ in **26,927 of 27,648 bytes**, and the same
+`(pose, tick)` rendered twice is bit-identical (`cargo test -p es-env --features render
+pt_seed_varies_per_tick_and_is_reproducible`).
+
+**Which tick, and where each stage gets it.** The episode-relative **render index**: 0 at the
+reset that opens an episode, +1 per rendered control step. Not the env's cumulative physics
+clock — that depends on how many episodes the same `Env` has already run and therefore on how
+the run was scheduled, which is the same trap `StepEvent::tick` was pulled out of in M7/R1.
+The three stages that render a document read it from three different places, and they agree
+because each is that same index:
+
+| stage | where tick 0 comes from |
+|---|---|
+| `es loop collect --frames` | `CollectEvent::EpisodeBegin`, emitted before the episode's first control step, calls `EnvRenderer::begin_episode` |
+| `es eval run --frames` | the backend clock reads 0, which since the `(cell, episode)` partition (M8/S1) happens exactly once per cell: the runner builds **one `Env` per episode** |
+| `es video showcase --task` | the `.estraj` row index — one trajectory is one episode, so the row *is* the tick the run rendered at |
+
+That last row is what makes a replay of a `seed = "tick"` run reproduce its frames rather than
+re-noise them.
+
+**What 12.8 skips.**
+
+- **Accumulation, still** (12.3). `Temporal` averages frames drawn from one seed; the two do
+  not combine, and `Renderer::set_seed` says so in its doc rather than guarding it — the
+  observation path has no accumulation to collide with.
+- **Alignment under `observation_delay`.** The evaluator counts *renders*, not control steps,
+  so a suite that drops observations advances the seed more slowly than a collector at the
+  same step would. It is internally consistent and reproducible; it is simply not the same
+  numbering, and the demo's collection never drops an observation.
+- **A stream id.** The tick is mixed into the seed rather than given its own coordinate in
+  `rng::key`. A coordinate would have been the tidier design and would have cost a Slang edit
+  in lockstep (`rng.slang`); mixing the seed costs nothing and is bit-identical to rendering
+  the same scene under a different `RenderConfig::seed`, which is a thing the CPU reference
+  already knows how to do.

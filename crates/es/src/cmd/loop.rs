@@ -230,12 +230,23 @@ fn collect_typed<const NJ: usize, const H: usize>(
     // is single-threaded -- neither hook can be entered from inside the other (packet M7/E7).
     let publishing = publisher.is_some();
     let publisher = publisher.map(std::cell::RefCell::new);
+    // Where this path learns that an episode began, for the `Tick` seed stream (packet
+    // M10/W1a). `CollectEvent::EpisodeBegin` is emitted before the episode's first control
+    // step and therefore before its first frame; the frame sink below clears the flag as it
+    // renders. The collector's own loop counter is not reachable from here and the env's tick
+    // runs across episodes, so this is the one signal that means "tick 0 of an episode".
+    let new_episode = std::cell::Cell::new(true);
     let mut publish = |event: CollectEvent| {
+        if matches!(event, CollectEvent::EpisodeBegin { .. }) {
+            new_episode.set(true);
+        }
         if let Some(p) = &publisher {
             p.borrow_mut().on_collect(event);
         }
     };
-    let sink: Option<CollectSink<'_>> = publishing.then_some(&mut publish);
+    // With `--frames` the sink is wired up even with nobody listening: it costs one bitset
+    // copy per control step and it is what keeps the seed stream aligned with the episode.
+    let sink: Option<CollectSink<'_>> = (publishing || frames.is_some()).then_some(&mut publish);
     // Teleop is real-robot I/O (M3 W1) and stays off this path; the one scripted intervener
     // the CLI offers is `--expert`. `es loop intervene` labels afterwards.
     //
@@ -282,6 +293,13 @@ fn collect_typed<const NJ: usize, const H: usize>(
             .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
         let mut frame_sink =
             |model: &ModelInfo, state: &es_physics_core::backend::StateView<'_>| {
+                // Tick 0 of the episode (packet M10/W1a): under `seed = "tick"` this is where
+                // the sample keys restart, so the evaluator -- which runs one `Env` per
+                // episode and therefore starts at tick 0 by construction -- renders the same
+                // grain at the same `(episode, tick)`.
+                if new_episode.replace(false) {
+                    renderer.begin_episode();
+                }
                 let tile = renderer.frame(model, state, 0).map_err(|e| e.to_string())?;
                 // The tile the run already rendered, borrowed, not a second render (packet
                 // M7/E7); the publisher decides whether this is one of the published ones.
