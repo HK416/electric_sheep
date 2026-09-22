@@ -58,14 +58,18 @@ over N worker processes: this same binary, re-invoked as `es eval run --shard i/
 <file>`. A worker runs the units it owns and judges nothing; the parent sums each suite's
 episodes back in episode order and computes the report, the `evaluation_hash` and
 `evaluation.lock` itself. So --jobs is a scheduling choice and not a different evaluation: at
-the same seeds, and **at the same worker thread count**, the artifacts are byte-identical to
---jobs 1 (`evaluation.lock`'s `created` timestamp excepted). The thread count is the caveat and
-not a formality: the cap below is `cores/N`, a Torch CPU inference is not bitwise-reproducible
+the same seeds, and **at the same policy-runtime thread count, which `evaluation.lock` records
+and `execution_hash` covers**, the artifacts are byte-identical to --jobs 1
+(`evaluation.lock`'s `created` timestamp excepted). The thread count is the caveat and not a
+formality: the cap below is `cores/N`, a Torch CPU inference is not bitwise-reproducible
 across intra-op thread counts, and a `--jobs` large enough to push `cores/N` below what the
 policy's tensors parallelise over therefore moves the trajectory. Measured on the demo's
 nominal suite on a 16-core box: --jobs 2 and --jobs 4 are byte-identical to --jobs 1, --jobs 8
 is not, and --jobs 1 with OMP_NUM_THREADS=2 exported reproduces the --jobs 8 artifacts exactly
-(`docs/design/evaluation-execution.md` 2.7). Export the thread vars yourself to pin it.
+(`docs/design/evaluation-execution.md` 2.7). Since packet M10/W0a the torch runtime reports
+the count it runs with, `runtime_threads` in `evaluation.lock` says it in plain text and
+`execution_hash` differs when it differs: two reports at two counts are two conditions, never
+one broken promise. Export the thread vars yourself to pin it.
 
 The split is by episode, so a one-suite evaluation parallelises too: the demo's 16-episode
 nominal suite runs 16-wide. Each unit builds its own `Env` -- seeked to its episode with
@@ -797,7 +801,31 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
 
     let scene = super::backend::load_scene(&a.scene)?;
 
-    let mut torch = TorchRuntime::new();
+    // More workers than units would start interpreters that own nothing; the partition N has
+    // to be the one the workers are actually told, so it is clamped before either is decided.
+    // The unit is the `(suite, episode)` pair since packet M7/R1, so a one-suite evaluation
+    // clamps to its episode count and not to 1. `n_episodes` is the count `es_eval` resolves
+    // the seed list to (spec 10.2): an explicit list is its own length, a `seed_base` is
+    // `n_episodes`.
+    let n_episodes = match &eval_ir.episodes.seeds {
+        es_ir::evaluation::SeedPlan::Explicit(list) => list.len(),
+        es_ir::evaluation::SeedPlan::Base(_) => eval_ir.episodes.n_episodes as usize,
+    };
+    let units = eval_ir.suites.len() * n_episodes;
+    let jobs = a.jobs.min(units.max(1) as u32);
+    // The workers' pool cap (`shard_thread_env`, below), decided once. The parent of a
+    // `--jobs N` run never infers, but its runtime is the one `merge` hashes and the one the
+    // lock quotes, so its reference process is spawned under the same variables the workers
+    // get and reports the count that produced the numbers (packet M10/W0a). `--jobs 1`
+    // exports nothing and inherits the ambient pool, as before.
+    let thread_env = if jobs > 1 {
+        let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+        shard_thread_env(jobs, cores, |name| std::env::var_os(name).is_some())
+    } else {
+        Vec::new()
+    };
+
+    let mut torch = TorchRuntime::with_env(thread_env.iter().cloned());
     // The episode counter the expert's `reset` keys off, shared with the frame source below.
     let seen = super::r#loop::SeenState::default();
     let mut expert = match &a.expert {
@@ -838,21 +866,9 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
     };
     let nj = bundle.deployment.robot.n_joints;
     let h = bundle.deployment.action.horizon;
-    // More workers than units would start interpreters that own nothing; the partition N has
-    // to be the one the workers are actually told, so it is clamped before either is decided.
-    // The unit is the `(suite, episode)` pair since packet M7/R1, so a one-suite evaluation
-    // clamps to its episode count and not to 1. `n_episodes` is the count `es_eval` resolves
-    // the seed list to (spec 10.2): an explicit list is its own length, a `seed_base` is
-    // `n_episodes`.
-    let n_episodes = match &eval_ir.episodes.seeds {
-        es_ir::evaluation::SeedPlan::Explicit(list) => list.len(),
-        es_ir::evaluation::SeedPlan::Base(_) => eval_ir.episodes.n_episodes as usize,
-    };
-    let units = eval_ir.suites.len() * n_episodes;
-    let jobs = a.jobs.min(units.max(1) as u32);
     let mut shards = if jobs > 1 {
         println!("es eval run --jobs {jobs}: {units} unit(s) over {jobs} worker(s)");
-        spawn_shards(&a, jobs)?
+        spawn_shards(&a, jobs, &thread_env)?
     } else {
         // The sink is a closure and not a trait object of this crate's invention (INV-17):
         // `es-eval` calls it, `Publisher::on` turns what it says into wire frames.
@@ -894,7 +910,7 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
     for s in &mut shards {
         events.append(&mut s.events);
     }
-    let (report, lock) = Evaluation::merge(
+    let (report, mut lock) = Evaluation::merge(
         &eval_ir,
         &bundle.task,
         &bundle.observation,
@@ -904,6 +920,9 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
         &shards,
     )
     .map_err(|e| CliError::Runtime(e.to_string()))?;
+    // In plain text beside the `execution_hash` that covers it (spec 5.3, packet M10/W0a).
+    // `None` under `--expert`: the torch runtime was never loaded and nothing has a pool.
+    lock.runtime_threads = torch.threads();
 
     std::fs::create_dir_all(&a.out)
         .map_err(|e| CliError::Runtime(format!("{}: {e}", a.out.display())))?;
@@ -1005,15 +1024,18 @@ fn shard_thread_env(
         .collect()
 }
 
-fn spawn_shards(a: &RunArgs, jobs: u32) -> Result<Vec<es_eval::Shard>, CliError> {
+/// `thread_env` is [`shard_thread_env`]'s answer, exported to every worker — and, by the
+/// caller, to the parent's own torch runtime, so the lock quotes the workers' count.
+fn spawn_shards(
+    a: &RunArgs,
+    jobs: u32,
+    thread_env: &[(&'static str, String)],
+) -> Result<Vec<es_eval::Shard>, CliError> {
     let exe = std::env::current_exe()
         .map_err(|e| CliError::Runtime(format!("cannot find this executable to re-run it: {e}")))?;
     let dir = a.out.join("shards");
     std::fs::create_dir_all(&dir)
         .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
-
-    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let thread_env = shard_thread_env(jobs, cores, |name| std::env::var_os(name).is_some());
 
     let mut running = Vec::new();
     for i in 0..jobs {
@@ -1046,7 +1068,7 @@ fn spawn_shards(a: &RunArgs, jobs: u32) -> Result<Vec<es_eval::Shard>, CliError>
         // share one directory exactly as the frames do, with nothing to merge.
         cmd.arg("--traj")
             .arg(a.traj.clone().unwrap_or_else(|| a.out.join("traj")));
-        for (name, value) in &thread_env {
+        for (name, value) in thread_env {
             cmd.env(name, value);
         }
         let child = cmd
