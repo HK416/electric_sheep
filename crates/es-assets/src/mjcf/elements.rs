@@ -52,6 +52,28 @@ impl<'a> Parser<'a> {
                 AssetKind::Material => attrs.get("texture").unwrap_or_default().to_owned(),
                 _ => join(dir, file.unwrap_or_default()),
             };
+            if kind == AssetKind::Mesh {
+                // `scale` / `refpos` / `refquat` transform the vertices before MuJoCo sees
+                // them, and this packet bakes none of them into the decoded mesh. Left as a
+                // `report_unknown` warning they would become a silent geometry error the
+                // moment the mesh is drawn and collided with, so a non-default value is
+                // refused by name -- the `<compiler coordinate>` pattern above.
+                for (attr, default) in [
+                    ("scale", "1 1 1"),
+                    ("refpos", "0 0 0"),
+                    ("refquat", "1 0 0 0"),
+                ] {
+                    let Some(value) = attrs.get(attr) else {
+                        continue;
+                    };
+                    if value.split_whitespace().ne(default.split_whitespace()) {
+                        return Err(MjcfError::Unsupported {
+                            line: attrs.line(),
+                            what: format!("<mesh {attr}=\"{value}\">"),
+                        });
+                    }
+                }
+            }
             let asset = AssetRef::from_path(kind, &name, &path);
             attrs.report_unknown(&mut self.warnings);
             match kind {

@@ -59,6 +59,7 @@ use es_core::StableId;
 use es_math::{Pose, Quat, Vec3};
 use gltf::mesh::Mode;
 use gltf::{Document, Gltf};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::scene::{scene_id, AssetKind, AssetRef, Body, Geom, SceneDesc, Shape};
@@ -93,7 +94,7 @@ pub struct GltfImport {
 
 /// Decoded geometry for one glTF primitive. `id` matches the [`AssetRef`] of the same mesh in
 /// [`GltfImport::scene`], so a caller can join the two.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MeshData {
     pub id: StableId,
     pub name: String,
@@ -439,7 +440,11 @@ fn primitive_geometry<'a>(
 
 /// `blake3` of the decoded vertex/index arrays, length-prefixed so presence/absence of
 /// normals and UVs cannot be confused with different array contents.
-fn mesh_content_hash(
+///
+/// The crate's one mesh content hash: glTF and [`crate::mesh::load`] both write it into the
+/// `AssetRef` that `scene_hash` covers (spec 5.3). Positions and indices go in as IEEE
+/// little-endian bytes, so the digest is the same number on every platform by construction.
+pub(crate) fn mesh_content_hash(
     positions: &[[f32; 3]],
     normals: Option<&[[f32; 3]]>,
     uvs: Option<&[[f32; 2]]>,
