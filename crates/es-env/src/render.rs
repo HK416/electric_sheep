@@ -110,7 +110,8 @@ pub fn frame_seed(stream: SeedStream, base: u32, tick: u32) -> u32 {
 ///
 /// [`SensorPath::Rs`] maps to exactly [`EnvRendererCfg::rgb`], field for field, which is what
 /// keeps every committed frame and every render golden bitwise (spec 28.10 rule 1). `Pt` maps
-/// to R3's estimator — NEE on, `ReSTIR` and `SVGF` off — and to **no accumulation** (R4): an
+/// to R3's estimator — NEE on, `ReSTIR` off, `SVGF` as declared (packet M11/X6: single-frame,
+/// `svgf_iterations` at its default, luminance weight 1.0) — and to **no accumulation** (R4): an
 /// observation frame is a pure function of the pose and the episode-relative tick it was
 /// rendered at, which is what the collector/evaluator parity oracle needs. Under the default
 /// [`SeedStream::Fixed`] the tick drops out and it is a pure function of the pose alone, as it
@@ -129,7 +130,7 @@ pub fn sensor_cfg(
                 bounces,
                 nee: true,
                 restir: false,
-                svgf: false,
+                svgf: render.svgf,
             },
         },
         exposure: render.exposure,

@@ -843,6 +843,8 @@ fn pt_seed_varies_per_tick_and_is_reproducible() {
 fn pt_svgf_sensor_is_a_pure_function_of_the_tick() {
     use std::time::Instant;
 
+    const TICKS: u32 = 3;
+    const N: u32 = 16;
     let test = "pt_svgf_sensor_is_a_pure_function_of_the_tick";
     let Some(gpu) = open(test) else { return };
     let scene = scene();
@@ -872,7 +874,6 @@ fn pt_svgf_sensor_is_a_pure_function_of_the_tick() {
         "an observation frame must not accumulate"
     );
 
-    const TICKS: u32 = 3;
     let run = |r: &mut EnvRenderer<'_>| -> Vec<Vec<u8>> {
         (0..TICKS)
             .map(|i| {
@@ -947,7 +948,6 @@ fn pt_svgf_sensor_is_a_pure_function_of_the_tick() {
     assert!(changed > 0, "SVGF left the frame untouched");
 
     // Cost: whole `EnvRenderer::frame` wall clock, one renderer kept across the frames.
-    const N: u32 = 16;
     let ms = |c: &EnvRendererCfg| {
         let mut r = EnvRenderer::new(&gpu, &scene, c.clone()).expect("renderer");
         r.frame(&f.model, &f.state(), 0).expect("warm-up");
