@@ -103,13 +103,13 @@ Safety Plane is the same code on either engine (INV-11..13). MJWarp is tier 2 (�
 it is never bitwise against the CPU backend, and `train_rl_two_runs_are_bitwise` stays a
 statement about `mujoco-cpu` only.
 
-**Measured when it landed: the reach scene cannot run on `mjwarp` as the spec stands.**
-`so101_pick_place.xml` declares `cone="elliptic"` and spec 17.2 pins MJWarp's friction cone to
-pyramidal, so `Rollout(…, backend="mjwarp")` on the reach documents is refused by the mapping
-report inside `MjWarpBackend::load` (`ContactElliptic`, severity `error`), before a process is
-spawned (`rollout_backend_mjwarp_refuses_the_elliptic_reach_scene`). The installed
-`mujoco_warp` does implement the elliptic cone; whether the spec 17.2 row should follow it is a
-human decision, recorded in `evaluation-execution.md` 2.8.
+**Measured: the reach scene runs on `mjwarp` since the spec 17.2 footnote.**
+`so101_pick_place.xml` declares `cone="elliptic"`; MJWarp maps it as a tier 2 row (the owner's
+decision after this packet's first measurement). A 20-iteration PPO smoke with
+`[rl] backend = "mjwarp"` on the reach recipe ran in 28 s (mean return −15.8 → −6.6); the
+numbers and the two adapter fixes it needed are in `evaluation-execution.md` 2.8.
+`rollout_backend_mjwarp_steps_the_reach_documents` (ignored; needs `mujoco_warp`) steps the reach
+documents on both engines and prints the distance.
 
 ## 3. Latency and chunking in rollouts
 
