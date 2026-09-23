@@ -5,9 +5,11 @@
 // wrong, not the Rust.
 //
 // Bindings 0 and 1 are the same in every kernel of this crate:
-//   0  params  — globals then one 16-float record per view
+//   0  params  — globals then one 16-float record per view, then (a batched render only)
+//                one copy of the globals per env
 //   1  tris    — 20 floats per triangle, then the BVH (nodes, then the triangle
-//                permutation) at the offsets slots 17..19 of `params` carry
+//                permutation) at the offsets slots 17..19 of `params` carry; a batched
+//                render appends one such block per env (packet M11/X3b)
 
 #ifndef ES_RENDER_COMMON_SLANG
 #define ES_RENDER_COMMON_SLANG
@@ -24,9 +26,9 @@ static const float ES_INV_GAMMA = 0.41666666;
 static const uint ES_TRI_STRIDE = 20;
 static const uint ES_VIEW_STRIDE = 16;
 // Slots 0..20 are M4's globals, 20..31 packet M7/R2's shading block, 31..37 packet M7/R3's
-// PT block, 37..39 packet M7/R4's temporal block, then the per-view records. Mirrors
-// `renderer.rs`'s PARAM_VIEW_BASE.
-static const uint ES_PARAM_VIEW_BASE = 39;
+// PT block, 37..39 packet M7/R4's temporal block, 39 packet M11/X3b's triangle base, then the
+// per-view records. Mirrors `renderer.rs`'s PARAM_VIEW_BASE.
+static const uint ES_PARAM_VIEW_BASE = 40;
 // Floats per pixel of the temporal history (packet M7/R4). Mirrors `renderer.rs`'s
 // HIST_STRIDE and `cpu::History`: sum(3), m1, m2, n, depth, tri, normal(3), variance.
 static const uint ES_HIST_STRIDE = 12;
@@ -46,35 +48,48 @@ static const float ES_SHADOW_FAR = 1e30;
 
 uint es_param_u(uint i) { return asuint(es_params[i]); }
 
-uint es_n_tri()        { return es_param_u(0); }
+// Packet M11/X3b: where this thread's env reads its scene and its light. A batched render gives
+// every env a copy of the globals (slots 0..40, same layout) and each view record names its
+// env's copy in pad slot 14; a single render names offset 0, the globals themselves. Set by
+// `es_pixel`, once per thread, before anything reads it; thread-private, so no thread can see
+// another's. `es_key_view` is the view index the sample keys are addressed with (pad slot 15):
+// the tile's own index on a single render, the env's own view 0 on a batched one, so a tile
+// draws exactly the samples the single render of that env draws.
+static uint es_env_base = 0;
+static uint es_key_view = 0;
+
+float es_env_f(uint i) { return es_params[es_env_base + i]; }
+uint es_env_u(uint i)  { return asuint(es_env_f(i)); }
+
+uint es_n_tri()        { return es_env_u(0); }
 uint es_n_views()      { return es_param_u(1); }
 uint es_tile_w()       { return es_param_u(2); }
 uint es_tile_h()       { return es_param_u(3); }
 uint es_tiles_per_row(){ return es_param_u(4); }
 uint es_rows()         { return es_param_u(5); }
-float3 es_light_dir()  { return float3(es_params[6], es_params[7], es_params[8]); }
-float es_ambient()     { return es_params[9]; }
-float3 es_sky()        { return float3(es_params[10], es_params[11], es_params[12]); }
-uint es_seed()         { return es_param_u(13); }
+float3 es_light_dir()  { return float3(es_env_f(6), es_env_f(7), es_env_f(8)); }
+float es_ambient()     { return es_env_f(9); }
+float3 es_sky()        { return float3(es_env_f(10), es_env_f(11), es_env_f(12)); }
+uint es_seed()         { return es_env_u(13); }
 uint es_spp()          { return es_param_u(14); }
 uint es_bounces()      { return es_param_u(15); }
-uint es_n_lights()     { return es_param_u(16); }
+uint es_n_lights()     { return es_env_u(16); }
 // Where the BVH sits inside `es_tris`, in floats. Zero nodes means an empty scene.
-uint es_bvh_base()      { return es_param_u(17); }
-uint es_bvh_nodes()     { return es_param_u(18); }
-uint es_bvh_prim_base() { return es_param_u(19); }
+uint es_bvh_base()      { return es_env_u(17); }
+uint es_bvh_nodes()     { return es_env_u(18); }
+uint es_bvh_prim_base() { return es_env_u(19); }
 // The Rs shading block (packet M7/R2): 0 = Lambert (the default look), 1 = Full.
-uint es_shading()       { return es_param_u(20); }
-bool es_shadows()       { return es_param_u(21) != 0; }
-float es_specular()     { return es_params[22]; }
-float es_shininess()    { return es_params[23]; }
-float3 es_sky_rgb()     { return float3(es_params[24], es_params[25], es_params[26]); }
-float3 es_ground_rgb()  { return float3(es_params[27], es_params[28], es_params[29]); }
-uint es_ssaa()          { return max(es_param_u(30), 1u); }
+uint es_shading()       { return es_env_u(20); }
+bool es_shadows()       { return es_env_u(21) != 0; }
+float es_specular()     { return es_env_f(22); }
+float es_shininess()    { return es_env_f(23); }
+float3 es_sky_rgb()     { return float3(es_env_f(24), es_env_f(25), es_env_f(26)); }
+float3 es_ground_rgb()  { return float3(es_env_f(27), es_env_f(28), es_env_f(29)); }
+uint es_ssaa()          { return max(es_env_u(30), 1u); }
 // The Pt block (packet M7/R3). Defaults reproduce the pre-R3 output byte for byte: nee off,
 // a directional light with zero radiance, exposure 1, Reinhard.
 bool es_nee()           { return es_param_u(31) != 0; }
-float3 es_light_rgb()   { return float3(es_params[32], es_params[33], es_params[34]); }
+float3 es_light_rgb()   { return float3(es_env_f(32), es_env_f(33), es_env_f(34)); }
 float es_exposure()     { return es_params[35]; }
 uint es_tonemap_kind()  { return es_param_u(36); }
 // The temporal block (packet M7/R4). `es_max_history() == 0` is no accumulation at all: one
@@ -82,6 +97,9 @@ uint es_tonemap_kind()  { return es_param_u(36); }
 uint es_max_history()   { return es_param_u(37); }
 // Frames this slot has rendered since the last whole-slot reset: the sample base.
 uint es_frame()         { return es_param_u(38); }
+// Where this env's triangles start inside `es_tris`, in floats (packet M11/X3b); 0 on a single
+// render.
+uint es_tri_base()      { return es_env_u(39); }
 uint es_atlas_w()      { return es_tiles_per_row() * es_tile_w(); }
 uint es_atlas_h()      { return es_rows() * es_tile_h(); }
 
@@ -96,7 +114,7 @@ struct EsTri {
 };
 
 EsTri es_tri(uint i) {
-    uint b = i * ES_TRI_STRIDE;
+    uint b = es_tri_base() + i * ES_TRI_STRIDE;
     EsTri t;
     t.v0 = float3(es_tris[b + 0], es_tris[b + 1], es_tris[b + 2]);
     t.v1 = float3(es_tris[b + 3], es_tris[b + 4], es_tris[b + 5]);
@@ -114,7 +132,7 @@ uint es_light_tri(uint k) {
     uint seen = 0;
     uint n = es_n_tri();
     for (uint i = 0; i < n; ++i) {
-        uint b = i * ES_TRI_STRIDE;
+        uint b = es_tri_base() + i * ES_TRI_STRIDE;
         if (es_tris[b + 15] > 0.0 || es_tris[b + 16] > 0.0 || es_tris[b + 17] > 0.0) {
             if (seen == k) { return i; }
             seen += 1;
@@ -195,6 +213,11 @@ EsPixel es_pixel(uint3 tid) {
     p.local = uint2(tid.x % es_tile_w(), tid.y % es_tile_h());
     p.view = tile;
     p.valid = tile < es_n_views();
+    if (p.valid) {
+        uint vb = ES_PARAM_VIEW_BASE + tile * ES_VIEW_STRIDE;
+        es_env_base = es_param_u(vb + 14);
+        es_key_view = es_param_u(vb + 15);
+    }
     return p;
 }
 

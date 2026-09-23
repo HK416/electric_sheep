@@ -131,7 +131,7 @@ void initial(uint3 tid : SV_DispatchThreadID) {
     if (!es_hit_of(p, vw, shade_p, n, albedo)) { return; }
 
     EsRes r = es_res_zero();
-    uint key = es_rng_key(es_seed(), p.view, p.local.x, p.local.y, 0, 0, 1);
+    uint key = es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, 0, 0, 1);
     for (uint c = 0; c < ES_RESTIR_CANDIDATES; ++c) {
         float pick = es_rng_uniform(key, c * 3);
         uint idx = min(uint(pick * float(es_n_lights())), es_n_lights() - 1);
@@ -168,7 +168,7 @@ void temporal(uint3 tid : SV_DispatchThreadID) {
     float3 albedo;
     if (!es_hit_of(p, vw, shade_p, n, albedo)) { es_res_store(p.index, cur); return; }
 
-    uint key = es_rng_key(es_seed(), p.view, p.local.x, p.local.y, 0, 0, 3);
+    uint key = es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, 0, 0, 3);
     EsRes merged = es_res_zero();
     float p_cur;
     es_di(shade_p, n, albedo, cur, p_cur);
@@ -205,7 +205,7 @@ void spatial(uint3 tid : SV_DispatchThreadID) {
     float3 albedo;
     if (!es_hit_of(p, vw, shade_p, n, albedo)) { return; }
 
-    uint key = es_rng_key(es_seed(), p.view, p.local.x, p.local.y, 0, 0, 2);
+    uint key = es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, 0, 0, 2);
 
     // The neighbours that pass the geometric similarity test, each with its own shading
     // point: pairwise MIS evaluates the neighbour's own target function, which the reservoir

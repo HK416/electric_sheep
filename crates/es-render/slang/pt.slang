@@ -124,14 +124,14 @@ void main(uint3 tid : SV_DispatchThreadID) {
             if (nee) {
                 acc += throughput * es_nee_direct(
                     hp, n, tr.albedo, vw.far, b + 1 == bounces,
-                    es_rng_key(es_seed(), p.view, p.local.x, p.local.y, s, b, 4),
-                    es_rng_key(es_seed(), p.view, p.local.x, p.local.y, s, b, 5),
-                    es_rng_key(es_seed(), p.view, p.local.x, p.local.y, s, b, 6));
+                    es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, s, b, 4),
+                    es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, s, b, 5),
+                    es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, s, b, 6));
             }
             throughput *= tr.albedo;
             o = hp;
             d = es_cosine_hemisphere(
-                n, es_rng_key(es_seed(), p.view, p.local.x, p.local.y, s, b, 0));
+                n, es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, s, b, 0));
             prev_pdf = dot(n, d) * ES_INV_PI;
             near = 0.0;
         }
