@@ -1,0 +1,76 @@
+# A reach policy trained in Isaac Lab on OUR scene -- adapter v2, packet M11/I3, spec 28.14
+# rules 2, 3 and 6.
+#
+# The source is `python/es/rl_source/isaac_so101_reach/`: a manager-based Isaac Lab env whose
+# robot is `tests/fixtures/mjcf/so101_pick_place.xml` as `scene_to_mjcf` emits it, imported by
+# `physx_ref.py`'s own `import_scene` (the stage `--backend physx` evaluates on), and whose
+# observation, action, reward, termination and resets mirror `task-reach-last-action.toml`.
+# rsl_rl PPO with Isaac Lab's own reach runner config (no empirical normalization), so the
+# Observation IR this adapter produces depends on this file alone -- one `observation_hash` for
+# every seed, the one `evaluation-reach-last-action.toml` names.
+
+[robot]
+name = "so101"
+
+[joints]
+# The articulation's DOF order, which the importer keeps from the MJCF (isaac-sim.md 7.3) and
+# `main.py build-usd` re-reads into `scene.json`; our actuator names, so no rename.
+source_names = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+units = "rad"
+# `default_joint_pos` = `task-reach-last-action.toml`'s `PreviousAction.initial`, so Isaac's
+# raw `last_action` is zero at reset exactly when ours reads `initial`. The Isaac env's reset
+# still puts every joint at 0 (the Task IR's `ResetState`), via `reset_joints_by_scale(0, 0)`.
+default_pos = [0.1, -0.4, 0.7, 0.25, -0.05, 0.3]
+
+[action]
+kind = "position_target"
+# `JointPositionActionCfg(scale = 0.5, use_default_offset = True)`, Isaac's reach convention;
+# its per-joint `clip` is the MJCF `ctrlrange` (MuJoCo's own clamp), applied after the scale.
+scale = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+use_default_offset = true
+
+[timing]
+# `decimation * sim.dt` = 4 x 0.005 s, the MJCF timestep and `deployment-reach.toml`'s 50 Hz.
+policy_dt = 0.02
+
+# The Isaac side's actuator model, source order -- reported next to the scene's, never
+# converted. `ImplicitActuatorCfg(stiffness = kp, damping = kv, effort_limit_sim = forcerange)`;
+# the MJCF joint damping (0.6) is not a drive gain there but an explicit `-d q'` effort, as
+# `physx_ref.py` applies it, and the importer keeps the armature.
+[actuators]
+stiffness = [998.22, 998.22, 998.22, 998.22, 998.22, 998.22]
+damping = [2.731, 2.731, 2.731, 2.731, 2.731, 2.731]
+armature = [0.028, 0.028, 0.028, 0.028, 0.028, 0.028]
+effort_limit = [2.94, 2.94, 2.94, 2.94, 2.94, 2.94]
+
+# The env's `PolicyCfg`, in declaration order -- the concatenation order. No noise, no clip:
+# the Task IR declares neither.
+[[observation.channels]]
+source = "mdp.joint_pos_rel"
+slice = [0, 6]
+channel = "joint_pos"
+offset = "default_pos"
+
+[[observation.channels]]
+source = "mdp.joint_vel_rel"
+slice = [6, 12]
+channel = "joint_vel"
+scale = 0.05
+
+# `body_pose_xyzw`: the body frame's position minus the env origin and its quaternion x-first
+# (spec 3.1). The robot base sits at the MJCF origin with the identity rotation, so the env
+# frame is both the Task IR's `World` and the robot base frame.
+[[observation.channels]]
+source = "isaac_so101_reach.body_pose_xyzw(cube)"
+slice = [12, 19]
+channel = "cube_pose"
+
+[[observation.channels]]
+source = "isaac_so101_reach.body_pose_xyzw(robot, gripper)"
+slice = [19, 26]
+channel = "gripper_pose"
+
+[[observation.channels]]
+source = "mdp.last_action"
+slice = [26, 32]
+channel = "last_action"
