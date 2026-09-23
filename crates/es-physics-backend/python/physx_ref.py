@@ -14,8 +14,8 @@ frame and its angular velocity in the body frame (MuJoCo's convention; PhysX rep
 centre-of-mass velocity and a world-frame angular velocity, converted both ways here).
 `xquat` is x-first like every other backend's reply (spec 3.1).
 
-stdout is the protocol. Kit logs to stdout, so fd 1 is duplicated for the protocol before
-anything is imported and then pointed at stderr (which the Rust side discards).
+stdout is the protocol. Kit logs to stdout, so `main` duplicates fd 1 for the protocol before
+anything is imported and then points it at stderr (which the Rust side discards).
 """
 
 import json
@@ -24,9 +24,6 @@ import os
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
-
-PROTO = os.fdopen(os.dup(1), "w")
-os.dup2(2, 1)
 
 JOINT_DIMS = {"free": (7, 6), "ball": (4, 3), "slide": (1, 1), "hinge": (1, 1)}
 
@@ -137,6 +134,150 @@ def cross(a, b):
     return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]]
 
 
+# Attribution toggles (packet M11/I3), diagnostics only: each names one approximated row of the
+# mapping report. A non-default value is written into the engine version, so it is in
+# `backend_identity` and every `evaluation.lock` -- a toggled run never shares a hash with the
+# default one.
+#   ES_PHYSX_JOINT_DAMPING = explicit (default: -d q' as an effort before every step) | none
+#   ES_PHYSX_FRICTION_COMBINE = max (default, MuJoCo's rule) | average | min | multiply
+JOINT_DAMPING = os.environ.get("ES_PHYSX_JOINT_DAMPING", "explicit")
+FRICTION_COMBINE = os.environ.get("ES_PHYSX_FRICTION_COMBINE", "max")
+if JOINT_DAMPING not in ("explicit", "none"):
+    raise SystemExit("ES_PHYSX_JOINT_DAMPING=%r is not explicit or none" % JOINT_DAMPING)
+if FRICTION_COMBINE not in ("max", "average", "min", "multiply"):
+    raise SystemExit("ES_PHYSX_FRICTION_COMBINE=%r is not max, average, min or multiply" % FRICTION_COMBINE)
+
+
+def toggles():
+    """The non-default attribution toggles, as the engine version's suffix."""
+    out = []
+    if JOINT_DAMPING != "explicit":
+        out.append("joint_damping=" + JOINT_DAMPING)
+    if FRICTION_COMBINE != "max":
+        out.append("friction_combine=" + FRICTION_COMBINE)
+    return out
+
+
+def import_scene(path, spec, root, scope):
+    """Isaac Sim's MJCF importer on the MJCF file at `path`, into the open stage at prim `root`,
+    and every repair of isaac-sim.md 8.2 that lives on the stage. `scope` is the prim every
+    collider and the friction materials live under (`scope/physics_materials`). Returns the
+    fixups. `Sim` calls it for the backend; `python/es/rl_source/isaac_so101_reach` calls it to
+    build the USD an Isaac Lab env trains on (packet M11/I3), so both see one stage."""
+    from isaacsim.core.utils.extensions import enable_extension
+
+    enable_extension("isaacsim.asset.importer.mjcf")
+    import omni.kit.app
+    import omni.kit.commands
+    import omni.usd
+    from pxr import PhysxSchema, Sdf, Usd, UsdPhysics, UsdShade
+
+    omni.kit.app.get_app().update()
+    fixups = []
+    _, cfg = omni.kit.commands.execute("MJCFCreateImportConfig")
+    cfg.set_fix_base(True)  # MJCF: a jointless root body is welded to the world
+    cfg.set_import_inertia_tensor(True)
+    cfg.set_create_physics_scene(False)  # the caller owns the scene and its dt
+    cfg.set_make_default_prim(False)
+    omni.kit.commands.execute("MJCFCreateAsset", mjcf_path=path, import_config=cfg, prim_path=root)
+    omni.kit.app.get_app().update()
+    stage = omni.usd.get_context().get_stage()
+    if not stage.GetPrimAtPath(root).IsValid():
+        raise RuntimeError("the MJCF importer produced no prim at %s" % root)
+
+    # The importer writes each body's colliders once as a prototype under /collisions (and
+    # meshes / visuals under /meshes, /visuals), then references them into the body as an
+    # instance. The prototypes are defined, active, collision-enabled prims: PhysX
+    # simulates every one as a static collider at the world origin (measured, I1). They
+    # are deactivated at their root; the references into the bodies still compose.
+    for top in stage.GetPseudoRoot().GetChildren():
+        if top.GetPath() != Sdf.Path("/World") and not top.IsA(UsdPhysics.Scene):
+            top.SetActive(False)
+            fixups.append("deactivated importer prototype root %s" % top.GetPath())
+    # Instances are made ordinary prims so a collider can carry its own material binding.
+    for p in [p for p in stage.Traverse() if p.IsInstanceable()]:
+        p.SetInstanceable(False)
+
+    by_name = {}
+    for p in stage.Traverse():
+        by_name.setdefault(p.GetName(), []).append(p)
+
+    for p in list(stage.Traverse()):
+        if not p.IsValid():
+            continue
+        # The <worldbody> becomes an Xform with ArticulationRootAPI but no rigid body.
+        if p.HasAPI(UsdPhysics.ArticulationRootAPI) and not p.HasAPI(UsdPhysics.RigidBodyAPI):
+            p.RemoveAPI(UsdPhysics.ArticulationRootAPI)
+            fixups.append("removed ArticulationRootAPI from bodiless " + str(p.GetPath()))
+        # fix_base welds every root, MJCF free bodies included; a free body is a plain
+        # rigid body here, not a 0-dof articulation.
+        if p.GetTypeName() == "PhysicsFixedJoint" and p.GetName() in ["rootJoint_" + b for b in spec["free"]]:
+            stage.RemovePrim(p.GetPath())
+            fixups.append("removed fix_base weld " + str(p.GetPath()))
+        elif p.GetName() in spec["free"] and p.HasAPI(UsdPhysics.ArticulationRootAPI):
+            p.RemoveAPI(UsdPhysics.ArticulationRootAPI)
+            fixups.append("free body %s is a rigid body, not an articulation" % p.GetName())
+        # The importer's collision groups filter nothing (api-note 7.3); envs are isolated
+        # by the cloner's own groups.
+        if p.IsValid() and p.GetTypeName() == "PhysicsCollisionGroup":
+            stage.RemovePrim(p.GetPath())
+            fixups.append("removed importer collision group " + str(p.GetPath()))
+
+    # Every rigid body: no PhysX-only damping, no sleeping (MuJoCo has neither).
+    for p in stage.Traverse():
+        if p.HasAPI(UsdPhysics.RigidBodyAPI):
+            rb = PhysxSchema.PhysxRigidBodyAPI.Apply(p)
+            rb.CreateAngularDampingAttr().Set(0.0)
+            rb.CreateLinearDampingAttr().Set(0.0)
+            rb.CreateSleepThresholdAttr().Set(0.0)
+        if p.HasAPI(UsdPhysics.ArticulationRootAPI):
+            PhysxSchema.PhysxArticulationAPI.Apply(p).CreateSleepThresholdAttr().Set(0.0)
+    fixups.append("angular/linear damping 0 and sleep threshold 0 on every rigid body")
+
+    # Friction: one PhysX material per distinct MJCF sliding coefficient, static = dynamic,
+    # combined by max as MuJoCo combines geom friction. Torsional / rolling (condim 4/6) have
+    # no PhysX analogue and are declared by the mapping report.
+    # A geom's collider sits at `<body>/collisions/<geom>/<geom>` (a world geom's at
+    # `worldBody/<geom>/collisions/...`), so the material is bound on the prims named after
+    # the geom and reaches the collider by inheritance.
+    def has_collider(p):
+        return any(q.HasAPI(UsdPhysics.CollisionAPI) for q in Usd.PrimRange(p))
+
+    mats = {}
+    missing = []
+    for g in spec["geoms"]:
+        if not g["collides"]:
+            continue
+        # A mesh geom's collider is named after its mesh, not the geom (measured, I1).
+        names = [g["name"]] + ([g["mesh"]] if g["mesh"] else [])
+        prims = [p for n in names for p in by_name.get(n, []) if p.IsValid() and str(p.GetPath()).startswith(scope)
+                 and "/%s/" % ("worldBody" if g["body"] == "world" else g["body"]) in str(p.GetPath()) + "/"
+                 and "/visuals/" not in str(p.GetPath()) and has_collider(p)]
+        if not prims:
+            missing.append(g["name"])
+            continue
+        mu = g["mu"]
+        if mu not in mats:
+            mpath = Sdf.Path("%s/physics_materials/mu_%d" % (scope, len(mats)))
+            mat = UsdShade.Material.Define(stage, mpath)
+            api = UsdPhysics.MaterialAPI.Apply(mat.GetPrim())
+            api.CreateStaticFrictionAttr().Set(mu)
+            api.CreateDynamicFrictionAttr().Set(mu)
+            api.CreateRestitutionAttr().Set(0.0)
+            px = PhysxSchema.PhysxMaterialAPI.Apply(mat.GetPrim())
+            px.CreateFrictionCombineModeAttr().Set(FRICTION_COMBINE)
+            mats[mu] = mat
+        for p in prims:
+            UsdShade.MaterialBindingAPI.Apply(p).Bind(mats[mu], UsdShade.Tokens.weakerThanDescendants, "physics")
+    if missing:
+        for p in stage.Traverse():
+            if p.HasAPI(UsdPhysics.CollisionAPI):
+                sys.stderr.write("collider %s\n" % p.GetPath())
+        raise RuntimeError("no collider prim for geom(s) %s after import" % ", ".join(missing))
+    fixups.append("%d friction material(s), static = dynamic = mu, combine %s" % (len(mats), FRICTION_COMBINE))
+    return fixups
+
+
 class Sim(object):
     def __init__(self, mjcf, n_envs, timestep, device):
         self.spec = parse(mjcf)
@@ -170,120 +311,19 @@ class Sim(object):
         self.app = SimulationApp({"headless": True}, experience=exp)
 
     def _build_stage(self, path, timestep):
-        from isaacsim.core.utils.extensions import enable_extension
-
-        enable_extension("isaacsim.asset.importer.mjcf")
-        self.app.update()
-        import omni.kit.commands
         import omni.usd
         from isaacsim.core.api import World
-        from pxr import Gf, PhysxSchema, Sdf, Usd, UsdPhysics, UsdShade
+        from pxr import Gf, UsdPhysics
 
         spec = self.spec
         self.world = World(stage_units_in_meters=1.0, physics_dt=timestep, rendering_dt=timestep,
                            backend="torch" if self.gpu else "numpy", device=self.device)
-        _, cfg = omni.kit.commands.execute("MJCFCreateImportConfig")
-        cfg.set_fix_base(True)  # MJCF: a jointless root body is welded to the world
-        cfg.set_import_inertia_tensor(True)
-        cfg.set_create_physics_scene(False)  # World owns the scene and its dt
-        cfg.set_make_default_prim(False)
         env0 = "/World/envs/env_0"
-        omni.kit.commands.execute("MJCFCreateAsset", mjcf_path=path, import_config=cfg, prim_path=env0 + "/robot")
-        self.app.update()
+        self.fixups += import_scene(path, spec, env0 + "/robot", env0)
         stage = omni.usd.get_context().get_stage()
-        if not stage.GetPrimAtPath(env0 + "/robot").IsValid():
-            raise RuntimeError("the MJCF importer produced no prim at %s/robot" % env0)
-
-        # The importer writes each body's colliders once as a prototype under /collisions (and
-        # meshes / visuals under /meshes, /visuals), then references them into the body as an
-        # instance. The prototypes are defined, active, collision-enabled prims: PhysX
-        # simulates every one as a static collider at the world origin (measured, I1). They
-        # are deactivated at their root; the references into the bodies still compose.
-        for top in stage.GetPseudoRoot().GetChildren():
-            if top.GetPath() != Sdf.Path("/World") and not top.IsA(UsdPhysics.Scene):
-                top.SetActive(False)
-                self.fixups.append("deactivated importer prototype root %s" % top.GetPath())
-        # Instances are made ordinary prims so a collider can carry its own material binding.
-        for p in [p for p in stage.Traverse() if p.IsInstanceable()]:
-            p.SetInstanceable(False)
-
         by_name = {}
         for p in stage.Traverse():
             by_name.setdefault(p.GetName(), []).append(p)
-
-        for p in list(stage.Traverse()):
-            if not p.IsValid():
-                continue
-            # The <worldbody> becomes an Xform with ArticulationRootAPI but no rigid body.
-            if p.HasAPI(UsdPhysics.ArticulationRootAPI) and not p.HasAPI(UsdPhysics.RigidBodyAPI):
-                p.RemoveAPI(UsdPhysics.ArticulationRootAPI)
-                self.fixups.append("removed ArticulationRootAPI from bodiless " + str(p.GetPath()))
-            # fix_base welds every root, MJCF free bodies included; a free body is a plain
-            # rigid body here, not a 0-dof articulation.
-            if p.GetTypeName() == "PhysicsFixedJoint" and p.GetName() in ["rootJoint_" + b for b in spec["free"]]:
-                stage.RemovePrim(p.GetPath())
-                self.fixups.append("removed fix_base weld " + str(p.GetPath()))
-            elif p.GetName() in spec["free"] and p.HasAPI(UsdPhysics.ArticulationRootAPI):
-                p.RemoveAPI(UsdPhysics.ArticulationRootAPI)
-                self.fixups.append("free body %s is a rigid body, not an articulation" % p.GetName())
-            # The importer's collision groups filter nothing (api-note 7.3); envs are isolated
-            # by the cloner's own groups below.
-            if p.IsValid() and p.GetTypeName() == "PhysicsCollisionGroup":
-                stage.RemovePrim(p.GetPath())
-                self.fixups.append("removed importer collision group " + str(p.GetPath()))
-
-        # Every rigid body: no PhysX-only damping, no sleeping (MuJoCo has neither).
-        for p in stage.Traverse():
-            if p.HasAPI(UsdPhysics.RigidBodyAPI):
-                rb = PhysxSchema.PhysxRigidBodyAPI.Apply(p)
-                rb.CreateAngularDampingAttr().Set(0.0)
-                rb.CreateLinearDampingAttr().Set(0.0)
-                rb.CreateSleepThresholdAttr().Set(0.0)
-            if p.HasAPI(UsdPhysics.ArticulationRootAPI):
-                PhysxSchema.PhysxArticulationAPI.Apply(p).CreateSleepThresholdAttr().Set(0.0)
-        self.fixups.append("angular/linear damping 0 and sleep threshold 0 on every rigid body")
-
-        # Friction: one PhysX material per distinct MJCF sliding coefficient, static = dynamic,
-        # combined by max as MuJoCo combines geom friction. Torsional / rolling (condim 4/6) have
-        # no PhysX analogue and are declared by the mapping report.
-        # A geom's collider sits at `<body>/collisions/<geom>/<geom>` (a world geom's at
-        # `worldBody/<geom>/collisions/...`), so the material is bound on the prims named after
-        # the geom and reaches the collider by inheritance.
-        def has_collider(p):
-            return any(q.HasAPI(UsdPhysics.CollisionAPI) for q in Usd.PrimRange(p))
-
-        mats = {}
-        missing = []
-        for g in spec["geoms"]:
-            if not g["collides"]:
-                continue
-            # A mesh geom's collider is named after its mesh, not the geom (measured, I1).
-            names = [g["name"]] + ([g["mesh"]] if g["mesh"] else [])
-            prims = [p for n in names for p in by_name.get(n, []) if p.IsValid() and str(p.GetPath()).startswith(env0)
-                     and "/%s/" % ("worldBody" if g["body"] == "world" else g["body"]) in str(p.GetPath()) + "/"
-                     and "/visuals/" not in str(p.GetPath()) and has_collider(p)]
-            if not prims:
-                missing.append(g["name"])
-                continue
-            mu = g["mu"]
-            if mu not in mats:
-                mpath = Sdf.Path("%s/physics_materials/mu_%d" % (env0, len(mats)))
-                mat = UsdShade.Material.Define(stage, mpath)
-                api = UsdPhysics.MaterialAPI.Apply(mat.GetPrim())
-                api.CreateStaticFrictionAttr().Set(mu)
-                api.CreateDynamicFrictionAttr().Set(mu)
-                api.CreateRestitutionAttr().Set(0.0)
-                px = PhysxSchema.PhysxMaterialAPI.Apply(mat.GetPrim())
-                px.CreateFrictionCombineModeAttr().Set("max")
-                mats[mu] = mat
-            for p in prims:
-                UsdShade.MaterialBindingAPI.Apply(p).Bind(mats[mu], UsdShade.Tokens.weakerThanDescendants, "physics")
-        if missing:
-            for p in stage.Traverse():
-                if p.HasAPI(UsdPhysics.CollisionAPI):
-                    sys.stderr.write("collider %s\n" % p.GetPath())
-            raise RuntimeError("no collider prim for geom(s) %s after import" % ", ".join(missing))
-        self.fixups.append("%d friction material(s), static = dynamic = mu, combine max" % len(mats))
 
         # Gravity from <option>, not World's default.
         g = spec["gravity"]
@@ -567,7 +607,7 @@ class Sim(object):
             if not art["dofs"]:
                 continue
             passive = [j for j in self.spec["joints"] if j["kind"] != "free" and self.where[j["name"]][0] == a
-                       and (j["damping"] or j["stiffness"])]
+                       and (j["damping"] or j["stiffness"])] if JOINT_DAMPING == "explicit" else []
             motors = [(i, act) for i, act in enumerate(self.spec["actuators"])
                       if act["kind"] == "motor" and self.where[act["joint"]][0] == a]
             if not passive and not motors:
@@ -621,7 +661,8 @@ class Sim(object):
             "bodies": spec["bodies"],
             # The pipeline is part of the engine: CPU and GPU PhysX differ (api-note 7.4), so
             # the version string -- and with it backend_identity -- names it.
-            "engine_version": "isaacsim %s physx %s %s" % (isaac, physx, "gpu" if self.gpu else "cpu"),
+            "engine_version": " ".join(["isaacsim %s physx %s %s" % (isaac, physx, "gpu" if self.gpu else "cpu")]
+                                       + toggles()),
             "experience": self.experience,
             "fixups": self.fixups,
         }
@@ -636,6 +677,10 @@ def handle(sim, req):
         if timestep is None:
             opt = ET.fromstring(req["mjcf"]).find("option")
             timestep = float(opt.get("timestep", "0.002")) if opt is not None else 0.002
+        dump = os.environ.get("ES_PHYSX_DUMP_MJCF")
+        if dump:  # the emitted MJCF, for the Isaac Lab env of packet M11/I3
+            with open(dump, "w") as f:
+                f.write(req["mjcf"])
         device = os.environ.get("ES_PHYSX_DEVICE", "cpu")
         sim = Sim(req["mjcf"], int(req["n_envs"]), float(timestep), device)
         return sim, sim.info()
@@ -659,6 +704,11 @@ def handle(sim, req):
 
 
 def main():
+    # Only when run as the backend process: `import_scene` is imported by packet M11/I3's
+    # Isaac Lab env, whose stdout is its own.
+    global PROTO
+    PROTO = os.fdopen(os.dup(1), "w")
+    os.dup2(2, 1)
     sim = None
     while True:
         line = sys.stdin.readline()
