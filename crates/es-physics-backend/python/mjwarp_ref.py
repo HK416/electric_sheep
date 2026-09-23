@@ -9,6 +9,7 @@ from Rust:
     {"cmd": "step", "n": int}
     {"cmd": "state"}
     {"cmd": "set_state", "state": {"qpos": [...], "qvel": [...], "act": [...]}}
+    {"cmd": "set_params", "envs": [int], "params": [{"field", "index", "sub", "scale"}]}
     {"cmd": "quit"}
 
 Every response is {"ok": true, ...} or {"ok": false, "error": str}.
@@ -21,6 +22,7 @@ from, so the `load` reply has exactly the fields `mujoco_ref.py` returns.
 as **unverified** (no GPU in CI). Failures surface as protocol errors, never as a traceback.
 """
 
+import copy
 import json
 import sys
 
@@ -48,6 +50,39 @@ def name_of(model, objtype, index):
     return mujoco.mj_id2name(model, objtype, index) or ""
 
 
+def write_param(orig, model, p):
+    """`mujoco_ref.py`'s edit, verbatim: `orig`'s value times the scale into `model`, returning
+    the (field, row, column) to read back."""
+    field, i, scale = p["field"], int(p["index"]), float(p["scale"])
+    if field == "body_mass":
+        model.body_mass[i] = orig.body_mass[i] * scale
+        return ("body_mass", i, None)
+    if field == "geom_friction":
+        sub = int(p["sub"])
+        if sub >= int(orig.body_geomnum[i]):
+            raise ValueError("body %d has no geom %d" % (i, sub))
+        g = int(orig.body_geomadr[i]) + sub
+        model.geom_friction[g, 0:3] = orig.geom_friction[g, 0:3] * scale
+        return ("geom_friction", g, 0)
+    if field == "actuator_gain":
+        gain = orig.actuator_gainprm[i, 0]
+        model.actuator_gainprm[i, 0] = gain * scale
+        for k in (1, 2):
+            if gain != 0 and orig.actuator_biasprm[i, k] == -gain:
+                model.actuator_biasprm[i, k] = orig.actuator_biasprm[i, k] * scale
+                break
+        return ("actuator_gainprm", i, 0)
+    raise ValueError("unknown parameter field %r" % (field,))
+
+
+def model_arrays(model):
+    """Every array field of a CPU `MjModel`, by name, plus `stat.meaninertia`."""
+    names = [n for n in dir(model) if not n.startswith("_")]
+    out = {n: getattr(model, n) for n in names if isinstance(getattr(model, n), np.ndarray)}
+    out["stat.meaninertia"] = np.asarray([model.stat.meaninertia])
+    return out
+
+
 def flat(arr):
     """A warp array as a flat list of float64, env-major (its first axis is nworld)."""
     return np.asarray(arr.numpy(), dtype=np.float64).reshape(-1).tolist()
@@ -66,6 +101,57 @@ class Sim(object):
         mujoco.mj_forward(self.mjm, self.mjd)
         self.m = mjw.put_model(self.mjm)
         self.d = mjw.put_data(self.mjm, self.mjd, nworld=n_envs)
+        # Per-env CPU models and the model fields made per-world, both only once `set_params`
+        # is called; until then every world shares the one loaded model.
+        self.models = None
+        self.batched = set()
+
+    def warp_field(self, name):
+        if name == "stat.meaninertia":
+            return self.m.stat, "meaninertia"
+        return self.m, name
+
+    def set_params(self, envs, params):
+        if self.models is None:
+            self.models = [copy.copy(self.mjm) for _ in range(self.n_envs)]
+        pristine = model_arrays(self.mjm)
+        slots, edited = [], {}
+        for env in envs:
+            model = self.models[env]
+            slots = [write_param(self.mjm, model, p) for p in params]
+            # Mass feeds derived constants; `mj_setConst` derives them exactly as on mujoco-cpu.
+            if any(p["field"] == "body_mass" for p in params):
+                mujoco.mj_setConst(model, mujoco.MjData(model))
+            edited[env] = model_arrays(model)
+            for name, value in edited[env].items():
+                if not np.array_equal(value, pristine[name], equal_nan=value.dtype.kind == "f"):
+                    owner, attr = self.warp_field(name)
+                    # A derived field mujoco_warp does not hold (e.g. dof_M0) feeds nothing.
+                    if getattr(owner, attr, None) is not None:
+                        self.batched.add(name)
+        for name in sorted(self.batched):
+            owner, attr = self.warp_field(name)
+            array = getattr(owner, attr)
+            host = np.array(array.numpy(), copy=True)
+            if host.shape[0] == 1 and self.n_envs > 1:
+                host = np.repeat(host, self.n_envs, axis=0)
+            elif host.shape[0] != self.n_envs:
+                raise ValueError("%s is not a per-world field in mujoco_warp (shape %s)" % (name, host.shape))
+            for env in envs:
+                value = edited[env][name]
+                if value.size != host[env].size:
+                    raise ValueError("%s: %d values per world, the CPU model has %d" % (name, host[env].size, value.size))
+                host[env] = np.asarray(value).reshape(host[env].shape)
+            setattr(owner, attr, wp.array(host, dtype=array.dtype, device=array.device))
+        values = []
+        for env in envs:
+            for field, row, col in slots:
+                world = getattr(self.m, field).numpy()
+                nominal, applied = getattr(self.mjm, field)[row], world[env % world.shape[0]][row]
+                if col is not None:
+                    nominal, applied = nominal[col], applied[col]
+                values.append([float(nominal), float(applied)])
+        return values
 
     def info(self):
         model = self.mjm
@@ -195,6 +281,8 @@ def handle(sim, req):
     if cmd == "set_state":
         sim.write_state(req["state"], range(sim.n_envs))
         return sim, {}
+    if cmd == "set_params":
+        return sim, {"values": sim.set_params([int(e) for e in req["envs"]], req["params"])}
     raise ValueError("unknown command %r" % (cmd,))
 
 

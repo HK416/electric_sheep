@@ -8,6 +8,7 @@ Line-delimited JSON on stdin, one JSON object per line on stdout. Requests:
     {"cmd": "step", "n": int}
     {"cmd": "state"}
     {"cmd": "set_state", "state": {"qpos": [...], "qvel": [...], "act": [...]}}
+    {"cmd": "set_params", "envs": [int], "params": [{"field", "index", "sub", "scale"}]}
     {"cmd": "quit"}
 
 Every response is {"ok": true, ...} or {"ok": false, "error": str}. Floats cross as JSON
@@ -17,6 +18,7 @@ Correctness over speed. Envs are independent `MjData` stepped in a loop; this pr
 reference, not a throughput path. See docs/api-notes/mujoco.md for the pinned API surface.
 """
 
+import copy
 import json
 import sys
 
@@ -36,6 +38,40 @@ def name_of(model, objtype, index):
     return mujoco.mj_id2name(model, objtype, index) or ""
 
 
+def write_param(orig, model, p):
+    """Writes `orig`'s value times the scale into `model`; returns the (field, row, column) read
+    back for the reply. Always from `orig`, the loaded model, so scales never compound."""
+    field, i, scale = p["field"], int(p["index"]), float(p["scale"])
+    if field == "body_mass":
+        model.body_mass[i] = orig.body_mass[i] * scale
+        return ("body_mass", i, None)
+    if field == "geom_friction":
+        sub = int(p["sub"])
+        if sub >= int(orig.body_geomnum[i]):
+            raise ValueError("body %d has no geom %d" % (i, sub))
+        g = int(orig.body_geomadr[i]) + sub
+        # Sliding, torsional and rolling together.
+        model.geom_friction[g, 0:3] = orig.geom_friction[g, 0:3] * scale
+        return ("geom_friction", g, 0)
+    if field == "actuator_gain":
+        gain = orig.actuator_gainprm[i, 0]
+        model.actuator_gainprm[i, 0] = gain * scale
+        # A servo's bias mirrors its gain (position: biasprm[1] = -kp; velocity:
+        # biasprm[2] = -kv), so it is scaled with it and the servo stays a servo.
+        for k in (1, 2):
+            if gain != 0 and orig.actuator_biasprm[i, k] == -gain:
+                model.actuator_biasprm[i, k] = orig.actuator_biasprm[i, k] * scale
+                break
+        return ("actuator_gainprm", i, 0)
+    raise ValueError("unknown parameter field %r" % (field,))
+
+
+def read_param(model, slot):
+    field, row, col = slot
+    array = getattr(model, field)
+    return float(array[row] if col is None else array[row, col])
+
+
 class Sim(object):
     def __init__(self, mjcf, n_envs, timestep, seed):
         self.model = mujoco.MjModel.from_xml_string(mjcf)
@@ -43,8 +79,29 @@ class Sim(object):
             self.model.opt.timestep = timestep
         self.seed = seed
         self.datas = [mujoco.MjData(self.model) for _ in range(n_envs)]
+        # One model per env exists only once `set_params` has been called; until then every
+        # env steps the one loaded model, byte for byte what it did before per-env models.
+        self.models = None
         for data in self.datas:
             mujoco.mj_forward(self.model, data)
+
+    def model_of(self, env):
+        return self.model if self.models is None else self.models[env]
+
+    def set_params(self, envs, params):
+        if self.models is None:
+            self.models = [copy.copy(self.model) for _ in self.datas]
+        values = []
+        for env in envs:
+            model = self.models[env]
+            slots = [write_param(self.model, model, p) for p in params]
+            # Mass feeds derived constants (body_subtreemass, the invweight0s, actuator_acc0,
+            # meaninertia); friction and gain feed none.
+            if any(p["field"] == "body_mass" for p in params):
+                mujoco.mj_setConst(model, mujoco.MjData(model))
+            for slot in slots:
+                values.append([read_param(self.model, slot), read_param(model, slot)])
+        return values
 
     def info(self):
         model = self.model
@@ -113,16 +170,16 @@ class Sim(object):
                 if width:
                     chunk = values[row * width : (row + 1) * width]
                     getattr(data, field)[:] = np.asarray(chunk, dtype=np.float64)
-            mujoco.mj_forward(self.model, data)
+            mujoco.mj_forward(self.model_of(env), data)
 
     def reset(self, envs, state):
         for env in envs:
-            mujoco.mj_resetData(self.model, self.datas[env])
+            mujoco.mj_resetData(self.model_of(env), self.datas[env])
         if state is not None:
             self.write_state(state, envs)
         else:
             for env in envs:
-                mujoco.mj_forward(self.model, self.datas[env])
+                mujoco.mj_forward(self.model_of(env), self.datas[env])
 
     def set_ctrl(self, ctrl):
         nu = self.model.nu
@@ -136,8 +193,9 @@ class Sim(object):
     def step(self, n):
         nonfinite = []
         for env, data in enumerate(self.datas):
+            model = self.model_of(env)
             for _ in range(n):
-                mujoco.mj_step(self.model, data)
+                mujoco.mj_step(model, data)
             if not (np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all()):
                 nonfinite.append(env)
         return nonfinite
@@ -164,6 +222,8 @@ def handle(sim, req):
     if cmd == "set_state":
         sim.write_state(req["state"], range(len(sim.datas)))
         return sim, {}
+    if cmd == "set_params":
+        return sim, {"values": sim.set_params([int(e) for e in req["envs"]], req["params"])}
     raise ValueError("unknown command %r" % (cmd,))
 
 

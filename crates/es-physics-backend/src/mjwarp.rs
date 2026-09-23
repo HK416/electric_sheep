@@ -18,7 +18,10 @@
 //! spec 17.2 mapping report, before a process is spawned (spec 14.4).
 
 use es_assets::scene::SceneDesc;
-use es_core::{FailureKind, PhysTick};
+use std::collections::BTreeMap;
+
+use es_core::{FailureKind, PhysTick, StableId};
+use es_physics_core::backend::Param;
 use es_physics_core::caps::{BackendQuirk, BatchSupport, DeterminismTier, FloatPrecision};
 use es_physics_core::{
     check_requirements, Capabilities, Feature, LoadConfig, ModelInfo, PhysicsBackend, PhysicsError,
@@ -28,8 +31,9 @@ use es_physics_core::{
 use crate::mapping::{mapping_report, BackendKind};
 use crate::mjcf_out::scene_to_mjcf;
 use crate::proc::{
-    import_available, model_info, rate_from_timestep, Ack, LoadReply, Process, Request,
-    StatePayload, StateReply, StepReply,
+    applied_values, check_envs, import_available, model_info, param_index, param_wire,
+    rate_from_timestep, Ack, AppliedKey, LoadReply, Process, Request, SetParamsReply, StatePayload,
+    StateReply, StepReply,
 };
 
 /// The backend's name in `es backend compare --backends ...` (spec 17.2).
@@ -97,6 +101,11 @@ pub struct MjWarpBackend {
     model: Option<ModelInfo>,
     tick: PhysTick,
     state: StateBuffers,
+    /// Where each parameter target lives in the model, built at load (packet M11/X4).
+    params: BTreeMap<(Param, StableId), (u32, u32)>,
+    /// `[nominal, applied]` of every parameter `set_params` wrote, the applied value read
+    /// back out of the world's `f32` model array.
+    applied: BTreeMap<AppliedKey, [f64; 2]>,
 }
 
 #[derive(Debug, Default)]
@@ -123,7 +132,15 @@ impl MjWarpBackend {
             model: None,
             tick: PhysTick::ZERO,
             state: StateBuffers::default(),
+            params: BTreeMap::new(),
+            applied: BTreeMap::new(),
         }
+    }
+
+    /// `(env, param, id) -> [nominal, applied]` for every parameter [`PhysicsBackend::set_params`]
+    /// wrote since the last load, as read back out of that world's model arrays.
+    pub fn applied_params(&self) -> &BTreeMap<AppliedKey, [f64; 2]> {
+        &self.applied
     }
 
     /// Whether a Python interpreter with `mujoco_warp` and `warp` is available. `Err` explains
@@ -222,6 +239,8 @@ impl PhysicsBackend for MjWarpBackend {
         let info = model_info(&reply, scene, "MuJoCo Warp", cfg.n_envs, rate)?;
 
         self.process = Some(process);
+        self.params = param_index(scene, &info);
+        self.applied.clear();
         self.model = Some(info.clone());
         self.tick = PhysTick::ZERO;
         self.fetch_state()?;
@@ -322,6 +341,25 @@ impl PhysicsBackend for MjWarpBackend {
             },
         })?;
         self.fetch_state()
+    }
+
+    /// `mjwarp_ref.py` edits a per-env CPU `MjModel` exactly as `mujoco-cpu` does (including
+    /// `mj_setConst` after a mass edit) and uploads every field that edit moved as that world's
+    /// row of a per-world `mujoco_warp` model array (`mujoco_warp` 3.13 indexes model fields
+    /// by `worldid % shape[0]`). Until the first call every array keeps its single shared row.
+    fn set_params(
+        &mut self,
+        envs: &[u32],
+        params: &[(Param, StableId, f64)],
+    ) -> Result<(), PhysicsError> {
+        check_envs(envs, self.info()?.n_envs)?;
+        let wire = param_wire(&self.params, params)?;
+        let reply: SetParamsReply = self.process()?.call(&Request::SetParams {
+            envs,
+            params: &wire,
+        })?;
+        self.applied.extend(applied_values(envs, params, &reply)?);
+        Ok(())
     }
 }
 

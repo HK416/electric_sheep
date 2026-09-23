@@ -13,6 +13,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use es_assets::scene::SceneDesc;
 use es_core::{StableId, TickRate};
+use es_physics_core::backend::Param;
 use es_physics_core::{IndexRange, ModelInfo, PhysicsError};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -45,7 +46,118 @@ pub enum Request<'a> {
     SetState {
         state: StatePayload<'a>,
     },
+    /// Scales model parameters of `envs` (packet M11/X4); the reply is [`SetParamsReply`].
+    SetParams {
+        envs: &'a [u32],
+        params: &'a [ParamWire],
+    },
     Quit,
+}
+
+/// One `set_params` entry on the wire: which model field, where in it, and the scale.
+///
+/// `index` is the engine's body row for `body_mass`, its actuator row for `actuator_gain`,
+/// and for `geom_friction` the owning body's row with `sub` the geom's position among that
+/// body's geoms -- the emitter writes a body's geoms in scene order and `MuJoCo` keeps them
+/// contiguous from `body_geomadr`, so no geom name has to be reconstructed here.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct ParamWire {
+    pub field: &'static str,
+    pub index: u32,
+    pub sub: u32,
+    pub scale: f64,
+}
+
+/// The `set_params` reply: `[nominal, applied]` read back out of each edited model, env-major,
+/// one pair per entry.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct SetParamsReply {
+    pub values: Vec<[f64; 2]>,
+}
+
+/// Where each parameter target of `scene` lives in the loaded model, as `(index, sub)` of a
+/// [`ParamWire`]. Built once at load; a target missing from it is refused by name.
+pub(crate) fn param_index(
+    scene: &SceneDesc,
+    info: &ModelInfo,
+) -> BTreeMap<(Param, StableId), (u32, u32)> {
+    let mut out = BTreeMap::new();
+    for body in &scene.bodies {
+        let Some(row) = info.body.get(&body.id) else {
+            continue;
+        };
+        out.insert((Param::BodyMass, body.id), (row.start, 0));
+        for (k, geom) in body.geoms.iter().enumerate() {
+            out.insert((Param::GeomFriction, geom.id), (row.start, k as u32));
+        }
+    }
+    for (id, row) in &info.actuator {
+        out.insert((Param::ActuatorGain, *id), (row.start, 0));
+    }
+    out
+}
+
+/// The wire form of `params`, or `Unsupported` naming the first target the model lacks.
+pub(crate) fn param_wire(
+    index: &BTreeMap<(Param, StableId), (u32, u32)>,
+    params: &[(Param, StableId, f64)],
+) -> Result<Vec<ParamWire>, PhysicsError> {
+    params
+        .iter()
+        .map(|&(param, id, scale)| {
+            let &(index, sub) = index.get(&(param, id)).ok_or_else(|| {
+                PhysicsError::Unsupported(format!(
+                    "set_params: {param:?} of {id:?} is not in the loaded model"
+                ))
+            })?;
+            let field = match param {
+                Param::BodyMass => "body_mass",
+                Param::GeomFriction => "geom_friction",
+                Param::ActuatorGain => "actuator_gain",
+            };
+            Ok(ParamWire {
+                field,
+                index,
+                sub,
+                scale,
+            })
+        })
+        .collect()
+}
+
+/// `(env, param, id)`: one parameter of one env, as `set_params` applied it.
+pub type AppliedKey = (u32, Param, StableId);
+
+/// Checks `envs` against the batch and `reply` against the request, then returns
+/// `(env, param, id) -> [nominal, applied]` for every entry.
+pub(crate) fn applied_values(
+    envs: &[u32],
+    params: &[(Param, StableId, f64)],
+    reply: &SetParamsReply,
+) -> Result<Vec<(AppliedKey, [f64; 2])>, PhysicsError> {
+    if reply.values.len() != envs.len() * params.len() {
+        return Err(PhysicsError::Protocol(format!(
+            "set_params answered {} values for {} envs x {} params",
+            reply.values.len(),
+            envs.len(),
+            params.len()
+        )));
+    }
+    Ok(envs
+        .iter()
+        .flat_map(|env| params.iter().map(move |&(p, id, _)| (*env, p, id)))
+        .zip(reply.values.iter().copied())
+        .collect())
+}
+
+/// `Err` naming the first env outside a batch of `n_envs`.
+pub(crate) fn check_envs(envs: &[u32], n_envs: u32) -> Result<(), PhysicsError> {
+    match envs.iter().find(|e| **e >= n_envs) {
+        Some(bad) => Err(PhysicsError::Backend(format!(
+            "env {bad} is out of range for a batch of {n_envs}"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// Env-major state arrays on the wire.

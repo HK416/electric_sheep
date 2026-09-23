@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use es_assets::scene::SceneDesc;
 use es_core::{FailureKind, PhysTick, StableId, TickRate};
+use es_physics_core::backend::Param;
 use es_physics_core::caps::{BackendQuirk, BatchSupport, DeterminismTier, FloatPrecision};
 use es_physics_core::{
     check_requirements, Capabilities, Feature, IndexRange, LoadConfig, ModelInfo, PhysicsBackend,
@@ -19,7 +20,10 @@ use es_physics_core::{
 };
 
 use crate::mjcf_out::scene_to_mjcf;
-use crate::proc::{Ack, LoadReply, Process, Request, StatePayload, StateReply, StepReply};
+use crate::proc::{
+    applied_values, check_envs, param_index, param_wire, Ack, AppliedKey, LoadReply, Process,
+    Request, SetParamsReply, StatePayload, StateReply, StepReply,
+};
 
 /// The backend's name in `es backend compare --backends ...` (spec 17.2).
 pub const NAME: &str = "mujoco-cpu";
@@ -61,6 +65,8 @@ pub fn capabilities() -> Capabilities {
             Feature::ActuatorPosition,
             Feature::ActuatorVelocity,
             Feature::ActuatorOnJoint,
+            // One `MjModel` per env, made on the first `set_params` (packet M11/X4).
+            Feature::ModelParams,
         ]
         .into(),
         sensors: [Feature::SensorJointPos, Feature::SensorJointVel].into(),
@@ -105,6 +111,11 @@ pub struct MuJoCoCpuBackend {
     model: Option<ModelInfo>,
     tick: PhysTick,
     state: StateBuffers,
+    /// Where each parameter target lives in the model, built at load.
+    params: BTreeMap<(Param, StableId), (u32, u32)>,
+    /// `[nominal, applied]` of every parameter `set_params` wrote, read back out of the env's
+    /// model: the evidence that a draw reached physics.
+    applied: BTreeMap<AppliedKey, [f64; 2]>,
 }
 
 #[derive(Debug, Default)]
@@ -131,7 +142,15 @@ impl MuJoCoCpuBackend {
             model: None,
             tick: PhysTick::ZERO,
             state: StateBuffers::default(),
+            params: BTreeMap::new(),
+            applied: BTreeMap::new(),
         }
+    }
+
+    /// `(env, param, id) -> [nominal, applied]` for every parameter [`PhysicsBackend::set_params`]
+    /// wrote since the last load, as read back out of that env's `MjModel`.
+    pub fn applied_params(&self) -> &BTreeMap<AppliedKey, [f64; 2]> {
+        &self.applied
     }
 
     /// Whether a Python interpreter with the `mujoco` package is available. `Err` explains what
@@ -281,6 +300,8 @@ impl PhysicsBackend for MuJoCoCpuBackend {
         }
 
         self.process = Some(process);
+        self.params = param_index(scene, &info);
+        self.applied.clear();
         self.model = Some(info.clone());
         self.tick = PhysTick::ZERO;
         self.fetch_state()?;
@@ -381,6 +402,26 @@ impl PhysicsBackend for MuJoCoCpuBackend {
             },
         })?;
         self.fetch_state()
+    }
+
+    /// `mujoco_ref.py` gives every env its own copy of the loaded `MjModel` on the first call
+    /// (a run that never calls this keeps one model) and writes `nominal × scale` from the
+    /// loaded model, so scales never compound. A mass edit is followed by `mj_setConst`, which
+    /// re-derives `body_subtreemass`, the `invweight0`s, `actuator_acc0` and `meaninertia`;
+    /// friction and gain feed nothing derived and need none.
+    fn set_params(
+        &mut self,
+        envs: &[u32],
+        params: &[(Param, StableId, f64)],
+    ) -> Result<(), PhysicsError> {
+        check_envs(envs, self.info()?.n_envs)?;
+        let wire = param_wire(&self.params, params)?;
+        let reply: SetParamsReply = self.process()?.call(&Request::SetParams {
+            envs,
+            params: &wire,
+        })?;
+        self.applied.extend(applied_values(envs, params, &reply)?);
+        Ok(())
     }
 }
 

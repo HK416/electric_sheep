@@ -246,6 +246,12 @@ impl<B: PhysicsBackend> Env<B> {
             if self.recorder.open(*env).steps() > 0 {
                 closed.push(self.recorder.finish(*env));
             }
+            // The drawn scales reach this env's model before its state is pushed (packet
+            // M11/X4); a task that draws none never calls the backend here.
+            if self.randomization.has_scales() {
+                let params: Vec<_> = scales.iter().map(|(&(p, id), &s)| (p, id, s)).collect();
+                self.backend.set_params(&[*env], &params)?;
+            }
             self.recorder.set_param_scales(*env, scales);
             self.last_ctrl[i * self.model.nu as usize..(i + 1) * self.model.nu as usize].fill(0.0);
         }
@@ -890,6 +896,16 @@ pub(crate) mod tests {
                 });
             }
             self.qpos.copy_from_slice(state.qpos);
+            Ok(())
+        }
+
+        /// The double has no model to scale; it accepts the draws so a task with a scale target
+        /// runs here (the draws themselves are checked in the episode record).
+        fn set_params(
+            &mut self,
+            _envs: &[u32],
+            _params: &[(es_physics_core::backend::Param, es_core::StableId, f64)],
+        ) -> Result<(), PhysicsError> {
             Ok(())
         }
     }

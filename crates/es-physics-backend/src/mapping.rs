@@ -91,7 +91,7 @@ impl Spec17Row {
 
 /// Every [`Feature`] `es-physics-core` knows. The table covers all of them, so a scene can
 /// never use something the report is silent about.
-const ALL_FEATURES: [Feature; 35] = [
+const ALL_FEATURES: [Feature; 36] = [
     Feature::JointFree,
     Feature::JointBall,
     Feature::JointHinge,
@@ -127,6 +127,7 @@ const ALL_FEATURES: [Feature; 35] = [
     Feature::ContactMesh,
     Feature::ContactHeightField,
     Feature::Tendon,
+    Feature::ModelParams,
 ];
 
 /// One thing a scene can ask a backend for: either a spec 17.2 table row or a capability
@@ -800,7 +801,7 @@ mod tests {
     #[test]
     fn every_feature_and_backend_pair_has_a_row() {
         let table = SemanticMapping::new();
-        assert_eq!(table.len(), (5 + 35) * 4);
+        assert_eq!(table.len(), (5 + 36) * 4);
         for feature in TaskFeature::all() {
             for backend in BackendKind::ALL {
                 let mapping = table
