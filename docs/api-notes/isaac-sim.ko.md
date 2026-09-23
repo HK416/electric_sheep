@@ -9,7 +9,8 @@
 리서치 준비 자료다 — 거기의 모든 주장은 `verified (fetched)`(2026-09-23에 인용된 페이지에서
 읽음) 또는 `unverified`(1차 출처에서 찾지 못했거나, 2차/커뮤니티 출처에서만 찾음)로 태그되어
 있다. **§7은 우리가 직접 측정한 것**이며(M11 I0, `docs/packets/M11/I0-isaac-sim-install.md`),
-§1–§6과 어긋나는 곳에서는 §7이 우선한다. 영어 원본: `isaac-sim.md`.
+§1–§6과 어긋나는 곳에서는 §7이 우선한다. **§8은 그 위에 만든 `PhysXBackend`**(M11 I1)이며,
+이것도 측정한 것이다. 영어 원본: `isaac-sim.md`.
 
 2026-09-23에 가져온 출처:
 
@@ -204,6 +205,7 @@ Bounding Sphere / Bounding Cube), `allow_self_collision`, `fix_base`, `link_dens
 
 - ~~MJCF로 임포트한 씬이 MuJoCo CPU 수치를 재현하는지~~ — §7에서 측정했다: 재현하지 않는다.
   SO-101에서 100스텝 동안 최대 1.73 rad 차이가 나며, 이를 설명하는 임포터 행을 §7이 적는다.
+  I1의 수리(§8)를 거치면 같은 제어에서 500스텝 동안 0.30 rad 차이다.
 - 정확한 액추에이터 타입→드라이브 매핑(§3)과 정확한 마찰 계수 매핑 — `<position>`
   액추에이터와 지오메트리 `friction`은 §7.3에서 측정했다. `velocity`/`motor`/`general`
   액추에이터와 텐던/등식 제약은 여전히 측정하지 않았다(그것을 가진 픽스처가 없다).
@@ -326,4 +328,122 @@ stiffness kp, damping kv + 조인트 감쇠, `deg`: 같은 값 × π/180) 차이
 강체 없는 `worldBody` 아티큘레이션 루트를 제거하고, (3) MJCF 자유 바디를 용접하지 않고, (4)
 드라이브를 직접 저작하고(kp는 도당 단위로, kv, 그리고 수동 감쇠와 frictionloss에 대한 결정),
 (5) 마찰 머티리얼을 저작하고, (6) 리셋/스텝 횟수를 직접 소유하고, (7) 이 호스트에서는 물리
-전용 익스피리언스로 시작해야 한다 — 각각이 매핑 리포트의 한 행이다.
+전용 익스피리언스로 시작해야 한다 — 각각이 매핑 리포트의 한 행이다. I1이 각각을 어떻게
+했는지는 §8이 적는다.
+
+## 8. `PhysXBackend` (M11 I1, 2026-09-23)
+
+`crates/es-physics-backend/src/physx.rs` + `python/physx_ref.py`, 패킷
+`docs/packets/M11/I1-physx-backend.md`. §7과 같은 서버, 같은 venv에서 측정했고 산출물은
+`~/artifacts/plan-x/i1/`에 있다. 여기의 모든 수치는 측정값이며 허용 오차는 주장하지 않는다.
+
+### 8.1 어떻게 도는가
+
+- **임포트가 아니라 서브프로세스.** `physx_ref.py`는 `proc.rs`의 JSON-lines 프로토콜(`load`,
+  `reset`, `set_ctrl`, `step`, `state`, `set_state`)을 말한다. `set_params`는 없다: env별 모델
+  필드를 측정하지 않았으므로 `ModelParams`를 선언하지 않고 `set_params`는 이름을 대며 거부한다.
+- **`ES_ISAAC_PYTHON`**이 인터프리터를 가리킨다. 설정되지 않았거나 `import isaacsim`을 못 하면
+  `is_available()`의 `Err`, 즉 호출자의 SKIPPED exit 3이다. Rust 쪽이
+  `OMNI_KIT_ACCEPT_EULA=YES`를 설정하고 §7.2의 호환 라이브러리를 `LD_LIBRARY_PATH` 앞에 붙인다
+  (`ES_ISAAC_COMPAT_LIBS`, 없으면 존재할 때 `$HOME/opt/isaac-compat/root/usr/lib/x86_64-linux-gnu`).
+  스크립트가 `isaaclab.python.headless.kit`을 스스로 고른다(`ES_ISAAC_EXPERIENCE`로 덮어씀).
+  호출자는 `ES_ISAAC_PYTHON` 말고는 아무것도 설정하지 않는다.
+- **스크립트는 파일로 실행한다.** 새 발견: 프로세스를 `python -c <script>`로
+  시작하면(`sys.argv == ["-c"]`) `SimulationApp`이 로그 없이 breakpad 핸들러에서 죽는다. 내장
+  스크립트를 blake3 이름으로 임시 디렉터리에 한 번 쓰고 파일로 실행한다(`Process::spawn_command`).
+- **stdout은 프로토콜이다.** Kit은 stdout에 로그를 쓴다. 스크립트는 무엇이든 임포트하기 전에
+  fd 1을 프로토콜용으로 복제하고 fd 1을 stderr로 돌린다. `ES_PHYSX_STDERR=<file>`이면 Kit 로그를
+  남긴다.
+- **파이프라인:** `ES_PHYSX_DEVICE=cpu`(기본) 또는 `cuda:0`. 패킷은 `LoadConfig`로 고르라 했지만
+  `LoadConfig`는 I1의 컨텍스트 밖인 `es-physics-core`에 있어서 벗어났다. 파이프라인은 엔진
+  버전(`isaacsim 5.1.0 physx 107.3.26 cpu|gpu`)에 기록되므로 `backend_identity`와
+  `evaluation.lock`이 둘을 구별하고, `gpu_resident`도 이를 따른다.
+- **Env:** `n_envs > 1`이면 `/World/envs/env_0`을 `GridCloner(spacing = 0)`로 복제하고
+  `filter_collisions`로 env를 서로 격리한다. 모든 env는 MJCF 좌표 그대로다.
+- **상태**는 `omni.physics.tensors`(힌지 dof와 모든 링크 포즈는 아티큘레이션 뷰, 자유 바디는
+  강체 뷰)로 읽고 쓰며, MJCF에서 다시 세운 MuJoCo 배치를 따른다: 바디는 `world`를 먼저 두고
+  깊이 우선, 조인트는 바디 순서, 자유 조인트는 `pos ‖ quat(w,x,y,z)`이고 선속도는 월드 프레임에서
+  본 바디 원점의 속도, 각속도는 바디 프레임(PhysX는 질량 중심 속도와 월드 프레임 각속도를 준다.
+  바디의 COM 오프셋으로 양방향 변환). `xquat`은 `x,y,z,w`. 프로세스당 스테이지 하나: 다시
+  로드하면 새 프로세스다(로드된 스테이지까지 ≈ 4 s).
+
+### 8.2 임포터 항목: 고친 것과 선언한 것
+
+"고침"은 `physx_ref.py`가 수리하고 능력 선언의 `BackendQuirk`(그래서 모든 `evaluation.lock`)에
+들어간다는 뜻이고, "행"은 매핑 리포트의 한 행(`es backend compare`, spec 14.4 관문)이며 모두
+경고다. 조용히 버리는 것은 없다.
+
+| 항목(§7.3과 새로 찾은 셋) | 처리 |
+|---|---|
+| 인라인 `<mesh vertex/face>`가 치명적, exit 0 | **고침**: 인라인 메시마다 임시 디렉터리에 `<메시 이름>.obj`로 쓰고 MJCF 사본은 `file=`을 쓴다. 새 발견: 임포터는 메시를 **이름으로** 찾는다. 다른 이름의 파일이면 충돌체가 아예 임포트되지 않고, 충돌체 prim은 지오메트리가 아니라 메시 이름을 딴다. 행 `ContactMesh` approximated: 볼록 껍질 |
+| 강체 없는 `worldBody` 아티큘레이션 루트 | **고침**: `ArticulationRootAPI` 제거 |
+| `fix_base`가 MJCF 자유 바디를 용접 | **고침**: `rootJoint_<body>`와 자유 바디의 `ArticulationRootAPI`를 지워 평범한 강체로 만든다. 자식이 있는 바디의 자유 조인트(부유 베이스)는 로드 때 이름을 대며 거부한다 |
+| `World.reset()`이 숨은 2스텝을 돈다 | **고침**: `reset()` 뒤에 MuJoCo의 qpos0(힌지 0, 자유 바디는 임포트된 포즈)과 0 속도를 써서 tick 0이 MuJoCo의 tick 0이다. `mesh_box`의 자유 낙하가 이제 충돌 직후인 tick 225까지 MuJoCo와 1e-6 m 안에서 맞는다(I0: 처음부터 1.99e-3 m 차이) |
+| kp가 USD의 도당 게인에 변환 없이 기록, kv 누락 | **고침**: 모든 드라이브를 텐서 API로 쓴다 — stiffness = kp, damping = kv, max force = forcerange — 텐서 API는 SI 단위(N·m/rad)를 받는다. 힌지 하나짜리 탐침(kp 1, kv 0.05, 중력 없음, 무작위 목표)에서 확인: 500틱 동안 MuJoCo와 max \|Δq\| 1.1e-3 rad, 57.3배 단위 오류라면 이렇게 가까이 머물 수 없다. position 액추에이터가 없는 dof에는 드라이브가 없다. 행 `actuator.pd` / `ActuatorPosition` approximated(PhysX 드라이브는 암시적) |
+| `ctrlrange` 누락 | **고침**: MuJoCo처럼 스크립트가 ctrl을 그 범위로 자른다 |
+| 조인트 `damping`이 힘 클램프 안쪽의 드라이브 감쇠가 됨 | **행** `joint.damping` approximated: `-d·q̇`(와 조인트 스프링 `-k(q − springref)`)를 매 물리 스텝 전에 명시적 조인트 힘으로 가한다. MuJoCo처럼 클램프 바깥이지만 MuJoCo에서는 암시적이다 |
+| `frictionloss` 누락 | **행** `JointFrictionLoss` unsupported: PhysX 조인트 마찰은 계수이지 건마찰 토크가 아니다 |
+| 지오메트리 마찰: 머티리얼 없음 | **행** `geom.friction` approximated: 미끄럼 계수마다 머티리얼 하나, static = dynamic = μ, 반발 0, 결합 `max`(MuJoCo의 규칙, `priority`는 무시) |
+| `contype`/`conaffinity` 비트마스크 | **행** `geom.contype_conaffinity` unsupported, 충돌하는 지오메트리가 1/1도 0/0도 아닐 때 묻는다. 임포터의 충돌 그룹은 아무것도 거르지 않았으므로 지운다 |
+| `solref`, `solimp`, `margin` | **행** `ContactSoftParams` unsupported. spec 17.2의 `contact.soft_params`는 상태를 유지하고, 버려진다고 적은 노트를 단다 |
+| `condim` 4/6(비틀림, 구름) | **행** `ContactCondim6` unsupported |
+| `cone = elliptic` | **행** `ContactElliptic` unsupported: 피라미드로 돈다 |
+| `<option>` integrator / solver / iterations / impratio | **행** `option.solver` unsupported, 모든 씬에서: PhysX TGS, 임포터의 32 / 1 아티큘레이션 반복 |
+| 충돌하지 않는 지오메트리의 `mass=` | **행** `body.mass_from_geoms` unsupported, `<inertial>` 없이 지오메트리를 가진 바디가 있을 때 묻는다 |
+| 모든 바디에 +0.05 각 감쇠 | **고침**: 모든 바디와 아티큘레이션에서 각·선 감쇠 0, 수면 끔(임계값 0) |
+| 물리 전용 익스피리언스 | **고침**: 스크립트가 고른다 |
+| armature | 임포터가 유지한다(§7.3): `JointArmature` native. spec 17.2의 `joint.armature` 행은 "unsupported" 상태를 유지하고, 임포터가 유지한다는 노트를 단다 |
+| **새 발견:** 임포터의 `/collisions`(와 `/meshes`, `/visuals`) 프로토타입 | **고침**: 정의되고 활성이며 충돌이 켜진 prim이라서 PhysX가 모든 바디의 충돌체를 **월드 원점의 정적 충돌체로** 한 번 더 시뮬레이션한다(원점에서의 겹침 쿼리가 `/collisions/wrist/…`, `/collisions/cube/…`에 맞는다). 루트에서 비활성화한다. 바디로 들어가는 인스턴스 참조는 그대로 합성된다(SO-101에서 34개 충돌체가 남고 모두 `/World` 아래). 충돌체가 자기 머티리얼을 가질 수 있도록 인스턴스를 인스턴스 불가로 바꾼다 |
+| **새 발견:** 0인 자유 조인트 쿼터니언 | **고침**: env의 리셋은 무작위화하는 자유 조인트의 위치만 쓰고 쿼터니언은 0으로 둔다. MuJoCo는 이를 항등으로 읽지만 PhysX는 **변환 전체를 조용히 버린다**(위치 포함). 스크립트가 `mju_normalize4`처럼 정규화한다(노름 < 1e-15 → 항등). 고치기 전에는 reach A0의 큐브가 움직이지 않았고 nominal이 0.0이었다 |
+
+아예 매핑하지 않는 것 — 프로세스가 뜨기 전에 매핑 리포트가 막는다(spec 14.4): 볼 조인트, 센서
+(어댑터가 읽지 않음), `velocity` / `general` / 사이트 액추에이터, 텐던, 높이 필드. `JointSlide`는
+구현했지만 어떤 픽스처도 쓰지 않아서 선언하지 않는다.
+
+### 8.3 오라클 2: `es backend compare`, 500틱
+
+`es backend compare --scene <scene> --backends mujoco-cpu,physx --ctrl-random --ticks 500`
+([−1, 1]의 splitmix64 목표, 두 엔진 모두 `ctrlrange`로 자름), 그리고 Isaac이 있을 때만 도는
+테스트 `physx_against_mujoco_cpu_is_measured`(모든 액추에이터가 `mid + ¼(hi−lo)·sin(2πk/100 + i)`,
+§7.4의 제어, 500틱, 이어서 PhysX 실행 대 두 번째 PhysX 실행).
+
+| 씬 | 파이프라인 | 제어 | max \|Δqpos\| | max \|Δqvel\| | 에너지 프록시 MuJoCo / PhysX(마지막 틱) | max 에너지 프록시 Δ | 발산 틱(1e-6) |
+|---|---|---|---|---|---|---|---|
+| SO-101 | CPU | 무작위 | 7.023e-2 | 3.20 | 6.564 / 7.440 | 5.04 | 0 |
+| SO-101 | CPU | 사인 | 3.03e-1 | 5.90 | 31.41 / 35.47 | 30.0 | 0 |
+| `mesh_box` | CPU | 없음(자유 낙하, ≈ 0.2 s에 착지) | 1.55e-2 | 2.22 | 2.7e-9 / 1.3e-8 | 4.91 | 225 |
+| SO-101 | GPU(`cuda:0`) | 무작위 | 7.025e-2 | 3.20 | 6.564 / 7.440 | 5.04 | 0 |
+| SO-101 | GPU | 사인 | 3.54e-1 | 5.60 | 31.41 / 35.51 | 31.1 | 0 |
+| `mesh_box` | GPU | 없음 | 1.55e-2 | 2.21 | 2.7e-9 / 8.3e-8 | 4.91 | 225 |
+
+- **재실행:** CPU `es backend compare` 두 번이 두 씬 모두 같은 출력을 냈고, 테스트의 PhysX 대
+  PhysX 재실행은 두 씬 모두 **비트 단위로 같다**(max \|Δqpos\| = max \|Δqvel\| = 0, 발산 틱
+  없음). GPU 파이프라인의 재실행도 두 곳, 두 씬 모두에서 비트 단위로 같다. 사인 제어에서 CPU
+  파이프라인 대 GPU 파이프라인: SO-101은 max \|Δqpos\| 0.124 rad로 tick 0에서 발산하고,
+  `mesh_box`는 6.9e-6 m로 tick 225(충돌)에서 발산한다. 두 파이프라인은 MuJoCo에서 똑같이 멀다.
+- **§7.4와 비교:** 같은 사인 제어에서 I0의 임포트된 그대로의 PhysX는 100스텝 안에 MuJoCo와
+  최대 1.73 rad 벌어졌다. §8.2의 수리를 거치면 500스텝 동안 0.30 rad다. SO-101은 f32만으로도
+  tick 0에서 발산하고, `mesh_box`는 충돌 전까지 1e-6 안에 머문다.
+
+### 8.4 오라클 3: `es eval run --backend physx`로 reach A0
+
+W0b의 reach A0(`~/artifacts/plan-w/w0b/reach/seed0/checkpoints/4000.esb`, mujoco-cpu에서 학습),
+`tests/fixtures/rl/evaluation-reach.toml`(16 에피소드 × 4 스위트), 씬 `so101_pick_place.xml`,
+같은 바이너리:
+
+| 백엔드 | nominal | observation_delay | torque_noise | backlash | 평균 에피소드 길이(nominal) | 벽시계 |
+|---|---|---|---|---|---|---|
+| mujoco-cpu | **0.5625** | 0.3125 | 0.5 | 0.5 | 129.4 | 13 s |
+| physx, CPU 파이프라인 | **0.125** | 0.0 | 0.3125 | 0.0625 | 184.9 | 5분 43초 |
+| physx, GPU 파이프라인(`cuda:0`) | **0.125** | 0.0625 | 0.0 | 0.0625 | 183.4 | 8분 1초 |
+| mjwarp | 무엇이든 뜨기 전에 매핑 리포트가 거부(`ContactElliptic`, M11 X1) | | | | | |
+
+실행은 끝까지 돌고, `evaluation.lock`은 위의 모든 quirk와 함께 `backend = physx`를 담으며,
+`execution_hash`는 mujoco-cpu의 것과 다르다(`2fdd30a0…` 대 `08851281…`, `hardware_capability`
+슬롯). GPU 파이프라인 실행은 또 다른 해시를 갖는다(`e16de409…`, 엔진 버전 `… gpu`). MuJoCo에서 학습한 정책은 PhysX에서 nominal 성공의 4분의 1만 지킨다: 측정했지만 여기서
+원인을 배분하지는 않은 sim-to-sim 차이다(남은 §8.2의 행들 — frictionloss, 소프트 접촉, 솔버,
+명시적 감쇠 — 이 후보다).
+
+실행 해시는 `physx_ref.py` 자체를 덮지 않는다: 영 쿼터니언 수정 전의 첫 A0 실행은 같은 해시
+아래에서 0.0을 냈다. 지금은 모든 프로세스 밖 백엔드의 스크립트(`mjwarp_ref.py`도)가 그렇고,
+해시 규칙의 후속 과제다.
