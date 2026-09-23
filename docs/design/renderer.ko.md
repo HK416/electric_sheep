@@ -75,10 +75,12 @@ atlas_bytes(cfg, n_tiles, channel)
 | `Sphere` | UV 구, 고정 16×8 |
 | `Capsule` | 실린더 16 세그먼트 + 16×4 반구 캡 2개 |
 | `Cylinder`, `Ellipsoid` | 각각의 반지름으로 `Capsule`/`Sphere`와 동일 |
-| `Mesh` | `RenderError::Unsupported` — `SceneDesc`는 정점이 아니라 `AssetRef`를 갖고 있고, `es_assets::gltf::MeshData`를 연결하려면 이 패킷이 소유하지 않는 자산 리졸버가 필요하다 |
+| `Mesh` | 파일의 삼각형: `SceneDesc::meshes[asset]`(`es_assets::mesh::load`가 채움, M10/W2a), 인덱스 세 개당 삼각형 하나, 위치는 `f32`→`f64`로 정확히 확장; `meshes`에 없는 자산은 `es_assets::mesh::load`를 명시하는 `RenderError::UnsupportedShape` (M10/W2b) |
 | `HeightField` | `RenderError::Unsupported` |
 
 테셀레이션 개수는 품질 설정이 아니라 상수다: 개수를 바꾸면 모든 골든이 바뀌므로, 실수가 아니라 의도적인 편집이어야 한다.
+
+메시에는 고를 개수가 없다: 삼각형은 파일의 것이고, geom 포즈는 프리미티브와 같은 `push_geom`이 프레임마다 `f64`로 적용하며, 노멀은 다른 모든 삼각형처럼 와인딩에서 나온다 — 메시 전용 셰이딩 경로는 없다. `SceneCache`는 geom의 로컬 삼각형을 `(Shape, AssetRef::hash)`(프리미티브는 0)로 키잉하므로, 이름은 같지만 파일이 다른 메시 geom을 가진 두 씬이 섞일 수 없다. 로딩은 임포터와 렌더러 사이에서 호출자가 밟는 단계다(`es_assets::mesh::load(&mut scene, scene_dir)`); `EnvRenderer`는 받은 씬을 메시째로 복제한다. 골든: `tests/golden/render/mesh_box_*`(`mesh_box.xml`, 64×64, `Rs` rgb8/depth/seg와 흰 하늘 아래 `Pt` 1 spp, `es_render::cpu`로 생성); RTX 3060은 depth에서 0 ULP, 나머지는 비트 단위로 일치한다. 후속 과제: SO-101 업스트림 모델(~350 k 삼각형)의 ms/프레임을 9-지표 세트로(§12.4); 누락된 메시가 첫 프레임이 아니라 생성 시점에 실패해야 한다면 `EnvRenderer::new`에서 `tri_scene` 드라이런; CLI 공용 `load_scene`(M10/W3b가 `crates/es-tools/src/backend.rs`로 옮겼고, W2b의 선언된 범위 밖)은 아직 `es_assets::mesh::load`를 호출해야 한다.
 
 각 삼각형은 다음을 갖는다: 월드 위치 3개(f32), 월드 기하 노멀(f32×3, 삼각형 와인딩에서), 알베도(f32×3, `Geom::rgba`의 RGB), 이미션(f32×3, 이름이 `_light`로 끝나는 geom에서만 0이 아님 — [§4.2](#42-restir-di) 참고), 세그멘테이션 id(u32). 세그멘테이션 id는 `1 + 순회 순서에서의 geom 인덱스`이며, `0`은 배경을 의미한다. id는 1부터 시작하는 밀집값이라 `SegmentationId` 채널에서 `0`이 "히트 없음"을 명확히 나타낸다.
 

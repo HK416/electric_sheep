@@ -121,11 +121,26 @@ world pose from its parent chain, and tessellates every `Geom` into world-space 
 | `Sphere` | UV sphere, fixed 16×8 |
 | `Capsule` | cylinder 16 segments + two 16×4 hemisphere caps |
 | `Cylinder`, `Ellipsoid` | as `Capsule`/`Sphere` with the respective radii |
-| `Mesh` | `RenderError::Unsupported` — `SceneDesc` carries an `AssetRef`, not vertices; wiring `es_assets::gltf::MeshData` in needs an asset resolver this packet does not own |
+| `Mesh` | the file's triangles: `SceneDesc::meshes[asset]` (filled by `es_assets::mesh::load`, M10/W2a), one triangle per index triple, positions widened `f32`→`f64` exactly; an asset not in `meshes` is `RenderError::UnsupportedShape` naming `es_assets::mesh::load` (M10/W2b) |
 | `HeightField` | `RenderError::Unsupported` |
 
 Tessellation counts are constants, not a quality setting: a changed count changes every
 golden, so it must be a deliberate edit, not a knob.
+
+A mesh has no count to choose: its triangles are the file's, the geom pose is applied per frame
+in `f64` by the same `push_geom` a primitive goes through, and the normal comes from the
+winding like every other triangle — no mesh-specific shading path. `SceneCache` keys a geom's
+local triangles on `(Shape, AssetRef::hash)` (zeros for a primitive), so two scenes whose mesh
+geoms share a name but not a file cannot alias. Loading is the caller's step between the
+importer and the renderer (`es_assets::mesh::load(&mut scene, scene_dir)`); `EnvRenderer`
+clones the scene it is handed, meshes included. Goldens: `tests/golden/render/mesh_box_*`
+(`mesh_box.xml`, 64×64, `Rs` rgb8/depth/seg and `Pt` 1 spp under a white sky, from
+`es_render::cpu`); the RTX 3060 matches them at 0 ULP on depth and bitwise elsewhere.
+Follow-ups: the SO-101 upstream model (~350 k triangles) in ms/frame under the nine-metric set
+(§12.4); a `tri_scene` dry run in `EnvRenderer::new` if a missing mesh should fail at
+construction rather than at the first frame; the CLI's shared `load_scene` (moved to
+`crates/es-tools/src/backend.rs` by M10/W3b, outside W2b's declared scope) still has to call
+`es_assets::mesh::load`.
 
 The curved shapes' vertex directions are computed in `f32` through `es_math::approx::{sin,
 cos}`, never the host `libm` (§3.2 `DET-010`), then widened exactly to `f64` and scaled by the
