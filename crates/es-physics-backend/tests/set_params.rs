@@ -176,6 +176,17 @@ fn set_params_reproduces_a_direct_mujoco_edit_bitwise() {
     let [env0, env1] = run(&mut backend, Some(&params));
     assert_bits("env 0 (untouched)", &env0, &unedited);
     assert_bits("env 1 (edited)", &env1, &edited);
+    // The bits themselves, so two platforms' runs can be compared line for line.
+    let hex = |v: &[f64]| {
+        v.iter()
+            .map(|x| format!("{:016x}", x.to_bits()))
+            .collect::<Vec<_>>()
+    };
+    println!(
+        "RAN set_params: env 0 {:?} env 1 {:?}",
+        hex(&env0),
+        hex(&env1)
+    );
 
     // What the model now holds, read back out of it: nominal × scale, for env 1 only.
     let applied: &BTreeMap<(u32, Param, StableId), [f64; 2]> = backend.applied_params();
