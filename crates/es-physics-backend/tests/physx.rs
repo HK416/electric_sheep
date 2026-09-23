@@ -6,7 +6,9 @@
 
 use es_assets::scene::SceneDesc;
 use es_physics_backend::mapping::{lookup, MjcfRow, Status};
-use es_physics_backend::{mapping_report, physx, BackendKind, MappingReport, PhysXBackend, TaskFeature};
+use es_physics_backend::{
+    mapping_report, physx, BackendKind, MappingReport, PhysXBackend, TaskFeature,
+};
 use es_physics_core::caps::{DeterminismTier, FloatPrecision};
 use es_physics_core::{Feature, LoadConfig, PhysicsBackend, PhysicsError};
 
@@ -43,7 +45,11 @@ fn row<'a>(report: &'a MappingReport, name: &str) -> &'a es_physics_backend::Map
 fn physx_capabilities_are_declared_honestly() {
     let cpu = physx::capabilities_on(false);
     let gpu = physx::capabilities_on(true);
-    assert_eq!(physx::capabilities(), cpu, "the CPU pipeline is the default");
+    assert_eq!(
+        physx::capabilities(),
+        cpu,
+        "the CPU pipeline is the default"
+    );
     for caps in [&cpu, &gpu] {
         assert_eq!(caps.name, "physx");
         assert_eq!(BackendKind::from_name(&caps.name), Some(BackendKind::PhysX));
@@ -79,19 +85,33 @@ fn physx_capabilities_are_declared_honestly() {
             Feature::SensorTouch,
             Feature::SensorForce,
         ] {
-            assert!(!caps.has(dropped), "{dropped} is not mapped and must not be declared");
+            assert!(
+                !caps.has(dropped),
+                "{dropped} is not mapped and must not be declared"
+            );
         }
         // The repairs the adapter makes are declared, each where it bites.
-        let quirks: String = caps
+        let quirks: Vec<String> = caps
             .quirks
             .iter()
-            .map(|q| format!("{}: {}\n", q.feature, q.description))
+            .map(|q| format!("{}: {}", q.feature, q.description))
             .collect();
+        let quirks = quirks.join("\n");
         for word in [
-            "kp", "kv", "ctrlrange", "reset", "free", "OBJ", "angular damping", "prototype",
+            "kp",
+            "kv",
+            "ctrlrange",
+            "reset",
+            "free",
+            "OBJ",
+            "angular damping",
+            "prototype",
             "pipeline",
         ] {
-            assert!(quirks.contains(word), "no quirk mentions `{word}`:\n{quirks}");
+            assert!(
+                quirks.contains(word),
+                "no quirk mentions `{word}`:\n{quirks}"
+            );
         }
     }
     assert!(!cpu.batch.gpu_resident);
@@ -138,7 +158,11 @@ fn physx_mapping_report_names_every_dropped_feature() {
     assert!(soft.mapping.status.note().contains("dropped"), "{so101}");
 
     // The MJCF rows are the PhysX column's business: other backends' reports do not move.
-    for kind in [BackendKind::MuJoCoCpu, BackendKind::MjWarp, BackendKind::Newton] {
+    for kind in [
+        BackendKind::MuJoCoCpu,
+        BackendKind::MjWarp,
+        BackendKind::Newton,
+    ] {
         let report = mapping_report(&fixture("so101_pick_place.xml"), kind);
         assert!(
             !report
@@ -156,10 +180,23 @@ fn physx_mapping_report_names_every_dropped_feature() {
     // mesh_box: a mesh collides as its convex hull; a body without <inertial> takes PhysX's mass.
     let mesh = mapping_report(&fixture("mesh_box.xml"), BackendKind::PhysX);
     assert!(!mesh.blocked, "{mesh}");
-    assert_eq!(row(&mesh, "ContactMesh").mapping.status.label(), "approximated");
-    assert!(row(&mesh, "ContactMesh").mapping.status.note().contains("hull"));
-    assert_eq!(row(&mesh, "body.mass_from_geoms").mapping.status.label(), "unsupported");
-    assert!(!rows(&mesh).iter().any(|(n, _)| n == "joint.damping"), "{mesh}");
+    assert_eq!(
+        row(&mesh, "ContactMesh").mapping.status.label(),
+        "approximated"
+    );
+    assert!(row(&mesh, "ContactMesh")
+        .mapping
+        .status
+        .note()
+        .contains("hull"));
+    assert_eq!(
+        row(&mesh, "body.mass_from_geoms").mapping.status.label(),
+        "unsupported"
+    );
+    assert!(
+        !rows(&mesh).iter().any(|(n, _)| n == "joint.damping"),
+        "{mesh}"
+    );
 
     // contype / conaffinity bitmasks other than 1/1 and 0/0.
     let masked = mapping_report(
@@ -171,7 +208,10 @@ fn physx_mapping_report_names_every_dropped_feature() {
         BackendKind::PhysX,
     );
     assert_eq!(
-        row(&masked, "geom.contype_conaffinity").mapping.status.label(),
+        row(&masked, "geom.contype_conaffinity")
+            .mapping
+            .status
+            .label(),
         "unsupported"
     );
 
@@ -208,7 +248,10 @@ fn physx_mapping_report_names_every_dropped_feature() {
         let PhysicsError::Unsupported(message) = &err else {
             panic!("expected the mapping report, got {err:?}");
         };
-        assert!(message.contains(name) && message.contains("blocked: yes"), "{message}");
+        assert!(
+            message.contains(name) && message.contains("blocked: yes"),
+            "{message}"
+        );
     }
 }
 
@@ -226,9 +269,9 @@ fn physx_is_unavailable_without_es_isaac_python() {
     assert!(why.contains("ES_ISAAC_PYTHON"), "{why}");
 }
 
-/// Oracle 2's shape, runnable wherever Isaac Sim is: SO-101 and `mesh_box` on PhysX against
+/// Oracle 2's shape, runnable wherever Isaac Sim is: SO-101 and `mesh_box` on `PhysX` against
 /// mujoco-cpu with the same seeded control, printed (numbers recorded, no tolerance claimed),
-/// and a PhysX rerun that is compared with the first.
+/// and a `PhysX` rerun that is compared with the first.
 #[test]
 fn physx_against_mujoco_cpu_is_measured() {
     if let Err(reason) = PhysXBackend::is_available() {

@@ -3,6 +3,7 @@
 use es_assets::scene::SceneDesc;
 use es_physics_backend::{
     compare_backends, mapping_report, BackendKind, MjWarpBackend, MuJoCoCpuBackend, NewtonBackend,
+    PhysXBackend,
 };
 use es_physics_core::{LoadConfig, PhysicsBackend};
 
@@ -17,7 +18,8 @@ semantic-mapping report (spec 17.2) -- always, even when the backend is unavaila
 yet implemented. Then, for every pair of requested backends that are both available and not
 blocked by their mapping report, runs the same scene on both from a shared reset state and
 prints a spec 3.5 tier 3 comparison (spec 14.4: a mapping blocked by severity error never
-runs). `physx` has no adapter yet and prints a `not implemented (M2/M3)` row.
+runs). `physx` needs ES_ISAAC_PYTHON (the Isaac Sim interpreter, packet M11/I1);
+ES_PHYSX_DEVICE=cpu|cuda:0 picks its pipeline.
 
     --scene <path>     MJCF (.xml) or URDF (.urdf) scene file
     --task <path>      Task IR TOML; reads its SceneRef path (must not be hash-only)
@@ -178,21 +180,14 @@ fn make_backend(kind: BackendKind) -> Box<dyn PhysicsBackend> {
         BackendKind::MuJoCoCpu => Box::new(MuJoCoCpuBackend::new()),
         BackendKind::MjWarp => Box::new(MjWarpBackend::new()),
         BackendKind::Newton => Box::new(NewtonBackend::new()),
-        BackendKind::PhysX => {
-            unreachable!("physx is never in the `available` list")
-        }
+        BackendKind::PhysX => Box::new(PhysXBackend::new()),
     }
 }
 
 /// `Ok(())` when the backend is implemented and its Python side is reachable; `Err(reason)`
-/// otherwise, `physx` included (spec 17.1: no adapter until M3).
+/// otherwise.
 fn availability(kind: BackendKind) -> Result<(), String> {
-    match kind {
-        BackendKind::MuJoCoCpu => MuJoCoCpuBackend::is_available(),
-        BackendKind::MjWarp => MjWarpBackend::is_available(),
-        BackendKind::Newton => NewtonBackend::is_available(),
-        BackendKind::PhysX => Err("not implemented (M2/M3)".to_owned()),
-    }
+    es_physics_backend::is_available(kind)
 }
 
 fn ctrl_seq(nu: u32, n_envs: u32, n_ticks: u32, random: bool, seed: u64) -> Vec<Vec<f64>> {

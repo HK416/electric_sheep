@@ -9,22 +9,17 @@
 //!     cargo test -p es-physics-backend backend_identity
 
 use es_physics_backend::{
-    backend_identity, hardware_capability, mjwarp, mujoco, newton, BackendKind,
+    backend_identity, hardware_capability, mjwarp, mujoco, newton, physx, BackendKind,
 };
 use es_physics_core::Capabilities;
 
-/// The declared capabilities of every name in the spec 17.2 table. `PhysX` has no adapter yet
-/// (M11/I1), so its row is the `MJWarp` declaration under the `PhysX` name: the digest must still
-/// tell the two apart, which is the point.
+/// The declared capabilities of every name in the spec 17.2 table.
 fn caps(kind: BackendKind) -> Capabilities {
     match kind {
         BackendKind::MuJoCoCpu => mujoco::capabilities(),
         BackendKind::MjWarp => mjwarp::capabilities(),
         BackendKind::Newton => newton::capabilities(),
-        BackendKind::PhysX => Capabilities {
-            name: "physx".to_owned(),
-            ..mjwarp::capabilities()
-        },
+        BackendKind::PhysX => physx::capabilities(),
     }
 }
 
