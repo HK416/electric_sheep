@@ -913,8 +913,8 @@ fn video_mosaic_missing_events_is_exit_1() {
 }
 
 /// The shared MJCF fixture (`option cone="elliptic"`), also used by `es-physics-backend`'s own
-/// mapping tests: it blocks `mjwarp` (spec 17.2 maps `MJWarp`'s cone to pyramidal only) but not
-/// `mujoco-cpu`.
+/// mapping tests: it blocks `newton` (whose adapter does not map the elliptic cone) but not
+/// `mujoco-cpu`, nor `mjwarp` since the spec 17.2 footnote (packet M11/X1).
 fn pendulum_fixture() -> PathBuf {
     Path::new(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -929,7 +929,7 @@ fn backend_compare_blocked_backend_exits_1() {
     let out = bin()
         .args(["backend", "compare", "--scene"])
         .arg(&scene)
-        .args(["--backends", "mujoco-cpu,mjwarp"])
+        .args(["--backends", "mujoco-cpu,newton"])
         .output()
         .expect("run es");
     let text = stdout(&out);
@@ -938,12 +938,12 @@ fn backend_compare_blocked_backend_exits_1() {
         "{text}"
     );
     assert!(
-        text.contains("semantic mapping report - backend `mjwarp`"),
+        text.contains("semantic mapping report - backend `newton`"),
         "{text}"
     );
-    // `mjwarp` maps the scene's elliptic friction cone to `blocked` (spec 17.2/14.4)
-    // regardless of whether a Python `mujoco_warp` is installed, so it is always skipped.
-    assert!(text.contains("backend `mjwarp`: SKIPPED"), "{text}");
+    // `newton` blocks the scene's elliptic friction cone (spec 17.2/14.4) regardless of
+    // whether a Python `newton` is installed, so it is always skipped.
+    assert!(text.contains("backend `newton`: SKIPPED"), "{text}");
     assert_eq!(
         out.status.code(),
         Some(1),
@@ -1312,24 +1312,24 @@ fn eval_run_backend_unknown_is_a_usage_error() {
     }
 }
 
-/// The demo scene declares `cone="elliptic"` and spec 17.2 pins the `MJWarp` friction cone to
-/// pyramidal, so `--backend mjwarp` on the demo documents is refused by the mapping report,
-/// naming the row, before any interpreter is probed -- measured while writing this packet,
-/// and the reason oracle 5 cannot run on the committed documents as they stand.
+/// The demo scene declares `cone="elliptic"`. Since the spec 17.2 footnote (packet M11/X1)
+/// that maps on `MJWarp` as a tier 2 row, so the gate passes and, without an interpreter, the
+/// run is the SKIPPED exit 3 -- not a mapping refusal.
 #[test]
-fn eval_run_backend_mjwarp_refuses_the_elliptic_demo_scene() {
+fn eval_run_backend_mjwarp_maps_the_elliptic_demo_scene() {
     for verb in BACKEND_VERBS {
         let out = run_on_backend(verb, "mjwarp", Some("es-no-such-python"));
-        let err = stderr_of(&out);
+        let text = stdout(&out);
         assert_eq!(
             out.status.code(),
-            Some(1),
-            "{verb}:\n{}\n{err}",
-            stdout(&out)
+            Some(3),
+            "{verb}:\n{text}\n{}",
+            stderr_of(&out)
         );
-        assert!(err.contains("backend `mjwarp`"), "{verb}: {err}");
-        assert!(err.contains("blocked: yes"), "{verb}: {err}");
-        assert!(err.contains("ContactElliptic"), "{verb}: {err}");
+        assert!(
+            text.contains("SKIPPED (mjwarp backend unavailable"),
+            "{verb}: {text}"
+        );
     }
 }
 

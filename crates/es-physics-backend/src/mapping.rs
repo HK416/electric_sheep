@@ -296,11 +296,14 @@ fn mjwarp(feature: TaskFeature) -> Mapping {
         TaskFeature::Spec17(Spec17Row::ActuatorPd) => {
             Mapping::native("position gain (spec 17.2), kp / kv on a position actuator")
         }
-        TaskFeature::Spec17(Spec17Row::ContactFrictionCone)
-        | TaskFeature::Capability(Feature::ContactPyramidal) => Mapping::native("pyramidal"),
-        TaskFeature::Capability(Feature::ContactElliptic) => Mapping::blocked(
-            "spec 17.2 maps MJWarp's friction cone to pyramidal; running an elliptic scene here \
-             would change contact dynamics silently",
+        TaskFeature::Spec17(Spec17Row::ContactFrictionCone) => {
+            Mapping::native("selectable: pyramidal or elliptic, as the scene asks (spec 17.2)")
+        }
+        TaskFeature::Capability(Feature::ContactPyramidal) => Mapping::native("pyramidal"),
+        // The owner's decision after packet M11/X1 (spec 17.2 footnote): a tier 2 row, run
+        // and reported with the difference named, not refused.
+        TaskFeature::Capability(Feature::ContactElliptic) => Mapping::approximated(
+            "elliptic cone as the scene asks (spec 17.2 footnote, tier 2): contact rows differ from mujoco-cpu -- the SO-101 cube's free joint by 0.103 over 1,000 steps (M11/X1)",
         ),
         TaskFeature::Spec17(Spec17Row::ContactSoftParams)
         | TaskFeature::Capability(Feature::ContactSoftParams) => {
@@ -829,7 +832,7 @@ mod tests {
         let is_native = |m: Mapping| matches!(m.status, Status::Native(_));
         let is_approx = |m: Mapping| matches!(m.status, Status::Approximated(_));
 
-        // MJWarp: position gain, pyramidal, impedance, armature, sensor.
+        // MJWarp: position gain, selectable (footnote), impedance, armature, sensor.
         assert!(is_native(cell(ActuatorPd, MjWarp)));
         assert!(is_native(cell(ContactFrictionCone, MjWarp)));
         assert!(is_native(cell(ContactSoftParams, MjWarp)));
@@ -871,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn the_pendulum_is_blocked_on_mjwarp_and_not_on_mujoco_cpu() {
+    fn the_elliptic_pendulum_maps_on_mjwarp_with_the_difference_named() {
         let pendulum = scene("pendulum.xml");
         let cpu = mapping_report(&pendulum, BackendKind::MuJoCoCpu);
         assert!(!cpu.blocked, "{cpu}");
@@ -890,14 +893,21 @@ mod tests {
             "{features:?}"
         );
 
+        // Since the spec 17.2 footnote (packet M11/X1) the elliptic cone maps on MJWarp as an
+        // approximated, warning-severity row: the run goes ahead with the difference named.
         let warp = mapping_report(&pendulum, BackendKind::MjWarp);
-        assert!(warp.blocked, "{warp}");
-        let blocking: Vec<String> = warp.blocking().map(|r| r.feature.to_string()).collect();
-        assert_eq!(blocking, vec!["ContactElliptic".to_owned()]);
+        assert!(!warp.blocked, "{warp}");
+        let elliptic = warp
+            .rows
+            .iter()
+            .find(|r| r.feature.to_string() == "ContactElliptic")
+            .expect("the elliptic row is reported");
+        assert!(matches!(elliptic.mapping.status, Status::Approximated(_)));
+        assert_eq!(elliptic.mapping.severity, Severity::Warning);
         // The rendered table is what `es backend compare` prints.
         let text = warp.to_string();
-        assert!(text.contains("blocked: yes"));
-        assert!(text.contains("unsupported"));
+        assert!(text.contains("blocked: no"));
+        assert!(text.contains("approximated"));
         assert!(text.lines().count() > 4);
     }
 

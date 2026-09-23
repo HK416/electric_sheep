@@ -24,13 +24,23 @@ as **unverified** (no GPU in CI). Failures surface as protocol errors, never as 
 
 import copy
 import json
+import os
 import sys
 
 # `warp` prints an initialization banner ("Warp x.y.z initialized:" and a device table) on
 # stdout, and stdout is the protocol. The real handle is taken first and everything else --
-# imports, `wp.init()`, any future chatter -- is pointed at stderr, which Rust discards.
-_OUT = sys.stdout
+# imports, `wp.init()`, any future chatter -- is pointed at stderr, which Rust discards. At the
+# *descriptor* level, not just `sys.stdout`: a kernel's `printf` (mujoco_warp's "nefc overflow"
+# warning, say) writes to fd 1 from C and would otherwise land mid-protocol (packet M11/X1).
+_OUT = os.fdopen(os.dup(1), "w")
+os.dup2(2, 1)
 sys.stdout = sys.stderr
+
+# Per-world constraint and contact capacity. mujoco_warp sizes these from the model when not
+# told, and on the SO-101 scene that is too small (`nefc overflow ... njmax beyond 64`), which
+# drops constraints silently. A declared bound, not a measurement (packet M11/X1).
+NJMAX = 1024
+NCONMAX = 256
 
 try:
     import mujoco
@@ -111,7 +121,9 @@ class Sim(object):
         self.mjd = mujoco.MjData(self.mjm)
         mujoco.mj_forward(self.mjm, self.mjd)
         self.m = mjw.put_model(self.mjm)
-        self.d = mjw.put_data(self.mjm, self.mjd, nworld=n_envs)
+        self.d = mjw.put_data(
+            self.mjm, self.mjd, nworld=n_envs, nconmax=NCONMAX, njmax=NJMAX
+        )
         # Per-env CPU models and the model fields made per-world, both only once `set_params`
         # is called; until then every world shares the one loaded model.
         self.models = None
@@ -238,10 +250,35 @@ class Sim(object):
             "act": int(self.mjm.na),
         }
 
+    def unit_quaternions(self, qpos, rows):
+        """A zero free- or ball-joint quaternion becomes MuJoCo's identity `(1, 0, 0, 0)`.
+
+        `mj_normalizeQuat` on mujoco-cpu turns a zero quaternion into wxyz identity; mujoco_warp
+        normalises it to `(0, 0, 0, 1)` read as wxyz -- a half turn about z. The env writes zeros
+        for every coordinate a reset does not draw (a free joint's orientation included), so
+        without this the same reset is two different poses on the two backends (packet M11/X1,
+        measured on the SO-101 cube).
+        """
+        model = self.mjm
+        nq = int(model.nq)
+        for i in range(model.njnt):
+            kind = int(model.jnt_type[i])
+            if kind not in (0, 1):  # free, ball
+                continue
+            adr = int(model.jnt_qposadr[i]) + (3 if kind == 0 else 0)
+            for row in range(rows):
+                quat = qpos[row * nq + adr : row * nq + adr + 4]
+                if len(quat) == 4 and not any(quat):
+                    qpos[row * nq + adr : row * nq + adr + 4] = [1.0, 0.0, 0.0, 0.0]
+        return qpos
+
     def write_state(self, state, envs):
         widths = self.widths()
         for field in ("qpos", "qvel", "act"):
-            self.write_field(field, state.get(field), envs, widths[field])
+            values = state.get(field)
+            if field == "qpos" and values:
+                values = self.unit_quaternions(list(values), len(envs))
+            self.write_field(field, values, envs, widths[field])
         mjw.forward(self.m, self.d)
 
     def reset(self, envs, state):

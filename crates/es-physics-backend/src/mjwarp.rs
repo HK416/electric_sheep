@@ -56,8 +56,6 @@ pub const SCRIPT: &str = include_str!("../python/mjwarp_ref.py");
 pub fn capabilities() -> Capabilities {
     let cpu = crate::mujoco::capabilities();
     let mut contact = cpu.contact;
-    // spec 17.2 maps MJWarp's friction cone to pyramidal.
-    contact.remove(&Feature::ContactElliptic);
     // Unverified against the engine, so not declared (TODO(api-notes)).
     contact.remove(&Feature::ContactCondim6);
     // The inline `<asset><mesh>` mujoco-cpu emits was never run through MJWarp's own convex
@@ -65,9 +63,11 @@ pub fn capabilities() -> Capabilities {
     contact.remove(&Feature::ContactMesh);
     let mut quirks = cpu.quirks;
     quirks.push(BackendQuirk::new(
-        Feature::ContactPyramidal,
-        "spec 17.2 pins MJWarp's friction cone to pyramidal; an elliptic scene is refused by \
-         name rather than silently re-coned",
+        Feature::ContactElliptic,
+        "the friction cone is the scene's, pyramidal or elliptic (spec 17.2 footnote); an \
+         elliptic scene is a tier 2 row whose contacts differ from mujoco-cpu -- measured on \
+         SO-101, the cube's free joint by 0.103 over 1,000 steps while the arm joints agree to \
+         1.1e-5 (packet M11/X1)",
     ));
     quirks.push(BackendQuirk::new(
         Feature::JointArmature,
@@ -393,8 +393,8 @@ mod tests {
         };
     }
 
-    /// Pyramidal cone (the MJCF default), so the scene is mappable on `MJWarp`; `pendulum.xml`
-    /// asks for an elliptic one and is refused by design.
+    /// Pyramidal cone (the MJCF default); `pendulum.xml` asks for an elliptic one, which maps
+    /// too since the spec 17.2 footnote (packet M11/X1).
     const PENDULUM: &str = r#"<mujoco model="warp-pendulum">
          <option timestep="0.001" gravity="0 0 -9.81"/>
          <worldbody><body name="rod" pos="0 0 1">
@@ -433,8 +433,8 @@ mod tests {
         assert_eq!(caps.batch.max_envs, MAX_ENVS);
         assert_eq!(caps.float, FloatPrecision::F32);
         assert!(caps.has(Feature::JointHinge) && caps.has(Feature::ContactPyramidal));
-        // spec 17.2 pins the cone to pyramidal.
-        assert!(!caps.has(Feature::ContactElliptic));
+        // spec 17.2's footnote: the cone is the scene's, elliptic included (tier 2).
+        assert!(caps.has(Feature::ContactElliptic));
         assert!(!caps.quirks.is_empty());
     }
 
@@ -463,20 +463,22 @@ mod tests {
     /// before a process is spawned, so this holds with or without `MuJoCo` Warp installed.
     #[test]
     fn a_blocked_scene_is_refused_with_the_report_as_the_message() {
-        let elliptic = es_assets::parse_mjcf(
-            r#"<mujoco><option cone="elliptic"/><worldbody><body name="b">
+        // A `general` actuator: the shared emitter cannot write one, so the row blocks.
+        let general = es_assets::parse_mjcf(
+            r#"<mujoco><worldbody><body name="b">
                  <joint name="j" type="hinge"/><geom name="g" type="sphere" size="0.1"/>
-               </body></worldbody></mujoco>"#,
+               </body></worldbody>
+               <actuator><general name="a" joint="j"/></actuator></mujoco>"#,
         )
         .unwrap()
         .scene;
         let err = MjWarpBackend::new()
-            .load(&elliptic, &LoadConfig::default())
+            .load(&general, &LoadConfig::default())
             .unwrap_err();
         let PhysicsError::Unsupported(message) = &err else {
             panic!("expected an unsupported failure, got {err:?}");
         };
-        assert!(message.contains("ContactElliptic"), "{message}");
+        assert!(message.contains("ActuatorGeneral"), "{message}");
         assert!(message.contains("blocked: yes"), "{message}");
         assert!(message.contains("spec 17.2"), "{message}");
     }

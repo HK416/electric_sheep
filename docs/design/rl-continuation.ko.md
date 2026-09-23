@@ -97,13 +97,12 @@ IR이 선언한 그대로 남는다(INV-11..13 — 다른 선택지인 엔벨로
 결코 비트 단위로 같지 않으며, `train_rl_two_runs_are_bitwise`는 계속 `mujoco-cpu`에 대한
 진술로만 남는다.
 
-**도입 시점에 측정한 것: 스펙이 지금 그대로라면 reach 장면은 `mjwarp`에서 돌 수 없다.**
-`so101_pick_place.xml`은 `cone="elliptic"`을 선언하고 스펙 17.2는 MJWarp의 마찰 원뿔을
-피라미드형으로 고정하므로, reach 문서에 대한 `Rollout(…, backend="mjwarp")`은 프로세스가 뜨기
-전에 `MjWarpBackend::load` 안의 매핑 리포트에 의해 거부된다(`ContactElliptic`, severity
-`error`; `rollout_backend_mjwarp_refuses_the_elliptic_reach_scene`). 설치된 `mujoco_warp`는
-타원 원뿔을 구현한다. 스펙 17.2의 행이 그것을 따라가야 하는지는 사람의 결정이며,
-`evaluation-execution.ko.md` 2.8에 기록되어 있다.
+**측정: 스펙 17.2 각주 이후 reach 장면은 `mjwarp`에서 돈다.** `so101_pick_place.xml`은
+`cone="elliptic"`을 선언하고, MJWarp는 그것을 tier 2 행으로 매핑한다(이 패킷의 첫 측정 뒤 소유자의
+결정). reach 레시피에 `[rl] backend = "mjwarp"`로 돌린 20 반복 PPO 스모크는 28 s에 끝났다(평균
+리턴 −15.8 → −6.6). 수치와 그것에 필요했던 어댑터 수정 둘은 `evaluation-execution.ko.md` 2.8에
+있다. `rollout_backend_mjwarp_steps_the_reach_documents`(ignored, `mujoco_warp` 필요)는 reach
+문서를 두 엔진에서 스텝하고 거리를 출력한다.
 
 ## 3. 롤아웃에서의 지연시간과 청킹
 

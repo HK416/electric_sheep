@@ -498,7 +498,7 @@ version ‖ threads as u32 LE)`다. `evaluation.lock`은 그 수를 `runtime_thr
 | `--backend` | 오늘 하는 일 |
 |---|---|
 | `mujoco-cpu` (기본값) | 기준(§17.1), tier 1. `hardware_capability` 슬롯은 커밋된 모든 lock이 해시될 때의 전부 0인 값 그대로다 |
-| `mjwarp` | MuJoCo Warp, tier 2(결코 비트 단위가 아니다, §3.5). `ES_PYTHON` 아래에 `mujoco_warp`가 있어야 하고, 없으면 `SKIPPED` 종료 코드 3 |
+| `mjwarp` | MuJoCo Warp, tier 2(결코 비트 단위가 아니다, §3.5, 실행 간에도). `ES_PYTHON` 아래에 `mujoco_warp`가 있어야 하고, 없으면 `SKIPPED` 종료 코드 3. 타원 원뿔은 근사 행으로 매핑된다(스펙 17.2 각주) |
 | `newton` | 아무것도 뜨기 전에 자신의 매핑 리포트에 의해 거부된다: 어댑터가 액추에이터도 센서도 선언하지 않고 접촉도 연결하지 않으므로, `es backend compare`의 개루프 전용이다 |
 | `physx` | 거부: `not implemented (M11/I1)` |
 | 그 밖의 이름 | 네 이름을 나열하는 사용법 오류(종료 코드 2) |
@@ -522,46 +522,73 @@ float와 tier는 lock의 `backend` 블록이 쓰는 철자 그대로다. `hardwa
 
 #### 측정, 오라클 서버 (RTX 4090, 16코어), 2026-09-23 UTC
 
-바이너리: 이 트리(`a737a04`)와 그 부모(`f161d24`, X1 이전), 둘 다 서버에서 빌드. 행이 따로 말하지
-않으면 `ES_PYTHON=~/venvs/es`(mujoco 3.13.0, mujoco_warp 3.13.0, warp 1.17.0, torch
-2.14.0+cpu). 산출물 `~/artifacts/plan-x/x1/`.
+트리 `7b1004d`(스펙 17.2 각주 적용: MJWarp는 타원 원뿔을 tier 2 행, `Approximated`, severity
+`warning`으로 매핑한다), 서버에서 빌드. 행이 따로 말하지 않으면 `ES_PYTHON=~/venvs/es`(mujoco
+3.13.0, mujoco_warp 3.13.0, warp 1.17.0, torch 2.14.0+cpu). 체크포인트는 W0b의 것이다(S4e와
+M7/U의 것은 W0b의 `scene_hash`보다 오래되어 `XIR-040`으로 거부된다): reach A0
+`plan-w/w0b/reach/seed0/checkpoints/4000.esb`를 `evaluation-reach.toml`(`66ef84a5…`)로, 데모 U3
+`plan-w/w0b/U3/m7u-repacked.esb`를 W0b의 `evaluation-augmented.toml`(`007aac67…`)로
+`--jobs 6 --frames`와 함께, W0b가 돌린 그대로. 산출물 `~/artifacts/plan-x/x1/s2/`, `es eval compare`
+출력은 `compare.log`.
 
-| 실행 | 백엔드 | `execution_hash` | 결과 |
-|---|---|---|---|
-| reach A0 (W0b seed 0, `4000.esb`), `evaluation-reach.toml` (`66ef84a5…`) | `mujoco-cpu`, 이 트리 | `08851281…5e93` | `nominal` 성공률 0.5625; `engine_version` `mujoco 3.13.0` |
-| 같음 | `mujoco-cpu`, X1 이전 바이너리 | `08851281…5e93` | `report.json`이 위 행과 바이트 단위로 같다 |
-| 같음, 이 트리로 한 번 더 | `mujoco-cpu` | `08851281…5e93` | 바이트 단위로 같다 (tier 1) |
-| 같음 | `mjwarp` (실행 1, 실행 2) | — | **거부**, 종료 코드 1: 매핑 리포트 `ContactElliptic unsupported error`, 어떤 프로세스보다 먼저 |
-| 그 체크포인트에 대한 W0b 자신의 실행, `~/venvs/es-lerobot-cuda` | `mujoco-cpu`, W0b 바이너리 | `145bc81a…934f` | 지표는 같다; 해시는 인터프리터의 torch(`runtime_hash`) 때문에 다르며, 그래서 같은 인터프리터 위의 X1 이전 바이너리가 이 패킷을 떼어 내 보는 행이다 |
-| 데모 U3 (W0b가 다시 묶은 `m7u-repacked.esb`), 그 자신의 `evaluation-augmented.toml` (`007aac67…`), `--jobs 6 --frames`, W0b가 돌린 대로 `ES_PYTHON=~/venvs/es-lerobot-cuda` | `mujoco-cpu`, 이 트리 | `2925ce8a…09a3` | W0b 4c 단계에 기록된 해시와 같다; `report.json`이 W0b의 것과 바이트 단위로 같다 (nominal 0.5625); 223 s |
-| 같음 | `mjwarp` | — | **거부**, 같은 행 |
-| reach 문서 위의 `es_native.Rollout`, env 2개 | `mujoco-cpu` / `mjwarp` / `newton` / `physx` | — | 생성됨 / `ContactElliptic`로 거부 / `ActuatorPosition, ActuatorOnJoint, ContactElliptic, ContactCondim6`로 거부 / `not implemented (M11/I1)` |
+Reach A0 — 스위트별 성공률 / `envelope_violation_rate` / `episode_length`:
 
-**발견: 이 패킷의 폐루프 비교는 커밋된 문서 위에서 돌 수 없다.** 데모와 reach 작업 둘 다의 장면인
-`so101_pick_place.xml`은 `cone="elliptic"`을 선언하고, 스펙 17.2는 MJWarp의 마찰 원뿔을
-피라미드형으로 고정하므로, 매핑 리포트가 두 문서의 모든 `mjwarp` 실행을 막는다(그것들 위의
-20 반복 `Rollout` PPO 스모크도). 이것은 관문이 제 일을 한 것이지(§14.4) 디스패치의 결함이 아니다:
-MJWarp 위에서는 아무것도 돌지 않았으므로 이 표에 넣을 `mjwarp` `execution_hash`가 없고, 비트 단위로
-같다고든 아니라고든 보고되는 MJWarp 수치도 없다. 패킷이 이름 붙인 reach A0 체크포인트
-(`~/artifacts/plan-s/s4e/run-4000`)와 M7/U의 U3 체크포인트는 W0b의 `scene_hash`보다 오래됐으므로
-이 트리의 `evaluation-reach.toml` / `evaluation.toml`은 그것들을 판정하지 않는다(`XIR-040`). 위의
-행들은 W0b가 다시 측정한, 가중치가 같은 바이트인 대응물을 쓴다. 어차피 `evaluation.toml`은 U3를
-판정하지 않는다: U3는 `observation-augmented.toml`로 묶였다.
+| 실행 | `execution_hash` | nominal | observation_delay | torque_noise | backlash |
+|---|---|---|---|---|---|
+| `mujoco-cpu` | `08851281…5e93` | 0.5625 / 1.00 / 129.4 | 0.3125 / 1.00 / 170.3 | 0.5000 / 1.00 / 127.6 | 0.5000 / 1.00 / 130.6 |
+| `mjwarp` 실행 1 | `4be0e691…2975` | 0.4375 / 1.00 / 140.1 | 0.1875 / 1.00 / 179.3 | 0.6250 / 1.00 / 113.6 | 0.5000 / 1.00 / 130.8 |
+| `mjwarp` 실행 2 | `4be0e691…2975` | 0.4375 / 1.00 / 140.3 | 0.1250 / 1.00 / 181.8 | 0.5625 / 1.00 / 116.2 | 0.5000 / 1.00 / 129.6 |
 
-**엔진 자체가 타원 장면으로 하는 일** (결정을 위한 증거이며 `es` 밖이다: 원시 MJCF에 대한
-`mujoco_warp.put_model`, 월드 1개, 고정된 사인파 제어로 1,000 스텝, `mujoco.mj_step` 옆에서).
-mujoco_warp 3.13.0은 타원 원뿔을 구현하고(`constraint.py`의 `IS_ELLIPTIC` 경로) 장면을 돌린다:
-내내 유한하다. CPU 엔진 대비 최대 |Δqpos|는 **팔 관절 여섯 개에서 1.1e-5**, **전체에서 0.103**이며
-후자는 큐브의 자유 관절에서, 이미 처음 100 스텝 안에 나온다. MJWarp 두 번의 실행은 비트 단위로
-같지 **않고**(최대 |Δ| 1.0e-6), 솔버가 10회 반복 한도에 닿았다고 경고한다. 첫 시도는 Warp의 커널
-캐시에서 죽었고(`KeyError … ccd_kernel … smem_bytes`) 똑같은 두 번째 시도는 돌았다 — 조용히
-재시도해 덮지 않고 보고한다.
+데모 U3:
 
-**사람이 결정해야 하는 것** (어느 것도 이 패킷이 정할 일이 아니다): 스펙 17.2의 MJWarp 행이 엔진을
-따라 `elliptic`으로 가는지(스펙과 `mapping.rs`의 변경이며, 위 수치에 대해 측정된다), 아니면 비교를
-장면의 피라미드형 변형 위에서 하는지(새 문서, 새 `scene_hash`, 다시 학습한 체크포인트). 그때까지
-`--backend mjwarp`는 관문, SKIPPED 경로, 식별자, 단형화된 디스패치 위에서 증명되었을 뿐, 폐루프
-수치 위에서 증명된 것은 아니다.
+| 실행 | `execution_hash` | nominal | light_intensity | light_direction | observation_delay | torque_noise | backlash |
+|---|---|---|---|---|---|---|---|
+| `mujoco-cpu`, `~/venvs/es-lerobot-cuda` (W0b의 것) | `2925ce8a…09a3` | 0.5625 / 0.667 / 1092 | 0.6250 / 0.624 / 921 | 0.1875 / 0.727 / 1635 | 0.2500 / 0.651 / 1502 | 0.0000 / 0.716 / 1800 | 0.4375 / 0.703 / 1244 |
+| `mujoco-cpu`, `~/venvs/es` | `d35c74c3…9c65` | 셀마다 동일 | | | | | |
+| `mjwarp` 실행 1 | `a88643d8…fb25` | 0.2500 / 0.649 / 1438 | 0.5625 / 0.655 / 943 | 0.3125 / 0.672 / 1362 | 0.3750 / 0.615 / 1282 | 0.0000 / 0.648 / 1800 | 0.6250 / 0.615 / 1100 |
+| `mjwarp` 실행 2 | `a88643d8…fb25` | 0.4375 / 0.627 / 1164 | 0.3750 / 0.718 / 1213 | 0.4375 / 0.696 / 1193 | 0.1875 / 0.655 / 1556 | 0.0000 / 0.694 / 1800 | 0.5000 / 0.542 / 1053 |
+
+수치가 말하는 것:
+
+- **`mujoco-cpu`는 움직이지 않았다.** A0의 `08851281…`은 같은 인터프리터에서 X1 이전 바이너리가
+  쓰는 값이다(리포트가 바이트 단위로 같다; X1의 첫 실행, `~/artifacts/plan-x/x1/a0-cpu-base/`). U3의 `2925ce8a…`는 W0b 4c
+  단계에 기록된 해시이고 리포트는 W0b의 것과 바이트 단위로 같다. 두 U3 `mujoco-cpu` 행은
+  `runtime_hash`(두 인터프리터의 torch)만 다르고 셀마다 일치한다.
+- **`mjwarp`는 자신의 `execution_hash`를 갖는다**(`hardware_capability` = `backend_identity`).
+  lock에는 `engine_version` `mujoco_warp 3.13.0; warp 1.17.0; mujoco 3.13.0`이 있다.
+- **`mjwarp`는 실행 간 재현되지 않는다** — 한 `execution_hash` 아래 두 번의 실행이 두 리포트를
+  낸다(A0 nominal은 같고 observation_delay는 0.1875 대 0.1250; U3 nominal은 0.25 대 0.4375).
+  따라서 §10.4의 "해시가 같으면 리포트가 비트 단위로 같다"는 `mujoco-cpu`에서만 성립하며, 그것이
+  tier 2가 선언하는 바다. `mjwarp` 행은 분포이고, 한 번의 실행은 그 표본이다.
+- **`mujoco-cpu` 대비** A0의 성공률은 스위트마다 최대 0.125, U3는 최대 0.3125(nominal, 실행 1)
+  움직인다 — MJWarp 자신의 실행 간 퍼짐과 같은 크기이므로, 16 에피소드로는 이 표의 한 셀이 엔진의
+  차이와 잡음을 구별하지 못한다. 접촉이 많은 데모가 reach 작업보다 더 퍼진다.
+- **궤적:** A0 nominal-00에서 팔과 큐브는 처음 20 제어 틱 동안 `mujoco-cpu`와 ~1e-7까지 일치하고
+  접촉 뒤에 갈라진다(틱 50에서 0.28 rad).
+- **PPO 스모크:** reach 레시피에 `[rl] backend = "mjwarp"`로 `es train`, 20 반복 × env 16 × 64
+  스텝, 28 s, 종료 코드 0, 체크포인트 묶임, `training_hash` `01eb1067…`. 20 반복 동안 평균 리턴
+  −15.8 → −6.6, `envelope_violation_rate` 1.0(CPU 백엔드에서와 같다).
+
+**첫 실행이 찾은 어댑터 결함 둘, 위 표 이전에 `mjwarp_ref.py`에서 고쳤다.** (1) mujoco_warp의
+커널이 경고를 fd 1로 `printf`하여(`nefc overflow - please increase njmax beyond 64`) 줄 단위
+프로토콜을 깨뜨렸다. 이제 스크립트는 디스크립터 수준에서 fd 1을 stderr로 옮기고 월드마다
+`njmax = 1024`, `nconmax = 256`으로 잡는다(선언된 상한). (2) env는 리셋이 뽑지 않는 모든 좌표에
+0을 쓰며, 큐브 자유 관절의 쿼터니언도 그렇다. MuJoCo는 0 쿼터니언을 wxyz 항등으로 정규화하고,
+mujoco_warp는 wxyz로 읽히는 `(0, 0, 0, 1)` — z축 반 바퀴 — 로 정규화한다. 이제 스크립트는 0인
+free/ball 쿼터니언에 MuJoCo의 항등을 쓰고, 그러면 큐브가 틱 1부터 1e-8까지 일치한다. 고치기 전
+`mjwarp`의 U3는 모든 스위트에서 0.00이었다(`s2-before-quat-fix/`). **어느 수정도 `execution_hash`를
+움직이지 않았다**: 어댑터 스크립트는 `backend_identity`에 없으므로(엔진 버전만 있다) 그 변경은
+해시 체인에 보이지 않는다 — 아래의 열린 질문.
+
+**결정의 근거가 된 증거** (`es` 밖: SO-101 MJCF에 대한 원시 `mujoco_warp.put_model`, 월드 1개,
+고정된 제어로 1,000 스텝, `mujoco.mj_step` 옆에서): 내내 유한; 최대 |Δqpos|는 팔 관절 여섯 개에서
+1.1e-5, 큐브 자유 관절에서 처음 100 스텝 안에 0.103; MJWarp 두 번의 실행은 1.0e-6 다르다; 솔버가
+10회 반복 한도에서 경고한다.
+
+**열린 질문:** `mjwarp_ref.py`의 바이트(또는 스크립트 버전)가 `backend_identity`에 들어가야
+하는가 — 아니면 어댑터 수정이 바뀌지 않은 `execution_hash` 아래서 결과를 바꿀 수 있다. 그리고
+엔진 자신의 실행 간 퍼짐이 0.19일 때 16 에피소드 셀로 sim-to-sim 격차를 읽기에 충분한가(I3의 세
+시드 규칙, §28.14 규칙 7이 자연스러운 다음 단계다).
 
 ## 3. Perturbation 실현 (`perturb.rs`)
 

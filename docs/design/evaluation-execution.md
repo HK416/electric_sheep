@@ -509,7 +509,7 @@ the chosen type — `Evaluation::run_shard_with_sink::<B, …>(…, B::default, 
 | `--backend` | what it does today |
 |---|---|
 | `mujoco-cpu` (default) | the reference (§17.1), tier 1; its `hardware_capability` slot is the all-zero value every committed lock was hashed with |
-| `mjwarp` | MuJoCo Warp, tier 2 (never bitwise, §3.5); needs `mujoco_warp` under `ES_PYTHON`, else `SKIPPED` exit 3 |
+| `mjwarp` | MuJoCo Warp, tier 2 (never bitwise, §3.5, not even run to run); needs `mujoco_warp` under `ES_PYTHON`, else `SKIPPED` exit 3; an elliptic cone maps as an approximated row (spec 17.2 footnote) |
 | `newton` | refused by its mapping report before anything spawns: the adapter declares no actuators or sensors and wires no contacts, so it is `es backend compare`'s open loop only |
 | `physx` | refused: `not implemented (M11/I1)` |
 | anything else | usage error (exit 2) listing the four |
@@ -533,48 +533,75 @@ absent from the bytes when unset, so older locks still parse).
 
 #### Measured, oracle server (RTX 4090, 16 cores), 2026-09-23 UTC
 
-Binaries: this tree (`a737a04`) and its parent (`f161d24`, pre-X1), both built on the server;
-`ES_PYTHON=~/venvs/es` (mujoco 3.13.0, mujoco_warp 3.13.0, warp 1.17.0, torch 2.14.0+cpu) unless
-a row says otherwise. Artifacts `~/artifacts/plan-x/x1/`.
+Tree `7b1004d` (the spec 17.2 footnote applied: MJWarp maps the elliptic cone as a tier 2 row,
+`Approximated`, severity `warning`), built on the server; `ES_PYTHON=~/venvs/es` (mujoco 3.13.0,
+mujoco_warp 3.13.0, warp 1.17.0, torch 2.14.0+cpu) unless a row says otherwise. Checkpoints are
+W0b's (the S4e and M7/U ones predate W0b's `scene_hash` and are refused by `XIR-040`): reach A0
+`plan-w/w0b/reach/seed0/checkpoints/4000.esb` on `evaluation-reach.toml` (`66ef84a5…`), demo U3
+`plan-w/w0b/U3/m7u-repacked.esb` on W0b's `evaluation-augmented.toml` (`007aac67…`) with
+`--jobs 6 --frames`, as W0b ran it. Artifacts `~/artifacts/plan-x/x1/s2/`; `es eval compare`
+output in `compare.log`.
 
-| run | backend | `execution_hash` | result |
-|---|---|---|---|
-| reach A0 (W0b seed 0, `4000.esb`), `evaluation-reach.toml` (`66ef84a5…`) | `mujoco-cpu`, this tree | `08851281…5e93` | `nominal` success 0.5625; `engine_version` `mujoco 3.13.0` |
-| same | `mujoco-cpu`, pre-X1 binary | `08851281…5e93` | `report.json` byte-identical to the row above |
-| same, this tree again | `mujoco-cpu` | `08851281…5e93` | byte-identical (tier 1) |
-| same | `mjwarp` (run 1 and run 2) | — | **refused**, exit 1: mapping report `ContactElliptic unsupported error`, before any process |
-| W0b's own run of that checkpoint, `~/venvs/es-lerobot-cuda` | `mujoco-cpu`, W0b binary | `145bc81a…934f` | same metrics; the hash differs by the interpreter's torch (`runtime_hash`), which is why the pre-X1 binary on the same interpreter is the row that isolates this packet |
-| demo U3 (W0b's re-packed `m7u-repacked.esb`), its `evaluation-augmented.toml` (`007aac67…`), `--jobs 6 --frames`, `ES_PYTHON=~/venvs/es-lerobot-cuda` as W0b ran it | `mujoco-cpu`, this tree | `2925ce8a…09a3` | = W0b stage 4c's recorded hash; `report.json` byte-identical to W0b's (nominal 0.5625); 223 s |
-| same | `mjwarp` | — | **refused**, same row |
-| `es_native.Rollout` on the reach documents, 2 envs | `mujoco-cpu` / `mjwarp` / `newton` / `physx` | — | built / refused `ContactElliptic` / refused `ActuatorPosition, ActuatorOnJoint, ContactElliptic, ContactCondim6` / `not implemented (M11/I1)` |
+Reach A0 — success rate / `envelope_violation_rate` / `episode_length` per suite:
 
-**The finding: the packet's closed-loop comparison cannot run on the committed documents.**
-`so101_pick_place.xml` — the scene of both the demo and the reach task — declares
-`cone="elliptic"`, and spec 17.2 pins MJWarp's friction cone to pyramidal, so the mapping report
-blocks every `mjwarp` run of both documents (and the 20-iteration `Rollout` PPO smoke with them).
-That is the gate doing its job (§14.4), not a defect of the dispatch: nothing ran on MJWarp, so
-there is no `mjwarp` `execution_hash` to put in this table, and no MJWarp number is reported as
-bitwise or otherwise. The reach A0 checkpoint named in the packet
-(`~/artifacts/plan-s/s4e/run-4000`) and the M7/U U3 checkpoint predate W0b's `scene_hash`, so
-`evaluation-reach.toml` / `evaluation.toml` of this tree do not judge them (`XIR-040`); the rows
-above use W0b's re-measured equivalents, whose weights are the same bytes. `evaluation.toml` does
-not judge U3 in any case: U3 was packed with `observation-augmented.toml`.
+| run | `execution_hash` | nominal | observation_delay | torque_noise | backlash |
+|---|---|---|---|---|---|
+| `mujoco-cpu` | `08851281…5e93` | 0.5625 / 1.00 / 129.4 | 0.3125 / 1.00 / 170.3 | 0.5000 / 1.00 / 127.6 | 0.5000 / 1.00 / 130.6 |
+| `mjwarp` run 1 | `4be0e691…2975` | 0.4375 / 1.00 / 140.1 | 0.1875 / 1.00 / 179.3 | 0.6250 / 1.00 / 113.6 | 0.5000 / 1.00 / 130.8 |
+| `mjwarp` run 2 | `4be0e691…2975` | 0.4375 / 1.00 / 140.3 | 0.1250 / 1.00 / 181.8 | 0.5625 / 1.00 / 116.2 | 0.5000 / 1.00 / 129.6 |
 
-**What the engine itself does with the elliptic scene** (evidence for the decision, outside `es`:
-`mujoco_warp.put_model` on the raw MJCF, one world, 1,000 steps of a fixed sinusoidal control, next
-to `mujoco.mj_step`). mujoco_warp 3.13.0 implements the elliptic cone (`constraint.py`'s
-`IS_ELLIPTIC` paths) and runs the scene: finite throughout; max |Δqpos| against the CPU engine
-**1.1e-5 on the six arm joints** and **0.103 overall**, the latter on the cube's free joint and
-already within the first 100 steps; two MJWarp runs are **not** bitwise (max |Δ| 1.0e-6), and it
-warns that the solver hit its 10-iteration limit. The first attempt died in Warp's kernel cache
-(`KeyError … ccd_kernel … smem_bytes`) and the identical second one ran — reported, not retried
-into silence.
+Demo U3:
 
-**What a human has to decide** (none of it is this packet's to take): whether spec 17.2's MJWarp
-row follows the engine to `elliptic` (a spec and `mapping.rs` change, measured against the numbers
-above), or the comparison is run on a pyramidal variant of the scene (new documents, new
-`scene_hash`, retrained checkpoints). Until then `--backend mjwarp` is proven on the gate, the
-SKIPPED path, the identity and the monomorphized dispatch, and not on a closed-loop number.
+| run | `execution_hash` | nominal | light_intensity | light_direction | observation_delay | torque_noise | backlash |
+|---|---|---|---|---|---|---|---|
+| `mujoco-cpu`, `~/venvs/es-lerobot-cuda` (W0b's) | `2925ce8a…09a3` | 0.5625 / 0.667 / 1092 | 0.6250 / 0.624 / 921 | 0.1875 / 0.727 / 1635 | 0.2500 / 0.651 / 1502 | 0.0000 / 0.716 / 1800 | 0.4375 / 0.703 / 1244 |
+| `mujoco-cpu`, `~/venvs/es` | `d35c74c3…9c65` | identical cell for cell | | | | | |
+| `mjwarp` run 1 | `a88643d8…fb25` | 0.2500 / 0.649 / 1438 | 0.5625 / 0.655 / 943 | 0.3125 / 0.672 / 1362 | 0.3750 / 0.615 / 1282 | 0.0000 / 0.648 / 1800 | 0.6250 / 0.615 / 1100 |
+| `mjwarp` run 2 | `a88643d8…fb25` | 0.4375 / 0.627 / 1164 | 0.3750 / 0.718 / 1213 | 0.4375 / 0.696 / 1193 | 0.1875 / 0.655 / 1556 | 0.0000 / 0.694 / 1800 | 0.5000 / 0.542 / 1053 |
+
+What the numbers say:
+
+- **`mujoco-cpu` is unmoved.** A0's `08851281…` is what the pre-X1 binary writes on the same
+  interpreter (report byte-identical; the first X1 run, `~/artifacts/plan-x/x1/a0-cpu-base/`); U3's `2925ce8a…` is W0b
+  stage 4c's recorded hash and its report is byte-identical to W0b's. The two U3 `mujoco-cpu`
+  rows differ only in `runtime_hash` (two interpreters' torch) and agree cell for cell.
+- **`mjwarp` has its own `execution_hash`** (`hardware_capability` = `backend_identity`), with
+  `engine_version` `mujoco_warp 3.13.0; warp 1.17.0; mujoco 3.13.0` in the lock.
+- **`mjwarp` is not run-to-run reproducible** — two runs under one `execution_hash` give two
+  reports (A0 nominal equal, observation_delay 0.1875 vs 0.1250; U3 nominal 0.25 vs 0.4375). §10.4's
+  "equal hashes ⇒ bitwise-identical report" therefore holds on `mujoco-cpu` only, which is what
+  tier 2 declares; an `mjwarp` row is a distribution, and one run is a sample of it.
+- **Against `mujoco-cpu`** the A0 success rates move by at most 0.125 per suite and U3's by up to
+  0.3125 (nominal, run 1) — the same size as MJWarp's own run-to-run spread, so on 16 episodes a
+  cell of this table cannot tell the engine's difference from its noise. The contact-heavy demo
+  spreads more than the reach task.
+- **Trajectories:** on A0 nominal-00 the arm and the cube agree with `mujoco-cpu` to ~1e-7 for
+  the first 20 control ticks and separate after contact (0.28 rad by tick 50).
+- **PPO smoke:** `es train` with `[rl] backend = "mjwarp"` on the reach recipe, 20 iterations × 16
+  envs × 64 steps, 28 s, exit 0, checkpoint packed, `training_hash` `01eb1067…`; mean return
+  −15.8 → −6.6 over the 20 iterations, `envelope_violation_rate` 1.0 (as on the CPU backend).
+
+**Two adapter defects the first run found, fixed in `mjwarp_ref.py` before the table above.**
+(1) mujoco_warp's kernels `printf` warnings to fd 1 (`nefc overflow - please increase njmax
+beyond 64`), which broke the line protocol; the script now moves fd 1 to stderr at the
+descriptor level and sizes `njmax = 1024`, `nconmax = 256` per world (a declared bound). (2) The
+env writes zeros for every coordinate a reset does not draw, including the cube's free-joint
+quaternion; MuJoCo normalises a zero quaternion to wxyz identity, mujoco_warp to `(0, 0, 0, 1)`
+read as wxyz — a half turn about z. The script now writes MuJoCo's identity for a zero free/ball
+quaternion, and the cube then agrees to 1e-8 from tick 1. Before the fix U3 on `mjwarp` scored
+0.00 on every suite (`s2-before-quat-fix/`). **Neither fix moved an `execution_hash`**: the
+adapter script is not in `backend_identity` (only the engine version is), so a change to it is
+invisible to the hash chain — an open question below.
+
+**Evidence behind the decision** (outside `es`: raw `mujoco_warp.put_model` on the SO-101 MJCF,
+one world, 1,000 steps of a fixed control, beside `mujoco.mj_step`): finite throughout; max
+|Δqpos| 1.1e-5 on the six arm joints and 0.103 on the cube's free joint within the first 100
+steps; two MJWarp runs differ by 1.0e-6; the solver warns at its 10-iteration limit.
+
+**Open:** the `mjwarp_ref.py` bytes (or a script version) belong in `backend_identity`, or an
+adapter fix can change results under an unchanged `execution_hash`; and whether 16-episode cells
+are enough to read a sim-to-sim gap when the engine's own run-to-run spread is 0.19 (I3's
+three-seed rule, §28.14 rule 7, is the natural next step).
 
 ## 3. Perturbation realisation (`perturb.rs`)
 
