@@ -1045,6 +1045,176 @@ Wall-clock: the three trainings concurrent with plan W's W1a PT run on the same 
 16 cores), 19,076 s ≈ 5.3 h for all three; the six evaluations 67 s. The nine §12.4 metrics are in
 each run's `metrics/env-metrics.json`, the rest `Target / Status: unverified`.
 
+### I3 — an Isaac Lab policy trained on our scene, and A0, on three engines, oracle server (RTX 4090, Ubuntu 26.04.1), 2026-09-23 UTC
+
+Packet `docs/packets/M11/I3-sim-to-sim-measured.md`. Artifacts `~/artifacts/plan-x/i3/` (`usd/`,
+`train{0,1,2}/`, `select{0,1,2}.json`, `heldout{0,1,2}.json`, `delay{0,1,2}.json`,
+`import/isaac-{0,1,2}/`, `eval/`, `scenes/`, `docs/`, `v1-xyzw/`, the stage scripts and their
+`<stage>.{start,end,done,log}` markers). Tree `~/Projects/es-i3` (`git archive`, the I3 files copied
+as they changed), `cargo build --release -p es`. Isaac Sim 5.1.0 + Isaac Lab 2.3.2.post1 +
+rsl-rl-lib 3.0.1 in `~/venvs/es-isaac`; MuJoCo 3.13.0, mujoco_warp, torch 2.14 CPU in `~/venvs/es`.
+
+**The Isaac task mirrors the Task IR; it was not tuned.** `python/es/rl_source/isaac_so101_reach/`
+is a manager-based env cfg (`env_cfg.py`) and an rsl_rl driver (`main.py`). Its robot is
+`robot.usd`, written by `main.py build-usd` from the MJCF `scene_to_mjcf` emits (dumped by
+`ES_PHYSX_DUMP_MJCF` from a `--backend physx` run) through `physx_ref.import_scene` — the backend's
+own import function, split out of `Sim._build_stage` for this, so the stage the policy trains on
+and the one `--backend physx` evaluates on carry the same eight fixups. Mirrored, row by row:
+
+| Task IR (`task-reach-last-action.toml`) | Isaac env |
+|---|---|
+| 50 Hz over the MJCF's 5 ms step, 200 control steps | `decimation 4`, `sim.dt 0.005`, `episode_length_s 4.0` (asserted: `max_episode_length == 200`) |
+| `joint_pos`, `joint_vel` | `mdp.joint_pos_rel`, `mdp.joint_vel_rel` × 0.05 (adapter: `offset = "default_pos"`, `scale = 0.05`) |
+| `cube_pose` = `JointState { cube, dof 7 }`: the free joint's `qpos`, quaternion **w-first** | `free_joint_qpos`: root frame minus env origin, Isaac's own w-first quaternion |
+| `gripper_pose` = `BodyPose(gripper)`: `xpos ‖ xquat`, quaternion **x-first** | `body_pose_xyzw` of link `gripper` |
+| `last_action` (`PreviousAction`, `initial` = the rest pose) | `mdp.last_action` (raw, zero at reset); `default_joint_pos` = that pose |
+| `JointPosition`, ctrl clamped to `ctrlrange` | `JointPositionActionCfg(scale 0.5, use_default_offset, clip = ctrlrange)` |
+| `-1 · dist + 1 · (dist < 0.03)` per control step | the same terms at weight ∓`1/step_dt` (the reward manager multiplies by `dt`) |
+| `Terminate Success` / `Timeout` | `DoneTerm(reached)` / `DoneTerm(time_out, time_out=True)` |
+| `ResetState` joints 0; cube x U[0.21, 0.27], y U[−0.03, 0.05], z 0.02 | `reset_joints_by_scale(0, 0)`; `reset_root_state_uniform` ±(0.03, 0.04) around (0.24, 0.01, 0.02) |
+| kp 998.22, kv 2.731, forcerange 2.94, armature 0.028, joint damping 0.6, frictionloss 0.052 | `ImplicitActuator` stiffness kp, damping kv, `effort_limit_sim` 2.94, armature from the USD; `-0.6·q̇` as an explicit effort every physics step (as `physx_ref.py`); frictionloss dropped (as `physx_ref.py`) |
+| envs in one scene | `env_spacing = 0`, inter-env collisions filtered (`physx_ref.py`'s `GridCloner(spacing = 0)`; also forced, `isaac-lab.md` §9) |
+
+Checked, not assumed: at `q = 0` the env's gripper pose is MuJoCo's to 1e-4 m (0.2932, −0.0002,
+0.2344; quaternion x-first (0.0172, −0.7069, −0.0172, 0.7069)), and settled at the rest pose to
+2e-4 m.
+**Not mirrored**, each a difference the Isaac policy meets only in our runtime or only in Isaac:
+
+1. **The Safety Plane** (Deployment IR): velocity 3 rad/s, acceleration 80 rad/s², action rate
+   0.08 / 0.04 rad per tick, position soft margins, workspace. Isaac has none; A0 trained under it.
+2. **One control tick of action latency** in `es eval run`: the import declares
+   `expected_latency_ms = min(budget, period) = 20 ms`, `latency_ticks` = 1 (A0's 2 ms is 1 tick
+   too). Isaac trains and scores at 0.
+3. **Scene-level PhysX settings.** Isaac Lab's `PhysxCfg` against `physx_ref.py`'s `World`: GPU
+   broadphase vs MBP, CCD off vs on, GPU dynamics on vs off, and bounce / friction-offset /
+   iteration-count attributes `World` does not author (`isaac-lab.md` §9). Isaac trains on the GPU
+   pipeline with 4,096 envs.
+4. **Training-side only:** `init_at_random_ep_len` on the first episode (rsl_rl), no observation
+   noise (the Task IR declares none), the Task IR's `Normalize{0..1}` on the distance (identical
+   below 1 m).
+
+**Training.** rsl_rl PPO with Isaac Lab's own reach runner config (`FrankaReachPPORunnerCfg`, copied
+field for field: 24 steps × 4,096 envs, [64, 64] ELU, lr 1e-3 adaptive, no empirical
+normalization), 1,500 iterations = 147.5 M env steps per seed. The checkpoint is chosen **on Isaac's
+side only**: every 100th checkpoint scored deterministically on 1,024 resets from seed 2000+s, the
+best taken; the number reported is a second set of 1,024 resets (seed 1000+s).
+
+| seed | learn wall | rsl_rl success (stochastic) at 100 / 500 / 1,000 / 1,500 | selected | **Isaac held-out** | at 1,000 | at 1,499 |
+|---|---|---|---|---|---|---|
+| 0 | 2,648 s | 0.170 / 0.948 / 0.969 / 0.970 | `model_700` | **0.975** | 0.968 | 0.978 |
+| 1 | 2,198 s | 0.238 / 0.583 / 0.623 / 0.609 | `model_900` | **0.631** | 0.619 | 0.623 |
+| 2 | 2,244 s | 0.203 / 0.644 / 0.651 / 0.643 | `model_1000` | **0.686** | 0.686 | 0.648 |
+
+All three plateau (seed 0 by 600 iterations, seeds 1 and 2 by 900); mean **0.764**. Seed 2's
+selected checkpoint scored 0.6855 and then 0.6680 on the same resets in one process: Isaac's GPU
+pipeline is not reproducible run to run either.
+
+**Import.** The files are rsl-rl-lib 3.0.1's classic shape (`model_state_dict` with `std`,
+`actor.{0,2,4}`, `critic.*`; `isaac-lab.md` §9). `import_rl.py --from rsl-rl --activation elu
+--isaac-env-cfg params/env.yaml --joint-names …` then `es policy import-rl` with
+`adapter-isaac-so101.toml` against `task-reach-last-action.toml` + `deployment-reach.toml`: all
+three carry `observation_hash ace0eba4…` (the one `evaluation-reach-last-action.toml` names) and
+`learning_hash 800a232c…`; `policy_hash` `2b05615c…` / `79c80b31…` / `36898e15…`. The mapping
+report's timing line reads `decimation 4 x sim_dt 0.005 = 0.02 s == the Deployment IR's control
+period`, and its six `damping` rows are warnings: 2.731 in the source, 3.331 (kv + joint damping)
+in the scene — the explicit passive term is not a drive gain on the Isaac side.
+
+**The table.** `success_rate` on `nominal`, 16 held-out seeds (201–216); Isaac rows are scored by
+`evaluation-reach-last-action.toml`, A0 rows (W0b's `4000.esb`) by `evaluation-reach.toml` — the
+same seeds, suites and acceptance. `episode_length` in brackets. `envelope_violation_rate` is 1.0
+in every cell (every episode clamps at least one tick).
+
+| policy | Isaac side | physx CPU (r1 = r2) | physx GPU (r1 = r2) | mujoco-cpu | mjwarp r1 / r2 |
+|---|---|---|---|---|---|
+| Isaac 0 | 0.975 | 0.6875 (105.8) | 0.6875 (107.2) | **0.8750** (83.8) | 0.9375 (62.8) / 0.8125 (84.6) |
+| Isaac 1 | 0.631 | 0.5000 (125.4) | 0.3750 (146.1) | 0.6250 (125.5) | 0.4375 (141.2) / 0.3125 (152.6) |
+| Isaac 2 | 0.686 | 0.3750 (148.3) | 0.6250 (105.0) | 0.1875 (172.9) | 0.3750 (153.6) / 0.2500 (160.3) |
+| A0 0 | — | 0.1250 (184.9) | 0.1250 (183.4) | 0.5625 (129.4) | 0.4375 (141.4) / 0.4375 (141.3) |
+| A0 1 | — | 0.1875 (176.8) | 0.0000 (200.0) | 0.3750 (147.2) | 0.3750 (146.6) / 0.4375 (137.3) |
+| A0 2 | — | 0.2500 (166.1) | 0.1250 (181.2) | 0.3125 (153.6) | 0.1875 (171.4) / 0.1875 (171.4) |
+| **mean** Isaac / A0 | 0.764 / — | 0.521 / 0.188 | 0.563 / 0.083 | 0.563 / 0.417 | 0.583 / 0.333 (r1), 0.458 / 0.354 (r2) |
+
+`execution_hash` per cell (first 8 hex digits; the two physx runs of each row printed one report
+and one hash — bitwise, as I1 measured; the two mjwarp runs share a hash and not a number, the X1
+tier-2 row):
+
+| policy | physx CPU | physx GPU | mujoco-cpu | mjwarp |
+|---|---|---|---|---|
+| Isaac 0 | `9b7fad37` | `815f8064` | `f9eb7538` | `e52b4ed8` |
+| Isaac 1 | `51a0dc8b` | `87cf5708` | `7ad08aa8` | `eba58084` |
+| Isaac 2 | `d0b4b213` | `6e61f76d` | `c0e8f22a` | `a44788f7` |
+| A0 0 | `37a6bc7a` | `e121afd9` | `08851281` | `7456e37d` |
+| A0 1 | `9064ff63` | `409e93f4` | `e9566999` | `03a25132` |
+| A0 2 | `2e352bc6` | `888b4ce0` | `808658ce` | `f9a760c0` |
+
+**Attribution** (`nominal` `success_rate`, 16 seeds). On physx (CPU pipeline) the two
+approximated rows the PhysX adapter can toggle — `ES_PHYSX_JOINT_DAMPING=none` (no explicit
+`-d·q̇`) and `ES_PHYSX_FRICTION_COMBINE=average` — each written into the engine version, so into
+the hash. On mujoco-cpu the two rows PhysX drops or moves, removed from MuJoCo instead: scene
+copies without `frictionloss`, without `damping`, without both (`scenes/`, sha256 `9f2769ed…`,
+`79b5fbaa…`, `752c725b…`). "Wide envelope" is a diagnostic Deployment IR (`docs/`,
+`deployment_hash 22473ac6…`): velocity 100 rad/s, acceleration 1e5, action rate 10 rad/tick,
+ee velocity 100 m/s; positions, torque and workspace kept, the plane on (INV-12). "Latency 1" is
+Isaac's own eval with `--action-delay 1` on the held-out resets.
+
+| policy | physx | physx, no joint damping | physx, friction average | physx, wide envelope | mujoco | mujoco, no frictionloss | mujoco, no damping | mujoco, neither | mujoco, wide envelope | Isaac, latency 0 → 1 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Isaac 0 | 0.6875 | 0.0000 | 0.6875 | 0.9375 | 0.8750 | **1.0000** | 0.0625 | 0.1250 | 0.9375 | 0.975 → 0.725 |
+| Isaac 1 | 0.5000 | 0.0000 | 0.5000 | 0.4375 | 0.6250 | 0.4375 | 0.0625 | 0.1250 | 0.2500 | 0.631 → 0.585 |
+| Isaac 2 | 0.3750 | 0.0000 | 0.3750 | 0.4375 | 0.1875 | 0.3125 | 0.0000 | 0.0000 | 0.4375 | 0.686 → 0.543 |
+| A0 0 | 0.1250 | 0.0625 | 0.1250 | — | 0.5625 | 0.5000 | 0.1875 | 0.0000 | — | — |
+| A0 1 | 0.1875 | 0.1875 | 0.1875 | — | 0.3750 | 0.4375 | 0.3125 | 0.1250 | — | — |
+| A0 2 | 0.2500 | 0.0625 | 0.2500 | — | 0.3125 | 0.5625 | 0.2500 | 0.4375 | — | — |
+
+What the rows say, as numbers. **Friction combine explains nothing here, by construction**: every
+colliding geom of the scene has μ = 1, one material, and max = average = min = 1 — the column equals
+the default cell for cell (and the hash still moves). **Joint damping is load-bearing on both
+sides**: without the explicit `-0.6·q̇` every Isaac policy scores 0.0 on physx, and removing
+MuJoCo's damping drops every policy on mujoco-cpu too — the one row that is *approximated* (explicit
+instead of implicit) is not the gap, the row itself is essential. **frictionloss**, the row PhysX
+drops, moves Isaac 0 to 1.0 on MuJoCo and A0 2 from 0.31 to 0.56, and the other four by at most
+0.19 either way. **The envelope** moves Isaac 0 from 0.69 to 0.94 on physx and from 0.88 to 0.94
+on MuJoCo, Isaac 2 from 0.19 to 0.44 on MuJoCo, Isaac 1 *down* from 0.63 to 0.25 on MuJoCo, and
+Isaac 1 and 2 on physx by one episode. None of the rows is "most of the gap" for all six policies:
+at 16 episodes, where one episode is 0.0625, the engine gap is policy-specific.
+
+**A first set of Isaac policies was trained on a mis-mirrored channel, and scored 0.0 here.** The
+first env cfg served `cube_pose` x-first, as `docs/design/rl-continuation.md` section 5 describes
+the poses. The runtime serves the Task IR's `cube_pose` — a `JointState { cube, dof = 7 }` channel
+— from the free joint's `qpos`, raw, **w-first** (`es_eval::runner::Capture::Qpos`); only
+`gripper_pose`, a `BodyPose`, is x-first. Those policies (`v1-xyzw/`) scored 0.632 / 0.006 / 0.806
+on Isaac's side and, for seed 0, 0.0 on physx CPU and 0.0625 on mujoco-cpu in ours — the identity
+quaternion lands as `(1, 0, 0, 0)` where the network learned `(0, 0, 0, 1)`. The fix is on the
+Isaac side (`free_joint_qpos`); section 5's sentence is right for `gripper_pose` and wrong for
+`cube_pose`, and the adapter cannot permute inside a channel, so any source must mirror it.
+
+**Two findings about the runtime, not fixed here.** (1) `es eval run --scene` is not bound to the
+Task IR's `scene_hash`: the three MuJoCo scene variants above ran against `task-reach*.toml`
+unrefused, and their `execution_hash` is the default scene's (`08851281…` for A0 0 on all four)
+— a different scene is not a different condition to the hash chain. The attribution rows are
+therefore identified by the scene file's sha256, not by the hash. (2) `task-reach-last-action.toml`
+failed `TaskIr::validate` (`TASK-001`, "declared channel last_action has no ObservationSpec node"),
+so no `PreviousAction` bundle could be built at all; the rule now skips a `PreviousAction`
+channel, which the loop serves and no graph node computes (`crates/es-ir/src/task.rs`, outside this
+packet's context; one line, no hash moves).
+
+**The answer.** **No, not what it scores in Isaac Lab — but it holds up across engines better than our
+own policy does:** imported cleanly (one `observation_hash`, the timing check passes), the three Isaac
+Lab policies average **0.52** on our physx CPU column (0.69 / 0.50 / 0.38) against **0.76** on
+Isaac's own held-out resets (0.975 / 0.631 / 0.686), and the one-tick action latency `es eval run`
+applies accounts for 0.15 of that on Isaac's side alone (0.76 → 0.62 on the same 1,024 resets with
+`--action-delay 1`); across engines they average 0.52 / 0.56 / 0.56 / 0.58–0.46 on physx CPU /
+physx GPU / mujoco-cpu / mjwarp, while A0 falls from 0.42 on mujoco-cpu, the engine it trained on,
+to 0.19 on physx CPU and 0.08 on physx GPU (0.33–0.35 on mjwarp) — the PhysX-trained policy
+transfers to MuJoCo better than the MuJoCo-trained one transfers to PhysX, and the attribution rows
+name joint damping as essential on both engines and frictionloss, the row PhysX drops, as the
+largest single mover on MuJoCo, policy by policy rather than as one row that explains the gap.
+
+Wall clock: Isaac training 2,648 / 2,198 / 2,244 s of learning on the GPU (one seed at a time,
+under the GPU queue lock); the Isaac-side selection and held-out runs about 2.5 min per seed; one
+`es eval run` (16 episodes × 4 suites) ≈ 12 s on mujoco-cpu, ≈ 5.5 min on physx CPU, ≈ 7.5 min on
+physx GPU, ≈ 3.5 min on mjwarp. Everything else `Target / Status: unverified`.
+
 ## 8. The importer and the adapter
 
 Rule 3 of section 1 says the adapter declares and code never guesses. This is what that comes

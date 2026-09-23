@@ -206,7 +206,7 @@ c_in) → (actions, h_out, c_out)`; GRU: `(obs, h_in) → (actions, h_out)`); re
   `isaaclab 2.3.2.post1` 휠의 메타데이터는 `[all]`과 `[rsl-rl]` 아래에 `rsl-rl-lib==3.0.1`을
   고정한다(번들된 `source/isaaclab_rl/setup.py`는 3.1.2라고 적지만 pip은 메타데이터를
   따른다). 3.x는 §7의 5.0 분리선 아래이므로 클래식 `model_state_dict` 형태가 예상된다 —
-  체크포인트를 실제로 저장해 보기 전까지는 unverified.
+  M11 I3가 측정했다(§9): 그 형태가 맞다.
 
 **측정된 설치(M11 I0, 2026-09-23, 자세한 내용은 `docs/api-notes/isaac-sim.md` §7).** pip
 경로로 서버의 `~/venvs/es-isaac`에 설치했다(Python 3.11.16, `isaacsim 5.1.0.0`). 휠은
@@ -224,4 +224,49 @@ c_in) → (actions, h_out, c_out)`; GRU: `(obs, h_in) → (actions, h_out)`); re
   이름을 고정하고 있다 — Isaac 쪽 USD 변환은 `docs/api-notes/isaac-sim.md` §3의 MJCF 임포터
   단서에 따라 이름을 바꿀 수 있다).
 - `PhysxCfg` 반복 횟수의 정확한 필드명/기본값 — `docs/api-notes/isaac-sim.md` §5로 미룸, 같은
-  공백.
+  공백. (2.3.2가 스테이지에 쓰는 값은 §9에 있다.)
+
+## 9. M11 I3가 측정한 것 (2026-09-23, 오라클 서버, Isaac Lab 2.3.2.post1, rsl-rl-lib 3.0.1)
+
+우리 장면에서 SO-101 reach 정책을 학습시키면서(`python/es/rl_source/isaac_so101_reach/`,
+`docs/design/rl-continuation.md` 7절 I3) Isaac Lab 자체에 대해 확인한 것. 모든 항목은 실제로
+실행했다; 산출물은 `~/artifacts/plan-x/i3/`.
+
+- **체크포인트는 §7의 클래식 형태다.** `model_<it>.pt`는 `model_state_dict`,
+  `optimizer_state_dict`, `iter`, `infos`(`None`)를 담는다. `model_state_dict`는 `ActorCritic`
+  하나다: `std` `[6]`, `actor.{0,2,4}.{weight,bias}`(32 → 64 → 64 → 6; 인덱스는 ELU 모듈까지
+  센다), `critic.{0,2,4}.*`, 그리고 `actor_obs_normalization = False`이면 정규화기 키는 없다.
+  `OnPolicyRunner`는 `save_interval`마다 저장하고 **마지막 것은 `model_<N>.pt`가 아니라
+  `model_<N-1>.pt`로** 저장한다. `import_rl.py --from rsl-rl`는 이를 그대로 읽는다.
+- **rsl-rl-lib 3.0.1은 `obs_groups`가 필요하고**(`{"policy": ["policy"], "critic": ["policy"]}`),
+  Isaac Lab 2.3의 `RslRlPpoActorCriticCfg`가 넘기는 `state_dependent_std` 필드는 무시한다
+  (`ActorCritic.__init__ got unexpected arguments, which will be ignored`).
+- **`params/env.yaml`은 안전한 YAML이 아니다.** `isaaclab.utils.io.dump_yaml`은 `yaml.dump`라서
+  모든 튜플이 `!!python/tuple`로, `SceneEntityCfg`의 id가
+  `!!python/object/apply:builtins.slice`로 쓰이고, `yaml.safe_load`는 파일을 거부한다.
+  `import_rl.py`는 이제 모든 `!!python/...` 노드를 그 표기대로의 평범한 list, dict, 문자열로 읽고
+  어떤 객체도 만들지 않는다.
+- **보상 관리자는 모든 항에 `step_dt`를 곱한다**(`reward_manager.py`: `value = func(...) *
+  weight * dt`); "제어 스텝당" 의미의 항은 `weight / step_dt`가 필요하다.
+- **`JointPositionActionCfg.clip`**(`{조인트 정규식: (lo, hi)}` dict)은 *처리된* 행동을 자른다;
+  `last_action`은 자르지 않은 원시 행동 그대로다.
+- **MJCF 임포터의 베이스 용접은 복제되지 않는다.** `fix_base`에서 임포터는 `body0`이 빈
+  `PhysicsFixedJoint rootJoint_<base>`를 쓴다 — MJCF 자체 좌표에서 월드에 고정된다.
+  `InteractiveScene`이 `env_spacing = 2.0`으로 복제하자 모든 env의 팔이 월드 원점으로 끌려갔다
+  (그리퍼가 자기 env 원점에서 ±1 m 떨어져 읽혔다; PhysX는 `Cloning joints …/rootJoint_base
+  without a body rel may cause issues, since the localPose wont be updated`를 남긴다). 그래서
+  env는 env 간 충돌을 거른 채 `env_spacing = 0`으로 돈다 — `physx_ref.py` 자신의
+  `GridCloner(spacing = 0)`과 같다.
+- **Kit은 `AppLauncher`로 시작한 스크립트에서 잡히지 않은 Python 예외 뒤에 0으로 종료한다**;
+  드라이버가 직접 잡아 `os._exit(1)`해야 한다.
+- **`torch.inference_mode()` 안에서 만든 텐서는 그 밖에서 쓸 수 없다**: inference-mode 롤아웃 두
+  번 사이의 `env.reset()`은 둘을 한 inference-mode 블록에 넣지 않으면
+  `write_joint_state_to_sim`에서 실패한다.
+- **2.3.2가 스테이지에 쓰는 `PhysxCfg`**(괄호 안은 `physx_ref.py`의 `World`가 쓰는 값): 솔버 TGS
+  (TGS); broadphase `GPU`(`MBP`); `enableCCD` false(true); GPU 파이프라인에서
+  `enableGPUDynamics` true(false); `enableStabilization` false(false); `bounceThreshold` 0.5,
+  `frictionOffsetThreshold` 0.04, `frictionCorrelationDistance` 0.025, 위치 반복 1..255, 속도
+  반복 0..255(모두 `World`는 쓰지 않음); 초당 200 스텝(200).
+- **GPU 파이프라인에서 같은 체크포인트, 같은 리셋이 실행마다 한 숫자가 아니다:** 시드 2의 선택된
+  체크포인트가 같은 1,024개 리셋에서 0.6855, 이어서 0.6680을 냈다(한 프로세스에서
+  `env.reset(seed=1002)` 두 번).
