@@ -430,14 +430,22 @@ fn cpu_reference_reproduces_the_mesh_goldens_bit_for_bit() {
     let (rs, pt) = (cpu_mesh_rs(), cpu_mesh_pt1());
     for g in &MESH_GOLDENS {
         let got = mesh_golden_tile(g, &rs, &pt).to_bytes();
-        assert!(got == read_golden(g.name), "{} differs from its golden", g.name);
+        assert!(
+            got == read_golden(g.name),
+            "{} differs from its golden",
+            g.name
+        );
         println!("bit-equal CPU vs golden: {}", g.name);
     }
     // The golden is a picture of the mesh, not of the floor: both boxes are in frame.
     let seg = rs.tile(Channel::SegmentationId).unwrap().as_u32().unwrap();
     let names = mesh_scene().names;
     for want in ["mesh_geom", "prim_geom"] {
-        let id = names.iter().find(|(_, n)| *n == want).expect("geom named").0;
+        let id = names
+            .iter()
+            .find(|(_, n)| *n == want)
+            .expect("geom named")
+            .0;
         let px = seg.iter().filter(|s| *s == id).count();
         println!("{want}: {px} pixels");
         assert!(px > 20, "{want} covers only {px} pixels");
@@ -1809,7 +1817,7 @@ fn showcase_camera(width: u32, height: u32) -> CameraView {
     )
 }
 
-/// A pinhole at `eye` looking at `target`, OpenCV frame, `fov_deg` vertical.
+/// A pinhole at `eye` looking at `target`, `OpenCV` frame, `fov_deg` vertical.
 fn look_at(
     eye: es_math::Vec3,
     target: es_math::Vec3,

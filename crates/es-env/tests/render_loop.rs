@@ -714,7 +714,10 @@ fn mesh_box_renders_through_env_renderer() {
         "{test}: {diff} of {} bytes differ from the CPU reference",
         want.len()
     );
-    assert!(got == want, "the GPU mesh frame must be bit-equal to the CPU");
+    assert!(
+        got == want,
+        "the GPU mesh frame must be bit-equal to the CPU"
+    );
 }
 
 // --- packet M10/W1a: the per-tick seed stream------------------------------------------------

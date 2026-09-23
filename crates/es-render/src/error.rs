@@ -10,8 +10,8 @@ pub enum RenderError {
     #[error("{0}")]
     Gpu(#[from] es_gpu::GpuError),
 
-    /// A `Shape` this crate cannot tessellate (spec 15: meshes need an asset resolver this
-    /// packet does not own; height fields need none at all yet).
+    /// A `Shape` this crate cannot tessellate (spec 15): a mesh whose asset is not in
+    /// `SceneDesc::meshes` (the caller skipped `es_assets::mesh::load`), or a height field.
     #[error("unsupported shape in geom '{geom}': {shape}")]
     UnsupportedShape { geom: String, shape: &'static str },
 

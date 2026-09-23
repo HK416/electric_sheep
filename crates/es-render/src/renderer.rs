@@ -299,8 +299,10 @@ impl<'gpu> Renderer<'gpu> {
         })
     }
 
-    /// Tessellate and upload. Primitives only: `Shape::Mesh` and `Shape::HeightField` are
-    /// [`RenderError::UnsupportedShape`] (see `docs/design/renderer.md`).
+    /// Tessellate and upload. Primitives, and `Shape::Mesh` geoms whose asset
+    /// `es_assets::mesh::load` put in `SceneDesc::meshes`; an unloaded mesh and
+    /// `Shape::HeightField` are [`RenderError::UnsupportedShape`] (see
+    /// `docs/design/renderer.md` 2.1).
     pub fn upload_scene(&mut self, scene: &SceneDesc) -> Result<(), RenderError> {
         self.upload_tris(TriScene::from_scene(scene)?)
     }

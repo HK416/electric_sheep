@@ -510,25 +510,30 @@ fn quat_from_basis(x: Vec3, y: Vec3, z: Vec3) -> Quat {
     }
 }
 
-/// MJCF or URDF by extension, as `es backend`'s `load_scene` and `es video showcase` do.
+/// MJCF or URDF by extension, as `es backend`'s `load_scene` and `es video showcase` do, then
+/// the mesh files the scene names, relative to its directory (packet M10/W2b).
 fn load_scene(path: &Path) -> Result<SceneDesc, ReplayError> {
     let bad = |message: String| ReplayError::Scene {
         path: path.display().to_string(),
         message,
     };
     let raw = std::fs::read_to_string(path).map_err(|e| bad(e.to_string()))?;
-    if path
+    let mut scene = if path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("urdf"))
     {
         let resolver = es_assets::urdf::PackageResolver::from_env();
-        let import =
-            es_assets::urdf::parse_urdf(&raw, &resolver).map_err(|e| bad(e.to_string()))?;
-        return Ok(import.scene);
-    }
-    Ok(es_assets::parse_mjcf(&raw)
-        .map_err(|e| bad(e.to_string()))?
-        .scene)
+        es_assets::urdf::parse_urdf(&raw, &resolver)
+            .map_err(|e| bad(e.to_string()))?
+            .scene
+    } else {
+        es_assets::parse_mjcf(&raw)
+            .map_err(|e| bad(e.to_string()))?
+            .scene
+    };
+    es_assets::mesh::load(&mut scene, path.parent().unwrap_or(Path::new(".")))
+        .map_err(|e| bad(e.to_string()))?;
+    Ok(scene)
 }
 
 #[cfg(test)]

@@ -139,13 +139,17 @@ impl TriScene {
 /// uncached one (`bvh_and_cache_tests::cached_tessellation_is_bit_identical`).
 ///
 /// A struct, not a trait: `INV-17` allows seven extension points and this is none of them.
-/// `BTreeMap`, never `HashMap` (spec 3.4). The stored [`Shape`] is checked on every hit: geom
-/// ids come from names (`es_assets::scene::scene_id`), so two scenes can share one, and a
-/// stale entry would be a silently wrong mesh rather than a miss.
+/// `BTreeMap`, never `HashMap` (spec 3.4). The stored [`Shape`] — and for a `Mesh` the
+/// asset's content hash (packet M10/W2b) — is checked on every hit: geom ids come from names
+/// (`es_assets::scene::scene_id`), so two scenes can share one, and a stale entry would be a
+/// silently wrong mesh rather than a miss.
 #[derive(Clone, Debug, Default)]
 pub struct SceneCache {
-    local: BTreeMap<StableId, (Shape, Vec<[Vec3; 3]>)>,
+    local: BTreeMap<StableId, (CacheKey, Vec<[Vec3; 3]>)>,
 }
+
+/// The geom's shape and, for a `Mesh`, its asset's content hash (zeros otherwise).
+type CacheKey = (Shape, [u8; 32]);
 
 impl SceneCache {
     /// [`TriScene::from_scene_with_poses`], reusing whatever this cache already holds.
@@ -163,15 +167,29 @@ impl SceneCache {
                 .copied()
                 .unwrap_or(Pose::IDENTITY);
             for geom in &body.geoms {
-                if !matches!(self.local.get(&geom.id), Some((s, _)) if *s == geom.shape) {
-                    let tris = tessellate(geom)?;
-                    self.local.insert(geom.id, (geom.shape, tris));
+                let key = (geom.shape, content_hash(geom, scene));
+                if !matches!(self.local.get(&geom.id), Some((k, _)) if *k == key) {
+                    let tris = tessellate(geom, scene)?;
+                    self.local.insert(geom.id, (key, tris));
                 }
                 let local = &self.local[&geom.id].1;
                 out.push_geom(geom, body_pose.compose(geom.pose), local);
             }
         }
         Ok(out)
+    }
+}
+
+/// The `AssetRef::hash` of a `Mesh` geom's asset (its content, once `es_assets::mesh::load`
+/// ran), zeros for every other shape.
+fn content_hash(geom: &Geom, scene: &SceneDesc) -> [u8; 32] {
+    match geom.shape {
+        Shape::Mesh { asset } => scene
+            .assets
+            .iter()
+            .find(|a| a.id == asset)
+            .map_or([0; 32], |a| a.hash),
+        _ => [0; 32],
     }
 }
 
@@ -220,8 +238,8 @@ fn world_poses(scene: &SceneDesc) -> BTreeMap<StableId, Pose> {
     world
 }
 
-/// Local-frame triangles for a primitive.
-fn tessellate(geom: &Geom) -> Result<Vec<[Vec3; 3]>, RenderError> {
+/// Local-frame triangles for a primitive, or for a mesh `scene.meshes` carries.
+fn tessellate(geom: &Geom, scene: &SceneDesc) -> Result<Vec<[Vec3; 3]>, RenderError> {
     let unsupported = |shape| {
         Err(RenderError::UnsupportedShape {
             geom: geom.name.clone(),
@@ -252,7 +270,22 @@ fn tessellate(geom: &Geom) -> Result<Vec<[Vec3; 3]>, RenderError> {
             radius,
             half_length,
         } => Ok(capsule_tris(radius, half_length, false)),
-        Shape::Mesh { .. } => unsupported("Mesh (needs an asset resolver, see the design doc)"),
+        // The file's `f32` positions widen exactly; the pose is applied per frame in `f64` by
+        // `push_geom`, exactly as for a primitive (packet M10/W2b).
+        Shape::Mesh { asset } => {
+            let Some(mesh) = scene.meshes.get(&asset) else {
+                return unsupported("Mesh (asset not loaded: es_assets::mesh::load)");
+            };
+            let vertex = |i: &u32| {
+                let p = mesh.positions.get(*i as usize)?;
+                Some(Vec3::new(f64::from(p[0]), f64::from(p[1]), f64::from(p[2])))
+            };
+            mesh.indices
+                .chunks_exact(3)
+                .map(|f| Some([vertex(&f[0])?, vertex(&f[1])?, vertex(&f[2])?]))
+                .collect::<Option<Vec<_>>>()
+                .map_or_else(|| unsupported("Mesh (index out of range)"), Ok)
+        }
         Shape::HeightField { .. } => unsupported("HeightField"),
     }
 }
@@ -620,10 +653,7 @@ mod tests {
                 (t.v[0][1] + t.v[1][1] + t.v[2][1]) / 3.0 - c[1],
                 (t.v[0][2] + t.v[1][2] + t.v[2][2]) / 3.0 - c[2],
             ];
-            assert!(
-                f[0] * t.n[0] + f[1] * t.n[1] + f[2] * t.n[2] > 0.0,
-                "{t:?}"
-            );
+            assert!(f[0] * t.n[0] + f[1] * t.n[1] + f[2] * t.n[2] > 0.0, "{t:?}");
         }
     }
 
@@ -672,7 +702,10 @@ mod tests {
         let b = cache.tri_scene(&big, &none).unwrap();
         assert_eq!(a, TriScene::from_scene(&small).unwrap());
         assert_eq!(b, TriScene::from_scene(&big).unwrap());
-        assert_ne!(a, b, "the cache served the first scene's mesh to the second");
+        assert_ne!(
+            a, b,
+            "the cache served the first scene's mesh to the second"
+        );
     }
 
     /// The tessellation feeds both paths: `to_floats` is what `Renderer::upload_tris`
