@@ -1223,3 +1223,247 @@ fn dr_env_pt_sensor_gets_a_directional_light() {
     }
     println!("RAN {test}");
 }
+
+// --- packet M11/X3b: N envs in one dispatch --------------------------------------------------
+
+/// A batch of `worlds.len()` envs as one `ModelInfo` / `StateView` pair: env `k`'s bodies at
+/// `worlds[k]`, every body the first world names indexed, every other body at its scene pose.
+struct Batch {
+    model: ModelInfo,
+    xpos: Vec<f64>,
+    xquat: Vec<f64>,
+}
+
+impl Batch {
+    fn new(scene: &SceneDesc, worlds: &[BTreeMap<StableId, Pose>]) -> Self {
+        let nbody = scene.bodies.len();
+        let mut model = ModelInfo {
+            nbody: nbody as u32,
+            n_envs: worlds.len() as u32,
+            ..ModelInfo::default()
+        };
+        let (mut xpos, mut xquat) = (
+            vec![0.0; worlds.len() * nbody * 3],
+            vec![0.0; worlds.len() * nbody * 4],
+        );
+        for (row, body) in scene.bodies.iter().enumerate() {
+            if !worlds[0].contains_key(&body.id) {
+                continue;
+            }
+            model.body.insert(body.id, IndexRange::new(row as u32, 1));
+            for (k, world) in worlds.iter().enumerate() {
+                let p = world[&body.id];
+                let r = k * nbody + row;
+                xpos[r * 3..r * 3 + 3].copy_from_slice(&[p.position.x, p.position.y, p.position.z]);
+                let q = p.orientation;
+                xquat[r * 4..r * 4 + 4].copy_from_slice(&[q.x, q.y, q.z, q.w]);
+            }
+        }
+        Self { model, xpos, xquat }
+    }
+
+    fn state(&self) -> StateView<'_> {
+        StateView {
+            n_envs: self.model.n_envs,
+            xpos: &self.xpos,
+            xquat: &self.xquat,
+            ..StateView::default()
+        }
+    }
+}
+
+/// `n` envs with the cube at `n` different poses.
+fn cube_worlds(scene: &SceneDesc, n: u32) -> Vec<BTreeMap<StableId, Pose>> {
+    let cube = by_name(scene, "cube").id;
+    (0..n)
+        .map(|k| {
+            let f = f64::from(k);
+            let (s, c) = (0.3 * f).sin_cos();
+            BTreeMap::from([(
+                cube,
+                Pose::new(
+                    CUBE_POS + Vec3::new(0.012 * f - 0.05, -0.009 * f + 0.03, 0.0),
+                    Quat::from_xyzw(0.0, 0.0, s, c),
+                ),
+            )])
+        })
+        .collect()
+}
+
+/// Packet M11/X3b, end to end through `es-env`: `EnvBatchRenderer` over 4 envs — each at its own
+/// cube pose, under its own episode's render draws, on its own `Tick` clock (env 1 restarts
+/// its episode before the third frame) — renders, frame after frame, exactly the tiles four
+/// `EnvRenderer`s render for the same envs, on `Rs` and on `Pt` 4 spp NEE + SVGF.
+#[test]
+fn batch_env_renderer_equals_env_renderers() {
+    const N: u32 = 4;
+    let test = "batch_env_renderer_equals_env_renderers";
+    let Some(gpu) = open(test) else { return };
+    let scene = scene();
+    let batch = Batch::new(&scene, &cube_worlds(&scene, N));
+    let state = batch.state();
+    let spec = image_spec(&scene, &cfg(&scene)).expect("the overhead camera resolves");
+    let pt = es_ir::task::SensorRender {
+        path: es_ir::task::SensorPath::Pt { spp: 4, bounces: 3 },
+        svgf: true,
+        ..pt_sensor(es_ir::task::SeedStream::Tick)
+    };
+    for (label, render, base) in [
+        ("Rs", es_ir::task::SensorRender::default(), "task.toml"),
+        ("Pt 4 spp NEE + SVGF, seed = tick", pt, "task-pt.toml"),
+    ] {
+        let sensor = sensor_cfg(overhead(&scene), &spec, &render, None);
+        let mut targets = dr_targets(&scene);
+        if base == "task-pt.toml" {
+            targets.push(("light.radiance".to_owned(), uniform(1.5, 3.0)));
+        }
+        let task = dr_task(base, &targets);
+        let draws: Vec<_> = (0..N)
+            .map(|k| dr_draw(&task, &scene, &batch.model, u64::from(k)))
+            .collect();
+        let ovs: Vec<&es_env::randomize::RenderOverrides> = draws.iter().collect();
+
+        let mut batched =
+            es_env::render::EnvBatchRenderer::new(&gpu, &scene, sensor.clone(), N).expect("batch");
+        batched.check(&spec).expect("the declared spec");
+        let mut singles: Vec<EnvRenderer<'_>> = (0..N)
+            .map(|_| EnvRenderer::new(&gpu, &scene, sensor.clone()).expect("renderer"))
+            .collect();
+        let mut previous: Option<Vec<Vec<u8>>> = None;
+        for frame in 0..3 {
+            if frame == 2 {
+                batched.begin_episode(1);
+                singles[1].begin_episode();
+            }
+            let tiles = batched.frames(&batch.model, &state, &ovs).expect("frames");
+            let bytes: Vec<Vec<u8>> = tiles.iter().map(Tile::to_bytes).collect();
+            for (k, single) in singles.iter_mut().enumerate() {
+                let want = single
+                    .frame_with(&batch.model, &state, k as u32, ovs[k])
+                    .expect("frame")
+                    .to_bytes();
+                assert!(
+                    bytes[k] == want,
+                    "{label}, frame {frame}: env {k} differs from its EnvRenderer"
+                );
+            }
+            for k in 1..bytes.len() {
+                assert!(
+                    bytes[k] != bytes[k - 1],
+                    "{label}: envs {k}, {} alike",
+                    k - 1
+                );
+            }
+            if let (Some(prev), true) = (&previous, label.starts_with("Pt")) {
+                assert!(prev[0] != bytes[0], "{label}: the tick did not move env 0");
+            }
+            previous = Some(bytes);
+        }
+        println!("{test}: {label}, 4 envs x 3 frames, every tile bit-equal to its EnvRenderer");
+    }
+    println!("RAN {test}");
+}
+
+/// Packet M11/X3b oracle 3: what a `Pt` observation costs per env when N envs share one
+/// dispatch, whole-frame (re-pose, BVH build, upload, dispatch, readback), beside the single
+/// `EnvRenderer` path measured in the same process (the X3 number, `renderer.md` 12.4).
+///
+/// The demo's 96×96 sensor (`task-pt.toml`: NEE, 3 bounces, exposure 64), `seed = "tick"`, the
+/// envs at N different ticks of the committed `nominal-00` trajectory. `ES_X3B_N` and
+/// `ES_X3B_SPP` (comma lists) narrow the sweep. Run with
+/// `cargo test -p es-env --features render --test render_loop --release -- --ignored
+/// --nocapture pt_batched_cost`.
+#[test]
+#[ignore = "measurement; run explicitly"]
+fn pt_batched_cost() {
+    use std::time::Instant;
+
+    const FRAMES: u32 = 4;
+    let test = "pt_batched_cost";
+    let Some(gpu) = open(test) else { return };
+    let scene = scene();
+    let traj = es_env::traj::Trajectory::read(
+        &repo_root().join("tests/fixtures/visible-learning/run/traj/nominal-00.estraj"),
+    )
+    .expect("the committed trajectory");
+    let spec = image_spec(&scene, &cfg(&scene)).expect("the overhead camera resolves");
+    let list = |var: &str, default: &[u32]| -> Vec<u32> {
+        std::env::var(var).map_or_else(
+            |_| default.to_vec(),
+            |v| v.split(',').map(|n| n.trim().parse().expect(var)).collect(),
+        )
+    };
+    let (ns, spps) = (
+        list("ES_X3B_N", &[1, 4, 16, 64]),
+        list("ES_X3B_SPP", &[4, 16, 64]),
+    );
+    println!("\n{}", gpu.capabilities().device_name);
+    println!(
+        "| spp | SVGF | N | single ms/env | batched ms/frame | batched ms/env | host prep ms/env \
+         | speed-up |"
+    );
+    println!("|---|---|---|---|---|---|---|---|");
+    for spp in spps {
+        for svgf in [false, true] {
+            let render = es_ir::task::SensorRender {
+                path: es_ir::task::SensorPath::Pt { spp, bounces: 3 },
+                svgf,
+                ..pt_sensor(es_ir::task::SeedStream::Tick)
+            };
+            let sensor = sensor_cfg(overhead(&scene), &spec, &render, None);
+            // The single path once per config: N does not change it.
+            let one = Batch::new(&scene, &[traj.poses(0)]);
+            let mut single = EnvRenderer::new(&gpu, &scene, sensor.clone()).expect("renderer");
+            single.frame(&one.model, &one.state(), 0).expect("warm-up");
+            let start = Instant::now();
+            for _ in 0..FRAMES {
+                single.frame(&one.model, &one.state(), 0).expect("frame");
+            }
+            let single_ms = start.elapsed().as_secs_f64() * 1e3 / f64::from(FRAMES);
+            for &n in &ns {
+                let stride = (traj.ticks() / n as usize).max(1);
+                let worlds: Vec<_> = (0..n as usize)
+                    .map(|k| traj.poses((k * stride).min(traj.ticks() - 1)))
+                    .collect();
+                let batch = Batch::new(&scene, &worlds);
+                let ident = es_env::randomize::RenderOverrides::default();
+                let ovs = vec![&ident; n as usize];
+                let mut r = es_env::render::EnvBatchRenderer::new(&gpu, &scene, sensor.clone(), n)
+                    .expect("batch");
+                r.frames(&batch.model, &batch.state(), &ovs)
+                    .expect("warm-up");
+                let start = Instant::now();
+                for _ in 0..FRAMES {
+                    r.frames(&batch.model, &batch.state(), &ovs)
+                        .expect("frames");
+                }
+                let ms = start.elapsed().as_secs_f64() * 1e3 / f64::from(FRAMES);
+                // The host half alone: every env's re-pose and BVH build, which is what a
+                // two-level BVH would save (`renderer.md` section 14.2).
+                let mut cache = es_render::SceneCache::default();
+                let start = Instant::now();
+                for world in &worlds {
+                    let tri = cache.tri_scene(&scene, world).expect("tessellates");
+                    std::hint::black_box(es_render::bvh::Bvh::build(&tri.tris));
+                }
+                let prep = start.elapsed().as_secs_f64() * 1e3 / f64::from(n);
+                let per_env = ms / f64::from(n);
+                println!(
+                    "| {spp} | {} | {n} | {single_ms:.2} | {ms:.2} | {per_env:.3} | {prep:.3} \
+                     | {:.1}x |",
+                    if svgf { "on" } else { "off" },
+                    single_ms / per_env
+                );
+            }
+        }
+    }
+    let tri = TriScene::from_scene(&scene).expect("tessellates");
+    let bvh = es_render::bvh::Bvh::build(&tri.tris);
+    println!(
+        "scene: {} triangles, {} BVH nodes; per-env upload {} KiB",
+        tri.tris.len(),
+        bvh.nodes.len(),
+        (tri.to_floats().len() + bvh.to_floats().len()) * 4 / 1024
+    );
+    println!("RAN {test}");
+}

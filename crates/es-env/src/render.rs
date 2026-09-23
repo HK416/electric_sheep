@@ -525,6 +525,111 @@ impl<'gpu> EnvRenderer<'gpu> {
     }
 }
 
+/// One camera for every env of a batch, rendered in **one** dispatch (packet M11/X3b).
+///
+/// Tile `k` of [`Self::frames`] is bit for bit the frame an [`EnvRenderer`] renders for env
+/// `k` at the same state, draws and episode tick: the same [`drawn_frame`], the same
+/// [`frame_seed`], and `Renderer::render_batch`, whose every tile is that env's single render
+/// (`docs/design/renderer.md` section 14). The single-env type stays the oracle and the
+/// one-env path.
+///
+/// No `frames_dir`: the per-frame files are [`EnvRenderer`]'s, whose callers (the collector,
+/// the evaluator, the showcase) render one env.
+#[derive(Debug)]
+pub struct EnvBatchRenderer<'gpu> {
+    renderer: Renderer<'gpu>,
+    cfg: EnvRendererCfg,
+    scene: SceneDesc,
+    /// One cache for every env: the local tessellation does not depend on the env.
+    cache: SceneCache,
+    base_seed: u32,
+    /// Per env, frames rendered since its own [`Self::begin_episode`].
+    episode_frame: Vec<u32>,
+}
+
+impl<'gpu> EnvBatchRenderer<'gpu> {
+    pub fn new(
+        gpu: &'gpu es_gpu::Gpu,
+        scene: &SceneDesc,
+        cfg: EnvRendererCfg,
+        n_envs: u32,
+    ) -> Result<Self, EnvError> {
+        if cfg.frames_dir.is_some() {
+            return Err(EnvError::Unsupported(
+                "a batched renderer writes no frame files; use EnvRenderer".to_owned(),
+            ));
+        }
+        let mut rc = render_config(&cfg);
+        let base_seed = rc.seed;
+        let per_row = (es_render::atlas::MAX_IMAGE_DIMENSION_2D / cfg.width.max(1)).max(1);
+        rc.atlas = TileAtlasCfg {
+            tiles_per_row: n_envs.clamp(1, per_row),
+            n_tiles: n_envs.max(1),
+            ..rc.atlas
+        };
+        let renderer =
+            Renderer::new(gpu, rc).map_err(|e| EnvError::Unsupported(format!("renderer: {e}")))?;
+        camera_view(scene, &cfg, &BTreeMap::new())?;
+        Ok(Self {
+            renderer,
+            cfg,
+            scene: scene.clone(),
+            cache: SceneCache::default(),
+            base_seed,
+            episode_frame: vec![0; n_envs as usize],
+        })
+    }
+
+    /// Env `env`'s episode begins: its [`SeedStream::Tick`] clock counts from zero again.
+    pub fn begin_episode(&mut self, env: usize) {
+        if let Some(t) = self.episode_frame.get_mut(env) {
+            *t = 0;
+        }
+    }
+
+    /// [`check_image_spec`] against this renderer's own spec.
+    pub fn check(&self, declared: &ImageSpec) -> Result<(), EnvError> {
+        check_image_spec(&image_spec(&self.scene, &self.cfg)?, declared)
+    }
+
+    /// One frame per env of the batch `state`, env `k` under `overrides[k]`, in env order.
+    pub fn frames(
+        &mut self,
+        model: &ModelInfo,
+        state: &StateView<'_>,
+        overrides: &[&RenderOverrides],
+    ) -> Result<Vec<Tile>, EnvError> {
+        if overrides.len() != self.episode_frame.len() {
+            return Err(EnvError::Unsupported(format!(
+                "{} render draws for a batch of {}",
+                overrides.len(),
+                self.episode_frame.len()
+            )));
+        }
+        let mut envs = Vec::with_capacity(overrides.len());
+        for (k, ov) in overrides.iter().enumerate() {
+            let world = body_poses(model, state, k as u32);
+            let (tri, view, mut rc) =
+                drawn_frame(&self.scene, &self.cfg, ov, &world, &mut self.cache)?;
+            rc.seed = frame_seed(self.cfg.seed_stream, self.base_seed, self.episode_frame[k]);
+            envs.push((tri, view, rc));
+        }
+        let tiles = self
+            .renderer
+            .render_batch(&envs)
+            .and_then(|mut atlas| atlas.read_tiles(self.cfg.channel))
+            .map_err(|e| EnvError::Unsupported(format!("batched render: {e}")))?;
+        for t in &mut self.episode_frame {
+            *t += 1;
+        }
+        Ok(tiles)
+    }
+
+    pub fn cfg(&self) -> &EnvRendererCfg {
+        &self.cfg
+    }
+}
+
 /// What a renderer configured this way produces, in Observation IR terms — the subset of
 /// spec 7.2's `ImageSpec` `es-render` decides (`crates/es-render/src/view.rs:44-50`).
 ///
