@@ -3083,7 +3083,9 @@ fn capture_reads_qvel_and_body_pose() {
     let id_of = |n: &str| match demo_task.observation_spec.channels[n].source {
         ObsSource::JointState { body, .. } | ObsSource::BodyPose(body) => body,
         ObsSource::Sensor { id, .. } => id,
-        ObsSource::Language => panic!("{n} is a language channel"),
+        ObsSource::Language | ObsSource::PreviousAction { .. } => {
+            panic!("{n} is not a state or sensor channel")
+        }
     };
     let (cube, arm, camera) = (
         id_of("sim_cube_pose"),
@@ -3193,4 +3195,226 @@ fn demo_trajectories_are_unmoved() {
         "a JointPosition plane verdict moved"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- packet M11/X2: the previous action --------------------------------------------------------
+
+/// A policy whose every chunk is distinct and a function of its call count, and which keeps
+/// the `prev` input it was handed on every call.
+struct RowPolicy {
+    seen: Vec<Vec<f32>>,
+    emitted: Vec<Vec<[f32; NJ]>>,
+}
+
+impl PolicyRuntime for RowPolicy {
+    fn load(
+        &mut self,
+        _graph: &LearningGraph,
+        _weights: &WeightsSource,
+    ) -> Result<PolicyInfo, PolicyError> {
+        Err(PolicyError::NotLoaded)
+    }
+
+    fn infer(
+        &mut self,
+        inputs: &BTreeMap<String, Tensor>,
+    ) -> Result<BTreeMap<String, Tensor>, PolicyError> {
+        let prev = &inputs["prev"];
+        self.seen.push(
+            prev.data
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+        );
+        let c = self.emitted.len() as f32;
+        let rows: Vec<[f32; NJ]> = (0..2u8)
+            .map(|r| {
+                let v = 0.001 * (1.0 + 10.0 * c + 5.0 * f32::from(r));
+                [v, -v]
+            })
+            .collect();
+        let data = rows
+            .iter()
+            .flatten()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        self.emitted.push(rows);
+        Ok(BTreeMap::from([(
+            "action".to_owned(),
+            Tensor {
+                dtype: ElemType::F32,
+                shape: vec![2, NJ as u64],
+                data,
+            },
+        )]))
+    }
+
+    fn info(&self) -> Option<&PolicyInfo> {
+        None
+    }
+
+    fn runtime_hash(&self) -> [u8; 32] {
+        [13; 32]
+    }
+}
+
+const INITIAL: [f64; NJ] = [0.3, -0.2];
+
+/// `task_ir()` with a `prev` channel -- `ObsSource::PreviousAction { initial }` -- no early
+/// success, a pinned reset and `steps` control steps per episode.
+fn previous_action_task(steps: u32) -> TaskIr {
+    let mut task = task_ir();
+    task.config.max_episode_steps = steps;
+    task.graph.insert(
+        NodeId(2),
+        TaskNode::Compare {
+            op: CmpOp::Gt,
+            rhs: Some(100.0),
+            ty: scalar_ty(Unit::Angle),
+        },
+    );
+    task.graph.insert(
+        NodeId(4),
+        TaskNode::ResetState {
+            target: "qpos[0]".to_owned(),
+            dist: Distribution::Constant(0.0),
+            stream: "reset.j0".to_owned(),
+        },
+    );
+    task.observation_spec.channels.insert(
+        "prev".to_owned(),
+        ObsChannel {
+            source: ObsSource::PreviousAction {
+                initial: Some(INITIAL.to_vec()),
+            },
+            ty: PortType {
+                shape: Shape::new([NJ as u64]),
+                ..scalar_ty(Unit::Angle)
+            },
+        },
+    );
+    task
+}
+
+/// `StateInput(previous action) -> Normalize{MeanStd 0, 1}`: the identity, bit for bit.
+fn previous_action_observation(task: &TaskIr) -> ObservationIr {
+    let raw = PortType {
+        shape: Shape::new([NJ as u64]),
+        ..scalar_ty(Unit::Angle)
+    };
+    let norm = PortType {
+        unit: Unit::Normalized { lo: -1.0, hi: 1.0 },
+        ..raw.clone()
+    };
+    let mut ir = ObservationIr::new(1, task.task_hash().expect("task hashes"));
+    ir.graph.insert(
+        NodeId(0),
+        ObservationNode::StateInput {
+            source: ObsSource::previous_action_id(),
+            io: Io::source(raw.clone()),
+        },
+    );
+    ir.graph.insert(
+        NodeId(1),
+        ObservationNode::Normalize {
+            stats: NormalizeStats::MeanStd {
+                mean: vec![0.0; NJ],
+                std: vec![1.0; NJ],
+            },
+            io: Io::unary(raw, norm.clone()),
+        },
+    );
+    ir.graph.connect(NodeId(0), "out", NodeId(1), "in0");
+    ir.outputs = BTreeMap::from([(
+        "prev".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(NodeId(1), "out"),
+            ty: norm,
+        },
+    )]);
+    ir
+}
+
+/// Two episodes of `steps` ticks under `deploy`; returns the policy's record.
+fn previous_action_run<const HH: usize>(deploy: &DeploymentIr, steps: u32) -> RowPolicy {
+    let mut ir = evaluation_ir(7, basic_metrics(), Vec::new());
+    ir.suites.truncate(1);
+    ir.episodes = EpisodeBatch {
+        n_episodes: 2,
+        seeds: SeedPlan::Base(7),
+    };
+    let task = previous_action_task(steps);
+    let obs = previous_action_observation(&task);
+    let mut policy = RowPolicy {
+        seen: Vec::new(),
+        emitted: Vec::new(),
+    };
+    Evaluation::run_with_frames::<FakeBackend, _, NJ, HH>(
+        &ir,
+        &task,
+        &scene(),
+        &obs,
+        &mut policy,
+        deploy,
+        FakeBackend::new,
+        &RunConfig {
+            max_steps: Some(steps),
+            ..RunConfig::default()
+        },
+        None,
+        None,
+    )
+    .expect("the previous-action fixture evaluates");
+    policy
+}
+
+/// **Oracle 4 of packet M11/X2.** What a `PreviousAction` channel serves the policy: `initial`
+/// on an episode's first tick, and on tick `k` the row the policy's output put on tick `k - 1`
+/// -- before the Safety Plane -- for a horizon-1 policy (row 0 of the previous call) and for a
+/// buffered one (the *last* served row of the previous chunk, which no call returned on its
+/// own tick).
+#[test]
+fn previous_action_is_the_last_policy_row() {
+    let steps = 6u32;
+    let initial: Vec<f32> = INITIAL.iter().map(|v| *v as f32).collect();
+
+    // Horizon 1: one call per control tick.
+    let one = DeploymentIr {
+        action: ActionContract {
+            horizon: 1,
+            execute_chunk: 1,
+            ..deployment_ir().action
+        },
+        ..deployment_ir()
+    };
+    let p = previous_action_run::<1>(&one, steps);
+    assert_eq!(p.seen.len(), 2 * steps as usize, "one call per tick");
+    for (k, seen) in p.seen.iter().enumerate() {
+        let want = if k % steps as usize == 0 {
+            initial.clone()
+        } else {
+            p.emitted[k - 1][0].to_vec()
+        };
+        assert_eq!(seen, &want, "horizon 1, call {k}");
+    }
+
+    // Buffered: horizon 2, both rows executed, one call every second tick.
+    let two = DeploymentIr {
+        rate: RateSpec {
+            control: TickRate::hz(CONTROL_HZ),
+            inference: TickRate::hz(CONTROL_HZ / 2),
+        },
+        ..deployment_ir()
+    };
+    let p = previous_action_run::<H>(&two, steps);
+    let per_episode = steps as usize / 2;
+    assert_eq!(p.seen.len(), 2 * per_episode, "one call per two ticks");
+    for (c, seen) in p.seen.iter().enumerate() {
+        let want = if c % per_episode == 0 {
+            initial.clone()
+        } else {
+            p.emitted[c - 1][1].to_vec()
+        };
+        assert_eq!(seen, &want, "buffered, call {c}");
+    }
 }

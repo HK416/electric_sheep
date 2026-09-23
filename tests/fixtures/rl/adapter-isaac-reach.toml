@@ -1,0 +1,67 @@
+# An Isaac Lab reach policy (rsl_rl, `JointPositionActionCfg`) under our SO-101 -- adapter v2,
+# packet M11/X2, spec 28.14 rule 3.
+#
+# The source is `python/es/rl_source/isaac_reference.py --make isaac-*`: the shape of Isaac
+# Lab's own reach task (`docs/api-notes/isaac-lab.md` section 4) on an articulation whose
+# joints the USD importer ordered differently from our MJCF and whose jaw it named differently.
+# Every convention the source applies is declared here once and compiled into the bundle --
+# folded into the observation normalizer, the first Dense's input columns, the head's rows and
+# the unnormalizer -- so nothing Isaac-specific runs at inference. It targets
+# `task-reach-last-action.toml` and `deployment-reach.toml`.
+
+[robot]
+name = "so101"
+
+[joints]
+# `resolve_matching_names` returns the ARTICULATION's order, not the regex list's (section 2),
+# so this is the order the source's action vector and its per-joint observation terms are in.
+# Each name is resolved against our actuators, through `[joints.rename]` where they differ.
+source_names = ["elbow_flex", "gripper_jaw", "shoulder_lift", "shoulder_pan", "wrist_flex", "wrist_roll"]
+units = "rad"
+# `default_joint_pos`, radians, SOURCE order. The manifest records the same numbers when
+# `import_rl.py` was given `--isaac-env-cfg` and `--joint-names`; a disagreement is a warning.
+default_pos = [0.7, 0.3, -0.4, 0.1, 0.25, -0.05]
+
+[joints.rename]
+gripper_jaw = "gripper"
+
+[action]
+kind = "position_target"
+# `processed = raw * scale + offset`, `offset = default_joint_pos` (section 3).
+scale = [0.5, 0.5, 0.5, 0.5, 0.5, 0.5]
+use_default_offset = true
+
+[timing]
+# `decimation * sim.dt` = 4 x 0.005 s, the Deployment IR's 50 Hz. Isaac's own reach task runs
+# 2 x 1/60 s (30 Hz); pointed at that, this import would be IMP-006.
+policy_dt = 0.02
+
+# The source's `PolicyCfg`, in declaration order -- which is the concatenation order. The rsl_rl
+# wrapper also clips the whole vector at +-100; the Observation IR has no clamp node, so that
+# clip is not declared here (declaring it is IMP-009), and the oracle checks that it never binds
+# on the states it draws.
+[[observation.channels]]
+source = "mdp.joint_pos_rel"
+slice = [0, 6]
+channel = "joint_pos"
+offset = "default_pos"
+
+[[observation.channels]]
+source = "mdp.joint_vel_rel"
+slice = [6, 12]
+channel = "joint_vel"
+scale = 0.05
+
+# The command generator's target pose, admitted because the Task IR declares the channel it
+# lands on (the cube's pose); a command nothing in the Task IR computes would be IMP-007.
+[[observation.channels]]
+source = "mdp.generated_commands(ee_pose)"
+slice = [12, 19]
+channel = "cube_pose"
+
+# The raw action of the previous tick. Our channel carries it in actuator units, and the
+# importer folds the action tail back out of it.
+[[observation.channels]]
+source = "mdp.last_action"
+slice = [19, 25]
+channel = "last_action"
