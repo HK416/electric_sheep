@@ -1117,7 +1117,7 @@ match stream {
 
 `camera.<n>.pose.*`는 카메라의 `OpenCV` 포즈 오른쪽에 포즈를 합성한다(카메라 자신의 축을 따른 이동; yaw, pitch, roll 순서, `approx` 사용). `camera.<n>.fov`는 주점을 중심으로 `fx`, `fy`에 초점 배율을 곱한다. 에피소드의 `image_specs`도 같은 숫자를 지닌다(`INV-14`, `batch-domains.md` 5절).
 
-**뽑힌 포즈가 어떤 골든도 드러낼 수 없던 GPU/CPU 불일치를 드러냈다.** RTX 3060에서 `Pose` 추첨의 첫 실행은 `Rgb8`과 세그멘테이션은 비트 단위로 맞았지만 **깊이 901픽셀이 최대 20 ULP** CPU와 어긋났다. 모든 골든 카메라의 쿼터니언 성분은 2의 거듭제곱이다(`LOOK_ALONG_X`는 ±0.5, 데모의 `MJCF_TO_OPENCV`는 `(1, 0, 0, 0)`). 그래서 `es_qrot`의 모든 곱이 정확했고 반올림 순서는 문제가 되지 않았다. 뽑힌 카메라는 임의의 성분을 가진다. `es_qrot`는 드라이버가 구현하는 확장 명령 GLSL.std.450 `Cross`를 불렀고, `NoContraction`은 *우리의* 산술을 장식할 뿐 드라이버의 것은 아니다 — 그 안에서는 융합이 자유였다. 이제 `es_qrot`는 CPU의 `cross`처럼 세 차이를 항 단위로 풀어 쓴 `es_cross`를 부르고, 뽑힌 카메라는 모든 채널에서 **0 ULP**다. 커밋된 프레임은 하나도 움직이지 않았다: 골든 카메라에서는 두 형태가 같은 비트다(기존 골든 전부와 `so101_frame0`이 두 카드에서 다시 통과). `common.slang`의 나머지 `Cross` 호출 둘(Möller–Trumbore와 면 법선)은 삼각형 변을 받으며, 여기서 어떤 테스트도 그것을 움직이지 않았으므로 그대로 둔다(13.7).
+**뽑힌 포즈가 어떤 골든도 드러낼 수 없던 GPU/CPU 불일치를 드러냈다.** RTX 3060에서 `Pose` 추첨의 첫 실행은 `Rgb8`과 세그멘테이션은 비트 단위로 맞았지만 **깊이 901픽셀이 최대 20 ULP** CPU와 어긋났다. 모든 골든 카메라의 쿼터니언 성분은 2의 거듭제곱이다(`LOOK_ALONG_X`는 ±0.5, 데모의 `MJCF_TO_OPENCV`는 `(1, 0, 0, 0)`). 그래서 `es_qrot`의 모든 곱이 정확했고 반올림 순서는 문제가 되지 않았다. 뽑힌 카메라는 임의의 성분을 가진다. `es_qrot`는 드라이버가 구현하는 확장 명령 GLSL.std.450 `Cross`를 불렀고, `NoContraction`은 *우리의* 산술을 장식할 뿐 드라이버의 것은 아니다 — 그 안에서는 융합이 자유였다. 이제 `es_qrot`는 CPU의 `cross`처럼 세 차이를 항 단위로 풀어 쓴 `es_cross`를 부르고, 뽑힌 카메라는 모든 채널에서 **0 ULP**다. 커밋된 프레임은 하나도 움직이지 않았다: 골든 카메라에서는 두 형태가 같은 비트다(기존 골든 전부와 `so101_frame0`이 두 카드에서 다시 통과). `common.slang`의 나머지 `Cross` 호출 둘(Möller–Trumbore와 면 법선)은 삼각형 변을 받으며, 여기서 어떤 테스트도 그것을 움직이지 않았으므로 그대로 둔다(13.7; R2가 정확함을 측정했다, 13.8).
 
 ### 13.5 `set_lighting`과 프레임별 계약
 
@@ -1141,8 +1141,28 @@ match stream {
 
 ### 13.7 X5가 건너뛰는 것
 
-- **수집기와 평가기는 아직 추첨을 적용하지 않는다.** `es loop collect --frames`와 `es eval run --frames`(`crates/es/src/cmd/`)는 X5의 범위 밖이며, 렌더 타깃이 있는 태스크에서도 추첨되지 않은 장면을 렌더한다. 고치는 방법은 수집기에서 `env.render_overrides(env)`를 `frame_with`에 넘기고, 평가기의 프레임 소스에 `RenderOverrides`를 접어 넣는 것이다. X7이 학습하는 RL 경로인 `Rollout`은 적용한다.
+- **수집기와 평가기는 아직 추첨을 적용하지 않는다.** `es loop collect --frames`와 `es eval run --frames`(`crates/es/src/cmd/`)는 X5의 범위 밖이며, 렌더 타깃이 있는 태스크에서도 추첨되지 않은 장면을 렌더한다. 고치는 방법은 수집기에서 `env.render_overrides(env)`를 `frame_with`에 넘기고, 평가기의 프레임 소스에 `RenderOverrides`를 접어 넣는 것이다. X7이 학습하는 RL 경로인 `Rollout`은 적용한다. *R2가 처리했다(13.8).*
 - **배치 렌더링 (X3b).** `RenderOverrides`는 env별 평범한 구조체이고 `drawn_frame`은 그것의 순수 함수지만, 조명 절반은 *설정* 단위다: 한 디스패치에서 N개 env가 N개 조명을 가지려면 뷰별 조명 파라미터가 필요하고, 그것은 X3b가 정할 파라미터 배치다.
-- **나머지 두 `Cross` 내장 함수** (13.4).
+- **나머지 두 `Cross` 내장 함수** (13.4). *R2가 정확함을 측정했다(13.8).*
 - **텍스처, 재질, 가림체** — M7 R6과 패킷의 `forbidden`.
 - **HSV 지오메트리 지터, 그리고 `Full`의 스펙큘러 항의 색** — 채널별 배율이 고른 방식이다(`batch-domains.md` 5). `Full`의 Blinn-Phong 하이라이트는 흰색으로 남는다.
+
+### 13.8 추첨이 적용되는 곳 (M11/R2)
+
+패킷 `docs/packets/M11/P-M11-R2-collect-eval-draws.md`. 이제 모든 프레임 소스가 에피소드를 그 에피소드의 추첨 아래에서, 하나뿐인 `EnvRenderer::frame_with`를 거쳐 렌더한다. 그래서 같은 추첨은 어디서 렌더되든 같은 프레임이다(spec 28.14 규칙 4). `Rollout`은 `env.render_overrides(i)`를 넘긴다. `es loop collect --frames`는 `Env::reset`이 추첨을 기록한 키 — `(seed, env 0, episode)`, `CollectEvent::EpisodeBegin`에서 뽑음 — 로 Task IR 자신의 `RandomizationPlan::apply_render`를 넘긴다. 수집기가 `Env`를 소유하고 프레임 싱크는 상태만 보기 때문이며, 같은 함수이지 두 번째 추첨이 아니다. `es eval run --frames`는 러너에게서 받는다: `Evaluation::run*`은 `es_eval::runner::DrawnFrameSource`를 받고, 여기에 스위트의 `LightOverride`를 `light`에 접어 넣은(세기는 곱하고 yaw는 더함) `env.render_overrides(0)`이 넘어간다. CLI의 `LightRig`는 오버라이드가 그 조명 이상인 에피소드를 `frame_with`로 보내고, 조명만 있는 경로(`LightOverride::scene`과 다시 만든 렌더러)는 그대로 둔다. `capture` / `capture_at`은 `Rollout`의 호출별 `FrameSource`를 유지한다. 뽑힌 시야각은 두 CLI 경로 모두에서 디스크에 닿는다: 수집기의 프레임별 사이드카(X5의 `intrinsics`)와 평가기의 셀별 `layout.json`(`"intrinsics"`, 에피소드가 기록한 `ImageSpec`; 셀 하나가 에피소드 하나라서 셀별). 렌더 타깃이 없는 태스크는 항등을 뽑고 하던 그대로 렌더하고 쓴다: 모든 프레임 골든, `so101_frame0`, 평가 `.estraj` / `events.json` 고정값이 다시 통과한다.
+
+`dr_collect_eval_frames_match_rollout`(`task-reach-vision.toml`에 렌더 타깃 열한 개를 더해 생성한 `task-reach-vision-dr.toml`; `Pt` 16 spp, `seed = "tick"`; 전문가 아래 시드 201의 에피소드 둘)의 측정(RTX 3060과 RTX 4090 동일): 각 에피소드의 틱 0은 수집기의 프레임과 쌍둥이 env 위 `Rollout`의 `frame_with`가 비트 단위로 같고, 추첨 없는 프레임과는 다르다. 수집기와 평가기는 같은 상태를 가진 모든 틱에서 비트 단위로 일치한다. 발견 둘:
+
+- **리치 배포에서 전문가 아래 두 경로의 상태는 틱 2에서 갈라진다**(qpos가 ~1e-5 차이, 두 에피소드 모두) — R2가 건드리지 않는 명령 경로의 차이다. 데모 배포의 궤적은 마지막 틱까지 일치한다(`collection_and_evaluation_ask_the_policy_at_the_same_cadence`). 오라클은 상태가 일치하는 곳(에피소드당 두 틱)에서 프레임을 비교하고, 추첨은 `Rollout`과의 틱 0 비교로 확인한다. 리치 배포가 왜 갈라지는지는 열린 문제다.
+- **기록된 초점과 렌더된 초점은 `f32` 1 ULP 떨어져 있다.** `RenderOverrides::image_spec`은 `fx_f64 * focal`을 기록하고, `drawn_frame`은 `fx_f32 * (focal as f32)`로 투영하며 사이드카는 그것을 쓴다. 측정: 두 에피소드에서 `fx`, `fy` 1 ULP, `cx`, `cy` 0. 오라클은 사이드카를 ≤ 1 ULP로, `layout.json`은 기록값과 정확히 같게 묶는다. 둘을 한 계산으로 만드는 일은 `es-env`의 몫이며 R2 밖이다.
+
+**두 `Cross` 내장 함수는 정확하다; `common.slang`은 바뀌지 않았다.** `dr_cross_is_exact`는 쿼터니언 성분 중 2의 거듭제곱이 없는 뽑힌 포즈 세 개에서 코넬 박스를 렌더한다:
+
+| 주장 | RTX 3060 (로컬) | RTX 4090 (오라클 서버) |
+|---|---|---|
+| `Rs` `Rgb8` / seg / depth (모든 광선에 Möller–Trumbore) | 비트 동일 / 비트 동일 / 0 ULP | 비트 동일 / 비트 동일 / 0 ULP |
+| `Pt` 1 spp, 2 바운스, `PtRadiance` (모든 바운스에 Möller–Trumbore) | 0 ULP | 0 ULP |
+| `Pt` NEE 1 spp, `PtRadiance` 대 CPU (모든 광원 pdf에 면적) | 196 / 159 / 1,707 ULP, 정규화 ≤ 1.9e-6 | 196 / 159 / 1,707 ULP, 정규화 ≤ 1.9e-6 |
+| `es_tri_area`를 `es_cross`로 바꾼 것과 내장 함수의 장치 NEE·`Pt` 바이트 | 세 포즈 모두 동일 | 세 포즈 모두 동일 |
+
+NEE는 포즈가 있든 없든 CPU에 대해 비트 단위가 아니다(10절). 그래서 면적의 `Cross`에 대한 증거는 장치 자신과의 비교다: 내장 함수를 `es_cross`로 바꿔도 모든 바이트가 그대로였고, 면적을 절반으로 하면 움직였다(항이 살아 있다). 어느 내장 함수도 풀어 쓴 형태와 다르게 반올림하지 않으므로 코드는 그대로 둔다.

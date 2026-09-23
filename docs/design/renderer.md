@@ -1819,7 +1819,8 @@ and `NoContraction` decorates *our* arithmetic, not the driver's — it was free
 `cross` is, and the drawn camera is **0 ULP** in every channel. No committed frame moved: for the
 golden cameras the two forms are the same bits (every existing golden and `so101_frame0` re-pass
 on both cards). The two other `Cross` calls in `common.slang` (Möller–Trumbore and the face
-normal) take triangle edges, no test here moved them, and they are left as they are (13.7).
+normal) take triangle edges, no test here moved them, and they are left as they are (13.7; R2
+measured them exact, 13.8).
 
 ### 13.5 `set_lighting` and the per-frame contract
 
@@ -1859,11 +1860,64 @@ the table is what it measured. The two cards agree to the byte and to the ULP on
   `es eval run --frames` (`crates/es/src/cmd/`) are outside X5's scope and still render the
   undrawn scene for a task with render targets; the fix is to hand `env.render_overrides(env)` to
   `frame_with` in the collector and to fold `RenderOverrides` into the evaluator's frame source.
-  `Rollout` — the RL path X7 trains on — applies them.
+  `Rollout` — the RL path X7 trains on — applies them. *Done by R2 (13.8).*
 - **Batched rendering (X3b).** `RenderOverrides` is a plain per-env struct and `drawn_frame` a pure
   function of it, but the lighting half is per *config*: N envs with N lightings in one dispatch
   need the light parameters per view, which is X3b's parameter layout to decide.
-- **The other two `Cross` builtins** (13.4).
+- **The other two `Cross` builtins** (13.4). *Measured exact by R2 (13.8).*
 - **Textures, materials, occluders** — M7 R6 and the packet's `forbidden`.
 - **HSV geom jitter, and colour on `Full`'s specular term** — the per-channel scale is the one
   chosen (`batch-domains.md` 5); `Full`'s Blinn-Phong highlight stays white.
+
+### 13.8 Where the draws are applied (M11/R2)
+
+Packet `docs/packets/M11/P-M11-R2-collect-eval-draws.md`. Every frame source now renders an
+episode under that episode's draws, through the one `EnvRenderer::frame_with`, so the same draw
+is the same frame wherever it is rendered (spec 28.14 rule 4). `Rollout` hands it
+`env.render_overrides(i)`. `es loop collect --frames` hands it the Task IR's own
+`RandomizationPlan::apply_render` at the key `Env::reset` recorded the draw under —
+`(seed, env 0, episode)`, drawn on `CollectEvent::EpisodeBegin` — because the collector owns the
+`Env` and its frame sink sees only the state; it is the same function, not a second draw.
+`es eval run --frames` gets it from the runner: `Evaluation::run*` take an
+`es_eval::runner::DrawnFrameSource`, handed `env.render_overrides(0)` with the suite's
+`LightOverride` folded into its `light` (intensities multiply, yaws add), and the CLI's
+`LightRig` sends an episode whose overrides are more than that light to `frame_with`, leaving the
+light-only path (`LightOverride::scene` and a rebuilt renderer) as it was; `capture` /
+`capture_at` keep `Rollout`'s per-call `FrameSource`. A drawn field of view reaches disk on both
+CLI paths: the collector's per-frame sidecar (X5's `intrinsics`) and the evaluator's per-cell
+`layout.json` (`"intrinsics"`, the episode's recorded `ImageSpec`; per cell because a cell is one
+episode). A task without render targets draws the identity and renders and writes exactly what
+it did: every frame golden, `so101_frame0` and the evaluation `.estraj` / `events.json` pins
+re-pass.
+
+`dr_collect_eval_frames_match_rollout` (`task-reach-vision-dr.toml`, generated from
+`task-reach-vision.toml` plus eleven render targets; `Pt` 16 spp, `seed = "tick"`; two episodes of
+seed 201 under the expert) measured, on the RTX 3060 and the RTX 4090 alike: tick 0 of each episode is, bit for bit, the collector's
+frame and `Rollout`'s `frame_with` on a twin env, and not the undrawn frame; collector and
+evaluator agree bit for bit at every tick they hold the same state. Two findings:
+
+- **Under the expert on the reach deployment the two paths' states part at tick 2** (qpos off by
+  ~1e-5, both episodes) — a command-path difference R2 does not touch; the demo deployment's
+  traces agree to the last tick (`collection_and_evaluation_ask_the_policy_at_the_same_cadence`).
+  The oracle compares frames where the states agree (two ticks per episode) and carries the draw
+  through the tick-0 comparison with `Rollout`. Why the reach deployment parts is open.
+- **The recorded focal and the rendered focal are one `f32` ULP apart.**
+  `RenderOverrides::image_spec` records `fx_f64 * focal`; `drawn_frame` projects with
+  `fx_f32 * (focal as f32)`, which is what the sidecar writes. Measured: 1 ULP on `fx` and `fy`
+  in both episodes, 0 on `cx`, `cy`. The oracle holds the sidecar to ≤ 1 ULP and `layout.json`
+  to the record exactly; making them one computation is `es-env`'s, outside R2.
+
+**The two `Cross` builtins are exact; `common.slang` is unchanged.** `dr_cross_is_exact`
+renders the Cornell box from three drawn poses with no power-of-two quaternion component:
+
+| claim | RTX 3060 (local) | RTX 4090 (oracle server) |
+|---|---|---|
+| `Rs` `Rgb8` / seg / depth (Möller–Trumbore on every ray) | bit-equal / bit-equal / 0 ULP | bit-equal / bit-equal / 0 ULP |
+| `Pt` 1 spp, 2 bounces, `PtRadiance` (Möller–Trumbore on every bounce) | 0 ULP | 0 ULP |
+| `Pt` NEE 1 spp, `PtRadiance` vs the CPU (the area in every light pdf) | 196 / 159 / 1,707 ULP, ≤ 1.9e-6 normalized | 196 / 159 / 1,707 ULP, ≤ 1.9e-6 normalized |
+| the device's NEE and `Pt` bytes with `es_tri_area` on `es_cross` vs the builtin | identical, all three poses | identical, all three poses |
+
+NEE is not bitwise against the CPU with or without a pose (section 10), so for the area's `Cross`
+the evidence is the device against itself: swapping the builtin for `es_cross` left every byte
+where it was, while halving the area moved them (the term is live). Neither builtin rounds
+differently from the written-out form, so the code stays as it is.
