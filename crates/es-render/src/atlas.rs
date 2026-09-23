@@ -181,14 +181,29 @@ impl Tile {
     /// is compared bit for bit, and a second encoding would be one more thing to keep
     /// identical (`docs/design/visible-learning.md` section 7.2).
     pub fn write_to(&self, dir: &std::path::Path, stem: &str) -> std::io::Result<()> {
+        self.write_to_with_intrinsics(dir, stem, None)
+    }
+
+    /// [`Self::write_to`], and when `intrinsics` is set, the sidecar also carries them under
+    /// `"intrinsics"`: the camera a drawn field of view really rendered with (packet M11/X5,
+    /// `INV-14`). `None` writes exactly [`Self::write_to`]'s sidecar.
+    pub fn write_to_with_intrinsics(
+        &self,
+        dir: &std::path::Path,
+        stem: &str,
+        intrinsics: Option<&crate::view::Intrinsics>,
+    ) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         std::fs::write(dir.join(format!("{stem}.bin")), self.to_bytes())?;
-        let sidecar = serde_json::json!({
+        let mut sidecar = serde_json::json!({
             "name": stem,
             "dtype": self.dtype(),
             "layout": "row-major, little-endian, tightly packed",
             "shape": self.shape,
         });
+        if let Some(i) = intrinsics {
+            sidecar["intrinsics"] = serde_json::json!(i);
+        }
         let text = serde_json::to_string_pretty(&sidecar)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(dir.join(format!("{stem}.json")), format!("{text}\n"))

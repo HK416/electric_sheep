@@ -2414,12 +2414,16 @@ const DRAWS: [Draw; 7] = [
 /// (on the `Rs` path a light is a gain on the whole reflected term, on `Pt` a gain on the
 /// emitters; `renderer.md` section 13.2).
 fn scale_tris(tri: &mut TriScene, seg: Option<u32>, gain: [f32; 3], albedo: bool) {
-    for t in tri.tris.iter_mut().filter(|t| seg.is_none_or(|s| t.seg == s)) {
-        for c in 0..3 {
+    for t in tri
+        .tris
+        .iter_mut()
+        .filter(|t| seg.is_none_or(|s| t.seg == s))
+    {
+        for (c, g) in gain.iter().enumerate() {
             if albedo {
-                t.albedo[c] *= gain[c];
+                t.albedo[c] *= g;
             }
-            t.emission[c] *= gain[c];
+            t.emission[c] *= g;
         }
     }
 }
@@ -2597,7 +2601,10 @@ fn dr_gpu_path_tracer_matches_the_cpu() {
     let test = "dr_gpu_path_tracer_matches_the_cpu";
     // The CPU half runs everywhere.
     let golden = cpu_dr_pt_sun().tile(Channel::Rgb8).unwrap().to_bytes();
-    assert!(golden == read_golden("dr_cornell_pt_sun_rgb8"));
+    assert!(
+        golden == read_golden("dr_cornell_pt_sun_rgb8"),
+        "dr_cornell_pt_sun_rgb8 differs from its golden"
+    );
     let Some(gpu) = open(test) else { return };
 
     // Emitters x colour x intensity, sky on and scaled: `Pt` 1 spp, bit for bit.
@@ -2666,12 +2673,25 @@ fn dr_pt_directional_light_lights_a_dark_scene() {
     let lit_px = |f: &[f32]| f.chunks(3).filter(|p| p.iter().any(|c| *c > 0.0)).count();
 
     let off = cpu::path_trace(&dark(), &cam, &cfg, 0);
-    let off = off.tile(Channel::PtRadiance).unwrap().as_f32().unwrap().to_vec();
+    let off = off
+        .tile(Channel::PtRadiance)
+        .unwrap()
+        .as_f32()
+        .unwrap()
+        .to_vec();
     assert_eq!(lit_px(&off), 0, "the dark box has a light somewhere");
     let on = cpu::path_trace(&dark(), &cam, &sun(cfg.clone()), 0);
-    let on = on.tile(Channel::PtRadiance).unwrap().as_f32().unwrap().to_vec();
+    let on = on
+        .tile(Channel::PtRadiance)
+        .unwrap()
+        .as_f32()
+        .unwrap()
+        .to_vec();
     let n = lit_px(&on);
-    println!("CPU: {n} of {} pixels lit by the directional light alone", TILE * TILE);
+    println!(
+        "CPU: {n} of {} pixels lit by the directional light alone",
+        TILE * TILE
+    );
     assert!(n * 4 > (TILE * TILE) as usize, "only {n} pixels lit");
 
     let Some(gpu) = open(test) else { return };
@@ -2684,7 +2704,10 @@ fn dr_pt_directional_light_lights_a_dark_scene() {
         .expect("radiance");
     let got = got.as_f32().unwrap();
     let (ulp, _) = max_ulp(got, &on);
-    println!("GPU: {} pixels lit, max ULP {ulp} against the CPU", lit_px(got));
+    println!(
+        "GPU: {} pixels lit, max ULP {ulp} against the CPU",
+        lit_px(got)
+    );
     assert_eq!(lit_px(got), n, "the GPU lit a different set of pixels");
     assert!(max_normalized(got, &on) <= 1e-5);
 }
@@ -2711,7 +2734,10 @@ fn dr_set_lighting_is_a_parameter() {
         .tile(Channel::Rgb8)
         .unwrap()
         .to_bytes();
-    assert!(got == want, "re-lit Rs differs from the drawn config's CPU frame");
+    assert!(
+        got == want,
+        "re-lit Rs differs from the drawn config's CPU frame"
+    );
     r.set_lighting(&rs_cfg());
     let back = r
         .render(&cams)
@@ -2737,7 +2763,10 @@ fn dr_set_lighting_is_a_parameter() {
     let fresh = render(&mut Renderer::new(&gpu, sun_cfg.clone()).expect("renderer"));
     let mut relit = Renderer::new(&gpu, pt_nee_cfg()).expect("renderer");
     relit.set_lighting(&sun_cfg);
-    assert!(render(&mut relit) == fresh, "re-lit Pt differs from a fresh one");
+    assert!(
+        render(&mut relit) == fresh,
+        "re-lit Pt differs from a fresh one"
+    );
     println!("set_lighting: Rs and Pt bit-identical to a fresh renderer");
 }
 

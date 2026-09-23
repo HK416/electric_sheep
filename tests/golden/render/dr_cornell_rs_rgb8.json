@@ -1,0 +1,15 @@
+{
+  "dtype": "u8",
+  "generator": "cargo test -p es-render -- --ignored generate_goldens",
+  "kernel": "raster.v1 (every M11/X5 draw at once: intensity 1.4, colour, direction, ambient 0.35, `tall` recoloured, camera moved, focal x1.3)",
+  "layout": "row-major, little-endian, tightly packed",
+  "name": "dr_cornell_rs_rgb8",
+  "oracle": "es_render::cpu, the pure-Rust mirror of the Slang kernels",
+  "pins": "OpenCV camera frame and top-left image origin (spec 3.1); depth in metres, unit_m = 1",
+  "shape": [
+    64,
+    64,
+    3
+  ],
+  "spec": "docs/design/renderer.md"
+}

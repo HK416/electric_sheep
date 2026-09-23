@@ -974,8 +974,12 @@ fn pt_svgf_sensor_is_a_pure_function_of_the_tick() {
 /// `targets`, each on its own stream `dr.<target>`.
 fn dr_task(base: &str, targets: &[(String, es_ir::task::Distribution)]) -> es_ir::task::TaskIr {
     let mut task = es_ir::serial::task_from_toml(
-        &std::fs::read_to_string(repo_root().join("tests/fixtures/visible-learning").join(base))
-            .expect("the committed task"),
+        &std::fs::read_to_string(
+            repo_root()
+                .join("tests/fixtures/visible-learning")
+                .join(base),
+        )
+        .expect("the committed task"),
     )
     .expect("it parses");
     task.graph = es_ir::task::TaskGraph::new(1);
@@ -1004,13 +1008,14 @@ fn dr_targets(scene: &SceneDesc) -> Vec<(String, es_ir::task::Distribution)> {
         .find(|c| c.id == overhead(scene))
         .expect("the overhead camera")
         .name;
-    let cube = &by_name(scene, "cube").geoms[0].name;
+    // The bin, not the cube: at the pinned pose the gripper hides the cube from overhead.
+    let bin = "bin_floor";
     let mut out = vec![
         ("light.intensity".to_owned(), uniform(0.7, 1.3)),
         ("light.direction".to_owned(), uniform(-30.0, 30.0)),
         ("light.color".to_owned(), uniform(0.7, 1.3)),
         ("light.ambient".to_owned(), uniform(0.5, 2.0)),
-        (format!("geom.{cube}.rgba"), uniform(0.5, 1.5)),
+        (format!("geom.{bin}.rgba"), uniform(0.5, 1.5)),
         (format!("camera.{cam}.fov"), uniform(0.85, 1.15)),
     ];
     for axis in ["x", "y", "z"] {
@@ -1049,9 +1054,14 @@ fn dr_env_frames_follow_the_draws_gpu_equals_cpu() {
     let cfg = cfg(&scene);
     let targets = dr_targets(&scene);
     let cpu_of = |ov: &es_env::randomize::RenderOverrides| {
-        let (tri, view, rc) =
-            es_env::render::drawn_frame(&scene, &cfg, ov, &world, &mut Default::default())
-                .expect("drawn");
+        let (tri, view, rc) = es_env::render::drawn_frame(
+            &scene,
+            &cfg,
+            ov,
+            &world,
+            &mut es_render::SceneCache::default(),
+        )
+        .expect("drawn");
         cpu::rasterize(&tri, &view, &rc, 0)
             .tile(Channel::Rgb8)
             .expect("rgb8")
@@ -1114,10 +1124,18 @@ fn dr_env_frames_follow_the_draws_gpu_equals_cpu() {
     w.frame_with(&f.model, &f.state(), 0, &ep0).expect("frame");
     let json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("000000.json")).unwrap()).unwrap();
-    let (_, view, _) =
-        es_env::render::drawn_frame(&scene, &cfg, &ep0, &world, &mut Default::default()).unwrap();
+    let (_, view, _) = es_env::render::drawn_frame(
+        &scene,
+        &cfg,
+        &ep0,
+        &world,
+        &mut es_render::SceneCache::default(),
+    )
+    .unwrap();
     assert_eq!(
-        json["intrinsics"]["fx"].as_f64().map(|v| (v as f32).to_bits()),
+        json["intrinsics"]["fx"]
+            .as_f64()
+            .map(|v| (v as f32).to_bits()),
         Some(view.spec.intrinsics.fx.to_bits())
     );
     let _ = std::fs::remove_dir_all(&dir);
@@ -1146,41 +1164,58 @@ fn dr_env_pt_sensor_gets_a_directional_light() {
     let ov = dr_draw(&task, &scene, &f.model, 0);
     assert!(ov.radiance.is_some() && ov.sky.is_some());
     // The same targets on the rasterizer's document are refused by name.
-    let err = es_env::RandomizationPlan::compile(
-        &dr_task("task.toml", &targets),
-        &scene,
-        &f.model,
-    )
-    .unwrap_err();
+    let err = es_env::RandomizationPlan::compile(&dr_task("task.toml", &targets), &scene, &f.model)
+        .unwrap_err();
     assert!(err.to_string().contains("light.radiance"), "{err}");
 
     let cpu_of = |ov: &es_env::randomize::RenderOverrides| {
-        let (tri, view, rc) =
-            es_env::render::drawn_frame(&scene, &pt, ov, &world, &mut Default::default())
-                .expect("drawn");
+        let (tri, view, rc) = es_env::render::drawn_frame(
+            &scene,
+            &pt,
+            ov,
+            &world,
+            &mut es_render::SceneCache::default(),
+        )
+        .expect("drawn");
         cpu::path_trace(&tri, &view, &rc, 0)
             .tile(Channel::Rgb8)
             .expect("rgb8")
             .to_bytes()
     };
-    let (lit, dark) = (cpu_of(&ov), cpu_of(&Default::default()));
+    let (lit, dark) = (
+        cpu_of(&ov),
+        cpu_of(&es_env::randomize::RenderOverrides::default()),
+    );
     let mean = |b: &[u8]| b.iter().map(|v| f64::from(*v)).sum::<f64>() / b.len() as f64;
     println!(
         "{test}: mean byte {:.1} with the drawn sun, {:.1} without",
         mean(&lit),
         mean(&dark)
     );
-    assert!(mean(&lit) > mean(&dark), "the directional light lit nothing");
+    assert!(
+        mean(&lit) > mean(&dark),
+        "the directional light lit nothing"
+    );
 
     let Some(gpu) = open(test) else { return };
     let mut r = EnvRenderer::new(&gpu, &scene, pt.clone()).expect("renderer");
-    for (label, ov, want) in [("drawn", &ov, &lit), ("undrawn", &Default::default(), &dark)] {
+    for (label, ov, want) in [
+        ("drawn", &ov, &lit),
+        (
+            "undrawn",
+            &es_env::randomize::RenderOverrides::default(),
+            &dark,
+        ),
+    ] {
         let got = r
             .frame_with(&f.model, &f.state(), 0, ov)
             .expect("frame")
             .to_bytes();
         let diff = got.iter().zip(want).filter(|(a, b)| a != b).count();
-        println!("{test}: {label} GPU vs CPU {diff} of {} bytes differ", got.len());
+        println!(
+            "{test}: {label} GPU vs CPU {diff} of {} bytes differ",
+            got.len()
+        );
         assert!(
             diff * 1000 <= got.len(),
             "{label}: {diff} bytes differ, more than a shadow-ray tie explains"

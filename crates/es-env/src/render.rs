@@ -30,9 +30,11 @@ use es_ir::task::{SeedStream, SensorPath, SensorRender};
 use es_math::{Pose, Quat, Vec3};
 use es_physics_core::backend::{ModelInfo, StateView};
 use es_render::{
-    CameraView, Channel, RenderConfig, RenderPath, Renderer, Tile, TileAtlasCfg, Tonemap,
+    CameraView, Channel, RenderConfig, RenderPath, Renderer, SceneCache, Shading, Tile,
+    TileAtlasCfg, Tonemap, TriScene,
 };
 
+use crate::randomize::RenderOverrides;
 use crate::EnvError;
 
 /// `T_opencv_mujoco`: a rotation of pi about `+X`.
@@ -218,6 +220,99 @@ pub fn camera_view(
     })
 }
 
+/// Everything one frame renders from under `ov` (packet M11/X5): the tessellated scene, the
+/// camera and the config — the **one** mapping from a render draw to render inputs, so
+/// [`EnvRenderer::frame_with`] and a CPU reference built from it cannot disagree
+/// (`docs/design/renderer.md` section 13).
+///
+/// Under the identity nothing is touched and the three are exactly what [`EnvRenderer::frame`]
+/// rendered before this packet. Otherwise, per path:
+///
+/// * **colour** — a geom's `rgba` draw scales its triangles' albedo and emission; the light's
+///   `intensity * color` scales albedo and emission on `Rs` (the Lambert term is linear in
+///   albedo, [`crate::randomize::LightOverride`]) and emission, the directional light and the
+///   sky on `Pt` (the rendering equation is linear in its sources, and scaling albedo there
+///   would double-count);
+/// * **direction** — `light_dir` yawed and pitched ([`RenderOverrides::light_dir`]);
+/// * **ambient** — `ambient` (clamped to `[0, 1]`) and `Full`'s hemisphere on `Rs`, the sky on
+///   `Pt`;
+/// * **camera** — the drawn offset composed on the right of the camera's `OpenCV` pose, and
+///   `fx`, `fy` times the focal scale about the principal point (`INV-14`: the episode records
+///   the same numbers, [`RenderOverrides::image_spec`]).
+///
+/// Per frame and from plain inputs, so a batched renderer (packet M11/X3b) can apply one env's
+/// overrides to that env's slice without state.
+pub fn drawn_frame(
+    scene: &SceneDesc,
+    cfg: &EnvRendererCfg,
+    ov: &RenderOverrides,
+    world: &BTreeMap<StableId, Pose>,
+    cache: &mut SceneCache,
+) -> Result<(TriScene, CameraView, RenderConfig), EnvError> {
+    let mut tri = cache
+        .tri_scene(scene, world)
+        .map_err(|e| EnvError::Unsupported(format!("tessellation: {e}")))?;
+    let mut view = camera_view(scene, cfg, world)?;
+    let mut rc = render_config(cfg);
+    if ov.is_identity() {
+        return Ok((tri, view, rc));
+    }
+    let pt = matches!(rc.path, RenderPath::Pt { .. });
+    let light = ov.light_gain();
+
+    // Segmentation id `k` is the `k`-th geom in scene order (`TriScene::from_scene`).
+    let ids: Vec<StableId> = scene
+        .bodies
+        .iter()
+        .flat_map(|b| &b.geoms)
+        .map(|g| g.id)
+        .collect();
+    let unit = [1.0; 3];
+    for t in &mut tri.tris {
+        let g = (t.seg as usize)
+            .checked_sub(1)
+            .and_then(|k| ids.get(k))
+            .and_then(|id| ov.geoms.get(id))
+            .unwrap_or(&unit);
+        for c in 0..3 {
+            let lit = g[c] * light[c];
+            t.albedo[c] *= (if pt { g[c] } else { lit }) as f32;
+            t.emission[c] *= lit as f32;
+        }
+    }
+
+    let d = ov.light_dir([rc.light_dir.x, rc.light_dir.y, rc.light_dir.z]);
+    rc.light_dir = Vec3::new(d[0], d[1], d[2]);
+    let ambient = ov.ambient as f32;
+    if pt {
+        let sun = ov.radiance.map_or(rc.light_rgb, |r| [r as f32; 3]);
+        let sky = ov.sky.map_or(rc.sky, |r| [r as f32; 3]);
+        for c in 0..3 {
+            rc.light_rgb[c] = sun[c] * light[c] as f32;
+            rc.sky[c] = sky[c] * (light[c] * ov.ambient) as f32;
+        }
+    } else {
+        rc.ambient = (rc.ambient * ambient).clamp(0.0, 1.0);
+        if let Shading::Full {
+            sky_rgb,
+            ground_rgb,
+            ..
+        } = &mut rc.shading
+        {
+            for v in sky_rgb.iter_mut().chain(ground_rgb.iter_mut()) {
+                *v = (*v * ambient).clamp(0.0, 1.0);
+            }
+        }
+    }
+
+    if let Some(d) = ov.cameras.get(&cfg.camera) {
+        view.pose = view.pose.compose(d.pose());
+        view.spec.intrinsics.fx *= d.focal as f32;
+        view.spec.intrinsics.fy *= d.focal as f32;
+    }
+    Ok((tri, view, rc))
+}
+
 /// A camera that is **not** in the scene: eye, aim point and vertical field of view.
 ///
 /// The showcase render (packet M5/V9) needs a view the Observation IR does not declare, and
@@ -364,12 +459,25 @@ impl<'gpu> EnvRenderer<'gpu> {
         state: &StateView<'_>,
         env: u32,
     ) -> Result<Tile, EnvError> {
+        self.frame_with(model, state, env, &RenderOverrides::default())
+    }
+
+    /// [`Self::frame`] under one episode's render draws (packet M11/X5): the scene, lights and
+    /// camera [`drawn_frame`] makes of `ov`. The draws are per frame and leave nothing behind,
+    /// so the identity after a draw renders today's frame again. A drawn field of view is
+    /// written into the frame's sidecar as `intrinsics` (`INV-14`); a frame with no camera
+    /// draw writes the sidecar it always did.
+    pub fn frame_with(
+        &mut self,
+        model: &ModelInfo,
+        state: &StateView<'_>,
+        env: u32,
+        ov: &RenderOverrides,
+    ) -> Result<Tile, EnvError> {
         let world = body_poses(model, state, env);
-        let tri = self
-            .cache
-            .tri_scene(&self.scene, &world)
-            .map_err(|e| EnvError::Unsupported(format!("tessellation: {e}")))?;
-        let view = camera_view(&self.scene, &self.cfg, &world)?;
+        let (tri, view, rc) = drawn_frame(&self.scene, &self.cfg, ov, &world, &mut self.cache)?;
+        // Parameters only (`Renderer::set_lighting`): no pipeline is rebuilt per episode.
+        self.renderer.set_lighting(&rc);
         // The sample keys of this tick (packet M10/W1a). `Fixed` is left alone rather than
         // re-set to the same number, so the default path does not even touch the config.
         if self.cfg.seed_stream == SeedStream::Tick {
@@ -390,7 +498,11 @@ impl<'gpu> EnvRenderer<'gpu> {
             .read_tile(0, self.cfg.channel)
             .map_err(|e| EnvError::Unsupported(format!("readback: {e}")))?;
         if let Some(dir) = &self.cfg.frames_dir {
-            tile.write_to(dir, &format!("{:06}", self.frame))
+            let drawn = ov
+                .cameras
+                .contains_key(&self.cfg.camera)
+                .then_some(&view.spec.intrinsics);
+            tile.write_to_with_intrinsics(dir, &format!("{:06}", self.frame), drawn)
                 .map_err(|e| EnvError::Unsupported(format!("frame write: {e}")))?;
         }
         self.frame += 1;

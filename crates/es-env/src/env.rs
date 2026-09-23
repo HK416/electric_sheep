@@ -22,9 +22,25 @@ use crate::control::ControlExecutor;
 use crate::domains::DomainRunner;
 use crate::episode::{self, Episode, EpisodeRecorder, EpisodeShape, StepRow, Termination};
 use crate::plan::{ScalarPlan, Source};
-use crate::randomize::{ParamScales, RandomizationPlan, ResetBuffer};
+use crate::randomize::{ParamScales, RandomizationPlan, RenderOverrides, ResetBuffer};
 use crate::scheduler::{BatchDomains, Schedule};
 use crate::EnvError;
+
+/// Every image sensor the task declares, as `(camera, declared ImageSpec)`, in channel order.
+fn image_sensors(task: &TaskIr) -> Vec<(es_core::StableId, es_ir::image::ImageSpec)> {
+    task.observation_spec
+        .channels
+        .values()
+        .filter_map(|c| match (&c.source, c.ty.frame, c.ty.image) {
+            (
+                es_ir::task::ObsSource::Sensor { .. },
+                es_ir::types::Frame::Camera(camera),
+                Some(spec),
+            ) => Some((camera, spec)),
+            _ => None,
+        })
+        .collect()
+}
 
 /// The §12.4 metric set. Every rate is `Option` — a metric nobody measured is `None`, never a
 /// fabricated zero — and there is deliberately **no `step/s` field**: simulation throughput is
@@ -70,6 +86,9 @@ pub struct Env<B: PhysicsBackend> {
     /// IR-C (spec 6.2). `None` is the IR-D-only task, and then nothing below changes.
     control: Option<ControlExecutor>,
     randomization: RandomizationPlan,
+    /// Every declared image sensor as `(camera, declared ImageSpec)`: what an episode's
+    /// drawn field of view and pose are applied to (packet M11/X5, `INV-14`).
+    sensors: Vec<(es_core::StableId, es_ir::image::ImageSpec)>,
     recorder: EpisodeRecorder,
     failure_policy: FailurePolicy,
     seed: u64,
@@ -139,6 +158,7 @@ impl<B: PhysicsBackend> Env<B> {
             scalar: ScalarPlan::compile(task, scene, &model)?,
             control: ControlExecutor::new(task, n_envs),
             randomization: RandomizationPlan::compile(task, scene, &model)?,
+            sensors: image_sensors(task),
             recorder: EpisodeRecorder::new(n_envs, shape, task.config.max_episode_steps),
             failure_policy: FailurePolicy::default(),
             seed,
@@ -188,6 +208,12 @@ impl<B: PhysicsBackend> Env<B> {
         self.tick
     }
 
+    /// The render draws `env`'s current episode was reset with (packet M11/X5): what its
+    /// frame source hands `EnvRenderer::frame_with`.
+    pub fn render_overrides(&self, env: u32) -> &RenderOverrides {
+        &self.recorder.open(env).render
+    }
+
     pub fn health(&self) -> &[EnvHealth] {
         &self.health
     }
@@ -226,6 +252,7 @@ impl<B: PhysicsBackend> Env<B> {
             );
             qpos.fill(0.0);
             qvel.fill(0.0);
+            let episode = self.episode[i];
             let mut scales = ParamScales::new();
             self.randomization.apply(
                 self.seed,
@@ -253,6 +280,17 @@ impl<B: PhysicsBackend> Env<B> {
                 self.backend.set_params(&[*env], &params)?;
             }
             self.recorder.set_param_scales(*env, scales);
+            // The render draws, from the same key; the physics never sees them (packet
+            // M11/X5). A task that declares none records the identity.
+            let mut render = RenderOverrides::default();
+            self.randomization
+                .apply_render(self.seed, *env, episode, &mut render);
+            let specs = self
+                .sensors
+                .iter()
+                .map(|(camera, declared)| (*camera, render.image_spec(*camera, declared)))
+                .collect();
+            self.recorder.set_render(*env, render, specs);
             self.last_ctrl[i * self.model.nu as usize..(i + 1) * self.model.nu as usize].fill(0.0);
         }
 

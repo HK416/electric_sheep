@@ -4,12 +4,18 @@
 //! time, so the per-reset path has no string work and cannot fail. A target this runtime does
 //! not implement is [`EnvError::Unsupported`] naming it — never silently skipped
 //! (`docs/design/batch-domains.md` §5).
+//!
+//! Render targets (packet M11/X5, spec 28.14 rule 4) draw into a per-env [`RenderOverrides`]
+//! that the frame source reads at render time ([`RandomizationPlan::apply_render`]); the
+//! physics never sees them, and a task that declares none draws the identity.
 
 use std::collections::BTreeMap;
 
 use es_assets::scene::SceneDesc;
 use es_core::StableId;
-use es_ir::task::{Distribution, TaskIr, TaskNode};
+use es_ir::image::ImageSpec;
+use es_ir::task::{Distribution, ObsSource, SensorPath, TaskIr, TaskNode};
+use es_math::{approx, Pose, Quat, Vec3};
 use es_physics_core::backend::ModelInfo;
 
 use crate::rng::EnvRng;
@@ -25,6 +31,294 @@ pub(crate) enum Target {
     /// Multiplicative scale on a model parameter: recorded in the episode and pushed into the
     /// backend through `PhysicsBackend::set_params` at reset (packet M11/X4).
     Scale(Param, StableId),
+    /// A render draw (packet M11/X5): recorded in the episode, read by the frame source.
+    Render(Visual),
+}
+
+/// One field of [`RenderOverrides`] a render draw writes. The `usize` is a channel (`r g b`)
+/// or an axis (`x y z`, `roll pitch yaw`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Visual {
+    Intensity,
+    Yaw,
+    Pitch,
+    Color(usize),
+    Kelvin,
+    Ambient,
+    Radiance,
+    Sky,
+    GeomRgb(StableId, usize),
+    CameraOffset(StableId, usize),
+    CameraRot(StableId, usize),
+    CameraFocal(StableId),
+}
+
+/// The scene lighting one episode renders under (§10.2 `light_intensity`, `light_direction`;
+/// moved here from `es-eval` by packet M11/X5 so the evaluation's two perturbations and the
+/// Task IR's `light.intensity` / `light.direction` draws are one type).
+///
+/// Two scalars rather than a light model: the `Rs` path shades
+/// `albedo * (ambient + n.l * (1 - ambient)) + emission` from **one** directional light
+/// (`crates/es-render/src/cpu.rs`), so a light is exactly a gain and a direction.
+///
+/// On `Rs` the gain is the scene's own colours ([`Self::scene`]): that Lambert term is linear
+/// in `albedo`, so scaling every geom's rgba by `k` is *identical* to scaling the incident
+/// radiance by `k`. On `Pt` that would double-count (albedo *and* emission), so the render
+/// draws scale the emitters, the directional light and the sky instead
+/// (`crate::render::drawn_frame`, `docs/design/renderer.md` section 13). The evaluation keeps
+/// [`Self::scene`] on both paths, byte for byte as it always ran.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LightOverride {
+    /// Multiplier on the light's radiance; `1.0` is the scene as authored.
+    pub intensity: f64,
+    /// Yaw of the light direction about `+Z`, in degrees; `0.0` is the scene as authored.
+    pub yaw_deg: f64,
+}
+
+impl Default for LightOverride {
+    /// The scene as authored: the identity, so a suite with no light perturbation renders
+    /// exactly what every earlier packet rendered.
+    fn default() -> Self {
+        Self {
+            intensity: 1.0,
+            yaw_deg: 0.0,
+        }
+    }
+}
+
+impl LightOverride {
+    /// Whether this leaves the scene as authored. A caller holding a renderer rebuilds it
+    /// only when the override changes, so the nominal cell builds exactly one.
+    pub fn is_identity(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// `base` with every geom's colour scaled by [`Self::intensity`] — the scene to
+    /// tessellate and upload for this episode.
+    ///
+    /// Alpha is untouched: it is not radiance. A clone rather than an in-place edit, because
+    /// the caller's scene is the *authored* one and every episode starts from it.
+    pub fn scene(&self, base: &SceneDesc) -> SceneDesc {
+        let mut out = base.clone();
+        // Exact, not within a margin: this is the "nothing was drawn" path, and a draw that
+        // really did land on 1.0 renders the same scene either way.
+        if self.intensity.to_bits() == 1.0_f64.to_bits() {
+            return out;
+        }
+        for body in &mut out.bodies {
+            for geom in &mut body.geoms {
+                for c in &mut geom.rgba[..3] {
+                    *c *= self.intensity;
+                }
+            }
+        }
+        out
+    }
+
+    /// `dir` yawed about `+Z` by [`Self::yaw_deg`], for the renderer's one directional light.
+    ///
+    /// `es_math::approx`, not `std`: a perturbation draw is an input to the §10.1 table and
+    /// two machines must agree on it bit for bit (§3.4).
+    pub fn rotate_dir(&self, dir: [f64; 3]) -> [f64; 3] {
+        if self.yaw_deg.to_bits() == 0.0_f64.to_bits() {
+            return dir;
+        }
+        let a = (self.yaw_deg as f32).to_radians();
+        let (s, c) = (f64::from(approx::sin(a)), f64::from(approx::cos(a)));
+        [dir[0] * c - dir[1] * s, dir[0] * s + dir[1] * c, dir[2]]
+    }
+}
+
+/// One camera's draw: a rigid offset in the camera's own `OpenCV` frame (`+X` right, `+Y`
+/// down, `+Z` forward, spec 3.1) and a zoom about the principal point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CameraDraw {
+    /// Translation, metres, along the camera's own `x y z`.
+    pub offset: [f64; 3],
+    /// Rotation, degrees: roll about `+Z`, pitch about `+X`, yaw about `+Y`.
+    pub rot_deg: [f64; 3],
+    /// `fx`, `fy` multiplier; `cx`, `cy` stay. `> 1` narrows the field of view.
+    pub focal: f64,
+}
+
+impl Default for CameraDraw {
+    fn default() -> Self {
+        Self {
+            offset: [0.0; 3],
+            rot_deg: [0.0; 3],
+            focal: 1.0,
+        }
+    }
+}
+
+impl CameraDraw {
+    /// The offset as a pose in the camera frame, composed on the right of the camera's own:
+    /// yaw, then pitch, then roll, each about the camera's axis (intrinsic), through
+    /// `es_math::approx` so two machines agree on it (§3.4).
+    pub fn pose(&self) -> Pose {
+        let about = |axis: usize, deg: f64| {
+            let h = (deg as f32).to_radians() * 0.5;
+            let mut v = [0.0; 3];
+            v[axis] = f64::from(approx::sin(h));
+            Quat::from_xyzw(v[0], v[1], v[2], f64::from(approx::cos(h)))
+        };
+        let [roll, pitch, yaw] = self.rot_deg;
+        let [x, y, z] = self.offset;
+        Pose::new(
+            Vec3::new(x, y, z),
+            about(1, yaw) * about(0, pitch) * about(2, roll),
+        )
+    }
+
+    fn moves_pose(&self) -> bool {
+        self.offset.iter().chain(&self.rot_deg).any(|v| *v != 0.0)
+    }
+}
+
+/// Every render draw of one env's episode (packet M11/X5, spec 28.14 rule 4): a small plain
+/// struct the frame source reads per frame and the episode records.
+///
+/// [`Self::default`] is the scene, lights and cameras as authored, and a frame drawn under it
+/// is today's frame byte for byte (`crate::render::drawn_frame` short-circuits on
+/// [`Self::is_identity`]). What each field means on each render path is
+/// `docs/design/renderer.md` section 13.
+#[derive(Clone, Debug, PartialEq)]
+pub struct RenderOverrides {
+    /// `light.intensity` and `light.direction.yaw`: the evaluation's own type.
+    pub light: LightOverride,
+    /// `light.direction.pitch`, degrees: raises the light towards `+Z` about the horizontal
+    /// axis perpendicular to it.
+    pub pitch_deg: f64,
+    /// `light.color` (per-channel scale) or `light.color.kelvin` (a fixed table).
+    pub color: [f64; 3],
+    /// `light.ambient`: scale on the ambient term (`Rs` `ambient`, `Pt` sky).
+    pub ambient: f64,
+    /// `light.radiance`: the `Pt` directional light's radiance, white. `None` keeps the
+    /// sensor's, which is zero — today's `Pt` sensor has no directional light.
+    pub radiance: Option<f64>,
+    /// `light.sky`: the `Pt` sky's radiance, white. `None` keeps the sensor's (zero).
+    pub sky: Option<f64>,
+    /// `geom.<name>.rgba`: per-channel RGB scale by geom; alpha untouched.
+    pub geoms: BTreeMap<StableId, [f64; 3]>,
+    /// `camera.<name>.pose.*` and `camera.<name>.fov`, by camera.
+    pub cameras: BTreeMap<StableId, CameraDraw>,
+}
+
+impl Default for RenderOverrides {
+    fn default() -> Self {
+        Self {
+            light: LightOverride::default(),
+            pitch_deg: 0.0,
+            color: [1.0; 3],
+            ambient: 1.0,
+            radiance: None,
+            sky: None,
+            geoms: BTreeMap::new(),
+            cameras: BTreeMap::new(),
+        }
+    }
+}
+
+impl RenderOverrides {
+    /// Whether nothing was drawn: the frame source renders the authored scene untouched.
+    pub fn is_identity(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Per-channel gain on every light source: `intensity * color`.
+    pub fn light_gain(&self) -> [f64; 3] {
+        self.color.map(|c| self.light.intensity * c)
+    }
+
+    /// `base` (unit, towards the light) yawed by [`LightOverride::rotate_dir`], then pitched
+    /// by [`Self::pitch_deg`] about the horizontal axis perpendicular to it. A light straight
+    /// overhead has no such axis and is left where it is.
+    pub fn light_dir(&self, base: [f64; 3]) -> [f64; 3] {
+        let d = self.light.rotate_dir(base);
+        if self.pitch_deg.to_bits() == 0.0_f64.to_bits() {
+            return d;
+        }
+        let horizontal = (d[0] * d[0] + d[1] * d[1]).sqrt();
+        if horizontal == 0.0 {
+            return d;
+        }
+        // Rodrigues about h = (z x d) / |z x d|, which is perpendicular to d, so the term in
+        // h (h . d) vanishes: d' = d cos a + (d x h) sin a.
+        let axis = [-d[1] / horizontal, d[0] / horizontal];
+        let dxh = [
+            -d[2] * axis[1],
+            d[2] * axis[0],
+            d[0] * axis[1] - d[1] * axis[0],
+        ];
+        let angle = (self.pitch_deg as f32).to_radians();
+        let (sin, cos) = (f64::from(approx::sin(angle)), f64::from(approx::cos(angle)));
+        [0, 1, 2].map(|i| d[i] * cos + dxh[i] * sin)
+    }
+
+    /// The `ImageSpec` this episode's frames of `camera` really have (`INV-14`): `fx`, `fy`
+    /// times the drawn focal scale about the principal point, and the drawn offset composed
+    /// onto the extrinsics. `declared` itself when nothing was drawn for this camera.
+    pub fn image_spec(&self, camera: StableId, declared: &ImageSpec) -> ImageSpec {
+        let Some(d) = self.cameras.get(&camera) else {
+            return *declared;
+        };
+        let mut out = *declared;
+        out.intrinsics.fx *= d.focal;
+        out.intrinsics.fy *= d.focal;
+        if d.moves_pose() {
+            out.extrinsics = declared.extrinsics.compose(d.pose());
+        }
+        out
+    }
+
+    fn set(&mut self, v: Visual, x: f64) {
+        match v {
+            Visual::Intensity => self.light.intensity = x.max(0.0),
+            Visual::Yaw => self.light.yaw_deg = x,
+            Visual::Pitch => self.pitch_deg = x,
+            Visual::Color(c) => self.color[c] = x.max(0.0),
+            Visual::Kelvin => self.color = kelvin_rgb(x),
+            Visual::Ambient => self.ambient = x.max(0.0),
+            Visual::Radiance => self.radiance = Some(x.max(0.0)),
+            Visual::Sky => self.sky = Some(x.max(0.0)),
+            Visual::GeomRgb(id, c) => self.geoms.entry(id).or_insert([1.0; 3])[c] = x.max(0.0),
+            Visual::CameraOffset(id, i) => self.cameras.entry(id).or_default().offset[i] = x,
+            Visual::CameraRot(id, i) => self.cameras.entry(id).or_default().rot_deg[i] = x,
+            // Positive by construction: `check_positive` refused any other support.
+            Visual::CameraFocal(id) => self.cameras.entry(id).or_default().focal = x,
+        }
+    }
+}
+
+/// `light.color.kelvin`'s fixed table: Tanner Helland's fit of the blackbody colour, sampled
+/// every 1000 K from 2000 K to 10000 K as 8-bit sRGB and used as linear multipliers over
+/// 255. Piecewise linear between rows, clamped at the ends. The table *is* the definition:
+/// changing a row changes every draw that lands near it.
+const KELVIN: [(f64, [f64; 3]); 9] = [
+    (2000.0, [255.0, 137.0, 14.0]),
+    (3000.0, [255.0, 177.0, 110.0]),
+    (4000.0, [255.0, 206.0, 166.0]),
+    (5000.0, [255.0, 228.0, 206.0]),
+    (6000.0, [255.0, 246.0, 237.0]),
+    (7000.0, [243.0, 242.0, 255.0]),
+    (8000.0, [221.0, 230.0, 255.0]),
+    (9000.0, [210.0, 223.0, 255.0]),
+    (10000.0, [202.0, 218.0, 255.0]),
+];
+
+pub(crate) fn kelvin_rgb(k: f64) -> [f64; 3] {
+    let (lo, hi) = (KELVIN[0], KELVIN[KELVIN.len() - 1]);
+    let row = |(_, rgb): (f64, [f64; 3])| rgb.map(|c| c / 255.0);
+    if k <= lo.0 || k.is_nan() {
+        return row(lo);
+    }
+    if k >= hi.0 {
+        return row(hi);
+    }
+    let row_at = KELVIN.iter().rposition(|(t, _)| *t <= k).unwrap_or(0);
+    let ((t0, below), (t1, above)) = (KELVIN[row_at], KELVIN[row_at + 1]);
+    let w = (k - t0) / (t1 - t0);
+    [0, 1, 2].map(|c| (below[c] + (above[c] - below[c]) * w) / 255.0)
 }
 
 pub use es_physics_core::backend::Param;
@@ -78,14 +372,42 @@ impl RandomizationPlan {
                 _ => continue,
             };
             check_distribution(dist, target)?;
-            into.push(Entry {
-                target: resolve(target, scene, model)?,
-                dist: dist.clone(),
-                stream: StableId::from_path(stream),
-            });
+            for (resolved, sub) in resolve(target, scene, model, has_rs_sensor(task))? {
+                if matches!(resolved, Target::Render(Visual::CameraFocal(_))) {
+                    check_positive(dist, target)?;
+                }
+                // A target that spans channels or angles draws each from its own stream,
+                // `<stream>.<sub>`; a one-value target keeps the stream as declared, so no
+                // draw a committed task already makes moves.
+                let stream = if sub.is_empty() {
+                    StableId::from_path(stream)
+                } else {
+                    StableId::from_path(&format!("{stream}.{sub}"))
+                };
+                into.push(Entry {
+                    target: resolved,
+                    dist: dist.clone(),
+                    stream,
+                });
+            }
         }
         reset.append(&mut random);
         Ok(Self { entries: reset })
+    }
+
+    /// Draws every render entry for one env's episode into `out` (packet M11/X5).
+    ///
+    /// Keyed exactly as [`Self::apply`] is — `(seed, env, episode, stream)` — and separate
+    /// from it, so the physical draws, `ResetBuffer` and `set_params` are untouched by a
+    /// render target and the physics never sees one. `out` is not reset first: the caller
+    /// hands in [`RenderOverrides::default`] at every reset.
+    pub fn apply_render(&self, seed: u64, env: u32, episode: u64, out: &mut RenderOverrides) {
+        for entry in &self.entries {
+            if let Target::Render(v) = entry.target {
+                let mut rng = EnvRng::new(seed, env, episode, entry.stream);
+                out.set(v, rng.sample(&entry.dist));
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -114,6 +436,8 @@ impl RandomizationPlan {
                 Target::Scale(param, id) => {
                     buf.scales.insert((param, id), v);
                 }
+                // Drawn by `apply_render`, from the same key: nothing to write here.
+                Target::Render(_) => {}
             }
         }
     }
@@ -141,26 +465,150 @@ fn check_distribution(dist: &Distribution, target: &str) -> Result<(), EnvError>
     }
 }
 
+/// A focal scale must stay positive whatever is drawn: a zero or negative `fx` is not a
+/// camera. Only distributions whose whole support is positive are accepted.
+fn check_positive(dist: &Distribution, target: &str) -> Result<(), EnvError> {
+    let ok = match dist {
+        Distribution::Constant(v) => *v > 0.0,
+        Distribution::Uniform { lo, hi } => *lo > 0.0 && *hi > 0.0,
+        Distribution::LogUniform { .. } => true, // positive bounds, checked above
+        Distribution::Choice(vs) => vs.iter().all(|v| *v > 0.0),
+        Distribution::Normal { .. } => false,
+    };
+    if ok {
+        Ok(())
+    } else {
+        Err(EnvError::Unsupported(format!(
+            "\"{target}\" draws a focal scale, whose distribution must be positive over its \
+             whole support: {dist:?}"
+        )))
+    }
+}
+
+/// Whether the task declares a sensor on the rasterizer, which has no `Pt` light or sky.
+fn has_rs_sensor(task: &TaskIr) -> bool {
+    task.observation_spec.channels.values().any(|c| {
+        matches!(
+            c.source,
+            ObsSource::Sensor { render, .. } if render.path == SensorPath::Rs
+        )
+    })
+}
+
+/// The render half of the grammar (packet M11/X5): `light.*` alone; `geom.` and `camera.`
+/// come through [`resolve`]'s dotted split.
+fn resolve_light(
+    target: &str,
+    rs_sensor: bool,
+) -> Option<Result<Vec<(Target, &'static str)>, EnvError>> {
+    let one = |v| Some(Ok(vec![(Target::Render(v), "")]));
+    let rgb = |f: fn(usize) -> Visual| {
+        Some(Ok(["r", "g", "b"]
+            .into_iter()
+            .enumerate()
+            .map(|(c, s)| (Target::Render(f(c)), s))
+            .collect()))
+    };
+    match target {
+        "light.intensity" => one(Visual::Intensity),
+        "light.direction" => Some(Ok(vec![
+            (Target::Render(Visual::Yaw), "yaw"),
+            (Target::Render(Visual::Pitch), "pitch"),
+        ])),
+        "light.direction.yaw" => one(Visual::Yaw),
+        "light.direction.pitch" => one(Visual::Pitch),
+        "light.color" => rgb(Visual::Color),
+        "light.color.kelvin" => one(Visual::Kelvin),
+        "light.ambient" => one(Visual::Ambient),
+        "light.radiance" | "light.sky" if rs_sensor => Some(Err(EnvError::Unsupported(format!(
+            "randomization target \"{target}\": the task declares an Rs sensor, and the \
+             rasterizer has no Pt directional light or sky to draw it into"
+        )))),
+        "light.radiance" => one(Visual::Radiance),
+        "light.sky" => one(Visual::Sky),
+        _ => None,
+    }
+}
+
 /// The target grammar. Anything else is `Unsupported`, by name.
-fn resolve(target: &str, scene: &SceneDesc, model: &ModelInfo) -> Result<Target, EnvError> {
+///
+/// One target can expand into several entries (`light.direction`, `light.color`,
+/// `geom.<n>.rgba`); the `&str` is the stream suffix each draws from, empty for a one-value
+/// target.
+fn resolve(
+    target: &str,
+    scene: &SceneDesc,
+    model: &ModelInfo,
+    rs_sensor: bool,
+) -> Result<Vec<(Target, &'static str)>, EnvError> {
     let unsupported = || EnvError::Unsupported(format!("randomization target \"{target}\""));
+    let one = |t| Ok(vec![(t, "")]);
 
     if let Some(i) = index_of(target, "qpos") {
         return in_range(i, model.nq)
             .map(Target::Qpos)
-            .ok_or_else(unsupported);
+            .ok_or_else(unsupported)
+            .and_then(one);
     }
     if let Some(i) = index_of(target, "qvel") {
         return in_range(i, model.nv)
             .map(Target::Qvel)
-            .ok_or_else(unsupported);
+            .ok_or_else(unsupported)
+            .and_then(one);
+    }
+    if let Some(r) = resolve_light(target, rs_sensor) {
+        return r;
     }
 
     let parts: Vec<&str> = target.split('.').collect();
+    let camera = |name: &str| {
+        scene
+            .cameras
+            .iter()
+            .find(|c| c.name == name)
+            .map(|c| c.id)
+            .ok_or_else(unsupported)
+    };
+    match parts[..] {
+        ["camera", name, "fov"] => {
+            return one(Target::Render(Visual::CameraFocal(camera(name)?)));
+        }
+        ["camera", name, "pose", axis] => {
+            let id = camera(name)?;
+            let v = match axis {
+                "x" => Visual::CameraOffset(id, 0),
+                "y" => Visual::CameraOffset(id, 1),
+                "z" => Visual::CameraOffset(id, 2),
+                "roll" => Visual::CameraRot(id, 0),
+                "pitch" => Visual::CameraRot(id, 1),
+                "yaw" => Visual::CameraRot(id, 2),
+                _ => return Err(unsupported()),
+            };
+            return one(Target::Render(v));
+        }
+        _ => {}
+    }
     let [kind, name, field] = parts[..] else {
         return Err(unsupported());
     };
-    match (kind, field) {
+    let geom = || {
+        scene
+            .bodies
+            .iter()
+            .flat_map(|b| &b.geoms)
+            .find(|g| g.name == name)
+            .map(|g| g.id)
+            .ok_or_else(unsupported)
+    };
+    if (kind, field) == ("geom", "rgba") {
+        let id = geom()?;
+        return Ok(["r", "g", "b"]
+            .into_iter()
+            .enumerate()
+            .map(|(c, s)| (Target::Render(Visual::GeomRgb(id, c)), s))
+            .collect());
+    }
+    let physical = match (kind, field) {
         ("joint", "qpos" | "qvel") => {
             let joint = scene
                 .joints
@@ -185,13 +633,7 @@ fn resolve(target: &str, scene: &SceneDesc, model: &ModelInfo) -> Result<Target,
             .find(|b| b.name == name)
             .map(|b| Target::Scale(Param::BodyMass, b.id))
             .ok_or_else(unsupported),
-        ("geom", "friction") => scene
-            .bodies
-            .iter()
-            .flat_map(|b| &b.geoms)
-            .find(|g| g.name == name)
-            .map(|g| Target::Scale(Param::GeomFriction, g.id))
-            .ok_or_else(unsupported),
+        ("geom", "friction") => geom().map(|id| Target::Scale(Param::GeomFriction, id)),
         ("actuator", "gain") => scene
             .actuators
             .iter()
@@ -199,7 +641,8 @@ fn resolve(target: &str, scene: &SceneDesc, model: &ModelInfo) -> Result<Target,
             .map(|a| Target::Scale(Param::ActuatorGain, a.id))
             .ok_or_else(unsupported),
         _ => Err(unsupported()),
-    }
+    };
+    physical.and_then(one)
 }
 
 /// `"qpos[3]"` -> `Some(3)`.
@@ -393,7 +836,10 @@ mod tests {
                 scales: &mut scales,
             },
         );
-        (qpos.iter().chain(&qvel).map(|v| v.to_bits()).collect(), scales)
+        (
+            qpos.iter().chain(&qvel).map(|v| v.to_bits()).collect(),
+            scales,
+        )
     }
 
     #[test]
@@ -411,7 +857,12 @@ mod tests {
             assert!(!ov.is_identity(), "{target} drew nothing");
         }
         // The multi-stream targets: two angles, three channels.
-        let n = |t: &str| visual_plan(&[randomization(t, uniform(0.5, 1.5))]).unwrap().entries.len();
+        let n = |t: &str| {
+            visual_plan(&[randomization(t, uniform(0.5, 1.5))])
+                .unwrap()
+                .entries
+                .len()
+        };
         assert_eq!(n("light.direction"), 2);
         assert_eq!(n("light.color"), 3);
         assert_eq!(n("geom.ball.rgba"), 3);
@@ -423,7 +874,11 @@ mod tests {
             0,
             0,
         );
-        assert!(ov.color[0] != ov.color[1] && ov.color[1] != ov.color[2], "{:?}", ov.color);
+        assert!(
+            ov.color[0] != ov.color[1] && ov.color[1] != ov.color[2],
+            "{:?}",
+            ov.color
+        );
     }
 
     #[test]
@@ -517,7 +972,10 @@ mod tests {
         );
         let both = visual_plan(&both).unwrap();
         for (env, ep) in [(0, 0), (1, 0), (0, 5)] {
-            assert_eq!(physical_draw(&plain, env, ep), physical_draw(&both, env, ep));
+            assert_eq!(
+                physical_draw(&plain, env, ep),
+                physical_draw(&both, env, ep)
+            );
         }
         assert_eq!(plain.has_scales(), both.has_scales());
     }
@@ -559,7 +1017,7 @@ mod tests {
         let mid = kelvin_rgb(2500.0);
         let (a, b) = (kelvin_rgb(2000.0), kelvin_rgb(3000.0));
         for c in 0..3 {
-            assert!((mid[c] - (a[c] + b[c]) / 2.0).abs() < 1e-12);
+            assert!((mid[c] - f64::midpoint(a[c], b[c])).abs() < 1e-12);
         }
         // The camera delta: a translation in the camera's own frame, and a yaw about its +Y.
         let d = CameraDraw {
