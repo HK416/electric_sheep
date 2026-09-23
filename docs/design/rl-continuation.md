@@ -1021,6 +1021,65 @@ rows travel in `import.json` under `source_std` as metadata and nothing reads th
 `log_std`. `python/es/train_ppo.py --init-log-std` is fed only when `log_std` is non-null, and
 it takes one scalar: a vector whose entries differ is a human's choice, not the importer's.
 
+### 8a. Adapter v2 — an Isaac Lab or Playground policy's I/O conventions (packet M11/X2)
+
+Spec §28.14 rule 3: the IR owns an external policy's I/O conventions. Every v2 field is optional
+and `deny_unknown_fields` still holds; an adapter that declares none of them converts to exactly
+the bytes it converted to before (the four committed v1 conversions are pinned by hash in
+`crates/es-import/tests/adapter_v2.rs`). Each source convention lands in one place:
+
+| source convention | adapter v2 | where it lands in the bundle |
+|---|---|---|
+| joints resolved by name in the articulation's order (Isaac `resolve_matching_names`) | `[joints] source_names` + `[joints.rename]` (exclusive with `source_order`) | the first Dense's input columns of every per-joint channel and the head's rows are permuted into our actuator order — a permutation, exact |
+| `default_joint_pos` | `[joints] default_pos` (source order), or the manifest's `default_joint_pos` | only where something reads it (below) |
+| `joint_pos_rel = q − default`, per-term `scale` | `[[observation.channels]] offset = "default_pos"` or a vector, `scale` (number or vector) | folded into `Normalize{MeanStd}`: `mean = offset + mean_src / scale`, `std = std_src / scale` |
+| `last_action` / `last_act` (the raw action, zero at reset) | a channel whose Task IR source is the new `ObsSource::PreviousAction { initial }` | the loop serves the previous tick's policy row in actuator units; the fold carries the action tail's inverse (`raw = (row − offset) / scale`); the Task IR must declare `initial = offset` (our order), else `IMP-005` |
+| `history_length` | `history = N`, `history_order = "newest_last"` (Isaac's flattening) or `"newest_first"` | a `TemporalWindowNode` of N (`Align::Hold`: the first frame repeated until the ring fills, Isaac's `CircularBuffer` on reset); newest-first is a column permutation |
+| per-term `clip`, the wrapper's `clip_observations` | `clip = [lo, hi]` | **`IMP-009`**: the Observation IR has no clamp node and this packet adds none. A clip that never binds on the states the policy meets is left undeclared (the Isaac oracle checks `max |obs| < 100`) |
+| `JointPositionActionCfg`: `raw · scale + offset`, `use_default_offset` | `[action] scale`, `use_default_offset = true` (`offset = default_pos`) | `Normalizer{Inverse, MeanStd}` with `mean = offset`, `std = scale`, in our order |
+| `clip_actions` | `[action] clip = [lo, hi]` | accepted only where it cannot bind — `squash = tanh` and `[lo, hi] ⊇ [−1, 1]`; else `IMP-009` |
+| `decimation × sim.dt`, Playground `ctrl_dt` | `[timing] policy_dt`, or the manifest's `decimation` / `sim_dt` | checked against the Deployment IR's control period, never resampled; a mismatch is **`IMP-006`**; the report's `timing` line |
+| actuator `stiffness` / `damping` / `armature` / `effort_limit` | `[actuators]` (source order) | `mapping-report.json` rows next to the scene's `kp`, `kv` + joint damping, armature and force range; never converted |
+| `projected_gravity`, `base_lin_vel`, `base_ang_vel`, `velocity_commands`, a `generated_commands` with no Task IR channel | (the channel's `source` term) | **`IMP-007`**, naming the term |
+| both / neither of `source_order`, `source_names`; an unused rename; a resolution that is not a permutation | — | **`IMP-008`** |
+
+**`ObsSource::PreviousAction { initial }`** is the last variant of `ObsSource`, and absent from
+every committed Task IR, so no `task_hash` moved (`crates/es-ir/tests/previous_action.rs`). Its
+value is the row the policy emitted for the previous control tick — before the Safety Plane, and
+for `JointDelta` the increment, not the integrated target — read in `es_eval::runner` (evaluation
+and collection, `capture_at`, from `ChunkBuffer::action_at` of the previous tick; an underrun tick
+emitted no row and the last one stands) and in `es_py::Rollout` (the row last handed to `act`).
+`initial` (absent = zeros) is served on tick 0 of every episode. A bake reads recorded rows and
+keeps no policy output, so it refuses the channel by name.
+
+**`import_rl.py`.** rsl_rl's `EmpiricalNormalization` is read wherever that version kept it —
+`obs_normalizer.*` in a ≥ 5.0 `actor_state_dict`, `actor_obs_normalizer.*` (never the critic's)
+in a 3.x `model_state_dict`, the runner's top-level `obs_norm_state_dict` in 2.x — flattened from
+`[1, D]`, and `obs_std = std + eps` (`eps = 1e-2`), because `forward` divides by the sum.
+`--isaac-env-cfg params/env.yaml` records `decimation`, `sim_dt`, the single action term's
+`scale` and `action_kind`, and `scene.robot.init_state.joint_pos` resolved into
+`default_joint_pos` against `--joint-names` (the articulation's order; without it the regex
+table is not resolved and says so). `--playground-config` records `ctrl_dt / sim_dt` as
+`decimation`, `sim_dt`, `action_scale` and a dumped `default_pose`. The pickle writer the
+oracle's generator needs (`save_native_rsl_rl`) lives here too (INV-16).
+
+**Measured (packet oracle 2, this workstation, torch 2.14 CPU, 256 states each).**
+`python/es/rl_source/isaac_reference.py` computes each framework's observation → action map in
+NumPy from `isaac-lab.md` §§ 2–6 and `brax-ppo-so101.md` § 6, and the imported bundle
+(Observation IR on `CpuPlan`, Learning IR on `TorchRuntime`) is compared in actuator units:
+
+| source | max abs error |
+|---|---|
+| Isaac-style rsl_rl, classic `model_state_dict` + `obs_norm_state_dict`, joints in another order and one renamed | 1.216e-7 |
+| the same actor in the ≥ 5.0 `actor_state_dict` shape | 1.216e-7 |
+| Playground-style brax (swish, tanh, `default_pose + 0.3·a`) | 7.605e-8 |
+| negative control: the Isaac source with `joint_vel`'s `scale = 0.05` left undeclared | 6.424e-1 |
+
+Two things this does not settle. The `eps = 1e-2` of rsl_rl's normalizer is not in the api-note
+(its § 8 open item is the pinned rsl_rl version); both the reader and the reference state it, so a
+different eps in the pinned version would move both. And no real Isaac checkpoint has been
+imported yet — that is wave 3's I3.
+
 ## 9. Open questions for a human
 
 1. Should rollouts model the Deployment IR's declared latency (a chunk buffer in the trainer),
