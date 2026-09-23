@@ -1,0 +1,16 @@
+<!-- Packet M11/X4 oracle 2: one block that falls onto a floor and is pushed along it by a
+     position servo, so a mass, a friction and a gain scale each change the trajectory. -->
+<mujoco model="set_params">
+  <option timestep="0.002"/>
+  <worldbody>
+    <geom name="floor" type="plane" size="1 1 0.1"/>
+    <body name="block" pos="0 0 0.06">
+      <joint name="x" type="slide" axis="1 0 0"/>
+      <joint name="z" type="slide" axis="0 0 1"/>
+      <geom name="block_geom" type="box" size="0.05 0.05 0.05" mass="1"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <position name="push" joint="x" kp="100" kv="5"/>
+  </actuator>
+</mujoco>

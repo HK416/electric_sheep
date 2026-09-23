@@ -259,7 +259,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
-    use crate::caps::{BatchSupport, DeterminismTier, FloatPrecision};
+    use crate::caps::{BatchSupport, DeterminismTier, Feature, FloatPrecision};
 
     /// A backend that does nothing, to pin the trait's object safety and its contracts.
     struct NullBackend {
@@ -429,6 +429,19 @@ mod tests {
         assert!(err.to_string().contains("expected 0 values, got 1"));
         let err = PhysicsError::Requirements(vec![Unsupported::GpuResidency]);
         assert!(err.to_string().contains("GPU-resident"));
+    }
+
+    /// Packet M11/X4 oracle 1: a backend that does not implement model parameters refuses
+    /// them by name (spec 17.2) and declares no `ModelParams`; it never ignores a draw.
+    #[test]
+    fn set_params_default_is_unsupported() {
+        let mut backend = NullBackend::new();
+        assert!(!backend.capabilities().has(Feature::ModelParams));
+        let err = backend
+            .set_params(&[0], &[(Param::BodyMass, StableId::from_path("b"), 1.5)])
+            .unwrap_err();
+        assert_eq!(err, PhysicsError::Unsupported("set_params".to_owned()));
+        assert!(err.to_string().contains("set_params"), "{err}");
     }
 
     #[test]
