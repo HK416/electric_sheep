@@ -57,11 +57,12 @@ slice = [6, 12]
 channel = "joint_vel"
 scale = 0.05
 
-# `body_pose_xyzw`: the body frame's position minus the env origin and its quaternion x-first
-# (spec 3.1). The robot base sits at the MJCF origin with the identity rotation, so the env
-# frame is both the Task IR's `World` and the robot base frame.
+# Positions are the body frame minus the env origin. The robot base sits at the MJCF origin with
+# the identity rotation, so the env frame is both the Task IR's `World` and the robot base frame.
+# `cube_pose` is `JointState { cube, dof = 7 }`: the free joint's `qpos`, quaternion w-first,
+# as our runtime serves it; `gripper_pose` is `BodyPose(gripper)`, quaternion x-first.
 [[observation.channels]]
-source = "isaac_so101_reach.body_pose_xyzw(cube)"
+source = "isaac_so101_reach.free_joint_qpos(cube)"
 slice = [12, 19]
 channel = "cube_pose"
 

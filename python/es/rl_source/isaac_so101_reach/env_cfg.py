@@ -8,7 +8,8 @@ number our runtime produced. Import only after `isaaclab.app.AppLauncher` has st
 | scene `so101_pick_place.xml` | the USD `main.py build-usd` writes from the MJCF `scene_to_mjcf` emits, through `physx_ref.import_scene` |
 | 50 Hz control over the MJCF's 5 ms step | `decimation = 4`, `sim.dt = 0.005` |
 | `joint_pos` / `joint_vel` channels | `mdp.joint_pos_rel` / `mdp.joint_vel_rel` (scale 0.05), folded back by the adapter |
-| `cube_pose` / `gripper_pose` (world frame, xyzw) | `body_pose_xyzw`: the body frame minus the env origin, x-first |
+| `cube_pose`: `JointState { cube, dof 7 }`, the free joint's `qpos` -- `pos | quat` **w-first** | `free_joint_qpos`: the root frame minus the env origin, then Isaac's own w-first quaternion |
+| `gripper_pose`: `BodyPose(gripper)`, `xpos | xquat` -- quaternion **x-first** (spec 3.1) | `body_pose_xyzw`: the body frame minus the env origin, x-first |
 | `last_action` (`PreviousAction`, `initial` = rest pose) | `mdp.last_action` (the raw action, zero at reset), with `default_joint_pos` = that pose |
 | `ActionSpec JointPosition`, MuJoCo clamps ctrl to `ctrlrange` | `JointPositionActionCfg(scale 0.5, use_default_offset)`, `clip` = `ctrlrange` |
 | reward `-1 * dist` + `1 * (dist < 0.03)` per control step | the same terms at weight `-1/dt`, `+1/dt`: Isaac Lab multiplies every term by `dt` |
@@ -90,6 +91,16 @@ def _pose(env, asset_cfg: SceneEntityCfg):
     return pos - env.scene.env_origins, quat
 
 
+def free_joint_qpos(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
+    """A free body's `qpos` in MuJoCo's layout, `pos[3] | quat[4]` with the quaternion
+    **w-first** -- what the Task IR's `cube_pose` channel (`JointState { cube, dof = 7 }`) is
+    served from (`es_eval::runner::Capture::Qpos` reads the free joint's `qpos` raw). Not the
+    x-first order of a `BodyPose` channel: measured in M11/I3, a first set of policies trained
+    on x-first here scored 0.0 in our runtime against 0.63 on Isaac's side."""
+    pos, quat = _pose(env, asset_cfg)
+    return torch.cat([pos, quat], dim=-1)
+
+
 def body_pose_xyzw(env, asset_cfg: SceneEntityCfg) -> torch.Tensor:
     """The body frame's pose in the env frame, `pos[3] | quat[4]` x-first (spec 3.1) -- the
     Task IR's `GetBodyPose` / `BodyPose` channel. The robot base is at the env origin with the
@@ -165,7 +176,7 @@ def make_env_cfg(usd_path: str, cube_path: str, num_envs: int, seed: int, device
             # Declaration order is the concatenation order (isaac-lab.md section 2).
             joint_pos = ObsTerm(func=mdp.joint_pos_rel)
             joint_vel = ObsTerm(func=mdp.joint_vel_rel, scale=JOINT_VEL_SCALE)
-            cube_pose = ObsTerm(func=body_pose_xyzw, params={"asset_cfg": CUBE})
+            cube_pose = ObsTerm(func=free_joint_qpos, params={"asset_cfg": CUBE})
             gripper_pose = ObsTerm(func=body_pose_xyzw, params={"asset_cfg": GRIPPER})
             actions = ObsTerm(func=mdp.last_action)
 
