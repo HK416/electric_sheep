@@ -33,9 +33,9 @@ const PARAM_VIEW_BASE: usize = GLOBALS;
 /// and later bands of a frame too big for one dispatch.
 const BAND_SLOT: usize = 40;
 /// Sample-bounces (`pixels * spp * bounces`) one tracer dispatch may carry before the frame is
-/// split into bands: about 0.3 s of the SO-101 scene on an RTX 3060, well inside the 2 s a
+/// split into bands: about 0.6 s of the SO-101 scene on an RTX 3060, well inside the 2 s a
 /// Windows driver gives a busy device. A single 96x96 64-spp 3-bounce frame is 1.8M, one band.
-const BAND_BUDGET: u64 = 1 << 23;
+const BAND_BUDGET: u64 = 1 << 24;
 /// Floats per direct-lighting reservoir (mirrors `restir.slang`).
 const RES_STRIDE: u64 = 8;
 /// Floats per pixel of the temporal history (mirrors `common.slang`'s `ES_HIST_STRIDE` and

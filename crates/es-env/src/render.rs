@@ -561,9 +561,12 @@ impl<'gpu> EnvBatchRenderer<'gpu> {
         }
         let mut rc = render_config(&cfg);
         let base_seed = rc.seed;
+        // A square-ish grid, not one long row: a frame the tracer splits into bands of rows
+        // (`docs/design/renderer.md` 14.5) then gets fewer, taller bands.
         let per_row = (es_render::atlas::MAX_IMAGE_DIMENSION_2D / cfg.width.max(1)).max(1);
+        let square = (1..=n_envs).find(|c| c * c >= n_envs).unwrap_or(1);
         rc.atlas = TileAtlasCfg {
-            tiles_per_row: n_envs.clamp(1, per_row),
+            tiles_per_row: square.clamp(1, per_row),
             n_tiles: n_envs.max(1),
             ..rc.atlas
         };

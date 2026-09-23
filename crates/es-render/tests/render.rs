@@ -1414,8 +1414,8 @@ fn batched_tiles_equal_single_renders() {
 }
 
 /// A frame too big for one tracer dispatch is traced in bands of rows (packet M11/X3b), and
-/// the bands change no bit: 64 envs at 64 spp, 3 bounces, on an 8 x 8 grid of 32 x 32 tiles is
-/// 256 x 256 px x 192 sample-bounces = 12.6M, past the renderer's 2^23 budget, so two bands of
+/// the bands change no bit: 64 envs at 128 spp, 3 bounces, on an 8 x 8 grid of 32 x 32 tiles is
+/// 256 x 256 px x 384 sample-bounces = 25.2M, past the renderer's 2^24 budget, so two bands of
 /// 168 and 88 rows — the second starting mid-tile. Every tile still equals its env's single
 /// render, which is one band.
 #[test]
@@ -1424,7 +1424,7 @@ fn a_banded_frame_is_the_one_dispatch_frame() {
     let Some(gpu) = open(test) else { return };
     let (_, mut base) = batch_paths().swap_remove(5);
     base.path = RenderPath::Pt {
-        spp: 64,
+        spp: 128,
         bounces: 3,
         nee: true,
         restir: false,
@@ -1442,7 +1442,7 @@ fn a_banded_frame_is_the_one_dispatch_frame() {
             );
         }
     }
-    println!("RAN {test}: 64 envs, 64 spp + SVGF, two bands, every tile bit-equal");
+    println!("RAN {test}: 64 envs, 128 spp + SVGF, two bands, every tile bit-equal");
 }
 
 /// The two `batch_*` goldens: 4 envs of the SO-101 cell, `Rs` and `Pt` 16 spp NEE, the four
