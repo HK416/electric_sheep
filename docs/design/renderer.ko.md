@@ -1085,3 +1085,64 @@ match stream {
 - **분산 유도 휘도 가중치.** 히스토리가 필요하고, 관측 경로의 히스토리는 12.3이 거부하는 누적이다. 단일 프레임 SVGF는 에지 인식 스무딩이지 분산 유도 디노이징이 아니다.
 - **문서 필드로서의 `svgf_iterations`.** 4가 기본값이고 다른 숫자를 요청한 사람이 없다; 필드는 고정해야 할 해시 입력 하나를 더할 뿐이다.
 - **센서의 `ReSTIR`**, CPU와 1e-5 이내로 일치하지만 비트 단위는 아니다(`gpu_restir_and_svgf_match_the_cpu_within_tolerance`).
+
+## 13. 렌더 시점의 시각 랜덤화 (M11/X5)
+
+패킷 `docs/packets/M11/X5-visual-dr.md`, spec 28.14 규칙 4. 오너는 비전 RL을 위한 Task IR `Randomization` 타깃으로 조명(세기, 방향, 색, 앰비언트), 지오메트리 색, 카메라 외부 파라미터와 내부 파라미터를 골랐다. 문법과 추첨은 `batch-domains.md` 5절이다. 이 절은 추첨이 프레임에 하는 일이다.
+
+### 13.1 `Pt` 경로에는 이미 방향광이 있었다; 어떤 문서도 닿지 못했을 뿐
+
+`docs/reviews/M10.md` S-6은 `Pt` 센서에 방향광이 없어 `light_direction`이 거기서 아무것도 측정하지 않는다고 한다. *렌더러*에는 R3부터 있었다: `RenderConfig::light_rgb`는 `light_dir` 쪽 델타 광원의 복사휘도이고, 발광 삼각형과 하늘 옆에서 NEE로 추정된다(10.1절; `common.slang`의 `es_nee_direct`와 `cpu.rs`의 미러, 그림자 광선 하나, BSDF 샘플은 델타 광원에 맞을 수 없으므로 MIS 없음). 기본값은 0이고 `sensor_cfg`는 그것을 설정한 적이 없다. 그래서 X5는 **셰이더 항을 추가하지 않는다**: `light.radiance`(흰색 복사휘도; `Constant`는 선언, 그 밖의 분포는 랜덤화)가 `light_rgb`를, `light.sky`가 `sky`를 설정하며, 둘 다 선언하지 않은 문서는 오늘의 바이트를 렌더한다. 둘 다 `Rs` 센서가 있는 태스크에서는 거부된다 — 래스터라이저에는 둘 다 없다.
+
+`dr_pt_directional_light_lights_a_dark_scene`: 천장 패널을 끈 코넬 박스는 `Pt`에서 검다(4,096픽셀 중 0이 아닌 것 0개). 열린 끝으로 태양을 비추면 1,577개가 밝아지고, GPU도 같은 1,577개를 0 ULP로 밝힌다. 데모의 96×96 `Pt` 센서(4 spp, 2 바운스, 노출 64)에서 뽑힌 태양은 평균 바이트를 119.8에서 ~244로 올린다(`dr_env_pt_sensor_gets_a_directional_light`).
+
+### 13.2 세기와 색, 경로별
+
+의미는 하나 — *모든 광원의 복사휘도에 `intensity * color`를 곱한다* — 이고 정확한 구현은 둘이다. 두 경로가 서로 다른 것에 선형이기 때문이다:
+
+| 경로 | 무엇을 곱하나 | 왜 정확한가 |
+|---|---|---|
+| `Rs` | 모든 삼각형의 albedo **와** emission | `albedo * (ambient + n.l (1 - ambient)) + emission`은 채널별로 albedo에 선형이고, 발광체의 emission은 곧 그 albedo다(`TriScene`) — `LightOverride::scene`이 이미 했던 논증을 채널별로 |
+| `Pt` | emission, `light_rgb`, `sky`; albedo는 그대로 | 렌더링 방정식은 광원에 선형이다. albedo까지 곱하면 매 바운스마다 이득이 또 곱해진다(평가기의 `LightOverride`가 달고 있던 `ponytail:` 메모) |
+
+`geom.<n>.rgba`는 두 경로 모두에서 그 지오메트리의 albedo와 emission을 곱한다(색이 바뀐 발광체는 새 색을 낸다). 모든 배율은 지오메트리별 캐시 다음, 테셀레이션된 `TriScene`에 `f32`로 적용되므로 프레임마다 `SceneDesc`를 복제하지 않는다. 평가기의 `light_intensity` 섭동은 `LightOverride::scene`(테셀레이션 전 `rgba`의 `f64` 편집)을 유지한다 — 타입은 그대로 `es-env`로 옮겨졌고 커밋된 모든 보고서는 바이트 단위로 같다 — 그래서 같은 그림으로 가는 두 길은 반올림이 다르며 비트 단위 일치를 단언하지 않는다.
+
+### 13.3 방향과 앰비언트
+
+`light.direction.yaw`는 평가기의 커널 그대로인 `LightOverride::rotate_dir`(`+Z`에 대해, `approx::sin`/`cos`)이다. 그다음 `light.direction.pitch`가 광원을 그에 수직인 수평축(`h = z × d / |z × d|`, `h (h·d)` 항이 0인 로드리게스) 둘레로 돌려, 양의 각에서 `+Z` 쪽으로 올린다. 바로 머리 위의 광원은 그런 축이 없어 그대로 둔다. 두 경로 모두 `light_dir`를 읽으므로 방향은 `Rs`와 `Pt`를 똑같이 움직이는 유일한 추첨이다 — 그리고 `light.radiance`가 선언되면 `Pt` 센서에도 드디어 `light_direction`이 돌릴 것이 생긴다.
+
+`light.ambient`는 `Rs`에서 `RenderConfig::ambient`를 곱하고(Lambert 혼합이 `a + n.l (1 - a)`이므로 `[0, 1]`로 클램프; `Full`의 반구 색도 마찬가지) `Pt`에서는 하늘을 곱한다(빛 이득도 함께 곱해, `intensity`가 여전히 모든 광원을 곱하도록).
+
+### 13.4 카메라, 그리고 하나의 발견
+
+`camera.<n>.pose.*`는 카메라의 `OpenCV` 포즈 오른쪽에 포즈를 합성한다(카메라 자신의 축을 따른 이동; yaw, pitch, roll 순서, `approx` 사용). `camera.<n>.fov`는 주점을 중심으로 `fx`, `fy`에 초점 배율을 곱한다. 에피소드의 `image_specs`도 같은 숫자를 지닌다(`INV-14`, `batch-domains.md` 5절).
+
+**뽑힌 포즈가 어떤 골든도 드러낼 수 없던 GPU/CPU 불일치를 드러냈다.** RTX 3060에서 `Pose` 추첨의 첫 실행은 `Rgb8`과 세그멘테이션은 비트 단위로 맞았지만 **깊이 901픽셀이 최대 20 ULP** CPU와 어긋났다. 모든 골든 카메라의 쿼터니언 성분은 2의 거듭제곱이다(`LOOK_ALONG_X`는 ±0.5, 데모의 `MJCF_TO_OPENCV`는 `(1, 0, 0, 0)`). 그래서 `es_qrot`의 모든 곱이 정확했고 반올림 순서는 문제가 되지 않았다. 뽑힌 카메라는 임의의 성분을 가진다. `es_qrot`는 드라이버가 구현하는 확장 명령 GLSL.std.450 `Cross`를 불렀고, `NoContraction`은 *우리의* 산술을 장식할 뿐 드라이버의 것은 아니다 — 그 안에서는 융합이 자유였다. 이제 `es_qrot`는 CPU의 `cross`처럼 세 차이를 항 단위로 풀어 쓴 `es_cross`를 부르고, 뽑힌 카메라는 모든 채널에서 **0 ULP**다. 커밋된 프레임은 하나도 움직이지 않았다: 골든 카메라에서는 두 형태가 같은 비트다(기존 골든 전부와 `so101_frame0`이 두 카드에서 다시 통과). `common.slang`의 나머지 `Cross` 호출 둘(Möller–Trumbore와 면 법선)은 삼각형 변을 받으며, 여기서 어떤 테스트도 그것을 움직이지 않았으므로 그대로 둔다(13.7).
+
+### 13.5 `set_lighting`과 프레임별 계약
+
+`Renderer::set_lighting(&RenderConfig)`는 `light_dir`, `light_rgb`, `ambient`, `sky`, `shading`을 렌더러의 설정으로 복사한다 — 파라미터(슬롯 6..13, 20..31, 32..35)일 뿐 파이프라인이 아니므로 에피소드별 추첨에 커널 컴파일 비용이 없다. `dr_set_lighting_is_a_parameter`: 기본 렌더러를 다시 밝히면 뽑힌 설정으로 만든 렌더러와 `Rs`, `Pt` 모두 비트 단위로 같은 것을 렌더하고, 기본값으로 되돌리면 다시 `cornell_rs_rgb8`을 렌더한다. `EnvRenderer::frame_with(model, state, env, &RenderOverrides)`는 매 프레임 `drawn_frame`과 `set_lighting`을 돌리고 아무것도 남기지 않는다: `frame`은 항등의 `frame_with`이고, 항등은 `frame`이 전에 쓰던 입력 그대로로 단락되므로 커밋된 모든 프레임은 그대로다(`dr_env_frames_follow_the_draws_gpu_equals_cpu`가 추첨 없는 경우와 `frame()`을 `so101_frame0`에 대어 렌더한다). 카메라 추첨이 있는 프레임은 사이드카에 `intrinsics`를 쓴다(`Tile::write_to_with_intrinsics`). 없는 프레임은 늘 쓰던 사이드카를 쓴다.
+
+### 13.6 동등성, 측정
+
+`cargo test -p es-render --test render dr_`와 `cargo test -p es-env --features render --test render_loop dr_`:
+
+| 주장 | RTX 3060 (로컬) | RTX 4090 (오라클 서버) |
+|---|---|---|
+| 코넬 `Rs`, 일곱 추첨 각각 단독과 전부 함께: `Rgb8` / seg / depth | 0 바이트 / 비트 동일 / 0 ULP | 0 바이트 / 비트 동일 / 0 ULP |
+| `dr_cornell_rs_rgb8`(모든 추첨), GPU 대 골든 | 0 바이트 | 0 바이트 |
+| 코넬 `Pt` 1 spp, 발광체 × 색 × 세기, 하늘 켬: `PtRadiance` | 0 ULP | 0 ULP |
+| 코넬 `Pt` NEE 4 spp와 태양: `PtRadiance` / `Rgb8` 대 `dr_cornell_pt_sun_rgb8` | 68 ULP, 정규화 7.7e-7 / 0 바이트 | 68 ULP, 정규화 7.7e-7 / 0 바이트 |
+| 태양만으로 밝힌 어두운 박스, GPU 대 CPU | 1,577 px, 0 ULP | 1,577 px, 0 ULP |
+| SO-101 96×96 `Rs`, `frame_with` 경유: 12개 타깃 각각 단독, 전부(에피소드 둘), 추첨 없음, 전부 다시 | 각각 0 바이트 | 각각 0 바이트 |
+| SO-101 96×96 `Pt` 4 spp NEE, 뽑힌 태양 / 추첨 없음 | 27,648 바이트 중 0 / 0 | 27,648 바이트 중 0 / 0 |
+
+`Pt` NEE 규칙은 10절의 것 그대로다(정규화 ≤ 1e-5, 그림자 광선 동률에 대해 바이트 ≤ 0.1 %). 표는 그것이 측정한 값이다. 두 카드는 모든 행에서 바이트와 ULP까지 일치한다.
+
+### 13.7 X5가 건너뛰는 것
+
+- **수집기와 평가기는 아직 추첨을 적용하지 않는다.** `es loop collect --frames`와 `es eval run --frames`(`crates/es/src/cmd/`)는 X5의 범위 밖이며, 렌더 타깃이 있는 태스크에서도 추첨되지 않은 장면을 렌더한다. 고치는 방법은 수집기에서 `env.render_overrides(env)`를 `frame_with`에 넘기고, 평가기의 프레임 소스에 `RenderOverrides`를 접어 넣는 것이다. X7이 학습하는 RL 경로인 `Rollout`은 적용한다.
+- **배치 렌더링 (X3b).** `RenderOverrides`는 env별 평범한 구조체이고 `drawn_frame`은 그것의 순수 함수지만, 조명 절반은 *설정* 단위다: 한 디스패치에서 N개 env가 N개 조명을 가지려면 뷰별 조명 파라미터가 필요하고, 그것은 X3b가 정할 파라미터 배치다.
+- **나머지 두 `Cross` 내장 함수** (13.4).
+- **텍스처, 재질, 가림체** — M7 R6과 패킷의 `forbidden`.
+- **HSV 지오메트리 지터, 그리고 `Full`의 스펙큘러 항의 색** — 채널별 배율이 고른 방식이다(`batch-domains.md` 5). `Full`의 Blinn-Phong 하이라이트는 흰색으로 남는다.

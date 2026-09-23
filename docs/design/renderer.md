@@ -1744,3 +1744,126 @@ not a reason to leave it off. `Target / Status: unverified` for anything beyond 
 - **`svgf_iterations` as a document field.** 4 is the default and nobody has asked for another
   number; a field would be one more hash input to pin.
 - **`ReSTIR` on the sensor**, which agrees with the CPU within 1e-5 but not bit for bit (`gpu_restir_and_svgf_match_the_cpu_within_tolerance`).
+
+## 13. Visual randomization at render time (M11/X5)
+
+Packet `docs/packets/M11/X5-visual-dr.md`, spec 28.14 rule 4. The owner chose lighting
+(intensity, direction, colour, ambient), geom colours, camera extrinsics and camera intrinsics as
+Task IR `Randomization` targets for vision RL; the grammar and the draw are `batch-domains.md`
+section 5. This section is what a draw does to a frame.
+
+### 13.1 The `Pt` path already had a directional light; no document could reach it
+
+`docs/reviews/M10.md` S-6 says the `Pt` sensor has no directional light, so `light_direction`
+measures nothing there. The *renderer* has had one since R3: `RenderConfig::light_rgb` is the
+radiance of a delta light toward `light_dir`, estimated by NEE beside the emissive triangles and
+the sky (section 10.1; `es_nee_direct` in `common.slang` and its mirror in `cpu.rs`, one shadow
+ray, no MIS because a BSDF sample cannot hit a delta light). It defaults to zero, and
+`sensor_cfg` never set it. So X5 adds **no shader term**: `light.radiance` (white radiance; a
+`Constant` declares it, any other distribution randomizes it) sets `light_rgb`, `light.sky` sets
+`sky`, and a document that declares neither renders today's bytes. Both are refused on a task
+with an `Rs` sensor, which has neither.
+
+`dr_pt_directional_light_lights_a_dark_scene`: the Cornell box with the ceiling panel switched off
+is black on `Pt` (0 of 4,096 pixels non-zero); with the sun shining in through the open end 1,577
+are lit, and the GPU lights the same 1,577 at 0 ULP. On the demo's 96×96 `Pt` sensor (4 spp,
+2 bounces, exposure 64) a drawn sun takes the mean byte from 119.8 to ~244
+(`dr_env_pt_sensor_gets_a_directional_light`).
+
+### 13.2 Intensity and colour, per path
+
+One meaning — *every light source's radiance times `intensity * color`* — and two exact
+implementations, because the two paths are linear in different things:
+
+| path | what is scaled | why it is exact |
+|---|---|---|
+| `Rs` | every triangle's albedo **and** emission | `albedo * (ambient + n.l (1 - ambient)) + emission` is linear in albedo per channel, and an emitter's emission *is* its albedo (`TriScene`) — the argument `LightOverride::scene` already made, now per channel |
+| `Pt` | emission, `light_rgb` and `sky`; albedo untouched | the rendering equation is linear in its sources; scaling albedo too would multiply every bounce by the gain again (the `ponytail:` note the evaluation's `LightOverride` carried) |
+
+`geom.<n>.rgba` scales that geom's albedo and emission on both paths (a recoloured emitter emits
+the new colour). Every scale is applied to the tessellated `TriScene` in `f32`, after the
+per-geom cache, so no `SceneDesc` is cloned per frame. The evaluation's `light_intensity`
+perturbation keeps `LightOverride::scene` (an `f64` edit of `rgba` before tessellation) — the type
+moved into `es-env` unchanged, and every committed report is byte-identical — so the two paths to
+the same picture round differently and are not asserted to agree bit for bit.
+
+### 13.3 Direction and ambient
+
+`light.direction.yaw` is the evaluation's own kernel, `LightOverride::rotate_dir` (about `+Z`,
+`approx::sin`/`cos`). `light.direction.pitch` then turns the light about the horizontal axis
+perpendicular to it (`h = z × d / |z × d|`, Rodrigues with the `h (h·d)` term zero), raising it
+toward `+Z` for a positive angle; a light straight overhead has no such axis and is left alone.
+Both paths read `light_dir`, so direction is the one draw that moves `Rs` and `Pt` alike — and,
+with `light.radiance` declared, the `Pt` sensor finally has something for `light_direction` to
+turn.
+
+`light.ambient` scales `RenderConfig::ambient` on `Rs` (clamped to `[0, 1]`, since the Lambert mix
+is `a + n.l (1 - a)`; `Full`'s hemisphere colours likewise) and the sky on `Pt` (times the light
+gain, so `intensity` still scales every source).
+
+### 13.4 The camera, and a finding
+
+`camera.<n>.pose.*` composes a pose on the right of the camera's `OpenCV` pose (translation along
+the camera's own axes; yaw, then pitch, then roll, through `approx`); `camera.<n>.fov` multiplies
+`fx`, `fy` by the focal scale about the principal point. The episode's `image_specs` carry the
+same numbers (`INV-14`, `batch-domains.md` section 5).
+
+**A drawn pose exposed a GPU/CPU disagreement no golden could.** The first run of the `Pose` draw
+on the RTX 3060 matched `Rgb8` and segmentation bit for bit but put **901 depth pixels up to
+20 ULP** off the CPU. Every golden camera's quaternion has power-of-two components
+(`LOOK_ALONG_X` is ±0.5, the demo's `MJCF_TO_OPENCV` is `(1, 0, 0, 0)`), so every product in
+`es_qrot` was exact and the rounding order never mattered; a drawn camera has arbitrary
+components. `es_qrot` called GLSL.std.450 `Cross`, an extended instruction the driver implements,
+and `NoContraction` decorates *our* arithmetic, not the driver's — it was free to fuse inside.
+`es_qrot` now calls `es_cross`, the three differences written out term for term as the CPU's
+`cross` is, and the drawn camera is **0 ULP** in every channel. No committed frame moved: for the
+golden cameras the two forms are the same bits (every existing golden and `so101_frame0` re-pass
+on both cards). The two other `Cross` calls in `common.slang` (Möller–Trumbore and the face
+normal) take triangle edges, no test here moved them, and they are left as they are (13.7).
+
+### 13.5 `set_lighting` and the per-frame contract
+
+`Renderer::set_lighting(&RenderConfig)` copies `light_dir`, `light_rgb`, `ambient`, `sky` and
+`shading` into the renderer's config — parameters (slots 6..13, 20..31, 32..35), never a
+pipeline — so a per-episode draw costs no kernel compile. `dr_set_lighting_is_a_parameter`: a
+default renderer re-lit renders what a renderer built with the drawn config renders, bit for bit,
+on `Rs` and `Pt`, and re-lit back to the default it renders `cornell_rs_rgb8` again.
+`EnvRenderer::frame_with(model, state, env, &RenderOverrides)` runs `drawn_frame` and
+`set_lighting` every frame and keeps nothing: `frame` is `frame_with` the identity, and the
+identity short-circuits to exactly the inputs `frame` used before, so every committed frame is
+unmoved (`dr_env_frames_follow_the_draws_gpu_equals_cpu` renders the undrawn case, and `frame()`,
+against `so101_frame0`). A frame with a camera draw writes `intrinsics` into its sidecar
+(`Tile::write_to_with_intrinsics`); a frame without one writes the sidecar it always did.
+
+### 13.6 Parity, measured
+
+`cargo test -p es-render --test render dr_` and `cargo test -p es-env --features render --test
+render_loop dr_`:
+
+| claim | RTX 3060 (local) | RTX 4090 (oracle server) |
+|---|---|---|
+| Cornell `Rs`, each of the seven draws alone and all at once: `Rgb8` / seg / depth | 0 bytes / bit-equal / 0 ULP | 0 bytes / bit-equal / 0 ULP |
+| `dr_cornell_rs_rgb8` (all draws), GPU vs the golden | 0 bytes | 0 bytes |
+| Cornell `Pt` 1 spp, emitters × colour × intensity, sky on: `PtRadiance` | 0 ULP | 0 ULP |
+| Cornell `Pt` NEE 4 spp with the sun: `PtRadiance` / `Rgb8` vs `dr_cornell_pt_sun_rgb8` | 68 ULP, 7.7e-7 normalized / 0 bytes | 68 ULP, 7.7e-7 normalized / 0 bytes |
+| dark box lit by the sun alone, GPU vs CPU | 1,577 px, 0 ULP | 1,577 px, 0 ULP |
+| SO-101 96×96 `Rs` through `frame_with`: each of 12 targets alone, all (two episodes), undrawn, all again | 0 bytes each | 0 bytes each |
+| SO-101 96×96 `Pt` 4 spp NEE, drawn sun / undrawn | 0 / 0 of 27,648 bytes | 0 / 0 of 27,648 bytes |
+
+The `Pt` NEE rule stays section 10's (≤ 1e-5 normalized, ≤ 0.1 % of bytes for a shadow-ray tie);
+the table is what it measured. The two cards agree to the byte and to the ULP on every row.
+
+### 13.7 What X5 skips
+
+- **The collector and the evaluator do not apply the draws yet.** `es loop collect --frames` and
+  `es eval run --frames` (`crates/es/src/cmd/`) are outside X5's scope and still render the
+  undrawn scene for a task with render targets; the fix is to hand `env.render_overrides(env)` to
+  `frame_with` in the collector and to fold `RenderOverrides` into the evaluator's frame source.
+  `Rollout` — the RL path X7 trains on — applies them.
+- **Batched rendering (X3b).** `RenderOverrides` is a plain per-env struct and `drawn_frame` a pure
+  function of it, but the lighting half is per *config*: N envs with N lightings in one dispatch
+  need the light parameters per view, which is X3b's parameter layout to decide.
+- **The other two `Cross` builtins** (13.4).
+- **Textures, materials, occluders** — M7 R6 and the packet's `forbidden`.
+- **HSV geom jitter, and colour on `Full`'s specular term** — the per-channel scale is the one
+  chosen (`batch-domains.md` 5); `Full`'s Blinn-Phong highlight stays white.

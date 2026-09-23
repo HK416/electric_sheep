@@ -205,6 +205,63 @@ backend별로 누가 구현하는지는 `Feature::ModelParams`가 말한다. tra
 `MuJoCoCpuBackend::applied_params` / `MjWarpBackend::applied_params`는 쓰인 모든 파라미터의
 `[nominal, applied]`를 env의 모델에서 다시 읽어 돌려준다: 추첨이 물리에 닿았다는 증거.
 
+**렌더 타깃 (패킷 M11/X5, spec 28.14 규칙 4).** 문법에 렌더 부류가 생긴다. 렌더 추첨은 다른 모든
+추첨과 똑같이 `EnvRng(seed, env, episode, stream)`로 키가 정해지지만, `RandomizationPlan::apply_render`가
+env별 `RenderOverrides`에 뽑을 뿐 `ResetBuffer`에는 절대 쓰지 않는다. 그래서 물리, `set_params`, 모든
+물리 추첨은 건드려지지 않는다(오라클: `visual_randomization_undeclared_targets_move_nothing`).
+`Env::reset`은 이를 에피소드에 기록하고(`Episode::render`, `param_scales` 옆), `Env::render_overrides(env)`가
+프레임 소스에 넘기며, 프레임 소스는 렌더 시점에 적용한다(`es_env::render::drawn_frame`, `renderer.md` 13절).
+
+```
+light.intensity                    모든 광원에 대한 이득 (Rs: albedo와 emission; Pt: 발광체, 태양, 하늘)
+light.direction                    yaw와 pitch, 도 -- 스트림 두 개, <stream>.yaw 와 <stream>.pitch
+light.direction.yaw | .pitch       둘 중 하나
+light.color                        채널별 RGB 이득 -- 스트림 세 개, <stream>.r .g .b
+light.color.kelvin                 켈빈 색온도, 고정 표를 거친다
+light.ambient                      앰비언트 항에 대한 이득 (Rs: `ambient`, [0, 1]로 클램프; Pt: 하늘)
+light.radiance                     Pt 전용: 방향광의 복사휘도, 흰색 (없음 = 0 = 오늘)
+light.sky                          Pt 전용: 하늘의 복사휘도, 흰색 (없음 = 0 = 오늘)
+geom.<name>.rgba                   그 지오메트리의 채널별 RGB 이득, 알파는 그대로 -- 스트림 세 개
+camera.<name>.pose.x | .y | .z     카메라 자신의 OpenCV 축을 따른 오프셋, 미터
+camera.<name>.pose.roll|pitch|yaw  카메라 자신의 z | x | y 축에 대한 회전, 도
+camera.<name>.fov                  초점 배율 s: 주점을 중심으로 fx, fy에 s를 곱한다
+```
+
+패킷이 열어 둔 선택들, 명시:
+
+* **노드 하나, 스트림 여럿.** 채널이나 각도에 걸친 타깃(`light.direction`, `light.color`,
+  `geom.<n>.rgba`)은 노드의 분포 하나로 각 성분을 `<stream>.<sub>`에서 뽑는다. 그래서 색의 세 채널은
+  독립이고, 노드는 여전히 스트림 하나를 이름 붙인다. 값이 하나인 타깃은 선언된 스트림을 그대로 쓴다.
+* **`geom.<n>.rgba`는 HSV 지터가 아니라 채널별 배율이다.** 배율은 Lambert 항에 선형이라
+  `light.color`와 곱셈으로 합성되고 색공간 초월함수가 필요 없다. HSV는 렌더러의 `f32` 동등성 규칙이
+  떠안을 이유가 없는 색상 회전을 요구한다.
+* **`camera.<n>.pose`는 축 하나짜리 타깃 여섯 개다.** 미터 단위 이동과 도 단위 회전은 분포 하나를
+  공유할 수 없다. 맨 `camera.<n>.pose`는 이름으로 거부된다. 회전 순서는 yaw, pitch, roll이며 각각
+  카메라 자신의 축에 대해서다.
+* **`camera.<n>.fov`는 초점 배율을 뽑는다.** 그래서 기록된 `fx`, `fy`는 정확히 공칭값 곱하기 추첨값이다
+  (오라클 4). `s > 1`은 시야를 좁히고, 수직 fov는 `2 atan(tan(fovy / 2) / s)`가 된다. 분포는 전체
+  지지에서 양수여야 한다 — `Normal`, 0에 닿는 `Uniform`, 양수가 아닌 `Constant`나 `Choice`는 거부된다.
+* **`light.radiance`와 `light.sky`는 `Rs` 센서를 선언한 태스크에서 거부된다.** 래스터라이저에는 둘 다
+  없고, 어느 프레임에도 보이지 않는 추첨은 조용한 건너뜀이 된다(spec 17.2). 이들에 `Constant` 분포를
+  주는 것이 새 IR 필드 없이 문서가 `Pt` 태양을 *선언*하는 방법이다(M10 S-6).
+* **켈빈 표**는 Tanner Helland의 흑체 근사를 2000 K부터 10000 K까지 1000 K마다 8비트 sRGB로 샘플링한
+  것으로, 255로 나눈 선형 배율로 쓰며 행 사이는 구간 선형, 양 끝은 클램프한다. 표가 곧 정의다.
+
+**뽑힌 시야각이 `ImageSpec`에 하는 일 (`INV-14`).** `Env::new`는 선언된 모든 이미지 센서를
+`(camera, ImageSpec)`으로 모으고, 매 리셋은 `Episode::image_specs[camera] =
+RenderOverrides::image_spec(camera, declared)`를 쓴다 — `fx`, `fy`에 초점 배율을 곱하고 `cx`, `cy`는
+그대로, 뽑힌 오프셋은 `extrinsics`에 합성한다. 그래서 내부 파라미터를 소비하는 쪽은 뽑힌 값을 읽고,
+하류의 `ImageSpec::resized` / `cropped`는 선언값을 변환하듯 그것을 변환한다
+(`camera_fov_draw_moves_intrinsics`). 렌더러가 쓴 프레임도 같은 숫자를 지닌다:
+`EnvRenderer::frame_with`는 카메라 추첨이 있는 프레임의 사이드카에 `intrinsics`를 쓴다
+(`Tile::write_to_with_intrinsics`). 카메라 추첨이 없는 프레임은 늘 쓰던 사이드카를 쓴다.
+
+**지금 추첨을 적용하는 쪽.** `es_native.Rollout`(RL 경로, X3의 env별 카메라)은
+`Env::render_overrides(env)`를 `EnvRenderer::frame_with`에 넘긴다. `es loop collect --frames`와
+`es eval run --frames`는 여전히 `frame` / 자체 렌더러를 불러, 렌더 타깃이 있는 태스크에서도
+**추첨되지 않은** 장면을 렌더한다 — X5의 범위 밖이며, 수집기와 평가기가 추첨을 보게 만드는 후속
+작업이다(`docs/packets/M11/X5-visual-dr.md`).
+
 ## 6. 보상과 종료
 
 `Reward`와 `Terminate`는 표현식 리터럴이 아니라 입력 엣지를 가진 그래프
