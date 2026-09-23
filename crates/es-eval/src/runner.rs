@@ -695,6 +695,7 @@ impl Evaluation {
                     &mut events,
                     &name,
                     sink.as_deref_mut(),
+                    previous_action_initial(task).as_deref(),
                 )?;
                 if let (Some(dir), Some(traj)) = (cfg.traj_dir.as_ref(), &traj) {
                     traj.write(&dir.join(format!("{name}.estraj")))?;
@@ -937,6 +938,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     events: &mut Vec<StepEvent>,
     cell_name: &str,
     mut sink: Option<&mut RunSink<'_>>,
+    previous_initial: Option<&[f64]>,
 ) -> Result<Episode, EvalError> {
     let (nu, nq, nv) = {
         let m = env.model();
@@ -998,6 +1000,16 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     let mut ring_cursor = 0usize;
     let mut extra_age = 0u64;
     let mut ctrl = vec![0.0; nu];
+    // The policy row of the previous control tick, for a `PreviousAction` channel (packet
+    // M11/X2): the task's `initial` at tick 0 of every episode, and empty -- never read --
+    // when the task declares no such channel.
+    let mut previous: Vec<f64> = previous_initial.map(<[f64]>::to_vec).unwrap_or_default();
+    if !previous.is_empty() && previous.len() != NJ {
+        return Err(EvalError::Plan(format!(
+            "the PreviousAction channel is {} wide; the deployment's action row is {NJ}",
+            previous.len()
+        )));
+    }
 
     let mut frame_idx: Option<u64> = None;
     // Observations captured so far, which is what `CellFrames` counts when `--frames` is on
@@ -1016,7 +1028,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
             if let Some(t) = traj.as_deref_mut() {
                 t.push(env.model(), &env.backend().state(), 0)?;
             }
-            let (names, bytes, rendered) = capture(
+            let (names, bytes, rendered) = capture_at(
                 plan,
                 sources,
                 env.model(),
@@ -1024,6 +1036,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
                 frames.as_deref_mut(),
                 &overrides.light,
                 cell_frames.as_deref_mut(),
+                &previous,
             )?;
             frame_idx = rendered;
             captured += 1;
@@ -1113,6 +1126,15 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         // an episode; what the arm was last told to do, after that. Unread for every absolute
         // space, so `JointPosition` runs exactly as it did.
         let prev = safety.last_safe_action();
+        // This tick's policy row, before the plane and before any integration -- what the
+        // next tick's `PreviousAction` reads. `action_at` is `next_action` without its
+        // counters, so reading it here moves nothing; an underrun emitted no row, and the
+        // last one stands.
+        if !previous.is_empty() {
+            if let Some(row) = buffer.action_at(u64::from(step)) {
+                previous.copy_from_slice(&row);
+            }
+        }
         let (fed, _commanded) = plane_chunk(buffer, feed, u64::from(step), mode, space, &prev);
         // **The plane's clock is the control tick, not the simulation tick** (packet M5/V17).
         // `SafetyPlane` turns a tick difference into microseconds with the Deployment IR's
@@ -1203,6 +1225,27 @@ pub enum Capture {
     BodyPose(usize),
     /// An `ObservationNode::ImageInput`: the frame source's bytes, unconverted.
     Image,
+    /// A Task IR `ObsSource::PreviousAction` channel of this width: the row the policy emitted
+    /// for the previous control tick, which the *loop* holds and hands [`capture_at`]
+    /// (packet M11/X2). Nothing in the physics state carries it.
+    PreviousAction(usize),
+}
+
+/// A task's `PreviousAction` channel on the first tick of an episode: its declared `initial`,
+/// or zeros of the channel's width when absent. `None` when the task declares no such channel,
+/// and then the loop keeps no previous action at all.
+pub fn previous_action_initial(task: &TaskIr) -> Option<Vec<f64>> {
+    task.observation_spec
+        .channels
+        .values()
+        .find_map(|c| match &c.source {
+            es_ir::task::ObsSource::PreviousAction { initial } => {
+                Some(initial.clone().unwrap_or_else(|| {
+                    vec![0.0; c.ty.shape.dims().iter().product::<u64>() as usize]
+                }))
+            }
+            _ => None,
+        })
 }
 
 /// Resolves every plan input **before the first episode**, so an observation this build
@@ -1231,6 +1274,12 @@ pub fn input_sources(
             continue;
         }
         let source = StableId::from_hex(name).map_err(|e| EvalError::Plan(e.to_string()))?;
+        if source == ObsSource::previous_action_id() {
+            if let Some(initial) = previous_action_initial(task) {
+                out.insert(name.clone(), Capture::PreviousAction(initial.len()));
+                continue;
+            }
+        }
         let is_image =
             obs.graph.nodes.values().any(
                 |n| matches!(n, ObservationNode::ImageInput { sensor, .. } if *sensor == source),
@@ -1370,9 +1419,26 @@ pub fn capture(
     sources: &BTreeMap<String, Capture>,
     model: &ModelInfo,
     state: &StateView<'_>,
+    frames: Option<&mut FrameSource<'_>>,
+    light: &LightOverride,
+    cell_frames: Option<&mut CellFrames>,
+) -> Result<Captured, EvalError> {
+    capture_at(plan, sources, model, state, frames, light, cell_frames, &[])
+}
+
+/// [`capture`], with the previous control tick's policy row a `PreviousAction` input reads
+/// (packet M11/X2). The loop owns that row -- `run_episode` and `es_py::Rollout` -- and an
+/// empty slice is "this caller keeps none", which a `PreviousAction` input refuses by name.
+#[allow(clippy::too_many_arguments)]
+pub fn capture_at(
+    plan: &CpuPlan,
+    sources: &BTreeMap<String, Capture>,
+    model: &ModelInfo,
+    state: &StateView<'_>,
     mut frames: Option<&mut FrameSource<'_>>,
     light: &LightOverride,
     mut cell_frames: Option<&mut CellFrames>,
+    previous: &[f64],
 ) -> Result<Captured, EvalError> {
     let mut descs = Vec::new();
     let mut bytes = Vec::new();
@@ -1387,6 +1453,17 @@ pub fn capture(
         })?;
         let values: Vec<f64> = match how {
             Capture::Qpos(r) => state.qpos_of(0)[r.as_range()].to_vec(),
+            Capture::PreviousAction(n) => {
+                if previous.len() != n {
+                    return Err(EvalError::Plan(format!(
+                        "observation input \"{name}\" is the previous action ({n} values); \
+                         this loop holds {} -- a caller that keeps no previous policy row \
+                         cannot serve a PreviousAction channel",
+                        previous.len()
+                    )));
+                }
+                previous.to_vec()
+            }
             Capture::Sensor(r) => state.sensordata[r.as_range()].to_vec(),
             Capture::Joints(dof) => {
                 let q = state.qpos_of(0);

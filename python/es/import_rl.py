@@ -3,6 +3,8 @@
 
     import_rl.py --from mujoco-playground|rsl-rl|rl-games --checkpoint <path>
                  [--activation relu|elu|swish|tanh] --out <dir>
+                 [--isaac-env-cfg env.yaml [--joint-names a,b,...]]
+                 [--playground-config config.json]
     import_rl.py --synth mujoco-playground|rsl-rl|rl-games [--native]
                  [--action position|delta] --out <dir>
     import_rl.py --reference --import <dir> [--resolved mapping-report.json]
@@ -63,6 +65,8 @@ SYNTH_OBS, SYNTH_ACTION = 26, 6
 # The increment `python/es/rl_source/train_brax_so101.py --action delta` records, in rad per
 # control tick (`docs/api-notes/brax-ppo-so101.md` section 7).
 DELTA_SCALE = 0.05
+# rsl_rl `EmpiricalNormalization(eps=1e-2)`: `forward` divides by `std + eps`.
+RSL_NORMALIZER_EPS = 1e-2
 
 
 def fail(message: str) -> SystemExit:
@@ -156,6 +160,94 @@ def _torch_load(path: Path) -> dict:
     return torch.load(path, map_location="cpu", weights_only=False)
 
 
+def save_native_rsl_rl(path: Path, payload: dict) -> None:
+    """`torch.save` -- the pickle door's *write* side, kept in this file with the read side
+    (INV-16). `rl_source/isaac_reference.py` builds an rsl_rl-layout checkpoint out of numpy
+    arrays and asks for it here rather than pickling anything itself."""
+
+    def tensors(v):
+        if isinstance(v, dict):
+            return {k: tensors(x) for k, x in v.items()}
+        if isinstance(v, np.ndarray):
+            return torch.from_numpy(np.ascontiguousarray(v))
+        return v
+
+    torch.save(tensors(payload), path)
+
+
+# --- the source configs (packet M11/X2) --------------------------------------------------------
+
+
+def isaac_env_fields(path: Path, joint_names: list[str] | None, action_dim: int) -> dict:
+    """Isaac Lab's `params/env.yaml` (or the same tree as JSON) -> manifest fields.
+
+    `decimation` and `sim.dt` always; the single action term's `scale` (a number, or a
+    `{regex: value}` table resolved against `--joint-names`) and, for a
+    `JointPositionAction`, `action_kind = position_target`; and `scene.robot.init_state.
+    joint_pos` -- a `{regex: value}` table -- resolved into `default_joint_pos` against
+    `--joint-names`, the articulation's order (`isaac-lab.md` section 2). Without the names the
+    pose is not recorded, and said so: resolving a regex table against a guessed order is
+    exactly the guess the import refuses.
+    """
+    import re  # noqa: PLC0415
+
+    import yaml  # noqa: PLC0415
+
+    cfg = yaml.safe_load(path.read_text())
+    out: dict = {"decimation": int(cfg["decimation"]), "sim_dt": float(cfg["sim"]["dt"])}
+
+    def resolve(table: dict, what: str) -> list[float] | None:
+        if joint_names is None:
+            print(f"NOTE --isaac-env-cfg: {what} is a per-joint table; pass --joint-names")
+            return None
+        values = []
+        for name in joint_names:
+            hits = [float(v) for p, v in table.items() if re.fullmatch(p, name)]
+            if len(hits) != 1:
+                raise fail(f"{what}: joint {name!r} matches {len(hits)} patterns of {table}")
+            values.append(hits[0])
+        return values
+
+    terms = [t for t in (cfg.get("actions") or {}).values() if isinstance(t, dict)]
+    if len(terms) == 1:
+        term = terms[0]
+        scale = term.get("scale", 1.0)
+        out["action_scale"] = (
+            resolve(scale, "actions.scale")
+            if isinstance(scale, dict)
+            else [float(scale)] * action_dim
+        )
+        if "JointPositionAction" in str(term.get("class_type", "")):
+            out["action_kind"] = "position_target"
+    else:
+        print(f"NOTE --isaac-env-cfg: {len(terms)} action terms; action_scale not recorded")
+    pose = (((cfg.get("scene") or {}).get("robot") or {}).get("init_state") or {}).get("joint_pos")
+    if isinstance(pose, dict):
+        out["default_joint_pos"] = resolve(pose, "scene.robot.init_state.joint_pos")
+    if joint_names is not None:
+        out["joint_order"] = joint_names
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def playground_fields(path: Path, action_dim: int) -> dict:
+    """A Playground env config dumped as JSON: `ctrl_dt`, `sim_dt`, `action_scale`, and the
+    env's `default_pose` (Playground reads it from the model's home keyframe at construction,
+    so a dump has to write it out; absent, it is not recorded)."""
+    cfg = json.loads(path.read_text())
+    ratio = float(cfg["ctrl_dt"]) / float(cfg["sim_dt"])
+    if abs(ratio - round(ratio)) > 1e-9:
+        raise fail(f"{path}: ctrl_dt / sim_dt = {ratio} is not a whole number of physics steps")
+    out = {"decimation": int(round(ratio)), "sim_dt": float(cfg["sim_dt"])}
+    if "action_scale" in cfg:
+        scale = cfg["action_scale"]
+        out["action_scale"] = (
+            [float(x) for x in scale] if isinstance(scale, list) else [float(scale)] * action_dim
+        )
+    if "default_pose" in cfg:
+        out["default_joint_pos"] = [float(x) for x in cfg["default_pose"]]
+    return out
+
+
 def _ordered_mlp(state: dict, prefix: str) -> list[tuple[np.ndarray, np.ndarray]]:
     """`<prefix>.<i>.weight|bias` in `i` order. `i` is the index inside the framework's own
     `nn.Sequential`, so it counts activations too and is never assumed to be contiguous."""
@@ -228,14 +320,26 @@ def read_rsl_rl(path: Path, activation: str | None) -> tuple[dict, dict]:
         std = torch.exp(state["distribution.log_std_param"])
     else:
         log_std = np.log(f32(std)).tolist() if std is not None else None
-    # `EmpiricalNormalization` keeps `mean` and `var`; the std it divides by is sqrt(var).
-    norm = {k.split(".")[-1].lstrip("_"): v for k, v in state.items() if "obs_normalizer" in k}
-    obs_mean = f32(norm["mean"]).tolist() if "mean" in norm else None
+    # The actor's `EmpiricalNormalization`, wherever this rsl_rl kept it (packet M11/X2):
+    # `obs_normalizer.*` inside a >= 5.0 `actor_state_dict`, `actor_obs_normalizer.*` inside a
+    # 3.x `model_state_dict` (never the critic's), or the runner's own top-level
+    # `obs_norm_state_dict` in 2.x. Its buffers are `_mean`, `_var`, `_std` shaped `[1, D]`.
+    norm = {
+        k.split(".")[-1].lstrip("_"): v
+        for k, v in state.items()
+        if k.split(".")[0] in ("obs_normalizer", "actor_obs_normalizer")
+    }
+    if not norm and isinstance(raw.get("obs_norm_state_dict"), dict):
+        norm = {k.split(".")[-1].lstrip("_"): v for k, v in raw["obs_norm_state_dict"].items()}
+    obs_mean = f32(norm["mean"]).reshape(-1).tolist() if "mean" in norm else None
     obs_std = None
+    # `EmpiricalNormalization.forward` is `(x - mean) / (std + eps)`, eps = 1e-2 by default
+    # (rsl_rl `modules/normalizer.py`): the std our `Normalize{MeanStd}` divides by is the sum.
     if "std" in norm:
-        obs_std = f32(norm["std"]).tolist()
+        obs_std = (f32(norm["std"]).reshape(-1).astype(np.float64) + RSL_NORMALIZER_EPS).tolist()
     elif "var" in norm:
-        obs_std = np.sqrt(f32(norm["var"])).tolist()
+        var = f32(norm["var"]).reshape(-1).astype(np.float64)
+        obs_std = (np.sqrt(var) + RSL_NORMALIZER_EPS).tolist()
 
     return tensors, {
         "framework": "rsl-rl",
@@ -249,7 +353,11 @@ def read_rsl_rl(path: Path, activation: str | None) -> tuple[dict, dict]:
         "squash": "none",
         "obs_mean": obs_mean,
         "obs_std": obs_std,
-        "normalizer": "EmpiricalNormalization: (x - mean) / sqrt(var)" if obs_mean else None,
+        "normalizer": (
+            f"EmpiricalNormalization: (x - mean) / (std + {RSL_NORMALIZER_EPS}); obs_std is the sum"
+            if obs_mean
+            else None
+        ),
         "log_std": log_std,
         "source_std": None if std is None else {"kind": "std", "value": f32(std).tolist()},
         "action_kind": None,
@@ -386,6 +494,15 @@ def _t(x) -> torch.Tensor:
 
 def do_import(args) -> None:
     tensors, manifest = READERS[args.source](Path(args.checkpoint).expanduser(), args.activation)
+    names = args.joint_names.split(",") if getattr(args, "joint_names", None) else None
+    if getattr(args, "isaac_env_cfg", None):
+        manifest.update(
+            isaac_env_fields(Path(args.isaac_env_cfg).expanduser(), names, manifest["action_dim"])
+        )
+    if getattr(args, "playground_config", None):
+        manifest.update(
+            playground_fields(Path(args.playground_config).expanduser(), manifest["action_dim"])
+        )
     out = Path(args.out).expanduser()
     out.mkdir(parents=True, exist_ok=True)
     write_safetensors(out / "weights.safetensors", {k: _t(v) for k, v in tensors.items()})
@@ -722,6 +839,21 @@ def main() -> int:
         default="position",
         help="--synth: whether the synthetic source's action is a position target or a "
         "per-tick joint increment (spec 8.5 JointDelta)",
+    )
+    ap.add_argument(
+        "--isaac-env-cfg",
+        help="--from rsl-rl: Isaac Lab's params/env.yaml, for decimation, sim.dt, the action "
+        "scale and the default joint pose",
+    )
+    ap.add_argument(
+        "--joint-names",
+        help="comma-separated source joint names in the articulation's order; resolves the "
+        "env cfg's regex tables and is recorded as joint_order",
+    )
+    ap.add_argument(
+        "--playground-config",
+        help="--from mujoco-playground: the env config as JSON (ctrl_dt, sim_dt, "
+        "action_scale, default_pose)",
     )
     ap.add_argument("--reference", action="store_true")
     ap.add_argument("--import", dest="import_dir")

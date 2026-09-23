@@ -204,6 +204,12 @@ impl ObservationBake {
                          is qpos followed by qvel and does not say where the second half begins"
                     )))
                 }
+                Capture::PreviousAction(_) => {
+                    return Err(EvalError::Plan(format!(
+                        "observation input \"{name}\" is the previous policy action; a bake \
+                         reads recorded observation rows and keeps no policy output"
+                    )))
+                }
                 Capture::BodyPose(_) => {
                     return Err(EvalError::Plan(format!(
                         "observation input \"{name}\" reads a body's pose from xpos and xquat; \

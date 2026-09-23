@@ -1,0 +1,40 @@
+# A MuJoCo Playground reach policy (brax PPO) under our SO-101 -- adapter v2, packet M11/X2.
+#
+# The source is `python/es/rl_source/isaac_reference.py --make playground`: an MJX env over our
+# own MJCF, so its joint order IS ours and the v1 `source_order` says so. What v2 adds is
+# Playground's centring: `obs = qpos - default_pose`, `ctrl = default_pose + action_scale * a`,
+# and `last_act`. The pose, the scale and the policy period come from the manifest
+# (`import_rl.py --playground-config`), not from here: an adapter that states none of them
+# defers to the source's own record, and one that states them is checked against it.
+
+[robot]
+name = "so101"
+
+[joints]
+source_order = ["shoulder_pan", "shoulder_lift", "elbow_flex", "wrist_flex", "wrist_roll", "gripper"]
+units = "rad"
+
+[action]
+kind = "position_target"
+use_default_offset = true
+
+[[observation.channels]]
+source = "qpos[0:6] - default_pose"
+slice = [0, 6]
+channel = "joint_pos"
+offset = "default_pos"
+
+[[observation.channels]]
+source = "qvel[0:6]"
+slice = [6, 12]
+channel = "joint_vel"
+
+[[observation.channels]]
+source = "target_pose"
+slice = [12, 19]
+channel = "cube_pose"
+
+[[observation.channels]]
+source = "last_act"
+slice = [19, 25]
+channel = "last_action"

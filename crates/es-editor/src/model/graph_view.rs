@@ -282,6 +282,7 @@ fn channel_key(src: &ObsSource) -> SourceKey {
         ObsSource::Sensor { id, .. } => ("sensor", Some(*id)),
         ObsSource::JointState { body, .. } | ObsSource::BodyPose(body) => ("state", Some(*body)),
         ObsSource::Language => ("language", None),
+        ObsSource::PreviousAction { .. } => ("state", Some(ObsSource::previous_action_id())),
     }
 }
 

@@ -12900,6 +12900,21 @@ fn run_import_rl(framework: &str, docs: &Documents, adapter: &Path, out: &Path) 
         .expect("run es policy import-rl")
 }
 
+/// Packet M11/X2 acceptance: `es policy import-rl --help` prints every refusal code, and asking
+/// for help is not a usage error.
+#[test]
+fn import_rl_help_lists_every_refusal() {
+    let out = bin()
+        .args(["policy", "import-rl", "--help"])
+        .output()
+        .expect("run es policy import-rl --help");
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let text = stdout(&out);
+    for code in (1..=9).map(|n| format!("IMP-00{n}")) {
+        assert!(text.contains(&code), "{code} is missing from the help");
+    }
+}
+
 /// The Task and Deployment IR an import targets, and the adapter that matches them.
 struct Documents {
     task: PathBuf,

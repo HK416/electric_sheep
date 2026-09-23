@@ -1005,6 +1005,64 @@ policy gradient(Fujita & Maeda, 2018), 클램프된 차원에 대해 가우시�
 `log_std`가 null이 아닐 때만 먹으며, 스칼라 하나를 받는다. 성분이 서로 다른 벡터는 임포터가 아니라
 사람의 선택이다.
 
+### 8a. 어댑터 v2 — Isaac Lab 또는 Playground 정책의 입출력 규약 (packet M11/X2)
+
+스펙 §28.14 규칙 3: 외부 정책의 입출력 규약은 IR이 소유한다. v2의 모든 필드는 선택이고
+`deny_unknown_fields`는 그대로다. 그중 아무것도 선언하지 않은 어댑터는 이전과 정확히 같은
+바이트로 변환된다(커밋된 v1 변환 네 개가 `crates/es-import/tests/adapter_v2.rs`에 해시로
+고정되어 있다). 소스 규약마다 도착하는 곳은 한 군데다:
+
+| 소스 규약 | 어댑터 v2 | 번들에서 도착하는 곳 |
+|---|---|---|
+| 관절을 아티큘레이션 순서에서 이름으로 해석 (Isaac `resolve_matching_names`) | `[joints] source_names` + `[joints.rename]` (`source_order`와 배타) | 관절별 채널마다 첫 Dense의 입력 열과 헤드의 행을 우리 액추에이터 순서로 치환 — 치환이므로 정확 |
+| `default_joint_pos` | `[joints] default_pos`(소스 순서), 또는 매니페스트의 `default_joint_pos` | 그것을 읽는 곳에서만(아래) |
+| `joint_pos_rel = q − default`, 항별 `scale` | `[[observation.channels]] offset = "default_pos"` 또는 벡터, `scale`(수 또는 벡터) | `Normalize{MeanStd}`에 접힌다: `mean = offset + mean_src / scale`, `std = std_src / scale` |
+| `last_action` / `last_act` (원시 행동, 리셋 시 0) | Task IR 소스가 새 `ObsSource::PreviousAction { initial }`인 채널 | 루프가 이전 틱의 정책 행을 액추에이터 단위로 제공하고, 접기가 행동 꼬리의 역(`raw = (row − offset) / scale`)을 싣는다. Task IR은 `initial = offset`(우리 순서)을 선언해야 하며, 아니면 `IMP-005` |
+| `history_length` | `history = N`, `history_order = "newest_last"`(Isaac의 평탄화) 또는 `"newest_first"` | N의 `TemporalWindowNode`(`Align::Hold`: 링이 찰 때까지 첫 프레임 반복 — 리셋 시 Isaac의 `CircularBuffer`). newest-first는 열 치환 |
+| 항별 `clip`, 래퍼의 `clip_observations` | `clip = [lo, hi]` | **`IMP-009`**: 관측 IR에 clamp 노드가 없고 이 패킷은 추가하지 않는다. 정책이 만나는 상태에서 결코 걸리지 않는 clip은 선언하지 않는다(Isaac 오라클이 `max |obs| < 100`을 확인) |
+| `JointPositionActionCfg`: `raw · scale + offset`, `use_default_offset` | `[action] scale`, `use_default_offset = true` (`offset = default_pos`) | 우리 순서의 `mean = offset`, `std = scale`인 `Normalizer{Inverse, MeanStd}` |
+| `clip_actions` | `[action] clip = [lo, hi]` | 걸릴 수 없을 때만 수용 — `squash = tanh`이고 `[lo, hi] ⊇ [−1, 1]`. 아니면 `IMP-009` |
+| `decimation × sim.dt`, Playground `ctrl_dt` | `[timing] policy_dt`, 또는 매니페스트의 `decimation` / `sim_dt` | 배치 IR의 제어 주기와 대조하고, 재샘플하지 않는다. 불일치는 **`IMP-006`**. 보고서의 `timing` 줄 |
+| 액추에이터 `stiffness` / `damping` / `armature` / `effort_limit` | `[actuators]`(소스 순서) | 장면의 `kp`, `kv` + 관절 감쇠, armature, 힘 범위 옆의 `mapping-report.json` 행. 변환하지 않는다 |
+| `projected_gravity`, `base_lin_vel`, `base_ang_vel`, `velocity_commands`, Task IR 채널이 없는 `generated_commands` | (채널의 `source` 항) | 항 이름을 댄 **`IMP-007`** |
+| `source_order`와 `source_names`를 둘 다 / 둘 다 안 씀, 쓰이지 않는 rename, 치환이 아닌 해석 | — | **`IMP-008`** |
+
+**`ObsSource::PreviousAction { initial }`**은 `ObsSource`의 마지막 변형이고 커밋된 어떤 Task IR에도
+없으므로 어떤 `task_hash`도 움직이지 않았다(`crates/es-ir/tests/previous_action.rs`). 그 값은
+정책이 이전 제어 틱에 낸 행이다 — 안전 평면 이전이며, `JointDelta`에서는 적분된 목표가 아니라
+증분이다. `es_eval::runner`(평가와 수집, `capture_at`, 이전 틱의 `ChunkBuffer::action_at`에서;
+언더런 틱은 행을 내지 않았으므로 마지막 행이 유지된다)와 `es_py::Rollout`(`act`에 마지막으로
+건넨 행)에서 읽는다. `initial`(없으면 0)은 매 에피소드의 틱 0에 제공된다. bake는 기록된 행을
+읽고 정책 출력을 갖고 있지 않으므로 이 채널을 이름으로 거절한다.
+
+**`import_rl.py`.** rsl_rl의 `EmpiricalNormalization`은 버전이 둔 곳에서 읽는다 — ≥ 5.0
+`actor_state_dict`의 `obs_normalizer.*`, 3.x `model_state_dict`의 `actor_obs_normalizer.*`
+(비평가의 것은 결코 아님), 2.x 러너의 최상위 `obs_norm_state_dict` — `[1, D]`에서 평탄화하고,
+`forward`가 합으로 나누므로 `obs_std = std + eps`(`eps = 1e-2`)다. `--isaac-env-cfg
+params/env.yaml`은 `decimation`, `sim_dt`, 단일 행동 항의 `scale`과 `action_kind`, 그리고
+`--joint-names`(아티큘레이션 순서. 없으면 정규식 표를 해석하지 않고 그렇다고 말한다)에 대해
+해석한 `scene.robot.init_state.joint_pos`를 `default_joint_pos`로 기록한다.
+`--playground-config`는 `ctrl_dt / sim_dt`를 `decimation`으로, `sim_dt`, `action_scale`, 덤프된
+`default_pose`를 기록한다. 오라클의 생성기가 필요로 하는 피클 작성기(`save_native_rsl_rl`)도
+여기에 산다(INV-16).
+
+**측정(패킷 오라클 2, 이 워크스테이션, torch 2.14 CPU, 각 256 상태).**
+`python/es/rl_source/isaac_reference.py`가 `isaac-lab.md` §§ 2–6과 `brax-ppo-so101.md` § 6에서
+각 프레임워크의 관측 → 행동 사상을 NumPy로 계산하고, 임포트된 번들(`CpuPlan` 위 관측 IR,
+`TorchRuntime` 위 학습 IR)과 액추에이터 단위로 비교한다:
+
+| 소스 | 최대 절대 오차 |
+|---|---|
+| Isaac 스타일 rsl_rl, 고전 `model_state_dict` + `obs_norm_state_dict`, 관절 순서가 다르고 하나는 이름이 다름 | 1.216e-7 |
+| 같은 액터의 ≥ 5.0 `actor_state_dict` 형태 | 1.216e-7 |
+| Playground 스타일 brax (swish, tanh, `default_pose + 0.3·a`) | 7.605e-8 |
+| 음성 대조: `joint_vel`의 `scale = 0.05`를 선언하지 않은 Isaac 소스 | 6.424e-1 |
+
+이것이 정하지 않는 두 가지. rsl_rl 정규화기의 `eps = 1e-2`는 api-note에 없다(그 § 8의 열린
+항목이 고정된 rsl_rl 버전이다). 리더와 레퍼런스가 둘 다 그것을 명시하므로, 고정 버전의 eps가
+다르면 둘 다 움직인다. 그리고 실제 Isaac 체크포인트는 아직 임포트된 적이 없다 — 그것은 웨이브
+3의 I3다.
+
 ## 9. 사람을 위한 열린 질문
 
 1. 롤아웃이 Deployment IR의 선언된 지연시간을 모델링해야 하는가(트레이너 안의 청크 버퍼),

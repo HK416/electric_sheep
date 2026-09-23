@@ -86,9 +86,25 @@ import-rl
           mapping-report.json  spec 14.4's Semantic Mapping Report: one row per joint
                                and per observation channel
         Nothing is guessed: joint order, units, action kind and the observation layout
-        come from the adapter or the import is refused by name (`IMP-001` .. `IMP-005`).
+        come from the adapter or the import is refused by name. Adapter v2 (packet M11/X2)
+        also declares the source's joint names, rest pose, per-term scale/offset, history,
+        previous action, action offset/clip, policy period and actuator model; each is
+        compiled into the bundle (folded into the normalizers and the weights where the
+        algebra is exact) or refused. The refusals:
+          IMP-001  joint count disagrees with the Task IR's ActionSpec dim
+          IMP-002  a joint name the scene has no actuator for
+          IMP-003  joint units are not radians
+          IMP-004  action kind disagrees with the ActionSpec (or with the manifest)
+          IMP-005  channels do not tile the observation, name an undeclared channel, or
+                   a PreviousAction channel's `initial` is not the action offset
+          IMP-006  the source's policy period is not the Deployment IR's control period
+          IMP-007  a term the IR cannot compute (projected_gravity, base_lin_vel,
+                   base_ang_vel, velocity_commands, a command with no Task IR channel)
+          IMP-008  joint order declared twice, not at all, or not as a permutation
+          IMP-009  a clip the IR has no node for (any observation clip; an action clip
+                   that can bind)
         The Task IR's own `scene.path` is opened, repository-relative, for the actuator
-        names `IMP-002` checks against.
+        names `IMP-002` checks against and the `[actuators]` rows of the report.
 
 Exit codes: 0 success, 1 runtime failure, 2 usage error.
 ";
@@ -465,6 +481,11 @@ pub(crate) fn import_lerobot(args: &[String]) -> Result<u8, CliError> {
 /// and builds the two documents, the bundle and the Semantic Mapping Report. Every mapping
 /// decision is the adapter's; every refusal names its `IMP-0xx` code and writes nothing.
 pub(crate) fn import_rl(args: &[String]) -> Result<u8, CliError> {
+    // The refusal list is part of the help (packet M11/X2), so asking for it is not an error.
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{HELP}");
+        return Ok(0);
+    }
     let a = parse(
         args,
         &[
@@ -509,6 +530,32 @@ pub(crate) fn import_rl(args: &[String]) -> Result<u8, CliError> {
         .scene;
     let actuators: Vec<String> = scene.actuators.iter().map(|x| x.name.clone()).collect();
 
+    // `[actuators]` (adapter v2) is compared against what this scene actually builds: a
+    // position servo's `kp`, the damping MuJoCo applies (the servo's `kv` plus the joint's own
+    // passive damping), the joint's armature, and the force range's magnitude.
+    let scene_actuators: Vec<es_data::rl_import::SceneActuator> = scene
+        .actuators
+        .iter()
+        .map(|x| {
+            let joint = match x.target {
+                es_assets::scene::ActuatorTarget::Joint(id) => {
+                    scene.joints.iter().find(|j| j.id == id)
+                }
+                _ => None,
+            };
+            let (kp, kv) = match x.kind {
+                es_assets::scene::ActuatorKind::Position { kp, kv } => (Some(kp), kv),
+                _ => (None, 0.0),
+            };
+            es_data::rl_import::SceneActuator {
+                name: x.name.clone(),
+                stiffness: kp,
+                damping: joint.map(|j| j.damping + kv),
+                armature: joint.map(|j| j.armature),
+                effort_limit: x.force_range.map(|(lo, hi)| lo.abs().max(hi.abs())),
+            }
+        })
+        .collect();
     let imported = match es_data::rl_import::convert(
         &manifest,
         &adapter,
@@ -526,6 +573,8 @@ pub(crate) fn import_rl(args: &[String]) -> Result<u8, CliError> {
         }
     };
 
+    let mut imported = imported;
+    imported.report.actuators = es_data::rl_import::actuator_rows(&adapter, &scene_actuators);
     let mut learning = imported.learning;
     learning.policy.weights = WeightsRef::Safetensors {
         path: "policy.safetensors".to_owned(),
