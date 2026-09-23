@@ -69,6 +69,7 @@ pub fn capabilities() -> Capabilities {
             Feature::ContactElliptic,
             Feature::ContactSoftParams,
             Feature::ContactCondim6,
+            Feature::ContactMesh,
         ]
         .into(),
         float: FloatPrecision::F64,
@@ -79,6 +80,12 @@ pub fn capabilities() -> Capabilities {
                 Feature::JointFixed,
                 "a fixed joint is emitted as a body with no joint, MJCF's own spelling for a \
                  weld",
+            ),
+            BackendQuirk::new(
+                Feature::ContactMesh,
+                "collision detection uses the convex hull of the mesh, never its concave \
+                 surface (MuJoCo 3.13, docs/api-notes/mujoco.md); the renderer draws the \
+                 surface, so what is drawn and what is collided with differ for a concave mesh",
             ),
             BackendQuirk::new(
                 Feature::SensorJointPos,
@@ -426,7 +433,8 @@ mod tests {
         assert!(!caps.has(Feature::ActuatorGeneral));
         assert!(!caps.has(Feature::ActuatorOnTendon));
         assert!(!caps.has(Feature::SensorTouch));
-        assert!(!caps.has(Feature::ContactMesh));
+        // What it *can* write: an inline `<asset><mesh vertex face>` (packet M10/W2a).
+        assert!(caps.has(Feature::ContactMesh));
         assert!(!caps.quirks.is_empty());
     }
 
@@ -434,27 +442,35 @@ mod tests {
     /// same way with or without `MuJoCo` installed.
     #[test]
     fn a_scene_the_backend_cannot_map_is_refused_before_anything_is_spawned() {
-        for mjcf in [
-            // A site-mounted sensor: not in the declared sensor set.
-            r#"<mujoco><worldbody><body name="b"><site name="s"/>
+        // A site-mounted sensor: not in the declared sensor set.
+        let sensor = r#"<mujoco><worldbody><body name="b"><site name="s"/>
                  <joint name="j" type="hinge"/><geom name="g" type="sphere" size="0.1"/>
                </body></worldbody>
-               <sensor><accelerometer name="a" site="s"/></sensor></mujoco>"#,
-            // A mesh geom: not in the declared contact set.
-            r#"<mujoco><asset><mesh name="m" file="m.obj"/></asset>
+               <sensor><accelerometer name="a" site="s"/></sensor></mujoco>"#;
+        let scene = es_assets::parse_mjcf(sensor).unwrap().scene;
+        let err = MuJoCoCpuBackend::new()
+            .load(&scene, &LoadConfig::default())
+            .unwrap_err();
+        let PhysicsError::Requirements(unmet) = &err else {
+            panic!("expected a requirements failure, got {err:?}");
+        };
+        assert_eq!(unmet.len(), 1, "{unmet:?}");
+        assert!(!err.to_string().is_empty());
+
+        // A mesh geom is now a declared capability, so it passes the requirements check --
+        // and is still refused before anything is spawned, because nobody ran
+        // `es_assets::mesh::load` and the emitter has no vertices to inline (packet M10/W2a).
+        let mesh = r#"<mujoco><asset><mesh name="m" file="m.obj"/></asset>
                <worldbody><body name="b"><joint name="j" type="hinge"/>
-                 <geom name="g" type="mesh" mesh="m"/></body></worldbody></mujoco>"#,
-        ] {
-            let scene = es_assets::parse_mjcf(mjcf).unwrap().scene;
-            let err = MuJoCoCpuBackend::new()
-                .load(&scene, &LoadConfig::default())
-                .unwrap_err();
-            let PhysicsError::Requirements(unmet) = &err else {
-                panic!("expected a requirements failure, got {err:?}");
-            };
-            assert_eq!(unmet.len(), 1, "{unmet:?}");
-            assert!(!err.to_string().is_empty());
-        }
+                 <geom name="g" type="mesh" mesh="m"/></body></worldbody></mujoco>"#;
+        let scene = es_assets::parse_mjcf(mesh).unwrap().scene;
+        let err = MuJoCoCpuBackend::new()
+            .load(&scene, &LoadConfig::default())
+            .unwrap_err();
+        let PhysicsError::Unsupported(what) = &err else {
+            panic!("expected an unsupported failure, got {err:?}");
+        };
+        assert!(what.contains("mesh `m` is not loaded"), "{what}");
     }
 
     #[test]

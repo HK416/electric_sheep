@@ -37,12 +37,14 @@
 //! elements in the source file therefore cannot change the hash. Each [`AssetRef`] contributes
 //! its own `asset_hash`, so `asset_hash -> scene_hash` of spec 5.3 holds by construction.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use es_core::StableId;
 use es_math::{Inertia, Pose, Quat, Vec3};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::gltf::MeshData;
 
 /// Domain separator: changing the canonical encoding must change every stored hash.
 const SCENE_TAG: &str = "es.scene.v1";
@@ -68,6 +70,15 @@ pub struct SceneDesc {
     pub cameras: Vec<Camera>,
     pub assets: Vec<AssetRef>,
     pub options: PhysicsOptions,
+    /// Decoded geometry for the [`AssetKind::Mesh`] entries of `assets`, filled by
+    /// [`crate::mesh::load`] and keyed by the asset's id.
+    ///
+    /// **Not** part of [`SceneDesc::scene_hash`]: what the chain covers is the content digest
+    /// `load` writes into the [`AssetRef`] (spec 5.3), so hashing the vertices here as well
+    /// would count them twice and would move every primitives-only scene the day the field
+    /// was added (spec 28.13 rule 2).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub meshes: BTreeMap<StableId, MeshData>,
 }
 
 /// A rigid body. `pose` is relative to `parent` (or to the world when `parent` is `None`).

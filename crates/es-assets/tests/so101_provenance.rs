@@ -26,6 +26,8 @@ use es_assets::Import;
 
 const FIXTURE: &str = "so101_pick_place.xml";
 const MANIFEST: &str = "so101_pick_place.PROVENANCE.json";
+/// The upstream model this fixture derives from, as a path inside the Menagerie repository.
+const UPSTREAM: &str = "robotstudio_so101/so101.xml";
 
 /// The kinematic chain, root first. `camera_mount` hangs off `gripper` with no joint.
 const CHAIN: [&str; 8] = [
@@ -104,28 +106,37 @@ fn pin() -> (String, String) {
 
 // --- upstream ---------------------------------------------------------------------------------
 
-/// Upstream `so101.xml` bytes, or the reason there are none. Never writes into the tree:
-/// a download lands under `target/`.
-fn fetch_upstream(commit: &str) -> Result<Vec<u8>, String> {
+/// Where a fetched upstream file lands: `target/menagerie/<commit>/<repo path>`, the real
+/// directory layout, so `es_assets::mesh::load` can resolve `<compiler meshdir="assets">`
+/// against it. Never inside the tree — nothing from Menagerie is vendored (packet M10/W2a).
+pub fn menagerie_dir(commit: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/menagerie")
+        .join(commit)
+}
+
+/// Upstream bytes of `repo_path` at `commit`, or the reason there are none.
+fn fetch_upstream(commit: &str, repo_path: &str) -> Result<Vec<u8>, String> {
+    let name = repo_path.rsplit('/').next().unwrap_or(repo_path);
     if let Ok(root) = std::env::var("ES_MENAGERIE_CACHE") {
-        let cached = PathBuf::from(root).join(commit).join("so101.xml");
-        if cached.is_file() {
-            return std::fs::read(&cached).map_err(|e| format!("{}: {e}", cached.display()));
+        let root = PathBuf::from(root).join(commit);
+        // The layout this test writes, then the flat one an older cache may hold.
+        for cached in [root.join(repo_path), root.join(name)] {
+            if cached.is_file() {
+                return std::fs::read(&cached).map_err(|e| format!("{}: {e}", cached.display()));
+            }
         }
     }
-    let out_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../target/menagerie")
-        .join(commit);
+    let out = menagerie_dir(commit).join(repo_path);
+    let out_dir = out.parent().expect("a file has a parent").to_owned();
     std::fs::create_dir_all(&out_dir).map_err(|e| format!("{}: {e}", out_dir.display()))?;
-    let out = out_dir.join("so101.xml");
     if !out.is_file() {
         let url = format!(
-            "https://raw.githubusercontent.com/google-deepmind/mujoco_menagerie/{commit}\
-             /robotstudio_so101/so101.xml"
+            "https://raw.githubusercontent.com/google-deepmind/mujoco_menagerie/{commit}/{repo_path}"
         );
         // Every test in this file fetches, and `cargo test` runs them in parallel: curl into a
         // per-thread temporary and rename, or one thread reads what another is still writing.
-        let tmp = out_dir.join(format!("so101.xml.{:?}.part", std::thread::current().id()));
+        let tmp = out_dir.join(format!("{name}.{:?}.part", std::thread::current().id()));
         let status = Command::new("curl")
             .args(["-fsSL", "-o"])
             .arg(&tmp)
@@ -149,7 +160,7 @@ fn fetch_upstream(commit: &str) -> Result<Vec<u8>, String> {
 /// The parsed upstream scene, or `None` after printing the SKIP line.
 fn upstream() -> Option<SceneDesc> {
     let (commit, expected) = pin();
-    let bytes = match fetch_upstream(&commit) {
+    let bytes = match fetch_upstream(&commit, UPSTREAM) {
         Ok(bytes) => bytes,
         Err(why) => {
             println!("SKIP so101_provenance: {why}");
@@ -454,4 +465,122 @@ fn link_lengths_are_derived_not_transcribed() {
             "the derivative's link lengths differ from upstream"
         );
     });
+}
+
+// --- the meshes (packet M10/W2a) --------------------------------------------------------------
+
+/// `mesh_blake3` of the manifest: upstream mesh file name to its blake3 hex.
+///
+/// Parsed by hand for the same reason as [`manifest_field`] -- this crate takes no JSON
+/// dependency, and the manifest is repo-owned and machine-written.
+fn mesh_pins() -> BTreeMap<String, String> {
+    let json = read_fixture(MANIFEST);
+    let fail = |what: &str| -> ! { panic!("{MANIFEST}: \"mesh_blake3\" {what}") };
+    let Some((_, rest)) = json.split_once("\"mesh_blake3\"") else {
+        fail("is missing")
+    };
+    let Some((_, rest)) = rest.split_once('{') else {
+        fail("is not an object")
+    };
+    let Some((block, _)) = rest.split_once('}') else {
+        fail("is unterminated")
+    };
+    let unquote = |s: &str| s.trim().trim_matches('"').to_owned();
+    block
+        .split(',')
+        .filter_map(|entry| entry.split_once(':'))
+        .map(|(name, hex)| (unquote(name), unquote(hex)))
+        .collect()
+}
+
+/// Every upstream STL loads through the readers, and its bytes are the ones the manifest pins.
+///
+/// `#[ignore]`: 17 MB over the network. The blake3 check runs **before** the parse (spec 25.1),
+/// so a moved upstream is a failure and never a silently different mesh.
+///
+///     cargo test -p es-assets --test so101_provenance -- --ignored --nocapture
+#[test]
+#[ignore = "fetches 19 STL files (17 MB) from GitHub"]
+fn upstream_meshes_load_and_hash() {
+    let (commit, _) = pin();
+    let pins = mesh_pins();
+    assert_eq!(pins.len(), 19, "the manifest pins {} meshes", pins.len());
+
+    let mut computed: Vec<(String, String)> = Vec::new();
+    let mut moved_under_the_pin: Vec<String> = Vec::new();
+    let mut triangles = 0usize;
+    for (name, expected) in &pins {
+        let repo_path = format!("robotstudio_so101/assets/{name}");
+        let bytes = match fetch_upstream(&commit, &repo_path) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                println!("SKIP upstream_meshes_load_and_hash: {why}");
+                return;
+            }
+        };
+        let got = blake3::hash(&bytes).to_hex().to_string();
+        let moved = &got != expected;
+        computed.push((name.clone(), got));
+        let (positions, indices) = es_assets::stl::parse(&bytes)
+            .unwrap_or_else(|e| panic!("{repo_path} does not decode: {e}"));
+        assert!(!positions.is_empty() && indices.len() % 3 == 0, "{name}");
+        assert!(
+            indices.iter().all(|i| (*i as usize) < positions.len()),
+            "{name}: an index points past the vertex buffer"
+        );
+        triangles += indices.len() / 3;
+        if moved {
+            moved_under_the_pin.push(name.clone());
+        }
+        println!(
+            "{name} {} vertices {} triangles",
+            positions.len(),
+            indices.len() / 3
+        );
+    }
+    println!("RAN upstream_meshes_load_and_hash: 19 meshes, {triangles} triangles");
+    // The block the manifest holds, so regenerating it is a copy rather than a transcription.
+    println!("  \"mesh_blake3\": {{");
+    for (name, hex) in &computed {
+        println!("    \"{name}\": \"{hex}\",");
+    }
+    println!("  }},");
+    // Every mismatch at once: one at a time would hide the other eighteen.
+    assert!(
+        moved_under_the_pin.is_empty(),
+        "at {commit} these meshes hash differently from the manifest -- upstream moved under \
+         the pin, or a download is corrupt: {moved_under_the_pin:?}"
+    );
+}
+
+/// The upstream model with every mesh resolved: `scene_hash` covers the mesh *content*, so it
+/// moves away from the same file's hash before the load.
+///
+///     cargo test -p es-assets --test so101_provenance -- --ignored --nocapture
+#[test]
+#[ignore = "fetches 19 STL files (17 MB) from GitHub"]
+fn upstream_scene_hash_follows_the_mesh_content() {
+    let (commit, _) = pin();
+    let Some(before) = upstream() else { return };
+    let mut after = before.clone();
+    let base = menagerie_dir(&commit).join("robotstudio_so101");
+    if let Err(why) = es_assets::mesh::load(&mut after, &base) {
+        println!("SKIP upstream_scene_hash_follows_the_mesh_content: {why}");
+        return;
+    }
+    assert_eq!(
+        after.meshes.len(),
+        18,
+        "so101.xml declares 18 of the 19 STL files"
+    );
+    assert_ne!(
+        before.scene_hash(),
+        after.scene_hash(),
+        "resolving the meshes must move the hash: the AssetRefs now carry content digests"
+    );
+    println!(
+        "upstream so101 scene_hash before {} after {}",
+        blake3::Hash::from(before.scene_hash()).to_hex(),
+        blake3::Hash::from(after.scene_hash()).to_hex()
+    );
 }

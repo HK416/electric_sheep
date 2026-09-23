@@ -56,6 +56,9 @@ pub fn capabilities() -> Capabilities {
     contact.remove(&Feature::ContactElliptic);
     // Unverified against the engine, so not declared (TODO(api-notes)).
     contact.remove(&Feature::ContactCondim6);
+    // The inline `<asset><mesh>` mujoco-cpu emits was never run through MJWarp's own convex
+    // hull path, so this column does not claim it (packet M10/W2a, a named follow-up).
+    contact.remove(&Feature::ContactMesh);
     let mut quirks = cpu.quirks;
     quirks.push(BackendQuirk::new(
         Feature::ContactPyramidal,

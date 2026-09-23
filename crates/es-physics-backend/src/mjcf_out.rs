@@ -6,6 +6,13 @@
 //! [`PhysicsError::Unsupported`] naming the item, because spec 17.2 says a backend declares
 //! what it cannot map instead of guessing an approximation.
 //!
+//! Mesh geoms are emitted *inline*: `<asset><mesh name vertex face>` carries the vertices
+//! `es_assets::mesh::load` decoded, and the geom names that mesh. No `file=` path is written --
+//! a path would have to reach this function through `PhysicsBackend::load(&SceneDesc)`, which
+//! takes no such channel (INV-17), and a machine path inside a hashed struct is exactly what
+//! spec 5.3 forbids. A mesh geom whose asset was never loaded is `PhysicsError::Unsupported`
+//! naming it, before anything is spawned.
+//!
 //! Not emitted, because they carry no dynamics into `MuJoCo`: sites, cameras, materials and
 //! rgba. A scene that *uses* a site (spatial tendon, site-mounted sensor or actuator) hits the
 //! unsupported path above instead.
@@ -16,9 +23,10 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use es_assets::gltf::MeshData;
 use es_assets::scene::{
-    Actuator, ActuatorKind, ActuatorTarget, Body, FrictionCone, Geom, Integrator, Jacobian, Joint,
-    JointKind, SceneDesc, Sensor, SensorKind, SensorTarget, Shape, Solver,
+    Actuator, ActuatorKind, ActuatorTarget, AssetKind, Body, FrictionCone, Geom, Integrator,
+    Jacobian, Joint, JointKind, SceneDesc, Sensor, SensorKind, SensorTarget, Shape, Solver,
 };
 use es_core::StableId;
 use es_math::{Quat, Vec3};
@@ -31,6 +39,12 @@ fn unsupported(what: impl Into<String>) -> PhysicsError {
 /// Shortest round-trip decimal form; `{:?}` on `f64` never prints an integer without a point,
 /// so `MuJoCo` always parses it as a real.
 fn num(v: f64) -> String {
+    format!("{v:?}")
+}
+
+/// The `f32` sibling of [`num`]: mesh vertices are stored as `f32`, and `{:?}` is again the
+/// shortest form that round-trips, so `MuJoCo` reads back the bits the content hash covers.
+fn num32(v: f32) -> String {
     format!("{v:?}")
 }
 
@@ -143,13 +157,14 @@ pub fn scene_to_mjcf(scene: &SceneDesc) -> Result<String, PhysicsError> {
             "<flag eulerdamp=\"disable\"/>"
         }
     );
+    write_meshes(&mut out, scene);
     out.push_str("  <worldbody>\n");
     for root in roots {
         if root.name == "world" {
             // The importer's root body *is* MJCF's implicit world body (P30 module docs), so
             // its contents go straight into <worldbody> rather than into a nested <body>.
             for geom in &root.geoms {
-                write_geom(&mut out, &root.name, geom, 2)?;
+                write_geom(&mut out, &root.name, geom, 2, scene)?;
             }
             if let Some(joints) = joints_by_body.get(&root.id) {
                 return Err(unsupported(format!(
@@ -158,10 +173,10 @@ pub fn scene_to_mjcf(scene: &SceneDesc) -> Result<String, PhysicsError> {
                 )));
             }
             for child in children.get(&root.id).into_iter().flatten() {
-                write_body(&mut out, child, &children, &joints_by_body, 2)?;
+                write_body(&mut out, child, &children, &joints_by_body, 2, scene)?;
             }
         } else {
-            write_body(&mut out, root, &children, &joints_by_body, 2)?;
+            write_body(&mut out, root, &children, &joints_by_body, 2, scene)?;
         }
     }
     out.push_str("  </worldbody>\n");
@@ -171,12 +186,50 @@ pub fn scene_to_mjcf(scene: &SceneDesc) -> Result<String, PhysicsError> {
     Ok(out)
 }
 
+/// `<asset><mesh name vertex face>` for every mesh the scene carries, inline.
+///
+/// `MuJoCo` builds the collision convex hull and the inertia from exactly these numbers, so the
+/// `f32` bits the content hash covers (spec 5.3) are what reaches the solver; `{:?}` is the
+/// shortest decimal that round-trips them. An unreferenced mesh is still written: it is what
+/// the scene says it carries, and dropping it silently is what spec 17.2 forbids.
+fn write_meshes(out: &mut String, scene: &SceneDesc) {
+    if scene.meshes.is_empty() {
+        return;
+    }
+    out.push_str("  <asset>\n");
+    for data in scene.meshes.values() {
+        write_mesh(out, data);
+    }
+    out.push_str("  </asset>\n");
+}
+
+fn write_mesh(out: &mut String, data: &MeshData) {
+    let _ = write!(out, "    <mesh name=\"{}\" vertex=\"", esc(&data.name));
+    for (i, p) in data.positions.iter().enumerate() {
+        for (k, c) in p.iter().enumerate() {
+            if i + k > 0 {
+                out.push(' ');
+            }
+            out.push_str(&num32(*c));
+        }
+    }
+    out.push_str("\" face=\"");
+    for (i, index) in data.indices.iter().enumerate() {
+        if i > 0 {
+            out.push(' ');
+        }
+        let _ = write!(out, "{index}");
+    }
+    out.push_str("\"/>\n");
+}
+
 fn write_body(
     out: &mut String,
     body: &Body,
     children: &BTreeMap<StableId, Vec<&Body>>,
     joints_by_body: &BTreeMap<StableId, Vec<&Joint>>,
     depth: usize,
+    scene: &SceneDesc,
 ) -> Result<(), PhysicsError> {
     let pad = "  ".repeat(depth);
     let _ = write!(out, "{pad}<body name=\"{}\"", esc(&body.name));
@@ -229,10 +282,10 @@ fn write_body(
         write_joint(out, joint, depth + 1);
     }
     for geom in &body.geoms {
-        write_geom(out, &body.name, geom, depth + 1)?;
+        write_geom(out, &body.name, geom, depth + 1, scene)?;
     }
     for child in children.get(&body.id).into_iter().flatten() {
-        write_body(out, child, children, joints_by_body, depth + 1)?;
+        write_body(out, child, children, joints_by_body, depth + 1, scene)?;
     }
     let _ = writeln!(out, "{pad}</body>");
     Ok(())
@@ -276,7 +329,10 @@ fn write_geom(
     owner: &str,
     geom: &Geom,
     depth: usize,
+    scene: &SceneDesc,
 ) -> Result<(), PhysicsError> {
+    // `Some(mesh name)` for a mesh geom, whose vertices are its size, so it writes no `size`.
+    let mut mesh = None;
     let (kind, size) = match geom.shape {
         Shape::Plane {
             half_x,
@@ -303,8 +359,23 @@ fn write_geom(
         } => ("cylinder", format!("{} {}", num(radius), num(half_length))),
         Shape::Box { half_extents } => ("box", vec3(half_extents)),
         Shape::Ellipsoid { radii } => ("ellipsoid", vec3(radii)),
-        Shape::Mesh { .. } => {
-            return Err(unsupported(format!("geom `{}`: mesh", geom.name)));
+        Shape::Mesh { asset } => {
+            // The geometry has to be on the scene already: `PhysicsBackend::load` is handed a
+            // `&SceneDesc` and nothing else, so a file this function could open does not exist
+            // as far as the trait is concerned (INV-17).
+            let data = scene.meshes.get(&asset).ok_or_else(|| {
+                let named = scene
+                    .assets
+                    .iter()
+                    .find(|a| a.id == asset && a.kind == AssetKind::Mesh)
+                    .map_or("<unknown>", |a| a.name.as_str());
+                unsupported(format!(
+                    "geom `{}`: mesh `{named}` is not loaded (es_assets::mesh::load)",
+                    geom.name
+                ))
+            })?;
+            mesh = Some(esc(&data.name));
+            ("mesh", String::new())
         }
         Shape::HeightField { .. } => {
             return Err(unsupported(format!("geom `{}`: height field", geom.name)));
@@ -326,11 +397,9 @@ fn write_geom(
     } else {
         geom.name.clone()
     };
-    let _ = write!(
-        out,
-        "{pad}<geom name=\"{}\" type=\"{kind}\" size=\"{size}\"",
-        esc(&name)
-    );
+    let _ = write!(out, "{pad}<geom name=\"{}\" type=\"{kind}\"", esc(&name));
+    attr(out, "size", (!size.is_empty()).then_some(size));
+    attr(out, "mesh", mesh);
     attr(out, "pos", Some(vec3(geom.pose.position)));
     attr(out, "quat", quat(geom.pose.orientation));
     attr(
@@ -587,13 +656,74 @@ mod tests {
         assert_eq!(after.actuators[3].ctrl_range, Some((-0.5, 0.5)));
     }
 
+    /// `tests/fixtures/mjcf/mesh_box.xml` with its STL resolved: the emitted file must carry
+    /// the vertices themselves, because `PhysicsBackend::load` gets a `&SceneDesc` and no path
+    /// channel (INV-17).
+    fn mesh_box() -> SceneDesc {
+        let dir = std::path::PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/mjcf"
+        ));
+        let mut scene = es_assets::parse_mjcf(&fixture("mesh_box.xml"))
+            .unwrap()
+            .scene;
+        es_assets::mesh::load(&mut scene, &dir).expect("the fixture STL loads");
+        scene
+    }
+
+    #[test]
+    fn mesh_geom_emits_inline_vertex_and_face() {
+        let scene = mesh_box();
+        let text = scene_to_mjcf(&scene).expect("a loaded mesh scene emits");
+        assert!(text.contains("<mesh name=\"box\" vertex=\""), "{text}");
+        assert!(text.contains("<geom name=\"mesh_geom\" type=\"mesh\" mesh=\"box\""));
+        // A mesh geom's vertices are its size, so no `size=` is written for it.
+        let geom = text
+            .lines()
+            .find(|l| l.contains("name=\"mesh_geom\""))
+            .unwrap();
+        assert!(!geom.contains("size="), "{geom}");
+        // Eight corners and twelve triangles, as f32 decimals and 0-based indices.
+        let mesh = text.lines().find(|l| l.contains("<mesh ")).unwrap();
+        let count = |attr: &str| {
+            mesh.split_once(&format!("{attr}=\""))
+                .unwrap()
+                .1
+                .split_once('"')
+                .unwrap()
+                .0
+                .split_whitespace()
+                .count()
+        };
+        assert_eq!(count("vertex"), 24);
+        assert_eq!(count("face"), 36);
+        assert!(mesh.contains("0.05") && mesh.contains("-0.05"), "{mesh}");
+        // And the whole file re-parses, so nothing about it is malformed XML.
+        es_assets::parse_mjcf(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    }
+
+    #[test]
+    fn unloaded_mesh_is_refused_by_name() {
+        let scene = es_assets::parse_mjcf(&fixture("mesh_box.xml"))
+            .unwrap()
+            .scene;
+        let err = scene_to_mjcf(&scene).expect_err("nothing resolved the STL");
+        let message = err.to_string();
+        assert!(
+            message.contains("mesh `box` is not loaded"),
+            "{message}, it must name the mesh and the way out"
+        );
+        assert!(message.contains("es_assets::mesh::load"), "{message}");
+        assert!(matches!(err, PhysicsError::Unsupported(_)));
+    }
+
     #[test]
     fn every_unmappable_item_is_named() {
         let cases = [
             (
                 r#"<mujoco><asset><mesh name="m" file="m.obj"/></asset><worldbody><body name="b">
                      <geom name="g" type="mesh" mesh="m"/></body></worldbody></mujoco>"#,
-                "geom `g`: mesh",
+                "geom `g`: mesh `m` is not loaded",
             ),
             (
                 r#"<mujoco><worldbody><body name="b"><site name="s"/>
