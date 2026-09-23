@@ -2,7 +2,7 @@
 
     main.py build-usd --mjcf emitted.xml --out <dir>
     main.py train --scene <dir>/scene.json --seed N --iterations N --out <run>
-    main.py eval  --scene <dir>/scene.json --checkpoint <run>/model_N.pt --seed N --episodes N --out <json>
+    main.py eval  --scene <dir>/scene.json --checkpoint <run>/model_N.pt [...] --seed N --episodes N --out <json>
 
 Run with the Isaac venv (`~/venvs/es-isaac/bin/python`), `OMNI_KIT_ACCEPT_EULA=YES` and the
 compat `LD_LIBRARY_PATH` of isaac-sim.md 7.2. `AppLauncher(headless=True)` starts Isaac Lab's
@@ -14,9 +14,9 @@ writes it), flattens the stage and writes the robot prim as `robot.usd`, plus `s
 fixups, the cube's prim path, and the PhysX scene attributes `physx_ref.py`'s `World` authors,
 so a mismatch with Isaac Lab's `PhysxCfg` is a listed row and not a guess. `train` is rsl_rl's
 `OnPolicyRunner` on `env_cfg.make_env_cfg` (Isaac Lab's `train.py` minus Hydra) and writes
-`params/env.yaml` + `params/agent.yaml` as `train.py` does. `eval` rolls the deterministic
-policy (the Gaussian's mean) for one episode in each of `--episodes` envs, reset from a seed
-the training run never used, and writes the Isaac-side success rate.
+`params/env.yaml` + `params/agent.yaml` as `train.py` does. `eval` rolls each checkpoint's
+deterministic policy (the Gaussian's mean) for one episode in each of `--episodes` envs, all
+reset from one seed the training run never used, and writes the Isaac-side success rates.
 """
 
 from __future__ import annotations
@@ -182,30 +182,33 @@ def evaluate(args) -> None:
     agent = env_cfg.make_runner_cfg(args.seed, 1, args.device)
     wrapped = RslRlVecEnvWrapper(env, clip_actions=None)
     runner = OnPolicyRunner(wrapped, agent.to_dict(), log_dir=None, device=args.device)
-    runner.load(args.checkpoint, load_optimizer=False)
-    policy = runner.get_inference_policy(device=args.device)
-    obs = wrapped.get_observations()
     n = args.episodes
-    done = torch.zeros(n, dtype=torch.bool, device=args.device)
-    success = torch.zeros(n, dtype=torch.bool, device=args.device)
-    length = torch.zeros(n, dtype=torch.long, device=args.device)
-    for t in range(1, 201):
-        with torch.inference_mode():
-            obs, _, dones, _ = wrapped.step(policy(obs))
-        ended = dones.bool() & ~done
-        success |= ended & env.termination_manager.get_term("success")
-        length[ended] = t
-        done |= ended
-        if bool(done.all()):
-            break
-    result = {
-        "checkpoint": args.checkpoint, "reset_seed": args.seed, "episodes": n,
-        "success_rate": success.float().mean().item(),
-        "episode_length": length.float().mean().item(),
-        "unfinished": int((~done).sum().item()),
-    }
-    Path(args.out).write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps(result))
+    results = []
+    for ckpt in args.checkpoint:
+        runner.load(ckpt, load_optimizer=False)
+        policy = runner.get_inference_policy(device=args.device)
+        env.reset(seed=args.seed)  # the same resets for every checkpoint
+        obs = wrapped.get_observations()
+        done = torch.zeros(n, dtype=torch.bool, device=args.device)
+        success = torch.zeros(n, dtype=torch.bool, device=args.device)
+        length = torch.zeros(n, dtype=torch.long, device=args.device)
+        for t in range(1, 201):
+            with torch.inference_mode():
+                obs, _, dones, _ = wrapped.step(policy(obs))
+            ended = dones.bool() & ~done
+            success |= ended & env.termination_manager.get_term("success")
+            length[ended] = t
+            done |= ended
+            if bool(done.all()):
+                break
+        results.append({
+            "checkpoint": ckpt, "reset_seed": args.seed, "episodes": n,
+            "success_rate": success.float().mean().item(),
+            "episode_length": length.float().mean().item(),
+            "unfinished": int((~done).sum().item()),
+        })
+        print(json.dumps(results[-1]))
+    Path(args.out).write_text(json.dumps(results, indent=2) + "\n")
     sys.stdout.flush()
     os._exit(0)
 
@@ -225,7 +228,7 @@ def main() -> None:
     t.add_argument("--out", required=True)
     e = sub.add_parser("eval")
     e.add_argument("--scene", required=True)
-    e.add_argument("--checkpoint", required=True)
+    e.add_argument("--checkpoint", required=True, nargs="+")
     e.add_argument("--seed", type=int, required=True)
     e.add_argument("--episodes", type=int, default=1024)
     e.add_argument("--device", default="cuda:0")
