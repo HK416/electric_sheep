@@ -377,6 +377,53 @@ fn rollout_matches_es_eval_loop() {
     println!("RAN rollout_matches_es_eval_loop: {STEPS} steps x {N_ENVS} envs match the golden");
 }
 
+/// Packet M11/X3 oracle 2: a state-only rollout is what it was, with and without the `render`
+/// feature -- run it both ways.
+///
+/// The SO-101 trace reproduces `tests/golden/rollout/so101_100steps.json` bitwise, and the
+/// reach documents build a rollout that renders nothing: no frame, no render cost, the render
+/// row of the metrics `None` (no renderer is built, so no Vulkan device is opened for it).
+#[test]
+fn rollout_state_only_is_unchanged() {
+    const TEST: &str = "rollout_state_only_is_unchanged";
+    if let Err(why) = MuJoCoCpuBackend::is_available() {
+        println!("SKIP {TEST}: {why}");
+        return;
+    }
+    let (task, observation, deployment, scene) = documents();
+    let mine =
+        serde_json::to_string_pretty(&through_rollout(&task, &observation, &deployment, &scene))
+            .expect("serialize");
+    let golden = repo_root().join("tests/golden/rollout/so101_100steps.json");
+    let committed =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(
+        committed.replace("\r\n", "\n").trim_end(),
+        mine,
+        "the state-only rollout no longer reproduces {}",
+        golden.display()
+    );
+
+    let (task, obs, deploy, scene) = reach_documents();
+    let mut roll =
+        Rollout::<NJ, 1>::new(&task, &obs, &deploy, &scene, 0, N_ENVS).expect("reach rollout");
+    roll.observe().expect("observe");
+    roll.act(&actions(0, N_ENVS as usize)).expect("act");
+    assert_eq!(
+        roll.frame(0),
+        None,
+        "a state-only rollout captures no image"
+    );
+    assert_eq!(roll.render_ms_per_frame(), None);
+    let m = roll.metrics();
+    assert_eq!((m.camera_frames_per_sec, m.pixels_per_sec), (None, None));
+    println!(
+        "RAN {TEST}: {STEPS} steps x {N_ENVS} envs match the golden; the reach rollout renders \
+         nothing (render feature: {})",
+        cfg!(feature = "render")
+    );
+}
+
 // --- packet M8/S4e: the reach documents' 26-wide port -----------------------------------------
 
 /// Packet M8/S4e oracle 3: `Rollout` over the four reach documents observes exactly the
