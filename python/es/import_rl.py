@@ -193,7 +193,16 @@ def isaac_env_fields(path: Path, joint_names: list[str] | None, action_dim: int)
 
     import yaml  # noqa: PLC0415
 
-    cfg = yaml.safe_load(path.read_text())
+    # Isaac Lab's `dump_yaml` is `yaml.dump`, not `safe_dump`: every tuple in the cfg
+    # (`sim.gravity`, `init_state.pos`, ...) is written `!!python/tuple` (measured, M11/I3).
+    # A safe loader that reads that one tag as a list, and still constructs nothing else.
+    class Loader(yaml.SafeLoader):
+        pass
+
+    Loader.add_constructor(
+        "tag:yaml.org,2002:python/tuple", lambda loader, node: loader.construct_sequence(node)
+    )
+    cfg = yaml.load(path.read_text(), Loader=Loader)  # noqa: S506 -- a SafeLoader subclass
     out: dict = {"decimation": int(cfg["decimation"]), "sim_dt": float(cfg["sim"]["dt"])}
 
     def resolve(table: dict, what: str) -> list[float] | None:

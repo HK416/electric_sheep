@@ -206,7 +206,10 @@ def make_env_cfg(usd_path: str, cube_path: str, num_envs: int, seed: int, device
 
     @configclass
     class So101ReachEnvCfg(ManagerBasedRLEnvCfg):
-        scene: SceneCfg = SceneCfg(num_envs=num_envs, env_spacing=2.0)
+        # Every env at one origin, collisions filtered between envs -- `physx_ref.py`'s
+        # `GridCloner(spacing = 0)`. Also forced: the importer welds the base to the world at
+        # the MJCF's own coordinates, so a spaced env's arm is pulled back to the origin.
+        scene: SceneCfg = SceneCfg(num_envs=num_envs, env_spacing=0.0)
         observations: ObservationsCfg = ObservationsCfg()
         actions: ActionsCfg = ActionsCfg()
         rewards: RewardsCfg = RewardsCfg()
