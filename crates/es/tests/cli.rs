@@ -13662,7 +13662,7 @@ const ISAAC_SO101_EVALUATION_HEADER: &str = "\
 ";
 
 /// Writes a neutral `import.json` + `weights.safetensors` with the shapes the Isaac env
-/// trains -- 32 -> [64, 64] -> 6, elu, rsl_rl's linear head, no normalizer, the env cfg's
+/// trains -- 32 -> [64, 64] -> 6, elu, `rsl_rl`'s linear head, no normalizer, the env cfg's
 /// decimation, dt, action scale and default pose -- and imports it with `es policy
 /// import-rl` against the Isaac adapter. What `import_rl.py --from rsl-rl --isaac-env-cfg
 /// env.yaml --joint-names ...` records for a trained checkpoint, with deterministic weights in
