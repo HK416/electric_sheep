@@ -378,7 +378,7 @@ impl<'gpu> Renderer<'gpu> {
     /// staging copy or a renumbering of every shader's bindings.
     pub fn upload_tris(&mut self, tri: TriScene) -> Result<(), RenderError> {
         let mut floats = Vec::new();
-        self.slot = Slot::pack(&tri, &mut floats);
+        self.slot = Slot::pack(&tri, &Bvh::build(&tri.tris), &mut floats);
         self.upload_floats(&floats)?;
         self.tri_scene = tri;
         Ok(())
@@ -602,10 +602,31 @@ impl<'gpu> Renderer<'gpu> {
                 c.path, self.cfg.path
             )));
         }
+        // Every env's tree is a pure function of its own triangles, so they are built on every
+        // core and packed in env order: the same trees, the same bytes, less wall clock.
+        let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let per = envs.len().div_ceil(workers).max(1);
+        let trees: Vec<Bvh> = std::thread::scope(|s| {
+            let parts: Vec<_> = envs
+                .chunks(per)
+                .map(|part| {
+                    s.spawn(move || {
+                        part.iter()
+                            .map(|(tri, _, _)| Bvh::build(&tri.tris))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            parts
+                .into_iter()
+                .flat_map(|h| h.join().expect("a BVH build panicked"))
+                .collect()
+        });
         let mut floats = Vec::new();
         let slots: Vec<Slot> = envs
             .iter()
-            .map(|(tri, _, _)| Slot::pack(tri, &mut floats))
+            .zip(&trees)
+            .map(|((tri, _, _), bvh)| Slot::pack(tri, bvh, &mut floats))
             .collect();
         self.upload_floats(&floats)?;
         self.slot = Slot::default();
@@ -891,11 +912,10 @@ struct Slot {
 }
 
 impl Slot {
-    /// Append `tri`'s triangles and then the BVH over them to `floats`. At an empty `floats`
-    /// this is the upload [`Renderer::upload_tris`] always made, float for float.
-    fn pack(tri: &TriScene, floats: &mut Vec<f32>) -> Self {
+    /// Append `tri`'s triangles and then `bvh`, the tree over them, to `floats`. At an empty
+    /// `floats` this is the upload [`Renderer::upload_tris`] always made, float for float.
+    fn pack(tri: &TriScene, bvh: &Bvh, floats: &mut Vec<f32>) -> Self {
         let at = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
-        let bvh = Bvh::build(&tri.tris);
         let tri_base = at(floats.len());
         floats.extend(tri.to_floats());
         let bvh_base = at(floats.len());
