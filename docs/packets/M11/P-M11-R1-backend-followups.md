@@ -60,7 +60,7 @@ docs/packets/M11/P-M11-R1-backend-followups.ko.md
 
 ## acceptance
 
-Oracles 1–4; `evaluation-execution.md` §2.8 (+ko) states the script rule.
+Oracles 1–4; `evaluation-execution.md` section 2.8 (+ko) states the script rule.
 
 ## forbidden
 

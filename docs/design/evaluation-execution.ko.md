@@ -492,7 +492,7 @@ version ‖ threads as u32 LE)`다. `evaluation.lock`은 그 수를 `runtime_thr
 `es_native.Rollout`은 `MuJoCoCpuBackend`를 하드코딩했다. 이제 각 동사는 `--backend`를
 `BackendKind`로 파싱하고, 고른 타입으로 단형화한 기존 제네릭 진입점을 부르는 `match` 하나를 둔다 —
 `Evaluation::run_shard_with_sink::<B, …>(…, B::default, …)`, `Collector::run_with_sink::<B, …>`,
-그리고 `Rollout` 안에서는 `Env<MuJoCoCpuBackend>` / `Env<MjWarpBackend>`의 닫힌 열거형. `Env`
+그리고 `Rollout` 안에서는 `Env<MuJoCoCpuBackend>` / `Env<MjWarpBackend>` / `Env<PhysXBackend>`(세 번째 갈래는 패킷 M11/R1부터)의 닫힌 열거형. `Env`
 안의 `Box<dyn PhysicsBackend>`도, 새 트레이트도 없다(INV-17, §3.4).
 
 | `--backend` | 오늘 하는 일 |
@@ -500,7 +500,7 @@ version ‖ threads as u32 LE)`다. `evaluation.lock`은 그 수를 `runtime_thr
 | `mujoco-cpu` (기본값) | 기준(§17.1), tier 1. `hardware_capability` 슬롯은 커밋된 모든 lock이 해시될 때의 전부 0인 값 그대로다 |
 | `mjwarp` | MuJoCo Warp, tier 2(결코 비트 단위가 아니다, §3.5, 실행 간에도). `ES_PYTHON` 아래에 `mujoco_warp`가 있어야 하고, 없으면 `SKIPPED` 종료 코드 3. 타원 원뿔은 근사 행으로 매핑된다(스펙 17.2 각주) |
 | `newton` | 아무것도 뜨기 전에 자신의 매핑 리포트에 의해 거부된다: 어댑터가 액추에이터도 센서도 선언하지 않고 접촉도 연결하지 않으므로, `es backend compare`의 개루프 전용이다 |
-| `physx` | 거부: `not implemented (M11/I1)` |
+| `physx` | Isaac Sim을 통한 PhysX(패킷 M11/I1), tier 2. `ES_ISAAC_PYTHON`이 있어야 하고, 없으면 `SKIPPED` 종료 코드 3. `es_native.Rollout`과 `[rl] backend = "physx"`는 패킷 M11/R1부터 |
 | 그 밖의 이름 | 네 이름을 나열하는 사용법 오류(종료 코드 2) |
 
 **순서.** `mujoco-cpu`가 아닌 백엔드에서는 장면을 읽고 그 §17.2 매핑 리포트가 첫 관문이다(§14.4) —
@@ -519,6 +519,18 @@ float와 tier는 lock의 `backend` 블록이 쓰는 철자 그대로다. `hardwa
 다른 `execution_hash` 두 개이고, 커밋된 모든 `mujoco-cpu` `execution_hash`는 움직이지 않는다.
 `evaluation.lock`의 `backend` 블록에는 `engine_version`이 생긴다(선택적이며 설정되지 않으면
 바이트에 없으므로 옛 lock도 그대로 파싱된다).
+
+**어댑터 스크립트 (패킷 M11/R1).** 엔진 버전이 엔진의 전부는 아니다: 기준을 제외한 모든 백엔드는
+자신이 내장한 Python 어댑터(`mjwarp::SCRIPT`, `newton::SCRIPT`, `physx::SCRIPT`)를 실행하며,
+`mjwarp_ref.py`의 수정 두 건과 `physx_ref.py`의 수정 한 건이 같은 엔진 버전에서 평가 결과를
+바꾸었는데도 어떤 `execution_hash`도 움직이지 않았다. 그래서
+`backend_identity(caps, engine_version, script)`는 위의 다섯 필드 뒤에, 같은 길이 접두 규칙으로,
+그 스크립트의 32바이트 blake3을 덧붙인다(`es_physics_backend::adapter_script(kind)`, 백엔드가
+띄우는 바로 그 상수). 어댑터의 한 바이트 변경은 다른 `hardware_capability`, 따라서 다른
+`execution_hash`다. `mujoco-cpu`는 `mujoco_ref.py`가 무엇이든 전부 0인 슬롯을 유지한다 — 기준은
+대신 자신의 골든으로 고정된다(§28.14 규칙 2) — 그래서 커밋된 어떤 lock도 움직이지 않는다.
+`evaluation.lock`의 `backend` 블록에는 `script_blake3`이 생긴다(hex, 선택적, `mujoco-cpu`에서는
+없음).
 
 #### 측정, 오라클 서버 (RTX 4090, 16코어), 2026-09-23 UTC
 

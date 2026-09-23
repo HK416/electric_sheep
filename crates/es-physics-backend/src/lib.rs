@@ -31,40 +31,56 @@ pub use physx::PhysXBackend;
 use es_assets::scene::SceneDesc;
 use es_physics_core::{Capabilities, LoadConfig, PhysicsBackend, PhysicsError};
 
-/// What a path with no `PhysX` wiring says. The backend exists since packet M11/I1
-/// ([`PhysXBackend`]); `es-py`'s `Rollout` (the `[rl]` trainer's env) is not wired to it yet.
-pub const PHYSX_NOT_IMPLEMENTED: &str = "backend `physx`: not implemented (M11/I1)";
-
-/// `H("es.backend.v1", name, engine version, float, determinism tier)` (spec 28.14 rule 2).
+/// `H("es.backend.v1", name, engine version, float, determinism tier, blake3(script))` (spec
+/// 28.14 rule 2).
 ///
 /// Every field is length-prefixed, so no two tuples hash the same bytes. The float and tier are
-/// spelled as `evaluation.lock`'s `backend` block spells them.
-pub fn backend_identity(caps: &Capabilities, engine_version: &str) -> [u8; 32] {
+/// spelled as `evaluation.lock`'s `backend` block spells them. `script` is the adapter the
+/// backend spawns ([`adapter_script`]): a fix to it can move results at the same engine version,
+/// so it is a condition of the run (packet M11/R1).
+pub fn backend_identity(caps: &Capabilities, engine_version: &str, script: &str) -> [u8; 32] {
     let float = format!("{:?}", caps.float);
     let tier = format!("{:?}", caps.determinism);
+    let script = blake3::hash(script.as_bytes());
     let mut h = blake3::Hasher::new();
     for field in [
-        "es.backend.v1",
-        caps.name.as_str(),
-        engine_version,
-        float.as_str(),
-        tier.as_str(),
+        b"es.backend.v1".as_slice(),
+        caps.name.as_bytes(),
+        engine_version.as_bytes(),
+        float.as_bytes(),
+        tier.as_bytes(),
+        script.as_bytes(),
     ] {
         h.update(&(field.len() as u64).to_le_bytes());
-        h.update(field.as_bytes());
+        h.update(field);
     }
     *h.finalize().as_bytes()
 }
 
+/// The Python adapter `kind` embeds and spawns: what [`identify`] hashes into the identity.
+pub fn adapter_script(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::MuJoCoCpu => proc::SCRIPT,
+        BackendKind::MjWarp => mjwarp::SCRIPT,
+        BackendKind::Newton => newton::SCRIPT,
+        BackendKind::PhysX => physx::SCRIPT,
+    }
+}
+
 /// The `hardware_capability` slot of `execution_hash` (spec 5.3) for a run on this backend:
 /// [`backend_identity`] everywhere except `mujoco-cpu`, the reference (spec 17.1), whose slot
-/// stays the all-zero value every committed `evaluation.lock` was hashed with.
-pub fn hardware_capability(caps: &Capabilities, engine_version: &str) -> [u8; 32] {
-    if BackendKind::from_name(&caps.name) == Some(BackendKind::MuJoCoCpu) {
+/// stays the all-zero value every committed `evaluation.lock` was hashed with -- its script is
+/// pinned by its goldens instead.
+pub fn hardware_capability(caps: &Capabilities, engine_version: &str, script: &str) -> [u8; 32] {
+    if is_reference(caps) {
         [0; 32]
     } else {
-        backend_identity(caps, engine_version)
+        backend_identity(caps, engine_version, script)
     }
+}
+
+fn is_reference(caps: &Capabilities) -> bool {
+    BackendKind::from_name(&caps.name) == Some(BackendKind::MuJoCoCpu)
 }
 
 /// A backend opened once on a scene: what a run on it writes into the hash chain.
@@ -73,7 +89,10 @@ pub struct BackendIdentity {
     pub kind: BackendKind,
     /// The load reply's engine version.
     pub engine_version: String,
-    /// [`hardware_capability`] of the declaration and that version.
+    /// The blake3 of [`adapter_script`], in hex -- `None` on `mujoco-cpu`, whose slot does
+    /// not hash it (packet M11/R1).
+    pub script_blake3: Option<String>,
+    /// [`hardware_capability`] of the declaration, that version and that script.
     pub hardware: [u8; 32],
 }
 
@@ -93,9 +112,13 @@ pub fn identify(kind: BackendKind, scene: &SceneDesc) -> Result<BackendIdentity,
         let engine_version = version(&backend)
             .ok_or_else(|| PhysicsError::Protocol("loaded without an engine version".to_owned()))?
             .to_owned();
+        let caps = backend.capabilities();
+        let script = adapter_script(kind);
         Ok(BackendIdentity {
             kind,
-            hardware: hardware_capability(backend.capabilities(), &engine_version),
+            script_blake3: (!is_reference(caps))
+                .then(|| blake3::hash(script.as_bytes()).to_hex().to_string()),
+            hardware: hardware_capability(caps, &engine_version, script),
             engine_version,
         })
     }

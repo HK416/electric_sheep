@@ -47,7 +47,7 @@ use es_eval::runner::{capture_at, input_sources, joint_state, previous_action_in
 use es_eval::LightOverride;
 use es_ir::deployment::{ActionSpace, ExecutionMode, Micros};
 use es_ir::types::ElemType;
-use es_physics_backend::{BackendKind, MjWarpBackend, MuJoCoCpuBackend};
+use es_physics_backend::{BackendKind, MjWarpBackend, MuJoCoCpuBackend, PhysXBackend};
 use es_physics_core::backend::{ModelInfo, PhysicsBackend, StateView};
 use es_safety::{ActionChunk, SafetyPlane};
 
@@ -84,7 +84,7 @@ pub enum RolloutError {
         nj: usize,
     },
     /// A backend `Rollout` has no closed-loop path for: Newton's own `load` refuses with its
-    /// mapping report, `PhysX` is not implemented (packet M11/X1).
+    /// mapping report (packet M11/X1).
     #[error("{0}")]
     Backend(String),
     /// The renderer could not be built for the observation's image input (packet M11/X3).
@@ -163,12 +163,14 @@ pub struct Rollout<const NJ: usize, const H: usize> {
     frame_pixels: u64,
 }
 
-/// The env on the backend `Rollout` was built for (packet M11/X1): a closed enum over the two
-/// engines with a closed-loop path, each arm the generic `Env<B>` monomorphized -- not a trait
+/// The env on the backend `Rollout` was built for (packets M11/X1, M11/R1): a closed enum over
+/// the three engines with a closed-loop path, each arm the generic `Env<B>` monomorphized -- not a trait
 /// object and not a new trait (INV-17).
 enum Sim {
     Cpu(Env<MuJoCoCpuBackend>),
     Warp(Env<MjWarpBackend>),
+    /// Packet M11/R1.
+    PhysX(Env<PhysXBackend>),
 }
 
 macro_rules! on_env {
@@ -176,6 +178,7 @@ macro_rules! on_env {
         match $sim {
             Sim::Cpu($e) => $body,
             Sim::Warp($e) => $body,
+            Sim::PhysX($e) => $body,
         }
     };
 }
@@ -233,9 +236,9 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
         )
     }
 
-    /// [`Rollout::new`] on the named backend (packet M11/X1): `mujoco-cpu` or `mjwarp`. Newton
-    /// is refused by its own `load` -- the mapping report, before a process spawns -- and
-    /// `PhysX` by name.
+    /// [`Rollout::new`] on the named backend (packets M11/X1, M11/R1): `mujoco-cpu`, `mjwarp` or
+    /// `physx`. Newton is refused by its own `load` -- the mapping report, before a process
+    /// spawns.
     pub fn with_backend(
         backend: BackendKind,
         task_toml: &str,
@@ -290,11 +293,13 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
                     "backend `newton` has no closed-loop path: {refused}"
                 )));
             }
-            BackendKind::PhysX => {
-                return Err(RolloutError::Backend(
-                    es_physics_backend::PHYSX_NOT_IMPLEMENTED.to_owned(),
-                ))
-            }
+            BackendKind::PhysX => Sim::PhysX(Env::new(
+                &task,
+                &scene,
+                PhysXBackend::new(),
+                &domains,
+                seed,
+            )?),
         };
 
         let (nu, nq, nv) = {

@@ -636,6 +636,7 @@ mod tests {
                 supports_state_get_set: true,
                 quirks: Vec::new(),
                 engine_version: None,
+                script_blake3: None,
             },
             created: 0,
             runtime_threads: None,

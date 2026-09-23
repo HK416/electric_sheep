@@ -57,7 +57,7 @@ docs/packets/M11/P-M11-R1-backend-followups.ko.md
 
 ## 수용
 
-오라클 1–4. `evaluation-execution.md` §2.8(+ko)에 스크립트 규칙을 적는다.
+오라클 1–4. `evaluation-execution.md` 2.8절(+ko)에 스크립트 규칙을 적는다.
 
 ## 금지
 

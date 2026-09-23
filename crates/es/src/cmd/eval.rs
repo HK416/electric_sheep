@@ -993,8 +993,11 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
     // In plain text beside the `execution_hash` that covers it (spec 5.3, packet M10/W0a).
     // `None` under `--expert`: the torch runtime was never loaded and nothing has a pool.
     lock.runtime_threads = torch.threads();
-    // Beside the `backend` block it names (packet M11/X1).
-    lock.backend.engine_version = identity.map(|i| i.engine_version);
+    // Beside the `backend` block it names (packets M11/X1, M11/R1).
+    if let Some(i) = identity {
+        lock.backend.engine_version = Some(i.engine_version);
+        lock.backend.script_blake3 = i.script_blake3;
+    }
 
     std::fs::create_dir_all(&a.out)
         .map_err(|e| CliError::Runtime(format!("{}: {e}", a.out.display())))?;

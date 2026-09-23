@@ -516,7 +516,7 @@ type ActTuple = (Vec<f64>, Vec<u32>, Vec<f64>, Vec<bool>);
 #[allow(clippy::needless_pass_by_value)]
 #[pymethods]
 impl Rollout {
-    /// `backend` is `mujoco-cpu` (the default) or `mjwarp` (packet M11/X1).
+    /// `backend` is `mujoco-cpu` (the default), `mjwarp` (packet M11/X1) or `physx` (M11/R1).
     #[new]
     #[pyo3(signature = (task_toml, observation_toml, deployment_toml, scene_xml, seed, n_envs, backend = "mujoco-cpu"))]
     fn new(

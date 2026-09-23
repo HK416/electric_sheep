@@ -321,6 +321,11 @@ pub struct BackendCaps {
     /// no such accessor (INV-17) -- and absent from the bytes when it did not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine_version: Option<String>,
+    /// The blake3 of the adapter script the backend spawned, in hex (packet M11/R1): covered
+    /// by `hardware_capability` beside the engine version. Absent on `mujoco-cpu`, whose slot
+    /// does not hash it, so no reference lock moves.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script_blake3: Option<String>,
 }
 
 /// `evaluation.lock` (§10.5): the conditions, in hex, next to the seeds that produced them.
@@ -848,6 +853,7 @@ impl Evaluation {
                     supports_state_get_set: false,
                     quirks: Vec::new(),
                     engine_version: None,
+                    script_blake3: None,
                 }),
             created: cfg.created,
             runtime_threads: None,
@@ -907,6 +913,7 @@ fn backend_caps<B: PhysicsBackend>(env: &Env<B>) -> BackendCaps {
         supports_state_get_set: c.supports_state_get_set,
         quirks: c.quirks.iter().map(|q| q.description.clone()).collect(),
         engine_version: None,
+        script_blake3: None,
     }
 }
 
