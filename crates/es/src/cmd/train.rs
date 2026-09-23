@@ -395,16 +395,17 @@ pub(crate) fn run(
     // printed on a machine that has neither the bundle nor the dataset.
     let plan = plan_with(&recipe, out, Some(observation))?;
     match route {
-        // Refused here rather than by `Rollout::observe` on the first step of the first
-        // iteration: a renderer is not something `es_native.Rollout` links (spec 4.3), so a
-        // recipe that asks for pixels is asking for a run that cannot start -- and finding
-        // that out after the lowering and the interpreter probe is the kind of thing this
-        // command exists to stop (packet M8/S4b).
-        Route::Rl if has_image_input(observation) => {
+        // `es_native.Rollout` renders an image input since packet M11/X3 (its maturin build
+        // has the `render` feature), so a render build passes the documents through and the
+        // trainer writes the render cost to `metrics/env-metrics.json` (packet M11/R1). A
+        // build without the feature is refused here rather than on the first step of the
+        // first iteration -- after the lowering and the interpreter probe (packet M8/S4b).
+        Route::Rl if !cfg!(feature = "render") && has_image_input(observation) => {
             return Err(bad(
-                "the policy's Observation IR has an image input and `[rl]` steps the env \
-                 through `es_native.Rollout`, which links no renderer. Train an RL policy \
-                 against a state-only Observation IR of the same task",
+                "the policy's Observation IR has an image input and this build of `es` has no \
+                 `render` feature, so `[rl]` cannot render it through `es_native.Rollout`. \
+                 Rebuild with `--features render`, or train against a state-only Observation \
+                 IR of the same task",
             ))
         }
         Route::Rl => {}

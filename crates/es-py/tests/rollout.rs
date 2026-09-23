@@ -687,23 +687,28 @@ fn reach_documents() -> (String, String, String, String) {
     )
 }
 
-/// Packet M11/X1: `Rollout` runs on `mujoco-cpu` and `mjwarp`. Newton is refused by its own
-/// mapping report before a process spawns (its adapter declares no actuators), and `PhysX`
-/// names the packet that brings it. Needs no Python.
+/// Packet M11/X1: Newton is refused by its own mapping report before a process spawns (its
+/// adapter declares no actuators). Packet M11/R1: `PhysX` is no longer refused by name -- without
+/// Isaac Sim it fails on the interpreter, never "not implemented". Needs no Python.
 #[test]
-fn rollout_backend_newton_and_physx_are_refused() {
-    use es_physics_backend::BackendKind;
+fn rollout_backend_newton_is_refused_and_physx_is_wired() {
+    use es_physics_backend::{BackendKind, PhysXBackend};
     let (task, obs, deploy, scene) = reach_documents();
-    let said = |kind| {
-        Rollout::<NJ, 1>::with_backend(kind, &task, &obs, &deploy, &scene, 0, 1)
+    let newton =
+        Rollout::<NJ, 1>::with_backend(BackendKind::Newton, &task, &obs, &deploy, &scene, 0, 1)
             .expect_err("refused")
-            .to_string()
-    };
-    let newton = said(BackendKind::Newton);
+            .to_string();
     assert!(newton.contains("backend `newton`"), "{newton}");
     assert!(newton.contains("blocked: yes"), "{newton}");
-    let physx = said(BackendKind::PhysX);
-    assert!(physx.contains("not implemented (M11/I1)"), "{physx}");
+    if PhysXBackend::is_available().is_ok() {
+        println!("SKIP the PhysX half: Isaac Sim is here (rollout_backend_physx_steps_the_reach_documents)");
+        return;
+    }
+    let physx =
+        Rollout::<NJ, 1>::with_backend(BackendKind::PhysX, &task, &obs, &deploy, &scene, 0, 1)
+            .expect_err("no Isaac Sim, no PhysX env")
+            .to_string();
+    assert!(!physx.contains("not implemented"), "{physx}");
 }
 
 /// Packet M11/X1: the reach documents step on `MJWarp` through the same plane and plan (the
@@ -739,4 +744,38 @@ fn rollout_backend_mjwarp_steps_the_reach_documents() {
         }
     }
     println!("RAN rollout mjwarp vs mujoco-cpu, 20 control steps: max |dqpos| = {worst:e}");
+}
+
+/// Packet M11/R1 oracle 3 (the Rust half): the reach documents step on `PhysX` through the same
+/// plane and plan. Tier 2: the distance to `mujoco-cpu` is printed, never asserted bitwise.
+#[test]
+#[ignore = "needs Isaac Sim through ES_ISAAC_PYTHON and mujoco through ES_PYTHON"]
+fn rollout_backend_physx_steps_the_reach_documents() {
+    use es_physics_backend::{BackendKind, PhysXBackend};
+    if let Err(why) = PhysXBackend::is_available() {
+        println!("SKIP rollout_backend_physx_steps_the_reach_documents: {why}");
+        return;
+    }
+    let (task, obs, deploy, scene) = reach_documents();
+    let n_envs = 2;
+    let build = |kind| {
+        Rollout::<NJ, 1>::with_backend(kind, &task, &obs, &deploy, &scene, 0, n_envs)
+            .expect("the reach documents build a rollout")
+    };
+    let (mut cpu, mut px) = (build(BackendKind::MuJoCoCpu), build(BackendKind::PhysX));
+    cpu.reset(None).expect("reset");
+    px.reset(None).expect("reset");
+    let mut worst = 0.0_f64;
+    for step in 0..20 {
+        let a = actions(step, n_envs as usize);
+        cpu.act(&a).expect("cpu act");
+        px.act(&a).expect("physx act");
+        for env in 0..n_envs as usize {
+            for (c, p) in cpu.qpos(env).iter().zip(px.qpos(env)) {
+                assert!(p.is_finite(), "physx qpos is not finite at step {step}");
+                worst = worst.max((c - p).abs());
+            }
+        }
+    }
+    println!("RAN rollout physx vs mujoco-cpu, 20 control steps: max |dqpos| = {worst:e}");
 }

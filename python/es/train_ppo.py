@@ -16,7 +16,7 @@ Usage:
                  [--schedule constant|warmup_cosine] [--warmup-steps N] [--lr-min F]
                  [--checkpoint-at 0 | 0,50,200] [--loss-curve curve.json]
                  [--progress-every N] [--estimator sampled|executed]
-                 [--backend mujoco-cpu|mjwarp]
+                 [--backend mujoco-cpu|mjwarp|physx]
 
 Prints one JSON line on stdout and nothing else -- the same contract `es train` reads for
 `train_act.py`: `torch` goes into spec 19.3's `hardware.json` and `optimizer` is compared
@@ -283,12 +283,13 @@ def main(argv: list) -> int:
     )
     p.add_argument(
         "--backend",
-        choices=["mujoco-cpu", "mjwarp"],
+        choices=["mujoco-cpu", "mjwarp", "physx"],
         default="mujoco-cpu",
         help="the physics backend es_native.Rollout steps (packet M11/X1): mujoco-cpu, the "
         "reference and the only bitwise one (the default), or mjwarp, MuJoCo Warp on the GPU "
-        "(tier 2). newton is refused by its mapping report (no actuators in its adapter) and "
-        "physx is not implemented (M11/I1); `[rl] backend` in the recipe sets this",
+        "(tier 2), or physx, PhysX through Isaac Sim (tier 2, packet M11/R1). newton is "
+        "refused by its mapping report (no actuators in its adapter); `[rl] backend` in the "
+        "recipe sets this",
     )
     p.add_argument(
         "--progress-every",

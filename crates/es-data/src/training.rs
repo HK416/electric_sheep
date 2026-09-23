@@ -176,9 +176,9 @@ pub struct Rl {
     pub backend: RlBackend,
 }
 
-/// `[rl] backend` -- the engines `es_native.Rollout` has a closed-loop path for (packet
-/// M11/X1). Newton (no actuators in its adapter) and `PhysX` (M11/I1) are refused at parse, by
-/// the word the recipe used.
+/// `[rl] backend` -- the engines `es_native.Rollout` has a closed-loop path for (packets
+/// M11/X1, M11/R1). Newton (no actuators in its adapter) is refused at parse, by the word the
+/// recipe used.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RlBackend {
     /// `MuJoCo` on the CPU, the reference and the default: every row before M11/X1.
@@ -188,6 +188,9 @@ pub enum RlBackend {
     /// `MuJoCo` Warp on the GPU: tier 2, never bitwise against the reference.
     #[serde(rename = "mjwarp")]
     MjWarp,
+    /// `PhysX` through Isaac Sim (packet M11/R1): tier 2, never bitwise against the reference.
+    #[serde(rename = "physx")]
+    PhysX,
 }
 
 impl RlBackend {
@@ -617,6 +620,10 @@ impl Recipe {
             RlBackend::MjWarp => {
                 args.push(s("--backend"));
                 args.push(s("mjwarp"));
+            }
+            RlBackend::PhysX => {
+                args.push(s("--backend"));
+                args.push(s("physx"));
             }
         }
         Ok(args)

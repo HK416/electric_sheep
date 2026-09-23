@@ -1562,6 +1562,7 @@ fn run_artifacts(f: &Fixture, chain: &HashChain) -> (EvaluationReport, Evaluatio
             supports_state_get_set: true,
             quirks: Vec::new(),
             engine_version: None,
+            script_blake3: None,
         },
         created: 0,
         runtime_threads: None,
@@ -11509,9 +11510,17 @@ fn train_rl_backend_dry_run_plan() {
         spelled.rl_args().expect("the args"),
         "the default reached the trainer's argv"
     );
-    // `Rollout` runs the two backends with a closed-loop path; the other two names and a name
-    // outside the table are refused with the word the recipe used.
-    for bad in ["newton", "physx", "banana"] {
+    // Packet M11/R1: `Rollout` runs `PhysX` too, so the name parses and reaches the argv last.
+    let physx = es_data::Recipe::parse(&reach_recipe_on_backend("physx")).expect("physx parses");
+    let args = physx.rl_args().expect("the args");
+    assert_eq!(
+        args[args.len() - 2..],
+        ["--backend".to_owned(), "physx".to_owned()],
+        "{args:?}"
+    );
+    // Newton has no closed-loop path, and a name outside the table is not a backend: both
+    // are refused with the word the recipe used.
+    for bad in ["newton", "banana"] {
         let Err(refused) = es_data::Recipe::parse(&reach_recipe_on_backend(bad)) else {
             panic!("[rl] backend = {bad:?} parsed");
         };
@@ -11520,8 +11529,98 @@ fn train_rl_backend_dry_run_plan() {
     }
 }
 
+/// Packet M11/R1 oracle 2: the vision reach recipe's plan is a golden of its own. It is the
+/// `[rl]` route's plan -- the trainer is handed the rollout documents as on the state task, and
+/// nothing in the argv says "image": the Observation IR in the bundle does.
+#[test]
+fn train_rl_vision_dry_run_plan() {
+    const RECIPE: &str = "tests/fixtures/rl/training-reach-vision.toml";
+    let dir = scratch_dir("train-reach-vision-dry");
+    let out = run_train(RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let golden = train_golden("plan-reach-vision.txt");
+    let want =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(stdout(&out), want, "{RECIPE}: stdout is not the golden");
+    assert!(want.starts_with("# route: rl\n"), "{want}");
+    assert!(want.contains("python/es/train_ppo.py"), "{want}");
+    assert!(want.contains("--rollout-docs docs"), "{want}");
+    assert!(want.contains("--envs 2 --horizon 16"), "{want}");
+}
+
+/// Packet M11/R1 oracle 2, the run: `training-reach-vision.toml` cut to 3 iterations goes
+/// through `es train` end to end on a `render` build -- a checkpoint is packed and the render
+/// cost is in `metrics/env-metrics.json`. Without the feature the image input is refused by
+/// name, before any interpreter is asked.
+#[test]
+fn train_rl_vision_runs_three_iterations() {
+    const TEST: &str = "train_rl_vision_runs_three_iterations";
+    let dir = scratch_dir("train-reach-vision-run");
+    let bundle = dir.join("untrained.esb");
+    std::fs::write(
+        &bundle,
+        pack_untrained(
+            &rl_fixture("task-reach-vision.toml"),
+            &rl_fixture("observation-reach-vision.toml"),
+            &rl_fixture("learning-reach-vision.toml"),
+            &rl_fixture("deployment-reach.toml"),
+        ),
+    )
+    .expect("write the vision bundle");
+    let text =
+        std::fs::read_to_string(rl_fixture("training-reach-vision.toml")).expect("the recipe");
+    let recipe = text
+        .replace(
+            "bundle = \"runs/reach-vision-001/untrained.esb\"",
+            &format!("bundle = \"{}\"", train_toml_path(&bundle)),
+        )
+        .replace(
+            "steps         = 10",
+            "steps         = 3\ncheckpoint_at = [3]",
+        );
+    assert_ne!(recipe, text, "the anchor lines moved");
+
+    if !cfg!(feature = "render") {
+        let path = dir.join("vision.toml");
+        write(&path, &recipe);
+        let done = run_train(&train_toml_path(&path), &dir.join("refused"), &[]);
+        let said = format!("{}{}", stdout(&done), stderr_of(&done));
+        assert!(
+            !done.status.success(),
+            "accepted without a renderer:\n{said}"
+        );
+        assert!(said.contains("image input"), "{said}");
+        assert!(said.contains("`render` feature"), "{said}");
+        println!("SKIP {TEST}: built without the `render` feature (the refusal is checked)");
+        return;
+    }
+    let Some((out, _)) = run_rl_train(&recipe, &dir, "vision") else {
+        return;
+    };
+    assert!(
+        out.join("checkpoints/3.esb").is_file(),
+        "no checkpoint was packed"
+    );
+    let metrics: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("metrics/env-metrics.json")).expect("env-metrics.json"),
+    )
+    .expect("env-metrics.json is JSON");
+    let render_ms = metrics["metrics"]["render_ms_per_frame"]
+        .as_f64()
+        .unwrap_or_else(|| panic!("no render cost in env-metrics.json: {metrics}"));
+    assert!(render_ms > 0.0, "{metrics}");
+    let curve: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("metrics/loss-curve.json")).expect("loss-curve.json"),
+    )
+    .expect("the curve is JSON");
+    for row in curve.as_array().expect("the curve is an array") {
+        assert!(row["loss"].as_f64().is_some_and(f64::is_finite), "{curve}");
+    }
+    println!("RAN {TEST}: 3 iterations, render_ms_per_frame {render_ms:.3}");
+}
+
 /// Regenerates `tests/golden/train/plan-rl.txt`, `plan-reach.txt`, `plan-reach-delta.txt`,
-/// `plan-reach-executed.txt` and `plan-reach-mjwarp.txt`.
+/// `plan-reach-executed.txt`, `plan-reach-vision.txt` and `plan-reach-mjwarp.txt`.
 #[test]
 #[ignore = "golden generator; run explicitly"]
 fn generate_rl_plan_golden() {
@@ -11539,6 +11638,10 @@ fn generate_rl_plan_golden() {
         (
             "tests/fixtures/rl/training-reach-executed.toml",
             "plan-reach-executed.txt",
+        ),
+        (
+            "tests/fixtures/rl/training-reach-vision.toml",
+            "plan-reach-vision.txt",
         ),
     ] {
         let dir = scratch_dir("train-rl-golden");
