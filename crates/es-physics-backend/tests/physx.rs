@@ -269,31 +269,62 @@ fn physx_is_unavailable_without_es_isaac_python() {
     assert!(why.contains("ES_ISAAC_PYTHON"), "{why}");
 }
 
-/// Oracle 2's shape, runnable wherever Isaac Sim is: SO-101 and `mesh_box` on `PhysX` against
-/// mujoco-cpu with the same seeded control, printed (numbers recorded, no tolerance claimed),
-/// and a `PhysX` rerun that is compared with the first.
+/// Oracle 2's shape, runnable wherever Isaac Sim is: SO-101 and `mesh_box` on `PhysX` (the
+/// `ES_PHYSX_DEVICE` pipeline) against mujoco-cpu under one control sequence, printed (numbers
+/// recorded, no tolerance claimed); then a `PhysX` rerun against the first run, and on a GPU
+/// pipeline the CPU pipeline against it.
 #[test]
 fn physx_against_mujoco_cpu_is_measured() {
-    if let Err(reason) = PhysXBackend::is_available() {
-        eprintln!("SKIP physx_against_mujoco_cpu_is_measured: {reason}");
-        return;
-    }
-    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
-        eprintln!("SKIP physx_against_mujoco_cpu_is_measured: {reason}");
-        return;
+    const TICKS: u32 = 500;
+    for probe in [
+        PhysXBackend::is_available(),
+        es_physics_backend::MuJoCoCpuBackend::is_available(),
+    ] {
+        if let Err(reason) = probe {
+            eprintln!("SKIP physx_against_mujoco_cpu_is_measured: {reason}");
+            return;
+        }
     }
     for name in ["so101_pick_place.xml", "mesh_box.xml"] {
         let scene = fixture(name);
-        let mut cpu = es_physics_backend::MuJoCoCpuBackend::new();
+        // Every actuator swings across the middle half of its ctrlrange, out of phase.
+        let ctrl: Vec<Vec<f64>> = (0..TICKS)
+            .map(|k| {
+                scene
+                    .actuators
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| {
+                        let (lo, hi) = a.ctrl_range.unwrap_or((-1.0, 1.0));
+                        let phase = std::f64::consts::TAU * f64::from(k) / 100.0 + i as f64;
+                        f64::midpoint(lo, hi) + 0.25 * (hi - lo) * phase.sin()
+                    })
+                    .collect()
+            })
+            .collect();
+        let ctrl: &[Vec<f64>] = if scene.actuators.is_empty() {
+            &[]
+        } else {
+            &ctrl
+        };
+        let compare = |a: &mut dyn PhysicsBackend, b: &mut dyn PhysicsBackend| {
+            es_physics_backend::compare_backends(a, b, &scene, ctrl, TICKS).unwrap()
+        };
         let mut px = PhysXBackend::new();
-        let report =
-            es_physics_backend::compare_backends(&mut cpu, &mut px, &scene, &[], 200).unwrap();
-        eprintln!("{name}\n{report}");
+        let report = compare(&mut es_physics_backend::MuJoCoCpuBackend::new(), &mut px);
+        eprintln!("{name}: {}\n{report}", px.engine_version().unwrap());
         assert!(report.max_dqpos.is_finite());
-        let mut again = PhysXBackend::new();
-        let mut first = PhysXBackend::new();
-        let rerun =
-            es_physics_backend::compare_backends(&mut first, &mut again, &scene, &[], 200).unwrap();
-        eprintln!("{name} PhysX rerun: max |dqpos| {:e}", rerun.max_dqpos);
+        let rerun = compare(&mut PhysXBackend::new(), &mut PhysXBackend::new());
+        eprintln!(
+            "{name}: PhysX rerun max |dqpos| {:e}, max |dqvel| {:e}, diverged at {:?}",
+            rerun.max_dqpos, rerun.max_dqvel, rerun.divergence_tick
+        );
+        if px.capabilities().batch.gpu_resident {
+            let pipelines = compare(&mut PhysXBackend::with_device("cpu"), &mut px);
+            eprintln!(
+                "{name}: PhysX CPU vs GPU pipeline max |dqpos| {:e}, diverged at {:?}",
+                pipelines.max_dqpos, pipelines.divergence_tick
+            );
+        }
     }
 }

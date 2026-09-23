@@ -169,6 +169,12 @@ impl PhysXBackend {
             .ok()
             .filter(|d| !d.trim().is_empty())
             .unwrap_or_else(|| "cpu".to_owned());
+        Self::with_device(&device)
+    }
+
+    /// The pipeline `device` names: `cpu` or `cuda:N`.
+    pub fn with_device(device: &str) -> Self {
+        let device = device.to_owned();
         Self {
             caps: capabilities_on(device.starts_with("cuda")),
             device,
