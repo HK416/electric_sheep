@@ -193,15 +193,21 @@ def isaac_env_fields(path: Path, joint_names: list[str] | None, action_dim: int)
 
     import yaml  # noqa: PLC0415
 
-    # Isaac Lab's `dump_yaml` is `yaml.dump`, not `safe_dump`: every tuple in the cfg
-    # (`sim.gravity`, `init_state.pos`, ...) is written `!!python/tuple` (measured, M11/I3).
-    # A safe loader that reads that one tag as a list, and still constructs nothing else.
+    # Isaac Lab's `dump_yaml` is `yaml.dump`, not `safe_dump`: tuples are written
+    # `!!python/tuple` and a `SceneEntityCfg`'s ids `!!python/object/apply:builtins.slice`
+    # (measured, M11/I3). A safe loader that reads every `!!python/...` node as the plain list,
+    # dict or string it is spelled as -- it constructs no Python object.
     class Loader(yaml.SafeLoader):
         pass
 
-    Loader.add_constructor(
-        "tag:yaml.org,2002:python/tuple", lambda loader, node: loader.construct_sequence(node)
-    )
+    def inert(loader, _suffix, node):
+        if isinstance(node, yaml.SequenceNode):
+            return loader.construct_sequence(node, deep=True)
+        if isinstance(node, yaml.MappingNode):
+            return loader.construct_mapping(node, deep=True)
+        return loader.construct_scalar(node)
+
+    Loader.add_multi_constructor("tag:yaml.org,2002:python/", inert)
     cfg = yaml.load(path.read_text(), Loader=Loader)  # noqa: S506 -- a SafeLoader subclass
     out: dict = {"decimation": int(cfg["decimation"]), "sim_dt": float(cfg["sim"]["dt"])}
 
