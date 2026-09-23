@@ -122,22 +122,26 @@ fn parse_args(args: &[String]) -> Result<Args, CliError> {
     })
 }
 
+/// MJCF or URDF by extension, then the mesh files the scene names, relative to the scene
+/// file's directory (packet M10/W2b) — the one loader every CLI verb that opens a scene uses.
 pub fn load_scene(path: &str) -> Result<SceneDesc, CliError> {
-    let raw =
-        std::fs::read_to_string(path).map_err(|e| CliError::Runtime(format!("{path}: {e}")))?;
-    let is_urdf = std::path::Path::new(path)
+    let fail = |e: &dyn std::fmt::Display| CliError::Runtime(format!("{path}: {e}"));
+    let raw = std::fs::read_to_string(path).map_err(|e| fail(&e))?;
+    let file = std::path::Path::new(path);
+    let is_urdf = file
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("urdf"));
-    if is_urdf {
+    let mut scene = if is_urdf {
         let resolver = es_assets::urdf::PackageResolver::from_env();
-        let import = es_assets::urdf::parse_urdf(&raw, &resolver)
-            .map_err(|e| CliError::Runtime(format!("{path}: {e}")))?;
-        Ok(import.scene)
+        es_assets::urdf::parse_urdf(&raw, &resolver)
+            .map_err(|e| fail(&e))?
+            .scene
     } else {
-        let import =
-            es_assets::parse_mjcf(&raw).map_err(|e| CliError::Runtime(format!("{path}: {e}")))?;
-        Ok(import.scene)
-    }
+        es_assets::parse_mjcf(&raw).map_err(|e| fail(&e))?.scene
+    };
+    let dir = file.parent().unwrap_or(std::path::Path::new("."));
+    es_assets::mesh::load(&mut scene, dir).map_err(|e| fail(&e))?;
+    Ok(scene)
 }
 
 /// Resolves `--scene`/`--task` to a scene file path.
