@@ -23,11 +23,19 @@ use crate::view::{
 
 /// Globals before the per-view records in the parameter buffer. Slots 0..20 are M4's and
 /// never move; 20..31 are packet M7/R2's shading block, 31..37 packet M7/R3's `Pt` block,
-/// 37..39 packet M7/R4's temporal block and 39 packet M11/X3b's triangle base, each appended
-/// at the end (`common.slang` mirrors every number). A batched render appends one copy of
-/// these slots per env after the view records ([`Renderer::render_batch`]).
-const GLOBALS: usize = 40;
+/// 37..39 packet M7/R4's temporal block, 39 packet M11/X3b's triangle base and 40 its band
+/// row, each appended at the end (`common.slang` mirrors every number). A batched render
+/// appends one copy of these slots per env after the view records
+/// ([`Renderer::render_batch`]).
+const GLOBALS: usize = 41;
 const PARAM_VIEW_BASE: usize = GLOBALS;
+/// The first atlas row of the tracer's current band (packet M11/X3b): 0 but for the second
+/// and later bands of a frame too big for one dispatch.
+const BAND_SLOT: usize = 40;
+/// Sample-bounces (`pixels * spp * bounces`) one tracer dispatch may carry before the frame is
+/// split into bands: about 0.3 s of the SO-101 scene on an RTX 3060, well inside the 2 s a
+/// Windows driver gives a busy device. A single 96x96 64-spp 3-bounce frame is 1.8M, one band.
+const BAND_BUDGET: u64 = 1 << 23;
 /// Floats per direct-lighting reservoir (mirrors `restir.slang`).
 const RES_STRIDE: u64 = 8;
 /// Floats per pixel of the temporal history (mirrors `common.slang`'s `ES_HIST_STRIDE` and
@@ -543,6 +551,22 @@ impl<'gpu> Renderer<'gpu> {
         Ok(())
     }
 
+    /// Atlas rows per tracer band: all of them on `Rs` and on any frame within
+    /// [`BAND_BUDGET`], else the most whole workgroup rows that fit (at least one).
+    fn band_rows(&self) -> u32 {
+        let RenderPath::Pt { .. } = self.cfg.path else {
+            return self.layout.height;
+        };
+        let per_row = u64::from(self.layout.width)
+            * u64::from(self.cfg.spp().max(1))
+            * u64::from(self.cfg.bounces().max(1));
+        let rows = BAND_BUDGET / per_row.max(1);
+        if rows >= u64::from(self.layout.height) {
+            return self.layout.height;
+        }
+        (rows as u32 / WORKGROUP * WORKGROUP).max(WORKGROUP)
+    }
+
     fn new_buffer(&self, words: u64) -> Result<Buffer<'gpu>, RenderError> {
         Ok(Buffer::new(self.gpu, (words * 4).max(4), Usage::Storage)?)
     }
@@ -647,20 +671,45 @@ impl<'gpu> Renderer<'gpu> {
 
         self.pipelines.primary.reset_descriptors()?;
         let mut rec = CommandRecorder::new(self.gpu)?;
-        match (&pt_rgb8, &pt_history) {
-            (Some(rgb8), Some(hist_out)) => rec.dispatch(
-                &self.pipelines.primary,
-                &[
-                    params, &self.tris, &color, &depth, &seg, &normal, hit_tri, rgb8, history,
-                    hist_out,
-                ],
-                groups,
-            )?,
-            _ => rec.dispatch(
-                &self.pipelines.primary,
-                &[params, &self.tris, &color, &depth, &seg, &normal, hit_tri],
-                groups,
-            )?,
+        // A `Pt` frame with more work than one dispatch should carry is traced in bands of atlas
+        // rows, each band its own submission (packet M11/X3b): a 64-env, 64-spp batch is one
+        // ~4 s dispatch on an RTX 3060, and Windows resets a device that stays busy past 2 s.
+        // A pixel reads nothing another pixel of the tracer writes, so the bands are the one
+        // dispatch's bits. Every frame of today's sizes is one band, exactly as before.
+        let band = self.band_rows();
+        let mut band_params: Vec<Buffer<'gpu>> = Vec::new();
+        let mut row0 = 0;
+        loop {
+            let rows = band.min(self.layout.height - row0);
+            let g = [groups[0], rows.div_ceil(WORKGROUP), 1];
+            let p = band_params.last().unwrap_or(params);
+            match (&pt_rgb8, &pt_history) {
+                (Some(rgb8), Some(hist_out)) => rec.dispatch(
+                    &self.pipelines.primary,
+                    &[
+                        p, &self.tris, &color, &depth, &seg, &normal, hit_tri, rgb8, history,
+                        hist_out,
+                    ],
+                    g,
+                )?,
+                _ => rec.dispatch(
+                    &self.pipelines.primary,
+                    &[p, &self.tris, &color, &depth, &seg, &normal, hit_tri],
+                    g,
+                )?,
+            }
+            row0 += rows;
+            if row0 >= self.layout.height {
+                break;
+            }
+            rec.submit_and_wait()?;
+            rec = CommandRecorder::new(self.gpu)?;
+            let mut f = params_f.clone();
+            f[BAND_SLOT] = f32::from_bits(row0);
+            let bytes: Vec<u8> = f.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut b = self.new_buffer(f.len() as u64)?;
+            b.upload(&bytes)?;
+            band_params.push(b);
         }
 
         // The variance estimate, after every pixel's accumulated colour is written (its

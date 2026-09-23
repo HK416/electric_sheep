@@ -27,7 +27,9 @@
 
 [shader("compute")]
 [numthreads(8, 8, 1)]
-void main(uint3 tid : SV_DispatchThreadID) {
+void main(uint3 gid : SV_DispatchThreadID) {
+    // The band this dispatch traces starts at atlas row es_band_y() (packet M11/X3b).
+    uint3 tid = uint3(gid.x, gid.y + es_band_y(), gid.z);
     if (tid.x >= es_atlas_w() || tid.y >= es_atlas_h()) { return; }
     EsPixel p = es_pixel(tid);
 

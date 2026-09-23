@@ -26,9 +26,9 @@ static const float ES_INV_GAMMA = 0.41666666;
 static const uint ES_TRI_STRIDE = 20;
 static const uint ES_VIEW_STRIDE = 16;
 // Slots 0..20 are M4's globals, 20..31 packet M7/R2's shading block, 31..37 packet M7/R3's
-// PT block, 37..39 packet M7/R4's temporal block, 39 packet M11/X3b's triangle base, then the
-// per-view records. Mirrors `renderer.rs`'s PARAM_VIEW_BASE.
-static const uint ES_PARAM_VIEW_BASE = 40;
+// PT block, 37..39 packet M7/R4's temporal block, 39..41 packet M11/X3b's triangle base and
+// band row, then the per-view records. Mirrors `renderer.rs`'s PARAM_VIEW_BASE.
+static const uint ES_PARAM_VIEW_BASE = 41;
 // Floats per pixel of the temporal history (packet M7/R4). Mirrors `renderer.rs`'s
 // HIST_STRIDE and `cpu::History`: sum(3), m1, m2, n, depth, tri, normal(3), variance.
 static const uint ES_HIST_STRIDE = 12;
@@ -49,7 +49,7 @@ static const float ES_SHADOW_FAR = 1e30;
 uint es_param_u(uint i) { return asuint(es_params[i]); }
 
 // Packet M11/X3b: where this thread's env reads its scene and its light. A batched render gives
-// every env a copy of the globals (slots 0..40, same layout) and each view record names its
+// every env a copy of the globals (slots 0..41, same layout) and each view record names its
 // env's copy in pad slot 14; a single render names offset 0, the globals themselves. Set by
 // `es_pixel`, once per thread, before anything reads it; thread-private, so no thread can see
 // another's. `es_key_view` is the view index the sample keys are addressed with (pad slot 15):
@@ -100,6 +100,9 @@ uint es_frame()         { return es_param_u(38); }
 // Where this env's triangles start inside `es_tris`, in floats (packet M11/X3b); 0 on a single
 // render.
 uint es_tri_base()      { return es_env_u(39); }
+// The first atlas row of this tracer dispatch (packet M11/X3b): 0 unless the host split a frame
+// too big for one dispatch into bands of rows.
+uint es_band_y()        { return es_param_u(40); }
 uint es_atlas_w()      { return es_tiles_per_row() * es_tile_w(); }
 uint es_atlas_h()      { return es_rows() * es_tile_h(); }
 
