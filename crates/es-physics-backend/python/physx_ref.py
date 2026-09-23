@@ -52,7 +52,8 @@ def parse(mjcf):
         for g in element.findall("geom"):
             collides = not (g.get("contype", "1") == "0" and g.get("conaffinity", "1") == "0")
             friction = floats(g.get("friction", "1 0.005 0.0001"))
-            geoms.append({"name": g.get("name"), "body": owner, "collides": collides, "mu": friction[0]})
+            geoms.append({"name": g.get("name"), "mesh": g.get("mesh"), "body": owner, "collides": collides,
+                          "mu": friction[0]})
         for b in element.findall("body"):
             name = b.get("name")
             bodies.append(name)
@@ -256,7 +257,10 @@ class Sim(object):
         for g in spec["geoms"]:
             if not g["collides"]:
                 continue
-            prims = [p for p in by_name.get(g["name"], []) if p.IsValid() and str(p.GetPath()).startswith(env0)
+            # A mesh geom's collider is named after its mesh, not the geom (measured, I1).
+            names = [g["name"]] + ([g["mesh"]] if g["mesh"] else [])
+            prims = [p for n in names for p in by_name.get(n, []) if p.IsValid() and str(p.GetPath()).startswith(env0)
+                     and "/%s/" % ("worldBody" if g["body"] == "world" else g["body"]) in str(p.GetPath()) + "/"
                      and "/visuals/" not in str(p.GetPath()) and has_collider(p)]
             if not prims:
                 missing.append(g["name"])
