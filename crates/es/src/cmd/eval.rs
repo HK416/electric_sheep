@@ -7,7 +7,7 @@ use es_compile::PolicyBundle;
 use es_eval::runner::{RunEvent, RunSink};
 use es_eval::{Evaluation, RunConfig};
 use es_ir::evaluation::{AcceptanceResult, EvaluationReport, MetricValue};
-use es_physics_backend::{BackendKind, MjWarpBackend, MuJoCoCpuBackend};
+use es_physics_backend::{BackendKind, MjWarpBackend, MuJoCoCpuBackend, PhysXBackend};
 use es_physics_core::backend::PhysicsBackend;
 use es_policy::{PolicyRuntime, TorchRuntime, WeightsSource};
 
@@ -131,7 +131,11 @@ BACKENDS (spec 17.2, packet M11/X1):
   newton      refused by its mapping report before anything spawns: the adapter declares no
               actuators or sensors and wires no contacts, so it runs open loop only
               (`es backend compare`).
-  physx       not implemented (M11/I1).
+  physx       NVIDIA PhysX through Isaac Sim, headless (M11/I1; needs ES_ISAAC_PYTHON, the
+              Isaac Sim interpreter; ES_PHYSX_DEVICE=cpu|cuda:0 picks the pipeline, cpu by
+              default): tier 2, the scene through Isaac Sim's MJCF importer, every importer gap
+              a mapping-report row (warnings; a blocking row refuses the run). Writes the same
+              identity slot as mjwarp, the pipeline named in the engine version.
 evaluation.lock's `backend` block carries the engine version the backend's load reply named.
 
 Exit code: 0 when every acceptance result is Determined{passed: true}; 1 when any failed or
@@ -140,13 +144,9 @@ unavailable (distinct from 1: nothing ran).
 ";
 
 /// `--backend <name>` of `es eval run` and `es loop collect` (packet M11/X1): one of the four
-/// spec 17.2 names, or a usage error that lists them. `PhysX` is a known name with no adapter
-/// yet, and is refused here, before anything is opened.
+/// spec 17.2 names, or a usage error that lists them.
 pub(crate) fn parse_backend(name: &str, help: &str) -> Result<BackendKind, CliError> {
     match BackendKind::from_name(name) {
-        Some(BackendKind::PhysX) => Err(CliError::Runtime(
-            es_physics_backend::PHYSX_NOT_IMPLEMENTED.to_owned(),
-        )),
         Some(kind) => Ok(kind),
         None => Err(CliError::Usage(format!(
             "unknown --backend '{name}': one of {}\n\n{help}",
@@ -172,7 +172,8 @@ pub(crate) fn mapping_gate(
 /// What a closed-loop verb says about a backend it has no path for (Newton, today).
 pub(crate) fn no_closed_loop(kind: BackendKind) -> CliError {
     CliError::Runtime(format!(
-        "--backend {kind}: no closed-loop path; the closed-loop verbs run mujoco-cpu and mjwarp"
+        "--backend {kind}: no closed-loop path; the closed-loop verbs run mujoco-cpu, mjwarp \
+         and physx"
     ))
 }
 
@@ -955,7 +956,11 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
                 MjWarpBackend; nj, h, &bundle, &eval_ir, &scene, policy, &cfg, frames, shard,
                 sink, seen
             ),
-            BackendKind::Newton | BackendKind::PhysX => Err(no_closed_loop(kind)),
+            BackendKind::PhysX => dispatch_nj_h!(
+                PhysXBackend; nj, h, &bundle, &eval_ir, &scene, policy, &cfg, frames, shard,
+                sink, seen
+            ),
+            BackendKind::Newton => Err(no_closed_loop(kind)),
         }?]
     };
 

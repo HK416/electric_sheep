@@ -7,7 +7,8 @@ R8 names ("Isaac Lab as the second source — an `es-usd` scene, the same adapte
 prep — every claim there is tagged `verified (fetched)` (read from the cited page on
 2026-09-23) or `unverified` (not found in a primary source, or found only in a
 secondary/community source). **§7 is measured by us** (M11 I0, `docs/packets/M11/I0-isaac-sim-install.md`)
-and overrides §1–§6 where they disagree. Korean sibling: `isaac-sim.ko.md`.
+and overrides §1–§6 where they disagree; **§8 is the `PhysXBackend` built on it** (M11 I1),
+also measured. Korean sibling: `isaac-sim.ko.md`.
 
 Sources fetched 2026-09-23:
 
@@ -205,7 +206,8 @@ whether M11 X2 will need URDF import at all).
 ## 6. What we don't know yet
 
 - ~~Whether a MJCF-imported scene reproduces MuJoCo CPU numerics~~ — measured in §7: it does
-  not, by up to 1.73 rad in 100 steps on SO-101, and §7 names the importer rows that explain it.
+  not, by up to 1.73 rad in 100 steps on SO-101, and §7 names the importer rows that explain it;
+  with I1's repairs (§8) the same control is 0.30 rad off over 500 steps.
 - Exact actuator-type-to-drive mapping (§3) and exact friction-coefficient mapping — measured
   for `<position>` actuators and geom `friction` in §7.3; `velocity`/`motor`/`general` actuators
   and tendons/equalities are still unmeasured (no fixture carries them).
@@ -329,4 +331,125 @@ attributed.
 (2) remove the bodiless `worldBody` articulation root, (3) not weld MJCF free bodies, (4)
 author the drives itself (kp in per-degree units, kv, and a decision on passive damping and
 frictionloss), (5) author friction materials, (6) own the reset/step count, and (7) start from
-the physics-only experience on this host — each a mapping-report row.
+the physics-only experience on this host — each a mapping-report row. §8 says what I1 did with
+each.
+
+## 8. `PhysXBackend` (M11 I1, 2026-09-23)
+
+`crates/es-physics-backend/src/physx.rs` + `python/physx_ref.py`, packet
+`docs/packets/M11/I1-physx-backend.md`. Measured on the same server and venvs as §7; artifacts
+under `~/artifacts/plan-x/i1/`. Every number here is a measurement; no tolerance is claimed.
+
+### 8.1 How it runs
+
+- **A subprocess, never an import.** `physx_ref.py` speaks the `proc.rs` JSON-lines protocol
+  (`load`, `reset`, `set_ctrl`, `step`, `state`, `set_state`). No `set_params`: per-env model
+  fields were not measured, so `ModelParams` is not declared and `set_params` is refused by name.
+- **`ES_ISAAC_PYTHON`** names the interpreter. Unset, or unable to `import isaacsim`, is
+  `is_available()`'s `Err`, the callers' SKIPPED exit 3. The Rust side sets
+  `OMNI_KIT_ACCEPT_EULA=YES` and prepends the §7.2 compat libraries to `LD_LIBRARY_PATH`
+  (`ES_ISAAC_COMPAT_LIBS`, else `$HOME/opt/isaac-compat/root/usr/lib/x86_64-linux-gnu` when it
+  exists); the script starts `isaaclab.python.headless.kit` itself (`ES_ISAAC_EXPERIENCE`
+  overrides). Callers set nothing but `ES_ISAAC_PYTHON`.
+- **The script runs from a file.** New finding: `SimulationApp` crashes in the breakpad handler,
+  with no log, when the process was started as `python -c <script>` (`sys.argv == ["-c"]`).
+  The embedded script is written once to the temp dir, named by its blake3, and run as a file
+  (`Process::spawn_command`).
+- **stdout is the protocol.** Kit logs to stdout; the script dups fd 1 for the protocol and
+  points fd 1 at stderr before importing anything. `ES_PHYSX_STDERR=<file>` keeps Kit's log.
+- **Pipeline:** `ES_PHYSX_DEVICE=cpu` (default) or `cuda:0`. Deviation from the packet, which
+  asked for `LoadConfig`: `LoadConfig` lives in `es-physics-core`, outside I1's context. The
+  pipeline is recorded in the engine version (`isaacsim 5.1.0 physx 107.3.26 cpu|gpu`), so
+  `backend_identity` and `evaluation.lock` tell the two apart; `gpu_resident` follows it.
+- **Envs:** `n_envs > 1` clones `/World/envs/env_0` with `GridCloner(spacing = 0)` and isolates
+  the envs with `filter_collisions`; every env keeps the MJCF's own coordinates.
+- **State** goes through `omni.physics.tensors` (articulation views for the hinge dofs and every
+  link pose, rigid-body views for free bodies), in MuJoCo's layout rebuilt from the MJCF:
+  bodies depth-first with `world` first, joints in body order, a free joint as
+  `pos ‖ quat(w,x,y,z)` with its linear velocity at the body origin in the world frame and its
+  angular velocity in the body frame (PhysX reports the centre-of-mass velocity and a
+  world-frame angular velocity; converted both ways with the body's COM offset). `xquat` is
+  `x,y,z,w`. One stage per process: a reload is a new process (≈ 4 s to a loaded stage).
+
+### 8.2 The importer items, fixed or declared
+
+"Fixed" means `physx_ref.py` repairs it and it is a `BackendQuirk` in the capabilities (so in
+every `evaluation.lock`); "row" means a mapping-report row (`es backend compare`, the spec 14.4
+gate), all of them warnings. Nothing is dropped silently.
+
+| item (§7.3, and three new ones) | how |
+|---|---|
+| inline `<mesh vertex/face>` is fatal, exit 0 | **fixed**: each inline mesh is written to `<mesh name>.obj` in a temp dir and the MJCF copy says `file=`. New: the importer looks a mesh up **by its name**; a file named otherwise imports no collider at all, and the collider prim is named after the mesh, not the geom. Row `ContactMesh` approximated: the convex hull |
+| bodiless `worldBody` articulation root | **fixed**: `ArticulationRootAPI` removed |
+| `fix_base` welds MJCF free bodies | **fixed**: `rootJoint_<body>` and the free body's `ArticulationRootAPI` removed, so it is a plain rigid body. A free joint on a body with children (a floating base) is refused at load, by name |
+| `World.reset()` runs 2 hidden steps | **fixed**: after `reset()` the script writes MuJoCo's qpos0 (hinges 0, free bodies at their imported pose) and zero velocity, so tick 0 is MuJoCo's tick 0. `mesh_box`'s free fall now agrees with MuJoCo to 1e-6 m until tick 225, just after the impact (I0: 1.99e-3 m off from the start) |
+| kp written unconverted into USD's per-degree gain; kv dropped | **fixed**: every drive is written through the tensor API — stiffness = kp, damping = kv, max force = forcerange — which takes SI units (N·m/rad). Checked on a one-hinge probe (kp 1, kv 0.05, no gravity, random targets): max \|Δq\| 1.1e-3 rad over 500 ticks against MuJoCo, which a 57.3× unit error could not stay near. A dof with no position actuator gets no drive. Rows `actuator.pd` / `ActuatorPosition` approximated (a PhysX drive is implicit) |
+| `ctrlrange` dropped | **fixed**: the script clamps ctrl to it, as MuJoCo does |
+| joint `damping` becomes drive damping, inside the force clamp | **row** `joint.damping` approximated: `-d·q̇` (and a joint spring `-k(q − springref)`) is applied as an explicit joint effort before every physics step, outside the clamp as in MuJoCo, where it is implicit |
+| `frictionloss` dropped | **row** `JointFrictionLoss` unsupported: PhysX joint friction is a coefficient, not a dry-friction torque |
+| geom friction: no material | **row** `geom.friction` approximated: one material per sliding coefficient, static = dynamic = μ, restitution 0, combine `max` (MuJoCo's rule; `priority` ignored) |
+| `contype`/`conaffinity` bitmasks | **row** `geom.contype_conaffinity` unsupported, asked when a colliding geom is neither 1/1 nor 0/0. The importer's collision groups filtered nothing and are removed |
+| `solref`, `solimp`, `margin` | **row** `ContactSoftParams` unsupported; spec 17.2's `contact.soft_params` keeps its status, with a note that says they are dropped |
+| `condim` 4/6 (torsional, rolling) | **row** `ContactCondim6` unsupported |
+| `cone = elliptic` | **row** `ContactElliptic` unsupported: runs pyramidal |
+| `<option>` integrator / solver / iterations / impratio | **row** `option.solver` unsupported, on every scene: PhysX TGS, the importer's 32 / 1 articulation iterations |
+| `mass=` on a non-colliding geom | **row** `body.mass_from_geoms` unsupported, asked when a body has geoms and no `<inertial>` |
+| +0.05 angular damping on every body | **fixed**: angular and linear damping 0, and sleeping off (threshold 0), on every body and articulation |
+| physics-only experience | **fixed**: the script picks it |
+| armature | kept by the importer (§7.3): `JointArmature` native. spec 17.2's `joint.armature` row keeps its "unsupported" status, with a note that the importer keeps it |
+| **new:** the importer's `/collisions` (and `/meshes`, `/visuals`) prototypes | **fixed**: they are defined, active, collision-enabled prims, so PhysX simulates every body's colliders a second time as **static colliders at the world origin** (an overlap query at the origin hits `/collisions/wrist/…`, `/collisions/cube/…`). Deactivated at their root; the instance references into the bodies still compose (34 colliders remain on SO-101, all under `/World`). The instances are made non-instanceable so a collider can carry its own material |
+| **new:** a zero free-joint quaternion | **fixed**: the env's reset writes only the position of a free joint it randomizes and leaves the quaternion 0; MuJoCo reads that as the identity, PhysX **silently drops the whole transform**, position included. The script normalizes as `mju_normalize4` does (norm < 1e-15 → identity). Before the fix reach A0's cube never moved and nominal scored 0.0 |
+
+Not mapped — blocked by the mapping report before a process starts (spec 14.4): ball joints,
+sensors (the adapter reads none), `velocity` / `general` / site actuators, tendons, height
+fields. `JointSlide` is implemented but not exercised by any fixture, so it is not declared.
+
+### 8.3 Oracle 2: `es backend compare`, 500 ticks
+
+`es backend compare --scene <scene> --backends mujoco-cpu,physx --ctrl-random --ticks 500`
+(splitmix64 targets in [−1, 1], clamped to `ctrlrange` by both engines), and the Isaac-gated
+test `physx_against_mujoco_cpu_is_measured` (every actuator at `mid + ¼(hi−lo)·sin(2πk/100 + i)`,
+§7.4's control, 500 ticks, then a PhysX run against a second PhysX run).
+
+| scene | pipeline | control | max \|Δqpos\| | max \|Δqvel\| | energy proxy MuJoCo / PhysX (last tick) | max energy-proxy Δ | divergence tick (1e-6) |
+|---|---|---|---|---|---|---|---|
+| SO-101 | CPU | random | 7.023e-2 | 3.20 | 6.564 / 7.440 | 5.04 | 0 |
+| SO-101 | CPU | sine | 3.03e-1 | 5.90 | 31.41 / 35.47 | 30.0 | 0 |
+| `mesh_box` | CPU | none (free fall, lands ≈ 0.2 s) | 1.55e-2 | 2.22 | 2.7e-9 / 1.3e-8 | 4.91 | 225 |
+| SO-101 | GPU (`cuda:0`) | random | 7.025e-2 | 3.20 | 6.564 / 7.440 | 5.04 | 0 |
+| SO-101 | GPU | sine | 3.54e-1 | 5.60 | 31.41 / 35.51 | 31.1 | 0 |
+| `mesh_box` | GPU | none | 1.55e-2 | 2.21 | 2.7e-9 / 8.3e-8 | 4.91 | 225 |
+
+- **Reruns:** the two CPU `es backend compare` runs printed identical output for both scenes,
+  and the test's PhysX-against-PhysX rerun is **bitwise** on both scenes (max \|Δqpos\| = max
+  \|Δqvel\| = 0, no divergence tick). The GPU pipeline's reruns are bitwise too, in both places
+  and on both scenes. CPU pipeline against GPU pipeline under the sine control: SO-101 max
+  \|Δqpos\| 0.124 rad, diverging at tick 0; `mesh_box` 6.9e-6 m, diverging at tick 225 (the
+  impact). Both pipelines are equally far from MuJoCo.
+- **Against §7.4:** under the same sine control, I0's as-imported PhysX was up to 1.73 rad off
+  MuJoCo within 100 steps; with §8.2's repairs it is 0.30 rad over 500. SO-101 diverges at
+  tick 0 from f32 alone; `mesh_box` stays within 1e-6 until the impact.
+
+### 8.4 Oracle 3: reach A0 through `es eval run --backend physx`
+
+W0b's reach A0 (`~/artifacts/plan-w/w0b/reach/seed0/checkpoints/4000.esb`, trained on
+mujoco-cpu), `tests/fixtures/rl/evaluation-reach.toml` (16 episodes × 4 suites), scene
+`so101_pick_place.xml`, one binary:
+
+| backend | nominal | observation_delay | torque_noise | backlash | mean episode length (nominal) | wall |
+|---|---|---|---|---|---|---|
+| mujoco-cpu | **0.5625** | 0.3125 | 0.5 | 0.5 | 129.4 | 13 s |
+| physx, CPU pipeline | **0.125** | 0.0 | 0.3125 | 0.0625 | 184.9 | 5 min 43 s |
+| physx, GPU pipeline (`cuda:0`) | **0.125** | 0.0625 | 0.0 | 0.0625 | 183.4 | 8 min 1 s |
+| mjwarp | refused by its mapping report before anything spawns (`ContactElliptic`, M11 X1) | | | | | |
+
+The run completes; its `evaluation.lock` carries `backend = physx` with every quirk above, and
+its `execution_hash` differs from mujoco-cpu's (`2fdd30a0…` against `08851281…`, the
+`hardware_capability` slot); the GPU pipeline's run hashes apart again (`e16de409…`, engine
+version `… gpu`). A policy trained on MuJoCo keeps a quarter of its nominal success
+on PhysX: a sim-to-sim gap, measured and not attributed here (the §8.2 rows that remain —
+frictionloss, the soft contact, the solver, explicit damping — are the candidates).
+
+The execution hash does not cover `physx_ref.py` itself: the first A0 run, before the
+zero-quaternion fix, scored 0.0 under the same hash. That holds for every out-of-process
+backend's script today (`mjwarp_ref.py` too) and is a follow-up for the hash rule.

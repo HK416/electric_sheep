@@ -17,7 +17,7 @@ use es_data::{CollectReport, InterventionSegment};
 use es_env::expert::{demo_cfg, ScriptedExpert};
 use es_env::Termination;
 use es_ir::types::ElemType;
-use es_physics_backend::{BackendKind, MjWarpBackend, MuJoCoCpuBackend};
+use es_physics_backend::{BackendKind, MjWarpBackend, MuJoCoCpuBackend, PhysXBackend};
 use es_physics_core::backend::ModelInfo;
 use es_physics_core::backend::PhysicsBackend;
 use es_policy::{PolicyInfo, PolicyRuntime, TorchRuntime, WeightsSource};
@@ -54,7 +54,8 @@ collect    Opens the policy bundle (spec 9.6), rolls out <N> episodes through th
              mjwarp      MuJoCo Warp on the GPU, needs `mujoco_warp`; never bitwise;
              newton      refused by its mapping report before anything spawns (no
                          actuators, sensors or contacts in its adapter);
-             physx       not implemented (M11/I1).
+             physx       PhysX through Isaac Sim (M11/I1), needs ES_ISAAC_PYTHON;
+                         never bitwise.
            Without --frames no pixels are written: an image channel becomes a declared
            video feature with VideoRef placeholders, plus a warning. --frames <dir> renders
            the Task IR's one image channel from its own camera, once per control step, as
@@ -690,7 +691,10 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
         BackendKind::MjWarp => dispatch_nj_h!(
             MjWarpBackend; nj, h, &spec, policy, expert, frames, publisher
         ),
-        BackendKind::Newton | BackendKind::PhysX => Err(crate::cmd::eval::no_closed_loop(kind)),
+        BackendKind::PhysX => dispatch_nj_h!(
+            PhysXBackend; nj, h, &spec, policy, expert, frames, publisher
+        ),
+        BackendKind::Newton => Err(crate::cmd::eval::no_closed_loop(kind)),
     }?;
 
     for w in &report.warnings {

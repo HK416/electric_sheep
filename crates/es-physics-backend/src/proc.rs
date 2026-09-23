@@ -330,24 +330,13 @@ impl Process {
     pub fn spawn_with(script: &str, engine: &str) -> Result<Self, PhysicsError> {
         let mut tried = Vec::new();
         for python in python_candidates() {
-            let spawned = Command::new(&python)
-                .args(["-c", script])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
+            let mut cmd = Command::new(&python);
+            cmd.args(["-c", script])
                 // Every Python-side failure is reported on stdout as JSON, so stderr carries
                 // nothing we need and an unread pipe could only deadlock us.
-                .stderr(Stdio::null())
-                .spawn();
-            match spawned {
-                Ok(mut child) => {
-                    let stdin = child.stdin.take().expect("stdin was piped");
-                    let stdout = child.stdout.take().expect("stdout was piped");
-                    return Ok(Self {
-                        child,
-                        stdin,
-                        stdout: BufReader::new(stdout),
-                    });
-                }
+                .stderr(Stdio::null());
+            match Self::spawn_command(cmd) {
+                Ok(process) => return Ok(process),
                 Err(e) => tried.push(format!("`{python}`: {e}")),
             }
         }
@@ -355,6 +344,20 @@ impl Process {
             "cannot start the {engine} reference process: {}",
             tried.join("; ")
         )))
+    }
+
+    /// Starts `cmd` (interpreter, arguments, environment and stderr already set) with the
+    /// protocol on its stdin / stdout -- for an engine that cannot run from `python -c`
+    /// (packet M11/I1: Isaac Sim's Kit crashes when `sys.argv` is `["-c"]`).
+    pub fn spawn_command(mut cmd: Command) -> std::io::Result<Self> {
+        let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let stdout = child.stdout.take().expect("stdout was piped");
+        Ok(Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+        })
     }
 
     /// Sends one request and decodes its reply.

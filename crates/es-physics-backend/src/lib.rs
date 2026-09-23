@@ -15,21 +15,24 @@ pub mod mjcf_out;
 pub mod mjwarp;
 pub mod mujoco;
 pub mod newton;
+pub mod physx;
 pub mod proc;
 
 pub use mapping::{
     compare_backends, lookup, mapping_report, BackendKind, CompareReport, Mapping, MappingReport,
-    MappingRow, SemanticMapping, Severity, Spec17Row, Status, TaskFeature,
+    MappingRow, MjcfRow, SemanticMapping, Severity, Spec17Row, Status, TaskFeature,
 };
 pub use mjcf_out::scene_to_mjcf;
 pub use mjwarp::MjWarpBackend;
 pub use mujoco::MuJoCoCpuBackend;
 pub use newton::NewtonBackend;
+pub use physx::PhysXBackend;
 
 use es_assets::scene::SceneDesc;
 use es_physics_core::{Capabilities, LoadConfig, PhysicsBackend, PhysicsError};
 
-/// What `--backend physx` says until packet M11/I1 lands.
+/// What a path with no `PhysX` wiring says. The backend exists since packet M11/I1
+/// ([`PhysXBackend`]); `es-py`'s `Rollout` (the `[rl]` trainer's env) is not wired to it yet.
 pub const PHYSX_NOT_IMPLEMENTED: &str = "backend `physx`: not implemented (M11/I1)";
 
 /// `H("es.backend.v1", name, engine version, float, determinism tier)` (spec 28.14 rule 2).
@@ -78,7 +81,7 @@ pub struct BackendIdentity {
 ///
 /// This is also the gate: a scene the backend cannot map is refused by its own `load`, with
 /// the mapping report, before a process spawns (spec 14.4) -- which is where Newton stops on
-/// any scene with actuators. `PhysX` is [`PHYSX_NOT_IMPLEMENTED`].
+/// any scene with actuators.
 pub fn identify(kind: BackendKind, scene: &SceneDesc) -> Result<BackendIdentity, PhysicsError> {
     fn open<B: PhysicsBackend>(
         kind: BackendKind,
@@ -115,17 +118,22 @@ pub fn identify(kind: BackendKind, scene: &SceneDesc) -> Result<BackendIdentity,
             scene,
             NewtonBackend::engine_version,
         ),
-        BackendKind::PhysX => Err(PhysicsError::Unsupported(PHYSX_NOT_IMPLEMENTED.to_owned())),
+        BackendKind::PhysX => open(
+            kind,
+            PhysXBackend::new(),
+            scene,
+            PhysXBackend::engine_version,
+        ),
     }
 }
 
-/// Whether `kind` can run here: the backend's own availability probe, or the `PhysX` refusal.
+/// Whether `kind` can run here: the backend's own availability probe.
 pub fn is_available(kind: BackendKind) -> Result<(), String> {
     match kind {
         BackendKind::MuJoCoCpu => MuJoCoCpuBackend::is_available(),
         BackendKind::MjWarp => MjWarpBackend::is_available(),
         BackendKind::Newton => NewtonBackend::is_available(),
-        BackendKind::PhysX => Err(PHYSX_NOT_IMPLEMENTED.to_owned()),
+        BackendKind::PhysX => PhysXBackend::is_available(),
     }
 }
 

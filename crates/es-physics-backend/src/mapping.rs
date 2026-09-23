@@ -89,6 +89,67 @@ impl Spec17Row {
     }
 }
 
+/// MJCF details that have no [`Feature`] because every `MuJoCo`-compiled backend reads them
+/// as `MuJoCo` does, but that a backend importing the MJCF through someone else's importer
+/// may drop or change (packet M11/I1, spec 28.14 rule 6: every importer gap is a row). They
+/// are asked only of such a backend -- today `PhysX` -- so no other report moves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum MjcfRow {
+    /// A joint's passive `damping`.
+    JointDamping,
+    /// A colliding geom's `friction`.
+    GeomFriction,
+    /// `contype` / `conaffinity` other than `1/1` (collides) and `0/0` (visual only).
+    CollisionBitmask,
+    /// `<option>`: integrator, solver, iterations, impratio. Every scene has one.
+    SolverOptions,
+    /// A body without `<inertial>`, whose mass `MuJoCo` derives from its geoms.
+    BodyMassFromGeoms,
+}
+
+impl MjcfRow {
+    pub const ALL: [Self; 5] = [
+        Self::JointDamping,
+        Self::GeomFriction,
+        Self::CollisionBitmask,
+        Self::SolverOptions,
+        Self::BodyMassFromGeoms,
+    ];
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::JointDamping => "joint.damping",
+            Self::GeomFriction => "geom.friction",
+            Self::CollisionBitmask => "geom.contype_conaffinity",
+            Self::SolverOptions => "option.solver",
+            Self::BodyMassFromGeoms => "body.mass_from_geoms",
+        }
+    }
+
+    /// Whether `scene` asks this row.
+    fn asked(self, scene: &SceneDesc) -> bool {
+        let colliding = || {
+            scene
+                .bodies
+                .iter()
+                .flat_map(|b| &b.geoms)
+                .filter(|g| !g.visual_only)
+        };
+        match self {
+            Self::JointDamping => scene.joints.iter().any(|j| j.damping != 0.0),
+            Self::GeomFriction => colliding().next().is_some(),
+            Self::CollisionBitmask => {
+                colliding().any(|g| !matches!((g.contype, g.conaffinity), (1, 1) | (0, 0)))
+            }
+            Self::SolverOptions => true,
+            Self::BodyMassFromGeoms => scene
+                .bodies
+                .iter()
+                .any(|b| b.name != "world" && b.inertial.is_none() && !b.geoms.is_empty()),
+        }
+    }
+}
+
 /// Every [`Feature`] `es-physics-core` knows. The table covers all of them, so a scene can
 /// never use something the report is silent about.
 const ALL_FEATURES: [Feature; 36] = [
@@ -136,15 +197,18 @@ const ALL_FEATURES: [Feature; 36] = [
 pub enum TaskFeature {
     Spec17(Spec17Row),
     Capability(Feature),
+    Mjcf(MjcfRow),
 }
 
 impl TaskFeature {
-    /// Every feature the table has a row for: the five spec 17.2 rows plus every [`Feature`].
+    /// Every feature the table has a row for: the five spec 17.2 rows, every [`Feature`] and
+    /// every [`MjcfRow`].
     pub fn all() -> Vec<Self> {
         Spec17Row::ALL
             .into_iter()
             .map(Self::Spec17)
             .chain(ALL_FEATURES.into_iter().map(Self::Capability))
+            .chain(MjcfRow::ALL.into_iter().map(Self::Mjcf))
             .collect()
     }
 }
@@ -154,6 +218,7 @@ impl fmt::Display for TaskFeature {
         match self {
             Self::Spec17(row) => f.write_str(row.name()),
             Self::Capability(feature) => write!(f, "{feature}"),
+            Self::Mjcf(row) => f.write_str(row.name()),
         }
     }
 }
@@ -278,6 +343,7 @@ fn mujoco_cpu(feature: TaskFeature) -> Mapping {
         TaskFeature::Spec17(Spec17Row::SensorContactForce) => {
             Mapping::blocked("MuJoCo has force / touch sensors but the MJCF emitter writes none")
         }
+        TaskFeature::Mjcf(_) => Mapping::native("MuJoCo's own compiler reads it"),
         TaskFeature::Capability(capability) => {
             if crate::mujoco::capabilities().has(capability) {
                 Mapping::native("MuJoCo's own semantics")
@@ -317,6 +383,7 @@ fn mjwarp(feature: TaskFeature) -> Mapping {
         TaskFeature::Capability(Feature::ContactCondim6 | Feature::ContactMesh) => {
             Mapping::unverified()
         }
+        TaskFeature::Mjcf(_) => Mapping::native("MuJoCo's own compiler reads it"),
         TaskFeature::Capability(capability) => {
             // Everything else the emitter can write has MuJoCo meaning on this backend too.
             if crate::mujoco::capabilities().has(capability) {
@@ -401,37 +468,134 @@ fn newton(feature: TaskFeature) -> Mapping {
             | Feature::ContactHeightField,
         ) => Mapping::blocked(NO_CONTACT),
         // Joint springs and friction loss were not checked against the importer.
-        TaskFeature::Capability(_) => Mapping::unverified(),
+        TaskFeature::Capability(_) | TaskFeature::Mjcf(_) => Mapping::unverified(),
     }
 }
 
-/// `PhysX`, likewise: only what spec 17.2 states, including the one row the spec marks as
-/// unsupported outright.
+/// `PhysX` through Isaac Sim's MJCF importer (packet M11/I1). As for Newton, the `Spec17` rows
+/// keep the spec 17.2 table's statement about the *engine* (their notes say what this adapter
+/// does), and the `Capability` and `Mjcf` rows are what `PhysXBackend` was measured to deliver
+/// (`docs/api-notes/isaac-sim.md` section 7-8); those are the rows that gate (spec 14.4). A gap
+/// the adapter does not repair is an `Unsupported` warning: the run keeps going, loudly, and
+/// nothing is dropped silently (spec 28.14 rule 6).
 fn physx(feature: TaskFeature) -> Mapping {
-    const DRIVE: &str = "drive stiffness / damping (spec 17.2), not a MuJoCo position gain";
-    const OFFSET: &str = "contact offset (spec 17.2), not MuJoCo impedance";
-    const NO_ARMATURE: &str = "PhysX has no joint armature (spec 17.2: unsupported, warn)";
+    const DRIVE: &str = "a PhysX joint drive (spec 17.2): stiffness kp, damping kv, max force \
+                         forcerange, authored in SI by the adapter; implicit in PhysX, not \
+                         MuJoCo's explicit position gain";
+    const NOT_MAPPED: &str = "not mapped by the PhysX adapter (refused by name)";
+    const NO_SENSOR: &str = "the PhysX adapter reads no sensors: sensordata would be empty";
+    const EMITTER: &str = "the shared MJCF emitter cannot write this";
+    let dropped = |note| Mapping {
+        status: Status::Unsupported(note),
+        severity: Severity::Warning,
+    };
     match feature {
         TaskFeature::Spec17(Spec17Row::ActuatorPd)
         | TaskFeature::Capability(Feature::ActuatorPosition) => Mapping::approximated(DRIVE),
         TaskFeature::Spec17(Spec17Row::ContactFrictionCone)
-        | TaskFeature::Capability(Feature::ContactPyramidal) => Mapping::native("pyramidal"),
-        TaskFeature::Capability(Feature::ContactElliptic) => Mapping {
-            status: Status::Unsupported("PhysX friction is pyramidal (spec 17.2)"),
-            severity: Severity::Warning,
-        },
-        TaskFeature::Spec17(Spec17Row::ContactSoftParams)
-        | TaskFeature::Capability(Feature::ContactSoftParams) => Mapping::approximated(OFFSET),
-        TaskFeature::Spec17(Spec17Row::JointArmature)
-        | TaskFeature::Capability(Feature::JointArmature) => Mapping {
-            status: Status::Unsupported(NO_ARMATURE),
-            severity: Severity::Warning,
-        },
-        TaskFeature::Spec17(Spec17Row::SensorContactForce)
-        | TaskFeature::Capability(Feature::SensorForce | Feature::SensorTouch) => {
-            Mapping::approximated("contact report (spec 17.2)")
+        | TaskFeature::Capability(Feature::ContactPyramidal) => {
+            Mapping::native("pyramidal (PhysX patch friction)")
         }
-        TaskFeature::Capability(_) => Mapping::unverified(),
+        TaskFeature::Capability(Feature::ContactElliptic) => dropped(
+            "dropped: PhysX friction is pyramidal (spec 17.2); an elliptic cone runs pyramidal",
+        ),
+        TaskFeature::Spec17(Spec17Row::ContactSoftParams) => Mapping::approximated(
+            "spec 17.2: contact offset. This adapter maps none: solref / solimp / margin are \
+             dropped and PhysX's default contact and rest offsets apply (measured, I0)",
+        ),
+        TaskFeature::Capability(Feature::ContactSoftParams) => dropped(
+            "dropped: solref / solimp have no PhysX analogue; rigid contact with default offsets",
+        ),
+        TaskFeature::Capability(Feature::ContactCondim6) => {
+            dropped("dropped: torsional and rolling friction (condim 4 / 6) have no PhysX analogue")
+        }
+        TaskFeature::Capability(Feature::ContactMesh) => Mapping::approximated(
+            "the mesh collides as its convex hull (importer convexHull approximation); the \
+             adapter hands the importer an OBJ file per inline mesh",
+        ),
+        TaskFeature::Capability(
+            Feature::ContactHeightField
+            | Feature::ModelParams
+            | Feature::JointBall
+            | Feature::ActuatorVelocity
+            | Feature::ActuatorGeneral
+            | Feature::ActuatorOnSite,
+        ) => Mapping::blocked(NOT_MAPPED),
+        TaskFeature::Spec17(Spec17Row::JointArmature) => Mapping {
+            status: Status::Unsupported(
+                "spec 17.2 says PhysX has no armature (unsupported, warn); measured, the \
+                 importer keeps it as physxJoint:armature (the JointArmature row)",
+            ),
+            severity: Severity::Warning,
+        },
+        TaskFeature::Capability(Feature::JointArmature) => {
+            Mapping::native("physxJoint:armature, the MJCF value exactly (measured, I0)")
+        }
+        TaskFeature::Capability(Feature::JointHinge) => Mapping::native("a revolute joint"),
+        TaskFeature::Capability(Feature::JointFixed) => {
+            Mapping::native("a fixed joint inside the articulation")
+        }
+        TaskFeature::Capability(Feature::JointLimit) => {
+            Mapping::native("revolute limits, exact (radians -> degrees in USD)")
+        }
+        TaskFeature::Capability(Feature::JointFree) => Mapping::native(
+            "a free rigid body; qpos / qvel converted to MuJoCo's free-joint convention (a free \
+             joint on a body with children, a floating-base articulation, is refused at load)",
+        ),
+        // Implemented, but no fixture exercises a prismatic joint, so it is not claimed.
+        TaskFeature::Capability(Feature::JointSlide) => Mapping::unverified(),
+        TaskFeature::Capability(Feature::JointSpring) => Mapping::approximated(
+            "an explicit joint effort -k (q - springref) before each physics step",
+        ),
+        TaskFeature::Capability(Feature::JointFrictionLoss) => dropped(
+            "dropped: the importer writes physxJoint:jointFriction 0, and PhysX joint friction \
+             is a coefficient, not MuJoCo's dry-friction torque",
+        ),
+        TaskFeature::Capability(Feature::ActuatorMotor) => Mapping::approximated(
+            "an explicit joint effort gear * ctrl, clamped to forcerange (no fixture exercises it)",
+        ),
+        TaskFeature::Capability(Feature::ActuatorOnJoint) => Mapping::native("a joint dof"),
+        TaskFeature::Capability(Feature::ActuatorOnTendon | Feature::Tendon) => {
+            Mapping::blocked(EMITTER)
+        }
+        TaskFeature::Spec17(Spec17Row::SensorContactForce) => Mapping::approximated(
+            "spec 17.2: contact report. This adapter reads no sensors (the Sensor* rows block)",
+        ),
+        TaskFeature::Capability(
+            Feature::SensorJointPos
+            | Feature::SensorJointVel
+            | Feature::SensorActuatorFrc
+            | Feature::SensorFramePos
+            | Feature::SensorFrameQuat
+            | Feature::SensorAccelerometer
+            | Feature::SensorGyro
+            | Feature::SensorForce
+            | Feature::SensorTorque
+            | Feature::SensorTouch
+            | Feature::SensorRangeFinder
+            | Feature::SensorCamera,
+        ) => Mapping::blocked(NO_SENSOR),
+        TaskFeature::Mjcf(MjcfRow::JointDamping) => Mapping::approximated(
+            "the importer turns it into drive damping, inside the force clamp; the adapter \
+             applies it as an explicit joint effort -d * qd before each physics step, outside \
+             the clamp as in MuJoCo (which integrates it implicitly)",
+        ),
+        TaskFeature::Mjcf(MjcfRow::GeomFriction) => Mapping::approximated(
+            "the importer authors no material; the adapter binds one per geom: static = dynamic \
+             = sliding friction, combine max (MuJoCo's rule; geom priority ignored)",
+        ),
+        TaskFeature::Mjcf(MjcfRow::CollisionBitmask) => dropped(
+            "dropped: contype / conaffinity bitmasks are not mapped; every PhysX collider pair \
+             collides except a joint's two bodies",
+        ),
+        TaskFeature::Mjcf(MjcfRow::SolverOptions) => dropped(
+            "dropped: integrator / solver / iterations / impratio have no analogue; PhysX TGS \
+             with the importer's 32 / 1 articulation iterations",
+        ),
+        TaskFeature::Mjcf(MjcfRow::BodyMassFromGeoms) => dropped(
+            "dropped: PhysX derives the mass from the colliders at its default density; a \
+             geom mass= (measured: on a non-colliding geom) is lost",
+        ),
     }
 }
 
@@ -543,6 +707,14 @@ pub fn mapping_report(scene: &SceneDesc, backend: BackendKind) -> MappingReport 
         .any(|s| matches!(s.kind, SensorKind::Force | SensorKind::Touch))
     {
         used.insert(TaskFeature::Spec17(Spec17Row::SensorContactForce));
+    }
+    if backend == BackendKind::PhysX {
+        used.extend(
+            MjcfRow::ALL
+                .into_iter()
+                .filter(|row| row.asked(scene))
+                .map(TaskFeature::Mjcf),
+        );
     }
 
     let rows: Vec<MappingRow> = used
@@ -804,7 +976,7 @@ mod tests {
     #[test]
     fn every_feature_and_backend_pair_has_a_row() {
         let table = SemanticMapping::new();
-        assert_eq!(table.len(), (5 + 36) * 4);
+        assert_eq!(table.len(), (5 + 36 + 5) * 4);
         for feature in TaskFeature::all() {
             for backend in BackendKind::ALL {
                 let mapping = table
