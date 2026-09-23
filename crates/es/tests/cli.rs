@@ -13088,3 +13088,33 @@ fn import_rl_matches_the_reconstruction() {
     );
     assert_eq!(mismatches, 0, "the import is not bitwise");
 }
+
+/// Packet M10/W2b: the one scene loader `es loop collect`, `es eval run`, `es video showcase`
+/// and `es backend` share resolves the mesh files a scene names, relative to the scene file,
+/// and a missing mesh file is an error naming the scene rather than a refusal at the first
+/// rendered frame.
+#[test]
+fn load_scene_resolves_meshes_relative_to_the_scene_file() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/mjcf/mesh_box.xml")
+        .display()
+        .to_string();
+    let scene = es_tools::backend::load_scene(&fixture).expect("mesh_box loads");
+    let names: Vec<&str> = scene.meshes.values().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["box"], "the loader did not resolve meshes/box.stl");
+    assert_eq!(scene.meshes.values().next().unwrap().indices.len(), 36);
+
+    // The same XML with no `meshes/` beside it.
+    let dir = scratch_dir("mesh-box-missing");
+    let copy = dir.join("mesh_box.xml");
+    std::fs::copy(&fixture, &copy).expect("copy the fixture");
+    let copy = copy.display().to_string();
+    let err = es_tools::backend::load_scene(&copy)
+        .expect_err("a missing mesh file must fail")
+        .to_string();
+    assert!(
+        err.contains(&copy) && err.contains("box.stl"),
+        "the error names neither the scene nor the mesh: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
