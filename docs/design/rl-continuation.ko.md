@@ -105,6 +105,68 @@ IR이 선언한 그대로 남는다(INV-11..13 — 다른 선택지인 엔벨로
 타원 원뿔을 구현한다. 스펙 17.2의 행이 그것을 따라가야 하는지는 사람의 결정이며,
 `evaluation-execution.ko.md` 2.8에 기록되어 있다.
 
+### 2c. 롤아웃이 렌더링한다 (패킷 M11/X3)
+
+es-py를 `render` 피처로 빌드하면 `es_native.Rollout`은 이미지를 관측한다(`python/es/pyproject.toml`의
+maturin 빌드가 이 피처를 켠다). `Rollout`은 Observation IR의 단 하나의 `ImageInput`에 대해 env마다
+`es_env::EnvRenderer`를 하나씩 가지며, 그 설정은 해당 센서를 선언한 Task IR 채널로부터
+`es_env::render::sensor_cfg`가 만든다 — `es loop collect --frames`와 `es eval run --frames`가 쓰는
+바로 그 함수다 — 그리고 그 `frame`을 같은 `es_eval::runner::capture`에 프레임 소스로 넘기므로 두
+번째 관측 구현은 없다. 각 env의 리셋(명시적 리셋이든 done에 대한 `Env::step` 자신의 리셋이든)은 그
+env의 `begin_episode`를 호출하므로, `seed = "tick"` 아래에서 샘플 키는 *그 env의* 에피소드에서 다시
+시작한다(`renderer.ko.md` 12.8). `observe` 한 번은 env마다 프레임 하나이며, 그것이 틱이 세는 렌더
+인덱스다. 누적도, env를 가로지르는 배치도(X3b) 없다. 피처가 없으면 이미지 입력은 예전처럼 `observe`에서
+이름으로 거부된다. 상태만 있는 Observation IR은 렌더러를 짓지 않고 장치도 열지 않는다.
+
+`train_ppo.py`는 모든 포트의 모양을 `contract.json`에서 읽고 이미지 포트를 `[n_envs, C, H, W]`로
+쌓는다(여기서는 `[3, 96, 96]`, Observation IR 자신의 출력 레이아웃이다). 가치 MLP는 포트들을 평탄화해
+읽는다. `Rollout.metrics()`는 `render_ms_per_frame`을 싣고 §12.4 집합의 `camera_frames_per_sec` /
+`pixels_per_sec`를 채운다. `train_ppo.py`는 이것을 `env-metrics.json`에 쓰고 렌더 행을 stderr에
+출력하며, `metrics.json`에는 결코 넣지 않는다.
+
+카메라를 가진 reach 문서 — `task-`, `observation-`, `learning-`, `evaluation-reach-vision.toml` — 는
+`regenerate_vision_reach_documents`(`crates/es-py/tests/vision_reach.rs`)가 reach 문서들과
+`task-pt-tick.toml`의 카메라로부터 생성한다: reach 작업에 `Pt` 16 spp, 3 바운스, `seed = "tick"`의
+`rgb_overhead`를 더한 것이다. Learning IR은 데모의 처음부터 학습하는 `VisionEncoder { ResNet18 }`(512)을
+reach 상태 MLP(64) 곁에 두고 `Fusion { Concat }` 576, 그리고 reach 헤드다. `deployment-reach.toml`은
+그대로 쓴다.
+
+**측정.**
+
+| 주장 | RTX 3060 (로컬) | RTX 4090 (오라클 서버) |
+|---|---|---|
+| `Rollout` 프레임 == `es loop collect --frames` 프레임(프로세스 내 수집기, env 0, 2 에피소드 × 4 틱), `Pt` 16 spp, `seed = "tick"` | 비트 동일, 8/8 | 비트 동일 |
+| `Rollout` 프레임 == 수집기 배선의 쌍둥이 렌더러, 2 env × 8 틱, env 1은 env 0과 다른 위상에서 리셋 | 비트 동일, 16/16 | 비트 동일 |
+| env 1의 `begin_episode`를 제거한 같은 오라클 | env 1의 첫 틱에서 실패(27,648바이트 중 27,054) | — |
+| 상태만 있는 롤아웃(`so101_100steps.json`), `render` 유무 모두 | 골든 재현 | 골든 재현 |
+| 상태만 있는 PPO 스모크, 이 패킷 전후의 `train_ppo.py`(3 반복, 4 env) | 체크포인트와 가치 비트 동일 | — |
+| `train_rl_two_runs_are_bitwise` | 통과 | 통과 |
+| 비전 작업 PPO 스모크, 10 반복 × 2 env × 16 스텝 | 실행됨, 손실 유한(0.51 → 1.37), 41.5 ms/프레임 | 실행됨, 손실 유한(0.51 → 1.37), 20.8 ms/프레임, 14 s |
+
+`Rollout.render_ms_per_frame`, env 하나, 96×96, 프레임 전체(재배치, 업로드, 트레이스, 리드백),
+릴리스 빌드, 워밍업 2프레임 후 팔이 움직이는 동안 16프레임; 각각 세 번 실행(3060 실행들은 ±0.4 ms
+안에서 일치):
+
+| 렌더 | RTX 3060 (로컬) | RTX 4090 (오라클 서버) |
+|---|---|---|
+| `Rs` | 2.02–2.42 ms | 2.44–2.45 ms |
+| `Pt` 4 spp | 9.30–9.65 ms | 5.72–5.86 ms |
+| `Pt` 4 spp + SVGF | 9.72–9.91 ms | 7.32–7.40 ms |
+| `Pt` 16 spp | 31.06–31.15 ms | 15.67–15.73 ms |
+| `Pt` 16 spp + SVGF | 31.40–31.42 ms | 17.17–17.32 ms |
+| `Pt` 64 spp | 117.03–117.15 ms | 54.41–54.54 ms |
+| `Pt` 64 spp + SVGF | 117.41–117.42 ms | 56.04–56.17 ms |
+
+(`cargo test -p es-py --release --features render --test vision_reach -- --ignored
+rollout_render_cost`.) env 하나가 프레임을 차례로 렌더링하므로, `envs × horizon` 행의 PPO 반복 하나는
+`envs × horizon` 프레임을 직렬로 치른다: 16 env × 64 스텝, 16 spp이면 4090에서 학습 이전에 반복마다
+렌더링만 ~16 초다. 그것이 X3b의 질문이다. 이 두 카드를 넘어서는 것은 `Target / Status: unverified`.
+
+**2c가 건너뛰는 것.** `es train`의 `[rl]` 경로는 Observation IR에 이미지 입력이 있는 번들을 여전히
+거부한다(`crates/es/src/cmd/train.rs`, 이 패킷의 범위 밖). 그래서 스모크는 `es policy lower` 모듈 위에서
+`train_ppo.py`를 직접 돌린다; 그 거부를 푸는 것은 후속 작업이다. 관측마다 이미지 입력 하나(수집기의
+규칙이기도 하다). env를 가로지르는 배치 렌더링(X3b).
+
 ## 3. 롤아웃에서의 지연시간과 청킹
 
 PPO는 매 제어 스텝마다 horizon 1로 행동한다: 청크 버퍼도 없고, 선언된 지연시간도 없다. 롤아웃은
