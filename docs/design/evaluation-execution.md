@@ -497,6 +497,85 @@ already true when one `Env` served a whole cell, and the partition neither fixes
 `Env::metrics`'s own expression, so the number means the same thing it did). No committed
 document declares either, and the parity claims above are about the documents that do not.
 
+### 2.8 The physics backend (`--backend`, packet M11/X1)
+
+`Env<B: PhysicsBackend>` was always generic; `es eval run`, `es loop collect` and
+`es_native.Rollout` hard-coded `MuJoCoCpuBackend`. Now each verb parses `--backend` into
+`BackendKind` and makes one `match` that calls the existing generic entry point monomorphized on
+the chosen type — `Evaluation::run_shard_with_sink::<B, …>(…, B::default, …)`,
+`Collector::run_with_sink::<B, …>`, and inside `Rollout` a closed enum of `Env<MuJoCoCpuBackend>`
+/ `Env<MjWarpBackend>`. No `Box<dyn PhysicsBackend>` in `Env`, no new trait (INV-17, §3.4).
+
+| `--backend` | what it does today |
+|---|---|
+| `mujoco-cpu` (default) | the reference (§17.1), tier 1; its `hardware_capability` slot is the all-zero value every committed lock was hashed with |
+| `mjwarp` | MuJoCo Warp, tier 2 (never bitwise, §3.5); needs `mujoco_warp` under `ES_PYTHON`, else `SKIPPED` exit 3 |
+| `newton` | refused by its mapping report before anything spawns: the adapter declares no actuators or sensors and wires no contacts, so it is `es backend compare`'s open loop only |
+| `physx` | refused: `not implemented (M11/I1)` |
+| anything else | usage error (exit 2) listing the four |
+
+**Order.** For any backend but `mujoco-cpu` the scene is read and its §17.2 mapping report is
+the first gate (§14.4) — before the availability probe spawns an interpreter — so a refusal names
+its rows on a machine without the engine; `mujoco-cpu` keeps today's order (availability, then the
+scene). Then the process that merges opens the backend once on the scene (`identify`) to read the
+engine version off its `load` reply (`mujoco 3.13.0`; `mujoco_warp X; warp Y; mujoco Z`;
+`newton X` — a reply without one is a protocol error, never an empty string), and computes the
+slot below. A `--jobs N` worker does not: its cells carry no hash.
+
+**The hash chain (§28.14 rule 2).** `es_physics_backend::backend_identity(caps, engine_version)`
+= blake3 over the length-prefixed tuple `("es.backend.v1", name, engine version, float,
+determinism tier)`, the float and tier spelled as the lock's `backend` block spells them.
+`hardware_capability(caps, version)` is that digest for every backend except `mujoco-cpu`, whose
+slot stays `[0; 32]`; `RunConfig.hardware` is set from it, so an `mjwarp` run and a `mujoco-cpu`
+run of the same bundle are two `execution_hash`es, and every committed `mujoco-cpu`
+`execution_hash` is unmoved. `evaluation.lock`'s `backend` block gains `engine_version` (optional,
+absent from the bytes when unset, so older locks still parse).
+
+#### Measured, oracle server (RTX 4090, 16 cores), 2026-09-23 UTC
+
+Binaries: this tree (`a737a04`) and its parent (`f161d24`, pre-X1), both built on the server;
+`ES_PYTHON=~/venvs/es` (mujoco 3.13.0, mujoco_warp 3.13.0, warp 1.17.0, torch 2.14.0+cpu) unless
+a row says otherwise. Artifacts `~/artifacts/plan-x/x1/`.
+
+| run | backend | `execution_hash` | result |
+|---|---|---|---|
+| reach A0 (W0b seed 0, `4000.esb`), `evaluation-reach.toml` (`66ef84a5…`) | `mujoco-cpu`, this tree | `08851281…5e93` | `nominal` success 0.5625; `engine_version` `mujoco 3.13.0` |
+| same | `mujoco-cpu`, pre-X1 binary | `08851281…5e93` | `report.json` byte-identical to the row above |
+| same, this tree again | `mujoco-cpu` | `08851281…5e93` | byte-identical (tier 1) |
+| same | `mjwarp` (run 1 and run 2) | — | **refused**, exit 1: mapping report `ContactElliptic unsupported error`, before any process |
+| W0b's own run of that checkpoint, `~/venvs/es-lerobot-cuda` | `mujoco-cpu`, W0b binary | `145bc81a…934f` | same metrics; the hash differs by the interpreter's torch (`runtime_hash`), which is why the pre-X1 binary on the same interpreter is the row that isolates this packet |
+| demo U3 (W0b's re-packed `m7u-repacked.esb`), its `evaluation-augmented.toml` (`007aac67…`), `--jobs 6 --frames`, `ES_PYTHON=~/venvs/es-lerobot-cuda` as W0b ran it | `mujoco-cpu`, this tree | `2925ce8a…09a3` | = W0b stage 4c's recorded hash; `report.json` byte-identical to W0b's (nominal 0.5625); 223 s |
+| same | `mjwarp` | — | **refused**, same row |
+| `es_native.Rollout` on the reach documents, 2 envs | `mujoco-cpu` / `mjwarp` / `newton` / `physx` | — | built / refused `ContactElliptic` / refused `ActuatorPosition, ActuatorOnJoint, ContactElliptic, ContactCondim6` / `not implemented (M11/I1)` |
+
+**The finding: the packet's closed-loop comparison cannot run on the committed documents.**
+`so101_pick_place.xml` — the scene of both the demo and the reach task — declares
+`cone="elliptic"`, and spec 17.2 pins MJWarp's friction cone to pyramidal, so the mapping report
+blocks every `mjwarp` run of both documents (and the 20-iteration `Rollout` PPO smoke with them).
+That is the gate doing its job (§14.4), not a defect of the dispatch: nothing ran on MJWarp, so
+there is no `mjwarp` `execution_hash` to put in this table, and no MJWarp number is reported as
+bitwise or otherwise. The reach A0 checkpoint named in the packet
+(`~/artifacts/plan-s/s4e/run-4000`) and the M7/U U3 checkpoint predate W0b's `scene_hash`, so
+`evaluation-reach.toml` / `evaluation.toml` of this tree do not judge them (`XIR-040`); the rows
+above use W0b's re-measured equivalents, whose weights are the same bytes. `evaluation.toml` does
+not judge U3 in any case: U3 was packed with `observation-augmented.toml`.
+
+**What the engine itself does with the elliptic scene** (evidence for the decision, outside `es`:
+`mujoco_warp.put_model` on the raw MJCF, one world, 1,000 steps of a fixed sinusoidal control, next
+to `mujoco.mj_step`). mujoco_warp 3.13.0 implements the elliptic cone (`constraint.py`'s
+`IS_ELLIPTIC` paths) and runs the scene: finite throughout; max |Δqpos| against the CPU engine
+**1.1e-5 on the six arm joints** and **0.103 overall**, the latter on the cube's free joint and
+already within the first 100 steps; two MJWarp runs are **not** bitwise (max |Δ| 1.0e-6), and it
+warns that the solver hit its 10-iteration limit. The first attempt died in Warp's kernel cache
+(`KeyError … ccd_kernel … smem_bytes`) and the identical second one ran — reported, not retried
+into silence.
+
+**What a human has to decide** (none of it is this packet's to take): whether spec 17.2's MJWarp
+row follows the engine to `elliptic` (a spec and `mapping.rs` change, measured against the numbers
+above), or the comparison is run on a pyramidal variant of the scene (new documents, new
+`scene_hash`, retrained checkpoints). Until then `--backend mjwarp` is proven on the gate, the
+SKIPPED path, the identity and the monomorphized dispatch, and not on a closed-loop number.
+
 ## 3. Perturbation realisation (`perturb.rs`)
 
 `PerturbationPlan::compile(&EvaluationIr, &SceneDesc, &ModelInfo, has_renderer)` resolves
@@ -673,7 +752,8 @@ serialiser to keep canonical.
   "backend": { "name": "mujoco-cpu", "determinism": "Bitwise", "float": "F64",
                "max_envs": 1024, "gpu_resident": false,
                "supports_reset_subset": true, "supports_state_get_set": true,
-               "quirks": ["..."] },
+               "quirks": ["..."],
+               "engine_version": "mujoco 3.13.0" },   // the load reply's; absent when unset (M11/X1)
   "created": 0                       // caller-supplied unix seconds; 0 = unset
 }
 ```
@@ -694,7 +774,7 @@ deliberately confined to the lock.
 | `learning`, `policy` | `PolicyInfo::lowering_hash` / `weights_hash` — the graph itself is not passed to `run`, and these are the two digests the loaded runtime can attest to |
 | `compiler` | `CpuPlan::compiler_hash()` |
 | `runtime` | `PolicyRuntime::runtime_hash()` |
-| `dataset`, `hardware` | `RunConfig` — an evaluation run reads no dataset, so the caller supplies zeros or the training set's digest |
+| `dataset`, `hardware` | `RunConfig` — an evaluation run reads no dataset, so the caller supplies zeros or the training set's digest; `hardware` is `[0; 32]` on `mujoco-cpu` and `backend_identity` on every other backend (2.8, packet M11/X1) |
 
 `evaluation` is in the chain but not in `execution_hash` by design (§5.3: the evaluation
 conditions do not change what is executed); the report carries both.

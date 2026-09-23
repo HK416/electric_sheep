@@ -180,6 +180,23 @@ pub struct LoadReply {
     pub actuators: Vec<String>,
     pub sensors: Vec<SensorEntry>,
     pub bodies: Vec<String>,
+    /// The engine the process runs, e.g. `mujoco 3.3.2` -- what
+    /// [`backend_identity`](crate::backend_identity) hashes (packet M11/X1). Required: a reply
+    /// without it is a protocol error, never an empty string in a hash.
+    pub engine_version: String,
+}
+
+impl LoadReply {
+    /// The engine version, refused when blank.
+    pub fn checked_engine_version(&self) -> Result<&str, PhysicsError> {
+        let v = self.engine_version.trim();
+        if v.is_empty() {
+            return Err(PhysicsError::Protocol(
+                "the load reply names no engine version".to_owned(),
+            ));
+        }
+        Ok(v)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -474,10 +491,11 @@ mod tests {
             r#"{"ok":true,"nq":7,"nv":6,"nu":1,"nsensordata":2,"nbody":3,
                 "joints":[{"name":"j","qpos":[0,7],"dof":[0,6]}],
                 "actuators":["m"],"sensors":[{"name":"s","adr":0,"dim":2}],
-                "bodies":["world","b"]}"#,
+                "bodies":["world","b"],"engine_version":"mujoco 3.3.2"}"#,
         )
         .unwrap();
         assert_eq!((reply.nq, reply.nv, reply.nbody), (7, 6, 3));
+        assert_eq!(reply.checked_engine_version().unwrap(), "mujoco 3.3.2");
         assert_eq!(reply.joints[0].qpos, [0, 7]);
         assert_eq!(reply.sensors[0].dim, 2);
 
@@ -488,6 +506,22 @@ mod tests {
         let step: StepReply = parse_response(r#"{"ok":true,"nonfinite":[3]}"#).unwrap();
         assert_eq!(step.nonfinite, vec![3]);
         let _: Ack = parse_response(r#"{"ok":true}"#).unwrap();
+    }
+
+    /// Packet M11/X1: the engine version is what `backend_identity` hashes, so a reply without
+    /// one is a protocol error and an empty one is refused -- never an empty string in a hash.
+    #[test]
+    fn backend_identity_needs_an_engine_version() {
+        let body = r#""ok":true,"nq":0,"nv":0,"nu":0,"nsensordata":0,"nbody":1,
+            "joints":[],"actuators":[],"sensors":[],"bodies":["world"]"#;
+        let missing = parse_response::<LoadReply>(&format!("{{{body}}}")).unwrap_err();
+        assert!(matches!(missing, PhysicsError::Protocol(_)), "{missing:?}");
+        let empty: LoadReply =
+            parse_response(&format!(r#"{{{body},"engine_version":" "}}"#)).unwrap();
+        assert!(matches!(
+            empty.checked_engine_version(),
+            Err(PhysicsError::Protocol(_))
+        ));
     }
 
     #[test]

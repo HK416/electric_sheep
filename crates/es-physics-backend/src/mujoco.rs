@@ -116,6 +116,8 @@ pub struct MuJoCoCpuBackend {
     /// `[nominal, applied]` of every parameter `set_params` wrote, read back out of the env's
     /// model: the evidence that a draw reached physics.
     applied: BTreeMap<AppliedKey, [f64; 2]>,
+    /// The load reply's engine version (packet M11/X1); `None` until loaded.
+    engine_version: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -144,6 +146,7 @@ impl MuJoCoCpuBackend {
             state: StateBuffers::default(),
             params: BTreeMap::new(),
             applied: BTreeMap::new(),
+            engine_version: None,
         }
     }
 
@@ -151,6 +154,11 @@ impl MuJoCoCpuBackend {
     /// wrote since the last load, as read back out of that env's `MjModel`.
     pub fn applied_params(&self) -> &BTreeMap<AppliedKey, [f64; 2]> {
         &self.applied
+    }
+
+    /// The engine the loaded process runs, as its load reply named it (packet M11/X1).
+    pub fn engine_version(&self) -> Option<&str> {
+        self.engine_version.as_deref()
     }
 
     /// Whether a Python interpreter with the `mujoco` package is available. `Err` explains what
@@ -299,6 +307,7 @@ impl PhysicsBackend for MuJoCoCpuBackend {
             info.body.insert(id, IndexRange::new(index as u32, 1));
         }
 
+        self.engine_version = Some(reply.checked_engine_version()?.to_owned());
         self.process = Some(process);
         self.params = param_index(scene, &info);
         self.applied.clear();

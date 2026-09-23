@@ -82,6 +82,29 @@ IR이 선언한 그대로 남는다(INV-11..13 — 다른 선택지인 엔벨로
 교정해야 할 절단(censoring)이 아니라 모델링되지 않은 환경의 일부로 두고, 환경이 실제로 본 분포
 위에서 PPO를 도는 것이다. 7절의 R5 행이 그 측정이다.
 
+### 2b. 롤아웃이 어느 엔진을 스텝하는가 (`[rl] backend`, 패킷 M11/X1)
+
+`[rl] backend = "mjwarp"`이면 `es train`은 트레이너의 argv에 `--backend mjwarp`를 덧붙이고,
+`train_ppo.py`는 그것을 `es_native.Rollout(…, backend=…)`에 넘기며, `Rollout`은 자신의 `Env`를
+`MuJoCoCpuBackend` 대신 `MjWarpBackend` 위에 짓는다 — `Rollout` 안의, 단형화된 두 env의 닫힌
+열거형이지 트레이트 객체도 새 트레이트도 아니다(INV-17). 없으면 `"mujoco-cpu"`이고, 적어 넣어도
+없는 것과 정확히 같게 직렬화되므로 M11 이전에 측정된 모든 레시피는 자신의 `training_hash`를
+유지한다. 그 밖의 값은 레시피 JSON과 `training/config.json`이 싣는 계획 줄에 들어가므로
+`training_hash`에 들어간다(계획 골든 `tests/golden/train/plan-reach-mjwarp.txt`). `"newton"`과
+`"physx"`는 레시피를 파싱할 때 거부된다: Newton 어댑터는 액추에이터를 선언하지 않으므로 그 자신의
+`load`가 정책이 행동할 수 있는 모든 장면을 거부하고, PhysX는 M11/I1이다. Safety Plane은 어느
+엔진에서나 같은 코드다(INV-11..13). MJWarp는 tier 2다(§3.5): 그 위의 실행은 CPU 백엔드에 대해
+결코 비트 단위로 같지 않으며, `train_rl_two_runs_are_bitwise`는 계속 `mujoco-cpu`에 대한
+진술로만 남는다.
+
+**도입 시점에 측정한 것: 스펙이 지금 그대로라면 reach 장면은 `mjwarp`에서 돌 수 없다.**
+`so101_pick_place.xml`은 `cone="elliptic"`을 선언하고 스펙 17.2는 MJWarp의 마찰 원뿔을
+피라미드형으로 고정하므로, reach 문서에 대한 `Rollout(…, backend="mjwarp")`은 프로세스가 뜨기
+전에 `MjWarpBackend::load` 안의 매핑 리포트에 의해 거부된다(`ContactElliptic`, severity
+`error`; `rollout_backend_mjwarp_refuses_the_elliptic_reach_scene`). 설치된 `mujoco_warp`는
+타원 원뿔을 구현한다. 스펙 17.2의 행이 그것을 따라가야 하는지는 사람의 결정이며,
+`evaluation-execution.ko.md` 2.8에 기록되어 있다.
+
 ## 3. 롤아웃에서의 지연시간과 청킹
 
 PPO는 매 제어 스텝마다 horizon 1로 행동한다: 청크 버퍼도 없고, 선언된 지연시간도 없다. 롤아웃은

@@ -72,6 +72,17 @@ def read_param(model, slot):
     return float(array[row] if col is None else array[row, col])
 
 
+def version_of(module, dist):
+    """`module.__version__`, else the installed distribution's; an engine with neither fails
+    the load, because the version is hashed into the run's condition (packet M11/X1)."""
+    version = getattr(module, "__version__", None)
+    if not version:
+        from importlib import metadata
+
+        version = metadata.version(dist)
+    return str(version)
+
+
 class Sim(object):
     def __init__(self, mjcf, n_envs, timestep, seed):
         self.model = mujoco.MjModel.from_xml_string(mjcf)
@@ -137,6 +148,7 @@ class Sim(object):
             "bodies": [
                 name_of(model, mujoco.mjtObj.mjOBJ_BODY, i) for i in range(model.nbody)
             ],
+            "engine_version": "mujoco %s" % version_of(mujoco, "mujoco"),
         }
 
     def state(self):

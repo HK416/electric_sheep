@@ -7,7 +7,8 @@ use es_compile::PolicyBundle;
 use es_eval::runner::{RunEvent, RunSink};
 use es_eval::{Evaluation, RunConfig};
 use es_ir::evaluation::{AcceptanceResult, EvaluationReport, MetricValue};
-use es_physics_backend::MuJoCoCpuBackend;
+use es_physics_backend::{BackendKind, MjWarpBackend, MuJoCoCpuBackend};
+use es_physics_core::backend::PhysicsBackend;
 use es_policy::{PolicyRuntime, TorchRuntime, WeightsSource};
 
 use crate::cmd::telemetry::{Publisher, TelemetryArgs, STAGE_EVAL};
@@ -100,7 +101,7 @@ hands a policy privileged state.
     --expert <name>    drive with the scripted expert instead of the policy's weights
     --frames <dir>     render every step here (needs the `render` feature)
     --traj <dir>       per-episode `.estraj` state trajectories (default <out>/traj)
-    --backend <name>   physics backend; only `mujoco-cpu` is supported (default, spec 17.1)
+    --backend <name>   physics backend (default mujoco-cpu); see BACKENDS below
     --runtime <name>   policy runtime; only `torch` is supported (default, spec 2.4)
     --jobs <N>         worker processes for the (suite, episode) units (default 1); 0 is refused
     --shard <i/N>      run only the units of shard i (worker mode); needs --shard-out
@@ -121,10 +122,59 @@ and `events.json` are byte-identical with and without the flag.
 --telemetry needs --jobs 1: the units of a --jobs N run are separate processes and only one
 of them could own the address.
 
+BACKENDS (spec 17.2, packet M11/X1):
+  mujoco-cpu  MuJoCo on the CPU, the reference (spec 17.1): tier 1, bitwise run to run. The
+              default; its runs keep the hardware_capability slot every committed lock has.
+  mjwarp      MuJoCo Warp on the GPU (needs `mujoco_warp` under ES_PYTHON): tier 2, never
+              bitwise against mujoco-cpu. Writes H(\"es.backend.v1\", name, engine version,
+              float, tier) into execution_hash's hardware_capability slot (spec 28.14 rule 2).
+  newton      refused by its mapping report before anything spawns: the adapter declares no
+              actuators or sensors and wires no contacts, so it runs open loop only
+              (`es backend compare`).
+  physx       not implemented (M11/I1).
+evaluation.lock's `backend` block carries the engine version the backend's load reply named.
+
 Exit code: 0 when every acceptance result is Determined{passed: true}; 1 when any failed or
 is Unavailable (both printed); 2 on a usage error; 3 when the backend or runtime is
 unavailable (distinct from 1: nothing ran).
 ";
+
+/// `--backend <name>` of `es eval run` and `es loop collect` (packet M11/X1): one of the four
+/// spec 17.2 names, or a usage error that lists them. `PhysX` is a known name with no adapter
+/// yet, and is refused here, before anything is opened.
+pub(crate) fn parse_backend(name: &str, help: &str) -> Result<BackendKind, CliError> {
+    match BackendKind::from_name(name) {
+        Some(BackendKind::PhysX) => Err(CliError::Runtime(
+            es_physics_backend::PHYSX_NOT_IMPLEMENTED.to_owned(),
+        )),
+        Some(kind) => Ok(kind),
+        None => Err(CliError::Usage(format!(
+            "unknown --backend '{name}': one of {}\n\n{help}",
+            BackendKind::ALL.map(BackendKind::name).join(", ")
+        ))),
+    }
+}
+
+/// The spec 14.4 gate for a backend other than the reference, run on the scene before any
+/// availability probe or process: an unmapped row with severity `error` refuses the run and
+/// names the rows. It is the same report the backend's own `load` checks first.
+pub(crate) fn mapping_gate(
+    kind: BackendKind,
+    scene: &es_assets::scene::SceneDesc,
+) -> Result<(), CliError> {
+    let report = es_physics_backend::mapping_report(scene, kind);
+    if report.blocked {
+        return Err(CliError::Runtime(format!("--backend {kind}: {report}")));
+    }
+    Ok(())
+}
+
+/// What a closed-loop verb says about a backend it has no path for (Newton, today).
+pub(crate) fn no_closed_loop(kind: BackendKind) -> CliError {
+    CliError::Runtime(format!(
+        "--backend {kind}: no closed-loop path; the closed-loop verbs run mujoco-cpu and mjwarp"
+    ))
+}
 
 pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
     match args.first().map(String::as_str) {
@@ -415,20 +465,20 @@ fn parse_shard(s: &str) -> Result<(u32, u32), CliError> {
 /// ponytail: a fixed dispatch table, not a runtime-generic solver -- add a pair here when a
 /// new robot/horizon combination needs `es eval run`.
 macro_rules! dispatch_nj_h {
-    ($nj:expr, $h:expr, $($args:expr),+ $(,)?) => {
+    ($b:ty; $nj:expr, $h:expr, $($args:expr),+ $(,)?) => {
         match ($nj, $h) {
-            (1, 1) => run_typed::<1, 1>($($args),+),
-            (6, 1) => run_typed::<6, 1>($($args),+),
-            (6, 8) => run_typed::<6, 8>($($args),+),
-            (6, 16) => run_typed::<6, 16>($($args),+),
-            (6, 50) => run_typed::<6, 50>($($args),+),
-            (7, 1) => run_typed::<7, 1>($($args),+),
+            (1, 1) => run_typed::<$b, 1, 1>($($args),+),
+            (6, 1) => run_typed::<$b, 6, 1>($($args),+),
+            (6, 8) => run_typed::<$b, 6, 8>($($args),+),
+            (6, 16) => run_typed::<$b, 6, 16>($($args),+),
+            (6, 50) => run_typed::<$b, 6, 50>($($args),+),
+            (7, 1) => run_typed::<$b, 7, 1>($($args),+),
             // Unitree Go1, packet M6/B1: twelve joints, chunk 1.
-            (12, 1) => run_typed::<12, 1>($($args),+),
-            (7, 8) => run_typed::<7, 8>($($args),+),
-            (7, 16) => run_typed::<7, 16>($($args),+),
-            (7, 50) => run_typed::<7, 50>($($args),+),
-            (8, 50) => run_typed::<8, 50>($($args),+),
+            (12, 1) => run_typed::<$b, 12, 1>($($args),+),
+            (7, 8) => run_typed::<$b, 7, 8>($($args),+),
+            (7, 16) => run_typed::<$b, 7, 16>($($args),+),
+            (7, 50) => run_typed::<$b, 7, 50>($($args),+),
+            (8, 50) => run_typed::<$b, 8, 50>($($args),+),
             (nj, h) => Err(CliError::Runtime(format!(
                 "unsupported (n_joints={nj}, horizon={h}); es eval run supports a fixed table \
                  of pairs (crates/es/src/cmd/eval.rs) -- add one for this robot"
@@ -438,7 +488,7 @@ macro_rules! dispatch_nj_h {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_typed<const NJ: usize, const H: usize>(
+fn run_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
     bundle: &PolicyBundle,
     eval_ir: &es_ir::evaluation::EvaluationIr,
     scene: &es_assets::scene::SceneDesc,
@@ -452,14 +502,14 @@ fn run_typed<const NJ: usize, const H: usize>(
 ) -> Result<es_eval::Shard, CliError> {
     let mut run = |frames: Option<&mut es_eval::runner::FrameSource<'_>>,
                    sink: Option<&mut RunSink<'_>>| {
-        Evaluation::run_shard_with_sink::<MuJoCoCpuBackend, _, NJ, H>(
+        Evaluation::run_shard_with_sink::<B, _, NJ, H>(
             eval_ir,
             &bundle.task,
             scene,
             &bundle.observation,
             policy,
             &bundle.deployment,
-            MuJoCoCpuBackend::new,
+            B::default,
             cfg,
             frames,
             frames_dir,
@@ -700,12 +750,7 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
         return Ok(0);
     }
     let a = parse_run_args(args)?;
-    if a.backend != "mujoco-cpu" {
-        return Err(CliError::Usage(format!(
-            "unknown --backend '{}': only mujoco-cpu is supported\n\n{RUN_HELP}",
-            a.backend
-        )));
-    }
+    let kind = parse_backend(&a.backend, RUN_HELP)?;
     if a.runtime != "torch" {
         return Err(CliError::Usage(format!(
             "unknown --runtime '{}': only torch is supported\n\n{RUN_HELP}",
@@ -773,8 +818,18 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
         )));
     }
 
-    if let Err(reason) = MuJoCoCpuBackend::is_available() {
-        println!("SKIPPED (mujoco-cpu backend unavailable: {reason})");
+    // Any backend but the reference is gated on its mapping report before an interpreter is
+    // probed (spec 14.4), so a refusal names the rows even where the engine is not installed.
+    // `mujoco-cpu` keeps today's order: availability first, the scene after.
+    let early_scene = if kind == BackendKind::MuJoCoCpu {
+        None
+    } else {
+        let scene = super::backend::load_scene(&a.scene)?;
+        mapping_gate(kind, &scene)?;
+        Some(scene)
+    };
+    if let Err(reason) = es_physics_backend::is_available(kind) {
+        println!("SKIPPED ({kind} backend unavailable: {reason})");
         return Ok(3);
     }
     // `--expert` drives every tick itself, so the bundle's weights are never loaded and the
@@ -792,7 +847,20 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
         )));
     }
 
-    let scene = super::backend::load_scene(&a.scene)?;
+    let scene = match early_scene {
+        Some(scene) => scene,
+        None => super::backend::load_scene(&a.scene)?,
+    };
+    // The backend opened once on this scene, for the engine version its load reply names and
+    // the `hardware_capability` slot that follows from it (spec 28.14 rule 2). A worker's
+    // cells carry no hash, so only the process that merges asks.
+    let identity = match a.shard {
+        Some(_) => None,
+        None => Some(
+            es_physics_backend::identify(kind, &scene)
+                .map_err(|e| CliError::Runtime(format!("--backend {kind}: {e}")))?,
+        ),
+    };
 
     // More workers than units would start interpreters that own nothing; the partition N has
     // to be the one the workers are actually told, so it is clamped before either is decided.
@@ -855,6 +923,8 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
         // control ticks with `es_env::latency_ticks` -- the one latency model, the same one
         // `es loop collect` drives `AsyncInference` with.
         expected_latency_ms: bundle.learning.policy.contract.runtime.expected_latency_ms,
+        // All zeros on mujoco-cpu, as before; the backend's identity everywhere else.
+        hardware: es_ir::HardwareCapability(identity.as_ref().map_or([0; 32], |i| i.hardware)),
         ..RunConfig::default()
     };
     let nj = bundle.deployment.robot.n_joints;
@@ -872,19 +942,21 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
             }
         };
         let sink: Option<&mut RunSink<'_>> = if publishing { Some(&mut publish) } else { None };
-        vec![dispatch_nj_h!(
-            nj,
-            h,
-            &bundle,
-            &eval_ir,
-            &scene,
-            policy,
-            &cfg,
-            a.frames.as_deref(),
-            a.shard.unwrap_or((0, 1)),
-            sink,
-            a.expert.is_some().then_some(&seen)
-        )?]
+        let seen = a.expert.is_some().then_some(&seen);
+        let shard = a.shard.unwrap_or((0, 1));
+        let frames = a.frames.as_deref();
+        // One dispatch on the backend, monomorphized: `Env<B>` stays generic (spec 3.4).
+        vec![match kind {
+            BackendKind::MuJoCoCpu => dispatch_nj_h!(
+                MuJoCoCpuBackend; nj, h, &bundle, &eval_ir, &scene, policy, &cfg, frames, shard,
+                sink, seen
+            ),
+            BackendKind::MjWarp => dispatch_nj_h!(
+                MjWarpBackend; nj, h, &bundle, &eval_ir, &scene, policy, &cfg, frames, shard,
+                sink, seen
+            ),
+            BackendKind::Newton | BackendKind::PhysX => Err(no_closed_loop(kind)),
+        }?]
     };
 
     // Worker mode stops here: the cells go to the parent and nothing else is written. A
@@ -916,6 +988,8 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
     // In plain text beside the `execution_hash` that covers it (spec 5.3, packet M10/W0a).
     // `None` under `--expert`: the torch runtime was never loaded and nothing has a pool.
     lock.runtime_threads = torch.threads();
+    // Beside the `backend` block it names (packet M11/X1).
+    lock.backend.engine_version = identity.map(|i| i.engine_version);
 
     std::fs::create_dir_all(&a.out)
         .map_err(|e| CliError::Runtime(format!("{}: {e}", a.out.display())))?;

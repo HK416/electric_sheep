@@ -315,6 +315,12 @@ pub struct BackendCaps {
     pub supports_reset_subset: bool,
     pub supports_state_get_set: bool,
     pub quirks: Vec<String>,
+    /// The engine the backend's load reply named (packet M11/X1), in plain text beside the
+    /// `execution_hash` whose `hardware_capability` slot covers it on every backend but
+    /// `mujoco-cpu`. Filled in by the caller that opened the backend -- `PhysicsBackend` has
+    /// no such accessor (INV-17) -- and absent from the bytes when it did not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_version: Option<String>,
 }
 
 /// `evaluation.lock` (§10.5): the conditions, in hex, next to the seeds that produced them.
@@ -840,6 +846,7 @@ impl Evaluation {
                     supports_reset_subset: false,
                     supports_state_get_set: false,
                     quirks: Vec::new(),
+                    engine_version: None,
                 }),
             created: cfg.created,
             runtime_threads: None,
@@ -898,6 +905,7 @@ fn backend_caps<B: PhysicsBackend>(env: &Env<B>) -> BackendCaps {
         supports_reset_subset: c.supports_reset_subset,
         supports_state_get_set: c.supports_state_get_set,
         quirks: c.quirks.iter().map(|q| q.description.clone()).collect(),
+        engine_version: None,
     }
 }
 

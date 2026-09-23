@@ -16,6 +16,7 @@ Usage:
                  [--schedule constant|warmup_cosine] [--warmup-steps N] [--lr-min F]
                  [--checkpoint-at 0 | 0,50,200] [--loss-curve curve.json]
                  [--progress-every N] [--estimator sampled|executed]
+                 [--backend mujoco-cpu|mjwarp]
 
 Prints one JSON line on stdout and nothing else -- the same contract `es train` reads for
 `train_act.py`: `torch` goes into spec 19.3's `hardware.json` and `optimizer` is compared
@@ -173,8 +174,9 @@ def gae(rewards, values, dones, last_value, gamma: float, lam: float):
 # --- the rollout ----------------------------------------------------------------------------
 
 
-def open_rollout(docs: Path, seed: int, n_envs: int):
-    """`es_native.Rollout` from the four files `es train` wrote under `--rollout-docs`."""
+def open_rollout(docs: Path, seed: int, n_envs: int, backend: str = "mujoco-cpu"):
+    """`es_native.Rollout` from the four files `es train` wrote under `--rollout-docs`, on
+    `backend` (packet M11/X1)."""
     read = lambda name: (docs / name).read_text(encoding="utf-8")  # noqa: E731
     try:
         return es_native.Rollout(
@@ -184,6 +186,7 @@ def open_rollout(docs: Path, seed: int, n_envs: int):
             read("scene.xml"),
             seed,
             n_envs,
+            backend=backend,
         )
     except FileNotFoundError as exc:
         raise SystemExit(
@@ -265,6 +268,15 @@ def main(argv: list) -> int:
         "default) or what the Safety Plane executed (packet M9/R5)",
     )
     p.add_argument(
+        "--backend",
+        choices=["mujoco-cpu", "mjwarp"],
+        default="mujoco-cpu",
+        help="the physics backend es_native.Rollout steps (packet M11/X1): mujoco-cpu, the "
+        "reference and the only bitwise one (the default), or mjwarp, MuJoCo Warp on the GPU "
+        "(tier 2). newton is refused by its mapping report (no actuators in its adapter) and "
+        "physx is not implemented (M11/I1); `[rl] backend` in the recipe sets this",
+    )
+    p.add_argument(
         "--progress-every",
         type=int,
         default=0,
@@ -300,7 +312,7 @@ def main(argv: list) -> int:
         load_init_weights(actor, read_safetensors(a.init_weights)) if a.init_weights else []
     )
 
-    roll = open_rollout(a.rollout_docs, a.seed, a.envs)
+    roll = open_rollout(a.rollout_docs, a.seed, a.envs, a.backend)
     model = roll.model()
     if int(model["nu"]) != action_dim:
         raise SystemExit(

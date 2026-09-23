@@ -106,6 +106,8 @@ pub struct MjWarpBackend {
     /// `[nominal, applied]` of every parameter `set_params` wrote, the applied value read
     /// back out of the world's `f32` model array.
     applied: BTreeMap<AppliedKey, [f64; 2]>,
+    /// The load reply's engine version (packet M11/X1); `None` until loaded.
+    engine_version: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -134,6 +136,7 @@ impl MjWarpBackend {
             state: StateBuffers::default(),
             params: BTreeMap::new(),
             applied: BTreeMap::new(),
+            engine_version: None,
         }
     }
 
@@ -141,6 +144,11 @@ impl MjWarpBackend {
     /// wrote since the last load, as read back out of that world's model arrays.
     pub fn applied_params(&self) -> &BTreeMap<AppliedKey, [f64; 2]> {
         &self.applied
+    }
+
+    /// The engine the loaded process runs, as its load reply named it (packet M11/X1).
+    pub fn engine_version(&self) -> Option<&str> {
+        self.engine_version.as_deref()
     }
 
     /// Whether a Python interpreter with `mujoco_warp` and `warp` is available. `Err` explains
@@ -238,6 +246,7 @@ impl PhysicsBackend for MjWarpBackend {
 
         let info = model_info(&reply, scene, "MuJoCo Warp", cfg.n_envs, rate)?;
 
+        self.engine_version = Some(reply.checked_engine_version()?.to_owned());
         self.process = Some(process);
         self.params = param_index(scene, &info);
         self.applied.clear();
@@ -525,7 +534,8 @@ mod tests {
         let reply: LoadReply = parse_response(
             r#"{"ok":true,"nq":1,"nv":1,"nu":1,"nsensordata":0,"nbody":2,
                 "joints":[{"name":"hinge","qpos":[0,1],"dof":[0,1]}],
-                "actuators":["m"],"sensors":[],"bodies":["world","rod"]}"#,
+                "actuators":["m"],"sensors":[],"bodies":["world","rod"],
+                "engine_version":"mujoco_warp 3.3.2"}"#,
         )
         .unwrap();
         assert_eq!((reply.nq, reply.nbody), (1, 2));
