@@ -19,9 +19,14 @@ bitwise on the CPU backend; the reach task trains from scratch to 0.42 (three se
 continuation cannot move it (saturated tanh, zero gradient). **M9 plan T** (spec §28.12, `docs/packets/M9/`) closed 2026-09-22: `es-ir` split under the line target; `ActionSpace::JointDelta` with one
 `es-env` integrator and the plane untouched; a brax increment policy imported bitwise; measured, the increment space clamps as much as the
 absolute one (on the position envelope instead of the rate bounds) and learns less (0.10 vs 0.42 at 4,000 iterations), so §13.4's default stays
-`JointPosition`. The next campaign waits on the human decisions in `docs/reviews/M9.md` (the envelope's meaning for a learning policy, the
-buffered-path watchdog for delta policies) and `docs/reviews/M8.md` (the worker thread pool in `execution_hash`, `scene_hash` across
-platforms, where the next source policy is trained), and the older ones in `docs/reviews/M7.md` (the stop rule's reading, the SSIM threshold). M6 (quadruped, `docs/design/quadruped-track.md`) is parked pending the owner's decision. GPU paths (es-gpu, es-render, Observation
+`JointPosition`. **M10 plan W** (spec §28.13, `docs/packets/M10/`) closed 2026-09-23: the torch thread count is in `runtime_hash`;
+`scene_hash` no longer uses the host libm (Windows was the platform that moved; every server number stood, re-measured bitwise);
+`render.seed = "tick"` makes the PT observation path learnable (U5 held-out 0.25 vs U4 0.0 on the same data); the executed-action
+estimator (P-M9-R5) scores 0.00, so `sampled` stays; STL/OBJ mesh geoms load, hash by content, simulate on MuJoCo (upstream SO-101) and
+render at 0 ULP; `es-import` and `es-tools` splits. The next campaign waits on the human decisions in `docs/reviews/M10.md` (the RL lever
+after B, the cycle recipe's step count against today's longer demonstrations, two training seeds for demo rows, the next source policy),
+`docs/reviews/M9.md` (the buffered-path watchdog for delta policies) and the older ones in `docs/reviews/M7.md` (the stop rule's reading,
+the SSIM threshold). M6 (quadruped, `docs/design/quadruped-track.md`) is parked pending the owner's decision. GPU paths (es-gpu, es-render, Observation
 IR GPU lowering, MJWarp/Newton adapters) were verified on an RTX 4060 with the Vulkan SDK;
 the Python oracles (MuJoCo, PyTorch, LeRobot ACT checkpoint, diffusers) run from the project
 venv `.venv` (set `ES_PYTHON` to its interpreter). Still open: M3 W1 real-robot

@@ -3154,6 +3154,20 @@ follow-up W2a names. The next source policy on a matching scene (MuJoCo Playgrou
 campaign; W2a is its prerequisite, not its measurement. The buffered-path watchdog (M9 S-1), the `hardware_capability` slot
 (L24) and M6 stay where they were.
 
+**M10 result (2026-09-23, `docs/reviews/M10.md`).** Every row of the ladder closed. W0a: the policy runtime's intra-op thread count is
+in `runtime_hash` (`--jobs 1` ≠ `--jobs 8` == `OMP_NUM_THREADS=2 --jobs 1` bitwise, `evaluation.lock` prints `runtime_threads`). W0b: the
+asset path's trigonometry goes through `es_math::approx`; the platform that had been off was Windows, so every server number of plans
+V–T already stood under today's hash — the 200-episode collect byte-identical, reach A0 bit-identical on three seeds, M7/U's report
+reproduced; CUDA ACT training is not bitwise (8 ULP at step 5) and that deviation is named. W1a: `render.seed = "tick"`, collector and
+evaluator bit-identical at the same `(episode, tick)`; row **U5** held-out **0.25**, training seeds **0.50**, against U4's 0.0 / 0.06 and the
+rasterized U3″'s 0.0 / 0.13 on the same 103,881-frame collect — the pose-fixed grain was learnable, a moving one is not. P-M9-R5: the
+executed-action estimator scores **0.00** on three seeds at 4,000 and 10,000 (A0 0.417); `sampled` stays the default. W2a / W2b: STL / OBJ
+meshes load, hash by content, simulate on MuJoCo identically on Windows and Linux (upstream SO-101, 362,996 triangles, every body mass
+equal to a direct upstream load) and render through one tessellator at 0 ULP on two GPUs; the primitives-only scenes' `scene_hash`
+unmoved. W3a / W3b: `es-data` 4,248 and `es` 5,361 lines. `es-safety` untouched. Open for the owner (M10 review): the RL lever after B
+(a wider margin, increments over the measured joint, or a clamp-aware estimator), the cycle recipe's step count against today's longer
+demonstrations, and two training seeds as the floor for demo rows.
+
 ---
 
 ## 29. Risks
