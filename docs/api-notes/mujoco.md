@@ -118,6 +118,12 @@ weighs 4.47e-8 more than the identical primitive box (measured 1.000000044703484
 mesh-against-primitive mass comparison is asking for `f64` vertices, which neither STL nor
 `MeshData` carries.
 
+**Both platforms, the same bits (2026-09-23).** The four `mesh_box` oracles, `mesh_load`, and the
+`--ignored` `so101_provenance`, `panda_provenance` and `menagerie_meshes` ran on the oracle server
+(Linux x86-64, MuJoCo 3.13 from `~/venvs/es-lerobot-cuda`) as well: all green, and every printed
+number — both masses, all six inertias, both resting heights (`0.0498922453248334` /
+`0.04989224457977534`) — is identical to the Windows run digit for digit.
+
 ### MuJoCo Menagerie
 
 No single repository licence: the root `LICENSE` concatenates one block per robot, and GitHub

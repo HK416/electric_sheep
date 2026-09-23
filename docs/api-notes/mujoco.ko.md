@@ -124,6 +124,12 @@ slide` (1 / 1), `3 = hinge` (1 / 1). 스크립트는 주소 차이로부터 너�
 비교에서 ~1e-7보다 빡빡한 허용오차는 `f64` 정점을 요구하는 것인데, STL도
 `MeshData`도 그것을 담지 않는다.
 
+**두 플랫폼, 같은 비트 (2026-09-23).** `mesh_box` 오라클 네 개, `mesh_load`, 그리고 `--ignored`인
+`so101_provenance`, `panda_provenance`, `menagerie_meshes`를 오라클 서버(Linux x86-64,
+`~/venvs/es-lerobot-cuda`의 MuJoCo 3.13)에서도 돌렸다: 모두 통과했고, 출력된 모든 수 — 두 질량, 관성
+여섯 개, 두 정지 높이(`0.0498922453248334` / `0.04989224457977534`) — 가 Windows 실행과 자릿수까지
+동일하다.
+
 ### MuJoCo Menagerie
 
 저장소 전체 라이선스는 없다. 루트 `LICENSE`가 로봇마다 한 블록씩 이어 붙인 것이고
