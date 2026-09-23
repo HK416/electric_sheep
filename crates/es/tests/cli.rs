@@ -1222,13 +1222,13 @@ fn eval_run_skips_when_backend_or_runtime_unavailable() {
 // --- packet M11/X1: `--backend` on `es eval run` and `es loop collect` ------------------------
 
 /// One `es eval run` or `es loop collect` of the demo documents on `backend`, with `python` as
-/// `ES_PYTHON` (`None` leaves the caller's).
+/// `ES_PYTHON` and `ES_ISAAC_PYTHON` (`None` leaves the caller's).
 fn run_on_backend(verb: &str, backend: &str, python: Option<&str>) -> Output {
     let dir = scratch_dir(&format!("backend-{verb}-{backend}"));
     let policy = write_demo_bundle(&dir);
     let mut cmd = bin();
     if let Some(p) = python {
-        cmd.env("ES_PYTHON", p);
+        cmd.env("ES_PYTHON", p).env("ES_ISAAC_PYTHON", p);
     }
     match verb {
         "eval" => cmd
@@ -1287,14 +1287,27 @@ fn eval_run_backend_newton_is_refused_by_its_mapping_report() {
     }
 }
 
-/// `PhysX` is a known name with no adapter yet: it names the packet that brings it.
+/// Packet M11/I1: `PhysX` maps the demo scene (every importer gap is a warning row, none
+/// blocks), so without an Isaac Sim interpreter the run is the documented SKIPPED exit 3,
+/// never a faked run and never "not implemented".
 #[test]
-fn eval_run_backend_physx_names_i1() {
+fn eval_run_backend_physx_skips_without_isaac_sim() {
     for verb in BACKEND_VERBS {
         let out = run_on_backend(verb, "physx", Some("es-no-such-python"));
-        let err = stderr_of(&out);
-        assert_eq!(out.status.code(), Some(1), "{verb}: {err}");
-        assert!(err.contains("not implemented (M11/I1)"), "{verb}: {err}");
+        let text = stdout(&out);
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "{verb}:
+{text}
+{}",
+            stderr_of(&out)
+        );
+        assert!(
+            text.contains("SKIPPED (physx backend unavailable"),
+            "{verb}: {text}"
+        );
+        assert!(!text.contains("not implemented"), "{verb}: {text}");
     }
 }
 
