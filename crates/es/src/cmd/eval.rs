@@ -501,7 +501,7 @@ fn run_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
     #[cfg_attr(not(feature = "render"), allow(unused_mut))] mut sink: Option<&mut RunSink<'_>>,
     seen: Option<&super::r#loop::SeenState>,
 ) -> Result<es_eval::Shard, CliError> {
-    let mut run = |frames: Option<&mut es_eval::runner::FrameSource<'_>>,
+    let mut run = |frames: Option<&mut es_eval::runner::DrawnFrameSource<'_>>,
                    sink: Option<&mut RunSink<'_>>| {
         Evaluation::run_shard_with_sink::<B, _, NJ, H>(
             eval_ir,
@@ -529,7 +529,7 @@ fn run_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
             .map_err(|e| CliError::Runtime(format!("no Vulkan device for --frames: {e}")))?;
         let mut rig = LightRig::new(&gpu, scene.clone(), rcfg);
         let mut source =
-            |light: &es_eval::LightOverride,
+            |drawn: &es_env::randomize::RenderOverrides,
              model: &es_physics_core::backend::ModelInfo,
              state: &es_physics_core::backend::StateView<'_>| {
                 // `--expert`: the raw `qpos ‖ qvel` row on its way past, because the runner
@@ -538,7 +538,7 @@ fn run_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
                 if let Some(seen) = seen {
                     seen.capture(model, state);
                 }
-                rig.frame(light, model, state)
+                rig.frame(drawn, model, state)
             };
         return run(Some(&mut source), sink.as_deref_mut());
     }
@@ -600,6 +600,8 @@ struct LightRig<'gpu> {
     /// episode's tick 0 — the `Tick` seed stream's clock (packet M10/W1a).
     base_seed: u32,
     episode_frame: u32,
+    /// The renderer of a task with render targets, built on the first drawn frame.
+    drawn: Option<es_env::EnvRenderer<'gpu>>,
 }
 
 #[cfg(feature = "render")]
@@ -616,15 +618,41 @@ impl<'gpu> LightRig<'gpu> {
             cfg,
             lit: None,
             episode_frame: 0,
+            drawn: None,
         }
     }
 
     fn frame(
         &mut self,
-        light: &es_eval::LightOverride,
+        drawn: &es_env::randomize::RenderOverrides,
         model: &es_physics_core::backend::ModelInfo,
         state: &es_physics_core::backend::StateView<'_>,
     ) -> Result<Vec<u8>, String> {
+        let light = &drawn.light;
+        // A task with render targets (packet M11/R2): the episode's draws through
+        // `EnvRenderer::frame_with`, the call `es loop collect --frames` and `Rollout` make, so
+        // the three render one frame at one `(seed, episode, tick)`. A task without them draws
+        // nothing but the suite's light and keeps the path below, byte for byte.
+        let undrawn = es_env::randomize::RenderOverrides {
+            light: *light,
+            ..Default::default()
+        };
+        if *drawn != undrawn {
+            let renderer = match &mut self.drawn {
+                Some(r) => r,
+                None => self.drawn.insert(
+                    es_env::EnvRenderer::new(self.gpu, &self.scene, self.cfg.clone())
+                        .map_err(|e| e.to_string())?,
+                ),
+            };
+            if state.tick.0 == 0 {
+                renderer.begin_episode();
+            }
+            return renderer
+                .frame_with(model, state, 0, drawn)
+                .map(|tile| tile.to_bytes())
+                .map_err(|e| e.to_string());
+        }
         if self.lit.as_ref().is_none_or(|(l, _, _)| l != light) {
             let scene = light.scene(&self.scene);
             let mut rc = es_env::render::render_config(&self.cfg);
