@@ -829,6 +829,27 @@ pub enum ObsSource {
     },
     BodyPose(StableId),
     Language,
+    /// The action row the policy emitted for the previous control tick -- before the Safety
+    /// Plane, in actuator units, in actuator order -- and `initial` (absent = zeros) on the
+    /// first tick of an episode (packet M11/X2). Isaac Lab's `last_action` and Playground's
+    /// `last_act` are this row with the action tail folded out; the importer folds it.
+    ///
+    /// **The last variant, and it must stay last**: nothing hashes a variant's index, but a
+    /// variant inserted above another would reorder every `Debug`-derived listing, and the
+    /// rule for an addition is that it leaves every committed document byte-identical.
+    PreviousAction {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial: Option<Vec<f64>>,
+    },
+}
+
+impl ObsSource {
+    /// The id a [`ObsSource::PreviousAction`] channel is keyed by: the `StateInput.source`
+    /// `XIR-002` matches it against and the name of its observation-plan input buffer. One
+    /// per task: there is one previous action.
+    pub fn previous_action_id() -> StableId {
+        StableId::from_path("es.previous_action")
+    }
 }
 
 fn joint_position() -> JointQuantity {
@@ -874,6 +895,14 @@ impl ObsSource {
                 wid(w, id);
             }
             Self::Language => w.str("Language"),
+            Self::PreviousAction { initial } => {
+                w.str("PreviousAction");
+                let initial = initial.as_deref().unwrap_or_default();
+                w.seq(initial.len());
+                for v in initial {
+                    w.f64(*v);
+                }
+            }
         }
     }
 }

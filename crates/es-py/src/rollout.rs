@@ -31,7 +31,7 @@ use es_compile::{CpuPlan, PlanMode, Tensor, TensorRef};
 use es_core::{PhysTick, TickRate};
 use es_env::scheduler::BatchDomains;
 use es_env::{Env, EnvMetrics};
-use es_eval::runner::{capture, input_sources, joint_state, Capture};
+use es_eval::runner::{capture_at, input_sources, joint_state, previous_action_initial, Capture};
 use es_eval::LightOverride;
 use es_ir::deployment::{ActionSpace, ExecutionMode, Micros};
 use es_ir::types::ElemType;
@@ -124,6 +124,11 @@ pub struct Rollout<const NJ: usize, const H: usize> {
     seq: u64,
     /// Scratch, allocated once: the post-plane command handed to `Env::step`.
     ctrl: Vec<f64>,
+    /// A `PreviousAction` channel's value per env (packet M11/X2): the row last handed to
+    /// [`Rollout::act`], before the plane, and `initial` after a reset. Empty when the task
+    /// declares no such channel.
+    previous: Vec<Vec<f64>>,
+    initial: Vec<f64>,
 }
 
 impl<const NJ: usize, const H: usize> std::fmt::Debug for Rollout<NJ, H> {
@@ -189,6 +194,14 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
                 })?);
         }
         let sources = input_sources(&plans[0], &obs, &task, Some(env.model()))?;
+        let initial = previous_action_initial(&task).unwrap_or_default();
+        if !initial.is_empty() && initial.len() != NJ {
+            return Err(RolloutError::Shape {
+                what: "PreviousAction channel",
+                expected: NJ,
+                got: initial.len(),
+            });
+        }
         let mut planes = Vec::with_capacity(n_envs as usize);
         for _ in 0..n_envs {
             planes.push(
@@ -209,6 +222,8 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
             step: 0,
             seq: 0,
             ctrl: vec![0.0; n_envs as usize * nu],
+            previous: vec![initial.clone(); n_envs as usize],
+            initial,
         })
     }
 
@@ -241,7 +256,7 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
         let state = self.env.backend().state();
         for i in 0..self.n_envs {
             let view = env_view(&state, i);
-            let (names, bytes, _) = capture(
+            let (names, bytes, _) = capture_at(
                 &self.plans[i],
                 &self.sources,
                 model,
@@ -249,6 +264,7 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
                 None,
                 &light,
                 None,
+                &self.previous[i],
             )?;
             let inputs: BTreeMap<String, TensorRef<'_>> = names
                 .iter()
@@ -323,6 +339,13 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
         }
         let out = self.env.step(&self.ctrl)?;
         self.step += 1;
+        // The sampled rows, before the plane: what the next `observe` reads as the previous
+        // action. Set before the resets below, which put `initial` back.
+        if !self.initial.is_empty() {
+            for (i, prev) in self.previous.iter_mut().enumerate() {
+                prev.copy_from_slice(&actions[i * NJ..(i + 1) * NJ]);
+            }
+        }
         // `Env::step` already reset every env it closed an episode on; the plane and the plan
         // it left behind are what still hold the old episode (packet P-M7-R1).
         for i in 0..self.n_envs {
@@ -399,6 +422,7 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
     fn begin_episode(&mut self, env: usize) {
         self.planes[env].begin_episode();
         self.plans[env].reset();
+        self.previous[env].clone_from(&self.initial);
     }
 }
 

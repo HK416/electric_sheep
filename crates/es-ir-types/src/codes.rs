@@ -37,6 +37,11 @@ pub const IMP_002: &str = "IMP-002";
 pub const IMP_003: &str = "IMP-003";
 pub const IMP_004: &str = "IMP-004";
 pub const IMP_005: &str = "IMP-005";
+/// Adapter v2 (packet M11/X2, spec 28.14 rule 3).
+pub const IMP_006: &str = "IMP-006";
+pub const IMP_007: &str = "IMP-007";
+pub const IMP_008: &str = "IMP-008";
+pub const IMP_009: &str = "IMP-009";
 
 // --- Task (spec 7.4) ----------------------------------------------------------------------
 pub const TASK_001: &str = "TASK-001";
@@ -207,6 +212,10 @@ pub const CODES: &[CodeEntry] = &[
     e(IMP_003, Error, "adapter joint units are not radians", "14.4"),
     e(IMP_004, Error, "adapter action kind disagrees with the Task IR ActionSpec space", "14.4"),
     e(IMP_005, Error, "observation channels do not tile the source observation exactly or name an undeclared channel", "14.4"),
+    e(IMP_006, Error, "the source's policy period disagrees with the Deployment IR control period", "28.14"),
+    e(IMP_007, Error, "an observation term the IR cannot compute", "28.14"),
+    e(IMP_008, Error, "adapter joint order is ambiguous", "28.14"),
+    e(IMP_009, Error, "a clip the IR has no node to express", "28.14"),
     e(LRN_001, Error, "schema version disagrees with the graph", "8.2"),
     e(LRN_002, Error, "wrong number of input ports for this node kind", "8.3"),
     e(LRN_010, Error, "graph boundary does not match the declared tensor ports", "8.2"),
@@ -314,6 +323,10 @@ mod tests {
             IMP_003,
             IMP_004,
             IMP_005,
+            IMP_006,
+            IMP_007,
+            IMP_008,
+            IMP_009,
             TASK_001,
             TASK_002,
             CTRL_001,

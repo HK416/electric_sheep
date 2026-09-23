@@ -25,11 +25,21 @@
 //! **Nothing is guessed** (rule 3). Joint order, units, action kind and the observation layout
 //! come from the adapter or they do not come, and a mismatch is one of five named refusals,
 //! `IMP-001` .. `IMP-005`.
+//!
+//! **Adapter v2** (packet M11/X2, spec 28.14 rule 3) declares an Isaac Lab or Playground
+//! policy's I/O conventions -- joint names in the source's order, the rest pose, per-term
+//! offset/scale, history, the previous action, the action offset and clip, the policy period and
+//! the actuator model -- and compiles each into the bundle where the algebra is exact
+//! (`fold_channels`, and `remap`'s column gather and row permutation), or refuses it by name
+//! (`IMP-006` .. `IMP-009`). Every v2 field is optional; absent, the conversion is v1's, byte
+//! for byte. `docs/design/rl-continuation.md` section 8a is the table.
 
 use std::collections::BTreeMap;
 
 use es_core::StableId;
-use es_ir::codes::{IMP_001, IMP_002, IMP_003, IMP_004, IMP_005};
+use es_ir::codes::{
+    IMP_001, IMP_002, IMP_003, IMP_004, IMP_005, IMP_006, IMP_007, IMP_008, IMP_009,
+};
 use es_ir::deployment::{ActionSpace as DeployedSpace, DeploymentIr, ExecutionMode};
 use es_ir::graph::{Graph, NodeId, Port, PortRef};
 use es_ir::learning::{
@@ -98,6 +108,18 @@ pub struct ImportManifest {
     pub joint_order: Option<Vec<String>>,
     #[serde(default)]
     pub synthetic: Option<String>,
+    /// The source's rest pose, in its own joint order, when `import_rl.py` was handed the
+    /// source config (`--isaac-env-cfg` / `--playground-config`, packet M11/X2). Read by an
+    /// adapter's `use_default_offset` and `offset = "default_pos"` when the adapter itself
+    /// does not state the pose.
+    #[serde(default)]
+    pub default_joint_pos: Option<Vec<f64>>,
+    /// `decimation` physics steps of `sim_dt` seconds per policy step, from the same config:
+    /// checked against the Deployment IR's control period (`IMP-006`).
+    #[serde(default)]
+    pub decimation: Option<u32>,
+    #[serde(default)]
+    pub sim_dt: Option<f64>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, serde_json::Value>,
 }
@@ -120,6 +142,12 @@ pub struct Adapter {
     pub joints: JointBlock,
     pub action: ActionBlock,
     pub observation: ObservationBlock,
+    /// v2 (packet M11/X2): the source's policy period, checked, never converted (`IMP-006`).
+    #[serde(default)]
+    pub timing: Option<TimingBlock>,
+    /// v2: the source's actuator model, compared to the scene's and reported, never converted.
+    #[serde(default)]
+    pub actuators: Option<ActuatorBlock>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -131,10 +159,25 @@ pub struct RobotBlock {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JointBlock {
-    /// The framework's own action order, by our actuator names.
+    /// v1: the framework's own action order, by our actuator names. Recorded, not permuted.
+    /// Empty when absent; exactly one of this and `source_names` is declared (`IMP-008`).
+    #[serde(default)]
     pub source_order: Vec<String>,
+    /// v2: the **source's** joint names in its articulation order -- what Isaac Lab's
+    /// `resolve_matching_names` returns (`isaac-lab.md` section 2) -- resolved by name against
+    /// our actuators, through `rename` where the two disagree. Every per-joint vector in the
+    /// adapter and the manifest is in this order; the importer permutes the first Dense's
+    /// input columns and the head's rows into ours, which is exact.
+    #[serde(default)]
+    pub source_names: Option<Vec<String>>,
+    /// `[joints.rename]`: source name -> our actuator name.
+    #[serde(default)]
+    pub rename: BTreeMap<String, String>,
     /// `"rad"` or `"deg"`. `"deg"` is refused (`IMP-003`), never converted.
     pub units: String,
+    /// v2: the source's rest pose, radians, source order (Isaac's `default_joint_pos`).
+    #[serde(default)]
+    pub default_pos: Option<Vec<f64>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -146,6 +189,37 @@ pub struct ActionBlock {
     pub scale: Option<Vec<f64>>,
     #[serde(default)]
     pub offset: Option<Vec<f64>>,
+    /// v2: `offset = default_pos`, Isaac's `JointPositionActionCfg.use_default_offset`.
+    #[serde(default)]
+    pub use_default_offset: bool,
+    /// v2: the source clamps its raw action to `[lo, hi]`. Exact, and accepted, only where it
+    /// cannot bind -- under a `tanh` squash with `lo <= -1` and `hi >= 1`; the Learning IR has
+    /// no clamp node, so anything tighter is `IMP-009`.
+    #[serde(default)]
+    pub clip: Option<[f64; 2]>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TimingBlock {
+    /// Seconds per policy step in the source: Isaac's `decimation * sim.dt`, Playground's
+    /// `ctrl_dt`.
+    pub policy_dt: f64,
+}
+
+/// Per joint, source order. Reported next to the scene's own numbers; a disagreement is a
+/// warning row, because the physics of *our* scene is what the policy will meet.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ActuatorBlock {
+    #[serde(default)]
+    pub stiffness: Option<Vec<f64>>,
+    #[serde(default)]
+    pub damping: Option<Vec<f64>>,
+    #[serde(default)]
+    pub armature: Option<Vec<f64>>,
+    #[serde(default)]
+    pub effort_limit: Option<Vec<f64>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -157,13 +231,54 @@ pub struct ObservationBlock {
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ChannelMap {
-    /// Where the framework read this block from, e.g. `"qpos[0:6]"`. Recorded for a human,
-    /// never interpreted — the meaning comes from `channel`.
+    /// Where the framework read this block from, e.g. `"qpos[0:6]"`. Recorded for a human --
+    /// the meaning comes from `channel` -- and read for one thing only: a term the IR cannot
+    /// compute (`"mdp.projected_gravity"`, ...) is refused by its name (`IMP-007`).
     pub source: String,
     /// `[start, end)` in the source's flat observation vector.
     pub slice: [u32; 2],
     /// The Task IR `ObservationSpec` channel this block feeds.
     pub channel: String,
+    /// v2: the source computed `(x - offset) * scale` for this block. Folded into the
+    /// `Normalize{MeanStd}` (`mean += offset`, `std /= scale`), which is exact algebra.
+    #[serde(default)]
+    pub scale: Option<Scale>,
+    #[serde(default)]
+    pub offset: Option<Offset>,
+    /// v2: a per-term clip. The Observation IR has no clamp node, so it is `IMP-009`.
+    #[serde(default)]
+    pub clip: Option<[f64; 2]>,
+    /// v2: the block is the last `history` frames of the channel, flattened frame by frame:
+    /// a `TemporalWindowNode` of that many steps (`Align::Hold`, the first frame repeated
+    /// before the ring fills -- Isaac's `CircularBuffer` on reset).
+    #[serde(default)]
+    pub history: Option<u32>,
+    /// v2: the frame order inside the block. Absent = `newest_last`, Isaac's flattening.
+    #[serde(default)]
+    pub history_order: Option<HistoryOrder>,
+}
+
+/// A per-term scale: one number for the whole block or one per element (source order).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum Scale {
+    One(f64),
+    Each(Vec<f64>),
+}
+
+/// A per-term offset: `"default_pos"` (Isaac's `joint_pos_rel`) or one number per element.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum Offset {
+    Named(String),
+    Each(Vec<f64>),
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryOrder {
+    NewestLast,
+    NewestFirst,
 }
 
 impl Adapter {
@@ -201,6 +316,14 @@ pub enum ImportError {
     ManifestActionKind { adapter: String, manifest: String },
     #[error("{IMP_005}: {detail}")]
     Channels { detail: String },
+    #[error("{IMP_006}: {detail}")]
+    Timing { detail: String },
+    #[error("{IMP_007}: channel \"{channel}\" is the source term `{term}`, which the IR cannot compute on this robot (spec 28.14 rule 3: refused by name, never zero-filled). The locomotion terms -- projected_gravity, base_lin_vel, base_ang_vel, velocity_commands -- stay with the parked quadruped track, and a generated command is admitted only onto a channel the Task IR's ObservationSpec declares")]
+    Uncomputable { channel: String, term: String },
+    #[error("{IMP_008}: {detail}")]
+    JointOrder { detail: String },
+    #[error("{IMP_009}: {detail}")]
+    Clip { detail: String },
     #[error("import.json: {0}")]
     Manifest(String),
     #[error("adapter: {0}")]
@@ -268,6 +391,94 @@ pub struct MappingReport {
     pub joints: Vec<JointRow>,
     pub channels: Vec<ChannelRow>,
     pub warnings: Vec<String>,
+    /// v2: the policy period the import checked, when either the adapter or the manifest
+    /// stated one. Absent from a v1 report, whose bytes this packet does not move.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<String>,
+    /// v2: `[actuators]` next to the scene's own numbers, filled by [`actuator_rows`].
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub actuators: Vec<ActuatorRow>,
+}
+
+/// One `[actuators]` quantity of one joint: the source's number and our scene's.
+#[derive(Clone, Debug, Serialize)]
+pub struct ActuatorRow {
+    pub name: String,
+    pub quantity: String,
+    pub source: f64,
+    pub scene: Option<f64>,
+    pub severity: Severity,
+    pub note: String,
+}
+
+/// What our scene says about one actuator, read by the caller out of the MJCF (this crate
+/// opens no files): a position servo's `kp` / `kv`, the joint's armature, the force range.
+#[derive(Clone, Debug, Default)]
+pub struct SceneActuator {
+    pub name: String,
+    pub stiffness: Option<f64>,
+    pub damping: Option<f64>,
+    pub armature: Option<f64>,
+    pub effort_limit: Option<f64>,
+}
+
+/// `[actuators]` against the scene, one row per declared joint and quantity. Never
+/// converted: a source trained on a stiffer servo is a fact a human deploying it must see,
+/// and rescaling the policy to hide it would be the guess rule 3 forbids. The rows are in
+/// the source's joint order, named by our actuators.
+pub fn actuator_rows(adapter: &Adapter, scene: &[SceneActuator]) -> Vec<ActuatorRow> {
+    let Some(block) = &adapter.actuators else {
+        return Vec::new();
+    };
+    let names = adapter
+        .joints
+        .source_names
+        .clone()
+        .unwrap_or_else(|| adapter.joints.source_order.clone());
+    let mut rows = Vec::new();
+    for (quantity, values, read) in [
+        (
+            "stiffness",
+            &block.stiffness,
+            (|s: &SceneActuator| s.stiffness) as fn(&SceneActuator) -> Option<f64>,
+        ),
+        ("damping", &block.damping, |s| s.damping),
+        ("armature", &block.armature, |s| s.armature),
+        ("effort_limit", &block.effort_limit, |s| s.effort_limit),
+    ] {
+        for (source_name, value) in names.iter().zip(values.iter().flatten()) {
+            let ours = adapter
+                .joints
+                .rename
+                .get(source_name)
+                .unwrap_or(source_name);
+            let found = scene.iter().find(|s| &s.name == ours).and_then(read);
+            let same = found.is_some_and(|v| (v - value).abs() <= 1e-9 * v.abs().max(1.0));
+            rows.push(ActuatorRow {
+                name: ours.clone(),
+                quantity: quantity.to_owned(),
+                source: *value,
+                scene: found,
+                severity: if same {
+                    Severity::Ok
+                } else {
+                    Severity::Warning
+                },
+                note: match found {
+                    Some(v) if same => format!("{quantity} {value} in the source and {v} here"),
+                    Some(v) => format!(
+                        "{quantity} {value} in the source, {v} in this scene: the policy meets \
+                         a different actuator (reported, never converted)"
+                    ),
+                    None => format!(
+                        "{quantity} {value} in the source; this scene states none for \
+                         \"{ours}\""
+                    ),
+                },
+            });
+        }
+    }
+    rows
 }
 
 /// What [`convert`] produced.
@@ -312,16 +523,19 @@ pub fn convert(
         .ok_or_else(|| ImportError::Ir("the Task IR declares no ActionSpec node".to_owned()))?;
     let (space, task_dim) = action_spec;
 
-    // IMP-001 / IMP-002 / IMP-003 / IMP-004: the joint block.
+    // IMP-008 / IMP-001 / IMP-002 / IMP-003 / IMP-004: the joint block. `names` is our
+    // actuator name of each source joint, in the source's order; `perm[i]` is where source
+    // joint `i` sits in ours (v2 only -- a v1 `source_order` records and does not permute).
     let joints = &adapter.joints;
-    if joints.source_order.len() as u32 != task_dim || manifest.action_dim != task_dim {
+    let (names, perm) = resolve_joints(joints, actuators, &task.scene.path, task_dim)?;
+    if names.len() as u32 != task_dim || manifest.action_dim != task_dim {
         return Err(ImportError::JointCount {
-            adapter: joints.source_order.len(),
+            adapter: names.len(),
             manifest: manifest.action_dim,
             task: task_dim,
         });
     }
-    for name in &joints.source_order {
+    for name in &names {
         if !actuators.contains(name) {
             return Err(ImportError::UnknownJoint {
                 joint: name.clone(),
@@ -358,21 +572,41 @@ pub fn convert(
         }
     }
     if let Some(order) = &manifest.joint_order {
-        if order != &joints.source_order {
+        let declared = joints.source_names.as_ref().unwrap_or(&joints.source_order);
+        if order != declared {
             warnings.push(format!(
-                "the checkpoint recorded joint order {order:?}, the adapter declares {:?}; the \
-                 adapter wins (spec 13.4) -- check that this permutation is intended",
-                joints.source_order
+                "the checkpoint recorded joint order {order:?}, the adapter declares {declared:?}; \
+                 the adapter wins (spec 13.4) -- check that this permutation is intended"
             ));
         }
     }
+    let timing = check_timing(adapter, manifest, deployment)?;
 
-    // IMP-005: the channels must tile `obs_dim` exactly, in order, and each must be a channel
-    // the Task IR declares at the same width.
+    // IMP-007 / IMP-009 / IMP-005: the channels must tile `obs_dim` exactly, in order, and
+    // each must be a channel the Task IR declares at the same width (times its history).
     let mut cursor = 0u32;
     let mut channels = Vec::new();
     for map in &adapter.observation.channels {
         let [start, end] = map.slice;
+        let term = term_name(&map.source);
+        let declared_here = task.observation_spec.channels.contains_key(&map.channel);
+        if UNCOMPUTABLE.contains(&term) || (term == "generated_commands" && !declared_here) {
+            return Err(ImportError::Uncomputable {
+                channel: map.channel.clone(),
+                term: term.to_owned(),
+            });
+        }
+        if let Some([lo, hi]) = map.clip {
+            return Err(ImportError::Clip {
+                detail: format!(
+                    "channel \"{}\" declares clip = [{lo}, {hi}]. The Observation IR has no \
+                     clamp node (spec 7.3), and this packet adds none; a clip that never binds \
+                     on the states this policy meets can be left out of the adapter, and one \
+                     that binds is a function the IR cannot express",
+                    map.channel
+                ),
+            });
+        }
         if start != cursor || end <= start {
             return Err(ImportError::Channels {
                 detail: format!(
@@ -396,13 +630,19 @@ pub fn convert(
                 ),
             })?;
         let width: u64 = declared.ty.shape.dims().iter().product();
-        if width != u64::from(end - start) {
+        let history = map.history.unwrap_or(1);
+        if history == 0 || width * u64::from(history) != u64::from(end - start) {
             return Err(ImportError::Channels {
                 detail: format!(
                     "channel \"{}\" takes {} source values but the Task IR declares it {width} \
-                     wide",
+                     wide{}",
                     map.channel,
-                    end - start
+                    end - start,
+                    if history == 1 {
+                        String::new()
+                    } else {
+                        format!(" over a history of {history} frames")
+                    }
                 ),
             });
         }
@@ -467,16 +707,71 @@ pub fn convert(
         1.0,
         &mut warnings,
     )?;
-    let offset = pick(
-        "offset",
-        adapter.action.offset.as_ref(),
-        manifest.action_offset.as_ref(),
-        dim,
-        0.0,
-        &mut warnings,
-    )?;
+    // v2: the rest pose, source order -- stated by the adapter or the manifest, or not at all.
+    let default_pos = match (&joints.default_pos, &manifest.default_joint_pos) {
+        (None, None) => None,
+        (a, m) => Some(pick(
+            "default_pos",
+            a.as_ref(),
+            m.as_ref(),
+            dim,
+            0.0,
+            &mut warnings,
+        )?),
+    };
+    let offset = if adapter.action.use_default_offset {
+        if adapter.action.offset.is_some() {
+            return Err(ImportError::Adapter(
+                "[action] states both `offset` and `use_default_offset = true`; one declaration \
+                 of the offset, not two"
+                    .to_owned(),
+            ));
+        }
+        default_pos.clone().ok_or_else(|| {
+            ImportError::Adapter(
+                "[action] use_default_offset = true, but neither [joints] default_pos nor the \
+                 manifest's default_joint_pos states the pose, and the import does not guess \
+                 one (spec 13.4)"
+                    .to_owned(),
+            )
+        })?
+    } else {
+        pick(
+            "offset",
+            adapter.action.offset.as_ref(),
+            manifest.action_offset.as_ref(),
+            dim,
+            0.0,
+            &mut warnings,
+        )?
+    };
+    if let Some([lo, hi]) = adapter.action.clip {
+        if !(squash == Squash::Tanh && lo <= -1.0 && hi >= 1.0) {
+            return Err(ImportError::Clip {
+                detail: format!(
+                    "[action] clip = [{lo}, {hi}] under squash \"{}\". A clip is folded only \
+                     where it cannot bind -- a tanh output inside [-1, 1] -- because the \
+                     Learning IR has no clamp node (spec 8.3) and this packet adds none",
+                    manifest.squash
+                ),
+            });
+        }
+    }
 
-    let observation = observation_ir(manifest, task, &channels, &mut warnings)?;
+    let fold = fold_channels(
+        manifest,
+        &channels,
+        perm.as_deref(),
+        &scale,
+        &offset,
+        default_pos.as_deref(),
+    )?;
+    let observation = observation_ir(manifest, task, &channels, fold.stats, &mut warnings)?;
+    // The head and its unnormalizer in *our* actuator order: exact, a row permutation.
+    let (scale_ours, offset_ours) = match &perm {
+        Some(p) => (permuted(&scale, p), permuted(&offset, p)),
+        None => (scale.clone(), offset.clone()),
+    };
     let learning = learning_graph(
         manifest,
         deployment,
@@ -485,10 +780,16 @@ pub fn convert(
         out_dim,
         activation,
         squash,
-        &scale,
-        &offset,
+        &scale_ours,
+        &offset_ours,
     )?;
-    let weights = remap(&learning, manifest, weights)?;
+    let weights = remap(
+        &learning,
+        manifest,
+        weights,
+        fold.columns.as_deref(),
+        perm.as_deref(),
+    )?;
 
     let report = MappingReport {
         framework: manifest.framework.clone(),
@@ -510,8 +811,7 @@ pub fn convert(
         }),
         action_scale: scale.clone(),
         action_offset: offset.clone(),
-        joints: joints
-            .source_order
+        joints: names
             .iter()
             .enumerate()
             .map(|(i, name)| JointRow {
@@ -519,12 +819,23 @@ pub fn convert(
                 name: name.clone(),
                 unit: joint_unit(space).to_owned(),
                 severity: Severity::Ok,
-                note: format!(
-                    "action[{i}] -> actuator \"{name}\"; {} = {:.6} + {:.6} * a",
-                    joint_unit(space),
-                    offset[i],
-                    scale[i]
-                ),
+                note: match (&perm, &joints.source_names) {
+                    (Some(p), Some(src)) => format!(
+                        "action[{i}] (source joint \"{}\") -> actuator \"{name}\" (ours {}); \
+                         {} = {:.6} + {:.6} * a",
+                        src[i],
+                        p[i],
+                        joint_unit(space),
+                        offset[i],
+                        scale[i]
+                    ),
+                    _ => format!(
+                        "action[{i}] -> actuator \"{name}\"; {} = {:.6} + {:.6} * a",
+                        joint_unit(space),
+                        offset[i],
+                        scale[i]
+                    ),
+                },
             })
             .collect(),
         channels: channels
@@ -565,15 +876,18 @@ pub fn convert(
                         )
                     } else {
                         format!(
-                            "{} -> ObsSource {}",
+                            "{} -> ObsSource {}{}",
                             map.source,
-                            source_name(&declared.source)
+                            source_name(&declared.source),
+                            fold_note(map, &declared.source)
                         )
                     },
                 }
             })
             .collect(),
         warnings,
+        timing,
+        actuators: Vec::new(),
     };
     Ok(RlImport {
         observation,
@@ -620,6 +934,344 @@ fn pick(
     Ok(chosen)
 }
 
+// --- adapter v2 (packet M11/X2) --------------------------------------------------------------
+
+/// Source terms the IR cannot compute on this robot (spec 28.14 "not on the ladder").
+const UNCOMPUTABLE: [&str; 4] = [
+    "projected_gravity",
+    "base_lin_vel",
+    "base_ang_vel",
+    "velocity_commands",
+];
+
+/// The term a channel's free-text `source` names: `"mdp.projected_gravity"` and
+/// `"projected_gravity(robot)"` are both `projected_gravity`. A v1 `source` such as
+/// `"qpos[0:6]"` reads as `qpos`, which names nothing refused.
+fn term_name(source: &str) -> &str {
+    let s = source.trim();
+    let s = s.strip_prefix("mdp.").unwrap_or(s);
+    s.split(['(', '[', ' ']).next().unwrap_or(s)
+}
+
+/// `[joints]` -> (our actuator name of each source joint in source order, the permutation).
+/// Exactly one of `source_order` (v1, recorded) and `source_names` (v2, permuted) (`IMP-008`).
+fn resolve_joints(
+    joints: &JointBlock,
+    actuators: &[String],
+    scene: &str,
+    dim: u32,
+) -> Result<(Vec<String>, Option<Vec<usize>>), ImportError> {
+    let order = |detail: String| ImportError::JointOrder { detail };
+    let Some(source) = &joints.source_names else {
+        if joints.source_order.is_empty() {
+            return Err(order(
+                "[joints] declares neither `source_order` nor `source_names`; the source's \
+                 joint order is not something the import may assume"
+                    .to_owned(),
+            ));
+        }
+        if !joints.rename.is_empty() {
+            return Err(order(
+                "[joints.rename] renames source names, and a v1 `source_order` is already in \
+                 our names; declare `source_names` instead"
+                    .to_owned(),
+            ));
+        }
+        return Ok((joints.source_order.clone(), None));
+    };
+    if !joints.source_order.is_empty() {
+        return Err(order(
+            "[joints] declares both `source_order` and `source_names`: two statements of one \
+             order, and nothing here may pick between them"
+                .to_owned(),
+        ));
+    }
+    if let Some(unused) = joints.rename.keys().find(|k| !source.contains(k)) {
+        return Err(order(format!(
+            "[joints.rename] renames \"{unused}\", which is not one of source_names {source:?}"
+        )));
+    }
+    let mut names = Vec::with_capacity(source.len());
+    let mut perm = Vec::with_capacity(source.len());
+    for name in source {
+        let ours = joints.rename.get(name).unwrap_or(name);
+        let at =
+            actuators
+                .iter()
+                .position(|a| a == ours)
+                .ok_or_else(|| ImportError::UnknownJoint {
+                    joint: ours.clone(),
+                    scene: scene.to_owned(),
+                    actuators: actuators.to_vec(),
+                })?;
+        if at >= dim as usize || perm.contains(&at) {
+            return Err(order(format!(
+                "source joint \"{name}\" resolves to actuator \"{ours}\" (index {at}), which is \
+                 {} -- the resolution must be a permutation of the {dim} actuators the \
+                 ActionSpec drives",
+                if perm.contains(&at) {
+                    "already taken by another source joint"
+                } else {
+                    "past the ActionSpec's width"
+                }
+            )));
+        }
+        names.push(ours.clone());
+        perm.push(at);
+    }
+    Ok((names, Some(perm)))
+}
+
+/// `IMP-006`: the adapter's `policy_dt` and the manifest's `decimation * sim_dt`, each against
+/// the Deployment IR's control period. Returns the report line, `None` when neither states one.
+fn check_timing(
+    adapter: &Adapter,
+    manifest: &ImportManifest,
+    deployment: &DeploymentIr,
+) -> Result<Option<String>, ImportError> {
+    let period = 1.0 / deployment.rate.control.as_hz_f64();
+    let manifest_dt = match (manifest.decimation, manifest.sim_dt) {
+        (Some(n), Some(dt)) => Some((f64::from(n) * dt, format!("decimation {n} x sim_dt {dt}"))),
+        _ => None,
+    };
+    let adapter_dt = adapter
+        .timing
+        .as_ref()
+        .map(|t| (t.policy_dt, "[timing] policy_dt".to_owned()));
+    let mut said = Vec::new();
+    for (dt, what) in [adapter_dt, manifest_dt].into_iter().flatten() {
+        if (dt - period).abs() > 1e-9 * period {
+            return Err(ImportError::Timing {
+                detail: format!(
+                    "{what} = {dt} s per policy step, but the Deployment IR's control period is \
+                     {period} s. A policy run at another rate than it was trained at sees a \
+                     different world per step; the import checks the period and never \
+                     resamples it"
+                ),
+            });
+        }
+        said.push(format!("{what} = {dt} s"));
+    }
+    Ok((!said.is_empty()).then(|| {
+        format!(
+            "{} == the Deployment IR's control period {period} s",
+            said.join(", ")
+        )
+    }))
+}
+
+/// The observation side of the fold: the `Normalize{MeanStd}` stats in *our* flat order
+/// (`None`: no source statistics and nothing folded -- v1's identity `Range`), and the first
+/// Dense's input column for each of our positions (`None`: the identity).
+struct Fold {
+    stats: Option<(Vec<f64>, Vec<f64>)>,
+    columns: Option<Vec<usize>>,
+}
+
+/// Every channel's `(x - offset) * scale`, the joint permutation, the history order and the
+/// previous action's un-normalization, folded into one per-element affine map and the
+/// source's `(o - mean) / std`:
+///
+/// ```text
+/// n_j = ((x - a_j) * b_j - mean_j) / std_j = (x - (a_j + mean_j / b_j)) / (std_j / b_j)
+/// ```
+///
+/// exact algebra, evaluated once in f64. For a `PreviousAction` channel `x` is our row in
+/// actuator units and the source saw its raw action, so `a` and `b` also carry the action
+/// tail's inverse: `raw = (x - offset) / scale`. An element with `a = 0, b = 1` keeps the
+/// source's numbers bit for bit, which is what leaves every v1 conversion unmoved.
+// The names are the formula's above; the float comparisons test for exactly the identity.
+#[allow(clippy::many_single_char_names, clippy::float_cmp)]
+fn fold_channels(
+    manifest: &ImportManifest,
+    channels: &[(&ChannelMap, &es_ir::task::ObsChannel)],
+    perm: Option<&[usize]>,
+    action_scale: &[f64],
+    action_offset: &[f64],
+    default_pos: Option<&[f64]>,
+) -> Result<Fold, ImportError> {
+    let n = manifest.obs_dim as usize;
+    let dim = action_scale.len();
+    let bad = |detail: String| ImportError::Channels { detail };
+    let (mu, sigma) = match (&manifest.obs_mean, &manifest.obs_std) {
+        (Some(m), Some(s)) => {
+            if m.len() != n || s.len() != n {
+                return Err(ImportError::Manifest(format!(
+                    "obs_mean/obs_std are {}/{} long for obs_dim {n}",
+                    m.len(),
+                    s.len()
+                )));
+            }
+            (Some(m), Some(s))
+        }
+        _ => (None, None),
+    };
+    let mut src_of: Vec<usize> = (0..n).collect();
+    let mut a = vec![0.0; n];
+    let mut b = vec![1.0; n];
+    let mut folded = false;
+    for (map, declared) in channels {
+        let start = map.slice[0] as usize;
+        let width = declared.ty.shape.dims().iter().product::<u64>() as usize;
+        let history = map.history.unwrap_or(1) as usize;
+        let previous = matches!(declared.source, ObsSource::PreviousAction { .. });
+        let per_joint = previous
+            || matches!(declared.source, ObsSource::JointState { .. })
+                && matches!(declared.ty.frame, Frame::Joint(_));
+        if (per_joint && (perm.is_some() || previous)) && width != dim {
+            return Err(bad(format!(
+                "channel \"{}\" is a per-joint channel {width} wide, and the action is {dim}: \
+                 a joint permutation or an action tail cannot be applied to it",
+                map.channel
+            )));
+        }
+        let term_scale: Vec<f64> = match &map.scale {
+            None => vec![1.0; width],
+            Some(Scale::One(s)) => vec![*s; width],
+            Some(Scale::Each(v)) if v.len() == width => v.clone(),
+            Some(Scale::Each(v)) => {
+                return Err(bad(format!(
+                    "channel \"{}\" has {} scale entries for a {width}-wide channel",
+                    map.channel,
+                    v.len()
+                )))
+            }
+        };
+        let term_offset: Vec<f64> = match &map.offset {
+            None => vec![0.0; width],
+            Some(Offset::Each(v)) if v.len() == width => v.clone(),
+            Some(Offset::Each(v)) => {
+                return Err(bad(format!(
+                    "channel \"{}\" has {} offset entries for a {width}-wide channel",
+                    map.channel,
+                    v.len()
+                )))
+            }
+            Some(Offset::Named(name)) if name == "default_pos" => {
+                let Some(pose) = default_pos.filter(|_| per_joint && width == dim) else {
+                    return Err(bad(format!(
+                        "channel \"{}\" declares offset = \"default_pos\", which needs a \
+                         per-joint channel as wide as the action and a pose stated by \
+                         [joints] default_pos or the manifest's default_joint_pos",
+                        map.channel
+                    )));
+                };
+                pose.to_vec()
+            }
+            Some(Offset::Named(other)) => {
+                return Err(ImportError::Adapter(format!(
+                    "channel \"{}\": offset = \"{other}\" is not \"default_pos\" or a vector",
+                    map.channel
+                )))
+            }
+        };
+        if term_scale.iter().any(|s| *s == 0.0 || !s.is_finite()) {
+            return Err(bad(format!(
+                "channel \"{}\" has a zero or non-finite scale: a term the source multiplied by \
+                 zero carries nothing, and no normalizer can divide it back out",
+                map.channel
+            )));
+        }
+        if previous {
+            if let ObsSource::PreviousAction { initial } = &declared.source {
+                // Isaac's `last_action` is zero on the first tick of an episode; ours is
+                // `initial` in actuator units, which folds to zero only if it is the offset.
+                let want = match perm {
+                    Some(p) => permuted(action_offset, p),
+                    None => action_offset.to_vec(),
+                };
+                let have = initial.clone().unwrap_or_else(|| vec![0.0; dim]);
+                if have.len() != dim || have.iter().zip(&want).any(|(h, w)| (h - w).abs() > 1e-9) {
+                    return Err(bad(format!(
+                        "channel \"{}\" is the previous action, whose raw value is zero at an \
+                         episode's first tick in the source; ours is `initial` in actuator \
+                         units, so the Task IR must declare initial = {want:?} (the action \
+                         offset, in our order), not {have:?}",
+                        map.channel
+                    )));
+                }
+            }
+        }
+        for e in 0..width * history {
+            let (f, k) = (e / width, e % width);
+            let our_k = match perm {
+                Some(p) if per_joint => p[k],
+                _ => k,
+            };
+            let our_f = match map.history_order {
+                Some(HistoryOrder::NewestFirst) => history - 1 - f,
+                _ => f,
+            };
+            let j = start + e;
+            src_of[start + our_f * width + our_k] = j;
+            let (aj, bj) = if previous {
+                (
+                    action_offset[k] + action_scale[k] * term_offset[k],
+                    term_scale[k] / action_scale[k],
+                )
+            } else {
+                (term_offset[k], term_scale[k])
+            };
+            folded |= aj != 0.0 || bj != 1.0;
+            a[j] = aj;
+            b[j] = bj;
+        }
+    }
+    let identity = src_of.iter().enumerate().all(|(i, j)| i == *j);
+    let stats = if mu.is_some() || folded {
+        let mut mean = vec![0.0; n];
+        let mut std = vec![0.0; n];
+        for (ours, &j) in src_of.iter().enumerate() {
+            let (m, s) = (mu.map_or(0.0, |v| v[j]), sigma.map_or(1.0, |v| v[j]));
+            // Exactly the identity, so v1 keeps its bits.
+            let untouched = a[j] == 0.0 && b[j] == 1.0;
+            mean[ours] = if untouched { m } else { a[j] + m / b[j] };
+            std[ours] = if untouched { s } else { s / b[j] };
+        }
+        Some((mean, std))
+    } else {
+        None
+    };
+    Ok(Fold {
+        stats,
+        columns: (!identity).then_some(src_of),
+    })
+}
+
+/// `out[perm[i]] = v[i]`: a source-order vector in our order.
+fn permuted(v: &[f64], perm: &[usize]) -> Vec<f64> {
+    let mut out = vec![0.0; v.len()];
+    for (i, p) in perm.iter().enumerate() {
+        out[*p] = v[i];
+    }
+    out
+}
+
+/// The v2 part of a channel row's note; empty for a v1 channel, whose note is unchanged.
+fn fold_note(map: &ChannelMap, source: &ObsSource) -> String {
+    let mut parts = Vec::new();
+    if let Some(o) = &map.offset {
+        parts.push(format!("offset {o:?}"));
+    }
+    if let Some(s) = &map.scale {
+        parts.push(format!("scale {s:?}"));
+    }
+    if let Some(n) = map.history {
+        parts.push(format!(
+            "history {n} ({:?})",
+            map.history_order.unwrap_or(HistoryOrder::NewestLast)
+        ));
+    }
+    if matches!(source, ObsSource::PreviousAction { .. }) {
+        parts.push("un-normalized by the action tail: raw = (row - offset) / scale".to_owned());
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("; folded into Normalize: {}", parts.join(", "))
+    }
+}
+
 fn joint_unit(space: ActionSpace) -> &'static str {
     match space {
         ActionSpace::JointTorque => "N m",
@@ -643,6 +1295,7 @@ fn source_name(source: &ObsSource) -> String {
         }
         ObsSource::BodyPose(id) => format!("BodyPose({id})"),
         ObsSource::Language => "Language".to_owned(),
+        ObsSource::PreviousAction { .. } => "PreviousAction".to_owned(),
     }
 }
 
@@ -655,6 +1308,7 @@ fn observation_ir(
     manifest: &ImportManifest,
     task: &TaskIr,
     channels: &[(&ChannelMap, &es_ir::task::ObsChannel)],
+    stats: Option<(Vec<f64>, Vec<f64>)>,
     warnings: &mut Vec<String>,
 ) -> Result<ObservationIr, ImportError> {
     let task_hash = task
@@ -662,10 +1316,11 @@ fn observation_ir(
         .map_err(|d| ImportError::Ir(format!("hashing the Task IR: {d}")))?;
     let mut ir = ObservationIr::new(1, task_hash);
 
-    let concat_id = NodeId(channels.len() as u32);
-    let normalize_id = NodeId(channels.len() as u32 + 1);
+    let n = channels.len() as u32;
+    let concat_id = NodeId(n);
+    let normalize_id = NodeId(n + 1);
     let mut parts = Vec::new();
-    for (i, (_, declared)) in channels.iter().enumerate() {
+    for (i, (map, declared)) in channels.iter().enumerate() {
         let id = NodeId(i as u32);
         ir.graph.insert(
             id,
@@ -674,8 +1329,37 @@ fn observation_ir(
                 io: Io::source(declared.ty.clone()),
             },
         );
-        ir.graph.connect(id, OUT, concat_id, &in_port(i));
-        parts.push(declared.ty.clone());
+        // v2 `history = N`: a `TemporalWindowNode` of N frames between the input and the
+        // concat, oldest first; a newest-first source was already reordered by the fold.
+        match map.history.filter(|h| *h > 1) {
+            None => {
+                ir.graph.connect(id, OUT, concat_id, &in_port(i));
+                parts.push(declared.ty.clone());
+            }
+            Some(h) => {
+                let window_id = NodeId(n + 2 + i as u32);
+                let mut stacked = declared.ty.clone();
+                let width: u64 = stacked.shape.dims().iter().product();
+                stacked.shape = Shape::new([width * u64::from(h)]);
+                ir.graph.insert(
+                    window_id,
+                    ObservationNode::TemporalWindowNode {
+                        window: TemporalWindow {
+                            n_steps: h,
+                            stride: 1,
+                            align: Align::Hold,
+                        },
+                        io: Io {
+                            inputs: vec![declared.ty.clone()],
+                            output: stacked.clone(),
+                        },
+                    },
+                );
+                ir.graph.connect(id, OUT, window_id, &in_port(0));
+                ir.graph.connect(window_id, OUT, concat_id, &in_port(i));
+                parts.push(stacked);
+            }
+        }
     }
 
     let flat = PortType {
@@ -702,19 +1386,9 @@ fn observation_ir(
     // The source's own running statistics when it carried them, an identity `Range` when it
     // did not (the packet's rule): either way the output is `Normalized`, which is what makes
     // the tensor admissible as a policy input (`OBS-040`).
-    let stats = if let (Some(mean), Some(std)) = (&manifest.obs_mean, &manifest.obs_std) {
-        let n = manifest.obs_dim as usize;
-        if mean.len() != n || std.len() != n {
-            return Err(ImportError::Manifest(format!(
-                "obs_mean/obs_std are {}/{} long for obs_dim {n}",
-                mean.len(),
-                std.len()
-            )));
-        }
-        NormalizeStats::MeanStd {
-            mean: mean.clone(),
-            std: std.clone(),
-        }
+    // `fold_channels` already checked the lengths and folded every v2 term into them.
+    let stats = if let Some((mean, std)) = stats {
+        NormalizeStats::MeanStd { mean, std }
     } else {
         warnings.push(
             "the checkpoint carries no observation normalizer; the Observation IR gets an \
@@ -759,6 +1433,7 @@ fn source_id(source: &ObsSource) -> StableId {
         ObsSource::Sensor { id, .. } | ObsSource::BodyPose(id) => *id,
         ObsSource::JointState { body, .. } => *body,
         ObsSource::Language => StableId::from_path("language"),
+        ObsSource::PreviousAction { .. } => ObsSource::previous_action_id(),
     }
 }
 
@@ -917,10 +1592,16 @@ fn learning_graph(
 /// members including the activation modules, and recomputing that index here would be a second
 /// copy of `torch.rs`'s layout. Every pair is shape-checked, and `validate_keys` re-checks the
 /// whole file against the lowering afterwards, so a misalignment is refused rather than packed.
+///
+/// v2 moves no number, only positions (packet M11/X2): `columns[k]` is the source input the
+/// first Dense's column `k` reads, and `rows[i]` is where the head's row `i` goes -- the same
+/// function of our state as the source's of its own, exactly. Both `None` for v1.
 fn remap(
     learning: &LearningGraph,
     manifest: &ImportManifest,
     weights: &[u8],
+    columns: Option<&[usize]>,
+    rows: Option<&[usize]>,
 ) -> Result<Vec<u8>, ImportError> {
     let module = lower_to_torch(learning)
         .map_err(|e| ImportError::Ir(format!("lowering the Learning IR: {e}")))?;
@@ -949,7 +1630,8 @@ fn remap(
     }
 
     let mut out: Checkpoint = BTreeMap::new();
-    for (from, to) in neutral.iter().zip(&ours) {
+    let last = neutral.len() - 2;
+    for (index, (from, to)) in neutral.iter().zip(&ours).enumerate() {
         let entry = header
             .get(from)
             .ok_or_else(|| ImportError::Weights(format!("no tensor named \"{from}\"")))?;
@@ -961,10 +1643,33 @@ fn remap(
                 want.expect("checked")
             )));
         }
-        out.insert(
-            (*to).clone(),
-            (entry.shape.clone(), tensor_f32(weights, entry)?),
-        );
+        let mut values = tensor_f32(weights, entry)?;
+        // The first hidden Dense's weight `[out, in]`: gather its input columns.
+        if let (0, Some(cols)) = (index, columns) {
+            let width = entry.shape.get(1).copied().unwrap_or(0) as usize;
+            if cols.len() != width {
+                return Err(ImportError::Weights(format!(
+                    "\"{from}\" reads {width} inputs and the observation folds {}",
+                    cols.len()
+                )));
+            }
+            values = values
+                .chunks_exact(width)
+                .flat_map(|row| cols.iter().map(|c| row[*c]))
+                .collect();
+        }
+        // The head's weight `[action, hidden]` and bias `[action]`: move source row `i` to
+        // our row `rows[i]`.
+        if let (true, Some(rows)) = (index >= last, rows) {
+            let stride = values.len() / rows.len().max(1);
+            let mut moved = vec![0.0f32; values.len()];
+            for (i, to) in rows.iter().enumerate() {
+                moved[to * stride..(to + 1) * stride]
+                    .copy_from_slice(&values[i * stride..(i + 1) * stride]);
+            }
+            values = moved;
+        }
+        out.insert((*to).clone(), (entry.shape.clone(), values));
     }
 
     let bytes = write_safetensors(&out);
