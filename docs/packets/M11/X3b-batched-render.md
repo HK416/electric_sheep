@@ -53,7 +53,7 @@ docs/packets/M11/X3b-batched-render.ko.md
 
 ## acceptance
 
-Oracles 1–4; `renderer.md` gains section 13 (+ko) with the cost table and the BVH choice's reason.
+Oracles 1–4; `renderer.md` gains section 14 (+ko; 13 went to X5) with the cost table and the BVH choice's reason.
 
 ## forbidden
 

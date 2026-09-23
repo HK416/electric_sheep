@@ -51,7 +51,7 @@ docs/packets/M11/X3b-batched-render.ko.md
 
 ## 수용
 
-오라클 1~4; `renderer.md`에 비용 표와 BVH 선택 이유를 담은 13절(+ko)이 생긴다.
+오라클 1~4; `renderer.md`에 비용 표와 BVH 선택 이유를 담은 14절(+ko; 13절은 X5가 가져갔다)이 생긴다.
 
 ## 금지
 
