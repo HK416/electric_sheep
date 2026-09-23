@@ -10,7 +10,7 @@ use es_physics_backend::{
     mapping_report, physx, BackendKind, MappingReport, PhysXBackend, TaskFeature,
 };
 use es_physics_core::caps::{DeterminismTier, FloatPrecision};
-use es_physics_core::{Feature, LoadConfig, PhysicsBackend, PhysicsError};
+use es_physics_core::{Feature, LoadConfig, PhysicsBackend, PhysicsError, StateView};
 
 fn fixture(name: &str) -> SceneDesc {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/mjcf/");
@@ -326,5 +326,39 @@ fn physx_against_mujoco_cpu_is_measured() {
                 pipelines.max_dqpos, pipelines.divergence_tick
             );
         }
+    }
+}
+
+/// The env's reset writes only the position of a free joint it randomizes and leaves the
+/// quaternion zero; `MuJoCo` reads that as the identity. `PhysX` silently drops a transform with a
+/// zero quaternion, so before the fix the cube never moved and reach A0 scored 0 (I1).
+#[test]
+fn physx_reset_state_moves_a_free_body_with_a_zero_quaternion() {
+    if let Err(reason) = PhysXBackend::is_available() {
+        eprintln!("SKIP physx_reset_state_moves_a_free_body_with_a_zero_quaternion: {reason}");
+        return;
+    }
+    let scene = fixture("so101_pick_place.xml");
+    let mut px = PhysXBackend::new();
+    let info = px.load(&scene, &LoadConfig::default()).unwrap();
+    let cube = scene.joints.iter().find(|j| j.name == "cube_free").unwrap();
+    let at = info.qpos[&cube.id].start as usize;
+    let mut qpos = vec![0.0; info.nq as usize];
+    qpos[at..at + 3].copy_from_slice(&[0.3, 0.05, 0.02]);
+    let qvel = vec![0.0; info.nv as usize];
+    px.reset(
+        None,
+        Some(&StateView {
+            n_envs: 1,
+            qpos: &qpos,
+            qvel: &qvel,
+            ..StateView::default()
+        }),
+    )
+    .unwrap();
+    let got = &px.state().qpos[at..at + 7];
+    let want = [0.3, 0.05, 0.02, 1.0, 0.0, 0.0, 0.0];
+    for (g, w) in got.iter().zip(want) {
+        assert!((g - w).abs() < 1e-6, "cube qpos {got:?}, want {want:?}");
     }
 }
