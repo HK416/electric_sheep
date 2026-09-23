@@ -1005,6 +1005,167 @@ policy gradient(Fujita & Maeda, 2018), 클램프된 차원에 대해 가우시�
 모두 19,076 s ≈ 5.3 h; 평가 여섯 번 67 s. §12.4 아홉 지표는 각 실행의 `metrics/env-metrics.json`에
 있고, 나머지는 `Target / Status: unverified`다.
 
+### I3 — 우리 장면에서 학습한 Isaac Lab 정책과 A0, 세 엔진에서, 오라클 서버(RTX 4090, Ubuntu 26.04.1), 2026-09-23 UTC
+
+패킷 `docs/packets/M11/I3-sim-to-sim-measured.md`. 산출물 `~/artifacts/plan-x/i3/`(`usd/`,
+`train{0,1,2}/`, `select{0,1,2}.json`, `heldout{0,1,2}.json`, `delay{0,1,2}.json`,
+`import/isaac-{0,1,2}/`, `eval/`, `scenes/`, `docs/`, `v1-xyzw/`, 단계 스크립트와 그
+`<stage>.{start,end,done,log}` 마커). 트리 `~/Projects/es-i3`(`git archive`, I3 파일은 바뀔 때마다
+복사), `cargo build --release -p es`. `~/venvs/es-isaac`에 Isaac Sim 5.1.0 + Isaac Lab 2.3.2.post1 +
+rsl-rl-lib 3.0.1; `~/venvs/es`에 MuJoCo 3.13.0, mujoco_warp, torch 2.14 CPU.
+
+**Isaac 작업은 Task IR을 따라 했고, 조정하지 않았다.** `python/es/rl_source/isaac_so101_reach/`는
+manager-based env cfg(`env_cfg.py`)와 rsl_rl 드라이버(`main.py`)다. 로봇은 `main.py build-usd`가
+`scene_to_mjcf`가 내보내는 MJCF(`--backend physx` 실행에서 `ES_PHYSX_DUMP_MJCF`로 덤프)를
+`physx_ref.import_scene` — 이를 위해 `Sim._build_stage`에서 떼어낸 백엔드 자신의 임포트 함수 — 로
+통과시켜 쓴 `robot.usd`이므로, 정책이 학습하는 스테이지와 `--backend physx`가 평가하는 스테이지는
+같은 여덟 가지 수정을 가진다. 행별로 따라 한 것:
+
+| Task IR (`task-reach-last-action.toml`) | Isaac env |
+|---|---|
+| MJCF의 5 ms 스텝 위 50 Hz, 200 제어 스텝 | `decimation 4`, `sim.dt 0.005`, `episode_length_s 4.0`(단언: `max_episode_length == 200`) |
+| `joint_pos`, `joint_vel` | `mdp.joint_pos_rel`, `mdp.joint_vel_rel` × 0.05(어댑터: `offset = "default_pos"`, `scale = 0.05`) |
+| `cube_pose` = `JointState { cube, dof 7 }`: 자유 조인트의 `qpos`, 쿼터니언 **w 먼저** | `free_joint_qpos`: 루트 좌표계 − env 원점, Isaac 자신의 w 먼저 쿼터니언 |
+| `gripper_pose` = `BodyPose(gripper)`: `xpos ‖ xquat`, 쿼터니언 **x 먼저** | 링크 `gripper`의 `body_pose_xyzw` |
+| `last_action`(`PreviousAction`, `initial` = 휴지 자세) | `mdp.last_action`(원시, 리셋 시 0); `default_joint_pos` = 그 자세 |
+| `JointPosition`, ctrl은 `ctrlrange`로 클램프 | `JointPositionActionCfg(scale 0.5, use_default_offset, clip = ctrlrange)` |
+| 제어 스텝당 `-1 · dist + 1 · (dist < 0.03)` | 같은 항을 가중치 ∓`1/step_dt`로(보상 관리자가 `dt`를 곱한다) |
+| `Terminate Success` / `Timeout` | `DoneTerm(reached)` / `DoneTerm(time_out, time_out=True)` |
+| `ResetState` 조인트 0; 큐브 x U[0.21, 0.27], y U[−0.03, 0.05], z 0.02 | `reset_joints_by_scale(0, 0)`; (0.24, 0.01, 0.02) 주위 ±(0.03, 0.04)의 `reset_root_state_uniform` |
+| kp 998.22, kv 2.731, forcerange 2.94, armature 0.028, 조인트 감쇠 0.6, frictionloss 0.052 | `ImplicitActuator` stiffness kp, damping kv, `effort_limit_sim` 2.94, armature는 USD에서; 물리 스텝마다 명시적 effort `-0.6·q̇`(`physx_ref.py`처럼); frictionloss는 버림(`physx_ref.py`처럼) |
+| 한 장면의 env들 | `env_spacing = 0`, env 간 충돌 필터(`physx_ref.py`의 `GridCloner(spacing = 0)`; 또한 강제됨, `isaac-lab.md` §9) |
+
+가정하지 않고 확인했다: `q = 0`에서 env의 그리퍼 자세는 MuJoCo의 것과 1e-4 m 이내(0.2932,
+−0.0002, 0.2344; x 먼저 쿼터니언 (0.0172, −0.7069, −0.0172, 0.7069))이고, 휴지 자세에서 안정된
+뒤 2e-4 m 이내다. **따라 하지 않은 것** — 각각 Isaac 정책이 우리 런타임에서만, 또는 Isaac에서만
+만나는 차이:
+
+1. **Safety Plane**(Deployment IR): 속도 3 rad/s, 가속도 80 rad/s², 행동 변화율 틱당 0.08 / 0.04
+   rad, 위치 소프트 여유, 작업 공간. Isaac에는 없다; A0는 그 아래에서 학습했다.
+2. `es eval run`의 **제어 틱 하나의 행동 지연**: 임포트가 `expected_latency_ms = min(예산, 주기)
+   = 20 ms`를 선언하고 `latency_ticks` = 1(A0의 2 ms도 1틱). Isaac은 0으로 학습하고 채점한다.
+3. **장면 수준 PhysX 설정.** Isaac Lab의 `PhysxCfg` 대 `physx_ref.py`의 `World`: GPU broadphase 대
+   MBP, CCD 끔 대 켬, GPU dynamics 켬 대 끔, 그리고 `World`가 쓰지 않는 bounce / friction-offset /
+   반복 횟수 속성(`isaac-lab.md` §9). Isaac은 4,096 env로 GPU 파이프라인에서 학습한다.
+4. **학습 쪽에만:** 첫 에피소드의 `init_at_random_ep_len`(rsl_rl), 관측 노이즈 없음(Task IR이
+   선언하지 않음), 거리에 대한 Task IR의 `Normalize{0..1}`(1 m 아래에서는 동일).
+
+**학습.** Isaac Lab 자신의 reach 러너 설정(`FrankaReachPPORunnerCfg`를 필드 그대로 복사: 24 스텝
+× 4,096 env, [64, 64] ELU, lr 1e-3 adaptive, 경험적 정규화 없음)의 rsl_rl PPO, 시드당 1,500 반복 =
+147.5 M env 스텝. 체크포인트는 **Isaac 쪽에서만** 고른다: 100번째마다의 체크포인트를 시드 2000+s의
+리셋 1,024개에서 결정론적으로 채점해 가장 좋은 것을 택하고, 보고하는 수치는 두 번째 리셋
+1,024개(시드 1000+s)의 것이다.
+
+| 시드 | 학습 벽시계 | rsl_rl 성공률(확률적) 100 / 500 / 1,000 / 1,500 | 선택 | **Isaac 보류** | 1,000에서 | 1,499에서 |
+|---|---|---|---|---|---|---|
+| 0 | 2,648 s | 0.170 / 0.948 / 0.969 / 0.970 | `model_700` | **0.975** | 0.968 | 0.978 |
+| 1 | 2,198 s | 0.238 / 0.583 / 0.623 / 0.609 | `model_900` | **0.631** | 0.619 | 0.623 |
+| 2 | 2,244 s | 0.203 / 0.644 / 0.651 / 0.643 | `model_1000` | **0.686** | 0.686 | 0.648 |
+
+셋 모두 정체한다(시드 0은 600 반복까지, 시드 1과 2는 900까지); 평균 **0.764**. 시드 2의 선택된
+체크포인트는 한 프로세스에서 같은 리셋에 대해 0.6855, 이어서 0.6680을 냈다: Isaac의 GPU
+파이프라인도 실행마다 재현되지 않는다.
+
+**임포트.** 파일은 rsl-rl-lib 3.0.1의 클래식 형태다(`std`, `actor.{0,2,4}`, `critic.*`를 담은
+`model_state_dict`; `isaac-lab.md` §9). `import_rl.py --from rsl-rl --activation elu --isaac-env-cfg
+params/env.yaml --joint-names …` 다음 `es policy import-rl`을 `adapter-isaac-so101.toml`로
+`task-reach-last-action.toml` + `deployment-reach.toml`에 대해: 셋 모두 `observation_hash
+ace0eba4…`(`evaluation-reach-last-action.toml`이 이름 붙이는 것)와 `learning_hash 800a232c…`를
+가진다; `policy_hash` `2b05615c…` / `79c80b31…` / `36898e15…`. 매핑 보고서의 timing 줄은
+`decimation 4 x sim_dt 0.005 = 0.02 s == the Deployment IR's control period`이고, 여섯 `damping`
+행은 경고다: 소스에서 2.731, 장면에서 3.331(kv + 조인트 감쇠) — Isaac 쪽에서 명시적 수동 항은 구동
+게인이 아니다.
+
+**표.** `nominal`의 `success_rate`, 보류 시드 16개(201–216); Isaac 행은
+`evaluation-reach-last-action.toml`이, A0 행(W0b의 `4000.esb`)은 `evaluation-reach.toml`이 채점한다
+— 같은 시드, 스위트, 합격 기준. 괄호 안은 `episode_length`. `envelope_violation_rate`는 모든 칸에서
+1.0이다(모든 에피소드가 적어도 한 틱은 클램프된다).
+
+| 정책 | Isaac 쪽 | physx CPU (r1 = r2) | physx GPU (r1 = r2) | mujoco-cpu | mjwarp r1 / r2 |
+|---|---|---|---|---|---|
+| Isaac 0 | 0.975 | 0.6875 (105.8) | 0.6875 (107.2) | **0.8750** (83.8) | 0.9375 (62.8) / 0.8125 (84.6) |
+| Isaac 1 | 0.631 | 0.5000 (125.4) | 0.3750 (146.1) | 0.6250 (125.5) | 0.4375 (141.2) / 0.3125 (152.6) |
+| Isaac 2 | 0.686 | 0.3750 (148.3) | 0.6250 (105.0) | 0.1875 (172.9) | 0.3750 (153.6) / 0.2500 (160.3) |
+| A0 0 | — | 0.1250 (184.9) | 0.1250 (183.4) | 0.5625 (129.4) | 0.4375 (141.4) / 0.4375 (141.3) |
+| A0 1 | — | 0.1875 (176.8) | 0.0000 (200.0) | 0.3750 (147.2) | 0.3750 (146.6) / 0.4375 (137.3) |
+| A0 2 | — | 0.2500 (166.1) | 0.1250 (181.2) | 0.3125 (153.6) | 0.1875 (171.4) / 0.1875 (171.4) |
+| **평균** Isaac / A0 | 0.764 / — | 0.521 / 0.188 | 0.563 / 0.083 | 0.563 / 0.417 | 0.583 / 0.333 (r1), 0.458 / 0.354 (r2) |
+
+칸별 `execution_hash`(앞 8자리 16진수; 각 행의 physx 두 실행은 보고서 하나, 해시 하나를 냈다 —
+I1이 측정한 대로 비트 동일; mjwarp 두 실행은 해시는 같고 수치는 다르다, X1의 tier 2 행):
+
+| 정책 | physx CPU | physx GPU | mujoco-cpu | mjwarp |
+|---|---|---|---|---|
+| Isaac 0 | `9b7fad37` | `815f8064` | `f9eb7538` | `e52b4ed8` |
+| Isaac 1 | `51a0dc8b` | `87cf5708` | `7ad08aa8` | `eba58084` |
+| Isaac 2 | `d0b4b213` | `6e61f76d` | `c0e8f22a` | `a44788f7` |
+| A0 0 | `37a6bc7a` | `e121afd9` | `08851281` | `7456e37d` |
+| A0 1 | `9064ff63` | `409e93f4` | `e9566999` | `03a25132` |
+| A0 2 | `2e352bc6` | `888b4ce0` | `808658ce` | `f9a760c0` |
+
+**귀속**(`nominal` `success_rate`, 16 시드). physx(CPU 파이프라인)에서는 PhysX 어댑터가 켜고 끌 수
+있는 근사 행 둘 — `ES_PHYSX_JOINT_DAMPING=none`(명시적 `-d·q̇` 없음)과
+`ES_PHYSX_FRICTION_COMBINE=average` — 을 바꾸며, 각각 엔진 버전에, 따라서 해시에 기록된다.
+mujoco-cpu에서는 PhysX가 버리거나 옮기는 행 둘을 거꾸로 MuJoCo에서 뺀다: `frictionloss` 없는,
+`damping` 없는, 둘 다 없는 장면 사본(`scenes/`, sha256 `9f2769ed…`, `79b5fbaa…`, `752c725b…`).
+"넓은 엔벌로프"는 진단용 Deployment IR이다(`docs/`, `deployment_hash 22473ac6…`): 속도 100 rad/s,
+가속도 1e5, 행동 변화율 틱당 10 rad, ee 속도 100 m/s; 위치, 토크, 작업 공간은 그대로, plane은 켜진
+채(INV-12). "지연 1"은 보류 리셋에서 `--action-delay 1`로 돌린 Isaac 자신의 평가다.
+
+| 정책 | physx | physx, 조인트 감쇠 없음 | physx, 마찰 average | physx, 넓은 엔벌로프 | mujoco | mujoco, frictionloss 없음 | mujoco, 감쇠 없음 | mujoco, 둘 다 없음 | mujoco, 넓은 엔벌로프 | Isaac, 지연 0 → 1 |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Isaac 0 | 0.6875 | 0.0000 | 0.6875 | 0.9375 | 0.8750 | **1.0000** | 0.0625 | 0.1250 | 0.9375 | 0.975 → 0.725 |
+| Isaac 1 | 0.5000 | 0.0000 | 0.5000 | 0.4375 | 0.6250 | 0.4375 | 0.0625 | 0.1250 | 0.2500 | 0.631 → 0.585 |
+| Isaac 2 | 0.3750 | 0.0000 | 0.3750 | 0.4375 | 0.1875 | 0.3125 | 0.0000 | 0.0000 | 0.4375 | 0.686 → 0.543 |
+| A0 0 | 0.1250 | 0.0625 | 0.1250 | — | 0.5625 | 0.5000 | 0.1875 | 0.0000 | — | — |
+| A0 1 | 0.1875 | 0.1875 | 0.1875 | — | 0.3750 | 0.4375 | 0.3125 | 0.1250 | — | — |
+| A0 2 | 0.2500 | 0.0625 | 0.2500 | — | 0.3125 | 0.5625 | 0.2500 | 0.4375 | — | — |
+
+행들이 수치로 말하는 것. **마찰 결합은 여기서 구조상 아무것도 설명하지 않는다**: 장면의 충돌 geom은
+모두 μ = 1, 재질 하나이고 max = average = min = 1 — 열이 기본 칸과 칸마다 같다(해시는 그래도
+움직인다). **조인트 감쇠는 양쪽 모두에서 하중을 받는다**: 명시적 `-0.6·q̇` 없이는 모든 Isaac 정책이
+physx에서 0.0이고, MuJoCo의 감쇠를 빼도 mujoco-cpu에서 모든 정책이 떨어진다 — *근사된*(암시적 대신
+명시적) 행이 격차가 아니라, 행 자체가 필수다. PhysX가 버리는 **frictionloss**는 MuJoCo에서 Isaac 0을
+1.0으로, A0 2를 0.31에서 0.56으로 옮기고, 나머지 넷은 어느 쪽으로든 최대 0.19 옮긴다. **엔벌로프**는
+Isaac 0을 physx에서 0.69에서 0.94로, MuJoCo에서 0.88에서 0.94로, Isaac 2를 MuJoCo에서 0.19에서
+0.44로 옮기고, Isaac 1을 MuJoCo에서 0.63에서 0.25로 *내리며*, physx의 Isaac 1과 2는 에피소드 하나만큼
+옮긴다. 여섯 정책 모두에 대해 "격차의 대부분"인 행은 없다: 에피소드 하나가 0.0625인 16 에피소드에서
+엔진 격차는 정책마다 다르다.
+
+**첫 번째 Isaac 정책 묶음은 잘못 따라 한 채널로 학습했고, 여기서 0.0을 냈다.** 첫 env cfg는
+`cube_pose`를 x 먼저로 내보냈다 — 5절이 자세를 설명하는 방식대로. 런타임은 Task IR의 `cube_pose` —
+`JointState { cube, dof = 7 }` 채널 — 를 자유 조인트의 `qpos`에서 가공 없이, **w 먼저**로 제공한다
+(`es_eval::runner::Capture::Qpos`); `BodyPose`인 `gripper_pose`만 x 먼저다. 그 정책들(`v1-xyzw/`)은
+Isaac 쪽에서 0.632 / 0.006 / 0.806을, 시드 0은 우리 쪽에서 physx CPU 0.0, mujoco-cpu 0.0625를 냈다 —
+신경망이 `(0, 0, 0, 1)`을 배운 자리에 항등 쿼터니언이 `(1, 0, 0, 0)`으로 들어간다. 수정은 Isaac 쪽에
+있다(`free_joint_qpos`); 5절의 문장은 `gripper_pose`에 대해서는 맞고 `cube_pose`에 대해서는 틀리며,
+어댑터는 채널 안을 순열할 수 없으므로 어떤 소스든 이를 따라 해야 한다.
+
+**런타임에 대한 두 발견, 여기서 고치지 않음.** (1) `es eval run --scene`은 Task IR의 `scene_hash`에
+묶여 있지 않다: 위의 MuJoCo 장면 변형 셋은 `task-reach*.toml`에 대해 거부 없이 돌았고, 그
+`execution_hash`는 기본 장면의 것이다(A0 0은 넷 모두 `08851281…`) — 다른 장면이 해시 체인에게는
+다른 조건이 아니다. 그래서 귀속 행은 해시가 아니라 장면 파일의 sha256으로 식별한다. (2)
+`task-reach-last-action.toml`은 `TaskIr::validate`에서 실패했다(`TASK-001`, "declared channel
+last_action has no ObservationSpec node"). 그래서 `PreviousAction` 번들은 아예 만들 수 없었다; 이제
+규칙은 루프가 제공하고 어떤 그래프 노드도 계산하지 않는 `PreviousAction` 채널을 건너뛴다
+(`crates/es-ir/src/task.rs`, 이 패킷의 context 밖; 한 줄, 움직이는 해시 없음).
+
+**답.** **아니다, Isaac Lab에서의 점수는 나오지 않는다 — 그러나 엔진 사이에서는 우리 정책보다 잘
+버틴다:** 깨끗하게 임포트된(`observation_hash` 하나, timing 검사 통과) Isaac Lab 정책 셋은 우리
+physx CPU 열에서 평균 **0.52**(0.69 / 0.50 / 0.38), Isaac 자신의 보류 리셋에서 **0.76**(0.975 /
+0.631 / 0.686)이며, `es eval run`이 적용하는 제어 틱 하나의 행동 지연이 Isaac 쪽만으로 그중 0.15를
+설명한다(같은 1,024개 리셋에서 `--action-delay 1`로 0.76 → 0.62); 엔진 사이에서는 physx CPU / physx
+GPU / mujoco-cpu / mjwarp에서 평균 0.52 / 0.56 / 0.56 / 0.58–0.46인 반면, A0는 학습한 엔진인
+mujoco-cpu의 0.42에서 physx CPU 0.19, physx GPU 0.08로 떨어진다(mjwarp 0.33–0.35) — PhysX에서
+학습한 정책이 MuJoCo로 옮겨 가는 것이 MuJoCo에서 학습한 정책이 PhysX로 옮겨 가는 것보다 낫고, 귀속
+행들은 조인트 감쇠를 두 엔진 모두에서 필수로, PhysX가 버리는 frictionloss를 MuJoCo에서 가장 크게
+움직이는 단일 행으로 지목하되, 격차를 혼자 설명하는 한 행이 아니라 정책마다 그렇다.
+
+벽시계: Isaac 학습은 GPU에서 학습 2,648 / 2,198 / 2,244 s(한 번에 시드 하나, GPU 큐 잠금 아래);
+Isaac 쪽 선택과 보류 실행은 시드당 약 2.5분; `es eval run` 한 번(16 에피소드 × 4 스위트)은
+mujoco-cpu ≈ 12 s, physx CPU ≈ 5.5분, physx GPU ≈ 7.5분, mjwarp ≈ 3.5분. 나머지는 모두
+`Target / Status: unverified`.
+
 ## 8. 임포터와 어댑터
 
 1절의 규칙 3은 어댑터가 선언하고 코드는 결코 추측하지 않는다고 말한다. `es policy import-rl`의
