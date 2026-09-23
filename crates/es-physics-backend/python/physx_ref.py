@@ -107,10 +107,11 @@ def externalize_meshes(mjcf, out_dir):
     scene's hashed structs never see these paths."""
     tree = ET.ElementTree(ET.fromstring(mjcf))
     inline = [m for m in tree.getroot().iter("mesh") if m.get("vertex") is not None]
-    for i, m in enumerate(inline):
+    for m in inline:
         v = floats(m.attrib.pop("vertex"))
         f = [int(x) for x in m.attrib.pop("face").split()]
-        name = "mesh%d.obj" % i
+        # Named after the mesh: the importer looks a mesh up by its name, not by file= (I1).
+        name = m.get("name").replace("/", "_") + ".obj"
         with open(os.path.join(out_dir, name), "w") as obj:
             obj.writelines("v %r %r %r\n" % tuple(v[k:k + 3]) for k in range(0, len(v), 3))
             obj.writelines("f %d %d %d\n" % (f[k] + 1, f[k + 1] + 1, f[k + 2] + 1) for k in range(0, len(f), 3))
