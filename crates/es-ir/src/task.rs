@@ -1105,7 +1105,10 @@ impl TaskIr {
                     );
                 }
             }
-            if !bound.contains(name.as_str()) {
+            // A `PreviousAction` channel is served by the control loop, not computed by the
+            // graph, so no ObservationSpec node binds it (packet M11/I3).
+            let served = matches!(ch.source, ObsSource::PreviousAction { .. });
+            if !served && !bound.contains(name.as_str()) {
                 diags.push(Diagnostic::new(
                     codes::TASK_001,
                     format!("declared channel \"{name}\" has no ObservationSpec node"),
