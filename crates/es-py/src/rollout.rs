@@ -29,6 +29,10 @@
 //! per env per [`Rollout::observe`]: the tick is the render index, as it is for the collector.
 //! Without the feature an image input is refused by name at `observe`, as it always was.
 //!
+//! With more than one env the frames come from one `es_env::render::EnvBatchRenderer` instead
+//! (packet M11/X3b): every env in one dispatch, each env's tile bit for bit what its own
+//! `EnvRenderer` renders, so nothing above changes but the cost. One env keeps the single path.
+//!
 //! Horizon 1, synchronous: PPO acts on every control tick, so the chunk handed to the plane
 //! carries exactly one row under a fresh `seq` and there is no chunk buffer and no declared
 //! latency here (`rl-continuation.md` section 3). The **evaluation** of the same policy runs
@@ -152,6 +156,10 @@ pub struct Rollout<const NJ: usize, const H: usize> {
     /// M11/X3). Per env because the `Tick` seed clock is per-episode state.
     #[cfg(feature = "render")]
     cameras: Vec<es_env::EnvRenderer<'static>>,
+    /// Every env's image in one dispatch, in place of `cameras`, when there is more than one
+    /// env (packet M11/X3b).
+    #[cfg(feature = "render")]
+    batch: Option<es_env::render::EnvBatchRenderer<'static>>,
     /// The image bytes each env's last [`Rollout::observe`] captured, empty without one: the
     /// plan's own input buffer, moved here after the plan ran rather than copied.
     frames: Vec<Vec<u8>>,
@@ -332,11 +340,13 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
             });
         }
         #[cfg(feature = "render")]
-        let cameras = cameras(&sources, &task, &scene, n_envs)?;
+        let (cameras, batch) = cameras(&sources, &task, &scene, n_envs)?;
         #[cfg(feature = "render")]
         let frame_pixels = cameras
             .first()
-            .map_or(0, |c| u64::from(c.cfg().width) * u64::from(c.cfg().height));
+            .map(es_env::EnvRenderer::cfg)
+            .or(batch.as_ref().map(es_env::render::EnvBatchRenderer::cfg))
+            .map_or(0, |c| u64::from(c.width) * u64::from(c.height));
         #[cfg(not(feature = "render"))]
         let frame_pixels = 0;
         let mut planes = Vec::with_capacity(n_envs as usize);
@@ -363,6 +373,8 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
             initial,
             #[cfg(feature = "render")]
             cameras,
+            #[cfg(feature = "render")]
+            batch,
             frames: vec![Vec::new(); n_envs as usize],
             render_wall: Duration::ZERO,
             rendered: 0,
@@ -398,6 +410,22 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
         let mut out: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         let model = self.env.model();
         let state = self.env.state();
+        // Every env's frame in one dispatch, before the per-env capture reads them (packet
+        // M11/X3b), timed whole-frame like the single path.
+        #[cfg(feature = "render")]
+        let batched = match &mut self.batch {
+            Some(batch) => {
+                let draws: Vec<&es_env::randomize::RenderOverrides> = (0..self.n_envs)
+                    .map(|i| self.env.render_overrides(i as u32))
+                    .collect();
+                let started = std::time::Instant::now();
+                let tiles = batch.frames(model, &state, &draws)?;
+                self.render_wall += started.elapsed();
+                self.rendered += tiles.len() as u64;
+                Some(tiles)
+            }
+            None => None,
+        };
         for i in 0..self.n_envs {
             let view = env_view(&state, i);
             // This env's renderer as `capture`'s frame source, timed whole-frame.
@@ -418,9 +446,16 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
                 }
             });
             #[cfg(feature = "render")]
-            let frames = source
-                .as_mut()
-                .map(|f| f as &mut es_eval::runner::FrameSource<'_>);
+            let mut from_batch = batched.as_ref().map(|tiles| {
+                let tile = &tiles[i];
+                move |_: &LightOverride, _: &ModelInfo, _: &StateView<'_>| Ok(tile.to_bytes())
+            });
+            #[cfg(feature = "render")]
+            let frames = match (source.as_mut(), from_batch.as_mut()) {
+                (Some(f), _) => Some(f as &mut es_eval::runner::FrameSource<'_>),
+                (None, Some(f)) => Some(f as &mut es_eval::runner::FrameSource<'_>),
+                (None, None) => None,
+            };
             #[cfg(not(feature = "render"))]
             let frames = None;
             let (names, mut bytes, _) = capture_at(
@@ -628,11 +663,16 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
         if let Some(camera) = self.cameras.get_mut(env) {
             camera.begin_episode();
         }
+        #[cfg(feature = "render")]
+        if let Some(batch) = &mut self.batch {
+            batch.begin_episode(env);
+        }
     }
 }
 
 /// One renderer per env for the observation's image input, or none when it has no image
-/// (packet M11/X3).
+/// (packet M11/X3) -- or, with more than one env, one batched renderer for all of them
+/// (packet M11/X3b).
 ///
 /// The Task IR channel that declares the input's sensor says which camera, at which
 /// `ImageSpec`, on which render path: `es_env::render::sensor_cfg` turns it into the config --
@@ -646,7 +686,13 @@ fn cameras(
     task: &es_ir::task::TaskIr,
     scene: &SceneDesc,
     n_envs: u32,
-) -> Result<Vec<es_env::EnvRenderer<'static>>, RolloutError> {
+) -> Result<
+    (
+        Vec<es_env::EnvRenderer<'static>>,
+        Option<es_env::render::EnvBatchRenderer<'static>>,
+    ),
+    RolloutError,
+> {
     use es_ir::task::ObsSource;
     use es_ir::types::Frame;
 
@@ -656,7 +702,7 @@ fn cameras(
         .map(|(n, _)| n)
         .collect();
     let name = match images.as_slice() {
-        [] => return Ok(Vec::new()),
+        [] => return Ok((Vec::new(), None)),
         [one] => *one,
         more => {
             return Err(RolloutError::Render(format!(
@@ -687,13 +733,19 @@ fn cameras(
     };
     let cfg = es_env::render::sensor_cfg(camera, &spec, render, None);
     let gpu = gpu()?;
-    (0..n_envs)
+    if n_envs > 1 {
+        let batch = es_env::render::EnvBatchRenderer::new(gpu, scene, cfg, n_envs)?;
+        batch.check(&spec)?;
+        return Ok((Vec::new(), Some(batch)));
+    }
+    let cameras = (0..n_envs)
         .map(|_| {
             let camera = es_env::EnvRenderer::new(gpu, scene, cfg.clone())?;
             camera.check(&spec)?;
             Ok(camera)
         })
-        .collect()
+        .collect::<Result<_, RolloutError>>()?;
+    Ok((cameras, None))
 }
 
 /// The Vulkan device this thread's rollouts render on: opened once per thread and leaked, so

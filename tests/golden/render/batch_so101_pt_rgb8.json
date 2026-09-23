@@ -1,0 +1,16 @@
+{
+  "dtype": "u8",
+  "generator": "cargo test -p es-render --test render -- --ignored generate_batch_goldens",
+  "kernel": "pt.v3 (16 spp, 3 bounces, NEE, Reinhard, exposure 8), 4 envs as batch_so101_rs_rgb8",
+  "layout": "row-major, little-endian, tightly packed; env tiles stacked in env order",
+  "name": "batch_so101_pt_rgb8",
+  "oracle": "es_render::cpu::render_batch, the pure-Rust mirror of the Slang kernels",
+  "pins": "one tile per env, each the env rendered alone as view 0 (packet M11/X3b)",
+  "shape": [
+    4,
+    32,
+    32,
+    3
+  ],
+  "spec": "docs/design/renderer.md"
+}

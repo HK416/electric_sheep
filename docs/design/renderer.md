@@ -1862,8 +1862,213 @@ the table is what it measured. The two cards agree to the byte and to the ULP on
   `Rollout` — the RL path X7 trains on — applies them.
 - **Batched rendering (X3b).** `RenderOverrides` is a plain per-env struct and `drawn_frame` a pure
   function of it, but the lighting half is per *config*: N envs with N lightings in one dispatch
-  need the light parameters per view, which is X3b's parameter layout to decide.
+  need the light parameters per view, which is X3b's parameter layout to decide (it did:
+  section 14.1).
 - **The other two `Cross` builtins** (13.4).
 - **Textures, materials, occluders** — M7 R6 and the packet's `forbidden`.
 - **HSV geom jitter, and colour on `Full`'s specular term** — the per-channel scale is the one
   chosen (`batch-domains.md` 5); `Full`'s Blinn-Phong highlight stays white.
+
+## 14. N envs in one dispatch (M11/X3b)
+
+Packet `docs/packets/M11/X3b-batched-render.md`, spec 28.14 wave 2, 15.2. After X3 `Rollout`
+rendered each env with its own `EnvRenderer` — one upload, one dispatch, one readback per env —
+at 57.5 ms per 96×96 64-spp `Pt` frame on the RTX 4090 (12.4). The atlas of section 1 already
+packs many *cameras over one scene* into one dispatch; X3b makes the tiles **envs**: each its
+own posed scene, camera, light and seed, and each tile bit for bit the single render of that env.
+
+`Renderer::render_batch(&[(TriScene, CameraView, RenderConfig)])` is the new entry point, the
+exact triple `es_env::render::drawn_frame` returns; `Atlas::read_tiles` reads a channel's every
+tile from one download. `es_env::render::EnvBatchRenderer` is the batched `EnvRenderer` (per-env
+`Tick` clocks, per-env draws, one shared `SceneCache`), and `Rollout` uses it when it has more
+than one env. `Renderer::render` and `EnvRenderer` are unchanged and stay the oracle.
+
+### 14.1 The parameter layout: a copy of the globals per env
+
+What differs between two envs is the scene (where its triangles and tree are), the light
+(`light_dir`, `light_rgb`, `ambient`, `sky`, `shading` — what `set_lighting` moves) and the seed.
+All of it was a *global* slot. Rather than re-plumb every accessor with a view argument, the
+batched render appends **one copy of the whole globals block per env** after the view records,
+same layout, and each view record names its env's copy in pad slot 14. The shaders read the
+per-env slots through `es_env_f(i) = es_params[es_env_base + i]`, where `es_env_base` is a
+thread-private static that `es_pixel` sets once from the view record; a single render writes 0
+there, so its accessors read the globals themselves exactly as before. Two slots are new: 39,
+the env's triangle base in `es_tris` (`es_tri` and `es_light_tri` add it), and 40, the band row
+of 14.5. `PARAM_VIEW_BASE` moves from 39 to 41; no output depends on it.
+
+The sample keys needed one more thing. `es_rng_key` is addressed by the **view** index, and in
+a batch env `k` is tile `k` while its single render is view 0. Pad slot 15 carries the key view
+— the tile's own index on a single render (so a multi-camera atlas keys exactly as before),
+0 on a batched one — and the seven key sites in `pt.slang` and `restir.slang` read it. With
+the env's own seed in its block, tile `k` draws the samples the single render of env `k` draws.
+
+SVGF, the variance estimate and `ReSTIR`'s spatial reuse needed nothing: every neighbourhood
+read in `svgf.slang`, `accumulate.slang` and `restir.slang` was already clamped to the pixel's
+own tile (`nx`, `ny` tested against the tile, not the atlas), which is what made a multi-camera
+atlas correct in the first place. `batched_tiles_equal_single_renders` at N = 16 with SVGF on
+(stride up to 8 on 32-pixel tiles) is the proof that no tap crosses a border.
+
+### 14.2 The tree: one world-space BVH per env, and why not two levels
+
+Each env's block in the triangle buffer is its posed triangles and then a BVH built over exactly
+them — `Slot::pack`, which at offset 0 is the upload `upload_tris` always made, float for float.
+What is shared across envs is the part that does not depend on the pose: the per-geom local
+tessellation in `SceneCache` (section 8.2), one cache for the whole batch.
+
+The alternative the packet names — one BLAS per rigid body in its local frame, a TLAS (or a
+per-env instance list) of body transforms, the ray moved into the body frame on the device — is
+cheaper on the host and the upload, and **cannot meet the packet's own acceptance**. The single
+path, whose bytes every golden and committed frame pins (spec 28.10 rule 1), intersects
+world-space vertices that `SceneCache` posed in `f64` on the host and rounded to `f32` once.
+A two-level traversal intersects local vertices with an `f32` ray transformed on the device:
+different roundings, different `t`, and at a grazing edge a different triangle. So a tile could
+only equal the single render if the single render moved to two levels too, which moves every
+golden. The per-env world-space tree is the only layout in which "tile `k` == env `k` alone" is
+true by construction — the tile traverses *the same tree*, not an equivalent one.
+
+What it costs, measured by `pt_batched_cost` on the SO-101 cell (2,754 triangles, 2,047 BVH
+nodes):
+
+| per env | RTX 3060 box (Windows) | RTX 4090 box (Linux) |
+|---|---|---|
+| re-pose (cached tessellation) + BVH build, CPU time on one core | 0.50–0.88 ms | 0.47–0.90 ms |
+| upload (triangles + tree) | 289 KiB | 289 KiB |
+| that CPU time over the batched per-env `Pt` frame, N = 64, 4 spp / 64 spp | 12 % / 0.8 % | 45 % / 3.2 % |
+
+The batch builds its trees on every core (`std::thread::scope` over the envs, packed back in env
+order — the trees are pure functions of their triangles, so the bytes do not depend on the
+thread count), which is what the second row's 45 % becomes in wall clock: the 4090's 4-spp
+frame at N = 64 is 1.06 ms per env with it. Two-level would save the build and most of the
+upload: a real share at 4 spp on the 4090, a few percent at the sensor's 64 spp. It is the upgrade path the moment a scene is large
+enough for the build to show up — the same trigger section 8.2's `ponytail:` note names — and
+it comes with a golden regeneration, not before.
+
+### 14.3 One submission, one readback
+
+`render_batch` uploads every env's block in one buffer write, records the same passes as a
+single render over the whole atlas (tracer, SVGF iterations, tone map — each one dispatch over
+all envs), and `read_tiles` pulls each wanted channel back in one download. `read_tile` in a loop
+would have downloaded the whole atlas N times.
+
+### 14.4 Parity, measured
+
+`cargo test -p es-render --test render batched_tiles_equal_single_renders`: the SO-101 cell at
+32×32, 16 envs each with its own cube pose, camera offset and focal length, light direction,
+ambient, sky, sun, albedo gain and tick seed; N ∈ {1, 4, 16} on a square-ish grid, so the batch
+crosses tile rows as well as columns. Every tile is compared on **every channel** the path
+writes (`Rs`: `Rgb8`, depth, normal, segmentation; `Pt`: also `PtRadiance` and `History`)
+against the single path driven exactly as `EnvRenderer` drives it (`set_lighting`, `set_seed`,
+`upload_tris`, `render`), and the first 4 envs against `cpu::render_batch`:
+
+| claim | RTX 3060 (local) | RTX 4090 (oracle server) |
+|---|---|---|
+| `Rs`, N = 1 / 4 / 16: tile vs single render, every channel | bit-equal | bit-equal |
+| `Pt` 1 spp no NEE, 1 spp NEE ± SVGF, 16 spp NEE ± SVGF, N = 1 / 4 / 16 | bit-equal | bit-equal |
+| `Pt` 128 spp NEE + SVGF, 64 envs, two bands (`a_banded_frame_is_the_one_dispatch_frame`) | bit-equal | bit-equal |
+| `EnvBatchRenderer` vs four `EnvRenderer`s, `Rs` and `Pt` 4 spp NEE + SVGF `Tick`, X5 draws, 3 frames, a mid-run `begin_episode` | bit-equal | bit-equal |
+| `Rollout` with 2 envs (now batched) vs the collector (`rollout_frame_equals_collector_frame`) | bit-equal | not run (needs MuJoCo there) |
+| CPU vs GPU per tile: `Rgb8` | 0 bytes | 0 bytes |
+| CPU vs GPU per tile: `PtRadiance` 1 spp no NEE / NEE (± SVGF) | 0 ULP / ≤ 14 ULP, ≤ 5.9e-7 normalized | 0 ULP / ≤ 14 ULP, ≤ 5.9e-7 normalized |
+| CPU vs GPU per tile: depth | ≤ 4 ULP | ≤ 4 ULP |
+| `batch_so101_rs_rgb8` / `batch_so101_pt_rgb8`, GPU batch vs the golden | 0 / 0 bytes | 0 / 0 bytes |
+| every existing golden and GPU oracle of `es-render` and `render_loop` | pass | pass |
+
+The two cards agree to the ULP on every row, env by env.
+
+The CPU-vs-GPU rows are the **single path's** own agreement — the batched tiles are that path's
+bytes — at a camera that is not a golden's. Depth is a few ULP off the CPU there, as 13.4 found
+for a drawn pose; replacing the two remaining `Cross` builtins with `es_cross` made it *worse*
+(12 ULP, on the showcase camera), so the residue is `dot`'s unpinned summation order (9.3), not the builtin. The test
+holds depth to a relative 1e-5 and `Rgb8`, segmentation and the no-NEE radiance to bit-equality.
+
+The two `batch_*` goldens are 4 envs' `Rgb8` tiles stacked in env order, `Rs` and `Pt` 16 spp
+NEE, from `cpu::render_batch` only (`generate_batch_goldens`, its own generator so it cannot
+rewrite an older golden). Every existing golden and `so101_frame0` is byte-identical: the new
+parameter slots are read, never computed with.
+
+### 14.5 Bands: a frame the driver would kill
+
+The first cost run lost the device: 64 envs at 64 spp is one ~4 s dispatch on the RTX 3060, and
+Windows resets a device that stays busy past 2 s. So a `Pt` frame of more than 2^24 sample-
+bounces (`pixels * spp * bounces`) is traced in bands of whole workgroup rows, **each band its
+own submission**, the band's first row in global slot 40 (`pt.slang`'s `main` adds it to the
+thread id). The tracer's pixels read nothing another tracer pixel writes, so a banded frame is
+the one-dispatch frame; the later passes (SVGF, tone map) run once over the whole atlas after
+the last band. Every frame of today's sizes — a 96×96 64-spp 3-bounce observation is 1.8M — is
+one band, recorded exactly as before.
+
+### 14.6 Cost, measured on two cards
+
+`cargo test -p es-env --features render --test render_loop --release -- --ignored --nocapture
+pt_batched_cost`: the demo's 96×96 sensor (NEE, 3 bounces, exposure 64, `seed = "tick"`), the
+envs at N different ticks of the committed `nominal-00` trajectory, whole-frame wall clock
+(re-pose, BVH build, upload, dispatch, readback of `Rgb8`) over 4 frames after a warm-up. "single"
+is `EnvRenderer::frame` in the same process — the X3 path; "per env" is the batched frame
+divided by N. ms per env, the mean over 4 frames after a warm-up; repeated local runs on a card
+no other process was using agreed to within ~3 %.
+
+| spp | SVGF | N | 3060 single | 3060 batched | × | 4090 single | 4090 batched | × |
+|---|---|---|---|---|---|---|---|---|
+| 4 | off | 1 | 10.19 | 10.53 | 1.0 | 6.48 | 6.61 | 1.0 |
+| 4 | off | 4 | | 5.44 | 1.9 | | 2.03 | 3.2 |
+| 4 | off | 16 | | 4.39 | 2.3 | | 1.42 | 4.6 |
+| 4 | off | 64 | | 4.19 | 2.4 | | 1.06 | 6.1 |
+| 4 | on | 1 | 10.73 | 10.97 | 1.0 | 8.21 | 8.48 | 1.0 |
+| 4 | on | 4 | | 5.64 | 1.9 | | 2.52 | 3.3 |
+| 4 | on | 16 | | 4.51 | 2.4 | | 1.29 | 6.4 |
+| 4 | on | 64 | | 4.24 | 2.5 | | 1.05 | 7.8 |
+| 16 | off | 1 | 35.26 | 36.00 | 1.0 | 17.44 | 17.77 | 1.0 |
+| 16 | off | 4 | | 18.79 | 1.9 | | 5.17 | 3.4 |
+| 16 | off | 16 | | 15.16 | 2.3 | | 3.69 | 4.7 |
+| 16 | off | 64 | | 14.83 | 2.4 | | 3.14 | 5.6 |
+| 16 | on | 1 | 35.26 | 35.89 | 1.0 | 19.23 | 19.64 | 1.0 |
+| 16 | on | 4 | | 18.35 | 1.9 | | 5.63 | 3.4 |
+| 16 | on | 16 | | 15.27 | 2.3 | | 3.84 | 5.0 |
+| 16 | on | 64 | | 14.86 | 2.4 | | 3.17 | 6.1 |
+| 64 | off | 1 | 138.30 | 140.38 | 1.0 | 62.34 | 63.65 | 1.0 |
+| 64 | off | 4 | | 70.61 | 2.0 | | 18.05 | 3.5 |
+| 64 | off | 16 | | **59.94** | 2.3 | | **11.39** | 5.5 |
+| 64 | off | 64 | | 62.89 | 2.2 | | 14.68 | 4.2 |
+| 64 | on | 1 | 138.93 | 140.77 | 1.0 | 63.84 | 65.11 | 1.0 |
+| 64 | on | 4 | | 71.62 | 1.9 | | 18.40 | 3.5 |
+| 64 | on | 16 | | **60.32** | 2.3 | | **11.50** | 5.6 |
+| 64 | on | 64 | | 62.53 | 2.2 | | 14.71 | 4.3 |
+
+What it says:
+
+- **The 4090 was idle, the 3060 was not.** One 96×96 frame is 144 workgroups; the 4090 has 128
+  SMs and was running each of them nearly empty, so batching buys 5.5× at the sensor's 64 spp
+  (57.5 → 11.4 ms per env against 12.4's number, 62.3 → 11.4 in the same process). The 3060 was
+  already close to busy with one env and buys 2.3×. N = 1 on the batched path costs what the
+  single path costs, within 2 %.
+- **N = 16 is the sweet spot at 64 spp; N = 64 is slower per env** on both cards, because a
+  64-env 64-spp frame is 113M sample-bounces, seven bands (two at N = 16), and each band is a
+  submission that drains the device before the next starts. The band budget is the 3060's (Windows kills a longer
+  submission; the 4090 box would not); at 4 and 16 spp, where N = 64 is one or two bands, it is
+  the fastest per env.
+- **SVGF costs nothing measurable per env** once batched (four more dispatches over the atlas).
+- In spec 12.4's terms, the 4090 at N = 16, 64 spp: `camera_frames_per_sec` 88, `pixels_per_sec`
+  8.1e5 (one 96×96 frame per env per control step); the 3060: 16.7 and 1.5e5.
+
+X3's estimate of a reach PPO run at 57.5 ms per frame was ~65 h of rendering; at 11.4 ms it is
+~13 h — arithmetic on this table, not a measured run (`Target / Status: unverified`).
+
+### 14.7 What X3b skips
+
+- **A two-level BVH** (14.2): not before a scene's build shows up in the frame, and then with a
+  golden regeneration.
+- **A band size that follows the device.** The 2^24 budget is sized for the 3060 under Windows'
+  2 s limit and costs the 4090 ~25 % at N = 64, 64 spp (14.6). Sizing later bands from the first
+  band's wall clock would change the schedule, never a bit.
+- **Parallel re-posing.** The trees are built on every core; the re-pose (`drawn_frame` over one
+  `&mut SceneCache`) is still one env after another, ~0.1 ms each.
+- **Concurrent GPU tests on the 4090.** The first server run of `cargo test -p es-render --test
+  render` stalled for 20 minutes with ~15 test threads each holding its own `VkDevice`: one
+  thread spinning inside the driver, the others blocked on a driver mutex. With
+  `--test-threads=1` the whole suite passes in 67 s; locally the default parallel run passes.
+  Whether a new test tipped a driver limit or the stall is older is not known.
+- **Collector and evaluator batching.** `es loop collect` and `es eval run` still render one env
+  per `EnvRenderer`; they are outside the packet's scope.
+- **Temporal accumulation on a batch** is not refused (each tile's history is per pixel and
+  per view, as in a multi-camera atlas) but is not tested: the observation path accumulates
+  nothing (12.3).

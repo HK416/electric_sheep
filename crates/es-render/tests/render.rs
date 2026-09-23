@@ -1164,6 +1164,382 @@ fn gpu_atlas_packs_several_cameras() {
     );
 }
 
+// --- N envs in one dispatch (packet M11/X3b) -------------------------------------------------
+
+/// Tile size of the batch oracles: small enough that the CPU reference of 16 envs at 16 spp is
+/// seconds in a debug build, large enough that SVGF's stride-8 taps reach past a tile's edge.
+const BT: u32 = 32;
+
+type EnvInputs = (TriScene, CameraView, RenderConfig);
+
+/// Env `k` of a batch over the SO-101 cell: its own cube pose, its own camera offset and focal
+/// length, its own light (direction, ambient, sky, sun), its own albedo gain, and the seed `es_env::render::frame_seed` gives tick `k` — every per-env input a
+/// batched dispatch has to keep apart.
+fn batch_env(k: u32, base: &RenderConfig, cache: &mut es_render::SceneCache) -> EnvInputs {
+    use es_math::{Pose, Quat, Vec3};
+    let scene = so101();
+    let f = f64::from(k);
+    let cube = scene
+        .bodies
+        .iter()
+        .find(|b| b.name == "cube")
+        .expect("the SO-101 cell has a cube");
+    let (s, c) = (0.21 * f).sin_cos();
+    let world = std::collections::BTreeMap::from([(
+        cube.id,
+        Pose::new(
+            cube.pose.position + Vec3::new(0.011 * f - 0.08, 0.007 * f - 0.05, 0.004 * f),
+            Quat::from_xyzw(0.0, 0.0, s, c),
+        ),
+    )]);
+    let mut tri = cache.tri_scene(&scene, &world).expect("so101 tessellates");
+    let gain = [
+        1.0 - 0.03 * (k % 5) as f32,
+        1.0,
+        1.0 - 0.02 * (k % 3) as f32,
+    ];
+    for t in &mut tri.tris {
+        for (a, g) in t.albedo.iter_mut().zip(gain) {
+            *a *= g;
+        }
+    }
+    // The demo's observation camera, in the `OpenCV` frame `es_env::render::camera_view` puts
+    // it in (a pi turn about `+X`), then a per-env offset as a `camera.*.pose` draw makes one.
+    let overhead = scene
+        .cameras
+        .iter()
+        .find(|c| c.name.ends_with("overhead"))
+        .expect("the SO-101 cell has the overhead camera");
+    let mut cam = CameraView {
+        pose: overhead
+            .pose
+            .compose(Pose::new(Vec3::ZERO, Quat::from_xyzw(1.0, 0.0, 0.0, 0.0))),
+        spec: es_render::ImageSpec::pinhole(BT, BT, overhead.fovy),
+    };
+    let (s, c) = (0.004 * f).sin_cos();
+    cam.pose = cam.pose.compose(Pose::new(
+        Vec3::new(0.003 * f, -0.002 * f, 0.004 * f),
+        Quat::from_xyzw(s, 0.5 * s, 0.0, c),
+    ));
+    cam.spec.intrinsics.fx *= 1.0 + 0.02 * (k % 4) as f32;
+    cam.spec.intrinsics.fy *= 1.0 + 0.02 * (k % 4) as f32;
+
+    let mut cfg = base.clone();
+    cfg.light_dir = Vec3::new(0.3 - 0.07 * f, 0.4, 0.8).normalize();
+    cfg.ambient = 0.1 + 0.05 * (k % 4) as f32;
+    cfg.sky = [0.05 * (k % 3) as f32, 0.04, 0.03 + 0.01 * (k % 2) as f32];
+    cfg.light_rgb = [1.5 + 0.1 * f as f32, 1.4, 1.2];
+    cfg.seed = es_render::rng::mix32(base.seed ^ k);
+    (tri, cam, cfg)
+}
+
+fn batch_envs(n: u32, base: &RenderConfig) -> Vec<EnvInputs> {
+    let mut cache = es_render::SceneCache::default();
+    (0..n).map(|k| batch_env(k, base, &mut cache)).collect()
+}
+
+/// A renderer for `n` tiles of `base`'s path: a square-ish grid, so the batch crosses tile rows
+/// as well as columns.
+fn batch_cfg(base: &RenderConfig, n: u32) -> RenderConfig {
+    let per_row = (f64::from(n).sqrt().ceil() as u32).max(1);
+    let mut cfg = base.clone();
+    cfg.atlas = TileAtlasCfg {
+        tile_w: BT,
+        tile_h: BT,
+        tiles_per_row: per_row,
+        n_tiles: n,
+    };
+    cfg
+}
+
+/// Every channel `cfg` asks for, env by env, from the **single** path: one renderer, re-lit,
+/// re-seeded and re-uploaded per env exactly as `es_env::EnvRenderer::frame_with` drives it.
+fn single_renders(gpu: &Gpu, base: &RenderConfig, envs: &[EnvInputs]) -> Vec<Vec<Vec<u8>>> {
+    let mut r = Renderer::new(gpu, base.clone()).expect("renderer");
+    envs.iter()
+        .map(|(tri, view, cfg)| {
+            r.set_lighting(cfg);
+            r.set_seed(cfg.seed);
+            r.upload_tris(tri.clone()).expect("upload");
+            let mut atlas = r.render(&[*view]).expect("render");
+            base.channels
+                .iter()
+                .map(|ch| atlas.read_tile(0, *ch).expect("tile").to_bytes())
+                .collect()
+        })
+        .collect()
+}
+
+/// The four path configurations of oracle 1, plus the one estimator whose GPU/CPU rule is
+/// bitwise (1 spp, no NEE).
+fn batch_paths() -> Vec<(&'static str, RenderConfig)> {
+    let atlas = TileAtlasCfg::row(BT, BT, 1);
+    let pt = |spp: u32, svgf: bool| {
+        let mut c = RenderConfig::pt_nee(atlas, spp, 3);
+        c.path = RenderPath::Pt {
+            spp,
+            bounces: 3,
+            nee: true,
+            restir: false,
+            svgf,
+        };
+        c.exposure = 8.0;
+        c
+    };
+    vec![
+        ("Rs", RenderConfig::rs(atlas)),
+        ("Pt 1 spp, no NEE", RenderConfig::pt(atlas, 1, 2)),
+        ("Pt 1 spp", pt(1, false)),
+        ("Pt 1 spp + SVGF", pt(1, true)),
+        ("Pt 16 spp", pt(16, false)),
+        ("Pt 16 spp + SVGF", pt(16, true)),
+    ]
+}
+
+/// Packet M11/X3b oracle 1: N envs in one dispatch, every tile bit-identical to the single
+/// render of that env, on every channel the path writes, for N in {1, 4, 16}; and every tile
+/// against the CPU reference (`cpu::render_batch`, env `k` rendered alone as view 0) at the
+/// rules the single path already meets — `Rs` and `Pt` 1 spp without NEE bit for bit, `Pt`
+/// with NEE and SVGF within section 10's 1e-5 normalized / 0.1 % of `Rgb8` bytes.
+#[test]
+fn batched_tiles_equal_single_renders() {
+    let test = "batched_tiles_equal_single_renders";
+    let Some(gpu) = open(test) else { return };
+    for (label, base) in batch_paths() {
+        let envs = batch_envs(16, &base);
+        let singles = single_renders(&gpu, &base, &envs);
+        // The envs really are 16 different pictures.
+        let rgb = base
+            .channels
+            .iter()
+            .position(|c| *c == Channel::Rgb8)
+            .expect("Rgb8 is rendered");
+        for k in 1..envs.len() {
+            assert!(
+                singles[k][rgb] != singles[k - 1][rgb],
+                "{label}: envs {k} and {} render the same Rgb8",
+                k - 1
+            );
+        }
+        for n in [1u32, 4, 16] {
+            let mut r = Renderer::new(&gpu, batch_cfg(&base, n)).expect("renderer");
+            let mut atlas = r.render_batch(&envs[..n as usize]).expect("render_batch");
+            for (c, ch) in base.channels.iter().enumerate() {
+                let tiles = atlas.read_tiles(*ch).expect("tiles");
+                assert_eq!(tiles.len(), n as usize);
+                for (k, tile) in tiles.iter().enumerate() {
+                    assert!(
+                        tile.to_bytes() == singles[k][c],
+                        "{label}, N = {n}: tile {k} {ch:?} differs from the single render"
+                    );
+                }
+            }
+            println!("{label}, N = {n}: every tile, every channel, bit-equal to the single render");
+        }
+
+        // The CPU reference, 4 envs (16 at 16 spp is minutes of debug-build CPU).
+        let want = cpu::render_batch(&envs[..4]);
+        for (k, frame) in want.iter().enumerate() {
+            let got = |ch: Channel| {
+                let c = base
+                    .channels
+                    .iter()
+                    .position(|x| *x == ch)
+                    .expect("rendered");
+                singles[k][c].clone()
+            };
+            let cpu = |ch: Channel| frame.tile(ch).expect("rendered").to_bytes();
+            assert!(
+                got(Channel::SegmentationId) == cpu(Channel::SegmentationId),
+                "{label} env {k}: segmentation differs from the CPU"
+            );
+            let depth = |b: Vec<u8>| -> Vec<f32> {
+                b.chunks_exact(4)
+                    .map(|w| f32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+                    .collect()
+            };
+            let (dulp, _) = max_ulp(&depth(got(DEPTH)), &depth(cpu(DEPTH)));
+            let bytes = cpu(Channel::Rgb8);
+            let diff = got(Channel::Rgb8)
+                .iter()
+                .zip(&bytes)
+                .filter(|(a, b)| a != b)
+                .count();
+            let rad = matches!(base.path, RenderPath::Pt { .. }).then(|| {
+                let (g, w) = (
+                    depth(got(Channel::PtRadiance)),
+                    depth(cpu(Channel::PtRadiance)),
+                );
+                (max_ulp(&g, &w).0, max_normalized(&g, &w))
+            });
+            println!(
+                "{label} env {k} vs CPU: depth max ULP {dulp}, Rgb8 {diff} of {} bytes, \
+                 PtRadiance (max ULP, normalized) {rad:?}",
+                bytes.len()
+            );
+            // Not 0 ULP: these cameras are not the goldens' power-of-two quaternions, and `dot`'s
+            // summation order is not pinned between the two texts (`renderer.md` 9.3, 14.4).
+            // The single render measures the same ULPs -- the batch is bit-equal to it above.
+            let (dg, dc) = (depth(got(DEPTH)), depth(cpu(DEPTH)));
+            let drel = dg
+                .iter()
+                .zip(&dc)
+                .map(|(a, b)| (a - b).abs() / b.abs().max(1e-6))
+                .fold(0.0f32, f32::max);
+            assert!(
+                drel <= 1e-5,
+                "{label} env {k}: depth relative error {drel:e}"
+            );
+            match base.path {
+                RenderPath::Rs | RenderPath::Pt { nee: false, .. } => {
+                    assert_eq!(diff, 0, "{label} env {k}: Rgb8 must be bit-equal");
+                    if let Some((ulp, _)) = rad {
+                        assert_eq!(ulp, 0, "{label} env {k}: PtRadiance must be bit-equal");
+                    }
+                }
+                RenderPath::Pt { .. } => {
+                    let (_, norm) = rad.expect("Pt");
+                    assert!(
+                        norm <= 1e-5,
+                        "{label} env {k}: PtRadiance diverged by {norm:e}"
+                    );
+                    assert!(
+                        diff * 1000 <= bytes.len(),
+                        "{label} env {k}: {diff} Rgb8 bytes differ"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// A frame too big for one tracer dispatch is traced in bands of rows (packet M11/X3b), and
+/// the bands change no bit: 64 envs at 128 spp, 3 bounces, on an 8 x 8 grid of 32 x 32 tiles is
+/// 256 x 256 px x 384 sample-bounces = 25.2M, past the renderer's 2^24 budget, so two bands of
+/// 168 and 88 rows — the second starting mid-tile. Every tile still equals its env's single
+/// render, which is one band.
+#[test]
+fn a_banded_frame_is_the_one_dispatch_frame() {
+    let test = "a_banded_frame_is_the_one_dispatch_frame";
+    let Some(gpu) = open(test) else { return };
+    let (_, mut base) = batch_paths().swap_remove(5);
+    base.path = RenderPath::Pt {
+        spp: 128,
+        bounces: 3,
+        nee: true,
+        restir: false,
+        svgf: true,
+    };
+    let envs = batch_envs(64, &base);
+    let singles = single_renders(&gpu, &base, &envs);
+    let mut r = Renderer::new(&gpu, batch_cfg(&base, 64)).expect("renderer");
+    let mut atlas = r.render_batch(&envs).expect("render_batch");
+    for (c, ch) in base.channels.iter().enumerate() {
+        for (k, tile) in atlas.read_tiles(*ch).expect("tiles").iter().enumerate() {
+            assert!(
+                tile.to_bytes() == singles[k][c],
+                "tile {k} {ch:?} differs from the single render"
+            );
+        }
+    }
+    println!("RAN {test}: 64 envs, 128 spp + SVGF, two bands, every tile bit-equal");
+}
+
+/// The two `batch_*` goldens: 4 envs of the SO-101 cell, `Rs` and `Pt` 16 spp NEE, the four
+/// `Rgb8` tiles stacked in env order.
+const BATCH_GOLDENS: [(&str, usize, &str); 2] = [
+    (
+        "batch_so101_rs_rgb8",
+        0,
+        "raster.v1, 4 envs (per-env cube pose, camera, light, albedo gain, seed)",
+    ),
+    (
+        "batch_so101_pt_rgb8",
+        4,
+        "pt.v3 (16 spp, 3 bounces, NEE, Reinhard, exposure 8), 4 envs as batch_so101_rs_rgb8",
+    ),
+];
+
+fn batch_golden_bytes(path: usize) -> Vec<u8> {
+    let (_, base) = batch_paths().swap_remove(path);
+    cpu::render_batch(&batch_envs(4, &base))
+        .iter()
+        .flat_map(|f| f.tile(Channel::Rgb8).expect("rgb8").to_bytes())
+        .collect()
+}
+
+/// Writes the `batch_*` goldens from the **CPU** reference. Its own generator, so running it
+/// cannot touch any older golden.
+#[test]
+#[ignore = "golden generator; run explicitly"]
+fn generate_batch_goldens() {
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP generate_batch_goldens: set ES_GENERATE_GOLDENS=1 to rewrite the goldens");
+        return;
+    }
+    for (name, path, kernel) in BATCH_GOLDENS {
+        let bytes = batch_golden_bytes(path);
+        std::fs::write(golden_dir().join(format!("{name}.bin")), &bytes).expect("write bin");
+        let sidecar = serde_json::json!({
+            "name": name,
+            "dtype": "u8",
+            "layout": "row-major, little-endian, tightly packed; env tiles stacked in env order",
+            "shape": [4, BT, BT, 3],
+            "kernel": kernel,
+            "pins": "one tile per env, each the env rendered alone as view 0 (packet M11/X3b)",
+            "oracle": "es_render::cpu::render_batch, the pure-Rust mirror of the Slang kernels",
+            "generator": "cargo test -p es-render --test render -- --ignored generate_batch_goldens",
+            "spec": "docs/design/renderer.md",
+        });
+        std::fs::write(
+            golden_dir().join(format!("{name}.json")),
+            format!(
+                "{}\n",
+                serde_json::to_string_pretty(&sidecar).expect("json")
+            ),
+        )
+        .expect("write json");
+        println!("wrote {name} ({} bytes)", bytes.len());
+    }
+}
+
+/// Oracle 2: the CPU reproduces the `batch_*` goldens, and the device's batched dispatch does
+/// too — `Rs` bit for bit, `Pt` NEE at the shadow-ray-tie rule.
+#[test]
+fn batch_goldens_are_the_cpu_and_the_device_renders_them() {
+    let test = "batch_goldens_are_the_cpu_and_the_device_renders_them";
+    for (name, path, _) in BATCH_GOLDENS {
+        assert!(
+            batch_golden_bytes(path) == read_golden(name),
+            "{name} differs from its golden"
+        );
+    }
+    let Some(gpu) = open(test) else { return };
+    for (name, path, _) in BATCH_GOLDENS {
+        let (_, base) = batch_paths().swap_remove(path);
+        let mut r = Renderer::new(&gpu, batch_cfg(&base, 4)).expect("renderer");
+        let got: Vec<u8> = r
+            .render_batch(&batch_envs(4, &base))
+            .expect("render_batch")
+            .read_tiles(Channel::Rgb8)
+            .expect("tiles")
+            .iter()
+            .flat_map(Tile::to_bytes)
+            .collect();
+        let want = read_golden(name);
+        let diff = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        println!(
+            "{name}: GPU batch vs golden, {diff} of {} bytes differ",
+            want.len()
+        );
+        if path == 0 {
+            assert_eq!(diff, 0, "{name}: Rs must be bit-equal");
+        } else {
+            assert!(diff * 1000 <= want.len(), "{name}: {diff} bytes differ");
+        }
+    }
+}
+
 // --- cached tessellation and the BVH (packet M7/R1) ------------------------------------------
 
 /// Three "ticks" of body poses for `scene`: the home pose, then two hand-set rigid motions

@@ -780,6 +780,18 @@ fn nee_direct(
     out
 }
 
+/// The reference for [`crate::Renderer::render_batch`] (packet M11/X3b): tile `k` is env `k`
+/// rendered alone as view 0 — its own BVH over its own triangles, its own seed and light, view
+/// 0's sample keys — which is the claim the batched dispatch makes about each of its tiles.
+pub fn render_batch(envs: &[(TriScene, CameraView, RenderConfig)]) -> Vec<Frame> {
+    envs.iter()
+        .map(|(tri, view, cfg)| match cfg.path {
+            RenderPath::Rs => rasterize(tri, view, cfg, 0),
+            RenderPath::Pt { .. } => path_trace(tri, view, cfg, 0),
+        })
+        .collect()
+}
+
 /// Path-trace one view (spec 15.3 `PT`, spec 1.9 item 2), with no history: one frame
 /// standing alone, which is what every golden but `cornell_pt_accum8_rgb8` pins.
 pub fn path_trace(

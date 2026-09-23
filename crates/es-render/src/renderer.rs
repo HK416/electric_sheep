@@ -22,10 +22,20 @@ use crate::view::{
 };
 
 /// Globals before the per-view records in the parameter buffer. Slots 0..20 are M4's and
-/// never move; 20..31 are packet M7/R2's shading block, 31..37 packet M7/R3's `Pt` block and
-/// 37..39 packet M7/R4's temporal block, each appended at the end (`common.slang` mirrors
-/// every number).
-const PARAM_VIEW_BASE: usize = 39;
+/// never move; 20..31 are packet M7/R2's shading block, 31..37 packet M7/R3's `Pt` block,
+/// 37..39 packet M7/R4's temporal block, 39 packet M11/X3b's triangle base and 40 its band
+/// row, each appended at the end (`common.slang` mirrors every number). A batched render
+/// appends one copy of these slots per env after the view records
+/// ([`Renderer::render_batch`]).
+const GLOBALS: usize = 41;
+const PARAM_VIEW_BASE: usize = GLOBALS;
+/// The first atlas row of the tracer's current band (packet M11/X3b): 0 but for the second
+/// and later bands of a frame too big for one dispatch.
+const BAND_SLOT: usize = 40;
+/// Sample-bounces (`pixels * spp * bounces`) one tracer dispatch may carry before the frame is
+/// split into bands: about 0.6 s of the SO-101 scene on an RTX 3060, well inside the 2 s a
+/// Windows driver gives a busy device. A single 96x96 64-spp 3-bounce frame is 1.8M, one band.
+const BAND_BUDGET: u64 = 1 << 24;
 /// Floats per direct-lighting reservoir (mirrors `restir.slang`).
 const RES_STRIDE: u64 = 8;
 /// Floats per pixel of the temporal history (mirrors `common.slang`'s `ES_HIST_STRIDE` and
@@ -86,6 +96,19 @@ impl Atlas<'_> {
         self.n_views
     }
 
+    /// Every tile of one channel, in view order, from **one** download of the channel buffer —
+    /// [`Self::read_tile`] per tile would download the whole atlas once per tile (packet
+    /// M11/X3b).
+    pub fn read_tiles(&mut self, channel: Channel) -> Result<Vec<Tile>, RenderError> {
+        let Some(buffer) = self.channels.get_mut(&channel) else {
+            return Err(RenderError::UnsupportedChannel { channel });
+        };
+        let words = buffer.download()?;
+        Ok((0..self.n_views)
+            .map(|cam| tile_of(&words, self.layout, cam, channel))
+            .collect())
+    }
+
     /// Read one camera's tile of one channel back to the host as a row-major `[h, w, c]`
     /// tensor. [`Channel::Rgb8`] is stored as packed `RGBA8` on the device; the unused alpha
     /// is dropped here.
@@ -100,52 +123,57 @@ impl Atlas<'_> {
             });
         }
         let words = buffer.download()?;
-        let cfg = self.layout.cfg;
-        let (ox, oy) = self.layout.tile_origin(cam);
-        let per_px = words_per_pixel(channel) as usize;
-        let (tw, th) = (cfg.tile_w as usize, cfg.tile_h as usize);
-        let aw = self.layout.width as usize;
+        Ok(tile_of(&words, self.layout, cam, channel))
+    }
+}
 
-        let word = |i: usize| {
-            let b = i * 4;
-            u32::from_le_bytes([words[b], words[b + 1], words[b + 2], words[b + 3]])
-        };
-        let mut u8_out = Vec::new();
-        let mut u32_out = Vec::new();
-        let mut f32_out = Vec::new();
-        for y in 0..th {
-            for x in 0..tw {
-                let src = ((oy as usize + y) * aw + ox as usize + x) * per_px;
-                match channel {
-                    Channel::Rgb8 => {
-                        let w = word(src);
-                        u8_out.extend_from_slice(&[
-                            (w & 0xff) as u8,
-                            ((w >> 8) & 0xff) as u8,
-                            ((w >> 16) & 0xff) as u8,
-                        ]);
-                    }
-                    Channel::SegmentationId | Channel::History => u32_out.push(word(src)),
-                    _ => {
-                        for c in 0..per_px {
-                            f32_out.push(f32::from_bits(word(src + c)));
-                        }
+/// Tile `cam` of one channel out of that channel's downloaded atlas bytes.
+fn tile_of(words: &[u8], layout: AtlasLayout, cam: u32, channel: Channel) -> Tile {
+    let cfg = layout.cfg;
+    let (ox, oy) = layout.tile_origin(cam);
+    let per_px = words_per_pixel(channel) as usize;
+    let (tw, th) = (cfg.tile_w as usize, cfg.tile_h as usize);
+    let aw = layout.width as usize;
+
+    let word = |i: usize| {
+        let b = i * 4;
+        u32::from_le_bytes([words[b], words[b + 1], words[b + 2], words[b + 3]])
+    };
+    let mut u8_out = Vec::new();
+    let mut u32_out = Vec::new();
+    let mut f32_out = Vec::new();
+    for y in 0..th {
+        for x in 0..tw {
+            let src = ((oy as usize + y) * aw + ox as usize + x) * per_px;
+            match channel {
+                Channel::Rgb8 => {
+                    let w = word(src);
+                    u8_out.extend_from_slice(&[
+                        (w & 0xff) as u8,
+                        ((w >> 8) & 0xff) as u8,
+                        ((w >> 16) & 0xff) as u8,
+                    ]);
+                }
+                Channel::SegmentationId | Channel::History => u32_out.push(word(src)),
+                _ => {
+                    for c in 0..per_px {
+                        f32_out.push(f32::from_bits(word(src + c)));
                     }
                 }
             }
         }
-        let comps = match channel {
-            Channel::Rgb8 => 3,
-            _ => per_px,
-        };
-        let shape = [th, tw, comps];
-        let data = match channel {
-            Channel::Rgb8 => TileData::U8(u8_out),
-            Channel::SegmentationId | Channel::History => TileData::U32(u32_out),
-            _ => TileData::F32(f32_out),
-        };
-        Ok(Tile { shape, data })
     }
+    let comps = match channel {
+        Channel::Rgb8 => 3,
+        _ => per_px,
+    };
+    let shape = [th, tw, comps];
+    let data = match channel {
+        Channel::Rgb8 => TileData::U8(u8_out),
+        Channel::SegmentationId | Channel::History => TileData::U32(u32_out),
+        _ => TileData::F32(f32_out),
+    };
+    Tile { shape, data }
 }
 
 struct Pipelines<'gpu> {
@@ -179,7 +207,8 @@ pub struct Renderer<'gpu> {
     cfg: RenderConfig,
     layout: AtlasLayout,
     pipelines: Pipelines<'gpu>,
-    /// The triangles, then the BVH. Persistent across frames.
+    /// The triangles, then the BVH — one such block per env after a batched render.
+    /// Persistent across frames.
     tris: Buffer<'gpu>,
     /// Persistent too: the globals, the per-view records and the `ReSTIR` light count.
     params_buf: Buffer<'gpu>,
@@ -187,12 +216,8 @@ pub struct Renderer<'gpu> {
     /// nothing on the host. Persistent, atlas-sized.
     hit_tri: Buffer<'gpu>,
     tri_scene: TriScene,
-    n_tri: u32,
-    n_lights: u32,
-    /// Where the BVH starts inside `tris`, in floats, and how many nodes it has.
-    bvh_base: u32,
-    bvh_nodes: u32,
-    bvh_prim_base: u32,
+    /// Where [`Self::upload_tris`]'s scene sits inside `tris`.
+    slot: Slot,
     /// Previous-frame reservoirs for `ReSTIR` temporal reuse. Empty until the first render
     /// finishes, which is why the temporal pass is a no-op on frame 1 (see the design doc).
     prev_reservoirs: Option<Buffer<'gpu>>,
@@ -213,7 +238,7 @@ impl std::fmt::Debug for Renderer<'_> {
         f.debug_struct("Renderer")
             .field("layout", &self.layout)
             .field("path", &self.cfg.path)
-            .field("n_tri", &self.n_tri)
+            .field("n_tri", &self.slot.n_tri)
             .finish_non_exhaustive()
     }
 }
@@ -286,11 +311,7 @@ impl<'gpu> Renderer<'gpu> {
             params_buf: Buffer::new(gpu, 4, Usage::Storage)?,
             hit_tri: Buffer::new(gpu, 4, Usage::Storage)?,
             tri_scene: TriScene::default(),
-            n_tri: 0,
-            n_lights: 0,
-            bvh_base: 0,
-            bvh_nodes: 0,
-            bvh_prim_base: 0,
+            slot: Slot::default(),
             prev_reservoirs: None,
             history: Buffer::new(gpu, 4, Usage::Storage)?,
             history_px: 0,
@@ -356,44 +377,46 @@ impl<'gpu> Renderer<'gpu> {
     /// seven descriptors to this kernel and the tree is not worth an eighth, a second
     /// staging copy or a renumbering of every shader's bindings.
     pub fn upload_tris(&mut self, tri: TriScene) -> Result<(), RenderError> {
-        let bvh = Bvh::build(&tri.tris);
-        let mut floats = tri.to_floats();
-        self.bvh_base = u32::try_from(floats.len()).unwrap_or(u32::MAX);
-        self.bvh_nodes = u32::try_from(bvh.nodes.len()).unwrap_or(u32::MAX);
-        self.bvh_prim_base = self.bvh_base + self.bvh_nodes * NODE_STRIDE as u32;
-        floats.extend(bvh.to_floats());
-        let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
-        grow(self.gpu, &mut self.tris, bytes.len() as u64)?;
-        self.tris.upload(&bytes)?;
-        self.n_tri = u32::try_from(tri.tris.len()).unwrap_or(u32::MAX);
-        self.n_lights = u32::try_from(tri.lights.len()).unwrap_or(u32::MAX);
+        let mut floats = Vec::new();
+        self.slot = Slot::pack(&tri, &Bvh::build(&tri.tris), &mut floats);
+        self.upload_floats(&floats)?;
         self.tri_scene = tri;
         Ok(())
     }
 
-    fn params(&self, cameras: &[CameraView], history_valid: &[bool]) -> Vec<f32> {
+    fn upload_floats(&mut self, floats: &[f32]) -> Result<(), RenderError> {
+        let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
+        grow(self.gpu, &mut self.tris, bytes.len() as u64)?;
+        self.tris.upload(&bytes)?;
+        Ok(())
+    }
+
+    /// The globals block: the scene at `slot`, lit and seeded by `lit` (`light_dir`,
+    /// `light_rgb`, `ambient`, `sky`, `shading`, `seed` — the fields [`Self::set_lighting`] and
+    /// [`Self::set_seed`] move), everything else from the renderer's own config.
+    fn globals(&self, lit: &RenderConfig, slot: &Slot, n_views: usize) -> [f32; GLOBALS] {
         let cfg = &self.cfg;
-        let mut p = vec![0.0f32; PARAM_VIEW_BASE + cameras.len() * VIEW_STRIDE];
-        p[0] = f32::from_bits(self.n_tri);
-        p[1] = f32::from_bits(cameras.len() as u32);
+        let mut p = [0.0f32; GLOBALS];
+        p[0] = f32::from_bits(slot.n_tri);
+        p[1] = f32::from_bits(n_views as u32);
         p[2] = f32::from_bits(cfg.atlas.tile_w);
         p[3] = f32::from_bits(cfg.atlas.tile_h);
         p[4] = f32::from_bits(cfg.atlas.tiles_per_row);
         p[5] = f32::from_bits(self.layout.rows);
-        p[6] = cfg.light_dir.x as f32;
-        p[7] = cfg.light_dir.y as f32;
-        p[8] = cfg.light_dir.z as f32;
-        p[9] = cfg.ambient;
-        p[10] = cfg.sky[0];
-        p[11] = cfg.sky[1];
-        p[12] = cfg.sky[2];
-        p[13] = f32::from_bits(cfg.seed);
+        p[6] = lit.light_dir.x as f32;
+        p[7] = lit.light_dir.y as f32;
+        p[8] = lit.light_dir.z as f32;
+        p[9] = lit.ambient;
+        p[10] = lit.sky[0];
+        p[11] = lit.sky[1];
+        p[12] = lit.sky[2];
+        p[13] = f32::from_bits(lit.seed);
         p[14] = f32::from_bits(cfg.spp().max(1));
         p[15] = f32::from_bits(cfg.bounces().max(1));
-        p[16] = f32::from_bits(self.n_lights);
-        p[17] = f32::from_bits(self.bvh_base);
-        p[18] = f32::from_bits(self.bvh_nodes);
-        p[19] = f32::from_bits(self.bvh_prim_base);
+        p[16] = f32::from_bits(slot.n_lights);
+        p[17] = f32::from_bits(slot.bvh_base);
+        p[18] = f32::from_bits(slot.bvh_nodes);
+        p[19] = f32::from_bits(slot.prim_base);
         // The `Rs` shading block (packet M7/R2). `Lambert` writes the flag and leaves the
         // rest zero; the kernel reads none of it then.
         if let Shading::Full {
@@ -403,7 +426,7 @@ impl<'gpu> Renderer<'gpu> {
             sky_rgb,
             ground_rgb,
             ..
-        } = cfg.shading
+        } = lit.shading
         {
             p[20] = f32::from_bits(1);
             p[21] = f32::from_bits(u32::from(shadows));
@@ -411,13 +434,13 @@ impl<'gpu> Renderer<'gpu> {
             p[23] = shininess;
             p[24..27].copy_from_slice(&sky_rgb);
             p[27..30].copy_from_slice(&ground_rgb);
-            p[30] = f32::from_bits(cfg.shading.ssaa());
+            p[30] = f32::from_bits(lit.shading.ssaa());
         }
         // The `Pt` block (packet M7/R3). At the defaults every one of these is what the
         // pre-R3 kernel behaved as: no NEE, a directional light with zero radiance, exposure
         // 1, Reinhard.
         p[31] = f32::from_bits(u32::from(cfg.nee()));
-        p[32..35].copy_from_slice(&cfg.light_rgb);
+        p[32..35].copy_from_slice(&lit.light_rgb);
         p[35] = cfg.exposure;
         p[36] = f32::from_bits(match cfg.tonemap {
             Tonemap::Reinhard => 0,
@@ -427,6 +450,21 @@ impl<'gpu> Renderer<'gpu> {
         // pre-R4 kernel byte for byte.
         p[37] = f32::from_bits(cfg.max_history().unwrap_or(0));
         p[38] = f32::from_bits(self.frame);
+        p[39] = f32::from_bits(slot.tri_base);
+        p
+    }
+
+    /// The parameter buffer: the globals, one record per view, then `envs` (one globals block
+    /// per view, a batched render only).
+    fn params(
+        &self,
+        cameras: &[CameraView],
+        history_valid: &[bool],
+        envs: &[[f32; GLOBALS]],
+    ) -> Vec<f32> {
+        let views_end = PARAM_VIEW_BASE + cameras.len() * VIEW_STRIDE;
+        let mut p = self.globals(&self.cfg, &self.slot, cameras.len()).to_vec();
+        p.resize(views_end, 0.0);
         for (i, cam) in cameras.iter().enumerate() {
             let base = PARAM_VIEW_BASE + i * VIEW_STRIDE;
             p[base..base + VIEW_STRIDE].copy_from_slice(&ViewParams::new(cam).to_floats());
@@ -434,6 +472,19 @@ impl<'gpu> Renderer<'gpu> {
             // because only the host has both frames' `ViewParams`.
             p[base + 13] =
                 f32::from_bits(u32::from(history_valid.get(i).copied().unwrap_or(false)));
+            // Pad slots 14 and 15 (packet M11/X3b): where this view's globals are, and the
+            // view index its sample keys use. A single render: the globals, and its own index.
+            // A batched one: its env's block, and view 0 -- what the env's single render uses.
+            let (env_base, key_view) = if envs.is_empty() {
+                (0, i as u32)
+            } else {
+                ((views_end + i * GLOBALS) as u32, 0)
+            };
+            p[base + 14] = f32::from_bits(env_base);
+            p[base + 15] = f32::from_bits(key_view);
+        }
+        for env in envs {
+            p.extend_from_slice(env);
         }
         p
     }
@@ -500,6 +551,22 @@ impl<'gpu> Renderer<'gpu> {
         Ok(())
     }
 
+    /// Atlas rows per tracer band: all of them on `Rs` and on any frame within
+    /// [`BAND_BUDGET`], else the most whole workgroup rows that fit (at least one).
+    fn band_rows(&self) -> u32 {
+        let RenderPath::Pt { .. } = self.cfg.path else {
+            return self.layout.height;
+        };
+        let per_row = u64::from(self.layout.width)
+            * u64::from(self.cfg.spp().max(1))
+            * u64::from(self.cfg.bounces().max(1));
+        let rows = BAND_BUDGET / per_row.max(1);
+        if rows >= u64::from(self.layout.height) {
+            return self.layout.height;
+        }
+        (rows as u32 / WORKGROUP * WORKGROUP).max(WORKGROUP)
+    }
+
     fn new_buffer(&self, words: u64) -> Result<Buffer<'gpu>, RenderError> {
         Ok(Buffer::new(self.gpu, (words * 4).max(4), Usage::Storage)?)
     }
@@ -510,6 +577,74 @@ impl<'gpu> Renderer<'gpu> {
     /// call, at the same pixel and with no motion-vector reprojection: it is a no-op on the
     /// first call and assumes a static camera afterwards.
     pub fn render(&mut self, cameras: &[CameraView]) -> Result<Atlas<'gpu>, RenderError> {
+        self.render_views(cameras, &[])
+    }
+
+    /// Render N envs in one dispatch (packet M11/X3b): env `k` — its own world-space
+    /// triangles, camera, light and seed — into tile `k`, each tile bit for bit what
+    /// [`Self::render`] makes of that env alone after [`Self::set_lighting`] and
+    /// [`Self::set_seed`] with its config and [`Self::upload_tris`] with its triangles.
+    ///
+    /// Of each env's [`RenderConfig`] only what those two setters move is read (`light_dir`,
+    /// `light_rgb`, `ambient`, `sky`, `shading`, `seed`); its `path` must be the renderer's,
+    /// and the atlas, channels and estimator are the renderer's own. Every env gets its own
+    /// block in the triangle buffer — the triangles, then a BVH built over exactly them — so a
+    /// tile traverses exactly the tree its single render traverses (`docs/design/renderer.md`
+    /// section 14 says why that is the tree and not a two-level one). The scene
+    /// [`Self::upload_tris`] uploaded is gone afterwards: upload again before a [`Self::render`].
+    pub fn render_batch(
+        &mut self,
+        envs: &[(TriScene, CameraView, RenderConfig)],
+    ) -> Result<Atlas<'gpu>, RenderError> {
+        if let Some((_, _, c)) = envs.iter().find(|(_, _, c)| c.path != self.cfg.path) {
+            return Err(RenderError::Config(format!(
+                "a batched env renders {:?}, the renderer {:?}",
+                c.path, self.cfg.path
+            )));
+        }
+        // Every env's tree is a pure function of its own triangles, so they are built on every
+        // core and packed in env order: the same trees, the same bytes, less wall clock.
+        let workers = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+        let per = envs.len().div_ceil(workers).max(1);
+        let trees: Vec<Bvh> = std::thread::scope(|s| {
+            let parts: Vec<_> = envs
+                .chunks(per)
+                .map(|part| {
+                    s.spawn(move || {
+                        part.iter()
+                            .map(|(tri, _, _)| Bvh::build(&tri.tris))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect();
+            parts
+                .into_iter()
+                .flat_map(|h| h.join().expect("a BVH build panicked"))
+                .collect()
+        });
+        let mut floats = Vec::new();
+        let slots: Vec<Slot> = envs
+            .iter()
+            .zip(&trees)
+            .map(|((tri, _, _), bvh)| Slot::pack(tri, bvh, &mut floats))
+            .collect();
+        self.upload_floats(&floats)?;
+        self.slot = Slot::default();
+        self.tri_scene = TriScene::default();
+        let cameras: Vec<CameraView> = envs.iter().map(|(_, view, _)| *view).collect();
+        let blocks: Vec<[f32; GLOBALS]> = envs
+            .iter()
+            .zip(&slots)
+            .map(|((_, _, lit), slot)| self.globals(lit, slot, cameras.len()))
+            .collect();
+        self.render_views(&cameras, &blocks)
+    }
+
+    fn render_views(
+        &mut self,
+        cameras: &[CameraView],
+        envs: &[[f32; GLOBALS]],
+    ) -> Result<Atlas<'gpu>, RenderError> {
         self.validate(cameras)?;
         let px = self.layout.pixels();
         let groups = [
@@ -519,7 +654,7 @@ impl<'gpu> Renderer<'gpu> {
         ];
 
         let history_valid = self.prepare_history(cameras, px)?;
-        let params_f = self.params(cameras, &history_valid);
+        let params_f = self.params(cameras, &history_valid, envs);
         let params_bytes: Vec<u8> = params_f.iter().flat_map(|f| f.to_le_bytes()).collect();
         grow(self.gpu, &mut self.params_buf, params_bytes.len() as u64)?;
         self.params_buf.upload(&params_bytes)?;
@@ -557,20 +692,45 @@ impl<'gpu> Renderer<'gpu> {
 
         self.pipelines.primary.reset_descriptors()?;
         let mut rec = CommandRecorder::new(self.gpu)?;
-        match (&pt_rgb8, &pt_history) {
-            (Some(rgb8), Some(hist_out)) => rec.dispatch(
-                &self.pipelines.primary,
-                &[
-                    params, &self.tris, &color, &depth, &seg, &normal, hit_tri, rgb8, history,
-                    hist_out,
-                ],
-                groups,
-            )?,
-            _ => rec.dispatch(
-                &self.pipelines.primary,
-                &[params, &self.tris, &color, &depth, &seg, &normal, hit_tri],
-                groups,
-            )?,
+        // A `Pt` frame with more work than one dispatch should carry is traced in bands of atlas
+        // rows, each band its own submission (packet M11/X3b): a 64-env, 64-spp batch is one
+        // ~4 s dispatch on an RTX 3060, and Windows resets a device that stays busy past 2 s.
+        // A pixel reads nothing another pixel of the tracer writes, so the bands are the one
+        // dispatch's bits. Every frame of today's sizes is one band, exactly as before.
+        let band = self.band_rows();
+        let mut band_params: Vec<Buffer<'gpu>> = Vec::new();
+        let mut row0 = 0;
+        loop {
+            let rows = band.min(self.layout.height - row0);
+            let g = [groups[0], rows.div_ceil(WORKGROUP), 1];
+            let p = band_params.last().unwrap_or(params);
+            match (&pt_rgb8, &pt_history) {
+                (Some(rgb8), Some(hist_out)) => rec.dispatch(
+                    &self.pipelines.primary,
+                    &[
+                        p, &self.tris, &color, &depth, &seg, &normal, hit_tri, rgb8, history,
+                        hist_out,
+                    ],
+                    g,
+                )?,
+                _ => rec.dispatch(
+                    &self.pipelines.primary,
+                    &[p, &self.tris, &color, &depth, &seg, &normal, hit_tri],
+                    g,
+                )?,
+            }
+            row0 += rows;
+            if row0 >= self.layout.height {
+                break;
+            }
+            rec.submit_and_wait()?;
+            rec = CommandRecorder::new(self.gpu)?;
+            let mut f = params_f.clone();
+            f[BAND_SLOT] = f32::from_bits(row0);
+            let bytes: Vec<u8> = f.iter().flat_map(|v| v.to_le_bytes()).collect();
+            let mut b = self.new_buffer(f.len() as u64)?;
+            b.upload(&bytes)?;
+            band_params.push(b);
         }
 
         // The variance estimate, after every pixel's accumulated colour is written (its
@@ -736,5 +896,38 @@ impl<'gpu> Renderer<'gpu> {
             n_views: cameras.len() as u32,
             channels,
         })
+    }
+}
+
+/// Where one scene sits inside the triangle buffer, in floats and counts (packet M11/X3b): the
+/// scene-dependent half of the globals block.
+#[derive(Clone, Copy, Debug, Default)]
+struct Slot {
+    tri_base: u32,
+    n_tri: u32,
+    n_lights: u32,
+    bvh_base: u32,
+    bvh_nodes: u32,
+    prim_base: u32,
+}
+
+impl Slot {
+    /// Append `tri`'s triangles and then `bvh`, the tree over them, to `floats`. At an empty
+    /// `floats` this is the upload [`Renderer::upload_tris`] always made, float for float.
+    fn pack(tri: &TriScene, bvh: &Bvh, floats: &mut Vec<f32>) -> Self {
+        let at = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let tri_base = at(floats.len());
+        floats.extend(tri.to_floats());
+        let bvh_base = at(floats.len());
+        let bvh_nodes = at(bvh.nodes.len());
+        floats.extend(bvh.to_floats());
+        Self {
+            tri_base,
+            n_tri: at(tri.tris.len()),
+            n_lights: at(tri.lights.len()),
+            bvh_base,
+            bvh_nodes,
+            prim_base: bvh_base + bvh_nodes * NODE_STRIDE as u32,
+        }
     }
 }
