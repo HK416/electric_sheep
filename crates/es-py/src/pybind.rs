@@ -616,11 +616,14 @@ impl Rollout {
         on!(self, r => r.tick())
     }
 
-    /// The nine spec 12.4 fields plus `chunk_underrun_rate`, `None` where nothing measured
-    /// them. There is deliberately no single `step/s`.
+    /// The nine spec 12.4 fields plus `chunk_underrun_rate` and `render_ms_per_frame` (the
+    /// whole-frame render cost of an image observation, packet M11/X3), `None` where nothing
+    /// measured them. There is deliberately no single `step/s`.
     fn metrics(&mut self) -> BTreeMap<String, Option<f64>> {
         let m = on!(self, r => r.metrics());
+        let render_ms = on!(self, r => r.render_ms_per_frame());
         [
+            ("render_ms_per_frame", render_ms),
             ("physics_steps_per_sec", m.physics_steps_per_sec),
             ("camera_frames_per_sec", m.camera_frames_per_sec),
             ("pixels_per_sec", m.pixels_per_sec),

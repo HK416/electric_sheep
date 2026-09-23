@@ -18,6 +18,17 @@
 //! `joint_state`, made `pub` by this packet): a second implementation is how a trainer and an
 //! evaluation quietly start reading two different observations off one state.
 //!
+//! **Images** (packet M11/X3). Built with the `render` feature, `Rollout` owns one
+//! `es_env::EnvRenderer` per env for the Observation IR's one `ImageInput`, configured by
+//! `es_env::render::sensor_cfg` from the Task IR channel that declares that sensor -- the
+//! function `es loop collect --frames` and `es eval run --frames` build theirs with -- and hands
+//! its `frame` to the same `capture` as a frame source. Each env's reset calls that env's
+//! `EnvRenderer::begin_episode`, so a `seed = "tick"` sensor keys its samples on the tick of
+//! *that env's* episode, and a `Rollout` frame at `(episode, tick)` is the collector's frame at
+//! the same `(episode, tick)`, bit for bit (`crates/es-py/tests/vision_reach.rs`). One frame
+//! per env per [`Rollout::observe`]: the tick is the render index, as it is for the collector.
+//! Without the feature an image input is refused by name at `observe`, as it always was.
+//!
 //! Horizon 1, synchronous: PPO acts on every control tick, so the chunk handed to the plane
 //! carries exactly one row under a fresh `seq` and there is no chunk buffer and no declared
 //! latency here (`rl-continuation.md` section 3). The **evaluation** of the same policy runs
@@ -25,6 +36,7 @@
 //! honest rather than the trainer's own.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use es_assets::scene::{Actuator, SceneDesc};
 use es_compile::{CpuPlan, PlanMode, Tensor, TensorRef};
@@ -75,6 +87,9 @@ pub enum RolloutError {
     /// mapping report, `PhysX` is not implemented (packet M11/X1).
     #[error("{0}")]
     Backend(String),
+    /// The renderer could not be built for the observation's image input (packet M11/X3).
+    #[error("render: {0}")]
+    Render(String),
     #[error("{what}: expected {expected} values, got {got}")]
     Shape {
         what: &'static str,
@@ -128,6 +143,19 @@ pub struct Rollout<const NJ: usize, const H: usize> {
     seq: u64,
     /// Scratch, allocated once: the post-plane command handed to `Env::step`.
     ctrl: Vec<f64>,
+    /// One renderer per env for the image input, empty when the observation has none (packet
+    /// M11/X3). Per env because the `Tick` seed clock is per-episode state.
+    #[cfg(feature = "render")]
+    cameras: Vec<es_env::EnvRenderer<'static>>,
+    /// The image bytes each env's last [`Rollout::observe`] captured, empty without one: the
+    /// plan's own input buffer, moved here after the plan ran rather than copied.
+    frames: Vec<Vec<u8>>,
+    /// Whole-frame wall clock (re-pose, upload, trace, readback) and the frames it covers --
+    /// the render row of spec 12.4.
+    render_wall: Duration,
+    rendered: u64,
+    /// Width x height of one frame, for `pixels_per_sec`.
+    frame_pixels: u64,
 }
 
 /// The env on the backend `Rollout` was built for (packet M11/X1): a closed enum over the two
@@ -280,6 +308,14 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
                 })?);
         }
         let sources = input_sources(&plans[0], &obs, &task, Some(env.model()))?;
+        #[cfg(feature = "render")]
+        let cameras = cameras(&sources, &task, &scene, n_envs)?;
+        #[cfg(feature = "render")]
+        let frame_pixels = cameras
+            .first()
+            .map_or(0, |c| u64::from(c.cfg().width) * u64::from(c.cfg().height));
+        #[cfg(not(feature = "render"))]
+        let frame_pixels = 0;
         let mut planes = Vec::with_capacity(n_envs as usize);
         for _ in 0..n_envs {
             planes.push(
@@ -300,6 +336,12 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
             step: 0,
             seq: 0,
             ctrl: vec![0.0; n_envs as usize * nu],
+            #[cfg(feature = "render")]
+            cameras,
+            frames: vec![Vec::new(); n_envs as usize],
+            render_wall: Duration::ZERO,
+            rendered: 0,
+            frame_pixels,
         })
     }
 
@@ -323,8 +365,9 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
     ///
     /// The inputs are captured by `es_eval::runner::capture` off this env's own row of the
     /// state, and run through this env's own `CpuPlan` — the same two calls `es eval run`
-    /// makes. An image input is refused there by name: images need a renderer, and this
-    /// binding links none (§4.3).
+    /// makes. An image input is served by this env's renderer under the `render` feature
+    /// (packet M11/X3) -- one frame per call, which is the tick the `Tick` seed stream counts --
+    /// and refused there by name without it: images need a renderer (§4.3).
     pub fn observe(&mut self) -> Result<BTreeMap<String, Vec<f64>>, RolloutError> {
         let light = LightOverride::default();
         let mut out: BTreeMap<String, Vec<f64>> = BTreeMap::new();
@@ -332,35 +375,77 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
         let state = self.env.state();
         for i in 0..self.n_envs {
             let view = env_view(&state, i);
-            let (names, bytes, _) = capture(
+            // This env's renderer as `capture`'s frame source, timed whole-frame.
+            #[cfg(feature = "render")]
+            let mut source = self.cameras.get_mut(i).map(|camera| {
+                let (wall, rendered) = (&mut self.render_wall, &mut self.rendered);
+                move |_: &LightOverride, model: &ModelInfo, state: &StateView<'_>| {
+                    let started = std::time::Instant::now();
+                    let tile = camera.frame(model, state, 0).map_err(|e| e.to_string())?;
+                    *wall += started.elapsed();
+                    *rendered += 1;
+                    Ok(tile.to_bytes())
+                }
+            });
+            #[cfg(feature = "render")]
+            let frames = source
+                .as_mut()
+                .map(|f| f as &mut es_eval::runner::FrameSource<'_>);
+            #[cfg(not(feature = "render"))]
+            let frames = None;
+            let (names, mut bytes, _) = capture(
                 &self.plans[i],
                 &self.sources,
                 model,
                 &view,
-                None,
+                frames,
                 &light,
                 None,
             )?;
-            let inputs: BTreeMap<String, TensorRef<'_>> = names
+            {
+                let inputs: BTreeMap<String, TensorRef<'_>> = names
+                    .iter()
+                    .zip(&bytes)
+                    .map(|((name, dtype, shape), data)| {
+                        (
+                            name.clone(),
+                            TensorRef::new(*dtype, shape.clone(), data.as_slice()),
+                        )
+                    })
+                    .collect();
+                let ports = self.plans[i]
+                    .run(&inputs)
+                    .map_err(|e| RolloutError::Plan(e.to_string()))?;
+                for (name, tensor) in &ports {
+                    out.entry(name.clone())
+                        .or_default()
+                        .extend(port_values(name, tensor)?);
+                }
+            }
+            if let Some(k) = names
                 .iter()
-                .zip(&bytes)
-                .map(|((name, dtype, shape), data)| {
-                    (
-                        name.clone(),
-                        TensorRef::new(*dtype, shape.clone(), data.as_slice()),
-                    )
-                })
-                .collect();
-            let ports = self.plans[i]
-                .run(&inputs)
-                .map_err(|e| RolloutError::Plan(e.to_string()))?;
-            for (name, tensor) in &ports {
-                out.entry(name.clone())
-                    .or_default()
-                    .extend(port_values(name, tensor)?);
+                .position(|(n, ..)| matches!(self.sources.get(n), Some(Capture::Image)))
+            {
+                self.frames[i] = std::mem::take(&mut bytes[k]);
             }
         }
         Ok(out)
+    }
+
+    /// The image bytes env `env`'s last [`Self::observe`] captured -- exactly what the plan's
+    /// `ImageInput` was handed, in its declared dtype and layout -- or `None` when the
+    /// observation has no image input or nothing was observed yet.
+    pub fn frame(&self, env: usize) -> Option<&[u8]> {
+        self.frames
+            .get(env)
+            .filter(|f| !f.is_empty())
+            .map(Vec::as_slice)
+    }
+
+    /// Mean whole-frame render time in milliseconds over every frame so far (re-pose, upload,
+    /// dispatch, readback), `None` when nothing was rendered.
+    pub fn render_ms_per_frame(&self) -> Option<f64> {
+        (self.rendered > 0).then(|| self.render_wall.as_secs_f64() * 1e3 / self.rendered as f64)
     }
 
     /// One control step: the plane validates every env's sampled action, `Env::step` executes
@@ -435,10 +520,19 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
         self.step
     }
 
-    /// The §12.4 metric set as the env measured it. A domain this path never runs (render,
-    /// inference, VRAM) stays `None` rather than a fabricated zero.
+    /// The §12.4 metric set as the env measured it, with the render row filled from this
+    /// rollout's own renderers when it has any (packet M11/X3). A domain this path never runs
+    /// (inference, VRAM, and render without an image input) stays `None` rather than a
+    /// fabricated zero.
     pub fn metrics(&self) -> EnvMetrics {
-        self.env.metrics()
+        let mut m = self.env.metrics();
+        let secs = self.render_wall.as_secs_f64();
+        if self.rendered > 0 && secs > 0.0 {
+            let frames = self.rendered as f64;
+            m.camera_frames_per_sec = Some(frames / secs);
+            m.pixels_per_sec = Some(frames * self.frame_pixels as f64 / secs);
+        }
+        m
     }
 
     pub fn n_envs(&self) -> usize {
@@ -490,7 +584,100 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
     fn begin_episode(&mut self, env: usize) {
         self.planes[env].begin_episode();
         self.plans[env].reset();
+        // The `Tick` seed clock restarts at *this* env's reset (packet M11/X3).
+        #[cfg(feature = "render")]
+        if let Some(camera) = self.cameras.get_mut(env) {
+            camera.begin_episode();
+        }
     }
+}
+
+/// One renderer per env for the observation's image input, or none when it has no image
+/// (packet M11/X3).
+///
+/// The Task IR channel that declares the input's sensor says which camera, at which
+/// `ImageSpec`, on which render path: `es_env::render::sensor_cfg` turns it into the config --
+/// the one function the collector and the evaluator build theirs with -- and `check` refuses a
+/// camera that does not produce the declared image rather than resampling it (`INV-14`). One
+/// image input: `capture` hands its frame source no input name, and the collector and the
+/// evaluator render one image channel too.
+#[cfg(feature = "render")]
+fn cameras(
+    sources: &BTreeMap<String, Capture>,
+    task: &es_ir::task::TaskIr,
+    scene: &SceneDesc,
+    n_envs: u32,
+) -> Result<Vec<es_env::EnvRenderer<'static>>, RolloutError> {
+    use es_ir::task::ObsSource;
+    use es_ir::types::Frame;
+
+    let images: Vec<&String> = sources
+        .iter()
+        .filter(|(_, c)| matches!(c, Capture::Image))
+        .map(|(n, _)| n)
+        .collect();
+    let name = match images.as_slice() {
+        [] => return Ok(Vec::new()),
+        [one] => *one,
+        more => {
+            return Err(RolloutError::Render(format!(
+                "the observation has {} image inputs; a rollout renders one camera per env",
+                more.len()
+            )))
+        }
+    };
+    let sensor = es_core::StableId::from_hex(name)
+        .map_err(|e| RolloutError::Render(format!("image input \"{name}\": {e}")))?;
+    let (channel, declared) = task
+        .observation_spec
+        .channels
+        .iter()
+        .find(|(_, c)| matches!(c.source, ObsSource::Sensor { id, .. } if id == sensor))
+        .ok_or_else(|| {
+            RolloutError::Render(format!(
+                "image input \"{name}\" is declared by no Sensor channel of the Task IR"
+            ))
+        })?;
+    let (ObsSource::Sensor { render, .. }, Some(spec), Frame::Camera(camera)) =
+        (&declared.source, declared.ty.image, declared.ty.frame)
+    else {
+        return Err(RolloutError::Render(format!(
+            "image channel \"{channel}\" declares no ImageSpec or no camera frame, so there is \
+             no camera to render it from"
+        )));
+    };
+    let cfg = es_env::render::sensor_cfg(camera, &spec, render, None);
+    let gpu = gpu()?;
+    (0..n_envs)
+        .map(|_| {
+            let camera = es_env::EnvRenderer::new(gpu, scene, cfg.clone())?;
+            camera.check(&spec)?;
+            Ok(camera)
+        })
+        .collect()
+}
+
+/// The Vulkan device this thread's rollouts render on: opened once per thread and leaked, so
+/// a renderer can borrow it for `'static` and `Rollout` stays a plain owned struct.
+///
+/// ponytail: one leaked device per thread that builds a rendering rollout (a trainer builds
+/// one); give it an owner if a process ever builds rendering rollouts on many threads.
+#[cfg(feature = "render")]
+fn gpu() -> Result<&'static es_gpu::Gpu, RolloutError> {
+    thread_local! {
+        static GPU: std::cell::OnceCell<&'static es_gpu::Gpu> =
+            const { std::cell::OnceCell::new() };
+    }
+    GPU.with(|cell| {
+        if let Some(gpu) = cell.get() {
+            return Ok(*gpu);
+        }
+        let gpu = es_gpu::Gpu::open(es_gpu::GpuOptions::default())
+            .map_err(|e| RolloutError::Render(format!("no Vulkan device: {e}")))?;
+        let gpu: &'static es_gpu::Gpu = Box::leak(Box::new(gpu));
+        let _ = cell.set(gpu);
+        Ok(gpu)
+    })
 }
 
 /// One env's row of the batch state, as a one-env [`StateView`].
