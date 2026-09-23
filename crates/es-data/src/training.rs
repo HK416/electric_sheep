@@ -164,6 +164,36 @@ pub struct Rl {
     /// `-0.5` otherwise — the trainer decides, because it is the side that can see both.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub init_log_std: Option<f64>,
+    /// Which action PPO's gradient is computed at (packet M9/R5, `docs/reviews/M9.md` S-7).
+    /// Absent is `Sampled`, and spelled out it serialises like absence, so every recipe
+    /// measured before the packet keeps the `training_hash` it was measured under.
+    #[serde(default, skip_serializing_if = "Estimator::is_default")]
+    pub estimator: Estimator,
+}
+
+/// `[rl] estimator` — which action PPO's log-probability is evaluated at (packet M9/R5).
+///
+/// Every RL row measured before this packet was clamped on every tick
+/// (`executed_ne_sampled_rate = 1.00`), so the gradient was computed at the log-probability of
+/// an action the environment never executed. `Executed` treats the Safety Plane as part of the
+/// environment instead. Nothing about the plane, the envelope or what is *recorded* moves —
+/// the choice is the estimator's alone, and it is hashed because it is a property of the run.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Estimator {
+    /// The Gaussian's own sample: every row before M9/R5, and the default (spec 13.4).
+    #[default]
+    Sampled,
+    /// What `Rollout::act` returned — the action the plane let through to the actuator.
+    Executed,
+}
+
+impl Estimator {
+    /// `skip_serializing_if`: the default has to serialise exactly like absence, or
+    /// `estimator = "sampled"` written out would move a `training_hash` nothing else moved.
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Sampled)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -544,6 +574,16 @@ impl Recipe {
         if let Some(log_std) = rl.init_log_std {
             args.push(s("--init-log-std"));
             args.push(log_std.to_string());
+        }
+        // Last in the argv and only when the recipe asks for it (packet M9/R5): the default
+        // is what every committed row was measured with, and a flag carrying it would move
+        // three plan goldens and their `training_hash`es for a value nobody changed.
+        match rl.estimator {
+            Estimator::Sampled => {}
+            Estimator::Executed => {
+                args.push(s("--estimator"));
+                args.push(s("executed"));
+            }
         }
         Ok(args)
     }

@@ -1,0 +1,67 @@
+# The reach task by PPO with the **executed** action in the rollout buffer (packet M9/R5):
+# `training-reach.toml` with one line added and nothing else changed.
+#
+# `es train --recipe tests/fixtures/rl/training-reach-executed.toml --out <dir> --dry-run`
+# prints the plan pinned by `tests/golden/train/plan-reach-executed.txt`; as with every other
+# recipe here, nothing it names has to exist for `--dry-run`.
+#
+# THE ONE FIELD THAT DIFFERS FROM `training-reach.toml` IS THE ESTIMATOR, WHICH IS WHY THIS
+# ROW CAN BE READ AGAINST A0's. Every RL row measured before this packet was clamped on every
+# tick (`executed_ne_sampled_rate = 1.00`), so PPO's gradient was computed at the
+# log-probability of an action the environment never executed. `estimator = "executed"` treats
+# the Safety Plane as part of the environment: the action stored in the rollout buffer is what
+# `Rollout::act` returned, and the log-probability -- both the stored old one and the ratio in
+# the update -- is evaluated there. Rewards, dones, values and GAE are untouched, the envelope
+# in `deployment-reach.toml` is the one every earlier row used, and
+# `executed_ne_sampled_rate` keeps comparing the plane's output with the *sample*, because it
+# is a fact about the envelope and not about the estimator. The owner chose this over widening
+# the envelope (`docs/reviews/M9.md` S-7, option B).
+#
+# The bundle is the four reach documents plus `learning-reach.toml`, packed with placeholder
+# weights -- the same untrained bundle A0 started from:
+#
+#     ES_PACK_TASK=tests/fixtures/rl/task-reach.toml \
+#     ES_PACK_OBSERVATION=tests/fixtures/rl/observation-reach.toml \
+#     ES_PACK_LEARNING=tests/fixtures/rl/learning-reach.toml \
+#     ES_PACK_DEPLOYMENT=tests/fixtures/rl/deployment-reach.toml \
+#     ES_PACK_OUT=runs/reach-executed-001/untrained.esb \
+#     cargo test -p es --test cli -- --ignored pack_untrained_bundle
+#
+# THE MEASURED ROWS RAN THIS FILE AT THE R1 BUDGET, NOT AT THIS ONE. The budget kept here is
+# `training-reach.toml`'s, so the two recipes differ by the estimator alone; the R5 table in
+# `docs/design/rl-continuation.md` section 7 is three seeds of this recipe with
+# `steps = 10000`, `checkpoint_at = [4000]` and `[run] seed` 0, 1, 2 -- the same two marks the
+# T3 delta rows and the quoted A0 rows are read at, so all of them are scored at 4,000 and at
+# 10,000.
+#
+# Everything else is `training-reach.toml`'s, including the three things that are absent on
+# purpose and are each a refusal if you put them back: `[dataset]` (PPO's data is the rollout
+# it generates), `[run] batch` (derived: `envs * horizon`), and the value head and `log_std`
+# (training-only state, `training/value.safetensors`, `training_hash` and never
+# `learning_hash`).
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-executed-001/untrained.esb"
+
+[rl]
+algo        = "ppo"
+envs        = 16
+horizon     = 64
+epochs      = 4
+minibatches = 4
+gamma       = 0.99
+lam         = 0.95
+clip        = 0.2
+entropy     = 0.005
+value_coef  = 0.5
+estimator   = "executed"
+
+[run]
+steps         = 4000
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [1000, 2000, 3000]
+device        = "cpu"
+interpreter   = "python"

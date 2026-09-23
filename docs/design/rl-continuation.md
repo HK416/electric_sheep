@@ -58,6 +58,36 @@ The value head is a separate MLP over the concatenation of the Observation IR's 
 built and trained only in `train_ppo.py`. It is written to `training/value.safetensors` for
 resumption and is never packed into a bundle.
 
+### 2a. Which action the gradient is computed at (`[rl] estimator`, packet M9/R5)
+
+Sampling says what the policy *proposed*; the plane says what the environment *ran*. When they
+differ — on this task, on every single tick — PPO has two actions to choose between and the
+choice is the estimator's, not the plane's:
+
+```
+a        = mu + exp(log_std) * eps       # the sample
+executed = Rollout.act(a)                # what the plane let through to the actuator
+```
+
+| `[rl] estimator` | the action in the rollout buffer | the log-probability, stored and in the ratio |
+|---|---|---|
+| `"sampled"` (default) | `a` | `log N(a; mu, sigma)` |
+| `"executed"` | `executed` | `log N(executed; mu, sigma)` |
+
+`"executed"` is the sanctioned reading of "the plane is part of the environment" (§13.4,
+`docs/reviews/M9.md` S-7, the owner's option B): the trainer learns from the action that
+actually produced the reward, and the envelope stays exactly as the Deployment IR declares it
+(INV-11..13 — the alternative, widening the envelope, is a document decision and not this
+one). Four things deliberately do **not** move with it: rewards, dones, values and GAE are the
+same numbers either way, because they were always the executed action's; `executed_ne_sampled_rate`
+keeps comparing the plane's output with the **sample**, because it is a fact about the envelope
+and not about the estimator; the deployed policy is `mu` under either, so `learning_hash` cannot
+feel the choice; and the default stays `"sampled"`, so every row measured before this packet is
+still the row it was. What it is *not* is an importance-sampling correction: the ratio is
+between two evaluations of the same Gaussian at the same point, so `"executed"` is PPO on the
+distribution the environment actually saw, with the clamp treated as an unmodelled part of the
+env rather than as a censoring to be un-biased. Section 7's R5 row is the measurement.
+
 ## 3. Latency and chunking in rollouts
 
 PPO acts every control step with horizon 1: no chunk buffer, no declared latency. The rollout
@@ -879,6 +909,55 @@ rather than assume. Artifacts `~/artifacts/plan-w/w0b/reach/seed{0,1,2}/`, `trai
 `2dfbc7c8…` / `6bf728e7…` / `e3d030e8…`. The nine §12.4 metrics are in each run's
 `metrics/env-metrics.json`; everything else is `Target / Status: unverified`.
 
+### P-M9-R5 — the executed-action estimator beside A0, oracle server (Linux, 16-core CPU), 2026-09-22 UTC
+
+Artifacts: `~/artifacts/plan-w/r5/` (`executed-seed{0,1,2}/`, `recipes/`, `logs/`, `run.sh`). Recipe:
+`tests/fixtures/rl/training-reach-executed.toml` at the R1 budget (`steps = 10000`, `checkpoint_at =
+[4000]`, `[run] seed` 0/1/2), the same untrained bundle as A0; scored on `evaluation-reach.toml`
+(16 held-out seeds). Written by the orchestrator from `report.json` / `metrics/loss-curve.json` on the
+server after the packet's agent had ended.
+
+**Held-out `success_rate`, `nominal`, 16 seeds, mean and per seed.**
+
+| row | at 4,000 | at 10,000 | nominal `envelope_violation_rate` (eval) | `episode_length` |
+|---|---|---|---|---|
+| absolute A0, `estimator = "sampled"` (quoted from T3) | **0.4167** (0.5625 / 0.3125 / 0.3750) | 0.3125 (seed 0) | 1.00 | 143.4 at 4,000 |
+| absolute, `estimator = "executed"` | 0.0 (0.0 / 0.0 / 0.0) | 0.0 (0.0 / 0.0 / 0.0) | 1.00 | 200.0 at both |
+
+Every perturbed suite (`observation_delay`, `torque_noise`, `backlash`) is 0.0 at both marks on
+all three seeds as well.
+
+**Rollout statistics** (`metrics/loss-curve.json`, iterations 1 / 4,000 / 10,000):
+
+| run | `executed_ne_sampled_rate` | entropy | `return` |
+|---|---|---|---|
+| executed seed 0 | 1.00 / 1.00 / 1.00 | 5.50 / 2.38 / 2.37 | −15.76 / −21.04 / −27.29 |
+| executed seed 1 | 1.00 / 1.00 / 1.00 | 5.50 / 2.35 / 2.35 | −14.72 / −17.47 / −17.60 |
+| executed seed 2 | 1.00 / 1.00 / 1.00 | 5.50 / 1.76 / 1.76 | −12.32 / −7.85 / −11.37 |
+
+**Failure histogram, `nominal`, at 4,000** (A0 seed 0 quoted from T3): A0 `violation.position` 2,053,
+`violation.velocity` 2,055, success 9; executed seeds 0/1/2 `violation.position` 2,866 / 3,184 / 2,280,
+`violation.velocity` 3,184 on each — every one of the 16 × 199 ticks — success 0.
+
+**What it says.** Option B does not help; it is worse than doing nothing. With the log-probability
+taken at the executed action the policy stops reaching: the return falls on two of three seeds, the
+entropy drops once and then freezes (seed 1 reads 2.3546 at both 4,000 and 10,000, i.e. `log_std`
+no longer moves), and in evaluation every tick violates the velocity bound. The mechanism is the
+estimator, not the envelope: the plane's clamp maps a whole half-line of samples onto one boundary
+value, so `log N(executed; mu, sigma)` is the density of a point the Gaussian almost never
+proposed — the ratio is between two evaluations of that same point, and the gradient pulls `mu`
+towards (positive advantage) or away from (negative advantage) the clamp boundary rather than
+towards the actions that earned the reward. **The sentence the next decision needs:** the curve
+does not hold past 4,000 and does not beat A0 at 10,000 on any seed; `"sampled"` stays the default
+and `"executed"` stays in the recipe vocabulary as a measured negative. The remaining options are
+the packet's A (a wider position margin, only with a servo-spec reason), C (increments over the
+*measured* joint), or an estimator that models the clamp as censoring — the clipped-action policy
+gradient (Fujita & Maeda, 2018), the log of the Gaussian's tail mass for a clamped dimension — which
+is a trainer change, keeps the envelope and INV-11..13 untouched, and is not this packet's to make.
+Wall-clock: the three trainings concurrent with plan W's W1a PT run on the same host (load ≈ 24 on
+16 cores), 19,076 s ≈ 5.3 h for all three; the six evaluations 67 s. The nine §12.4 metrics are in
+each run's `metrics/env-metrics.json`, the rest `Target / Status: unverified`.
+
 ## 8. The importer and the adapter
 
 Rule 3 of section 1 says the adapter declares and code never guesses. This is what that comes
@@ -947,8 +1026,11 @@ it takes one scalar: a vector whose entries differ is a human's choice, not the 
 1. Should rollouts model the Deployment IR's declared latency (a chunk buffer in the trainer),
    or stay synchronous with the evaluation carrying the honesty? This note chooses synchronous.
 2. When the plane clamps a sampled action, the log-probability is that of the *sample*; the env
-   saw the *executed* action. The rate at which they differ is reported; whether to train on the
-   executed action instead is a later ablation.
+   saw the *executed* action. The rate at which they differ is reported. **Answered for the
+   trainer by packet M9/R5** (section 2a): `[rl] estimator = "executed"` trains on the executed
+   action, the default stays `"sampled"`, and section 7's R5 row says what it measured. What is
+   still a human's is the other half of the same question — what the envelope should mean for a
+   *learning* policy on this task (`docs/reviews/M9.md` S-7).
 3. `Squash::Tanh` on a Regression head: an IR parameter (this note) or a property of the action
    unit the lowering applies (`quadruped-track.md` 3.6 question 2)? This note chooses the
    parameter, with absent = default = today's hash.

@@ -15,7 +15,7 @@ Usage:
                  [--lr F] [--seed N] [--device cpu] [--grad-clip F] [--weight-decay F]
                  [--schedule constant|warmup_cosine] [--warmup-steps N] [--lr-min F]
                  [--checkpoint-at 0 | 0,50,200] [--loss-curve curve.json]
-                 [--progress-every N]
+                 [--progress-every N] [--estimator sampled|executed]
 
 Prints one JSON line on stdout and nothing else -- the same contract `es train` reads for
 `train_act.py`: `torch` goes into spec 19.3's `hardware.json` and `optimizer` is compared
@@ -39,7 +39,14 @@ documents is measuring a different thing than the evaluation will.
     there is no flag here that turns the plane off (`INV-12`). What the plane did is measured
     rather than hidden: `envelope_violation_rate` is how often it raised an event and
     `executed_ne_sampled_rate` is how often what reached the actuator was not what was
-    sampled.
+    sampled. **`--estimator` says which of the two the gradient is computed at** (packet
+    M9/R5, design note section 2a): `sampled` is the default and every row measured before
+    that packet, and `executed` puts the plane inside the environment -- the action stored in
+    the rollout buffer is the one `Rollout.act` returned and the log-probability, both the
+    stored one and the ratio in the update, is evaluated there. Rewards, dones, values and
+    GAE are untouched either way, and `executed_ne_sampled_rate` keeps comparing the plane's
+    output with the *sample*, because it is a fact about the envelope and not about the
+    estimator.
  3. *The Gaussian is around the module's own output, in actuator units.* `lower_to_torch`
     emits one `forward(obs) -> action` that already contains the head's squash and the
     `Normalizer{Inverse}`, so `mu = module(obs)` is the deployed function unchanged and
@@ -251,6 +258,13 @@ def main(argv: list) -> int:
     p.add_argument("--checkpoint-at", default="", help="0 | 0,50,200 -- iteration marks")
     p.add_argument("--loss-curve", type=Path, help="one object per iteration, as JSON")
     p.add_argument(
+        "--estimator",
+        choices=["sampled", "executed"],
+        default="sampled",
+        help="which action PPO's log-probability is evaluated at: the Gaussian's sample (the "
+        "default) or what the Safety Plane executed (packet M9/R5)",
+    )
+    p.add_argument(
         "--progress-every",
         type=int,
         default=0,
@@ -388,7 +402,17 @@ def main(argv: list) -> int:
                     a.envs, action_dim
                 )
                 violations += sum(1 for bits in events if bits != 0)
+                # Against the *sample*, whichever estimator is in use: this row is what the
+                # envelope did, not what the gradient was taken at.
                 clamped += int((executed != action).any(dim=1).sum())
+                if a.estimator == "executed":
+                    # The plane is part of the environment (packet M9/R5): the step's action
+                    # is what it let through, and the old log-probability is the current
+                    # Gaussian's *there*. Overwritten rather than branched above so the
+                    # default path's order of operations -- the thing the bitwise oracle pins
+                    # -- is the one it always had.
+                    buf_act[t] = executed
+                    buf_logp[t] = normal_logp(executed, mu, log_std)
                 buf_rew[t] = torch.tensor(rewards, dtype=torch.float32)
                 buf_done[t] = torch.tensor(
                     [1.0 if d else 0.0 for d in dones], dtype=torch.float32
