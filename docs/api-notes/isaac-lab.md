@@ -205,8 +205,21 @@ checkpoint file):
 
 ## 8. What we don't know yet
 
-- Exact `rsl_rl` version Isaac Lab 2.3.2 pins (classic vs. split checkpoint shape) —
-  unverified in this pass, needed before M11 X2 commits to one checkpoint reader.
+- ~~Exact `rsl_rl` version Isaac Lab 2.3.2 pins~~ — measured (M11 I0, 2026-09-23): the
+  `isaaclab 2.3.2.post1` wheel's metadata pins `rsl-rl-lib==3.0.1` under `[all]` and
+  `[rsl-rl]` (its bundled `source/isaaclab_rl/setup.py` says 3.1.2; pip follows the metadata).
+  3.x is below §7's 5.0 split, so the classic `model_state_dict` shape is the expected one —
+  unverified until a checkpoint is saved.
+
+**Measured install (M11 I0, 2026-09-23; details in `docs/api-notes/isaac-sim.md` §7).** The pip
+route installed into `~/venvs/es-isaac` on the server (Python 3.11.16, `isaacsim 5.1.0.0`). The
+wheel bundles `isaaclab_rl`, `isaaclab_tasks`, `isaaclab_assets`, `isaaclab_mimic` and
+`isaaclab_contrib` as source extensions under `isaaclab/source/` (no separate dists).
+`isaaclab.app.AppLauncher(headless=True)` starts on Ubuntu 26.04 once `libxml2.so.2` is supplied
+(isaac-sim §7.2) — it uses `isaaclab.python.headless.kit`, which avoids the RTX renderer crash;
+`isaaclab_rl.rsl_rl` and `isaaclab_tasks` import and 18 `*Reach*` gym ids register
+(`Isaac-Reach-Franka-v0`, `Isaac-Reach-OpenArm-Bi-v0`, UR10e deploy variants, …; none for
+SO-101). The training scripts (`train.py`) were not run and the Isaac Lab repo was not cloned.
 - Whether SO-101's joint names/count need a custom `joint_names` regex or can use one
   catch-all pattern the way Franka's `"panda_joint.*"` does — depends on the SO-101 USD asset's
   authored joint names, not fetched here (this project's own MJCF is the source of truth, not an

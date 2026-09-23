@@ -4,11 +4,12 @@
 
 **M11 X2**(`docs/packets/M11/X2-adapter-v2.md`)와 M8 리뷰가 남긴 미해결 항목 R8("Isaac Lab을
 두 번째 소스로 — `es-usd` 씬, 동일한 어댑터 모양", `docs/reviews/M8.md`)을 위한 고정 다이제스트.
-이 워크스페이스의 어떤 크레이트도 아직 Isaac Sim에 의존하지 않는다: 어떤 크레이트도 이를
-임포트하지 않고, 어떤 venv도 이를 설치하지 않는다. 이 문서는 웹 리서치 준비 자료이며,
-`docs/api-notes/mujoco.md`처럼 우리가 직접 검증한 오라클이 아니다 — 아래의 모든 주장은
-`verified (fetched)`(2026-09-23에 인용된 페이지에서 읽음) 또는 `unverified`(1차 출처에서
-찾지 못했거나, 2차/커뮤니티 출처에서만 찾음)로 태그되어 있다. 영어 원본: `isaac-sim.md`.
+어떤 크레이트도 Isaac Sim을 임포트하지 않는다. M11 I0(2026-09-23)부터 서버의 venv 하나
+(`~/venvs/es-isaac`)가 이를 설치하고 `python/physx_smoke.py`가 이를 구동한다. §1–§6은 웹
+리서치 준비 자료다 — 거기의 모든 주장은 `verified (fetched)`(2026-09-23에 인용된 페이지에서
+읽음) 또는 `unverified`(1차 출처에서 찾지 못했거나, 2차/커뮤니티 출처에서만 찾음)로 태그되어
+있다. **§7은 우리가 직접 측정한 것**이며(M11 I0, `docs/packets/M11/I0-isaac-sim-install.md`),
+§1–§6과 어긋나는 곳에서는 §7이 우선한다. 영어 원본: `isaac-sim.md`.
 
 2026-09-23에 가져온 출처:
 
@@ -120,7 +121,11 @@ output_usd_path = importer.import_mjcf()          # 기본적으로 소스 옆�
 result, stage = stage_utils.open_stage(output_usd_path)
 ```
 
-익스텐션 자체 튜토리얼 페이지에서 **verified (fetched)**.
+익스텐션 자체 튜토리얼 페이지에서 **verified (fetched)**. **측정으로 바로잡음(§7):** 5.1.0
+휠의 익스텐션(`isaacsim.asset.importer.mjcf` 2.5.13)에는 `MJCFImporter` /
+`MJCFImporterConfig`가 없다. 파이썬 API는 Kit 명령 두 개, `MJCFCreateImportConfig`와
+`MJCFCreateAsset(mjcf_path, import_config, prim_path, dest_path="")`이다(익스텐션 자체의
+`docs/api.rst`와 테스트가 이를 쓴다). 위의 클래스 이름은 이후 릴리스의 것이다.
 
 관측된 `MJCFImporterConfig` 필드: `mjcf_path`(파일 또는 디렉터리), `robot_type`(스키마 힌트:
 Default/Manipulator/Humanoid/Wheeled/…), `import_scene`(MJCF 자체의 `<option>`/조명을 시뮬레이션
@@ -197,13 +202,128 @@ Bounding Sphere / Bounding Cube), `allow_self_collision`, `fix_base`, `link_dens
 
 ## 6. 아직 모르는 것
 
-- MJCF로 임포트한 씬을 TGS를 쓰는 GPU PhysX에서 돌렸을 때, 어떤 백엔드 간 비교라도 성립할
-  만큼 **MuJoCo CPU** 수치에 근접하게 재현하는지 — 이 노트를 위해 오라클을 돌리지는 않았다
-  (이것은 측정 결과인 `docs/api-notes/mujoco.md`의 메시 절과 달리 리서치 다이제스트다).
-- 정확한 액추에이터 타입→드라이브 매핑(§3)과 정확한 마찰 계수 매핑 — "두 번째 소스" 씬을
-  Isaac Lab의 네이티브 USD 에셋을 직접 읽는 대신 MJCF 임포트로 만들 경우 M11 X2의 어댑터에
-  둘 다 중요하다.
+- ~~MJCF로 임포트한 씬이 MuJoCo CPU 수치를 재현하는지~~ — §7에서 측정했다: 재현하지 않는다.
+  SO-101에서 100스텝 동안 최대 1.73 rad 차이가 나며, 이를 설명하는 임포터 행을 §7이 적는다.
+- 정확한 액추에이터 타입→드라이브 매핑(§3)과 정확한 마찰 계수 매핑 — `<position>`
+  액추에이터와 지오메트리 `friction`은 §7.3에서 측정했다. `velocity`/`motor`/`general`
+  액추에이터와 텐던/등식 제약은 여전히 측정하지 않았다(그것을 가진 픽스처가 없다).
 - Isaac Sim 6.0/6.1과 Isaac Lab 3.0의 멀티백엔드(Warp/Newton) 아키텍처는 릴리스 노트
   헤드라인에서만 보였다; 이 노트 작성 시점에 3.0이 Early Access이고 이 프로젝트 자체의 Newton
   백엔드(`docs/api-notes/newton.md`)가 어느 쪽이든 더 관련성 높은 참고 자료이므로, API 표면은
   아무것도 가져오지 않았다.
+
+## 7. 오라클 서버에서 측정한 것 (M11 I0, 2026-09-23)
+
+이 절의 모든 것은 우리가 직접 돌렸다. 산출물(로그, `pip freeze`, 스테이지 리포트, 모든
+궤적, `run_all.sh`)은 RTX 4090 서버의 `~/artifacts/plan-x/i0/` 아래에 있다.
+
+### 7.1 EULA, 설치, 버전, 비용
+
+- **EULA:** 소유자가 **2026-09-23**에 NVIDIA Omniverse License Agreement / Isaac Sim EULA를
+  수락했다(I0 시작 전에 M11 오케스트레이터가 기록). 모든 실행은
+  `OMNI_KIT_ACCEPT_EULA=YES`를 설정한다.
+- **호스트:** Ubuntu **26.04.1**(NVIDIA의 22.04/24.04 목록에 없음), GLIBC 2.43, 커널 7.0.0,
+  드라이버 **610.57.04**, RTX 4090 24 GB, Ryzen 7 7700, RAM 60 GB, sudo 없음.
+- **설치**(`uv`, 시스템 패키지 없음): `uv venv --python 3.11 ~/venvs/es-isaac`(uv가 관리하는
+  CPython **3.11.16**), 이어서 `uv pip install "isaacsim[all,extscache]==5.1.0" --extra-index-url
+  https://pypi.nvidia.com --index-strategy unsafe-best-match`, 이어서
+  `"isaaclab[isaacsim,all]==2.3.2.post1"`(같은 인덱스 플래그), 이어서 `rsl-rl-lib`(이미 충족).
+  모두 종료 코드 0.
+- **해석된 버전:** `isaacsim 5.1.0.0`(빌드 `5.1.0-rc.19`, 2025-10-17), PhysX / `omni.physx`
+  **107.3.26**, MJCF 임포터 익스텐션 **2.5.13**, `isaaclab 2.3.2.post1`, `rsl-rl-lib 3.0.1`
+  (휠 메타데이터는 3.0.1로 고정하고, 번들된 `isaaclab_rl/setup.py`는 3.1.2라고 적는다), `torch
+  2.7.0+cu126`, `numpy 1.26.0`, `warp-lang 1.17.0`. `pip-freeze.txt`에 패키지 205개.
+- **시간:** venv 4 s, `isaacsim` 154 s, `isaaclab` 20 s(torch는 이미 `uv` 캐시에 있었음).
+  헤드리스 앱 시작 ≈ 3.5 s, 100스텝 스모크 한 번 ≈ 4.2 s(전체 벽시계).
+- **디스크:** venv **17 GB**, 설치 중 `uv` 캐시가 19 → 35 GB로 증가(≈ 16 GB). §7.2의 호환
+  라이브러리: 49 MB.
+
+### 7.2 Ubuntu 26.04가 깨뜨리는 것과 사용자 공간 우회책
+
+| 증상 | 원인 | 우회책(sudo 없음, 시스템 전역 변경 없음) |
+|---|---|---|
+| `omni.kit.asset_converter`, `omni.kit.tool.asset_importer`, URDF **및 MJCF 임포터** 플러그인에서 `OSError: libxml2.so.2: cannot open shared object file`(어느 것도 로드되지 않음) | 26.04에는 `libxml2.so.16`만 있다 | `archive.ubuntu.com`의 Ubuntu 24.04 `.deb` `libxml2_2.9.14+dfsg-1.3ubuntu3.9`와 `libicu74_74.2-1ubuntu3.1`를 `dpkg-deb -x`로 `~/opt/isaac-compat/root`에 풀고 `LD_LIBRARY_PATH=~/opt/isaac-compat/root/usr/lib/x86_64-linux-gnu` |
+| 기본 익스피리언스(`isaacsim.exp.base.python.kit`)로는 헤드리스에서도 `app ready` 직후 `librtx.scenedb.plugin.so`(`carb.scenerenderer-rtx`)에서 세그폴트 | 이 OS / 드라이버에서의 RTX 렌더러 — 더 진단하지 않음 | `SimulationApp`을 Isaac Lab의 물리 전용 익스피리언스 `isaaclab/apps/isaaclab.python.headless.kit`(씬 델리게이트 없음)로 시작한다. `isaaclab.app.AppLauncher(headless=True)`도 같은 파일을 고른다. 따라서 이 호스트에서 렌더링(카메라, `isaaclab.python.headless.rendering.kit`)은 **시험하지 않았다** |
+
+둘 다 적용하면: Isaac Lab의 `AppLauncher`가 헤드리스로 뜨고, `isaaclab_rl.rsl_rl`과
+`isaaclab_tasks`가 임포트되며(pip 휠은 이들을 별도 배포판이 아니라 소스 익스텐션으로
+번들한다), `*Reach*` gym id 18개가 등록된다(`Isaac-Reach-Franka-v0` 포함, SO-101 태스크는 없음).
+
+### 7.3 MJCF 임포터 충실도 (SO-101과 `mesh_box`, 임포트된 USD 스테이지에서 읽음)
+
+입력: `es_physics_backend::scene_to_mjcf`가 `tests/fixtures/mjcf/so101_pick_place.xml`과
+`mesh_box.xml`에 대해 내보내는 MJCF 텍스트(리포 밖의 일회용 바이너리가
+`es_assets::parse_mjcf` → `es_assets::mesh::load` → `scene_to_mjcf`를 호출해 덤프), 그리고 원본
+픽스처 자체. 임포트 설정: `fix_base`는 표에 적은 대로, `import_inertia_tensor = true`,
+`create_physics_scene = false`(씬은 `World`가 소유), 프림 경로 `/World/robot`.
+`python/physx_smoke.py --stage-report`로 읽었다.
+
+| MJCF | 임포트 후 USD / PhysX | 판정 |
+|---|---|---|
+| 힌지 `range`(rad) | `PhysicsRevoluteJoint` `lowerLimit`/`upperLimit`, **도(degree)** 단위로 정확(±1.91986 rad → ±109.9999°) | 유지 |
+| 조인트 순서 | SO-101에서 DOF 순서 = MJCF 순서(`shoulder_pan … gripper`). 스모크는 그래도 이름으로 맞춘다 | 유지(이 에셋) |
+| 조인트 `armature` 0.028 | `physxJoint:armature` 0.028 | 유지 |
+| 조인트 `damping` 0.6 | **드라이브** 감쇠(0.6)와 `physxLimit:X:damping`(0.6)이 된다. 아티큘레이션에는 수동 조인트 감쇠가 없다 | **변경** — 액추에이터 `forcerange` 바깥이 아니라 드라이브 `maxForce` 클램프 안쪽 |
+| 조인트 `frictionloss` 0.052 | `physxJoint:jointFriction` 0.0 | **누락** |
+| `<position kp=998.22>` | 드라이브 `type = force`, `stiffness = 998.22` 그대로. USD 각 드라이브 게인은 **도당** 단위 | **변경** — rad→deg 변환 없음(USD 단위가 맞다면 N·m/rad로 57.3배 뻣뻣함. 여기서는 어차피 드라이브가 포화한다) |
+| `<position kv=2.731>` | 어디에도 없음(드라이브 감쇠는 조인트 감쇠) | **누락** |
+| `forcerange ±2.94` | 드라이브 `maxForce` 2.94 | 유지 |
+| `ctrlrange` | 쓰지 않음 | 누락(호출자가 목표를 클램프해야 함) |
+| 바디 `mass`, `<inertial fullinertia>` | `physics:mass` 정확, `diagonalInertia` = MuJoCo의 주관성 모멘트(순서 바뀜) + `principalAxes`, `centerOfMass` 정확 | 유지 |
+| 충돌하지 않는 지오메트리의 `mass=`(`camera_mount_shell mass=0.012`, `contype=0`) | 바디 `physics:mass` 0(PhysX가 기본 밀도로 콜라이더에서 유도) | **누락** |
+| 자유 조인트, `fix_base = 0` | 바디가 자기 `ArticulationRootAPI`(DOF 0개인 아티큘레이션)를 받고 올바르게 떨어진다 | 유지 |
+| 자유 조인트, `fix_base = 1` | 월드로의 `PhysicsFixedJoint rootJoint_<body>`: `fix_base`가 **모든** 루트에 적용되어 자유 큐브가 용접된다 | **변경** — 스모크가 용접을 지운다 |
+| 조인트 없는 루트 바디(`base`) | `fix_base = 1`일 때만 용접, 0이면 팔이 자유 | 호출자의 선택. MJCF 의미론은 1이 필요 |
+| `<worldbody>` 지오메트리(테이블, 통) | `/World/robot/worldBody` 아래 지오메트리마다 키네마틱 `RigidBodyAPI` Xform 하나. 그런데 `worldBody` 자체가 강체 **없이** `ArticulationRootAPI`를 가진다 → `World.reset()` 실패(`'NoneType' object has no attribute 'is_homogeneous'`) | **고장** — 스모크가 그 API를 제거 |
+| `plane` | `Plane` 콜라이더 | 유지 |
+| `box` / `sphere` / `capsule` | `Cube` / `Sphere` / `Capsule` 콜라이더 | 유지 |
+| 파일에서 온 메시 지오메트리(STL) | `Mesh` 콜라이더, `physics:approximation = convexHull` | 유지(볼록 껍질로) |
+| 인라인 메시 `vertex=`/`face=`(`scene_to_mjcf`가 내보내는 것) | 임포터가 메시 이름의 파일을 찾고, `Unsupported Format (/meshes/box)`를 로그한 뒤 `[Fatal] attempted member lookup on NULL TfRefPtr<UsdStage>`, 그리고 프로세스가 **종료 코드 0**으로 끝난다 | **고장** — 스모크가 각 인라인 메시를 OBJ로 쓰고 다시 쓴 MJCF 옆에 둔다 |
+| `contype = conaffinity = 0` | 콜라이더 없음(시각 전용) | 유지 |
+| 그 밖의 `contype`/`conaffinity` 비트마스크 | 매핑되지 않음: `PhysicsCollisionGroup` 두 개(`robotCollisionGroup` = `/World/robot`, 그리고 그것과 필터되는 프로토타입 그룹). 로봇 아래 모든 콜라이더가 서로 충돌 | **누락**(비트마스크 의미론) |
+| 지오메트리 `friction`(1.0 / 0.005 / 0.0001) | 어디에도 물리 머티리얼을 쓰지 않음 → PhysX 기본 머티리얼 | **누락** |
+| `solref`, `solimp`, `condim`, `margin` | 없음 | 누락(대응물 없음) |
+| `<option>` `integrator`, `cone`, `solver`, `iterations`, `impratio` | 없음. 씬은 TGS, patch 마찰, PCM, 아티큘레이션 위치/속도 반복 32/1, 바디 16/1 | 누락(대응물 없음) |
+| `<option timestep>`, `gravity` | 스모크의 `World(physics_dt=…)`가 MJCF대로 200 Hz / 1000 Hz, 중력 9.81로 돈다(임포터 자체의 `create_physics_scene` 경로는 시험하지 않음) | 호출자가 설정 |
+| — | 모든 강체에 `physxRigidBody:angularDamping = 0.05` | **추가**(MuJoCo에는 없음) |
+| `<sensor>` | — | 측정 안 함: 두 픽스처 모두 센서를 선언하지 않음 |
+
+추가로 측정: `World.reset()`은 호출자의 첫 `world.step` 전에 물리를 **두** 스텝 진행한다(자유
+바디가 z = 0.3 − 3·g·dt²에서 시작). 따라서 PhysX의 k행은 MuJoCo의 k+2행이다.
+
+### 7.4 같은 제어, MuJoCo CPU 대 PhysX — 수치만, 허용 오차는 주장하지 않음
+
+제어: 모든 `<position>` 액추에이터는 스텝 k 전에 자기 `ctrlrange`에서
+`mid + ¼·(hi−lo)·sin(2πk/100 + i)`를 받는다. MJCF 자체의 타임스텝으로 100스텝, k행은 스텝 k
+후의 상태, `max |Δq|`는 100행 전체에서. MuJoCo 3.13.0(`~/venvs/es`), 따로 적지 않으면 PhysX CPU
+파이프라인. 모두 `~/artifacts/plan-x/i0/run_all.sh`에서 나왔다.
+
+| 씬 | 쌍 | max \|Δq\| (rad): pan, lift, elbow, wrist_flex, wrist_roll, gripper | 자유 바디 max \|Δpos\| |
+|---|---|---|---|
+| SO-101 내보낸 것(dt 5 ms) | MuJoCo 대 PhysX CPU | 0.781, 1.73, 1.05, 1.26, 1.30, 0.851 | 큐브 3.9e-4 m(MuJoCo의 소프트 접촉이 0.11 mm 가라앉힘, PhysX는 z = 0.02 유지) |
+| SO-101 원본 픽스처 | MuJoCo 대 PhysX CPU | 0.781, 1.73, 1.05, 1.26, 1.30, 0.851 | 큐브 3.9e-4 m |
+| SO-101 내보낸 것 | MuJoCo 대 PhysX GPU 파이프라인(`cuda:0`) | 0.716, 1.71, 1.13, 1.26, 1.31, 0.853 | 큐브 3.9e-4 m |
+| SO-101 내보낸 것 | PhysX CPU 대 PhysX GPU | 0.069, 0.261, 0.273, 0.065, 0.0012, 0.0028 | 1.3e-7 m |
+| SO-101 내보낸 것 | PhysX CPU 실행 대 재실행 | 0(JSON이 비트 단위로 같음) | 0 |
+| SO-101 | MuJoCo 내보낸 것 대 MuJoCo 원본 | ≤ 1.2e-15 | 0 |
+| SO-101 | PhysX 내보낸 것 대 PhysX 원본 | 2.1e-4, 3.6e-5, 1.8e-4, 1.9e-5, 1.1e-5, 4.8e-7 | 0 |
+| `mesh_box`(dt 1 ms, 100스텝, 자유 낙하) | MuJoCo 대 PhysX, 내보낸 것과 원본 모두 | — | 1.99e-3 m(리셋의 두 스텝: 99행에서 0.25046 대 0.24847 m) |
+| `mesh_box`, 500스텝(≈ 0.2 s에 착지) | MuJoCo 대 PhysX | — | 1.55e-2 m(충돌 직후 299행에서 MuJoCo 0.0464 m, PhysX 0.0500 m, 정지 시 MuJoCo 0.04989 m, PhysX 0.05000 m). 메시 상자와 프리미티브 상자는 두 엔진 모두에서 서로 같다 |
+
+SO-101 실행의 99행에서 MuJoCo는 (−0.165, −0.014, 0.142, 0.418, 0.289, 0.550), PhysX는
+(−0.946, −1.740, −0.686, 1.644, 1.131, −0.136)에 있다. 실행 대부분 동안 모든 드라이브가 2.94
+N·m 한계에 걸려 있어서 둘 다 목표를 뒤따라간다.
+
+원인 배분(진단, 같은 스크립트): MJCF에서 드라이브 게인을 다시 써도(`--drive-gains rad`:
+stiffness kp, damping kv + 조인트 감쇠, `deg`: 같은 값 × π/180) 차이는 줄지 않는다(최대
+0.99, 1.69, … 및 0.84, 1.67, … rad). MuJoCo의 수동 조인트 감쇠와 frictionloss를 0으로 두면
+(PhysX가 버리거나 클램프 안으로 옮기는 두 행), MuJoCo는 임포트된 그대로의 PhysX 실행과 처음
+10스텝 동안 다섯 조인트에서 ≤ 1.5e-3 rad(wrist_flex 0.032), 20스텝 동안 wrist_flex(0.074)를
+뺀 모든 조인트에서 ≤ 0.02 rad로 맞는다. 두 엔진이 힘 한계에 걸려 있는 동안에는 그 두 행이
+발산의 원인이다. 그 뒤의 잔차(최대 0.83 rad)는 원인을 배분하지 않았다.
+
+**I1을 위해:** 이 임포터 위에 만드는 `PhysXBackend`는 (1) 인라인 메시를 파일로 쓰고, (2)
+강체 없는 `worldBody` 아티큘레이션 루트를 제거하고, (3) MJCF 자유 바디를 용접하지 않고, (4)
+드라이브를 직접 저작하고(kp는 도당 단위로, kv, 그리고 수동 감쇠와 frictionloss에 대한 결정),
+(5) 마찰 머티리얼을 저작하고, (6) 리셋/스텝 횟수를 직접 소유하고, (7) 이 호스트에서는 물리
+전용 익스피리언스로 시작해야 한다 — 각각이 매핑 리포트의 한 행이다.
