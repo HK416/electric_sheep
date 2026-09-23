@@ -209,7 +209,7 @@ checkpoint file):
   `isaaclab 2.3.2.post1` wheel's metadata pins `rsl-rl-lib==3.0.1` under `[all]` and
   `[rsl-rl]` (its bundled `source/isaaclab_rl/setup.py` says 3.1.2; pip follows the metadata).
   3.x is below §7's 5.0 split, so the classic `model_state_dict` shape is the expected one —
-  unverified until a checkpoint is saved.
+  measured by M11 I3 (§9): it is.
 
 **Measured install (M11 I0, 2026-09-23; details in `docs/api-notes/isaac-sim.md` §7).** The pip
 route installed into `~/venvs/es-isaac` on the server (Python 3.11.16, `isaacsim 5.1.0.0`). The

@@ -184,30 +184,32 @@ def evaluate(args) -> None:
     runner = OnPolicyRunner(wrapped, agent.to_dict(), log_dir=None, device=args.device)
     n = args.episodes
     results = []
-    for ckpt in args.checkpoint:
-        runner.load(ckpt, load_optimizer=False)
-        policy = runner.get_inference_policy(device=args.device)
-        env.reset(seed=args.seed)  # the same resets for every checkpoint
-        obs = wrapped.get_observations()
-        done = torch.zeros(n, dtype=torch.bool, device=args.device)
-        success = torch.zeros(n, dtype=torch.bool, device=args.device)
-        length = torch.zeros(n, dtype=torch.long, device=args.device)
-        for t in range(1, 201):
-            with torch.inference_mode():
+    # One inference-mode block: tensors made inside it cannot be written outside it, and a
+    # reset between checkpoints writes the articulation state.
+    with torch.inference_mode():
+        for ckpt in args.checkpoint:
+            runner.load(ckpt, load_optimizer=False)
+            policy = runner.get_inference_policy(device=args.device)
+            env.reset(seed=args.seed)  # the same resets for every checkpoint
+            obs = wrapped.get_observations()
+            done = torch.zeros(n, dtype=torch.bool, device=args.device)
+            success = torch.zeros(n, dtype=torch.bool, device=args.device)
+            length = torch.zeros(n, dtype=torch.long, device=args.device)
+            for t in range(1, 201):
                 obs, _, dones, _ = wrapped.step(policy(obs))
-            ended = dones.bool() & ~done
-            success |= ended & env.termination_manager.get_term("success")
-            length[ended] = t
-            done |= ended
-            if bool(done.all()):
-                break
-        results.append({
-            "checkpoint": ckpt, "reset_seed": args.seed, "episodes": n,
-            "success_rate": success.float().mean().item(),
-            "episode_length": length.float().mean().item(),
-            "unfinished": int((~done).sum().item()),
-        })
-        print(json.dumps(results[-1]))
+                ended = dones.bool() & ~done
+                success |= ended & env.termination_manager.get_term("success")
+                length[ended] = t
+                done |= ended
+                if bool(done.all()):
+                    break
+            results.append({
+                "checkpoint": ckpt, "reset_seed": args.seed, "episodes": n,
+                "success_rate": success.float().mean().item(),
+                "episode_length": length.float().mean().item(),
+                "unfinished": int((~done).sum().item()),
+            })
+            print(json.dumps(results[-1]))
     Path(args.out).write_text(json.dumps(results, indent=2) + "\n")
     sys.stdout.flush()
     os._exit(0)
@@ -234,7 +236,15 @@ def main() -> None:
     e.add_argument("--device", default="cuda:0")
     e.add_argument("--out", required=True)
     args = ap.parse_args()
-    {"build-usd": build_usd, "train": train, "eval": evaluate}[args.cmd](args)
+    try:
+        {"build-usd": build_usd, "train": train, "eval": evaluate}[args.cmd](args)
+    except BaseException:
+        # Kit's own exit path reports 0 after an uncaught exception (measured, M11/I3).
+        import traceback
+
+        traceback.print_exc()
+        sys.stderr.flush()
+        os._exit(1)
 
 
 if __name__ == "__main__":

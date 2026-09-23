@@ -206,7 +206,7 @@ c_in) → (actions, h_out, c_out)`; GRU: `(obs, h_in) → (actions, h_out)`); re
   `isaaclab 2.3.2.post1` 휠의 메타데이터는 `[all]`과 `[rsl-rl]` 아래에 `rsl-rl-lib==3.0.1`을
   고정한다(번들된 `source/isaaclab_rl/setup.py`는 3.1.2라고 적지만 pip은 메타데이터를
   따른다). 3.x는 §7의 5.0 분리선 아래이므로 클래식 `model_state_dict` 형태가 예상된다 —
-  체크포인트를 실제로 저장해 보기 전까지는 unverified.
+  M11 I3가 측정했다(§9): 그 형태가 맞다.
 
 **측정된 설치(M11 I0, 2026-09-23, 자세한 내용은 `docs/api-notes/isaac-sim.md` §7).** pip
 경로로 서버의 `~/venvs/es-isaac`에 설치했다(Python 3.11.16, `isaacsim 5.1.0.0`). 휠은
