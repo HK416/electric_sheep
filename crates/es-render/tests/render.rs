@@ -295,7 +295,8 @@ fn generate_goldens() {
             MESH_GOLDENS
                 .iter()
                 .map(|g| (g, mesh_golden_tile(g, &mesh_rs, &mesh_pt))),
-        );
+        )
+        .chain(DR_GOLDENS.iter().map(|g| (g, dr_golden_tile(g))));
     for (g, tile) in tiles {
         std::fs::write(dir.join(format!("{}.bin", g.name)), tile.to_bytes()).expect("write bin");
         let sidecar = serde_json::json!({
@@ -2375,4 +2376,395 @@ fn gpu_accumulation_matches_the_cpu() {
         "{bytes} of {} Rgb8 bytes differ after the guided filter",
         rgb.len()
     );
+}
+
+// --- visual randomization (packet M11/X5) ---------------------------------------------------
+//
+// A Task IR render draw (`light.*`, `geom.<n>.rgba`, `camera.<n>.pose.*`, `camera.<n>.fov`)
+// reaches this crate as nothing but *inputs*: a triangle's albedo and emission, the config's
+// `light_dir` / `light_rgb` / `ambient` / `sky`, and the camera's pose and `fx`, `fy`.
+// `es_env::render::drawn_frame` is the one mapping from a draw to these fields, and
+// `crates/es-env/tests/render_loop.rs` drives it end to end; here each target's *effect* is
+// rendered on both sides at the parity rule of its path.
+
+/// One target's effect on the render inputs. The numbers are arbitrary but not round, so a
+/// field that was dropped on one side cannot hide behind a multiply by one.
+#[derive(Clone, Copy, Debug)]
+enum Draw {
+    Intensity,
+    Direction,
+    Color,
+    Ambient,
+    GeomColor,
+    Pose,
+    Fov,
+}
+
+const DRAWS: [Draw; 7] = [
+    Draw::Intensity,
+    Draw::Direction,
+    Draw::Color,
+    Draw::Ambient,
+    Draw::GeomColor,
+    Draw::Pose,
+    Draw::Fov,
+];
+
+/// `tri`'s colours times `gain` per channel: `albedo` when `albedo` is set, `emission` always
+/// (on the `Rs` path a light is a gain on the whole reflected term, on `Pt` a gain on the
+/// emitters; `renderer.md` section 13.2).
+fn scale_tris(tri: &mut TriScene, seg: Option<u32>, gain: [f32; 3], albedo: bool) {
+    for t in tri.tris.iter_mut().filter(|t| seg.is_none_or(|s| t.seg == s)) {
+        for c in 0..3 {
+            if albedo {
+                t.albedo[c] *= gain[c];
+            }
+            t.emission[c] *= gain[c];
+        }
+    }
+}
+
+fn seg_of(tri: &TriScene, name: &str) -> u32 {
+    *tri.names
+        .iter()
+        .find(|(_, n)| *n == name)
+        .expect("geom named")
+        .0
+}
+
+/// The cornell inputs with `draws` applied, on the path `cfg` names.
+fn drawn(draws: &[Draw], mut cfg: RenderConfig) -> (TriScene, CameraView, RenderConfig) {
+    use es_math::{Pose, Quat, Vec3};
+    let pt = matches!(cfg.path, RenderPath::Pt { .. });
+    let mut tri = scene();
+    let mut cam = cornell_camera(TILE, TILE);
+    for d in draws {
+        match d {
+            Draw::Intensity => scale_tris(&mut tri, None, [1.4; 3], !pt),
+            Draw::Color => scale_tris(&mut tri, None, [1.2, 0.9, 0.6], !pt),
+            Draw::Direction => cfg.light_dir = Vec3::new(-0.5, 0.3, 0.8).normalize(),
+            Draw::Ambient => cfg.ambient = 0.35,
+            Draw::GeomColor => {
+                let tall = seg_of(&tri, "tall");
+                scale_tris(&mut tri, Some(tall), [0.3, 1.0, 1.6], true);
+            }
+            Draw::Pose => {
+                cam.pose = cam.pose.compose(Pose::new(
+                    Vec3::new(0.1, -0.05, 0.2),
+                    Quat::from_xyzw(0.02, 0.03, 0.01, 1.0),
+                ));
+            }
+            Draw::Fov => {
+                cam.spec.intrinsics.fx *= 1.3;
+                cam.spec.intrinsics.fy *= 1.3;
+            }
+        }
+    }
+    (tri, cam, cfg)
+}
+
+/// The `Pt` "sun" of packet M11/X5: a directional light shining in through the open end of
+/// the box, beside the ceiling panel dimmed to half. `light_rgb` is what `light.radiance`
+/// declares; the direction is chosen so the shadow ray leaves through the open `x = -1.2` end.
+fn sun(mut cfg: RenderConfig) -> RenderConfig {
+    cfg.light_dir = es_math::Vec3::new(-0.8, 0.25, 0.45).normalize();
+    cfg.light_rgb = [2.0, 1.8, 1.5];
+    cfg
+}
+
+fn sun_inputs() -> (TriScene, CameraView, RenderConfig) {
+    let (mut tri, cam, cfg) = drawn(&[], sun(pt_nee_cfg()));
+    scale_tris(&mut tri, None, [0.5; 3], false);
+    (tri, cam, cfg)
+}
+
+fn cpu_dr_rs() -> Frame {
+    let (tri, cam, cfg) = drawn(&DRAWS, rs_cfg());
+    cpu::rasterize(&tri, &cam, &cfg, 0)
+}
+
+fn cpu_dr_pt_sun() -> Frame {
+    let (tri, cam, cfg) = sun_inputs();
+    cpu::path_trace(&tri, &cam, &cfg, 0)
+}
+
+const DR_GOLDENS: [Golden; 2] = [
+    Golden {
+        name: "dr_cornell_rs_rgb8",
+        channel: Channel::Rgb8,
+        dtype: "u8",
+        source: Source::Rs,
+        kernel: "raster.v1 (every M11/X5 draw at once: intensity 1.4, colour, direction, ambient \
+                 0.35, `tall` recoloured, camera moved, focal x1.3)",
+    },
+    Golden {
+        name: "dr_cornell_pt_sun_rgb8",
+        channel: Channel::Rgb8,
+        dtype: "u8",
+        source: Source::PtNee,
+        kernel: "pt.v2 (4 spp, 3 bounces, NEE, Reinhard, exposure 1; directional light rgb \
+                 2.0/1.8/1.5 toward -0.8/0.25/0.45, ceiling panel x0.5)",
+    },
+];
+
+fn dr_golden_tile(g: &Golden) -> Tile {
+    let frame = if g.source == Source::Rs {
+        cpu_dr_rs()
+    } else {
+        cpu_dr_pt_sun()
+    };
+    frame.tile(g.channel).expect("channel rendered").clone()
+}
+
+/// Oracle 2, CPU half: the reference reproduces the new `dr_*` goldens (generated from it by
+/// `generate_goldens`), and every draw moved the picture — a draw that renders the undrawn
+/// golden would have been dropped somewhere.
+#[test]
+fn dr_cpu_reference_reproduces_the_dr_goldens() {
+    for g in &DR_GOLDENS {
+        let got = dr_golden_tile(g).to_bytes();
+        assert!(
+            got == read_golden(g.name),
+            "{} differs from its golden",
+            g.name
+        );
+        println!("bit-equal CPU vs golden: {}", g.name);
+    }
+    let base = cpu_rs().tile(Channel::Rgb8).unwrap().to_bytes();
+    for d in DRAWS {
+        let (tri, cam, cfg) = drawn(&[d], rs_cfg());
+        let got = cpu::rasterize(&tri, &cam, &cfg, 0)
+            .tile(Channel::Rgb8)
+            .unwrap()
+            .to_bytes();
+        let moved = got.iter().zip(&base).filter(|(a, b)| a != b).count();
+        println!("{d:?}: {moved} of {} Rgb8 bytes moved", base.len());
+        assert!(moved > 0, "{d:?} moved nothing");
+    }
+}
+
+/// Oracle 2: each target alone on the `Rs` path, GPU against the CPU reference at the `Rs`
+/// rule (`Rgb8` and segmentation bit for bit, depth within 1 ULP), and all of them at once
+/// against the golden.
+#[test]
+fn dr_gpu_rasterizer_matches_the_cpu_for_each_target() {
+    let test = "dr_gpu_rasterizer_matches_the_cpu_for_each_target";
+    let Some(gpu) = open(test) else { return };
+    let mut cases: Vec<(String, Vec<Draw>)> =
+        DRAWS.iter().map(|d| (format!("{d:?}"), vec![*d])).collect();
+    cases.push(("all".to_owned(), DRAWS.to_vec()));
+    for (label, draws) in cases {
+        let (tri, cam, cfg) = drawn(&draws, rs_cfg());
+        let want = cpu::rasterize(&tri, &cam, &cfg, 0);
+        let mut renderer = Renderer::new(&gpu, cfg).expect("renderer");
+        renderer.upload_tris(tri).expect("upload");
+        let mut atlas = renderer.render(&[cam]).expect("render");
+        let rgb = atlas.read_tile(0, Channel::Rgb8).expect("rgb8");
+        let seg = atlas.read_tile(0, Channel::SegmentationId).expect("seg");
+        let depth = atlas.read_tile(0, DEPTH).expect("depth");
+        let diff = rgb
+            .as_u8()
+            .unwrap()
+            .iter()
+            .zip(want.tile(Channel::Rgb8).unwrap().as_u8().unwrap())
+            .filter(|(a, b)| a != b)
+            .count();
+        let (ulp, _) = max_ulp(
+            depth.as_f32().unwrap(),
+            want.tile(DEPTH).unwrap().as_f32().unwrap(),
+        );
+        println!("{label}: Rgb8 {diff} bytes differ, depth max ULP {ulp}");
+        assert_eq!(diff, 0, "{label}: Rgb8 must be bit-equal to the CPU");
+        assert!(
+            seg.to_bytes() == want.tile(Channel::SegmentationId).unwrap().to_bytes(),
+            "{label}: segmentation must be bit-equal"
+        );
+        assert!(ulp <= 1, "{label}: depth max ULP {ulp}");
+        if label == "all" {
+            assert!(
+                rgb.to_bytes() == read_golden("dr_cornell_rs_rgb8"),
+                "the GPU does not render the dr_cornell_rs_rgb8 golden"
+            );
+        }
+    }
+}
+
+/// Oracle 2 on the `Pt` path: the emitter-and-sky gains at 1 spp without NEE are the path
+/// tracer's bit-for-bit rule; the directional light needs NEE, whose rule is the
+/// shadow-ray-tie tolerance of `gpu_pt_nee_matches_the_cpu` — measured and printed.
+#[test]
+fn dr_gpu_path_tracer_matches_the_cpu() {
+    let test = "dr_gpu_path_tracer_matches_the_cpu";
+    // The CPU half runs everywhere.
+    let golden = cpu_dr_pt_sun().tile(Channel::Rgb8).unwrap().to_bytes();
+    assert!(golden == read_golden("dr_cornell_pt_sun_rgb8"));
+    let Some(gpu) = open(test) else { return };
+
+    // Emitters x colour x intensity, sky on and scaled: `Pt` 1 spp, bit for bit.
+    let (tri, cam, mut cfg) = drawn(&[Draw::Intensity, Draw::Color], pt_cfg(1, 2));
+    cfg.sky = [0.3, 0.25, 0.2];
+    let want = cpu::path_trace(&tri, &cam, &cfg, 0);
+    let mut r = Renderer::new(&gpu, cfg).expect("renderer");
+    r.upload_tris(tri).expect("upload");
+    let got = r
+        .render(&[cam])
+        .expect("render")
+        .read_tile(0, Channel::PtRadiance)
+        .expect("radiance");
+    let expected = want.tile(Channel::PtRadiance).unwrap();
+    let (ulp, _) = max_ulp(got.as_f32().unwrap(), expected.as_f32().unwrap());
+    println!("Pt 1 spp, emitters and sky drawn: max ULP {ulp}");
+    assert!(
+        got.to_bytes() == expected.to_bytes(),
+        "PtRadiance at 1 spp must be bit-equal (max ULP {ulp})"
+    );
+
+    // The sun: NEE toward a direction, 4 spp.
+    let (tri, cam, cfg) = sun_inputs();
+    let want = cpu::path_trace(&tri, &cam, &cfg, 0);
+    let mut r = Renderer::new(&gpu, cfg).expect("renderer");
+    r.upload_tris(tri).expect("upload");
+    let mut atlas = r.render(&[cam]).expect("render");
+    let rad = atlas.read_tile(0, Channel::PtRadiance).expect("radiance");
+    let want_rad = want.tile(Channel::PtRadiance).unwrap().as_f32().unwrap();
+    let norm = max_normalized(rad.as_f32().unwrap(), want_rad);
+    let (ulp, _) = max_ulp(rad.as_f32().unwrap(), want_rad);
+    let rgb = atlas.read_tile(0, Channel::Rgb8).expect("rgb8");
+    let diff = rgb
+        .as_u8()
+        .unwrap()
+        .iter()
+        .zip(&golden)
+        .filter(|(a, b)| a != b)
+        .count();
+    println!(
+        "Pt NEE 4 spp with the sun: PtRadiance max ULP {ulp}, normalized {norm:e}; Rgb8 {diff} \
+         of {} bytes differ from the golden",
+        rgb.len()
+    );
+    assert!(norm <= 1e-5, "PtRadiance diverged by {norm:e}");
+    assert!(
+        diff * 1000 <= rgb.len(),
+        "{diff} of {} bytes differ, more than the 0.1% a shadow-ray tie explains",
+        rgb.len()
+    );
+}
+
+/// Oracle 2, "lit": with the ceiling panel switched off the box is black on the `Pt` path —
+/// no emitter, no sky — and the directional light alone lights it, on the CPU and the GPU.
+#[test]
+fn dr_pt_directional_light_lights_a_dark_scene() {
+    let test = "dr_pt_directional_light_lights_a_dark_scene";
+    let dark = || {
+        let mut tri = scene();
+        scale_tris(&mut tri, None, [0.0; 3], false);
+        tri.lights.clear();
+        tri
+    };
+    let cfg = RenderConfig::pt_nee(TileAtlasCfg::row(TILE, TILE, 1), 1, 2);
+    let cam = cornell_camera(TILE, TILE);
+    let lit_px = |f: &[f32]| f.chunks(3).filter(|p| p.iter().any(|c| *c > 0.0)).count();
+
+    let off = cpu::path_trace(&dark(), &cam, &cfg, 0);
+    let off = off.tile(Channel::PtRadiance).unwrap().as_f32().unwrap().to_vec();
+    assert_eq!(lit_px(&off), 0, "the dark box has a light somewhere");
+    let on = cpu::path_trace(&dark(), &cam, &sun(cfg.clone()), 0);
+    let on = on.tile(Channel::PtRadiance).unwrap().as_f32().unwrap().to_vec();
+    let n = lit_px(&on);
+    println!("CPU: {n} of {} pixels lit by the directional light alone", TILE * TILE);
+    assert!(n * 4 > (TILE * TILE) as usize, "only {n} pixels lit");
+
+    let Some(gpu) = open(test) else { return };
+    let mut r = Renderer::new(&gpu, sun(cfg)).expect("renderer");
+    r.upload_tris(dark()).expect("upload");
+    let got = r
+        .render(&[cam])
+        .expect("render")
+        .read_tile(0, Channel::PtRadiance)
+        .expect("radiance");
+    let got = got.as_f32().unwrap();
+    let (ulp, _) = max_ulp(got, &on);
+    println!("GPU: {} pixels lit, max ULP {ulp} against the CPU", lit_px(got));
+    assert_eq!(lit_px(got), n, "the GPU lit a different set of pixels");
+    assert!(max_normalized(got, &on) <= 1e-5);
+}
+
+/// `Renderer::set_lighting` is a parameter, not a second code path: a renderer built with the
+/// default config and re-lit renders what a renderer built with the drawn config renders, and
+/// re-lit back to the default it renders the undrawn golden again.
+#[test]
+fn dr_set_lighting_is_a_parameter() {
+    let test = "dr_set_lighting_is_a_parameter";
+    let Some(gpu) = open(test) else { return };
+    let cams = [cornell_camera(TILE, TILE)];
+    let (_, _, lit) = drawn(&[Draw::Direction, Draw::Ambient], rs_cfg());
+    let mut r = Renderer::new(&gpu, rs_cfg()).expect("renderer");
+    r.upload_tris(scene()).expect("upload");
+    r.set_lighting(&lit);
+    let got = r
+        .render(&cams)
+        .expect("render")
+        .read_tile(0, Channel::Rgb8)
+        .expect("rgb8")
+        .to_bytes();
+    let want = cpu::rasterize(&scene(), &cams[0], &lit, 0)
+        .tile(Channel::Rgb8)
+        .unwrap()
+        .to_bytes();
+    assert!(got == want, "re-lit Rs differs from the drawn config's CPU frame");
+    r.set_lighting(&rs_cfg());
+    let back = r
+        .render(&cams)
+        .expect("render")
+        .read_tile(0, Channel::Rgb8)
+        .expect("rgb8")
+        .to_bytes();
+    assert!(
+        back == read_golden("cornell_rs_rgb8"),
+        "re-lit to the default, the renderer no longer renders the golden"
+    );
+
+    // The same on `Pt`: a fresh renderer with the sun, and a default one given the sun.
+    let (tri, cam, sun_cfg) = sun_inputs();
+    let render = |r: &mut Renderer<'_>| {
+        r.upload_tris(tri.clone()).expect("upload");
+        r.render(&[cam])
+            .expect("render")
+            .read_tile(0, Channel::PtRadiance)
+            .expect("radiance")
+            .to_bytes()
+    };
+    let fresh = render(&mut Renderer::new(&gpu, sun_cfg.clone()).expect("renderer"));
+    let mut relit = Renderer::new(&gpu, pt_nee_cfg()).expect("renderer");
+    relit.set_lighting(&sun_cfg);
+    assert!(render(&mut relit) == fresh, "re-lit Pt differs from a fresh one");
+    println!("set_lighting: Rs and Pt bit-identical to a fresh renderer");
+}
+
+/// A drawn field of view reaches the frame's sidecar (spec 28.14 rule 4, `INV-14`), and a
+/// frame with no camera draw writes exactly the sidecar it always did.
+#[test]
+fn dr_frame_sidecar_carries_the_drawn_intrinsics() {
+    let dir = std::env::temp_dir().join(format!("es-render-dr-sidecar-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let tile = cpu_rs().tile(Channel::Rgb8).unwrap().clone();
+    tile.write_to(&dir, "plain").expect("write");
+    tile.write_to_with_intrinsics(&dir, "none", None)
+        .expect("write");
+    let read = |stem: &str| std::fs::read_to_string(dir.join(format!("{stem}.json"))).unwrap();
+    assert_eq!(
+        read("plain").replace("\"plain\"", "\"none\""),
+        read("none"),
+        "no draw, no new key"
+    );
+    let (_, cam, _) = drawn(&[Draw::Fov], rs_cfg());
+    tile.write_to_with_intrinsics(&dir, "drawn", Some(&cam.spec.intrinsics))
+        .expect("write");
+    let json: serde_json::Value = serde_json::from_str(&read("drawn")).unwrap();
+    let fx = json["intrinsics"]["fx"].as_f64().expect("fx");
+    assert_eq!(
+        (fx as f32).to_bits(),
+        (cornell_camera(TILE, TILE).spec.intrinsics.fx * 1.3).to_bits()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

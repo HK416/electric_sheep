@@ -344,4 +344,237 @@ mod tests {
         let (_, mass) = draw(3, 2);
         assert!((0.5..=1.5).contains(&mass), "{mass}");
     }
+
+    // --- visual randomization (packet M11/X5), oracle 1 --------------------------------------
+
+    use crate::env::tests::{camera_scene, sensor_channel};
+
+    /// Every render target of `docs/design/batch-domains.md` section 5.
+    const VISUAL: [&str; 18] = [
+        "light.intensity",
+        "light.direction",
+        "light.direction.yaw",
+        "light.direction.pitch",
+        "light.color",
+        "light.color.kelvin",
+        "light.ambient",
+        "light.radiance",
+        "light.sky",
+        "geom.ball.rgba",
+        "camera.cam.pose.x",
+        "camera.cam.pose.y",
+        "camera.cam.pose.z",
+        "camera.cam.pose.roll",
+        "camera.cam.pose.pitch",
+        "camera.cam.pose.yaw",
+        "camera.cam.fov",
+        "geom.cube.rgba",
+    ];
+
+    fn visual_plan(nodes: &[TaskNode]) -> Result<RandomizationPlan, EnvError> {
+        RandomizationPlan::compile(&task_with(nodes), &camera_scene(), &fake_model())
+    }
+
+    fn visual_draw(plan: &RandomizationPlan, seed: u64, env: u32, ep: u64) -> RenderOverrides {
+        let mut out = RenderOverrides::default();
+        plan.apply_render(seed, env, ep, &mut out);
+        out
+    }
+
+    fn physical_draw(plan: &RandomizationPlan, env: u32, ep: u64) -> (Vec<u64>, ParamScales) {
+        let (mut qpos, mut qvel, mut scales) = (vec![0.0; 2], vec![0.0; 2], ParamScales::new());
+        plan.apply(
+            3,
+            env,
+            ep,
+            &mut ResetBuffer {
+                qpos: &mut qpos,
+                qvel: &mut qvel,
+                scales: &mut scales,
+            },
+        );
+        (qpos.iter().chain(&qvel).map(|v| v.to_bits()).collect(), scales)
+    }
+
+    #[test]
+    fn visual_randomization_every_target_parses_and_resolves() {
+        for target in VISUAL {
+            let dist = if target.ends_with("kelvin") {
+                uniform(2500.0, 9000.0)
+            } else {
+                uniform(0.5, 1.5)
+            };
+            let plan = visual_plan(&[randomization(target, dist)])
+                .unwrap_or_else(|e| panic!("{target}: {e}"));
+            assert!(!plan.has_scales(), "{target} is not a physics parameter");
+            let ov = visual_draw(&plan, 1, 0, 0);
+            assert!(!ov.is_identity(), "{target} drew nothing");
+        }
+        // The multi-stream targets: two angles, three channels.
+        let n = |t: &str| visual_plan(&[randomization(t, uniform(0.5, 1.5))]).unwrap().entries.len();
+        assert_eq!(n("light.direction"), 2);
+        assert_eq!(n("light.color"), 3);
+        assert_eq!(n("geom.ball.rgba"), 3);
+        assert_eq!(n("camera.cam.fov"), 1);
+        // Each channel from its own stream: a draw of `light.color` is not grey.
+        let ov = visual_draw(
+            &visual_plan(&[randomization("light.color", uniform(0.5, 1.5))]).unwrap(),
+            1,
+            0,
+            0,
+        );
+        assert!(ov.color[0] != ov.color[1] && ov.color[1] != ov.color[2], "{:?}", ov.color);
+    }
+
+    #[test]
+    fn visual_randomization_unknown_targets_are_named_not_skipped() {
+        for target in [
+            "light",
+            "light.flux",
+            "light.direction.roll",
+            "light.color.hue",
+            "geom.nope.rgba",
+            "geom.ball.rgb",
+            "camera.nope.fov",
+            "camera.cam.pose",
+            "camera.cam.pose.w",
+            "camera.cam.zoom",
+            "camera.cam.fov.x",
+        ] {
+            let err = visual_plan(&[randomization(target, uniform(0.5, 1.5))]).unwrap_err();
+            assert!(err.to_string().contains(target), "{target}: {err}");
+        }
+        // A focal scale must stay positive: an unbounded distribution is refused.
+        let err = visual_plan(&[randomization(
+            "camera.cam.fov",
+            Distribution::Normal {
+                mean: 1.0,
+                std: 0.1,
+            },
+        )])
+        .unwrap_err();
+        assert!(err.to_string().contains("positive"), "{err}");
+        let err = visual_plan(&[randomization("camera.cam.fov", uniform(0.0, 1.0))]).unwrap_err();
+        assert!(err.to_string().contains("positive"), "{err}");
+        // The `Pt` light and sky mean nothing to the rasterizer, and a task with an `Rs` sensor
+        // refuses them rather than drawing a value no frame shows (spec 17.2).
+        for target in ["light.radiance", "light.sky"] {
+            let mut task = task_with(&[randomization(target, uniform(0.5, 1.5))]);
+            let scene = camera_scene();
+            let (channel, _) =
+                sensor_channel(scene.cameras[0].id, es_ir::task::SensorRender::default());
+            task.observation_spec
+                .channels
+                .insert("rgb".to_owned(), channel);
+            let err = RandomizationPlan::compile(&task, &scene, &fake_model()).unwrap_err();
+            let text = err.to_string();
+            assert!(text.contains(target) && text.contains("Rs"), "{text}");
+        }
+    }
+
+    #[test]
+    fn visual_randomization_draws_are_keyed_by_seed_env_episode_stream() {
+        let nodes: Vec<TaskNode> = VISUAL
+            .iter()
+            .filter(|t| !t.ends_with("kelvin"))
+            .map(|t| randomization(t, uniform(0.5, 1.5)))
+            .collect();
+        let plan = visual_plan(&nodes).unwrap();
+        assert_eq!(visual_draw(&plan, 7, 2, 3), visual_draw(&plan, 7, 2, 3));
+        assert_ne!(visual_draw(&plan, 7, 2, 3), visual_draw(&plan, 7, 2, 4));
+        assert_ne!(visual_draw(&plan, 7, 2, 3), visual_draw(&plan, 7, 1, 3));
+        assert_ne!(visual_draw(&plan, 7, 2, 3), visual_draw(&plan, 8, 2, 3));
+        // The stream name is part of the key.
+        let renamed = |stream: &str| {
+            let plan = visual_plan(&[TaskNode::Randomization {
+                target: "light.intensity".to_owned(),
+                dist: uniform(0.5, 1.5),
+                stream: stream.to_owned(),
+            }])
+            .unwrap();
+            visual_draw(&plan, 7, 2, 3).light.intensity
+        };
+        assert_eq!(renamed("a"), renamed("a"));
+        assert_ne!(renamed("a"), renamed("b"));
+    }
+
+    #[test]
+    fn visual_randomization_undeclared_targets_move_nothing() {
+        let physical = [
+            randomization("qpos[0]", uniform(-1.0, 1.0)),
+            randomization("body.link.mass", uniform(0.5, 1.5)),
+        ];
+        let plain = visual_plan(&physical).unwrap();
+        assert!(visual_draw(&plain, 3, 0, 0).is_identity());
+        assert_eq!(visual_draw(&plain, 3, 0, 0), RenderOverrides::default());
+        // Render entries beside the physical ones move none of the physical draws.
+        let mut both = physical.to_vec();
+        both.extend(
+            VISUAL
+                .iter()
+                .filter(|t| !t.ends_with("kelvin"))
+                .map(|t| randomization(t, uniform(0.5, 1.5))),
+        );
+        let both = visual_plan(&both).unwrap();
+        for (env, ep) in [(0, 0), (1, 0), (0, 5)] {
+            assert_eq!(physical_draw(&plain, env, ep), physical_draw(&both, env, ep));
+        }
+        assert_eq!(plain.has_scales(), both.has_scales());
+    }
+
+    #[test]
+    fn visual_randomization_light_and_camera_arithmetic() {
+        let base = [0.3, 0.4, 0.866_025_4];
+        let norm = |d: [f64; 3]| (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        // The identity is exact.
+        assert_eq!(
+            RenderOverrides::default().light_dir(base).map(f64::to_bits),
+            base.map(f64::to_bits)
+        );
+        // Yaw is the evaluation's own kernel: `LightOverride::rotate_dir`.
+        let yawed = RenderOverrides {
+            light: LightOverride {
+                intensity: 1.0,
+                yaw_deg: 30.0,
+            },
+            ..RenderOverrides::default()
+        };
+        assert_eq!(yawed.light_dir(base), yawed.light.rotate_dir(base));
+        // Pitch raises the light towards +Z and keeps it a unit vector and its azimuth.
+        let up = RenderOverrides {
+            pitch_deg: 20.0,
+            ..RenderOverrides::default()
+        }
+        .light_dir(base);
+        assert!(up[2] > base[2], "{up:?}");
+        assert!((norm(up) - norm(base)).abs() < 1e-6, "{up:?}");
+        assert!((up[1] / up[0] - base[1] / base[0]).abs() < 1e-6, "{up:?}");
+        // The colour-temperature table: warm is red-heavy, cool is blue-heavy, clamped at the
+        // ends, piecewise linear between its rows.
+        let warm = kelvin_rgb(2000.0);
+        let cool = kelvin_rgb(10_000.0);
+        assert!(warm[0] > warm[2] && cool[2] > cool[0], "{warm:?} {cool:?}");
+        assert_eq!(kelvin_rgb(500.0), warm);
+        assert_eq!(kelvin_rgb(40_000.0), cool);
+        let mid = kelvin_rgb(2500.0);
+        let (a, b) = (kelvin_rgb(2000.0), kelvin_rgb(3000.0));
+        for c in 0..3 {
+            assert!((mid[c] - (a[c] + b[c]) / 2.0).abs() < 1e-12);
+        }
+        // The camera delta: a translation in the camera's own frame, and a yaw about its +Y.
+        let d = CameraDraw {
+            offset: [0.1, 0.0, 0.0],
+            ..CameraDraw::default()
+        };
+        assert_eq!(d.pose().position.x, 0.1);
+        assert_eq!(d.pose().orientation, es_math::Quat::IDENTITY);
+        let turned = CameraDraw {
+            rot_deg: [0.0, 0.0, 90.0],
+            ..CameraDraw::default()
+        }
+        .pose()
+        .orientation
+        .rotate(es_math::Vec3::new(0.0, 0.0, 1.0));
+        assert!((turned.x - 1.0).abs() < 1e-6, "{turned:?}");
+    }
 }

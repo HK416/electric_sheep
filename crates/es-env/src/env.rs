@@ -1240,4 +1240,111 @@ pub(crate) mod tests {
             .eval(&BTreeMap::new())
             .is_none());
     }
+
+    /// [`fake_scene`] plus one world-fixed camera, `cam`, for the render targets of packet
+    /// M11/X5. `FakeBackend::load` ignores the scene, so the model is unchanged.
+    pub(crate) fn camera_scene() -> SceneDesc {
+        let mut scene = fake_scene();
+        scene.cameras.push(es_assets::scene::Camera {
+            id: es_assets::scene::scene_id("camera", "world/cam"),
+            name: "cam".to_owned(),
+            body: None,
+            pose: es_math::Pose::IDENTITY,
+            fovy: 0.8,
+        });
+        scene
+    }
+
+    /// A 64x48 RGB sensor on `camera`, declared the way a Task IR declares one.
+    pub(crate) fn sensor_channel(
+        camera: es_core::StableId,
+        render: es_ir::task::SensorRender,
+    ) -> (es_ir::task::ObsChannel, es_ir::image::ImageSpec) {
+        use es_ir::image::{
+            CameraModel, ChannelFormat, ColorSpace, DistortionModel, ImageDType, ImageSpec,
+            Intrinsics, ShutterModel,
+        };
+        let spec = ImageSpec {
+            width: 64,
+            height: 48,
+            channels: ChannelFormat::Rgb,
+            dtype: ImageDType::U8,
+            color_space: ColorSpace::SRgb,
+            camera_model: CameraModel::Pinhole,
+            intrinsics: Intrinsics::new(57.3, 57.3, 32.0, 24.0),
+            extrinsics: es_math::Pose::IDENTITY,
+            distortion: DistortionModel::None,
+            shutter: ShutterModel::Global,
+            exposure: Duration::ZERO,
+            rate_hz: 0.0,
+            depth_scale: None,
+        };
+        let channel = es_ir::task::ObsChannel {
+            source: es_ir::task::ObsSource::Sensor {
+                id: es_core::StableId::from_path("sensor.rgb"),
+                format: ChannelFormat::Rgb,
+                render,
+            },
+            ty: PortType {
+                elem: ElemType::U8,
+                shape: Shape::new([48, 64, 3]),
+                unit: Unit::Dimensionless,
+                frame: Frame::Camera(camera),
+                time: TimeRef::Tick,
+                image: Some(spec),
+            },
+        };
+        (channel, spec)
+    }
+
+    /// Oracle 4 of packet M11/X5 (spec 28.14 rule 4, `INV-14`): a drawn field of view moves
+    /// the episode's recorded intrinsics — `fx`, `fy` are the nominal times the drawn focal
+    /// scale, the principal point stays — and a downstream `Resize` still transforms them.
+    #[test]
+    #[allow(clippy::float_cmp)]
+    fn camera_fov_draw_moves_intrinsics() {
+        let scene = camera_scene();
+        let cam = scene.cameras[0].id;
+        let mut task = task_with(&[TaskNode::Randomization {
+            target: "camera.cam.fov".to_owned(),
+            dist: Distribution::Uniform { lo: 0.8, hi: 1.25 },
+            stream: "dr.fov".to_owned(),
+        }]);
+        let (channel, declared) = sensor_channel(cam, es_ir::task::SensorRender::default());
+        task.observation_spec
+            .channels
+            .insert("rgb".to_owned(), channel);
+        let mut env = Env::new(&task, &scene, FakeBackend::new(), &domains(1), 7).unwrap();
+
+        let mut seen = Vec::new();
+        for _ in 0..2 {
+            let s = env.render_overrides(0).cameras[&cam].focal;
+            assert!((0.8..=1.25).contains(&s), "{s}");
+            let got = env.recorder.open(0).image_specs[&cam];
+            assert_eq!(got.intrinsics.fx, declared.intrinsics.fx * s);
+            assert_eq!(got.intrinsics.fy, declared.intrinsics.fy * s);
+            assert_eq!(
+                (got.intrinsics.cx, got.intrinsics.cy),
+                (declared.intrinsics.cx, declared.intrinsics.cy),
+                "the zoom is about the principal point"
+            );
+            assert_eq!(got.extrinsics, declared.extrinsics, "no pose was drawn");
+            let half = got.resized(32, 24, true);
+            assert_eq!(half.intrinsics.fx, declared.intrinsics.fx * s * 0.5);
+            assert_eq!(half.intrinsics.cx, declared.intrinsics.cx * 0.5);
+            seen.push(s);
+            env.reset(None).unwrap();
+        }
+        assert_ne!(seen[0], seen[1], "the next episode draws again");
+        // The episode that closes carries its own draw.
+        let closed = {
+            env.step(&[0.0]).unwrap();
+            env.reset(None).unwrap()
+        };
+        let ep = &closed[0];
+        assert_eq!(
+            ep.image_specs[&cam].intrinsics.fx,
+            declared.intrinsics.fx * ep.render.cameras[&cam].focal
+        );
+    }
 }
