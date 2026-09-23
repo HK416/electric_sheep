@@ -22,7 +22,7 @@
   않는다. `from_scene_with_poses`, `tri_scene`, `upload_scene` 시그니처 불변; CPU 레퍼런스(`cpu.rs`)와 BVH가 같은
   `TriScene`을 소비하므로 CPU/GPU 패리티는 자동. `renderer.rs:302`의 "프리미티브만" 주석과 `renderer.md` 2.1의 행을
   갱신.
-* 배관: `es::cmd::backend::load_scene`(`crates/es/src/cmd/backend.rs:125-141` — `es loop collect`, `es eval run`,
+* 배관: `es::cmd::backend::load_scene`(`crates/es-tools/src/backend.rs:125` — `es loop collect`, `es eval run`,
   `es video showcase`, `es backend`가 공유하는 유일한 헬퍼)과 `replay_view::load_scene`
   (`crates/es-editor/src/model/replay_view.rs:514-532`)이 MJCF / URDF 파싱 뒤 `es_assets::mesh::load(&mut scene,
   path.parent())`를 부른다. `EnvRenderer`는 장면을 메시째 복제하므로 **`es-env` 소스 변경 없음**; 편집기 replay는 세 줄.
@@ -40,7 +40,8 @@ crates/es-render/src/renderer.rs
 crates/es-render/src/error.rs
 crates/es-render/tests/render.rs
 crates/es-env/tests/render_loop.rs
-crates/es/src/cmd/backend.rs
+crates/es-tools/src/backend.rs
+crates/es/tests/cli.rs
 crates/es-editor/src/model/replay_view.rs
 tests/golden/render/mesh_box_*
 docs/design/renderer.md
@@ -48,6 +49,9 @@ docs/design/renderer.ko.md
 docs/packets/M10/W2b-mesh-render.md
 docs/packets/M10/W2b-mesh-render.ko.md
 ```
+
+수정: CLI 로더는 W3b에서 `crates/es/src/cmd/backend.rs`에서 `crates/es-tools/src/backend.rs`로 옮겨졌다; 그 오라클은
+`crates/es/tests/cli.rs`의 `load_scene_resolves_meshes_relative_to_the_scene_file`이다.
 
 ## 오라클
 

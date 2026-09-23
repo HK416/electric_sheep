@@ -26,7 +26,7 @@ carry the meshes without `es-env` changing?**
   alias. `from_scene_with_poses`, `tri_scene`, `upload_scene` signatures unchanged; the CPU
   reference (`cpu.rs`) and the BVH consume the same `TriScene`, so CPU/GPU parity is automatic.
   `renderer.rs:302`'s "primitives only" doc and `renderer.md` 2.1's row are updated.
-* Plumbing: `es::cmd::backend::load_scene` (`crates/es/src/cmd/backend.rs:125-141` — the one
+* Plumbing: `es::cmd::backend::load_scene` (`crates/es-tools/src/backend.rs:125` — the one
   helper `es loop collect`, `es eval run`, `es video showcase` and `es backend` share) and
   `replay_view::load_scene` (`crates/es-editor/src/model/replay_view.rs:514-532`) call
   `es_assets::mesh::load(&mut scene, path.parent())` after the MJCF / URDF parse. `EnvRenderer`
@@ -47,7 +47,8 @@ crates/es-render/src/renderer.rs
 crates/es-render/src/error.rs
 crates/es-render/tests/render.rs
 crates/es-env/tests/render_loop.rs
-crates/es/src/cmd/backend.rs
+crates/es-tools/src/backend.rs
+crates/es/tests/cli.rs
 crates/es-editor/src/model/replay_view.rs
 tests/golden/render/mesh_box_*
 docs/design/renderer.md
@@ -55,6 +56,9 @@ docs/design/renderer.ko.md
 docs/packets/M10/W2b-mesh-render.md
 docs/packets/M10/W2b-mesh-render.ko.md
 ```
+
+Amended: the CLI loader moved from `crates/es/src/cmd/backend.rs` to `crates/es-tools/src/backend.rs`
+in W3b; its oracle is `load_scene_resolves_meshes_relative_to_the_scene_file` in `crates/es/tests/cli.rs`.
 
 ## oracle
 
