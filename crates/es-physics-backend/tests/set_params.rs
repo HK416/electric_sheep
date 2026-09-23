@@ -24,7 +24,7 @@ use std::process::{Command, Stdio};
 
 use es_assets::scene::SceneDesc;
 use es_core::StableId;
-use es_physics_backend::{scene_to_mjcf, MuJoCoCpuBackend, NewtonBackend};
+use es_physics_backend::{scene_to_mjcf, MjWarpBackend, MuJoCoCpuBackend, NewtonBackend};
 use es_physics_core::backend::Param;
 use es_physics_core::{Feature, LoadConfig, PhysicsBackend, PhysicsError};
 
@@ -64,8 +64,8 @@ sys.stdout.write("".join("%r\n" % float(v) for v in list(data.qpos) + list(data.
 "#;
 
 fn scene() -> SceneDesc {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/mjcf/set_params.xml");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mjcf/set_params.xml");
     let xml = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     es_assets::parse_mjcf(&xml)
         .unwrap_or_else(|e| panic!("set_params.xml: {e}"))
@@ -122,7 +122,10 @@ fn reference(mjcf: &str, timestep: f64, edit: bool) -> Vec<f64> {
 
 /// One env's `qpos ++ qvel` after `set_params` (when `params` is given), a whole-batch reset,
 /// a constant servo target and `STEPS` steps.
-fn run(backend: &mut MuJoCoCpuBackend, params: Option<&[(Param, StableId, f64)]>) -> [Vec<f64>; 2] {
+fn run(
+    backend: &mut dyn PhysicsBackend,
+    params: Option<&[(Param, StableId, f64)]>,
+) -> [Vec<f64>; 2] {
     if let Some(params) = params {
         backend.set_params(&[1], params).unwrap();
     }
@@ -181,7 +184,10 @@ fn set_params_reproduces_a_direct_mujoco_edit_bitwise() {
         let [nominal, value] = applied[&(1, *param, *id)];
         assert_eq!(value, nominal * scale, "{param:?}");
     }
-    assert_eq!(applied[&(1, Param::BodyMass, body(&scene, "block"))][0], 1.0);
+    assert_eq!(
+        applied[&(1, Param::BodyMass, body(&scene, "block"))][0],
+        1.0
+    );
 
     // The same scales again (a second reset of the same draw): no compounding.
     let [env0, env1] = run(&mut backend, Some(&params));
@@ -211,9 +217,7 @@ fn set_params_names_what_it_cannot_resolve() {
         .set_params(&[0], &[(Param::BodyMass, stranger, 1.1)])
         .unwrap_err();
     assert!(matches!(err, PhysicsError::Unsupported(_)), "{err:?}");
-    let err = backend
-        .set_params(&[2], &scales(&scene))
-        .unwrap_err();
+    let err = backend.set_params(&[2], &scales(&scene)).unwrap_err();
     assert!(err.to_string().contains("env 2"), "{err}");
     // A rejected call leaves nothing half-applied.
     assert!(backend.applied_params().is_empty());
@@ -227,5 +231,73 @@ fn newton_refuses_set_params_by_name() {
     assert_eq!(
         newton.set_params(&[0], &scales(&scene())),
         Err(PhysicsError::Unsupported("set_params".to_owned()))
+    );
+}
+
+fn max_delta(a: &[f64], b: &[f64]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
+}
+
+/// `mjwarp` holds per-world model arrays (`mujoco_warp` 3.13 indexes them by
+/// `worldid % shape[0]`), so it declares `ModelParams` too -- judged against `mujoco-cpu` at
+/// its declared tier (spec 17.3: tolerance, never bitwise), and against itself for the envs a
+/// draw did not touch. Needs a GPU with `mujoco_warp`; skips otherwise.
+#[test]
+fn mjwarp_set_params_tracks_mujoco_cpu() {
+    for check in [
+        MuJoCoCpuBackend::is_available(),
+        MjWarpBackend::is_available(),
+    ] {
+        if let Err(why) = check {
+            println!("SKIP mjwarp_set_params_tracks_mujoco_cpu: {why}");
+            return;
+        }
+    }
+    let scene = scene();
+    let cfg = LoadConfig {
+        n_envs: 2,
+        ..LoadConfig::default()
+    };
+    let params = scales(&scene);
+
+    let mut cpu = MuJoCoCpuBackend::new();
+    cpu.load(&scene, &cfg).unwrap();
+    let [cpu_plain, _] = run(&mut cpu, None);
+    let [_, cpu_edited] = run(&mut cpu, Some(&params));
+
+    let mut warp = MjWarpBackend::new();
+    assert!(warp.capabilities().has(Feature::ModelParams));
+    warp.load(&scene, &cfg).unwrap();
+    let [warp_plain, _] = run(&mut warp, None);
+    let [warp_env0, warp_env1] = run(&mut warp, Some(&params));
+    let [again_env0, again_env1] = run(&mut warp, Some(&params));
+
+    for (param, id, scale) in &params {
+        let [nominal, value] = warp.applied_params()[&(1, *param, *id)];
+        // The world holds `f32(nominal * scale)`.
+        assert!(
+            (value - nominal * scale).abs() <= 1e-6 * (nominal * scale).abs(),
+            "{param:?}: {value} vs {nominal} x {scale}"
+        );
+    }
+    let untouched = max_delta(&warp_env0, &warp_plain);
+    let repeat = max_delta(&again_env1, &warp_env1).max(max_delta(&again_env0, &warp_env0));
+    let to_edited = max_delta(&warp_env1, &cpu_edited);
+    let to_plain = max_delta(&warp_env1, &cpu_plain);
+    println!(
+        "RAN mjwarp_set_params_tracks_mujoco_cpu: env 0 vs unedited {untouched:e}, second          application {repeat:e}, env 1 vs cpu edited {to_edited:e}, vs cpu unedited {to_plain:e}"
+    );
+    assert!(untouched <= 1e-6, "env 0 moved: {untouched:e}");
+    assert!(repeat <= 1e-6, "scales compounded: {repeat:e}");
+    assert!(
+        to_edited <= 1e-3,
+        "env 1 is not the edited model: {to_edited:e}"
+    );
+    assert!(
+        to_edited * 10.0 < to_plain,
+        "the draw did not reach physics"
     );
 }

@@ -90,7 +90,11 @@ fn randomized_params_reach_the_backend() {
     let (applied, recorded) = run(&scene, cube);
     for (env, ([nominal, mass], scale)) in applied.iter().zip(&recorded).enumerate() {
         assert!((0.8..=1.2).contains(scale), "env {env}: scale {scale}");
-        assert_eq!(*mass, nominal * scale, "env {env}: the model holds the draw");
+        assert_eq!(
+            *mass,
+            nominal * scale,
+            "env {env}: the model holds the draw"
+        );
     }
     assert!(
         applied.windows(2).all(|w| w[0][1] != w[1][1]),
