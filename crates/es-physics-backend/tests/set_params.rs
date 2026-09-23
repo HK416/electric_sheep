@@ -299,7 +299,7 @@ fn mjwarp_set_params_tracks_mujoco_cpu() {
     let to_edited = max_delta(&warp_env1, &cpu_edited);
     let to_plain = max_delta(&warp_env1, &cpu_plain);
     println!(
-        "RAN mjwarp_set_params_tracks_mujoco_cpu: env 0 vs unedited {untouched:e}, second          application {repeat:e}, env 1 vs cpu edited {to_edited:e}, vs cpu unedited {to_plain:e}"
+        "RAN mjwarp_set_params_tracks_mujoco_cpu: env 0 vs unedited {untouched:e}, second application {repeat:e}, env 1 vs cpu edited {to_edited:e}, vs cpu unedited {to_plain:e}"
     );
     assert!(untouched <= 1e-6, "env 0 moved: {untouched:e}");
     assert!(repeat <= 1e-6, "scales compounded: {repeat:e}");
