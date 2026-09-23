@@ -504,14 +504,14 @@ document declares either, and the parity claims above are about the documents th
 `BackendKind` and makes one `match` that calls the existing generic entry point monomorphized on
 the chosen type — `Evaluation::run_shard_with_sink::<B, …>(…, B::default, …)`,
 `Collector::run_with_sink::<B, …>`, and inside `Rollout` a closed enum of `Env<MuJoCoCpuBackend>`
-/ `Env<MjWarpBackend>`. No `Box<dyn PhysicsBackend>` in `Env`, no new trait (INV-17, §3.4).
+/ `Env<MjWarpBackend>` / `Env<PhysXBackend>` (the third arm since packet M11/R1). No `Box<dyn PhysicsBackend>` in `Env`, no new trait (INV-17, §3.4).
 
 | `--backend` | what it does today |
 |---|---|
 | `mujoco-cpu` (default) | the reference (§17.1), tier 1; its `hardware_capability` slot is the all-zero value every committed lock was hashed with |
 | `mjwarp` | MuJoCo Warp, tier 2 (never bitwise, §3.5, not even run to run); needs `mujoco_warp` under `ES_PYTHON`, else `SKIPPED` exit 3; an elliptic cone maps as an approximated row (spec 17.2 footnote) |
 | `newton` | refused by its mapping report before anything spawns: the adapter declares no actuators or sensors and wires no contacts, so it is `es backend compare`'s open loop only |
-| `physx` | refused: `not implemented (M11/I1)` |
+| `physx` | PhysX through Isaac Sim (packet M11/I1), tier 2; needs `ES_ISAAC_PYTHON`, else `SKIPPED` exit 3. `es_native.Rollout` and `[rl] backend = "physx"` since packet M11/R1 |
 | anything else | usage error (exit 2) listing the four |
 
 **Order.** For any backend but `mujoco-cpu` the scene is read and its §17.2 mapping report is
@@ -530,6 +530,19 @@ slot stays `[0; 32]`; `RunConfig.hardware` is set from it, so an `mjwarp` run an
 run of the same bundle are two `execution_hash`es, and every committed `mujoco-cpu`
 `execution_hash` is unmoved. `evaluation.lock`'s `backend` block gains `engine_version` (optional,
 absent from the bytes when unset, so older locks still parse).
+
+**The adapter script (packet M11/R1).** The engine version is not the whole engine: every
+backend but the reference runs a Python adapter it embeds (`mjwarp::SCRIPT`,
+`newton::SCRIPT`, `physx::SCRIPT`), and two fixes to `mjwarp_ref.py` and one to `physx_ref.py`
+moved evaluation results at the same engine version without moving any `execution_hash`. So
+`backend_identity(caps, engine_version, script)` appends, after the five fields above and
+under the same length-prefix rule, the 32-byte blake3 of that script
+(`es_physics_backend::adapter_script(kind)`, the constant the backend spawns): a one-byte
+change to an adapter is a different `hardware_capability`, hence a different
+`execution_hash`. `mujoco-cpu` keeps its all-zero slot whatever `mujoco_ref.py` says — the
+reference is pinned by its goldens instead (§28.14 rule 2) — so no committed lock moves.
+`evaluation.lock`'s `backend` block gains `script_blake3` (hex, optional, absent on
+`mujoco-cpu`).
 
 #### Measured, oracle server (RTX 4090, 16 cores), 2026-09-23 UTC
 
