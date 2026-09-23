@@ -301,3 +301,96 @@ fn committed_task_hashes_are_unmoved_by_seed_stream() {
     );
     println!("RAN committed_task_hashes_are_unmoved_by_seed_stream");
 }
+
+// --- packet M11/X6: the sensor declares SVGF ------------------------------------------------
+
+/// The `task_hash` of `tests/fixtures/visible-learning/task-pt-tick.toml`, recorded in
+/// `docs/design/visible-learning.md` 7.37 and named by `evaluation-pt-tick.toml`.
+const COMMITTED_PT_TICK_TASK_HASH: &str =
+    "51b60dadd79a878275c519df080c1cbce62b1d60dde2d114955ddfaa06078dd7";
+
+/// `text` with `svgf = false` written into the sensor's `render` table.
+fn with_explicit_svgf_off(text: &str) -> String {
+    let marker = "[body.observation_spec.channels.rgb_overhead.source.Sensor.render]";
+    let at = text.find(marker).expect("the document has a render table") + marker.len();
+    format!("{}\nsvgf = false{}", &text[..at], &text[at..])
+}
+
+/// Packet M11/X6 oracle 1: `SensorRender::svgf` is a new field and **not** a new document.
+///
+/// `false` is the default, absent and spelled out are the same bytes, `true` moves the hash —
+/// the W1a rule once more (spec 28.10 rule 1) — and SVGF on the rasterizer is refused by code
+/// rather than silently ignored.
+#[test]
+fn committed_task_hashes_are_unmoved_by_svgf() {
+    assert!(!SensorRender::default().svgf);
+
+    for (name, pinned) in [
+        ("task.toml", COMMITTED_TASK_HASH),
+        ("task-pt.toml", COMMITTED_PT_TASK_HASH),
+        ("task-pt-tick.toml", COMMITTED_PT_TICK_TASK_HASH),
+    ] {
+        let text = fixture(name);
+        let ir = es_ir::serial::task_from_toml(&text).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(
+            hash_of(&ir),
+            pinned,
+            "{name}: the committed task_hash moved"
+        );
+        assert!(!render_of(&ir).svgf, "{name}: an absent `svgf` is false");
+        if name == "task.toml" {
+            // No `render` table to write it into; the `if not default` rule covers it.
+            continue;
+        }
+
+        let explicit = es_ir::serial::task_from_toml(&with_explicit_svgf_off(&text))
+            .expect("an explicit `svgf = false` parses");
+        assert!(!render_of(&explicit).svgf);
+        assert_eq!(
+            hash_of(&explicit),
+            pinned,
+            "{name}: an explicitly written `svgf = false` moved the hash"
+        );
+        assert!(explicit.validate().is_empty(), "{:?}", explicit.validate());
+
+        let on = with_render(
+            &ir,
+            SensorRender {
+                svgf: true,
+                ..render_of(&ir)
+            },
+        );
+        let moved = hash_of(&on);
+        assert_ne!(moved, pinned, "{name}: `svgf = true` must move the hash");
+        assert!(on.validate().is_empty(), "{:?}", on.validate());
+        let round = es_ir::serial::task_from_toml(
+            &es_ir::serial::task_to_toml(&on).expect("the svgf task serializes"),
+        )
+        .expect("it parses again");
+        assert!(render_of(&round).svgf);
+        assert_eq!(hash_of(&round), moved);
+        println!("{name}: svgf = true hashes {moved}");
+    }
+
+    // SVGF filters the path tracer's noise; the rasterizer has none, so `Rs` + `svgf` is a
+    // document error with its own code, not a quiet no-op.
+    let committed = es_ir::serial::task_from_toml(&fixture("task.toml")).expect("task.toml");
+    let rs_svgf = with_render(
+        &committed,
+        SensorRender {
+            svgf: true,
+            ..SensorRender::default()
+        },
+    );
+    let codes: Vec<String> = rs_svgf
+        .validate()
+        .iter()
+        .map(|d| d.code.as_str().to_owned())
+        .collect();
+    assert_eq!(
+        codes,
+        [es_ir::codes::TASK_003],
+        "Rs + svgf is refused by code"
+    );
+    println!("RAN committed_task_hashes_are_unmoved_by_svgf");
+}
