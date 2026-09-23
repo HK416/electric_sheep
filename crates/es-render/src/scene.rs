@@ -533,21 +533,146 @@ mod tests {
         assert_eq!(tri.tris[0].emission, [1.0, 0.9, 0.8]);
     }
 
+    /// A mesh asset in `scene.meshes`, and the `AssetRef` naming it with `hash`.
+    fn with_mesh(
+        mut s: SceneDesc,
+        name: &str,
+        positions: Vec<[f32; 3]>,
+        indices: Vec<u32>,
+        hash: [u8; 32],
+    ) -> SceneDesc {
+        let id = scene_id("asset", name);
+        s.assets.push(es_assets::scene::AssetRef {
+            id,
+            name: name.to_owned(),
+            kind: es_assets::scene::AssetKind::Mesh,
+            path: format!("{name}.stl"),
+            hash,
+        });
+        s.meshes.insert(
+            id,
+            es_assets::gltf::MeshData {
+                id,
+                name: name.to_owned(),
+                positions,
+                normals: None,
+                uvs: None,
+                indices,
+                material: None,
+            },
+        );
+        s
+    }
+
+    /// A tetrahedron with legs of `scale`, every face wound counter-clockwise from outside.
+    fn tetra(scale: f32) -> (Vec<[f32; 3]>, Vec<u32>) {
+        (
+            vec![
+                [0.0, 0.0, 0.0],
+                [scale, 0.0, 0.0],
+                [0.0, scale, 0.0],
+                [0.0, 0.0, scale],
+            ],
+            vec![0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3],
+        )
+    }
+
+    fn mesh_geom(name: &str, asset: &str) -> Geom {
+        geom(
+            name,
+            Shape::Mesh {
+                asset: scene_id("asset", asset),
+            },
+            [0.5, 0.5, 0.5, 1.0],
+        )
+    }
+
+    /// Packet M10/W2b oracle 1: the `Mesh` arm reads `scene.meshes` — one triangle per index
+    /// triple, the same dense segmentation ids as a primitive, normals from the winding.
     #[test]
-    fn mesh_and_height_field_are_refused_by_name() {
-        let s = scene(vec![body(
+    fn mesh_tessellates_from_the_scene_store() {
+        let (positions, indices) = tetra(1.0);
+        let s = with_mesh(
+            scene(vec![body(
+                "b",
+                Pose::new(Vec3::new(0.0, 0.0, 1.0), es_math::Quat::IDENTITY),
+                vec![
+                    mesh_geom("m", "tet"),
+                    geom("s", Shape::Sphere { radius: 0.1 }, [1.0; 4]),
+                ],
+            )]),
+            "tet",
+            positions,
+            indices,
+            [7; 32],
+        );
+        let tri = TriScene::from_scene(&s).unwrap();
+        let mesh: Vec<&Tri> = tri.tris.iter().filter(|t| t.seg == 1).collect();
+        assert_eq!(mesh.len(), 4);
+        let ids: std::collections::BTreeSet<u32> = tri.tris.iter().map(|t| t.seg).collect();
+        assert_eq!(ids, [1, 2].into_iter().collect());
+        assert_eq!(tri.names.get(&1).map(String::as_str), Some("m"));
+        // The body pose lifted every vertex by 1; each normal points away from the centroid.
+        let c = [0.25_f32, 0.25, 1.25];
+        for t in mesh {
+            let f = [
+                (t.v[0][0] + t.v[1][0] + t.v[2][0]) / 3.0 - c[0],
+                (t.v[0][1] + t.v[1][1] + t.v[2][1]) / 3.0 - c[1],
+                (t.v[0][2] + t.v[1][2] + t.v[2][2]) / 3.0 - c[2],
+            ];
+            assert!(
+                f[0] * t.n[0] + f[1] * t.n[1] + f[2] * t.n[2] > 0.0,
+                "{t:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mesh_without_store_is_refused_by_name() {
+        let s = scene(vec![body("b", Pose::IDENTITY, vec![mesh_geom("m", "x")])]);
+        let err = TriScene::from_scene(&s).unwrap_err();
+        assert!(
+            matches!(err, RenderError::UnsupportedShape { ref geom, shape }
+                if geom == "m" && shape.contains("mesh::load")),
+            "{err}"
+        );
+        let hf = scene(vec![body(
             "b",
             Pose::IDENTITY,
             vec![geom(
-                "m",
-                Shape::Mesh {
-                    asset: scene_id("asset", "mesh/x"),
+                "h",
+                Shape::HeightField {
+                    asset: scene_id("asset", "hf"),
                 },
                 [1.0; 4],
             )],
         )]);
-        let err = TriScene::from_scene(&s).unwrap_err();
-        assert!(matches!(err, RenderError::UnsupportedShape { ref geom, .. } if geom == "m"));
+        let err = TriScene::from_scene(&hf).unwrap_err();
+        assert!(matches!(err, RenderError::UnsupportedShape { ref geom, .. } if geom == "h"));
+    }
+
+    /// Geom ids come from names, so two scenes can share one: a mesh geom whose asset content
+    /// differs must not be served the other scene's cached triangles.
+    #[test]
+    fn scene_cache_keys_on_mesh_content() {
+        let make = |scale: f32, hash: u8| {
+            let (p, i) = tetra(scale);
+            with_mesh(
+                scene(vec![body("b", Pose::IDENTITY, vec![mesh_geom("m", "tet")])]),
+                "tet",
+                p,
+                i,
+                [hash; 32],
+            )
+        };
+        let (small, big) = (make(1.0, 1), make(2.0, 2));
+        let mut cache = SceneCache::default();
+        let none = BTreeMap::new();
+        let a = cache.tri_scene(&small, &none).unwrap();
+        let b = cache.tri_scene(&big, &none).unwrap();
+        assert_eq!(a, TriScene::from_scene(&small).unwrap());
+        assert_eq!(b, TriScene::from_scene(&big).unwrap());
+        assert_ne!(a, b, "the cache served the first scene's mesh to the second");
     }
 
     /// The tessellation feeds both paths: `to_floats` is what `Renderer::upload_tris`
@@ -578,9 +703,22 @@ mod tests {
                     },
                     [1.0; 4],
                 ),
+                mesh_geom("m", "tet"),
             ],
         )]);
+        let (positions, indices) = tetra(0.3);
+        let s = with_mesh(s, "tet", positions.clone(), indices.clone(), [3; 32]);
         let tri = TriScene::from_scene(&s).unwrap();
+        // Packet M10/W2b: at the identity pose a mesh vertex is the file's `f32`, bit for bit
+        // (`f64::from(f32)` is exact and the round trip back is too).
+        let mesh: Vec<&Tri> = tri.tris.iter().filter(|t| t.seg == 4).collect();
+        assert_eq!(mesh.len(), indices.len() / 3);
+        for (t, face) in mesh.iter().zip(indices.chunks(3)) {
+            for (v, &i) in t.v.iter().zip(face) {
+                let want = positions[i as usize].map(f32::to_bits);
+                assert_eq!(v.map(f32::to_bits), want, "mesh vertex {i}");
+            }
+        }
         let floats = tri.to_floats();
         assert!(tri.tris.len() > 200, "{} triangles", tri.tris.len());
         for (i, t) in tri.tris.iter().enumerate() {

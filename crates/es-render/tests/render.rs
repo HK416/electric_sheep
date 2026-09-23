@@ -287,8 +287,16 @@ fn generate_goldens() {
     std::fs::create_dir_all(&dir).expect("golden dir");
     let (rs, rs_full, pt, pt_nee) = (cpu_rs(), cpu_rs_full(), cpu_pt1(), cpu_pt_nee());
     let pt_accum8 = cpu_pt_accum8();
-    for g in &GOLDENS {
-        let tile = golden_tile(g, &rs, &rs_full, &pt, &pt_nee, &pt_accum8);
+    let (mesh_rs, mesh_pt) = (cpu_mesh_rs(), cpu_mesh_pt1());
+    let tiles = GOLDENS
+        .iter()
+        .map(|g| (g, golden_tile(g, &rs, &rs_full, &pt, &pt_nee, &pt_accum8)))
+        .chain(
+            MESH_GOLDENS
+                .iter()
+                .map(|g| (g, mesh_golden_tile(g, &mesh_rs, &mesh_pt))),
+        );
+    for (g, tile) in tiles {
         std::fs::write(dir.join(format!("{}.bin", g.name)), tile.to_bytes()).expect("write bin");
         let sidecar = serde_json::json!({
             "name": g.name,
@@ -328,7 +336,164 @@ fn cpu_reference_reproduces_the_goldens_bit_for_bit() {
     }
 }
 
-// --- the Rs look (packet M7/R2) ---------------------------------------------------------------
+// --- mesh geoms (packet M10/W2b) -------------------------------------------------------------
+
+/// `tests/fixtures/mjcf/mesh_box.xml` through the one loading path every CLI command shares:
+/// the MJCF parse, then `es_assets::mesh::load` against the file's directory.
+fn mesh_box() -> es_assets::scene::SceneDesc {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mjcf");
+    let xml = std::fs::read_to_string(dir.join("mesh_box.xml")).expect("the mesh_box fixture");
+    let mut scene = es_assets::parse_mjcf(&xml)
+        .expect("the mesh_box fixture parses")
+        .scene;
+    es_assets::mesh::load(&mut scene, &dir).expect("meshes/box.stl loads");
+    scene
+}
+
+/// A fixed camera beside the two boxes (the `cornell_camera` pattern: a golden must not move
+/// when a scene camera's MJCF reading does).
+fn mesh_camera(width: u32, height: u32) -> CameraView {
+    use es_math::Vec3;
+    look_at(
+        Vec3::new(0.25, -0.9, 0.45),
+        Vec3::new(0.25, 0.0, 0.3),
+        45.0,
+        width,
+        height,
+    )
+}
+
+fn mesh_scene() -> TriScene {
+    TriScene::from_scene(&mesh_box()).expect("mesh_box tessellates")
+}
+
+/// `pt_cfg(1, 2)` under a white sky: the fixture has no `_light` geom, and a golden of zeros
+/// would pin nothing.
+fn mesh_pt_cfg() -> RenderConfig {
+    let mut cfg = pt_cfg(1, 2);
+    cfg.sky = [1.0, 1.0, 1.0];
+    cfg
+}
+
+fn cpu_mesh_rs() -> Frame {
+    cpu::rasterize(&mesh_scene(), &mesh_camera(TILE, TILE), &rs_cfg(), 0)
+}
+
+fn cpu_mesh_pt1() -> Frame {
+    cpu::path_trace(&mesh_scene(), &mesh_camera(TILE, TILE), &mesh_pt_cfg(), 0)
+}
+
+const MESH_GOLDENS: [Golden; 4] = [
+    Golden {
+        name: "mesh_box_rs_rgb8",
+        channel: Channel::Rgb8,
+        dtype: "u8",
+        source: Source::Rs,
+        kernel: "raster.v1",
+    },
+    Golden {
+        name: "mesh_box_rs_depth",
+        channel: DEPTH,
+        dtype: "f32",
+        source: Source::Rs,
+        kernel: "raster.v1",
+    },
+    Golden {
+        name: "mesh_box_rs_seg",
+        channel: Channel::SegmentationId,
+        dtype: "u32",
+        source: Source::Rs,
+        kernel: "raster.v1",
+    },
+    Golden {
+        name: "mesh_box_pt1spp",
+        channel: Channel::PtRadiance,
+        dtype: "f32",
+        source: Source::Pt,
+        kernel: "pt.v1 (1 spp, 2 bounces, sky 1)",
+    },
+];
+
+fn mesh_golden_tile(g: &Golden, rs: &Frame, pt: &Frame) -> Tile {
+    let frame = if g.source == Source::Pt { pt } else { rs };
+    frame.tile(g.channel).expect("channel rendered").clone()
+}
+
+fn read_golden(name: &str) -> Vec<u8> {
+    let path = golden_dir().join(format!("{name}.bin"));
+    std::fs::read(&path)
+        .unwrap_or_else(|e| panic!("{}: {e} (run the generate_goldens test)", path.display()))
+}
+
+#[test]
+fn cpu_reference_reproduces_the_mesh_goldens_bit_for_bit() {
+    let (rs, pt) = (cpu_mesh_rs(), cpu_mesh_pt1());
+    for g in &MESH_GOLDENS {
+        let got = mesh_golden_tile(g, &rs, &pt).to_bytes();
+        assert!(got == read_golden(g.name), "{} differs from its golden", g.name);
+        println!("bit-equal CPU vs golden: {}", g.name);
+    }
+    // The golden is a picture of the mesh, not of the floor: both boxes are in frame.
+    let seg = rs.tile(Channel::SegmentationId).unwrap().as_u32().unwrap();
+    let names = mesh_scene().names;
+    for want in ["mesh_geom", "prim_geom"] {
+        let id = names.iter().find(|(_, n)| *n == want).expect("geom named").0;
+        let px = seg.iter().filter(|s| *s == id).count();
+        println!("{want}: {px} pixels");
+        assert!(px > 20, "{want} covers only {px} pixels");
+    }
+}
+
+#[test]
+fn gpu_rasterizer_matches_the_mesh_goldens() {
+    let test = "gpu_rasterizer_matches_the_mesh_goldens";
+    let Some(gpu) = open(test) else { return };
+    let mut renderer = Renderer::new(&gpu, rs_cfg()).expect("renderer");
+    renderer.upload_scene(&mesh_box()).expect("upload_scene");
+    let mut atlas = renderer.render(&[mesh_camera(TILE, TILE)]).expect("render");
+    for (channel, name) in [
+        (Channel::Rgb8, "mesh_box_rs_rgb8"),
+        (Channel::SegmentationId, "mesh_box_rs_seg"),
+    ] {
+        let got = atlas.read_tile(0, channel).expect("tile").to_bytes();
+        let want = read_golden(name);
+        let diff = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        println!("{name}: {diff} of {} bytes differ", want.len());
+        assert!(got == want, "{name} must be bit-equal to the golden");
+    }
+    let depth = atlas.read_tile(0, DEPTH).expect("depth");
+    let want: Vec<f32> = read_golden("mesh_box_rs_depth")
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let (ulp, at) = max_ulp(depth.as_f32().unwrap(), &want);
+    println!("mesh_box Depth32: max ULP {ulp} (at index {at})");
+    assert!(ulp <= 1, "Depth32 max ULP {ulp} exceeds the documented 1");
+}
+
+#[test]
+fn gpu_path_tracer_matches_the_cpu_on_the_mesh_box() {
+    let test = "gpu_path_tracer_matches_the_cpu_on_the_mesh_box";
+    let Some(gpu) = open(test) else { return };
+    let mut renderer = Renderer::new(&gpu, mesh_pt_cfg()).expect("renderer");
+    renderer.upload_scene(&mesh_box()).expect("upload_scene");
+    let mut atlas = renderer.render(&[mesh_camera(TILE, TILE)]).expect("render");
+    let got = atlas.read_tile(0, Channel::PtRadiance).expect("radiance");
+    let want = cpu_mesh_pt1();
+    let want = want.tile(Channel::PtRadiance).unwrap();
+    let (ulp, at) = max_ulp(got.as_f32().unwrap(), want.as_f32().unwrap());
+    println!("mesh_box PtRadiance 1 spp: max ULP {ulp} (index {at})");
+    assert!(
+        got.to_bytes() == want.to_bytes(),
+        "PtRadiance at 1 spp must be bit-equal (max ULP {ulp})"
+    );
+    assert!(
+        got.to_bytes() == read_golden("mesh_box_pt1spp"),
+        "the GPU frame differs from mesh_box_pt1spp"
+    );
+}
+
+// --- the Rs look (packet M7/R2)---------------------------------------------------------------
 
 /// The three geometry channels of two frames, bit for bit.
 fn same_geometry(a: &Frame, b: &Frame, what: &str) {
@@ -1026,7 +1191,7 @@ fn ticks(
 #[test]
 fn cached_tessellation_is_bit_identical() {
     let mut cache = es_render::SceneCache::default();
-    for scene in [cornell_box(), so101()] {
+    for scene in [cornell_box(), so101(), mesh_box()] {
         for (tick, world) in ticks(&scene).iter().enumerate() {
             let cached = cache.tri_scene(&scene, world).expect("cached");
             let fresh = TriScene::from_scene_with_poses(&scene, world).expect("fresh");
@@ -1634,13 +1799,29 @@ fn so101() -> es_assets::scene::SceneDesc {
 /// `es video showcase`'s free camera at the angle the acceptance uses, built here rather than
 /// imported: `es_env::render::look_at` is layer 9 and this crate is layer 5 (spec 4.2).
 fn showcase_camera(width: u32, height: u32) -> CameraView {
+    use es_math::Vec3;
+    look_at(
+        Vec3::new(0.66, -0.46, 0.52),
+        Vec3::new(0.14, -0.04, 0.04),
+        36.0,
+        width,
+        height,
+    )
+}
+
+/// A pinhole at `eye` looking at `target`, OpenCV frame, `fov_deg` vertical.
+fn look_at(
+    eye: es_math::Vec3,
+    target: es_math::Vec3,
+    fov_deg: f64,
+    width: u32,
+    height: u32,
+) -> CameraView {
     use es_math::{Pose, Quat, Vec3};
-    let eye = Vec3::new(0.66, -0.46, 0.52);
-    let target = Vec3::new(0.14, -0.04, 0.04);
     let fwd = (target - eye).normalize();
     let right = fwd.cross(Vec3::new(0.0, 0.0, 1.0)).normalize();
     let down = fwd.cross(right);
-    // Shepperd's positive-trace branch; the showcase camera never looks along world up.
+    // Shepperd's positive-trace branch; neither caller looks along world up.
     let den = (right.x + down.y + fwd.z + 1.0).sqrt() * 2.0;
     let quat = Quat::from_xyzw(
         (down.z - fwd.y) / den,
@@ -1650,7 +1831,7 @@ fn showcase_camera(width: u32, height: u32) -> CameraView {
     );
     CameraView {
         pose: Pose::new(eye, quat),
-        spec: es_render::ImageSpec::pinhole(width, height, 36f64.to_radians()),
+        spec: es_render::ImageSpec::pinhole(width, height, fov_deg.to_radians()),
     }
 }
 

@@ -91,12 +91,17 @@ struct Fixed {
 
 impl Fixed {
     fn new(scene: &SceneDesc, pose: Pose) -> Self {
+        Self::body(scene, "cube", pose)
+    }
+
+    /// `name` pinned at `pose`, every other body at its scene pose.
+    fn body(scene: &SceneDesc, name: &str, pose: Pose) -> Self {
         let nbody = scene.bodies.len() as u32;
         let row = scene
             .bodies
             .iter()
-            .position(|b| b.name == "cube")
-            .expect("the V0 fixture has a cube");
+            .position(|b| b.name == name)
+            .unwrap_or_else(|| panic!("the fixture has `{name}`"));
         let mut model = ModelInfo {
             nbody,
             n_envs: 1,
@@ -104,7 +109,7 @@ impl Fixed {
         };
         model
             .body
-            .insert(by_name(scene, "cube").id, IndexRange::new(row as u32, 1));
+            .insert(by_name(scene, name).id, IndexRange::new(row as u32, 1));
         let mut xpos = vec![0.0; nbody as usize * 3];
         let mut xquat = vec![0.0; nbody as usize * 4];
         xpos[row * 3..row * 3 + 3].copy_from_slice(&[
@@ -653,7 +658,66 @@ fn gpu_frame_matches_the_cpu_frame() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// --- packet M10/W1a: the per-tick seed stream ------------------------------------------------
+// --- packet M10/W2b: a mesh geom through the env renderer ------------------------------------
+
+/// `EnvRenderer` clones the scene it is handed, meshes included, so a scene loaded through
+/// `es_assets::mesh::load` renders its mesh geom with no `es-env` change: the GPU frame of a
+/// posed state equals the CPU reference of `from_scene_with_poses` bit for bit.
+#[test]
+fn mesh_box_renders_through_env_renderer() {
+    let test = "mesh_box_renders_through_env_renderer";
+    let Some(gpu) = open(test) else { return };
+    let dir = repo_root().join("tests/fixtures/mjcf");
+    let xml = std::fs::read_to_string(dir.join("mesh_box.xml")).expect("the mesh_box fixture");
+    let mut scene = es_assets::parse_mjcf(&xml)
+        .expect("the mesh_box fixture parses")
+        .scene;
+    es_assets::mesh::load(&mut scene, &dir).expect("meshes/box.stl loads");
+    let cam = scene
+        .cameras
+        .iter()
+        .find(|c| c.name.ends_with("cam"))
+        .expect("the fixture declares `cam`")
+        .id;
+    let cfg = EnvRendererCfg::rgb(cam, 64, 64);
+    // `cam` looks straight down (an MJCF camera looks along its `-Z`), so the mesh body is
+    // posed under it, turned about `+Z`, rather than left out of frame at its scene pose.
+    let posed = Fixed::body(
+        &scene,
+        "mesh_box",
+        Pose::new(Vec3::new(0.25, -0.95, 0.1), CUBE_QUAT),
+    );
+    let cpu = |f: &Fixed| {
+        let world = body_poses(&f.model, &f.state(), 0);
+        let tri = TriScene::from_scene_with_poses(&scene, &world).expect("mesh_box tessellates");
+        let view = camera_view(&scene, &cfg, &world).expect("`cam` resolves");
+        cpu::rasterize(&tri, &view, &render_config(&cfg), 0)
+            .tile(Channel::Rgb8)
+            .expect("Rgb8 was requested")
+            .to_bytes()
+    };
+    let want = cpu(&posed);
+    let rest = Fixed::body(
+        &scene,
+        "mesh_box",
+        Pose::new(Vec3::new(0.0, 0.0, 0.3), Quat::IDENTITY),
+    );
+    assert!(want != cpu(&rest), "the posed mesh is not in the frame");
+
+    let mut renderer = EnvRenderer::new(&gpu, &scene, cfg.clone()).expect("renderer");
+    let got = renderer
+        .frame(&posed.model, &posed.state(), 0)
+        .expect("frame")
+        .to_bytes();
+    let diff = got.iter().zip(&want).filter(|(x, y)| x != y).count();
+    println!(
+        "{test}: {diff} of {} bytes differ from the CPU reference",
+        want.len()
+    );
+    assert!(got == want, "the GPU mesh frame must be bit-equal to the CPU");
+}
+
+// --- packet M10/W1a: the per-tick seed stream------------------------------------------------
 
 /// The `Pt` sensor `task-pt.toml` declares, at the `seed` stream asked for.
 fn pt_sensor(seed: es_ir::task::SeedStream) -> es_ir::task::SensorRender {
