@@ -202,8 +202,21 @@ c_in) → (actions, h_out, c_out)`; GRU: `(obs, h_in) → (actions, h_out)`); re
 
 ## 8. 아직 모르는 것
 
-- Isaac Lab 2.3.2가 고정하는 정확한 `rsl_rl` 버전(클래식 vs. 분리된 체크포인트 형태) —
-  이번 패스에서는 unverified, M11 X2가 하나의 체크포인트 리더를 확정하기 전에 필요.
+- ~~Isaac Lab 2.3.2가 고정하는 정확한 `rsl_rl` 버전~~ — 측정함(M11 I0, 2026-09-23):
+  `isaaclab 2.3.2.post1` 휠의 메타데이터는 `[all]`과 `[rsl-rl]` 아래에 `rsl-rl-lib==3.0.1`을
+  고정한다(번들된 `source/isaaclab_rl/setup.py`는 3.1.2라고 적지만 pip은 메타데이터를
+  따른다). 3.x는 §7의 5.0 분리선 아래이므로 클래식 `model_state_dict` 형태가 예상된다 —
+  체크포인트를 실제로 저장해 보기 전까지는 unverified.
+
+**측정된 설치(M11 I0, 2026-09-23, 자세한 내용은 `docs/api-notes/isaac-sim.md` §7).** pip
+경로로 서버의 `~/venvs/es-isaac`에 설치했다(Python 3.11.16, `isaacsim 5.1.0.0`). 휠은
+`isaaclab_rl`, `isaaclab_tasks`, `isaaclab_assets`, `isaaclab_mimic`, `isaaclab_contrib`를
+`isaaclab/source/` 아래 소스 익스텐션으로 번들한다(별도 배포판 없음). Ubuntu 26.04에서
+`libxml2.so.2`를 공급하면(isaac-sim §7.2) `isaaclab.app.AppLauncher(headless=True)`가 뜬다 —
+이것은 `isaaclab.python.headless.kit`을 써서 RTX 렌더러 크래시를 피한다. `isaaclab_rl.rsl_rl`과
+`isaaclab_tasks`가 임포트되고 `*Reach*` gym id 18개가 등록된다(`Isaac-Reach-Franka-v0`,
+`Isaac-Reach-OpenArm-Bi-v0`, UR10e 배포 변형 등, SO-101용은 없음). 학습 스크립트(`train.py`)는
+돌리지 않았고 Isaac Lab 리포도 클론하지 않았다.
 - SO-101의 조인트 이름/개수가 커스텀 `joint_names` 정규식을 필요로 하는지, 아니면 Franka의
   `"panda_joint.*"`처럼 하나의 전체 매칭 패턴으로 되는지 — SO-101 USD 에셋이 저작한 조인트
   이름에 달려 있으며 여기서는 가져오지 않았다(이 프로젝트 자체의 MJCF가 Isaac 에셋이 아니라
