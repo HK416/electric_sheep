@@ -629,3 +629,66 @@ fn rollout_integrates_delta() {
          {clamped} clamped lanes"
     );
 }
+
+/// The reach documents, in `Rollout::new`'s argument order.
+fn reach_documents() -> (String, String, String, String) {
+    (
+        read("tests/fixtures/rl/task-reach.toml"),
+        read("tests/fixtures/rl/observation-reach.toml"),
+        read("tests/fixtures/rl/deployment-reach.toml"),
+        read("tests/fixtures/mjcf/so101_pick_place.xml"),
+    )
+}
+
+/// Packet M11/X1: `Rollout` runs on `mujoco-cpu` and `mjwarp`. Newton is refused by its own
+/// mapping report before a process spawns (its adapter declares no actuators), and PhysX
+/// names the packet that brings it. Needs no Python.
+#[test]
+fn rollout_backend_newton_and_physx_are_refused() {
+    use es_physics_backend::BackendKind;
+    let (task, obs, deploy, scene) = reach_documents();
+    let said = |kind| {
+        Rollout::<NJ, 1>::with_backend(kind, &task, &obs, &deploy, &scene, 0, 1)
+            .expect_err("refused")
+            .to_string()
+    };
+    let newton = said(BackendKind::Newton);
+    assert!(newton.contains("backend `newton`"), "{newton}");
+    assert!(newton.contains("blocked: yes"), "{newton}");
+    let physx = said(BackendKind::PhysX);
+    assert!(physx.contains("not implemented (M11/I1)"), "{physx}");
+}
+
+/// Packet M11/X1: the reach documents step on MJWarp through the same plane and plan. Tier 2
+/// (spec 3.5): the distance to `mujoco-cpu` is printed as a number, never asserted bitwise.
+#[test]
+#[ignore = "needs mujoco_warp and mujoco through ES_PYTHON"]
+fn rollout_backend_mjwarp_steps_the_reach_documents() {
+    use es_physics_backend::{BackendKind, MjWarpBackend};
+    if let Err(why) = MjWarpBackend::is_available() {
+        println!("SKIP rollout_backend_mjwarp_steps_the_reach_documents: {why}");
+        return;
+    }
+    let (task, obs, deploy, scene) = reach_documents();
+    let n_envs = 2;
+    let build = |kind| {
+        Rollout::<NJ, 1>::with_backend(kind, &task, &obs, &deploy, &scene, 0, n_envs)
+            .expect("the reach documents build a rollout")
+    };
+    let (mut cpu, mut warp) = (build(BackendKind::MuJoCoCpu), build(BackendKind::MjWarp));
+    cpu.reset(None).expect("reset");
+    warp.reset(None).expect("reset");
+    let mut worst = 0.0_f64;
+    for step in 0..20 {
+        let a = actions(step, n_envs as usize);
+        cpu.act(&a).expect("cpu act");
+        warp.act(&a).expect("mjwarp act");
+        for env in 0..n_envs as usize {
+            for (c, w) in cpu.qpos(env).iter().zip(warp.qpos(env)) {
+                assert!(w.is_finite(), "mjwarp qpos is not finite at step {step}");
+                worst = worst.max((c - w).abs());
+            }
+        }
+    }
+    println!("RAN rollout mjwarp vs mujoco-cpu, 20 control steps: max |dqpos| = {worst:e}");
+}

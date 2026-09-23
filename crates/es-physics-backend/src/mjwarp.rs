@@ -487,7 +487,8 @@ mod tests {
         let reply: LoadReply = parse_response(
             r#"{"ok":true,"nq":1,"nv":1,"nu":1,"nsensordata":0,"nbody":2,
                 "joints":[{"name":"hinge","qpos":[0,1],"dof":[0,1]}],
-                "actuators":["m"],"sensors":[],"bodies":["world","rod"]}"#,
+                "actuators":["m"],"sensors":[],"bodies":["world","rod"],
+                "engine_version":"mujoco_warp 3.3.2"}"#,
         )
         .unwrap();
         assert_eq!((reply.nq, reply.nbody), (1, 2));

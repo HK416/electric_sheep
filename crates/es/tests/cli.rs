@@ -1219,6 +1219,112 @@ fn eval_run_skips_when_backend_or_runtime_unavailable() {
     assert!(text.contains("SKIPPED"), "{text}");
 }
 
+// --- packet M11/X1: `--backend` on `es eval run` and `es loop collect` ------------------------
+
+/// One `es eval run` or `es loop collect` of the demo documents on `backend`, with `python` as
+/// `ES_PYTHON` (`None` leaves the caller's).
+fn run_on_backend(verb: &str, backend: &str, python: Option<&str>) -> Output {
+    let dir = scratch_dir(&format!("backend-{verb}-{backend}"));
+    let policy = write_demo_bundle(&dir);
+    let mut cmd = bin();
+    if let Some(p) = python {
+        cmd.env("ES_PYTHON", p);
+    }
+    match verb {
+        "eval" => cmd
+            .args(["eval", "run", "--config"])
+            .arg(vl_fixture("evaluation.toml"))
+            .arg("--policy")
+            .arg(&policy)
+            .arg("--scene")
+            .arg(demo_scene_path()),
+        "collect" => cmd
+            .args(["loop", "collect", "--policy"])
+            .arg(&policy)
+            .arg("--scene")
+            .arg(demo_scene_path())
+            .args(["--episodes", "1", "--seed", "1"]),
+        other => panic!("no verb {other}"),
+    };
+    cmd.args(["--backend", backend, "--out"])
+        .arg(dir.join("out"))
+        .output()
+        .expect("run es")
+}
+
+const BACKEND_VERBS: [&str; 2] = ["eval", "collect"];
+
+/// Packet M11/X1 oracle 2. Newton is refused by its own mapping report, naming the rows, and
+/// before any process spawns: with an `ES_PYTHON` that does not exist, an availability probe
+/// (or a backend load that got as far as its subprocess) would have said SKIPPED or "cannot
+/// start" instead.
+#[test]
+fn eval_run_backend_newton_is_refused_by_its_mapping_report() {
+    for verb in BACKEND_VERBS {
+        let out = run_on_backend(verb, "newton", Some("es-no-such-python"));
+        let err = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{verb}:\n{}\n{err}", stdout(&out));
+        assert!(!stdout(&out).contains("SKIPPED"), "{verb}: {}", stdout(&out));
+        assert!(err.contains("backend `newton`"), "{verb}: {err}");
+        assert!(err.contains("blocked: yes"), "{verb}: {err}");
+        assert!(err.contains("actuator"), "{verb}: the rows are named\n{err}");
+        assert!(!err.contains("cannot start"), "{verb}: a process was spawned\n{err}");
+    }
+}
+
+/// PhysX is a known name with no adapter yet: it names the packet that brings it.
+#[test]
+fn eval_run_backend_physx_names_i1() {
+    for verb in BACKEND_VERBS {
+        let out = run_on_backend(verb, "physx", Some("es-no-such-python"));
+        let err = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{verb}: {err}");
+        assert!(err.contains("not implemented (M11/I1)"), "{verb}: {err}");
+    }
+}
+
+/// A name outside the spec 17.2 table is a usage error, and the message lists the four.
+#[test]
+fn eval_run_backend_unknown_is_a_usage_error() {
+    for verb in BACKEND_VERBS {
+        let out = run_on_backend(verb, "banana", Some("es-no-such-python"));
+        let err = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(2), "{verb}: {err}");
+        assert!(err.contains("banana"), "{verb}: {err}");
+        for name in ["mujoco-cpu", "mjwarp", "newton", "physx"] {
+            assert!(err.contains(name), "{verb}: {name} is not listed\n{err}");
+        }
+    }
+}
+
+/// Without `mujoco_warp` an `mjwarp` run is the documented SKIPPED exit 3, never a faked run;
+/// the demo scene maps on MJWarp, so the refusal is availability and not the mapping report.
+#[test]
+fn eval_run_backend_mjwarp_skips_without_mujoco_warp() {
+    if es_physics_backend::MjWarpBackend::is_available().is_ok() {
+        println!("SKIP eval_run_backend_mjwarp_skips_without_mujoco_warp: mujoco_warp is here");
+        return;
+    }
+    for verb in BACKEND_VERBS {
+        let out = run_on_backend(verb, "mjwarp", None);
+        let text = stdout(&out);
+        assert_eq!(out.status.code(), Some(3), "{verb}:\n{text}\n{}", stderr_of(&out));
+        assert!(text.contains("SKIPPED (mjwarp backend unavailable"), "{verb}: {text}");
+    }
+}
+
+/// The help text of both verbs lists the four names and what each does today.
+#[test]
+fn eval_run_backend_help_lists_the_four_names() {
+    for args in [&["eval", "run", "--help"][..], &["loop", "--help"][..]] {
+        let out = bin().args(args).output().expect("run es");
+        let text = stdout(&out);
+        for name in ["mujoco-cpu", "mjwarp", "newton", "physx", "M11/I1"] {
+            assert!(text.contains(name), "{args:?}: {name} missing\n{text}");
+        }
+    }
+}
+
 /// Packet M5/V5. `--jobs 0` is "run no cell and report on it": a usage error (exit 2) raised
 /// while parsing, before a bundle, a scene or a Python interpreter is touched -- which is why
 /// this runs in the PR tier where neither `mujoco` nor `torch` exists. The same check covers
@@ -11129,8 +11235,77 @@ fn train_rl_estimator_dry_run_plan() {
     assert!(said.contains("executed_mean"), "{said}");
 }
 
-/// Regenerates `tests/golden/train/plan-rl.txt`, `plan-reach.txt`, `plan-reach-delta.txt` and
-/// `plan-reach-executed.txt`.
+/// `training-reach.toml` with one `[rl] backend` line added after `value_coef` and nothing else
+/// changed (packet M11/X1).
+fn reach_recipe_on_backend(value: &str) -> String {
+    let text = std::fs::read_to_string(rl_fixture("training-reach.toml")).expect("the recipe");
+    assert!(text.contains("value_coef  = 0.5"), "the anchor line moved");
+    text.replace(
+        "value_coef  = 0.5",
+        &format!("value_coef  = 0.5\nbackend     = \"{value}\""),
+    )
+}
+
+/// Packet M11/X1 oracle 3: `[rl] backend = "mjwarp"` reaches the trainer's argv -- and so
+/// `training/config.json` and `training_hash` -- as one flag appended last; the plan is a
+/// golden of its own; `backend = "mujoco-cpu"` spelled out serialises exactly like absence, so
+/// `training-reach.toml`'s `training_hash` does not move; and a backend `Rollout` cannot run is
+/// refused by name.
+#[test]
+fn train_rl_backend_dry_run_plan() {
+    let dir = scratch_dir("train-reach-mjwarp-dry");
+    let recipe = dir.join("training-reach-mjwarp.toml");
+    write(&recipe, &reach_recipe_on_backend("mjwarp"));
+    let out = run_train(&train_toml_path(&recipe), &dir.join("out"), &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let golden = train_golden("plan-reach-mjwarp.txt");
+    let want =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(stdout(&out), want, "the mjwarp plan is not the golden");
+    let line = want
+        .lines()
+        .find(|l| l.contains("train_ppo.py"))
+        .expect("the plan runs the PPO trainer");
+    assert!(line.ends_with(" --backend mjwarp"), "{line}");
+    let plain = std::fs::read_to_string(train_golden("plan-reach.txt")).expect("plan-reach.txt");
+    assert!(!plain.contains("--backend"), "{plain}");
+    assert_eq!(
+        line.replace(" --backend mjwarp", ""),
+        plain
+            .lines()
+            .find(|l| l.contains("train_ppo.py"))
+            .expect("plan-reach.txt runs the PPO trainer"),
+        "the two plans differ by more than the backend"
+    );
+
+    let text = std::fs::read_to_string(rl_fixture("training-reach.toml")).expect("the recipe");
+    let absent = es_data::Recipe::parse(&text).expect("training-reach.toml parses");
+    let spelled =
+        es_data::Recipe::parse(&reach_recipe_on_backend("mujoco-cpu")).expect("the default");
+    assert_eq!(
+        serde_json::to_value(&absent).expect("the recipe serialises"),
+        serde_json::to_value(&spelled).expect("the recipe serialises"),
+        "`backend = \"mujoco-cpu\"` does not serialise like absence: every measured row's \
+         training_hash just moved"
+    );
+    assert_eq!(
+        absent.rl_args().expect("the args"),
+        spelled.rl_args().expect("the args"),
+        "the default reached the trainer's argv"
+    );
+    // `Rollout` runs the two backends with a closed-loop path; the other two names and a name
+    // outside the table are refused with the word the recipe used.
+    for bad in ["newton", "physx", "banana"] {
+        let Err(refused) = es_data::Recipe::parse(&reach_recipe_on_backend(bad)) else {
+            panic!("[rl] backend = {bad:?} parsed");
+        };
+        let said = refused.to_string();
+        assert!(said.contains(bad), "{said}");
+    }
+}
+
+/// Regenerates `tests/golden/train/plan-rl.txt`, `plan-reach.txt`, `plan-reach-delta.txt`,
+/// `plan-reach-executed.txt` and `plan-reach-mjwarp.txt`.
 #[test]
 #[ignore = "golden generator; run explicitly"]
 fn generate_rl_plan_golden() {
@@ -11155,6 +11330,14 @@ fn generate_rl_plan_golden() {
         assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
         write(&train_golden(golden), &stdout(&out));
     }
+    // Packet M11/X1: `training-reach.toml` plus `[rl] backend = "mjwarp"`, written beside the
+    // run rather than committed as a fixture of its own.
+    let dir = scratch_dir("train-rl-golden");
+    let recipe = dir.join("training-reach-mjwarp.toml");
+    write(&recipe, &reach_recipe_on_backend("mjwarp"));
+    let out = run_train(&train_toml_path(&recipe), &dir.join("out"), &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    write(&train_golden("plan-reach-mjwarp.txt"), &stdout(&out));
 }
 
 /// Runs one real `[rl]` recipe end to end under `ES_PYTHON`, or says why it did not.

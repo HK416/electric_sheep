@@ -513,7 +513,8 @@ mod tests {
         let reply: LoadReply = parse_response(
             r#"{"ok":true,"nq":1,"nv":1,"nu":0,"nsensordata":0,"nbody":1,
                 "joints":[{"name":"hinge","qpos":[0,1],"dof":[0,1]}],
-                "actuators":[],"sensors":[],"bodies":["rod"]}"#,
+                "actuators":[],"sensors":[],"bodies":["rod"],
+                "engine_version":"newton 1.0"}"#,
         )
         .unwrap();
         assert_eq!((reply.nq, reply.nu, reply.nbody), (1, 0, 1));
