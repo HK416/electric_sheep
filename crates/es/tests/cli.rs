@@ -14037,3 +14037,279 @@ fn dr_collect_eval_frames_match_rollout() {
         gpu.capabilities().device_name
     );
 }
+
+// --- packet M11/X7: vision RL on the path tracer, randomization on and off ----------------
+
+/// The training setting stage 1 chose (`docs/design/rl-continuation.md` section 7, X7):
+/// samples per pixel and whether the sensor runs SVGF on the `Pt` rows.
+const X7_SPP: u32 = 16;
+const X7_SVGF: bool = false;
+
+/// X7's randomization targets: `vision_dr_targets` (R2's eleven, at X5's ranges) plus X5's
+/// colour and ambient, and X4's physics scales at moderate ranges -- the cube's mass and
+/// friction and every arm servo's gain. `light.radiance` (the `Pt` sun) is refused on an `Rs`
+/// sensor, which has no such light, so the `Rs` rows go without it.
+fn x7_dr_targets(pt: bool) -> Vec<(String, es_ir::task::Distribution)> {
+    let uniform = |lo: f64, hi: f64| es_ir::task::Distribution::Uniform { lo, hi };
+    let mut out: Vec<_> = vision_dr_targets()
+        .into_iter()
+        .filter(|(t, _)| pt || t != "light.radiance")
+        .collect();
+    out.push(("light.color".to_owned(), uniform(0.7, 1.3)));
+    out.push(("light.ambient".to_owned(), uniform(0.5, 2.0)));
+    out.push(("body.cube.mass".to_owned(), uniform(0.8, 1.2)));
+    out.push(("geom.cube_geom.friction".to_owned(), uniform(0.8, 1.2)));
+    for servo in [
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow_flex",
+        "wrist_flex",
+        "wrist_roll",
+        "gripper",
+    ] {
+        out.push((format!("actuator.{servo}.gain"), uniform(0.9, 1.1)));
+    }
+    out
+}
+
+/// `(file name, header, body)` of one X7 row's task, observation and evaluation documents:
+/// `task-reach-vision.toml` with the overhead sensor on `Pt` at `spp` (± SVGF, everything else
+/// as there) or on `Rs`, with or without `x7_dr_targets`; the observation with `task_ref`
+/// following; `evaluation-reach-vision.toml` with the hashes following and the demo's two light
+/// suites (`visible-learning/evaluation.toml`, streams 0 and 1) after `nominal`.
+fn x7_row_documents(row: &str, pt: Option<(u32, bool)>, dr: bool) -> Vec<(String, String, String)> {
+    let read = |path: PathBuf| {
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+            .replace("\r\n", "\n")
+    };
+    let mut task = es_ir::serial::task_from_toml(&read(rl_fixture("task-reach-vision.toml")))
+        .expect("the vision task");
+    let es_ir::task::ObsSource::Sensor { render, .. } = &mut task
+        .observation_spec
+        .channels
+        .get_mut("rgb_overhead")
+        .expect("the image channel")
+        .source
+    else {
+        panic!("rgb_overhead is not a sensor channel");
+    };
+    match pt {
+        Some((spp, svgf)) => {
+            let es_ir::task::SensorPath::Pt { bounces, .. } = render.path else {
+                panic!("task-reach-vision.toml is not on Pt");
+            };
+            render.path = es_ir::task::SensorPath::Pt { spp, bounces };
+            render.svgf = svgf;
+        }
+        None => *render = es_ir::task::SensorRender::default(),
+    }
+    let targets = if dr {
+        x7_dr_targets(pt.is_some())
+    } else {
+        vec![]
+    };
+    let first = task.graph.nodes.keys().map(|n| n.0).max().expect("nodes") + 1;
+    for (next, (target, dist)) in (first..).zip(targets) {
+        let stream = format!("dr.{target}");
+        task.config.rng_streams.insert(stream.clone());
+        task.graph.insert(
+            es_ir::graph::NodeId(next),
+            es_ir::task::TaskNode::Randomization {
+                target,
+                dist,
+                stream,
+            },
+        );
+    }
+    let mut observation =
+        es_ir::serial::observation_from_toml(&read(rl_fixture("observation-reach-vision.toml")))
+            .expect("the vision observation");
+    observation.task_ref = task.task_hash().expect("the task hashes");
+    let mut evaluation =
+        es_ir::serial::evaluation_from_toml(&read(rl_fixture("evaluation-reach-vision.toml")))
+            .expect("the vision evaluation");
+    let demo = es_ir::serial::evaluation_from_toml(&read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/visible-learning/evaluation.toml"),
+    ))
+    .expect("the demo evaluation");
+    let light: Vec<_> = demo
+        .suites
+        .into_iter()
+        .filter(|s| s.name.starts_with("light_"))
+        .collect();
+    assert_eq!(light.len(), 2, "the demo's two light suites");
+    evaluation.suites.splice(1..1, light);
+    evaluation.task = hex(&task.task_hash().expect("hash"));
+    evaluation.observation = hex(&observation.observation_hash().expect("hash"));
+
+    let sensor = match pt {
+        Some((spp, svgf)) => {
+            format!("`Pt` {spp} spp, 3 bounces, exposure 64,\n# `seed = \"tick\"`, svgf = {svgf}")
+        }
+        None => "`Rs` (the default render block)".to_owned(),
+    };
+    let draws = if dr {
+        "plus X7's randomization targets (`x7_dr_targets`: R2's render draws,\n# light colour \
+         and ambient, cube mass and friction, the six servo gains), each on its own stream"
+    } else {
+        "and no randomization beyond task-reach-vision.toml's own reset and\n# cube draws"
+    };
+    let generated = "# Generated by `ES_GENERATE_GOLDENS=1 cargo test -p es --test cli -- \
+                     --ignored\n# regenerate_x7_documents` (crates/es/tests/cli.rs); no hash in \
+                     it is typed in by hand.\n";
+    let task_header = format!(
+        "# Task IR (spec 6), packet M11/X7 row `{row}`.\n#\n{generated}#\n# \
+         task-reach-vision.toml with the overhead sensor on {sensor},\n# {draws}.\n"
+    );
+    let observation_header = format!(
+        "# Observation IR (spec 7), packet M11/X7 row `{row}`.\n#\n{generated}#\n# \
+         observation-reach-vision.toml with `task_ref` following task-reach-vision-{row}.toml.\n"
+    );
+    let evaluation_header = format!(
+        "# Evaluation IR (spec 10), packet M11/X7 row `{row}`.\n#\n{generated}#\n# \
+         evaluation-reach-vision.toml with `task` and `observation` following row `{row}`, and \
+         the\n# demo's `light_intensity` and `light_direction` suites \
+         (tests/fixtures/visible-learning/\n# evaluation.toml, streams 0 and 1) after \
+         `nominal`. The same 16 held-out seeds 201-216.\n"
+    );
+    vec![
+        (
+            format!("task-reach-vision-{row}.toml"),
+            task_header,
+            es_ir::serial::task_to_toml(&task).expect("task toml"),
+        ),
+        (
+            format!("observation-reach-vision-{row}.toml"),
+            observation_header,
+            es_ir::serial::observation_to_toml(&observation).expect("observation toml"),
+        ),
+        (
+            format!("evaluation-reach-vision-{row}.toml"),
+            evaluation_header,
+            es_ir::serial::evaluation_to_toml(&evaluation).expect("evaluation toml"),
+        ),
+    ]
+}
+
+/// The four X7 rows at the chosen setting, three documents each.
+fn x7_documents() -> Vec<(String, String, String)> {
+    let pt = Some((X7_SPP, X7_SVGF));
+    [
+        ("pt-dr", pt, true),
+        ("rs-dr", None, true),
+        ("pt", pt, false),
+        ("rs", None, false),
+    ]
+    .into_iter()
+    .flat_map(|(row, pt, dr)| x7_row_documents(row, pt, dr))
+    .collect()
+}
+
+/// Writes the X7 documents. Run explicitly:
+///
+///     ES_GENERATE_GOLDENS=1 cargo test -p es --test cli -- --ignored regenerate_x7_documents
+///
+/// With `ES_X7_SWEEP=<dir>` it instead writes stage 1's six `Pt` + randomization variants
+/// (spp 4, 8, 16 x SVGF off, on) into `<dir>/s<spp>-svgf<0|1>/`; those are not committed.
+#[test]
+#[ignore = "fixture generator; run explicitly"]
+fn regenerate_x7_documents() {
+    if let Ok(dir) = std::env::var("ES_X7_SWEEP") {
+        for spp in [4, 8, 16] {
+            for svgf in [false, true] {
+                let out = Path::new(&dir).join(format!("s{spp}-svgf{}", u8::from(svgf)));
+                std::fs::create_dir_all(&out).expect("mkdir");
+                for (name, header, body) in x7_row_documents("pt-dr", Some((spp, svgf)), true) {
+                    std::fs::write(out.join(name), format!("{header}\n{body}")).expect("write");
+                }
+                println!("wrote {}", out.display());
+            }
+        }
+        return;
+    }
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP regenerate_x7_documents: set ES_GENERATE_GOLDENS=1");
+        return;
+    }
+    for (name, header, body) in x7_documents() {
+        let path = rl_fixture(&name);
+        std::fs::write(&path, format!("{header}\n{body}")).expect("write");
+        println!("wrote {}", path.display());
+    }
+}
+
+/// Packet M11/X7 oracle 1: the committed X7 documents are what the generator writes, each
+/// validates, and each row agrees across every Cross-IR boundary with
+/// `learning-reach-vision.toml`, `deployment-reach.toml` and its own evaluation.
+#[test]
+fn vision_reach_dr_documents_check() {
+    let docs = x7_documents();
+    for (name, _, body) in &docs {
+        let on_disk = std::fs::read_to_string(rl_fixture(name))
+            .unwrap_or_else(|e| panic!("{name}: {e}"))
+            .replace("\r\n", "\n");
+        let committed = on_disk
+            .split_once("\nes_schema")
+            .map(|(_, rest)| format!("es_schema{rest}"))
+            .unwrap_or(on_disk);
+        assert_eq!(
+            &committed, body,
+            "{name} is not what the generator writes; rerun `ES_GENERATE_GOLDENS=1 cargo test \
+             -p es --test cli -- --ignored regenerate_x7_documents`"
+        );
+    }
+    let read = |name: &str| std::fs::read_to_string(rl_fixture(name)).expect(name);
+    let learning =
+        es_ir::serial::learning_from_toml(&read("learning-reach-vision.toml")).expect("learning");
+    let deployment =
+        es_ir::serial::deployment_from_toml(&read("deployment-reach.toml")).expect("deployment");
+    for row in docs.chunks(3) {
+        let task = es_ir::serial::task_from_toml(&row[0].2).expect("task");
+        let observation = es_ir::serial::observation_from_toml(&row[1].2).expect("observation");
+        let evaluation = es_ir::serial::evaluation_from_toml(&row[2].2).expect("evaluation");
+        for (name, diags) in [
+            (&row[0].0, task.validate()),
+            (&row[1].0, observation.validate()),
+            (&row[2].0, evaluation.validate()),
+        ] {
+            assert!(diags.is_empty(), "{name}: {diags:#?}");
+        }
+        let diags = cross::check(&IrBundle {
+            task: &task,
+            observation: &observation,
+            learning: &learning,
+            deployment: &deployment,
+            evaluation: Some(&evaluation),
+        });
+        assert!(diags.is_empty(), "{}: cross-IR {diags:#?}", row[0].0);
+    }
+}
+
+/// Packet M11/X7 oracle 1: each row's recipe plans the `[rl]` route on its own bundle, pinned
+/// by `tests/golden/train/plan-reach-vision-<row>.txt`. With `ES_GENERATE_GOLDENS=1` the
+/// goldens are written instead (they are new files; no older golden is rewritten).
+#[test]
+fn train_x7_dry_run_plans() {
+    for row in ["pt-dr", "rs-dr", "pt", "rs"] {
+        let recipe = format!("tests/fixtures/rl/training-reach-vision-{row}.toml");
+        let dir = scratch_dir("train-x7-dry");
+        let out = run_train(&recipe, &dir, &["--dry-run"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+        let golden = train_golden(&format!("plan-reach-vision-{row}.txt"));
+        if std::env::var("ES_GENERATE_GOLDENS").as_deref() == Ok("1") {
+            write(&golden, &stdout(&out));
+            continue;
+        }
+        let want = std::fs::read_to_string(&golden)
+            .unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+        assert_eq!(stdout(&out), want, "{recipe}: stdout is not the golden");
+        assert!(
+            want.contains(&format!("runs/reach-vision-{row}/untrained.esb")),
+            "{want}"
+        );
+        assert!(want.contains("--device cuda"), "{want}");
+        assert!(want.contains("--iterations 4000"), "{want}");
+    }
+}

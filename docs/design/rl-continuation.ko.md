@@ -1005,6 +1005,48 @@ policy gradient(Fujita & Maeda, 2018), 클램프된 차원에 대해 가우시�
 모두 19,076 s ≈ 5.3 h; 평가 여섯 번 67 s. §12.4 아홉 지표는 각 실행의 `metrics/env-metrics.json`에
 있고, 나머지는 `Target / Status: unverified`다.
 
+### X7 — 경로 추적기 위의 비전 RL, 무작위화 켬과 끔, 오라클 서버(Linux, RTX 4090) — 초안
+
+패킷 `docs/packets/M11/X7-vision-rl-pt.md`, spec 28.14 wave 3. **초안: stage 1의 선택 규칙을
+stage 1이 돌기 전에 여기 적어 둔다. 측정은 그 뒤에 붙는다.**
+
+**문서.** `regenerate_x7_documents`(`crates/es/tests/cli.rs`)가 `task-reach-vision.toml`,
+`observation-reach-vision.toml`, `evaluation-reach-vision.toml`로부터 네 행을 쓴다:
+`pt-dr`, `rs-dr`, `pt`, `rs`(`task-`, `observation-`, `evaluation-reach-vision-<row>.toml`).
+`Pt` 행은 X3의 센서(3 bounces, exposure 64, `seed = "tick"`)를 stage 1이 고른 spp와 SVGF로
+유지하고, `Rs` 행은 기본 render 블록을 가진다. `-dr` 행은 다음 `Randomization` 대상을 더하며,
+각각 자기 스트림 `dr.<target>` 위에 있고 모두 `Uniform`이다:
+
+| 대상 | 범위 | 출처 |
+|---|---|---|
+| `light.radiance` (`Pt`의 태양; `Rs`에서는 거부되므로 `pt-dr`에만) | 0.5–2.0 | R2 |
+| `light.intensity` | 0.7–1.3 | X5 |
+| `light.direction` (yaw, 도) | −30–30 | X5 |
+| `light.color` | 0.7–1.3 | X5 |
+| `light.ambient` | 0.5–2.0 | X5 |
+| `geom.bin_floor.rgba` | 0.5–1.5 | X5 |
+| `camera.overhead.fov` | 0.85–1.15 | X5 |
+| `camera.overhead.pose.{x,y,z}` (m) | −0.02–0.02 | X5 |
+| `camera.overhead.pose.{roll,pitch,yaw}` (도) | −4–4 | X5 |
+| `body.cube.mass` | 0.8–1.2 | X4 |
+| `geom.cube_geom.friction` | 0.8–1.2 | X4 |
+| `actuator.<servo>.gain`, 서보 여섯 개 모두 | 0.9–1.1 | X4 |
+
+평가 문서는 `evaluation-reach-vision.toml`(시드 201–216, `nominal`, `observation_delay`,
+`torque_noise`, `backlash`)에 데모의 `light_intensity`(0.5–1.5)와 `light_direction`(45°) 스위트를
+더한 것이다. 레시피 `training-reach-vision-<row>.toml`은 `training-reach.toml`의 것(16 envs × 64
+steps, epochs × minibatches 4 × 4, 4,000 iterations)을 그 행의 번들 위에 `device = "cuda"`로 둔
+것이다.
+
+**Stage 1의 선택 규칙, 돌기 전에 고정.** 여섯 개의 `pt-dr` 실행(spp ∈ {4, 8, 16} × SVGF {off,
+on}, 1,000 iterations, seed 0) 각각을 **벽시계 시간당 return 이득**으로 채점한다:
+`(final_return − initial_return) / (wall_clock_s / 3600)`. 여기서 `initial_return`과
+`final_return`은 `train_ppo.py` 자신의 요약에서 처음과 마지막 10 % iteration의 평균이고,
+`wall_clock_s`는 `metrics/env-metrics.json`의 값이다. 값이 가장 큰 행이 stage 2의 학습 설정이
+된다. 어떤 행도 이득이 없으면(모든 값 ≤ 0), 이 예산에서 학습함을 보인 행이 없는 것이므로 가장
+싼 행(`wall_clock_s`가 가장 작은 행)을 고른다. 행마다 시드 하나: 선택은 설정이지 주장이 아니며,
+stage 1의 어떤 숫자도 학습에 관한 결과로 보고하지 않는다(§28.14 rule 7).
+
 ## 8. 임포터와 어댑터
 
 1절의 규칙 3은 어댑터가 선언하고 코드는 결코 추측하지 않는다고 말한다. `es policy import-rl`의

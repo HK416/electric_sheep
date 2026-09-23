@@ -1045,6 +1045,49 @@ Wall-clock: the three trainings concurrent with plan W's W1a PT run on the same 
 16 cores), 19,076 s ≈ 5.3 h for all three; the six evaluations 67 s. The nine §12.4 metrics are in
 each run's `metrics/env-metrics.json`, the rest `Target / Status: unverified`.
 
+### X7 — vision RL on the path tracer, randomization on and off, oracle server (Linux, RTX 4090) — draft
+
+Packet `docs/packets/M11/X7-vision-rl-pt.md`, spec 28.14 wave 3. **Draft: the stage-1 choice rule
+is written here before stage 1 runs; the measurements follow.**
+
+**Documents.** `regenerate_x7_documents` (`crates/es/tests/cli.rs`) writes four rows from
+`task-reach-vision.toml`, `observation-reach-vision.toml` and `evaluation-reach-vision.toml`:
+`pt-dr`, `rs-dr`, `pt`, `rs` (`task-`, `observation-`, `evaluation-reach-vision-<row>.toml`).
+`Pt` rows keep X3's sensor (3 bounces, exposure 64, `seed = "tick"`) at stage 1's spp and SVGF;
+`Rs` rows carry the default render block. The `-dr` rows add these `Randomization` targets, each
+on its own stream `dr.<target>`, every one `Uniform`:
+
+| target | range | from |
+|---|---|---|
+| `light.radiance` (the `Pt` sun; refused on `Rs`, so `pt-dr` only) | 0.5–2.0 | R2 |
+| `light.intensity` | 0.7–1.3 | X5 |
+| `light.direction` (yaw, degrees) | −30–30 | X5 |
+| `light.color` | 0.7–1.3 | X5 |
+| `light.ambient` | 0.5–2.0 | X5 |
+| `geom.bin_floor.rgba` | 0.5–1.5 | X5 |
+| `camera.overhead.fov` | 0.85–1.15 | X5 |
+| `camera.overhead.pose.{x,y,z}` (m) | −0.02–0.02 | X5 |
+| `camera.overhead.pose.{roll,pitch,yaw}` (degrees) | −4–4 | X5 |
+| `body.cube.mass` | 0.8–1.2 | X4 |
+| `geom.cube_geom.friction` | 0.8–1.2 | X4 |
+| `actuator.<servo>.gain`, all six servos | 0.9–1.1 | X4 |
+
+The evaluation documents are `evaluation-reach-vision.toml` (seeds 201–216, `nominal`,
+`observation_delay`, `torque_noise`, `backlash`) plus the demo's `light_intensity` (0.5–1.5) and
+`light_direction` (45°) suites. The recipes `training-reach-vision-<row>.toml` are
+`training-reach.toml`'s (16 envs × 64 steps, 4 × 4 epochs × minibatches, 4,000 iterations) on
+the row's bundle with `device = "cuda"`.
+
+**Stage 1's choice rule, fixed before it ran.** Each of the six `pt-dr` runs (spp ∈ {4, 8, 16} ×
+SVGF {off, on}, 1,000 iterations, seed 0) is scored by its **return gain per wall-clock hour**:
+`(final_return − initial_return) / (wall_clock_s / 3600)`, where `initial_return` and
+`final_return` are `train_ppo.py`'s own summary means over the first and the last 10 % of the
+iterations and `wall_clock_s` is `metrics/env-metrics.json`'s. The row with the largest value is
+the training setting of stage 2. If no row gains (every value ≤ 0), no row has shown it learns
+at this budget and the cheapest row (the smallest `wall_clock_s`) is chosen. One seed per row:
+the choice is a setting, not a claim, and no stage-1 number is reported as a result about
+learning (§28.14 rule 7).
+
 ## 8. The importer and the adapter
 
 Rule 3 of section 1 says the adapter declares and code never guesses. This is what that comes
