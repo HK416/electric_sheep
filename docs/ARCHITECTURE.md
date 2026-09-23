@@ -1998,13 +1998,15 @@ The same Task IR must not behave differently across backends. Instead of buildin
 Task IR                         MJWarp          Newton          PhysX
 ─────────────────────────────────────────────────────────────────────
 actuator.pd(kp, kd)             position gain   controller      drive stiffness
-contact.friction_cone           pyramidal       selectable       pyramidal
+contact.friction_cone           selectable¹     selectable       pyramidal
 contact.soft_params             impedance       solver-dependent contact offset
 joint.armature                  armature        armature        unsupported → warning
 sensor.contact_force            sensor          contact          contact report
 ```
 
 `es backend compare --task T --backends mjwarp,newton,mujoco-cpu` runs the same task on the three backends and produces a report comparing them with the §3.5 layer-3 metrics. **Unmapped items block execution if `severity: error`** (§14.4).
+
+¹ Pyramidal until 2026-09-23. `mujoco_warp` 3.13 implements the elliptic cone, and M11/X1 measured it on the SO-101 scene (1,000 steps, fixed control: arm joints within 1.1e-5 rad of MuJoCo CPU, the cube's free joint 0.103). The owner then allowed an elliptic scene on MJWarp as a tier-2 row with its contact difference reported, never hidden (§28.14).
 
 ### 17.3 Determinism
 

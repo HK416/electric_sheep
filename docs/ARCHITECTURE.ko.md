@@ -1983,13 +1983,15 @@ PhysicsBackend
 Task IR                         MJWarp          Newton          PhysX
 ─────────────────────────────────────────────────────────────────────
 actuator.pd(kp, kd)             position gain   controller      drive stiffness
-contact.friction_cone           pyramidal       선택 가능        pyramidal
+contact.friction_cone           선택 가능¹      선택 가능        pyramidal
 contact.soft_params             impedance       solver-dependent contact offset
 joint.armature                  armature        armature        미지원 → 경고
 sensor.contact_force            sensor          contact          contact report
 ```
 
 `es backend compare --task T --backends mjwarp,newton,mujoco-cpu`가 동일 태스크를 세 백엔드에서 실행하고 §3.5 계층 3 지표로 비교한 리포트를 낸다. **미매핑 항목은 `severity: error`면 실행 차단**(§14.4).
+
+¹ 2026-09-23까지는 pyramidal. `mujoco_warp` 3.13은 타원 뿔을 구현하고 M11/X1이 SO-101 장면에서 측정했다(고정 제어 1,000스텝: 팔 관절은 MuJoCo CPU와 1.1e-5 rad 이내, 큐브의 자유 관절은 0.103). 이후 소유자가 MJWarp에서 타원 장면을 계층 2 행으로 허용했다. 접촉 차이는 숨기지 않고 보고한다(§28.14).
 
 ### 17.3 결정성
 
