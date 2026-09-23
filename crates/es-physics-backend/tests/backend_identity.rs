@@ -13,8 +13,8 @@ use es_physics_backend::{
 };
 use es_physics_core::Capabilities;
 
-/// The declared capabilities of every name in the spec 17.2 table. PhysX has no adapter yet
-/// (M11/I1), so its row is MJWarp's declaration under PhysX's name: the digest must still
+/// The declared capabilities of every name in the spec 17.2 table. `PhysX` has no adapter yet
+/// (M11/I1), so its row is the `MJWarp` declaration under the `PhysX` name: the digest must still
 /// tell the two apart, which is the point.
 fn caps(kind: BackendKind) -> Capabilities {
     match kind {
@@ -60,7 +60,11 @@ fn backend_identity_differs_across_engine_versions() {
 fn backend_identity_is_stable_across_calls() {
     for kind in BackendKind::ALL {
         let c = caps(kind);
-        assert_eq!(backend_identity(&c, "v"), backend_identity(&c, "v"), "{kind}");
+        assert_eq!(
+            backend_identity(&c, "v"),
+            backend_identity(&c, "v"),
+            "{kind}"
+        );
     }
 }
 

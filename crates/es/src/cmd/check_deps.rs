@@ -123,6 +123,15 @@ pub fn run() -> u8 {
         yes_no(lerobot)
     );
     println!("  LeRobot dataset read (Rust-native)       yes  (no Python needed)");
+    // `--backend` of `es eval run` / `es loop collect` / `[rl] backend` (packet M11/X1).
+    println!("physics backends (--backend, spec 17.2):");
+    for kind in es_physics_backend::BackendKind::ALL {
+        let status = match es_physics_backend::is_available(kind) {
+            Ok(()) => "available".to_owned(),
+            Err(why) => format!("unavailable ({why})"),
+        };
+        println!("  {:<11} {status}", kind.name());
+    }
     println!(
         "  observation/preprocessing GPU lowering   {}  (unneeded on a Slang cache hit)",
         yes_no(vulkan)

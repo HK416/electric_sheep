@@ -119,6 +119,8 @@ pub struct NewtonBackend {
     model: Option<ModelInfo>,
     tick: PhysTick,
     state: StateBuffers,
+    /// The load reply's engine version (packet M11/X1); `None` until loaded.
+    engine_version: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -145,7 +147,13 @@ impl NewtonBackend {
             model: None,
             tick: PhysTick::ZERO,
             state: StateBuffers::default(),
+            engine_version: None,
         }
+    }
+
+    /// The engine the loaded process runs, as its load reply named it (packet M11/X1).
+    pub fn engine_version(&self) -> Option<&str> {
+        self.engine_version.as_deref()
     }
 
     /// Whether a Python interpreter with `newton` is available. `Err` explains what was tried,
@@ -242,6 +250,7 @@ impl PhysicsBackend for NewtonBackend {
         })?;
         let info = model_info(&reply, scene, ENGINE, cfg.n_envs, rate)?;
 
+        self.engine_version = Some(reply.checked_engine_version()?.to_owned());
         self.process = Some(process);
         self.model = Some(info.clone());
         self.tick = PhysTick::ZERO;

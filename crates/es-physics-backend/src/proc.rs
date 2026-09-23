@@ -68,6 +68,23 @@ pub struct LoadReply {
     pub actuators: Vec<String>,
     pub sensors: Vec<SensorEntry>,
     pub bodies: Vec<String>,
+    /// The engine the process runs, e.g. `mujoco 3.3.2` -- what
+    /// [`backend_identity`](crate::backend_identity) hashes (packet M11/X1). Required: a reply
+    /// without it is a protocol error, never an empty string in a hash.
+    pub engine_version: String,
+}
+
+impl LoadReply {
+    /// The engine version, refused when blank.
+    pub fn checked_engine_version(&self) -> Result<&str, PhysicsError> {
+        let v = self.engine_version.trim();
+        if v.is_empty() {
+            return Err(PhysicsError::Protocol(
+                "the load reply names no engine version".to_owned(),
+            ));
+        }
+        Ok(v)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize)]

@@ -105,6 +105,8 @@ pub struct MuJoCoCpuBackend {
     model: Option<ModelInfo>,
     tick: PhysTick,
     state: StateBuffers,
+    /// The load reply's engine version (packet M11/X1); `None` until loaded.
+    engine_version: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -131,7 +133,13 @@ impl MuJoCoCpuBackend {
             model: None,
             tick: PhysTick::ZERO,
             state: StateBuffers::default(),
+            engine_version: None,
         }
+    }
+
+    /// The engine the loaded process runs, as its load reply named it (packet M11/X1).
+    pub fn engine_version(&self) -> Option<&str> {
+        self.engine_version.as_deref()
     }
 
     /// Whether a Python interpreter with the `mujoco` package is available. `Err` explains what
@@ -280,6 +288,7 @@ impl PhysicsBackend for MuJoCoCpuBackend {
             info.body.insert(id, IndexRange::new(index as u32, 1));
         }
 
+        self.engine_version = Some(reply.checked_engine_version()?.to_owned());
         self.process = Some(process);
         self.model = Some(info.clone());
         self.tick = PhysTick::ZERO;

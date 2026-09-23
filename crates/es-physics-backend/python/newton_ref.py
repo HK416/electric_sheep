@@ -46,6 +46,17 @@ def flat(arr):
     return np.asarray(arr.numpy(), dtype=np.float64).reshape(-1).tolist()
 
 
+def version_of(module, dist):
+    """`module.__version__`, else the installed distribution's; an engine with neither fails
+    the load, because the version is hashed into the run's condition (packet M11/X1)."""
+    version = getattr(module, "__version__", None)
+    if not version:
+        from importlib import metadata
+
+        version = metadata.version(dist)
+    return str(version)
+
+
 class Sim(object):
     def __init__(self, mjcf, n_envs, timestep, seed):
         one = newton.ModelBuilder()
@@ -98,6 +109,7 @@ class Sim(object):
             "actuators": [],
             "sensors": [],
             "bodies": [leaf(b) for b in list(model.body_label)[: self.nbody]],
+            "engine_version": "newton %s" % version_of(newton, "newton"),
         }
 
     def state_payload(self):

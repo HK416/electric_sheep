@@ -169,6 +169,32 @@ pub struct Rl {
     /// measured before the packet keeps the `training_hash` it was measured under.
     #[serde(default, skip_serializing_if = "Estimator::is_default")]
     pub estimator: Estimator,
+    /// The physics backend `Rollout` steps (packet M11/X1). Absent is `mujoco-cpu`, and spelled
+    /// out it serialises like absence, so no measured recipe's `training_hash` moves; any other
+    /// value reaches `train_ppo.py --backend` and, through the plan and this JSON, the hash.
+    #[serde(default, skip_serializing_if = "RlBackend::is_default")]
+    pub backend: RlBackend,
+}
+
+/// `[rl] backend` -- the engines `es_native.Rollout` has a closed-loop path for (packet
+/// M11/X1). Newton (no actuators in its adapter) and `PhysX` (M11/I1) are refused at parse, by
+/// the word the recipe used.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RlBackend {
+    /// `MuJoCo` on the CPU, the reference and the default: every row before M11/X1.
+    #[default]
+    #[serde(rename = "mujoco-cpu")]
+    MujocoCpu,
+    /// `MuJoCo` Warp on the GPU: tier 2, never bitwise against the reference.
+    #[serde(rename = "mjwarp")]
+    MjWarp,
+}
+
+impl RlBackend {
+    /// `skip_serializing_if`: the default serialises exactly like absence.
+    fn is_default(&self) -> bool {
+        matches!(self, Self::MujocoCpu)
+    }
 }
 
 /// `[rl] estimator` — which action PPO's log-probability is evaluated at (packet M9/R5).
@@ -583,6 +609,14 @@ impl Recipe {
             Estimator::Executed => {
                 args.push(s("--estimator"));
                 args.push(s("executed"));
+            }
+        }
+        // Last, and only off the default, for the same reason (packet M11/X1).
+        match rl.backend {
+            RlBackend::MujocoCpu => {}
+            RlBackend::MjWarp => {
+                args.push(s("--backend"));
+                args.push(s("mjwarp"));
             }
         }
         Ok(args)

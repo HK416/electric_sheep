@@ -17,8 +17,9 @@ use es_data::{CollectReport, InterventionSegment};
 use es_env::expert::{demo_cfg, ScriptedExpert};
 use es_env::Termination;
 use es_ir::types::ElemType;
-use es_physics_backend::MuJoCoCpuBackend;
+use es_physics_backend::{BackendKind, MjWarpBackend, MuJoCoCpuBackend};
 use es_physics_core::backend::ModelInfo;
+use es_physics_core::backend::PhysicsBackend;
 use es_policy::{PolicyInfo, PolicyRuntime, TorchRuntime, WeightsSource};
 
 /// The one scripted expert the CLI knows: SO-101, cube into the bin
@@ -31,7 +32,7 @@ use crate::util::hex;
 
 const HELP: &str = "\
 es loop collect --policy <policy.esb> --scene <file.xml|urdf> --episodes <N> --seed <S>
-                --out <root> [--backend mujoco-cpu] [--runtime torch] [--max-steps <N>]
+                --out <root> [--backend <name>] [--runtime torch] [--max-steps <N>]
                 [--expert so101-pick-place] [--frames <dir>] [--traj <dir>]
                 [--telemetry <addr>] [--telemetry-token <t>] [--telemetry-image-every <N>]
 es loop intervene --dataset <root> --segments <segments.json>
@@ -48,6 +49,12 @@ collect    Opens the policy bundle (spec 9.6), rolls out <N> episodes through th
            and an `intervention` column per frame (spec 13.2). Checks that the requested
            backend and runtime are available first; when either is not, prints
            `SKIPPED (<reason>)` and exits 3 without faking a run (spec 1.4).
+           --backend (packet M11/X1; the names `es eval run --help` lists):
+             mujoco-cpu  the reference, bitwise run to run (the default);
+             mjwarp      MuJoCo Warp on the GPU, needs `mujoco_warp`; never bitwise;
+             newton      refused by its mapping report before anything spawns (no
+                         actuators, sensors or contacts in its adapter);
+             physx       not implemented (M11/I1).
            Without --frames no pixels are written: an image channel becomes a declared
            video feature with VideoRef placeholders, plus a warning. --frames <dir> renders
            the Task IR's one image channel from its own camera, once per control step, as
@@ -169,19 +176,19 @@ fn number<T: std::str::FromStr>(
 /// ponytail: the same fixed dispatch table `es eval run` uses -- add a pair here when a new
 /// robot/horizon combination needs `es loop collect`.
 macro_rules! dispatch_nj_h {
-    ($nj:expr, $h:expr, $($args:expr),+ $(,)?) => {
+    ($b:ty; $nj:expr, $h:expr, $($args:expr),+ $(,)?) => {
         match ($nj, $h) {
-            (1, 1) => collect_typed::<1, 1>($($args),+),
-            (2, 2) => collect_typed::<2, 2>($($args),+),
-            (6, 1) => collect_typed::<6, 1>($($args),+),
-            (6, 8) => collect_typed::<6, 8>($($args),+),
-            (6, 16) => collect_typed::<6, 16>($($args),+),
-            (6, 50) => collect_typed::<6, 50>($($args),+),
-            (7, 1) => collect_typed::<7, 1>($($args),+),
-            (7, 8) => collect_typed::<7, 8>($($args),+),
-            (7, 16) => collect_typed::<7, 16>($($args),+),
-            (7, 50) => collect_typed::<7, 50>($($args),+),
-            (8, 50) => collect_typed::<8, 50>($($args),+),
+            (1, 1) => collect_typed::<$b, 1, 1>($($args),+),
+            (2, 2) => collect_typed::<$b, 2, 2>($($args),+),
+            (6, 1) => collect_typed::<$b, 6, 1>($($args),+),
+            (6, 8) => collect_typed::<$b, 6, 8>($($args),+),
+            (6, 16) => collect_typed::<$b, 6, 16>($($args),+),
+            (6, 50) => collect_typed::<$b, 6, 50>($($args),+),
+            (7, 1) => collect_typed::<$b, 7, 1>($($args),+),
+            (7, 8) => collect_typed::<$b, 7, 8>($($args),+),
+            (7, 16) => collect_typed::<$b, 7, 16>($($args),+),
+            (7, 50) => collect_typed::<$b, 7, 50>($($args),+),
+            (8, 50) => collect_typed::<$b, 8, 50>($($args),+),
             (nj, h) => Err(CliError::Runtime(format!(
                 "unsupported (n_joints={nj}, horizon={h}); es loop collect supports a fixed \
                  table of pairs (crates/es/src/cmd/loop.rs) -- add one for this robot"
@@ -218,7 +225,7 @@ fn renderer_cfg(
     ))
 }
 
-fn collect_typed<const NJ: usize, const H: usize>(
+fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
     spec: &CollectSpec<'_>,
     policy: &mut dyn PolicyRuntime,
     mut expert: Option<&mut ScriptedExpert>,
@@ -308,10 +315,10 @@ fn collect_typed<const NJ: usize, const H: usize>(
                 }
                 Ok(())
             };
-        return Collector::run_with_sink::<MuJoCoCpuBackend, _, NJ, H>(
+        return Collector::run_with_sink::<B, _, NJ, H>(
             spec,
             policy,
-            MuJoCoCpuBackend::new,
+            B::default,
             &mut hook,
             Some(&mut frame_sink),
             sink,
@@ -327,15 +334,8 @@ fn collect_typed<const NJ: usize, const H: usize>(
                 .to_owned(),
         ));
     }
-    Collector::run_with_sink::<MuJoCoCpuBackend, _, NJ, H>(
-        spec,
-        policy,
-        MuJoCoCpuBackend::new,
-        &mut hook,
-        None,
-        sink,
-    )
-    .map_err(|e| CliError::Runtime(e.to_string()))
+    Collector::run_with_sink::<B, _, NJ, H>(spec, policy, B::default, &mut hook, None, sink)
+        .map_err(|e| CliError::Runtime(e.to_string()))
 }
 
 /// The `PolicyRuntime` slot under `--expert`: the bundle's Task, Observation and Deployment IR
@@ -588,13 +588,9 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
     // `es video showcase` replays and what "what the robot did" means for provenance. It sits
     // beside the `LeRobot` files, not inside them, so no dataset hash moves.
     let traj_dir = one(&pairs, "--traj").map_or_else(|| out.join("traj"), PathBuf::from);
-    let backend = one(&pairs, "--backend").unwrap_or("mujoco-cpu");
+    let kind =
+        crate::cmd::eval::parse_backend(one(&pairs, "--backend").unwrap_or("mujoco-cpu"), HELP)?;
     let runtime = one(&pairs, "--runtime").unwrap_or("torch");
-    if backend != "mujoco-cpu" {
-        return Err(CliError::Usage(format!(
-            "unknown --backend '{backend}': only mujoco-cpu is supported\n\n{HELP}"
-        )));
-    }
     if runtime != "torch" {
         return Err(CliError::Usage(format!(
             "unknown --runtime '{runtime}': only torch is supported\n\n{HELP}"
@@ -629,9 +625,18 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
         .map_err(|e| CliError::Runtime(format!("{policy_path}: {e}")))?;
     let bundle = PolicyBundle::open(&bytes).map_err(|e| CliError::Runtime(e.to_string()))?;
 
-    // Before touching the scene: a run this machine cannot really do is skipped, never faked.
-    if let Err(reason) = MuJoCoCpuBackend::is_available() {
-        println!("SKIPPED (mujoco-cpu backend unavailable: {reason})");
+    // A backend other than the reference is gated on its mapping report first (spec 14.4),
+    // so the refusal names the rows even where the engine is not installed; `mujoco-cpu`
+    // keeps today's order. Then: a run this machine cannot really do is skipped, never faked.
+    let early_scene = if kind == BackendKind::MuJoCoCpu {
+        None
+    } else {
+        let scene = super::backend::load_scene(&scene_path)?;
+        crate::cmd::eval::mapping_gate(kind, &scene)?;
+        Some(scene)
+    };
+    if let Err(reason) = es_physics_backend::is_available(kind) {
+        println!("SKIPPED ({kind} backend unavailable: {reason})");
         return Ok(3);
     }
     // `--expert` drives every tick itself, so the bundle's weights are never loaded and the
@@ -643,7 +648,10 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
         }
     }
 
-    let scene = super::backend::load_scene(&scene_path)?;
+    let scene = match early_scene {
+        Some(scene) => scene,
+        None => super::backend::load_scene(&scene_path)?,
+    };
     let mut expert = match &expert_name {
         Some(name) => Some(build_expert(name, &scene, &bundle.deployment)?),
         None => None,
@@ -673,15 +681,17 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
     };
     let nj = bundle.deployment.robot.n_joints;
     let h = bundle.deployment.action.horizon;
-    let report = dispatch_nj_h!(
-        nj,
-        h,
-        &spec,
-        policy,
-        expert.as_mut(),
-        frames.as_deref(),
-        publisher
-    )?;
+    // One dispatch on the backend, monomorphized: `Env<B>` stays generic (spec 3.4).
+    let (expert, frames) = (expert.as_mut(), frames.as_deref());
+    let report = match kind {
+        BackendKind::MuJoCoCpu => dispatch_nj_h!(
+            MuJoCoCpuBackend; nj, h, &spec, policy, expert, frames, publisher
+        ),
+        BackendKind::MjWarp => dispatch_nj_h!(
+            MjWarpBackend; nj, h, &spec, policy, expert, frames, publisher
+        ),
+        BackendKind::Newton | BackendKind::PhysX => Err(crate::cmd::eval::no_closed_loop(kind)),
+    }?;
 
     for w in &report.warnings {
         println!("warning: {w}");

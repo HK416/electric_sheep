@@ -30,13 +30,13 @@ use es_assets::scene::{Actuator, SceneDesc};
 use es_compile::{CpuPlan, PlanMode, Tensor, TensorRef};
 use es_core::{PhysTick, TickRate};
 use es_env::scheduler::BatchDomains;
-use es_env::{Env, EnvMetrics};
+use es_env::{Env, EnvMetrics, StepOutcome};
 use es_eval::runner::{capture, input_sources, joint_state, Capture};
 use es_eval::LightOverride;
 use es_ir::deployment::{ActionSpace, ExecutionMode, Micros};
 use es_ir::types::ElemType;
-use es_physics_backend::MuJoCoCpuBackend;
-use es_physics_core::backend::{PhysicsBackend, StateView};
+use es_physics_backend::{BackendKind, MjWarpBackend, MuJoCoCpuBackend};
+use es_physics_core::backend::{ModelInfo, PhysicsBackend, StateView};
 use es_safety::{ActionChunk, SafetyPlane};
 
 /// Everything that stops a rollout from being built or stepped.
@@ -71,6 +71,10 @@ pub enum RolloutError {
         nv: usize,
         nj: usize,
     },
+    /// A backend `Rollout` has no closed-loop path for: Newton's own `load` refuses with its
+    /// mapping report, `PhysX` is not implemented (packet M11/X1).
+    #[error("{0}")]
+    Backend(String),
     #[error("{what}: expected {expected} values, got {got}")]
     Shape {
         what: &'static str,
@@ -99,7 +103,7 @@ pub struct Act {
 /// the document, because `SafetyPlane::from_ir` refuses an envelope whose width is not its
 /// own. Only row 0 of the chunk is ever filled here — see the module docs.
 pub struct Rollout<const NJ: usize, const H: usize> {
-    env: Env<MuJoCoCpuBackend>,
+    env: Sim,
     /// Per robot, because the plane's hold target, rate-limit history and latch are per-robot
     /// state (§9.3) — the same reason `Env::step_with_policy` takes one per env.
     planes: Vec<SafetyPlane<NJ, H>>,
@@ -126,6 +130,41 @@ pub struct Rollout<const NJ: usize, const H: usize> {
     ctrl: Vec<f64>,
 }
 
+/// The env on the backend `Rollout` was built for (packet M11/X1): a closed enum over the two
+/// engines with a closed-loop path, each arm the generic `Env<B>` monomorphized -- not a trait
+/// object and not a new trait (INV-17).
+enum Sim {
+    Cpu(Env<MuJoCoCpuBackend>),
+    Warp(Env<MjWarpBackend>),
+}
+
+macro_rules! on_env {
+    ($sim:expr, $e:ident => $body:expr) => {
+        match $sim {
+            Sim::Cpu($e) => $body,
+            Sim::Warp($e) => $body,
+        }
+    };
+}
+
+impl Sim {
+    fn model(&self) -> &ModelInfo {
+        on_env!(self, e => e.model())
+    }
+    fn state(&self) -> StateView<'_> {
+        on_env!(self, e => e.backend().state())
+    }
+    fn reset(&mut self, envs: Option<&[u32]>) -> Result<(), es_env::EnvError> {
+        on_env!(self, e => e.reset(envs).map(|_| ()))
+    }
+    fn step(&mut self, ctrl: &[f64]) -> Result<StepOutcome, es_env::EnvError> {
+        on_env!(self, e => e.step(ctrl))
+    }
+    fn metrics(&self) -> EnvMetrics {
+        on_env!(self, e => e.metrics())
+    }
+}
+
 impl<const NJ: usize, const H: usize> std::fmt::Debug for Rollout<NJ, H> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Rollout")
@@ -143,6 +182,29 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
     /// `BatchDomains::single_env_at`'s own derivation, which is what `es eval run` and
     /// `es loop collect` step at (packet M5/V11).
     pub fn new(
+        task_toml: &str,
+        observation_toml: &str,
+        deployment_toml: &str,
+        scene_xml: &str,
+        seed: u64,
+        n_envs: u32,
+    ) -> Result<Self, RolloutError> {
+        Self::with_backend(
+            BackendKind::MuJoCoCpu,
+            task_toml,
+            observation_toml,
+            deployment_toml,
+            scene_xml,
+            seed,
+            n_envs,
+        )
+    }
+
+    /// [`Rollout::new`] on the named backend (packet M11/X1): `mujoco-cpu` or `mjwarp`. Newton
+    /// is refused by its own `load` -- the mapping report, before a process spawns -- and
+    /// `PhysX` by name.
+    pub fn with_backend(
+        backend: BackendKind,
         task_toml: &str,
         observation_toml: &str,
         deployment_toml: &str,
@@ -170,8 +232,37 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
         ] {
             d.batch = n_envs;
         }
-        let env: Env<MuJoCoCpuBackend> =
-            Env::new(&task, &scene, MuJoCoCpuBackend::new(), &domains, seed)?;
+        let env = match backend {
+            BackendKind::MuJoCoCpu => Sim::Cpu(Env::new(
+                &task,
+                &scene,
+                MuJoCoCpuBackend::new(),
+                &domains,
+                seed,
+            )?),
+            BackendKind::MjWarp => Sim::Warp(Env::new(
+                &task,
+                &scene,
+                MjWarpBackend::new(),
+                &domains,
+                seed,
+            )?),
+            BackendKind::Newton => {
+                // Its own load is the gate, and it refuses before spawning (spec 14.4).
+                let refused = es_physics_backend::NewtonBackend::new()
+                    .load(&scene, &es_physics_core::backend::LoadConfig::default())
+                    .err()
+                    .map_or_else(|| "loaded".to_owned(), |e| e.to_string());
+                return Err(RolloutError::Backend(format!(
+                    "backend `newton` has no closed-loop path: {refused}"
+                )));
+            }
+            BackendKind::PhysX => {
+                return Err(RolloutError::Backend(
+                    es_physics_backend::PHYSX_NOT_IMPLEMENTED.to_owned(),
+                ))
+            }
+        };
 
         let (nu, nq, nv) = {
             let m = env.model();
@@ -238,7 +329,7 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
         let light = LightOverride::default();
         let mut out: BTreeMap<String, Vec<f64>> = BTreeMap::new();
         let model = self.env.model();
-        let state = self.env.backend().state();
+        let state = self.env.state();
         for i in 0..self.n_envs {
             let view = env_view(&state, i);
             let (names, bytes, _) = capture(
@@ -293,7 +384,7 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
         self.seq += 1;
         let mut events = Vec::with_capacity(self.n_envs);
         {
-            let state = self.env.backend().state();
+            let state = self.env.state();
             for i in 0..self.n_envs {
                 let view = env_view(&state, i);
                 let (q, qd) = joint_state::<NJ>(&view);
@@ -392,7 +483,7 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
     /// `qpos` of one env — what the golden vector pins, and what a trainer's own
     /// bookkeeping (a value function over privileged state) reads.
     pub fn qpos(&self, env: usize) -> Vec<f64> {
-        let state = self.env.backend().state();
+        let state = self.env.state();
         env_view(&state, env).qpos.to_vec()
     }
 

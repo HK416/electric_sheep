@@ -1263,16 +1263,31 @@ fn eval_run_backend_newton_is_refused_by_its_mapping_report() {
     for verb in BACKEND_VERBS {
         let out = run_on_backend(verb, "newton", Some("es-no-such-python"));
         let err = stderr_of(&out);
-        assert_eq!(out.status.code(), Some(1), "{verb}:\n{}\n{err}", stdout(&out));
-        assert!(!stdout(&out).contains("SKIPPED"), "{verb}: {}", stdout(&out));
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{verb}:\n{}\n{err}",
+            stdout(&out)
+        );
+        assert!(
+            !stdout(&out).contains("SKIPPED"),
+            "{verb}: {}",
+            stdout(&out)
+        );
         assert!(err.contains("backend `newton`"), "{verb}: {err}");
         assert!(err.contains("blocked: yes"), "{verb}: {err}");
-        assert!(err.contains("actuator"), "{verb}: the rows are named\n{err}");
-        assert!(!err.contains("cannot start"), "{verb}: a process was spawned\n{err}");
+        assert!(
+            err.contains("actuator"),
+            "{verb}: the rows are named\n{err}"
+        );
+        assert!(
+            !err.contains("cannot start"),
+            "{verb}: a process was spawned\n{err}"
+        );
     }
 }
 
-/// PhysX is a known name with no adapter yet: it names the packet that brings it.
+/// `PhysX` is a known name with no adapter yet: it names the packet that brings it.
 #[test]
 fn eval_run_backend_physx_names_i1() {
     for verb in BACKEND_VERBS {
@@ -1297,19 +1312,71 @@ fn eval_run_backend_unknown_is_a_usage_error() {
     }
 }
 
-/// Without `mujoco_warp` an `mjwarp` run is the documented SKIPPED exit 3, never a faked run;
-/// the demo scene maps on MJWarp, so the refusal is availability and not the mapping report.
+/// The demo scene declares `cone="elliptic"` and spec 17.2 pins the `MJWarp` friction cone to
+/// pyramidal, so `--backend mjwarp` on the demo documents is refused by the mapping report,
+/// naming the row, before any interpreter is probed -- measured while writing this packet,
+/// and the reason oracle 5 cannot run on the committed documents as they stand.
+#[test]
+fn eval_run_backend_mjwarp_refuses_the_elliptic_demo_scene() {
+    for verb in BACKEND_VERBS {
+        let out = run_on_backend(verb, "mjwarp", Some("es-no-such-python"));
+        let err = stderr_of(&out);
+        assert_eq!(
+            out.status.code(),
+            Some(1),
+            "{verb}:\n{}\n{err}",
+            stdout(&out)
+        );
+        assert!(err.contains("backend `mjwarp`"), "{verb}: {err}");
+        assert!(err.contains("blocked: yes"), "{verb}: {err}");
+        assert!(err.contains("ContactElliptic"), "{verb}: {err}");
+    }
+}
+
+/// Without `mujoco_warp` an `mjwarp` run on a scene `MJWarp` maps is the documented SKIPPED exit
+/// 3, never a faked run. `arm2.xml` keeps the default (pyramidal) cone; availability
+/// is checked before the bundle's documents are held against the scene, so the demo bundle
+/// beside it is fine.
 #[test]
 fn eval_run_backend_mjwarp_skips_without_mujoco_warp() {
     if es_physics_backend::MjWarpBackend::is_available().is_ok() {
         println!("SKIP eval_run_backend_mjwarp_skips_without_mujoco_warp: mujoco_warp is here");
         return;
     }
+    let scene = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mjcf/arm2.xml");
     for verb in BACKEND_VERBS {
-        let out = run_on_backend(verb, "mjwarp", None);
+        let dir = scratch_dir(&format!("backend-{verb}-mjwarp-skip"));
+        let policy = write_demo_bundle(&dir);
+        let mut cmd = bin();
+        match verb {
+            "eval" => cmd
+                .args(["eval", "run", "--config"])
+                .arg(vl_fixture("evaluation.toml"))
+                .arg("--policy")
+                .arg(&policy),
+            _ => cmd
+                .args(["loop", "collect", "--policy"])
+                .arg(&policy)
+                .args(["--episodes", "1", "--seed", "1"]),
+        };
+        let out = cmd
+            .arg("--scene")
+            .arg(&scene)
+            .args(["--backend", "mjwarp", "--out"])
+            .arg(dir.join("out"))
+            .output()
+            .expect("run es");
         let text = stdout(&out);
-        assert_eq!(out.status.code(), Some(3), "{verb}:\n{text}\n{}", stderr_of(&out));
-        assert!(text.contains("SKIPPED (mjwarp backend unavailable"), "{verb}: {text}");
+        assert_eq!(
+            out.status.code(),
+            Some(3),
+            "{verb}:\n{text}\n{}",
+            stderr_of(&out)
+        );
+        assert!(
+            text.contains("SKIPPED (mjwarp backend unavailable"),
+            "{verb}: {text}"
+        );
     }
 }
 
@@ -1481,6 +1548,7 @@ fn run_artifacts(f: &Fixture, chain: &HashChain) -> (EvaluationReport, Evaluatio
             supports_reset_subset: false,
             supports_state_get_set: true,
             quirks: Vec::new(),
+            engine_version: None,
         },
         created: 0,
         runtime_threads: None,

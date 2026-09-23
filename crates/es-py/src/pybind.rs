@@ -457,7 +457,8 @@ impl Deployment {
 
 // --- Rollout (packet M8/S4a) --------------------------------------------------------------
 
-/// `es_native.Rollout(task_toml, observation_toml, deployment_toml, scene_xml, seed, n_envs)`
+/// `es_native.Rollout(task_toml, observation_toml, deployment_toml, scene_xml, seed, n_envs,
+/// backend="mujoco-cpu")`
 /// — the four documents as **text**, not paths, exactly like the JSON the builders take.
 ///
 /// Lists in, lists out: no numpy here and therefore no numpy in the Rust crate either
@@ -515,7 +516,9 @@ type ActTuple = (Vec<f64>, Vec<u32>, Vec<f64>, Vec<bool>);
 #[allow(clippy::needless_pass_by_value)]
 #[pymethods]
 impl Rollout {
+    /// `backend` is `mujoco-cpu` (the default) or `mjwarp` (packet M11/X1).
     #[new]
+    #[pyo3(signature = (task_toml, observation_toml, deployment_toml, scene_xml, seed, n_envs, backend = "mujoco-cpu"))]
     fn new(
         task_toml: &str,
         observation_toml: &str,
@@ -523,7 +526,13 @@ impl Rollout {
         scene_xml: &str,
         seed: u64,
         n_envs: u32,
+        backend: &str,
     ) -> PyResult<Self> {
+        let backend = es_physics_backend::BackendKind::from_name(backend).ok_or_else(|| {
+            PyValueError::new_err(format!(
+                "unknown backend {backend:?}: one of mujoco-cpu, mjwarp, newton, physx"
+            ))
+        })?;
         // Parsed here only to read `(n_joints, horizon)`; the core parses the document it
         // actually runs, so neither side is handed an IR the other one validated.
         let deploy = es_ir::serial::deployment_from_toml(deployment_toml)
@@ -531,7 +540,8 @@ impl Rollout {
         macro_rules! build {
             ($nj:literal, $h:literal, $v:ident) => {
                 Kind::$v(
-                    RolloutCore::<$nj, $h>::new(
+                    RolloutCore::<$nj, $h>::with_backend(
+                        backend,
                         task_toml,
                         observation_toml,
                         deployment_toml,

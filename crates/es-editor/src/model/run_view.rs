@@ -635,6 +635,7 @@ mod tests {
                 supports_reset_subset: true,
                 supports_state_get_set: true,
                 quirks: Vec::new(),
+                engine_version: None,
             },
             created: 0,
             runtime_threads: None,
