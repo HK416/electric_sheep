@@ -3097,6 +3097,49 @@ Windows와 Linux가 동일하게 시뮬레이션되고(상류 SO-101, 삼각형 
 4,248줄, `es` 5,361줄. `es-safety`는 손대지 않았다. 소유자에게 남은 것(M10 리뷰): B 이후의 RL 지렛대(더 넓은 여유, 측정 관절 기준
 증분, 또는 클램프를 아는 추정량), 오늘의 더 긴 시연에 맞춘 cycle 레시피의 스텝 수, 데모 행의 하한으로서 학습 시드 두 개.
 
+### 28.14 M11 — 하나의 정책, 세 물리 엔진, 그리고 배우는 카메라 (plan X)
+
+M10이 닫힌 뒤(`docs/reviews/M10.ko.md`) 소유자가 2026-09-23에 셋을 요청하고 셋을 정했다. 요청: sim-to-sim — Isaac Lab이나 MuJoCo에서
+학습된 정책의 입력과 출력을 어떻게 맞출지 포함; vision 기반 RL의 도메인 랜덤화; 틱마다 바뀌는 시드와 SVGF를 통한 vision RL의 PT 노이즈
+처리. 결정: **Isaac Sim(PhysX)을 MuJoCo 계열 곁의 백엔드로 붙인다**; **시각 랜덤화는 조명(세기·방향·색·ambient), geom 색, 카메라 외부
+파라미터와 내부 파라미터를 모두 포함한다**; **vision RL은 `Pt` 경로로 학습한다**. 근거: `Env<B>`는 제네릭이고 MJWarp·Newton 어댑터는
+`PhysicsBackend` 전체를 구현하는데도 모든 폐루프 동사가 MuJoCo CPU를 하드코딩한다; RL 임포터는 Isaac Lab 정책이 모두 쓰는 기본 관절
+자세·항목별 스케일·이전 행동을 표현하지 못한다; 질량·마찰·게인 추출은 기록만 되고 물리에 닿지 않는다; `Rollout`은 아무것도 렌더하지
+않는다; `Pt` 센서 경로는 디노이저 없이 돈다.
+
+**이 절이 고정하는 규칙.** (1) 모든 추가는 부재 = 기본값 = 오늘의 바이트다: 새 필드·타깃·백엔드를 하나도 선언하지 않은 문서는 모든
+해시를 유지한다. (2) 물리 백엔드는 조건이다: `mujoco-cpu`가 아닌 백엔드에서의 실행은 `H("es.backend.v1", 이름, 엔진 버전, float,
+결정론 계층)`을 `execution_hash`의 `hardware_capability` 슬롯에 쓴다(§5.3); 기준인 `mujoco-cpu`(§17.1)는 오늘의 슬롯을 유지한다.
+(3) 외부 정책의 입출력 규약은 IR이 소유한다: 관절 순서, 기본 자세, 항목별 스케일, 행동 오프셋·스케일, 클리핑, 히스토리, 이전 행동은
+임포터의 어댑터에 선언되고 번들로 컴파일된다(대수가 정확한 곳에서는 가중치나 정규화기에 접어 넣는다); 추론 시에는 프레임워크 고유의
+코드가 돌지 않으며, IR이 계산할 수 없는 항목은 이름으로 거부한다. (4) 랜덤화 추출은 `(seed, env, episode, stream)`으로 키가 매겨지고
+에피소드에 기록되며, 같은 추출은 같은 프레임을 비트 단위로 렌더한다(GPU == CPU); 모델 파라미터는 기존 `PhysicsBackend` trait의 메서드
+하나로 물리에 닿는다(INV-17: 새 trait 없음); 추출된 시야각은 그 에피소드의 `ImageSpec` 내부 파라미터를 옮긴다(INV-14); Safety Plane은
+건드리지 않는다(INV-11–13). (5) `Pt` 관측 노이즈는 선언된 문서 필드로만 다룬다 — `render.seed = "tick"`과 `render.svgf` — 관측 경로의
+시간 누적이나 벤더 디노이저로는 결코 다루지 않는다. (6) Isaac Sim은 소유자가 NVIDIA EULA를 수락한 뒤에만 설치한다; 계층은
+`CrossBackend`(결코 비트 단위 아님)이다; 장면은 `scene_to_mjcf`와 그 MJCF 임포터를 거쳐 들어가고, 임포터의 모든 빈틈은 매핑 보고서의
+한 행이다. (7) RL 수치 하나에 시드 셋, 데모 행 하나에 학습 시드 둘(M10 S-4, M9 S-5).
+
+| 웨이브 | 패킷 | 답하는 질문 | 오라클 (한 줄) | 유형 |
+|---|---|---|---|---|
+| 1 | **X1 `--backend`** (`docs/packets/M11/X1-backend-dispatch.md`) | `es eval run`, `es loop collect`, `Rollout`이 백엔드를 해시 체인에 넣은 채 MJWarp에서 정책을 폐루프로 돌리고, Newton은 매핑 보고서로 거부되는가 | reach A0와 데모 U3를 `mujoco-cpu` 대 `mjwarp`로, `es eval compare`; `mujoco-cpu`에서 커밋된 `execution_hash` 불변 | B/D |
+| 1 | **X2 어댑터 v2** (`X2-adapter-v2.md`) | Isaac Lab이나 Playground 정책의 관절 순서, 기본 자세, 항목별 스케일, 행동 오프셋·스케일, 클리핑, 히스토리, 이전 행동을 선언하고 정확히 컴파일할 수 있는가 | 두 프레임워크의 관측·행동 공식을 구현한 NumPy 레퍼런스가 임포트된 번들과 1e-6 이내로 같음; M8/M9 어댑터의 해시 불변 | B |
+| 1 | **X4 모델 파라미터가 물리에 닿음** (`X4-set-params.md`) | 질량·마찰·게인 추출이 env마다 백엔드에 닿는가 | MuJoCo CPU에서 추출된 스케일이 `MjModel` 직접 수정과 비트 단위로 같음; 능력이 없는 백엔드는 이름으로 거부 | B |
+| 1 | **X6 `render.svgf`** (`X6-sensor-svgf.md`) | `Pt` 센서가 선언된 필드로 SVGF를 돌리고, 수집기와 평가기가 여전히 비트 동일한가 | 커밋된 task 해시 불변; 수집기 == 평가기 프레임 비트 동일; GPU == CPU | B |
+| 1 | **I0 오라클 서버의 Isaac Sim** (`I0-isaac-sim-install.md`) | 헤드리스 Isaac Sim이 SO-101 MJCF를 임포트하고 스텝하는가 | 스크립트가 버전과 100 스텝 관절 궤적을 출력; api-note 측정 | D |
+| 2 | **X3 `Rollout` 렌더** (`X3-rollout-render.md`) | RL이 env마다 틱 시드로 이미지를 관측하는가 | 같은 `(episode, tick)`에서 `Rollout` 프레임 == 수집기 프레임, 비트 동일 | B |
+| 2 | **X3b 배치 다중 env 렌더** (`X3b-batched-render.md`) | N개 env를 PT 학습에 필요한 비용으로 한 디스패치에 렌더할 수 있는가 | 한 디스패치의 N env == 단일 렌더 N번, 비트 동일; 아홉 지표로 env당 ms/프레임 | B |
+| 2 | **X5 시각 랜덤화** (`X5-visual-dr.md`) | 조명, 색, ambient, geom 색, 카메라 자세와 시야각이 에피소드마다 랜덤화되고, `Pt`에 방향광이 생기는가 | 같은 추출 → 같은 프레임, GPU == CPU; 골든은 추가만; 선언되지 않은 타깃은 해시를 움직이지 않음 | B |
+| 2 | **I1 `PhysXBackend`** (`I1-physx-backend.md`) | Isaac Sim이 정직한 매핑 보고서와 함께 `PhysicsBackend`로 도는가 | SO-101과 `mesh_box`에서 `es backend compare --backends mujoco-cpu,physx`; X1이 `physx`에서 평가 | B/D |
+| 3 | **I3 sim-to-sim 측정** | 한 정책이 세 엔진에서 같은 점수를 내고, Isaac Lab 정책이 옮겨 오는가 | Isaac Lab SO-101 reach 정책과 A0, 각각 시드 셋, `physx` / `mujoco-cpu` / `mjwarp` | D |
+| 3 | **X7 `Pt` 위의 vision RL** | 랜덤화를 켠 채 PPO가 경로 추적 픽셀로 reach를 배우는가 | spp × SVGF 스윕, 그다음 시드 셋; 행 `Rs`/`Pt`, 랜덤화 끔/켬; 평가 섭동 아래 held-out | D |
+| 3 | **U6** | SVGF가 데모의 `Pt` 행을 움직이는가 | U5 + `svgf = true`, 학습 시드 둘 | D |
+| 3 | **M11 리뷰** | | `docs/reviews/M11.md` + `.ko.md`; `cargo xtask ci` | A |
+
+**사다리에 없는 것.** 이 런타임 안의 *학습* 엔진으로서의 Isaac Sim(Isaac Lab은 자기 프로세스에서 학습하고, 이 런타임은 결과를 임포트해
+채점한다); 보행 항목(투영 중력, 몸체 속도, 명령 — M6은 계속 보류); 텍스처와 머티리얼(M7 R6); Newton의 액추에이터와 접촉(그 어댑터는 둘 다
+선언하지 않는다); 관측 경로의 시간 누적.
+
 ---
 
 ## 29. 리스크

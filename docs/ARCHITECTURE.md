@@ -3168,6 +3168,52 @@ unmoved. W3a / W3b: `es-data` 4,248 and `es` 5,361 lines. `es-safety` untouched.
 (a wider margin, increments over the measured joint, or a clamp-aware estimator), the cycle recipe's step count against today's longer
 demonstrations, and two training seeds as the floor for demo rows.
 
+### 28.14 M11 — One Policy, Three Physics Engines, and a Camera That Learns (plan X)
+
+After M10 closed (`docs/reviews/M10.md`) the owner asked on 2026-09-23 for three things and took three decisions. The asks:
+sim-to-sim, including how the input and output of a policy trained in Isaac Lab or MuJoCo are matched; domain randomization for
+vision-based RL; PT noise handling for vision RL through the per-tick seed and SVGF. The decisions: **Isaac Sim (PhysX) becomes a
+backend** beside the MuJoCo family; **visual randomization covers lighting (intensity, direction, colour, ambient), geom colours,
+camera extrinsics and camera intrinsics**; **vision RL trains on the `Pt` path**. Grounds: `Env<B>` is generic and the MJWarp and
+Newton adapters implement the whole `PhysicsBackend`, yet every closed-loop verb hard-codes MuJoCo CPU; the RL importer cannot express
+a default joint pose, per-term scales or the previous action, which every Isaac Lab policy uses; mass, friction and gain draws are
+recorded but never reach physics; `Rollout` renders nothing; and the `Pt` sensor path runs without a denoiser.
+
+**The rules this section pins down.** (1) Every addition is absent = default = today's bytes: documents that declare none of the new
+fields, targets or backends keep every hash. (2) The physics backend is a condition: a run on any backend other than `mujoco-cpu`
+writes `H("es.backend.v1", name, engine version, float, determinism tier)` into the `hardware_capability` slot of `execution_hash`
+(§5.3); `mujoco-cpu`, the reference (§17.1), keeps today's slot. (3) The IR owns an external policy's I/O conventions: joint order,
+default pose, per-term scale, action offset and scale, clipping, history and the previous action are declared in the importer's
+adapter and compiled into the bundle (folded into weights or normalizer where the algebra is exact); nothing framework-specific runs at
+inference, and a term the IR cannot compute is refused by name. (4) A randomization draw is keyed by `(seed, env, episode, stream)`,
+recorded in the episode, and the same draw renders the same frame bitwise, GPU == CPU; model parameters reach physics through one
+method on the existing `PhysicsBackend` trait (INV-17: no new trait); a drawn field of view moves that episode's `ImageSpec`
+intrinsics (INV-14); the Safety Plane is untouched (INV-11–13). (5) `Pt` observation noise is handled by declared document fields
+only — `render.seed = "tick"` and `render.svgf` — never by temporal accumulation on the observation path or by a vendor denoiser.
+(6) Isaac Sim is installed only after the owner accepts NVIDIA's EULA; it is tier `CrossBackend` (never bitwise); scenes reach it
+through `scene_to_mjcf` and its MJCF importer, and every importer gap is a mapping-report row. (7) Three seeds per RL number, two
+training seeds per demo row (M10 S-4, M9 S-5).
+
+| Wave | Packet | Question it answers | Oracle (one line) | Type |
+|---|---|---|---|---|
+| 1 | **X1 `--backend`** (`docs/packets/M11/X1-backend-dispatch.md`) | Do `es eval run`, `es loop collect` and `Rollout` run a policy closed-loop on MJWarp with the backend in the hash chain, and is Newton refused by its mapping report | reach A0 and demo U3 on `mujoco-cpu` vs `mjwarp`, `es eval compare`; committed `execution_hash`es unmoved on `mujoco-cpu` | B/D |
+| 1 | **X2 adapter v2** (`X2-adapter-v2.md`) | Can an Isaac Lab or Playground policy's joint order, default pose, per-term scales, action offset/scale, clipping, history and previous action be declared and compiled exactly | a NumPy reference of the two frameworks' observation and action formulas equals the imported bundle within 1e-6; M8/M9 adapters' hashes unmoved | B |
+| 1 | **X4 model parameters reach physics** (`X4-set-params.md`) | Do mass, friction and gain draws reach the backend per env | a drawn scale on MuJoCo CPU reproduces a direct `MjModel` edit bitwise; backends without the capability refuse by name | B |
+| 1 | **X6 `render.svgf`** (`X6-sensor-svgf.md`) | Does the `Pt` sensor run SVGF as a declared field, with collector and evaluator still bit-identical | committed task hashes unmoved; collector == evaluator frames bitwise; GPU == CPU | B |
+| 1 | **I0 Isaac Sim on the oracle server** (`I0-isaac-sim-install.md`) | Does a headless Isaac Sim import the SO-101 MJCF and step it | a script prints versions and a 100-step joint trajectory; api-note measured | D |
+| 2 | **X3 `Rollout` renders** (`X3-rollout-render.md`) | Does RL observe images, with the per-tick seed per env | a `Rollout` frame equals the collector's at the same `(episode, tick)` bitwise | B |
+| 2 | **X3b batched multi-env render** (`X3b-batched-render.md`) | Can N envs render in one dispatch at the cost PT training needs | N envs in one dispatch == N single renders bitwise; ms/frame per env under the nine metrics | B |
+| 2 | **X5 visual randomization** (`X5-visual-dr.md`) | Do light, colour, ambient, geom colour, camera pose and field of view randomize per episode, with a directional light on `Pt` | same draws → same frames, GPU == CPU; new goldens only; undeclared targets move no hash | B |
+| 2 | **I1 `PhysXBackend`** (`I1-physx-backend.md`) | Does Isaac Sim run as a `PhysicsBackend` with an honest mapping report | `es backend compare --backends mujoco-cpu,physx` on SO-101 and `mesh_box`; X1 evaluates on `physx` | B/D |
+| 3 | **I3 sim-to-sim, measured** | Does one policy score the same on three engines, and does an Isaac Lab policy transfer | an Isaac Lab SO-101 reach policy and A0, three seeds each, on `physx` / `mujoco-cpu` / `mjwarp` | D |
+| 3 | **X7 vision RL on `Pt`** | Does PPO learn reach from path-traced pixels with randomization on | spp × SVGF sweep, then three seeds; rows `Rs`/`Pt`, randomization off/on; held-out under eval perturbations | D |
+| 3 | **U6** | Does SVGF move the demo's `Pt` row | U5 + `svgf = true`, two training seeds | D |
+| 3 | **M11 review** | | `docs/reviews/M11.md` + `.ko.md`; `cargo xtask ci` | A |
+
+**What is not on the ladder, and why.** Isaac Sim as a *training* engine inside this runtime (Isaac Lab trains in its own process; this
+runtime imports and scores the result); locomotion terms (projected gravity, base velocity, commands — M6 stays parked); textures and
+materials (M7 R6); Newton's actuators and contacts (its adapter declares neither); temporal accumulation on the observation path.
+
 ---
 
 ## 29. Risks
