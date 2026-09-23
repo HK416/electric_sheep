@@ -145,11 +145,54 @@ actuator.<name>.gain                   scale factor
 Anything else is `EnvError::Unsupported(target)` at compile time — never silently skipped
 (§17.2's rule, applied to randomization).
 
-**Ceiling, deliberate:** `PhysicsBackend` has no model-parameter API (it exposes `set_state`,
-not `set_body_mass`). The three scale targets are therefore *sampled, recorded into
-`EpisodeMeta.param_scales`, and not pushed into the backend*. The plan is complete and the
-draws are part of the hash chain the moment a `set_param` lands on the trait; state targets
-(`qpos`/`qvel`) are applied for real today.
+**Model parameters reach physics (packet M11/X4, spec 28.14 rule 4).** The three scale targets are
+drawn, recorded into `EpisodeMeta.param_scales` exactly as before, and pushed into the backend at
+reset through one method on the existing trait (INV-17: no new trait):
+
+```
+PhysicsBackend::set_params(&mut self, envs: &[u32], params: &[(Param, StableId, f64)])
+    -> Result<(), PhysicsError>
+```
+
+`Env::reset` calls it once per reset env, with that env's draws, after the draw and before the
+state is pushed — and only when the plan has a `Scale` entry, so a task without one never calls it
+and its bytes do not move (rule 1). The draw order and the recorded `param_scales` are unchanged.
+`Param` lives in `es-physics-core` and is re-exported from `es_env::randomize`.
+
+A scale is relative to the value the model was **loaded** with, never to the last one applied, so
+two resets of the same draw are one edit, not two:
+
+| Target | What is scaled | Derived fields |
+|---|---|---|
+| `body.<n>.mass` | `body_mass` | `mj_setConst` (body_subtreemass, body/dof invweight0, actuator_acc0, meaninertia) |
+| `geom.<n>.friction` | all three of `geom_friction` (sliding, torsional, rolling) | none |
+| `actuator.<n>.gain` | `gainprm[0]`, and the bias term that mirrors it on a servo — `biasprm[1]` on a position actuator, `biasprm[2]` on a velocity actuator — so a servo stays a servo; `kv` is not scaled | none |
+
+A geom is addressed by its owning body's row and its position among that body's geoms (the emitter
+writes a body's geoms in scene order and `MuJoCo` keeps them contiguous from `body_geomadr`), so
+no emitted geom name is reconstructed.
+
+Per backend, `Feature::ModelParams` says who implements it; the trait's default is
+`PhysicsError::Unsupported("set_params")`, so a backend without it refuses a scale target by name
+at the first reset rather than dropping the draw (spec 17.2):
+
+* **`mujoco-cpu`** — `mujoco_ref.py` keeps one `MjModel` per env, copies of the loaded model made on
+  the first `set_params`; a run that never calls it keeps one model and today's bytes. Measured
+  (oracle 2): a drawn scale reproduces a direct `MjModel` edit + `mj_setConst` bit for bit over 500
+  steps, the untouched env equals the unedited run bit for bit, and the trajectory bits are the
+  same on Windows and on the Linux server.
+* **`mjwarp`** — `mujoco_warp` 3.13 (server, 2026-09-23) holds every batchable model field with a
+  leading world axis indexed `worldid % shape[0]` (`body_mass`, `geom_friction`,
+  `actuator_gainprm`/`biasprm`, the invweights, `actuator_acc0`, `stat.meaninertia` all `(1, …)`
+  after `put_model`). `mjwarp_ref.py` edits a per-env CPU `MjModel` exactly as `mujoco-cpu` does
+  and uploads each field the edit moved as that world's row, widening the field to `nworld` rows
+  the first time. Measured: the untouched world is bitwise the unedited run, a second application
+  moves nothing, and the edited world is 9.5e-7 from `mujoco-cpu`'s edited run (1.6e-2 from its
+  unedited one) — tier 2, as declared.
+* **`newton`** — not declared; refused by name.
+
+`MuJoCoCpuBackend::applied_params` / `MjWarpBackend::applied_params` return `[nominal, applied]`
+for every written parameter, read back out of the env's model: the evidence a draw reached physics.
 
 ## 6. Reward and termination
 

@@ -156,12 +156,54 @@ actuator.<name>.gain                   scale factor
 그 외의 것은 컴파일 시점에 `EnvError::Unsupported(target)`이 되며 절대 조용히
 건너뛰지 않는다 (§17.2의 규칙을, 무작위화에 적용한 것).
 
-**한계, 의도된 것:** `PhysicsBackend`에는 모델 파라미터 API가 없다
-(`set_state`는 노출하지만 `set_body_mass`는 노출하지 않는다). 따라서 세 개의
-scale 대상은 *추첨되고, `EpisodeMeta.param_scales`에 기록될 뿐, backend로
-밀어 넣어지지 않는다*. `set_param`이 trait에 도착하는 순간 계획은 완전해지고
-그 추첨은 hash chain의 일부가 된다. state 대상(`qpos`/`qvel`)은 오늘 실제로
-적용된다.
+**모델 파라미터가 물리에 닿는다 (packet M11/X4, spec 28.14 규칙 4).** 세 개의 scale 대상은
+전과 똑같이 추첨되어 `EpisodeMeta.param_scales`에 기록되고, 리셋 때 기존 trait의 메서드 하나를
+통해 backend로 밀어 넣어진다 (INV-17: 새 trait 없음):
+
+```
+PhysicsBackend::set_params(&mut self, envs: &[u32], params: &[(Param, StableId, f64)])
+    -> Result<(), PhysicsError>
+```
+
+`Env::reset`은 리셋되는 env마다 그 env의 추첨값으로 한 번, 추첨 뒤 state를 밀어 넣기 전에
+이것을 부른다 — 계획에 `Scale` 항목이 있을 때만. 그래서 그런 항목이 없는 task는 이것을 결코
+부르지 않고 그 바이트도 움직이지 않는다 (규칙 1). 추첨 순서와 기록되는 `param_scales`는
+그대로다. `Param`은 `es-physics-core`에 있고 `es_env::randomize`에서 re-export된다.
+
+scale은 모델이 **로드될 때의** 값에 대한 상대값이며, 마지막으로 적용된 값에 대한 것이 결코
+아니다. 그래서 같은 추첨으로 두 번 리셋해도 편집은 두 번이 아니라 한 번이다:
+
+| 대상 | 스케일되는 것 | 파생 필드 |
+|---|---|---|
+| `body.<n>.mass` | `body_mass` | `mj_setConst` (body_subtreemass, body/dof invweight0, actuator_acc0, meaninertia) |
+| `geom.<n>.friction` | `geom_friction` 세 개 모두 (sliding, torsional, rolling) | 없음 |
+| `actuator.<n>.gain` | `gainprm[0]`, 그리고 servo에서 그것을 거울처럼 따라가는 bias 항 — position actuator는 `biasprm[1]`, velocity actuator는 `biasprm[2]` — 그래서 servo는 servo로 남는다. `kv`는 스케일하지 않는다 | 없음 |
+
+geom은 소유 body의 행과 그 body의 geom 중 몇 번째인지로 지정된다 (emitter는 body의 geom을
+scene 순서대로 쓰고 `MuJoCo`는 그것들을 `body_geomadr`부터 연속으로 둔다). 그래서 방출된
+geom 이름을 재구성하지 않는다.
+
+backend별로 누가 구현하는지는 `Feature::ModelParams`가 말한다. trait의 기본 구현은
+`PhysicsError::Unsupported("set_params")`이므로, 그것이 없는 backend는 추첨을 버리지 않고 첫
+리셋에서 scale 대상을 이름으로 거부한다 (spec 17.2):
+
+* **`mujoco-cpu`** — `mujoco_ref.py`는 env마다 `MjModel` 하나를 둔다. 첫 `set_params` 때 로드된
+  모델의 복사본으로 만든다. 이것을 한 번도 부르지 않는 run은 모델 하나와 오늘의 바이트를
+  유지한다. 측정 (oracle 2): 추첨된 scale은 `MjModel` 직접 편집 + `mj_setConst`를 500 step 동안
+  비트 단위로 재현하고, 건드리지 않은 env는 편집 없는 run과 비트 단위로 같으며, 궤적 비트는
+  Windows와 Linux 서버에서 같다.
+* **`mjwarp`** — `mujoco_warp` 3.13 (서버, 2026-09-23)은 batch 가능한 모든 모델 필드를
+  `worldid % shape[0]`로 인덱싱되는 선행 world 축과 함께 가진다 (`put_model` 뒤 `body_mass`,
+  `geom_friction`, `actuator_gainprm`/`biasprm`, invweight들, `actuator_acc0`,
+  `stat.meaninertia`가 모두 `(1, …)`). `mjwarp_ref.py`는 env별 CPU `MjModel`을 `mujoco-cpu`와
+  똑같이 편집하고, 그 편집이 움직인 필드마다 그 world의 행으로 올린다. 처음에는 필드를
+  `nworld` 행으로 넓힌다. 측정: 건드리지 않은 world는 편집 없는 run과 비트 단위로 같고, 두 번째
+  적용은 아무것도 움직이지 않으며, 편집된 world는 `mujoco-cpu`의 편집된 run에서 9.5e-7
+  떨어져 있다 (편집 없는 run에서는 1.6e-2) — 선언한 대로 tier 2.
+* **`newton`** — 선언하지 않음. 이름으로 거부한다.
+
+`MuJoCoCpuBackend::applied_params` / `MjWarpBackend::applied_params`는 쓰인 모든 파라미터의
+`[nominal, applied]`를 env의 모델에서 다시 읽어 돌려준다: 추첨이 물리에 닿았다는 증거.
 
 ## 6. 보상과 종료
 

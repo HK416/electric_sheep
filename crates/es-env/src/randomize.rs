@@ -22,17 +22,12 @@ pub(crate) enum Target {
     Qpos(u32),
     /// Index into one env's `qvel` row.
     Qvel(u32),
-    /// Multiplicative scale on a model parameter. Recorded, not yet pushed into the backend:
-    /// `PhysicsBackend` has no parameter API (see the ceiling in the design note).
+    /// Multiplicative scale on a model parameter: recorded in the episode and pushed into the
+    /// backend through `PhysicsBackend::set_params` at reset (packet M11/X4).
     Scale(Param, StableId),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Param {
-    BodyMass,
-    GeomFriction,
-    ActuatorGain,
-}
+pub use es_physics_core::backend::Param;
 
 /// One resolved node: a target, a distribution and the RNG stream it draws from.
 #[derive(Clone, Debug, PartialEq)]
@@ -95,6 +90,14 @@ impl RandomizationPlan {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    /// Whether any entry scales a model parameter, i.e. whether a reset has to call
+    /// `PhysicsBackend::set_params`. A task without one never does (spec 28.14 rule 1).
+    pub fn has_scales(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| matches!(e.target, Target::Scale(..)))
     }
 
     /// Draws every entry for one env and writes it into `buf`.

@@ -87,6 +87,10 @@ pub enum Feature {
     ContactHeightField,
     // Other (spec 18.2): tendons are a transmission, not an actuator kind.
     Tendon,
+    /// Per-env model parameters through `PhysicsBackend::set_params` (spec 28.14 rule 4). A
+    /// run capability, not a scene feature: declared in the `actuators` set, which `has`
+    /// searches like the other three.
+    ModelParams,
 }
 
 impl fmt::Display for Feature {
