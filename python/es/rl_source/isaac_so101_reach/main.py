@@ -192,11 +192,15 @@ def evaluate(args) -> None:
             policy = runner.get_inference_policy(device=args.device)
             env.reset(seed=args.seed)  # the same resets for every checkpoint
             obs = wrapped.get_observations()
+            # `--action-delay k`: the env executes the row the policy emitted k ticks ago (raw 0,
+            # the rest pose, before that) -- the latency `es eval run` applies (diagnostic).
+            queue = [torch.zeros(n, env.action_manager.total_action_dim, device=args.device)] * args.action_delay
             done = torch.zeros(n, dtype=torch.bool, device=args.device)
             success = torch.zeros(n, dtype=torch.bool, device=args.device)
             length = torch.zeros(n, dtype=torch.long, device=args.device)
             for t in range(1, 201):
-                obs, _, dones, _ = wrapped.step(policy(obs))
+                queue.append(policy(obs))
+                obs, _, dones, _ = wrapped.step(queue.pop(0))
                 ended = dones.bool() & ~done
                 success |= ended & env.termination_manager.get_term("success")
                 length[ended] = t
@@ -204,7 +208,7 @@ def evaluate(args) -> None:
                 if bool(done.all()):
                     break
             results.append({
-                "checkpoint": ckpt, "reset_seed": args.seed, "episodes": n,
+                "checkpoint": ckpt, "reset_seed": args.seed, "episodes": n, "action_delay": args.action_delay,
                 "success_rate": success.float().mean().item(),
                 "episode_length": length.float().mean().item(),
                 "unfinished": int((~done).sum().item()),
@@ -233,6 +237,7 @@ def main() -> None:
     e.add_argument("--checkpoint", required=True, nargs="+")
     e.add_argument("--seed", type=int, required=True)
     e.add_argument("--episodes", type=int, default=1024)
+    e.add_argument("--action-delay", type=int, default=0)
     e.add_argument("--device", default="cuda:0")
     e.add_argument("--out", required=True)
     args = ap.parse_args()
