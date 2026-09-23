@@ -486,6 +486,83 @@ version ‖ threads as u32 LE)`다. `evaluation.lock`은 그 수를 `runtime_thr
 같다). 커밋된 문서 중 어느 것도 둘을 선언하지 않으며, 위의 동일성 주장은 선언하지 않는 문서에
 대한 것이다.
 
+### 2.8 물리 백엔드 (`--backend`, 패킷 M11/X1)
+
+`Env<B: PhysicsBackend>`는 처음부터 제네릭이었지만 `es eval run`, `es loop collect`,
+`es_native.Rollout`은 `MuJoCoCpuBackend`를 하드코딩했다. 이제 각 동사는 `--backend`를
+`BackendKind`로 파싱하고, 고른 타입으로 단형화한 기존 제네릭 진입점을 부르는 `match` 하나를 둔다 —
+`Evaluation::run_shard_with_sink::<B, …>(…, B::default, …)`, `Collector::run_with_sink::<B, …>`,
+그리고 `Rollout` 안에서는 `Env<MuJoCoCpuBackend>` / `Env<MjWarpBackend>`의 닫힌 열거형. `Env`
+안의 `Box<dyn PhysicsBackend>`도, 새 트레이트도 없다(INV-17, §3.4).
+
+| `--backend` | 오늘 하는 일 |
+|---|---|
+| `mujoco-cpu` (기본값) | 기준(§17.1), tier 1. `hardware_capability` 슬롯은 커밋된 모든 lock이 해시될 때의 전부 0인 값 그대로다 |
+| `mjwarp` | MuJoCo Warp, tier 2(결코 비트 단위가 아니다, §3.5). `ES_PYTHON` 아래에 `mujoco_warp`가 있어야 하고, 없으면 `SKIPPED` 종료 코드 3 |
+| `newton` | 아무것도 뜨기 전에 자신의 매핑 리포트에 의해 거부된다: 어댑터가 액추에이터도 센서도 선언하지 않고 접촉도 연결하지 않으므로, `es backend compare`의 개루프 전용이다 |
+| `physx` | 거부: `not implemented (M11/I1)` |
+| 그 밖의 이름 | 네 이름을 나열하는 사용법 오류(종료 코드 2) |
+
+**순서.** `mujoco-cpu`가 아닌 백엔드에서는 장면을 읽고 그 §17.2 매핑 리포트가 첫 관문이다(§14.4) —
+가용성 탐침이 인터프리터를 띄우기 전이다 — 그래서 엔진이 없는 머신에서도 거부가 자신의 행을
+이름으로 댄다. `mujoco-cpu`는 오늘의 순서(가용성, 그다음 장면)를 유지한다. 그다음 병합하는
+프로세스가 장면 위에서 백엔드를 한 번 열어(`identify`) `load` 응답에서 엔진 버전을 읽고
+(`mujoco 3.13.0`; `mujoco_warp X; warp Y; mujoco Z`; `newton X` — 버전이 없는 응답은 프로토콜
+오류이지 결코 빈 문자열이 아니다) 아래의 슬롯을 계산한다. `--jobs N`의 워커는 하지 않는다: 워커의
+셀에는 해시가 없다.
+
+**해시 체인 (§28.14 규칙 2).** `es_physics_backend::backend_identity(caps, engine_version)` =
+길이 접두 튜플 `("es.backend.v1", name, engine version, float, determinism tier)`의 blake3이며,
+float와 tier는 lock의 `backend` 블록이 쓰는 철자 그대로다. `hardware_capability(caps, version)`은
+`mujoco-cpu`를 제외한 모든 백엔드에서 그 다이제스트이고, `mujoco-cpu`의 슬롯은 `[0; 32]`로 남는다.
+`RunConfig.hardware`가 그것으로 정해지므로 같은 번들의 `mjwarp` 실행과 `mujoco-cpu` 실행은 서로
+다른 `execution_hash` 두 개이고, 커밋된 모든 `mujoco-cpu` `execution_hash`는 움직이지 않는다.
+`evaluation.lock`의 `backend` 블록에는 `engine_version`이 생긴다(선택적이며 설정되지 않으면
+바이트에 없으므로 옛 lock도 그대로 파싱된다).
+
+#### 측정, 오라클 서버 (RTX 4090, 16코어), 2026-09-23 UTC
+
+바이너리: 이 트리(`a737a04`)와 그 부모(`f161d24`, X1 이전), 둘 다 서버에서 빌드. 행이 따로 말하지
+않으면 `ES_PYTHON=~/venvs/es`(mujoco 3.13.0, mujoco_warp 3.13.0, warp 1.17.0, torch
+2.14.0+cpu). 산출물 `~/artifacts/plan-x/x1/`.
+
+| 실행 | 백엔드 | `execution_hash` | 결과 |
+|---|---|---|---|
+| reach A0 (W0b seed 0, `4000.esb`), `evaluation-reach.toml` (`66ef84a5…`) | `mujoco-cpu`, 이 트리 | `08851281…5e93` | `nominal` 성공률 0.5625; `engine_version` `mujoco 3.13.0` |
+| 같음 | `mujoco-cpu`, X1 이전 바이너리 | `08851281…5e93` | `report.json`이 위 행과 바이트 단위로 같다 |
+| 같음, 이 트리로 한 번 더 | `mujoco-cpu` | `08851281…5e93` | 바이트 단위로 같다 (tier 1) |
+| 같음 | `mjwarp` (실행 1, 실행 2) | — | **거부**, 종료 코드 1: 매핑 리포트 `ContactElliptic unsupported error`, 어떤 프로세스보다 먼저 |
+| 그 체크포인트에 대한 W0b 자신의 실행, `~/venvs/es-lerobot-cuda` | `mujoco-cpu`, W0b 바이너리 | `145bc81a…934f` | 지표는 같다; 해시는 인터프리터의 torch(`runtime_hash`) 때문에 다르며, 그래서 같은 인터프리터 위의 X1 이전 바이너리가 이 패킷을 떼어 내 보는 행이다 |
+| 데모 U3 (W0b가 다시 묶은 `m7u-repacked.esb`), 그 자신의 `evaluation-augmented.toml` (`007aac67…`), `--jobs 6 --frames`, W0b가 돌린 대로 `ES_PYTHON=~/venvs/es-lerobot-cuda` | `mujoco-cpu`, 이 트리 | `2925ce8a…09a3` | W0b 4c 단계에 기록된 해시와 같다; `report.json`이 W0b의 것과 바이트 단위로 같다 (nominal 0.5625); 223 s |
+| 같음 | `mjwarp` | — | **거부**, 같은 행 |
+| reach 문서 위의 `es_native.Rollout`, env 2개 | `mujoco-cpu` / `mjwarp` / `newton` / `physx` | — | 생성됨 / `ContactElliptic`로 거부 / `ActuatorPosition, ActuatorOnJoint, ContactElliptic, ContactCondim6`로 거부 / `not implemented (M11/I1)` |
+
+**발견: 이 패킷의 폐루프 비교는 커밋된 문서 위에서 돌 수 없다.** 데모와 reach 작업 둘 다의 장면인
+`so101_pick_place.xml`은 `cone="elliptic"`을 선언하고, 스펙 17.2는 MJWarp의 마찰 원뿔을
+피라미드형으로 고정하므로, 매핑 리포트가 두 문서의 모든 `mjwarp` 실행을 막는다(그것들 위의
+20 반복 `Rollout` PPO 스모크도). 이것은 관문이 제 일을 한 것이지(§14.4) 디스패치의 결함이 아니다:
+MJWarp 위에서는 아무것도 돌지 않았으므로 이 표에 넣을 `mjwarp` `execution_hash`가 없고, 비트 단위로
+같다고든 아니라고든 보고되는 MJWarp 수치도 없다. 패킷이 이름 붙인 reach A0 체크포인트
+(`~/artifacts/plan-s/s4e/run-4000`)와 M7/U의 U3 체크포인트는 W0b의 `scene_hash`보다 오래됐으므로
+이 트리의 `evaluation-reach.toml` / `evaluation.toml`은 그것들을 판정하지 않는다(`XIR-040`). 위의
+행들은 W0b가 다시 측정한, 가중치가 같은 바이트인 대응물을 쓴다. 어차피 `evaluation.toml`은 U3를
+판정하지 않는다: U3는 `observation-augmented.toml`로 묶였다.
+
+**엔진 자체가 타원 장면으로 하는 일** (결정을 위한 증거이며 `es` 밖이다: 원시 MJCF에 대한
+`mujoco_warp.put_model`, 월드 1개, 고정된 사인파 제어로 1,000 스텝, `mujoco.mj_step` 옆에서).
+mujoco_warp 3.13.0은 타원 원뿔을 구현하고(`constraint.py`의 `IS_ELLIPTIC` 경로) 장면을 돌린다:
+내내 유한하다. CPU 엔진 대비 최대 |Δqpos|는 **팔 관절 여섯 개에서 1.1e-5**, **전체에서 0.103**이며
+후자는 큐브의 자유 관절에서, 이미 처음 100 스텝 안에 나온다. MJWarp 두 번의 실행은 비트 단위로
+같지 **않고**(최대 |Δ| 1.0e-6), 솔버가 10회 반복 한도에 닿았다고 경고한다. 첫 시도는 Warp의 커널
+캐시에서 죽었고(`KeyError … ccd_kernel … smem_bytes`) 똑같은 두 번째 시도는 돌았다 — 조용히
+재시도해 덮지 않고 보고한다.
+
+**사람이 결정해야 하는 것** (어느 것도 이 패킷이 정할 일이 아니다): 스펙 17.2의 MJWarp 행이 엔진을
+따라 `elliptic`으로 가는지(스펙과 `mapping.rs`의 변경이며, 위 수치에 대해 측정된다), 아니면 비교를
+장면의 피라미드형 변형 위에서 하는지(새 문서, 새 `scene_hash`, 다시 학습한 체크포인트). 그때까지
+`--backend mjwarp`는 관문, SKIPPED 경로, 식별자, 단형화된 디스패치 위에서 증명되었을 뿐, 폐루프
+수치 위에서 증명된 것은 아니다.
+
 ## 3. Perturbation 실현 (`perturb.rs`)
 
 `PerturbationPlan::compile(&EvaluationIr, &SceneDesc, &ModelInfo, has_renderer)`는 어떤
@@ -662,7 +739,8 @@ TOML이 아니라 JSON이다: `evaluation_hash`가 이미 자신의 전송 보�
   "backend": { "name": "mujoco-cpu", "determinism": "Bitwise", "float": "F64",
                "max_envs": 1024, "gpu_resident": false,
                "supports_reset_subset": true, "supports_state_get_set": true,
-               "quirks": ["..."] },
+               "quirks": ["..."],
+               "engine_version": "mujoco 3.13.0" },   // the load reply's; absent when unset (M11/X1)
   "created": 0                       // caller-supplied unix seconds; 0 = unset
 }
 ```
@@ -683,7 +761,7 @@ lock 안에만 갇혀 있다.
 | `learning`, `policy` | `PolicyInfo::lowering_hash` / `weights_hash` — 그래프 자체는 `run`에 넘겨지지 않으며, 이 둘은 로드된 런타임이 증명할 수 있는 두 다이제스트다 |
 | `compiler` | `CpuPlan::compiler_hash()` |
 | `runtime` | `PolicyRuntime::runtime_hash()` |
-| `dataset`, `hardware` | `RunConfig` — 평가 실행은 어떤 데이터셋도 읽지 않으므로, 호출자가 0들이나 학습 세트의 다이제스트를 공급한다 |
+| `dataset`, `hardware` | `RunConfig` — 평가 실행은 어떤 데이터셋도 읽지 않으므로, 호출자가 0들이나 학습 세트의 다이제스트를 공급한다. `hardware`는 `mujoco-cpu`에서 `[0; 32]`, 그 밖의 모든 백엔드에서 `backend_identity`다(2.8, 패킷 M11/X1) |
 
 `evaluation`은 체인 안에 있지만 의도적으로 `execution_hash`에는 들어가지 않는다(§5.3:
 평가 조건은 무엇이 실행되는지를 바꾸지 않는다); 리포트는 둘 다 싣는다.

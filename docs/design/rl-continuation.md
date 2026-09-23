@@ -88,6 +88,29 @@ between two evaluations of the same Gaussian at the same point, so `"executed"` 
 distribution the environment actually saw, with the clamp treated as an unmodelled part of the
 env rather than as a censoring to be un-biased. Section 7's R5 row is the measurement.
 
+### 2b. Which engine the rollout steps (`[rl] backend`, packet M11/X1)
+
+`[rl] backend = "mjwarp"` makes `es train` append `--backend mjwarp` to the trainer's argv, and
+`train_ppo.py` hands it to `es_native.Rollout(…, backend=…)`, which builds its `Env` on
+`MjWarpBackend` instead of `MuJoCoCpuBackend` — a closed enum of the two monomorphized envs
+inside `Rollout`, not a trait object and not a new trait (INV-17). Absent is `"mujoco-cpu"`, and
+spelled out it serialises exactly like absence, so every recipe measured before M11 keeps its
+`training_hash`; any other value is in the recipe JSON and the plan lines `training/config.json`
+carries, so it is in `training_hash` (plan golden `tests/golden/train/plan-reach-mjwarp.txt`).
+`"newton"` and `"physx"` are refused when the recipe is parsed: Newton's adapter declares no
+actuators, so its own `load` refuses any scene a policy could act in, and PhysX is M11/I1. The
+Safety Plane is the same code on either engine (INV-11..13). MJWarp is tier 2 (§3.5): a run on
+it is never bitwise against the CPU backend, and `train_rl_two_runs_are_bitwise` stays a
+statement about `mujoco-cpu` only.
+
+**Measured when it landed: the reach scene cannot run on `mjwarp` as the spec stands.**
+`so101_pick_place.xml` declares `cone="elliptic"` and spec 17.2 pins MJWarp's friction cone to
+pyramidal, so `Rollout(…, backend="mjwarp")` on the reach documents is refused by the mapping
+report inside `MjWarpBackend::load` (`ContactElliptic`, severity `error`), before a process is
+spawned (`rollout_backend_mjwarp_refuses_the_elliptic_reach_scene`). The installed
+`mujoco_warp` does implement the elliptic cone; whether the spec 17.2 row should follow it is a
+human decision, recorded in `evaluation-execution.md` 2.8.
+
 ## 3. Latency and chunking in rollouts
 
 PPO acts every control step with horizon 1: no chunk buffer, no declared latency. The rollout
