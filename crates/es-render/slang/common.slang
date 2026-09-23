@@ -155,10 +155,19 @@ bool es_view_history_valid(uint v) {
     return asuint(es_params[ES_PARAM_VIEW_BASE + v * ES_VIEW_STRIDE + 13]) != 0;
 }
 
+// Written out rather than GLSL.std.450 `Cross`: an extended instruction is the driver's to
+// implement, and `NoContraction` decorates *our* arithmetic, not its — so a driver that fuses
+// inside `Cross` moves a rotated ray by an ULP where no quaternion component is a power of two
+// (packet M11/X5: a drawn camera pose measured 20 ULP of depth through the builtin). Mirror of
+// `cpu::cross`, term for term.
+float3 es_cross(float3 a, float3 b) {
+    return float3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+
 float3 es_qrot(float4 q, float3 v) {
     float3 u = float3(q.x, q.y, q.z);
-    float3 t = 2.0 * cross(u, v);
-    return v + q.w * t + cross(u, t);
+    float3 t = 2.0 * es_cross(u, v);
+    return v + q.w * t + es_cross(u, t);
 }
 
 float3 es_qrot_inv(float4 q, float3 v) {

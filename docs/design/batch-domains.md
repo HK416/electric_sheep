@@ -194,6 +194,68 @@ at the first reset rather than dropping the draw (spec 17.2):
 `MuJoCoCpuBackend::applied_params` / `MjWarpBackend::applied_params` return `[nominal, applied]`
 for every written parameter, read back out of the env's model: the evidence a draw reached physics.
 
+**Render targets (packet M11/X5, spec 28.14 rule 4).** The grammar gains a render class. A render
+draw is keyed exactly like every other draw — `EnvRng(seed, env, episode, stream)` — but it is drawn
+by `RandomizationPlan::apply_render` into a per-env `RenderOverrides`, never into `ResetBuffer`, so
+the physics, `set_params` and every physical draw are untouched (oracle:
+`visual_randomization_undeclared_targets_move_nothing`). `Env::reset` records it in the episode
+(`Episode::render`, beside `param_scales`) and `Env::render_overrides(env)` hands it to the frame
+source, which applies it at render time (`es_env::render::drawn_frame`, `renderer.md` section 13).
+
+```
+light.intensity                    gain on every light source (Rs: albedo and emission; Pt: emitters, sun, sky)
+light.direction                    yaw and pitch, degrees -- two streams, <stream>.yaw and <stream>.pitch
+light.direction.yaw | .pitch       one of the two
+light.color                        RGB gain, per channel -- three streams, <stream>.r .g .b
+light.color.kelvin                 a colour temperature in kelvin, through a fixed table
+light.ambient                      gain on the ambient term (Rs: `ambient`, clamped to [0, 1]; Pt: the sky)
+light.radiance                     Pt only: the directional light's radiance, white (absent = 0 = today)
+light.sky                          Pt only: the sky's radiance, white (absent = 0 = today)
+geom.<name>.rgba                   RGB gain on that geom, per channel, alpha untouched -- three streams
+camera.<name>.pose.x | .y | .z     offset, metres, along the camera's own OpenCV axes
+camera.<name>.pose.roll|pitch|yaw  rotation, degrees, about the camera's own z | x | y
+camera.<name>.fov                  focal scale s: fx, fy times s about the principal point
+```
+
+Choices the packet left open, stated:
+
+* **One node, several streams.** A target that spans channels or angles (`light.direction`,
+  `light.color`, `geom.<n>.rgba`) draws each from `<stream>.<sub>` with the node's one
+  distribution, so the three channels of a colour are independent and a node still names one
+  stream. A one-value target keeps its stream exactly as declared.
+* **`geom.<n>.rgba` is a per-channel scale, not HSV jitter.** A scale is linear in the Lambert term,
+  so it composes with `light.color` by multiplication and needs no colour-space transcendental;
+  HSV would need a hue rotation the renderer's `f32` parity rule has no reason to take on.
+* **`camera.<n>.pose` is six one-axis targets**, not one six-value target: a translation in metres
+  and a rotation in degrees cannot share one distribution. The bare `camera.<n>.pose` is refused by
+  name. Rotation order is yaw, then pitch, then roll, each about the camera's own axis.
+* **`camera.<n>.fov` draws the focal scale**, so the recorded `fx`, `fy` are exactly the nominal
+  times the draw (oracle 4); `s > 1` narrows the view, and the vertical fov becomes
+  `2 atan(tan(fovy / 2) / s)`. Its distribution must be positive over its whole support — a
+  `Normal`, a `Uniform` reaching 0, a non-positive `Constant` or `Choice` is refused.
+* **`light.radiance` and `light.sky` are refused on a task that declares an `Rs` sensor**: the
+  rasterizer has neither, and a draw no frame shows would be a silent skip (spec 17.2). A
+  `Constant` distribution on them is how a document *declares* the `Pt` sun (M10 S-6) without a
+  new IR field.
+* **The kelvin table** is Tanner Helland's blackbody fit sampled every 1000 K from 2000 K to
+  10000 K as 8-bit sRGB, used as linear multipliers over 255, piecewise linear between rows and
+  clamped at the ends. The table is the definition.
+
+**What a drawn field of view does to `ImageSpec` (`INV-14`).** `Env::new` collects every declared
+image sensor as `(camera, ImageSpec)`; each reset writes `Episode::image_specs[camera] =
+RenderOverrides::image_spec(camera, declared)` — `fx`, `fy` times the focal scale, `cx`, `cy`
+unchanged, and a drawn offset composed onto `extrinsics` — so a consumer of intrinsics reads the
+drawn ones, and `ImageSpec::resized` / `cropped` downstream transform them as they would the
+declared ones (`camera_fov_draw_moves_intrinsics`). The frame the renderer wrote carries the same
+numbers: `EnvRenderer::frame_with` writes `intrinsics` into a drawn frame's sidecar
+(`Tile::write_to_with_intrinsics`); a frame with no camera draw writes the sidecar it always did.
+
+**Who applies the draw today.** `es_native.Rollout` (the RL path, X3's per-env cameras) passes
+`Env::render_overrides(env)` to `EnvRenderer::frame_with`. `es loop collect --frames` and
+`es eval run --frames` still call `frame` / their own renderer and render the **undrawn** scene
+for a task with render targets — they are out of X5's scope and are the follow-up that makes the
+collector and the evaluator see the draws (`docs/packets/M11/X5-visual-dr.md`).
+
 ## 6. Reward and termination
 
 `Reward` and `Terminate` are graph sinks with an input edge, not expression literals. `es-env`

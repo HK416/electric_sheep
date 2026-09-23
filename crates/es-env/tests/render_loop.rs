@@ -967,3 +967,259 @@ fn pt_svgf_sensor_is_a_pure_function_of_the_tick() {
     );
     println!("RAN {test}");
 }
+
+// --- visual randomization (packet M11/X5) ---------------------------------------------------
+
+/// `base`'s declarations (its sensor, hence its render path) with a graph of nothing but
+/// `targets`, each on its own stream `dr.<target>`.
+fn dr_task(base: &str, targets: &[(String, es_ir::task::Distribution)]) -> es_ir::task::TaskIr {
+    let mut task = es_ir::serial::task_from_toml(
+        &std::fs::read_to_string(
+            repo_root()
+                .join("tests/fixtures/visible-learning")
+                .join(base),
+        )
+        .expect("the committed task"),
+    )
+    .expect("it parses");
+    task.graph = es_ir::task::TaskGraph::new(1);
+    for (i, (target, dist)) in targets.iter().enumerate() {
+        task.graph.insert(
+            es_ir::graph::NodeId(i as u32),
+            es_ir::task::TaskNode::Randomization {
+                target: target.clone(),
+                dist: dist.clone(),
+                stream: format!("dr.{target}"),
+            },
+        );
+    }
+    task
+}
+
+fn uniform(lo: f64, hi: f64) -> es_ir::task::Distribution {
+    es_ir::task::Distribution::Uniform { lo, hi }
+}
+
+/// Every render target on the demo scene, at ranges a trainer would use.
+fn dr_targets(scene: &SceneDesc) -> Vec<(String, es_ir::task::Distribution)> {
+    let cam = &scene
+        .cameras
+        .iter()
+        .find(|c| c.id == overhead(scene))
+        .expect("the overhead camera")
+        .name;
+    // The bin, not the cube: at the pinned pose the gripper hides the cube from overhead.
+    let bin = "bin_floor";
+    let mut out = vec![
+        ("light.intensity".to_owned(), uniform(0.7, 1.3)),
+        ("light.direction".to_owned(), uniform(-30.0, 30.0)),
+        ("light.color".to_owned(), uniform(0.7, 1.3)),
+        ("light.ambient".to_owned(), uniform(0.5, 2.0)),
+        (format!("geom.{bin}.rgba"), uniform(0.5, 1.5)),
+        (format!("camera.{cam}.fov"), uniform(0.85, 1.15)),
+    ];
+    for axis in ["x", "y", "z"] {
+        out.push((format!("camera.{cam}.pose.{axis}"), uniform(-0.02, 0.02)));
+    }
+    for axis in ["roll", "pitch", "yaw"] {
+        out.push((format!("camera.{cam}.pose.{axis}"), uniform(-4.0, 4.0)));
+    }
+    out
+}
+
+fn dr_draw(
+    task: &es_ir::task::TaskIr,
+    scene: &SceneDesc,
+    model: &ModelInfo,
+    episode: u64,
+) -> es_env::randomize::RenderOverrides {
+    let plan = es_env::RandomizationPlan::compile(task, scene, model).expect("every target");
+    let mut ov = es_env::randomize::RenderOverrides::default();
+    plan.apply_render(11, 0, episode, &mut ov);
+    ov
+}
+
+/// Packet M11/X5 oracle 2, end to end on the `Rs` observation path: every render target
+/// through the Task IR grammar, the plan's draw, `EnvRenderer::frame_with` on the device and
+/// `drawn_frame` + `es_render::cpu` on the host, **bit for bit** — each target alone, all of
+/// them at once, and two episodes. The same draw renders the same frame after others, the
+/// undrawn frame is still the `so101_frame0` golden, and a drawn field of view reaches the
+/// frame's sidecar.
+#[test]
+fn dr_env_frames_follow_the_draws_gpu_equals_cpu() {
+    let test = "dr_env_frames_follow_the_draws_gpu_equals_cpu";
+    let scene = scene();
+    let f = fixed(&scene);
+    let world = body_poses(&f.model, &f.state(), 0);
+    let cfg = cfg(&scene);
+    let targets = dr_targets(&scene);
+    let cpu_of = |ov: &es_env::randomize::RenderOverrides| {
+        let (tri, view, rc) = es_env::render::drawn_frame(
+            &scene,
+            &cfg,
+            ov,
+            &world,
+            &mut es_render::SceneCache::default(),
+        )
+        .expect("drawn");
+        cpu::rasterize(&tri, &view, &rc, 0)
+            .tile(Channel::Rgb8)
+            .expect("rgb8")
+            .to_bytes()
+    };
+    let none = es_env::randomize::RenderOverrides::default();
+    assert!(
+        cpu_of(&none) == cpu_tile(&scene).to_bytes(),
+        "the undrawn frame moved"
+    );
+    let all = dr_task("task.toml", &targets);
+    let mut cases: Vec<(String, es_env::randomize::RenderOverrides)> = targets
+        .iter()
+        .map(|t| {
+            let one = dr_task("task.toml", std::slice::from_ref(t));
+            (t.0.clone(), dr_draw(&one, &scene, &f.model, 0))
+        })
+        .collect();
+    let (ep0, ep1) = (
+        dr_draw(&all, &scene, &f.model, 0),
+        dr_draw(&all, &scene, &f.model, 1),
+    );
+    assert!(cpu_of(&ep0) != cpu_of(&ep1), "two episodes, one picture");
+    cases.push(("all, episode 0".to_owned(), ep0.clone()));
+    cases.push(("all, episode 1".to_owned(), ep1));
+    cases.push(("undrawn".to_owned(), none.clone()));
+    cases.push(("all, episode 0 again".to_owned(), ep0.clone()));
+
+    let Some(gpu) = open(test) else { return };
+    let mut r = EnvRenderer::new(&gpu, &scene, cfg.clone()).expect("renderer");
+    let golden = std::fs::read(golden_dir().join(format!("{GOLDEN}.bin"))).expect("golden");
+    for (label, ov) in &cases {
+        let got = r
+            .frame_with(&f.model, &f.state(), 0, ov)
+            .expect("frame")
+            .to_bytes();
+        let want = cpu_of(ov);
+        let diff = got.iter().zip(&want).filter(|(a, b)| a != b).count();
+        let moved = got.iter().zip(&golden).filter(|(a, b)| a != b).count();
+        println!("{label}: GPU vs CPU {diff} bytes differ; {moved} bytes off the undrawn golden");
+        assert_eq!(diff, 0, "{label}: GPU != CPU");
+        assert_eq!(moved == 0, ov.is_identity(), "{label}");
+    }
+    // `frame` is `frame_with` the identity: today's golden.
+    let plain = r.frame(&f.model, &f.state(), 0).expect("frame").to_bytes();
+    assert!(plain == golden, "frame() no longer renders the golden");
+
+    // The drawn intrinsics reach the frame sidecar (`INV-14`).
+    let dir = std::env::temp_dir().join(format!("es-env-dr-frames-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut w = EnvRenderer::new(
+        &gpu,
+        &scene,
+        EnvRendererCfg {
+            frames_dir: Some(dir.clone()),
+            ..cfg.clone()
+        },
+    )
+    .expect("renderer");
+    w.frame_with(&f.model, &f.state(), 0, &ep0).expect("frame");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(dir.join("000000.json")).unwrap()).unwrap();
+    let (_, view, _) = es_env::render::drawn_frame(
+        &scene,
+        &cfg,
+        &ep0,
+        &world,
+        &mut es_render::SceneCache::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        json["intrinsics"]["fx"]
+            .as_f64()
+            .map(|v| (v as f32).to_bits()),
+        Some(view.spec.intrinsics.fx.to_bits())
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("RAN {test}");
+}
+
+/// Packet M11/X5 on the `Pt` sensor: `light.radiance` declares the directional light the
+/// path tracer has had since M7/R3 and no document could reach (`docs/reviews/M10.md` S-6),
+/// the draws land on it, and the device agrees with the CPU at the `Pt` NEE rule.
+#[test]
+fn dr_env_pt_sensor_gets_a_directional_light() {
+    let test = "dr_env_pt_sensor_gets_a_directional_light";
+    let scene = scene();
+    let f = fixed(&scene);
+    let world = body_poses(&f.model, &f.state(), 0);
+    let spec = image_spec(&scene, &cfg(&scene)).expect("the overhead camera resolves");
+    let render = es_ir::task::SensorRender {
+        path: es_ir::task::SensorPath::Pt { spp: 4, bounces: 2 },
+        ..pt_sensor(es_ir::task::SeedStream::Fixed)
+    };
+    let pt = sensor_cfg(overhead(&scene), &spec, &render, None);
+    let mut targets = dr_targets(&scene);
+    targets.push(("light.radiance".to_owned(), uniform(1.5, 3.0)));
+    targets.push(("light.sky".to_owned(), uniform(0.05, 0.2)));
+    let task = dr_task("task-pt.toml", &targets);
+    let ov = dr_draw(&task, &scene, &f.model, 0);
+    assert!(ov.radiance.is_some() && ov.sky.is_some());
+    // The same targets on the rasterizer's document are refused by name.
+    let err = es_env::RandomizationPlan::compile(&dr_task("task.toml", &targets), &scene, &f.model)
+        .unwrap_err();
+    assert!(err.to_string().contains("light.radiance"), "{err}");
+
+    let cpu_of = |ov: &es_env::randomize::RenderOverrides| {
+        let (tri, view, rc) = es_env::render::drawn_frame(
+            &scene,
+            &pt,
+            ov,
+            &world,
+            &mut es_render::SceneCache::default(),
+        )
+        .expect("drawn");
+        cpu::path_trace(&tri, &view, &rc, 0)
+            .tile(Channel::Rgb8)
+            .expect("rgb8")
+            .to_bytes()
+    };
+    let (lit, dark) = (
+        cpu_of(&ov),
+        cpu_of(&es_env::randomize::RenderOverrides::default()),
+    );
+    let mean = |b: &[u8]| b.iter().map(|v| f64::from(*v)).sum::<f64>() / b.len() as f64;
+    println!(
+        "{test}: mean byte {:.1} with the drawn sun, {:.1} without",
+        mean(&lit),
+        mean(&dark)
+    );
+    assert!(
+        mean(&lit) > mean(&dark),
+        "the directional light lit nothing"
+    );
+
+    let Some(gpu) = open(test) else { return };
+    let mut r = EnvRenderer::new(&gpu, &scene, pt.clone()).expect("renderer");
+    for (label, ov, want) in [
+        ("drawn", &ov, &lit),
+        (
+            "undrawn",
+            &es_env::randomize::RenderOverrides::default(),
+            &dark,
+        ),
+    ] {
+        let got = r
+            .frame_with(&f.model, &f.state(), 0, ov)
+            .expect("frame")
+            .to_bytes();
+        let diff = got.iter().zip(want).filter(|(a, b)| a != b).count();
+        println!(
+            "{test}: {label} GPU vs CPU {diff} of {} bytes differ",
+            got.len()
+        );
+        assert!(
+            diff * 1000 <= got.len(),
+            "{label}: {diff} bytes differ, more than a shadow-ray tie explains"
+        );
+    }
+    println!("RAN {test}");
+}

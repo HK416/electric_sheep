@@ -327,6 +327,22 @@ impl<'gpu> Renderer<'gpu> {
         self.cfg.seed = seed;
     }
 
+    /// Rewrites the lighting half of the config — `light_dir`, `light_rgb`, `ambient`, `sky`
+    /// and `shading` — from `from`, for the next [`Self::render`] (packet M11/X5).
+    ///
+    /// Like [`Self::set_seed`] these are *parameters* (slots `p[6..13]`, `p[20..31]` and
+    /// `p[32..35]`), not part of any pipeline, so this rebuilds nothing: a per-episode
+    /// lighting draw costs no kernel compile. The path, channels, atlas and every other field
+    /// stay as the renderer was built. Not for use with accumulation on, for the reason
+    /// `set_seed` gives: a history mixes frames lit two ways.
+    pub fn set_lighting(&mut self, from: &RenderConfig) {
+        self.cfg.light_dir = from.light_dir;
+        self.cfg.light_rgb = from.light_rgb;
+        self.cfg.ambient = from.ambient;
+        self.cfg.sky = from.sky;
+        self.cfg.shading = from.shading;
+    }
+
     /// The seed the next [`Self::render`] will draw with.
     pub fn seed(&self) -> u32 {
         self.cfg.seed

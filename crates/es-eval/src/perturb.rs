@@ -17,7 +17,6 @@ use es_core::StableId;
 use es_env::rng::EnvRng;
 use es_ir::evaluation::{CountRange, EvaluationIr, PerturbationKind, Range};
 use es_ir::task::Distribution;
-use es_math::approx;
 use es_physics_core::backend::ModelInfo;
 
 use crate::EvalError;
@@ -45,82 +44,10 @@ pub struct TorqueNoise {
     pub stream: StableId,
 }
 
-/// The scene lighting one episode renders under (§10.2 `light_intensity`, `light_direction`).
-///
-/// Two scalars rather than a light model: the render path the demo uses shades
-/// `albedo * (ambient + n.l * (1 - ambient)) + emission` from **one** directional light
-/// (`crates/es-render/src/cpu.rs:177-186`), so a light is exactly a gain and a direction.
-///
-/// The gain is applied to the scene's own colours ([`Self::scene`]) rather than to a renderer
-/// knob, because that Lambert term is linear in `albedo`: scaling every geom's rgba by `k` is
-/// *identical* to scaling the incident radiance by `k`, and it happens before the `TriScene`
-/// upload, where this crate can reach. The direction is applied to the renderer's
-/// `light_dir` ([`Self::rotate_dir`]), which has no scene equivalent.
-///
-/// `ponytail:` the gain is exact for the `Rs` Lambert path only; on a path tracer, scaling
-/// albedo *and* emission double-counts, and the gain would have to move to the emitters
-/// alone. Split it when a path-traced suite exists.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LightOverride {
-    /// Multiplier on the light's radiance; `1.0` is the scene as authored.
-    pub intensity: f64,
-    /// Yaw of the light direction about `+Z`, in degrees; `0.0` is the scene as authored.
-    pub yaw_deg: f64,
-}
-
-impl Default for LightOverride {
-    /// The scene as authored: the identity, so a suite with no light perturbation renders
-    /// exactly what every earlier packet rendered.
-    fn default() -> Self {
-        Self {
-            intensity: 1.0,
-            yaw_deg: 0.0,
-        }
-    }
-}
-
-impl LightOverride {
-    /// Whether this leaves the scene as authored. A caller holding a renderer rebuilds it
-    /// only when the override changes, so the nominal cell builds exactly one.
-    pub fn is_identity(&self) -> bool {
-        *self == Self::default()
-    }
-
-    /// `base` with every geom's colour scaled by [`Self::intensity`] — the scene to
-    /// tessellate and upload for this episode.
-    ///
-    /// Alpha is untouched: it is not radiance. A clone rather than an in-place edit, because
-    /// the caller's scene is the *authored* one and every episode starts from it.
-    pub fn scene(&self, base: &SceneDesc) -> SceneDesc {
-        let mut out = base.clone();
-        // Exact, not within a margin: this is the "nothing was drawn" path, and a draw that
-        // really did land on 1.0 renders the same scene either way.
-        if self.intensity.to_bits() == 1.0_f64.to_bits() {
-            return out;
-        }
-        for body in &mut out.bodies {
-            for geom in &mut body.geoms {
-                for c in &mut geom.rgba[..3] {
-                    *c *= self.intensity;
-                }
-            }
-        }
-        out
-    }
-
-    /// `dir` yawed about `+Z` by [`Self::yaw_deg`], for the renderer's one directional light.
-    ///
-    /// `es_math::approx`, not `std`: a perturbation draw is an input to the §10.1 table and
-    /// two machines must agree on it bit for bit (§3.4).
-    pub fn rotate_dir(&self, dir: [f64; 3]) -> [f64; 3] {
-        if self.yaw_deg.to_bits() == 0.0_f64.to_bits() {
-            return dir;
-        }
-        let a = (self.yaw_deg as f32).to_radians();
-        let (s, c) = (f64::from(approx::sin(a)), f64::from(approx::cos(a)));
-        [dir[0] * c - dir[1] * s, dir[0] * s + dir[1] * c, dir[2]]
-    }
-}
+/// The scene lighting one episode renders under (§10.2 `light_intensity`,
+/// `light_direction`). Defined in `es-env` since packet M11/X5, so these two perturbations
+/// and the Task IR's `light.intensity` / `light.direction` draws are one implementation.
+pub use es_env::randomize::LightOverride;
 
 /// What one episode of one cell was set up with.
 ///

@@ -52,7 +52,7 @@ crates/es-eval/tests/**
 crates/es-ir/src/task.rs
 crates/es-ir/tests/**
 crates/es-render/src/**
-crates/es-render/shaders/**
+crates/es-render/slang/**
 crates/es-render/tests/**
 crates/es-py/src/rollout.rs
 tests/golden/render/dr_*

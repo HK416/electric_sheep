@@ -199,6 +199,11 @@ impl Sim {
     fn metrics(&self) -> EnvMetrics {
         on_env!(self, e => e.metrics())
     }
+    /// This env's episode render draws (packet M11/X5), for its renderer.
+    #[cfg(feature = "render")]
+    fn render_overrides(&self, env: u32) -> &es_env::randomize::RenderOverrides {
+        on_env!(self, e => e.render_overrides(env))
+    }
 }
 
 impl<const NJ: usize, const H: usize> std::fmt::Debug for Rollout<NJ, H> {
@@ -396,12 +401,17 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
         for i in 0..self.n_envs {
             let view = env_view(&state, i);
             // This env's renderer as `capture`'s frame source, timed whole-frame.
+            // Under this env's episode draws (packet M11/X5): the identity for a task with none.
+            #[cfg(feature = "render")]
+            let drawn = self.env.render_overrides(i as u32);
             #[cfg(feature = "render")]
             let mut source = self.cameras.get_mut(i).map(|camera| {
                 let (wall, rendered) = (&mut self.render_wall, &mut self.rendered);
                 move |_: &LightOverride, model: &ModelInfo, state: &StateView<'_>| {
                     let started = std::time::Instant::now();
-                    let tile = camera.frame(model, state, 0).map_err(|e| e.to_string())?;
+                    let tile = camera
+                        .frame_with(model, state, 0, drawn)
+                        .map_err(|e| e.to_string())?;
                     *wall += started.elapsed();
                     *rendered += 1;
                     Ok(tile.to_bytes())

@@ -6,11 +6,12 @@
 
 use std::collections::BTreeMap;
 
-use es_core::{FailureKind, PhysTick};
+use es_core::{FailureKind, PhysTick, StableId};
+use es_ir::image::ImageSpec;
 use es_ir::task::TerminationKind;
 
 use crate::plan::ScalarPlan;
-use crate::randomize::ParamScales;
+use crate::randomize::{ParamScales, RenderOverrides};
 
 /// Why an episode ended, or that it has not (§6.3: success | failure | timeout).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -93,6 +94,12 @@ pub struct Episode {
     pub termination: Termination,
     /// The model-parameter scales this episode was randomized with (§5 of the design note).
     pub param_scales: ParamScales,
+    /// The render draws this episode's frames were made under (packet M11/X5); the identity
+    /// when the task declares no render target.
+    pub render: RenderOverrides,
+    /// The `ImageSpec` each declared image sensor's frames really have this episode, by
+    /// camera: the declared one with the drawn field of view and pose applied (`INV-14`).
+    pub image_specs: BTreeMap<StableId, ImageSpec>,
 }
 
 impl Episode {
@@ -116,6 +123,8 @@ impl Episode {
             failure: Vec::with_capacity(max_steps),
             termination: Termination::Running,
             param_scales: ParamScales::new(),
+            render: RenderOverrides::default(),
+            image_specs: BTreeMap::new(),
         }
     }
 }
@@ -188,6 +197,18 @@ impl EpisodeRecorder {
     /// Records the parameter scales a reset drew for `env`.
     pub fn set_param_scales(&mut self, env: u32, scales: ParamScales) {
         self.open[env as usize].param_scales = scales;
+    }
+
+    /// Records the render draws a reset made for `env`, and the image specs they imply.
+    pub fn set_render(
+        &mut self,
+        env: u32,
+        render: RenderOverrides,
+        image_specs: BTreeMap<StableId, ImageSpec>,
+    ) {
+        let ep = &mut self.open[env as usize];
+        ep.render = render;
+        ep.image_specs = image_specs;
     }
 
     /// Closes `env`'s episode and opens the next one.
