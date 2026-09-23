@@ -227,4 +227,50 @@ SO-101). The training scripts (`train.py`) were not run and the Isaac Lab repo w
   names for MuJoCo — an Isaac-side USD conversion could rename them, per
   `docs/api-notes/isaac-sim.md` §3's MJCF-importer caveats).
 - Precise field names/defaults for `PhysxCfg` iteration counts — deferred to
-  `docs/api-notes/isaac-sim.md` §5, same gap.
+  `docs/api-notes/isaac-sim.md` §5, same gap. (§9 lists what 2.3.2 authors on the stage.)
+
+## 9. Measured by M11 I3 (2026-09-23, the oracle server, Isaac Lab 2.3.2.post1, rsl-rl-lib 3.0.1)
+
+What training an SO-101 reach policy on our own scene (`python/es/rl_source/isaac_so101_reach/`,
+`docs/design/rl-continuation.md` section 7, I3) established about Isaac Lab itself. Every item
+was run; artifacts under `~/artifacts/plan-x/i3/`.
+
+- **The checkpoint is §7's classic shape.** `model_<it>.pt` holds `model_state_dict`,
+  `optimizer_state_dict`, `iter` and `infos` (`None`). `model_state_dict` is one `ActorCritic`:
+  `std` `[6]`, `actor.{0,2,4}.{weight,bias}` (32 → 64 → 64 → 6; the indices count the ELU
+  modules), `critic.{0,2,4}.*`, and no normalizer keys when `actor_obs_normalization = False`.
+  `OnPolicyRunner` saves every `save_interval` iterations **and the last one as
+  `model_<N-1>.pt`**, not `model_<N>.pt`. `import_rl.py --from rsl-rl` reads it unchanged.
+- **rsl-rl-lib 3.0.1 needs `obs_groups`** (`{"policy": ["policy"], "critic": ["policy"]}`), and
+  ignores the `state_dependent_std` field Isaac Lab 2.3's `RslRlPpoActorCriticCfg` passes it
+  (`ActorCritic.__init__ got unexpected arguments, which will be ignored`).
+- **`params/env.yaml` is not safe YAML.** `isaaclab.utils.io.dump_yaml` is `yaml.dump`: every
+  tuple is written `!!python/tuple` and a `SceneEntityCfg`'s ids
+  `!!python/object/apply:builtins.slice`, so `yaml.safe_load` refuses the file. `import_rl.py`
+  now reads every `!!python/...` node as the plain list, dict or string it is spelled as and
+  constructs no object.
+- **The reward manager multiplies every term by `step_dt`** (`reward_manager.py`: `value =
+  func(...) * weight * dt`); a term meant as "per control step" needs `weight / step_dt`.
+- **`JointPositionActionCfg.clip`** (a `{joint regex: (lo, hi)}` dict) clamps the *processed*
+  action; `last_action` stays the raw, unclipped one.
+- **The MJCF importer's base weld does not clone.** With `fix_base` the importer writes a
+  `PhysicsFixedJoint rootJoint_<base>` whose `body0` is empty — anchored to the world at the
+  MJCF's own coordinates. Cloned by `InteractiveScene` at `env_spacing = 2.0`, every env's arm was
+  pulled back to the world origin (the gripper read ±1 m off its env origin; PhysX logs
+  `Cloning joints …/rootJoint_base without a body rel may cause issues, since the localPose wont be
+  updated`). The env therefore runs at `env_spacing = 0` with inter-env collisions filtered,
+  which is also `physx_ref.py`'s own `GridCloner(spacing = 0)`.
+- **Kit exits 0 after an uncaught Python exception** in a script started through
+  `AppLauncher`; a driver has to catch it and `os._exit(1)` itself.
+- **Tensors made under `torch.inference_mode()` cannot be written outside it**: an
+  `env.reset()` between two inference-mode rollouts fails in `write_joint_state_to_sim` unless
+  both are inside one inference-mode block.
+- **`PhysxCfg` as 2.3.2 authors it on the stage** (what `physx_ref.py`'s `World` authors in
+  brackets): solver TGS (TGS); broadphase `GPU` (`MBP`); `enableCCD` false (true);
+  `enableGPUDynamics` true on the GPU pipeline (false); `enableStabilization` false (false);
+  `bounceThreshold` 0.5, `frictionOffsetThreshold` 0.04, `frictionCorrelationDistance` 0.025,
+  position iterations 1..255, velocity iterations 0..255 (none of these authored by `World`);
+  200 steps/s (200).
+- **On the GPU pipeline the same checkpoint on the same resets is not one number run to run:**
+  seed 2's selected checkpoint scored 0.6855 and then 0.6680 on the same 1,024 resets
+  (`env.reset(seed=1002)` twice in one process).
