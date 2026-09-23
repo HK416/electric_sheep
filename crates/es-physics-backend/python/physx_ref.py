@@ -486,7 +486,11 @@ class Sim(object):
                 row = f["rows"][e]
                 p = qpos[k * nq + j["qpos"][0]: k * nq + j["qpos"][0] + 7]
                 u = qvel[k * nv + j["dof"][0]: k * nv + j["dof"][0] + 6]
-                q = p[3:7]
+                # MuJoCo's mju_normalize4: a quaternion of norm < 1e-15 (the env's reset writes
+                # zeros for a free joint it only moves) reads as the identity. PhysX silently
+                # drops a transform with a zero quaternion, position included (measured, I1).
+                norm = math.sqrt(sum(x * x for x in p[3:7]))
+                q = [x / norm for x in p[3:7]] if norm >= 1e-15 else [1.0, 0.0, 0.0, 0.0]
                 w = qrot(q, u[3:6])
                 c = qrot(q, com[row][0:3])
                 tf[row] = p[0:3] + [q[1], q[2], q[3], q[0]]

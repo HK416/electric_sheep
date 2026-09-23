@@ -536,7 +536,8 @@ fn physx(feature: TaskFeature) -> Mapping {
             Mapping::native("revolute limits, exact (radians -> degrees in USD)")
         }
         TaskFeature::Capability(Feature::JointFree) => Mapping::native(
-            "a free rigid body; qpos / qvel converted to MuJoCo's free-joint convention",
+            "a free rigid body; qpos / qvel converted to MuJoCo's free-joint convention (a free \
+             joint on a body with children, a floating-base articulation, is refused at load)",
         ),
         // Implemented, but no fixture exercises a prismatic joint, so it is not claimed.
         TaskFeature::Capability(Feature::JointSlide) => Mapping::unverified(),
