@@ -138,9 +138,7 @@ clones the scene it is handed, meshes included. Goldens: `tests/golden/render/me
 `es_render::cpu`); the RTX 3060 matches them at 0 ULP on depth and bitwise elsewhere.
 Follow-ups: the SO-101 upstream model (~350 k triangles) in ms/frame under the nine-metric set
 (§12.4); a `tri_scene` dry run in `EnvRenderer::new` if a missing mesh should fail at
-construction rather than at the first frame; the CLI's shared `load_scene` (moved to
-`crates/es-tools/src/backend.rs` by M10/W3b, outside W2b's declared scope) still has to call
-`es_assets::mesh::load`.
+construction rather than at the first frame.
 
 The curved shapes' vertex directions are computed in `f32` through `es_math::approx::{sin,
 cos}`, never the host `libm` (§3.2 `DET-010`), then widened exactly to `f64` and scaled by the
