@@ -154,7 +154,10 @@ fn max_error(py: &str, kind: &str, adapter: &str, edit: (&str, &str)) -> f64 {
     let max_obs = json(&dir.join("reference.json"))["max_abs_obs"]
         .as_f64()
         .expect("max_abs_obs");
-    assert!(max_obs < 100.0, "{kind}: the observation clip binds ({max_obs})");
+    assert!(
+        max_obs < 100.0,
+        "{kind}: the observation clip binds ({max_obs})"
+    );
     let states = json(&dir.join("states.json"));
     let reference = rows(&json(&dir.join("reference.json"))["actions"]);
     let columns: BTreeMap<&str, Vec<Vec<f64>>> =
