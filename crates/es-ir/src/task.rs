@@ -762,6 +762,17 @@ pub struct SensorRender {
     /// (`cargo test -p es-ir committed_task_hashes_are_unmoved_by_seed_stream`).
     #[serde(default, skip_serializing_if = "SeedStream::is_fixed")]
     pub seed: SeedStream,
+    /// `Pt` only: run the renderer's single-frame SVGF filter on the sensor's frame (packet
+    /// M11/X6, spec 28.14 rule 5). No accumulation: without a history the luminance weight is
+    /// exactly 1.0, so the frame stays a pure function of `(pose, episode, tick)`. Absent =
+    /// `false` = today's bytes; `true` on `Rs` is `TASK-003`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub svgf: bool,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 impl Default for SensorRender {
@@ -771,6 +782,7 @@ impl Default for SensorRender {
             exposure: 1.0,
             tonemap: Tonemap::Reinhard,
             seed: SeedStream::Fixed,
+            svgf: false,
         }
     }
 }
@@ -800,6 +812,10 @@ impl SensorRender {
         // `task_hash`es, and `seed = "tick"` is a new document (spec 13.3, 28.10 rule 1).
         if !self.seed.is_fixed() {
             wdbg(w, &self.seed);
+        }
+        // Packet M11/X6: the same rule, after `seed`, so no committed document moves.
+        if self.svgf {
+            w.str("svgf");
         }
     }
 }
@@ -1047,7 +1063,19 @@ impl TaskIr {
                 _ => None,
             })
             .collect();
-        for name in self.observation_spec.channels.keys() {
+        for (name, ch) in &self.observation_spec.channels {
+            // Packet M11/X6: SVGF filters the path tracer's noise; the rasterizer has none.
+            if let ObsSource::Sensor { render, .. } = &ch.source {
+                if render.svgf && render.path == SensorPath::Rs {
+                    diags.push(
+                        Diagnostic::new(
+                            codes::TASK_003,
+                            format!("channel \"{name}\" declares svgf on the rasterizer"),
+                        )
+                        .with_hint("use path = \"pt\""),
+                    );
+                }
+            }
             if !bound.contains(name.as_str()) {
                 diags.push(Diagnostic::new(
                     codes::TASK_001,

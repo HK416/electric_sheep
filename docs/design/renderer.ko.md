@@ -1057,3 +1057,31 @@ match stream {
 - **누적, 여전히**(12.3). `Temporal`은 하나의 시드에서 뽑은 프레임들을 평균한다; 둘은 결합하지 않으며, `Renderer::set_seed`는 그것을 막는 대신 문서에 적는다 — 관측 경로에는 충돌할 누적이 없다.
 - **`observation_delay` 아래의 정렬.** 평가기는 제어 스텝이 아니라 *렌더*를 센다. 그래서 관측을 떨어뜨리는 스위트는 같은 스텝의 수집기보다 시드를 느리게 전진시킨다. 내부적으로 일관되고 재현 가능하지만 같은 번호 매김은 아니며, 데모의 수집은 관측을 떨어뜨리지 않는다.
 - **스트림 id.** 틱은 `rng::key`의 자기 좌표를 받는 대신 시드에 섞인다. 좌표가 더 단정한 설계였겠지만 Slang 쪽(`rng.slang`)을 맞물려 고쳐야 했을 것이다; 시드를 섞는 것은 비용이 없고, 다른 `RenderConfig::seed`로 같은 장면을 렌더하는 것과 비트 동일하며, 그것은 CPU 레퍼런스가 이미 할 줄 아는 일이다.
+
+### 12.9 센서가 SVGF를 선언할 수 있다 (M11/X6)
+
+§28.14 규칙 5는 `Pt` 관측의 노이즈를 선언된 문서 필드로만 다룬다고 말한다 — `render.seed = "tick"`(12.8)과 `render.svgf` — 관측 경로의 누적이나 벤더 디노이저로는 결코 다루지 않는다. 이것이 두 번째 필드다.
+
+**선언.** `SensorRender`가 `svgf: bool`을 얻는다. 기본값은 `false`이고, 정규 형식에는 **`true`일 때만**, `seed` 뒤에 쓰인다 — 12.8의 규칙을 한 번 더. `task.toml`(`86a7f3a3…`), `task-pt.toml`(`02036847…`), `task-pt-tick.toml`(`51b60dad…`)의 `task_hash`는 움직이지 않고, `svgf = false`를 명시해도 부재와 같은 해시이며, `true`는 해시를 움직인다(`cargo test -p es-ir committed_task_hashes_are_unmoved_by_svgf`). `Rs` 센서의 `svgf = true`는 검증 오류 **`TASK-003`**이다: 래스터라이저에는 거를 노이즈가 없고, 조용히 아무것도 하지 않는 필드라도 해시는 움직였을 것이다. 새 문서는 `task-pt-tick-svgf.toml`(`3249363e…`), `observation-pt-tick-svgf.toml`(`2ecd5ddf…`), `evaluation-pt-tick-svgf.toml`(`06122b67…`)이며 `generate_pt_fixtures`가 `task-pt-tick.toml`에서 생성한다; 두 태스크 문서의 차이는 `svgf = true` 한 줄이다.
+
+**매핑.** `sensor_cfg`가 필드를 `RenderPath::Pt { svgf }`로 복사한다; `svgf_iterations`는 `RenderConfig`의 기본값(4)에, `temporal`은 `None`에 머문다. 히스토리가 없으면 필터의 휘도 가중치는 정확히 `1.0`을 곱하는 것이므로(4.3절), 실행되는 것은 한 프레임 위의 M4 깊이/법선 에지 정지 à-trous 필터다 — 그 프레임의 radiance와 g-buffer의 순수 함수. SVGF의 커널과 상수는 바뀌지 않았다. `es video showcase --task`는 `sensor_cfg`를 거치므로 문서를 따른다.
+
+**비용, 그리고 여전히 비트 단위인가.** 데모의 96×96 센서, `seed = "tick"`, 고정 포즈 하나에서 `cargo test -p es-env --features render --test render_loop pt_svgf_sensor_`:
+
+| 주장 | RTX 3060 (로컬) | RTX 4090 (오라클 서버) |
+|---|---|---|
+| 수집기 경로(렌더러 하나, 이전 에피소드, `begin_episode`) == 평가기 경로(새 렌더러), 틱 0..2 | 비트 동일 | 비트 동일 |
+| GPU == CPU 레퍼런스(`cpu::path_trace`, 같은 설정, 틱 1 시드), `Rgb8` | **27,648바이트 중 0 다름** | **27,648바이트 중 0 다름** |
+| 같은 `(포즈, 틱)`에서 SVGF 프레임 vs 필터 없는 프레임 | 27,648바이트 중 26,722 다름 | 27,648바이트 중 26,722 다름 |
+| `EnvRenderer::frame`, `Pt` 64 spp NEE | 133.6–134.6 ms/frame | 64.8–65.1 ms/frame |
+| … + SVGF | 134.9–135.0 ms/frame | 68.6–69.0 ms/frame |
+| SVGF 오버헤드 | +0.3–1.3 ms (≤ 1 %) | +3.8–3.9 ms (5.8–5.9 %) |
+
+워밍업 후 16프레임의 프레임 전체 벽시계, 디버그 빌드, 세 번 실행; 다른 GPU 작업과 겹친 3060 실행 하나(162.6 / 190.3 ms)는 제외했다. 필터는 9,216픽셀 위의 à-trous 디스패치 네 번으로, 픽셀당 64 샘플 × 3 바운스 옆에 있다. 4090 실행은 ±0.2 ms 안에서 안정적이었고 필터를 일정한 ~3.8 ms로 잡았다; 3060에서는 같은 ms 단위의 비용이 두 배 느린 트레이스의 실행 간 편차 안에 묻힌다. 어느 쪽이든 프레임의 몇 퍼센트이며, 끄고 둘 이유는 아니다. 이 두 카드 밖의 것은 `Target / Status: unverified`.
+
+**12.9가 건너뛰는 것.**
+
+- **정책에 도움이 되는가.** 그것은 U6 행(§28.14 웨이브 1 행 3: U5 + `svgf = true`, 학습 시드 두 개)이며, 이 패킷이 돌리지 않는 서버 런이다.
+- **분산 유도 휘도 가중치.** 히스토리가 필요하고, 관측 경로의 히스토리는 12.3이 거부하는 누적이다. 단일 프레임 SVGF는 에지 인식 스무딩이지 분산 유도 디노이징이 아니다.
+- **문서 필드로서의 `svgf_iterations`.** 4가 기본값이고 다른 숫자를 요청한 사람이 없다; 필드는 고정해야 할 해시 입력 하나를 더할 뿐이다.
+- **센서의 `ReSTIR`**, CPU와 1e-5 이내로 일치하지만 비트 단위는 아니다(`gpu_restir_and_svgf_match_the_cpu_within_tolerance`).

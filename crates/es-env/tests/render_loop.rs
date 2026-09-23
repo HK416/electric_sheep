@@ -472,6 +472,7 @@ fn sensor_cfg_rs_is_todays_config() {
             exposure: 32.0,
             tonemap: es_ir::task::Tonemap::Aces,
             seed: es_ir::task::SeedStream::Fixed,
+            svgf: false,
         },
         None,
     );
@@ -732,6 +733,7 @@ fn pt_sensor(seed: es_ir::task::SeedStream) -> es_ir::task::SensorRender {
         exposure: 64.0,
         tonemap: es_ir::task::Tonemap::Reinhard,
         seed,
+        svgf: false,
     }
 }
 
@@ -823,4 +825,145 @@ fn pt_seed_varies_per_tick_and_is_reproducible() {
         "tick 0 of the Tick stream is the Fixed frame: the mixer is the identity at 0"
     );
     println!("RAN {test}: Fixed unmoved, Tick moves every tick and repeats");
+}
+
+// --- packet M11/X6: the sensor declares SVGF ------------------------------------------------
+
+/// Packet M11/X6 oracle 2: `svgf = true` on a `seed = "tick"` `Pt` sensor keeps the frame a
+/// pure function of `(pose, episode, tick)`.
+///
+/// 1. `sensor_cfg` maps it to `Pt { svgf: true }`, `svgf_iterations` 4, `temporal: None`;
+/// 2. the **collector** path (one renderer across episodes, `begin_episode` between them) and
+///    the **evaluator** path (a fresh renderer per episode) agree bit for bit at every tick;
+/// 3. the GPU frame equals the CPU reference (`es_render::cpu::path_trace`, same config, same
+///    tick seed) bit for bit;
+/// 4. the filtered frame differs from the unfiltered one at the same `(pose, tick)`;
+/// 5. ms/frame with and without the filter, printed for `renderer.md` 12.9.
+#[test]
+fn pt_svgf_sensor_is_a_pure_function_of_the_tick() {
+    use std::time::Instant;
+
+    const TICKS: u32 = 3;
+    const N: u32 = 16;
+    let test = "pt_svgf_sensor_is_a_pure_function_of_the_tick";
+    let Some(gpu) = open(test) else { return };
+    let scene = scene();
+    let f = fixed(&scene);
+    let spec = image_spec(&scene, &cfg(&scene)).expect("the overhead camera resolves");
+    let id = overhead(&scene);
+    let sensor = |svgf| es_ir::task::SensorRender {
+        svgf,
+        ..pt_sensor(es_ir::task::SeedStream::Tick)
+    };
+
+    let on = sensor_cfg(id, &spec, &sensor(true), None);
+    assert_eq!(
+        on.path,
+        es_render::RenderPath::Pt {
+            spp: 64,
+            bounces: 3,
+            nee: true,
+            restir: false,
+            svgf: true
+        }
+    );
+    let rc = render_config(&on);
+    assert_eq!(rc.svgf_iterations, 4, "SVGF runs at RenderConfig's default");
+    assert!(
+        rc.temporal.is_none(),
+        "an observation frame must not accumulate"
+    );
+
+    let run = |r: &mut EnvRenderer<'_>| -> Vec<Vec<u8>> {
+        (0..TICKS)
+            .map(|i| {
+                r.frame(&f.model, &f.state(), 0)
+                    .unwrap_or_else(|e| panic!("frame {i}: {e}"))
+                    .to_bytes()
+            })
+            .collect()
+    };
+
+    // The collector: one renderer, a previous episode at another pose, then this one.
+    let mut collector = EnvRenderer::new(&gpu, &scene, on.clone()).expect("renderer");
+    collector.begin_episode();
+    let other = Fixed::new(
+        &scene,
+        Pose::new(Vec3::new(0.1, -0.05, 0.03), Quat::IDENTITY),
+    );
+    for _ in 0..2 {
+        collector
+            .frame(&other.model, &other.state(), 0)
+            .expect("previous episode");
+    }
+    collector.begin_episode();
+    let collected = run(&mut collector);
+
+    // The evaluator: a fresh renderer, tick 0 at construction.
+    let mut evaluator = EnvRenderer::new(&gpu, &scene, on.clone()).expect("renderer");
+    let evaluated = run(&mut evaluator);
+    for (i, (a, b)) in collected.iter().zip(&evaluated).enumerate() {
+        assert!(a == b, "tick {i}: the collector and the evaluator disagree");
+    }
+    assert!(
+        collected[0] != collected[1],
+        "the tick seed no longer moves the grain under SVGF"
+    );
+
+    // The CPU reference at tick 1, with the seed `EnvRenderer` draws that tick with.
+    let tick = 1;
+    let world = body_poses(&f.model, &f.state(), 0);
+    let tri = TriScene::from_scene_with_poses(&scene, &world).expect("tessellates");
+    let view = camera_view(&scene, &on, &world).expect("camera");
+    let mut cpu_cfg = render_config(&on);
+    cpu_cfg.seed = es_env::render::frame_seed(on.seed_stream, cpu_cfg.seed, tick);
+    let want = cpu::path_trace(&tri, &view, &cpu_cfg, 0)
+        .tile(Channel::Rgb8)
+        .expect("rgb8")
+        .to_bytes();
+    let got = &collected[tick as usize];
+    let diff = got.iter().zip(&want).filter(|(x, y)| x != y).count();
+    println!(
+        "{test}: GPU vs CPU at tick {tick}: {diff} of {} bytes differ",
+        want.len()
+    );
+    assert!(
+        *got == want,
+        "the SVGF frame is not bit-equal to the CPU reference"
+    );
+
+    // It did something: the unfiltered sensor at the same (pose, tick) is other bytes.
+    let off = sensor_cfg(id, &spec, &sensor(false), None);
+    let mut plain = EnvRenderer::new(&gpu, &scene, off.clone()).expect("renderer");
+    let unfiltered = run(&mut plain);
+    let changed = unfiltered[0]
+        .iter()
+        .zip(&collected[0])
+        .filter(|(x, y)| x != y)
+        .count();
+    println!(
+        "{test}: SVGF changes {changed} of {} bytes at tick 0",
+        unfiltered[0].len()
+    );
+    assert!(changed > 0, "SVGF left the frame untouched");
+
+    // Cost: whole `EnvRenderer::frame` wall clock, one renderer kept across the frames.
+    let ms = |c: &EnvRendererCfg| {
+        let mut r = EnvRenderer::new(&gpu, &scene, c.clone()).expect("renderer");
+        r.frame(&f.model, &f.state(), 0).expect("warm-up");
+        let start = Instant::now();
+        for _ in 0..N {
+            r.frame(&f.model, &f.state(), 0).expect("frame");
+        }
+        start.elapsed().as_secs_f64() * 1000.0 / f64::from(N)
+    };
+    let (ms_off, ms_on) = (ms(&off), ms(&on));
+    println!(
+        "{test}: {} | Pt 64 spp NEE {ms_off:.2} ms/frame | + SVGF {ms_on:.2} ms/frame | \
+         +{:.2} ms ({:.1}%)",
+        gpu.capabilities().device_name,
+        ms_on - ms_off,
+        (ms_on / ms_off - 1.0) * 100.0
+    );
+    println!("RAN {test}");
 }
