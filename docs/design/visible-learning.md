@@ -4849,7 +4849,7 @@ what the parity stage below checks before anything expensive runs.
 |---|---|---|---|---|
 | **U3** | `task.toml` (`Rs`) | — | `es train` | **0.5625** |
 | **U4** | `task-pt.toml` (`Pt`) | `fixed` | `es train` | **0.0 (0 of 16)**; train-seeds 0.0625 (1 of 16) |
-| **U5** | `task-pt-tick.toml` (`Pt`) | `tick` | `es train` | *pending — the run below* |
+| **U5** | `task-pt-tick.toml` (`Pt`) | `tick` | `es train` | **0.2500 (4 of 16)**; train-seeds 0.5000 (8 of 16) |
 
 **The run.** Launched on the oracle server (RTX 4090) as `nohup sh
 ~/artifacts/plan-w/w1a/w1a.sh &` from the tree `~/Projects/es-w1a`, behind the GPU queue lock
@@ -4907,6 +4907,46 @@ reason — the next suspects being the lighting (`renderer.md` 10.4 option 2: th
 no directional light, which is why `light_direction` reported a byte-identical histogram to
 `nominal` in U4) and the estimator itself. Somewhere in between is the least useful outcome
 and would need `spp` moved, which doubles a three-hour evaluation each time.
+
+**U5 landed (2026-09-22 12:32 server time), and it is the answer in between — read against the
+right neighbour it is not the useless one.** Collection 200/200 `Success`, **103,881 frames**
+(`content ca915df2…`, the same count as U4's `m7-r5/ds-train-pt` and W0b's `ds-train`), 6,177 s;
+training 20,000 steps, loss 0.0393 → **0.0021** (U4 0.0045), 312 s; held-out 8,356 s at `--jobs 6`
+(135,475 PT frames); training seeds 1,108 s. `policy_hash 2abbd28a…`, `evaluation_hash d6986812…`,
+`execution_hash 3443a384…`, `passed = false`.
+
+| suite (16 held-out seeds) | U4 (`fixed`, 7.32) | **U5 (`tick`)** | U5 `envelope_violation_rate` / `episode_length` |
+|---|---|---|---|
+| nominal | 0.0 | **0.2500** | 0.0536 / 1553.3 |
+| light_intensity | — | 0.4375 | 0.0732 / 1405.7 |
+| light_direction | — | 0.2500 | 0.0536 / 1553.3 |
+| observation_delay | — | 0.7500 | 0.2085 / 1065.8 |
+| torque_noise | — | 0.1875 | 0.3963 / 1555.4 |
+| backlash | — | 0.3750 | 0.0975 / 1333.6 |
+| training seeds 1–16, nominal | 0.0625 | **0.5000** | 0.0899 / 1187.9 |
+
+The neighbour that isolates the seed stream is U4, not U3: the two rows share the Task IR but
+for one line, the recipe, the step count and the dataset size to the frame, so the move from 0/16
+to 4/16 held-out and from 1/16 to 8/16 on the policy's own training seeds is the grain moving and
+nothing else. The neighbour that isolates the renderer is W0b's **U3″** (section 7.36) — the
+rasterized path, the same recipe, today's 103,881-frame collect — which scored **0/16** held-out
+and 2/16 on training seeds. So on the one dataset regime all three rows share, the path-traced
+observation with a moving grain is the best of the three, and U3's 0.5625 (and U3′'s 0.8750) are
+rows on V15's 36,960 frames, where the 20,000-step recipe is 34.6 epochs rather than 12.3.
+
+**Reading.** R13 was right in direction: a pose-fixed grain was something the ACT could fit to —
+U4's lower loss and zero transfer — and moving it with the tick is enough to make the `Pt`
+observation path learnable as it stands. The magnitude is not settled by one run: CUDA training
+is not bitwise (section 7.36, 8 ULP at step 5) and U3's own retrain moved the headline by 0.31,
+so 4/16 against 0/16 on held-out is inside that band on its own; the training-seed row (8/16
+against 1/16) and the ordering against U3″ on the same data are the stronger half of the
+evidence. `light_direction` again reports a histogram byte-identical to `nominal` — the `Pt`
+sensor still has no directional light (`renderer.md` 10.4 option 2), so that suite measures
+nothing on this path. What would settle the magnitude is the same row at a step count matched
+to the dataset (the open question W0b raised for `es loop cycle`'s recipe), trained at two
+seeds — a follow-up, not this packet. The raw frame trees (`frames-train-pt-tick` 3.2 GB,
+`U5/frames-holdout` 3.7 GB, `U5/frames-trainseeds` 0.5 GB) are deleted now that the numbers are
+read.
 
 ## 8. Safety overlay (V3)
 
