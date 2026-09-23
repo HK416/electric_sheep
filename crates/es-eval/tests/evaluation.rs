@@ -10,6 +10,7 @@ use es_assets::scene::SceneDesc;
 use es_compile::Tensor;
 use es_core::time::{PhysTick, TickRate};
 use es_core::{FailureKind, StableId};
+use es_env::randomize::RenderOverrides;
 use es_eval::{EvalError, Evaluation, EventSource, FrameSink, LightOverride, RunConfig};
 use es_ir::deployment::{
     ActionContract, ActionSpace as DepSpace, Deadlines, DeploymentIr, ExecutionMode,
@@ -706,7 +707,7 @@ fn run_obs_frames(
     ir: &EvaluationIr,
     obs: &ObservationIr,
     target: f64,
-    frames: Option<&mut es_eval::runner::FrameSource<'_>>,
+    frames: Option<&mut es_eval::runner::DrawnFrameSource<'_>>,
     sink: Option<&mut es_eval::FrameSink>,
 ) -> Result<EvaluationReport, EvalError> {
     run_deploy(ir, obs, target, &deployment_ir(), frames, sink)
@@ -717,7 +718,7 @@ fn run_deploy(
     obs: &ObservationIr,
     target: f64,
     deploy: &DeploymentIr,
-    frames: Option<&mut es_eval::runner::FrameSource<'_>>,
+    frames: Option<&mut es_eval::runner::DrawnFrameSource<'_>>,
     sink: Option<&mut es_eval::FrameSink>,
 ) -> Result<EvaluationReport, EvalError> {
     let task = task_ir();
@@ -1206,7 +1207,7 @@ fn a_frame_source_serves_the_image_input() {
     let task = task_ir();
     let obs = image_observation_ir(task.task_hash().expect("task hashes"));
     let mut calls = 0u32;
-    let mut frames = |_: &LightOverride, _: &ModelInfo, _: &StateView<'_>| {
+    let mut frames = |_: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| {
         calls += 1;
         Ok(vec![0x5a_u8; IMG as usize * IMG as usize * 3])
     };
@@ -1222,7 +1223,7 @@ fn a_frame_of_the_wrong_size_is_refused_not_resized() {
     let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
     let task = task_ir();
     let obs = image_observation_ir(task.task_hash().expect("task hashes"));
-    let mut frames = |_: &LightOverride, _: &ModelInfo, _: &StateView<'_>| Ok(vec![0_u8; 4]);
+    let mut frames = |_: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| Ok(vec![0_u8; 4]);
     let err = run_obs_frames(&ir, &obs, 0.2, Some(&mut frames), None).expect_err("a short frame");
     let EvalError::Plan(message) = &err else {
         panic!("expected EvalError::Plan, got {err}");
@@ -1230,7 +1231,7 @@ fn a_frame_of_the_wrong_size_is_refused_not_resized() {
     assert!(message.contains("the frame supplies 4 bytes"), "{message}");
 
     // A frame source that cannot render says so, and the reason survives.
-    let mut broken = |_: &LightOverride, _: &ModelInfo, _: &StateView<'_>| {
+    let mut broken = |_: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| {
         Err("no camera in the scene".to_owned())
     };
     let err = run_obs_frames(&ir, &obs, 0.2, Some(&mut broken), None).expect_err("a broken source");
@@ -1249,9 +1250,9 @@ fn scratch(name: &str) -> std::path::PathBuf {
 /// A frame source whose bytes are a pure function of the state and the lighting, so two runs
 /// of the same conditions agree.
 fn state_frames(
-) -> impl FnMut(&LightOverride, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> {
-    |light: &LightOverride, _: &ModelInfo, state: &StateView<'_>| {
-        let q = state.qpos_of(0)[0] * light.intensity;
+) -> impl FnMut(&RenderOverrides, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> {
+    |light: &RenderOverrides, _: &ModelInfo, state: &StateView<'_>| {
+        let q = state.qpos_of(0)[0] * light.light.intensity;
         let mut out = vec![0_u8; IMG as usize * IMG as usize * 3];
         // `FakePolicy::infer` reads the first four bytes of its first input as an `f32`, so
         // they carry the joint angle; the rest is a flat fill derived from the same number.
@@ -1550,7 +1551,7 @@ fn episode_zero_runs_on_the_first_randomization_draw() {
 
     let seen: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
     let taken = Rc::clone(&seen);
-    let mut frames = move |light: &LightOverride,
+    let mut frames = move |light: &RenderOverrides,
                            model: &ModelInfo,
                            state: &StateView<'_>|
           -> Result<Vec<u8>, String> {
@@ -1724,8 +1725,11 @@ fn the_light_kinds_need_a_frame_source() {
 
     // With one, the draw reaches the frame source and is not the identity.
     let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
-    let mut frames = |light: &LightOverride, _: &ModelInfo, _: &StateView<'_>| {
-        seen.insert((light.intensity.to_bits(), light.yaw_deg.to_bits()));
+    let mut frames = |light: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| {
+        seen.insert((
+            light.light.intensity.to_bits(),
+            light.light.yaw_deg.to_bits(),
+        ));
         Ok(vec![0x5a_u8; IMG as usize * IMG as usize * 3])
     };
     run_obs_frames(&ir, &obs, 0.2, Some(&mut frames), None).expect("the lit run");
@@ -2202,7 +2206,7 @@ fn a_baked_frame_is_bit_identical_to_what_capture_serves() {
     // The frame source is also the recorder: it is handed the very `StateView` `capture` reads,
     // so the rows below are the rows the plan saw, not a re-simulation of them.
     let mut recorded: Vec<(Vec<f64>, Vec<u8>)> = Vec::new();
-    let mut frames = |_: &LightOverride, _: &ModelInfo, state: &StateView<'_>| {
+    let mut frames = |_: &RenderOverrides, _: &ModelInfo, state: &StateView<'_>| {
         let q = state.qpos_of(0)[0];
         let mut tile = vec![0_u8; IMG as usize * IMG as usize * 3];
         for (i, byte) in tile.iter_mut().enumerate() {

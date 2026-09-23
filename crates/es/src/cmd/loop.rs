@@ -243,10 +243,11 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
     // step and therefore before its first frame; the frame sink below clears the flag as it
     // renders. The collector's own loop counter is not reachable from here and the env's tick
     // runs across episodes, so this is the one signal that means "tick 0 of an episode".
-    let new_episode = std::cell::Cell::new(true);
+    // It also carries the episode's index, which keys that episode's render draws below.
+    let new_episode = std::cell::Cell::new(Some(0u32));
     let mut publish = |event: CollectEvent| {
-        if matches!(event, CollectEvent::EpisodeBegin { .. }) {
-            new_episode.set(true);
+        if let CollectEvent::EpisodeBegin { episode, .. } = event {
+            new_episode.set(Some(episode));
         }
         if let Some(p) = &publisher {
             p.borrow_mut().on_collect(event);
@@ -299,16 +300,37 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
             .map_err(|e| CliError::Runtime(e.to_string()))?;
         std::fs::create_dir_all(dir)
             .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
+        // The episode's render draws (packet M11/R2): the Task IR's own `RandomizationPlan`,
+        // drawn at the key `Env::reset` recorded them under -- `(seed, env 0, episode)`, one
+        // env and one draw per collected episode -- because the collector owns the `Env` and
+        // hands this sink only its state. The identity for a task with no render target.
+        let mut plan: Option<es_env::RandomizationPlan> = None;
+        let mut drawn = es_env::randomize::RenderOverrides::default();
         let mut frame_sink =
             |model: &ModelInfo, state: &es_physics_core::backend::StateView<'_>| {
                 // Tick 0 of the episode (packet M10/W1a): under `seed = "tick"` this is where
                 // the sample keys restart, so the evaluator -- which runs one `Env` per
                 // episode and therefore starts at tick 0 by construction -- renders the same
                 // grain at the same `(episode, tick)`.
-                if new_episode.replace(false) {
+                if let Some(episode) = new_episode.take() {
                     renderer.begin_episode();
+                    let plan = match &mut plan {
+                        Some(p) => p,
+                        None => plan.insert(
+                            es_env::RandomizationPlan::compile(
+                                &spec.bundle.task,
+                                spec.scene,
+                                model,
+                            )
+                            .map_err(|e| e.to_string())?,
+                        ),
+                    };
+                    drawn = es_env::randomize::RenderOverrides::default();
+                    plan.apply_render(spec.seed, 0, u64::from(episode), &mut drawn);
                 }
-                let tile = renderer.frame(model, state, 0).map_err(|e| e.to_string())?;
+                let tile = renderer
+                    .frame_with(model, state, 0, &drawn)
+                    .map_err(|e| e.to_string())?;
                 // The tile the run already rendered, borrowed, not a second render (packet
                 // M7/E7); the publisher decides whether this is one of the published ones.
                 if let (Some(p), Some(bytes)) = (&publisher, tile.as_u8()) {

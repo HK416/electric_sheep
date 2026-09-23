@@ -3173,3 +3173,88 @@ fn dr_frame_sidecar_carries_the_drawn_intrinsics() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Packet M11/R2 oracle 3: the two GLSL.std.450 `Cross` builtins X5 left in `common.slang` --
+/// Möller–Trumbore's (`es_intersect`, every ray the rasterizer's depth and the path tracer
+/// cast) and the triangle area's (`es_tri_area`, the NEE light pdf) -- under drawn camera
+/// poses whose quaternions have no power-of-two component. The camera-relative vertices and
+/// the rotated rays then carry arbitrary bits into both, which is what exposed `es_qrot`'s.
+///
+/// * `Rs`: `Rgb8` and segmentation bit for bit, depth at 0 ULP (`es_intersect`).
+/// * `Pt` 1 spp, 2 bounces, no NEE: `PtRadiance` bit for bit (`es_intersect` on every bounce).
+/// * `Pt` NEE, 1 spp, the ceiling panel the only light (`es_tri_area` in every light pdf):
+///   the NEE rule of `gpu_pt_nee_matches_the_cpu` (normalized 1e-5), because NEE is not bitwise
+///   against the CPU with or without a pose. Whether *that* builtin is exact was measured by
+///   swapping it for `es_cross` and comparing the device's own bytes
+///   (`docs/design/renderer.md` 13.8).
+///
+/// A builtin that fused inside would move the first two by an ULP, which is the evidence the
+/// packet asks for before the code changes.
+#[test]
+fn dr_cross_is_exact() {
+    use es_math::{Pose, Quat, Vec3};
+    let test = "dr_cross_is_exact";
+    let Some(gpu) = open(test) else { return };
+    let poses = [
+        (
+            Vec3::new(0.1, -0.05, 0.2),
+            Quat::from_xyzw(0.02, 0.03, 0.01, 1.0),
+        ),
+        (
+            Vec3::new(-0.07, 0.11, -0.13),
+            Quat::from_xyzw(-0.09, 0.05, 0.13, 0.98),
+        ),
+        (
+            Vec3::new(0.03, 0.02, 0.05),
+            Quat::from_xyzw(0.17, -0.11, -0.07, 0.97),
+        ),
+    ];
+    let nee_cfg = RenderConfig::pt_nee(TileAtlasCfg::row(TILE, TILE, 1), 1, 2);
+    for (i, (t, q)) in poses.iter().enumerate() {
+        let mut cam = cornell_camera(TILE, TILE);
+        cam.pose = cam.pose.compose(Pose::new(*t, *q));
+        let q = cam.pose.orientation;
+        let pow2 = |v: f64| v == 0.0 || v.abs().log2().fract() == 0.0;
+        assert!(
+            ![q.x, q.y, q.z, q.w].into_iter().any(pow2),
+            "pose {i}: a power-of-two component would hide a fused product"
+        );
+
+        let want = cpu::rasterize(&scene(), &cam, &rs_cfg(), 0);
+        let mut got = render_gpu(&gpu, rs_cfg(), &[cam], 1);
+        let rgb = got.read_tile(0, Channel::Rgb8).expect("rgb8");
+        let seg = got.read_tile(0, Channel::SegmentationId).expect("seg");
+        let depth = got.read_tile(0, DEPTH).expect("depth");
+        let (d_ulp, _) = max_ulp(
+            depth.as_f32().unwrap(),
+            want.tile(DEPTH).unwrap().as_f32().unwrap(),
+        );
+        let rgb_eq = rgb.to_bytes() == want.tile(Channel::Rgb8).unwrap().to_bytes();
+        let seg_eq = seg.to_bytes() == want.tile(Channel::SegmentationId).unwrap().to_bytes();
+
+        let radiance = |cfg: RenderConfig| {
+            let want = cpu::path_trace(&scene(), &cam, &cfg, 0);
+            let got = render_gpu(&gpu, cfg, &[cam], 1)
+                .read_tile(0, Channel::PtRadiance)
+                .expect("radiance");
+            let (got, want) = (
+                got.as_f32().unwrap(),
+                want.tile(Channel::PtRadiance).unwrap().as_f32().unwrap(),
+            );
+            (max_ulp(got, want).0, max_normalized(got, want))
+        };
+        let (pt_ulp, _) = radiance(pt_cfg(1, 2));
+        let (nee_ulp, nee_norm) = radiance(nee_cfg.clone());
+        println!(
+            "pose {i}: Rs Rgb8 equal {rgb_eq}, seg equal {seg_eq}, depth max ULP {d_ulp}; \
+             Pt 1 spp max ULP {pt_ulp}; Pt NEE 1 spp max ULP {nee_ulp}, normalized {nee_norm:e}"
+        );
+        assert!(rgb_eq && seg_eq, "pose {i}: Rs Rgb8/segmentation moved");
+        assert_eq!(d_ulp, 0, "pose {i}: depth through es_intersect");
+        assert_eq!(pt_ulp, 0, "pose {i}: Pt radiance through es_intersect");
+        assert!(
+            nee_norm <= 1e-5,
+            "pose {i}: Pt NEE diverged by {nee_norm:e}"
+        );
+    }
+}

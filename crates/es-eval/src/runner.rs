@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use es_assets::scene::SceneDesc;
 use es_compile::{CpuPlan, Home, PlanMode, Tensor, TensorRef};
 use es_core::{PhysTick, StableId, TickRate};
+use es_env::randomize::RenderOverrides;
 use es_env::scheduler::BatchDomains;
 use es_env::traj::Trajectory;
 use es_env::{plane_chunk, AsyncInference, ChunkBuffer, Env, Episode, PlaneFeed};
@@ -106,6 +107,16 @@ impl Default for RunConfig {
 /// declared is an error, and every conversion is an Observation IR node (§7.2, `INV-14`).
 pub type FrameSource<'a> =
     dyn FnMut(&LightOverride, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> + 'a;
+
+/// A [`FrameSource`] for a whole evaluation: handed each episode's [`RenderOverrides`] — the
+/// Task IR's render draws `Env::render_overrides` recorded at reset, with the suite's
+/// [`LightOverride`] folded into its `light` (packet M11/R2, spec 28.14 rule 4) — so the
+/// frame at `(seed, episode, tick)` is the one `es loop collect --frames` and `Rollout` render.
+///
+/// A task that declares no render target draws the identity, and the overrides are then the
+/// suite's light and nothing else: exactly what the frame source was handed before R2.
+pub type DrawnFrameSource<'a> =
+    dyn FnMut(&RenderOverrides, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> + 'a;
 
 /// Where a run says, as it happens, what it just did (packet M7/E4).
 ///
@@ -251,6 +262,36 @@ impl FrameSink {
     }
 }
 
+/// This episode's render draws with the suite's light perturbation folded in (packet M11/R2):
+/// intensities multiply and yaws add. A suite with no light perturbation leaves the draws
+/// exactly as recorded; a task with no render target is left with the suite's light alone.
+fn episode_draws(recorded: &RenderOverrides, light: &LightOverride) -> RenderOverrides {
+    let mut out = recorded.clone();
+    if !light.is_identity() {
+        out.light.intensity *= light.intensity;
+        out.light.yaw_deg += light.yaw_deg;
+    }
+    out
+}
+
+/// The intrinsics a drawn field of view gives the task's image sensor this episode -- the
+/// episode's own `ImageSpec` (`RenderOverrides::image_spec`, `INV-14`) -- or `None` when no
+/// camera an image channel names was drawn.
+fn drawn_intrinsics(task: &TaskIr, drawn: &RenderOverrides) -> Option<es_ir::image::Intrinsics> {
+    task.observation_spec.channels.values().find_map(|c| {
+        match (&c.source, c.ty.frame, c.ty.image) {
+            (
+                es_ir::task::ObsSource::Sensor { .. },
+                es_ir::types::Frame::Camera(camera),
+                Some(spec),
+            ) if drawn.cameras.contains_key(&camera) => {
+                Some(drawn.image_spec(camera, &spec).intrinsics)
+            }
+            _ => None,
+        }
+    })
+}
+
 /// One cell's frame directory: the raw `.bin` sequence plus the `layout.json` that pins their
 /// shape, written as the frames are captured.
 ///
@@ -260,6 +301,9 @@ impl FrameSink {
 pub struct CellFrames {
     dir: PathBuf,
     n: u64,
+    /// The episode's drawn intrinsics, written into `layout.json` beside `dtype` and `shape`
+    /// (packet M11/R2, `INV-14`); `None` writes the layout it always did.
+    intrinsics: Option<es_ir::image::Intrinsics>,
 }
 
 impl CellFrames {
@@ -276,8 +320,15 @@ impl CellFrames {
         if self.n == 0 {
             fs::create_dir_all(&self.dir).map_err(io(&self.dir))?;
             let layout = self.dir.join("layout.json");
+            let drawn = match &self.intrinsics {
+                Some(i) => format!(
+                    ",\"intrinsics\":{}",
+                    serde_json::to_string(i).expect("four floats serialize")
+                ),
+                None => String::new(),
+            };
             let text = format!(
-                "{{\"dtype\":\"{}\",\"shape\":{:?}}}\n",
+                "{{\"dtype\":\"{}\",\"shape\":{:?}{drawn}}}\n",
                 dtype_name(dtype),
                 shape
             );
@@ -446,7 +497,7 @@ impl Evaluation {
         deploy: &DeploymentIr,
         new_backend: F,
         cfg: &RunConfig,
-        frames: Option<&mut FrameSource<'_>>,
+        frames: Option<&mut DrawnFrameSource<'_>>,
         sink: Option<&mut FrameSink>,
     ) -> Result<(EvaluationReport, EvaluationLock), EvalError>
     where
@@ -495,7 +546,7 @@ impl Evaluation {
         deploy: &DeploymentIr,
         new_backend: F,
         cfg: &RunConfig,
-        frames: Option<&mut FrameSource<'_>>,
+        frames: Option<&mut DrawnFrameSource<'_>>,
         frames_dir: Option<&Path>,
         shard: (u32, u32),
     ) -> Result<Shard, EvalError>
@@ -536,7 +587,7 @@ impl Evaluation {
         deploy: &DeploymentIr,
         mut new_backend: F,
         cfg: &RunConfig,
-        mut frames: Option<&mut FrameSource<'_>>,
+        mut frames: Option<&mut DrawnFrameSource<'_>>,
         frames_dir: Option<&Path>,
         shard: (u32, u32),
         mut sink: Option<&mut RunSink<'_>>,
@@ -660,6 +711,7 @@ impl Evaluation {
                 let mut cell_frames = frames_dir.map(|d| CellFrames {
                     dir: d.join(&name),
                     n: 0,
+                    intrinsics: drawn_intrinsics(task, env.render_overrides(0)),
                 });
                 let mut events = Vec::new();
                 // One `.estraj` per episode, the same cell name the frames use: what the
@@ -939,7 +991,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     buffer: &mut ChunkBuffer<NJ, H>,
     feed: &mut PlaneFeed,
     inference: &mut AsyncInference,
-    mut frames: Option<&mut FrameSource<'_>>,
+    frames: Option<&mut DrawnFrameSource<'_>>,
     mut cell_frames: Option<&mut CellFrames>,
     mut traj: Option<&mut Trajectory>,
     events: &mut Vec<StepEvent>,
@@ -992,6 +1044,15 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
 
     let mut overrides = ResetOverrides::default();
     perturbations.apply_at_reset(cell, seed, episode, &mut overrides);
+    // The frame source renders this episode under its own render draws (packet M11/R2): the
+    // ones the env recorded at the reset that opened it, with the suite's light folded in.
+    // `capture_at` is `Rollout`'s too and keeps its per-call light argument; this ignores it.
+    let drawn = episode_draws(env.render_overrides(0), &overrides.light);
+    let mut frames = frames.map(|source| {
+        move |_: &LightOverride, model: &ModelInfo, state: &StateView<'_>| {
+            source(&drawn, model, state)
+        }
+    });
     let hold = vec![0.0; nu];
     let mut step_state = StepState::new(
         &overrides,
@@ -1040,7 +1101,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
                 sources,
                 env.model(),
                 &env.backend().state(),
-                frames.as_deref_mut(),
+                frames.as_mut().map(|f| f as &mut FrameSource<'_>),
                 &overrides.light,
                 cell_frames.as_deref_mut(),
                 &previous,
