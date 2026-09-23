@@ -32,6 +32,14 @@ serde_json = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }
 pyo3 = { workspace = true, optional = true }
+# The Vulkan device `Rollout`'s renderers borrow (packet M11/X3). Only under `render`.
+es-gpu = { workspace = true, optional = true }
+
+[dev-dependencies]
+# Oracle only (packet M11/X3): the collector `es loop collect --frames` runs, in-process, as
+# the reference a `Rollout` frame is compared to. Both are layer 10 / 8, below this crate.
+es-data = { workspace = true }
+es-policy = { workspace = true }
 
 # Off by default so `cargo build`/`cargo test --workspace` never require a Python dev
 # environment (CLAUDE.md, spec 2.1: Python is first-class on the learning/authoring path only,
@@ -39,6 +47,11 @@ pyo3 = { workspace = true, optional = true }
 [features]
 default = []
 python = ["dep:pyo3"]
+# `Rollout` renders the image inputs of its Observation IR (packet M11/X3): one
+# `es_env::EnvRenderer` per env, built through `es_env::render::sensor_cfg` like the collector's.
+# Off by default for the reason `es-env`'s own `render` is: it is what links Vulkan. Without it
+# an image input is refused by name, as it always was.
+render = ["es-env/render", "dep:es-gpu"]
 
 [lints]
 workspace = true

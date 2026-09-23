@@ -1,0 +1,44 @@
+# The RL route on the camera-bearing reach task -- packet M11/X3's smoke, not a training run.
+#
+# PPO over `es_native.Rollout` on task-reach-vision.toml: every control step renders each env's
+# overhead camera on the `Pt` path (16 spp, `seed = "tick"`), the Observation IR turns it into
+# `rgb_overhead` `[3, 96, 96]`, and learning-reach-vision.toml's ResNet18 `VisionEncoder` reads
+# it beside the 26-wide state. The oracle is that it runs, the loss stays finite, and
+# `render_ms_per_frame` is reported (`metrics/env-metrics.json`); what a vision policy learns,
+# at which spp and with which randomization, is spec 28.14 wave 3's X7 and not this file.
+#
+# The bundle is the vision documents plus deployment-reach.toml, packed with placeholder weights:
+#
+#     ES_PACK_TASK=tests/fixtures/rl/task-reach-vision.toml \
+#     ES_PACK_OBSERVATION=tests/fixtures/rl/observation-reach-vision.toml \
+#     ES_PACK_LEARNING=tests/fixtures/rl/learning-reach-vision.toml \
+#     ES_PACK_DEPLOYMENT=tests/fixtures/rl/deployment-reach.toml \
+#     ES_PACK_OUT=runs/reach-vision-001/untrained.esb \
+#     cargo test -p es --test cli -- --ignored pack_untrained_bundle
+#
+# and `es_native` must be built with the `render` feature (python/es/pyproject.toml turns it
+# on). 10 iterations of 2 envs x 16 steps is 320 rendered frames.
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-vision-001/untrained.esb"
+
+[rl]
+algo        = "ppo"
+envs        = 2
+horizon     = 16
+epochs      = 2
+minibatches = 2
+gamma       = 0.99
+lam         = 0.95
+clip        = 0.2
+entropy     = 0.005
+value_coef  = 0.5
+
+[run]
+steps         = 10
+lr            = 3e-4
+seed          = 0
+device        = "cpu"
+interpreter   = "python"

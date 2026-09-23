@@ -119,7 +119,7 @@ except ImportError:  # pragma: no cover - reported as a stopped run, never a sil
         raise SystemExit(
             "es_native is not importable (%s). It is the pyo3 extension this trainer steps "
             "the env through; build it once with `cd python/es && maturin develop --release "
-            "--features python` in the interpreter that runs this file." % exc
+            "--features python,render` in the interpreter that runs this file." % exc
         )
 
 
@@ -134,6 +134,11 @@ class Value(torch.nn.Module):
     into `policy_hash` that no deployment ever evaluates. Two hidden layers of 64 is the
     reference PPO baseline's shape and is deliberately not a flag: a value head that needed
     tuning per task would be an IR decision wearing a command-line flag's clothes.
+
+    An image port reaches it flattened (packet M11/X3), so on the vision reach task its first
+    layer reads 27,648 pixels beside the 26 state lanes.
+    ponytail: a pixel MLP baseline; give the value its own conv trunk (still training-only) if a
+    vision run's value loss is what stalls it (spec 28.14 wave 3, X7).
     """
 
     def __init__(self, obs_dim: int) -> None:
@@ -196,10 +201,13 @@ def open_rollout(docs: Path, seed: int, n_envs: int, backend: str = "mujoco-cpu"
         )
 
 
-def observe(roll, ports: list, n_envs: int) -> dict:
-    """`{port: [n_envs, dim]}` as f32 tensors, in the port order fixed once by the caller."""
+def observe(roll, shapes: dict, n_envs: int) -> dict:
+    """`{port: [n_envs, *shape]}` as f32 tensors, `shape` being the port's own in
+    `contract.json` -- `[dim]` for a state port, `[C, H, W]` for an image port (packet M11/X3),
+    which is the lowered module's layout because the lowering wrote that file from the same IR.
+    `Rollout.observe` hands each port back flat and row-major by env; nothing is transposed."""
     raw = roll.observe()
-    missing = [p for p in ports if p not in raw]
+    missing = [p for p in shapes if p not in raw]
     if missing:
         raise SystemExit(
             "the Observation IR produced %s and the module declares %s; they come from one "
@@ -207,8 +215,14 @@ def observe(roll, ports: list, n_envs: int) -> dict:
             % (sorted(raw), missing)
         )
     return {
-        p: torch.tensor(raw[p], dtype=torch.float32).reshape(n_envs, -1) for p in ports
+        p: torch.tensor(raw[p], dtype=torch.float32).reshape(n_envs, *shape)
+        for p, shape in shapes.items()
     }
+
+
+def flatten(obs: dict, ports: list) -> torch.Tensor:
+    """The value network's input: every port flattened per row, concatenated in port order."""
+    return torch.cat([obs[p].reshape(obs[p].shape[0], -1) for p in ports], dim=1)
 
 
 def main(argv: list) -> int:
@@ -322,8 +336,8 @@ def main(argv: list) -> int:
         )
     roll.reset(None)
 
-    obs = observe(roll, ports, a.envs)
-    obs_dim = sum(int(t.shape[1]) for t in obs.values())
+    obs = observe(roll, shapes, a.envs)
+    obs_dim = int(flatten(obs, ports).shape[1])
     value = Value(obs_dim).to(device)
 
     # Training-only state, `[action_dim]` wide and state-independent (design note section 2).
@@ -382,7 +396,7 @@ def main(argv: list) -> int:
         applied_lr.append(lr_now)
 
         # --- collect ------------------------------------------------------------------
-        buf_obs = {p: torch.zeros(a.horizon, a.envs, shapes[p][0]) for p in ports}
+        buf_obs = {p: torch.zeros(a.horizon, a.envs, *shapes[p]) for p in ports}
         buf_flat = torch.zeros(a.horizon, a.envs, obs_dim)
         buf_act = torch.zeros(a.horizon, a.envs, action_dim)
         buf_logp = torch.zeros(a.horizon, a.envs)
@@ -393,7 +407,7 @@ def main(argv: list) -> int:
 
         with torch.no_grad():
             for t in range(a.horizon):
-                flat = torch.cat([obs[p] for p in ports], dim=1)
+                flat = flatten(obs, ports)
                 mu = next(iter(actor(**obs).values()))[:, 0, :]
                 std = log_std.exp()
                 eps = torch.randn(mu.shape, generator=noise_rng)
@@ -437,15 +451,15 @@ def main(argv: list) -> int:
                         finished.append((float(episode_return[i]), float(episode_steps[i])))
                         episode_return[i] = 0.0
                         episode_steps[i] = 0.0
-                obs = observe(roll, ports, a.envs)
+                obs = observe(roll, shapes, a.envs)
 
-            last_value = value(torch.cat([obs[p] for p in ports], dim=1))
+            last_value = value(flatten(obs, ports))
             advantages, returns = gae(
                 buf_rew, buf_val, buf_done, last_value, a.gamma, a.lam
             )
 
         # --- update -------------------------------------------------------------------
-        flat_obs = {p: buf_obs[p].reshape(rows, -1) for p in ports}
+        flat_obs = {p: buf_obs[p].reshape(rows, *shapes[p]) for p in ports}
         flat_state = buf_flat.reshape(rows, obs_dim)
         flat_act = buf_act.reshape(rows, action_dim)
         flat_logp = buf_logp.reshape(rows)
@@ -569,6 +583,12 @@ def main(argv: list) -> int:
             ),
             encoding="utf-8",
         )
+
+    # The render row, on stderr: stdout is the one JSON line `es train` reads, and a machine's
+    # frame time is not a `training_hash` input (packet M11/X3).
+    render_ms = roll.metrics().get("render_ms_per_frame")
+    if render_ms is not None:
+        sys.stderr.write("render_ms_per_frame %.3f\n" % render_ms)
 
     window = max(1, len(curve) // 10)
     group = optimizer.param_groups[0]

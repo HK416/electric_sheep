@@ -13,9 +13,11 @@ dependencies = ["blake3"]
 # is this file's own parent directory (`python/`), so maturin finds the pure-Python `es` package
 # right next to this file and merges the compiled extension into it. `features = ["python"]` is
 # what turns on the `pyo3` half of `es-py` (see `crates/es-py/Cargo.toml`) — the default
-# workspace build never needs it.
+# workspace build never needs it. `render` (packet M11/X3) is what lets `es_native.Rollout` render
+# an image observation for `train_ppo.py`; it links Vulkan, and a rollout whose Observation IR has
+# no image input builds no renderer and opens no device.
 [tool.maturin]
 manifest-path = "../../crates/es-py/Cargo.toml"
 python-source = ".."
 module-name = "es.es_native"
-features = ["python"]
+features = ["python", "render"]
