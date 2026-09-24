@@ -106,7 +106,12 @@ pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
     let report = generate::repair_loop(&prompt, &mut *provider, rounds);
     print_report(&report);
 
-    if let Some(task) = report.result {
+    if let Some(mut task) = report.result {
+        // The model only reads the scene's hashes in the prompt; the document pins the scene
+        // `--scene` loaded, the one `Env::new` will compare (packet M11/R4).
+        if let Some(scene) = req.scene {
+            task.scene = scene;
+        }
         write_task(Path::new(&out_dir), &task)?;
         Ok(0)
     } else {
@@ -121,13 +126,14 @@ fn next_arg(args: &[String], i: usize) -> Result<String, CliError> {
         .ok_or_else(|| CliError::Usage(HELP.to_owned()))
 }
 
+/// `scene_hash` is the loaded scene's content hash (spec 5.3), the value `Env::new` compares
+/// (packet M11/R4); `asset_hash` stays blake3 of the file bytes, which the spec leaves open.
 fn scene_ref(path: &str) -> Result<es_ir::task::SceneRef, CliError> {
     let bytes = std::fs::read(path).map_err(|e| CliError::Runtime(format!("{path}: {e}")))?;
-    let hash = *blake3::hash(&bytes).as_bytes();
     Ok(es_ir::task::SceneRef {
         path: path.to_owned(),
-        scene_hash: hash,
-        asset_hash: hash,
+        scene_hash: super::backend::load_scene(path)?.scene_hash(),
+        asset_hash: *blake3::hash(&bytes).as_bytes(),
     })
 }
 

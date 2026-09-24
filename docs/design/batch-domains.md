@@ -74,7 +74,9 @@ bytes, hex). Every runner — `es eval run`, `es loop collect`, `es train` / `es
 builds its env there (`es video` only composes the frames an evaluation wrote), so no runner can report a committed `execution_hash` (§5.3)
 for a scene the Task IR does not pin. There is no opt-out: a diagnostic run on an edited scene
 declares that scene's hash in its own Task IR, which is what makes it a different condition.
-`asset_hash` is not checked here.
+`asset_hash` is not checked here. `es task generate --scene` writes the loaded scene's hash;
+the RoboVerse importer's placeholder hash (blake3 of a USD path it cannot load) is refused, as it
+should be.
 
 `reset(None)` resets the whole batch; `reset(Some(&envs))` resets a subset and requires
 `capabilities().supports_reset_subset` (otherwise `EnvError::Physics(Unsupported)`; the backend

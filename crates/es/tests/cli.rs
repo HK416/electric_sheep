@@ -2975,6 +2975,48 @@ fn task_generate_stdin_provider_accepts_a_valid_reply() {
     assert!(dir.join("task.toml").exists(), "{}", stdout(&out));
 }
 
+/// Packet M11/R4: a generated Task IR pins the `--scene` it was generated for by the loaded
+/// scene's content hash, whatever hash the model's reply carried, so `Env::new` accepts it.
+#[test]
+fn task_generate_pins_the_loaded_scene_hash() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let reply = format!(
+        "```toml\n{}\n```",
+        es_ir::serial::task_to_toml(&task_ir_with_reward()).expect("task toml")
+    );
+    let dir = scratch_dir("task-generate-scene");
+    let mut child = bin()
+        .args(["task", "generate", "--prompt", "reach the target"])
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .args(["--provider", "stdin", "--out"])
+        .arg(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn es task generate");
+    child
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(reply.as_bytes())
+        .expect("write reply");
+    let out = child.wait_with_output().expect("es task generate exits");
+    assert!(out.status.success(), "{}", stdout(&out));
+
+    let written = std::fs::read_to_string(dir.join("task.toml")).expect("task.toml");
+    let task = es_ir::serial::task_from_toml(&written).expect("the written task parses");
+    let xml = std::fs::read_to_string(demo_scene_path()).expect("demo scene");
+    let scene = es_assets::parse_mjcf(&xml).expect("parses").scene;
+    assert_eq!(task.scene.scene_hash, scene.scene_hash());
+    assert_eq!(
+        task.scene.asset_hash,
+        *blake3::hash(xml.as_bytes()).as_bytes()
+    );
+}
+
 #[test]
 fn task_generate_reports_failure_when_no_round_validates() {
     let dir = scratch_dir("task-generate-stdin-empty");

@@ -82,7 +82,8 @@ active = [slot * N_obs, min((slot + 1) * N_obs, N_sim))
 (`es video`는 평가가 쓴 프레임을 조합할 뿐이다) 여기서 env를 만들므로, 어떤 실행기도 Task IR이 고정하지 않은 씬에 대해
 커밋된 `execution_hash`(§5.3)를 보고할 수 없다. 우회 옵션은 없다. 편집된 씬으로 하는 진단
 실행은 자기 Task IR에 그 씬의 해시를 선언하며, 그것이 곧 다른 조건이라는 뜻이다.
-`asset_hash`는 여기서 검사하지 않는다.
+`asset_hash`는 여기서 검사하지 않는다. `es task generate --scene`은 로드한 씬의 해시를 쓴다.
+RoboVerse 임포터의 자리표시 해시(로드할 수 없는 USD 경로의 blake3)는 거부되며, 그것이 맞다.
 
 `reset(None)`은 배치 전체를 리셋하고, `reset(Some(&envs))`는 부분 집합을
 리셋하며 `capabilities().supports_reset_subset`을 요구한다(그렇지 않으면

@@ -208,7 +208,11 @@ class Contact:
 
 
 class Task:
-    """`es.Task(name, scene=...)` (spec 14.2)."""
+    """`es.Task(name, scene=...)` (spec 14.2).
+
+    `scene_hash` must be the scene's content hash (`SceneDesc::scene_hash`, spec 5.3): the
+    default of 32 zero bytes is refused by `Env::new` when the task runs (packet M11/R4).
+    """
 
     def __init__(
         self,

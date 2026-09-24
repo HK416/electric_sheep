@@ -40,11 +40,16 @@ crates/es-data/tests/**
 crates/es/tests/**
 crates/es-py/tests/**
 crates/es-py/src/**
+crates/es/src/cmd/generate.rs
+python/es/builder.py
 docs/design/batch-domains.md
 docs/design/batch-domains.ko.md
 docs/packets/M11/P-M11-R4-scene-hash-check.md
 docs/packets/M11/P-M11-R4-scene-hash-check.ko.md
 ```
+
+Extended 2026-09-24 by the coordinator: `crates/es/src/cmd/generate.rs` and `python/es/builder.py`, so a
+generated Task IR pins the loaded scene's hash and the Python builder says a zero hash is refused.
 
 ## oracle
 
