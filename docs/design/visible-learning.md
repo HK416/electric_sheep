@@ -4948,6 +4948,66 @@ seeds — a follow-up, not this packet. The raw frame trees (`frames-train-pt-ti
 `U5/frames-holdout` 3.7 GB, `U5/frames-trainseeds` 0.5 GB) are deleted now that the numbers are
 read.
 
+### 7.38 As built (M11/U6): SVGF on the path-traced row, two training seeds each
+
+Packet `docs/packets/M11/U6-demo-svgf.md`; the denoiser is `renderer.md` section 12 (X6's
+`render.svgf`). U6 is U5 plus one field: `svgf = true` in the sensor's `render` table
+(`task-pt-tick-svgf.toml`, with its observation and evaluation siblings; the augmented
+observation and evaluation are derived as W1a derived U5's). The recipe is `training-u5.toml`
+with only the training seed changed. U5 is also trained again at seed 1, so both rows have
+two seeds (M10 review S-4: one CUDA training carries ±0.3).
+
+**The run.** Oracle server (RTX 4090), `nohup sh ~/artifacts/plan-x/u6/u6.sh`, behind
+`~/artifacts/plan-x/queue/gpu.lock`, 2026-09-23/24.
+
+- **Parity gate:** under `task-pt-tick-svgf`, seed 1, `--expert`, the collector's and the
+  evaluator's ticks 0–2 are md5-identical (three leading frames). Tick 3 differs because the
+  states have parted, as in 7.37.
+- **Collection:** both collections are 200/200 with 103,881 frames. The dataset `content` is
+  `ca915df2…`, the same as U5's, because the frames live beside the dataset. The collections
+  took 6,603 s (SVGF) and 6,176 s (U5 again).
+- **Training:** 20,000 steps, about 330 s each.
+- **Held-out evaluations:** 16 seeds × 6 suites took 9,933 / 10,502 s (U6) and 8,292 s (U5 s1).
+
+| row | training seed | final loss | held-out nominal | training seeds, nominal | `execution_hash` |
+|---|---|---|---|---|---|
+| U5 (`tick`) | 0 (7.37) | 0.0021 | 0.2500 | 0.5000 | `3443a384…` |
+| U5 (`tick`) | 1 | 0.00215 | 0.3750 | 0.3750 | `e1a08fd6…` |
+| **U6 (`tick` + SVGF)** | 0 | 0.00465 | 0.3750 | 0.1875 | `259cf44d…` |
+| **U6 (`tick` + SVGF)** | 1 | 0.00466 | 0.0625 | 0.3125 | `4c8c3da5…` |
+
+| suite (16 held-out seeds) | U5 s0 | U5 s1 | U6 s0 | U6 s1 |
+|---|---|---|---|---|
+| nominal | 0.2500 | 0.3750 | 0.3750 | 0.0625 |
+| light_intensity | 0.4375 | 0.3750 | 0.2500 | 0.1250 |
+| light_direction | 0.2500 | 0.3750 | 0.3750 | 0.0625 |
+| observation_delay | 0.7500 | 0.3750 | 0.0000 | 0.0625 |
+| torque_noise | 0.1875 | 0.3750 | 0.1250 | 0.1250 |
+| backlash | 0.3750 | 0.0625 | 0.0000 | 0.0000 |
+
+The held-out `evaluation_hash` is `d6986812…` for U5 and `d995237f…` for U6; they differ
+because the task differs. `passed = false` in all four.
+
+**Answer: SVGF does not move the row by more than the spread of two training seeds.** On
+held-out nominal:
+
+- U5 is 0.25 / 0.375 (mean 0.31).
+- U6 is 0.375 / 0.0625 (mean 0.22).
+
+U6's own two seeds are 0.31 apart, which is larger than the difference between the two rows'
+means. U6's two-seed mean is below U5's in all six suites, but every one of those gaps is
+within the seed spread. The one clean, repeatable difference is the loss:
+
+- Both SVGF seeds end at 0.0047, to two digits.
+- Both U5 seeds end at 0.0021.
+
+On denoised frames the ACT fits the demonstrations less tightly, and that does not turn into
+held-out success. `light_direction` still equals `nominal` in every row. The
+demo's documents declare no `light.radiance`, so the `Pt` sun X5 exposed is off and that
+suite still measures nothing on this path. The recipe's step count is under-trained for a
+103,881-frame collect (M10 S-2); that is the owner's decision and was not changed here. The
+raw frame trees were deleted after the numbers were read.
+
 ## 8. Safety overlay (V3)
 
 Per rendered frame, V3 appends one record to `events.json`:
