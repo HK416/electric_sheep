@@ -356,7 +356,7 @@ fn task_ir() -> TaskIr {
         schema_version: 1,
         scene: SceneRef {
             path: "fixture.xml".to_owned(),
-            scene_hash: [1; 32],
+            scene_hash: scene().scene_hash(),
             asset_hash: [2; 32],
         },
         graph,

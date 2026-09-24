@@ -75,6 +75,15 @@ active = [slot * N_obs, min((slot + 1) * N_obs, N_sim))
 
 ## 3. 리셋 프로토콜
 
+**씬은 무엇이든 로드되기 전에 검사된다 (packet M11/R4).** `Env::new`는 넘겨받은 씬의
+`SceneDesc::scene_hash()`를 Task IR의 `scene.scene_hash`와 비교하고, 다르면
+`EnvError::Task`로 거부한다. 메시지는 선언된 경로와 두 해시(앞 4바이트, hex)를 밝힌다.
+모든 실행기 — `es eval run`, `es loop collect`, `es train` / `es_native.Rollout` — 가
+(`es video`는 평가가 쓴 프레임을 조합할 뿐이다) 여기서 env를 만들므로, 어떤 실행기도 Task IR이 고정하지 않은 씬에 대해
+커밋된 `execution_hash`(§5.3)를 보고할 수 없다. 우회 옵션은 없다. 편집된 씬으로 하는 진단
+실행은 자기 Task IR에 그 씬의 해시를 선언하며, 그것이 곧 다른 조건이라는 뜻이다.
+`asset_hash`는 여기서 검사하지 않는다.
+
 `reset(None)`은 배치 전체를 리셋하고, `reset(Some(&envs))`는 부분 집합을
 리셋하며 `capabilities().supports_reset_subset`을 요구한다(그렇지 않으면
 `EnvError::Physics(Unsupported)`가 되며, backend가 그 이름을 밝힌다 — 우리가

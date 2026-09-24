@@ -1219,6 +1219,82 @@ fn eval_run_skips_when_backend_or_runtime_unavailable() {
     assert!(text.contains("SKIPPED"), "{text}");
 }
 
+// --- packet M11/R4: a run refuses a scene its Task IR does not pin ---------------------------
+
+/// Packet M11/R4 oracle 2. `es eval run --scene <edited copy>` with the committed evaluation
+/// exits non-zero and names both hashes: `scene_hash` is a hash-chain input (spec 5.3), so a
+/// run on a scene the Task IR does not pin would report the committed `execution_hash` for a
+/// different condition.
+#[test]
+fn eval_run_refuses_an_edited_scene() {
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP eval_run_refuses_an_edited_scene: {reason}");
+        return;
+    }
+    let dir = scratch_dir("r4-edited-scene");
+    // The reach documents: an MLP, so a conforming checkpoint loads without a trained run.
+    let read = |name: &str| std::fs::read_to_string(rl_fixture(name)).expect(name);
+    let mut learning =
+        es_ir::serial::learning_from_toml(&read("learning-reach.toml")).expect("learning");
+    let module = es_policy::lower_to_torch(&learning).expect("the reach graph lowers");
+    let weights = es_policy::weights::write_safetensors(&conforming_checkpoint(&module));
+    learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let policy = dir.join("policy.esb");
+    let bundle = es_compile::PolicyBundle::build(
+        &es_ir::serial::task_from_toml(&read("task-reach.toml")).expect("task"),
+        &es_ir::serial::observation_from_toml(&read("observation-reach.toml")).expect("obs"),
+        &learning,
+        &es_ir::serial::deployment_from_toml(&read("deployment-reach.toml")).expect("deploy"),
+        &weights,
+    )
+    .expect("the reach documents pack");
+    std::fs::write(&policy, bundle).expect("write policy.esb");
+    let xml = std::fs::read_to_string(demo_scene_path()).expect("demo scene");
+    let edited = xml.replacen("damping=\"0.60\"", "damping=\"0.61\"", 1);
+    assert_ne!(edited, xml, "the demo scene carries damping=\"0.60\"");
+    let scene = dir.join("edited.xml");
+    write(&scene, &edited);
+    let short = |x: &str| {
+        let d = es_assets::parse_mjcf(x).expect("parses").scene.scene_hash();
+        format!("{:02x}{:02x}{:02x}{:02x}", d[0], d[1], d[2], d[3])
+    };
+
+    let out = bin()
+        .args(["eval", "run", "--config"])
+        .arg(rl_fixture("evaluation-reach.toml"))
+        .arg("--policy")
+        .arg(&policy)
+        .arg("--scene")
+        .arg(&scene)
+        .arg("--out")
+        .arg(dir.join("out"))
+        .output()
+        .expect("run es");
+    let err = stderr_of(&out);
+    print!("{err}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}
+{err}",
+        stdout(&out)
+    );
+    for needle in [
+        short(&xml),
+        short(&edited),
+        "so101_pick_place.xml".to_owned(),
+    ] {
+        assert!(
+            err.contains(&needle),
+            "`{needle}` not in
+{err}"
+        );
+    }
+}
+
 // --- packet M11/X1: `--backend` on `es eval run` and `es loop collect` ------------------------
 
 /// One `es eval run` or `es loop collect` of the demo documents on `backend`, with `python` as
