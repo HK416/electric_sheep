@@ -1252,6 +1252,52 @@ stage 1의 어떤 숫자도 학습에 관한 결과로 보고하지 않는다(§
 커밋된 `Pt` 문서는 stage 1이 끝까지 돌 때까지 X3의 16 spp, SVGF off(`crates/es/tests/cli.rs`의
 `X7_SPP`, `X7_SVGF`)에 머문다.
 
+**P-M11-R3: CUDA 위의 학습기와 `-pix` 행 (2026-09-24 UTC, `~/artifacts/plan-x/r3/`).**
+`train_ppo.py`는 이제 actor나 value net에 닿는 모든 텐서를 `--device`에 둔다. 잡음과 순서
+생성기는 CPU에 남고, 각 추출은 만들어진 뒤 옮겨진다. `--device cpu`는 이전과 같은 바이트를 쓴다.
+옛 trainer와 새 trainer를 같은 인자로 돌리면 state reach 모듈과 vision 모듈(Windows, `.venv`)
+모두에서 체크포인트(0, 1, 3, 최종), value 파일, stdout, loss curve(`samples_per_sec` 제외)가
+같았고, `train_rl_*` cli 테스트가 통과한다. CPU가 아닌 곳에서는 `use_deterministic_algorithms`가
+`warn_only`로 돌고(이번 실행에서 경고는 출력되지 않았다) cuBLAS에
+`CUBLAS_WORKSPACE_CONFIG=:4096:8`이 주어진다. trainer는 stderr에
+`seconds_per_iteration collect … update …`를 출력한다. X7의 각 행에 `-pix` 형제가 생겼다
+(`observation-`, `evaluation-reach-vision-<row>-pix.toml`, `learning-reach-vision-pix.toml`,
+`training-reach-vision-<row>-pix.toml`): `cube_pose`가 빠진 19폭 `state` 포트이고, task는 부모
+행의 것이다.
+
+서버, 커밋된 16 spp `pt-dr` 문서, recipe의 16 env × 64 step, seed 0, 인터프리터
+`~/venvs/es-lerobot-cuda/bin/python`. 렌더 초는 `render_ms_per_frame` × 1,024 프레임이고,
+rollout은 `collect`에서 렌더를 뺀 값이다.
+
+| 실행 | device | iteration | 초 / iteration (wall) | 렌더 | rollout | 학습기 (`update`) |
+|---|---|---|---|---|---|---|
+| `pt-dr` smoke | cuda | 3 | 7.6 | 5.2 | 1.6 | 0.47 |
+| `pt-dr-pix` smoke | cuda | 3 | 8.7 | 5.6 | 2.3 | 0.47 |
+| `pt-dr` | cuda | 20 | 8.3 | 6.3 | 1.6 | 0.42 |
+| `pt-dr` | cpu | 20 | 28.0 | 6.2 | 2.8 | 18.9 |
+
+학습기는 GPU에서 45배 빠르다(18.9 → 0.42 초). 이제 iteration은 렌더가 좌우한다. 한 seed의
+20 iteration return 곡선(recipe의 segment별 `return`):
+
+- cuda: −11.12, −10.68, −10.41, −10.08, −10.73, −10.77, −10.36, −10.61, −10.58, −10.50, −10.86,
+  −10.93, −10.39, −10.38, −10.42, −10.25, −10.66, −10.71, −10.60, −10.58 (평균 −10.58)
+- cpu: −11.10, −10.50, −10.20, −10.00, −10.73, −10.78, −10.36, −10.62, −10.58, −10.51, −10.86,
+  −10.93, −10.39, −10.39, −10.43, −10.26, −10.66, −10.71, −10.60, −10.58 (평균 −10.56)
+
+둘은 비트 단위로 같지 않고 같다고 주장하지도 않는다(spec 3.5). iteration별 최대 차이는
+0.21(iteration 3)이고 iteration 5부터는 0.015 안에서 일치한다. cuda smoke의 처음 세 return은
+cuda 20 iteration 실행의 것과 같다. 어느 곡선도 20 iteration 안에 학습을 보이지 않으며, 기대한
+것도 아니다. `-pix` smoke의 세 return(−8.91, −16.96, −18.86)은 세 iteration일 뿐 학습에 대해
+아무것도 말하지 않는다.
+
+**새 stage-2 추정** (위 속도에 대한 산술, `Target / Status: unverified`). iteration당 8.3 초인
+`Pt` 16 spp 실행은 4,000 iteration에 ≈ 9.2 h다. `Rs` 행은 cuda에서 돌리지 않았다. X7이 잰 프레임당
+0.52 ms(렌더 0.5 초)와 같은 rollout, 학습기로 보면 iteration당 ≈ 2.6 초, ≈ 2.9 h다. 12 실행
+(4 행 × 3 seed)은 6 × 9.2 + 6 × 2.9 ≈ 평가 전 **73 GPU-시간**으로, CPU 학습기일 때의 ≈ 305 h와
+대비된다. 네 `-pix` 행을 3 seed로 돌리면 같은 만큼이 더 들어, 24 실행 전체가 ≈ **145 h**다.
+stage 1의 4 spp(프레임당 1.56 ms)라면 `Pt` 실행은 iteration당 ≈ 3.6 초, ≈ 4 h이고, 12 실행은
+≈ 41 h, 24 실행은 ≈ 83 h가 된다.
+
 ## 8. 임포터와 어댑터
 
 1절의 규칙 3은 어댑터가 선언하고 코드는 결코 추측하지 않는다고 말한다. `es policy import-rl`의
