@@ -1,0 +1,47 @@
+# Packet M11/X7 row `pt-pix` (packet M11/R3): PPO on the camera-bearing reach task, the overhead sensor on the
+# `Pt` path at stage 1's setting, randomization off
+# (task-reach-vision-pt.toml; docs/design/rl-continuation.md section 7, X7).
+#
+# The recipe is training-reach.toml's -- 16 envs x 64 steps, 4 epochs x 4 minibatches, the same
+# PPO block, lr and budget (4,000 iterations, the state task's measured peak) -- on the vision
+# bundle, with `device = "cuda"`: a ResNet18 on 1,024 images an iteration is not a CPU job. The
+# four X7 recipes differ in `[policy] bundle` and nothing else; seeds 1 and 2 are this file with
+# `[run] seed` changed. `Rollout` renders the 16 envs in one dispatch (X3b).
+#
+# The bundle is the row's documents plus learning-reach-vision-pix.toml and deployment-reach.toml:
+#
+#     ES_PACK_TASK=tests/fixtures/rl/task-reach-vision-pt.toml \
+#     ES_PACK_OBSERVATION=tests/fixtures/rl/observation-reach-vision-pt-pix.toml \
+#     ES_PACK_LEARNING=tests/fixtures/rl/learning-reach-vision-pix.toml \
+#     ES_PACK_DEPLOYMENT=tests/fixtures/rl/deployment-reach.toml \
+#     ES_PACK_OUT=runs/reach-vision-pt-pix/untrained.esb \
+#     cargo test -p es --test cli -- --ignored pack_untrained_bundle
+
+# The `-pix` sibling: the `state` port has no cube_pose (joints and gripper pose, 19
+# wide), so the camera is the only way the policy sees the cube. The task is the
+# `pt` row's own file.
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-vision-pt-pix/untrained.esb"
+
+[rl]
+algo        = "ppo"
+envs        = 16
+horizon     = 64
+epochs      = 4
+minibatches = 4
+gamma       = 0.99
+lam         = 0.95
+clip        = 0.2
+entropy     = 0.005
+value_coef  = 0.5
+
+[run]
+steps         = 4000
+lr            = 3e-4
+seed          = 0
+checkpoint_at = [1000, 2000, 3000]
+device        = "cuda"
+interpreter   = "python"
