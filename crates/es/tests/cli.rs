@@ -1219,6 +1219,82 @@ fn eval_run_skips_when_backend_or_runtime_unavailable() {
     assert!(text.contains("SKIPPED"), "{text}");
 }
 
+// --- packet M11/R4: a run refuses a scene its Task IR does not pin ---------------------------
+
+/// Packet M11/R4 oracle 2. `es eval run --scene <edited copy>` with the committed evaluation
+/// exits non-zero and names both hashes: `scene_hash` is a hash-chain input (spec 5.3), so a
+/// run on a scene the Task IR does not pin would report the committed `execution_hash` for a
+/// different condition.
+#[test]
+fn eval_run_refuses_an_edited_scene() {
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP eval_run_refuses_an_edited_scene: {reason}");
+        return;
+    }
+    let dir = scratch_dir("r4-edited-scene");
+    // The reach documents: an MLP, so a conforming checkpoint loads without a trained run.
+    let read = |name: &str| std::fs::read_to_string(rl_fixture(name)).expect(name);
+    let mut learning =
+        es_ir::serial::learning_from_toml(&read("learning-reach.toml")).expect("learning");
+    let module = es_policy::lower_to_torch(&learning).expect("the reach graph lowers");
+    let weights = es_policy::weights::write_safetensors(&conforming_checkpoint(&module));
+    learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let policy = dir.join("policy.esb");
+    let bundle = es_compile::PolicyBundle::build(
+        &es_ir::serial::task_from_toml(&read("task-reach.toml")).expect("task"),
+        &es_ir::serial::observation_from_toml(&read("observation-reach.toml")).expect("obs"),
+        &learning,
+        &es_ir::serial::deployment_from_toml(&read("deployment-reach.toml")).expect("deploy"),
+        &weights,
+    )
+    .expect("the reach documents pack");
+    std::fs::write(&policy, bundle).expect("write policy.esb");
+    let xml = std::fs::read_to_string(demo_scene_path()).expect("demo scene");
+    let edited = xml.replacen("damping=\"0.60\"", "damping=\"0.61\"", 1);
+    assert_ne!(edited, xml, "the demo scene carries damping=\"0.60\"");
+    let scene = dir.join("edited.xml");
+    write(&scene, &edited);
+    let short = |x: &str| {
+        let d = es_assets::parse_mjcf(x).expect("parses").scene.scene_hash();
+        format!("{:02x}{:02x}{:02x}{:02x}", d[0], d[1], d[2], d[3])
+    };
+
+    let out = bin()
+        .args(["eval", "run", "--config"])
+        .arg(rl_fixture("evaluation-reach.toml"))
+        .arg("--policy")
+        .arg(&policy)
+        .arg("--scene")
+        .arg(&scene)
+        .arg("--out")
+        .arg(dir.join("out"))
+        .output()
+        .expect("run es");
+    let err = stderr_of(&out);
+    print!("{err}");
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "{}
+{err}",
+        stdout(&out)
+    );
+    for needle in [
+        short(&xml),
+        short(&edited),
+        "so101_pick_place.xml".to_owned(),
+    ] {
+        assert!(
+            err.contains(&needle),
+            "`{needle}` not in
+{err}"
+        );
+    }
+}
+
 // --- packet M11/X1: `--backend` on `es eval run` and `es loop collect` ------------------------
 
 /// One `es eval run` or `es loop collect` of the demo documents on `backend`, with `python` as
@@ -2897,6 +2973,48 @@ fn task_generate_stdin_provider_accepts_a_valid_reply() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(dir.join("task.toml").exists(), "{}", stdout(&out));
+}
+
+/// Packet M11/R4: a generated Task IR pins the `--scene` it was generated for by the loaded
+/// scene's content hash, whatever hash the model's reply carried, so `Env::new` accepts it.
+#[test]
+fn task_generate_pins_the_loaded_scene_hash() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    let reply = format!(
+        "```toml\n{}\n```",
+        es_ir::serial::task_to_toml(&task_ir_with_reward()).expect("task toml")
+    );
+    let dir = scratch_dir("task-generate-scene");
+    let mut child = bin()
+        .args(["task", "generate", "--prompt", "reach the target"])
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .args(["--provider", "stdin", "--out"])
+        .arg(&dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn es task generate");
+    child
+        .stdin
+        .as_mut()
+        .expect("piped stdin")
+        .write_all(reply.as_bytes())
+        .expect("write reply");
+    let out = child.wait_with_output().expect("es task generate exits");
+    assert!(out.status.success(), "{}", stdout(&out));
+
+    let written = std::fs::read_to_string(dir.join("task.toml")).expect("task.toml");
+    let task = es_ir::serial::task_from_toml(&written).expect("the written task parses");
+    let xml = std::fs::read_to_string(demo_scene_path()).expect("demo scene");
+    let scene = es_assets::parse_mjcf(&xml).expect("parses").scene;
+    assert_eq!(task.scene.scene_hash, scene.scene_hash());
+    assert_eq!(
+        task.scene.asset_hash,
+        *blake3::hash(xml.as_bytes()).as_bytes()
+    );
 }
 
 #[test]

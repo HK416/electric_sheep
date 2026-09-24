@@ -130,6 +130,18 @@ impl<B: PhysicsBackend> Env<B> {
         domains: &BatchDomains,
         seed: u64,
     ) -> Result<Self, EnvError> {
+        // The scene is a hash-chain input (§5.3): a run on a scene the Task IR does not pin
+        // would report the declared condition's hashes for a different one (packet M11/R4).
+        let loaded = scene.scene_hash();
+        if loaded != task.scene.scene_hash {
+            let short = |d: &[u8; 32]| format!("{:02x}{:02x}{:02x}{:02x}", d[0], d[1], d[2], d[3]);
+            return Err(EnvError::Task(format!(
+                "the Task IR pins scene {} at scene_hash {}…, the loaded scene hashes to {}…",
+                task.scene.path,
+                short(&task.scene.scene_hash),
+                short(&loaded)
+            )));
+        }
         let schedule = Schedule::build(domains)?;
         let n_envs = domains.simulation.batch;
         let model = backend.load(
@@ -694,7 +706,7 @@ pub(crate) mod tests {
             schema_version: 1,
             scene: es_ir::task::SceneRef {
                 path: "fixture.xml".to_owned(),
-                scene_hash: [0; 32],
+                scene_hash: fake_scene().scene_hash(),
                 asset_hash: [0; 32],
             },
             graph,
@@ -1352,6 +1364,7 @@ pub(crate) mod tests {
         task.observation_spec
             .channels
             .insert("rgb".to_owned(), channel);
+        task.scene.scene_hash = scene.scene_hash();
         let mut env = Env::new(&task, &scene, FakeBackend::new(), &domains(1), 7).unwrap();
 
         let mut seen = Vec::new();

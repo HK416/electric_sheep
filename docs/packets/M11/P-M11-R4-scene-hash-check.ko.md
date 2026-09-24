@@ -36,11 +36,16 @@ crates/es-data/tests/**
 crates/es/tests/**
 crates/es-py/tests/**
 crates/es-py/src/**
+crates/es/src/cmd/generate.rs
+python/es/builder.py
 docs/design/batch-domains.md
 docs/design/batch-domains.ko.md
 docs/packets/M11/P-M11-R4-scene-hash-check.md
 docs/packets/M11/P-M11-R4-scene-hash-check.ko.md
 ```
+
+2026-09-24 코디네이터가 확장: `crates/es/src/cmd/generate.rs`와 `python/es/builder.py`. 생성된 Task IR이 로드한
+씬의 해시를 고정하고, Python 빌더가 0 해시는 거부된다고 밝히도록 한다.
 
 ## 오라클
 

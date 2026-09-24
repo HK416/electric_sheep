@@ -67,6 +67,17 @@ per `cycle` observation ticks, and the order is env-ID ascending, as §12.3 requ
 
 ## 3. Reset protocol
 
+**The scene is checked before anything is loaded (packet M11/R4).** `Env::new` compares
+`SceneDesc::scene_hash()` of the scene it is handed with the Task IR's `scene.scene_hash` and
+refuses a mismatch with `EnvError::Task`, naming the declared path and both hashes (first four
+bytes, hex). Every runner — `es eval run`, `es loop collect`, `es train` / `es_native.Rollout` —
+builds its env there (`es video` only composes the frames an evaluation wrote), so no runner can report a committed `execution_hash` (§5.3)
+for a scene the Task IR does not pin. There is no opt-out: a diagnostic run on an edited scene
+declares that scene's hash in its own Task IR, which is what makes it a different condition.
+`asset_hash` is not checked here. `es task generate --scene` writes the loaded scene's hash;
+the RoboVerse importer's placeholder hash (blake3 of a USD path it cannot load) is refused, as it
+should be.
+
 `reset(None)` resets the whole batch; `reset(Some(&envs))` resets a subset and requires
 `capabilities().supports_reset_subset` (otherwise `EnvError::Physics(Unsupported)`; the backend
 names it, we do not emulate it). Per env, in this order:
