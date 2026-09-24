@@ -28,6 +28,16 @@ the rasterizer, and which training renderer transfers better to the other one?**
   suites. Cross-render: a policy trained on `Pt` is evaluated on the `Rs` document and vice versa.
   That comparison is the "which renderer transfers" answer.
 
+**Owner decision 2026-09-24 (the rerun).** After R3 moved the learner to CUDA, the rerun covers
+only the four pixel-only rows (`-pix`, no `cube_pose` in the state): `pt-dr-pix`, `pt-pix`,
+`rs-dr-pix`, `rs-pix`, 3 seeds each, 4,000 iterations, `--device cuda`, the `Pt` rows at **4 spp**.
+The rows with `cube_pose` are not run; they stay in the report as the confound finding. Stage 1
+shrinks to `pt-dr-pix` at 4 spp, SVGF off against on (1,000 iterations, seed 0): the higher mean
+return over the last 100 iterations wins, unless the difference is smaller than the larger of the
+two runs' std over those iterations, in which case SVGF off (the cheaper one) wins. The 4 spp
+documents are new files beside the committed 16 spp ones (`x7_pt_pix_variants`). Budget ≈ 50–55
+GPU-hours; a projection above 65 h stops the run.
+
 ## context
 
 ```
