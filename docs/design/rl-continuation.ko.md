@@ -1007,8 +1007,9 @@ policy gradient(Fujita & Maeda, 2018), 클램프된 차원에 대해 가우시�
 
 ### X7 — 경로 추적기 위의 비전 RL, 무작위화 켬과 끔, 오라클 서버(Linux, RTX 4090) — 초안
 
-패킷 `docs/packets/M11/X7-vision-rl-pt.md`, spec 28.14 wave 3. **초안: stage 1의 선택 규칙을
-stage 1이 돌기 전에 여기 적어 둔다. 측정은 그 뒤에 붙는다.**
+패킷 `docs/packets/M11/X7-vision-rl-pt.md`, spec 28.14 wave 3. **초안: stage 1의 선택 규칙은
+stage 1이 돌기 전에 여기 적었다. 측정은 아래 "측정, 그리고 예산 정지"에 있다. Stage 2는 돌지
+않았다.**
 
 **문서.** `regenerate_x7_documents`(`crates/es/tests/cli.rs`)가 `task-reach-vision.toml`,
 `observation-reach-vision.toml`, `evaluation-reach-vision.toml`로부터 네 행을 쓴다:
@@ -1046,6 +1047,49 @@ on}, 1,000 iterations, seed 0) 각각을 **벽시계 시간당 return 이득**�
 된다. 어떤 행도 이득이 없으면(모든 값 ≤ 0), 이 예산에서 학습함을 보인 행이 없는 것이므로 가장
 싼 행(`wall_clock_s`가 가장 작은 행)을 고른다. 행마다 시드 하나: 선택은 설정이지 주장이 아니며,
 stage 1의 어떤 숫자도 학습에 관한 결과로 보고하지 않는다(§28.14 rule 7).
+
+**측정, 그리고 예산 정지 (2026-09-23/24 UTC, `~/artifacts/plan-x/x7/`).** 인터프리터
+`~/venvs/es-lerobot-cuda/bin/python`(torch 2.11.0+cu129), 이 커밋에서 `render`로 빌드한 `es`와
+`es_native`, CPU 물리 백엔드, 16 env에 걸쳐 배치된 `Rollout`(X3b).
+
+- **`--device cuda`는 돌지 않는다.** 커밋된 레시피로 돌린 5-iteration 스모크 두 개가 모두 첫
+  forward에서 멈췄다: `RuntimeError: Expected all tensors to be on the same device … mat1 is on
+  cpu`(`failed-cuda/smoke-*.log`). `train_ppo.py`는 actor를 장치로 옮기지만 관측과 모든 rollout
+  버퍼는 CPU에 둔다. 상태 전용 실행은 모두 `cpu`로 돌았기 때문에 이것을 만난 적이 없다. 트레이너는
+  이 패킷 밖이므로, 아래 모든 실행은 `device = "cpu"`로 덮어썼고(서버 스크립트의 레시피 단계),
+  그래서 ResNet18 업데이트가 CPU에서 돈다.
+- **스모크, 각 5 iteration, `cpu`:** `pt-dr`(16 spp) iteration당 28.0 s,
+  `render_ms_per_frame` 5.44; `rs-dr` iteration당 23.0 s, 프레임당 0.52 ms. 두 경로 모두에서
+  모든 대상 — render와 물리 — 이 컴파일되고 돌았다.
+- **Stage 1, 돈 한 행** (`pt-dr`, 4 spp, SVGF off, seed 0, 1,000 iterations):
+
+| spp | SVGF | 벽시계 | s / iteration | `render_ms_per_frame` | `initial_return` | `final_return` | 이득 / h | 엔트로피 처음 → 마지막 100 it. |
+|---|---|---|---|---|---|---|---|---|
+| 4 | off | 6.50 h | 23.4 | 1.56 | −8.91 | −10.64 | −0.27 | 5.63 → 7.49 |
+| 4 | on | 돌지 않음 | | | | | | |
+| 8 | off / on | 돌지 않음 | | | | | | |
+| 16 | off / on | 돌지 않음 | | | | | | |
+
+  1,000 iteration 동안 어떤 rollout 에피소드도 성공으로 끝나지 않았고(끝난 에피소드는 모두 200
+  스텝 timeout까지 갔다), 엔트로피는 100-iteration 구간마다 올랐으며, `executed_ne_sampled_rate`는
+  이전의 모든 reach 실행처럼 1.00이었다. §12.4 아홉 지표(`metrics/env-metrics.json`):
+  `physics_steps_per_sec` 27,341; `actions_per_sec` 6,835; `camera_frames_per_sec` 639;
+  `pixels_per_sec` 5.89e6; `observation_gb_per_sec`, `policy_inferences_per_sec`,
+  `p50_end_to_end_latency`, `p95_end_to_end_latency`, `gpu_memory_peak`,
+  `chunk_underrun_rate`는 `null`(S4e처럼 이 경로에서 계측되지 않음).
+- **멈추게 한 추정.** 23.4 s iteration 중 렌더는 1.6 s이고 나머지는 CPU 학습기다. Stage 1의
+  나머지 다섯 행은 ≈ 36 h가 더 걸린다(스모크의 프레임당 렌더 비용으로 4 spp ≈ 6.5 h에서 16 spp
+  ≈ 7.8 h). 레시피의 4,000 iteration에서 stage 2는 평가 전에 12 실행 × ≈ 25–26 h ≈ **305 h**이고,
+  1,000 iteration이면 ≈ 76 h다. 둘 다 이 패킷이 따른 60 GPU-시간 한도를 넘으므로, stage 1의
+  남은 행은 건너뛰었고 stage 2는 시작하지 않았다. 측정된 속도 위의 산술, `Target / Status:
+  unverified`.
+- **문서 안의 교란 요인.** 비전 행은 `observation-reach-vision.toml`의 26폭 `state` 포트를
+  그대로 가지며, 거기에 큐브의 자세(`cube_pose`, 7)가 들어 있다. 그래서 카메라는 상태가 이미
+  정확히 주는 것 이상을 정책에 보여 주지 않고, 이 행들은 "*픽셀로부터* 배우는가"에 답할 수 없다.
+  그 답에는 상태에 `cube_pose`가 없는 행이 필요하다.
+
+커밋된 `Pt` 문서는 stage 1이 끝까지 돌 때까지 X3의 16 spp, SVGF off(`crates/es/tests/cli.rs`의
+`X7_SPP`, `X7_SVGF`)에 머문다.
 
 ## 8. 임포터와 어댑터
 

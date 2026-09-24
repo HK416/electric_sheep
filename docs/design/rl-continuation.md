@@ -1048,7 +1048,8 @@ each run's `metrics/env-metrics.json`, the rest `Target / Status: unverified`.
 ### X7 — vision RL on the path tracer, randomization on and off, oracle server (Linux, RTX 4090) — draft
 
 Packet `docs/packets/M11/X7-vision-rl-pt.md`, spec 28.14 wave 3. **Draft: the stage-1 choice rule
-is written here before stage 1 runs; the measurements follow.**
+was written here before stage 1 ran; the measurements are under "Measured, and a budget stop"
+below. Stage 2 did not run.**
 
 **Documents.** `regenerate_x7_documents` (`crates/es/tests/cli.rs`) writes four rows from
 `task-reach-vision.toml`, `observation-reach-vision.toml` and `evaluation-reach-vision.toml`:
@@ -1087,6 +1088,50 @@ the training setting of stage 2. If no row gains (every value ≤ 0), no row has
 at this budget and the cheapest row (the smallest `wall_clock_s`) is chosen. One seed per row:
 the choice is a setting, not a claim, and no stage-1 number is reported as a result about
 learning (§28.14 rule 7).
+
+**Measured, and a budget stop (2026-09-23/24 UTC, `~/artifacts/plan-x/x7/`).** Interpreter
+`~/venvs/es-lerobot-cuda/bin/python` (torch 2.11.0+cu129), `es` and `es_native` built from this
+commit with `render`, the CPU physics backend, `Rollout` batched over 16 envs (X3b).
+
+- **`--device cuda` does not run.** Both 5-iteration smokes with the committed recipes stopped
+  at the first forward: `RuntimeError: Expected all tensors to be on the same device … mat1 is on
+  cpu` (`failed-cuda/smoke-*.log`). `train_ppo.py` moves the actor to the device but keeps the
+  observation and every rollout buffer on the CPU; the state-only runs never met this because
+  they all ran on `cpu`. The trainer is outside this packet, so every run below overrode
+  `device = "cpu"` (the server script's recipe step), which puts the ResNet18 update on the CPU.
+- **Smokes, 5 iterations each, `cpu`:** `pt-dr` (16 spp) 28.0 s per iteration,
+  `render_ms_per_frame` 5.44; `rs-dr` 23.0 s per iteration, 0.52 ms per frame. Every target —
+  render and physics, on both paths — compiled and ran.
+- **Stage 1, the one row that ran** (`pt-dr`, 4 spp, SVGF off, seed 0, 1,000 iterations):
+
+| spp | SVGF | wall clock | s / iteration | `render_ms_per_frame` | `initial_return` | `final_return` | gain / h | entropy first → last 100 it. |
+|---|---|---|---|---|---|---|---|---|
+| 4 | off | 6.50 h | 23.4 | 1.56 | −8.91 | −10.64 | −0.27 | 5.63 → 7.49 |
+| 4 | on | not run | | | | | | |
+| 8 | off / on | not run | | | | | | |
+| 16 | off / on | not run | | | | | | |
+
+  No rollout episode ended in success in 1,000 iterations (every episode that ended ran to the
+  200-step timeout), the entropy rose in every 100-iteration block, and `executed_ne_sampled_rate`
+  was 1.00, as on every reach run before. The nine §12.4 metrics (`metrics/env-metrics.json`):
+  `physics_steps_per_sec` 27,341; `actions_per_sec` 6,835; `camera_frames_per_sec` 639;
+  `pixels_per_sec` 5.89e6; `observation_gb_per_sec`, `policy_inferences_per_sec`,
+  `p50_end_to_end_latency`, `p95_end_to_end_latency`, `gpu_memory_peak`,
+  `chunk_underrun_rate` `null` (not instrumented on this path, as in S4e).
+- **The estimate that stopped it.** The render is 1.6 s of the 23.4 s iteration; the rest is the
+  CPU learner. Stage 1's other five rows would take ≈ 36 h more (≈ 6.5 h at 4 spp to ≈ 7.8 h at
+  16 spp, from the smokes' per-frame render cost). Stage 2 at the recipes' 4,000 iterations is
+  12 runs × ≈ 25–26 h ≈ **305 h** before evaluations; at 1,000 iterations it is ≈ 76 h. Both are
+  over the 60 GPU-hour limit the packet was run under, so the remaining stage-1 rows were
+  skipped and stage 2 was not started. Arithmetic on measured rates, `Target / Status:
+  unverified`.
+- **A confound in the documents.** The vision rows keep `observation-reach-vision.toml`'s
+  26-wide `state` port, which carries the cube's pose (`cube_pose`, 7). The camera therefore
+  shows the policy nothing the state does not already give it exactly, so these rows cannot answer
+  "learns *from pixels*"; a row without `cube_pose` in the state is needed for that.
+
+The committed `Pt` documents stay at X3's 16 spp, SVGF off (`X7_SPP`, `X7_SVGF` in
+`crates/es/tests/cli.rs`) until a stage 1 runs to its end.
 
 ## 8. The importer and the adapter
 
