@@ -1303,6 +1303,53 @@ commit with `render`, the CPU physics backend, `Rollout` batched over 16 envs (X
 The committed `Pt` documents stay at X3's 16 spp, SVGF off (`X7_SPP`, `X7_SVGF` in
 `crates/es/tests/cli.rs`) until a stage 1 runs to its end.
 
+**P-M11-R3: the learner on CUDA, and the `-pix` rows (2026-09-24 UTC, `~/artifacts/plan-x/r3/`).**
+`train_ppo.py` now puts every tensor that meets the actor or the value net on `--device`; the
+noise and order generators stay on the CPU and each draw is moved after it is made. `--device
+cpu` writes the bytes it wrote before: the old and the new trainer, same arguments, gave equal
+checkpoints (0, 1, 3, final), value file, stdout and loss curve (without `samples_per_sec`) on
+the state reach module and on the vision module (Windows, `.venv`), and the `train_rl_*` cli tests
+pass. Off the CPU, `use_deterministic_algorithms` runs with `warn_only` (no warning was printed in
+these runs) and cuBLAS gets `CUBLAS_WORKSPACE_CONFIG=:4096:8`. The trainer prints
+`seconds_per_iteration collect … update …` on stderr. Each X7 row has a `-pix` sibling
+(`observation-`, `evaluation-reach-vision-<row>-pix.toml`, `learning-reach-vision-pix.toml`,
+`training-reach-vision-<row>-pix.toml`): the `state` port without `cube_pose`, 19 wide; the task is
+the parent row's.
+
+Server, the committed 16 spp `pt-dr` documents, the recipe's 16 envs × 64 steps, seed 0,
+interpreter `~/venvs/es-lerobot-cuda/bin/python`. Render seconds are `render_ms_per_frame` ×
+1,024 frames; rollout is `collect` minus render.
+
+| run | device | iterations | s / iteration (wall) | render | rollout | learner (`update`) |
+|---|---|---|---|---|---|---|
+| `pt-dr` smoke | cuda | 3 | 7.6 | 5.2 | 1.6 | 0.47 |
+| `pt-dr-pix` smoke | cuda | 3 | 8.7 | 5.6 | 2.3 | 0.47 |
+| `pt-dr` | cuda | 20 | 8.3 | 6.3 | 1.6 | 0.42 |
+| `pt-dr` | cpu | 20 | 28.0 | 6.2 | 2.8 | 18.9 |
+
+The learner is 45× faster on the GPU (18.9 → 0.42 s); the iteration is now render-bound. The
+20-iteration return curves from one seed (the recipe's per-segment `return`):
+
+- cuda: −11.12, −10.68, −10.41, −10.08, −10.73, −10.77, −10.36, −10.61, −10.58, −10.50, −10.86,
+  −10.93, −10.39, −10.38, −10.42, −10.25, −10.66, −10.71, −10.60, −10.58 (mean −10.58)
+- cpu: −11.10, −10.50, −10.20, −10.00, −10.73, −10.78, −10.36, −10.62, −10.58, −10.51, −10.86,
+  −10.93, −10.39, −10.39, −10.43, −10.26, −10.66, −10.71, −10.60, −10.58 (mean −10.56)
+
+They are not bitwise equal and are not claimed to be (spec 3.5): the largest per-iteration gap
+is 0.21 (iteration 3) and from iteration 5 on they agree to within 0.015. The cuda smoke's first
+three returns equal the cuda 20-iteration run's. Neither curve shows learning in 20 iterations,
+and none was expected. The `-pix` smoke's three returns (−8.91, −16.96, −18.86) are three
+iterations and say nothing about learning.
+
+**A new stage-2 estimate** (arithmetic on the rates above, `Target / Status: unverified`). A `Pt`
+16 spp run at 8.3 s per iteration is ≈ 9.2 h for 4,000 iterations. An `Rs` row was not run on
+cuda; with X7's measured 0.52 ms per frame (0.5 s of render), the same rollout and learner it
+is ≈ 2.6 s per iteration, ≈ 2.9 h. The 12 runs (4 rows × 3 seeds) are 6 × 9.2 + 6 × 2.9 ≈
+**73 GPU-hours** before evaluations, against ≈ 305 h with the CPU learner. The four `-pix` rows
+at 3 seeds cost the same again, ≈ **145 h** for all 24 runs. At stage 1's 4 spp (1.56 ms per
+frame) a `Pt` run would be ≈ 3.6 s per iteration, ≈ 4 h, which would put the 12 runs at ≈ 41 h
+and all 24 at ≈ 83 h.
+
 ## 8. The importer and the adapter
 
 Rule 3 of section 1 says the adapter declares and code never guesses. This is what that comes

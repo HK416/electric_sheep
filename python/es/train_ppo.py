@@ -90,6 +90,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -201,11 +202,12 @@ def open_rollout(docs: Path, seed: int, n_envs: int, backend: str = "mujoco-cpu"
         )
 
 
-def observe(roll, shapes: dict, n_envs: int) -> dict:
+def observe(roll, shapes: dict, n_envs: int, device="cpu") -> dict:
     """`{port: [n_envs, *shape]}` as f32 tensors, `shape` being the port's own in
     `contract.json` -- `[dim]` for a state port, `[C, H, W]` for an image port (packet M11/X3),
     which is the lowered module's layout because the lowering wrote that file from the same IR.
-    `Rollout.observe` hands each port back flat and row-major by env; nothing is transposed."""
+    `Rollout.observe` hands each port back flat and row-major by env; nothing is transposed.
+    The tensors are built on the CPU and then moved to `device` (packet M11/R3)."""
     raw = roll.observe()
     missing = [p for p in shapes if p not in raw]
     if missing:
@@ -215,7 +217,7 @@ def observe(roll, shapes: dict, n_envs: int) -> dict:
             % (sorted(raw), missing)
         )
     return {
-        p: torch.tensor(raw[p], dtype=torch.float32).reshape(n_envs, *shape)
+        p: torch.tensor(raw[p], dtype=torch.float32).reshape(n_envs, *shape).to(device)
         for p, shape in shapes.items()
     }
 
@@ -309,7 +311,14 @@ def main(argv: list) -> int:
     # Every RNG this run reads is seeded and local. `use_deterministic_algorithms` turns a
     # non-deterministic kernel into an error rather than a silently different number, which is
     # the only way the two-runs oracle can mean anything.
-    torch.use_deterministic_algorithms(True)
+    if a.device == "cpu":
+        torch.use_deterministic_algorithms(True)
+    else:
+        # Off the CPU the run is not tier 1 anyway (spec 3.5), and some CUDA backward kernels
+        # have no deterministic variant: the flag warns there instead of stopping the run
+        # (packet M11/R3). cuBLAS still needs its workspace pinned for its deterministic path.
+        os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+        torch.use_deterministic_algorithms(True, warn_only=True)
     torch.manual_seed(a.seed)
     device = torch.device(a.device)
 
@@ -337,7 +346,7 @@ def main(argv: list) -> int:
         )
     roll.reset(None)
 
-    obs = observe(roll, shapes, a.envs)
+    obs = observe(roll, shapes, a.envs, device)
     obs_dim = int(flatten(obs, ports).shape[1])
     value = Value(obs_dim).to(device)
 
@@ -382,9 +391,10 @@ def main(argv: list) -> int:
     # Per-env episode bookkeeping that survives an iteration boundary: an episode is not the
     # same thing as a rollout segment, and reporting the segment sum as "return" would make
     # the number a property of `--horizon` (design note section 6).
-    episode_return = torch.zeros(a.envs)
-    episode_steps = torch.zeros(a.envs)
+    episode_return = torch.zeros(a.envs, device=device)
+    episode_steps = torch.zeros(a.envs, device=device)
     started = time.perf_counter()
+    collect_s, update_s = 0.0, 0.0
 
     for iteration in range(a.iterations):
         lr_now = (
@@ -397,13 +407,16 @@ def main(argv: list) -> int:
         applied_lr.append(lr_now)
 
         # --- collect ------------------------------------------------------------------
-        buf_obs = {p: torch.zeros(a.horizon, a.envs, *shapes[p]) for p in ports}
-        buf_flat = torch.zeros(a.horizon, a.envs, obs_dim)
-        buf_act = torch.zeros(a.horizon, a.envs, action_dim)
-        buf_logp = torch.zeros(a.horizon, a.envs)
-        buf_val = torch.zeros(a.horizon, a.envs)
-        buf_rew = torch.zeros(a.horizon, a.envs)
-        buf_done = torch.zeros(a.horizon, a.envs)
+        mark = time.perf_counter()
+        buf_obs = {
+            p: torch.zeros(a.horizon, a.envs, *shapes[p], device=device) for p in ports
+        }
+        buf_flat = torch.zeros(a.horizon, a.envs, obs_dim, device=device)
+        buf_act = torch.zeros(a.horizon, a.envs, action_dim, device=device)
+        buf_logp = torch.zeros(a.horizon, a.envs, device=device)
+        buf_val = torch.zeros(a.horizon, a.envs, device=device)
+        buf_rew = torch.zeros(a.horizon, a.envs, device=device)
+        buf_done = torch.zeros(a.horizon, a.envs, device=device)
         violations, clamped, finished = 0, 0, []
 
         with torch.no_grad():
@@ -411,7 +424,9 @@ def main(argv: list) -> int:
                 flat = flatten(obs, ports)
                 mu = next(iter(actor(**obs).values()))[:, 0, :]
                 std = log_std.exp()
-                eps = torch.randn(mu.shape, generator=noise_rng)
+                # Drawn on the CPU generator and then moved: the draw is the same on every
+                # device (packet M11/R3).
+                eps = torch.randn(mu.shape, generator=noise_rng).to(device)
                 action = mu + std * eps
                 logp = normal_logp(action, mu, log_std)
 
@@ -425,8 +440,10 @@ def main(argv: list) -> int:
                 executed, events, rewards, dones = roll.act(
                     action.reshape(-1).double().tolist()
                 )
-                executed = torch.tensor(executed, dtype=torch.float32).reshape(
-                    a.envs, action_dim
+                executed = (
+                    torch.tensor(executed, dtype=torch.float32)
+                    .reshape(a.envs, action_dim)
+                    .to(device)
                 )
                 violations += sum(1 for bits in events if bits != 0)
                 # Against the *sample*, whichever estimator is in use: this row is what the
@@ -440,10 +457,10 @@ def main(argv: list) -> int:
                     # -- is the one it always had.
                     buf_act[t] = executed
                     buf_logp[t] = normal_logp(executed, mu, log_std)
-                buf_rew[t] = torch.tensor(rewards, dtype=torch.float32)
+                buf_rew[t] = torch.tensor(rewards, dtype=torch.float32).to(device)
                 buf_done[t] = torch.tensor(
                     [1.0 if d else 0.0 for d in dones], dtype=torch.float32
-                )
+                ).to(device)
 
                 episode_return += buf_rew[t]
                 episode_steps += 1.0
@@ -452,7 +469,7 @@ def main(argv: list) -> int:
                         finished.append((float(episode_return[i]), float(episode_steps[i])))
                         episode_return[i] = 0.0
                         episode_steps[i] = 0.0
-                obs = observe(roll, shapes, a.envs)
+                obs = observe(roll, shapes, a.envs, device)
 
             last_value = value(flatten(obs, ports))
             advantages, returns = gae(
@@ -460,6 +477,8 @@ def main(argv: list) -> int:
             )
 
         # --- update -------------------------------------------------------------------
+        collect_s += time.perf_counter() - mark
+        mark = time.perf_counter()
         flat_obs = {p: buf_obs[p].reshape(rows, *shapes[p]) for p in ports}
         flat_state = buf_flat.reshape(rows, obs_dim)
         flat_act = buf_act.reshape(rows, action_dim)
@@ -473,7 +492,7 @@ def main(argv: list) -> int:
 
         last = {"loss": 0.0, "policy": 0.0, "value": 0.0, "entropy": 0.0}
         for _ in range(a.epochs):
-            perm = torch.randperm(rows, generator=order_rng)
+            perm = torch.randperm(rows, generator=order_rng).to(device)
             for start in range(0, rows, minibatch):
                 idx = perm[start : start + minibatch]
                 inputs = {p: flat_obs[p][idx] for p in ports}
@@ -504,6 +523,7 @@ def main(argv: list) -> int:
                     "entropy": float(entropy.detach()),
                 }
 
+        update_s += time.perf_counter() - mark
         elapsed = time.perf_counter() - started
         curve.append(
             {
@@ -559,8 +579,8 @@ def main(argv: list) -> int:
         # `value.*` and `log_std`, in one file, under `training/`: the state a resumed run
         # needs and a deployment never does. `es policy pack` would refuse these keys, which
         # is the structural half of "never packed" (design note rule 1).
-        tensors = {"log_std": log_std.detach()}
-        tensors.update({"value." + k: v for k, v in value.state_dict().items()})
+        tensors = {"log_std": log_std.detach().cpu()}
+        tensors.update({"value." + k: v.cpu() for k, v in value.state_dict().items()})
         write_safetensors(a.value_out, tensors)
     if a.loss_curve:
         a.loss_curve.write_text(json.dumps(curve), encoding="utf-8")
@@ -590,6 +610,14 @@ def main(argv: list) -> int:
     render_ms = roll.metrics().get("render_ms_per_frame")
     if render_ms is not None:
         sys.stderr.write("render_ms_per_frame %.3f\n" % render_ms)
+    # Where an iteration's seconds went, on stderr for the same reason (packet M11/R3):
+    # `collect` is the rollout (env, plane, render and the no-grad forwards), `update` the
+    # learner. `.tolist()` and `float(loss)` synchronize the device, so both are wall clock.
+    if curve:
+        sys.stderr.write(
+            "seconds_per_iteration collect %.3f update %.3f\n"
+            % (collect_s / len(curve), update_s / len(curve))
+        )
 
     window = max(1, len(curve) // 10)
     group = optimizer.param_groups[0]
