@@ -6992,12 +6992,19 @@ fn quadruped_evaluation(task: &TaskIr, observation: &ObservationIr) -> Evaluatio
 /// projected gravity, joint velocities, the previous action and the joystick command. This
 /// test pins the refusal *by its message* so that the day the capture path grows base state,
 /// this test fails and is updated rather than quietly staying green over a gap.
+///
+/// The joystick command is the first part of that gap a run reaches: `Env::new` resolves the
+/// task's `command.*` randomization targets before the capture path is planned (the plan needs
+/// the env's model), and no runtime state holds a command, so the env refuses the target by
+/// name. That refusal is the gap's; any other `1`, the checkpoint refusal included, is not.
 #[test]
 fn quadruped_eval_run_names_the_observation_gap() {
     let dir = scratch_dir("quadruped-eval-run");
-    let (task, observation, learning, deployment) = quadruped_documents();
-    let weights = b"es-m6-b1-untrained-placeholder".to_vec();
-    let mut learning = learning;
+    let (task, observation, mut learning, deployment) = quadruped_documents();
+    // Every tensor the lowered graph asks for, at its lowered shape: the runtime checks the
+    // checkpoint against the lowering (spec 8.7) before it reaches the observation gap.
+    let module = es_policy::lower_to_torch(&learning).expect("the quadruped graph lowers");
+    let weights = es_policy::weights::write_safetensors(&conforming_checkpoint(&module));
     learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
         path: "policy.safetensors".to_owned(),
         hash: *blake3::hash(&weights).as_bytes(),
@@ -7039,7 +7046,9 @@ fn quadruped_eval_run_names_the_observation_gap() {
         }
         Some(1) => {
             assert!(
-                text.contains("joint positions") || text.contains("is none of"),
+                text.contains("joint positions")
+                    || text.contains("is none of")
+                    || text.contains("randomization target \"command."),
                 "eval run failed for a reason that is not the known observation gap:\n{text}"
             );
             assert!(
