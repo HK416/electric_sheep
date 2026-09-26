@@ -53,6 +53,10 @@ a    = mu + exp(log_std) * eps           # log_std: training-only, state-indepen
 
 가치 헤드는 Observation IR의 출력 포트들의 결합 위의 별도 MLP이고, `train_ppo.py`에서만 만들어지고
 학습된다. 재개를 위해 `training/value.safetensors`에 쓰이며 번들로 패킹되는 일은 결코 없다.
+`[rl] critic = "privileged"`(패킷 M11/R10)는 그 대신 모든 비이미지 포트와 `Rollout.qpos`를
+읽게 만들어서, 배포에는 결코 없는 시뮬레이터 상태(큐브의 자유 관절)가 기준선에는 닿고 어떤
+픽셀에도 닿지 않게 한다; 부재는 `"observation"`이며, 이는 부재처럼 직렬화된다. 7절의 R10 행이
+그 측정이다.
 
 ### 2a. 그래디언트를 어느 행동에서 계산하는가(`[rl] estimator`, 패킷 M9/R5)
 
@@ -1403,6 +1407,120 @@ task이자 두 observation이며, 평가 문서는 자신이 이름 붙인 task�
    2.76–2.80 h 대비 3.41–4.12 h가 된다(stage 1에서 SVGF는 iteration당 렌더 0.2 초를 더한다).**
 3. **답하지 못했다:** 배운 정책이 없어 비교할 전이가 없고, 렌더러가 task의 일부이므로 해시
    체인이 교차 렌더 평가를 XIR-040으로 거부한다.
+
+### R10 — 특권 크리틱을 쓴 픽셀 PPO, 오라클 서버(Linux, RTX 4090), 2026-09-26 UTC
+
+패킷 `docs/packets/M11/P-M11-R10-vision-rl-critic.md`. 이 패킷은 질문을 두 개 물었고, 무엇이든
+돌기 전에 stage-1 규칙을 고정해 두었다.
+
+**코드.** `[rl] critic = "observation" | "privileged"`는 학습 레시피에서 `estimator` 곁에 놓인다.
+부재이거나 `"observation"`으로 명시되면 부재처럼 직렬화되므로, X7의 `rs-pix` 레시피는 패킷 이전에
+가졌던 `identity_hash`(`7b3e8019…`, `crates/es-data/tests/training_critic.rs`에 고정됨)를 그대로
+갖는다. `"privileged"`는 `training/config.json`에 있고 해시를 움직이며, `train_ppo.py`에 argv의
+마지막 `--critic privileged`로 닿는다. 특권 가치 네트워크는 같은 64-64 tanh MLP지만, 입력은 모든
+비이미지 포트(`contract.json`의 `[dim]` 모양)에 `Rollout.qpos(env)`를 더한 것이며, 둘 다 같은
+상태에서 읽힌다. `-pix` 행들에서 이는 19 + `nq` 13 = 32개의 입력이다. 액터는 바뀌지 않았고, 가치
+네트워크는 여전히 결코 패킹되지 않는다. `[rl]` 경로 위의 `[policy] base_model`은 이제
+`train_act.py` 자신의 `init_backbone`을 거쳐 `train_ppo.py`에 `--init-backbone`으로 닿고,
+`base_model.lock`을 채운다. 이 패킷 이전에는 레시피가 받아들여지고 백본이 검증되긴 했지만, 플랜은
+어떤 플래그도 넘기지 않았고 락은 `none`을 읽었다.
+
+오라클, 모두 `.venv`를 쓴 Windows에서:
+
+* `training_critic.rs`는 3개 중 3개를 통과한다.
+* `train_rl_privileged_critic_is_bitwise_and_reads_state`: CPU에서 2 iteration × 2 env × 8
+  step을 두 번 돈다. 체크포인트와 가치 파일은 비트 단위로 같고, `value.net.0.weight`는
+  `[64, 32]`다.
+* `train_r10_dry_run_plans`: 갈래-P 플랜은 각각 해당 행에 대한 X7의 플랜에 플래그 하나를 더한
+  것이다. `plan-reach-vision-rs[-dr]-pix-critic.txt`는 새 파일이다.
+* HEAD의 `train_ppo.py`와 이번 것은, 같은 인자와 비전 모듈에 대한 기본 크리틱으로, 같은
+  체크포인트(0, 3, final), 가치 파일, stdout, loss curve(`samples_per_sec` 제외)를 쓴다.
+* 모든 `train_rl_*` 테스트가 통과한다. `verify-goldens`는 추가 두 건과 수정 0건을 보고한다.
+
+**갈래 PI는 돌기 전에 멈췄다.** 파이프라인의 두 부분이 픽셀을 스케일해야 했을 텐데, 둘 다 그러지
+않는다:
+
+* `-pix` Observation IR은 이미지 체인을 `Dequantize → Normalize { Range 0..1 }`로 끝맺는다.
+* 로워링은 그 텐서에 대해 `_frozen_backbone(...)`을 직접 호출하며(`lower/torch.rs`), 그 사이에
+  ImageNet mean/std가 없다.
+
+그래서 ImageNet ResNet18은, 자신의 FrozenBatchNorm 통계가 맞춰진 표준화된 입력 대신 `[0, 1]`
+픽셀을 읽게 된다. 그 정규화를 더하는 것은 이 패킷 밖의 IR 결정이다. 그러므로 `-imagenet` 문서도
+PI 레시피도 쓰지 않았다.
+
+**Stage 1** (`~/artifacts/plan-x/r10/`, 코드 `82db6db`, `rs-pix`, seed 0, 1,000 iterations,
+`--device cuda`, 인터프리터 `~/venvs/es-lerobot-cuda/bin/python`). 기준선은 X7의 `rs-pix-s0`
+곡선(`~/artifacts/plan-x/x7b/out/rs-pix-s0/metrics/loss-curve.json`)이며, 다시 돌리지 않았다.
+구간은 900–999회 반복이고, 모집단 표준편차를 쓴다.
+
+| 갈래 | 벽시계 | 초 / it. | 렌더 | rollout | 학습기 | 900–999 평균 return (표준편차) | 기준선 대비 격차 | 통과? |
+|---|---|---|---|---|---|---|---|---|
+| 기준선(X7 `rs-pix-s0`) | — | 2.49 | 0.54 | 1.54 | 0.417 | −18.623 (0.360) | — | — |
+| P(특권 크리틱, from-scratch 인코더) | 0.721 h | 2.60 | 0.56 | 1.62 | 0.414 | −18.620 (0.361) | +0.003 | 아니오(> 0.361 필요) |
+| PI(특권 크리틱, 얼린 ImageNet 인코더) | 돌지 않음 | | | | | | | 멈춤(정규화) |
+
+**어느 갈래도 통과하지 못했으므로, 규칙에 따라 패킷은 여기서 멈추고, 다음 패킷은
+state-to-pixel DAgger(arXiv:2412.13662)다.** Stage 2는 시작하지 않았다. P가 통과했다면 stage 2는
+18.4 GPU-시간으로 추정되어, 30시간 예산 안에 들었을 것이다. GPU 락은 총 0.73 h 잡혔다: stage 1이
+0.72 h를 썼고, 아래의 진단이 17초를 썼다.
+
+X7의 실행 곁의 이 실행, 가치 손실 / 엔트로피 / return:
+
+| iteration | 0 | 1 | 100 | 500 | 999 | 900–999 평균 |
+|---|---|---|---|---|---|---|
+| X7 `rs-pix-s0` | 0.42 / 5.52 / −8.90 | 7.82 / 5.52 / −16.08 | 2.90 / 5.69 / −18.70 | 2.16 / 6.45 / −18.24 | 35.06 / 7.36 / −18.73 | 13.07 / 7.27 / −18.62 |
+| P | 2.07 / 5.52 / −8.90 | 9.90 / 5.52 / −16.07 | 2.88 / 5.70 / −18.70 | 2.16 / 6.46 / −18.24 | 35.03 / 7.38 / −18.74 | 13.06 / 7.29 / −18.62 |
+
+두 실행은 가치 네트워크가 무엇을 읽는지에서만 다르다. iteration별 return은 1,000회 반복 전체에
+걸쳐 0.036 이내로, 평균으로는 0.0056 이내로 일치한다. 가치 손실은 시작 시점에는
+다르지만(iteration 0에서 0.42 대 2.07), iteration 100부터는 iteration당 2.7 % 이내로(평균
+0.23 %) 일치한다. 엔트로피는 둘 다 오른다. `envelope_violation_rate`와
+`executed_ne_sampled_rate`는 모든 iteration에서 1.00이었다.
+
+9지표(`metrics/env-metrics.json`)는 다음과 같았다:
+
+| 지표 | 값 |
+|---|---|
+| `physics_steps_per_sec` | 43,642 |
+| `actions_per_sec` | 10,911 |
+| `camera_frames_per_sec` | 1,840 |
+| `pixels_per_sec` | 1.70e7 |
+| `observation_gb_per_sec`, `policy_inferences_per_sec`, `p50_end_to_end_latency`, `p95_end_to_end_latency`, `gpu_memory_peak`, `chunk_underrun_rate` | `null`(계측되지 않음) |
+
+**왜 크리틱이 여기서 문제가 될 수 없는가** (`~/artifacts/plan-x/r10/diag/`, `diag.py`). 각
+액터는 `rs-pix` 문서에서 시드 0으로부터, 자신의 결정론적 `mu`로 16개 env × 64 스텝을 몰았다.
+헤드의 `Linear`에 건 훅이 `tanh` 이전 값인 `z`를 기록했다.
+
+| 액터 | 구간 return | 플레인이 행동을 바꿨는지 | 평균 \|z\| | \|z\| > 3의 비율 |
+|---|---|---|---|---|
+| 학습되지 않음(로워링의 추출, 시드 0) | −8.58 | 0.995 | 0.24 | 0.00 |
+| P, iteration 1,000 | −18.02 | 1.00 | 20.9 | 1.00 |
+| X7 `rs-pix-s0`, iteration 4,000 | −18.02 | 1.00 | 19.1 | 1.00 |
+| 상수 행동 0(정책 없음) | −14.36 | 0.00 | — | — |
+| 상수 행동 0.5(정책 없음) | −8.37 | 0.14 | — | — |
+
+두 학습된 액터 모두 모든 채널의 `tanh`를 포화로 밀어 넣었다. |z| > 3에서 `tanh`는 그 경계의
+0.5 % 이내이고 그레이디언트는 1 % 미만이다. 그래서 `mu`는 행동 범위의 한쪽 구석에 앉고, 플레인은
+매번 같은 방식으로 그것을 클램프하며, 두 액터는 같은 return을 낸다.
+
+환경은 실제로 행동에 반응한다: 관측을 무시하는 두 상수는 각각 −14.4와 −8.4를 내고, 학습되지 않은
+액터는 −8.6을 낸다. 붕괴는 첫 업데이트에서 일어난다. return은 두 실행 모두에서 iteration 0의
+−8.9에서 iteration 1의 −16.1로 떨어지며, 이는 두 크리틱이 크게 갈릴 수 있기 전이다.
+
+이것은 S4c의 실패(그레이디언트 0의 포화된 `tanh`)가 다시, 이번에는 from-scratch ResNet18 위에서
+일어난 것이다. 가치 네트워크는 그 아래에 있다: 출력 그레이디언트가 0인 액터는 더 나은 기준선으로도
+움직일 수 없다. 이것은 규칙이 적용된 뒤에 이루어진 관찰이며, 규칙의 결정은 그대로 선다. 이는 또한
+R10의 전제("원인은 엔벨로프가 아니라 레시피에 있다")가 부분적으로만 성립함을 말한다. 원인은
+크리틱이 아니라 액터의 첫 업데이트에 있다.
+
+*패킷의 질문.*
+
+1. **아니다.** `qpos`와 상태 포트를 읽는 크리틱을 두어도, 래스터라이저 위의 픽셀만 보는 PPO는
+   1,000 iteration 동안 X7의 픽셀-크리틱 실행을 iteration당 0.036 return 이내로 따라갔다
+   (900–999회 반복에서 −18.620 대 −18.623). 그 시점에 두 액터 모두 이미 `tanh`가 포화되어
+   있었다.
+2. **측정하지 못했다.** ImageNet 갈래는, `Normalized{0,1}` 포트와 사전학습 백본 사이의 무엇도
+   ImageNet의 입력 정규화를 적용하지 않기 때문에 멈췄다.
 
 ## 8. 임포터와 어댑터
 
