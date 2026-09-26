@@ -56,7 +56,10 @@ from it instead of a constant.
 
 The value head is a separate MLP over the concatenation of the Observation IR's output ports,
 built and trained only in `train_ppo.py`. It is written to `training/value.safetensors` for
-resumption and is never packed into a bundle.
+resumption and is never packed into a bundle. `[rl] critic = "privileged"` (packet M11/R10)
+makes it read every non-image port and `Rollout.qpos` instead, so simulator state a deployment
+never has (the cube's free joint) reaches the baseline and no pixel does; absent is
+`"observation"`, which serialises like absence. Section 7's R10 row is the measurement.
 
 ### 2a. Which action the gradient is computed at (`[rl] estimator`, packet M9/R5)
 
@@ -1462,6 +1465,123 @@ this packet works around.
    3.41–4.12 h against 2.76–2.80 h (SVGF adds 0.2 s of render per iteration in stage 1).**
 3. **Unanswered:** no policy learned, so there is no transfer to compare, and the hash chain
    refuses the cross-render evaluation with XIR-040 because the renderer is part of the task.
+
+### R10 — pixel PPO with a privileged critic, oracle server (Linux, RTX 4090), 2026-09-26 UTC
+
+Packet `docs/packets/M11/P-M11-R10-vision-rl-critic.md`. The packet asked two questions, and it
+fixed the stage-1 rule before anything ran.
+
+**Code.** `[rl] critic = "observation" | "privileged"` sits in the training recipe beside
+`estimator`. Absent, or spelled out at `"observation"`, it serialises like absence, so X7's
+`rs-pix` recipe keeps the `identity_hash` it had before the packet (`7b3e8019…`, pinned in
+`crates/es-data/tests/training_critic.rs`). `"privileged"` is in `training/config.json` and moves
+the hash, and it reaches `train_ppo.py` as `--critic privileged`, last in the argv. The privileged
+value network is the same 64-64 tanh MLP, but its input is every non-image port (a `[dim]` shape
+in `contract.json`) plus `Rollout.qpos(env)`, both read at the same state. On the `-pix` rows that
+is 19 + `nq` 13 = 32 inputs. The actor is unchanged, and the value network is still never packed.
+`[policy] base_model` on the `[rl]` route now reaches `train_ppo.py` as `--init-backbone`, through
+`train_act.py`'s own `init_backbone`, and fills `base_model.lock`. Before this packet the recipe
+was accepted and the backbone verified, but the plan passed no flag and the lock read `none`.
+
+Oracles, all on Windows with `.venv`:
+
+* `training_critic.rs` passes 3 of 3.
+* `train_rl_privileged_critic_is_bitwise_and_reads_state`: 2 iterations × 2 envs × 8 steps on
+  the CPU, run twice. The checkpoint and the value file are bitwise equal, and
+  `value.net.0.weight` is `[64, 32]`.
+* `train_r10_dry_run_plans`: each arm-P plan is X7's plan for the row plus the one flag.
+  `plan-reach-vision-rs[-dr]-pix-critic.txt` are new files.
+* HEAD's `train_ppo.py` and this one, with the same arguments and the default critic on the
+  vision module, write equal checkpoints (0, 3, final), value file, stdout and loss curve (the
+  curve without `samples_per_sec`).
+* Every `train_rl_*` test passes. `verify-goldens` reports two additions and nothing modified.
+
+**Arm PI stopped before it ran.** Two parts of the pipeline would have to scale the pixels, and
+neither does:
+
+* The `-pix` Observation IR ends the image chain with `Dequantize → Normalize { Range 0..1 }`.
+* The lowering calls `_frozen_backbone(...)` on that tensor directly (`lower/torch.rs`), with no
+  ImageNet mean/std in between.
+
+So an ImageNet ResNet18 would read `[0, 1]` pixels instead of the standardised input its
+FrozenBatchNorm statistics were fitted to. Adding that normalization is an IR decision outside
+this packet. Therefore no `-imagenet` document and no PI recipe were written.
+
+**Stage 1** (`~/artifacts/plan-x/r10/`, code `82db6db`, `rs-pix`, seed 0, 1,000 iterations,
+`--device cuda`, interpreter `~/venvs/es-lerobot-cuda/bin/python`). The baseline is X7's
+`rs-pix-s0` curve (`~/artifacts/plan-x/x7b/out/rs-pix-s0/metrics/loss-curve.json`), which was not
+rerun. The windows are iterations 900–999, with the population std.
+
+| arm | wall clock | s / it. | render | rollout | learner | mean return 900–999 (std) | margin over baseline | passes? |
+|---|---|---|---|---|---|---|---|---|
+| baseline (X7 `rs-pix-s0`) | — | 2.49 | 0.54 | 1.54 | 0.417 | −18.623 (0.360) | — | — |
+| P (privileged critic, from-scratch encoder) | 0.721 h | 2.60 | 0.56 | 1.62 | 0.414 | −18.620 (0.361) | +0.003 | no (needs > 0.361) |
+| PI (privileged critic, frozen ImageNet encoder) | not run | | | | | | | stopped (normalization) |
+
+**No arm passes, so under the rule the packet stops here, and the next packet is state-to-pixel
+DAgger (arXiv:2412.13662).** Stage 2 was not started. Had P passed, stage 2 was projected at
+18.4 GPU-hours, inside the 30-hour budget. The GPU lock was held for 0.73 h in total: stage 1
+took 0.72 h, and the diagnostic below took 17 s.
+
+The run beside X7's, value loss / entropy / return:
+
+| iteration | 0 | 1 | 100 | 500 | 999 | mean 900–999 |
+|---|---|---|---|---|---|---|
+| X7 `rs-pix-s0` | 0.42 / 5.52 / −8.90 | 7.82 / 5.52 / −16.08 | 2.90 / 5.69 / −18.70 | 2.16 / 6.45 / −18.24 | 35.06 / 7.36 / −18.73 | 13.07 / 7.27 / −18.62 |
+| P | 2.07 / 5.52 / −8.90 | 9.90 / 5.52 / −16.07 | 2.88 / 5.70 / −18.70 | 2.16 / 6.46 / −18.24 | 35.03 / 7.38 / −18.74 | 13.06 / 7.29 / −18.62 |
+
+The two runs differ only in what the value network reads. Their per-iteration returns agree to
+within 0.036, and to 0.0056 on average, over all 1,000 iterations. Their value losses differ at
+the start (0.42 against 2.07 at iteration 0) and agree to within 2.7 % per iteration from
+iteration 100 on (0.23 % on average). Entropy rises in both. `envelope_violation_rate` and
+`executed_ne_sampled_rate` were 1.00 in every iteration.
+
+The nine metrics (`metrics/env-metrics.json`) were:
+
+| metric | value |
+|---|---|
+| `physics_steps_per_sec` | 43,642 |
+| `actions_per_sec` | 10,911 |
+| `camera_frames_per_sec` | 1,840 |
+| `pixels_per_sec` | 1.70e7 |
+| `observation_gb_per_sec`, `policy_inferences_per_sec`, `p50_end_to_end_latency`, `p95_end_to_end_latency`, `gpu_memory_peak`, `chunk_underrun_rate` | `null` (not instrumented) |
+
+**Why the critic cannot matter here** (`~/artifacts/plan-x/r10/diag/`, `diag.py`). Each actor
+drove 16 envs × 64 steps with its deterministic `mu`, from seed 0 on the `rs-pix` documents. A
+hook on the head's `Linear` recorded `z`, the value before `tanh`.
+
+| actor | segment return | plane changed the action | mean \|z\| | share of \|z\| > 3 |
+|---|---|---|---|---|
+| untrained (the lowering's draw, seed 0) | −8.58 | 0.995 | 0.24 | 0.00 |
+| P, iteration 1,000 | −18.02 | 1.00 | 20.9 | 1.00 |
+| X7 `rs-pix-s0`, iteration 4,000 | −18.02 | 1.00 | 19.1 | 1.00 |
+| constant action 0 (no policy) | −14.36 | 0.00 | — | — |
+| constant action 0.5 (no policy) | −8.37 | 0.14 | — | — |
+
+Both trained actors have pushed every channel's `tanh` into saturation. At \|z\| > 3, `tanh`
+is within 0.5 % of its bound and its gradient is under 1 %. So `mu` sits at a corner of the
+action range, the plane clamps it the same way each time, and the two actors produce the same
+return.
+
+The environment does respond to the action: two constants that ignore the observation score
+−14.4 and −8.4, and the untrained actor scores −8.6. The collapse happens in the first update.
+The return falls from −8.9 at iteration 0 to −16.1 at iteration 1 in both runs, before the two
+critics could differ much.
+
+This is S4c's failure again (a saturated `tanh` with zero gradient), now on a from-scratch
+ResNet18. The value network is downstream of it: a better baseline cannot move an actor whose
+output gradient is zero. This is an observation made after the rule was applied, and the rule's
+decision stands. It does also say that R10's premise ("the cause is in the recipe, not in the
+envelope") holds only in part. The cause is in the actor's first update, not in the critic.
+
+*The packet's questions.*
+
+1. **No.** With a critic that reads `qpos` and the state port, pixel-only PPO on the rasterizer
+   followed X7's pixel-critic run to within 0.036 return per iteration for 1,000 iterations
+   (−18.620 against −18.623 over iterations 900–999). Both actors had saturated their `tanh` by
+   then.
+2. **Not measured.** The ImageNet arm stopped because nothing between the `Normalized{0,1}` port
+   and a pretrained backbone applies ImageNet's input normalization.
 
 ## 8. The importer and the adapter
 
