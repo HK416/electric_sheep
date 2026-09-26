@@ -14133,9 +14133,8 @@ fn dr_collect_eval_frames_match_rollout() {
 
         // The episode's recorded intrinsics, on disk on both paths. The evaluator writes the
         // recorded `ImageSpec`'s own `f64`s. The collector's sidecar is `EnvRenderer`'s: the
-        // `f32` the frame was projected with, `fx_f32 * focal as f32`, where the record is
-        // `fx_f64 * focal` -- one number rounded two ways inside `es-env`, measured at one
-        // `f32` ULP (`docs/design/renderer.md` 13.8), so that is the bound held here.
+        // `f32` the frame was projected with. Both go through `CameraDraw::zoom` (packet
+        // M11/R9 item 1), so the two agree to the bit.
         let recorded = drawn.image_spec(camera, &declared).intrinsics;
         let sidecar = json(collected.join(format!("{first:06}.json")));
         let layout = json(cell.join("layout.json"));
@@ -14143,10 +14142,9 @@ fn dr_collect_eval_frames_match_rollout() {
             let on_disk = sidecar["intrinsics"][k]
                 .as_f64()
                 .expect("sidecar intrinsics");
-            let ulp = (on_disk as f32).to_bits().abs_diff((v as f32).to_bits());
-            println!("episode {episode}: sidecar {k} {on_disk} vs recorded {v}: {ulp} ULP");
-            assert!(
-                ulp <= 1,
+            assert_eq!(
+                on_disk.to_bits(),
+                v.to_bits(),
                 "episode {episode}: the collector's sidecar {k} {on_disk} vs recorded {v}"
             );
             assert_eq!(

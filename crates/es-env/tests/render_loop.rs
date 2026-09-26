@@ -1142,6 +1142,66 @@ fn dr_env_frames_follow_the_draws_gpu_equals_cpu() {
     println!("RAN {test}");
 }
 
+/// Packet M11/R9 item 1 (`INV-14`): for a drawn field of view, the `ImageSpec` an episode
+/// records (`RenderOverrides::image_spec`, from the committed task's declared spec, exactly as
+/// `Env::reset` calls it) holds, bit for bit, the intrinsics `drawn_frame` projects with. No
+/// device: the projection is host arithmetic.
+#[test]
+fn drawn_fov_records_the_intrinsics_the_frame_is_projected_with() {
+    let scene = scene();
+    let f = fixed(&scene);
+    let world = body_poses(&f.model, &f.state(), 0);
+    let cam = overhead(&scene);
+    let name = &scene.cameras.iter().find(|c| c.id == cam).unwrap().name;
+    let task = dr_task(
+        "task.toml",
+        &[(format!("camera.{name}.fov"), uniform(0.85, 1.15))],
+    );
+    // The committed document's declared spec: an `f64` the authoring side computed, which
+    // the renderer's `f32` only rounds to.
+    let declared = es_ir::serial::task_from_toml(
+        &std::fs::read_to_string(repo_root().join("tests/fixtures/visible-learning/task.toml"))
+            .expect("the committed task"),
+    )
+    .expect("it parses")
+    .observation_spec
+    .channels
+    .values()
+    .find_map(|c| c.ty.image)
+    .expect("the task declares an image channel");
+    for episode in 0..4 {
+        let ov = dr_draw(&task, &scene, &f.model, episode);
+        let focal = ov.cameras[&cam].focal;
+        assert_ne!(
+            focal.to_bits(),
+            1.0f64.to_bits(),
+            "episode {episode}: no zoom"
+        );
+        let recorded = ov.image_spec(cam, &declared).intrinsics;
+        let (_, view, _) = es_env::render::drawn_frame(
+            &scene,
+            &cfg(&scene),
+            &ov,
+            &world,
+            &mut es_render::SceneCache::default(),
+        )
+        .expect("drawn");
+        let projected = view.spec.intrinsics;
+        for (k, r, p) in [
+            ("fx", recorded.fx, projected.fx),
+            ("fy", recorded.fy, projected.fy),
+            ("cx", recorded.cx, projected.cx),
+            ("cy", recorded.cy, projected.cy),
+        ] {
+            assert_eq!(
+                r.to_bits(),
+                f64::from(p).to_bits(),
+                "episode {episode} {k}: recorded {r}, projected {p}"
+            );
+        }
+    }
+}
+
 /// Packet M11/X5 on the `Pt` sensor: `light.radiance` declares the directional light the
 /// path tracer has had since M7/R3 and no document could reach (`docs/reviews/M10.md` S-6),
 /// the draws land on it, and the device agrees with the CPU at the `Pt` NEE rule.
