@@ -243,8 +243,10 @@ randomization, so no new randomization mechanism is needed:
 - scene: `tests/fixtures/mjcf/so101_pick_place.xml`, 50 Hz control over 200 Hz physics (the demo's
   V11 cadence, `n_substeps = 4`);
 - observation (26): `joint_pos[6] ‖ joint_vel[6] ‖ cube_pose[7] ‖ gripper_pose[7]`, each pose
-  the body's world-frame `pos[3] ‖ quat[4]` (quaternion xyzw, §3.1; MuJoCo's `xquat` is wxyz
-  and the source side reorders), gripper = body `gripper`. The poses go in whole because the
+  the body's world-frame `pos[3] ‖ quat[4]`, gripper = body `gripper`. Quaternion order differs
+  between the two (corrected 2026-09-24, M11/I3): `gripper_pose` is a `BodyPose`, served x-first
+  (xyzw, §3.1); `cube_pose` is the free joint's raw `qpos`, served **w-first** as MuJoCo stores it
+  (`es_eval::runner::Capture::Qpos`). A source trainer must match each. The poses go in whole because the
   Observation IR cannot slice a state port (`ChannelSelect` is not lowered) and the Task IR's
   observation capture binds a `GetBodyPose` channel as the demo's `sim_cube_pose` does (7);
   the network learns the subtraction. Revised 2026-09-21 from the 15-dim difference layout.

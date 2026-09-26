@@ -232,7 +232,7 @@ IR(S4c)이 채점한다. 커밋된 SO-101 장면과 그 에피소드별 큐브 �
 - 장면: `tests/fixtures/mjcf/so101_pick_place.xml`, 200 Hz 물리 위의 50 Hz 제어(데모의 V11
   카덴스, `n_substeps = 4`);
 - 관측(26): `joint_pos[6] ‖ joint_vel[6] ‖ cube_pose[7] ‖ gripper_pose[7]`, 각 포즈는 몸체의 월드
-  프레임 `pos[3] ‖ quat[4]`(쿼터니언 xyzw, §3.1; MuJoCo의 `xquat`은 wxyz라 원본 쪽이 재배열), 그리퍼 =
+  프레임 `pos[3] ‖ quat[4]`(쿼터니언 순서는 둘이 다르다 — 2026-09-24 M11/I3에서 정정: `gripper_pose`는 `BodyPose`라 x 먼저(xyzw, §3.1), `cube_pose`는 자유 관절의 원시 `qpos`라 MuJoCo가 저장한 대로 **w 먼저**(`es_eval::runner::Capture::Qpos`); 원본 학습기는 각각에 맞춰야 한다), 그리퍼 =
   몸체 `gripper`. 관측 IR이 상태 포트를 자르지 못하고(`ChannelSelect`는 로워링되지 않는다) Task IR의
   관측 캡처가 데모의 `sim_cube_pose`처럼 `GetBodyPose` 채널을 7로 묶기 때문에 포즈를 통째로 싣고,
   뺄셈은 네트워크가 배운다. 2026-09-21 15차원 차분 배치에서 개정;
