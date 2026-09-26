@@ -965,10 +965,11 @@ fn frames_are_written_once_per_control_step() {
     let root = scratch("loop-frames");
     let b = bundle_with_camera();
     let mut seen: Vec<(u32, f64)> = Vec::new();
-    let mut sink = |model: &ModelInfo, state: &StateView<'_>| {
-        seen.push((model.nq, state.qpos_of(0)[0]));
-        Ok(())
-    };
+    let mut sink =
+        |model: &ModelInfo, state: &StateView<'_>, _: &es_env::randomize::RenderOverrides| {
+            seen.push((model.nq, state.qpos_of(0)[0]));
+            Ok(())
+        };
     let report = collect_with(&root, &b, &mut no_intervention, Some(&mut sink));
 
     assert_eq!(report.rendered, report.frames);

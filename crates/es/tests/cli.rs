@@ -4709,7 +4709,8 @@ fn collection_and_evaluation_ask_the_policy_at_the_same_cadence() {
     {
         let (trace, seen) = (Rc::clone(&collected), Rc::clone(&seen));
         let mut sink = |model: &es_physics_core::backend::ModelInfo,
-                        state: &es_physics_core::backend::StateView<'_>| {
+                        state: &es_physics_core::backend::StateView<'_>,
+                        _: &es_env::randomize::RenderOverrides| {
             let row = row_of(state);
             *seen.borrow_mut() = Some((model.clone(), row.clone()));
             trace.borrow_mut().push(row);
@@ -4909,7 +4910,8 @@ fn collection_and_evaluation_draw_the_same_trajectory() {
         };
         let seen = Rc::clone(&seen);
         let mut sink = |model: &es_physics_core::backend::ModelInfo,
-                        state: &es_physics_core::backend::StateView<'_>| {
+                        state: &es_physics_core::backend::StateView<'_>,
+                        _: &es_env::randomize::RenderOverrides| {
             *seen.borrow_mut() = Some((model.clone(), row_of(state)));
             Ok::<(), String>(())
         };
