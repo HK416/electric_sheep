@@ -1154,7 +1154,7 @@ match stream {
 `dr_collect_eval_frames_match_rollout`(`task-reach-vision.toml`에 렌더 타깃 열한 개를 더해 생성한 `task-reach-vision-dr.toml`; `Pt` 16 spp, `seed = "tick"`; 전문가 아래 시드 201의 에피소드 둘)의 측정(RTX 3060과 RTX 4090 동일): 각 에피소드의 틱 0은 수집기의 프레임과 쌍둥이 env 위 `Rollout`의 `frame_with`가 비트 단위로 같고, 추첨 없는 프레임과는 다르다. 수집기와 평가기는 같은 상태를 가진 모든 틱에서 비트 단위로 일치한다. 발견 둘:
 
 - **리치 배포에서 전문가 아래 두 경로의 상태는 틱 2에서 갈라진다**(qpos가 ~1e-5 차이, 두 에피소드 모두) — R2가 건드리지 않는 명령 경로의 차이다. 데모 배포의 궤적은 마지막 틱까지 일치한다(`collection_and_evaluation_ask_the_policy_at_the_same_cadence`). 오라클은 상태가 일치하는 곳(에피소드당 두 틱)에서 프레임을 비교하고, 추첨은 `Rollout`과의 틱 0 비교로 확인한다. 리치 배포가 왜 갈라지는지는 열린 문제다.
-- **기록된 초점과 렌더된 초점은 `f32` 1 ULP 떨어져 있다.** `RenderOverrides::image_spec`은 `fx_f64 * focal`을 기록하고, `drawn_frame`은 `fx_f32 * (focal as f32)`로 투영하며 사이드카는 그것을 쓴다. 측정: 두 에피소드에서 `fx`, `fy` 1 ULP, `cx`, `cy` 0. 오라클은 사이드카를 ≤ 1 ULP로, `layout.json`은 기록값과 정확히 같게 묶는다. 둘을 한 계산으로 만드는 일은 `es-env`의 몫이며 R2 밖이다.
+- **기록된 초점과 렌더된 초점은 `f32` 1 ULP 떨어져 있다.** `RenderOverrides::image_spec`은 `fx_f64 * focal`을 기록하고, `drawn_frame`은 `fx_f32 * (focal as f32)`로 투영하며 사이드카는 그것을 쓴다. 측정: 두 에피소드에서 `fx`, `fy` 1 ULP, `cx`, `cy` 0. 오라클은 사이드카를 ≤ 1 ULP로, `layout.json`은 기록값과 정확히 같게 묶는다. 둘을 한 계산으로 만드는 일은 `es-env`의 몫이며 R2 밖이다. *P-M11-R9 항목 1에서 해결:* 이제 둘 다 `CameraDraw::zoom`을 거치며, 사이드카는 기록값과 비트 단위로 같다(`drawn_fov_records_the_intrinsics_the_frame_is_projected_with`).
 
 **두 `Cross` 내장 함수는 정확하다; `common.slang`은 바뀌지 않았다.** `dr_cross_is_exact`는 쿼터니언 성분 중 2의 거듭제곱이 없는 뽑힌 포즈 세 개에서 코넬 박스를 렌더한다:
 

@@ -1906,7 +1906,9 @@ evaluator agree bit for bit at every tick they hold the same state. Two findings
   `RenderOverrides::image_spec` records `fx_f64 * focal`; `drawn_frame` projects with
   `fx_f32 * (focal as f32)`, which is what the sidecar writes. Measured: 1 ULP on `fx` and `fy`
   in both episodes, 0 on `cx`, `cy`. The oracle holds the sidecar to ≤ 1 ULP and `layout.json`
-  to the record exactly; making them one computation is `es-env`'s, outside R2.
+  to the record exactly; making them one computation is `es-env`'s, outside R2. *Closed by
+  P-M11-R9 item 1:* both now go through `CameraDraw::zoom`, and the sidecar equals the record to
+  the bit (`drawn_fov_records_the_intrinsics_the_frame_is_projected_with`).
 
 **The two `Cross` builtins are exact; `common.slang` is unchanged.** `dr_cross_is_exact`
 renders the Cornell box from three drawn poses with no power-of-two quaternion component:
