@@ -14625,7 +14625,8 @@ fn x7_row_documents(
 }
 
 /// The four X7 rows at the chosen setting and their four `-pix` siblings (packet M11/R3),
-/// three documents each; a `-pix` row's task is its parent's file.
+/// three documents each; a `-pix` row's task is its parent's file. Then the X7 rerun's `Pt`
+/// `-pix` rows at `X7_RERUN_SPP` (`x7_pt_pix_variants`).
 fn x7_documents() -> Vec<(String, String, String)> {
     let pt = Some((X7_SPP, X7_SVGF));
     [false, true]
@@ -14639,6 +14640,25 @@ fn x7_documents() -> Vec<(String, String, String)> {
             ]
             .into_iter()
             .flat_map(move |(row, pt, dr)| x7_row_documents(row, pt, dr, pix))
+        })
+        .chain(x7_pt_pix_variants(X7_RERUN_SPP))
+        .collect()
+}
+
+/// The X7 rerun (owner decision 2026-09-24, `docs/packets/M11/X7-vision-rl-pt.md`): the `Pt`
+/// rows train at this many samples per pixel. The committed 16 spp rows stay as they are.
+const X7_RERUN_SPP: u32 = 4;
+
+/// The two `Pt` `-pix` rows (`pt-dr`, `pt`) at `spp`, SVGF off and on, as new files: row
+/// `<row>-<spp>spp[-svgf]`, so the observation and evaluation are `<row>-<spp>spp[-svgf]-pix`.
+fn x7_pt_pix_variants(spp: u32) -> Vec<(String, String, String)> {
+    [("pt-dr", true), ("pt", false)]
+        .into_iter()
+        .flat_map(|(row, dr)| {
+            [false, true].into_iter().flat_map(move |svgf| {
+                let name = format!("{row}-{spp}spp{}", if svgf { "-svgf" } else { "" });
+                x7_row_documents(&name, Some((spp, svgf)), dr, true)
+            })
         })
         .collect()
 }
@@ -14745,6 +14765,10 @@ fn train_x7_dry_run_plans() {
         "rs-dr-pix",
         "pt-pix",
         "rs-pix",
+        "pt-dr-4spp-pix",
+        "pt-dr-4spp-svgf-pix",
+        "pt-4spp-pix",
+        "pt-4spp-svgf-pix",
     ] {
         let recipe = format!("tests/fixtures/rl/training-reach-vision-{row}.toml");
         let dir = scratch_dir("train-x7-dry");
