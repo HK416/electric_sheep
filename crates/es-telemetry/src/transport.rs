@@ -664,6 +664,9 @@ mod tests {
             .expect_err("the connection past max_clients must be refused");
         match err {
             TransportError::Rejected { reason } => assert!(reason.contains("too many"), "{reason}"),
+            // The server closes the refused socket with the client's `Hello` unread, so TCP may
+            // reset it before the `Bye` is read: a reset from a refused connection is a refusal.
+            TransportError::Io(e) if e.kind() == io::ErrorKind::ConnectionReset => {}
             other => panic!("expected Rejected, got {other:?}"),
         }
     }
