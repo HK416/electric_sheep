@@ -155,6 +155,20 @@ pub(crate) fn parse_backend(name: &str, help: &str) -> Result<BackendKind, CliEr
     }
 }
 
+/// The stdout line that says which spec 3.5 tier produced a run (`docs/reviews/M11.md` S-4):
+/// the tier `kind` declares in its capabilities, by number and name. A line and not a
+/// `report.json` field, because a new field would move every committed report.
+pub(crate) fn determinism_tier(kind: BackendKind) -> String {
+    let tier = match kind {
+        BackendKind::MuJoCoCpu => es_physics_backend::mujoco::capabilities(),
+        BackendKind::MjWarp => es_physics_backend::mjwarp::capabilities(),
+        BackendKind::Newton => es_physics_backend::newton::capabilities(),
+        BackendKind::PhysX => es_physics_backend::physx::capabilities(),
+    }
+    .determinism;
+    format!("determinism tier: {} {tier:?} (backend {kind})", tier as u8)
+}
+
 /// The spec 14.4 gate for a backend other than the reference, run on the scene before any
 /// availability probe or process: an unmapped row with severity `error` refuses the run and
 /// names the rows. It is the same report the backend's own `load` checks first.
@@ -1048,6 +1062,7 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
     }
 
     println!("trajectories: {}", traj_dir.display());
+    println!("{}", determinism_tier(kind));
     // Only the command that bound the socket closes the account of it: a stage of a cycle
     // would print a running total three more stages are still adding to.
     if let Some(p) = &owned {

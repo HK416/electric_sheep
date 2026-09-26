@@ -1481,6 +1481,110 @@ fn eval_run_backend_help_lists_the_four_names() {
     }
 }
 
+/// Packet M11/R9 item 3 (`docs/reviews/M11.md` S-4): `es eval run` and `es loop collect` say,
+/// on one stdout line, which spec 3.5 tier produced the run -- the tier the backend declares.
+/// `mujoco-cpu` declares tier 3, physics meaning (`crates/es-physics-backend/src/mujoco.rs`
+/// says why it is not tier 1). A line, not a `report.json` field: nothing committed moves.
+#[test]
+fn runs_print_the_backends_determinism_tier() {
+    const TEST: &str = "runs_print_the_backends_determinism_tier";
+    const LINE: &str = "determinism tier: 3 PhysicsMeaning (backend mujoco-cpu)";
+    for probe in [
+        es_physics_backend::MuJoCoCpuBackend::is_available(),
+        es_policy::torch_runtime::is_available(),
+    ] {
+        if let Err(reason) = probe {
+            println!("SKIP {TEST}: {reason}");
+            return;
+        }
+    }
+    // The reach documents, 20 ticks an episode: an MLP, so a conforming checkpoint loads
+    // without a trained run, and one short episode is the cheapest run that writes a report.
+    let dir = scratch_dir("determinism-tier");
+    let read = |name: &str| std::fs::read_to_string(rl_fixture(name)).expect(name);
+    let mut task = es_ir::serial::task_from_toml(&read("task-reach.toml")).expect("task");
+    task.config.max_episode_steps = 20;
+    let mut obs =
+        es_ir::serial::observation_from_toml(&read("observation-reach.toml")).expect("obs");
+    obs.task_ref = task.task_hash().expect("the task hashes");
+    let mut learning =
+        es_ir::serial::learning_from_toml(&read("learning-reach.toml")).expect("learning");
+    let module = es_policy::lower_to_torch(&learning).expect("the reach graph lowers");
+    let weights = es_policy::weights::write_safetensors(&conforming_checkpoint(&module));
+    learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let deployment =
+        es_ir::serial::deployment_from_toml(&read("deployment-reach.toml")).expect("deploy");
+    let policy = dir.join("policy.esb");
+    std::fs::write(
+        &policy,
+        es_compile::PolicyBundle::build(&task, &obs, &learning, &deployment, &weights)
+            .expect("the reach documents pack"),
+    )
+    .expect("write policy.esb");
+    let config = dir.join("eval.toml");
+    write(
+        &config,
+        &es_ir::serial::evaluation_to_toml(&quadruped_evaluation(&task, &obs))
+            .expect("evaluation toml"),
+    );
+
+    let eval = bin()
+        .args(["eval", "run", "--config"])
+        .arg(&config)
+        .arg("--policy")
+        .arg(&policy)
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .arg("--out")
+        .arg(dir.join("eval"))
+        .output()
+        .expect("run es eval run");
+    // The collector under the demo's scripted expert: no weights to load at all.
+    let collect = bin()
+        .args([
+            "loop",
+            "collect",
+            "--expert",
+            "so101-pick-place",
+            "--policy",
+        ])
+        .arg(write_demo_bundle(&dir))
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .args([
+            "--episodes",
+            "1",
+            "--seed",
+            "4",
+            "--max-steps",
+            "4",
+            "--out",
+        ])
+        .arg(dir.join("collect"))
+        .output()
+        .expect("run es loop collect");
+    for (verb, out) in [("eval run", &eval), ("loop collect", &collect)] {
+        let text = stdout(out);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{verb}:\n{text}\n{}",
+            stderr_of(out)
+        );
+        assert_eq!(
+            text.lines().filter(|l| *l == LINE).count(),
+            1,
+            "{verb}: one `{LINE}` line\n{text}"
+        );
+    }
+    let report = std::fs::read_to_string(dir.join("eval").join("report.json")).expect("report");
+    assert!(!report.contains("determinism tier"), "{report}");
+    println!("RAN {TEST}");
+}
+
 /// Packet M5/V5. `--jobs 0` is "run no cell and report on it": a usage error (exit 2) raised
 /// while parsing, before a bundle, a scene or a Python interpreter is touched -- which is why
 /// this runs in the PR tier where neither `mujoco` nor `torch` exists. The same check covers
@@ -4709,7 +4813,8 @@ fn collection_and_evaluation_ask_the_policy_at_the_same_cadence() {
     {
         let (trace, seen) = (Rc::clone(&collected), Rc::clone(&seen));
         let mut sink = |model: &es_physics_core::backend::ModelInfo,
-                        state: &es_physics_core::backend::StateView<'_>| {
+                        state: &es_physics_core::backend::StateView<'_>,
+                        _: &es_env::randomize::RenderOverrides| {
             let row = row_of(state);
             *seen.borrow_mut() = Some((model.clone(), row.clone()));
             trace.borrow_mut().push(row);
@@ -4909,7 +5014,8 @@ fn collection_and_evaluation_draw_the_same_trajectory() {
         };
         let seen = Rc::clone(&seen);
         let mut sink = |model: &es_physics_core::backend::ModelInfo,
-                        state: &es_physics_core::backend::StateView<'_>| {
+                        state: &es_physics_core::backend::StateView<'_>,
+                        _: &es_env::randomize::RenderOverrides| {
             *seen.borrow_mut() = Some((model.clone(), row_of(state)));
             Ok::<(), String>(())
         };
@@ -6992,12 +7098,19 @@ fn quadruped_evaluation(task: &TaskIr, observation: &ObservationIr) -> Evaluatio
 /// projected gravity, joint velocities, the previous action and the joystick command. This
 /// test pins the refusal *by its message* so that the day the capture path grows base state,
 /// this test fails and is updated rather than quietly staying green over a gap.
+///
+/// The joystick command is the first part of that gap a run reaches: `Env::new` resolves the
+/// task's `command.*` randomization targets before the capture path is planned (the plan needs
+/// the env's model), and no runtime state holds a command, so the env refuses the target by
+/// name. That refusal is the gap's; any other `1`, the checkpoint refusal included, is not.
 #[test]
 fn quadruped_eval_run_names_the_observation_gap() {
     let dir = scratch_dir("quadruped-eval-run");
-    let (task, observation, learning, deployment) = quadruped_documents();
-    let weights = b"es-m6-b1-untrained-placeholder".to_vec();
-    let mut learning = learning;
+    let (task, observation, mut learning, deployment) = quadruped_documents();
+    // Every tensor the lowered graph asks for, at its lowered shape: the runtime checks the
+    // checkpoint against the lowering (spec 8.7) before it reaches the observation gap.
+    let module = es_policy::lower_to_torch(&learning).expect("the quadruped graph lowers");
+    let weights = es_policy::weights::write_safetensors(&conforming_checkpoint(&module));
     learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
         path: "policy.safetensors".to_owned(),
         hash: *blake3::hash(&weights).as_bytes(),
@@ -7039,7 +7152,9 @@ fn quadruped_eval_run_names_the_observation_gap() {
         }
         Some(1) => {
             assert!(
-                text.contains("joint positions") || text.contains("is none of"),
+                text.contains("joint positions")
+                    || text.contains("is none of")
+                    || text.contains("randomization target \"command."),
                 "eval run failed for a reason that is not the known observation gap:\n{text}"
             );
             assert!(
@@ -14124,9 +14239,8 @@ fn dr_collect_eval_frames_match_rollout() {
 
         // The episode's recorded intrinsics, on disk on both paths. The evaluator writes the
         // recorded `ImageSpec`'s own `f64`s. The collector's sidecar is `EnvRenderer`'s: the
-        // `f32` the frame was projected with, `fx_f32 * focal as f32`, where the record is
-        // `fx_f64 * focal` -- one number rounded two ways inside `es-env`, measured at one
-        // `f32` ULP (`docs/design/renderer.md` 13.8), so that is the bound held here.
+        // `f32` the frame was projected with. Both go through `CameraDraw::zoom` (packet
+        // M11/R9 item 1), so the two agree to the bit.
         let recorded = drawn.image_spec(camera, &declared).intrinsics;
         let sidecar = json(collected.join(format!("{first:06}.json")));
         let layout = json(cell.join("layout.json"));
@@ -14134,10 +14248,9 @@ fn dr_collect_eval_frames_match_rollout() {
             let on_disk = sidecar["intrinsics"][k]
                 .as_f64()
                 .expect("sidecar intrinsics");
-            let ulp = (on_disk as f32).to_bits().abs_diff((v as f32).to_bits());
-            println!("episode {episode}: sidecar {k} {on_disk} vs recorded {v}: {ulp} ULP");
-            assert!(
-                ulp <= 1,
+            assert_eq!(
+                on_disk.to_bits(),
+                v.to_bits(),
                 "episode {episode}: the collector's sidecar {k} {on_disk} vs recorded {v}"
             );
             assert_eq!(

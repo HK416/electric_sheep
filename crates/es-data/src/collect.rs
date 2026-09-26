@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use es_assets::scene::SceneDesc;
 use es_compile::{PolicyBundle, Tensor};
 use es_core::{PhysTick, TickRate};
+use es_env::randomize::RenderOverrides;
 use es_env::scheduler::BatchDomains;
 use es_env::traj::Trajectory;
 use es_env::{DomainRunner, Env, Termination};
@@ -266,14 +267,17 @@ pub type Intervener<'a, const NJ: usize> =
     &'a mut dyn FnMut(u32, u32, &ModelInfo, &[f64]) -> Intervention<NJ>;
 
 /// Called once per control step with the state that step is entered with -- the same
-/// instant the `observation.state` row and the `.estraj` pose of that step carry (M5/V12).
+/// instant the `observation.state` row and the `.estraj` pose of that step carry (M5/V12) --
+/// and the env's render draws for the episode that step is in (`Env::render_overrides`,
+/// packet M11/X5), so a frame is drawn under the draws the episode records.
 ///
 /// A closure, not a renderer: `es-data` is layer 10 and `es-render` layer 5, and this is the
 /// same trade `es_eval::runner::FrameSource` makes — the caller owns
 /// `es_env::render::EnvRenderer` (feature `render`) and hands its `frame` in through this, so
 /// nothing here links Vulkan. With a sink, `info.json`'s video feature stops being a dangling
 /// reference.
-pub type FrameSink<'a> = &'a mut dyn FnMut(&ModelInfo, &StateView<'_>) -> Result<(), String>;
+pub type FrameSink<'a> =
+    &'a mut dyn FnMut(&ModelInfo, &StateView<'_>, &RenderOverrides) -> Result<(), String>;
 
 /// One moment of a running collection, for a [`CollectSink`] (packet M7/E7).
 ///
@@ -619,7 +623,8 @@ impl Collector {
                         t.push(env.model(), &state, 0).map_err(|e| bad(&e))?;
                     }
                     if let Some(sink) = frame_sink.as_deref_mut() {
-                        sink(env.model(), &state).map_err(DataError::Loop)?;
+                        sink(env.model(), &state, env.render_overrides(0))
+                            .map_err(DataError::Loop)?;
                         rendered += 1;
                     }
                 }

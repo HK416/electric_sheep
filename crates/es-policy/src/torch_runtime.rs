@@ -306,8 +306,11 @@ impl TorchRuntime {
     }
 
     /// Materialize the checkpoint: the Python side reads a path, so in-memory bytes are spilled
-    /// to a temporary file named by their own hash.
+    /// to a temporary file named by their own hash, this process and a per-process count. The
+    /// hash alone is not unique: two runtimes holding the same bytes, in this process or
+    /// another, would share one file, and the first to drop would delete it under the other.
     fn checkpoint(&mut self, weights: &WeightsSource) -> Result<(PathBuf, Vec<u8>), PolicyError> {
+        static SPILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         match weights {
             WeightsSource::Safetensors(path) => {
                 let bytes = std::fs::read(path)
@@ -316,12 +319,17 @@ impl TorchRuntime {
             }
             WeightsSource::InMemory(bytes) => {
                 let path = std::env::temp_dir().join(format!(
-                    "es-policy-{}.safetensors",
-                    hex(&weights_hash(bytes))
+                    "es-policy-{}-{}-{}.safetensors",
+                    hex(&weights_hash(bytes)),
+                    std::process::id(),
+                    SPILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 ));
                 std::fs::write(&path, bytes)
                     .map_err(|e| PolicyError::Io(format!("{}: {e}", path.display())))?;
-                self.scratch = Some(path.clone());
+                // A reload spills again; the previous file is already read and closed.
+                if let Some(old) = self.scratch.replace(path.clone()) {
+                    let _ = std::fs::remove_file(old);
+                }
                 Ok((path, bytes.clone()))
             }
         }

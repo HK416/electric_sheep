@@ -307,8 +307,8 @@ pub fn drawn_frame(
 
     if let Some(d) = ov.cameras.get(&cfg.camera) {
         view.pose = view.pose.compose(d.pose());
-        view.spec.intrinsics.fx *= d.focal as f32;
-        view.spec.intrinsics.fy *= d.focal as f32;
+        view.spec.intrinsics.fx = d.zoom(view.spec.intrinsics.fx);
+        view.spec.intrinsics.fy = d.zoom(view.spec.intrinsics.fy);
     }
     Ok((tri, view, rc))
 }

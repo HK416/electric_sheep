@@ -1367,13 +1367,15 @@ pub(crate) mod tests {
         task.scene.scene_hash = scene.scene_hash();
         let mut env = Env::new(&task, &scene, FakeBackend::new(), &domains(1), 7).unwrap();
 
+        // The nominal through the drawn zoom, in the `f32` the frame is projected in.
+        let zoomed = |f: f64, s: f64| f64::from(f as f32 * s as f32);
         let mut seen = Vec::new();
         for _ in 0..2 {
             let s = env.render_overrides(0).cameras[&cam].focal;
             assert!((0.8..=1.25).contains(&s), "{s}");
             let got = env.recorder.open(0).image_specs[&cam];
-            assert_eq!(got.intrinsics.fx, declared.intrinsics.fx * s);
-            assert_eq!(got.intrinsics.fy, declared.intrinsics.fy * s);
+            assert_eq!(got.intrinsics.fx, zoomed(declared.intrinsics.fx, s));
+            assert_eq!(got.intrinsics.fy, zoomed(declared.intrinsics.fy, s));
             assert_eq!(
                 (got.intrinsics.cx, got.intrinsics.cy),
                 (declared.intrinsics.cx, declared.intrinsics.cy),
@@ -1381,7 +1383,7 @@ pub(crate) mod tests {
             );
             assert_eq!(got.extrinsics, declared.extrinsics, "no pose was drawn");
             let half = got.resized(32, 24, true);
-            assert_eq!(half.intrinsics.fx, declared.intrinsics.fx * s * 0.5);
+            assert_eq!(half.intrinsics.fx, zoomed(declared.intrinsics.fx, s) * 0.5);
             assert_eq!(half.intrinsics.cx, declared.intrinsics.cx * 0.5);
             seen.push(s);
             env.reset(None).unwrap();
@@ -1395,7 +1397,7 @@ pub(crate) mod tests {
         let ep = &closed[0];
         assert_eq!(
             ep.image_specs[&cam].intrinsics.fx,
-            declared.intrinsics.fx * ep.render.cameras[&cam].focal
+            zoomed(declared.intrinsics.fx, ep.render.cameras[&cam].focal)
         );
     }
 }

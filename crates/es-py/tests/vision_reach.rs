@@ -670,14 +670,15 @@ mod render {
                 new_episode.set(true);
             }
         };
-        let mut frame_sink =
-            |model: &ModelInfo, state: &es_physics_core::backend::StateView<'_>| {
-                if new_episode.replace(false) {
-                    renderer.begin_episode();
-                }
-                renderer.frame(model, state, 0).map_err(|e| e.to_string())?;
-                Ok(())
-            };
+        let mut frame_sink = |model: &ModelInfo,
+                              state: &es_physics_core::backend::StateView<'_>,
+                              _: &es_env::randomize::RenderOverrides| {
+            if new_episode.replace(false) {
+                renderer.begin_episode();
+            }
+            renderer.frame(model, state, 0).map_err(|e| e.to_string())?;
+            Ok(())
+        };
         let mut hook = |episode: u32, frame: u32, _: &ModelInfo, _: &[f64]| {
             Intervention::Action(command(&env0_q0[episode as usize], frame))
         };

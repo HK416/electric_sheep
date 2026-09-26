@@ -170,6 +170,13 @@ impl CameraDraw {
         )
     }
 
+    /// A focal length (`fx` or `fy`, in the renderer's `f32`) under this draw's zoom: the one
+    /// computation `render::drawn_frame` projects with and [`RenderOverrides::image_spec`]
+    /// records, so the episode's intrinsics are the frame's to the bit (`INV-14`).
+    pub fn zoom(&self, f: f32) -> f32 {
+        f * self.focal as f32
+    }
+
     fn moves_pose(&self) -> bool {
         self.offset.iter().chain(&self.rot_deg).any(|v| *v != 0.0)
     }
@@ -256,15 +263,16 @@ impl RenderOverrides {
     }
 
     /// The `ImageSpec` this episode's frames of `camera` really have (`INV-14`): `fx`, `fy`
-    /// times the drawn focal scale about the principal point, and the drawn offset composed
-    /// onto the extrinsics. `declared` itself when nothing was drawn for this camera.
+    /// through the drawn zoom ([`CameraDraw::zoom`], in the `f32` the frame is projected in)
+    /// about the principal point, and the drawn offset composed onto the extrinsics.
+    /// `declared` itself when nothing was drawn for this camera.
     pub fn image_spec(&self, camera: StableId, declared: &ImageSpec) -> ImageSpec {
         let Some(d) = self.cameras.get(&camera) else {
             return *declared;
         };
         let mut out = *declared;
-        out.intrinsics.fx *= d.focal;
-        out.intrinsics.fy *= d.focal;
+        out.intrinsics.fx = f64::from(d.zoom(declared.intrinsics.fx as f32));
+        out.intrinsics.fy = f64::from(d.zoom(declared.intrinsics.fy as f32));
         if d.moves_pose() {
             out.extrinsics = declared.extrinsics.compose(d.pose());
         }

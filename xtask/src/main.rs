@@ -156,10 +156,16 @@ fn main() -> ExitCode {
         Some("check-spec-refs") => spec_refs::run(&root),
         Some("verify-goldens") => goldens::run(&root),
         Some("check-scope") => {
-            if let Some(packet) = args.next() {
-                scope::run(&root, Path::new(&packet))
+            let packet = args.next();
+            let base = match (args.next().as_deref(), args.next()) {
+                (None, _) => Ok(None),
+                (Some("--base"), Some(rev)) => Ok(Some(rev)),
+                _ => Err(()),
+            };
+            if let (Some(packet), Ok(base)) = (packet, base) {
+                scope::run(&root, Path::new(&packet), base.as_deref())
             } else {
-                eprintln!("usage: cargo xtask check-scope <packet.md>");
+                eprintln!("usage: cargo xtask check-scope <packet.md> [--base <rev>]");
                 false
             }
         }
@@ -168,7 +174,7 @@ fn main() -> ExitCode {
         Some(other) => {
             eprintln!("unknown xtask command: {other}");
             eprintln!(
-                "available: context-budget, layering, check-spec-refs, verify-goldens, check-scope <packet.md>, nostd [--require], ci"
+                "available: context-budget, layering, check-spec-refs, verify-goldens, check-scope <packet.md> [--base <rev>], nostd [--require], ci"
             );
             false
         }
