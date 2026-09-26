@@ -174,6 +174,31 @@ pub struct Rl {
     /// value reaches `train_ppo.py --backend` and, through the plan and this JSON, the hash.
     #[serde(default, skip_serializing_if = "RlBackend::is_default")]
     pub backend: RlBackend,
+    /// What the value network reads (packet M11/R10). Absent is `Observation`, and spelled out
+    /// it serialises like absence, as `estimator` does.
+    #[serde(default, skip_serializing_if = "Critic::is_default")]
+    pub critic: Critic,
+}
+
+/// `[rl] critic` -- the value network's input (packet M11/R10, the asymmetric actor-critic of
+/// Pinto et al., arXiv:1710.06542). The value is training-only state either way (design note
+/// rule 1): it moves `training_hash` and never `learning_hash`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Critic {
+    /// Every Observation IR port, flattened: every row before M11/R10, and the default.
+    #[default]
+    Observation,
+    /// Every non-image port and `Rollout.qpos`, which carries simulator state a deployment
+    /// never has (the cube's free joint). An image port never reaches it.
+    Privileged,
+}
+
+impl Critic {
+    /// `skip_serializing_if`: the default serialises exactly like absence.
+    fn is_default(&self) -> bool {
+        matches!(self, Self::Observation)
+    }
 }
 
 /// `[rl] backend` -- the engines `es_native.Rollout` has a closed-loop path for (packets
@@ -625,6 +650,11 @@ impl Recipe {
                 args.push(s("--backend"));
                 args.push(s("physx"));
             }
+        }
+        // Last, and only off the default, for the same reason (packet M11/R10).
+        if rl.critic == Critic::Privileged {
+            args.push(s("--critic"));
+            args.push(s("privileged"));
         }
         Ok(args)
     }
@@ -1340,6 +1370,15 @@ impl Plan {
                     .into_iter()
                     .chain(recipe.rl_args()?)
                     .chain(recipe.schedule_args()?)
+                    // The IR route's pretrained backbone, the same flag and the same function
+                    // in `train_act.py` (packet M11/R10); absent, the plan of before.
+                    .chain(
+                        recipe
+                            .policy
+                            .base_model
+                            .iter()
+                            .flat_map(|path| [s("--init-backbone"), path.clone()]),
+                    )
                     .chain(
                         recipe
                             .init
@@ -2012,14 +2051,12 @@ impl Training {
             }),
         };
         let base_model = match route {
-            // A PPO run starts from `[init]` or from the lowering's own draw, and either way
-            // not from ImageNet: `[policy] base_model` needs a `VisionEncoder`, and the RL
-            // route's graph reads state.
-            Route::Rl => json!({"source": "none"}),
             // Packet M7/T5: a *verified* provenance. `es train` hashed the file, agreed with
             // the lock beside it and with the pin, and what goes into the slot is what the
-            // lock said about the weights -- not about the machine that fetched them.
-            Route::Ir => match backbone {
+            // lock said about the weights -- not about the machine that fetched them. A PPO
+            // run on a `VisionEncoder { pretrained = true }` loads it too (packet M11/R10);
+            // one without starts from `[init]` or the lowering's own draw.
+            Route::Ir | Route::Rl => match backbone {
                 Some(lock) => serde_json::to_value(lock)
                     .map_err(|e| refuse(format!("base_model.lock does not serialise: {e}")))?,
                 None => json!({"source": "none"}),
