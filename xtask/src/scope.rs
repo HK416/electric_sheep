@@ -1,5 +1,6 @@
-//! `cargo xtask check-scope <packet.md>` — the working-tree diff must stay
-//! inside the globs declared under the packet's `## context` section (spec 1.2,
+//! `cargo xtask check-scope <packet.md> [--base <rev>]` — the working-tree diff
+//! (plus, with `--base`, the branch's commits since `<rev>`) must stay inside
+//! the globs declared under the packet's `## context` section (spec 1.2,
 //! defends against quiet scope creep, spec 1.7).
 
 use regex::Regex;
@@ -102,8 +103,14 @@ fn git_lines(workspace_root: &Path, args: &[&str]) -> Vec<String> {
         .collect()
 }
 
-fn changed_files(workspace_root: &Path) -> Vec<String> {
+/// The working tree's changes against `HEAD`, plus, with `base`, every file committed on this
+/// branch since it left `base` (`git diff --name-only <base>...HEAD`).
+fn changed_files(workspace_root: &Path, base: Option<&str>) -> Vec<String> {
     let mut files = git_lines(workspace_root, &["diff", "--name-only", "HEAD"]);
+    if let Some(base) = base {
+        let range = format!("{base}...HEAD");
+        files.extend(git_lines(workspace_root, &["diff", "--name-only", &range]));
+    }
     for line in git_lines(
         workspace_root,
         &["status", "--porcelain", "--untracked-files=all"],
@@ -117,7 +124,7 @@ fn changed_files(workspace_root: &Path) -> Vec<String> {
     files
 }
 
-pub fn run(workspace_root: &Path, packet_path: &Path) -> bool {
+pub fn run(workspace_root: &Path, packet_path: &Path, base: Option<&str>) -> bool {
     let md = match std::fs::read_to_string(packet_path) {
         Ok(m) => m,
         Err(e) => {
@@ -134,7 +141,20 @@ pub fn run(workspace_root: &Path, packet_path: &Path) -> bool {
         return false;
     }
 
-    let files = changed_files(workspace_root);
+    if let Some(base) = base {
+        // A base git cannot resolve would diff to nothing and pass vacuously.
+        let commit = format!("{base}^{{commit}}");
+        if git_lines(
+            workspace_root,
+            &["rev-parse", "--verify", "--quiet", &commit],
+        )
+        .is_empty()
+        {
+            eprintln!("check-scope: --base {base} is not a commit");
+            return false;
+        }
+    }
+    let files = changed_files(workspace_root, base);
     let out_of_scope: Vec<&String> = files
         .iter()
         .filter(|f| !path_matches_any(f, &globs))
@@ -192,6 +212,46 @@ mod tests {
         let globs = vec![".gitattributes".to_string()];
         assert!(path_matches_any(".gitattributes", &globs));
         assert!(!path_matches_any("a/.gitattributes", &globs));
+    }
+
+    /// `--base <rev>` adds the committed diff `<rev>...HEAD` to the working tree's; without
+    /// it only the working tree counts, as before.
+    #[test]
+    fn base_adds_the_committed_diff() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("xtask-scope-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let ok = Command::new("git")
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git runs")
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "a").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "base"]);
+        git(&["tag", "base"]);
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::write(dir.join("b/c.txt"), "c").unwrap();
+        git(&["add", "b/c.txt"]);
+        git(&["commit", "-q", "-m", "work"]);
+        std::fs::write(dir.join("d.txt"), "d").unwrap();
+
+        assert_eq!(changed_files(&dir, None), vec!["d.txt".to_string()]);
+        assert_eq!(
+            changed_files(&dir, Some("base")),
+            vec!["b/c.txt".to_string(), "d.txt".to_string()]
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
