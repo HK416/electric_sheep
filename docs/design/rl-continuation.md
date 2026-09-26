@@ -1215,11 +1215,12 @@ under the GPU queue lock); the Isaac-side selection and held-out runs about 2.5 
 `es eval run` (16 episodes × 4 suites) ≈ 12 s on mujoco-cpu, ≈ 5.5 min on physx CPU, ≈ 7.5 min on
 physx GPU, ≈ 3.5 min on mjwarp. Everything else `Target / Status: unverified`.
 
-### X7 — vision RL on the path tracer, randomization on and off, oracle server (Linux, RTX 4090) — draft
+### X7 — vision RL on the path tracer, randomization on and off, oracle server (Linux, RTX 4090)
 
-Packet `docs/packets/M11/X7-vision-rl-pt.md`, spec 28.14 wave 3. **Draft: the stage-1 choice rule
-was written here before stage 1 ran; the measurements are under "Measured, and a budget stop"
-below. Stage 2 did not run.**
+Packet `docs/packets/M11/X7-vision-rl-pt.md`, spec 28.14 wave 3. The first run stopped on budget
+("Measured, and a budget stop" below); P-M11-R3 moved the learner to CUDA and added the `-pix`
+rows; the rerun under the owner decision of 2026-09-24 ("The rerun" at the end of this section)
+ran stage 1 and stage 2 on the four `-pix` rows and answers the packet's questions.
 
 **Documents.** `regenerate_x7_documents` (`crates/es/tests/cli.rs`) writes four rows from
 `task-reach-vision.toml`, `observation-reach-vision.toml` and `evaluation-reach-vision.toml`:
@@ -1301,7 +1302,8 @@ commit with `render`, the CPU physics backend, `Rollout` batched over 16 envs (X
   "learns *from pixels*"; a row without `cube_pose` in the state is needed for that.
 
 The committed `Pt` documents stay at X3's 16 spp, SVGF off (`X7_SPP`, `X7_SVGF` in
-`crates/es/tests/cli.rs`) until a stage 1 runs to its end.
+`crates/es/tests/cli.rs`); the rerun trains on 4 spp siblings that are new files
+(`X7_RERUN_SPP`, `x7_pt_pix_variants`).
 
 **P-M11-R3: the learner on CUDA, and the `-pix` rows (2026-09-24 UTC, `~/artifacts/plan-x/r3/`).**
 `train_ppo.py` now puts every tensor that meets the actor or the value net on `--device`; the
@@ -1349,6 +1351,115 @@ is ≈ 2.6 s per iteration, ≈ 2.9 h. The 12 runs (4 rows × 3 seeds) are 6 × 
 at 3 seeds cost the same again, ≈ **145 h** for all 24 runs. At stage 1's 4 spp (1.56 ms per
 frame) a `Pt` run would be ≈ 3.6 s per iteration, ≈ 4 h, which would put the 12 runs at ≈ 41 h
 and all 24 at ≈ 83 h.
+
+**The rerun: the four `-pix` rows on cuda, `Pt` at 4 spp (owner decision 2026-09-24; server,
+2026-09-24 10:02 to 2026-09-26 03:54 UTC, `~/artifacts/plan-x/x7b/`).** The rows with `cube_pose`
+were not run; the confound note above stands for them. Code from `0d9aedd` (archive in
+`~/Projects/es-x7b`), `es` and `es_native` built with `render`, the CPU physics backend,
+`--device cuda`, interpreter `~/venvs/es-lerobot-cuda/bin/python`. The `Pt` rows train on new 4 spp
+files (`task-reach-vision-pt[-dr]-4spp[-svgf].toml` and their `-pix` observation and evaluation,
+`training-reach-vision-pt[-dr]-4spp[-svgf]-pix.toml`); the 16 spp documents and goldens did not
+move. Render seconds are `render_ms_per_frame` × 1,024; rollout is `collect` minus render;
+learner is `update`. The GPU lock was held for 41.7 h in total (stage 1 1.8 h, stage 2 training
+39.4 h, evaluations 0.5 h). A foreign process (`SSR_RENDER_GLTF`, ≈ 1 GB) was on the GPU at every
+stage's start (`load.<stage>`); the timing spread between seeds below is not attributed to it or to
+anything else.
+
+*Stage 1, SVGF choice.* The rule, written in the packet before it ran: the run with the higher
+mean return over the last 100 iterations wins, unless the difference is smaller than the larger of
+the two runs' std over those iterations, in which case SVGF off (the cheaper one) wins. `pt-dr-pix`
+at 4 spp, seed 0, 1,000 iterations:
+
+| SVGF | wall clock | s / it. | render | rollout | learner | first 100 it. return | last 100 it. return (std) | entropy, last 100 |
+|---|---|---|---|---|---|---|---|---|
+| off | 0.874 h | 3.15 | 1.30 | 1.43 | 0.415 | −18.79 | −18.86 (1.17) | 6.49 |
+| on | 0.927 h | 3.34 | 1.50 | 1.42 | 0.415 | −20.01 | −20.06 (1.02) | 6.65 |
+
+The difference is 1.20, larger than 1.17, so the higher mean wins: **SVGF off**, which is also the
+cheaper one. Neither run learns in 1,000 iterations (first and last 100 agree within the std).
+The nine metrics, off / on: `physics_steps_per_sec` 37,138 / 36,031; `actions_per_sec` 9,284 /
+9,008; `camera_frames_per_sec` 790 / 682; `pixels_per_sec` 7.28e6 / 6.28e6;
+`observation_gb_per_sec`, `policy_inferences_per_sec`, `p50_end_to_end_latency`,
+`p95_end_to_end_latency`, `gpu_memory_peak`, `chunk_underrun_rate` `null` (not instrumented on this
+path). The earlier stage-1 row (16 spp documents' task at 4 spp with `cube_pose`, CPU learner,
+23.4 s per iteration) is the table in "Measured, and a budget stop" above.
+
+*Stage 2, training.* 4 rows × seeds 0, 1, 2, 4,000 iterations each, the recipe unchanged, `Pt` at
+4 spp with SVGF off. Returns are the per-iteration `return` of `metrics/loss-curve.json`, averaged
+over the first and the last 100 iterations; seconds are per iteration.
+
+| row | seed | wall clock | s / it. | render | rollout | learner | first 100 return | last 100 return (std) | entropy, last 100 |
+|---|---|---|---|---|---|---|---|---|---|
+| `pt-dr-pix` | 0 | 3.65 h | 3.29 | 1.34 | 1.53 | 0.415 | −18.79 | −18.66 (1.19) | 8.25 |
+| `pt-dr-pix` | 1 | 4.11 h | 3.70 | 1.72 | 1.57 | 0.414 | −13.54 | −11.44 (1.46) | 12.85 |
+| `pt-dr-pix` | 2 | 4.12 h | 3.71 | 1.73 | 1.57 | 0.414 | −9.15 | −8.75 (0.61) | 11.98 |
+| `pt-pix` | 0 | 3.41 h | 3.07 | 1.10 | 1.55 | 0.415 | −18.81 | −18.66 (1.19) | 8.23 |
+| `pt-pix` | 1 | 3.69 h | 3.32 | 1.36 | 1.55 | 0.415 | −13.95 | −11.53 (1.51) | 13.32 |
+| `pt-pix` | 2 | 3.69 h | 3.32 | 1.38 | 1.53 | 0.414 | −9.09 | −7.53 (0.64) | 12.65 |
+| `rs-dr-pix` | 0 | 2.76 h | 2.49 | 0.53 | 1.54 | 0.417 | −18.79 | −18.66 (1.19) | 8.28 |
+| `rs-dr-pix` | 1 | 2.79 h | 2.51 | 0.56 | 1.53 | 0.417 | −18.40 | −15.92 (1.30) | 12.67 |
+| `rs-dr-pix` | 2 | 2.78 h | 2.50 | 0.53 | 1.55 | 0.417 | −9.15 | −8.70 (0.63) | 12.14 |
+| `rs-pix` | 0 | 2.77 h | 2.49 | 0.54 | 1.54 | 0.417 | −18.61 | −16.73 (1.07) | 12.56 |
+| `rs-pix` | 1 | 2.80 h | 2.52 | 0.54 | 1.57 | 0.417 | −15.01 | −7.77 (0.65) | 10.77 |
+| `rs-pix` | 2 | 2.80 h | 2.52 | 0.54 | 1.56 | 0.416 | −9.11 | −8.73 (0.69) | 11.93 |
+
+The return is set by the seed more than by the row: seed 0 starts near −18.8 and seed 2 near −9.1
+on all four rows. The entropy rose in every run (≈ 5.5 at iteration 0), `envelope_violation_rate`
+and `executed_ne_sampled_rate` were 1.00 in every iteration of every run, as on every reach run
+before. The per-iteration returns of `pt-dr-pix` and `rs-dr-pix` at seed 0 (same physics draws,
+different renderer) differ by at most 0.27 and by 0.023 on average over the 4,000 iterations. The
+nine metrics, per run (`metrics/env-metrics.json`; the other five `null` as in stage 1):
+
+| row | seed | `physics_steps_per_sec` | `actions_per_sec` | `camera_frames_per_sec` | `pixels_per_sec` |
+|---|---|---|---|---|---|
+| `pt-dr-pix` | 0 / 1 / 2 | 37,548 / 32,275 / 32,753 | 9,387 / 8,069 / 8,188 | 765 / 595 / 593 | 7.05e6 / 5.48e6 / 5.46e6 |
+| `pt-pix` | 0 / 1 / 2 | 39,144 / 32,704 / 36,751 | 9,786 / 8,176 / 9,188 | 928 / 755 / 744 | 8.55e6 / 6.96e6 / 6.85e6 |
+| `rs-dr-pix` | 0 / 1 / 2 | 37,573 / 40,943 / 32,933 | 9,393 / 10,236 / 8,233 | 1,937 / 1,824 / 1,933 | 1.78e7 / 1.68e7 / 1.78e7 |
+| `rs-pix` | 0 / 1 / 2 | 42,788 / 33,360 / 33,559 | 10,697 / 8,340 / 8,390 | 1,894 / 1,893 / 1,885 | 1.75e7 / 1.74e7 / 1.74e7 |
+
+*Evaluation.* Each run's `checkpoints/4000.esb` on its own row's evaluation document
+(`evaluation-reach-vision-<row>.toml`, seeds 201–216, `es eval run --jobs 4 --frames`, 153–179 s
+each; the frames were deleted after each report). `success_rate` per suite:
+
+| row | seed | `nominal` | `light_intensity` | `light_direction` | `observation_delay` | `torque_noise` | `backlash` |
+|---|---|---|---|---|---|---|---|
+| `pt-dr-pix` | 0, 1, 2 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 |
+| `pt-pix` | 0, 1, 2 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 |
+| `rs-dr-pix` | 0, 1, 2 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 |
+| `rs-pix` | 0, 1, 2 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 |
+
+Every held-out episode ran to the 200-step timeout with `envelope_violation_rate` 1.00; the
+`nominal` failure histogram of `pt-dr-pix` seed 1, for one, is 16 timeouts, 16 fallbacks, 16 chunk
+underruns, 3,184 position, 720 velocity and 112 acceleration violations.
+
+*Cross-render.* All twelve cross evaluations (`Pt`-trained on the matching `Rs` document,
+`Rs`-trained on the matching `Pt` document) were refused before any episode ran, exit 1, e.g.
+`pt-dr-pix` seed 0 on `evaluation-reach-vision-rs-dr-pix.toml`:
+
+```
+error: tests/fixtures/rl/evaluation-reach-vision-rs-dr-pix.toml does not judge …/pt-dr-4spp-pix-s0/checkpoints/4000.esb:
+ERROR XIR-040  evaluation references a different Task or Observation IR
+  evaluation task reference is d3948e1b, the bundle hashes to eaa0d34b
+ERROR XIR-040  evaluation references a different Task or Observation IR
+  evaluation observation reference is 79495062, the bundle hashes to 1876c3f7
+```
+
+The sensor's render block is part of the Task IR, so a `Pt` and an `Rs` row are two tasks and two
+observations to the hash chain, and an evaluation document judges only the bundle whose task and
+observation it names (spec 10.4). A cross-render evaluation needs a way to state "the same task
+rendered by the other path" as an evaluation condition; that is a design question, not something
+this packet works around.
+
+*The packet's questions.*
+
+1. **No:** at 4,000 iterations none of the three `pt-dr-pix` seeds (nor any seed of the other three
+   rows) scored a single held-out success on any of the six suites, and the training return did
+   not move beyond the spread between seeds.
+2. **At 4 spp the path tracer's render is 1.10–1.73 s per iteration against 0.53–0.56 s on `Rs`
+   (2.0–3.3×), which makes an iteration 3.07–3.71 s against 2.49–2.52 s and a 4,000-iteration run
+   3.41–4.12 h against 2.76–2.80 h (SVGF adds 0.2 s of render per iteration in stage 1).**
+3. **Unanswered:** no policy learned, so there is no transfer to compare, and the hash chain
+   refuses the cross-render evaluation with XIR-040 because the renderer is part of the task.
 
 ## 8. The importer and the adapter
 

@@ -1166,11 +1166,12 @@ Isaac 쪽 선택과 보류 실행은 시드당 약 2.5분; `es eval run` 한 번
 mujoco-cpu ≈ 12 s, physx CPU ≈ 5.5분, physx GPU ≈ 7.5분, mjwarp ≈ 3.5분. 나머지는 모두
 `Target / Status: unverified`.
 
-### X7 — 경로 추적기 위의 비전 RL, 무작위화 켬과 끔, 오라클 서버(Linux, RTX 4090) — 초안
+### X7 — 경로 추적기 위의 비전 RL, 무작위화 켬과 끔, 오라클 서버(Linux, RTX 4090)
 
-패킷 `docs/packets/M11/X7-vision-rl-pt.md`, spec 28.14 wave 3. **초안: stage 1의 선택 규칙은
-stage 1이 돌기 전에 여기 적었다. 측정은 아래 "측정, 그리고 예산 정지"에 있다. Stage 2는 돌지
-않았다.**
+패킷 `docs/packets/M11/X7-vision-rl-pt.md`, spec 28.14 wave 3. 첫 실행은 예산에서 멈췄다(아래
+"측정, 그리고 예산 정지"). P-M11-R3가 학습기를 CUDA로 옮기고 `-pix` 행을 더했으며, 2026-09-24
+소유자 결정에 따른 재실행(이 절 끝의 "재실행")이 네 `-pix` 행에서 stage 1과 stage 2를 돌려
+패킷의 질문에 답한다.
 
 **문서.** `regenerate_x7_documents`(`crates/es/tests/cli.rs`)가 `task-reach-vision.toml`,
 `observation-reach-vision.toml`, `evaluation-reach-vision.toml`로부터 네 행을 쓴다:
@@ -1249,8 +1250,8 @@ stage 1의 어떤 숫자도 학습에 관한 결과로 보고하지 않는다(§
   정확히 주는 것 이상을 정책에 보여 주지 않고, 이 행들은 "*픽셀로부터* 배우는가"에 답할 수 없다.
   그 답에는 상태에 `cube_pose`가 없는 행이 필요하다.
 
-커밋된 `Pt` 문서는 stage 1이 끝까지 돌 때까지 X3의 16 spp, SVGF off(`crates/es/tests/cli.rs`의
-`X7_SPP`, `X7_SVGF`)에 머문다.
+커밋된 `Pt` 문서는 X3의 16 spp, SVGF off(`crates/es/tests/cli.rs`의 `X7_SPP`, `X7_SVGF`)에
+머문다. 재실행은 새 파일인 4 spp 형제 문서로 학습한다(`X7_RERUN_SPP`, `x7_pt_pix_variants`).
 
 **P-M11-R3: CUDA 위의 학습기와 `-pix` 행 (2026-09-24 UTC, `~/artifacts/plan-x/r3/`).**
 `train_ppo.py`는 이제 actor나 value net에 닿는 모든 텐서를 `--device`에 둔다. 잡음과 순서
@@ -1297,6 +1298,111 @@ cuda 20 iteration 실행의 것과 같다. 어느 곡선도 20 iteration 안에 
 대비된다. 네 `-pix` 행을 3 seed로 돌리면 같은 만큼이 더 들어, 24 실행 전체가 ≈ **145 h**다.
 stage 1의 4 spp(프레임당 1.56 ms)라면 `Pt` 실행은 iteration당 ≈ 3.6 초, ≈ 4 h이고, 12 실행은
 ≈ 41 h, 24 실행은 ≈ 83 h가 된다.
+
+**재실행: cuda 위의 네 `-pix` 행, `Pt`는 4 spp (소유자 결정 2026-09-24; 서버, 2026-09-24 10:02부터
+2026-09-26 03:54 UTC까지, `~/artifacts/plan-x/x7b/`).** `cube_pose`가 든 행은 돌리지 않았고, 그
+행들에 대해서는 위의 교란 요인 기록이 그대로 선다. 코드는 `0d9aedd`(`~/Projects/es-x7b`의
+archive), `es`와 `es_native`는 `render`로 빌드, CPU 물리 백엔드, `--device cuda`, 인터프리터
+`~/venvs/es-lerobot-cuda/bin/python`. `Pt` 행은 새 4 spp 파일로 학습한다
+(`task-reach-vision-pt[-dr]-4spp[-svgf].toml`과 그 `-pix` observation·evaluation,
+`training-reach-vision-pt[-dr]-4spp[-svgf]-pix.toml`). 16 spp 문서와 golden은 움직이지 않았다.
+렌더 초는 `render_ms_per_frame` × 1,024, rollout은 `collect`에서 렌더를 뺀 값, 학습기는
+`update`다. GPU lock은 모두 41.7 h 잡혔다(stage 1 1.8 h, stage 2 학습 39.4 h, 평가 0.5 h).
+모든 stage 시작 시점에 외부 프로세스(`SSR_RENDER_GLTF`, ≈ 1 GB)가 GPU 위에 있었다
+(`load.<stage>`). 아래 seed 사이의 시간 차이는 그것에도, 다른 어떤 것에도 귀속하지 않는다.
+
+*Stage 1, SVGF 선택.* 돌기 전에 패킷에 적은 규칙: 마지막 100 iteration의 평균 return이 높은
+실행이 이기되, 그 차이가 두 실행의 같은 100 iteration 표준편차 중 큰 값보다 작으면 SVGF
+off(더 싼 쪽)가 이긴다. `pt-dr-pix`, 4 spp, seed 0, 1,000 iteration:
+
+| SVGF | wall clock | 초 / it. | 렌더 | rollout | 학습기 | 처음 100 it. return | 마지막 100 it. return (std) | 엔트로피, 마지막 100 |
+|---|---|---|---|---|---|---|---|---|
+| off | 0.874 h | 3.15 | 1.30 | 1.43 | 0.415 | −18.79 | −18.86 (1.17) | 6.49 |
+| on | 0.927 h | 3.34 | 1.50 | 1.42 | 0.415 | −20.01 | −20.06 (1.02) | 6.65 |
+
+차이는 1.20으로 1.17보다 크므로 평균이 높은 쪽이 이긴다: **SVGF off**이고, 이것이 더 싼 쪽이기도
+하다. 두 실행 모두 1,000 iteration 안에 배우지 않는다(처음과 마지막 100이 표준편차 안에서
+일치). 9지표, off / on: `physics_steps_per_sec` 37,138 / 36,031; `actions_per_sec` 9,284 / 9,008;
+`camera_frames_per_sec` 790 / 682; `pixels_per_sec` 7.28e6 / 6.28e6; `observation_gb_per_sec`,
+`policy_inferences_per_sec`, `p50_end_to_end_latency`, `p95_end_to_end_latency`,
+`gpu_memory_peak`, `chunk_underrun_rate`는 `null`(이 경로에서 계측하지 않음). 이전의 stage-1 행
+(`cube_pose`가 있는 4 spp, CPU 학습기, iteration당 23.4 초)은 위 "측정, 그리고 예산 정지"의 표다.
+
+*Stage 2, 학습.* 4 행 × seed 0, 1, 2, 각 4,000 iteration, recipe는 그대로, `Pt`는 4 spp에 SVGF
+off. return은 `metrics/loss-curve.json`의 iteration별 `return`을 처음과 마지막 100 iteration에
+걸쳐 평균한 값이고, 초는 iteration당이다.
+
+| 행 | seed | wall clock | 초 / it. | 렌더 | rollout | 학습기 | 처음 100 return | 마지막 100 return (std) | 엔트로피, 마지막 100 |
+|---|---|---|---|---|---|---|---|---|---|
+| `pt-dr-pix` | 0 | 3.65 h | 3.29 | 1.34 | 1.53 | 0.415 | −18.79 | −18.66 (1.19) | 8.25 |
+| `pt-dr-pix` | 1 | 4.11 h | 3.70 | 1.72 | 1.57 | 0.414 | −13.54 | −11.44 (1.46) | 12.85 |
+| `pt-dr-pix` | 2 | 4.12 h | 3.71 | 1.73 | 1.57 | 0.414 | −9.15 | −8.75 (0.61) | 11.98 |
+| `pt-pix` | 0 | 3.41 h | 3.07 | 1.10 | 1.55 | 0.415 | −18.81 | −18.66 (1.19) | 8.23 |
+| `pt-pix` | 1 | 3.69 h | 3.32 | 1.36 | 1.55 | 0.415 | −13.95 | −11.53 (1.51) | 13.32 |
+| `pt-pix` | 2 | 3.69 h | 3.32 | 1.38 | 1.53 | 0.414 | −9.09 | −7.53 (0.64) | 12.65 |
+| `rs-dr-pix` | 0 | 2.76 h | 2.49 | 0.53 | 1.54 | 0.417 | −18.79 | −18.66 (1.19) | 8.28 |
+| `rs-dr-pix` | 1 | 2.79 h | 2.51 | 0.56 | 1.53 | 0.417 | −18.40 | −15.92 (1.30) | 12.67 |
+| `rs-dr-pix` | 2 | 2.78 h | 2.50 | 0.53 | 1.55 | 0.417 | −9.15 | −8.70 (0.63) | 12.14 |
+| `rs-pix` | 0 | 2.77 h | 2.49 | 0.54 | 1.54 | 0.417 | −18.61 | −16.73 (1.07) | 12.56 |
+| `rs-pix` | 1 | 2.80 h | 2.52 | 0.54 | 1.57 | 0.417 | −15.01 | −7.77 (0.65) | 10.77 |
+| `rs-pix` | 2 | 2.80 h | 2.52 | 0.54 | 1.56 | 0.416 | −9.11 | −8.73 (0.69) | 11.93 |
+
+return은 행보다 seed가 정한다: 네 행 모두에서 seed 0은 −18.8 근처, seed 2는 −9.1 근처에서
+시작한다. 엔트로피는 모든 실행에서 올랐고(iteration 0에서 ≈ 5.5), `envelope_violation_rate`와
+`executed_ne_sampled_rate`는 모든 실행의 모든 iteration에서 1.00이었다. 이전의 모든 reach 실행과
+같다. seed 0의 `pt-dr-pix`와 `rs-dr-pix`(같은 물리 추출, 다른 렌더러)의 iteration별 return은
+4,000 iteration에 걸쳐 최대 0.27, 평균 0.023 다르다. 실행별 9지표(`metrics/env-metrics.json`;
+나머지 다섯은 stage 1처럼 `null`):
+
+| 행 | seed | `physics_steps_per_sec` | `actions_per_sec` | `camera_frames_per_sec` | `pixels_per_sec` |
+|---|---|---|---|---|---|
+| `pt-dr-pix` | 0 / 1 / 2 | 37,548 / 32,275 / 32,753 | 9,387 / 8,069 / 8,188 | 765 / 595 / 593 | 7.05e6 / 5.48e6 / 5.46e6 |
+| `pt-pix` | 0 / 1 / 2 | 39,144 / 32,704 / 36,751 | 9,786 / 8,176 / 9,188 | 928 / 755 / 744 | 8.55e6 / 6.96e6 / 6.85e6 |
+| `rs-dr-pix` | 0 / 1 / 2 | 37,573 / 40,943 / 32,933 | 9,393 / 10,236 / 8,233 | 1,937 / 1,824 / 1,933 | 1.78e7 / 1.68e7 / 1.78e7 |
+| `rs-pix` | 0 / 1 / 2 | 42,788 / 33,360 / 33,559 | 10,697 / 8,340 / 8,390 | 1,894 / 1,893 / 1,885 | 1.75e7 / 1.74e7 / 1.74e7 |
+
+*평가.* 각 실행의 `checkpoints/4000.esb`를 자기 행의 평가 문서
+(`evaluation-reach-vision-<row>.toml`, seed 201–216, `es eval run --jobs 4 --frames`, 각 153–179
+초; 프레임은 각 보고서가 쓰인 뒤 지웠다)에서 평가했다. 스위트별 `success_rate`:
+
+| 행 | seed | `nominal` | `light_intensity` | `light_direction` | `observation_delay` | `torque_noise` | `backlash` |
+|---|---|---|---|---|---|---|---|
+| `pt-dr-pix` | 0, 1, 2 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 |
+| `pt-pix` | 0, 1, 2 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 |
+| `rs-dr-pix` | 0, 1, 2 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 |
+| `rs-pix` | 0, 1, 2 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 | 0.00, 0.00, 0.00 |
+
+모든 held-out 에피소드가 200 step timeout까지 갔고 `envelope_violation_rate`는 1.00이었다. 예로
+`pt-dr-pix` seed 1의 `nominal` 실패 히스토그램은 timeout 16, fallback 16, chunk underrun 16,
+position 위반 3,184, velocity 720, acceleration 112다.
+
+*Cross-render.* 열두 교차 평가(`Pt`로 학습한 것을 짝 `Rs` 문서에서, `Rs`로 학습한 것을 짝 `Pt`
+문서에서) 모두 에피소드가 돌기 전에 exit 1로 거부되었다. 예로 `pt-dr-pix` seed 0을
+`evaluation-reach-vision-rs-dr-pix.toml`에서:
+
+```
+error: tests/fixtures/rl/evaluation-reach-vision-rs-dr-pix.toml does not judge …/pt-dr-4spp-pix-s0/checkpoints/4000.esb:
+ERROR XIR-040  evaluation references a different Task or Observation IR
+  evaluation task reference is d3948e1b, the bundle hashes to eaa0d34b
+ERROR XIR-040  evaluation references a different Task or Observation IR
+  evaluation observation reference is 79495062, the bundle hashes to 1876c3f7
+```
+
+센서의 render 블록은 Task IR의 일부이므로, 해시 체인에게 `Pt` 행과 `Rs` 행은 서로 다른 두
+task이자 두 observation이며, 평가 문서는 자신이 이름 붙인 task와 observation을 가진 번들만
+판정한다(spec 10.4). 교차 렌더 평가에는 "같은 task를 다른 경로로 렌더한 것"을 평가 조건으로
+적을 방법이 필요하다. 이것은 설계 질문이며, 이 패킷이 우회할 대상이 아니다.
+
+*패킷의 질문.*
+
+1. **아니다:** 4,000 iteration에서 `pt-dr-pix`의 세 seed 중 어느 것도(다른 세 행의 어느 seed도)
+   여섯 스위트 어디에서도 held-out 성공을 한 번도 내지 못했고, 학습 return은 seed 사이의 차이
+   이상으로 움직이지 않았다.
+2. **4 spp에서 경로 추적기의 렌더는 iteration당 1.10–1.73 초로 `Rs`의 0.53–0.56 초 대비
+   2.0–3.3배이고, 이로써 iteration은 2.49–2.52 초 대비 3.07–3.71 초, 4,000 iteration 실행은
+   2.76–2.80 h 대비 3.41–4.12 h가 된다(stage 1에서 SVGF는 iteration당 렌더 0.2 초를 더한다).**
+3. **답하지 못했다:** 배운 정책이 없어 비교할 전이가 없고, 렌더러가 task의 일부이므로 해시
+   체인이 교차 렌더 평가를 XIR-040으로 거부한다.
 
 ## 8. 임포터와 어댑터
 
