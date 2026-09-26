@@ -3216,6 +3216,32 @@ training seeds per demo row (M10 S-4, M9 S-5).
 runtime imports and scores the result); locomotion terms (projected gravity, base velocity, commands — M6 stays parked); textures and
 materials (M7 R6); Newton's actuators and contacts (its adapter declares neither); temporal accumulation on the observation path.
 
+**M11 result (2026-09-26, `docs/reviews/M11.md`).** Every row of the ladder closed.
+
+- **Engines.** `es eval run`, `es loop collect` and `Rollout` take `--backend` over `mujoco-cpu`, `mjwarp` and `physx` (Isaac Sim 5.1),
+  with the engine and its adapter script hashed into the `hardware_capability` slot (`mujoco-cpu` keeps a zero slot).
+- **Adapter v2.** An Isaac Lab or Playground policy's joint order, default pose, per-term scale, action offset/scale and previous
+  action compile into the bundle within 1.2e-7 of the frameworks' own formulas. `set_params` brings mass, friction and gain draws
+  into physics, bitwise against a direct `MjModel` edit.
+- **Rendering in RL.** `Rollout` renders, and N envs render in one dispatch, bitwise against single renders. Every visual target
+  (light, colour, ambient, geom colour, camera pose, field of view with its intrinsics) is drawn per `(seed, env, episode)` and
+  renders the same frame in `Rollout`, the collector and the evaluator on two GPUs.
+- **`Pt` noise.** `render.svgf` joins `render.seed = "tick"`. On the demo's `Pt` row, SVGF stays within the spread of two training
+  seeds: held-out 0.375 / 0.0625 against U5's 0.25 / 0.375.
+- **Sim-to-sim, measured.** Three Isaac Lab reach policies average 0.76 in Isaac and 0.52–0.58 here across the four engines. No
+  single cause explains the gap: one tick of action latency costs 0.15, and joint damping and friction modelling account for most
+  of the rest.
+- **Vision RL on pixels.** With the cube's pose removed from the state, PPO scores 0.00 on 12 of 12 policies (`Pt` and `Rs`,
+  randomization on and off, three seeds). The machinery runs, and `envelope_violation_rate` is 1.00 in every iteration.
+- **Hash chain.** `Env::new` now refuses a scene whose hash the Task IR does not pin. `es-safety` untouched.
+
+Open for the owner (M11 review):
+- the envelope for a learning policy, which now gates both sim-to-sim fidelity and vision RL;
+- how a cross-render condition is declared, since the render block is in `task_hash` and XIR-040 refuses a `Pt` policy on an `Rs`
+  document;
+- a declared source latency;
+- what `asset_hash` is a function of.
+
 ---
 
 ## 29. Risks

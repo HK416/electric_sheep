@@ -23,8 +23,14 @@ absolute one (on the position envelope instead of the rate bounds) and learns le
 `scene_hash` no longer uses the host libm (Windows was the platform that moved; every server number stood, re-measured bitwise);
 `render.seed = "tick"` makes the PT observation path learnable (U5 held-out 0.25 vs U4 0.0 on the same data); the executed-action
 estimator (P-M9-R5) scores 0.00, so `sampled` stays; STL/OBJ mesh geoms load, hash by content, simulate on MuJoCo (upstream SO-101) and
-render at 0 ULP; `es-import` and `es-tools` splits. The next campaign waits on the human decisions in `docs/reviews/M10.md` (the RL lever
-after B, the cycle recipe's step count against today's longer demonstrations, two training seeds for demo rows, the next source policy),
+render at 0 ULP; `es-import` and `es-tools` splits. **M11 plan X** (spec §28.14, `docs/packets/M11/`) closed 2026-09-26: `--backend`
+runs eval/collect/`Rollout` on `mujoco-cpu`, `mjwarp` and `physx` (Isaac Sim 5.1, installed after the owner accepted the EULA) with the
+backend hashed; adapter v2 compiles an Isaac Lab / Playground policy's I/O conventions into the bundle; `set_params`, visual
+randomization (light, colour, geom rgba, camera pose and fov) and `render.svgf` are declared document fields, bitwise wherever a frame is
+rendered; N envs render in one dispatch; `Env::new` refuses a scene its Task IR does not pin. Measured: Isaac Lab reach policies score
+0.76 in Isaac and 0.52–0.58 here; SVGF stays inside two training seeds; pixel-only PPO scores 0.00 on 12 of 12 with the envelope clamping
+every step. The next campaign waits on the human decisions in `docs/reviews/M11.md` (the envelope for a learning policy, a cross-render
+condition, a declared source latency, `asset_hash`), `docs/reviews/M10.md` (the cycle recipe's step count, the next source policy),
 `docs/reviews/M9.md` (the buffered-path watchdog for delta policies) and the older ones in `docs/reviews/M7.md` (the stop rule's reading,
 the SSIM threshold). M6 (quadruped, `docs/design/quadruped-track.md`) is parked pending the owner's decision. GPU paths (es-gpu, es-render, Observation
 IR GPU lowering, MJWarp/Newton adapters) were verified on an RTX 4060 with the Vulkan SDK;
