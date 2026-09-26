@@ -1481,6 +1481,110 @@ fn eval_run_backend_help_lists_the_four_names() {
     }
 }
 
+/// Packet M11/R9 item 3 (`docs/reviews/M11.md` S-4): `es eval run` and `es loop collect` say,
+/// on one stdout line, which spec 3.5 tier produced the run -- the tier the backend declares.
+/// `mujoco-cpu` declares tier 3, physics meaning (`crates/es-physics-backend/src/mujoco.rs`
+/// says why it is not tier 1). A line, not a `report.json` field: nothing committed moves.
+#[test]
+fn runs_print_the_backends_determinism_tier() {
+    const TEST: &str = "runs_print_the_backends_determinism_tier";
+    const LINE: &str = "determinism tier: 3 PhysicsMeaning (backend mujoco-cpu)";
+    for probe in [
+        es_physics_backend::MuJoCoCpuBackend::is_available(),
+        es_policy::torch_runtime::is_available(),
+    ] {
+        if let Err(reason) = probe {
+            println!("SKIP {TEST}: {reason}");
+            return;
+        }
+    }
+    // The reach documents, 20 ticks an episode: an MLP, so a conforming checkpoint loads
+    // without a trained run, and one short episode is the cheapest run that writes a report.
+    let dir = scratch_dir("determinism-tier");
+    let read = |name: &str| std::fs::read_to_string(rl_fixture(name)).expect(name);
+    let mut task = es_ir::serial::task_from_toml(&read("task-reach.toml")).expect("task");
+    task.config.max_episode_steps = 20;
+    let mut obs =
+        es_ir::serial::observation_from_toml(&read("observation-reach.toml")).expect("obs");
+    obs.task_ref = task.task_hash().expect("the task hashes");
+    let mut learning =
+        es_ir::serial::learning_from_toml(&read("learning-reach.toml")).expect("learning");
+    let module = es_policy::lower_to_torch(&learning).expect("the reach graph lowers");
+    let weights = es_policy::weights::write_safetensors(&conforming_checkpoint(&module));
+    learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let deployment =
+        es_ir::serial::deployment_from_toml(&read("deployment-reach.toml")).expect("deploy");
+    let policy = dir.join("policy.esb");
+    std::fs::write(
+        &policy,
+        es_compile::PolicyBundle::build(&task, &obs, &learning, &deployment, &weights)
+            .expect("the reach documents pack"),
+    )
+    .expect("write policy.esb");
+    let config = dir.join("eval.toml");
+    write(
+        &config,
+        &es_ir::serial::evaluation_to_toml(&quadruped_evaluation(&task, &obs))
+            .expect("evaluation toml"),
+    );
+
+    let eval = bin()
+        .args(["eval", "run", "--config"])
+        .arg(&config)
+        .arg("--policy")
+        .arg(&policy)
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .arg("--out")
+        .arg(dir.join("eval"))
+        .output()
+        .expect("run es eval run");
+    // The collector under the demo's scripted expert: no weights to load at all.
+    let collect = bin()
+        .args([
+            "loop",
+            "collect",
+            "--expert",
+            "so101-pick-place",
+            "--policy",
+        ])
+        .arg(write_demo_bundle(&dir))
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .args([
+            "--episodes",
+            "1",
+            "--seed",
+            "4",
+            "--max-steps",
+            "4",
+            "--out",
+        ])
+        .arg(dir.join("collect"))
+        .output()
+        .expect("run es loop collect");
+    for (verb, out) in [("eval run", &eval), ("loop collect", &collect)] {
+        let text = stdout(out);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{verb}:\n{text}\n{}",
+            stderr_of(out)
+        );
+        assert_eq!(
+            text.lines().filter(|l| *l == LINE).count(),
+            1,
+            "{verb}: one `{LINE}` line\n{text}"
+        );
+    }
+    let report = std::fs::read_to_string(dir.join("eval").join("report.json")).expect("report");
+    assert!(!report.contains("determinism tier"), "{report}");
+    println!("RAN {TEST}");
+}
+
 /// Packet M5/V5. `--jobs 0` is "run no cell and report on it": a usage error (exit 2) raised
 /// while parsing, before a bundle, a scene or a Python interpreter is touched -- which is why
 /// this runs in the PR tier where neither `mujoco` nor `torch` exists. The same check covers

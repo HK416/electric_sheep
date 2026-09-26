@@ -609,6 +609,13 @@ pub(crate) fn run(
         })?;
         write_file(&docs.join("scene.xml"), &bytes)?;
         println!("rollout docs:  {}", docs.display());
+        // The one route that steps physics, so the one that has a tier to say (S-4).
+        let kind = match recipe.rl.as_ref().map(|rl| &rl.backend) {
+            Some(es_data::training::RlBackend::MjWarp) => es_physics_backend::BackendKind::MjWarp,
+            Some(es_data::training::RlBackend::PhysX) => es_physics_backend::BackendKind::PhysX,
+            _ => es_physics_backend::BackendKind::MuJoCoCpu,
+        };
+        println!("{}", super::eval::determinism_tier(kind));
     }
 
     // --- the plan ------------------------------------------------------------------------

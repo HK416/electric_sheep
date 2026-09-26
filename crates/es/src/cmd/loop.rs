@@ -709,6 +709,7 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
     println!("wrote {}", report.root.display());
     println!("episodes: {}   frames: {}", report.episodes, report.frames);
     println!("trajectories: {}", traj_dir.display());
+    println!("{}", crate::cmd::eval::determinism_tier(kind));
     let count = |t: Termination| report.terminations.iter().filter(|x| **x == t).count();
     println!(
         "terminations: success {}   failure {}   timeout {}   running {}",
