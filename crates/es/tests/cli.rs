@@ -14790,3 +14790,144 @@ fn train_x7_dry_run_plans() {
         assert!(want.contains("--iterations 4000"), "{want}");
     }
 }
+
+// --- packet M11/R10: pixel PPO with a privileged critic ------------------------------------
+
+/// Packet M11/R10 oracle 1: the arm-P recipes (`training-reach-vision-<row>-critic.toml`) plan
+/// the `[rl]` route as X7's recipe for the row plus `--critic privileged` last, pinned by
+/// `tests/golden/train/plan-reach-vision-<row>-critic.txt`. With `ES_GENERATE_GOLDENS=1` the
+/// goldens are written instead (new files; no older golden is rewritten).
+#[test]
+fn train_r10_dry_run_plans() {
+    for row in ["rs-pix", "rs-dr-pix"] {
+        let recipe = format!("tests/fixtures/rl/training-reach-vision-{row}-critic.toml");
+        let dir = scratch_dir("train-r10-dry");
+        let out = run_train(&recipe, &dir, &["--dry-run"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+        let golden = train_golden(&format!("plan-reach-vision-{row}-critic.txt"));
+        if std::env::var("ES_GENERATE_GOLDENS").as_deref() == Ok("1") {
+            write(&golden, &stdout(&out));
+            continue;
+        }
+        let want = std::fs::read_to_string(&golden)
+            .unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+        assert_eq!(stdout(&out), want, "{recipe}: stdout is not the golden");
+        let x7 = std::fs::read_to_string(train_golden(&format!("plan-reach-vision-{row}.txt")))
+            .expect("X7's golden");
+        let with = x7.replace(
+            "--value-coef 0.5\n",
+            "--value-coef 0.5 --critic privileged\n",
+        );
+        assert_ne!(with, x7, "the anchor moved");
+        assert_eq!(want, with, "{recipe} is not X7's recipe plus the critic");
+    }
+}
+
+/// Packet M11/R10 oracle 2: `es train` on a tiny `-pix` recipe with `critic = "privileged"`,
+/// two iterations on the CPU backend, run twice, gives bitwise-equal checkpoints and value
+/// files, and the value network's first layer reads the non-image ports and `qpos` -- never a
+/// pixel.
+#[test]
+fn train_rl_privileged_critic_is_bitwise_and_reads_state() {
+    use es_physics_backend::MuJoCoCpuBackend;
+    use es_physics_core::{LoadConfig, PhysicsBackend};
+
+    const TEST: &str = "train_rl_privileged_critic_is_bitwise_and_reads_state";
+    if !cfg!(feature = "render") {
+        println!("SKIP {TEST}: built without the `render` feature");
+        return;
+    }
+    let dir = scratch_dir("train-rl-critic");
+    let bundle = dir.join("untrained.esb");
+    std::fs::write(
+        &bundle,
+        pack_untrained(
+            &rl_fixture("task-reach-vision-rs.toml"),
+            &rl_fixture("observation-reach-vision-rs-pix.toml"),
+            &rl_fixture("learning-reach-vision-pix.toml"),
+            &rl_fixture("deployment-reach.toml"),
+        ),
+    )
+    .expect("write the -pix bundle");
+    let text = std::fs::read_to_string(rl_fixture("training-reach-vision-rs-pix-critic.toml"))
+        .expect("the recipe")
+        .replace("\r\n", "\n");
+    let recipe = text
+        .replace(
+            "bundle = \"runs/reach-vision-rs-pix/untrained.esb\"",
+            &format!("bundle = \"{}\"", train_toml_path(&bundle)),
+        )
+        .replace("envs        = 16", "envs        = 2")
+        .replace("horizon     = 64", "horizon     = 8")
+        .replace("steps         = 4000", "steps         = 2")
+        .replace("checkpoint_at = [1000, 2000, 3000]", "checkpoint_at = [2]")
+        .replace("device        = \"cuda\"", "device        = \"cpu\"");
+    assert!(
+        recipe.contains(&train_toml_path(&bundle)),
+        "the bundle anchor moved"
+    );
+    for anchor in ["envs        = 2", "steps         = 2", "\"cpu\""] {
+        assert!(recipe.contains(anchor), "the anchor for {anchor} moved");
+    }
+    let Some((a, _)) = run_rl_train(&recipe, &dir, "run-a") else {
+        return;
+    };
+    let (b, _) = run_rl_train(&recipe, &dir, "run-b").expect("the first run resolved ES_PYTHON");
+    for name in ["checkpoints/2.esb", "training/value.safetensors"] {
+        let (x, y) = (
+            std::fs::read(a.join(name)).expect(name),
+            std::fs::read(b.join(name)).expect(name),
+        );
+        assert_eq!(
+            hex(blake3::hash(&x).as_bytes()),
+            hex(blake3::hash(&y).as_bytes()),
+            "{name} is not bitwise between two runs of one recipe"
+        );
+    }
+
+    // The width the value reads: the non-image ports (an image port is `[C, H, W]`) plus the
+    // scene's `nq`, read here from the documents and the scene rather than from the trainer.
+    let observation = es_ir::serial::observation_from_toml(
+        &std::fs::read_to_string(rl_fixture("observation-reach-vision-rs-pix.toml"))
+            .expect("the observation"),
+    )
+    .expect("the observation parses");
+    let state: u64 = observation
+        .outputs
+        .values()
+        .filter_map(|o| match o.ty.shape.dims() {
+            [w] => Some(*w),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(state, 19, "the -pix state port");
+    let xml = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/mjcf/so101_pick_place.xml"),
+    )
+    .expect("the reach scene");
+    let scene = es_assets::parse_mjcf(&xml).expect("the scene parses").scene;
+    let nq = MuJoCoCpuBackend::new()
+        .load(
+            &scene,
+            &LoadConfig {
+                n_envs: 1,
+                rate: Some(TickRate::hz(200)),
+                seed: 1,
+            },
+        )
+        .expect("the scene loads")
+        .nq;
+    let value = std::fs::read(a.join("training/value.safetensors")).expect("the value file");
+    let header = es_policy::weights::parse_header(&value).expect("safetensors");
+    let first = &header["value.net.0.weight"].shape;
+    assert_eq!(
+        first,
+        &vec![64, state + u64::from(nq)],
+        "the privileged value's first layer is not state + nq wide"
+    );
+    println!(
+        "RAN {TEST}: 2 iterations twice, bitwise; value input {} = {state} + nq {nq}",
+        first[1]
+    );
+}

@@ -16,7 +16,8 @@ Usage:
                  [--schedule constant|warmup_cosine] [--warmup-steps N] [--lr-min F]
                  [--checkpoint-at 0 | 0,50,200] [--loss-curve curve.json]
                  [--progress-every N] [--estimator sampled|executed]
-                 [--backend mujoco-cpu|mjwarp|physx]
+                 [--backend mujoco-cpu|mjwarp|physx] [--critic observation|privileged]
+                 [--init-backbone weights.safetensors]
 
 Prints one JSON line on stdout and nothing else -- the same contract `es train` reads for
 `train_act.py`: `torch` goes into spec 19.3's `hardware.json` and `optimizer` is compared
@@ -59,6 +60,14 @@ documents is measuring a different thing than the evaluation will.
     `NormalTanhDistribution`; that is accepted and recorded (design note section 2) -- the
     imported *deterministic* policy is reproduced exactly by S2b, and continuation is a new
     training run whose distribution is ours.
+
+**What the value network reads** (packet M11/R10). `--critic observation`, the default, is every
+port flattened -- on a vision task that is 27,648 pixels into a 64-wide MLP. `--critic
+privileged` is the asymmetric actor-critic (Pinto et al., arXiv:1710.06542): every non-image
+port (a `[dim]` shape in `contract.json`) and `Rollout.qpos(env)`, read at the same state the
+observation was, so the cube's free joint reaches the baseline and no pixel does. The actor is
+unchanged, and the value stays training-only (rule 1): a deployment never has `qpos`, and it
+never needs it, because the value is never packed.
 
 **Horizon 1, synchronous** (design note section 3). PPO acts on every control tick: the chunk
 handed to the plane carries one row, `expected_latency_ms` is 0, and there is no chunk buffer.
@@ -104,6 +113,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from train_act import (  # noqa: E402
     build_policy,
     checkpoint_tensors,
+    init_backbone,
     init_weights as load_init_weights,
     lr_at,
     lr_curve_hash,
@@ -136,10 +146,11 @@ class Value(torch.nn.Module):
     reference PPO baseline's shape and is deliberately not a flag: a value head that needed
     tuning per task would be an IR decision wearing a command-line flag's clothes.
 
-    An image port reaches it flattened (packet M11/X3), so on the vision reach task its first
-    layer reads 27,648 pixels beside the 26 state lanes.
-    ponytail: a pixel MLP baseline; give the value its own conv trunk (still training-only) if a
-    vision run's value loss is what stalls it (spec 28.14 wave 3, X7).
+    Under `--critic observation` an image port reaches it flattened (packet M11/X3), so on the
+    vision reach task its first layer reads 27,648 pixels beside the state lanes; `--critic
+    privileged` reads the state ports and `qpos` instead (packet M11/R10).
+    ponytail: a pixel MLP baseline under `--critic observation`; give the value its own conv
+    trunk (still training-only) if a vision run that cannot use `privileged` needs one.
     """
 
     def __init__(self, obs_dim: int) -> None:
@@ -294,6 +305,20 @@ def main(argv: list) -> int:
         "recipe sets this",
     )
     p.add_argument(
+        "--critic",
+        choices=["observation", "privileged"],
+        default="observation",
+        help="what the value network reads: every observation port flattened (the default), or "
+        "every non-image port and Rollout.qpos (packet M11/R10); `[rl] critic` sets this",
+    )
+    p.add_argument(
+        "--init-backbone",
+        type=Path,
+        help="train_act.py's flag, through train_act.py's function: a backbone's own state_dict "
+        "loaded into every lowered pretrained backbone before the first step; `es train` passes "
+        "the `base_model` its recipe names (packet M11/R10)",
+    )
+    p.add_argument(
         "--progress-every",
         type=int,
         default=0,
@@ -332,6 +357,7 @@ def main(argv: list) -> int:
     action_dim = int(contract["action_dim"])
 
     actor = build_policy(a.module).to(device)
+    backbones = init_backbone(actor, read_safetensors(a.init_backbone)) if a.init_backbone else []
     initialised = (
         load_init_weights(actor, read_safetensors(a.init_weights)) if a.init_weights else []
     )
@@ -347,7 +373,20 @@ def main(argv: list) -> int:
     roll.reset(None)
 
     obs = observe(roll, shapes, a.envs, device)
-    obs_dim = int(flatten(obs, ports).shape[1])
+    if a.critic == "privileged":
+        state_ports = [q for q in ports if len(shapes[q]) == 1]
+
+        def critic_input(obs):
+            # `qpos` of the state `obs` was observed at: nothing steps the env between the
+            # two reads, and an env that ended an episode in `act` was reset before both.
+            qpos = torch.tensor(
+                [roll.qpos(i) for i in range(a.envs)], dtype=torch.float32
+            ).to(device)
+            return torch.cat([obs[q] for q in state_ports] + [qpos], dim=1)
+
+    else:
+        critic_input = lambda obs: flatten(obs, ports)  # noqa: E731
+    obs_dim = int(critic_input(obs).shape[1])
     value = Value(obs_dim).to(device)
 
     # Training-only state, `[action_dim]` wide and state-independent (design note section 2).
@@ -421,7 +460,7 @@ def main(argv: list) -> int:
 
         with torch.no_grad():
             for t in range(a.horizon):
-                flat = flatten(obs, ports)
+                flat = critic_input(obs)
                 mu = next(iter(actor(**obs).values()))[:, 0, :]
                 std = log_std.exp()
                 # Drawn on the CPU generator and then moved: the draw is the same on every
@@ -471,7 +510,7 @@ def main(argv: list) -> int:
                         episode_steps[i] = 0.0
                 obs = observe(roll, shapes, a.envs, device)
 
-            last_value = value(flatten(obs, ports))
+            last_value = value(critic_input(obs))
             advantages, returns = gae(
                 buf_rew, buf_val, buf_done, last_value, a.gamma, a.lam
             )
@@ -681,6 +720,9 @@ def main(argv: list) -> int:
             "weight_decay": group["weight_decay"],
         },
     }
+    if backbones:
+        # Only when one was loaded, so a run without reports the bytes it always did.
+        report["backbones"] = backbones
     sys.stdout.write(json.dumps(report) + "\n")
     return 0
 
