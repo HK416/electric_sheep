@@ -29,7 +29,10 @@ backend hashed; adapter v2 compiles an Isaac Lab / Playground policy's I/O conve
 randomization (light, colour, geom rgba, camera pose and fov) and `render.svgf` are declared document fields, bitwise wherever a frame is
 rendered; N envs render in one dispatch; `Env::new` refuses a scene its Task IR does not pin. Measured: Isaac Lab reach policies score
 0.76 in Isaac and 0.52–0.58 here; SVGF stays inside two training seeds; pixel-only PPO scores 0.00 on 12 of 12 with the envelope clamping
-every step. The next campaign waits on the human decisions in `docs/reviews/M11.md` (the envelope for a learning policy, a cross-render
+every step. The M11 follow-ups (addendum in `docs/reviews/M11.md`, 2026-09-27): `cargo xtask ci` runs end to end with
+`ES_PYTHON` (R5); `[rl] critic = "privileged"` (R10); a 100-iteration lr warmup keeps the pixel actor's `tanh` out of
+first-update saturation, and pixel-only PPO scores its first held-out successes (`rs-pix` 0.06–0.19 nominal, 3 of 3 seeds; R11).
+The next campaign waits on the human decisions in `docs/reviews/M11.md` (the envelope for a learning policy, a cross-render
 condition, a declared source latency, `asset_hash`), `docs/reviews/M10.md` (the cycle recipe's step count, the next source policy),
 `docs/reviews/M9.md` (the buffered-path watchdog for delta policies) and the older ones in `docs/reviews/M7.md` (the stop rule's reading,
 the SSIM threshold). M6 (quadruped, `docs/design/quadruped-track.md`) is parked pending the owner's decision. GPU paths (es-gpu, es-render, Observation
