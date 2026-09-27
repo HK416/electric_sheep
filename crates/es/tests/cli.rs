@@ -14936,6 +14936,38 @@ fn train_r10_dry_run_plans() {
     }
 }
 
+/// Packet M11/R11 oracle 4: arm AW's recipes (`training-reach-vision-<row>-critic-warmup.toml`),
+/// the two that reached stage C, plan R10's arm-P recipe for the row plus the warmup-cosine
+/// schedule last, pinned by `tests/golden/train/plan-reach-vision-<row>-critic-warmup.txt`. With
+/// `ES_GENERATE_GOLDENS=1` the goldens are written instead (new files; no older golden is
+/// rewritten).
+#[test]
+fn train_r11_dry_run_plans() {
+    for row in ["rs-pix", "rs-dr-pix"] {
+        let recipe = format!("tests/fixtures/rl/training-reach-vision-{row}-critic-warmup.toml");
+        let dir = scratch_dir("train-r11-dry");
+        let out = run_train(&recipe, &dir, &["--dry-run"]);
+        assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+        let golden = train_golden(&format!("plan-reach-vision-{row}-critic-warmup.txt"));
+        if std::env::var("ES_GENERATE_GOLDENS").as_deref() == Ok("1") {
+            write(&golden, &stdout(&out));
+            continue;
+        }
+        let want = std::fs::read_to_string(&golden)
+            .unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+        assert_eq!(stdout(&out), want, "{recipe}: stdout is not the golden");
+        let r10 =
+            std::fs::read_to_string(train_golden(&format!("plan-reach-vision-{row}-critic.txt")))
+                .expect("R10's golden");
+        let with = r10.replace(
+            "--critic privileged\n",
+            "--critic privileged --schedule warmup_cosine --warmup-steps 100 --lr-min 0\n",
+        );
+        assert_ne!(with, r10, "the anchor moved");
+        assert_eq!(want, with, "{recipe} is not R10's recipe plus the schedule");
+    }
+}
+
 /// Packet M11/R10 oracle 2: `es train` on a tiny `-pix` recipe with `critic = "privileged"`,
 /// two iterations on the CPU backend, run twice, gives bitwise-equal checkpoints and value
 /// files, and the value network's first layer reads the non-image ports and `qpos` -- never a

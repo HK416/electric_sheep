@@ -1,0 +1,43 @@
+# Packet M11/R11 arm AW on the `rs-dr-pix` row: R10's arm-P recipe
+# (training-reach-vision-rs-dr-pix-critic.toml) with
+# `[run] schedule = { kind = "warmup_cosine", warmup = 100, lr_min = 0.0 }` and nothing else
+# changed (docs/packets/M11/P-M11-R11-first-update-saturation.md; docs/design/rl-continuation.md
+# section 7, R11). The `rs-pix` sibling, training-reach-vision-rs-pix-critic-warmup.toml, says why
+# `warmup` is 100: the trainer's schedule counts PPO iterations, so 100 iterations are 1,600
+# optimizer steps. Seeds 1 and 2 are this file with `[run] seed` changed.
+#
+# The bundle is X7's `rs-dr-pix` bundle:
+#
+#     ES_PACK_TASK=tests/fixtures/rl/task-reach-vision-rs-dr.toml \
+#     ES_PACK_OBSERVATION=tests/fixtures/rl/observation-reach-vision-rs-dr-pix.toml \
+#     ES_PACK_LEARNING=tests/fixtures/rl/learning-reach-vision-pix.toml \
+#     ES_PACK_DEPLOYMENT=tests/fixtures/rl/deployment-reach.toml \
+#     ES_PACK_OUT=runs/reach-vision-rs-dr-pix/untrained.esb \
+#     cargo test -p es --test cli -- --ignored pack_untrained_bundle
+
+kind = "training"
+
+[policy]
+bundle = "runs/reach-vision-rs-dr-pix/untrained.esb"
+
+[rl]
+algo        = "ppo"
+envs        = 16
+horizon     = 64
+epochs      = 4
+minibatches = 4
+gamma       = 0.99
+lam         = 0.95
+clip        = 0.2
+entropy     = 0.005
+value_coef  = 0.5
+critic      = "privileged"
+
+[run]
+steps         = 4000
+lr            = 3e-4
+schedule      = { kind = "warmup_cosine", warmup = 100, lr_min = 0.0 }
+seed          = 0
+checkpoint_at = [1000, 2000, 3000]
+device        = "cuda"
+interpreter   = "python"
