@@ -1583,6 +1583,163 @@ envelope") holds only in part. The cause is in the actor's first update, not in 
 2. **Not measured.** The ImageNet arm stopped because nothing between the `Normalized{0,1}` port
    and a pretrained backbone applies ImageNet's input normalization.
 
+### R11 — the pixel actor's first update, oracle server (Linux, RTX 4090), 2026-09-26/27 UTC
+
+Packet `docs/packets/M11/P-M11-R11-first-update-saturation.md`. Type D: recipes only, no code
+changed. Everything ran under `~/artifacts/plan-x/r11/` (`r11.sh`, `sumA.py`, `decideB.py`) with
+R10's build: `es` and `es_native` from `82db6db`, the tree `~/Projects/es-r10`, R10's two
+untrained bundles, R10's lowered `rs-pix` module and its `diag.py`. Interpreter
+`~/venvs/es-lerobot-cuda/bin/python`, `--device cuda`, CPU physics. Every arm is `rs-pix` with
+`critic = "privileged"`, and every recipe is R10's `training-reach-vision-rs-pix-critic.toml`
+with only the named field changed (`training-reach-vision-rs-pix-critic-{lr1e-4, lr3e-5, lr1e-5,
+warmup, clip}.toml`). The server script rewrites `steps`, `checkpoint_at` and the bundle path per
+stage, as R10's did. A foreign process (`SSR_RENDER_GLTF`, 994 MiB) was on the GPU at every
+stage's start.
+
+**AW's `warmup` is 100, counted in iterations.** `train_ppo.py` evaluates the schedule once per
+PPO iteration (`lr_at(iteration, iterations, lr, lr_min, warmup_steps)`), and all 4 epochs × 4
+minibatches = 16 Adam steps of that iteration use it. So "100 iterations of optimizer steps" is
+100 × 4 × 4 = 1,600 Adam steps, and in the trainer's unit the field is `warmup = 100`.
+`warmup = 1600` would have been 1,600 iterations. Two consequences, reported rather than fixed:
+
+* `Schedule::warmup` (`crates/es-data/src/training.rs`) is documented as "optimizer steps". That
+  is true on the IR route (`train_act.py`), and on the `[rl]` route it is iterations.
+* `es train` refuses `warmup >= steps`, so AW's 20-iteration probe cannot be written. AW's probe
+  ran the same recipe at `steps = 101` with `checkpoint_at = [1, 5, 20]` and reads iterations
+  1–20. On the ramp the rate is `3e-4 × iteration / 100`, whatever the run's length, and the
+  probe's first 100 returns equal stage B's to the last digit.
+
+The ramp starts at 0 (`lr_at(0) = 0`), so AW's first update does not move the actor. Its
+checkpoint 1 measures exactly as the untrained actor does.
+
+**Stage A, the probe** (20 iterations, seed 0). `diag.py` drove 16 envs × 64 steps of each
+checkpoint's deterministic `mu` from seed 0 and hooked the head's `Linear` for `z`, the value
+before `tanh`. "Segment" is that rollout's return. "Train" is the loss curve's `return` at
+0-based index 1, 5 and 19, the segment collected by the actor after that many updates (index 20
+does not exist in a 20-iteration run). The untrained actor has mean |z| 0.239, share of |z| > 3
+0.00 and segment return −8.58.
+
+| arm | change | lr at it. 20 | mean \|z\| 1 / 5 / 20 | share \|z\| > 3, 1 / 5 / 20 | segment return 1 / 5 / 20 | train return 1 / 5 / 19 |
+|---|---|---|---|---|---|---|
+| A0 | none | 3e-4 | 6.95 / 8.38 / 9.19 | 0.83 / 1.00 / 1.00 | −18.02 / −18.02 / −18.02 | −16.07 / −19.21 / −18.69 |
+| A1 | `lr = 1e-4` | 1e-4 | 2.50 / 2.78 / 3.05 | 0.17 / 0.33 / 0.33 | −21.43 / −21.56 / −21.88 | −20.55 / −20.40 / −21.07 |
+| A2 | `lr = 3e-5` | 3e-5 | 0.69 / 0.69 / 0.76 | 0.00 / 0.00 / 0.00 | −14.17 / −11.95 / −7.66 | −9.29 / −21.02 / −13.01 |
+| A3 | `lr = 1e-5` | 1e-5 | 0.21 / 0.24 / 0.21 | 0.00 / 0.00 / 0.00 | −7.90 / −6.89 / −5.51 | −8.57 / −6.93 / −5.39 |
+| AW | warmup-cosine, `warmup = 100` | 6e-5 | 0.24 / 0.22 / 0.28 | 0.00 / 0.00 / 0.00 | −8.58 / −6.99 / −8.94 | −8.85 / −7.21 / −10.10 |
+| AG | `grad_clip = 0.5` | 3e-4 | 7.40 / 8.77 / 8.70 | 1.00 / 1.00 / 1.00 | −18.02 / −18.02 / −18.02 | −16.08 / −19.21 / −18.71 |
+
+A0 reproduces R10's collapse. Its first 20 training returns equal R10's `s1-p` run's to the last
+digit (the largest difference is 0.0), including −8.90 → −16.07 between index 0 and index 1. Its
+actor already has 83 % of |z| beyond 3 after one update, so the stage stands. A1's shares
+(1/6, 2/6) are one and then two of the six channels saturated on every step. Clipping the global
+gradient norm at 0.5 changes nothing measurable: AG's returns stay within 0.03 of A0's.
+
+*Rule A.* The stable arms (share of |z| > 3 at iteration 20 below 0.05) are A2 (0.00), A3 (0.00)
+and AW (0.00). A0 (1.00), A1 (0.33) and AG (1.00) are not. Among the stable arms the largest rate
+at iteration 20 is AW's 6e-5 (A2 3e-5, A3 1e-5), so **AW goes to stage B**. The GPU lock was held
+for 629 s: 58–60 s per 20-iteration run, 262 s for AW's 101 iterations and 74 s for the
+diagnostic.
+
+AW's probe also recorded iterations 21–100. They were not part of the rule, but they were
+already on disk. The return stays between −4.7 and −12.2 through iteration 44, then drops to
+−22.1 at iteration 46, where the ramp is at 1.38e-4.
+
+**Stage B, the screen** (AW, `rs-pix`, seed 0, 1,000 iterations; the schedule ramps over
+iterations 0–100 and then decays by cosine to 0 at 1,000). The windows are iterations 900–999
+with the population std, and the baseline is X7's `rs-pix-s0` curve, as in R10.
+
+| run | wall clock | s / it. | render | rollout | learner | mean return 900–999 (std) | margin | passes? |
+|---|---|---|---|---|---|---|---|---|
+| baseline (X7 `rs-pix-s0`) | — | 2.49 | 0.54 | 1.54 | 0.417 | −18.623 (0.360) | — | — |
+| AW | 0.734 h | 2.64 | 0.56 | 1.67 | 0.414 | −3.950 (0.295) | +14.673 | **yes** (needs > 0.360) |
+
+| iteration | 0 | 1 | 46 | 100 | 150 | 500 | 999 |
+|---|---|---|---|---|---|---|---|
+| value loss / entropy / return | 3.27 / 5.51 / −8.90 | 3.82 / 5.51 / −8.85 | — / — / −22.08 | 3.28 / 5.57 / −18.20 | — / — / −7.42 | 0.57 / 5.90 / −4.73 | 0.73 / 5.88 / −3.49 |
+
+The return is below −15 on 87 of iterations 45–132. It recovers after 132, while the rate is
+still near its 3e-4 peak: −7.2 by iteration 152, −5.0 on average over iterations 200–299 and −4.4
+over 400–499. `diag.py`:
+checkpoint 100 has mean |z| 1.31, share 0.00 and segment return −17.48. Checkpoint 1,000 has mean
+|z| 1.51, share 0.069 and segment return −4.04, better than both constant actions (−14.36 and
+−8.37). `envelope_violation_rate` and `executed_ne_sampled_rate` were 1.00 in every iteration.
+The nine metrics were `physics_steps_per_sec` 28,331, `actions_per_sec` 7,083,
+`camera_frames_per_sec` 1,838 and `pixels_per_sec` 1.69e7; the other five were `null` (not
+instrumented).
+
+*Rule B passes*, so the budget was projected before stage C: 0.91 GPU-hours used, plus six runs
+at four times stage B's lock time, six evaluations at 0.05 h and two diagnostics, gives
+18.9 GPU-hours, inside the 25-hour budget. Stage C ran.
+
+**Stage C, the rows.** AW × seeds {0, 1, 2} × `rs-pix` and `rs-dr-pix`
+(`training-reach-vision-rs[-dr]-pix-critic-warmup.toml`, 4,000 iterations, plan goldens
+`plan-reach-vision-rs[-dr]-pix-critic-warmup.txt` from `train_r11_dry_run_plans`). The final
+value loss, entropy and return are at iteration 3,999. The last-100 return is the mean (std) over
+iterations 3,900–3,999. |z| and the segment return come from `diag.py` on `checkpoints/4000.esb`,
+run on the row's own rollout documents.
+
+| row | seed | wall clock | s / it. | final value loss / entropy / return | last 100 return (std) | X7's last 100 | mean \|z\| / share > 3 | segment return |
+|---|---|---|---|---|---|---|---|---|
+| `rs-pix` | 0 | 2.94 h | 2.65 | 0.61 / 5.91 / −3.72 | −3.41 (0.21) | −16.73 | 5.12 / 0.58 | −3.83 |
+| `rs-pix` | 1 | 2.93 h | 2.64 | 0.34 / 5.71 / −3.90 | −4.04 (0.31) | −7.77 | 4.08 / 0.53 | −4.43 |
+| `rs-pix` | 2 | 2.94 h | 2.64 | 0.58 / 7.14 / −4.13 | −4.43 (0.39) | −8.73 | 7.76 / 0.85 | −4.60 |
+| `rs-dr-pix` | 0 | 2.96 h | 2.66 | 0.36 / 5.69 / −3.77 | −4.01 (0.28) | −18.66 | 2.28 / 0.35 | −4.08 |
+| `rs-dr-pix` | 1 | 2.95 h | 2.65 | 0.66 / 7.05 / −5.49 | −5.78 (0.31) | −15.92 | 3.55 / 0.50 | −5.94 |
+| `rs-dr-pix` | 2 | 2.93 h | 2.64 | 2.33 / 7.14 / −4.86 | −5.18 (0.74) | −8.70 | 14.88 / 0.88 | −6.42 |
+
+Render was 0.54–0.56 s, rollout 1.66–1.69 s and learner 0.414 s per iteration in every run.
+`envelope_violation_rate` and `executed_ne_sampled_rate` were 1.00 in every iteration of every
+run. The nine metrics (`metrics/env-metrics.json`; `observation_gb_per_sec`,
+`policy_inferences_per_sec`, `p50_end_to_end_latency`, `p95_end_to_end_latency`,
+`gpu_memory_peak` and `chunk_underrun_rate` were `null`, as before):
+
+| row | seeds | `physics_steps_per_sec` | `actions_per_sec` | `camera_frames_per_sec` | `pixels_per_sec` |
+|---|---|---|---|---|---|
+| `rs-pix` | 0 / 1 / 2 | 27,363 / 28,919 / 29,255 | 6,841 / 7,230 / 7,314 | 1,859 / 1,900 / 1,896 | 1.71e7 / 1.75e7 / 1.75e7 |
+| `rs-dr-pix` | 0 / 1 / 2 | 26,732 / 31,006 / 31,528 | 6,683 / 7,752 / 7,882 | 1,839 / 1,827 / 1,822 | 1.69e7 / 1.68e7 / 1.68e7 |
+
+*Evaluation.* Each run's `checkpoints/4000.esb` on its row's document
+(`evaluation-reach-vision-<row>.toml`, seeds 201–216, `es eval run --jobs 4 --frames`, 138–154 s
+each; the frames were deleted after each report). `success_rate` per suite:
+
+| row | seed | `nominal` | `light_intensity` | `light_direction` | `observation_delay` | `torque_noise` | `backlash` |
+|---|---|---|---|---|---|---|---|
+| `rs-pix` | 0 | 0.1875 | 0.125 | 0.3125 | 0.1875 | 0.4375 | 0.1875 |
+| `rs-pix` | 1 | 0.125 | 0.0625 | 0.00 | 0.0625 | 0.1875 | 0.1875 |
+| `rs-pix` | 2 | 0.0625 | 0.00 | 0.125 | 0.125 | 0.0625 | 0.125 |
+| `rs-dr-pix` | 0 | 0.3125 | 0.1875 | 0.3125 | 0.00 | 0.25 | 0.25 |
+| `rs-dr-pix` | 1 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+| `rs-dr-pix` | 2 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 | 0.00 |
+
+These are the first held-out successes of pixel-only PPO in this project, where X7 scored 0.00 on
+all 12 runs. No run meets the documents' acceptance (`nominal` success ≥ 0.8). The
+`envelope_violation_rate` is still 1.00 in every suite. The `nominal` histogram of `rs-dr-pix`
+seed 0, for one, is 5 successes, 11 timeouts, 16 fallbacks, 16 chunk underruns, and 2,426
+position, 2,262 velocity and 2,085 acceleration violations.
+
+Two limits on what stage C shows:
+
+* Against X7, AW changes both the critic and the schedule. Against R10 it changes only the
+  schedule, and R10's arm P followed X7 within 0.036 return per iteration for 1,000 iterations.
+  The schedule is also a warmup *and* a decay to 0, and this packet does not separate the two.
+* At 4,000 iterations the head's `tanh` is partly saturated again in every run (share of
+  |z| > 3 of 0.35–0.88). This time it comes with the best returns measured, so late saturation
+  here is not the first-update collapse.
+
+The GPU lock was held for 18.82 h in total: stage A 0.17 h, stage B 0.74 h (2,645 s training,
+14 s diagnostic), and stage C 17.90 h (63,536 s training, 881 s evaluation, 36 s diagnostics).
+
+*The packet's questions.*
+
+1. **A lower rate of 3e-5 or 1e-5, or a 100-iteration warmup, keeps the pixel actor's `tanh` out of
+   saturation through 20 iterations (share of |z| > 3 of 0.00 at iteration 20). `lr = 1e-4`
+   (0.33) and `grad_clip = 0.5` (1.00, the same as no change) do not. Rule A chose the warmup.**
+2. **Yes, partly.** With the warmup-cosine schedule and R10's privileged critic, pixel-only PPO
+   learns `rs-pix`. The 1,000-iteration screen beat X7's baseline by 14.7 return (−3.95 against
+   −18.62), and at 4,000 iterations all three `rs-pix` seeds score held-out `nominal` successes
+   (0.19, 0.13, 0.06) where X7's scored 0.00. So does one of three `rs-dr-pix` seeds (0.31).
+   None comes near the 0.8 acceptance, and the envelope still clamps every step.
+
 ## 8. The importer and the adapter
 
 Rule 3 of section 1 says the adapter declares and code never guesses. This is what that comes
