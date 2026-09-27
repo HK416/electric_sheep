@@ -351,7 +351,9 @@ pub struct Run {
 pub struct Schedule {
     /// `constant` or `warmup_cosine`.
     pub kind: String,
-    /// Optimizer steps of linear warmup from 0 to `[run] lr`.
+    /// Linear warmup from 0 to `[run] lr`, in `[run] steps`' unit: optimizer steps on the IR
+    /// route, PPO iterations on the `[rl]` route, where every epoch and minibatch of an
+    /// iteration uses that iteration's rate (packet M11/R11).
     #[serde(default)]
     pub warmup: u32,
     /// The floor the cosine decays to.
