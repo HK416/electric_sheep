@@ -25,15 +25,10 @@
 "textsize.l" = "L"
 
 # --- the tabs. The hover carries the name the tab used to have, and its spec section. -----
-"tab.design" = "Design"
 "tab.design.hint" = "Graph - the four IRs stacked, read-only or edited (spec 23.2, spec 23.4)"
-"tab.results" = "Results"
 "tab.results.hint" = "Run - a finished run's cells, and the Start panel that begins one (spec 10.5, spec 23.1)"
-"tab.live" = "Live"
 "tab.live.hint" = "Telemetry - what a running process is publishing right now (spec 23.3)"
-"tab.sees" = "What the policy sees"
 "tab.sees.hint" = "Images - the observation frame before and after preprocessing (spec 23.3, spec 7)"
-"tab.problems" = "Problems"
 "tab.problems.hint" = "Diagnostics - what the IRs complain about (spec 11.1)"
 "tab.edit" = "Edit"
 "tab.edit.hint" = "Edit mode - one EditSession over the Task IR (spec 23.4 stage 2)"
@@ -51,20 +46,38 @@
 "status.refused" = "Refused: {} {}"
 "status.font_missing" = "No Korean, Japanese or Chinese font on this machine, so that text shows as boxes. Tried: {}. On Debian or Ubuntu, install fonts-noto-cjk."
 
-# --- the home screen --------------------------------------------------------------------
+# --- the start screen (packet M12/Y11) ----------------------------------------------------
 "home.recent" = "Recent"
-"home.step.design" = "Describe the task, what the robot senses, and what counts as success."
-"home.step.collect" = "Gather demonstrations, so the robot has something to learn from."
-"home.step.train" = "Train a policy on what was collected, and watch the loss come down."
-"home.step.evaluate" = "Run the policy against the acceptance tests and read the verdict."
-"home.step.watch" = "Watch a run as it happens, and replay the episodes that went wrong."
+"home.check" = "This PC:"
+"home.checking" = "Checking what this PC has - this can take half a minute."
+"home.check_failed" = "Could not check this PC: {}"
+"home.es_binary" = "The es program it ran: {} ({})"
+"home.optional" = "{} (optional)"
+"home.mark.have" = "Found on this PC"
+"home.mark.missing" = "Not found on this PC"
+"home.mark.optional" = "Not found; only needed to use this simulator"
+"home.install" = "To add what is marked red: install Python 3 and run pip install mujoco torch lerobot, and update the graphics driver for Vulkan. If es finds a different Python, set ES_PYTHON to the one you installed into. Then restart the editor."
+"home.what" = "What would you like to do?"
+"home.create" = "Create a project..."
+"home.missing" = "Cannot start yet. Missing on this PC: {}"
+"home.unknown" = "Waiting for the PC check before this can start."
+"home.broken_template" = "A template could not be read: {} ({})"
+"home.no_templates" = "No templates were found next to this program."
+"home.gone" = "{} - no longer there"
+"home.open_ways" = "Or open something you already have"
+"home.new_title" = "New project"
+"home.name" = "Name"
+"home.folder" = "Folder"
+"home.folder.hint" = "Where the project's files go. A folder you choose that already holds files gets a new folder inside it."
+"home.create_button" = "Create"
+"home.cancel" = "Cancel"
+"home.create_failed" = "Could not create the project: {}"
+"home.already_project" = "That folder already holds a project. Choose another folder or name."
 
 # --- the workflow's five words ----------------------------------------------------------
-"word.design" = "Design"
 "word.collect" = "Collect"
 "word.train" = "Train"
 "word.evaluate" = "Evaluate"
-"word.watch" = "Watch"
 "word.expert_gate" = "Check the demonstration"
 "word.showcase" = "Make a video"
 
@@ -255,6 +268,7 @@
 "template.cube_into_bin_hint.notice" = "Practice: the simulator also tells the policy where the cube is, which a real robot cannot know. That makes the task much easier than it is for a real robot."
 
 # --- the PC check: what a template needs ----------------------------------------------------
+"deps.python" = "Python"
 "deps.mujoco" = "MuJoCo physics simulator"
 "deps.torch" = "PyTorch machine learning library"
 "deps.lerobot" = "LeRobot robot learning tools"
@@ -276,8 +290,7 @@
 "run.stopped_by_you" = "Stopped by you"
 
 # --- the shell: menu bar, step bar, dock and status line (packet M12/Y10) -----------------
-"menu.new_project" = "New project from a template..."
-"menu.new_project.hint" = "Not here yet: the start screen will offer the templates."
+"menu.new_project" = "New project from a template"
 "menu.open_project" = "Open a project..."
 "menu.open_file" = "Open a file..."
 "menu.open_run" = "Open a run folder..."

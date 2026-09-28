@@ -28,6 +28,7 @@ use es_render::raster::Camera;
 use crate::model::edit::{self, EditIr, EditSession};
 use crate::model::fonts;
 use crate::model::graph_view::LayeredGraph;
+use crate::model::home::StartScreen;
 use crate::model::i18n::{self, Lang};
 use crate::model::image_view::{BeforeAfter, ImagePair};
 use crate::model::inspector::Inspector;
@@ -116,6 +117,8 @@ pub struct EditorApp {
     /// Nothing else in this file may consult them: what they change is which *table*
     /// [`i18n::t`] reads, never which sentence is written here.
     pub(crate) settings: Settings,
+    /// The start screen (packet M12/Y11): the PC check, the templates, the new-project dialog.
+    pub(crate) home: StartScreen,
 }
 
 impl std::fmt::Debug for EditorApp {
@@ -163,6 +166,7 @@ impl EditorApp {
             recent: Recent::default(),
             pending_open: None,
             settings: Settings::default(),
+            home: StartScreen::load(),
         }
     }
 
@@ -227,8 +231,10 @@ impl EditorApp {
         Arrangement::of(self.project.as_ref().map(|p| p.phase))
     }
 
-    /// Brings `pane` to the front in the arrangement shown now.
+    /// Brings `pane` to the front in the arrangement shown now. Asking for a pane is asking for
+    /// the dock, so the start screen gives way even with nothing open.
     pub(crate) fn focus(&mut self, pane: Pane) {
+        self.home.workspace = true;
         let arrangement = self.arrangement();
         self.docks.focus(arrangement, pane);
     }

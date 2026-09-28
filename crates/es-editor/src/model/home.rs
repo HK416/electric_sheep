@@ -5,6 +5,11 @@
 //! thread because the probe imports Python modules and can take half a minute. A template that
 //! this PC cannot run is not hidden: [`availability`] names what is missing, and the card is
 //! drawn disabled with those names in plain words ([`need_label`]).
+//!
+//! What the start screen itself decides (packet M12/Y11) is here too: how each PC-check item is
+//! marked ([`pc_check`]), what a card that cannot be created says ([`availability_text`]), where
+//! a new project goes ([`NewProject`]), and when the start screen fills the window
+//! ([`StartScreen::shown`]). `ui/home.rs` only draws the answers.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -12,9 +17,10 @@ use std::sync::mpsc::{self, Receiver};
 
 use serde::Deserialize;
 
-use crate::model::project::Project;
+use crate::model::i18n::{self, Lang};
+use crate::model::project::{Project, ProjectError};
 use crate::model::recent::{self, Recent};
-use crate::model::template::Template;
+use crate::model::template::{load, templates_root, Template};
 use crate::model::workflow::{phases, PhaseState, RunFacts};
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -225,6 +231,285 @@ pub fn recent_cards(recent: &Recent) -> Vec<RecentCard> {
         .collect()
 }
 
+// --- the start screen (packet M12/Y11) --------------------------------------------------------
+
+/// How one item of the PC-check line is marked: green when this PC has it, red when a template
+/// needs it and it is not here, amber for an optional simulator that is not here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    Have,
+    Missing,
+    Optional,
+}
+
+impl Mark {
+    /// The same mid tones as the step bar's dots (`layout::colour`), so one green means one thing.
+    pub fn colour(self) -> [u8; 3] {
+        match self {
+            Mark::Have => [70, 170, 90],
+            Mark::Missing => [220, 80, 70],
+            Mark::Optional => [230, 165, 40],
+        }
+    }
+
+    /// A shape as well as a colour, for whoever cannot tell red from green.
+    pub fn glyph(self) -> &'static str {
+        match self {
+            Mark::Have => "\u{2714}",
+            Mark::Missing => "\u{2716}",
+            Mark::Optional => "\u{25cb}",
+        }
+    }
+
+    /// The hover: what the mark means.
+    pub fn key(self) -> &'static str {
+        match self {
+            Mark::Have => "home.mark.have",
+            Mark::Missing => "home.mark.missing",
+            Mark::Optional => "home.mark.optional",
+        }
+    }
+}
+
+/// One item of the PC-check line.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckItem {
+    /// Its plain name; `home.optional` takes the simulator's name as its `{}`.
+    pub key: &'static str,
+    pub name: Option<String>,
+    pub mark: Mark,
+    /// Why an optional simulator is not here, in `es`'s own words (not translated: they are
+    /// another program's).
+    pub reason: Option<String>,
+}
+
+/// The PC-check line: Python, every `needs` name the editor knows, then each physics backend as
+/// an optional extra.
+pub fn pc_check(deps: &Deps) -> Vec<CheckItem> {
+    let item = |key, have: bool| CheckItem {
+        key,
+        name: None,
+        mark: if have { Mark::Have } else { Mark::Missing },
+        reason: None,
+    };
+    let mut items = vec![item("deps.python", deps.python.found)];
+    items.extend(NEEDS.iter().map(|n| item(n.1, (n.2)(deps))));
+    items.extend(deps.backends.iter().map(|b| CheckItem {
+        key: "home.optional",
+        name: Some(b.name.clone()),
+        mark: if b.available {
+            Mark::Have
+        } else {
+            Mark::Optional
+        },
+        reason: b.reason.clone(),
+    }));
+    items
+}
+
+/// Whether the line needs the sentence on how to install what is missing: only for a red item.
+pub fn needs_install(items: &[CheckItem]) -> bool {
+    items.iter().any(|i| i.mark == Mark::Missing)
+}
+
+/// What a card (or a File-menu item) says instead of offering Create, and in which colour: the
+/// missing items in plain words (red), or that the PC check has not answered (amber). `None`
+/// when the template is ready.
+pub fn availability_text(lang: Lang, availability: &Availability) -> Option<(Mark, String)> {
+    match availability {
+        Availability::Ready => None,
+        Availability::Unknown => Some((Mark::Optional, i18n::t(lang, "home.unknown").to_owned())),
+        Availability::Missing(names) => {
+            let words: Vec<&str> = names
+                .iter()
+                .map(|n| need_label(n).map_or(n.as_str(), |k| i18n::t(lang, k)))
+                .collect();
+            let text = i18n::fill(lang, "home.missing", &[&words.join(", ")]);
+            Some((Mark::Missing, text))
+        }
+    }
+}
+
+/// Where new projects go by default, under the person's Documents folder.
+const PROJECTS_DIR: &str = "Electric Sheep";
+
+/// `<home>/Documents`: `USERPROFILE` on Windows, `HOME` elsewhere.
+///
+/// ponytail: an environment variable and a fixed `Documents`, not the platform's known-folder
+/// call (a dependency and `unsafe` this crate forbids); a Documents folder redirected elsewhere
+/// (to a cloud drive) is not followed. The dialog's folder picker is the way out; the
+/// known-folder call comes with a dependency the orchestrator approves.
+pub fn documents_dir() -> Option<PathBuf> {
+    let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+    Some(PathBuf::from(home).join("Documents"))
+}
+
+/// `<documents>/Electric Sheep/<name>`.
+pub fn default_folder(documents: Option<&Path>, name: &str) -> PathBuf {
+    let base = documents.map_or_else(|| PathBuf::from(PROJECTS_DIR), |d| d.join(PROJECTS_DIR));
+    free(&base, name)
+}
+
+/// `<base>/<name>`, or `<name> 2`, `<name> 3`... when that is taken: a second project from the
+/// same template does not land on the first one.
+fn free(base: &Path, name: &str) -> PathBuf {
+    let name = name.trim();
+    let mut path = base.join(name);
+    let mut n = 1;
+    while path.exists() {
+        n += 1;
+        path = base.join(format!("{name} {n}"));
+    }
+    path
+}
+
+/// The new-project dialog: a template, a name and a folder.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewProject {
+    pub template: Template,
+    /// The directory holding `templates/`, which `Project::create` reads the documents from.
+    pub root: PathBuf,
+    pub name: String,
+    pub folder: String,
+    documents: Option<PathBuf>,
+    /// Once the person has typed or picked a folder, the name no longer moves it.
+    chosen: bool,
+    /// Why the last Create failed, as `Project::create` said it.
+    pub error: Option<String>,
+}
+
+impl NewProject {
+    /// `name` is the template's plain name in the reader's language; the folder follows it.
+    pub fn new(template: Template, root: PathBuf, name: &str, documents: Option<PathBuf>) -> Self {
+        Self {
+            folder: default_folder(documents.as_deref(), name)
+                .display()
+                .to_string(),
+            template,
+            root,
+            name: name.to_owned(),
+            documents,
+            chosen: false,
+            error: None,
+        }
+    }
+
+    pub fn name_changed(&mut self) {
+        self.error = None;
+        if !self.chosen {
+            self.folder = default_folder(self.documents.as_deref(), &self.name)
+                .display()
+                .to_string();
+        }
+    }
+
+    pub fn folder_typed(&mut self) {
+        self.error = None;
+        self.chosen = true;
+    }
+
+    /// What the OS folder picker returned. An empty folder is the project's; one that already
+    /// holds files gets a new folder inside it, so a project never spills into, say, Documents.
+    pub fn folder_picked(&mut self, dir: &Path) {
+        let empty = std::fs::read_dir(dir).is_ok_and(|mut e| e.next().is_none());
+        let folder = if empty {
+            dir.to_path_buf()
+        } else {
+            free(dir, &self.name)
+        };
+        self.folder = folder.display().to_string();
+        self.folder_typed();
+    }
+
+    /// Why Create is refused before it is pressed, as a key: the folder already holds a project,
+    /// which `Project::create` would refuse in its own (untranslated) words.
+    pub fn blocker(&self) -> Option<&'static str> {
+        Project::is_project_dir(Path::new(self.folder.trim())).then_some("home.already_project")
+    }
+
+    pub fn can_create(&self) -> bool {
+        !self.name.trim().is_empty() && !self.folder.trim().is_empty() && self.blocker().is_none()
+    }
+
+    pub fn create(&self) -> Result<Project, ProjectError> {
+        Project::create(
+            Path::new(self.folder.trim()),
+            self.name.trim(),
+            &self.template,
+            &self.root,
+        )
+    }
+}
+
+/// The start screen's state: the PC check, the templates, the new-project dialog, and whether
+/// the person asked for the workspace with nothing open.
+#[derive(Debug, Default)]
+pub struct StartScreen {
+    probe: Option<DepsProbe>,
+    /// The directory holding `templates/`; `None` when none was found above the editor.
+    pub root: Option<PathBuf>,
+    pub templates: Vec<Template>,
+    /// Every template that did not parse, with why.
+    pub broken: Vec<(PathBuf, String)>,
+    pub dialog: Option<NewProject>,
+    /// Set when a pane is asked for (File > Watch a running run): the dock shows even though
+    /// nothing is open.
+    pub workspace: bool,
+    cards: Option<(Recent, Vec<RecentCard>)>,
+}
+
+impl StartScreen {
+    /// The templates beside this editor's checkout (`template::templates_root`).
+    pub fn load() -> Self {
+        Self::at(templates_root())
+    }
+
+    fn at(root: Option<PathBuf>) -> Self {
+        let (templates, broken) = root.as_deref().map(load).unwrap_or_default();
+        Self {
+            root,
+            templates,
+            broken,
+            ..Self::default()
+        }
+    }
+
+    /// The PC check's answer so far. The probe is started on the first call, with `es`, so an
+    /// editor that never shows the start screen or the New project menu never runs it.
+    pub fn poll(&mut self, es: &Path) -> &DepsState {
+        self.probe
+            .get_or_insert_with(|| DepsProbe::start(es))
+            .poll()
+    }
+
+    /// The recent cards, read again only when the list changes: reading them opens every
+    /// project on it, which is not something to do every frame.
+    pub fn cards(&mut self, recent: &Recent) -> &[RecentCard] {
+        if self.cards.as_ref().is_none_or(|(r, _)| r != recent) {
+            self.cards = Some((recent.clone(), recent_cards(recent)));
+        }
+        self.cards.as_ref().map_or(&[], |(_, c)| c)
+    }
+
+    /// Opens the dialog for `templates[index]`, named `name` (its plain name).
+    pub fn open_dialog(&mut self, index: usize, name: &str) {
+        if let (Some(template), Some(root)) = (self.templates.get(index), &self.root) {
+            self.dialog = Some(NewProject::new(
+                template.clone(),
+                root.clone(),
+                name,
+                documents_dir(),
+            ));
+        }
+    }
+
+    /// The start screen fills the window unless something is open, a run is streaming in, or
+    /// the person asked for a pane.
+    pub fn shown(&self, open: bool, streaming: bool) -> bool {
+        !(open || streaming || self.workspace)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -410,5 +695,156 @@ mod tests {
         let state = settle(&mut probe(&format!("{cat} {}", file.display())));
         std::fs::remove_file(&file).ok();
         assert_eq!(state, DepsState::Ready(parse_deps(READY).unwrap()));
+    }
+
+    /// The PC-check line (packet M12/Y11): Python, then every `needs` item, then each simulator
+    /// as an optional extra. Red only for what a template needs; an absent simulator is amber
+    /// and keeps `es`'s reason.
+    #[test]
+    fn pc_check_marks_what_is_here_missing_and_optional() {
+        let all = pc_check(&parse_deps(READY).unwrap());
+        assert!(all.iter().all(|i| i.mark == Mark::Have), "{all:?}");
+        assert!(!needs_install(&all));
+        assert_eq!(all[0].key, "deps.python");
+        assert_eq!(all.len(), 1 + NEEDS.len() + 1);
+
+        let mut d = parse_deps(READY).unwrap();
+        d.modules.lerobot = false;
+        d.backends.push(Backend {
+            name: "physx".into(),
+            available: false,
+            reason: Some("no Isaac Sim".into()),
+        });
+        let items = pc_check(&d);
+        let lerobot = items.iter().find(|i| i.key == "deps.lerobot").unwrap();
+        assert_eq!(lerobot.mark, Mark::Missing);
+        let physx = items.last().unwrap();
+        assert_eq!(
+            (physx.key, physx.name.as_deref(), physx.mark),
+            ("home.optional", Some("physx"), Mark::Optional)
+        );
+        assert_eq!(physx.reason.as_deref(), Some("no Isaac Sim"));
+        assert!(needs_install(&items));
+        // An absent simulator alone asks nobody to install anything.
+        d.modules.lerobot = true;
+        assert!(!needs_install(&pc_check(&d)));
+
+        for lang in Lang::ALL {
+            for mark in [Mark::Have, Mark::Missing, Mark::Optional] {
+                assert_ne!(Strings::get(lang).t(mark.key()), mark.key(), "{mark:?}");
+            }
+        }
+    }
+
+    /// A card that cannot be created says why in plain words; one that can says nothing.
+    #[test]
+    fn availability_text_names_what_is_missing_in_plain_words() {
+        for lang in Lang::ALL {
+            assert_eq!(availability_text(lang, &Availability::Ready), None);
+            let (mark, unknown) = availability_text(lang, &Availability::Unknown).unwrap();
+            assert_ne!(unknown, "home.unknown");
+            assert_eq!(mark, Mark::Optional, "waiting is not an error");
+            let missing = Availability::Missing(vec!["lerobot".into(), "warp-drive".into()]);
+            let (mark, text) = availability_text(lang, &missing).unwrap();
+            assert_eq!(mark, Mark::Missing);
+            assert!(text.contains(i18n::t(lang, "deps.lerobot")), "{text}");
+            // A name the editor has no word for is shown as itself, never dropped.
+            assert!(text.contains("warp-drive"), "{text}");
+            assert!(!text.contains("{}"), "{text}");
+        }
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("es-home-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The folder follows the name under `<Documents>/Electric Sheep` until the person types or
+    /// picks one; a taken folder gets a number; a picked folder that holds files gets the
+    /// project in a new folder inside it.
+    #[test]
+    fn the_new_project_folder_follows_the_name_until_chosen() {
+        let docs = scratch("docs");
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let base = docs.join("Electric Sheep");
+        let mut d = NewProject::new(cube(), root, "Cube try", Some(docs.clone()));
+        assert_eq!(d.folder, base.join("Cube try").display().to_string());
+        assert!(d.can_create());
+
+        std::fs::create_dir_all(base.join("My arm")).unwrap();
+        "My arm".clone_into(&mut d.name);
+        d.name_changed();
+        assert_eq!(d.folder, base.join("My arm 2").display().to_string());
+
+        "  ".clone_into(&mut d.name);
+        d.name_changed();
+        assert!(!d.can_create(), "a blank name creates nothing");
+
+        "typed by hand".clone_into(&mut d.folder);
+        d.folder_typed();
+        "Cube try".clone_into(&mut d.name);
+        d.name_changed();
+        assert_eq!(d.folder, "typed by hand", "a typed folder stays put");
+
+        let empty = docs.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        d.folder_picked(&empty);
+        assert_eq!(d.folder, empty.display().to_string());
+        d.folder_picked(&docs);
+        assert_eq!(d.folder, docs.join("Cube try").display().to_string());
+        std::fs::remove_dir_all(&docs).ok();
+    }
+
+    /// Create makes the project at the chosen folder, and a project with no run opens at step
+    /// three: the template did steps one and two. A second Create on the same folder is refused
+    /// with a sentence, and the dialog's next default does not collide with it.
+    #[test]
+    fn creating_a_project_opens_it_at_train() {
+        use crate::model::layout::start_phase;
+        use crate::model::workflow::Phase;
+
+        let docs = scratch("create");
+        let root = find_root(Some(Path::new(env!("CARGO_MANIFEST_DIR")))).unwrap();
+        let mut screen = StartScreen::at(Some(root));
+        let index = screen.templates.iter().position(|t| t.id == cube().id);
+        screen.open_dialog(index.unwrap(), "My cube");
+        let mut d = screen.dialog.take().expect("the dialog opened");
+        d.documents = Some(docs.clone());
+        d.name_changed();
+
+        let project = d.create().expect("created");
+        assert_eq!(project.file.name, "My cube");
+        let reopened = Project::open(Path::new(&d.folder)).unwrap();
+        let facts = reopened.latest_run().map(|run| RunFacts::read(&run));
+        assert_eq!(start_phase(&phases(facts.as_ref(), None)), Phase::Train);
+
+        assert!(d.create().is_err(), "the same folder twice");
+        // ...which the dialog says in its own words before Create is pressed.
+        assert_eq!(d.blocker(), Some("home.already_project"));
+        assert!(!d.can_create());
+        d.name_changed();
+        assert!(d.folder.ends_with("My cube 2"), "{}", d.folder);
+        assert_eq!(d.blocker(), None);
+        assert!(d.can_create());
+        std::fs::remove_dir_all(&docs).ok();
+    }
+
+    /// The start screen fills the window only while there is nothing else to show.
+    #[test]
+    fn the_start_screen_gives_way_to_anything_open() {
+        let mut screen = StartScreen::at(None);
+        assert!(screen.templates.is_empty() && screen.broken.is_empty());
+        assert!(screen.shown(false, false));
+        assert!(
+            !screen.shown(true, false),
+            "a project, a file or a run is open"
+        );
+        assert!(!screen.shown(false, true), "a run is streaming in");
+        screen.workspace = true;
+        assert!(!screen.shown(false, false), "a pane was asked for");
+        screen.open_dialog(0, "x");
+        assert_eq!(screen.dialog, None, "no template, no dialog");
     }
 }

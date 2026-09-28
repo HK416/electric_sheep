@@ -30,9 +30,19 @@ pub fn draw(app: &mut EditorApp, ctx: &egui::Context) {
             path_bar(app, ui);
         });
     });
-    egui::TopBottomPanel::top("steps").show(ctx, |ui| step_bar(app, ui));
+    // With nothing to show, the start screen fills the window between the menu and the status
+    // line (packet M12/Y11); the new-project dialog floats over whichever is drawn.
+    let start = super::home::shown(app);
+    if !start {
+        egui::TopBottomPanel::top("steps").show(ctx, |ui| step_bar(app, ui));
+    }
     egui::TopBottomPanel::bottom("status").show(ctx, |ui| status_line(app, ui));
-    dock(app, ctx);
+    if start {
+        egui::CentralPanel::default().show(ctx, |ui| super::home::draw(app, ui));
+    } else {
+        dock(app, ctx);
+    }
+    super::home::dialog(app, ctx);
 
     // Asked for from inside a pane, while the dock was out of `app`; opened now that it is
     // back, so what opening focuses lands in the dock that is kept.
@@ -53,15 +63,10 @@ fn file_menu(app: &mut EditorApp, ui: &mut egui::Ui) {
     let mut open: Option<String> = None;
     let mut attach = false;
     ui.menu_button(app.t("menu.file"), |ui| {
-        ui.add_enabled(false, egui::Button::new(app.t("menu.new_project")))
-            .on_disabled_hover_text(app.t("menu.new_project.hint"));
-        // What a folder turns out to be is `recent::classify`'s, so the project and the run
-        // folder share a folder chooser; the words say which one the person meant.
-        for (key, browse) in [
-            ("menu.open_project", Browse::Folder),
-            ("menu.open_file", Browse::Policy),
-            ("menu.open_run", Browse::Folder),
-        ] {
+        ui.menu_button(app.t("menu.new_project"), |ui| {
+            super::home::template_menu(app, ui);
+        });
+        for (key, browse) in super::home::OPEN_WAYS {
             let item = ui
                 .add_enabled(dialogs::AVAILABLE, egui::Button::new(app.t(key)))
                 .on_disabled_hover_text(app.t("open.no_dialog.hint"));
@@ -338,7 +343,7 @@ fn summary(app: &EditorApp, ui: &mut egui::Ui) {
 }
 
 /// A step's state as a dot in [`layout::colour`]'s colour.
-fn dot(state: &PhaseState) -> RichText {
+pub(crate) fn dot(state: &PhaseState) -> RichText {
     let [r, g, b] = layout::colour(state);
     RichText::new("\u{25cf}").color(Color32::from_rgb(r, g, b))
 }

@@ -1,11 +1,13 @@
 //! The drawing half of the editor (packet M12/Y10): [`shell`] is the menu bar, the step bar,
-//! the dock and the status line; [`advanced`] is the five tabs the editor had before the dock.
+//! the dock and the status line; [`advanced`] is the five tabs the editor had before the dock;
+//! [`home`] is the start screen and the new-project dialog (packet M12/Y11).
 //!
 //! Compiled only, never run by CI (`docs/design/editor-shell.md` section 2): every branch that
 //! chooses what to show is in [`crate::model`], under test. This half turns answers into
 //! widgets.
 
 pub mod advanced;
+pub mod home;
 pub mod shell;
 
 use eframe::egui;

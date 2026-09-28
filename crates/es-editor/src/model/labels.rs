@@ -8,13 +8,13 @@
 //! know what the column means.
 //!
 //! **Every table is total and has no wildcard arm.** A metric added to
-//! [`MetricSpec`](es_ir::evaluation::MetricSpec), a flag added to [`LaunchField`] or a tab
-//! added to [`Tab`] must break this crate's *build*; the alternative - a `_ =>` returning the
-//! raw name - is a column nobody ever gets around to naming. `metric_and_launch_labels_are_total`
-//! judges the same thing from the other side, over `MetricSpec::ALL`.
+//! [`MetricSpec`](es_ir::evaluation::MetricSpec) or a flag added to [`LaunchField`] must break
+//! this crate's *build*; the alternative - a `_ =>` returning the raw name - is a column nobody
+//! ever gets around to naming. `metric_and_launch_labels_are_total` judges the same thing from
+//! the other side, over `MetricSpec::ALL`.
 //!
-//! The home screen's five steps are here too, for the same reason `app.rs` decides nothing
-//! else (spec 28.10 rule 3): their order is spec 13.1's loop, not a layout.
+//! The dock's panes are named by [`crate::model::layout::Pane`] and the five steps by
+//! [`crate::model::workflow::Phase`] (packets M12/Y10, Y11).
 
 use es_ir::evaluation::{MetricSpec, PerturbationKind};
 
@@ -22,116 +22,12 @@ use crate::model::i18n::{t, Lang};
 use crate::model::launch::{Kind, LaunchField, LaunchFlag};
 use crate::model::results::Cause;
 
-// --- tabs --------------------------------------------------------------------------------
-
-/// The tabs, named for what a person does in them rather than for the view-model behind
-/// them. The old name and the spec section live in [`Tab::hint_key`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum Tab {
-    #[default]
-    Design,
-    Results,
-    Live,
-    Sees,
-    Problems,
-}
-
-impl Tab {
-    pub const ALL: [Tab; 5] = [
-        Tab::Design,
-        Tab::Results,
-        Tab::Live,
-        Tab::Sees,
-        Tab::Problems,
-    ];
-
-    pub fn key(self) -> &'static str {
-        match self {
-            Tab::Design => "tab.design",
-            Tab::Results => "tab.results",
-            Tab::Live => "tab.live",
-            Tab::Sees => "tab.sees",
-            Tab::Problems => "tab.problems",
-        }
-    }
-
-    /// The hover: the name the tab had before this packet, and the spec section it serves.
-    pub fn hint_key(self) -> &'static str {
-        match self {
-            Tab::Design => "tab.design.hint",
-            Tab::Results => "tab.results.hint",
-            Tab::Live => "tab.live.hint",
-            Tab::Sees => "tab.sees.hint",
-            Tab::Problems => "tab.problems.hint",
-        }
-    }
-}
-
-// --- the home screen ----------------------------------------------------------------------
-
-/// The five steps of spec 13.1's loop, in the order they happen.
-///
-/// The home screen is a strip of these: the word, one sentence of what it means, and a button
-/// to the tab that does it. The order is the loop's, which is why it is a `const` here and
-/// not a `for` loop in `app.rs`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Step {
-    Design,
-    Collect,
-    Train,
-    Evaluate,
-    Watch,
-}
-
-impl Step {
-    pub const ALL: [Step; 5] = [
-        Step::Design,
-        Step::Collect,
-        Step::Train,
-        Step::Evaluate,
-        Step::Watch,
-    ];
-
-    /// The workflow's own word for the step.
-    pub fn word_key(self) -> &'static str {
-        match self {
-            Step::Design => "word.design",
-            Step::Collect => "word.collect",
-            Step::Train => "word.train",
-            Step::Evaluate => "word.evaluate",
-            Step::Watch => "word.watch",
-        }
-    }
-
-    /// One sentence saying what the step is for, in words that assume no domain knowledge.
-    pub fn sentence_key(self) -> &'static str {
-        match self {
-            Step::Design => "home.step.design",
-            Step::Collect => "home.step.collect",
-            Step::Train => "home.step.train",
-            Step::Evaluate => "home.step.evaluate",
-            Step::Watch => "home.step.watch",
-        }
-    }
-
-    /// Where the step's button goes. Collecting, training and evaluating all start from the
-    /// Results tab, because that is where the Start panel is; watching is the Live tab.
-    pub fn tab(self) -> Tab {
-        match self {
-            Step::Design => Tab::Design,
-            Step::Collect | Step::Train | Step::Evaluate => Tab::Results,
-            Step::Watch => Tab::Live,
-        }
-    }
-}
-
 // --- the stages of a cycle -----------------------------------------------------------------
 
 /// The plain word for one stage of `es loop cycle`, as the wire names it (packet M7/E7).
 ///
-/// Three of the five are already the workflow's own words, so they share [`Step`]'s keys
-/// rather than getting a second set that could drift from them. A name this build has no word
-/// for renders as the producer's own, which is better than an empty chip.
+/// A name this build has no word for renders as the producer's own, which is better than an
+/// empty chip.
 pub fn stage_label(lang: Lang, name: &str) -> &'static str {
     match name {
         "collect" => t(lang, "word.collect"),
@@ -362,7 +258,7 @@ impl Browse {
 mod tests {
     use super::{
         browses, column_label, kind_label, launch_flag_label, launch_label, metric_by_name,
-        metric_label, Browse, Step, Tab,
+        metric_label, Browse,
     };
 
     use std::collections::BTreeSet;
@@ -412,11 +308,6 @@ mod tests {
                 assert!(!label.contains("es "), "{kind:?} shows a command: {label}");
                 assert!(seen.insert(label), "{label} is used twice in {lang:?}");
             }
-            for tab in Tab::ALL {
-                assert!(seen.insert(t(lang, tab.key())), "two tabs share a name");
-                assert!(!t(lang, tab.hint_key()).is_empty(), "{tab:?} has a hover");
-            }
-
             // The three fixed columns and the metric columns all humanise.
             for column in ["cell", "suite", "seed"] {
                 assert!(!column_label(lang, column).is_empty(), "{column}");
@@ -537,46 +428,6 @@ mod tests {
                 assert!(!label.contains('_'), "{label} reads as an identifier");
                 assert!(seen.insert(label), "{label} is used twice in {lang:?}");
             }
-        }
-    }
-
-    /// Oracle 5 (packet M7/E6). The home screen's strip is spec 13.1's loop, in order, and
-    /// every step says what it is for in both languages.
-    #[test]
-    fn home_screen_lists_the_five_steps_in_loop_order() {
-        assert_eq!(
-            Step::ALL,
-            [
-                Step::Design,
-                Step::Collect,
-                Step::Train,
-                Step::Evaluate,
-                Step::Watch
-            ],
-            "collect -> train -> evaluate -> watch, after describing the task"
-        );
-        for lang in Lang::ALL {
-            let mut words = BTreeSet::new();
-            let mut sentences = BTreeSet::new();
-            for step in Step::ALL {
-                let word = t(lang, step.word_key());
-                let sentence = t(lang, step.sentence_key());
-                assert!(!word.is_empty(), "{step:?} has a word in {lang:?}");
-                assert!(
-                    sentence.len() > 20 && sentence.ends_with('.'),
-                    "{step:?} in {lang:?} is one sentence: {sentence}"
-                );
-                assert!(!sentence.contains("spec "), "{step:?} cites the spec");
-                assert!(words.insert(word), "{word} is used twice");
-                assert!(sentences.insert(sentence), "two steps say the same thing");
-            }
-        }
-        // Every button lands somewhere a person can act, and the first step is the tab the
-        // home screen itself is on.
-        assert_eq!(Step::Design.tab(), Tab::Design);
-        assert_eq!(Step::Watch.tab(), Tab::Live);
-        for step in Step::ALL {
-            assert!(Tab::ALL.contains(&step.tab()), "{step:?} goes somewhere");
         }
     }
 }
