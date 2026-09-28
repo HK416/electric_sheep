@@ -27,6 +27,8 @@ use crate::error::CliError;
 use crate::util::hex;
 
 const HELP: &str = "\
+es policy init  --task <t.toml> --observation <o.toml> --learning <l.toml>
+                --deployment <d.toml> [--seed <n>] --out <out.esb>
 es policy lower --policy <in.esb> --out <dir>
 es policy pack  --policy <in.esb> --weights <model.safetensors> --out <out.esb>
 es policy import-lerobot --checkpoint <dir> --task <t.toml> --observation <o.toml>
@@ -36,6 +38,12 @@ es policy import-rl --manifest <import.json> --weights <w.safetensors>
                     --out <dir>
 
 The Rust half of the spec 2.3 training split. No subcommand needs Python.
+
+init    Builds an untrained bundle from four documents: the one a cycle's
+        `[collect] policy` names, whose Deployment IR is the Safety Plane the scripted
+        demonstrator runs under. Its weights are a placeholder that names --seed
+        (default 0) and are never loaded under --expert; the same documents and seed
+        give the same bytes.
 
 lower   Opens the policy bundle (spec 9.6), lowers its Learning IR to PyTorch
         (`es_policy::lower_to_torch`, spec 8.7) and writes, under <dir>:
@@ -111,6 +119,7 @@ Exit codes: 0 success, 1 runtime failure, 2 usage error.
 
 pub fn dispatch(args: &[String]) -> i32 {
     let result = match args.first().map(String::as_str) {
+        Some("init") => init(&args[1..]),
         Some("lower") => lower(&args[1..]),
         Some("pack") => pack(&args[1..]),
         Some("import-lerobot") => import_lerobot(&args[1..]),
@@ -163,6 +172,69 @@ fn parse(args: &[String], flags: &[&str]) -> Result<BTreeMap<String, String>, Cl
 fn open_bundle(path: &str) -> Result<PolicyBundle, CliError> {
     let bytes = std::fs::read(path).map_err(|e| CliError::Runtime(format!("{path}: {e}")))?;
     PolicyBundle::open(&bytes).map_err(|e| CliError::Runtime(format!("{path}: {e}")))
+}
+
+/// `es policy init` — a fresh checkout's way to the bundle a cycle's `[collect] policy` names
+/// (packet M12/Y5). The editor builds the same bytes through the same function.
+fn init(args: &[String]) -> Result<u8, CliError> {
+    // `--seed` is the one optional flag; everything else is `parse`'s required set.
+    let mut rest = args.to_vec();
+    let seed = match rest.iter().position(|a| a == "--seed") {
+        Some(i) => {
+            let value = rest
+                .get(i + 1)
+                .ok_or_else(|| CliError::Usage(format!("--seed: missing value\n\n{HELP}")))?;
+            let seed = value.parse::<u64>().map_err(|_| {
+                CliError::Usage(format!("--seed {value:?} is not a number\n\n{HELP}"))
+            })?;
+            rest.drain(i..=i + 1);
+            seed
+        }
+        None => 0,
+    };
+    let a = parse(
+        &rest,
+        &[
+            "--task",
+            "--observation",
+            "--learning",
+            "--deployment",
+            "--out",
+        ],
+    )?;
+    let path = |flag: &str| PathBuf::from(&a[flag]);
+    let bytes = es_data::training::untrained_bundle(
+        &path("--task"),
+        &path("--observation"),
+        &path("--learning"),
+        &path("--deployment"),
+        seed,
+    )
+    .map_err(|e| CliError::Runtime(e.to_string()))?;
+    let out = path("--out");
+    if let Some(parent) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| CliError::Runtime(format!("{}: {e}", parent.display())))?;
+    }
+    std::fs::write(&out, &bytes)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", out.display())))?;
+
+    // Reopened rather than trusted, like `pack`.
+    let reopened = PolicyBundle::open(&bytes)
+        .map_err(|e| CliError::Runtime(format!("the bundle just written does not open: {e}")))?;
+    println!("bundle:        {}", out.display());
+    for (slot, value) in [
+        ("task", reopened.manifest.hashes.task),
+        ("observation", reopened.manifest.hashes.observation),
+        ("learning", reopened.manifest.hashes.learning),
+        ("policy", reopened.manifest.hashes.policy),
+        ("deployment", reopened.manifest.hashes.deployment),
+    ] {
+        if let Some(h) = value {
+            println!("{slot}_hash: {}", hex(&h));
+        }
+    }
+    Ok(0)
 }
 
 pub(crate) fn lower(args: &[String]) -> Result<u8, CliError> {

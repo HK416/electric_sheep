@@ -1,0 +1,41 @@
+# The cube template (packet M12/Y5, `docs/design/editor-redesign.md` section 6.2): an SO-101 puts
+# a cube into a bin, taught by the scripted demonstrator and learned by LeRobot's ACT from the
+# camera and the joint angles.
+#
+# Every path is a committed document, relative to the repository root, and none is copied: a
+# scene path is hash input (`SceneRef::canonical`), so a copy would move every hash downstream
+# and the template would no longer name the documents its numbers were measured on.
+
+kind = "template"
+id = "cube-into-bin"
+name = "template.cube_into_bin.name"        # es-editor i18n key
+summary = "template.cube_into_bin.summary"  # es-editor i18n key
+robot = "SO-101"
+method = "blocks"
+needs = ["mujoco", "torch", "lerobot", "vulkan", "render"]
+cycle = "tests/fixtures/visible-learning/cycle-vision.toml"
+scene = "tests/fixtures/mjcf/so101_pick_place.xml"
+demonstrations = 200
+
+# The bundle `es policy init` builds for `[collect] policy`: the documents the 200 expert
+# demonstrations have been collected under since plan V. Under `--expert` its weights are never
+# loaded; its Deployment IR is the Safety Plane the demonstrator runs under. The cycle's expert
+# gate judges it by `evaluation-v8.toml`, which refuses it -- see the header of the cycle.
+[bundle]
+task        = "tests/fixtures/visible-learning/task.toml"
+observation = "tests/fixtures/visible-learning/observation.toml"
+learning    = "tests/fixtures/visible-learning/learning.toml"
+deployment  = "tests/fixtures/visible-learning/deployment.toml"
+
+# Training length presets: the `[run] checkpoint_at` series; the last mark is the length.
+# `lerobot-train` saves at one `--save_freq`, which `es train` takes as the first mark, so every
+# mark is a multiple of the first (`Recipe::save_freq`).
+#   short   a quick look that the whole cycle runs: a quarter of `medium`.
+#   medium  `training-lerobot.toml`'s own marks.
+#   long    60,000 steps: the checkpoint at which LeRobot's ACT passed held-out 15/16 on this
+#           task (packets M5/V19, V19b -- with the cube's pose in its state; this camera-only
+#           route has not been measured on the current harness at any length).
+[lengths]
+short  = [2500, 5000]
+medium = [10000, 20000]
+long   = [20000, 40000, 60000]

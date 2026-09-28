@@ -31,6 +31,10 @@ es-telemetry = { workspace = true }
 # `es_safety::EventSet`. Both are below layer 12; neither is re-implemented here.
 es-eval = { workspace = true }
 es-safety = { workspace = true }
+# A project (packet M12/Y5, Y6) builds its collect bundle with `es_data::training::
+# untrained_bundle` and writes its run recipe as an `es_data::training::Cycle`: the same code
+# `es policy init` and `es loop cycle` run, not a second copy. Layer 10, below this one.
+es-data = { workspace = true }
 # The Replay panel (packet M7/E2) re-poses a recorded `.estraj` and projects it on the CPU:
 # the scene loader, the trajectory, the tessellation and the camera are all theirs. `es-env`
 # is taken **without** its `render` feature, so the editor links no Vulkan of its own.
