@@ -12,8 +12,10 @@ use std::sync::mpsc::{self, Receiver};
 
 use serde::Deserialize;
 
+use crate::model::project::Project;
 use crate::model::recent::{self, Recent};
 use crate::model::template::Template;
+use crate::model::workflow::{phases, PhaseState, RunFacts};
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 pub struct Python {
@@ -176,36 +178,28 @@ pub fn availability(template: &Template, deps: Option<&Deps>) -> Availability {
 }
 
 /// One recent path, as the start screen lists it.
-// Packet M12/Y6's merge adds `phases: [PhaseState; 5]` to `Project`, read from the latest run.
+// At most `recent::CAP` cards exist, so boxing `phases` would buy nothing.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum RecentCard {
-    Project { path: PathBuf, name: String },
-    Other { path: PathBuf, kind: recent::Kind },
-    Missing { path: PathBuf },
+    /// `phases` is what disk says about the latest run: a card is drawn without attaching.
+    Project {
+        path: PathBuf,
+        name: String,
+        phases: [PhaseState; 5],
+    },
+    Other {
+        path: PathBuf,
+        kind: recent::Kind,
+    },
+    Missing {
+        path: PathBuf,
+    },
 }
 
-/// `project.toml`, read just far enough for a card.
-///
-/// ponytail: a stand-in for packet M12/Y6's `project::Project::open`, which replaces it when
-/// both are merged; the fields and `deny_unknown_fields` match Y6's `ProjectFile` so the two
-/// accept the same files.
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ProjectFile {
-    kind: String,
-    name: String,
-    #[allow(dead_code)]
-    template: String,
-}
-
-fn project_name(dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("project.toml")).ok()?;
-    let file: ProjectFile = toml::from_str(&text).ok()?;
-    (file.kind == "project").then_some(file.name)
-}
-
-/// A path that is gone is `Missing`; a folder with a readable `project.toml` is a `Project`;
-/// anything else - a broken `project.toml` included - is what [`recent::classify`] says.
+/// A path that is gone is `Missing`; a folder [`Project::open`] reads is a `Project`; anything
+/// else is what [`recent::classify`] says - a broken `project.toml` is `Kind::Project` there,
+/// which the start screen draws as a project it cannot open.
 pub fn recent_cards(recent: &Recent) -> Vec<RecentCard> {
     recent
         .paths
@@ -214,8 +208,13 @@ pub fn recent_cards(recent: &Recent) -> Vec<RecentCard> {
             let path = p.clone();
             if !p.exists() {
                 RecentCard::Missing { path }
-            } else if let Some(name) = project_name(p) {
-                RecentCard::Project { path, name }
+            } else if let Ok(project) = Project::open(p) {
+                let facts = project.latest_run().map(|run| RunFacts::read(&run));
+                RecentCard::Project {
+                    path,
+                    name: project.file.name,
+                    phases: phases(facts.as_ref(), None),
+                }
             } else {
                 RecentCard::Other {
                     path,
@@ -305,17 +304,20 @@ mod tests {
         assert_eq!(
             recent_cards(&r),
             vec![
+                // No run yet: ① ② done, ③ not started (`workflow::phases(None, None)`).
                 RecentCard::Project {
                     path: good,
-                    name: "Cube try 2".into()
+                    name: "Cube try 2".into(),
+                    phases: phases(None, None),
                 },
                 RecentCard::Other {
                     path: run,
                     kind: recent::Kind::Run
                 },
+                // A `project.toml` that does not parse is still a project folder to `classify`.
                 RecentCard::Other {
                     path: broken,
-                    kind: recent::Kind::Documents
+                    kind: recent::Kind::Project
                 },
             ]
         );

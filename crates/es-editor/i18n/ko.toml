@@ -266,3 +266,17 @@
 "deps.lerobot" = "LeRobot 로봇 학습 도구"
 "deps.vulkan" = "Vulkan 그래픽 드라이버"
 "deps.render" = "카메라 화면 그리기 (es에 들어 있는 기능)"
+
+# --- 단계 표시줄: 다섯 단계와 각 단계의 상태 -------------------------------------------------
+"phase.scene" = "장면"
+"phase.teach" = "가르치기"
+"phase.train" = "학습"
+"phase.evaluate" = "평가"
+"phase.results" = "결과"
+"run.done" = "완료"
+"run.not_started" = "시작 전"
+"run.locked" = "앞 단계를 기다리는 중"
+"run.running" = "진행 중"
+"run.failed" = "실패"
+"run.interrupted" = "중단됨"
+"run.stopped_by_you" = "직접 중지함"

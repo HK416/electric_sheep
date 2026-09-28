@@ -2,11 +2,11 @@
 //!
 //! Two decisions, both kept out of `app.rs` (spec 28.10 rule 3):
 //!
-//! * [`classify`] — a path is a `.esb` container, a directory of the five per-IR documents, or
-//!   a finished run (spec 9.6, spec 14.3, spec 10.5). Told apart by **what is on disk**, not by
-//!   a flag: someone who typed the wrong one gets the other view's error, not a mode. Every
-//!   way of naming a path — the text field, the command line, the recent list, a dropped file
-//!   — arrives here.
+//! * [`classify`] — a path is a `.esb` container, a directory of the five per-IR documents, a
+//!   finished run (spec 9.6, spec 14.3, spec 10.5), or a project folder (packet M12/Y6). Told
+//!   apart by **what is on disk**, not by a flag: someone who typed the wrong one gets the
+//!   other view's error, not a mode. Every way of naming a path — the text field, the command
+//!   line, the recent list, a dropped file — arrives here.
 //! * [`Recent`] — the last ten, most recent first, no duplicates. `app.rs` persists it through
 //!   `eframe::App::save` into `eframe::Storage` under [`RECENT_KEY`]; on Windows that file is
 //!   `%APPDATA%\Electric Sheep editor\data\app.ron`.
@@ -20,6 +20,7 @@ use es_eval::run_dir::RunDir;
 
 use crate::model::fonts::TextSize;
 use crate::model::i18n::Lang;
+use crate::model::project::Project;
 
 /// The `eframe::Storage` key the recent list is stored under.
 pub const RECENT_KEY: &str = "es-editor.recent";
@@ -71,16 +72,21 @@ pub enum Kind {
     Documents,
     /// A finished `es eval run` / `es loop collect` directory (spec 10.5).
     Run,
+    /// A project folder, holding `project.toml` (packet M12/Y6).
+    Project,
 }
 
-/// Which of the three `path` is.
+/// Which of the four `path` is.
 ///
-/// A run is recognised by [`RunDir::is_run_dir`] — the same one call the Run tab opens with,
-/// so the classification and the reader cannot drift apart. Anything that is not a directory
-/// is a bundle: a file that turns out not to be one fails with the bundle reader's own error,
-/// which says more than "not a directory" would.
+/// A project is asked about first ([`Project::is_project_dir`]): its `project.toml` is what it
+/// is, whatever else the folder holds. A run is recognised by [`RunDir::is_run_dir`] — the
+/// same one call the Run tab opens with, so the classification and the reader cannot drift
+/// apart. Anything that is not a directory is a bundle: a file that turns out not to be one
+/// fails with the bundle reader's own error, which says more than "not a directory" would.
 pub fn classify(path: &Path) -> Kind {
-    if RunDir::is_run_dir(path) {
+    if Project::is_project_dir(path) {
+        Kind::Project
+    } else if RunDir::is_run_dir(path) {
         Kind::Run
     } else if path.is_dir() {
         Kind::Documents
@@ -167,6 +173,19 @@ mod tests {
         // error rather than with a third kind nobody can open.
         assert_eq!(classify(&tmp), Kind::Documents);
         assert_eq!(classify(Path::new("no/such/path")), Kind::Bundle);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A project folder is a project, even one that also looks like a run: `project.toml` is
+    /// asked about first (packet M12/Y6).
+    #[test]
+    fn classify_asks_for_a_project_first() {
+        let tmp = std::env::temp_dir().join(format!("es-editor-project-{}", std::process::id()));
+        fs::create_dir_all(&tmp).expect("a temporary directory");
+        fs::copy(fixtures().join("run/report.json"), tmp.join("report.json")).expect("copy");
+        assert_eq!(classify(&tmp), Kind::Run);
+        fs::write(tmp.join(crate::model::project::PROJECT_FILE), "").expect("write");
+        assert_eq!(classify(&tmp), Kind::Project);
         fs::remove_dir_all(&tmp).ok();
     }
 
