@@ -260,3 +260,17 @@
 "template.cube_into_bin_hint.name" = "Cube into bin - with the cube's position"
 "template.cube_into_bin_hint.summary" = "The same arm, cube and bin. Besides the camera and its joints, the policy is told exactly where the cube is."
 "template.cube_into_bin_hint.notice" = "Practice: the simulator also tells the policy where the cube is, which a real robot cannot know. That makes the task much easier than it is for a real robot."
+
+# --- the step bar: the five steps, and where each one is ----------------------------------
+"phase.scene" = "Scene"
+"phase.teach" = "Teach"
+"phase.train" = "Train"
+"phase.evaluate" = "Evaluate"
+"phase.results" = "Results"
+"run.done" = "Done"
+"run.not_started" = "Not started"
+"run.locked" = "Waiting for the step before"
+"run.running" = "Running"
+"run.failed" = "Failed"
+"run.interrupted" = "Interrupted"
+"run.stopped_by_you" = "Stopped by you"

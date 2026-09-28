@@ -292,6 +292,8 @@ pub struct LaunchModel {
     attaching: Option<Receiver<Result<Client, String>>>,
     /// The dial's answer, until [`Self::take_attached`] takes it.
     attached: Option<Result<Client, String>>,
+    /// The argv [`Self::start_in`] was handed; `None` when the child is the form's.
+    started: Option<Vec<String>>,
     /// How the dial retries; the defaults are [`ATTACH_TRIES`] and [`ATTACH_DELAY`].
     pub attach_tries: usize,
     pub attach_delay: Duration,
@@ -336,6 +338,7 @@ impl Default for LaunchModel {
             killed: false,
             attaching: None,
             attached: None,
+            started: None,
             attach_tries: ATTACH_TRIES,
             attach_delay: ATTACH_DELAY,
         }
@@ -523,6 +526,12 @@ impl LaunchModel {
     /// the platform shell down the same path a real run takes (spec 1.4: the harness must
     /// exercise the code, not a copy of it).
     pub fn start_program(&mut self, program: &Path, args: &[String]) {
+        self.spawn(program, args, None);
+    }
+
+    /// Both starts. With `cwd` the command is [`Self::start_in`]'s own `args` and the attach
+    /// reads them; without, it is the panel's form ([`Self::argv`]), as it always was.
+    fn spawn(&mut self, program: &Path, args: &[String], cwd: Option<&Path>) {
         if matches!(self.state, State::Running { .. }) {
             return;
         }
@@ -530,7 +539,12 @@ impl LaunchModel {
         self.killed = false;
         self.attaching = None;
         self.attached = None;
-        let child = Command::new(program)
+        self.started = cwd.map(|_| args.to_vec());
+        let mut command = Command::new(program);
+        if let Some(cwd) = cwd {
+            command.current_dir(cwd);
+        }
+        let child = command
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -561,14 +575,13 @@ impl LaunchModel {
         // The dial starts now and answers through `poll`; never on this thread, because on a
         // machine where a refused connect takes seconds (Windows) twenty tries would hold the
         // UI for most of a minute - which is exactly what happened before this existed.
-        self.attaching = self.attach().map(|addr| {
-            dial_in_background(
-                addr,
-                self.field(F::TelemetryToken).to_owned(),
-                self.attach_tries,
-                self.attach_delay,
-            )
-        });
+        let token = match &self.started {
+            Some(args) => value_of(args, F::TelemetryToken.flag()).unwrap_or_default(),
+            None => self.field(F::TelemetryToken).to_owned(),
+        };
+        self.attaching = self
+            .attach()
+            .map(|addr| dial_in_background(addr, token, self.attach_tries, self.attach_delay));
     }
 
     /// Drains whatever the reader threads have queued and asks the child whether it is still
@@ -630,6 +643,22 @@ impl LaunchModel {
         self.ring.push_back(line);
     }
 
+    /// Starts `es` with `args` in `cwd` (the template's repository root), exactly like
+    /// `start_program` otherwise; a no-op while a child runs; attach-follows-launch reads the
+    /// `--telemetry` value out of `args`.
+    pub fn start_in(&mut self, args: &[String], cwd: &Path) {
+        let program = self.binary.path.clone();
+        self.spawn(&program, args, Some(cwd));
+    }
+
+    /// The running child's process id.
+    pub fn pid(&self) -> Option<u32> {
+        match self.state {
+            State::Running { pid, .. } => Some(pid),
+            _ => None,
+        }
+    }
+
     /// Ends the child. The **only** control there is: the run speaks no protocol, so pause,
     /// step and reset (spec 23.3) cannot be offered honestly and are not (packet M7/E5).
     pub fn kill(&mut self) {
@@ -681,9 +710,10 @@ impl LaunchModel {
         if !matches!(self.state, State::Running { .. }) {
             return None;
         }
-        let argv = self.argv();
-        let i = argv.iter().position(|a| a == F::Telemetry.flag())?;
-        argv.get(i + 1).cloned()
+        match &self.started {
+            Some(args) => value_of(args, F::Telemetry.flag()),
+            None => value_of(&self.argv(), F::Telemetry.flag()),
+        }
     }
 
     /// The dial's answer, once: `Some(Ok(source))` when the producer answered, `Some(Err(why))`
@@ -696,6 +726,20 @@ impl LaunchModel {
             .take()
             .map(|answer| answer.map(telemetry_view::source_of))
     }
+}
+
+/// A port the OS says is free on 127.0.0.1 now (bind `:0`, read it, drop). `0` if the OS
+/// gives none; the attach then fails with that address in its message.
+pub fn free_local_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .map_or(0, |a| a.port())
+}
+
+/// The word after `flag` in `argv`.
+fn value_of(argv: &[String], flag: &str) -> Option<String> {
+    let i = argv.iter().position(|a| a == flag)?;
+    argv.get(i + 1).cloned()
 }
 
 /// One pipe, read line by line into `tx` until it ends. A line that is not UTF-8 ends the
@@ -1093,6 +1137,62 @@ mod tests {
         let addr = listener.local_addr().expect("its number");
         drop(listener);
         addr
+    }
+
+    #[test]
+    fn start_in_while_running_is_a_no_op() {
+        let mut m = LaunchModel::default();
+        let (shell, args) = sleeper();
+        m.start_program(&shell, &args);
+        let pid = m.pid();
+        assert!(pid.is_some(), "{:?}", m.state());
+        m.start_in(&["loop".into(), "cycle".into()], Path::new("."));
+        assert_eq!(m.pid(), pid, "a second start while running starts nothing");
+        m.kill();
+        poll_until_exit(&mut m);
+        assert_eq!(m.pid(), None);
+    }
+
+    /// `start_in` is `start_program` with the working directory set, and the address it
+    /// attaches to is the one in its own `args`, not the panel's form.
+    #[test]
+    fn start_in_runs_in_the_directory_and_attaches_to_its_args() {
+        let name = format!("es-y6-cwd-{}", std::process::id());
+        let dir = std::env::temp_dir().join(&name);
+        fs::create_dir_all(&dir).unwrap();
+        let (shell, _) = shell("");
+        let args: Vec<String> = if cfg!(windows) {
+            vec!["/C", "cd", "&", "rem", "--telemetry", "127.0.0.1:7010"]
+        } else {
+            vec!["-c", "pwd", "--telemetry", "127.0.0.1:7010"]
+        }
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        let mut m = LaunchModel {
+            binary: EsBinary {
+                path: shell,
+                reason: "test".to_owned(),
+            },
+            attach_tries: 1,
+            ..LaunchModel::default()
+        };
+        m.start_in(&args, &dir);
+        assert_eq!(m.attach().as_deref(), Some("127.0.0.1:7010"));
+        assert_eq!(poll_until_exit(&mut m), 0);
+        assert!(
+            m.lines().any(|l| l.trim_end().ends_with(&name)),
+            "{:?}",
+            m.lines().collect::<Vec<_>>()
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn free_local_port_can_be_bound() {
+        let port = free_local_port();
+        assert_ne!(port, 0);
+        std::net::TcpListener::bind(("127.0.0.1", port)).expect("still free");
     }
 
     /// Start returns at once: the dial is a background thread, so the panel stays live even on

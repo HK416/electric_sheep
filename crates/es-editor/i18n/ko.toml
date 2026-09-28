@@ -259,3 +259,17 @@
 "template.cube_into_bin_hint.name" = "큐브를 통에 넣기 - 큐브 위치 알려 주기"
 "template.cube_into_bin_hint.summary" = "팔도, 큐브도, 통도 같습니다. 다만 카메라와 관절에 더해 큐브가 정확히 어디 있는지도 정책에 알려 줍니다."
 "template.cube_into_bin_hint.notice" = "연습용: 시뮬레이터가 큐브 위치까지 정책에 알려 줍니다. 실제 로봇은 알 수 없는 정보라서, 실제보다 훨씬 쉬운 문제가 됩니다."
+
+# --- 단계 표시줄: 다섯 단계와 각 단계의 상태 -------------------------------------------------
+"phase.scene" = "장면"
+"phase.teach" = "가르치기"
+"phase.train" = "학습"
+"phase.evaluate" = "평가"
+"phase.results" = "결과"
+"run.done" = "완료"
+"run.not_started" = "시작 전"
+"run.locked" = "앞 단계를 기다리는 중"
+"run.running" = "진행 중"
+"run.failed" = "실패"
+"run.interrupted" = "중단됨"
+"run.stopped_by_you" = "직접 중지함"
