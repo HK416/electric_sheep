@@ -307,9 +307,21 @@ pub fn pc_check(deps: &Deps) -> Vec<CheckItem> {
     items
 }
 
-/// Whether the line needs the sentence on how to install what is missing: only for a red item.
-pub fn needs_install(items: &[CheckItem]) -> bool {
-    items.iter().any(|i| i.mark == Mark::Missing)
+/// The sentences under the line on how to get what is red, each with its hover: the Python
+/// tools and the driver for any red item but `render`, and a rebuild of `es` for `render` (packet
+/// M12/Y15: a default `es` build has no camera drawing, and no install adds it).
+pub fn install_lines(items: &[CheckItem]) -> Vec<(&'static str, Option<&'static str>)> {
+    let red = |render: bool| {
+        (items.iter()).any(|i| i.mark == Mark::Missing && (i.key == "deps.render") == render)
+    };
+    let mut lines = Vec::new();
+    if red(false) {
+        lines.push(("home.install", None));
+    }
+    if red(true) {
+        lines.push(("home.install_render", Some("home.install_render.hint")));
+    }
+    lines
 }
 
 /// What a card (or a File-menu item) says instead of offering Create, and in which colour: the
@@ -704,7 +716,7 @@ mod tests {
     fn pc_check_marks_what_is_here_missing_and_optional() {
         let all = pc_check(&parse_deps(READY).unwrap());
         assert!(all.iter().all(|i| i.mark == Mark::Have), "{all:?}");
-        assert!(!needs_install(&all));
+        assert!(install_lines(&all).is_empty());
         assert_eq!(all[0].key, "deps.python");
         assert_eq!(all.len(), 1 + NEEDS.len() + 1);
 
@@ -724,10 +736,21 @@ mod tests {
             ("home.optional", Some("physx"), Mark::Optional)
         );
         assert_eq!(physx.reason.as_deref(), Some("no Isaac Sim"));
-        assert!(needs_install(&items));
-        // An absent simulator alone asks nobody to install anything.
+        let keys =
+            |d: &Deps| -> Vec<&str> { install_lines(&pc_check(d)).iter().map(|l| l.0).collect() };
+        assert_eq!(keys(&d), ["home.install"]);
+        // The render line is there exactly when `render` is not, beside the tools' or alone.
+        d.render = false;
+        assert_eq!(keys(&d), ["home.install", "home.install_render"]);
         d.modules.lerobot = true;
-        assert!(!needs_install(&pc_check(&d)));
+        assert_eq!(keys(&d), ["home.install_render"]);
+        assert_eq!(
+            install_lines(&pc_check(&d))[0].1,
+            Some("home.install_render.hint")
+        );
+        // An absent simulator alone asks nobody to install anything.
+        d.render = true;
+        assert!(install_lines(&pc_check(&d)).is_empty());
 
         for lang in Lang::ALL {
             for mark in [Mark::Have, Mark::Missing, Mark::Optional] {

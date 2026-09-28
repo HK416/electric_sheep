@@ -179,7 +179,7 @@ impl ReplayView {
 
 /// MJCF or URDF by extension, as `es backend`'s `load_scene` and `es video showcase` do, then
 /// the mesh files the scene names, relative to its directory (packet M10/W2b).
-fn load_scene(path: &Path) -> Result<SceneDesc, ReplayError> {
+pub(crate) fn load_scene(path: &Path) -> Result<SceneDesc, ReplayError> {
     let bad = |message: String| ReplayError::Scene {
         path: path.display().to_string(),
         message,

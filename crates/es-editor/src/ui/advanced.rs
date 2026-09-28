@@ -18,7 +18,7 @@ use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use es_eval::run_dir::{Bucket, Rgb8Image, RunDir};
 use es_ir::graph::PortRef;
 use es_ir::NodeId;
-use es_render::raster::{Camera, Raster, BACKGROUND};
+use es_render::raster::{Camera, Projected, Raster, BACKGROUND};
 
 use crate::app::EditorApp;
 use crate::model::dialogs;
@@ -1341,6 +1341,20 @@ pub(crate) fn replay_canvas(
     camera: &mut Camera,
     texture: &mut Option<((usize, Camera), egui::TextureHandle)>,
 ) {
+    let project = |camera: &Camera| view.project(view.tick, camera);
+    scene_canvas(ui, size, view.tick, project, camera, texture);
+}
+
+/// [`replay_canvas`] for any posed scene: `tick` is what changes the picture besides the
+/// camera, and `project` draws it. ① and ② show a template's scene with it (packet M12/Y15).
+pub(crate) fn scene_canvas(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    tick: usize,
+    project: impl Fn(&Camera) -> Projected,
+    camera: &mut Camera,
+    texture: &mut Option<((usize, Camera), egui::TextureHandle)>,
+) {
     let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
     (camera.width, camera.height) =
         Raster::size_for([response.rect.width(), response.rect.height()]);
@@ -1361,13 +1375,9 @@ pub(crate) fn replay_canvas(
     // One CPU frame per tick or camera change, never per repaint: the raster is the same
     // bytes until one of them moves, and re-drawing 2,700 triangles for a picture that
     // did not change would burn a core holding still.
-    let key = (view.tick, *camera);
+    let key = (tick, *camera);
     if texture.as_ref().is_none_or(|(k, _)| *k != key) {
-        let raster = Raster::draw(
-            &view.project(view.tick, camera),
-            camera.width,
-            camera.height,
-        );
+        let raster = Raster::draw(&project(camera), camera.width, camera.height);
         let image = egui::ColorImage::from_rgb([raster.w as usize, raster.h as usize], &raster.rgb);
         *texture = Some((
             key,

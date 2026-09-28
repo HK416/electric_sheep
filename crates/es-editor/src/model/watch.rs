@@ -835,7 +835,7 @@ impl Watch {
     }
 }
 
-fn source_of(
+pub(crate) fn source_of(
     project: &Project,
     repo_root: Option<PathBuf>,
 ) -> Result<(Template, PathBuf), &'static str> {

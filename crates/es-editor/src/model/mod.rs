@@ -24,6 +24,7 @@ pub mod recent;
 pub mod replay_view;
 pub mod results;
 pub mod run_view;
+pub mod scene_view;
 pub mod search;
 pub mod telemetry_view;
 pub mod template;

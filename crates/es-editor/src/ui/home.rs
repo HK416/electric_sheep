@@ -137,8 +137,11 @@ fn pc_check(app: &mut EditorApp, ui: &mut egui::Ui) {
             }
         }
     });
-    if home::needs_install(&items) {
-        ui.weak(app.t("home.install"));
+    for (key, hint) in home::install_lines(&items) {
+        let line = ui.weak(app.t(key));
+        if let Some(hint) = hint {
+            line.on_hover_text(app.t(hint));
+        }
     }
     if matches!(state, DepsState::Failed(_)) {
         let es = app.launch.binary();

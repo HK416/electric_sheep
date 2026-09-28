@@ -3,6 +3,7 @@
 //! [`home`] is the start screen and the new-project dialog (packet M12/Y11).
 //! [`train`] is ③ and ④, a run started, watched and stopped (packet M12/Y12).
 //! [`results`] is ⑤, a finished run read in plain words (packet M12/Y13).
+//! [`scene`] is ① and ②, a template's scene and how it teaches (packet M12/Y15).
 //!
 //! Compiled only, never run by CI (`docs/design/editor-shell.md` section 2): every branch that
 //! chooses what to show is in [`crate::model`], under test. This half turns answers into
@@ -11,6 +12,7 @@
 pub mod advanced;
 pub mod home;
 pub mod results;
+pub mod scene;
 pub mod shell;
 pub mod train;
 

@@ -81,6 +81,8 @@ pub struct EditorApp {
     pub(crate) docks: Docks,
     /// ⑤ Results between frames (packet M12/Y13).
     pub(crate) results: crate::ui::results::State,
+    /// ① and ② between frames: the template's scene, read once per project (packet M12/Y15).
+    pub(crate) scene: crate::ui::scene::State,
     /// Frames of the selected cell's filmstrip, keyed `<cell>#<index>`.
     pub(crate) run_frames: BTreeMap<String, egui::TextureHandle>,
     /// The scene the replay poses (packet M7/E2). A run directory does not carry one, so it
@@ -149,6 +151,7 @@ impl EditorApp {
             project: None,
             docks: Docks::default(),
             results: crate::ui::results::State::default(),
+            scene: crate::ui::scene::State::default(),
             run_frames: BTreeMap::new(),
             scene_path: String::new(),
             frames_path: String::new(),

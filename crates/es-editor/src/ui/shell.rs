@@ -3,8 +3,8 @@
 //!
 //! Which panes exist and where each step puts them, what a step's button says, its colour,
 //! whether it opens and where `Next` goes are all [`crate::model::layout`]'s; the states are
-//! [`crate::model::workflow`]'s. The step panels are placeholders until packets M12/Y11-Y13
-//! fill them; until then the Advanced panes along the bottom do the work.
+//! [`crate::model::workflow`]'s. Each step draws its own panes (packets M12/Y12, Y13, Y15); the
+//! Advanced panes along the bottom are the editor from before the dock.
 
 use eframe::egui;
 use egui::{Color32, RichText};
@@ -269,6 +269,10 @@ impl TabViewer for Panes<'_> {
         if crate::ui::train::draw(app, ui, *pane) {
             return;
         }
+        // ① and ② draw their own step panel, centre and summary (packet M12/Y15).
+        if crate::ui::scene::draw(app, ui, *pane) {
+            return;
+        }
         match pane {
             Pane::Viewport => viewport(app, ui),
             Pane::StepPanel => step_panel(app, ui),
@@ -304,17 +308,14 @@ impl TabViewer for Panes<'_> {
     }
 }
 
-/// The centre of every step. What it shows is packets M12/Y11-Y13's.
+/// The centre of every step. What it shows is packets M12/Y12, Y13 and Y15's.
 fn viewport(app: &EditorApp, ui: &mut egui::Ui) {
     if app.project.is_none() {
         ui.label(app.t("shell.not_a_project"));
-        return;
     }
-    ui.weak(app.t("shell.coming_soon"));
 }
 
-/// The step's own panel, left: its name, where it is, and - until its packet lands - a line
-/// saying it is not built yet.
+/// The step's own panel, left, when its packet draws nothing: its name and where it is.
 fn step_panel(app: &EditorApp, ui: &mut egui::Ui) {
     let Some(open) = &app.project else {
         ui.label(app.t("shell.not_a_project"));
@@ -324,8 +325,6 @@ fn step_panel(app: &EditorApp, ui: &mut egui::Ui) {
     let state = state_of(open, open.phase);
     ui.heading(layout::step_text(lang, open.phase, state));
     ui.label(i18n::t(lang, state.key()));
-    ui.separator();
-    ui.weak(app.t("shell.coming_soon"));
 }
 
 /// The project at a glance, right: its name, its folder and the five steps' states.
