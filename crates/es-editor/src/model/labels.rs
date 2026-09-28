@@ -16,10 +16,11 @@
 //! The home screen's five steps are here too, for the same reason `app.rs` decides nothing
 //! else (spec 28.10 rule 3): their order is spec 13.1's loop, not a layout.
 
-use es_ir::evaluation::MetricSpec;
+use es_ir::evaluation::{MetricSpec, PerturbationKind};
 
 use crate::model::i18n::{t, Lang};
 use crate::model::launch::{Kind, LaunchField, LaunchFlag};
+use crate::model::results::Cause;
 
 // --- tabs --------------------------------------------------------------------------------
 
@@ -198,6 +199,61 @@ pub fn column_label(lang: Lang, column: &str) -> &'static str {
         "suite" => t(lang, "column.suite"),
         "seed" => t(lang, "column.seed"),
         _ => metric_by_name(column).map_or("", |m| metric_label(lang, m)),
+    }
+}
+
+// --- results: why it failed, and under what -------------------------------------------------
+
+/// The key of a failure cause's plain name. Total over [`Cause`], no wildcard arm.
+pub fn cause_key(cause: Cause) -> &'static str {
+    match cause {
+        Cause::Timeout => "cause.timeout",
+        Cause::FailureCondition => "cause.failure_condition",
+        Cause::Unfinished => "cause.unfinished",
+        Cause::SafetyLimit => "cause.safety_limit",
+        Cause::SafetyFallback => "cause.safety_fallback",
+        Cause::MotionGaps => "cause.motion_gaps",
+        Cause::TooLate => "cause.too_late",
+        Cause::Unstable => "cause.unstable",
+        Cause::SensorDrop => "cause.sensor_drop",
+        Cause::ActuatorFault => "cause.actuator_fault",
+        Cause::BackendUnsupported => "cause.backend_unsupported",
+    }
+}
+
+/// The key of a cause's one line of advice: what usually helps. Total over [`Cause`].
+pub fn cause_advice_key(cause: Cause) -> &'static str {
+    match cause {
+        Cause::Timeout => "cause.timeout.advice",
+        Cause::FailureCondition => "cause.failure_condition.advice",
+        Cause::Unfinished => "cause.unfinished.advice",
+        Cause::SafetyLimit => "cause.safety_limit.advice",
+        Cause::SafetyFallback => "cause.safety_fallback.advice",
+        Cause::MotionGaps => "cause.motion_gaps.advice",
+        Cause::TooLate => "cause.too_late.advice",
+        Cause::Unstable => "cause.unstable.advice",
+        Cause::SensorDrop => "cause.sensor_drop.advice",
+        Cause::ActuatorFault => "cause.actuator_fault.advice",
+        Cause::BackendUnsupported => "cause.backend_unsupported.advice",
+    }
+}
+
+/// The key of a perturbation kind's plain name - what a situation bar is labelled with.
+/// Total over the twelve [`PerturbationKind`]s, no wildcard arm.
+pub fn perturbation_key(kind: &PerturbationKind) -> &'static str {
+    match kind {
+        PerturbationKind::LightIntensity { .. } => "perturb.light_intensity",
+        PerturbationKind::LightDirection { .. } => "perturb.light_direction",
+        PerturbationKind::ColorTemperature { .. } => "perturb.color_temperature",
+        PerturbationKind::CameraExtrinsic { .. } => "perturb.camera_extrinsic",
+        PerturbationKind::CameraIntrinsic { .. } => "perturb.camera_intrinsic",
+        PerturbationKind::ObjectPose { .. } => "perturb.object_pose",
+        PerturbationKind::Occluder { .. } => "perturb.occluder",
+        PerturbationKind::ObservationDelay { .. } => "perturb.observation_delay",
+        PerturbationKind::ActionDelay { .. } => "perturb.action_delay",
+        PerturbationKind::FrameDrop { .. } => "perturb.frame_drop",
+        PerturbationKind::TorqueNoise { .. } => "perturb.torque_noise",
+        PerturbationKind::Backlash { .. } => "perturb.backlash",
     }
 }
 
@@ -409,6 +465,78 @@ mod tests {
                 extensions.is_empty(),
                 "{field:?}: a filter has both or neither"
             );
+        }
+    }
+
+    /// Packet M12/Y8. Every failure cause and every perturbation kind has a plain name in both
+    /// languages - pairwise distinct, no `_`, never its key or its raw name - and every cause
+    /// has its own line of advice.
+    #[test]
+    fn cause_and_perturbation_labels_are_total() {
+        use es_ir::evaluation::{CountRange, PerturbationKind as P, Range};
+
+        use super::{cause_advice_key, cause_key, perturbation_key};
+        use crate::model::results::Cause;
+
+        let r = Range::new(0.0, 1.0);
+        let n = CountRange::new(0, 1);
+        let kinds = [
+            P::LightIntensity {
+                range: r,
+                dist: es_ir::evaluation::Distribution::Uniform,
+            },
+            P::LightDirection { range_deg: 1.0 },
+            P::ColorTemperature { range_k: r },
+            P::CameraExtrinsic {
+                pos_sigma_m: 0.0,
+                rot_sigma_deg: 0.0,
+            },
+            P::CameraIntrinsic {
+                focal_rel_sigma: 0.0,
+            },
+            P::ObjectPose {
+                target: "cube".into(),
+                pos_sigma_m: 0.0,
+                yaw_deg: 0.0,
+            },
+            P::Occluder {
+                count: n,
+                size_m: r,
+            },
+            P::ObservationDelay { ms: vec![0] },
+            P::ActionDelay { ms: vec![0] },
+            P::FrameDrop {
+                prob: 0.0,
+                burst: n,
+            },
+            P::TorqueNoise { rel_sigma: 0.0 },
+            P::Backlash { rad: r },
+        ];
+        let names: BTreeSet<&str> = kinds.iter().map(P::name).collect();
+        assert_eq!(names.len(), 12, "every kind, once");
+
+        for lang in Lang::ALL {
+            let mut seen = BTreeSet::new();
+            let mut advice = BTreeSet::new();
+            for cause in Cause::ALL {
+                let label = t(lang, cause_key(cause));
+                assert_ne!(label, cause_key(cause), "{cause:?} in {lang:?}");
+                assert!(!label.contains('_'), "{cause:?} reads as an identifier");
+                assert!(seen.insert(label), "{label} is used twice in {lang:?}");
+                let line = t(lang, cause_advice_key(cause));
+                assert!(
+                    line != cause_advice_key(cause) && line.ends_with('.'),
+                    "{cause:?} advice in {lang:?} is a sentence: {line}"
+                );
+                assert!(advice.insert(line), "two causes share advice: {line}");
+            }
+            for kind in &kinds {
+                let label = t(lang, perturbation_key(kind));
+                assert_ne!(label, perturbation_key(kind), "{} in {lang:?}", kind.name());
+                assert_ne!(label, kind.name());
+                assert!(!label.contains('_'), "{label} reads as an identifier");
+                assert!(seen.insert(label), "{label} is used twice in {lang:?}");
+            }
         }
     }
 

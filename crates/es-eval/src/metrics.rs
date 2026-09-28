@@ -266,7 +266,7 @@ fn failure_histogram(episodes: &[Episode], counters: &SafetyCounters) -> BTreeMa
     out
 }
 
-fn failure_name(k: FailureKind) -> &'static str {
+pub fn failure_name(k: FailureKind) -> &'static str {
     match k {
         FailureKind::NanDetected => "nan_detected",
         FailureKind::Diverged => "diverged",
@@ -279,7 +279,7 @@ fn failure_name(k: FailureKind) -> &'static str {
     }
 }
 
-fn violation_name(k: ViolationKind) -> &'static str {
+pub fn violation_name(k: ViolationKind) -> &'static str {
     match k {
         ViolationKind::NonFinite => "violation.non_finite",
         ViolationKind::Position => "violation.position",
