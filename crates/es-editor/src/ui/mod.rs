@@ -6,6 +6,7 @@
 //! widgets.
 
 pub mod advanced;
+pub mod results;
 pub mod shell;
 
 use eframe::egui;

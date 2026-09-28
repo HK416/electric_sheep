@@ -6,16 +6,30 @@
 //! it, and a comparison is a difference of those - and only between two reports of the same
 //! `evaluation_hash`, because a number across different conditions reads as progress that
 //! is not there (spec 13.3).
+//!
+//! The screen's own choices are here too (packet M12/Y13): which run is shown and which it is
+//! compared with, each acceptance line in plain words, a suite's plain name, the views an
+//! attempt can be played in and the one it opens on, and which policy file Export copies.
 
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use es_core::FailureKind;
-use es_eval::episodes::EpisodeRow;
+use es_data::training::Cycle;
+use es_eval::episodes::{read_episodes, EpisodeRow};
 use es_eval::metrics::{failure_name, violation_name};
+use es_eval::run_dir::{CellRow, RunDir};
 use es_ir::evaluation::{
-    EvaluationIr, EvaluationReport, MetricSpec, MetricValue, PerturbationKind,
+    AcceptanceResult, Comparator, EvaluationIr, EvaluationReport, MetricSpec, MetricValue,
+    PerturbationKind,
 };
+use es_ir::serial::evaluation_from_toml;
 use es_safety::ViolationKind;
+
+use crate::model::i18n::{fill, t, Lang};
+use crate::model::labels::{metric_label, perturbation_key};
+use crate::model::project::{Project, RunFolder, StartSettings, RUN_RECIPE};
+use crate::model::template::{load, Length, Template};
 
 /// Why an episode failed, in the words a person reads - one per group of histogram buckets.
 /// The order is the tie-break of [`causes`] and a tile's pick: how the episode ended first.
@@ -269,8 +283,9 @@ pub fn situations(
         .collect()
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TileFilter {
+    #[default]
     All,
     Successes,
     Failures,
@@ -307,6 +322,347 @@ pub fn tiles(rows: &[EpisodeRow], filter: TileFilter) -> Vec<Tile> {
             })
         })
         .collect()
+}
+
+// --- the screen (packet M12/Y13) --------------------------------------------------------------
+
+impl TileFilter {
+    pub const ALL: [TileFilter; 3] = [TileFilter::All, TileFilter::Successes, TileFilter::Failures];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            TileFilter::All => "results.filter.all",
+            TileFilter::Successes => "results.filter.successes",
+            TileFilter::Failures => "results.filter.failures",
+        }
+    }
+}
+
+impl Card {
+    pub fn verdict_key(&self) -> &'static str {
+        if self.passed {
+            "results.card.passed"
+        } else {
+            "results.card.failed"
+        }
+    }
+}
+
+/// How the player shows an attempt: the recorded motion re-posed on the scene and seen from a
+/// camera the person turns, the pictures the policy was given, or both beside each other.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum View {
+    Outside,
+    Eye,
+    SideBySide,
+}
+
+impl View {
+    pub fn key(self) -> &'static str {
+        match self {
+            View::Outside => "results.view.outside",
+            View::Eye => "results.view.eye",
+            View::SideBySide => "results.view.both",
+        }
+    }
+}
+
+/// The views an attempt can be played in, the first being the one it opens in: outside needs
+/// its motion (a trajectory and a scene that loaded), the policy's eye its pictures, side by
+/// side both. An attempt that kept neither has none.
+pub fn views(motion: bool, frames: usize) -> Vec<View> {
+    match (motion, frames > 0) {
+        (true, true) => vec![View::Outside, View::Eye, View::SideBySide],
+        (true, false) => vec![View::Outside],
+        (false, true) => vec![View::Eye],
+        (false, false) => Vec::new(),
+    }
+}
+
+/// The playback speeds offered, as multiples of the run's own rate.
+pub const SPEEDS: [f64; 3] = [0.5, 1.0, 2.0];
+
+/// The recorded picture shown at playback index `tick`. `es eval run` pushes the trajectory
+/// where it captures the frame, so the two share an index; past the last picture, the last.
+pub fn frame_at(tick: usize, frames: usize) -> Option<usize> {
+    frames.checked_sub(1).map(|last| tick.min(last))
+}
+
+/// The attempt the player opens on: the first failure (spec 10.5 replays failures first), else
+/// the first attempt. An old run has no rows: its first cell that kept its motion, else its
+/// first cell.
+pub fn first_to_play(rows: Option<&[EpisodeRow]>, cells: &[CellRow]) -> Option<String> {
+    match rows {
+        Some(rows) => rows
+            .iter()
+            .find(|r| r.termination != SUCCESS)
+            .or(rows.first())
+            .map(|r| r.cell.clone()),
+        None => cells
+            .iter()
+            .find(|c| c.has_traj)
+            .or(cells.first())
+            .map(|c| c.name.clone()),
+    }
+}
+
+/// A suite's plain name: its perturbation kinds' names, each once, in the document's order;
+/// `results.nominal` for a suite that perturbs nothing. A suite the Evaluation IR does not
+/// declare - or every suite, when the IR could not be read - keeps its raw name.
+pub fn suite_label(lang: Lang, suite: &str, ir: Option<&EvaluationIr>) -> String {
+    let Some(declared) = ir.and_then(|ir| ir.suites.iter().find(|s| s.name == suite)) else {
+        return suite.to_owned();
+    };
+    let mut words: Vec<&str> = Vec::new();
+    for p in &declared.perturbations {
+        let word = t(lang, perturbation_key(&p.kind));
+        if !words.contains(&word) {
+            words.push(word);
+        }
+    }
+    if words.is_empty() {
+        t(lang, "results.nominal").to_owned()
+    } else {
+        words.join(", ")
+    }
+}
+
+/// One acceptance line: passed, failed or not measured (`None`), the plain sentence, and the
+/// criterion as the Evaluation IR spells it, for the hover.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Line {
+    pub passed: Option<bool>,
+    pub text: String,
+    pub raw: String,
+}
+
+fn comparator_key(comparator: Comparator) -> &'static str {
+    match comparator {
+        Comparator::Ge => "results.ge",
+        Comparator::Gt => "results.gt",
+        Comparator::Le => "results.le",
+        Comparator::Lt => "results.lt",
+    }
+}
+
+/// At most three decimals, and none that are only zeros: `0.5`, `0.688`, `12`.
+fn number(x: f64) -> String {
+    let s = format!("{x:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// "Every situation: Success rate at least 0.5 (measured 0.688)" - the report's own verdict
+/// and number, never recomputed.
+pub fn acceptance_line(lang: Lang, line: &AcceptanceResult, ir: Option<&EvaluationIr>) -> Line {
+    match line {
+        AcceptanceResult::Determined {
+            criterion: c,
+            observed,
+            passed,
+        } => {
+            let place = c.suite.as_deref().map_or_else(
+                || t(lang, "results.everywhere").to_owned(),
+                |suite| suite_label(lang, suite, ir),
+            );
+            let condition = fill(
+                lang,
+                comparator_key(c.comparator),
+                &[metric_label(lang, c.metric), &number(c.threshold)],
+            );
+            Line {
+                passed: Some(*passed),
+                text: fill(
+                    lang,
+                    "results.criterion",
+                    &[&place, &condition, &number(*observed)],
+                ),
+                raw: format!(
+                    "{} {} {} ({}, {})",
+                    c.metric.name(),
+                    c.comparator.name(),
+                    c.threshold,
+                    c.aggregation.name(),
+                    c.suite.as_deref().unwrap_or("*")
+                ),
+            }
+        }
+        AcceptanceResult::Unavailable { metric, reason } => Line {
+            passed: None,
+            text: format!(
+                "{}: {} ({reason})",
+                metric_label(lang, *metric),
+                t(lang, "results.not_measured")
+            ),
+            raw: metric.name().to_owned(),
+        },
+    }
+}
+
+/// The change from run `previous`, in percentage points with its sign; "not comparable" for
+/// other conditions; nothing when there is no earlier run.
+pub fn change_text(lang: Lang, comparison: &Comparison, previous: u32) -> Option<String> {
+    match comparison {
+        Comparison::NoPrevious => None,
+        Comparison::NotComparable => Some(t(lang, "results.not_comparable").to_owned()),
+        Comparison::Delta { success_points } => Some(fill(
+            lang,
+            "results.change",
+            &[&format!("{success_points:+.1}"), &format!("{previous:03}")],
+        )),
+    }
+}
+
+/// The runs ⑤ can show: those with an `eval/report.json`, ascending.
+pub fn finished_runs(project: &Project) -> Vec<RunFolder> {
+    project
+        .runs()
+        .into_iter()
+        .filter(|r| r.report_path().is_file())
+        .collect()
+}
+
+/// The run on screen: the one picked from the list while it is there, else the newest.
+pub fn shown(runs: &[RunFolder], chosen: Option<u32>) -> Option<&RunFolder> {
+    runs.iter()
+        .find(|r| Some(r.number) == chosen)
+        .or(runs.last())
+}
+
+/// The policy file to export: the checkpoint the evaluation judged - the recipe's
+/// `[eval] checkpoint` when it names a mark that is on disk - else the newest
+/// `train/checkpoints/<mark>.esb` (`"last"`, or the recipe is gone). `None` before training
+/// wrote one.
+pub fn export_bundle(run: &RunFolder, cycle: Option<&Cycle>) -> Option<PathBuf> {
+    let dir = run.path.join("train").join("checkpoints");
+    let evaluated = cycle
+        .and_then(|c| c.eval.checkpoint.parse::<u32>().ok())
+        .map(|mark| dir.join(format!("{mark}.esb")))
+        .filter(|p| p.is_file());
+    evaluated.or_else(|| {
+        std::fs::read_dir(&dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "esb"))
+            .filter_map(|p| Some((p.file_stem()?.to_str()?.parse::<u32>().ok()?, p)))
+            .max_by_key(|(mark, _)| *mark)
+            .map(|(_, p)| p)
+    })
+}
+
+/// The file name the save dialog suggests: the project folder, the run and the mark, so two
+/// exports never suggest the same name.
+pub fn export_name(project: &Project, run: &RunFolder, bundle: &Path) -> String {
+    let stem = |p: &Path| p.file_stem().map(|s| s.to_string_lossy().into_owned());
+    let folder = project
+        .root
+        .file_name()
+        .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    format!(
+        "{folder}-{:03}-{}.esb",
+        run.number,
+        stem(bundle).unwrap_or_default()
+    )
+}
+
+/// What Run again starts ③ with: the run's `[collect] episodes` and the preset whose marks its
+/// inline `[train] run` holds. `None` for a recipe the editor did not write.
+pub fn start_settings(cycle: &Cycle, template: &Template) -> Option<StartSettings> {
+    let demonstrations = cycle.collect.as_ref()?.episodes;
+    let marks = &cycle.train.run.as_ref()?.checkpoint_at;
+    let length = [Length::Short, Length::Medium, Length::Long]
+        .into_iter()
+        .find(|l| template.marks(*l) == marks.as_slice())?;
+    Some(StartSettings {
+        demonstrations,
+        length,
+    })
+}
+
+/// One run, read for ⑤: its `eval/` folder, `episodes.json` when it has one, and what its
+/// `cycle.toml` names.
+#[derive(Debug)]
+pub struct RunResults {
+    pub run: RunFolder,
+    pub dir: RunDir,
+    /// `None` is a run from before `episodes.json`: no tiles, bars from the report.
+    pub rows: Option<Vec<EpisodeRow>>,
+    /// Why an `episodes.json` that is there could not be read.
+    pub rows_error: Option<String>,
+    pub cycle: Option<Cycle>,
+    /// The Evaluation IR `[eval] config` names; `None` shows the raw suite names.
+    pub ir: Option<EvaluationIr>,
+    /// What the outside camera re-poses the motion on: the recipe's scene, else the template's.
+    pub scene: Option<PathBuf>,
+    /// The project's previous run with a result, and its report.
+    pub previous: Option<(u32, EvaluationReport)>,
+    /// What Run again starts ③ with ([`start_settings`]).
+    pub settings: Option<StartSettings>,
+    /// The policy file Export copies ([`export_bundle`]).
+    pub export: Option<PathBuf>,
+}
+
+impl RunResults {
+    /// Only `eval/report.json` is required. `repo_root` resolves the recipe's
+    /// repository-relative paths and finds the project's template; without it the labels
+    /// are raw and the outside camera has no scene.
+    pub fn read(
+        project: &Project,
+        run: &RunFolder,
+        repo_root: Option<&Path>,
+    ) -> Result<Self, String> {
+        let dir = RunDir::open(&run.eval_dir()).map_err(|e| e.to_string())?;
+        let (rows, rows_error) = match read_episodes(&run.eval_dir()) {
+            Ok(rows) => (rows, None),
+            Err(e) => (None, Some(e.to_string())),
+        };
+        let cycle = std::fs::read_to_string(run.path.join(RUN_RECIPE))
+            .ok()
+            .and_then(|text| Cycle::parse(&text).ok());
+        let template = repo_root.and_then(|root| {
+            load(root)
+                .0
+                .into_iter()
+                .find(|t| t.id == project.file.template)
+        });
+        let ir = cycle.as_ref().zip(repo_root).and_then(|(c, root)| {
+            let text = std::fs::read_to_string(root.join(&c.eval.config)).ok()?;
+            evaluation_from_toml(&text).ok()
+        });
+        let scene = cycle
+            .as_ref()
+            .map(|c| &c.scene)
+            .or(template.as_ref().map(|t| &t.scene))
+            .zip(repo_root)
+            .map(|(scene, root)| root.join(scene));
+        let previous = finished_runs(project)
+            .into_iter()
+            .rfind(|r| r.number < run.number)
+            .and_then(|r| {
+                let text = std::fs::read_to_string(r.report_path()).ok()?;
+                Some((r.number, serde_json::from_str(&text).ok()?))
+            });
+        let settings = cycle
+            .as_ref()
+            .zip(template.as_ref())
+            .and_then(|(c, t)| start_settings(c, t));
+        Ok(Self {
+            run: run.clone(),
+            export: export_bundle(run, cycle.as_ref()),
+            dir,
+            rows,
+            rows_error,
+            cycle,
+            ir,
+            scene,
+            previous,
+            settings,
+        })
+    }
+
+    pub fn comparison(&self) -> Comparison {
+        compare(&self.dir.report, self.previous.as_ref().map(|(_, r)| r))
+    }
 }
 
 #[cfg(test)]
@@ -445,8 +801,8 @@ mod tests {
         assert_eq!((s[0].successes, s[0].episodes), (0, 0));
     }
 
-    #[test]
-    fn situations_follow_the_evaluation_and_count_rows() {
+    /// Two suites: `dim` (one kind, twice) and `nominal` (none).
+    fn two_suite_ir() -> EvaluationIr {
         let light = Perturbation::new(
             PerturbationKind::LightIntensity {
                 range: Range::new(0.5, 1.5),
@@ -454,7 +810,7 @@ mod tests {
             },
             0,
         );
-        let ir = EvaluationIr {
+        EvaluationIr {
             schema_version: 1,
             task: "task.toml".into(),
             observation: "observation.toml".into(),
@@ -476,7 +832,12 @@ mod tests {
             acceptance: Vec::new(),
             augmentation: AugmentationPolicy::Disabled,
             replay: ReplayPolicy::default(),
-        };
+        }
+    }
+
+    #[test]
+    fn situations_follow_the_evaluation_and_count_rows() {
+        let ir = two_suite_ir();
         let rows = [
             row("nominal", 0, "success", &[]),
             row("nominal", 1, "timeout", &[]),
@@ -514,5 +875,292 @@ mod tests {
         assert_eq!(tiles(&rows, TileFilter::Successes)[0].cell, "nominal-00");
         assert_eq!(tiles(&rows, TileFilter::Successes)[0].cause, None);
         assert_eq!(tiles(&rows, TileFilter::All).len(), 2);
+    }
+
+    // --- the screen (packet M12/Y13) ----------------------------------------------------------
+
+    use crate::model::project::tests::{cube, repo};
+    use crate::model::project::{write_run, ProjectFile};
+    use es_eval::episodes::write_episodes;
+    use es_ir::evaluation::{AcceptanceCriterion, Aggregation};
+
+    /// A project folder holding only its `project.toml`: nothing here builds a bundle.
+    fn scratch(name: &str) -> Project {
+        let root = std::env::temp_dir().join(format!("es-y13-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let file = ProjectFile {
+            kind: "project".into(),
+            name: name.into(),
+            template: "cube-into-bin".into(),
+        };
+        std::fs::write(root.join("project.toml"), toml::to_string(&file).unwrap()).unwrap();
+        Project::open(&root).unwrap()
+    }
+
+    fn copy_dir(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for entry in std::fs::read_dir(from).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                copy_dir(&path, &to.join(entry.file_name()));
+            } else {
+                std::fs::copy(&path, to.join(entry.file_name())).unwrap();
+            }
+        }
+    }
+
+    /// The committed E5 fixture run, copied into `runs/<n>/eval/`. The fixture is only read.
+    fn copy_fixture(project: &Project, n: u32) -> RunFolder {
+        let run = RunFolder {
+            number: n,
+            path: project.root.join("runs").join(format!("{n:03}")),
+        };
+        copy_dir(
+            &repo().join("tests/fixtures/visible-learning/run"),
+            &run.eval_dir(),
+        );
+        run
+    }
+
+    /// Review focus 5, on disk: the fixture has no `episodes.json`, so it is the old-run path
+    /// (no rows, bars and headline from the report); rows written beside it that agree with its
+    /// report give tiles and causes, and a broken file is named rather than guessed around.
+    #[test]
+    fn a_copied_fixture_run_is_an_old_run_until_episodes_json_is_beside_it() {
+        let p = scratch("old");
+        let run = copy_fixture(&p, 1);
+        let runs = finished_runs(&p);
+        assert_eq!(runs, std::slice::from_ref(&run));
+        assert_eq!(shown(&runs, None), Some(&run));
+
+        let r = RunResults::read(&p, &run, Some(&repo())).unwrap();
+        assert!(r.rows.is_none() && r.rows_error.is_none());
+        assert!(r.cycle.is_none() && r.ir.is_none() && r.settings.is_none());
+        assert_eq!(
+            r.scene,
+            Some(repo().join("tests/fixtures/mjcf/so101_pick_place.xml")),
+            "no recipe: the template's scene"
+        );
+        assert_eq!(r.comparison(), Comparison::NoPrevious);
+        let old = card(&r.dir.report, None);
+        assert_eq!((old.passed, old.successes, old.episodes), (false, 3, 4));
+        assert_eq!(
+            first_to_play(None, r.dir.cells()).as_deref(),
+            Some("nominal-00"),
+            "the one cell that kept its motion"
+        );
+        assert_eq!(suite_label(Lang::En, "light", r.ir.as_ref()), "light");
+
+        let rows = [
+            row("nominal", 0, "success", &[]),
+            row("nominal", 1, "success", &[("violation.velocity", 2)]),
+            row("light", 0, "success", &[]),
+            row("light", 1, "timeout", &[("fallback", 1)]),
+        ];
+        write_episodes(&rows, &run.eval_dir()).unwrap();
+        let r = RunResults::read(&p, &run, Some(&repo())).unwrap();
+        let read = r.rows.as_deref().expect("rows");
+        assert_eq!(
+            card(&r.dir.report, Some(read)),
+            old,
+            "rows and report agree"
+        );
+        assert_eq!(
+            causes(read),
+            [(Cause::Timeout, 1), (Cause::SafetyFallback, 1)]
+        );
+        assert_eq!(
+            first_to_play(Some(read), r.dir.cells()).as_deref(),
+            Some("light-01"),
+            "failures first"
+        );
+
+        std::fs::write(run.eval_dir().join("episodes.json"), "{").unwrap();
+        let r = RunResults::read(&p, &run, None).unwrap();
+        assert!(r.rows.is_none() && r.rows_error.is_some(), "named, not old");
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
+    /// Review focus 5, the other half: a previous run under the same evaluation gives a
+    /// number, under another none at all; a run folder without a result is not listed.
+    #[test]
+    fn the_previous_run_is_compared_only_under_the_same_evaluation() {
+        let p = scratch("compare");
+        copy_fixture(&p, 1);
+        let two = copy_fixture(&p, 2);
+        let r = RunResults::read(&p, &two, None).unwrap();
+        assert_eq!(r.previous.as_ref().map(|(n, _)| *n), Some(1));
+        assert_eq!(
+            r.comparison(),
+            Comparison::Delta {
+                success_points: 0.0
+            }
+        );
+        assert_eq!(
+            change_text(Lang::En, &r.comparison(), 1),
+            Some(fill(Lang::En, "results.change", &["+0.0", "001"]))
+        );
+
+        let mut report = r.dir.report.clone();
+        report.evaluation_hash = [7; 32];
+        std::fs::write(two.report_path(), serde_json::to_string(&report).unwrap()).unwrap();
+        let r = RunResults::read(&p, &two, None).unwrap();
+        assert_eq!(r.comparison(), Comparison::NotComparable);
+        assert_eq!(
+            change_text(Lang::En, &r.comparison(), 1).as_deref(),
+            Some(t(Lang::En, "results.not_comparable"))
+        );
+        assert_eq!(change_text(Lang::En, &Comparison::NoPrevious, 1), None);
+
+        std::fs::create_dir_all(p.root.join("runs/003")).unwrap();
+        let runs = finished_runs(&p);
+        assert_eq!(runs.iter().map(|r| r.number).collect::<Vec<_>>(), [1, 2]);
+        assert_eq!(shown(&runs, Some(1)).map(|r| r.number), Some(1));
+        assert_eq!(
+            shown(&runs, Some(3)).map(|r| r.number),
+            Some(2),
+            "gone: newest"
+        );
+        assert_eq!(shown(&[], None), None);
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
+    /// Export takes the checkpoint the evaluation judged, else the newest one on disk; Run
+    /// again reads back the two settings the editor wrote.
+    #[test]
+    fn export_and_run_again_read_what_the_editor_wrote() {
+        let p = scratch("export");
+        let settings = StartSettings {
+            demonstrations: 50,
+            length: Length::Short,
+        };
+        write_run(
+            &cube(),
+            &repo(),
+            &p,
+            settings,
+            &p.next_run_dir(),
+            "127.0.0.1:7010",
+        )
+        .unwrap();
+        let run = p.latest_run().unwrap();
+        let cycle =
+            Cycle::parse(&std::fs::read_to_string(run.path.join(RUN_RECIPE)).unwrap()).unwrap();
+        assert_eq!(start_settings(&cycle, &cube()), Some(settings));
+        let mut hand = cycle.clone();
+        hand.train.run.as_mut().unwrap().checkpoint_at = vec![123];
+        assert_eq!(start_settings(&hand, &cube()), None, "no preset");
+
+        assert_eq!(export_bundle(&run, Some(&cycle)), None, "nothing trained");
+        let dir = run.path.join("train").join("checkpoints");
+        std::fs::create_dir_all(&dir).unwrap();
+        for name in ["2500.esb", "5000.esb", "notes.txt"] {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        let newest = Some(dir.join("5000.esb"));
+        assert_eq!(export_bundle(&run, Some(&cycle)), newest, "last");
+        let mut early = cycle.clone();
+        early.eval.checkpoint = "2500".into();
+        assert_eq!(
+            export_bundle(&run, Some(&early)),
+            Some(dir.join("2500.esb"))
+        );
+        early.eval.checkpoint = "1000".into();
+        assert_eq!(export_bundle(&run, Some(&early)), newest, "not on disk");
+        assert_eq!(export_bundle(&run, None), newest);
+        assert_eq!(
+            export_name(&p, &run, &dir.join("5000.esb")),
+            format!("es-y13-{}-export-001-5000.esb", std::process::id())
+        );
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
+    #[test]
+    fn the_player_offers_what_was_recorded() {
+        assert_eq!(views(true, 3), [View::Outside, View::Eye, View::SideBySide]);
+        assert_eq!(views(true, 0), [View::Outside]);
+        assert_eq!(views(false, 1), [View::Eye]);
+        assert!(views(false, 0).is_empty());
+        assert_eq!(frame_at(0, 0), None);
+        assert_eq!(frame_at(5, 10), Some(5));
+        assert_eq!(frame_at(47, 1), Some(0), "past the last picture, the last");
+        for lang in Lang::ALL {
+            let words: BTreeSet<&str> = [View::Outside, View::Eye, View::SideBySide]
+                .map(|v| t(lang, v.key()))
+                .into_iter()
+                .chain(TileFilter::ALL.map(|f| t(lang, f.key())))
+                .collect();
+            assert_eq!(words.len(), 6, "{lang:?}");
+            assert!(words.iter().all(|w| !w.contains('.')), "{words:?}");
+        }
+    }
+
+    #[test]
+    fn acceptance_lines_and_suites_read_in_plain_words() {
+        let ir = two_suite_ir();
+        let en = Lang::En;
+        assert_eq!(
+            suite_label(en, "dim", Some(&ir)),
+            t(en, "perturb.light_intensity"),
+            "one kind, named once"
+        );
+        assert_eq!(
+            suite_label(en, "nominal", Some(&ir)),
+            t(en, "results.nominal")
+        );
+        assert_eq!(suite_label(en, "elsewhere", Some(&ir)), "elsewhere");
+        assert_eq!(suite_label(en, "dim", None), "dim");
+
+        let line = AcceptanceResult::Determined {
+            criterion: AcceptanceCriterion {
+                suite: Some("dim".into()),
+                metric: MetricSpec::SuccessRate,
+                comparator: Comparator::Ge,
+                threshold: 0.5,
+                aggregation: Aggregation::Mean,
+            },
+            observed: 0.6875,
+            passed: true,
+        };
+        let l = acceptance_line(en, &line, Some(&ir));
+        assert_eq!(l.passed, Some(true));
+        let condition = fill(
+            en,
+            "results.ge",
+            &[metric_label(en, MetricSpec::SuccessRate), "0.5"],
+        );
+        assert_eq!(
+            l.text,
+            fill(
+                en,
+                "results.criterion",
+                &[t(en, "perturb.light_intensity"), &condition, "0.688"]
+            )
+        );
+        assert_eq!(l.raw, "success_rate >= 0.5 (mean, dim)");
+        let gone = AcceptanceResult::Unavailable {
+            metric: MetricSpec::SuccessRate,
+            reason: "no episode finished".into(),
+        };
+        let l = acceptance_line(en, &gone, None);
+        assert!(l.passed.is_none() && l.text.contains("no episode finished"));
+        for lang in Lang::ALL {
+            let words: BTreeSet<&str> = [
+                Comparator::Ge,
+                Comparator::Gt,
+                Comparator::Le,
+                Comparator::Lt,
+            ]
+            .map(|c| t(lang, comparator_key(c)))
+            .into_iter()
+            .collect();
+            assert_eq!(words.len(), 4, "{lang:?}");
+            assert!(
+                words.iter().all(|w| w.matches("{}").count() == 2),
+                "{words:?}"
+            );
+        }
+        assert_eq!([number(0.5), number(12.0), number(0.0)], ["0.5", "12", "0"]);
     }
 }

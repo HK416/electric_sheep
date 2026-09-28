@@ -921,51 +921,7 @@ impl EditorApp {
             ui.add(egui::Slider::new(&mut view.tick, 0..=last).text("tick"));
         });
 
-        let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
-        (camera.width, camera.height) =
-            Raster::size_for([response.rect.width(), response.rect.height()]);
-        if response.dragged() {
-            let drag = response.drag_delta();
-            *camera = camera.orbit(
-                f64::from(-drag.x) * ORBIT_PER_POINT,
-                f64::from(drag.y) * ORBIT_PER_POINT,
-            );
-        }
-        if response.hovered() {
-            let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-            if scroll != 0.0 {
-                *camera = camera.zoom(f64::from(-scroll).mul_add(ZOOM_PER_POINT, 1.0));
-            }
-        }
-        painter.rect_filled(response.rect, 0.0, Color32::from_gray(BACKGROUND));
-        // One CPU frame per tick or camera change, never per repaint: the raster is the same
-        // bytes until one of them moves, and re-drawing 2,700 triangles for a picture that
-        // did not change would burn a core holding still.
-        let key = (view.tick, *camera);
-        if replay_texture.as_ref().is_none_or(|(k, _)| *k != key) {
-            let raster = Raster::draw(
-                &view.project(view.tick, camera),
-                camera.width,
-                camera.height,
-            );
-            let image =
-                egui::ColorImage::from_rgb([raster.w as usize, raster.h as usize], &raster.rgb);
-            *replay_texture = Some((
-                key,
-                ui.ctx()
-                    .load_texture("replay", image, egui::TextureOptions::LINEAR),
-            ));
-        }
-        if let Some((_, texture)) = replay_texture.as_ref() {
-            // Stretched over the whole panel: `size_for` kept the aspect, so this only ever
-            // scales the picture up, and never by much.
-            painter.image(
-                texture.id(),
-                response.rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                Color32::WHITE,
-            );
-        }
+        replay_canvas(ui, ui.available_size(), view, camera, replay_texture);
         if view.playing {
             ui.ctx().request_repaint();
         }
@@ -1219,7 +1175,7 @@ fn texture(ctx: &egui::Context, pair: &ImagePair, before: bool) -> egui::Texture
     rgb_texture(ctx, &name, img)
 }
 
-fn rgb_texture(ctx: &egui::Context, name: &str, img: &Rgb8Image) -> egui::TextureHandle {
+pub(crate) fn rgb_texture(ctx: &egui::Context, name: &str, img: &Rgb8Image) -> egui::TextureHandle {
     let color = egui::ColorImage::from_rgb([img.width, img.height], &img.data);
     ctx.load_texture(name, color, egui::TextureOptions::NEAREST)
 }
@@ -1235,7 +1191,7 @@ fn dash(lang: Lang) -> String {
 
 /// A metric cell. A histogram has no single number and an unmeasured metric has none at all
 /// (spec 10.3): neither is rendered as `0`.
-fn metric_text(lang: Lang, value: &es_ir::evaluation::MetricValue) -> String {
+pub(crate) fn metric_text(lang: Lang, value: &es_ir::evaluation::MetricValue) -> String {
     match value {
         es_ir::evaluation::MetricValue::Scalar(v) => format!("{v:.4}"),
         es_ir::evaluation::MetricValue::Histogram(h) => {
@@ -1290,7 +1246,7 @@ fn acceptance_row(lang: Lang, line: &es_ir::evaluation::AcceptanceResult) -> (St
 }
 
 /// One colour per `EventSource`, violations as a tick beneath (spec 23.3).
-fn paint_timeline(lang: Lang, ui: &mut egui::Ui, buckets: &[Bucket]) {
+pub(crate) fn paint_timeline(lang: Lang, ui: &mut egui::Ui, buckets: &[Bucket]) {
     if buckets.is_empty() {
         ui.label(i18n::t(lang, "results.no_events"));
         return;
@@ -1369,11 +1325,66 @@ pub(crate) const SHOWCASE_CAMERA: Camera = Camera {
 /// The control rate a recorded `.estraj` tick is worth. 50 Hz is the demo deployment's
 /// `rate.control`; a run directory carries no Deployment IR to read it from, and playing at
 /// the wrong rate only changes how fast the arm appears to move.
-const REPLAY_RATE_HZ: f64 = 50.0;
+pub(crate) const REPLAY_RATE_HZ: f64 = 50.0;
 
 /// Radians of orbit per point of drag, and zoom per point of scroll.
 const ORBIT_PER_POINT: f64 = 0.008;
 const ZOOM_PER_POINT: f64 = 0.002;
+
+/// One replay frame in a `size` canvas: drag orbits, scroll zooms. Shared by the Replay panel
+/// and the results screen's player (packet M12/Y13).
+pub(crate) fn replay_canvas(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    view: &ReplayView,
+    camera: &mut Camera,
+    texture: &mut Option<((usize, Camera), egui::TextureHandle)>,
+) {
+    let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
+    (camera.width, camera.height) =
+        Raster::size_for([response.rect.width(), response.rect.height()]);
+    if response.dragged() {
+        let drag = response.drag_delta();
+        *camera = camera.orbit(
+            f64::from(-drag.x) * ORBIT_PER_POINT,
+            f64::from(drag.y) * ORBIT_PER_POINT,
+        );
+    }
+    if response.hovered() {
+        let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+        if scroll != 0.0 {
+            *camera = camera.zoom(f64::from(-scroll).mul_add(ZOOM_PER_POINT, 1.0));
+        }
+    }
+    painter.rect_filled(response.rect, 0.0, Color32::from_gray(BACKGROUND));
+    // One CPU frame per tick or camera change, never per repaint: the raster is the same
+    // bytes until one of them moves, and re-drawing 2,700 triangles for a picture that
+    // did not change would burn a core holding still.
+    let key = (view.tick, *camera);
+    if texture.as_ref().is_none_or(|(k, _)| *k != key) {
+        let raster = Raster::draw(
+            &view.project(view.tick, camera),
+            camera.width,
+            camera.height,
+        );
+        let image = egui::ColorImage::from_rgb([raster.w as usize, raster.h as usize], &raster.rgb);
+        *texture = Some((
+            key,
+            ui.ctx()
+                .load_texture("replay", image, egui::TextureOptions::LINEAR),
+        ));
+    }
+    if let Some((_, texture)) = texture.as_ref() {
+        // Stretched over the whole canvas: `size_for` kept the aspect, so this only ever
+        // scales the picture up, and never by much.
+        painter.image(
+            texture.id(),
+            response.rect,
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    }
+}
 
 fn source_colour(source: es_eval::runner::EventSource) -> Color32 {
     match source {
