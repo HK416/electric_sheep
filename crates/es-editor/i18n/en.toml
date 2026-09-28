@@ -196,3 +196,21 @@
 # --- the inspector ------------------------------------------------------------------------
 "inspector.title" = "Settings"
 "inspector.empty" = "Pick a block to change its settings."
+
+# --- the traffic light of a running cycle -------------------------------------------------
+"health.starting" = "Starting"
+"health.starting.advice" = "The run is getting ready. Nothing has come back from it yet."
+"health.going_well" = "Going well"
+"health.going_well.advice" = "Nothing to do. You can leave it running."
+"health.stopped_learning" = "Stopped learning"
+"health.stopped_learning.advice" = "It has not got any better for a while. Collecting more demonstrations usually helps more than training longer."
+"health.slow" = "Slow"
+"health.slow.advice" = "It is running much slower than earlier in this run. Close other programs that use the graphics card."
+"health.not_responding" = "Not responding"
+"health.not_responding.advice" = "The run is still there but has sent nothing for a while. Wait a little longer, or stop it."
+"health.broken" = "Broken"
+"health.broken.advice" = "Its numbers broke down and this run cannot recover. Start again and let it take smaller steps."
+"health.stopped" = "Stopped"
+"health.stopped.advice" = "The run ended with an error. Check the run's log for the step that failed, then start again."
+"health.stopped_by_you" = "Stopped by you"
+"health.stopped_by_you.advice" = "You stopped this run. Start again whenever you are ready."
