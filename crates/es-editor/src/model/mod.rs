@@ -28,4 +28,5 @@ pub mod search;
 pub mod telemetry_view;
 pub mod template;
 pub mod train_view;
+pub mod watch;
 pub mod workflow;

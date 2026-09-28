@@ -668,6 +668,12 @@ impl LaunchModel {
         }
     }
 
+    /// Whether [`Self::kill`] ended the child started last: what makes ③ and the light say
+    /// *stopped by you* rather than *stopped* (packet M12/Y12). Cleared by the next start.
+    pub fn was_killed(&self) -> bool {
+        self.killed
+    }
+
     pub fn state(&self) -> &State {
         &self.state
     }
@@ -1062,8 +1068,13 @@ mod tests {
         let (program, args) = sleeper();
         m.start_program(&program, &args);
         assert!(matches!(m.state(), State::Running { .. }));
+        assert!(!m.was_killed());
         m.kill();
         assert_ne!(poll_until_exit(&mut m), 0, "a killed child did not succeed");
+        assert!(
+            m.was_killed(),
+            "the kill is observable, not only in the status line"
+        );
         // ... and is not reported as a failure, which its exit code alone would say.
         assert!(
             m.status_line().contains("killed from here"),

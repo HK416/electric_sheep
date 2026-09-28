@@ -265,6 +265,10 @@ impl TabViewer for Panes<'_> {
         if crate::ui::results::draw(app, ui, *pane) {
             return;
         }
+        // ③ and ④ draw their own step panel, centre and summary (packet M12/Y12).
+        if crate::ui::train::draw(app, ui, *pane) {
+            return;
+        }
         match pane {
             Pane::Viewport => viewport(app, ui),
             Pane::StepPanel => step_panel(app, ui),
