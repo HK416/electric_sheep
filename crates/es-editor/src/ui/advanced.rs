@@ -1114,7 +1114,7 @@ impl EditorApp {
                 ] {
                     ui.label(i18n::t(lang, key));
                     match plot {
-                        Some(plot) => paint_curve(ui, &plot, colour),
+                        Some(plot) => paint_curve(ui, &plot, colour, 90.0),
                         None => {
                             ui.label(i18n::t(lang, "results.no_events"));
                         }
@@ -1219,7 +1219,7 @@ fn texture(ctx: &egui::Context, pair: &ImagePair, before: bool) -> egui::Texture
     rgb_texture(ctx, &name, img)
 }
 
-fn rgb_texture(ctx: &egui::Context, name: &str, img: &Rgb8Image) -> egui::TextureHandle {
+pub(crate) fn rgb_texture(ctx: &egui::Context, name: &str, img: &Rgb8Image) -> egui::TextureHandle {
     let color = egui::ColorImage::from_rgb([img.width, img.height], &img.data);
     ctx.load_texture(name, color, egui::TextureOptions::NEAREST)
 }
@@ -1320,9 +1320,10 @@ fn paint_timeline(lang: Lang, ui: &mut egui::Ui, buckets: &[Bucket]) {
 /// square from [`crate::model::train_view::TrainView::plot`], and this maps them onto a
 /// rectangle, joins them, and draws a vertical line where a checkpoint was packed. The two
 /// numbers beside it are the range the model normalised against, in the series' own units.
-fn paint_curve(ui: &mut egui::Ui, plot: &Plot, colour: Color32) {
+/// `height` in points: a strip in the Live pane, the whole centre while ③ trains (M12/Y12).
+pub(crate) fn paint_curve(ui: &mut egui::Ui, plot: &Plot, colour: Color32, height: f32) {
     let (response, painter) =
-        ui.allocate_painter(Vec2::new(ui.available_width(), 90.0), Sense::hover());
+        ui.allocate_painter(Vec2::new(ui.available_width(), height), Sense::hover());
     let rect = response.rect.shrink(4.0);
     let at = |p: &[f32; 2]| {
         Pos2::new(

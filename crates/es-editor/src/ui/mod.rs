@@ -1,5 +1,6 @@
 //! The drawing half of the editor (packet M12/Y10): [`shell`] is the menu bar, the step bar,
-//! the dock and the status line; [`advanced`] is the five tabs the editor had before the dock.
+//! the dock and the status line; [`advanced`] is the five tabs the editor had before the dock;
+//! [`train`] is ③ and ④, a run started, watched and stopped (packet M12/Y12).
 //!
 //! Compiled only, never run by CI (`docs/design/editor-shell.md` section 2): every branch that
 //! chooses what to show is in [`crate::model`], under test. This half turns answers into
@@ -7,6 +8,7 @@
 
 pub mod advanced;
 pub mod shell;
+pub mod train;
 
 use eframe::egui;
 

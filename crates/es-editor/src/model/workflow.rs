@@ -174,8 +174,8 @@ pub enum Child {
 }
 
 /// The cycle's stages under ③ and ④, in `Stage::as_str`'s words.
-const TRAIN_STAGES: &[&str] = &["collect", "expert-gate", "train"];
-const EVALUATE_STAGES: &[&str] = &["eval", "showcase"];
+pub const TRAIN_STAGES: &[&str] = &["collect", "expert-gate", "train"];
+pub const EVALUATE_STAGES: &[&str] = &["eval", "showcase"];
 
 /// ③ = collect, expert-gate, train; ④ = eval, showcase. ① ② are Done for a template.
 pub fn phases(run: Option<&RunFacts>, live: Option<&LiveFacts>) -> [PhaseState; 5] {

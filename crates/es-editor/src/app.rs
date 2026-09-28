@@ -40,6 +40,8 @@ use crate::model::replay_view::ReplayView;
 use crate::model::run_view;
 use crate::model::search::Search;
 use crate::model::telemetry_view::{Source, TelemetryModel};
+use crate::model::template;
+use crate::model::watch::Watch;
 use crate::model::workflow::{self, Phase, PhaseState, RunFacts};
 use crate::ui::advanced::{Drag, SHOWCASE_CAMERA};
 
@@ -56,12 +58,14 @@ pub(crate) struct Opened {
     pub(crate) textures: BTreeMap<String, (egui::TextureHandle, egui::TextureHandle)>,
 }
 
-/// The project the step bar follows (packet M12/Y10): what disk says about its latest run and
-/// which step is open. There is no live connection yet; packet M12/Y12 adds it.
+/// The project the step bar follows (packet M12/Y10): its steps' states and which step is
+/// open. `watch` is its run as ③ and ④ start, watch and stop it (packet M12/Y12), and
+/// `phases` is what its tick said this frame.
 pub(crate) struct OpenProject {
     pub(crate) project: Project,
     pub(crate) phases: [PhaseState; 5],
     pub(crate) phase: Phase,
+    pub(crate) watch: Watch,
 }
 
 pub struct EditorApp {
@@ -344,6 +348,7 @@ impl EditorApp {
                 self.edit = None;
                 self.recent.push(path);
                 self.project = Some(OpenProject {
+                    watch: Watch::new(&project, template::templates_root()),
                     project,
                     phase: layout::start_phase(&phases),
                     phases,
@@ -435,6 +440,8 @@ impl eframe::App for EditorApp {
                 Err(e) => self.status = e,
             }
         }
+        // ③ and ④: the open project's run (packet M12/Y12).
+        crate::ui::train::tick(self, ctx);
 
         // A dropped file goes through the same function the path field does (packet M7/E3):
         // one way in means one set of errors out.
