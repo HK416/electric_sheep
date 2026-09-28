@@ -63,8 +63,9 @@ differ, the design note wins and the difference is a plan bug to report.
    light never panics, never shows green before data, and says *stopped by you* rather than
    *stopped* for a kill. Test: Y7 `edge_series_never_panic_and_never_start_green`,
    `a_kill_is_stopped_by_you`.
-5. **An old run without `episodes.json`; a previous run with another `evaluation_hash`**: no
-   tiles and bars from `report.json` for the first, no number at all for the second. Test: Y8
+5. **An old run without `episodes.json`; a previous run with another `evaluation_hash`**: the
+   first shows no tiles and draws its bars from `report.json`; the second shows no number at
+   all. Test: Y8
    `old_run_falls_back_to_suite_metrics` and `different_evaluation_hash_is_not_comparable`.
 
 ---
