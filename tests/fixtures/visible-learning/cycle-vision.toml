@@ -21,12 +21,17 @@
 # prints the stage plan pinned by `tests/golden/train/plan-cycle-vision.txt`, and needs neither
 # the dataset, the bundle nor Python.
 #
-# Open (packet M12/Y5, fact (a)): `[collect] policy` is also the expert gate's `--policy`, and
-# `es eval run` checks it against `[eval] config`. The bundle `es policy init` builds from the
-# template's documents carries `observation.toml` (`8a528bc0…`), which `evaluation-v8.toml`
-# does not name (`3009284b…`), so the gate refuses it (`XIR-040`); and no committed Learning IR
-# takes `observation-v8.toml`'s ports (`XIR-010`), so no four committed documents make a bundle
-# this gate accepts. `--dry-run` opens neither, which is why the golden is unaffected.
+# The gate (packets M12/Y5, Y5b): `[collect] policy` is also the expert gate's `--policy`, and
+# `es eval run` checks it against `[eval] config` before it opens a backend. A bundle carrying
+# `observation.toml` (`8a528bc0…`) is refused, because `evaluation-v8.toml` names
+# `observation-v8.toml` (`3009284b…`, `XIR-040`); and no committed Learning IR takes
+# `observation-v8.toml`'s ports (`XIR-010`). So the cube template builds it with
+# `es policy init` from `task.toml`, `observation-v8.toml` and `deployment.toml` and **no**
+# `--learning`: the Learning IR is then spec 8.1's external-policy shape, a contract over
+# `observation-v8.toml`'s outputs and the deployment's action chunk -- the shape
+# `es policy import-lerobot` writes -- which both checks accept. `cargo test -p es --test cli
+# policy_init_without_learning_makes_a_bundle_the_v8_gate_accepts` makes the gate's two calls on
+# it. `--dry-run` opens no bundle, which is why the golden is unaffected.
 
 kind  = "cycle"
 scene = "tests/fixtures/mjcf/so101_pick_place.xml"

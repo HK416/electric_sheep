@@ -1,0 +1,44 @@
+# The cube template, with the cube's position (packet M12/Y5b; `docs/design/editor-redesign.md`
+# sections 4 and 6.2): the same SO-101, cube, bin and scripted demonstrator as
+# `cube-into-bin.toml`, on the committed IR route -- `cycle.toml`: the IR-graph policy of
+# `learning.toml` trained by `training.toml` on `observation.toml`, judged by `evaluation.toml`.
+# `observation.toml`'s third port is `sim_cube_pose`, the simulator-privileged cube pose no real
+# robot reports, so the card is for practice and says so (`notice`). With that pose in the input
+# this task has passed held-out: LeRobot's ACT 15/16 (packets M5/V19, V19b) and the IR-graph
+# policy 0.5625 (M7/U3, with `learning-pretrained.toml` and `observation-augmented.toml`).
+#
+# Every path is a committed document, relative to the repository root, and none is copied (see
+# `cube-into-bin.toml`).
+
+kind = "template"
+id = "cube-into-bin-hint"
+name = "template.cube_into_bin_hint.name"        # es-editor i18n key
+summary = "template.cube_into_bin_hint.summary"  # es-editor i18n key
+notice = "template.cube_into_bin_hint.notice"    # es-editor i18n key: practice only
+robot = "SO-101"
+method = "blocks"
+needs = ["mujoco", "torch", "vulkan", "render"]
+cycle = "tests/fixtures/visible-learning/cycle.toml"
+scene = "tests/fixtures/mjcf/so101_pick_place.xml"
+demonstrations = 200
+
+# The bundle `es policy init` builds for `[collect] policy` -- the documents the expert
+# demonstrations have been collected under since plan V. On this route it is also what
+# `training.toml`'s `[policy] bundle` trains: `learning.toml` is the architecture. The cycle's
+# expert gate judges it by `evaluation.toml`, which names `observation.toml`.
+[bundle]
+task        = "tests/fixtures/visible-learning/task.toml"
+observation = "tests/fixtures/visible-learning/observation.toml"
+learning    = "tests/fixtures/visible-learning/learning.toml"
+deployment  = "tests/fixtures/visible-learning/deployment.toml"
+
+# Training length presets: the `[run] checkpoint_at` series; the last mark is the length. The IR
+# route's rule is only that every mark is an optimizer step of the run (`Recipe::marks`):
+# `train_act.py` saves at each one, so no mark has to divide another.
+#   medium  `training.toml`'s own marks.
+#   short   and long keep its marks and change only the length, to the camera-only card's 5,000
+#           and 60,000 steps, so the two cards' three lengths are the same three lengths.
+[lengths]
+short  = [1000, 5000]
+medium = [1000, 5000, 20000]
+long   = [1000, 5000, 20000, 60000]
