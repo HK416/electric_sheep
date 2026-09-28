@@ -10,6 +10,7 @@ pub mod edit;
 pub mod fonts;
 pub mod graph_view;
 pub mod health;
+pub mod home;
 pub mod i18n;
 pub mod image_view;
 pub mod inspector;

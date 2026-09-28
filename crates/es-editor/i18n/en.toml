@@ -260,3 +260,10 @@
 "template.cube_into_bin_hint.name" = "Cube into bin - with the cube's position"
 "template.cube_into_bin_hint.summary" = "The same arm, cube and bin. Besides the camera and its joints, the policy is told exactly where the cube is."
 "template.cube_into_bin_hint.notice" = "Practice: the simulator also tells the policy where the cube is, which a real robot cannot know. That makes the task much easier than it is for a real robot."
+
+# --- the PC check: what a template needs ----------------------------------------------------
+"deps.mujoco" = "MuJoCo physics simulator"
+"deps.torch" = "PyTorch machine learning library"
+"deps.lerobot" = "LeRobot robot learning tools"
+"deps.vulkan" = "Vulkan graphics driver"
+"deps.render" = "Camera picture drawing, built into es"
