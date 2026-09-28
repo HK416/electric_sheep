@@ -1615,6 +1615,112 @@ fn runs_print_the_backends_determinism_tier() {
     println!("RAN {TEST}");
 }
 
+/// Packet M12/Y2: `episodes.json` and `report.json` count one run twice -- the rows from each
+/// episode's own termination bucket, `success_rate` from the metric path's per-episode samples
+/// -- so they must agree exactly: one row per `(suite, episode)`, and in every suite the rows'
+/// successes over its rows are the report's `success_rate`.
+#[test]
+fn eval_run_episodes_json_agrees_with_the_report() {
+    const TEST: &str = "eval_run_episodes_json_agrees_with_the_report";
+    for probe in [
+        es_physics_backend::MuJoCoCpuBackend::is_available(),
+        es_policy::torch_runtime::is_available(),
+    ] {
+        if let Err(reason) = probe {
+            println!("SKIP {TEST}: {reason}");
+            return;
+        }
+    }
+    // The reach documents at 20 ticks an episode, as in the test above, under the committed
+    // reach evaluation's suites at two episodes each.
+    let dir = scratch_dir("episodes-json");
+    let read = |name: &str| std::fs::read_to_string(rl_fixture(name)).expect(name);
+    let mut task = es_ir::serial::task_from_toml(&read("task-reach.toml")).expect("task");
+    task.config.max_episode_steps = 20;
+    let mut obs =
+        es_ir::serial::observation_from_toml(&read("observation-reach.toml")).expect("obs");
+    obs.task_ref = task.task_hash().expect("the task hashes");
+    let mut learning =
+        es_ir::serial::learning_from_toml(&read("learning-reach.toml")).expect("learning");
+    let module = es_policy::lower_to_torch(&learning).expect("the reach graph lowers");
+    let weights = es_policy::weights::write_safetensors(&conforming_checkpoint(&module));
+    learning.policy.weights = es_ir::learning::WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    let deployment =
+        es_ir::serial::deployment_from_toml(&read("deployment-reach.toml")).expect("deploy");
+    let policy = dir.join("policy.esb");
+    std::fs::write(
+        &policy,
+        es_compile::PolicyBundle::build(&task, &obs, &learning, &deployment, &weights)
+            .expect("the reach documents pack"),
+    )
+    .expect("write policy.esb");
+    let mut evaluation =
+        es_ir::serial::evaluation_from_toml(&read("evaluation-reach.toml")).expect("evaluation");
+    evaluation.task = hex(&task.task_hash().expect("the task hashes"));
+    evaluation.observation = hex(&obs.observation_hash().expect("the observation hashes"));
+    evaluation.episodes = EpisodeBatch {
+        n_episodes: 2,
+        seeds: SeedPlan::Explicit(vec![201, 202]),
+    };
+    // An untrained policy in 20 ticks: the counts are the point, not the verdict.
+    for c in &mut evaluation.acceptance {
+        c.threshold = 0.0;
+    }
+    let config = dir.join("eval.toml");
+    write(
+        &config,
+        &es_ir::serial::evaluation_to_toml(&evaluation).expect("evaluation toml"),
+    );
+
+    let out = bin()
+        .args(["eval", "run", "--config"])
+        .arg(&config)
+        .arg("--policy")
+        .arg(&policy)
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .arg("--out")
+        .arg(dir.join("eval"))
+        .output()
+        .expect("run es eval run");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}\n{}",
+        stdout(&out),
+        stderr_of(&out)
+    );
+    let report: EvaluationReport = serde_json::from_str(
+        &std::fs::read_to_string(dir.join("eval").join("report.json")).expect("report"),
+    )
+    .expect("report.json parses");
+    let rows = es_eval::episodes::read_episodes(&dir.join("eval"))
+        .expect("episodes.json reads")
+        .expect("episodes.json is written");
+    assert_eq!(rows.len(), 2 * evaluation.suites.len(), "{rows:?}");
+    for suite in &evaluation.suites {
+        let mine: Vec<_> = rows.iter().filter(|r| r.suite == suite.name).collect();
+        let successes = mine.iter().filter(|r| r.termination == "success").count();
+        let rate = report
+            .cells
+            .iter()
+            .find(|c| c.suite == suite.name && c.metric == MetricSpec::SuccessRate)
+            .map(|c| c.value.clone());
+        assert_eq!(
+            rate,
+            Some(EvalMetricValue::Scalar(
+                successes as f64 / mine.len() as f64
+            )),
+            "suite {}: {mine:?}",
+            suite.name
+        );
+    }
+    println!("RAN {TEST}");
+}
+
 /// Packet M5/V5. `--jobs 0` is "run no cell and report on it": a usage error (exit 2) raised
 /// while parsing, before a bundle, a scene or a Python interpreter is touched -- which is why
 /// this runs in the PR tier where neither `mujoco` nor `torch` exists. The same check covers

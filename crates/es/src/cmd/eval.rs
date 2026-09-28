@@ -41,6 +41,8 @@ Otherwise loads the scene, runs the evaluation (`es_eval::Evaluation::run`) and 
 under --out:
   report.json         spec 10.5, via `es_eval::write_artifacts`
   evaluation.lock      spec 10.5, via `es_eval::write_artifacts`
+  episodes.json        one row per episode: suite, cell, seed, termination, plane steps and
+                        changed steps, its own failure-mode buckets (`es_eval::episodes`)
   report.html          a minimal static HTML table rendered from report.json (escaped,
                         no template crate)
 `episodes/` replay is not produced by this build -- there is no renderer yet (M2 packet
@@ -1044,6 +1046,8 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
     std::fs::create_dir_all(&a.out)
         .map_err(|e| CliError::Runtime(format!("{}: {e}", a.out.display())))?;
     es_eval::write_artifacts(&report, &lock, &a.out)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
+    es_eval::episodes::write_episodes(&es_eval::episodes::episode_rows(&eval_ir, &shards), &a.out)
         .map_err(|e| CliError::Runtime(e.to_string()))?;
     write_report_html(&report, &a.out.join("report.html"))?;
     if let Some(dir) = &a.frames {

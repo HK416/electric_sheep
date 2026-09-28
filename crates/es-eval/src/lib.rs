@@ -18,6 +18,7 @@
 
 pub mod bake;
 pub mod domain_gap;
+pub mod episodes;
 pub mod evidence;
 pub mod metrics;
 pub mod perturb;
@@ -27,8 +28,8 @@ pub use bake::ObservationBake;
 pub use metrics::compute;
 pub use perturb::{LightOverride, PerturbationPlan, ResetOverrides, StepState};
 pub use runner::{
-    write_artifacts, BackendCaps, Evaluation, EvaluationLock, EventSource, FrameSink, RunConfig,
-    Shard, ShardCell, StepEvent,
+    cell_name, write_artifacts, BackendCaps, Evaluation, EvaluationLock, EventSource, FrameSink,
+    RunConfig, Shard, ShardCell, StepEvent,
 };
 
 /// Everything that stops an evaluation from producing a report.
