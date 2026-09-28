@@ -8368,6 +8368,72 @@ fn policy_init_is_deterministic_and_the_bundle_opens() {
     es_compile::PolicyBundle::open(&a).expect("the bundle opens");
 }
 
+/// Packet M12/Y5b. The camera-only template's collect bundle -- `es policy init` on
+/// `observation-v8.toml` with no `--learning` -- passes the checks the vision cycle's expert gate
+/// makes before it opens any backend. The gate is `es eval run` (`crates/es/src/cmd/eval.rs`,
+/// `run`), and before a backend is probed it does two things with the bundle: `PolicyBundle::open`,
+/// which re-runs the four-IR cross pass (`XIR-010`), then `es_ir::cross::check` with the
+/// Evaluation IR (`XIR-040`), keeping the errors. This test makes those same two calls in process,
+/// so it needs no Python. The hint template's bundle is the control: the same check accepts it
+/// under its own `evaluation.toml` and refuses it under `evaluation-v8.toml`.
+#[test]
+fn policy_init_without_learning_makes_a_bundle_the_v8_gate_accepts() {
+    let dir = scratch_dir("policy-init-v8");
+    let fixture = |name: &str| format!("tests/fixtures/visible-learning/{name}");
+    let init = |out: &str, observation: &str, learning: Option<&str>| {
+        let mut cmd = bin();
+        cmd.current_dir(train_root())
+            .args(["policy", "init", "--task", &fixture("task.toml")])
+            .args(["--observation", &fixture(observation)])
+            .args(["--deployment", &fixture("deployment.toml")]);
+        if let Some(learning) = learning {
+            cmd.args(["--learning", &fixture(learning)]);
+        }
+        let o = cmd
+            .arg("--out")
+            .arg(dir.join(out))
+            .output()
+            .expect("run es policy init");
+        assert_eq!(o.status.code(), Some(0), "{}", stderr_of(&o));
+        let bytes = std::fs::read(dir.join(out)).expect("the bundle was written");
+        es_compile::PolicyBundle::open(&bytes).expect("the bundle opens (XIR-010 included)")
+    };
+    let gate = |bundle: &es_compile::PolicyBundle, evaluation: &str| -> Vec<String> {
+        let raw = std::fs::read_to_string(train_root().join(fixture(evaluation)))
+            .expect("the evaluation document");
+        let eval_ir = es_ir::serial::evaluation_from_toml(&raw).expect("it parses");
+        es_ir::cross::check(&es_ir::cross::IrBundle {
+            task: &bundle.task,
+            observation: &bundle.observation,
+            learning: &bundle.learning,
+            deployment: &bundle.deployment,
+            evaluation: Some(&eval_ir),
+        })
+        .into_iter()
+        .filter(es_ir::diag::Diagnostic::is_error)
+        .map(|d| d.to_string())
+        .collect()
+    };
+
+    let camera = init("camera.esb", "observation-v8.toml", None);
+    assert_eq!(gate(&camera, "evaluation-v8.toml"), Vec::<String>::new());
+
+    let hint = init("hint.esb", "observation.toml", Some("learning.toml"));
+    assert_eq!(gate(&hint, "evaluation.toml"), Vec::<String>::new());
+    let refused = gate(&hint, "evaluation-v8.toml");
+    assert!(refused.iter().any(|d| d.contains("XIR-040")), "{refused:?}");
+
+    // The two cards collect the same demonstrations: the expert drives through the chunk
+    // buffer under the bundle's declared latency, so the timing must match too.
+    let ticks = |b: &es_compile::PolicyBundle| {
+        es_env::latency_ticks(
+            b.learning.policy.contract.runtime.expected_latency_ms,
+            b.deployment.rate.control,
+        )
+    };
+    assert_eq!(ticks(&camera), ticks(&hint));
+}
+
 /// Oracle 4. One real cycle on the demo fixtures: a 2-episode expert collect, the harness on
 /// the expert *before* the 40-step IR-route training, then the trained checkpoint through the
 /// same harness -- with `loop.jsonl` holding `collect`, `evaluate` (the gate), `train`,

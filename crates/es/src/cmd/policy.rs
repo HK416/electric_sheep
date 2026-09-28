@@ -27,7 +27,7 @@ use crate::error::CliError;
 use crate::util::hex;
 
 const HELP: &str = "\
-es policy init  --task <t.toml> --observation <o.toml> --learning <l.toml>
+es policy init  --task <t.toml> --observation <o.toml> [--learning <l.toml>]
                 --deployment <d.toml> [--seed <n>] --out <out.esb>
 es policy lower --policy <in.esb> --out <dir>
 es policy pack  --policy <in.esb> --weights <model.safetensors> --out <out.esb>
@@ -43,7 +43,11 @@ init    Builds an untrained bundle from four documents: the one a cycle's
         `[collect] policy` names, whose Deployment IR is the Safety Plane the scripted
         demonstrator runs under. Its weights are a placeholder that names --seed
         (default 0) and are never loaded under --expert; the same documents and seed
-        give the same bytes.
+        give the same bytes. Without --learning the Learning IR is spec 8.1's shape
+        for an external policy, the one import-lerobot writes: an opaque PolicyHandle
+        whose contract takes the Observation IR's outputs and returns the Deployment
+        IR's action chunk -- the collect bundle for an Observation IR that no
+        committed Learning IR takes (observation-v8.toml).
 
 lower   Opens the policy bundle (spec 9.6), lowers its Learning IR to PyTorch
         (`es_policy::lower_to_torch`, spec 8.7) and writes, under <dir>:
@@ -177,36 +181,32 @@ fn open_bundle(path: &str) -> Result<PolicyBundle, CliError> {
 /// `es policy init` — a fresh checkout's way to the bundle a cycle's `[collect] policy` names
 /// (packet M12/Y5). The editor builds the same bytes through the same function.
 fn init(args: &[String]) -> Result<u8, CliError> {
-    // `--seed` is the one optional flag; everything else is `parse`'s required set.
+    // `--seed` and `--learning` are the optional flags; everything else is `parse`'s required set.
     let mut rest = args.to_vec();
-    let seed = match rest.iter().position(|a| a == "--seed") {
-        Some(i) => {
-            let value = rest
-                .get(i + 1)
-                .ok_or_else(|| CliError::Usage(format!("--seed: missing value\n\n{HELP}")))?;
-            let seed = value.parse::<u64>().map_err(|_| {
-                CliError::Usage(format!("--seed {value:?} is not a number\n\n{HELP}"))
-            })?;
-            rest.drain(i..=i + 1);
-            seed
-        }
+    let mut take = |flag: &str| -> Result<Option<String>, CliError> {
+        let Some(i) = rest.iter().position(|a| a == flag) else {
+            return Ok(None);
+        };
+        let value = rest
+            .get(i + 1)
+            .cloned()
+            .ok_or_else(|| CliError::Usage(format!("{flag}: missing value\n\n{HELP}")))?;
+        rest.drain(i..=i + 1);
+        Ok(Some(value))
+    };
+    let seed = match take("--seed")? {
+        Some(value) => value
+            .parse::<u64>()
+            .map_err(|_| CliError::Usage(format!("--seed {value:?} is not a number\n\n{HELP}")))?,
         None => 0,
     };
-    let a = parse(
-        &rest,
-        &[
-            "--task",
-            "--observation",
-            "--learning",
-            "--deployment",
-            "--out",
-        ],
-    )?;
+    let learning = take("--learning")?.map(PathBuf::from);
+    let a = parse(&rest, &["--task", "--observation", "--deployment", "--out"])?;
     let path = |flag: &str| PathBuf::from(&a[flag]);
     let bytes = es_data::training::untrained_bundle(
         &path("--task"),
         &path("--observation"),
-        &path("--learning"),
+        learning.as_deref(),
         &path("--deployment"),
         seed,
     )

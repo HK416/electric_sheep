@@ -252,3 +252,11 @@
 "health.stopped.advice" = "The run ended with an error. Check the run's log for the step that failed, then start again."
 "health.stopped_by_you" = "Stopped by you"
 "health.stopped_by_you.advice" = "You stopped this run. Start again whenever you are ready."
+
+# --- the templates (`templates/*.toml` name these keys) ------------------------------------
+"template.cube_into_bin.name" = "Cube into bin - camera only"
+"template.cube_into_bin.summary" = "An SO-101 arm picks up a cube and drops it into a bin. It learns from scripted demonstrations, using only its camera and the positions of its own joints."
+"template.cube_into_bin.notice" = "Experimental: learns from the camera and the arm's joints only, as a real robot would. It has not yet succeeded on this task."
+"template.cube_into_bin_hint.name" = "Cube into bin - with the cube's position"
+"template.cube_into_bin_hint.summary" = "The same arm, cube and bin. Besides the camera and its joints, the policy is told exactly where the cube is."
+"template.cube_into_bin_hint.notice" = "Practice: the simulator also tells the policy where the cube is, which a real robot cannot know. That makes the task much easier than it is for a real robot."

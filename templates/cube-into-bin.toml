@@ -1,6 +1,8 @@
-# The cube template (packet M12/Y5, `docs/design/editor-redesign.md` section 6.2): an SO-101 puts
-# a cube into a bin, taught by the scripted demonstrator and learned by LeRobot's ACT from the
-# camera and the joint angles.
+# The cube template, camera only (packets M12/Y5, Y5b; `docs/design/editor-redesign.md` sections
+# 4 and 6.2): an SO-101 puts a cube into a bin, taught by the scripted demonstrator and learned by
+# LeRobot's ACT from the camera and the six joint angles -- what a real robot has. No camera-only
+# route has passed on this task yet, so the card says so (`notice`); `cube-into-bin-hint.toml` is
+# the route that has, with the simulator's cube pose in the policy's input.
 #
 # Every path is a committed document, relative to the repository root, and none is copied: a
 # scene path is hash input (`SceneRef::canonical`), so a copy would move every hash downstream
@@ -10,6 +12,7 @@ kind = "template"
 id = "cube-into-bin"
 name = "template.cube_into_bin.name"        # es-editor i18n key
 summary = "template.cube_into_bin.summary"  # es-editor i18n key
+notice = "template.cube_into_bin.notice"    # es-editor i18n key: experimental
 robot = "SO-101"
 method = "blocks"
 needs = ["mujoco", "torch", "lerobot", "vulkan", "render"]
@@ -17,14 +20,16 @@ cycle = "tests/fixtures/visible-learning/cycle-vision.toml"
 scene = "tests/fixtures/mjcf/so101_pick_place.xml"
 demonstrations = 200
 
-# The bundle `es policy init` builds for `[collect] policy`: the documents the 200 expert
-# demonstrations have been collected under since plan V. Under `--expert` its weights are never
-# loaded; its Deployment IR is the Safety Plane the demonstrator runs under. The cycle's expert
-# gate judges it by `evaluation-v8.toml`, which refuses it -- see the header of the cycle.
+# The bundle `es policy init` builds for `[collect] policy`, which is also the expert gate's
+# `--policy`. The gate judges it by `evaluation-v8.toml`, whose `observation` is
+# `observation-v8.toml`, so the bundle carries that document (`XIR-040`). No committed Learning IR
+# takes its ports and none is added (`XIR-010`): with no `learning`, `es policy init` writes spec
+# 8.1's external-policy shape, the one `es policy import-lerobot` writes for every checkpoint of
+# this route. Under `--expert` its weights are never loaded; its Deployment IR is the Safety Plane
+# the demonstrator runs under.
 [bundle]
 task        = "tests/fixtures/visible-learning/task.toml"
-observation = "tests/fixtures/visible-learning/observation.toml"
-learning    = "tests/fixtures/visible-learning/learning.toml"
+observation = "tests/fixtures/visible-learning/observation-v8.toml"
 deployment  = "tests/fixtures/visible-learning/deployment.toml"
 
 # Training length presets: the `[run] checkpoint_at` series; the last mark is the length.

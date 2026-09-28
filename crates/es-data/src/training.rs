@@ -1173,10 +1173,13 @@ pub fn init_weights(out: &Path) -> String {
 /// repository has been (nothing on the Rust side initialises weights). What the bundle is for
 /// is its documents -- above all the Deployment IR, the Safety Plane the demonstrator runs
 /// under. The same documents and seed give the same bytes.
+///
+/// Without `learning` the Learning IR is [`external_policy`]'s (packet M12/Y5b): the collect
+/// bundle of an Observation IR no committed Learning IR takes, such as `observation-v8.toml`.
 pub fn untrained_bundle(
     task: &Path,
     observation: &Path,
-    learning: &Path,
+    learning: Option<&Path>,
     deployment: &Path,
     seed: u64,
 ) -> Result<Vec<u8>, DataError> {
@@ -1185,14 +1188,20 @@ pub fn untrained_bundle(
     let task_ir = es_ir::serial::task_from_toml(&read(task)?).map_err(|e| bad(task, &e))?;
     let observation_ir = es_ir::serial::observation_from_toml(&read(observation)?)
         .map_err(|e| bad(observation, &e))?;
-    let mut learning_ir =
-        es_ir::serial::learning_from_toml(&read(learning)?).map_err(|e| bad(learning, &e))?;
     let deployment_ir =
         es_ir::serial::deployment_from_toml(&read(deployment)?).map_err(|e| bad(deployment, &e))?;
     let weights = format!("es policy init: untrained, never loaded, seed {seed}").into_bytes();
-    learning_ir.policy.weights = WeightsRef::Safetensors {
-        path: learning_ir.policy.weights.path().to_owned(),
-        hash: *blake3::hash(&weights).as_bytes(),
+    let hash = *blake3::hash(&weights).as_bytes();
+    let learning_ir = match learning {
+        Some(p) => {
+            let mut ir = es_ir::serial::learning_from_toml(&read(p)?).map_err(|e| bad(p, &e))?;
+            ir.policy.weights = WeightsRef::Safetensors {
+                path: ir.policy.weights.path().to_owned(),
+                hash,
+            };
+            ir
+        }
+        None => external_policy(&observation_ir, &deployment_ir, hash),
     };
     es_compile::PolicyBundle::build(
         &task_ir,
@@ -1202,6 +1211,92 @@ pub fn untrained_bundle(
         &weights,
     )
     .map_err(|e| refuse(format!("the four documents do not make a bundle: {e}")))
+}
+
+/// Spec 8.1's shape for an external policy, built from the two documents it has to agree with:
+/// the contract takes every Observation IR output at the policy tick and returns the Deployment
+/// IR's action chunk, and the graph is one `PolicyBundle` node over those ports with an empty
+/// boundary. It mirrors the Learning IR `es policy import-lerobot` writes
+/// (`crates/es/src/cmd/policy.rs`, `import_lerobot`), which lives in the `es` binary and so is
+/// out of this layer's reach; the cadence and the deadline are that function's.
+///
+/// One number is not: `expected_latency_ms` is one control period, not `import_lerobot`'s
+/// re-plan period. `latency_ticks` makes that one tick, which is what `learning.toml`'s 15 ms
+/// makes it -- so the scripted demonstrator, which drives through the chunk buffer under this
+/// latency, collects and passes the gate under the timing it has always been measured under
+/// (`expert_passes_the_evaluation_harness`, the V15 demonstrations).
+fn external_policy(
+    observation: &ObservationIr,
+    deployment: &es_ir::deployment::DeploymentIr,
+    weights_hash: [u8; 32],
+) -> LearningGraph {
+    use es_ir::deployment::ExecutionMode;
+    use es_ir::learning::{
+        ActionExecutionMode, ArchKind, PolicyContract, PolicyHandle, RuntimeHints, TensorPort,
+    };
+    use es_ir::types::{ElemType, Frame, PortType, TimeRef};
+
+    let action = deployment.action;
+    let inputs: BTreeMap<String, TensorPort> = observation
+        .outputs
+        .iter()
+        .map(|(name, out)| {
+            let ty = PortType {
+                frame: Frame::Policy,
+                time: TimeRef::Tick,
+                image: None,
+                ..out.ty.clone()
+            };
+            (name.clone(), TensorPort::new(name.clone(), ty))
+        })
+        .collect();
+    let weights = WeightsRef::Safetensors {
+        path: "policy.safetensors".to_owned(),
+        hash: weights_hash,
+    };
+    let mut nodes = es_ir::graph::Graph::new(1);
+    nodes.insert(
+        es_ir::graph::NodeId(0),
+        LearningNode::PolicyBundle {
+            inputs: inputs.values().cloned().collect(),
+            weights: weights.clone(),
+            action_dim: action.dim as u32,
+            horizon: action.horizon as u32,
+        },
+    );
+    let ms = |micros: u64| micros as f32 / 1000.0;
+    LearningGraph {
+        schema_version: 1,
+        inputs: Vec::new(),
+        nodes,
+        outputs: Vec::new(),
+        policy: PolicyHandle {
+            // Not `Act`: nothing here is an architecture, only a contract.
+            architecture: ArchKind::Bundle,
+            base_model: None,
+            weights,
+            contract: PolicyContract {
+                inputs,
+                observation_window: observation.temporal.window.map_or(1, |w| w.n_steps),
+                action_dim: action.dim as u32,
+                horizon: action.horizon as u32,
+                execute_chunk: action.execute_chunk as u32,
+                replanning_hz: (deployment.rate.control.as_hz_f64()
+                    / action.execute_chunk.max(1) as f64) as f32,
+                execution_mode: match deployment.execution {
+                    ExecutionMode::OpenLoopChunk => ActionExecutionMode::OpenLoopChunk,
+                    ExecutionMode::RecedingHorizon => ActionExecutionMode::RecedingHorizon,
+                    ExecutionMode::TemporalEnsemble { .. } => ActionExecutionMode::TemporalEnsemble,
+                    ExecutionMode::RealTimeChunking => ActionExecutionMode::RealTimeChunking,
+                },
+                runtime: RuntimeHints {
+                    dtype: ElemType::F32,
+                    expected_latency_ms: ms(deployment.rate.control_period().0),
+                    deadline_ms: ms(deployment.deadlines.inference_budget.0),
+                },
+            },
+        },
+    }
 }
 
 impl Plan {

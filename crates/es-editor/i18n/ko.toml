@@ -251,3 +251,11 @@
 "health.stopped.advice" = "실행이 오류로 끝났습니다. 실행 기록에서 어느 단계가 실패했는지 확인한 뒤 다시 시작하세요."
 "health.stopped_by_you" = "직접 중지함"
 "health.stopped_by_you.advice" = "이 실행은 직접 중지하셨습니다. 준비되면 언제든 다시 시작하세요."
+
+# --- 템플릿 (`templates/*.toml`이 이 키를 씁니다) ---------------------------------------------
+"template.cube_into_bin.name" = "큐브를 통에 넣기 - 카메라만"
+"template.cube_into_bin.summary" = "SO-101 팔이 큐브를 집어 통에 넣습니다. 정해진 시범을 보고 배우며, 카메라와 자기 관절의 위치만 씁니다."
+"template.cube_into_bin.notice" = "실험 단계: 실제 로봇처럼 카메라와 팔 관절만 보고 배웁니다. 이 작업에서 아직 성공한 적이 없습니다."
+"template.cube_into_bin_hint.name" = "큐브를 통에 넣기 - 큐브 위치 알려 주기"
+"template.cube_into_bin_hint.summary" = "팔도, 큐브도, 통도 같습니다. 다만 카메라와 관절에 더해 큐브가 정확히 어디 있는지도 정책에 알려 줍니다."
+"template.cube_into_bin_hint.notice" = "연습용: 시뮬레이터가 큐브 위치까지 정책에 알려 줍니다. 실제 로봇은 알 수 없는 정보라서, 실제보다 훨씬 쉬운 문제가 됩니다."
