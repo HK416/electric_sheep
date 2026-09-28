@@ -335,7 +335,7 @@ pub fn primary_dir_sub(
 ///
 /// `ponytail:` no shadows in `Rs`; add a shadow scan when a golden shows the missing contact
 /// shadow costs a policy something.
-fn shade_lambert(tri: &Tri, n: [f32; 3], cfg: &RenderConfig) -> [f32; 3] {
+pub(crate) fn shade_lambert(tri: &Tri, n: [f32; 3], cfg: &RenderConfig) -> [f32; 3] {
     let light = [
         cfg.light_dir.x as f32,
         cfg.light_dir.y as f32,

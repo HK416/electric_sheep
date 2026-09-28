@@ -30,6 +30,7 @@ use es_ir::observation::ObservationIr;
 use es_ir::serial::{self, Layout};
 use es_ir::task::TaskIr;
 use es_ir::NodeId;
+use es_render::raster::{Camera, Raster, BACKGROUND};
 
 use crate::model::dialogs;
 use crate::model::edit::{self, Edit, EditIr, EditSession};
@@ -43,7 +44,7 @@ use crate::model::launch::{Kind as LaunchKind, LaunchModel, State as LaunchState
 use crate::model::live_run::cell_key;
 use crate::model::palette::Palette;
 use crate::model::recent::{self, Kind, Recent, Settings};
-use crate::model::replay_view::{self, Camera, ReplayView};
+use crate::model::replay_view::{self, ReplayView};
 use crate::model::run_view::{Bucket, RunView};
 use crate::model::search::Search;
 use crate::model::telemetry_view::{self, Source, TelemetryModel};
@@ -1524,7 +1525,7 @@ impl EditorApp {
 
         let (response, painter) = ui.allocate_painter(ui.available_size(), Sense::click_and_drag());
         (camera.width, camera.height) =
-            replay_view::Raster::size_for([response.rect.width(), response.rect.height()]);
+            Raster::size_for([response.rect.width(), response.rect.height()]);
         if response.dragged() {
             let drag = response.drag_delta();
             *camera = camera.orbit(
@@ -1538,17 +1539,13 @@ impl EditorApp {
                 *camera = camera.zoom(f64::from(-scroll).mul_add(ZOOM_PER_POINT, 1.0));
             }
         }
-        painter.rect_filled(
-            response.rect,
-            0.0,
-            Color32::from_gray(replay_view::BACKGROUND),
-        );
+        painter.rect_filled(response.rect, 0.0, Color32::from_gray(BACKGROUND));
         // One CPU frame per tick or camera change, never per repaint: the raster is the same
         // bytes until one of them moves, and re-drawing 2,700 triangles for a picture that
         // did not change would burn a core holding still.
         let key = (view.tick, *camera);
         if replay_texture.as_ref().is_none_or(|(k, _)| *k != key) {
-            let raster = replay_view::Raster::draw(
+            let raster = Raster::draw(
                 &view.project(view.tick, camera),
                 camera.width,
                 camera.height,

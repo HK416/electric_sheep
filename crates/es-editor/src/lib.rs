@@ -39,7 +39,7 @@ pub use model::launch::{Kind as LaunchKind, LaunchModel};
 pub use model::live_run::LiveRun;
 pub use model::palette::{Palette, Registries};
 pub use model::recent::{classify, Kind, Recent};
-pub use model::replay_view::{Camera, ReplayView, Tri2d};
+pub use model::replay_view::ReplayView;
 pub use model::run_view::{CellRow, RunView, Timeline};
 pub use model::search::Search;
 pub use model::telemetry_view::TelemetryModel;
