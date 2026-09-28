@@ -75,7 +75,8 @@ differ, the design note wins and the difference is a plan bug to report.
 | Wave | Tasks (parallel inside a wave) | Needs |
 |---|---|---|
 | 1 | Y1 `--check-deps --json` · Y2 `episodes.json` · Y3 raster → `es-render` · Y4 run reading → `es-eval` · Y5 cube template + `es policy init` | — |
-| 2 | Y6 project + workflow · Y7 traffic light · Y8 results model · Y9 home model | wave 1 |
+| 2a | Y5b two cube templates · Y7 traffic light · Y8 results model | wave 1 |
+| 2b | Y6 project + workflow · Y9 home model | Y5b |
 | 3 | Y10 docking shell | wave 2 |
 | 4 | Y11 start screen · Y12 ③/④ progress · Y13 ⑤ results | Y10 |
 | 5 | Y14 docs and the Y-V checklist | wave 4 |
@@ -542,6 +543,95 @@ copying committed documents (their paths are hash input); changing `cycle.toml`,
 
 ---
 
+### Task Y5b: two cube templates, and a collect bundle the camera-only gate accepts
+
+*Added 2026-09-28 after Y5 (owner decision: show both routes).* Y5 found that no camera-only
+route has passed on the cube task, that V19b's 15/16 read the simulator-privileged cube pose,
+and that no four committed documents make a collect bundle `evaluation-v8.toml`'s expert gate
+accepts (`XIR-040` with `observation.toml`; `XIR-010` for `observation-v8.toml` with
+`learning.toml`). The owner chose two cards: camera-only (marked experimental) and cube-pose
+hint (marked practice-only).
+
+**Files:**
+- Modify: `crates/es-data/src/training.rs` (`untrained_bundle`'s `learning` becomes optional)
+- Modify: `crates/es/src/cmd/policy.rs` (`init`: `--learning` optional)
+- Modify: `templates/cube-into-bin.toml` (camera-only: `[bundle]` on `observation-v8.toml`
+  without `learning`; `notice`), `tests/fixtures/visible-learning/cycle-vision.toml` (header:
+  the gate is now satisfiable, and how)
+- Create: `templates/cube-into-bin-hint.toml`
+- Modify: `crates/es-editor/src/model/template.rs` (`notice`, optional `bundle.learning`)
+- Modify: `crates/es-editor/i18n/en.toml`, `ko.toml` (the two templates' `name`, `summary`,
+  `notice` keys)
+- Test: `crates/es/tests/cli.rs`, in-module tests in `template.rs`
+- Read (for reuse, not to change unless unavoidable): `crates/es-import/src/lerobot_config.rs`
+  (`build_learning`: the opaque `PolicyHandle` with a typed contract that `import-lerobot`
+  writes), `crates/es/src/cmd/policy.rs` (`import_lerobot`)
+
+**Interfaces:**
+
+```rust
+// es_data::training
+pub fn untrained_bundle(task: &Path, observation: &Path, learning: Option<&Path>,
+                        deployment: &Path, seed: u64) -> Result<Vec<u8>, DataError>;
+```
+
+`learning == None` builds spec 8.1's external-policy shape: an opaque `PolicyHandle` whose
+typed contract's inputs are the Observation IR's outputs and whose outputs are the Deployment
+IR's action (the same shape `import-lerobot` writes, reusing its builder if it is reachable
+without a layering violation; otherwise the smallest local equivalent, with a comment naming
+the one it mirrors). The weights stay the seeded placeholder.
+
+```rust
+// template.rs
+pub struct Template { /* Y5's fields */ pub notice: Option<String> /* i18n key */ }
+pub struct BundleDocs { pub task: String, pub observation: String,
+                        pub learning: Option<String>, pub deployment: String }
+```
+
+`templates/cube-into-bin-hint.toml`: `id = "cube-into-bin-hint"`, `cycle =
+"tests/fixtures/visible-learning/cycle.toml"` (the committed IR route: `training.toml` on
+`observation.toml` with `sim_cube_pose`, `evaluation.toml`), `[bundle]` = the IR-route documents
+with `learning.toml`, `needs = ["mujoco", "torch", "vulkan", "render"]` (no LeRobot on the IR
+route), `demonstrations = 200`, presets obeying the IR route's own mark rule with `medium`
+equal to `training.toml`'s marks, and `notice = "template.cube_into_bin_hint.notice"`.
+`templates/cube-into-bin.toml` gains `notice = "template.cube_into_bin.notice"` and its
+`[bundle]` becomes `task.toml` + `observation-v8.toml` + `deployment.toml`, no `learning`.
+
+Plain words for the notices (en; ko in the table, the orchestrator reviews them):
+- camera-only: "Experimental: learns from the camera and the arm's joints only, as a real robot
+  would. It has not yet succeeded on this task."
+- hint: "Practice: the simulator also tells the policy where the cube is — information a real
+  robot does not have. It has succeeded on this task."
+
+- [ ] **Step 1: Failing tests.** `crates/es/tests/cli.rs`:
+
+```rust
+#[test]
+fn policy_init_without_learning_makes_a_bundle_the_v8_gate_accepts() {
+    // Build the camera-only collect bundle, then run the expert gate's own compatibility
+    // check (`es ir check` or the eval path's XIR pass, whichever the gate uses) against
+    // evaluation-v8.toml: no XIR-040, no XIR-010.
+}
+```
+
+  Write it with the file's own helpers. The check it runs must be the one the gate runs —
+  find it in `crates/es/src/cmd/eval.rs` (the checks before any backend is opened) and call
+  the same function or the same CLI path that needs no Python; state which in a comment.
+  Add to `template.rs`: both committed templates load, every `[bundle]` path exists,
+  `cube-into-bin` has no `learning` and `cube-into-bin-hint` has one, and both carry a
+  `notice` key that exists in both i18n tables.
+- [ ] **Step 2:** Run; expect FAIL. Implement.
+- [ ] **Step 3:** Run the new tests, `cargo test -p es --test cli policy_init`,
+  `cargo test -p es --test cli cycle_`, `cargo test -p es-editor`, `cargo xtask verify-goldens`
+  (the vision golden must not change: `--dry-run` opens no bundle).
+- [ ] **Step 4: Commit** `feat: two cube templates, and a collect bundle the camera-only gate accepts`.
+
+**Acceptance:** the gate compatibility test passes without Python; both templates load.
+**Forbidden:** committing a Learning IR document for `observation-v8`; lowering any acceptance
+threshold; touching `cycle.toml`, `evaluation*.toml` or any committed Observation IR.
+
+---
+
 ### Task Y6: project folder, run recipes, and the step bar's state
 
 **Files:**
@@ -553,7 +643,7 @@ copying committed documents (their paths are hash input); changing `cycle.toml`,
 **Interfaces:**
 - Consumes: `template::{Template, Length}` (Y5), `es_data::training::Cycle` (existing,
   `Serialize`/`Deserialize`), `es_data::collect::{read_loop_steps, LoopKind}`,
-  `es_data::untrained_bundle` (Y5), `live_run::StageRow` (existing).
+  `es_data::training::untrained_bundle` (Y5, `learning` optional since Y5b), `live_run::StageRow` (existing).
 - Produces, `project.rs`:
 
 ```rust

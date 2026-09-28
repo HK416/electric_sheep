@@ -76,7 +76,8 @@
 | 웨이브 | 작업(같은 웨이브 안에서는 병렬) | 필요 |
 |---|---|---|
 | 1 | Y1 `--check-deps --json` · Y2 `episodes.json` · Y3 래스터 → `es-render` · Y4 실행 읽기 → `es-eval` · Y5 큐브 템플릿 + `es policy init` | — |
-| 2 | Y6 프로젝트 + 작업 흐름 · Y7 신호등 · Y8 결과 모델 · Y9 시작 화면 모델 | 웨이브 1 |
+| 2a | Y5b 큐브 템플릿 두 개 · Y7 신호등 · Y8 결과 모델 | 웨이브 1 |
+| 2b | Y6 프로젝트 + 작업 흐름 · Y9 시작 화면 모델 | Y5b |
 | 3 | Y10 도킹 셸 | 웨이브 2 |
 | 4 | Y11 시작 화면 · Y12 ③/④ 진행 · Y13 ⑤ 결과 | Y10 |
 | 5 | Y14 문서와 Y-V 체크리스트 | 웨이브 4 |
@@ -543,6 +544,91 @@ fn a_broken_template_is_reported_not_fatal() {
 
 ---
 
+### 작업 Y5b: 큐브 템플릿 두 개, 그리고 카메라 전용 점검이 받아들이는 수집 번들
+
+*2026-09-28 Y5 뒤에 추가(소유자 결정: 두 경로 모두 보여 줌).* Y5는 큐브 과제에서 카메라 전용
+경로가 합격한 적이 없고, V19b의 15/16은 시뮬레이터가 주는 큐브 위치를 읽었으며, 커밋된 문서 네
+개로는 `evaluation-v8.toml`의 전문가 점검이 받아들이는 수집 번들을 만들 수 없음을 밝혔다
+(`observation.toml`로는 `XIR-040`; `learning.toml`과 함께 쓴 `observation-v8.toml`로는 `XIR-010`).
+소유자는 카드 두 장을 골랐다: 카메라 전용(실험적 표시)과 큐브 위치 힌트(연습용 표시).
+
+**Files:**
+- Modify: `crates/es-data/src/training.rs` (`untrained_bundle`의 `learning`이 선택이 됨)
+- Modify: `crates/es/src/cmd/policy.rs` (`init`: `--learning` 선택)
+- Modify: `templates/cube-into-bin.toml` (카메라 전용: `learning` 없이 `observation-v8.toml` 위의
+  `[bundle]`; `notice`), `tests/fixtures/visible-learning/cycle-vision.toml` (머리말: 이제 점검을
+  통과할 수 있고, 어떻게 되는지)
+- Create: `templates/cube-into-bin-hint.toml`
+- Modify: `crates/es-editor/src/model/template.rs` (`notice`, 선택인 `bundle.learning`)
+- Modify: `crates/es-editor/i18n/en.toml`, `ko.toml` (두 템플릿의 `name`, `summary`, `notice` 키)
+- Test: `crates/es/tests/cli.rs`, `template.rs`의 모듈 내 테스트
+- Read (재사용을 위해 읽기만, 피할 수 없을 때만 변경): `crates/es-import/src/lerobot_config.rs`
+  (`build_learning`: `import-lerobot`이 쓰는, 타입이 붙은 계약을 가진 불투명 `PolicyHandle`),
+  `crates/es/src/cmd/policy.rs` (`import_lerobot`)
+
+**Interfaces:**
+
+```rust
+// es_data::training
+pub fn untrained_bundle(task: &Path, observation: &Path, learning: Option<&Path>,
+                        deployment: &Path, seed: u64) -> Result<Vec<u8>, DataError>;
+```
+
+`learning == None`이면 스펙 8.1의 외부 정책 모양을 만든다: 타입이 붙은 계약의 입력이 Observation
+IR의 출력이고 출력이 Deployment IR의 동작인 불투명 `PolicyHandle`(`import-lerobot`이 쓰는 것과
+같은 모양으로, 계층 위반 없이 닿을 수 있으면 그 빌더를 재사용하고, 아니면 가장 작은 로컬 대응물을
+만들고 그것이 따라 하는 것을 주석으로 적는다). 가중치는 시드가 들어간 자리표시자 그대로다.
+
+```rust
+// template.rs
+pub struct Template { /* Y5's fields */ pub notice: Option<String> /* i18n key */ }
+pub struct BundleDocs { pub task: String, pub observation: String,
+                        pub learning: Option<String>, pub deployment: String }
+```
+
+`templates/cube-into-bin-hint.toml`: `id = "cube-into-bin-hint"`, `cycle =
+"tests/fixtures/visible-learning/cycle.toml"`(커밋된 IR 경로: `sim_cube_pose`가 있는
+`observation.toml` 위의 `training.toml`, `evaluation.toml`), `[bundle]` = `learning.toml`을 포함한
+IR 경로 문서, `needs = ["mujoco", "torch", "vulkan", "render"]`(IR 경로에는 LeRobot 없음),
+`demonstrations = 200`, IR 경로 자신의 표시 규칙을 따르고 `medium`이 `training.toml`의 표시와 같은
+프리셋, 그리고 `notice = "template.cube_into_bin_hint.notice"`. `templates/cube-into-bin.toml`은
+`notice = "template.cube_into_bin.notice"`를 얻고, 그 `[bundle]`은 `learning` 없이 `task.toml` +
+`observation-v8.toml` + `deployment.toml`이 된다.
+
+안내 문구의 쉬운 말(en; ko는 표에, 오케스트레이터가 검토한다):
+- 카메라 전용: "Experimental: learns from the camera and the arm's joints only, as a real robot
+  would. It has not yet succeeded on this task."
+- 힌트: "Practice: the simulator also tells the policy where the cube is — information a real
+  robot does not have. It has succeeded on this task."
+
+- [ ] **Step 1: 실패하는 테스트.** `crates/es/tests/cli.rs`:
+
+```rust
+#[test]
+fn policy_init_without_learning_makes_a_bundle_the_v8_gate_accepts() {
+    // Build the camera-only collect bundle, then run the expert gate's own compatibility
+    // check (`es ir check` or the eval path's XIR pass, whichever the gate uses) against
+    // evaluation-v8.toml: no XIR-040, no XIR-010.
+}
+```
+
+  파일의 기존 헬퍼로 쓴다. 그것이 돌리는 검사는 점검이 돌리는 바로 그 검사여야 한다 —
+  `crates/es/src/cmd/eval.rs`(백엔드를 열기 전의 검사)에서 찾아, Python이 필요 없는 같은 함수나
+  같은 CLI 경로를 부르고, 어느 것인지 주석으로 적는다. `template.rs`에 추가: 커밋된 템플릿 둘이
+  모두 읽히고, 모든 `[bundle]` 경로가 있으며, `cube-into-bin`은 `learning`이 없고
+  `cube-into-bin-hint`는 있으며, 둘 다 i18n 표 두 개 모두에 있는 `notice` 키를 가진다.
+- [ ] **Step 2:** 실행; 실패를 예상. 구현한다.
+- [ ] **Step 3:** 새 테스트, `cargo test -p es --test cli policy_init`,
+  `cargo test -p es --test cli cycle_`, `cargo test -p es-editor`, `cargo xtask verify-goldens`
+  (비전 golden은 바뀌면 안 된다: `--dry-run`은 번들을 열지 않는다)를 실행한다.
+- [ ] **Step 4: Commit** `feat: two cube templates, and a collect bundle the camera-only gate accepts`.
+
+**Acceptance:** 점검 호환성 테스트가 Python 없이 통과; 두 템플릿이 모두 읽힘.
+**Forbidden:** `observation-v8`용 Learning IR 문서를 커밋하는 것; 합격 기준을 낮추는 것;
+`cycle.toml`, `evaluation*.toml`, 커밋된 Observation IR을 건드리는 것.
+
+---
+
 ### 작업 Y6: 프로젝트 폴더, 실행 레시피, 단계 바의 상태
 
 **파일:**
@@ -554,7 +640,7 @@ fn a_broken_template_is_reported_not_fatal() {
 **인터페이스:**
 - 입력: `template::{Template, Length}`(Y5), `es_data::training::Cycle`(기존,
   `Serialize`/`Deserialize`), `es_data::collect::{read_loop_steps, LoopKind}`,
-  `es_data::untrained_bundle`(Y5), `live_run::StageRow`(기존).
+  `es_data::training::untrained_bundle`(Y5, Y5b 이후 `learning`은 선택), `live_run::StageRow`(기존).
 - 출력, `project.rs`:
 
 ```rust
