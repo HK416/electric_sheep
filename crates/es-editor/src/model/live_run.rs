@@ -6,7 +6,7 @@
 //! [`CellRow`]s and a [`Timeline`] — E1's own types — so the Run tab has **one** table, one
 //! strip and one set of column headers whether the run finished yesterday or is on its third
 //! episode right now. Nothing draws here and nothing in `app.rs` decides: the fold is tested
-//! against what [`crate::model::run_view::RunView`] makes of the same run on disk.
+//! against what [`es_eval::run_dir::RunDir`] makes of the same run on disk.
 //!
 //! What a live run cannot have is a verdict: `report.json` is written after the last suite, so
 //! there is no `acceptance()` here and [`LiveRun::status`] says what is running instead.
@@ -14,12 +14,10 @@
 use std::collections::BTreeMap;
 
 use es_core::PhysTick;
+use es_eval::run_dir::{decode_events, CellRow, FirstSeen, Rgb8Image, TickRow, Timeline};
 use es_eval::runner::{EventSource, StepEvent};
 use es_ir::evaluation::MetricValue;
 use es_telemetry::protocol::{Message, Payload, StreamId};
-
-use crate::model::image_view::Rgb8Image;
-use crate::model::run_view::{decode_events, CellRow, FirstSeen, TickRow, Timeline};
 
 /// The producer's four streams (`docs/design/telemetry-protocol.md`, "Producers"). Data and
 /// not schema — `es_telemetry::protocol` is frozen at its version, and which number carries
@@ -46,7 +44,7 @@ pub const RUN_STREAMS: [StreamId; 5] = [
 ///
 /// The one place the key is built, because `app.rs` rebuilds it from a [`CellRow`] to select a
 /// row or ask for its timeline. A run read off disk has no stage, and its key is its cell name
-/// unchanged, which is what keeps `RunView` and E4's oracle out of this.
+/// unchanged, which is what keeps `RunDir` and E4's oracle out of this.
 pub fn cell_key(stage: &str, cell: &str) -> String {
     if stage.is_empty() {
         cell.to_owned()
@@ -109,7 +107,7 @@ impl StageRow {
 #[derive(Clone, Debug, Default)]
 pub struct LiveRun {
     /// Keyed by [`cell_key`], so a stage's rows are contiguous and in cell-name order inside
-    /// it — the order `RunView` sorts its rows into, once [`Self::cells`] has put the stages
+    /// it — the order `RunDir` sorts its rows into, once [`Self::cells`] has put the stages
     /// back in the order they arrived.
     cells: BTreeMap<String, LiveCell>,
     /// One suite row per `(stage, suite)`, keyed by [`cell_key`] too: the expert gate's
@@ -320,7 +318,7 @@ impl LiveRun {
     }
 
     /// One row per `(stage, cell)`, in stage-arrival then cell-name order —
-    /// [`crate::model::run_view::RunView::cells`]'s own shape, and its order for a run that has
+    /// [`es_eval::run_dir::RunDir::cells`]'s own shape, and its order for a run that has
     /// no stages, so the table does not know which end it came from.
     pub fn cells(&self) -> Vec<CellRow> {
         let mut rows: Vec<&LiveCell> = self.cells.values().collect();
@@ -367,7 +365,7 @@ impl LiveRun {
     }
 
     /// The table's headers: the three identity columns, then one per metric seen so far. The
-    /// same rule `RunView::columns` follows, so a metric added to `es-ir` needs no change
+    /// same rule `run_view::columns` follows, so a metric added to `es-ir` needs no change
     /// here either.
     pub fn columns(&self) -> Vec<String> {
         let mut out = vec!["cell".to_owned(), "suite".to_owned(), "seed".to_owned()];
@@ -380,11 +378,12 @@ impl LiveRun {
         out
     }
 
-    /// One episode's Safety Plane history so far, decoded exactly as `RunView::timeline`
+    /// One episode's Safety Plane history so far, decoded exactly as `RunDir::timeline`
     /// decodes `events.json` — the bits are `es_safety::EventSet::bits()` either way.
     ///
-    /// The fold is repeated rather than shared because `run_view.rs` is not this packet's to
-    /// change; the oracle pins the two equal for the same run, so they cannot drift quietly.
+    /// The fold is repeated rather than shared because the reader (`es_eval::run_dir` now) was
+    /// not packet E4's to change; the oracle pins the two equal for the same run, so they
+    /// cannot drift quietly.
     pub fn timeline(&self, cell: &str) -> Timeline {
         let mut out = Timeline::default();
         let Some(live) = self.cell(cell) else {
@@ -499,8 +498,9 @@ pub(crate) fn rgb8(w: u32, h: u32, format: &str, bytes: &[u8]) -> Option<Rgb8Ima
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::run_view::RunView;
+    use crate::model::run_view;
     use crate::model::telemetry_view::{replay, TelemetryModel};
+    use es_eval::run_dir::RunDir;
     use es_telemetry::protocol::Frame;
     use std::path::{Path, PathBuf};
 
@@ -640,7 +640,7 @@ mod tests {
     #[test]
     fn live_run_folds_streams_into_run_rows() {
         let dir = fixture();
-        let run = RunView::open(&dir).expect("the fixture run opens");
+        let run = RunDir::open(&dir).expect("the fixture run opens");
 
         let mut model = TelemetryModel::default();
         let messages = messages_for(&dir);
@@ -650,7 +650,7 @@ mod tests {
 
         let live = &model.live;
         assert_eq!(live.cells(), run.cells());
-        assert_eq!(live.columns(), run.columns());
+        assert_eq!(live.columns(), run_view::columns(&run));
         for row in run.cells() {
             assert_eq!(
                 live.timeline(&row.name),

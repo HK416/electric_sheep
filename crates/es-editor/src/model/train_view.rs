@@ -15,9 +15,9 @@
 
 use std::time::Duration;
 
+use es_eval::run_dir::Rgb8Image;
 use es_telemetry::protocol::{Message, Payload, StreamId};
 
-use crate::model::image_view::Rgb8Image;
 use crate::model::live_run::{rgb8, STREAM_EVENTS, STREAM_IMAGE};
 
 /// The training curve's stream. Data and not schema, like streams 1-4
