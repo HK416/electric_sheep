@@ -1443,6 +1443,67 @@ would be.
 
 ---
 
+### Task Y15: ① and ② for a template project, and the `render` install line
+
+*Added 2026-09-28 at the wave-4 merge: design note section 6.3 says ① shows the template's scene
+through the CPU raster and ② shows a summary, and no task owned it.* Y11 also found that a
+default `es` build has no `render` feature, so both cube cards stay disabled even with every
+Python tool installed; the start screen's install line must say how to get it.
+
+**Files:**
+- Create: `crates/es-editor/src/model/scene_view.rs`, `crates/es-editor/src/ui/scene.rs`
+- Modify: `crates/es-editor/src/model/mod.rs`, `crates/es-editor/src/ui/mod.rs`,
+  `crates/es-editor/src/ui/shell.rs` (one early-return hook, like Y12's and Y13's; the two
+  `shell.coming_soon` placeholders go), `crates/es-editor/src/app.rs` (one field),
+  `crates/es-editor/src/model/home.rs` (the install lines), `crates/es-editor/i18n/{en,ko}.toml`
+
+**Interfaces:**
+
+```rust
+// model/scene_view.rs
+pub struct ScenePreview { /* the parsed scene and its triangles at the model's initial pose */ }
+impl ScenePreview {
+    /// The template's scene (repository-relative `Template::scene`), posed at `qpos0`.
+    pub fn open(scene: &Path) -> Result<Self, String>;
+    pub fn project(&self, camera: &es_render::raster::Camera) -> es_render::raster::Projected;
+    /// What the step panel lists: bodies (robot links grouped under the robot's root body),
+    /// free bodies (the objects), cameras — by their scene names, in scene order.
+    pub fn contents(&self) -> SceneContents;
+}
+pub struct SceneContents { pub robot: Option<String>, pub objects: Vec<String>,
+                           pub cameras: Vec<String> }
+```
+
+Reuse what `model/replay_view.rs` and `es_render::raster` already do (scene loading, the
+tessellation, `Camera::orbit`/`zoom`, `Raster::draw`) — no second rasterizer, no second scene
+loader. `ui/advanced.rs`'s `replay_canvas` shows how a projected frame is drawn.
+
+`model/home.rs`: the install text becomes a list of lines, each chosen by what is missing —
+Python tools (today's line) and, when `render` is missing, a line saying `es` was built without
+camera drawing and must be rebuilt with `cargo build -p es --features render` (the command in
+the line's `.hint`, plain words in the line).
+
+Screens: ① — viewport: the scene, orbit with the mouse, zoom with the wheel; step panel: "What
+is in the scene" from `contents()`; summary: the template's name, summary and notice. ② — step
+panel: the teaching method in plain words ("Action blocks: a scripted demonstrator shows the
+SO-101 how to do it") and the demonstration count; viewport: the same scene; summary: the
+notice. Both read-only for a template (editing is S3/S4).
+
+- [ ] **Step 1: Failing tests** — `ScenePreview::open` on `tests/fixtures/mjcf/so101_pick_place.xml`
+  yields a non-empty projection from a default camera and `contents()` names one robot, the cube
+  and the bin, and the `overhead` camera; a missing file is an `Err`, not a panic; the install
+  lines include the render line exactly when `render` is false.
+- [ ] **Step 2:** Implement; `cargo test -p es-editor`, clippy, fmt; `shell.coming_soon` removed
+  from both tables once unused.
+- [ ] **Step 3:** Screenshots of ① and ② (in-app temporary hook, never committed) into
+  `<worktree>/target/plan-y/y15/`.
+- [ ] **Step 4: Commit** `feat(es-editor): the scene and teach steps of a template project`.
+
+**Forbidden:** editing anything in the scene (S3/S4); a new dependency; connecting to any remote
+server.
+
+---
+
 ### Task Y14: documents, and the checklist for later
 
 **Files:**
