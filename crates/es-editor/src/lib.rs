@@ -1,4 +1,5 @@
-//! `es-editor` (layer 12): the editor shell of spec 23 — tabs, the layered graph view
+//! `es-editor` (layer 12): the editor shell of spec 23 — a step bar over a dock of panes
+//! (packet M12/Y10), the layered graph view
 //! (read-only and editable), telemetry, and the before/after image pair.
 //!
 //! Layer rule (spec 4.2 rule 4): this crate may depend on anything, and **nothing may depend
@@ -12,8 +13,10 @@
 //! graph. Editing ([`model::edit`], [`model::palette`]) was added beside it — layout
 //! persistence and undo/redo, which read-only needs none of.
 //!
-//! The split is deliberate: [`model`] is headless and fully tested, [`app`] is a thin egui
-//! layer over it that CI only compiles. See `docs/design/editor-shell.md`.
+//! The split is deliberate: [`model`] is headless and fully tested; [`app`] (the
+//! `eframe::App` glue and its state) and [`ui`] (the shell and the Advanced panes, packet
+//! M12/Y10) are a thin egui layer over it that CI only compiles. See
+//! `docs/design/editor-shell.md` and `docs/design/editor-redesign.md` section 6.1.
 //!
 //! It is also meant to be usable by someone who is not an engineer (packet M7/E6): every
 //! visible string is a key in [`model::i18n`]'s two tables rather than a literal in
@@ -30,6 +33,7 @@
 
 pub mod app;
 pub mod model;
+pub mod ui;
 
 pub use app::EditorApp;
 pub use model::edit::{Edit, EditSession};

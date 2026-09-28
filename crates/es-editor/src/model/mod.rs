@@ -16,6 +16,7 @@ pub mod image_view;
 pub mod inspector;
 pub mod labels;
 pub mod launch;
+pub mod layout;
 pub mod live_run;
 pub mod palette;
 pub mod project;

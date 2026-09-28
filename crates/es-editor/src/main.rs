@@ -1,5 +1,5 @@
-//! `es-editor [bundle.esb|run-dir] [--attach <addr> [--token <t>]]` — the editor shell of
-//! spec 23.
+//! `es-editor [project-dir|bundle.esb|run-dir] [--attach <addr> [--token <t>]]` — the editor
+//! shell of spec 23.
 //!
 //! The window is the only thing this file owns. Everything it shows is
 //! [`es_editor::model`], which runs headless.
@@ -36,8 +36,9 @@ fn main() -> eframe::Result<()> {
         "Electric Sheep editor",
         eframe::NativeOptions::default(),
         Box::new(move |cc| {
-            // `cc.storage` is the previous session's recent list (packet M7/E3), read before
-            // a path on the command line is opened so that path joins the list.
+            // `cc.storage` is the previous session's recent list (packet M7/E3) and dock
+            // arrangements (M12/Y10), read before a path on the command line is opened so
+            // that path joins the list.
             let mut app = EditorApp::new(source).with_storage(cc.storage);
             // The system CJK face and the persisted text size, before anything is drawn: a
             // Korean label or a Korean path in a field renders as boxes without it (packet

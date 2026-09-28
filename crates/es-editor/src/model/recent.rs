@@ -32,6 +32,10 @@ pub const LANG_KEY: &str = "es-editor.lang";
 /// How big the text is, as [`TextSize::code`] spells it (packet M7/E6).
 pub const TEXT_SIZE_KEY: &str = "es-editor.text-size";
 
+/// The person's dock arrangements, one per step and one for anything that is not a project
+/// (packet M12/Y10). Read and written by [`crate::model::layout::Docks`].
+pub const LAYOUT_KEY: &str = "es-editor.layout";
+
 /// The two display settings, read from and written to `eframe::Storage` beside the list.
 ///
 /// Both fall back to their default when the store is missing, empty or written by another
@@ -129,7 +133,9 @@ impl Recent {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify, Kind, Recent, Settings, CAP, LANG_KEY, RECENT_KEY, TEXT_SIZE_KEY};
+    use super::{
+        classify, Kind, Recent, Settings, CAP, LANG_KEY, LAYOUT_KEY, RECENT_KEY, TEXT_SIZE_KEY,
+    };
 
     use crate::model::fonts::TextSize;
     use crate::model::i18n::Lang;
@@ -207,8 +213,9 @@ mod tests {
             "anything unrecognised is English at the default size"
         );
         assert_eq!(Settings::default().lang, Lang::En);
-        assert_ne!(LANG_KEY, TEXT_SIZE_KEY);
-        assert_ne!(LANG_KEY, RECENT_KEY);
+        let keys = [LANG_KEY, TEXT_SIZE_KEY, RECENT_KEY, LAYOUT_KEY];
+        let unique: std::collections::BTreeSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "no two settings share a key");
     }
 
     /// Oracle 4b: capped at ten, deduplicated to the front, and the JSON round-trips.

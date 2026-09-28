@@ -63,6 +63,11 @@ eframe = { version = "0.32.3", default-features = false, features = [
     "wayland",
 ] }
 egui = { version = "0.32.3", default-features = false }
+# The editor's docking (packet M12/Y10). 0.17 is the newest release on egui 0.32 with an MSRV
+# of 1.85: 0.18 moves to egui 0.33 and 0.19 on to Rust 1.92. It has no default features;
+# `serde` is the one taken, to persist the arrangement, and it only switches on `egui/serde`,
+# which eframe's `persistence` already does.
+egui_dock = { version = "0.17.0", default-features = false, features = ["serde"] }
 # The editor's native Open dialog (packet M7/E6), taken without default features so that no
 # GTK or XDG-portal backend is pulled in: es-editor declares it for Windows and macOS only,
 # where it is the OS's own dialog and nothing else.

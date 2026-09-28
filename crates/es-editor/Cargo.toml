@@ -48,6 +48,8 @@ es-render = { workspace = true }
 # the feature pulls `ron` and `home` in behind eframe, both already in its own tree.
 eframe = { workspace = true, features = ["persistence"] }
 egui = { workspace = true }
+# The dock under the step bar (packet M12/Y10): panes a person can drag and re-dock.
+egui_dock = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }

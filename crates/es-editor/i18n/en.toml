@@ -52,14 +52,7 @@
 "status.font_missing" = "No Korean, Japanese or Chinese font on this machine, so that text shows as boxes. Tried: {}. On Debian or Ubuntu, install fonts-noto-cjk."
 
 # --- the home screen --------------------------------------------------------------------
-"home.welcome" = "Electric Sheep"
-"home.subtitle" = "Teach a robot a task, then check what it learned."
-"home.open_project" = "Open a project file..."
-"home.open_project.hint" = "A .esb bundle, or a folder holding task.toml, observation.toml, learning.toml, deployment.toml and evaluation.toml"
-"home.open_run" = "Open a run result..."
-"home.open_run.hint" = "A folder holding report.json, written by es eval run --out (spec 10.5)"
 "home.recent" = "Recent"
-"home.loop" = "How the work goes"
 "home.step.design" = "Describe the task, what the robot senses, and what counts as success."
 "home.step.collect" = "Gather demonstrations, so the robot has something to learn from."
 "home.step.train" = "Train a policy on what was collected, and watch the loss come down."
@@ -81,7 +74,7 @@
 "find.next" = "Next"
 
 # --- the Results tab --------------------------------------------------------------------
-"results.empty" = "Nothing to show yet. Open a run result from the Design tab's home screen, or press Start above to begin one."
+"results.empty" = "Nothing to show yet. Open a run folder from the File menu, or press Start above to begin one."
 "column.cell" = "Case"
 "column.stage" = "Step"
 "column.suite" = "Group"
@@ -204,7 +197,7 @@
 "live.performance.hint" = "The nine-metric performance set; never a single step/s figure (spec 12.4)"
 "live.streams" = "Signals"
 "live.events" = "Events"
-"live.empty" = "Nothing is attached. Type the address a run publishes on and press Connect, or press Start on the Results tab."
+"live.empty" = "Nothing is attached. Type the address a run publishes on and press Connect, or press Start in the Results table."
 "live.training" = "Learning"
 "live.training.hint" = "The learning curve of a running es train, every --progress-every steps on stream 5 (spec 23.3, spec 19.3)"
 "live.training.empty" = "Nothing is learning right now. Start a training run, or the whole loop, and its curve appears here."
@@ -222,13 +215,13 @@
 "results.stages" = "Steps of this run"
 
 # --- what the policy sees ---------------------------------------------------------------
-"sees.empty" = "Open a project file to see what the robot's camera gives the policy."
+"sees.empty" = "Open a file to see what the robot's camera gives the policy."
 "sees.count" = "{} of {} outputs are pictures"
 "sees.before" = "as the camera sees it"
 "sees.after" = "as the policy sees it"
 
 # --- problems ----------------------------------------------------------------------------
-"problems.empty" = "Open a project file and it will be checked."
+"problems.empty" = "Open a file and it will be checked."
 "problems.none" = "Nothing wrong: every part checks out and they agree with each other."
 
 # --- the inspector ------------------------------------------------------------------------
@@ -281,3 +274,31 @@
 "run.failed" = "Failed"
 "run.interrupted" = "Interrupted"
 "run.stopped_by_you" = "Stopped by you"
+
+# --- the shell: menu bar, step bar, dock and status line (packet M12/Y10) -----------------
+"menu.new_project" = "New project from a template..."
+"menu.new_project.hint" = "Not here yet: the start screen will offer the templates."
+"menu.open_project" = "Open a project..."
+"menu.open_file" = "Open a file..."
+"menu.open_run" = "Open a run folder..."
+"menu.attach" = "Watch a running run..."
+"menu.view" = "View"
+"menu.reset_layout" = "Reset the layout"
+"menu.language" = "Language"
+"shell.viewport" = "Viewport"
+"shell.step_panel" = "Step"
+"shell.summary" = "Summary"
+"shell.console" = "Log"
+"shell.coming_soon" = "This step's panel is not built yet. Until it is, the Advanced panes along the bottom do the work."
+"shell.not_a_project" = "Not a project: open a project folder to follow its steps."
+"shell.empty" = "Open a project, a file or a run folder from the File menu, or drop one on the window."
+"shell.next" = "Next ▶"
+"shell.left" = "⚠ {} step(s) left"
+"shell.all_done" = "Every step is done"
+"shell.project" = "Project: {}"
+"shell.console_empty" = "Nothing has run yet."
+"advanced.graph" = "Design graph"
+"advanced.sees" = "What the policy sees"
+"advanced.problems" = "Problems"
+"advanced.metrics" = "Results table"
+"advanced.live" = "Live signals"

@@ -51,14 +51,7 @@
 "status.font_missing" = "이 컴퓨터에 한국어·일본어·중국어 글꼴이 없어 해당 글자가 네모로 보입니다. 찾아본 곳: {}. 데비안이나 우분투라면 fonts-noto-cjk를 설치하세요."
 
 # --- 첫 화면 ------------------------------------------------------------------------------
-"home.welcome" = "Electric Sheep"
-"home.subtitle" = "로봇에게 일을 가르치고, 무엇을 배웠는지 확인하세요."
-"home.open_project" = "프로젝트 파일 열기..."
-"home.open_project.hint" = ".esb 묶음, 또는 task.toml, observation.toml, learning.toml, deployment.toml, evaluation.toml이 든 폴더"
-"home.open_run" = "실행 결과 열기..."
-"home.open_run.hint" = "es eval run --out이 남긴 report.json이 있는 폴더 (spec 10.5)"
 "home.recent" = "최근 항목"
-"home.loop" = "작업은 이렇게 흘러갑니다"
 "home.step.design" = "무슨 일을 시킬지, 로봇이 무엇을 보고 느낄지, 무엇을 성공으로 칠지 적습니다."
 "home.step.collect" = "시범을 모읍니다. 로봇이 보고 배울 것이 있어야 합니다."
 "home.step.train" = "모은 것으로 정책을 학습시키고, 오차가 줄어드는지 지켜봅니다."
@@ -80,7 +73,7 @@
 "find.next" = "다음"
 
 # --- 결과 탭 ------------------------------------------------------------------------------
-"results.empty" = "아직 보여 줄 것이 없습니다. 설계 탭의 첫 화면에서 실행 결과를 열거나, 위의 시작을 눌러 새로 실행하세요."
+"results.empty" = "아직 보여 줄 것이 없습니다. 파일 메뉴에서 실행 폴더를 열거나, 위의 시작을 눌러 새로 실행하세요."
 "column.cell" = "항목"
 "column.stage" = "단계"
 "column.suite" = "묶음"
@@ -203,7 +196,7 @@
 "live.performance.hint" = "아홉 가지 성능 지표. step/s 한 숫자로는 절대 말하지 않습니다 (spec 12.4)"
 "live.streams" = "신호"
 "live.events" = "사건"
-"live.empty" = "연결된 것이 없습니다. 실행이 값을 내보내는 주소를 적고 연결을 누르거나, 결과 탭에서 시작을 누르세요."
+"live.empty" = "연결된 것이 없습니다. 실행이 값을 내보내는 주소를 적고 연결을 누르거나, 결과 표에서 시작을 누르세요."
 "live.training" = "배우는 중"
 "live.training.hint" = "실행 중인 es train의 학습 곡선. --progress-every 걸음마다 5번 신호로 옵니다 (spec 23.3, spec 19.3)"
 "live.training.empty" = "지금 배우고 있는 것이 없습니다. 학습이나 전체 과정을 시작하면 여기에 곡선이 그려집니다."
@@ -221,13 +214,13 @@
 "results.stages" = "이 실행의 단계"
 
 # --- 정책이 보는 것 --------------------------------------------------------------------------
-"sees.empty" = "프로젝트 파일을 열면 로봇의 카메라가 정책에 무엇을 건네는지 보여 줍니다."
+"sees.empty" = "파일을 열면 로봇의 카메라가 정책에 무엇을 건네는지 보여 줍니다."
 "sees.count" = "사진인 출력이 {}개입니다 (전체 {}개)"
 "sees.before" = "카메라가 본 그대로"
 "sees.after" = "정책이 받는 모습"
 
 # --- 문제 ------------------------------------------------------------------------------------
-"problems.empty" = "프로젝트 파일을 열면 곧바로 검사합니다."
+"problems.empty" = "파일을 열면 곧바로 검사합니다."
 "problems.none" = "이상 없습니다. 모든 부분이 맞고 서로 어긋나지도 않습니다."
 
 # --- 설정 패널 --------------------------------------------------------------------------------
@@ -280,3 +273,31 @@
 "run.failed" = "실패"
 "run.interrupted" = "중단됨"
 "run.stopped_by_you" = "직접 중지함"
+
+# --- 셸: 메뉴 막대, 단계 표시줄, 도크, 상태 줄 (작업 패킷 M12/Y10) ---------------------------
+"menu.new_project" = "템플릿으로 새 프로젝트..."
+"menu.new_project.hint" = "아직 없습니다. 시작 화면에서 템플릿을 고를 수 있게 됩니다."
+"menu.open_project" = "프로젝트 열기..."
+"menu.open_file" = "파일 열기..."
+"menu.open_run" = "실행 폴더 열기..."
+"menu.attach" = "진행 중인 실행 지켜보기..."
+"menu.view" = "보기"
+"menu.reset_layout" = "배치 되돌리기"
+"menu.language" = "언어"
+"shell.viewport" = "뷰포트"
+"shell.step_panel" = "단계"
+"shell.summary" = "요약"
+"shell.console" = "기록"
+"shell.coming_soon" = "이 단계의 패널은 아직 만들어지지 않았습니다. 그때까지는 아래쪽의 고급 패널에서 작업하세요."
+"shell.not_a_project" = "프로젝트가 아닙니다. 단계를 따라가려면 프로젝트 폴더를 여세요."
+"shell.empty" = "파일 메뉴에서 프로젝트, 파일, 실행 폴더를 열거나 창에 끌어다 놓으세요."
+"shell.next" = "다음 ▶"
+"shell.left" = "⚠ 남은 단계 {}개"
+"shell.all_done" = "모든 단계를 마쳤습니다"
+"shell.project" = "프로젝트: {}"
+"shell.console_empty" = "아직 실행한 것이 없습니다."
+"advanced.graph" = "설계 그래프"
+"advanced.sees" = "정책이 보는 것"
+"advanced.problems" = "문제"
+"advanced.metrics" = "결과 표"
+"advanced.live" = "실시간 신호"
