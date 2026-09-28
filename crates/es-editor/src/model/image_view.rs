@@ -8,16 +8,9 @@
 use std::collections::BTreeMap;
 
 use es_compile::{CpuPlan, PlanMode, Tensor, TensorRef};
+use es_eval::run_dir::Rgb8Image;
 use es_ir::observation::{ObservationIr, ObservationNode};
 use es_ir::types::ElemType;
-
-/// Packed RGB8, row-major — what an egui texture wants.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Rgb8Image {
-    pub width: usize,
-    pub height: usize,
-    pub data: Vec<u8>,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ImagePair {

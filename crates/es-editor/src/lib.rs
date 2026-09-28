@@ -23,7 +23,8 @@
 //!
 //! A run can be watched as it happens as well as read after the fact:
 //! `es-editor --attach <addr>` is a client of `es eval run --telemetry <addr>`, and
-//! [`model::live_run::LiveRun`] folds that stream into the same [`CellRow`]/[`Timeline`] the
+//! [`model::live_run::LiveRun`] folds that stream into the same
+//! [`es_eval::run_dir::CellRow`]/[`es_eval::run_dir::Timeline`] the
 //! Run tab draws a finished run with (packet M7/E4).
 #![forbid(unsafe_code)]
 
@@ -33,13 +34,12 @@ pub mod model;
 pub use app::EditorApp;
 pub use model::edit::{Edit, EditSession};
 pub use model::graph_view::LayeredGraph;
-pub use model::image_view::{BeforeAfter, ImagePair, Rgb8Image};
+pub use model::image_view::{BeforeAfter, ImagePair};
 pub use model::inspector::{Field, Inspector, Widget};
 pub use model::launch::{Kind as LaunchKind, LaunchModel};
 pub use model::live_run::LiveRun;
 pub use model::palette::{Palette, Registries};
 pub use model::recent::{classify, Kind, Recent};
 pub use model::replay_view::ReplayView;
-pub use model::run_view::{CellRow, RunView, Timeline};
 pub use model::search::Search;
 pub use model::telemetry_view::TelemetryModel;

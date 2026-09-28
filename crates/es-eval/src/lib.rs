@@ -22,6 +22,7 @@ pub mod episodes;
 pub mod evidence;
 pub mod metrics;
 pub mod perturb;
+pub mod run_dir;
 pub mod runner;
 
 pub use bake::ObservationBake;

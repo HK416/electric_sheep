@@ -16,9 +16,10 @@
 
 use std::path::{Path, PathBuf};
 
+use es_eval::run_dir::RunDir;
+
 use crate::model::fonts::TextSize;
 use crate::model::i18n::Lang;
-use crate::model::run_view::RunView;
 
 /// The `eframe::Storage` key the recent list is stored under.
 pub const RECENT_KEY: &str = "es-editor.recent";
@@ -74,12 +75,12 @@ pub enum Kind {
 
 /// Which of the three `path` is.
 ///
-/// A run is recognised by [`RunView::is_run_dir`] — the same one call the Run tab opens with,
+/// A run is recognised by [`RunDir::is_run_dir`] — the same one call the Run tab opens with,
 /// so the classification and the reader cannot drift apart. Anything that is not a directory
 /// is a bundle: a file that turns out not to be one fails with the bundle reader's own error,
 /// which says more than "not a directory" would.
 pub fn classify(path: &Path) -> Kind {
-    if RunView::is_run_dir(path) {
+    if RunDir::is_run_dir(path) {
         Kind::Run
     } else if path.is_dir() {
         Kind::Documents

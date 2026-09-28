@@ -23,6 +23,7 @@ use eframe::egui;
 use egui::{Align2, Color32, FontId, Pos2, Rect, Sense, Stroke, Vec2};
 use es_compile::bundle;
 use es_compile::PolicyBundle;
+use es_eval::run_dir::{Bucket, Rgb8Image, RunDir};
 use es_ir::deployment::DeploymentIr;
 use es_ir::graph::PortRef;
 use es_ir::learning::LearningGraph;
@@ -37,7 +38,7 @@ use crate::model::edit::{self, Edit, EditIr, EditSession};
 use crate::model::fonts;
 use crate::model::graph_view::{CrossEdge, LayerView, LayeredGraph, NodeView};
 use crate::model::i18n::{self, Lang};
-use crate::model::image_view::{BeforeAfter, ImagePair, Rgb8Image};
+use crate::model::image_view::{BeforeAfter, ImagePair};
 use crate::model::inspector::{Field, Inspector, Widget};
 use crate::model::labels::{self, Browse, Step, Tab};
 use crate::model::launch::{Kind as LaunchKind, LaunchModel, State as LaunchState};
@@ -45,7 +46,7 @@ use crate::model::live_run::cell_key;
 use crate::model::palette::Palette;
 use crate::model::recent::{self, Kind, Recent, Settings};
 use crate::model::replay_view::{self, ReplayView};
-use crate::model::run_view::{Bucket, RunView};
+use crate::model::run_view;
 use crate::model::search::Search;
 use crate::model::telemetry_view::{self, Source, TelemetryModel};
 use crate::model::train_view::{Plot, Series};
@@ -96,7 +97,7 @@ pub struct EditorApp {
     status: String,
     opened: Option<Opened>,
     /// An opened run directory (packet M7/E1). A path is one or the other, never both.
-    run: Option<RunView>,
+    run: Option<RunDir>,
     /// Frames of the selected cell's filmstrip, keyed `<cell>#<index>`.
     run_frames: BTreeMap<String, egui::TextureHandle>,
     /// The scene the replay poses (packet M7/E2). A run directory does not carry one, so it
@@ -318,9 +319,9 @@ impl EditorApp {
         self.replay_texture = None;
         self.search.set_hits(Vec::new());
         if recent::classify(&path) == Kind::Run {
-            match RunView::open(&path) {
+            match RunDir::open(&path) {
                 Ok(run) => {
-                    self.status = format!("{}: {}", path.display(), run.status);
+                    self.status = format!("{}: {}", path.display(), run_view::status(&run));
                     self.frames_path = run.frames_root().display().to_string();
                     self.run = Some(run);
                     self.tab = Tab::Results;
@@ -1034,7 +1035,7 @@ impl EditorApp {
 
     /// The Run tab (packet M7/E1): the cell table, the acceptance verdict, and for the
     /// selected cell its Safety Plane timeline and a filmstrip. Every number, every order and
-    /// every decoded byte is [`RunView`]'s; this turns them into widgets.
+    /// every decoded byte is [`RunDir`]'s; this turns them into widgets.
     fn run_tab(&mut self, ui: &mut egui::Ui) {
         // The Launch section is above the table and there whether or not anything is open:
         // starting a run is how the tab gets something to show (packet M7/E5).
@@ -1086,7 +1087,7 @@ impl EditorApp {
         let is_live = run.is_none();
         let (columns, rows, selected, heading, acceptance) = match run.as_ref() {
             Some(run) => (
-                run.columns(),
+                run_view::columns(run),
                 run.cells().to_vec(),
                 run.selected_cell().map(|c| c.name.clone()),
                 i18n::t(
@@ -1225,12 +1226,12 @@ impl EditorApp {
                     return;
                 };
                 ui.separator();
-                ui.heading(timeline.heading(cell));
+                ui.heading(run_view::timeline_heading(timeline, cell));
                 // One column per ~4 px of the strip; the model folds the frames into them.
                 let n = (ui.available_width() / 4.0) as usize;
                 paint_timeline(lang, ui, &timeline.buckets(n));
                 for kind in timeline.kind_rows() {
-                    ui.label(kind.label());
+                    ui.label(run_view::kind_label(&kind));
                 }
 
                 ui.separator();
@@ -1430,7 +1431,7 @@ impl EditorApp {
         } = self;
         let selected = run
             .as_ref()
-            .and_then(RunView::selected_cell)
+            .and_then(RunDir::selected_cell)
             .filter(|c| c.has_traj)
             .map(|c| c.name.clone());
 
@@ -1459,7 +1460,7 @@ impl EditorApp {
             if field.lost_focus() {
                 if let Some(run) = run.as_mut() {
                     run.set_frames_root(frames_path.trim());
-                    *status = format!("{}: {}", run.dir.display(), run.status);
+                    *status = format!("{}: {}", run.dir.display(), run_view::status(run));
                 }
             }
             let replay_label = i18n::t(lang, "replay.replay");
@@ -1828,7 +1829,7 @@ fn rgb_texture(ctx: &egui::Context, name: &str, img: &Rgb8Image) -> egui::Textur
 
 // --- the Run tab -------------------------------------------------------------------------------
 
-/// Frames the filmstrip shows, sampled evenly over the cell by [`RunView::filmstrip`].
+/// Frames the filmstrip shows, sampled evenly over the cell by [`RunDir::filmstrip`].
 const FILMSTRIP: usize = 8;
 
 fn dash(lang: Lang) -> String {
