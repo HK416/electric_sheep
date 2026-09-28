@@ -81,8 +81,19 @@ fn yes_no(b: bool) -> &'static str {
     }
 }
 
-/// Always returns `0`: this command reports, it never fails (spec 2.5).
-pub fn run() -> u8 {
+/// The facts both outputs report, gathered once.
+struct Deps {
+    python: Option<String>,
+    mujoco: bool,
+    torch: bool,
+    lerobot: bool,
+    vulkan: bool,
+    /// `cfg!(feature = "render")` of this binary: `es eval run --frames` needs it.
+    render: bool,
+    backends: Vec<(&'static str, Result<(), String>)>,
+}
+
+fn gather() -> Deps {
     let python = find_python();
     // `MuJoCoCpuBackend::is_available` does its own interpreter search (honoring `ES_PYTHON`
     // too), so it is not gated on `python` being found by this module's own search.
@@ -93,7 +104,66 @@ pub fn run() -> u8 {
     let lerobot = python
         .as_deref()
         .is_some_and(|p| module_importable(p, "lerobot"));
-    let vulkan = vulkan_loader_present();
+    // `--backend` of `es eval run` / `es loop collect` / `[rl] backend` (packet M11/X1).
+    let backends = es_physics_backend::BackendKind::ALL
+        .into_iter()
+        .map(|kind| (kind.name(), es_physics_backend::is_available(kind)))
+        .collect();
+    Deps {
+        python,
+        mujoco,
+        torch,
+        lerobot,
+        vulkan: vulkan_loader_present(),
+        render: cfg!(feature = "render"),
+        backends,
+    }
+}
+
+/// Schema 1, one line: what the editor's start screen reads (design note editor-redesign 6.6).
+/// `python.path` is present only when an interpreter was found; `reason` only when a backend
+/// is unavailable.
+fn to_json(d: &Deps) -> String {
+    let mut python = serde_json::json!({ "found": d.python.is_some() });
+    if let Some(p) = &d.python {
+        python["path"] = p.as_str().into();
+    }
+    let backends: Vec<serde_json::Value> = d
+        .backends
+        .iter()
+        .map(|(name, status)| match status {
+            Ok(()) => serde_json::json!({ "name": name, "available": true }),
+            Err(why) => serde_json::json!({ "name": name, "available": false, "reason": why }),
+        })
+        .collect();
+    serde_json::json!({
+        "schema": 1,
+        "python": python,
+        "modules": { "mujoco": d.mujoco, "torch": d.torch, "lerobot": d.lerobot },
+        "vulkan_loader": d.vulkan,
+        "render": d.render,
+        "backends": backends,
+    })
+    .to_string()
+}
+
+/// Always returns `0`: this command reports, it never fails (spec 2.5). `json` prints the same
+/// facts as one JSON object instead of the text.
+pub fn run(json: bool) -> u8 {
+    let deps = gather();
+    if json {
+        println!("{}", to_json(&deps));
+        return 0;
+    }
+    let Deps {
+        python,
+        mujoco,
+        torch,
+        lerobot,
+        vulkan,
+        backends,
+        ..
+    } = deps;
 
     println!("es --check-deps (spec 2.5)");
     println!();
@@ -123,14 +193,13 @@ pub fn run() -> u8 {
         yes_no(lerobot)
     );
     println!("  LeRobot dataset read (Rust-native)       yes  (no Python needed)");
-    // `--backend` of `es eval run` / `es loop collect` / `[rl] backend` (packet M11/X1).
     println!("physics backends (--backend, spec 17.2):");
-    for kind in es_physics_backend::BackendKind::ALL {
-        let status = match es_physics_backend::is_available(kind) {
+    for (name, status) in backends {
+        let status = match status {
             Ok(()) => "available".to_owned(),
             Err(why) => format!("unavailable ({why})"),
         };
-        println!("  {:<11} {status}", kind.name());
+        println!("  {name:<11} {status}");
     }
     println!(
         "  observation/preprocessing GPU lowering   {}  (unneeded on a Slang cache hit)",

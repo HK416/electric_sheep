@@ -18,7 +18,7 @@ const TOP_HELP: &str = "\
 es -- Electric Sheep runtime/CLI
 
 USAGE:
-    es --check-deps
+    es --check-deps [--json]
     es --version
     es --help
     es ir validate <file.toml>...
@@ -52,7 +52,7 @@ fn dispatch(args: &[String]) -> Result<u8, CliError> {
             println!("es {}", env!("CARGO_PKG_VERSION"));
             Ok(0)
         }
-        Some("--check-deps") => Ok(cmd::check_deps::run()),
+        Some("--check-deps") => Ok(cmd::check_deps::run(args.iter().any(|a| a == "--json"))),
         Some("ir") => cmd::ir::dispatch(&args[1..]),
         Some("task") if args.get(1).map(String::as_str) == Some("generate") => {
             cmd::generate::dispatch(&args[2..])

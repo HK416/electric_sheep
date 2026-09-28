@@ -842,6 +842,36 @@ fn check_deps_always_exits_zero() {
 }
 
 #[test]
+fn check_deps_json_is_one_object_with_every_field() {
+    let out = bin()
+        .args(["--check-deps", "--json"])
+        .output()
+        .expect("run es");
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout(&out);
+    let v: serde_json::Value = serde_json::from_str(text.trim()).expect("one JSON object");
+    assert_eq!(v["schema"], 1);
+    assert!(v["python"]["found"].is_boolean());
+    for m in ["mujoco", "torch", "lerobot"] {
+        assert!(v["modules"][m].is_boolean(), "modules.{m}");
+    }
+    assert!(v["vulkan_loader"].is_boolean());
+    assert!(v["render"].is_boolean());
+    let names: Vec<&str> = v["backends"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|b| b["name"].as_str().unwrap())
+        .collect();
+    assert!(names.contains(&"mujoco-cpu"));
+    for b in v["backends"].as_array().unwrap() {
+        if b["available"] == false {
+            assert!(b["reason"].is_string(), "an unavailable backend says why");
+        }
+    }
+}
+
+#[test]
 fn version_and_help_exit_zero() {
     let out = bin().arg("--version").output().expect("run es");
     assert!(out.status.success());
