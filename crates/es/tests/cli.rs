@@ -8155,6 +8155,83 @@ fn cycle_refuses_a_moved_evaluation_hash() {
     assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
 }
 
+// --- packet M12/Y5: the cube template's cycle and `es policy init` --------------------------
+
+/// The vision route of the cube template: `cycle.toml` with the `LeRobot` recipe and
+/// `evaluation-v8.toml`.
+const CYCLE_VISION_RECIPE: &str = "tests/fixtures/visible-learning/cycle-vision.toml";
+
+/// Regenerates `tests/golden/train/plan-cycle-vision.txt`. Run once, explicitly; it is then
+/// read-only (spec 1.4), exactly like `generate_cycle_golden` above.
+#[test]
+#[ignore = "golden generator; run explicitly"]
+fn generate_cycle_vision_golden() {
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP generate_cycle_vision_golden: set ES_GENERATE_GOLDENS=1 to regenerate");
+        return;
+    }
+    let dir = scratch_dir("cycle-vision-golden");
+    let out = run_cycle(CYCLE_VISION_RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    write(&train_golden("plan-cycle-vision.txt"), &stdout(&out));
+}
+
+/// The stage plan the editor launches for the cube template, pinned: collect, the expert gate,
+/// the `LeRobot` route nested under `train`, and `evaluation-v8.toml` for the eval stage.
+#[test]
+fn cycle_vision_dry_run_matches_its_golden() {
+    let dir = scratch_dir("cycle-vision-dry");
+    let out = run_cycle(CYCLE_VISION_RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let golden = train_golden("plan-cycle-vision.txt");
+    let want =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(stdout(&out), want, "the stage plan is not the golden");
+}
+
+/// `es policy init` builds the bundle a cycle's `[collect] policy` names from four committed
+/// documents: the same bytes for the same documents and seed, and a bundle that opens.
+#[test]
+fn policy_init_is_deterministic_and_the_bundle_opens() {
+    let dir = scratch_dir("policy-init");
+    let init = |out: &str, seed: &[&str]| {
+        bin()
+            .current_dir(train_root())
+            .args(["policy", "init"])
+            .args(["--task", "tests/fixtures/visible-learning/task.toml"])
+            .args([
+                "--observation",
+                "tests/fixtures/visible-learning/observation.toml",
+            ])
+            .args([
+                "--learning",
+                "tests/fixtures/visible-learning/learning.toml",
+            ])
+            .args([
+                "--deployment",
+                "tests/fixtures/visible-learning/deployment.toml",
+            ])
+            .args(seed)
+            .arg("--out")
+            .arg(dir.join(out))
+            .output()
+            .expect("run es policy init")
+    };
+    for (out, seed) in [
+        ("a.esb", &[][..]),
+        ("b.esb", &["--seed", "0"][..]),
+        ("c.esb", &["--seed", "1"][..]),
+    ] {
+        let o = init(out, seed);
+        assert_eq!(o.status.code(), Some(0), "{}", stderr_of(&o));
+    }
+    let read = |name: &str| std::fs::read(dir.join(name)).expect("the bundle was written");
+    let (a, b, c) = (read("a.esb"), read("b.esb"), read("c.esb"));
+    assert_eq!(a, b, "same documents, same seed, different bytes");
+    assert_ne!(a, c, "the seed is not in the bundle");
+    es_compile::PolicyBundle::open(&a).expect("the bundle opens");
+}
+
 /// Oracle 4. One real cycle on the demo fixtures: a 2-episode expert collect, the harness on
 /// the expert *before* the 40-step IR-route training, then the trained checkpoint through the
 /// same harness -- with `loop.jsonl` holding `collect`, `evaluate` (the gate), `train`,

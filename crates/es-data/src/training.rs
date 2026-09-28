@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use es_compile::plan::{augmentation_chains, AugmentStep};
-use es_ir::learning::{LearningGraph, LearningNode};
+use es_ir::learning::{LearningGraph, LearningNode, WeightsRef};
 use es_ir::observation::{AugmentKind, ObservationIr, ObservationNode};
 use es_ir::DatasetHash;
 use serde::{Deserialize, Serialize};
@@ -1165,6 +1165,43 @@ pub fn value_weights(out: &Path) -> String {
 /// disagree with the list, and a whole checkpoint plus a list can.
 pub fn init_weights(out: &Path) -> String {
     under(out, "weights/init.safetensors")
+}
+
+/// The bundle a cycle's `[collect] policy` names, from four documents (`es policy init`,
+/// packet M12/Y5). The demonstrator drives under `--expert`, so the weights are never loaded:
+/// they are a placeholder that names the seed, which is what every untrained bundle in this
+/// repository has been (nothing on the Rust side initialises weights). What the bundle is for
+/// is its documents -- above all the Deployment IR, the Safety Plane the demonstrator runs
+/// under. The same documents and seed give the same bytes.
+pub fn untrained_bundle(
+    task: &Path,
+    observation: &Path,
+    learning: &Path,
+    deployment: &Path,
+    seed: u64,
+) -> Result<Vec<u8>, DataError> {
+    let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| DataError::io(p, e));
+    let bad = |p: &Path, e: &dyn std::fmt::Display| refuse(format!("{}: {e}", p.display()));
+    let task_ir = es_ir::serial::task_from_toml(&read(task)?).map_err(|e| bad(task, &e))?;
+    let observation_ir = es_ir::serial::observation_from_toml(&read(observation)?)
+        .map_err(|e| bad(observation, &e))?;
+    let mut learning_ir =
+        es_ir::serial::learning_from_toml(&read(learning)?).map_err(|e| bad(learning, &e))?;
+    let deployment_ir =
+        es_ir::serial::deployment_from_toml(&read(deployment)?).map_err(|e| bad(deployment, &e))?;
+    let weights = format!("es policy init: untrained, never loaded, seed {seed}").into_bytes();
+    learning_ir.policy.weights = WeightsRef::Safetensors {
+        path: learning_ir.policy.weights.path().to_owned(),
+        hash: *blake3::hash(&weights).as_bytes(),
+    };
+    es_compile::PolicyBundle::build(
+        &task_ir,
+        &observation_ir,
+        &learning_ir,
+        &deployment_ir,
+        &weights,
+    )
+    .map_err(|e| refuse(format!("the four documents do not make a bundle: {e}")))
 }
 
 impl Plan {
