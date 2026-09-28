@@ -6,8 +6,10 @@ fixed evaluation), §10 (Evaluation IR), §28.9 (the expert gate), §1.4 (oracle
 (context budget), §4.2 (layering). It builds on `editor-shell.md` §10–§16, which it
 reorganises rather than replaces.
 
-Status: agreed with the owner on 2026-09-28 (screens and decomposition); S1 is the next
-implementation. S2–S6 are directions, each to get its own design pass before it is planned.
+Status: agreed with the owner on 2026-09-28 (screens and decomposition). **S1 implemented the same
+day** (plan Y, `docs/packets/M12/plan-y.md`, Y1–Y15; review `docs/reviews/M12.md`); not closed until the
+real runs of `docs/packets/M12/YV-verification.md`. S2–S6 are directions, each to get its own
+design pass before it is planned; S2 waits on the `es-editor` split (section 9).
 
 ## 1. Why
 
@@ -397,3 +399,37 @@ remote execution; an installable package.
    camera-only route, how the expert gate gets a bundle it accepts (packet Y5 found that no four
    committed documents make one: `XIR-040` under `evaluation-v8.toml`, `XIR-010` for
    `observation-v8.toml` with `learning.toml`).
+
+   *Decided 2026-09-28: both, as two cards — `cube-into-bin` (camera only, marked experimental)
+   and `cube-into-bin-hint` (cube pose given, marked practice). `es policy init` without
+   `--learning` builds the camera-only gate's bundle (packet Y5b).*
+
+## 9. What the implementation settled (2026-09-28)
+
+Facts plan Y found or fixed that the sections above did not say; the review `docs/reviews/M12.md`
+has the findings and the open decisions.
+
+- **Docking:** `egui_dock` 0.17.0, the last release on egui 0.32 and MSRV 1.85 (0.18 moves to egui
+  0.33, 0.19+ to Rust 1.92). Dock states persist per arrangement (one per step, one Advanced).
+- **Language:** language and text size moved to the View menu; the start screen carries its own
+  language switch (review H-5).
+- **Templates need `render`:** a default `es` build has no renderer (`"render": false`), so both
+  cube cards stay disabled until `es` is built with `--features render`; the start screen says so
+  (review H-1).
+- **The traffic light** (section 6.4) as built, first match wins: *stopped by you* (grey) →
+  *stopped* → *broken* → *not responding* → *starting* (grey, before any message) → *slow* →
+  *stopped learning* → *going well*. A failed acceptance is **not** *stopped*: `es loop cycle` ends
+  eval (and showcase, which repeats eval's code) with 1 when the acceptance fails, and ④ reads
+  "finished — did not pass", grey, with ⑤ open.
+- **Run folders:** `write_run` creates `runs/NNN` exclusively and is refused while a run is going;
+  Start is refused while a child runs, a start is queued, or a step is still running. The ledger
+  maps to the step bar as: `collect` row → collected (and, with an expert, only once the latest gate
+  row says passed); `train` row → trained; an `evaluate` row without `expert` → evaluated;
+  showcase writes no row. `--from` accepts `collect | train | eval | showcase`.
+- **`episodes.json`** holds suite, cell, episode, seed, termination, plane steps and changed steps,
+  and the episode's own failure-mode buckets; frames and trajectory are found by the cell name
+  (`frames/<cell>/`, `traj/<cell>.estraj`), not stored.
+- **Length presets:** camera-only [2500, 5000], [10000, 20000], [20000, 40000, 60000] (the LeRobot
+  route's marks are a multiple series); hint [1000, 5000], [1000, 5000, 20000],
+  [1000, 5000, 20000, 60000] — both mean 5,000 / 20,000 / 60,000 steps.
+- **Budget:** `es-editor` is at 9,715 of 10,000 after S1. S2 needs a split first (review S-1, H-2).

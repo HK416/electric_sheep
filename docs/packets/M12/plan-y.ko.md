@@ -1435,6 +1435,67 @@ S3–S5의 카드는 아직 없음; 작은 단계 바가 딸린 최근 프로젝
 
 ---
 
+### 작업 Y15: 템플릿 프로젝트의 ①과 ②, 그리고 `render` 설치 안내 줄
+
+*2026-09-28 웨이브 4 머지 때 추가: 설계 노트 6.3절은 ①이 템플릿의 장면을 CPU 래스터로
+보여 주고 ②가 요약을 보여 준다고 말하지만, 어떤 작업도 그것을 맡지 않았다.* Y11은 또한
+기본 `es` 빌드에 `render` feature가 없어서, Python 도구가 모두 설치돼 있어도 두 큐브
+카드가 비활성으로 남는다는 것을 밝혔다; 시작 화면의 설치 안내 줄은 그것을 얻는 방법을
+말해야 한다.
+
+**Files:**
+- Create: `crates/es-editor/src/model/scene_view.rs`, `crates/es-editor/src/ui/scene.rs`
+- Modify: `crates/es-editor/src/model/mod.rs`, `crates/es-editor/src/ui/mod.rs`,
+  `crates/es-editor/src/ui/shell.rs`(Y12와 Y13의 것과 같은 이른 반환 훅 하나; 두
+  `shell.coming_soon` 자리표시자가 사라짐), `crates/es-editor/src/app.rs`(필드 하나),
+  `crates/es-editor/src/model/home.rs`(설치 안내 줄들), `crates/es-editor/i18n/{en,ko}.toml`
+
+**Interfaces:**
+
+```rust
+// model/scene_view.rs
+pub struct ScenePreview { /* the parsed scene and its triangles at the model's initial pose */ }
+impl ScenePreview {
+    /// The template's scene (repository-relative `Template::scene`), posed at `qpos0`.
+    pub fn open(scene: &Path) -> Result<Self, String>;
+    pub fn project(&self, camera: &es_render::raster::Camera) -> es_render::raster::Projected;
+    /// What the step panel lists: bodies (robot links grouped under the robot's root body),
+    /// free bodies (the objects), cameras — by their scene names, in scene order.
+    pub fn contents(&self) -> SceneContents;
+}
+pub struct SceneContents { pub robot: Option<String>, pub objects: Vec<String>,
+                           pub cameras: Vec<String> }
+```
+
+`model/replay_view.rs`와 `es_render::raster`가 이미 하는 것을 재사용한다(장면 로딩, 테셀레이션,
+`Camera::orbit`/`zoom`, `Raster::draw`) — 두 번째 래스터라이저도, 두 번째 장면 로더도 없다.
+`ui/advanced.rs`의 `replay_canvas`가 투영된 프레임을 어떻게 그리는지 보여 준다.
+
+`model/home.rs`: 설치 문구가 줄들의 목록이 되며, 각 줄은 무엇이 빠졌는지로 고른다 —
+Python 도구(오늘의 줄)와, `render`가 빠졌을 때는 `es`가 카메라 그리기 없이 빌드됐고
+`cargo build -p es --features render`로 다시 빌드해야 한다는 줄(명령은 그 줄의 `.hint`에,
+쉬운 말은 줄 안에).
+
+화면: ① — 뷰포트: 장면, 마우스로 orbit, 휠로 zoom; 단계 패널: `contents()`로부터의
+"장면에 무엇이 있나"; 요약: 템플릿의 이름, 요약, 안내문. ② — 단계 패널: 쉬운 말로 된
+가르치는 방법("동작 블록: 스크립트로 된 시연기가 SO-101에게 하는 법을 보여 줘요")과
+시연 개수; 뷰포트: 같은 장면; 요약: 안내문. 템플릿에서는 둘 다 읽기 전용(편집은
+S3/S4).
+
+- [ ] **Step 1: 실패하는 테스트** — `tests/fixtures/mjcf/so101_pick_place.xml`에 대한
+  `ScenePreview::open`은 기본 카메라로부터 비어 있지 않은 투영을 내고 `contents()`는
+  로봇 하나, 큐브, 통, 그리고 `overhead` 카메라를 이름한다; 파일이 없으면 패닉이 아니라
+  `Err`다; 설치 안내 줄은 `render`가 false일 때 정확히 render 줄을 포함한다.
+- [ ] **Step 2:** 구현; `cargo test -p es-editor`, clippy, fmt; 쓰이지 않게 되면
+  `shell.coming_soon`을 두 표에서 뺀다.
+- [ ] **Step 3:** ①과 ②의 스크린샷(앱 안의 임시 훅, 절대 커밋하지 않음)을
+  `<worktree>/target/plan-y/y15/`로.
+- [ ] **Step 4: Commit** `feat(es-editor): the scene and teach steps of a template project`.
+
+**Forbidden:** 장면 안의 무엇이든 편집하는 것(S3/S4); 새 의존성; 원격 서버에 연결하는 것.
+
+---
+
 ### 작업 Y14: 문서, 그리고 나중을 위한 체크리스트
 
 **파일:**

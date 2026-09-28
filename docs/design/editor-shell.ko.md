@@ -1146,3 +1146,24 @@ client(s)`로 읽힌다. 따라서 위 숫자는 빈 팬아웃으로 발행하�
   §14가 실행에 대해 하는 것과 같은 거절이고 같은 이유다. 끄기가 유일한 제어다.
 - **두 번째 탭.** Training은 관찰 탭의 한 절이다. "지금 무슨 일이 일어나고 있는가"는 하나의
   물음이고 하나의 자리다.
+
+---
+
+## 17. 작업 흐름 셸(M12 플랜 Y)
+
+1–16절은 에디터를 다섯 개의 탭으로 설명한다. 플랜 Y(2026-09-28)는 그 위에 단계 바와
+도크를 얹었다; 설계는 `docs/design/editor-redesign.md`, 패킷은 `docs/packets/M12/`, 리뷰는
+`docs/reviews/M12.md`. 위에서 설명한 부분들에 대해 바뀐 것:
+
+- **다섯 탭은 Advanced 패널이 된다**(`ui/advanced.rs`), 동작은 바뀌지 않는다: 설계 그래프,
+  결과 표(실행 패널과 Replay 패널을 포함해), 관찰, 정책이 보는 것, 문제. 15절의
+  `labels::Tab`과 home 모델은 사라졌다; 시작 화면(`ui/home.rs`, `model/home.rs`)이 그것들을
+  대신했다.
+- **`RunView`는 `es_eval::run_dir::RunDir`다**(10절의 리더가 그 파일들을 쓰는 크레이트로
+  옮겨졌다), `Rgb8Image`와 함께; 사람이 읽는 문자열은 여기 남았다(`run_view.rs`).
+- **재생 래스터라이저는 `es_render::raster`다**(11절); `ReplayView`는 `es-env`를 거쳐
+  궤적에 자세를 입히기 때문에 여기 남는다. 셰이딩은 이제 `es_render::cpu::shade_lambert`를
+  호출한다.
+- **`app.rs`는 접착제다**; 그리기는 `ui/`에 있고, 2절의 규칙이 유지된다: 새 화면이 내리는
+  모든 결정은 `model/`(`workflow`, `project`, `watch`, `health`, `results`, `home`,
+  `template`, `layout`, `scene_view`)에 있으며, 테스트 아래 있다.

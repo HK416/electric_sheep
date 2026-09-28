@@ -1190,3 +1190,23 @@ different run shape and says nothing about these two.
   makes for a run, for the same reason. Kill is the only control.
 - **A second tab.** Training is a section of the Live tab, because "what is happening right
   now" is one question and one place.
+
+---
+
+## 17. The workflow shell (M12 plan Y)
+
+Sections 1–16 describe the editor as five tabs. Plan Y (2026-09-28) put a step bar and a dock
+over them; the design is `docs/design/editor-redesign.md`, the packets `docs/packets/M12/`, the
+review `docs/reviews/M12.md`. What changed for the parts described above:
+
+- **The five tabs are Advanced panes** (`ui/advanced.rs`), unchanged in behaviour: Design graph,
+  Results table (with the launch panel and the Replay panel), Live, What the policy sees,
+  Problems. `labels::Tab` and the home model of section 15 are gone; the start screen
+  (`ui/home.rs`, `model/home.rs`) replaced them.
+- **`RunView` is `es_eval::run_dir::RunDir`** (section 10's reader moved to the crate that writes
+  the files), with `Rgb8Image`; the words a person reads stayed here (`run_view.rs`).
+- **The replay rasterizer is `es_render::raster`** (section 11); `ReplayView` stays here because it
+  poses a trajectory through `es-env`. The shading now calls `es_render::cpu::shade_lambert`.
+- **`app.rs` is glue**; drawing is in `ui/`, and the rule of section 2 holds: every decision the
+  new screens make is in `model/` (`workflow`, `project`, `watch`, `health`, `results`, `home`,
+  `template`, `layout`, `scene_view`), under test.

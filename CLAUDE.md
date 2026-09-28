@@ -32,6 +32,13 @@ rendered; N envs render in one dispatch; `Env::new` refuses a scene its Task IR 
 every step. The M11 follow-ups (addendum in `docs/reviews/M11.md`, 2026-09-27): `cargo xtask ci` runs end to end with
 `ES_PYTHON` (R5); `[rl] critic = "privileged"` (R10); a 100-iteration lr warmup keeps the pixel actor's `tanh` out of
 first-update saturation, and pixel-only PPO scores its first held-out successes (`rs-pix` 0.06–0.19 nominal, 3 of 3 seeds; R11).
+**M12 plan Y** (`docs/design/editor-redesign.md`, `docs/packets/M12/`, review `docs/reviews/M12.md`) was implemented 2026-09-28:
+the editor's workflow shell for non-experts — a step bar (① scene → ② teach → ③ train → ④ evaluate → ⑤ results) over an
+`egui_dock` dock, a start screen with a PC check and two cube templates (camera only, experimental; cube pose given, practice),
+one-button `es loop cycle` runs with a traffic light, and a plain-language results screen; the old tabs are Advanced panes.
+Backend: `es --check-deps --json`, `episodes.json`, `es policy init`. It is **not closed**: no learning run has gone through it
+(no `ES_PYTHON` here, the remote server off-limits by the owner), and `docs/packets/M12/YV-verification.md` lists what must run;
+`es-editor` is at 9,715 of the 10,000 cap, so S2 waits on a split (review H-2).
 The next campaign waits on the human decisions in `docs/reviews/M11.md` (the envelope for a learning policy, a cross-render
 condition, a declared source latency, `asset_hash`), `docs/reviews/M10.md` (the cycle recipe's step count, the next source policy),
 `docs/reviews/M9.md` (the buffered-path watchdog for delta policies) and the older ones in `docs/reviews/M7.md` (the stop rule's reading,
