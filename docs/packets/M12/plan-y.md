@@ -1244,7 +1244,7 @@ another dependency.
 - Produces: `pub fn draw(app: &mut EditorApp, ui: &mut egui::Ui)`; full-window when no
   project or file is open.
 
-Layout (design note §3): the PC-check line (one item per `needs` name in plain words, green /
+Layout (design note section 3): the PC-check line (one item per `needs` name in plain words, green /
 red, optional backends amber, "checking…" while `Checking`, the failure text while `Failed`);
 "What would you like to do?" with one card per loaded template (disabled with
 `home.missing` + the missing items when `Missing`) — and nothing for S3–S5's cards; recent
@@ -1281,7 +1281,7 @@ does not run end to end.
 - Produces: `pub fn draw_train(app, ui)` and `pub fn draw_evaluate(app, ui)` for the step
   panel, centre and summary panes.
 
-Behaviour (design note §6.4):
+Behaviour (design note section 6.4):
 1. **Settings** before a run: demonstrations (default `template.demonstrations`), length
    (short / medium / long). **Start** → `next_run_dir`, `write_run` with
    `127.0.0.1:{free_local_port()}`, write `telemetry.txt`, `start_in(argv, repo_root)`.
@@ -1332,7 +1332,7 @@ ETA; blocking the UI thread on a child, a socket or a file larger than a recipe.
   `[eval] config`, repository-relative).
 - Produces: `pub fn draw(app, ui)`.
 
-Behaviour (design note §6.5): the run list; the card (pass/fail, "x of n", each acceptance line
+Behaviour (design note section 6.5): the run list; the card (pass/fail, "x of n", each acceptance line
 in plain words with ✓/✗, the comparison with the previous run of the project or
 `results.not_comparable`); causes with advice; the player (outside orbit camera / the policy's
 eye from `frames/<cell>/` / side by side; 0.5×/1×/2×; the existing timeline marks); situation
@@ -1385,11 +1385,11 @@ or the server — the owner decides), and what counts as pass:
 
 ## Self-review (done while writing)
 
-- **Spec coverage:** §6.1 shell/dock/code layout → Y10; moves → Y3, Y4; §6.2 project/template
-  → Y5, Y6; §6.3 step state → Y6; §6.4 progress/light → Y7, Y12; §6.5 results → Y2, Y8, Y13;
-  §6.6 backend → Y1, Y2, Y5; §6.7 errors → Y6 (interrupted), Y7 (stopped/stopped by you),
-  Y8 (old run), Y9 (missing deps, broken template), Y13 (no report); §6.8 oracles → each
-  task's tests + Y-V; §8's five open facts → Y5 step 1, Y10 step 1, Y-V 1–5.
+- **Spec coverage:** section 6.1 shell/dock/code layout → Y10; moves → Y3, Y4; section 6.2 project/template
+  → Y5, Y6; section 6.3 step state → Y6; section 6.4 progress/light → Y7, Y12; section 6.5 results → Y2, Y8, Y13;
+  section 6.6 backend → Y1, Y2, Y5; section 6.7 errors → Y6 (interrupted), Y7 (stopped/stopped by you),
+  Y8 (old run), Y9 (missing deps, broken template), Y13 (no report); section 6.8 oracles → each
+  task's tests + Y-V; section 8's five open facts → Y5 step 1, Y10 step 1, Y-V 1–5.
 - **Placeholders:** the length presets are chosen in Y5 step 2 from `training.rs`'s rule;
   `THRESHOLDS` are declared first guesses with the calibration task named (Y-V 4).
 - **Type names:** `es_eval::run_dir::RunDir` (a finished evaluation's files, Y4) and

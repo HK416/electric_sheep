@@ -38,7 +38,7 @@ does not know that a recipe exists cannot start. This redesign changes the shape
 | What the viewport shows during training | **Checkpoint previews**: a few test episodes per checkpoint, with video (new) |
 | How much the results screen guides | One line of advice per failure cause, plus **"Train again, focused on failures"** |
 | Decomposition | S1 → S2 → S3 → S4 → S5 → S6, S1 first |
-| Crate budget | Move code the editor holds on others' behalf back to its owners (§6.1) |
+| Crate budget | Move code the editor holds on others' behalf back to its owners (section 6.1) |
 
 ## 3. The screens (all sub-projects)
 
@@ -116,10 +116,13 @@ again focused on failures** (S2).
 
 Two facts that shape S1:
 
-- **The cube template must use the vision route of M5/V19b** — LeRobot ACT on
-  `observation-v8.toml` (camera and joint state, no `sim_cube_pose`), which passed held-out
-  15/16. The IR route of M7 (U3, 0.5625) reads the simulator-privileged cube pose and cannot be
-  called vision-based.
+- **No camera-only route has passed on the cube task yet.** *(Corrected 2026-09-28 by packet
+  Y5; an earlier draft said the opposite.)* M5/V19b's held-out 15/16 was LeRobot ACT on
+  `observation-v19` (`07fad282…`, not committed): a 13-value state of the six joint angles
+  **and** the simulator-privileged `sim_cube_pose`, beside the camera. The IR route of M7 (U3,
+  0.5625) reads the same privileged pose. The camera-and-joints route (`observation-v8.toml`)
+  scored 0–1/16 in V8, V11 and V12 on older harnesses and has not been measured on the current
+  one. Which route the template uses is the owner's choice (section 8).
 - **"Train again focused on failures" must not train on the evaluation's seeds.** That would
   make the next comparison meaningless (§13.3). It widens the *training* randomization towards
   the perturbations that failed and collects with fresh seeds.
@@ -308,7 +311,7 @@ Reads `runs/NNN/eval/`: `report.json`, the new `episodes.json`, `frames/`, `traj
   from the author's free-form suite name, which is shown in the hover.
 - **Tiles and player.** Every episode as a tile (all / successes / failures), the last recorded
   frame as its thumbnail. A tile plays in the centre viewport through the existing replay
-  (moved to `es-render`, §6.1) with its timeline marks; camera: outside (orbit) / the policy's
+  (moved to `es-render`, section 6.1) with its timeline marks; camera: outside (orbit) / the policy's
   eye (recorded frames) / side by side; speed 0.5× / 1× / 2×.
 - **Folded**: the 18 metrics (today's results table) and the settings and hashes of the run.
 - **Buttons**: export the policy (a save dialog copying the `.esb`); run again (③ with the same
@@ -352,7 +355,7 @@ All under `cargo xtask ci`:
   episodes equals the `success_rate` metric exactly** — two independently computed numbers
   checking each other.
 - **`--check-deps --json`**: a schema test.
-- **The moves of §6.1** leave every existing golden byte-identical
+- **The moves of section 6.1** leave every existing golden byte-identical
   (`tests/golden/editor/replay-tick0-320x180.bin`, `replay_tick0_order.json`, the launch
   goldens).
 - **Strings**: the existing i18n completeness test (en/ko key parity, every key used) and the
@@ -387,5 +390,10 @@ remote execution; an installable package.
    route included);
 3. `--from eval` after `[eval] checkpoint` is changed;
 4. the traffic-light thresholds, from the recorded acceptance run;
-5. how short / medium / long map onto the LeRobot route, whose `[run] steps` is 0 and whose
-   `checkpoint_at` must be a multiple series (`lerobot-train` saves at one `--save_freq`).
+5. how short / medium / long map onto the LeRobot route: settled by Y5 — `[run] steps` > 0 and
+   every mark a multiple of the first (`lerobot-train` saves at one `--save_freq`); the presets
+   are [2500, 5000], [10000, 20000], [20000, 40000, 60000];
+6. **owner decision:** which observation route the cube template uses (section 4) — and, for the
+   camera-only route, how the expert gate gets a bundle it accepts (packet Y5 found that no four
+   committed documents make one: `XIR-040` under `evaluation-v8.toml`, `XIR-010` for
+   `observation-v8.toml` with `learning.toml`).
