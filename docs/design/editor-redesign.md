@@ -192,17 +192,20 @@ code**. New view-models, each headless-tested:
 `app.rs` (2,456 lines) is split by screen into `ui/` (shell, home, train, results, advanced),
 all drawing.
 
-**Context budget (§1.5).** `es-editor` counts 8,238 source lines today (warn 6,000, cap
-10,000); S1 adds 2,000–3,000. Instead of a new crate — which would need a layer 13 and a change
-to §4.2 and Appendix C.8, since same-layer dependencies are forbidden — the editor returns code
-it holds on its owners' behalf:
+**Code the editor holds on its owners' behalf goes back to them.** `es-editor` counts 6,128
+lines by §1.5's measure today (code lines: no blank, comment-only or test lines; warn 6,000,
+cap 10,000), and S1 adds roughly 2,000–2,500, so the cap does not force this; the owner chose
+it for ownership and to remove a duplicate:
 
 - `replay_view`'s CPU rasterizer (its shading is `es_render::cpu::shade_lambert` re-implemented)
-  moves to `es-render`'s `cpu` module;
-- `run_view`'s reading of a finished run (the owner of `report.json` and `events.json` is
-  `es-eval`) moves to `es-eval`.
+  moves to a `raster` module of `es-render`; the trajectory posing, which needs `es-env`
+  (layer 9), stays in the editor;
+- `run_view`'s reading of a finished run moves to `es-eval`, which writes those files
+  (`report.json`, `events.json`, `frames/`), together with `Rgb8Image`, the frame format's
+  in-memory form. Strings a person reads stay in the editor.
 
-About 2,000 lines leave the editor; no layer changes.
+No layer changes. (An earlier draft of this note said 8,238 lines; that is the count with
+blank and comment lines, not §1.5's.)
 
 ### 6.2 Project and template
 
@@ -275,7 +278,8 @@ changed `[eval] checkpoint` is an item the plan verifies by running it.
 | 3 | amber — *not responding* | the process is alive but no telemetry for T s | wait, or stop |
 | 4 | amber — *slow* | samples/s below a third of the run's median, after warm-up | check other GPU programs |
 | 5 | amber — *stopped learning* | the loss has not fallen over a window | more data |
-| 6 | green — *going well* | none of the above | — |
+| 6 | grey — *starting* | no progress frame has arrived yet, and fewer than T s have passed | — |
+| 7 | green — *going well* | none of the above | — |
 
 T and rule 5's window are **not guessed**: the curve of the real acceptance run is recorded,
 and "replaying a successful run is green from start to finish" is a test the thresholds must
@@ -318,6 +322,10 @@ Reads `runs/NNN/eval/`: `report.json`, the new `episodes.json`, `frames/`, `traj
   cell, seed, termination, failure-kind counts, Safety Plane violations and fallbacks, steps,
   the frames directory and the trajectory path when recorded.
 - The vision-route cycle recipe for the cube template, and `templates/cube-into-bin.toml`.
+- `es policy init`: builds the bundle a cycle's `[collect] policy` names from the committed
+  documents. A fresh checkout has no way to make one today (`untrained.esb` has come from
+  test helpers and server artifacts), and the collect stage needs it for its Deployment IR —
+  the Safety Plane the demonstrator runs under — even when the policy itself never acts.
 
 ### 6.7 Errors
 
