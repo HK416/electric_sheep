@@ -52,9 +52,25 @@ pub fn pick_dir() -> Option<PathBuf> {
     rfd::FileDialog::new().pick_folder()
 }
 
+/// Where to save a new file (packet M12/Y13: exporting a policy), suggesting `default_name`
+/// and filtered to `(name, extensions)`. The OS dialog asks before overwriting.
+#[cfg(all(feature = "file-dialogs", any(windows, target_os = "macos")))]
+pub fn save_file(default_name: &str, filter: (&str, &[&str])) -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_file_name(default_name)
+        .add_filter(filter.0, filter.1)
+        .save_file()
+}
+
 /// The `cfg`-off twin: no dialog, so nothing is picked.
 #[cfg(not(all(feature = "file-dialogs", any(windows, target_os = "macos"))))]
 pub fn pick_file(_filter: (&str, &[&str])) -> Option<PathBuf> {
+    None
+}
+
+/// The `cfg`-off twin of [`save_file`].
+#[cfg(not(all(feature = "file-dialogs", any(windows, target_os = "macos"))))]
+pub fn save_file(_default_name: &str, _filter: (&str, &[&str])) -> Option<PathBuf> {
     None
 }
 

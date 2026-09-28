@@ -261,6 +261,10 @@ impl TabViewer for Panes<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, pane: &mut Pane) {
         let app = &mut *self.0;
+        // ⑤ draws its own step panel, viewport and summary (packet M12/Y13).
+        if crate::ui::results::draw(app, ui, *pane) {
+            return;
+        }
         match pane {
             Pane::Viewport => viewport(app, ui),
             Pane::StepPanel => step_panel(app, ui),

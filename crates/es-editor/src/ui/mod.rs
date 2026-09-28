@@ -8,6 +8,7 @@
 
 pub mod advanced;
 pub mod home;
+pub mod results;
 pub mod shell;
 
 use eframe::egui;

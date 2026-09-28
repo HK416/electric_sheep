@@ -1,0 +1,641 @@
+//! ⑤ Results (packet M12/Y13, `docs/design/editor-redesign.md` section 6.5): the run list, the
+//! verdict card and why attempts failed on the left; the player and every attempt as a tile in
+//! the centre; success per situation, and folded the report's numbers and the run's hashes, on
+//! the right.
+//!
+//! Drawing only. Which run is shown and what it is compared with, what each line says, which
+//! views an attempt can be played in, which attempt opens first and which policy file Export
+//! copies are [`crate::model::results`]'s, under test.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::SystemTime;
+
+use eframe::egui;
+use egui::load::SizedTexture;
+use egui::{Color32, Pos2, Rect, RichText, Sense, Vec2};
+use es_render::raster::{Camera, BACKGROUND};
+
+use crate::app::EditorApp;
+use crate::model::dialogs;
+use crate::model::i18n::{fill, t, Lang};
+use crate::model::labels::{self, Browse};
+use crate::model::layout::{self, Pane};
+use crate::model::project::{RunFolder, StartSettings};
+use crate::model::replay_view::ReplayView;
+use crate::model::results::{self, RunResults, TileFilter, View};
+use crate::model::template;
+use crate::model::workflow::{Phase, PhaseState};
+use crate::ui::advanced::{
+    metric_text, paint_timeline, replay_canvas, rgb_texture, short_hash, REPLAY_RATE_HZ,
+    SHOWCASE_CAMERA,
+};
+
+const GREEN: Color32 = Color32::from_rgb(120, 200, 120);
+const RED: Color32 = Color32::from_rgb(230, 120, 110);
+/// A tile's thumbnail width, in points.
+const TILE: f32 = 96.0;
+
+/// Where a run was read from, and `report.json`'s time then: evaluating again into the same
+/// folder is read again.
+type Stamp = (PathBuf, Option<SystemTime>);
+
+/// ⑤ between frames. It belongs to one project; opening another starts afresh.
+#[derive(Default)]
+pub struct State {
+    project: Option<PathBuf>,
+    /// The egui pass disk was last looked at in: three panes draw a frame, disk is read once.
+    pass: Option<u64>,
+    runs: Vec<RunFolder>,
+    /// The run picked from the list; `None` follows the newest.
+    chosen: Option<u32>,
+    shown: Option<(Stamp, Result<RunResults, String>)>,
+    filter: TileFilter,
+    player: Option<Player>,
+    /// Each tile's last picture, decoded once; `None` when it has none.
+    thumbs: BTreeMap<String, Option<egui::TextureHandle>>,
+    /// The settings Run again hands to ③'s Start panel (packet M12/Y12 takes them).
+    pub run_again: Option<StartSettings>,
+}
+
+impl std::fmt::Debug for State {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("State")
+            .field("project", &self.project)
+            .field("chosen", &self.chosen)
+            .finish_non_exhaustive()
+    }
+}
+
+/// One attempt, playing.
+struct Player {
+    cell: String,
+    frames: usize,
+    views: Vec<View>,
+    view: View,
+    replay: Option<ReplayView>,
+    /// Why the motion could not be replayed, in the loader's own words.
+    note: Option<String>,
+    /// The playhead when there is no motion to carry it.
+    index: usize,
+    camera: Camera,
+    picture: Option<((usize, Camera), egui::TextureHandle)>,
+    eye: Option<(usize, Option<egui::TextureHandle>)>,
+}
+
+impl Player {
+    fn open(shown: &RunResults, cell: String) -> Self {
+        let row = shown.dir.cells().iter().find(|c| c.name == cell);
+        let frames = row.map_or(0, |r| r.frames);
+        let (replay, note) = match (row.is_some_and(|r| r.has_traj), &shown.scene) {
+            (true, Some(scene)) => match ReplayView::open(scene, &shown.dir.traj_path(&cell)) {
+                Ok(view) => (Some(view), None),
+                Err(e) => (None, Some(e.to_string())),
+            },
+            _ => (None, None),
+        };
+        let views = results::views(replay.is_some(), frames);
+        Self {
+            view: views.first().copied().unwrap_or(View::Outside),
+            views,
+            cell,
+            frames,
+            replay,
+            note,
+            index: 0,
+            camera: SHOWCASE_CAMERA,
+            picture: None,
+            eye: None,
+        }
+    }
+
+    fn tick(&self) -> usize {
+        self.replay.as_ref().map_or(self.index, |r| r.tick)
+    }
+
+    fn len(&self) -> usize {
+        self.replay.as_ref().map_or(self.frames, ReplayView::ticks)
+    }
+}
+
+/// Draws `pane` when ⑤ is the open step and the pane is one of its three; `false` leaves it
+/// to the shell.
+pub fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
+    let ours = matches!(pane, Pane::StepPanel | Pane::Viewport | Pane::Summary);
+    if !ours
+        || app
+            .project
+            .as_ref()
+            .is_none_or(|p| p.phase != Phase::Results)
+    {
+        return false;
+    }
+    refresh(app, ui.ctx().cumulative_pass_nr());
+    match pane {
+        Pane::StepPanel => step_panel(app, ui),
+        Pane::Viewport => viewport(app, ui),
+        _ => summary(app, ui),
+    }
+    true
+}
+
+/// Lists the project's finished runs and reads the one shown, when it is not what was read.
+fn refresh(app: &mut EditorApp, pass: u64) {
+    let Some(open) = &app.project else { return };
+    let s = &mut app.results;
+    if s.pass == Some(pass) {
+        return;
+    }
+    if s.project.as_ref() != Some(&open.project.root) {
+        *s = State {
+            project: Some(open.project.root.clone()),
+            ..State::default()
+        };
+    }
+    s.pass = Some(pass);
+    s.runs = results::finished_runs(&open.project);
+    let Some(run) = results::shown(&s.runs, s.chosen) else {
+        s.shown = None;
+        s.player = None;
+        return;
+    };
+    let modified = std::fs::metadata(run.report_path())
+        .and_then(|m| m.modified())
+        .ok();
+    let stamp = (run.path.clone(), modified);
+    if s.shown.as_ref().is_some_and(|(k, _)| *k == stamp) {
+        return;
+    }
+    let read = RunResults::read(&open.project, run, template::templates_root().as_deref());
+    s.thumbs.clear();
+    s.player = read.as_ref().ok().and_then(|r| {
+        let cell = results::first_to_play(r.rows.as_deref(), r.dir.cells())?;
+        Some(Player::open(r, cell))
+    });
+    s.shown = Some((stamp, read));
+}
+
+/// Left: the run list, the verdict, the acceptance lines, why attempts failed, the buttons.
+fn step_panel(app: &mut EditorApp, ui: &mut egui::Ui) {
+    let lang = app.settings.lang;
+    ui.heading(layout::step_text(lang, Phase::Results, &PhaseState::Done));
+    let s = &mut app.results;
+    let current = results::shown(&s.runs, s.chosen).map(|r| r.number);
+    let mut picked = None;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(t(lang, "results.run"));
+        for run in &s.runs {
+            let label = format!("{:03}", run.number);
+            if ui
+                .selectable_label(current == Some(run.number), label)
+                .clicked()
+            {
+                picked = Some(run.number);
+            }
+        }
+    });
+    if picked.is_some() {
+        s.chosen = picked;
+        ui.ctx().request_repaint();
+    }
+    let shown = match &s.shown {
+        None => {
+            ui.label(t(lang, "results.none"));
+            return;
+        }
+        Some((_, Err(e))) => {
+            ui.colored_label(RED, e);
+            return;
+        }
+        Some((_, Ok(shown))) => shown,
+    };
+    let mut run_again = None;
+    let mut status = None;
+    egui::ScrollArea::vertical()
+        .id_salt("results-left")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            verdict(lang, ui, shown);
+            ui.separator();
+            if let Some(rows) = shown.rows.as_deref() {
+                ui.strong(t(lang, "results.why"));
+                let causes = results::causes(rows);
+                if causes.is_empty() {
+                    ui.label(t(lang, "results.no_failures"));
+                }
+                for (cause, n) in causes {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new(t(lang, labels::cause_key(cause))).strong());
+                        ui.weak(fill(lang, "results.times", &[&n.to_string()]));
+                    });
+                    ui.weak(t(lang, labels::cause_advice_key(cause)));
+                }
+                ui.separator();
+            }
+            let reason = if dialogs::AVAILABLE {
+                "results.no_export"
+            } else {
+                "open.no_dialog.hint"
+            };
+            let export = ui
+                .add_enabled(
+                    dialogs::AVAILABLE && shown.export.is_some(),
+                    egui::Button::new(t(lang, "results.export")),
+                )
+                .on_hover_text(t(lang, "results.export.hint"))
+                .on_disabled_hover_text(t(lang, reason));
+            if let (true, Some(bundle), Some(open)) =
+                (export.clicked(), &shown.export, &app.project)
+            {
+                let name = results::export_name(&open.project, &shown.run, bundle);
+                if let Some(dest) = dialogs::save_file(&name, Browse::Policy.filter()) {
+                    // ponytail: copied on the UI thread; a bundle is tens of MB, well under a
+                    // second. A background copy when bundles grow past that.
+                    status = Some(match std::fs::copy(bundle, &dest) {
+                        Ok(_) => fill(lang, "results.exported", &[&dest.display().to_string()]),
+                        Err(e) => format!("{}: {e}", dest.display()),
+                    });
+                }
+            }
+            if ui
+                .button(t(lang, "results.run_again"))
+                .on_hover_text(t(lang, "results.run_again.hint"))
+                .clicked()
+            {
+                run_again = Some(shown.settings);
+            }
+        });
+    if let Some(status) = status {
+        app.status = status;
+    }
+    if let Some(settings) = run_again {
+        app.results.run_again = settings;
+        if let Some(open) = app.project.as_mut() {
+            open.phase = Phase::Train;
+        }
+    }
+}
+
+/// The card: passed or not, "x of n", the change from the previous run, each acceptance line.
+fn verdict(lang: Lang, ui: &mut egui::Ui, shown: &RunResults) {
+    let card = results::card(&shown.dir.report, shown.rows.as_deref());
+    let colour = if card.passed { GREEN } else { RED };
+    ui.label(
+        RichText::new(t(lang, card.verdict_key()))
+            .heading()
+            .color(colour),
+    );
+    ui.label(fill(
+        lang,
+        "results.headline",
+        &[&card.successes.to_string(), &card.episodes.to_string()],
+    ));
+    let previous = shown.previous.as_ref().map_or(0, |(n, _)| *n);
+    if let Some(change) = results::change_text(lang, &shown.comparison(), previous) {
+        ui.label(change);
+    }
+    ui.add_space(6.0);
+    ui.strong(t(lang, "results.to_pass"))
+        .on_hover_text(t(lang, "results.acceptance.hint"));
+    for line in &shown.dir.report.acceptance {
+        let line = results::acceptance_line(lang, line, shown.ir.as_ref());
+        let (mark, colour) = match line.passed {
+            Some(true) => ("\u{2714}", GREEN),
+            Some(false) => ("\u{2716}", RED),
+            None => ("\u{2013}", Color32::GRAY),
+        };
+        ui.colored_label(colour, format!("{mark} {}", line.text))
+            .on_hover_text(line.raw);
+    }
+}
+
+/// Centre: the player, its timeline, and the tiles.
+fn viewport(app: &mut EditorApp, ui: &mut egui::Ui) {
+    let lang = app.settings.lang;
+    let dt = f64::from(ui.input(|i| i.stable_dt));
+    let s = &mut app.results;
+    let Some((_, Ok(shown))) = &s.shown else {
+        ui.label(t(lang, "results.none"));
+        return;
+    };
+    let mut pick = None;
+    match s.player.as_mut() {
+        Some(player) => play(lang, ui, dt, shown, player, &mut pick),
+        None => {
+            ui.weak(t(lang, "results.nothing_recorded"));
+        }
+    }
+    ui.separator();
+    let playing = s.player.as_ref().map(|p| p.cell.as_str());
+    tiles(
+        lang,
+        ui,
+        shown,
+        &mut s.filter,
+        &mut s.thumbs,
+        playing,
+        &mut pick,
+    );
+    if let Some(cell) = pick {
+        s.player = Some(Player::open(shown, cell));
+    }
+}
+
+fn play(
+    lang: Lang,
+    ui: &mut egui::Ui,
+    dt: f64,
+    shown: &RunResults,
+    p: &mut Player,
+    pick: &mut Option<String>,
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.label(t(lang, "results.attempt"));
+        egui::ComboBox::from_id_salt("results-attempt")
+            .selected_text(&p.cell)
+            .show_ui(ui, |ui| {
+                for cell in shown.dir.cells() {
+                    if ui
+                        .selectable_label(cell.name == p.cell, &cell.name)
+                        .clicked()
+                    {
+                        *pick = Some(cell.name.clone());
+                    }
+                }
+            });
+        ui.separator();
+        for view in p.views.clone() {
+            ui.selectable_value(&mut p.view, view, t(lang, view.key()));
+        }
+        if let Some(replay) = p.replay.as_mut() {
+            ui.separator();
+            let key = if replay.playing {
+                "replay.pause"
+            } else {
+                "replay.play"
+            };
+            if ui.button(t(lang, key)).clicked() {
+                replay.playing = !replay.playing;
+            }
+            for speed in results::SPEEDS {
+                ui.selectable_value(&mut replay.speed, speed, format!("{speed}\u{d7}"));
+            }
+        }
+    });
+    if p.views.is_empty() {
+        ui.weak(t(lang, "results.nothing_recorded"));
+    }
+    if let Some(note) = &p.note {
+        ui.weak(note);
+    }
+    if let Some(replay) = p.replay.as_mut() {
+        replay.advance(dt, REPLAY_RATE_HZ);
+        if replay.playing {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    let size = Vec2::new(
+        ui.available_width(),
+        (ui.available_height() * 0.6).max(160.0),
+    );
+    let half = Vec2::new(size.x / 2.0 - 4.0, size.y);
+    match (p.view, p.replay.as_ref()) {
+        (View::Outside, Some(replay)) => {
+            replay_canvas(ui, size, replay, &mut p.camera, &mut p.picture);
+        }
+        (View::SideBySide, Some(replay)) => {
+            ui.horizontal(|ui| {
+                replay_canvas(ui, half, replay, &mut p.camera, &mut p.picture);
+                let tick = replay.tick;
+                eye(ui, half, shown, &p.cell, p.frames, tick, &mut p.eye);
+            });
+        }
+        (View::Eye, _) => {
+            let tick = p.tick();
+            eye(ui, size, shown, &p.cell, p.frames, tick, &mut p.eye);
+        }
+        (View::Outside | View::SideBySide, None) => {}
+    }
+
+    let len = p.len();
+    if len > 0 {
+        let n = (ui.available_width() / 4.0) as usize;
+        paint_timeline(lang, ui, &shown.dir.timeline(&p.cell).buckets(n));
+        let mut at = p.tick();
+        ui.spacing_mut().slider_width = (ui.available_width() - 60.0).max(80.0);
+        if ui.add(egui::Slider::new(&mut at, 0..=len - 1)).changed() {
+            match p.replay.as_mut() {
+                Some(replay) => {
+                    replay.tick = at;
+                    replay.playing = false;
+                }
+                None => p.index = at,
+            }
+        }
+    }
+}
+
+/// The policy's own picture at `tick`, fitted into `size` with its aspect kept.
+fn eye(
+    ui: &mut egui::Ui,
+    size: Vec2,
+    shown: &RunResults,
+    cell: &str,
+    frames: usize,
+    tick: usize,
+    cache: &mut Option<(usize, Option<egui::TextureHandle>)>,
+) {
+    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
+    ui.painter()
+        .rect_filled(rect, 0.0, Color32::from_gray(BACKGROUND));
+    let Some(index) = results::frame_at(tick, frames) else {
+        return;
+    };
+    if cache.as_ref().is_none_or(|(i, _)| *i != index) {
+        let texture = shown
+            .dir
+            .frame(cell, index)
+            .map(|img| rgb_texture(ui.ctx(), "results-eye", &img));
+        *cache = Some((index, texture));
+    }
+    if let Some((_, Some(texture))) = cache {
+        let px = texture.size_vec2();
+        let scale = (size.x / px.x).min(size.y / px.y);
+        ui.painter().image(
+            texture.id(),
+            Rect::from_center_size(rect.center(), px * scale),
+            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+            Color32::WHITE,
+        );
+    }
+}
+
+/// Every attempt as a tile, its last picture as the thumbnail; an old run says why there are
+/// none.
+fn tiles(
+    lang: Lang,
+    ui: &mut egui::Ui,
+    shown: &RunResults,
+    filter: &mut TileFilter,
+    thumbs: &mut BTreeMap<String, Option<egui::TextureHandle>>,
+    playing: Option<&str>,
+    pick: &mut Option<String>,
+) {
+    ui.horizontal(|ui| {
+        ui.strong(t(lang, "results.tiles"));
+        for f in TileFilter::ALL {
+            ui.selectable_value(filter, f, t(lang, f.key()));
+        }
+    });
+    let Some(rows) = shown.rows.as_deref() else {
+        ui.weak(
+            shown
+                .rows_error
+                .as_deref()
+                .unwrap_or(t(lang, "results.old_run")),
+        );
+        return;
+    };
+    let ctx = ui.ctx().clone();
+    egui::ScrollArea::vertical()
+        .id_salt("results-tiles")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for tile in results::tiles(rows, *filter) {
+                    let frames = shown
+                        .dir
+                        .cells()
+                        .iter()
+                        .find(|c| c.name == tile.cell)
+                        .map_or(0, |c| c.frames);
+                    let thumb = thumbs.entry(tile.cell.clone()).or_insert_with(|| {
+                        let last = results::frame_at(usize::MAX, frames)?;
+                        let img = shown.dir.frame(&tile.cell, last)?;
+                        Some(rgb_texture(&ctx, &tile.cell, &img))
+                    });
+                    ui.vertical(|ui| {
+                        ui.set_width(TILE);
+                        let mark = if tile.success { "\u{2714}" } else { "\u{2716}" };
+                        let button = match thumb {
+                            Some(texture) => {
+                                let px = texture.size_vec2();
+                                egui::Button::image(SizedTexture::new(
+                                    texture.id(),
+                                    px * (TILE / px.x),
+                                ))
+                            }
+                            None => egui::Button::new(mark).min_size(Vec2::splat(TILE)),
+                        };
+                        let hover = results::suite_label(lang, &tile.suite, shown.ir.as_ref());
+                        if ui
+                            .add(button.selected(playing == Some(tile.cell.as_str())))
+                            .on_hover_text(hover)
+                            .clicked()
+                        {
+                            *pick = Some(tile.cell.clone());
+                        }
+                        let (colour, word) = match (tile.success, tile.cause) {
+                            (true, _) => (GREEN, t(lang, "results.tile.success")),
+                            (false, Some(cause)) => (RED, t(lang, labels::cause_key(cause))),
+                            (false, None) => (RED, t(lang, "results.tile.failure")),
+                        };
+                        // One line each, the whole of it on hover: a tile is a thumbnail wide.
+                        let name = RichText::new(format!("{mark} {}", tile.cell)).color(colour);
+                        ui.add(egui::Label::new(name).truncate());
+                        ui.add(egui::Label::new(RichText::new(word).small()).truncate());
+                    });
+                }
+            });
+        });
+}
+
+/// Right: success per situation; folded, the report's numbers and the run's settings and
+/// hashes.
+fn summary(app: &mut EditorApp, ui: &mut egui::Ui) {
+    let lang = app.settings.lang;
+    // The left pane says why when there is nothing to show.
+    let Some((_, Ok(shown))) = &app.results.shown else {
+        return;
+    };
+    let report = &shown.dir.report;
+    let ir = shown.ir.as_ref();
+    // Both ways: the numbers table is wider than a narrow side pane.
+    egui::ScrollArea::both()
+        .id_salt("results-right")
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.heading(t(lang, "results.situations"));
+            for s in results::situations(report, shown.rows.as_deref(), ir) {
+                ui.label(results::suite_label(lang, &s.suite, ir))
+                    .on_hover_text(&s.suite);
+                if s.episodes == 0 {
+                    ui.weak(t(lang, "results.not_measured"));
+                    continue;
+                }
+                let fraction = s.successes as f32 / s.episodes as f32;
+                ui.add(
+                    egui::ProgressBar::new(fraction)
+                        .text(format!("{} / {}", s.successes, s.episodes)),
+                );
+            }
+            ui.separator();
+            egui::CollapsingHeader::new(t(lang, "results.details"))
+                .id_salt("results-details")
+                .show(ui, |ui| {
+                    egui::Grid::new("results-details-grid")
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for cell in &report.cells {
+                                ui.label(results::suite_label(lang, &cell.suite, ir))
+                                    .on_hover_text(&cell.suite);
+                                ui.label(labels::metric_label(lang, cell.metric))
+                                    .on_hover_text(cell.metric.name());
+                                ui.label(metric_text(lang, &cell.value));
+                                ui.end_row();
+                            }
+                        });
+                });
+            egui::CollapsingHeader::new(t(lang, "results.settings"))
+                .id_salt("results-settings")
+                .show(ui, |ui| {
+                    let none = || t(lang, "value.none").to_owned();
+                    let cycle = shown.cycle.as_ref();
+                    let demonstrations = cycle
+                        .and_then(|c| c.collect.as_ref())
+                        .map_or_else(none, |c| c.episodes.to_string());
+                    let steps = cycle
+                        .and_then(|c| c.train.run.as_ref())
+                        .map_or_else(none, |r| r.steps.to_string());
+                    egui::Grid::new("results-settings-grid").show(ui, |ui| {
+                        ui.label(t(lang, "results.demonstrations"));
+                        ui.label(demonstrations);
+                        ui.end_row();
+                        ui.label(t(lang, "results.steps"));
+                        ui.label(steps);
+                        ui.end_row();
+                        for (key, hint, hash) in [
+                            (
+                                "results.evaluation_hash",
+                                "results.evaluation_hash.hint",
+                                &report.evaluation_hash,
+                            ),
+                            (
+                                "results.execution_hash",
+                                "results.execution_hash.hint",
+                                &report.execution_hash,
+                            ),
+                        ] {
+                            ui.label(t(lang, key)).on_hover_text(t(lang, hint));
+                            ui.monospace(short_hash(Ok(hash)))
+                                .on_hover_text(es_compile::bundle::hex(hash));
+                            ui.end_row();
+                        }
+                        ui.label(t(lang, "results.folder"));
+                        ui.label(shown.run.path.display().to_string());
+                        ui.end_row();
+                    });
+                });
+        });
+}
