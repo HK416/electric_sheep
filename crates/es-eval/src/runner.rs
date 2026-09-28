@@ -707,7 +707,7 @@ impl Evaluation {
                 let mut inference = AsyncInference::new(latency, domains.inference.batch);
                 // One cell of the mosaic is one episode of one suite: `single_env()` makes
                 // them independent runs, so the grid is `suites x episodes` directories.
-                let name = format!("{}-{idx:02}", suite.name);
+                let name = cell_name(&suite.name, idx as u64);
                 let mut cell_frames = frames_dir.map(|d| CellFrames {
                     dir: d.join(&name),
                     n: 0,
@@ -943,8 +943,15 @@ fn refuse_augmentation(ir: &EvaluationIr, obs: &ObservationIr) -> Result<(), Eva
     Ok(())
 }
 
+/// One episode of one suite's name, `<suite>-<NN>`: the key of `frames/<cell>/`,
+/// `traj/<cell>.estraj`, `events.json` and `episodes.json`. `episode` indexes the resolved seed
+/// list (§10.2).
+pub fn cell_name(suite: &str, episode: u64) -> String {
+    format!("{suite}-{episode:02}")
+}
+
 /// §10.2 `seed_base` / explicit seeds, resolved to one seed per episode.
-fn resolve_seeds(ir: &EvaluationIr) -> Vec<u64> {
+pub(crate) fn resolve_seeds(ir: &EvaluationIr) -> Vec<u64> {
     match &ir.episodes.seeds {
         SeedPlan::Base(base) => (0..u64::from(ir.episodes.n_episodes))
             .map(|i| base.wrapping_add(i))
