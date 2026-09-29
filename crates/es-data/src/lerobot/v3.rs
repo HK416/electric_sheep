@@ -511,11 +511,22 @@ fn feature_stats(values: &[f64], width: usize, nest: bool) -> serde_json::Value 
     })
 }
 
-/// `data/chunk-000/file-000.parquet`: every episode, one row group.
+/// One output column's values over every frame, before they are cut into row groups.
+enum Values {
+    /// `elems` values per frame: `1` is a scalar column, more is a list.
+    Plain(Column, usize),
+    /// One PNG per frame; the struct's `path` leaf is null on every row.
+    Image(Vec<ByteArray>),
+}
+
+/// `data/chunk-000/file-000.parquet`: every episode, **one row group per episode**, in episode
+/// order — what `LeRobot`'s own writer does. One row group for the whole file measured 2.9 GB at
+/// 200 demonstrations of 96x96 pixels, and pyarrow cannot materialise a nested column past 2 GB
+/// out of one row group (packet `M12/P-M12-R1`).
 ///
-/// Returns `meta/stats.json`'s body, computed from the same values in the same pass — the
-/// file is normalization statistics and a second traversal would be a second chance for the
-/// two to disagree.
+/// Returns `meta/stats.json`'s body, computed over **all** rows from the same values that are
+/// written — the file is normalization statistics and a second traversal would be a second
+/// chance for the two to disagree.
 fn write_data(
     path: &Path,
     fields: Vec<TypePtr>,
@@ -524,34 +535,19 @@ fn write_data(
     metas: &[EpisodeMeta],
 ) -> Result<serde_json::Map<String, serde_json::Value>, DataError> {
     let n: usize = metas.iter().map(|m| m.length as usize).sum();
-    let schema = Type::group_type_builder("lerobot")
-        .with_fields(fields)
-        .build()
-        .map(Arc::new)
-        .map_err(|e| pq(path, e))?;
-    let file = create(path)?;
-    let props = Arc::new(WriterProperties::builder().build());
-    let mut writer = SerializedFileWriter::new(file, schema, props).map_err(|e| pq(path, e))?;
-    let mut rg = writer.next_row_group().map_err(|e| pq(path, e))?;
     let mut stats = serde_json::Map::new();
+    let mut columns = Vec::with_capacity(plan.len());
 
     for col in plan {
         match col {
             Col::Reserved(name) => {
-                let def = vec![1i16; n];
-                let mut w = next_col!(rg, path);
-                if name == "timestamp" {
-                    let v: Vec<f64> = episodes.iter().flat_map(|e| e.timestamps.clone()).collect();
-                    stats.insert(name.clone(), feature_stats(&v, 1, false));
-                    w.typed::<DoubleType>().write_batch(&v, Some(&def), None)
+                let values = if name == "timestamp" {
+                    Column::F64(episodes.iter().flat_map(|e| e.timestamps.clone()).collect())
                 } else {
-                    let v = reserved_i64(name, episodes);
-                    let as_f64: Vec<f64> = v.iter().map(|i| *i as f64).collect();
-                    stats.insert(name.clone(), feature_stats(&as_f64, 1, false));
-                    w.typed::<Int64Type>().write_batch(&v, Some(&def), None)
-                }
-                .map_err(|e| pq(path, e))?;
-                w.close().map_err(|e| pq(path, e))?;
+                    Column::I64(reserved_i64(name, episodes))
+                };
+                stats.insert(name.clone(), feature_stats(&as_f64(&values), 1, false));
+                columns.push((name, Values::Plain(values, 1)));
             }
             Col::Feature {
                 name,
@@ -559,28 +555,8 @@ fn write_data(
                 source_elems,
             } => {
                 let values = narrow(concat(episodes, name)?, *source_elems, *elems);
-                if values.len() != n * elems {
-                    return Err(bad(format!(
-                        "{name:?}: {} values for {n} frames of {elems}",
-                        values.len()
-                    )));
-                }
                 stats.insert(name.clone(), feature_stats(&as_f64(&values), *elems, false));
-                let (def, rep) = if *elems == 1 {
-                    (vec![1i16; n], None)
-                } else {
-                    (vec![3i16; n * elems], Some(rep_levels(n, *elems)))
-                };
-                let rep = rep.as_deref();
-                let mut w = next_col!(rg, path);
-                match &values {
-                    Column::F32(v) => w.typed::<FloatType>().write_batch(v, Some(&def), rep),
-                    Column::F64(v) => w.typed::<DoubleType>().write_batch(v, Some(&def), rep),
-                    Column::I64(v) => w.typed::<Int64Type>().write_batch(v, Some(&def), rep),
-                    Column::Bool(v) => w.typed::<BoolType>().write_batch(v, Some(&def), rep),
-                }
-                .map_err(|e| pq(path, e))?;
-                w.close().map_err(|e| pq(path, e))?;
+                columns.push((name, Values::Plain(values, *elems)));
             }
             Col::Image {
                 name,
@@ -629,22 +605,85 @@ fn write_data(
                         "count": [n],
                     }),
                 );
-                let mut w = next_col!(rg, path);
-                w.typed::<ByteArrayType>()
-                    .write_batch(&pngs, Some(&vec![2i16; n]), None)
-                    .map_err(|e| pq(path, e))?;
-                w.close().map_err(|e| pq(path, e))?;
-                // `path` is null on every row: `datasets.Image()` decodes `bytes` and never
-                // looks at it (api-note, "Image features without ffmpeg or torchcodec").
-                let mut w = next_col!(rg, path);
-                w.typed::<ByteArrayType>()
-                    .write_batch(&[], Some(&vec![1i16; n]), None)
-                    .map_err(|e| pq(path, e))?;
-                w.close().map_err(|e| pq(path, e))?;
+                columns.push((name, Values::Image(pngs)));
             }
         }
     }
-    rg.close().map_err(|e| pq(path, e))?;
+    for (name, values) in &columns {
+        if let Values::Plain(values, elems) = values {
+            if values.len() != n * elems {
+                return Err(bad(format!(
+                    "{name:?}: {} values for {n} frames of {elems}",
+                    values.len()
+                )));
+            }
+        }
+    }
+
+    let schema = Type::group_type_builder("lerobot")
+        .with_fields(fields)
+        .build()
+        .map(Arc::new)
+        .map_err(|e| pq(path, e))?;
+    let file = create(path)?;
+    let props = Arc::new(WriterProperties::builder().build());
+    let mut writer = SerializedFileWriter::new(file, schema, props).map_err(|e| pq(path, e))?;
+    let mut from = 0usize;
+    for meta in metas {
+        let to = from + meta.length as usize;
+        let rows = to - from;
+        let mut rg = writer.next_row_group().map_err(|e| pq(path, e))?;
+        for (_, values) in &columns {
+            match values {
+                Values::Plain(values, elems) => {
+                    let (start, end) = (from * elems, to * elems);
+                    let (def, rep) = if *elems == 1 {
+                        (vec![1i16; rows], None)
+                    } else {
+                        (vec![3i16; rows * elems], Some(rep_levels(rows, *elems)))
+                    };
+                    let rep = rep.as_deref();
+                    let mut w = next_col!(rg, path);
+                    match values {
+                        Column::F32(v) => {
+                            w.typed::<FloatType>()
+                                .write_batch(&v[start..end], Some(&def), rep)
+                        }
+                        Column::F64(v) => {
+                            w.typed::<DoubleType>()
+                                .write_batch(&v[start..end], Some(&def), rep)
+                        }
+                        Column::I64(v) => {
+                            w.typed::<Int64Type>()
+                                .write_batch(&v[start..end], Some(&def), rep)
+                        }
+                        Column::Bool(v) => {
+                            w.typed::<BoolType>()
+                                .write_batch(&v[start..end], Some(&def), rep)
+                        }
+                    }
+                    .map_err(|e| pq(path, e))?;
+                    w.close().map_err(|e| pq(path, e))?;
+                }
+                Values::Image(pngs) => {
+                    let mut w = next_col!(rg, path);
+                    w.typed::<ByteArrayType>()
+                        .write_batch(&pngs[from..to], Some(&vec![2i16; rows]), None)
+                        .map_err(|e| pq(path, e))?;
+                    w.close().map_err(|e| pq(path, e))?;
+                    // `path` is null on every row: `datasets.Image()` decodes `bytes` and never
+                    // looks at it (api-note, "Image features without ffmpeg or torchcodec").
+                    let mut w = next_col!(rg, path);
+                    w.typed::<ByteArrayType>()
+                        .write_batch(&[], Some(&vec![1i16; rows]), None)
+                        .map_err(|e| pq(path, e))?;
+                    w.close().map_err(|e| pq(path, e))?;
+                }
+            }
+        }
+        rg.close().map_err(|e| pq(path, e))?;
+        from = to;
+    }
     writer.close().map_err(|e| pq(path, e))?;
     Ok(stats)
 }

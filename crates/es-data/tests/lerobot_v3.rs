@@ -21,7 +21,9 @@ use es_data::{
     LeRobotDataset, LeRobotWriter, Split,
 };
 
-const LENGTHS: [usize; 2] = [4, 3];
+/// Three episodes of different lengths, so a row-group boundary that ignores the episode
+/// boundary cannot line up by accident (packet `M12/P-M12-R1`).
+const LENGTHS: [usize; 3] = [4, 3, 5];
 const NJ: usize = 3;
 const H: u64 = 4;
 const W: u64 = 6;
@@ -248,6 +250,97 @@ fn images_without_frames_are_dropped_not_dangled() {
         json(&out.join("meta/info.json"))["features"][CAMERA].is_null(),
         "the dropped camera must not be declared"
     );
+}
+
+/// Packet M12/P-M12-R1: one row group per episode, each holding exactly that episode's rows,
+/// and every row read back across all row groups, in order, is the fixture's. A single row
+/// group for the whole file measured 2.9 GB at 200 demonstrations, and pyarrow refuses to
+/// materialise a nested column past 2 GB out of one row group.
+#[test]
+fn one_row_group_per_episode() {
+    use parquet::file::reader::{FileReader, SerializedFileReader};
+    use parquet::record::Field;
+
+    let dir = scratch("v3-row-groups");
+    let (src, frames, out) = (dir.join("src"), dir.join("frames"), dir.join("out"));
+    let written = write_fixture(&src, Some(&frames));
+    let dataset = LeRobotDataset::open(&src).expect("open the v2.1 source");
+    export_v3(&dataset, &out, Some(&frames), &ExportOptions::default()).expect("export");
+
+    let data = out.join("data/chunk-000/file-000.parquet");
+    let reader = SerializedFileReader::new(std::fs::File::open(&data).expect("data file"))
+        .expect("parquet footer");
+    let rows: Vec<usize> = reader
+        .metadata()
+        .row_groups()
+        .iter()
+        .map(|g| usize::try_from(g.num_rows()).expect("row count"))
+        .collect();
+    assert_eq!(rows, LENGTHS, "rows per row group");
+    let long = |f: &Field| match f {
+        Field::Long(v) => usize::try_from(*v).expect("a non-negative index"),
+        other => panic!("{other:?}"),
+    };
+
+    let at: Vec<(usize, usize)> = LENGTHS
+        .iter()
+        .enumerate()
+        .flat_map(|(ep, n)| (0..*n).map(move |f| (ep, f)))
+        .collect();
+    let (mut state, mut action) = (Vec::new(), Vec::new());
+    let mut seen = 0;
+    for (global, row) in reader.get_row_iter(None).expect("rows").enumerate() {
+        let row = row.expect("row");
+        let col: BTreeMap<&str, &Field> = row
+            .get_column_iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        let (ep, frame) = at[global];
+        assert_eq!(
+            ["episode_index", "frame_index", "index", "task_index"].map(|c| long(col[c])),
+            [ep, frame, global, 0],
+            "row {global}"
+        );
+        assert_eq!(
+            col["timestamp"],
+            &Field::Double(frame as f64 / FPS),
+            "row {global}"
+        );
+        for (name, into) in [("observation.state", &mut state), ("action", &mut action)] {
+            let Field::ListInternal(list) = col[name] else {
+                panic!("row {global} {name}: {:?}", col[name]);
+            };
+            into.extend(list.elements().iter().map(|v| match v {
+                Field::Float(x) => f64::from(*x),
+                other => panic!("row {global} {name}: {other:?}"),
+            }));
+        }
+        // The image: a PNG of *this* frame's pixels (one stored deflate block at this size, so
+        // the filtered scanlines sit in it verbatim), and a null `path`.
+        let Field::Group(image) = col[CAMERA] else {
+            panic!("row {global} image: {:?}", col[CAMERA]);
+        };
+        let image: BTreeMap<&str, &Field> = image
+            .get_column_iter()
+            .map(|(k, v)| (k.as_str(), v))
+            .collect();
+        assert_eq!(image["path"], &Field::Null, "row {global}");
+        let Field::Bytes(png) = image["bytes"] else {
+            panic!("row {global} bytes: {:?}", image["bytes"]);
+        };
+        let scanlines: Vec<u8> = frame_bytes(global)
+            .chunks((W * 3) as usize)
+            .flat_map(|r| std::iter::once(0).chain(r.iter().copied()))
+            .collect();
+        assert!(
+            png.data().windows(scanlines.len()).any(|w| w == scanlines),
+            "row {global}: the PNG is not frame {global}"
+        );
+        seen += 1;
+    }
+    assert_eq!(seen, total_frames());
+    assert_eq!(state, flat(&written, "observation.state"));
+    assert_eq!(action, flat(&written, "action"));
 }
 
 /// The one value of a flat JSON field, without leaning on `serde_json` for the script's

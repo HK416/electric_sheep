@@ -767,7 +767,12 @@ LEN/NLEN 쌍, Adler-32 — 그래서 인코더는 인터프리터가 필요 없�
 - **청크/파일 분할 없음.** `data/chunk-000/file-000.parquet` 하나와
   `meta/episodes/chunk-000/file-000.parquet` 하나. `data_files_size_in_mb`는 권고값이고(리더는
   `data/*/*.parquet`을 글롭한다), 내보내기는 현재 데이터셋 하나를 메모리에 올린다 — 그 한계는
-  소스에 그대로 표시했다.
+  소스에 그대로 표시했다. 다만 *row group*은 나눈다: 에피소드당 하나(패킷
+  `docs/packets/M12/P-M12-R1-v3-row-groups.md`, 2026-09-29). 처음 만들었을 때 데이터 파일은
+  row group 하나였고, 시연 200개(103,881 프레임)에서 그 row group이 2.9 GB가 되어
+  `lerobot-train`이 `ArrowNotImplementedError`로 실패했다 — pyarrow는 row group 하나에서 2 GB를
+  넘는 중첩 컬럼을 구체화하지 못한다. LeRobot 자체 라이터처럼 에피소드당 row group 하나로 쓰면
+  로드된다.
 - **픽셀이 없는 카메라는 내보내지 않고 버린다.** `es loop collect`는 오늘 픽셀을 쓰지 않으므로
   (7.5절) 픽셀은 `--frames <dir>`에서 온다: `<dir>/<name>/<NNNNNN>.bin`, `EnvRenderer`가 이미
   쓰는 원시 덤프를 `observation.images.<name>`마다 하위 디렉터리 하나로. 그것이 없으면 피처를

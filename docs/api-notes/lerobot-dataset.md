@@ -363,7 +363,9 @@ export --lerobot-v3` therefore writes `image`, never `video`, and calls no encod
 
 The cost is size: a stored-deflate PNG is roughly the raw frame plus 0.1%.
 `data_files_size_in_mb` is advisory (the reader globs), so a single large data file is legal;
-splitting is an optimisation, not a correctness requirement.
+splitting into several *files* is an optimisation, not a correctness requirement. Splitting the
+file into *row groups* is a requirement: one row group of 2.9 GB does not load (see "Parquet
+physical encodings that were accepted" below).
 
 ## `meta/episodes/chunk-XXX/file-XXX.parquet`
 
@@ -471,9 +473,17 @@ Measured against 0.6.1 / pyarrow 25.0.1, writing with `parquet 59.3`'s low-level
 - `optional group X { optional byte_array bytes; optional byte_array path (String); }` for an
   image column, with `path` written as null on every row.
 - Plain `optional` primitives for the five bookkeeping columns and for any `shape: [1]` feature.
-- One row group for the whole file. `write_table_one_row_group_per_episode` is what LeRobot's
-  own writer does (`io_utils.py:295-309`) and is a random-access optimisation, not a
-  requirement.
+- One row group **per episode**, in episode order — what LeRobot's own writer does
+  (`io_utils.py:295-309`, `write_table_one_row_group_per_episode`). This note used to say "one
+  row group for the whole file … a random-access optimisation, not a requirement"; that held
+  only for small exports. Measured 2026-09-29 (lerobot 0.6.1, datasets 4.8.5, pyarrow 25.0.1,
+  packet `docs/packets/M12/P-M12-R1-v3-row-groups.md`): 200 demonstrations, 103,881 frames of
+  96×96 stored-deflate PNG, written as one row group of 2.9 GB, and `lerobot-train` fails with
+  `pyarrow.lib.ArrowNotImplementedError: Nested data conversions not implemented for chunked
+  array outputs` — pyarrow cannot materialise the nested image column past 2 GB out of one
+  row group, and `pq.read_table` fails on the file too. The same rows in row groups of 1,000
+  load all 103,881 frames through `LeRobotDataset`, and so does the export with one row group
+  per episode.
 
 ## `meta/es_provenance.json` — ours, not LeRobot's
 

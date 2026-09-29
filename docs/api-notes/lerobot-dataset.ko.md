@@ -353,7 +353,9 @@ v2.1 필드인 `total_videos`와 `total_chunks`는 v3.0 필드가 *아니며* �
 `~/.local/bin/ffmpeg`도, Rust에서도, 오라클의 Python 쪽에서도.
 
 대가는 크기다. stored-deflate PNG는 원시 프레임 + 약 0.1%다. `data_files_size_in_mb`는 권고값이므로
-(리더는 글롭한다) 큰 데이터 파일 하나도 합법이다. 분할은 최적화이지 정확성 요건이 아니다.
+(리더는 글롭한다) 큰 데이터 파일 하나도 합법이다. 여러 *파일*로 나누는 것은 최적화이지 정확성
+요건이 아니다. 파일을 *row group*으로 나누는 것은 요건이다: 2.9 GB짜리 row group 하나는 로드되지
+않는다(아래 "받아들여진 parquet 물리 인코딩" 참조).
 
 ## `meta/episodes/chunk-XXX/file-XXX.parquet`
 
@@ -456,8 +458,17 @@ v2.1 필드인 `total_videos`와 `total_chunks`는 v3.0 필드가 *아니며* �
 - 이미지 컬럼에 `optional group X { optional byte_array bytes; optional byte_array path (String); }`,
   `path`는 모든 행에서 null.
 - 다섯 부기 컬럼과 모든 `shape: [1]` 피처에 평범한 `optional` 프리미티브.
-- 파일 전체에 로우 그룹 하나. `write_table_one_row_group_per_episode`는 LeRobot 자체 라이터가 하는
-  것이고(`io_utils.py:295-309`) 임의 접근 최적화이지 요건이 아니다.
+- **에피소드당** 로우 그룹 하나, 에피소드 순서대로 — LeRobot 자체 라이터가 하는 방식이다
+  (`io_utils.py:295-309`, `write_table_one_row_group_per_episode`). 이 노트는 전에 "파일 전체에
+  로우 그룹 하나 … 임의 접근 최적화이지 요건이 아니다"라고 했는데, 작은 내보내기에서만 맞는
+  말이었다. 2026-09-29 측정(lerobot 0.6.1, datasets 4.8.5, pyarrow 25.0.1, 패킷
+  `docs/packets/M12/P-M12-R1-v3-row-groups.md`): 시연 200개, 96×96 stored-deflate PNG 103,881
+  프레임을 로우 그룹 하나(2.9 GB)로 쓰면 `lerobot-train`이
+  `pyarrow.lib.ArrowNotImplementedError: Nested data conversions not implemented for chunked
+  array outputs`로 실패한다 — pyarrow는 로우 그룹 하나에서 2 GB를 넘는 중첩 이미지 컬럼을
+  구체화하지 못하고, `pq.read_table`도 그 파일에서 실패한다. 같은 행을 1,000행 로우 그룹으로
+  다시 쓰면 `LeRobotDataset`이 103,881 프레임을 모두 로드하고, 에피소드당 로우 그룹 하나로 쓴
+  내보내기도 로드된다.
 
 ## `meta/es_provenance.json` — 우리 것이고 LeRobot의 것이 아니다
 

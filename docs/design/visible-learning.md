@@ -798,7 +798,12 @@ not survive a LeRobot-side rewrite.
 - **No chunk/file splitting.** One `data/chunk-000/file-000.parquet` and one
   `meta/episodes/chunk-000/file-000.parquet`. `data_files_size_in_mb` is advisory — the reader
   globs `data/*/*.parquet` — and an export currently buffers one dataset in memory, which is
-  marked in the source as the ceiling it is.
+  marked in the source as the ceiling it is. *Row groups* are split, though: one per episode
+  (packet `docs/packets/M12/P-M12-R1-v3-row-groups.md`, 2026-09-29). As first built the data
+  file was one row group, and at 200 demonstrations (103,881 frames) that row group was 2.9 GB
+  and `lerobot-train` failed with `ArrowNotImplementedError` — pyarrow cannot materialise a
+  nested column past 2 GB out of one row group. One row group per episode, which is what
+  LeRobot's own writer does, loads.
 - **A camera with no frames behind it is dropped, not exported.** `es loop collect` writes no
   pixels today (section 7.5), so `--frames <dir>` is where they come from:
   `<dir>/<name>/<NNNNNN>.bin`, the raw dump `EnvRenderer` already writes, one subdirectory per
