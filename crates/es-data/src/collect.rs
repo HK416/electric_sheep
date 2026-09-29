@@ -4,8 +4,8 @@
 //! Read `docs/design/learning-loop.md` first. Two of its rules are the whole module:
 //!
 //! - **The Safety Plane is on the only actuator path** (`INV-12`). [`Collector::run`] drives
-//!   [`es_env::Env::step_with_policy`], and an injected human action is wired in as a
-//!   `PolicyRuntime` wrapper — so it becomes *just another chunk*, bounded by the same
+//!   the phases of [`es_env::Env::step_with_policy`], and an injected human action is wired
+//!   in as a `PolicyRuntime` wrapper — so it becomes *just another chunk*, bounded by the same
 //!   envelope and counted by the same counters as a policy chunk. There is no collect-mode
 //!   branch around `validate`, tests included.
 //! - **The training run is not here.** [`distill`] produces the *input identity* of a
@@ -312,6 +312,97 @@ pub enum CollectEvent {
 /// run of before — nothing is computed for a sink that is not there.
 pub type CollectSink<'a> = &'a mut dyn FnMut(CollectEvent);
 
+/// One moment of a collection under an Evaluation IR's perturbations (packet M13/Z2), for the
+/// caller's [`Perturber`] to answer.
+///
+/// `es_eval::PerturbationPlan` draws them and is layer 10 beside this crate (spec 4.2 forbids
+/// the dependency), so the caller owns the plan and its per-step state the way it owns the
+/// renderer behind a [`FrameSink`]. The moments are the ones `es_eval::runner` applies the same
+/// draws at: an episode's reset, the observation of a control step, and the plane's answer on
+/// its way to the actuator -- *after* `SafetyPlane::validate`, which still runs on every step
+/// (`INV-12`). The perturbation is the plant's, never the policy's.
+#[derive(Debug)]
+pub enum PerturbAt<'c> {
+    /// Episode `episode` begins: draw what is fixed for it, and write how many control steps
+    /// the policy's observation lags in it (§10.2 `observation_delay`).
+    Episode {
+        episode: u32,
+        observation_delay: &'c mut usize,
+    },
+    /// A control step is about to be observed: write `true` when its observation is lost and
+    /// the held one is handed on instead (§10.2 `frame_drop`).
+    Observe { dropped: &'c mut bool },
+    /// The plane's answer for this step, on its way to the actuator (§10.2 `action_delay`,
+    /// `backlash`, `torque_noise`).
+    Actuate(&'c mut [f64]),
+}
+
+/// The perturbation hook: a closure, not an eighth extension point (`INV-17`).
+pub type Perturber<'a> = &'a mut dyn FnMut(PerturbAt<'_>);
+
+/// What [`Collector::run_perturbed`] is given beyond [`Collector::run_with_sink`].
+pub struct Perturbation<'a> {
+    pub hook: Perturber<'a>,
+    /// Extra inputs of this run's `collect` ledger step (`perturb.config`, ...): provenance,
+    /// which like every ledger value feeds no hash (spec 13.3).
+    pub ledger: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for Perturbation<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Perturbation")
+            .field("ledger", &self.ledger)
+            .finish_non_exhaustive()
+    }
+}
+
+/// What the policy observes on a perturbed control step: the ring `es_eval::runner` keeps for
+/// §10.2 `observation_delay` and `frame_drop`, index rule for index rule. It holds raw `qpos`
+/// / `qvel` rows rather than plan outputs because this path's observation *is* the raw row
+/// (`DomainRunner::observe_window` with no plans).
+#[derive(Debug, Default)]
+struct Held {
+    delay: usize,
+    ring: Vec<(Vec<f64>, Vec<f64>)>,
+    cursor: usize,
+}
+
+impl Held {
+    fn new(delay: usize) -> Self {
+        Self {
+            delay,
+            ..Self::default()
+        }
+    }
+
+    /// Captures `state` unless its observation was dropped -- never the first one, there being
+    /// nothing to hold yet -- and returns what the policy is handed this step.
+    fn observe(&mut self, state: &StateView<'_>, dropped: bool) -> StateView<'_> {
+        if !dropped || self.ring.is_empty() {
+            let row = (state.qpos_of(0).to_vec(), state.qvel_of(0).to_vec());
+            if self.ring.len() <= self.delay {
+                self.ring.push(row);
+            } else {
+                self.ring[self.cursor] = row;
+                self.cursor = (self.cursor + 1) % self.ring.len();
+            }
+        }
+        let oldest = if self.ring.len() > self.delay {
+            self.cursor
+        } else {
+            0
+        };
+        let (qpos, qvel) = &self.ring[oldest];
+        StateView {
+            n_envs: 1,
+            tick: state.tick,
+            qpos,
+            qvel,
+            ..StateView::default()
+        }
+    }
+}
+
 /// What [`Collector::run`] is given that the bundle does not say.
 #[derive(Debug)]
 pub struct CollectSpec<'a> {
@@ -497,10 +588,42 @@ impl Collector {
     pub fn run_with_sink<B, F, const NJ: usize, const H: usize>(
         spec: &CollectSpec<'_>,
         policy: &mut dyn PolicyRuntime,
+        new_backend: F,
+        intervener: Intervener<'_, NJ>,
+        frame_sink: Option<FrameSink<'_>>,
+        sink: Option<CollectSink<'_>>,
+    ) -> Result<CollectReport, DataError>
+    where
+        B: PhysicsBackend,
+        F: FnMut() -> B,
+    {
+        Self::run_perturbed::<B, F, NJ, H>(
+            spec,
+            policy,
+            new_backend,
+            intervener,
+            frame_sink,
+            sink,
+            None,
+        )
+    }
+
+    /// [`Self::run_with_sink`] under an Evaluation IR's perturbations (packet M13/Z2): the
+    /// [`PerturbAt`] moments go to `perturb.hook` and `perturb.ledger` joins the ledger step.
+    /// `None` is the run of before, byte for byte.
+    ///
+    /// The frames, the `.estraj` poses and the `observation.state` rows stay what the world
+    /// was at each step -- a camera sees the scene, whatever reaches the policy late -- and
+    /// the `action` column stays the plane's answer: a delayed, deadbanded or noisy actuator
+    /// is the plant, and a demonstration labelled with it would teach the plant's error.
+    pub fn run_perturbed<B, F, const NJ: usize, const H: usize>(
+        spec: &CollectSpec<'_>,
+        policy: &mut dyn PolicyRuntime,
         mut new_backend: F,
         intervener: Intervener<'_, NJ>,
         mut frame_sink: Option<FrameSink<'_>>,
         mut sink: Option<CollectSink<'_>>,
+        mut perturb: Option<Perturbation<'_>>,
     ) -> Result<CollectReport, DataError>
     where
         B: PhysicsBackend,
@@ -588,9 +711,19 @@ impl Collector {
                     seed: spec.seed,
                 });
             }
+            let mut delay = 0;
+            if let Some(p) = perturb.as_mut() {
+                (p.hook)(PerturbAt::Episode {
+                    episode: index,
+                    observation_delay: &mut delay,
+                });
+            }
+            let mut held = Held::new(delay);
             let mut traj = spec.traj_dir.as_ref().map(|_| Trajectory::new(env.model()));
             let mut sources: Vec<i64> = Vec::with_capacity(max_steps as usize);
             let mut commanded: Vec<f64> = Vec::with_capacity(max_steps as usize * NJ);
+            // The plane's answer per frame: the `action` column (see `run_perturbed`).
+            let mut answered: Vec<f64> = Vec::with_capacity(max_steps as usize * NJ);
             let mut human = vec![false; max_steps as usize + latency + execute + 1];
             let mut closed = None;
             let mut aborted = false;
@@ -633,9 +766,40 @@ impl Collector {
                 // stream-2 sample is the only reader of it (packet M7/E7).
                 let kinds_before = sink.as_ref().map(|_| planes[0].counters().violations);
                 let tick = env.tick();
-                let outcome = env
-                    .step_with_policy(&mut runner, &mut wrapper, &mut planes, &mut [])
+                // `Env::step_with_policy`, phase for phase, opened up where a perturbation
+                // enters (packet M13/Z2): observe -> infer -> chunk buffer -> SafetyPlane ->
+                // plant. The plane is on the path either way (`INV-12`).
+                {
+                    let state = env.backend().state();
+                    match perturb.as_mut() {
+                        None => runner.observe_window(tick.0, env.model(), &state, &mut []),
+                        Some(p) => {
+                            let mut dropped = false;
+                            (p.hook)(PerturbAt::Observe {
+                                dropped: &mut dropped,
+                            });
+                            let seen = held.observe(&state, dropped);
+                            runner.observe_window(tick.0, env.model(), &seen, &mut [])
+                        }
+                    }
                     .map_err(|e| bad(&e))?;
+                }
+                runner
+                    .infer_window(tick.0, &mut wrapper)
+                    .map_err(|e| bad(&e))?;
+                let mut ctrl = [0.0; NJ];
+                runner
+                    .emit_actions(&mut planes, &mut ctrl)
+                    .map_err(|e| bad(&e))?;
+                answered.extend_from_slice(&ctrl);
+                if let Some(p) = perturb.as_mut() {
+                    (p.hook)(PerturbAt::Actuate(&mut ctrl));
+                }
+                let outcome = env.step(&ctrl).map_err(|e| bad(&e))?;
+                if outcome.dones.first() == Some(&true) {
+                    runner.reset_env(0);
+                }
+                runner.advance();
                 // Provenance for the row `env.step` just recorded: what the plane was asked
                 // for, beside what it allowed (spec 13.2).
                 commanded.extend_from_slice(&runner.commanded()[..NJ]);
@@ -709,6 +873,7 @@ impl Collector {
             }
             sources.truncate(n);
             commanded.truncate(n * NJ);
+            answered.truncate(n * NJ);
             human.truncate(n);
             human.resize(n, false);
             intervention_frames += human.iter().filter(|h| **h).count() as u64;
@@ -729,6 +894,7 @@ impl Collector {
                     sources: &sources,
                     human: &human,
                     commanded: &commanded,
+                    answered: &answered,
                 },
                 fps,
                 &task_name,
@@ -741,18 +907,19 @@ impl Collector {
         let (content, schema) = identity_of(&dataset)?;
         let h = &bundle.manifest.hashes;
         let slot = |d: Option<[u8; 32]>| d.as_ref().map_or_else(|| "-".to_owned(), hex);
-        append_loop_step(
-            spec.out_root,
-            &LoopStep::new(LoopKind::Collect)
-                .input("task", &slot(h.task))
-                .input("observation", &slot(h.observation))
-                .input("learning", &slot(h.learning))
-                .input("deployment", &slot(h.deployment))
-                .input("seed", &spec.seed)
-                .input("episodes", &spec.n_episodes)
-                .output("content", &hex(&content))
-                .output("schema", &hex(&schema)),
-        )?;
+        let mut step = LoopStep::new(LoopKind::Collect)
+            .input("task", &slot(h.task))
+            .input("observation", &slot(h.observation))
+            .input("learning", &slot(h.learning))
+            .input("deployment", &slot(h.deployment))
+            .input("seed", &spec.seed)
+            .input("episodes", &spec.n_episodes)
+            .output("content", &hex(&content))
+            .output("schema", &hex(&schema));
+        for (key, value) in perturb.iter().flat_map(|p| &p.ledger) {
+            step = step.input(key, value);
+        }
+        append_loop_step(spec.out_root, &step)?;
 
         Ok(CollectReport {
             root: spec.out_root.to_path_buf(),
@@ -865,6 +1032,8 @@ struct Recorded<'a> {
     human: &'a [bool],
     /// The pre-plane command of each frame, `n * nu` (spec 13.2).
     commanded: &'a [f64],
+    /// The plane's answer of each frame, `n * nu`.
+    answered: &'a [f64],
 }
 
 /// One `es_env::Episode` as `LeRobot` columns (design note section 3).
@@ -887,11 +1056,17 @@ fn to_lerobot(
     let columns = BTreeMap::from([
         ("observation.state".to_owned(), Column::F32(state)),
         (
-            // `ep.ctrl` is the `SafeAction` the plane returned for that step, copied into
-            // `ctrl` by `DomainRunner::emit_actions` and into the episode by `Env::step`:
-            // what is executed is what is recorded (spec 13.2, `INV-12`).
+            // The `SafeAction` the plane returned for that step, as `DomainRunner::emit_actions`
+            // wrote it: what the plane let through is what is recorded (spec 13.2, `INV-12`).
+            // It is `ep.ctrl` bit for bit unless a perturbation moved the command on its way to
+            // the actuator (packet M13/Z2), and then the plant's error is not the label.
             "action".to_owned(),
-            Column::F32(ep.ctrl[..n * nu].iter().map(|v| *v as f32).collect()),
+            Column::F32(
+                frames.answered[..n * nu]
+                    .iter()
+                    .map(|v| *v as f32)
+                    .collect(),
+            ),
         ),
         (
             ACTION_COMMANDED.to_owned(),
@@ -1078,6 +1253,43 @@ mod tests {
         assert_eq!(classify((0, 0), (0, 0), false), ActionSourceCode::Policy);
         // A clamp with nobody intervening is still just a clamp (spec 18.5).
         assert_eq!(classify((3, 7), (3, 8), false), ActionSourceCode::Clamped);
+    }
+
+    /// Packet M13/Z2: the observation a perturbed step hands on is `es_eval::runner`'s -- step
+    /// `s` sees step `s - delay` once the ring is full, step 0 until then, and a dropped step
+    /// reuses the held one without moving the ring.
+    #[test]
+    #[allow(clippy::float_cmp)] // exact: the ring hands on the captured value itself
+    fn a_delayed_or_dropped_observation_is_the_evaluations() {
+        let seen = |held: &mut Held, s: f64, dropped: bool| {
+            let q = [s];
+            let state = StateView {
+                n_envs: 1,
+                qpos: &q,
+                qvel: &q,
+                ..StateView::default()
+            };
+            held.observe(&state, dropped).qpos[0]
+        };
+        let mut held = Held::new(2);
+        let got: Vec<f64> = (0..5)
+            .map(|s| seen(&mut held, f64::from(s), false))
+            .collect();
+        assert_eq!(got, [0.0, 0.0, 0.0, 1.0, 2.0]);
+
+        let mut held = Held::new(0);
+        assert_eq!(
+            seen(&mut held, 0.0, true),
+            0.0,
+            "the first step has nothing to hold"
+        );
+        assert_eq!(seen(&mut held, 1.0, false), 1.0);
+        assert_eq!(
+            seen(&mut held, 2.0, true),
+            1.0,
+            "a drop reuses the held observation"
+        );
+        assert_eq!(seen(&mut held, 3.0, false), 3.0);
     }
 
     #[test]
