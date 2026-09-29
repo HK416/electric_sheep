@@ -107,22 +107,26 @@ pub const THRESHOLDS: Thresholds = Thresholds {
     plateau_fraction: 0.25,
 };
 
-/// The first rule that matches wins: `StoppedByYou` (killed) -> `Stopped` (a non-zero exit or
-/// stage code) -> `Broken` (a non-finite loss) -> `NotResponding` (alive and silent past
+/// The first rule that matches wins: `StoppedByYou` (killed) -> `Broken` (a non-finite loss)
+/// -> `Stopped` (a non-zero exit or stage code) -> `NotResponding` (alive and silent past
 /// `silence_s`, counted from the start when nothing has arrived) -> `Starting` (nothing has
 /// arrived) -> `Slow` -> `StoppedLearning` -> `GoingWell`. `Slow` and `StoppedLearning` need
 /// more than `warmup_points` points; `StoppedLearning` also needs `total_steps`.
+///
+/// `Broken` outranks `Stopped` (packet P-M14-R1): the trainer stops with a non-zero exit
+/// *because* its loss became non-finite, and "the loss became invalid" says why the run
+/// stopped where "stopped" only says that it did.
 pub fn judge(input: &Input<'_>, th: &Thresholds) -> Verdict {
     let failed = |code: &Option<i32>| code.is_some_and(|c| c != 0);
     if input.killed {
         return Verdict::StoppedByYou;
     }
-    if failed(&input.exit_code) || input.stage_codes.iter().any(failed) {
-        return Verdict::Stopped;
-    }
     let points = input.points;
     if points.iter().any(|p| !p.loss.is_finite()) {
         return Verdict::Broken;
+    }
+    if failed(&input.exit_code) || input.stage_codes.iter().any(failed) {
+        return Verdict::Stopped;
     }
     let silent_for = input.since_last_message_s.unwrap_or(input.since_start_s);
     if input.child_alive && silent_for > th.silence_s {
@@ -221,6 +225,20 @@ mod tests {
             samples_per_s: 1.0,
         }];
         assert_eq!(judge(&base(&q), &THRESHOLDS), Verdict::Broken);
+    }
+
+    /// Packet P-M14-R1: the trainer exits non-zero because the loss became NaN, and the light
+    /// says the cause, not only the stop. A kill still reads as the person's own stop.
+    #[test]
+    fn a_nonfinite_loss_outranks_a_bad_exit() {
+        let mut p = falling(30);
+        p.last_mut().unwrap().loss = f64::NAN;
+        let mut i = base(&p);
+        i.child_alive = false;
+        i.exit_code = Some(1);
+        assert_eq!(judge(&i, &THRESHOLDS), Verdict::Broken);
+        i.killed = true;
+        assert_eq!(judge(&i, &THRESHOLDS), Verdict::StoppedByYou);
     }
 
     #[test]

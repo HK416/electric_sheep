@@ -217,6 +217,37 @@ def lr_curve_hash(applied: list) -> str:
     return blake3.blake3(struct.pack("<%dd" % len(applied), *applied)).hexdigest()
 
 
+def finite_or_null(value):
+    """`value` with every non-finite float in it replaced by `None`, containers walked."""
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {k: finite_or_null(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [finite_or_null(v) for v in value]
+    return value
+
+
+def json_text(value) -> str:
+    """JSON for `es train` to read, with a non-finite float written as `null` (packet
+    P-M14-R1): JSON has no NaN, and the bare `NaN` `json.dumps` writes by default is a line
+    no parser reads -- `es train` dropped every progress line after a divergence, so a watcher
+    saw the last finite loss for thousands of NaN steps. `allow_nan=False` makes a float this
+    misses an error instead of such a line. Finite values are the bytes `json.dumps` wrote.
+    """
+    return json.dumps(finite_or_null(value), allow_nan=False)
+
+
+def diverged_message(trainer: str, step: int, loss: float, lr_now: float, lr: float) -> str:
+    """The one sentence a run that diverged stops with (packet P-M14-R1)."""
+    return (
+        "%s: the loss became %r at optimizer step %d (learning rate %g), so training stopped "
+        "there and wrote no weights after its last checkpoint. Try a lower learning rate "
+        "([run] lr, --lr; this run's is %g) or clip the gradient ([run] grad_clip, --grad-clip, "
+        "e.g. 1.0)." % (trainer, loss, step, lr_now, lr)
+    )
+
+
 def init_backbone(model, tensors: dict) -> list:
     """Load `--init-backbone`'s tensors into every lowered `ResNet` backbone (M7/T5).
 
@@ -730,13 +761,17 @@ def main(argv: list) -> int:
             torch.nn.utils.clip_grad_norm_(trainable, a.grad_clip)
         optimizer.step()
         losses.append(float(loss.detach()))
+        # The first non-finite loss ends the run (packet P-M14-R1): every step after it is NaN,
+        # and so is every checkpoint and every evaluation of one. A watcher is told on this step
+        # whatever the period, so the curve it draws ends where the run did.
+        diverged = not math.isfinite(losses[-1])
         # Rate-limited, never per step: one line per `--progress-every` and one picture per
         # `--sample-every`, both after the optimizer has moved so the numbers describe a step
         # that happened. Flushed, because the reader is a pipe (packet M7/E7).
-        if a.progress_every > 0 and (step + 1) % a.progress_every == 0:
+        if a.progress_every > 0 and ((step + 1) % a.progress_every == 0 or diverged):
             elapsed = time.perf_counter() - started
             sys.stdout.write(
-                json.dumps(
+                json_text(
                     {
                         "progress": {
                             "step": step + 1,
@@ -750,18 +785,25 @@ def main(argv: list) -> int:
                 + "\n"
             )
             sys.stdout.flush()
+        if diverged:
+            break
         if watch_port and watch_dir and (step + 1) % a.sample_every == 0:
             path = write_sample(watch_dir, step + 1, inputs[watch_port][0], watch_port)
-            sys.stdout.write(json.dumps({"sample": str(path)}) + "\n")
+            sys.stdout.write(json_text({"sample": str(path)}) + "\n")
             sys.stdout.flush()
         if marks and (step + 1) in marks:
             write_safetensors(
                 Path("%s-%d%s" % (stem, step + 1, a.out.suffix)), checkpoint_tensors(model)
             )
 
-    write_safetensors(a.out, checkpoint_tensors(model))
+    # The step a divergence started at, rather than a NaN at the end of the run and no way to
+    # tell when it happened (packet M7/T4's acceptance asks for exactly this). Since P-M14-R1
+    # it is also the last step: the loop stopped on it.
+    first_nonfinite = next((i for i, v in enumerate(losses) if not math.isfinite(v)), None)
+    if first_nonfinite is None:
+        write_safetensors(a.out, checkpoint_tensors(model))
     if a.loss_curve:
-        a.loss_curve.write_text(json.dumps(losses), encoding="utf-8")
+        a.loss_curve.write_text(json_text(losses), encoding="utf-8")
 
     # A single step's loss is noise; the reported pair is the mean of the first and last tenth
     # of the run, so "the loss fell" is a statement about the run and not about one draw.
@@ -771,11 +813,7 @@ def main(argv: list) -> int:
         "initial_loss": sum(losses[:window]) / window,
         "final_loss": sum(losses[-window:]) / window,
         "steps": len(losses),
-        # The step a divergence started at, rather than a NaN at the end of the run and no
-        # way to tell when it happened (packet M7/T4's acceptance asks for exactly this).
-        "first_nonfinite_step": next(
-            (i for i, v in enumerate(losses) if not math.isfinite(v)), None
-        ),
+        "first_nonfinite_step": first_nonfinite,
         "samples": len(samples),
         "batch": a.batch,
         # One forward over `batch` samples, not `batch` forwards accumulated (packet M7/T3).
@@ -836,7 +874,18 @@ def main(argv: list) -> int:
             "weight_decay": group["weight_decay"],
         },
     }
-    sys.stdout.write(json.dumps(report) + "\n")
+    sys.stdout.write(json_text(report) + "\n")
+    if first_nonfinite is not None:
+        sys.stdout.flush()
+        raise SystemExit(
+            diverged_message(
+                "train_act.py",
+                first_nonfinite + 1,
+                losses[first_nonfinite],
+                applied_lr[first_nonfinite],
+                a.lr,
+            )
+        )
     return 0
 
 

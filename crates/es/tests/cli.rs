@@ -11797,6 +11797,82 @@ fn train_telemetry_streams_the_curve() {
     println!("RAN {TEST}: {} curve point(s), 1 checkpoint", curve.len());
 }
 
+/// Packet P-M14-R1: a training that diverges stops at its first non-finite loss. An absurd
+/// learning rate on the bake fixture: the trainer publishes that step's loss (as NaN, the
+/// trainer having written `null`), writes its summary with `first_nonfinite_step`, says why it
+/// stopped and what to try, and exits non-zero -- no checkpoint past it, no `training_hash`.
+#[test]
+fn train_stops_at_the_first_nonfinite_loss() {
+    const TEST: &str = "train_stops_at_the_first_nonfinite_loss";
+    let Ok(python) = std::env::var("ES_PYTHON") else {
+        println!("SKIP {TEST}: ES_PYTHON is not set, so nothing can train");
+        return;
+    };
+    if skip_without_bake_model(TEST) {
+        return;
+    }
+    let dir = scratch_dir("train-diverges");
+    let bundle = write_demo_bundle(&dir);
+    let (root, tiles) = (dir.join("ds"), dir.join("tiles"));
+    write_bake_fixture(&root, &tiles, 4, 16);
+    let recipe = dir.join("training.toml");
+    write(
+        &recipe,
+        &train_fixture_recipe(&bundle, &root, &tiles, 0, "1e30").replace(
+            "es-no-such-interpreter",
+            &train_toml_path(Path::new(&python)),
+        ),
+    );
+    let port = free_loopback_port();
+    let addr = format!("127.0.0.1:{port}");
+    let reader = drain_from(addr.parse().expect("socket addr"));
+    let out = dir.join("out");
+    let run = bin()
+        .current_dir(train_root())
+        .args(["train", "--recipe", &train_toml_path(&recipe), "--out"])
+        .arg(&out)
+        .args(["--telemetry", &addr, "--progress-every", "10"])
+        .output()
+        .expect("run es train");
+    let received = reader.join().expect("reader thread");
+    let (said, err) = (stdout(&run), stderr_of(&run));
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "stdout:\n{said}\nstderr:\n{err}"
+    );
+    assert!(
+        err.contains("the loss became") && err.contains("[run] lr") && err.contains("grad_clip"),
+        "{err}"
+    );
+    let summary: serde_json::Value = said
+        .lines()
+        .find(|l| l.contains("\"first_nonfinite_step\""))
+        .and_then(|l| serde_json::from_str(l).ok())
+        .unwrap_or_else(|| panic!("no summary line that parses:\n{said}"));
+    let first = summary["first_nonfinite_step"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{summary}"));
+    assert_eq!(
+        summary["steps"].as_u64(),
+        Some(first + 1),
+        "it stopped there"
+    );
+    assert!(!out.join("checkpoints/40.esb").exists());
+    // The lock `es train` writes before the trainer, never finished with a `training_hash`.
+    assert_eq!(
+        train_lock(&out)["training_hash"],
+        serde_json::json!({"unset": true})
+    );
+    // The step it stopped on is published although 10 does not divide it, and as NaN.
+    let frames = frames_of(&received);
+    let curve = scalars_on(&frames, 5);
+    let last = curve.last().unwrap_or_else(|| panic!("no curve:\n{said}"));
+    assert_eq!(last[0] as u64, first + 1, "{curve:?}");
+    assert!(!last[1].is_finite(), "{curve:?}");
+    println!("RAN {TEST}: stopped at step {}", first + 1);
+}
+
 /// Oracle 2 (packet M7/E7). `es loop collect --frames --telemetry`: an `episode.begin` and an
 /// `episode.end` per episode, one stream-2 frame per control tick, at least one image -- and
 /// the dataset directory byte-identical to a run without the flag.
