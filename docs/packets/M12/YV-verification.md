@@ -147,3 +147,48 @@ Z7 runs.
 
 Not yet run: items 3 (evaluate-so-far, the process tree on Stop), 4 (the light's thresholds on a
 recorded run), 6 (medium/long), 8 (the whole flow by hand).
+
+## Results, 2026-09-29 (later): plan Z's real run (M13/Z7)
+
+The hint card after R7 (U3's documents) at the **long** preset (60,000 steps), with
+`[eval.preview]` on, made by the editor's model and launched with its argv; the editor was
+opened on the project while it trained (it attached through `telemetry.txt`). Project
+`target/yv/cube-hint-u3`, run 001, 14:07–15:45 (1 h 38 min).
+
+| stage | result | time |
+|---|---|---|
+| backbone fetch (R8) | `target/backbone` moved aside first: fetched, blake3 matched the pin, byte-identical to the old file | seconds |
+| collect | 200/200 successful demonstrations, 103,881 frames | 27.5 min |
+| expert gate | passed | 2.9 min |
+| train (60,000 steps, batch 64) | median 1,098 samples/s; loss 0.012 → 0.005 | 54.8 min |
+| previews at 1,000 / 5,000 / 20,000 / 60,000 | 0/4 each | 113–121 s each |
+| eval (96 episodes, 6 workers) | **did not pass**: nominal 0/16; all suites 6/96 | ≈7 min |
+| showcase | written | 28 s |
+
+Per suite: nominal 0/16, light intensity 1/16, light direction 1/16, observation delay 2/16,
+torque noise 1/16, backlash 1/16. `envelope_violation_rate` 0.05–0.12 per suite (torque noise
+0.44) — against 0.996 at the short preset of the S1 run: the plane now changes about one step in
+nine, not nearly all of them.
+
+- **What a preview costs.** One preview is one worker, 4 episodes, about 2 minutes. While one
+  ran, the trainer's rate was 0–15 % below the minutes around it (builds of other packets shared
+  the PC, so this is an upper bound); four previews over a 55-minute training cost at most about
+  1.2 minutes of training time.
+- **Why it failed, by outcome class (Z4a):** of the 90 timed-out attempts, 65 *never lifted*
+  the cube, 16 *lifted it but left it outside* the bin, 9 *got it in too late*.
+- **More steps is not the answer (M10 review S-2).** 60,000 steps is 37 epochs of today's
+  103,881 frames — U3's own 34.6 epochs of V15's data — and scores nominal 0/16, as U3″'s 20,000
+  steps did. What differs from V15 is the demonstrations themselves: every one of today's holds
+  still for exactly **221 frames (4.4 s, 43 % of the episode)** between closing the gripper and
+  lifting (`templates/teach/so101-pick-place.toml`'s 5 s grip wait, counted in re-plans since
+  V11 made one control step one control period). A policy that cannot see time passing in a
+  still scene has no cue for when to lift, which matches the 65 *never lifted*. With the wait
+  at 1 s the demonstrator still succeeds 4 of 4 on seeds 5000–5003, with the same plane counts,
+  and the episodes are 38 % shorter. Measuring the policy trained on those is the next run
+  (plan Q's Q5 follow-up).
+- **The editor, watched.** ③ showed the previews as they finished (chips, headline, player) and
+  ⑤ opened by itself when the run ended. Opening the editor mid-run showed the finished stages
+  as *waiting* and no training view — fixed (`b637725`). ⑤ led "why it failed" with "the safety
+  device stopped it, 90" and "motion gaps, 90 — a faster computer helps": one fallback step and
+  one chunk underrun at every attempt's first tick, successes included — fixed (review follow-up
+  R3: a plane step counter counts only above 1 % of the attempt's steps).
