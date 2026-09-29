@@ -16,6 +16,7 @@
 //! The dock's panes are named by [`crate::model::layout::Pane`] and the five steps by
 //! [`crate::model::workflow::Phase`] (packets M12/Y10, Y11).
 
+use es_env::program::ProgramError;
 use es_ir::evaluation::{MetricSpec, PerturbationKind};
 
 use crate::model::i18n::{t, Lang};
@@ -159,6 +160,28 @@ pub fn perturbation_key(kind: &PerturbationKind) -> &'static str {
         PerturbationKind::FrameDrop { .. } => "perturb.frame_drop",
         PerturbationKind::TorqueNoise { .. } => "perturb.torque_noise",
         PerturbationKind::Backlash { .. } => "perturb.backlash",
+    }
+}
+
+// --- ② Teach: why a demonstration program is refused -----------------------------------------
+
+/// The key of a [`ProgramError`]'s plain words (packet M14/Q3). Total, no wildcard arm: a
+/// refusal `es-env` adds breaks this build. `teach::error_text` fills the holes.
+pub fn program_error_key(error: &ProgramError) -> &'static str {
+    match error {
+        ProgramError::Parse(_) => "teach.error.parse",
+        ProgramError::Kind(_) => "teach.error.kind",
+        ProgramError::Robot(_) => "teach.error.robot",
+        ProgramError::Empty => "teach.error.empty",
+        ProgramError::BothHeights(_) => "teach.error.both_heights",
+        ProgramError::NoHeight(_) => "teach.error.no_height",
+        ProgramError::Missing { .. } => "teach.error.missing",
+        ProgramError::Misplaced { .. } => "teach.error.misplaced",
+        ProgramError::GripFirst => "teach.error.grip_first",
+        ProgramError::UnknownPlace { .. } => "teach.error.unknown_place",
+        ProgramError::UnknownObject(_) => "teach.error.unknown_object",
+        ProgramError::Wait { .. } => "teach.error.wait",
+        ProgramError::Scene(_) => "teach.error.scene",
     }
 }
 

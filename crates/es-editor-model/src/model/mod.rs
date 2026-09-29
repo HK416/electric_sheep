@@ -28,6 +28,7 @@ pub mod results;
 pub mod run_view;
 pub mod scene_view;
 pub mod search;
+pub mod teach;
 pub mod telemetry_view;
 pub mod template;
 pub mod train_view;

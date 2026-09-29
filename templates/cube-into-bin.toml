@@ -20,6 +20,11 @@ cycle = "tests/fixtures/visible-learning/cycle-vision.toml"
 scene = "tests/fixtures/mjcf/so101_pick_place.xml"
 demonstrations = 200
 
+# The demonstration program (packet M14/Q3): `Project::create` copies it into the project as
+# `teach.toml`, ② edits that copy, and a run's `[collect] expert` names it. This file is never
+# written by the editor.
+teach = "templates/teach/so101-pick-place.toml"
+
 # The bundle `es policy init` builds for `[collect] policy`, which is also the expert gate's
 # `--policy`. The gate judges it by `evaluation-v8.toml`, whose `observation` is
 # `observation-v8.toml`, so the bundle carries that document (`XIR-040`). No committed Learning IR

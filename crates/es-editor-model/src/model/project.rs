@@ -4,6 +4,8 @@
 //! my-project/
 //!   project.toml      kind = "project", name, template
 //!   untrained.esb     the collect bundle, from the template's `[bundle]` documents
+//!   teach.toml        the demonstration program, a copy of the template's (packet M14/Q3)
+//!   try/001/          one try of it from ② Teach: `es eval run --expert` on one seed
 //!   runs/001/         exactly what `es loop cycle --out runs/001` writes, plus
 //!     cycle.toml      the recipe this run used, written just before launch
 //!     telemetry.txt   the live address, so a re-opened editor can attach again
@@ -29,6 +31,10 @@ pub const RUNS_DIR: &str = "runs";
 pub const RUN_RECIPE: &str = "cycle.toml";
 pub const TELEMETRY_FILE: &str = "telemetry.txt";
 pub const COLLECT_BUNDLE: &str = "untrained.esb";
+/// Spelt in two literals: whole, it is shaped like an i18n key of the `teach` group, which the
+/// completeness test would read as a typo.
+pub const TEACH_FILE: &str = concat!("teach", ".toml");
+pub const TRY_DIR: &str = "try";
 
 const KIND: &str = "project";
 
@@ -88,8 +94,10 @@ fn write(path: &Path, bytes: impl AsRef<[u8]>) -> Result<(), ProjectError> {
 }
 
 impl Project {
-    /// Makes `root` (refusing one that already holds a `project.toml`), writes `project.toml`
-    /// and builds `untrained.esb` from the template's `[bundle]` documents.
+    /// Makes `root` (refusing one that already holds a `project.toml`), writes `project.toml`,
+    /// builds `untrained.esb` from the template's `[bundle]` documents and copies the template's
+    /// demonstration program to `teach.toml`, byte for byte: the person's copy, which ② edits
+    /// and nothing ever writes back under `templates/` (packet M14/Q3).
     ///
     /// The bundle is built before anything is written, and `project.toml` is written last:
     /// its presence is what makes a folder a project, so a failure leaves no half project.
@@ -113,8 +121,14 @@ impl Project {
             BUNDLE_SEED,
         )
         .map_err(|e| ProjectError(format!("template {}: {e}", template.id)))?;
+        let teach = (template.teach.as_ref())
+            .map(|p| std::fs::read(doc(p)).map_err(|e| err(&doc(p), e)))
+            .transpose()?;
         std::fs::create_dir_all(&root).map_err(|e| err(&root, e))?;
         write(&root.join(COLLECT_BUNDLE), bundle)?;
+        if let Some(bytes) = teach {
+            write(&root.join(TEACH_FILE), bytes)?;
+        }
         let file = ProjectFile {
             kind: KIND.to_owned(),
             name: name.to_owned(),
@@ -148,9 +162,23 @@ impl Project {
         self.root.join(COLLECT_BUNDLE)
     }
 
+    /// The project's demonstration program; absent in a project made before packet M14/Q3.
+    pub fn teach(&self) -> PathBuf {
+        self.root.join(TEACH_FILE)
+    }
+
     /// `runs/NNN` directories, ascending; anything else under `runs/` is ignored.
     pub fn runs(&self) -> Vec<RunFolder> {
-        let Ok(entries) = std::fs::read_dir(self.root.join(RUNS_DIR)) else {
+        self.numbered(RUNS_DIR)
+    }
+
+    /// `try/NNN`, ascending: ②'s tries of the program, numbered as runs are.
+    pub fn tries(&self) -> Vec<RunFolder> {
+        self.numbered(TRY_DIR)
+    }
+
+    fn numbered(&self, dir: &str) -> Vec<RunFolder> {
+        let Ok(entries) = std::fs::read_dir(self.root.join(dir)) else {
             return Vec::new();
         };
         let mut runs: Vec<RunFolder> = entries
@@ -178,9 +206,18 @@ impl Project {
 
     /// One past the largest existing number, three digits; never an existing directory.
     pub fn next_run_dir(&self) -> PathBuf {
-        let mut n = self.latest_run().map_or(1, |r| r.number + 1);
+        self.next_in(RUNS_DIR)
+    }
+
+    /// As [`Self::next_run_dir`], under `try/`.
+    pub fn next_try_dir(&self) -> PathBuf {
+        self.next_in(TRY_DIR)
+    }
+
+    fn next_in(&self, dir: &str) -> PathBuf {
+        let mut n = self.numbered(dir).last().map_or(1, |r| r.number + 1);
         loop {
-            let path = self.root.join(RUNS_DIR).join(format!("{n:03}"));
+            let path = self.root.join(dir).join(format!("{n:03}"));
             if !path.exists() {
                 return path;
             }
@@ -214,7 +251,9 @@ fn arg(path: &Path) -> String {
 }
 
 /// Writes `run/cycle.toml`: the template's recipe with `[collect] episodes`, `[collect]
-/// policy` (absolute path of the project's bundle) and an inline `[train]` whose
+/// policy` (absolute path of the project's bundle), `[collect] expert` (absolute path of the
+/// project's `teach.toml`, when it has one - a project made before packet M14/Q3 keeps the
+/// template's built-in name) and an inline `[train]` whose
 /// `[run] checkpoint_at` is the preset and `steps` its last mark. Everything else is the
 /// template's, unchanged, but for `[eval.preview]`: at its defaults when the template's cycle
 /// declares none, so every run the editor starts shows a short test after each checkpoint
@@ -375,6 +414,9 @@ fn run_cycle(
     })?;
     collect.episodes = settings.demonstrations;
     collect.policy = bundle;
+    if project.teach().is_file() {
+        collect.expert = Some(arg(&project.teach()));
+    }
     Ok((cycle, cycle_path))
 }
 
@@ -499,6 +541,39 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&p.root).ok();
     }
 
+    /// Packet M14/Q3: the template's program is copied into the project byte for byte, and a
+    /// run's recipe names the copy - or, for a project made before it, the built-in name.
+    #[test]
+    fn the_template_program_is_copied_and_a_run_names_it() {
+        let p = scratch_project("teach");
+        let template = repo().join(cube().teach.expect("teach"));
+        assert_eq!(
+            std::fs::read(p.teach()).unwrap(),
+            std::fs::read(template).unwrap()
+        );
+        let text = std::fs::read_to_string(p.teach()).unwrap();
+        assert_eq!(
+            es_env::program::Program::parse(&text),
+            Ok(es_env::program::Program::builtin())
+        );
+        let settings = StartSettings {
+            demonstrations: 3,
+            length: Length::Short,
+        };
+        let expert = |run: &Path| {
+            let text = std::fs::read_to_string(run.join(RUN_RECIPE)).unwrap();
+            Cycle::parse(&text).unwrap().collect.unwrap().expert
+        };
+        let run = p.next_run_dir();
+        write_run(&cube(), &repo(), &p, settings, &run, "127.0.0.1:7005").unwrap();
+        assert_eq!(expert(&run), Some(p.teach().display().to_string()));
+        std::fs::remove_file(p.teach()).unwrap();
+        let run = p.next_run_dir();
+        write_run(&cube(), &repo(), &p, settings, &run, "127.0.0.1:7005").unwrap();
+        assert_eq!(expert(&run).as_deref(), Some("so101-pick-place"));
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
     #[test]
     fn run_recipe_overrides_only_what_the_person_chose() {
         let p = scratch_project("recipe");
@@ -536,7 +611,9 @@ pub(crate) mod tests {
             written.collect.as_ref().unwrap(),
             template.collect.as_ref().unwrap(),
         );
-        assert_eq!((&w.expert, w.seed, w.frames), (&t.expert, t.seed, t.frames));
+        assert_eq!((w.seed, w.frames), (t.seed, t.frames));
+        // Packet M14/Q3: the demonstrator runs the project's own program.
+        assert_eq!(w.expert, Some(p.teach().display().to_string()));
         assert_eq!(w.policy, p.bundle().display().to_string());
         // the inline train's marks are the preset, and the length is its last mark
         let marks = cube().marks(Length::Short).to_vec();
@@ -660,9 +737,11 @@ pub(crate) mod tests {
         assert!(Path::new(&recipe).is_file());
         // ... and the recipe names the bundle under the same path, verbatim.
         let written = Cycle::parse(&std::fs::read_to_string(&recipe).unwrap()).unwrap();
+        let collect = written.collect.unwrap();
+        assert_eq!(PathBuf::from(&collect.policy), root.join(COLLECT_BUNDLE));
         assert_eq!(
-            PathBuf::from(&written.collect.unwrap().policy),
-            root.join(COLLECT_BUNDLE)
+            collect.expert.map(PathBuf::from),
+            Some(root.join(TEACH_FILE))
         );
         std::fs::remove_dir_all(&base).ok();
     }

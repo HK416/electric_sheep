@@ -34,6 +34,11 @@ cycle = "tests/fixtures/visible-learning/cycle-hint-u3.toml"
 scene = "tests/fixtures/mjcf/so101_pick_place.xml"
 demonstrations = 200
 
+# The demonstration program (packet M14/Q3): `Project::create` copies it into the project as
+# `teach.toml`, ② edits that copy, and a run's `[collect] expert` names it. This file is never
+# written by the editor.
+teach = "templates/teach/so101-pick-place.toml"
+
 # The bundle `es policy init` builds for `[collect] policy`: U3's four documents. It is also what
 # `training-hint-u3.toml`'s `[policy] bundle` trains (`learning-pretrained.toml` is the
 # architecture), and the cycle's expert gate judges it by `evaluation-augmented.toml`, which

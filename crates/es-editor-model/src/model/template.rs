@@ -74,6 +74,10 @@ pub struct Template {
     pub scene: String,
     pub demonstrations: u32,
     pub bundle: BundleDocs,
+    /// The demonstration program a project starts from (packet M14/Q3), which
+    /// [`Project::create`](crate::model::project::Project::create) copies into the project as
+    /// `teach.toml`. Absent: the cycle's `[collect] expert` name is used as it is.
+    pub teach: Option<String>,
     pub lengths: Lengths,
     /// Absent: failures keep the causes the evaluation recorded.
     pub outcome: Option<OutcomeSpec>,
@@ -199,6 +203,10 @@ mod tests {
             {
                 assert!(root.join(p).is_file(), "{id}: {p}");
             }
+            // Packet M14/Q3: both cards teach with the committed built-in program.
+            let teach = std::fs::read_to_string(root.join(cube.teach.as_ref().expect("teach")))
+                .expect("the program file");
+            assert_eq!(teach, es_env::program::SO101_PICK_PLACE, "{id}");
             assert_eq!(
                 (
                     cube.name.as_str(),
