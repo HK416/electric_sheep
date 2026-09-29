@@ -1,7 +1,7 @@
 //! The editable graph of spec 23.4 stage 2, as a headless edit model.
 //!
-//! Everything an edit *decides* lives here and is judged by `cargo test -p es-editor`;
-//! `crate::app` only turns a mouse gesture into an [`Edit`] and paints the result. CI has no
+//! Everything an edit *decides* lives here and is judged by `cargo test -p es-editor-model`;
+//! `es_editor::app` only turns a mouse gesture into an [`Edit`] and paints the result. CI has no
 //! display, so a decision that leaks into the egui half is a decision nothing tests.
 //!
 //! Three rules shape this module:

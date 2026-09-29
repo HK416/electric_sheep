@@ -18,6 +18,17 @@ use crate::model::replay_view::load_scene;
 use crate::model::template::{Method, Template};
 use crate::model::watch::source_of;
 
+/// Where the replay camera starts: the demo's showcase view (`es video showcase --eye`).
+/// `ui/advanced.rs` re-exports it for the Replay panel, ① Scene and the result tiles.
+pub const SHOWCASE_CAMERA: Camera = Camera {
+    eye: [0.55, -0.45, 0.42],
+    look_at: [0.12, -0.02, 0.08],
+    // 45 degrees, the showcase default. `to_radians` is not `const`.
+    fov_y: std::f64::consts::FRAC_PI_4,
+    width: 640,
+    height: 400,
+};
+
 /// A scene file, parsed, and its triangles at the initial pose.
 #[derive(Debug)]
 pub struct ScenePreview {
@@ -136,7 +147,6 @@ mod tests {
     use super::*;
     use crate::model::i18n::{fill, Lang};
     use crate::model::project::tests::{repo, scratch_project};
-    use crate::ui::advanced::SHOWCASE_CAMERA;
 
     fn fixture() -> PathBuf {
         repo().join("tests/fixtures/mjcf/so101_pick_place.xml")

@@ -1,6 +1,7 @@
 # Editor shell — read-only layered graph, telemetry, before/after images
 
-Design note for `crates/es-editor` (layer 12). Spec: §23 (editor and integrated debugger),
+Design note for `crates/es-editor` (layer 13) and `crates/es-editor-model` (layer 12, its
+headless half since packet M12/R4; section 2). Spec: §23 (editor and integrated debugger),
 §23.2 (layered graph view), §23.3 (watching during training), §23.4 (the three graph-feature
 stages — read-only is M1), §14.3 (`.eslayout` sidecar), §1.9 (cut 5: the *editable* visual
 graph goes, read-only stays), §12.4 (the metric set).
@@ -10,7 +11,7 @@ graph goes, read-only stays), §12.4 (the metric set).
 A **client** (§23.1). It hosts no training, owns no simulation and holds no IR authority: it
 opens a bundle, asks each IR to validate itself, and draws what it is told. §4.2 rule 4 makes
 that structural — nothing may depend on `es-editor`, so nothing can grow a dependency on a
-view.
+view, and nothing but `es-editor` may depend on `es-editor-model`.
 
 Stage 1 of §23.4 only: read-only. Editing needs layout persistence, undo/redo, search and
 large-graph performance; read-only needs none of them, and §23.4 says most of the debugging
@@ -20,13 +21,21 @@ value is already there. It is also the half that survives §1.9 cut 5.
 
 | Half | Where | Tested |
 |---|---|---|
-| view-model | `src/model/{graph_view,telemetry_view,image_view}.rs` | fully, headless |
-| egui shell | `src/app.rs`, `src/main.rs` | compiled only |
+| view-model | `es-editor-model`: `src/model/{graph_view,telemetry_view,image_view}.rs` | fully, headless |
+| egui shell | `es-editor`: `src/app.rs`, `src/ui/`, `src/main.rs` | compiled only |
 
 CI has no display, so everything that *decides* anything lives in `model` and is judged by
-`cargo test -p es-editor`; `app.rs` turns positions into rectangles and is judged by
+`cargo test -p es-editor-model`; `app.rs` turns positions into rectangles and is judged by
 `cargo build -p es-editor`. Keeping a decision out of `app.rs` is the rule, not a preference:
 an untested file is allowed to be thin and nothing else.
+
+Until packet M12/R4 the two halves were one crate; at 9,763 of §1.5's 10,000 lines it could not
+take another step, so the owner split it along this line (review H-2, 2026-09-29). The split
+is a pure move: `es-editor-model` keeps the `model` module, its tests and the string tables,
+and `es-editor` re-exports it as `es_editor::model`, so no type changed its name.
+`model/fonts.rs` (an `egui::FontDefinitions`) and `model/layout.rs` (an `egui_dock::DockState`
+kept in `eframe::Storage`) are why the model crate still names egui, egui_dock and eframe;
+none of the three needs a display there.
 
 ## 3. No `egui-snarl`
 
@@ -857,7 +866,7 @@ Everything below is the same §28.10 rule 3 as the rest of the crate — **nothi
 
 ### The string-table rule
 
-`crates/es-editor/i18n/en.toml` and `ko.toml`, flat keys quoted so TOML keeps them flat
+`crates/es-editor-model/i18n/en.toml` and `ko.toml`, flat keys quoted so TOML keeps them flat
 (`"home.open_project" = "…"`), `include_str!`d into `model/i18n.rs`: `Lang { En, Ko }`,
 `Strings::get(lang)`, `t(lang, key)`, and `fill(lang, key, args)` for the handful of
 templates that carry a number. A key missing at runtime renders as the key, because an editor

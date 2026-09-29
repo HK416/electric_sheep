@@ -1,6 +1,7 @@
 # Editor redesign — a workflow shell for people who are not experts
 
-Design note for `crates/es-editor` (layer 12) and the small backend changes it needs. Spec:
+Design note for `crates/es-editor` (layer 13; its headless half is `crates/es-editor-model`,
+layer 12, since packet M12/R4) and the small backend changes it needs. Spec:
 §23.1 (the editor is a client), §23.3 (watching a run), §13.1 and §13.3 (the loop and its
 fixed evaluation), §10 (Evaluation IR), §28.9 (the expert gate), §1.4 (oracle first), §1.5
 (context budget), §4.2 (layering). It builds on `editor-shell.md` §10–§16, which it
@@ -9,7 +10,7 @@ reorganises rather than replaces.
 Status: agreed with the owner on 2026-09-28 (screens and decomposition). **S1 implemented the same
 day** (plan Y, `docs/packets/M12/plan-y.md`, Y1–Y15; review `docs/reviews/M12.md`); not closed until the
 real runs of `docs/packets/M12/YV-verification.md`. S2–S6 are directions, each to get its own
-design pass before it is planned; S2 waits on the `es-editor` split (section 9).
+design pass before it is planned; the `es-editor` split S2 waited on is done (section 9).
 
 ## 1. Why
 
@@ -433,3 +434,5 @@ has the findings and the open decisions.
   route's marks are a multiple series); hint [1000, 5000], [1000, 5000, 20000],
   [1000, 5000, 20000, 60000] — both mean 5,000 / 20,000 / 60,000 steps.
 - **Budget:** `es-editor` is at 9,715 of 10,000 after S1. S2 needs a split first (review S-1, H-2).
+  Done by packet M12/R4 (2026-09-29): `es-editor-model` (layer 12, the view-models, tests and
+  string tables) at 6,084 and `es-editor` (layer 13, the egui shell) at 3,682.

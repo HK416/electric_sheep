@@ -928,7 +928,7 @@ mod tests {
             let path = golden_path(name(kind));
             let expected = fs::read_to_string(&path).unwrap_or_else(|e| {
                 panic!(
-                    "{}: {e} (run ES_GENERATE_GOLDENS=1 cargo test -p es-editor -- --ignored \
+                    "{}: {e} (run ES_GENERATE_GOLDENS=1 cargo test -p es-editor-model -- --ignored \
                      generate_launch_goldens)",
                     path.display()
                 )

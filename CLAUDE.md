@@ -38,7 +38,8 @@ the editor's workflow shell for non-experts — a step bar (① scene → ② te
 one-button `es loop cycle` runs with a traffic light, and a plain-language results screen; the old tabs are Advanced panes.
 Backend: `es --check-deps --json`, `episodes.json`, `es policy init`. It is **not closed**: no learning run has gone through it
 (no `ES_PYTHON` here, the remote server off-limits by the owner), and `docs/packets/M12/YV-verification.md` lists what must run;
-`es-editor` is at 9,715 of the 10,000 cap, so S2 waits on a split (review H-2).
+the owner's split (review H-2, P-M12-R4) made the view-models `es-editor-model` (layer 12, 6,084 lines) under the egui
+shell `es-editor` (layer 13, 3,682).
 The next campaign waits on the human decisions in `docs/reviews/M11.md` (the envelope for a learning policy, a cross-render
 condition, a declared source latency, `asset_hash`), `docs/reviews/M10.md` (the cycle recipe's step count, the next source policy),
 `docs/reviews/M9.md` (the buffered-path watchdog for delta policies) and the older ones in `docs/reviews/M7.md` (the stop rule's reading,
@@ -137,12 +138,13 @@ policy, dataset, deployment, compiler, runtime, hardware_capability)`, the condi
 bitwise reproducibility (§3.5 tier 1). Four batch domains — simulation / observation /
 inference / training — have independent sizes and schedules (§5.2, §12).
 
-**Crate layering (§4.2, layers 0–12, CI-enforced):** `es-math`(0) → `es-core`(1) → `es-gpu`
+**Crate layering (§4.2, layers 0–13, CI-enforced):** `es-math`(0) → `es-core`(1) → `es-gpu`
 /`es-assets`/`es-usd`(2) → `es-actuator`/`es-sensor`/`es-physics-core`(3) →
 `es-physics-backend`/`-cpu`/`-gpu`(4) → `es-render`/`es-splat`(5) → `es-ir`(6) →
 `es-compile`(7) → `es-policy`/`es-safety`(8) → `es-env`(9) → `es-data`/`es-telemetry`/
-`es-eval`(10) → `es-ros2`/`es-py`/`es-script`/`es-transport`(11) → `es-editor`(12). Upper
-depends on lower only; no same-layer deps.
+`es-eval`(10) → `es-ros2`/`es-py`/`es-script`/`es-transport`(11) → `es-editor-model`(12) →
+`es-editor`(13). Upper depends on lower only; no same-layer deps; nothing depends on
+`es-editor`, and nothing but `es-editor` on `es-editor-model`.
 
 ## Non-negotiable invariants (§4.2, §7.2, §9, App. D) — do not violate
 

@@ -128,7 +128,8 @@ mod tests {
     use std::collections::BTreeSet;
     use std::path::{Path, PathBuf};
 
-    /// Every `.rs` file of this crate, source and tests alike.
+    /// Every `.rs` file of this crate, source and tests alike, and of `es-editor`, the shell
+    /// that shows the same tables (packet M12/R4 split the two).
     fn sources() -> Vec<String> {
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -147,7 +148,12 @@ mod tests {
         let mut paths = Vec::new();
         walk(&root.join("src"), &mut paths);
         walk(&root.join("tests"), &mut paths);
-        assert!(!paths.is_empty(), "the crate has sources");
+        let own = paths.len();
+        walk(&root.join("../es-editor/src"), &mut paths);
+        assert!(
+            own > 0 && paths.len() > own,
+            "this crate's and the shell's sources"
+        );
         paths
             .iter()
             .map(|p| std::fs::read_to_string(p).expect("a source file"))

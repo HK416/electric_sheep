@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-/// Layer table, spec 4.2 / Appendix B.8. Layer 12 (`es-editor`) is included
-/// only so rule 4 ("nothing depends on es-editor") can name it; nothing may
-/// depend on it regardless of layer.
+/// Layer table, spec 4.2 / Appendix B.8. Layers 12 (`es-editor-model`) and 13
+/// (`es-editor`) are rule 4's: nothing may depend on `es-editor` regardless of
+/// layer, and nothing but `es-editor` on `es-editor-model`.
 const LAYERS: &[(&str, u8)] = &[
     ("es-math", 0),
     ("es-core", 1),
@@ -38,7 +38,8 @@ const LAYERS: &[(&str, u8)] = &[
     ("es-script", 11),
     ("es-tools", 11),
     ("es-transport", 11),
-    ("es-editor", 12),
+    ("es-editor-model", 12),
+    ("es-editor", 13),
 ];
 
 fn layer_of(name: &str) -> Option<u8> {
@@ -73,6 +74,13 @@ pub fn check_layering(pkgs: &[Pkg]) -> Vec<String> {
             if dep == "es-editor" {
                 errors.push(format!(
                     "{}: must not depend on es-editor (rule 4)",
+                    pkg.name
+                ));
+            }
+            // Rule 4: nothing but es-editor depends on es-editor-model.
+            if dep == "es-editor-model" && pkg.name != "es-editor" {
+                errors.push(format!(
+                    "{}: only es-editor may depend on es-editor-model (rule 4)",
                     pkg.name
                 ));
             }
@@ -276,6 +284,39 @@ mod tests {
         let pkgs = vec![pkg("es-env", &["es-editor"]), pkg("es-editor", &[])];
         let errors = check_layering(&pkgs);
         assert!(errors.iter().any(|e| e.contains("rule 4")), "{errors:?}");
+    }
+
+    #[test]
+    fn only_the_editor_depends_on_the_editor_model() {
+        let model = pkg("es-editor-model", &["es-eval"]);
+        let ok = vec![model.clone(), pkg("es-editor", &["es-editor-model"])];
+        assert!(check_layering(&ok).is_empty(), "{:?}", check_layering(&ok));
+
+        let upward = vec![
+            pkg("es-editor-model", &["es-editor"]),
+            pkg("es-editor", &[]),
+        ];
+        let errors = check_layering(&upward);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("must not depend on es-editor (rule 4)")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("higher layer")),
+            "{errors:?}"
+        );
+
+        for third in ["es-eval", "es-py", "es-tools"] {
+            let errors = check_layering(&[model.clone(), pkg(third, &["es-editor-model"])]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("only es-editor may depend")),
+                "{third}: {errors:?}"
+            );
+        }
     }
 
     #[test]

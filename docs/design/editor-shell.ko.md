@@ -1,7 +1,8 @@
 <!-- Korean translation of docs/design/editor-shell.md. The English file is the working copy; regenerate this when it changes. -->
 # 에디터 셸 — 읽기 전용 계층 그래프, 텔레메트리, 전/후 이미지
 
-`crates/es-editor`(계층 12)를 위한 설계 노트. 스펙: §23(에디터와 통합 디버거),
+`crates/es-editor`(계층 13)와 `crates/es-editor-model`(계층 12, 패킷 M12/R4부터 그 헤드리스
+절반; 2절)을 위한 설계 노트. 스펙: §23(에디터와 통합 디버거),
 §23.2(계층 그래프 뷰), §23.3(학습 중 확인), §23.4(그래프 기능 3단계 — 읽기 전용이 M1),
 §14.3(`.eslayout` 사이드카), §1.9(cut 5: *편집 가능한* 비주얼 그래프는 잘라내고, 읽기 전용은
 남긴다), §12.4(메트릭 세트).
@@ -11,7 +12,7 @@
 **클라이언트**다(§23.1). 학습을 호스팅하지 않고, 시뮬레이션을 소유하지 않으며, IR 권한도
 갖지 않는다: 번들을 열고, 각 IR에 스스로 검증하라고 요청하고, 지시받은 대로 그린다.
 §4.2 규칙 4가 이를 구조적으로 강제한다 — 아무것도 `es-editor`에 의존할 수 없으므로,
-어떤 것도 뷰에 대한 의존성을 키울 수 없다.
+어떤 것도 뷰에 대한 의존성을 키울 수 없다. `es-editor-model`에는 `es-editor`만 의존할 수 있다.
 
 §23.4의 1단계만: 읽기 전용. 편집에는 레이아웃 영속화, undo/redo, 검색, 대형 그래프 성능이
 필요하지만 읽기 전용에는 그중 아무것도 필요 없고, §23.4는 디버깅 가치의 대부분이 이미
@@ -21,13 +22,21 @@
 
 | 절반 | 위치 | 테스트 |
 |---|---|---|
-| 뷰모델 | `src/model/{graph_view,telemetry_view,image_view}.rs` | 완전히, 헤드리스로 |
-| egui 셸 | `src/app.rs`, `src/main.rs` | 컴파일만 |
+| 뷰모델 | `es-editor-model`: `src/model/{graph_view,telemetry_view,image_view}.rs` | 완전히, 헤드리스로 |
+| egui 셸 | `es-editor`: `src/app.rs`, `src/ui/`, `src/main.rs` | 컴파일만 |
 
 CI에는 디스플레이가 없으므로 무언가를 *결정*하는 모든 것은 `model`에 있고
-`cargo test -p es-editor`로 판정되며, `app.rs`는 위치를 사각형으로 바꿀 뿐이고
+`cargo test -p es-editor-model`로 판정되며, `app.rs`는 위치를 사각형으로 바꿀 뿐이고
 `cargo build -p es-editor`로 판정된다. 결정을 `app.rs` 밖에 두는 것은 취향이 아니라
 규칙이다: 테스트되지 않는 파일은 얇고 그 이상 아무것도 아닌 것만 허용된다.
+
+패킷 M12/R4 전까지 두 절반은 한 크레이트였다. §1.5의 10,000줄 중 9,763줄에 이르러 다음
+단계를 더 받을 수 없었으므로, 오너가 이 선을 따라 크레이트를 나눴다(리뷰 H-2, 2026-09-29).
+분리는 순수한 이동이다: `es-editor-model`이 `model` 모듈과 그 테스트, 문자열 표를 가져가고
+`es-editor`가 그것을 `es_editor::model`로 다시 내보내므로 이름이 바뀐 타입은 없다.
+모델 크레이트가 여전히 egui, egui_dock, eframe을 부르는 이유는 `model/fonts.rs`
+(`egui::FontDefinitions`)와 `model/layout.rs`(`eframe::Storage`에 보관하는
+`egui_dock::DockState`)다. 셋 다 거기서 디스플레이를 필요로 하지 않는다.
 
 ## 3. `egui-snarl` 없음
 
@@ -835,7 +844,7 @@ EOF이고, 리더 스레드들은 끝나는 중이며, 그들의 마지막 줄�
 
 ### 문자열 표 규칙
 
-`crates/es-editor/i18n/en.toml`과 `ko.toml`. TOML이 평평하게 유지하도록 키를 따옴표로 감싸고
+`crates/es-editor-model/i18n/en.toml`과 `ko.toml`. TOML이 평평하게 유지하도록 키를 따옴표로 감싸고
 (`"home.open_project" = "…"`), `model/i18n.rs`에 `include_str!`로 들어간다: `Lang { En, Ko }`,
 `Strings::get(lang)`, `t(lang, key)`, 그리고 숫자를 품는 몇 안 되는 템플릿을 위한
 `fill(lang, key, args)`. 실행 중에 없는 키는 키 자체로 그려진다. 화면에 `tab.design`이 보이는

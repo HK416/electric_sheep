@@ -3,7 +3,7 @@
 //! Spec 23.2 stacks the IRs on one screen — Task above Observation above Learning above the
 //! action/safety plane — and draws the cross-IR joins between them. Everything that decides
 //! *what* is drawn lives here, with no egui in sight, so it is testable in CI without a
-//! display; `crate::app` only turns positions into rectangles.
+//! display; `es_editor::app` only turns positions into rectangles.
 //!
 //! Two rules shape this module:
 //!
