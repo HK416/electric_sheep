@@ -1,0 +1,45 @@
+# Plan N's experiment 1, the three-view arm's training recipe (packet M15/N1,
+# docs/packets/M15/plan-n.md, docs/design/multi-camera.md section 4): M7/U row U3's run settings,
+# `training-hint-u3.toml`'s body value for value -- batch 64, lr 4e-4, `warmup_cosine` 250 / 1e-6,
+# seed 0, 20,000 steps with checkpoints at 1,000 / 5,000 / 20,000, cuda, the ImageNet ResNet18
+# `base_model` with `base_model_fetch = "resnet18"`, no `--resident-gpu`. That file's header says
+# why each setting is what it is; `cargo test -p es --test views
+# views_recipes_and_cycles_mirror_the_hint_card` holds the two bodies equal.
+#
+# A recipe names no IR document -- the bundle does (`[policy] bundle`, which `es loop cycle`
+# replaces with its `[collect] policy`) -- so this is the one-view arm's recipe too
+# (`training-cam.toml`). Two files so that either arm's recipe can move alone, a second training
+# seed first.
+#
+# What three views change for this recipe, written down before experiment 1 measures it:
+#  * `--init-backbone` loads the ImageNet weights into every lowered backbone
+#    (`python/es/train_act.py`), so learning-views.toml's three ResNet18s start from the same
+#    weights and train apart. One shared encoder is plan N's `share` (packet N5).
+#  * The baked training set holds three image tensors instead of one. By training-hint-u3.toml's
+#    arithmetic one view of today's 200 demonstrations at the `Pad(4)` boundary, [3, 104, 104] F32,
+#    is 12,865.8 MiB; three are 38,597 MiB (37.7 GiB), in host RAM because there is no
+#    `--resident-gpu` -- against this PC's 64 GB and 4 GB page file. Not measured yet.
+#
+# `es train --recipe <this> --out <dir> --dry-run` needs neither the dataset, the bundle, the
+# backbone nor Python.
+
+kind = "training"
+
+[dataset]
+root   = "runs/collect-001/ds"
+frames = "runs/collect-001/frames"
+
+[policy]
+bundle           = "runs/collect-001/untrained.esb"
+base_model       = "target/backbone/resnet18-imagenet1k-v1.safetensors"
+base_model_fetch = "resnet18"
+
+[run]
+steps         = 20000
+batch         = 64
+lr            = 4e-4
+seed          = 0
+checkpoint_at = [1000, 5000, 20000]
+device        = "cuda"
+interpreter   = "python"
+schedule      = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }

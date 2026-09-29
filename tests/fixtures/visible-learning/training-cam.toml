@@ -1,0 +1,40 @@
+# Plan N's experiment 1, the one-view arm's training recipe (packet M15/N1,
+# docs/packets/M15/plan-n.md, docs/design/multi-camera.md section 4): M7/U row U3's run settings,
+# `training-hint-u3.toml`'s body value for value -- batch 64, lr 4e-4, `warmup_cosine` 250 / 1e-6,
+# seed 0, 20,000 steps with checkpoints at 1,000 / 5,000 / 20,000, cuda, the ImageNet ResNet18
+# `base_model` with `base_model_fetch = "resnet18"`, no `--resident-gpu`. That file's header says
+# why each setting is what it is, and what the one-view bake of 200 demonstrations costs
+# (12,865.8 MiB at the `Pad(4)` boundary); `cargo test -p es --test views
+# views_recipes_and_cycles_mirror_the_hint_card` holds the two bodies equal.
+#
+# A recipe names no IR document -- the bundle does (`[policy] bundle`, which `es loop cycle`
+# replaces with its `[collect] policy`) -- so this is the three-view arm's recipe too
+# (`training-views.toml`). Two files so that either arm's recipe can move alone, a second training
+# seed first.
+#
+# The graph it trains is learning-cam.toml: U3's without the simulator-privileged `sim_cube_pose`
+# branch, so it starts from the ImageNet backbone and never from a U3 checkpoint.
+#
+# `es train --recipe <this> --out <dir> --dry-run` needs neither the dataset, the bundle, the
+# backbone nor Python.
+
+kind = "training"
+
+[dataset]
+root   = "runs/collect-001/ds"
+frames = "runs/collect-001/frames"
+
+[policy]
+bundle           = "runs/collect-001/untrained.esb"
+base_model       = "target/backbone/resnet18-imagenet1k-v1.safetensors"
+base_model_fetch = "resnet18"
+
+[run]
+steps         = 20000
+batch         = 64
+lr            = 4e-4
+seed          = 0
+checkpoint_at = [1000, 5000, 20000]
+device        = "cuda"
+interpreter   = "python"
+schedule      = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
