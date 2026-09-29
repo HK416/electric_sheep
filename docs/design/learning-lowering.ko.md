@@ -125,8 +125,12 @@ class EsPolicy(nn.Module):
   `forward(self, keep_views=None, **inputs)`를 얻는다(패킷 M15/N7). 모든 추론 경로에서 `None`이라
   모든 항이 더해진다. 이것을 넘기는 것은 `train_act.py --single-view`뿐이며, 거기서 이름이 빠진
   카메라의 항은 합에서 빠진다 — 그 카메라 없이 배포된 번들이 계산하는 것이지, 0 이미지가 주는
-  것이 아니다. `contract.json`은 그 카메라들을 `sum_views`로 적는다(비면 없음). `Sum`이 없는
-  그래프는 `forward(self, **inputs)`를 바이트 그대로 유지한다.
+  것이 아니다. `keep_views`는 그런 부분집합들의 **리스트**일 수도 있다(패킷 M15/N7b). 이때 모든
+  `Sum`보다 앞선 노드 — 각 인코더, state 경로 — 는 한 번만 돌고, `Sum`과 그 뒤의 모든 것을 담은
+  내부 함수 `post(keep_views)`가 부분집합마다 한 번씩 돌며, `forward`는 부분집합마다 출력 하나를
+  돌려준다. `train_act.py --single-view`는 `[None, (v1,), ...]`을 넘기므로 한 스텝의 인코더 적용은
+  `V * (1 + V)`번이 아니라 `V`번이다. `contract.json`은 그 카메라들을 `sum_views`로 적는다(비면
+  없음). `Sum`이 없는 그래프는 `forward(self, **inputs)`를 바이트 그대로 유지한다.
 - **`ActionChunker`.** `execute_chunk`를 제외한 나머지 — `replan_hz`, `mode`, `blend`,
   `buffer_chunks` — 는 텐서 연산이 아니라 런타임 스케줄링(spec 8.6)이다. lowering은
   `execute_chunk`만 소비하고 나머지는 **의도적으로** 무시한다; 비동기 버퍼와 blend 정책은 env

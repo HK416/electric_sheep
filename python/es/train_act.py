@@ -138,9 +138,11 @@ is what a bundle deployed without them computes (design note section 3.4) -- not
 which a backbone does not map to a zero feature. `keep_views` is the lowering's (`_sum` in
 `crates/es-policy/src/lower/torch.rs`) and this is its only caller; inference never passes it.
 The views are `contract.json`'s `sum_views`, the cameras whose encoders meet in a `Sum`, and a
-module without any is refused here as `es train` refuses the recipe. Each view's pass runs the
-whole module again (every encoder, the dropped ones' outputs discarded), so a step costs
-`1 + len(views)` forwards. Both terms are logged -- `loss_all` and `loss_single` on each
+module without any is refused here as `es train` refuses the recipe. The `1 + len(views)` passes
+are **one** forward (packet M15/N7b, `single_view_loss`): `keep_views` given as the list
+`[None, (v1,), (v2,), ...]` runs every encoder once and only the `Sum` and what follows it once
+per subset, so a step costs `len(views)` encoder applications, not `len(views) * (1 +
+len(views))`; the loss is the separate passes' to the bit. Both terms are logged -- `loss_all` and `loss_single` on each
 progress line, and a `single_view` block in the summary -- and `loss` stays the sum that was
 optimized. Without the flag nothing here runs and the loop is the loop of before, bit for bit.
 
@@ -494,6 +496,20 @@ def make_samples(episodes: list, chunk: int) -> list:
     return samples
 
 
+def single_view_loss(forward, inputs: dict, target, weights, views: list, alpha: float) -> tuple:
+    """`(loss, loss_all, loss_single)` of one `--single-view` step, from **one** forward.
+
+    The subsets `[None, (v1,), (v2,), ...]` go to the lowered module as one `keep_views` list
+    (packet M15/N7b): every encoder runs once, and the `Sum` and what follows it once per
+    subset. The numbers are those of `1 + len(views)` separate forwards, bit for bit
+    (`crates/es-policy/tests/sum_share.rs`); only the gradient's sum order differs.
+    """
+    outs = forward(keep_views=[None] + [(view,) for view in views], **inputs)
+    per = [((next(iter(o.values())) - target).abs() * weights).mean() for o in outs]
+    loss_all, loss_single = per[0], torch.stack(per[1:]).mean()
+    return loss_all + alpha * loss_single, loss_all, loss_single
+
+
 # --- the loop -------------------------------------------------------------------------------
 
 
@@ -797,22 +813,17 @@ def main(argv: list) -> int:
             inputs[port] = batch.reshape([len(picked)] + shape)
         target = torch.stack([episodes[i]["action"][rows] for i, _, rows in picked]).to(device)
         with amp:
-            predicted = next(iter(forward(**inputs).values()))
-            # `(|d| * w).mean()` over [batch, chunk, action_dim]; with every weight 1 this is
-            # exactly `l1_loss`, and the batch mean is the average of the per-sample means the
-            # accumulation loop summed -- the same gradient, one sum order later.
-            loss = ((predicted - target).abs() * weights).mean()
-            if a.single_view is not None:
+            if a.single_view is None:
+                predicted = next(iter(forward(**inputs).values()))
+                # `(|d| * w).mean()` over [batch, chunk, action_dim]; with every weight 1 this
+                # is exactly `l1_loss`, and the batch mean is the average of the per-sample
+                # means the accumulation loop summed -- the same gradient, one sum order later.
+                loss = ((predicted - target).abs() * weights).mean()
+            else:
                 # Each camera alone: its term is the only one the `Sum` keeps (the header).
-                alone = [
-                    (
-                        (next(iter(forward(keep_views=(view,), **inputs).values())) - target).abs()
-                        * weights
-                    ).mean()
-                    for view in views
-                ]
-                loss_all, loss_single = loss, torch.stack(alone).mean()
-                loss = loss_all + a.single_view * loss_single
+                loss, loss_all, loss_single = single_view_loss(
+                    forward, inputs, target, weights, views, a.single_view
+                )
         loss.backward()
         if a.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(trainable, a.grad_clip)

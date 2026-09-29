@@ -130,8 +130,13 @@ Notes on the entries that are not obvious:
   `forward(self, keep_views=None, **inputs)` (packet M15/N7): `None` on every inference path,
   so every term is summed; `train_act.py --single-view` alone passes it, and a camera it does
   not name has its term left out of the sum -- what a bundle without that camera computes,
-  not what a zero image would. `contract.json` lists the cameras as `sum_views` (absent when
-  empty). A graph without a `Sum` keeps `forward(self, **inputs)` byte for byte.
+  not what a zero image would. `keep_views` may also be a **list** of such subsets (packet
+  M15/N7b): the nodes upstream of every `Sum` -- each encoder, the state path -- run once, an
+  inner `post(keep_views)` holding the `Sum` and everything downstream runs once per subset,
+  and `forward` returns one output per subset; `train_act.py --single-view` passes
+  `[None, (v1,), ...]`, so a step applies the encoders `V` times instead of `V * (1 + V)`.
+  `contract.json` lists the cameras as `sum_views` (absent when empty). A graph without a
+  `Sum` keeps `forward(self, **inputs)` byte for byte.
 - **`ActionChunker`.** Everything about it except `execute_chunk` — `replan_hz`, `mode`,
   `blend`, `buffer_chunks` — is runtime scheduling (spec 8.6), not a tensor operation. The
   lowering consumes `execute_chunk` and ignores the rest **by design**; the async buffer and

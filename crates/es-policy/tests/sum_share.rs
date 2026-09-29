@@ -13,8 +13,10 @@
 //! lowered module equals `python/sum_share_ref.py` -- one hand-written `ResNet18` applied to
 //! each camera and the features added with `+` -- on fixed inputs, **bitwise** on CPU; the
 //! weight file it writes holds one copy of the encoder and loads through `TorchRuntime`
-//! (`validate_keys` included); and `train_act.py`'s `init_backbone` finds exactly one backbone,
-//! the owner's, to initialise.
+//! (`validate_keys` included); `train_act.py`'s `init_backbone` finds exactly one backbone,
+//! the owner's, to initialise; and its single-view loss from one forward over a list of view
+//! subsets is N7's `1 + V` separate forwards bitwise, with the encoder run `V` times instead
+//! of `V * (1 + V)` (packet M15/N7b).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -328,6 +330,15 @@ fn a_share_group_lowers_to_one_module_applied_per_view() {
     );
     assert_eq!(Contract::new(&m, &g).sum_views, VIEWS);
     assert_eq!(es_policy::lower::sum_views(&g), VIEWS);
+    // Packet M15/N7b: the encoders and the state path run once, before `post`; the `Sum` and
+    // the head are inside it, which a list of view subsets runs once per subset.
+    let (once, per_subset) = m
+        .source
+        .split_once("def post(keep_views):\n")
+        .expect("a Sum graph has an inner post");
+    assert!(once.contains("v0_out = self.n1(") && once.contains("v3_out = self.n3("));
+    assert!(per_subset.contains("v4_out = _sum(") && !per_subset.contains("self.n1("));
+    assert!(per_subset.contains("return [post(keep) for keep in keep_views]"));
     // One claim for the group, none for the sharers.
     let claims: Vec<&String> = m.weight_keys.iter().filter(|k| k.ends_with(".*")).collect();
     assert_eq!(claims, ["nodes.1.*"]);
@@ -483,7 +494,7 @@ fn the_lowered_share_and_sum_equal_a_hand_written_module() {
         "owner": OWNER, "state": STATE_NODE, "head": HEAD,
         "views": VIEWS, "image": IMAGE, "state_dim": STATE, "width": W, "hidden": W,
         "horizon": HORIZON, "action_dim": ACTION_DIM, "execute": EXECUTE, "batch": 4,
-        "keep_views": true,
+        "keep_views": true, "single_view": 0.5,
     });
     let out = Command::new(&python)
         .args(["-c", REF, &spec.to_string()])
@@ -571,11 +582,32 @@ fn the_lowered_share_and_sum_equal_a_hand_written_module() {
     }
     assert_eq!(reply["keep_every_view_is_default"], true, "{reply}");
 
+    // 6. Packet M15/N7b: `train_act.py`'s single-view loss from one forward (a list of view
+    //    subsets) is N7's `1 + V` separate forwards to the bit, its gradient within spec 8.9's
+    //    tier-4 fp32 (only the sum order moved), and the shared encoder runs once per view
+    //    instead of once per view per pass.
+    let sv = &reply["single_view"];
+    assert_eq!(sv["loss_bitwise"], true, "{sv}");
+    assert_eq!(sv["grad_tensors"][0], sv["grad_tensors"][1], "{sv}");
+    let rel = sv["grad_max_rel"].as_f64().expect("a number");
+    assert!(rel <= Tolerance::TIER4_FP32.rel, "{sv}");
+    let views = VIEWS.len() as u64;
+    assert_eq!(sv["encoder_calls"]["separate"], views * (1 + views), "{sv}");
+    assert_eq!(sv["encoder_calls"]["shared"], views, "{sv}");
+
     println!(
         "RAN the_lowered_share_and_sum_equal_a_hand_written_module: torch {}, bitwise over a \
          batch of 4 (and with each camera alone); one ResNet18 copy ({backbone} tensors under \
-         nodes.1); TorchRuntime sample 0 max_abs {:.3e}; init_backbone -> {}",
-        reply["torch"], e.max_abs, report[0]["member"]
+         nodes.1); TorchRuntime sample 0 max_abs {:.3e}; init_backbone -> {}; single-view \
+         loss {} bitwise, grad max_rel {rel:.3e}, encoder calls {} -> {}, seconds {} -> {}",
+        reply["torch"],
+        e.max_abs,
+        report[0]["member"],
+        sv["loss"][1],
+        sv["encoder_calls"]["separate"],
+        sv["encoder_calls"]["shared"],
+        sv["seconds"]["separate"],
+        sv["seconds"]["shared"]
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -10,14 +10,17 @@
 //! encoders that name one owner are **one** member, `self.n<owner>`, applied to each view on
 //! each encoder's own forward line. A sharer owns no parameter, declares no weight key, and a
 //! checkpoint that still carries tensors under its id is refused by name
-//! (`weights::validate_keys`). A graph with no `share` and no `Sum` lowers byte for byte as
-//! before either existed.
+//! (`weights::validate_keys`). The other is a graph with a `Sum` (packet M15/N7b): its lines
+//! keep topological order but split in two -- the nodes upstream of every `Sum` in `forward`
+//! itself, the `Sum` and everything downstream in an inner `post(keep_views)` -- so a trainer
+//! can run the encoders once and the rest once per view subset (`SUM_PY`). A graph with no
+//! `share` and no `Sum` lowers byte for byte as before either existed.
 //!
 //! Determinism is a hard requirement, not a nicety: `lowering_hash` is a component of the
 //! compiler identity, so the same graph must produce byte-identical source. Everything here
 //! iterates a `BTreeMap` or a `Vec` built in topological order (spec 3.4).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 use es_ir::graph::{IrNode, NodeId};
@@ -360,6 +363,13 @@ class _FlowHead(nn.Module):
 /// and not what a zero image would (a backbone does not map zeros to a zero feature). A term
 /// that is not a camera (`None`) is always kept. The dropped camera's encoder still runs; its
 /// output is discarded and receives no gradient.
+///
+/// `keep_views` may also be a **list** of such subsets (packet M15/N7b), and `forward` then
+/// returns one output dict per subset: the nodes upstream of every `Sum` -- each camera's
+/// encoder, the state path -- run **once**, and `forward`'s inner `post`, the `Sum` and every
+/// node downstream of it, runs once per subset on those same features. That is what makes
+/// single-view training cost `V` encoder applications per step instead of `V * (1 + V)`. A
+/// `None` or a tuple is one call of `post` and returns what it always did.
 const SUM_PY: &str = r"
 
 def _sum(terms, views, keep_views):
@@ -373,7 +383,8 @@ def _sum(terms, views, keep_views):
 pub struct TorchModule {
     /// A self-contained Python file defining `class EsPolicy(nn.Module)` whose
     /// `forward(**inputs) -> dict` takes the graph's declared input names. A graph with a
-    /// `Sum` fusion also takes `keep_views=None` ([`SUM_PY`], packet M15/N7).
+    /// `Sum` fusion also takes `keep_views=None`, or a list of view subsets and then returns a
+    /// list of dicts ([`SUM_PY`], packets M15/N7 and N7b).
     pub source: String,
     /// Safetensors keys this module needs. An entry ending in `.*` is a *prefix claim* over an
     /// opaque sub-module (a torchvision backbone, a `torch.nn` transformer) whose internal
@@ -436,6 +447,9 @@ pub fn lower_to_torch(graph: &LearningGraph) -> Result<TorchModule, LowerError> 
         .topo_order()
         .map_err(|d| LowerError::Invalid(format!("{} {}", d.code, d.message)))?;
 
+    // A `Sum` and every node downstream of one (packet M15/N7b): the part of `forward` that
+    // runs once per view subset, while everything before it -- every encoder -- runs once.
+    let mut after_sum = BTreeSet::new();
     for id in order {
         let node = &graph.nodes.nodes[&id];
         let args = inputs_of(graph, id, node)?;
@@ -448,8 +462,26 @@ pub fn lower_to_torch(graph: &LearningGraph) -> Result<TorchModule, LowerError> 
                 node: id.0,
                 message: "the node has no output port".to_owned(),
             })?;
-        lo.body
-            .push(format!("        {} = {expr}", value_of(id, &out)));
+        let line = format!("{} = {expr}", value_of(id, &out));
+        let is_sum = matches!(
+            node,
+            LearningNode::Fusion {
+                kind: FusionKind::Sum,
+                ..
+            }
+        );
+        if is_sum
+            || graph
+                .nodes
+                .edges
+                .iter()
+                .any(|e| e.to.node == id && after_sum.contains(&e.from.node))
+        {
+            after_sum.insert(id);
+            lo.post.push(format!("            {line}"));
+        } else {
+            lo.body.push(format!("        {line}"));
+        }
     }
 
     let mut returns = Vec::new();
@@ -572,6 +604,9 @@ fn unsupported(kind: &str, variant: &impl std::fmt::Debug) -> LowerError {
 struct Lowering {
     members: Vec<String>,
     body: Vec<String>,
+    /// The `Sum` and everything downstream of it, indented for `forward`'s inner `post`
+    /// (packet M15/N7b). Empty for a graph with no `Sum`.
+    post: Vec<String>,
     keys: Vec<String>,
     shapes: BTreeMap<String, Vec<u64>>,
     needs_torchvision: bool,
@@ -1087,16 +1122,30 @@ impl Lowering {
             let _ = writeln!(source, "{m}");
         }
         // `keep_views` only where a `Sum` reads it, so every other graph's source is the
-        // source it always was (packet M15/N7).
-        source.push_str(if self.needs_sum {
-            "\n    def forward(self, keep_views=None, **inputs):\n"
+        // source it always was (packet M15/N7). With a `Sum`, the nodes before it run once
+        // and `post` -- the `Sum` and what follows -- once per subset ([`SUM_PY`], N7b).
+        if self.needs_sum {
+            source.push_str("\n    def forward(self, keep_views=None, **inputs):\n");
+            for line in &self.body {
+                let _ = writeln!(source, "{line}");
+            }
+            source.push_str("\n        def post(keep_views):\n");
+            for line in &self.post {
+                let _ = writeln!(source, "{line}");
+            }
+            let _ = writeln!(source, "            return {{{}}}", returns.join(", "));
+            source.push_str(
+                "\n        if isinstance(keep_views, list):\n\
+                 \x20           return [post(keep) for keep in keep_views]\n\
+                 \x20       return post(keep_views)\n",
+            );
         } else {
-            "\n    def forward(self, **inputs):\n"
-        });
-        for line in &self.body {
-            let _ = writeln!(source, "{line}");
+            source.push_str("\n    def forward(self, **inputs):\n");
+            for line in &self.body {
+                let _ = writeln!(source, "{line}");
+            }
+            let _ = writeln!(source, "        return {{{}}}", returns.join(", "));
         }
-        let _ = writeln!(source, "        return {{{}}}", returns.join(", "));
 
         TorchModule {
             lowering_hash: lowering_hash(&source),
