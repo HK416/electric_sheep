@@ -23,7 +23,9 @@ use std::path::{Path, PathBuf};
 use es_assets::scene::{Joint, JointKind, SceneDesc};
 use es_data::training::{preview_evaluation, Cycle, PreviewRef};
 use es_env::expert::{demo_cfg, so101_ik, Links};
-use es_env::program::{Block, Grip, Program, ProgramError, Target, OBJECT};
+use es_env::program::{place_point, Block, Program, ProgramError};
+/// What a block's fields hold, for the screen that edits them.
+pub use es_env::program::{Grip, Target, OBJECT};
 use es_env::ScriptedExpert;
 use es_eval::episodes::read_episodes;
 use es_eval::run_dir::RunDir;
@@ -705,6 +707,20 @@ impl Teach {
             .collect()
     }
 
+    /// Where `target` is on the floor, `[x, y]` in metres: a point's own, a place's
+    /// ([`place_point`]), the object's where the scene puts it - where a move switched to a point
+    /// starts. `None` when the scene did not load or has no such thing.
+    pub fn point_of(&self, target: &Target) -> Option<[f64; 2]> {
+        let scene = &self.world.as_ref().ok()?.scene;
+        match target {
+            Target::Point(p) => Some(*p),
+            Target::Named(name) if name == OBJECT => (scene.bodies.iter())
+                .find(|b| b.name == self.program.object)
+                .map(|b| [b.pose.position.x, b.pose.position.y]),
+            Target::Named(name) => place_point(scene, name).map(|p| [p.x, p.y]),
+        }
+    }
+
     /// A grip block's wait is a whole number of these seconds: one demonstrator step
     /// (`ExpertCfg::pace_to`: the re-plan period at the control rate).
     pub fn wait_step(&self) -> Option<f64> {
@@ -1087,6 +1103,12 @@ mod tests {
         assert_ne!(labels(&teach, Lang::Ko), labels(&teach, Lang::En));
         assert_eq!(teach.places(), ["bin"]);
         assert_eq!(teach.wait_step(), Some(0.2));
+        // A target switched to a point starts where it was: the bin's floor exactly.
+        let bin = Target::Named("bin".into());
+        assert_eq!(teach.point_of(&bin), Some([0.14, -0.1]));
+        assert!(teach.point_of(&Target::Named(OBJECT.into())).is_some());
+        assert_eq!(teach.point_of(&Target::Point([0.2, 0.0])), Some([0.2, 0.0]));
+        assert_eq!(teach.point_of(&Target::Named("shelf".into())), None);
         std::fs::remove_dir_all(&project.root).ok();
     }
 
