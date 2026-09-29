@@ -117,17 +117,9 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
         return drawn;
     }
     match pane {
-        Pane::StepPanel => {
-            egui::ScrollArea::vertical()
-                .id_salt("teach-panel")
-                .show(ui, |ui| panel(app, ui));
-        }
+        Pane::StepPanel => panel(app, ui),
         Pane::Viewport => centre(app, ui),
-        _ => {
-            egui::ScrollArea::vertical()
-                .id_salt("teach-inspector")
-                .show(ui, |ui| inspector(app, ui));
-        }
+        _ => inspector(app, ui),
     }
     true
 }

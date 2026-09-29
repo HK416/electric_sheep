@@ -81,6 +81,16 @@ impl Pane {
             AdvancedLive => Some("tab.live.hint"),
         }
     }
+
+    /// Whether the dock scrolls the pane up and down. The rest size themselves to the pane: the
+    /// viewport's canvas, players and tiles, the log's own stick-to-bottom list, the graph's
+    /// panning canvas, and the run table's panels, each of which scrolls inside.
+    pub fn scrolls(self) -> bool {
+        match self {
+            StepPanel | Summary | AdvancedSees | AdvancedProblems | AdvancedLive => true,
+            Viewport | Console | AdvancedGraph | AdvancedMetrics => false,
+        }
+    }
 }
 
 /// The panes of one arrangement, by where they sit. The first pane of a group is its open tab.
@@ -341,6 +351,11 @@ mod tests {
             let advanced = p.hint_key().is_some();
             assert_eq!(advanced, format!("{p:?}").starts_with("Advanced"), "{p:?}");
         }
+    }
+
+    #[test]
+    fn the_side_panes_scroll_and_the_viewport_does_not() {
+        assert!(Pane::StepPanel.scrolls() && Pane::Summary.scrolls() && !Pane::Viewport.scrolls());
     }
 
     fn arrangements() -> Vec<Arrangement> {

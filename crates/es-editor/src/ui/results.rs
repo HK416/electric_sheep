@@ -155,75 +155,68 @@ fn step_panel(app: &mut EditorApp, ui: &mut egui::Ui) {
     let mut run_again = None;
     let mut again = None;
     let mut status = None;
-    egui::ScrollArea::vertical()
-        .id_salt("results-left")
-        .auto_shrink([false, false])
-        .show(ui, |ui| {
-            verdict(lang, ui, shown);
-            ui.separator();
-            if let Some(rows) = shown.rows.as_deref() {
-                ui.strong(t(lang, "results.why"));
-                let causes = results::causes(rows, &shown.outcomes);
-                if causes.is_empty() {
-                    ui.label(t(lang, "results.no_failures"));
-                }
-                for (cause, n) in causes {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(shown.cause_label(lang, cause)).strong());
-                        ui.weak(fill(lang, "results.times", &[&n.to_string()]));
-                    });
-                    ui.weak(t(lang, labels::cause_advice_key(cause)));
-                }
-                ui.separator();
-            }
-            let reason = if dialogs::AVAILABLE {
-                "results.no_export"
-            } else {
-                "open.no_dialog.hint"
-            };
-            let export = ui
-                .add_enabled(
-                    dialogs::AVAILABLE && shown.export.is_some(),
-                    egui::Button::new(t(lang, "results.export")),
-                )
-                .on_hover_text(t(lang, "results.export.hint"))
-                .on_disabled_hover_text(t(lang, reason));
-            if let (true, Some(bundle), Some(open)) =
-                (export.clicked(), &shown.export, &app.project)
-            {
-                let name = results::export_name(&open.project, &shown.run, bundle);
-                if let Some(dest) = dialogs::save_file(&name, Browse::Policy.filter()) {
-                    // ponytail: copied on the UI thread; a bundle is tens of MB, well under a
-                    // second. A background copy when bundles grow past that.
-                    status = Some(match std::fs::copy(bundle, &dest) {
-                        Ok(_) => fill(lang, "results.exported", &[&dest.display().to_string()]),
-                        Err(e) => format!("{}: {e}", dest.display()),
-                    });
-                }
-            }
-            if ui
-                .button(t(lang, "results.run_again"))
-                .on_hover_text(t(lang, "results.run_again.hint"))
-                .clicked()
-            {
-                run_again = Some(shown.settings);
-            }
-            // Packet M13/Z4b: the same settings and the plan, which ③ shows and starts only on
-            // Start (review of plan Z, R1).
-            let reason = shown.again.as_ref().err().copied().unwrap_or_default();
-            if ui
-                .add_enabled(
-                    shown.again.is_ok(),
-                    egui::Button::new(t(lang, "results.again")),
-                )
-                .on_disabled_hover_text(t(lang, reason))
-                .clicked()
-            {
-                again = shown.again.clone().ok();
-                run_again = Some(shown.settings);
-            }
-            ui.weak(t(lang, "results.again.about"));
-        });
+    verdict(lang, ui, shown);
+    ui.separator();
+    if let Some(rows) = shown.rows.as_deref() {
+        ui.strong(t(lang, "results.why"));
+        let causes = results::causes(rows, &shown.outcomes);
+        if causes.is_empty() {
+            ui.label(t(lang, "results.no_failures"));
+        }
+        for (cause, n) in causes {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(shown.cause_label(lang, cause)).strong());
+                ui.weak(fill(lang, "results.times", &[&n.to_string()]));
+            });
+            ui.weak(t(lang, labels::cause_advice_key(cause)));
+        }
+        ui.separator();
+    }
+    let reason = if dialogs::AVAILABLE {
+        "results.no_export"
+    } else {
+        "open.no_dialog.hint"
+    };
+    let export = ui
+        .add_enabled(
+            dialogs::AVAILABLE && shown.export.is_some(),
+            egui::Button::new(t(lang, "results.export")),
+        )
+        .on_hover_text(t(lang, "results.export.hint"))
+        .on_disabled_hover_text(t(lang, reason));
+    if let (true, Some(bundle), Some(open)) = (export.clicked(), &shown.export, &app.project) {
+        let name = results::export_name(&open.project, &shown.run, bundle);
+        if let Some(dest) = dialogs::save_file(&name, Browse::Policy.filter()) {
+            // ponytail: copied on the UI thread; a bundle is tens of MB, well under a
+            // second. A background copy when bundles grow past that.
+            status = Some(match std::fs::copy(bundle, &dest) {
+                Ok(_) => fill(lang, "results.exported", &[&dest.display().to_string()]),
+                Err(e) => format!("{}: {e}", dest.display()),
+            });
+        }
+    }
+    if ui
+        .button(t(lang, "results.run_again"))
+        .on_hover_text(t(lang, "results.run_again.hint"))
+        .clicked()
+    {
+        run_again = Some(shown.settings);
+    }
+    // Packet M13/Z4b: the same settings and the plan, which ③ shows and starts only on
+    // Start (review of plan Z, R1).
+    let reason = shown.again.as_ref().err().copied().unwrap_or_default();
+    if ui
+        .add_enabled(
+            shown.again.is_ok(),
+            egui::Button::new(t(lang, "results.again")),
+        )
+        .on_disabled_hover_text(t(lang, reason))
+        .clicked()
+    {
+        again = shown.again.clone().ok();
+        run_again = Some(shown.settings);
+    }
+    ui.weak(t(lang, "results.again.about"));
     if let Some(status) = status {
         app.status = status;
     }
@@ -390,10 +383,11 @@ fn summary(app: &mut EditorApp, ui: &mut egui::Ui) {
     };
     let report = &shown.dir.report;
     let ir = shown.ir.as_ref();
-    // Both ways: the numbers table is wider than a narrow side pane.
-    egui::ScrollArea::both()
+    // Sideways: the numbers table is wider than a narrow side pane. The dock scrolls it up and
+    // down (`Pane::scrolls`).
+    egui::ScrollArea::horizontal()
         .id_salt("results-right")
-        .auto_shrink([false, false])
+        .auto_shrink([false, true])
         .show(ui, |ui| {
             ui.heading(t(lang, "results.situations"));
             for s in results::situations(report, shown.rows.as_deref(), ir) {

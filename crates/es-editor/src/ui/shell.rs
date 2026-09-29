@@ -307,9 +307,9 @@ impl TabViewer for Panes<'_> {
         false
     }
 
-    /// The panes lay themselves out, as the tabs did in the window before the dock.
-    fn scroll_bars(&self, _pane: &Pane) -> [bool; 2] {
-        [false, false]
+    /// Up and down for the panes [`Pane::scrolls`] names; the rest lay themselves out.
+    fn scroll_bars(&self, pane: &Pane) -> [bool; 2] {
+        [false, pane.scrolls()]
     }
 }
 
