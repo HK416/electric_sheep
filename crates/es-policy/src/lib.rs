@@ -28,6 +28,8 @@ pub mod lower;
 #[cfg(test)]
 mod reference;
 pub mod runtime;
+/// `es policy subset`: a bundle that reads fewer cameras with the same weights (packet M15/N8).
+pub mod subset;
 pub mod torch_runtime;
 pub mod weights;
 

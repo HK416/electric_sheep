@@ -31,6 +31,7 @@ es policy init  --task <t.toml> --observation <o.toml> [--learning <l.toml>]
                 --deployment <d.toml> [--seed <n>] --out <out.esb>
 es policy lower --policy <in.esb> --out <dir>
 es policy pack  --policy <in.esb> --weights <model.safetensors> --out <out.esb>
+es policy subset --policy <in.esb> --views <name,...> --out <out.esb>
 es policy import-lerobot --checkpoint <dir> --task <t.toml> --observation <o.toml>
                          --deployment <d.toml> --out <out.esb>
 es policy import-rl --manifest <import.json> --weights <w.safetensors>
@@ -66,6 +67,20 @@ pack    Reads <model.safetensors>, checks every key and every shape against the 
         padded or reshaped. The Task, Observation and Deployment IR are carried across
         unchanged, so `es eval run --policy <out.esb>` loads it with no change to the
         eval path.
+
+subset  Writes a bundle that reads only the named camera views (Learning IR input names,
+        e.g. rgb_wrist), with the parent's weights (packet M15/N8,
+        docs/design/multi-camera.md section 3.4). The dropped views' Observation IR chains
+        and outputs, their encoders, their contract inputs and their terms of the Sum
+        fusion go; non-camera inputs stay; a Sum left with one term becomes that term. Every
+        kept tensor is copied byte for byte -- a dropped group owner's under the name of its
+        lowest-id kept sharer, which becomes the owner. New hashes follow; the weights'
+        safetensors __metadata__ records `es.subset.of` (the parent's policy_hash) and
+        `es.subset.views`. The Task and Deployment IR are carried across unchanged.
+        Refused by name: a view the bundle does not have, no view kept, a graph whose views
+        do not meet in a Sum fusion, and a dropped view whose encoder feeds anything but one
+        Sum term (a Concat, a second consumer) -- dropping it would change what that node
+        was trained on.
 
 import-lerobot
         Admits a policy designed and trained **outside** this project -- a LeRobot ACT
@@ -126,6 +141,7 @@ pub fn dispatch(args: &[String]) -> i32 {
         Some("init") => init(&args[1..]),
         Some("lower") => lower(&args[1..]),
         Some("pack") => pack(&args[1..]),
+        Some("subset") => subset(&args[1..]),
         Some("import-lerobot") => import_lerobot(&args[1..]),
         Some("import-rl") => import_rl(&args[1..]),
         Some("--help" | "-h") | None => {
@@ -318,6 +334,54 @@ pub(crate) fn pack(args: &[String]) -> Result<u8, CliError> {
     println!("tensors:       {}", header.len());
     println!("weights_hash:  {}", hex(learning.policy.weights.hash()));
     println!("lowering_hash: {}", hex(&module.lowering_hash));
+    for (slot, value) in [
+        ("task", reopened.manifest.hashes.task),
+        ("observation", reopened.manifest.hashes.observation),
+        ("learning", reopened.manifest.hashes.learning),
+        ("policy", reopened.manifest.hashes.policy),
+    ] {
+        if let Some(h) = value {
+            println!("{slot}_hash: {}", hex(&h));
+        }
+    }
+    Ok(0)
+}
+
+/// `es policy subset` — the same weights reading fewer cameras (packet M15/N8). The rewrite and
+/// its rules are `es_policy::subset`'s; this is the file handling around it.
+fn subset(args: &[String]) -> Result<u8, CliError> {
+    let a = parse(args, &["--policy", "--views", "--out"])?;
+    let parent = &a["--policy"];
+    let bundle = open_bundle(parent)?;
+    let keep: Vec<String> = a["--views"]
+        .split(',')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let s = es_policy::subset::subset(&bundle, &keep).map_err(|e| {
+        CliError::Runtime(match &e {
+            es_policy::subset::SubsetError::Weights(w) => mismatch(parent, w),
+            _ => format!("{parent}: {e}"),
+        })
+    })?;
+
+    let out = PathBuf::from(&a["--out"]);
+    if let Some(dir) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
+    }
+    std::fs::write(&out, &s.bytes)
+        .map_err(|e| CliError::Runtime(format!("{}: {e}", out.display())))?;
+    // Reopened rather than trusted, like `pack`.
+    let reopened = PolicyBundle::open(&s.bytes)
+        .map_err(|e| CliError::Runtime(format!("the bundle just written does not open: {e}")))?;
+    println!("bundle:        {}", out.display());
+    println!("subset_of:     {}", hex(&s.parent));
+    println!("views:         {}", s.views.join(","));
+    for (from, to) in &s.rehomed {
+        println!("owner:         node {from} -> node {to} (its tensors renamed, not changed)");
+    }
     for (slot, value) in [
         ("task", reopened.manifest.hashes.task),
         ("observation", reopened.manifest.hashes.observation),
@@ -781,7 +845,117 @@ fn declared_latency_ms(budget_ms: f32, replanning_hz: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::declared_latency_ms;
+    use super::{declared_latency_ms, subset, CliError};
+    use es_compile::PolicyBundle;
+    use es_ir::graph::{NodeId, Port};
+    use es_ir::learning::{FusionKind, LearningGraph, LearningNode, WeightsRef};
+    use es_ir::serial;
+    use es_policy::weights::{write_safetensors, Checkpoint};
+    use std::path::{Path, PathBuf};
+
+    /// `es policy subset` end to end on plan N's three-view documents (packet M15/N8): it writes
+    /// a bundle reading the one named view, and refuses by name. The rewrite's own oracles are
+    /// `crates/es-policy/tests/subset.rs`.
+    #[test]
+    fn subset_writes_a_bundle_of_the_named_views_and_refuses_by_name() {
+        let root =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/visible-learning");
+        let read = |name: &str| std::fs::read_to_string(root.join(name)).expect("a fixture");
+        let dir = std::env::temp_dir().join(format!("es-policy-subset-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch");
+        // A bundle of `g` under the three-view documents, with weights that fit its lowering.
+        let bundle = |g: &LearningGraph, name: &str| -> PathBuf {
+            let m = es_policy::lower_to_torch(g).expect("lowers");
+            let mut file: Checkpoint = m
+                .weight_shapes
+                .iter()
+                .map(|(k, s)| {
+                    (
+                        k.clone(),
+                        (s.clone(), vec![0.25; s.iter().product::<u64>() as usize]),
+                    )
+                })
+                .collect();
+            for claim in m.weight_keys.iter().filter(|k| k.ends_with(".*")) {
+                file.insert(
+                    format!("{}fc.bias", claim.trim_end_matches('*')),
+                    (vec![1], vec![1.0]),
+                );
+            }
+            let weights = write_safetensors(&file);
+            let mut g = g.clone();
+            g.policy.weights = WeightsRef::Safetensors {
+                path: g.policy.weights.path().to_owned(),
+                hash: *blake3::hash(&weights).as_bytes(),
+            };
+            let bytes = PolicyBundle::build(
+                &serial::task_from_toml(&read("task-views.toml")).expect("task"),
+                &serial::observation_from_toml(&read("observation-views.toml")).expect("obs"),
+                &g,
+                &serial::deployment_from_toml(&read("deployment.toml")).expect("deployment"),
+                &weights,
+            )
+            .expect("builds");
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).expect("write");
+            path
+        };
+        // Experiment 1's graph (three encoders into a Concat), and it made MAD's: one group
+        // owned by the overhead encoder (0), the three features summed by a new node 8.
+        let concat = serial::learning_from_toml(&read("learning-views.toml")).expect("parses");
+        let mut mad = concat.clone();
+        let Some(LearningNode::Fusion { inputs, .. }) = mad.nodes.nodes.get_mut(&NodeId(2)) else {
+            panic!("node 2 is the Concat")
+        };
+        let ty = inputs[0].ty.clone();
+        inputs.retain(|p| p.name == "image" || p.name == "state");
+        mad.nodes.insert(
+            NodeId(8),
+            LearningNode::Fusion {
+                inputs: ["overhead", "wrist", "side"]
+                    .map(|n| Port::new(n, ty.clone()))
+                    .to_vec(),
+                kind: FusionKind::Sum,
+                out_dim: 512,
+                token_count: 0,
+            },
+        );
+        mad.nodes
+            .edges
+            .retain(|e| e.to.node != NodeId(2) || e.to.port == "state");
+        for (from, to) in [(0, "overhead"), (6, "wrist"), (7, "side")] {
+            mad.nodes.connect(NodeId(from), "out", NodeId(8), to);
+            if let Some(LearningNode::VisionEncoder { share, .. }) =
+                mad.nodes.nodes.get_mut(&NodeId(from))
+            {
+                *share = (from != 0).then_some(NodeId(0));
+            }
+        }
+        mad.nodes.connect(NodeId(8), "out", NodeId(2), "image");
+
+        let parent = bundle(&mad, "mad.esb");
+        let args = |policy: &Path, views: &str, out: &Path| -> Vec<String> {
+            let (p, o) = (policy.display().to_string(), out.display().to_string());
+            ["--policy", &p, "--views", views, "--out", &o]
+                .map(str::to_owned)
+                .to_vec()
+        };
+        let out = dir.join("out").join("wrist.esb");
+        assert!(matches!(subset(&args(&parent, "rgb_wrist", &out)), Ok(0)));
+        let b = PolicyBundle::open(&std::fs::read(&out).expect("written")).expect("opens");
+        let inputs: Vec<&String> = b.learning.policy.contract.inputs.keys().collect();
+        assert_eq!(inputs, ["joint_state", "rgb_wrist"]);
+
+        let refused = |policy: &Path, views: &str| match subset(&args(policy, views, &out)) {
+            Err(CliError::Runtime(m)) => m,
+            _ => panic!("{views}: not refused"),
+        };
+        assert!(refused(&parent, "rgb_top").contains("no camera view \"rgb_top\""));
+        assert!(refused(&parent, " , ").contains("no view kept"));
+        let concat = bundle(&concat, "concat.esb");
+        assert!(refused(&concat, "rgb_wrist").contains("do not meet in a Sum fusion"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// The two plan-V deployments, and the rule `LRN-052` applies to the result.
     #[test]

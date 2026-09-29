@@ -40,7 +40,9 @@ struct RawEntry {
 }
 
 /// The header's JSON object and the length of the data segment behind it.
-fn header_of(bytes: &[u8]) -> Result<(BTreeMap<String, serde_json::Value>, u64), PolicyError> {
+pub(crate) fn header_of(
+    bytes: &[u8],
+) -> Result<(BTreeMap<String, serde_json::Value>, u64), PolicyError> {
     let len_bytes: [u8; 8] = bytes
         .get(..8)
         .and_then(|b| b.try_into().ok())
