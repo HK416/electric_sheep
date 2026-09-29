@@ -19,8 +19,8 @@ use es_data::{CollectReport, InterventionSegment};
 use es_env::expert::{demo_cfg, ScriptedExpert};
 use es_env::Termination;
 use es_eval::{LightOverride, PerturbationPlan, ResetOverrides, StepState};
-use es_ir::deployment::{DeploymentIr, Watchdog};
-use es_ir::evaluation::{EvaluationIr, PerturbationKind, SeedPlan};
+use es_ir::deployment::DeploymentIr;
+use es_ir::evaluation::{EvaluationIr, SeedPlan};
 use es_ir::types::ElemType;
 use es_physics_backend::{BackendKind, MjWarpBackend, MuJoCoCpuBackend, PhysXBackend};
 use es_physics_core::backend::ModelInfo;
@@ -667,49 +667,20 @@ pub(crate) fn refuse_evaluation_seeds(
     )))
 }
 
-/// The one thing this path cannot hand the Safety Plane that `es eval run` does: the
-/// collector's `DomainRunner` stamps an observation's age itself, so a held observation
-/// reaches `SafetyPlane::validate` as age 0 where the evaluation passes its true age. The plane
-/// reads that age only against a `stale_observation` watchdog, so a suite is realised when no
-/// age it can produce crosses that watchdog and refused otherwise, rather than judged by a
-/// different plane (spec 17.2) -- `frame_drop` whenever there is one, its bursts having no bound.
+/// The one thing this path cannot hand the Safety Plane that `es eval run` does, an
+/// observation's true age: the first chosen suite `es_eval::perturb::unseen_age` refuses, named.
+/// The editor's "train again" asks the same function before it offers a suite (review of plan
+/// Z, R2).
 fn refuse_unseen_age(
     ir: &EvaluationIr,
     cells: &[usize],
     deploy: &DeploymentIr,
     control_us: u64,
 ) -> Result<(), CliError> {
-    let Some(max_age) = deploy.watchdogs.0.iter().find_map(|w| match w {
-        Watchdog::StaleObservation { max_age } => Some(max_age.0),
-        _ => None,
-    }) else {
-        return Ok(());
-    };
-    for suite in cells.iter().map(|k| &ir.suites[*k]) {
-        for p in &suite.perturbations {
-            let worst = match &p.kind {
-                PerturbationKind::ObservationDelay { ms } => ms
-                    .iter()
-                    .map(|m| ms_to_steps(*m, control_us) as u64 * control_us)
-                    .max()
-                    .unwrap_or(0),
-                PerturbationKind::FrameDrop { .. } => u64::MAX,
-                _ => 0,
-            };
-            if worst > max_age {
-                return Err(CliError::Runtime(format!(
-                    "suite {:?}: {} can age the observation past the deployment's \
-                     stale_observation max_age of {max_age} us, and `es loop collect` cannot \
-                     hand the Safety Plane that age (its runner stamps its own), so the plane \
-                     here would not be the evaluation's -- refused rather than approximated \
-                     (spec 17.2)",
-                    suite.name,
-                    p.kind.name()
-                )));
-            }
-        }
+    match es_eval::perturb::unseen_age(ir, cells, deploy, control_us).first() {
+        Some(refused) => Err(CliError::Runtime(refused.to_string())),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 /// The `PolicyRuntime` slot under `--expert`: the bundle's Task, Observation and Deployment IR
@@ -1312,6 +1283,7 @@ fn merge_frames(inputs: &[(&Path, &Path)], out: &Path) -> Result<u64, CliError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use es_ir::deployment::Watchdog;
 
     fn fixture(name: &str) -> String {
         format!(
