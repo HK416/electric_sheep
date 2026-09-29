@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use es_data::collect::CollectEvent;
@@ -46,6 +47,8 @@ pub(crate) const STAGE_TRAIN: &str = "train";
 pub(crate) const STAGE_EVAL: &str = "eval";
 pub(crate) const STAGE_SHOWCASE: &str = "showcase";
 pub(crate) const STAGE_CYCLE: &str = "cycle";
+/// A checkpoint preview (packet M13/Z1): it runs beside the train stage, so it names itself.
+pub(crate) const STAGE_PREVIEW: &str = "preview";
 
 /// What one `--telemetry` triple says. Parsed by each command's own parser, because each has
 /// one already; bound by [`Publisher::bind`], which is the part that must not differ.
@@ -90,7 +93,8 @@ impl TelemetryArgs {
 
 /// The one place an event becomes a wire [`Frame`].
 pub(crate) struct Publisher {
-    server: Server,
+    /// Shared with the [`Voice`]s this publisher hands out, which speak on the same socket.
+    server: Arc<Server>,
     /// The address as it was asked for, for the closing summary line.
     addr: SocketAddr,
     /// Control ticks between two stream-4 images; `0` publishes none.
@@ -129,7 +133,7 @@ impl Publisher {
             .map_err(|e| CliError::Runtime(format!("--telemetry {addr}: {e}")))?;
         println!("telemetry: {}", server.local_addr());
         Ok(Self {
-            server,
+            server: Arc::new(server),
             addr,
             image_every,
             stage,
@@ -483,6 +487,69 @@ impl Publisher {
             self.addr,
             stats.clients.len()
         )
+    }
+
+    /// A second speaker on this socket, for work that runs beside a stage rather than in it.
+    pub(crate) fn voice(&self, stage: &'static str) -> Voice {
+        Voice {
+            server: Arc::clone(&self.server),
+            stage,
+        }
+    }
+}
+
+/// Stream-1 events from another thread on the [`Publisher`]'s socket (packet M13/Z1): the
+/// checkpoint previews, which run while the train stage holds the publisher. It says nothing
+/// but its own events, each carrying its own stage, at tick zero -- a preview has no place in
+/// the stage's physics clock. Non-blocking like everything else here (`Server::publish`).
+#[derive(Clone)]
+pub(crate) struct Voice {
+    server: Arc<Server>,
+    stage: &'static str,
+}
+
+impl Voice {
+    #[allow(clippy::default_trait_access)] // `PhysTick` is `es-core`'s, a dev-dependency here.
+    fn event(&self, kind: &str, mut fields: BTreeMap<String, String>) {
+        fields.insert("stage".to_owned(), self.stage.to_owned());
+        self.server.publish(Frame {
+            tick: Default::default(),
+            wall_ns: wall_ns(),
+            stream: STREAM_EVENTS,
+            payload: Payload::Event {
+                kind: kind.to_owned(),
+                fields,
+            },
+        });
+    }
+
+    /// A preview of checkpoint `step` starts; its results go to `dir`, relative to the run.
+    pub(crate) fn preview_begin(&self, step: u32, dir: &str) {
+        self.event(
+            "preview.begin",
+            fields([("step", step.to_string()), ("dir", dir.to_owned())]),
+        );
+    }
+
+    /// It ended: `successes` of `episodes`, and the child's exit code.
+    pub(crate) fn preview_end(
+        &self,
+        step: u32,
+        dir: &str,
+        successes: usize,
+        episodes: usize,
+        code: i32,
+    ) {
+        self.event(
+            "preview.end",
+            fields([
+                ("step", step.to_string()),
+                ("dir", dir.to_owned()),
+                ("successes", successes.to_string()),
+                ("episodes", episodes.to_string()),
+                ("code", code.to_string()),
+            ]),
+        );
     }
 }
 

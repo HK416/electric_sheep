@@ -10,20 +10,26 @@
 //! Only what those already spawn (the physics subprocess, the trainer, `--jobs` workers) is a
 //! process.
 
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 
 use es_compile::PolicyBundle;
 use es_data::collect::{
     append_loop_step, last_evaluation_hash, read_loop_steps, LoopKind, LoopStep, CHECKPOINT,
 };
-use es_data::training::{Cycle, CyclePlan, CycleStep, Stage};
+use es_data::training::{
+    preview_evaluation, Cycle, CyclePlan, CycleStep, PreviewRef, PreviewStep, Stage,
+};
 use es_data::{DatasetIdentity, LeRobotDataset, Split};
 use es_ir::evaluation::{AcceptanceResult, EvaluationReport};
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::cmd::telemetry::{
-    TelemetryArgs, STAGE_COLLECT, STAGE_CYCLE, STAGE_EVAL, STAGE_EXPERT_GATE, STAGE_SHOWCASE,
-    STAGE_TRAIN,
+    TelemetryArgs, Voice, STAGE_COLLECT, STAGE_CYCLE, STAGE_EVAL, STAGE_EXPERT_GATE, STAGE_PREVIEW,
+    STAGE_SHOWCASE, STAGE_TRAIN,
 };
 use crate::cmd::train::TrainWatch;
 use crate::error::CliError;
@@ -50,7 +56,16 @@ in-process: nothing here re-implements what `es loop collect`, `es train`, `es e
   [collect]  policy, expert, episodes, seed, frames     # or  dataset = \"<root>\"
   [train]    recipe = \"training.toml\"
   [eval]     config, checkpoint = \"last\", jobs, frames
+  [eval.preview]  episodes = 4, suite = <the first>, frames = true      # optional
   [showcase] cell, eye, look_at, fov, width, height
+
+With [eval.preview], each checkpoint gets a short test as soon as its bundle is on disk -- on the
+lerobot route while `lerobot-train` is still running: this same `es`, as a child process, runs
+`es eval run --jobs 1` on the bundle under a document derived from [eval] config (that suite
+alone, its first `episodes` seeds, the same metrics, **no acceptance**), written to
+<out>/preview/<mark>/evaluation.toml with the run's artifacts and `eval.log` beside it. One
+preview at a time; the eval stage waits for the last. A preview judges nothing (spec 13.3): its
+results go to <out>/preview/index.jsonl, one row per mark, and never into loop.jsonl.
 
 Two refusals are the point of the command:
 
@@ -170,6 +185,12 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
     // a property of the document, so a moved `evaluation_hash` is knowable without a GPU.
     let evaluation_hash = evaluation_hash(&cycle.eval.config)?;
     check_evaluation_hash(&out, &evaluation_hash, allow_new)?;
+    // Derived before anything runs, so a suite the Evaluation IR does not declare is refused by
+    // `--dry-run` too (packet M13/Z1).
+    let preview = match &cycle.eval.preview {
+        Some(p) => Some(PreviewIr::derive(&cycle.eval.config, p)?),
+        None => None,
+    };
 
     if dry_run {
         print!("{}", plan.render(&out));
@@ -258,14 +279,31 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
                 gate = Some("passed".to_owned());
             }
             Stage::Train => {
+                // Packet M13/Z1: one worker previews each mark as its bundle lands, and the stage
+                // ends after the last preview -- the eval stage never shares the machine with one.
+                let queue = preview.as_ref().map(|ir| {
+                    let voice = publisher.as_ref().map(|p| p.voice(STAGE_PREVIEW));
+                    Previews::start(plan.previews.clone(), ir.clone(), voice, &out)
+                });
+                let mut push = |mark: u32| {
+                    if let Some(q) = &queue {
+                        q.push(mark);
+                    }
+                };
                 let watch = TrainWatch {
                     publisher: publisher.as_mut(),
                     progress_every,
                     // One number for "how often a picture": control ticks in collect and the
                     // evaluations, optimizer steps here.
                     sample_every: telemetry.image_every,
+                    on_checkpoint: queue.is_some().then_some(&mut push as &mut dyn FnMut(u32)),
                 };
-                crate::cmd::train::run(&recipe, &out.join("train"), false, None, watch)?;
+                let trained =
+                    crate::cmd::train::run(&recipe, &out.join("train"), false, None, watch);
+                if let Some(q) = queue {
+                    q.finish();
+                }
+                trained?;
                 let step = train_step(&out.join("train"), &dataset_root, gate.as_deref())?;
                 append_both(&out, &dataset_root, &step)?;
             }
@@ -522,6 +560,136 @@ fn from_hex(text: &str) -> Option<[u8; 32]> {
         .filter_map(|i| u8::from_str_radix(text.get(i * 2..i * 2 + 2)?, 16).ok())
         .collect();
     bytes.try_into().ok()
+}
+
+// --- the checkpoint previews (packet M13/Z1) ------------------------------------------------
+
+/// The one document every preview of a cycle runs, derived from `[eval] config`.
+#[derive(Clone)]
+struct PreviewIr {
+    /// `evaluation.toml`, as written beside each preview.
+    text: String,
+    /// Its own `evaluation_hash`, for the index row -- never the cycle's (spec 13.3).
+    hash: String,
+    suite: String,
+}
+
+impl PreviewIr {
+    fn derive(config: &str, preview: &PreviewRef) -> Result<Self, CliError> {
+        let ir = es_ir::serial::evaluation_from_toml(&read(Path::new(config))?)
+            .map_err(|e| bad(format!("{config}: {e}")))?;
+        let derived = preview_evaluation(&ir, preview).map_err(|e| bad(e.to_string()))?;
+        Ok(Self {
+            text: es_ir::serial::evaluation_to_toml(&derived)
+                .map_err(|e| bad(format!("the preview's Evaluation IR: {e}")))?,
+            hash: hex(&derived.evaluation_hash().map_err(|e| bad(e.to_string()))?),
+            suite: derived.suites[0].name.clone(),
+        })
+    }
+}
+
+/// One worker thread, one preview at a time, in the order the marks land.
+///
+/// ponytail: a killed cycle leaves a running preview child to finish its few episodes alone; a
+/// job object (Windows) / process group (Unix) would take it down too, if that ever matters.
+struct Previews {
+    tx: mpsc::Sender<u32>,
+    worker: thread::JoinHandle<()>,
+}
+
+impl Previews {
+    fn start(steps: Vec<PreviewStep>, ir: PreviewIr, voice: Option<Voice>, out: &Path) -> Self {
+        let (tx, rx) = mpsc::channel::<u32>();
+        let out = out.to_path_buf();
+        let worker = thread::spawn(move || {
+            for mark in rx {
+                if let Some(step) = steps.iter().find(|s| s.mark == mark) {
+                    preview(step, &ir, voice.as_ref(), &out);
+                }
+            }
+        });
+        Self { tx, worker }
+    }
+
+    /// Queues a mark and returns at once: the trainer may still be running.
+    fn push(&self, mark: u32) {
+        let _ = self.tx.send(mark);
+    }
+
+    /// Waits for the last queued preview.
+    fn finish(self) {
+        drop(self.tx);
+        let _ = self.worker.join();
+    }
+}
+
+/// One mark's preview: the derived document into `<out>/preview/<mark>/`, the running `es` as
+/// the child that evaluates the bundle (its console into `eval.log` there, not into the
+/// trainer's), and what came of it said three ways -- a line, `preview.end`, and a row of
+/// `<out>/preview/index.jsonl`. A preview that fails is a row with its exit code, never the
+/// cycle's failure: it judges nothing.
+fn preview(step: &PreviewStep, ir: &PreviewIr, voice: Option<&Voice>, out: &Path) {
+    let dir = Path::new(&step.dir);
+    let rel = format!("preview/{}", step.mark);
+    if let Some(v) = voice {
+        v.preview_begin(step.mark, &rel);
+    }
+    let code = preview_child(step, &ir.text, dir).unwrap_or_else(|e| {
+        println!("preview {}: {e}", step.mark);
+        1
+    });
+    let rows = es_eval::episodes::read_episodes(dir)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let successes = rows.iter().filter(|r| r.termination == "success").count();
+    println!(
+        "preview {}: {successes} of {} episode(s) succeeded, exit {code} ({})",
+        step.mark,
+        rows.len(),
+        dir.display()
+    );
+    if let Some(v) = voice {
+        v.preview_end(step.mark, &rel, successes, rows.len(), code);
+    }
+    let created = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let row = json!({
+        "step": step.mark,
+        "dir": rel,
+        "bundle": format!("train/checkpoints/{}.esb", step.mark),
+        "suite": ir.suite,
+        "evaluation_hash": ir.hash,
+        "successes": successes,
+        "episodes": rows.len(),
+        "code": code,
+        "created": created,
+    });
+    let index = out.join("preview").join("index.jsonl");
+    let appended = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&index)
+        .and_then(|mut f| writeln!(f, "{row}"));
+    if let Err(e) = appended {
+        println!("preview {}: {}: {e}", step.mark, index.display());
+    }
+}
+
+/// `es eval run` on one mark, as a child of this very binary.
+fn preview_child(step: &PreviewStep, document: &str, dir: &Path) -> std::io::Result<i32> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(dir.join("evaluation.toml"), document)?;
+    let log = std::fs::File::create(dir.join("eval.log"))?;
+    let status = Command::new(std::env::current_exe()?)
+        .args(["eval", "run"])
+        .args(&step.args)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log)
+        .status()?;
+    Ok(status.code().unwrap_or(-1))
 }
 
 // --- the two refusals -------------------------------------------------------------------------
