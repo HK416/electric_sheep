@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::codes;
 use crate::diag::Diagnostic;
-use crate::graph::{Graph, IrNode, Port};
+use crate::graph::{Graph, IrNode, NodeId, Port};
 use crate::hash::{canonical_hash, CanonWriter};
 use crate::types::{ElemType, Frame, PortType, Shape, TimeRef, Unit};
 
@@ -137,6 +137,11 @@ pub enum FusionKind {
     FiLm,
     AdaLn,
     TokenConcat,
+    /// The element-wise sum of inputs that all have the node's own shape (`LRN-032`). With
+    /// encoders that [`LearningNode::VisionEncoder::share`] weights, a view can be dropped
+    /// without retraining the fusion: the remaining terms keep their meaning
+    /// (`docs/design/multi-camera.md` section 3.3, packet M15/N5).
+    Sum,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -294,6 +299,15 @@ pub enum LearningNode {
         out_dim: u32,
         /// `0` for a pooled feature vector, `n` for `n` tokens.
         token_count: u32,
+        /// The encoder whose weights this one uses (packet M15/N5): each view keeps its own
+        /// node and its one input, and the lowering applies one module to each. It names the
+        /// group's owner — a `VisionEncoder` of the same backbone, `out_dim`, `token_count`,
+        /// `pretrained` and `frozen` that shares nothing itself — anywhere in the graph, before
+        /// or after this node; anything else is `LRN-033`. Absent = no sharing = today's
+        /// canonical form: it is never written into [`IrNode::params_canonical`] (a `NodeId`
+        /// is not hash input), and `learning_hash` reads it as an edge instead.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        share: Option<NodeId>,
     },
     StateEncoder {
         inputs: Vec<TensorPort>,
@@ -776,7 +790,123 @@ impl LearningGraph {
         self.check_contract(&mut diags);
         self.check_normalizers(&mut diags);
         self.check_squash(&mut diags);
+        self.check_sum(&mut diags);
+        self.check_share(&mut diags);
         diags
+    }
+
+    /// Spec 8.3: a `Sum` adds its terms element by element, so every input has the node's own
+    /// output shape — one width, one token count, and `out_dim` equal to that width.
+    fn check_sum(&self, diags: &mut Vec<Diagnostic>) {
+        for (id, node) in &self.nodes.nodes {
+            let LearningNode::Fusion {
+                inputs,
+                kind: FusionKind::Sum,
+                out_dim,
+                token_count,
+            } = node
+            else {
+                continue;
+            };
+            let out = feature("out", *out_dim, *token_count).ty.shape;
+            for p in inputs.iter().filter(|p| p.ty.shape != out) {
+                diags.push(
+                    Diagnostic::new(
+                        codes::LRN_032,
+                        format!(
+                            "Sum input \"{}\" is {:?} but the fusion's output is {:?} (out_dim {out_dim}, token_count {token_count})",
+                            p.name,
+                            p.ty.shape.dims(),
+                            out.dims()
+                        ),
+                    )
+                    .at(*id)
+                    .on_port(p.name.clone())
+                    .with_hint("every term of a Sum has the same width and token count, and out_dim is that width"),
+                );
+            }
+        }
+    }
+
+    /// Spec 8.3 `share`: it names the owner of a weight group. Looked up by id, one sharer at a
+    /// time, so neither node order nor where the owner sits in the document matters.
+    fn check_share(&self, diags: &mut Vec<Diagnostic>) {
+        for (id, node) in &self.nodes.nodes {
+            let LearningNode::VisionEncoder {
+                share: Some(owner),
+                backbone,
+                pretrained,
+                frozen,
+                out_dim,
+                token_count,
+                ..
+            } = node
+            else {
+                continue;
+            };
+            let refuse = |why: String| {
+                Diagnostic::new(codes::LRN_033, format!("share = {}: {why}", owner.0))
+                    .at(*id)
+                    .with_hint("share names a VisionEncoder of the same backbone, out_dim, token_count, pretrained and frozen that shares nothing itself")
+            };
+            if owner == id {
+                diags.push(refuse("an encoder cannot share its own weights".to_owned()));
+                continue;
+            }
+            let Some(other) = self.nodes.nodes.get(owner) else {
+                diags.push(refuse(format!("node {} does not exist", owner.0)));
+                continue;
+            };
+            let LearningNode::VisionEncoder {
+                share: next,
+                backbone: their_backbone,
+                pretrained: their_pretrained,
+                frozen: their_frozen,
+                out_dim: their_out_dim,
+                token_count: their_token_count,
+                ..
+            } = other
+            else {
+                diags.push(refuse(format!(
+                    "node {} is a {}, not a VisionEncoder",
+                    owner.0,
+                    other.kind()
+                )));
+                continue;
+            };
+            if let Some(next) = next {
+                diags.push(refuse(format!(
+                    "node {} itself shares node {}; sharing does not chain, name the group's owner",
+                    owner.0, next.0
+                )));
+            }
+            for (field, mine, theirs) in [
+                (
+                    "backbone",
+                    format!("{backbone:?}"),
+                    format!("{their_backbone:?}"),
+                ),
+                ("out_dim", out_dim.to_string(), their_out_dim.to_string()),
+                (
+                    "token_count",
+                    token_count.to_string(),
+                    their_token_count.to_string(),
+                ),
+                (
+                    "pretrained",
+                    pretrained.to_string(),
+                    their_pretrained.to_string(),
+                ),
+                ("frozen", frozen.to_string(), their_frozen.to_string()),
+            ] {
+                if mine != theirs {
+                    diags.push(refuse(format!(
+                        "{field} is {mine} here but {theirs} on node {}",
+                        owner.0
+                    )));
+                }
+            }
+        }
     }
 
     /// Spec 8.3: only a `Regression` head produces the point estimate a squash is defined on.
@@ -1071,8 +1201,22 @@ impl LearningGraph {
 
     /// `learning_hash` (spec 5.3): the architecture only. Independent of node ids and node
     /// order, and independent of the weights — changing a checkpoint must not change it.
+    ///
+    /// A `share` names a node by id, and an id is never hash input, so it is hashed the way
+    /// IR-C hashes its child ids (`ControlGraph::as_graph`): as an edge `owner.share ->
+    /// sharer.share`. No real edge can look like one — a `VisionEncoder`'s only output is
+    /// `out` — and a graph without `share` gets no edge, so its hash is today's.
     pub fn learning_hash(&self) -> Result<[u8; 32], Diagnostic> {
-        let graph = canonical_hash(&self.nodes)?;
+        let mut nodes = self.nodes.clone();
+        for (id, node) in &self.nodes.nodes {
+            if let LearningNode::VisionEncoder {
+                share: Some(owner), ..
+            } = node
+            {
+                nodes.connect(*owner, "share", *id, "share");
+            }
+        }
+        let graph = canonical_hash(&nodes)?;
         let c = &self.policy.contract;
         let mut w = CanonWriter::new();
         w.str(LEARNING_TAG);
@@ -1170,6 +1314,7 @@ pub mod testing {
                 frozen: false,
                 out_dim: feat,
                 token_count: 0,
+                share: None,
             },
         );
         g.insert(

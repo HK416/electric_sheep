@@ -721,6 +721,7 @@ fn build_learning(
                 frozen: false,
                 out_dim: feat,
                 token_count,
+                share: None,
             },
         );
         g.inputs.push(PortRef::new(vid, name.clone()));

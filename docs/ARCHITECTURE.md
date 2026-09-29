@@ -937,16 +937,21 @@ pub struct LearningGraph {
 
 **Encoder**
 ```
-VisionEncoder { backbone, pretrained, frozen, out_dim, token_count }
+VisionEncoder { backbone, pretrained, frozen, out_dim, token_count, share? }
     backbone = ResNet18 | ResNet34 | ViT{size} | DINOv2 | SigLIP | SmolVLM | Custom(hash)
+    share    = node id of the VisionEncoder whose weights this one uses (absent = no sharing)
 StateEncoder { kind, out_dim }          MLP | Identity
 LanguageEncoder { tokenizer, model, max_len }
 ```
 
+**Weight sharing: `share` (packet M15/N5).** Each view keeps its own `VisionEncoder` node and its one input (an encoder takes one input, `LRN-002`), and `share = <node id>` names the encoder whose weights it uses. The lowering builds one module and applies it to each view. `share` names the group's owner: a node that exists, is a `VisionEncoder`, is not the encoder itself, has the same backbone·`out_dim`·`token_count`·`pretrained`·`frozen`, and has no `share` of its own (no chains, one owner per group). Violating any of these is refused with `LRN-033`. The relation is by node id, so the owner may come before or after its sharers. A `NodeId` is not hash input (§11.2), so `learning_hash` reads `share` as an owner → sharer edge. Absent = no sharing = today's canonical form, so no committed `learning_hash` moves.
+
 **Fusion**
 ```
-Concat | CrossAttention | FiLM | AdaLN | TokenConcat
+Concat | CrossAttention | FiLM | AdaLN | TokenConcat | Sum
 ```
+
+**`Sum` fusion (packet M15/N5).** The output is the element-wise sum of the inputs. Every input must have the node's own output shape — the same width, the same token count, and an `out_dim` equal to that width — or it is refused with `LRN-032`. When the encoders share weights through `share`, `Sum` lets a view be dropped without retraining the fusion: the remaining terms keep their meaning (`docs/design/multi-camera.md`).
 
 **Temporal**
 ```
@@ -1788,6 +1793,8 @@ dep.fallback("hold_position")
 
 Task.save_bundle("tasks/pick_cube/", task, obs, lrn, dep)
 ```
+
+**`shared=True` is written as `share` on each encoder (§8.3).** The IR has no `shared` field. The builder creates one `VisionEncoder` node per image input, makes the first view's encoder the owner, and writes `share = <the owner's node id>` on the others. It never builds one encoder node that takes several inputs.
 
 **The builder does not execute immediately.** At `save_bundle` or `compile` time it assembles the IR and runs the Cross-IR Check (§11.1). Type errors surface as Python exceptions, but the messages use the same diagnostic format as the compiler.
 

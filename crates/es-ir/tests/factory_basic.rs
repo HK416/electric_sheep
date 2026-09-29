@@ -13,7 +13,13 @@ use es_ir::{Diagnostic, IrNode};
 
 fn params_from_schema(schema: &NodeSchema) -> toml::Value {
     let mut table = toml::Table::new();
-    for param in &schema.params {
+    // An optional parameter without a starting value (`VisionEncoder`'s `share`, a node id)
+    // is left absent, which is what absent means for it.
+    for param in schema
+        .params
+        .iter()
+        .filter(|p| p.required || p.default.is_some())
+    {
         table.insert(
             param.name.clone(),
             param
