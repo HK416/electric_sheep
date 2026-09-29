@@ -105,7 +105,7 @@ impl ScenePreview {
                 continue;
             }
             for geom in &body.geoms {
-                let stem = geom.name.split('_').next().unwrap_or_default();
+                let stem = stem(&geom.name);
                 let ground = matches!(geom.shape, Shape::Plane { .. });
                 if stem.is_empty() || ground || lights.contains(&&geom.name) {
                     continue;
@@ -122,6 +122,13 @@ impl ScenePreview {
             cameras: self.scene.cameras.iter().map(|c| c.name.clone()).collect(),
         }
     }
+}
+
+/// The object a fixed geom belongs to: its name before the first `_` (`bin_floor` is the `bin`).
+/// [`ScenePreview::contents`] groups by it, and a template's `[outcome] target` names one
+/// ([`crate::model::outcome`]).
+pub(crate) fn stem(geom: &str) -> &str {
+    geom.split('_').next().unwrap_or_default()
 }
 
 /// ① and ② of a project: its template and that template's scene, or `None` when the editor

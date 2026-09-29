@@ -20,6 +20,7 @@ use es_ir::evaluation::{MetricSpec, PerturbationKind};
 
 use crate::model::i18n::{t, Lang};
 use crate::model::launch::{Kind, LaunchField, LaunchFlag};
+use crate::model::outcome::Outcome;
 use crate::model::results::Cause;
 
 // --- the stages of a cycle -----------------------------------------------------------------
@@ -100,9 +101,14 @@ pub fn column_label(lang: Lang, column: &str) -> &'static str {
 
 // --- results: why it failed, and under what -------------------------------------------------
 
-/// The key of a failure cause's plain name. Total over [`Cause`], no wildcard arm.
+/// The key of a failure cause's plain name. Total over [`Cause`] and [`Outcome`], no wildcard
+/// arm. An outcome class's name has two holes, the object and the target
+/// (`RunResults::cause_label` fills them).
 pub fn cause_key(cause: Cause) -> &'static str {
     match cause {
+        Cause::Outcome(Outcome::NeverLifted) => "cause.never_lifted",
+        Cause::Outcome(Outcome::LeftOutside) => "cause.left_outside",
+        Cause::Outcome(Outcome::InsideTooLate) => "cause.inside_too_late",
         Cause::Timeout => "cause.timeout",
         Cause::FailureCondition => "cause.failure_condition",
         Cause::Unfinished => "cause.unfinished",
@@ -120,6 +126,9 @@ pub fn cause_key(cause: Cause) -> &'static str {
 /// The key of a cause's one line of advice: what usually helps. Total over [`Cause`].
 pub fn cause_advice_key(cause: Cause) -> &'static str {
     match cause {
+        Cause::Outcome(Outcome::NeverLifted) => "cause.never_lifted.advice",
+        Cause::Outcome(Outcome::LeftOutside) => "cause.left_outside.advice",
+        Cause::Outcome(Outcome::InsideTooLate) => "cause.inside_too_late.advice",
         Cause::Timeout => "cause.timeout.advice",
         Cause::FailureCondition => "cause.failure_condition.advice",
         Cause::Unfinished => "cause.unfinished.advice",

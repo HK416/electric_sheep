@@ -219,13 +219,13 @@ fn step_panel(app: &mut EditorApp, ui: &mut egui::Ui) {
             ui.separator();
             if let Some(rows) = shown.rows.as_deref() {
                 ui.strong(t(lang, "results.why"));
-                let causes = results::causes(rows);
+                let causes = results::causes(rows, &shown.outcomes);
                 if causes.is_empty() {
                     ui.label(t(lang, "results.no_failures"));
                 }
                 for (cause, n) in causes {
                     ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new(t(lang, labels::cause_key(cause))).strong());
+                        ui.label(RichText::new(shown.cause_label(lang, cause)).strong());
                         ui.weak(fill(lang, "results.times", &[&n.to_string()]));
                     });
                     ui.weak(t(lang, labels::cause_advice_key(cause)));
@@ -503,7 +503,7 @@ fn tiles(
         .auto_shrink([false, false])
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
-                for tile in results::tiles(rows, *filter) {
+                for tile in results::tiles(rows, *filter, &shown.outcomes) {
                     let frames = shown
                         .dir
                         .cells()
@@ -537,9 +537,9 @@ fn tiles(
                             *pick = Some(tile.cell.clone());
                         }
                         let (colour, word) = match (tile.success, tile.cause) {
-                            (true, _) => (GREEN, t(lang, "results.tile.success")),
-                            (false, Some(cause)) => (RED, t(lang, labels::cause_key(cause))),
-                            (false, None) => (RED, t(lang, "results.tile.failure")),
+                            (true, _) => (GREEN, t(lang, "results.tile.success").to_owned()),
+                            (false, Some(cause)) => (RED, shown.cause_label(lang, cause)),
+                            (false, None) => (RED, t(lang, "results.tile.failure").to_owned()),
                         };
                         // One line each, the whole of it on hover: a tile is a thumbnail wide.
                         let name = RichText::new(format!("{mark} {}", tile.cell)).color(colour);

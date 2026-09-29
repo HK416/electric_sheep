@@ -21,6 +21,7 @@ use crate::model::health::{self, Input, Light, Point, Verdict, THRESHOLDS};
 use crate::model::launch::{self, LaunchModel, State};
 use crate::model::layout;
 use crate::model::live_run::StageRow;
+use crate::model::preview::{self, Preview};
 use crate::model::project::{
     self, Project, ProjectError, RunFolder, StartSettings, RUN_RECIPE, TELEMETRY_FILE,
 };
@@ -499,6 +500,9 @@ pub struct View {
     pub interrupted: bool,
     /// Why no run can start here (an i18n key), when none can.
     pub cannot_start: Option<&'static str>,
+    /// The checkpoints' short tests, newest first (packet M13/Z4): from disk, and from stream 1
+    /// while the run is watched.
+    pub previews: Vec<Preview>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -555,6 +559,10 @@ pub struct Watch {
     ended: Option<Ended>,
     /// ④ on the previous frame: the done latch.
     evaluate: PhaseState,
+    /// The run's previews: re-read with the facts, and whenever what stream 1 says of them
+    /// changes.
+    previews: Vec<Preview>,
+    heard_previews: Vec<Preview>,
 }
 
 impl std::fmt::Debug for Watch {
@@ -587,6 +595,7 @@ impl Watch {
             )),
             None => Dial::Idle,
         };
+        let previews = (run.as_ref()).map_or_else(Vec::new, |r| preview::previews(&r.path, &[]));
         Self {
             settings: StartSettings {
                 demonstrations: source.as_ref().map_or(1, |(t, _)| t.demonstrations),
@@ -606,6 +615,8 @@ impl Watch {
             failed: None,
             ended: None,
             evaluate: disk[3].clone(),
+            previews,
+            heard_previews: Vec::new(),
         }
     }
 
@@ -665,9 +676,16 @@ impl Watch {
             rows.iter().filter(|r| !r.running()).count(),
             child,
         );
-        if self.facts_key != Some(key) {
+        let reread = self.facts_key != Some(key);
+        if reread {
             self.facts_key = Some(key);
             self.facts = self.run.as_ref().map(RunFacts::read);
+        }
+        let heard = preview::heard(if fresh { &[] } else { &telemetry.events });
+        if reread || heard != self.heard_previews {
+            self.previews =
+                (self.run.as_ref()).map_or_else(Vec::new, |r| preview::previews(&r.path, &heard));
+            self.heard_previews = heard;
         }
         // Nothing runs, nothing is attached and disk says the run did not finish: it may have
         // been resumed elsewhere, at a new address (packet M12/R3).
@@ -818,6 +836,7 @@ impl Watch {
                     .iter()
                     .any(|p| matches!(p, PhaseState::Interrupted { .. })),
             cannot_start: self.source.as_ref().err().copied(),
+            previews: self.previews.clone(),
             state,
         }
     }
@@ -1470,6 +1489,38 @@ mod tests {
             view.centre,
             Centre::Idle,
             "a stopped run shows nothing live"
+        );
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
+    /// Packet M13/Z4: a re-opened run shows the previews its disk holds; watched, what stream 1
+    /// says of them joins in, newest first.
+    #[test]
+    fn previews_come_from_disk_then_from_the_stream() {
+        use crate::model::preview::tests::{begin, end, index_row};
+        let p = scratch_project("z4-previews");
+        let run = p.next_run_dir();
+        std::fs::create_dir_all(run.join("preview")).unwrap();
+        std::fs::write(run.join(preview::INDEX), index_row(1000, 1, 0) + "\n").unwrap();
+        let mut watch = Watch::new(&p, Some(repo()));
+        let mut launch = LaunchModel::default();
+        let mut telemetry = TelemetryModel::default();
+        let now = Instant::now();
+        let mut steps = |telemetry: &TelemetryModel| {
+            let (_, phases) = watch.tick(&mut launch, telemetry, Phase::Train, now);
+            let view = watch.view(Phase::Train, &launch, telemetry, &phases, now);
+            view.previews
+                .iter()
+                .map(|p| (p.step, p.code))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(steps(&telemetry), [(1000, Some(0))], "from disk alone");
+        telemetry
+            .events
+            .extend([end("5000", "3", "0"), begin("20000")]);
+        assert_eq!(
+            steps(&telemetry),
+            [(20000, None), (5000, Some(0)), (1000, Some(0))]
         );
         std::fs::remove_dir_all(&p.root).ok();
     }
