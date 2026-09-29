@@ -21,11 +21,12 @@ use std::path::{Path, PathBuf};
 
 use es_assets::scene::{Joint, JointKind, SceneDesc};
 use es_data::training::{preview_evaluation, Cycle, PreviewRef};
-use es_env::expert::{demo_cfg, so101_ik, ExpertCfg, Links};
+use es_env::expert::{demo_cfg, so101_ik, Links};
 use es_env::program::{Block, Grip, Program, ProgramError, Target, OBJECT};
 use es_env::ScriptedExpert;
 use es_eval::episodes::read_episodes;
 use es_eval::run_dir::RunDir;
+use es_ir::deployment::DeploymentIr;
 use es_ir::evaluation::{EpisodeBatch, EvaluationIr, SeedPlan};
 use es_ir::serial::{
     deployment_from_toml, evaluation_from_toml, evaluation_to_toml, parse_toml, task_from_toml,
@@ -386,12 +387,12 @@ pub struct Row {
 struct World {
     scene: SceneDesc,
     links: Links,
-    /// The demonstrator's tuning, paced to the template's Deployment IR as `es` paces it.
-    cfg: ExpertCfg,
-    /// Every corner of the box of object positions the Task IR can draw.
-    corners: Vec<Vec3>,
-    /// What a move may name as a place: the scene's objects but the program's own.
-    places: Vec<String>,
+    task: TaskIr,
+    deploy: DeploymentIr,
+    /// Control ticks per demonstrator step: the deployment's re-plan period.
+    replan: u32,
+    /// The scene's objects: a move's places, but for the program's own object.
+    objects: Vec<String>,
 }
 
 fn read(path: &Path) -> Result<String, String> {
@@ -399,42 +400,45 @@ fn read(path: &Path) -> Result<String, String> {
 }
 
 impl World {
-    /// ponytail: the pacing mirrors `es`'s `build_expert` (the one free body, `demo_cfg`, the
-    /// deployment's re-plan period); `es` is a binary this crate cannot call.
     fn read(template: &Template, root: &Path) -> Result<Self, String> {
         let scene_path = root.join(&template.scene);
         let scene = load_scene(&scene_path).map_err(|e| e.to_string())?;
         let links = Links::from_scene(&scene).map_err(|e| e.to_string())?;
-        let free: Vec<&Joint> = (scene.joints.iter())
-            .filter(|j| j.kind == JointKind::Free)
-            .collect();
-        let [joint] = free.as_slice() else {
-            return Err(format!("{} free bodies; one is picked up", free.len()));
-        };
         let deploy = root.join(&template.bundle.deployment);
         let deploy = deployment_from_toml(&read(&deploy)?).map_err(|e| e.to_string())?;
         let replan = es_env::replan_interval(deploy.rate)
             .map_err(|e| e.to_string())?
             .min(deploy.action.execute_chunk as u64);
-        let mut cfg = demo_cfg(joint.id);
-        cfg.pace_to(&deploy, replan as u32);
         let task =
             task_from_toml(&read(&root.join(&template.bundle.task))?).map_err(|e| e.to_string())?;
-        let corners = corners(&task, &scene, joint);
-        let object = scene.bodies.iter().find(|b| b.id == joint.body);
-        let places = ScenePreview::open(&scene_path)?
-            .contents()
-            .objects
-            .into_iter()
-            .filter(|o| object.is_none_or(|b| b.name != *o))
-            .collect();
+        let objects = ScenePreview::open(&scene_path)?.contents().objects;
         Ok(Self {
             scene,
             links,
-            cfg,
-            corners,
-            places,
+            task,
+            deploy,
+            replan: u32::try_from(replan).unwrap_or(u32::MAX),
+            objects,
         })
+    }
+
+    /// The demonstrator `es` builds for `program` (`build_expert`, packet M14/Q2): the free
+    /// joint of the body the program calls its object, `demo_cfg` paced to the deployment's
+    /// re-plan period - or its refusal, by name.
+    ///
+    /// ponytail: a copy of `es`'s dozen lines, since `es` is a binary this crate cannot call.
+    fn expert(&self, program: &Program) -> Result<&Joint, ProgramError> {
+        let scene = &self.scene;
+        let joint = (scene.joints.iter())
+            .find(|j| {
+                j.kind == JointKind::Free
+                    && (scene.bodies.iter()).any(|b| b.id == j.body && b.name == program.object)
+            })
+            .ok_or_else(|| ProgramError::UnknownObject(program.object.clone()))?;
+        let mut cfg = demo_cfg(joint.id);
+        cfg.pace_to(&self.deploy, self.replan);
+        ScriptedExpert::with_program(scene, cfg, program)?;
+        Ok(joint)
     }
 }
 
@@ -514,11 +518,12 @@ fn corners(task: &TaskIr, scene: &SceneDesc, joint: &Joint) -> Vec<Vec3> {
 /// The refusal first, then the warnings: reach only for a program the demonstrator accepts (it
 /// is what places a waypoint), the gripper's always.
 fn check(program: &Program, world: Option<&World>) -> Check {
-    let error = program.validate().err().or_else(|| {
-        world.and_then(|w| ScriptedExpert::with_program(&w.scene, w.cfg, program).err())
-    });
+    let built = world.map(|w| (w, w.expert(program)));
+    let error = (program.validate().err())
+        .or_else(|| built.as_ref().and_then(|(_, b)| b.as_ref().err().cloned()));
     let mut warnings = Vec::new();
-    if let (None, Some(w)) = (&error, world) {
+    if let (None, Some((w, Ok(joint)))) = (&error, &built) {
+        let corners = corners(&w.task, &w.scene, joint);
         for (i, (block, point)) in (program.blocks.iter())
             .zip(program.waypoints(&w.scene).unwrap_or_default())
             .enumerate()
@@ -526,7 +531,7 @@ fn check(program: &Program, world: Option<&World>) -> Check {
             if block.target.is_none() {
                 continue;
             }
-            let missed: Vec<Vec3> = (w.corners.iter())
+            let missed: Vec<Vec3> = (corners.iter())
                 .map(|&c| point.tool(c))
                 .filter(|&at| so101_ik(&w.links, at, point.pitch()).is_none())
                 .collect();
@@ -681,15 +686,20 @@ impl Teach {
         &self.check
     }
 
-    /// The places a move may name ([`TargetKind::Place`]); empty when the scene did not load.
-    pub fn places(&self) -> &[String] {
-        self.world.as_ref().map_or(&[], |w| w.places.as_slice())
+    /// The places a move may name ([`TargetKind::Place`]): the scene's objects but the one
+    /// the program picks up; none when the scene did not load.
+    pub fn places(&self) -> Vec<&str> {
+        let objects = self.world.as_ref().map_or(&[][..], |w| &w.objects);
+        (objects.iter().map(String::as_str))
+            .filter(|o| *o != self.program.object)
+            .collect()
     }
 
-    /// A grip block's wait is a whole number of these seconds: one demonstrator step.
+    /// A grip block's wait is a whole number of these seconds: one demonstrator step
+    /// (`ExpertCfg::pace_to`: the re-plan period at the control rate).
     pub fn wait_step(&self) -> Option<f64> {
-        let cfg = self.world.as_ref().ok()?.cfg;
-        Some(f64::from(cfg.execute.max(1)) / cfg.control_hz)
+        let w = self.world.as_ref().ok()?;
+        Some(f64::from(w.replan.max(1)) / w.deploy.rate.control.as_hz_f64())
     }
 
     fn recheck(&mut self) {
@@ -1089,8 +1099,12 @@ mod tests {
     #[test]
     fn the_object_is_drawn_from_the_task_irs_box() {
         let world = World::read(&cube(), &repo()).expect("the demo's documents");
-        let mut corners: Vec<(f64, f64, f64)> =
-            (world.corners.iter()).map(|c| (c.x, c.y, c.z)).collect();
+        let joint = world
+            .expert(&Program::builtin())
+            .expect("the cube's free joint");
+        let mut corners: Vec<(f64, f64, f64)> = (corners(&world.task, &world.scene, joint).iter())
+            .map(|c| (c.x, c.y, c.z))
+            .collect();
         corners.dedup();
         assert_eq!(
             corners,
@@ -1347,6 +1361,20 @@ mod tests {
         }
         assert_eq!(again.check().error, Some(ProgramError::Empty));
         assert!(again.top(Lang::En).error.is_some());
+
+        // An object the scene has no free body of: `es`'s own refusal, said at the top.
+        let ball = SO101_PICK_PLACE.replace("object = \"cube\"", "object = \"ball\"");
+        std::fs::write(project.teach(), ball).unwrap();
+        let ball = Teach::open(&project, &cube(), &repo()).expect("opens");
+        assert_eq!(
+            ball.check().error,
+            Some(ProgramError::UnknownObject("ball".into()))
+        );
+        assert!(ball
+            .top(Lang::En)
+            .error
+            .is_some_and(|e| e.ends_with("ball")));
+        assert_eq!(ball.places(), ["bin", "cube"]);
         std::fs::remove_dir_all(&project.root).ok();
     }
 
