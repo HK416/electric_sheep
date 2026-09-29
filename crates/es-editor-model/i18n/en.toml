@@ -226,6 +226,15 @@
 "results.run_again" = "Run again"
 "results.run_again.hint" = "Back to Train, with this run's settings"
 
+# ⑤'s "train again on what failed" (packet M13/Z4b); each `no_*` says why the button is off.
+"results.again" = "Train again on what failed"
+"results.again.about" = "Collects more demonstrations in the situations the last evaluation failed most, and goes on training from the last policy."
+"results.again.no_recipe" = "This run's settings file (cycle.toml) could not be read, so it cannot be trained again."
+"results.again.no_collect" = "This run trained on data it did not collect, so there are no demonstrations to add to."
+"results.again.no_evaluation" = "This run has no results per situation, so there is nothing to say what to practise more."
+"results.again.no_failures" = "No attempt failed in this evaluation, so there is no situation to practise more."
+"results.again.no_checkpoint" = "The policy this evaluation judged is not in the run folder, so training cannot go on from it."
+
 # --- the Start panel. The hover is the flag the CLI is actually given. --------------------
 "launch.kind.eval" = "Evaluate"
 "launch.kind.train" = "Train"

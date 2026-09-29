@@ -225,6 +225,15 @@
 "results.run_again" = "다시 실행"
 "results.run_again.hint" = "이 실행과 같은 설정으로 학습 단계로 돌아갑니다"
 
+# ⑤의 "실패 위주로 다시 학습" (패킷 M13/Z4b). `no_*`는 버튼을 누를 수 없는 이유입니다.
+"results.again" = "실패 위주로 다시 학습"
+"results.again.about" = "지난 평가에서 가장 많이 실패한 상황에서 시범을 더 모으고, 지난 정책에서 이어서 학습합니다."
+"results.again.no_recipe" = "이 실행의 설정 파일(cycle.toml)을 읽을 수 없어서 다시 학습할 수 없습니다."
+"results.again.no_collect" = "이 실행은 직접 모으지 않은 데이터로 학습해서, 시범을 더할 곳이 없습니다."
+"results.again.no_evaluation" = "이 실행에는 상황별 결과가 없어서, 무엇을 더 연습할지 정할 수 없습니다."
+"results.again.no_failures" = "이 평가에서 실패한 시도가 없어서, 더 연습할 상황이 없습니다."
+"results.again.no_checkpoint" = "이 평가가 판정한 정책이 실행 폴더에 없어서, 그 정책에서 이어서 학습할 수 없습니다."
+
 # --- 시작 패널. 마우스를 올리면 실제로 넘어가는 플래그가 나온다. ----------------------------
 "launch.kind.eval" = "평가하기"
 "launch.kind.train" = "학습하기"

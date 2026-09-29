@@ -15,7 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use es_core::FailureKind;
-use es_data::training::Cycle;
+use es_data::collect::{read_loop_steps, LoopKind, CHECKPOINT};
+use es_data::training::{collect_root, lerobot_checkpoint, Cycle, Route};
 use es_eval::episodes::{read_episodes, EpisodeRow};
 use es_eval::metrics::{failure_name, violation_name};
 use es_eval::run_dir::{CellRow, RunDir};
@@ -609,6 +610,110 @@ pub fn scene(
         .map(|(scene, root)| root.join(scene))
 }
 
+/// What "train again on what failed" adds to the next run's recipe (packet M13/Z4b,
+/// [`crate::model::project::write_run_again`]); the seed is chosen when the recipe is written,
+/// against every run on disk then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Again {
+    /// The previous run's `[eval] config`, verbatim (a repository-relative path, which `es`
+    /// resolves from the repository root it runs in): collected under, and judging the new run.
+    pub config: String,
+    /// [`weakest`].
+    pub suites: Vec<String>,
+    /// Every dataset root the previous run trained on: its own `collect/ds` first, then its own
+    /// `merge` list -- never its `collect/merged`, so no attempt is merged twice. Absolute.
+    pub merge: Vec<String>,
+    /// The checkpoint the previous run's evaluation judged: its `.esb` on the IR route, the
+    /// `lerobot` `pretrained_model` directory it was imported from on the `LeRobot` route.
+    pub init: String,
+}
+
+/// Whether ⑤'s "train again on what failed" is offered for `run`, and what it adds; `Err` is the
+/// i18n key of why not, shown on the button.
+pub fn again(
+    run: &RunFolder,
+    cycle: Option<&Cycle>,
+    situations: &[Situation],
+) -> Result<Again, &'static str> {
+    let cycle = cycle.ok_or("results.again.no_recipe")?;
+    let collect = cycle.collect.as_ref().ok_or("results.again.no_collect")?;
+    let suites = weakest(situations)?;
+    let no_checkpoint = "results.again.no_checkpoint";
+    let recipe = cycle.training(None, &run.path).map_err(|_| no_checkpoint)?;
+    let mark = match evaluated_mark(&run.path) {
+        Some(mark) => mark,
+        None => cycle.mark(&recipe).map_err(|_| no_checkpoint)?,
+    };
+    let train = run.path.join("train");
+    // What `Cycle::check_inputs` asks of `[train] init` before the next run collects anything.
+    let (init, complete) = if matches!(recipe.route(), Ok(Route::External)) {
+        let dir = PathBuf::from(lerobot_checkpoint(&train, mark));
+        let ok = dir.join("model.safetensors").is_file() && dir.join("config.json").is_file();
+        (dir, ok)
+    } else {
+        let file = train.join("checkpoints").join(format!("{mark}.esb"));
+        let ok = file.is_file();
+        (file, ok)
+    };
+    if !complete {
+        return Err(no_checkpoint);
+    }
+    Ok(Again {
+        config: cycle.eval.config.clone(),
+        suites,
+        merge: std::iter::once(collect_root(&run.path))
+            .chain(collect.merge.iter().cloned())
+            .collect(),
+        init: init.display().to_string(),
+    })
+}
+
+/// The mark the run's own ledger says its evaluation judged: the newest evaluate step's
+/// `policy_hash`, among the train steps' `checkpoint.<mark>` outputs. The expert gate's step
+/// names no checkpoint, so it matches none.
+fn evaluated_mark(run: &Path) -> Option<u32> {
+    let ledger = read_loop_steps(run).ok()?;
+    let marks: Vec<(&String, &String)> = ledger
+        .iter()
+        .filter(|s| s.kind == LoopKind::Train)
+        .flat_map(|s| &s.outputs)
+        .collect();
+    ledger
+        .iter()
+        .rev()
+        .filter(|s| s.kind == LoopKind::Evaluate)
+        .filter_map(|s| s.inputs.get("policy_hash"))
+        .find_map(|hash| {
+            let (key, _) = marks.iter().find(|(_, v)| *v == hash)?;
+            key.strip_prefix(CHECKPOINT)?.parse().ok()
+        })
+}
+
+/// The suites with the lowest success rate among those that ran an attempt, every one of them
+/// on a tie, in the evaluation's order. Refused when nothing was measured, or when the lowest is
+/// every attempt a success (plan Z review focus 4).
+pub fn weakest(situations: &[Situation]) -> Result<Vec<String>, &'static str> {
+    // `a` below `b`: compared as fractions, exactly.
+    let rate = |a: &Situation, b: &Situation| {
+        (u64::from(a.successes) * u64::from(b.episodes))
+            .cmp(&(u64::from(b.successes) * u64::from(a.episodes)))
+    };
+    let ran: Vec<&Situation> = situations.iter().filter(|s| s.episodes > 0).collect();
+    let low = ran
+        .iter()
+        .copied()
+        .min_by(|a, b| rate(a, b))
+        .ok_or("results.again.no_evaluation")?;
+    if low.successes == low.episodes {
+        return Err("results.again.no_failures");
+    }
+    Ok(ran
+        .iter()
+        .filter(|s| rate(s, low).is_eq())
+        .map(|s| s.suite.clone())
+        .collect())
+}
+
 /// One run, read for ⑤: its `eval/` folder, `episodes.json` when it has one, and what its
 /// `cycle.toml` names.
 #[derive(Debug)]
@@ -634,6 +739,8 @@ pub struct RunResults {
     /// says one (packet M13/Z4).
     pub outcome: Option<OutcomeSpec>,
     pub outcomes: Outcomes,
+    /// "Train again on what failed", or the i18n key of why not ([`again`]).
+    pub again: Result<Again, &'static str>,
 }
 
 impl RunResults {
@@ -680,7 +787,9 @@ impl RunResults {
             (Some(rows), Some(spec), Some(scene)) => outcome::outcomes(scene, spec, rows, &dir),
             _ => Outcomes::new(),
         };
+        let bars = situations(&dir.report, rows.as_deref(), ir.as_ref());
         Ok(Self {
+            again: again(run, cycle.as_ref(), &bars),
             run: run.clone(),
             export: export_bundle(run, cycle.as_ref()),
             dir,
@@ -932,7 +1041,8 @@ mod tests {
     // --- the screen (packet M12/Y13) ----------------------------------------------------------
 
     use crate::model::project::tests::{cube, repo};
-    use crate::model::project::{write_run, ProjectFile};
+    use crate::model::project::{write_run, write_run_again, ProjectFile};
+    use es_data::training::PerturbRef;
     use es_eval::episodes::write_episodes;
     use es_ir::evaluation::{AcceptanceCriterion, Aggregation};
 
@@ -989,6 +1099,7 @@ mod tests {
         let r = RunResults::read(&p, &run, Some(&repo())).unwrap();
         assert!(r.rows.is_none() && r.rows_error.is_none());
         assert!(r.cycle.is_none() && r.ir.is_none() && r.settings.is_none());
+        assert_eq!(r.again, Err("results.again.no_recipe"));
         assert_eq!(
             r.scene,
             Some(repo().join("tests/fixtures/mjcf/so101_pick_place.xml")),
@@ -1277,5 +1388,266 @@ mod tests {
             );
         }
         assert_eq!([number(0.5), number(12.0), number(0.0)], ["0.5", "12", "0"]);
+    }
+
+    fn bar(suite: &str, successes: u32, episodes: u32) -> Situation {
+        Situation {
+            suite: suite.into(),
+            kinds: Vec::new(),
+            successes,
+            episodes,
+        }
+    }
+
+    /// Packet M13/Z4b: the lowest success rate, every suite tied at it, in the evaluation's
+    /// order; a suite nobody ran is not the weakest; no failure anywhere refuses (review focus 4).
+    #[test]
+    fn the_weakest_suites_are_every_one_tied_at_the_lowest_rate() {
+        let bars = [
+            bar("nominal", 2, 2),
+            bar("light_intensity", 1, 2),
+            bar("backlash", 0, 0),
+            bar("torque_noise", 2, 4),
+        ];
+        assert_eq!(
+            weakest(&bars),
+            Ok(vec!["light_intensity".into(), "torque_noise".into()])
+        );
+        assert_eq!(
+            weakest(&[bar("nominal", 3, 4), bar("light", 0, 1)]),
+            Ok(vec!["light".into()])
+        );
+        assert_eq!(
+            weakest(&[bar("nominal", 2, 2), bar("light", 4, 4)]),
+            Err("results.again.no_failures")
+        );
+        assert_eq!(
+            weakest(&[bar("nominal", 0, 0)]),
+            Err("results.again.no_evaluation")
+        );
+        assert_eq!(weakest(&[]), Err("results.again.no_evaluation"));
+    }
+
+    /// A run folder as `es loop cycle` leaves it for ⑤: the fixture's `eval/` with `rows` beside
+    /// it. `failing` suites lose their second attempt.
+    fn evaluated(project: &Project, n: u32, failing: &[&str]) -> RunFolder {
+        let run = copy_fixture(project, n);
+        let rows: Vec<EpisodeRow> = ["nominal", "light_intensity", "torque_noise"]
+            .into_iter()
+            .flat_map(|suite| {
+                let second = if failing.contains(&suite) {
+                    "timeout"
+                } else {
+                    "success"
+                };
+                [row(suite, 0, "success", &[]), row(suite, 1, second, &[])]
+            })
+            .collect();
+        write_episodes(&rows, &run.eval_dir()).unwrap();
+        run
+    }
+
+    fn lerobot_checkpoint_on_disk(run: &RunFolder, mark: u32) -> PathBuf {
+        let dir = PathBuf::from(lerobot_checkpoint(&run.path.join("train"), mark));
+        std::fs::create_dir_all(&dir).unwrap();
+        for file in ["model.safetensors", "config.json"] {
+            std::fs::write(dir.join(file), "").unwrap();
+        }
+        dir
+    }
+
+    fn written(run: &Path) -> Cycle {
+        Cycle::parse(&std::fs::read_to_string(run.join(RUN_RECIPE)).unwrap()).unwrap()
+    }
+
+    /// Packet M13/Z4b on the camera-only card (the `LeRobot` route): a run whose evaluation had
+    /// no failure, or whose checkpoint is gone, is refused by name; then two "train again" runs
+    /// in a row. Each writes a Z3 cycle `es loop cycle` parses and resolves -- perturbed under
+    /// the weakest suites of the same Evaluation IR, seeds after every earlier collection and
+    /// clear of the evaluation's 101-116, every earlier `collect/ds` merged and none of the
+    /// `collect/merged` roots, started from the checkpoint the last one judged.
+    #[test]
+    fn train_again_writes_a_cycle_that_collects_fresh_seeds_merges_and_continues() {
+        let p = scratch("again");
+        let settings = StartSettings {
+            demonstrations: 100,
+            length: Length::Short,
+        };
+        write_run(
+            &cube(),
+            &repo(),
+            &p,
+            settings,
+            &p.next_run_dir(),
+            "127.0.0.1:7020",
+        )
+        .unwrap();
+        let first = evaluated(&p, 1, &[]);
+        let read = |run: &RunFolder| RunResults::read(&p, run, Some(&repo())).unwrap();
+        assert_eq!(read(&first).again, Err("results.again.no_failures"));
+        let first = evaluated(&p, 1, &["light_intensity", "torque_noise"]);
+        assert_eq!(read(&first).again, Err("results.again.no_checkpoint"));
+        // `[eval] checkpoint = "last"` is the Short preset's 5000.
+        let init = lerobot_checkpoint_on_disk(&first, 5000);
+        let again = read(&first).again.unwrap();
+        let config = written(&first.path).eval.config;
+        assert_eq!(
+            again,
+            Again {
+                config: config.clone(),
+                suites: vec!["light_intensity".into(), "torque_noise".into()],
+                merge: vec![collect_root(&first.path)],
+                init: init.display().to_string(),
+            }
+        );
+
+        let judged: Vec<u64> = (101..=116).collect();
+        let ir =
+            evaluation_from_toml(&std::fs::read_to_string(repo().join(&config)).unwrap()).unwrap();
+        assert_eq!(crate::model::project::evaluation_seeds(&ir), judged);
+        let second = p.next_run_dir();
+        write_run_again(
+            &cube(),
+            &repo(),
+            &p,
+            &again,
+            settings,
+            &second,
+            "127.0.0.1:7021",
+        )
+        .unwrap();
+        let cycle = written(&second);
+        let c = cycle.collect.as_ref().unwrap();
+        assert_eq!(
+            c.perturb,
+            Some(PerturbRef {
+                config: config.clone(),
+                suites: again.suites.clone(),
+            })
+        );
+        assert_eq!(cycle.eval, written(&first.path).eval, "the same judge");
+        assert!(cycle.eval.preview.is_some());
+        assert_eq!(c.merge, again.merge);
+        assert_eq!(cycle.train.init, Some(again.init.clone()));
+        // 1-100 was the first run's, and 101-200 would meet the evaluation's 101-116.
+        assert_eq!((c.seed, c.episodes), (117, 100));
+        let range = c.seed..c.seed + u64::from(c.episodes);
+        assert!(judged.iter().all(|s| !range.contains(s)) && range.start >= 101);
+        let recipe = cycle.training(None, &second).unwrap();
+        let lerobot = recipe.policy.lerobot.as_ref().unwrap();
+        assert_eq!(lerobot.path, Some(again.init.clone()), "--policy.path");
+        assert_eq!(
+            recipe.dataset.unwrap().root,
+            cycle.dataset_root(&second),
+            "the merged root trains"
+        );
+
+        // Again after the again-run: both earlier roots, never a `collect/merged`.
+        let second = evaluated(&p, 2, &["nominal"]);
+        let init = lerobot_checkpoint_on_disk(&second, 5000);
+        let again = read(&second).again.unwrap();
+        assert_eq!(again.suites, ["nominal"]);
+        assert_eq!(
+            again.merge,
+            [collect_root(&second.path), collect_root(&first.path)]
+        );
+        assert!(again.merge.iter().all(|m| !m.contains("merged")));
+        assert_eq!(again.init, init.display().to_string());
+        let third = p.next_run_dir();
+        write_run_again(
+            &cube(),
+            &repo(),
+            &p,
+            &again,
+            settings,
+            &third,
+            "127.0.0.1:7022",
+        )
+        .unwrap();
+        let c = written(&third).collect.unwrap();
+        assert_eq!(
+            (c.seed, c.merge),
+            (217, again.merge.clone()),
+            "after 117-216"
+        );
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
+    /// The IR route (the cube-pose card) starts from the evaluated `.esb`, and the mark is the
+    /// one the run's own ledger says its evaluation judged, whatever `[eval] checkpoint` says.
+    #[test]
+    fn train_again_on_the_ir_route_starts_from_the_bundle_the_ledger_judged() {
+        use es_data::collect::{append_loop_step, LoopStep};
+
+        let p = scratch("again-ir");
+        let settings = StartSettings {
+            demonstrations: 10,
+            length: Length::Short,
+        };
+        let hint = crate::model::project::tests::hint();
+        write_run(
+            &hint,
+            &repo(),
+            &p,
+            settings,
+            &p.next_run_dir(),
+            "127.0.0.1:7023",
+        )
+        .unwrap();
+        let run = evaluated(&p, 1, &["torque_noise"]);
+        let dir = run.path.join("train").join("checkpoints");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("5000.esb"), "").unwrap();
+        let again = RunResults::read(&p, &run, Some(&repo())).unwrap().again;
+        assert_eq!(
+            again.map(|a| a.init),
+            Ok(dir.join("5000.esb").display().to_string()),
+            "no ledger: `last`, the preset's 5000"
+        );
+
+        let train = LoopStep::new(LoopKind::Train)
+            .output("checkpoint.1000", &"aa")
+            .output("checkpoint.5000", &"bb");
+        let judged = LoopStep::new(LoopKind::Evaluate).input("policy_hash", &"aa");
+        let expert = LoopStep::new(LoopKind::Evaluate).input("policy_hash", &"cc");
+        for step in [train, judged, expert] {
+            append_loop_step(&run.path, &step).unwrap();
+        }
+        assert_eq!(
+            evaluated_mark(&run.path),
+            Some(1000),
+            "the expert gate matches none"
+        );
+        assert_eq!(
+            RunResults::read(&p, &run, Some(&repo())).unwrap().again,
+            Err("results.again.no_checkpoint"),
+            "1000.esb is not on disk"
+        );
+        std::fs::write(dir.join("1000.esb"), "").unwrap();
+        let again = RunResults::read(&p, &run, Some(&repo()))
+            .unwrap()
+            .again
+            .unwrap();
+        assert_eq!(again.init, dir.join("1000.esb").display().to_string());
+        let next = p.next_run_dir();
+        write_run_again(
+            &hint,
+            &repo(),
+            &p,
+            &again,
+            settings,
+            &next,
+            "127.0.0.1:7024",
+        )
+        .unwrap();
+        let cycle = written(&next);
+        let recipe = cycle.training(None, &next).unwrap();
+        assert_eq!(
+            recipe.init.map(|i| i.policy),
+            Some(again.init),
+            "[init] policy"
+        );
+        assert_eq!(cycle.collect.unwrap().seed, 11, "after 1-10, below 101");
+        std::fs::remove_dir_all(&p.root).ok();
     }
 }

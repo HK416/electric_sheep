@@ -59,6 +59,16 @@ pub(crate) fn tick(app: &mut EditorApp, ctx: &egui::Context) {
     if let Some(settings) = app.results.run_again.take() {
         open.watch.settings = settings;
     }
+    // ⑤'s "Train again on what failed" (packet M13/Z4b), with the settings just taken.
+    if let Some(again) = app.results.again.take() {
+        let pid = app.launch.pid();
+        if let Err(e) = open
+            .watch
+            .start_again(&open.project, &again, pid, &open.phases)
+        {
+            app.status = e.to_string();
+        }
+    }
     let (tick, phases) =
         open.watch
             .tick(&mut app.launch, &app.telemetry, open.phase, Instant::now());

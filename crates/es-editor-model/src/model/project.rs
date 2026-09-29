@@ -16,9 +16,12 @@
 
 use std::path::{Path, PathBuf};
 
-use es_data::training::{Cycle, Recipe, TrainRef};
+use es_data::training::{Cycle, PerturbRef, PreviewRef, Recipe, TrainRef};
+use es_ir::evaluation::{EvaluationIr, SeedPlan};
+use es_ir::serial::evaluation_from_toml;
 use serde::{Deserialize, Serialize};
 
+use crate::model::results::Again;
 use crate::model::template::{Length, Template};
 
 pub const PROJECT_FILE: &str = "project.toml";
@@ -213,7 +216,10 @@ fn arg(path: &Path) -> String {
 /// Writes `run/cycle.toml`: the template's recipe with `[collect] episodes`, `[collect]
 /// policy` (absolute path of the project's bundle) and an inline `[train]` whose
 /// `[run] checkpoint_at` is the preset and `steps` its last mark. Everything else is the
-/// template's, unchanged. Returns the argv for `es` (no program name).
+/// template's, unchanged, but for `[eval.preview]`: at its defaults when the template's cycle
+/// declares none, so every run the editor starts shows a short test after each checkpoint
+/// (packet M13/Z6) while the committed cycles and their goldens stay as they are. Returns the
+/// argv for `es` (no program name).
 ///
 /// The inline `[train]` is the template's training recipe with `[dataset]` left out (the
 /// cycle overrides it with its own collect output) and two more words changed: `[run]`'s
@@ -232,6 +238,97 @@ pub fn write_run(
     run: &Path,
     telemetry: &str,
 ) -> Result<Vec<String>, ProjectError> {
+    let (cycle, cycle_path) = run_cycle(template, repo_root, project, settings, run)?;
+    write_cycle(&cycle, &cycle_path, run, telemetry)
+}
+
+/// "Train again on what failed" (packet M13/Z4b): [`write_run`]'s recipe plus what [`Again`]
+/// decided -- `[collect] perturb` (the weakest suites of the previous run's `[eval] config`),
+/// `[collect] merge`, `[train] init` -- and a fresh `[collect] seed`. `[eval]` stays
+/// [`write_run`]'s, so the Evaluation IR that judged the previous run judges this one and the
+/// two reports compare (spec 13.3).
+///
+/// The seed is [`fresh_seed`]'s: after every collection of every run the project has, and clear
+/// of every seed of the Evaluation IRs the cycle names (the one it is judged by and the one it
+/// collects under) -- the check `es loop cycle` refuses a recipe by.
+pub fn write_run_again(
+    template: &Template,
+    repo_root: &Path,
+    project: &Project,
+    again: &Again,
+    settings: StartSettings,
+    run: &Path,
+    telemetry: &str,
+) -> Result<Vec<String>, ProjectError> {
+    let (mut cycle, cycle_path) = run_cycle(template, repo_root, project, settings, run)?;
+    let taken: Vec<(u64, u32)> = project
+        .runs()
+        .iter()
+        .filter_map(|r| {
+            let text = std::fs::read_to_string(r.path.join(RUN_RECIPE)).ok()?;
+            let c = Cycle::parse(&text).ok()?.collect?;
+            Some((c.seed, c.episodes))
+        })
+        .collect();
+    let mut judged = Vec::new();
+    for config in [&cycle.eval.config, &again.config] {
+        let path = repo_root.join(config);
+        let ir = evaluation_from_toml(&read(&path)?).map_err(|e| err(&path, e))?;
+        judged.extend(evaluation_seeds(&ir));
+    }
+    cycle.train.init = Some(again.init.clone());
+    let collect = cycle
+        .collect
+        .as_mut()
+        .expect("run_cycle refuses a cycle without [collect]");
+    collect.seed = fresh_seed(&taken, &judged, collect.episodes);
+    collect.perturb = Some(PerturbRef {
+        config: again.config.clone(),
+        suites: again.suites.clone(),
+    });
+    collect.merge.clone_from(&again.merge);
+    write_cycle(&cycle, &cycle_path, run, telemetry)
+}
+
+/// Spec 10.2's resolved seeds: the explicit list, or `n_episodes` from `seed_base` -- what
+/// `es_eval::runner::resolve_seeds` and `es loop collect`'s overlap refusal both read.
+pub fn evaluation_seeds(ir: &EvaluationIr) -> Vec<u64> {
+    match &ir.episodes.seeds {
+        SeedPlan::Base(b) => (0..u64::from(ir.episodes.n_episodes))
+            .map(|i| b.wrapping_add(i))
+            .collect(),
+        SeedPlan::Explicit(list) => list.clone(),
+    }
+}
+
+/// The first collect seed at or after the end of every `(seed, episodes)` range in `taken`
+/// whose `episodes` seeds meet none of `judged` (spec 13.3: a re-collection never draws what the
+/// policy is judged on). Each step moves past one judged seed, so it ends.
+pub fn fresh_seed(taken: &[(u64, u32)], judged: &[u64], episodes: u32) -> u64 {
+    let mut seed = taken
+        .iter()
+        .map(|&(s, n)| s.saturating_add(u64::from(n)))
+        .max()
+        .unwrap_or(0);
+    while let Some(hit) = judged
+        .iter()
+        .filter(|&&j| j >= seed && j - seed < u64::from(episodes))
+        .max()
+    {
+        seed = hit + 1;
+    }
+    seed
+}
+
+/// The template's cycle with the person's settings in it, and where it was read from; see
+/// [`write_run`].
+fn run_cycle(
+    template: &Template,
+    repo_root: &Path,
+    project: &Project,
+    settings: StartSettings,
+    run: &Path,
+) -> Result<(Cycle, PathBuf), ProjectError> {
     let cycle_path = repo_root.join(&template.cycle);
     let mut cycle = Cycle::parse(&read(&cycle_path)?).map_err(|e| err(&cycle_path, e))?;
     let recipe = match &cycle.train.recipe {
@@ -269,6 +366,7 @@ pub fn write_run(
         }),
         init: cycle.train.init.clone(),
     };
+    cycle.eval.preview.get_or_insert_with(PreviewRef::default);
     let collect = cycle.collect.as_mut().ok_or_else(|| {
         err(
             &cycle_path,
@@ -277,11 +375,20 @@ pub fn write_run(
     })?;
     collect.episodes = settings.demonstrations;
     collect.policy = bundle;
-    // The same checks `es loop cycle` makes before it runs anything, so a preset the route
-    // refuses is refused here, not a second after Start.
-    cycle.training(None, run).map_err(|e| err(&cycle_path, e))?;
+    Ok((cycle, cycle_path))
+}
 
-    let text = toml::to_string(&cycle).map_err(|e| err(&cycle_path, e))?;
+/// Makes `run` and writes `cycle` and `telemetry.txt` into it, after the checks `es loop cycle`
+/// makes before it runs anything, so a preset the route refuses is refused here, not a second
+/// after Start.
+fn write_cycle(
+    cycle: &Cycle,
+    cycle_path: &Path,
+    run: &Path,
+    telemetry: &str,
+) -> Result<Vec<String>, ProjectError> {
+    cycle.training(None, run).map_err(|e| err(cycle_path, e))?;
+    let text = toml::to_string(cycle).map_err(|e| err(cycle_path, e))?;
     let parent = run.parent().unwrap_or(run);
     std::fs::create_dir_all(parent).map_err(|e| err(parent, e))?;
     std::fs::create_dir(run).map_err(|e| err(run, e))?;
@@ -334,7 +441,7 @@ pub(crate) mod tests {
         template("cube-into-bin")
     }
 
-    fn hint() -> Template {
+    pub(crate) fn hint() -> Template {
         template("cube-into-bin-hint")
     }
 
@@ -413,7 +520,16 @@ pub(crate) mod tests {
         let template: Cycle =
             toml::from_str(&std::fs::read_to_string(repo().join(&cube().cycle)).unwrap()).unwrap();
         assert_eq!(written.collect.as_ref().unwrap().episodes, 50);
-        assert_eq!(written.eval, template.eval);
+        // `[eval.preview]` at its defaults, which the template's cycle does not declare
+        // (packet M13/Z6); the rest of `[eval]` is the template's.
+        assert_eq!(template.eval.preview, None);
+        assert_eq!(
+            written.eval,
+            es_data::training::EvalRef {
+                preview: Some(PreviewRef::default()),
+                ..template.eval.clone()
+            }
+        );
         assert_eq!(written.scene, template.scene);
         assert_eq!(written.showcase, template.showcase);
         let (w, t) = (
@@ -549,6 +665,23 @@ pub(crate) mod tests {
             root.join(COLLECT_BUNDLE)
         );
         std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Packet M13/Z4b: a re-collection starts after every earlier one and steps over the
+    /// evaluation's seeds; after a first run of 200 on seed 1 it is `cycle-again.toml`'s 201.
+    #[test]
+    fn a_fresh_seed_range_misses_earlier_ranges_and_the_evaluation() {
+        let judged: Vec<u64> = (101..=116).collect();
+        assert_eq!(fresh_seed(&[(1, 200)], &judged, 64), 201);
+        assert_eq!(fresh_seed(&[(1, 50)], &judged, 50), 51, "51-100 misses 101");
+        assert_eq!(fresh_seed(&[(1, 50)], &judged, 51), 117, "51-101 meets 101");
+        assert_eq!(
+            fresh_seed(&[(117, 10), (1, 50)], &judged, 5),
+            127,
+            "the latest end"
+        );
+        assert_eq!(fresh_seed(&[], &[0, 3], 3), 4, "past 0, then past 3");
+        assert_eq!(fresh_seed(&[], &[5], 0), 0, "no attempt meets nothing");
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::model::i18n::{fill, t, Lang};
 use crate::model::labels::{self, Browse};
 use crate::model::layout::{self, Pane};
 use crate::model::project::{RunFolder, StartSettings};
-use crate::model::results::{self, RunResults, TileFilter};
+use crate::model::results::{self, Again, RunResults, TileFilter};
 use crate::model::template;
 use crate::model::workflow::{Phase, PhaseState};
 use crate::ui::advanced::{metric_text, rgb_texture, short_hash};
@@ -52,6 +52,8 @@ pub struct State {
     thumbs: BTreeMap<String, Option<egui::TextureHandle>>,
     /// The settings Run again hands to ③'s Start panel (packet M12/Y12 takes them).
     pub run_again: Option<StartSettings>,
+    /// "Train again on what failed", pressed: ③'s tick starts it (packet M13/Z4b).
+    pub again: Option<Again>,
 }
 
 impl std::fmt::Debug for State {
@@ -155,6 +157,7 @@ fn step_panel(app: &mut EditorApp, ui: &mut egui::Ui) {
         Some((_, Ok(shown))) => shown,
     };
     let mut run_again = None;
+    let mut again = None;
     let mut status = None;
     egui::ScrollArea::vertical()
         .id_salt("results-left")
@@ -209,9 +212,26 @@ fn step_panel(app: &mut EditorApp, ui: &mut egui::Ui) {
             {
                 run_again = Some(shown.settings);
             }
+            // Packet M13/Z4b: the same settings, and the run starts as soon as ③ ticks.
+            let reason = shown.again.as_ref().err().copied().unwrap_or_default();
+            if ui
+                .add_enabled(
+                    shown.again.is_ok(),
+                    egui::Button::new(t(lang, "results.again")),
+                )
+                .on_disabled_hover_text(t(lang, reason))
+                .clicked()
+            {
+                again = shown.again.clone().ok();
+                run_again = Some(shown.settings);
+            }
+            ui.weak(t(lang, "results.again.about"));
         });
     if let Some(status) = status {
         app.status = status;
+    }
+    if again.is_some() {
+        app.results.again = again;
     }
     if let Some(settings) = run_again {
         app.results.run_again = settings;

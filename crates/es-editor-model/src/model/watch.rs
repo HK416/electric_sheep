@@ -25,7 +25,7 @@ use crate::model::preview::{self, Preview};
 use crate::model::project::{
     self, Project, ProjectError, RunFolder, StartSettings, RUN_RECIPE, TELEMETRY_FILE,
 };
-use crate::model::results;
+use crate::model::results::{self, Again};
 use crate::model::telemetry_view::{self, Closed, Event, SeriesKey, Source, TelemetryModel};
 use crate::model::template::{self, Length, Template};
 use crate::model::train_view::STREAM_TRAIN;
@@ -869,6 +869,28 @@ impl Watch {
         pid: Option<u32>,
         phases: &[PhaseState; 5],
     ) -> Result<bool, ProjectError> {
+        self.start_with(project, None, pid, phases)
+    }
+
+    /// ⑤'s "train again on what failed" (packet M13/Z4b): [`Self::start`], under the same
+    /// [`may_start`] gate, with the recipe [`project::write_run_again`] writes.
+    pub fn start_again(
+        &mut self,
+        project: &Project,
+        again: &Again,
+        pid: Option<u32>,
+        phases: &[PhaseState; 5],
+    ) -> Result<bool, ProjectError> {
+        self.start_with(project, Some(again), pid, phases)
+    }
+
+    fn start_with(
+        &mut self,
+        project: &Project,
+        again: Option<&Again>,
+        pid: Option<u32>,
+        phases: &[PhaseState; 5],
+    ) -> Result<bool, ProjectError> {
         let Ok((template, root)) = &self.source else {
             return Ok(false);
         };
@@ -877,7 +899,11 @@ impl Watch {
         }
         let path = project.next_run_dir();
         let addr = address(launch::free_local_port());
-        let argv = project::write_run(template, root, project, self.settings, &path, &addr)?;
+        let (s, p) = (self.settings, project);
+        let argv = match again {
+            None => project::write_run(template, root, p, s, &path, &addr)?,
+            Some(a) => project::write_run_again(template, root, p, a, s, &path, &addr)?,
+        };
         self.run = project.latest_run();
         self.demonstrations = self.settings.demonstrations;
         self.queued = Some(with_pictures(argv));
@@ -1059,6 +1085,32 @@ mod tests {
             after(&argv, "--telemetry"),
             run.telemetry_addr().as_deref(),
             "telemetry.txt is the address the child publishes on"
+        );
+
+        // ⑤'s "train again" (packet M13/Z4b): the same gate, then the next run's Z3 recipe.
+        let again = Again {
+            config: "tests/fixtures/visible-learning/evaluation-v8.toml".into(),
+            suites: vec!["nominal".into()],
+            merge: vec![es_data::training::collect_root(&run.path)],
+            init: run
+                .path
+                .join("train/checkpoints/5000.esb")
+                .display()
+                .to_string(),
+        };
+        let start_again = |w: &mut Watch| w.start_again(&p, &again, None, &fresh());
+        assert_eq!(start_again(&mut watch), Ok(false), "a start is queued");
+        watch.queued = None;
+        assert_eq!(start_again(&mut watch), Ok(true));
+        assert_eq!(p.runs().len(), 2);
+        let next = watch.run.clone().expect("the again run");
+        let text = std::fs::read_to_string(next.path.join(RUN_RECIPE)).unwrap();
+        let cycle = Cycle::parse(&text).unwrap();
+        assert_eq!(cycle.train.init, Some(again.init.clone()));
+        assert_eq!(
+            cycle.collect.map(|c| c.seed),
+            Some(8),
+            "after run 001's 1-7"
         );
         std::fs::remove_dir_all(&p.root).ok();
     }
