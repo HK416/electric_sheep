@@ -479,7 +479,11 @@ IR's own perturbations instead of a widened randomization (no new document field
   above }`, an attempt that ends inside while that joint (its `qpos` in the trajectory, at the
   index the scene's joint order gives) never went past `above` after the object last went in is
   *put in but never let go*, asked before *too late*. Both cube templates use the Task IR's own
-  success threshold, `gripper` 0.85.
+  success threshold, `gripper` 0.85. A later run (2026-09-29) held the cube right above the bin,
+  gripper shut, until time ran out, and was named *left outside*: with `release`, an object last
+  seen over the target (inside its x/y footprint, above its top) is judged by the same rule from
+  when it last came over the footprint (*never let go*; let go and still in the air, *too late*);
+  without `release` nothing changes.
 - **Collection under perturbations (Z2).** `es loop collect --perturb <evaluation.toml> --suites
   a,b` runs episode i under `suites[i % n]` through the same `PerturbationPlan` `es eval run`
   uses, under the same Safety Plane, on per-episode seeds `seed..seed+N` that must miss every

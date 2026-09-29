@@ -6,13 +6,18 @@
 //! `[outcome]` says which body is the object and which scene geoms are the place it belongs:
 //!
 //! - [`Outcome::NotReleased`]: last seen inside the target region, and the `[outcome] release`
-//!   joint never went past its `above` since the object last went in (packet M13/R4);
-//! - [`Outcome::InsideTooLate`]: otherwise last seen inside, but time ran out;
+//!   joint never went past its `above` since the object last went in (packet M13/R4); or, with a
+//!   release condition, last seen held over the target - inside its x/y footprint, above its top -
+//!   and never let go since it last came over the footprint (a real run, 2026-09-29, carried the
+//!   cube right above the bin and held it there until time ran out);
+//! - [`Outcome::InsideTooLate`]: otherwise last seen inside, or over the target with a release
+//!   condition, and let go, but time ran out (over it: still falling, or perched on a wall);
 //! - [`Outcome::NeverLifted`]: otherwise, never `lift_m` above where it started;
-//! - [`Outcome::LeftOutside`]: otherwise - lifted, and last seen outside.
+//! - [`Outcome::LeftOutside`]: otherwise - lifted, and last seen away from the target.
 //!
-//! Inside is asked first: an object that got there got there, however it did. Without a release
-//! condition, inside is always too late. The release joint's position is its `qpos` value in the
+//! Inside and over are asked first: an object that got there got there, however it did. Without a
+//! release condition nothing is over the target: inside is always too late, and an object above
+//! the target's top is outside it. The release joint's position is its `qpos` value in the
 //! trajectory, at the index the scene's joint order gives it. The target region
 //! is the axis-aligned box of the triangles the renderer tessellates for the geoms of the target's
 //! stem ([`stem`], the rule ① Scene groups objects by), at the scene's own pose. Nothing here is a
@@ -39,11 +44,17 @@ use crate::model::template::OutcomeSpec;
 /// `EpisodeRow::termination` of an attempt that ran out of time.
 const TIMEOUT: &str = "timeout";
 
+/// Why a timed-out attempt failed; [`classify`] asks the last two first (the module's list).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Outcome {
+    /// Never `lift_m` above where it started.
     NeverLifted,
+    /// Lifted, and last seen away from the target: neither inside it nor held over it.
     LeftOutside,
+    /// Inside the target, or held over it, and the release joint never past its opening since it
+    /// came in or over; only with a release condition.
     NotReleased,
+    /// Inside the target when time ran out; or, with a release condition, over it and let go.
     InsideTooLate,
 }
 
@@ -86,7 +97,8 @@ impl Region {
 
 /// The class of an object's path, first tick first; `None` for no ticks. `release`, when the
 /// template declares one, is the release joint's position at each tick and the opening past
-/// which the object counts as let go.
+/// which the object counts as let go. Asked in the module's order: inside, then (with `release`)
+/// over, then the lift.
 pub fn classify(
     path: &[[f64; 3]],
     target: &Region,
@@ -98,9 +110,15 @@ pub fn classify(
         .iter()
         .map(|p| p[2] - first[2])
         .fold(f64::NEG_INFINITY, f64::max);
-    Some(if target.contains(*last) {
-        // The first tick of the stretch inside that the path ends on.
-        let entered = (path.iter().rposition(|p| !target.contains(*p))).map_or(0, |i| i + 1);
+    let inside = target.contains(*last);
+    // Over the target: inside its x/y footprint, anywhere from its floor up.
+    let over = |p: [f64; 3]| target.contains([p[0], p[1], p[2].min(target.max[2])]);
+    // The stretch the release is judged over: inside the box for an object that ended in it,
+    // over the target for one held over it.
+    let within = |p: [f64; 3]| if inside { target.contains(p) } else { over(p) };
+    Some(if inside || (release.is_some() && over(*last)) {
+        // The first tick of that stretch that the path ends on.
+        let entered = (path.iter().rposition(|p| !within(*p))).map_or(0, |i| i + 1);
         let let_go =
             release.is_none_or(|(opening, above)| opening.iter().skip(entered).any(|&q| q > above));
         if let_go {
@@ -319,6 +337,62 @@ mod tests {
             j.classify(&traj(j.object, &almost, &shut)),
             Some(Outcome::NeverLifted)
         );
+    }
+
+    /// Above the bin's walls, inside its footprint, is over it only with a release condition.
+    #[test]
+    fn an_object_held_over_the_target_is_judged_by_its_release() {
+        let j = judge();
+        let start = [0.24, 0.0, 0.02];
+        // Lifted, carried right above the bin (its top is 0.09 m) and held there.
+        let held = [start, [0.14, -0.1, 0.13], [0.139, -0.092, 0.135]];
+        // Lifted, and dropped (or held up) just beside the bin's x = 0.198 wall.
+        let beside = [start, [0.21, -0.1, 0.13], [0.21, -0.1, 0.02]];
+        let beside_high = [start, [0.21, -0.1, 0.13], [0.21, -0.1, 0.13]];
+        for (path, grip, want) in [
+            (&held[..], [0.0, 0.09, 0.09], Outcome::NotReleased),
+            // Opened wide before it came over the bin, shut since: not let go over it.
+            (&held[..], [1.2, 0.09, 0.09], Outcome::NotReleased),
+            // Let go over the bin, still in the air when time ran out: there, too late.
+            (&held[..], [0.0, 0.09, 1.2], Outcome::InsideTooLate),
+            (&beside[..], [0.0, 0.09, 1.2], Outcome::LeftOutside),
+            (&beside_high[..], [0.0, 0.09, 0.09], Outcome::LeftOutside),
+        ] {
+            let t = traj(j.object, path, &grip);
+            assert_eq!(j.classify(&t), Some(want), "{path:?} {grip:?}");
+        }
+        // Without a release condition nothing is over the bin: above it is outside.
+        let no_release = Judge {
+            release: None,
+            ..j.clone()
+        };
+        let t = traj(j.object, &held, &[0.0, 0.09, 0.09]);
+        assert_eq!(no_release.classify(&t), Some(Outcome::LeftOutside));
+    }
+
+    /// The run that found the held-over case (2026-09-29): two 60,000-step checkpoint preview
+    /// attempts lifted the cube about 11.5 cm, carried it right above the bin and held it there,
+    /// the gripper shut, until time ran out. Read from the owner's checkout, never committed.
+    #[test]
+    fn the_real_attempts_held_over_the_bin_are_not_released() {
+        const EVIDENCE: &str =
+            "F:/Projects/electric_sheep/target/yv/cube-hint-wait1/runs/001/preview/60000/traj";
+        let j = judge();
+        for cell in ["nominal-01", "nominal-02"] {
+            let path = Path::new(EVIDENCE).join(format!("{cell}.estraj"));
+            if !path.is_file() {
+                eprintln!("skipped: {} is not on this machine", path.display());
+                continue;
+            }
+            let traj = Trajectory::read(&path).expect("the evidence file");
+            assert_eq!(j.classify(&traj), Some(Outcome::NotReleased), "{cell}");
+            // What the editor said before: lifted but left outside.
+            let before = Judge {
+                release: None,
+                ..j.clone()
+            };
+            assert_eq!(before.classify(&traj), Some(Outcome::LeftOutside), "{cell}");
+        }
     }
 
     /// The run that found it (packet M13/R4, 2026-09-29): a checkpoint preview attempt put the
