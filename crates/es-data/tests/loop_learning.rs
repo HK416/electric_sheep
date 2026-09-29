@@ -1047,6 +1047,18 @@ fn an_unreachable_waypoint_fails_the_episode() {
         vec![Termination::Failure; 2],
         "an aborted demonstration is a failure, not a timeout"
     );
+    // Packet P-M14-R1: the collect step says how the demonstrations ended, which is what
+    // `es loop cycle` reads before it trains on them.
+    let steps = read_loop_steps(&root).expect("the ledger reads back");
+    let collect = &steps.last().expect("a collect step").outputs;
+    assert_eq!(
+        (
+            &collect["success"][..],
+            &collect["failure"][..],
+            &collect["timeout"][..]
+        ),
+        ("0", "2", "0")
+    );
     let dataset = LeRobotDataset::open(&root).expect("the collected dataset opens");
     assert_eq!(dataset.episodes().len(), 2, "aborted episodes are written");
     let ep = dataset.read_episode(0).expect("episode reads back");

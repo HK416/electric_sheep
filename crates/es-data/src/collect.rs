@@ -926,6 +926,9 @@ impl Collector {
         let (content, schema) = identity_of(&dataset)?;
         let h = &bundle.manifest.hashes;
         let slot = |d: Option<[u8; 32]>| d.as_ref().map_or_else(|| "-".to_owned(), hex);
+        let ended = |t: Termination| terminations.iter().filter(|e| **e == t).count();
+        // How the demonstrations ended, which the `LeRobot` columns have no place for: what
+        // `es loop cycle` reads before it trains on them (packet P-M14-R1).
         let mut step = LoopStep::new(LoopKind::Collect)
             .input("task", &slot(h.task))
             .input("observation", &slot(h.observation))
@@ -934,7 +937,10 @@ impl Collector {
             .input("seed", &spec.seed)
             .input("episodes", &spec.n_episodes)
             .output("content", &hex(&content))
-            .output("schema", &hex(&schema));
+            .output("schema", &hex(&schema))
+            .output("success", &ended(Termination::Success))
+            .output("failure", &ended(Termination::Failure))
+            .output("timeout", &ended(Termination::Timeout));
         for (key, value) in ledger {
             step = step.input(key, value);
         }
