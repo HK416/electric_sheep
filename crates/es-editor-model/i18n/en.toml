@@ -155,6 +155,14 @@
 "cause.actuator_fault.advice" = "A motor did not work as expected. On a real robot, check the motor and its cable."
 "cause.backend_unsupported" = "The simulator lacks a needed feature"
 "cause.backend_unsupported.advice" = "The chosen simulator cannot do something this task needs. Run it with another simulator."
+# A timeout, told apart by where the object went (packet M13/Z4). `{}` is the template's
+# `[outcome] object_name`, then its `target_name`.
+"cause.never_lifted" = "The {} was never lifted"
+"cause.never_lifted.advice" = "The robot never picked the object up. More demonstrations, or a longer training run, usually teach it to grasp."
+"cause.left_outside" = "The {} was lifted but ended outside the {}"
+"cause.left_outside.advice" = "The robot picked the object up but did not leave it where it belongs. More demonstrations usually teach it where to carry it."
+"cause.inside_too_late" = "The {} reached the {}, but too late"
+"cause.inside_too_late.advice" = "The object ended where it belongs, but not before time ran out. A longer training run usually makes the robot quicker."
 
 # --- results: what an evaluation changed on purpose, one name per perturbation kind -------
 "perturb.light_intensity" = "Light brightness"
@@ -316,6 +324,9 @@
 "template.cube_into_bin_hint.name" = "Cube into bin - with the cube's position"
 "template.cube_into_bin_hint.summary" = "The same arm, cube and bin. Besides the camera and its joints, the policy is told exactly where the cube is."
 "template.cube_into_bin_hint.notice" = "Practice: the simulator also tells the policy where the cube is, which a real robot cannot know. That makes the task much easier than it is for a real robot."
+# What a template's `[outcome]` names its object and target (packet M13/Z6).
+"outcome.cube" = "cube"
+"outcome.bin" = "bin"
 
 # --- the PC check: what a template needs ----------------------------------------------------
 "deps.python" = "Python"

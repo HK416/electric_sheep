@@ -11,7 +11,7 @@
 //! compared with, each acceptance line in plain words, a suite's plain name, the views an
 //! attempt can be played in and the one it opens on, and which policy file Export copies.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use es_core::FailureKind;
@@ -26,15 +26,19 @@ use es_ir::evaluation::{
 use es_ir::serial::evaluation_from_toml;
 use es_safety::ViolationKind;
 
-use crate::model::i18n::{fill, t, Lang};
-use crate::model::labels::{metric_label, perturbation_key};
+use crate::model::i18n::{fill, t, Lang, Strings};
+use crate::model::labels::{cause_key, metric_label, perturbation_key};
+use crate::model::outcome::{self, Outcome};
 use crate::model::project::{Project, RunFolder, StartSettings, RUN_RECIPE};
-use crate::model::template::{load, Length, Template};
+use crate::model::template::{load, Length, OutcomeSpec, Template};
 
 /// Why an episode failed, in the words a person reads - one per group of histogram buckets.
 /// The order is the tie-break of [`causes`] and a tile's pick: how the episode ended first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Cause {
+    /// A timeout, told apart by where the object went (packet M13/Z4): it takes `Timeout`'s
+    /// place whenever the attempt's trajectory says it.
+    Outcome(Outcome),
     Timeout,
     FailureCondition,
     Unfinished,
@@ -49,7 +53,10 @@ pub enum Cause {
 }
 
 impl Cause {
-    pub const ALL: [Cause; 11] = [
+    pub const ALL: [Cause; 14] = [
+        Cause::Outcome(Outcome::NeverLifted),
+        Cause::Outcome(Outcome::LeftOutside),
+        Cause::Outcome(Outcome::InsideTooLate),
         Cause::Timeout,
         Cause::FailureCondition,
         Cause::Unfinished,
@@ -136,10 +143,20 @@ const FAILURE_KINDS: [FailureKind; 8] = [
 
 const SUCCESS: &str = "success";
 
-/// One episode's causes, each once however many of its buckets name it.
-fn row_causes(row: &EpisodeRow) -> BTreeSet<Cause> {
-    row.histogram.keys().filter_map(|b| cause_of(b)).collect()
+/// One episode's causes, each once however many of its buckets name it; its outcome class, when
+/// there is one, in place of `Timeout`. A failure something else ended keeps that cause.
+fn row_causes(row: &EpisodeRow, outcome: Option<Outcome>) -> BTreeSet<Cause> {
+    let mut causes: BTreeSet<Cause> = row.histogram.keys().filter_map(|b| cause_of(b)).collect();
+    if let Some(o) = outcome {
+        if causes.remove(&Cause::Timeout) {
+            causes.insert(Cause::Outcome(o));
+        }
+    }
+    causes
 }
+
+/// The outcome classes of a run's attempts, by cell ([`outcome::outcomes`]).
+pub type Outcomes = BTreeMap<String, Outcome>;
 
 /// The headline: pass or fail, and successes over all episodes ("9 of 16").
 #[derive(Clone, Debug, PartialEq)]
@@ -193,19 +210,15 @@ pub fn compare(current: &EvaluationReport, previous: Option<&EvaluationReport>) 
 }
 
 /// Failed episodes per cause, most first, then `Cause` order; an episode with two causes
-/// counts once under each.
-pub fn causes(rows: &[EpisodeRow]) -> Vec<(Cause, u32)> {
-    let mut counts = [0u32; Cause::ALL.len()];
+/// counts once under each, and one with an outcome class under the class.
+pub fn causes(rows: &[EpisodeRow], outcomes: &Outcomes) -> Vec<(Cause, u32)> {
+    let mut counts: BTreeMap<Cause, u32> = BTreeMap::new();
     for row in rows.iter().filter(|r| r.termination != SUCCESS) {
-        for cause in row_causes(row) {
-            counts[cause as usize] += 1;
+        for cause in row_causes(row, outcomes.get(&row.cell).copied()) {
+            *counts.entry(cause).or_default() += 1;
         }
     }
-    let mut out: Vec<(Cause, u32)> = Cause::ALL
-        .into_iter()
-        .zip(counts)
-        .filter(|&(_, n)| n > 0)
-        .collect();
+    let mut out: Vec<(Cause, u32)> = counts.into_iter().collect();
     // Stable: equal counts keep `Cause::ALL`'s order.
     out.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
     out
@@ -297,11 +310,12 @@ pub struct Tile {
     pub cell: String,
     pub suite: String,
     pub success: bool,
-    /// A failure's first cause in `Cause` order - how it ended; `None` for a success.
+    /// A failure's first cause in `Cause` order - how it ended, its outcome class first;
+    /// `None` for a success.
     pub cause: Option<Cause>,
 }
 
-pub fn tiles(rows: &[EpisodeRow], filter: TileFilter) -> Vec<Tile> {
+pub fn tiles(rows: &[EpisodeRow], filter: TileFilter, outcomes: &Outcomes) -> Vec<Tile> {
     rows.iter()
         .filter_map(|row| {
             let success = row.termination == SUCCESS;
@@ -317,7 +331,9 @@ pub fn tiles(rows: &[EpisodeRow], filter: TileFilter) -> Vec<Tile> {
                 cause: if success {
                     None
                 } else {
-                    row_causes(row).first().copied()
+                    row_causes(row, outcomes.get(&row.cell).copied())
+                        .first()
+                        .copied()
                 },
             })
         })
@@ -600,6 +616,10 @@ pub struct RunResults {
     pub settings: Option<StartSettings>,
     /// The policy file Export copies ([`export_bundle`]).
     pub export: Option<PathBuf>,
+    /// The template's `[outcome]`, and the class of each timed-out attempt whose trajectory
+    /// says one (packet M13/Z4).
+    pub outcome: Option<OutcomeSpec>,
+    pub outcomes: Outcomes,
 }
 
 impl RunResults {
@@ -646,6 +666,11 @@ impl RunResults {
             .as_ref()
             .zip(template.as_ref())
             .and_then(|(c, t)| start_settings(c, t));
+        let outcome = template.and_then(|t| t.outcome);
+        let outcomes = match (&rows, &outcome, &scene) {
+            (Some(rows), Some(spec), Some(scene)) => outcome::outcomes(scene, spec, rows, &dir),
+            _ => Outcomes::new(),
+        };
         Ok(Self {
             run: run.clone(),
             export: export_bundle(run, cycle.as_ref()),
@@ -657,11 +682,22 @@ impl RunResults {
             scene,
             previous,
             settings,
+            outcome,
+            outcomes,
         })
     }
 
     pub fn comparison(&self) -> Comparison {
         compare(&self.dir.report, self.previous.as_ref().map(|(_, r)| r))
+    }
+
+    /// A cause's plain name; an outcome class's names the template's object and target.
+    pub fn cause_label(&self, lang: Lang, cause: Cause) -> String {
+        let table = Strings::get(lang);
+        let names: Vec<&str> = (self.outcome.iter())
+            .flat_map(|o| [table.t(&o.object_name), table.t(&o.target_name)])
+            .collect();
+        fill(lang, cause_key(cause), &names)
     }
 }
 
@@ -692,6 +728,10 @@ mod tests {
             changed_steps: 0,
             histogram,
         }
+    }
+
+    fn none() -> Outcomes {
+        Outcomes::new()
     }
 
     fn hash(hex: &str) -> [u8; 32] {
@@ -740,7 +780,7 @@ mod tests {
             row("nominal", 3, "success", &[]),
         ];
         assert_eq!(
-            causes(&rows),
+            causes(&rows, &none()),
             [
                 (Cause::Timeout, 2),
                 (Cause::FailureCondition, 1),
@@ -758,7 +798,7 @@ mod tests {
             row("nominal", 1, "success", &[("violation.torque", 1)]),
         ];
         assert_eq!(
-            causes(&rows),
+            causes(&rows, &none()),
             [(Cause::FailureCondition, 1), (Cause::SafetyLimit, 1)]
         );
     }
@@ -783,7 +823,7 @@ mod tests {
         let s = situations(&report, None, None);
         assert_eq!((s[0].successes, s[0].episodes), (3, 4));
         assert!(s[0].kinds.is_empty());
-        assert!(tiles(&[], TileFilter::All).is_empty());
+        assert!(tiles(&[], TileFilter::All, &none()).is_empty());
         assert_eq!(
             card(&report, None),
             Card {
@@ -867,14 +907,17 @@ mod tests {
             row("nominal", 0, "success", &[]),
             row("nominal", 1, "timeout", &[]),
         ];
-        assert_eq!(tiles(&rows, TileFilter::Failures).len(), 1);
+        assert_eq!(tiles(&rows, TileFilter::Failures, &none()).len(), 1);
         assert_eq!(
-            tiles(&rows, TileFilter::Failures)[0].cause,
+            tiles(&rows, TileFilter::Failures, &none())[0].cause,
             Some(Cause::Timeout)
         );
-        assert_eq!(tiles(&rows, TileFilter::Successes)[0].cell, "nominal-00");
-        assert_eq!(tiles(&rows, TileFilter::Successes)[0].cause, None);
-        assert_eq!(tiles(&rows, TileFilter::All).len(), 2);
+        assert_eq!(
+            tiles(&rows, TileFilter::Successes, &none())[0].cell,
+            "nominal-00"
+        );
+        assert_eq!(tiles(&rows, TileFilter::Successes, &none())[0].cause, None);
+        assert_eq!(tiles(&rows, TileFilter::All, &none()).len(), 2);
     }
 
     // --- the screen (packet M12/Y13) ----------------------------------------------------------
@@ -967,7 +1010,7 @@ mod tests {
             "rows and report agree"
         );
         assert_eq!(
-            causes(read),
+            causes(read, &none()),
             [(Cause::Timeout, 1), (Cause::SafetyFallback, 1)]
         );
         assert_eq!(
@@ -979,6 +1022,69 @@ mod tests {
         std::fs::write(run.eval_dir().join("episodes.json"), "{").unwrap();
         let r = RunResults::read(&p, &run, None).unwrap();
         assert!(r.rows.is_none() && r.rows_error.is_some(), "named, not old");
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
+    /// Packet M13/Z4, review focus 3: a timed-out attempt with a trajectory is named by where
+    /// the cube went, in the template's words; one without keeps "not done in time", and a
+    /// failure something else ended keeps its own cause.
+    #[test]
+    fn a_timeout_with_a_trajectory_is_named_by_its_outcome() {
+        let p = scratch("outcome");
+        let run = copy_fixture(&p, 1);
+        let rows = [
+            // The fixture's one trajectory: the arm sweeps, the cube never moves.
+            row("nominal", 0, "timeout", &[("violation.velocity", 2)]),
+            row("nominal", 1, "failure", &[]),
+            row("light", 0, "success", &[]),
+            row("light", 1, "timeout", &[]),
+        ];
+        write_episodes(&rows, &run.eval_dir()).unwrap();
+        let r = RunResults::read(&p, &run, Some(&repo())).unwrap();
+        let never = Cause::Outcome(Outcome::NeverLifted);
+        assert_eq!(
+            r.outcomes,
+            Outcomes::from([("nominal-00".to_owned(), Outcome::NeverLifted)]),
+            "no trajectory for light-01, and nominal-01 did not time out"
+        );
+        let read = r.rows.as_deref().expect("rows");
+        assert_eq!(
+            causes(read, &r.outcomes),
+            [
+                (never, 1),
+                (Cause::Timeout, 1),
+                (Cause::FailureCondition, 1),
+                (Cause::SafetyLimit, 1)
+            ]
+        );
+        let failed = tiles(read, TileFilter::Failures, &r.outcomes);
+        let picked: Vec<_> = failed.iter().map(|t| t.cause).collect();
+        assert_eq!(
+            picked,
+            [
+                Some(never),
+                Some(Cause::FailureCondition),
+                Some(Cause::Timeout)
+            ]
+        );
+        for lang in Lang::ALL {
+            let label = r.cause_label(lang, never);
+            assert!(
+                label.contains(t(lang, "outcome.cube")) && !label.contains("{}"),
+                "{label}"
+            );
+            for o in Outcome::ALL {
+                let label = r.cause_label(lang, Cause::Outcome(o));
+                assert!(!label.contains("{}"), "{o:?} {lang:?}: {label}");
+            }
+            assert_eq!(
+                r.cause_label(lang, Cause::Timeout),
+                t(lang, "cause.timeout")
+            );
+        }
+        // Without a checkout there is no template, so no class: the recorded causes stand.
+        let bare = RunResults::read(&p, &run, None).unwrap();
+        assert!(bare.outcomes.is_empty() && bare.outcome.is_none());
         std::fs::remove_dir_all(&p.root).ok();
     }
 

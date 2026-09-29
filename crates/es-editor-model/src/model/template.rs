@@ -42,6 +42,21 @@ pub struct Lengths {
     pub long: Vec<u32>,
 }
 
+/// `[outcome]` (packet M13/Z4, Z6): what a timed-out attempt is judged by - where the `object`
+/// body went against the region the scene geoms of the `target` stem cover
+/// ([`crate::model::outcome`]). `object_name` and `target_name` are i18n keys: the two things in
+/// the words a failure cause names them by.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeSpec {
+    pub object: String,
+    pub target: String,
+    /// The height gain, in metres, that counts as lifted.
+    pub lift_m: f64,
+    pub object_name: String,
+    pub target_name: String,
+}
+
 /// One `templates/<id>.toml`. `name`, `summary` and `notice` (what the card warns about, such
 /// as an experimental route) are i18n keys; every path is relative to the repository root.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -60,6 +75,8 @@ pub struct Template {
     pub demonstrations: u32,
     pub bundle: BundleDocs,
     pub lengths: Lengths,
+    /// Absent: failures keep the causes the evaluation recorded.
+    pub outcome: Option<OutcomeSpec>,
 }
 
 const KIND: &str = "template";
@@ -204,6 +221,23 @@ mod tests {
                 );
             }
             assert!(cube.marks(Length::Short).last() < cube.marks(Length::Long).last());
+            // Packet M13/Z6: the cube, the bin, two centimetres, named in both languages.
+            let o = cube.outcome.as_ref().expect("[outcome]");
+            assert_eq!(
+                (o.object.as_str(), o.target.as_str(), o.lift_m),
+                ("cube", "bin", 0.02),
+                "{id}"
+            );
+            assert_eq!(
+                (o.object_name.as_str(), o.target_name.as_str()),
+                ("outcome.cube", "outcome.bin"),
+                "{id}"
+            );
+            for lang in Lang::ALL {
+                for key in [&o.object_name, &o.target_name] {
+                    assert_ne!(Strings::get(lang).t(key), key, "{id}: {key}");
+                }
+            }
         }
     }
 
