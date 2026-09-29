@@ -1070,7 +1070,9 @@ impl EditorApp {
                 ] {
                     ui.label(i18n::t(lang, key));
                     match plot {
-                        Some(plot) => paint_curve(ui, &plot, colour, 90.0),
+                        Some(plot) => {
+                            paint_curve(ui, &plot, colour, 90.0);
+                        }
                         None => {
                             ui.label(i18n::t(lang, "results.no_events"));
                         }
@@ -1277,7 +1279,8 @@ pub(crate) fn paint_timeline(lang: Lang, ui: &mut egui::Ui, buckets: &[Bucket]) 
 /// rectangle, joins them, and draws a vertical line where a checkpoint was packed. The two
 /// numbers beside it are the range the model normalised against, in the series' own units.
 /// `height` in points: a strip in the Live pane, the whole centre while ③ trains (M12/Y12).
-pub(crate) fn paint_curve(ui: &mut egui::Ui, plot: &Plot, colour: Color32, height: f32) {
+/// Returns the rectangle the unit square was mapped onto, for ③'s preview marks (M13/Z5a).
+pub(crate) fn paint_curve(ui: &mut egui::Ui, plot: &Plot, colour: Color32, height: f32) -> Rect {
     let (response, painter) =
         ui.allocate_painter(Vec2::new(ui.available_width(), height), Sense::hover());
     let rect = response.rect.shrink(4.0);
@@ -1309,6 +1312,7 @@ pub(crate) fn paint_curve(ui: &mut egui::Ui, plot: &Plot, colour: Color32, heigh
     };
     text(rect.left_top(), Align2::LEFT_TOP, plot.max);
     text(rect.left_bottom(), Align2::LEFT_BOTTOM, plot.min);
+    rect
 }
 
 // --- the Replay panel --------------------------------------------------------------------------

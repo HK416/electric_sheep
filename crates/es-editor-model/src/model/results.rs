@@ -595,6 +595,20 @@ pub fn start_settings(cycle: &Cycle, template: &Template) -> Option<StartSetting
     })
 }
 
+/// What the outside camera re-poses a run's motion on: the recipe's scene, else the
+/// template's, under the repository root. ⑤'s player and ③'s preview player both use it.
+pub fn scene(
+    cycle: Option<&Cycle>,
+    template: Option<&Template>,
+    repo_root: Option<&Path>,
+) -> Option<PathBuf> {
+    cycle
+        .map(|c| &c.scene)
+        .or(template.map(|t| &t.scene))
+        .zip(repo_root)
+        .map(|(scene, root)| root.join(scene))
+}
+
 /// One run, read for ⑤: its `eval/` folder, `episodes.json` when it has one, and what its
 /// `cycle.toml` names.
 #[derive(Debug)]
@@ -649,12 +663,7 @@ impl RunResults {
             let text = std::fs::read_to_string(root.join(&c.eval.config)).ok()?;
             evaluation_from_toml(&text).ok()
         });
-        let scene = cycle
-            .as_ref()
-            .map(|c| &c.scene)
-            .or(template.as_ref().map(|t| &t.scene))
-            .zip(repo_root)
-            .map(|(scene, root)| root.join(scene));
+        let scene = scene(cycle.as_ref(), template.as_ref(), repo_root);
         let previous = finished_runs(project)
             .into_iter()
             .rfind(|r| r.number < run.number)

@@ -3,13 +3,16 @@
 //!
 //! Drawing and wiring only. Which run, each step's state, the light, the stage cards, which
 //! buttons are offered and what they write to disk are [`crate::model::watch`]'s, under test;
-//! this turns a [`View`] into widgets and a click into one call on the watch.
+//! this turns a [`View`] into widgets and a click into one call on the watch. Which checkpoint
+//! check ③ shows, its words and which mark a click picks are [`crate::model::preview`]'s
+//! (packet M13/Z5a).
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use eframe::egui;
-use egui::{Color32, RichText};
-use es_eval::run_dir::Rgb8Image;
+use egui::{Color32, Pos2, Rect, RichText, Sense, Stroke};
+use es_eval::run_dir::{Rgb8Image, RunDir};
 use es_ir::evaluation::MetricSpec;
 
 use crate::app::EditorApp;
@@ -17,14 +20,34 @@ use crate::model::health::Light;
 use crate::model::i18n::{self, Lang};
 use crate::model::labels;
 use crate::model::layout::{self, Pane};
+use crate::model::preview::{self, Preview};
 use crate::model::project::StartSettings;
 use crate::model::telemetry_view::{replay, TelemetryModel};
-use crate::model::train_view::Series;
+use crate::model::train_view::{Plot, Series};
 use crate::model::watch::{self, CardState, Centre, View, DEMONSTRATIONS, LENGTHS};
 use crate::model::workflow::Phase;
 use crate::ui::advanced::{paint_curve, rgb_texture};
+use crate::ui::player::{play, Player};
 
 const LOSS: Color32 = Color32::from_rgb(120, 200, 255);
+/// A check whose test could not run to the end, on the curve.
+const FAILED: Color32 = Color32::from_rgb(230, 120, 110);
+
+/// ③'s checks along the way between frames (packet M13/Z5a): which one was picked and the one
+/// playing. It belongs to one run; another run, or another project, starts afresh.
+#[derive(Default)]
+pub(crate) struct Previews {
+    run: Option<PathBuf>,
+    /// What the player re-poses a motion on, asked once per run.
+    scene: Option<PathBuf>,
+    /// The step picked from the chips or on the curve; `None` follows [`preview::shown`].
+    chosen: Option<u32>,
+    /// The check playing, by its step and the attempt it opened on.
+    playing: Option<((u32, String), Playing)>,
+}
+
+/// A check's test folder and its player, or why that folder could not be read.
+type Playing = Result<(RunDir, Player), String>;
 
 /// Once a frame, after the child and the telemetry were polled and before anything is drawn:
 /// the watch's tick, and what it asks of the window.
@@ -250,9 +273,15 @@ fn centre(app: &mut EditorApp, ui: &mut egui::Ui, view: &View) {
     }
     let live = &app.telemetry.live;
     let picture = (live.images(), live.image().cloned());
+    // ③'s checks along the way take the live picture's place once the run has any (packet
+    // M13/Z5a); without them ③ is what it was. The demonstrations keep theirs.
+    let checks = !view.previews.is_empty();
     match view.centre {
         Centre::Idle => {
             ui.weak(i18n::t(lang, "watch.idle"));
+            if checks {
+                previews(app, ui, &view.previews);
+            }
         }
         Centre::Demonstrations {
             made,
@@ -272,21 +301,133 @@ fn centre(app: &mut EditorApp, ui: &mut egui::Ui, view: &View) {
             ui.label(i18n::t(lang, "live.loss"));
             match plot {
                 Some(plot) => {
-                    let height = (ui.available_height() * 0.5).max(120.0);
-                    paint_curve(ui, &plot, LOSS, height);
+                    let share = if checks { 0.25 } else { 0.5 };
+                    let height = (ui.available_height() * share).max(120.0);
+                    let rect = paint_curve(ui, &plot, LOSS, height);
+                    if checks {
+                        marks(app, ui, &plot, rect, &view.previews);
+                    }
                 }
                 None => {
                     ui.weak(i18n::t(lang, "live.training.empty"));
                 }
             }
-            ui.label(i18n::t(lang, "live.sample"))
-                .on_hover_text(i18n::t(lang, "live.sample.hint"));
-            image(app, ui, "watch-sample", sample);
+            if checks {
+                previews(app, ui, &view.previews);
+            } else {
+                ui.label(i18n::t(lang, "live.sample"))
+                    .on_hover_text(i18n::t(lang, "live.sample.hint"));
+                image(app, ui, "watch-sample", sample);
+            }
         }
+        Centre::Picture if checks => previews(app, ui, &view.previews),
         Centre::Picture => {
             ui.label(i18n::t(lang, "watch.picture"));
             image(app, ui, "watch-picture", picture);
         }
+    }
+}
+
+/// Each check's mark on the loss curve: a dot at the top of the curve over its step, the one
+/// shown ringed - apart from the checkpoints' lines, which fall on the same steps. A click near
+/// a dot shows that check.
+fn marks(app: &mut EditorApp, ui: &mut egui::Ui, plot: &Plot, rect: Rect, previews: &[Preview]) {
+    let lang = app.settings.lang;
+    let marks: Vec<(u32, f32)> = previews.iter().map(|p| (p.step, plot.x(p.step))).collect();
+    let near = |pos: Option<Pos2>| {
+        let pos = pos?;
+        preview::picked(&marks, (pos.x - rect.left()) / rect.width(), rect.width())
+    };
+    let response = ui
+        .interact(rect, ui.id().with("watch-checks"), Sense::click())
+        .on_hover_text(i18n::t(lang, "watch.previews.curve.hint"));
+    if near(response.hover_pos()).is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if response.clicked() {
+        if let Some(step) = near(response.interact_pointer_pos()) {
+            app.previews.chosen = Some(step);
+            ui.ctx().request_repaint();
+        }
+    }
+    let shown = preview::shown(previews, app.previews.chosen).map(|p| p.step);
+    let painter = ui.painter_at(rect);
+    for (p, (_, x)) in previews.iter().zip(&marks) {
+        let at = Pos2::new(rect.left() + x * rect.width(), rect.top() + 8.0);
+        let colour = match p.code {
+            None => ui.visuals().weak_text_color(),
+            Some(0) => ui.visuals().strong_text_color(),
+            Some(_) => FAILED,
+        };
+        painter.circle_filled(at, 4.0, colour);
+        if Some(p.step) == shown {
+            painter.circle_stroke(at, 7.0, Stroke::new(1.5_f32, colour));
+        }
+    }
+}
+
+/// ③'s checks along the way: a chip per check, ascending as they fall along the curve, the
+/// shown one's headline, and its first attempt to play in ⑤'s player.
+fn previews(app: &mut EditorApp, ui: &mut egui::Ui, previews: &[Preview]) {
+    let lang = app.settings.lang;
+    let dt = f64::from(ui.input(|i| i.stable_dt));
+    let Some(open) = app.project.as_ref() else {
+        return;
+    };
+    let Some(run) = &open.watch.run else {
+        return;
+    };
+    let s = &mut app.previews;
+    if s.run.as_ref() != Some(&run.path) {
+        *s = Previews {
+            run: Some(run.path.clone()),
+            scene: open.watch.scene(),
+            ..Previews::default()
+        };
+    }
+    let Some(shown) = preview::shown(previews, s.chosen) else {
+        return;
+    };
+    ui.separator();
+    ui.horizontal_wrapped(|ui| {
+        ui.label(i18n::t(lang, "watch.previews"))
+            .on_hover_text(i18n::t(lang, "watch.previews.hint"));
+        for p in previews.iter().rev() {
+            if ui
+                .selectable_label(p.step == shown.step, p.step.to_string())
+                .on_hover_text(preview::headline(lang, p))
+                .clicked()
+            {
+                s.chosen = Some(p.step);
+                ui.ctx().request_repaint();
+            }
+        }
+    });
+    ui.heading(preview::headline(lang, shown));
+    let key = shown.first.clone().map(|cell| (shown.step, cell));
+    if s.playing.as_ref().map(|(k, _)| k) != key.as_ref() {
+        s.playing = key.map(|(step, cell)| {
+            let opened = RunDir::open(&run.path.join(&shown.dir))
+                .map(|dir| {
+                    let player = Player::open(&dir, s.scene.as_deref(), cell.clone());
+                    (dir, player)
+                })
+                .map_err(|e| e.to_string());
+            ((step, cell), opened)
+        });
+    }
+    let mut pick = None;
+    match &mut s.playing {
+        Some((_, Ok((dir, player)))) => {
+            play(lang, ui, dt, dir, player, &mut pick);
+            if let Some(cell) = pick {
+                *player = Player::open(dir, s.scene.as_deref(), cell);
+            }
+        }
+        Some((_, Err(e))) => {
+            ui.weak(e.as_str());
+        }
+        None => {}
     }
 }
 

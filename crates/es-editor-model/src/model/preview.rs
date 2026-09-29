@@ -15,6 +15,7 @@ use std::str::FromStr;
 use es_eval::episodes::read_episodes;
 use serde::Deserialize;
 
+use crate::model::i18n::{fill, Lang};
 use crate::model::results::first_to_play;
 use crate::model::telemetry_view::Event;
 
@@ -111,6 +112,45 @@ pub fn previews(run: &Path, heard: &[Preview]) -> Vec<Preview> {
             p
         })
         .collect()
+}
+
+/// The preview ③ shows (packet M13/Z5a): the one picked while it is there, else the newest
+/// that finished, else the newest still running - its headline alone. `previews` is newest
+/// first, as [`previews`] hands them back.
+pub fn shown(previews: &[Preview], chosen: Option<u32>) -> Option<&Preview> {
+    (previews.iter().find(|p| Some(p.step) == chosen))
+        .or_else(|| previews.iter().find(|p| p.code.is_some()))
+        .or(previews.first())
+}
+
+/// A preview's one line: still running, run to the end (how many attempts succeeded), or its
+/// child failed - said so, with no numbers, since a half-run test counted nothing.
+pub fn headline(lang: Lang, p: &Preview) -> String {
+    let step = p.step.to_string();
+    match p.code {
+        None => fill(lang, "watch.preview.running", &[&step]),
+        Some(0) => fill(
+            lang,
+            "watch.preview.done",
+            &[&p.successes.to_string(), &p.episodes.to_string(), &step],
+        ),
+        Some(_) => fill(lang, "watch.preview.failed", &[&step]),
+    }
+}
+
+/// How far from a preview's mark on the loss curve, in points, a click still picks it.
+pub const REACH: f32 = 8.0;
+
+/// The preview whose mark is nearest a click on the curve, when it is within [`REACH`]:
+/// `marks` are `(step, x)` and `x` the click, both across the curve in `0..=1`, and `width` the
+/// curve's width in points.
+pub fn picked(marks: &[(u32, f32)], x: f32, width: f32) -> Option<u32> {
+    marks
+        .iter()
+        .map(|&(step, at)| (step, (at - x).abs() * width))
+        .filter(|(_, off)| *off <= REACH)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(step, _)| step)
 }
 
 #[cfg(test)]
@@ -276,5 +316,68 @@ pub(crate) mod tests {
         assert_eq!(previews(&run, &[escape]).len(), 2);
         assert!(previews(&run.join("absent"), &[]).is_empty());
         std::fs::remove_dir_all(&run).ok();
+    }
+
+    /// Which preview ③ shows: the chosen step while it is listed; otherwise the newest that
+    /// finished, a failed one included; with none finished, the newest running.
+    #[test]
+    fn the_shown_preview_is_the_chosen_else_the_newest_finished() {
+        let list = [
+            running(20000),
+            done(5000, 1, 0, None),
+            done(1000, 3, 0, None),
+        ];
+        let step = |chosen| shown(&list, chosen).map(|p| p.step);
+        assert_eq!(step(Some(1000)), Some(1000));
+        assert_eq!(step(Some(20000)), Some(20000), "a running one, when picked");
+        assert_eq!(step(None), Some(5000));
+        assert_eq!(step(Some(7)), Some(5000), "a step no longer listed");
+        let failed = [running(20000), done(5000, 0, 1, None)];
+        assert_eq!(shown(&failed, None).map(|p| p.step), Some(5000));
+        let none_finished = [running(20000), running(5000)];
+        assert_eq!(shown(&none_finished, None).map(|p| p.step), Some(20000));
+        assert_eq!(shown(&[], Some(1000)), None);
+    }
+
+    /// The headline names the step every time, and the numbers only of a test that ran to the
+    /// end.
+    #[test]
+    fn a_headline_says_running_done_or_failed() {
+        for lang in Lang::ALL {
+            let finished = headline(lang, &done(1000, 1, 0, None));
+            assert!(
+                finished.contains("1000") && finished.contains('4') && !finished.contains("{}"),
+                "{finished}"
+            );
+            let going = headline(lang, &running(5000));
+            assert!(going.contains("5000") && !going.contains("{}"), "{going}");
+            let failed = headline(lang, &done(5000, 3, 2, None));
+            assert!(
+                failed.contains("5000") && !failed.contains('3') && !failed.contains('4'),
+                "no numbers from a test that did not finish: {failed}"
+            );
+            assert_ne!(going, failed);
+        }
+        assert_eq!(
+            headline(Lang::En, &done(1000, 1, 0, None)),
+            "Check: 1 of 4 succeeded — at step 1000"
+        );
+    }
+
+    /// A click picks the nearest mark within reach, in points: two marks 0.1 apart on a
+    /// 200-point curve are 20 points apart.
+    #[test]
+    fn a_click_picks_the_nearest_mark_within_reach() {
+        let marks = [(1000, 0.2), (5000, 0.3)];
+        assert_eq!(picked(&marks, 0.2, 200.0), Some(1000), "on the mark");
+        assert_eq!(picked(&marks, 0.23, 200.0), Some(1000), "6 points off");
+        assert_eq!(picked(&marks, 0.27, 200.0), Some(5000), "nearer the other");
+        assert_eq!(picked(&marks, 0.25, 200.0), None, "10 points from both");
+        assert_eq!(
+            picked(&marks, 0.24, 100.0),
+            Some(1000),
+            "4 points off on a narrower curve"
+        );
+        assert_eq!(picked(&[], 0.2, 200.0), None);
     }
 }
