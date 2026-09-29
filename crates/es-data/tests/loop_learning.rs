@@ -1053,6 +1053,56 @@ fn an_unreachable_waypoint_fails_the_episode() {
     assert!(ep.len() >= 3 && ep.len() < STEPS as usize, "{}", ep.len());
 }
 
+/// Packet P-M14-R1: an abort fails its own episode and no other. With a declared inference
+/// latency an episode's first `infer` is off frame 0, so an abort flag the previous episode left
+/// set ended every later episode after one frame -- plan Q's first real run wrote one genuine
+/// abort and then 186 one-frame failures.
+#[test]
+fn an_abort_fails_only_its_own_episode() {
+    let root = scratch("loop-abort-once");
+    let mut b = bundle();
+    // One control tick of latency, as the demo's `learning.toml` declares.
+    b.learning.policy.contract.runtime.expected_latency_ms = 1000.0 / CONTROL_HZ as f32;
+    let s = scene();
+    let mut policy = FakePolicy { target: 0.2 };
+    let mut hook = |episode: u32, frame: u32, _: &ModelInfo, _: &[f64]| {
+        if episode == 0 && frame >= 3 {
+            Intervention::Abort
+        } else {
+            Intervention::Action([0.1; NJ])
+        }
+    };
+    let report = Collector::run::<FakeBackend, _, NJ, H>(
+        &CollectSpec {
+            bundle: &b,
+            scene: &s,
+            n_episodes: 3,
+            seed: 7,
+            max_steps: STEPS,
+            out_root: &root,
+            traj_dir: None,
+        },
+        &mut policy,
+        FakeBackend::new,
+        &mut hook,
+        None,
+    )
+    .expect("the fixture collect run succeeds");
+
+    assert_eq!(report.terminations[0], Termination::Failure);
+    assert!(
+        !report.terminations[1..].contains(&Termination::Failure),
+        "the abort leaked into the episodes after it: {:?}",
+        report.terminations
+    );
+    let dataset = LeRobotDataset::open(&root).expect("the collected dataset opens");
+    let lengths: Vec<usize> = (0..3)
+        .map(|e| dataset.read_episode(e).expect("episode reads back").len())
+        .collect();
+    assert!(lengths[0] < STEPS as usize, "{lengths:?}");
+    assert_eq!(lengths[1..], [STEPS as usize; 2], "{lengths:?}");
+}
+
 /// Spec 8.6 / 9.3 and `INV-12`: the demonstration is recorded as the actuator saw it. With an
 /// envelope too tight for the injected action, the recorded `action` is the clamped value and
 /// `action_source` says `Clamped`, not `Human`.
