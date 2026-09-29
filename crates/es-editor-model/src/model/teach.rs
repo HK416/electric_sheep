@@ -613,12 +613,12 @@ pub struct Teach {
     world: Result<World, String>,
     /// The Evaluation IR a try derives its own from, and the scene it runs on.
     trial: Result<(EvaluationIr, PathBuf), String>,
-    pub program: Program,
-    pub selected: Option<usize>,
+    program: Program,
+    selected: Option<usize>,
     dirty: bool,
     check: Check,
     /// The seed the next try runs: the latest try's, else the evaluation's first.
-    pub seed: u64,
+    seed: u64,
 }
 
 impl Teach {
@@ -658,6 +658,19 @@ impl Teach {
         };
         teach.recheck();
         Ok(teach)
+    }
+
+    /// Read-only: every change goes through an edit, which re-checks it.
+    pub fn program(&self) -> &Program {
+        &self.program
+    }
+
+    pub fn selected(&self) -> Option<usize> {
+        self.selected
+    }
+
+    pub fn seed(&self) -> u64 {
+        self.seed
     }
 
     pub fn dirty(&self) -> bool {
@@ -917,28 +930,19 @@ impl Teach {
             .and_then(|()| std::fs::write(&config, text))
             .map_err(|e| TryRefused::Broken(format!("{}: {e}", dir.display())))?;
         let arg = |p: &Path| p.display().to_string();
-        let argv = [
-            "eval".to_owned(),
-            "run".to_owned(),
-            "--config".to_owned(),
-            arg(&config),
-            "--expert".to_owned(),
-            arg(&self.project.teach()),
-            "--policy".to_owned(),
-            arg(&self.project.bundle()),
-            "--scene".to_owned(),
-            arg(&scene),
-            "--out".to_owned(),
-            arg(&dir),
-            "--jobs".to_owned(),
-            "1".to_owned(),
-            "--frames".to_owned(),
-            arg(&dir.join("frames")),
-        ];
-        Ok(TryStart {
-            dir,
-            argv: argv.to_vec(),
-        })
+        let mut argv = vec!["eval".to_owned(), "run".to_owned()];
+        for (flag, value) in [
+            ("--config", arg(&config)),
+            ("--expert", arg(&self.project.teach())),
+            ("--policy", arg(&self.project.bundle())),
+            ("--scene", arg(&scene)),
+            ("--out", arg(&dir)),
+            ("--jobs", "1".to_owned()),
+            ("--frames", arg(&dir.join("frames"))),
+        ] {
+            argv.extend([flag.to_owned(), value]);
+        }
+        Ok(TryStart { dir, argv })
     }
 
     /// A try's one attempt, once `es eval run` has written it: whether it succeeded, the cell
@@ -1013,7 +1017,7 @@ mod tests {
     use es_eval::episodes::{write_episodes, EpisodeRow};
 
     use crate::model::outcome::Outcome;
-    use crate::model::project::tests::{cube, repo, scratch_project};
+    use crate::model::project::tests::{cube, hint, repo, scratch_project};
     use crate::model::results::Cause;
     use PhaseState::{Done, Locked, NotStarted, Running};
 
@@ -1059,6 +1063,25 @@ mod tests {
         assert_eq!(teach.places(), ["bin"]);
         assert_eq!(teach.wait_step(), Some(0.2));
         std::fs::remove_dir_all(&project.root).ok();
+    }
+
+    /// The cube-pose card teaches with the same program, and its try derives from its own
+    /// Evaluation IR (`evaluation-augmented.toml`).
+    #[test]
+    fn the_hint_card_teaches_the_same_program() {
+        let root = std::env::temp_dir().join(format!("es-q3-hint-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let project = Project::create(&root, "hint", &hint(), &repo()).expect("a project");
+        let mut teach = Teach::open(&project, &hint(), &repo()).expect("its program");
+        assert_eq!(teach.check(), &Check::default());
+        let start = teach.start_try(None, false, &fresh()).expect("a try");
+        let ir = evaluation_from_toml(&read(&start.dir.join("evaluation.toml")).unwrap());
+        let ir = ir.expect("parses");
+        let own = repo().join("tests/fixtures/visible-learning/evaluation-augmented.toml");
+        let own = evaluation_from_toml(&read(&own).unwrap()).unwrap();
+        assert_eq!((&ir.task, &ir.observation), (&own.task, &own.observation));
+        assert!(ir.validate().is_empty(), "{:?}", ir.validate());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// The object is drawn from the Task IR's box: `qpos[6]` (x) and `qpos[7]` (y) of the
