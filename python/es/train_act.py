@@ -19,7 +19,7 @@ Usage:
                  [--init-weights init.safetensors]
                  [--checkpoint-at 0 | 1000,5000,20000] [--loss-curve curve.json]
                  [--resident-gpu] [--amp bf16] [--compile]
-                 [--progress-every N] [--sample-every N]
+                 [--progress-every N] [--sample-every N] [--single-view ALPHA]
 
 Prints one JSON line on stdout and nothing else:
 
@@ -119,7 +119,30 @@ key that is unknown or the wrong shape stops the run. It is a *checkpoint like a
 this script still reads and writes nothing that can execute code on load (INV-16), and still
 never touches the network. The file is `es train`'s `[policy] base_model`, whose blake3 was
 checked against its lock file and against the repository's pin before this script saw it; its
-provenance is spec 19.3's `training/base_model.lock`, not anything here.
+provenance is spec 19.3's `training/base_model.lock`, not anything here. Encoders that `share`
+one weight group are one lowered member, the owner's (packet M15/N6), so the owner is the
+backbone initialised and every view it serves starts from the same tensors.
+
+**Single-view training** (packet M15/N7, `docs/design/multi-camera.md` section 3.3).
+`--single-view ALPHA` is MAD's "disentangle" -- Almuzairee, Patil, Bhatt, Christensen, *Merging
+and Disentangling Views in Visual Reinforcement Learning for Robotic Manipulation*, CoRL 2025,
+arXiv 2505.04619. There the single-view features are fed, weighted by `alpha`, to both the actor
+and the critic of an RL agent; here there is no critic, and the weighting is on this script's
+imitation loss:
+
+    loss = L(all views) + ALPHA * mean over views v of L(view v alone)
+
+where `L` is the L1 below and "view v alone" is the lowered module's `Sum` taking **only** v's
+term: `forward(keep_views=(v,), **inputs)` leaves the other cameras' terms out of the sum, which
+is what a bundle deployed without them computes (design note section 3.4) -- not a zeroed image,
+which a backbone does not map to a zero feature. `keep_views` is the lowering's (`_sum` in
+`crates/es-policy/src/lower/torch.rs`) and this is its only caller; inference never passes it.
+The views are `contract.json`'s `sum_views`, the cameras whose encoders meet in a `Sum`, and a
+module without any is refused here as `es train` refuses the recipe. Each view's pass runs the
+whole module again (every encoder, the dropped ones' outputs discarded), so a step costs
+`1 + len(views)` forwards. Both terms are logged -- `loss_all` and `loss_single` on each
+progress line, and a `single_view` block in the summary -- and `loss` stays the sum that was
+optimized. Without the flag nothing here runs and the loop is the loop of before, bit for bit.
 
 **The augmentation** (packet M7/T6). `--augmentation <training/augmentation.json>` names the
 Observation IR's `training_only` chain per port and the seed to key it with; `python/es/
@@ -599,6 +622,14 @@ def main(argv: list) -> int:
         "for a bundle whose document declares one, and `es dataset bake --for-training` is "
         "what wrote the tensors it expects",
     )
+    p.add_argument(
+        "--single-view",
+        type=float,
+        metavar="ALPHA",
+        help="also train each camera of the module's Sum fusion alone, its loss weighted by "
+        "ALPHA > 0 (MAD, arXiv 2505.04619; see the header). `es train` passes `[run] "
+        "single_view.weight`; absent is the run of before",
+    )
     a = p.parse_args(argv)
 
     torch.manual_seed(a.seed)
@@ -611,6 +642,19 @@ def main(argv: list) -> int:
             "emits a single-sample module (before packet M7/T3). Re-run `es policy lower`."
             % a.module
         )
+    # The cameras `--single-view` drops one at a time (packet M15/N7). Refused rather than
+    # ignored: a run that claims a single-view loss and optimized none would be a recipe
+    # describing a different run.
+    views = contract.get("sum_views", [])
+    if a.single_view is not None:
+        if not math.isfinite(a.single_view) or a.single_view <= 0:
+            raise SystemExit("--single-view is %r; it is a weight above 0" % a.single_view)
+        if not views:
+            raise SystemExit(
+                "--single-view: %s/contract.json lists no `sum_views` -- the module has no "
+                "`Sum` fusion over VisionEncoder features, so no camera's term can be dropped "
+                "from it. The Learning IR needs its views to meet in a `Sum`." % a.module
+            )
     model = build_policy(a.module).to(device)
     # Before the probe and before the optimizer: the ImageNet tensors are the module's
     # initial state, exactly as a resumed checkpoint's would be (packet M7/T5).
@@ -699,6 +743,8 @@ def main(argv: list) -> int:
     )
     model.train()
     losses, applied_lr = [], []
+    # `loss_all` and `loss_single` per step, filled only under `--single-view` (packet M15/N7).
+    losses_all, losses_single = [], []
     order, cursor = [], 0
     # What a watcher is shown (packet M7/E7), decided once: the port, the directory and the
     # two periods. All four are inert when neither flag was passed, so the loop below is the
@@ -756,11 +802,25 @@ def main(argv: list) -> int:
             # exactly `l1_loss`, and the batch mean is the average of the per-sample means the
             # accumulation loop summed -- the same gradient, one sum order later.
             loss = ((predicted - target).abs() * weights).mean()
+            if a.single_view is not None:
+                # Each camera alone: its term is the only one the `Sum` keeps (the header).
+                alone = [
+                    (
+                        (next(iter(forward(keep_views=(view,), **inputs).values())) - target).abs()
+                        * weights
+                    ).mean()
+                    for view in views
+                ]
+                loss_all, loss_single = loss, torch.stack(alone).mean()
+                loss = loss_all + a.single_view * loss_single
         loss.backward()
         if a.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(trainable, a.grad_clip)
         optimizer.step()
         losses.append(float(loss.detach()))
+        if a.single_view is not None:
+            losses_all.append(float(loss_all.detach()))
+            losses_single.append(float(loss_single.detach()))
         # The first non-finite loss ends the run (packet P-M14-R1): every step after it is NaN,
         # and so is every checkpoint and every evaluation of one. A watcher is told on this step
         # whatever the period, so the curve it draws ends where the run did.
@@ -770,20 +830,16 @@ def main(argv: list) -> int:
         # that happened. Flushed, because the reader is a pipe (packet M7/E7).
         if a.progress_every > 0 and ((step + 1) % a.progress_every == 0 or diverged):
             elapsed = time.perf_counter() - started
-            sys.stdout.write(
-                json_text(
-                    {
-                        "progress": {
-                            "step": step + 1,
-                            "loss": losses[-1],
-                            "lr": lr_now,
-                            "samples_per_s": (step + 1) * a.batch / elapsed if elapsed > 0 else 0.0,
-                            "elapsed_s": elapsed,
-                        }
-                    }
-                )
-                + "\n"
-            )
+            progress = {
+                "step": step + 1,
+                "loss": losses[-1],
+                "lr": lr_now,
+                "samples_per_s": (step + 1) * a.batch / elapsed if elapsed > 0 else 0.0,
+                "elapsed_s": elapsed,
+            }
+            if a.single_view is not None:
+                progress["loss_all"], progress["loss_single"] = losses_all[-1], losses_single[-1]
+            sys.stdout.write(json_text({"progress": progress}) + "\n")
             sys.stdout.flush()
         if diverged:
             break
@@ -874,6 +930,18 @@ def main(argv: list) -> int:
             "weight_decay": group["weight_decay"],
         },
     }
+    if a.single_view is not None:
+        # Both terms of the objective, windowed like `initial_loss`/`final_loss`, which stay
+        # the sum that was optimized (packet M15/N7). Only under the flag, so a summary
+        # without it is the line of before.
+        report["single_view"] = {
+            "weight": a.single_view,
+            "views": views,
+            "initial_loss_all": sum(losses_all[:window]) / window,
+            "final_loss_all": sum(losses_all[-window:]) / window,
+            "initial_loss_single": sum(losses_single[:window]) / window,
+            "final_loss_single": sum(losses_single[-window:]) / window,
+        }
     sys.stdout.write(json_text(report) + "\n")
     if first_nonfinite is not None:
         sys.stdout.flush()

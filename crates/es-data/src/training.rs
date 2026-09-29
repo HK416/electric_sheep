@@ -346,6 +346,12 @@ pub struct Run {
     /// Gradient-norm clip. Absent is off, and `optimizer.json` then names no clip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grad_clip: Option<f64>,
+    /// `single_view = { weight = alpha }` — MAD's single-view loss (packet M15/N7, design note
+    /// `multi-camera.md` section 3.3): `train_act.py --single-view alpha`. The IR route's only,
+    /// and only for a graph whose cameras meet in a `Sum` ([`Recipe::check_single_view`]).
+    /// Absent is absent: no flag, and the plan and `identity_hash` of before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub single_view: Option<SingleView>,
     /// Passed to whichever trainer the route runs, verbatim, after everything this module
     /// derives (and after `[policy.lerobot] extra` on the external route). `--resident-gpu`
     /// is the one packet M7/T3 measured; a flag that changes the bits is a deliberate,
@@ -372,6 +378,15 @@ pub struct Schedule {
     /// The floor the cosine decays to.
     #[serde(default)]
     pub lr_min: f64,
+}
+
+/// `[run] single_view` (packet M15/N7). A table, not a bare number, so what is weighted is
+/// named where it is written.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SingleView {
+    /// `alpha`: the weight of the mean single-view loss beside the all-views loss. Above 0.
+    pub weight: f64,
 }
 
 fn default_interpreter() -> String {
@@ -421,6 +436,7 @@ impl Recipe {
         let schedule_args = recipe.schedule_args()?;
         recipe.rl_args()?;
         recipe.fetch_args()?;
+        recipe.single_view_args()?;
         match (route, recipe.run.batch) {
             // Refused **by name**, not silently ignored: PPO's batch is `envs * horizon` and
             // is therefore derived. A recipe that declared one would put a number into
@@ -559,6 +575,62 @@ impl Recipe {
             args.push(value.to_string());
         }
         Ok(args)
+    }
+
+    /// `[run] single_view` validated, as `train_act.py`'s `--single-view <alpha>` (packet
+    /// M15/N7). Empty when it is absent, which keeps every plan and its golden byte-identical.
+    ///
+    /// Refused by name off the IR route: MAD (arXiv 2505.04619) weights the single-view
+    /// features into both the actor and the critic of an RL agent, and `train_ppo.py`
+    /// implements neither; `lerobot-train` has no such loss at all. The graph half of the
+    /// check needs the bundle and is [`Recipe::check_single_view`].
+    pub fn single_view_args(&self) -> Result<Vec<String>, DataError> {
+        let Some(single) = &self.run.single_view else {
+            return Ok(Vec::new());
+        };
+        if !single.weight.is_finite() || single.weight <= 0.0 {
+            return Err(refuse(format!(
+                "[run] `single_view.weight` is {}; it weights the single-view loss beside the \
+                 all-views one and must be above 0. Delete `single_view` to train on all views \
+                 together only",
+                single.weight
+            )));
+        }
+        match self.route()? {
+            Route::Ir => Ok(vec![s("--single-view"), single.weight.to_string()]),
+            Route::Rl => Err(refuse(
+                "[run] `single_view` is the imitation trainer's (`train_act.py`): MAD's RL form \
+                 weights the single-view features into both the actor and the critic, and \
+                 `train_ppo.py` implements neither. Delete it beside `[rl]`",
+            )),
+            Route::External => Err(refuse(
+                "[run] `single_view` is the IR route's: it drops a camera's term from the \
+                 Learning IR's `Sum` fusion, and `lerobot-train` trains lerobot's own \
+                 architecture, which has none",
+            )),
+        }
+    }
+
+    /// `[run] single_view` against the graph it would train (packet M15/N7): the bundle `[policy]
+    /// bundle` names must have cameras that meet in a `Sum` fusion
+    /// ([`es_policy::lower::sum_views`]), or there is no camera's term to drop and the recipe
+    /// is refused by name. Reads the bundle only when the field is set, so every other recipe
+    /// is still judged, `--dry-run` included, without one on disk. `es train` calls this before
+    /// its plan, and [`Cycle::training`] before a cycle's.
+    pub fn check_single_view(&self) -> Result<(), DataError> {
+        if self.run.single_view.is_none() {
+            return Ok(());
+        }
+        let path = self.policy.bundle.as_deref().unwrap_or_default();
+        let bytes = std::fs::read(path).map_err(|e| {
+            refuse(format!(
+                "[run] `single_view` is checked against the bundle's Learning IR before \
+                 anything runs, and [policy] `bundle` {path:?} cannot be read: {e}"
+            ))
+        })?;
+        let bundle = es_compile::PolicyBundle::open(&bytes)
+            .map_err(|e| refuse(format!("[policy] `bundle` {path}: {e}")))?;
+        check_single_view(&bundle.learning)
     }
 
     /// The `[rl]` table validated, as `train_ppo.py`'s flags (packet M8/S4b).
@@ -898,6 +970,21 @@ pub fn has_pretrained_backbone(learning: &LearningGraph) -> bool {
         .nodes
         .values()
         .any(|n| matches!(n, LearningNode::VisionEncoder { pretrained, .. } if *pretrained))
+}
+
+/// The graph half of [`Recipe::check_single_view`] (packet M15/N7): single-view training
+/// drops a camera's term from a `Sum` fusion, so a Learning IR with no `Sum` fed by a
+/// `VisionEncoder` has nothing to drop and is refused by name.
+pub fn check_single_view(learning: &LearningGraph) -> Result<(), DataError> {
+    if es_policy::lower::sum_views(learning).is_empty() {
+        return Err(refuse(
+            "[run] `single_view` trains each camera alone by leaving the others' terms out of \
+             a `Sum` fusion, and this bundle's Learning IR has no `Sum` whose inputs come from \
+             `VisionEncoder`s (a `Concat` of views cannot lose one without retraining). Give \
+             the views a `Sum` fusion, or delete `single_view`",
+        ));
+    }
+    Ok(())
 }
 
 /// `<weights>.lock.json` as `python/es/fetch_backbone.py` writes it, reduced to the fields
@@ -1481,6 +1568,8 @@ impl Plan {
                     // Appended, and only when the recipe asks for them (packet M7/T4): a
                     // recipe that names no schedule renders the plan it always did.
                     .chain(recipe.schedule_args()?)
+                    // `[run] single_view` (packet M15/N7): absent, nothing.
+                    .chain(recipe.single_view_args()?)
                     // Likewise for the pretrained backbone (packet M7/T5). `frozen` is *not*
                     // here: it is a field of the IR, so the lowered module carries it and the
                     // trainer reads it off `requires_grad` -- a copy of it on this line would
@@ -2158,7 +2247,8 @@ impl Cycle {
     }
 
     /// T1's recipe for this cycle: the document `[train] recipe` names (read by the caller —
-    /// this module opens no path it was not handed) or the inline tables, with the dataset
+    /// this module opens no path it was not handed, except the `[policy] bundle` a
+    /// `[run] single_view` is checked against) or the inline tables, with the dataset
     /// slot **overridden by the cycle's own collect output**. A cycle that trained on another
     /// directory's data would chain nothing (spec 13.3).
     pub fn training(&self, recipe_text: Option<&str>, out: &Path) -> Result<Recipe, DataError> {
@@ -2220,6 +2310,11 @@ impl Cycle {
         }
         recipe.marks()?;
         recipe.fetch_args()?;
+        // An inline `[train] run` never went through `Recipe::parse`, so both halves of
+        // `single_view`'s check run here (packet M15/N7); the second reads the bundle only
+        // when the field is set.
+        recipe.single_view_args()?;
+        recipe.check_single_view()?;
         Ok(recipe)
     }
 

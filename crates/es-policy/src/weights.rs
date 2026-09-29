@@ -128,7 +128,10 @@ pub fn write_safetensors(tensors: &Checkpoint) -> Vec<u8> {
 /// - an exact key must be present with the declared shape;
 /// - a file key under a `prefix.*` claim is accepted — those names belong to torchvision or
 ///   `torch.nn`, not to us;
-/// - a file key matching neither is `unexpected`.
+/// - tensors under an encoder that `share`s another's weights (spec 8.3, packet M15/N6) are
+///   one `unexpected` entry naming that encoder and its owner: the group's tensors are stored
+///   once, under the owner, and a file with a second copy was written against another graph;
+/// - any other file key matching neither is `unexpected`.
 pub fn validate_keys(
     module: &TorchModule,
     file: &BTreeMap<String, SafetensorsEntry>,
@@ -160,13 +163,33 @@ pub fn validate_keys(
         }
     }
 
-    let unexpected: Vec<String> = file
-        .keys()
-        .filter(|k| {
-            !module.weight_shapes.contains_key(*k) && !claims.iter().any(|p| k.starts_with(p))
+    let shared: Vec<(String, String)> = module
+        .sharers
+        .iter()
+        .map(|(sharer, owner)| {
+            (
+                format!("{WEIGHT_PREFIX}{sharer}."),
+                format!(
+                    "{WEIGHT_PREFIX}{sharer}.* (node {sharer} shares node {owner}'s weights; \
+                     they are stored once, under {WEIGHT_PREFIX}{owner}.*)"
+                ),
+            )
         })
-        .cloned()
         .collect();
+    let mut unexpected: Vec<String> = shared
+        .iter()
+        .filter(|(prefix, _)| file.keys().any(|k| k.starts_with(prefix)))
+        .map(|(_, named)| named.clone())
+        .collect();
+    unexpected.extend(
+        file.keys()
+            .filter(|k| {
+                !module.weight_shapes.contains_key(*k)
+                    && !claims.iter().any(|p| k.starts_with(p))
+                    && !shared.iter().any(|(p, _)| k.starts_with(p))
+            })
+            .cloned(),
+    );
 
     if missing.is_empty() && unexpected.is_empty() && shape.is_empty() {
         Ok(())

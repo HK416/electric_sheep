@@ -179,6 +179,9 @@ pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
             es_data::training::KIND
         )));
     }
+    // Before the plan, `--dry-run` included (packet M15/N7): a `single_view` over a graph with
+    // no camera `Sum` is refused by name here, as `Cycle::training` refuses it for a cycle.
+    recipe.check_single_view().map_err(|e| bad(e.to_string()))?;
     // Bound before the bundle, the dataset or Python is opened, so a viewer that attaches on
     // the printed address is subscribed before the first optimizer step (packet M7/E7).
     let telemetry = TelemetryArgs {

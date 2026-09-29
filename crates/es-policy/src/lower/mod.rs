@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use es_ir::learning::LearningGraph;
 use serde::{Deserialize, Serialize};
 
-pub use torch::{lower_to_torch, LowerError, TorchModule};
+pub use torch::{lower_to_torch, sum_views, LowerError, TorchModule};
 
 /// Everything a training run outside the Rust core needs to know about a lowered module, and
 /// everything `es policy pack` checks the resulting checkpoint against (spec 25.1: weights
@@ -41,6 +41,12 @@ pub struct Contract {
     /// and then fails on a shape, which is the failure one wants: silently feeding `[C, H, W]`
     /// to a module expecting `[N, C, H, W]` is how a trainer optimizes the wrong function.
     pub batch_axis: bool,
+    /// The cameras whose encoders meet in a `Sum` fusion ([`sum_views`], packet M15/N7): the
+    /// names the module's `keep_views` understands, which `train_act.py --single-view` drops
+    /// one at a time. Absent when empty, so every contract written before the packet is
+    /// byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sum_views: Vec<String>,
 }
 
 impl Contract {
@@ -57,6 +63,7 @@ impl Contract {
                 .map(|p| (p.name.clone(), p.ty.shape.dims().to_vec()))
                 .collect(),
             batch_axis: true,
+            sum_views: sum_views(graph),
         }
     }
 }
