@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use es_compile::plan::{augmentation_chains, AugmentStep};
+use es_ir::evaluation::{EpisodeBatch, EvaluationIr, SeedPlan};
 use es_ir::learning::{LearningGraph, LearningNode, WeightsRef};
 use es_ir::observation::{AugmentKind, ObservationIr, ObservationNode};
 use es_ir::DatasetHash;
@@ -1727,6 +1728,9 @@ pub struct EvalRef {
     /// refused without them, and the expert gate reads its own state through the same source.
     #[serde(default)]
     pub frames: bool,
+    /// A short test of every checkpoint while the run trains; absent, none (packet M13/Z1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preview: Option<PreviewRef>,
 }
 
 fn default_checkpoint() -> String {
@@ -1735,6 +1739,86 @@ fn default_checkpoint() -> String {
 
 fn one_job() -> u32 {
     1
+}
+
+/// `[eval.preview]` — after each checkpoint bundle is written, `es loop cycle` runs a child
+/// `es eval run` on it, so a person sees the policy get better while it trains (packet M13/Z1).
+///
+/// Never the evaluation the run is judged by (spec 13.3): [`preview_evaluation`] derives its
+/// own document from `[eval] config` -- one suite, a few of its seeds, **no acceptance** -- and
+/// the preview's results stay under `<out>/preview/<mark>/`, out of the ledger.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreviewRef {
+    /// The suite's first `episodes` seeds.
+    #[serde(default = "four_episodes")]
+    pub episodes: u32,
+    /// A suite of `[eval] config`; absent, its first -- the nominal one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suite: Option<String>,
+    /// Render the frames, which is what makes a preview something to watch.
+    #[serde(default = "rendered")]
+    pub frames: bool,
+}
+
+impl Default for PreviewRef {
+    fn default() -> Self {
+        Self {
+            episodes: four_episodes(),
+            suite: None,
+            frames: rendered(),
+        }
+    }
+}
+
+fn four_episodes() -> u32 {
+    4
+}
+
+fn rendered() -> bool {
+    true
+}
+
+/// The Evaluation IR a preview runs: `[eval] config`'s chosen suite alone, its first
+/// `episodes` seeds (never more than the document has), the same metrics, and no acceptance --
+/// a preview is watched, never judged (spec 13.3).
+///
+/// ponytail: a suite other than the first moves to index 0, which is its `suite_id` in the
+/// perturbation draws (spec 10.4), so its draws are not the full evaluation's for the same
+/// seed; keep the other suites and run one if a preview must equal its rows.
+pub fn preview_evaluation(
+    ir: &EvaluationIr,
+    preview: &PreviewRef,
+) -> Result<EvaluationIr, DataError> {
+    let suite = match &preview.suite {
+        Some(name) => ir.suites.iter().find(|s| s.name == *name).ok_or_else(|| {
+            let declared: Vec<&str> = ir.suites.iter().map(|s| s.name.as_str()).collect();
+            refuse(format!(
+                "[eval.preview] `suite` is \"{name}\", which [eval] config does not declare: \
+                 its suites are {declared:?}"
+            ))
+        })?,
+        None => ir
+            .suites
+            .first()
+            .ok_or_else(|| refuse("[eval] config declares no suite to preview"))?,
+    };
+    let n = preview.episodes.min(ir.episodes.n_episodes);
+    let seeds = match &ir.episodes.seeds {
+        SeedPlan::Base(base) => SeedPlan::Base(*base),
+        SeedPlan::Explicit(list) => {
+            SeedPlan::Explicit(list.iter().copied().take(n as usize).collect())
+        }
+    };
+    Ok(EvaluationIr {
+        episodes: EpisodeBatch {
+            n_episodes: n,
+            seeds,
+        },
+        suites: vec![suite.clone()],
+        acceptance: Vec::new(),
+        ..ir.clone()
+    })
 }
 
 /// `[showcase]` — the human-facing re-render of one evaluated episode (packet M5/V9).
@@ -1816,6 +1900,20 @@ pub struct CyclePlan {
     pub mark: u32,
     /// Where the dataset the cycle trains on lives.
     pub dataset_root: String,
+    /// `[eval.preview]`, and one preview per training mark; both empty without it.
+    pub preview: Option<PreviewRef>,
+    pub previews: Vec<PreviewStep>,
+}
+
+/// One checkpoint's preview: `es eval run`'s words, run as a child of `es loop cycle` once the
+/// mark's bundle is on disk (packet M13/Z1). `--config` is `<dir>/evaluation.toml`, the
+/// [`preview_evaluation`] document the cycle writes there first.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PreviewStep {
+    pub mark: u32,
+    /// `<out>/preview/<mark>`: the derived IR, then the run's usual artifacts.
+    pub dir: String,
+    pub args: Vec<String>,
 }
 
 impl Cycle {
@@ -1827,6 +1925,12 @@ impl Cycle {
                 "kind = {:?}; `es loop cycle` reads a {CYCLE_KIND:?} document",
                 cycle.kind
             )));
+        }
+        if cycle.eval.preview.as_ref().is_some_and(|p| p.episodes == 0) {
+            return Err(refuse(
+                "[eval.preview] `episodes` is 0; a preview with no episodes shows nothing. \
+                 Delete [eval.preview] to run none",
+            ));
         }
         match (&cycle.collect, &cycle.dataset) {
             (Some(_), Some(_)) => Err(refuse(
@@ -1989,6 +2093,16 @@ impl CyclePlan {
             ],
         });
 
+        let preview = cycle.eval.preview.clone();
+        let previews = match &preview {
+            Some(p) => train
+                .marks
+                .iter()
+                .map(|&m| preview_step(cycle, p, m, out))
+                .collect(),
+            None => Vec::new(),
+        };
+
         let checkpoint = under(out, &format!("train/checkpoints/{mark}.esb"));
         steps.push(CycleStep {
             stage: Stage::Eval,
@@ -2028,6 +2142,8 @@ impl CyclePlan {
             train,
             mark,
             dataset_root,
+            preview,
+            previews,
         })
     }
 
@@ -2050,6 +2166,29 @@ impl CyclePlan {
                 for line in self.train.render(out).lines() {
                     text.push_str("  ");
                     text.push_str(line);
+                    text.push('\n');
+                }
+                // Beside the training plan and not in it: a preview runs as the cycle's child
+                // while the trainer goes on, and the trainer's plan is `training.lock`'s.
+                if let Some(p) = &self.preview {
+                    let suite = p
+                        .suite
+                        .as_ref()
+                        .map_or_else(|| s("the first suite"), |n| format!("suite {n}"));
+                    text.push_str("  # preview: after each checkpoint, one at a time, ");
+                    text.push_str(&p.episodes.to_string());
+                    text.push_str(" episode(s) of ");
+                    text.push_str(&suite);
+                    text.push('\n');
+                }
+                for p in &self.previews {
+                    let words: Vec<String> = ["es", "eval", "run"]
+                        .iter()
+                        .map(s)
+                        .chain(p.args.iter().map(rel))
+                        .collect();
+                    text.push_str("  ");
+                    text.push_str(&words.join(" "));
                     text.push('\n');
                 }
             }
@@ -2078,6 +2217,29 @@ fn eval_args(cycle: &Cycle, policy: &str, out_dir: &str, out: &Path) -> Vec<Stri
         args.push(under(out, &format!("{out_dir}/frames")));
     }
     args
+}
+
+/// `es eval run`'s words for one mark's preview: the derived document, the mark's bundle, one
+/// worker -- the preview shares the machine with the trainer.
+fn preview_step(cycle: &Cycle, preview: &PreviewRef, mark: u32, out: &Path) -> PreviewStep {
+    let dir = under(out, &format!("preview/{mark}"));
+    let mut args = vec![
+        s("--config"),
+        under(out, &format!("preview/{mark}/evaluation.toml")),
+        s("--policy"),
+        under(out, &format!("train/checkpoints/{mark}.esb")),
+        s("--scene"),
+        cycle.scene.clone(),
+        s("--out"),
+        dir.clone(),
+        s("--jobs"),
+        s("1"),
+    ];
+    if preview.frames {
+        args.push(s("--frames"));
+        args.push(under(out, &format!("preview/{mark}/frames")));
+    }
+    PreviewStep { mark, dir, args }
 }
 
 fn triple(v: [f64; 3]) -> String {
@@ -2988,5 +3150,120 @@ fov = 36
             "rgb_overhead"
         );
         assert_eq!(camera_suffix("rgb"), "rgb");
+    }
+
+    // --- the checkpoint preview (packet M13/Z1) ----------------------------------------------
+
+    const EVALUATION: &str =
+        include_str!("../../../tests/fixtures/visible-learning/evaluation.toml");
+
+    fn demo_evaluation() -> EvaluationIr {
+        es_ir::serial::evaluation_from_toml(EVALUATION).expect("the demo Evaluation IR parses")
+    }
+
+    /// The committed demo evaluation, previewed with the defaults: the nominal suite alone, its
+    /// first four seeds, the same metrics and no acceptance -- a document that validates, round
+    /// trips through the TOML written beside the preview, and hashes as other conditions.
+    #[test]
+    fn a_preview_is_the_first_suite_with_its_first_seeds_and_no_acceptance() {
+        let ir = demo_evaluation();
+        let derived = preview_evaluation(&ir, &PreviewRef::default()).expect("derives");
+        assert_eq!(derived.suites, ir.suites[..1]);
+        assert_eq!(derived.suites[0].name, "nominal");
+        assert_eq!(derived.episodes.n_episodes, 4);
+        assert_eq!(
+            derived.episodes.seeds,
+            SeedPlan::Explicit(vec![101, 102, 103, 104])
+        );
+        assert_eq!(derived.metrics, ir.metrics);
+        assert!(derived.acceptance.is_empty(), "{:?}", derived.acceptance);
+        assert_eq!(
+            (&derived.task, &derived.observation, derived.replay),
+            (&ir.task, &ir.observation, ir.replay)
+        );
+        assert!(derived.validate().is_empty(), "{:?}", derived.validate());
+        assert_ne!(derived.evaluation_hash(), ir.evaluation_hash());
+        let text = es_ir::serial::evaluation_to_toml(&derived).expect("serialises");
+        assert_eq!(
+            es_ir::serial::evaluation_from_toml(&text).expect("parses back"),
+            derived
+        );
+    }
+
+    /// A named suite is that suite; more episodes than the evaluation has are its episodes; a
+    /// `seed_base` plan keeps its base; a suite the document does not declare is refused by
+    /// name.
+    #[test]
+    fn a_preview_names_its_suite_and_takes_no_seed_the_evaluation_lacks() {
+        let ir = demo_evaluation();
+        let named = PreviewRef {
+            episodes: 40,
+            suite: Some("torque_noise".to_owned()),
+            frames: false,
+        };
+        let derived = preview_evaluation(&ir, &named).expect("derives");
+        assert_eq!(derived.suites.len(), 1);
+        assert_eq!(derived.suites[0], ir.suites[4]);
+        assert_eq!(derived.episodes, ir.episodes);
+
+        let mut based = ir.clone();
+        based.episodes.seeds = SeedPlan::Base(7);
+        let derived = preview_evaluation(&based, &PreviewRef::default()).expect("derives");
+        assert_eq!(derived.episodes.seeds, SeedPlan::Base(7));
+        assert_eq!(derived.episodes.n_episodes, 4);
+
+        let unknown = PreviewRef {
+            suite: Some("fog".to_owned()),
+            ..PreviewRef::default()
+        };
+        let e = preview_evaluation(&ir, &unknown).expect_err("refused");
+        assert!(e.to_string().contains("\"fog\""), "{e}");
+        assert!(e.to_string().contains("light_intensity"), "{e}");
+    }
+
+    /// `[eval.preview]` is optional: absent, the plan has no preview and renders as before;
+    /// present and empty, it is four framed episodes of the first suite after every mark.
+    #[test]
+    fn eval_preview_is_optional_and_previews_every_mark() {
+        let cycle = Cycle::parse(CYCLE).expect("parses");
+        assert_eq!(cycle.eval.preview, None);
+        let before = cycle_plan(CYCLE, "/tmp/run");
+        assert!(before.previews.is_empty());
+        assert!(!before.render(Path::new("/tmp/run")).contains("preview"));
+
+        let text = format!("{CYCLE}[eval.preview]\n");
+        let cycle = Cycle::parse(&text).expect("parses");
+        assert_eq!(cycle.eval.preview, Some(PreviewRef::default()));
+        assert_eq!(
+            PreviewRef::default(),
+            PreviewRef {
+                episodes: 4,
+                suite: None,
+                frames: true
+            }
+        );
+        let plan = cycle_plan(&text, "/tmp/run");
+        let marks: Vec<u32> = plan.previews.iter().map(|p| p.mark).collect();
+        assert_eq!(marks, plan.train.marks);
+        let rendered = plan.render(Path::new("/tmp/run"));
+        assert!(
+            rendered.contains(
+                "\n  es eval run --config preview/5000/evaluation.toml --policy \
+                 train/checkpoints/5000.esb --scene scene.xml --out preview/5000 --jobs 1 \
+                 --frames preview/5000/frames\n"
+            ),
+            "{rendered}"
+        );
+        // Everything else is the plan of before, line for line.
+        let without: Vec<&str> = rendered
+            .lines()
+            .filter(|l| !l.contains("preview"))
+            .collect();
+        let old = before.render(Path::new("/tmp/run"));
+        assert_eq!(without, old.lines().collect::<Vec<_>>());
+
+        let e =
+            Cycle::parse(&format!("{CYCLE}[eval.preview]\nepisodes = 0\n")).expect_err("refused");
+        assert!(e.to_string().contains("episodes"), "{e}");
     }
 }

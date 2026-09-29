@@ -8327,6 +8327,66 @@ fn cycle_vision_dry_run_matches_its_golden() {
     assert_eq!(stdout(&out), want, "the stage plan is not the golden");
 }
 
+// --- packet M13/Z1: a short test after every checkpoint -------------------------------------
+
+/// `cycle-vision.toml` with `extra` appended, as a cycle document in `dir`. The fixture is not
+/// copied into the repository: the preview table is the only difference, and the plan names
+/// no path of the cycle document itself.
+fn preview_cycle(dir: &Path, extra: &str) -> String {
+    let text = std::fs::read_to_string(vl_fixture("cycle-vision.toml")).expect("cycle-vision");
+    let path = dir.join("cycle-preview.toml");
+    write(&path, &format!("{text}\n{extra}"));
+    train_toml_path(&path)
+}
+
+/// Regenerates `tests/golden/train/plan-cycle-preview.txt`. Run once, explicitly; it is then
+/// read-only (spec 1.4), exactly like `generate_cycle_golden` above.
+#[test]
+#[ignore = "golden generator; run explicitly"]
+fn generate_cycle_preview_golden() {
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP generate_cycle_preview_golden: set ES_GENERATE_GOLDENS=1 to regenerate");
+        return;
+    }
+    let dir = scratch_dir("cycle-preview-golden");
+    let recipe = preview_cycle(&dir, "[eval.preview]\n");
+    let out = run_cycle(&recipe, &dir.join("out"), &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    write(&train_golden("plan-cycle-preview.txt"), &stdout(&out));
+}
+
+/// The cube template's cycle with `[eval.preview]` at its defaults: one child `es eval run` per
+/// training mark under the train line, on the mark's bundle and its own derived document, one
+/// worker -- and every other line the vision cycle's golden, word for word.
+#[test]
+fn cycle_preview_dry_run_matches_its_golden() {
+    let dir = scratch_dir("cycle-preview-dry");
+    let recipe = preview_cycle(&dir, "[eval.preview]\n");
+    let out = run_cycle(&recipe, &dir.join("out"), &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let golden = train_golden("plan-cycle-preview.txt");
+    let want =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(stdout(&out), want, "the stage plan is not the golden");
+
+    let vision = std::fs::read_to_string(train_golden("plan-cycle-vision.txt")).expect("golden");
+    let rest: Vec<&str> = want.lines().filter(|l| !l.contains("preview")).collect();
+    assert_eq!(rest, vision.lines().collect::<Vec<_>>());
+    // A dry run writes nothing, previews included.
+    assert!(!dir.join("out").exists());
+}
+
+/// A preview of a suite the Evaluation IR does not declare is refused before anything runs,
+/// `--dry-run` included, naming the suite.
+#[test]
+fn cycle_preview_refuses_an_undeclared_suite() {
+    let dir = scratch_dir("cycle-preview-suite");
+    let recipe = preview_cycle(&dir, "[eval.preview]\nsuite = \"fog\"\n");
+    let out = run_cycle(&recipe, &dir.join("out"), &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    assert!(stderr_of(&out).contains("\"fog\""), "{}", stderr_of(&out));
+}
+
 /// `es policy init` builds the bundle a cycle's `[collect] policy` names from four committed
 /// documents: the same bytes for the same documents and seed, and a bundle that opens.
 #[test]

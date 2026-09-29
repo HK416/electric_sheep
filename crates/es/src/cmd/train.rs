@@ -90,7 +90,10 @@ the repository root: the IR route's trainer is `python/es/train_act.py` and a Ta
               says goes out on stream 5 as [step, loss, lr, samples_per_s], with a
               `checkpoint` event per packed mark on stream 1 and the sample image on stream 4.
               The summary is still the trainer's last stdout line and still what
-              training.lock records.
+              training.lock records. On the lerobot route each checkpoint is imported as
+              soon as `lerobot-train` has finished writing it -- `model.safetensors` and
+              `config.json` on disk when a training bar past its step is read -- instead of
+              all after the trainer exits; the bundles and training.lock are the same bytes.
 --telemetry-token <t>
               required in every client's Hello (spec 25.1); none by default
 --progress-every <N>
@@ -101,9 +104,12 @@ the repository root: the IR route's trainer is `python/es/train_act.py` and a Ta
               Rgb8 beside metrics/ every N steps (default 0, never). --telemetry-image-every
               is the same number under the spelling `es eval run` and the editor use.
 
-Both trainer flags are passed **only** with --telemetry, and neither enters the plan: they
-change nothing the run computes, so `training.lock`, the checkpoints and metrics/loss.json
-are byte-identical with and without them.
+Both trainer flags are passed **only** with --telemetry (and --progress-every also when `es
+loop cycle` previews checkpoints), and neither enters the plan: they change nothing the run
+computes, so `training.lock`, the checkpoints and metrics/loss.json are byte-identical with and
+without them. With either listener each checkpoint is bundled as soon as the trainer is past
+it -- its weights on disk when a progress line (a training bar on the lerobot route) past the
+mark is read -- instead of all after the trainer exits; the bundles are the same bytes.
 
 ES_PYTHON overrides `[run] interpreter` when it is set.
 
@@ -204,6 +210,7 @@ pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
         }),
         sample_every: number("--sample-every", &sample_every)?.unwrap_or(telemetry.image_every),
         publisher: owned.as_mut(),
+        on_checkpoint: None,
     };
     let code = run(&recipe, &out, dry_run, retired.as_deref(), watch)?;
     if let Some(p) = &owned {
@@ -225,9 +232,17 @@ pub(crate) struct TrainWatch<'a> {
     pub publisher: Option<&'a mut Publisher>,
     pub progress_every: u64,
     pub sample_every: u64,
+    /// Told each checkpoint mark as soon as its bundle is on disk (packet M13/Z1): `es loop
+    /// cycle`'s preview queue. It must return at once -- the trainer may still be running.
+    pub on_checkpoint: Option<&'a mut dyn FnMut(u32)>,
 }
 
 impl TrainWatch<'_> {
+    /// Someone wants to hear from the run while it is going, not only from its end.
+    fn listening(&self) -> bool {
+        self.publisher.is_some() || self.on_checkpoint.is_some()
+    }
+
     /// The flags appended to `train_act.py`'s command line — **not** to the plan.
     ///
     /// The plan is `config.json`'s `plan` and therefore part of `identity_hash` (spec 19.3):
@@ -236,17 +251,20 @@ impl TrainWatch<'_> {
     /// runs look like two runs. `--dry-run` prints the same plan either way.
     fn trainer_flags(&self, route: Route) -> Vec<String> {
         let mut out = Vec::new();
-        if self.publisher.is_none() || !route.captures_trainer_stdout() {
+        if !self.listening() || !route.captures_trainer_stdout() {
             return out;
         }
         for (flag, n) in [
+            // The progress line is also how a mark is known to be written (packet M13/Z1),
+            // so the preview queue asks for it too.
             ("--progress-every", self.progress_every),
             // A rollout has no image batch to draw one from: `--sample-every` is
             // `train_act.py`'s, and passing it to `train_ppo.py` would name a flag that
-            // trainer does not have (packet M8/S4b).
+            // trainer does not have (packet M8/S4b). And a picture is for a viewer: without
+            // one it would be a file written for nobody.
             (
                 "--sample-every",
-                if route == Route::Rl {
+                if route == Route::Rl || self.publisher.is_none() {
                     0
                 } else {
                     self.sample_every
@@ -622,6 +640,16 @@ pub(crate) fn run(
     let mut checkpoints = Vec::new();
     let mut summary = Value::Null;
     for step in &plan.steps {
+        // Bundled while the trainer was still running (packet M13/Z1).
+        if matches!(
+            step.kind,
+            StepKind::PolicyPack | StepKind::PolicyImportLerobot
+        ) && checkpoints
+            .iter()
+            .any(|r: &Value| r["step"] == json!(step.step))
+        {
+            continue;
+        }
         println!("$ {}", one_line(step));
         match step.kind {
             StepKind::DatasetBake => {
@@ -640,7 +668,13 @@ pub(crate) fn run(
                 if let Some(p) = watch.publisher.as_deref_mut() {
                     p.train_begin(recipe.run.steps);
                 }
-                summary = spawn(step, route, recipe.run.batch, &mut watch)?;
+                let mut early = Early {
+                    plan: &plan,
+                    out,
+                    marks: CheckpointWatch::of(&plan),
+                    rows: &mut checkpoints,
+                };
+                summary = spawn(step, route, recipe.run.batch, &mut watch, &mut early)?;
             }
             StepKind::PolicyPack => {
                 crate::cmd::policy::pack(&step.args)?;
@@ -654,6 +688,9 @@ pub(crate) fn run(
     }
 
     // --- the three post-run slots --------------------------------------------------------
+    // In mark order whichever way each was bundled: a no-op unless an early bundle failed
+    // and was redone after the trainer exited, and the manifest is a `training_hash` slot.
+    checkpoints.sort_by_key(|r| r["step"].as_u64());
     let manifest = json!({"schema_version": 1, "checkpoints": checkpoints});
     training.finish(
         &manifest,
@@ -832,16 +869,19 @@ print(json.dumps(d))
 /// Runs the one subprocess. `capture` is for `train_act.py`, whose whole report is a single
 /// JSON line on stdout; `lerobot-train` streams a progress log instead and inherits.
 ///
-/// With a publisher the captured path becomes a *streamed* one: the same stdout, read line by
-/// line so a `{"progress": ...}` line reaches a viewer while the run is still going. The
-/// summary is still the last line and still parsed the same way, which is what keeps
-/// `training.lock` byte-identical (packet M7/E7). `lerobot-train` prints no such line, so
-/// with a publisher its console is relayed and read instead (packet M12/R2).
+/// With someone listening -- a publisher, or `es loop cycle`'s preview queue -- the run is
+/// read while it goes: the captured path becomes a *streamed* one, the same stdout read line
+/// by line so a `{"progress": ...}` line reaches a viewer, and `lerobot-train`'s console is
+/// relayed and read for its bar and metric lines (packet M12/R2). Either way each checkpoint
+/// is bundled as soon as the trainer is past it (`early`, packet M13/Z1). The summary is still
+/// the last line and still parsed the same way, which is what keeps `training.lock`
+/// byte-identical (packet M7/E7).
 fn spawn(
     step: &Step,
     route: Route,
     batch: Option<u32>,
     watch: &mut TrainWatch<'_>,
+    early: &mut Early<'_>,
 ) -> Result<Value, CliError> {
     let capture = route.captures_trainer_stdout();
     let mut cmd = Command::new(&step.prefix[0]);
@@ -852,8 +892,8 @@ fn spawn(
         cmd.args(&extra);
     }
     let named = || format!("{}: ", step.prefix[0]);
-    let (ok, code, summary) = if capture && watch.publisher.is_some() {
-        stream(&mut cmd, watch).map_err(|e| bad(format!("{}{e}", named())))?
+    let (ok, code, summary) = if capture && watch.listening() {
+        stream(&mut cmd, watch, early).map_err(|e| bad(format!("{}{e}", named())))?
     } else if capture {
         let out = cmd.output().map_err(|e| bad(format!("{}{e}", named())))?;
         let text = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -866,9 +906,18 @@ fn spawn(
             out.status.code(),
             serde_json::from_str(last).unwrap_or(Value::Null),
         )
-    } else if let Some(p) = watch.publisher.as_deref() {
-        let status =
-            stream_lerobot(&mut cmd, p, batch).map_err(|e| bad(format!("{}{e}", named())))?;
+    } else if watch.listening() {
+        let mut progress = LerobotProgress::default();
+        let status = stream_lerobot(&mut cmd, |piece| {
+            if let (Some(p), Some(row)) = (watch.publisher.as_deref(), progress.read(piece, batch))
+            {
+                p.train_row(row);
+            }
+            if let Some((past, _, _)) = training_bar(piece) {
+                early.past(past, watch);
+            }
+        })
+        .map_err(|e| bad(format!("{}{e}", named())))?;
         (status.success(), status.code(), Value::Null)
     } else {
         let status = cmd.status().map_err(|e| bad(format!("{}{e}", named())))?;
@@ -888,12 +937,14 @@ fn spawn(
 ///
 /// stderr is inherited rather than piped: reading two pipes from one thread deadlocks when
 /// either fills, and the non-streamed path's `eprint!` of the captured stderr and this go to
-/// the same place. A line that is not one of the two the trainer publishes is printed and
-/// remembered as a candidate summary, so the last non-progress line is the report — exactly
-/// what `Command::output`'s `text.lines().last()` picks.
+/// the same place. stdout is read on its own thread, so the trainer never waits on a full pipe
+/// while a mark is packed here. A line that is not one of the two the trainer publishes is
+/// printed and remembered as a candidate summary, so the last non-progress line is the report
+/// -- exactly what `Command::output`'s `text.lines().last()` picks.
 fn stream(
     cmd: &mut Command,
     watch: &mut TrainWatch<'_>,
+    early: &mut Early<'_>,
 ) -> std::io::Result<(bool, Option<i32>, Value)> {
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -903,8 +954,16 @@ fn stream(
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::other("the trainer's stdout was not piped"))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
     let mut last = String::new();
-    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+    for line in rx {
         println!("{line}");
         let parsed = serde_json::from_str::<Value>(&line).unwrap_or(Value::Null);
         let publisher = watch.publisher.as_deref_mut();
@@ -912,6 +971,9 @@ fn stream(
             (Some(p), Some(progress), _) => p.progress(progress),
             (Some(p), None, Some(Value::String(path))) => p.sample(Path::new(path)),
             _ => {}
+        }
+        if let Some(past) = progress_step(&parsed) {
+            early.past(past, watch);
         }
         if parsed.get("progress").is_none() && parsed.get("sample").is_none() {
             last = line;
@@ -925,6 +987,51 @@ fn stream(
     ))
 }
 
+/// The step `train_act.py` or `train_ppo.py` says it has finished: `{"progress": {"step": N}}`.
+fn progress_step(line: &Value) -> Option<u64> {
+    line.get("progress")?.get("step")?.as_u64()
+}
+
+/// The checkpoints bundled while the trainer is still running (packet M13/Z1): the plan's own
+/// pack or import step for a mark, run as soon as [`CheckpointWatch`] says the mark is written,
+/// and skipped by the plan loop afterwards.
+///
+/// A bundle that fails here is not the run's failure: the mark stays in the plan, and the loop
+/// after the trainer bundles it the way it always has, and fails there if it still does.
+struct Early<'p> {
+    plan: &'p Plan,
+    out: &'p Path,
+    marks: CheckpointWatch,
+    rows: &'p mut Vec<Value>,
+}
+
+impl Early<'_> {
+    /// The trainer says it is past optimizer step (or iteration) `step`.
+    fn past(&mut self, step: u64, watch: &mut TrainWatch<'_>) {
+        for mark in self.marks.past(step) {
+            let Some(s) = self.plan.steps.iter().find(|s| {
+                s.step == Some(mark)
+                    && matches!(s.kind, StepKind::PolicyPack | StepKind::PolicyImportLerobot)
+            }) else {
+                continue;
+            };
+            println!("$ {}", one_line(s));
+            let made = if s.kind == StepKind::PolicyPack {
+                crate::cmd::policy::pack(&s.args)
+            } else {
+                crate::cmd::policy::import_lerobot(&s.args)
+            };
+            match made.and_then(|_| published_row(s, self.out, watch)) {
+                Ok(row) => self.rows.push(row),
+                Err(e) => println!(
+                    "note: checkpoint {mark} was not bundled while training ({e}); it is \
+                     bundled again after the trainer exits"
+                ),
+            }
+        }
+    }
+}
+
 /// [`manifest_row`], announced: a viewer learns that a mark was packed and which policy it
 /// is, at the moment the bundle exists on disk (packet M7/E7).
 fn published_row(step: &Step, out: &Path, watch: &mut TrainWatch<'_>) -> Result<Value, CliError> {
@@ -935,18 +1042,21 @@ fn published_row(step: &Step, out: &Path, watch: &mut TrainWatch<'_>) -> Result<
             row["bundle_policy_hash"].as_str().unwrap_or("-"),
         );
     }
+    if let (Some(hook), Some(mark)) = (watch.on_checkpoint.as_deref_mut(), step.step) {
+        hook(mark);
+    }
     Ok(row)
+}
+
+/// The word after `flag` on a step's command line.
+fn arg<'s>(step: &'s Step, flag: &str) -> Option<&'s String> {
+    step.args.iter().skip_while(|a| *a != flag).nth(1)
 }
 
 /// One `checkpoint.manifest` row, read back from the bundle that was just written so the
 /// digest names bytes on disk rather than bytes in memory.
 fn manifest_row(step: &Step, out: &Path) -> Result<Value, CliError> {
-    let path = step
-        .args
-        .iter()
-        .skip_while(|a| *a != "--out")
-        .nth(1)
-        .ok_or_else(|| bad("a checkpoint step with no --out"))?;
+    let path = arg(step, "--out").ok_or_else(|| bad("a checkpoint step with no --out"))?;
     let bytes = std::fs::read(path).map_err(|e| bad(format!("{path}: {e}")))?;
     let bundle = PolicyBundle::open(&bytes).map_err(|e| bad(format!("{path}: {e}")))?;
     let relative = Path::new(path)
@@ -1186,12 +1296,11 @@ fn relay(mut from: impl Read, mut to: impl Write, mut on_piece: impl FnMut(Strin
     }
 }
 
-/// `lerobot-train` with someone watching: both pipes relayed to ours and read for the bar and
-/// the metric lines, which become stream 5. Nothing it prints is written anywhere new.
+/// `lerobot-train` with someone listening: both pipes relayed to ours, and every piece of what
+/// it said handed to `on_piece`. Nothing it prints is written anywhere new.
 fn stream_lerobot(
     cmd: &mut Command,
-    publisher: &Publisher,
-    batch: Option<u32>,
+    mut on_piece: impl FnMut(&str),
 ) -> std::io::Result<std::process::ExitStatus> {
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1205,18 +1314,75 @@ fn stream_lerobot(
     }
     drop(tx);
     // Ends when both relays have seen their pipe close.
-    let mut progress = LerobotProgress::default();
     for piece in rx {
-        if let Some(row) = progress.read(&piece, batch) {
-            publisher.train_row(row);
-        }
+        on_piece(&piece);
     }
     child.wait()
 }
 
+/// Which checkpoint marks the trainer has finished writing (packet M13/Z1). One rule on every
+/// route: a mark is complete when its files are on disk **and** the trainer has said it is
+/// past the mark -- because each trainer says where it is *before* it writes the mark:
+///
+/// * `train_act.py` / `train_ppo.py` print `{"progress": {"step": N}}` and then write
+///   `weights/model-N.safetensors`, so the first progress line past N comes after the write
+///   returned;
+/// * `lerobot-train` 0.6.1 draws the bar for step N (`progbar.update(1)`) and then saves step
+///   N, writing `model.safetensors` and `config.json` before the processor files
+///   `import-lerobot` also reads -- a directory holding both can still be half written, and a
+///   stats file missing then is read as the older layout. The next bar past N is drawn after
+///   the save returned.
+///
+/// The last mark is the run's length: nothing is said past it, so it is bundled after the
+/// trainer exits, as before.
+struct CheckpointWatch {
+    /// `(mark, the files it is written as)`, not yet reported.
+    pending: Vec<(u32, Vec<PathBuf>)>,
+}
+
+impl CheckpointWatch {
+    /// Every mark the plan bundles, with what the trainer writes for it.
+    fn of(plan: &Plan) -> Self {
+        let pending = plan
+            .steps
+            .iter()
+            .filter_map(|s| {
+                let files = match s.kind {
+                    StepKind::PolicyPack => vec![PathBuf::from(arg(s, "--weights")?)],
+                    StepKind::PolicyImportLerobot => {
+                        let dir = Path::new(arg(s, "--checkpoint")?);
+                        vec![dir.join("model.safetensors"), dir.join("config.json")]
+                    }
+                    _ => return None,
+                };
+                Some((s.step?, files))
+            })
+            .collect();
+        Self { pending }
+    }
+
+    /// The marks complete now that the trainer is past `step`, each reported once.
+    fn past(&mut self, step: u64) -> Vec<u32> {
+        let (ready, pending): (Vec<_>, Vec<_>) =
+            self.pending.drain(..).partition(|(mark, files)| {
+                step > u64::from(*mark) && files.iter().all(|f| f.is_file())
+            });
+        self.pending = pending;
+        ready.into_iter().map(|(mark, _)| mark).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{lerobot_said, relay, LerobotProgress, LerobotSaid};
+    use std::path::{Path, PathBuf};
+
+    use es_data::training::{ir_checkpoint, lerobot_checkpoint, Plan, Recipe};
+    use serde_json::{json, Value};
+
+    use super::{
+        lerobot_said, progress_step, relay, training_bar, CheckpointWatch, LerobotProgress,
+        LerobotSaid,
+    };
 
     // Copied from a real `lerobot-train` 0.6.1 run (Y-V item 1, `target/yv/cube-cam/runs/001/
     // es.log`). tqdm and the logger both write stderr, so a metric line lands on the end of
@@ -1300,5 +1466,147 @@ mod tests {
             progress.read(METRIC, Some(8)),
             Some([3510.0, 0.131, 1.0e-4, 14.94 * 8.0])
         );
+    }
+
+    // --- packet M13/Z1: which marks are written --------------------------------------------
+
+    /// A fresh directory for one test, gone before it starts.
+    fn scratch(tag: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("es-z1-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// The plan `es train` runs for `recipe` under `out` -- the steps whose files are watched.
+    fn plan(recipe: &str, out: &Path) -> Plan {
+        let recipe = Recipe::parse(recipe).expect("the recipe parses");
+        let trainer = ["lerobot-train".to_owned()];
+        Plan::build(&recipe, out, "python", &trainer, Some(6), false).expect("the plan builds")
+    }
+
+    const TRAIN_RUN: &str = "steps = 2000\nlr = 1e-4\nseed = 0\ncheckpoint_at = [1000]\n\
+                       device = \"cpu\"\n";
+
+    /// What the runtime does with one piece of `lerobot-train`'s console, and with one stdout
+    /// line of `train_act.py` / `train_ppo.py`.
+    fn bar(watch: &mut CheckpointWatch, piece: &str) -> Vec<u32> {
+        training_bar(piece).map_or_else(Vec::new, |(step, _, _)| watch.past(step))
+    }
+    fn line(watch: &mut CheckpointWatch, line: &Value) -> Vec<u32> {
+        progress_step(line).map_or_else(Vec::new, |step| watch.past(step))
+    }
+    fn progress(step: u64) -> Value {
+        json!({"progress": {"step": step, "loss": 0.1, "lr": 1e-4, "samples_per_s": 8.0,
+               "elapsed_s": 1.0}})
+    }
+
+    /// Review focus 2: a checkpoint `lerobot-train` is still writing is never imported. The
+    /// directory is written in stages, the way `save_checkpoint` writes it.
+    #[test]
+    fn a_lerobot_mark_is_complete_once_a_bar_past_it_is_read_with_both_files_on_disk() {
+        let out = scratch("lerobot");
+        let recipe = format!(
+            "kind = \"training\"\n[dataset]\nroot = \"ds\"\n[policy]\ntask = \"t.toml\"\n\
+             observation = \"o.toml\"\ndeployment = \"d.toml\"\n\
+             lerobot = {{ type = \"act\", chunk_size = 16, n_action_steps = 16 }}\n\
+             [run]\nbatch = 8\n{TRAIN_RUN}"
+        );
+        let mut watch = CheckpointWatch::of(&plan(&recipe, &out));
+        let dir = PathBuf::from(lerobot_checkpoint(&out, 1000));
+        let at = |n: u64| format!("Training:  20%|██        | {n}/2000 [01:00<04:00, 16.00step/s]");
+
+        assert!(bar(&mut watch, &at(1001)).is_empty(), "nothing on disk yet");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        assert!(bar(&mut watch, &at(1002)).is_empty(), "config.json alone");
+        std::fs::write(dir.join("model.safetensors"), b"weights").unwrap();
+        // The bar for the mark itself is drawn before the save starts, and a metric line is
+        // no bar at all.
+        assert!(bar(&mut watch, &at(1000)).is_empty(), "the mark's own bar");
+        assert!(bar(&mut watch, METRIC).is_empty(), "a metric line");
+        assert_eq!(bar(&mut watch, &at(1003)), vec![1000]);
+        assert!(bar(&mut watch, &at(1004)).is_empty(), "reported once");
+        assert_eq!(
+            watch.pending.len(),
+            1,
+            "2000, the run's length, waits for the exit"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// The IR route: `train_act.py` prints step N's progress line and then writes
+    /// `model-N.safetensors`, so only a line past N, with the file there, completes N.
+    #[test]
+    fn an_ir_mark_is_complete_once_a_progress_line_past_it_is_read_with_its_weights() {
+        let out = scratch("ir");
+        let recipe = format!(
+            "kind = \"training\"\n[dataset]\nroot = \"ds\"\n[policy]\nbundle = \"b.esb\"\n\
+             [run]\nbatch = 8\n{TRAIN_RUN}"
+        );
+        let mut watch = CheckpointWatch::of(&plan(&recipe, &out));
+        assert!(
+            line(&mut watch, &progress(1010)).is_empty(),
+            "no weights yet"
+        );
+        let weights = PathBuf::from(ir_checkpoint(&out, 1000));
+        std::fs::create_dir_all(weights.parent().unwrap()).unwrap();
+        std::fs::write(&weights, b"weights").unwrap();
+        // Step 1000's own line is printed before the write; a sample line and the summary
+        // say nothing about where the trainer is.
+        assert!(
+            line(&mut watch, &progress(1000)).is_empty(),
+            "the mark's own line"
+        );
+        assert!(line(&mut watch, &json!({"sample": "metrics/sample.bin"})).is_empty());
+        assert!(line(&mut watch, &json!({"initial_loss": 1.0, "steps": 2000})).is_empty());
+        assert_eq!(line(&mut watch, &progress(1010)), vec![1000]);
+        assert!(
+            line(&mut watch, &progress(1020)).is_empty(),
+            "reported once"
+        );
+        assert_eq!(
+            watch.pending.len(),
+            1,
+            "2000, the run's length, waits for the exit"
+        );
+        let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// The RL route: `train_ppo.py` numbers its progress lines by iteration, as its marks are,
+    /// and writes mark 0 before the first iteration -- which the first line then completes.
+    #[test]
+    fn an_rl_mark_is_complete_once_a_progress_line_past_it_is_read_with_its_weights() {
+        let out = scratch("rl");
+        let recipe = "kind = \"training\"\n[policy]\nbundle = \"b.esb\"\n\
+                      [rl]\nalgo = \"ppo\"\nenvs = 4\nhorizon = 8\nepochs = 1\n\
+                      minibatches = 2\ngamma = 0.99\nlam = 0.95\nclip = 0.2\nentropy = 0.0\n\
+                      value_coef = 0.5\n\
+                      [run]\nsteps = 300\nlr = 3e-4\nseed = 0\ncheckpoint_at = [0, 100]\n\
+                      device = \"cpu\"\n";
+        let mut watch = CheckpointWatch::of(&plan(recipe, &out));
+        let write = |mark: u32| {
+            let weights = PathBuf::from(ir_checkpoint(&out, mark));
+            std::fs::create_dir_all(weights.parent().unwrap()).unwrap();
+            std::fs::write(&weights, b"weights").unwrap();
+        };
+        write(0);
+        assert_eq!(line(&mut watch, &progress(10)), vec![0]);
+        assert!(
+            line(&mut watch, &progress(110)).is_empty(),
+            "100 is not written yet"
+        );
+        write(100);
+        assert!(
+            line(&mut watch, &progress(100)).is_empty(),
+            "the mark's own line"
+        );
+        assert_eq!(line(&mut watch, &progress(110)), vec![100]);
+        assert_eq!(
+            watch.pending.len(),
+            1,
+            "300, the run's length, waits for the exit"
+        );
+        let _ = std::fs::remove_dir_all(&out);
     }
 }
