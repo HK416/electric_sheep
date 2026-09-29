@@ -51,9 +51,10 @@ medium = [10000, 20000]
 long   = [20000, 40000, 60000]
 
 # What a timed-out attempt is judged by (packets M13/Z4, Z6, R4): the `cube` body's path against
-# the region the scene's `bin_*` geoms cover. Last seen inside the bin with the gripper never past
-# `release.above` since it went in = not let go; inside otherwise = got there too late; else never
-# 2 cm above where it started = never lifted; else left outside. The two names are es-editor i18n
+# the region the scene's `bin_*` geoms cover. Last seen inside the bin, or held over it (inside its
+# footprint, above its walls), with the gripper never past `release.above` since it went in or came
+# over = not let go; inside or over otherwise = got there too late; else never 2 cm above where it
+# started = never lifted; else left outside. The two names are es-editor i18n
 # keys. `release` is the Task IR's own threshold: `task.toml`'s success predicate ANDs in
 # `joint.gripper.qpos` `Gt 0.85` (its `Compare` node 32), so a cube in the bin in shut jaws still
 # times out.
