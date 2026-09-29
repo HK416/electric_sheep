@@ -223,6 +223,18 @@ const CHUNKS_GOLDEN: &str = "tests/golden/expert/so101-pick-place-chunks.json";
 const CUBES: [(f64, f64); 3] = [(0.21, -0.03), (0.24, 0.01), (0.27, 0.05)];
 /// Chunks recorded once the demonstration is over, holding its last command.
 const AFTER_DONE: usize = 3;
+/// The golden's names for the built-in program's blocks: the stages it was recorded under,
+/// before packet M14/Q1 made them the blocks of `templates/teach/so101-pick-place.toml`.
+const STAGES: [&str; 8] = [
+    "Approach",
+    "Descend",
+    "Close",
+    "Lift",
+    "Transport",
+    "Lower",
+    "Release",
+    "Done",
+];
 
 /// `lo..=hi` of the Task IR's `Uniform` draw on `target`.
 fn drawn_range(task: &es_ir::task::TaskIr, target: &str) -> (f64, f64) {
@@ -353,7 +365,7 @@ fn chunks_golden_text() -> String {
         let (mut n, mut after_done) = (0, 0);
         while after_done < AFTER_DONE {
             assert!(n < cap, "cube ({cx}, {cy}): not done in {cap} re-plans");
-            let stage = format!("{:?}", expert.stage());
+            let stage = STAGES[expert.block()];
             let rows = expert
                 .chunk(&model, &state_of_row(&model, &row), 0)
                 .unwrap_or_else(|| panic!("cube ({cx}, {cy}): out of reach in {stage}"));

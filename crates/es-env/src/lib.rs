@@ -17,6 +17,8 @@ pub mod episode;
 pub mod expert;
 pub mod inference;
 pub mod plan;
+/// The demonstration program the scripted expert runs (packet M14/Q1).
+pub mod program;
 pub mod randomize;
 /// The renderer in the env loop. Feature `render` (off by default): the only part of this
 /// crate that links Vulkan (§15, `docs/design/visible-learning.md` section 7).
@@ -33,6 +35,7 @@ pub use env::{Env, EnvMetrics, StepOutcome};
 pub use episode::{Episode, EpisodeRecorder, Termination};
 pub use expert::{so101_ik, ExpertCfg, Links, ScriptedExpert, Stage};
 pub use inference::{default_max_pending, latency_ticks, AsyncInference, Submission};
+pub use program::{Program, ProgramError};
 pub use randomize::RandomizationPlan;
 #[cfg(feature = "render")]
 pub use render::{EnvRenderer, EnvRendererCfg};

@@ -8,8 +8,9 @@
 //!   SO-101 is exactly that shape (design note section 2.8), so there is no Jacobian, no
 //!   iteration and no convergence failure mode. Out of reach or out of joint range is
 //!   [`None`] -- never a clamped approximation (spec 17.2 applied to kinematics).
-//! * [`ScriptedExpert`], a waypoint state machine over [`Stage`] whose only entropy is the
-//!   Task IR's own reset draw, so `(task_hash, seed, episode)` fixes the demonstration.
+//! * [`ScriptedExpert`], a waypoint state machine over a demonstration [`Program`]'s blocks
+//!   (packet M14/Q1) whose only entropy is the Task IR's own reset draw, so
+//!   `(task_hash, seed, episode)` fixes the demonstration.
 //!
 //! Every length, angle and axis it uses is **derived from the parsed scene** by
 //! [`Links::from_scene`] -- walking the body tree from the tool site up to the root and
@@ -25,9 +26,10 @@
 
 use es_assets::scene::{ActuatorTarget, Body, JointKind, SceneDesc};
 use es_core::StableId;
-use es_math::{axis::UP, units::DEG_TO_RAD, Pose, Vec3};
+use es_math::{axis::UP, Pose, Vec3};
 use es_physics_core::backend::{ModelInfo, StateView};
 
+use crate::program::{Grip, Program, ProgramError, Waypoint};
 use crate::EnvError;
 
 /// The site whose pose the IK solves for: upstream SO-101's tool frame.
@@ -105,8 +107,9 @@ pub struct Links {
     a3: f64,
 }
 
-/// World pose of every body at the zero configuration, by composing parent poses.
-fn world_poses(scene: &SceneDesc) -> Result<Vec<(StableId, Pose)>, EnvError> {
+/// World pose of every body at the zero configuration, by composing parent poses; one entry
+/// per `scene.bodies`, in order.
+pub(crate) fn world_poses(scene: &SceneDesc) -> Result<Vec<(StableId, Pose)>, EnvError> {
     let mut out: Vec<(StableId, Pose)> = Vec::with_capacity(scene.bodies.len());
     // `SceneDesc::bodies` is parent-before-child (the importers walk the tree), so one pass
     // suffices; a body whose parent has not been seen is a malformed scene, not a reorder.
@@ -318,68 +321,33 @@ pub fn so101_ik(links: &Links, target: Vec3, approach_pitch: f64) -> Option<[f64
 
 // --- the waypoint state machine -----------------------------------------------------------------
 
-/// Where the demonstration is (design note section 5.3).
+/// What kind of block the demonstration is running (design note section 5.3); which block is
+/// [`ScriptedExpert::block`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stage {
-    /// Above the cube, gripper open.
-    Approach,
-    /// Down onto the cube.
-    Descend,
-    /// Squeeze, for `close_ticks` control steps.
+    /// A move block: going to its point.
+    Move,
+    /// A grip block closing the gripper, then waiting.
     Close,
-    /// Straight up to carry height.
-    Lift,
-    /// Across to the bin, at carry height.
-    Transport,
-    /// Down into the bin. Without it the cube is released above the wall top, bounces out as
-    /// often as not, and -- because the Task IR's success predicate cannot see `z` -- the
-    /// episode ends with the cube still in the air (design note section 5.4).
-    Lower,
-    /// Open, and let it drop.
-    Release,
-    /// Hold the last command; the episode ends on the Task IR's own `Terminate` node.
+    /// A grip block opening it, then waiting.
+    Open,
+    /// Past the last block: its command is held, and the episode ends on the Task IR's own
+    /// `Terminate` node.
     Done,
 }
 
-impl Stage {
-    fn next(self) -> Self {
-        match self {
-            Self::Approach => Self::Descend,
-            Self::Descend => Self::Close,
-            Self::Close => Self::Lift,
-            Self::Lift => Self::Transport,
-            Self::Transport => Self::Lower,
-            Self::Lower => Self::Release,
-            Self::Release | Self::Done => Self::Done,
-        }
-    }
-}
-
-/// What the demonstration aims at, in metres and radians.
+/// The tuning a demonstration program runs with: not the person's to change, so not in the
+/// program (packet M14/Q1). What the demonstration aims at is the [`Program`].
 ///
-/// `cube_joint` is the cube's **free joint**, not its body: the collector hands a scripted
-/// intervener the `qpos ‖ qvel` observation row, which has no `xpos` in it, and a free joint's
-/// `qpos` is its world pose exactly (design note section 5.4).
+/// `cube_joint` is the program's object's **free joint**, not its body: the collector hands a
+/// scripted intervener the `qpos ‖ qvel` observation row, which has no `xpos` in it, and a free
+/// joint's `qpos` is its world pose exactly (design note section 5.4).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExpertCfg {
     pub cube_joint: StableId,
-    /// Where the cube is dropped; `z` is the height the arm carries at, above the bin's walls.
-    pub bin_center: Vec3,
-    /// Tool height at the release, inside the bin: low enough that the cube is in the bin's
-    /// volume when the jaws open, not above it.
-    pub drop_height: f64,
-    pub hover_height: f64,
-    /// How far below the cube's centre the tool tip goes to grip it.
-    pub grasp_depth: f64,
-    /// Tool pitch for the approach and the grasp; `-pi/2` is straight down.
-    pub approach_pitch: f64,
-    /// Tool pitch while carrying. SO-101 cannot hold `-pi/2` at carry height
-    /// (design note section 5.2), so this is a second angle rather than a clamp.
-    pub carry_pitch: f64,
     pub grip_open: f64,
     pub grip_closed: f64,
-    pub close_ticks: u32,
-    /// Joint error, rad, at which a stage counts as reached.
+    /// Joint error, rad, at which a move block counts as reached.
     pub pos_tol: f64,
     /// How far a commanded joint may move in one control tick, rad, and how much that step may
     /// change from tick to tick. A demonstration that steps straight to its waypoint is
@@ -395,6 +363,9 @@ pub struct ExpertCfg {
     /// the *command* got to -- starting again from the measured joints would step backwards by
     /// the servo's following error, which the Safety Plane sees as a violation.
     pub execute: u32,
+    /// Control ticks per second. With `execute`, what turns a grip block's `wait` into the
+    /// expert's own steps: one per [`chunk`](ScriptedExpert::chunk) call, every `execute` ticks.
+    pub control_hz: f64,
 }
 
 /// The fraction of the Deployment IR's envelope the expert paces itself to.
@@ -447,10 +418,11 @@ impl ExpertCfg {
         }
         self.horizon = deploy.action.horizon as u32;
         self.execute = replan_every.max(1);
+        self.control_hz = deploy.rate.control.as_hz_f64();
     }
 }
 
-/// One scripted demonstration, stage by stage.
+/// One scripted demonstration, block by block of its [`Program`].
 ///
 /// A concrete struct reached through the intervener hook `es-data`'s collector already takes,
 /// so a demonstration is recorded by machinery that already exists -- and passes through the
@@ -459,8 +431,12 @@ impl ExpertCfg {
 pub struct ScriptedExpert {
     cfg: ExpertCfg,
     links: Links,
-    stage: Stage,
-    stage_tick: u32,
+    /// The program's blocks resolved against the scene, each with the steps a grip block waits
+    /// (`None`: a move, done when reached). Never empty ([`Program::validate`]).
+    plan: Vec<(Waypoint, Option<u32>)>,
+    /// The running block; `plan.len()` once the last one is done.
+    block: usize,
+    block_tick: u32,
     /// The cube pose the grasp was planned from, latched when the episode starts: once the
     /// jaws touch it the cube moves, and re-planning from the moved cube chases it.
     grasp: Option<Vec3>,
@@ -473,7 +449,22 @@ pub struct ScriptedExpert {
 }
 
 impl ScriptedExpert {
+    /// The built-in `so101-pick-place` ([`Program::builtin`]) on `scene`.
     pub fn new(scene: &SceneDesc, cfg: ExpertCfg) -> Result<Self, EnvError> {
+        Self::with_program(scene, cfg, &Program::builtin()).map_err(|e| match e {
+            ProgramError::Scene(e) => e,
+            e => unsupported(e),
+        })
+    }
+
+    /// `program` on `scene`, paced by `cfg`. Refused by name when a place is not in the scene,
+    /// the program's object is not the body `cfg.cube_joint` moves, or a `wait` is not a whole
+    /// number of the expert's steps.
+    pub fn with_program(
+        scene: &SceneDesc,
+        cfg: ExpertCfg,
+        program: &Program,
+    ) -> Result<Self, ProgramError> {
         let links = Links::from_scene(scene)?;
         let joints = links.joints();
         let mut actuators = Vec::with_capacity(joints.len());
@@ -485,11 +476,44 @@ impl ScriptedExpert {
                 .ok_or_else(|| unsupported(format!("joint {joint} has no actuator")))?;
             actuators.push(actuator.id);
         }
+        let object = scene
+            .joints
+            .iter()
+            .find(|j| j.id == cfg.cube_joint && j.kind == JointKind::Free)
+            .and_then(|j| scene.bodies.iter().find(|b| b.id == j.body));
+        if object.is_none_or(|b| b.name != program.object) {
+            return Err(ProgramError::UnknownObject(program.object.clone()));
+        }
+        // One step per `chunk` call, every `execute` control ticks.
+        let execute = f64::from(cfg.execute.max(1));
+        let mut plan = Vec::with_capacity(program.blocks.len());
+        for (block, w) in program.waypoints(scene)?.into_iter().enumerate() {
+            let steps = match w.wait() {
+                None => None,
+                Some(wait) => {
+                    let steps = wait * cfg.control_hz / execute;
+                    let whole = steps.round();
+                    if !(whole >= 1.0
+                        && whole <= f64::from(u32::MAX)
+                        && (steps - whole).abs() <= 1e-9)
+                    {
+                        return Err(ProgramError::Wait {
+                            block,
+                            wait,
+                            step: execute / cfg.control_hz,
+                        });
+                    }
+                    Some(whole as u32)
+                }
+            };
+            plan.push((w, steps));
+        }
         Ok(Self {
             cfg,
             links,
-            stage: Stage::Approach,
-            stage_tick: 0,
+            plan,
+            block: 0,
+            block_tick: 0,
             grasp: None,
             actuators,
             command: Vec::new(),
@@ -497,60 +521,34 @@ impl ScriptedExpert {
         })
     }
 
-    /// Back to [`Stage::Approach`] with no latched cube pose: call it once per episode.
+    /// Back to the first block with no latched cube pose: call it once per episode.
     pub fn reset(&mut self) {
-        self.stage = Stage::Approach;
-        self.stage_tick = 0;
+        self.block = 0;
+        self.block_tick = 0;
         self.grasp = None;
         self.command.clear();
         self.speed.clear();
     }
 
+    /// The index of the running block; the program's length once the last one is done.
+    pub fn block(&self) -> usize {
+        self.block
+    }
+
+    /// What kind of block is running.
     pub fn stage(&self) -> Stage {
-        self.stage
+        match self.plan.get(self.block) {
+            None => Stage::Done,
+            Some((_, None)) => Stage::Move,
+            Some((w, Some(_))) => match w.grip() {
+                Grip::Closed => Stage::Close,
+                Grip::Open => Stage::Open,
+            },
+        }
     }
 
     pub fn links(&self) -> &Links {
         &self.links
-    }
-
-    /// The tool target, pitch and gripper command of `stage`.
-    fn waypoint(&self, cube: Vec3) -> (Vec3, f64, f64) {
-        let cfg = &self.cfg;
-        let grip = cfg.grip_closed;
-        match self.stage {
-            Stage::Approach => (
-                Vec3::new(cube.x, cube.y, cube.z + cfg.hover_height),
-                cfg.approach_pitch,
-                cfg.grip_open,
-            ),
-            Stage::Descend => (
-                Vec3::new(cube.x, cube.y, cube.z + cfg.grasp_depth),
-                cfg.approach_pitch,
-                cfg.grip_open,
-            ),
-            Stage::Close => (
-                Vec3::new(cube.x, cube.y, cube.z + cfg.grasp_depth),
-                cfg.approach_pitch,
-                grip,
-            ),
-            Stage::Lift => (
-                Vec3::new(cube.x, cube.y, cfg.bin_center.z),
-                cfg.carry_pitch,
-                grip,
-            ),
-            Stage::Transport => (cfg.bin_center, cfg.carry_pitch, grip),
-            Stage::Lower => (
-                Vec3::new(cfg.bin_center.x, cfg.bin_center.y, cfg.drop_height),
-                cfg.approach_pitch,
-                grip,
-            ),
-            Stage::Release | Stage::Done => (
-                Vec3::new(cfg.bin_center.x, cfg.bin_center.y, cfg.drop_height),
-                cfg.approach_pitch,
-                cfg.grip_open,
-            ),
-        }
     }
 
     /// One control step of demonstration: the first row of [`chunk`](Self::chunk).
@@ -563,7 +561,7 @@ impl ScriptedExpert {
         self.chunk(model, state, env)?.into_iter().next()
     }
 
-    /// `horizon` control steps of demonstration, or [`None`] when this stage's waypoint is out
+    /// `horizon` control steps of demonstration, or [`None`] when this block's waypoint is out
     /// of reach -- which ends the episode as a failed demonstration rather than driving
     /// somewhere close (spec 17.2).
     ///
@@ -579,8 +577,13 @@ impl ScriptedExpert {
     ) -> Option<Vec<Vec<f64>>> {
         let cube = self.cube_pose(model, state, env)?;
         let grasp = *self.grasp.get_or_insert(cube);
-        let (target, pitch, grip) = self.waypoint(grasp);
-        let solution = so101_ik(&self.links, target, pitch)?;
+        // Past the last block, its command is held.
+        let (waypoint, wait) = self.plan[self.block.min(self.plan.len() - 1)];
+        let grip = match waypoint.grip() {
+            Grip::Open => self.cfg.grip_open,
+            Grip::Closed => self.cfg.grip_closed,
+        };
+        let solution = so101_ik(&self.links, waypoint.tool(grasp), waypoint.pitch())?;
 
         let qpos = state.qpos_of(env);
         let horizon = self.cfg.horizon.max(1) as usize;
@@ -631,15 +634,15 @@ impl ScriptedExpert {
             }
         }
 
-        self.stage_tick += 1;
-        let advance = match self.stage {
-            Stage::Close | Stage::Release => self.stage_tick >= self.cfg.close_ticks,
-            Stage::Done => false,
-            _ => reached,
-        };
+        self.block_tick += 1;
+        let advance = self.block < self.plan.len()
+            && match wait {
+                Some(steps) => self.block_tick >= steps,
+                None => reached,
+            };
         if advance {
-            self.stage = self.stage.next();
-            self.stage_tick = 0;
+            self.block += 1;
+            self.block_tick = 0;
         }
         Some(rows)
     }
@@ -699,32 +702,20 @@ pub fn state_of_row<'a>(model: &ModelInfo, row: &'a [f64]) -> StateView<'a> {
 }
 
 /// The demo's own tuning, measured on the oracle server against
-/// `tests/fixtures/mjcf/so101_pick_place.xml` (packet M5/V1): these values put every cube the
-/// Task IR's `Randomization` node can draw into the bin.
+/// `tests/fixtures/mjcf/so101_pick_place.xml` (packet M5/V1): with the built-in program
+/// ([`Program::builtin`], which holds what the demonstration aims at since packet M14/Q1) these
+/// values put every cube the Task IR's `Randomization` node can draw into the bin.
 ///
 /// Not a default `impl`: they describe *this* scene, and a second scene wants its own.
 #[must_use]
 pub fn demo_cfg(cube_joint: StableId) -> ExpertCfg {
     ExpertCfg {
         cube_joint,
-        // The bin's interior centre, at the height the arm carries and releases at -- above
-        // the wall top, so the carried cube clears it on the way in.
-        bin_center: Vec3::new(0.14, -0.10, 0.14),
-        drop_height: 0.06,
-        hover_height: 0.045,
-        // Five millimetres below the cube's centre: the jaws grip a band around their own
-        // tips, and the cube is 40 mm tall.
-        grasp_depth: -0.005,
-        // Not straight down: at -90 degrees the far half of the cube's draw leaves
-        // `wrist_flex`'s range, and the closed form refuses rather than approximating.
-        approach_pitch: -85.0 * DEG_TO_RAD,
-        carry_pitch: -45.0 * DEG_TO_RAD,
         // Wide open, not just wide enough: a jaw holding the 30 mm cube stalls at about 0.30,
         // so an opening the Task IR's success predicate can tell apart from "still holding it"
         // has to be well clear of that (packet M5/V1).
         grip_open: 0.9,
         grip_closed: -0.05,
-        close_ticks: 25,
         // 0.01 rad is about two millimetres at the tool. Looser than that and the arm starts
         // its descent while still a jaw-clearance away from over the cube, and shoves it
         // (measured, packet M5/V1).
@@ -735,6 +726,8 @@ pub fn demo_cfg(cube_joint: StableId) -> ExpertCfg {
         accel_max: 0.0072,
         horizon: 16,
         execute: 10,
+        // The demo deployment's control rate; `pace_to` reads the one it is driven at.
+        control_hz: 50.0,
     }
 }
 
@@ -862,9 +855,8 @@ mod tests {
             .find(|j| j.name == "cube_free")
             .expect("the fixture has a cube")
             .id;
-        let mut cfg = demo_cfg(cube);
-        cfg.close_ticks = 3;
-        let expert = ScriptedExpert::new(&scene, cfg).expect("the fixture builds an expert");
+        let expert =
+            ScriptedExpert::new(&scene, demo_cfg(cube)).expect("the fixture builds an expert");
         let mut model = model_of(expert.links(), cube);
         for (i, a) in scene.actuators.iter().enumerate() {
             model
@@ -890,44 +882,80 @@ mod tests {
         let cube = Vec3::new(0.24, 0.0, 0.02);
         let frozen = row(cube, [0.0; 6]);
         let state = state_of_row(&model, &frozen);
-        assert_eq!(expert.stage(), Stage::Approach);
+        assert_eq!((expert.block(), expert.stage()), (0, Stage::Move));
         for _ in 0..20 {
             let ctrl = expert.action(&model, &state, 0).expect("reachable");
             assert_eq!(ctrl.len(), 6);
-            assert_eq!(expert.stage(), Stage::Approach, "a frozen state moved on");
+            assert_eq!(expert.block(), 0, "a frozen state moved on");
         }
 
-        // A robot that follows the commanded ramp walks the stages, in order, exactly once
+        // A robot that follows the commanded ramp walks the blocks, in order, exactly once
         // each. The expert commands a ramp rather than a step (design note section 7.5), so a
         // waypoint takes several steps to reach -- what is pinned here is the order, not the
         // count.
         let mut joints = [0.0; 6];
-        let mut seen = vec![expert.stage()];
+        let mut seen = vec![(expert.block(), expert.stage())];
         for _ in 0..4000 {
             let at = row(cube, joints);
             let ctrl = expert
                 .action(&model, &state_of_row(&model, &at), 0)
                 .expect("reachable");
             joints = [ctrl[0], ctrl[1], ctrl[2], ctrl[3], ctrl[4], ctrl[5]];
-            if *seen.last().expect("non-empty") != expert.stage() {
-                seen.push(expert.stage());
+            let now = (expert.block(), expert.stage());
+            if *seen.last().expect("non-empty") != now {
+                seen.push(now);
             }
             if expert.stage() == Stage::Done {
                 break;
             }
         }
+        let (mv, close, open, done) = (Stage::Move, Stage::Close, Stage::Open, Stage::Done);
         assert_eq!(
             seen,
             vec![
-                Stage::Approach,
-                Stage::Descend,
-                Stage::Close,
-                Stage::Lift,
-                Stage::Transport,
-                Stage::Lower,
-                Stage::Release,
-                Stage::Done,
+                (0, mv),
+                (1, mv),
+                (2, close),
+                (3, mv),
+                (4, mv),
+                (5, mv),
+                (6, open),
+                (7, done)
             ]
+        );
+    }
+
+    /// A `wait` is counted in the expert's own steps -- one per `chunk`, every `execute` control
+    /// ticks -- and one that is not a whole number of them is refused, never rounded.
+    #[test]
+    fn a_wait_is_whole_steps() {
+        let scene = fixture();
+        let cube = scene
+            .joints
+            .iter()
+            .find(|j| j.name == "cube_free")
+            .expect("the fixture has a cube")
+            .id;
+        // The built-in's 5 s at 50 Hz, re-planning every 10 ticks: 25 steps.
+        let expert = ScriptedExpert::new(&scene, demo_cfg(cube)).expect("builds");
+        assert_eq!(expert.plan[2].1, Some(25));
+        assert_eq!(expert.plan[6].1, Some(25));
+        let mut program = Program::builtin();
+        program.blocks[2].wait = Some(0.3);
+        let refused = ScriptedExpert::with_program(&scene, demo_cfg(cube), &program);
+        assert!(
+            matches!(refused, Err(ProgramError::Wait { block: 2, .. })),
+            "{refused:?}"
+        );
+        program.blocks[2].wait = Some(0.4);
+        let two = ScriptedExpert::with_program(&scene, demo_cfg(cube), &program).expect("0.4 s");
+        assert_eq!(two.plan[2].1, Some(2));
+        // The object is the body the expert reads, by name.
+        program.object = "bin".into();
+        let wrong = ScriptedExpert::with_program(&scene, demo_cfg(cube), &program);
+        assert!(
+            matches!(wrong, Err(ProgramError::UnknownObject(_))),
+            "{wrong:?}"
         );
     }
 
@@ -961,7 +989,7 @@ mod tests {
         expert.reset();
         let c = aim(&mut expert, &second);
         assert_ne!(a[0], c[0], "reset re-plans from the new cube");
-        assert_eq!(expert.stage(), Stage::Approach);
+        assert_eq!(expert.block(), 0);
     }
 
     /// Packet M5/V1c: `reset` also drops the ramp's integrator, so the first chunk of an

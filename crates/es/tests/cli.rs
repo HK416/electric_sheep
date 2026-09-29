@@ -7946,13 +7946,9 @@ fn the_temporal_ensemble_survives_the_grasp_window() {
         log.len()
     );
     for stage in [
-        es_env::Stage::Approach,
-        es_env::Stage::Descend,
+        es_env::Stage::Move,
         es_env::Stage::Close,
-        es_env::Stage::Lift,
-        es_env::Stage::Transport,
-        es_env::Stage::Lower,
-        es_env::Stage::Release,
+        es_env::Stage::Open,
     ] {
         if let Some(at) = log.iter().position(|(s, ..)| *s == stage) {
             println!("  {stage:?} opens at tick {at}");

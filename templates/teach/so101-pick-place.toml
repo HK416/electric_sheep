@@ -1,0 +1,76 @@
+# The demonstration program `so101-pick-place` (packet M14/Q1, `docs/packets/M14/plan-q.md`;
+# `docs/design/editor-redesign.md` section 11): what the scripted demonstrator does, block by
+# block. `es loop collect --expert so101-pick-place` runs this file, compiled into `es-env`
+# (`es_env::program::SO101_PICK_PLACE`), so it is the one source of the demo's numbers. Until
+# packet M14/Q1 they were `demo_cfg`'s seven stages; `tests/golden/expert/so101-pick-place-chunks.json`
+# pins that this file reproduces them bit for bit.
+#
+# Not an IR (spec 5.1 rule 6): the demonstrator's recipe. What is not the person's to change --
+# the joint tolerance a move counts as reached at, the gripper's open and closed angles, and the
+# pace the Deployment IR's envelope allows -- stays in `es_env::expert::demo_cfg`, so this file
+# says only what to do. The numbers were measured on the oracle server against
+# `tests/fixtures/mjcf/so101_pick_place.xml` (packet M5/V1): they put every cube the Task IR's
+# `Randomization` node can draw into the bin.
+#
+# A move block goes to a point: `"object"` (the cube, where it was when the episode began), a
+# place (a geom stem in the scene; `"bin"` is the bin's floor, its lowest geom) or `[x, y]`.
+# `above` is metres above the target's own centre, `height` metres above the world origin.
+# `pitch` is the tool's pitch in degrees; -90 is straight down. A move is done when the arm has
+# reached it. A grip block holds the previous block's pose, sets the gripper and waits `wait`
+# seconds, which must be a whole number of the demonstrator's steps (one per re-plan: 0.2 s at
+# the demo's 50 Hz control rate, re-planning every 10 ticks). After the last block the
+# demonstrator holds its command until the episode ends.
+
+kind = "demonstration"
+robot = "SO-101"
+object = "cube"
+
+# Approach: above the cube. Not straight down: at -90 degrees the far half of the cube's draw
+# leaves `wrist_flex`'s range, and the closed-form IK refuses rather than approximating.
+[[blocks]]
+move = "object"
+above = 0.045
+pitch = -85
+grip = "open"
+
+# Descend: five millimetres below the cube's centre -- the jaws grip a band around their own
+# tips, and the cube is 40 mm tall.
+[[blocks]]
+move = "object"
+above = -0.005
+pitch = -85
+grip = "open"
+
+# Close, and let the jaws settle on the cube.
+[[blocks]]
+grip = "closed"
+wait = 5.0
+
+# Lift: straight up to the carry height, above the bin's walls. SO-101 cannot hold -90 degrees
+# up there (design note `docs/design/visible-learning.md` section 5.2), so it carries at -45.
+[[blocks]]
+move = "object"
+height = 0.14
+pitch = -45
+grip = "closed"
+
+# Transport: across to the bin at the carry height.
+[[blocks]]
+move = "bin"
+height = 0.14
+pitch = -45
+grip = "closed"
+
+# Lower: into the bin. Released above the wall top, the cube bounces out as often as not
+# (design note section 5.4).
+[[blocks]]
+move = "bin"
+height = 0.06
+pitch = -85
+grip = "closed"
+
+# Release: open wide -- a jaw holding the cube stalls at about 0.30 rad, so the opening the Task
+# IR's success predicate reads has to be well clear of that -- and let it drop.
+[[blocks]]
+grip = "open"
+wait = 5.0
