@@ -3,7 +3,8 @@
 //! [`home`] is the start screen and the new-project dialog (packet M12/Y11).
 //! [`train`] is ③ and ④, a run started, watched and stopped (packet M12/Y12).
 //! [`results`] is ⑤, a finished run read in plain words (packet M12/Y13).
-//! [`scene`] is ① and ②, a template's scene and how it teaches (packet M12/Y15).
+//! [`scene`] is ①, a template's scene, and ② read-only for a project with no program (M12/Y15).
+//! [`teach`] is ②, the demonstration program as blocks, edited and tried once (packet M14/Q4).
 //! [`player`] plays one attempt of an evaluation, for ⑤ and for ③'s checks (packet M13/Z5a).
 //!
 //! Compiled only, never run by CI (`docs/design/editor-shell.md` section 2): every branch that
@@ -16,6 +17,7 @@ pub mod player;
 pub mod results;
 pub mod scene;
 pub mod shell;
+pub mod teach;
 pub mod train;
 
 use eframe::egui;

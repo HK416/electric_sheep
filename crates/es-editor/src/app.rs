@@ -85,6 +85,8 @@ pub struct EditorApp {
     pub(crate) previews: crate::ui::train::Previews,
     /// ① and ② between frames: the template's scene, read once per project (packet M12/Y15).
     pub(crate) scene: crate::ui::scene::State,
+    /// ② between frames: the program being edited and its try (packet M14/Q4).
+    pub(crate) teach: crate::ui::teach::State,
     /// Frames of the selected cell's filmstrip, keyed `<cell>#<index>`.
     pub(crate) run_frames: BTreeMap<String, egui::TextureHandle>,
     /// The scene the replay poses (packet M7/E2). A run directory does not carry one, so it
@@ -155,6 +157,7 @@ impl EditorApp {
             results: crate::ui::results::State::default(),
             previews: crate::ui::train::Previews::default(),
             scene: crate::ui::scene::State::default(),
+            teach: crate::ui::teach::State::default(),
             run_frames: BTreeMap::new(),
             scene_path: String::new(),
             frames_path: String::new(),
@@ -457,6 +460,8 @@ impl eframe::App for EditorApp {
         }
         // ③ and ④: the open project's run (packet M12/Y12).
         crate::ui::train::tick(self, ctx);
+        // ②: a try's own child (packet M14/Q4).
+        crate::ui::teach::tick(self);
 
         // A dropped file goes through the same function the path field does (packet M7/E3):
         // one way in means one set of errors out.

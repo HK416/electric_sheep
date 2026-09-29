@@ -269,7 +269,12 @@ impl TabViewer for Panes<'_> {
         if crate::ui::train::draw(app, ui, *pane) {
             return;
         }
-        // ① and ② draw their own step panel, centre and summary (packet M12/Y15).
+        // ② draws its program's blocks, the try and the inspector (packet M14/Q4).
+        if crate::ui::teach::draw(app, ui, *pane) {
+            return;
+        }
+        // ① draws its own step panel, centre and summary, and ② for a project with no program
+        // (packet M12/Y15).
         if crate::ui::scene::draw(app, ui, *pane) {
             return;
         }
