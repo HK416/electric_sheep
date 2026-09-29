@@ -59,8 +59,8 @@ in-process: nothing here re-implements what `es loop collect`, `es train`, `es e
   [eval.preview]  episodes = 4, suite = <the first>, frames = true      # optional
   [showcase] cell, eye, look_at, fov, width, height
 
-With [eval.preview], each checkpoint gets a short test as soon as its bundle is on disk -- on the
-lerobot route while `lerobot-train` is still running: this same `es`, as a child process, runs
+With [eval.preview], each checkpoint gets a short test as soon as its bundle is on disk, while
+the trainer is still running (the last mark after it exits): this same `es`, as a child, runs
 `es eval run --jobs 1` on the bundle under a document derived from [eval] config (that suite
 alone, its first `episodes` seeds, the same metrics, **no acceptance**), written to
 <out>/preview/<mark>/evaluation.toml with the run's artifacts and `eval.log` beside it. One
