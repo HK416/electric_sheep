@@ -7,7 +7,7 @@
 //! **in-process** — they are functions in this module's siblings — and the only subprocess is
 //! the Python trainer, which is exactly where spec 2.3 draws the line.
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -640,7 +640,7 @@ pub(crate) fn run(
                 if let Some(p) = watch.publisher.as_deref_mut() {
                     p.train_begin(recipe.run.steps);
                 }
-                summary = spawn(step, route, &mut watch)?;
+                summary = spawn(step, route, recipe.run.batch, &mut watch)?;
             }
             StepKind::PolicyPack => {
                 crate::cmd::policy::pack(&step.args)?;
@@ -835,8 +835,14 @@ print(json.dumps(d))
 /// With a publisher the captured path becomes a *streamed* one: the same stdout, read line by
 /// line so a `{"progress": ...}` line reaches a viewer while the run is still going. The
 /// summary is still the last line and still parsed the same way, which is what keeps
-/// `training.lock` byte-identical (packet M7/E7).
-fn spawn(step: &Step, route: Route, watch: &mut TrainWatch<'_>) -> Result<Value, CliError> {
+/// `training.lock` byte-identical (packet M7/E7). `lerobot-train` prints no such line, so
+/// with a publisher its console is relayed and read instead (packet M12/R2).
+fn spawn(
+    step: &Step,
+    route: Route,
+    batch: Option<u32>,
+    watch: &mut TrainWatch<'_>,
+) -> Result<Value, CliError> {
     let capture = route.captures_trainer_stdout();
     let mut cmd = Command::new(&step.prefix[0]);
     cmd.args(&step.prefix[1..]).args(&step.args);
@@ -860,6 +866,10 @@ fn spawn(step: &Step, route: Route, watch: &mut TrainWatch<'_>) -> Result<Value,
             out.status.code(),
             serde_json::from_str(last).unwrap_or(Value::Null),
         )
+    } else if let Some(p) = watch.publisher.as_deref() {
+        let status =
+            stream_lerobot(&mut cmd, p, batch).map_err(|e| bad(format!("{}{e}", named())))?;
+        (status.success(), status.code(), Value::Null)
     } else {
         let status = cmd.status().map_err(|e| bad(format!("{}{e}", named())))?;
         (status.success(), status.code(), Value::Null)
@@ -1078,4 +1088,217 @@ fn from_hex(text: &str) -> Option<[u8; 32]> {
         .filter_map(|i| u8::from_str_radix(text.get(i * 2..i * 2 + 2)?, 16).ok())
         .collect();
     bytes.try_into().ok()
+}
+
+// --- `lerobot-train`'s console (packet M12/R2) ------------------------------------------
+
+/// What one `\r`- or `\n`-delimited piece of `lerobot-train`'s console says. tqdm's bar and
+/// the logger both write stderr, so a metric line can land on the end of the bar it
+/// interrupted, in the same piece.
+#[derive(Debug, Default, PartialEq)]
+struct LerobotSaid {
+    /// `Training:  70%|███████   | 3510/5000 [03:51<01:39, 14.94step/s]`: the exact step, the
+    /// total, and steps per second once tqdm has measured one.
+    tqdm: Option<(u64, u64, Option<f64>)>,
+    /// `… step:3K smpl:26K ep:49 epch:0.25 loss:0.131 grdn:12.233 lr:1.0e-04 …`, every
+    /// `log_freq` steps. Its `step:` is abbreviated and is not read.
+    loss: Option<f64>,
+    lr: Option<f64>,
+}
+
+fn lerobot_said(piece: &str) -> LerobotSaid {
+    let token = |key: &str| {
+        piece
+            .split_whitespace()
+            .find_map(|t| t.strip_prefix(key)?.parse().ok())
+    };
+    LerobotSaid {
+        tqdm: training_bar(piece),
+        loss: token("loss:"),
+        lr: token("lr:"),
+    }
+}
+
+/// The training bar only: the pretrained backbone's download is a tqdm bar too.
+fn training_bar(piece: &str) -> Option<(u64, u64, Option<f64>)> {
+    let bar = piece.split_once("Training:")?.1;
+    let (counts, timing) = bar.splitn(3, '|').nth(2)?.trim_start().split_once(" [")?;
+    let (step, total) = counts.split_once('/')?;
+    let rate = timing.split_once(", ")?.1.split(']').next()?.trim();
+    let rate = match (rate.strip_suffix("step/s"), rate.strip_suffix("s/step")) {
+        (Some(per_s), _) => per_s.parse().ok(),
+        (_, Some(s_per)) => s_per.parse().ok().map(|s: f64| 1.0 / s),
+        _ => None,
+    };
+    Some((step.parse().ok()?, total.parse().ok()?, rate))
+}
+
+/// The latest bar, and the stream-5 rows the metric lines complete.
+#[derive(Default)]
+struct LerobotProgress {
+    step: Option<u64>,
+    rate: Option<f64>,
+}
+
+impl LerobotProgress {
+    /// `[step, loss, lr, samples_per_s]` when this piece gives a loss and a bar has already
+    /// given the exact step; nothing otherwise, never a stand-in for the loss.
+    fn read(&mut self, piece: &str, batch: Option<u32>) -> Option<[f64; 4]> {
+        let said = lerobot_said(piece);
+        if let Some((step, _, rate)) = said.tqdm {
+            (self.step, self.rate) = (Some(step), rate);
+        }
+        Some([
+            self.step? as f64,
+            said.loss?,
+            said.lr.unwrap_or(f64::NAN),
+            self.rate
+                .zip(batch)
+                .map_or(f64::NAN, |(r, b)| r * f64::from(b)),
+        ])
+    }
+}
+
+/// Copies one of the trainer's pipes to ours as it arrives, byte for byte, and hands each
+/// `\r`- or `\n`-delimited piece on. It keeps draining after a failed write, so the trainer
+/// never blocks on a full pipe.
+fn relay(mut from: impl Read, mut to: impl Write, mut on_piece: impl FnMut(String)) {
+    let (mut buf, mut piece) = ([0u8; 4096], Vec::new());
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let _ = to.write_all(&buf[..n]).and_then(|()| to.flush());
+        for &b in &buf[..n] {
+            if b != b'\r' && b != b'\n' {
+                piece.push(b);
+            } else if !piece.is_empty() {
+                on_piece(String::from_utf8_lossy(&piece).into_owned());
+                piece.clear();
+            }
+        }
+    }
+    if !piece.is_empty() {
+        on_piece(String::from_utf8_lossy(&piece).into_owned());
+    }
+}
+
+/// `lerobot-train` with someone watching: both pipes relayed to ours and read for the bar and
+/// the metric lines, which become stream 5. Nothing it prints is written anywhere new.
+fn stream_lerobot(
+    cmd: &mut Command,
+    publisher: &Publisher,
+    batch: Option<u32>,
+) -> std::io::Result<std::process::ExitStatus> {
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    if let Some(out) = child.stdout.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || relay(out, std::io::stdout(), |p| drop(tx.send(p))));
+    }
+    if let Some(err) = child.stderr.take() {
+        let tx = tx.clone();
+        std::thread::spawn(move || relay(err, std::io::stderr(), |p| drop(tx.send(p))));
+    }
+    drop(tx);
+    // Ends when both relays have seen their pipe close.
+    let mut progress = LerobotProgress::default();
+    for piece in rx {
+        if let Some(row) = progress.read(&piece, batch) {
+            publisher.train_row(row);
+        }
+    }
+    child.wait()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{lerobot_said, relay, LerobotProgress, LerobotSaid};
+
+    // Copied from a real `lerobot-train` 0.6.1 run (Y-V item 1, `target/yv/cube-cam/runs/001/
+    // es.log`). tqdm and the logger both write stderr, so a metric line lands on the end of
+    // the bar it interrupted, with no separator between them.
+    const BAR: &str = "Training:  70%|███████   | 3510/5000 [03:51<01:39, 14.94step/s]";
+    const METRIC: &str = "INFO 2026-09-29 11:29:52 ot_train.py:641 step:3K smpl:26K ep:49 \
+                          epch:0.25 loss:0.131 grdn:12.233 lr:1.0e-04 updt_s:0.062 \
+                          data_s:0.001 smp/s:127 mem_gb:0.94 l1_loss:0.092 kld_loss:0.004";
+    const BAR_THEN_METRIC: &str = "Training:  64%|██████▍   | 3200/5000 [03:31<01:55, \
+                                   15.62step/s]INFO 2026-09-29 11:29:52 ot_train.py:641 \
+                                   step:3K smpl:26K ep:49 epch:0.25 loss:0.131 grdn:12.233 \
+                                   lr:1.0e-04 updt_s:0.062 data_s:0.001 smp/s:127 \
+                                   mem_gb:0.94 l1_loss:0.092 kld_loss:0.004";
+    const FIRST: &str = "Training:   0%|          | 0/5000 [00:00<?, ?step/s]INFO 2026-09-29 \
+                         11:26:21 ot_train.py:597 Start offline training on a fixed dataset, \
+                         with effective batch size: 8";
+    const DOWNLOAD: &str = " 84%|████████▎ | 37.4M/44.7M [00:00<00:00, 58.9MB/s]";
+    const RUN: &str = "\rTraining:   0%|          | 1/5000 [00:12<17:29:51, 12.60s/step]\
+                       \rTraining:   0%|          | 3/5000 [00:12<4:36:11,  3.32s/step] \
+                       \rTraining:   0%|          | 5/5000 [00:12<2:17:01,  1.65s/step]";
+
+    #[test]
+    fn the_tqdm_form_is_step_total_rate() {
+        let said = lerobot_said(BAR);
+        assert_eq!(said.tqdm, Some((3510, 5000, Some(14.94))));
+        assert_eq!(said.loss, None);
+        // Before tqdm has a rate it prints `?step/s`: the step is known, the rate is not.
+        assert_eq!(lerobot_said(FIRST).tqdm, Some((0, 5000, None)));
+    }
+
+    #[test]
+    fn the_metric_form_is_loss_and_lr() {
+        let said = lerobot_said(METRIC);
+        assert_eq!(
+            said,
+            LerobotSaid {
+                tqdm: None,
+                loss: Some(0.131),
+                lr: Some(1.0e-4),
+            }
+        );
+        // Both in one piece, the way stderr carries them.
+        let both = lerobot_said(BAR_THEN_METRIC);
+        assert_eq!(both.tqdm, Some((3200, 5000, Some(15.62))));
+        assert_eq!((both.loss, both.lr), (Some(0.131), Some(1.0e-4)));
+    }
+
+    #[test]
+    fn a_piece_with_neither_says_nothing() {
+        // The pretrained backbone's download bar is a tqdm bar too, but not the training one.
+        assert_eq!(lerobot_said(DOWNLOAD), LerobotSaid::default());
+        let start = &FIRST[FIRST.find("INFO").unwrap()..];
+        assert_eq!(lerobot_said(start), LerobotSaid::default());
+        assert_eq!(lerobot_said(""), LerobotSaid::default());
+    }
+
+    #[test]
+    fn a_run_of_tqdm_updates_the_last_one_wins() {
+        // `\r\n`: the Windows log's own line end after a metric line.
+        let console = format!("{RUN}\r{METRIC}\r\n");
+        let (mut echoed, mut progress, mut rows) = (Vec::new(), LerobotProgress::default(), vec![]);
+        relay(console.as_bytes(), &mut echoed, |p| {
+            rows.extend(progress.read(&p, Some(8)));
+        });
+        // What the trainer wrote reaches the console byte for byte.
+        assert_eq!(echoed, console.as_bytes());
+        // `1.65s/step` is 1 / 1.65 steps per second, times the batch of 8.
+        assert_eq!(rows, [[5.0, 0.131, 1.0e-4, (1.0 / 1.65) * 8.0]]);
+    }
+
+    #[test]
+    fn a_metric_line_before_any_bar_is_no_row_yet() {
+        let mut progress = LerobotProgress::default();
+        assert_eq!(progress.read(METRIC, Some(8)), None);
+        assert_eq!(
+            progress.read(BAR, Some(8)),
+            None,
+            "a bar alone carries no loss"
+        );
+        assert_eq!(
+            progress.read(METRIC, Some(8)),
+            Some([3510.0, 0.131, 1.0e-4, 14.94 * 8.0])
+        );
+    }
 }

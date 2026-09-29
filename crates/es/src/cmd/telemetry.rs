@@ -398,18 +398,24 @@ impl Publisher {
         let (Some(step), Some(loss)) = (at("step"), at("loss")) else {
             return;
         };
+        self.train_row([
+            step,
+            loss,
+            at("lr").unwrap_or(f64::NAN),
+            at("samples_per_s").unwrap_or(f64::NAN),
+        ]);
+    }
+
+    /// One `[step, loss, lr, samples_per_s]` row on stream 5, from whichever trainer said it:
+    /// a `{"progress": ...}` line, or `lerobot-train`'s console (packet M12/R2).
+    pub(crate) fn train_row(&self, row: [f64; 4]) {
         self.send(Frame {
             // `last` is `None` on a training run, so this is tick zero; naming the type would
             // mean taking `es-core` as a dependency of this crate for one constructor.
             tick: self.last.map_or_else(Default::default, |e| e.tick),
             wall_ns: wall_ns(),
             stream: STREAM_TRAIN,
-            payload: Payload::Scalars(vec![
-                step,
-                loss,
-                at("lr").unwrap_or(f64::NAN),
-                at("samples_per_s").unwrap_or(f64::NAN),
-            ]),
+            payload: Payload::Scalars(row.to_vec()),
         });
     }
 
