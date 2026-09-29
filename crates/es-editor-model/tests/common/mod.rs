@@ -356,6 +356,7 @@ fn learning_graph() -> LearningGraph {
             frozen: false,
             out_dim: feat,
             token_count: 0,
+            share: None,
         },
     );
     g.insert(

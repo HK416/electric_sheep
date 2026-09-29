@@ -940,16 +940,21 @@ pub struct LearningGraph {
 
 **Encoder**
 ```
-VisionEncoder { backbone, pretrained, frozen, out_dim, token_count }
+VisionEncoder { backbone, pretrained, frozen, out_dim, token_count, share? }
     backbone = ResNet18 | ResNet34 | ViT{size} | DINOv2 | SigLIP | SmolVLM | Custom(hash)
+    share    = 이 인코더가 가중치를 쓰는 VisionEncoder의 노드 id (부재 = 공유 없음)
 StateEncoder { kind, out_dim }          MLP | Identity
 LanguageEncoder { tokenizer, model, max_len }
 ```
 
+**가중치 공유: `share`(패킷 M15/N5).** 뷰마다 자기 `VisionEncoder` 노드와 입력 하나를 그대로 두고(인코더 입력은 하나, `LRN-002`), `share = <노드 id>`로 가중치를 쓰는 인코더를 가리킨다. lowering은 모듈 하나를 만들어 각 뷰에 적용한다. `share`는 그룹의 소유자를 가리킨다: 존재하는 노드이고, `VisionEncoder`이며, 자기 자신이 아니고, backbone·`out_dim`·`token_count`·`pretrained`·`frozen`이 같고, 스스로는 `share`가 없다(연쇄 없음, 그룹당 소유자 하나). 하나라도 어기면 `LRN-033`으로 거부한다. 관계는 노드 id로 맺으므로 소유자는 공유자보다 앞에 있든 뒤에 있든 상관없다. `NodeId`는 해시 입력이 아니므로(§11.2) `learning_hash`는 `share`를 소유자 → 공유자 간선으로 읽는다. 부재 = 공유 없음 = 오늘의 정규형이라 커밋된 `learning_hash`는 움직이지 않는다.
+
 **Fusion**
 ```
-Concat | CrossAttention | FiLM | AdaLN | TokenConcat
+Concat | CrossAttention | FiLM | AdaLN | TokenConcat | Sum
 ```
+
+**`Sum` 퓨전(패킷 M15/N5).** 출력은 입력의 원소별 합이다. 모든 입력이 노드 자신의 출력과 같은 모양 — 같은 너비, 같은 토큰 수, 그 너비와 같은 `out_dim` — 이어야 하며 어긋나면 `LRN-032`로 거부한다. 인코더가 `share`로 가중치를 공유할 때 `Sum`은 퓨전을 다시 학습하지 않고 뷰 하나를 뺄 수 있게 한다: 남은 항의 의미가 그대로다(`docs/design/multi-camera.md`).
 
 **Temporal**
 ```
@@ -1778,6 +1783,8 @@ dep.fallback("hold_position")
 
 Task.save_bundle("tasks/pick_cube/", task, obs, lrn, dep)
 ```
+
+**`shared=True`는 인코더마다의 `share`로 쓴다(§8.3).** IR에 `shared` 필드는 없다. 빌더는 이미지 입력마다 `VisionEncoder` 노드를 하나씩 만들고, 첫 번째 뷰의 인코더를 소유자로 두고 나머지 인코더에 `share = <소유자의 노드 id>`를 쓴다. 입력 여럿을 받는 인코더 노드는 만들지 않는다.
 
 **빌더는 즉시 실행하지 않는다.** `save_bundle` 또는 `compile` 시점에 IR을 구성하고 Cross-IR Check(§11.1)를 돌린다. 타입 오류는 Python 예외로 올라오되 메시지는 컴파일러와 동일한 진단 형식이다.
 

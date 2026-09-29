@@ -326,6 +326,7 @@ fn example_learning_node(kind: &str) -> Option<LearningNode> {
             frozen: false,
             out_dim: 8,
             token_count: 0,
+            share: None,
         },
         "StateEncoder" => LearningNode::StateEncoder {
             inputs: vec![],
@@ -409,6 +410,13 @@ fn optional_params(kind: &str) -> Vec<ParamSchema> {
             ty: ParamType::String,
             required: false,
             default: Some(toml::Value::String("None".to_owned())),
+        }],
+        // A node id, and no default: absent means "shares nothing" (packet M15/N5).
+        "VisionEncoder" => vec![ParamSchema {
+            name: "share".to_owned(),
+            ty: ParamType::Int,
+            required: false,
+            default: None,
         }],
         _ => Vec::new(),
     }

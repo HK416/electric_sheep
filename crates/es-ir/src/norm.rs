@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use crate::diag::Diagnostic;
 use crate::graph::{Edge, Graph, IrNode, NodeId, PortRef};
 use crate::hash::canonical_order;
-use crate::learning::LearningGraph;
+use crate::learning::{LearningGraph, LearningNode};
 use crate::observation::ObservationIr;
 use crate::task::TaskIr;
 
@@ -49,12 +49,20 @@ pub fn canon_observation(ir: &ObservationIr) -> Result<ObservationIr, Diagnostic
 }
 
 /// Canonical Learning IR. `inputs` / `outputs` are named tensor ports, not node references,
-/// so only `nodes` moves.
+/// so only `nodes` moves — and a `VisionEncoder`'s `share`, which names a node, moves with it.
 pub fn canon_learning(g: &LearningGraph) -> Result<LearningGraph, Diagnostic> {
-    Ok(LearningGraph {
-        nodes: canon_graph(&g.nodes)?,
-        ..g.clone()
-    })
+    let map = canon_map(&g.nodes)?;
+    let mut nodes = relabel(&g.nodes, &map);
+    nodes.edges.sort_unstable();
+    for node in nodes.nodes.values_mut() {
+        if let LearningNode::VisionEncoder {
+            share: Some(owner), ..
+        } = node
+        {
+            *owner = *map.get(owner).unwrap_or(owner);
+        }
+    }
+    Ok(LearningGraph { nodes, ..g.clone() })
 }
 
 fn canon_map<N: IrNode>(g: &Graph<N>) -> Result<BTreeMap<NodeId, NodeId>, Diagnostic> {
