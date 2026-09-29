@@ -185,10 +185,19 @@ fn stages_of(phase: Phase) -> &'static [&'static str] {
     }
 }
 
+/// The stage `state` says runs.
+fn running(state: &PhaseState) -> Option<&str> {
+    match state {
+        PhaseState::Running { stage, .. } => Some(stage.as_str()),
+        _ => None,
+    }
+}
+
 /// One card per stage of `phase`, from the live `stage.begin` / `stage.end` rows and the phase's
 /// state. A stage with no row is done when a later stage has one (a `--from` run skipped it) or
-/// when the phase is, running when the phase says the child is about to begin it (nothing heard
-/// yet), and otherwise still to come. A phase that is done - a failed acceptance included
+/// the phase says a later one runs (attached mid-run: what began before was never heard), or
+/// when the phase is done; running when the phase says the child is about to begin it (nothing
+/// heard yet), and otherwise still to come. A phase that is done - a failed acceptance included
 /// ([`settle`]) - shows every stage that ended as done.
 pub fn cards(
     phase: Phase,
@@ -201,7 +210,11 @@ pub fn cards(
             .chain(EVALUATE_STAGES)
             .position(|s| *s == name)
     };
-    let later = |stage: &str| rows.iter().any(|r| order(&r.name) > order(stage));
+    let later = |stage: &str| {
+        (rows.iter().map(|r| r.name.as_str()))
+            .chain(running(state))
+            .any(|s| order(s) > order(stage))
+    };
     let done = *state == PhaseState::Done;
     stages_of(phase)
         .iter()
@@ -784,12 +797,11 @@ impl Watch {
     ) -> View {
         let child = self.child(launch);
         let rows = telemetry.live.stages();
-        let stage = rows
-            .iter()
-            .rev()
-            .find(|r| r.running())
-            .map(|r| r.name.as_str());
         let state = phases[Phase::ALL.iter().position(|p| *p == phase).unwrap_or(0)].clone();
+        // Attached mid-stage, its `stage.begin` was never heard: the phase's state names it.
+        let stage = (rows.iter().rev().find(|r| r.running()))
+            .map(|r| r.name.as_str())
+            .or(running(&state));
         let train = &telemetry.train;
         let running = launch.pid().is_some();
         let checking = matches!(self.dial, Dial::Dialling(_));
@@ -1427,6 +1439,15 @@ mod tests {
                 ("train", CardState::Running)
             ]
         );
+        assert_eq!(
+            cards(Phase::Train, &[], &train),
+            [
+                ("collect", CardState::Done(None)),
+                ("expert-gate", CardState::Done(None)),
+                ("train", CardState::Running)
+            ],
+            "attached mid-train: what began before was never heard"
+        );
         let starting = Running {
             stage: "collect".into(),
             fraction: None,
@@ -1461,6 +1482,30 @@ mod tests {
         for length in LENGTHS {
             assert_ne!(t(Lang::Ko, length_key(length)), length_key(length));
         }
+    }
+
+    /// Attached while training runs, its `stage.begin` never heard: the step bar's running stage
+    /// is what ③'s centre shows - the loss curve - and ④'s stays the picture.
+    #[test]
+    fn attached_mid_train_shows_the_training() {
+        let p = scratch_project("attach-mid-train");
+        let mut watch = Watch::new(&p, Some(repo()));
+        watch.dial = Dial::Attached(Closed::default());
+        let launch = LaunchModel::default();
+        let telemetry = TelemetryModel::default();
+        let now = Instant::now();
+        let running = |stage: &str| Running {
+            stage: stage.into(),
+            fraction: None,
+        };
+        let phases = [Done, Done, running("train"), Locked, Locked];
+        let view = watch.view(Phase::Train, &launch, &telemetry, &phases, now);
+        assert_eq!(view.centre, Centre::Learning);
+        assert_eq!(view.cards[0].1, CardState::Done(None));
+        let phases = [Done, Done, Done, running("eval"), Locked];
+        let view = watch.view(Phase::Evaluate, &launch, &telemetry, &phases, now);
+        assert_eq!(view.centre, Centre::Picture);
+        std::fs::remove_dir_all(&p.root).ok();
     }
 
     /// Review focus 3: a re-opened project dials its unfinished run's address once, and a
