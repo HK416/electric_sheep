@@ -144,10 +144,37 @@ const FAILURE_KINDS: [FailureKind; 8] = [
 
 const SUCCESS: &str = "success";
 
+/// The share of an attempt's steps, in percent, that one of the Safety Plane's step counters
+/// (`fallback` and every `violation.*`: steps, not endings) must cover before it is a cause of
+/// that attempt (review of plan Z, R3).
+///
+/// With a declared latency of one control period no chunk exists at tick 0, so every attempt of
+/// the hint card's first real run -- its successes too -- counted one `fallback`, one
+/// `violation.chunk_underrun` and a few `violation.acceleration` steps while the first chunk
+/// arrived: the start, not why it failed. 1 % of that run's 1,800-step horizon is 18 steps:
+/// above a start-up's handful, far below a policy that fights the envelope (hundreds). On its
+/// 90 failed attempts it leaves "not done in time" on all 90, a safety limit on 43 and the
+/// fallback on the 4 that fell back for 25 to 153 steps, where counting every bucket read 90
+/// fallbacks, 90 motion gaps and 87 safety limits. How an attempt ended (the termination
+/// buckets) and a failure the backend reported (a `FailureKind`) always count.
+const STEP_SHARE_PERCENT: u64 = 1;
+
+/// A Safety Plane step counter, as `es_eval::metrics` names them: counted per step, not per
+/// ending.
+fn per_step(bucket: &str) -> bool {
+    bucket == "fallback" || bucket.starts_with("violation.")
+}
+
 /// One episode's causes, each once however many of its buckets name it; its outcome class, when
-/// there is one, in place of `Timeout`. A failure something else ended keeps that cause.
+/// there is one, in place of `Timeout`. A failure something else ended keeps that cause. A step
+/// counter below [`STEP_SHARE_PERCENT`] of the attempt's steps is no cause, so an attempt whose
+/// only other buckets are that small keeps how it ended.
 fn row_causes(row: &EpisodeRow, outcome: Option<Outcome>) -> BTreeSet<Cause> {
-    let mut causes: BTreeSet<Cause> = row.histogram.keys().filter_map(|b| cause_of(b)).collect();
+    let covers = |n: u64| n.saturating_mul(100) >= row.steps.saturating_mul(STEP_SHARE_PERCENT);
+    let mut causes: BTreeSet<Cause> = (row.histogram.iter())
+        .filter(|(bucket, n)| !per_step(bucket) || covers(**n))
+        .filter_map(|(bucket, _)| cause_of(bucket))
+        .collect();
     if let Some(o) = outcome {
         if causes.remove(&Cause::Timeout) {
             causes.insert(Cause::Outcome(o));
@@ -918,6 +945,63 @@ mod tests {
         assert_eq!(
             causes(&rows, &none()),
             [(Cause::FailureCondition, 1), (Cause::SafetyLimit, 1)]
+        );
+    }
+
+    /// Review R3, in the shape of the hint card's first run: nominal-00's start-up buckets over
+    /// 1,800 steps are no cause -- it keeps how it ended, or its outcome class -- while a
+    /// torque-noise attempt clamped on 800 of its 1,800 steps hit a safety limit.
+    #[test]
+    fn a_step_counter_under_one_percent_of_the_steps_is_no_cause() {
+        fn long(suite: &str, ep: u64, termination: &str, extra: &[(&str, u64)]) -> EpisodeRow {
+            EpisodeRow {
+                steps: 1800,
+                ..row(suite, ep, termination, extra)
+            }
+        }
+        let start = [
+            ("fallback", 1),
+            ("violation.acceleration", 2),
+            ("violation.chunk_underrun", 1),
+        ];
+        let noisy = [
+            ("fallback", 1),
+            ("violation.chunk_underrun", 1),
+            ("violation.velocity", 800),
+        ];
+        let rows = [
+            long("nominal", 0, "timeout", &start),
+            long("torque_noise", 1, "timeout", &noisy),
+            long("nominal", 2, "success", &start),
+        ];
+        assert_eq!(
+            causes(&rows, &none()),
+            [(Cause::Timeout, 2), (Cause::SafetyLimit, 1)]
+        );
+        let left = Cause::Outcome(Outcome::LeftOutside);
+        let classes = Outcomes::from([("nominal-00".to_owned(), Outcome::LeftOutside)]);
+        assert_eq!(causes(&rows[..1], &classes), [(left, 1)]);
+        let picked: Vec<_> = tiles(&rows, TileFilter::Failures, &classes)
+            .iter()
+            .map(|t| t.cause)
+            .collect();
+        assert_eq!(picked, [Some(left), Some(Cause::Timeout)]);
+        // 18 of 1,800 steps is a cause and 17 is not; a failure the backend reported always is.
+        let at = |n| {
+            let extra = [("violation.position", n), ("chunk_underrun", 1)];
+            causes(&[long("nominal", 0, "failure", &extra)], &none())
+        };
+        assert_eq!(
+            at(18),
+            [
+                (Cause::FailureCondition, 1),
+                (Cause::SafetyLimit, 1),
+                (Cause::MotionGaps, 1)
+            ]
+        );
+        assert_eq!(
+            at(17),
+            [(Cause::FailureCondition, 1), (Cause::MotionGaps, 1)]
         );
     }
 
