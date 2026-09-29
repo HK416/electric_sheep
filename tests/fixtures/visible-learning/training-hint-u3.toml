@@ -1,0 +1,70 @@
+# M7/U row U3's run settings with repository-relative paths: the recipe the hint card trains
+# (packet M12/R7, `templates/cube-into-bin-hint.toml`, `cycle-hint-u3.toml`).
+#
+# `training-u3.toml` is the record of the run that passed held-out 0.5625
+# (`docs/design/visible-learning.md` section 7.31) and names the oracle server's paths; it stays
+# as it is. This is that run's `[run]` -- batch 64, lr 4e-4, `warmup_cosine` 250 / 1e-6, seed 0
+# (so the augmentation seed is 0 too), 20,000 steps, cuda -- with four differences:
+#
+#  * Paths. `[dataset]` and `[policy] bundle` are `training.toml`'s `runs/collect-001/...` shape:
+#    `es loop cycle` trains on its own collect output whatever `[dataset]` says, and the editor
+#    writes the project's own `untrained.esb` over `bundle`. That bundle is U3's four documents --
+#    `task.toml`, `observation-augmented.toml`, `learning-pretrained.toml`, `deployment.toml` --
+#    built by `es policy init` from the hint card's `[bundle]`. `es train` bakes it with
+#    `--for-training` and passes `--augmentation` on its own, because the augmentation chain is
+#    a property of the bundle's Observation IR, not of this document (see `training-u3.toml`).
+#  * `interpreter = "python"`: `ES_PYTHON` overrides it, as everywhere.
+#  * `checkpoint_at` is the hint card's `medium` preset, so this cycle's dry run is the medium
+#    run. U3 saved at 20,000 only; `train_act.py` does nothing at a mark but write a checkpoint,
+#    so the extra 1,000 and 5,000 marks leave the 20,000-step weights on U3's trajectory.
+#  * **No `extra = ["--resident-gpu"]`.** The flag moves the whole baked set onto the card (it
+#    changes where tensors live and never the numbers: `train_act.py`'s loss curve is
+#    bit-identical without it). Measured, it does not fit a 12 GB card with 200 demonstrations:
+#    `es loop collect --episodes 200 --seed 1` writes 103,881 frames today, and the committed-
+#    observation bake of those frames on this PC (RTX 3060 12 GB, the hint card's first run,
+#    `docs/packets/M12/YV-verification.md`) is 10,963.7 MiB, 10,956.2 of it `rgb_overhead` F32
+#    [3, 96, 96]. U3's `--for-training` bake stops at the `Pad(4)` boundary, [3, 104, 104], so it
+#    is (104/96)^2 larger: 12,865.8 MiB -- more than the card's 12,288 MiB before the model,
+#    AdamW's state, the activations and the CUDA context. U3 fitted because V15's 36,960 frames
+#    were 4,577.6 MiB on a 24 GB card. Without the flag the set stays in host RAM (64 GB here).
+#
+# `base_model` is torchvision's ImageNet ResNet18 as `python/es/fetch_backbone.py` writes it,
+# under `target/` (never committed; `target/lerobot-cache/` is the same kind of fetched file).
+# Neither `es train` nor the editor fetches it: without it the train stage stops at
+# `Backbone::verify`'s refusal, after collect and the expert gate. Once per checkout, from the
+# repository root, with an interpreter that has torchvision and blake3 (the project venv does):
+#
+#   "$ES_PYTHON" python/es/fetch_backbone.py --arch resnet18 --out target/backbone \
+#       --expect 8511928e7ca6e3b07355e8b66284294ba692093fd0dfe246cdf96a6c9e801899
+#
+# The first time, torchvision downloads `resnet18-f37072fd.pth` (45 MB, BSD-3-Clause). On this PC
+# (torchvision 0.26.0+cu128, Windows) it wrote the pinned blake3, 46,805,551 bytes, 2026-09-29.
+#
+# **The length is U3's and the data is not.** U3 trained 20,000 steps on V15's 36,960 frames,
+# 34.6 epochs; on today's 103,881 frames 20,000 steps are 12.3 epochs, and that run -- U3'', the
+# same settings on today's own 200 demonstrations, `visible-learning.md` section 7.36 -- scored
+# held-out 0/16. The card's `long` preset, 60,000 steps, is 37.0 epochs: the length comparable to
+# U3's. How long the cycle recipe should train is an open owner decision (`docs/reviews/M10.md`).
+#
+# `es train --recipe <this> --out <dir> --dry-run` needs neither the dataset, the bundle, the
+# backbone nor Python.
+
+kind = "training"
+
+[dataset]
+root   = "runs/collect-001/ds"
+frames = "runs/collect-001/frames"
+
+[policy]
+bundle     = "runs/collect-001/untrained.esb"
+base_model = "target/backbone/resnet18-imagenet1k-v1.safetensors"
+
+[run]
+steps         = 20000
+batch         = 64
+lr            = 4e-4
+seed          = 0
+checkpoint_at = [1000, 5000, 20000]
+device        = "cuda"
+interpreter   = "python"
+schedule      = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }

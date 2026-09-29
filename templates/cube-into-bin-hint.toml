@@ -1,13 +1,23 @@
-# The cube template, with the cube's position (packet M12/Y5b; `docs/design/editor-redesign.md`
+# The cube template, with the cube's position (packets M12/Y5b, R7; `docs/design/editor-redesign.md`
 # sections 4 and 6.2): the same SO-101, cube, bin and scripted demonstrator as
-# `cube-into-bin.toml`, on the committed IR route -- `cycle.toml`: the IR-graph policy of
-# `learning.toml` trained by `training.toml` on `observation.toml`, judged by `evaluation.toml`.
-# `observation.toml`'s third port is `sim_cube_pose`, the simulator-privileged cube pose no real
-# robot reports, so the card is for practice and says so (`notice`). With that pose in the input
-# this task has passed held-out: LeRobot's ACT 15/16 (packets M5/V19, V19b) and the IR-graph
-# policy 0.5625 (M7/U3, with `learning-pretrained.toml` and `observation-augmented.toml`).
-# This card's own recipe (`training.toml` on `learning.toml`) has not been measured; U0, the same
-# documents at other settings, scored 0.25. The notice therefore claims no success.
+# `cube-into-bin.toml`, on the IR route with the one IR-graph combination that has passed the
+# demo's acceptance -- M7/U row U3 (`docs/design/visible-learning.md` section 7.31, held-out
+# 0.5625): `learning-pretrained.toml` (ImageNet ResNet18 backbone, fine-tuned) on
+# `observation-augmented.toml` (random shift and colour jitter while training), U3's run settings
+# (`training-hint-u3.toml`), judged by `evaluation-augmented.toml` -- `evaluation.toml` with only
+# `observation` moved (`cycle-hint-u3.toml`). The observation's third port is `sim_cube_pose`, the
+# simulator-privileged cube pose no real robot reports, so the card is for practice and says so
+# (`notice`).
+#
+# The notice still claims no success. U3 trained on V15's 36,960 frames; the same 200
+# demonstrations are 103,881 frames today, and U3's 20,000 steps on them (U3'', section 7.36)
+# scored held-out 0/16 -- `training-hint-u3.toml`'s header has the arithmetic. `long` is the
+# length comparable to U3's in epochs; it has not been run.
+#
+# One thing `needs` cannot say: the training stage reads the ImageNet weights from
+# `target/backbone/`, fetched once per checkout by `python/es/fetch_backbone.py` (the command is
+# in `training-hint-u3.toml`'s header). `es --check-deps` does not report them, and a `needs`
+# name the probe does not report counts as missing, which would disable the card.
 #
 # Every path is a committed document, relative to the repository root, and none is copied (see
 # `cube-into-bin.toml`).
@@ -20,24 +30,25 @@ notice = "template.cube_into_bin_hint.notice"    # es-editor i18n key: practice 
 robot = "SO-101"
 method = "blocks"
 needs = ["mujoco", "torch", "vulkan", "render"]
-cycle = "tests/fixtures/visible-learning/cycle.toml"
+cycle = "tests/fixtures/visible-learning/cycle-hint-u3.toml"
 scene = "tests/fixtures/mjcf/so101_pick_place.xml"
 demonstrations = 200
 
-# The bundle `es policy init` builds for `[collect] policy` -- the documents the expert
-# demonstrations have been collected under since plan V. On this route it is also what
-# `training.toml`'s `[policy] bundle` trains: `learning.toml` is the architecture. The cycle's
-# expert gate judges it by `evaluation.toml`, which names `observation.toml`.
+# The bundle `es policy init` builds for `[collect] policy`: U3's four documents. It is also what
+# `training-hint-u3.toml`'s `[policy] bundle` trains (`learning-pretrained.toml` is the
+# architecture), and the cycle's expert gate judges it by `evaluation-augmented.toml`, which
+# names `observation-augmented.toml` (`XIR-040`). Its declared latency is `learning.toml`'s, so
+# the demonstrator collects exactly as under the camera-only card's bundle.
 [bundle]
 task        = "tests/fixtures/visible-learning/task.toml"
-observation = "tests/fixtures/visible-learning/observation.toml"
-learning    = "tests/fixtures/visible-learning/learning.toml"
+observation = "tests/fixtures/visible-learning/observation-augmented.toml"
+learning    = "tests/fixtures/visible-learning/learning-pretrained.toml"
 deployment  = "tests/fixtures/visible-learning/deployment.toml"
 
 # Training length presets: the `[run] checkpoint_at` series; the last mark is the length. The IR
 # route's rule is only that every mark is an optimizer step of the run (`Recipe::marks`):
 # `train_act.py` saves at each one, so no mark has to divide another.
-#   medium  `training.toml`'s own marks.
+#   medium  `training-hint-u3.toml`'s own marks: U3's 20,000 steps.
 #   short   and long keep its marks and change only the length, to the camera-only card's 5,000
 #           and 60,000 steps, so the two cards' three lengths are the same three lengths.
 [lengths]

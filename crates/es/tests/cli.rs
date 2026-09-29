@@ -8370,14 +8370,33 @@ fn policy_init_is_deterministic_and_the_bundle_opens() {
     es_compile::PolicyBundle::open(&a).expect("the bundle opens");
 }
 
+/// The second of the expert gate's two checks on a bundle `PolicyBundle::open` accepted:
+/// `es_ir::cross::check` with the Evaluation IR at `evaluation` (`XIR-040`), errors only.
+fn gate_errors(bundle: &es_compile::PolicyBundle, evaluation: &Path) -> Vec<String> {
+    let raw = std::fs::read_to_string(evaluation).expect("the evaluation document");
+    let eval_ir = es_ir::serial::evaluation_from_toml(&raw).expect("it parses");
+    es_ir::cross::check(&es_ir::cross::IrBundle {
+        task: &bundle.task,
+        observation: &bundle.observation,
+        learning: &bundle.learning,
+        deployment: &bundle.deployment,
+        evaluation: Some(&eval_ir),
+    })
+    .into_iter()
+    .filter(es_ir::diag::Diagnostic::is_error)
+    .map(|d| d.to_string())
+    .collect()
+}
+
 /// Packet M12/Y5b. The camera-only template's collect bundle -- `es policy init` on
 /// `observation-v8.toml` with no `--learning` -- passes the checks the vision cycle's expert gate
 /// makes before it opens any backend. The gate is `es eval run` (`crates/es/src/cmd/eval.rs`,
 /// `run`), and before a backend is probed it does two things with the bundle: `PolicyBundle::open`,
 /// which re-runs the four-IR cross pass (`XIR-010`), then `es_ir::cross::check` with the
 /// Evaluation IR (`XIR-040`), keeping the errors. This test makes those same two calls in process,
-/// so it needs no Python. The hint template's bundle is the control: the same check accepts it
-/// under its own `evaluation.toml` and refuses it under `evaluation-v8.toml`.
+/// so it needs no Python. `cycle.toml`'s IR-route bundle (`observation.toml`, `learning.toml`) is
+/// the control: the same check accepts it under its own `evaluation.toml` and refuses it under
+/// `evaluation-v8.toml`.
 #[test]
 fn policy_init_without_learning_makes_a_bundle_the_v8_gate_accepts() {
     let dir = scratch_dir("policy-init-v8");
@@ -8400,21 +8419,8 @@ fn policy_init_without_learning_makes_a_bundle_the_v8_gate_accepts() {
         let bytes = std::fs::read(dir.join(out)).expect("the bundle was written");
         es_compile::PolicyBundle::open(&bytes).expect("the bundle opens (XIR-010 included)")
     };
-    let gate = |bundle: &es_compile::PolicyBundle, evaluation: &str| -> Vec<String> {
-        let raw = std::fs::read_to_string(train_root().join(fixture(evaluation)))
-            .expect("the evaluation document");
-        let eval_ir = es_ir::serial::evaluation_from_toml(&raw).expect("it parses");
-        es_ir::cross::check(&es_ir::cross::IrBundle {
-            task: &bundle.task,
-            observation: &bundle.observation,
-            learning: &bundle.learning,
-            deployment: &bundle.deployment,
-            evaluation: Some(&eval_ir),
-        })
-        .into_iter()
-        .filter(es_ir::diag::Diagnostic::is_error)
-        .map(|d| d.to_string())
-        .collect()
+    let gate = |bundle: &es_compile::PolicyBundle, evaluation: &str| {
+        gate_errors(bundle, &train_root().join(fixture(evaluation)))
     };
 
     let camera = init("camera.esb", "observation-v8.toml", None);
@@ -8434,6 +8440,98 @@ fn policy_init_without_learning_makes_a_bundle_the_v8_gate_accepts() {
         )
     };
     assert_eq!(ticks(&camera), ticks(&hint));
+}
+
+// --- packet M12/R7: the hint card on M7/U row U3's documents --------------------------------
+
+/// The hint card's cycle: `cycle.toml` with U3's recipe and the Evaluation IR U3 was judged by.
+const CYCLE_HINT_U3_RECIPE: &str = "tests/fixtures/visible-learning/cycle-hint-u3.toml";
+
+/// Regenerates `tests/golden/train/plan-cycle-hint-u3.txt`. Run once, explicitly; it is then
+/// read-only (spec 1.4), exactly like `generate_cycle_vision_golden` above.
+#[test]
+#[ignore = "golden generator; run explicitly"]
+fn generate_cycle_hint_u3_golden() {
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP generate_cycle_hint_u3_golden: set ES_GENERATE_GOLDENS=1 to regenerate");
+        return;
+    }
+    let dir = scratch_dir("cycle-hint-u3-golden");
+    let out = run_cycle(CYCLE_HINT_U3_RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    write(&train_golden("plan-cycle-hint-u3.txt"), &stdout(&out));
+}
+
+/// The stage plan the editor launches for the hint card, pinned: U3's recipe on the IR route
+/// (`--init-backbone`, the warmup-cosine schedule, no `--resident-gpu`) and
+/// `evaluation-augmented.toml` for both the expert gate and the eval stage.
+#[test]
+fn cycle_hint_u3_dry_run_matches_its_golden() {
+    let dir = scratch_dir("cycle-hint-u3-dry");
+    let out = run_cycle(CYCLE_HINT_U3_RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let golden = train_golden("plan-cycle-hint-u3.txt");
+    let want =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(stdout(&out), want, "the stage plan is not the golden");
+}
+
+/// Packet M12/R7, oracle 2. `es policy init` from the hint card's `[bundle]`, read from
+/// `templates/cube-into-bin-hint.toml` itself, builds a bundle the gate of the card's own cycle
+/// accepts: `PolicyBundle::open` (`XIR-010`), then `XIR-040` against its `[eval] config` -- the
+/// two calls of `policy_init_without_learning_makes_a_bundle_the_v8_gate_accepts`, no Python.
+/// Controls: `evaluation.toml` refuses the bundle, and the card's Evaluation IR is
+/// `evaluation.toml` with only `observation` moved.
+#[test]
+fn cycle_hint_u3_gate_accepts_the_bundle_policy_init_builds() {
+    let root = train_root();
+    let read =
+        |p: &Path| std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    let card: toml::Value = toml::from_str(&read(&root.join("templates/cube-into-bin-hint.toml")))
+        .expect("the hint card parses");
+    let word = |v: &toml::Value| v.as_str().expect("a path").to_owned();
+    assert_eq!(word(&card["cycle"]), CYCLE_HINT_U3_RECIPE);
+    let cycle = es_data::training::Cycle::parse(&read(&root.join(CYCLE_HINT_U3_RECIPE)))
+        .expect("the cycle parses");
+
+    let dir = scratch_dir("policy-init-hint-u3");
+    let docs = &card["bundle"];
+    let o = bin()
+        .current_dir(&root)
+        .args(["policy", "init"])
+        .args(["--task", &word(&docs["task"])])
+        .args(["--observation", &word(&docs["observation"])])
+        .args(["--learning", &word(&docs["learning"])])
+        .args(["--deployment", &word(&docs["deployment"])])
+        .arg("--out")
+        .arg(dir.join("hint.esb"))
+        .output()
+        .expect("run es policy init");
+    assert_eq!(o.status.code(), Some(0), "{}", stderr_of(&o));
+    let bytes = std::fs::read(dir.join("hint.esb")).expect("the bundle was written");
+    let hint = es_compile::PolicyBundle::open(&bytes).expect("the bundle opens (XIR-010 included)");
+
+    let card_eval = root.join(&cycle.eval.config);
+    assert_eq!(gate_errors(&hint, &card_eval), Vec::<String>::new());
+    let refused = gate_errors(&hint, &vl_fixture("evaluation.toml"));
+    assert!(refused.iter().any(|d| d.contains("XIR-040")), "{refused:?}");
+
+    // No suite, seed, metric or threshold moved: put `observation` back and it is evaluation.toml.
+    let parse = |p: &Path| es_ir::serial::evaluation_from_toml(&read(p)).expect("it parses");
+    let (mut moved, committed) = (parse(&card_eval), parse(&vl_fixture("evaluation.toml")));
+    assert_ne!(moved.observation, committed.observation);
+    moved.observation.clone_from(&committed.observation);
+    assert_eq!(moved, committed);
+
+    // The demonstrator drives through the chunk buffer under the bundle's declared latency, so
+    // the card collects under the timing both cards have always collected under (Y5b).
+    let learning = es_ir::serial::learning_from_toml(&read(&vl_fixture("learning.toml")))
+        .expect("learning.toml");
+    let ticks = |ms| es_env::latency_ticks(ms, hint.deployment.rate.control);
+    assert_eq!(
+        ticks(hint.learning.policy.contract.runtime.expected_latency_ms),
+        ticks(learning.policy.contract.runtime.expected_latency_ms)
+    );
 }
 
 /// Oracle 4. One real cycle on the demo fixtures: a 2-episode expert collect, the harness on
@@ -9587,6 +9685,61 @@ fn generate_augmented_observation_fixture() {
          observation-augmented.toml {}",
         hex(&base.observation_hash().expect("committed hash")),
         hex(&obs.observation_hash().expect("augmented hash")),
+    );
+}
+
+const EVALUATION_AUGMENTED_HEADER: &str = "\
+# Evaluation IR (spec 10) for a policy fed through observation-augmented.toml -- packet M12/R7.
+#
+# Generated by `cargo test -p es --test cli -- --ignored generate_augmented_evaluation_fixture`;
+# the committed evaluation.toml with `observation` replaced by observation-augmented.toml's own
+# hash. Same 16 held-out seeds 101-116, same six suites, same perturbation parameters, same
+# metrics, same acceptance (`success_rate >= 0.5` on nominal) -- a diff with the field put back
+# is empty, and `cycle_hint_u3_gate_accepts_the_bundle_policy_init_builds` checks exactly that.
+#
+# It is the document M7/U row U3 was judged by (docs/design/visible-learning.md sections 7.31
+# and 7.36: `evaluation-augmented.toml` on the oracle server, re-generated by M10/W0b with the
+# moved `task`). U3's bundle carries observation-augmented.toml, not observation.toml: the
+# augmentation is a property of the bundle's Observation IR, disabled in evaluation (INV-15),
+# where the Pad/RandomCrop pair lowers to the deterministic centre crop -- and an Evaluation IR
+# names the observation it judges (XIR-040). A separate document rather than a widened one, for
+# spec 13.3's reason: a report under it is not chained to a report under evaluation.toml.
+";
+
+/// Regenerates `tests/fixtures/visible-learning/evaluation-augmented.toml` from the committed
+/// `task.toml` and `observation-augmented.toml` (packet M12/R7), and prints its hash. Run
+/// explicitly:
+///
+///     cargo test -p es --test cli -- --ignored generate_augmented_evaluation_fixture
+#[test]
+#[ignore = "fixture generator; run explicitly"]
+fn generate_augmented_evaluation_fixture() {
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!(
+            "SKIP generate_augmented_evaluation_fixture: set ES_GENERATE_GOLDENS=1 to regenerate"
+        );
+        return;
+    }
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let task = es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml");
+    let obs = es_ir::serial::observation_from_toml(&read("observation-augmented.toml"))
+        .expect("observation-augmented.toml");
+    let evaluation = demo_evaluation_ir(
+        hex(&task.task_hash().expect("task hash")),
+        hex(&obs.observation_hash().expect("observation hash")),
+    );
+    let diags = evaluation.validate();
+    assert!(diags.is_empty(), "{diags:?}");
+    write(
+        &vl_fixture("evaluation-augmented.toml"),
+        &format!(
+            "{EVALUATION_AUGMENTED_HEADER}\n{}",
+            es_ir::serial::evaluation_to_toml(&evaluation).expect("evaluation-augmented toml")
+        ),
+    );
+    println!(
+        "evaluation_hash {} (evaluation-augmented)",
+        hex(&evaluation.evaluation_hash().expect("evaluation hash"))
     );
 }
 
