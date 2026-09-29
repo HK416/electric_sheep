@@ -466,7 +466,12 @@ IR's own perturbations instead of a widened randomization (no new document field
   `lift_m` above where it started → *never lifted*; otherwise *lifted but left outside*. The
   target region is the box of the renderer's triangles for the geoms of that stem, at the scene's
   pose. An attempt with no trajectory has no class, and a failure something else ended keeps its
-  own cause.
+  own cause. Follow-up R4 (found on the first real run: the cube was in the bin at tick 451 of
+  1,800, the gripper never opened past 0.09 rad): with the optional `[outcome] release = { joint,
+  above }`, an attempt that ends inside while that joint (its `qpos` in the trajectory, at the
+  index the scene's joint order gives) never went past `above` after the object last went in is
+  *put in but never let go*, asked before *too late*. Both cube templates use the Task IR's own
+  success threshold, `gripper` 0.85.
 - **Collection under perturbations (Z2).** `es loop collect --perturb <evaluation.toml> --suites
   a,b` runs episode i under `suites[i % n]` through the same `PerturbationPlan` `es eval run`
   uses, under the same Safety Plane, on per-episode seeds `seed..seed+N` that must miss every

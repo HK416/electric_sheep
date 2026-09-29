@@ -55,6 +55,17 @@ pub struct OutcomeSpec {
     pub lift_m: f64,
     pub object_name: String,
     pub target_name: String,
+    /// Absent: an object that ends inside the target is always *too late* (packet M13/R4).
+    pub release: Option<Release>,
+}
+
+/// `[outcome] release` (packet M13/R4): the scene joint whose opening lets the object go, and
+/// the position it must pass for the task to count the object as let go.
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Release {
+    pub joint: String,
+    pub above: f64,
 }
 
 /// One `templates/<id>.toml`. `name`, `summary` and `notice` (what the card warns about, such
@@ -241,6 +252,9 @@ mod tests {
                 ("outcome.cube", "outcome.bin"),
                 "{id}"
             );
+            // Packet M13/R4: let go = the gripper past the Task IR's own 0.85 rad.
+            let r = o.release.as_ref().expect("[outcome] release");
+            assert_eq!((r.joint.as_str(), r.above), ("gripper", 0.85), "{id}");
             for lang in Lang::ALL {
                 for key in [&o.object_name, &o.target_name] {
                     assert_ne!(Strings::get(lang).t(key), key, "{id}: {key}");

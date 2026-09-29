@@ -56,9 +56,10 @@ pub enum Cause {
 }
 
 impl Cause {
-    pub const ALL: [Cause; 14] = [
+    pub const ALL: [Cause; 15] = [
         Cause::Outcome(Outcome::NeverLifted),
         Cause::Outcome(Outcome::LeftOutside),
+        Cause::Outcome(Outcome::NotReleased),
         Cause::Outcome(Outcome::InsideTooLate),
         Cause::Timeout,
         Cause::FailureCondition,
