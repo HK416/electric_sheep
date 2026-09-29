@@ -892,14 +892,27 @@ print(json.dumps(d))
         ))
     })?;
     if !out.status.success() {
+        // The exit status too: a process the OS ends (an access violation, a failed DLL load)
+        // leaves no Python traceback, and an empty message says nothing (review M14 N-5).
         return Err(bad(format!(
-            "{interpreter} cannot import what the {} route needs:\n{}",
+            "{interpreter} cannot import what the {} route needs ({}):\n{}",
             route.as_str(),
+            exit_words(out.status),
             String::from_utf8_lossy(&out.stderr).trim_end()
         )));
     }
     serde_json::from_slice(&out.stdout)
         .map_err(|e| bad(format!("{interpreter}: the probe printed {e}")))
+}
+
+/// An exit status in words, the Windows NTSTATUS in hex where it is one (0xC0000005 is an
+/// access violation, 0xC0000135 a DLL that did not load).
+fn exit_words(status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) if code < 0 => format!("exit status 0x{:08X}", code as u32),
+        Some(code) => format!("exit status {code}"),
+        None => "ended by a signal".to_owned(),
+    }
 }
 
 /// Runs the one subprocess. `capture` is for `train_act.py`, whose whole report is a single
