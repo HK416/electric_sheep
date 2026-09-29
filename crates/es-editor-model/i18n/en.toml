@@ -161,6 +161,8 @@
 "cause.never_lifted.advice" = "The robot never picked the object up. More demonstrations, or a longer training run, usually teach it to grasp."
 "cause.left_outside" = "The {} was lifted but ended outside the {}"
 "cause.left_outside.advice" = "The robot picked the object up but did not leave it where it belongs. More demonstrations usually teach it where to carry it."
+"cause.not_released" = "The {} reached the {}, but was never let go"
+"cause.not_released.advice" = "The robot carried the object where it belongs but never opened the gripper to let it go. When letting go is only a moment of each demonstration, the robot learns it late. In ② Teach, wait longer after opening the gripper, or train longer."
 "cause.inside_too_late" = "The {} reached the {}, but too late"
 "cause.inside_too_late.advice" = "The object ended where it belongs, but not before time ran out. A longer training run usually makes the robot quicker."
 

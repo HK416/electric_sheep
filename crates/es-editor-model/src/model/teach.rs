@@ -452,7 +452,7 @@ impl World {
 }
 
 /// `qpos` values a joint takes: `MuJoCo`'s layout, in the scene's joint order.
-fn width(kind: JointKind) -> usize {
+pub(crate) fn width(kind: JointKind) -> usize {
     match kind {
         JointKind::Free => 7,
         JointKind::Ball => 4,

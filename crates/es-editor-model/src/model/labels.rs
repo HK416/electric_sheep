@@ -109,6 +109,7 @@ pub fn cause_key(cause: Cause) -> &'static str {
     match cause {
         Cause::Outcome(Outcome::NeverLifted) => "cause.never_lifted",
         Cause::Outcome(Outcome::LeftOutside) => "cause.left_outside",
+        Cause::Outcome(Outcome::NotReleased) => "cause.not_released",
         Cause::Outcome(Outcome::InsideTooLate) => "cause.inside_too_late",
         Cause::Timeout => "cause.timeout",
         Cause::FailureCondition => "cause.failure_condition",
@@ -129,6 +130,7 @@ pub fn cause_advice_key(cause: Cause) -> &'static str {
     match cause {
         Cause::Outcome(Outcome::NeverLifted) => "cause.never_lifted.advice",
         Cause::Outcome(Outcome::LeftOutside) => "cause.left_outside.advice",
+        Cause::Outcome(Outcome::NotReleased) => "cause.not_released.advice",
         Cause::Outcome(Outcome::InsideTooLate) => "cause.inside_too_late.advice",
         Cause::Timeout => "cause.timeout.advice",
         Cause::FailureCondition => "cause.failure_condition.advice",
