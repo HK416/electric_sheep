@@ -127,9 +127,23 @@ What the first real runs found, each fixed and merged before the numbers above:
 **Item 2 — `episodes.json` agrees with `report.json`: yes**, exactly, in all six suites of both
 runs (successes ÷ rows = `success_rate`).
 
-**Item 5 (partly)** — the lengths in minutes, short preset, this PC: hint ≈ 39 min end to end;
+**Item 6 (partly)** — the lengths in minutes, short preset, this PC: hint ≈ 39 min end to end;
 camera-only ≈ 50 min without the interruptions.
 
+**Item 7 — the two cards collect the same demonstrations: no.** Compared episode by episode
+(`collect/ds` of both runs above, same seeds, 200 episodes): none of the 200 is identical. Every
+one agrees up to tick 70–80 (median 80), where the demonstrator's *commanded* action first
+differs — by 0.008 rad on three joints in episode 3 — with the observed state still equal; the
+state follows one tick later, and 197 of 200 episodes keep the same length. Both sets are 200/200
+successful, so neither card is worse for it, but Y5b's claim (the same demonstrator run exactly as
+under the IR-route bundle) does not hold. The cause is not investigated; the templates' comments
+now say what was measured.
+
+**The hint card after R7.** The card now trains M7/U row U3 (packet P-M12-R7). Its `medium` is
+U3's own 20,000 steps, which on today's 200 demonstrations (103,881 frames, 2.8× V15's) scored
+held-out 0/16 — U3″, `docs/design/visible-learning.md` section 7.36 — so `medium` is expected not
+to pass; `long` (60,000 steps) is the length comparable to U3's in epochs and is the one plan Z's
+Z7 runs.
+
 Not yet run: items 3 (evaluate-so-far, the process tree on Stop), 4 (the light's thresholds on a
-recorded run), 6 (medium/long), 7 (the two cards' demonstrations compared), 8 (the whole flow by
-hand).
+recorded run), 6 (medium/long), 8 (the whole flow by hand).
