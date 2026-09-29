@@ -1,0 +1,62 @@
+# Plan N's experiment 1, the one-view arm (packet M15/N1, docs/packets/M15/plan-n.md,
+# docs/design/multi-camera.md section 4): the hint card's cycle, `cycle-hint-u3.toml`, camera only
+# -- the overhead camera and the arm's joints, no `sim_cube_pose` -- on the three-camera scene.
+# What differs from it, and nothing else does:
+#
+# * `scene` is so101_pick_place_views.xml: the demo scene plus the `wrist` and `side` cameras,
+#   which this arm's policy does not read. It is the scene of task-views.toml, the Task IR both
+#   arms carry, so this arm collects exactly the demonstrations the three-view arm collects
+#   (cycle-views.toml) and one collection can serve both.
+# * `[train] recipe` is training-cam.toml: U3's run settings, value for value.
+# * `[eval] config` is evaluation-cam.toml: evaluation-augmented.toml's suites, seeds 101-116,
+#   metrics and `success_rate >= 0.5`, naming task-views.toml and observation-cam.toml.
+# * `[eval.preview]` at its defaults: a short test of each checkpoint while training runs.
+#
+# `cargo test -p es --test views views_recipes_and_cycles_mirror_the_hint_card` holds all of that.
+# The same 200 expert demonstrations on seed 1, the same expert gate, the same showcase camera.
+#
+# `[collect] policy` is the bundle `es policy init` builds from the arm's four documents -- the
+# committed deployment.toml among them, which names no camera:
+#
+#   es policy init --task tests/fixtures/visible-learning/task-views.toml \
+#       --observation tests/fixtures/visible-learning/observation-cam.toml \
+#       --learning tests/fixtures/visible-learning/learning-cam.toml \
+#       --deployment tests/fixtures/visible-learning/deployment.toml \
+#       --out runs/collect-001/untrained.esb
+#
+# `policy_init_builds_each_arms_bundle_and_the_gate_accepts_it` (crates/es/tests/views.rs) builds
+# it and makes the expert gate's two checks on it.
+#
+# Collecting and evaluating under a Task IR with three image channels is plan N's packet N2; until
+# it lands only `--dry-run` is meaningful here. `es loop cycle --recipe
+# tests/fixtures/visible-learning/cycle-cam.toml --out <dir> --dry-run` needs neither the
+# dataset, the bundle, the backbone nor Python.
+
+kind  = "cycle"
+scene = "tests/fixtures/mjcf/so101_pick_place_views.xml"
+
+[collect]
+policy   = "runs/collect-001/untrained.esb"
+expert   = "so101-pick-place"
+episodes = 200
+seed     = 1
+frames   = true
+
+[train]
+recipe = "tests/fixtures/visible-learning/training-cam.toml"
+
+[eval]
+config     = "tests/fixtures/visible-learning/evaluation-cam.toml"
+checkpoint = "last"
+jobs       = 6
+frames     = true
+
+[eval.preview]
+
+[showcase]
+cell    = "nominal-00"
+eye     = [0.66, -0.46, 0.52]
+look_at = [0.14, -0.04, 0.04]
+fov     = 36
+width   = 1280
+height  = 720

@@ -1,0 +1,20 @@
+{
+  "derivative": "so101_pick_place_views.xml",
+  "derived_from": "so101_pick_place.xml",
+  "derived_from_blake3": "94d7fa5fa07e3d0ba23774151bc6cb12339f0882a2e3480cf18e9577043f86ad",
+  "upstream": "so101_pick_place.PROVENANCE.json (google-deepmind/mujoco_menagerie robotstudio_so101/so101.xml at commit ac6b2b09983786f3036cab1000221017fa2193b4, Apache-2.0)",
+  "license": "Apache-2.0",
+  "license_file": "so101_pick_place.LICENSE",
+  "packet": "docs/packets/M15/plan-n.md, Task N1 (design note docs/design/multi-camera.md, owner decision 6.4: three cameras, as in MAD)",
+  "derivation": [
+    "Carried over unchanged from so101_pick_place.xml: every element and attribute -- the bodies, geoms, joints, inertials, actuators, <option>, <compiler>, <default> and the `overhead` camera. Only XML comments differ, and two <camera> elements are added. crates/es/tests/views.rs::the_views_scene_is_the_demo_scene_plus_two_cameras proves it: with the two cameras removed the parsed scene hashes to so101_pick_place.xml's scene_hash, which covers every entity (spec 5.3), and the overhead camera keeps its StableId.",
+    "Added `wrist` inside `camera_mount`: pos=\"0.0 0.055 -0.045\" euler=\"-0.57 0 0\", upstream menagerie's own `wrist_cam` pose, which so101_pick_place.xml removed because the demo then had one camera. Upstream's `mode=\"fixed\"`, `resolution`, `sensorsize` and `focal` are not represented by SceneDesc and are not carried (as for the parent derivation). `fovy=\"70\"` is chosen here: upstream's 3.6 mm lens on a 5.76 x 3.24 mm sensor spans about 77 x 48.5 degrees, and a square 96x96 frame at 70 degrees keeps the fixed jaw, the cube below the demonstration's approach waypoint and the bin's rim in view. The camera sits 4 mm clear of the mount's `camera_box2` plate on the side it faces away from.",
+    "Added `side`, fixed to the world: pos=\"0.18 0.40 0.26\" xyaxes=\"-1 0 0 0 -0.447 0.894\" fovy=\"45\". It looks along -Y and 26.6 degrees down, at about (0.18, -0.04, 0.04), so the cube's whole draw (x 0.21-0.27, y -0.03-0.05, z 0.02) and the bin (interior x 0.09-0.19, y -0.15 to -0.05) are in the frame with the arm; image-right is world -X. It complements the top-down `overhead` camera with heights: the lift, the carry and the drop into the bin.",
+    "A camera carries no dynamics: crates/es-physics-backend/src/mjcf_out.rs does not emit cameras, so MuJoCo simulates this scene as it simulates so101_pick_place.xml."
+  ],
+  "measured": "crates/es/tests/views.rs::render::the_cameras_see_the_cube_and_the_wrist_moves_with_the_gripper renders each camera with the CPU reference at 96x96 at five pinned cube positions (the draw's four corners and (0.24, 0.01)) and counts cube-coloured pixels, floor 16: `side` at the Task IR's reset pose 66-107; `wrist` at the approach waypoint (tool 45 mm above the cube, pitch -85 deg) 448-470. At the reset pose the wrist camera looks at the horizon (0 at every position) and the outstretched arm hides most of the draw from `overhead` (0, 21, 3, 29, 0); at the approach waypoint the gripper hides the cube from `overhead` (0 at every position).",
+  "vendored": [
+    "so101_pick_place_views.xml",
+    "so101_pick_place_views.PROVENANCE.json"
+  ]
+}
