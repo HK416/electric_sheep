@@ -9,9 +9,9 @@
 
 상태: 2026-09-28 소유자와 합의(화면과 분할). **S1은 같은 날 구현됐다**(플랜 Y,
 `docs/packets/M12/plan-y.md`, Y1–Y15; 리뷰 `docs/reviews/M12.md`);
-`docs/packets/M12/YV-verification.md`의 실제 실행 전까지는 닫히지 않는다. S2–S6은 방향만
-정해져 있고, 계획 전에 각자 설계를 한 번 더 거친다; S2가 기다리던 `es-editor` 분할은
-끝났다(9절).
+`docs/packets/M12/YV-verification.md`의 실제 실행 전까지는 닫히지 않는다. **S2는 2026-09-29
+구현됐다**(플랜 Z, `docs/packets/M13/plan-z.md`; 10절). S3–S6은 방향만 정해져 있고, 계획 전에
+각자 설계를 한 번 더 거친다.
 
 ## 1. 왜
 
@@ -411,3 +411,50 @@ RL과 손 뻗기 템플릿(S5); 직접 조종(S6); 원격 실행; 설치형 배�
 - **예산:** `es-editor`는 S1 이후 10,000 중 9,715에 있다. S2는 먼저 분할이 필요하다
   (리뷰 S-1, H-2). 패킷 M12/R4가 나눴다(2026-09-29): `es-editor-model`(계층 12, 뷰모델·테스트·
   문자열 표) 6,084, `es-editor`(계층 13, egui 셸) 3,682.
+
+## 10. 구현된 S2 (플랜 Z, 2026-09-29)
+
+플랜 Z(`docs/packets/M13/plan-z.md`, Z1–Z6)는 첫 실제 실행이 방향을 바꾼 뒤 S2를 구현했다: 큐브
+작업은 실패 조건을 선언하지 않으므로 실패한 시도는 모두 시간 초과로 끝나고, "어느 조건이
+걸렸는가"는 아무것도 가리키지 않는다. 5절의 방향과 다른 점은 둘이다: 실패 원인은 물체가 간
+곳에서 읽고, 다시 모으기는 무작위화를 넓히는 대신 Evaluation IR 자신의 교란 아래에서 한다(새
+문서 필드 없음).
+
+- **체크포인트 점검(Z1).** 사이클의 선택적 `[eval.preview]`(`episodes` 4, `suite`는 Evaluation
+  IR의 첫 스위트, `frames` 켬). 체크포인트 번들이 생기자마자 — IR·RL 경로는 표시마다 `es policy
+  pack` 뒤, LeRobot 경로는 `lerobot-train`이 `checkpoints/<NNNNNN>/pretrained_model`을 다 쓴
+  뒤 — `es loop cycle`이 파생된 Evaluation IR(그 스위트, 처음 N개 시드, acceptance 없음)로 `es
+  eval run --jobs 1`을 자식으로 돌려 `<run>/preview/<step>/`에 쓴다. 한 번에 하나씩, 학습기를
+  막지 않는다. 끝난 점검마다 한 행이 `<run>/preview/index.jsonl`에 간다 — 원장이 아니므로 어떤
+  해시 입력도 움직이지 않는다 — 그리고 스트림 1이 `preview.begin` / `preview.end`를 나른다.
+  사이클은 자기 평가 전에 마지막 점검을 기다린다. 에디터가 쓰는 모든 실행에 `[eval.preview]`가
+  있다(템플릿의 사이클에 없으면 `write_run`이 넣는다). 커밋된 사이클과 그 골든은 그대로다.
+- **③이 보여 준다(Z5a).** 걸음 수 칩 한 줄, 보이는 점검의 제목("점검: 1번 성공 / 전체 4번 —
+  1000걸음 때"), 그리고 그 첫 실패를 재생하는 시도 재생기 — Z5a부터 ⑤와 공유(`ui/player.rs`).
+  손실 곡선 위의 점이 점검을 표시하고, 누르면 그 점검을 고른다. 점검은 아무것도 판정하지
+  않는다(§13.3): 그 수치는 acceptance와 비교되지 않는다.
+- **왜 실패했는가, 물체가 간 곳에서(Z4a).** 템플릿의 `[outcome]`(`object`, `target` 접두,
+  `lift_m`, 두 언어의 두 이름)이 시간 초과로 끝난 시도를 그 `.estraj`로 나눈다: 마지막에 목표
+  영역 안 → *너무 늦게 들어감*; 아니면 시작 위치보다 `lift_m` 위로 한 번도 오르지 않음 → *들어
+  올리지 못함*; 아니면 *들어 올렸지만 밖에 남음*. 목표 영역은 그 접두의 지오메트리에 대해
+  렌더러가 만든 삼각형의 상자이고, 장면의 자세 기준이다. 궤적이 없는 시도는 분류가 없고, 다른
+  것이 끝낸 실패는 자기 원인을 유지한다.
+- **교란 아래 수집(Z2).** `es loop collect --perturb <evaluation.toml> --suites a,b`는 에피소드
+  i를 `suites[i % n]` 아래에서, `es eval run`이 쓰는 같은 `PerturbationPlan`으로, 같은 Safety
+  Plane 아래에서 돌린다. 에피소드별 시드 `seed..seed+N`은 Evaluation IR의 모든 시드를 피해야
+  한다(이름을 대며 거부, §13.3). `meta/perturbations.jsonl`이 에피소드마다 스위트를 적는다.
+  관측 나이를 배포의 `stale_observation` 감시 한도 너머로 늘릴 수 있는 스위트는 거부된다 —
+  수집기는 그 나이를 plane에 넘길 수 없기 때문이다.
+- **"다시" 사이클(Z3).** `[collect] perturb = { config, suites }`, `[collect] merge = [roots]`
+  (합치기 단계: `es loop distill`로 `collect/merged`에, 전부 학습용, 프레임 타일은 합친 순서로
+  배치; 합친 루트를 학습한다), `[train] init`(IR·RL 경로: `[init] policy`; LeRobot 경로:
+  `--policy.path`).
+- **"실패 위주로 다시 학습"(Z4b).** ⑤의 버튼이 다음 실행을 쓰고 시작한다: `perturb`는 이전
+  실행의 `[eval] config`와 그 성공률이 가장 낮은 스위트들(동률이면 모두); 시드는 프로젝트의
+  모든 실행 뒤에서 시작해 평가의 시드를 건너뛴다; `merge`는 사슬의 이전 데이터셋 루트 전부
+  (`collect/merged`는 절대 아님); `init`은 이전 평가가 판정한 체크포인트로, 원장의
+  `policy_hash`에서 찾는다. 같은 Evaluation IR이 새 실행을 판정하므로 두 보고서를 비교할 수
+  있다. 실행에 설정 파일이 없거나, 모은 것이 없거나, 평가나 실패가 없거나, 체크포인트가
+  사라졌으면 버튼은 이유와 함께 꺼진다.
+- **S2 이후 예산:** `es-editor-model` 6,582줄(목표 6,000 초과, 상한 아래), `es-editor` 3,842,
+  `es` 6,543.

@@ -339,13 +339,22 @@ relies on.
 2. Episodes are re-indexed `0..N` in input order, then by original index — a total order, so
    two runs of the same inputs produce byte-identical parquet.
 3. `meta/interventions.jsonl` of each input is merged with the episode indices remapped, so
-   labels survive the merge. (An input with no such file contributes none.)
+   labels survive the merge. (An input with no such file contributes none.) Since packet
+   M13/Z3 the same holds for `meta/perturbations.jsonl` (the suite each episode was collected
+   under, packet M13/Z2); a stale one is deleted when no input has any.
 4. `Split::deterministic(N, ratios, seed)` — the existing §19.2 seeded Fisher-Yates cut.
    `train` and `val` take `floor(N * ratio)` and `test` takes the remainder, so the three
    lists are always an exact partition of `0..N`.
 5. `DatasetIdentity::compute` -> `training_identity.json`, `split.json` (the lists themselves,
    so `dataset_split_hash` is reproducible by hand and not only by re-running this function)
    -> a `Distill` `LoopStep`.
+
+**Frame tiles (packet M13/Z3).** Tiles are numbered by position across the whole dataset, so a
+merged root needs its tiles laid out in merged order: `--in-frames <dir>` pairs with the `--in`
+before it and `--frames <dir>` is where they go, hard-linked (copied where a link fails). Every
+offset is computed before a tile moves, so a refused call leaves every tile where it was. `es
+loop cycle`'s merge stage (`[collect] merge`) uses it with `--train 1 --val 0 --test 0`, because
+`es train` trains on every episode of its root.
 
 Ratios are not required to sum to 1: the split function clamps and the remainder lands in
 `test`, which is the conservative direction (a mis-specified ratio shrinks training data

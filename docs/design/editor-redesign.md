@@ -9,8 +9,9 @@ reorganises rather than replaces.
 
 Status: agreed with the owner on 2026-09-28 (screens and decomposition). **S1 implemented the same
 day** (plan Y, `docs/packets/M12/plan-y.md`, Y1–Y15; review `docs/reviews/M12.md`); not closed until the
-real runs of `docs/packets/M12/YV-verification.md`. S2–S6 are directions, each to get its own
-design pass before it is planned; the `es-editor` split S2 waited on is done (section 9).
+real runs of `docs/packets/M12/YV-verification.md`. **S2 implemented 2026-09-29** (plan Z,
+`docs/packets/M13/plan-z.md`; section 10). S3–S6 are directions, each to get its own design pass
+before it is planned.
 
 ## 1. Why
 
@@ -436,3 +437,53 @@ has the findings and the open decisions.
 - **Budget:** `es-editor` is at 9,715 of 10,000 after S1. S2 needs a split first (review S-1, H-2).
   Done by packet M12/R4 (2026-09-29): `es-editor-model` (layer 12, the view-models, tests and
   string tables) at 6,084 and `es-editor` (layer 13, the egui shell) at 3,682.
+
+## 10. S2 as built (plan Z, 2026-09-29)
+
+Plan Z (`docs/packets/M13/plan-z.md`, Z1–Z6) implemented S2 after the first real runs changed its
+direction: the cube tasks declare no failure predicate, so every failed attempt ends as a timeout
+and "which predicate fired" names nothing. Two things differ from the direction in section 5: the
+failure cause is read from where the object went, and a re-collection runs under the Evaluation
+IR's own perturbations instead of a widened randomization (no new document field).
+
+- **Checkpoint previews (Z1).** A cycle's optional `[eval.preview]` (`episodes` 4, `suite` the
+  Evaluation IR's first, `frames` on). As soon as a checkpoint bundle exists — IR and RL routes
+  after `es policy pack` per mark; the LeRobot route once `lerobot-train` has finished writing
+  `checkpoints/<NNNNNN>/pretrained_model` — `es loop cycle` runs `es eval run --jobs 1` as a
+  child on a derived Evaluation IR (that suite, its first N seeds, no acceptance) into
+  `<run>/preview/<step>/`, one at a time and never blocking the trainer. A row per finished
+  preview goes to `<run>/preview/index.jsonl` — not the ledger, so no hash input moves — and
+  stream 1 carries `preview.begin` / `preview.end`. The cycle waits for the last preview before
+  its own eval. Every run the editor writes has `[eval.preview]` (`write_run` adds it when the
+  template's cycle has none), and the committed cycles and their goldens are unchanged.
+- **③ shows them (Z5a).** A row of step chips, the shown preview's headline ("점검: 1번 성공 /
+  전체 4번 — 1000걸음 때"), and the attempt player — shared with ⑤ since Z5a (`ui/player.rs`) —
+  on its first failure. Dots on the loss curve mark the previews and a click picks one. A preview
+  judges nothing (§13.3): its numbers are never compared with the acceptance.
+- **Why it failed, from where the object went (Z4a).** A template's `[outcome]` (`object`, the
+  `target` stem, `lift_m`, and the two names in both languages) classifies each timed-out attempt
+  from its `.estraj`: last seen inside the target region → *got there too late*; otherwise never
+  `lift_m` above where it started → *never lifted*; otherwise *lifted but left outside*. The
+  target region is the box of the renderer's triangles for the geoms of that stem, at the scene's
+  pose. An attempt with no trajectory has no class, and a failure something else ended keeps its
+  own cause.
+- **Collection under perturbations (Z2).** `es loop collect --perturb <evaluation.toml> --suites
+  a,b` runs episode i under `suites[i % n]` through the same `PerturbationPlan` `es eval run`
+  uses, under the same Safety Plane, on per-episode seeds `seed..seed+N` that must miss every
+  seed of the Evaluation IR (refused by name, §13.3); `meta/perturbations.jsonl` records each
+  episode's suite. A suite that could age an observation past the deployment's
+  `stale_observation` watchdog is refused, because the collector cannot hand the plane that age.
+- **The "again" cycle (Z3).** `[collect] perturb = { config, suites }`, `[collect] merge =
+  [roots]` (a merge stage: `es loop distill` into `collect/merged`, all-train, the frame tiles
+  laid out in merged order; the merged root is what trains) and `[train] init` (IR and RL routes:
+  `[init] policy`; LeRobot route: `--policy.path`).
+- **"실패 위주로 다시 학습" (Z4b).** ⑤'s button writes and starts the next run: `perturb` is the
+  previous run's `[eval] config` with its suites of the lowest success rate (all of them on a
+  tie); the seeds start after every run in the project and step past the evaluation's; `merge`
+  is every earlier dataset root of the chain (never a `collect/merged`); `init` is the checkpoint
+  the previous evaluation judged, found from the ledger's `policy_hash`. The same Evaluation IR
+  judges the new run, so the two reports compare. The button is disabled, with the reason, when
+  the run has no recipe, collected nothing, has no evaluation or no failure, or its checkpoint is
+  gone.
+- **Budget after S2:** `es-editor-model` 6,582 lines (over the 6,000 target, under the cap),
+  `es-editor` 3,842, `es` 6,543.

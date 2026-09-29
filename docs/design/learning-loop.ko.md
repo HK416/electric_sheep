@@ -351,13 +351,21 @@ collect 실행당 env가 하나이므로, 스텝마다 정확히 한 번의 `val
    parquet를 만든다.
 3. 각 입력의 `meta/interventions.jsonl`은 에피소드 인덱스가 재매핑된 채로
    병합되어, 라벨이 병합을 살아남는다. (그런 파일이 없는 입력은 아무것도 기여하지
-   않는다.)
+   않는다.) 패킷 M13/Z3부터 `meta/perturbations.jsonl`(에피소드마다 수집 때의 스위트, 패킷
+   M13/Z2)도 똑같이 병합되고, 어느 입력에도 없으면 남아 있던 파일은 지운다.
 4. `Split::deterministic(N, ratios, seed)` — 기존의 §19.2 seed 기반
    Fisher-Yates 절단. `train`과 `val`은 `floor(N * ratio)`를 취하고 `test`는 나머지를
    취하므로, 세 목록은 항상 `0..N`의 정확한 분할(partition)이다.
 5. `DatasetIdentity::compute` -> `training_identity.json`, `split.json`(목록
    그 자체이며, 그래서 `dataset_split_hash`는 이 함수를 다시 실행해야만이 아니라 손으로도
    재현 가능하다) -> `Distill` `LoopStep`.
+
+**프레임 타일(패킷 M13/Z3).** 타일은 데이터셋 전체에서의 위치로 번호가 매겨지므로, 병합된
+루트에는 병합 순서대로 놓인 타일이 필요하다: `--in-frames <dir>`는 바로 앞의 `--in`과 짝을
+이루고 `--frames <dir>`가 놓일 곳이며, 하드 링크로 놓는다(링크가 안 되면 복사). 타일을 옮기기
+전에 모든 오프셋을 계산하므로, 거부된 호출은 모든 타일을 제자리에 둔다. `es loop cycle`의
+합치기 단계(`[collect] merge`)는 이것을 `--train 1 --val 0 --test 0`으로 쓴다 — `es train`은
+루트의 모든 에피소드를 학습하기 때문이다.
 
 비율의 합이 1이어야 할 필요는 없다: 분할 함수는 clamp하고 나머지는 `test`로
 떨어지는데, 이는 보수적인 방향이다(잘못 지정된 비율은 test 데이터를 새어들게 하는 대신
