@@ -15,9 +15,13 @@ use std::path::PathBuf;
 
 use es_compile::PolicyBundle;
 use es_data::rl_import::{Adapter, ImportManifest};
+use es_ir::evaluation::EvaluationIr;
 use es_ir::graph::Graph;
 use es_ir::learning::{ActionExecutionMode, LearningGraph, WeightsRef};
-use es_ir::serial::{deployment_from_toml, observation_from_toml, task_from_toml};
+use es_ir::serial::{
+    deployment_from_toml, evaluation_from_toml, evaluation_to_toml, observation_from_toml,
+    task_from_toml,
+};
 use es_policy::lerobot::{act_policy, remap_checkpoint, ActConfig};
 use es_policy::lower::{lower_to_torch, Contract};
 use es_policy::weights::{parse_header, validate_keys, weights_hash};
@@ -32,6 +36,7 @@ es policy init  --task <t.toml> --observation <o.toml> [--learning <l.toml>]
 es policy lower --policy <in.esb> --out <dir>
 es policy pack  --policy <in.esb> --weights <model.safetensors> --out <out.esb>
 es policy subset --policy <in.esb> --views <name,...> --out <out.esb>
+                 [--evaluation <eval.toml> [--evaluation-out <path>]]
 es policy import-lerobot --checkpoint <dir> --task <t.toml> --observation <o.toml>
                          --deployment <d.toml> --out <out.esb>
 es policy import-rl --manifest <import.json> --weights <w.safetensors>
@@ -81,6 +86,18 @@ subset  Writes a bundle that reads only the named camera views (Learning IR inpu
         do not meet in a Sum fusion, and a dropped view whose encoder feeds anything but one
         Sum term (a Concat, a second consumer) -- dropping it would change what that node
         was trained on.
+
+        The subset reads another Observation IR, so the parent's Evaluation IR no longer
+        judges it (XIR-040). --evaluation <eval.toml> names the document the parent is
+        judged by; the subset is then written with the Evaluation IR it is judged by
+        (packet M15/N8c, docs/design/multi-camera.md section 3.5): the parent's document
+        with only its `task` and `observation` references changed to the subset's hashes --
+        suites, seeds, metrics, acceptance and perturbations are the parent's values,
+        written by the same serializer -- under a header naming the parent document, its
+        evaluation_hash, the parent's policy_hash and the kept views. It goes to
+        --evaluation-out (default: <out> with `.esb` replaced by `.evaluation.toml`).
+        Refused by name, before anything is written, when <eval.toml> does not judge the
+        parent bundle: a wrong parent document is caught there, not carried over.
 
 import-lerobot
         Admits a policy designed and trained **outside** this project -- a LeRobot ACT
@@ -189,6 +206,19 @@ fn parse(args: &[String], flags: &[&str]) -> Result<BTreeMap<String, String>, Cl
     Ok(out)
 }
 
+/// Removes an optional `flag value` pair from `rest`, for `parse` to see the required ones.
+fn take(rest: &mut Vec<String>, flag: &str) -> Result<Option<String>, CliError> {
+    let Some(i) = rest.iter().position(|a| a == flag) else {
+        return Ok(None);
+    };
+    let value = rest
+        .get(i + 1)
+        .cloned()
+        .ok_or_else(|| CliError::Usage(format!("{flag}: missing value\n\n{HELP}")))?;
+    rest.drain(i..=i + 1);
+    Ok(Some(value))
+}
+
 fn open_bundle(path: &str) -> Result<PolicyBundle, CliError> {
     let bytes = std::fs::read(path).map_err(|e| CliError::Runtime(format!("{path}: {e}")))?;
     PolicyBundle::open(&bytes).map_err(|e| CliError::Runtime(format!("{path}: {e}")))
@@ -199,24 +229,13 @@ fn open_bundle(path: &str) -> Result<PolicyBundle, CliError> {
 fn init(args: &[String]) -> Result<u8, CliError> {
     // `--seed` and `--learning` are the optional flags; everything else is `parse`'s required set.
     let mut rest = args.to_vec();
-    let mut take = |flag: &str| -> Result<Option<String>, CliError> {
-        let Some(i) = rest.iter().position(|a| a == flag) else {
-            return Ok(None);
-        };
-        let value = rest
-            .get(i + 1)
-            .cloned()
-            .ok_or_else(|| CliError::Usage(format!("{flag}: missing value\n\n{HELP}")))?;
-        rest.drain(i..=i + 1);
-        Ok(Some(value))
-    };
-    let seed = match take("--seed")? {
+    let seed = match take(&mut rest, "--seed")? {
         Some(value) => value
             .parse::<u64>()
             .map_err(|_| CliError::Usage(format!("--seed {value:?} is not a number\n\n{HELP}")))?,
         None => 0,
     };
-    let learning = take("--learning")?.map(PathBuf::from);
+    let learning = take(&mut rest, "--learning")?.map(PathBuf::from);
     let a = parse(&rest, &["--task", "--observation", "--deployment", "--out"])?;
     let path = |flag: &str| PathBuf::from(&a[flag]);
     let bytes = es_data::training::untrained_bundle(
@@ -347,12 +366,104 @@ pub(crate) fn pack(args: &[String]) -> Result<u8, CliError> {
     Ok(0)
 }
 
-/// `es policy subset` — the same weights reading fewer cameras (packet M15/N8). The rewrite and
+/// The cross-IR pass (spec 11.1) of `bundle` under `ev`, errors only, one per line: what
+/// `es eval run` refuses a policy by before it runs anything.
+fn judges(ev: &EvaluationIr, bundle: &PolicyBundle) -> Result<(), String> {
+    let errors: Vec<String> = es_ir::cross::check(&es_ir::cross::IrBundle {
+        task: &bundle.task,
+        observation: &bundle.observation,
+        learning: &bundle.learning,
+        deployment: &bundle.deployment,
+        evaluation: Some(ev),
+    })
+    .iter()
+    .filter(|d| d.is_error())
+    .map(ToString::to_string)
+    .collect();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("\n"))
+    }
+}
+
+/// The document the subset `sub` (written to `bundle_path`) is judged by, and its
+/// `evaluation_hash` (packet M15/N8c, design note 3.5): the parent document `ev` with `task` and
+/// `observation` naming the subset's IRs, every other field the parent's value, written through
+/// the serializer the committed documents come from, under a header that says so. Refused
+/// unless it judges `sub`.
+fn evaluation_for(
+    parent_doc: &str,
+    mut ev: EvaluationIr,
+    sub: &PolicyBundle,
+    s: &es_policy::subset::Subset,
+    bundle_path: &std::path::Path,
+) -> Result<(String, String), CliError> {
+    let runtime = |e: es_ir::diag::Diagnostic| CliError::Runtime(e.to_string());
+    let parent_hash = hex(&ev.evaluation_hash().map_err(runtime)?);
+    ev.task = hex(&sub.task.task_hash().map_err(runtime)?);
+    ev.observation = hex(&sub.observation.observation_hash().map_err(runtime)?);
+    judges(&ev, sub).map_err(|d| {
+        CliError::Runtime(format!(
+            "{parent_doc} with the subset's references does not judge the subset:\n{d}"
+        ))
+    })?;
+    let body = evaluation_to_toml(&ev).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let header = format!(
+        "# Evaluation IR (spec 10) for {}, written by\n\
+         # `es policy subset` (packet M15/N8c, docs/design/multi-camera.md section 3.5).\n\
+         #\n\
+         # parent document:        {parent_doc}\n\
+         # parent evaluation_hash: {parent_hash}\n\
+         # parent policy_hash:     {}\n\
+         # views kept:             {}\n\
+         #\n\
+         # The parent document with `task` and `observation` changed to this bundle's own\n\
+         # hashes and nothing else: the same suites, seeds, metrics and acceptance, so its\n\
+         # numbers compare with the parent's. It judges the subset bundle, not the parent\n\
+         # (XIR-040, spec 10.4).\n",
+        bundle_path.display(),
+        hex(&s.parent),
+        s.views.join(","),
+    );
+    let hash = hex(&ev.evaluation_hash().map_err(runtime)?);
+    // Laid out as the generated documents are: the header, a blank line, the body.
+    Ok((format!("{header}\n{body}"), hash))
+}
+
+/// `es policy subset` — the same weights reading fewer cameras (packet M15/N8), and with
+/// `--evaluation` the Evaluation IR the subset is judged by (packet M15/N8c). The rewrite and
 /// its rules are `es_policy::subset`'s; this is the file handling around it.
 fn subset(args: &[String]) -> Result<u8, CliError> {
-    let a = parse(args, &["--policy", "--views", "--out"])?;
+    let mut rest = args.to_vec();
+    let evaluation = take(&mut rest, "--evaluation")?;
+    let evaluation_out = take(&mut rest, "--evaluation-out")?;
+    let a = parse(&rest, &["--policy", "--views", "--out"])?;
+    if evaluation.is_none() && evaluation_out.is_some() {
+        return Err(CliError::Usage(format!(
+            "--evaluation-out needs --evaluation\n\n{HELP}"
+        )));
+    }
     let parent = &a["--policy"];
     let bundle = open_bundle(parent)?;
+    // Before anything is rewritten: the parent document has to judge the parent bundle, or a
+    // wrong one would be carried over to the subset with nothing left to catch it.
+    let judged = match evaluation {
+        Some(path) => {
+            let raw = std::fs::read_to_string(&path)
+                .map_err(|e| CliError::Runtime(format!("{path}: {e}")))?;
+            let ev = evaluation_from_toml(&raw)
+                .map_err(|e| CliError::Runtime(format!("{path}: {e}")))?;
+            judges(&ev, &bundle).map_err(|d| {
+                CliError::Runtime(format!(
+                    "{path} does not judge the parent bundle {parent}, so it cannot be carried \
+                     over to the subset:\n{d}"
+                ))
+            })?;
+            Some((path, ev))
+        }
+        None => None,
+    };
     let keep: Vec<String> = a["--views"]
         .split(',')
         .map(str::trim)
@@ -366,17 +477,37 @@ fn subset(args: &[String]) -> Result<u8, CliError> {
         })
     })?;
 
-    let out = PathBuf::from(&a["--out"]);
-    if let Some(dir) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
-    }
-    std::fs::write(&out, &s.bytes)
-        .map_err(|e| CliError::Runtime(format!("{}: {e}", out.display())))?;
-    // Reopened rather than trusted, like `pack`.
+    // Reopened rather than trusted, like `pack` -- and before a file is written, so that a
+    // refusal below leaves nothing behind.
     let reopened = PolicyBundle::open(&s.bytes)
-        .map_err(|e| CliError::Runtime(format!("the bundle just written does not open: {e}")))?;
+        .map_err(|e| CliError::Runtime(format!("the subset bundle does not open: {e}")))?;
+    let out = PathBuf::from(&a["--out"]);
+
+    let derived = match judged {
+        Some((path, ev)) => {
+            let (text, hash) = evaluation_for(&path, ev, &reopened, &s, &out)?;
+            let to =
+                evaluation_out.map_or_else(|| out.with_extension("evaluation.toml"), PathBuf::from);
+            Some((to, text, hash))
+        }
+        None => None,
+    };
+
+    let write = |path: &std::path::Path, bytes: &[u8]| -> Result<(), CliError> {
+        if let Some(dir) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir)
+                .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
+        }
+        std::fs::write(path, bytes)
+            .map_err(|e| CliError::Runtime(format!("{}: {e}", path.display())))
+    };
+    write(&out, &s.bytes)?;
     println!("bundle:        {}", out.display());
+    if let Some((to, text, hash)) = &derived {
+        write(to, text.as_bytes())?;
+        println!("evaluation:    {}", to.display());
+        println!("evaluation_hash: {hash}");
+    }
     println!("subset_of:     {}", hex(&s.parent));
     println!("views:         {}", s.views.join(","));
     for (from, to) in &s.rehomed {
@@ -952,6 +1083,12 @@ mod tests {
         };
         assert!(refused(&parent, "rgb_top").contains("no camera view \"rgb_top\""));
         assert!(refused(&parent, " , ").contains("no view kept"));
+        let mut orphan = args(&parent, "rgb_wrist", &out);
+        orphan.extend(["--evaluation-out".to_owned(), "wrist.toml".to_owned()]);
+        assert!(matches!(
+            subset(&orphan),
+            Err(CliError::Usage(m)) if m.starts_with("--evaluation-out needs --evaluation")
+        ));
         let concat = bundle(&concat, "concat.esb");
         assert!(refused(&concat, "rgb_wrist").contains("do not meet in a Sum fusion"));
         let _ = std::fs::remove_dir_all(&dir);
