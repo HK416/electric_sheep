@@ -824,12 +824,16 @@ fn views_documents_validate_check_and_compile() {
 /// only -- as `crates/es/tests/cli.rs`'s `gate_errors` makes it.
 fn gate_errors(bundle: &es_compile::PolicyBundle, evaluation: &str) -> Vec<String> {
     let eval_ir = es_ir::serial::evaluation_from_toml(&read(&vl(evaluation))).expect("parses");
+    xir_errors(bundle, &eval_ir)
+}
+
+fn xir_errors(bundle: &es_compile::PolicyBundle, eval_ir: &EvaluationIr) -> Vec<String> {
     es_ir::cross::check(&es_ir::cross::IrBundle {
         task: &bundle.task,
         observation: &bundle.observation,
         learning: &bundle.learning,
         deployment: &bundle.deployment,
-        evaluation: Some(&eval_ir),
+        evaluation: Some(eval_ir),
     })
     .into_iter()
     .filter(es_ir::diag::Diagnostic::is_error)
@@ -934,7 +938,9 @@ fn policy_init_builds_each_arms_bundle_and_the_gate_accepts_it() {
 
 /// Packet M15/N8b: `es policy init` builds the MAD bundle, the gate accepts it under
 /// evaluation-mad.toml, it lowers to **one** backbone applied to the three views and summed,
-/// `[run] single_view` accepts its graph, and `es policy subset` keeps each camera alone.
+/// `[run] single_view` accepts its graph, and `es policy subset` keeps each camera alone --
+/// with, packet M15/N8c, the Evaluation IR each subset is judged by: evaluation-mad.toml with
+/// only its references changed, and a wrong parent document refused by name.
 ///
 /// The init bundle's weights are a placeholder the subset refuses (it rewrites a checkpoint
 /// that fits the lowering), so the subset runs on a bundle of the same four documents with
@@ -996,15 +1002,32 @@ fn the_mad_bundle_builds_trains_one_view_at_a_time_and_subsets() {
     )
     .expect("the MAD documents pack with fitting weights");
     std::fs::write(&fitted, built).expect("write");
-    for view in ["rgb_overhead", "rgb_wrist", "rgb_side"] {
-        let out = dir.join(format!("{view}.esb"));
-        let o = Command::new(env!("CARGO_BIN_EXE_es"))
-            .args(["policy", "subset", "--policy"])
+    let parent_policy = hex(&learning.policy_hash().expect("policy hash"));
+    let judged_by = vl("evaluation-mad.toml");
+    let committed = read(&judged_by);
+    let parent_ev = es_ir::serial::evaluation_from_toml(&committed).expect("parses");
+    let subset = |view: &str, out: &Path, evaluation: &Path| -> Command {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_es"));
+        cmd.args(["policy", "subset", "--policy"])
             .arg(&fitted)
             .args(["--views", view, "--out"])
-            .arg(&out)
-            .output()
-            .expect("run es policy subset");
+            .arg(out)
+            .arg("--evaluation")
+            .arg(evaluation);
+        cmd
+    };
+    for view in ["rgb_overhead", "rgb_wrist", "rgb_side"] {
+        let out = dir.join(format!("{view}.esb"));
+        // One names where its Evaluation IR goes; the others take the default beside the bundle.
+        let mut cmd = subset(view, &out, &judged_by);
+        let written = if view == "rgb_overhead" {
+            let to = dir.join("judged").join("overhead.toml");
+            cmd.arg("--evaluation-out").arg(&to);
+            to
+        } else {
+            dir.join(format!("{view}.evaluation.toml"))
+        };
+        let o = cmd.output().expect("run es policy subset");
         let text = String::from_utf8_lossy(&o.stdout);
         assert_eq!(
             o.status.code(),
@@ -1022,7 +1045,82 @@ fn the_mad_bundle_builds_trains_one_view_at_a_time_and_subsets() {
             .expect("the subset opens");
         let inputs: Vec<&String> = sub.learning.policy.contract.inputs.keys().collect();
         assert_eq!(inputs, ["joint_state", view]);
+
+        // Packet M15/N8c (design note 3.5): the parent's document no longer judges the subset,
+        // the written one does, and it is the parent's with the references changed.
+        assert!(
+            xir_errors(&sub, &parent_ev)
+                .iter()
+                .any(|d| d.contains("XIR-040")),
+            "{view}"
+        );
+        assert!(
+            text.contains(&format!("evaluation:    {}", written.display())),
+            "{text}"
+        );
+        let doc = read(&written);
+        let ev = es_ir::serial::evaluation_from_toml(&doc).expect("the written evaluation parses");
+        assert_eq!(xir_errors(&sub, &ev), Vec::<String>::new(), "{view}");
+        assert!(ev.validate().is_empty(), "{view}");
+        assert_eq!(ev.task, hex(&sub.task.task_hash().expect("hash")));
+        assert_eq!(
+            ev.observation,
+            hex(&sub.observation.observation_hash().expect("hash"))
+        );
+        assert_ne!(ev.observation, parent_ev.observation, "{view}");
+        let mut undone = ev.clone();
+        undone.task.clone_from(&parent_ev.task);
+        undone.observation.clone_from(&parent_ev.observation);
+        assert_eq!(undone, parent_ev, "{view}: more than the references differ");
+        // The overhead camera alone reads the one-view arm's Observation IR, so experiment 2
+        // judges it under experiment 1's own document.
+        if view == "rgb_overhead" {
+            let cam = es_ir::serial::evaluation_from_toml(&read(&vl("evaluation-cam.toml")));
+            assert_eq!(ev, cam.expect("evaluation-cam.toml"));
+        }
+        // Byte for byte below the headers: the Task IR is carried over, so only the observation
+        // line differs.
+        let body = |t: &str| -> Vec<String> {
+            t.lines()
+                .filter(|l| !l.starts_with('#'))
+                .map(str::to_owned)
+                .collect()
+        };
+        let (mine, theirs) = (body(&doc), body(&committed));
+        assert_eq!(mine.len(), theirs.len(), "{view}");
+        let differ: Vec<&String> = mine
+            .iter()
+            .zip(&theirs)
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| a)
+            .collect();
+        assert_eq!(differ, [&format!("observation = \"{}\"", ev.observation)]);
+        for line in [
+            format!("# parent document:        {}", judged_by.display()),
+            format!(
+                "# parent evaluation_hash: {}",
+                hex(&parent_ev.evaluation_hash().expect("hash"))
+            ),
+            format!("# parent policy_hash:     {parent_policy}"),
+            format!("# views kept:             {view}"),
+        ] {
+            assert!(doc.lines().any(|l| l == line), "{line}\n{doc}");
+        }
     }
+
+    // A wrong parent document -- the one-view arm's -- is refused by name, and nothing is written.
+    let wrong = dir.join("wrong.esb");
+    let o = subset("rgb_wrist", &wrong, &vl("evaluation-cam.toml"))
+        .output()
+        .expect("run es policy subset");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(o.status.code(), Some(1), "{err}");
+    assert!(
+        err.contains("evaluation-cam.toml does not judge the parent bundle")
+            && err.contains("XIR-040"),
+        "{err}"
+    );
+    assert!(!wrong.exists() && !dir.join("wrong.evaluation.toml").exists());
     let _ = std::fs::remove_dir_all(&dir);
     println!("RAN the_mad_bundle_builds_trains_one_view_at_a_time_and_subsets");
 }
