@@ -487,3 +487,36 @@ IR's own perturbations instead of a widened randomization (no new document field
   gone.
 - **Budget after S2:** `es-editor-model` 6,582 lines (over the 6,000 target, under the cap),
   `es-editor` 3,842, `es` 6,543.
+
+## 11. S3 design: action blocks (plan Q, 2026-09-29)
+
+The design pass section 5 asked for; the packets are `docs/packets/M14/plan-q.md`.
+
+- **What a block is.** Today's demonstrator is already a list of waypoints: `ScriptedExpert`
+  walks seven stages (approach, descend, close, lift, transport, lower, release) whose targets
+  come from one `ExpertCfg` of hand-tuned numbers. S3 makes the list data — a **demonstration
+  program** (`teach.toml`, `kind = "demonstration"`) of *move* blocks (a target — the object,
+  a place named by a scene geom stem, or a point — a height above it or above the floor, a wrist
+  pitch, the gripper) and *grip* blocks (open or close, then wait). It is the demonstrator's
+  recipe, not an IR (§5.1 rule 6), and it is run by the same concrete struct (INV-17).
+- **One source of the demo's numbers.** `--expert so101-pick-place` becomes the committed
+  program `templates/teach/so101-pick-place.toml`, compiled in. The refactor is proven by a
+  golden of today's chunk sequence recorded before it, bit for bit, on a perfect-follower state
+  sequence that needs no simulator. What is not the person's to change — the joint tolerance,
+  the gripper's open and closed angles, the pace the Deployment IR's envelope allows — stays in
+  code, so the file says only *what* to do.
+- **A place resolves exactly:** its point is the world position of the lowest geom of that stem
+  (the bin's floor), which reproduces `demo_cfg`'s literal bin centre.
+- **The person's copy.** `Project::create` copies the template's program into the project;
+  `write_run` points `[collect] expert` at it; the ledger records the program's blake3 beside the
+  `expert` name (new provenance, no hash moves).
+- **② as built in S3.** A block list in plain words with a mark on any block that cannot be
+  reached for some object position the Task IR can draw; an inspector for the selected block;
+  "한 번 해 보기" (one expert episode on a derived one-seed Evaluation IR into
+  `<project>/try/<n>/`, played in the shared player with its outcome class) and "🎲 다른
+  위치로" (the next seed). Warnings never block trying: the demonstrator fails an unreachable
+  block by name (spec 17.2), which is what the try shows.
+- **What S3 does not do:** a timeline of the demonstration (the player's timeline stands in), a
+  block for turning the wrist (roll is held at zero, which keeps the tool's lateral offset
+  constant), robots other than SO-101 (`so101_ik` is closed-form for its shape), and dragging
+  targets in the viewport (S4's gizmos).
