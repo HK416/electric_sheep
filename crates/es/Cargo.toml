@@ -11,12 +11,16 @@ name = "es"
 path = "src/main.rs"
 
 [features]
+# `render` is on by default since packet M12/R5 (owner decision H-1): without it the editor's
+# start screen keeps both cube templates disabled. `--no-default-features` still builds a CLI
+# that links no Vulkan at all and refuses `--frames`.
+default = ["render"]
 # `es task generate --provider anthropic` (spec 14.5); off by default so the default build
 # never links a TLS stack (see crates/es-script/Cargo.toml's own `llm` feature).
 es-script-llm = ["es-script/llm"]
 # `es loop collect --frames` (spec 15.2, packet M5/V2) and `es eval run --frames` (spec 10.5,
-# packet M5/V3). Off by default so the default build of the CLI links no Vulkan at all -- the
-# same trade `es-env`'s own `render` feature makes. `es-render` is direct because a light
+# packet M5/V3). A build without it links no Vulkan at all -- the trade `es-env`'s own
+# `render` feature still makes off by default. `es-render` is direct because a light
 # perturbation sets `RenderConfig::light_dir`, which `EnvRendererCfg` does not carry
 # (packet M5/V3, design note section 7.8). `es-tools/render` is `es video showcase`, which
 # moved out with the rest of the artifact verbs (packet M10/W3b).

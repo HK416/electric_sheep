@@ -643,7 +643,9 @@ input)"*. 어떤 테스트도 이를 잡지 못했는데, `torch_equivalence.rs`
 이유다(7.4절) — Task IR 자신의 이미지 채널과 `ImageSpec`으로 설정하고, 컨트롤 스텝마다 raw tile
 하나를 `<dir>/<NNNNNN>.bin` + `.json`으로 쓴다. 렌더 골든과 `es video mosaic`이 이미 쓰는 형식이다.
 `es`의 새 `render` 피처 뒤에 있고 기본은 꺼져 있으므로, 평소의 CLI는 여전히 Vulkan을 전혀 링크하지
-않는다(스펙 4.2). 피처 없는 빌드는 구멍 뚫린 데이터셋을 쓰는 대신 `--frames`를 거부한다. 오라클
+않는다(스펙 4.2). 피처 없는 빌드는 구멍 뚫린 데이터셋을 쓰는 대신 `--frames`를 거부한다. (패킷
+M12/R5부터 이 피처는 기본으로 켜져 있다; Vulkan을 링크하지 않고 `--frames`를 거부하는 것은
+`--no-default-features` 빌드다.) 오라클
 서버에서 측정: 352 스텝 시연 하나가 1.8초에 렌더되고, "no mp4 was written" 경고는 사라졌다.
 
 **3. 학습이 Observation IR 노드를 정확히 하나 재구현한다. 그리고 그것은 부채다.** tile은 HWC
@@ -814,7 +816,8 @@ Safety Plane에 먹이려고 이미 쓰는 것과 같은 규약이다. 그 외�
 `es_render::Renderer`를 V0b 자신의 공개 `render_config` / `body_poses` / `camera_view`와
 조합해 그것을 적용하며, 추첨이 바뀔 때만 렌더러를 다시 만든다. `es-render`와
 `es-env/src/render.rs`는 손대지 않았다. `es` 크레이트의 `render` 피처가 `es-render`를 직접
-의존성으로 얻었을 뿐이고, 기본 빌드에는 아무 비용이 없다(기본 꺼짐, spec 4.2).
+의존성으로 얻었을 뿐이고, 기본 빌드에는 아무 비용이 없다(기본 꺼짐, spec 4.2; 패킷 M12/R5부터는
+기본으로 켜져 있어서, 이제 그 비용을 피하는 것은 `--no-default-features` 빌드뿐이다).
 
 **envelope은 조이지 않았다. 조일 필요가 없었기 때문이다.** 섹션 8은 데모의 clamp가
 Deployment IR의 한계를 조여서 나온다고 말한다. 측정은 그것이 공짜로 나온다고 말한다: ACT

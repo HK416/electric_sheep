@@ -856,7 +856,9 @@ fn check_deps_json_is_one_object_with_every_field() {
         assert!(v["modules"][m].is_boolean(), "modules.{m}");
     }
     assert!(v["vulkan_loader"].is_boolean());
-    assert!(v["render"].is_boolean());
+    // The binary reports its own build: `true` by default (packet M12/R5), `false` under
+    // `--no-default-features`.
+    assert_eq!(v["render"], cfg!(feature = "render"));
     let names: Vec<&str> = v["backends"]
         .as_array()
         .unwrap()

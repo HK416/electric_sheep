@@ -167,7 +167,9 @@ collect 실행에는 거기 넣을 자연어 지시문이 없다; 최소한 해�
 `meta/info.json`에 `video` 피처가 쓰인다 — 그래서 `info.video_path`가 채워지고
 `LeRobotDataset::read_episode`는 카메라별·프레임별로 `VideoRef` 하나를 돌려준다 — 하지만
 **mp4는 쓰이지 않는다**, 이 빌드에는 렌더러가 없기 때문이다(`es-render`는 layer 5이며
-이후 마일스톤이다; `es eval run`도 같은 이유로 이미지 관측을 거부한다).
+이후 마일스톤이다; `es eval run`도 같은 이유로 이미지 관측을 거부한다). 이후 바뀌었다:
+패킷 M5/V2부터 `es loop collect --frames`가 채널을 렌더하고, 패킷 M12/R5부터 `es`의 기본
+빌드에 렌더러가 들어 있다; 플레이스홀더와 경고는 `--frames` 없이 돈 실행이 쓰는 것이다.
 
 그런 실행마다 각 카메라 이름을 담은 경고를 낸다:
 

@@ -45,8 +45,8 @@ under --out:
                         changed steps, its own failure-mode buckets (`es_eval::episodes`)
   report.html          a minimal static HTML table rendered from report.json (escaped,
                         no template crate)
-`episodes/` replay is not produced by this build -- there is no renderer yet (M2 packet
-CLI-eval-run-import); `report.html` carries no failure-episode links because of that.
+`episodes/` replay is not produced (M2 packet CLI-eval-run-import; --frames below is what
+renders a run); `report.html` carries no failure-episode links because of that.
 
 With --frames <dir> the run also renders the Task IR's one image channel from the scene's
 own camera, which is what lets an Observation IR with an image input be evaluated at all
@@ -807,9 +807,9 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
     #[cfg(not(feature = "render"))]
     if a.frames.is_some() {
         return Err(CliError::Usage(
-            "--frames needs the `render` feature; this build links no renderer (spec 4.2: \
-             es-render is layer 5 and the default build of `es` does not pull it in). Rebuild \
-             with `cargo build -p es --features render`."
+            "--frames needs the `render` feature; this build links no renderer (it was built \
+             with `--no-default-features`). Rebuild with the default features \
+             (`cargo build -p es`)."
                 .to_owned(),
         ));
     }

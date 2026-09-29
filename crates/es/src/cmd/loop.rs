@@ -335,9 +335,9 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
     #[cfg(not(feature = "render"))]
     if frames.is_some() {
         return Err(CliError::Runtime(
-            "--frames needs the `render` feature; this build links no renderer (spec 4.2: \
-             es-render is layer 5 and the default build of `es` does not pull it in). Rebuild \
-             with `cargo build -p es --features render`."
+            "--frames needs the `render` feature; this build links no renderer (it was built \
+             with `--no-default-features`). Rebuild with the default features \
+             (`cargo build -p es`)."
                 .to_owned(),
         ));
     }

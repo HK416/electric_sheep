@@ -664,7 +664,9 @@ renderer (section 7.4) — configures it from the Task IR's own image channel an
 and writes `<dir>/<NNNNNN>.bin` + `.json`, one raw tile per control step, in the format the
 render goldens and `es video mosaic` already use. It is behind a new `render` feature on `es`,
 off by default, so the ordinary CLI still links no Vulkan (spec 4.2); a build without the
-feature refuses `--frames` rather than writing a dataset with a hole in it. Measured on the
+feature refuses `--frames` rather than writing a dataset with a hole in it. (Since packet
+M12/R5 the feature is on by default; `--no-default-features` is the build that links no
+Vulkan and refuses `--frames`.) Measured on the
 oracle server: a 352-step demonstration renders in 1.8 s, and the "no mp4 was written" warning
 is gone.
 
@@ -848,7 +850,8 @@ because the Lambert term is linear in `albedo`) and `LightOverride::rotate_dir` 
 `render_config` / `body_poses` / `camera_view` to apply them, rebuilding the renderer only
 when the draw changes. `es-render` and `es-env/src/render.rs` are untouched; the `es` crate's
 `render` feature gained `es-render` as a direct dependency, which costs the default build
-nothing (it is off by default, spec 4.2).
+nothing (it is off by default, spec 4.2; on by default since packet M12/R5, so only a
+`--no-default-features` build is spared it now).
 
 **The envelope was not tightened, because it did not need to be.** Section 8 says the demo's
 clamps come from tightening the Deployment IR's limits. The measurement says they come for

@@ -404,7 +404,7 @@ pub(crate) fn run(
             return Err(bad(
                 "the policy's Observation IR has an image input and this build of `es` has no \
                  `render` feature, so `[rl]` cannot render it through `es_native.Rollout`. \
-                 Rebuild with `--features render`, or train against a state-only Observation \
+                 Rebuild with the default features, or train against a state-only Observation \
                  IR of the same task",
             ))
         }

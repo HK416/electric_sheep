@@ -413,9 +413,9 @@ has the findings and the open decisions.
   0.33, 0.19+ to Rust 1.92). Dock states persist per arrangement (one per step, one Advanced).
 - **Language:** language and text size moved to the View menu; the start screen carries its own
   language switch (review H-5).
-- **Templates need `render`:** a default `es` build has no renderer (`"render": false`), so both
-  cube cards stay disabled until `es` is built with `--features render`; the start screen says so
-  (review H-1).
+- **Templates need `render`:** an `es` built without the renderer reports `"render": false`, and
+  both cube cards stay disabled; the start screen says so (review H-1). Since packet M12/R5
+  `render` is a default feature of `es`, so only a `--no-default-features` build hits this.
 - **The traffic light** (section 6.4) as built, first match wins: *stopped by you* (grey) →
   *stopped* → *broken* → *not responding* → *starting* (grey, before any message) → *slow* →
   *stopped learning* → *going well*. A failed acceptance is **not** *stopped*: `es loop cycle` ends

@@ -163,7 +163,10 @@ If the bundle's `ObservationSpec` declares channels carrying an `ImageSpec`, a `
 feature is written into `meta/info.json` for each — so `info.video_path` is populated and
 `LeRobotDataset::read_episode` hands back one `VideoRef` per frame per camera — but **no mp4
 is written**, because there is no renderer in this build (`es-render` is layer 5 and is a
-later milestone; `es eval run` refuses image observations for the same reason).
+later milestone; `es eval run` refuses image observations for the same reason). Superseded:
+`es loop collect --frames` renders the channel since packet M5/V2, and since packet M12/R5 the
+default build of `es` has the renderer; the placeholders and the warning are what a run
+without `--frames` writes.
 
 Every such run emits a warning naming each camera:
 

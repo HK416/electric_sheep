@@ -333,9 +333,9 @@ fn showcase(args: &[String]) -> Result<(), CliError> {
 #[cfg(not(feature = "render"))]
 fn showcase(_args: &[String]) -> Result<(), CliError> {
     Err(bad(
-        "[showcase] needs the `render` feature; this build links no renderer (spec 4.2: \
-         es-render is layer 5 and the default build of `es` does not pull it in). Rebuild with \
-         `cargo build -p es --features render`, or delete [showcase] from the cycle.",
+        "[showcase] needs the `render` feature; this build links no renderer (it was built \
+         with `--no-default-features`). Rebuild with the default features \
+         (`cargo build -p es`), or delete [showcase] from the cycle.",
     ))
 }
 
