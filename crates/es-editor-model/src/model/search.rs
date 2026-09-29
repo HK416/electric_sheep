@@ -2,7 +2,7 @@
 //! performance").
 //!
 //! Every decision is here: what a query matches, in what order the hits come back, and which
-//! one Enter goes to next. `crate::app` sets the pan from the hit's position and highlights it
+//! one Enter goes to next. `es_editor::app` sets the pan from the hit's position and highlights it
 //! — geometry, nothing more (spec 28.10 rule 3).
 //!
 //! Two sources, one matcher. Read-only mode searches the four stacked IRs of a

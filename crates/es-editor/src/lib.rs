@@ -1,9 +1,11 @@
-//! `es-editor` (layer 12): the editor shell of spec 23 — a step bar over a dock of panes
+//! `es-editor` (layer 13): the editor shell of spec 23 — a step bar over a dock of panes
 //! (packet M12/Y10), the layered graph view
 //! (read-only and editable), telemetry, and the before/after image pair.
 //!
 //! Layer rule (spec 4.2 rule 4): this crate may depend on anything, and **nothing may depend
-//! on it**. `cargo xtask layering` enforces both halves.
+//! on it**; nothing but it may depend on `es-editor-model` (layer 12), whose [`model`] it
+//! re-exports under the path it had before packet M12/R4 split the two. `cargo xtask
+//! layering` enforces all of it.
 //!
 //! Spec 23.1: the editor does not host training. It is a client that attaches to a running
 //! process. Everything it knows arrives as an IR bundle on disk or as telemetry messages.
@@ -32,8 +34,9 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
-pub mod model;
 pub mod ui;
+
+pub use es_editor_model::model;
 
 pub use app::EditorApp;
 pub use model::edit::{Edit, EditSession};

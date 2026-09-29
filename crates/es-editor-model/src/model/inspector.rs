@@ -3,7 +3,7 @@
 //! `Edit::SetParam` and [`NodeSchema`] have existed since M4 with no widget behind them: a
 //! node's parameters could only be changed by editing TOML. This is the half of that widget
 //! that *decides* something — which control a [`ParamType`] gets, what a person's text means,
-//! and when text becomes an [`Edit`] — so `crate::app` is left with the drawing (spec 28.10
+//! and when text becomes an [`Edit`] — so `es_editor::app` is left with the drawing (spec 28.10
 //! rule 3).
 //!
 //! Three rules shape it:

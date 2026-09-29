@@ -28,6 +28,8 @@ es-safety = { path = "crates/es-safety" }
 es-compile = { path = "crates/es-compile" }
 es-runtime-embedded = { path = "crates/es-runtime-embedded" }
 es-editor = { path = "crates/es-editor" }
+# Without its default `file-dialogs`: es-editor forwards its own feature to it.
+es-editor-model = { path = "crates/es-editor-model", default-features = false }
 es-eval = { path = "crates/es-eval" }
 es-splat = { path = "crates/es-splat" }
 es-script = { path = "crates/es-script" }

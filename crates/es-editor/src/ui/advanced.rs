@@ -1313,15 +1313,8 @@ pub(crate) fn paint_curve(ui: &mut egui::Ui, plot: &Plot, colour: Color32, heigh
 
 // --- the Replay panel --------------------------------------------------------------------------
 
-/// Where the replay camera starts: the demo's showcase view (`es video showcase --eye`).
-pub(crate) const SHOWCASE_CAMERA: Camera = Camera {
-    eye: [0.55, -0.45, 0.42],
-    look_at: [0.12, -0.02, 0.08],
-    // 45 degrees, the showcase default. `to_radians` is not `const`.
-    fov_y: std::f64::consts::FRAC_PI_4,
-    width: 640,
-    height: 400,
-};
+/// Where the replay camera starts; defined beside the scene preview it is tested with.
+pub(crate) use crate::model::scene_view::SHOWCASE_CAMERA;
 
 /// The control rate a recorded `.estraj` tick is worth. 50 Hz is the demo deployment's
 /// `rate.control`; a run directory carries no Deployment IR to read it from, and playing at

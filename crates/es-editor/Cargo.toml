@@ -11,36 +11,19 @@ name = "es-editor"
 path = "src/main.rs"
 
 [features]
-# The native Open dialog (packet M7/E6). Default, but `rfd` is only *declared* for Windows and
-# macOS, and `model/dialogs.rs` gates on `all(feature = "file-dialogs", any(windows, macos))` -
-# cargo has no per-target default feature, and this is the same effect: Linux compiles the
-# `None` stub whether or not the feature is on, and gains no GTK or portal requirement.
+# The native Open dialog (packet M7/E6) lives in `es-editor-model`'s `model/dialogs.rs`. This
+# forwards to that crate's feature, which is taken without its defaults, so a
+# `--no-default-features` build of the editor still has no dialog.
 default = ["file-dialogs"]
-file-dialogs = ["dep:rfd"]
-
-[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
-rfd = { workspace = true, optional = true }
+file-dialogs = ["es-editor-model/file-dialogs"]
 
 [dependencies]
-es-core = { workspace = true }
+# The headless half (packet M12/R4): everything the window shows. Spec 4.2 rule 4: nothing
+# but this crate depends on it.
+es-editor-model = { workspace = true }
 es-ir = { workspace = true }
 es-compile = { workspace = true }
-es-telemetry = { workspace = true }
-# The Run tab (packet M7/E1) reads a finished run's own artifacts: `report.json` through
-# `es-ir`, `events.json` through `es_eval::runner::StepEvent`, and its `events` bitset through
-# `es_safety::EventSet`. Both are below layer 12; neither is re-implemented here.
 es-eval = { workspace = true }
-es-safety = { workspace = true }
-# A project (packet M12/Y5, Y6) builds its collect bundle with `es_data::training::
-# untrained_bundle` and writes its run recipe as an `es_data::training::Cycle`: the same code
-# `es policy init` and `es loop cycle` run, not a second copy. Layer 10, below this one.
-es-data = { workspace = true }
-# The Replay panel (packet M7/E2) re-poses a recorded `.estraj` and projects it on the CPU:
-# the scene loader, the trajectory, the tessellation and the camera are all theirs. `es-env`
-# is taken **without** its `render` feature, so the editor links no Vulkan of its own.
-es-assets = { workspace = true }
-es-env = { workspace = true }
-es-math = { workspace = true }
 es-render = { workspace = true }
 # `persistence` is the one feature added on top of the workspace's minimal set: it is what
 # gives `eframe::App::save` a `Storage`, and the recent-files list (packet M7/E3) is kept
@@ -50,16 +33,6 @@ eframe = { workspace = true, features = ["persistence"] }
 egui = { workspace = true }
 # The dock under the step bar (packet M12/Y10): panes a person can drag and re-dock.
 egui_dock = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-toml = { workspace = true }
-
-[dev-dependencies]
-es-math = { workspace = true }
-# The `.estraj` fixture generator only: `es_env::Trajectory` is shaped by a `ModelInfo` and
-# filled from a `StateView`, and both are `es-physics-core`'s plain structs. The editor itself
-# never names them, so this stays out of the normal build.
-es-physics-core = { workspace = true }
 
 [lints]
 workspace = true
