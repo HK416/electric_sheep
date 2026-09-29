@@ -1110,12 +1110,19 @@ impl Default for SplitSpec {
     }
 }
 
+/// Each episode's suite, seed and reset draws under `es loop collect --perturb` (packet
+/// M13/Z2), one JSON line per episode beside `meta/interventions.jsonl` and, like it, outside
+/// every hash (`dataset_content_hash` reads the parquet files, `dataset_schema_hash`
+/// `info.json`).
+pub const PERTURBATIONS_FILE: &str = "meta/perturbations.jsonl";
+
 /// Merges datasets, splits deterministically, and writes the spec 19.3 identity.
 ///
 /// Episodes are re-indexed `0..N` in input order then original index — a total order, so two
 /// runs of the same inputs produce byte-identical parquet and the same `TrainingIdentity`.
 /// `meta/interventions.jsonl` of each input is merged with its episode indices remapped, so
-/// labels survive the merge.
+/// labels survive the merge, and so is [`PERTURBATIONS_FILE`], so each episode keeps the suite
+/// it was collected under (packet M13/Z3); a merge of inputs that have none writes none.
 ///
 /// The `Distill` loop step is appended to the output root **and** every input root: a
 /// dataset's own ledger should record that it was consumed (spec 13.3).
@@ -1163,6 +1170,7 @@ pub fn distill<P: AsRef<Path>>(
     crate::intervention::ensure_columns(&mut info);
     let mut writer = LeRobotWriter::create(out_root, info)?;
     let mut segments = Vec::new();
+    let mut perturbations = String::new();
     let mut next = 0u32;
     for ds in &datasets {
         let mut remap = BTreeMap::new();
@@ -1179,9 +1187,24 @@ pub fn distill<P: AsRef<Path>>(
                 segments.push(s);
             }
         }
+        for mut row in read_perturbations(ds.root())? {
+            let episode = row["episode"].as_u64().and_then(|e| u32::try_from(e).ok());
+            if let Some(index) = episode.and_then(|e| remap.get(&e)) {
+                row["episode"] = (*index).into();
+                perturbations.push_str(&row.to_string());
+                perturbations.push('\n');
+            }
+        }
     }
     writer.finish()?;
     crate::intervention::write_segments(out_root, &segments)?;
+    let path = out_root.join(PERTURBATIONS_FILE);
+    if perturbations.is_empty() {
+        // An earlier merge into the same root must not name suites for these episodes.
+        let _ = std::fs::remove_file(&path);
+    } else {
+        write_file(&path, perturbations.as_bytes())?;
+    }
 
     let merged = LeRobotDataset::open(out_root)?;
     let lists = Split::deterministic(next, split.ratios, split.seed);
@@ -1228,6 +1251,25 @@ pub fn distill<P: AsRef<Path>>(
         }
     }
     Ok(training)
+}
+
+/// [`PERTURBATIONS_FILE`]'s rows; an absent file is none, as with the intervention segments.
+fn read_perturbations(root: &Path) -> Result<Vec<serde_json::Value>, DataError> {
+    let path = root.join(PERTURBATIONS_FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(DataError::io(&path, e)),
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(|l| {
+            serde_json::from_str(l).map_err(|source| DataError::Json {
+                path: path.clone(),
+                source,
+            })
+        })
+        .collect()
 }
 
 fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), DataError> {

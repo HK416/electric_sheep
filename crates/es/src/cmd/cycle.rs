@@ -21,7 +21,8 @@ use es_data::collect::{
     append_loop_step, last_evaluation_hash, read_loop_steps, LoopKind, LoopStep, CHECKPOINT,
 };
 use es_data::training::{
-    preview_evaluation, Backbone, Cycle, CyclePlan, CycleStep, PreviewRef, PreviewStep, Stage,
+    collect_root, preview_evaluation, Backbone, Cycle, CyclePlan, CycleStep, PreviewRef,
+    PreviewStep, Stage,
 };
 use es_data::{DatasetIdentity, LeRobotDataset, Split};
 use es_ir::evaluation::{AcceptanceResult, EvaluationReport};
@@ -54,10 +55,21 @@ in-process: nothing here re-implements what `es loop collect`, `es train`, `es e
   kind = \"cycle\"
   scene = \"tests/fixtures/mjcf/so101_pick_place.xml\"
   [collect]  policy, expert, episodes, seed, frames     # or  dataset = \"<root>\"
+             perturb = { config, suites }, merge = [\"<root>\", ...]     # optional
   [train]    recipe = \"training.toml\"
+             init = \"<bundle | lerobot pretrained_model dir>\"           # optional
   [eval]     config, checkpoint = \"last\", jobs, frames
   [eval.preview]  episodes = 4, suite = <the first>, frames = true      # optional
   [showcase] cell, eye, look_at, fov, width, height
+
+Training again on what failed (packet M13/Z3): `perturb` collects under those suites of an
+Evaluation IR (`es loop collect --perturb --suites`), and a collection whose seeds meet those
+of [eval] config or of `perturb`'s own config is refused, `--dry-run` included (spec 13.3).
+`merge` is a merge stage after collect: `es loop distill` of the new dataset and those roots
+into <out>/collect/merged, all-train, which is what trains; with `frames`, each root's tiles
+are the `frames` beside it and are linked into collect/frames after the new ones. `init` is
+where training starts: the IR and RL routes' `[init] policy`, the lerobot route's
+`--policy.path`. Both have to be on disk before anything runs (not checked by `--dry-run`).
 
 With [eval.preview], each checkpoint gets a short test as soon as its bundle is on disk, while
 the trainer is still running (the last mark after it exits): this same `es`, as a child, runs
@@ -195,11 +207,21 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
         Some(p) => Some(PreviewIr::derive(&cycle.eval.config, p)?),
         None => None,
     };
+    check_perturb(&cycle)?;
 
     if dry_run {
         print!("{}", plan.render(&out));
         return Ok(0);
     }
+    cycle
+        .check_inputs(plan.train.route)
+        .map_err(|e| bad(e.to_string()))?;
+    // The step that wrote the data the cycle trains on, for the ledger's own checks.
+    let data_kind = if cycle.merge().is_empty() {
+        LoopKind::Collect
+    } else {
+        LoopKind::Distill
+    };
 
     // **One socket for the whole cycle** (packet M7/E7), bound before the first stage opens
     // anything. The stages are in-process calls, so they are handed this publisher rather
@@ -228,7 +250,7 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
     std::fs::create_dir_all(&out).map_err(|e| bad(format!("{}: {e}", out.display())))?;
     let dataset_root = PathBuf::from(&plan.dataset_root);
     if let Some(stage) = from {
-        check_resume(&plan, &out, &dataset_root, stage)?;
+        check_resume(&plan, &out, &dataset_root, data_kind, stage)?;
     }
     // Packet M12/R8: the backbone the train stage reads is fetched when missing and checked
     // against the pin now, not after collect and the expert gate (26 minutes on the hint card).
@@ -263,7 +285,11 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
                 if c != 0 {
                     return Ok(c);
                 }
-                mirror_collect(&dataset_root, &out)?;
+                mirror(Path::new(&collect_root(&out)), &out, LoopKind::Collect)?;
+            }
+            Stage::Merge => {
+                crate::cmd::r#loop::distill(&step.args)?;
+                mirror(&dataset_root, &out, LoopKind::Distill)?;
             }
             Stage::ExpertGate => {
                 let c = crate::cmd::eval::run(&step.args, publisher.as_mut())?;
@@ -316,7 +342,12 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
                     q.finish();
                 }
                 trained?;
-                let step = train_step(&out.join("train"), &dataset_root, gate.as_deref())?;
+                let step = train_step(
+                    &out.join("train"),
+                    &dataset_root,
+                    data_kind,
+                    gate.as_deref(),
+                )?;
                 append_both(&out, &dataset_root, &step)?;
             }
             Stage::Eval => {
@@ -365,7 +396,9 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
 /// and the wire wants a `'static` one, so the two are matched here rather than allocated.
 fn stage_name(stage: Stage) -> &'static str {
     match stage {
-        Stage::Collect => STAGE_COLLECT,
+        // The merge is the collect stage's second half on the wire: a viewer reads the data as
+        // still being made while it runs, and a failed merge as a failed collection.
+        Stage::Collect | Stage::Merge => STAGE_COLLECT,
         Stage::ExpertGate => STAGE_EXPERT_GATE,
         Stage::Train => STAGE_TRAIN,
         Stage::Eval => STAGE_EVAL,
@@ -410,28 +443,26 @@ fn append_both(out: &Path, dataset_root: &Path, step: &LoopStep) -> Result<(), C
     Ok(())
 }
 
-/// `Collector::run` appends its own step to the dataset's ledger; the cycle's ledger gets the
-/// same line, so `<out>/loop.jsonl` holds the whole chain and not only the half this command
-/// wrote itself.
-fn mirror_collect(dataset_root: &Path, out: &Path) -> Result<(), CliError> {
-    let steps = read_loop_steps(dataset_root).map_err(|e| bad(e.to_string()))?;
-    let last = steps
-        .iter()
-        .rev()
-        .find(|s| s.kind == LoopKind::Collect)
-        .ok_or_else(|| {
-            bad(format!(
-                "{}: the collect stage wrote no collect step",
-                dataset_root.display()
-            ))
-        })?;
+/// `Collector::run` and `es_data::distill` append their own step to the dataset's ledger; the
+/// cycle's ledger gets the same line, so `<out>/loop.jsonl` holds the whole chain and not only
+/// the half this command wrote itself.
+fn mirror(root: &Path, out: &Path, kind: LoopKind) -> Result<(), CliError> {
+    let steps = read_loop_steps(root).map_err(|e| bad(e.to_string()))?;
+    let last = steps.iter().rev().find(|s| s.kind == kind).ok_or_else(|| {
+        bad(format!(
+            "{}: the stage wrote no {kind:?} step",
+            root.display()
+        ))
+    })?;
     append_loop_step(out, last).map_err(|e| bad(e.to_string()))
 }
 
-/// The `train` step of spec 13.3: what the run read, and what it produced.
+/// The `train` step of spec 13.3: what the run read, and what it produced. `data` is the kind
+/// of step that wrote the dataset: the collection, or the merge (packet M13/Z3).
 fn train_step(
     train_out: &Path,
     dataset_root: &Path,
+    data: LoopKind,
     gate: Option<&str>,
 ) -> Result<LoopStep, CliError> {
     let lock = json_of(&train_out.join("training.lock"))?;
@@ -439,7 +470,7 @@ fn train_step(
         .map_err(|e| bad(e.to_string()))?
         .into_iter()
         .rev()
-        .find(|s| s.kind == LoopKind::Collect);
+        .find(|s| s.kind == data);
     let dataset = json_of(&train_out.join("training").join("dataset.lock"))?;
     let slot = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("-").to_owned();
     let mut step = LoopStep::new(LoopKind::Train)
@@ -735,11 +766,41 @@ fn check_evaluation_hash(out: &Path, want: &str, allow_new: bool) -> Result<(), 
     )))
 }
 
+/// `[collect] perturb`, refused on the documents before anything runs, `--dry-run` included
+/// (packet M13/Z3): a suite `config` does not declare, or collect seeds that meet the seeds of
+/// the Evaluation IR this cycle is judged by or of the one it draws from (spec 13.3). Z2's own
+/// checks, so the words are `es loop collect`'s.
+fn check_perturb(cycle: &Cycle) -> Result<(), CliError> {
+    let Some((collect, p)) = cycle
+        .collect
+        .as_ref()
+        .and_then(|c| Some((c, c.perturb.as_ref()?)))
+    else {
+        return Ok(());
+    };
+    let open = |config: &str| {
+        es_ir::serial::evaluation_from_toml(&read(Path::new(config))?)
+            .map_err(|e| bad(format!("{config}: {e}")))
+    };
+    crate::cmd::r#loop::suite_cells(&open(&p.config)?, &p.config, &p.suites)?;
+    for config in [&cycle.eval.config, &p.config] {
+        crate::cmd::r#loop::refuse_evaluation_seeds(
+            &open(config)?,
+            config,
+            collect.seed,
+            collect.episodes,
+        )?;
+    }
+    Ok(())
+}
+
 /// `--from <stage>`: the earlier stages' outputs have to be on disk and agree with the ledger.
+/// `data` is the kind of step that wrote `dataset_root`: the collection, or the merge.
 fn check_resume(
     plan: &CyclePlan,
     out: &Path,
     dataset_root: &Path,
+    data: LoopKind,
     from: Stage,
 ) -> Result<(), CliError> {
     if from <= Stage::Collect {
@@ -760,15 +821,16 @@ fn check_resume(
     let recorded = steps
         .iter()
         .rev()
-        .find(|s| s.kind == LoopKind::Collect)
+        .find(|s| s.kind == data)
         .and_then(|s| s.outputs.get("content"));
     if let Some(recorded) = recorded {
         if *recorded != content {
             return Err(bad(format!(
-                "--from {}: {} holds dataset content {content} and the ledger's collect step \
+                "--from {}: {} holds dataset content {content} and the ledger's {} step \
                  wrote {recorded}; the stages under {} are not one cycle",
                 from.as_str(),
                 dataset_root.display(),
+                format!("{data:?}").to_lowercase(),
                 out.display()
             )));
         }

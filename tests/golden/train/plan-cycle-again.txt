@@ -1,0 +1,20 @@
+# cycle: collect -> merge -> expert-gate -> train -> eval -> showcase
+# fetch: python python/es/fetch_backbone.py --arch resnet18 --out target/backbone --expect 8511928e7ca6e3b07355e8b66284294ba692093fd0dfe246cdf96a6c9e801899
+es loop collect --policy runs/collect-001/untrained.esb --scene tests/fixtures/mjcf/so101_pick_place.xml --episodes 64 --seed 201 --out collect/ds --frames collect/frames --expert so101-pick-place --perturb tests/fixtures/visible-learning/evaluation-augmented.toml --suites light_intensity,torque_noise
+es loop distill --in collect/ds --in-frames collect/frames --in runs/001/collect/ds --in-frames runs/001/collect/frames --train 1 --val 0 --test 0 --out collect/merged --frames collect/frames
+es eval run --config tests/fixtures/visible-learning/evaluation-augmented.toml --policy runs/collect-001/untrained.esb --scene tests/fixtures/mjcf/so101_pick_place.xml --out eval-expert --jobs 6 --frames eval-expert/frames --expert so101-pick-place
+es train --recipe tests/fixtures/visible-learning/training-hint-u3.toml --out train
+  # route: ir
+  es dataset bake --policy runs/collect-001/untrained.esb --out train/baked --frames collect/frames collect/merged
+  es policy lower --policy runs/collect-001/untrained.esb --out train/module
+  python python/es/train_act.py --module train/module --baked train/baked --out train/weights/model.safetensors --checkpoint-at 1000,5000,20000 --seed 0 --batch 64 --lr 0.0004 --device cuda --loss-curve train/metrics/loss.json --schedule warmup_cosine --warmup-steps 250 --lr-min 0.000001 --init-backbone target/backbone/resnet18-imagenet1k-v1.safetensors --init-weights train/weights/init.safetensors
+  es policy pack --policy runs/collect-001/untrained.esb --weights train/weights/model-1000.safetensors --out train/checkpoints/1000.esb
+  es policy pack --policy runs/collect-001/untrained.esb --weights train/weights/model-5000.safetensors --out train/checkpoints/5000.esb
+  es policy pack --policy runs/collect-001/untrained.esb --weights train/weights/model-20000.safetensors --out train/checkpoints/20000.esb
+  # init: from runs/001/train/checkpoints/20000.esb
+  # preview: after each checkpoint, one at a time, 4 episode(s) of the first suite
+  es eval run --config preview/1000/evaluation.toml --policy train/checkpoints/1000.esb --scene tests/fixtures/mjcf/so101_pick_place.xml --out preview/1000 --jobs 1 --frames preview/1000/frames
+  es eval run --config preview/5000/evaluation.toml --policy train/checkpoints/5000.esb --scene tests/fixtures/mjcf/so101_pick_place.xml --out preview/5000 --jobs 1 --frames preview/5000/frames
+  es eval run --config preview/20000/evaluation.toml --policy train/checkpoints/20000.esb --scene tests/fixtures/mjcf/so101_pick_place.xml --out preview/20000 --jobs 1 --frames preview/20000/frames
+es eval run --config tests/fixtures/visible-learning/evaluation-augmented.toml --policy train/checkpoints/20000.esb --scene tests/fixtures/mjcf/so101_pick_place.xml --out eval --jobs 6 --frames eval/frames
+es video showcase --run eval --scene tests/fixtures/mjcf/so101_pick_place.xml --out showcase --cell nominal-00 --eye 0.66,-0.46,0.52 --look-at 0.14,-0.04,0.04 --fov 36 --width 1280 --height 720
