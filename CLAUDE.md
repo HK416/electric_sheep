@@ -36,10 +36,19 @@ first-update saturation, and pixel-only PPO scores its first held-out successes 
 the editor's workflow shell for non-experts — a step bar (① scene → ② teach → ③ train → ④ evaluate → ⑤ results) over an
 `egui_dock` dock, a start screen with a PC check and two cube templates (camera only, experimental; cube pose given, practice),
 one-button `es loop cycle` runs with a traffic light, and a plain-language results screen; the old tabs are Advanced panes.
-Backend: `es --check-deps --json`, `episodes.json`, `es policy init`. It is **not closed**: no learning run has gone through it
-(no `ES_PYTHON` here, the remote server off-limits by the owner), and `docs/packets/M12/YV-verification.md` lists what must run;
-the owner's split (review H-2, P-M12-R4) made the view-models `es-editor-model` (layer 12, 6,084 lines) under the egui
-shell `es-editor` (layer 13, 3,682).
+Backend: `es --check-deps --json`, `episodes.json`, `es policy init`. The owner's split (review H-2, P-M12-R4) made the
+view-models `es-editor-model` (layer 12) under the egui shell `es-editor` (layer 13). Since 2026-09-29 learning runs go
+through the editor **on this PC** (`.venv`, `ES_PYTHON` per command; the remote server stays off-limits) — the Y-V results are in
+`docs/packets/M12/YV-verification.md`. **M13 plan Z** (S2, `docs/packets/M13/`, review `docs/reviews/M13.md`): checkpoint
+previews during training, collection under the Evaluation IR's perturbations on fresh seeds, the "again" cycle
+(`perturb`/`merge`/`init`) and ⑤'s "실패 위주로 다시 학습", outcome classes from the object's trajectory. **M14 plan Q** (S3,
+`docs/packets/M14/`, review `docs/reviews/M14.md`): the demonstration program (`templates/teach/*.toml`, move/grip blocks run
+by `ScriptedExpert`, pinned by `tests/golden/expert/`), `--expert <program.toml>`, and ② edits it as blocks with a one-episode
+try. Their real runs found and fixed a collector abort leak, invisible NaN training, training on failed collections and
+several editor gaps; measured, the hint card still does not pass (long preset: nominal 0/16, and 2/16 with 1 s grip waits) and
+its shared failure is that the robot does not let go (27 release frames per demonstration). Next, by the owner's order: the
+multi-camera design note (MAD, arXiv 2505.04619), then S4 with failures explained by the success predicate's missing clause;
+open human decisions are M14's H-1 (the grip wait) and H-2 (letting go vs. the Task IR's immediate termination).
 The next campaign waits on the human decisions in `docs/reviews/M11.md` (the envelope for a learning policy, a cross-render
 condition, a declared source latency, `asset_hash`), `docs/reviews/M10.md` (the cycle recipe's step count, the next source policy),
 `docs/reviews/M9.md` (the buffered-path watchdog for delta policies) and the older ones in `docs/reviews/M7.md` (the stop rule's reading,
