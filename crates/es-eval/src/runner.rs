@@ -99,6 +99,8 @@ impl Default for RunConfig {
 /// closure rather than the renderer itself: `es-eval` is layer 10 and `es-render` layer 5, and
 /// linking Vulkan here just to *refuse* an image would be the wrong trade — the caller owns
 /// `es_env::render::EnvRenderer` (feature `render`) and hands its `frame` in through this.
+/// It is not told which image input it serves, so it serves a plan with one camera (`Rollout`);
+/// several cameras are a [`ViewSource`].
 ///
 /// The [`LightOverride`] is this cell and episode's draw (§10.2). It is constant for a whole
 /// episode, so a caller rebuilds its renderer only when it changes.
@@ -108,7 +110,14 @@ impl Default for RunConfig {
 pub type FrameSource<'a> =
     dyn FnMut(&LightOverride, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> + 'a;
 
-/// A [`FrameSource`] for a whole evaluation: handed each episode's [`RenderOverrides`] — the
+/// A [`FrameSource`] told which image input it serves (packet M15/N2): the observation plan's
+/// input name, which is the hex of the `ImageInput`'s sensor id -- the id of the Task IR
+/// channel whose camera it is (spec 7.4). An Observation IR with several cameras has several
+/// image inputs, and each gets its own camera's frame, never one frame reused.
+pub type ViewSource<'a> =
+    dyn FnMut(&str, &LightOverride, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> + 'a;
+
+/// A [`ViewSource`] for a whole evaluation: handed each episode's [`RenderOverrides`] — the
 /// Task IR's render draws `Env::render_overrides` recorded at reset, with the suite's
 /// [`LightOverride`] folded into its `light` (packet M11/R2, spec 28.14 rule 4) — so the
 /// frame at `(seed, episode, tick)` is the one `es loop collect --frames` and `Rollout` render.
@@ -116,7 +125,7 @@ pub type FrameSource<'a> =
 /// A task that declares no render target draws the identity, and the overrides are then the
 /// suite's light and nothing else: exactly what the frame source was handed before R2.
 pub type DrawnFrameSource<'a> =
-    dyn FnMut(&RenderOverrides, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> + 'a;
+    dyn FnMut(&str, &RenderOverrides, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> + 'a;
 
 /// Where a run says, as it happens, what it just did (packet M7/E4).
 ///
@@ -278,18 +287,28 @@ fn episode_draws(recorded: &RenderOverrides, light: &LightOverride) -> RenderOve
 /// episode's own `ImageSpec` (`RenderOverrides::image_spec`, `INV-14`) -- or `None` when no
 /// camera an image channel names was drawn.
 fn drawn_intrinsics(task: &TaskIr, drawn: &RenderOverrides) -> Option<es_ir::image::Intrinsics> {
-    task.observation_spec.channels.values().find_map(|c| {
-        match (&c.source, c.ty.frame, c.ty.image) {
-            (
-                es_ir::task::ObsSource::Sensor { .. },
-                es_ir::types::Frame::Camera(camera),
-                Some(spec),
-            ) if drawn.cameras.contains_key(&camera) => {
-                Some(drawn.image_spec(camera, &spec).intrinsics)
-            }
-            _ => None,
+    task.observation_spec
+        .channels
+        .values()
+        .find_map(|c| channel_intrinsics(c, drawn))
+}
+
+/// [`drawn_intrinsics`] of one channel: `None` unless it is an image sensor whose camera was
+/// drawn.
+fn channel_intrinsics(
+    c: &es_ir::task::ObsChannel,
+    drawn: &RenderOverrides,
+) -> Option<es_ir::image::Intrinsics> {
+    match (&c.source, c.ty.frame, c.ty.image) {
+        (
+            es_ir::task::ObsSource::Sensor { .. },
+            es_ir::types::Frame::Camera(camera),
+            Some(spec),
+        ) if drawn.cameras.contains_key(&camera) => {
+            Some(drawn.image_spec(camera, &spec).intrinsics)
         }
-    })
+        _ => None,
+    }
 }
 
 /// One cell's frame directory: the raw `.bin` sequence plus the `layout.json` that pins their
@@ -304,12 +323,63 @@ pub struct CellFrames {
     /// The episode's drawn intrinsics, written into `layout.json` beside `dtype` and `shape`
     /// (packet M11/R2, `INV-14`); `None` writes the layout it always did.
     intrinsics: Option<es_ir::image::Intrinsics>,
+    /// A plan with several image inputs (packet M15/N2): input name -> its own
+    /// `<cell>/<channel>/` directory, each a cell of its own. Empty for one image input,
+    /// which writes into `dir` itself exactly as before.
+    views: BTreeMap<String, CellFrames>,
 }
 
 impl CellFrames {
-    /// Appends one frame and returns its index. The first one writes `layout.json`, so a cell
-    /// that rendered nothing leaves no half-described directory behind.
-    fn write(&mut self, dtype: ElemType, shape: &[u64], data: &[u8]) -> Result<u64, EvalError> {
+    /// The cell `dir` of `task`'s episode drawn as `drawn`, for a plan whose image inputs are
+    /// `images` (their plan input names). Several inputs each get a subdirectory named after
+    /// the Task IR channel whose sensor they read -- the layout `es loop collect --frames`
+    /// writes -- and that channel's own drawn intrinsics.
+    fn new(dir: PathBuf, task: &TaskIr, drawn: &RenderOverrides, images: &[&String]) -> Self {
+        let views = if images.len() > 1 {
+            images
+                .iter()
+                .map(|input| {
+                    let channel = task.observation_spec.channels.iter().find(|(_, c)| {
+                        matches!(c.source, es_ir::task::ObsSource::Sensor { id, .. }
+                            if id.to_string() == **input)
+                    });
+                    let name = channel.map_or((*input).clone(), |(name, _)| name.clone());
+                    let intrinsics = channel.and_then(|(_, c)| channel_intrinsics(c, drawn));
+                    let view = Self {
+                        dir: dir.join(name),
+                        n: 0,
+                        intrinsics,
+                        views: BTreeMap::new(),
+                    };
+                    ((*input).clone(), view)
+                })
+                .collect()
+        } else {
+            BTreeMap::new()
+        };
+        Self {
+            intrinsics: drawn_intrinsics(task, drawn),
+            dir,
+            n: 0,
+            views,
+        }
+    }
+
+    /// Appends one frame of image input `input` and returns its index. The first one writes
+    /// `layout.json`, so a cell that rendered nothing leaves no half-described directory
+    /// behind. Every input of a step writes one frame, so the indices advance together.
+    fn write(
+        &mut self,
+        input: &str,
+        dtype: ElemType,
+        shape: &[u64],
+        data: &[u8],
+    ) -> Result<u64, EvalError> {
+        if let Some(view) = self.views.get_mut(input) {
+            let index = view.write(input, dtype, shape, data)?;
+            self.n = view.n;
+            return Ok(index);
+        }
         let io = |path: &Path| {
             let p = path.display().to_string();
             move |source| EvalError::Io {
@@ -708,10 +778,14 @@ impl Evaluation {
                 // One cell of the mosaic is one episode of one suite: `single_env()` makes
                 // them independent runs, so the grid is `suites x episodes` directories.
                 let name = cell_name(&suite.name, idx as u64);
-                let mut cell_frames = frames_dir.map(|d| CellFrames {
-                    dir: d.join(&name),
-                    n: 0,
-                    intrinsics: drawn_intrinsics(task, env.render_overrides(0)),
+                let sources_now = sources.as_ref().expect("just resolved");
+                let images: Vec<&String> = sources_now
+                    .iter()
+                    .filter(|(_, c)| matches!(c, Capture::Image))
+                    .map(|(input, _)| input)
+                    .collect();
+                let mut cell_frames = frames_dir.map(|d| {
+                    CellFrames::new(d.join(&name), task, env.render_overrides(0), &images)
                 });
                 let mut events = Vec::new();
                 // One `.estraj` per episode, the same cell name the frames use: what the
@@ -1056,8 +1130,8 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     // `capture_at` is `Rollout`'s too and keeps its per-call light argument; this ignores it.
     let drawn = episode_draws(env.render_overrides(0), &overrides.light);
     let mut frames = frames.map(|source| {
-        move |_: &LightOverride, model: &ModelInfo, state: &StateView<'_>| {
-            source(&drawn, model, state)
+        move |input: &str, _: &LightOverride, model: &ModelInfo, state: &StateView<'_>| {
+            source(input, &drawn, model, state)
         }
     });
     let hold = vec![0.0; nu];
@@ -1103,12 +1177,12 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
             if let Some(t) = traj.as_deref_mut() {
                 t.push(env.model(), &env.backend().state(), 0)?;
             }
-            let (names, bytes, rendered) = capture_at(
+            let (names, bytes, rendered) = capture_views(
                 plan,
                 sources,
                 env.model(),
                 &env.backend().state(),
-                frames.as_mut().map(|f| f as &mut FrameSource<'_>),
+                frames.as_mut().map(|f| f as &mut ViewSource<'_>),
                 &overrides.light,
                 cell_frames.as_deref_mut(),
                 &previous,
@@ -1510,7 +1584,37 @@ pub fn capture_at(
     sources: &BTreeMap<String, Capture>,
     model: &ModelInfo,
     state: &StateView<'_>,
-    mut frames: Option<&mut FrameSource<'_>>,
+    frames: Option<&mut FrameSource<'_>>,
+    light: &LightOverride,
+    cell_frames: Option<&mut CellFrames>,
+    previous: &[f64],
+) -> Result<Captured, EvalError> {
+    let mut named = frames.map(|frame| {
+        move |_: &str, light: &LightOverride, model: &ModelInfo, state: &StateView<'_>| {
+            frame(light, model, state)
+        }
+    });
+    capture_views(
+        plan,
+        sources,
+        model,
+        state,
+        named.as_mut().map(|f| f as &mut ViewSource<'_>),
+        light,
+        cell_frames,
+        previous,
+    )
+}
+
+/// [`capture_at`] with a [`ViewSource`]: every image input is asked for by its own name, so
+/// several cameras each feed their own port (packet M15/N2).
+#[allow(clippy::too_many_arguments)]
+pub fn capture_views(
+    plan: &CpuPlan,
+    sources: &BTreeMap<String, Capture>,
+    model: &ModelInfo,
+    state: &StateView<'_>,
+    mut frames: Option<&mut ViewSource<'_>>,
     light: &LightOverride,
     mut cell_frames: Option<&mut CellFrames>,
     previous: &[f64],
@@ -1604,7 +1708,7 @@ pub fn capture_at(
                 };
                 // Exactly what the plan declared, or nothing: the frame is not resized, converted
                 // or reordered here — every such step is an Observation IR node (§7.2, INV-14).
-                let data = frame(light, model, state).map_err(EvalError::Plan)?;
+                let data = frame(name, light, model, state).map_err(EvalError::Plan)?;
                 let want = desc.elems * elem_bytes(desc.dtype);
                 if data.len() != want {
                     return Err(EvalError::Plan(format!(
@@ -1618,7 +1722,7 @@ pub fn capture_at(
                 // The frame the policy sees is the frame on disk: written here, from the same
                 // bytes, before anything downstream can touch them.
                 if let Some(cell) = cell_frames.as_deref_mut() {
-                    rendered = Some(cell.write(desc.dtype, &desc.shape, &data)?);
+                    rendered = Some(cell.write(name, desc.dtype, &desc.shape, &data)?);
                 }
                 descs.push((name.clone(), desc.dtype, desc.shape.clone()));
                 bytes.push(data);

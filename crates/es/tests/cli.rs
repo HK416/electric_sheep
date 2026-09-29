@@ -4639,7 +4639,8 @@ fn expert_passes_the_evaluation_harness() {
         let taken = Rc::clone(&seen);
         let blank_for_source = blank.clone();
         let mut frames =
-            move |_light: &es_env::randomize::RenderOverrides,
+            move |_: &str,
+                  _light: &es_env::randomize::RenderOverrides,
                   model: &es_physics_core::backend::ModelInfo,
                   state: &es_physics_core::backend::StateView<'_>| {
                 let mut row = state.qpos_of(0).to_vec();
@@ -4804,7 +4805,8 @@ fn collection_and_evaluation_draw_the_same_scene_for_a_seed() {
     let evaluated: Rc<RefCell<Option<Vec<f64>>>> = Rc::new(RefCell::new(None));
     let taken = Rc::clone(&evaluated);
     let blank = vec![0u8; 96 * 96 * 3];
-    let mut frames = move |_light: &es_env::randomize::RenderOverrides,
+    let mut frames = move |_: &str,
+                           _light: &es_env::randomize::RenderOverrides,
                            _model: &es_physics_core::backend::ModelInfo,
                            state: &es_physics_core::backend::StateView<'_>| {
         let mut slot = taken.borrow_mut();
@@ -5000,7 +5002,8 @@ fn collection_and_evaluation_ask_the_policy_at_the_same_cadence() {
         let (trace, seen) = (Rc::clone(&evaluated), Rc::clone(&seen));
         let blank = vec![0u8; 96 * 96 * 3];
         let mut frames =
-            move |_light: &es_env::randomize::RenderOverrides,
+            move |_: &str,
+                  _light: &es_env::randomize::RenderOverrides,
                   model: &es_physics_core::backend::ModelInfo,
                   state: &es_physics_core::backend::StateView<'_>| {
                 let row = row_of(state);
@@ -5197,7 +5200,8 @@ fn collection_and_evaluation_draw_the_same_trajectory() {
         let seen = Rc::clone(&seen);
         let blank = vec![0u8; 96 * 96 * 3];
         let mut frames =
-            move |_light: &es_env::randomize::RenderOverrides,
+            move |_: &str,
+                  _light: &es_env::randomize::RenderOverrides,
                   model: &es_physics_core::backend::ModelInfo,
                   state: &es_physics_core::backend::StateView<'_>| {
                 *seen.borrow_mut() = Some((model.clone(), row_of(state)));
@@ -7569,7 +7573,8 @@ fn a_showcase_replay_reproduces_the_frames_the_policy_saw() {
         calls: std::rc::Rc::default(),
     };
     let taken = Rc::clone(&seen);
-    let mut source = |_light: &es_env::randomize::RenderOverrides,
+    let mut source = |_: &str,
+                      _light: &es_env::randomize::RenderOverrides,
                       model: &es_physics_core::backend::ModelInfo,
                       state: &es_physics_core::backend::StateView<'_>| {
         let mut row = state.qpos_of(0).to_vec();
@@ -16366,4 +16371,371 @@ fn train_rl_privileged_critic_is_bitwise_and_reads_state() {
         "RAN {TEST}: 2 iterations twice, bitwise; value input {} = {state} + nq {nq}",
         first[1]
     );
+}
+
+// --- packet M15/N2: several cameras per env -------------------------------------------------
+
+/// `value` with every occurrence of each `(from, to)` pair replaced in its serialized form: a
+/// node, channel or type re-pointed at another camera, id and name alike.
+#[cfg(feature = "render")]
+fn renamed<T: serde::Serialize + serde::de::DeserializeOwned>(
+    value: &T,
+    pairs: &[(String, String)],
+) -> T {
+    let mut text = serde_json::to_string(value).expect("serializes");
+    for (from, to) in pairs {
+        text = text.replace(from.as_str(), to.as_str());
+    }
+    serde_json::from_str(&text).expect("deserializes")
+}
+
+/// The demo seen by a second camera, generated into `dir` (packet M15/N2): the demo scene plus
+/// a world-fixed `side` camera, a Task IR with an `rgb_side` channel bound exactly like
+/// `rgb_overhead`, and an Observation IR with the overhead image chain repeated for it --
+/// packed with the placeholder weights `--expert` never loads. Test-only: nothing committed
+/// moves. Returns the scene's path and the bundle's.
+#[cfg(feature = "render")]
+fn write_two_camera_bundle(dir: &Path) -> (PathBuf, PathBuf) {
+    use es_ir::graph::NodeId;
+    use es_ir::observation::ObservationNode;
+    use es_ir::task::TaskNode;
+
+    let overhead_line = "<camera name=\"overhead\" pos=\"0.16 0 0.5\" fovy=\"45\"/>";
+    let xml = std::fs::read_to_string(demo_scene_path()).expect("the demo scene");
+    assert!(
+        xml.contains(overhead_line),
+        "the demo scene's overhead camera moved"
+    );
+    // Straight down like the overhead camera and at its field of view, so the declared
+    // intrinsics stay true; lower and off to the side, so it sees another picture.
+    let xml = xml.replace(
+        overhead_line,
+        &format!("{overhead_line}\n    <camera name=\"side\" pos=\"0.22 0.02 0.35\" fovy=\"45\"/>"),
+    );
+    let scene_path = dir.join("so101_two_cameras.xml");
+    write(&scene_path, &xml);
+    let scene = es_assets::parse_mjcf(&xml)
+        .expect("the two-camera scene parses")
+        .scene;
+    let camera = |name: &str| {
+        scene
+            .cameras
+            .iter()
+            .find(|c| c.name == name)
+            .unwrap_or_else(|| panic!("camera {name}"))
+            .id
+    };
+    let pairs = [
+        (camera("overhead").to_string(), camera("side").to_string()),
+        ("rgb_overhead".to_owned(), "rgb_side".to_owned()),
+    ];
+
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let mut task = es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml");
+    task.scene.path = scene_path.display().to_string();
+    task.scene.scene_hash = scene.scene_hash();
+    task.scene.asset_hash = *blake3::hash(xml.as_bytes()).as_bytes();
+    let overhead = camera("overhead");
+    let find = |pred: &dyn Fn(&TaskNode) -> bool| {
+        task.graph
+            .nodes
+            .iter()
+            .find(|(_, n)| pred(n))
+            .map(|(id, n)| (*id, n.clone()))
+            .expect("the demo binds its image channel")
+    };
+    let (_, sensor) =
+        find(&|n| matches!(n, TaskNode::GetSensor { sensor, .. } if *sensor == overhead));
+    let (_, spec) = find(
+        &|n| matches!(n, TaskNode::ObservationSpec { channel, .. } if channel == "rgb_overhead"),
+    );
+    let next = task.graph.nodes.keys().map(|id| id.0).max().expect("nodes") + 1;
+    task.graph.insert(NodeId(next), renamed(&sensor, &pairs));
+    task.graph.insert(NodeId(next + 1), renamed(&spec, &pairs));
+    task.graph
+        .connect(NodeId(next), "value", NodeId(next + 1), "value");
+    let channel = renamed(&task.observation_spec.channels["rgb_overhead"], &pairs);
+    task.observation_spec
+        .channels
+        .insert("rgb_side".to_owned(), channel);
+    assert!(task.validate().is_empty(), "{:?}", task.validate());
+
+    let mut obs =
+        es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation");
+    let input = obs
+        .graph
+        .nodes
+        .iter()
+        .find(|(_, n)| matches!(n, ObservationNode::ImageInput { .. }))
+        .map(|(id, _)| *id)
+        .expect("the demo's image input");
+    // The chain downstream of the image input, repeated at `id + 1000`.
+    let mut chain = vec![input];
+    let mut i = 0;
+    while i < chain.len() {
+        for e in &obs.graph.edges {
+            if e.from.node == chain[i] && !chain.contains(&e.to.node) {
+                chain.push(e.to.node);
+            }
+        }
+        i += 1;
+    }
+    let moved = |id: NodeId| NodeId(id.0 + 1000);
+    for id in &chain {
+        let node = renamed(&obs.graph.nodes[id], &pairs);
+        obs.graph.insert(moved(*id), node);
+    }
+    let edges: Vec<_> = obs
+        .graph
+        .edges
+        .iter()
+        .filter(|e| chain.contains(&e.from.node))
+        .cloned()
+        .collect();
+    for e in edges {
+        obs.graph.connect(
+            moved(e.from.node),
+            &e.from.port,
+            moved(e.to.node),
+            &e.to.port,
+        );
+    }
+    let mut output = renamed(&obs.outputs["rgb_overhead"], &pairs);
+    output.port.node = moved(output.port.node);
+    obs.outputs.insert("rgb_side".to_owned(), output);
+    obs.task_ref = task.task_hash().expect("task hash");
+
+    // Every observation output is a policy input (XIR-010): a second ResNet18 for the side
+    // view, its feature one more input of the `Concat` fusion, whose width stays `out_dim`.
+    let mut learning =
+        es_ir::serial::learning_from_toml(&read("learning.toml")).expect("learning.toml");
+    let port = |ports: &[es_ir::learning::TensorPort], name: &str| {
+        ports
+            .iter()
+            .find(|p| p.name == name)
+            .cloned()
+            .unwrap_or_else(|| panic!("port {name}"))
+    };
+    let side = renamed(&port(&learning.inputs, "rgb_overhead"), &pairs);
+    learning.inputs.push(side.clone());
+    learning
+        .policy
+        .contract
+        .inputs
+        .insert("rgb_side".to_owned(), side);
+    let (encoder, fusion) = {
+        let id_of = |pred: &dyn Fn(&es_ir::learning::LearningNode) -> bool| {
+            *learning
+                .nodes
+                .nodes
+                .iter()
+                .find(|(_, n)| pred(n))
+                .expect("the demo's graph")
+                .0
+        };
+        (
+            id_of(&|n| matches!(n, es_ir::learning::LearningNode::VisionEncoder { .. })),
+            id_of(&|n| matches!(n, es_ir::learning::LearningNode::Fusion { .. })),
+        )
+    };
+    let next = learning
+        .nodes
+        .nodes
+        .keys()
+        .map(|id| id.0)
+        .max()
+        .expect("nodes")
+        + 1;
+    let encoder_side = renamed(&learning.nodes.nodes[&encoder], &pairs);
+    learning.nodes.insert(NodeId(next), encoder_side);
+    if let Some(es_ir::learning::LearningNode::Fusion { inputs, .. }) =
+        learning.nodes.nodes.get_mut(&fusion)
+    {
+        let mut feature = port(inputs, "image");
+        "image_side".clone_into(&mut feature.name);
+        inputs.push(feature);
+    }
+    learning
+        .nodes
+        .connect(NodeId(next), "out", fusion, "image_side");
+    learning
+        .nodes
+        .inputs
+        .push(es_ir::graph::PortRef::new(NodeId(next), "rgb_side"));
+
+    let (task_path, obs_path, learning_path) = (
+        dir.join("task.toml"),
+        dir.join("observation.toml"),
+        dir.join("learning.toml"),
+    );
+    write(
+        &task_path,
+        &es_ir::serial::task_to_toml(&task).expect("task toml"),
+    );
+    write(
+        &obs_path,
+        &es_ir::serial::observation_to_toml(&obs).expect("observation toml"),
+    );
+    write(
+        &learning_path,
+        &es_ir::serial::learning_to_toml(&learning).expect("learning toml"),
+    );
+    let bytes = pack_untrained(
+        &task_path,
+        &obs_path,
+        &learning_path,
+        &vl_fixture("deployment.toml"),
+    );
+    let bundle = dir.join("two-cameras.esb");
+    std::fs::write(&bundle, bytes).expect("write the bundle");
+    (scene_path, bundle)
+}
+
+/// Packet M15/N2 oracle 2: **two cameras through `es loop collect --frames` and `es eval run
+/// --frames`**, on a generated two-camera version of the demo.
+///
+/// The collection writes `<frames>/rgb_overhead/` and `<frames>/rgb_side/`, one frame per
+/// control step each and **different** frames (two pictures, not one reused), and no flat
+/// frame beside them. The evaluation, under the same expert and seed, feeds both image ports:
+/// each cell has one directory per channel, and at tick 0 -- the reset state both paths
+/// render -- each channel's frame is the collection's frame of the **same** channel, so no
+/// port was handed the other camera. Needs `mujoco`, `slangc` and a Vulkan device.
+#[test]
+#[cfg(feature = "render")]
+fn two_cameras_collect_and_evaluate_with_both_ports_fed() {
+    const TICKS: usize = 12;
+    const SEED: u64 = 1;
+    const TEST: &str = "two_cameras_collect_and_evaluate_with_both_ports_fed";
+    const CHANNELS: [&str; 2] = ["rgb_overhead", "rgb_side"];
+
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP {TEST}: {reason}");
+        return;
+    }
+    if let Err(e) = es_gpu::SlangCompiler::new() {
+        println!("SKIP {TEST}: no slangc ({e})");
+        return;
+    }
+    if let Err(e) = es_gpu::Gpu::open(es_gpu::GpuOptions::default()) {
+        println!("SKIP {TEST}: no Vulkan device ({e})");
+        return;
+    }
+    let dir = scratch_dir("two-cameras");
+    let (scene, bundle) = write_two_camera_bundle(&dir);
+
+    // --- es loop collect --frames ----------------------------------------------------------
+    let collected = dir.join("collect-frames");
+    let out = bin()
+        .args([
+            "loop",
+            "collect",
+            "--expert",
+            "so101-pick-place",
+            "--policy",
+        ])
+        .arg(&bundle)
+        .arg("--scene")
+        .arg(&scene)
+        .args(["--episodes", "1", "--seed", &SEED.to_string()])
+        .args(["--max-steps", &TICKS.to_string()])
+        .arg("--frames")
+        .arg(&collected)
+        .arg("--out")
+        .arg(dir.join("ds"))
+        .output()
+        .expect("run es loop collect");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "collect\n{}{}",
+        stdout(&out),
+        stderr_of(&out)
+    );
+    assert!(
+        !collected.join("000000.bin").exists(),
+        "several channels wrote a flat frame"
+    );
+    let frame = |dir: &Path, tick: usize| {
+        std::fs::read(dir.join(format!("{tick:06}.bin")))
+            .unwrap_or_else(|e| panic!("{}/{tick:06}.bin: {e}", dir.display()))
+    };
+    for tick in 0..TICKS {
+        let [a, b] = CHANNELS.map(|c| frame(&collected.join(c), tick));
+        assert_eq!(a.len(), 96 * 96 * 3, "tick {tick}: not a 96x96 Rgb8 tile");
+        assert!(collected
+            .join(CHANNELS[1])
+            .join(format!("{tick:06}.json"))
+            .is_file());
+        assert!(a != b, "tick {tick}: the two cameras wrote one picture");
+    }
+    assert!(
+        !collected
+            .join(CHANNELS[0])
+            .join(format!("{TICKS:06}.bin"))
+            .exists(),
+        "one frame per control step"
+    );
+
+    // --- es eval run --frames, the seed's first episode ------------------------------------
+    let opened = es_compile::PolicyBundle::open(&std::fs::read(&bundle).expect("bundle"))
+        .expect("the bundle opens");
+    let mut ir = es_ir::serial::evaluation_from_toml(
+        &std::fs::read_to_string(vl_fixture("evaluation.toml")).expect("evaluation.toml"),
+    )
+    .expect("the demo evaluation parses");
+    ir.task = hex(&opened.task.task_hash().expect("task hash"));
+    ir.observation = hex(&opened.observation.observation_hash().expect("obs hash"));
+    ir.suites.truncate(1);
+    ir.episodes.n_episodes = 1;
+    ir.episodes.seeds = es_ir::evaluation::SeedPlan::Explicit(vec![SEED]);
+    ir.acceptance.clear();
+    let config = dir.join("nominal.toml");
+    write(
+        &config,
+        &es_ir::serial::evaluation_to_toml(&ir).expect("evaluation toml"),
+    );
+    let eval_out = dir.join("eval");
+    let out = bin()
+        .args(["eval", "run", "--config"])
+        .arg(&config)
+        .arg("--policy")
+        .arg(&bundle)
+        .arg("--scene")
+        .arg(&scene)
+        .arg("--out")
+        .arg(&eval_out)
+        .arg("--frames")
+        .arg(eval_out.join("frames"))
+        .args(["--expert", "so101-pick-place"])
+        .output()
+        .expect("run es eval run");
+    assert!(
+        matches!(out.status.code(), Some(0 | 1)),
+        "eval exit {:?}\n{}{}",
+        out.status.code(),
+        stdout(&out),
+        stderr_of(&out)
+    );
+    let cell = eval_out
+        .join("frames")
+        .join(format!("{}-00", ir.suites[0].name));
+    assert!(
+        !cell.join("000000.bin").exists(),
+        "several inputs wrote a flat frame"
+    );
+    let [a, b] = CHANNELS.map(|c| {
+        assert!(
+            cell.join(c).join("layout.json").is_file(),
+            "{c}: no layout.json"
+        );
+        frame(&cell.join(c), 0)
+    });
+    assert!(a != b, "the evaluation fed both ports one picture");
+    for (c, evaluated) in CHANNELS.iter().zip([a, b]) {
+        assert!(
+            evaluated == frame(&collected.join(c), 0),
+            "{c}: the evaluation's tick-0 frame is not the collection's frame of that camera"
+        );
+    }
+    println!("RAN {TEST}: {TICKS} ticks x 2 cameras collected, both ports fed in evaluation");
 }

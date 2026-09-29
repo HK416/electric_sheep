@@ -66,9 +66,10 @@ collect    Opens the policy bundle (spec 9.6), rolls out <N> episodes through th
                          never bitwise.
            Without --frames no pixels are written: an image channel becomes a declared
            video feature with VideoRef placeholders, plus a warning. --frames <dir> renders
-           the Task IR's one image channel from its own camera, once per control step, as
+           every image channel of the Task IR from its own camera, once per control step, as
            <dir>/<NNNNNN>.bin + .json -- the raw-tile format `es video mosaic` and the render
-           goldens already use. It needs the `render` feature and a Vulkan device; a build
+           goldens already use -- or, with several channels, <dir>/<channel>/<NNNNNN>.bin +
+           .json per channel. It needs the `render` feature and a Vulkan device; a build
            without it refuses the flag rather than writing a dataset with a hole in it.
            Every episode's per-tick state (qpos, qvel and every body's world pose) is
            written to <root>/traj/ep-NNN.estraj, or to --traj <dir>; `es video showcase`
@@ -230,34 +231,6 @@ macro_rules! dispatch_nj_h {
     };
 }
 
-/// The renderer `--frames` needs, built from what the bundle's Task IR already declares.
-///
-/// One image channel: `MultiViewPack` is rejected upstream anyway, and a second camera would be
-/// a second frame directory this flag does not have a name for. The `ImageSpec` is the Task
-/// IR's, so a scene whose camera does not produce what the IR declares is refused by
-/// `EnvRenderer::check` rather than silently rendered at the wrong size (`INV-14`), and the
-/// render path is the channel's own `render` declaration (packet M7/R5) -- there is no flag
-/// for it, because the document decides.
-#[cfg(feature = "render")]
-fn renderer_cfg(
-    bundle: &PolicyBundle,
-    frames: &std::path::Path,
-) -> Result<es_env::EnvRendererCfg, CliError> {
-    let (name, frame, spec, render) = crate::cmd::eval::image_channel(&bundle.task)?;
-    let es_ir::types::Frame::Camera(camera) = frame else {
-        return Err(CliError::Runtime(format!(
-            "image channel {name:?} is not in a camera frame, so there is no camera to render \
-             it from"
-        )));
-    };
-    Ok(es_env::render::sensor_cfg(
-        camera,
-        &spec,
-        &render,
-        Some(frames.to_path_buf()),
-    ))
-}
-
 fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
     spec: &CollectSpec<'_>,
     policy: &mut dyn PolicyRuntime,
@@ -327,17 +300,18 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
             None => Intervention::Abort,
         }
     };
-    // With a renderer, the image channel the Task IR declares stops being a dangling video
-    // reference: `EnvRenderer::frame` writes `<dir>/<NNNNNN>.bin` + `.json` per control step.
+    // With a renderer, the image channels the Task IR declares stop being dangling video
+    // references: `EnvRenderer::frames_with` writes `<NNNNNN>.bin` + `.json` per control step
+    // and per camera, all cameras in one dispatch (`es_tools::frame_cameras` says where).
     // The `Gpu` and the renderer live here because `EnvRenderer<'gpu>` borrows the device, and
     // putting that borrow on `Env` would put a lifetime on a type `es-data` and `es-eval` both
     // name (design note section 7.4).
     #[cfg(feature = "render")]
     if let Some(dir) = frames {
-        let cfg = renderer_cfg(spec.bundle, dir)?;
+        let cameras = es_tools::frame_cameras(&spec.bundle.task, Some(dir))?;
         let gpu = es_gpu::Gpu::open(es_gpu::GpuOptions::default())
             .map_err(|e| CliError::Runtime(format!("no Vulkan device for --frames: {e}")))?;
-        let mut renderer = es_env::EnvRenderer::new(&gpu, spec.scene, cfg)
+        let mut renderer = es_env::EnvRenderer::views(&gpu, spec.scene, cameras)
             .map_err(|e| CliError::Runtime(e.to_string()))?;
         std::fs::create_dir_all(dir)
             .map_err(|e| CliError::Runtime(format!("{}: {e}", dir.display())))?;
@@ -355,13 +329,16 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
                     renderer.begin_episode();
                 }
                 let drawn = episode_draws(drawn, &light.get());
-                let tile = renderer
-                    .frame_with(model, state, 0, &drawn)
+                let tiles = renderer
+                    .frames_with(model, state, 0, &drawn)
                     .map_err(|e| e.to_string())?;
                 // The tile the run already rendered, borrowed, not a second render (packet
                 // M7/E7); the publisher decides whether this is one of the published ones.
-                if let (Some(p), Some(bytes)) = (&publisher, tile.as_u8()) {
-                    p.borrow_mut().observation(tile.shape, bytes);
+                // The first camera's: the stream carries one image.
+                if let (Some(p), Some((_, tile))) = (&publisher, tiles.first()) {
+                    if let Some(bytes) = tile.as_u8() {
+                        p.borrow_mut().observation(tile.shape, bytes);
+                    }
                 }
                 Ok(())
             };

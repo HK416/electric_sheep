@@ -478,10 +478,31 @@ fn observation_ir(task_ref: [u8; 32], augment: Option<bool>) -> ObservationIr {
 
 /// One `ImageInput`, 8x8 `Rgb8`: the port §10.1 refuses without a frame source and serves
 /// with one (packet `docs/packets/M5/V0b-render-in-the-loop.md`).
-#[allow(clippy::default_trait_access)] // `es-eval` does not depend on `es-math` for `Pose`.
 fn image_observation_ir(task_ref: [u8; 32]) -> ObservationIr {
     let camera = StableId::from_path("camera/overhead");
-    let ty = PortType {
+    let ty = image_ty(camera);
+    let mut ir = ObservationIr::new(1, task_ref);
+    ir.graph.insert(
+        NodeId(0),
+        ObservationNode::ImageInput {
+            sensor: camera,
+            io: Io::source(ty.clone()),
+        },
+    );
+    ir.outputs = BTreeMap::from([(
+        "rgb".to_owned(),
+        ObservationOutput {
+            port: PortRef::new(NodeId(0), "out"),
+            ty,
+        },
+    )]);
+    ir
+}
+
+/// The 8x8 `Rgb8` frame `camera` delivers.
+#[allow(clippy::default_trait_access)] // `es-eval` does not depend on `es-math` for `Pose`.
+fn image_ty(camera: StableId) -> PortType {
+    PortType {
         elem: ElemType::U8,
         shape: Shape::new([u64::from(IMG), u64::from(IMG), 3]),
         unit: Unit::Pixel,
@@ -505,23 +526,7 @@ fn image_observation_ir(task_ref: [u8; 32]) -> ObservationIr {
             rate_hz: CONTROL_HZ as f32,
             depth_scale: None,
         }),
-    };
-    let mut ir = ObservationIr::new(1, task_ref);
-    ir.graph.insert(
-        NodeId(0),
-        ObservationNode::ImageInput {
-            sensor: camera,
-            io: Io::source(ty.clone()),
-        },
-    );
-    ir.outputs = BTreeMap::from([(
-        "rgb".to_owned(),
-        ObservationOutput {
-            port: PortRef::new(NodeId(0), "out"),
-            ty,
-        },
-    )]);
-    ir
+    }
 }
 
 /// `StateInput(j0) -> Normalize -> TemporalWindow(n = 2)`. The policy reads the first element
@@ -1207,7 +1212,7 @@ fn a_frame_source_serves_the_image_input() {
     let task = task_ir();
     let obs = image_observation_ir(task.task_hash().expect("task hashes"));
     let mut calls = 0u32;
-    let mut frames = |_: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| {
+    let mut frames = |_: &str, _: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| {
         calls += 1;
         Ok(vec![0x5a_u8; IMG as usize * IMG as usize * 3])
     };
@@ -1223,7 +1228,8 @@ fn a_frame_of_the_wrong_size_is_refused_not_resized() {
     let ir = evaluation_ir(20_260_912, basic_metrics(), Vec::new());
     let task = task_ir();
     let obs = image_observation_ir(task.task_hash().expect("task hashes"));
-    let mut frames = |_: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| Ok(vec![0_u8; 4]);
+    let mut frames =
+        |_: &str, _: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| Ok(vec![0_u8; 4]);
     let err = run_obs_frames(&ir, &obs, 0.2, Some(&mut frames), None).expect_err("a short frame");
     let EvalError::Plan(message) = &err else {
         panic!("expected EvalError::Plan, got {err}");
@@ -1231,7 +1237,7 @@ fn a_frame_of_the_wrong_size_is_refused_not_resized() {
     assert!(message.contains("the frame supplies 4 bytes"), "{message}");
 
     // A frame source that cannot render says so, and the reason survives.
-    let mut broken = |_: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| {
+    let mut broken = |_: &str, _: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| {
         Err("no camera in the scene".to_owned())
     };
     let err = run_obs_frames(&ir, &obs, 0.2, Some(&mut broken), None).expect_err("a broken source");
@@ -1250,8 +1256,8 @@ fn scratch(name: &str) -> std::path::PathBuf {
 /// A frame source whose bytes are a pure function of the state and the lighting, so two runs
 /// of the same conditions agree.
 fn state_frames(
-) -> impl FnMut(&RenderOverrides, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> {
-    |light: &RenderOverrides, _: &ModelInfo, state: &StateView<'_>| {
+) -> impl FnMut(&str, &RenderOverrides, &ModelInfo, &StateView<'_>) -> Result<Vec<u8>, String> {
+    |_: &str, light: &RenderOverrides, _: &ModelInfo, state: &StateView<'_>| {
         let q = state.qpos_of(0)[0] * light.light.intensity;
         let mut out = vec![0_u8; IMG as usize * IMG as usize * 3];
         // `FakePolicy::infer` reads the first four bytes of its first input as an `f32`, so
@@ -1345,6 +1351,130 @@ fn events_json_has_one_record_per_frame() {
     // The spelling `es video mosaic` reads (`crates/es/src/cmd/video.rs`).
     assert!(text.contains("\"source\": \"Policy\""), "{text:.400}");
     assert!(text.contains("\"frame\": 0"), "{text:.400}");
+}
+
+/// Packet M15/N2 oracle: **two cameras, two image inputs, each fed its own camera's frame.**
+///
+/// The frame source is asked once per image input per step, by that input's name (its sensor
+/// id); every policy call sees each port carry its own camera's bytes, never one frame reused;
+/// and `--frames` writes one `<cell>/<channel>/` directory per camera, named after the Task IR
+/// channel, each with its own `layout.json` and as many frames as the cell has records.
+#[test]
+fn each_image_input_gets_its_own_cameras_frame() {
+    let cameras = [
+        ("rgb_a", StableId::from_path("camera/a"), 0x11_u8),
+        ("rgb_b", StableId::from_path("camera/b"), 0x22_u8),
+    ];
+    let mut task = task_ir();
+    let mut obs = ObservationIr::new(1, [0; 32]);
+    for (k, (name, camera, _)) in cameras.iter().enumerate() {
+        let ty = image_ty(*camera);
+        task.observation_spec.channels.insert(
+            (*name).to_owned(),
+            ObsChannel {
+                source: ObsSource::Sensor {
+                    id: *camera,
+                    format: es_ir::image::ChannelFormat::Rgb,
+                    render: es_ir::task::SensorRender::default(),
+                },
+                ty: ty.clone(),
+            },
+        );
+        obs.graph.insert(
+            NodeId(k as u32),
+            ObservationNode::ImageInput {
+                sensor: *camera,
+                io: Io::source(ty.clone()),
+            },
+        );
+        obs.outputs.insert(
+            (*name).to_owned(),
+            ObservationOutput {
+                port: PortRef::new(NodeId(k as u32), "out"),
+                ty,
+            },
+        );
+    }
+    obs.task_ref = task.task_hash().expect("task hashes");
+    let fill: BTreeMap<String, u8> = cameras
+        .iter()
+        .map(|(_, camera, byte)| (camera.to_string(), *byte))
+        .collect();
+    let mut asked: Vec<String> = Vec::new();
+    let mut frames = |input: &str, _: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| {
+        asked.push(input.to_owned());
+        let byte = fill
+            .get(input)
+            .ok_or_else(|| format!("no camera behind input {input}"))?;
+        Ok(vec![*byte; IMG as usize * IMG as usize * 3])
+    };
+    let dir = scratch("two-cameras");
+    let mut sink = FrameSink::new(&dir);
+    let mut policy = RecordingPolicy::default();
+    Evaluation::run_with_frames::<FakeBackend, _, NJ, H>(
+        &one_suite(Vec::new()),
+        &task,
+        &scene(),
+        &obs,
+        &mut policy,
+        &deployment_ir(),
+        FakeBackend::new,
+        &RunConfig::default(),
+        Some(&mut frames),
+        Some(&mut sink),
+    )
+    .expect("the two-camera run");
+
+    // Asked for each input by name, once per step, in plan-input order.
+    let names: Vec<String> = fill.keys().cloned().collect();
+    assert!(!asked.is_empty() && asked.len() % 2 == 0, "{asked:?}");
+    for step in asked.chunks(2) {
+        assert_eq!(step, names.as_slice());
+    }
+    // Every policy call: each port its own camera's bytes.
+    assert!(!policy.seen.is_empty(), "the policy was never called");
+    for inputs in &policy.seen {
+        for (name, _, byte) in &cameras {
+            let data = &inputs[*name].data;
+            assert!(
+                !data.is_empty() && data.iter().all(|b| b == byte),
+                "port {name} did not carry its camera's frame"
+            );
+        }
+    }
+    // One directory per camera, named after its channel.
+    for (cell, records) in &sink.events {
+        let cell_dir = dir.join(cell);
+        assert!(
+            !cell_dir.join("000000.bin").exists(),
+            "{cell}: a flat frame"
+        );
+        for (name, _, byte) in &cameras {
+            let view = cell_dir.join(name);
+            let layout = std::fs::read_to_string(view.join("layout.json")).expect("layout.json");
+            assert_eq!(
+                layout.trim(),
+                format!("{{\"dtype\":\"u8\",\"shape\":[{IMG}, {IMG}, 3]}}"),
+                "{cell}/{name}"
+            );
+            let bins = std::fs::read_dir(&view)
+                .expect("the camera's directory")
+                .filter(|e| {
+                    e.as_ref()
+                        .expect("entry")
+                        .path()
+                        .extension()
+                        .is_some_and(|x| x == "bin")
+                })
+                .count();
+            assert_eq!(bins, records.len(), "{cell}/{name}");
+            let first = std::fs::read(view.join("000000.bin")).expect("frame 0");
+            assert!(
+                first.iter().all(|b| b == byte),
+                "{cell}/{name}: another camera's frame"
+            );
+        }
+    }
 }
 
 /// Packet M7/T7 oracle 1 -- **tick 0 of every episode is a chunk underrun under a declared
@@ -1551,12 +1681,13 @@ fn episode_zero_runs_on_the_first_randomization_draw() {
 
     let seen: Rc<RefCell<Vec<f64>>> = Rc::new(RefCell::new(Vec::new()));
     let taken = Rc::clone(&seen);
-    let mut frames = move |light: &RenderOverrides,
+    let mut frames = move |input: &str,
+                           light: &RenderOverrides,
                            model: &ModelInfo,
                            state: &StateView<'_>|
           -> Result<Vec<u8>, String> {
         taken.borrow_mut().push(state.qpos_of(0)[0]);
-        state_frames()(light, model, state)
+        state_frames()(input, light, model, state)
     };
 
     let (mut ir, obs) = image_ir();
@@ -1725,7 +1856,7 @@ fn the_light_kinds_need_a_frame_source() {
 
     // With one, the draw reaches the frame source and is not the identity.
     let mut seen: BTreeSet<(u64, u64)> = BTreeSet::new();
-    let mut frames = |light: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| {
+    let mut frames = |_: &str, light: &RenderOverrides, _: &ModelInfo, _: &StateView<'_>| {
         seen.insert((
             light.light.intensity.to_bits(),
             light.light.yaw_deg.to_bits(),
@@ -2206,7 +2337,7 @@ fn a_baked_frame_is_bit_identical_to_what_capture_serves() {
     // The frame source is also the recorder: it is handed the very `StateView` `capture` reads,
     // so the rows below are the rows the plan saw, not a re-simulation of them.
     let mut recorded: Vec<(Vec<f64>, Vec<u8>)> = Vec::new();
-    let mut frames = |_: &RenderOverrides, _: &ModelInfo, state: &StateView<'_>| {
+    let mut frames = |_: &str, _: &RenderOverrides, _: &ModelInfo, state: &StateView<'_>| {
         let q = state.qpos_of(0)[0];
         let mut tile = vec![0_u8; IMG as usize * IMG as usize * 3];
         for (i, byte) in tile.iter_mut().enumerate() {
