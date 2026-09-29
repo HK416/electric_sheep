@@ -19,12 +19,14 @@ use es_data::collect::{read_loop_steps, LoopKind, CHECKPOINT};
 use es_data::training::{collect_root, lerobot_checkpoint, Cycle, Route};
 use es_eval::episodes::{read_episodes, EpisodeRow};
 use es_eval::metrics::{failure_name, violation_name};
+use es_eval::perturb::unseen_age;
 use es_eval::run_dir::{CellRow, RunDir};
+use es_ir::deployment::DeploymentIr;
 use es_ir::evaluation::{
     AcceptanceResult, Comparator, EvaluationIr, EvaluationReport, MetricSpec, MetricValue,
     PerturbationKind,
 };
-use es_ir::serial::evaluation_from_toml;
+use es_ir::serial::{deployment_from_toml, evaluation_from_toml};
 use es_safety::ViolationKind;
 
 use crate::model::i18n::{fill, t, Lang, Strings};
@@ -144,10 +146,37 @@ const FAILURE_KINDS: [FailureKind; 8] = [
 
 const SUCCESS: &str = "success";
 
+/// The share of an attempt's steps, in percent, that one of the Safety Plane's step counters
+/// (`fallback` and every `violation.*`: steps, not endings) must cover before it is a cause of
+/// that attempt (review of plan Z, R3).
+///
+/// With a declared latency of one control period no chunk exists at tick 0, so every attempt of
+/// the hint card's first real run -- its successes too -- counted one `fallback`, one
+/// `violation.chunk_underrun` and a few `violation.acceleration` steps while the first chunk
+/// arrived: the start, not why it failed. 1 % of that run's 1,800-step horizon is 18 steps:
+/// above a start-up's handful, far below a policy that fights the envelope (hundreds). On its
+/// 90 failed attempts it leaves "not done in time" on all 90, a safety limit on 43 and the
+/// fallback on the 4 that fell back for 25 to 153 steps, where counting every bucket read 90
+/// fallbacks, 90 motion gaps and 87 safety limits. How an attempt ended (the termination
+/// buckets) and a failure the backend reported (a `FailureKind`) always count.
+const STEP_SHARE_PERCENT: u64 = 1;
+
+/// A Safety Plane step counter, as `es_eval::metrics` names them: counted per step, not per
+/// ending.
+fn per_step(bucket: &str) -> bool {
+    bucket == "fallback" || bucket.starts_with("violation.")
+}
+
 /// One episode's causes, each once however many of its buckets name it; its outcome class, when
-/// there is one, in place of `Timeout`. A failure something else ended keeps that cause.
+/// there is one, in place of `Timeout`. A failure something else ended keeps that cause. A step
+/// counter below [`STEP_SHARE_PERCENT`] of the attempt's steps is no cause, so an attempt whose
+/// only other buckets are that small keeps how it ended.
 fn row_causes(row: &EpisodeRow, outcome: Option<Outcome>) -> BTreeSet<Cause> {
-    let mut causes: BTreeSet<Cause> = row.histogram.keys().filter_map(|b| cause_of(b)).collect();
+    let covers = |n: u64| n.saturating_mul(100) >= row.steps.saturating_mul(STEP_SHARE_PERCENT);
+    let mut causes: BTreeSet<Cause> = (row.histogram.iter())
+        .filter(|(bucket, n)| !per_step(bucket) || covers(**n))
+        .filter_map(|(bucket, _)| cause_of(bucket))
+        .collect();
     if let Some(o) = outcome {
         if causes.remove(&Cause::Timeout) {
             causes.insert(Cause::Outcome(o));
@@ -629,15 +658,17 @@ pub struct Again {
 }
 
 /// Whether ⑤'s "train again on what failed" is offered for `run`, and what it adds; `Err` is the
-/// i18n key of why not, shown on the button.
+/// i18n key of why not, shown on the button. `refused` names the suites `es loop collect` would
+/// not collect under ([`uncollectable`]); the suites practised are [`weakest`] of the others.
 pub fn again(
     run: &RunFolder,
     cycle: Option<&Cycle>,
     situations: &[Situation],
+    refused: &[String],
 ) -> Result<Again, &'static str> {
     let cycle = cycle.ok_or("results.again.no_recipe")?;
     let collect = cycle.collect.as_ref().ok_or("results.again.no_collect")?;
-    let suites = weakest(situations)?;
+    let suites = weakest(situations, refused)?;
     let no_checkpoint = "results.again.no_checkpoint";
     let recipe = cycle.training(None, &run.path).map_err(|_| no_checkpoint)?;
     let mark = match evaluated_mark(&run.path) {
@@ -689,29 +720,48 @@ fn evaluated_mark(run: &Path) -> Option<u32> {
         })
 }
 
-/// The suites with the lowest success rate among those that ran an attempt, every one of them
-/// on a tie, in the evaluation's order. Refused when nothing was measured, or when the lowest is
-/// every attempt a success (plan Z review focus 4).
-pub fn weakest(situations: &[Situation]) -> Result<Vec<String>, &'static str> {
+/// The suites with the lowest success rate among those that ran an attempt and are not
+/// `refused`, every one of them on a tie, in the evaluation's order. Refused when nothing was
+/// measured, when every attempt was a success (plan Z review focus 4), and when every suite with
+/// a failure is `refused` (review of plan Z, R2): a suite the collector cannot realise is left
+/// out as if it had not run, so the next-lowest takes its place, and none that failed is
+/// practised only when none can be.
+pub fn weakest(situations: &[Situation], refused: &[String]) -> Result<Vec<String>, &'static str> {
     // `a` below `b`: compared as fractions, exactly.
     let rate = |a: &Situation, b: &Situation| {
         (u64::from(a.successes) * u64::from(b.episodes))
             .cmp(&(u64::from(b.successes) * u64::from(a.episodes)))
     };
     let ran: Vec<&Situation> = situations.iter().filter(|s| s.episodes > 0).collect();
-    let low = ran
-        .iter()
-        .copied()
-        .min_by(|a, b| rate(a, b))
-        .ok_or("results.again.no_evaluation")?;
-    if low.successes == low.episodes {
+    if ran.is_empty() {
+        return Err("results.again.no_evaluation");
+    }
+    if ran.iter().all(|s| s.successes == s.episodes) {
         return Err("results.again.no_failures");
     }
-    Ok(ran
+    let open: Vec<&Situation> = ran
+        .into_iter()
+        .filter(|s| !refused.contains(&s.suite))
+        .collect();
+    let low = (open.iter().copied())
+        .min_by(|a, b| rate(a, b))
+        .filter(|low| low.successes < low.episodes)
+        .ok_or("results.again.cannot_collect")?;
+    Ok(open
         .iter()
         .filter(|s| rate(s, low).is_eq())
         .map(|s| s.suite.clone())
         .collect())
+}
+
+/// The suites of `ir` that `es loop collect --perturb` refuses under `deploy`, by name: the
+/// same [`es_eval::perturb::unseen_age`] it asks, at the deployment's control period.
+pub fn uncollectable(ir: &EvaluationIr, deploy: &DeploymentIr) -> Vec<String> {
+    let all: Vec<usize> = (0..ir.suites.len()).collect();
+    let control_us = deploy.rate.control_period().0;
+    (unseen_age(ir, &all, deploy, control_us).into_iter())
+        .map(|r| r.suite)
+        .collect()
 }
 
 /// One run, read for ⑤: its `eval/` folder, `episodes.json` when it has one, and what its
@@ -782,6 +832,15 @@ impl RunResults {
             .as_ref()
             .zip(template.as_ref())
             .and_then(|(c, t)| start_settings(c, t));
+        // The plane `es loop collect` would collect under: the template's Deployment IR, which
+        // the project's collect bundle was built from. Without it or the Evaluation IR nothing
+        // is known to be refused, and the collection itself still refuses by name.
+        let deploy = template.as_ref().zip(repo_root).and_then(|(t, root)| {
+            let text = std::fs::read_to_string(root.join(&t.bundle.deployment)).ok()?;
+            deployment_from_toml(&text).ok()
+        });
+        let refused = (ir.as_ref().zip(deploy.as_ref()))
+            .map_or_else(Vec::new, |(ir, deploy)| uncollectable(ir, deploy));
         let outcome = template.and_then(|t| t.outcome);
         let outcomes = match (&rows, &outcome, &scene) {
             (Some(rows), Some(spec), Some(scene)) => outcome::outcomes(scene, spec, rows, &dir),
@@ -789,7 +848,7 @@ impl RunResults {
         };
         let bars = situations(&dir.report, rows.as_deref(), ir.as_ref());
         Ok(Self {
-            again: again(run, cycle.as_ref(), &bars),
+            again: again(run, cycle.as_ref(), &bars, &refused),
             run: run.clone(),
             export: export_bundle(run, cycle.as_ref()),
             dir,
@@ -918,6 +977,63 @@ mod tests {
         assert_eq!(
             causes(&rows, &none()),
             [(Cause::FailureCondition, 1), (Cause::SafetyLimit, 1)]
+        );
+    }
+
+    /// Review R3, in the shape of the hint card's first run: nominal-00's start-up buckets over
+    /// 1,800 steps are no cause -- it keeps how it ended, or its outcome class -- while a
+    /// torque-noise attempt clamped on 800 of its 1,800 steps hit a safety limit.
+    #[test]
+    fn a_step_counter_under_one_percent_of_the_steps_is_no_cause() {
+        fn long(suite: &str, ep: u64, termination: &str, extra: &[(&str, u64)]) -> EpisodeRow {
+            EpisodeRow {
+                steps: 1800,
+                ..row(suite, ep, termination, extra)
+            }
+        }
+        let start = [
+            ("fallback", 1),
+            ("violation.acceleration", 2),
+            ("violation.chunk_underrun", 1),
+        ];
+        let noisy = [
+            ("fallback", 1),
+            ("violation.chunk_underrun", 1),
+            ("violation.velocity", 800),
+        ];
+        let rows = [
+            long("nominal", 0, "timeout", &start),
+            long("torque_noise", 1, "timeout", &noisy),
+            long("nominal", 2, "success", &start),
+        ];
+        assert_eq!(
+            causes(&rows, &none()),
+            [(Cause::Timeout, 2), (Cause::SafetyLimit, 1)]
+        );
+        let left = Cause::Outcome(Outcome::LeftOutside);
+        let classes = Outcomes::from([("nominal-00".to_owned(), Outcome::LeftOutside)]);
+        assert_eq!(causes(&rows[..1], &classes), [(left, 1)]);
+        let picked: Vec<_> = tiles(&rows, TileFilter::Failures, &classes)
+            .iter()
+            .map(|t| t.cause)
+            .collect();
+        assert_eq!(picked, [Some(left), Some(Cause::Timeout)]);
+        // 18 of 1,800 steps is a cause and 17 is not; a failure the backend reported always is.
+        let at = |n| {
+            let extra = [("violation.position", n), ("chunk_underrun", 1)];
+            causes(&[long("nominal", 0, "failure", &extra)], &none())
+        };
+        assert_eq!(
+            at(18),
+            [
+                (Cause::FailureCondition, 1),
+                (Cause::SafetyLimit, 1),
+                (Cause::MotionGaps, 1)
+            ]
+        );
+        assert_eq!(
+            at(17),
+            [(Cause::FailureCondition, 1), (Cause::MotionGaps, 1)]
         );
     }
 
@@ -1410,22 +1526,49 @@ mod tests {
             bar("torque_noise", 2, 4),
         ];
         assert_eq!(
-            weakest(&bars),
+            weakest(&bars, &[]),
             Ok(vec!["light_intensity".into(), "torque_noise".into()])
         );
         assert_eq!(
-            weakest(&[bar("nominal", 3, 4), bar("light", 0, 1)]),
+            weakest(&[bar("nominal", 3, 4), bar("light", 0, 1)], &[]),
             Ok(vec!["light".into()])
         );
         assert_eq!(
-            weakest(&[bar("nominal", 2, 2), bar("light", 4, 4)]),
+            weakest(&[bar("nominal", 2, 2), bar("light", 4, 4)], &[]),
             Err("results.again.no_failures")
         );
         assert_eq!(
-            weakest(&[bar("nominal", 0, 0)]),
+            weakest(&[bar("nominal", 0, 0)], &[]),
             Err("results.again.no_evaluation")
         );
-        assert_eq!(weakest(&[]), Err("results.again.no_evaluation"));
+        assert_eq!(weakest(&[], &[]), Err("results.again.no_evaluation"));
+    }
+
+    /// Review R2: a suite the collector refuses is left out as if it had not run -- the lowest
+    /// of the others is practised, a tie keeps only its realisable half, and when only refused
+    /// suites failed nothing is.
+    #[test]
+    fn the_weakest_suites_are_among_those_the_collector_can_realise() {
+        let drop = vec!["frame_drop".to_owned()];
+        let bars = [
+            bar("nominal", 2, 2),
+            bar("frame_drop", 0, 2),
+            bar("torque_noise", 1, 2),
+            bar("backlash", 1, 2),
+        ];
+        assert_eq!(weakest(&bars, &[]), Ok(drop.clone()));
+        assert_eq!(
+            weakest(&bars, &drop),
+            Ok(vec!["torque_noise".into(), "backlash".into()])
+        );
+        let tied = [bar("frame_drop", 0, 2), bar("torque_noise", 0, 2)];
+        assert_eq!(weakest(&tied, &drop), Ok(vec!["torque_noise".into()]));
+        let only = [bar("nominal", 2, 2), bar("frame_drop", 1, 2)];
+        assert_eq!(weakest(&only, &drop), Err("results.again.cannot_collect"));
+        assert_eq!(
+            weakest(&[bar("frame_drop", 0, 2)], &drop),
+            Err("results.again.cannot_collect")
+        );
     }
 
     /// A run folder as `es loop cycle` leaves it for ⑤: the fixture's `eval/` with `rows` beside
@@ -1648,6 +1791,68 @@ mod tests {
             "[init] policy"
         );
         assert_eq!(cycle.collect.unwrap().seed, 11, "after 1-10, below 101");
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
+    /// Review R2 on disk: the run was judged by an Evaluation IR whose `frame_drop` suite failed
+    /// most, which `es loop collect` refuses under the template's deployment (its
+    /// `stale_observation` watchdog), so "train again" practises the next-lowest suite -- and
+    /// is refused by name once that suite is the only one that failed.
+    #[test]
+    fn train_again_leaves_out_a_suite_the_collector_cannot_realise() {
+        use es_ir::evaluation::{CountRange, Perturbation, PerturbationSuite};
+
+        let p = scratch("again-drop");
+        let settings = StartSettings {
+            demonstrations: 10,
+            length: Length::Short,
+        };
+        write_run(
+            &cube(),
+            &repo(),
+            &p,
+            settings,
+            &p.next_run_dir(),
+            "127.0.0.1:7025",
+        )
+        .unwrap();
+        let run = copy_fixture(&p, 1);
+        lerobot_checkpoint_on_disk(&run, 5000);
+        let mut cycle = written(&run.path);
+        let judge = std::fs::read_to_string(repo().join(&cycle.eval.config)).unwrap();
+        let mut ir = evaluation_from_toml(&judge).unwrap();
+        ir.suites.push(PerturbationSuite {
+            name: "dropped_frames".into(),
+            perturbations: vec![Perturbation::new(
+                PerturbationKind::FrameDrop {
+                    prob: 0.05,
+                    burst: CountRange::new(1, 3),
+                },
+                9,
+            )],
+        });
+        let config = run.path.join("evaluation.toml");
+        let text = es_ir::serial::evaluation_to_toml(&ir).unwrap();
+        std::fs::write(&config, text).unwrap();
+        cycle.eval.config = config.display().to_string();
+        std::fs::write(run.path.join(RUN_RECIPE), toml::to_string(&cycle).unwrap()).unwrap();
+
+        let judged = |torque: &str| {
+            let rows = [
+                row("nominal", 0, "success", &[]),
+                row("torque_noise", 0, "success", &[]),
+                row("torque_noise", 1, torque, &[]),
+                row("dropped_frames", 0, "timeout", &[]),
+                row("dropped_frames", 1, "timeout", &[]),
+            ];
+            write_episodes(&rows, &run.eval_dir()).unwrap();
+            RunResults::read(&p, &run, Some(&repo())).unwrap().again
+        };
+        assert_eq!(
+            judged("timeout").map(|a| a.suites),
+            Ok(vec!["torque_noise".into()])
+        );
+        assert_eq!(judged("success"), Err("results.again.cannot_collect"));
         std::fs::remove_dir_all(&p.root).ok();
     }
 }

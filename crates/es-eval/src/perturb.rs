@@ -15,6 +15,7 @@
 use es_assets::scene::SceneDesc;
 use es_core::StableId;
 use es_env::rng::EnvRng;
+use es_ir::deployment::{DeploymentIr, Watchdog};
 use es_ir::evaluation::{CountRange, EvaluationIr, PerturbationKind, Range};
 use es_ir::task::Distribution;
 use es_physics_core::backend::ModelInfo;
@@ -182,6 +183,78 @@ impl PerturbationPlan {
             }
         }
     }
+}
+
+/// A suite `es loop collect --perturb` refuses: one of its perturbations can age an observation
+/// past the deployment's `stale_observation` watchdog. The collector's `DomainRunner` stamps an
+/// observation's age itself, so a held observation reaches `SafetyPlane::validate` as age 0
+/// where `es eval run` passes its true age; the plane reads that age only against the watchdog,
+/// so a suite no age of which crosses it is realised, and one that can is refused rather than
+/// judged by a different plane (§17.2).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnseenAge {
+    /// The suite's index in the Evaluation IR, and its name.
+    pub cell: usize,
+    pub suite: String,
+    /// The first of its perturbations that can (`PerturbationKind::name`).
+    pub kind: &'static str,
+    /// The watchdog's `max_age`, in microseconds.
+    pub max_age_us: u64,
+}
+
+impl std::fmt::Display for UnseenAge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "suite {:?}: {} can age the observation past the deployment's stale_observation \
+             max_age of {} us, and `es loop collect` cannot hand the Safety Plane that age (its \
+             runner stamps its own), so the plane here would not be the evaluation's -- refused \
+             rather than approximated (spec 17.2)",
+            self.suite, self.kind, self.max_age_us
+        )
+    }
+}
+
+/// The suites of `cells` that `es loop collect --perturb` refuses, in `cells`' order: an
+/// `observation_delay` whose longest draw, in whole control periods of `control_us` (the
+/// runner's own truncating conversion), is older than the watchdog's `max_age`, and a
+/// `frame_drop` whenever there is a watchdog, its bursts having no bound. No
+/// `stale_observation` watchdog refuses nothing.
+pub fn unseen_age(
+    ir: &EvaluationIr,
+    cells: &[usize],
+    deploy: &DeploymentIr,
+    control_us: u64,
+) -> Vec<UnseenAge> {
+    let Some(max_age) = deploy.watchdogs.0.iter().find_map(|w| match w {
+        Watchdog::StaleObservation { max_age } => Some(max_age.0),
+        _ => None,
+    }) else {
+        return Vec::new();
+    };
+    let age = |ms: u32| u64::from(ms) * 1000 / control_us.max(1) * control_us;
+    cells
+        .iter()
+        .filter_map(|&cell| {
+            let suite = &ir.suites[cell];
+            let p = suite.perturbations.iter().find(|p| {
+                let worst = match &p.kind {
+                    PerturbationKind::ObservationDelay { ms } => {
+                        ms.iter().map(|m| age(*m)).max().unwrap_or(0)
+                    }
+                    PerturbationKind::FrameDrop { .. } => u64::MAX,
+                    _ => 0,
+                };
+                worst > max_age
+            })?;
+            Some(UnseenAge {
+                cell,
+                suite: suite.name.clone(),
+                kind: p.kind.name(),
+                max_age_us: max_age,
+            })
+        })
+        .collect()
 }
 
 fn resolve(
@@ -358,5 +431,90 @@ impl StepState {
                 *v *= 1.0 + n;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use es_ir::evaluation::{Perturbation, PerturbationSuite};
+
+    fn fixture(name: &str) -> String {
+        let path = format!(
+            "{}/../../tests/fixtures/visible-learning/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        std::fs::read_to_string(&path).expect(&path)
+    }
+
+    /// The committed evaluation (its `observation_delay` draws 20 or 40 ms) with a `frame_drop`
+    /// suite after it, and the committed deployment (50 Hz, `stale_observation` 80 ms).
+    fn documents() -> (EvaluationIr, DeploymentIr) {
+        let mut ir = es_ir::serial::evaluation_from_toml(&fixture("evaluation.toml")).unwrap();
+        ir.suites.push(PerturbationSuite {
+            name: "dropped_frames".into(),
+            perturbations: vec![Perturbation::new(
+                PerturbationKind::FrameDrop {
+                    prob: 0.05,
+                    burst: CountRange::new(1, 3),
+                },
+                9,
+            )],
+        });
+        let deploy = es_ir::serial::deployment_from_toml(&fixture("deployment.toml")).unwrap();
+        (ir, deploy)
+    }
+
+    fn set_max_age(deploy: &mut DeploymentIr, us: u64) {
+        for w in &mut deploy.watchdogs.0 {
+            if let Watchdog::StaleObservation { max_age } = w {
+                max_age.0 = us;
+            }
+        }
+    }
+
+    /// Review of plan Z, R2: what `es loop collect` and the editor's "train again" both ask. A
+    /// `frame_drop` suite is refused whenever the plane has the watchdog, a delay only when a
+    /// draw, in whole control periods, is older than it; without the watchdog nothing is.
+    #[test]
+    fn a_suite_that_can_age_an_observation_past_the_watchdog_is_refused() {
+        let (ir, mut deploy) = documents();
+        let control_us = deploy.rate.control_period().0;
+        assert_eq!(control_us, 20_000);
+        let all: Vec<usize> = (0..ir.suites.len()).collect();
+        let drop = all.len() - 1;
+        let refused = unseen_age(&ir, &all, &deploy, control_us);
+        assert_eq!(
+            refused,
+            [UnseenAge {
+                cell: drop,
+                suite: "dropped_frames".into(),
+                kind: "frame_drop",
+                max_age_us: 80_000,
+            }]
+        );
+        assert!(refused[0].to_string().starts_with(
+            "suite \"dropped_frames\": frame_drop can age the observation past the deployment's \
+             stale_observation max_age of 80000 us"
+        ));
+        assert!(unseen_age(&ir, &all[..drop], &deploy, control_us).is_empty());
+
+        let delay = (ir.suites.iter())
+            .position(|s| s.name == "observation_delay")
+            .unwrap();
+        // 40 ms is two whole periods: refused under 40 ms, realised at it.
+        set_max_age(&mut deploy, 39_999);
+        let names: Vec<String> = (unseen_age(&ir, &all, &deploy, control_us).into_iter())
+            .map(|r| r.suite)
+            .collect();
+        assert_eq!(names, ["observation_delay", "dropped_frames"]);
+        set_max_age(&mut deploy, 40_000);
+        assert!(unseen_age(&ir, &[delay], &deploy, control_us).is_empty());
+        // A 30 ms period truncates 40 ms to one period, which a 30 ms watchdog allows.
+        set_max_age(&mut deploy, 30_000);
+        assert!(unseen_age(&ir, &[delay], &deploy, 30_000).is_empty());
+
+        (deploy.watchdogs.0).retain(|w| !matches!(w, Watchdog::StaleObservation { .. }));
+        assert!(unseen_age(&ir, &all, &deploy, control_us).is_empty());
     }
 }

@@ -20,8 +20,8 @@ use crate::model::dialogs;
 use crate::model::i18n::{fill, t, Lang};
 use crate::model::labels::{self, Browse};
 use crate::model::layout::{self, Pane};
-use crate::model::project::{RunFolder, StartSettings};
-use crate::model::results::{self, Again, RunResults, TileFilter};
+use crate::model::project::RunFolder;
+use crate::model::results::{self, RunResults, TileFilter};
 use crate::model::template;
 use crate::model::workflow::{Phase, PhaseState};
 use crate::ui::advanced::{metric_text, rgb_texture, short_hash};
@@ -50,10 +50,6 @@ pub struct State {
     player: Option<Player>,
     /// Each tile's last picture, decoded once; `None` when it has none.
     thumbs: BTreeMap<String, Option<egui::TextureHandle>>,
-    /// The settings Run again hands to ③'s Start panel (packet M12/Y12 takes them).
-    pub run_again: Option<StartSettings>,
-    /// "Train again on what failed", pressed: ③'s tick starts it (packet M13/Z4b).
-    pub again: Option<Again>,
 }
 
 impl std::fmt::Debug for State {
@@ -212,7 +208,8 @@ fn step_panel(app: &mut EditorApp, ui: &mut egui::Ui) {
             {
                 run_again = Some(shown.settings);
             }
-            // Packet M13/Z4b: the same settings, and the run starts as soon as ③ ticks.
+            // Packet M13/Z4b: the same settings and the plan, which ③ shows and starts only on
+            // Start (review of plan Z, R1).
             let reason = shown.again.as_ref().err().copied().unwrap_or_default();
             if ui
                 .add_enabled(
@@ -230,12 +227,9 @@ fn step_panel(app: &mut EditorApp, ui: &mut egui::Ui) {
     if let Some(status) = status {
         app.status = status;
     }
-    if again.is_some() {
-        app.results.again = again;
-    }
     if let Some(settings) = run_again {
-        app.results.run_again = settings;
         if let Some(open) = app.project.as_mut() {
+            open.watch.prepare(settings, again);
             open.phase = Phase::Train;
         }
     }
