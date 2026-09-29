@@ -24,7 +24,7 @@ use crate::model::preview::{self, Preview};
 use crate::model::project::StartSettings;
 use crate::model::telemetry_view::{replay, TelemetryModel};
 use crate::model::train_view::{Plot, Series};
-use crate::model::watch::{self, CardState, Centre, View, DEMONSTRATIONS, LENGTHS};
+use crate::model::watch::{self, AgainPlan, CardState, Centre, View, DEMONSTRATIONS, LENGTHS};
 use crate::model::workflow::Phase;
 use crate::ui::advanced::{paint_curve, rgb_texture};
 use crate::ui::player::{play, Player};
@@ -55,20 +55,6 @@ pub(crate) fn tick(app: &mut EditorApp, ctx: &egui::Context) {
     let Some(open) = app.project.as_mut() else {
         return;
     };
-    // ⑤'s "Run again" hands ③ the finished run's settings (packets M12/Y13, Y12).
-    if let Some(settings) = app.results.run_again.take() {
-        open.watch.settings = settings;
-    }
-    // ⑤'s "Train again on what failed" (packet M13/Z4b), with the settings just taken.
-    if let Some(again) = app.results.again.take() {
-        let pid = app.launch.pid();
-        if let Err(e) = open
-            .watch
-            .start_again(&open.project, &again, pid, &open.phases)
-        {
-            app.status = e.to_string();
-        }
-    }
     let (tick, phases) =
         open.watch
             .tick(&mut app.launch, &app.telemetry, open.phase, Instant::now());
@@ -126,6 +112,7 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
 /// A click in the step panel.
 pub(crate) enum Action {
     Start,
+    CancelAgain,
     Resume(String),
     Stop,
     EvaluateNow,
@@ -138,6 +125,10 @@ pub(crate) fn perform(app: &mut EditorApp, action: Action) {
     let pid = app.launch.pid();
     let result = match action {
         Action::Start => open.watch.start(&open.project, pid, &open.phases),
+        Action::CancelAgain => {
+            open.watch.cancel_again();
+            Ok(true)
+        }
         Action::Resume(from) => open.watch.resume(&from, pid, &open.phases),
         Action::Stop => {
             app.launch.kill();
@@ -201,14 +192,27 @@ fn panel(app: &mut EditorApp, ui: &mut egui::Ui, phase: Phase, view: &View) {
     }
     let mut action = None;
     if let Some(key) = view.start {
-        settings(ui, lang, &mut open.watch.settings);
-        if ui
-            .button(i18n::t(lang, key))
-            .on_hover_text(i18n::t(lang, "watch.start.hint"))
-            .clicked()
-        {
-            action = Some(Action::Start);
+        if let Some(plan) = &view.again {
+            again_plan(ui, lang, plan);
         }
+        settings(ui, lang, &mut open.watch.settings);
+        ui.horizontal(|ui| {
+            if ui
+                .button(i18n::t(lang, key))
+                .on_hover_text(i18n::t(lang, "watch.start.hint"))
+                .clicked()
+            {
+                action = Some(Action::Start);
+            }
+            if view.again.is_some()
+                && ui
+                    .button(i18n::t(lang, "watch.again.cancel"))
+                    .on_hover_text(i18n::t(lang, "watch.again.cancel.hint"))
+                    .clicked()
+            {
+                action = Some(Action::CancelAgain);
+            }
+        });
     }
     if let Some(from) = &view.resume {
         let text = i18n::fill(lang, "watch.resume", &[labels::stage_label(lang, from)]);
@@ -236,6 +240,19 @@ fn panel(app: &mut EditorApp, ui: &mut egui::Ui, phase: Phase, view: &View) {
     if let Some(action) = action {
         perform(app, action);
     }
+}
+
+/// ⑤'s "train again on what failed", before it starts (review of plan Z, R1): what it practises,
+/// that the two settings below are its new demonstrations and length, and what it builds on.
+fn again_plan(ui: &mut egui::Ui, lang: Lang, plan: &AgainPlan) {
+    ui.label(RichText::new(i18n::t(lang, "watch.again.heading")).strong());
+    ui.label(i18n::t(lang, "watch.again.practise"));
+    for situation in plan.practise(lang) {
+        ui.label(format!("\u{2022} {situation}"));
+    }
+    ui.label(i18n::t(lang, "watch.again.more"));
+    ui.label(i18n::t(lang, "watch.again.continues"));
+    ui.separator();
 }
 
 /// ③'s two settings.

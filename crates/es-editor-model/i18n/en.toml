@@ -401,6 +401,16 @@
 "watch.start" = "Start"
 "watch.start_over" = "Start over"
 "watch.start.hint" = "Writes runs/NNN/cycle.toml, then runs es loop cycle --recipe runs/NNN/cycle.toml --out runs/NNN --telemetry 127.0.0.1:<port> from the repository root"
+
+# Plan Z review R1: "train again on what failed" waits on the start panel until Start.
+"watch.again.heading" = "Next: training again on what failed"
+"watch.again.practise" = "It practises these situations more:"
+"watch.again.more" = "In them it records as many new demonstrations as Demonstrations says below, and trains for the Training length below."
+"watch.again.continues" = "It goes on from the last run's policy, and learns from the earlier demonstrations as well."
+"watch.again.start" = "Start training again"
+"watch.again.cancel" = "Cancel"
+"watch.again.cancel.hint" = "Drops this plan; Start then starts an ordinary run"
+
 "watch.stop" = "Stop"
 "watch.evaluate_now" = "Evaluate what it has learned so far"
 "watch.evaluate_now.hint" = "Stops training, sets [eval] checkpoint to the newest saved mark and runs es loop cycle --from eval"
