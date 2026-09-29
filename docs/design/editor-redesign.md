@@ -162,7 +162,15 @@ Directions already fixed for S2–S6 (each still gets its own design pass):
   device. The sentence editor offers only what `es-env` lowers. "Held for 1 s" compiles to
   "inside and nearly still" (the demo's settling bound) because IR-D has no hold node; the
   lowering gains multi-lane `GetJointState`, `Slice` and `GetBodyVelocity` (`es-env`, not
-  `es-ir`). Contact conditions wait for `GetContact` lowering.
+  `es-ir`). Contact conditions wait for `GetContact` lowering. **Why an attempt failed comes from
+  the success sentence itself** (owner, 2026-09-29): `es eval run` records, per attempt, whether
+  each clause of the Task IR's success predicate (each `Compare` under the success `Terminate`'s
+  `And` tree) held at the attempt's end — an output in `episodes.json`, no IR or hash change —
+  and ⑤ names the clause that was missing in the words of ①'s sentence ("✓ the cube is inside the
+  bin · ✓ it is still · ✗ the gripper was not opened"). A template's `[outcome]` then adds only
+  milestones the predicate cannot express (such as *lifted*). The hand-written classes of M13/Z4a
+  and follow-up R4 (*not released*) are the stopgap this replaces; the first real run showed why:
+  an attempt that put the cube in the bin and never let go was named *too late* until R4.
 - **S5.** The pieces exist: `[rl]` trains a state teacher, `es loop collect --policy teacher
   --frames` renders the Task IR's camera during its rollout. Missing: keeping only successful
   episodes, and a cycle that chains teacher → collect → student.
