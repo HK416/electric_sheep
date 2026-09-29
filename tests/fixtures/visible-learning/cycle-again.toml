@@ -1,0 +1,52 @@
+# The hint card's "train again" cycle (packet M13/Z3): `cycle-hint-u3.toml` after a first run in
+# `runs/001`, going again on more of what that run failed at.
+#
+# * `[collect] perturb` collects under two of the Evaluation IR's own suites, episode i under
+#   `suites[i % 2]` (`es loop collect --perturb --suites`, packet M13/Z2). The seeds, 201-264,
+#   come after the first run's 1-200 and miss the evaluation's 101-116; a range that met them
+#   would be refused by `--dry-run` already (spec 13.3).
+# * `[collect] merge` merges the new demonstrations with the first run's (`es loop distill` into
+#   `collect/merged`), and that is what trains. The first run's tiles are the `frames` beside
+#   its root, `runs/001/collect/frames`, and are linked into this cycle's `collect/frames`
+#   after its own.
+# * `[train] init` starts from the first run's evaluated checkpoint: on this IR route it is the
+#   recipe's `[init] policy`, so the nested plan's trainer takes `--init-weights`.
+#
+# Everything else is `cycle-hint-u3.toml`'s, word for word, plus `[eval.preview]` at its
+# defaults. The same Evaluation IR judges both runs, so their reports compare (spec 13.3).
+#
+# `es loop cycle --recipe tests/fixtures/visible-learning/cycle-again.toml --out <dir> --dry-run`
+# prints the stage plan pinned by `tests/golden/train/plan-cycle-again.txt`. `--dry-run` opens
+# none of the `runs/001` paths; a real run refuses them first if they are not on disk.
+
+kind  = "cycle"
+scene = "tests/fixtures/mjcf/so101_pick_place.xml"
+
+[collect]
+policy   = "runs/collect-001/untrained.esb"
+expert   = "so101-pick-place"
+episodes = 64
+seed     = 201
+frames   = true
+perturb  = { config = "tests/fixtures/visible-learning/evaluation-augmented.toml", suites = ["light_intensity", "torque_noise"] }
+merge    = ["runs/001/collect/ds"]
+
+[train]
+recipe = "tests/fixtures/visible-learning/training-hint-u3.toml"
+init   = "runs/001/train/checkpoints/20000.esb"
+
+[eval]
+config     = "tests/fixtures/visible-learning/evaluation-augmented.toml"
+checkpoint = "last"
+jobs       = 6
+frames     = true
+
+[eval.preview]
+
+[showcase]
+cell    = "nominal-00"
+eye     = [0.66, -0.46, 0.52]
+look_at = [0.14, -0.04, 0.04]
+fov     = 36
+width   = 1280
+height  = 720

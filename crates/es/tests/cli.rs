@@ -8387,6 +8387,172 @@ fn cycle_preview_refuses_an_undeclared_suite() {
     assert!(stderr_of(&out).contains("\"fog\""), "{}", stderr_of(&out));
 }
 
+// --- packet M13/Z3: the "again" cycle ---------------------------------------------------------
+
+/// The hint card's cycle going again after `runs/001`: perturbed, merged, started from its
+/// checkpoint.
+const CYCLE_AGAIN_RECIPE: &str = "tests/fixtures/visible-learning/cycle-again.toml";
+
+/// `cycle-again.toml` with `from` replaced by `to`, as a cycle document in `dir`.
+fn again_cycle(dir: &Path, from: &str, to: &str) -> String {
+    let text = std::fs::read_to_string(vl_fixture("cycle-again.toml")).expect("cycle-again");
+    assert!(text.contains(from), "{from:?}");
+    let path = dir.join("cycle-again.toml");
+    write(&path, &text.replace(from, to));
+    train_toml_path(&path)
+}
+
+/// Regenerates `tests/golden/train/plan-cycle-again.txt`. Run once, explicitly; it is then
+/// read-only (spec 1.4), exactly like `generate_cycle_golden` above.
+#[test]
+#[ignore = "golden generator; run explicitly"]
+fn generate_cycle_again_golden() {
+    if std::env::var("ES_GENERATE_GOLDENS").as_deref() != Ok("1") {
+        println!("SKIP generate_cycle_again_golden: set ES_GENERATE_GOLDENS=1 to regenerate");
+        return;
+    }
+    let dir = scratch_dir("cycle-again-golden");
+    let out = run_cycle(CYCLE_AGAIN_RECIPE, &dir, &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    write(&train_golden("plan-cycle-again.txt"), &stdout(&out));
+}
+
+/// The "train again" plan, pinned: Z2's `--perturb --suites` on the collect line, a merge stage
+/// (`es loop distill`, frames beside each root) into `collect/merged`, which the nested plan
+/// bakes, and `--init-weights` from the first run's checkpoint. A dry run opens none of the
+/// `runs/001` paths and writes nothing.
+#[test]
+fn cycle_again_dry_run_matches_its_golden() {
+    let dir = scratch_dir("cycle-again-dry");
+    let out = run_cycle(CYCLE_AGAIN_RECIPE, &dir.join("out"), &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let golden = train_golden("plan-cycle-again.txt");
+    let want =
+        std::fs::read_to_string(&golden).unwrap_or_else(|e| panic!("{}: {e}", golden.display()));
+    assert_eq!(stdout(&out), want, "the stage plan is not the golden");
+    assert!(!dir.join("out").exists());
+}
+
+/// Spec 13.3, before anything runs and `--dry-run` included: collect seeds that meet the
+/// evaluation's are refused in Z2's words, and so is a suite the Evaluation IR does not declare.
+#[test]
+fn cycle_again_refuses_the_evaluations_seeds_and_an_undeclared_suite() {
+    let dir = scratch_dir("cycle-again-seeds");
+    let recipe = again_cycle(&dir, "seed     = 201", "seed     = 100");
+    let out = run_cycle(&recipe, &dir.join("out"), &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    let said = stderr_of(&out);
+    assert!(said.contains("overlaps evaluation seeds 101-116"), "{said}");
+    assert!(said.contains("evaluation-augmented.toml"), "{said}");
+
+    let recipe = again_cycle(&dir, "\"torque_noise\"", "\"fog\"");
+    let out = run_cycle(&recipe, &dir.join("out"), &["--dry-run"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    assert!(stderr_of(&out).contains("\"fog\""), "{}", stderr_of(&out));
+}
+
+/// A real run refuses `[train] init` and `[collect] merge` that are not on disk before any stage
+/// runs -- nothing is collected for a merge or a start that cannot happen.
+#[test]
+fn cycle_again_refuses_an_init_that_is_not_on_disk() {
+    let dir = scratch_dir("cycle-again-init");
+    let out = run_cycle(CYCLE_AGAIN_RECIPE, &dir.join("out"), &[]);
+    assert_eq!(out.status.code(), Some(1), "{}", stdout(&out));
+    let said = stderr_of(&out);
+    assert!(
+        said.contains("[train] `init`") && said.contains("runs/001/train/checkpoints/20000.esb"),
+        "{said}"
+    );
+    assert!(!dir.join("out").exists(), "nothing ran");
+}
+
+/// Packet M13/Z3: `es loop distill` carries each input's `meta/perturbations.jsonl` rows with
+/// their episodes re-indexed, and `--frames` lays the inputs' tiles out in the merged global
+/// frame order -- leaving the first input's in place when they already are `--frames`.
+#[test]
+fn loop_distill_carries_perturbations_and_frames() {
+    let dir = scratch_dir("loop-distill-again");
+    let (a, b, merged) = (dir.join("a"), dir.join("b"), dir.join("merged"));
+    let (tiles, old) = (dir.join("frames"), dir.join("old-frames"));
+    write_loop_fixture(&a, 3);
+    write_loop_fixture(&b, 2);
+    std::fs::create_dir_all(&tiles).expect("frames");
+    std::fs::create_dir_all(&old).expect("old frames");
+    for i in 0..24 {
+        write(&tiles.join(format!("{i:06}.bin")), &format!("a{i}"));
+    }
+    for i in 0..16 {
+        write(&old.join(format!("{i:06}.bin")), &format!("b{i}"));
+        write(&old.join(format!("{i:06}.json")), "{}");
+    }
+    let rows = "{\"episode\":0,\"suite\":\"light_intensity\",\"seed\":500}\n\
+                {\"episode\":1,\"suite\":\"torque_noise\",\"seed\":501}\n";
+    write(&b.join("meta/perturbations.jsonl"), rows);
+
+    let distill = |order: [(&Path, &Path); 2], frames: bool| {
+        let mut cmd = bin();
+        cmd.args(["loop", "distill"]);
+        for (root, t) in order {
+            cmd.arg("--in").arg(root);
+            if frames {
+                cmd.arg("--in-frames").arg(t);
+            }
+        }
+        cmd.args(["--train", "1", "--val", "0", "--test", "0", "--out"])
+            .arg(&merged)
+            .arg("--frames")
+            .arg(&tiles)
+            .output()
+            .expect("run es")
+    };
+    let out = distill(
+        [(a.as_path(), tiles.as_path()), (b.as_path(), old.as_path())],
+        true,
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    assert!(
+        stdout(&out).contains("frames: 40 tile(s)"),
+        "{}",
+        stdout(&out)
+    );
+
+    let carried = std::fs::read_to_string(merged.join("meta/perturbations.jsonl")).expect("rows");
+    let carried: Vec<serde_json::Value> = carried
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("a JSON row"))
+        .collect();
+    assert_eq!(carried.len(), 2);
+    assert_eq!(carried[0]["episode"], 3);
+    assert_eq!(carried[0]["suite"], "light_intensity");
+    assert_eq!(carried[0]["seed"], 500);
+    assert_eq!(carried[1]["episode"], 4);
+
+    let tile = |i: u32, ext: &str| std::fs::read_to_string(tiles.join(format!("{i:06}.{ext}")));
+    assert_eq!(tile(0, "bin").expect("a's first"), "a0");
+    assert_eq!(tile(23, "bin").expect("a's last"), "a23");
+    assert_eq!(tile(24, "bin").expect("b's first"), "b0");
+    assert_eq!(tile(39, "bin").expect("b's last"), "b15");
+    assert_eq!(tile(24, "json").expect("its sidecar"), "{}");
+    assert!(tile(40, "bin").is_err());
+
+    // The tiles that already are --frames have to come first, and --frames needs every input's.
+    let out = distill(
+        [(b.as_path(), old.as_path()), (a.as_path(), tiles.as_path())],
+        true,
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+    assert_eq!(
+        tile(0, "bin").expect("untouched"),
+        "a0",
+        "a refusal moves nothing"
+    );
+    let out = distill(
+        [(a.as_path(), tiles.as_path()), (b.as_path(), old.as_path())],
+        false,
+    );
+    assert_eq!(out.status.code(), Some(2), "{}", stdout(&out));
+}
+
 /// `es policy init` builds the bundle a cycle's `[collect] policy` names from four committed
 /// documents: the same bytes for the same documents and seed, and a bundle that opens.
 #[test]

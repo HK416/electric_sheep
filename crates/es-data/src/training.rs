@@ -297,6 +297,11 @@ pub struct Lerobot {
     /// Passed to `lerobot-train` verbatim, after everything this module derives.
     #[serde(default)]
     pub extra: Vec<String>,
+    /// `--policy.path` (packet M13/Z3): the `pretrained_model` directory this run fine-tunes,
+    /// in place of `--policy.type`, which `lerobot-train` refuses beside it. The other
+    /// `--policy.*` flags then override the loaded config. A cycle's `[train] init` sets it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1547,6 +1552,7 @@ impl Plan {
                     chunk_size: 0,
                     n_action_steps: 0,
                     extra: Vec::new(),
+                    path: None,
                 });
                 let dim = state_dim.ok_or_else(|| {
                     refuse(
@@ -1583,7 +1589,10 @@ impl Plan {
                 let mut train = vec![
                     s("--dataset.repo_id=es/train"),
                     format!("--dataset.root={}", under(out, "ds-v3")),
-                    format!("--policy.type={}", lerobot.kind),
+                    match &lerobot.path {
+                        Some(path) => format!("--policy.path={path}"),
+                        None => format!("--policy.type={}", lerobot.kind),
+                    },
                     format!("--policy.chunk_size={}", lerobot.chunk_size),
                     format!("--policy.n_action_steps={}", lerobot.n_action_steps),
                     format!("--policy.device={}", run.device),
@@ -1685,18 +1694,41 @@ pub struct Cycle {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CollectRef {
-    /// The bundle whose Deployment IR is the plane (`es loop collect --policy`).
+    /// The bundle whose Deployment IR is the plane (`es loop collect --policy`). Required;
+    /// defaulted only so that a `[collect]` holding nothing but `merge` is refused by name.
+    #[serde(default)]
     pub policy: String,
     /// The scripted demonstrator, or absent for a trained policy's own rollouts. Setting it
     /// is what arms the expert gate of spec 28.9 rule 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expert: Option<String>,
+    /// Required and never 0; defaulted for the same reason as `policy`.
+    #[serde(default)]
     pub episodes: u32,
     #[serde(default)]
     pub seed: u64,
     /// Render the Task IR's image channel beside the dataset (`es loop collect --frames`).
     #[serde(default)]
     pub frames: bool,
+    /// Collect under an Evaluation IR's own perturbations (packet M13/Z3): `es loop collect
+    /// --perturb <config> --suites <a,b>` (packet M13/Z2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub perturb: Option<PerturbRef>,
+    /// Earlier dataset roots, merged with this collection by `es loop distill` into
+    /// `<out>/collect/merged`, which is then what trains (packet M13/Z3). Each root's frame
+    /// tiles are the `frames` directory beside it -- the layout a cycle writes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merge: Vec<String>,
+}
+
+/// `[collect] perturb = { config, suites }` (packet M13/Z3).
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerturbRef {
+    /// An Evaluation IR by path; its suites are what the collection runs under.
+    pub config: String,
+    /// Episode `i` runs under `suites[i % len]`.
+    pub suites: Vec<String>,
 }
 
 /// `[train]` — T1's recipe by path (`recipe`) or inline (`dataset`/`policy`/`run`).
@@ -1711,6 +1743,11 @@ pub struct TrainRef {
     pub policy: Option<PolicyRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<Run>,
+    /// What the run starts from (packet M13/Z3): a bundle, which becomes the IR and RL routes'
+    /// `[init] policy`, or a `lerobot` `pretrained_model` directory, which becomes the lerobot
+    /// route's `--policy.path` -- its fine-tuning path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub init: Option<String>,
 }
 
 /// `[eval]` — what `es eval run` is told, for the expert gate and for the trained policy
@@ -1854,6 +1891,9 @@ fn default_height() -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Stage {
     Collect,
+    /// `[collect] merge`: `es loop distill` of the new dataset with the earlier roots (packet
+    /// M13/Z3). Part of the collect stage's data, so, like the gate, not a `--from` name.
+    Merge,
     /// Spec 28.9 rule 1: the same harness, on the expert, before anything trains.
     ExpertGate,
     Train,
@@ -1865,6 +1905,7 @@ impl Stage {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Collect => "collect",
+            Self::Merge => "merge",
             Self::ExpertGate => "expert-gate",
             Self::Train => "train",
             Self::Eval => "eval",
@@ -1903,6 +1944,9 @@ pub struct CyclePlan {
     /// `[eval.preview]`, and one preview per training mark; both empty without it.
     pub preview: Option<PreviewRef>,
     pub previews: Vec<PreviewStep>,
+    /// `[train] init`, said under the train line: the IR route's plan names only the file
+    /// `init_from` writes, not where its tensors came from.
+    pub init: Option<String>,
 }
 
 /// One checkpoint's preview: `es eval run`'s words, run as a child of `es loop cycle` once the
@@ -1932,6 +1976,28 @@ impl Cycle {
                  Delete [eval.preview] to run none",
             ));
         }
+        if let Some(c) = &cycle.collect {
+            if !c.merge.is_empty() && (c.policy.is_empty() || c.episodes == 0) {
+                return Err(refuse(
+                    "[collect] `merge` merges earlier roots with what this cycle collects, and \
+                     this [collect] collects nothing (no `policy`, or `episodes` 0). To train on \
+                     earlier roots alone, `es loop distill` them and name the result in \
+                     `dataset`",
+                ));
+            }
+            if c.policy.is_empty() || c.episodes == 0 {
+                return Err(refuse(
+                    "[collect] needs `policy` (the bundle whose Deployment IR the collection \
+                     runs under) and `episodes` above 0",
+                ));
+            }
+            if c.perturb.as_ref().is_some_and(|p| p.suites.is_empty()) {
+                return Err(refuse(
+                    "[collect] perturb `suites` is empty; name the suites of `config` to collect \
+                     under, or delete `perturb`",
+                ));
+            }
+        }
         match (&cycle.collect, &cycle.dataset) {
             (Some(_), Some(_)) => Err(refuse(
                 "the cycle sets both `[collect]` and `dataset`; one collects the data and the \
@@ -1944,12 +2010,53 @@ impl Cycle {
         }
     }
 
-    /// The dataset root this cycle trains on; `<out>/collect/ds` when it collects its own.
+    /// The dataset root this cycle trains on: `<out>/collect/ds` when it collects its own, and
+    /// `<out>/collect/merged` when that is merged with `[collect] merge` (packet M13/Z3).
     pub fn dataset_root(&self, out: &Path) -> String {
         match &self.dataset {
             Some(root) => root.clone(),
-            None => under(out, "collect/ds"),
+            None if self.merge().is_empty() => collect_root(out),
+            None => under(out, "collect/merged"),
         }
+    }
+
+    /// `[collect] merge`, empty when there is none.
+    pub fn merge(&self) -> &[String] {
+        self.collect.as_ref().map_or(&[], |c| &c.merge)
+    }
+
+    /// What `[train] init` and `[collect] merge` name has to be on disk before a real run
+    /// starts, or the collection before it is wasted (packet M13/Z3). `--dry-run` does not call
+    /// this: it opens nothing, which is what keeps the goldens judgeable without a run.
+    pub fn check_inputs(&self, route: Route) -> Result<(), DataError> {
+        if let Some(init) = &self.train.init {
+            let at = Path::new(init);
+            let (ok, what) = match route {
+                Route::External => (
+                    at.join("model.safetensors").is_file() && at.join("config.json").is_file(),
+                    "a lerobot `pretrained_model` directory (model.safetensors, config.json)",
+                ),
+                Route::Ir | Route::Rl => (at.is_file(), "a bundle"),
+            };
+            if !ok {
+                return Err(refuse(format!(
+                    "[train] `init` is {init:?}, which is not {what} on disk"
+                )));
+            }
+        }
+        let frames = self.collect.as_ref().is_some_and(|c| c.frames);
+        for root in self.merge() {
+            crate::LeRobotDataset::open(Path::new(root))
+                .map_err(|e| refuse(format!("[collect] `merge` {root}: {e}")))?;
+            let tiles = frames_beside(root);
+            if frames && !Path::new(&tiles).is_dir() {
+                return Err(refuse(format!(
+                    "[collect] `merge` {root}: this cycle trains on frames and {tiles} is not a \
+                     directory; a merged root's tiles are the `frames` beside it"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// T1's recipe for this cycle: the document `[train] recipe` names (read by the caller —
@@ -1971,9 +2078,7 @@ impl Cycle {
                 run: self.train.run.clone().ok_or_else(|| {
                     refuse("[train] is inline and has no `run` block: steps, batch, lr, seed")
                 })?,
-                // An inline `[train]` names no policy to start from: a cycle that continues
-                // one reaches `[init]` through `[train] recipe`, where the whole recipe --
-                // and its `init.lock` -- is one document (packet M8/S1).
+                // `[train] init` below, or `[init]` through `[train] recipe` (packet M8/S1).
                 init: None,
                 // A cycle collects demonstrations and trains on them; `[rl]` generates its
                 // own data and has no collect stage to chain to. Reached, like `[init]`,
@@ -1983,7 +2088,9 @@ impl Cycle {
         };
         let dataset = recipe.dataset.get_or_insert_with(DatasetRef::default);
         if let Some(collect) = &self.collect {
-            dataset.root = under(out, "collect/ds");
+            // The merge extends `collect/frames` with the earlier roots' tiles, so one
+            // directory serves `collect/ds` and `collect/merged` alike (packet M13/Z3).
+            dataset.root = self.dataset_root(out);
             dataset.frames = collect.frames.then(|| under(out, "collect/frames"));
         } else if let Some(root) = &self.dataset {
             dataset.root.clone_from(root);
@@ -1995,6 +2102,24 @@ impl Cycle {
             ));
         }
         recipe.route()?;
+        if let Some(init) = &self.train.init {
+            // The lerobot route is the recipe with `[policy] lerobot`.
+            let taken = match recipe.policy.lerobot.as_mut() {
+                Some(lerobot) => lerobot.path.replace(init.clone()).is_some(),
+                None => recipe
+                    .init
+                    .replace(InitRef {
+                        policy: init.clone(),
+                    })
+                    .is_some(),
+            };
+            if taken {
+                return Err(refuse(format!(
+                    "[train] `init` is {init:?} and the recipe already names what it starts \
+                     from; one of the two, not both"
+                )));
+            }
+        }
         recipe.marks()?;
         Ok(recipe)
     }
@@ -2039,6 +2164,7 @@ impl CyclePlan {
         let mut steps = Vec::new();
 
         if let Some(collect) = &cycle.collect {
+            let frames = collect.frames.then(|| under(out, "collect/frames"));
             let mut args = vec![
                 s("--policy"),
                 collect.policy.clone(),
@@ -2049,21 +2175,45 @@ impl CyclePlan {
                 s("--seed"),
                 collect.seed.to_string(),
                 s("--out"),
-                dataset_root.clone(),
+                collect_root(out),
             ];
-            if collect.frames {
+            if let Some(frames) = &frames {
                 args.push(s("--frames"));
-                args.push(under(out, "collect/frames"));
+                args.push(frames.clone());
             }
             if let Some(expert) = &collect.expert {
                 args.push(s("--expert"));
                 args.push(expert.clone());
+            }
+            if let Some(p) = &collect.perturb {
+                args.extend([s("--perturb"), p.config.clone()]);
+                args.extend([s("--suites"), p.suites.join(",")]);
             }
             steps.push(CycleStep {
                 stage: Stage::Collect,
                 prefix: es(&["es", "loop", "collect"]),
                 args,
             });
+            // Packet M13/Z3: the new dataset first, then the earlier roots, into the root that
+            // trains. All-train, because `es train` trains on every episode of its root and the
+            // split `split.json` records should say so. The tiles go into `collect/frames`
+            // after the new collection's own, which is the merged root's global frame order.
+            if !collect.merge.is_empty() {
+                let mut args = Vec::new();
+                for root in std::iter::once(collect_root(out)).chain(collect.merge.clone()) {
+                    let tiles = frames.as_ref().map(|_| frames_beside(&root));
+                    args.extend([s("--in"), root]);
+                    args.extend(tiles.into_iter().flat_map(|t| [s("--in-frames"), t]));
+                }
+                args.extend(["--train", "1", "--val", "0", "--test", "0"].map(s));
+                args.extend([s("--out"), dataset_root.clone()]);
+                args.extend(frames.iter().flat_map(|f| [s("--frames"), f.clone()]));
+                steps.push(CycleStep {
+                    stage: Stage::Merge,
+                    prefix: es(&["es", "loop", "distill"]),
+                    args,
+                });
+            }
             // Spec 28.9 rule 1. The expert's own report is kept beside the policy's, under its
             // own directory: a harness the expert fails is a harness no policy can pass, and
             // the evidence for that has to survive the run that comes after it.
@@ -2144,6 +2294,7 @@ impl CyclePlan {
             dataset_root,
             preview,
             previews,
+            init: cycle.train.init.clone(),
         })
     }
 
@@ -2166,6 +2317,11 @@ impl CyclePlan {
                 for line in self.train.render(out).lines() {
                     text.push_str("  ");
                     text.push_str(line);
+                    text.push('\n');
+                }
+                if let Some(init) = &self.init {
+                    text.push_str("  # init: from ");
+                    text.push_str(&rel(init));
                     text.push('\n');
                 }
                 // Beside the training plan and not in it: a preview runs as the cycle's child
@@ -2240,6 +2396,21 @@ fn preview_step(cycle: &Cycle, preview: &PreviewRef, mark: u32, out: &Path) -> P
         args.push(under(out, &format!("preview/{mark}/frames")));
     }
     PreviewStep { mark, dir, args }
+}
+
+/// Where a cycle's `[collect]` writes its dataset.
+pub fn collect_root(out: &Path) -> String {
+    under(out, "collect/ds")
+}
+
+/// A dataset root's flat frame tiles, in the layout a cycle writes: the `frames` directory
+/// beside it (`collect/ds`, `collect/merged` and `collect/frames`).
+///
+/// ponytail: a convention, not a declaration; a merged root from elsewhere needs a
+/// `{ root, frames }` entry in `[collect] merge` if that ever comes up.
+pub fn frames_beside(root: &str) -> String {
+    let parent = Path::new(root).parent().unwrap_or(Path::new(""));
+    parent.join("frames").to_string_lossy().into_owned()
 }
 
 fn triple(v: [f64; 3]) -> String {
@@ -3265,5 +3436,185 @@ fov = 36
         let e =
             Cycle::parse(&format!("{CYCLE}[eval.preview]\nepisodes = 0\n")).expect_err("refused");
         assert!(e.to_string().contains("episodes"), "{e}");
+    }
+
+    // --- the "again" cycle (packet M13/Z3) ---------------------------------------------------
+
+    /// `CYCLE` going again: perturbed, merged with an earlier root, started from its checkpoint.
+    fn again() -> String {
+        CYCLE
+            .replace(
+                "frames = true\n[train]",
+                "frames = true\nperturb = { config = \"evaluation.toml\", suites = \
+                 [\"light_intensity\", \"torque_noise\"] }\nmerge = [\"runs/001/collect/ds\"]\n\
+                 [train]",
+            )
+            .replace(
+                "recipe = \"training.toml\"",
+                "recipe = \"training.toml\"\ninit = \"runs/001/train/checkpoints/20000.esb\"",
+            )
+    }
+
+    /// Z2's flags on the collect line, a merge stage into `collect/merged` with the frames beside
+    /// each root, the merged root and its frames as what trains, and `[init] policy` on the IR
+    /// route -- said under the train line.
+    #[test]
+    fn an_again_cycle_perturbs_merges_and_starts_from_init() {
+        let text = again();
+        let cycle = Cycle::parse(&text).expect("parses");
+        let recipe = cycle.training(Some(IR), Path::new("/tmp/run")).unwrap();
+        let dataset = recipe.dataset.as_ref().unwrap();
+        assert!(dataset.root.ends_with("collect/merged"), "{recipe:?}");
+        assert!(dataset
+            .frames
+            .as_deref()
+            .unwrap()
+            .ends_with("collect/frames"));
+        assert_eq!(
+            recipe.init,
+            Some(InitRef {
+                policy: s("runs/001/train/checkpoints/20000.esb")
+            })
+        );
+
+        let plan = cycle_plan(&text, "/tmp/run");
+        assert!(plan.dataset_root.ends_with("collect/merged"));
+        let stages: Vec<Stage> = plan.steps.iter().map(|s| s.stage).collect();
+        assert_eq!(
+            stages[..3],
+            [Stage::Collect, Stage::Merge, Stage::ExpertGate]
+        );
+        let rendered = plan.render(Path::new("/tmp/run"));
+        for line in [
+            "# cycle: collect -> merge -> expert-gate -> train -> eval -> showcase\n",
+            " --out collect/ds --frames collect/frames --expert so101-pick-place --perturb \
+             evaluation.toml --suites light_intensity,torque_noise\n",
+            "\nes loop distill --in collect/ds --in-frames collect/frames --in \
+             runs/001/collect/ds --in-frames runs/001/collect/frames --train 1 --val 0 --test 0 \
+             --out collect/merged --frames collect/frames\n",
+            "--frames collect/frames collect/merged\n",
+            "--init-weights train/weights/init.safetensors",
+            "\n  # init: from runs/001/train/checkpoints/20000.esb\n",
+        ] {
+            assert!(rendered.contains(line), "{line:?} not in\n{rendered}");
+        }
+
+        // Without frames there are no tiles to merge.
+        let bare = text.replace("frames = true\nperturb", "perturb");
+        let plan = cycle_plan(&bare, "/tmp/run");
+        assert_eq!(
+            plan.steps[1].args.join(" ").replace('\\', "/"),
+            "--in /tmp/run/collect/ds --in runs/001/collect/ds --train 1 --val 0 --test 0 \
+             --out /tmp/run/collect/merged"
+        );
+    }
+
+    /// The lerobot route starts from `--policy.path`, in place of `--policy.type`, which
+    /// `lerobot-train` refuses beside it (`lerobot/configs/parser.py`, 0.6.1).
+    #[test]
+    fn init_is_the_lerobot_routes_policy_path() {
+        let cycle = Cycle::parse(&again()).expect("parses");
+        let out = Path::new("/tmp/run");
+        let recipe = cycle.training(Some(EXTERNAL), out).unwrap();
+        assert_eq!(recipe.init, None);
+        let trainer = vec![s("lerobot-train")];
+        let plan = Plan::build(
+            &recipe,
+            &out.join("train"),
+            "python",
+            &trainer,
+            Some(6),
+            false,
+        )
+        .unwrap();
+        let rendered = plan.render(&out.join("train"));
+        assert!(
+            rendered.contains("--policy.path=runs/001/train/checkpoints/20000.esb --policy.chunk"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("--policy.type"), "{rendered}");
+    }
+
+    /// Refused by name: a `[collect]` that merges and collects nothing, a perturbation with no
+    /// suite, and an `init` beside a recipe that already starts from something.
+    #[test]
+    fn an_again_cycle_refuses_what_it_cannot_do() {
+        let block = CYCLE
+            .split_once("[collect]\n")
+            .and_then(|(_, rest)| rest.split_once("[train]"))
+            .map(|(block, _)| block.to_owned())
+            .expect("the fixture has a [collect] block");
+        let merge_only = CYCLE.replace(
+            &format!("[collect]\n{block}"),
+            "dataset = \"runs/ds\"\n[collect]\nmerge = [\"runs/001/collect/ds\"]\n",
+        );
+        let e = Cycle::parse(&merge_only).expect_err("refused");
+        assert!(e.to_string().contains("`merge`"), "{e}");
+        let none = again().replace("episodes = 200", "episodes = 0");
+        let e = Cycle::parse(&none).expect_err("refused");
+        assert!(e.to_string().contains("`merge`"), "{e}");
+        let e = Cycle::parse(&CYCLE.replace("episodes = 200\n", "")).expect_err("refused");
+        assert!(e.to_string().contains("episodes"), "{e}");
+        let empty = again().replace("[\"light_intensity\", \"torque_noise\"]", "[]");
+        let e = Cycle::parse(&empty).expect_err("refused");
+        assert!(e.to_string().contains("suites"), "{e}");
+
+        let cycle = Cycle::parse(&again()).expect("parses");
+        let with_init = format!("{IR}\n[init]\npolicy = \"other.esb\"\n");
+        let e = cycle
+            .training(Some(&with_init), Path::new("/tmp/run"))
+            .expect_err("refused");
+        assert!(e.to_string().contains("not both"), "{e}");
+    }
+
+    /// `[train] init` and `[collect] merge` have to be on disk before a real run starts: a bundle
+    /// on the IR route, a `pretrained_model` directory on the lerobot route, a dataset root.
+    #[test]
+    fn a_real_run_refuses_an_init_or_a_merge_root_that_is_not_there() {
+        let dir = std::env::temp_dir().join(format!("es-data-again-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let bundle = dir.join("20000.esb");
+        let at = |init: &Path, merge: &[&str]| {
+            let mut cycle = Cycle::parse(&again()).unwrap();
+            cycle.train.init = Some(init.to_string_lossy().into_owned());
+            cycle.collect.as_mut().unwrap().merge = merge.iter().map(|m| s(*m)).collect();
+            cycle
+        };
+
+        let e = at(&bundle, &[])
+            .check_inputs(Route::Ir)
+            .expect_err("no bundle");
+        assert!(e.to_string().contains("20000.esb"), "{e}");
+        std::fs::write(&bundle, b"esb").unwrap();
+        at(&bundle, &[])
+            .check_inputs(Route::Ir)
+            .expect("a file is there");
+        at(&bundle, &[])
+            .check_inputs(Route::Rl)
+            .expect("a file is there");
+
+        let model = dir.join("pretrained_model");
+        std::fs::create_dir_all(&model).unwrap();
+        std::fs::write(model.join("config.json"), b"{}").unwrap();
+        let e = at(&model, &[])
+            .check_inputs(Route::External)
+            .expect_err("half a checkpoint");
+        assert!(e.to_string().contains("pretrained_model"), "{e}");
+        std::fs::write(model.join("model.safetensors"), b"st").unwrap();
+        at(&model, &[])
+            .check_inputs(Route::External)
+            .expect("a whole checkpoint");
+        let e = at(&bundle, &[])
+            .check_inputs(Route::External)
+            .expect_err("a file, not a dir");
+        assert!(e.to_string().contains("lerobot"), "{e}");
+
+        let missing = dir.join("runs/001/collect/ds");
+        let e = at(&bundle, &[&missing.to_string_lossy()])
+            .check_inputs(Route::Ir)
+            .expect_err("no root");
+        assert!(e.to_string().contains("`merge`"), "{e}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

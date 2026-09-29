@@ -267,6 +267,7 @@ pub fn write_run(
             checkpoint_at: marks,
             ..recipe.run
         }),
+        init: cycle.train.init.clone(),
     };
     let collect = cycle.collect.as_mut().ok_or_else(|| {
         err(

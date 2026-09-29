@@ -13,7 +13,7 @@ use es_assets::scene::{JointKind, SceneDesc};
 use es_compile::PolicyBundle;
 use es_data::collect::{
     CollectEvent, CollectSink, CollectSpec, Collector, Intervention, PerturbAt, Perturbation,
-    SplitSpec,
+    SplitSpec, PERTURBATIONS_FILE,
 };
 use es_data::{CollectReport, InterventionSegment};
 use es_env::expert::{demo_cfg, ScriptedExpert};
@@ -42,8 +42,9 @@ es loop collect --policy <policy.esb> --scene <file.xml|urdf> --episodes <N> --s
                 [--perturb <evaluation.toml> --suites <a,b>]
                 [--telemetry <addr>] [--telemetry-token <t>] [--telemetry-image-every <N>]
 es loop intervene --dataset <root> --segments <segments.json>
-es loop distill --in <root> [--in <root>...] [--train 0.8] [--val 0.1] [--test 0.1]
-                [--seed <S>] --out <root>
+es loop distill --in <root> [--in-frames <dir>] [--in <root> [--in-frames <dir>]...]
+                [--train 0.8] [--val 0.1] [--test 0.1] [--seed <S>] --out <root>
+                [--frames <dir>]
 es loop cycle --recipe <cycle.toml> [--out <dir>] [--dry-run] [--from <stage>]
               [--allow-new-evaluation] [--skip-expert-gate]     (see `es loop cycle --help`)
 
@@ -108,10 +109,15 @@ intervene  Applies intervention segments to a dataset that is already on disk. <
            provenance. dataset_content_hash moves; dataset_schema_hash does not, unless a
            column had to be added.
 
-distill    Merges datasets (episodes re-indexed, intervention labels remapped), computes the
-           spec 19.2 deterministic split and writes training_identity.json (spec 19.3),
-           split.json and a loop step. The training run itself is PyTorch-side and is not
-           run here, so every TrainingIdentity slot but `dataset` is an all-zero digest.
+distill    Merges datasets (episodes re-indexed, intervention labels and the rows of
+           meta/perturbations.jsonl remapped), computes the spec 19.2 deterministic split and
+           writes training_identity.json (spec 19.3), split.json and a loop step. The training
+           run itself is PyTorch-side and is not run here, so every TrainingIdentity slot but
+           `dataset` is an all-zero digest.
+           --frames <dir> also merges the inputs' flat frame tiles (`es loop collect --frames`)
+           into <dir>, in the merged dataset's global frame order; each input's tiles are the
+           --in-frames after its --in. Tiles that already are <dir> stay, when their --in is
+           first -- what `es loop cycle`'s [collect] merge does with collect/frames.
 
 cycle      Runs collect -> train -> eval -> showcase from one document, appending a step per
            stage to one ledger (spec 13.1, spec 13.3). It re-implements no stage: each one is
@@ -404,11 +410,6 @@ fn episode_draws(
 
 // --- collection under an Evaluation IR's perturbations (packet M13/Z2) ----------------------
 
-/// Each episode's suite, seed and reset draws, one JSON line per episode beside
-/// `meta/interventions.jsonl` and, like it, outside every hash (`dataset_content_hash` reads
-/// the parquet files, `dataset_schema_hash` `info.json`).
-const PERTURBATIONS_FILE: &str = "meta/perturbations.jsonl";
-
 /// `--perturb <evaluation.toml> --suites <a,b>`.
 ///
 /// Episode `i` runs under suite `suites[i % len]` with the key `es eval run` gives episode
@@ -461,30 +462,7 @@ impl Perturb {
             .filter(|s| !s.is_empty())
             .map(ToOwned::to_owned)
             .collect();
-        let known = || {
-            let all: Vec<&str> = ir.suites.iter().map(|s| s.name.as_str()).collect();
-            all.join(", ")
-        };
-        if names.is_empty() {
-            return Err(CliError::Usage(format!(
-                "--suites names no suite; {config} has {}",
-                known()
-            )));
-        }
-        let cells = names
-            .iter()
-            .map(|name| {
-                ir.suites
-                    .iter()
-                    .position(|s| s.name == *name)
-                    .ok_or_else(|| {
-                        CliError::Usage(format!(
-                            "--suites: {config} has no suite {name:?}; it has {}",
-                            known()
-                        ))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let cells = suite_cells(&ir, config, &names)?;
         refuse_evaluation_seeds(&ir, config, seed, episodes)?;
         let control_us = deploy.rate.control_period().0;
         refuse_unseen_age(&ir, &cells, deploy, control_us)?;
@@ -616,10 +594,44 @@ impl Perturb {
     }
 }
 
+/// `--suites` against the Evaluation IR: each name's index, which is its draws' `suite_id`,
+/// and a name the IR lacks refused beside the ones it has. `es loop cycle` asks it too, so a
+/// cycle's `[collect] perturb` is refused by `--dry-run` (packet M13/Z3).
+pub(crate) fn suite_cells(
+    ir: &EvaluationIr,
+    config: &str,
+    names: &[String],
+) -> Result<Vec<usize>, CliError> {
+    let known = || {
+        let all: Vec<&str> = ir.suites.iter().map(|s| s.name.as_str()).collect();
+        all.join(", ")
+    };
+    if names.is_empty() {
+        return Err(CliError::Usage(format!(
+            "--suites names no suite; {config} has {}",
+            known()
+        )));
+    }
+    names
+        .iter()
+        .map(|name| {
+            ir.suites
+                .iter()
+                .position(|s| s.name == *name)
+                .ok_or_else(|| {
+                    CliError::Usage(format!(
+                        "--suites: {config} has no suite {name:?}; it has {}",
+                        known()
+                    ))
+                })
+        })
+        .collect()
+}
+
 /// Spec 13.3: a re-collection never draws what the policy will be judged on. The collection's
 /// seeds `[seed, seed + episodes)` against the Evaluation IR's resolved ones (spec 10.2: the
 /// explicit list, or `n_episodes` from `seed_base`, as `es_eval::runner::resolve_seeds` has it).
-fn refuse_evaluation_seeds(
+pub(crate) fn refuse_evaluation_seeds(
     ir: &EvaluationIr,
     config: &str,
     seed: u64,
@@ -1169,22 +1181,53 @@ fn intervene(args: &[String]) -> Result<u8, CliError> {
 
 // --- distill ----------------------------------------------------------------------------------
 
-fn distill(args: &[String]) -> Result<u8, CliError> {
+/// One merge. `es loop cycle`'s merge stage is this call, with the words its plan prints.
+pub(crate) fn distill(args: &[String]) -> Result<u8, CliError> {
     let pairs = parse(
         args,
-        &["--in", "--out", "--train", "--val", "--test", "--seed"],
+        &[
+            "--in",
+            "--in-frames",
+            "--out",
+            "--frames",
+            "--train",
+            "--val",
+            "--test",
+            "--seed",
+        ],
     )?;
-    let inputs: Vec<PathBuf> = pairs
-        .iter()
-        .filter(|(f, _)| f == "--in")
-        .map(|(_, v)| PathBuf::from(v))
-        .collect();
+    // Each `--in-frames` belongs to the `--in` before it (packet M13/Z3).
+    let mut inputs: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+    for (flag, value) in &pairs {
+        match (flag.as_str(), inputs.last_mut()) {
+            ("--in", _) => inputs.push((PathBuf::from(value), None)),
+            ("--in-frames", Some((_, tiles @ None))) => *tiles = Some(PathBuf::from(value)),
+            ("--in-frames", _) => {
+                return Err(CliError::Usage(format!(
+                    "--in-frames {value}: it follows the --in <root> whose tiles it holds, once \
+                     per --in\n\n{HELP}"
+                )))
+            }
+            _ => {}
+        }
+    }
     if inputs.is_empty() {
         return Err(CliError::Usage(format!(
             "at least one --in <root> is required\n\n{HELP}"
         )));
     }
     let out = PathBuf::from(required(&pairs, "--out")?);
+    let frames = one(&pairs, "--frames").map(PathBuf::from);
+    let tiles: Vec<(&Path, &Path)> = inputs
+        .iter()
+        .filter_map(|(root, t)| Some((root.as_path(), t.as_deref()?)))
+        .collect();
+    if tiles.len() != if frames.is_some() { inputs.len() } else { 0 } {
+        return Err(CliError::Usage(format!(
+            "--frames <dir> and --in-frames go together: every --in names its tiles when the \
+             merge writes frames, and none does when it does not\n\n{HELP}"
+        )));
+    }
     let split = SplitSpec {
         ratios: [
             number(&pairs, "--train", 0.8)?,
@@ -1194,6 +1237,12 @@ fn distill(args: &[String]) -> Result<u8, CliError> {
         seed: number(&pairs, "--seed", 0)?,
     };
 
+    // Before the dataset, so a missing tile stops the merge before any ledger records it.
+    if let Some(dir) = &frames {
+        let n = merge_frames(&tiles, dir)?;
+        println!("frames: {n} tile(s) in {}", dir.display());
+    }
+    let inputs: Vec<&Path> = inputs.iter().map(|(root, _)| root.as_path()).collect();
     let identity =
         es_data::distill(&inputs, &split, &out).map_err(|e| CliError::Runtime(e.to_string()))?;
     let training_hash = identity
@@ -1210,6 +1259,54 @@ fn distill(args: &[String]) -> Result<u8, CliError> {
          PyTorch-side (spec 19.3, spec 2.3)."
     );
     Ok(0)
+}
+
+/// The inputs' flat `<NNNNNN>.bin` tiles (and `.json` beside them) in the merged dataset's
+/// global frame order: input `k`'s tile `i` becomes `<out>/<offset + i>`, the offset being the
+/// frames of the inputs before it -- `es_data::distill`'s episode order. Hard links where the
+/// volume allows, copies where not. Tiles that already are `<out>` at offset 0 (a cycle's new
+/// collection, merged first) stay where they are.
+fn merge_frames(inputs: &[(&Path, &Path)], out: &Path) -> Result<u64, CliError> {
+    let fail =
+        |p: &Path, e: &dyn std::fmt::Display| CliError::Runtime(format!("{}: {e}", p.display()));
+    std::fs::create_dir_all(out).map_err(|e| fail(out, &e))?;
+    let here = out.canonicalize().map_err(|e| fail(out, &e))?;
+    // Every offset first, so a refusal leaves every tile where it was.
+    let mut next = 0u64;
+    let mut moves = Vec::new();
+    for (root, tiles) in inputs {
+        let dataset = es_data::LeRobotDataset::open(root).map_err(|e| fail(root, &e))?;
+        let n: u64 = dataset.episodes().iter().map(|m| m.length).sum();
+        if tiles.canonicalize().ok().as_ref() != Some(&here) {
+            moves.push((*tiles, next, n));
+        } else if next != 0 {
+            return Err(CliError::Usage(format!(
+                "--in-frames {}: these tiles are --frames itself, so its --in has to come \
+                 first\n\n{HELP}",
+                tiles.display()
+            )));
+        }
+        next += n;
+    }
+    for (tiles, offset, n) in moves {
+        for i in 0..n {
+            for ext in ["bin", "json"] {
+                let src = tiles.join(format!("{i:06}.{ext}"));
+                let dst = out.join(format!("{:06}.{ext}", offset + i));
+                if ext == "json" && !src.exists() {
+                    continue;
+                }
+                // A tile of an earlier merge into the same directory.
+                let _ = std::fs::remove_file(&dst);
+                if std::fs::hard_link(&src, &dst).is_err() {
+                    std::fs::copy(&src, &dst).map_err(|e| {
+                        CliError::Runtime(format!("{} -> {}: {e}", src.display(), dst.display()))
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(next)
 }
 
 #[cfg(test)]
