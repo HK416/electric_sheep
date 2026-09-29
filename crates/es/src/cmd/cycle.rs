@@ -83,12 +83,16 @@ A recipe's `[policy] base_model` is checked against the pin before the first sta
 `base_model_fetch` a missing one is fetched then (the plan's `# fetch:` line) -- never after
 collect.
 
-Two refusals are the point of the command:
+Three refusals are the point of the command:
 
 * **The harness passes the expert first** (spec 28.9 rule 1). With `[collect] expert` set, the
   expert is run through `es eval run` on the *same* `[eval] config` before anything trains, and
   a failed acceptance stops the cycle: a harness the expert fails is a harness no policy can
   pass. `--skip-expert-gate` runs anyway and records the deviation in the ledger.
+* **The demonstrations mostly succeeded.** With `[collect] expert` set, a collection in which
+  fewer than half of the demonstrations succeeded (its collect step's `success` of `episodes`
+  in loop.jsonl) is not trained on: the cycle stops before the train stage, `--from train`
+  included. Fix the demonstration program and collect again.
 * **A moved `evaluation_hash` is refused by name** (spec 13.3). If `<out>/loop.jsonl` already
   holds an evaluate step under different evaluation conditions, the comparison the ledger
   invites would be invalid; both hashes are printed and `--allow-new-evaluation` is the
@@ -109,8 +113,9 @@ Two refusals are the point of the command:
               collect and the evaluations, and the training sample every N optimizer steps.
 --progress-every <N>    the trainer's progress lines, in optimizer steps (default 10)
 
-Exit codes: 0 success, 1 the expert gate or the final acceptance failed (both printed) or a
-runtime failure, 2 usage error, 3 skipped (a backend or runtime this machine does not have).
+Exit codes: 0 success, 1 the expert gate, the demonstrations or the final acceptance failed
+(each printed) or a runtime failure, 2 usage error, 3 skipped (a backend or runtime this machine
+does not have).
 ";
 
 fn bad(msg: impl Into<String>) -> CliError {
@@ -272,6 +277,12 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
             println!("- expert-gate (skipped by --skip-expert-gate)");
             gate = Some("skipped (--skip-expert-gate)".to_owned());
             continue;
+        }
+        // Before the trainer, `--from train` included: whatever path reaches training reads
+        // the same collect step (packet P-M14-R1). A cycle that trains on `[dataset]` collected
+        // nothing, and an earlier iteration's collection in the same ledger is not its data.
+        if step.stage == Stage::Train && cycle.collect.is_some() {
+            check_demonstrations(&read_loop_steps(&out).map_err(|e| bad(e.to_string()))?)?;
         }
         println!("$ {}", one_line(step));
         // Every event of this stage carries its name, and `stage.begin` / `stage.end` bracket
@@ -766,6 +777,41 @@ fn check_evaluation_hash(out: &Path, want: &str, allow_new: bool) -> Result<(), 
     )))
 }
 
+/// Below this share of successful demonstrations a cycle does not train (packet P-M14-R1): a
+/// policy imitates what it is shown, and a collection whose demonstrator mostly failed teaches
+/// failing. A constant, not read from `[eval] config`: the demo's nominal acceptance is the same
+/// 0.5, but an acceptance criterion judges a policy on one suite under its own comparator and
+/// aggregation, and this judges a collection.
+const MIN_DEMONSTRATION_SUCCESS: f64 = 0.5;
+
+/// The last collection, refused when it was demonstrations (a collect step with an `expert`)
+/// and fewer than [`MIN_DEMONSTRATION_SUCCESS`] of them succeeded -- read from the step's own
+/// `success` and `episodes`, so the facts the refusal rests on are in `loop.jsonl` beside the
+/// dataset, as the expert gate's evaluate step is. A step without counts (an older `es`) is not
+/// judged.
+fn check_demonstrations(steps: &[LoopStep]) -> Result<(), CliError> {
+    let Some(collect) = steps.iter().rev().find(|s| s.kind == LoopKind::Collect) else {
+        return Ok(());
+    };
+    let count = |v: Option<&String>| v.and_then(|v| v.parse::<u32>().ok());
+    let (Some(success), Some(episodes)) = (
+        count(collect.outputs.get("success")),
+        count(collect.inputs.get("episodes")),
+    ) else {
+        return Ok(());
+    };
+    if !collect.inputs.contains_key("expert")
+        || f64::from(success) >= MIN_DEMONSTRATION_SUCCESS * f64::from(episodes)
+    {
+        return Ok(());
+    }
+    Err(bad(format!(
+        "only {success} of {episodes} demonstrations succeeded, fewer than half, so nothing is \
+         trained on them: fix the demonstration program in step ② (teach), try it once there, \
+         and run again"
+    )))
+}
+
 /// `[collect] perturb`, refused on the documents before anything runs, `--dry-run` included
 /// (packet M13/Z3): a suite `config` does not declare, or collect seeds that meet the seeds of
 /// the Evaluation IR this cycle is judged by or of the one it draws from (spec 13.3). Z2's own
@@ -856,4 +902,43 @@ fn check_resume(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use es_data::collect::{LoopKind, LoopStep};
+
+    use super::check_demonstrations;
+
+    fn collected(expert: bool, success: Option<u32>) -> LoopStep {
+        let mut step = LoopStep::new(LoopKind::Collect).input("episodes", &200);
+        if expert {
+            step = step.input("expert", &"teach.toml");
+        }
+        if let Some(n) = success {
+            step = step.output("success", &n);
+        }
+        step
+    }
+
+    /// Packet P-M14-R1: a collection whose demonstrator mostly failed is not trained on, and
+    /// the refusal says how many succeeded and where to fix it.
+    #[test]
+    fn cycle_refuses_to_train_on_mostly_failed_demonstrations() {
+        let e = check_demonstrations(&[collected(true, Some(10))]).expect_err("10 of 200");
+        let said = e.to_string();
+        assert!(said.contains("10 of 200 demonstrations"), "{said}");
+        assert!(said.contains("demonstration program"), "{said}");
+        // Exactly half is not fewer than half.
+        check_demonstrations(&[collected(true, Some(100))]).expect("100 of 200");
+        // The last collection is the one judged: an earlier bad one is history.
+        check_demonstrations(&[collected(true, Some(10)), collected(true, Some(150))])
+            .expect("the last collection succeeded");
+        // A policy's own rollouts after an expert's: the last collection is not demonstrations.
+        check_demonstrations(&[collected(true, Some(10)), collected(false, Some(0))])
+            .expect("no expert in the last collection");
+        // No counts (a collection by an older `es`): nothing to judge.
+        check_demonstrations(&[collected(true, None)]).expect("no counts");
+        check_demonstrations(&[]).expect("no collection");
+    }
 }

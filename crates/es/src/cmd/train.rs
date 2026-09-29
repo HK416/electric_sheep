@@ -997,7 +997,11 @@ fn stream(
         let parsed = serde_json::from_str::<Value>(&line).unwrap_or(Value::Null);
         let publisher = watch.publisher.as_deref_mut();
         match (publisher, parsed.get("progress"), parsed.get("sample")) {
-            (Some(p), Some(progress), _) => p.progress(progress),
+            (Some(p), Some(progress), _) => {
+                if let Some(row) = progress_row(progress) {
+                    p.train_row(row);
+                }
+            }
             (Some(p), None, Some(Value::String(path))) => p.sample(Path::new(path)),
             _ => {}
         }
@@ -1014,6 +1018,26 @@ fn stream(
         status.code(),
         serde_json::from_str(&last).unwrap_or(Value::Null),
     ))
+}
+
+/// One `{"progress": {...}}` object of `train_act.py` / `train_ppo.py` as the stream-5 row
+/// `[step, loss, lr, samples_per_s]` (packet M7/E7); a line without a step or a loss is none.
+///
+/// A `null` loss is NaN (packet P-M14-R1): JSON has no NaN, so the trainers write a non-finite
+/// loss as `null`, and a diverged run must be drawn as one -- the editor's light reads a
+/// non-finite loss as broken. An absent `lr` or rate is NaN, never a stand-in.
+fn progress_row(progress: &Value) -> Option<[f64; 4]> {
+    let at = |k: &str| progress.get(k).and_then(Value::as_f64);
+    let loss = match progress.get("loss")? {
+        Value::Null => f64::NAN,
+        v => v.as_f64()?,
+    };
+    Some([
+        at("step")?,
+        loss,
+        at("lr").unwrap_or(f64::NAN),
+        at("samples_per_s").unwrap_or(f64::NAN),
+    ])
 }
 
 /// The step `train_act.py` or `train_ppo.py` says it has finished: `{"progress": {"step": N}}`.
@@ -1409,8 +1433,8 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        lerobot_said, progress_step, relay, training_bar, CheckpointWatch, LerobotProgress,
-        LerobotSaid,
+        lerobot_said, progress_row, progress_step, relay, training_bar, CheckpointWatch,
+        LerobotProgress, LerobotSaid,
     };
 
     // Copied from a real `lerobot-train` 0.6.1 run (Y-V item 1, `target/yv/cube-cam/runs/001/
@@ -1457,6 +1481,35 @@ mod tests {
         let both = lerobot_said(BAR_THEN_METRIC);
         assert_eq!(both.tqdm, Some((3200, 5000, Some(15.62))));
         assert_eq!((both.loss, both.lr), (Some(0.131), Some(1.0e-4)));
+    }
+
+    /// Packet P-M14-R1: a diverged run is drawn as one. The trainer writes a non-finite loss as
+    /// `null` (JSON has no NaN) and `lerobot-train` prints `loss:nan`; both reach the published
+    /// row as NaN, which the editor's light judges `Broken`. An absent loss is still no row.
+    #[test]
+    #[allow(clippy::float_cmp)] // exact: the row carries the parsed values themselves
+    fn a_nonfinite_loss_is_published_as_nan() {
+        let row = progress_row(&json!({"step": 1130, "loss": null, "lr": 4e-4,
+                                       "samples_per_s": 8.0, "elapsed_s": 1.0}))
+        .expect("a null loss is a row");
+        assert_eq!(row[0], 1130.0);
+        assert!(row[1].is_nan(), "{row:?}");
+        assert_eq!((row[2], row[3]), (4e-4, 8.0));
+        let fine = progress_row(&json!({"step": 10, "loss": 0.25, "lr": 1e-4}))
+            .expect("a finite loss is a row");
+        assert_eq!(fine[..2], [10.0, 0.25]);
+        assert!(
+            fine[3].is_nan(),
+            "no samples_per_s is NaN, never a stand-in"
+        );
+        assert_eq!(progress_row(&json!({"step": 10})), None);
+
+        let diverged = METRIC.replace("loss:0.131", "loss:nan");
+        assert!(lerobot_said(&diverged).loss.is_some_and(f64::is_nan));
+        let mut progress = LerobotProgress::default();
+        progress.read(BAR, Some(8));
+        let row = progress.read(&diverged, Some(8)).expect("a row");
+        assert!(row[1].is_nan(), "{row:?}");
     }
 
     #[test]

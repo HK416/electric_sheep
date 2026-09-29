@@ -459,6 +459,21 @@ struct Intervened<'a, const NJ: usize, const H: usize> {
     last: Vec<[f64; NJ]>,
 }
 
+impl<const NJ: usize, const H: usize> Intervened<'_, NJ, H> {
+    /// Episode `episode` begins as the first one did: nothing the last episode's driver said
+    /// carries into it (packet P-M14-R1). The three flags are set by `infer`, which runs on the
+    /// inference tick -- with a declared latency never on frame 0 -- so an abort left set here
+    /// ended every later episode after one frame, and a stale `injected` marked frames no chunk
+    /// of this episode drove as the human's.
+    fn begin_episode(&mut self, episode: u32) {
+        self.episode = episode;
+        self.frame = 0;
+        self.injected = false;
+        self.aborted = false;
+        self.last = vec![[0.0; NJ]];
+    }
+}
+
 impl<const NJ: usize, const H: usize> PolicyRuntime for Intervened<'_, NJ, H> {
     fn load(
         &mut self,
@@ -709,6 +724,7 @@ impl Collector {
         let mut rendered = 0u64;
 
         for index in 0..spec.n_episodes {
+            wrapper.begin_episode(index);
             if let Some(sink) = sink.as_deref_mut() {
                 sink(CollectEvent::EpisodeBegin {
                     episode: index,
@@ -732,7 +748,6 @@ impl Collector {
             let mut closed = None;
             let mut aborted = false;
             for frame in 0..max_steps {
-                wrapper.episode = index;
                 wrapper.frame = frame;
                 // Every consumer of the plane observes before every `validate` and none of
                 // them decides what that means: `SafetyPlane::observe_state` seeds the
@@ -911,6 +926,9 @@ impl Collector {
         let (content, schema) = identity_of(&dataset)?;
         let h = &bundle.manifest.hashes;
         let slot = |d: Option<[u8; 32]>| d.as_ref().map_or_else(|| "-".to_owned(), hex);
+        let ended = |t: Termination| terminations.iter().filter(|e| **e == t).count();
+        // How the demonstrations ended, which the `LeRobot` columns have no place for: what
+        // `es loop cycle` reads before it trains on them (packet P-M14-R1).
         let mut step = LoopStep::new(LoopKind::Collect)
             .input("task", &slot(h.task))
             .input("observation", &slot(h.observation))
@@ -919,7 +937,10 @@ impl Collector {
             .input("seed", &spec.seed)
             .input("episodes", &spec.n_episodes)
             .output("content", &hex(&content))
-            .output("schema", &hex(&schema));
+            .output("schema", &hex(&schema))
+            .output("success", &ended(Termination::Success))
+            .output("failure", &ended(Termination::Failure))
+            .output("timeout", &ended(Termination::Timeout));
         for (key, value) in ledger {
             step = step.input(key, value);
         }

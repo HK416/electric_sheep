@@ -392,26 +392,12 @@ impl Publisher {
 
     // --- `es train` (packet M7/E7) --------------------------------------------------------
 
-    /// One `{"progress": {...}}` line of the trainer's stdout, as
-    /// `[step, loss, lr, samples_per_s]` on stream 5.
+    /// One `[step, loss, lr, samples_per_s]` row on stream 5, from whichever trainer said it:
+    /// a `{"progress": ...}` line, or `lerobot-train`'s console (packet M12/R2); `es train`
+    /// reads both (`progress_row`, `LerobotProgress`).
     ///
     /// The frame's `tick` is zero and the step is the first scalar: an optimizer step is not a
     /// physics tick, and putting one in the other's field would be a number nobody can read.
-    pub(crate) fn progress(&self, progress: &serde_json::Value) {
-        let at = |k: &str| progress.get(k).and_then(serde_json::Value::as_f64);
-        let (Some(step), Some(loss)) = (at("step"), at("loss")) else {
-            return;
-        };
-        self.train_row([
-            step,
-            loss,
-            at("lr").unwrap_or(f64::NAN),
-            at("samples_per_s").unwrap_or(f64::NAN),
-        ]);
-    }
-
-    /// One `[step, loss, lr, samples_per_s]` row on stream 5, from whichever trainer said it:
-    /// a `{"progress": ...}` line, or `lerobot-train`'s console (packet M12/R2).
     pub(crate) fn train_row(&self, row: [f64; 4]) {
         self.send(Frame {
             // `last` is `None` on a training run, so this is tick zero; naming the type would

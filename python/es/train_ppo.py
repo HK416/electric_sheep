@@ -113,8 +113,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from train_act import (  # noqa: E402
     build_policy,
     checkpoint_tensors,
+    diverged_message,
     init_backbone,
     init_weights as load_init_weights,
+    json_text,
     lr_at,
     lr_curve_hash,
     read_safetensors,
@@ -594,9 +596,12 @@ def main(argv: list) -> int:
                 "samples_per_sec": (iteration + 1) * rows / elapsed if elapsed > 0 else 0.0,
             }
         )
-        if a.progress_every > 0 and (iteration + 1) % a.progress_every == 0:
+        # The first non-finite loss ends the run, as in `train_act.py` (packet P-M14-R1): told
+        # to a watcher on this iteration whatever the period, and no checkpoint after it.
+        diverged = not math.isfinite(last["loss"])
+        if a.progress_every > 0 and ((iteration + 1) % a.progress_every == 0 or diverged):
             sys.stdout.write(
-                json.dumps(
+                json_text(
                     {
                         "progress": {
                             "step": iteration + 1,
@@ -610,11 +615,17 @@ def main(argv: list) -> int:
                 + "\n"
             )
             sys.stdout.flush()
+        if diverged:
+            break
         if (iteration + 1) in marks:
             write_checkpoint(iteration + 1)
 
-    write_safetensors(a.out, checkpoint_tensors(actor))
-    if a.value_out:
+    first_nonfinite = next(
+        (i for i, c in enumerate(curve) if not math.isfinite(c["loss"])), None
+    )
+    if first_nonfinite is None:
+        write_safetensors(a.out, checkpoint_tensors(actor))
+    if a.value_out and first_nonfinite is None:
         # `value.*` and `log_std`, in one file, under `training/`: the state a resumed run
         # needs and a deployment never does. `es policy pack` would refuse these keys, which
         # is the structural half of "never packed" (design note rule 1).
@@ -622,7 +633,7 @@ def main(argv: list) -> int:
         tensors.update({"value." + k: v.cpu() for k, v in value.state_dict().items()})
         write_safetensors(a.value_out, tensors)
     if a.loss_curve:
-        a.loss_curve.write_text(json.dumps(curve), encoding="utf-8")
+        a.loss_curve.write_text(json_text(curve), encoding="utf-8")
         # The nine spec 12.4 fields as the env measured them, beside the curve and **not** in
         # the summary: they are a measurement of the machine, so putting them in the summary
         # would put them in `metrics.json`, which is a `training_hash` slot. A domain this
@@ -666,9 +677,7 @@ def main(argv: list) -> int:
         "initial_return": sum(c["return"] for c in curve[:window]) / window if curve else 0.0,
         "final_return": sum(c["return"] for c in curve[-window:]) / window if curve else 0.0,
         "steps": len(curve),
-        "first_nonfinite_step": next(
-            (i for i, c in enumerate(curve) if not math.isfinite(c["loss"])), None
-        ),
+        "first_nonfinite_step": first_nonfinite,
         "algo": "ppo",
         "envs": a.envs,
         "horizon": a.horizon,
@@ -723,7 +732,18 @@ def main(argv: list) -> int:
     if backbones:
         # Only when one was loaded, so a run without reports the bytes it always did.
         report["backbones"] = backbones
-    sys.stdout.write(json.dumps(report) + "\n")
+    sys.stdout.write(json_text(report) + "\n")
+    if first_nonfinite is not None:
+        sys.stdout.flush()
+        raise SystemExit(
+            diverged_message(
+                "train_ppo.py",
+                first_nonfinite + 1,
+                curve[first_nonfinite]["loss"],
+                applied_lr[first_nonfinite],
+                a.lr,
+            )
+        )
     return 0
 
 

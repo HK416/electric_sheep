@@ -85,7 +85,10 @@ pub struct Frame {
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum Payload {
     Scalar(f64),
-    Scalars(Vec<f64>),
+    /// A non-finite value is `null` on the wire (JSON has no NaN) and NaN again once decoded
+    /// (packet P-M14-R1): a producer's NaN -- a diverged loss, a rate not yet measured -- is
+    /// what it said, and refusing the frame would end the client's read of the whole stream.
+    Scalars(#[serde(deserialize_with = "nan_from_null")] Vec<f64>),
     Tensor {
         shape: Vec<u32>,
         dtype: String,
@@ -102,6 +105,13 @@ pub enum Payload {
         fields: BTreeMap<String, String>,
     },
     Metrics(PerfMetrics),
+}
+
+/// [`Payload::Scalars`]' decoder: `null`, which is how `serde_json` writes a non-finite `f64`,
+/// is NaN.
+fn nan_from_null<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<f64>, D::Error> {
+    let values = Vec::<Option<f64>>::deserialize(d)?;
+    Ok(values.into_iter().map(|v| v.unwrap_or(f64::NAN)).collect())
 }
 
 /// The spec 12.4 performance metric set. `step/s` alone is forbidden (spec 12.4): simulation,
@@ -313,6 +323,30 @@ mod tests {
             assert_eq!(consumed, encoded.len());
             assert_eq!(decoded, msg);
         }
+    }
+
+    /// Packet P-M14-R1: a non-finite scalar crosses the wire. JSON has no NaN, so the encoder
+    /// writes `null`; the decoder used to refuse that frame, and a client that meets an
+    /// undecodable frame stops reading -- so a diverged run's loss closed the editor's link
+    /// instead of turning its light red.
+    #[test]
+    fn a_nonfinite_scalar_round_trips_as_nan() {
+        let msg = Message::Frame(Frame {
+            tick: PhysTick(0),
+            wall_ns: 1,
+            stream: StreamId(5),
+            payload: Payload::Scalars(vec![1130.0, f64::NAN, f64::INFINITY, 4e-4]),
+        });
+        let (decoded, _) = decode(&encode(&msg)).expect("the frame decodes");
+        let Message::Frame(Frame {
+            payload: Payload::Scalars(v),
+            ..
+        }) = decoded
+        else {
+            panic!("{decoded:?}");
+        };
+        assert_eq!((v[0], v[3]), (1130.0, 4e-4));
+        assert!(v[1].is_nan() && v[2].is_nan(), "{v:?}");
     }
 
     #[test]
