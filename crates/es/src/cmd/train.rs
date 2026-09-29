@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use es_compile::PolicyBundle;
+use es_core::child::{retry_start, transient_start_failure};
 use es_data::training::{
     camera_dirs, has_image_input, has_pretrained_backbone, init_from, init_weights, rollout_docs,
     state_dim, Backbone, DatasetFacts, Plan, Recipe, Route, Step, StepKind, Training, TRAIN_ACT,
@@ -886,23 +887,35 @@ print(json.dumps(d))
     if route == Route::External {
         cmd.arg("lerobot");
     }
-    let out = cmd.output().map_err(|e| {
-        bad(format!(
-            "{interpreter}: {e}\nSet ES_PYTHON or [run] interpreter."
-        ))
-    })?;
-    if !out.status.success() {
-        // The exit status too: a process the OS ends (an access violation, a failed DLL load)
-        // leaves no Python traceback, and an empty message says nothing (review M14 N-5).
-        return Err(bad(format!(
-            "{interpreter} cannot import what the {} route needs ({}):\n{}",
-            route.as_str(),
-            exit_words(out.status),
-            String::from_utf8_lossy(&out.stderr).trim_end()
-        )));
-    }
-    serde_json::from_slice(&out.stdout)
-        .map_err(|e| bad(format!("{interpreter}: the probe printed {e}")))
+    // Many interpreters importing CUDA torch at once on Windows sometimes fail to start (packet
+    // M15/R1); such a failure is retried with a fresh interpreter, which changes nothing.
+    retry_start(interpreter, || {
+        let out = cmd.output().map_err(|e| {
+            let msg = format!("{interpreter}: {e}\nSet ES_PYTHON or [run] interpreter.");
+            (msg, false)
+        })?;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let printed = !out.stdout.trim_ascii().is_empty();
+        let transient = transient_start_failure(out.status.code(), &stderr, printed);
+        if !out.status.success() {
+            // The exit status too: a process the OS ends (an access violation, a failed DLL
+            // load) leaves no Python traceback, and an empty message says nothing (review M14
+            // N-5).
+            let msg = format!(
+                "{interpreter} cannot import what the {} route needs ({}):\n{}",
+                route.as_str(),
+                exit_words(out.status),
+                stderr.trim_end()
+            );
+            return Err((msg, transient));
+        }
+        serde_json::from_slice(&out.stdout)
+            .map_err(|e| (format!("{interpreter}: the probe printed {e}"), transient))
+    })
+    .map_err(|(msg, attempts)| match attempts {
+        1 => bad(msg),
+        n => bad(format!("{msg}\n(after {n} start attempts)")),
+    })
 }
 
 /// An exit status in words, the Windows NTSTATUS in hex where it is one (0xC0000005 is an
@@ -1786,5 +1799,29 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&dir);
         }
+    }
+
+    /// Packet M15/R1's reproduction: 26 interpreter probes at once, which on Windows with CUDA
+    /// torch lost one or more starts to the DLL loader. Every probe must now answer; a retried
+    /// start prints `start attempt n of 3 failed` (run with `--nocapture` to count them).
+    /// Ignored: it needs `ES_PYTHON` with torch and loads CUDA 26 times.
+    #[test]
+    #[ignore = "needs ES_PYTHON with torch; loads CUDA 26 times"]
+    fn twenty_six_probes_at_once_all_answer() {
+        let python = std::env::var("ES_PYTHON").expect("ES_PYTHON names an interpreter");
+        let failed: Vec<String> = std::thread::scope(|s| {
+            let probes: Vec<_> = (0..26)
+                .map(|_| s.spawn(|| super::probe(&python, super::Route::Ir)))
+                .collect();
+            probes
+                .into_iter()
+                .filter_map(|p| p.join().unwrap().err().map(|e| format!("{e:?}")))
+                .collect()
+        });
+        assert!(
+            failed.is_empty(),
+            "{} of 26 failed: {failed:#?}",
+            failed.len()
+        );
     }
 }

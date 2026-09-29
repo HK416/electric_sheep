@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use es_assets::scene::SceneDesc;
+use es_core::child::{retry_start, transient_start_failure};
 use es_core::{StableId, TickRate};
 use es_physics_core::backend::Param;
 use es_physics_core::{IndexRange, ModelInfo, PhysicsError};
@@ -367,9 +368,52 @@ pub struct Process {
     stdout: BufReader<ChildStdout>,
     /// `None` when the caller did not pipe stderr.
     stderr: Option<StderrTail>,
+    /// Whether a failed call found a line the process had left on stdout (packet M15/R1): a
+    /// process that answered, even with an error, did not fail silently.
+    wrote: bool,
 }
 
 impl Process {
+    /// Starts `script` as [`Self::spawn_with`] does and makes the first call, `first` (the
+    /// load); the reply comes back with the process. A start that fails the way the Windows
+    /// loader fails concurrent starts is retried by [`retry_start`] (packet M15/R1): a fresh
+    /// process, the same script and the same request, so a retried start changes no result.
+    /// A process that dies after this, mid-episode, is never restarted.
+    pub fn start<T: DeserializeOwned>(
+        script: &str,
+        engine: &str,
+        first: &Request<'_>,
+    ) -> Result<(Self, T), PhysicsError> {
+        retry_start(&format!("the {engine} reference process"), || {
+            let mut process = Self::spawn_with(script, engine).map_err(|e| (e, false))?;
+            match process.call(first) {
+                Ok(reply) => Ok((process, reply)),
+                Err(e) => {
+                    let died = matches!(e, PhysicsError::ProcessDied(_));
+                    Err((e, died && process.failed_to_start()))
+                }
+            }
+        })
+        .map_err(|(e, attempts)| match e {
+            PhysicsError::ProcessDied(text) if attempts > 1 => {
+                PhysicsError::ProcessDied(format!("{text} (after {attempts} start attempts)"))
+            }
+            e => e,
+        })
+    }
+
+    /// Whether this process, whose call just died, failed the way [`transient_start_failure`]
+    /// retries. Its exit status and stderr are settled: the failed call waited for them.
+    fn failed_to_start(&mut self) -> bool {
+        let code = self.child.try_wait().ok().flatten().and_then(|s| s.code());
+        let stderr = self
+            .stderr
+            .as_ref()
+            .map(StderrTail::text)
+            .unwrap_or_default();
+        transient_start_failure(code, &stderr, self.wrote)
+    }
+
     /// Starts the first interpreter that spawns, running [`SCRIPT`].
     pub fn spawn() -> Result<Self, PhysicsError> {
         Self::spawn_with(SCRIPT, "MuJoCo")
@@ -414,6 +458,7 @@ impl Process {
             stdin,
             stdout: BufReader::new(stdout),
             stderr,
+            wrote: false,
         })
     }
 
@@ -450,6 +495,7 @@ impl Process {
         let mut what = cause;
         let mut line = String::new();
         if read_stdout && status.is_some() && self.stdout.read_line(&mut line).is_ok() {
+            self.wrote |= !line.trim().is_empty();
             match parse_response::<Ack>(&line) {
                 Err(PhysicsError::Backend(error)) => what = error,
                 _ if !line.trim().is_empty() => {
@@ -772,6 +818,70 @@ while True:
             "{text}"
         );
         assert!(!text.contains("os error"), "{text}");
+    }
+
+    /// `body` behind a prologue that counts its starts in `count` (a fresh file) and, while
+    /// the count is under `fail`, dies the way the Windows loader kills a start: a
+    /// `[WinError 6]` traceback on stderr, nothing on stdout.
+    fn counted(count: &std::path::Path, fail: u32, body: &str) -> String {
+        let _ = std::fs::remove_file(count);
+        format!(
+            "import os, sys\npath = {count:?}\n\
+             n = int(open(path).read()) if os.path.exists(path) else 0\n\
+             open(path, 'w').write(str(n + 1))\n\
+             if n < {fail}:\n    sys.stderr.write('OSError: [WinError 6] The handle is invalid. \
+             Error loading \"c10.dll\" or one of its dependencies.\\n')\n    \
+             raise SystemExit(1)\n{body}"
+        )
+    }
+
+    fn starts(count: &std::path::Path) -> String {
+        std::fs::read_to_string(count).unwrap()
+    }
+
+    /// Packet M15/R1: a start that dies the loader's way twice is retried and the third
+    /// answers.
+    #[test]
+    fn a_start_the_loader_kills_is_retried() {
+        if let Err(why) = import_available("sys", "Python interpreter") {
+            println!("SKIP: {why}");
+            return;
+        }
+        let count = std::env::temp_dir().join(format!("es-r1-flaky-{}", std::process::id()));
+        let answers = "for line in sys.stdin:\n    print('{\"ok\": true}', flush=True)\n";
+        let script = counted(&count, 2, answers);
+        let (_process, _): (_, Ack) =
+            Process::start(&script, "stand-in", &Request::State).expect("the third start answers");
+        assert_eq!(starts(&count), "3");
+        let _ = std::fs::remove_file(&count);
+    }
+
+    /// Packet M15/R1: a clean import failure is an answer, not a flaky start: one start, and
+    /// the message is today's. Its only words are the protocol line on stdout, read after a
+    /// load too big for the pipe found the process gone (os error 232 on Windows).
+    #[test]
+    fn an_import_failure_is_not_retried() {
+        if let Err(why) = import_available("sys", "Python interpreter") {
+            println!("SKIP: {why}");
+            return;
+        }
+        let count = std::env::temp_dir().join(format!("es-r1-import-{}", std::process::id()));
+        let body =
+            "print('{\"ok\": false, \"error\": \"import failed: no module named mujoco\"}', \
+                    flush=True)\nraise SystemExit(1)\n";
+        let script = counted(&count, 0, body);
+        let mjcf = "x".repeat(1 << 20);
+        let load = Request::Load {
+            mjcf: &mjcf,
+            n_envs: 1,
+            timestep: None,
+            seed: 0,
+        };
+        let err = Process::start::<Ack>(&script, "stand-in", &load).unwrap_err();
+        assert!(err.to_string().contains("no module named mujoco"), "{err}");
+        assert!(!err.to_string().contains("attempts"), "{err}");
+        assert_eq!(starts(&count), "1");
+        let _ = std::fs::remove_file(&count);
     }
 
     /// Packet M12/R6: stderr is drained as it is written, so a process that floods it still

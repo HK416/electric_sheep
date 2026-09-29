@@ -1,5 +1,5 @@
-//! `es-core` (layer 1): ECS, job system, time model, failure semantics, stable ids and
-//! allocation primitives. See `docs/ARCHITECTURE.ko.md` §5, §12, §18 and the work packets
+//! `es-core` (layer 1): ECS, job system, time model, failure semantics, stable ids,
+//! allocation primitives and the child-start retry every Python subprocess shares. See `docs/ARCHITECTURE.ko.md` §5, §12, §18 and the work packets
 //! `docs/packets/M0/P13.md` .. `P17.md`.
 //!
 //! Layer rule (§4.2): this crate may depend on `es-math` and external crates only.
@@ -20,6 +20,8 @@
 pub mod alloc_count;
 #[cfg(feature = "std")]
 pub mod arena;
+#[cfg(feature = "std")]
+pub mod child;
 #[cfg(feature = "std")]
 pub mod ecs;
 #[cfg(feature = "std")]

@@ -22,7 +22,7 @@ use es_physics_core::{
 use crate::mjcf_out::scene_to_mjcf;
 use crate::proc::{
     applied_values, check_envs, param_index, param_wire, Ack, AppliedKey, LoadReply, Process,
-    Request, SetParamsReply, StatePayload, StateReply, StepReply,
+    Request, SetParamsReply, StatePayload, StateReply, StepReply, SCRIPT,
 };
 
 /// The backend's name in `es backend compare --backends ...` (spec 17.2).
@@ -263,13 +263,13 @@ impl PhysicsBackend for MuJoCoCpuBackend {
             None => rate_from_timestep(scene.options.timestep)?,
         };
 
-        let mut process = Process::spawn()?;
-        let reply: LoadReply = process.call(&Request::Load {
+        let load = Request::Load {
             mjcf: &mjcf,
             n_envs: cfg.n_envs,
             timestep: Some(rate.period_secs_f64()),
             seed: cfg.seed,
-        })?;
+        };
+        let (process, reply): (_, LoadReply) = Process::start(SCRIPT, "MuJoCo", &load)?;
 
         let joints = index_by_name(&scene.joints, |j| (j.name.as_str(), j.id));
         let actuators = index_by_name(&scene.actuators, |a| (a.name.as_str(), a.id));

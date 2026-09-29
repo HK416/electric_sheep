@@ -241,13 +241,13 @@ impl PhysicsBackend for NewtonBackend {
             None => rate_from_timestep(scene.options.timestep)?,
         };
 
-        let mut process = Process::spawn_with(SCRIPT, ENGINE)?;
-        let reply: LoadReply = process.call(&Request::Load {
+        let load = Request::Load {
             mjcf: &mjcf,
             n_envs: cfg.n_envs,
             timestep: Some(rate.period_secs_f64()),
             seed: cfg.seed,
-        })?;
+        };
+        let (process, reply): (_, LoadReply) = Process::start(SCRIPT, ENGINE, &load)?;
         let info = model_info(&reply, scene, ENGINE, cfg.n_envs, rate)?;
 
         self.engine_version = Some(reply.checked_engine_version()?.to_owned());

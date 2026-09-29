@@ -20,6 +20,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use es_compile::Tensor;
+use es_core::child::{retry_start, transient_start_failure};
 use es_ir::learning::{LearningGraph, PolicyHandle};
 use es_ir::types::ElemType;
 use serde::de::DeserializeOwned;
@@ -252,9 +253,47 @@ struct Process {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     stderr: StderrTail,
+    /// Whether a failed call found a line the process had left on stdout (packet M15/R1): a
+    /// process that answered, even with an error, did not fail silently.
+    wrote: bool,
 }
 
 impl Process {
+    /// Spawns `script` and makes the first call, `first` (the load); the reply comes back with
+    /// the process. A start that fails the way the Windows loader fails concurrent starts is
+    /// retried by [`retry_start`] (packet M15/R1): a fresh process, the same script,
+    /// environment and request, so a retried start changes no result. A process that dies
+    /// after this, mid-episode, is never restarted.
+    fn start<T: DeserializeOwned>(
+        script: &str,
+        env: &[(String, String)],
+        first: &Request<'_>,
+    ) -> Result<(Self, T), PolicyError> {
+        retry_start("the torch reference process", || {
+            let mut process = Self::spawn(script, env).map_err(|e| (e, false))?;
+            match process.call(first) {
+                Ok(reply) => Ok((process, reply)),
+                Err(e) => {
+                    let died = matches!(e, PolicyError::ProcessDied(_));
+                    Err((e, died && process.failed_to_start()))
+                }
+            }
+        })
+        .map_err(|(e, attempts)| match e {
+            PolicyError::ProcessDied(text) if attempts > 1 => {
+                PolicyError::ProcessDied(format!("{text} (after {attempts} start attempts)"))
+            }
+            e => e,
+        })
+    }
+
+    /// Whether this process, whose call just died, failed the way [`transient_start_failure`]
+    /// retries. Its exit status and stderr are settled: the failed call waited for them.
+    fn failed_to_start(&mut self) -> bool {
+        let code = self.child.try_wait().ok().flatten().and_then(|s| s.code());
+        transient_start_failure(code, &self.stderr.text(), self.wrote)
+    }
+
     /// Runs `script` ([`SCRIPT`] but in tests); `env` is exported to the child on top of this
     /// process's own environment.
     fn spawn(script: &str, env: &[(String, String)]) -> Result<Self, PolicyError> {
@@ -281,6 +320,7 @@ impl Process {
                         stdin,
                         stdout: BufReader::new(stdout),
                         stderr: StderrTail::drain(stderr),
+                        wrote: false,
                     });
                 }
                 Err(e) => tried.push(format!("`{python}`: {e}")),
@@ -324,6 +364,7 @@ impl Process {
         let mut what = cause;
         let mut line = String::new();
         if read_stdout && status.is_some() && self.stdout.read_line(&mut line).is_ok() {
+            self.wrote |= !line.trim().is_empty();
             match parse_response::<serde_json::Value>(&line) {
                 Err(PolicyError::Backend(error)) => what = error,
                 _ if !line.trim().is_empty() => {
@@ -480,12 +521,12 @@ impl TorchRuntime {
         }
         validate_keys(module, &parse_header(bytes)?)?;
 
-        let mut process = Process::spawn(SCRIPT, &self.env)?;
-        let reply: LoadReply = process.call(&Request::Load {
+        let load = Request::Load {
             source: &module.source,
             weights_path: &path.to_string_lossy(),
             batch_axis,
-        })?;
+        };
+        let (process, reply): (_, LoadReply) = Process::start(SCRIPT, &self.env, &load)?;
         reply.check_protocol()?;
 
         let info = PolicyInfo {
@@ -850,6 +891,31 @@ while True:
             "{text}"
         );
         assert!(!text.contains("os error"), "{text}");
+    }
+
+    /// Packet M15/R1: a start that ends having written nothing (as the `0xC000070A` ones did)
+    /// is retried; here twice, counted in a file, and the third start answers.
+    #[test]
+    fn a_start_that_ends_silently_is_retried() {
+        if stand_in("").is_none() {
+            return;
+        }
+        let count = std::env::temp_dir().join(format!("es-r1-silent-{}", std::process::id()));
+        let _ = std::fs::remove_file(&count);
+        let script = format!(
+            "import os, sys\npath = {count:?}\n\
+             n = int(open(path).read()) if os.path.exists(path) else 0\n\
+             open(path, 'w').write(str(n + 1))\n\
+             if n < 2:\n    os._exit(1)\n\
+             for line in sys.stdin:\n    print('{{\"ok\": true}}', flush=True)\n"
+        );
+        let first = Request::Infer {
+            inputs: BTreeMap::new(),
+        };
+        let started = Process::start::<serde_json::Value>(&script, &[], &first);
+        assert!(started.is_ok(), "{:?}", started.err());
+        assert_eq!(std::fs::read_to_string(&count).unwrap(), "3");
+        let _ = std::fs::remove_file(&count);
     }
 
     /// Packet M12/R6: stderr is drained as it is written, so a process that floods it still
