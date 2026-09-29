@@ -97,10 +97,15 @@ required -- the bundle carries the Task, Observation and Deployment IR the run j
 -- but its weights are never loaded and no Torch runtime is needed. It needs --frames: the
 expert reads the cube's pose out of the state the frame source is handed, which is the same
 scaffold the `expert_passes_the_evaluation_harness` oracle uses, and nothing else on this path
-hands a policy privileged state.
+hands a policy privileged state. The expert runs a demonstration program (packet M14/Q2): a
+value ending in .toml is a program file's path, anything else a built-in name --
+so101-pick-place, which is templates/teach/so101-pick-place.toml compiled in -- resolved
+exactly as `es loop collect --expert` resolves it. A missing file, a file that does not parse
+and an unknown name are refused by name before anything opens.
 
     --out <dir>        output directory (default: ./eval-out)
-    --expert <name>    drive with the scripted expert instead of the policy's weights
+    --expert <name | program.toml>
+                       drive with the scripted expert instead of the policy's weights
     --frames <dir>     render every step here (needs the `render` feature)
     --traj <dir>       per-episode `.estraj` state trajectories (default <out>/traj)
     --backend <name>   physics backend (default mujoco-cpu); see BACKENDS below
@@ -813,6 +818,13 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
                 .to_owned(),
         ));
     }
+    // The expert gate's argument check (packet M14/Q2): the program is read and parsed before
+    // anything opens, by the resolver `es loop collect --expert` uses.
+    let program = a
+        .expert
+        .as_deref()
+        .map(|e| super::r#loop::ExpertProgram::resolve(e, RUN_HELP))
+        .transpose()?;
 
     // Bound **before** the bundle, the scene or either Python interpreter is opened (packet
     // M7/E4): a viewer that attaches on the printed address is subscribed well before the
@@ -934,15 +946,10 @@ pub(crate) fn run(args: &[String], cycle: Option<&mut Publisher>) -> Result<u8, 
     let mut torch = TorchRuntime::with_env(thread_env.iter().cloned());
     // The episode counter the expert's `reset` keys off, shared with the frame source below.
     let seen = super::r#loop::SeenState::default();
-    let mut expert = match &a.expert {
-        Some(name) => Some(super::r#loop::expert_policy(
-            name,
-            &scene,
-            &bundle.deployment,
-            &seen,
-        )?),
-        None => None,
-    };
+    let mut expert = program
+        .as_ref()
+        .map(|p| super::r#loop::expert_policy(p, &scene, &bundle.deployment, &seen))
+        .transpose()?;
     let policy: &mut dyn PolicyRuntime = if let Some(e) = &mut expert {
         e
     } else {

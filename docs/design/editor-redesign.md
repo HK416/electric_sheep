@@ -477,14 +477,23 @@ IR's own perturbations instead of a widened randomization (no new document field
   [roots]` (a merge stage: `es loop distill` into `collect/merged`, all-train, the frame tiles
   laid out in merged order; the merged root is what trains) and `[train] init` (IR and RL routes:
   `[init] policy`; LeRobot route: `--policy.path`).
-- **"실패 위주로 다시 학습" (Z4b).** ⑤'s button writes and starts the next run: `perturb` is the
-  previous run's `[eval] config` with its suites of the lowest success rate (all of them on a
-  tie); the seeds start after every run in the project and step past the evaluation's; `merge`
+- **"실패 위주로 다시 학습" (Z4b, review follow-up R1).** ⑤'s button prepares the next run on
+  ③'s start panel — what it will practise, in plain words, with the demonstrations and the length
+  still editable, and Cancel — and Start writes and starts it: `perturb` is the previous run's
+  `[eval] config` with its suites of the lowest success rate among those the collector can
+  realise (all of them on a tie; follow-up R2 leaves out a suite that could age an observation
+  past the `stale_observation` watchdog, through the same `es_eval::perturb::unseen_age` check
+  `es loop collect` makes); the seeds start after every run in the project and step past the evaluation's; `merge`
   is every earlier dataset root of the chain (never a `collect/merged`); `init` is the checkpoint
   the previous evaluation judged, found from the ledger's `policy_hash`. The same Evaluation IR
   judges the new run, so the two reports compare. The button is disabled, with the reason, when
-  the run has no recipe, collected nothing, has no evaluation or no failure, or its checkpoint is
-  gone.
+  the run has no recipe, collected nothing, has no evaluation or no failure, no failed suite the
+  collector can realise, or its checkpoint is gone.
+- **Why it failed, counted honestly (follow-up R3).** A Safety Plane step counter (`fallback`,
+  `violation.*`) is a cause of an attempt only when it covers at least 1 % of the attempt's
+  steps: with a declared latency of one control period every attempt, successes included, starts
+  with one fallback step and one chunk underrun, which had put "safety stopped it" and "motion gaps
+  — a faster computer helps" at the top of ⑤ for the first real run.
 - **Budget after S2:** `es-editor-model` 6,582 lines (over the 6,000 target, under the cap),
   `es-editor` 3,842, `es` 6,543.
 

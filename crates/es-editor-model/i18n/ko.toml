@@ -234,6 +234,9 @@
 "results.again.no_failures" = "이 평가에서 실패한 시도가 없어서, 더 연습할 상황이 없습니다."
 "results.again.no_checkpoint" = "이 평가가 판정한 정책이 실행 폴더에 없어서, 그 정책에서 이어서 학습할 수 없습니다."
 
+# 계획 Z 검토 R2: 실패한 상황이 모두 `es loop collect`가 만들 수 없는 상황입니다.
+"results.again.cannot_collect" = "실패한 상황은 모두 로봇이 받는 화면이 늦게 오거나 빠지는 상황이라서, 그 상태로는 시범을 기록할 수 없습니다. 그래서 더 연습할 상황이 없습니다."
+
 # --- 시작 패널. 마우스를 올리면 실제로 넘어가는 플래그가 나온다. ----------------------------
 "launch.kind.eval" = "평가하기"
 "launch.kind.train" = "학습하기"
@@ -397,6 +400,16 @@
 "watch.start" = "시작"
 "watch.start_over" = "처음부터 다시"
 "watch.start.hint" = "runs/NNN/cycle.toml을 쓴 뒤 저장소 루트에서 es loop cycle --recipe runs/NNN/cycle.toml --out runs/NNN --telemetry 127.0.0.1:<포트>를 실행합니다"
+
+# 계획 Z 검토 R1: "실패 위주로 다시 학습"은 시작을 누를 때까지 시작 패널에서 기다립니다.
+"watch.again.heading" = "다음 실행: 실패 위주로 다시 학습"
+"watch.again.practise" = "이 상황들을 더 연습합니다:"
+"watch.again.more" = "이 상황들에서 아래 시범 횟수만큼 시범을 새로 기록하고, 아래 학습 길이만큼 학습합니다."
+"watch.again.continues" = "지난 실행의 정책에서 이어서 학습하고, 앞서 기록한 시범도 함께 학습합니다."
+"watch.again.start" = "다시 학습 시작"
+"watch.again.cancel" = "취소"
+"watch.again.cancel.hint" = "이 계획을 취소합니다. 그 뒤 시작을 누르면 평소처럼 새로 실행합니다"
+
 "watch.stop" = "중지"
 "watch.evaluate_now" = "지금까지 배운 것 평가하기"
 "watch.evaluate_now.hint" = "학습을 멈추고 [eval] checkpoint를 가장 최근에 저장한 값으로 바꾼 뒤 es loop cycle --from eval을 실행합니다"

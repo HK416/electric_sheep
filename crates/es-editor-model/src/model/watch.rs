@@ -15,9 +15,12 @@ use std::time::{Duration, Instant};
 
 use es_data::collect::{read_loop_steps, LoopKind, LoopStep, CHECKPOINT};
 use es_data::training::Cycle;
+use es_ir::evaluation::EvaluationIr;
+use es_ir::serial::evaluation_from_toml;
 use es_telemetry::transport::Client;
 
 use crate::model::health::{self, Input, Light, Point, Verdict, THRESHOLDS};
+use crate::model::i18n::Lang;
 use crate::model::launch::{self, LaunchModel, State};
 use crate::model::layout;
 use crate::model::live_run::StageRow;
@@ -503,8 +506,11 @@ pub struct View {
     pub centre: Centre,
     /// ④'s strip; `None` on ③.
     pub tiles: Option<Vec<Tile>>,
-    /// The Start button's key (`watch.start` or `watch.start_over`), when it is offered.
+    /// The Start button's key (`watch.start`, `watch.start_over`, or `watch.again.start` while
+    /// a plan from ⑤ is pending), when it is offered.
     pub start: Option<&'static str>,
+    /// ⑤'s pending "train again on what failed", shown above Start while Start is offered.
+    pub again: Option<AgainPlan>,
     /// The stage `--from` resumes at, when Resume is offered.
     pub resume: Option<String>,
     pub stop: bool,
@@ -546,12 +552,35 @@ pub fn centre(alive: bool, stage: Option<&str>, episodes: Episodes, of: u32) -> 
     }
 }
 
+/// ⑤'s "train again on what failed", handed to ③ and kept until Start or Cancel (review of plan
+/// Z, R1): what ③'s start panel says the next run will do before anything starts. How many new
+/// demonstrations and how long are ③'s two settings, which stay editable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgainPlan {
+    /// What Start hands [`project::write_run_again`].
+    pub again: Again,
+    /// The Evaluation IR `again.config` names, read when the plan was handed over, for the
+    /// situations' plain names; `None` (unreadable) keeps the raw suite names.
+    ir: Option<EvaluationIr>,
+}
+
+impl AgainPlan {
+    /// The situations the next run practises, in plain words, in the evaluation's order.
+    pub fn practise(&self, lang: Lang) -> Vec<String> {
+        (self.again.suites.iter())
+            .map(|suite| results::suite_label(lang, suite, self.ir.as_ref()))
+            .collect()
+    }
+}
+
 /// ③ and ④ of one open project.
 pub struct Watch {
     /// The run ③ and ④ follow: the project's latest, or the one started here.
     pub run: Option<RunFolder>,
     /// ③'s two settings.
     pub settings: StartSettings,
+    /// ⑤'s plan, until Start starts it or Cancel drops it.
+    again: Option<AgainPlan>,
     /// The template and the repository root `es` runs in, or the i18n key of why there are none.
     source: Result<(Template, PathBuf), &'static str>,
     /// The run's `[collect] episodes`.
@@ -615,6 +644,7 @@ impl Watch {
                 demonstrations: source.as_ref().map_or(1, |(t, _)| t.demonstrations),
                 length: Length::Medium,
             },
+            again: None,
             demonstrations: run.as_ref().and_then(demonstrations_of).unwrap_or(0),
             source,
             run,
@@ -831,11 +861,14 @@ impl Watch {
                 self.demonstrations,
             ),
             tiles: (phase == Phase::Evaluate).then(|| tiles(&telemetry.events)),
-            start: free.then_some(if self.run.is_some() {
+            start: free.then_some(if self.again.is_some() {
+                "watch.again.start"
+            } else if self.run.is_some() {
                 "watch.start_over"
             } else {
                 "watch.start"
             }),
+            again: self.again.clone().filter(|_| free),
             resume: resume.filter(|_| free),
             stop: self.ours && running,
             evaluate_now: self.ours
@@ -873,19 +906,47 @@ impl Watch {
         )
     }
 
+    /// What ⑤ hands ③ (packets M12/Y13, M13/Z4b; review of plan Z, R1), which starts nothing.
+    /// Run again: its settings, and any pending plan dropped. "Train again on what failed": its
+    /// settings and its plan, which ③'s panel shows until Start starts it or Cancel drops it.
+    /// No settings (a recipe the editor did not write) keeps the ones ③ has.
+    pub fn prepare(&mut self, settings: Option<StartSettings>, again: Option<Again>) {
+        if let Some(settings) = settings {
+            self.settings = settings;
+        }
+        let root = self.source.as_ref().ok().map(|(_, root)| root);
+        self.again = again.map(|again| AgainPlan {
+            ir: root.and_then(|root| {
+                let text = std::fs::read_to_string(root.join(&again.config)).ok()?;
+                evaluation_from_toml(&text).ok()
+            }),
+            again,
+        });
+    }
+
+    /// Cancel on the plan: Start is an ordinary start again.
+    pub fn cancel_again(&mut self) {
+        self.again = None;
+    }
+
     /// Start: a new run folder, its recipe and its `telemetry.txt`, and `es loop cycle` queued
-    /// for the next frame. `Ok(false)`, with nothing written, whenever [`may_start`] says no.
+    /// for the next frame - the pending plan's ([`Self::start_again`]) when there is one.
+    /// `Ok(false)`, with nothing written, whenever [`may_start`] says no.
     pub fn start(
         &mut self,
         project: &Project,
         pid: Option<u32>,
         phases: &[PhaseState; 5],
     ) -> Result<bool, ProjectError> {
-        self.start_with(project, None, pid, phases)
+        match self.again.as_ref().map(|plan| plan.again.clone()) {
+            Some(again) => self.start_again(project, &again, pid, phases),
+            None => self.start_with(project, None, pid, phases),
+        }
     }
 
     /// ⑤'s "train again on what failed" (packet M13/Z4b): [`Self::start`], under the same
-    /// [`may_start`] gate, with the recipe [`project::write_run_again`] writes.
+    /// [`may_start`] gate, with the recipe [`project::write_run_again`] writes. Once started, no
+    /// plan is pending.
     pub fn start_again(
         &mut self,
         project: &Project,
@@ -893,7 +954,11 @@ impl Watch {
         pid: Option<u32>,
         phases: &[PhaseState; 5],
     ) -> Result<bool, ProjectError> {
-        self.start_with(project, Some(again), pid, phases)
+        let started = self.start_with(project, Some(again), pid, phases)?;
+        if started {
+            self.again = None;
+        }
+        Ok(started)
     }
 
     fn start_with(
@@ -1124,6 +1189,77 @@ mod tests {
             Some(8),
             "after run 001's 1-7"
         );
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
+    /// Review of plan Z, R1: ⑤'s "train again on what failed" prepares ③ and starts nothing.
+    /// The panel shows the plan in plain words and Start starts it, with the settings as edited
+    /// there; Cancel, or Run again, leaves an ordinary start.
+    #[test]
+    fn train_again_is_prepared_on_the_panel_and_started_by_start() {
+        let p = scratch_project("r1-again");
+        let mut watch = Watch::new(&p, Some(repo()));
+        let (launch, telemetry, now) = (
+            LaunchModel::default(),
+            TelemetryModel::default(),
+            Instant::now(),
+        );
+        let view = |w: &Watch| w.view(Phase::Train, &launch, &telemetry, &fresh(), now);
+        assert_eq!(view(&watch).start, Some("watch.start"));
+        assert_eq!(view(&watch).again, None);
+
+        let again = Again {
+            config: "tests/fixtures/visible-learning/evaluation.toml".into(),
+            suites: vec!["light_intensity".into(), "torque_noise".into()],
+            merge: vec![p.root.join("runs/000/collect/ds").display().to_string()],
+            init: p
+                .root
+                .join("runs/000/train/checkpoints/5000.esb")
+                .display()
+                .to_string(),
+        };
+        let long = StartSettings {
+            demonstrations: 200,
+            length: Length::Long,
+        };
+        watch.prepare(Some(long), Some(again.clone()));
+        assert!(
+            p.runs().is_empty() && watch.queued.is_none(),
+            "nothing starts"
+        );
+        assert_eq!(watch.settings, long);
+        let shown = view(&watch);
+        assert_eq!(shown.start, Some("watch.again.start"));
+        let plan = shown.again.expect("the plan on the panel");
+        assert_eq!(plan.again, again);
+        for lang in Lang::ALL {
+            let words = [
+                t(lang, "perturb.light_intensity"),
+                t(lang, "perturb.torque_noise"),
+            ];
+            assert_eq!(plan.practise(lang), words, "{lang:?}");
+        }
+
+        watch.cancel_again();
+        assert_eq!(view(&watch).start, Some("watch.start"));
+        assert_eq!(view(&watch).again, None);
+        watch.prepare(Some(long), Some(again.clone()));
+        watch.prepare(None, None);
+        assert_eq!(view(&watch).again, None, "Run again drops the plan");
+        assert_eq!(watch.settings, long, "no settings keeps ③'s");
+
+        // Start: the plan's recipe under the settings as edited on the panel.
+        watch.prepare(Some(long), Some(again.clone()));
+        watch.settings = settings();
+        assert_eq!(watch.start(&p, None, &fresh()), Ok(true));
+        assert!(watch.again.is_none(), "started, so no longer pending");
+        let run = watch.run.clone().expect("the again run");
+        let text = std::fs::read_to_string(run.path.join(RUN_RECIPE)).unwrap();
+        let cycle = Cycle::parse(&text).unwrap();
+        assert_eq!(cycle.train.init, Some(again.init.clone()));
+        let collect = cycle.collect.expect("[collect]");
+        assert_eq!(collect.perturb.map(|x| x.suites), Some(again.suites));
+        assert_eq!((collect.episodes, collect.merge), (7, again.merge));
         std::fs::remove_dir_all(&p.root).ok();
     }
 
