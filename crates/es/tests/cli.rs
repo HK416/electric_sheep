@@ -8594,6 +8594,161 @@ fn cycle_hint_u3_gate_accepts_the_bundle_policy_init_builds() {
     );
 }
 
+// --- packet M12/R8: the backbone is fetched before collect --------------------------------
+
+/// A stand-in for the run's interpreter. Called as `<it> fetch_backbone.py --arch resnet18
+/// --out <dir> --expect <pin>`, it copies what `from` holds into `<dir>`; with `None` it exits
+/// 7 having written nothing. No Python, no network.
+fn fake_fetch(dir: &Path, name: &str, from: Option<&Path>) -> PathBuf {
+    #[cfg(windows)]
+    let (path, body) = (
+        dir.join(format!("{name}.cmd")),
+        match from {
+            Some(src) => format!(
+                "@echo off\r\nmkdir \"%~f5\" 2>nul\r\ncopy /y \"{}\\*\" \"%~f5\" >nul\r\n",
+                src.display()
+            ),
+            None => "@exit /b 7\r\n".to_owned(),
+        },
+    );
+    #[cfg(not(windows))]
+    let (path, body) = (
+        dir.join(name),
+        match from {
+            Some(src) => format!(
+                "#!/bin/sh\nmkdir -p \"$5\" && cp \"{}\"/* \"$5\"/\n",
+                src.display()
+            ),
+            None => "#!/bin/sh\nexit 7\n".to_owned(),
+        },
+    );
+    write(&path, &body);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    }
+    path
+}
+
+/// Packet M12/R8. `[policy] base_model_fetch` runs the fetch with the recipe's interpreter
+/// before `es loop cycle` collects anything, and the file it wrote is then held to the pin: a
+/// fake that writes a self-consistent artifact which is not the pinned one is refused before
+/// collect, a present file is never re-fetched, and a failed fetch says so plainly -- in each
+/// case no stage has started. `es train` runs the same fetch before its backbone check.
+#[test]
+fn cycle_fetches_the_backbone_before_collect() {
+    let dir = scratch_dir("cycle-fetch");
+    let bundle = write_pretrained_bundle(&dir);
+    // What the stand-in "downloads": bytes and the lock beside them, agreeing with each other
+    // and not with the pin -- the 45 MB of ImageNet that would are not in this repository.
+    let source = dir.join("source");
+    std::fs::create_dir_all(&source).expect("source dir");
+    write_base_model(
+        &source,
+        "resnet18-imagenet1k-v1",
+        "not the pinned backbone",
+        |_| {},
+    );
+    let backbone = dir
+        .join("backbone")
+        .join("resnet18-imagenet1k-v1.safetensors");
+    let (writes, fails) = (
+        fake_fetch(&dir, "fetch-writes", Some(&source)),
+        fake_fetch(&dir, "fetch-fails", None),
+    );
+    // TOML literal strings, so a Windows path keeps its separators.
+    let recipe = dir.join("training.toml");
+    let with = |interpreter: &Path| {
+        write(
+            &recipe,
+            &format!(
+                "kind = \"training\"\n\
+                 [dataset]\nroot = \"unused\"\nframes = \"unused\"\n\
+                 [policy]\nbundle = '{}'\nbase_model = '{}'\nbase_model_fetch = \"resnet18\"\n\
+                 [run]\nsteps = 40\nbatch = 2\nlr = 1e-4\nseed = 0\ncheckpoint_at = [40]\n\
+                 device = \"cpu\"\ninterpreter = '{}'\n",
+                bundle.display(),
+                backbone.display(),
+                interpreter.display(),
+            ),
+        );
+    };
+    let cycle = dir.join("cycle.toml");
+    write(
+        &cycle,
+        &format!(
+            "kind = \"cycle\"\nscene = \"unused.xml\"\n\
+             [collect]\npolicy = '{}'\nexpert = \"so101-pick-place\"\nepisodes = 1\nframes = true\n\
+             [train]\nrecipe = '{}'\n\
+             [eval]\nconfig = \"tests/fixtures/visible-learning/evaluation.toml\"\n",
+            bundle.display(),
+            recipe.display(),
+        ),
+    );
+    let pin = es_data::training::RESNET18_IMAGENET1K_V1_BLAKE3;
+    let cycle_path = cycle.to_string_lossy().into_owned();
+    let refused = |out: &Path| -> (String, String) {
+        let run = run_cycle(&cycle_path, out, &[]);
+        let (said, err) = (stdout(&run), stderr_of(&run));
+        assert_eq!(
+            run.status.code(),
+            Some(1),
+            "stdout:\n{said}\nstderr:\n{err}"
+        );
+        assert!(
+            !said.contains("$ es loop collect"),
+            "a stage started:\n{said}"
+        );
+        assert!(!out.join("collect").exists() && !out.join("loop.jsonl").exists());
+        (said, err)
+    };
+
+    // 1. Missing: fetched with the recipe's interpreter, then held to the pin, before collect.
+    with(&writes);
+    let (said, err) = refused(&dir.join("run-1"));
+    assert!(
+        said.contains("fetch_backbone.py --arch resnet18 --out"),
+        "{said}"
+    );
+    assert!(said.contains(&format!("--expect {pin}")), "{said}");
+    assert!(backbone.exists(), "the fetch did not run:\n{said}");
+    assert!(
+        err.contains("not the pinned backbone") && err.contains(pin),
+        "{err}"
+    );
+
+    // 2. Present: never fetched again; the file on disk is what is judged.
+    with(&fails);
+    let (said, err) = refused(&dir.join("run-2"));
+    assert!(!said.contains("fetch_backbone.py"), "{said}");
+    assert!(err.contains("not the pinned backbone"), "{err}");
+
+    // 3. Missing, and the fetch fails: a plain sentence naming the file and the command.
+    std::fs::remove_file(&backbone).expect("remove the fetched file");
+    let (_, err) = refused(&dir.join("run-3"));
+    assert!(err.contains("is missing and could not be fetched"), "{err}");
+    assert!(
+        err.contains("it exited with 7") && err.contains("ES_PYTHON"),
+        "{err}"
+    );
+    assert!(!backbone.exists());
+
+    // 4. `es train` alone: the same fetch, before the backbone check refuses the bytes.
+    with(&writes);
+    let out = dir.join("train-out");
+    let run = run_train(&recipe.to_string_lossy(), &out, &[]);
+    let (said, err) = (stdout(&run), stderr_of(&run));
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "stdout:\n{said}\nstderr:\n{err}"
+    );
+    assert!(backbone.exists(), "es train did not fetch:\n{said}");
+    assert!(err.contains("not the pinned backbone"), "{err}");
+    assert!(!out.join("training.lock").exists());
+}
+
 /// Oracle 4. One real cycle on the demo fixtures: a 2-episode expert collect, the harness on
 /// the expert *before* the 40-step IR-route training, then the trained checkpoint through the
 /// same harness -- with `loop.jsonl` holding `collect`, `evaluate` (the gate), `train`,

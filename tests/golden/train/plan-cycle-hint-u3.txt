@@ -1,4 +1,5 @@
 # cycle: collect -> expert-gate -> train -> eval -> showcase
+# fetch: python python/es/fetch_backbone.py --arch resnet18 --out target/backbone --expect 8511928e7ca6e3b07355e8b66284294ba692093fd0dfe246cdf96a6c9e801899
 es loop collect --policy runs/collect-001/untrained.esb --scene tests/fixtures/mjcf/so101_pick_place.xml --episodes 200 --seed 1 --out collect/ds --frames collect/frames --expert so101-pick-place
 es eval run --config tests/fixtures/visible-learning/evaluation-augmented.toml --policy runs/collect-001/untrained.esb --scene tests/fixtures/mjcf/so101_pick_place.xml --out eval-expert --jobs 6 --frames eval-expert/frames --expert so101-pick-place
 es train --recipe tests/fixtures/visible-learning/training-hint-u3.toml --out train

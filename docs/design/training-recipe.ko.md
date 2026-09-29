@@ -605,6 +605,29 @@ Learning IR의 필드이므로 lowering된 모듈이 그것을 `requires_grad_(F
 쪽은 `tests/fixtures/visible-learning/learning-pretrained.toml`이고, 그것을 가리키는 레시피는
 U-측정의 것이지 커밋된 픽스처가 아니다.
 
+### 받아 오기 (패킷 M12/R8)
+
+새로 받은 체크아웃에는 `base_model`이 없고, 사이클이 그 사실을 학습 단계에서야 알게 되면 이미
+26분을 수집한 뒤다(힌트 카드, `templates/cube-into-bin-hint.toml`). 선택 필드 하나가 그 파일을
+어떻게 얻는지 말한다.
+
+```toml
+[policy]
+base_model       = "target/backbone/resnet18-imagenet1k-v1.safetensors"
+base_model_fetch = "resnet18"
+```
+
+`fetch_backbone.py`의 `--arch`이고 그 이상은 아니다. `--out`은 `base_model`의 디렉터리,
+`--expect`는 `RESNET18_IMAGENET1K_V1_BLAKE3`이다. 그래서 문서는 고정값의 두 번째 사본을 갖지 않고,
+스크립트는 다른 텐서를 쓰기를 거부한다. 이름으로 거부되는 경우: `base_model`이 없을 때,
+`resnet18`이 아닌 arch일 때(고정값이 하나라 arch도 하나), `base_model`의 파일 이름이 스크립트가
+쓰는 `<arch>-imagenet1k-v1.safetensors`가 아닐 때. 계획은 그 명령을 `# fetch:` 줄로 싣는다 —
+`es train`에서는 `# route:` 다음, 사이클에서는 모든 단계 위. 그리고 파일이 없을 때만 돈다.
+`es train`은 백본 검사 전에, `es loop cycle`은 수집 전에 돌리고 이어서 파일을 `Backbone::verify`로
+확인한다. 그래서 받아 오기가 실패하거나 파일이 틀리면 사이클은 아무것도 수집하기 전에 멈춘다.
+인터프리터는 실행의 것이다(`ES_PYTHON`이 먼저). 필드가 없으면 모든 계획, 골든, `identity_hash`가
+그대로이고, 있으면 다른 필드처럼 `config.json`의 레시피 안에 들어간다.
+
 ---
 
 ## 12. 사이클 (패킷 M7/T2)
