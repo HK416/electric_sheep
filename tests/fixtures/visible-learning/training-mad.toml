@@ -1,0 +1,52 @@
+# Plan N's experiment 2, the MAD policy's training recipe (packet M15/N8b,
+# docs/packets/M15/plan-n.md task E2, docs/design/multi-camera.md sections 3.3 and 4). The graph
+# it trains is learning-mad.toml: one shared ResNet18 applied to the three cameras, the features
+# summed. It is training-views.toml's body with these differences, and nothing else differs --
+# `cargo test -p es --test views mad_recipe_and_cycle_are_the_views_arms_with_single_view` holds
+# that:
+#
+#  * `lr = 1e-4` and `grad_clip = 1.0`: the settings experiment 1 now runs. U3's lr 4e-4 diverged
+#    to NaN on the camera-only graphs, one view and three, with and without clipping (experiment
+#    1's first runs on this PC, 2026-09-29); U3's own graph had the simulator-privileged cube pose.
+#    training-views.toml and training-cam.toml still say 4e-4 -- they mirror training-hint-u3.toml
+#    by test, and experiment 1 runs local copies.
+#  * `steps = 60000`, `checkpoint_at = [1000, 5000, 20000, 60000]`: three times U3's 20,000
+#    steps; U3's marks kept and the last one added.
+#  * `single_view = { weight = 0.5 }`: MAD's "disentangle" (Almuzairee et al., CoRL 2025, arXiv
+#    2505.04619), `train_act.py --single-view 0.5` (packet M15/N7). Each step's loss is
+#    L(all views) + alpha * mean over views v of L(v's term alone in the Sum), so alpha balances
+#    the merged term against the single-view ones. 0.5 is our choice, pending a sweep. Each view
+#    alone is one more forward pass, so a step costs 1 + 3 forwards -- not measured yet.
+#
+# The rest is U3's: batch 64, `warmup_cosine` 250 / 1e-6, seed 0, cuda, the ImageNet ResNet18
+# `base_model` with `base_model_fetch = "resnet18"` (loaded into the one shared backbone), no
+# `--resident-gpu`; training-hint-u3.toml's header says why each is what it is. The baked set is
+# the three-view arm's: three image tensors per frame (training-views.toml's header).
+#
+# `[policy] bundle` is the MAD bundle, built by the command in cycle-mad.toml's header.
+# `[run] single_view` is checked against its Learning IR before any plan, `--dry-run` included,
+# so `es train --recipe <this> --out <dir> --dry-run` needs that bundle on disk -- and neither
+# the dataset, the backbone nor Python.
+
+kind = "training"
+
+[dataset]
+root   = "runs/collect-001/ds"
+frames = "runs/collect-001/frames"
+
+[policy]
+bundle           = "runs/collect-001/untrained.esb"
+base_model       = "target/backbone/resnet18-imagenet1k-v1.safetensors"
+base_model_fetch = "resnet18"
+
+[run]
+steps         = 60000
+batch         = 64
+lr            = 1e-4
+seed          = 0
+checkpoint_at = [1000, 5000, 20000, 60000]
+device        = "cuda"
+interpreter   = "python"
+schedule      = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
+grad_clip     = 1.0
+single_view   = { weight = 0.5 }

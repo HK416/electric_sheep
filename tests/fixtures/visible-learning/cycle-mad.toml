@@ -1,0 +1,63 @@
+# Plan N's experiment 2, the MAD policy (packet M15/N8b, docs/packets/M15/plan-n.md task E2,
+# docs/design/multi-camera.md sections 3.3-3.5 and 4): cycle-views.toml -- experiment 1's
+# three-view arm -- with two differences, and nothing else differs:
+#
+# * `[train] recipe` is training-mad.toml: training-views.toml at lr 1e-4 with grad_clip 1.0,
+#   60,000 steps, and MAD's single-view loss at weight 0.5 (that file's header).
+# * `[eval] config` is evaluation-mad.toml, whose body and `evaluation_hash` are
+#   evaluation-views.toml's: the MAD bundle reads the same Task and Observation IR.
+#
+# `[eval.preview]` stays: a short test of each checkpoint while training runs. The same scene
+# (so101_pick_place_views.xml), the same 200 expert demonstrations on seed 1 -- one collection
+# under task-views.toml serves experiments 1 and 2 -- the same expert gate, the same showcase.
+# `cargo test -p es --test views mad_recipe_and_cycle_are_the_views_arms_with_single_view`
+# holds all of that.
+#
+# `[collect] policy`, which training-mad.toml also names as `[policy] bundle`, is the MAD bundle
+# `es policy init` builds from task-views.toml, observation-views.toml, learning-mad.toml and the
+# committed deployment.toml:
+#
+#   es policy init --task tests/fixtures/visible-learning/task-views.toml \
+#       --observation tests/fixtures/visible-learning/observation-views.toml \
+#       --learning tests/fixtures/visible-learning/learning-mad.toml \
+#       --deployment tests/fixtures/visible-learning/deployment.toml \
+#       --out runs/collect-001/untrained.esb
+#
+# That is the path cycle-views.toml's bundle takes too: a directory holding experiment 1's
+# three-view bundle there refuses this cycle by name, since `[run] single_view` needs a `Sum`.
+# `the_mad_bundle_builds_trains_one_view_at_a_time_and_subsets` (crates/es/tests/views.rs)
+# builds the bundle, makes the expert gate's checks on it and derives each one-camera bundle
+# with `es policy subset`.
+#
+# `es loop cycle --recipe tests/fixtures/visible-learning/cycle-mad.toml --out <dir> --dry-run`
+# needs the bundle above and neither the dataset, the backbone nor Python; its train stage
+# plans `train_act.py ... --single-view 0.5`.
+
+kind  = "cycle"
+scene = "tests/fixtures/mjcf/so101_pick_place_views.xml"
+
+[collect]
+policy   = "runs/collect-001/untrained.esb"
+expert   = "so101-pick-place"
+episodes = 200
+seed     = 1
+frames   = true
+
+[train]
+recipe = "tests/fixtures/visible-learning/training-mad.toml"
+
+[eval]
+config     = "tests/fixtures/visible-learning/evaluation-mad.toml"
+checkpoint = "last"
+jobs       = 6
+frames     = true
+
+[eval.preview]
+
+[showcase]
+cell    = "nominal-00"
+eye     = [0.66, -0.46, 0.52]
+look_at = [0.14, -0.04, 0.04]
+fov     = 36
+width   = 1280
+height  = 720
