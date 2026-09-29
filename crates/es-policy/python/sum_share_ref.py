@@ -28,6 +28,9 @@ Steps, all in this one process so both modules read the very same tensors:
      of the graph, which must find exactly one backbone -- the owner's -- to initialise.
   5. With `keep_views` (packet M15/N7): the lowered module with one camera kept equals the
      hand-written module fed that camera alone, bitwise.
+  6. With `single_view: alpha` (packet M15/N7b): `train_act.py`'s `single_view_loss` -- one
+     forward with a list of view subsets -- against N7's `1 + V` separate forwards, on the same
+     weights, inputs and target; see `single_view()`.
 
 `INV-16`: weights cross as safetensors bytes, never `torch.load`, never `pickle`.
 """
@@ -53,6 +56,65 @@ def lowered(source):
     namespace = {}
     exec(compile(source, "<es-policy>", "exec"), namespace)  # noqa: S102 - our own lowering
     return namespace["EsPolicy"]()
+
+
+def single_view(spec, model, inputs, single_view_loss):
+    """Step 6 (packet M15/N7b): `train_act.py`'s one-forward single-view loss against N7's
+    `1 + V` separate forwards -- the loop's code before N7b, verbatim -- on the same weights,
+    inputs and target, in `train()`. Reports the losses' bitwise equality, the gradients' max
+    difference, and how many times the encoder ran each way, counted by a forward hook."""
+    import time
+
+    import torch
+
+    views, alpha = spec["views"], spec["single_view"]
+    g = torch.Generator().manual_seed(2)
+    target = torch.randn([spec["batch"], spec["execute"], spec["action_dim"]], generator=g)
+    weights = torch.rand([spec["action_dim"]], generator=g) + 0.5
+    encoder = getattr(model, "n%d" % spec["owner"])
+    calls = [0]
+    hook = encoder.register_forward_hook(lambda *_: calls.__setitem__(0, calls[0] + 1))
+
+    def separate():
+        loss = ((next(iter(model(**inputs).values())) - target).abs() * weights).mean()
+        alone = [
+            ((next(iter(model(keep_views=(view,), **inputs).values())) - target).abs() * weights).mean()
+            for view in views
+        ]
+        loss_all, loss_single = loss, torch.stack(alone).mean()
+        return loss_all + alpha * loss_single, loss_all, loss_single
+
+    model.train()
+    measured = {}
+    for name, step in [
+        ("separate", separate),
+        ("shared", lambda: single_view_loss(model, inputs, target, weights, views, alpha)),
+    ]:
+        model.zero_grad(set_to_none=True)
+        calls[0] = 0
+        started = time.perf_counter()
+        losses = step()
+        losses[0].backward()
+        seconds = time.perf_counter() - started
+        grads = [p.grad.clone() for p in model.parameters() if p.grad is not None]
+        measured[name] = (losses, grads, calls[0], seconds)
+    hook.remove()
+
+    (old, old_grads, old_calls, old_s), (new, new_grads, new_calls, new_s) = (
+        measured["separate"],
+        measured["shared"],
+    )
+    diff = max(float((a - b).abs().max()) for a, b in zip(old_grads, new_grads))
+    scale = max(float(a.abs().max()) for a in old_grads)
+    return {
+        "loss": [float(old[0]), float(new[0])],
+        "loss_bitwise": all(bool(torch.equal(a, b)) for a, b in zip(old, new)),
+        "grad_tensors": [len(old_grads), len(new_grads)],
+        "grad_max_abs": diff,
+        "grad_max_rel": diff / scale if scale > 0 else diff,
+        "encoder_calls": {"separate": old_calls, "shared": new_calls},
+        "seconds": {"separate": old_s, "shared": new_s},
+    }
 
 
 def run(spec):
@@ -136,12 +198,16 @@ def run(spec):
         reply["keep_views_bitwise"] = alone
         reply["keep_every_view_is_default"] = bool(torch.equal(everything, got))
 
+    # `train_act.py` is run as a file, so it is read and executed here with no `__file__`,
+    # exactly as `ir_training.rs` probes `lr_at` out of it.
+    namespace = {}
+    with open(spec["train_act"], encoding="utf-8") as handle:
+        exec(compile(handle.read(), spec["train_act"], "exec"), namespace)  # noqa: S102
+
+    if spec.get("single_view"):
+        reply["single_view"] = single_view(spec, model, inputs, namespace["single_view_loss"])
+
     if spec.get("pretrained_source"):
-        # `train_act.py` is run as a file, so it is read and executed here with no `__file__`,
-        # exactly as `ir_training.rs` probes `lr_at` out of it.
-        namespace = {}
-        with open(spec["train_act"], encoding="utf-8") as handle:
-            exec(compile(handle.read(), spec["train_act"], "exec"), namespace)  # noqa: S102
         with open(spec["pretrained_source"], encoding="utf-8") as handle:
             pretrained = lowered(handle.read())
         owner = getattr(pretrained, "n%d" % spec["owner"])
