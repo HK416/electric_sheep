@@ -15,7 +15,8 @@
 //! A try is `es eval run --expert <teach.toml>` on a derived Evaluation IR - the template's first
 //! suite, one explicit seed, no acceptance, derived as a checkpoint preview derives its own
 //! ([`preview_evaluation`]) - into `<project>/try/<n>/`, and it is read back like any run: its one
-//! attempt as a result [`Tile`], with the outcome class of packet M13/Z4.
+//! attempt as a result [`Tile`], with the outcome class of packet M13/Z4. The seed is never one
+//! the Evaluation IR judges the policy on ([`TRY_SEED_BASE`]).
 
 use std::path::{Path, PathBuf};
 
@@ -38,7 +39,7 @@ use es_math::{units::DEG_TO_RAD, Vec3};
 use crate::model::i18n::{fill, t, Lang, Strings};
 use crate::model::labels::{cause_key, program_error_key};
 use crate::model::outcome;
-use crate::model::project::{evaluation_seeds, Project};
+use crate::model::project::{evaluation_seeds, fresh_seed, Project};
 use crate::model::replay_view::load_scene;
 use crate::model::results::{tiles, Outcomes, Tile, TileFilter};
 use crate::model::scene_view::ScenePreview;
@@ -51,6 +52,12 @@ const NEW_ABOVE_M: f64 = 0.05;
 const NEW_PITCH_DEG: f64 = -85.0;
 /// What a new grip block waits: five of the demo's 0.2 s demonstrator steps.
 const NEW_WAIT_S: f64 = 1.0;
+
+/// A project's first try's seed. Never one the template's Evaluation IR resolves, nor is any try
+/// after it ([`free_seed`]): a person tunes the program until its try succeeds, and tuning it on
+/// the held-out positions the policy is judged on would leak them (spec 13.3, as collection
+/// seeds keep off them in packets M13/Z2 and Z4b).
+pub const TRY_SEED_BASE: u64 = 1001;
 
 // --- words ---------------------------------------------------------------------------------------
 
@@ -622,7 +629,9 @@ pub struct Teach {
     selected: Option<usize>,
     dirty: bool,
     check: Check,
-    /// The seed the next try runs: the latest try's, else the evaluation's first.
+    /// Every seed the template's Evaluation IR resolves: never a try's.
+    judged: Vec<u64>,
+    /// The seed the next try runs: the latest try's, else [`TRY_SEED_BASE`] - past any judged.
     seed: u64,
 }
 
@@ -644,11 +653,11 @@ impl Teach {
             let ir = evaluation_from_toml(&read(&config)?).map_err(|e| e.to_string())?;
             Ok((ir, root.join(&cycle.scene)))
         })();
-        let first = trial.as_ref().ok().and_then(|(ir, _)| {
-            let seeds = evaluation_seeds(ir);
-            seeds.first().copied()
-        });
+        let judged = trial
+            .as_ref()
+            .map_or_else(|_| Vec::new(), |(ir, _)| evaluation_seeds(ir));
         let latest = project.tries().last().and_then(|r| try_seed(&r.path));
+        let seed = free_seed(latest.unwrap_or(TRY_SEED_BASE), &judged);
         let mut teach = Self {
             project: project.clone(),
             origin: template.teach.as_ref().map(|p| root.join(p)),
@@ -659,7 +668,8 @@ impl Teach {
             selected: None,
             dirty: false,
             check: Check::default(),
-            seed: latest.or(first).unwrap_or_default(),
+            judged,
+            seed,
         };
         teach.recheck();
         Ok(teach)
@@ -895,7 +905,7 @@ impl Teach {
 
     /// 🎲: the object somewhere else.
     pub fn next_seed(&mut self) {
-        self.seed = self.seed.wrapping_add(1);
+        self.seed = free_seed(self.seed.saturating_add(1), &self.judged);
     }
 
     /// Why a try would do nothing now, or `None`.
@@ -1011,6 +1021,11 @@ pub fn try_evaluation(ir: &EvaluationIr, seed: u64) -> Result<EvaluationIr, Stri
     Ok(derived)
 }
 
+/// The first seed at or after `from` that is none of `judged` ([`fresh_seed`] with one attempt).
+fn free_seed(from: u64, judged: &[u64]) -> u64 {
+    fresh_seed(&[(from, 0)], judged, 1)
+}
+
 /// The seed a try ran, from the Evaluation IR written into it.
 fn try_seed(dir: &Path) -> Option<u64> {
     let ir = evaluation_from_toml(&read(&dir.join("evaluation.toml")).ok()?).ok()?;
@@ -1092,6 +1107,55 @@ mod tests {
         assert_eq!((&ir.task, &ir.observation), (&own.task, &own.observation));
         assert!(ir.validate().is_empty(), "{:?}", ir.validate());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Spec 13.3: for both cube cards, no try - the first, 🎲's next ones, one re-opened after
+    /// a try made on a judged seed - runs a seed the card's Evaluation IR judges the policy on,
+    /// and each is still one nominal attempt with no acceptance.
+    #[test]
+    fn a_try_never_draws_a_judged_seed() {
+        assert_eq!(free_seed(1001, &[1001, 1002]), 1003, "steps past");
+        assert_eq!(free_seed(101, &(101..=116).collect::<Vec<_>>()), 117);
+        for template in [cube(), hint()] {
+            let root = std::env::temp_dir().join(format!(
+                "es-q3-judged-{}-{}",
+                template.id,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            let project = Project::create(&root, "judged", &template, &repo()).unwrap();
+            let cycle = Cycle::parse(&read(&repo().join(&template.cycle)).unwrap()).unwrap();
+            let own = read(&repo().join(&cycle.eval.config)).unwrap();
+            let judged = evaluation_seeds(&evaluation_from_toml(&own).unwrap());
+            assert!(judged.contains(&101), "{}: {judged:?}", template.id);
+            let mut teach = Teach::open(&project, &template, &repo()).unwrap();
+            for _ in 0..3 {
+                let start = teach.start_try(None, false, &fresh()).expect("a try");
+                let text = read(&start.dir.join("evaluation.toml")).unwrap();
+                let ir = evaluation_from_toml(&text).unwrap();
+                let SeedPlan::Explicit(seeds) = &ir.episodes.seeds else {
+                    panic!("{:?}", ir.episodes);
+                };
+                assert_eq!((ir.episodes.n_episodes, seeds.len()), (1, 1));
+                assert!(!judged.contains(&seeds[0]), "{}: {seeds:?}", template.id);
+                assert_eq!(ir.suites.len(), 1);
+                assert_eq!(ir.suites[0].name, "nominal");
+                assert!(ir.acceptance.is_empty());
+                teach.next_seed();
+            }
+            // A try written on a judged seed (before this rule) is gone on from, past them.
+            let old = try_evaluation(&evaluation_from_toml(&own).unwrap(), 101).unwrap();
+            let dir = project.next_try_dir();
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("evaluation.toml"),
+                evaluation_to_toml(&old).unwrap(),
+            )
+            .unwrap();
+            let reopened = Teach::open(&project, &template, &repo()).unwrap();
+            assert!(!judged.contains(&reopened.seed), "{}", reopened.seed);
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     /// The object is drawn from the Task IR's box: `qpos[6]` (x) and `qpos[7]` (y) of the
@@ -1384,7 +1448,7 @@ mod tests {
     #[test]
     fn the_try_argv_and_its_derived_evaluation() {
         let (project, mut teach) = open("q3-try");
-        assert_eq!(teach.seed, 101, "evaluation-v8.toml's first seed");
+        assert_eq!(teach.seed, TRY_SEED_BASE);
         teach.select(Some(0));
         teach.edit(Field::Above(0.06));
         let first = teach.start_try(None, false, &fresh()).expect("a try");
@@ -1413,7 +1477,7 @@ mod tests {
             ir.episodes,
             EpisodeBatch {
                 n_episodes: 1,
-                seeds: SeedPlan::Explicit(vec![101])
+                seeds: SeedPlan::Explicit(vec![1001])
             }
         );
         assert!(ir.acceptance.is_empty());
@@ -1422,8 +1486,8 @@ mod tests {
         teach.next_seed();
         let second = teach.start_try(None, false, &fresh()).expect("another");
         assert_eq!(second.dir, project.root.join("try").join("002"));
-        assert_eq!(try_seed(&second.dir), Some(102));
-        assert_eq!(Teach::open(&project, &cube(), &repo()).unwrap().seed, 102);
+        assert_eq!(try_seed(&second.dir), Some(1002));
+        assert_eq!(Teach::open(&project, &cube(), &repo()).unwrap().seed, 1002);
 
         let running = [
             Done,
