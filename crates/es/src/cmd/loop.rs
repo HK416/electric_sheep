@@ -6,16 +6,21 @@
 //! training run is on the Python side of spec 2.3's split, and `distill` produces its input
 //! identity rather than pretending to run it.
 
-use std::path::PathBuf;
+use std::cell::Cell;
+use std::path::{Path, PathBuf};
 
 use es_assets::scene::{JointKind, SceneDesc};
 use es_compile::PolicyBundle;
 use es_data::collect::{
-    CollectEvent, CollectSink, CollectSpec, Collector, Intervention, SplitSpec,
+    CollectEvent, CollectSink, CollectSpec, Collector, Intervention, PerturbAt, Perturbation,
+    SplitSpec,
 };
 use es_data::{CollectReport, InterventionSegment};
 use es_env::expert::{demo_cfg, ScriptedExpert};
 use es_env::Termination;
+use es_eval::{LightOverride, PerturbationPlan, ResetOverrides, StepState};
+use es_ir::deployment::{DeploymentIr, Watchdog};
+use es_ir::evaluation::{EvaluationIr, PerturbationKind, SeedPlan};
 use es_ir::types::ElemType;
 use es_physics_backend::{BackendKind, MjWarpBackend, MuJoCoCpuBackend, PhysXBackend};
 use es_physics_core::backend::ModelInfo;
@@ -34,6 +39,7 @@ const HELP: &str = "\
 es loop collect --policy <policy.esb> --scene <file.xml|urdf> --episodes <N> --seed <S>
                 --out <root> [--backend <name>] [--runtime torch] [--max-steps <N>]
                 [--expert so101-pick-place] [--frames <dir>] [--traj <dir>]
+                [--perturb <evaluation.toml> --suites <a,b>]
                 [--telemetry <addr>] [--telemetry-token <t>] [--telemetry-image-every <N>]
 es loop intervene --dataset <root> --segments <segments.json>
 es loop distill --in <root> [--in <root>...] [--train 0.8] [--val 0.1] [--test 0.1]
@@ -78,6 +84,18 @@ collect    Opens the policy bundle (spec 9.6), rolls out <N> episodes through th
            the rendered observation every --telemetry-image-every ticks, which needs --frames.
            Publishing is non-blocking and computes nothing extra: the dataset under --out is
            byte-identical with and without the flag.
+           --perturb <evaluation.toml> --suites <a,b> (packet M13/Z2) collects under that
+           Evaluation IR's own perturbations: episode i runs under suite suites[i % len], drawn
+           by es_eval::PerturbationPlan with the key `es eval run` gives episode i of an
+           evaluation whose seed_base is --seed, so its scene, light and actuator are that
+           evaluation episode's. The seeds [S, S+N) must not meet the Evaluation IR's own; an
+           overlap is refused by name (spec 13.3). Frames, trajectories and state rows are the
+           world as it was; the action column is the plane's answer, never the perturbed
+           actuator's. <root>/meta/perturbations.jsonl records each episode's suite, seed and
+           draws, and the ledger's collect step perturb.config, perturb.evaluation_hash and
+           perturb.suites. A light suite needs --frames; an observation delay or frame drop
+           the Deployment IR's stale_observation watchdog could see is refused (the
+           collector's runner stamps an observation's age itself).
 
 intervene  Applies intervention segments to a dataset that is already on disk. <segments.json>
            is a JSON array of
@@ -232,7 +250,20 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
     mut expert: Option<&mut ScriptedExpert>,
     frames: Option<&std::path::Path>,
     publisher: Option<&mut Publisher>,
+    perturb: Option<&mut Perturb>,
 ) -> Result<CollectReport, CliError> {
+    // The running episode's suite light, set by the perturbation hook at each episode's reset
+    // and read by the frame sink below (packet M13/Z2); the identity without `--perturb`.
+    let light = Cell::new(LightOverride::default());
+    let ledger = perturb.as_ref().map(|p| p.ledger());
+    let mut at = perturb.map(|p| {
+        let light = &light;
+        move |at: PerturbAt<'_>| p.at(at, light)
+    });
+    let perturbation = match (at.as_mut(), ledger) {
+        (Some(hook), Some(ledger)) => Some(Perturbation { hook, ledger }),
+        _ => None,
+    };
     // One publisher, two hooks: the collector's own sink says what the plane did and the
     // frame sink has the pixels. A `RefCell` because both closures live at once and the run
     // is single-threaded -- neither hook can be entered from inside the other (packet M7/E7).
@@ -312,8 +343,9 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
                 if new_episode.take().is_some() {
                     renderer.begin_episode();
                 }
+                let drawn = episode_draws(drawn, &light.get());
                 let tile = renderer
-                    .frame_with(model, state, 0, drawn)
+                    .frame_with(model, state, 0, &drawn)
                     .map_err(|e| e.to_string())?;
                 // The tile the run already rendered, borrowed, not a second render (packet
                 // M7/E7); the publisher decides whether this is one of the published ones.
@@ -322,13 +354,14 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
                 }
                 Ok(())
             };
-        return Collector::run_with_sink::<B, _, NJ, H>(
+        return Collector::run_perturbed::<B, _, NJ, H>(
             spec,
             policy,
             B::default,
             &mut hook,
             Some(&mut frame_sink),
             sink,
+            perturbation,
         )
         .map_err(|e| CliError::Runtime(e.to_string()));
     }
@@ -341,8 +374,330 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
                 .to_owned(),
         ));
     }
-    Collector::run_with_sink::<B, _, NJ, H>(spec, policy, B::default, &mut hook, None, sink)
-        .map_err(|e| CliError::Runtime(e.to_string()))
+    Collector::run_perturbed::<B, _, NJ, H>(
+        spec,
+        policy,
+        B::default,
+        &mut hook,
+        None,
+        sink,
+        perturbation,
+    )
+    .map_err(|e| CliError::Runtime(e.to_string()))
+}
+
+/// `es_eval::runner::episode_draws`, which that module keeps private: this episode's render
+/// draws with the suite's light folded in -- intensities multiply and yaws add, and a suite
+/// with no light perturbation leaves the draws exactly as recorded.
+#[cfg(feature = "render")]
+fn episode_draws(
+    recorded: &es_env::randomize::RenderOverrides,
+    light: &LightOverride,
+) -> es_env::randomize::RenderOverrides {
+    let mut out = recorded.clone();
+    if !light.is_identity() {
+        out.light.intensity *= light.intensity;
+        out.light.yaw_deg += light.yaw_deg;
+    }
+    out
+}
+
+// --- collection under an Evaluation IR's perturbations (packet M13/Z2) ----------------------
+
+/// Each episode's suite, seed and reset draws, one JSON line per episode beside
+/// `meta/interventions.jsonl` and, like it, outside every hash (`dataset_content_hash` reads
+/// the parquet files, `dataset_schema_hash` `info.json`).
+const PERTURBATIONS_FILE: &str = "meta/perturbations.jsonl";
+
+/// `--perturb <evaluation.toml> --suites <a,b>`.
+///
+/// Episode `i` runs under suite `suites[i % len]` with the key `es eval run` gives episode
+/// `i` of an evaluation whose `seed_base` is `--seed`: `apply_at_reset(suite index, seed + i,
+/// i)` and `StepState::new(.., seed + i, suite index, i)`, as `es_eval::runner::run_episode`
+/// calls them. The collector's `Env` is seeded `seed` at episode `i`, which is that evaluation
+/// episode's scene as well (`Env::new(seeds[0])` then `seek_episode(i)` there).
+#[derive(Debug)]
+struct Perturb {
+    config: String,
+    evaluation_hash: [u8; 32],
+    plan: PerturbationPlan,
+    /// `--suites` as given, and each one's index in the Evaluation IR: the draw's `suite_id`.
+    names: Vec<String>,
+    cells: Vec<usize>,
+    seed: u64,
+    /// The Deployment IR's control period, which turns a drawn delay into control steps.
+    control_us: u64,
+    nj: usize,
+    /// The running episode's per-step processes.
+    step: Option<StepState>,
+}
+
+/// A drawn delay in control steps: `es_eval::runner`'s own conversion, truncating.
+fn ms_to_steps(ms: u32, control_us: u64) -> usize {
+    (u64::from(ms) * 1000 / control_us.max(1)) as usize
+}
+
+impl Perturb {
+    /// Reads the Evaluation IR and refuses, before anything opens, what this collection cannot
+    /// do faithfully.
+    fn open(
+        config: &str,
+        suites: &str,
+        seed: u64,
+        episodes: u32,
+        deploy: &DeploymentIr,
+        has_renderer: bool,
+    ) -> Result<Self, CliError> {
+        let fail = |e: &dyn std::fmt::Display| CliError::Runtime(format!("{config}: {e}"));
+        let raw = std::fs::read_to_string(config).map_err(|e| fail(&e))?;
+        let mut ir = es_ir::serial::evaluation_from_toml(&raw).map_err(|e| fail(&e))?;
+        if let Some(d) = ir.validate().first() {
+            return Err(fail(d));
+        }
+        let evaluation_hash = ir.evaluation_hash().map_err(|d| fail(&d))?;
+        let names: Vec<String> = suites
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        let known = || {
+            let all: Vec<&str> = ir.suites.iter().map(|s| s.name.as_str()).collect();
+            all.join(", ")
+        };
+        if names.is_empty() {
+            return Err(CliError::Usage(format!(
+                "--suites names no suite; {config} has {}",
+                known()
+            )));
+        }
+        let cells = names
+            .iter()
+            .map(|name| {
+                ir.suites
+                    .iter()
+                    .position(|s| s.name == *name)
+                    .ok_or_else(|| {
+                        CliError::Usage(format!(
+                            "--suites: {config} has no suite {name:?}; it has {}",
+                            known()
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        refuse_evaluation_seeds(&ir, config, seed, episodes)?;
+        let control_us = deploy.rate.control_period().0;
+        refuse_unseen_age(&ir, &cells, deploy, control_us)?;
+        // Only the chosen suites are realised, so an unchosen light suite does not demand
+        // `--frames`. Emptied rather than removed: every suite keeps its index, which is the
+        // `suite_id` its draws are keyed on (spec 10.4).
+        for (k, suite) in ir.suites.iter_mut().enumerate() {
+            if !cells.contains(&k) {
+                suite.perturbations.clear();
+            }
+        }
+        // ponytail: compiled before any backend opens, against an empty scene and model --
+        // `compile` reads neither today (perturb.rs keeps them for the state-mutation kinds,
+        // all `Unsupported`). When one of those gets a kernel, compile after `Env::new`.
+        let plan = PerturbationPlan::compile(
+            &ir,
+            &SceneDesc::default(),
+            &ModelInfo::default(),
+            has_renderer,
+        )
+        .map_err(|e| fail(&e))?;
+        Ok(Self {
+            config: config.to_owned(),
+            evaluation_hash,
+            plan,
+            names,
+            cells,
+            seed,
+            control_us,
+            nj: deploy.robot.n_joints,
+            step: None,
+        })
+    }
+
+    /// Episode `episode`'s suite index, seed and reset draws.
+    fn draw(&self, episode: u32) -> (usize, u64, ResetOverrides) {
+        let cell = self.cells[episode as usize % self.cells.len()];
+        let seed = self.seed.wrapping_add(u64::from(episode));
+        let mut ov = ResetOverrides::default();
+        self.plan
+            .apply_at_reset(cell, seed, u64::from(episode), &mut ov);
+        (cell, seed, ov)
+    }
+
+    /// The collector's [`PerturbAt`] moments, answered as `es_eval::runner::run_episode`
+    /// answers them.
+    fn at(&mut self, at: PerturbAt<'_>, light: &Cell<LightOverride>) {
+        match at {
+            PerturbAt::Episode {
+                episode,
+                observation_delay,
+            } => {
+                let (cell, seed, ov) = self.draw(episode);
+                light.set(ov.light);
+                *observation_delay = ms_to_steps(ov.observation_delay_ms, self.control_us);
+                // The runner fills its action-delay ring with this hold command.
+                let hold = vec![0.0; self.nj];
+                self.step = Some(StepState::new(
+                    &ov,
+                    ms_to_steps(ov.action_delay_ms, self.control_us),
+                    &hold,
+                    seed,
+                    cell,
+                    u64::from(episode),
+                ));
+            }
+            PerturbAt::Observe { dropped } => {
+                *dropped = self.step.as_mut().is_some_and(StepState::drop_observation);
+            }
+            PerturbAt::Actuate(ctrl) => {
+                if let Some(step) = self.step.as_mut() {
+                    step.apply_per_step(ctrl);
+                }
+            }
+        }
+    }
+
+    /// The collect step's extra ledger inputs.
+    fn ledger(&self) -> Vec<(String, String)> {
+        vec![
+            ("perturb.config".to_owned(), self.config.clone()),
+            (
+                "perturb.evaluation_hash".to_owned(),
+                hex(&self.evaluation_hash),
+            ),
+            ("perturb.suites".to_owned(), self.names.join(",")),
+        ]
+    }
+
+    fn write_meta(&self, root: &Path, episodes: u32) -> Result<(), CliError> {
+        let mut text = String::new();
+        for i in 0..episodes {
+            let (cell, seed, ov) = self.draw(i);
+            let line = serde_json::json!({
+                "episode": i,
+                "suite": self.plan.suite_name(cell),
+                "seed": seed,
+                "observation_delay_ms": ov.observation_delay_ms,
+                "action_delay_ms": ov.action_delay_ms,
+                "backlash_rad": ov.backlash_rad,
+                "light_intensity": ov.light.intensity,
+                "light_yaw_deg": ov.light.yaw_deg,
+            });
+            text.push_str(&line.to_string());
+            text.push('\n');
+        }
+        let path = root.join(PERTURBATIONS_FILE);
+        std::fs::write(&path, text)
+            .map_err(|e| CliError::Runtime(format!("{}: {e}", path.display())))
+    }
+
+    /// Successes per suite, in `--suites` order.
+    fn summary(&self, terminations: &[Termination]) {
+        let mut said: Vec<&str> = Vec::new();
+        for name in &self.names {
+            if said.contains(&name.as_str()) {
+                continue;
+            }
+            said.push(name);
+            let mine: Vec<&Termination> = terminations
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| self.names[i % self.names.len()] == *name)
+                .map(|(_, t)| t)
+                .collect();
+            let won = mine.iter().filter(|t| ***t == Termination::Success).count();
+            println!("suite {name}: success {won} of {}", mine.len());
+        }
+    }
+}
+
+/// Spec 13.3: a re-collection never draws what the policy will be judged on. The collection's
+/// seeds `[seed, seed + episodes)` against the Evaluation IR's resolved ones (spec 10.2: the
+/// explicit list, or `n_episodes` from `seed_base`, as `es_eval::runner::resolve_seeds` has it).
+fn refuse_evaluation_seeds(
+    ir: &EvaluationIr,
+    config: &str,
+    seed: u64,
+    episodes: u32,
+) -> Result<(), CliError> {
+    let mut judged: Vec<u64> = match &ir.episodes.seeds {
+        SeedPlan::Base(b) => (0..u64::from(ir.episodes.n_episodes))
+            .map(|i| b.wrapping_add(i))
+            .collect(),
+        SeedPlan::Explicit(list) => list.clone(),
+    };
+    if !judged
+        .iter()
+        .any(|s| s.wrapping_sub(seed) < u64::from(episodes))
+    {
+        return Ok(());
+    }
+    judged.sort_unstable();
+    judged.dedup();
+    let span = match (judged.first(), judged.last()) {
+        (Some(lo), Some(hi)) if hi - lo == judged.len() as u64 - 1 => format!("{lo}-{hi}"),
+        _ => judged
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    };
+    let last = seed.wrapping_add(u64::from(episodes) - 1);
+    Err(CliError::Usage(format!(
+        "--seed {seed} --episodes {episodes} collects seeds {seed}-{last}, and --seed overlaps \
+         evaluation seeds {span} of {config}: a re-collection never trains on what it is judged \
+         on (spec 13.3). Pick a --seed whose range misses them."
+    )))
+}
+
+/// The one thing this path cannot hand the Safety Plane that `es eval run` does: the
+/// collector's `DomainRunner` stamps an observation's age itself, so a held observation
+/// reaches `SafetyPlane::validate` as age 0 where the evaluation passes its true age. The plane
+/// reads that age only against a `stale_observation` watchdog, so a suite is realised when no
+/// age it can produce crosses that watchdog and refused otherwise, rather than judged by a
+/// different plane (spec 17.2) -- `frame_drop` whenever there is one, its bursts having no bound.
+fn refuse_unseen_age(
+    ir: &EvaluationIr,
+    cells: &[usize],
+    deploy: &DeploymentIr,
+    control_us: u64,
+) -> Result<(), CliError> {
+    let Some(max_age) = deploy.watchdogs.0.iter().find_map(|w| match w {
+        Watchdog::StaleObservation { max_age } => Some(max_age.0),
+        _ => None,
+    }) else {
+        return Ok(());
+    };
+    for suite in cells.iter().map(|k| &ir.suites[*k]) {
+        for p in &suite.perturbations {
+            let worst = match &p.kind {
+                PerturbationKind::ObservationDelay { ms } => ms
+                    .iter()
+                    .map(|m| ms_to_steps(*m, control_us) as u64 * control_us)
+                    .max()
+                    .unwrap_or(0),
+                PerturbationKind::FrameDrop { .. } => u64::MAX,
+                _ => 0,
+            };
+            if worst > max_age {
+                return Err(CliError::Runtime(format!(
+                    "suite {:?}: {} can age the observation past the deployment's \
+                     stale_observation max_age of {max_age} us, and `es loop collect` cannot \
+                     hand the Safety Plane that age (its runner stamps its own), so the plane \
+                     here would not be the evaluation's -- refused rather than approximated \
+                     (spec 17.2)",
+                    suite.name,
+                    p.kind.name()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The `PolicyRuntime` slot under `--expert`: the bundle's Task, Observation and Deployment IR
@@ -581,8 +936,20 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
             "--telemetry",
             "--telemetry-token",
             "--telemetry-image-every",
+            "--perturb",
+            "--suites",
         ],
     )?;
+    let perturb_args = match (one(&pairs, "--perturb"), one(&pairs, "--suites")) {
+        (Some(config), Some(suites)) => Some((config, suites)),
+        (None, None) => None,
+        _ => {
+            return Err(CliError::Usage(format!(
+                "--perturb and --suites go together: the Evaluation IR, and which of its suites \
+                 to collect under\n\n{HELP}"
+            )))
+        }
+    };
     let expert_name = one(&pairs, "--expert").map(ToOwned::to_owned);
     let policy_path = required(&pairs, "--policy")?.to_owned();
     let scene_path = required(&pairs, "--scene")?.to_owned();
@@ -631,6 +998,20 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
     let bytes = std::fs::read(&policy_path)
         .map_err(|e| CliError::Runtime(format!("{policy_path}: {e}")))?;
     let bundle = PolicyBundle::open(&bytes).map_err(|e| CliError::Runtime(e.to_string()))?;
+    // Before any backend is probed, so a collection that would reuse the evaluation's seeds is
+    // refused on the documents alone (packet M13/Z2).
+    let mut perturb = perturb_args
+        .map(|(config, suites)| {
+            Perturb::open(
+                config,
+                suites,
+                seed,
+                episodes,
+                &bundle.deployment,
+                frames.is_some(),
+            )
+        })
+        .transpose()?;
 
     // A backend other than the reference is gated on its mapping report first (spec 14.4),
     // so the refusal names the rows even where the engine is not installed; `mujoco-cpu`
@@ -690,18 +1071,22 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
     let h = bundle.deployment.action.horizon;
     // One dispatch on the backend, monomorphized: `Env<B>` stays generic (spec 3.4).
     let (expert, frames) = (expert.as_mut(), frames.as_deref());
+    let p = perturb.as_mut();
     let report = match kind {
         BackendKind::MuJoCoCpu => dispatch_nj_h!(
-            MuJoCoCpuBackend; nj, h, &spec, policy, expert, frames, publisher
+            MuJoCoCpuBackend; nj, h, &spec, policy, expert, frames, publisher, p
         ),
         BackendKind::MjWarp => dispatch_nj_h!(
-            MjWarpBackend; nj, h, &spec, policy, expert, frames, publisher
+            MjWarpBackend; nj, h, &spec, policy, expert, frames, publisher, p
         ),
         BackendKind::PhysX => dispatch_nj_h!(
-            PhysXBackend; nj, h, &spec, policy, expert, frames, publisher
+            PhysXBackend; nj, h, &spec, policy, expert, frames, publisher, p
         ),
         BackendKind::Newton => Err(crate::cmd::eval::no_closed_loop(kind)),
     }?;
+    if let Some(p) = &perturb {
+        p.write_meta(&out, episodes)?;
+    }
 
     for w in &report.warnings {
         println!("warning: {w}");
@@ -718,6 +1103,9 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
         count(Termination::Timeout),
         count(Termination::Running)
     );
+    if let Some(p) = &perturb {
+        p.summary(&report.terminations);
+    }
     println!("intervention frames: {}", report.intervention_frames);
     // What the plane did, per spec 10.3's failure-mode histogram: a demonstration the envelope
     // had to correct is worth seeing, not hiding (INV-12).
@@ -822,4 +1210,220 @@ fn distill(args: &[String]) -> Result<u8, CliError> {
          PyTorch-side (spec 19.3, spec 2.3)."
     );
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> String {
+        format!(
+            "{}/../../tests/fixtures/visible-learning/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    }
+
+    fn evaluation() -> EvaluationIr {
+        es_ir::serial::evaluation_from_toml(
+            &std::fs::read_to_string(fixture("evaluation.toml")).expect("evaluation.toml"),
+        )
+        .expect("the committed Evaluation IR parses")
+    }
+
+    fn deployment() -> DeploymentIr {
+        es_ir::serial::deployment_from_toml(
+            &std::fs::read_to_string(fixture("deployment.toml")).expect("deployment.toml"),
+        )
+        .expect("the committed Deployment IR parses")
+    }
+
+    fn open(suites: &str, seed: u64, episodes: u32) -> Result<Perturb, CliError> {
+        Perturb::open(
+            &fixture("evaluation.toml"),
+            suites,
+            seed,
+            episodes,
+            &deployment(),
+            true,
+        )
+    }
+
+    /// Packet M13/Z2 oracle: episode `i` runs under `suites[i % len]`, at seed `seed + i`.
+    #[test]
+    fn collect_assigns_suites_by_episode_index() {
+        let p = open("light_intensity,nominal,torque_noise", 500, 7).expect("opens");
+        let suites: Vec<&str> = (0..7).map(|i| p.plan.suite_name(p.draw(i).0)).collect();
+        assert_eq!(
+            suites,
+            [
+                "light_intensity",
+                "nominal",
+                "torque_noise",
+                "light_intensity",
+                "nominal",
+                "torque_noise",
+                "light_intensity"
+            ]
+        );
+        assert_eq!(p.draw(3).1, 503);
+    }
+
+    /// Packet M13/Z2 oracle: what collect draws for a (suite, seed) is what `es eval run`
+    /// draws for it -- the reset draws and the per-step streams -- because collect's episode
+    /// `i` is episode `i` of an evaluation whose `seed_base` is `--seed`. The evaluation side
+    /// is written out the way `es_eval::runner::run_shard_with_sink` and `run_episode` make
+    /// it: the plan over *every* suite, `apply_at_reset(cell, seeds[i], i)` and
+    /// `StepState::new(.., zeros, seeds[i], cell, i)`. Collect is handed a subset of the
+    /// suites in another order, so the suite index and the emptied suites are covered too.
+    #[test]
+    #[allow(clippy::float_cmp)] // bit for bit is the claim
+    fn collect_draws_what_eval_draws_for_a_suite_and_seed() {
+        const S: u64 = 500;
+        let mut ir = evaluation();
+        ir.episodes.seeds = SeedPlan::Base(S);
+        let eval =
+            PerturbationPlan::compile(&ir, &SceneDesc::default(), &ModelInfo::default(), true)
+                .expect("the evaluation's plan");
+        let control_us = deployment().rate.control_period().0;
+        let chosen = [
+            "torque_noise",
+            "light_intensity",
+            "backlash",
+            "observation_delay",
+        ];
+        let mut p = open(&chosen.join(","), S, 8).expect("opens");
+        let light = Cell::new(LightOverride::default());
+        let mut moved = 0;
+        for i in 0..8u32 {
+            let cell = ir
+                .suites
+                .iter()
+                .position(|s| s.name == chosen[i as usize % chosen.len()])
+                .expect("a suite of the IR");
+            // `resolve_seeds` of `SeedPlan::Base(S)`, entry `i`.
+            let seed = S + u64::from(i);
+            let mut want = ResetOverrides::default();
+            eval.apply_at_reset(cell, seed, u64::from(i), &mut want);
+            assert_eq!(p.draw(i), (cell, seed, want), "episode {i}");
+            moved += usize::from(want != ResetOverrides::default());
+
+            let mut delay = usize::MAX;
+            p.at(
+                PerturbAt::Episode {
+                    episode: i,
+                    observation_delay: &mut delay,
+                },
+                &light,
+            );
+            assert_eq!(delay, ms_to_steps(want.observation_delay_ms, control_us));
+            assert_eq!(light.get(), want.light);
+            let mut eval_step = StepState::new(
+                &want,
+                ms_to_steps(want.action_delay_ms, control_us),
+                &[0.0; 6],
+                seed,
+                cell,
+                u64::from(i),
+            );
+            for t in 0..5 {
+                let mut a = [0.3, -0.2, 0.1, 0.5, -0.4, f64::from(t)];
+                let mut b = a;
+                p.at(PerturbAt::Actuate(&mut a), &light);
+                eval_step.apply_per_step(&mut b);
+                assert_eq!(a, b, "episode {i} step {t}");
+            }
+        }
+        assert_eq!(moved, 8, "every chosen suite moves its episodes' overrides");
+    }
+
+    /// Packet M13/Z2 oracle: seeds `[S, S+N)` that meet the Evaluation IR's are refused by
+    /// name; a range that misses them is not.
+    #[test]
+    fn collect_refuses_the_evaluations_seeds() {
+        let usage = |seed, n| match open("nominal", seed, n) {
+            Err(CliError::Usage(m)) => m,
+            other => panic!("--seed {seed} --episodes {n} was not refused: {other:?}"),
+        };
+        let m = usage(100, 5);
+        assert!(m.contains("overlaps evaluation seeds 101-116"), "{m}");
+        assert!(m.contains("collects seeds 100-104"), "{m}");
+        usage(116, 1);
+        usage(1, 200);
+        assert!(open("nominal", 96, 5).is_ok(), "96-100 misses 101");
+        assert!(open("nominal", 117, 200).is_ok());
+        // A `seed_base` plan is its base and the next `n_episodes - 1`.
+        let mut ir = evaluation();
+        ir.episodes.seeds = SeedPlan::Base(40);
+        assert!(refuse_evaluation_seeds(&ir, "e.toml", 30, 10).is_ok());
+        assert!(refuse_evaluation_seeds(&ir, "e.toml", 56, 1).is_ok());
+        assert!(refuse_evaluation_seeds(&ir, "e.toml", 30, 11).is_err());
+        assert!(refuse_evaluation_seeds(&ir, "e.toml", 55, 1).is_err());
+        assert!(refuse_evaluation_seeds(&ir, "e.toml", 45, 0).is_ok());
+    }
+
+    /// Packet M13/Z2 oracle: the collect step's ledger row names the Evaluation IR by path and
+    /// by hash, and the suites as given.
+    #[test]
+    fn collect_ledger_names_the_evaluation_and_its_suites() {
+        let p = open("light_intensity,nominal", 500, 4).expect("opens");
+        let row: std::collections::BTreeMap<String, String> = p.ledger().into_iter().collect();
+        assert_eq!(row["perturb.config"], fixture("evaluation.toml"));
+        assert_eq!(
+            row["perturb.evaluation_hash"],
+            hex(&evaluation().evaluation_hash().expect("hash"))
+        );
+        assert_eq!(row["perturb.suites"], "light_intensity,nominal");
+        assert_eq!(row.len(), 3);
+    }
+
+    /// Only the chosen suites are realised: an unchosen light suite needs no renderer, a
+    /// chosen one does, and a suite the IR lacks is named beside the ones it has.
+    #[test]
+    fn collect_realises_only_the_chosen_suites() {
+        let open = |suites: &str, renderer: bool| {
+            Perturb::open(
+                &fixture("evaluation.toml"),
+                suites,
+                500,
+                4,
+                &deployment(),
+                renderer,
+            )
+        };
+        assert!(open("torque_noise,backlash", false).is_ok());
+        let e = open("light_intensity", false).expect_err("no frame source");
+        assert!(e.to_string().contains("light_intensity"), "{e}");
+        let e = open("nominal,dusk", true).expect_err("unknown suite");
+        assert!(matches!(e, CliError::Usage(_)), "{e}");
+        assert!(
+            e.to_string().contains("\"dusk\"") && e.to_string().contains("backlash"),
+            "{e}"
+        );
+    }
+
+    /// An observation delay the plane's `stale_observation` watchdog could see is refused,
+    /// since this path hands the plane age 0; one below it is collected.
+    #[test]
+    fn collect_refuses_a_delay_the_plane_would_see() {
+        let mut deploy = deployment();
+        let ir = evaluation();
+        let delay = ir
+            .suites
+            .iter()
+            .position(|s| s.name == "observation_delay")
+            .expect("suite");
+        let control_us = deploy.rate.control_period().0;
+        assert!(refuse_unseen_age(&ir, &[delay], &deploy, control_us).is_ok());
+        for w in &mut deploy.watchdogs.0 {
+            if let Watchdog::StaleObservation { max_age } = w {
+                max_age.0 = 30_000;
+            }
+        }
+        let e = refuse_unseen_age(&ir, &[delay], &deploy, control_us).expect_err("40 ms > 30 ms");
+        assert!(e.to_string().contains("stale_observation"), "{e}");
+        assert!(
+            refuse_unseen_age(&ir, &[0], &deploy, control_us).is_ok(),
+            "nominal"
+        );
+    }
 }

@@ -10389,6 +10389,255 @@ fn collect_renders_the_sensor_with_the_path_tracer() {
     );
 }
 
+/// Packet M13/Z2 oracle (review focus 5): a perturbed collection whose seeds `[S, S+N)` meet
+/// the Evaluation IR's is refused by name, on the documents alone -- before any backend is
+/// probed, so it holds on a machine without one.
+#[test]
+fn collect_perturbed_refuses_the_evaluation_seeds() {
+    let dir = scratch_dir("collect-perturb-seeds");
+    let policy = write_demo_bundle(&dir);
+    let evaluation = vl_fixture("evaluation.toml");
+    let run = |seed: &str, extra: &[&str]| {
+        bin()
+            .env("ES_PYTHON", "es-no-such-python")
+            .args(["loop", "collect", "--policy"])
+            .arg(&policy)
+            // Refused or skipped before the scene is read, so a missing file is fine.
+            .args([
+                "--scene",
+                "does-not-exist.xml",
+                "--episodes",
+                "5",
+                "--seed",
+                seed,
+            ])
+            .arg("--out")
+            .arg(dir.join("out"))
+            .arg("--perturb")
+            .arg(&evaluation)
+            .args(extra)
+            .output()
+            .expect("run es loop collect --perturb")
+    };
+    let text = |out: &Output| format!("{}{}", stdout(out), String::from_utf8_lossy(&out.stderr));
+
+    let out = run("100", &["--suites", "nominal"]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(
+        text(&out).contains("--seed 100 --episodes 5 collects seeds 100-104")
+            && text(&out).contains("overlaps evaluation seeds 101-116"),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        !dir.join("out").exists(),
+        "a refused collection wrote something"
+    );
+
+    let out = run("200", &[]);
+    assert_eq!(out.status.code(), Some(2), "{}", text(&out));
+    assert!(
+        text(&out).contains("--perturb and --suites go together"),
+        "{}",
+        text(&out)
+    );
+
+    // A light suite with no frame source is refused by `PerturbationPlan::compile` itself.
+    let out = run("200", &["--suites", "nominal,light_intensity"]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+    assert!(
+        text(&out).contains("`light_intensity` is not realisable here"),
+        "{}",
+        text(&out)
+    );
+
+    // A range that misses them gets as far as the backend probe, which has nothing to find.
+    let out = run("200", &["--suites", "nominal,torque_noise"]);
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out));
+    assert!(text(&out).contains("SKIPPED"), "{}", text(&out));
+}
+
+/// Packet M13/Z2 oracle: `es loop collect --perturb` over two suites. Each episode's suite,
+/// seed and draws are recorded -- and the draws are `es eval run`'s for that (suite, seed),
+/// recomputed here through `es_eval::PerturbationPlan` with the evaluation's own key -- the
+/// ledger names the Evaluation IR, and against the same collection without `--perturb`:
+/// every frame of a `light_intensity` episode differs, every frame of a `nominal` episode is
+/// byte-identical, and so is the whole dataset (the light is render-only and `nominal`
+/// perturbs nothing, so the opened-up step path moved no row).
+#[test]
+#[cfg(feature = "render")]
+fn collect_under_evaluation_perturbations() {
+    const SEED: u64 = 500;
+    const SUITES: [&str; 2] = ["nominal", "light_intensity"];
+
+    let test = "collect_under_evaluation_perturbations";
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP {test}: {reason}");
+        return;
+    }
+    if let Err(e) = es_gpu::SlangCompiler::new() {
+        println!("SKIP {test}: no slangc ({e})");
+        return;
+    }
+    let device = match es_gpu::Gpu::open(es_gpu::GpuOptions::default()) {
+        Ok(gpu) => gpu.capabilities().device_name.clone(),
+        Err(e) => {
+            println!("SKIP {test}: no Vulkan device ({e})");
+            return;
+        }
+    };
+
+    let dir = scratch_dir("collect-perturb");
+    let policy = write_demo_bundle(&dir);
+    let evaluation = vl_fixture("evaluation.toml");
+    let collect = |tag: &str, perturb: bool| -> (String, PathBuf, PathBuf) {
+        let (ds, frames) = (
+            dir.join(format!("ds-{tag}")),
+            dir.join(format!("frames-{tag}")),
+        );
+        let mut cmd = bin();
+        cmd.args([
+            "loop",
+            "collect",
+            "--expert",
+            "so101-pick-place",
+            "--policy",
+        ])
+        .arg(&policy)
+        .arg("--scene")
+        .arg(demo_scene_path())
+        .args([
+            "--episodes",
+            "4",
+            "--seed",
+            &SEED.to_string(),
+            "--max-steps",
+            "3",
+        ])
+        .arg("--frames")
+        .arg(&frames)
+        .arg("--out")
+        .arg(&ds);
+        if perturb {
+            cmd.arg("--perturb")
+                .arg(&evaluation)
+                .args(["--suites", &SUITES.join(",")]);
+        }
+        let out = cmd.output().expect("run es loop collect");
+        let text = stdout(&out);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{tag}\nstdout:\n{text}\nstderr:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (text, ds, frames)
+    };
+    let (plain_text, _, plain_frames) = collect("plain", false);
+    let (text, ds, frames) = collect("perturbed", true);
+
+    for suite in SUITES {
+        assert!(text.contains(&format!("suite {suite}: success ")), "{text}");
+    }
+    let content = |t: &str| {
+        t.lines()
+            .find(|l| l.starts_with("content:"))
+            .map(ToOwned::to_owned)
+    };
+    assert!(content(&text).is_some(), "{text}");
+    assert_eq!(
+        content(&text),
+        content(&plain_text),
+        "the dataset moved under a render-only and an empty suite"
+    );
+
+    let read =
+        |p: PathBuf| std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    let jsonl = |p: PathBuf| -> Vec<serde_json::Value> {
+        read(p)
+            .lines()
+            .map(|l| serde_json::from_str(l).expect("a JSON line"))
+            .collect()
+    };
+    let ir = es_ir::serial::evaluation_from_toml(&read(evaluation.clone()))
+        .expect("evaluation.toml parses");
+    // `es eval run`'s plan: every suite. Nothing in `compile` reads the scene or the model.
+    let eval = es_eval::PerturbationPlan::compile(
+        &ir,
+        &es_assets::scene::SceneDesc::default(),
+        &es_physics_core::backend::ModelInfo::default(),
+        true,
+    )
+    .expect("the evaluation's plan");
+    let meta = jsonl(ds.join("meta/perturbations.jsonl"));
+    assert_eq!(meta.len(), 4, "{meta:?}");
+    let mut gains = Vec::new();
+    for (i, line) in meta.iter().enumerate() {
+        let suite = SUITES[i % SUITES.len()];
+        let seed = SEED + i as u64;
+        assert_eq!(line["episode"], i as u64, "{line}");
+        assert_eq!(line["suite"], suite, "{line}");
+        assert_eq!(line["seed"], seed, "{line}");
+        let cell = ir
+            .suites
+            .iter()
+            .position(|s| s.name == suite)
+            .expect("a suite of the IR");
+        let mut want = es_eval::ResetOverrides::default();
+        eval.apply_at_reset(cell, seed, i as u64, &mut want);
+        assert_eq!(
+            line["light_intensity"].as_f64(),
+            Some(want.light.intensity),
+            "{line}"
+        );
+        assert_eq!(
+            line["light_yaw_deg"].as_f64(),
+            Some(want.light.yaw_deg),
+            "{line}"
+        );
+        gains.push(want.light.intensity);
+    }
+
+    let ledger = jsonl(ds.join("loop.jsonl"));
+    let step = ledger.last().expect("a collect step");
+    assert_eq!(step["kind"], "collect", "{step}");
+    let inputs = &step["inputs"];
+    assert_eq!(inputs["perturb.suites"], SUITES.join(","), "{step}");
+    assert_eq!(
+        inputs["perturb.config"],
+        evaluation.display().to_string(),
+        "{step}"
+    );
+    assert_eq!(
+        inputs["perturb.evaluation_hash"],
+        hex(&ir.evaluation_hash().expect("hash")),
+        "{step}"
+    );
+
+    let lengths: Vec<u64> = jsonl(ds.join("meta/episodes.jsonl"))
+        .iter()
+        .map(|e| e["length"].as_u64().expect("length"))
+        .collect();
+    assert_eq!(lengths.len(), 4);
+    let frame = |dir: &Path, k: u64| {
+        std::fs::read(dir.join(format!("{k:06}.bin")))
+            .unwrap_or_else(|e| panic!("{}/{k:06}.bin: {e}", dir.display()))
+    };
+    let mut k = 0;
+    for (i, n) in lengths.iter().enumerate() {
+        for f in k..k + n {
+            let same = frame(&plain_frames, f) == frame(&frames, f);
+            if SUITES[i % SUITES.len()] == "nominal" {
+                assert!(same, "nominal episode {i}: frame {f} moved");
+            } else {
+                assert!(!same, "light episode {i}: frame {f} is the unperturbed one");
+            }
+        }
+        k += n;
+    }
+    println!("RAN {test} on {device}: episode lengths {lengths:?}, light gains {gains:?}");
+}
+
 /// Packet M7/R5 oracle 4: a path-traced bundle judged by the rasterizer's Evaluation IR is
 /// refused by name, which is spec 13.3 doing its job -- the numbers would otherwise carry a
 /// correct `evaluation_hash` and describe documents nobody evaluated.
