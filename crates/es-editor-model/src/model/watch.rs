@@ -20,7 +20,7 @@ use es_ir::serial::evaluation_from_toml;
 use es_telemetry::transport::Client;
 
 use crate::model::health::{self, Input, Light, Point, Verdict, THRESHOLDS};
-use crate::model::i18n::Lang;
+use crate::model::i18n::{self, Lang};
 use crate::model::launch::{self, LaunchModel, State};
 use crate::model::layout;
 use crate::model::live_run::StageRow;
@@ -74,11 +74,28 @@ pub fn length_key(length: Length) -> &'static str {
 
 // --- what the wire says ------------------------------------------------------------------------
 
-/// Collect's `episode.end` events: demonstrations made, and how many of them succeeded.
+/// Collect's episode events: demonstrations made, and how many of the ends heard succeeded.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Episodes {
     pub made: u32,
     pub succeeded: u32,
+    /// The `episode.end`s heard: fewer than `made` when the editor attached mid-collection
+    /// (or the log dropped the oldest), and then `succeeded` is only of these.
+    pub heard: u32,
+}
+
+impl Episodes {
+    /// ③'s line while collecting. Successes the editor never heard are not claimed: with ends
+    /// missing, the line says the successes are of the ones it saw.
+    pub fn line(self, lang: Lang, of: u32) -> String {
+        let [made, of, succeeded, heard] =
+            [self.made, of, self.succeeded, self.heard].map(|n| n.to_string());
+        if self.heard == self.made {
+            i18n::fill(lang, "watch.demos", &[&made, &of, &succeeded])
+        } else {
+            i18n::fill(lang, "watch.demos.seen", &[&made, &of, &heard, &succeeded])
+        }
+    }
 }
 
 fn outcome(e: &Event) -> Option<&str> {
@@ -86,13 +103,25 @@ fn outcome(e: &Event) -> Option<&str> {
 }
 
 /// Counted from the event log, which keeps the last `telemetry_view::DEFAULT_CAP` events - some
-/// ten times what a 200-demonstration cycle sends.
+/// ten times what a 200-demonstration cycle sends. `made` is read off the 0-based episode index,
+/// not counted, so an editor attached mid-collection shows the true number at once (as the
+/// stage cards read the phase state for what was never heard): an episode that began at index
+/// `i` had `i` before it, one that ended at `i` makes `i + 1`.
 pub fn episodes(events: &[Event]) -> Episodes {
     let mut out = Episodes::default();
-    for e in events.iter().filter(|e| e.kind == "episode.end") {
-        out.made += 1;
-        out.succeeded += u32::from(outcome(e) == Some(SUCCESS));
+    for e in events {
+        let index = || e.fields.get("episode").and_then(|i| i.parse::<u32>().ok());
+        match e.kind.as_str() {
+            "episode.begin" => out.made = out.made.max(index().unwrap_or(0)),
+            "episode.end" => {
+                out.heard += 1;
+                out.succeeded += u32::from(outcome(e) == Some(SUCCESS));
+                out.made = out.made.max(index().map_or(0, |i| i.saturating_add(1)));
+            }
+            _ => {}
+        }
     }
+    out.made = out.made.max(out.heard);
     out
 }
 
@@ -530,8 +559,8 @@ pub enum Centre {
     /// No child runs and nothing is attached: a run that ended has its word on the light, and
     /// its pictures in ⑤.
     Idle,
-    /// Collecting: the latest picture and the demonstrations so far.
-    Demonstrations { made: u32, of: u32, succeeded: u32 },
+    /// Collecting: the latest picture and the demonstrations so far ([`Episodes::line`]).
+    Demonstrations { episodes: Episodes, of: u32 },
     /// Training: the sample the network is fitting and the loss curve.
     Learning,
     /// Anything else: the latest picture.
@@ -542,11 +571,7 @@ pub enum Centre {
 pub fn centre(alive: bool, stage: Option<&str>, episodes: Episodes, of: u32) -> Centre {
     match (alive, stage) {
         (false, _) => Centre::Idle,
-        (true, Some("collect")) => Centre::Demonstrations {
-            made: episodes.made,
-            of,
-            succeeded: episodes.succeeded,
-        },
+        (true, Some("collect")) => Centre::Demonstrations { episodes, of },
         (true, Some("train")) => Centre::Learning,
         (true, _) => Centre::Picture,
     }
@@ -1449,6 +1474,70 @@ mod tests {
         })
     }
 
+    /// The 2026-09-29 run: attached with 24 demonstrations done, ③ read "2 of 200". Made comes
+    /// from the episode index; the successes are said to be of the ends the editor saw. A run
+    /// watched from its start reads exactly as before.
+    #[test]
+    fn demonstrations_made_come_from_the_episode_index() {
+        let begin = |i| event("episode.begin", &[("episode", i), ("stage", "collect")]);
+        let end = |i, outcome| {
+            event(
+                "episode.end",
+                &[("episode", i), ("outcome", outcome), ("stage", "collect")],
+            )
+        };
+
+        let attached = episodes(&[end("24", "Success"), begin("25")]);
+        assert_eq!(
+            attached,
+            Episodes {
+                made: 25,
+                succeeded: 1,
+                heard: 1
+            }
+        );
+        assert_eq!(
+            progress("collect", attached.made, 200, None, None),
+            Some(0.125)
+        );
+        assert_eq!(episodes(&[begin("25")]).made, 25, "at once, before any end");
+        assert_eq!(
+            attached.line(Lang::En, 200),
+            "25 of 200 demonstrations made; of the 1 the editor saw, 1 succeeded"
+        );
+
+        let watched = episodes(&[
+            begin("0"),
+            end("0", "Success"),
+            begin("1"),
+            end("1", "Timeout"),
+            begin("2"),
+        ]);
+        assert_eq!(
+            watched,
+            Episodes {
+                made: 2,
+                succeeded: 1,
+                heard: 2
+            }
+        );
+        assert_eq!(
+            watched.line(Lang::En, 200),
+            "2 of 200 demonstrations made, 1 succeeded"
+        );
+        assert_eq!(
+            watched.line(Lang::Ko, 200),
+            i18n::fill(Lang::Ko, "watch.demos", &["2", "200", "1"])
+        );
+
+        for lang in Lang::ALL {
+            for e in [attached, watched] {
+                let line = e.line(lang, 200);
+                assert!(!line.contains("{}") && line.contains("200"), "{line}");
+            }
+        }
+    }
+
     /// Progress is demonstrations made while collecting and steps while training; the tiles are
     /// the evaluation's cells, not the expert gate's; the curve the light reads keeps a NaN.
     #[test]
@@ -1488,7 +1577,7 @@ mod tests {
             ),
         ];
         let e = episodes(&events);
-        assert_eq!((e.made, e.succeeded), (2, 1));
+        assert_eq!((e.made, e.succeeded, e.heard), (2, 1, 2));
         assert_eq!(progress("collect", e.made, 8, None, None), Some(0.25));
         assert_eq!(progress("collect", 3, 0, None, None), None, "of nothing");
         assert_eq!(progress("train", 0, 8, Some(500), Some(1000)), Some(0.5));
@@ -1513,11 +1602,7 @@ mod tests {
         );
         assert_eq!(
             centre(true, Some("collect"), e, 8),
-            Centre::Demonstrations {
-                made: 2,
-                of: 8,
-                succeeded: 1
-            }
+            Centre::Demonstrations { episodes: e, of: 8 }
         );
         assert_eq!(centre(true, Some("train"), e, 8), Centre::Learning);
         assert_eq!(centre(true, None, e, 8), Centre::Picture);

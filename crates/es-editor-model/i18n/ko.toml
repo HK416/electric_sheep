@@ -424,6 +424,7 @@
 "watch.took" = "{} 걸림"
 "watch.idle" = "진행 중인 실행이 없습니다. 단계 패널에서 실행을 시작하세요."
 "watch.demos" = "시범 {}개 완료 (목표 {}개), 그중 {}개 성공"
+"watch.demos.seen" = "시범 {}개 완료 (목표 {}개), 에디터가 본 {}개 중 {}개 성공"
 "watch.picture" = "카메라가 보는 것"
 "watch.no_picture" = "아직 사진이 없습니다."
 "watch.tiles" = "지금까지의 시험"

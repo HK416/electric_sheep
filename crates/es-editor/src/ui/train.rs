@@ -306,14 +306,8 @@ fn centre(app: &mut EditorApp, ui: &mut egui::Ui, view: &View) {
                 previews(app, ui, &view.previews);
             }
         }
-        Centre::Demonstrations {
-            made,
-            of,
-            succeeded,
-        } => {
-            let counts = [made.to_string(), of.to_string(), succeeded.to_string()];
-            let counts: Vec<&str> = counts.iter().map(String::as_str).collect();
-            ui.heading(i18n::fill(lang, "watch.demos", &counts));
+        Centre::Demonstrations { episodes, of } => {
+            ui.heading(episodes.line(lang, of));
             ui.label(i18n::t(lang, "watch.picture"));
             image(app, ui, "watch-picture", picture);
         }

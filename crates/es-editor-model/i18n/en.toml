@@ -425,6 +425,7 @@
 "watch.took" = "took {}"
 "watch.idle" = "Nothing is running. Start a run from the step panel."
 "watch.demos" = "{} of {} demonstrations made, {} succeeded"
+"watch.demos.seen" = "{} of {} demonstrations made; of the {} the editor saw, {} succeeded"
 "watch.picture" = "What the camera sees"
 "watch.no_picture" = "No picture yet."
 "watch.tiles" = "Test attempts so far"
