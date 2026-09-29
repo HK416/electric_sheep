@@ -86,7 +86,7 @@ class EsPolicy(nn.Module):
 | `LanguageEncoder` | — | — | `Unsupported` |
 | `Fusion { Concat }` | `Linear(Σin, out_dim)`, `Σin == out_dim`이면 없음 | `v = self.nk(torch.cat([a, b], dim=-1))` | 정확 / 없음 |
 | `Fusion { TokenConcat }` | — | `v = torch.cat([a, b], dim=-2)` | 없음 |
-| `Fusion { Sum }` | — | `v = torch.stack([a, b, c], 0).sum(0)` | 없음 |
+| `Fusion { Sum }` | `_sum(terms, views, keep_views)` = `torch.stack(terms, 0).sum(0)` | `v = _sum([a, b, c], ["cam_a", …], keep_views)` | 없음 |
 | `Fusion { CrossAttention, FiLm, AdaLn }` | — | — | `Unsupported` |
 | `TemporalEncoder { None }` | — | `v = x` | 없음 |
 | `TemporalEncoder { Transformer }` | `nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=out_dim, nhead=8, batch_first=True), 1)` | `v = self.nk(x)` | 접두사 |
@@ -121,6 +121,12 @@ class EsPolicy(nn.Module):
   `LRN-032`가 모든 항을 노드 자신의 shape으로 만든다. 항은 노드의 **선언된 입력 순서**(문서의
   순서이지 map의 순서가 아니다)로 쌓이며, 이것이 합의 연산 순서를 정한다. 손으로 쓴 모듈(ResNet18
   하나, 피처를 `+`로 더함)과 대조해 CPU에서 bitwise로 같다(`crates/es-policy/tests/sum_share.rs`).
+  각 항은 자신이 온 카메라를 지니고, `Sum`이 있는 그래프는
+  `forward(self, keep_views=None, **inputs)`를 얻는다(패킷 M15/N7). 모든 추론 경로에서 `None`이라
+  모든 항이 더해진다. 이것을 넘기는 것은 `train_act.py --single-view`뿐이며, 거기서 이름이 빠진
+  카메라의 항은 합에서 빠진다 — 그 카메라 없이 배포된 번들이 계산하는 것이지, 0 이미지가 주는
+  것이 아니다. `contract.json`은 그 카메라들을 `sum_views`로 적는다(비면 없음). `Sum`이 없는
+  그래프는 `forward(self, **inputs)`를 바이트 그대로 유지한다.
 - **`ActionChunker`.** `execute_chunk`를 제외한 나머지 — `replan_hz`, `mode`, `blend`,
   `buffer_chunks` — 는 텐서 연산이 아니라 런타임 스케줄링(spec 8.6)이다. lowering은
   `execute_chunk`만 소비하고 나머지는 **의도적으로** 무시한다; 비동기 버퍼와 blend 정책은 env

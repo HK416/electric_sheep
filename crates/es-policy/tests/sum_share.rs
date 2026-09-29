@@ -18,7 +18,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use es_compile::Tensor;
@@ -304,13 +304,30 @@ fn a_share_group_lowers_to_one_module_applied_per_view() {
     }
     assert!(!m.source.contains("self.n0"), "{}", m.source);
     assert!(!m.source.contains("self.n2"), "{}", m.source);
-    // The Sum, in the node's declared input order (wrist, overhead, side), not a map's.
+    // The Sum, in the node's declared input order (wrist, overhead, side), not a map's, each
+    // term with the camera it came from (packet M15/N7) and N6's stacked sum as the body.
     assert!(
-        m.source
-            .contains("v4_out = torch.stack([v0_out, v1_out, v2_out], 0).sum(0)"),
+        m.source.contains(
+            "v4_out = _sum([v0_out, v1_out, v2_out], [\"rgb_wrist\", \"rgb_overhead\", \
+             \"rgb_side\"], keep_views)"
+        ),
         "{}",
         m.source
     );
+    assert!(
+        m.source.contains("return torch.stack(terms, 0).sum(0)"),
+        "{}",
+        m.source
+    );
+    // `keep_views` is a keyword only a `Sum` graph has, and it defaults to every view.
+    assert!(
+        m.source
+            .contains("def forward(self, keep_views=None, **inputs):"),
+        "{}",
+        m.source
+    );
+    assert_eq!(Contract::new(&m, &g).sum_views, VIEWS);
+    assert_eq!(es_policy::lower::sum_views(&g), VIEWS);
     // One claim for the group, none for the sharers.
     let claims: Vec<&String> = m.weight_keys.iter().filter(|k| k.ends_with(".*")).collect();
     assert_eq!(claims, ["nodes.1.*"]);
@@ -466,6 +483,7 @@ fn the_lowered_share_and_sum_equal_a_hand_written_module() {
         "owner": OWNER, "state": STATE_NODE, "head": HEAD,
         "views": VIEWS, "image": IMAGE, "state_dim": STATE, "width": W, "hidden": W,
         "horizon": HORIZON, "action_dim": ACTION_DIM, "execute": EXECUTE, "batch": 4,
+        "keep_views": true,
     });
     let out = Command::new(&python)
         .args(["-c", REF, &spec.to_string()])
@@ -546,11 +564,230 @@ fn the_lowered_share_and_sum_equal_a_hand_written_module() {
     assert_eq!(report[0]["member"], "n1", "{report:?}");
     assert_eq!(reply["init_backbone_loaded_exactly"], true, "{reply}");
 
+    // 5. Packet M15/N7: one camera kept is the hand-written module fed that camera alone,
+    //    and keeping every camera is the default forward -- both bitwise.
+    for view in VIEWS {
+        assert_eq!(reply["keep_views_bitwise"][view], true, "{view}: {reply}");
+    }
+    assert_eq!(reply["keep_every_view_is_default"], true, "{reply}");
+
     println!(
         "RAN the_lowered_share_and_sum_equal_a_hand_written_module: torch {}, bitwise over a \
-         batch of 4; one ResNet18 copy ({backbone} tensors under nodes.1); TorchRuntime sample \
-         0 max_abs {:.3e}; init_backbone -> {}",
+         batch of 4 (and with each camera alone); one ResNet18 copy ({backbone} tensors under \
+         nodes.1); TorchRuntime sample 0 max_abs {:.3e}; init_backbone -> {}",
         reply["torch"], e.max_abs, report[0]["member"]
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- single-view training (packet M15/N7) -----------------------------------------------------
+
+/// `es policy lower`'s two files for `g`, written directly: the trainer needs the module and
+/// its contract, not a bundle.
+fn module_dir(dir: &Path, g: &LearningGraph) -> PathBuf {
+    let m = lower_to_torch(g).expect("lowers");
+    let out = dir.join("module");
+    std::fs::create_dir_all(&out).expect("module dir");
+    std::fs::write(out.join("es_policy.py"), &m.source).expect("es_policy.py");
+    std::fs::write(
+        out.join("contract.json"),
+        serde_json::to_string_pretty(&Contract::new(&m, g)).expect("serialises"),
+    )
+    .expect("contract.json");
+    out
+}
+
+/// A synthetic bake in `es dataset bake`'s layout: two episodes of six frames, each camera
+/// its own pixel pattern (so dropping one changes the input), a ramp of states and actions.
+fn baked_dir(dir: &Path) -> PathBuf {
+    const FRAMES: u64 = 6;
+    let out = dir.join("baked");
+    std::fs::create_dir_all(&out).expect("baked dir");
+    let pixels: u64 = IMAGE.iter().product();
+    let mut episodes = Vec::new();
+    for e in 0..2u64 {
+        let mut file = Checkpoint::new();
+        for (i, view) in VIEWS.iter().enumerate() {
+            let values = (0..FRAMES * pixels)
+                .map(|j| ((j * 7 + 29 * i as u64 + 13 * e) % 256) as f32 / 255.0)
+                .collect();
+            let mut shape = vec![FRAMES];
+            shape.extend(IMAGE);
+            file.insert((*view).to_owned(), (shape, values));
+        }
+        let ramp = |w: u64| -> Vec<f32> {
+            (0..FRAMES * w)
+                .map(|j| 0.1 * ((j / w + 2 * e) as f32) * (1.0 + (j % w) as f32 / 4.0))
+                .collect()
+        };
+        file.insert("joint_state".to_owned(), (vec![FRAMES, STATE], ramp(STATE)));
+        let action = u64::from(ACTION_DIM);
+        file.insert("action".to_owned(), (vec![FRAMES, action], ramp(action)));
+        let name = format!("episode_{e:06}.safetensors");
+        std::fs::write(out.join(&name), write_safetensors(&file)).expect("episode");
+        episodes.push(serde_json::json!({"file": name, "frames": FRAMES}));
+    }
+    let mut tensors = serde_json::Map::new();
+    for view in VIEWS {
+        tensors.insert(
+            view.to_owned(),
+            serde_json::json!({"dtype": "F32", "shape": IMAGE}),
+        );
+    }
+    tensors.insert(
+        "joint_state".to_owned(),
+        serde_json::json!({"dtype": "F32", "shape": [STATE]}),
+    );
+    let manifest = serde_json::json!({
+        "schema_version": 1, "observation_hash": null, "episodes": episodes, "tensors": tensors,
+    });
+    std::fs::write(out.join("manifest.json"), manifest.to_string()).expect("manifest.json");
+    out
+}
+
+/// `train_act.py` for three steps at batch 2, a progress line per step, plus `extra`.
+/// Returns (exit code, the JSON lines on stdout, stderr).
+fn train(
+    python: &str,
+    module: &Path,
+    baked: &Path,
+    out: &Path,
+    extra: &[&str],
+) -> (Option<i32>, Vec<serde_json::Value>, String) {
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/es/train_act.py");
+    let run = Command::new(python)
+        .arg(&script)
+        .args(["--module", &module.to_string_lossy()])
+        .args(["--baked", &baked.to_string_lossy()])
+        .args(["--out", &out.to_string_lossy()])
+        .args([
+            "--checkpoint-at",
+            "3",
+            "--seed",
+            "0",
+            "--batch",
+            "2",
+            "--lr",
+            "1e-3",
+        ])
+        .args(["--device", "cpu", "--progress-every", "1"])
+        .args(extra)
+        .output()
+        .expect("run train_act.py");
+    let lines = String::from_utf8_lossy(&run.stdout)
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
+    (
+        run.status.code(),
+        lines,
+        String::from_utf8_lossy(&run.stderr).into_owned(),
+    )
+}
+
+/// Packet M15/N7's oracle: `--single-view 0.5` runs, and every step's logged loss is
+/// `loss_all + 0.5 * loss_single`, with the single-view term a different number (a camera's
+/// term really was dropped). Without the flag no line carries either term. And the trainer
+/// refuses the flag on a module whose contract lists no `sum_views`, or with a weight <= 0.
+#[test]
+fn single_view_training_logs_both_terms_of_its_loss() {
+    let python = match python() {
+        Ok(p) => p,
+        Err(why) => {
+            println!("SKIP single_view_training_logs_both_terms_of_its_loss: {why}");
+            return;
+        }
+    };
+    let dir = scratch("single-view");
+    let module = module_dir(&dir, &three_views(false));
+    let baked = baked_dir(&dir);
+
+    let (code, lines, err) = train(
+        &python,
+        &module,
+        &baked,
+        &dir.join("sv.safetensors"),
+        &["--single-view", "0.5"],
+    );
+    assert_eq!(code, Some(0), "{err}");
+    let progress: Vec<&serde_json::Value> =
+        lines.iter().filter_map(|l| l.get("progress")).collect();
+    assert_eq!(progress.len(), 3, "{lines:?}");
+    for p in &progress {
+        let f = |k: &str| p[k].as_f64().unwrap_or_else(|| panic!("{k} in {p}"));
+        let (loss, all, single) = (f("loss"), f("loss_all"), f("loss_single"));
+        // f32 arithmetic in torch against this f64 recomputation: a relative 1e-6.
+        assert!(
+            (loss - (all + 0.5 * single)).abs() <= 1e-6 * loss.abs().max(1.0),
+            "{p}: loss {loss} != {all} + 0.5 * {single}"
+        );
+        assert!(
+            (all - single).abs() > 1e-6,
+            "{p}: dropping two cameras' terms changed nothing"
+        );
+    }
+    let summary = lines.last().expect("a summary line");
+    let block = &summary["single_view"];
+    assert_eq!(block["weight"], 0.5, "{summary}");
+    assert_eq!(block["views"], serde_json::json!(VIEWS), "{summary}");
+    for key in [
+        "initial_loss_all",
+        "final_loss_all",
+        "initial_loss_single",
+        "final_loss_single",
+    ] {
+        assert!(block[key].as_f64().is_some(), "{key}: {summary}");
+    }
+
+    // Without the flag: the loop of before, so neither term appears anywhere.
+    let (code, lines, err) = train(
+        &python,
+        &module,
+        &baked,
+        &dir.join("plain.safetensors"),
+        &[],
+    );
+    assert_eq!(code, Some(0), "{err}");
+    for line in &lines {
+        let text = line.to_string();
+        assert!(
+            !text.contains("loss_all") && !text.contains("single_view"),
+            "{text}"
+        );
+    }
+
+    // Refused by name: a weight that is not above 0, and a module with no camera `Sum`.
+    let (code, _, err) = train(
+        &python,
+        &module,
+        &baked,
+        &dir.join("z.safetensors"),
+        &["--single-view", "0"],
+    );
+    assert_ne!(code, Some(0));
+    assert!(err.contains("--single-view is 0.0"), "{err}");
+    let contract = module.join("contract.json");
+    let mut json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&contract).expect("read")).expect("json");
+    json.as_object_mut().expect("an object").remove("sum_views");
+    std::fs::write(&contract, json.to_string()).expect("write");
+    let (code, _, err) = train(
+        &python,
+        &module,
+        &baked,
+        &dir.join("n.safetensors"),
+        &["--single-view", "0.5"],
+    );
+    assert_ne!(code, Some(0));
+    assert!(err.contains("lists no `sum_views`"), "{err}");
+
+    println!(
+        "RAN single_view_training_logs_both_terms_of_its_loss: {} steps, first step loss {} = \
+         {} + 0.5 * {}",
+        progress.len(),
+        progress[0]["loss"],
+        progress[0]["loss_all"],
+        progress[0]["loss_single"]
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

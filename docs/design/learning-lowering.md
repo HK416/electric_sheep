@@ -89,7 +89,7 @@ safetensors file before the first `forward`, and a missing key is an error, neve
 | `LanguageEncoder` | — | — | `Unsupported` |
 | `Fusion { Concat }` | `Linear(Σin, out_dim)`, or nothing when `Σin == out_dim` | `v = self.nk(torch.cat([a, b], dim=-1))` | exact / none |
 | `Fusion { TokenConcat }` | — | `v = torch.cat([a, b], dim=-2)` | none |
-| `Fusion { Sum }` | — | `v = torch.stack([a, b, c], 0).sum(0)` | none |
+| `Fusion { Sum }` | `_sum(terms, views, keep_views)` = `torch.stack(terms, 0).sum(0)` | `v = _sum([a, b, c], ["cam_a", …], keep_views)` | none |
 | `Fusion { CrossAttention, FiLm, AdaLn }` | — | — | `Unsupported` |
 | `TemporalEncoder { None }` | — | `v = x` | none |
 | `TemporalEncoder { Transformer }` | `nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=out_dim, nhead=8, batch_first=True), 1)` | `v = self.nk(x)` | prefix |
@@ -126,6 +126,12 @@ Notes on the entries that are not obvious:
   shape. Its terms are stacked in the node's **declared input order** (the document's order,
   never a map's), which fixes the sum's op order. Measured against a hand-written module (one
   ResNet18, the features added with `+`): bitwise on CPU (`crates/es-policy/tests/sum_share.rs`).
+  Each term carries the camera it came from, and a graph with a `Sum` gets
+  `forward(self, keep_views=None, **inputs)` (packet M15/N7): `None` on every inference path,
+  so every term is summed; `train_act.py --single-view` alone passes it, and a camera it does
+  not name has its term left out of the sum -- what a bundle without that camera computes,
+  not what a zero image would. `contract.json` lists the cameras as `sum_views` (absent when
+  empty). A graph without a `Sum` keeps `forward(self, **inputs)` byte for byte.
 - **`ActionChunker`.** Everything about it except `execute_chunk` — `replan_hz`, `mode`,
   `blend`, `buffer_chunks` — is runtime scheduling (spec 8.6), not a tensor operation. The
   lowering consumes `execute_chunk` and ignores the rest **by design**; the async buffer and

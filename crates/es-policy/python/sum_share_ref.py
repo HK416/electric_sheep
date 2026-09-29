@@ -26,6 +26,8 @@ Steps, all in this one process so both modules read the very same tensors:
      file through `TorchRuntime::load` (`validate_keys` included) and compare.
   4. With `pretrained_source`: `train_act.py`'s own `init_backbone` on the pretrained variant
      of the graph, which must find exactly one backbone -- the owner's -- to initialise.
+  5. With `keep_views` (packet M15/N7): the lowered module with one camera kept equals the
+     hand-written module fed that camera alone, bitwise.
 
 `INV-16`: weights cross as safetensors bytes, never `torch.load`, never `pickle`.
 """
@@ -120,6 +122,19 @@ def run(spec):
         "sample0_inputs": {k: v[0].reshape(-1).tolist() for k, v in inputs.items()},
         "sample0_actions": got[0].reshape(-1).tolist(),
     }
+
+    if spec.get("keep_views"):
+        # Packet M15/N7: `keep_views=(v,)` is the hand-written module given camera v alone --
+        # its term the only one summed -- and naming every camera is the default forward.
+        alone = {}
+        with torch.no_grad():
+            for view in views:
+                lowered_alone = model(keep_views=(view,), **inputs)["actions"]
+                ref_alone = ref([inputs[view]], inputs["joint_state"])
+                alone[view] = bool(torch.equal(lowered_alone, ref_alone))
+            everything = model(keep_views=tuple(views), **inputs)["actions"]
+        reply["keep_views_bitwise"] = alone
+        reply["keep_every_view_is_default"] = bool(torch.equal(everything, got))
 
     if spec.get("pretrained_source"):
         # `train_act.py` is run as a file, so it is read and executed here with no `__file__`,

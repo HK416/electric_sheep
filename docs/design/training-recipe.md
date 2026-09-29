@@ -61,6 +61,8 @@ interpreter   = "python"              # ES_PYTHON wins when it is set
 # schedule     = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
 # weight_decay = 0.01                 # AdamW's; absent is torch's own 1e-2
 # grad_clip    = 1.0                  # gradient-norm clip; absent is off
+# single_view  = { weight = 0.5 }     # IR route, views meeting in a Sum: MAD's single-view
+#                                     # loss (M15/N7, docs/design/multi-camera.md 3.3)
 ```
 
 Every table is `deny_unknown_fields`: a typo is a refusal, not a silently ignored knob. The

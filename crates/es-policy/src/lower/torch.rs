@@ -346,11 +346,34 @@ class _FlowHead(nn.Module):
         return x.reshape(-1, self.horizon, self.action_dim)
 ";
 
+/// `FusionKind::Sum` (spec 8.3, packets M15/N6 and N7), emitted once when the graph has one.
+///
+/// The terms arrive in the node's **declared input order** (the order the document lists
+/// them, never a map's), so the sum's op order is a property of the document, and the body is
+/// N6's `torch.stack(terms, 0).sum(0)` unchanged.
+///
+/// `keep_views` is the smallest honest way to expose single-view training (packet M15/N7): it
+/// is `None` on every inference path -- `TorchRuntime`, `es eval run`, the trainer's own probe
+/// -- and then every term is summed. Only `python/es/train_act.py --single-view` passes it: a
+/// camera not named in `keep_views` has its term **left out of the sum**, which is what a
+/// bundle deployed without that camera computes (design note `multi-camera.md` section 3.4),
+/// and not what a zero image would (a backbone does not map zeros to a zero feature). A term
+/// that is not a camera (`None`) is always kept. The dropped camera's encoder still runs; its
+/// output is discarded and receives no gradient.
+const SUM_PY: &str = r"
+
+def _sum(terms, views, keep_views):
+    if keep_views is not None:
+        terms = [t for t, v in zip(terms, views) if v is None or v in keep_views]
+    return torch.stack(terms, 0).sum(0)
+";
+
 /// A lowered graph: a complete `PyTorch` file plus the checkpoint contract it implies.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TorchModule {
     /// A self-contained Python file defining `class EsPolicy(nn.Module)` whose
-    /// `forward(**inputs) -> dict` takes the graph's declared input names.
+    /// `forward(**inputs) -> dict` takes the graph's declared input names. A graph with a
+    /// `Sum` fusion also takes `keep_views=None` ([`SUM_PY`], packet M15/N7).
     pub source: String,
     /// Safetensors keys this module needs. An entry ending in `.*` is a *prefix claim* over an
     /// opaque sub-module (a torchvision backbone, a `torch.nn` transformer) whose internal
@@ -416,7 +439,7 @@ pub fn lower_to_torch(graph: &LearningGraph) -> Result<TorchModule, LowerError> 
     for id in order {
         let node = &graph.nodes.nodes[&id];
         let args = inputs_of(graph, id, node)?;
-        let expr = lo.node_expr(id, node, &args)?;
+        let expr = lo.node_expr(id, node, &args, &port_views(graph, id, node))?;
         let out = node
             .outputs()
             .first()
@@ -478,6 +501,56 @@ fn inputs_of(
     Ok(args)
 }
 
+/// The camera each declared input port of `node` carries: the graph input read by the
+/// `VisionEncoder` whose output feeds that port, or `None` for any other source (packet
+/// M15/N7). Only a `Sum` reads it.
+fn port_views(graph: &LearningGraph, id: NodeId, node: &LearningNode) -> Vec<Option<String>> {
+    node.inputs()
+        .iter()
+        .map(|port| {
+            let edge = graph
+                .nodes
+                .edges
+                .iter()
+                .find(|e| e.to.node == id && e.to.port == port.name)?;
+            let LearningNode::VisionEncoder { inputs, .. } =
+                graph.nodes.nodes.get(&edge.from.node)?
+            else {
+                return None;
+            };
+            let image = &inputs.first()?.name;
+            let at = graph
+                .nodes
+                .inputs
+                .iter()
+                .position(|r| r.node == edge.from.node && r.port == *image)?;
+            graph.inputs.get(at).map(|p| p.name.clone())
+        })
+        .collect()
+}
+
+/// The cameras whose encoders meet in a `Sum` fusion, each once, in node-id order and then in
+/// each `Sum`'s declared input order (packet M15/N7): the names the lowered module's
+/// `keep_views` understands and `contract.json` lists as `sum_views`. `es train` refuses
+/// `[run] single_view` for a graph where this is empty.
+pub fn sum_views(graph: &LearningGraph) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (id, node) in &graph.nodes.nodes {
+        if let LearningNode::Fusion {
+            kind: FusionKind::Sum,
+            ..
+        } = node
+        {
+            for view in port_views(graph, *id, node).into_iter().flatten() {
+                if !out.contains(&view) {
+                    out.push(view);
+                }
+            }
+        }
+    }
+    out
+}
+
 /// The last dimension of a node's `i`-th declared input port — the feature width every module
 /// here is sized by.
 fn in_dim(node: &LearningNode, i: usize, id: NodeId) -> Result<u64, LowerError> {
@@ -506,6 +579,7 @@ struct Lowering {
     needs_sampler: bool,
     needs_ddpm: bool,
     needs_flow: bool,
+    needs_sum: bool,
     sharers: BTreeMap<u32, u32>,
 }
 
@@ -606,6 +680,7 @@ impl Lowering {
         id: NodeId,
         node: &LearningNode,
         args: &[String],
+        views: &[Option<String>],
     ) -> Result<String, LowerError> {
         let k = id.0;
         match node {
@@ -742,10 +817,26 @@ impl Lowering {
                         Ok(format!("torch.cat([{}], dim=-2)", args.join(", ")))
                     }
                     // `LRN-032` guarantees every term has the node's own shape, so there is no
-                    // projection and no weight. The terms are stacked in the node's declared
-                    // input order -- the order the document lists them, never a map's -- so
-                    // the sum's op order is a property of the document (packet M15/N6).
-                    FusionKind::Sum => Ok(format!("torch.stack([{}], 0).sum(0)", args.join(", "))),
+                    // projection and no weight. `_sum` stacks the terms in the node's declared
+                    // input order -- the order the document lists them, never a map's -- so the
+                    // sum's op order is a property of the document (packet M15/N6). Each term
+                    // carries the camera it came from, which only `--single-view` training ever
+                    // reads (packet M15/N7).
+                    FusionKind::Sum => {
+                        self.needs_sum = true;
+                        let views: Vec<String> = views
+                            .iter()
+                            .map(|v| {
+                                v.as_ref()
+                                    .map_or_else(|| "None".to_owned(), |v| format!("{v:?}"))
+                            })
+                            .collect();
+                        Ok(format!(
+                            "_sum([{}], [{}], keep_views)",
+                            args.join(", "),
+                            views.join(", ")
+                        ))
+                    }
                     other => Err(unsupported("Fusion", other)),
                 }
             }
@@ -986,13 +1077,22 @@ impl Lowering {
         if self.needs_flow {
             source.push_str(FLOW_PY);
         }
+        if self.needs_sum {
+            source.push_str(SUM_PY);
+        }
         source.push_str(
             "\n\nclass EsPolicy(nn.Module):\n    def __init__(self):\n        super().__init__()\n",
         );
         for m in &self.members {
             let _ = writeln!(source, "{m}");
         }
-        source.push_str("\n    def forward(self, **inputs):\n");
+        // `keep_views` only where a `Sum` reads it, so every other graph's source is the
+        // source it always was (packet M15/N7).
+        source.push_str(if self.needs_sum {
+            "\n    def forward(self, keep_views=None, **inputs):\n"
+        } else {
+            "\n    def forward(self, **inputs):\n"
+        });
         for line in &self.body {
             let _ = writeln!(source, "{line}");
         }

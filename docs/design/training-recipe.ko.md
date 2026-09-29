@@ -59,6 +59,8 @@ interpreter   = "python"              # ES_PYTHON이 설정되어 있으면 그�
 # schedule     = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
 # weight_decay = 0.01                 # AdamW의 것. 없으면 torch 자신의 1e-2
 # grad_clip    = 1.0                  # 그래디언트 노름 클립. 없으면 끔
+# single_view  = { weight = 0.5 }     # IR 경로, 시점들이 Sum에서 만나는 그래프: MAD의 단일 시점
+#                                     # 손실(M15/N7, docs/design/multi-camera.md 3.3)
 ```
 
 모든 테이블이 `deny_unknown_fields`다. 오타는 조용히 무시되는 손잡이가 아니라 거절이다.
