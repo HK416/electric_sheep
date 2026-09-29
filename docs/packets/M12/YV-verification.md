@@ -79,3 +79,57 @@ On Windows, with the editor as a first-time user sees it: start → template car
 Start (short) → watch ③ and ④ → ⑤ → play a failed episode → Run again. Screenshots of each
 screen in both languages under `target/plan-y/yv/`, and every place the reader had to guess
 written down as a follow-up.
+
+## Results, 2026-09-29 (this PC: Windows 11, RTX 3060 12 GB, 64 GB RAM, 4 GB page file)
+
+Environment, set up for this run: `.venv` with Python 3.12.10, `torch 2.11.0+cu128` and
+`torchvision 0.26.0+cu128` (the server's `+cu129` build has no Windows wheel; 2.11 is what
+`lerobot 0.6.1` allows, `torch<2.12`), `lerobot[training] 0.6.1`, `mujoco 3.13.0`; `es` built with
+`--features render`. `torchcodec 0.11.1` cannot load without FFmpeg's shared libraries; LeRobot
+falls back to `pyav` and nothing here decodes video (the export writes `image`). Every run below
+was made by the editor's own model (`Project::create`, `write_run`) and launched with the argv the
+editor's Start uses, `--telemetry-image-every 50` included.
+
+**Item 1 — both cards run end to end: yes, after three fixes.**
+
+| | hint card (IR route) | camera-only card (LeRobot route) |
+|---|---|---|
+| collect | 200/200 successful demonstrations, 103,881 frames, 26.4 min | 200/200, 26.2 min |
+| expert gate | passed, 2.1 min | passed, 3.4 min (the `XIR-040` gate of Y5 is gone: Y5b holds on a real run) |
+| train (short, 5,000 steps) | 2.3 min, ~480 samples/s | export + 5,000 LeRobot steps at ~16 steps/s, ~11 min |
+| eval (96 episodes, 6 workers) | 7.3 min | 9 min |
+| showcase | 0.5 min | 0.5 min |
+| held-out nominal | **0/16**; all suites 6/96 | **0/16**; all suites 0/96 |
+| `envelope_violation_rate` (nominal) | **0.996** | 0.12 |
+| verdict | did not pass (exit 1) | did not pass (exit 1) |
+
+Neither number is a surprise at the short preset: the hint recipe was written for 20,000 steps
+and U3 passed only with the pretrained backbone and augmentation; the camera-only route had never
+passed. The hint card's plane changed 99.6 % of the policy's steps — M11's open human decision
+"the envelope for a learning policy", now seen from the editor.
+
+What the first real runs found, each fixed and merged before the numbers above:
+- **P-M12-R1** — the v3 export wrote one 2.9 GB row group; `pyarrow` cannot read a nested column
+  past 2 GB from one row group, so `lerobot-train` refused the dataset. One row group per episode.
+- **P-M12-R2** — the LeRobot route published no training progress, so the editor's light read
+  *not responding* while training was healthy. `lerobot-train`'s bar and metric lines now feed
+  stream 5.
+- **P-M12-R3** — the editor never noticed a closed telemetry connection, so a run that had ended
+  (or been resumed elsewhere) read *not responding* forever. Closed now ends the attachment and
+  `telemetry.txt` is re-dialled every 10 s.
+- **Unexplained, once:** the camera card's first evaluation lost one worker's MuJoCo process
+  (`backend process died: … (os error 232)`), while two agents were compiling on the same PC. The
+  same shard alone and the whole evaluation re-run on a quiet PC both completed; commit peaked at
+  41.7 GB of a 67.9 GB limit. The cause is not proven: the backend's own last words are discarded
+  (`proc.rs` nulls stderr, and a failed write never reads the error line the script leaves on
+  stdout) — the follow-up is to surface them, then see it again.
+
+**Item 2 — `episodes.json` agrees with `report.json`: yes**, exactly, in all six suites of both
+runs (successes ÷ rows = `success_rate`).
+
+**Item 5 (partly)** — the lengths in minutes, short preset, this PC: hint ≈ 39 min end to end;
+camera-only ≈ 50 min without the interruptions.
+
+Not yet run: items 3 (evaluate-so-far, the process tree on Stop), 4 (the light's thresholds on a
+recorded run), 6 (medium/long), 7 (the two cards' demonstrations compared), 8 (the whole flow by
+hand).
