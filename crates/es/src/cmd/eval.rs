@@ -48,13 +48,14 @@ under --out:
 `episodes/` replay is not produced (M2 packet CLI-eval-run-import; --frames below is what
 renders a run); `report.html` carries no failure-episode links because of that.
 
-With --frames <dir> the run also renders the Task IR's one image channel from the scene's
-own camera, which is what lets an Observation IR with an image input be evaluated at all
+With --frames <dir> the run also renders each image input's channel from the scene's own
+camera, which is what lets an Observation IR with image inputs be evaluated at all
 (spec 7.2). It writes one subdirectory per cell -- a cell being one episode of one suite,
-named `<suite>-<NN>` -- holding `<NNNNNN>.bin` plus one `layout.json`, and an `events.json`
-under --out with one { frame, tick, source, events } record per frame. That is exactly what
-`es video mosaic` reads. It needs the `render` feature and a Vulkan device; a build without
-the feature refuses the flag rather than running with no frames.
+named `<suite>-<NN>` -- holding `<NNNNNN>.bin` plus one `layout.json` (with several image
+inputs, one `<cell>/<channel>/` of those per input), and an `events.json` under --out with
+one { frame, tick, source, events } record per frame. That is exactly what `es video
+mosaic` reads. It needs the `render` feature and a Vulkan device; a build without the
+feature refuses the flag rather than running with no frames.
 
 With --jobs N (default 1) the evaluation's (suite, episode) units are partitioned round-robin
 over N worker processes: this same binary, re-invoked as `es eval run --shard i/N --shard-out
@@ -545,20 +546,30 @@ fn run_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
     // (design note section 7.4).
     #[cfg(feature = "render")]
     if frames_dir.is_some() {
-        let rcfg = renderer_cfg(bundle)?;
+        let cameras = renderer_cfgs(bundle)?;
         let gpu = es_gpu::Gpu::open(es_gpu::GpuOptions::default())
             .map_err(|e| CliError::Runtime(format!("no Vulkan device for --frames: {e}")))?;
-        let mut rig = LightRig::new(&gpu, scene.clone(), rcfg);
+        // One rig per image input, keyed by the plan input's name (packet M15/N2). A rig
+        // builds its renderer on its first frame, so a camera no input reads costs nothing.
+        let mut rigs: std::collections::BTreeMap<String, LightRig<'_>> = cameras
+            .into_iter()
+            .map(|(input, cfg)| (input, LightRig::new(&gpu, scene.clone(), cfg)))
+            .collect();
         let mut source =
-            |drawn: &es_env::randomize::RenderOverrides,
+            |input: &str,
+             drawn: &es_env::randomize::RenderOverrides,
              model: &es_physics_core::backend::ModelInfo,
              state: &es_physics_core::backend::StateView<'_>| {
                 // `--expert`: the raw `qpos ‖ qvel` row on its way past, because the runner
                 // hands the frame source the full state immediately before it calls the
-                // policy and the demo's Observation IR carries no cube pose.
+                // policy and the demo's Observation IR carries no cube pose. Once per image
+                // input of a step; the row is the same state each time.
                 if let Some(seen) = seen {
                     seen.capture(model, state);
                 }
+                let rig = rigs.get_mut(input).ok_or_else(|| {
+                    format!("image input {input} reads no image channel of the Task IR")
+                })?;
                 rig.frame(drawn, model, state)
             };
         return run(Some(&mut source), sink.as_deref_mut());
@@ -569,32 +580,24 @@ fn run_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
     run(None, sink)
 }
 
-/// The renderer `--frames` needs, built from what the bundle's Task IR already declares.
+/// The renderers `--frames` needs, built from what the bundle's Task IR already declares.
 ///
-/// The same rule `es loop collect --frames` follows (`crates/es/src/cmd/loop.rs`): one image
+/// The same rule `es loop collect --frames` follows (`es_tools::frame_cameras`): every image
 /// channel, rendered from the camera its `Frame` names, at the `ImageSpec` the IR declares --
 /// so a scene whose camera produces something else is refused rather than silently resampled
-/// (`INV-14`).
+/// (`INV-14`). Keyed by the name of the observation-plan input that reads the channel, which
+/// is its sensor id (`CpuPlan`, spec 7.4): each image port gets its own camera's frame.
 #[cfg(feature = "render")]
-fn renderer_cfg(bundle: &PolicyBundle) -> Result<es_env::EnvRendererCfg, CliError> {
-    let (name, frame, spec, render) = image_channel(&bundle.task)?;
-    let es_ir::types::Frame::Camera(camera) = frame else {
-        return Err(CliError::Runtime(format!(
-            "image channel {name:?} is not in a camera frame, so there is no camera to render \
-             it from"
-        )));
-    };
-    Ok(es_env::render::sensor_cfg(camera, &spec, &render, None))
+fn renderer_cfgs(bundle: &PolicyBundle) -> Result<Vec<(String, es_env::EnvRendererCfg)>, CliError> {
+    let channels = &bundle.task.observation_spec.channels;
+    Ok(es_tools::frame_cameras(&bundle.task, None)?
+        .into_iter()
+        .filter_map(|(name, cfg)| match channels[&name].source {
+            es_ir::task::ObsSource::Sensor { id, .. } => Some((id.to_string(), cfg)),
+            _ => None,
+        })
+        .collect())
 }
-
-/// The one image channel a `--frames` render is of (spec 7.4, packet M7/R5).
-///
-/// Lives in `es-tools` since packet `docs/packets/M10/W3b-es-tools-split.md`, because
-/// `es video showcase` needs it too; re-exported here so `es loop collect --frames` still
-/// reaches it at `crate::cmd::eval::image_channel` and the three commands cannot disagree
-/// about which channel is being rendered or about how.
-#[cfg(feature = "render")]
-pub(crate) use es_tools::image_channel;
 
 /// One camera, rendered under one episode's lighting (spec 10.2).
 ///

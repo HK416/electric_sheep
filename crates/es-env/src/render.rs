@@ -15,8 +15,9 @@
 //! Three deliberate limits, each stated rather than hidden:
 //!
 //! * the whole scene is re-tessellated and re-uploaded per frame (design note section 7.1);
-//! * one camera, because `MultiViewPack` is rejected by plan lowering
-//!   (`crates/es-compile/src/plan.rs:545`);
+//! * several cameras are independent `ImageInput` chains, one atlas tile each
+//!   ([`EnvRenderer::views`], spec 15.2, packet M15/N2) -- not `MultiViewPack`, which plan
+//!   lowering still rejects (`crates/es-compile/src/plan.rs`);
 //! * the declared `ImageSpec` is **checked**, never resampled to fit ([`EnvRenderer::check`],
 //!   spec 7.2, spec 26.1, `INV-14`).
 
@@ -252,7 +253,7 @@ pub fn drawn_frame(
     let mut tri = cache
         .tri_scene(scene, world)
         .map_err(|e| EnvError::Unsupported(format!("tessellation: {e}")))?;
-    let mut view = camera_view(scene, cfg, world)?;
+    let view = drawn_view(scene, cfg, ov, world)?;
     let mut rc = render_config(cfg);
     if ov.is_identity() {
         return Ok((tri, view, rc));
@@ -305,12 +306,26 @@ pub fn drawn_frame(
         }
     }
 
+    Ok((tri, view, rc))
+}
+
+/// The camera `cfg` names under `ov`'s draw for it: [`camera_view`], then the drawn offset
+/// composed on the right of its `OpenCV` pose and `fx`, `fy` times the focal scale about the
+/// principal point (`INV-14`). A camera with no draw is exactly [`camera_view`] -- the part of
+/// [`drawn_frame`] that is per camera, so several cameras of one frame share the rest.
+fn drawn_view(
+    scene: &SceneDesc,
+    cfg: &EnvRendererCfg,
+    ov: &RenderOverrides,
+    world: &BTreeMap<StableId, Pose>,
+) -> Result<CameraView, EnvError> {
+    let mut view = camera_view(scene, cfg, world)?;
     if let Some(d) = ov.cameras.get(&cfg.camera) {
         view.pose = view.pose.compose(d.pose());
         view.spec.intrinsics.fx = d.zoom(view.spec.intrinsics.fx);
         view.spec.intrinsics.fy = d.zoom(view.spec.intrinsics.fy);
     }
-    Ok((tri, view, rc))
+    Ok(view)
 }
 
 /// A camera that is **not** in the scene: eye, aim point and vertical field of view.
@@ -374,7 +389,9 @@ fn quat_from_basis(x: Vec3, y: Vec3, z: Vec3) -> Quat {
     }
 }
 
-/// One camera rendered from a running env's state, frame after frame.
+/// The cameras of one env rendered from its running state, frame after frame -- one camera
+/// ([`Self::new`]) or every image channel of a Task IR ([`Self::views`], packet M15/N2), one
+/// atlas tile each, in one dispatch (spec 15.2).
 ///
 /// A concrete struct, not a trait: `INV-17` allows seven extension points and this is none of
 /// them. It is not stored inside [`Env`](crate::Env) either — the `&Gpu` borrow would put a
@@ -383,7 +400,10 @@ fn quat_from_basis(x: Vec3, y: Vec3, z: Vec3) -> Quat {
 #[derive(Debug)]
 pub struct EnvRenderer<'gpu> {
     renderer: Renderer<'gpu>,
-    cfg: EnvRendererCfg,
+    /// Every camera, under the name its caller gave it (the Task IR channel), in the order its
+    /// tiles come back. They differ in `camera` and `frames_dir` only ([`Self::views`]), so the
+    /// first one's config is the renderer's.
+    cameras: Vec<(String, EnvRendererCfg)>,
     /// Kept whole: every frame re-poses the bodies (design note 7.1).
     scene: SceneDesc,
     /// The per-geom local tessellation, computed once and re-posed per frame (design note
@@ -398,21 +418,59 @@ pub struct EnvRenderer<'gpu> {
 }
 
 impl<'gpu> EnvRenderer<'gpu> {
+    /// One camera: exactly the renderer every caller had before packet M15/N2.
     pub fn new(
         gpu: &'gpu es_gpu::Gpu,
         scene: &SceneDesc,
         cfg: EnvRendererCfg,
     ) -> Result<Self, EnvError> {
-        let rc = render_config(&cfg);
+        Self::views(gpu, scene, vec![(String::new(), cfg)])
+    }
+
+    /// Several cameras of one env (packet M15/N2): `cameras` by name, each with the config
+    /// [`sensor_cfg`] made of its own channel, all rendered per frame into one atlas and one
+    /// dispatch (spec 15.2), each tile bit for bit what [`Self::new`] renders of that camera
+    /// alone.
+    ///
+    /// One renderer draws them all, so they must agree on everything but the camera and where
+    /// its frames go: a camera declared at another size, channel, path, exposure, tonemap or
+    /// seed stream is refused by name rather than rendered under the first one's.
+    pub fn views(
+        gpu: &'gpu es_gpu::Gpu,
+        scene: &SceneDesc,
+        cameras: Vec<(String, EnvRendererCfg)>,
+    ) -> Result<Self, EnvError> {
+        let Some((first_name, first)) = cameras.first() else {
+            return Err(EnvError::Task("a renderer needs a camera".to_owned()));
+        };
+        for (name, cfg) in &cameras[1..] {
+            let alike = EnvRendererCfg {
+                camera: first.camera,
+                frames_dir: first.frames_dir.clone(),
+                ..cfg.clone()
+            };
+            if alike != *first {
+                return Err(EnvError::Unsupported(format!(
+                    "camera {name:?} is declared to render differently from {first_name:?}; one \
+                     env's cameras share one renderer, so they share its size, channel, path, \
+                     exposure, tonemap and seed stream"
+                )));
+            }
+        }
+        let mut rc = render_config(first);
         let base_seed = rc.seed;
+        // One row of one tile per camera; one camera is the one-tile row `config` built.
+        rc.atlas = TileAtlasCfg::row(first.width, first.height, cameras.len() as u32);
         let renderer =
             Renderer::new(gpu, rc).map_err(|e| EnvError::Unsupported(format!("renderer: {e}")))?;
         // Fail at construction rather than on the first frame: a camera the scene does not
         // have is a configuration error, not a run-time one.
-        camera_view(scene, &cfg, &BTreeMap::new())?;
+        for (_, cfg) in &cameras {
+            camera_view(scene, cfg, &BTreeMap::new())?;
+        }
         Ok(Self {
             renderer,
-            cfg,
+            cameras,
             scene: scene.clone(),
             cache: es_render::SceneCache::default(),
             frame: 0,
@@ -435,12 +493,12 @@ impl<'gpu> EnvRenderer<'gpu> {
         self.episode_frame = 0;
     }
 
-    /// The renderer's `ImageSpec` subset, in Observation IR terms.
+    /// The first camera's `ImageSpec` subset, in Observation IR terms.
     pub fn image_spec(&self) -> ImageSpec {
-        image_spec(&self.scene, &self.cfg).expect("the camera was resolved in `new`")
+        image_spec(&self.scene, self.cfg()).expect("the camera was resolved in `new`")
     }
 
-    /// [`check_image_spec`] against this renderer's own spec.
+    /// [`check_image_spec`] against the first camera's own spec.
     pub fn check(&self, declared: &ImageSpec) -> Result<(), EnvError> {
         check_image_spec(&self.image_spec(), declared)
     }
@@ -467,6 +525,9 @@ impl<'gpu> EnvRenderer<'gpu> {
     /// so the identity after a draw renders today's frame again. A drawn field of view is
     /// written into the frame's sidecar as `intrinsics` (`INV-14`); a frame with no camera
     /// draw writes the sidecar it always did.
+    ///
+    /// The first camera's tile: the only one of a renderer [`Self::new`] built. Every camera's
+    /// is [`Self::frames_with`].
     pub fn frame_with(
         &mut self,
         model: &ModelInfo,
@@ -474,40 +535,82 @@ impl<'gpu> EnvRenderer<'gpu> {
         env: u32,
         ov: &RenderOverrides,
     ) -> Result<Tile, EnvError> {
+        Ok(self.frames_with(model, state, env, ov)?.swap_remove(0).1)
+    }
+
+    /// Every camera's frame of `env` under `ov`, by name, in the order [`Self::views`] was
+    /// given, each written to its own `frames_dir` when it has one (packet M15/N2).
+    ///
+    /// One camera takes exactly the path [`Self::frame_with`] always took. Several share one
+    /// tessellation, one lighting and one dispatch: `Renderer::render_batch` with the posed
+    /// scene once per camera, which keys each tile's samples as its own single render keys
+    /// them -- so every tile is bit for bit that camera rendered alone, `Pt` included (packet
+    /// M11/X3b). A plain several-view `Renderer::render` would key view `k`'s samples with
+    /// `k` and break that on the path tracer.
+    pub fn frames_with(
+        &mut self,
+        model: &ModelInfo,
+        state: &StateView<'_>,
+        env: u32,
+        ov: &RenderOverrides,
+    ) -> Result<Vec<(String, Tile)>, EnvError> {
         let world = body_poses(model, state, env);
-        let (tri, view, rc) = drawn_frame(&self.scene, &self.cfg, ov, &world, &mut self.cache)?;
-        // Parameters only (`Renderer::set_lighting`): no pipeline is rebuilt per episode.
-        self.renderer.set_lighting(&rc);
-        // The sample keys of this tick (packet M10/W1a). `Fixed` is left alone rather than
-        // re-set to the same number, so the default path does not even touch the config.
-        if self.cfg.seed_stream == SeedStream::Tick {
-            self.renderer.set_seed(frame_seed(
-                self.cfg.seed_stream,
-                self.base_seed,
-                self.episode_frame,
-            ));
+        let (channel, seed_stream) = (self.cfg().channel, self.cfg().seed_stream);
+        let (tri, view, mut rc) =
+            drawn_frame(&self.scene, &self.cameras[0].1, ov, &world, &mut self.cache)?;
+        let mut views = vec![view];
+        for (_, cfg) in &self.cameras[1..] {
+            views.push(drawn_view(&self.scene, cfg, ov, &world)?);
         }
-        self.renderer
-            .upload_tris(tri)
-            .map_err(|e| EnvError::Unsupported(format!("scene upload: {e}")))?;
-        let mut atlas = self
-            .renderer
-            .render(&[view])
-            .map_err(|e| EnvError::Unsupported(format!("render: {e}")))?;
-        let tile = atlas
-            .read_tile(0, self.cfg.channel)
-            .map_err(|e| EnvError::Unsupported(format!("readback: {e}")))?;
-        if let Some(dir) = &self.cfg.frames_dir {
-            let drawn = ov
-                .cameras
-                .contains_key(&self.cfg.camera)
-                .then_some(&view.spec.intrinsics);
-            tile.write_to_with_intrinsics(dir, &format!("{:06}", self.frame), drawn)
-                .map_err(|e| EnvError::Unsupported(format!("frame write: {e}")))?;
+        let seed = frame_seed(seed_stream, self.base_seed, self.episode_frame);
+        let tiles = if let [view] = views[..] {
+            // Parameters only (`Renderer::set_lighting`): no pipeline is rebuilt per episode.
+            self.renderer.set_lighting(&rc);
+            // The sample keys of this tick (packet M10/W1a). `Fixed` is left alone rather than
+            // re-set to the same number, so the default path does not even touch the config.
+            if seed_stream == SeedStream::Tick {
+                self.renderer.set_seed(seed);
+            }
+            self.renderer
+                .upload_tris(tri)
+                .map_err(|e| EnvError::Unsupported(format!("scene upload: {e}")))?;
+            let mut atlas = self
+                .renderer
+                .render(&[view])
+                .map_err(|e| EnvError::Unsupported(format!("render: {e}")))?;
+            vec![atlas
+                .read_tile(0, channel)
+                .map_err(|e| EnvError::Unsupported(format!("readback: {e}")))?]
+        } else {
+            rc.seed = seed;
+            let cams: Vec<_> = views
+                .iter()
+                .map(|v| (tri.clone(), *v, rc.clone()))
+                .collect();
+            self.renderer
+                .render_batch(&cams)
+                .and_then(|mut atlas| atlas.read_tiles(channel))
+                .map_err(|e| EnvError::Unsupported(format!("render: {e}")))?
+        };
+        let stem = format!("{:06}", self.frame);
+        for (((_, cfg), tile), view) in self.cameras.iter().zip(&tiles).zip(&views) {
+            if let Some(dir) = &cfg.frames_dir {
+                let drawn = ov
+                    .cameras
+                    .contains_key(&cfg.camera)
+                    .then_some(&view.spec.intrinsics);
+                tile.write_to_with_intrinsics(dir, &stem, drawn)
+                    .map_err(|e| EnvError::Unsupported(format!("frame write: {e}")))?;
+            }
         }
         self.frame += 1;
         self.episode_frame += 1;
-        Ok(tile)
+        Ok(self
+            .cameras
+            .iter()
+            .map(|(name, _)| name.clone())
+            .zip(tiles)
+            .collect())
     }
 
     /// Frames produced so far — the next one's `<NNNNNN>` stem.
@@ -520,8 +623,9 @@ impl<'gpu> EnvRenderer<'gpu> {
         self.episode_frame
     }
 
+    /// The first camera's config, which is every camera's but for `camera` and `frames_dir`.
     pub fn cfg(&self) -> &EnvRendererCfg {
-        &self.cfg
+        &self.cameras[0].1
     }
 }
 
@@ -535,6 +639,9 @@ impl<'gpu> EnvRenderer<'gpu> {
 ///
 /// No `frames_dir`: the per-frame files are [`EnvRenderer`]'s, whose callers (the collector,
 /// the evaluator, the showcase) render one env.
+///
+/// One camera per env: its one caller, `Rollout`, observes one image. Several cameras of one
+/// env are [`EnvRenderer::views`] (packet M15/N2); envs x views would tile the same way.
 #[derive(Debug)]
 pub struct EnvBatchRenderer<'gpu> {
     renderer: Renderer<'gpu>,

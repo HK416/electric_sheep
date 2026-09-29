@@ -1527,3 +1527,222 @@ fn pt_batched_cost() {
     );
     println!("RAN {test}");
 }
+
+// --- packet M15/N2: several cameras of one env ------------------------------------------------
+
+/// The fixture scene with a second camera bolted to the cube, 25 cm above it and looking down
+/// its body's `-Z` (an MJCF camera's view axis): a body-mounted camera whose picture moves
+/// when, and only when, its body does. Its id is new; every other id stays the fixture's.
+fn with_cube_camera(scene: &SceneDesc) -> (SceneDesc, StableId) {
+    let mut scene = scene.clone();
+    let id = StableId::from_path("camera/test_on_cube");
+    scene.cameras.push(es_assets::scene::Camera {
+        id,
+        name: "test_on_cube".to_owned(),
+        body: Some(by_name(&scene, "cube").id),
+        pose: Pose::new(Vec3::new(0.0, 0.0, 0.25), Quat::IDENTITY),
+        fovy: 70f64.to_radians(),
+    });
+    (scene, id)
+}
+
+/// Packet M15/N2 oracle 1: `EnvRenderer::views` renders an env's cameras in one dispatch, and
+/// each camera's tile is **bit for bit** that camera rendered alone by `EnvRenderer::new` --
+/// the fixed overhead camera and a body-mounted one, each under its own camera draw, at two
+/// poses of the body, on `Rs` and on `Pt` 4 spp NEE + SVGF under `seed = "tick"`. The two
+/// cameras' tiles differ (two pictures, not one reused), the body-mounted camera's picture
+/// moves with its body, each camera's frames go to its own directory, and a camera declared
+/// to render differently from the first is refused by name.
+#[test]
+fn several_cameras_render_as_each_camera_alone() {
+    let test = "several_cameras_render_as_each_camera_alone";
+    let Some(gpu) = open(test) else { return };
+    let (scene, on_cube) = with_cube_camera(&scene());
+    let spec = image_spec(&scene, &cfg(&scene)).expect("the overhead camera resolves");
+    let poses = [
+        fixed(&scene),
+        Fixed::new(
+            &scene,
+            Pose::new(CUBE_POS + Vec3::new(0.05, -0.08, 0.0), Quat::IDENTITY),
+        ),
+    ];
+    let pt = es_ir::task::SensorRender {
+        path: es_ir::task::SensorPath::Pt { spp: 4, bounces: 3 },
+        svgf: true,
+        ..pt_sensor(es_ir::task::SeedStream::Tick)
+    };
+    let dir = std::env::temp_dir().join(format!("es-env-views-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    for (label, render, base) in [
+        ("Rs", es_ir::task::SensorRender::default(), "task.toml"),
+        ("Pt 4 spp NEE + SVGF, seed = tick", pt, "task-pt.toml"),
+    ] {
+        let overhead_cfg = sensor_cfg(overhead(&scene), &spec, &render, None);
+        let cube_cfg = EnvRendererCfg {
+            camera: on_cube,
+            ..overhead_cfg.clone()
+        };
+        let frames = dir.join(label.split(' ').next().expect("a label"));
+        let mut both = EnvRenderer::views(
+            &gpu,
+            &scene,
+            vec![
+                (
+                    "rgb_overhead".to_owned(),
+                    EnvRendererCfg {
+                        frames_dir: Some(frames.join("rgb_overhead")),
+                        ..overhead_cfg.clone()
+                    },
+                ),
+                (
+                    "rgb_cube".to_owned(),
+                    EnvRendererCfg {
+                        frames_dir: Some(frames.join("rgb_cube")),
+                        ..cube_cfg.clone()
+                    },
+                ),
+            ],
+        )
+        .expect("two cameras, one renderer");
+        let mut alone = [
+            EnvRenderer::new(&gpu, &scene, overhead_cfg.clone()).expect("renderer"),
+            EnvRenderer::new(&gpu, &scene, cube_cfg).expect("renderer"),
+        ];
+        // Each camera its own draw of pose and field of view, keyed by its id.
+        let mut targets = dr_targets(&scene);
+        targets.push(("camera.test_on_cube.fov".to_owned(), uniform(0.85, 1.15)));
+        targets.push((
+            "camera.test_on_cube.pose.yaw".to_owned(),
+            uniform(-4.0, 4.0),
+        ));
+        if base == "task-pt.toml" {
+            targets.push(("light.radiance".to_owned(), uniform(1.5, 3.0)));
+        }
+        let ov = dr_draw(&dr_task(base, &targets), &scene, &poses[0].model, 0);
+        assert!(ov.cameras.contains_key(&overhead(&scene)) && ov.cameras.contains_key(&on_cube));
+
+        let mut on_cube_frames = Vec::new();
+        for (k, f) in poses.iter().enumerate() {
+            let tiles = both
+                .frames_with(&f.model, &f.state(), 0, &ov)
+                .expect("frames");
+            let names: Vec<&str> = tiles.iter().map(|(n, _)| n.as_str()).collect();
+            assert_eq!(names, ["rgb_overhead", "rgb_cube"], "in the order given");
+            for ((name, tile), single) in tiles.iter().zip(&mut alone) {
+                let want = single
+                    .frame_with(&f.model, &f.state(), 0, &ov)
+                    .expect("frame")
+                    .to_bytes();
+                assert!(
+                    tile.to_bytes() == want,
+                    "{label}, pose {k}: camera {name} differs from its own render"
+                );
+                let on_disk = std::fs::read(frames.join(name).join(format!("{k:06}.bin")))
+                    .expect("the camera's own frame file");
+                assert!(on_disk == want, "{label}, pose {k}: {name}'s file");
+            }
+            assert!(
+                tiles[0].1.to_bytes() != tiles[1].1.to_bytes(),
+                "{label}, pose {k}: two cameras, one picture"
+            );
+            on_cube_frames.push(tiles[1].1.to_bytes());
+        }
+        assert!(
+            on_cube_frames[0] != on_cube_frames[1],
+            "{label}: the body-mounted camera did not follow its body"
+        );
+        println!("{test}: {label}, 2 cameras x 2 poses, every tile bit-equal to its own render");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let wider = EnvRendererCfg {
+        camera: on_cube,
+        width: W * 2,
+        ..cfg(&scene)
+    };
+    let err = EnvRenderer::views(
+        &gpu,
+        &scene,
+        vec![("a".to_owned(), cfg(&scene)), ("b".to_owned(), wider)],
+    )
+    .expect_err("a camera at another size");
+    assert!(err.to_string().contains("camera \"b\""), "{err}");
+    println!("RAN {test}");
+}
+
+/// What each extra camera costs `EnvRenderer::views` per frame, whole-frame (re-pose, BVH
+/// build, upload, dispatch, readback), against one camera, on the demo's `Rs` sensor and a
+/// `Pt` 16 spp one. Run with `cargo test -p es-env --features render --test render_loop
+/// --release -- --ignored --nocapture views_cost`.
+#[test]
+#[ignore = "measurement; run explicitly"]
+fn views_cost() {
+    use std::time::Instant;
+
+    const FRAMES: u32 = 16;
+    let test = "views_cost";
+    let Some(gpu) = open(test) else { return };
+    let (scene, on_cube) = with_cube_camera(&scene());
+    let f = fixed(&scene);
+    let spec = image_spec(&scene, &cfg(&scene)).expect("the overhead camera resolves");
+    let pt = es_ir::task::SensorRender {
+        path: es_ir::task::SensorPath::Pt {
+            spp: 16,
+            bounces: 3,
+        },
+        ..pt_sensor(es_ir::task::SeedStream::Fixed)
+    };
+    println!("\n{}", gpu.capabilities().device_name);
+    println!("| path | cameras | ms/frame | ms per extra camera |");
+    println!("|---|---|---|---|");
+    for (label, render) in [
+        ("Rs", es_ir::task::SensorRender::default()),
+        ("Pt 16 spp", pt),
+    ] {
+        let one = sensor_cfg(overhead(&scene), &spec, &render, None);
+        let mut base_ms = 0.0;
+        for n in 1..=3usize {
+            let cams: Vec<(String, EnvRendererCfg)> = (0..n)
+                .map(|k| {
+                    let camera = if k % 2 == 0 { one.camera } else { on_cube };
+                    (
+                        format!("c{k}"),
+                        EnvRendererCfg {
+                            camera,
+                            ..one.clone()
+                        },
+                    )
+                })
+                .collect();
+            let mut r = EnvRenderer::views(&gpu, &scene, cams).expect("renderer");
+            r.frames_with(
+                &f.model,
+                &f.state(),
+                0,
+                &es_env::randomize::RenderOverrides::default(),
+            )
+            .expect("warm-up");
+            let start = Instant::now();
+            for _ in 0..FRAMES {
+                r.frames_with(
+                    &f.model,
+                    &f.state(),
+                    0,
+                    &es_env::randomize::RenderOverrides::default(),
+                )
+                .expect("frame");
+            }
+            let ms = start.elapsed().as_secs_f64() * 1e3 / f64::from(FRAMES);
+            if n == 1 {
+                base_ms = ms;
+            }
+            let extra = if n == 1 {
+                "-".to_owned()
+            } else {
+                format!("{:.2}", (ms - base_ms) / (n - 1) as f64)
+            };
+            println!("| {label} | {n} | {ms:.2} | {extra} |");
+        }
+    }
+    println!("RAN {test}");
+}

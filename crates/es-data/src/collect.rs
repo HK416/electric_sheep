@@ -273,9 +273,10 @@ pub type Intervener<'a, const NJ: usize> =
 ///
 /// A closure, not a renderer: `es-data` is layer 10 and `es-render` layer 5, and this is the
 /// same trade `es_eval::runner::FrameSource` makes — the caller owns
-/// `es_env::render::EnvRenderer` (feature `render`) and hands its `frame` in through this, so
-/// nothing here links Vulkan. With a sink, `info.json`'s video feature stops being a dangling
-/// reference.
+/// `es_env::render::EnvRenderer` (feature `render`) and hands its `frames_with` in through
+/// this, so nothing here links Vulkan. One call is one step of **every** camera: a task with
+/// several image channels writes one frame per channel per call, each into its own directory
+/// (packet M15/N2). With a sink, `info.json`'s video features stop being dangling references.
 pub type FrameSink<'a> =
     &'a mut dyn FnMut(&ModelInfo, &StateView<'_>, &RenderOverrides) -> Result<(), String>;
 
