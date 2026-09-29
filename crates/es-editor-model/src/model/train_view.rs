@@ -60,6 +60,22 @@ pub struct Plot {
     pub max: f32,
     /// Where a packed checkpoint falls along `x`.
     pub marks: Vec<f32>,
+    /// The optimizer steps `x = 0.0` and `x = 1.0` stand for.
+    pub steps: [u32; 2],
+}
+
+impl Plot {
+    /// Where optimizer step `step` falls along `x`, clamped to the curve: a checkpoint's mark,
+    /// and a checkpoint preview's (packet M13/Z5a).
+    pub fn x(&self, step: u32) -> f32 {
+        let [x0, x1] = self.steps.map(|s| s as f32);
+        let span = if (x1 - x0).abs() < f32::EPSILON {
+            1.0
+        } else {
+            x1 - x0
+        };
+        ((step as f32 - x0) / span).clamp(0.0, 1.0)
+    }
 }
 
 /// A training run being watched.
@@ -230,25 +246,22 @@ impl TrainView {
         } else {
             hi - lo
         };
-        let (x0, x1) = (pairs[0].0 as f32, pairs[pairs.len() - 1].0 as f32);
-        let x_span = if (x1 - x0).abs() < f32::EPSILON {
-            1.0
-        } else {
-            x1 - x0
-        };
-        let at = |step: u32| ((step as f32 - x0) / x_span).clamp(0.0, 1.0);
-        Some(Plot {
-            points: pairs
-                .iter()
-                .map(|(s, v)| [at(*s), ((scaled(*v) - lo) / span).clamp(0.0, 1.0)])
-                .collect(),
+        let mut plot = Plot {
+            points: Vec::new(),
             min: pairs.iter().map(|(_, v)| *v).fold(f32::INFINITY, f32::min),
             max: pairs
                 .iter()
                 .map(|(_, v)| *v)
                 .fold(f32::NEG_INFINITY, f32::max),
-            marks: self.checkpoints.iter().map(|(step, _)| at(*step)).collect(),
-        })
+            marks: Vec::new(),
+            steps: [pairs[0].0, pairs[pairs.len() - 1].0],
+        };
+        plot.points = pairs
+            .iter()
+            .map(|(s, v)| [plot.x(*s), ((scaled(*v) - lo) / span).clamp(0.0, 1.0)])
+            .collect();
+        plot.marks = self.checkpoints.iter().map(|(s, _)| plot.x(*s)).collect();
+        Some(plot)
     }
 }
 
@@ -353,6 +366,16 @@ mod tests {
         assert_eq!(plot.marks.len(), 1);
         let want = (40.0 - every as f32) / (view.step().expect("step") - every) as f32;
         assert!((plot.marks[0] - want).abs() < 1e-6, "{:?}", plot.marks);
+        assert_eq!(
+            plot.x(40).to_bits(),
+            plot.marks[0].to_bits(),
+            "a preview of the same step marks the same x"
+        );
+        assert_eq!(
+            (plot.x(0), plot.x(u32::MAX)),
+            (0.0, 1.0),
+            "clamped to the curve"
+        );
         assert!(plot.min <= plot.max);
         println!(
             "RAN train_view_folds_the_curve: {} point(s), min {} max {}",

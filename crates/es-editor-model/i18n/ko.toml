@@ -414,6 +414,13 @@
 "watch.did_not_pass" = "끝남 - 시험 불합격"
 "watch.did_not_pass.advice" = "실행은 끝까지 진행됐지만 정책이 합격 기준에 못 미쳤습니다. 결과에서 어느 시도가 왜 실패했는지 볼 수 있습니다."
 "watch.done" = "실행이 끝났습니다. 결과를 볼 수 있습니다."
+# ③'s checks along the way (packet M13/Z5a).
+"watch.previews" = "학습 중 점검:"
+"watch.previews.hint" = "학습이 정책을 저장할 때마다 짧은 시험을 몇 번 해서 그때 얼마나 잘하는지 보여 줍니다. 이 점검은 최종 결과에 들어가지 않습니다."
+"watch.previews.curve.hint" = "점은 점검한 곳을 표시합니다. 점을 누르면 그 점검을 봅니다."
+"watch.preview.done" = "점검: {}번 성공 / 전체 {}번 — {}걸음 때"
+"watch.preview.running" = "{}걸음 때 저장한 정책을 시험하는 중..."
+"watch.preview.failed" = "{}걸음 때 점검은 끝까지 실행되지 못했습니다."
 
 # ① Scene and ② Teach of a template project (packet M12/Y15).
 "setup.contents" = "장면에 있는 것"
@@ -426,5 +433,5 @@
 "setup.no_template" = "장면을 보여 줄 수 없습니다. 이 프로젝트를 만든 템플릿({})을 여기서 찾지 못했습니다."
 "setup.load_failed" = "장면 파일을 읽지 못했습니다: {}"
 "teach.heading" = "로봇을 가르치는 방법"
-"teach.blocks" = "동작 블록: 미리 짜 둔 시범 동작으로 {}에게 할 일을 보여 줍니다."
+"teach.blocks" = "미리 짜 둔 시범: 준비된 시범 프로그램이 {}에게 할 일을 보여 줍니다."
 "teach.demonstrations" = "학습 전에 시범을 {}번 기록합니다. 횟수는 ③ 학습에서 바꿀 수 있습니다."

@@ -25,6 +25,7 @@ use crate::model::preview::{self, Preview};
 use crate::model::project::{
     self, Project, ProjectError, RunFolder, StartSettings, RUN_RECIPE, TELEMETRY_FILE,
 };
+use crate::model::results;
 use crate::model::telemetry_view::{self, Closed, Event, SeriesKey, Source, TelemetryModel};
 use crate::model::template::{self, Length, Template};
 use crate::model::train_view::STREAM_TRAIN;
@@ -501,7 +502,7 @@ pub struct View {
     /// Why no run can start here (an i18n key), when none can.
     pub cannot_start: Option<&'static str>,
     /// The checkpoints' short tests, newest first (packet M13/Z4): from disk, and from stream 1
-    /// while the run is watched.
+    /// while the run is watched. ③'s only (packet M13/Z5a): ④ shows its own attempts.
     pub previews: Vec<Preview>,
 }
 
@@ -836,9 +837,28 @@ impl Watch {
                     .iter()
                     .any(|p| matches!(p, PhaseState::Interrupted { .. })),
             cannot_start: self.source.as_ref().err().copied(),
-            previews: self.previews.clone(),
+            previews: if phase == Phase::Train {
+                self.previews.clone()
+            } else {
+                Vec::new()
+            },
             state,
         }
+    }
+
+    /// What ③'s preview player re-poses a motion on: the scene ⑤ uses for the same run
+    /// ([`results::scene`]). Read from disk, so asked for when a player opens, not every frame.
+    pub fn scene(&self) -> Option<PathBuf> {
+        let cycle = self.run.as_ref().and_then(|r| {
+            let text = std::fs::read_to_string(r.path.join(RUN_RECIPE)).ok()?;
+            Cycle::parse(&text).ok()
+        });
+        let source = self.source.as_ref().ok();
+        results::scene(
+            cycle.as_ref(),
+            source.map(|(t, _)| t),
+            source.map(|(_, root)| root.as_path()),
+        )
     }
 
     /// Start: a new run folder, its recipe and its `telemetry.txt`, and `es loop cycle` queued
@@ -1522,6 +1542,37 @@ mod tests {
             steps(&telemetry),
             [(20000, None), (5000, Some(0)), (1000, Some(0))]
         );
+        let (_, phases) = watch.tick(&mut launch, &telemetry, Phase::Evaluate, now);
+        let view = watch.view(Phase::Evaluate, &launch, &telemetry, &phases, now);
+        assert!(view.previews.is_empty(), "④ shows its own attempts");
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
+    /// Packet M13/Z5a: ③'s preview player poses a motion on the scene ⑤ uses for the run - its
+    /// recipe's, else the template's.
+    #[test]
+    fn the_preview_player_poses_on_the_scene_results_uses() {
+        let p = scratch_project("z5-scene");
+        let template = repo().join(&cube().scene);
+        assert_eq!(
+            Watch::new(&p, Some(repo())).scene(),
+            Some(template),
+            "no run yet"
+        );
+        let run = p.next_run_dir();
+        std::fs::create_dir_all(&run).unwrap();
+        let fixture = repo().join("tests/fixtures/visible-learning/cycle.toml");
+        let recipe = std::fs::read_to_string(fixture).unwrap();
+        let elsewhere = "tests/fixtures/mjcf/elsewhere.xml";
+        let moved = recipe.replace(&cube().scene, elsewhere);
+        assert_ne!(moved, recipe, "the fixture names the template's scene");
+        std::fs::write(run.join(RUN_RECIPE), moved).unwrap();
+        assert_eq!(
+            Watch::new(&p, Some(repo())).scene(),
+            Some(repo().join(elsewhere)),
+            "the recipe's"
+        );
+        assert_eq!(Watch::new(&p, None).scene(), None, "no checkout, no scene");
         std::fs::remove_dir_all(&p.root).ok();
     }
 

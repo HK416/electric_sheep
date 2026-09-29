@@ -13,8 +13,7 @@ use std::time::SystemTime;
 
 use eframe::egui;
 use egui::load::SizedTexture;
-use egui::{Color32, Pos2, Rect, RichText, Sense, Vec2};
-use es_render::raster::{Camera, BACKGROUND};
+use egui::{Color32, RichText, Vec2};
 
 use crate::app::EditorApp;
 use crate::model::dialogs;
@@ -22,14 +21,11 @@ use crate::model::i18n::{fill, t, Lang};
 use crate::model::labels::{self, Browse};
 use crate::model::layout::{self, Pane};
 use crate::model::project::{RunFolder, StartSettings};
-use crate::model::replay_view::ReplayView;
-use crate::model::results::{self, RunResults, TileFilter, View};
+use crate::model::results::{self, RunResults, TileFilter};
 use crate::model::template;
 use crate::model::workflow::{Phase, PhaseState};
-use crate::ui::advanced::{
-    metric_text, paint_timeline, replay_canvas, rgb_texture, short_hash, REPLAY_RATE_HZ,
-    SHOWCASE_CAMERA,
-};
+use crate::ui::advanced::{metric_text, rgb_texture, short_hash};
+use crate::ui::player::{play, Player};
 
 const GREEN: Color32 = Color32::from_rgb(120, 200, 120);
 const RED: Color32 = Color32::from_rgb(230, 120, 110);
@@ -64,57 +60,6 @@ impl std::fmt::Debug for State {
             .field("project", &self.project)
             .field("chosen", &self.chosen)
             .finish_non_exhaustive()
-    }
-}
-
-/// One attempt, playing.
-struct Player {
-    cell: String,
-    frames: usize,
-    views: Vec<View>,
-    view: View,
-    replay: Option<ReplayView>,
-    /// Why the motion could not be replayed, in the loader's own words.
-    note: Option<String>,
-    /// The playhead when there is no motion to carry it.
-    index: usize,
-    camera: Camera,
-    picture: Option<((usize, Camera), egui::TextureHandle)>,
-    eye: Option<(usize, Option<egui::TextureHandle>)>,
-}
-
-impl Player {
-    fn open(shown: &RunResults, cell: String) -> Self {
-        let row = shown.dir.cells().iter().find(|c| c.name == cell);
-        let frames = row.map_or(0, |r| r.frames);
-        let (replay, note) = match (row.is_some_and(|r| r.has_traj), &shown.scene) {
-            (true, Some(scene)) => match ReplayView::open(scene, &shown.dir.traj_path(&cell)) {
-                Ok(view) => (Some(view), None),
-                Err(e) => (None, Some(e.to_string())),
-            },
-            _ => (None, None),
-        };
-        let views = results::views(replay.is_some(), frames);
-        Self {
-            view: views.first().copied().unwrap_or(View::Outside),
-            views,
-            cell,
-            frames,
-            replay,
-            note,
-            index: 0,
-            camera: SHOWCASE_CAMERA,
-            picture: None,
-            eye: None,
-        }
-    }
-
-    fn tick(&self) -> usize {
-        self.replay.as_ref().map_or(self.index, |r| r.tick)
-    }
-
-    fn len(&self) -> usize {
-        self.replay.as_ref().map_or(self.frames, ReplayView::ticks)
     }
 }
 
@@ -170,7 +115,7 @@ fn refresh(app: &mut EditorApp, pass: u64) {
     s.thumbs.clear();
     s.player = read.as_ref().ok().and_then(|r| {
         let cell = results::first_to_play(r.rows.as_deref(), r.dir.cells())?;
-        Some(Player::open(r, cell))
+        Some(Player::open(&r.dir, r.scene.as_deref(), cell))
     });
     s.shown = Some((stamp, read));
 }
@@ -320,7 +265,7 @@ fn viewport(app: &mut EditorApp, ui: &mut egui::Ui) {
     };
     let mut pick = None;
     match s.player.as_mut() {
-        Some(player) => play(lang, ui, dt, shown, player, &mut pick),
+        Some(player) => play(lang, ui, dt, &shown.dir, player, &mut pick),
         None => {
             ui.weak(t(lang, "results.nothing_recorded"));
         }
@@ -337,137 +282,7 @@ fn viewport(app: &mut EditorApp, ui: &mut egui::Ui) {
         &mut pick,
     );
     if let Some(cell) = pick {
-        s.player = Some(Player::open(shown, cell));
-    }
-}
-
-fn play(
-    lang: Lang,
-    ui: &mut egui::Ui,
-    dt: f64,
-    shown: &RunResults,
-    p: &mut Player,
-    pick: &mut Option<String>,
-) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(t(lang, "results.attempt"));
-        egui::ComboBox::from_id_salt("results-attempt")
-            .selected_text(&p.cell)
-            .show_ui(ui, |ui| {
-                for cell in shown.dir.cells() {
-                    if ui
-                        .selectable_label(cell.name == p.cell, &cell.name)
-                        .clicked()
-                    {
-                        *pick = Some(cell.name.clone());
-                    }
-                }
-            });
-        ui.separator();
-        for view in p.views.clone() {
-            ui.selectable_value(&mut p.view, view, t(lang, view.key()));
-        }
-        if let Some(replay) = p.replay.as_mut() {
-            ui.separator();
-            let key = if replay.playing {
-                "replay.pause"
-            } else {
-                "replay.play"
-            };
-            if ui.button(t(lang, key)).clicked() {
-                replay.playing = !replay.playing;
-            }
-            for speed in results::SPEEDS {
-                ui.selectable_value(&mut replay.speed, speed, format!("{speed}\u{d7}"));
-            }
-        }
-    });
-    if p.views.is_empty() {
-        ui.weak(t(lang, "results.nothing_recorded"));
-    }
-    if let Some(note) = &p.note {
-        ui.weak(note);
-    }
-    if let Some(replay) = p.replay.as_mut() {
-        replay.advance(dt, REPLAY_RATE_HZ);
-        if replay.playing {
-            ui.ctx().request_repaint();
-        }
-    }
-
-    let size = Vec2::new(
-        ui.available_width(),
-        (ui.available_height() * 0.6).max(160.0),
-    );
-    let half = Vec2::new(size.x / 2.0 - 4.0, size.y);
-    match (p.view, p.replay.as_ref()) {
-        (View::Outside, Some(replay)) => {
-            replay_canvas(ui, size, replay, &mut p.camera, &mut p.picture);
-        }
-        (View::SideBySide, Some(replay)) => {
-            ui.horizontal(|ui| {
-                replay_canvas(ui, half, replay, &mut p.camera, &mut p.picture);
-                let tick = replay.tick;
-                eye(ui, half, shown, &p.cell, p.frames, tick, &mut p.eye);
-            });
-        }
-        (View::Eye, _) => {
-            let tick = p.tick();
-            eye(ui, size, shown, &p.cell, p.frames, tick, &mut p.eye);
-        }
-        (View::Outside | View::SideBySide, None) => {}
-    }
-
-    let len = p.len();
-    if len > 0 {
-        let n = (ui.available_width() / 4.0) as usize;
-        paint_timeline(lang, ui, &shown.dir.timeline(&p.cell).buckets(n));
-        let mut at = p.tick();
-        ui.spacing_mut().slider_width = (ui.available_width() - 60.0).max(80.0);
-        if ui.add(egui::Slider::new(&mut at, 0..=len - 1)).changed() {
-            match p.replay.as_mut() {
-                Some(replay) => {
-                    replay.tick = at;
-                    replay.playing = false;
-                }
-                None => p.index = at,
-            }
-        }
-    }
-}
-
-/// The policy's own picture at `tick`, fitted into `size` with its aspect kept.
-fn eye(
-    ui: &mut egui::Ui,
-    size: Vec2,
-    shown: &RunResults,
-    cell: &str,
-    frames: usize,
-    tick: usize,
-    cache: &mut Option<(usize, Option<egui::TextureHandle>)>,
-) {
-    let (rect, _) = ui.allocate_exact_size(size, Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 0.0, Color32::from_gray(BACKGROUND));
-    let Some(index) = results::frame_at(tick, frames) else {
-        return;
-    };
-    if cache.as_ref().is_none_or(|(i, _)| *i != index) {
-        let texture = shown
-            .dir
-            .frame(cell, index)
-            .map(|img| rgb_texture(ui.ctx(), "results-eye", &img));
-        *cache = Some((index, texture));
-    }
-    if let Some((_, Some(texture))) = cache {
-        let px = texture.size_vec2();
-        let scale = (size.x / px.x).min(size.y / px.y);
-        ui.painter().image(
-            texture.id(),
-            Rect::from_center_size(rect.center(), px * scale),
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        s.player = Some(Player::open(&shown.dir, shown.scene.as_deref(), cell));
     }
 }
 

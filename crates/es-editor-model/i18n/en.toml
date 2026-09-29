@@ -415,6 +415,13 @@
 "watch.did_not_pass" = "Finished - did not pass the test"
 "watch.did_not_pass.advice" = "The run went all the way through, but the policy did not meet the acceptance test. The results show which attempts failed, and why."
 "watch.done" = "The run has finished. Its results are ready."
+# ③'s checks along the way (packet M13/Z5a).
+"watch.previews" = "Checks along the way:"
+"watch.previews.hint" = "Each time training saves the policy, a few short test attempts show how it does at that point. These checks do not count toward the result."
+"watch.previews.curve.hint" = "The dots mark the checks. Click one to see it."
+"watch.preview.done" = "Check: {} of {} succeeded — at step {}"
+"watch.preview.running" = "Testing the policy saved at step {}..."
+"watch.preview.failed" = "The check at step {} could not run to the end."
 
 # ① Scene and ② Teach of a template project (packet M12/Y15).
 "setup.contents" = "What is in the scene"
@@ -427,5 +434,5 @@
 "setup.no_template" = "The scene cannot be shown: the template this project was made from ({}) was not found here."
 "setup.load_failed" = "The scene file could not be read: {}"
 "teach.heading" = "How the robot is taught"
-"teach.blocks" = "Action blocks: a scripted demonstrator shows the {} how to do the task."
+"teach.blocks" = "Scripted demonstrations: a ready-made demonstration program shows the {} what to do."
 "teach.demonstrations" = "{} demonstrations are recorded before training. You can change the number in ③ Train."
