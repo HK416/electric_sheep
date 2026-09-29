@@ -37,8 +37,9 @@ demonstrations = 200
 # The bundle `es policy init` builds for `[collect] policy`: U3's four documents. It is also what
 # `training-hint-u3.toml`'s `[policy] bundle` trains (`learning-pretrained.toml` is the
 # architecture), and the cycle's expert gate judges it by `evaluation-augmented.toml`, which
-# names `observation-augmented.toml` (`XIR-040`). Its declared latency is `learning.toml`'s, so
-# the demonstrator collects exactly as under the camera-only card's bundle.
+# names `observation-augmented.toml` (`XIR-040`). Its declared latency is one control period, as
+# the camera-only card's bundle declares; the two cards' demonstrations nevertheless differ from
+# about tick 70 on (Y-V item 7, `docs/packets/M12/YV-verification.md`), both 200/200 successful.
 [bundle]
 task        = "tests/fixtures/visible-learning/task.toml"
 observation = "tests/fixtures/visible-learning/observation-augmented.toml"

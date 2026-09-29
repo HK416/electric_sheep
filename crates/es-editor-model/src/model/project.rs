@@ -452,13 +452,14 @@ pub(crate) mod tests {
     }
 
     /// Both cards, through the parser `es loop cycle` itself uses: the camera-only one trains
-    /// on `training-lerobot.toml`'s route, the cube-pose one on `training.toml`'s, and each
+    /// on `training-lerobot.toml`'s route, the cube-pose one on `training-hint-u3.toml`'s, and each
     /// written recipe resolves to its preset under the route's own mark rule.
     #[test]
     fn a_run_recipe_for_each_template_parses_as_a_cycle() {
-        for (template, recipe_file) in
-            [(cube(), "training-lerobot.toml"), (hint(), "training.toml")]
-        {
+        for (template, recipe_file) in [
+            (cube(), "training-lerobot.toml"),
+            (hint(), "training-hint-u3.toml"),
+        ] {
             let root = scratch(&format!("both-{}", template.id));
             let p = Project::create(&root, "both", &template, &repo()).unwrap();
             let committed =
