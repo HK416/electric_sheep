@@ -8,8 +8,10 @@
 //! Histories are plain capped `Vec`s, not `es_core::ring`: a viewer dropping the oldest
 //! sample is not on the determinism path, and the ring is for the *producer* side.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::rc::Rc;
 
 use es_telemetry::protocol::{HelloAck, Message, Payload, PerfMetrics, StreamId, PROTOCOL_VERSION};
 use es_telemetry::transport::{Client, TransportError};
@@ -18,7 +20,7 @@ use crate::model::live_run::{LiveRun, RUN_STREAMS};
 use crate::model::train_view::TrainView;
 
 /// Where messages come from. `None` means "nothing right now", not "closed" — the app polls
-/// once a frame.
+/// once a frame; a connection says it closed through [`Closed`].
 pub type Source = Box<dyn FnMut() -> Option<Message>>;
 
 /// One scalar series: a stream plus, for `Scalars`, which component of it.
@@ -223,13 +225,24 @@ pub fn connect(addr: &str, token: &str) -> Result<Client, String> {
 }
 
 /// The non-blocking half: a connected client as the [`Source`] the tab pumps.
-pub fn source_of(mut client: Client) -> Source {
+pub fn source_of(client: Client) -> Source {
+    source_and_closed(client).0
+}
+
+/// Set once the connection behind a [`source_and_closed`] source has closed or broken (packet
+/// M12/R3): whoever watches the run can tell a quiet producer from one that is gone.
+pub type Closed = Rc<Cell<bool>>;
+
+/// [`source_of`], and the flag its connection sets when it closes.
+pub fn source_and_closed(mut client: Client) -> (Source, Closed) {
+    let closed = Closed::default();
+    let flag = Rc::clone(&closed);
     let mut ack = Some(Message::HelloAck(HelloAck {
         version: PROTOCOL_VERSION,
         session_id: client.session_id,
         execution_hash: client.execution_hash,
     }));
-    Box::new(move || {
+    let source: Source = Box::new(move || {
         if let Some(ack) = ack.take() {
             return Some(ack);
         }
@@ -240,19 +253,75 @@ pub fn source_of(mut client: Client) -> Source {
                 // them apart is to read again (see [`READS_PER_POLL`]).
                 Err(TransportError::WouldBlock) => {}
                 // A closed or broken connection is "nothing right now" forever: the tab keeps
-                // what it has rather than clearing itself over a dropped socket.
-                Err(_) => return None,
+                // what it has rather than clearing itself over a dropped socket (M7/E4). The
+                // flag is what says so.
+                Err(_) => {
+                    flag.set(true);
+                    return None;
+                }
             }
         }
         None
-    })
+    });
+    (source, closed)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use es_core::PhysTick;
-    use es_telemetry::protocol::{Frame, HelloAck, PROTOCOL_VERSION};
+    use es_telemetry::protocol::{encode, Frame, HelloAck, PROTOCOL_VERSION};
+    use std::io::{Read, Write};
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    /// A producer on loopback that answers the handshake, reads the subscription and then says
+    /// nothing until the sender is dropped, when it hangs up - a run's `es` exiting.
+    pub(crate) fn hanging_up_peer() -> (String, mpsc::Sender<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let (hang_up, wait) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let _ = stream.read(&mut buf);
+            let ack = Message::HelloAck(HelloAck {
+                version: PROTOCOL_VERSION,
+                session_id: 1,
+                execution_hash: None,
+            });
+            stream.write_all(&encode(&ack)).expect("ack");
+            let _ = stream.read(&mut buf);
+            let _ = wait.recv();
+        });
+        (addr, hang_up)
+    }
+
+    /// Packet M12/R3: a connection whose producer hung up says so, apart from one that is only
+    /// quiet - and the source still answers `None`, so the tab keeps what it shows (M7/E4).
+    #[test]
+    fn a_source_whose_peer_hangs_up_reports_closed() {
+        let (addr, hang_up) = hanging_up_peer();
+        let (mut source, closed) = source_and_closed(connect(&addr, "").expect("connects"));
+        assert!(matches!(source(), Some(Message::HelloAck(_))));
+        for _ in 0..3 {
+            assert!(source().is_none());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!closed.get(), "quiet is not closed");
+
+        drop(hang_up);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !closed.get() {
+            assert!(Instant::now() < deadline, "the hang-up was never noticed");
+            assert!(
+                source().is_none(),
+                "a closed connection is nothing, never an error"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(source().is_none());
+    }
 
     fn frame(tick: u64, stream: u32, payload: Payload) -> Message {
         Message::Frame(Frame {
