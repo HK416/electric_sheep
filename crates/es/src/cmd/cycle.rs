@@ -21,7 +21,7 @@ use es_data::collect::{
     append_loop_step, last_evaluation_hash, read_loop_steps, LoopKind, LoopStep, CHECKPOINT,
 };
 use es_data::training::{
-    preview_evaluation, Cycle, CyclePlan, CycleStep, PreviewRef, PreviewStep, Stage,
+    preview_evaluation, Backbone, Cycle, CyclePlan, CycleStep, PreviewRef, PreviewStep, Stage,
 };
 use es_data::{DatasetIdentity, LeRobotDataset, Split};
 use es_ir::evaluation::{AcceptanceResult, EvaluationReport};
@@ -66,6 +66,10 @@ alone, its first `episodes` seeds, the same metrics, **no acceptance**), written
 <out>/preview/<mark>/evaluation.toml with the run's artifacts and `eval.log` beside it. One
 preview at a time; the eval stage waits for the last. A preview judges nothing (spec 13.3): its
 results go to <out>/preview/index.jsonl, one row per mark, and never into loop.jsonl.
+
+A recipe's `[policy] base_model` is checked against the pin before the first stage, and with
+`base_model_fetch` a missing one is fetched then (the plan's `# fetch:` line) -- never after
+collect.
 
 Two refusals are the point of the command:
 
@@ -225,6 +229,14 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
     let dataset_root = PathBuf::from(&plan.dataset_root);
     if let Some(stage) = from {
         check_resume(&plan, &out, &dataset_root, stage)?;
+    }
+    // Packet M12/R8: the backbone the train stage reads is fetched when missing and checked
+    // against the pin now, not after collect and the expert gate (26 minutes on the hint card).
+    if from.is_none_or(|f| f <= Stage::Train) {
+        crate::cmd::train::fetch_base_model(&plan.train, &recipe)?;
+        if let Some(path) = &recipe.policy.base_model {
+            Backbone::verify(Path::new(path)).map_err(|e| bad(e.to_string()))?;
+        }
     }
 
     let mut gate = None;

@@ -30,15 +30,18 @@
 #
 # `base_model` is torchvision's ImageNet ResNet18 as `python/es/fetch_backbone.py` writes it,
 # under `target/` (never committed; `target/lerobot-cache/` is the same kind of fetched file).
-# Neither `es train` nor the editor fetches it: without it the train stage stops at
-# `Backbone::verify`'s refusal, after collect and the expert gate. Once per checkout, from the
-# repository root, with an interpreter that has torchvision and blake3 (the project venv does):
+# `base_model_fetch = "resnet18"` (packet M12/R8) says how it is obtained: when the file is
+# missing, `es train` runs that script with the run's interpreter (`ES_PYTHON` first), and
+# `es loop cycle` does so before its collect stage and then checks the file against the pin -- a
+# failed fetch or a wrong file stops the cycle before the 26 minutes of collection, never after.
+# The dry-run plan shows the command as its `# fetch:` line:
 #
-#   "$ES_PYTHON" python/es/fetch_backbone.py --arch resnet18 --out target/backbone \
+#   python python/es/fetch_backbone.py --arch resnet18 --out target/backbone \
 #       --expect 8511928e7ca6e3b07355e8b66284294ba692093fd0dfe246cdf96a6c9e801899
 #
-# The first time, torchvision downloads `resnet18-f37072fd.pth` (45 MB, BSD-3-Clause). On this PC
-# (torchvision 0.26.0+cu128, Windows) it wrote the pinned blake3, 46,805,551 bytes, 2026-09-29.
+# The interpreter needs torchvision and blake3 (the project venv has both). The first time,
+# torchvision downloads `resnet18-f37072fd.pth` (45 MB, BSD-3-Clause). On this PC (torchvision
+# 0.26.0+cu128, Windows) the script wrote the pinned blake3, 46,805,551 bytes, 2026-09-29.
 #
 # **The length is U3's and the data is not.** U3 trained 20,000 steps on V15's 36,960 frames,
 # 34.6 epochs; on today's 103,881 frames 20,000 steps are 12.3 epochs, and that run -- U3'', the
@@ -56,8 +59,9 @@ root   = "runs/collect-001/ds"
 frames = "runs/collect-001/frames"
 
 [policy]
-bundle     = "runs/collect-001/untrained.esb"
-base_model = "target/backbone/resnet18-imagenet1k-v1.safetensors"
+bundle           = "runs/collect-001/untrained.esb"
+base_model       = "target/backbone/resnet18-imagenet1k-v1.safetensors"
+base_model_fetch = "resnet18"
 
 [run]
 steps         = 20000

@@ -14,10 +14,10 @@
 # scored held-out 0/16 -- `training-hint-u3.toml`'s header has the arithmetic. `long` is the
 # length comparable to U3's in epochs; it has not been run.
 #
-# One thing `needs` cannot say: the training stage reads the ImageNet weights from
-# `target/backbone/`, fetched once per checkout by `python/es/fetch_backbone.py` (the command is
-# in `training-hint-u3.toml`'s header). `es --check-deps` does not report them, and a `needs`
-# name the probe does not report counts as missing, which would disable the card.
+# The training stage reads the ImageNet weights from `target/backbone/`, which a fresh checkout
+# lacks. `training-hint-u3.toml` declares `base_model_fetch` (packet M12/R8), so `es loop cycle`
+# runs `python/es/fetch_backbone.py` with the run's interpreter before it collects, and checks
+# the file against the pin; `needs` no longer has to say anything about it.
 #
 # Every path is a committed document, relative to the repository root, and none is copied (see
 # `cube-into-bin.toml`).

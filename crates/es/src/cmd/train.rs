@@ -60,7 +60,10 @@ A bundle whose Learning IR declares `VisionEncoder { pretrained = true }` also n
 `python/es/fetch_backbone.py` writes. Its blake3 is checked against the lock file beside it
 *and* against the pin this build carries, its licence is copied into
 training/base_model.lock, and the tensors reach the trainer as `--init-backbone` -- never
-over the network at construction (spec 2.5, 19.3).
+over the network at construction (spec 2.5, 19.3). With `[policy] base_model_fetch =
+\"resnet18\"` a missing file is fetched first: `fetch_backbone.py --out <its dir> --expect <the
+pin>` with the run's interpreter, shown as the plan's `# fetch:` line (`es loop cycle` runs it
+before collect).
 
 An optional `[init] policy = \"<bundle.esb>\"` says which policy this run starts from (IR route
 only). Its safetensors is compared to the lowered module's contract, the tensors whose name
@@ -441,6 +444,7 @@ pub(crate) fn run(
         }
         _ => {}
     }
+    fetch_base_model(&plan, &recipe)?;
     // Packet M7/T5: the recipe and the Learning IR must agree about where this run starts.
     // Either disagreement writes a `base_model.lock` that does not describe the run -- a
     // bundle that wants ImageNet and gets none trains from scratch under a document saying
@@ -715,6 +719,31 @@ pub(crate) fn run(
 }
 
 // --- helpers ----------------------------------------------------------------------------
+
+/// Packet M12/R8: the plan's `# fetch:` line, run when `[policy] base_model` is not on disk --
+/// with the run's interpreter, before anything that takes time. What it wrote is then
+/// `Backbone::verify`'s to judge, exactly as a file fetched by hand always was.
+pub(crate) fn fetch_base_model(plan: &Plan, recipe: &Recipe) -> Result<(), CliError> {
+    let (Some(words), Some(path)) = (&plan.fetch, &recipe.policy.base_model) else {
+        return Ok(());
+    };
+    if Path::new(path).exists() {
+        return Ok(());
+    }
+    let command = words.join(" ");
+    println!("$ {command}");
+    let why = match Command::new(&words[0]).args(&words[1..]).status() {
+        Ok(status) if status.success() => return Ok(()),
+        Ok(status) => format!("it exited with {}", status.code().unwrap_or(-1)),
+        Err(e) => format!("{}: {e}", words[0]),
+    };
+    Err(bad(format!(
+        "the pretrained backbone {path} is missing and could not be fetched ({why}).\n\
+         It is downloaded once, by `{command}`: the interpreter needs torchvision and blake3 \
+         (set ES_PYTHON to one that has them) and, the first time, the network. Nothing else \
+         has run."
+    )))
+}
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
     if let Some(dir) = path.parent() {

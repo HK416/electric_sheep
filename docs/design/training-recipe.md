@@ -628,6 +628,30 @@ the from-scratch one and the plan golden beside it must keep rendering. The pret
 the experiment is `tests/fixtures/visible-learning/learning-pretrained.toml`, and the recipe
 that points at it is the U-measurement's, not a committed fixture.
 
+### Fetching it (packet M12/R8)
+
+A fresh checkout has no `base_model`, and a cycle that finds that out at its train stage has
+already collected for 26 minutes (the hint card, `templates/cube-into-bin-hint.toml`). One
+optional field says how the file is obtained:
+
+```toml
+[policy]
+base_model       = "target/backbone/resnet18-imagenet1k-v1.safetensors"
+base_model_fetch = "resnet18"
+```
+
+It is `fetch_backbone.py`'s `--arch` and nothing more. `--out` is `base_model`'s directory and
+`--expect` is `RESNET18_IMAGENET1K_V1_BLAKE3`, so the document holds no second copy of the pin
+and the script refuses to write any other tensors. Refused by name: with no `base_model`, for an
+arch other than `resnet18` (one arch because one pin), and when `base_model`'s file name is not
+the `<arch>-imagenet1k-v1.safetensors` the script writes. The plan carries the command as a
+`# fetch:` line — after `# route:` in `es train`'s, above every stage in a cycle's — and it runs
+only when the file is missing: `es train` runs it before the backbone check, `es loop cycle`
+before collect and then `Backbone::verify`s the file, so a failed fetch or a wrong file stops the
+cycle before anything is collected. The interpreter is the run's (`ES_PYTHON` first). Absent,
+every plan, golden and `identity_hash` is what it was; present, the field is part of the recipe
+in `config.json` like every other.
+
 ---
 
 ## 12. The cycle (packet M7/T2)

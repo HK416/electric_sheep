@@ -274,6 +274,12 @@ pub struct PolicyRef {
     /// whether this run started from `ImageNet`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_model: Option<String>,
+    /// How `base_model` is obtained when it is not on disk: `fetch_backbone.py --arch` of it
+    /// (packet M12/R8). `es train` -- and `es loop cycle`, before it collects -- runs that script
+    /// with the run's interpreter and verifies what it wrote. The pin stays
+    /// [`RESNET18_IMAGENET1K_V1_BLAKE3`]; the document holds no second copy of it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_model_fetch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lerobot: Option<Lerobot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -408,6 +414,7 @@ impl Recipe {
         // on both routes, and on this one for a second reason as well.
         let schedule_args = recipe.schedule_args()?;
         recipe.rl_args()?;
+        recipe.fetch_args()?;
         match (route, recipe.run.batch) {
             // Refused **by name**, not silently ignored: PPO's batch is `envs * horizon` and
             // is therefore derived. A recipe that declared one would put a number into
@@ -660,6 +667,52 @@ impl Recipe {
             args.push(s("privileged"));
         }
         Ok(args)
+    }
+
+    /// `[policy] base_model_fetch` validated, as [`FETCH_BACKBONE`]'s flags (packet M12/R8).
+    ///
+    /// Empty when the recipe declares none, which keeps every other plan and its golden
+    /// byte-identical. `--out` is `base_model`'s directory and `--expect` the pin, so the file
+    /// the script writes is the file this run reads, or the script refuses to write it.
+    pub fn fetch_args(&self) -> Result<Vec<String>, DataError> {
+        let Some(arch) = &self.policy.base_model_fetch else {
+            return Ok(Vec::new());
+        };
+        let Some(path) = &self.policy.base_model else {
+            return Err(refuse(
+                "[policy] `base_model_fetch` says how to obtain `base_model`, and `base_model` \
+                 names no file",
+            ));
+        };
+        // One arch because one pin: a second is a licence decision and a measured hash
+        // (`fetch_backbone.py`'s `ARCHS`), not a word in a recipe.
+        if arch != "resnet18" {
+            return Err(refuse(format!(
+                "[policy] `base_model_fetch` is {arch:?}; the one backbone this repository has \
+                 approved and pinned is \"resnet18\" ({BASE_MODEL_SOURCE})"
+            )));
+        }
+        let want = format!("{arch}-imagenet1k-v1.safetensors");
+        let path = Path::new(path);
+        if path.file_name().and_then(|n| n.to_str()) != Some(want.as_str()) {
+            return Err(refuse(format!(
+                "[policy] `base_model` is {}, and `base_model_fetch` writes <dir>/{want}: the \
+                 fetched file would not be the one this run reads",
+                path.display()
+            )));
+        }
+        let dir = path
+            .parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        Ok(vec![
+            s("--arch"),
+            arch.clone(),
+            s("--out"),
+            dir.to_string_lossy().into_owned(),
+            s("--expect"),
+            s(RESNET18_IMAGENET1K_V1_BLAKE3),
+        ])
     }
 
     /// `bundle` xor `lerobot`, and the external route needs the three documents the import
@@ -1108,6 +1161,10 @@ pub struct Plan {
     pub route: Route,
     pub steps: Vec<Step>,
     pub marks: Vec<u32>,
+    /// [`FETCH_BACKBONE`]'s whole command line when the recipe declares `base_model_fetch`
+    /// (packet M12/R8), run only when `base_model` is not on disk -- so a comment in the
+    /// rendered plan, not a step.
+    pub fetch: Option<Vec<String>>,
 }
 
 fn s(v: impl AsRef<str>) -> String {
@@ -1136,6 +1193,9 @@ pub fn ir_checkpoint(out: &Path, step: u32) -> String {
 
 /// The trainer of the RL route, relative to the repository root (packet M8/S4b).
 pub const TRAIN_PPO: &str = "python/es/train_ppo.py";
+
+/// What writes a `base_model`, relative to the repository root (packets M7/T5, M12/R8).
+pub const FETCH_BACKBONE: &str = "python/es/fetch_backbone.py";
 
 /// `<out>/docs` — the bundle's Task, Observation and Deployment IR, written back out as the
 /// three `.toml` files `es_native.Rollout` is constructed from (packet M8/S4b).
@@ -1625,11 +1685,25 @@ impl Plan {
                 }
             }
         }
+        let fetch_args = recipe.fetch_args()?;
+        let fetch = (!fetch_args.is_empty()).then(|| {
+            [s(interpreter), s(FETCH_BACKBONE)]
+                .into_iter()
+                .chain(fetch_args)
+                .collect()
+        });
         Ok(Self {
             route,
             steps,
             marks,
+            fetch,
         })
+    }
+
+    /// `# fetch: <command>` and a newline, when the recipe declares one (packet M12/R8).
+    pub fn fetch_line(&self) -> Option<String> {
+        let words = self.fetch.as_ref()?;
+        Some(format!("# fetch: {}\n", words.join(" ").replace('\\', "/")))
     }
 
     /// One line per step, every path under `<out>` written relative to it and every separator
@@ -1640,6 +1714,7 @@ impl Plan {
         // external trainer takes `--flag=value` and the value is the path.
         let prefix = format!("{}/", out.to_string_lossy().replace('\\', "/"));
         let mut text = format!("# route: {}\n", self.route.as_str());
+        text.push_str(&self.fetch_line().unwrap_or_default());
         for step in &self.steps {
             let words = step
                 .prefix
@@ -1996,6 +2071,7 @@ impl Cycle {
         }
         recipe.route()?;
         recipe.marks()?;
+        recipe.fetch_args()?;
         Ok(recipe)
     }
 
@@ -2155,6 +2231,9 @@ impl CyclePlan {
         let rel = |w: &String| w.replace('\\', "/").replace(&prefix, "");
         let stages: Vec<&str> = self.steps.iter().map(|s| s.stage.as_str()).collect();
         let mut text = format!("# cycle: {}\n", stages.join(" -> "));
+        // Above every stage and not under `train`: `es loop cycle` fetches a missing backbone
+        // before it collects, so it is never the train stage that finds it gone (M12/R8).
+        text.push_str(&self.train.fetch_line().unwrap_or_default());
         for step in &self.steps {
             let words: Vec<String> = step.prefix.iter().chain(&step.args).map(rel).collect();
             text.push_str(&words.join(" "));
@@ -2163,7 +2242,8 @@ impl CyclePlan {
                 // Nested, and relative to the *cycle's* `<out>`: the training plan reaches out
                 // of `<out>/train` into the collect output, so rendering it against its own
                 // directory would leave an absolute path in the golden.
-                for line in self.train.render(out).lines() {
+                let rendered = self.train.render(out);
+                for line in rendered.lines().filter(|l| !l.starts_with("# fetch: ")) {
                     text.push_str("  ");
                     text.push_str(line);
                     text.push('\n');
@@ -3096,6 +3176,68 @@ fov = 36
         );
         let e = Recipe::parse(&external).expect_err("refused");
         assert!(e.to_string().contains("base_model"), "{e}");
+    }
+
+    /// Packet M12/R8. `base_model_fetch` is one `# fetch:` line -- the run's interpreter,
+    /// `base_model`'s directory, the pin -- and nothing else in the plan moves; a cycle prints
+    /// it once, above collect. Refused by name with no `base_model`, for an arch that has no
+    /// pin, and when the script would write a file the run does not read.
+    #[test]
+    fn base_model_fetch_is_one_line_above_collect() {
+        let named = IR.replace(
+            "bundle = \"untrained.esb\"",
+            "bundle = \"untrained.esb\"\n\
+             base_model = \"target/backbone/resnet18-imagenet1k-v1.safetensors\"",
+        );
+        let fetching = named.replace("[run]", "base_model_fetch = \"resnet18\"\n[run]");
+        let (_, before) = plan_of(&named, "/tmp/a");
+        let (_, plan) = plan_of(&fetching, "/tmp/a");
+        let line = format!(
+            "# fetch: python python/es/fetch_backbone.py --arch resnet18 --out target/backbone \
+             --expect {RESNET18_IMAGENET1K_V1_BLAKE3}\n"
+        );
+        assert_eq!(before.fetch, None);
+        assert_eq!(plan.fetch_line().as_deref(), Some(line.as_str()));
+        assert_eq!(plan.steps, before.steps);
+        let out = Path::new("/tmp/a");
+        assert_eq!(
+            plan.render(out),
+            before.render(out).replacen('\n', &format!("\n{line}"), 1)
+        );
+
+        let cycle = Cycle::parse(CYCLE).expect("parses");
+        let run = Path::new("/tmp/run");
+        let recipe = cycle.training(Some(&fetching), run).expect("resolves");
+        let train = Plan::build(&recipe, &run.join("train"), "python", &[], None, false)
+            .expect("plan builds");
+        let rendered = CyclePlan::build(&cycle, &recipe, train, run)
+            .expect("the cycle plan builds")
+            .render(run);
+        assert_eq!(rendered.matches("# fetch: ").count(), 1, "{rendered}");
+        let (_, rest) = rendered.split_once('\n').expect("a header line");
+        assert!(
+            rest.starts_with(&format!("{line}es loop collect ")),
+            "{rendered}"
+        );
+
+        for (text, word) in [
+            (
+                IR.replace("[run]", "base_model_fetch = \"resnet18\"\n[run]"),
+                "names no file",
+            ),
+            (
+                fetching.replace("= \"resnet18\"", "= \"resnet50\""),
+                "\"resnet50\"",
+            ),
+            (
+                fetching.replace("target/backbone/resnet18-imagenet1k-v1", "b/resnet18"),
+                "resnet18-imagenet1k-v1.safetensors",
+            ),
+        ] {
+            let e = Recipe::parse(&text).expect_err("refused");
+            assert!(e.to_string().contains("base_model"), "{e}");
+            assert!(e.to_string().contains(word), "{e}");
+        }
     }
 
     /// The verified lock is what `base_model.lock` holds, and it moves `training_hash`.
