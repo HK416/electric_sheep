@@ -1,0 +1,54 @@
+# The hint card's cycle (packet M12/R7, `templates/cube-into-bin-hint.toml`): `cycle.toml` with
+# two words changed, so the run the editor starts is the IR-graph combination that passed the
+# demo's acceptance -- M7/U row U3 (`docs/design/visible-learning.md` section 7.31).
+#
+# * `[train] recipe` is `training-hint-u3.toml`: U3's run settings on U3's documents,
+#   `learning-pretrained.toml` (ImageNet ResNet18 backbone, fine-tuned) on
+#   `observation-augmented.toml` (random shift and colour jitter, training only). Its header says
+#   what differs from `training-u3.toml` and why `--resident-gpu` is not there.
+# * `[eval] config` is `evaluation-augmented.toml`: `evaluation.toml`'s suites, seeds 101-116,
+#   metrics and `success_rate >= 0.5`, not one number lowered, naming
+#   `observation-augmented.toml` -- the Observation IR U3's bundle carried when it was judged, and
+#   the one this cycle's collect bundle carries, which `XIR-040` requires the Evaluation IR to
+#   name. `evaluation.toml` would refuse both.
+#
+# Everything else is `cycle.toml`'s, word for word: the same 200 expert demonstrations on seed 1
+# (outside the evaluation's 101-116), the same expert gate, the same showcase camera.
+#
+# `es loop cycle --recipe tests/fixtures/visible-learning/cycle-hint-u3.toml --out <dir> --dry-run`
+# prints the stage plan pinned by `tests/golden/train/plan-cycle-hint-u3.txt`, and needs neither
+# the dataset, the bundle, the backbone nor Python.
+#
+# The gate: `[collect] policy` is also the expert gate's `--policy`, and `es eval run` checks it
+# against `[eval] config` before it opens a backend. `es policy init` from the hint card's
+# `[bundle]` -- `task.toml`, `observation-augmented.toml`, `learning-pretrained.toml`,
+# `deployment.toml` -- builds a bundle both checks accept; `cargo test -p es --test cli
+# cycle_hint_u3_gate_accepts_the_bundle_policy_init_builds` makes the gate's two calls on it.
+# `--dry-run` opens no bundle, which is why the golden is unaffected.
+
+kind  = "cycle"
+scene = "tests/fixtures/mjcf/so101_pick_place.xml"
+
+[collect]
+policy   = "runs/collect-001/untrained.esb"
+expert   = "so101-pick-place"
+episodes = 200
+seed     = 1
+frames   = true
+
+[train]
+recipe = "tests/fixtures/visible-learning/training-hint-u3.toml"
+
+[eval]
+config     = "tests/fixtures/visible-learning/evaluation-augmented.toml"
+checkpoint = "last"
+jobs       = 6
+frames     = true
+
+[showcase]
+cell    = "nominal-00"
+eye     = [0.66, -0.46, 0.52]
+look_at = [0.14, -0.04, 0.04]
+fov     = 36
+width   = 1280
+height  = 720
