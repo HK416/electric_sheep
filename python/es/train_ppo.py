@@ -114,6 +114,7 @@ from train_act import (  # noqa: E402
     build_policy,
     checkpoint_tensors,
     diverged_message,
+    exact_attention,
     init_backbone,
     init_weights as load_init_weights,
     json_text,
@@ -348,6 +349,9 @@ def main(argv: list) -> int:
         torch.use_deterministic_algorithms(True, warn_only=True)
     torch.manual_seed(a.seed)
     device = torch.device(a.device)
+    # Exact attention on CUDA, as in `train_act.py` (packet P-M15-R2): a one-token transformer's
+    # q/k gradient is exactly 0, and the memory-efficient kernel's backward returns noise for it.
+    sdpa = exact_attention(device)
 
     contract = json.loads((a.module / "contract.json").read_text(encoding="utf-8"))
     if not contract.get("batch_axis"):
@@ -732,6 +736,9 @@ def main(argv: list) -> int:
     if backbones:
         # Only when one was loaded, so a run without reports the bytes it always did.
         report["backbones"] = backbones
+    if sdpa:
+        # Only on CUDA, so a CPU summary -- a `training_hash` slot -- is the bytes of before.
+        report["sdpa"] = sdpa
     sys.stdout.write(json_text(report) + "\n")
     if first_nonfinite is not None:
         sys.stdout.flush()

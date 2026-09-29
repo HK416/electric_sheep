@@ -5135,6 +5135,28 @@ V0 (장면 + IR)  ∥  V0b (루프 안의 렌더링)  ∥  V4 (영상 조립)
     움직이지 않고 노트가 그 발산을 있는 그대로의 행으로 싣는다. 기본값: **(c)**. 데모의 결론 —
     7.29절의 것 — 이 여기에 걸려 있지 않기 때문이다. 다만 (b)는 레시피의 필드 하나이고 M7
     사다리 전체에서 가장 싼 실험일 것이다.
+
+    **답함 2026-09-29 (P-M15-R2): 학습률도 초기화도 아니고 어텐션 커널이었다.** 그래프의
+    `TemporalEncoder { Transformer }`는 `token_count = 0`이라서, lowering은 이것을 토큰 하나짜리
+    시퀀스로 돌린다(`self.nK(x.unsqueeze(1))`, `crates/es-policy/src/lower/torch.rs`). 키가 하나면
+    softmax는 정확히 1이고, 어텐션의 q·k 투영의 그래디언트는 정확히 0이다. CUDA(RTX 3060,
+    torch 2.11.0+cu128, fp32)에서 torch의 scaled-dot-product attention은 memory-efficient 커널을
+    고르는데, 이 커널은 forward는 정확하지만 backward가 그 0 자리에 반올림 잡음을 돌려준다:
+    logit 1에서 |dq| 2.9e-5, 1e6에서 0.03, 1e9에서 NaN. AdamW가 이 잡음을 학습률 크기의 스텝으로
+    정규화하면 `Wq`와 `Wk`가 위로 떠밀려 가고(노름 16 → 41), logit이 지수적으로 커지며(스텝 1에서
+    0.27, 스텝 1,843에서 3e9) 손실이 NaN이 된다 — U1은 4,517에서, plan N의 카메라 전용 그래프들은
+    lr 4e-4에서 800–3,200 스텝 안에, 힌트 그래프는 한 번 ~1,130에서. math 백엔드에서는 dq와 dk가
+    정확히 0이고, 같은 재현이 클리핑 없이 lr 4e-4로 10,000 스텝을 버티며 그때까지 똑같이
+    배운다(평균 손실 양쪽 모두 0.026). 그러니 위의 전제 — 4e-4가 (스케줄, 초기화) 쌍의 성질이라는
+    것 — 는 성립하지 않는다. 어느 실행이 커널의 잡음을 먼저 만났는지는 학습률에 대해 아무것도
+    말하지 않는다. 이제 `train_act.py`와 `train_ppo.py`는 CUDA에서 학습할 때 flash,
+    memory-efficient, cuDNN SDPA 백엔드를 끄고(`exact_attention`), 요약에 `"sdpa": "math"`를
+    기록한다(CUDA에서만이라 CPU 요약은 이전과 같은 바이트다). 움직인 해시는 없다: lowering,
+    `lowering_hash`, `learning_hash`, `policy_hash`는 그대로이고, forward가 정확했으므로 추론은
+    영향을 받지 않는다. 오라클은 `crates/es-policy/tests/exact_attention.rs`다: 토큰 하나짜리
+    트랜스포머 그래프에서 CUDA로 `train_act.py`를 옵티마이저 한 스텝 돌리면 `in_proj_weight`
+    그래디언트의 q·k 행이 정확히 0이다(스위치 없이, 이 GPU에서: 4.8e-10과 3.8e-10). (a)와 (b)는
+    철회되고, `training-mad.toml`은 U3의 lr 4e-4, `grad_clip` 없음으로 돌아간다.
 36. **`es eval compare`가 움직인 `evaluation_hash`를 넘어 말없이 비교한다** (7.31절). §13.3은
     움직인 evaluation 문서는 새 비교라고 말하고, `es loop cycle`은 두 해시를 모두 찍으며
     이름으로 거부한다(`training-recipe.md` 12.3). 같은 절이 독자에게 가리키는 비교 도구는

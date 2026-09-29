@@ -5,11 +5,6 @@
 # `cargo test -p es --test views mad_recipe_and_cycle_are_the_views_arms_with_single_view` holds
 # that:
 #
-#  * `lr = 1e-4` and `grad_clip = 1.0`: the settings experiment 1 now runs. U3's lr 4e-4 diverged
-#    to NaN on the camera-only graphs, one view and three, with and without clipping (experiment
-#    1's first runs on this PC, 2026-09-29); U3's own graph had the simulator-privileged cube pose.
-#    training-views.toml and training-cam.toml still say 4e-4 -- they mirror training-hint-u3.toml
-#    by test, and experiment 1 runs local copies.
 #  * `steps = 60000`, `checkpoint_at = [1000, 5000, 20000, 60000]`: three times U3's 20,000
 #    steps; U3's marks kept and the last one added.
 #  * `single_view = { weight = 0.5 }`: MAD's "disentangle" (Almuzairee et al., CoRL 2025, arXiv
@@ -18,10 +13,18 @@
 #    the merged term against the single-view ones. 0.5 is our choice, pending a sweep. Each view
 #    alone is one more forward pass, so a step costs 1 + 3 forwards -- not measured yet.
 #
-# The rest is U3's: batch 64, `warmup_cosine` 250 / 1e-6, seed 0, cuda, the ImageNet ResNet18
-# `base_model` with `base_model_fetch = "resnet18"` (loaded into the one shared backbone), no
-# `--resident-gpu`; training-hint-u3.toml's header says why each is what it is. The baked set is
-# the three-view arm's: three image tensors per frame (training-views.toml's header).
+# The rest is U3's: lr 4e-4 with no `grad_clip`, batch 64, `warmup_cosine` 250 / 1e-6, seed 0,
+# cuda, the ImageNet ResNet18 `base_model` with `base_model_fetch = "resnet18"` (loaded into the
+# one shared backbone), no `--resident-gpu`; training-hint-u3.toml's header says why each is what
+# it is. The baked set is the three-view arm's: three image tensors per frame
+# (training-views.toml's header).
+#
+# lr 4e-4 went to NaN on the camera-only graphs in experiment 1's first runs on this PC
+# (2026-09-29), and not because of the rate: the graph's `TemporalEncoder { Transformer }` attends
+# over one token, whose q/k gradient is exactly 0, and on CUDA torch's memory-efficient attention
+# kernel returned rounding noise for it that AdamW grew into diverging logits. Both trainers now
+# train on CUDA under exact (math) attention (packet P-M15-R2, visible-learning.md open question
+# 35), and the reproduction holds 10,000 steps at 4e-4 with no clipping.
 #
 # `[policy] bundle` is the MAD bundle, built by the command in cycle-mad.toml's header.
 # `[run] single_view` is checked against its Learning IR before any plan, `--dry-run` included,
@@ -42,11 +45,10 @@ base_model_fetch = "resnet18"
 [run]
 steps         = 60000
 batch         = 64
-lr            = 1e-4
+lr            = 4e-4
 seed          = 0
 checkpoint_at = [1000, 5000, 20000, 60000]
 device        = "cuda"
 interpreter   = "python"
 schedule      = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }
-grad_clip     = 1.0
 single_view   = { weight = 0.5 }

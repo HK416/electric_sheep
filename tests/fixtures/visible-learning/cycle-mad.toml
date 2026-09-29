@@ -2,8 +2,8 @@
 # docs/design/multi-camera.md sections 3.3-3.5 and 4): cycle-views.toml -- experiment 1's
 # three-view arm -- with two differences, and nothing else differs:
 #
-# * `[train] recipe` is training-mad.toml: training-views.toml at lr 1e-4 with grad_clip 1.0,
-#   60,000 steps, and MAD's single-view loss at weight 0.5 (that file's header).
+# * `[train] recipe` is training-mad.toml: training-views.toml at 60,000 steps with MAD's
+#   single-view loss at weight 0.5 (that file's header).
 # * `[eval] config` is evaluation-mad.toml, whose body and `evaluation_hash` are
 #   evaluation-views.toml's: the MAD bundle reads the same Task and Observation IR.
 #

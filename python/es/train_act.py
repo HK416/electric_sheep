@@ -273,6 +273,26 @@ def diverged_message(trainer: str, step: int, loss: float, lr_now: float, lr: fl
     )
 
 
+def exact_attention(device) -> str | None:
+    """Train with exact attention on CUDA; `"math"`, the SDPA backend left on, or `None` off it.
+
+    A lowered `TemporalEncoder { Transformer }` over a pooled feature (`token_count == 0`) runs
+    as a one-token sequence, so its softmax is exactly 1 and its q/k projections' gradient is
+    exactly 0. On CUDA torch picked the memory-efficient SDPA kernel, whose backward returns
+    rounding noise for that zero (2.9e-5 at logit 1, NaN at 1e9) while its forward is exact:
+    AdamW turned the noise into lr-sized steps and U1 and the camera-only graphs went NaN at
+    lr 4e-4 -- `docs/design/visible-learning.md` open question 35, answered (P-M15-R2). The
+    process-wide switches also cover the attention inside the lowered module's torch-provided
+    transformer layers. Inference is untouched: the forward was exact.
+    """
+    if device.type != "cuda":
+        return None
+    torch.backends.cuda.enable_flash_sdp(False)
+    torch.backends.cuda.enable_mem_efficient_sdp(False)
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    return "math"
+
+
 def init_backbone(model, tensors: dict) -> list:
     """Load `--init-backbone`'s tensors into every lowered `ResNet` backbone (M7/T5).
 
@@ -650,6 +670,7 @@ def main(argv: list) -> int:
 
     torch.manual_seed(a.seed)
     device = torch.device(a.device)
+    sdpa = exact_attention(device)
     contract = json.loads((a.module / "contract.json").read_text(encoding="utf-8"))
     shapes = {port: [int(d) for d in shape] for port, shape in contract["inputs"].items()}
     if not contract.get("batch_axis"):
@@ -953,6 +974,10 @@ def main(argv: list) -> int:
             "initial_loss_single": sum(losses_single[:window]) / window,
             "final_loss_single": sum(losses_single[-window:]) / window,
         }
+    if sdpa:
+        # The attention backend a CUDA run trained under (packet P-M15-R2, `exact_attention`).
+        # Only on CUDA, so a CPU summary is the line of before.
+        report["sdpa"] = sdpa
     sys.stdout.write(json_text(report) + "\n")
     if first_nonfinite is not None:
         sys.stdout.flush()

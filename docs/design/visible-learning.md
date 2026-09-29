@@ -5556,6 +5556,30 @@ Each packet is budgeted at or under ~1,000 `src/*.rs` lines (section 2.10) and n
     note carries the divergence as the row it is. Default: **(c)**, because the demo's
     conclusion — section 7.29's — does not depend on it; but (b) is one field in a recipe and
     would be the cheapest experiment in M7's whole ladder.
+
+    **Answered 2026-09-29 (P-M15-R2): not the rate and not the initialisation, but the attention
+    kernel.** The graph's `TemporalEncoder { Transformer }` has `token_count = 0`, so the lowering
+    runs it as a one-token sequence (`self.nK(x.unsqueeze(1))`, `crates/es-policy/src/lower/torch.rs`).
+    With one key the softmax is exactly 1, and the attention's q and k projections have an exactly
+    zero gradient. On CUDA (RTX 3060, torch 2.11.0+cu128, fp32) torch's scaled-dot-product
+    attention picks the memory-efficient kernel, whose forward is exact and whose backward returns
+    rounding noise for that zero: |dq| 2.9e-5 at logit 1, 0.03 at 1e6, NaN at 1e9. AdamW normalises
+    the noise into learning-rate-sized steps, `Wq` and `Wk` drift upward (norm 16 → 41), the logits
+    grow exponentially (0.27 at step 1, 3e9 at step 1,843) and the loss goes NaN — U1 at 4,517,
+    plan N's camera-only graphs at lr 4e-4 in 800–3,200 steps, the hint graph once at ~1,130.
+    Under the math backend dq and dk are exactly 0, and the reproduction holds 10,000 steps at
+    lr 4e-4 with no clipping, learning the same until then (mean loss 0.026 either way). So the
+    premise above — that 4e-4 is a property of the pair (schedule, initialisation) — does not
+    hold: which run met the kernel's noise first says nothing about the rate. `train_act.py` and
+    `train_ppo.py` now turn the flash, memory-efficient and cuDNN SDPA backends off when training
+    on CUDA (`exact_attention`), and the summary records `"sdpa": "math"` (only on CUDA, so a CPU
+    summary is the bytes of before). No hash moves: the lowering, `lowering_hash`,
+    `learning_hash` and `policy_hash` are unchanged, and inference is unaffected because the
+    forward was exact. The oracle is `crates/es-policy/tests/exact_attention.rs`: one optimizer
+    step of `train_act.py` on a one-token-transformer graph on CUDA leaves the q and k rows of
+    `in_proj_weight`'s gradient exactly 0 (without the switch, on this GPU: 4.8e-10 and 3.8e-10).
+    (a) and (b) are withdrawn, and `training-mad.toml` is back at U3's lr 4e-4 with no
+    `grad_clip`.
 36. **`es eval compare` compares reports across a moved `evaluation_hash` silently**
     (section 7.31). §13.3 says a moved evaluation document is a new comparison, and `es loop
     cycle` refuses one by name with both hashes printed (`training-recipe.md` 12.3). The

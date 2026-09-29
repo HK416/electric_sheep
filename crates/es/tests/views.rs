@@ -1195,9 +1195,10 @@ fn views_recipes_and_cycles_mirror_the_hint_card() {
     println!("RAN views_recipes_and_cycles_mirror_the_hint_card");
 }
 
-/// Packet M15/N8b: experiment 2's recipe is training-views.toml with the settings experiment 1
-/// now runs (lr 1e-4, `grad_clip` 1.0), 60,000 steps and their marks, and MAD's single-view loss;
-/// its cycle is cycle-views.toml with the recipe and the Evaluation IR moved, nothing else.
+/// Packet M15/N8b: experiment 2's recipe is training-views.toml with 60,000 steps and their
+/// marks and MAD's single-view loss -- U3's lr 4e-4 and no `grad_clip`, since packet P-M15-R2
+/// found the camera-only divergence in the attention kernel and not in the rate; its cycle is
+/// cycle-views.toml with the recipe and the Evaluation IR moved, nothing else.
 ///
 /// The dry run plans `--single-view 0.5`. `[run] single_view` is checked against the recipe's
 /// `[policy] bundle` before any plan, so the dry run runs in a scratch directory holding the
@@ -1207,8 +1208,6 @@ fn views_recipes_and_cycles_mirror_the_hint_card() {
 fn mad_recipe_and_cycle_are_the_views_arms_with_single_view() {
     let mut want = toml_value("training-views.toml");
     let run = want["run"].as_table_mut().expect("[run]");
-    run.insert("lr".into(), 1e-4.into());
-    run.insert("grad_clip".into(), 1.0.into());
     run.insert("steps".into(), 60_000.into());
     run.insert(
         "checkpoint_at".into(),
@@ -1268,13 +1267,10 @@ fn mad_recipe_and_cycle_are_the_views_arms_with_single_view() {
         train.len() == 1 && train[0].contains("--single-view 0.5"),
         "{plan}"
     );
-    for want in [
-        "--lr 0.0001 ",
-        "--grad-clip 1 ",
-        "--checkpoint-at 1000,5000,20000,60000 ",
-    ] {
+    for want in ["--lr 0.0004 ", "--checkpoint-at 1000,5000,20000,60000 "] {
         assert!(train[0].contains(want), "{want}: {plan}");
     }
+    assert!(!train[0].contains("--grad-clip"), "{plan}");
     assert!(
         plan.contains("evaluation-mad.toml") && plan.contains("preview"),
         "{plan}"
