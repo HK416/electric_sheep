@@ -6,6 +6,13 @@
 //! `Graph::topo_order()` order. No fusion, no reordering, no cleverness — an oracle that is
 //! hard to read against the spec is not an oracle.
 //!
+//! The one exception to "a member per node" is a `share` group (spec 8.3, packet M15/N6): the
+//! encoders that name one owner are **one** member, `self.n<owner>`, applied to each view on
+//! each encoder's own forward line. A sharer owns no parameter, declares no weight key, and a
+//! checkpoint that still carries tensors under its id is refused by name
+//! (`weights::validate_keys`). A graph with no `share` and no `Sum` lowers byte for byte as
+//! before either existed.
+//!
 //! Determinism is a hard requirement, not a nicety: `lowering_hash` is a component of the
 //! compiler identity, so the same graph must produce byte-identical source. Everything here
 //! iterates a `BTreeMap` or a `Vec` built in topological order (spec 3.4).
@@ -353,6 +360,10 @@ pub struct TorchModule {
     pub weight_shapes: BTreeMap<String, Vec<u64>>,
     /// `blake3(LOWERING_TAG || source)`.
     pub lowering_hash: [u8; 32],
+    /// Encoder node id -> the owner whose weights it uses (spec 8.3 `share`, packet M15/N6).
+    /// A sharer declares no key; this is what lets `validate_keys` name one whose tensors a
+    /// checkpoint still carries, instead of listing them as anonymous strays.
+    pub sharers: BTreeMap<u32, u32>,
 }
 
 impl TorchModule {
@@ -495,6 +506,7 @@ struct Lowering {
     needs_sampler: bool,
     needs_ddpm: bool,
     needs_flow: bool,
+    sharers: BTreeMap<u32, u32>,
 }
 
 /// What [`Lowering::sampler`] worked out for a sampler head.
@@ -597,6 +609,16 @@ impl Lowering {
     ) -> Result<String, LowerError> {
         let k = id.0;
         match node {
+            // A sharer (packet M15/N6): the owner's module on this view. `LRN-033` has already
+            // checked that the owner is a `VisionEncoder` of this backbone, width, token count,
+            // `pretrained` and `frozen` sharing nothing itself, so the owner's arm below —
+            // whenever topological order reaches it — is the whole group's member and claim.
+            LearningNode::VisionEncoder {
+                share: Some(owner), ..
+            } => {
+                self.sharers.insert(k, owner.0);
+                Ok(format!("self.n{}({})", owner.0, args[0]))
+            }
             LearningNode::VisionEncoder {
                 backbone,
                 out_dim,
@@ -719,6 +741,11 @@ impl Lowering {
                         }
                         Ok(format!("torch.cat([{}], dim=-2)", args.join(", ")))
                     }
+                    // `LRN-032` guarantees every term has the node's own shape, so there is no
+                    // projection and no weight. The terms are stacked in the node's declared
+                    // input order -- the order the document lists them, never a map's -- so
+                    // the sum's op order is a property of the document (packet M15/N6).
+                    FusionKind::Sum => Ok(format!("torch.stack([{}], 0).sum(0)", args.join(", "))),
                     other => Err(unsupported("Fusion", other)),
                 }
             }
@@ -976,6 +1003,7 @@ impl Lowering {
             source,
             weight_keys: self.keys,
             weight_shapes: self.shapes,
+            sharers: self.sharers,
         }
     }
 }

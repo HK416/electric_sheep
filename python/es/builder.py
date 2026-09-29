@@ -527,7 +527,15 @@ class Learning:
         self._native.connect(from_node, from_port, to_node, to_port)
 
     def vision_encoder(self, backbone: str, pretrained: str | bool = True, frozen: bool = False, shared: bool = True, out_dim: int = 512) -> int:
-        del shared  # multi-camera weight sharing is a compiler-pass concern (spec 8.3), not a field this node carries
+        """One `VisionEncoder` node per call, i.e. per view (spec 14.2 as amended by M15/N5).
+
+        `shared=True` is spec 8.3's `share`, not a field of its own: the first shared encoder
+        this builder makes is the group's owner and carries no `share`; every later one names
+        it (`share = <owner id>`), and the lowering applies the owner's one module to each
+        view (packet M15/N6). `shared=False` makes an encoder with weights of its own. An
+        encoder whose backbone, width, `pretrained` or `frozen` differs from the owner's is
+        refused by the validator (`LRN-033`), never silently given its own weights.
+        """
         # `VisionBackbone::pretrained` is a plain `bool` (`learning.rs`); spec 14.2's
         # `pretrained="imagenet"` names a *source*, which the current schema has no field for,
         # so any truthy value here just means "yes, start from pretrained weights". Its own
@@ -535,14 +543,18 @@ class Learning:
         # another Learning node, so one placeholder port satisfies `LRN-002`'s minimum-of-1
         # without anything needing to match it.
         self._vision_out = out_dim
-        return self.add(
-            "VisionEncoder",
-            {
-                "inputs": [{"name": "in0", "ty": _port_type()}],
-                "backbone": _BACKBONE[backbone], "pretrained": bool(pretrained), "frozen": frozen,
-                "out_dim": out_dim, "token_count": 0,
-            },
-        )
+        params = {
+            "inputs": [{"name": "in0", "ty": _port_type()}],
+            "backbone": _BACKBONE[backbone], "pretrained": bool(pretrained), "frozen": frozen,
+            "out_dim": out_dim, "token_count": 0,
+        }
+        owner = getattr(self, "_share_owner", None)
+        if shared and owner is not None:
+            params["share"] = owner
+        node = self.add("VisionEncoder", params)
+        if shared and owner is None:
+            self._share_owner = node
+        return node
 
     def state_encoder(self, kind: str, out_dim: int = 512) -> int:
         self._state_out = out_dim

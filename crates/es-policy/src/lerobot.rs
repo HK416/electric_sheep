@@ -715,6 +715,7 @@ class EsPolicy(nn.Module):
         source,
         weight_keys: keys,
         weight_shapes: shapes,
+        sharers: BTreeMap::new(),
     })
 }
 

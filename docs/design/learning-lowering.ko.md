@@ -82,9 +82,11 @@ class EsPolicy(nn.Module):
 | `StateEncoder { Mlp { hidden, activation, activate_output } }` | `nn.Sequential(Linear, act, …, Linear[, act])` | `v = self.nk(x)` | 정확 |
 | `VisionEncoder { ResNet18/34 }` | `torchvision.models.resnet{18,34}`, `fc = Linear(512, out_dim)`로 교체 | `v = self.nk(x)` | 접두사 |
 | `VisionEncoder { other }` | — | — | `Unsupported` |
+| `VisionEncoder { share = o }` | — (그룹의 멤버는 owner의 것) | `v = self.no(x)` | 없음 (owner의 접두사 아래) |
 | `LanguageEncoder` | — | — | `Unsupported` |
 | `Fusion { Concat }` | `Linear(Σin, out_dim)`, `Σin == out_dim`이면 없음 | `v = self.nk(torch.cat([a, b], dim=-1))` | 정확 / 없음 |
 | `Fusion { TokenConcat }` | — | `v = torch.cat([a, b], dim=-2)` | 없음 |
+| `Fusion { Sum }` | — | `v = torch.stack([a, b, c], 0).sum(0)` | 없음 |
 | `Fusion { CrossAttention, FiLm, AdaLn }` | — | — | `Unsupported` |
 | `TemporalEncoder { None }` | — | `v = x` | 없음 |
 | `TemporalEncoder { Transformer }` | `nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=out_dim, nhead=8, batch_first=True), 1)` | `v = self.nk(x)` | 접두사 |
@@ -111,6 +113,14 @@ class EsPolicy(nn.Module):
   `unsqueeze(0)`이었다). `nhead = 8`은 고정값이다; spec 8.3의 노드
   파라미터에는 이 값이 실려 있지 않으므로 lowering 상수이며, 다른 head 개수로 학습된 체크포인트는
   조용히 재해석되지 않고 shape 검사에서 실패한다.
+- **`share`와 `Sum` (패킷 M15/N6, spec 8.3).** `share` 그룹은 멤버 하나, `self.n<owner>`다.
+  위 표의 owner 행이 만들고, 각 인코더가 자기 forward 라인에서 그것을 적용한다. sharer에는
+  멤버도 키도 없고, 체크포인트는 그룹의 텐서를 `nodes.<owner>.*` 아래 한 번만 담는다. sharer의
+  id 아래 텐서가 남아 있는 파일은 `validate_keys`가 그 sharer와 owner를 이름으로 대며 거부한다.
+  그래서 `--init-backbone`은 owner를, 곧 모든 view를 초기화한다. `Sum`에는 가중치가 없다:
+  `LRN-032`가 모든 항을 노드 자신의 shape으로 만든다. 항은 노드의 **선언된 입력 순서**(문서의
+  순서이지 map의 순서가 아니다)로 쌓이며, 이것이 합의 연산 순서를 정한다. 손으로 쓴 모듈(ResNet18
+  하나, 피처를 `+`로 더함)과 대조해 CPU에서 bitwise로 같다(`crates/es-policy/tests/sum_share.rs`).
 - **`ActionChunker`.** `execute_chunk`를 제외한 나머지 — `replan_hz`, `mode`, `blend`,
   `buffer_chunks` — 는 텐서 연산이 아니라 런타임 스케줄링(spec 8.6)이다. lowering은
   `execute_chunk`만 소비하고 나머지는 **의도적으로** 무시한다; 비동기 버퍼와 blend 정책은 env

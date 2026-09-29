@@ -85,9 +85,11 @@ safetensors file before the first `forward`, and a missing key is an error, neve
 | `StateEncoder { Mlp { hidden, activation, activate_output } }` | `nn.Sequential(Linear, act, …, Linear[, act])` | `v = self.nk(x)` | exact |
 | `VisionEncoder { ResNet18/34 }` | `torchvision.models.resnet{18,34}` with `fc = Linear(512, out_dim)` | `v = self.nk(x)` | prefix |
 | `VisionEncoder { other }` | — | — | `Unsupported` |
+| `VisionEncoder { share = o }` | — (the owner's member is the group's) | `v = self.no(x)` | none (under the owner's prefix) |
 | `LanguageEncoder` | — | — | `Unsupported` |
 | `Fusion { Concat }` | `Linear(Σin, out_dim)`, or nothing when `Σin == out_dim` | `v = self.nk(torch.cat([a, b], dim=-1))` | exact / none |
 | `Fusion { TokenConcat }` | — | `v = torch.cat([a, b], dim=-2)` | none |
+| `Fusion { Sum }` | — | `v = torch.stack([a, b, c], 0).sum(0)` | none |
 | `Fusion { CrossAttention, FiLm, AdaLn }` | — | — | `Unsupported` |
 | `TemporalEncoder { None }` | — | `v = x` | none |
 | `TemporalEncoder { Transformer }` | `nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=out_dim, nhead=8, batch_first=True), 1)` | `v = self.nk(x)` | prefix |
@@ -115,6 +117,15 @@ Notes on the entries that are not obvious:
   `unsqueeze(0)`, a batch of one standing in for a sequence of one). `nhead = 8` is fixed; spec 8.3's node
   parameters do not carry it, so it is a lowering constant, and a checkpoint trained with a
   different head count will fail the shape check rather than silently reinterpret.
+- **`share` and `Sum` (packet M15/N6, spec 8.3).** A `share` group is one member,
+  `self.n<owner>`, built by the owner's row above and applied on each encoder's own forward
+  line; a sharer has no member and no key, the checkpoint holds the group's tensors once under
+  `nodes.<owner>.*`, and a file that still carries tensors under a sharer's id is refused by
+  `validate_keys` naming the sharer and its owner. `--init-backbone` therefore initialises the
+  owner and with it every view. `Sum` has no weight: `LRN-032` makes every term the node's own
+  shape. Its terms are stacked in the node's **declared input order** (the document's order,
+  never a map's), which fixes the sum's op order. Measured against a hand-written module (one
+  ResNet18, the features added with `+`): bitwise on CPU (`crates/es-policy/tests/sum_share.rs`).
 - **`ActionChunker`.** Everything about it except `execute_chunk` — `replan_hz`, `mode`,
   `blend`, `buffer_chunks` — is runtime scheduling (spec 8.6), not a tensor operation. The
   lowering consumes `execute_chunk` and ignores the rest **by design**; the async buffer and
