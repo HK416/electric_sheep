@@ -735,7 +735,7 @@ es video showcase --run eval --scene .../so101_pick_place.xml --out showcase --c
 it — not the dataset, not the bundle, not Python — which is what makes it judgeable in CI on a
 machine that has none of them. A run that did not happen writes nothing, not even a directory.
 
-### 12.3 Two refusals are the point of the command
+### 12.3 Three refusals are the point of the command
 
 **The harness passes the expert first** (§28.9 rule 1, M5-R1). With `[collect] expert` set,
 the cycle runs the expert through `es eval run` on the *same* `[eval] config` **before**
@@ -755,6 +755,16 @@ because the evaluation conditions are a property of the document). `--allow-new-
 the deliberate act that starts a new comparison. From iteration 2 on, `es eval compare` runs
 on the two reports at the end: the previous `report.json` is moved to `report-prev.json`
 before the new one overwrites it.
+
+**A collection whose demonstrator mostly failed is not trained on** (packet P-M14-R1). The
+collect step in the ledger records how its demonstrations ended (`success`, `failure`,
+`timeout`), and before the train stage — `--from train` included — the cycle refuses, exit 1,
+when fewer than half succeeded (`MIN_DEMONSTRATION_SUCCESS = 0.5`, a constant: an acceptance
+criterion judges a policy on one suite, not a collection). The expert gate can pass a program
+the collection mostly fails — it judges 16 evaluation episodes, the collection 200 others — and
+the first real run of an edited program (plan Q's Q5) trained on 10 good demonstrations and 190
+failed ones until its loss went NaN. The facts are in both ledgers before it refuses, as the
+gate's are; a ledger from an `es` older than the counts passes.
 
 ### 12.4 `--from <stage>` resumes, and checks before it does
 
