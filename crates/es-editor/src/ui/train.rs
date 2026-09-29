@@ -98,11 +98,7 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
         Instant::now(),
     );
     match pane {
-        Pane::StepPanel => {
-            egui::ScrollArea::vertical()
-                .id_salt("watch-panel")
-                .show(ui, |ui| panel(app, ui, phase, &view));
-        }
+        Pane::StepPanel => panel(app, ui, phase, &view),
         Pane::Viewport => centre(app, ui, &view),
         _ => summary(app, ui, &view),
     }

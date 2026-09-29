@@ -216,7 +216,12 @@ impl EditorApp {
         }
         ctx.set_fonts(definitions);
         let styles = fonts::text_styles(self.settings.text_size);
-        ctx.all_styles_mut(|style| style.text_styles.clone_from(&styles));
+        ctx.all_styles_mut(|style| {
+            style.text_styles.clone_from(&styles);
+            // A bar that shows whenever there is more to scroll to, not only under the pointer
+            // (egui's default floating bar is invisible until hovered).
+            style.spacing.scroll = egui::style::ScrollStyle::thin();
+        });
     }
 
     /// What the previous session left in `eframe::Storage`: the recent list (packet M7/E3),

@@ -439,7 +439,13 @@ impl EditorApp {
         egui::TopBottomPanel::top("launch")
             .resizable(true)
             .default_height(400.0)
-            .show_inside(ui, |ui| self.launch_panel(ui));
+            .show_inside(ui, |ui| {
+                // A pane shorter than the form scrolls it rather than cutting its flags off.
+                egui::ScrollArea::vertical()
+                    .id_salt("launch-form")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.launch_panel(ui));
+            });
         if self.run.is_none() && self.telemetry.live.is_empty() {
             ui.label(self.t("results.empty"));
             return;
@@ -788,6 +794,8 @@ impl EditorApp {
         );
         egui::ScrollArea::vertical()
             .id_salt("launch-lines")
+            // A box of its own height inside the form's scroll, not one that fills it.
+            .max_height(160.0)
             .auto_shrink([false, false])
             .stick_to_bottom(true)
             .show(ui, |ui| {
@@ -928,72 +936,70 @@ impl EditorApp {
     }
 
     pub(crate) fn telemetry_tab(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            // Spec 23.1: the editor attaches to a running process. The address and the token
-            // are typed here and dialled by the model, which owns every error string.
-            ui.horizontal(|ui| {
-                ui.label(self.t("live.attach"))
-                    .on_hover_text(self.t("live.attach.hint"));
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.attach_addr)
-                        .hint_text(crate::model::launch::DEFAULT_TELEMETRY)
-                        .desired_width(160.0),
-                );
-                let token_hint = self.t("live.token");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.attach_token)
-                        .hint_text(token_hint)
-                        .password(true)
-                        .desired_width(160.0),
-                );
-                if ui.button(self.t("live.connect")).clicked() {
-                    match telemetry_view::attach(&self.attach_addr, &self.attach_token) {
-                        Ok(source) => {
-                            self.source = source;
-                            self.status = format!("attached to {}", self.attach_addr.trim());
-                        }
-                        Err(e) => self.status = e,
+        // Spec 23.1: the editor attaches to a running process. The address and the token
+        // are typed here and dialled by the model, which owns every error string.
+        ui.horizontal(|ui| {
+            ui.label(self.t("live.attach"))
+                .on_hover_text(self.t("live.attach.hint"));
+            ui.add(
+                egui::TextEdit::singleline(&mut self.attach_addr)
+                    .hint_text(crate::model::launch::DEFAULT_TELEMETRY)
+                    .desired_width(160.0),
+            );
+            let token_hint = self.t("live.token");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.attach_token)
+                    .hint_text(token_hint)
+                    .password(true)
+                    .desired_width(160.0),
+            );
+            if ui.button(self.t("live.connect")).clicked() {
+                match telemetry_view::attach(&self.attach_addr, &self.attach_token) {
+                    Ok(source) => {
+                        self.source = source;
+                        self.status = format!("attached to {}", self.attach_addr.trim());
                     }
+                    Err(e) => self.status = e,
                 }
-            });
-            ui.separator();
-            ui.heading(self.t("live.performance"))
-                .on_hover_text(self.t("live.performance.hint"));
-            if self.telemetry.received == 0 {
-                ui.label(self.t("live.empty"));
-            }
-            egui::Grid::new("metrics").striped(true).show(ui, |ui| {
-                for (name, value) in self.telemetry.metric_rows() {
-                    // The row is named by the metric it is, and hovers the raw spelling the
-                    // producer sends (packet M7/E6).
-                    let plain = labels::metric_by_name(name)
-                        .map_or(name, |m| labels::metric_label(self.settings.lang, m));
-                    ui.label(plain).on_hover_text(name);
-                    ui.label(value.map_or_else(
-                        || self.t("value.not_measured").to_owned(),
-                        |v| format!("{v:.3}"),
-                    ));
-                    ui.end_row();
-                }
-            });
-            ui.separator();
-            self.training_section(ui);
-            ui.separator();
-            ui.heading(self.t("live.streams"));
-            egui::Grid::new("streams").striped(true).show(ui, |ui| {
-                for (key, tick, value) in self.telemetry.latest() {
-                    ui.label(format!("stream {}[{}]", key.stream.0, key.index));
-                    ui.label(format!("tick {tick}"));
-                    ui.label(format!("{value:.4}"));
-                    ui.end_row();
-                }
-            });
-            ui.separator();
-            ui.heading(self.t("live.events"));
-            for e in self.telemetry.events.iter().rev().take(200) {
-                ui.label(format!("[{}] {} {:?}", e.tick, e.kind, e.fields));
             }
         });
+        ui.separator();
+        ui.heading(self.t("live.performance"))
+            .on_hover_text(self.t("live.performance.hint"));
+        if self.telemetry.received == 0 {
+            ui.label(self.t("live.empty"));
+        }
+        egui::Grid::new("metrics").striped(true).show(ui, |ui| {
+            for (name, value) in self.telemetry.metric_rows() {
+                // The row is named by the metric it is, and hovers the raw spelling the
+                // producer sends (packet M7/E6).
+                let plain = labels::metric_by_name(name)
+                    .map_or(name, |m| labels::metric_label(self.settings.lang, m));
+                ui.label(plain).on_hover_text(name);
+                ui.label(value.map_or_else(
+                    || self.t("value.not_measured").to_owned(),
+                    |v| format!("{v:.3}"),
+                ));
+                ui.end_row();
+            }
+        });
+        ui.separator();
+        self.training_section(ui);
+        ui.separator();
+        ui.heading(self.t("live.streams"));
+        egui::Grid::new("streams").striped(true).show(ui, |ui| {
+            for (key, tick, value) in self.telemetry.latest() {
+                ui.label(format!("stream {}[{}]", key.stream.0, key.index));
+                ui.label(format!("tick {tick}"));
+                ui.label(format!("{value:.4}"));
+                ui.end_row();
+            }
+        });
+        ui.separator();
+        ui.heading(self.t("live.events"));
+        for e in self.telemetry.events.iter().rev().take(200) {
+            ui.label(format!("[{}] {} {:?}", e.tick, e.kind, e.fields));
+        }
     }
 
     /// The Live tab's Training section (packet M7/E7): the learning curve, the learning rate,
@@ -1124,28 +1130,26 @@ impl EditorApp {
         }
         let outputs = opened.observation.outputs.len();
         ui.label(count(opened.pairs.len(), outputs));
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for pair in &opened.pairs {
-                let (pair_before, pair_after) = opened
-                    .textures
-                    .entry(pair.name.clone())
-                    .or_insert_with(|| (texture(&ctx, pair, true), texture(&ctx, pair, false)));
-                ui.heading(&pair.name);
-                ui.horizontal(|ui| {
-                    for (label, tex) in [(before, &*pair_before), (after, &*pair_after)] {
-                        ui.vertical(|ui| {
-                            ui.label(label);
-                            let scale = (240.0 / tex.size_vec2().x).max(1.0);
-                            ui.image(egui::load::SizedTexture::new(
-                                tex.id(),
-                                tex.size_vec2() * scale,
-                            ));
-                        });
-                    }
-                });
-                ui.separator();
-            }
-        });
+        for pair in &opened.pairs {
+            let (pair_before, pair_after) = opened
+                .textures
+                .entry(pair.name.clone())
+                .or_insert_with(|| (texture(&ctx, pair, true), texture(&ctx, pair, false)));
+            ui.heading(&pair.name);
+            ui.horizontal(|ui| {
+                for (label, tex) in [(before, &*pair_before), (after, &*pair_after)] {
+                    ui.vertical(|ui| {
+                        ui.label(label);
+                        let scale = (240.0 / tex.size_vec2().x).max(1.0);
+                        ui.image(egui::load::SizedTexture::new(
+                            tex.id(),
+                            tex.size_vec2() * scale,
+                        ));
+                    });
+                }
+            });
+            ui.separator();
+        }
     }
 
     pub(crate) fn diagnostics_tab(&mut self, ui: &mut egui::Ui) {
@@ -1163,11 +1167,9 @@ impl EditorApp {
             ui.label(self.t("problems.none"));
             return;
         }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for d in diagnostics {
-                ui.label(d.to_string());
-            }
-        });
+        for d in diagnostics {
+            ui.label(d.to_string());
+        }
     }
 }
 
