@@ -7,9 +7,12 @@
 //! The script is embedded with `include_str!` and handed to `python -c`, so there is no
 //! installed-data-file lookup at runtime and editing the script forces a rebuild.
 
-use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::collections::{BTreeMap, VecDeque};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use es_assets::scene::SceneDesc;
 use es_core::{StableId, TickRate};
@@ -308,12 +311,62 @@ pub fn is_available() -> Result<(), String> {
     import_available("mujoco", "`mujoco` package")
 }
 
+/// How much of a process's stderr a death report can quote: the last this many bytes, and of
+/// those the last [`TAIL_LINES`] lines (packet M12/R6).
+const TAIL_BYTES: usize = 16 * 1024;
+const TAIL_LINES: usize = 64;
+
+/// How long a process whose call failed is given to finish exiting before its last words are
+/// read.
+const LAST_WORDS_WAIT: Duration = Duration::from_secs(1);
+
+/// The tail of a process's stderr, kept by a reader thread that drains the pipe as it fills,
+/// so an unread pipe never blocks the process. Read only when a call fails.
+#[derive(Debug)]
+struct StderrTail {
+    ring: Arc<Mutex<VecDeque<u8>>>,
+    reader: JoinHandle<()>,
+}
+
+impl StderrTail {
+    fn drain(mut stderr: ChildStderr) -> Self {
+        let ring = Arc::new(Mutex::new(VecDeque::with_capacity(TAIL_BYTES)));
+        let sink = Arc::clone(&ring);
+        let reader = std::thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                match stderr.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let mut ring = sink.lock().unwrap_or_else(PoisonError::into_inner);
+                        ring.extend(&buf[..n]);
+                        let excess = ring.len().saturating_sub(TAIL_BYTES);
+                        ring.drain(..excess);
+                    }
+                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        Self { ring, reader }
+    }
+
+    fn text(&self) -> String {
+        let mut ring = self.ring.lock().unwrap_or_else(PoisonError::into_inner);
+        let text = String::from_utf8_lossy(ring.make_contiguous()).into_owned();
+        let lines: Vec<&str> = text.trim().lines().collect();
+        lines[lines.len().saturating_sub(TAIL_LINES)..].join("\n")
+    }
+}
+
 /// A running reference process.
 #[derive(Debug)]
 pub struct Process {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// `None` when the caller did not pipe stderr.
+    stderr: Option<StderrTail>,
 }
 
 impl Process {
@@ -332,9 +385,10 @@ impl Process {
         for python in python_candidates() {
             let mut cmd = Command::new(&python);
             cmd.args(["-c", script])
-                // Every Python-side failure is reported on stdout as JSON, so stderr carries
-                // nothing we need and an unread pipe could only deadlock us.
-                .stderr(Stdio::null());
+                // Protocol errors come back on stdout as JSON; stderr is for a process that
+                // dies before it can write one (a traceback, the DLL loader), and it is drained
+                // as it fills, so it cannot deadlock us.
+                .stderr(Stdio::piped());
             match Self::spawn_command(cmd) {
                 Ok(process) => return Ok(process),
                 Err(e) => tried.push(format!("`{python}`: {e}")),
@@ -348,15 +402,18 @@ impl Process {
 
     /// Starts `cmd` (interpreter, arguments, environment and stderr already set) with the
     /// protocol on its stdin / stdout -- for an engine that cannot run from `python -c`
-    /// (packet M11/I1: Isaac Sim's Kit crashes when `sys.argv` is `["-c"]`).
+    /// (packet M11/I1: Isaac Sim's Kit crashes when `sys.argv` is `["-c"]`). A piped stderr is
+    /// drained into the tail a death report quotes.
     pub fn spawn_command(mut cmd: Command) -> std::io::Result<Self> {
         let mut child = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
         let stdin = child.stdin.take().expect("stdin was piped");
         let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().map(StderrTail::drain);
         Ok(Self {
             child,
             stdin,
             stdout: BufReader::new(stdout),
+            stderr,
         })
     }
 
@@ -364,19 +421,72 @@ impl Process {
     pub fn call<T: DeserializeOwned>(&mut self, request: &Request<'_>) -> Result<T, PhysicsError> {
         let line = serde_json::to_string(request)
             .map_err(|e| PhysicsError::Protocol(format!("cannot encode request: {e}")))?;
-        self.stdin
+        let sent = self
+            .stdin
             .write_all(line.as_bytes())
             .and_then(|()| self.stdin.write_all(b"\n"))
-            .and_then(|()| self.stdin.flush())
-            .map_err(|e| PhysicsError::ProcessDied(e.to_string()))?;
+            .and_then(|()| self.stdin.flush());
+        if let Err(e) = sent {
+            return Err(self.last_words(e.to_string(), true));
+        }
 
         let mut reply = String::new();
         match self.stdout.read_line(&mut reply) {
-            Ok(0) => Err(PhysicsError::ProcessDied(
+            Ok(0) => Err(self.last_words(
                 "the process closed its output without answering".to_owned(),
+                false,
             )),
             Ok(_) => parse_response(&reply),
-            Err(e) => Err(PhysicsError::ProcessDied(e.to_string())),
+            Err(e) => Err(self.last_words(e.to_string(), false)),
+        }
+    }
+
+    /// The [`PhysicsError::ProcessDied`] for a call that failed with `cause` (packet M12/R6):
+    /// a line the process left on stdout (a protocol error line's `error` replaces `cause`),
+    /// how it exited, and the tail of its stderr. Stdout is read only after a failed write and
+    /// only once the process has exited, so this never blocks past [`LAST_WORDS_WAIT`].
+    fn last_words(&mut self, cause: String, read_stdout: bool) -> PhysicsError {
+        let status = self.wait_briefly();
+        let mut what = cause;
+        let mut line = String::new();
+        if read_stdout && status.is_some() && self.stdout.read_line(&mut line).is_ok() {
+            match parse_response::<Ack>(&line) {
+                Err(PhysicsError::Backend(error)) => what = error,
+                _ if !line.trim().is_empty() => {
+                    what = format!("{what}; it wrote `{}`", truncate(&line));
+                }
+                _ => {}
+            }
+        }
+        let status = match status {
+            Some(s) => s
+                .code()
+                .map_or_else(|| s.to_string(), |c| format!("exit code {c}")),
+            None => "still running".to_owned(),
+        };
+        let tail = self
+            .stderr
+            .as_ref()
+            .map(StderrTail::text)
+            .unwrap_or_default();
+        PhysicsError::ProcessDied(if tail.is_empty() {
+            format!("{what} ({status})")
+        } else {
+            format!("{what} ({status}) — stderr: {tail}")
+        })
+    }
+
+    /// The exit status once the process has exited and its stderr is read to the end, or
+    /// whatever is known at [`LAST_WORDS_WAIT`].
+    fn wait_briefly(&mut self) -> Option<ExitStatus> {
+        let deadline = Instant::now() + LAST_WORDS_WAIT;
+        loop {
+            let status = self.child.try_wait().ok().flatten();
+            let drained = self.stderr.as_ref().is_none_or(|s| s.reader.is_finished());
+            if (status.is_some() && drained) || Instant::now() >= deadline {
+                return status;
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 }
@@ -604,5 +714,84 @@ mod tests {
     fn the_embedded_script_is_the_file_on_disk() {
         assert!(SCRIPT.contains("mujoco.mj_step"));
         assert!(SCRIPT.contains("\"cmd\""));
+    }
+
+    /// What `mujoco_ref.py` does when its imports fail: one protocol error line, then exit 1.
+    const DIES_ON_IMPORT: &str = r#"
+import sys
+sys.stderr.write("Traceback: the stand-in cannot import mujoco\n")
+print('{"ok": false, "error": "import failed: no module named mujoco"}', flush=True)
+raise SystemExit(1)
+"#;
+
+    /// Writes 2 MiB to stderr before every answer; a `step` makes it exit 3.
+    const FLOODS_STDERR: &str = r#"
+import sys
+while True:
+    line = sys.stdin.readline()
+    if not line or '"quit"' in line:
+        break
+    sys.stderr.write(("x" * 1023 + "\n") * 2048)
+    sys.stderr.flush()
+    if '"step"' in line:
+        raise SystemExit(3)
+    print('{"ok": true}', flush=True)
+"#;
+
+    /// `script` as a reference process, on the interpreter the backends use; `None` (printing
+    /// why) where there is none.
+    fn stand_in(script: &str) -> Option<Process> {
+        if let Err(why) = import_available("sys", "Python interpreter") {
+            println!("SKIP: {why}");
+            return None;
+        }
+        Some(Process::spawn_with(script, "stand-in").expect("the stand-in starts"))
+    }
+
+    /// Packet M12/R6: a process that reports an import failure and exits before the first
+    /// request is reported by what it said and how it exited, not by the write that found its
+    /// pipe closed (os error 232 on Windows).
+    #[test]
+    fn a_process_that_dies_before_the_first_request_says_why() {
+        let Some(mut process) = stand_in(DIES_ON_IMPORT) else {
+            return;
+        };
+        while process.child.try_wait().unwrap().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let err = process.call::<Ack>(&Request::State).unwrap_err();
+        let PhysicsError::ProcessDied(text) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(
+            text.starts_with("import failed: no module named mujoco (exit code 1)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("stderr: Traceback: the stand-in cannot import mujoco"),
+            "{text}"
+        );
+        assert!(!text.contains("os error"), "{text}");
+    }
+
+    /// Packet M12/R6: stderr is drained as it is written, so a process that floods it still
+    /// answers, and what a death report quotes of it stays bounded.
+    #[test]
+    fn a_process_that_floods_stderr_still_answers() {
+        let Some(mut process) = stand_in(FLOODS_STDERR) else {
+            return;
+        };
+        for _ in 0..2 {
+            let _: Ack = process.call(&Request::State).unwrap();
+        }
+        let err = process.call::<Ack>(&Request::Step { n: 1 }).unwrap_err();
+        let PhysicsError::ProcessDied(text) = &err else {
+            panic!("{err:?}");
+        };
+        assert!(text.contains("(exit code 3) — stderr: xxx"), "{text}");
+        assert!(
+            text.lines().count() <= 64 && text.len() <= 17 * 1024,
+            "{text}"
+        );
     }
 }
