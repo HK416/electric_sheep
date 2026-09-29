@@ -185,8 +185,12 @@ impl SlangCompiler {
         // compile independently and both reach here — deterministic compilation (spec §3.4)
         // means their bytes are identical, so whichever rename lands second just overwrites
         // the first with the same content; the cache dir still ends up with exactly one
-        // `<hash>.spv`.
-        let tmp = self.cache_dir.join(format!("{hash}.spv.tmp-{n}"));
+        // `<hash>.spv`. The counter is per process, so the process id makes the name unique
+        // across processes too: two `es` processes on a cold cache both drew `tmp-0`, and the
+        // second rename found the file already moved (packet P-M15-R1's finding).
+        let tmp = self
+            .cache_dir
+            .join(format!("{hash}.spv.tmp-{}-{n}", std::process::id()));
         std::fs::write(&tmp, bytes_from_words(&words))?;
         std::fs::rename(&tmp, &cached)?;
 
