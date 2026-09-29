@@ -123,10 +123,11 @@ distill    Merges datasets (episodes re-indexed, intervention labels and the row
            writes training_identity.json (spec 19.3), split.json and a loop step. The training
            run itself is PyTorch-side and is not run here, so every TrainingIdentity slot but
            `dataset` is an all-zero digest.
-           --frames <dir> also merges the inputs' flat frame tiles (`es loop collect --frames`)
-           into <dir>, in the merged dataset's global frame order; each input's tiles are the
-           --in-frames after its --in. Tiles that already are <dir> stay, when their --in is
-           first -- what `es loop cycle`'s [collect] merge does with collect/frames.
+           --frames <dir> also merges the inputs' frame tiles (`es loop collect --frames`, one
+           directory per camera when there are several) into <dir>, in the merged dataset's
+           global frame order; each input's tiles are the --in-frames after its --in. Tiles
+           that already are <dir> stay, when their --in is first -- what `es loop cycle`'s
+           [collect] merge does with collect/frames.
 
 cycle      Runs collect -> train -> eval -> showcase from one document, appending a step per
            stage to one ledger (spec 13.1, spec 13.3). It re-implements no stage: each one is
@@ -1385,8 +1386,9 @@ pub(crate) fn distill(args: &[String]) -> Result<u8, CliError> {
     Ok(0)
 }
 
-/// The inputs' flat `<NNNNNN>.bin` tiles (and `.json` beside them) in the merged dataset's
-/// global frame order: input `k`'s tile `i` becomes `<out>/<offset + i>`, the offset being the
+/// The inputs' `<NNNNNN>.bin` tiles (and `.json` beside them), per camera, in the merged
+/// dataset's global frame order: input `k`'s tile `i` becomes `<out>/<offset + i>` (under
+/// `<out>/<channel>/` for a collection of several cameras), the offset being the
 /// frames of the inputs before it -- `es_data::distill`'s episode order. Hard links where the
 /// volume allows, copies where not. Tiles that already are `<out>` at offset 0 (a cycle's new
 /// collection, merged first) stay where they are.
@@ -1402,7 +1404,16 @@ fn merge_frames(inputs: &[(&Path, &Path)], out: &Path) -> Result<u64, CliError> 
         let dataset = es_data::LeRobotDataset::open(root).map_err(|e| fail(root, &e))?;
         let n: u64 = dataset.episodes().iter().map(|m| m.length).sum();
         if tiles.canonicalize().ok().as_ref() != Some(&here) {
-            moves.push((*tiles, next, n));
+            // Several cameras: each one's `<channel>/` into the same `<channel>/` of `<dir>`
+            // (packet M15/N3). One, or none declared: the flat tiles, as before.
+            let cameras = es_data::training::camera_dirs(dataset.info(), tiles);
+            if cameras.len() > 1 {
+                for (camera, from) in cameras {
+                    moves.push((from, out.join(camera), next, n));
+                }
+            } else {
+                moves.push((tiles.to_path_buf(), out.to_path_buf(), next, n));
+            }
         } else if next != 0 {
             return Err(CliError::Usage(format!(
                 "--in-frames {}: these tiles are --frames itself, so its --in has to come \
@@ -1412,11 +1423,12 @@ fn merge_frames(inputs: &[(&Path, &Path)], out: &Path) -> Result<u64, CliError> 
         }
         next += n;
     }
-    for (tiles, offset, n) in moves {
+    for (tiles, into, offset, n) in moves {
+        std::fs::create_dir_all(&into).map_err(|e| fail(&into, &e))?;
         for i in 0..n {
             for ext in ["bin", "json"] {
                 let src = tiles.join(format!("{i:06}.{ext}"));
-                let dst = out.join(format!("{:06}.{ext}", offset + i));
+                let dst = into.join(format!("{:06}.{ext}", offset + i));
                 if ext == "json" && !src.exists() {
                     continue;
                 }

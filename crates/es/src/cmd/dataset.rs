@@ -44,9 +44,11 @@ train_act.py --baked <dir>` is the consumer.
                 the layout `es_env::render::EnvRenderer` writes. Without it, a declared
                 camera is dropped from the export and reported, because there are no
                 pixels for it.
-                For `bake`: the flat <dir>/<NNNNNN>.bin tiles `es loop collect --frames`
-                writes, in dataset-global frame order. An Observation IR with an image
-                input and no --frames is refused, never baked with zeros.
+                For `bake`: the tiles `es loop collect --frames` writes, in dataset-global
+                frame order -- flat <dir>/<NNNNNN>.bin for a Task IR with one image
+                channel, <dir>/<channel>/<NNNNNN>.bin for several, and each image input
+                reads its own channel's. An Observation IR with an image input and no
+                --frames is refused, never baked with zeros.
 --drop <a,b>    For `export`: source columns to leave out. `lerobot` classifies a policy
                 feature by name alone, so every `action*` column it sees becomes an action
                 head -- `--drop action_commanded,action_source` is what leaves one.
@@ -261,6 +263,12 @@ pub(crate) fn bake(args: &[String]) -> Result<u8, CliError> {
     std::fs::create_dir_all(&out)
         .map_err(|e| CliError::Runtime(format!("{}: {e}", out.display())))?;
 
+    // Each image port reads its own camera's frames: the directory `es loop collect --frames`
+    // wrote the Task IR channel its sensor is into (packet M15/N3) -- `--frames` itself for
+    // one image channel, as before, `<frames>/<channel>/` for several.
+    let dirs = frames
+        .as_deref()
+        .map(|d| es_tools::image_input_dirs(&bundle.task, d));
     let mut episodes = Vec::new();
     let mut global = 0u64;
     for meta in dataset.episodes() {
@@ -277,9 +285,17 @@ pub(crate) fn bake(args: &[String]) -> Result<u8, CliError> {
         plan.reset();
         for (t, row) in state.iter().enumerate() {
             let index = global + t as u64;
-            let mut tile = |port: &str| match frames.as_deref() {
-                Some(dir) => std::fs::read(dir.join(format!("{index:06}.bin")))
-                    .map_err(|e| format!("{}/{index:06}.bin: {e}", dir.display())),
+            let mut tile = |port: &str| match &dirs {
+                Some(dirs) => {
+                    let dir = dirs.get(port).ok_or_else(|| {
+                        format!(
+                            "observation input \"{port}\" is an image that no image channel of \
+                             the Task IR declares, so no frame directory is its"
+                        )
+                    })?;
+                    std::fs::read(dir.join(format!("{index:06}.bin")))
+                        .map_err(|e| format!("{}/{index:06}.bin: {e}", dir.display()))
+                }
                 None => Err(format!(
                     "observation input \"{port}\" is an image and --frames was not given; a \
                      baked set with a zero-filled image channel trains a policy that looks fine"

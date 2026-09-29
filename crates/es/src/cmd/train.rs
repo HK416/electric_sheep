@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 
 use es_compile::PolicyBundle;
 use es_data::training::{
-    camera_suffix, has_image_input, has_pretrained_backbone, init_from, init_weights, rollout_docs,
+    camera_dirs, has_image_input, has_pretrained_backbone, init_from, init_weights, rollout_docs,
     state_dim, Backbone, DatasetFacts, Plan, Recipe, Route, Step, StepKind, Training, TRAIN_ACT,
     TRAIN_PPO,
 };
@@ -572,13 +572,14 @@ pub(crate) fn run(
     let hardware_probe = probe(&interpreter, route)?;
 
     // The external route's exporter wants one directory per camera and `es loop collect
-    // --frames` writes a flat one; packet M5/V19 bridged the two with `mkdir` and `ln -s`.
-    if let (Route::External, Some(dataset), Some(flat)) = (
+    // --frames` writes a flat one for one camera; packet M5/V19 bridged the two with `mkdir`
+    // and `ln -s`.
+    if let (Route::External, Some(dataset), Some(frames)) = (
         route,
         &opened,
         recipe.dataset.as_ref().and_then(|d| d.frames.as_ref()),
     ) {
-        mirror_frames(Path::new(flat), dataset, &out.join("frames-in"))?;
+        mirror_frames(Path::new(frames), dataset, &out.join("frames-in"))?;
     }
 
     // `train_act.py` writes its checkpoints and its loss curve where it is told and creates
@@ -824,19 +825,22 @@ fn check_task(
     )))
 }
 
-/// Hard-links the flat `<NNNNNN>.bin` tiles into the `<camera>/` layout `es dataset export`
-/// reads. Nothing is copied unless the link fails, and an existing file is left alone.
+/// Hard-links each camera's `<NNNNNN>.bin` tiles into the `<camera>/` layout `es dataset
+/// export` reads: the flat tiles of a one-camera collection, `<frames>/<camera>/` for each
+/// camera of several (packet M15/N3, [`camera_dirs`]) -- never one camera's frames under
+/// another's name. Nothing is copied unless the link fails, and an existing file is left
+/// alone.
 ///
 /// ponytail: one link per frame, ~60k for a 200-demonstration set; a directory symlink would
 /// be one syscall, but it needs privileges on Windows and this runs on both.
-fn mirror_frames(flat: &Path, dataset: &LeRobotDataset, into: &Path) -> Result<(), CliError> {
-    let frames: u64 = dataset.episodes().iter().map(|m| m.length).sum();
-    for camera in dataset.info().cameras() {
-        let dir = into.join(camera_suffix(camera));
+fn mirror_frames(frames: &Path, dataset: &LeRobotDataset, into: &Path) -> Result<(), CliError> {
+    let total: u64 = dataset.episodes().iter().map(|m| m.length).sum();
+    for (camera, from) in camera_dirs(dataset.info(), frames) {
+        let dir = into.join(camera);
         std::fs::create_dir_all(&dir).map_err(|e| bad(format!("{}: {e}", dir.display())))?;
-        for i in 0..frames {
+        for i in 0..total {
             let (src, dst) = (
-                flat.join(format!("{i:06}.bin")),
+                from.join(format!("{i:06}.bin")),
                 dir.join(format!("{i:06}.bin")),
             );
             if dst.exists() {
@@ -847,7 +851,7 @@ fn mirror_frames(flat: &Path, dataset: &LeRobotDataset, into: &Path) -> Result<(
                     .map_err(|e| bad(format!("{} -> {}: {e}", src.display(), dst.display())))?;
             }
         }
-        println!("frames:        {} <- {}", dir.display(), flat.display());
+        println!("frames:        {} <- {}", dir.display(), from.display());
     }
     Ok(())
 }
@@ -1690,5 +1694,81 @@ mod tests {
             "300, the run's length, waits for the exit"
         );
         let _ = std::fs::remove_dir_all(&out);
+    }
+
+    /// Packet M15/N3: the external route's export gets each camera's own frames. One camera
+    /// mirrors the flat tiles, as before; two mirror `<frames>/<channel>/` each, and the v3
+    /// export then carries two image features, each with its own camera's pixels -- where the
+    /// old mirror linked one flat directory under every camera's name.
+    #[test]
+    fn mirror_frames_gives_each_camera_its_own_frames() {
+        use std::collections::BTreeMap;
+
+        use es_data::{Column, Dtype, Episode, FeatureSpec, Info, LeRobotDataset, LeRobotWriter};
+
+        let byte = |k: usize, g: usize| (10 + 100 * k + g) as u8;
+        for cameras in [&["top"][..], &["top", "wrist"]] {
+            let dir = scratch(&format!("mirror-{}", cameras.len()));
+            let (root, frames, into) = (dir.join("ds"), dir.join("frames"), dir.join("in"));
+            let mut features =
+                BTreeMap::from([("action".to_owned(), FeatureSpec::new(Dtype::Float32, [1]))]);
+            for c in cameras {
+                features.insert(
+                    format!("observation.images.{c}"),
+                    FeatureSpec::new(Dtype::Video, [2, 2, 3]),
+                );
+            }
+            let mut writer = LeRobotWriter::create(&root, Info::new(50.0, features)).unwrap();
+            writer
+                .write_episode(&Episode {
+                    index: 0,
+                    tasks: vec!["t".to_owned()],
+                    timestamps: vec![0.0, 0.02, 0.04],
+                    task_index: vec![0; 3],
+                    columns: BTreeMap::from([("action".to_owned(), Column::F32(vec![0.0; 3]))]),
+                    video: BTreeMap::new(),
+                })
+                .unwrap();
+            writer.finish().unwrap();
+            // The layout `es loop collect --frames` writes: flat for one image channel.
+            for (k, c) in cameras.iter().enumerate() {
+                let at = if cameras.len() > 1 {
+                    frames.join(c)
+                } else {
+                    frames.clone()
+                };
+                std::fs::create_dir_all(&at).unwrap();
+                for g in 0..3 {
+                    std::fs::write(at.join(format!("{g:06}.bin")), [byte(k, g); 12]).unwrap();
+                }
+            }
+
+            let dataset = LeRobotDataset::open(&root).unwrap();
+            super::mirror_frames(&frames, &dataset, &into).unwrap();
+            for (k, c) in cameras.iter().enumerate() {
+                for g in 0..3 {
+                    let tile = std::fs::read(into.join(c).join(format!("{g:06}.bin"))).unwrap();
+                    assert_eq!(tile, [byte(k, g); 12], "{c} {g}");
+                }
+            }
+            let out = dir.join("v3");
+            let report = es_data::export_v3(
+                &dataset,
+                &out,
+                Some(&into),
+                &es_data::ExportOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(report.cameras.len(), cameras.len(), "{report:?}");
+            let stats: Value = serde_json::from_str(
+                &std::fs::read_to_string(out.join("meta/stats.json")).unwrap(),
+            )
+            .unwrap();
+            for (k, c) in cameras.iter().enumerate() {
+                let max = &stats[format!("observation.images.{c}")]["max"][0][0][0];
+                assert_eq!(max.as_f64(), Some(f64::from(byte(k, 2)) / 255.0), "{c}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

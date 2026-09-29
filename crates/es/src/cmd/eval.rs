@@ -589,13 +589,9 @@ fn run_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
 /// is its sensor id (`CpuPlan`, spec 7.4): each image port gets its own camera's frame.
 #[cfg(feature = "render")]
 fn renderer_cfgs(bundle: &PolicyBundle) -> Result<Vec<(String, es_env::EnvRendererCfg)>, CliError> {
-    let channels = &bundle.task.observation_spec.channels;
     Ok(es_tools::frame_cameras(&bundle.task, None)?
         .into_iter()
-        .filter_map(|(name, cfg)| match channels[&name].source {
-            es_ir::task::ObsSource::Sensor { id, .. } => Some((id.to_string(), cfg)),
-            _ => None,
-        })
+        .filter_map(|(name, cfg)| Some((es_tools::plan_input(&bundle.task, &name)?, cfg)))
         .collect())
 }
 

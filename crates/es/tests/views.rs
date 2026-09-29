@@ -700,40 +700,50 @@ fn gate_errors(bundle: &es_compile::PolicyBundle, evaluation: &str) -> Vec<Strin
     .collect()
 }
 
+fn scratch(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    std::env::temp_dir().join(format!("es-views-{tag}-{nanos}"))
+}
+
+/// `es policy init` of one arm's bundle into `<dir>/<arm>.esb`: its Observation and Learning IR
+/// over task-views.toml and the committed deployment.toml, as the cycles' headers write it.
+fn policy_init(dir: &Path, arm: &str) -> PathBuf {
+    let out = dir.join(format!("{arm}.esb"));
+    let fixture = |n: &str| format!("tests/fixtures/visible-learning/{n}");
+    let o = Command::new(env!("CARGO_BIN_EXE_es"))
+        .current_dir(repo())
+        .args(["policy", "init", "--task", &fixture("task-views.toml")])
+        .args([
+            "--observation",
+            &fixture(&format!("observation-{arm}.toml")),
+        ])
+        .args(["--learning", &fixture(&format!("learning-{arm}.toml"))])
+        .args(["--deployment", &fixture("deployment.toml")])
+        .arg("--out")
+        .arg(&out)
+        .output()
+        .expect("run es policy init");
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    out
+}
+
 /// `es policy init` builds each arm's untrained bundle from its four documents (the committed
 /// `deployment.toml` reused), and the bundle passes the checks the expert gate makes before it
 /// opens a backend: `PolicyBundle::open` (XIR-010) and XIR-040 against the arm's own Evaluation
 /// IR -- and not against the other arm's (packet M12/Y5b's two calls, no Python).
 #[test]
 fn policy_init_builds_each_arms_bundle_and_the_gate_accepts_it() {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock")
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("es-views-policy-init-{nanos}"));
+    let dir = scratch("policy-init");
     let init = |arm: &str| -> es_compile::PolicyBundle {
-        let out = dir.join(format!("{arm}.esb"));
-        let fixture = |n: &str| format!("tests/fixtures/visible-learning/{n}");
-        let o = Command::new(env!("CARGO_BIN_EXE_es"))
-            .current_dir(repo())
-            .args(["policy", "init", "--task", &fixture("task-views.toml")])
-            .args([
-                "--observation",
-                &fixture(&format!("observation-{arm}.toml")),
-            ])
-            .args(["--learning", &fixture(&format!("learning-{arm}.toml"))])
-            .args(["--deployment", &fixture("deployment.toml")])
-            .arg("--out")
-            .arg(&out)
-            .output()
-            .expect("run es policy init");
-        assert_eq!(
-            o.status.code(),
-            Some(0),
-            "{}",
-            String::from_utf8_lossy(&o.stderr)
-        );
-        let bytes = std::fs::read(&out).expect("the bundle was written");
+        let bytes = std::fs::read(policy_init(&dir, arm)).expect("the bundle was written");
         es_compile::PolicyBundle::open(&bytes).expect("the bundle opens (XIR-010 included)")
     };
     let (cam, views) = (init("cam"), init("views"));
@@ -833,10 +843,254 @@ fn views_recipes_and_cycles_mirror_the_hint_card() {
         );
         assert!(plan.contains(&format!("evaluation-{arm}.toml")), "{plan}");
         assert!(plan.contains(VIEWS_SCENE), "{plan}");
+        // The bake reads the directory the collection writes: `collect/frames`, under which
+        // each of task-views.toml's three channels has its own `<channel>/` (packet M15/N3).
+        assert!(
+            plan.contains("--out collect/ds --frames collect/frames")
+                && plan.contains("--frames collect/frames collect/ds\n"),
+            "{plan}"
+        );
         assert!(plan.contains("preview"), "{plan}");
         assert!(!out.exists(), "a dry run writes nothing");
     }
     println!("RAN views_recipes_and_cycles_mirror_the_hint_card");
+}
+
+// --- baking several cameras (packet M15/N3) -------------------------------------------------------
+
+/// task-views.toml's image channels, in channel-name order.
+const CHANNELS: [&str; 3] = ["rgb_overhead", "rgb_side", "rgb_wrist"];
+
+/// The one byte every pixel of camera `k`'s tile at global frame `g` holds in collection
+/// `salt`: a tensor baked from it says which camera, which frame and which collection it is.
+fn tile_byte(salt: usize, k: usize, g: usize) -> u8 {
+    (7 + 50 * k + 3 * g + 100 * salt) as u8
+}
+
+/// A collection as `es loop collect --frames` writes it for task-views.toml: the columns the
+/// bake reads, a video feature per image channel, and each camera's tiles in its own
+/// `<frames>/<channel>/` (packet M15/N2).
+fn write_views_collection(root: &Path, frames: &Path, lengths: &[usize], salt: usize) {
+    use es_data::{Column, Dtype, Episode, FeatureSpec, Info, LeRobotWriter};
+
+    // `qpos || qvel` of the views scene, as `es_data::collect::to_lerobot` writes it.
+    let (state, dof) = (13 + 12, 6);
+    let mut features = BTreeMap::from([
+        (
+            "observation.state".to_owned(),
+            FeatureSpec::new(Dtype::Float32, [state as u64]),
+        ),
+        (
+            "action".to_owned(),
+            FeatureSpec::new(Dtype::Float32, [dof as u64]),
+        ),
+    ]);
+    for channel in CHANNELS {
+        features.insert(
+            format!("observation.images.{channel}"),
+            FeatureSpec::new(Dtype::Video, [96, 96, 3]),
+        );
+    }
+    // The labels `es loop distill` remaps.
+    for label in [es_data::INTERVENTION, es_data::ACTION_SOURCE] {
+        features.insert(label.to_owned(), FeatureSpec::new(Dtype::Int64, [1]));
+    }
+    let mut writer = LeRobotWriter::create(root, Info::new(50.0, features)).expect("create");
+    let mut g = 0;
+    for (index, n) in lengths.iter().copied().enumerate() {
+        let ramp = |w: usize| Column::F32((0..n * w).map(|i| (i % 7) as f32 / 7.0 - 0.5).collect());
+        writer
+            .write_episode(&Episode {
+                index: index as u32,
+                tasks: vec!["views".to_owned()],
+                timestamps: (0..n).map(|i| i as f64 / 50.0).collect(),
+                task_index: vec![0; n],
+                columns: BTreeMap::from([
+                    ("observation.state".to_owned(), ramp(state)),
+                    ("action".to_owned(), ramp(dof)),
+                    (es_data::INTERVENTION.to_owned(), Column::I64(vec![0; n])),
+                    (es_data::ACTION_SOURCE.to_owned(), Column::I64(vec![0; n])),
+                ]),
+                video: BTreeMap::new(),
+            })
+            .expect("write episode");
+        for _ in 0..n {
+            for (k, channel) in CHANNELS.iter().enumerate() {
+                let dir = frames.join(channel);
+                std::fs::create_dir_all(&dir).expect("camera dir");
+                let tile = vec![tile_byte(salt, k, g); 96 * 96 * 3];
+                std::fs::write(dir.join(format!("{g:06}.bin")), tile).expect("tile");
+            }
+            g += 1;
+        }
+    }
+    writer.finish().expect("finish");
+}
+
+/// One tensor of a safetensors file: its shape and its F32 values.
+fn tensor(bytes: &[u8], name: &str) -> (Vec<u64>, Vec<f32>) {
+    let header = es_policy::weights::parse_header(bytes).expect("safetensors");
+    let entry = header.get(name).unwrap_or_else(|| panic!("no {name}"));
+    let base = 8 + u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes")) as usize;
+    let data = &bytes[base + entry.offsets.0 as usize..base + entry.offsets.1 as usize];
+    let values = data
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes(b.try_into().expect("4 bytes")))
+        .collect();
+    (entry.shape.clone(), values)
+}
+
+/// Packet M15/N3's oracle: `es dataset bake` hands each image port its own camera's frames.
+/// Each of the three-view arm's three image tensors is, frame by frame, the one byte its own
+/// camera's tile holds at that global frame -- three different tensors, not one camera read
+/// three times -- and the one-view arm, baked from the same three-camera collection, reads the
+/// overhead camera's directory: its tensors are the three-view arm's, bit for bit.
+///
+/// task-views.toml has two `JointState` channels, so the bake resolves `joint_state` against
+/// the scene (packet M5/V7a) and needs the `MuJoCo` backend: `ES_PYTHON` with `mujoco`, or a
+/// skip.
+#[test]
+fn bake_reads_each_image_port_from_its_own_camera() {
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP bake_reads_each_image_port_from_its_own_camera: {reason}");
+        return;
+    }
+    let dir = scratch("bake");
+    let (root, frames) = (dir.join("ds"), dir.join("frames"));
+    let lengths = [3, 2];
+    write_views_collection(&root, &frames, &lengths, 0);
+    let bake = |arm: &str, flags: &[&str]| -> (Vec<Vec<u8>>, serde_json::Value) {
+        let out = dir.join(format!("baked-{arm}{}", flags.concat()));
+        let o = Command::new(env!("CARGO_BIN_EXE_es"))
+            .current_dir(repo())
+            .args(["dataset", "bake"])
+            .args(flags)
+            .arg("--policy")
+            .arg(policy_init(&dir, arm))
+            .arg("--out")
+            .arg(&out)
+            .arg("--frames")
+            .arg(&frames)
+            .arg(&root)
+            .output()
+            .expect("run es dataset bake");
+        assert_eq!(
+            o.status.code(),
+            Some(0),
+            "{}{}",
+            String::from_utf8_lossy(&o.stdout),
+            String::from_utf8_lossy(&o.stderr)
+        );
+        let manifest = std::fs::read_to_string(out.join("manifest.json")).expect("manifest");
+        let episodes = (0..lengths.len())
+            .map(|e| std::fs::read(out.join(format!("episode_{e:06}.safetensors"))).expect("ep"))
+            .collect();
+        (
+            episodes,
+            serde_json::from_str(&manifest).expect("manifest.json"),
+        )
+    };
+    let ((views, _), (cam, _)) = (bake("views", &[]), bake("cam", &[]));
+
+    let mut g = 0;
+    for (e, n) in lengths.iter().copied().enumerate() {
+        let mut seen = Vec::new();
+        for (k, channel) in CHANNELS.iter().enumerate() {
+            let (shape, values) = tensor(&views[e], channel);
+            assert_eq!(shape, [n as u64, 3, 96, 96], "{channel}");
+            for (t, frame) in values.chunks_exact(3 * 96 * 96).enumerate() {
+                let want = f32::from(tile_byte(0, k, g + t)) / 255.0;
+                assert!(
+                    frame.iter().all(|v| (v - want).abs() < 1e-6),
+                    "episode {e} frame {t} {channel}: {} is not camera {k}'s {want}",
+                    frame[0]
+                );
+            }
+            seen.push(values);
+        }
+        assert!(seen[0] != seen[1] && seen[1] != seen[2] && seen[0] != seen[2]);
+        for name in ["rgb_overhead", "joint_state", "action"] {
+            assert_eq!(tensor(&cam[e], name), tensor(&views[e], name), "{name}");
+        }
+        assert!(
+            es_policy::weights::parse_header(&cam[e])
+                .expect("safetensors")
+                .keys()
+                .all(|k| !k.contains("wrist") && !k.contains("side")),
+            "the one-view arm bakes one image"
+        );
+        g += n;
+    }
+
+    // What `es train` bakes for the three-view arm: `--for-training`, each view at its `Pad(4)`
+    // boundary. Its bytes per frame are the host RAM `train_act.py` holds per frame of the set.
+    let (_, manifest) = bake("views", &["--for-training"]);
+    let tensors = manifest["tensors"].as_object().expect("tensors");
+    for channel in CHANNELS {
+        assert_eq!(tensors[channel]["shape"], serde_json::json!([3, 104, 104]));
+    }
+    let per_frame: u64 = tensors
+        .values()
+        .map(|t| {
+            let shape = t["shape"].as_array().expect("a shape");
+            4 * shape
+                .iter()
+                .filter_map(serde_json::Value::as_u64)
+                .product::<u64>()
+        })
+        .sum();
+    println!("three-view training bake: {per_frame} bytes per frame");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("RAN bake_reads_each_image_port_from_its_own_camera");
+}
+
+/// `es loop distill --frames` (a cycle's `[collect] merge`) merges a three-camera collection
+/// camera by camera: the second input's tile `i` of each camera lands at `offset + i` in that
+/// camera's own directory, never in another's (packet M15/N3).
+#[test]
+fn distill_merges_each_cameras_tiles_into_its_own_directory() {
+    let dir = scratch("distill");
+    let (a, b) = (dir.join("a/ds"), dir.join("b/ds"));
+    let (fa, fb, merged) = (
+        dir.join("a/frames"),
+        dir.join("b/frames"),
+        dir.join("merged"),
+    );
+    write_views_collection(&a, &fa, &[2], 0);
+    write_views_collection(&b, &fb, &[3], 1);
+    let o = Command::new(env!("CARGO_BIN_EXE_es"))
+        .args(["loop", "distill", "--in"])
+        .arg(&a)
+        .arg("--in-frames")
+        .arg(&fa)
+        .arg("--in")
+        .arg(&b)
+        .arg("--in-frames")
+        .arg(&fb)
+        .args(["--train", "1", "--val", "0", "--test", "0", "--out"])
+        .arg(&merged)
+        .arg("--frames")
+        .arg(&fa)
+        .output()
+        .expect("run es loop distill");
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    for (k, channel) in CHANNELS.iter().enumerate() {
+        for (g, want) in [(0, tile_byte(0, k, 0)), (1, tile_byte(0, k, 1))]
+            .into_iter()
+            .chain((0..3).map(|i| (2 + i, tile_byte(1, k, i))))
+        {
+            let tile = std::fs::read(fa.join(channel).join(format!("{g:06}.bin"))).expect("tile");
+            assert!(tile.iter().all(|b| *b == want), "{channel} {g}");
+        }
+    }
+    assert!(!fa.join("000000.bin").exists(), "no flat tile");
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("RAN distill_merges_each_cameras_tiles_into_its_own_directory");
 }
 
 // --- the scene ------------------------------------------------------------------------------------

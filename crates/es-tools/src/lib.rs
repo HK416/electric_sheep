@@ -26,6 +26,52 @@ pub mod showcase;
 pub mod util;
 pub mod video;
 
+/// Where `--frames` writes one image channel's frames, and where `es dataset bake` reads them
+/// back: a Task IR with one image channel straight into `frames` (today's flat layout, byte for
+/// byte), one with several into `<frames>/<channel>/` each -- the directory the `LeRobot` v3
+/// export reads the camera `observation.images.<channel>` from (packets M15/N2, M15/N3).
+pub fn frame_dir(
+    task: &es_ir::task::TaskIr,
+    frames: &std::path::Path,
+    channel: &str,
+) -> std::path::PathBuf {
+    let images = task
+        .observation_spec
+        .channels
+        .values()
+        .filter(|c| c.ty.image.is_some())
+        .count();
+    if images > 1 {
+        frames.join(channel)
+    } else {
+        frames.to_path_buf()
+    }
+}
+
+/// The observation-plan input that reads a Task IR channel: its sensor id (`CpuPlan`, spec
+/// 7.4), or `None` for a channel whose source is not a sensor. The one key by which `es eval
+/// run --frames` and `es dataset bake` hand each image port its own camera.
+pub fn plan_input(task: &es_ir::task::TaskIr, channel: &str) -> Option<String> {
+    match task.observation_spec.channels.get(channel)?.source {
+        es_ir::task::ObsSource::Sensor { id, .. } => Some(id.to_string()),
+        _ => None,
+    }
+}
+
+/// Every image channel's [`frame_dir`], keyed by its [`plan_input`] -- what `es dataset bake`
+/// reads each image port's frames from (packet M15/N3).
+pub fn image_input_dirs(
+    task: &es_ir::task::TaskIr,
+    frames: &std::path::Path,
+) -> std::collections::BTreeMap<String, std::path::PathBuf> {
+    task.observation_spec
+        .channels
+        .iter()
+        .filter(|(_, c)| c.ty.image.is_some())
+        .filter_map(|(name, _)| Some((plan_input(task, name)?, frame_dir(task, frames, name))))
+        .collect()
+}
+
 /// One image channel of a Task IR: its name, frame, declared `ImageSpec` and the `render` its
 /// sensor declares (spec 7.4, packet M7/R5).
 #[cfg(feature = "render")]
@@ -93,7 +139,6 @@ pub fn frame_cameras(
                 .to_owned(),
         ));
     }
-    let several = images.len() > 1;
     images
         .into_iter()
         .map(|(name, frame, spec, render)| {
@@ -103,13 +148,7 @@ pub fn frame_cameras(
                      render it from"
                 )));
             };
-            let dir = frames.map(|d| {
-                if several {
-                    d.join(&name)
-                } else {
-                    d.to_path_buf()
-                }
-            });
+            let dir = frames.map(|d| frame_dir(task, d, &name));
             let cfg = es_env::render::sensor_cfg(camera, &spec, &render, dir);
             Ok((name, cfg))
         })

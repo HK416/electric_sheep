@@ -256,8 +256,9 @@ impl Estimator {
 pub struct DatasetRef {
     /// A `LeRobot` v2.1 root, as `es loop collect` writes it.
     pub root: String,
-    /// The flat `<NNNNNN>.bin` tiles beside it (`es loop collect --frames`). Required when
-    /// the Observation IR has an image input.
+    /// The `<NNNNNN>.bin` tiles beside it (`es loop collect --frames`): flat for one camera,
+    /// `<frames>/<channel>/` each for several ([`camera_dirs`]). Required when the Observation
+    /// IR has an image input.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frames: Option<String>,
 }
@@ -1135,6 +1136,26 @@ pub fn camera_suffix(feature: &str) -> &str {
     feature.rsplit_once('.').map_or(feature, |(_, tail)| tail)
 }
 
+/// Each camera of a dataset `es loop collect` wrote, by [`camera_suffix`] -- which is its Task
+/// IR channel's name -- with the directory its tiles are in under the collection's `--frames`:
+/// the root itself for one camera (the flat layout), `<frames>/<channel>/` each for several
+/// (packet M15/N2). What `es train` mirrors for the export and `es loop distill` merges.
+pub fn camera_dirs(info: &crate::Info, frames: &Path) -> Vec<(String, std::path::PathBuf)> {
+    let cameras: Vec<&str> = info.cameras().map(|c| camera_suffix(c)).collect();
+    let several = cameras.len() > 1;
+    cameras
+        .into_iter()
+        .map(|c| {
+            let dir = if several {
+                frames.join(c)
+            } else {
+                frames.to_path_buf()
+            };
+            (c.to_owned(), dir)
+        })
+        .collect()
+}
+
 // --- the command plan ------------------------------------------------------------------------
 
 /// Which command a [`Step`] is, so the shell can call it in-process.
@@ -1628,10 +1649,10 @@ impl Plan {
                 ];
                 if dataset.frames.is_some() {
                     // Not the recipe's path: `export` wants one directory per camera and
-                    // `es loop collect --frames` writes a flat one, so the shell mirrors the
-                    // tiles into `<out>/frames-in/<camera>` first. Packet M5/V19 did that by
-                    // hand with `mkdir` and `ln -s`; a recipe that needed it would not be one
-                    // command.
+                    // `es loop collect --frames` writes a flat one for one camera, so the shell
+                    // mirrors each camera's tiles into `<out>/frames-in/<camera>` first. Packet
+                    // M5/V19 did that by hand with `mkdir` and `ln -s`; a recipe that needed it
+                    // would not be one command.
                     export.push(s("--frames"));
                     export.push(under(out, "frames-in"));
                 }
@@ -2485,7 +2506,7 @@ pub fn collect_root(out: &Path) -> String {
     under(out, "collect/ds")
 }
 
-/// A dataset root's flat frame tiles, in the layout a cycle writes: the `frames` directory
+/// A dataset root's frame tiles, in the layout a cycle writes: the `frames` directory
 /// beside it (`collect/ds`, `collect/merged` and `collect/frames`).
 ///
 /// ponytail: a convention, not a declaration; a merged root from elsewhere needs a
