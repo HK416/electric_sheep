@@ -5442,6 +5442,160 @@ fn loop_collect_expert_needs_no_torch() {
     println!("RAN loop_collect_expert_needs_no_torch");
 }
 
+// --- packet M14/Q2: `--expert <name | program.toml>` -----------------------------------------
+
+/// The committed program, as the plan's oracle names it: relative to the repository root.
+const TEACH_PROGRAM: &str = "templates/teach/so101-pick-place.toml";
+
+/// `es <args>` from the repository root, `--expert <expert>` appended.
+fn run_expert(args: &[&str], expert: &str) -> Output {
+    bin()
+        .current_dir(train_root())
+        .args(args)
+        .args(["--expert", expert])
+        .output()
+        .expect("run es")
+}
+
+/// Packet M14/Q2: `es loop collect` and `es eval run` share one resolver. A program file passes
+/// its argument check and the command goes on to the next thing it opens (here a bundle that
+/// is not there); an unknown name, a missing file and a file that does not parse are refused
+/// by name before that.
+#[test]
+fn loop_collect_and_eval_run_resolve_expert_by_name() {
+    let dir = scratch_dir("expert-resolver");
+    let absent = dir.join("absent.esb").display().to_string();
+    let scene = demo_scene_path().display().to_string();
+    let bad = dir.join("grip-first.toml");
+    write(
+        &bad,
+        "kind = \"demonstration\"\nrobot = \"SO-101\"\nobject = \"cube\"\n\
+         [[blocks]]\ngrip = \"closed\"\nwait = 5.0\n",
+    );
+    let bad = bad.display().to_string();
+    let missing = dir.join("missing.toml").display().to_string();
+    let collect = [
+        "loop", "collect", "--policy", &absent, "--scene", &scene, "--out", "unused",
+    ];
+    let eval = [
+        "eval",
+        "run",
+        "--config",
+        "tests/fixtures/visible-learning/evaluation.toml",
+        "--policy",
+        &absent,
+        "--scene",
+        &scene,
+    ];
+    for args in [&collect[..], &eval[..]] {
+        for expert in [TEACH_PROGRAM, "so101-pick-place"] {
+            let out = run_expert(args, expert);
+            let err = stderr_of(&out);
+            assert_eq!(out.status.code(), Some(1), "{args:?} {expert}: {err}");
+            assert!(err.contains("absent.esb"), "{args:?} {expert}: {err}");
+        }
+        let out = run_expert(args, "nope");
+        assert_eq!(out.status.code(), Some(2), "{args:?}");
+        assert!(
+            stderr_of(&out).contains("unknown --expert 'nope'"),
+            "{}",
+            stderr_of(&out)
+        );
+        let out = run_expert(args, &missing);
+        let err = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        assert!(
+            err.contains(&format!("--expert {missing}: cannot read")),
+            "{err}"
+        );
+        let out = run_expert(args, &bad);
+        let err = stderr_of(&out);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        assert!(
+            err.contains(&format!("--expert {bad}: block 1 is a grip block")),
+            "{err}"
+        );
+    }
+}
+
+/// Packet M14/Q2: a cycle's `[collect] expert` may be a program's path, printed verbatim on
+/// the collection and the expert gate; the rest of the plan is the committed golden's.
+#[test]
+fn cycle_dry_run_prints_an_expert_program_verbatim() {
+    let dir = scratch_dir("cycle-teach");
+    let text = std::fs::read_to_string(train_root().join(CYCLE_RECIPE)).expect("cycle.toml");
+    let named = "expert   = \"so101-pick-place\"";
+    assert!(text.contains(named), "the fixture names the built-in");
+    let recipe = dir.join("cycle.toml");
+    write(
+        &recipe,
+        &text.replace(named, &format!("expert   = \"{TEACH_PROGRAM}\"")),
+    );
+    let out = run_cycle(
+        &recipe.display().to_string(),
+        &dir.join("run"),
+        &["--dry-run"],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", stderr_of(&out));
+    let plan = stdout(&out);
+    let with = format!("--expert {TEACH_PROGRAM}");
+    assert_eq!(plan.matches(&with).count(), 2, "{plan}");
+    let golden = std::fs::read_to_string(train_golden("plan-cycle.txt")).expect("the golden");
+    assert_eq!(plan.replace(&with, "--expert so101-pick-place"), golden);
+}
+
+/// Packet M14/Q2, Python-gated: the committed program file and the built-in name are one
+/// demonstration -- the same dataset `content` -- and the collect step records both the value
+/// as given and the one blake3 of the program's bytes.
+#[test]
+fn loop_collect_expert_program_file_is_the_builtin() {
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP loop_collect_expert_program_file_is_the_builtin: {reason}");
+        return;
+    }
+    let dir = scratch_dir("expert-program-file");
+    let policy = write_demo_bundle(&dir).display().to_string();
+    let scene = demo_scene_path().display().to_string();
+    let collect = |expert: &str, out: &str| {
+        let root = dir.join(out).display().to_string();
+        let args = [
+            "loop",
+            "collect",
+            "--policy",
+            &policy,
+            "--scene",
+            &scene,
+            "--episodes",
+            "2",
+            "--seed",
+            "1",
+            "--out",
+            &root,
+        ];
+        let run = run_expert(&args, expert);
+        let text = stdout(&run);
+        assert_eq!(run.status.code(), Some(0), "{text}\n{}", stderr_of(&run));
+        let content = text
+            .lines()
+            .find_map(|l| l.strip_prefix("content: "))
+            .unwrap_or_else(|| panic!("no content line in\n{text}"))
+            .to_owned();
+        let ledger = es_data::read_loop_steps(Path::new(&root)).expect("the ledger");
+        let step = ledger.last().expect("a collect step").inputs.clone();
+        println!("{expert}: {text}");
+        (content, step)
+    };
+    let (by_name, name_step) = collect("so101-pick-place", "name");
+    let (by_file, file_step) = collect(TEACH_PROGRAM, "file");
+    assert_eq!(by_file, by_name, "the file is the built-in's demonstration");
+    assert_eq!(name_step["expert"], "so101-pick-place");
+    assert_eq!(file_step["expert"], TEACH_PROGRAM);
+    let digest = blake3::hash(es_env::program::SO101_PICK_PLACE.as_bytes()).to_hex();
+    assert_eq!(name_step["expert_program"], digest.as_str());
+    assert_eq!(file_step["expert_program"], digest.as_str());
+    println!("RAN loop_collect_expert_program_file_is_the_builtin: content {by_name}");
+}
+
 // --- plan V: `es policy lower` / `es policy pack` (packet M5/V2) ------------------------------
 
 /// A checkpoint that fits a lowered module exactly: every declared shape, plus one tensor

@@ -340,19 +340,16 @@ pub enum PerturbAt<'c> {
 /// The perturbation hook: a closure, not an eighth extension point (`INV-17`).
 pub type Perturber<'a> = &'a mut dyn FnMut(PerturbAt<'_>);
 
-/// What [`Collector::run_perturbed`] is given beyond [`Collector::run_with_sink`].
+/// What [`Collector::run_perturbed`] is given beyond [`Collector::run_with_sink`]. What a
+/// perturbation adds to the ledger step (`perturb.config`, ...) travels in `run_perturbed`'s
+/// `ledger`, beside the expert's (packet M14/Q2).
 pub struct Perturbation<'a> {
     pub hook: Perturber<'a>,
-    /// Extra inputs of this run's `collect` ledger step (`perturb.config`, ...): provenance,
-    /// which like every ledger value feeds no hash (spec 13.3).
-    pub ledger: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for Perturbation<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Perturbation")
-            .field("ledger", &self.ledger)
-            .finish_non_exhaustive()
+        f.debug_struct("Perturbation").finish_non_exhaustive()
     }
 }
 
@@ -605,17 +602,23 @@ impl Collector {
             frame_sink,
             sink,
             None,
+            &[],
         )
     }
 
     /// [`Self::run_with_sink`] under an Evaluation IR's perturbations (packet M13/Z2): the
-    /// [`PerturbAt`] moments go to `perturb.hook` and `perturb.ledger` joins the ledger step.
-    /// `None` is the run of before, byte for byte.
+    /// [`PerturbAt`] moments go to `perturb.hook`. `None` is the run of before, byte for byte.
     ///
     /// The frames, the `.estraj` poses and the `observation.state` rows stay what the world
     /// was at each step -- a camera sees the scene, whatever reaches the policy late -- and
     /// the `action` column stays the plane's answer: a delayed, deadbanded or noisy actuator
     /// is the plant, and a demonstration labelled with it would teach the plant's error.
+    ///
+    /// `ledger` is the extra inputs of this run's `collect` ledger step: the expert and the
+    /// blake3 of its program (packet M14/Q2), the perturbation's `perturb.config`, ... (packet
+    /// M13/Z2). Provenance, which like every ledger value feeds no hash (spec 13.3); `&[]` is
+    /// the step of before.
+    #[allow(clippy::too_many_arguments)]
     pub fn run_perturbed<B, F, const NJ: usize, const H: usize>(
         spec: &CollectSpec<'_>,
         policy: &mut dyn PolicyRuntime,
@@ -624,6 +627,7 @@ impl Collector {
         mut frame_sink: Option<FrameSink<'_>>,
         mut sink: Option<CollectSink<'_>>,
         mut perturb: Option<Perturbation<'_>>,
+        ledger: &[(String, String)],
     ) -> Result<CollectReport, DataError>
     where
         B: PhysicsBackend,
@@ -916,7 +920,7 @@ impl Collector {
             .input("episodes", &spec.n_episodes)
             .output("content", &hex(&content))
             .output("schema", &hex(&schema));
-        for (key, value) in perturb.iter().flat_map(|p| &p.ledger) {
+        for (key, value) in ledger {
             step = step.input(key, value);
         }
         append_loop_step(spec.out_root, &step)?;

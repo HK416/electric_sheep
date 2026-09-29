@@ -17,6 +17,7 @@ use es_data::collect::{
 };
 use es_data::{CollectReport, InterventionSegment};
 use es_env::expert::{demo_cfg, ScriptedExpert};
+use es_env::program::{Program, ProgramError, SO101_PICK_PLACE};
 use es_env::Termination;
 use es_eval::{LightOverride, PerturbationPlan, ResetOverrides, StepState};
 use es_ir::deployment::{DeploymentIr, Watchdog};
@@ -38,7 +39,7 @@ use crate::util::hex;
 const HELP: &str = "\
 es loop collect --policy <policy.esb> --scene <file.xml|urdf> --episodes <N> --seed <S>
                 --out <root> [--backend <name>] [--runtime torch] [--max-steps <N>]
-                [--expert so101-pick-place] [--frames <dir>] [--traj <dir>]
+                [--expert <name | program.toml>] [--frames <dir>] [--traj <dir>]
                 [--perturb <evaluation.toml> --suites <a,b>]
                 [--telemetry <addr>] [--telemetry-token <t>] [--telemetry-image-every <N>]
 es loop intervene --dataset <root> --segments <segments.json>
@@ -78,6 +79,13 @@ collect    Opens the policy bundle (spec 9.6), rolls out <N> episodes through th
            required -- the bundle carries the Task, Observation and Deployment IR the
            collector reads -- but its weights are never loaded. A waypoint the arm cannot
            reach ends that episode as a failed demonstration (spec 17.2), written, not dropped.
+           The demonstration is a program of move and grip blocks (packet M14/Q2; design note
+           docs/design/editor-redesign.md section 11): a value ending in .toml is a program
+           file's path, anything else a built-in name -- so101-pick-place, which is
+           templates/teach/so101-pick-place.toml compiled in. A missing file, a file that does
+           not parse and an unknown name are refused by name before anything opens. The
+           ledger's collect step records `expert` (the value as given) and `expert_program`
+           (the blake3 of the program's bytes; the built-in's for a name).
            With --telemetry <addr> the collection publishes what it is doing, on the streams
            `es eval run --telemetry` uses (packet M7/E7): 1 the episode.begin / episode.end
            events, 2 one [frame, tick, source, violation bits] sample per control tick -- the
@@ -257,19 +265,16 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
     frames: Option<&std::path::Path>,
     publisher: Option<&mut Publisher>,
     perturb: Option<&mut Perturb>,
+    ledger: &[(String, String)],
 ) -> Result<CollectReport, CliError> {
     // The running episode's suite light, set by the perturbation hook at each episode's reset
     // and read by the frame sink below (packet M13/Z2); the identity without `--perturb`.
     let light = Cell::new(LightOverride::default());
-    let ledger = perturb.as_ref().map(|p| p.ledger());
     let mut at = perturb.map(|p| {
         let light = &light;
         move |at: PerturbAt<'_>| p.at(at, light)
     });
-    let perturbation = match (at.as_mut(), ledger) {
-        (Some(hook), Some(ledger)) => Some(Perturbation { hook, ledger }),
-        _ => None,
-    };
+    let perturbation = at.as_mut().map(|hook| Perturbation { hook });
     // One publisher, two hooks: the collector's own sink says what the plane did and the
     // frame sink has the pixels. A `RefCell` because both closures live at once and the run
     // is single-threaded -- neither hook can be entered from inside the other (packet M7/E7).
@@ -368,6 +373,7 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
             Some(&mut frame_sink),
             sink,
             perturbation,
+            ledger,
         )
         .map_err(|e| CliError::Runtime(e.to_string()));
     }
@@ -388,6 +394,7 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
         None,
         sink,
         perturbation,
+        ledger,
     )
     .map_err(|e| CliError::Runtime(e.to_string()))
 }
@@ -872,16 +879,16 @@ impl PolicyRuntime for ExpertPolicy {
     }
 }
 
-/// The expert `es eval run --expert <name>` drives with, paced by the same Deployment IR the
-/// collection path paces it with.
+/// The expert `es eval run --expert <name | program.toml>` drives with, paced by the same
+/// Deployment IR the collection path paces it with.
 pub(crate) fn expert_policy(
-    name: &str,
+    expert: &ExpertProgram,
     scene: &SceneDesc,
     deploy: &es_ir::deployment::DeploymentIr,
     seen: &SeenState,
 ) -> Result<ExpertPolicy, CliError> {
     Ok(ExpertPolicy {
-        expert: build_expert(name, scene, deploy)?,
+        expert: build_expert(expert, scene, deploy)?,
         seen: seen.clone(),
         nj: deploy.robot.n_joints,
         horizon: deploy.action.horizon,
@@ -889,31 +896,79 @@ pub(crate) fn expert_policy(
     })
 }
 
-/// The scripted expert for `--expert <name>`, built from the scene it will drive.
+/// What `--expert <name | program.toml>` names (packet M14/Q2), resolved once for `es loop
+/// collect` and `es eval run` alike: a value ending in `.toml` is a demonstration program's path
+/// (`docs/design/editor-redesign.md` section 11), anything else a built-in's name -- and the
+/// one built-in, `so101-pick-place`, is the committed program compiled in.
+#[derive(Debug)]
+pub(crate) struct ExpertProgram {
+    /// The flag's value as given: the collect step's `expert`.
+    given: String,
+    program: Program,
+    /// blake3 of the program's bytes, the built-in's compiled-in bytes for a name: the collect
+    /// step's `expert_program`.
+    digest: [u8; 32],
+}
+
+impl ExpertProgram {
+    /// Refuses, by name, an unknown name, a file that cannot be read and a file that does not
+    /// parse (in `ProgramError`'s words) -- before any bundle, scene or backend is opened.
+    pub(crate) fn resolve(given: &str, help: &str) -> Result<Self, CliError> {
+        let text = if Path::new(given).extension().is_some_and(|e| e == "toml") {
+            std::fs::read_to_string(given).map_err(|e| {
+                CliError::Runtime(format!(
+                    "--expert {given}: cannot read this demonstration program: {e}"
+                ))
+            })?
+        } else if given == EXPERT_NAME {
+            SO101_PICK_PLACE.to_owned()
+        } else {
+            return Err(CliError::Usage(format!(
+                "unknown --expert '{given}': the built-in expert is {EXPERT_NAME}, and a \
+                 demonstration program is a path ending in .toml\n\n{help}"
+            )));
+        };
+        let program = Program::parse(&text)
+            .map_err(|e| CliError::Runtime(format!("--expert {given}: {e}")))?;
+        Ok(Self {
+            given: given.to_owned(),
+            program,
+            digest: *blake3::hash(text.as_bytes()).as_bytes(),
+        })
+    }
+
+    /// The collect step's ledger inputs: provenance, which feeds no hash (spec 13.3).
+    fn ledger(&self) -> [(String, String); 2] {
+        [
+            ("expert".to_owned(), self.given.clone()),
+            ("expert_program".to_owned(), hex(&self.digest)),
+        ]
+    }
+}
+
+/// The scripted expert running `expert`'s program on the scene it will drive.
 ///
-/// The cube is the scene's one free-joint body: a demonstration that picks something up needs
-/// something that can be picked up, and naming it by id would put a scene detail in a flag.
+/// The object is the free-joint body the program names (`object = "cube"`): a demonstration
+/// that picks something up needs something that can be picked up, and the program -- not a
+/// flag -- says which.
 fn build_expert(
-    name: &str,
+    expert: &ExpertProgram,
     scene: &SceneDesc,
     deploy: &es_ir::deployment::DeploymentIr,
 ) -> Result<ScriptedExpert, CliError> {
-    if name != EXPERT_NAME {
-        return Err(CliError::Usage(format!(
-            "unknown --expert '{name}': only {EXPERT_NAME} exists\n\n{HELP}"
-        )));
-    }
-    let free: Vec<_> = scene
+    let refuse = |e: ProgramError| CliError::Runtime(format!("--expert {}: {e}", expert.given));
+    let object = &expert.program.object;
+    let joint = scene
         .joints
         .iter()
-        .filter(|j| j.kind == JointKind::Free)
-        .collect();
-    let [joint] = free.as_slice() else {
-        return Err(CliError::Runtime(format!(
-            "--expert {EXPERT_NAME} needs exactly one free-joint body to pick up; the scene has {}",
-            free.len()
-        )));
-    };
+        .find(|j| {
+            j.kind == JointKind::Free
+                && scene
+                    .bodies
+                    .iter()
+                    .any(|b| b.id == j.body && b.name == *object)
+        })
+        .ok_or_else(|| refuse(ProgramError::UnknownObject(object.clone())))?;
     let mut cfg = demo_cfg(joint.id);
     // Both paths replan at the deployment's inference rate and execute the chunk's rows in
     // between, so the rows that actually execute per chunk are the re-plan period -- one
@@ -922,7 +977,119 @@ fn build_expert(
         .map_err(|e| CliError::Runtime(e.to_string()))?
         .min(deploy.action.execute_chunk as u64);
     cfg.pace_to(deploy, replan as u32);
-    ScriptedExpert::new(scene, cfg).map_err(|e| CliError::Runtime(e.to_string()))
+    ScriptedExpert::with_program(scene, cfg, &expert.program).map_err(refuse)
+}
+
+/// Packet M14/Q2 oracles: the resolver `es loop collect` and `es eval run` share.
+#[cfg(test)]
+mod expert_program_tests {
+    use super::*;
+
+    fn repo(path: &str) -> String {
+        format!("{}/../../{path}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// A program file in this test's own directory.
+    fn written(name: &str, text: &str) -> String {
+        let dir = std::env::temp_dir().join(format!("es-q2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join(name);
+        std::fs::write(&path, text).expect("write the program");
+        path.display().to_string()
+    }
+
+    fn resolve(given: &str) -> Result<ExpertProgram, CliError> {
+        ExpertProgram::resolve(given, HELP)
+    }
+
+    /// The name and the committed file are one program with one digest; only `expert`, the
+    /// value as given, tells them apart in the ledger.
+    #[test]
+    fn expert_name_and_committed_file_are_one_program() {
+        let digest = hex(blake3::hash(SO101_PICK_PLACE.as_bytes()).as_bytes());
+        let name = resolve(EXPERT_NAME).expect("the built-in resolves");
+        assert_eq!(name.program, Program::builtin());
+        assert_eq!(
+            name.ledger(),
+            [
+                ("expert".to_owned(), EXPERT_NAME.to_owned()),
+                ("expert_program".to_owned(), digest.clone()),
+            ]
+        );
+        let path = repo("templates/teach/so101-pick-place.toml");
+        let file = resolve(&path).expect("the committed program resolves");
+        assert_eq!(file.program, name.program);
+        assert_eq!(
+            file.ledger(),
+            [
+                ("expert".to_owned(), path),
+                ("expert_program".to_owned(), digest),
+            ]
+        );
+    }
+
+    /// An unknown name, a missing file and a file that does not parse are each refused by
+    /// name, the last in `ProgramError`'s own words.
+    #[test]
+    fn expert_refuses_by_name() {
+        match resolve("so101-pick") {
+            Err(CliError::Usage(m)) => assert!(m.contains("unknown --expert 'so101-pick'"), "{m}"),
+            other => panic!("an unknown name was not a usage error: {other:?}"),
+        }
+        let missing = repo("templates/teach/no-such-program.toml");
+        let e = resolve(&missing).expect_err("a missing file");
+        assert!(matches!(e, CliError::Runtime(_)), "{e}");
+        assert!(
+            e.to_string()
+                .contains(&format!("--expert {missing}: cannot read")),
+            "{e}"
+        );
+
+        let both = written(
+            "both.toml",
+            &SO101_PICK_PLACE.replacen("above = 0.045", "above = 0.045\nheight = 0.2", 1),
+        );
+        let e = resolve(&both).expect_err("both heights");
+        let words = ProgramError::BothHeights(0).to_string();
+        assert!(
+            e.to_string().contains(&format!("--expert {both}: {words}")),
+            "{e}"
+        );
+        let junk = written("junk.toml", "kind = [");
+        let e = resolve(&junk).expect_err("not TOML");
+        assert!(e.to_string().contains("demonstration program:"), "{e}");
+    }
+
+    /// The program's object and places resolve against the scene it will drive; a program that
+    /// names what the scene lacks is refused by name, never approximated.
+    #[test]
+    fn expert_builds_on_the_scene_the_program_names() {
+        let scene =
+            crate::cmd::backend::load_scene(&repo("tests/fixtures/mjcf/so101_pick_place.xml"))
+                .expect("the demo scene");
+        let deploy = es_ir::serial::deployment_from_toml(
+            &std::fs::read_to_string(repo("tests/fixtures/visible-learning/deployment.toml"))
+                .expect("deployment.toml"),
+        )
+        .expect("the demo deployment");
+        let build = |name: &str, text: &str| {
+            let program = resolve(&written(name, text)).expect("parses");
+            build_expert(&program, &scene, &deploy)
+        };
+        build("builtin.toml", SO101_PICK_PLACE).expect("the built-in builds");
+        let e = build(
+            "ball.toml",
+            &SO101_PICK_PLACE.replace("object = \"cube\"", "object = \"ball\""),
+        )
+        .expect_err("no ball");
+        assert!(e.to_string().contains("object = \"ball\""), "{e}");
+        let e = build(
+            "shelf.toml",
+            &SO101_PICK_PLACE.replacen("move = \"bin\"", "move = \"shelf\"", 1),
+        )
+        .expect_err("no shelf");
+        assert!(e.to_string().contains("block 5: no geom"), "{e}");
+    }
 }
 
 /// One collection.
@@ -962,7 +1129,9 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
             )))
         }
     };
-    let expert_name = one(&pairs, "--expert").map(ToOwned::to_owned);
+    let program = one(&pairs, "--expert")
+        .map(|e| ExpertProgram::resolve(e, HELP))
+        .transpose()?;
     let policy_path = required(&pairs, "--policy")?.to_owned();
     let scene_path = required(&pairs, "--scene")?.to_owned();
     let out = PathBuf::from(required(&pairs, "--out")?);
@@ -1041,7 +1210,7 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
     }
     // `--expert` drives every tick itself, so the bundle's weights are never loaded and the
     // Torch runtime is not needed at all (design note section 5.1).
-    if expert_name.is_none() {
+    if program.is_none() {
         if let Err(reason) = es_policy::torch_runtime::is_available() {
             println!("SKIPPED (torch runtime unavailable: {reason})");
             return Ok(3);
@@ -1052,10 +1221,10 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
         Some(scene) => scene,
         None => super::backend::load_scene(&scene_path)?,
     };
-    let mut expert = match &expert_name {
-        Some(name) => Some(build_expert(name, &scene, &bundle.deployment)?),
-        None => None,
-    };
+    let mut expert = program
+        .as_ref()
+        .map(|p| build_expert(p, &scene, &bundle.deployment))
+        .transpose()?;
     let mut torch = TorchRuntime::new();
     let mut no_policy = NoPolicy;
     let policy: &mut dyn PolicyRuntime = if expert.is_some() {
@@ -1083,16 +1252,23 @@ pub(crate) fn collect(args: &[String], cycle: Option<&mut Publisher>) -> Result<
     let h = bundle.deployment.action.horizon;
     // One dispatch on the backend, monomorphized: `Env<B>` stays generic (spec 3.4).
     let (expert, frames) = (expert.as_mut(), frames.as_deref());
-    let p = perturb.as_mut();
+    // The collect step's inputs beyond the bundle's (spec 13.3): what drove it (packet M14/Q2)
+    // and what it ran under (packet M13/Z2).
+    let ledger: Vec<(String, String)> = program
+        .iter()
+        .flat_map(ExpertProgram::ledger)
+        .chain(perturb.iter().flat_map(Perturb::ledger))
+        .collect();
+    let (p, l) = (perturb.as_mut(), ledger.as_slice());
     let report = match kind {
         BackendKind::MuJoCoCpu => dispatch_nj_h!(
-            MuJoCoCpuBackend; nj, h, &spec, policy, expert, frames, publisher, p
+            MuJoCoCpuBackend; nj, h, &spec, policy, expert, frames, publisher, p, l
         ),
         BackendKind::MjWarp => dispatch_nj_h!(
-            MjWarpBackend; nj, h, &spec, policy, expert, frames, publisher, p
+            MjWarpBackend; nj, h, &spec, policy, expert, frames, publisher, p, l
         ),
         BackendKind::PhysX => dispatch_nj_h!(
-            PhysXBackend; nj, h, &spec, policy, expert, frames, publisher, p
+            PhysXBackend; nj, h, &spec, policy, expert, frames, publisher, p, l
         ),
         BackendKind::Newton => Err(crate::cmd::eval::no_closed_loop(kind)),
     }?;

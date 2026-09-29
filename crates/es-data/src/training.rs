@@ -1774,7 +1774,9 @@ pub struct CollectRef {
     #[serde(default)]
     pub policy: String,
     /// The scripted demonstrator, or absent for a trained policy's own rollouts. Setting it
-    /// is what arms the expert gate of spec 28.9 rule 1.
+    /// is what arms the expert gate of spec 28.9 rule 1. A built-in name or a demonstration
+    /// program's `.toml` path (packet M14/Q2), passed through verbatim to both `es loop
+    /// collect --expert` and the gate's `es eval run --expert`, which resolve it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expert: Option<String>,
     /// Required and never 0; defaulted for the same reason as `policy`.
@@ -3281,6 +3283,23 @@ fov = 36
             a.contains("--eye 0.66,-0.46,0.52 --look-at 0.14,-0.04,0.04"),
             "{a}"
         );
+    }
+
+    /// Packet M14/Q2: `[collect] expert` may be a program's path, and the plan carries it
+    /// verbatim to the collection and to the expert gate; nothing else in the plan moves.
+    #[test]
+    fn a_cycle_passes_an_expert_program_path_through() {
+        let path = "projects/cube/teach.toml";
+        let named = cycle_plan(CYCLE, "/tmp/q2").render(Path::new("/tmp/q2"));
+        let text = CYCLE.replace("\"so101-pick-place\"", &format!("{path:?}"));
+        let file = cycle_plan(&text, "/tmp/q2").render(Path::new("/tmp/q2"));
+        let with = format!("--expert {path}");
+        assert_eq!(
+            file.matches(&with).count(),
+            2,
+            "collect and the gate: {file}"
+        );
+        assert_eq!(file.replace(&with, "--expert so101-pick-place"), named);
     }
 
     /// A cycle names one source of data.
