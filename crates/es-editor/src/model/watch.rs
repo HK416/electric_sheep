@@ -10,7 +10,7 @@
 
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use es_data::collect::{read_loop_steps, LoopKind, LoopStep, CHECKPOINT};
@@ -24,7 +24,7 @@ use crate::model::live_run::StageRow;
 use crate::model::project::{
     self, Project, ProjectError, RunFolder, StartSettings, RUN_RECIPE, TELEMETRY_FILE,
 };
-use crate::model::telemetry_view::{self, Event, SeriesKey, Source, TelemetryModel};
+use crate::model::telemetry_view::{self, Closed, Event, SeriesKey, Source, TelemetryModel};
 use crate::model::template::{self, Length, Template};
 use crate::model::train_view::STREAM_TRAIN;
 use crate::model::workflow::{
@@ -44,6 +44,10 @@ pub const IMAGE_EVERY: &str = "50";
 /// `HelloAck`, which [`telemetry_view::source_of`] hands over first. It is not news of the run,
 /// and counting it would turn the light green before any data.
 const HANDSHAKE: u64 = 1;
+
+/// How long nothing attached waits before its unfinished run's `telemetry.txt` is dialled again
+/// (packet M12/R3): counted from the last dial's refusal, or from the attachment closing.
+pub const REDIAL_S: u64 = 10;
 
 /// `Termination::Success` as `episode.end` and `cell.end` both spell it (`{:?}`).
 const SUCCESS: &str = "Success";
@@ -354,10 +358,26 @@ pub fn may_start(pid: Option<u32>, queued: bool, phases: &[PhaseState; 5]) -> bo
 /// The address a re-opened project dials, once: its latest run's `telemetry.txt`, when disk says
 /// that run did not finish. A finished run has nobody left to answer.
 pub fn should_dial(run: Option<&RunFolder>, disk: &[PhaseState; 5]) -> Option<String> {
-    let unfinished = disk[2..4]
+    run.filter(|_| unfinished(disk))?.telemetry_addr()
+}
+
+fn unfinished(disk: &[PhaseState; 5]) -> bool {
+    disk[2..4]
         .iter()
-        .any(|p| matches!(p, PhaseState::Interrupted { .. }));
-    run.filter(|_| unfinished)?.telemetry_addr()
+        .any(|p| matches!(p, PhaseState::Interrupted { .. }))
+}
+
+/// The run's `telemetry.txt`, read and dialled on a thread of its own - never the UI's.
+fn redial(run: RunFolder) -> Receiver<Result<Client, String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let answer = run
+            .telemetry_addr()
+            .ok_or_else(String::new)
+            .and_then(|addr| launch::dial(&addr, "", 1, launch::ATTACH_DELAY));
+        let _ = tx.send(answer);
+    });
+    rx
 }
 
 /// The frame ④ becomes done: `Some(the step to show)` once - ⑤ when the person is on ③ or ④ and
@@ -426,14 +446,18 @@ fn demonstrations_of(run: &RunFolder) -> Option<u32> {
 
 enum Dial {
     Idle,
+    /// The re-open dial: ③ and ④ say *checking* until it answers.
     Dialling(Receiver<Result<Client, String>>),
-    Attached,
+    /// A later dial of `telemetry.txt` (packet M12/R3), which says nothing until it attaches.
+    Redialling(Receiver<Result<Client, String>>),
+    /// Until the connection says it closed.
+    Attached(Closed),
 }
 
 /// What one frame asks of the window.
 #[derive(Default)]
 pub struct Tick {
-    /// A re-opened run that is still going: the telemetry pane's new source.
+    /// A run still going that a dial reached: the telemetry pane's new source.
     pub attached: Option<Source>,
     /// A child started this frame: what was heard before belongs to another run.
     pub started: bool,
@@ -519,6 +543,8 @@ pub struct Watch {
     /// An argv to start once no child runs: Start, Resume, and the evaluation queued behind a kill.
     queued: Option<Vec<String>>,
     dial: Dial,
+    /// When the last dial was refused or the attachment closed: [`REDIAL_S`] counts from here.
+    quiet_since: Option<Instant>,
     /// When watching began, and the count and time of the last message heard.
     since: Option<Instant>,
     heard: (u64, Option<Instant>),
@@ -545,7 +571,8 @@ impl std::fmt::Debug for Watch {
 impl Watch {
     /// The project's latest run as disk has it. A run that did not finish is dialled once at its
     /// `telemetry.txt` address, on a thread of its own: an answer attaches, silence leaves it
-    /// *interrupted*. `repo_root` is `template::templates_root()`'s answer.
+    /// *interrupted* - and [`Self::tick`] dials again every [`REDIAL_S`] while it stays so.
+    /// `repo_root` is `template::templates_root()`'s answer.
     pub fn new(project: &Project, repo_root: Option<PathBuf>) -> Self {
         let source = source_of(project, repo_root);
         let run = project.latest_run();
@@ -571,6 +598,7 @@ impl Watch {
             ours: false,
             queued: None,
             dial,
+            quiet_since: None,
             since: None,
             heard: (0, None),
             facts,
@@ -595,20 +623,27 @@ impl Watch {
             self.heard = (telemetry.received, Some(now));
         }
         let answer = match &self.dial {
-            Dial::Dialling(rx) => match rx.try_recv() {
+            Dial::Dialling(rx) | Dial::Redialling(rx) => match rx.try_recv() {
                 Ok(answer) => Some(answer),
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(Err(String::new())),
             },
+            // A closed attachment is none (packet M12/R3): the phases go back to disk.
+            Dial::Attached(closed) if closed.get() => Some(Err(String::new())),
             _ => None,
         };
         match answer {
             Some(Ok(client)) => {
-                self.dial = Dial::Attached;
+                let (source, closed) = telemetry_view::source_and_closed(client);
+                self.dial = Dial::Attached(closed);
+                self.ours = false;
                 self.begin(now);
-                tick.attached = Some(telemetry_view::source_of(client));
+                tick.attached = Some(source);
             }
-            Some(Err(_)) => self.dial = Dial::Idle,
+            Some(Err(_)) => {
+                self.dial = Dial::Idle;
+                self.quiet_since = Some(now);
+            }
             None => {}
         }
         if launch.pid().is_none() {
@@ -633,6 +668,21 @@ impl Watch {
         if self.facts_key != Some(key) {
             self.facts_key = Some(key);
             self.facts = self.run.as_ref().map(RunFacts::read);
+        }
+        // Nothing runs, nothing is attached and disk says the run did not finish: it may have
+        // been resumed elsewhere, at a new address (packet M12/R3).
+        let due = self
+            .quiet_since
+            .is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_secs(REDIAL_S));
+        let idle = matches!(self.dial, Dial::Idle) && launch.pid().is_none();
+        if let Some(run) = self
+            .run
+            .as_ref()
+            .filter(|_| idle && due && self.queued.is_none())
+        {
+            if unfinished(&workflow::phases(self.facts.as_ref(), None)) {
+                self.dial = Dial::Redialling(redial(run.clone()));
+            }
         }
         let live = child.map(|c| LiveFacts::new(rows, self.fraction(rows, telemetry), c));
         let mut phases = workflow::phases(self.facts.as_ref(), live.as_ref());
@@ -662,7 +712,7 @@ impl Watch {
                 State::Failed(_) => Some(Child::Exited(-1)),
             };
         }
-        matches!(self.dial, Dial::Attached).then_some(Child::NotOurs)
+        matches!(self.dial, Dial::Attached(_)).then_some(Child::NotOurs)
     }
 
     fn fraction(&self, rows: &[StageRow], telemetry: &TelemetryModel) -> Option<f32> {
@@ -853,6 +903,7 @@ mod tests {
     use super::*;
     use crate::model::i18n::{t, Lang};
     use crate::model::project::tests::{cube, repo, scratch_project};
+    use crate::model::telemetry_view::tests::hanging_up_peer;
     use es_core::PhysTick;
     use es_telemetry::protocol::{Frame, Message, Payload};
     use PhaseState::{Done, Failed, Interrupted, Locked, NotStarted, Running, StoppedByYou};
@@ -1420,6 +1471,90 @@ mod tests {
             Centre::Idle,
             "a stopped run shows nothing live"
         );
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
+    /// Ticks at `now` until a dial attaches, and hands back the source it made.
+    fn attach(watch: &mut Watch, launch: &mut LaunchModel, now: Instant) -> Source {
+        let telemetry = TelemetryModel::default();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(Instant::now() < deadline, "nothing attached");
+            if let Some(source) = watch.tick(launch, &telemetry, Phase::Train, now).0.attached {
+                return source;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// Packet M12/R3: an attachment whose connection closes is no attachment - no light, never
+    /// *not responding*, and the phases disk's - and the run's `telemetry.txt` is dialled again
+    /// `REDIAL_S` later and not before, so a run resumed elsewhere is picked up.
+    #[test]
+    fn a_closed_attachment_falls_back_to_disk_and_is_dialled_again() {
+        let p = scratch_project("r3-closed");
+        let run = RunFolder {
+            number: 1,
+            path: p.next_run_dir(),
+        };
+        std::fs::create_dir_all(&run.path).unwrap();
+        let (first, hang_up) = hanging_up_peer();
+        std::fs::write(run.path.join(TELEMETRY_FILE), &first).unwrap();
+        let mut watch = Watch::new(&p, Some(repo()));
+        let mut launch = LaunchModel::default();
+        let t0 = Instant::now();
+        let mut source = attach(&mut watch, &mut launch, t0);
+        let mut telemetry = TelemetryModel::default();
+        telemetry.pump(&mut source, 8);
+
+        let late = t0 + Duration::from_secs(3600);
+        let (_, phases) = watch.tick(&mut launch, &telemetry, Phase::Train, late);
+        let view = watch.view(Phase::Train, &launch, &telemetry, &phases, late);
+        assert_eq!(
+            view.signal.map(|s| s.name),
+            Some(Verdict::NotResponding.key()),
+            "attached and silent"
+        );
+
+        drop(hang_up);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(&watch.dial, Dial::Attached(closed) if closed.get()) {
+            assert!(Instant::now() < deadline, "the hang-up was never noticed");
+            telemetry.pump(&mut source, 8);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (tick, phases) = watch.tick(&mut launch, &telemetry, Phase::Train, late);
+        assert!(tick.attached.is_none());
+        let view = watch.view(Phase::Train, &launch, &telemetry, &phases, late);
+        assert_eq!(
+            view.signal, None,
+            "no light at all, so never not responding"
+        );
+        assert_eq!(phases, workflow::phases(Some(&RunFacts::read(&run)), None));
+        assert!(view.interrupted && view.resume.is_none() && view.start.is_some());
+
+        // The run resumed elsewhere, publishing on a new address.
+        let server =
+            es_telemetry::transport::Server::bind("127.0.0.1:0".parse().unwrap(), None).unwrap();
+        std::fs::write(
+            run.path.join(TELEMETRY_FILE),
+            server.local_addr().to_string(),
+        )
+        .unwrap();
+        let redial = late + Duration::from_secs(REDIAL_S);
+        let early = late + Duration::from_millis(REDIAL_S * 1000 - 1);
+        watch.tick(&mut launch, &telemetry, Phase::Train, early);
+        assert!(matches!(watch.dial, Dial::Idle), "not before REDIAL_S");
+        let (_, phases) = watch.tick(&mut launch, &telemetry, Phase::Train, redial);
+        assert!(matches!(watch.dial, Dial::Redialling(_)), "dialled again");
+        assert!(
+            !watch
+                .view(Phase::Train, &launch, &telemetry, &phases, redial)
+                .checking
+        );
+        let mut source = attach(&mut watch, &mut launch, redial);
+        assert!(matches!(source(), Some(Message::HelloAck(_))));
+        assert_eq!(watch.child(&launch), Some(Child::NotOurs));
         std::fs::remove_dir_all(&p.root).ok();
     }
 }
