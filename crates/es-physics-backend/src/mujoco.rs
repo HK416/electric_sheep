@@ -184,7 +184,7 @@ impl MuJoCoCpuBackend {
 
     /// Pulls the whole batch's state into the local buffers.
     fn fetch_state(&mut self) -> Result<(), PhysicsError> {
-        let reply: StateReply = self.process()?.call(&Request::State)?;
+        let reply: StateReply = self.process()?.call_state()?;
         self.state = StateBuffers {
             qpos: reply.qpos,
             qvel: reply.qvel,
@@ -374,7 +374,7 @@ impl PhysicsBackend for MuJoCoCpuBackend {
                 got: ctrl.len(),
             });
         }
-        let _: Ack = self.process()?.call(&Request::SetCtrl { ctrl })?;
+        self.process()?.set_ctrl_frame(ctrl)?;
         Ok(())
     }
 

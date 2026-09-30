@@ -6,13 +6,16 @@ from Rust:
     {"cmd": "load", "mjcf": str, "n_envs": int, "timestep": float|null, "seed": int}
     {"cmd": "reset", "envs": [int]|null, "state": {...}|null}
     {"cmd": "set_ctrl", "ctrl": [float]}          # n_envs * nu, env-major
+    {"cmd": "set_ctrl", "frame": int}             # the same, as float64 bytes after the line
     {"cmd": "step", "n": int}
     {"cmd": "state"}
     {"cmd": "set_state", "state": {"qpos": [...], "qvel": [...], "act": [...]}}
     {"cmd": "set_params", "envs": [int], "params": [{"field", "index", "sub", "scale"}]}
     {"cmd": "quit"}
 
-Every response is {"ok": true, ...} or {"ok": false, "error": str}.
+Every response is {"ok": true, ...} or {"ok": false, "error": str}; the `state` reply is a
+line {"ok": true, "frame": [six lengths]} followed by the arrays' float64 bytes (`answer`,
+packet M16/H0).
 
 `n_envs` is `nworld` here: unlike the CPU reference, this is a real batch on one device
 (spec 12.1). Model metadata still comes from the CPU `MjModel`, which `put_model` is built
@@ -51,6 +54,40 @@ except ImportError as exc:  # Reported as a protocol response, not a traceback o
     _OUT.write(json.dumps({"ok": False, "error": "import failed: %s" % exc}) + "\n")
     _OUT.flush()
     raise SystemExit(1)
+
+
+def patch_ccd_grid_size():
+    """Works around an upstream failure (mujoco_warp 3.13.0, warp-lang 1.16.0; found by packet
+    M16/H1 on the Shadow Hand scene, reproduced in H0): with the CCD module already in warp's
+    kernel cache, `collision_convex._ccd_grid_size` asks `wp.get_suggested_block_size` about a
+    CCD kernel the loaded module's metadata does not list, and `mjw.step` raises
+    `KeyError: 'ccd_kernel_builder__locals__ccd_kernel_<hash>_cuda_kernel_forward_smem_bytes'`.
+    On that error the kernel's module is unloaded (warp rehashes it on the next load) and the
+    query retried once; if it fails again the grid is `naconmax`, the CPU branch's width -- the
+    kernel grid-strides over the candidates, so the contacts are the same and only the launch
+    width differs. A mujoco_warp without the function is left alone."""
+    try:
+        from mujoco_warp._src import collision_convex
+    except ImportError:
+        return
+    upstream = getattr(collision_convex, "_ccd_grid_size", None)
+    if upstream is None:
+        return
+
+    def ccd_grid_size(kernel, naconmax, device):
+        try:
+            return upstream(kernel, naconmax, device)
+        except KeyError:
+            kernel.module.unload()
+        try:
+            return upstream(kernel, naconmax, device)
+        except KeyError:
+            return naconmax
+
+    collision_convex._ccd_grid_size = ccd_grid_size
+
+
+patch_ccd_grid_size()
 
 # qpos / dof width per joint type, indexed by mjtJoint (free, ball, slide, hinge).
 JOINT_DIMS = {0: (7, 6), 1: (4, 3), 2: (1, 1), 3: (1, 1)}
@@ -94,8 +131,8 @@ def model_arrays(model):
 
 
 def flat(arr):
-    """A warp array as a flat list of float64, env-major (its first axis is nworld)."""
-    return np.asarray(arr.numpy(), dtype=np.float64).reshape(-1).tolist()
+    """A warp array as a flat float64 array, env-major (its first axis is nworld)."""
+    return np.asarray(arr.numpy(), dtype=np.float64).reshape(-1)
 
 
 def version_of(module, dist):
@@ -128,6 +165,28 @@ class Sim(object):
         # is called; until then every world shares the one loaded model.
         self.models = None
         self.batched = set()
+        # `replay`'s captured graphs, by key. A graph holds the arrays it was captured on, so
+        # `set_params` drops every graph when it replaces a model array.
+        self.graphs = {}
+
+    def replay(self, key, launch):
+        """Runs `launch` (mjw calls on `self.m` / `self.d`) as a CUDA graph captured right
+        after its first eager run, which builds every kernel module: the same kernels on the
+        same arrays, without the Python cost of issuing each launch -- ~30x for `step` on SO-101
+        at 1,024 worlds (packet M16/H0). Capturing enqueues nothing, so each call runs once."""
+        graph = self.graphs.get(key)
+        if graph is not None:
+            wp.capture_launch(graph)
+            return
+        launch()
+        device = self.d.qpos.device
+        if device.is_cuda and wp.is_mempool_enabled(device):
+            with wp.ScopedCapture(device=device) as capture:
+                launch()
+            self.graphs[key] = capture.graph
+
+    def forward(self):
+        self.replay("forward", lambda: mjw.forward(self.m, self.d))
 
     def warp_field(self, name):
         if name == "stat.meaninertia":
@@ -165,7 +224,12 @@ class Sim(object):
                 if value.size != host[env].size:
                     raise ValueError("%s: %d values per world, the CPU model has %d" % (name, host[env].size, value.size))
                 host[env] = np.asarray(value).reshape(host[env].shape)
-            setattr(owner, attr, wp.array(host, dtype=array.dtype, device=array.device))
+            if host.shape == tuple(array.shape):
+                # Already per-world: written in place, so the captured graphs stay valid.
+                array.assign(host)
+            else:
+                setattr(owner, attr, wp.array(host, dtype=array.dtype, device=array.device))
+                self.graphs = {}
         values = []
         for env in envs:
             for field, row, col in slots:
@@ -222,25 +286,28 @@ class Sim(object):
         # MuJoCo stores wxyz; spec 3.1 is xyzw.
         wxyz = np.asarray(self.d.xquat.numpy(), dtype=np.float64).reshape(-1, 4)
         return {
-            "qpos": flat(self.d.qpos),
-            "qvel": flat(self.d.qvel),
-            "act": flat(self.d.act),
-            "sensordata": flat(self.d.sensordata),
-            "xpos": flat(self.d.xpos),
-            "xquat": wxyz[:, [1, 2, 3, 0]].reshape(-1).tolist(),
+            "frame": [
+                flat(self.d.qpos),
+                flat(self.d.qvel),
+                flat(self.d.act),
+                flat(self.d.sensordata),
+                flat(self.d.xpos),
+                wxyz[:, [1, 2, 3, 0]].reshape(-1),
+            ]
         }
 
     def write_field(self, name, values, envs, width):
         """Overwrites rows `envs` of one state field from a flat env-major list."""
-        if not values or width == 0:
+        if len(values) == 0 or width == 0:
             return
         array = getattr(self.d, name)
         rows = np.array(array.numpy(), copy=True).reshape(self.n_envs, width)
-        for row, env in enumerate(envs):
-            chunk = values[row * width : (row + 1) * width]
-            if len(chunk) != width:
-                raise ValueError("%s row %d has %d values, expected %d" % (name, row, len(chunk), width))
-            rows[env] = np.asarray(chunk, dtype=rows.dtype)
+        envs = list(envs)
+        if len(values) != len(envs) * width:
+            raise ValueError("%s has %d values, expected %d rows of %d" % (name, len(values), len(envs), width))
+        # One fancy assignment, not a Python loop over rows (packet M16/H0): the same
+        # per-element float64 -> float32 conversion, a repeated env still last-wins.
+        rows[envs] = np.asarray(values, dtype=np.float64).reshape(len(envs), width).astype(rows.dtype)
         array.assign(np.ascontiguousarray(rows.reshape(array.shape)))
 
     def widths(self):
@@ -279,7 +346,7 @@ class Sim(object):
             if field == "qpos" and values:
                 values = self.unit_quaternions(list(values), len(envs))
             self.write_field(field, values, envs, widths[field])
-        mjw.forward(self.m, self.d)
+        self.forward()
 
     def reset(self, envs, state):
         mujoco.mj_resetData(self.mjm, self.mjd)
@@ -296,7 +363,7 @@ class Sim(object):
         if state is not None:
             self.write_state(state, envs)
         else:
-            mjw.forward(self.m, self.d)
+            self.forward()
 
     def set_ctrl(self, ctrl):
         nu = int(self.mjm.nu)
@@ -306,8 +373,11 @@ class Sim(object):
         self.write_field("ctrl", ctrl, range(self.n_envs), nu)
 
     def step(self, n):
-        for _ in range(n):
-            mjw.step(self.m, self.d)
+        def launch():
+            for _ in range(n):
+                mjw.step(self.m, self.d)
+
+        self.replay(("step", n), launch)
         qpos = np.asarray(self.d.qpos.numpy(), dtype=np.float64).reshape(self.n_envs, -1)
         qvel = np.asarray(self.d.qvel.numpy(), dtype=np.float64).reshape(self.n_envs, -1)
         finite = np.isfinite(qpos).all(axis=1) & np.isfinite(qvel).all(axis=1)
@@ -344,7 +414,7 @@ def main():
     wp.init()
     sim = None
     while True:
-        line = sys.stdin.readline()
+        line = sys.stdin.buffer.readline()
         if not line:
             return
         line = line.strip()
@@ -352,14 +422,39 @@ def main():
             continue
         try:
             req = json.loads(line)
+            if "frame" in req:
+                req["ctrl"] = read_frame(sys.stdin.buffer, int(req["frame"]))
             if req.get("cmd") == "quit":
                 return
             sim, payload = handle(sim, req)
             payload["ok"] = True
         except Exception as exc:  # Any failure is a protocol response, never a crash.
             payload = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
-        _OUT.write(json.dumps(payload) + "\n")
-        _OUT.flush()
+        answer(_OUT, payload)
+
+
+def read_frame(stream, n):
+    """`mujoco_ref.py`'s `read_frame`, verbatim: the `n` float64 values a request line's
+    `frame` announced, read as raw little-endian bytes right after the line (packet M16/H0)."""
+    data = stream.read(8 * n)
+    if len(data) != 8 * n:
+        raise EOFError("frame cut short: %d of %d bytes" % (len(data), 8 * n))
+    return np.frombuffer(data, dtype="<f8")
+
+
+def answer(out, payload):
+    """`mujoco_ref.py`'s `answer`, verbatim: a payload with a `frame` (the `state` reply) goes
+    as a line naming each array's length, then the arrays as raw little-endian float64 bytes
+    (packet M16/H0)."""
+    arrays = payload.pop("frame", None)
+    if arrays is not None:
+        payload["frame"] = [int(a.size) for a in arrays]
+    out.write(json.dumps(payload) + "\n")
+    out.flush()
+    if arrays is not None:
+        for a in arrays:
+            out.buffer.write(np.ascontiguousarray(a, dtype="<f8").tobytes())
+        out.buffer.flush()
 
 
 if __name__ == "__main__":

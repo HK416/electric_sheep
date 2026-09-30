@@ -2,7 +2,9 @@
 //!
 //! One request per line in, one JSON object per line out. Errors on the Python side come back
 //! as `{"ok": false, "error": ...}`, so a modelling mistake is a typed [`PhysicsError`] and
-//! never a dead process.
+//! never a dead process. Bulk floats (`state` replies and `set_ctrl` from/to `mujoco_ref.py`
+//! and `mjwarp_ref.py`) cross as raw `f64` bytes after their line instead ([`FrameHeader`],
+//! packet M16/H0).
 //!
 //! The script is embedded with `include_str!` and handed to `python -c`, so there is no
 //! installed-data-file lookup at runtime and editing the script forces a rebuild.
@@ -42,6 +44,12 @@ pub enum Request<'a> {
     },
     SetCtrl {
         ctrl: &'a [f64],
+    },
+    /// `set_ctrl` to `mujoco_ref.py` / `mjwarp_ref.py`: the `frame` values follow the line as
+    /// raw little-endian `f64` bytes ([`Process::set_ctrl_frame`], packet M16/H0).
+    #[serde(rename = "set_ctrl")]
+    SetCtrlFrame {
+        frame: usize,
     },
     Step {
         n: u32,
@@ -235,6 +243,37 @@ pub struct StateReply {
     pub sensordata: Vec<f64>,
     pub xpos: Vec<f64>,
     pub xquat: Vec<f64>,
+}
+
+/// The `state` reply of `mujoco_ref.py` and `mjwarp_ref.py` (packet M16/H0): a line
+/// `{"ok": true, "frame": [n_qpos, n_qvel, n_act, n_sensordata, n_xpos, n_xquat]}`, then those
+/// arrays' values as raw little-endian `f64` bytes, in that order. The bytes themselves, so a
+/// value arrives bit for bit, and a 1,024-env SO-101 state is 0.8 MB of memcpy rather than
+/// 1.8 MB of decimal text for Python to format and Rust to parse. `newton_ref.py` and
+/// `physx_ref.py` still answer [`StateReply`] as JSON lists.
+#[derive(Clone, Copy, Debug, Deserialize)]
+pub struct FrameHeader {
+    pub frame: [usize; 6],
+}
+
+/// Reads the bytes a [`FrameHeader`] announced off `reader` into a [`StateReply`].
+pub fn read_frame(reader: &mut impl Read, header: FrameHeader) -> std::io::Result<StateReply> {
+    let total: usize = header.frame.iter().sum();
+    let mut bytes = vec![0u8; total * 8];
+    reader.read_exact(&mut bytes)?;
+    let mut values = bytes
+        .chunks_exact(8)
+        .map(|b| f64::from_le_bytes(b.try_into().expect("chunks of 8")));
+    let [qpos, qvel, act, sensordata, xpos, xquat] =
+        header.frame.map(|n| values.by_ref().take(n).collect());
+    Ok(StateReply {
+        qpos,
+        qvel,
+        act,
+        sensordata,
+        xpos,
+        xquat,
+    })
 }
 
 /// A reply with no payload beyond `ok`.
@@ -456,7 +495,7 @@ impl Process {
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout: BufReader::with_capacity(1 << 20, stdout),
             stderr,
             wrote: false,
         })
@@ -464,12 +503,22 @@ impl Process {
 
     /// Sends one request and decodes its reply.
     pub fn call<T: DeserializeOwned>(&mut self, request: &Request<'_>) -> Result<T, PhysicsError> {
+        self.call_with(request, &[])
+    }
+
+    /// [`Self::call`], with `trailer` written right after the request line.
+    fn call_with<T: DeserializeOwned>(
+        &mut self,
+        request: &Request<'_>,
+        trailer: &[u8],
+    ) -> Result<T, PhysicsError> {
         let line = serde_json::to_string(request)
             .map_err(|e| PhysicsError::Protocol(format!("cannot encode request: {e}")))?;
         let sent = self
             .stdin
             .write_all(line.as_bytes())
             .and_then(|()| self.stdin.write_all(b"\n"))
+            .and_then(|()| self.stdin.write_all(trailer))
             .and_then(|()| self.stdin.flush());
         if let Err(e) = sent {
             return Err(self.last_words(e.to_string(), true));
@@ -484,6 +533,21 @@ impl Process {
             Ok(_) => parse_response(&reply),
             Err(e) => Err(self.last_words(e.to_string(), false)),
         }
+    }
+
+    /// `state` to a script that answers it as a [`FrameHeader`] and its bytes (packet M16/H0).
+    pub fn call_state(&mut self) -> Result<StateReply, PhysicsError> {
+        let header: FrameHeader = self.call(&Request::State)?;
+        read_frame(&mut self.stdout, header).map_err(|e| self.last_words(e.to_string(), false))
+    }
+
+    /// `set_ctrl` to a script that reads the values as raw little-endian `f64` bytes after the
+    /// line (packet M16/H0): what a JSON list of them is, bit for bit, without Python parsing
+    /// `n_envs * nu` decimal numbers every control step.
+    pub fn set_ctrl_frame(&mut self, ctrl: &[f64]) -> Result<(), PhysicsError> {
+        let bytes: Vec<u8> = ctrl.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _: Ack = self.call_with(&Request::SetCtrlFrame { frame: ctrl.len() }, &bytes)?;
+        Ok(())
     }
 
     /// The [`PhysicsError::ProcessDied`] for a call that failed with `cause` (packet M12/R6):
@@ -639,6 +703,88 @@ pub(crate) fn model_info(
     Ok(info)
 }
 
+/// Packet M16/H0 oracle: `script` (`mujoco_ref.py` or `mjwarp_ref.py`) loads the SO-101 scene
+/// with three envs and steps it twice (on `mjwarp` the second call replays the captured graph);
+/// its `state` is written once by the script's own `answer` (the frame) and once as the JSON
+/// float lists the scripts sent before, and the two decodings are asserted equal bit for bit.
+/// Run on the interpreter the backends use, after the caller checked it has the engine.
+#[cfg(test)]
+pub(crate) fn assert_state_matches_the_json_encoding(script: &str) {
+    const DRIVER: &str = r#"
+import json, sys
+g = {"__name__": "es_h0"}
+exec(open(sys.argv[1]).read(), g)
+out = g.get("_OUT", sys.stdout)
+if "wp" in g:
+    g["wp"].init()
+sim = g["Sim"](open(sys.argv[2]).read(), 3, None, 0)
+sim.reset(range(3), None)
+model = sim.mjm if hasattr(sim, "mjm") else sim.model
+sim.set_ctrl([0.3 * ((k % 5) - 2) for k in range(int(model.nu) * 3)])
+sim.step(25)
+sim.step(25)
+arrays = sim.state()["frame"]
+g["answer"](out, {"ok": True, "frame": arrays})
+names = ("qpos", "qvel", "act", "sensordata", "xpos", "xquat")
+old = dict(zip(names, (a.tolist() for a in arrays)), ok=True)
+out.write(json.dumps(old) + "\n")
+out.flush()
+"#;
+    let dir = std::env::temp_dir().join(format!(
+        "es-h0-{}-{}",
+        std::process::id(),
+        blake3::hash(script.as_bytes()).to_hex()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ref.py");
+    std::fs::write(&path, script).unwrap();
+    let mjcf = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/mjcf/so101_pick_place.xml"
+    );
+    let python = python_candidates().remove(0);
+    // Retried as `Process::start` retries: concurrent starts on Windows can die in the loader.
+    let out = retry_start("the M16/H0 driver", || {
+        let out = Command::new(&python)
+            .args(["-c", DRIVER])
+            .arg(&path)
+            .arg(mjcf)
+            .output()
+            .map_err(|e| (e.to_string(), false))?;
+        if out.status.success() {
+            return Ok(out);
+        }
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        let transient = transient_start_failure(out.status.code(), &stderr, !out.stdout.is_empty());
+        Err((format!("{}: {stderr}", out.status), transient))
+    })
+    .unwrap_or_else(|(e, attempts)| panic!("{e} (after {attempts} attempts)"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let mut reader = out.stdout.as_slice();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    let header: FrameHeader =
+        parse_response(&line).unwrap_or_else(|e| panic!("{e} ({})\n{stderr}", out.status));
+    let new = read_frame(&mut reader, header).unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    let old: StateReply = parse_response(&line).unwrap();
+    assert!(reader.is_empty(), "{} bytes left over", reader.len());
+    let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    for (what, a, b) in [
+        ("qpos", &new.qpos, &old.qpos),
+        ("qvel", &new.qvel, &old.qvel),
+        ("act", &new.act, &old.act),
+        ("sensordata", &new.sensordata, &old.sensordata),
+        ("xpos", &new.xpos, &old.xpos),
+        ("xquat", &new.xquat, &old.xquat),
+    ] {
+        assert_eq!(bits(a), bits(b), "{what}");
+    }
+    assert!(new.qpos.len() >= 3 * 13 && new.xquat.len() % 4 == 0);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +875,93 @@ mod tests {
         }
     }
 
+    /// Packet M16/H0: a frame decodes to exactly the bits it was written from, split in the
+    /// header's order, including what a JSON number cannot carry (`NaN`, infinities); a short
+    /// one is an error, never a truncated state.
+    #[test]
+    fn a_frame_decodes_bit_for_bit() {
+        let values = [
+            0.1,
+            -0.0,
+            -9.81,
+            f64::MIN_POSITIVE,
+            5e-324,
+            f64::MAX,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let header: FrameHeader =
+            parse_response(r#"{"ok": true, "frame": [3, 0, 0, 1, 4, 0]}"#).unwrap();
+        let state = read_frame(&mut bytes.as_slice(), header).unwrap();
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&state.qpos), bits(&values[..3]));
+        assert_eq!(bits(&state.sensordata), bits(&values[3..4]));
+        assert_eq!(bits(&state.xpos), bits(&values[4..]));
+        assert!(state.qvel.is_empty() && state.act.is_empty() && state.xquat.is_empty());
+        let short = FrameHeader {
+            frame: [9, 0, 0, 0, 0, 0],
+        };
+        assert!(read_frame(&mut bytes.as_slice(), short).is_err());
+    }
+
+    /// Packet M16/H0: `mujoco_ref.py`'s state frame is its old JSON state, bit for bit.
+    #[test]
+    fn mujoco_state_frame_is_the_json_state() {
+        if let Err(why) = is_available() {
+            println!("SKIP mujoco_state_frame_is_the_json_state: {why}");
+            return;
+        }
+        assert_state_matches_the_json_encoding(SCRIPT);
+    }
+
+    /// Packet M16/H0: through the real protocol, a `set_ctrl` sent as a frame steps
+    /// `mujoco_ref.py` to the state a JSON list of the same controls does, bit for bit.
+    #[test]
+    fn mujoco_ctrl_frame_is_the_json_ctrl() {
+        if let Err(why) = is_available() {
+            println!("SKIP mujoco_ctrl_frame_is_the_json_ctrl: {why}");
+            return;
+        }
+        let mjcf = crate::tests_support::fixture("so101_pick_place.xml");
+        let load = Request::Load {
+            mjcf: &mjcf,
+            n_envs: 2,
+            timestep: None,
+            seed: 0,
+        };
+        let run = |frame: bool| {
+            let (mut p, info): (Process, LoadReply) =
+                Process::start(SCRIPT, "MuJoCo", &load).unwrap();
+            let ctrl: Vec<f64> = (0..2 * info.nu)
+                .map(|k| 0.1 * f64::from(k) / 3.0 - 0.2)
+                .collect();
+            if frame {
+                p.set_ctrl_frame(&ctrl).unwrap();
+            } else {
+                let _: Ack = p.call(&Request::SetCtrl { ctrl: &ctrl }).unwrap();
+            }
+            let _: StepReply = p.call(&Request::Step { n: 40 }).unwrap();
+            p.call_state().unwrap()
+        };
+        let (a, b) = (run(true), run(false));
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&a.qpos), bits(&b.qpos));
+        assert_eq!(bits(&a.qvel), bits(&b.qvel));
+        assert_eq!(bits(&a.xpos), bits(&b.xpos));
+    }
+
+    /// Packet M16/H0: `mjwarp_ref.py`'s state frame is its old JSON state, bit for bit, after a
+    /// replayed step graph.
+    #[test]
+    fn mjwarp_state_frame_is_the_json_state() {
+        if let Err(why) = crate::MjWarpBackend::is_available() {
+            println!("SKIP mjwarp_state_frame_is_the_json_state: {why}");
+            return;
+        }
+        assert_state_matches_the_json_encoding(crate::mjwarp::SCRIPT);
+    }
+
     #[test]
     fn requests_encode_as_the_script_expects() {
         let encode = |r: &Request<'_>| serde_json::to_string(r).unwrap();
@@ -746,6 +979,10 @@ mod tests {
         assert_eq!(
             encode(&Request::SetCtrl { ctrl: &[0.5] }),
             r#"{"cmd":"set_ctrl","ctrl":[0.5]}"#
+        );
+        assert_eq!(
+            encode(&Request::SetCtrlFrame { frame: 12 }),
+            r#"{"cmd":"set_ctrl","frame":12}"#
         );
         assert_eq!(
             encode(&Request::Reset {
