@@ -7,13 +7,17 @@
     rendering, user data, memory sizing, the touch sensors), spell the servos as the
     <position> they are, write four orientations as the unit vectors SceneDesc stores (two of
     them move MuJoCo's compiled model by one bit), move the floating goal cube beside the hand,
-    and add what the path-traced cameras need (three cameras, an emitter, colour-faced cubes,
-    alpha 0 on what should not be drawn).
+    and add what the path-traced cameras need (three cameras, an emitter, alpha 0 on what
+    should not be drawn).
+    Appearance (packet H1b): the cube and the goal wear the bundle's `block.png` cube texture
+    and the hand the bundle's MatViz / MatColl materials, as the source declares them, less
+    `reflectance` (not rendered here). The goal's 0.5 alpha draws opaque (transparency is not
+    rendered either). Nothing here reaches the dynamics.
     One dynamics edit (packet H2b): the hand joints' class armature is 0.001, gymnasium-robotics'
     own value (the bundle's Isaac-parity 0 made MuJoCo's qacc blow up and auto-reset the data
     under policy-like servo targets); the wrists keep their explicit 0.005.
   -->
-  <compiler angle="radian" meshdir="meshes/"/>
+  <compiler angle="radian" meshdir="meshes/" texturedir="textures/"/>
 
   <option timestep="0.008333333333333333" integrator="implicitfast" iterations="20"/>
 
@@ -24,10 +28,12 @@
       <position ctrllimited="true" forcelimited="true"/>
     </default>
     <default class="robot0:DC_Hand">
-      <geom conaffinity="0" rgba="0.4 0.5 0.6 0"/>
+      <!-- MatColl as the source names it; alpha 0 on the geom overrides the material's 1
+           (MuJoCo's setMaterial), so the collision geoms draw nothing. -->
+      <geom conaffinity="0" material="robot0:MatColl" rgba="0.4 0.5 0.6 0"/>
     </default>
     <default class="robot0:D_Vizual">
-      <geom type="mesh" contype="0" conaffinity="0" rgba="0.93 0.93 0.93 1"/>
+      <geom type="mesh" contype="0" conaffinity="0" material="robot0:MatViz"/>
     </default>
     <default class="robot0:free">
       <joint type="free"/>
@@ -35,6 +41,12 @@
   </default>
 
   <asset>
+    <!-- The source's texture and materials, attribute for attribute, less `reflectance`. -->
+    <texture type="cube" colorspace="linear" name="texture:object" file="block.png" gridsize="3 4" gridlayout=".U..LFRB.D.."/>
+    <material name="robot0:MatColl" specular="1" shininess="0.3" rgba="0.4 0.5 0.6 1"/>
+    <material name="robot0:MatViz" specular="0.75" shininess="0.1" rgba="0.93 0.93 0.93 1"/>
+    <material name="material:object" texture="texture:object" specular="1" shininess="0.3"/>
+    <material name="material:target" texture="texture:object" specular="1" shininess="0.3" rgba="1 1 1 0.5"/>
     <mesh name="robot0:forearm" file="forearm_electric.stl"/>
     <mesh name="robot0:forearm_cvx" file="forearm_electric_cvx.stl"/>
     <mesh name="robot0:wrist" file="wrist.stl"/>
@@ -215,32 +227,14 @@
     <body name="object" pos="1 0.87 0.2" gravcomp="0">
       <joint name="object:joint" type="free"/>
       <!-- Live RigidBodyView confirmed authored USD mass precedence: 0.216 kg, box inertia diag 1.296e-4 kg*m^2. -->
-      <geom name="object" size="0.03 0.03 0.03" type="box" condim="4" mass="0.216" friction="1 0 0" rgba="1 1 1 0"/>
-      <!-- Six visual-only face slabs (mass 0, no collision), one saturated colour per face:
-           +x red, -x cyan, +y green, -y magenta, +z blue, -z yellow. The renderer draws rgba,
-           not textures, and a one-colour cube is ambiguous to a camera modulo 90 degrees. -->
-      <geom name="object_px" type="box" size="0.001 0.03 0.03" pos="0.029 0 0" contype="0" conaffinity="0" mass="0" rgba="1 0 0 1"/>
-      <geom name="object_nx" type="box" size="0.001 0.03 0.03" pos="-0.029 0 0" contype="0" conaffinity="0" mass="0" rgba="0 1 1 1"/>
-      <geom name="object_py" type="box" size="0.03 0.001 0.03" pos="0 0.029 0" contype="0" conaffinity="0" mass="0" rgba="0 1 0 1"/>
-      <geom name="object_ny" type="box" size="0.03 0.001 0.03" pos="0 -0.029 0" contype="0" conaffinity="0" mass="0" rgba="1 0 1 1"/>
-      <geom name="object_pz" type="box" size="0.03 0.03 0.001" pos="0 0 0.029" contype="0" conaffinity="0" mass="0" rgba="0 0 1 1"/>
-      <geom name="object_nz" type="box" size="0.03 0.03 0.001" pos="0 0 -0.029" contype="0" conaffinity="0" mass="0" rgba="1 1 0 1"/>
+      <geom name="object" size="0.03 0.03 0.03" type="box" condim="4" mass="0.216" friction="1 0 0" material="material:object"/>
       <site name="object:center" pos="0 0 0" size="0.01 0.01 0.01"/>
     </body>
     <!-- The goal cube floats (gravcomp) beside the hand, where the cameras see it; the Task IR's
          reset sets its pose. -->
     <body name="target" pos="1.12 0.87 0.2" gravcomp="1">
       <joint name="target:joint" type="free"/>
-      <geom name="target" size="0.03 0.03 0.03" type="box" contype="0" conaffinity="0" condim="4" rgba="1 1 1 0"/>
-      <!-- Six visual-only face slabs (mass 0, no collision), one saturated colour per face:
-           +x red, -x cyan, +y green, -y magenta, +z blue, -z yellow. The renderer draws rgba,
-           not textures, and a one-colour cube is ambiguous to a camera modulo 90 degrees. -->
-      <geom name="target_px" type="box" size="0.001 0.03 0.03" pos="0.029 0 0" contype="0" conaffinity="0" mass="0" rgba="1 0 0 1"/>
-      <geom name="target_nx" type="box" size="0.001 0.03 0.03" pos="-0.029 0 0" contype="0" conaffinity="0" mass="0" rgba="0 1 1 1"/>
-      <geom name="target_py" type="box" size="0.03 0.001 0.03" pos="0 0.029 0" contype="0" conaffinity="0" mass="0" rgba="0 1 0 1"/>
-      <geom name="target_ny" type="box" size="0.03 0.001 0.03" pos="0 -0.029 0" contype="0" conaffinity="0" mass="0" rgba="1 0 1 1"/>
-      <geom name="target_pz" type="box" size="0.03 0.03 0.001" pos="0 0 0.029" contype="0" conaffinity="0" mass="0" rgba="0 0 1 1"/>
-      <geom name="target_nz" type="box" size="0.03 0.03 0.001" pos="0 0 -0.029" contype="0" conaffinity="0" mass="0" rgba="1 1 0 1"/>
+      <geom name="target" size="0.03 0.03 0.03" type="box" contype="0" conaffinity="0" condim="4" material="material:target"/>
       <site name="target:center" pos="0 0 0" size="0.01 0.01 0.01"/>
     </body>
   </worldbody>

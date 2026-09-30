@@ -158,18 +158,21 @@ fn the_hand_parses_and_names_its_dofs_in_mujoco_order() {
     let cameras: Vec<&str> = scene.cameras.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(cameras, ["top", "front", "side"]);
 
-    // The face slabs change nothing about either cube's mass: the box geom carries it all.
+    // Packet H1b: each cube is its one box again, wearing the bundle's block texture through
+    // a drawn material; the held cube's box carries its mass.
     for cube in ["object", "target"] {
         let b = body(cube);
         assert!(b.inertial.is_none(), "{cube} takes its mass from its geoms");
-        let slabs: Vec<_> = b.geoms.iter().filter(|g| g.name != cube).collect();
-        assert_eq!(slabs.len(), 6, "{cube}");
-        assert!(slabs
-            .iter()
-            .all(|g| g.mass == Some(0.0) && g.visual_only && g.rgba[3] == 1.0));
-        let own = b.geoms.iter().find(|g| g.name == cube).unwrap();
-        assert_eq!(own.rgba[3], 0.0, "{cube}'s own box is not drawn");
+        let [own] = &b.geoms[..] else {
+            panic!("{cube}: {} geoms", b.geoms.len())
+        };
+        let material = own.material.expect("the box names its material");
+        assert!(
+            scene.materials[&material].rgb.is_some(),
+            "{cube} is textured"
+        );
     }
+    assert_eq!(body("object").geoms[0].mass, Some(0.216));
 }
 
 #[test]
