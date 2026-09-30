@@ -10,9 +10,10 @@
 //! solver, iterations, impratio), `<default>` classes including nesting, `class=` and
 //! `childclass=`, `<worldbody>` recursion over `<body>`, `<geom>`, `<joint>`, `<freejoint>`,
 //! `<site>`, `<inertial>`, `<camera>`, all five orientation spellings (see [`orient`]),
-//! `<actuator>`, `<sensor>`, `<tendon>` and `<asset>`.
+//! `<body gravcomp>`, `<actuator>`, `<sensor>`, `<tendon>`, `<contact>` (`<pair>`,
+//! `<exclude>`) and `<asset>`.
 //!
-//! Everything else — `<equality>`, `<contact>`, `<keyframe>`, `<visual>`, unknown elements and
+//! Everything else — `<equality>`, `<keyframe>`, `<visual>`, unknown elements and
 //! unknown attributes — becomes a [`Warning`]. Nothing is dropped in silence.
 //!
 //! The `<worldbody>` itself becomes a body named `world` (`MuJoCo`'s body 0), so world-level
@@ -194,26 +195,26 @@ impl std::fmt::Debug for Parser<'_> {
 /// Root children in the order they must be read: `<compiler>` changes angle units, classes
 /// must exist before an element names one, assets before a geom references one, bodies before
 /// a tendon or sensor references one.
-const ROOT_ORDER: [&str; 8] = [
+const ROOT_ORDER: [&str; 9] = [
     "compiler",
     "option",
     "asset",
     "default",
     "worldbody",
+    "contact",
     "tendon",
     "actuator",
     "sensor",
 ];
 
 /// Root children that are valid MJCF but have no place in [`SceneDesc`] yet.
-const ROOT_IGNORED: [&str; 8] = [
+const ROOT_IGNORED: [&str; 7] = [
     "size",
     "visual",
     "statistic",
     "custom",
     "extension",
     "equality",
-    "contact",
     "keyframe",
 ];
 
@@ -270,6 +271,7 @@ impl<'a> Parser<'a> {
                     "asset" => self.parse_asset(child)?,
                     "default" => self.parse_default(child, None)?,
                     "worldbody" => self.parse_worldbody(child)?,
+                    "contact" => self.parse_contact(child)?,
                     "tendon" => self.parse_tendon(child)?,
                     "actuator" => self.parse_actuator(child)?,
                     _ => self.parse_sensor(child)?,
@@ -571,6 +573,10 @@ impl<'a> Parser<'a> {
             sites: Vec::new(),
         };
         let childclass = attrs.own("childclass").unwrap_or(childclass);
+        let gravcomp = attrs.num_or("gravcomp", 0.0)?;
+        if gravcomp != 0.0 {
+            self.scene.gravcomp.insert(id, gravcomp);
+        }
         attrs.report_unknown(&mut self.warnings);
         let nested = self.parse_body_children(node, &mut body, &path, childclass)?;
         self.names.bodies.insert(name, id);

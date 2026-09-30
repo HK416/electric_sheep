@@ -7,7 +7,7 @@
 //!
 //! Severity is what makes the table operational: an unmapped row with `severity: error` blocks
 //! execution (spec 14.4). A row that is merely unverified is a `Warning` carrying
-//! `TODO(api-notes)` — a mapping is never *guessed* native.
+//! `TODO(api-notes)` ??a mapping is never *guessed* native.
 //!
 //! [`compare_backends`] runs one scene on two backends and reports spec 3.5 tier 3 metrics
 //! next to both mapping reports; it is the body of `es backend compare` (spec 17.2), whose CLI
@@ -92,7 +92,9 @@ impl Spec17Row {
 /// MJCF details that have no [`Feature`] because every `MuJoCo`-compiled backend reads them
 /// as `MuJoCo` does, but that a backend importing the MJCF through someone else's importer
 /// may drop or change (packet M11/I1, spec 28.14 rule 6: every importer gap is a row). They
-/// are asked only of such a backend -- today `PhysX` -- so no other report moves.
+/// are asked only of such a backend -- today `PhysX` -- so no other report moves; the rows
+/// [`MjcfRow::every_backend`] names (plan H, H1) are asked of every backend, and only of a
+/// scene that uses them, which no scene did before they were carried.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum MjcfRow {
     /// A joint's passive `damping`.
@@ -105,15 +107,24 @@ pub enum MjcfRow {
     SolverOptions,
     /// A body without `<inertial>`, whose mass `MuJoCo` derives from its geoms.
     BodyMassFromGeoms,
+    /// `<contact><pair>`: a geom pair that collides whatever its bitmasks say.
+    ContactPair,
+    /// `<contact><exclude>`: a body pair that never collides.
+    ContactExclude,
+    /// `<body gravcomp>`: a passive force cancelling (part of) a body's weight.
+    BodyGravComp,
 }
 
 impl MjcfRow {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 8] = [
         Self::JointDamping,
         Self::GeomFriction,
         Self::CollisionBitmask,
         Self::SolverOptions,
         Self::BodyMassFromGeoms,
+        Self::ContactPair,
+        Self::ContactExclude,
+        Self::BodyGravComp,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -123,7 +134,19 @@ impl MjcfRow {
             Self::CollisionBitmask => "geom.contype_conaffinity",
             Self::SolverOptions => "option.solver",
             Self::BodyMassFromGeoms => "body.mass_from_geoms",
+            Self::ContactPair => "contact.pair",
+            Self::ContactExclude => "contact.exclude",
+            Self::BodyGravComp => "body.gravcomp",
         }
+    }
+
+    /// Rows every backend's report asks, not `PhysX`'s alone: what the MJCF emitter writes
+    /// only since plan H, so a backend fed by it has to say what it makes of them.
+    pub const fn every_backend(self) -> bool {
+        matches!(
+            self,
+            Self::ContactPair | Self::ContactExclude | Self::BodyGravComp
+        )
     }
 
     /// Whether `scene` asks this row.
@@ -146,6 +169,9 @@ impl MjcfRow {
                 .bodies
                 .iter()
                 .any(|b| b.name != "world" && b.inertial.is_none() && !b.geoms.is_empty()),
+            Self::ContactPair => !scene.contact_pairs.is_empty(),
+            Self::ContactExclude => !scene.contact_excludes.is_empty(),
+            Self::BodyGravComp => !scene.gravcomp.is_empty(),
         }
     }
 }
@@ -328,7 +354,7 @@ pub fn lookup(feature: TaskFeature, backend: BackendKind) -> Mapping {
     }
 }
 
-/// `mujoco-cpu` is `MuJoCo`, so its column is whatever the adapter declares — derived from
+/// `mujoco-cpu` is `MuJoCo`, so its column is whatever the adapter declares ??derived from
 /// [`crate::mujoco::capabilities`] rather than restated, so the two cannot drift apart.
 fn mujoco_cpu(feature: TaskFeature) -> Mapping {
     match feature {
@@ -542,8 +568,13 @@ fn physx(feature: TaskFeature) -> Mapping {
             "a free rigid body; qpos / qvel converted to MuJoCo's free-joint convention (a free \
              joint on a body with children, a floating-base articulation, is refused at load)",
         ),
-        // Implemented, but no fixture exercises a prismatic joint, so it is not claimed.
-        TaskFeature::Capability(Feature::JointSlide) => Mapping::unverified(),
+        // Implemented, but no fixture exercises a prismatic joint, so it is not claimed. The
+        // emitter writes pairs, excludes and gravcomp since plan H; what Isaac's importer makes
+        // of them was never run.
+        TaskFeature::Capability(Feature::JointSlide)
+        | TaskFeature::Mjcf(
+            MjcfRow::ContactPair | MjcfRow::ContactExclude | MjcfRow::BodyGravComp,
+        ) => Mapping::unverified(),
         TaskFeature::Capability(Feature::JointSpring) => Mapping::approximated(
             "an explicit joint effort -k (q - springref) before each physics step",
         ),
@@ -708,14 +739,14 @@ pub fn mapping_report(scene: &SceneDesc, backend: BackendKind) -> MappingReport 
     {
         used.insert(TaskFeature::Spec17(Spec17Row::SensorContactForce));
     }
-    if backend == BackendKind::PhysX {
-        used.extend(
-            MjcfRow::ALL
-                .into_iter()
-                .filter(|row| row.asked(scene))
-                .map(TaskFeature::Mjcf),
-        );
-    }
+    used.extend(
+        MjcfRow::ALL
+            .into_iter()
+            .filter(|row| {
+                (backend == BackendKind::PhysX || row.every_backend()) && row.asked(scene)
+            })
+            .map(TaskFeature::Mjcf),
+    );
 
     let rows: Vec<MappingRow> = used
         .into_iter()
@@ -796,7 +827,7 @@ pub struct CompareReport {
     /// `max |qvel_a - qvel_b|` over every tick and every element.
     pub max_dqvel: f64,
     /// Energy drift **proxy**: `sum 1/2 qvel^2` at the last tick. It is not the system's
-    /// energy — no mass matrix, no potential term — but it is monotone in the kinetic part and
+    /// energy ??no mass matrix, no potential term ??but it is monotone in the kinetic part and
     /// needs nothing from the backend beyond `qvel`, so it is comparable across backends.
     /// Replace it with a real Hamiltonian when `ModelInfo` carries inertia.
     pub energy_proxy_a: f64,
@@ -976,7 +1007,7 @@ mod tests {
     #[test]
     fn every_feature_and_backend_pair_has_a_row() {
         let table = SemanticMapping::new();
-        assert_eq!(table.len(), (5 + 36 + 5) * 4);
+        assert_eq!(table.len(), (5 + 36 + 8) * 4);
         for feature in TaskFeature::all() {
             for backend in BackendKind::ALL {
                 let mapping = table

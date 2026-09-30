@@ -93,6 +93,7 @@ pub fn cornell_box() -> SceneDesc {
         assets: Vec::new(),
         options: PhysicsOptions::default(),
         meshes: BTreeMap::new(),
+        ..SceneDesc::default()
     }
 }
 

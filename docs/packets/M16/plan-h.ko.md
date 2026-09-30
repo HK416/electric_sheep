@@ -35,10 +35,16 @@ JSON 파이프로는 X7 ≈ 초당 제어 스텝 640이 나왔고, 이는 약 10
 
 | 웨이브 | 작업 | 선행 |
 |---|---|---|
-| 1 | H1 이 런타임에서의 장면 | — |
-| 2 | H2 작업과 교사 문서, 처리량 스모크 | H1 |
-| 3 | E1 교사 실행과 그 평가(오케스트레이터) | H2 |
-| 4 | H3 학생 문서 · E2 `Pt` 카메라 세 대로 수집, 학습, 평가(오케스트레이터) | E1 |
+| 1 | H1 이 런타임에서의 장면 · H0 물리 파이프의 바이너리 상태 페이로드 | — |
+| 2 | H2 작업과 교사 문서, 처리량 스모크 · HT1 텍스처와 metallic-roughness 머티리얼 | H1 (HT1은 H1이 머지된 뒤이기도 하다. `es-render/src/scene.rs`를 고친다) |
+| 3 | E1 교사 실행과 그 평가(오케스트레이터) · HT2 노멀 맵과 이미시브 맵, glTF 머티리얼 | H2 · HT1 |
+| 4 | H1b 손 장면이 번들의 텍스처와 머티리얼을 입는다. H2의 문서를 재생성 | HT1 |
+| 5 | H3 학생 문서 · E2 `Pt` 카메라 세 대로 수집, 학습, 평가(오케스트레이터) | E1, H1b |
+
+**오너 결정 2026-09-30 (M7 검토에서 보류된 R6):** "텍스처(PBR 기반 재질) 지원도 plan H에 패킷으로
+추가해줘" — 텍스처와 PBR 머티리얼을 넣는다. HT1/HT2는 메시의 선례(M10/W2)를 따라 **가산적**이다.
+텍스처도 PBR 머티리얼 속성도 없는 장면은 `scene_hash`를 그대로 유지하고 오늘과 비트 단위로 똑같이
+렌더되므로, 커밋된 문서와 체크포인트, 골든은 하나도 움직이지 않는다.
 
 ### 작업 H1: 이 런타임에서의 Shadow Hand 장면
 
@@ -68,6 +74,56 @@ JSON 파이프로는 X7 ≈ 초당 제어 스텝 640이 나왔고, 이는 약 10
   (3) 각 카메라가 리셋 자세를 `Pt`로 렌더하며 세 카메라 모두에서 큐브의 분할(segmentation) 픽셀이
   0보다 크고, 기존 것들과 같은 래스터 대 CPU 참조 검사를 한다. (4) 렌더와 데이터셋 골든은 그대로다
   (`cargo xtask verify-goldens`).
+
+### 작업 HT1: 텍스처와 metallic-roughness 머티리얼
+
+**Files:** `crates/es-assets/src/{mjcf/**,scene.rs,mesh.rs}`(+ 텍스처 모듈), `crates/es-render/**`
+(장면, CPU 참조, `Rs`/`Pt` Slang 커널, 생성기로 만드는 골든), 머티리얼 테이블을 렌더러까지 전달해야
+한다면 `crates/es-env/src/render*`, `docs/design/renderer.md`(+ko),
+`docs/ARCHITECTURE.ko.md` / `.md` §15.3(ko 먼저, 같은 커밋)과 §28의 R6 메모.
+
+- **에셋.** MJCF `<texture>`: PNG `file`(`gridsize` / `gridlayout`, 그리고 여섯 파일 형태 포함)에서
+  읽는 `type="2d"`와 `type="cube"`, 결정적으로 생성하는 `builtin="checker|gradient|flat"`
+  (`rgb1`/`rgb2`/`mark`/`markrgb`/`random`), `colorspace`(`auto`/`sRGB`/`linear`).
+  `<material>`: `rgba`, `texture`, `texrepeat`, `texuniform`, `emission`, 그리고 PBR 속성
+  `metallic`, `roughness`(MuJoCo ≥ 3.2), 여기에 `<layer role="rgb|orm|metallic|roughness">`.
+  기존의 `specular`/`shininess` 쌍은 명시적으로 주어졌을 **때만** 글로 적은 공식 하나로 유전체의
+  roughness에 대응시킨다(MuJoCo의 기본값이 지오메트리를 PBR로 바꾸지는 않는다). 텍스처 바이트는
+  경로가 아니라 내용으로 `asset_hash`에 해시한다. OBJ의 `vt` UV는 읽으며, STL에는 없다.
+- **UV.** 프리미티브의 정점별 UV는 MuJoCo 자체의 매핑을 따른다(큐브 텍스처의 박스 면은 MuJoCo가
+  `gridlayout`을 배치하는 대로, 평면 위의 2d 텍스처는 `texrepeat`/`texuniform`으로, 구·캡슐·실린더·
+  타원체는 MuJoCo가 매핑하는 대로). 메시는 자체 UV를 쓰고, UV가 없으면 MuJoCo의 투영을 쓴다.
+- **셰이딩.** 머티리얼 모델은 하나, glTF 2.0 metallic-roughness다. 베이스 컬러(계수 × sRGB 디코딩한
+  텍셀), metallic, roughness, `F0 = mix(0.04, base, metallic)`인 GGX / Smith 높이 상관 / Schlick
+  프레넬, 그리고 Lambert 확산 로브 × (1 − metallic). `Pt`: GGX 가시 법선의 중요도 샘플링, NEE 및
+  ReSTIR DI와의 MIS. `Rs`의 `Full`: PBR 머티리얼의 직접광에 Blinn-Phong 대신 같은 BRDF를 쓴다.
+  `Rs`의 `Lambert`: 베이스 컬러만. 샘플링은 쌍선형이고, wrap = repeat, 텍셀 중심은 +0.5, 밉맵은
+  없다(경로 추적기의 샘플과 `Full`의 SSAA가 풋프린트를 평균한다. 에일리어싱이 보이면 밉 체인은 뒤의
+  행으로 한다).
+- **오라클.** (1) 커밋된 모든 렌더 골든과 `scene_hash`, `asset_hash`가 그대로다(`verify-goldens`,
+  커밋된 문서의 해시를 다시 유도한다). (2) MuJoCo 자체 렌더러(`mujoco.Renderer`, 오프스크린)와의
+  텍스처 배치 비교: 번들의 `block.png` 큐브 텍스처를 입은 박스와 체커 평면을 같은 카메라로 양쪽에서
+  렌더하고, 각 면의 지배적인 텍셀 색이 일치한다(배치를 보는 것이지 셰이딩이 아니다). (3) BRDF:
+  화이트 퍼니스 테스트(알베도 1, 모든 roughness, metallic 0과 1에서 `Pt` 추정값이 ≤ 1이고, CPU에서
+  구적법으로 계산한 참조 적분값으로 수렴한다), CPU BRDF의 상호성과 비음수성. (4) GPU와 CPU 참조가
+  비트 단위로 같거나, 경로마다 렌더러 노트가 이미 밝힌 `Full`의 가장자리 픽셀 허용 오차 안에 있다.
+  (5) 새 골든은 그 생성기로 쓴다.
+
+### 작업 HT2: 노멀 맵과 이미시브 맵, glTF 머티리얼
+
+**Files:** HT1과 같고, 여기에 `crates/es-assets/src/gltf.rs`. 노멀 맵(UV에서 만드는 탄젠트 프레임,
+MikkTSpace 호환), 이미시브 텍스처(이미시브 삼각형은 `Pt`의 광원 목록에 들어간다), 그리고 같은
+머티리얼 테이블 위의 glTF 리더 `pbrMetallicRoughness`(베이스 컬러, metallic-roughness, 노멀
+텍스처). 오라클은 HT1의 (1), (4), (5)와 같고, 여기에 같은 높이 필드의 기하학적 범프와 견주는
+노멀 맵을 입힌 평면이 더해진다.
+
+### 작업 H1b: 손이 번들의 외형을 입는다
+
+**Files:** `tests/fixtures/mjcf/shadow_hand/**`, H2의 문서와 생성기. 큐브와 목표는 번들이 선언한 대로
+`block.png`를 입고(면 슬래브는 없앤다), 손은 그 머티리얼을 입는다. Task IR은 새 `scene_hash`에 맞춰
+재생성한다(물리는 그대로이므로 오라클은 H1의 qpos 일치다). 이것이 반영되기 전에 학습한 교사는
+재생성한 문서로 다시 묶는다(`es policy init` + `es policy pack`: 가중치는 Learning IR에만
+의존한다).
 
 ### 작업 H2: 재정향 작업과 교사의 문서
 

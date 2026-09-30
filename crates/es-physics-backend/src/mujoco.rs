@@ -58,6 +58,8 @@ pub fn capabilities() -> Capabilities {
             Feature::JointArmature,
             Feature::JointSpring,
             Feature::JointFrictionLoss,
+            // Fixed tendons: the emitter writes `<tendon><fixed>` (plan H, H1).
+            Feature::Tendon,
         ]
         .into(),
         actuators: [
@@ -92,6 +94,11 @@ pub fn capabilities() -> Capabilities {
                 "collision detection uses the convex hull of the mesh, never its concave \
                  surface (MuJoCo 3.13, docs/api-notes/mujoco.md); the renderer draws the \
                  surface, so what is drawn and what is collided with differ for a concave mesh",
+            ),
+            BackendQuirk::new(
+                Feature::Tendon,
+                "fixed tendons only: a spatial tendon runs through sites, which the MJCF \
+                 emitter does not write, so it is refused by name at load",
             ),
             BackendQuirk::new(
                 Feature::SensorJointPos,
