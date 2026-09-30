@@ -55,6 +55,40 @@ except ImportError as exc:  # Reported as a protocol response, not a traceback o
     _OUT.flush()
     raise SystemExit(1)
 
+
+def patch_ccd_grid_size():
+    """Works around an upstream failure (mujoco_warp 3.13.0, warp-lang 1.16.0; found by packet
+    M16/H1 on the Shadow Hand scene, reproduced in H0): with the CCD module already in warp's
+    kernel cache, `collision_convex._ccd_grid_size` asks `wp.get_suggested_block_size` about a
+    CCD kernel the loaded module's metadata does not list, and `mjw.step` raises
+    `KeyError: 'ccd_kernel_builder__locals__ccd_kernel_<hash>_cuda_kernel_forward_smem_bytes'`.
+    On that error the kernel's module is unloaded (warp rehashes it on the next load) and the
+    query retried once; if it fails again the grid is `naconmax`, the CPU branch's width -- the
+    kernel grid-strides over the candidates, so the contacts are the same and only the launch
+    width differs. A mujoco_warp without the function is left alone."""
+    try:
+        from mujoco_warp._src import collision_convex
+    except ImportError:
+        return
+    upstream = getattr(collision_convex, "_ccd_grid_size", None)
+    if upstream is None:
+        return
+
+    def ccd_grid_size(kernel, naconmax, device):
+        try:
+            return upstream(kernel, naconmax, device)
+        except KeyError:
+            kernel.module.unload()
+        try:
+            return upstream(kernel, naconmax, device)
+        except KeyError:
+            return naconmax
+
+    collision_convex._ccd_grid_size = ccd_grid_size
+
+
+patch_ccd_grid_size()
+
 # qpos / dof width per joint type, indexed by mjtJoint (free, ball, slide, hinge).
 JOINT_DIMS = {0: (7, 6), 1: (4, 3), 2: (1, 1), 3: (1, 1)}
 
