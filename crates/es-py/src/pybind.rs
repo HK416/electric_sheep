@@ -20,7 +20,7 @@ use std::collections::BTreeMap;
 use pyo3::create_exception;
 use pyo3::exceptions::{PyException, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyByteArray, PyDict};
 
 use es_ir::graph::NodeId;
 use es_ir::Diagnostic;
@@ -461,10 +461,13 @@ impl Deployment {
 /// backend="mujoco-cpu")`
 /// — the four documents as **text**, not paths, exactly like the JSON the builders take.
 ///
-/// Lists in, lists out: no numpy here and therefore no numpy in the Rust crate either
-/// (`docs/design/rl-continuation.md` section 3). `train_ppo.py` is the one that wants tensors
-/// and is also the one that already imports torch, so the conversion belongs on its side —
-/// adding `numpy` to `es-py` would put a second array ABI in the runtime for nobody's benefit.
+/// No numpy here and therefore no numpy in the Rust crate either (`docs/design/rl-continuation.md`
+/// section 3). `train_ppo.py` is the one that wants tensors and is also the one that already
+/// imports torch, so the conversion belongs on its side — adding `numpy` to `es-py` would put a
+/// second array ABI in the runtime for nobody's benefit. The two wide arrays -- the
+/// observation ports and the actions -- cross as little-endian `f64` bytes, which
+/// `torch.frombuffer` reads without a Python float per value (packet M16/H2c: at 2,048 Shadow
+/// Hand envs that is 180k observation values a control step); the per-env ones stay lists.
 ///
 /// `unsendable` for the same reason every builder above is: `Env`, `CpuPlan` and the backend
 /// process handle are not `Send`, and a trainer steps its envs from the thread that built
@@ -510,9 +513,18 @@ fn rollout_err(e: RolloutError) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
-/// What one [`Rollout::act`] hands back, as the tuple Python unpacks: the executed action, the
-/// plane's event bits, the rewards and the dones, each `n_envs` long (`executed` `n_envs * nu`).
-type ActTuple = (Vec<f64>, Vec<u32>, Vec<f64>, Vec<bool>);
+/// What one [`Rollout::act`] hands back, as the tuple Python unpacks: the executed action (as
+/// `f64` bytes, `n_envs * nu` values), the plane's event bits, the rewards and the dones, each
+/// `n_envs` long.
+type ActTuple<'py> = (Bound<'py, PyByteArray>, Vec<u32>, Vec<f64>, Vec<bool>);
+
+/// `values` as the little-endian `f64` bytes `torch.frombuffer(b, dtype=torch.float64)` reads
+/// back bit for bit. A `bytearray` rather than `bytes` because `frombuffer` warns on a buffer
+/// it cannot write.
+fn f64_bytes<'py>(py: Python<'py>, values: &[f64]) -> Bound<'py, PyByteArray> {
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    PyByteArray::new(py, &bytes)
+}
 
 // `Vec<f64>` / `Option<Vec<u32>>` by value is how a Python list crosses the boundary -- pyo3
 // extracts into an owned collection, so there is no borrowed form to take instead.
@@ -583,15 +595,34 @@ impl Rollout {
         on!(self, r => r.reset(envs.as_deref()).map_err(rollout_err))
     }
 
-    /// `{port: [n_envs * dim]}` — the Observation IR's output ports, row-major by env.
-    fn observe(&mut self) -> PyResult<BTreeMap<String, Vec<f64>>> {
-        on!(self, r => r.observe().map_err(rollout_err))
+    /// `{port: bytearray}` — the Observation IR's output ports, `[n_envs * dim]` little-endian
+    /// `f64` values each, row-major by env.
+    fn observe<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<BTreeMap<String, Bound<'py, PyByteArray>>> {
+        let ports = on!(self, r => r.observe().map_err(rollout_err))?;
+        Ok(ports
+            .into_iter()
+            .map(|(name, values)| (name, f64_bytes(py, &values)))
+            .collect())
     }
 
-    /// `act([n_envs * nu]) -> (executed, events, rewards, dones)`.
-    fn act(&mut self, actions: Vec<f64>) -> PyResult<ActTuple> {
+    /// `act(bytes of [n_envs * nu] little-endian f64) -> (executed, events, rewards, dones)`,
+    /// `executed` in the same bytes.
+    fn act<'py>(&mut self, py: Python<'py>, actions: &[u8]) -> PyResult<ActTuple<'py>> {
+        if actions.len() % 8 != 0 {
+            return Err(PyValueError::new_err(format!(
+                "actions are little-endian f64 bytes; {} is not a multiple of 8",
+                actions.len()
+            )));
+        }
+        let actions: Vec<f64> = actions
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+            .collect();
         let a = on!(self, r => r.act(&actions).map_err(rollout_err))?;
-        Ok((a.executed, a.events, a.rewards, a.dones))
+        Ok((f64_bytes(py, &a.executed), a.events, a.rewards, a.dones))
     }
 
     /// The loaded model: `nq`, `nv`, `nu`, `n_envs`, actuator and joint names in index order,

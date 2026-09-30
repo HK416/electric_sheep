@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import sys
+from array import array
 from pathlib import Path
 
 from .builder import _chunk_ty, _feature_ty, stable_id
@@ -82,9 +83,11 @@ def _trace(rollout) -> dict:
         qpos: list[float] = []
         for env in range(N_ENVS):
             qpos.extend(rollout.qpos(env))
-        observations = rollout.observe()
+        # f64 bytes across the boundary (packet M16/H2c), lists in the golden.
+        observations = {k: array("d", v).tolist() for k, v in rollout.observe().items()}
         actions = [_scripted(step, e, j) for e in range(N_ENVS) for j in range(NJ)]
-        executed, events, rewards, dones = rollout.act(actions)
+        executed, events, rewards, dones = rollout.act(array("d", actions).tobytes())
+        executed = array("d", executed).tolist()
         steps.append(
             {
                 "qpos": qpos,
