@@ -512,11 +512,16 @@ def main(argv: list) -> int:
 
                 episode_return += buf_rew[t]
                 episode_steps += 1.0
-                for i, done in enumerate(dones):
-                    if done:
-                        finished.append((float(episode_return[i]), float(episode_steps[i])))
-                        episode_return[i] = 0.0
-                        episode_steps[i] = 0.0
+                # The finished envs in ascending order, read and zeroed in one transfer each:
+                # an element-wise loop costs one device round trip per env, which on a GPU
+                # with a thousand envs finishing together is most of the collect time.
+                ended = buf_done[t].nonzero().flatten()
+                if len(ended):
+                    finished.extend(
+                        zip(episode_return[ended].tolist(), episode_steps[ended].tolist())
+                    )
+                    episode_return[ended] = 0.0
+                    episode_steps[ended] = 0.0
                 obs = observe(roll, shapes, a.envs, device)
 
             last_value = value(critic_input(obs))
