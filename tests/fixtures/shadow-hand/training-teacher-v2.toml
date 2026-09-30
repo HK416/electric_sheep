@@ -1,0 +1,40 @@
+# Training recipe for the Shadow Hand PPO teacher, second run (plan H, E1) -- hand-written.
+# training-teacher.toml's recipe with three changes, from its run (runs/shadow-hand/teacher-001):
+# the 64-seed evaluation (evaluation-teacher-64.toml, mujoco-cpu) peaked at 500-1,000 iterations
+# (success 0.36, 23/64 each; ~6% succeed by chance) and fell to 0.11-0.17 by 2,000-5,000, while
+# the policy's entropy rose every block (-4.5 -> +21, sigma 0.2 -> ~0.7 rad) and the sampled
+# actions were clamped by the position envelope on every tick. So:
+#   * entropy = 0 (rl_games' Shadow Hand value): nothing rewards a wider Gaussian;
+#   * lr decays by warmup_cosine to 1e-5 over the run;
+#   * 3,000 iterations, a checkpoint every 250, each evaluated on 64 seeds.
+#
+kind = "training"
+
+[policy]
+bundle = "runs/shadow-hand/teacher-untrained-v2.esb"
+
+[rl]
+algo        = "ppo"
+envs        = 2048
+horizon     = 16
+epochs      = 5
+minibatches = 4
+gamma       = 0.99
+lam         = 0.95
+clip        = 0.2
+entropy     = 0.0
+value_coef  = 0.5
+# The exploration noise starts at sigma = e^-1.6 ~ 0.20 rad in actuator units (the default -0.5,
+# sigma 0.61, is wider than every finger servo's half-range, 0.21-0.79 rad: H2's smokes saw the
+# position envelope clamp every tick, executed_ne_sampled_rate ~1.00).
+init_log_std = -1.6
+backend     = "mjwarp"
+
+[run]
+steps         = 3000
+lr            = 5e-4
+schedule      = { kind = "warmup_cosine", warmup = 50, lr_min = 1e-5 }
+seed          = 0
+checkpoint_at = [250, 500, 750, 1000, 1250, 1500, 1750, 2000, 2250, 2500, 2750]
+device        = "cuda"
+interpreter   = "python"
