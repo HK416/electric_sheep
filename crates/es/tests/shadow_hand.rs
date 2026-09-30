@@ -1537,32 +1537,24 @@ fn the_task_scores_scripted_states() {
         } else {
             Termination::Running
         };
-        // A running step leaves the post-step state in the backend, which is what the cones
-        // read: the formula on it is exact. A finished episode was reset inside `step`, so its
-        // formula is taken on the state that was set, two physics ticks earlier: within 5e-3
-        // (the cube falls 1.4 mm and turns by less than the curve's first knot).
-        let (reward, success, fell, tol) = if out.dones[0] {
-            let unit = |q: &[f64]| {
-                let n = q.iter().map(|v| v * v).sum::<f64>().sqrt();
-                q.iter().map(|v| v / n).collect::<Vec<f64>>()
-            };
-            let (r, s, f) = expected_reward(
-                &q[c..c + 3],
-                &unit(&q[c + 3..c + 7]),
-                &unit(&q[g + 3..g + 7]),
-            );
-            (r, s, f, 5e-3)
-        } else {
-            let after = env.backend().state();
-            let (xpos, xquat) = (after.xpos.to_vec(), after.xquat.to_vec());
-            // `xquat` is x y z w; a dot product does not care about the order.
-            let (r, s, f) = expected_reward(
-                &xpos[object * 3..object * 3 + 3],
-                &xquat[object * 4..object * 4 + 4],
-                &xquat[target * 4..target * 4 + 4],
-            );
-            (r, s, f, 1e-9)
-        };
+        // The cones read the post-step state, so the formula is taken on it. A finished episode
+        // was reset inside `step`, so its post-step state is made again: the same state and
+        // controls through the backend alone, for the step's two physics ticks (packet H2b:
+        // the formula on the state as set, two ticks earlier, drifts with the hand's motion).
+        if out.dones[0] {
+            env.reset(None).expect("reset");
+            env.backend_mut().set_state(&view).expect("set_state");
+            env.backend_mut().set_ctrl(&ctrl).expect("ctrl");
+            env.backend_mut().step(2).expect("the step again");
+        }
+        let after = env.backend().state();
+        let (xpos, xquat) = (after.xpos.to_vec(), after.xquat.to_vec());
+        // `xquat` is x y z w; a dot product does not care about the order.
+        let (reward, success, fell) = expected_reward(
+            &xpos[object * 3..object * 3 + 3],
+            &xquat[object * 4..object * 4 + 4],
+            &xquat[target * 4..target * 4 + 4],
+        );
         println!(
             "{what}: reward {:.6} (formula {reward:.6}), success {success}, fell {fell}, {got:?}",
             out.rewards[0]
@@ -1573,7 +1565,7 @@ fn the_task_scores_scripted_states() {
             (want == Termination::Success, want == Termination::Failure)
         );
         assert!(
-            (out.rewards[0] - reward).abs() < tol,
+            (out.rewards[0] - reward).abs() < 1e-9,
             "{what}: the cones pay {}, the header's formula {reward}",
             out.rewards[0]
         );
