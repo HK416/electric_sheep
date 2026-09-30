@@ -1,0 +1,49 @@
+# Training recipe (spec 8, `es train`) for the Shadow Hand PPO teacher -- plan H, packet M16/H2.
+# Hand-written; `crates/es/tests/shadow_hand.rs` dry-runs it.
+#
+# The bundle is the untrained teacher, built from the four committed documents:
+#
+#   es policy init --task tests/fixtures/shadow-hand/task-repose.toml \
+#     --observation tests/fixtures/shadow-hand/observation-teacher.toml \
+#     --learning tests/fixtures/shadow-hand/learning-teacher.toml \
+#     --deployment tests/fixtures/shadow-hand/deployment-hand.toml \
+#     --out runs/shadow-hand/teacher-untrained.esb
+#
+# PPO through `es_native.Rollout` on `mjwarp` (tier 2, never bitwise against the reference;
+# evaluate on `mujoco-cpu` under evaluation-teacher.toml).
+#
+# ENVS 2048, measured on this PC (RTX 3060 12 GB, H0's binary transport, 3-iteration smokes):
+# 2048 envs peak at 8.3 GB of GPU memory (the whole card, the desktop's ~2.3 GB included) and
+# es_native.Rollout steps them at 33k actions/s end to end (39k in the backend); 4096 peak at
+# 12.0 GB -- the card is full -- and collect 5x slower per sample. One iteration collects
+# 2048 x 16 = 32,768 rows in 4 minibatches of 8,192.
+#
+# gamma, lam, clip, epochs and lr are rl_games' Shadow Hand values (0.99, 0.95, 0.2, 5, 5e-4);
+# entropy is small (rl_games uses 0). `steps` (iterations) and `checkpoint_at` are placeholders
+# the orchestrator sets from E1's stop rule (5,000 iterations = 1.6e8 rows).
+
+kind = "training"
+
+[policy]
+bundle = "runs/shadow-hand/teacher-untrained.esb"
+
+[rl]
+algo        = "ppo"
+envs        = 2048
+horizon     = 16
+epochs      = 5
+minibatches = 4
+gamma       = 0.99
+lam         = 0.95
+clip        = 0.2
+entropy     = 0.001
+value_coef  = 0.5
+backend     = "mjwarp"
+
+[run]
+steps         = 5000
+lr            = 5e-4
+seed          = 0
+checkpoint_at = [500, 1000, 2000, 3000, 4000]
+device        = "cuda"
+interpreter   = "python"

@@ -80,7 +80,13 @@ fn every_committed_task_pins_its_scene() {
             let Ok(task) = es_ir::serial::task_from_toml(&text) else {
                 continue;
             };
-            let scene = scene_of(&read(&task.scene.path));
+            // As every runtime path loads it (`load_scene`): the mesh files the scene names are
+            // read relative to it, and a mesh scene's hash covers their content (packet
+            // M10/W2a). A primitives-only scene names none, so this is a no-op for it.
+            let mut scene = scene_of(&read(&task.scene.path));
+            let dir = repo_root().join(&task.scene.path);
+            es_assets::mesh::load(&mut scene, dir.parent().expect("a directory"))
+                .expect("the scene's meshes load");
             assert!(
                 scene.scene_hash() == task.scene.scene_hash,
                 "{} declares scene_hash {}…, its scene {} hashes to {}…",
