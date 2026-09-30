@@ -297,7 +297,7 @@ fn assets_are_references_not_files() {
 #[test]
 fn unknown_elements_and_attributes_become_warnings() {
     let xml = "<mujoco>\n  <worldbody>\n    <light name=\"l\"/>\n    <body name=\"b\" \
-               gravcomp=\"1\"/>\n  </worldbody>\n</mujoco>";
+               mocap=\"true\"/>\n  </worldbody>\n</mujoco>";
     let import = parse_str(xml).unwrap();
     assert!(import
         .warnings
@@ -306,7 +306,71 @@ fn unknown_elements_and_attributes_become_warnings() {
     assert!(import
         .warnings
         .iter()
-        .any(|w| w.message.contains("gravcomp") && w.line == 4));
+        .any(|w| w.message.contains("mocap") && w.line == 4));
+}
+
+/// Plan H, H1: `<contact>` pairs and excludes and `<body gravcomp>` are carried, not warned
+/// about -- and a scene without them keeps its digest (`scene_hash_pins.rs`).
+#[test]
+fn contact_pairs_excludes_and_gravcomp_are_carried() {
+    let xml = r#"<mujoco>
+      <default><pair condim="1"/></default>
+      <worldbody>
+        <body name="a" gravcomp="1"><geom name="ga" size="0.1"/></body>
+        <body name="b"><geom name="gb" size="0.1"/></body>
+      </worldbody>
+      <contact>
+        <pair name="p" geom1="ga" geom2="gb" friction="0.5 0.5" margin="0.01"/>
+        <exclude body1="a" body2="b"/>
+      </contact>
+    </mujoco>"#;
+    let import = parse_str(xml).unwrap();
+    assert!(import.warnings.is_empty(), "{:?}", import.warnings);
+    let scene = &import.scene;
+    let id = |name: &str| {
+        scene
+            .bodies
+            .iter()
+            .flat_map(|b| &b.geoms)
+            .find(|g| g.name == name)
+            .unwrap()
+            .id
+    };
+    let pair = &scene.contact_pairs[0];
+    assert_eq!((pair.geom1, pair.geom2), (id("ga"), id("gb")));
+    assert_eq!(pair.condim, Some(1), "the <default><pair> condim");
+    assert_eq!(pair.friction, Some([0.5, 0.5, 0.005, 0.0001, 0.0001]));
+    assert_eq!(
+        (pair.margin, pair.solref, pair.gap),
+        (Some(0.01), None, None)
+    );
+    let body = |name: &str| scene.bodies.iter().find(|b| b.name == name).unwrap().id;
+    assert_eq!(scene.contact_excludes, vec![(body("a"), body("b"))]);
+    assert_eq!(scene.gravcomp.get(&body("a")), Some(&1.0));
+    assert_eq!(
+        scene.gravcomp.len(),
+        1,
+        "gravcomp 0 is the default and not stored"
+    );
+
+    // Each one is in the digest.
+    let hash = scene.scene_hash();
+    let mut other = scene.clone();
+    other.gravcomp.clear();
+    assert_ne!(other.scene_hash(), hash);
+    let mut other = scene.clone();
+    other.contact_pairs[0].condim = Some(3);
+    assert_ne!(other.scene_hash(), hash);
+    let mut other = scene.clone();
+    other.contact_excludes.clear();
+    assert_ne!(other.scene_hash(), hash);
+
+    let err = parse_str(
+        r#"<mujoco><worldbody><geom name="g" size="1"/></worldbody>
+           <contact><pair geom1="g" geom2="nope"/></contact></mujoco>"#,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("unknown geom `nope`"), "{err}");
 }
 
 #[test]

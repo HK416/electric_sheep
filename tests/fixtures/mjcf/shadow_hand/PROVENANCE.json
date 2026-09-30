@@ -1,0 +1,83 @@
+{
+  "derivative": "shadow_hand_repose.xml",
+  "packet": "docs/packets/M16/plan-h.md, Task H1",
+  "source_bundle": {
+    "path": "server-side-rendering/PhysicalAI/ShadowHand (read-only; not vendored)",
+    "bundle_name": "shadow_hand_mujoco_gui_bundle_20260826",
+    "source_repository_commit": "1f83cd10021edaa5bab06446011f42e6e4c49831",
+    "mjcf_upstream": "Gymnasium Robotics v1.4.2 (commit 42eae53b2b27321d29090c219ce2f675c596de77) Shadow Hand, flattened by the bundle to Isaac Lab's repose-cube configuration (Profile B: four J1/J0 coupling tendons)",
+    "manifest_lines": [
+      "7d11ddb3269988203102ac678828d167d9297b722685a621a5edbcf16768aaff  ./phase4a_physics_configuration/assets/shadow_hand_physics_configured.xml",
+      "a2d35742067f71e4888954d1aa55d043dbc6ec0c63f4cc715f339cb45fd13734  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/stls/hand/F1.stl",
+      "0eeb932dcc102dd1fc6bef55fe83f6a74d97aebd32c34d6ee7020c19647306c5  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/stls/hand/F2.stl",
+      "d11a521ae498e947491ba947df8f999136fdf1401d1ba86d594eec20da656ad1  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/stls/hand/F3.stl",
+      "83fd93c9e4c1bf240aa6def2e5fdf5b1adcf4e341c146b05313aeaa8c54fd36a  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/stls/hand/TH1_z.stl",
+      "98e26cf013cd8d7f6ed890d3402ba0aceb11ec5c78779e388390ca2cddc7daf2  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/stls/hand/TH2_z.stl",
+      "80aae0002a6684428278cf214a31040f7cd7aeb3e2e648bd4b68baa375c2d2ad  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/stls/hand/TH3_z.stl",
+      "01aca61837d9db13c52dd170245cacb6f1cedc8238d66fe7239602c80c7a0130  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/stls/hand/forearm_electric.stl",
+      "874ae2ac813c6c9d873d04f872cb13de3cabd427cb24a8924619d0a1719d6da7  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/stls/hand/forearm_electric_cvx.stl",
+      "a8a9c1659aa4391291531b46997ba5eeda1b36e597070ae8a3cd824159937aae  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/stls/hand/knuckle.stl",
+      "b6901da4d4b93059c02b8803650ad484b3f31aebce46badfa411897d521a4877  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/stls/hand/lfmetacarpal.stl",
+      "12593bcba03bbf278cd7d7db3ca79ba753ada3cb58ee93e725603e9b5e29fd0c  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/stls/hand/palm.stl",
+      "47d0f252ae456541993746ff76d7022135b1bf54263f8f83b19d61f6f94871c9  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/stls/hand/wrist.stl",
+      "1f293999c0191f530033b34ed87763b1b9d4bf65913e4675bb79a71b5ea4e07b  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/LICENSE.md",
+      "7dacaa9772e856aee6943b32ef663d3634d91d72ec7bbc74d136943673f91e18  ./docs/licenses/dependencies/gymnasium-license.txt",
+      "df351ebfa8af317bf5a9ad83df63a8b68e4f5c04b71f30767cdb27aa434eac62  ./LICENSE"
+    ]
+  },
+  "licenses": {
+    "LICENSE.md": "the bundle's model_parity_audit/.../envs/assets/LICENSE.md, verbatim: the Shadow Hand model's attribution and its Apache License 2.0 terms; the bundle's THIRD_PARTY_NOTICES.md says it must stay with the STL assets",
+    "gymnasium-license.txt": "the bundle's docs/licenses/dependencies/gymnasium-license.txt, verbatim: Gymnasium Robotics' MIT licence, which the MJCF derives from",
+    "LICENSE-isaaclab.txt": "the bundle's root LICENSE, verbatim: BSD-3-Clause, Isaac Lab's, for the repose-cube configuration the bundle ported"
+  },
+  "meshes": {
+    "copied_verbatim": ["forearm_electric.stl", "forearm_electric_cvx.stl"],
+    "pre_scaled": ["wrist.stl", "palm.stl", "knuckle.stl", "F3.stl", "F2.stl", "F1.stl", "lfmetacarpal.stl", "TH3_z.stl", "TH2_z.stl", "TH1_z.stl"],
+    "pre_scaling": "The source's <mesh scale=\"0.001 0.001 0.001\">, which crates/es-assets/src/mjcf/elements.rs refuses by name, baked into the vertex data: binary STL, 80-byte header and triangle count kept, each 50-byte facet's nine vertex floats replaced by float32(float64(v) * 0.001) (one rounding), the facet normal kept (a uniform scale does not change it), the attribute count written as 0. Sizes are unchanged.",
+    "sha256": {
+      "meshes/F1.stl": "6c28d4837864a6557ef081b9dc0cfa27c4f397ae168fb1615430d443b5ad1e27",
+      "meshes/F2.stl": "2c20be6acdbcb1447208438a62a6b115cd731dc8826be738ae11c489a8073ec1",
+      "meshes/F3.stl": "de29c65835402ddfc8297fc9518abe3137c9fcb22ba47a339c05a193699af08c",
+      "meshes/TH1_z.stl": "66eb20a05339ff79024e4455e187c775369914ada88c6f53236474c70b22da63",
+      "meshes/TH2_z.stl": "669208bdc8ea935dbae36fb73a2517d67a4c89d3244aa5752662a4fa8dd9b9ae",
+      "meshes/TH3_z.stl": "8946d843659eb33eb92e8b7a780fb923883d6531f11fdb55a5e674ce845a2dfe",
+      "meshes/forearm_electric.stl": "01aca61837d9db13c52dd170245cacb6f1cedc8238d66fe7239602c80c7a0130",
+      "meshes/forearm_electric_cvx.stl": "874ae2ac813c6c9d873d04f872cb13de3cabd427cb24a8924619d0a1719d6da7",
+      "meshes/knuckle.stl": "68c484d13bca08840ddce2fad027528a732555f6262ea6fd881a57087260dde4",
+      "meshes/lfmetacarpal.stl": "f60527b4568c381e510eea3ec01d305c4b4c759d0010f64dd4dae919e1e557cb",
+      "meshes/palm.stl": "4f0c42a4dbb35746f82b8f90b33325fa09e837293205ab411d0310fc751b4b15",
+      "meshes/wrist.stl": "9e93fa00e4a3d43ffa44985382b9410e4ae9d17448602a7a2cf87b3c59d61098"
+    }
+  },
+  "derivation": [
+    "Kept unchanged: every body, inertial, joint (name, axis, range, armature, damping), geom (type, size, pose, friction, condim, contype, conaffinity, mass), the <option> (timestep 1/120 s, implicitfast, 20 iterations), the four coupling tendons' joints, coefficients, limits and damping, the 17 <contact><pair>s, every body's gravcomp, the 24 jointpos sensors and the <default> classes' dynamics attributes.",
+    "Header comment and model name replaced (`shadow_hand_repose`); XML comments added where something was added.",
+    "<compiler>: meshdir is `meshes/` (the vendored copies); texturedir dropped (no texture file is referenced any more).",
+    "Dropped as not represented by SceneDesc and not dynamics: <size> (njmax, nconmax, nstack, nuser_*: memory sizing and user-data widths), <custom> (the bundle's metadata texts and the joint velocity limit 100.00003814697266 rad/s, which the source's own comment says has no native MJCF meaning), <visual>, <light name=\"light0\">, every `user` attribute (joints and actuators), `group` on sites and geoms, the <default> class `robot0:asset_class`'s joint `margin=\"0\"` (MuJoCo's default) and site `rgba`, `content_type` on meshes.",
+    "Dropped with their only users: the five <touch> sensors, the five `robot0:Tch_*` sites they read and the `robot0:D_Touch` default class.",
+    "<asset>: the five <texture>s and eight <material>s dropped -- es-render draws a geom's rgba, not its material. Colours moved to rgba: class `robot0:D_Vizual` rgba \"0.93 0.93 0.93 1\" (MatViz's colour), class `robot0:DC_Hand` rgba \"0.4 0.5 0.6 0\" (MatColl's colour at alpha 0), and the seven collision geoms' own translucent rgba overrides (0.1 / 0.2 / 0.7, which only served MuJoCo's viewer) removed so the class's alpha 0 applies. The floor `floor0` keeps floor_mat's colour \"0.2 0.2 0.2 0\": alpha 0, as in the source. Alpha 0 is not drawn by es-render (crates/es-render/src/scene.rs, packet H1).",
+    "<mesh scale=\"0.001 0.001 0.001\"> removed from the ten meshes whose STLs are pre-scaled (see `meshes`).",
+    "The twenty <general dyntype=none gaintype=fixed gainprm=\"kp\" biastype=\"affine\" biasprm=\"0 -kp -kv\"> servos written as <position kp=\"kp\" kv=\"kv\">, which MuJoCo compiles to exactly those parameters (wrist: kp 5, kv 0.5; the rest: kp 1, kv 0.10000000149011612); ctrlrange, forcerange and class kept, and the class's <general ctrllimited forcelimited> default written as <position ...>.",
+    "The four tendons' `springlength=\"0\"` dropped: MuJoCo's default is the length at qpos0, which is 0 for these couplings (every joint at 0), and their stiffness is 0.",
+    "Single-value site sizes (`object:center`, `target:center`, size 0.01) written as three values, which is what MuJoCo expands them to; their rgba (alpha 0) dropped.",
+    "Four orientations written as the unit vectors SceneDesc stores, so that `parse -> SceneDesc -> scene_to_mjcf` writes them back bit for bit and MuJoCo compiles the emitted file exactly as it compiles this one: the hand mount's quat (9.381843730734243e-7 9.381873730746175e-7 -0.7071082811849306 0.7071052811837377, source 9.38184e-07 9.38187e-07 -0.707108 0.707105), LFJ4's axis (0.5709770263548727 0 0.8209660378937408, source 0.570977 0 0.820966), thbase's quat (0.9239559191829653 0 0.3824989665433906 0, source 0.923956 0 0.382499 0) and C_wrist's quat (0.7071067811865476 0.7071067811865476 0 0, source 0.707107 0.707107 0 0). The first two are exactly what MuJoCo makes of the source text; for the last two, es_math::Quat::normalize and MuJoCo's normalization differ in the last bit and no value is a fixed point of both.",
+    "The held cube `object`: its box keeps collision, mass 0.216 and condim 4 and gets rgba alpha 0; `object_hidden` (the textured inner cube, mass 0, no collision) dropped; six visual-only face slabs added, each a box 1 mm thick covering one face from the inside (contype 0, conaffinity 0, mass 0): +x red, -x cyan, +y green, -y magenta, +z blue, -z yellow. MuJoCo's compiled mass and inertia of the body are unchanged (0.216 kg, diag 1.296e-4).",
+    "The goal cube `target`: moved from (1, 0.87, 0.2) -- where it overlapped the held cube -- to (1.12, 0.87, 0.2), beside the little finger, where all three cameras see it (the Task IR's reset sets its pose); its box gets alpha 0 and the same six slabs; gravcomp 1, no collision, mass 0.216 as in the source.",
+    "Added `ceiling_light`: a visual-only world box (half extents 0.6 0.6 0.005 at (1, 0.95, 0.9), rgba 1) whose `_light` suffix makes it the path tracer's emitter.",
+    "Added three world-fixed cameras at fovy 45 (MJCF: look down -Z, +Y up): `top` at (1.04, 0.88, 0.56) looking straight down, image up +Y (towards the wrist); `front` at (1.04, 0.52, 0.36) aimed at (1.04, 0.87, 0.17), in front of the fingertips (xyaxes \"1 0 0 0 0.4771 0.8789\"); `side` at (0.68, 0.72, 0.36) aimed at (1.04, 0.88, 0.17), from the thumb side and in front (xyaxes \"0.4061 -0.9138 0 0.397 0.1764 0.9007\"). Chosen by rendering them (crates/es-render/tests/shadow_hand.rs, ES_RENDER_DUMP)."
+  ],
+  "measured": [
+    "MuJoCo 3.13.0 compiles the source file and this one to the same model in everything that reaches the dynamics except: thbase's body_quat and C_wrist's geom_quat (1 ulp, 1.1e-16), and what mj_setConst derives from them (dof_invweight0, body_invweight0, actuator_acc0, dof_M0: <= 2e-10 relative); the target's body_pos and qpos0 (moved); pair_geom1/2 (indices shift by one: ceiling_light is a world geom); dof_length (the slabs and pre-scaled meshes change body extents; no effect on the trajectory, below).",
+    "With the source's four orientation strings and target position put back, this file and the source give bit-identical qpos (MuJoCo 3.13.0, 240 ticks from qpos0: 120 with every servo at 0 clamped to its range, then 120 at 10 / 20 / 30 / 40% of its range): the servo respelling, the removals, the slabs and the pre-scaled meshes change nothing. As committed, the one-ulp orientations grow through contact: after those 240 ticks the hand and held cube differ from the source by 1.7e-10 / 4.0e-10 / 2.9e-7 / 1.1e-5. With every servo held at 0, both files run 10 s without a MuJoCo instability warning.",
+    "crates/es-physics-backend/tests/shadow_hand.rs: MuJoCoCpuBackend (parse -> SceneDesc -> emitted MJCF) and MuJoCo loading this file directly agree bit for bit (max |dqpos| 0.0) over 240 ticks, 120 at the servos' zero and 120 at 40% of their ranges, up to 13 contacts including fingertip pairs.",
+    "crates/es-render/tests/shadow_hand.rs: at 96x96 the held cube covers 462 / 467 / 524 pixels and the goal cube 500 / 508 / 235 in top / front / side (CPU Rs; the Pt segmentation agrees)."
+  ],
+  "vendored": [
+    "shadow_hand_repose.xml",
+    "meshes/*.stl (12)",
+    "LICENSE.md",
+    "gymnasium-license.txt",
+    "LICENSE-isaaclab.txt",
+    "PROVENANCE.json"
+  ]
+}

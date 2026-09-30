@@ -1,4 +1,4 @@
-//! `<asset>`, `<tendon>`, `<actuator>` and `<sensor>` (P33).
+//! `<asset>`, `<tendon>`, `<contact>`, `<actuator>` and `<sensor>` (P33).
 //!
 //! These are the sections that reference elements by name, so they run after `<worldbody>`
 //! and resolve every name through [`lookup`] — an unresolved name is an error, never a
@@ -10,8 +10,8 @@ use roxmltree::Node;
 use super::attrs::Attrs;
 use super::{lookup, MjcfError, Parser};
 use crate::scene::{
-    scene_id, Actuator, ActuatorKind, ActuatorTarget, AssetKind, AssetRef, Sensor, SensorKind,
-    SensorTarget, Tendon, TendonKind,
+    scene_id, Actuator, ActuatorKind, ActuatorTarget, AssetKind, AssetRef, ContactPair, Sensor,
+    SensorKind, SensorTarget, Tendon, TendonKind,
 };
 
 /// Actuator element names this packet maps; anything else is reported, not guessed at.
@@ -165,6 +165,66 @@ impl<'a> Parser<'a> {
             attrs.report_unknown(&mut self.warnings);
         }
         Ok(out)
+    }
+
+    // ---- <contact> --------------------------------------------------------------------
+
+    /// `<pair>` and `<exclude>`. A pair's name is a label nothing refers to, so it is read and
+    /// not kept; every contact parameter the pair states is kept, and one it leaves out stays
+    /// `None` for `MuJoCo` to mix from the two geoms.
+    pub(super) fn parse_contact(&mut self, node: Node<'a, 'a>) -> Result<(), MjcfError> {
+        for child in node.children().filter(Node::is_element) {
+            let tag = child.tag_name().name();
+            if tag != "pair" && tag != "exclude" {
+                let line = self.line(child);
+                self.warn(
+                    line,
+                    format!("<contact><{tag}> is not represented, ignored"),
+                );
+                continue;
+            }
+            let attrs = self.element(child, "main")?;
+            let _ = attrs.get("name");
+            if tag == "exclude" {
+                let body = |attr| -> Result<StableId, MjcfError> {
+                    let name = attrs.get(attr).ok_or_else(|| attrs.missing(attr))?;
+                    lookup(&self.names.bodies, &attrs, attr, "body", name)
+                };
+                let pair = (body("body1")?, body("body2")?);
+                attrs.report_unknown(&mut self.warnings);
+                self.scene.contact_excludes.push(pair);
+                continue;
+            }
+            let geom = |attr| -> Result<StableId, MjcfError> {
+                let name = attrs.get(attr).ok_or_else(|| attrs.missing(attr))?;
+                lookup(&self.names.geoms, &attrs, attr, "geom", name)
+            };
+            let pair = ContactPair {
+                geom1: geom("geom1")?,
+                geom2: geom("geom2")?,
+                condim: match attrs.get("condim") {
+                    None => None,
+                    Some(_) => Some(attrs.int_or("condim", 3)?),
+                },
+                friction: match attrs.get("friction") {
+                    None => None,
+                    Some(_) => Some(attrs.padded("friction", [1.0, 1.0, 0.005, 0.0001, 0.0001])?),
+                },
+                solref: match attrs.get("solref") {
+                    None => None,
+                    Some(_) => Some(attrs.padded("solref", [0.02, 1.0])?),
+                },
+                solimp: match attrs.get("solimp") {
+                    None => None,
+                    Some(_) => Some(attrs.padded("solimp", [0.9, 0.95, 0.001, 0.5, 2.0])?),
+                },
+                margin: attrs.num("margin")?,
+                gap: attrs.num("gap")?,
+            };
+            attrs.report_unknown(&mut self.warnings);
+            self.scene.contact_pairs.push(pair);
+        }
+        Ok(())
     }
 
     // ---- <actuator> -------------------------------------------------------------------

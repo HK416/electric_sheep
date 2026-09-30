@@ -167,6 +167,13 @@ impl SceneCache {
                 .copied()
                 .unwrap_or(Pose::IDENTITY);
             for geom in &body.geoms {
+                if geom.rgba[3] == 0.0 {
+                    // Alpha 0 is not drawn (collision-only geoms, an invisible floor). It
+                    // keeps its segmentation id, which is the geom's traversal index
+                    // (`renderer.md` section 2.1), and contributes no triangle.
+                    out.push_geom(geom, Pose::IDENTITY, &[]);
+                    continue;
+                }
                 let key = (geom.shape, content_hash(geom, scene));
                 if !matches!(self.local.get(&geom.id), Some((k, _)) if *k == key) {
                     let tris = tessellate(geom, scene)?;
@@ -498,6 +505,7 @@ mod tests {
             assets: Vec::new(),
             options: es_assets::scene::PhysicsOptions::default(),
             meshes: BTreeMap::new(),
+            ..SceneDesc::default()
         }
     }
 
@@ -543,6 +551,27 @@ mod tests {
         let tri = TriScene::from_scene(&s).unwrap();
         let ids: std::collections::BTreeSet<u32> = tri.tris.iter().map(|t| t.seg).collect();
         assert_eq!(ids, [1, 2].into_iter().collect());
+    }
+
+    /// Plan H, H1: alpha 0 draws nothing but keeps its segmentation id, so the geoms after it
+    /// keep theirs (`es_env::render` reads `seg - 1` as the geom's traversal index).
+    #[test]
+    fn alpha_zero_is_not_drawn_and_keeps_its_segmentation_id() {
+        let sphere = Shape::Sphere { radius: 1.0 };
+        let s = scene(vec![body(
+            "b",
+            Pose::IDENTITY,
+            vec![
+                geom("hidden", sphere, [0.4, 0.5, 0.6, 0.0]),
+                geom("shown", sphere, [0.0, 1.0, 0.0, 1.0]),
+                geom("faint", sphere, [0.0, 0.0, 1.0, 0.1]),
+            ],
+        )]);
+        let tri = TriScene::from_scene(&s).unwrap();
+        let ids: std::collections::BTreeSet<u32> = tri.tris.iter().map(|t| t.seg).collect();
+        assert_eq!(ids, [2, 3].into_iter().collect());
+        assert_eq!(tri.names[&1], "hidden");
+        assert_eq!(tri.names[&2], "shown");
     }
 
     #[allow(clippy::float_cmp)]

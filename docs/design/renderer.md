@@ -158,6 +158,11 @@ The segmentation id is `1 + the geom's index in traversal order`; `0` means back
 are dense and start at 1 so that `0` is unambiguously "no hit" in the `SegmentationId`
 channel.
 
+A geom whose `rgba` alpha is exactly 0 is not drawn (plan H, H1): it contributes no triangle
+but keeps its segmentation id, so the ids of the geoms after it do not move. That is how an
+MJCF hides a collision-only geom or an invisible floor, and a scene without one renders bit for
+bit as before. Any other alpha is ignored (there is no transparency).
+
 Buffer layout is a flat `f32` array, stride 20 floats (80 B) per triangle — `v0 v1 v2 n
 albedo emission seg pad` — the segmentation id `asuint`-bitcast into slot 18. One buffer, one
 stride, the same on both sides.
