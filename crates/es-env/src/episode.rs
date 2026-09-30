@@ -107,24 +107,17 @@ impl Episode {
         self.ticks.len()
     }
 
-    fn fresh(env: u32, episode: u64, shape: EpisodeShape, max_steps: usize) -> Self {
-        let column = |w: usize| Vec::with_capacity(max_steps * w);
+    /// Empty columns that grow as steps are pushed (packet M16/H2c). Not sized for
+    /// `max_episode_steps` up front: a reset opens one of these per env, and at 2,048 envs whose
+    /// episodes end within a step or two -- an untrained policy dropping the cube -- reserving
+    /// 480 rows of every column per reset was most of a control step spent allocating and
+    /// freeing memory that was never written.
+    fn fresh(env: u32, episode: u64, shape: EpisodeShape) -> Self {
         Self {
             env,
             episode,
             shape,
-            ticks: Vec::with_capacity(max_steps),
-            qpos: column(shape.nq),
-            qvel: column(shape.nv),
-            ctrl: column(shape.nu),
-            sensordata: column(shape.nsensordata),
-            reward: Vec::with_capacity(max_steps),
-            done: Vec::with_capacity(max_steps),
-            failure: Vec::with_capacity(max_steps),
-            termination: Termination::Running,
-            param_scales: ParamScales::new(),
-            render: RenderOverrides::default(),
-            image_specs: BTreeMap::new(),
+            ..Self::default()
         }
     }
 }
@@ -147,18 +140,15 @@ pub struct StepRow<'a> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct EpisodeRecorder {
     shape: EpisodeShape,
-    max_steps: usize,
     open: Vec<Episode>,
 }
 
 impl EpisodeRecorder {
-    pub fn new(n_envs: u32, shape: EpisodeShape, max_steps: u32) -> Self {
-        let max_steps = max_steps as usize;
+    pub fn new(n_envs: u32, shape: EpisodeShape) -> Self {
         Self {
             shape,
-            max_steps,
             open: (0..n_envs)
-                .map(|env| Episode::fresh(env, 0, shape, max_steps))
+                .map(|env| Episode::fresh(env, 0, shape))
                 .collect(),
         }
     }
@@ -216,7 +206,7 @@ impl EpisodeRecorder {
         let next_id = self.open[env as usize].episode + 1;
         std::mem::replace(
             &mut self.open[env as usize],
-            Episode::fresh(env, next_id, self.shape, self.max_steps),
+            Episode::fresh(env, next_id, self.shape),
         )
     }
 }
@@ -250,7 +240,7 @@ mod tests {
 
     #[test]
     fn columns_keep_their_shape_and_finish_rolls_the_episode_id() {
-        let mut rec = EpisodeRecorder::new(2, shape(), 8);
+        let mut rec = EpisodeRecorder::new(2, shape());
         for t in 0..5 {
             rec.push(0, &row(t, f64::from(t as u32), Termination::Running));
         }
@@ -276,7 +266,7 @@ mod tests {
 
     #[test]
     fn a_short_row_is_padded_rather_than_desynchronizing_the_columns() {
-        let mut rec = EpisodeRecorder::new(1, shape(), 4);
+        let mut rec = EpisodeRecorder::new(1, shape());
         rec.push(
             0,
             &StepRow {
