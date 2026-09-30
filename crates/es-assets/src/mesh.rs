@@ -34,9 +34,19 @@ pub enum MeshError {
         path: String,
         reason: String,
     },
+    /// A `<texture>` that could not be decoded (plan H, HT1): a missing or malformed PNG, a
+    /// grid that does not divide the image, a builtin without a size.
+    #[error("texture `{name}`: `{path}`: {reason}")]
+    Texture {
+        name: String,
+        path: String,
+        reason: String,
+    },
 }
 
-/// Loads every mesh asset `scene` names but does not yet carry, relative to `base_dir`.
+/// Loads every mesh asset `scene` names but does not yet carry, relative to `base_dir` — and,
+/// since plan H's HT1, decodes its textures through [`crate::texture::load`], so every caller
+/// of this one resolver gets both.
 ///
 /// Idempotent: an asset already in `scene.meshes` is left alone, so calling this twice hashes
 /// the same and costs one directory walk. A scene with no mesh asset is untouched — which is
@@ -67,18 +77,18 @@ pub fn load(scene: &mut SceneDesc, base_dir: &Path) -> Result<(), MeshError> {
         }
         let bytes = std::fs::read(&path).map_err(|e| fail(format!("{}: {e}", path.display())))?;
         let decoded = if extension == "stl" {
-            crate::stl::parse(&bytes)
+            crate::stl::parse(&bytes).map(|(p, i)| (p, None, i))
         } else {
             std::str::from_utf8(&bytes)
                 .map_err(|e| format!("OBJ is not UTF-8: {e}"))
-                .and_then(crate::obj::parse)
+                .and_then(crate::obj::parse_uv)
         };
-        let (positions, indices) = decoded.map_err(|reason| MeshError::Malformed {
+        let (positions, uvs, indices) = decoded.map_err(|reason| MeshError::Malformed {
             name: asset.name.clone(),
             path: asset.path.clone(),
             reason,
         })?;
-        asset.hash = mesh_content_hash(&positions, None, None, &indices);
+        asset.hash = mesh_content_hash(&positions, None, uvs.as_deref(), &indices);
         meshes.insert(
             asset.id,
             MeshData {
@@ -86,11 +96,11 @@ pub fn load(scene: &mut SceneDesc, base_dir: &Path) -> Result<(), MeshError> {
                 name: asset.name.clone(),
                 positions,
                 normals: None,
-                uvs: None,
+                uvs,
                 indices,
                 material: None,
             },
         );
     }
-    Ok(())
+    crate::texture::load(scene, base_dir)
 }

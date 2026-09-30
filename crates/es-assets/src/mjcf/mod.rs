@@ -19,6 +19,7 @@
 //! The `<worldbody>` itself becomes a body named `world` (`MuJoCo`'s body 0), so world-level
 //! geoms, sites and cameras have an owner like every other element.
 
+mod appearance;
 mod attrs;
 mod elements;
 mod orient;
@@ -168,6 +169,7 @@ pub(crate) struct Names {
     pub(crate) meshes: BTreeMap<String, StableId>,
     pub(crate) materials: BTreeMap<String, StableId>,
     pub(crate) hfields: BTreeMap<String, StableId>,
+    pub(crate) textures: BTreeMap<String, StableId>,
 }
 
 pub(crate) struct Parser<'a> {
@@ -181,6 +183,8 @@ pub(crate) struct Parser<'a> {
     pub(crate) names: Names,
     /// Per-owner counters for elements the file leaves unnamed.
     counters: BTreeMap<String, u32>,
+    /// Material texture references awaiting every `<texture>` of the file (plan H, HT1).
+    pub(crate) pending_textures: Vec<appearance::TextureRef>,
 }
 
 impl std::fmt::Debug for Parser<'_> {
@@ -231,6 +235,7 @@ impl<'a> Parser<'a> {
             warnings: Vec::new(),
             names: Names::default(),
             counters: BTreeMap::new(),
+            pending_textures: Vec::new(),
         }
     }
 
@@ -276,6 +281,10 @@ impl<'a> Parser<'a> {
                     "actuator" => self.parse_actuator(child)?,
                     _ => self.parse_sensor(child)?,
                 }
+            }
+            if wanted == "asset" {
+                // A material may name a texture declared after it, in any `<asset>` section.
+                self.resolve_material_textures()?;
             }
         }
         Ok(())

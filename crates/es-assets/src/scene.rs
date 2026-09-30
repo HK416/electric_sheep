@@ -90,6 +90,100 @@ pub struct SceneDesc {
     /// passive force. A body absent here has none.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub gravcomp: BTreeMap<StableId, f64>,
+    /// The `<material>`s that change how a geom is drawn, by asset id (plan H, HT1): those that
+    /// name a texture or write one of `specular`, `shininess`, `metallic`, `roughness`,
+    /// `emission` explicitly. A material that only carries `rgba` is not here — it rendered as
+    /// the geom's own `rgba` before textures existed and still does, so no committed scene
+    /// moves. Hashed into [`SceneDesc::scene_hash`] in its own section, present only when
+    /// this map is non-empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub materials: BTreeMap<StableId, Material>,
+    /// Every `<texture>`, by asset id: its declaration and, once [`crate::mesh::load`] ran,
+    /// its texels. **Not** hashed here: the content digest `load` writes into the texture's
+    /// [`AssetRef`] is what the chain covers, as for meshes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub textures: BTreeMap<StableId, crate::texture::Texture>,
+}
+
+/// A drawn material (plan H, HT1): the file's values, unset ones `None`. The renderer's glTF
+/// metallic-roughness parameters come from [`Material::metallic`] and
+/// [`Material::roughness`], the one place the classic pair is converted.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Material {
+    /// Base colour factor; a geom's own `rgba` wins when it is not `MuJoCo`'s default.
+    pub rgba: [f64; 4],
+    /// Emitted radiance as a multiple of the base colour (`MuJoCo`'s scalar `emission`).
+    pub emission: f64,
+    pub specular: Option<f64>,
+    pub shininess: Option<f64>,
+    pub metallic: Option<f64>,
+    pub roughness: Option<f64>,
+    pub texrepeat: [f64; 2],
+    pub texuniform: bool,
+    /// Texture of role `rgb` (the `texture` attribute or `<layer role="rgb">`).
+    pub rgb: Option<StableId>,
+    /// `<layer role="orm">`: occlusion, roughness, metallic in R, G, B (glTF's packing).
+    pub orm: Option<StableId>,
+    /// `<layer role="metallic">` and `role="roughness">`: read from the red channel.
+    pub metallic_map: Option<StableId>,
+    pub roughness_map: Option<StableId>,
+}
+
+impl Default for Material {
+    /// `mjs_defaultMaterial`, with nothing written explicitly.
+    fn default() -> Self {
+        Self {
+            rgba: [1.0; 4],
+            emission: 0.0,
+            specular: None,
+            shininess: None,
+            metallic: None,
+            roughness: None,
+            texrepeat: [1.0, 1.0],
+            texuniform: false,
+            rgb: None,
+            orm: None,
+            metallic_map: None,
+            roughness_map: None,
+        }
+    }
+}
+
+impl Material {
+    /// glTF metallic factor: the explicit value, else 1 under a metallic map (glTF's default
+    /// factor), else 0 — a dielectric.
+    #[must_use]
+    pub fn metallic(&self) -> f64 {
+        self.metallic
+            .unwrap_or(if self.metallic_map.is_some() || self.orm.is_some() {
+                1.0
+            } else {
+                0.0
+            })
+    }
+
+    /// glTF roughness factor: the explicit value, else 1 under a roughness map, else the
+    /// classic `shininess` converted by the one formula this crate writes down —
+    ///
+    /// ```text
+    /// n = 128 * shininess                  (MuJoCo's Blinn-Phong exponent, OpenGL's 0..128)
+    /// roughness = (2 / (n + 2))^(1/4)      (Walter et al. 2007: alpha^2 = 2 / (n + 2), alpha = r^2)
+    /// ```
+    ///
+    /// at the explicit `shininess`, or at `MuJoCo`'s default 0.5 when only `specular` is
+    /// written. `specular` itself maps to nothing: `F0` is glTF's `mix(0.04, base, metallic)`.
+    #[must_use]
+    pub fn roughness(&self) -> f64 {
+        if let Some(r) = self.roughness {
+            return r;
+        }
+        if self.roughness_map.is_some() || self.orm.is_some() {
+            return 1.0;
+        }
+        let n = 128.0 * self.shininess.unwrap_or(0.5).clamp(0.0, 1.0);
+        // The fourth root by two square roots: IEEE-exact, no host `powf` (spec 3.4).
+        (2.0 / (n + 2.0)).sqrt().sqrt()
+    }
 }
 
 /// One `<contact><pair>`. `None` leaves the parameter to `MuJoCo`, which then mixes it from
@@ -683,7 +777,41 @@ impl SceneDesc {
             },
         );
         self.encode_contact(&mut c);
+        self.encode_appearance(&mut c);
         c.finish()
+    }
+
+    /// The drawn materials (plan H, HT1), appended only when the scene has one, so a scene
+    /// without textures or PBR attributes keeps the digest it had (spec 28.13 rule 2). The
+    /// texels themselves are in the texture assets' content digests.
+    fn encode_appearance(&self, c: &mut Canon) {
+        if self.materials.is_empty() {
+            return;
+        }
+        c.str("es.scene.appearance.v1");
+        c.seq(self.materials.len());
+        for (id, m) in &self.materials {
+            c.id(*id);
+            for v in m.rgba {
+                c.f64(v);
+            }
+            c.f64(m.emission);
+            for v in [m.specular, m.shininess, m.metallic, m.roughness] {
+                match v {
+                    None => c.u8(0),
+                    Some(v) => {
+                        c.u8(1);
+                        c.f64(v);
+                    }
+                }
+            }
+            c.f64(m.texrepeat[0]);
+            c.f64(m.texrepeat[1]);
+            c.u8(u8::from(m.texuniform));
+            for t in [m.rgb, m.orm, m.metallic_map, m.roughness_map] {
+                c.opt_id(t);
+            }
+        }
     }
 
     /// Pairs, excludes and gravity compensation, appended only when the scene has any, so a

@@ -5,7 +5,8 @@
 //!
 //! Layer rule (spec 4.2): this crate may depend on `es-core`, `es-math` and external crates
 //! only. Nothing here computes physics, and the one thing that reads a file from disk is
-//! [`mesh::load`], the mesh resolver of packet M10/W2a -- an importer is still handed bytes.
+//! [`mesh::load`], the mesh resolver of packet M10/W2a, which since plan H's HT1 also decodes
+//! the scene's textures through [`texture::load`] -- an importer is still handed bytes.
 #![forbid(unsafe_code)]
 
 pub mod fuzz;
@@ -15,6 +16,7 @@ pub mod mjcf;
 pub mod obj;
 pub mod scene;
 pub mod stl;
+pub mod texture;
 pub mod urdf;
 
 pub use mesh::MeshError;

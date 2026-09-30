@@ -1,0 +1,38 @@
+<!-- Plan H, packet HT1: textures and metallic-roughness materials, one of each kind.
+
+     cube_a and cube_b wear the Shadow Hand bundle's block.png as the bundle declares it (a
+     3 x 4 grid, ".U..LFRB.D..", linear). cube_b is turned 180 degrees about (1, 1, 0), so the
+     camera sees cube_a's +X, -Y, +Z faces and cube_b's +Y, -X, -Z: all six between them. The
+     floor is a 2D checker repeated three times. The other geoms carry the remaining shapes,
+     texture kinds and PBR attributes for the GPU-vs-CPU and golden oracles; `mujoco.Renderer`
+     draws the same file for the placement oracle. See PROVENANCE.json. -->
+<mujoco model="textured">
+  <compiler angle="degree" texturedir="textures"/>
+  <asset>
+    <texture name="block" type="cube" colorspace="linear" file="block.png" gridsize="3 4" gridlayout=".U..LFRB.D.."/>
+    <texture name="checker" type="2d" builtin="checker" rgb1="0.9 0.2 0.1" rgb2="0.1 0.3 0.9" width="64" height="64"/>
+    <texture name="stripes" type="2d" builtin="gradient" rgb1="0.95 0.9 0.2" rgb2="0.1 0.6 0.3" width="32" height="32" mark="edge" markrgb="0 0 0"/>
+    <texture name="crossed" type="cube" builtin="flat" mark="cross" rgb1="0.3 0.6 0.5" rgb2="0.8 0.3 0.2" markrgb="1 1 1" width="31"/>
+    <material name="block" texture="block"/>
+    <material name="floor" texture="checker" texrepeat="3 3"/>
+    <material name="metal_ball" texture="stripes" metallic="0.8" roughness="0.3"/>
+    <material name="capsule" texture="crossed" specular="1" shininess="0.3"/>
+    <material name="rough" rgba="0.8 0.8 0.8 1" roughness="0.6"/>
+    <material name="glow" rgba="1 0.6 0.2 1" emission="2"/>
+  </asset>
+  <worldbody>
+    <geom name="floor" type="plane" size="0.3 0.3 0.01" material="floor"/>
+    <body name="cube_a" pos="-0.06 -0.06 0.05">
+      <geom name="cube_a" type="box" size="0.05 0.05 0.05" material="block"/>
+    </body>
+    <body name="cube_b" pos="0.06 0.06 0.05" quat="0 0.7071068 0.7071068 0">
+      <geom name="cube_b" type="box" size="0.05 0.05 0.05" material="block"/>
+    </body>
+    <geom name="ball" type="sphere" size="0.04" pos="-0.2 0.1 0.04" material="metal_ball"/>
+    <geom name="pill" type="capsule" size="0.025 0.04" pos="0.1 -0.2 0.06" material="capsule"/>
+    <geom name="drum" type="cylinder" size="0.03 0.03" pos="-0.1 -0.2 0.03" material="rough"/>
+    <geom name="bean" type="ellipsoid" size="0.03 0.02 0.015" pos="0.2 0.0 0.02" material="glow"/>
+    <geom name="ceiling_light" type="box" size="0.2 0.2 0.005" pos="-0.3 0.3 0.8"/>
+    <camera name="cam" pos="0.29 -0.29 0.333" xyaxes="0.7071068 0.7071068 0 -0.4 0.4 0.82"/>
+  </worldbody>
+</mujoco>

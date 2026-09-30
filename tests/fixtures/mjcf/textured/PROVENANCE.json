@@ -1,0 +1,25 @@
+{
+  "fixture": "textured.xml",
+  "packet": "docs/packets/M16/plan-h.md, Task HT1",
+  "written_here": "textured.xml is new, written for the HT1 oracles; only textures/block.png and the two licence files are copied.",
+  "source_bundle": {
+    "path": "server-side-rendering/PhysicalAI/ShadowHand (read-only; not vendored)",
+    "bundle_name": "shadow_hand_mujoco_gui_bundle_20260826",
+    "declaration": "phase4a_physics_configuration/assets/shadow_hand_physics_configured.xml line 55: <texture type=\"cube\" colorspace=\"linear\" name=\"texture:object\" file=\"block.png\" gridsize=\"3 4\" gridlayout=\".U..LFRB.D..\"/>, repeated here attribute for attribute",
+    "manifest_lines": [
+      "d39ffb85a87d00c346764191e38ecac3135f2d6f690f64a8ee5da4783ef18e76  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/textures/block.png",
+      "1f293999c0191f530033b34ed87763b1b9d4bf65913e4675bb79a71b5ea4e07b  ./model_parity_audit/assets/mujoco/gymnasium_robotics/envs/assets/LICENSE.md",
+      "7dacaa9772e856aee6943b32ef663d3634d91d72ec7bbc74d136943673f91e18  ./docs/licenses/dependencies/gymnasium-license.txt"
+    ]
+  },
+  "copied_verbatim": {
+    "textures/block.png": "d39ffb85a87d00c346764191e38ecac3135f2d6f690f64a8ee5da4783ef18e76",
+    "LICENSE.md": "1f293999c0191f530033b34ed87763b1b9d4bf65913e4675bb79a71b5ea4e07b",
+    "gymnasium-license.txt": "7dacaa9772e856aee6943b32ef663d3634d91d72ec7bbc74d136943673f91e18"
+  },
+  "licenses": {
+    "LICENSE.md": "the bundle's model_parity_audit/.../envs/assets/LICENSE.md, verbatim: the Gymnasium Robotics hand assets' attribution and Apache License 2.0 terms, which block.png ships under",
+    "gymnasium-license.txt": "the bundle's docs/licenses/dependencies/gymnasium-license.txt, verbatim: Gymnasium Robotics' MIT licence"
+  },
+  "edits": []
+}
