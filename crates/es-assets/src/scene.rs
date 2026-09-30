@@ -79,6 +79,31 @@ pub struct SceneDesc {
     /// was added (spec 28.13 rule 2).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub meshes: BTreeMap<StableId, MeshData>,
+    /// MJCF `<contact><pair>`: geom pairs that collide whatever their `contype` /
+    /// `conaffinity` say, with the contact parameters the pair overrides (plan H, H1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contact_pairs: Vec<ContactPair>,
+    /// MJCF `<contact><exclude>`: body pairs that never collide.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub contact_excludes: Vec<(StableId, StableId)>,
+    /// MJCF `<body gravcomp>`, by body id: the fraction of the body's weight cancelled by a
+    /// passive force. A body absent here has none.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub gravcomp: BTreeMap<StableId, f64>,
+}
+
+/// One `<contact><pair>`. `None` leaves the parameter to `MuJoCo`, which then mixes it from
+/// the two geoms as for any other contact.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ContactPair {
+    pub geom1: StableId,
+    pub geom2: StableId,
+    pub condim: Option<u32>,
+    pub friction: Option<[f64; 5]>,
+    pub solref: Option<[f64; 2]>,
+    pub solimp: Option<[f64; 5]>,
+    pub margin: Option<f64>,
+    pub gap: Option<f64>,
 }
 
 /// A rigid body. `pose` is relative to `parent` (or to the world when `parent` is `None`).
@@ -566,6 +591,21 @@ impl SceneDesc {
                 });
             }
         }
+        let pairs = self.contact_pairs.iter().map(|p| (p.geom1, p.geom2));
+        for (a, b) in pairs.chain(self.contact_excludes.iter().copied()) {
+            if !ids.contains(&a) || !ids.contains(&b) {
+                return Err(SceneError::DanglingRef {
+                    kind: "contact",
+                    name: format!("{a} / {b}"),
+                });
+            }
+        }
+        if let Some(body) = self.gravcomp.keys().find(|b| !bodies.contains(b)) {
+            return Err(SceneError::DanglingRef {
+                kind: "gravcomp",
+                name: body.to_string(),
+            });
+        }
         Ok(())
     }
 
@@ -642,7 +682,58 @@ impl SceneDesc {
                 c.raw(&asset.hash);
             },
         );
+        self.encode_contact(&mut c);
         c.finish()
+    }
+
+    /// Pairs, excludes and gravity compensation, appended only when the scene has any, so a
+    /// scene without them keeps the digest it had before they were represented (spec 28.13
+    /// rule 2). Each list is sorted, so source order cannot move the hash.
+    fn encode_contact(&self, c: &mut Canon) {
+        if self.contact_pairs.is_empty()
+            && self.contact_excludes.is_empty()
+            && self.gravcomp.is_empty()
+        {
+            return;
+        }
+        c.str("es.scene.contact.v1");
+        let mut pairs: Vec<&ContactPair> = self.contact_pairs.iter().collect();
+        pairs.sort_by_key(|p| (p.geom1, p.geom2));
+        c.seq(pairs.len());
+        for p in pairs {
+            c.id(p.geom1);
+            c.id(p.geom2);
+            c.u32(p.condim.map_or(0, |d| d + 1));
+            for values in [
+                p.friction.as_ref().map(|v| &v[..]),
+                p.solref.as_ref().map(|v| &v[..]),
+                p.solimp.as_ref().map(|v| &v[..]),
+                p.margin.as_ref().map(std::slice::from_ref),
+                p.gap.as_ref().map(std::slice::from_ref),
+            ] {
+                match values {
+                    None => c.u8(0),
+                    Some(values) => {
+                        c.u8(1);
+                        for v in values {
+                            c.f64(*v);
+                        }
+                    }
+                }
+            }
+        }
+        let mut excludes = self.contact_excludes.clone();
+        excludes.sort();
+        c.seq(excludes.len());
+        for (a, b) in excludes {
+            c.id(a);
+            c.id(b);
+        }
+        c.seq(self.gravcomp.len());
+        for (body, value) in &self.gravcomp {
+            c.id(*body);
+            c.f64(*value);
+        }
     }
 
     fn encode_options(&self, c: &mut Canon) {

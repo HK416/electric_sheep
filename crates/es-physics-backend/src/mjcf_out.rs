@@ -1,8 +1,8 @@
 //! `SceneDesc` to MJCF text, for backends that consume MJCF (spec 17.2).
 //!
-//! A minimal emitter: bodies, joints, primitive geoms, `motor` / `position` / `velocity`
-//! actuators, `jointpos` / `jointvel` sensors and the whole `<option>` — enough for the
-//! pendulum and two-link arm the oracle runs. Anything else is
+//! A minimal emitter: bodies (with `gravcomp`), joints, primitive and mesh geoms, fixed
+//! tendons, `<contact>` pairs and excludes, `motor` / `position` / `velocity` actuators,
+//! `jointpos` / `jointvel` sensors and the whole `<option>`. Anything else is
 //! [`PhysicsError::Unsupported`] naming the item, because spec 17.2 says a backend declares
 //! what it cannot map instead of guessing an approximation.
 //!
@@ -26,7 +26,8 @@ use std::fmt::Write as _;
 use es_assets::gltf::MeshData;
 use es_assets::scene::{
     Actuator, ActuatorKind, ActuatorTarget, AssetKind, Body, FrictionCone, Geom, Integrator,
-    Jacobian, Joint, JointKind, SceneDesc, Sensor, SensorKind, SensorTarget, Shape, Solver,
+    Jacobian, Joint, JointKind, SceneDesc, Sensor, SensorKind, SensorTarget, Shape, Solver, Tendon,
+    TendonKind,
 };
 use es_core::StableId;
 use es_math::{Quat, Vec3};
@@ -91,12 +92,6 @@ fn nonzero(v: f64) -> Option<String> {
 
 /// Emits `scene` as MJCF.
 pub fn scene_to_mjcf(scene: &SceneDesc) -> Result<String, PhysicsError> {
-    if !scene.tendons.is_empty() {
-        return Err(unsupported(format!(
-            "tendon `{}` (this backend emits no <tendon>)",
-            scene.tendons[0].name
-        )));
-    }
     let joint_names: BTreeMap<StableId, &str> = scene
         .joints
         .iter()
@@ -180,6 +175,8 @@ pub fn scene_to_mjcf(scene: &SceneDesc) -> Result<String, PhysicsError> {
         }
     }
     out.push_str("  </worldbody>\n");
+    write_contact(&mut out, scene)?;
+    write_tendons(&mut out, &scene.tendons, &joint_names)?;
     write_actuators(&mut out, &scene.actuators, &joint_names)?;
     write_sensors(&mut out, &scene.sensors, &joint_names)?;
     out.push_str("</mujoco>\n");
@@ -235,6 +232,11 @@ fn write_body(
     let _ = write!(out, "{pad}<body name=\"{}\"", esc(&body.name));
     attr(out, "pos", Some(vec3(body.pose.position)));
     attr(out, "quat", quat(body.pose.orientation));
+    attr(
+        out,
+        "gravcomp",
+        scene.gravcomp.get(&body.id).map(|g| num(*g)),
+    );
     out.push_str(">\n");
 
     if let Some(inertial) = &body.inertial {
@@ -382,21 +384,7 @@ fn write_geom(
         }
     };
     let pad = "  ".repeat(depth);
-    // `MuJoCo` requires geom names to be unique across the model, while the scene names a
-    // geom the source left unnamed `geom<n>` with `n` counted per owner (`es_assets::scene`),
-    // so two bodies with unnamed geoms both carry a `geom1`. Nothing in the emitted file or
-    // in the Python side refers to a geom by name (contact pairs, sites and sensors on geoms
-    // are not emitted), so the name is a label: an auto-generated one is qualified by its
-    // owner, a source name is written verbatim.
-    let auto_named = geom
-        .name
-        .strip_prefix("geom")
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
-    let name = if auto_named {
-        format!("{owner}.{}", geom.name)
-    } else {
-        geom.name.clone()
-    };
+    let name = geom_label(owner, geom);
     let _ = write!(out, "{pad}<geom name=\"{}\" type=\"{kind}\"", esc(&name));
     attr(out, "size", (!size.is_empty()).then_some(size));
     attr(out, "mesh", mesh);
@@ -450,6 +438,115 @@ fn write_geom(
         ),
     );
     out.push_str("/>\n");
+    Ok(())
+}
+
+/// The name a geom is emitted under. `MuJoCo` requires geom names to be unique across the
+/// model, while the scene names a geom the source left unnamed `geom<n>` with `n` counted per
+/// owner (`es_assets::scene`), so two bodies with unnamed geoms both carry a `geom1`: an
+/// auto-generated name is qualified by its owner, a source name is written verbatim. A
+/// `<contact><pair>` refers to geoms through this same function.
+fn geom_label(owner: &str, geom: &Geom) -> String {
+    let auto_named = geom
+        .name
+        .strip_prefix("geom")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    if auto_named {
+        format!("{owner}.{}", geom.name)
+    } else {
+        geom.name.clone()
+    }
+}
+
+/// `<contact>`: every `<pair>` (with the parameters it states) and `<exclude>`.
+fn write_contact(out: &mut String, scene: &SceneDesc) -> Result<(), PhysicsError> {
+    if scene.contact_pairs.is_empty() && scene.contact_excludes.is_empty() {
+        return Ok(());
+    }
+    let geoms: BTreeMap<StableId, String> = scene
+        .bodies
+        .iter()
+        .flat_map(|b| b.geoms.iter().map(move |g| (g.id, geom_label(&b.name, g))))
+        .collect();
+    let bodies: BTreeMap<StableId, &str> = scene
+        .bodies
+        .iter()
+        .map(|b| (b.id, b.name.as_str()))
+        .collect();
+    let missing = |id: &StableId| unsupported(format!("contact: {id} is not in the scene"));
+    let list = |values: &[f64]| values.iter().map(|v| num(*v)).collect::<Vec<_>>().join(" ");
+    out.push_str("  <contact>\n");
+    for pair in &scene.contact_pairs {
+        let (a, b) = (
+            geoms.get(&pair.geom1).ok_or_else(|| missing(&pair.geom1))?,
+            geoms.get(&pair.geom2).ok_or_else(|| missing(&pair.geom2))?,
+        );
+        let _ = write!(out, "    <pair geom1=\"{}\" geom2=\"{}\"", esc(a), esc(b));
+        attr(out, "condim", pair.condim.map(|d| d.to_string()));
+        attr(out, "friction", pair.friction.map(|v| list(&v)));
+        attr(out, "solref", pair.solref.map(|v| list(&v)));
+        attr(out, "solimp", pair.solimp.map(|v| list(&v)));
+        attr(out, "margin", pair.margin.map(num));
+        attr(out, "gap", pair.gap.map(num));
+        out.push_str("/>\n");
+    }
+    for (a, b) in &scene.contact_excludes {
+        let (a, b) = (
+            bodies.get(a).ok_or_else(|| missing(a))?,
+            bodies.get(b).ok_or_else(|| missing(b))?,
+        );
+        let _ = writeln!(
+            out,
+            "    <exclude body1=\"{}\" body2=\"{}\"/>",
+            esc(a),
+            esc(b)
+        );
+    }
+    out.push_str("  </contact>\n");
+    Ok(())
+}
+
+/// `<tendon>`: fixed tendons. A spatial tendon runs through sites, which this emitter does not
+/// write, so it is refused by name.
+fn write_tendons(
+    out: &mut String,
+    tendons: &[Tendon],
+    joint_names: &BTreeMap<StableId, &str>,
+) -> Result<(), PhysicsError> {
+    if tendons.is_empty() {
+        return Ok(());
+    }
+    out.push_str("  <tendon>\n");
+    for tendon in tendons {
+        let TendonKind::Fixed { joints } = &tendon.kind else {
+            return Err(unsupported(format!(
+                "tendon `{}`: spatial (this backend emits no sites)",
+                tendon.name
+            )));
+        };
+        let _ = write!(out, "    <fixed name=\"{}\"", esc(&tendon.name));
+        attr(out, "limited", tendon.range.map(|_| "true".to_owned()));
+        attr(out, "range", range_attr(tendon.range));
+        attr(out, "stiffness", nonzero(tendon.stiffness));
+        attr(out, "damping", nonzero(tendon.damping));
+        out.push_str(">\n");
+        for (joint, coef) in joints {
+            let name = joint_names.get(joint).ok_or_else(|| {
+                unsupported(format!(
+                    "tendon `{}`: a joint that is not in the scene",
+                    tendon.name
+                ))
+            })?;
+            let _ = writeln!(
+                out,
+                "      <joint joint=\"{}\" coef=\"{}\"/>",
+                esc(name),
+                num(*coef)
+            );
+        }
+        out.push_str("    </fixed>\n");
+    }
+    out.push_str("  </tendon>\n");
     Ok(())
 }
 
