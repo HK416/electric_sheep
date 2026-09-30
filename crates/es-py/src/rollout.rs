@@ -261,13 +261,44 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
         seed: u64,
         n_envs: u32,
     ) -> Result<Self, RolloutError> {
+        Self::with_scene_dir(
+            backend,
+            task_toml,
+            observation_toml,
+            deployment_toml,
+            scene_xml,
+            None,
+            seed,
+            n_envs,
+        )
+    }
+
+    /// [`Rollout::with_backend`] with the directory the scene's mesh files resolve against
+    /// (packet M16/H2): `es_assets::mesh::load`, as every CLI verb's `load_scene` does, so a
+    /// scene with `<mesh file=...>` geoms (the Shadow Hand) hashes and loads as its Task IR
+    /// pins it. `None` loads no mesh file, which is every primitives-only scene's case.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_scene_dir(
+        backend: BackendKind,
+        task_toml: &str,
+        observation_toml: &str,
+        deployment_toml: &str,
+        scene_xml: &str,
+        scene_dir: Option<&std::path::Path>,
+        seed: u64,
+        n_envs: u32,
+    ) -> Result<Self, RolloutError> {
         let doc = |what: &'static str| move |source| RolloutError::Document { what, source };
         let task = es_ir::serial::task_from_toml(task_toml).map_err(doc("task.toml"))?;
         let obs =
             es_ir::serial::observation_from_toml(observation_toml).map_err(doc("observation"))?;
         let deploy =
             es_ir::serial::deployment_from_toml(deployment_toml).map_err(doc("deployment"))?;
-        let scene = es_assets::parse_mjcf(scene_xml)?.scene;
+        let mut scene = es_assets::parse_mjcf(scene_xml)?.scene;
+        if let Some(dir) = scene_dir {
+            es_assets::mesh::load(&mut scene, dir)
+                .map_err(|e| RolloutError::Backend(format!("scene meshes: {e}")))?;
+        }
 
         let mut domains = BatchDomains::single_env_at(
             TickRate::from_period_secs(scene.options.timestep)

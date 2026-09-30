@@ -207,6 +207,9 @@ def open_rollout(docs: Path, seed: int, n_envs: int, backend: str = "mujoco-cpu"
             seed,
             n_envs,
             backend=backend,
+            # The scene's mesh files, which `es train` copies beside scene.xml at their
+            # scene-relative paths (packet M16/H2); a primitives-only scene reads none.
+            scene_dir=str(docs),
         )
     except FileNotFoundError as exc:
         raise SystemExit(

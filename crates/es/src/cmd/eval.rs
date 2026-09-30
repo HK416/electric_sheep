@@ -502,6 +502,8 @@ macro_rules! dispatch_nj_h {
             (7, 16) => run_typed::<$b, 7, 16>($($args),+),
             (7, 50) => run_typed::<$b, 7, 50>($($args),+),
             (8, 50) => run_typed::<$b, 8, 50>($($args),+),
+            // The Shadow Hand's 20 actuators, one action per tick (plan H, packet M16/H2).
+            (20, 1) => run_typed::<$b, 20, 1>($($args),+),
             (nj, h) => Err(CliError::Runtime(format!(
                 "unsupported (n_joints={nj}, horizon={h}); es eval run supports a fixed table \
                  of pairs (crates/es/src/cmd/eval.rs) -- add one for this robot"

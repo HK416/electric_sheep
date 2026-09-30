@@ -486,6 +486,8 @@ enum Kind {
     N6H16(RolloutCore<6, 16>),
     N7H1(RolloutCore<7, 1>),
     N12H1(RolloutCore<12, 1>),
+    /// The Shadow Hand's 20 actuators (plan H, packet M16/H2).
+    N20H1(RolloutCore<20, 1>),
 }
 
 /// Runs `$body` against whichever arm is live. Every method below is `&mut self`, so one macro
@@ -498,6 +500,7 @@ macro_rules! on {
             Kind::N6H16($r) => $body,
             Kind::N7H1($r) => $body,
             Kind::N12H1($r) => $body,
+            Kind::N20H1($r) => $body,
         }
     };
 }
@@ -517,8 +520,10 @@ type ActTuple = (Vec<f64>, Vec<u32>, Vec<f64>, Vec<bool>);
 #[pymethods]
 impl Rollout {
     /// `backend` is `mujoco-cpu` (the default), `mjwarp` (packet M11/X1) or `physx` (M11/R1).
+    /// `scene_dir` is where the scene's mesh files resolve (packet M16/H2); absent loads none.
     #[new]
-    #[pyo3(signature = (task_toml, observation_toml, deployment_toml, scene_xml, seed, n_envs, backend = "mujoco-cpu"))]
+    #[pyo3(signature = (task_toml, observation_toml, deployment_toml, scene_xml, seed, n_envs, backend = "mujoco-cpu", scene_dir = None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         task_toml: &str,
         observation_toml: &str,
@@ -527,6 +532,7 @@ impl Rollout {
         seed: u64,
         n_envs: u32,
         backend: &str,
+        scene_dir: Option<&str>,
     ) -> PyResult<Self> {
         let backend = es_physics_backend::BackendKind::from_name(backend).ok_or_else(|| {
             PyValueError::new_err(format!(
@@ -540,12 +546,13 @@ impl Rollout {
         macro_rules! build {
             ($nj:literal, $h:literal, $v:ident) => {
                 Kind::$v(
-                    RolloutCore::<$nj, $h>::with_backend(
+                    RolloutCore::<$nj, $h>::with_scene_dir(
                         backend,
                         task_toml,
                         observation_toml,
                         deployment_toml,
                         scene_xml,
+                        scene_dir.map(std::path::Path::new),
                         seed,
                         n_envs,
                     )
@@ -559,6 +566,7 @@ impl Rollout {
             (6, 16) => build!(6, 16, N6H16),
             (7, 1) => build!(7, 1, N7H1),
             (12, 1) => build!(12, 1, N12H1),
+            (20, 1) => build!(20, 1, N20H1),
             (nj, h) => {
                 return Err(PyValueError::new_err(format!(
                     "unsupported (n_joints={nj}, horizon={h}); es_native.Rollout supports a \

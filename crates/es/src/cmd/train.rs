@@ -635,6 +635,20 @@ pub(crate) fn run(
             ))
         })?;
         write_file(&docs.join("scene.xml"), &bytes)?;
+        // The mesh files the scene names, at the same scene-relative paths, so the rollout
+        // resolves them against `docs` exactly as `load_scene` does against the scene's own
+        // directory (packet M16/H2). A primitives-only scene names none.
+        let parsed = std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|xml| es_assets::parse_mjcf(xml).ok());
+        let scene_dir = Path::new(scene).parent().unwrap_or(Path::new("."));
+        for asset in parsed.iter().flat_map(|p| &p.scene.assets) {
+            if asset.kind == es_assets::scene::AssetKind::Mesh {
+                let mesh = std::fs::read(scene_dir.join(&asset.path))
+                    .map_err(|e| bad(format!("{}: {e}", scene_dir.join(&asset.path).display())))?;
+                write_file(&docs.join(&asset.path), &mesh)?;
+            }
+        }
         println!("rollout docs:  {}", docs.display());
         // The one route that steps physics, so the one that has a tier to say (S-4).
         let kind = match recipe.rl.as_ref().map(|rl| &rl.backend) {
