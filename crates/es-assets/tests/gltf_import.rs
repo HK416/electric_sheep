@@ -235,3 +235,113 @@ fn malformed_truncated_buffer_is_a_typed_error_not_a_panic() {
         "{err:?}"
     );
 }
+
+/// A 2 x 2 RGB PNG: red, green / blue, white.
+const PNG_2X2: &str =
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR42mP4z8DAAMIM/4EAAB/uBfvxq7p3AAAAAElFTkSuQmCC";
+
+/// Plan H, HT2: glTF materials land on the scene's material table, their PNG images decoded
+/// (from the BIN chunk here) with the sampler's wrap modes and glTF's colour spaces, and what
+/// is not drawn is reported: `alphaMode` BLEND, a `texCoord` other than 0, a non-PNG image.
+#[test]
+fn gltf_materials_join_the_material_table() {
+    let png = {
+        // The same standard base64 the importer's data URIs use, decoded by hand here.
+        let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut bits = 0u32;
+        let mut n = 0;
+        let mut out = Vec::new();
+        for c in PNG_2X2.bytes().filter(|c| *c != b'=') {
+            bits = bits << 6 | alphabet.iter().position(|a| *a == c).unwrap() as u32;
+            n += 6;
+            if n >= 8 {
+                n -= 8;
+                out.push((bits >> n) as u8);
+            }
+        }
+        out
+    };
+    let mut bin = triangle_bin();
+    bin.extend_from_slice(&[0, 0]); // align the image view to 4 bytes
+    let image_offset = bin.len();
+    bin.extend_from_slice(&png);
+    let json = format!(
+        r#"{{
+      "asset": {{ "version": "2.0" }},
+      "extensionsUsed": ["KHR_materials_emissive_strength"],
+      "scenes": [{{ "nodes": [0] }}],
+      "nodes": [{{ "name": "n", "mesh": 0 }}],
+      "meshes": [{{ "name": "tri", "primitives": [{{ "attributes": {{ "POSITION": 0 }}, "indices": 1, "material": 0 }}] }}],
+      "materials": [{{
+        "name": "m",
+        "alphaMode": "BLEND",
+        "pbrMetallicRoughness": {{
+          "baseColorFactor": [0.5, 0.25, 1.0, 1.0],
+          "baseColorTexture": {{ "index": 0 }},
+          "metallicFactor": 0.3,
+          "roughnessFactor": 0.7,
+          "metallicRoughnessTexture": {{ "index": 0, "texCoord": 1 }}
+        }},
+        "normalTexture": {{ "index": 0, "scale": 0.5 }},
+        "emissiveTexture": {{ "index": 1 }},
+        "emissiveFactor": [1.0, 0.5, 0.25],
+        "extensions": {{ "KHR_materials_emissive_strength": {{ "emissiveStrength": 4.0 }} }}
+      }}],
+      "samplers": [{{ "wrapS": 33071, "wrapT": 33648 }}],
+      "images": [
+        {{ "bufferView": 2, "mimeType": "image/png" }},
+        {{ "uri": "data:image/jpeg;base64,/9j/4AAQSkZJRg==" }}
+      ],
+      "textures": [{{ "source": 0, "sampler": 0 }}, {{ "source": 1 }}],
+      "accessors": [
+        {{ "bufferView": 0, "componentType": 5126, "count": 3, "type": "VEC3",
+          "min": [0.0, 0.0, 0.0], "max": [1.0, 1.0, 0.0] }},
+        {{ "bufferView": 1, "componentType": 5123, "count": 3, "type": "SCALAR" }}
+      ],
+      "bufferViews": [
+        {{ "buffer": 0, "byteOffset": 0, "byteLength": 36 }},
+        {{ "buffer": 0, "byteOffset": 36, "byteLength": 6 }},
+        {{ "buffer": 0, "byteOffset": {image_offset}, "byteLength": {len} }}
+      ],
+      "buffers": [{{ "byteLength": {total} }}]
+    }}"#,
+        len = png.len(),
+        total = bin.len(),
+    );
+    let import = import_gltf(&build_glb(json.as_bytes(), &bin), None).unwrap();
+    let text: Vec<&str> = import.warnings.iter().map(|w| w.message.as_str()).collect();
+    println!("{text:#?}");
+    assert_eq!(text.len(), 3, "{text:?}");
+    assert!(text[0].contains("BLEND"));
+    assert!(text.iter().any(|t| t.contains("TEXCOORD_1")));
+    assert!(text.iter().any(|t| t.contains("not a PNG")));
+
+    let scene = &import.scene;
+    assert_eq!(scene.meshes.len(), 1, "the meshes ride on the scene");
+    let m = scene.materials.values().next().unwrap();
+    assert_eq!(m.rgba, [0.5, 0.25, 1.0, 1.0]);
+    assert!((m.metallic() - 0.3).abs() < 1e-6 && (m.roughness() - 0.7).abs() < 1e-6);
+    assert_eq!(m.orm, None, "a texCoord-1 texture is dropped");
+    assert_eq!(m.emissive, Some([4.0, 2.0, 1.0]));
+    assert_eq!(m.emissive_map, None, "the JPEG is dropped");
+    assert_eq!(m.normal_scale, Some(0.5));
+    // One image, read twice: sRGB as base colour, linear as the normal map.
+    let (base, normal) = (m.rgb.unwrap(), m.normal_map.unwrap());
+    assert_ne!(base, normal);
+    let tex = |id| scene.textures[&id].data.as_ref().unwrap();
+    assert!(tex(base).srgb && !tex(normal).srgb);
+    assert_eq!(
+        tex(base).rgb,
+        vec![255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255]
+    );
+
+    assert_eq!(
+        tex(base).wrap,
+        [
+            es_assets::texture::Wrap::Clamp,
+            es_assets::texture::Wrap::Mirror
+        ]
+    );
+    let asset = scene.assets.iter().find(|a| a.id == base).unwrap();
+    assert_eq!(asset.hash, tex(base).content_hash(), "hashed by content");
+}

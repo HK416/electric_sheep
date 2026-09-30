@@ -1,0 +1,21 @@
+<!-- Plan H, HT2: textured_box.gltf's material declared in MJCF, for the glTF-vs-MJCF oracle.
+     Written by generate.py; see PROVENANCE.json. -->
+<mujoco model="textured_box">
+  <compiler meshdir="." texturedir="."/>
+  <asset>
+    <mesh name="box" file="textured_box.obj"/>
+    <texture name="base" type="2d" file="base.png" colorspace="sRGB"/>
+    <texture name="mr" type="2d" file="mr.png" colorspace="linear"/>
+    <texture name="normal" type="2d" file="normal.png" colorspace="linear"/>
+    <texture name="glow" type="2d" file="emissive.png" colorspace="sRGB"/>
+    <material name="box" emission="2">
+      <layer role="rgb" texture="base"/>
+      <layer role="orm" texture="mr"/>
+      <layer role="normal" texture="normal"/>
+      <layer role="emissive" texture="glow"/>
+    </material>
+  </asset>
+  <worldbody>
+    <geom name="box" type="mesh" mesh="box" material="box" contype="0" conaffinity="0"/>
+  </worldbody>
+</mujoco>

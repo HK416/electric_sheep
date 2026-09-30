@@ -127,6 +127,21 @@ pub struct Material {
     /// `<layer role="metallic">` and `role="roughness">`: read from the red channel.
     pub metallic_map: Option<StableId>,
     pub roughness_map: Option<StableId>,
+    /// Tangent-space normal map (plan H, HT2): `<layer role="normal">`, glTF `normalTexture`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_map: Option<StableId>,
+    /// glTF `normalTexture.scale`: the texel's X and Y are multiplied by it. `None` is 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub normal_scale: Option<f64>,
+    /// Emissive map: `<layer role="emissive">`, glTF `emissiveTexture`. The emitted radiance
+    /// is [`Material::emissive`] times the texel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emissive_map: Option<StableId>,
+    /// Emitted radiance as a colour, replacing `emission x rgba` when set: glTF's
+    /// `emissiveFactor x emissive_strength`, or an MJCF emissive layer's `emission` (1 when the
+    /// attribute is not written) on all three channels.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emissive: Option<[f64; 3]>,
 }
 
 impl Default for Material {
@@ -145,6 +160,10 @@ impl Default for Material {
             orm: None,
             metallic_map: None,
             roughness_map: None,
+            normal_map: None,
+            normal_scale: None,
+            emissive_map: None,
+            emissive: None,
         }
     }
 }
@@ -810,6 +829,27 @@ impl SceneDesc {
             c.u8(u8::from(m.texuniform));
             for t in [m.rgb, m.orm, m.metallic_map, m.roughness_map] {
                 c.opt_id(t);
+            }
+            // Plan H, HT2's maps, in a tagged block written only when the material has one,
+            // so an HT1 material keeps the digest it had.
+            if m.normal_map.is_some()
+                || m.normal_scale.is_some()
+                || m.emissive_map.is_some()
+                || m.emissive.is_some()
+            {
+                c.str("es.material.maps.v1");
+                c.opt_id(m.normal_map);
+                c.f64(m.normal_scale.unwrap_or(1.0));
+                c.opt_id(m.emissive_map);
+                match m.emissive {
+                    None => c.u8(0),
+                    Some(e) => {
+                        c.u8(1);
+                        for v in e {
+                            c.f64(v);
+                        }
+                    }
+                }
             }
         }
     }
