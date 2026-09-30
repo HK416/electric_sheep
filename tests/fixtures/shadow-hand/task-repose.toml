@@ -20,6 +20,16 @@
 #    hand where the cameras see it); its orientation is the goal. A 4-wide goal_quat is not a
 #    source an ObsSource can name (a channel starts at a joint's first qpos), so the goal is
 #    the whole pose.
+#  * target_qpos[7] -- the goal cube's free joint `target:joint` in qpos (packet M16/H5b):
+#    position, then the quaternion w x y z as MuJoCo stores it. The student reads it in place
+#    of goal_pose: a recorded row (`observation.state` = qpos || qvel) carries qpos and no
+#    xpos / xquat, so a BodyPose channel cannot be baked, and this one is read from the same
+#    qpos range live and baked. Its quaternion is the reset's (1, 0.0355, -0.0355 u, u)
+#    UNNORMALIZED on an episode's first observation and MuJoCo's normalized one from the first
+#    physics step on (RESET below). Named target_, not goal_: DEP-031 reads the robot's joint
+#    count off the first JointState channel by name (object_vel's note), and `goal_qpos`
+#    would sort before joint_pos. Bound in the graph as task-reach.toml binds its free-joint
+#    cube_pose: GetBodyPose -> Concat -> ObservationSpec.
 #  * object_vel[6] -- the cube's free joint's qvel: linear (world frame), angular (body frame,
 #    MuJoCo's convention). Not `cube_vel`: the cross-IR width check (DEP-031) reads the robot's
 #    joint count off the first JointState channel by name, and it must be joint_pos (24), not
@@ -73,7 +83,8 @@
 #    cube (`cube.yaw`, `goal.yaw`), the yaw 2 atan(u) in [-90, 90] deg. Unnormalized on purpose:
 #    each lane is linear in u, so four nodes on one stream write it from one draw; MuJoCo and
 #    MJWarp both normalize a free joint's quaternion (in xquat at once, in qpos after the first
-#    step, measured) and this document reads xquat only. Isaac Lab draws both from all of SO(3);
+#    step, measured) and this document's rewards and terminations read xquat only (target_qpos,
+#    an observation, reads qpos as it is). Isaac Lab draws both from all of SO(3);
 #    yaw goals are plan H's reduced set.
 
 es_schema = 1
@@ -232,28 +243,38 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 4
+node = 10
 port = "pos"
 
 [body.graph.edges.to]
-node = 14
-port = "value"
+node = 13
+port = "in0"
 
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 14
+node = 10
+port = "quat"
+
+[body.graph.edges.to]
+node = 13
+port = "in1"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 13
 port = "value"
 
 [body.graph.edges.to]
-node = 15
+node = 14
 port = "value"
 
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 15
-port = "value"
+node = 4
+port = "pos"
 
 [body.graph.edges.to]
 node = 16
@@ -272,12 +293,12 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 15
+node = 17
 port = "value"
 
 [body.graph.edges.to]
 node = 18
-port = "a"
+port = "value"
 
 [[body.graph.edges]]
 
@@ -292,11 +313,31 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
+node = 17
+port = "value"
+
+[body.graph.edges.to]
+node = 20
+port = "a"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 20
+port = "value"
+
+[body.graph.edges.to]
+node = 21
+port = "value"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
 node = 4
 port = "quat"
 
 [body.graph.edges.to]
-node = 20
+node = 22
 port = "a"
 
 [[body.graph.edges]]
@@ -306,28 +347,8 @@ node = 10
 port = "quat"
 
 [body.graph.edges.to]
-node = 20
-port = "b"
-
-[[body.graph.edges]]
-
-[body.graph.edges.from]
-node = 20
-port = "value"
-
-[body.graph.edges.to]
-node = 21
-port = "value"
-
-[[body.graph.edges]]
-
-[body.graph.edges.from]
-node = 21
-port = "value"
-
-[body.graph.edges.to]
 node = 22
-port = "a"
+port = "b"
 
 [[body.graph.edges]]
 
@@ -342,17 +363,17 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 22
+node = 23
 port = "value"
 
 [body.graph.edges.to]
 node = 24
-port = "value"
+port = "a"
 
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 21
+node = 24
 port = "value"
 
 [body.graph.edges.to]
@@ -362,7 +383,7 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 25
+node = 24
 port = "value"
 
 [body.graph.edges.to]
@@ -372,7 +393,7 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 26
+node = 23
 port = "value"
 
 [body.graph.edges.to]
@@ -392,7 +413,7 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 26
+node = 28
 port = "value"
 
 [body.graph.edges.to]
@@ -412,7 +433,7 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 26
+node = 28
 port = "value"
 
 [body.graph.edges.to]
@@ -432,7 +453,7 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 26
+node = 28
 port = "value"
 
 [body.graph.edges.to]
@@ -452,7 +473,7 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 26
+node = 28
 port = "value"
 
 [body.graph.edges.to]
@@ -472,7 +493,7 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 26
+node = 28
 port = "value"
 
 [body.graph.edges.to]
@@ -492,7 +513,7 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 26
+node = 28
 port = "value"
 
 [body.graph.edges.to]
@@ -512,7 +533,7 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 26
+node = 28
 port = "value"
 
 [body.graph.edges.to]
@@ -532,27 +553,27 @@ port = "value"
 [[body.graph.edges]]
 
 [body.graph.edges.from]
+node = 28
+port = "value"
+
+[body.graph.edges.to]
+node = 43
+port = "value"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
 node = 43
 port = "value"
 
 [body.graph.edges.to]
 node = 44
-port = "a"
+port = "value"
 
 [[body.graph.edges]]
 
 [body.graph.edges.from]
-node = 44
-port = "value"
-
-[body.graph.edges.to]
 node = 45
-port = "value"
-
-[[body.graph.edges]]
-
-[body.graph.edges.from]
-node = 43
 port = "value"
 
 [body.graph.edges.to]
@@ -568,6 +589,16 @@ port = "value"
 [body.graph.edges.to]
 node = 47
 port = "value"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 45
+port = "value"
+
+[body.graph.edges.to]
+node = 48
+port = "a"
 
 [[body.graph.edges]]
 
@@ -597,6 +628,16 @@ port = "value"
 
 [body.graph.edges.to]
 node = 53
+port = "value"
+
+[[body.graph.edges]]
+
+[body.graph.edges.from]
+node = 54
+port = "value"
+
+[body.graph.edges.to]
+node = 55
 port = "value"
 
 [body.graph.nodes.0.GetJointState]
@@ -672,12 +713,39 @@ shape = [7]
 time = "Tick"
 unit = "Length"
 
-[body.graph.nodes.13.ActionSpec]
+[body.graph.nodes.13.Concat]
+axis = 0
+
+[[body.graph.nodes.13.Concat.parts]]
+elem = "F32"
+frame = "World"
+shape = [3]
+time = "Tick"
+unit = "Length"
+
+[[body.graph.nodes.13.Concat.parts]]
+elem = "F32"
+frame = "World"
+shape = [4]
+time = "Tick"
+unit = "Quaternion"
+
+[body.graph.nodes.14.ObservationSpec]
+channel = "target_qpos"
+
+[body.graph.nodes.14.ObservationSpec.ty]
+elem = "F32"
+frame = "World"
+shape = [7]
+time = "Tick"
+unit = "Length"
+
+[body.graph.nodes.15.ActionSpec]
 control_rate_hz = 60.0
 dim = 20
 space = "JointPosition"
 
-[body.graph.nodes.14.Normalize]
+[body.graph.nodes.16.Normalize]
 hi = [
     2.0,
     1.867,
@@ -691,73 +759,56 @@ lo = [
 out_hi = 1.0
 out_lo = -1.0
 
-[body.graph.nodes.14.Normalize.ty]
+[body.graph.nodes.16.Normalize.ty]
 elem = "F32"
 frame = "World"
 shape = [3]
 time = "Tick"
 unit = "Length"
 
-[body.graph.nodes.15.Norm]
+[body.graph.nodes.17.Norm]
 kind = "L2"
 
-[body.graph.nodes.15.Norm.ty]
+[body.graph.nodes.17.Norm.ty]
 elem = "F32"
 frame = "World"
 shape = [3]
 time = "Tick"
 
-[body.graph.nodes.15.Norm.ty.unit.Normalized]
+[body.graph.nodes.17.Norm.ty.unit.Normalized]
 hi = 1.0
 lo = -1.0
 
-[body.graph.nodes.16.Normalize]
+[body.graph.nodes.18.Normalize]
 hi = [1.0]
 lo = [0.0]
 out_hi = 1.0
 out_lo = 0.0
 
-[body.graph.nodes.16.Normalize.ty]
+[body.graph.nodes.18.Normalize.ty]
 elem = "F32"
 frame = "World"
 shape = [1]
 time = "Tick"
 
-[body.graph.nodes.16.Normalize.ty.unit.Normalized]
+[body.graph.nodes.18.Normalize.ty.unit.Normalized]
 hi = 1.0
 lo = -1.0
 
-[body.graph.nodes.17.Reward]
+[body.graph.nodes.19.Reward]
 aggregation = "Sum"
 name = "cube_distance"
 weight = -0.1
 
-[body.graph.nodes.17.Reward.ty]
+[body.graph.nodes.19.Reward.ty]
 elem = "F32"
 frame = "World"
 shape = [1]
 time = "Tick"
 
-[body.graph.nodes.17.Reward.ty.unit.Normalized]
+[body.graph.nodes.19.Reward.ty.unit.Normalized]
 hi = 1.0
 lo = 0.0
-
-[body.graph.nodes.18.Compare]
-op = "Gt"
-rhs = 0.24
-
-[body.graph.nodes.18.Compare.ty]
-elem = "F32"
-frame = "World"
-shape = [1]
-time = "Tick"
-
-[body.graph.nodes.18.Compare.ty.unit.Normalized]
-hi = 1.0
-lo = -1.0
-
-[body.graph.nodes.19.Terminate]
-kind = "Failure"
 
 [body.graph.nodes.2.GetJointState]
 body = "e44ec3fd52fe7e8f97d377dbe5983f18"
@@ -789,81 +840,71 @@ joints = [
 ]
 quantity = "Velocity"
 
-[body.graph.nodes.20.Dot.ty]
+[body.graph.nodes.20.Compare]
+op = "Gt"
+rhs = 0.24
+
+[body.graph.nodes.20.Compare.ty]
+elem = "F32"
+frame = "World"
+shape = [1]
+time = "Tick"
+
+[body.graph.nodes.20.Compare.ty.unit.Normalized]
+hi = 1.0
+lo = -1.0
+
+[body.graph.nodes.21.Terminate]
+kind = "Failure"
+
+[body.graph.nodes.22.Dot.ty]
 elem = "F32"
 frame = "World"
 shape = [4]
 time = "Tick"
 unit = "Quaternion"
 
-[body.graph.nodes.21.MathFn]
+[body.graph.nodes.23.MathFn]
 approx = false
 func = "Abs"
 
-[body.graph.nodes.21.MathFn.ty]
+[body.graph.nodes.23.MathFn.ty]
 elem = "F32"
 frame = "World"
 shape = [1]
 time = "Tick"
 unit = "Quaternion"
 
-[body.graph.nodes.22.Compare]
+[body.graph.nodes.24.Compare]
 op = "Ge"
 rhs = 0.9987502603949663
 
-[body.graph.nodes.22.Compare.ty]
+[body.graph.nodes.24.Compare.ty]
 elem = "F32"
 frame = "World"
 shape = [1]
 time = "Tick"
 unit = "Quaternion"
 
-[body.graph.nodes.23.Reward]
+[body.graph.nodes.25.Reward]
 aggregation = "Sum"
 name = "success"
 weight = 2.5
 
-[body.graph.nodes.23.Reward.ty]
+[body.graph.nodes.25.Reward.ty]
 elem = "Bool"
 frame = "World"
 shape = [1]
 time = "Tick"
 unit = "Dimensionless"
 
-[body.graph.nodes.24.Terminate]
+[body.graph.nodes.26.Terminate]
 kind = "Success"
-
-[body.graph.nodes.25.Normalize]
-hi = [0.0]
-lo = [1.0]
-out_hi = 8.0
-out_lo = 0.0
-
-[body.graph.nodes.25.Normalize.ty]
-elem = "F32"
-frame = "World"
-shape = [1]
-time = "Tick"
-unit = "Quaternion"
-
-[body.graph.nodes.26.MathFn]
-approx = false
-func = "Sqrt"
-
-[body.graph.nodes.26.MathFn.ty]
-elem = "F32"
-frame = "World"
-shape = [1]
-time = "Tick"
-
-[body.graph.nodes.26.MathFn.ty.unit.Normalized]
-hi = 8.0
-lo = 0.0
 
 [body.graph.nodes.27.Normalize]
 hi = [0.0]
-lo = [0.025]
-out_hi = 1.0
+lo = [1.0]
+out_hi = 8.0
 out_lo = 0.0
 
 [body.graph.nodes.27.Normalize.ty]
@@ -871,29 +912,25 @@ elem = "F32"
 frame = "World"
 shape = [1]
 time = "Tick"
+unit = "Quaternion"
 
-[body.graph.nodes.27.Normalize.ty.unit.Normalized]
-hi = 8.0
-lo = 0.0
+[body.graph.nodes.28.MathFn]
+approx = false
+func = "Sqrt"
 
-[body.graph.nodes.28.Reward]
-aggregation = "Sum"
-name = "rotation_0"
-weight = 0.02
-
-[body.graph.nodes.28.Reward.ty]
+[body.graph.nodes.28.MathFn.ty]
 elem = "F32"
 frame = "World"
 shape = [1]
 time = "Tick"
 
-[body.graph.nodes.28.Reward.ty.unit.Normalized]
-hi = 1.0
+[body.graph.nodes.28.MathFn.ty.unit.Normalized]
+hi = 8.0
 lo = 0.0
 
 [body.graph.nodes.29.Normalize]
-hi = [0.025]
-lo = [0.05]
+hi = [0.0]
+lo = [0.025]
 out_hi = 1.0
 out_lo = 0.0
 
@@ -921,8 +958,8 @@ Joint = "e44ec3fd52fe7e8f97d377dbe5983f18"
 
 [body.graph.nodes.30.Reward]
 aggregation = "Sum"
-name = "rotation_1"
-weight = 0.01333333333333334
+name = "rotation_0"
+weight = 0.02
 
 [body.graph.nodes.30.Reward.ty]
 elem = "F32"
@@ -935,8 +972,8 @@ hi = 1.0
 lo = 0.0
 
 [body.graph.nodes.31.Normalize]
-hi = [0.05]
-lo = [0.1]
+hi = [0.025]
+lo = [0.05]
 out_hi = 1.0
 out_lo = 0.0
 
@@ -952,8 +989,8 @@ lo = 0.0
 
 [body.graph.nodes.32.Reward]
 aggregation = "Sum"
-name = "rotation_2"
-weight = 0.01666666666666666
+name = "rotation_1"
+weight = 0.01333333333333334
 
 [body.graph.nodes.32.Reward.ty]
 elem = "F32"
@@ -966,8 +1003,8 @@ hi = 1.0
 lo = 0.0
 
 [body.graph.nodes.33.Normalize]
-hi = [0.1]
-lo = [0.2]
+hi = [0.05]
+lo = [0.1]
 out_hi = 1.0
 out_lo = 0.0
 
@@ -983,8 +1020,8 @@ lo = 0.0
 
 [body.graph.nodes.34.Reward]
 aggregation = "Sum"
-name = "rotation_3"
-weight = 0.01666666666666667
+name = "rotation_2"
+weight = 0.01666666666666666
 
 [body.graph.nodes.34.Reward.ty]
 elem = "F32"
@@ -997,8 +1034,8 @@ hi = 1.0
 lo = 0.0
 
 [body.graph.nodes.35.Normalize]
-hi = [0.2]
-lo = [0.4]
+hi = [0.1]
+lo = [0.2]
 out_hi = 1.0
 out_lo = 0.0
 
@@ -1014,8 +1051,8 @@ lo = 0.0
 
 [body.graph.nodes.36.Reward]
 aggregation = "Sum"
-name = "rotation_4"
-weight = 0.01333333333333333
+name = "rotation_3"
+weight = 0.01666666666666667
 
 [body.graph.nodes.36.Reward.ty]
 elem = "F32"
@@ -1028,8 +1065,8 @@ hi = 1.0
 lo = 0.0
 
 [body.graph.nodes.37.Normalize]
-hi = [0.4]
-lo = [0.8]
+hi = [0.2]
+lo = [0.4]
 out_hi = 1.0
 out_lo = 0.0
 
@@ -1045,8 +1082,8 @@ lo = 0.0
 
 [body.graph.nodes.38.Reward]
 aggregation = "Sum"
-name = "rotation_5"
-weight = 0.008888888888888889
+name = "rotation_4"
+weight = 0.01333333333333333
 
 [body.graph.nodes.38.Reward.ty]
 elem = "F32"
@@ -1059,8 +1096,8 @@ hi = 1.0
 lo = 0.0
 
 [body.graph.nodes.39.Normalize]
-hi = [0.8]
-lo = [1.6]
+hi = [0.4]
+lo = [0.8]
 out_hi = 1.0
 out_lo = 0.0
 
@@ -1080,8 +1117,8 @@ relative_to = "World"
 
 [body.graph.nodes.40.Reward]
 aggregation = "Sum"
-name = "rotation_6"
-weight = 0.005228758169934642
+name = "rotation_5"
+weight = 0.008888888888888889
 
 [body.graph.nodes.40.Reward.ty]
 elem = "F32"
@@ -1094,8 +1131,8 @@ hi = 1.0
 lo = 0.0
 
 [body.graph.nodes.41.Normalize]
-hi = [1.6]
-lo = [2.8284271247461903]
+hi = [0.8]
+lo = [1.6]
 out_hi = 1.0
 out_lo = 0.0
 
@@ -1111,8 +1148,8 @@ lo = 0.0
 
 [body.graph.nodes.42.Reward]
 aggregation = "Sum"
-name = "rotation_7"
-weight = 0.0024675505322325525
+name = "rotation_6"
+weight = 0.005228758169934642
 
 [body.graph.nodes.42.Reward.ty]
 elem = "F32"
@@ -1124,35 +1161,43 @@ time = "Tick"
 hi = 1.0
 lo = 0.0
 
-[body.graph.nodes.43.GetTime]
-since_reset = true
+[body.graph.nodes.43.Normalize]
+hi = [1.6]
+lo = [2.8284271247461903]
+out_hi = 1.0
+out_lo = 0.0
 
-[body.graph.nodes.44.Compare]
-op = "Ge"
-rhs = 0.0
-
-[body.graph.nodes.44.Compare.ty]
+[body.graph.nodes.43.Normalize.ty]
 elem = "F32"
 frame = "World"
 shape = [1]
 time = "Tick"
-unit = "Time"
 
-[body.graph.nodes.45.Reward]
+[body.graph.nodes.43.Normalize.ty.unit.Normalized]
+hi = 8.0
+lo = 0.0
+
+[body.graph.nodes.44.Reward]
 aggregation = "Sum"
-name = "rotation_floor"
-weight = 0.003414802408943917
+name = "rotation_7"
+weight = 0.0024675505322325525
 
-[body.graph.nodes.45.Reward.ty]
-elem = "Bool"
+[body.graph.nodes.44.Reward.ty]
+elem = "F32"
 frame = "World"
 shape = [1]
 time = "Tick"
-unit = "Dimensionless"
+
+[body.graph.nodes.44.Reward.ty.unit.Normalized]
+hi = 1.0
+lo = 0.0
+
+[body.graph.nodes.45.GetTime]
+since_reset = true
 
 [body.graph.nodes.46.Compare]
 op = "Ge"
-rhs = 8.0
+rhs = 0.0
 
 [body.graph.nodes.46.Compare.ty]
 elem = "F32"
@@ -1161,112 +1206,31 @@ shape = [1]
 time = "Tick"
 unit = "Time"
 
-[body.graph.nodes.47.Terminate]
+[body.graph.nodes.47.Reward]
+aggregation = "Sum"
+name = "rotation_floor"
+weight = 0.003414802408943917
+
+[body.graph.nodes.47.Reward.ty]
+elem = "Bool"
+frame = "World"
+shape = [1]
+time = "Tick"
+unit = "Dimensionless"
+
+[body.graph.nodes.48.Compare]
+op = "Ge"
+rhs = 8.0
+
+[body.graph.nodes.48.Compare.ty]
+elem = "F32"
+frame = "World"
+shape = [1]
+time = "Tick"
+unit = "Time"
+
+[body.graph.nodes.49.Terminate]
 kind = "Timeout"
-
-[body.graph.nodes.48.GetSensor]
-sensor = "88ca8b6647628c7af98c8e359e7d8e4c"
-
-[body.graph.nodes.48.GetSensor.ty]
-elem = "U8"
-shape = [
-    96,
-    96,
-    3,
-]
-unit = "Pixel"
-
-[body.graph.nodes.48.GetSensor.ty.frame]
-Camera = "88ca8b6647628c7af98c8e359e7d8e4c"
-
-[body.graph.nodes.48.GetSensor.ty.image]
-camera_model = "Pinhole"
-channels = "Rgb"
-color_space = "SRgb"
-distortion = "None"
-dtype = "U8"
-height = 96
-rate_hz = 60.0
-shutter = "Global"
-width = 96
-
-[body.graph.nodes.48.GetSensor.ty.image.exposure]
-nanos = 2000000
-secs = 0
-
-[body.graph.nodes.48.GetSensor.ty.image.extrinsics.orientation]
-w = 1.0
-x = 0.0
-y = 0.0
-z = 0.0
-
-[body.graph.nodes.48.GetSensor.ty.image.extrinsics.position]
-x = 0.0
-y = 0.0
-z = 0.0
-
-[body.graph.nodes.48.GetSensor.ty.image.intrinsics]
-cx = 48.0
-cy = 48.0
-fx = 115.88225099390857
-fy = 115.88225099390857
-skew = 0.0
-
-[body.graph.nodes.48.GetSensor.ty.time.Sensor]
-align = "Hold"
-id = "88ca8b6647628c7af98c8e359e7d8e4c"
-
-[body.graph.nodes.49.ObservationSpec]
-channel = "rgb_top"
-
-[body.graph.nodes.49.ObservationSpec.ty]
-elem = "U8"
-shape = [
-    96,
-    96,
-    3,
-]
-unit = "Pixel"
-
-[body.graph.nodes.49.ObservationSpec.ty.frame]
-Camera = "88ca8b6647628c7af98c8e359e7d8e4c"
-
-[body.graph.nodes.49.ObservationSpec.ty.image]
-camera_model = "Pinhole"
-channels = "Rgb"
-color_space = "SRgb"
-distortion = "None"
-dtype = "U8"
-height = 96
-rate_hz = 60.0
-shutter = "Global"
-width = 96
-
-[body.graph.nodes.49.ObservationSpec.ty.image.exposure]
-nanos = 2000000
-secs = 0
-
-[body.graph.nodes.49.ObservationSpec.ty.image.extrinsics.orientation]
-w = 1.0
-x = 0.0
-y = 0.0
-z = 0.0
-
-[body.graph.nodes.49.ObservationSpec.ty.image.extrinsics.position]
-x = 0.0
-y = 0.0
-z = 0.0
-
-[body.graph.nodes.49.ObservationSpec.ty.image.intrinsics]
-cx = 48.0
-cy = 48.0
-fx = 115.88225099390857
-fy = 115.88225099390857
-skew = 0.0
-
-[body.graph.nodes.49.ObservationSpec.ty.time.Sensor]
-align = "Hold"
-id = "88ca8b6647628c7af98c8e359e7d8e4c"
 
 [body.graph.nodes.5.Concat]
 axis = 0
@@ -1286,7 +1250,7 @@ time = "Tick"
 unit = "Quaternion"
 
 [body.graph.nodes.50.GetSensor]
-sensor = "b81e3f052ac4cc2bc8f23f955f6bfe76"
+sensor = "88ca8b6647628c7af98c8e359e7d8e4c"
 
 [body.graph.nodes.50.GetSensor.ty]
 elem = "U8"
@@ -1298,7 +1262,7 @@ shape = [
 unit = "Pixel"
 
 [body.graph.nodes.50.GetSensor.ty.frame]
-Camera = "b81e3f052ac4cc2bc8f23f955f6bfe76"
+Camera = "88ca8b6647628c7af98c8e359e7d8e4c"
 
 [body.graph.nodes.50.GetSensor.ty.image]
 camera_model = "Pinhole"
@@ -1335,10 +1299,10 @@ skew = 0.0
 
 [body.graph.nodes.50.GetSensor.ty.time.Sensor]
 align = "Hold"
-id = "b81e3f052ac4cc2bc8f23f955f6bfe76"
+id = "88ca8b6647628c7af98c8e359e7d8e4c"
 
 [body.graph.nodes.51.ObservationSpec]
-channel = "rgb_front"
+channel = "rgb_top"
 
 [body.graph.nodes.51.ObservationSpec.ty]
 elem = "U8"
@@ -1350,7 +1314,7 @@ shape = [
 unit = "Pixel"
 
 [body.graph.nodes.51.ObservationSpec.ty.frame]
-Camera = "b81e3f052ac4cc2bc8f23f955f6bfe76"
+Camera = "88ca8b6647628c7af98c8e359e7d8e4c"
 
 [body.graph.nodes.51.ObservationSpec.ty.image]
 camera_model = "Pinhole"
@@ -1387,10 +1351,10 @@ skew = 0.0
 
 [body.graph.nodes.51.ObservationSpec.ty.time.Sensor]
 align = "Hold"
-id = "b81e3f052ac4cc2bc8f23f955f6bfe76"
+id = "88ca8b6647628c7af98c8e359e7d8e4c"
 
 [body.graph.nodes.52.GetSensor]
-sensor = "2a7f26f16492710443ac44a955b65d16"
+sensor = "b81e3f052ac4cc2bc8f23f955f6bfe76"
 
 [body.graph.nodes.52.GetSensor.ty]
 elem = "U8"
@@ -1402,7 +1366,7 @@ shape = [
 unit = "Pixel"
 
 [body.graph.nodes.52.GetSensor.ty.frame]
-Camera = "2a7f26f16492710443ac44a955b65d16"
+Camera = "b81e3f052ac4cc2bc8f23f955f6bfe76"
 
 [body.graph.nodes.52.GetSensor.ty.image]
 camera_model = "Pinhole"
@@ -1439,10 +1403,10 @@ skew = 0.0
 
 [body.graph.nodes.52.GetSensor.ty.time.Sensor]
 align = "Hold"
-id = "2a7f26f16492710443ac44a955b65d16"
+id = "b81e3f052ac4cc2bc8f23f955f6bfe76"
 
 [body.graph.nodes.53.ObservationSpec]
-channel = "rgb_side"
+channel = "rgb_front"
 
 [body.graph.nodes.53.ObservationSpec.ty]
 elem = "U8"
@@ -1454,7 +1418,7 @@ shape = [
 unit = "Pixel"
 
 [body.graph.nodes.53.ObservationSpec.ty.frame]
-Camera = "2a7f26f16492710443ac44a955b65d16"
+Camera = "b81e3f052ac4cc2bc8f23f955f6bfe76"
 
 [body.graph.nodes.53.ObservationSpec.ty.image]
 camera_model = "Pinhole"
@@ -1491,54 +1455,142 @@ skew = 0.0
 
 [body.graph.nodes.53.ObservationSpec.ty.time.Sensor]
 align = "Hold"
+id = "b81e3f052ac4cc2bc8f23f955f6bfe76"
+
+[body.graph.nodes.54.GetSensor]
+sensor = "2a7f26f16492710443ac44a955b65d16"
+
+[body.graph.nodes.54.GetSensor.ty]
+elem = "U8"
+shape = [
+    96,
+    96,
+    3,
+]
+unit = "Pixel"
+
+[body.graph.nodes.54.GetSensor.ty.frame]
+Camera = "2a7f26f16492710443ac44a955b65d16"
+
+[body.graph.nodes.54.GetSensor.ty.image]
+camera_model = "Pinhole"
+channels = "Rgb"
+color_space = "SRgb"
+distortion = "None"
+dtype = "U8"
+height = 96
+rate_hz = 60.0
+shutter = "Global"
+width = 96
+
+[body.graph.nodes.54.GetSensor.ty.image.exposure]
+nanos = 2000000
+secs = 0
+
+[body.graph.nodes.54.GetSensor.ty.image.extrinsics.orientation]
+w = 1.0
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.54.GetSensor.ty.image.extrinsics.position]
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.54.GetSensor.ty.image.intrinsics]
+cx = 48.0
+cy = 48.0
+fx = 115.88225099390857
+fy = 115.88225099390857
+skew = 0.0
+
+[body.graph.nodes.54.GetSensor.ty.time.Sensor]
+align = "Hold"
 id = "2a7f26f16492710443ac44a955b65d16"
 
-[body.graph.nodes.54.ResetState]
+[body.graph.nodes.55.ObservationSpec]
+channel = "rgb_side"
+
+[body.graph.nodes.55.ObservationSpec.ty]
+elem = "U8"
+shape = [
+    96,
+    96,
+    3,
+]
+unit = "Pixel"
+
+[body.graph.nodes.55.ObservationSpec.ty.frame]
+Camera = "2a7f26f16492710443ac44a955b65d16"
+
+[body.graph.nodes.55.ObservationSpec.ty.image]
+camera_model = "Pinhole"
+channels = "Rgb"
+color_space = "SRgb"
+distortion = "None"
+dtype = "U8"
+height = 96
+rate_hz = 60.0
+shutter = "Global"
+width = 96
+
+[body.graph.nodes.55.ObservationSpec.ty.image.exposure]
+nanos = 2000000
+secs = 0
+
+[body.graph.nodes.55.ObservationSpec.ty.image.extrinsics.orientation]
+w = 1.0
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.55.ObservationSpec.ty.image.extrinsics.position]
+x = 0.0
+y = 0.0
+z = 0.0
+
+[body.graph.nodes.55.ObservationSpec.ty.image.intrinsics]
+cx = 48.0
+cy = 48.0
+fx = 115.88225099390857
+fy = 115.88225099390857
+skew = 0.0
+
+[body.graph.nodes.55.ObservationSpec.ty.time.Sensor]
+align = "Hold"
+id = "2a7f26f16492710443ac44a955b65d16"
+
+[body.graph.nodes.56.ResetState]
 stream = "reset.robot0:WRJ1"
 target = "joint.robot0:WRJ1.qpos"
 
-[body.graph.nodes.54.ResetState.dist.Uniform]
+[body.graph.nodes.56.ResetState.dist.Uniform]
 hi = 0.028000000119209292
 lo = -0.09779999256134034
 
-[body.graph.nodes.55.ResetState]
+[body.graph.nodes.57.ResetState]
 stream = "reset.robot0:WRJ0"
 target = "joint.robot0:WRJ0.qpos"
 
-[body.graph.nodes.55.ResetState.dist.Uniform]
+[body.graph.nodes.57.ResetState.dist.Uniform]
 hi = 0.09779999256134034
 lo = -0.1396000027656555
 
-[body.graph.nodes.56.ResetState]
+[body.graph.nodes.58.ResetState]
 stream = "reset.robot0:FFJ3"
 target = "joint.robot0:FFJ3.qpos"
 
-[body.graph.nodes.56.ResetState.dist.Uniform]
+[body.graph.nodes.58.ResetState.dist.Uniform]
 hi = 0.06980000138282776
 lo = -0.06980000138282776
 
-[body.graph.nodes.57.ResetState]
+[body.graph.nodes.59.ResetState]
 stream = "reset.robot0:FFJ2"
 target = "joint.robot0:FFJ2.qpos"
 
-[body.graph.nodes.57.ResetState.dist.Uniform]
-hi = 0.31419997215271
-lo = 0.0
-
-[body.graph.nodes.58.ResetState]
-stream = "reset.robot0:FFJ1"
-target = "joint.robot0:FFJ1.qpos"
-
-[body.graph.nodes.58.ResetState.dist.Uniform]
-hi = 0.31419997215271
-lo = 0.0
-
-[body.graph.nodes.59.ResetState]
-stream = "reset.robot0:FFJ1"
-target = "joint.robot0:FFJ0.qpos"
-
 [body.graph.nodes.59.ResetState.dist.Uniform]
-hi = 0.3587673505654715
+hi = 0.31419997215271
 lo = 0.0
 
 [body.graph.nodes.6.ObservationSpec]
@@ -1552,168 +1604,168 @@ time = "Tick"
 unit = "Length"
 
 [body.graph.nodes.60.ResetState]
-stream = "reset.robot0:MFJ3"
-target = "joint.robot0:MFJ3.qpos"
+stream = "reset.robot0:FFJ1"
+target = "joint.robot0:FFJ1.qpos"
 
 [body.graph.nodes.60.ResetState.dist.Uniform]
-hi = 0.06980000138282776
-lo = -0.06980000138282776
+hi = 0.31419997215271
+lo = 0.0
 
 [body.graph.nodes.61.ResetState]
-stream = "reset.robot0:MFJ2"
-target = "joint.robot0:MFJ2.qpos"
+stream = "reset.robot0:FFJ1"
+target = "joint.robot0:FFJ0.qpos"
 
 [body.graph.nodes.61.ResetState.dist.Uniform]
-hi = 0.31419997215271
+hi = 0.3587673505654715
 lo = 0.0
 
 [body.graph.nodes.62.ResetState]
-stream = "reset.robot0:MFJ1"
-target = "joint.robot0:MFJ1.qpos"
+stream = "reset.robot0:MFJ3"
+target = "joint.robot0:MFJ3.qpos"
 
 [body.graph.nodes.62.ResetState.dist.Uniform]
-hi = 0.31419997215271
-lo = 0.0
+hi = 0.06980000138282776
+lo = -0.06980000138282776
 
 [body.graph.nodes.63.ResetState]
-stream = "reset.robot0:MFJ1"
-target = "joint.robot0:MFJ0.qpos"
+stream = "reset.robot0:MFJ2"
+target = "joint.robot0:MFJ2.qpos"
 
 [body.graph.nodes.63.ResetState.dist.Uniform]
-hi = 0.3587673505654715
+hi = 0.31419997215271
 lo = 0.0
 
 [body.graph.nodes.64.ResetState]
-stream = "reset.robot0:RFJ3"
-target = "joint.robot0:RFJ3.qpos"
+stream = "reset.robot0:MFJ1"
+target = "joint.robot0:MFJ1.qpos"
 
 [body.graph.nodes.64.ResetState.dist.Uniform]
-hi = 0.06980000138282776
-lo = -0.06980000138282776
+hi = 0.31419997215271
+lo = 0.0
 
 [body.graph.nodes.65.ResetState]
-stream = "reset.robot0:RFJ2"
-target = "joint.robot0:RFJ2.qpos"
+stream = "reset.robot0:MFJ1"
+target = "joint.robot0:MFJ0.qpos"
 
 [body.graph.nodes.65.ResetState.dist.Uniform]
-hi = 0.31419997215271
-lo = 0.0
-
-[body.graph.nodes.66.ResetState]
-stream = "reset.robot0:RFJ1"
-target = "joint.robot0:RFJ1.qpos"
-
-[body.graph.nodes.66.ResetState.dist.Uniform]
-hi = 0.31419997215271
-lo = 0.0
-
-[body.graph.nodes.67.ResetState]
-stream = "reset.robot0:RFJ1"
-target = "joint.robot0:RFJ0.qpos"
-
-[body.graph.nodes.67.ResetState.dist.Uniform]
 hi = 0.3587673505654715
 lo = 0.0
 
+[body.graph.nodes.66.ResetState]
+stream = "reset.robot0:RFJ3"
+target = "joint.robot0:RFJ3.qpos"
+
+[body.graph.nodes.66.ResetState.dist.Uniform]
+hi = 0.06980000138282776
+lo = -0.06980000138282776
+
+[body.graph.nodes.67.ResetState]
+stream = "reset.robot0:RFJ2"
+target = "joint.robot0:RFJ2.qpos"
+
+[body.graph.nodes.67.ResetState.dist.Uniform]
+hi = 0.31419997215271
+lo = 0.0
+
 [body.graph.nodes.68.ResetState]
-stream = "reset.robot0:LFJ4"
-target = "joint.robot0:LFJ4.qpos"
+stream = "reset.robot0:RFJ1"
+target = "joint.robot0:RFJ1.qpos"
 
 [body.graph.nodes.68.ResetState.dist.Uniform]
-hi = 0.15700000524520874
+hi = 0.31419997215271
 lo = 0.0
 
 [body.graph.nodes.69.ResetState]
-stream = "reset.robot0:LFJ3"
-target = "joint.robot0:LFJ3.qpos"
+stream = "reset.robot0:RFJ1"
+target = "joint.robot0:RFJ0.qpos"
 
 [body.graph.nodes.69.ResetState.dist.Uniform]
-hi = 0.06980000138282776
-lo = -0.06980000138282776
+hi = 0.3587673505654715
+lo = 0.0
 
 [body.graph.nodes.7.GetBodyVelocity]
 body = "98888156e7929b7176b44797dafd5f79"
 relative_to = "World"
 
 [body.graph.nodes.70.ResetState]
-stream = "reset.robot0:LFJ2"
-target = "joint.robot0:LFJ2.qpos"
+stream = "reset.robot0:LFJ4"
+target = "joint.robot0:LFJ4.qpos"
 
 [body.graph.nodes.70.ResetState.dist.Uniform]
-hi = 0.31419997215271
+hi = 0.15700000524520874
 lo = 0.0
 
 [body.graph.nodes.71.ResetState]
-stream = "reset.robot0:LFJ1"
-target = "joint.robot0:LFJ1.qpos"
+stream = "reset.robot0:LFJ3"
+target = "joint.robot0:LFJ3.qpos"
 
 [body.graph.nodes.71.ResetState.dist.Uniform]
+hi = 0.06980000138282776
+lo = -0.06980000138282776
+
+[body.graph.nodes.72.ResetState]
+stream = "reset.robot0:LFJ2"
+target = "joint.robot0:LFJ2.qpos"
+
+[body.graph.nodes.72.ResetState.dist.Uniform]
 hi = 0.31419997215271
 lo = 0.0
 
-[body.graph.nodes.72.ResetState]
+[body.graph.nodes.73.ResetState]
+stream = "reset.robot0:LFJ1"
+target = "joint.robot0:LFJ1.qpos"
+
+[body.graph.nodes.73.ResetState.dist.Uniform]
+hi = 0.31419997215271
+lo = 0.0
+
+[body.graph.nodes.74.ResetState]
 stream = "reset.robot0:LFJ1"
 target = "joint.robot0:LFJ0.qpos"
 
-[body.graph.nodes.72.ResetState.dist.Uniform]
+[body.graph.nodes.74.ResetState.dist.Uniform]
 hi = 0.3587673505654715
 lo = 0.0
 
-[body.graph.nodes.73.ResetState]
+[body.graph.nodes.75.ResetState]
 stream = "reset.robot0:THJ4"
 target = "joint.robot0:THJ4.qpos"
 
-[body.graph.nodes.73.ResetState.dist.Uniform]
+[body.graph.nodes.75.ResetState.dist.Uniform]
 hi = 0.20940001010894777
 lo = -0.20940001010894777
 
-[body.graph.nodes.74.ResetState]
+[body.graph.nodes.76.ResetState]
 stream = "reset.robot0:THJ3"
 target = "joint.robot0:THJ3.qpos"
 
-[body.graph.nodes.74.ResetState.dist.Uniform]
+[body.graph.nodes.76.ResetState.dist.Uniform]
 hi = 0.2444000005722046
 lo = 0.0
 
-[body.graph.nodes.75.ResetState]
+[body.graph.nodes.77.ResetState]
 stream = "reset.robot0:THJ2"
 target = "joint.robot0:THJ2.qpos"
 
-[body.graph.nodes.75.ResetState.dist.Uniform]
+[body.graph.nodes.77.ResetState.dist.Uniform]
 hi = 0.04180000126361847
 lo = -0.04180000126361847
 
-[body.graph.nodes.76.ResetState]
+[body.graph.nodes.78.ResetState]
 stream = "reset.robot0:THJ1"
 target = "joint.robot0:THJ1.qpos"
 
-[body.graph.nodes.76.ResetState.dist.Uniform]
+[body.graph.nodes.78.ResetState.dist.Uniform]
 hi = 0.10479999780654908
 lo = -0.10479999780654908
 
-[body.graph.nodes.77.ResetState]
+[body.graph.nodes.79.ResetState]
 stream = "reset.robot0:THJ0"
 target = "joint.robot0:THJ0.qpos"
 
-[body.graph.nodes.77.ResetState.dist.Uniform]
+[body.graph.nodes.79.ResetState.dist.Uniform]
 hi = 0.0
 lo = -0.31419997215271
-
-[body.graph.nodes.78.ResetState]
-stream = "cube.pos.0"
-target = "qpos[24]"
-
-[body.graph.nodes.78.ResetState.dist.Uniform]
-hi = 1.01
-lo = 0.99
-
-[body.graph.nodes.79.ResetState]
-stream = "cube.pos.1"
-target = "qpos[25]"
-
-[body.graph.nodes.79.ResetState.dist.Uniform]
-hi = 0.877
-lo = 0.857
 
 [body.graph.nodes.8.Concat]
 axis = 0
@@ -1733,71 +1785,79 @@ time = "Tick"
 unit = "AngularVelocity"
 
 [body.graph.nodes.80.ResetState]
+stream = "cube.pos.0"
+target = "qpos[24]"
+
+[body.graph.nodes.80.ResetState.dist.Uniform]
+hi = 1.01
+lo = 0.99
+
+[body.graph.nodes.81.ResetState]
+stream = "cube.pos.1"
+target = "qpos[25]"
+
+[body.graph.nodes.81.ResetState.dist.Uniform]
+hi = 0.877
+lo = 0.857
+
+[body.graph.nodes.82.ResetState]
 stream = "cube.pos.2"
 target = "qpos[26]"
 
-[body.graph.nodes.80.ResetState.dist]
-Constant = 0.1772
-
-[body.graph.nodes.81.ResetState]
-stream = "cube.yaw"
-target = "qpos[27]"
-
-[body.graph.nodes.81.ResetState.dist]
-Constant = 1.0
-
-[body.graph.nodes.82.ResetState]
-stream = "cube.yaw"
-target = "qpos[28]"
-
 [body.graph.nodes.82.ResetState.dist]
-Constant = 0.0355
+Constant = 0.1772
 
 [body.graph.nodes.83.ResetState]
 stream = "cube.yaw"
-target = "qpos[29]"
+target = "qpos[27]"
 
-[body.graph.nodes.83.ResetState.dist.Uniform]
-hi = -0.0355
-lo = 0.0355
+[body.graph.nodes.83.ResetState.dist]
+Constant = 1.0
 
 [body.graph.nodes.84.ResetState]
 stream = "cube.yaw"
-target = "qpos[30]"
+target = "qpos[28]"
 
-[body.graph.nodes.84.ResetState.dist.Uniform]
-hi = 1.0
-lo = -1.0
-
-[body.graph.nodes.85.ResetState]
-stream = "goal.yaw"
-target = "qpos[34]"
-
-[body.graph.nodes.85.ResetState.dist]
-Constant = 1.0
-
-[body.graph.nodes.86.ResetState]
-stream = "goal.yaw"
-target = "qpos[35]"
-
-[body.graph.nodes.86.ResetState.dist]
+[body.graph.nodes.84.ResetState.dist]
 Constant = 0.0355
 
-[body.graph.nodes.87.ResetState]
-stream = "goal.yaw"
-target = "qpos[36]"
+[body.graph.nodes.85.ResetState]
+stream = "cube.yaw"
+target = "qpos[29]"
 
-[body.graph.nodes.87.ResetState.dist.Uniform]
+[body.graph.nodes.85.ResetState.dist.Uniform]
 hi = -0.0355
 lo = 0.0355
 
-[body.graph.nodes.88.ResetState]
-stream = "goal.yaw"
-target = "qpos[37]"
+[body.graph.nodes.86.ResetState]
+stream = "cube.yaw"
+target = "qpos[30]"
 
-[body.graph.nodes.88.ResetState.dist.Uniform]
+[body.graph.nodes.86.ResetState.dist.Uniform]
 hi = 1.0
 lo = -1.0
+
+[body.graph.nodes.87.ResetState]
+stream = "goal.yaw"
+target = "qpos[34]"
+
+[body.graph.nodes.87.ResetState.dist]
+Constant = 1.0
+
+[body.graph.nodes.88.ResetState]
+stream = "goal.yaw"
+target = "qpos[35]"
+
+[body.graph.nodes.88.ResetState.dist]
+Constant = 0.0355
+
+[body.graph.nodes.89.ResetState]
+stream = "goal.yaw"
+target = "qpos[36]"
+
+[body.graph.nodes.89.ResetState.dist.Uniform]
+hi = -0.0355
+lo = 0.0355
 
 [body.graph.nodes.9.ObservationSpec]
 channel = "object_vel"
@@ -1808,6 +1868,14 @@ frame = "World"
 shape = [6]
 time = "Tick"
 unit = "Velocity"
+
+[body.graph.nodes.90.ResetState]
+stream = "goal.yaw"
+target = "qpos[37]"
+
+[body.graph.nodes.90.ResetState.dist.Uniform]
+hi = 1.0
+lo = -1.0
 
 [body.observation_spec.channels.cube_pose.source]
 BodyPose = "98888156e7929b7176b44797dafd5f79"
@@ -2081,6 +2149,17 @@ skew = 0.0
 [body.observation_spec.channels.rgb_top.ty.time.Sensor]
 align = "Hold"
 id = "88ca8b6647628c7af98c8e359e7d8e4c"
+
+[body.observation_spec.channels.target_qpos.source.JointState]
+body = "8060d4cf0da1f2b6a6131cb5213cbf1c"
+dof = 7
+
+[body.observation_spec.channels.target_qpos.ty]
+elem = "F32"
+frame = "World"
+shape = [7]
+time = "Tick"
+unit = "Length"
 
 [body.scene]
 asset_hash = [

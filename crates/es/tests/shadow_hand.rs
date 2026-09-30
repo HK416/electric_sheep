@@ -377,6 +377,19 @@ fn task() -> TaskIr {
     b.link(vel, "angular", cat, "in1");
     b.link(cat, "value", spec, "value");
     let goal = pose_channel(&mut b, target, "goal_pose");
+    // `target_qpos`: the goal's free joint in `qpos` (packet M16/H5b), bound in the graph as
+    // task-reach.toml binds its free-joint `cube_pose` -- the body's pose, concatenated.
+    let cat = b.add(TaskNode::Concat {
+        parts: vec![pos3.clone(), quat4.clone()],
+        axis: 0,
+    });
+    let spec = b.add(TaskNode::ObservationSpec {
+        channel: "target_qpos".to_owned(),
+        ty: pose7.clone(),
+    });
+    b.link(goal, "pos", cat, "in0");
+    b.link(goal, "quat", cat, "in1");
+    b.link(cat, "value", spec, "value");
     b.add(TaskNode::ActionSpec {
         space: ActionSpace::JointPosition,
         dim: 20,
@@ -666,6 +679,19 @@ fn task() -> TaskIr {
             "goal_pose".to_owned(),
             ObsChannel {
                 source: ObsSource::BodyPose(target),
+                ty: pose7.clone(),
+            },
+        ),
+        (
+            "target_qpos".to_owned(),
+            ObsChannel {
+                // The goal's free joint: its seven `qpos` (position, then w x y z), which a
+                // recorded `qpos ‖ qvel` row carries and `xpos` / `xquat` are not in.
+                source: ObsSource::JointState {
+                    body: joint(&scene, "target:joint").id,
+                    dof: 7,
+                    quantity: JointQuantity::Position,
+                },
                 ty: pose7,
             },
         ),
@@ -742,8 +768,9 @@ fn channel_stats(scene: &SceneDesc, name: &str) -> Vec<(f64, f64)> {
             .collect(),
         // Linear m/s as is, angular rad/s by 0.2 as Isaac Lab does.
         "object_vel" => [n(3, 0.0, 1.0), n(3, 0.0, 5.0)].concat(),
-        // The goal cube floats where the scene puts it; its position is a constant.
-        "goal_pose" => {
+        // The goal cube floats where the scene puts it; its position is a constant. Its qpos
+        // (`target_qpos`) is the same seven numbers with the quaternion w-first, same ranges.
+        "goal_pose" | "target_qpos" => {
             let target = scene
                 .bodies
                 .iter()
@@ -1041,7 +1068,7 @@ fn evaluation(task: &TaskIr, obs: &ObservationIr) -> EvaluationIr {
 
 /// The student's state: the hand's joints and the goal. Never the cube: its pose is what the
 /// cameras are for.
-const STUDENT_STATE: [&str; 2] = ["joint_pos", "goal_pose"];
+const STUDENT_STATE: [&str; 2] = ["joint_pos", "target_qpos"];
 /// Plan N's three views onto this scene's three cameras: `observation-views.toml`'s chains and
 /// `learning-views.toml`'s encoders, in that order.
 const VIEWS: [(&str, &str); 3] = [
@@ -1360,6 +1387,16 @@ const TASK_HEADER: &str = "\
 #    hand where the cameras see it); its orientation is the goal. A 4-wide goal_quat is not a
 #    source an ObsSource can name (a channel starts at a joint's first qpos), so the goal is
 #    the whole pose.
+#  * target_qpos[7] -- the goal cube's free joint `target:joint` in qpos (packet M16/H5b):
+#    position, then the quaternion w x y z as MuJoCo stores it. The student reads it in place
+#    of goal_pose: a recorded row (`observation.state` = qpos || qvel) carries qpos and no
+#    xpos / xquat, so a BodyPose channel cannot be baked, and this one is read from the same
+#    qpos range live and baked. Its quaternion is the reset's (1, 0.0355, -0.0355 u, u)
+#    UNNORMALIZED on an episode's first observation and MuJoCo's normalized one from the first
+#    physics step on (RESET below). Named target_, not goal_: DEP-031 reads the robot's joint
+#    count off the first JointState channel by name (object_vel's note), and `goal_qpos`
+#    would sort before joint_pos. Bound in the graph as task-reach.toml binds its free-joint
+#    cube_pose: GetBodyPose -> Concat -> ObservationSpec.
 #  * object_vel[6] -- the cube's free joint's qvel: linear (world frame), angular (body frame,
 #    MuJoCo's convention). Not `cube_vel`: the cross-IR width check (DEP-031) reads the robot's
 #    joint count off the first JointState channel by name, and it must be joint_pos (24), not
@@ -1413,7 +1450,8 @@ const TASK_HEADER: &str = "\
 #    cube (`cube.yaw`, `goal.yaw`), the yaw 2 atan(u) in [-90, 90] deg. Unnormalized on purpose:
 #    each lane is linear in u, so four nodes on one stream write it from one draw; MuJoCo and
 #    MJWarp both normalize a free joint's quaternion (in xquat at once, in qpos after the first
-#    step, measured) and this document reads xquat only. Isaac Lab draws both from all of SO(3);
+#    step, measured) and this document's rewards and terminations read xquat only (target_qpos,
+#    an observation, reads qpos as it is). Isaac Lab draws both from all of SO(3);
 #    yaw goals are plan H's reduced set.
 ";
 
@@ -1513,14 +1551,18 @@ const OBSERVATION_STUDENT_HEADER: &str = "\
 #    rgb_wrist -> rgb_front, rgb_side -> rgb_side (sensor, frame and time reference), fx = fy
 #    from this scene's fovy 45 deg (all three), and rate_hz 50 -> 60 (the control rate).
 #    observation-augmented.toml's header says what the chain does in training and evaluation.
-#  * `joint_state` replaced by `state` (31): joint_pos[24] || goal_pose[7] -> Concat ->
-#    Normalize{MeanStd} with observation-teacher.toml's statistics for those two channels.
-#    The goal is the task's input (which way to turn the cube), not privileged: a real hand
-#    is told its goal. What the teacher also read and the student does not: joint_vel,
-#    cube_pose (SIMULATOR-PRIVILEGED), object_vel and last_action.
-# goal_pose is the goal cube's free-joint pose; a recorded row carries qpos, so the bake and
-# the evaluator read it from the free joint's qpos range with the loaded model
-# (es_eval::runner::input_sources).
+#  * `joint_state` replaced by `state` (31): joint_pos[24] || target_qpos[7] -> Concat ->
+#    Normalize{MeanStd} with observation-teacher.toml's statistics for joint_pos and, for
+#    target_qpos, goal_pose's (the same seven numbers: the goal's position, then its
+#    quaternion with w first). The goal is the task's input (which way to turn the cube), not
+#    privileged: a real hand is told its goal. What the teacher also read and the student does
+#    not: joint_vel, cube_pose (SIMULATOR-PRIVILEGED), object_vel and last_action.
+# target_qpos, not the teacher's goal_pose (packet M16/H5b): the student is trained on a baked
+# recorded row, `qpos || qvel`, which has no xpos / xquat. The bake and the evaluator both read
+# the goal's free-joint qpos range with the loaded model (es_eval::runner::input_sources), so
+# what training reads is what inference computes, bit for bit. On an episode's first frame the
+# goal quaternion is the reset's unnormalized (1, 0.0355, -0.0355 u, u); from the first physics
+# step on it is MuJoCo's normalized one (task-repose.toml's RESET).
 ";
 
 const LEARNING_STUDENT_HEADER: &str = "\
@@ -2022,14 +2064,19 @@ fn the_student_recipe_and_cycle_dry_run() {
     println!("RAN the_student_recipe_and_cycle_dry_run:\n{text}");
 }
 
-/// The student's Observation IR bakes a recorded row with the loaded hand: `joint_pos` is the
-/// row's leading 24 and `goal_pose` the goal cube's free joint in `qpos` (a recorded row has no
-/// `xpos` / `xquat`), so `es train` can bake what the teacher collects. Needs `ES_PYTHON`
-/// (`MuJoCo`, for the model).
+/// The student's Observation IR bakes a recorded row into exactly what the evaluator computes
+/// live for the same state (packet M16/H5b): `joint_pos` is the row's leading 24 and
+/// `target_qpos` the goal's free joint in `qpos`, so the bake of `qpos ‖ qvel` and
+/// `capture_views` + `CpuPlan::run` on the `StateView` it was taken from agree bit for bit, on
+/// every output -- at the reset, where the goal's quaternion is the one the reset wrote
+/// (unnormalized), and after control steps, where it is `MuJoCo`'s normalized one. The images are
+/// the same zero tile on both sides: what is compared is the state. Needs `ES_PYTHON` (`MuJoCo`).
 #[test]
 fn the_student_state_bakes_from_a_recorded_row() {
+    use es_env::{scheduler::BatchDomains, Env};
+    use es_eval::runner::{capture_views, input_sources};
     use es_physics_backend::MuJoCoCpuBackend;
-    use es_physics_core::backend::{LoadConfig, PhysicsBackend};
+    use es_physics_core::backend::{ModelInfo, PhysicsBackend, StateView};
 
     if std::env::var_os("ES_PYTHON").is_none() {
         println!("SKIP the_student_state_bakes_from_a_recorded_row: ES_PYTHON is not set");
@@ -2039,14 +2086,86 @@ fn the_student_state_bakes_from_a_recorded_row() {
     let obs = es_ir::serial::observation_from_toml(&read(&repo().join(STUDENT_DOCS[1])))
         .expect("observation");
     let (scene, _) = scene();
-    let mut backend = MuJoCoCpuBackend::new();
-    let model = backend
-        .load(&scene, &LoadConfig::default())
-        .expect("the hand loads");
+    let domains = BatchDomains::single_env_at(
+        TickRate::from_period_secs(scene.options.timestep).expect("120 Hz"),
+        control_rate(&scene),
+    )
+    .expect("two ticks per control step");
+    let mut env = Env::new(&task, &scene, MuJoCoCpuBackend::new(), &domains, 1001)
+        .expect("the task compiles against the loaded hand");
+    let model = env.model().clone();
     es_eval::ObservationBake::new(&obs, &task, None)
-        .expect_err("goal_pose needs the model's qpos range");
-    es_eval::ObservationBake::new(&obs, &task, Some(&model))
+        .expect_err("target_qpos needs the model's qpos range");
+    let mut bake = es_eval::ObservationBake::new(&obs, &task, Some(&model))
         .expect("the student's inputs resolve against the loaded hand");
+    let mut plan =
+        es_compile::CpuPlan::compile(&obs, es_compile::PlanMode::Release).expect("compiles");
+    let sources = input_sources(&plan, &obs, &task, Some(&model)).expect("every input resolves");
+    let tiles: BTreeMap<String, usize> = plan
+        .inputs
+        .iter()
+        .map(|(name, id)| (name.clone(), plan.buffers[id.0].elems))
+        .collect();
+    let tile = |name: &str| vec![0_u8; tiles[name]];
+    let goal = model.qpos[&joint(&scene, "target:joint").id].as_range();
+    assert_eq!(goal.len(), 7, "a free joint's qpos");
+
+    env.reset(None).expect("reset");
+    let ctrl: Vec<f64> = ctrlrange(&scene)
+        .iter()
+        .map(|(lo, hi)| f64::midpoint(*lo, *hi))
+        .collect();
+    for step in 0..4 {
+        if step > 0 {
+            env.step(&ctrl).expect("a control step");
+        }
+        let s = env.backend().state();
+        let row: Vec<f64> = s.qpos_of(0).iter().chain(s.qvel_of(0)).copied().collect();
+        let mut view = |name: &str,
+                        _: &es_eval::LightOverride,
+                        _: &ModelInfo,
+                        _: &StateView<'_>| { Ok(tile(name)) };
+        let (names, bytes, _) = capture_views(
+            &plan,
+            &sources,
+            &model,
+            &s,
+            Some(&mut view),
+            &es_eval::LightOverride::default(),
+            None,
+            &[],
+        )
+        .expect("the live capture");
+        let inputs = names
+            .iter()
+            .zip(&bytes)
+            .map(|((n, dtype, shape), data)| {
+                (
+                    n.clone(),
+                    es_compile::TensorRef::new(*dtype, shape.clone(), data.as_slice()),
+                )
+            })
+            .collect();
+        let live = plan.run(&inputs).expect("the live plan");
+        let baked = bake
+            .frame(&row, &mut |name| Ok(tile(name)))
+            .expect("the recorded row bakes");
+        assert_eq!(
+            live.keys().collect::<Vec<_>>(),
+            baked.keys().collect::<Vec<_>>()
+        );
+        for (port, t) in &live {
+            assert!(
+                t.dtype == baked[port].dtype && t.data == baked[port].data,
+                "step {step}: {port} baked is not {port} live"
+            );
+        }
+        let q = &row[goal.start + 3..goal.end];
+        println!(
+            "step {step}: target_qpos quaternion (w x y z) {q:?}, norm {:.9}",
+            q.iter().map(|v| v * v).sum::<f64>().sqrt()
+        );
+    }
     println!("RAN the_student_state_bakes_from_a_recorded_row");
 }
 
@@ -2847,18 +2966,14 @@ fn the_teacher_collects_with_frames() {
         &student,
     ]);
     assert!(ok, "{text}");
-    // The bake loads the hand -- STLs and all, which it did not before H5 -- and then stops
-    // where the recorded row ends: `goal_pose` is a `BodyPose` channel, which the live capture
-    // reads from `xpos` / `xquat` and a `qpos ‖ qvel` row does not carry. An open decision
-    // (where a recorded body pose lives), pinned here so it cannot pass unnoticed.
+    // The bake loads the hand -- STLs and all, which it did not before H5 -- and reads the
+    // student's goal from the row's `qpos` (`target_qpos`, packet M16/H5b; before it, the
+    // student read `goal_pose` from `xpos` / `xquat`, which a `qpos ‖ qvel` row does not carry).
     let baked = dir.join("baked").to_string_lossy().into_owned();
     let (ok, text) = es(&[
         "dataset", "bake", "--policy", &student, "--out", &baked, "--frames", &frames_s, "--scene",
         SCENE, &ds_s,
     ]);
-    assert!(
-        !ok && text.contains("reads a body's pose from xpos and xquat"),
-        "{text}"
-    );
+    assert!(ok, "{text}");
     println!("RAN the_teacher_collects_with_frames:\n{text}");
 }

@@ -10,14 +10,18 @@
 #    rgb_wrist -> rgb_front, rgb_side -> rgb_side (sensor, frame and time reference), fx = fy
 #    from this scene's fovy 45 deg (all three), and rate_hz 50 -> 60 (the control rate).
 #    observation-augmented.toml's header says what the chain does in training and evaluation.
-#  * `joint_state` replaced by `state` (31): joint_pos[24] || goal_pose[7] -> Concat ->
-#    Normalize{MeanStd} with observation-teacher.toml's statistics for those two channels.
-#    The goal is the task's input (which way to turn the cube), not privileged: a real hand
-#    is told its goal. What the teacher also read and the student does not: joint_vel,
-#    cube_pose (SIMULATOR-PRIVILEGED), object_vel and last_action.
-# goal_pose is the goal cube's free-joint pose; a recorded row carries qpos, so the bake and
-# the evaluator read it from the free joint's qpos range with the loaded model
-# (es_eval::runner::input_sources).
+#  * `joint_state` replaced by `state` (31): joint_pos[24] || target_qpos[7] -> Concat ->
+#    Normalize{MeanStd} with observation-teacher.toml's statistics for joint_pos and, for
+#    target_qpos, goal_pose's (the same seven numbers: the goal's position, then its
+#    quaternion with w first). The goal is the task's input (which way to turn the cube), not
+#    privileged: a real hand is told its goal. What the teacher also read and the student does
+#    not: joint_vel, cube_pose (SIMULATOR-PRIVILEGED), object_vel and last_action.
+# target_qpos, not the teacher's goal_pose (packet M16/H5b): the student is trained on a baked
+# recorded row, `qpos || qvel`, which has no xpos / xquat. The bake and the evaluator both read
+# the goal's free-joint qpos range with the loaded model (es_eval::runner::input_sources), so
+# what training reads is what inference computes, bit for bit. On an episode's first frame the
+# goal quaternion is the reset's unnormalized (1, 0.0355, -0.0355 u, u); from the first physics
+# step on it is MuJoCo's normalized one (task-repose.toml's RESET).
 
 es_schema = 1
 kind = "observation"
@@ -25,38 +29,38 @@ kind = "observation"
 [body]
 schema_version = 1
 task_ref = [
-    162,
-    194,
-    94,
-    52,
-    179,
-    243,
-    234,
-    193,
-    19,
-    114,
-    211,
-    171,
-    90,
-    227,
-    251,
-    189,
-    183,
-    38,
-    87,
-    233,
-    129,
-    165,
-    106,
-    67,
-    99,
-    89,
+    225,
+    107,
+    68,
+    169,
+    4,
+    151,
+    150,
+    224,
+    237,
     113,
-    245,
-    48,
-    48,
-    81,
-    70,
+    212,
+    134,
+    54,
+    44,
+    11,
+    206,
+    138,
+    208,
+    138,
+    0,
+    15,
+    207,
+    170,
+    209,
+    84,
+    183,
+    117,
+    200,
+    199,
+    25,
+    6,
+    133,
 ]
 
 [body.graph]
@@ -1604,7 +1608,7 @@ unit = "Angle"
 Joint = "e44ec3fd52fe7e8f97d377dbe5983f18"
 
 [body.graph.nodes.23.StateInput]
-source = "66ac81c7b44da1e7d2d607b5d6b507fd"
+source = "8060d4cf0da1f2b6a6131cb5213cbf1c"
 
 [body.graph.nodes.23.StateInput.io]
 inputs = []
