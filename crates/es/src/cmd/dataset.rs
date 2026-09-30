@@ -480,13 +480,13 @@ fn info(args: &[String]) -> Result<u8, CliError> {
 ///
 /// `MuJoCoCpuBackend` is the same loader `es loop collect` and `es eval run` use, so the
 /// ranges a bake indexes the recorded row with are the ranges the run that recorded it
-/// indexed `qpos` with.
+/// indexed `qpos` with -- and so is the scene loader, `load_scene`, which loads the mesh and
+/// texture files the scene names (the Shadow Hand's STLs; packet M16/H5).
 fn load_model(scene: &str) -> Result<es_physics_core::ModelInfo, String> {
     use es_physics_core::{LoadConfig, PhysicsBackend};
 
-    let xml = std::fs::read_to_string(scene).map_err(|e| format!("{scene}: {e}"))?;
-    let parsed = es_assets::parse_mjcf(&xml).map_err(|e| format!("{scene}: {e}"))?;
+    let scene = super::backend::load_scene(scene).map_err(|e| e.to_string())?;
     es_physics_backend::MuJoCoCpuBackend::new()
-        .load(&parsed.scene, &LoadConfig::default())
+        .load(&scene, &LoadConfig::default())
         .map_err(|e| e.to_string())
 }

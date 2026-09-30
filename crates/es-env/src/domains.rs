@@ -243,20 +243,33 @@ impl<const NJ: usize, const H: usize> DomainRunner<NJ, H> {
                 plans.len(),
             ));
         }
+        let port = self.obs_port.clone();
+        self.observe_window_with(sim_tick, &mut |env| {
+            let raw = state_row(state, model, env);
+            Ok(match plans.get_mut(env as usize) {
+                None => [(port.clone(), raw)].into_iter().collect(),
+                Some(plan) => {
+                    let one = [(port.clone(), raw.as_ref())].into_iter().collect();
+                    plan.run(&one)
+                        .map_err(|e| EnvError::Unsupported(format!("observation plan: {e}")))?
+                }
+            })
+        })
+    }
+
+    /// [`Self::observe_window`] with the policy's inputs computed by the caller: `observe(env)`
+    /// is called on exactly the ticks and for exactly the envs the round-robin selects, and its
+    /// map is what inference is later handed for that env. `es loop collect` runs the bundle's
+    /// Observation IR here, the capture `es eval run` and `Rollout` run (packet M16/H5).
+    pub fn observe_window_with(
+        &mut self,
+        sim_tick: u64,
+        observe: &mut dyn FnMut(u32) -> Result<BTreeMap<String, Tensor>, EnvError>,
+    ) -> Result<(), EnvError> {
         let period = u64::from(self.schedule.domains().inference.period);
         for t in sim_tick..sim_tick + period {
             for env in self.schedule.observation_envs(t) {
-                let raw = state_row(state, model, env);
-                let inputs = match plans.get_mut(env as usize) {
-                    None => [(self.obs_port.clone(), raw)].into_iter().collect(),
-                    Some(plan) => {
-                        let one = [(self.obs_port.clone(), raw.as_ref())]
-                            .into_iter()
-                            .collect();
-                        plan.run(&one)
-                            .map_err(|e| EnvError::Unsupported(format!("observation plan: {e}")))?
-                    }
-                };
+                let inputs = observe(env)?;
                 self.latest[env as usize] = Some(Latest {
                     tick: self.control_tick,
                     inputs,

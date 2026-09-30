@@ -30,7 +30,7 @@ pub use metrics::compute;
 pub use perturb::{LightOverride, PerturbationPlan, ResetOverrides, StepState};
 pub use runner::{
     cell_name, write_artifacts, BackendCaps, Evaluation, EvaluationLock, EventSource, FrameSink,
-    RunConfig, Shard, ShardCell, StepEvent,
+    LiveObservation, RunConfig, Shard, ShardCell, StepEvent,
 };
 
 /// Everything that stops an evaluation from producing a report.

@@ -258,6 +258,33 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
         move |at: PerturbAt<'_>| p.at(at, light)
     });
     let perturbation = at.as_mut().map(|hook| Perturbation { hook });
+    // A trained policy is handed its Observation IR's output, captured as `es eval run` and
+    // `Rollout` capture it (packet M16/H5); the raw `qpos ‖ qvel` row it was handed before is
+    // what the expert reads, and the only thing an expert run computes.
+    let mut live = match expert {
+        Some(_) => None,
+        None => Some(
+            es_eval::LiveObservation::new(&spec.bundle.observation, &spec.bundle.task).map_err(
+                |e| {
+                    CliError::Runtime(format!(
+                        "es loop collect --policy: {e}. Collecting with a policy that reads \
+                         images is not supported; use --expert, or a state policy"
+                    ))
+                },
+            )?,
+        ),
+    };
+    let has_live = live.is_some();
+    let mut observer = |first: bool,
+                        previous: Option<&[f64]>,
+                        model: &ModelInfo,
+                        state: &es_physics_core::backend::StateView<'_>| {
+        live.as_mut()
+            .ok_or_else(|| "no live observation under --expert".to_owned())?
+            .observe(first, previous, model, state)
+            .map_err(|e| e.to_string())
+    };
+    let observe: Option<es_data::Observer<'_>> = has_live.then_some(&mut observer);
     // One publisher, two hooks: the collector's own sink says what the plane did and the
     // frame sink has the pixels. A `RefCell` because both closures live at once and the run
     // is single-threaded -- neither hook can be entered from inside the other (packet M7/E7).
@@ -360,6 +387,7 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
             Some(&mut frame_sink),
             sink,
             perturbation,
+            observe,
             ledger,
         )
         .map_err(|e| CliError::Runtime(e.to_string()));
@@ -381,6 +409,7 @@ fn collect_typed<B: PhysicsBackend + Default, const NJ: usize, const H: usize>(
         None,
         sink,
         perturbation,
+        observe,
         ledger,
     )
     .map_err(|e| CliError::Runtime(e.to_string()))

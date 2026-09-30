@@ -341,6 +341,28 @@ pub enum PerturbAt<'c> {
 /// The perturbation hook: a closure, not an eighth extension point (`INV-17`).
 pub type Perturber<'a> = &'a mut dyn FnMut(PerturbAt<'_>);
 
+/// The policy's observation of one control step (packet M16/H5):
+/// `(first, previous, model, state) -> the policy's input tensors`.
+///
+/// Without one, the policy is handed the raw `qpos ‖ qvel` row under `"state"` -- the
+/// plan-free path the scripted demonstrations are collected through, and what an
+/// [`Intervener`] reads. A trained policy was trained on its Observation IR's output instead
+/// (joint blocks, poses, velocities, the previous action, normalized and concatenated), which
+/// the raw row is not: the Shadow Hand teacher wants 88 values and the row is 74. The caller
+/// runs that plan here with the capture `es eval run` and `Rollout` use
+/// (`es_eval::LiveObservation`, over `es_eval::runner::capture_at`), which `es-data` cannot
+/// name (layer 10 beside `es-eval`).
+///
+/// `first` is the first observation of an episode (reset the plan's history); `previous` is
+/// the policy row the last control step executed, before the plane -- what a
+/// `PreviousAction` channel reads -- and `None` until this episode has one.
+pub type Observer<'a> = &'a mut dyn FnMut(
+    bool,
+    Option<&[f64]>,
+    &ModelInfo,
+    &StateView<'_>,
+) -> Result<BTreeMap<String, Tensor>, String>;
+
 /// What [`Collector::run_perturbed`] is given beyond [`Collector::run_with_sink`]. What a
 /// perturbation adds to the ledger step (`perturb.config`, ...) travels in `run_perturbed`'s
 /// `ledger`, beside the expert's (packet M14/Q2).
@@ -525,7 +547,15 @@ impl<const NJ: usize, const H: usize> PolicyRuntime for Intervened<'_, NJ, H> {
                 },
             )]));
         }
-        self.inner.infer(inputs)
+        // A policy's only output is its action chunk, whatever the Learning IR names it -- every
+        // committed one says "actions" -- which is `es eval run`'s rule (`RunConfig::
+        // action_output` = `None`) too (packet M16/H5).
+        let mut out = self.inner.infer(inputs)?;
+        if out.len() == 1 && !out.contains_key(&self.action_port) {
+            let only = out.pop_first().map(|(_, t)| t).expect("len == 1");
+            out.insert(self.action_port.clone(), only);
+        }
+        Ok(out)
     }
 
     fn info(&self) -> Option<&PolicyInfo> {
@@ -618,6 +648,7 @@ impl Collector {
             frame_sink,
             sink,
             None,
+            None,
             &[],
         )
     }
@@ -643,6 +674,7 @@ impl Collector {
         mut frame_sink: Option<FrameSink<'_>>,
         mut sink: Option<CollectSink<'_>>,
         mut perturb: Option<Perturbation<'_>>,
+        mut observe: Option<Observer<'_>>,
         ledger: &[(String, String)],
     ) -> Result<CollectReport, DataError>
     where
@@ -740,6 +772,8 @@ impl Collector {
                 });
             }
             let mut held = Held::new(delay);
+            // The policy row the last control step executed, for an [`Observer`].
+            let mut previous: Option<[f64; NJ]> = None;
             let mut traj = spec.traj_dir.as_ref().map(|_| Trajectory::new(env.model()));
             let mut sources: Vec<i64> = Vec::with_capacity(max_steps as usize);
             let mut commanded: Vec<f64> = Vec::with_capacity(max_steps as usize * NJ);
@@ -791,22 +825,48 @@ impl Collector {
                 // plant. The plane is on the path either way (`INV-12`).
                 {
                     let state = env.backend().state();
-                    match perturb.as_mut() {
-                        None => runner.observe_window(tick.0, env.model(), &state, &mut []),
+                    let delayed;
+                    let seen = match perturb.as_mut() {
+                        None => &state,
                         Some(p) => {
                             let mut dropped = false;
                             (p.hook)(PerturbAt::Observe {
                                 dropped: &mut dropped,
                             });
-                            let seen = held.observe(&state, dropped);
-                            runner.observe_window(tick.0, env.model(), &seen, &mut [])
+                            delayed = held.observe(&state, dropped);
+                            &delayed
                         }
+                    };
+                    let model = env.model();
+                    match observe.as_deref_mut() {
+                        None => runner.observe_window(tick.0, model, seen, &mut []),
+                        // ponytail: under `observation_delay` / `frame_drop` this re-captures
+                        // the held state with the current previous action and advances the
+                        // plan's history, where `es_eval::runner` replays the held plan output;
+                        // equal for a plan without a TemporalWindow or PreviousAction input.
+                        Some(observe) => runner.observe_window_with(tick.0, &mut |_| {
+                            observe(frame == 0, previous.as_ref().map(|r| &r[..]), model, seen)
+                                .map_err(|e| {
+                                    es_env::EnvError::Unsupported(format!("observation: {e}"))
+                                })
+                        }),
                     }
                     .map_err(|e| bad(&e))?;
                 }
                 runner
                     .infer_window(tick.0, &mut wrapper)
                     .map_err(|e| bad(&e))?;
+                // This step's policy row before the plane, which the next observation reads
+                // (`es_eval::runner::run_episode` reads `action_at` at the same point). An
+                // underrun serves no row and the last one stands.
+                if observe.is_some() {
+                    if let Some(row) = runner
+                        .buffer(0)
+                        .and_then(|b| b.action_at(runner.control_tick()))
+                    {
+                        previous = Some(row);
+                    }
+                }
                 let mut ctrl = [0.0; NJ];
                 runner
                     .emit_actions(&mut planes, &mut ctrl)

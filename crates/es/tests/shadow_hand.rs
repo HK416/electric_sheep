@@ -2536,3 +2536,329 @@ mod render {
         println!("RAN a_light_intensity_draw_scales_the_drawn_colours");
     }
 }
+
+// --- packet M16/H5: `es loop collect` hands a trained policy its Observation IR --------------
+
+/// The untrained teacher bundle, from the four documents (`es policy init`).
+fn teacher_bundle(dir: &Path) -> String {
+    let out = dir.join("teacher.esb").to_string_lossy().into_owned();
+    let (ok, text) = es(&[
+        "policy",
+        "init",
+        "--task",
+        DOCS[0],
+        "--observation",
+        DOCS[1],
+        "--learning",
+        DOCS[2],
+        "--deployment",
+        DOCS[3],
+        "--out",
+        &out,
+    ]);
+    assert!(ok, "{text}");
+    out
+}
+
+/// Hands back one constant row and keeps what it was handed.
+struct Recorder {
+    handed: std::rc::Rc<std::cell::RefCell<Vec<BTreeMap<String, es_compile::Tensor>>>>,
+    row: Vec<f64>,
+}
+
+impl es_policy::PolicyRuntime for Recorder {
+    fn load(
+        &mut self,
+        _: &LearningGraph,
+        _: &es_policy::WeightsSource,
+    ) -> Result<es_policy::PolicyInfo, es_policy::PolicyError> {
+        Err(es_policy::PolicyError::NotLoaded)
+    }
+
+    fn infer(
+        &mut self,
+        inputs: &BTreeMap<String, es_compile::Tensor>,
+    ) -> Result<BTreeMap<String, es_compile::Tensor>, es_policy::PolicyError> {
+        self.handed.borrow_mut().push(inputs.clone());
+        Ok(BTreeMap::from([(
+            "action".to_owned(),
+            es_compile::Tensor {
+                dtype: ElemType::F64,
+                shape: vec![1, 1, self.row.len() as u64],
+                data: self.row.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            },
+        )]))
+    }
+
+    fn info(&self) -> Option<&es_policy::PolicyInfo> {
+        None
+    }
+
+    fn runtime_hash(&self) -> [u8; 32] {
+        [0; 32]
+    }
+}
+
+/// The collector hands a trained policy, at every step, exactly what `es eval run` computes
+/// for the state that step is entered with: its `CpuPlan` over `input_sources` and
+/// `capture_at`, with the previous action `run_episode` keeps (the task's `initial` until the
+/// first row is served, then the row). Before, it handed the raw `qpos ‖ qvel` row -- 74
+/// values against the teacher's 88 -- and the teacher failed on its first step. The reference
+/// is computed in the frame sink, which sees the very `StateView` the observation is taken
+/// from. Needs `ES_PYTHON` (`MuJoCo`); prints SKIP without.
+#[test]
+fn the_collector_hands_the_policy_the_evaluation_observation() {
+    use es_eval::runner::{capture_at, input_sources, previous_action_initial};
+    use es_physics_backend::MuJoCoCpuBackend;
+    use es_physics_core::backend::{ModelInfo, StateView};
+
+    const TICKS: u32 = 6;
+    if std::env::var_os("ES_PYTHON").is_none() {
+        println!(
+            "SKIP the_collector_hands_the_policy_the_evaluation_observation: ES_PYTHON is not \
+             set (MuJoCo)"
+        );
+        return;
+    }
+    let dir = scratch("live-observation");
+    std::fs::create_dir_all(&dir).expect("scratch");
+    let bundle =
+        es_compile::PolicyBundle::open(&std::fs::read(teacher_bundle(&dir)).expect("the bundle"))
+            .expect("opens");
+    let scene = es_tools::backend::load_scene(&repo().join(SCENE).to_string_lossy())
+        .expect("the hand loads");
+    let initial = previous_action_initial(&bundle.task).expect("the teacher reads last_action");
+    let row: Vec<f64> = initial.iter().map(|v| v + 0.001).collect();
+    let latency = es_env::latency_ticks(
+        bundle.learning.policy.contract.runtime.expected_latency_ms,
+        bundle.deployment.rate.control,
+    );
+
+    // The reference, per step.
+    let mut plan = es_compile::CpuPlan::compile(&bundle.observation, es_compile::PlanMode::Release)
+        .expect("compiles");
+    let mut sources = None;
+    let mut expected: Vec<BTreeMap<String, es_compile::Tensor>> = Vec::new();
+    let mut frame_sink = |model: &ModelInfo,
+                          state: &StateView<'_>,
+                          _: &es_env::randomize::RenderOverrides|
+     -> Result<(), String> {
+        let sources = sources.get_or_insert_with(|| {
+            input_sources(&plan, &bundle.observation, &bundle.task, Some(model))
+                .expect("every input resolves")
+        });
+        // The row served at step k is the chunk observed at k - latency, and step k's
+        // observation reads step k - 1's row.
+        let previous = if expected.len() as u64 <= latency {
+            &initial
+        } else {
+            &row
+        };
+        let (names, bytes, _) = capture_at(
+            &plan,
+            sources,
+            model,
+            state,
+            None,
+            &es_eval::LightOverride::default(),
+            None,
+            previous,
+        )
+        .map_err(|e| e.to_string())?;
+        let inputs = names
+            .iter()
+            .zip(&bytes)
+            .map(|((n, dtype, shape), data)| {
+                (
+                    n.clone(),
+                    es_compile::TensorRef::new(*dtype, shape.clone(), data.as_slice()),
+                )
+            })
+            .collect();
+        expected.push(plan.run(&inputs).map_err(|e| e.to_string())?);
+        Ok(())
+    };
+
+    let mut live =
+        es_eval::LiveObservation::new(&bundle.observation, &bundle.task).expect("state only");
+    let mut observer =
+        |first: bool, previous: Option<&[f64]>, model: &ModelInfo, state: &StateView<'_>| {
+            live.observe(first, previous, model, state)
+                .map_err(|e| e.to_string())
+        };
+    let handed = std::rc::Rc::default();
+    let mut policy = Recorder {
+        handed: std::rc::Rc::clone(&handed),
+        row: row.clone(),
+    };
+    es_data::Collector::run_perturbed::<MuJoCoCpuBackend, _, 20, 1>(
+        &es_data::CollectSpec {
+            bundle: &bundle,
+            scene: &scene,
+            n_episodes: 1,
+            seed: 1001,
+            max_steps: TICKS,
+            out_root: &dir.join("ds"),
+            traj_dir: None,
+        },
+        &mut policy,
+        MuJoCoCpuBackend::new,
+        &mut |_, _, _, _| es_data::Intervention::Policy,
+        Some(&mut frame_sink),
+        None,
+        None,
+        Some(&mut observer),
+        &[],
+    )
+    .expect("the teacher collects");
+
+    let handed = handed.borrow();
+    // One observation per step; the last `latency` of them are still in flight at the end.
+    assert_eq!(handed.len() as u64, u64::from(TICKS) - latency);
+    for (k, (got, want)) in handed.iter().zip(&expected).enumerate() {
+        assert_eq!(got.keys().collect::<Vec<_>>(), ["state"], "step {k}");
+        let (g, w) = (&got["state"], &want["state"]);
+        // Batched by the runner: one env.
+        assert_eq!((&g.shape, &w.shape), (&vec![1, 88], &vec![88]), "step {k}");
+        assert!(
+            g.dtype == w.dtype && g.data == w.data,
+            "step {k}: the collector's observation is not the evaluation's"
+        );
+    }
+    println!(
+        "RAN the_collector_hands_the_policy_the_evaluation_observation: {} steps compared",
+        handed.len()
+    );
+}
+
+/// The failure H5 was filed for, through the command: `es loop collect` with the (untrained)
+/// teacher and `--frames` collects two short episodes, renders every camera of the Task IR,
+/// records `observation.state` as `qpos ‖ qvel` (74, what a bake indexes), and the student's
+/// `es dataset bake` loads the hand to resolve its channels against.
+#[test]
+#[ignore = "needs ES_PYTHON (MuJoCo, Torch) and a Vulkan device; run explicitly"]
+fn the_teacher_collects_with_frames() {
+    let dir = scratch("collect");
+    std::fs::create_dir_all(&dir).expect("scratch");
+    // `es policy init` writes a placeholder the runtime never loads: pack the lowered module's
+    // own initialisation (seed 0) instead, through the trainer's writer.
+    let untrained = teacher_bundle(&dir);
+    let (lowered, weights) = (dir.join("lowered"), dir.join("init.safetensors"));
+    let (ok, text) = es(&[
+        "policy",
+        "lower",
+        "--policy",
+        &untrained,
+        "--out",
+        &lowered.to_string_lossy(),
+    ]);
+    assert!(ok, "{text}");
+    let python = std::env::var("ES_PYTHON").expect("ES_PYTHON");
+    let script = format!(
+        "import sys, torch; sys.path.insert(0, 'python/es'); torch.manual_seed(0)\n\
+         from pathlib import Path\n\
+         from train_act import build_policy, checkpoint_tensors, write_safetensors\n\
+         write_safetensors(Path(r'{}'), checkpoint_tensors(build_policy(Path(r'{}'))))",
+        weights.display(),
+        lowered.display()
+    );
+    let out = Command::new(python)
+        .current_dir(repo())
+        .args(["-c", &script])
+        .output()
+        .expect("run ES_PYTHON");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bundle = dir.join("teacher-init.esb").to_string_lossy().into_owned();
+    let (ok, text) = es(&[
+        "policy",
+        "pack",
+        "--policy",
+        &untrained,
+        "--weights",
+        &weights.to_string_lossy(),
+        "--out",
+        &bundle,
+    ]);
+    assert!(ok, "{text}");
+    let (ds, frames) = (dir.join("ds"), dir.join("frames"));
+    let (ds_s, frames_s) = (
+        ds.to_string_lossy().into_owned(),
+        frames.to_string_lossy().into_owned(),
+    );
+    let (ok, text) = es(&[
+        "loop",
+        "collect",
+        "--policy",
+        &bundle,
+        "--scene",
+        SCENE,
+        "--episodes",
+        "2",
+        "--seed",
+        "1001",
+        "--max-steps",
+        "3",
+        "--out",
+        &ds_s,
+        "--frames",
+        &frames_s,
+    ]);
+    assert!(ok, "{text}");
+    assert!(text.contains("episodes: 2   frames: 6"), "{text}");
+    let cameras: Vec<PathBuf> = std::fs::read_dir(&frames)
+        .expect("frames")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(cameras.len(), 3, "{cameras:?}");
+    for camera in &cameras {
+        for k in 0..6 {
+            assert!(
+                camera.join(format!("{k:06}.bin")).is_file(),
+                "{camera:?} {k}"
+            );
+        }
+    }
+    let info: serde_json::Value =
+        serde_json::from_str(&read(&ds.join("meta/info.json"))).expect("info.json");
+    assert_eq!(
+        info["features"]["observation.state"]["shape"],
+        serde_json::json!([74]),
+        "qpos (38) ‖ qvel (36)"
+    );
+
+    let student = dir.join("student.esb").to_string_lossy().into_owned();
+    let (ok, text) = es(&[
+        "policy",
+        "init",
+        "--task",
+        STUDENT_DOCS[0],
+        "--observation",
+        STUDENT_DOCS[1],
+        "--learning",
+        STUDENT_DOCS[2],
+        "--deployment",
+        STUDENT_DOCS[3],
+        "--out",
+        &student,
+    ]);
+    assert!(ok, "{text}");
+    // The bake loads the hand -- STLs and all, which it did not before H5 -- and then stops
+    // where the recorded row ends: `goal_pose` is a `BodyPose` channel, which the live capture
+    // reads from `xpos` / `xquat` and a `qpos ‖ qvel` row does not carry. An open decision
+    // (where a recorded body pose lives), pinned here so it cannot pass unnoticed.
+    let baked = dir.join("baked").to_string_lossy().into_owned();
+    let (ok, text) = es(&[
+        "dataset", "bake", "--policy", &student, "--out", &baked, "--frames", &frames_s, "--scene",
+        SCENE, &ds_s,
+    ]);
+    assert!(
+        !ok && text.contains("reads a body's pose from xpos and xquat"),
+        "{text}"
+    );
+    println!("RAN the_teacher_collects_with_frames:\n{text}");
+}

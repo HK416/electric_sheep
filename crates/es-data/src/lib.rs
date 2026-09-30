@@ -30,8 +30,8 @@ pub use es_import::{lerobot_config, rl_import, roboverse};
 
 pub use collect::{
     append_loop_step, check_chain, distill, last_evaluation_hash, read_loop_steps, CollectReport,
-    CollectSpec, Collector, FrameSink, Intervener, Intervention, LoopKind, LoopStep, SplitSpec,
-    ACTION_COMMANDED, CHECKPOINT,
+    CollectSpec, Collector, FrameSink, Intervener, Intervention, LoopKind, LoopStep, Observer,
+    SplitSpec, ACTION_COMMANDED, CHECKPOINT,
 };
 pub use identity::{BaseModel, DatasetIdentity, Split, TrainingIdentity};
 pub use intervention::{

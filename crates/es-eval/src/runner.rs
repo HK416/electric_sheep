@@ -1735,6 +1735,102 @@ pub fn capture_views(
     Ok((descs, bytes, rendered))
 }
 
+/// The Observation IR run on a live state, one control step at a time: what `es loop collect`
+/// hands a trained policy (packet M16/H5), which before this was the raw `qpos ‖ qvel` row.
+///
+/// Nothing here is a second implementation: the `CpuPlan` [`Evaluation::run`] compiles, the
+/// [`input_sources`] resolution against the loaded model, [`capture_at`] and `CpuPlan::run`,
+/// and the previous action as `run_episode` keeps it -- the task's `initial` on an episode's
+/// first step, then the row the loop last executed. The sources are resolved on the first
+/// call, because the model is only loaded once the collector's `Env` exists.
+///
+/// No frame source: an image input is refused at construction, by name, rather than failing
+/// on the first step with "no renderer in this build".
+#[derive(Debug)]
+pub struct LiveObservation {
+    plan: CpuPlan,
+    obs: ObservationIr,
+    task: TaskIr,
+    sources: Option<BTreeMap<String, Capture>>,
+    initial: Vec<f64>,
+    previous: Vec<f64>,
+}
+
+impl LiveObservation {
+    pub fn new(obs: &ObservationIr, task: &TaskIr) -> Result<Self, EvalError> {
+        if let Some(sensor) = obs.graph.nodes.values().find_map(|n| match n {
+            ObservationNode::ImageInput { sensor, .. } => Some(sensor),
+            _ => None,
+        }) {
+            return Err(EvalError::Plan(format!(
+                "observation input \"{sensor}\" is an image; a live observation captures state \
+                 only (it has no frame source)"
+            )));
+        }
+        let plan = CpuPlan::compile(obs, PlanMode::Release)
+            .map_err(|d| EvalError::Plan(d.iter().map(ToString::to_string).collect()))?;
+        let initial = previous_action_initial(task).unwrap_or_default();
+        Ok(Self {
+            plan,
+            obs: obs.clone(),
+            task: task.clone(),
+            sources: None,
+            previous: initial.clone(),
+            initial,
+        })
+    }
+
+    /// One step: `first` opens an episode (the plan's history and the previous action
+    /// restart); `previous` is the policy row the last step executed, if this episode has one.
+    pub fn observe(
+        &mut self,
+        first: bool,
+        previous: Option<&[f64]>,
+        model: &ModelInfo,
+        state: &StateView<'_>,
+    ) -> Result<BTreeMap<String, Tensor>, EvalError> {
+        let sources = match &mut self.sources {
+            Some(s) => s,
+            None => self.sources.insert(input_sources(
+                &self.plan,
+                &self.obs,
+                &self.task,
+                Some(model),
+            )?),
+        };
+        if first {
+            self.plan.reset();
+            self.previous.clone_from(&self.initial);
+        }
+        if let (Some(row), false) = (previous, self.initial.is_empty()) {
+            self.previous = row.to_vec();
+        }
+        let (names, bytes, _) = capture_at(
+            &self.plan,
+            sources,
+            model,
+            state,
+            None,
+            &LightOverride::default(),
+            None,
+            &self.previous,
+        )?;
+        let inputs: BTreeMap<String, TensorRef<'_>> = names
+            .iter()
+            .zip(&bytes)
+            .map(|((name, dtype, shape), data)| {
+                (
+                    name.clone(),
+                    TensorRef::new(*dtype, shape.clone(), data.as_slice()),
+                )
+            })
+            .collect();
+        self.plan
+            .run(&inputs)
+            .map_err(|e| EvalError::Plan(e.to_string()))
+    }
+}
+
 /// State values into one plan input buffer.
 ///
 /// The one place this conversion happens. `crate::bake` calls it with a recorded
