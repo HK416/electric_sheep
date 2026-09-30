@@ -5,14 +5,17 @@ Line-delimited JSON on stdin, one JSON object per line on stdout. Requests:
     {"cmd": "load", "mjcf": str, "n_envs": int, "timestep": float|null, "seed": int}
     {"cmd": "reset", "envs": [int]|null, "state": {...}|null}
     {"cmd": "set_ctrl", "ctrl": [float]}          # n_envs * nu, env-major
+    {"cmd": "set_ctrl", "frame": int}             # the same, as float64 bytes after the line
     {"cmd": "step", "n": int}
     {"cmd": "state"}
     {"cmd": "set_state", "state": {"qpos": [...], "qvel": [...], "act": [...]}}
     {"cmd": "set_params", "envs": [int], "params": [{"field", "index", "sub", "scale"}]}
     {"cmd": "quit"}
 
-Every response is {"ok": true, ...} or {"ok": false, "error": str}. Floats cross as JSON
-numbers: `repr` is shortest-round-trip on both sides, so the values are exact.
+Every response is {"ok": true, ...} or {"ok": false, "error": str}. Request floats cross as
+JSON numbers: `repr` is shortest-round-trip on both sides, so the values are exact. The
+`state` reply is a line {"ok": true, "frame": [six lengths]} followed by the six arrays'
+float64 bytes (`answer`, packet M16/H0).
 
 Correctness over speed. Envs are independent `MjData` stepped in a loop; this process is the
 reference, not a throughput path. See docs/api-notes/mujoco.md for the pinned API surface.
@@ -152,23 +155,23 @@ class Sim(object):
         }
 
     def state(self):
-        qpos, qvel, act, sensordata, xpos, xquat = [], [], [], [], [], []
-        for data in self.datas:
-            qpos.extend(data.qpos.tolist())
-            qvel.extend(data.qvel.tolist())
-            act.extend(data.act.tolist())
-            sensordata.extend(data.sensordata.tolist())
-            xpos.extend(data.xpos.reshape(-1).tolist())
-            # MuJoCo stores wxyz; spec 3.1 is xyzw.
-            wxyz = data.xquat.reshape(-1, 4)
-            xquat.extend(wxyz[:, [1, 2, 3, 0]].reshape(-1).tolist())
+        """qpos, qvel, act, sensordata, xpos, xquat, each env-major float64, as `answer`'s
+        frame."""
+
+        def cat(read):
+            rows = [np.asarray(read(data), dtype=np.float64).reshape(-1) for data in self.datas]
+            return np.concatenate(rows)
+
         return {
-            "qpos": qpos,
-            "qvel": qvel,
-            "act": act,
-            "sensordata": sensordata,
-            "xpos": xpos,
-            "xquat": xquat,
+            "frame": [
+                cat(lambda d: d.qpos),
+                cat(lambda d: d.qvel),
+                cat(lambda d: d.act),
+                cat(lambda d: d.sensordata),
+                cat(lambda d: d.xpos),
+                # MuJoCo stores wxyz; spec 3.1 is xyzw.
+                cat(lambda d: d.xquat.reshape(-1, 4)[:, [1, 2, 3, 0]]),
+            ]
         }
 
     def write_state(self, state, envs):
@@ -242,7 +245,7 @@ def handle(sim, req):
 def main():
     sim = None
     while True:
-        line = sys.stdin.readline()
+        line = sys.stdin.buffer.readline()
         if not line:
             return
         line = line.strip()
@@ -250,14 +253,39 @@ def main():
             continue
         try:
             req = json.loads(line)
+            if "frame" in req:
+                req["ctrl"] = read_frame(sys.stdin.buffer, int(req["frame"]))
             if req.get("cmd") == "quit":
                 return
             sim, payload = handle(sim, req)
             payload["ok"] = True
         except Exception as exc:  # Any failure is a protocol response, never a crash.
             payload = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
-        sys.stdout.write(json.dumps(payload) + "\n")
-        sys.stdout.flush()
+        answer(sys.stdout, payload)
+
+
+def read_frame(stream, n):
+    """The `n` float64 values a request line's `frame` announced (`set_ctrl`), read as raw
+    little-endian bytes off the binary stream right after the line (packet M16/H0)."""
+    data = stream.read(8 * n)
+    if len(data) != 8 * n:
+        raise EOFError("frame cut short: %d of %d bytes" % (len(data), 8 * n))
+    return np.frombuffer(data, dtype="<f8")
+
+
+def answer(out, payload):
+    """Writes one response to the text stream `out`. A payload with a `frame` (the `state`
+    reply) goes as a line naming each array's length, then the arrays as raw little-endian
+    float64 bytes: exact, and far cheaper than JSON float lists (packet M16/H0)."""
+    arrays = payload.pop("frame", None)
+    if arrays is not None:
+        payload["frame"] = [int(a.size) for a in arrays]
+    out.write(json.dumps(payload) + "\n")
+    out.flush()
+    if arrays is not None:
+        for a in arrays:
+            out.buffer.write(np.ascontiguousarray(a, dtype="<f8").tobytes())
+        out.buffer.flush()
 
 
 if __name__ == "__main__":
