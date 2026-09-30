@@ -9,6 +9,9 @@
     them move MuJoCo's compiled model by one bit), move the floating goal cube beside the hand,
     and add what the path-traced cameras need (three cameras, an emitter, colour-faced cubes,
     alpha 0 on what should not be drawn).
+    One dynamics edit (packet H2b): the hand joints' class armature is 0.001, gymnasium-robotics'
+    own value (the bundle's Isaac-parity 0 made MuJoCo's qacc blow up and auto-reset the data
+    under policy-like servo targets); the wrists keep their explicit 0.005.
   -->
   <compiler angle="radian" meshdir="meshes/"/>
 
@@ -16,7 +19,7 @@
 
   <default>
     <default class="robot0:asset_class">
-      <joint limited="true" armature="0" stiffness="0" damping="0" frictionloss="0"/>
+      <joint limited="true" armature="0.001" stiffness="0" damping="0" frictionloss="0"/>
       <geom friction="1 0 0" margin="0"/>
       <position ctrllimited="true" forcelimited="true"/>
     </default>

@@ -36,6 +36,13 @@ except ImportError as exc:  # Reported as a protocol response, not a traceback o
 # qpos / dof width per joint type, indexed by mjtJoint (free, ball, slide, hinge).
 JOINT_DIMS = {0: (7, 6), 1: (4, 3), 2: (1, 1), 3: (1, 1)}
 
+# The warnings on which `mj_step` resets an env's data by itself (`Sim.step`).
+AUTO_RESET_WARNINGS = (
+    mujoco.mjtWarning.mjWARN_BADQPOS,
+    mujoco.mjtWarning.mjWARN_BADQVEL,
+    mujoco.mjtWarning.mjWARN_BADQACC,
+)
+
 
 def name_of(model, objtype, index):
     return mujoco.mj_id2name(model, objtype, index) or ""
@@ -206,12 +213,20 @@ class Sim(object):
                 data.ctrl[:] = np.asarray(ctrl[env * nu : (env + 1) * nu], dtype=np.float64)
 
     def step(self, n):
+        """Steps every env `n` times; returns the envs that diverged. MuJoCo does not leave a
+        diverged env's NaNs behind: on a bad qpos, qvel or qacc (NaN, or |x| > mjMAXVAL) its
+        `mj_checkPos` / `mj_checkVel` / `mj_checkAcc` reset the data to qpos0 and count the
+        warning, so the state after the step is finite -- and a task whose success holds at
+        qpos0 would score it. The counters are what tells (packet M16/H2b)."""
         nonfinite = []
         for env, data in enumerate(self.datas):
             model = self.model_of(env)
+            for w in AUTO_RESET_WARNINGS:
+                data.warning[w].number = 0
             for _ in range(n):
                 mujoco.mj_step(model, data)
-            if not (np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all()):
+            reset = any(data.warning[w].number for w in AUTO_RESET_WARNINGS)
+            if reset or not (np.isfinite(data.qpos).all() and np.isfinite(data.qvel).all()):
                 nonfinite.append(env)
         return nonfinite
 

@@ -10,7 +10,9 @@
 //! * `mujoco-cpu` and `mjwarp` map every feature it uses (spec 17.2, 14.4);
 //! * the oracle (spec 1.4): 240 ticks through `MuJoCoCpuBackend` (parse -> `SceneDesc` ->
 //!   emitted MJCF) agree to 1e-9 with `MuJoCo` loading the fixture file directly, under the
-//!   same controls. Needs an interpreter with `mujoco` (`ES_PYTHON`); prints `SKIP` without.
+//!   same controls. Needs an interpreter with `mujoco` (`ES_PYTHON`); prints `SKIP` without;
+//! * packet M16/H2b: a `MuJoCo` auto-reset and an `MJWarp` blow-up are reported as divergence,
+//!   and (`--ignored`) the hand does not diverge under random servo targets on either backend.
 //!
 //! ```text
 //! ES_PYTHON=.venv/Scripts/python.exe cargo test -p es-physics-backend --test shadow_hand -- --nocapture
@@ -23,9 +25,10 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use es_assets::scene::{ActuatorKind, JointKind, SceneDesc, TendonKind};
-use es_core::TickRate;
+use es_core::{FailureKind, TickRate};
 use es_physics_backend::{
-    mapping_report, scene_to_mjcf, BackendKind, MjcfRow, MuJoCoCpuBackend, Status, TaskFeature,
+    mapping_report, scene_to_mjcf, BackendKind, MjWarpBackend, MjcfRow, MuJoCoCpuBackend, Status,
+    TaskFeature,
 };
 use es_physics_core::{Feature, LoadConfig, PhysicsBackend};
 
@@ -348,4 +351,154 @@ fn the_backend_steps_the_hand_as_mujoco_loading_the_file_does() {
         worst <= 1e-9,
         "the backend and MuJoCo on the file disagree by {worst:e}:\nours   {ours:?}\ntheirs {theirs:?}"
     );
+}
+
+/// A slide joint under a servo so stiff (kp 1e12 on 1 kg) that the first step's `qacc` is past
+/// `mjMAXVAL` (1e10): `MuJoCo` resets that env to qpos0 by itself and the state it leaves is
+/// finite. Env 0 is driven 1 m off its rest position, env 1 sits at it.
+const EXPLODING: &str = r#"<mujoco model="exploding">
+  <worldbody>
+    <body name="slider">
+      <joint name="slide" type="slide" axis="1 0 0"/>
+      <geom name="ball" type="sphere" size="0.05" mass="1"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <position name="servo" joint="slide" kp="1e12"/>
+  </actuator>
+</mujoco>"#;
+
+fn diverged_envs(backend: &mut dyn PhysicsBackend) -> Vec<(u32, FailureKind)> {
+    let scene = es_assets::parse_mjcf(EXPLODING)
+        .expect("the exploding scene parses")
+        .scene;
+    backend
+        .load(
+            &scene,
+            &LoadConfig {
+                n_envs: 2,
+                rate: Some(TickRate::hz(500)),
+                seed: 1,
+            },
+        )
+        .expect("the exploding scene loads");
+    backend.set_ctrl(&[1.0, 0.0]).expect("two controls");
+    backend.step(20).expect("a step").failures
+}
+
+/// Packet M16/H2b: an env `MuJoCo` reset on its own is reported as diverged (`nonfinite`, the
+/// channel NaN states use), so `es-env` quarantines it and ends its episode as a failure --
+/// not as the success a task can read off qpos0.
+#[test]
+fn a_mujoco_auto_reset_is_reported_as_divergence() {
+    if let Err(reason) = MuJoCoCpuBackend::is_available() {
+        println!("SKIP auto-reset: {reason}");
+        return;
+    }
+    let mut backend = MuJoCoCpuBackend::new();
+    let failures = diverged_envs(&mut backend);
+    assert_eq!(failures, [(0, FailureKind::NanDetected)]);
+    // What the report exists for: the state itself shows nothing wrong.
+    assert_eq!(backend.state().qpos_of(0), [0.0], "MuJoCo reset env 0");
+}
+
+/// `MJWarp` does not reset: the same blow-up leaves non-finite state, reported the same way.
+#[test]
+fn an_mjwarp_blow_up_is_reported_as_divergence() {
+    if let Err(reason) = MjWarpBackend::is_available() {
+        println!("SKIP mjwarp blow-up: {reason}");
+        return;
+    }
+    let mut backend = MjWarpBackend::new();
+    let failures = diverged_envs(&mut backend);
+    println!("mjwarp: env 0 qpos {:?}", backend.state().qpos_of(0));
+    assert_eq!(failures, [(0, FailureKind::NanDetected)]);
+}
+
+/// `splitmix64`: a seeded stream for the stress controls, without an RNG dependency.
+fn uniform(state: &mut u64) -> f64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    (z ^ (z >> 31)) as f64 / u64::MAX as f64
+}
+
+/// 15 s of the hand under a policy's worst case: a fresh uniform target over each servo's
+/// `ctrlrange` every 60 Hz control tick (two physics steps). Returns the diverged env-steps
+/// and the largest |qvel| seen.
+fn stress(backend: &mut dyn PhysicsBackend, n_envs: u32) -> (usize, f64) {
+    let scene = scene();
+    backend
+        .load(
+            &scene,
+            &LoadConfig {
+                n_envs,
+                rate: Some(TickRate::hz(RATE_HZ)),
+                seed: 1,
+            },
+        )
+        .expect("the Shadow Hand loads");
+    let ranges: Vec<(f64, f64)> = scene
+        .actuators
+        .iter()
+        .map(|a| a.ctrl_range.expect("every servo is ctrl-limited"))
+        .collect();
+    let mut rng = 7_u64;
+    let (mut events, mut fastest) = (0, 0.0_f64);
+    for _ in 0..(15 * RATE_HZ / 2) {
+        let ctrl: Vec<f64> = (0..n_envs)
+            .flat_map(|_| ranges.iter())
+            .map(|(lo, hi)| lo + uniform(&mut rng) * (hi - lo))
+            .collect();
+        backend.set_ctrl(&ctrl).expect("the controls");
+        let report = backend.step(2).expect("a step");
+        let bad: Vec<u32> = report.failures.iter().map(|(env, _)| *env).collect();
+        events += bad.len();
+        fastest = backend
+            .state()
+            .qvel
+            .iter()
+            .fold(fastest, |m, v| m.max(v.abs()));
+        if !bad.is_empty() {
+            backend.reset(Some(&bad), None).expect("a reset");
+        }
+    }
+    (events, fastest)
+}
+
+/// Packet M16/H2b's stress oracle: with `armature="0.001"` on the hand joints (gymnasium-
+/// robotics' own value), no env diverges under 15 s of random servo targets on `mujoco-cpu`
+/// or `mjwarp`. Before it (armature 0 on ~1e-5 kg m^2 finger links, kp servos, dt 1/120)
+/// `MuJoCo` reset the data ~90 times per 15 s. Slow: `--ignored`.
+#[test]
+#[ignore = "15 s of the hand per backend; run with --ignored"]
+fn the_hand_does_not_diverge_under_random_servo_targets() {
+    let mut diverged = Vec::new();
+    for (name, n_envs) in [("mujoco-cpu", 4), ("mjwarp", 64)] {
+        let (available, mut backend): (_, Box<dyn PhysicsBackend>) = if name == "mjwarp" {
+            (
+                MjWarpBackend::is_available(),
+                Box::new(MjWarpBackend::new()),
+            )
+        } else {
+            (
+                MuJoCoCpuBackend::is_available(),
+                Box::new(MuJoCoCpuBackend::new()),
+            )
+        };
+        if let Err(reason) = available {
+            println!("SKIP stress on {name}: {reason}");
+            continue;
+        }
+        let (events, fastest) = stress(backend.as_mut(), n_envs);
+        println!(
+            "stress {name}: {n_envs} envs x 15 s, {events} diverged env-steps, \
+             max |qvel| {fastest:.3e}"
+        );
+        if events > 0 {
+            diverged.push(name);
+        }
+    }
+    assert!(diverged.is_empty(), "diverged on {diverged:?}");
 }
