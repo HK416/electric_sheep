@@ -42,8 +42,10 @@ Not here, deliberately:
 - **Optical flow and velocity channels.** `Channel::Flow` needs a previous-frame transform
   per primitive; the renderer has no notion of a previous frame yet. Asking for it is an
   error, not an empty buffer.
-- **Textures and materials.** One flat albedo per geom, from `Geom::rgba`. No UVs, no
-  texture sampling, no PBR.
+- **Textures and materials** — *no longer skipped since plan H's HT1* ([§15](#15-textures-and-metallic-roughness-materials-plan-h-ht1)):
+  MJCF 2D and cube textures, bilinear, and glTF metallic-roughness on both paths. A geom
+  without a texture or an explicit material attribute is still one flat albedo from
+  `Geom::rgba`, bit for bit. Normal and emissive maps are HT2's.
 
 ## 1. Tile atlas (§15.2)
 
@@ -163,9 +165,12 @@ but keeps its segmentation id, so the ids of the geoms after it do not move. Tha
 MJCF hides a collision-only geom or an invisible floor, and a scene without one renders bit for
 bit as before. Any other alpha is ignored (there is no transparency).
 
-Buffer layout is a flat `f32` array, stride 20 floats (80 B) per triangle — `v0 v1 v2 n
-albedo emission seg pad` — the segmentation id `asuint`-bitcast into slot 18. One buffer, one
-stride, the same on both sides.
+Buffer layout is a flat `f32` array, stride 32 floats (128 B) per triangle — `v0 v1 v2 n
+albedo emission seg mat tc0 tc1 tc2 pad` — the segmentation id and the material slot
+`asuint`-bitcast into slots 18 and 19. One buffer, one stride, the same on both sides. The
+stride was 20 until plan H's HT1 appended the material slot and three texture coordinates
+([§15](#15-textures-and-metallic-roughness-materials-plan-h-ht1)); a layout is not an
+output, and every golden re-passed unchanged.
 
 ### 2.2 `ImageSpec` at layer 5
 
@@ -392,9 +397,11 @@ pinned in `crates/es-render/src/rng.rs` and here, and both are the contract:
 | 4 | NEE: which emissive triangle (M7/R3) | sample, bounce |
 | 5 | NEE: the uniform point on that triangle | sample, bounce |
 | 6 | NEE: the cosine-weighted sky direction | sample, bounce |
+| 7 | a PBR bounce (plan H, HT1): index 0 picks the lobe, 1 and 2 sample GGX's visible normals | sample, bounce |
 
 The NEE shadow test has no stream: it draws no random number. Streams 4–6 are only drawn
-when `nee` is on, so a `nee: false` render makes exactly the draws it made before M7/R3.
+when `nee` is on, so a `nee: false` render makes exactly the draws it made before M7/R3;
+stream 7 only at a PBR vertex, so a scene without one draws what it drew before HT1.
 
 ### 4.2 ReSTIR DI
 
@@ -2133,3 +2140,195 @@ X3's estimate of a reach PPO run at 57.5 ms per frame was ~65 h of rendering; at
 - **Temporal accumulation on a batch** is not refused (each tile's history is per pixel and
   per view, as in a multi-camera atlas) but is not tested: the observation path accumulates
   nothing (12.3).
+
+## 15. Textures and metallic-roughness materials (plan H, HT1)
+
+Packet `docs/packets/M16/plan-h.md` task HT1, the owner's decision of 2026-09-30 (M7's parked
+R6), spec 15.3. **Additive**, after the mesh precedent of M10/W2: a scene with no texture and no
+explicitly written material attribute keeps its `scene_hash` and renders every committed byte
+as before — `cargo xtask verify-goldens` reports no golden changed, every `es-render` and
+`es-env --features render` oracle re-passes on the RTX 3060, and the pinned `scene_hash`es of
+`so101_pick_place.xml` and `go1_primitives.xml` hold under parse *and* under `mesh::load`
+(`crates/es-assets/tests/texture_load.rs`).
+
+### 15.1 What a scene declares, and what enters the hash
+
+`<texture>` becomes an `es_assets::texture::TextureSpec` on `SceneDesc::textures`;
+`es_assets::mesh::load` — the one loader every CLI verb, the editor and the tests already call —
+now also decodes the texels (`texture::load`) and writes their digest into the texture's
+`AssetRef::hash`: `blake3("es.texture.v1", kind, sRGB, width, height, texels)`, content never
+path, so the same PNG under another name in another directory hashes the same. What is decoded
+follows MuJoCo 3.13's `mjCTexture::Compile` line by line:
+
+- **PNG** through the `png` crate (already in the lockfile), reduced as `lodepng` with `LCT_RGB`
+  reduces it: palette and low depths expanded, 16-bit to the high byte, grey replicated, alpha
+  dropped (MuJoCo's `nchannel = 3`).
+- **cube**: always six square faces in MuJoCo's order R L U D F B = `+X −X +Y −Y +Z −Z` (the
+  OpenGL cube-map order); from one file cut by `gridsize` / `gridlayout` (an undeclared face is
+  `rgb1`), one `1 x 1` image repeated on all six, or `fileright … fileback`.
+- **builtins** `checker|gradient|flat` with `mark="edge|cross|random"`, the `(std::byte)(255 c)`
+  truncation included; the cube gradient's `asin`/`acos` go through `es_math::approx::acos_f64`
+  and `random` through a written-out `mt19937_64` (seed 42, libstdc++'s canonical draw), so the
+  texels — and the digest — are the same on every host.
+- **colorspace** `auto` is the PNG's `sRGB` chunk, linear for a builtin, as MuJoCo resolves it.
+- A **skybox** is parsed and not decoded: this renderer has no environment map.
+
+`<material>` becomes an `es_assets::scene::Material` on `SceneDesc::materials` **only when it is
+drawn**: it names a texture (attribute or `<layer role="rgb|orm|metallic|roughness">`) or writes
+`specular`, `shininess`, `metallic`, `roughness` or `emission` explicitly. Drawn materials are
+hashed in their own `scene_hash` section, `es.scene.appearance.v1`, appended only when there is
+one. A material with nothing but `rgba` is not drawn and moves nothing — a **deviation from
+MuJoCo**, kept on purpose: `go1_primitives.xml`'s `dark` material would render 0.2 grey in
+MuJoCo, renders its geom's own 0.5 grey here as it always did, and keeps its `scene_hash` and its
+enumerated importer warnings. A drawn material's `rgba` follows MuJoCo's `setMaterial`: the
+geom's own `rgba` wins when it is not MuJoCo's default `0.5 0.5 0.5 1`; the resolved alpha is what
+the alpha-0 rule of [§2.1](#21-scene) reads; `emission` makes the geom emit `emission x rgba` and
+join the light list. The classic pair maps to glTF by one formula, `Material::roughness`:
+`n = 128 shininess`, `roughness = (2 / (n + 2))^(1/4)` (Walter et al. 2007's `alpha^2 = 2 / (n + 2)`
+with `alpha = roughness^2`), at the explicit `shininess`, or at MuJoCo's default 0.5 when only
+`specular` is written; `specular` itself maps to nothing, `F0` being glTF's. OBJ `vt` is read
+(one vertex per distinct `(v, vt)`, `v` flipped to `1 − v` as MuJoCo's OBJ decoder does); a file
+without `vt` decodes exactly as before.
+
+### 15.2 Texture coordinates are MuJoCo's
+
+Read from MuJoCo 3.13's classic renderer (`render_context.c`'s primitive display lists and
+`render_gl3.c`'s `settexture`). Each tessellated vertex carries MuJoCo's UV before `texrepeat`
+and its coordinate in the unit object MuJoCo draws and scales; the per-geom mapping turns them
+into the triangle's three texture coordinates (`Tri::tc`, slots 20–28):
+
+| shape | 2D texture: `(u, v)` | cube texture: direction |
+|---|---|---|
+| `Box` | `(x+1)/2, (1−y)/2` on a Z face; `(y+1)/2, (1−z)/2` on an X face; `(x+1)/2, (1−z)/2` on a Y face (unit coordinates) | the unit-box corner |
+| `Plane` | across the extent, `v` down the Y axis; an infinite side `0.5 x` / `−0.5 y`, the texture matrix shifted by −0.5 | `(x, y, 0)` |
+| `Sphere`, `Ellipsoid` | `az / 2π`, `θ / π` from the +Z pole; a pole vertex its triangle's middle `u` | the unit-sphere direction |
+| `Capsule`, `Cylinder` side | `az / 2π`, `(1 − z/hl) / 2` | `(cos, sin, ±1)` |
+| capsule caps | `v` from 1 at the equator to 0 at the top pole (0 to 1 below) | `(cos t cos, cos t sin, ±(1 + sin t))` |
+| cylinder discs | `0.5 + 0.5 (x, y) / r` | `(cos, sin, ±1)` |
+| `Mesh` | its own UVs, else MuJoCo's texgen `(0.5 s x − 0.5, −0.5 t y − 0.5)` with `s, t = texrepeat / size` | the local position |
+
+A 2D texture is scaled by `texrepeat` (≤ 0 reads as 1), times the geom's `mjvGeom` size under
+`texuniform`; a cube direction is multiplied by that size under `texuniform`. The face of a cube
+texture and its `(s, t)` follow OpenGL's cube-map table, per pixel. These coordinates are affine
+in the position on each of MuJoCo's own quads, so interpolating them over this renderer's coarser
+tessellation reproduces MuJoCo's function at every vertex.
+
+### 15.3 Sampling and shading
+
+A triangle's `mat` slot (19) is 0 or `1 +` a material index. The material region is appended
+after the scene in the triangle buffer — `LUT (512) | materials (8 floats each) | texture headers
+(4 words) | texels (one packed RGB8 word each)` — once per distinct table (a batch's envs share
+their `SceneCache`'s), and global slots 41 and 42 carry its base and material count
+(`PARAM_VIEW_BASE` 41 → 43, which no output depends on). A scene without a drawn material
+uploads no region at all. Texels decode through the table, built on the host with
+`es_math::approx` (`i/255`, then the exact sRGB EOTF) and read from the same buffer by both
+sides. Sampling is bilinear with texel centres at +0.5, `repeat` across a 2D texture and
+clamp-to-edge inside a cube face, no mipmaps. The barycentrics are Moller–Trumbore's, recomputed
+at the hit with `dot` and `cross` written out term for term (`es_dot3`, `es_cross`), never
+SPIR-V's `OpDot`, whose summation order [§9.3](#93-what-the-gpu-and-the-cpu-agree-about) found
+unpinned.
+
+**One material model**, glTF 2.0 metallic-roughness: base colour = factor × texel, GGX `D`,
+height-correlated Smith `V`, Schlick `F` at `v·h`, `F0 = mix(0.04, base, metallic)`, roughness
+clamped to ≥ 0.05. **One deviation**: the Lambert lobe is weighted by `(1 − F(n·l))(1 − F(n·v))`
+rather than glTF Appendix B's `(1 − F(v·h))`. The furnace oracle below measured Appendix B at
+**1.025** for a white dielectric at 60° and roughness 0.05 (1.026 at 0.25, 1.011 at 0.5) — more
+light out than in. The replacement is reciprocal and keeps every configuration at or below one.
+PBR is on only for a material that writes `specular`, `shininess`, `metallic` or `roughness` (or
+a map) explicitly; a material that only brings a texture or `emission` is textured and
+Lambertian, and MuJoCo's defaults switch nothing.
+
+| path | a drawn material |
+|---|---|
+| `Rs` `Lambert` | base colour × the Lambert term; metallic and roughness ignored |
+| `Rs` `Full`, PBR | `A hemi + π f(l, v) max(0, n·l) vis (1 − hemi) + emission`, `A = c_diff (1 − F0) + F0` — the scale `Full`'s own `diffuse (1 − hemi)` has |
+| `Rs` `Full`, not PBR | the Blinn-Phong look of §9 with the base colour |
+| `Pt`, PBR | a lobe mixture: stream 7 index 0 picks specular with probability `lum(F(n·v)) / (lum(F(n·v)) + lum(c_diff))`; the specular lobe samples GGX's visible normals (Heitz 2018, stream 7 indices 1, 2), the diffuse lobe takes stream 0's cosine direction; throughput × `f cos / pdf` over the mixture pdf, a direction below the surface zeroing the path's throughput (not its loop, spec 3.4). NEE's three light kinds weigh against the mixture pdf; ReSTIR's target is `lum(f Le G)` with the view direction rebuilt from the g-buffer |
+| `Pt`, not PBR | today's estimator with the base colour: the same expressions, so a Lambertian vertex draws what it drew before |
+
+### 15.4 The oracles, measured (RTX 3060, Slang 2026.8)
+
+**Placement against MuJoCo** (`cargo test -p es-render --test textured
+mujoco_places_the_textures_where_we_do` with `ES_PYTHON`; `mujoco.Renderer` offscreen on this
+Windows desktop, 160×160, the fixture's camera). `tests/fixtures/mjcf/textured/textured.xml`:
+two cubes wearing the bundle's `block.png` as the bundle declares it (copied with its licence and
+a `PROVENANCE.json`) — `cube_b` turned 180° about `(1, 1, 0)` so the camera sees all six faces
+between them — and a 3× repeated checker floor. Each visible face (a segmentation id and a
+world-axis normal, borders dropped) is classified per pixel against the block's six backdrop
+colours and white, in chroma space (linear RGB over its maximum, which two lighting models leave
+alone), in both images:
+
+| region | pixels | dominant, ours / MuJoCo | per-pixel agreement |
+|---|---|---|---|
+| floor | 9,202 | checker / checker | 0.999 |
+| `cube_a` +X | 975 | R (purple "E") / R | 0.923 |
+| `cube_a` −Y | 550 | D (red "I") / D | 0.884 |
+| `cube_a` +Z | 736 | F (yellow "P") / F | 0.992 |
+| `cube_b` +X | 550 | U (magenta "A") / U | 0.856 |
+| `cube_b` −Y | 975 | L (green "O") / L | 0.978 |
+| `cube_b` +Z | 736 | B (pink "N") / B | 0.986 |
+
+All six faces, the right way up — the letters' white pixels fall where MuJoCo's do; the
+disagreement is at the letters' edges, where MuJoCo's trilinear mipmapping blurs and this
+renderer's bilinear does not. The assertion is the dominant colour equal and ≥ 0.85 agreement.
+
+**The white furnace** (`white_furnace_converges_to_the_quadrature_albedo`): a white PBR plane
+under a white sky, seen 60° off the normal, 8×8 pixels × 512 spp, two bounces, against the
+directional albedo integrated by quadrature in `f64` (the diffuse lobe on a cosine-mapped grid,
+the specular one on a grid in GGX's `h` distribution, 256² midpoints each) from formulas written
+out in the test, independently of `es_render::material`:
+
+| metallic | roughness | quadrature `ρ` | `Pt`, NEE off / on | worst relative error |
+|---|---|---|---|---|
+| 0 | 0.05 | 0.92036 | 0.91997 / 0.91950 | 9.4e-4 |
+| 0 | 0.25 | 0.92123 | 0.92026 / 0.91984 | 1.5e-3 |
+| 0 | 0.5 | 0.90610 | 0.90458 / 0.90472 | 1.7e-3 |
+| 0 | 0.75 | 0.88502 | 0.88339 / 0.88367 | 1.8e-3 |
+| 0 | 1 | 0.87124 | 0.86999 / 0.86998 | 1.4e-3 |
+| 1 | 0.05 | 0.99999 | 0.99997 / 0.99960 | 3.9e-4 |
+| 1 | 0.25 | 0.98875 | 0.98819 / 0.98745 | 1.3e-3 |
+| 1 | 0.5 | 0.85740 | 0.85769 / 0.85664 | 8.9e-4 |
+| 1 | 0.75 | 0.66318 | 0.66357 / 0.66328 | 5.9e-4 |
+| 1 | 1 | 0.45069 | 0.45239 / 0.45071 | 3.8e-3 |
+
+Every `ρ` ≤ 1 and every estimate ≤ 1 + 5e-3; the assertion is 1 % (the view angle varies
+±0.05 rad across the tile). The BRDF is non-negative and reciprocal to 1e-5 on a 24×24 grid of
+directions at four `(metallic, roughness)` pairs (`brdf_is_reciprocal_and_non_negative`).
+
+**GPU against the CPU reference** (`gpu_matches_the_cpu_on_textures_and_materials`, the
+textured scene at 64×64 from its own camera, whose quaternion is not a golden's):
+
+| comparison | measured |
+|---|---|
+| `Rs` `Lambert` `Rgb8`, segmentation | 0 bytes differ |
+| `Rs` `Lambert` depth / normal | 6 ULP (5.3e-7 relative) / 0 ULP — [§14.4](#144-parity-measured)'s camera residue |
+| `Rs` `Full` `Rgb8` | 0 of 12,288 bytes |
+| `Pt` 1 spp, 3 bounces, no NEE | 2,915 ULP, **2.0e-6 normalized** |
+| `Pt` NEE 4 spp / `ReSTIR` 1 spp | 212 ULP, 1.1e-6 / 42 ULP, 1.9e-7 normalized; `Rgb8` 0 bytes both |
+| the furnace, three materials × NEE off / on (`gpu_white_furnace_matches_the_cpu`) | ≤ 5 ULP, ≤ 3.1e-7 normalized |
+
+`Pt` 1 spp is not bitwise here where the Lambertian scenes are: a textured or PBR surface turns
+the few-ULP depth residue of a non-golden camera into a few-ULP texture coordinate and reflected
+direction, where a flat albedo is insensitive to it. It stays inside §5.1's 1e-5.
+
+**Goldens**, written by `generate_textured_goldens` from the CPU reference (its own generator,
+so it cannot rewrite an older golden): `textured_rs_rgb8`, `textured_rs_full_rgb8`,
+`textured_pt_nee_rgb8` (4 spp, 3 bounces, NEE, sky `0.3 0.35 0.4`, exposure 4). The CPU
+reproduces all three bit for bit, and so does the GPU (0 of 12,288 bytes each).
+
+### 15.5 What HT1 skips
+
+- **Mipmaps** — the path tracer's samples and `Full`'s SSAA average the footprint; a mip chain is
+  a later row if aliasing shows (it is what the placement oracle's letter edges measure).
+- **Normal and emissive maps, glTF materials** — HT2. `<layer>` roles other than
+  `rgb|orm|metallic|roughness` are refused by name.
+- **Transparency** (an alpha other than 0 is ignored, as before), **`reflectance`** (MuJoCo's
+  planar mirror; reported as an unrepresented attribute), `specular` as a knob, `hflip` /
+  `vflip` / `nchannel` (reported, not honoured).
+- **A cube texture's colour space as MuJoCo's classic renderer has it**: that renderer uploads
+  cube faces as linear `GL_RGB` whatever `colorspace` says; this one honours `colorspace`. The
+  bundle's `block.png` is declared linear, so the two agree on it.
+- **A persistent texture buffer**: the texels ride in the triangle buffer and are re-uploaded
+  with every frame's triangles (`ponytail:` at `pack_materials`). What that costs on the hand's
+  cameras is `Target / Status: unverified` until `frame_profile` measures it.
+- **The editor's replay rasterizer** (`raster.rs`) draws the base colour factor, not the texel.

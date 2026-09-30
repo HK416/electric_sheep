@@ -1890,6 +1890,8 @@ Vision Encoder → Policy
 
 **Output contract:** All three paths output the same channels (RGB, linear depth, instance/semantic seg, world normal, optical flow, velocity) in the same tensor layout. Depth/seg/normal are bit-identical between RS/PT; RGB is an SSIM threshold.
 
+**Materials and textures (plan H, HT1; owner decision 2026-09-30, M7 R6):** both paths draw MJCF `<texture>` (2d and cube; a PNG file, a grid or six files; builtin `checker|gradient|flat` with marks; `colorspace`) and `<material>` (`rgba`, `texture`, `texrepeat`, `texuniform`, `emission`, `metallic`, `roughness`, `<layer role="rgb|orm|metallic|roughness">`). Texture coordinates are MuJoCo 3.13's classic renderer's (per-primitive UVs, a cube texture's direction in the unit object, a mesh's own UVs or MuJoCo's texgen); sampling is bilinear, repeat (clamp inside a cube face), no mipmaps. There is one material model, glTF 2.0 metallic-roughness: GGX `D`, height-correlated Smith `V`, Schlick `F`, `F0 = mix(0.04, base, metallic)`, and a Lambert lobe `(1 − F(n·l))(1 − F(n·v))(1 − metallic)·base/π` — glTF Appendix B's `(1 − F(v·h))` exceeds one in the white furnace (1.025 at 60°, roughness 0.05), so this reciprocal, energy-bounded coupling replaces it. `Rs` `Lambert` draws the base colour (factor × texel) only, `Rs` `Full` the same BRDF for a PBR material's direct light, `Pt` GGX visible-normal importance sampling with MIS against NEE and ReSTIR DI. PBR is switched on only by an explicitly written `specular`, `shininess`, `metallic`, `roughness` (or a map), never by MuJoCo's *defaults*; the classic pair maps by one formula, `roughness = (2/(128·shininess + 2))^{1/4}`. **Additive:** a scene with no texture and no explicit material attribute keeps its `scene_hash` and every rendered byte — an `rgba`-only material is not a drawn material, and texture bytes enter `asset_hash` by content, never by path. Texels decode through a 512-entry table (linear, then sRGB, built with `es_math::approx`) that both sides read from the same buffer, and barycentrics are recomputed with a written-out `dot` and `cross`, so the GPU and the CPU reference see the same texture coordinate. Details and measurements: `docs/design/renderer.md` §15.
+
 PT is M4 and is item 2 in the §1.9 reduction order. **The design premise is that vision learning holds up with RS alone.**
 
 ### 15.4 Acceleration Structures
@@ -2965,6 +2967,9 @@ one §1.2 packet and each oracle is a runnable one-liner. Design notes:
 textures and materials** (builtin checker, `texrepeat`, `specular`, `shininess`) each need
 `es-assets` work — loading `Shape::Mesh`, fields on `Material` — and both move `scene_hash`,
 invalidating the committed checkpoints; they become R5 and R6 after the owner's decision.
+(R6 became plan H's HT1 by the owner's decision of 2026-09-30, *additive* after the mesh
+precedent of M10/W2: a scene with no texture and no explicit material attribute keeps its
+`scene_hash`, and no committed checkpoint moved — §15.3, `docs/design/renderer.md` §15.)
 **MJWarp in evaluation** (§28.9 rung 11) opens only after T8 has parallelised the nominal run
 and the gain is still there, because a tier-3 backend changes the numbers. **The sensor realism
 pass** (§18.3) was never asked for. **M6** is parked.
