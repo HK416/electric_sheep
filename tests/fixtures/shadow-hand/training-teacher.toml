@@ -19,8 +19,10 @@
 # 2048 x 16 = 32,768 rows in 4 minibatches of 8,192.
 #
 # gamma, lam, clip, epochs and lr are rl_games' Shadow Hand values (0.99, 0.95, 0.2, 5, 5e-4);
-# entropy is small (rl_games uses 0). `steps` (iterations) and `checkpoint_at` are placeholders
-# the orchestrator sets from E1's stop rule (5,000 iterations = 1.6e8 rows).
+# entropy is small (rl_games uses 0). `steps` (iterations) and `checkpoint_at` were set by
+# the orchestrator for E1 (5,000 iterations = 1.6e8 rows). E1's stop rule, written before
+# the run: evaluate the 1,000-iteration checkpoint on mujoco-cpu (evaluation-teacher.toml); go
+# on to 5,000 unless the rollout return has not risen over iterations 500-1,000.
 
 kind = "training"
 
@@ -38,12 +40,16 @@ lam         = 0.95
 clip        = 0.2
 entropy     = 0.001
 value_coef  = 0.5
+# The exploration noise starts at sigma = e^-1.6 ~ 0.20 rad in actuator units (the default -0.5,
+# sigma 0.61, is wider than every finger servo's half-range, 0.21-0.79 rad: H2's smokes saw the
+# position envelope clamp every tick, executed_ne_sampled_rate ~1.00).
+init_log_std = -1.6
 backend     = "mjwarp"
 
 [run]
 steps         = 5000
 lr            = 5e-4
 seed          = 0
-checkpoint_at = [500, 1000, 2000, 3000, 4000]
+checkpoint_at = [250, 500, 1000, 2000, 3000, 4000]
 device        = "cuda"
 interpreter   = "python"
