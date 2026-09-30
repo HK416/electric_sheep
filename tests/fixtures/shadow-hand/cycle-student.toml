@@ -11,7 +11,18 @@
 #   merge    `success_only`: `es loop distill --success-only` of that collection into
 #            collect/successes/ds, its tiles renumbered into collect/successes/frames.
 #   train    training-student.toml on collect/successes (its header sizes the collection).
-#   eval     evaluation-student.toml: 64 held-out seeds, six suites, the last checkpoint.
+#   eval     evaluation-student-nominal.toml: 64 held-out seeds, the nominal suite only, the
+#            last checkpoint (packet M16/H3b).
+#
+# WHY NOMINAL ONLY: rendering 64 episodes x six suites of three 32-spp cameras is about 14 h on
+# the local PC; the nominal suite is a sixth of that and says whether the student imitates the
+# teacher at all. The full six-suite evaluation-student.toml (same seeds, metrics, acceptance)
+# runs afterwards on the checkpoint this cycle trains:
+#
+#   es eval run --config tests/fixtures/shadow-hand/evaluation-student.toml \
+#     --policy <out>/train/checkpoints/60000.esb \
+#     --scene tests/fixtures/mjcf/shadow_hand/shadow_hand_repose.xml \
+#     --out <out>/eval-full --jobs 4 --frames <out>/eval-full/frames
 #
 # The teacher bundle is the teacher's chosen checkpoint re-packed under the current
 # task-repose.toml (the orchestrator's, E1; `es policy init` + `es policy pack`: its weights
@@ -29,7 +40,7 @@
 #     --frames <out>/collect/successes/frames --success-only
 #   es train --recipe tests/fixtures/shadow-hand/training-student.toml --out <out>/train
 #   es eval run --policy <out>/train/checkpoints/60000.esb \
-#     --config tests/fixtures/shadow-hand/evaluation-student.toml --frames ... --out <out>/eval
+#     --config tests/fixtures/shadow-hand/evaluation-student-nominal.toml --frames ... --out <out>/eval
 #
 # `jobs = 4`, not plan N's 6: each job holds three ResNet18s and renders three 32-spp cameras,
 # and M12's review measured a 6-worker evaluation at 41.7 GB of host RAM. Not measured here.
@@ -51,7 +62,7 @@ success_only = true
 recipe = "tests/fixtures/shadow-hand/training-student.toml"
 
 [eval]
-config     = "tests/fixtures/shadow-hand/evaluation-student.toml"
+config     = "tests/fixtures/shadow-hand/evaluation-student-nominal.toml"
 checkpoint = "last"
 jobs       = 4
 frames     = true
