@@ -21,6 +21,10 @@ use es_physics_core::backend::ModelInfo;
 use crate::rng::EnvRng;
 use crate::EnvError;
 
+/// `MuJoCo`'s default geom `rgba`: a geom at it that names a drawn material wears the
+/// material's colour (`es_render`'s `setMaterial`, renderer.md 15.1).
+const MUJOCO_DEFAULT_RGBA: [f64; 4] = [0.5, 0.5, 0.5, 1.0];
+
 /// What one draw writes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Target {
@@ -93,8 +97,13 @@ impl LightOverride {
         *self == Self::default()
     }
 
-    /// `base` with every geom's colour scaled by [`Self::intensity`] — the scene to
+    /// `base` with every drawn colour scaled by [`Self::intensity`] — the scene to
     /// tessellate and upload for this episode.
+    ///
+    /// A drawn colour is a geom's `rgba`, or its drawn material's when the geom leaves `rgba`
+    /// at `MuJoCo`'s default (`setMaterial`, `docs/design/renderer.md` 15.1): both are scaled,
+    /// and such a geom's default is left alone, so it keeps wearing its material's colour
+    /// (times its texels) rather than a scaled grey (packet M16/H1b).
     ///
     /// Alpha is untouched: it is not radiance. A clone rather than an in-place edit, because
     /// the caller's scene is the *authored* one and every episode starts from it.
@@ -105,8 +114,21 @@ impl LightOverride {
         if self.intensity.to_bits() == 1.0_f64.to_bits() {
             return out;
         }
+        for m in out.materials.values_mut() {
+            for c in &mut m.rgba[..3] {
+                *c *= self.intensity;
+            }
+        }
+        let materials = &out.materials;
         for body in &mut out.bodies {
             for geom in &mut body.geoms {
+                let wears_material = geom.rgba == MUJOCO_DEFAULT_RGBA
+                    && geom.material.is_some_and(|id| materials.contains_key(&id));
+                if wears_material {
+                    continue;
+                }
+                // ponytail: a scaled geom rgba that lands exactly on the default would switch
+                // to its material's colour; a continuous draw hitting 0.5 exactly is ignored.
                 for c in &mut geom.rgba[..3] {
                     *c *= self.intensity;
                 }
