@@ -92,6 +92,8 @@ struct LocalTri {
 struct Wear {
     rgba: [f64; 4],
     emission: f64,
+    /// A drawn material's emitted colour, replacing `emission x rgba` (plan H, HT2).
+    emissive: Option<[f64; 3]>,
     look: Option<Look>,
     /// `MuJoCo`'s `mjvGeom` size: what `texuniform` multiplies by.
     size: [f32; 3],
@@ -183,6 +185,8 @@ impl TriScene {
         ];
         let emission = if geom.name.ends_with(LIGHT_SUFFIX) {
             albedo
+        } else if let Some(e) = wear.emissive {
+            e.map(|c| c as f32)
         } else if wear.emission > 0.0 {
             [0, 1, 2].map(|c| (wear.emission * wear.rgba[c]) as f32)
         } else {
@@ -346,6 +350,7 @@ fn wear(geom: &Geom, scene: &SceneDesc, looks: &BTreeMap<StableId, Look>) -> Wea
         return Wear {
             rgba: geom.rgba,
             emission: 0.0,
+            emissive: None,
             look: None,
             size: [0.0; 3],
             infinite: false,
@@ -385,6 +390,7 @@ fn wear(geom: &Geom, scene: &SceneDesc, looks: &BTreeMap<StableId, Look>) -> Wea
     Wear {
         rgba,
         emission: m.emission,
+        emissive: m.emissive,
         look: looks.get(&id).copied(),
         size,
         infinite,

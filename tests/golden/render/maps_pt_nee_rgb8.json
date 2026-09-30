@@ -1,0 +1,16 @@
+{
+  "dtype": "u8",
+  "generator": "cargo test -p es-render --test maps -- --ignored generate_maps_goldens",
+  "kernel": "pt.v5 (4 spp, 3 bounces, NEE, sky 0.3 0.35 0.4, light 1 0.95 0.9, Reinhard, exposure 2, normal and emissive maps)",
+  "layout": "row-major, little-endian, tightly packed",
+  "name": "maps_pt_nee_rgb8",
+  "oracle": "es_render::cpu, the pure-Rust mirror of the Slang kernels",
+  "pins": "OpenCV camera frame and top-left image origin (spec 3.1)",
+  "scene": "tests/fixtures/gltf/textured_box/textured_box.xml (= textured_box.gltf), the camera of crates/es-render/tests/maps.rs `box_camera`",
+  "shape": [
+    64,
+    64,
+    3
+  ],
+  "spec": "docs/design/renderer.md section 16"
+}

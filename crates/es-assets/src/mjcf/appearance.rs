@@ -1,5 +1,8 @@
 //! `<texture>` and `<material>` beyond their names (plan H, packet HT1).
 //!
+//! Plan H's HT2 adds the `normal` and `emissive` layer roles: a tangent-space normal map, and
+//! an emitted colour map scaled by `emission` (1 when it is not written) — not by `rgba`.
+//!
 //! A texture's declaration becomes a [`TextureSpec`] on the scene; its texels are decoded by
 //! [`crate::mesh::load`]. A material becomes a [`Material`] only when it changes how a geom is
 //! drawn: it names a texture (attribute or `<layer>`) or writes `specular`, `shininess`,
@@ -43,6 +46,9 @@ pub(crate) enum Role {
     Orm,
     Metallic,
     Roughness,
+    /// Plan H, HT2.
+    Normal,
+    Emissive,
 }
 
 /// A material's texture reference, resolved once every `<asset>` section is read.
@@ -151,7 +157,7 @@ impl<'a> Parser<'a> {
             return Ok(()); // rgba only: drawn as the geom's own colour, exactly as before
         }
         let finite = |v: Option<f64>| v.filter(|x| *x >= 0.0);
-        let material = Material {
+        let mut material = Material {
             rgba: attrs.padded("rgba", [1.0; 4])?,
             emission: attrs.num_or("emission", 0.0)?,
             specular: attrs.num("specular")?,
@@ -174,6 +180,8 @@ impl<'a> Parser<'a> {
                 Some("orm") => Role::Orm,
                 Some("metallic") => Role::Metallic,
                 Some("roughness") => Role::Roughness,
+                Some("normal") => Role::Normal,
+                Some("emissive") => Role::Emissive,
                 other => {
                     return Err(MjcfError::Unsupported {
                         line,
@@ -188,6 +196,11 @@ impl<'a> Parser<'a> {
                     attr: "texture",
                 });
             };
+            if matches!(role, Role::Emissive) {
+                // The map is the emitted colour, scaled by `emission` when it is written.
+                let e = attrs.num("emission")?.unwrap_or(1.0);
+                material.emissive = Some([e; 3]);
+            }
             refs.push((role, name.to_owned(), line));
         }
         for (role, name, line) in refs {
@@ -223,6 +236,8 @@ impl<'a> Parser<'a> {
                 Role::Orm => &mut m.orm,
                 Role::Metallic => &mut m.metallic_map,
                 Role::Roughness => &mut m.roughness_map,
+                Role::Normal => &mut m.normal_map,
+                Role::Emissive => &mut m.emissive_map,
             };
             *slot = Some(tex);
         }

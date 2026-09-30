@@ -388,14 +388,15 @@ float3 es_primary_dir(EsView vw, uint2 px) {
 
 // Flat + Lambert, one directional light, no shadow ray (the Pt path models occlusion).
 // With a base colour that is not the flat albedo: a texel times the factor (plan H, HT1).
-float3 es_shade_lambert_base(float3 base, EsTri tr, float3 n) {
+// And with the emission at the hit (an emissive map's texel, HT2).
+float3 es_shade_lambert_base(float3 base, float3 emission, float3 n) {
     float ndl = max(dot(n, es_light_dir()), 0.0);
     float lambert = es_ambient() + ndl * (1.0 - es_ambient());
-    return base * lambert + tr.emission;
+    return base * lambert + emission;
 }
 
 float3 es_shade_lambert(EsTri tr, float3 n) {
-    return es_shade_lambert_base(tr.albedo, tr, n);
+    return es_shade_lambert_base(tr.albedo, tr.emission, n);
 }
 
 // Exact piecewise sRGB transfer (spec 3.1); the power goes through `approx.slang`, not
@@ -427,6 +428,9 @@ float3 es_shade_full(EsTri tr, EsSurface s, float3 n, float3 p, float3 d) {
     float3 light = es_light_dir();
     float vis = 1.0;
     if (es_shadows() && es_any_hit(p + n * ES_RAY_EPS, light, 0.0, ES_SHADOW_FAR)) { vis = 0.0; }
+    // A normal-mapped surface lights with its shading normal (plan H, HT2); the shadow ray
+    // above left along the geometric one.
+    if (s.bumped) { n = s.ns; }
     // A PBR surface (plan H, HT1): the glTF BRDF under the same light and hemisphere. Mirror
     // of the `surf.pbr` branch of `cpu::shade_full_surface`.
     if (s.pbr) {
@@ -447,7 +451,7 @@ float3 es_shade_full(EsTri tr, EsSurface s, float3 n, float3 p, float3 d) {
         float3 rgb = float3(amb.x * hemi_p.x + direct.x * (1.0 - hemi_p.x),
                             amb.y * hemi_p.y + direct.y * (1.0 - hemi_p.y),
                             amb.z * hemi_p.z + direct.z * (1.0 - hemi_p.z));
-        return rgb + tr.emission;
+        return rgb + s.emission;
     }
     float diffuse = max(dot(n, light), 0.0) * vis;
     float3 h = es_normalize(light - d);
@@ -461,7 +465,7 @@ float3 es_shade_full(EsTri tr, EsSurface s, float3 n, float3 p, float3 d) {
     // at review): hemi + diffuse * (1 - hemi) per channel, so a fully lit surface returns its
     // albedo and a shadowed one albedo * hemi. spec stays additive.
     float3 lit = hemi + diffuse * (1.0 - hemi);
-    return s.base * lit + spec + tr.emission;
+    return s.base * lit + spec + s.emission;
 }
 
 float es_luminance(float3 c) {
@@ -502,12 +506,18 @@ float3 es_cosine_hemisphere(float3 n, uint key) {
     return es_normalize(t * (r * es_cos(phi)) + b * (r * es_sin(phi)) + n * z);
 }
 
-// Uniform point on a triangle from two canonical randoms.
-float3 es_tri_point(EsTri tr, float u, float v) {
+// Uniform point on a triangle from two canonical randoms, and its barycentrics (b0, b1).
+float3 es_tri_point_b(EsTri tr, float u, float v, out float b0, out float b1) {
     float su = es_sqrt(u);
-    float b0 = 1.0 - su;
-    float b1 = v * su;
+    b0 = 1.0 - su;
+    b1 = v * su;
     return tr.v0 * (1.0 - b0 - b1) + tr.v1 * b0 + tr.v2 * b1;
+}
+
+float3 es_tri_point(EsTri tr, float u, float v) {
+    float b0;
+    float b1;
+    return es_tri_point_b(tr, u, v, b0, b1);
 }
 
 float es_tri_area(EsTri tr) {
@@ -579,7 +589,9 @@ float3 es_nee_direct(float3 p, float3 n, EsSurface s, float3 v, float far, bool 
         float pick = es_rng_uniform(k_pick, 0);
         uint idx = min(uint(pick * n_lights), n_l - 1);
         EsTri light = es_tri(es_light_tri(idx));
-        float3 lp = es_tri_point(light, es_rng_uniform(k_area, 0), es_rng_uniform(k_area, 1));
+        float b0;
+        float b1;
+        float3 lp = es_tri_point_b(light, es_rng_uniform(k_area, 0), es_rng_uniform(k_area, 1), b0, b1);
         float3 seg = lp - p;
         float dist2 = dot(seg, seg);
         float dist = es_sqrt(dist2);
@@ -593,7 +605,7 @@ float3 es_nee_direct(float3 p, float3 n, EsSurface s, float3 v, float far, bool 
                 // `dist * (1 - 1e-3)` so the shadow ray stops short of the light itself.
                 if (!es_any_hit(p, dir, 0.0, dist * (1.0 - 1e-3))) {
                     float3 fd = s.pbr ? es_brdf(s, n, v, dir) : f;
-                    out_rgb += (fd * light.emission) * (cos_s / p_light * w);
+                    out_rgb += (fd * es_emission_at(light, b0, b1)) * (cos_s / p_light * w);
                 }
             }
         }
@@ -627,8 +639,8 @@ float3 es_nee_direct(float3 p, float3 n, EsSurface s, float3 v, float far, bool 
 // One BSDF bounce (plan H, HT1). Mirror of `cpu::bounce_dir`: a Lambertian surface is the
 // cosine-weighted direction of stream 0 with a throughput factor of `base` and both pdfs the
 // one `cos / pi`; a PBR one samples the lobe mixture (stream 7) and weights by f cos / pdf.
-void es_bounce(EsSurface s, float3 n, float3 v, uint key_dir, uint key_lobe,
-               out float3 dir, out float3 weight, out float pdf, out float sky_pdf) {
+void es_bounce_lobe(EsSurface s, float3 n, float3 v, uint key_dir, uint key_lobe,
+                    out float3 dir, out float3 weight, out float pdf, out float sky_pdf) {
     float3 cosine = es_cosine_hemisphere(n, key_dir);
     if (!s.pbr) {
         dir = cosine;
@@ -648,6 +660,14 @@ void es_bounce(EsSurface s, float3 n, float3 v, uint key_dir, uint key_lobe,
     weight = (pdf > 0.0 && nl > 0.0) ? es_brdf(s, n, v, l) * (nl / pdf) : float3(0.0, 0.0, 0.0);
     sky_pdf = max(nl, 0.0) * ES_INV_PI;
     dir = l;
+}
+
+// `n` the shading normal, `ng` the geometric one: a normal-mapped surface's direction below
+// the geometric surface carries no throughput (plan H, HT2). Mirror of `cpu::bounce_dir`.
+void es_bounce(EsSurface s, float3 n, float3 ng, float3 v, uint key_dir, uint key_lobe,
+               out float3 dir, out float3 weight, out float pdf, out float sky_pdf) {
+    es_bounce_lobe(s, n, v, key_dir, key_lobe, dir, weight, pdf, sky_pdf);
+    if (s.bumped && es_dot3(ng, dir) <= 0.0) { weight = float3(0.0, 0.0, 0.0); }
 }
 
 #endif

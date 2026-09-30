@@ -46,6 +46,21 @@
 //! 1, 2, ...`; a node reachable only as a child is visited when its parent recurses into it, so
 //! the effective order is a preorder walk seeded by the nodes nobody claims as a child.
 //!
+//! # Materials (plan H, HT2)
+//!
+//! Every glTF material also becomes a drawn [`crate::scene::Material`] on
+//! [`SceneDesc::materials`], the table the MJCF importer fills: `pbrMetallicRoughness`
+//! (`baseColorFactor` / `baseColorTexture`, `metallicFactor`, `roughnessFactor`,
+//! `metallicRoughnessTexture` as the `orm` slot — G roughness, B metal), `normalTexture` with its
+//! `scale`, and `emissiveTexture` x `emissiveFactor` x `KHR_materials_emissive_strength`. Their
+//! PNG images are decoded here into [`SceneDesc::textures`] (base colour and emissive as sRGB,
+//! the others linear, as glTF 2.0 section 3.9 fixes them) with the sampler's wrap modes, and
+//! each texture's [`AssetRef::hash`] is its content digest. What the renderer does not draw is
+//! reported: `alphaMode` `MASK` / `BLEND` (drawn opaque), a `texCoord` other than 0 and an image
+//! that is not a PNG (the texture is dropped). `doubleSided` needs no report: this renderer draws
+//! every triangle from both sides, which is what a closed mesh looks like either way. The
+//! meshes are carried on [`SceneDesc::meshes`] too, so the scene renders as it is.
+//!
 //! # Content hash (spec 5.3)
 //!
 //! A mesh [`AssetRef::hash`] is `blake3` of the *decoded* vertex/index arrays, not of the
@@ -62,7 +77,8 @@ use gltf::{Document, Gltf};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use crate::scene::{scene_id, AssetKind, AssetRef, Body, Geom, SceneDesc, Shape};
+use crate::scene::{scene_id, AssetKind, AssetRef, Body, Geom, Material, SceneDesc, Shape};
+use crate::texture::{ColorSpace, TexKind, Texture, TextureData, TextureSpec, Wrap};
 
 /// The fixed rotation from glTF (Y-up) to spec 3.1 (Z-up, X-forward); see the module docs.
 /// Order 3 (`AXIS_FIX^3 == IDENTITY`): it is a 120 degree rotation about `(-1, 1, 1)`.
@@ -167,6 +183,15 @@ pub fn import_gltf(bytes: &[u8], base_dir: Option<&Path>) -> Result<GltfImport, 
     let mut assets = Vec::new();
     let mut material_ids = BTreeMap::new();
     let mut materials = Vec::new();
+    let mut images = Images {
+        buffers: &buffers,
+        base_dir,
+        done: BTreeMap::new(),
+        textures: BTreeMap::new(),
+        assets: Vec::new(),
+        warnings: Vec::new(),
+    };
+    let mut drawn = BTreeMap::new();
     for material in document.materials() {
         let index = material.index().unwrap_or_default();
         let name = material
@@ -174,9 +199,18 @@ pub fn import_gltf(bytes: &[u8], base_dir: Option<&Path>) -> Result<GltfImport, 
             .map_or_else(|| format!("material_{index}"), str::to_owned);
         let asset = AssetRef::from_path(AssetKind::Material, &name, &format!("material/{name}"));
         material_ids.insert(index, asset.id);
+        drawn.insert(asset.id, images.material(&material, &name));
         materials.push(material_data(&material, asset.id, name));
         assets.push(asset);
     }
+    let Images {
+        textures,
+        assets: texture_assets,
+        warnings: image_warnings,
+        ..
+    } = images;
+    assets.extend(texture_assets);
+    warnings.extend(image_warnings);
 
     // A node reachable only as someone's child is visited when that parent recurses into it;
     // a node nobody claims is a traversal root (spec: "document order" — see module docs).
@@ -212,6 +246,9 @@ pub fn import_gltf(bytes: &[u8], base_dir: Option<&Path>) -> Result<GltfImport, 
         name: "gltf".to_owned(),
         bodies,
         assets,
+        meshes: meshes.iter().map(|m| (m.id, m.clone())).collect(),
+        materials: drawn,
+        textures,
         ..SceneDesc::default()
     };
     Ok(GltfImport {
@@ -522,6 +559,177 @@ fn material_data(material: &gltf::Material<'_>, id: StableId, name: String) -> M
         roughness: f64::from(pbr.roughness_factor()),
         emissive: material.emissive_factor().map(f64::from),
         textures,
+    }
+}
+
+/// The image decoder of the drawn materials (plan H, HT2): each glTF texture once per colour
+/// space, into the scene's texture table, with what could not be drawn reported.
+struct Images<'a> {
+    buffers: &'a [Vec<u8>],
+    base_dir: Option<&'a Path>,
+    /// `(texture index, sRGB)` -> the scene texture, or `None` once it failed.
+    done: BTreeMap<(usize, bool), Option<StableId>>,
+    textures: BTreeMap<StableId, Texture>,
+    assets: Vec<AssetRef>,
+    warnings: Vec<Warning>,
+}
+
+impl Images<'_> {
+    fn material(&mut self, material: &gltf::Material<'_>, name: &str) -> Material {
+        let mode = match material.alpha_mode() {
+            gltf::material::AlphaMode::Opaque => None,
+            gltf::material::AlphaMode::Mask => Some("MASK"),
+            gltf::material::AlphaMode::Blend => Some("BLEND"),
+        };
+        if let Some(mode) = mode {
+            self.warn(format!(
+                "material `{name}`: alphaMode {mode} is drawn OPAQUE"
+            ));
+        }
+        let pbr = material.pbr_metallic_roughness();
+        let mut m = Material {
+            rgba: pbr.base_color_factor().map(f64::from),
+            metallic: Some(f64::from(pbr.metallic_factor())),
+            roughness: Some(f64::from(pbr.roughness_factor())),
+            ..Material::default()
+        };
+        if let Some(info) = pbr.base_color_texture() {
+            m.rgb = self.texture(&info.texture(), info.tex_coord(), true, name);
+        }
+        if let Some(info) = pbr.metallic_roughness_texture() {
+            m.orm = self.texture(&info.texture(), info.tex_coord(), false, name);
+        }
+        if let Some(info) = material.normal_texture() {
+            m.normal_map = self.texture(&info.texture(), info.tex_coord(), false, name);
+            m.normal_scale = m.normal_map.map(|_| f64::from(info.scale()));
+        }
+        let strength = f64::from(material.emissive_strength().unwrap_or(1.0));
+        let emissive = material.emissive_factor().map(|c| f64::from(c) * strength);
+        if emissive.iter().any(|c| *c > 0.0) {
+            m.emissive = Some(emissive);
+            if let Some(info) = material.emissive_texture() {
+                m.emissive_map = self.texture(&info.texture(), info.tex_coord(), true, name);
+            }
+        }
+        m
+    }
+
+    fn warn(&mut self, message: String) {
+        self.warnings.push(Warning { message });
+    }
+
+    /// The scene texture for `texture` read in `srgb`, decoded on first use; `None`, with a
+    /// warning, when it cannot be drawn.
+    fn texture(
+        &mut self,
+        texture: &gltf::Texture<'_>,
+        tex_coord: u32,
+        srgb: bool,
+        material: &str,
+    ) -> Option<StableId> {
+        if tex_coord != 0 {
+            self.warn(format!(
+                "material `{material}`: texture {} reads TEXCOORD_{tex_coord}; only set 0 is \
+                 drawn, the texture is dropped",
+                texture.index()
+            ));
+            return None;
+        }
+        let key = (texture.index(), srgb);
+        if let Some(done) = self.done.get(&key) {
+            return *done;
+        }
+        let id = match self.decode(texture, srgb) {
+            Ok((asset, data)) => {
+                let id = asset.id;
+                let spec = TextureSpec {
+                    kind: TexKind::TwoD,
+                    colorspace: if srgb {
+                        ColorSpace::Srgb
+                    } else {
+                        ColorSpace::Linear
+                    },
+                    ..TextureSpec::default()
+                };
+                self.textures.insert(
+                    id,
+                    Texture {
+                        spec,
+                        data: Some(data),
+                    },
+                );
+                self.assets.push(asset);
+                Some(id)
+            }
+            Err(reason) => {
+                self.warn(format!(
+                    "material `{material}`: texture {} is dropped: {reason}",
+                    texture.index()
+                ));
+                None
+            }
+        };
+        self.done.insert(key, id);
+        id
+    }
+
+    fn decode(
+        &self,
+        texture: &gltf::Texture<'_>,
+        srgb: bool,
+    ) -> Result<(AssetRef, TextureData), String> {
+        let image = texture.source();
+        let bytes = match image.source() {
+            gltf::image::Source::View { view, .. } => {
+                let buffer = self
+                    .buffers
+                    .get(view.buffer().index())
+                    .ok_or("its buffer is missing")?;
+                buffer
+                    .get(view.offset()..view.offset() + view.length())
+                    .ok_or("its buffer view runs past the buffer")?
+                    .to_vec()
+            }
+            gltf::image::Source::Uri { uri, .. } => {
+                if let Some(rest) = uri.strip_prefix("data:") {
+                    let (_, payload) = rest.split_once(',').ok_or("a data URI without `,`")?;
+                    base64_decode(payload).ok_or("a data URI that is not base64")?
+                } else {
+                    let dir = self
+                        .base_dir
+                        .ok_or("an external image and no base directory")?;
+                    let path = dir.join(percent_decode(uri));
+                    std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?
+                }
+            }
+        };
+        if !bytes.starts_with(b"\x89PNG") {
+            return Err("not a PNG (only PNG images are decoded)".to_owned());
+        }
+        let png = crate::texture::decode_png(bytes)?;
+        let wrap = |mode: gltf::texture::WrappingMode| match mode {
+            gltf::texture::WrappingMode::ClampToEdge => Wrap::Clamp,
+            gltf::texture::WrappingMode::MirroredRepeat => Wrap::Mirror,
+            gltf::texture::WrappingMode::Repeat => Wrap::Repeat,
+        };
+        let sampler = texture.sampler();
+        let data = TextureData {
+            kind: TexKind::TwoD,
+            width: png.w,
+            height: png.h,
+            srgb,
+            rgb: png.rgb,
+            wrap: [wrap(sampler.wrap_s()), wrap(sampler.wrap_t())],
+        };
+        let space = if srgb { "srgb" } else { "linear" };
+        let path = texture_asset(texture).path;
+        let mut asset = AssetRef::from_path(
+            AssetKind::Texture,
+            &format!("texture_{}_{space}", texture.index()),
+            &path,
+        );
+        asset.hash = data.content_hash();
+        Ok((asset, data))
     }
 }
 

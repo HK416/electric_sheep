@@ -197,12 +197,23 @@ fn a_missing_texture_or_a_bad_layer_is_named() {
         m.metallic() == 1.0 && m.roughness() == 1.0,
         "a map's default factor is 1"
     );
+    // Plan H, HT2: `normal` and `emissive` are drawn; the emissive map's colour is
+    // `emission`, 1 when unwritten. A role this renderer does not draw is still refused.
     let xml = r#"<mujoco><asset>
         <texture name="t" type="2d" builtin="flat" width="2" height="2"/>
-        <material name="m"><layer role="normal" texture="t"/></material>
+        <material name="m"><layer role="normal" texture="t"/><layer role="emissive" texture="t"/></material>
+        <material name="n" emission="3"><layer role="emissive" texture="t"/></material>
+        </asset><worldbody/></mujoco>"#;
+    let s = es_assets::parse_mjcf(xml).unwrap().scene;
+    let emissive: Vec<_> = s.materials.values().map(|m| m.emissive).collect();
+    assert!(emissive.contains(&Some([1.0; 3])) && emissive.contains(&Some([3.0; 3])));
+    assert!(s.materials.values().any(|m| m.normal_map.is_some()));
+    let xml = r#"<mujoco><asset>
+        <texture name="t" type="2d" builtin="flat" width="2" height="2"/>
+        <material name="m"><layer role="opacity" texture="t"/></material>
         </asset><worldbody/></mujoco>"#;
     let text = es_assets::parse_mjcf(xml).unwrap_err().to_string();
-    assert!(text.contains("normal"), "{text}");
+    assert!(text.contains("opacity"), "{text}");
     // A missing file is named at load, not at parse.
     let xml = r#"<mujoco><asset><texture name="t" type="2d" file="gone.png"/>
         <material name="m" texture="t"/></asset><worldbody/></mujoco>"#;

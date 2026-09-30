@@ -112,6 +112,16 @@ impl Default for TextureSpec {
     }
 }
 
+/// How a 2D texture's coordinate outside `[0, 1)` is folded back (glTF's sampler `wrapS` /
+/// `wrapT`; plan H, HT2). An MJCF texture always repeats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Wrap {
+    #[default]
+    Repeat,
+    Clamp,
+    Mirror,
+}
+
 /// Decoded texels: 8-bit RGB, row-major, row 0 the image's top row (`MuJoCo`'s and `OpenGL`'s
 /// `t = 0`). A cube is six `width x width` faces stacked in face order.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -123,6 +133,9 @@ pub struct TextureData {
     /// The resolved colour space: `true` decodes each texel from sRGB before filtering.
     pub srgb: bool,
     pub rgb: Vec<u8>,
+    /// `(s, t)` wrap modes; `Repeat` for every MJCF texture.
+    #[serde(default)]
+    pub wrap: [Wrap; 2],
 }
 
 impl TextureData {
@@ -147,6 +160,12 @@ impl TextureData {
         h.update(&self.width.to_le_bytes());
         h.update(&self.height.to_le_bytes());
         h.update(&self.rgb);
+        // Plan H, HT2: a sampler other than repeat is part of what the texture looks like;
+        // appended only then, so every HT1 digest stands.
+        if self.wrap != [Wrap::Repeat; 2] {
+            h.update(b"wrap");
+            h.update(&self.wrap.map(|w| w as u8));
+        }
         *h.finalize().as_bytes()
     }
 }
@@ -203,6 +222,7 @@ fn decode(spec: &TextureSpec, base: &Path) -> Result<TextureData, String> {
                 height: w,
                 srgb,
                 rgb: builtin_cube(spec, w),
+                wrap: [Wrap::Repeat; 2],
             }
         } else {
             TextureData {
@@ -211,6 +231,7 @@ fn decode(spec: &TextureSpec, base: &Path) -> Result<TextureData, String> {
                 height: h,
                 srgb,
                 rgb: builtin_2d(spec, w, h),
+                wrap: [Wrap::Repeat; 2],
             }
         });
     }
@@ -229,6 +250,7 @@ fn decode(spec: &TextureSpec, base: &Path) -> Result<TextureData, String> {
                 height: img.h,
                 srgb,
                 rgb: img.rgb,
+                wrap: [Wrap::Repeat; 2],
             });
         }
         return cube_single(spec, &img, srgb);
@@ -240,30 +262,31 @@ fn decode(spec: &TextureSpec, base: &Path) -> Result<TextureData, String> {
 }
 
 /// A decoded PNG, reduced to 8-bit RGB.
-struct Png {
-    w: u32,
-    h: u32,
-    srgb: bool,
-    rgb: Vec<u8>,
+pub(crate) struct Png {
+    pub(crate) w: u32,
+    pub(crate) h: u32,
+    pub(crate) srgb: bool,
+    pub(crate) rgb: Vec<u8>,
+}
+
+fn read_png(path: &Path) -> Result<Png, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    decode_png(bytes).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// `lodepng` with `LCT_RGB`, as `MuJoCo` asks for it: palette and low bit depths expanded,
-/// 16-bit channels to their high byte, grey replicated, alpha dropped.
-fn read_png(path: &Path) -> Result<Png, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+/// 16-bit channels to their high byte, grey replicated, alpha dropped. Also the glTF
+/// importer's image decoder (plan H, HT2).
+pub(crate) fn decode_png(bytes: Vec<u8>) -> Result<Png, String> {
     let mut decoder = png::Decoder::new(std::io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
-    let mut reader = decoder
-        .read_info()
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
     let srgb = reader.info().srgb.is_some();
     let size = reader
         .output_buffer_size()
-        .ok_or_else(|| format!("{}: image too large", path.display()))?;
+        .ok_or_else(|| "image too large".to_owned())?;
     let mut buf = vec![0u8; size];
-    let info = reader
-        .next_frame(&mut buf)
-        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
     let stride = match info.color_type {
         png::ColorType::Grayscale => 1,
         png::ColorType::GrayscaleAlpha => 2,
@@ -483,6 +506,7 @@ fn cube_single(spec: &TextureSpec, img: &Png, srgb: bool) -> Result<TextureData,
         height: w,
         srgb,
         rgb: out,
+        wrap: [Wrap::Repeat; 2],
     })
 }
 
@@ -521,6 +545,7 @@ fn cube_separate(
         height: w,
         srgb,
         rgb: out,
+        wrap: [Wrap::Repeat; 2],
     })
 }
 

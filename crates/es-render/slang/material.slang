@@ -4,9 +4,10 @@
 // The region sits in `es_tris` at `es_mat_base()` (global slot 41), after the scene:
 //   LUT (512 floats: i/255, then the sRGB decode of i/255)
 //   materials, ES_MAT_STRIDE floats each (rgb tex+1, metallic, roughness, metal tex+1,
-//     metal channel, rough tex+1, rough channel, pbr)
+//     metal channel, rough tex+1, rough channel, pbr, normal tex+1, normal scale,
+//     emissive tex+1, pad — the last four plan H's HT2)
 //   texture headers, 4 words each (texel offset from the region start, width, face height,
-//     flags: bit 0 cube, bit 1 sRGB)
+//     flags: bit 0 cube, bit 1 sRGB, bits 2-3 / 4-5 the s / t wrap: 0 repeat, 1 clamp, 2 mirror)
 //   texels, one packed r | g << 8 | b << 16 word each, cube faces stacked
 // A triangle with `mat == 0` never reads any of it.
 //
@@ -17,7 +18,7 @@
 #ifndef ES_RENDER_MATERIAL_SLANG
 #define ES_RENDER_MATERIAL_SLANG
 
-static const uint ES_MAT_STRIDE = 8;
+static const uint ES_MAT_STRIDE = 12;
 static const uint ES_LUT_LEN = 512;
 static const float ES_MIN_ROUGHNESS = 0.05;
 
@@ -29,6 +30,11 @@ struct EsSurface {
     float metallic;
     float roughness;
     bool pbr;
+    // Plan H, HT2: the emission at the hit, and the normal-mapped shading normal (facing the
+    // ray) when `bumped`.
+    float3 emission;
+    bool bumped;
+    float3 ns;
 };
 
 EsSurface es_surface_flat(float3 albedo) {
@@ -37,6 +43,16 @@ EsSurface es_surface_flat(float3 albedo) {
     s.metallic = 0.0;
     s.roughness = 1.0;
     s.pbr = false;
+    s.emission = float3(0.0, 0.0, 0.0);
+    s.bumped = false;
+    s.ns = float3(0.0, 0.0, 0.0);
+    return s;
+}
+
+// The untextured triangle: its flat albedo and its emission.
+EsSurface es_surface_of(EsTri tr) {
+    EsSurface s = es_surface_flat(tr.albedo);
+    s.emission = tr.emission;
     return s;
 }
 
@@ -98,12 +114,25 @@ float3 es_texel(uint hdr, uint face, uint row, uint col) {
                   es_tris[lb + ((word >> 16) & 0xffu)]);
 }
 
-// Bilinear, texel centres at +0.5: repeat across a 2D texture, clamp to the edge of a face.
+// Folds texel index i into 0..n by wrap mode (0 repeat, 1 clamp, 2 mirror).
+uint es_wrap(int i, int n, uint mode) {
+    if (mode == 1u) { return uint(clamp(i, 0, n - 1)); }
+    if (mode == 2u) {
+        int p = 2 * n;
+        int m = ((i % p) + p) % p;
+        return uint(m < n ? m : p - 1 - m);
+    }
+    return uint(((i % n) + n) % n);
+}
+
+// Bilinear, texel centres at +0.5: each axis of a 2D texture by its wrap mode, clamp to the
+// edge of a cube face.
 float3 es_sample(uint tex, float3 tc) {
     uint hdr = es_mat_base() + ES_LUT_LEN + es_n_mat() * ES_MAT_STRIDE + tex * 4u;
     int w = int(asuint(es_tris[hdr + 1]));
     int h = int(asuint(es_tris[hdr + 2]));
-    bool cube = (asuint(es_tris[hdr + 3]) & 1u) != 0u;
+    uint flags = asuint(es_tris[hdr + 3]);
+    bool cube = (flags & 1u) != 0u;
     uint face = 0;
     float s = tc.x;
     float t = tc.y;
@@ -116,23 +145,12 @@ float3 es_sample(uint tex, float3 tc) {
     float fy = y - y0;
     int ix = int(x0);
     int iy = int(y0);
-    uint cx0;
-    uint cx1;
-    uint cy0;
-    uint cy1;
-    if (cube) {
-        cx0 = uint(clamp(ix, 0, w - 1));
-        cx1 = uint(clamp(ix + 1, 0, w - 1));
-        cy0 = uint(clamp(iy, 0, h - 1));
-        cy1 = uint(clamp(iy + 1, 0, h - 1));
-    } else {
-        int a = ((ix % w) + w) % w;
-        int b = ((iy % h) + h) % h;
-        cx0 = uint(a);
-        cx1 = uint((a + 1) % w);
-        cy0 = uint(b);
-        cy1 = uint((b + 1) % h);
-    }
+    uint ws = cube ? 1u : ((flags >> 2) & 3u);
+    uint wt = cube ? 1u : ((flags >> 4) & 3u);
+    uint cx0 = es_wrap(ix, w, ws);
+    uint cx1 = es_wrap(ix + 1, w, ws);
+    uint cy0 = es_wrap(iy, h, wt);
+    uint cy1 = es_wrap(iy + 1, h, wt);
     float3 c00 = es_texel(hdr, face, cy0, cx0);
     float3 c10 = es_texel(hdr, face, cy0, cx1);
     float3 c01 = es_texel(hdr, face, cy1, cx0);
@@ -146,9 +164,41 @@ float es_channel(float3 c, uint ch) {
     return ch == 0u ? c.x : (ch == 1u ? c.y : c.z);
 }
 
-// The surface the ray (o, d) sees on `tr`. `mat == 0` is the flat albedo and nothing else.
+// The normal-mapped shading normal of texel `c` on `tr`, facing the ray `d`; false when the
+// triangle's UVs have no area. Mirror of `material::bump`: the per-face MikkTSpace frame of
+// glTF, the bitangent pointing up the image (towards decreasing t).
+bool es_bump(EsTri tr, float3 d, float3 c, float k, out float3 ns) {
+    ns = float3(0.0, 0.0, 0.0);
+    float3 e1 = tr.v1 - tr.v0;
+    float3 e2 = tr.v2 - tr.v0;
+    float du1 = tr.tc1.x - tr.tc0.x;
+    float dv1 = tr.tc1.y - tr.tc0.y;
+    float du2 = tr.tc2.x - tr.tc0.x;
+    float dv2 = tr.tc2.y - tr.tc0.y;
+    float det = du1 * dv2 - du2 * dv1;
+    if (!(det > 0.0 || det < 0.0)) { return false; }
+    float r = 1.0 / det;
+    float3 dpds = (e1 * dv2 - e2 * dv1) * r;
+    float3 dpdt = (e2 * du1 - e1 * du2) * r;
+    float3 n = tr.n;
+    float3 t = es_norm3(dpds - n * es_dot3(n, dpds));
+    if (es_dot3(t, t) <= 0.0) { return false; }
+    float3 nt = es_cross(n, t);
+    float w = es_dot3(nt, dpdt) > 0.0 ? -1.0 : 1.0;
+    float x = (c.x * 2.0 - 1.0) * k;
+    float y = (c.y * 2.0 - 1.0) * k;
+    float z = c.z * 2.0 - 1.0;
+    ns = es_norm3(float3(t.x * x + nt.x * w * y + n.x * z,
+                         t.y * x + nt.y * w * y + n.y * z,
+                         t.z * x + nt.z * w * y + n.z * z));
+    if (es_dot3(n, d) > 0.0) { ns = -ns; }
+    return true;
+}
+
+// The surface the ray (o, d) sees on `tr`. `mat == 0` is the flat albedo and emission and
+// nothing else.
 EsSurface es_surface(EsTri tr, float3 o, float3 d) {
-    if (tr.mat == 0u) { return es_surface_flat(tr.albedo); }
+    if (tr.mat == 0u) { return es_surface_of(tr); }
     uint mb = es_mat_base() + ES_LUT_LEN + (tr.mat - 1u) * ES_MAT_STRIDE;
     uint rgb = asuint(es_tris[mb + 0]);
     float metallic = es_tris[mb + 1];
@@ -157,18 +207,40 @@ EsSurface es_surface(EsTri tr, float3 o, float3 d) {
     uint metal_ch = asuint(es_tris[mb + 4]);
     uint rough_tex = asuint(es_tris[mb + 5]);
     uint rough_ch = asuint(es_tris[mb + 6]);
+    uint normal_tex = asuint(es_tris[mb + 8]);
+    float normal_scale = es_tris[mb + 9];
+    uint emissive_tex = asuint(es_tris[mb + 10]);
     EsSurface s;
     s.base = tr.albedo;
-    if (rgb != 0u || metal_tex != 0u || rough_tex != 0u) {
+    s.emission = tr.emission;
+    s.bumped = false;
+    s.ns = float3(0.0, 0.0, 0.0);
+    if (rgb != 0u || metal_tex != 0u || rough_tex != 0u || emissive_tex != 0u || normal_tex != 0u) {
         float3 tc = es_tex_coord(tr, o, d);
         if (rgb != 0u) { s.base = s.base * es_sample(rgb - 1u, tc); }
         if (metal_tex != 0u) { metallic = metallic * es_channel(es_sample(metal_tex - 1u, tc), metal_ch); }
         if (rough_tex != 0u) { roughness = roughness * es_channel(es_sample(rough_tex - 1u, tc), rough_ch); }
+        if (emissive_tex != 0u) { s.emission = s.emission * es_sample(emissive_tex - 1u, tc); }
+        if (normal_tex != 0u) {
+            s.bumped = es_bump(tr, d, es_sample(normal_tex - 1u, tc), normal_scale, s.ns);
+        }
     }
     s.metallic = metallic;
     s.roughness = clamp(roughness, ES_MIN_ROUGHNESS, 1.0);
     s.pbr = asuint(es_tris[mb + 7]) != 0u;
     return s;
+}
+
+// The emitted radiance at barycentrics (b0, b1) of `tr`, where es_tri_point puts a light
+// sample: the emission, times the emissive texel under a map (plan H, HT2). Mirror of
+// `Materials::emission_at`.
+float3 es_emission_at(EsTri tr, float b0, float b1) {
+    if (tr.mat == 0u) { return tr.emission; }
+    uint mb = es_mat_base() + ES_LUT_LEN + (tr.mat - 1u) * ES_MAT_STRIDE;
+    uint emissive_tex = asuint(es_tris[mb + 10]);
+    if (emissive_tex == 0u) { return tr.emission; }
+    float3 tc = tr.tc0 * (1.0 - b0 - b1) + tr.tc1 * b0 + tr.tc2 * b1;
+    return tr.emission * es_sample(emissive_tex - 1u, tc);
 }
 
 // --- glTF 2.0 metallic-roughness (Appendix B) -------------------------------------------------

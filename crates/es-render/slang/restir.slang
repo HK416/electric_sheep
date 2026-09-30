@@ -89,7 +89,9 @@ struct EsShade {
 // Unshadowed contribution and its target function (the luminance of that contribution).
 float3 es_di(float3 shade_p, float3 n, EsShade albedo, EsRes r, out float p_hat) {
     EsTri light = es_tri(r.tri);
-    float3 lp = es_tri_point(light, r.u, r.v);
+    float b0;
+    float b1;
+    float3 lp = es_tri_point_b(light, r.u, r.v, b0, b1);
     float3 to_light = lp - shade_p;
     float dist2 = max(dot(to_light, to_light), 1e-8);
     float3 dir = to_light * (1.0 / es_sqrt(dist2));
@@ -99,7 +101,7 @@ float3 es_di(float3 shade_p, float3 n, EsShade albedo, EsRes r, out float p_hat)
     // A Lambertian point is today's `albedo / pi`; a PBR one the glTF BRDF towards the light
     // sample (plan H, HT1). Mirror of `cpu::di_contribution`.
     float3 f = albedo.s.pbr ? es_brdf(albedo.s, n, albedo.v, dir) : (albedo.s.base * ES_INV_PI);
-    float3 radiance = f * light.emission * g;
+    float3 radiance = f * es_emission_at(light, b0, b1) * g;
     p_hat = es_luminance(radiance);
     return radiance;
 }
@@ -116,9 +118,10 @@ bool es_hit_at(uint index, uint2 local, EsView vw, out float3 shade_p, out float
     if (g_tri[index] == 0) { return false; }
     EsTri tr = es_tri(g_tri[index] - 1);
     float3 d = es_primary_dir(vw, local);
-    n = es_face_forward(tr.n, d);
-    shade_p = vw.pos + d * g_depth[index] + n * ES_RAY_EPS;
+    float3 ng = es_face_forward(tr.n, d);
+    shade_p = vw.pos + d * g_depth[index] + ng * ES_RAY_EPS;
     albedo.s = es_surface(tr, vw.pos, d);
+    n = albedo.s.bumped ? albedo.s.ns : ng;
     if (albedo.s.pbr) { albedo.v = es_norm3(-d); }
     return true;
 }
@@ -310,7 +313,7 @@ void spatial(uint3 tid : SV_DispatchThreadID) {
         float dist = es_sqrt(dot(seg, seg));
         if (es_any_hit(shade_p, seg * (1.0 / dist), 0.0, dist * (1.0 - 1e-3))) { vis = 0.0; }
     }
-    float3 shaded = radiance * vis + es_tri(g_tri[p.index] - 1).emission;
+    float3 shaded = radiance * vis + albedo.s.emission;
     out_radiance[p.index * 3 + 0] = shaded.x;
     out_radiance[p.index * 3 + 1] = shaded.y;
     out_radiance[p.index * 3 + 2] = shaded.z;
