@@ -474,6 +474,10 @@ impl<B: PhysicsBackend> Env<B> {
                 Source::Xpos { row, axis } => {
                     at(state.xpos, env, self.model.nbody * 3, row * 3 + axis)
                 }
+                // `xquat` is `n_envs * nbody * 4`, env-major, `x y z w` (packet M16/H2).
+                Source::Xquat { row, axis } => {
+                    at(state.xquat, env, self.model.nbody * 4, row * 4 + axis)
+                }
                 // Seconds are derived from a tick count at the edge, never accumulated (§18.1).
                 Source::Time { since_reset } => {
                     let ticks = if since_reset {

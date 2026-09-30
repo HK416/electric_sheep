@@ -11,8 +11,8 @@ use std::collections::BTreeMap;
 use es_assets::scene::SceneDesc;
 use es_ir::graph::{NodeId, PortRef};
 use es_ir::task::{
-    Aggregation, ArithOp, Expr, JointQuantity, LogicOp, NormKind, TaskGraph, TaskIr, TaskNode,
-    TerminationKind,
+    Aggregation, ArithOp, Expr, JointQuantity, LogicOp, MathFunc, NormKind, TaskGraph, TaskIr,
+    TaskNode, TerminationKind,
 };
 use es_ir::types::Frame;
 use es_physics_core::backend::ModelInfo;
@@ -32,6 +32,13 @@ pub(crate) enum Source {
     /// One axis of one body's world position: `xpos[row * 3 + axis]` of the env's row, with
     /// `row` from [`ModelInfo::body`] (spec 6.3 `GetBodyPose`).
     Xpos {
+        row: u32,
+        axis: u32,
+    },
+    /// One component of one body's world orientation: `xquat[row * 4 + axis]`, in the order
+    /// `StateView` stores it -- `x y z w` (spec 3.1) -- and unit length, because the backend
+    /// computes it from `qpos` (spec 6.3 `GetBodyPose.quat`, packet M16/H2).
+    Xquat {
         row: u32,
         axis: u32,
     },
@@ -229,6 +236,57 @@ impl Ctx<'_> {
             TaskNode::Norm { kind, .. } => Err(EnvError::Unsupported(format!(
                 "Norm {{ kind: {kind:?} }} in a reward or termination cone"
             ))),
+            // Packet M16/H2: the products summed in lane order, the association `Norm { L2 }`
+            // uses (`DET-020`) -- `((a0*b0 + a1*b1) + a2*b2) + a3*b3` for two quaternions.
+            TaskNode::Dot { .. } => {
+                let a = self.lower_input(id, "a", depth)?;
+                let b = self.lower_input(id, "b", depth)?;
+                if a.len() != b.len() || a.is_empty() {
+                    return Err(EnvError::Unsupported(format!(
+                        "Dot between {} lanes and {} lanes in a reward or termination cone",
+                        a.len(),
+                        b.len()
+                    )));
+                }
+                let mut sum: Option<Expr> = None;
+                for product in lane_wise(ArithOp::Mul, &a, &b)? {
+                    sum = Some(match sum {
+                        None => product,
+                        Some(acc) => Expr::Arith {
+                            op: ArithOp::Add,
+                            lhs: Box::new(acc),
+                            rhs: Box::new(product),
+                        },
+                    });
+                }
+                Ok(sum.into_iter().collect())
+            }
+            // Lane by lane. `Abs` is `max(x, 0 - x)` and `Sqrt` the IEEE root; both are basic
+            // operations, not `DET-010` transcendentals, and `Expr` has no polynomial for the
+            // rest, which are refused by name.
+            TaskNode::MathFn { func, .. } => {
+                let lanes = self.lower_input(id, "value", depth)?;
+                match func {
+                    MathFunc::Abs => Ok(lanes
+                        .into_iter()
+                        .map(|x| Expr::Arith {
+                            op: ArithOp::Max,
+                            lhs: Box::new(x.clone()),
+                            rhs: Box::new(Expr::Arith {
+                                op: ArithOp::Sub,
+                                lhs: Box::new(Expr::Const(0.0)),
+                                rhs: Box::new(x),
+                            }),
+                        })
+                        .collect()),
+                    MathFunc::Sqrt => {
+                        Ok(lanes.into_iter().map(|x| Expr::Sqrt(Box::new(x))).collect())
+                    }
+                    other => Err(EnvError::Unsupported(format!(
+                        "MathFn {{ func: {other:?} }} in a reward or termination cone"
+                    ))),
+                }
+            }
             TaskNode::Compare { op, rhs, .. } => {
                 let lhs = Box::new(self.scalar_input(id, "a", depth, "Compare")?);
                 let rhs = match rhs {
@@ -248,36 +306,28 @@ impl Ctx<'_> {
                 out_hi,
                 ..
             } => {
-                let (lo, hi) = (lo.first().copied(), hi.first().copied());
-                let (Some(lo), Some(hi)) = (lo, hi) else {
+                // One lane reads `lo[0]` / `hi[0]` as it always did; a vector reads one bound
+                // pair per lane (packet M16/H2), and a count that matches neither is refused.
+                let lanes = self.lower_input(id, "value", depth)?;
+                if lanes.len() > 1 && (lo.len() != lanes.len() || hi.len() != lanes.len()) {
+                    return Err(EnvError::Unsupported(format!(
+                        "Normalize over {} lanes with {} lo and {} hi bounds in a reward or \
+                         termination cone",
+                        lanes.len(),
+                        lo.len(),
+                        hi.len()
+                    )));
+                }
+                if lanes.is_empty() || lo.is_empty() || hi.is_empty() {
                     return Err(EnvError::Task(
                         "Normalize with an empty lo/hi in a reward or termination cone".to_owned(),
                     ));
-                };
-                if (hi - lo).abs() < f64::EPSILON {
-                    return Err(EnvError::Task(format!(
-                        "Normalize maps the empty range [{lo}, {hi}]"
-                    )));
                 }
-                let scale = (out_hi - out_lo) / (hi - lo);
-                let shifted = Expr::Arith {
-                    op: ArithOp::Sub,
-                    lhs: Box::new(self.scalar_input(id, "value", depth, "Normalize")?),
-                    rhs: Box::new(Expr::Const(lo)),
-                };
-                Ok(vec![Expr::Clamp {
-                    value: Box::new(Expr::Arith {
-                        op: ArithOp::Add,
-                        lhs: Box::new(Expr::Const(*out_lo)),
-                        rhs: Box::new(Expr::Arith {
-                            op: ArithOp::Mul,
-                            lhs: Box::new(shifted),
-                            rhs: Box::new(Expr::Const(scale)),
-                        }),
-                    }),
-                    lo: out_lo.min(*out_hi),
-                    hi: out_lo.max(*out_hi),
-                }])
+                lanes
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, lane)| affine(lane, lo[i], hi[i], *out_lo, *out_hi))
+                    .collect()
             }
             // `Compare` yields exactly 1.0 or 0.0 (`Expr::eval`), so the four logic ops are
             // arithmetic on those two values -- no new `Expr` variant, and no `es-ir` change.
@@ -320,11 +370,11 @@ impl Ctx<'_> {
         }
     }
 
-    /// The three world-position lanes of a body, in `x, y, z` order.
+    /// The three world-position lanes of a body, in `x, y, z` order, or its four orientation
+    /// lanes (`quat`, `x, y, z, w`).
     ///
-    /// Only `Frame::World` and only the `pos` port: `StateView` carries `xpos` and `xquat`,
-    /// and neither a quaternion nor a relative frame is three subtractable numbers. Both are
-    /// refused naming what was asked for rather than approximated.
+    /// Only `Frame::World`: `StateView` carries `xpos` and `xquat` in the world frame, and a
+    /// relative frame is refused naming what was asked for rather than approximated.
     fn body_pose_leaf(
         &mut self,
         body: es_core::StableId,
@@ -343,7 +393,7 @@ impl Ctx<'_> {
                  termination cone"
             )));
         }
-        if port != "pos" {
+        if port != "pos" && port != "quat" {
             return Err(EnvError::Unsupported(format!(
                 "GetBodyPose(\"{name}\").{port} in a reward or termination cone"
             )));
@@ -356,6 +406,19 @@ impl Ctx<'_> {
                 EnvError::Unsupported(format!("body \"{name}\" is not in the loaded model"))
             })?
             .start;
+        // `quat` is four lanes in `StateView`'s `x y z w` order (packet M16/H2). Nothing
+        // lane-wise mixes a quaternion with a position -- the widths differ and `lane_wise`
+        // refuses them -- and a dot product of two quaternions is order-free.
+        if port == "quat" {
+            return Ok((0..4)
+                .map(|axis| {
+                    self.bind(
+                        format!("xquat[{}]", row * 4 + axis),
+                        Source::Xquat { row, axis },
+                    )
+                })
+                .collect());
+        }
         Ok((0..3)
             .map(|axis| {
                 self.bind(
@@ -401,6 +464,35 @@ impl Ctx<'_> {
         self.bindings.insert(name.clone(), source);
         Expr::Port(name)
     }
+}
+
+/// `Normalize`'s affine map of one lane, `out_lo + (x - lo) * scale`, clamped to the output
+/// range -- the association every committed cone was lowered with.
+fn affine(x: Expr, lo: f64, hi: f64, out_lo: f64, out_hi: f64) -> Result<Expr, EnvError> {
+    if (hi - lo).abs() < f64::EPSILON {
+        return Err(EnvError::Task(format!(
+            "Normalize maps the empty range [{lo}, {hi}]"
+        )));
+    }
+    let scale = (out_hi - out_lo) / (hi - lo);
+    let shifted = Expr::Arith {
+        op: ArithOp::Sub,
+        lhs: Box::new(x),
+        rhs: Box::new(Expr::Const(lo)),
+    };
+    Ok(Expr::Clamp {
+        value: Box::new(Expr::Arith {
+            op: ArithOp::Add,
+            lhs: Box::new(Expr::Const(out_lo)),
+            rhs: Box::new(Expr::Arith {
+                op: ArithOp::Mul,
+                lhs: Box::new(shifted),
+                rhs: Box::new(Expr::Const(scale)),
+            }),
+        }),
+        lo: out_lo.min(out_hi),
+        hi: out_lo.max(out_hi),
+    })
 }
 
 /// `Arith` lane by lane, with a one-lane operand broadcast over the other side.
@@ -510,7 +602,10 @@ mod tests {
                         Source::Qpos(6) => x,
                         Source::Qpos(_) => grip,
                         Source::Qvel(_) => vx,
-                        Source::Sensor(_) | Source::Time { .. } | Source::Xpos { .. } => 0.0,
+                        Source::Sensor(_)
+                        | Source::Time { .. }
+                        | Source::Xpos { .. }
+                        | Source::Xquat { .. } => 0.0,
                     },
                 );
             }
@@ -755,15 +850,16 @@ Const(0.85) } }), (Failure, Compare { op: Gt, lhs: Port(\"qpos[6]\"), rhs: Const
             "the refusal must name the node and the width: {text}"
         );
 
-        // The orientation, another frame, an L1 norm and a body the model does not index are
-        // all refused the same way -- by name.
+        // An orientation subtracted from a position, another frame, an L1 norm and a body the
+        // model does not index are all refused the same way -- by name. The orientation is
+        // four lanes since packet M16/H2, so the refusal names the widths.
         for (patch, wanted) in [
             (
                 Box::new(|t: &mut TaskIr| {
                     t.graph.edges.retain(|e| e.from.node != NodeId(0));
                     t.graph.connect(NodeId(0), "quat", NodeId(2), "a");
                 }) as Box<dyn Fn(&mut TaskIr)>,
-                "quat",
+                "4 lanes and 3 lanes",
             ),
             (
                 Box::new(|t: &mut TaskIr| {
@@ -826,5 +922,146 @@ Const(0.85) } }), (Failure, Compare { op: Gt, lhs: Port(\"qpos[6]\"), rhs: Const
             plan.bindings
         );
         println!("RAN body_norm_cone_lowers_and_the_demo_task_is_unmoved");
+    }
+
+    /// Packet M16/H2: `|q_a . q_b|` from two `GetBodyPose.quat`s (`Dot`, `MathFn { Abs }`),
+    /// `sqrt` of it, and a position offset from a constant by a per-lane `Normalize` -- each
+    /// evaluated through the `Expr` the env runs, against the same numbers computed by hand.
+    // Exact association is the property under test: these comparisons are deliberate.
+    #[allow(clippy::float_cmp)]
+    #[test]
+    fn quaternion_dot_abs_sqrt_and_per_lane_normalize_lower() {
+        use es_ir::task::{CmpOp, NormKind, TerminationKind};
+        use es_ir::types::Unit;
+
+        let scene = crate::env::tests::fake_scene();
+        let model = crate::env::tests::fake_model();
+        let pose = |name: &str| TaskNode::GetBodyPose {
+            body: body_id(&scene, name),
+            relative_to: es_ir::types::Frame::World,
+        };
+        let q1 = vec_ty(1, Unit::Quaternion);
+        let p_ref = [0.25, -0.5, 0.125];
+        let mut task = crate::env::tests::task_with(&[
+            pose("link"),
+            pose("target"),
+            TaskNode::Dot {
+                ty: vec_ty(4, Unit::Quaternion),
+            },
+            TaskNode::MathFn {
+                func: MathFunc::Abs,
+                approx: false,
+                ty: q1.clone(),
+            },
+            TaskNode::Compare {
+                op: CmpOp::Ge,
+                rhs: Some(0.9),
+                ty: q1.clone(),
+            },
+            TaskNode::Terminate {
+                kind: TerminationKind::Success,
+            },
+            TaskNode::MathFn {
+                func: MathFunc::Sqrt,
+                approx: false,
+                ty: q1.clone(),
+            },
+            TaskNode::Reward {
+                name: "root".to_owned(),
+                weight: 1.0,
+                aggregation: Aggregation::Sum,
+                ty: q1,
+            },
+            TaskNode::Normalize {
+                lo: p_ref.iter().map(|p| p - 1.0).collect(),
+                hi: p_ref.iter().map(|p| p + 1.0).collect(),
+                out_lo: -1.0,
+                out_hi: 1.0,
+                ty: vec_ty(3, Unit::Length),
+            },
+            TaskNode::Norm {
+                kind: NormKind::L2,
+                ty: vec_ty(3, Unit::Normalized { lo: -1.0, hi: 1.0 }),
+            },
+            TaskNode::Reward {
+                name: "offset".to_owned(),
+                weight: -1.0,
+                aggregation: Aggregation::Sum,
+                ty: vec_ty(1, Unit::Normalized { lo: -1.0, hi: 1.0 }),
+            },
+        ]);
+        let n = NodeId;
+        for (from, fp, to, tp) in [
+            (0, "quat", 2, "a"),
+            (1, "quat", 2, "b"),
+            (2, "value", 3, "value"),
+            (3, "value", 4, "a"),
+            (4, "value", 5, "value"),
+            (3, "value", 6, "value"),
+            (6, "value", 7, "value"),
+            (0, "pos", 8, "value"),
+            (8, "value", 9, "value"),
+            (9, "value", 10, "value"),
+        ] {
+            task.graph.connect(n(from), fp, n(to), tp);
+        }
+        let plan = ScalarPlan::compile(&task, &scene, &model).expect("the cones lower");
+        // `link` is body row 1 and `target` row 2: `xquat[4..8]` and `xquat[8..12]`.
+        assert_eq!(plan.bindings["xquat[4]"], Source::Xquat { row: 1, axis: 0 });
+        assert_eq!(
+            plan.bindings["xquat[11]"],
+            Source::Xquat { row: 2, axis: 3 }
+        );
+
+        // Two unit quaternions (x y z w) whose dot product is negative: `Abs` makes the
+        // double cover one orientation.
+        let (a, b) = (
+            [0.1, -0.2, 0.3, 0.927_361_849_549_570_3],
+            [-0.3, 0.1, -0.2, -0.9],
+        );
+        let pos = [0.5, -0.25, 0.375];
+        let mut ports = BTreeMap::new();
+        for (i, (qa, qb)) in a.iter().zip(&b).enumerate() {
+            ports.insert(format!("xquat[{}]", 4 + i), *qa);
+            ports.insert(format!("xquat[{}]", 8 + i), *qb);
+        }
+        for (i, p) in pos.iter().enumerate() {
+            ports.insert(format!("xpos[{}]", 3 + i), *p);
+        }
+        let dot = ((a[0] * b[0] + a[1] * b[1]) + a[2] * b[2]) + a[3] * b[3];
+        assert!(dot < 0.0);
+        let root = plan.rewards[0].expr.eval(&ports).expect("evaluates");
+        assert_eq!(root, dot.abs().sqrt(), "sqrt(|q_a . q_b|)");
+        let success = &plan.terminations[0].1;
+        assert_eq!(
+            success.eval(&ports),
+            Some(1.0),
+            "|dot| = {} >= 0.9",
+            dot.abs()
+        );
+
+        let offset = plan.rewards[1].expr.eval(&ports).expect("evaluates");
+        let d: Vec<f64> = (0..3)
+            .map(|i| -1.0 + (pos[i] - (p_ref[i] - 1.0)) * 1.0)
+            .collect();
+        assert_eq!(offset, ((d[0] * d[0] + d[1] * d[1]) + d[2] * d[2]).sqrt());
+        // pos - p_ref = (0.25, 0.25, 0.25): the offset from the constant, not from the origin.
+        assert!((offset - 0.25 * 3.0_f64.sqrt()).abs() < 1e-15, "{offset}");
+
+        // A bound count that matches neither one lane nor the width is refused by name.
+        let mut short = task.clone();
+        short.graph.insert(
+            n(8),
+            TaskNode::Normalize {
+                lo: vec![0.0, 0.0],
+                hi: vec![1.0, 1.0],
+                out_lo: -1.0,
+                out_hi: 1.0,
+                ty: vec_ty(3, Unit::Length),
+            },
+        );
+        let err = ScalarPlan::compile(&short, &scene, &model).expect_err("2 bounds for 3 lanes");
+        assert!(err.to_string().contains("3 lanes with 2 lo"), "{err}");
+        println!("RAN quaternion_dot_abs_sqrt_and_per_lane_normalize_lower");
     }
 }
