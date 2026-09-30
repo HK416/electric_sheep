@@ -26,10 +26,18 @@
 #    this one (6).
 #  * last_action[20] -- the previous policy row in actuator units; `initial` is each
 #    ctrlrange's centre, which is Isaac Lab's zero raw action.
-#  * rgb_top, rgb_front, rgb_side -- 96x96 Rgb8 on the path tracer: 4 spp, 3 bounces,
-#    `seed = "tick"` (the X7 rerun's), exposure 8. At the X7 rerun's 64 the white hand
-#    saturates (3-6 % of each camera's pixels at 255); at 8 none do and the hand keeps its
-#    shading (chosen by rendering the three cameras at 64, 32, 16, 8, 4).
+#  * rgb_top, rgb_front, rgb_side -- 96x96 Rgb8 on the path tracer: 32 spp, 3 bounces, no
+#    SVGF, `seed = "tick"` (the X7 rerun's), exposure 8. EXPOSURE: at the X7 rerun's 64 the
+#    white hand saturates (3-6 % of each camera's pixels at 255); at 8 none do and the hand
+#    keeps its shading (chosen by rendering the three cameras at 64, 32, 16, 8, 4).
+#    SAMPLES (packet M16/H3, `render_quality_sweep`): the three cameras at the reset pose and
+#    three mid-episode poses, 4/8/16/32/64 spp x 2/3 bounces x SVGF off/on, against 256 spp.
+#    The rule: the cheapest setting whose cube keeps block.png's letters on every visible face
+#    and whose speckle -- pixels under half the reference's luminance -- is at most 5 % on
+#    every camera. 4 spp (H2's) left 17-37 % speckle; SVGF removes it at any spp but also the
+#    letters (single-frame SVGF smooths the textured radiance), so it fails the first clause.
+#    32 spp / 3 bounces: speckle 0.2 / 3.2 / 4.8 % (top / front / side), 89 ms per camera on
+#    an RTX 3060 shared with a PPO run (4 spp: 27 ms); 32 / 2 bounces left 7.4 % on `side`.
 #
 # REWARD (Isaac Lab's terms times 0.01, rl_games' `scale_value`), with p_ref = (1.0, 0.867,
 # 0.1772) -- where the cube rests on the palm, measured -- and d = |q_cube . q_goal|:
@@ -1900,7 +1908,7 @@ bounces = 3
 exposure = 8.0
 path = "pt"
 seed = "tick"
-spp = 4
+spp = 32
 tonemap = "reinhard"
 
 [body.observation_spec.channels.rgb_front.ty]
@@ -1961,7 +1969,7 @@ bounces = 3
 exposure = 8.0
 path = "pt"
 seed = "tick"
-spp = 4
+spp = 32
 tonemap = "reinhard"
 
 [body.observation_spec.channels.rgb_side.ty]
@@ -2022,7 +2030,7 @@ bounces = 3
 exposure = 8.0
 path = "pt"
 seed = "tick"
-spp = 4
+spp = 32
 tonemap = "reinhard"
 
 [body.observation_spec.channels.rgb_top.ty]

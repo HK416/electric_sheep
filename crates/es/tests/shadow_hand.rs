@@ -520,7 +520,10 @@ fn task() -> TaskIr {
 
     // --- the three cameras -------------------------------------------------------------------
     let render = SensorRender {
-        path: SensorPath::Pt { spp: 4, bounces: 3 },
+        path: SensorPath::Pt {
+            spp: 32,
+            bounces: 3,
+        },
         exposure: EXPOSURE,
         tonemap: Tonemap::Reinhard,
         seed: SeedStream::Tick,
@@ -718,62 +721,67 @@ const STATE: [&str; 6] = [
     "last_action",
 ];
 
-/// Per-element `(mean, std)` bringing each channel to about `[-1, 1]` with static ranges.
-fn state_stats(task: &TaskIr) -> (Vec<f64>, Vec<f64>) {
-    let (scene, _) = scene();
-    let mut mean = Vec::new();
-    let mut std = Vec::new();
-    let mut push = |m: f64, s: f64| {
-        mean.push(m);
-        std.push(s);
-    };
-    for name in HAND {
-        let (lo, hi) = joint(&scene, name).range.expect("limited");
-        push(f64::midpoint(lo, hi), (hi - lo) / 2.0);
+/// Per-element `(mean, std)` bringing channel `name` to about `[-1, 1]` with static ranges.
+fn channel_stats(scene: &SceneDesc, name: &str) -> Vec<(f64, f64)> {
+    let n = |k: usize, m: f64, s: f64| vec![(m, s); k];
+    match name {
+        "joint_pos" => HAND
+            .iter()
+            .map(|j| {
+                let (lo, hi) = joint(scene, j).range.expect("limited");
+                (f64::midpoint(lo, hi), (hi - lo) / 2.0)
+            })
+            .collect(),
+        // Isaac Lab scales joint velocities by 0.2.
+        "joint_vel" => n(24, 0.0, 5.0),
+        // The cube: +-1 at the drop radius; the quaternion is already in [-1, 1].
+        "cube_pose" => P_REF
+            .iter()
+            .map(|p| (*p, FALL_M))
+            .chain(n(4, 0.0, 1.0))
+            .collect(),
+        // Linear m/s as is, angular rad/s by 0.2 as Isaac Lab does.
+        "object_vel" => [n(3, 0.0, 1.0), n(3, 0.0, 5.0)].concat(),
+        // The goal cube floats where the scene puts it; its position is a constant.
+        "goal_pose" => {
+            let target = scene
+                .bodies
+                .iter()
+                .find(|b| b.name == "target")
+                .expect("target");
+            let p = target.pose.position;
+            [p.x, p.y, p.z]
+                .iter()
+                .map(|v| (*v, 1.0))
+                .chain(n(4, 0.0, 1.0))
+                .collect()
+        }
+        "last_action" => ctrlrange(scene)
+            .iter()
+            .map(|(lo, hi)| (f64::midpoint(*lo, *hi), (hi - lo) / 2.0))
+            .collect(),
+        other => panic!("no statistics for {other}"),
     }
-    // Isaac Lab scales joint velocities by 0.2.
-    (0..24).for_each(|_| push(0.0, 5.0));
-    // The cube: +-1 at the drop radius; the quaternion (x y z w) is already in [-1, 1].
-    for p in P_REF {
-        push(p, FALL_M);
-    }
-    (0..4).for_each(|_| push(0.0, 1.0));
-    // Linear m/s as is, angular rad/s by 0.2 as Isaac Lab does.
-    (0..3).for_each(|_| push(0.0, 1.0));
-    (0..3).for_each(|_| push(0.0, 5.0));
-    // The goal cube floats where the scene puts it; its position is a constant.
-    let target = scene
-        .bodies
-        .iter()
-        .find(|b| b.name == "target")
-        .expect("target");
-    let p = target.pose.position;
-    for v in [p.x, p.y, p.z] {
-        push(v, 1.0);
-    }
-    (0..4).for_each(|_| push(0.0, 1.0));
-    for (lo, hi) in ctrlrange(&scene) {
-        push(f64::midpoint(lo, hi), (hi - lo) / 2.0);
-    }
-    let width: u64 = STATE
-        .iter()
-        .map(|n| task.observation_spec.channels[*n].ty.shape.dims()[0])
-        .sum();
-    assert_eq!(mean.len() as u64, width);
-    (mean, std)
 }
 
-fn state_width(task: &TaskIr) -> u64 {
-    STATE
+fn state_width(task: &TaskIr, names: &[&str]) -> u64 {
+    names
         .iter()
         .map(|n| task.observation_spec.channels[*n].ty.shape.dims()[0])
         .sum()
 }
 
-fn observation(task: &TaskIr) -> ObservationIr {
-    let mut ir = ObservationIr::new(1, task.task_hash().expect("hash"));
+/// `names`' channels as `StateInput`s from node `base` on, one `Concat` and one
+/// `Normalize { MeanStd }` after them; returns the normalized port and its type.
+fn add_state(
+    ir: &mut ObservationIr,
+    task: &TaskIr,
+    names: &[&str],
+    base: u32,
+) -> (PortRef, PortType) {
+    let (scene, _) = scene();
     let mut parts = Vec::new();
-    for (i, name) in STATE.iter().enumerate() {
+    for (i, name) in names.iter().enumerate() {
         let ch = &task.observation_spec.channels[*name];
         let source = match ch.source {
             ObsSource::JointState { body, .. } | ObsSource::BodyPose(body) => body,
@@ -781,7 +789,7 @@ fn observation(task: &TaskIr) -> ObservationIr {
             ref other => panic!("{other:?}"),
         };
         ir.graph.insert(
-            NodeId(i as u32),
+            NodeId(base + i as u32),
             ObservationNode::StateInput {
                 source,
                 io: Io::source(ch.ty.clone()),
@@ -789,12 +797,13 @@ fn observation(task: &TaskIr) -> ObservationIr {
         );
         parts.push(ch.ty.clone());
     }
-    let wide = ty(state_width(task), Unit::Dimensionless, Frame::World);
+    let wide = ty(state_width(task, names), Unit::Dimensionless, Frame::World);
     let normalized = PortType {
         unit: Unit::Normalized { lo: -1.0, hi: 1.0 },
         ..wide.clone()
     };
-    let (cat, norm) = (NodeId(STATE.len() as u32), NodeId(STATE.len() as u32 + 1));
+    let k = names.len() as u32;
+    let (cat, norm) = (NodeId(base + k), NodeId(base + k + 1));
     ir.graph.insert(
         cat,
         ObservationNode::Concat {
@@ -803,7 +812,9 @@ fn observation(task: &TaskIr) -> ObservationIr {
             io: Io::new(parts, wide.clone()),
         },
     );
-    let (mean, std) = state_stats(task);
+    let (mean, std): (Vec<f64>, Vec<f64>) =
+        names.iter().flat_map(|n| channel_stats(&scene, n)).unzip();
+    assert_eq!(mean.len() as u64, state_width(task, names));
     ir.graph.insert(
         norm,
         ObservationNode::Normalize {
@@ -811,12 +822,18 @@ fn observation(task: &TaskIr) -> ObservationIr {
             io: Io::unary(wide, normalized.clone()),
         },
     );
-    for i in 0..STATE.len() {
+    for i in 0..k {
         ir.graph
-            .connect(NodeId(i as u32), "out", cat, &format!("in{i}"));
+            .connect(NodeId(base + i), "out", cat, &format!("in{i}"));
     }
     ir.graph.connect(cat, "out", norm, "in0");
-    ir.graph.outputs.push(PortRef::new(norm, "out"));
+    (PortRef::new(norm, "out"), normalized)
+}
+
+fn observation(task: &TaskIr) -> ObservationIr {
+    let mut ir = ObservationIr::new(1, task.task_hash().expect("hash"));
+    let (port, normalized) = add_state(&mut ir, task, &STATE, 0);
+    ir.graph.outputs.push(port.clone());
     ir.temporal.window = Some(TemporalWindow {
         n_steps: 1,
         stride: 1,
@@ -825,7 +842,7 @@ fn observation(task: &TaskIr) -> ObservationIr {
     ir.outputs = BTreeMap::from([(
         "state".to_owned(),
         ObservationOutput {
-            port: PortRef::new(norm, "out"),
+            port,
             ty: normalized,
         },
     )]);
@@ -841,7 +858,7 @@ fn learning(task: &TaskIr) -> LearningGraph {
     let signed = Unit::Normalized { lo: -1.0, hi: 1.0 };
     let state = Port::new(
         "state",
-        ty(state_width(task), signed.clone(), Frame::Policy),
+        ty(state_width(task, &STATE), signed.clone(), Frame::Policy),
     );
     let chunk = PortType {
         shape: Shape::new([1, 20]),
@@ -1020,6 +1037,291 @@ fn evaluation(task: &TaskIr, obs: &ObservationIr) -> EvaluationIr {
     ev
 }
 
+// --- the student (packet M16/H3) ----------------------------------------------------------------
+
+/// The student's state: the hand's joints and the goal. Never the cube: its pose is what the
+/// cameras are for.
+const STUDENT_STATE: [&str; 2] = ["joint_pos", "goal_pose"];
+/// Plan N's three views onto this scene's three cameras: `observation-views.toml`'s chains and
+/// `learning-views.toml`'s encoders, in that order.
+const VIEWS: [(&str, &str); 3] = [
+    ("rgb_overhead", "rgb_top"),
+    ("rgb_wrist", "rgb_front"),
+    ("rgb_side", "rgb_side"),
+];
+/// The student's chunk: 16 rows predicted (0.27 s at 60 Hz), 6 executed, so it replans at
+/// 10 Hz with a temporal ensemble over the overlapping rows.
+const CHUNK: u32 = 16;
+const EXECUTE: u32 = 6;
+/// The held-out seeds every Shadow Hand policy is judged on from packet M16/H3: 64, the
+/// teacher's 16 (301-316) first, so the two documents' shared episodes are the same episodes.
+const SEEDS_64: std::ops::RangeInclusive<u64> = 301..=364;
+
+fn vl(name: &str) -> PathBuf {
+    repo().join("tests/fixtures/visible-learning").join(name)
+}
+
+/// `value` through its serialized form with every string and map key in `names` renamed and,
+/// with `image = Some((fx, hz))`, every `fx` / `fy` set to `fx` and every `rate_hz` to `hz`.
+/// A camera appears in a node, a port type's frame, its time reference and its image spec;
+/// the serialized form catches every one without naming each (`crates/es/tests/views.rs`'s
+/// `retarget`, with a map).
+fn rewrite<T: serde::Serialize + serde::de::DeserializeOwned>(
+    value: &T,
+    names: &BTreeMap<String, String>,
+    image: Option<(f64, f64)>,
+) -> T {
+    fn walk(
+        v: &mut serde_json::Value,
+        names: &BTreeMap<String, String>,
+        image: Option<(f64, f64)>,
+    ) {
+        match v {
+            serde_json::Value::String(s) => {
+                if let Some(to) = names.get(s.as_str()) {
+                    to.clone_into(s);
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item, names, image);
+                }
+            }
+            serde_json::Value::Object(map) => {
+                for (key, mut item) in std::mem::take(map) {
+                    match (key.as_str(), image) {
+                        ("fx" | "fy", Some((fx, _))) => item = serde_json::json!(fx),
+                        ("rate_hz", Some((_, hz))) => item = serde_json::json!(hz),
+                        _ => walk(&mut item, names, image),
+                    }
+                    map.insert(names.get(&key).cloned().unwrap_or(key), item);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut v = serde_json::to_value(value).expect("serializes");
+    walk(&mut v, names, image);
+    serde_json::from_value(v).expect("deserializes")
+}
+
+/// `ir` without output `name` and the nodes that exist only to produce it (views.rs's).
+fn drop_output(ir: &mut ObservationIr, name: &str) {
+    let out = ir.outputs.remove(name).expect("the output");
+    let mut gone = vec![out.port.node];
+    while let Some(e) = ir
+        .graph
+        .edges
+        .iter()
+        .find(|e| gone.contains(&e.to.node) && !gone.contains(&e.from.node))
+    {
+        gone.push(e.from.node);
+    }
+    ir.graph
+        .edges
+        .retain(|e| !gone.contains(&e.from.node) && !gone.contains(&e.to.node));
+    for id in &gone {
+        ir.graph.nodes.remove(id);
+    }
+}
+
+fn id_string(id: StableId) -> String {
+    serde_json::to_value(id)
+        .expect("id")
+        .as_str()
+        .expect("an id serializes as a string")
+        .to_owned()
+}
+
+/// observation-views.toml's three image chains on this scene's cameras, and the state of
+/// [`STUDENT_STATE`] in place of `joint_state`.
+fn observation_student(task: &TaskIr) -> ObservationIr {
+    let views = es_ir::serial::observation_from_toml(&read(&vl("observation-views.toml")))
+        .expect("observation-views.toml");
+    let mut names = BTreeMap::new();
+    let mut fx = None;
+    for (from, to) in VIEWS {
+        let Frame::Camera(old) = views.outputs[from].ty.frame else {
+            panic!("{from} is not a camera port")
+        };
+        let ch = &task.observation_spec.channels[to];
+        let ObsSource::Sensor { id, .. } = ch.source else {
+            panic!("{to} is not a sensor")
+        };
+        names.insert(id_string(old), id_string(id));
+        names.insert(from.to_owned(), to.to_owned());
+        let f = ch.ty.image.as_ref().expect("image").intrinsics.fx;
+        assert!(
+            fx.is_none_or(|x| x == f),
+            "the three cameras share one fovy"
+        );
+        fx = Some(f);
+    }
+    let hz = task.config.control_rate_hz.into();
+    let mut obs = rewrite(&views, &names, Some((fx.expect("three cameras"), hz)));
+    drop_output(&mut obs, "joint_state");
+    obs.task_ref = task.task_hash().expect("hash");
+    let base = obs.graph.nodes.keys().map(|n| n.0).max().expect("nodes") + 1;
+    let (port, ty) = add_state(&mut obs, task, &STUDENT_STATE, base);
+    obs.outputs
+        .insert("state".to_owned(), ObservationOutput { port, ty });
+    let diags = obs.validate();
+    assert!(diags.is_empty(), "{diags:#?}");
+    obs
+}
+
+/// learning-views.toml on this task: the views and the state renamed, the state 31 wide, a
+/// 20-wide action chunked 16 / 6 at 10 Hz, and the teacher's unnormalizer after the chunker.
+fn learning_student(task: &TaskIr) -> LearningGraph {
+    let (scene, _) = scene();
+    let views = es_ir::serial::learning_from_toml(&read(&vl("learning-views.toml")))
+        .expect("learning-views.toml");
+    let names: BTreeMap<String, String> = VIEWS
+        .iter()
+        .chain(&[("joint_state", "state")])
+        .map(|(a, b)| ((*a).to_owned(), (*b).to_owned()))
+        .collect();
+    let mut g = rewrite(&views, &names, None);
+    let width = Shape::new([state_width(task, &STUDENT_STATE)]);
+    let chunk = Shape::new([u64::from(CHUNK), 20]);
+    let fused = |p: &str| {
+        match p {
+            "image" => "top",
+            "wrist" => "front",
+            other => other,
+        }
+        .to_owned()
+    };
+    let mut fusion = None;
+    let mut chunker = None;
+    for (id, node) in &mut g.nodes.nodes {
+        match node {
+            LearningNode::StateEncoder { inputs, .. } => inputs[0].ty.shape = width.clone(),
+            LearningNode::Fusion { inputs, .. } => {
+                fusion = Some(*id);
+                for p in inputs {
+                    p.name = fused(&p.name);
+                }
+            }
+            LearningNode::PolicyHead {
+                action_dim,
+                horizon,
+                ..
+            } => (*action_dim, *horizon) = (20, CHUNK),
+            LearningNode::ActionChunker {
+                inputs,
+                horizon,
+                execute_chunk,
+                replan_hz,
+                ..
+            } => {
+                chunker = Some(*id);
+                inputs[0].ty.shape = chunk.clone();
+                (*horizon, *execute_chunk) = (CHUNK, EXECUTE);
+                *replan_hz = (CONTROL_HZ / u64::from(EXECUTE)) as f32;
+            }
+            _ => {}
+        }
+    }
+    let (fusion, chunker) = (fusion.expect("a fusion"), chunker.expect("a chunker"));
+    for e in &mut g.nodes.edges {
+        if e.to.node == fusion {
+            e.to.port = fused(&e.to.port);
+        }
+    }
+    for p in &mut g.inputs {
+        if p.name == "state" {
+            p.ty.shape = width.clone();
+        }
+    }
+    let contract = &mut g.policy.contract;
+    contract.inputs.get_mut("state").expect("state").ty.shape = width;
+    (
+        contract.action_dim,
+        contract.horizon,
+        contract.execute_chunk,
+    ) = (20, CHUNK, EXECUTE);
+    contract.replanning_hz = (CONTROL_HZ / u64::from(EXECUTE)) as f32;
+
+    // The teacher's unnormalizer: the head works in about [-1, 1], the chunk leaves in radians.
+    let executed = PortType {
+        shape: Shape::new([u64::from(EXECUTE), 20]),
+        ..g.outputs[0].ty.clone()
+    };
+    let norm = NodeId(g.nodes.nodes.keys().map(|n| n.0).max().expect("nodes") + 1);
+    let range = ctrlrange(&scene);
+    g.nodes.insert(
+        norm,
+        LearningNode::Normalizer {
+            inputs: vec![Port::new("actions", executed.clone())],
+            direction: NormalizeDir::Inverse,
+            stats: StatsSource::MeanStd {
+                mean: range.iter().map(|(lo, hi)| (lo + hi) / 2.0).collect(),
+                std: range.iter().map(|(lo, hi)| (hi - lo) / 2.0).collect(),
+            },
+            out_unit: Unit::Angle,
+        },
+    );
+    g.nodes.connect(chunker, "actions", norm, "actions");
+    g.nodes.outputs = vec![PortRef::new(norm, "out")];
+    g.outputs = vec![Port::new(
+        "actions",
+        PortType {
+            unit: Unit::Angle,
+            ..executed
+        },
+    )];
+    let diags = g.validate();
+    assert!(diags.is_empty(), "{diags:#?}");
+    g
+}
+
+/// deployment-hand.toml executing the student's chunks: 16 / 6 under a temporal ensemble,
+/// asked for a chunk every 6 control ticks.
+fn deployment_student() -> DeploymentIr {
+    let (scene, _) = scene();
+    let mut dep = deployment();
+    dep.action.horizon = CHUNK as usize;
+    dep.action.execute_chunk = EXECUTE as usize;
+    dep.execution = es_ir::deployment::ExecutionMode::TemporalEnsemble { decay: 0.01 };
+    let c = control_rate(&scene);
+    dep.rate.inference =
+        TickRate::rational(c.num(), c.den() * u64::from(EXECUTE)).expect("non-zero");
+    let diags = dep.validate();
+    assert!(diags.is_empty(), "{diags:#?}");
+    dep
+}
+
+/// evaluation-teacher.toml on [`SEEDS_64`].
+fn evaluation_64(task: &TaskIr, obs: &ObservationIr) -> EvaluationIr {
+    let mut ev = evaluation(task, obs);
+    ev.episodes = EpisodeBatch {
+        n_episodes: 64,
+        seeds: SeedPlan::Explicit(SEEDS_64.collect()),
+    };
+    let diags = ev.validate();
+    assert!(diags.is_empty(), "{diags:#?}");
+    ev
+}
+
+/// [`evaluation_64`] for the student with evaluation-augmented.toml's six suites, the
+/// observation delay moved onto 60 Hz ticks.
+fn evaluation_student(task: &TaskIr, obs: &ObservationIr) -> EvaluationIr {
+    use es_ir::evaluation::PerturbationKind;
+    let mut ev = evaluation_64(task, obs);
+    let so101 = es_ir::serial::evaluation_from_toml(&read(&vl("evaluation-augmented.toml")))
+        .expect("evaluation-augmented.toml");
+    ev.suites = so101.suites;
+    for p in ev.suites.iter_mut().flat_map(|s| &mut s.perturbations) {
+        if let PerturbationKind::ObservationDelay { ms } = &mut p.kind {
+            *ms = vec![17, 34];
+        }
+    }
+    let diags = ev.validate();
+    assert!(diags.is_empty(), "{diags:#?}");
+    ev
+}
+
 // --- the generator ------------------------------------------------------------------------------
 
 const GENERATED: &str = "`ES_GENERATE_GOLDENS=1 cargo test -p es --test shadow_hand -- --ignored \
@@ -1054,10 +1356,18 @@ const TASK_HEADER: &str = "\
 #    this one (6).
 #  * last_action[20] -- the previous policy row in actuator units; `initial` is each
 #    ctrlrange's centre, which is Isaac Lab's zero raw action.
-#  * rgb_top, rgb_front, rgb_side -- 96x96 Rgb8 on the path tracer: 4 spp, 3 bounces,
-#    `seed = \"tick\"` (the X7 rerun's), exposure 8. At the X7 rerun's 64 the white hand
-#    saturates (3-6 % of each camera's pixels at 255); at 8 none do and the hand keeps its
-#    shading (chosen by rendering the three cameras at 64, 32, 16, 8, 4).
+#  * rgb_top, rgb_front, rgb_side -- 96x96 Rgb8 on the path tracer: 32 spp, 3 bounces, no
+#    SVGF, `seed = \"tick\"` (the X7 rerun's), exposure 8. EXPOSURE: at the X7 rerun's 64 the
+#    white hand saturates (3-6 % of each camera's pixels at 255); at 8 none do and the hand
+#    keeps its shading (chosen by rendering the three cameras at 64, 32, 16, 8, 4).
+#    SAMPLES (packet M16/H3, `render_quality_sweep`): the three cameras at the reset pose and
+#    three mid-episode poses, 4/8/16/32/64 spp x 2/3 bounces x SVGF off/on, against 256 spp.
+#    The rule: the cheapest setting whose cube keeps block.png's letters on every visible face
+#    and whose speckle -- pixels under half the reference's luminance -- is at most 5 % on
+#    every camera. 4 spp (H2's) left 17-37 % speckle; SVGF removes it at any spp but also the
+#    letters (single-frame SVGF smooths the textured radiance), so it fails the first clause.
+#    32 spp / 3 bounces: speckle 0.2 / 3.2 / 4.8 % (top / front / side), 89 ms per camera on
+#    an RTX 3060 shared with a PPO run (4 spp: 27 ms); 32 / 2 bounces left 7.4 % on `side`.
 #
 # REWARD (Isaac Lab's terms times 0.01, rl_games' `scale_value`), with p_ref = (1.0, 0.867,
 # 0.1772) -- where the cube rests on the palm, measured -- and d = |q_cube . q_goal|:
@@ -1168,6 +1478,106 @@ const EVALUATION_HEADER: &str = "\
 # E1's stop rule before the run.
 ";
 
+const EVALUATION_64_HEADER: &str = "\
+# Evaluation IR (spec 10) for the Shadow Hand teacher on 64 held-out seeds -- plan H, packet
+# M16/H3.
+#
+# Generated by GENERATED;
+# evaluation-teacher.toml with 64 episodes on seeds 301-364 in place of 16 on 301-316 (its first
+# 16 are those), so a checkpoint comparison is not 16-episode noise: one episode is 1.6 points
+# of success rate here, 6.25 there. Everything else -- `task`, `observation`, the nominal suite,
+# the metrics, the placeholder acceptance -- is evaluation-teacher.toml's. evaluation-student.toml
+# uses the same seeds, so teacher and student are judged on the same episodes.
+";
+
+const OBSERVATION_STUDENT_HEADER: &str = "\
+# Observation IR (spec 7) for the Shadow Hand student -- plan H, packet M16/H3. Three cameras
+# and the hand's own state; NO cube pose.
+#
+# Generated by GENERATED
+# from ../visible-learning/observation-views.toml (plan N's three-view arm, M7/U3's chain per
+# camera) and task-repose.toml:
+#  * the three image chains, byte for byte plan N's -- ImageInput (U8 HWC) -> Dequantize ->
+#    Normalize{0..1} -> Pad{4} -> Crop{Random 96x96} -> Augment{ColorJitter 0.2 / 0.2,
+#    training only} -- with the cameras moved onto this scene's: rgb_overhead -> rgb_top,
+#    rgb_wrist -> rgb_front, rgb_side -> rgb_side (sensor, frame and time reference), fx = fy
+#    from this scene's fovy 45 deg (all three), and rate_hz 50 -> 60 (the control rate).
+#    observation-augmented.toml's header says what the chain does in training and evaluation.
+#  * `joint_state` replaced by `state` (31): joint_pos[24] || goal_pose[7] -> Concat ->
+#    Normalize{MeanStd} with observation-teacher.toml's statistics for those two channels.
+#    The goal is the task's input (which way to turn the cube), not privileged: a real hand
+#    is told its goal. What the teacher also read and the student does not: joint_vel,
+#    cube_pose (SIMULATOR-PRIVILEGED), object_vel and last_action.
+# goal_pose is the goal cube's free-joint pose; a recorded row carries qpos, so the bake and
+# the evaluator read it from the free joint's qpos range with the loaded model
+# (es_eval::runner::input_sources).
+";
+
+const LEARNING_STUDENT_HEADER: &str = "\
+# Learning IR (spec 8) for the Shadow Hand student -- plan H, packet M16/H3.
+#
+# Generated by GENERATED
+# from ../visible-learning/learning-views.toml (plan N's three-view ACT-shaped graph):
+#
+#   rgb_top   -> VisionEncoder{ResNet18, ImageNet} 0 -.
+#   rgb_front -> VisionEncoder{ResNet18, ImageNet} 6 -+
+#   rgb_side  -> VisionEncoder{ResNet18, ImageNet} 7 -+- Fusion{Concat 4x512 -> 512} 2
+#   state     -> StateEncoder{Mlp[256]} 1            -'   -> TemporalEncoder -> PolicyHead
+#                                                         -> ActionChunker -> Normalizer{Inverse}
+#
+# What differs from learning-views.toml: the inputs renamed (rgb_top / rgb_front / rgb_side,
+# `state` 31 wide) and the fusion's ports with them (top, state, front, side); action_dim 20;
+# the unnormalizer learning-teacher.toml ends with (mean = each ctrlrange's centre, std = its
+# half-range), so the head works in about [-1, 1] and the chunk leaves in radians -- the hand's
+# servos span 0.4-1.6 rad where SO-101's six were alike.
+#
+# WHY CONCAT, NOT learning-mad.toml's shared encoder + Sum: MAD's gain is deploying on fewer
+# cameras without retraining, and this student is deployed with the three it is trained on.
+# On plan N's E1/E2 (NV-verification.md) the Concat graph scored best -- 7/16 nominal and
+# 21/96 on one seed -- and MAD with three cameras 4/16 and 12/96, inside the seed spread
+# but not above it; three encoders also let each camera's features differ (the three views
+# here are all world-fixed but see different faces). The MAD graph stays one derivation away.
+#
+# WHY 16 / 6 AT 10 Hz: plan N kept SO-101's 16 / 10 at 50 Hz, replanning every 200 ms. The
+# hand's contacts change within a few ticks and its teacher acts every tick, so the student
+# replans every 6 ticks (100 ms, 10 Hz: an integer relation to 60 Hz, XIR-023) and keeps a
+# 16-row chunk (267 ms) for the temporal ensemble to average over, as ACT does. Three
+# ResNet18s at batch 1 fit the 100 ms between inferences (plan N declared 15 ms expected,
+# 40 ms deadline; kept).
+";
+
+const DEPLOYMENT_STUDENT_HEADER: &str = "\
+# Deployment IR + Safety Plane (spec 9) for the Shadow Hand student -- plan H, packet M16/H3.
+#
+# Generated by GENERATED
+# from deployment-hand.toml (the teacher's): the same envelope, watchdogs, fallback and control
+# rate, with the student's chunk execution -- action horizon 16, execute_chunk 6, a temporal
+# ensemble (decay 0.01, ../visible-learning/deployment.toml's) and rate.inference = the control
+# rate / 6 (500000000 / 49999998 Hz, 10.0000004 Hz: a chunk every six control ticks, exactly).
+# deployment-hand.toml's header argues every envelope number, and they are still for the
+# owner's review.
+";
+
+const EVALUATION_STUDENT_HEADER: &str = "\
+# Evaluation IR (spec 10) for the Shadow Hand student -- plan H, packet M16/H3.
+#
+# Generated by GENERATED;
+# `task` and `observation` are task-repose.toml's and observation-student.toml's hashes; 64
+# held-out seeds 301-364 (evaluation-teacher-64.toml's, so the teacher and the student play the
+# same episodes; the student's collection draws from 1001 on). Metrics as the teacher's.
+# The suites are ../visible-learning/evaluation-augmented.toml's six (the SO-101 student's), each
+# on its own stream:
+#   nominal; light_intensity 0.5-1.5 and light_direction +-45 deg (the three cameras render
+#   under them, so the collection and this evaluation need frames); observation_delay 17 or
+#   34 ms -- one or two 60 Hz ticks (SO-101's 20 / 40 ms were one or two 50 Hz ticks; the
+#   runner floors ms to ticks); torque_noise 5 %; backlash 0-0.01 rad.
+# None is left out: every one is a property of the cameras or of the actuators, and none
+# assumes a moving base.
+# ACCEPTANCE IS A PLACEHOLDER (success_rate >= 0.5 on nominal): the orchestrator sets it from
+# the teacher's own score on evaluation-teacher-64.toml -- the student imitates the teacher's
+# successes and is not expected to pass it.
+";
+
 /// Every generated document as `(file, header, body)`.
 fn documents() -> Vec<(&'static str, String, String)> {
     use es_ir::serial::{
@@ -1175,6 +1585,7 @@ fn documents() -> Vec<(&'static str, String, String)> {
     };
     let task = task();
     let obs = observation(&task);
+    let student = observation_student(&task);
     let header = |h: &str| h.replace("GENERATED", GENERATED);
     vec![
         (
@@ -1202,10 +1613,35 @@ fn documents() -> Vec<(&'static str, String, String)> {
             header(EVALUATION_HEADER),
             evaluation_to_toml(&evaluation(&task, &obs)).expect("toml"),
         ),
+        (
+            "evaluation-teacher-64.toml",
+            header(EVALUATION_64_HEADER),
+            evaluation_to_toml(&evaluation_64(&task, &obs)).expect("toml"),
+        ),
+        (
+            "observation-student.toml",
+            header(OBSERVATION_STUDENT_HEADER),
+            observation_to_toml(&student).expect("toml"),
+        ),
+        (
+            "learning-student.toml",
+            header(LEARNING_STUDENT_HEADER),
+            learning_to_toml(&learning_student(&task)).expect("toml"),
+        ),
+        (
+            "deployment-student.toml",
+            header(DEPLOYMENT_STUDENT_HEADER),
+            deployment_to_toml(&deployment_student()).expect("toml"),
+        ),
+        (
+            "evaluation-student.toml",
+            header(EVALUATION_STUDENT_HEADER),
+            evaluation_to_toml(&evaluation_student(&task, &student)).expect("toml"),
+        ),
     ]
 }
 
-/// Writes the five IR documents. Run explicitly:
+/// Writes every IR document of `documents`. Run explicitly:
 ///
 ///     ES_GENERATE_GOLDENS=1 cargo test -p es --test shadow_hand -- --ignored generate_shadow_hand_documents
 #[test]
@@ -1380,6 +1816,190 @@ fn the_training_recipe_dry_runs() {
     assert!(text.contains("train_ppo"), "{text}");
     assert!(text.contains("mjwarp"), "{text}");
     println!("RAN the_training_recipe_dry_runs:\n{text}");
+}
+
+// --- the student (packet M16/H3) ----------------------------------------------------------------
+
+const STUDENT_DOCS: [&str; 5] = [
+    "tests/fixtures/shadow-hand/task-repose.toml",
+    "tests/fixtures/shadow-hand/observation-student.toml",
+    "tests/fixtures/shadow-hand/learning-student.toml",
+    "tests/fixtures/shadow-hand/deployment-student.toml",
+    "tests/fixtures/shadow-hand/evaluation-student.toml",
+];
+
+/// The student's documents agree across every boundary the cross-IR pass sees (and so do the
+/// teacher's under the 64-seed evaluation): three camera ports and a 31-wide state that holds
+/// no cube, a 20-wide action chunked 16 / 6, and `es ir validate` / `es ir check` accept them.
+#[test]
+fn the_student_documents_agree_and_check() {
+    let doc = |i: usize| read(&repo().join(STUDENT_DOCS[i]));
+    let task = es_ir::serial::task_from_toml(&doc(0)).expect("task");
+    let obs = es_ir::serial::observation_from_toml(&doc(1)).expect("observation");
+    let learning = es_ir::serial::learning_from_toml(&doc(2)).expect("learning");
+    let deployment = es_ir::serial::deployment_from_toml(&doc(3)).expect("deployment");
+    let evaluation = es_ir::serial::evaluation_from_toml(&doc(4)).expect("evaluation");
+    let diags = es_ir::cross::check(&es_ir::cross::IrBundle {
+        task: &task,
+        observation: &obs,
+        learning: &learning,
+        deployment: &deployment,
+        evaluation: Some(&evaluation),
+    });
+    assert!(diags.is_empty(), "cross-IR: {diags:#?}");
+    let ports: Vec<&str> = obs.outputs.keys().map(String::as_str).collect();
+    assert_eq!(ports, ["rgb_front", "rgb_side", "rgb_top", "state"]);
+    assert_eq!(obs.outputs["state"].ty.shape.dims(), [31]);
+    let read_by_state: Vec<StableId> = obs
+        .graph
+        .nodes
+        .values()
+        .filter_map(|n| match n {
+            ObservationNode::StateInput { source, .. } => Some(*source),
+            _ => None,
+        })
+        .collect();
+    let cube = body(&scene().0, "object");
+    assert!(
+        !read_by_state.contains(&cube),
+        "the student reads no cube pose"
+    );
+    assert_eq!(read_by_state.len(), 2);
+    let c = &learning.policy.contract;
+    assert_eq!((c.action_dim, c.horizon, c.execute_chunk), (20, 16, 6));
+    assert_eq!(evaluation.episodes.n_episodes, 64);
+    assert_eq!(evaluation.suites.len(), 6);
+
+    let teacher = |f: &str| read(&fixture(f));
+    let diags = es_ir::cross::check(&es_ir::cross::IrBundle {
+        task: &task,
+        observation: &es_ir::serial::observation_from_toml(&teacher("observation-teacher.toml"))
+            .expect("observation"),
+        learning: &es_ir::serial::learning_from_toml(&teacher("learning-teacher.toml"))
+            .expect("learning"),
+        deployment: &es_ir::serial::deployment_from_toml(&teacher("deployment-hand.toml"))
+            .expect("deployment"),
+        evaluation: Some(
+            &es_ir::serial::evaluation_from_toml(&teacher("evaluation-teacher-64.toml"))
+                .expect("evaluation"),
+        ),
+    });
+    assert!(
+        diags.is_empty(),
+        "cross-IR, teacher on 64 seeds: {diags:#?}"
+    );
+
+    for verb in ["validate", "check"] {
+        let (ok, text) = es(&[&["ir", verb][..], &STUDENT_DOCS].concat());
+        assert!(ok && !text.contains("ERROR"), "es ir {verb}\n{text}");
+    }
+    println!("RAN the_student_documents_agree_and_check");
+}
+
+/// `es policy init` builds the untrained student bundle, which opens and passes XIR-040
+/// against the student's Evaluation IR.
+#[test]
+fn policy_init_builds_the_student_bundle() {
+    let out = scratch("student-init").join("student.esb");
+    let out_s = out.to_string_lossy().into_owned();
+    let (ok, text) = es(&[
+        "policy",
+        "init",
+        "--task",
+        STUDENT_DOCS[0],
+        "--observation",
+        STUDENT_DOCS[1],
+        "--learning",
+        STUDENT_DOCS[2],
+        "--deployment",
+        STUDENT_DOCS[3],
+        "--out",
+        &out_s,
+    ]);
+    assert!(ok, "{text}");
+    let bundle =
+        es_compile::PolicyBundle::open(&std::fs::read(&out).expect("written")).expect("opens");
+    let evaluation =
+        es_ir::serial::evaluation_from_toml(&read(&repo().join(STUDENT_DOCS[4]))).expect("eval");
+    let errors: Vec<_> = es_ir::cross::check(&es_ir::cross::IrBundle {
+        task: &bundle.task,
+        observation: &bundle.observation,
+        learning: &bundle.learning,
+        deployment: &bundle.deployment,
+        evaluation: Some(&evaluation),
+    })
+    .into_iter()
+    .filter(es_ir::diag::Diagnostic::is_error)
+    .collect();
+    assert!(errors.is_empty(), "{errors:#?}");
+    println!("RAN policy_init_builds_the_student_bundle: {text}");
+}
+
+/// `es train --dry-run` on the student's recipe (the IR route, ACT over the baked set) and `es
+/// loop cycle --dry-run` on its cycle: collect with the teacher, keep the successes, train,
+/// evaluate.
+#[test]
+fn the_student_recipe_and_cycle_dry_run() {
+    let out = scratch("student-dry-run");
+    let out = out.to_string_lossy();
+    let (ok, text) = es(&[
+        "train",
+        "--recipe",
+        "tests/fixtures/shadow-hand/training-student.toml",
+        "--out",
+        &out,
+        "--dry-run",
+    ]);
+    assert!(ok, "{text}");
+    assert!(text.contains("train_act"), "{text}");
+    let (ok, text) = es(&[
+        "loop",
+        "cycle",
+        "--recipe",
+        "tests/fixtures/shadow-hand/cycle-student.toml",
+        "--out",
+        &out,
+        "--dry-run",
+    ]);
+    assert!(ok, "{text}");
+    for want in [
+        "--policy runs/shadow-hand/teacher.esb",
+        "--success-only",
+        "collect/successes/frames",
+        "evaluation-student.toml",
+    ] {
+        assert!(text.contains(want), "{want:?} not in\n{text}");
+    }
+    assert!(!text.contains("--expert"), "{text}");
+    println!("RAN the_student_recipe_and_cycle_dry_run:\n{text}");
+}
+
+/// The student's Observation IR bakes a recorded row with the loaded hand: `joint_pos` is the
+/// row's leading 24 and `goal_pose` the goal cube's free joint in `qpos` (a recorded row has no
+/// `xpos` / `xquat`), so `es train` can bake what the teacher collects. Needs `ES_PYTHON`
+/// (`MuJoCo`, for the model).
+#[test]
+fn the_student_state_bakes_from_a_recorded_row() {
+    use es_physics_backend::MuJoCoCpuBackend;
+    use es_physics_core::backend::{LoadConfig, PhysicsBackend};
+
+    if std::env::var_os("ES_PYTHON").is_none() {
+        println!("SKIP the_student_state_bakes_from_a_recorded_row: ES_PYTHON is not set");
+        return;
+    }
+    let task = es_ir::serial::task_from_toml(&read(&repo().join(STUDENT_DOCS[0]))).expect("task");
+    let obs = es_ir::serial::observation_from_toml(&read(&repo().join(STUDENT_DOCS[1])))
+        .expect("observation");
+    let (scene, _) = scene();
+    let mut backend = MuJoCoCpuBackend::new();
+    let model = backend
+        .load(&scene, &LoadConfig::default())
+        .expect("the hand loads");
+    es_eval::ObservationBake::new(&obs, &task, None)
+        .expect_err("goal_pose needs the model's qpos range");
+    es_eval::ObservationBake::new(&obs, &task, Some(&model))
+        .expect("the student's inputs resolve against the loaded hand");
+    println!("RAN the_student_state_bakes_from_a_recorded_row");
 }
 
 // --- the task on scripted states (MuJoCo) --------------------------------------------------------
@@ -1583,7 +2203,7 @@ mod render {
     use es_render::{Channel, Renderer, TriScene};
 
     /// Each camera channel's declared `ImageSpec` is what the renderer produces (INV-14), and
-    /// at the declared `Pt` settings -- 4 spp, 3 bounces, exposure 8 -- each camera sees the
+    /// at the declared `Pt` settings -- 32 spp, 3 bounces, exposure 8 -- each camera sees the
     /// cube (segmentation) at the scene's static pose, with no pixel at the tonemap's white.
     /// `ES_HAND_DUMP=<dir>` writes each frame's Rgb8 bytes there. SKIP without a GPU.
     #[test]
@@ -1651,6 +2271,182 @@ mod render {
             assert_eq!(white, 0, "`{name}` saturates at exposure {EXPOSURE}");
         }
         println!("RAN the_cameras_declare_what_the_scene_renders_and_see_the_cube");
+    }
+
+    /// Packet M16/H3: the sweep `task-repose.toml`'s render settings were chosen from. The
+    /// three cameras at the reset pose and three mid-episode poses (the hand driven by a slow
+    /// sinusoid on `mujoco-cpu`), rendered at 4 / 8 / 16 / 32 / 64 spp x 2 / 3 bounces x SVGF off / on
+    /// at tick 0, each against a 256-spp reference: per camera the RMSE (sRGB bytes) and the
+    /// share of speckle pixels (luminance under half the reference's where the reference is
+    /// above 40), and the wall clock per camera (one dispatch renders all three, as `es loop
+    /// collect` does; 8 frames after a warm-up). `ES_HAND_SHEET=<dir>` writes one PPM per pose
+    /// (rows: the configs in the printed order, reference last; columns: top, front, side).
+    /// Needs `ES_PYTHON` (`MuJoCo`) and a GPU; a measurement, so run explicitly.
+    #[test]
+    #[ignore = "measurement; run explicitly"]
+    #[allow(clippy::too_many_lines)]
+    fn render_quality_sweep() {
+        use es_env::render::EnvRenderer;
+        use es_env::{scheduler::BatchDomains, Env};
+        use es_physics_backend::MuJoCoCpuBackend;
+        use es_physics_core::backend::{PhysicsBackend, StateView};
+
+        if std::env::var_os("ES_PYTHON").is_none() {
+            println!("SKIP render_quality_sweep: ES_PYTHON is not set (MuJoCo)");
+            return;
+        }
+        let gpu = match es_gpu::Gpu::open(es_gpu::GpuOptions::default()) {
+            Ok(gpu) => gpu,
+            Err(e) => {
+                println!("SKIP render_quality_sweep: {e}");
+                return;
+            }
+        };
+        let task =
+            es_ir::serial::task_from_toml(&read(&fixture("task-repose.toml"))).expect("task");
+        let (scene, _) = scene();
+        let domains = BatchDomains::single_env_at(
+            TickRate::from_period_secs(scene.options.timestep).expect("120 Hz"),
+            control_rate(&scene),
+        )
+        .expect("two ticks per control step");
+        let mut env = Env::new(&task, &scene, MuJoCoCpuBackend::new(), &domains, 7)
+            .expect("the task compiles");
+        let model = env.model().clone();
+        env.reset(None).expect("reset");
+        let range = ctrlrange(&scene);
+        let snapshot = |env: &Env<MuJoCoCpuBackend>| {
+            let s = env.backend().state();
+            (s.xpos.to_vec(), s.xquat.to_vec())
+        };
+        let mut poses = vec![("reset", snapshot(&env))];
+        for step in 1..=150u32 {
+            let t = f64::from(step) / CONTROL_HZ as f64;
+            let ctrl: Vec<f64> = range
+                .iter()
+                .enumerate()
+                .map(|(j, (lo, hi))| {
+                    let phase = 0.7 * j as f64;
+                    f64::midpoint(*lo, *hi) + 0.4 * (hi - lo) / 2.0 * (2.0 * t + phase).sin()
+                })
+                .collect();
+            env.step(&ctrl).expect("step");
+            if [40, 90, 150].contains(&step) {
+                poses.push((
+                    ["", "mid-40", "mid-90", "mid-150"][poses.len()],
+                    snapshot(&env),
+                ));
+            }
+        }
+
+        let cams = |spp: u32, bounces: u32, svgf: bool| -> Vec<(String, _)> {
+            CAMERAS
+                .iter()
+                .map(|(_, channel)| {
+                    let ch = &task.observation_spec.channels[*channel];
+                    let ObsSource::Sensor { id, render, .. } = &ch.source else {
+                        panic!("{channel}")
+                    };
+                    let render = SensorRender {
+                        path: SensorPath::Pt { spp, bounces },
+                        svgf,
+                        ..*render
+                    };
+                    let spec = ch.ty.image.as_ref().expect("image");
+                    ((*channel).to_owned(), sensor_cfg(*id, spec, &render, None))
+                })
+                .collect()
+        };
+        let render_all =
+            |r: &mut EnvRenderer<'_>, (xpos, xquat): &(Vec<f64>, Vec<f64>)| -> Vec<Vec<u8>> {
+                let state = StateView {
+                    n_envs: 1,
+                    xpos,
+                    xquat,
+                    ..StateView::default()
+                };
+                r.begin_episode();
+                r.frames_with(
+                    &model,
+                    &state,
+                    0,
+                    &es_env::randomize::RenderOverrides::default(),
+                )
+                .expect("frames")
+                .into_iter()
+                .map(|(_, t)| t.as_u8().expect("rgb8").to_vec())
+                .collect()
+            };
+
+        let reference: Vec<Vec<Vec<u8>>> = {
+            let mut r = EnvRenderer::views(&gpu, &scene, cams(256, 3, false)).expect("renderer");
+            poses.iter().map(|(_, p)| render_all(&mut r, p)).collect()
+        };
+        let lum = |p: &[u8]| {
+            0.2126 * f64::from(p[0]) + 0.7152 * f64::from(p[1]) + 0.0722 * f64::from(p[2])
+        };
+        let mut sheets: Vec<Vec<Vec<Vec<u8>>>> = vec![Vec::new(); poses.len()];
+        println!("config            ms/camera  | RMSE top front side | speckle % top front side");
+        for spp in [4, 8, 16, 32, 64] {
+            for bounces in [2, 3] {
+                for svgf in [false, true] {
+                    let mut r = EnvRenderer::views(&gpu, &scene, cams(spp, bounces, svgf))
+                        .expect("renderer");
+                    render_all(&mut r, &poses[0].1);
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..8 {
+                        render_all(&mut r, &poses[1].1);
+                    }
+                    let ms = t0.elapsed().as_secs_f64() * 1000.0 / 8.0 / 3.0;
+                    let (mut rmse, mut speckle) = ([0.0f64; 3], [0.0f64; 3]);
+                    for (k, (_, pose)) in poses.iter().enumerate() {
+                        let frames = render_all(&mut r, pose);
+                        for (c, (img, want)) in frames.iter().zip(&reference[k]).enumerate() {
+                            let se: f64 = img
+                                .iter()
+                                .zip(want)
+                                .map(|(a, b)| (f64::from(*a) - f64::from(*b)).powi(2))
+                                .sum();
+                            rmse[c] += (se / img.len() as f64).sqrt() / poses.len() as f64;
+                            let lit: Vec<(f64, f64)> = img
+                                .chunks(3)
+                                .zip(want.chunks(3))
+                                .map(|(a, b)| (lum(a), lum(b)))
+                                .filter(|(_, b)| *b > 40.0)
+                                .collect();
+                            let dark = lit.iter().filter(|(a, b)| *a < 0.5 * b).count();
+                            speckle[c] +=
+                                100.0 * dark as f64 / lit.len().max(1) as f64 / poses.len() as f64;
+                        }
+                        sheets[k].push(frames);
+                    }
+                    println!(
+                        "spp {spp:>2} b {bounces} svgf {:<5} {ms:>7.2}  | {:>5.1} {:>5.1} {:>5.1} | {:>5.2} {:>5.2} {:>5.2}",
+                        svgf, rmse[0], rmse[1], rmse[2], speckle[0], speckle[1], speckle[2]
+                    );
+                }
+            }
+        }
+        if let Ok(dir) = std::env::var("ES_HAND_SHEET") {
+            std::fs::create_dir_all(&dir).expect("sheet dir");
+            let w = IMAGE as usize;
+            for (k, (name, _)) in poses.iter().enumerate() {
+                let rows: Vec<&Vec<Vec<u8>>> = sheets[k]
+                    .iter()
+                    .chain(std::iter::once(&reference[k]))
+                    .collect();
+                let mut ppm = format!("P6\n{} {}\n255\n", 3 * w, rows.len() * w).into_bytes();
+                for row in rows {
+                    for y in 0..w {
+                        for img in row {
+                            ppm.extend_from_slice(&img[y * w * 3..(y + 1) * w * 3]);
+                        }
+                    }
+                }
+                std::fs::write(Path::new(&dir).join(format!("{name}.ppm")), ppm).expect("ppm");
+            }
+        }
+        println!("RAN render_quality_sweep over {} poses", poses.len());
     }
 
     /// Packet H1b: the evaluation's `light_intensity` draw (`LightOverride::scene`) scales what

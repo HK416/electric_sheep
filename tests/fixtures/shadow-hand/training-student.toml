@@ -1,0 +1,68 @@
+# Training recipe (spec 8, `es train`) for the Shadow Hand student -- plan H, packet M16/H3.
+# Hand-written; `crates/es/tests/shadow_hand.rs` dry-runs it.
+#
+# Imitation (ACT-shaped, learning-student.toml) of the PPO teacher's successful episodes,
+# rendered by the three `Pt` cameras. The run settings are plan N's (M7/U row U3's,
+# ../visible-learning/training-views.toml and training-mad.toml): batch 64, lr 4e-4 with no
+# `grad_clip`, `warmup_cosine` 250 / 1e-6, seed 0, cuda, the ImageNet ResNet18 `base_model`
+# with `base_model_fetch = "resnet18"` (loaded into each of the three backbones), no
+# `--resident-gpu`, and plan N's E1/E2 length: 60,000 steps, checkpoints at 1,000 / 5,000 /
+# 20,000 / 60,000. Both trainers train under exact attention on CUDA (P-M15-R2), so lr 4e-4
+# holds on the one-token temporal encoder.
+#
+# The bundle is the untrained student, built from its four documents:
+#
+#   es policy init --task tests/fixtures/shadow-hand/task-repose.toml \
+#     --observation tests/fixtures/shadow-hand/observation-student.toml \
+#     --learning tests/fixtures/shadow-hand/learning-student.toml \
+#     --deployment tests/fixtures/shadow-hand/deployment-student.toml \
+#     --out runs/shadow-hand/student-untrained.esb
+#
+# `[dataset]` is what cycle-student.toml writes (and what `es loop cycle` overrides with it):
+# the teacher's collection filtered to its successes by `es loop distill --success-only`.
+#
+# HOW BIG THE COLLECTION IS, so the bake fits this PC (Windows 11, 64 GB RAM, 4 GB page file,
+# RTX 3060 12 GB):
+#  * The bake stops at the `Pad(4)` boundary (training-hint-u3.toml's header): one view of one
+#    frame is F32 [3, 104, 104] = 129,792 B, three views 389,376 B = 0.371 MiB per frame. The
+#    state (31) and the action rows are under 2 KB. Without `--resident-gpu` the set lives in
+#    host RAM: plan N's E1 trained 63,901 three-view frames (23.2 GiB) on this PC.
+#  * Budget: of 59.6 GiB, ~16 GiB stay for Windows, the editor, the trainer's CUDA context and
+#    its batches, so ~40 GiB for the set: at most ~110,000 frames.
+#  * Kept frames = episodes x the teacher's success rate x the mean length of a successful
+#    episode. A success ends the episode, so a kept episode is shorter than the 480-step limit.
+#    With 300 episodes (cycle-student.toml): the worst case the teacher plausibly shows --
+#    success 0.5 and every success at the limit -- is 72,000 frames, 26.1 GiB; at E1's 500-
+#    iteration 0.375 and a success at ~250 steps (read the real number off
+#    evaluation-teacher-64.toml's `episode_length` first) ~28,000 frames, 10.4 GiB.
+#  * Time is the tighter bound: every collected episode renders all three cameras at every
+#    step, failures included (the filter comes after). At 32 spp that measured 89 ms per camera
+#    with the teacher's PPO run on the same GPU (packet M16/H3's sweep), ~0.27 s per control
+#    step: 300 episodes x <= 480 steps is <= 10.7 h, ~7-8 h expected. Target / Status:
+#    unverified on a quiet GPU.
+#  * 60,000 steps x 64 = 3.84 M samples: ~140 epochs of 28,000 frames (plan N: 60 epochs of
+#    63,901). Plan N's three-view graph trained at ~440 samples/s here: ~2 h 25 min.
+#
+# `es train --recipe <this> --out <dir> --dry-run` needs neither the dataset, the bundle, the
+# backbone nor Python.
+
+kind = "training"
+
+[dataset]
+root   = "runs/shadow-hand/student-001/collect/successes/ds"
+frames = "runs/shadow-hand/student-001/collect/successes/frames"
+
+[policy]
+bundle           = "runs/shadow-hand/student-untrained.esb"
+base_model       = "target/backbone/resnet18-imagenet1k-v1.safetensors"
+base_model_fetch = "resnet18"
+
+[run]
+steps         = 60000
+batch         = 64
+lr            = 4e-4
+seed          = 0
+checkpoint_at = [1000, 5000, 20000, 60000]
+device        = "cuda"
+interpreter   = "python"
+schedule      = { kind = "warmup_cosine", warmup = 250, lr_min = 1e-6 }

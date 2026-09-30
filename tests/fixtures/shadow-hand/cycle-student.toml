@@ -1,0 +1,59 @@
+# The Shadow Hand student's cycle -- plan H, packet M16/H3 (task E2): the PPO teacher
+# demonstrates under the three `Pt` cameras, only its successful episodes are kept, the
+# three-view student imitates them and is evaluated. Hand-written; `crates/es/tests/
+# shadow_hand.rs` dry-runs it.
+#
+#   collect  `es loop collect` with `[collect] policy` = the TEACHER bundle (no `--expert`: the
+#            demonstrator is a trained policy, so there is no expert gate and no half-success
+#            refusal), 300 episodes on seeds 1001-1300 -- outside the evaluation's 301-364 --
+#            on `mujoco-cpu` (the reference), every image channel of task-repose.toml rendered
+#            (`frames`), each episode's outcome in collect/ds/meta/outcomes.jsonl.
+#   merge    `success_only`: `es loop distill --success-only` of that collection into
+#            collect/successes/ds, its tiles renumbered into collect/successes/frames.
+#   train    training-student.toml on collect/successes (its header sizes the collection).
+#   eval     evaluation-student.toml: 64 held-out seeds, six suites, the last checkpoint.
+#
+# The teacher bundle is the teacher's chosen checkpoint re-packed under the current
+# task-repose.toml (the orchestrator's, E1; `es policy init` + `es policy pack`: its weights
+# depend on the Learning IR alone) and copied to `runs/shadow-hand/teacher.esb`. The student's
+# own bundle is training-student.toml's `[policy] bundle` (its header has the `es policy init`
+# line); a cycle trains that bundle, not the one that collected.
+#
+# The same run by hand, stage for stage (what `--dry-run` prints):
+#
+#   es loop collect --policy runs/shadow-hand/teacher.esb \
+#     --scene tests/fixtures/mjcf/shadow_hand/shadow_hand_repose.xml --episodes 300 --seed 1001 \
+#     --out <out>/collect/ds --frames <out>/collect/frames
+#   es loop distill --in <out>/collect/ds --in-frames <out>/collect/frames \
+#     --train 1 --val 0 --test 0 --out <out>/collect/successes/ds \
+#     --frames <out>/collect/successes/frames --success-only
+#   es train --recipe tests/fixtures/shadow-hand/training-student.toml --out <out>/train
+#   es eval run --policy <out>/train/checkpoints/60000.esb \
+#     --config tests/fixtures/shadow-hand/evaluation-student.toml --frames ... --out <out>/eval
+#
+# `jobs = 4`, not plan N's 6: each job holds three ResNet18s and renders three 32-spp cameras,
+# and M12's review measured a 6-worker evaluation at 41.7 GB of host RAM. Not measured here.
+#
+# `es loop cycle --recipe tests/fixtures/shadow-hand/cycle-student.toml --out <dir> --dry-run`
+# needs neither the bundles, the backbone nor Python.
+
+kind  = "cycle"
+scene = "tests/fixtures/mjcf/shadow_hand/shadow_hand_repose.xml"
+
+[collect]
+policy       = "runs/shadow-hand/teacher.esb"
+episodes     = 300
+seed         = 1001
+frames       = true
+success_only = true
+
+[train]
+recipe = "tests/fixtures/shadow-hand/training-student.toml"
+
+[eval]
+config     = "tests/fixtures/shadow-hand/evaluation-student.toml"
+checkpoint = "last"
+jobs       = 4
+frames     = true
+
+[eval.preview]
