@@ -105,13 +105,15 @@ void main(uint3 gid : SV_DispatchThreadID) {
         // Solid-angle pdf of the BSDF sample that produced the current ray; the camera ray
         // has none, so its MIS weight is 1 and the default path is unchanged.
         float prev_pdf = 0.0;
+        // The sky strategy's pdf of the current ray: `prev_pdf` itself on a Lambertian vertex.
+        float prev_sky = 0.0;
         for (uint b = 0; b < bounces; ++b) {
             float t;
             uint hit;
             if (!es_nearest(o, d, near, vw.far, t, hit)) {
-                // The sky through the BSDF strategy; its NEE counterpart draws from the same
-                // cosine pdf, so the power heuristic splits it in half.
-                float w = (nee && b > 0) ? es_power_heuristic(prev_pdf, prev_pdf) : 1.0;
+                // The sky through the BSDF strategy; its NEE counterpart draws from the cosine
+                // pdf, so on a Lambertian vertex the power heuristic splits it in half.
+                float w = (nee && b > 0) ? es_power_heuristic(prev_pdf, prev_sky) : 1.0;
                 acc += (throughput * es_sky()) * w;
                 break;
             }
@@ -123,18 +125,29 @@ void main(uint3 gid : SV_DispatchThreadID) {
             acc += (throughput * tr.emission) * w_em;
             float3 n = es_face_forward(tr.n, d);
             float3 hp = o + d * t + n * ES_RAY_EPS;
+            // The surface this ray sees (plan H, HT1): the flat albedo when `mat == 0`.
+            EsSurface sf = es_surface(tr, o, d);
+            float3 v = sf.pbr ? es_norm3(-d) : float3(0.0, 0.0, 0.0);
             if (nee) {
                 acc += throughput * es_nee_direct(
-                    hp, n, tr.albedo, vw.far, b + 1 == bounces,
+                    hp, n, sf, v, vw.far, b + 1 == bounces,
                     es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, s, b, 4),
                     es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, s, b, 5),
                     es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, s, b, 6));
             }
-            throughput *= tr.albedo;
+            float3 next;
+            float3 weight;
+            float pdf;
+            float sky_pdf;
+            es_bounce(sf, n, v,
+                      es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, s, b, 0),
+                      es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, s, b, 7),
+                      next, weight, pdf, sky_pdf);
+            throughput *= weight;
             o = hp;
-            d = es_cosine_hemisphere(
-                n, es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, s, b, 0));
-            prev_pdf = dot(n, d) * ES_INV_PI;
+            d = next;
+            prev_pdf = pdf;
+            prev_sky = sky_pdf;
             near = 0.0;
         }
     }

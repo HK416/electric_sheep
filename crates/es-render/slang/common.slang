@@ -23,12 +23,13 @@ static const float ES_PI = 3.14159265358979323846;
 static const float ES_INV_PI = 0.31830988618379067154;
 static const float ES_INV_GAMMA = 0.41666666;
 
-static const uint ES_TRI_STRIDE = 20;
+static const uint ES_TRI_STRIDE = 32;
 static const uint ES_VIEW_STRIDE = 16;
 // Slots 0..20 are M4's globals, 20..31 packet M7/R2's shading block, 31..37 packet M7/R3's
 // PT block, 37..39 packet M7/R4's temporal block, 39..41 packet M11/X3b's triangle base and
 // band row, then the per-view records. Mirrors `renderer.rs`'s PARAM_VIEW_BASE.
-static const uint ES_PARAM_VIEW_BASE = 41;
+// Slots 41 and 42 are plan H HT1's material region base and material count (material.slang).
+static const uint ES_PARAM_VIEW_BASE = 43;
 // Floats per pixel of the temporal history (packet M7/R4). Mirrors `renderer.rs`'s
 // HIST_STRIDE and `cpu::History`: sum(3), m1, m2, n, depth, tri, normal(3), variance.
 static const uint ES_HIST_STRIDE = 12;
@@ -114,6 +115,11 @@ struct EsTri {
     float3 albedo;
     float3 emission;
     uint seg;
+    // Plan H, HT1: 1 + the material slot (0 = none) and the per-vertex texture coordinates.
+    uint mat;
+    float3 tc0;
+    float3 tc1;
+    float3 tc2;
 };
 
 EsTri es_tri(uint i) {
@@ -126,6 +132,10 @@ EsTri es_tri(uint i) {
     t.albedo = float3(es_tris[b + 12], es_tris[b + 13], es_tris[b + 14]);
     t.emission = float3(es_tris[b + 15], es_tris[b + 16], es_tris[b + 17]);
     t.seg = asuint(es_tris[b + 18]);
+    t.mat = asuint(es_tris[b + 19]);
+    t.tc0 = float3(es_tris[b + 20], es_tris[b + 21], es_tris[b + 22]);
+    t.tc1 = float3(es_tris[b + 23], es_tris[b + 24], es_tris[b + 25]);
+    t.tc2 = float3(es_tris[b + 26], es_tris[b + 27], es_tris[b + 28]);
     return t;
 }
 
@@ -194,6 +204,8 @@ float3 es_qrot(float4 q, float3 v) {
 float3 es_qrot_inv(float4 q, float3 v) {
     return es_qrot(float4(-q.x, -q.y, -q.z, q.w), v);
 }
+
+#include "material.slang"
 
 // Which tile, which view, which atlas slot. `valid` is false for a padding tile or a thread
 // off the end of the atlas.
@@ -375,10 +387,15 @@ float3 es_primary_dir(EsView vw, uint2 px) {
 }
 
 // Flat + Lambert, one directional light, no shadow ray (the Pt path models occlusion).
-float3 es_shade_lambert(EsTri tr, float3 n) {
+// With a base colour that is not the flat albedo: a texel times the factor (plan H, HT1).
+float3 es_shade_lambert_base(float3 base, EsTri tr, float3 n) {
     float ndl = max(dot(n, es_light_dir()), 0.0);
     float lambert = es_ambient() + ndl * (1.0 - es_ambient());
-    return tr.albedo * lambert + tr.emission;
+    return base * lambert + tr.emission;
+}
+
+float3 es_shade_lambert(EsTri tr, float3 n) {
+    return es_shade_lambert_base(tr.albedo, tr, n);
 }
 
 // Exact piecewise sRGB transfer (spec 3.1); the power goes through `approx.slang`, not
@@ -406,10 +423,32 @@ float3 es_normalize(float3 a) {
 // highlight. Line-for-line mirror of `cpu::shade_full`; the order below is the order there.
 // `n` is the world-space face-forwarded normal, `p` the hit point, `d` the (not normalised)
 // view ray. pow is exp(ln(x) * k), guarded at x <= 0 — never GLSL.std.450 (spec 3.2 DET-010).
-float3 es_shade_full(EsTri tr, float3 n, float3 p, float3 d) {
+float3 es_shade_full(EsTri tr, EsSurface s, float3 n, float3 p, float3 d) {
     float3 light = es_light_dir();
     float vis = 1.0;
     if (es_shadows() && es_any_hit(p + n * ES_RAY_EPS, light, 0.0, ES_SHADOW_FAR)) { vis = 0.0; }
+    // A PBR surface (plan H, HT1): the glTF BRDF under the same light and hemisphere. Mirror
+    // of the `surf.pbr` branch of `cpu::shade_full_surface`.
+    if (s.pbr) {
+        float3 v = es_norm3(-d);
+        float ndl_p = max(es_dot3(n, light), 0.0);
+        float3 fb = es_brdf(s, n, v, light);
+        float k = ES_PI * ndl_p * vis;
+        float3 direct = fb * k;
+        float tp = (n.z + 1.0) * 0.5;
+        float3 hemi_p = es_ground_rgb() + (es_sky_rgb() - es_ground_rgb()) * tp;
+        float3 c_diff;
+        float3 f0;
+        float a;
+        es_lobes(s, c_diff, f0, a);
+        float3 amb = float3(c_diff.x * (1.0 - f0.x) + f0.x,
+                            c_diff.y * (1.0 - f0.y) + f0.y,
+                            c_diff.z * (1.0 - f0.z) + f0.z);
+        float3 rgb = float3(amb.x * hemi_p.x + direct.x * (1.0 - hemi_p.x),
+                            amb.y * hemi_p.y + direct.y * (1.0 - hemi_p.y),
+                            amb.z * hemi_p.z + direct.z * (1.0 - hemi_p.z));
+        return rgb + tr.emission;
+    }
     float diffuse = max(dot(n, light), 0.0) * vis;
     float3 h = es_normalize(light - d);
     float ndh = max(dot(n, h), 0.0);
@@ -422,7 +461,7 @@ float3 es_shade_full(EsTri tr, float3 n, float3 p, float3 d) {
     // at review): hemi + diffuse * (1 - hemi) per channel, so a fully lit surface returns its
     // albedo and a shadowed one albedo * hemi. spec stays additive.
     float3 lit = hemi + diffuse * (1.0 - hemi);
-    return tr.albedo * lit + spec + tr.emission;
+    return s.base * lit + spec + tr.emission;
 }
 
 float es_luminance(float3 c) {
@@ -525,9 +564,13 @@ float es_light_pdf(EsTri light, float3 dir, float dist2, float n_lights) {
 //
 // `last` is the bounce budget's final vertex: no BSDF continuation is traced from there, so
 // the MIS weights are dropped and NEE carries the whole term (see `cpu::nee_direct`).
-float3 es_nee_direct(float3 p, float3 n, float3 albedo, float far, bool last, uint k_pick,
-                     uint k_area, uint k_sky) {
-    float3 f = albedo * ES_INV_PI;
+//
+// `s` and `v` are the surface and the view direction (plan H, HT1): a Lambertian surface is
+// the `albedo / pi` and `cos / pi` of before, the same expressions; a PBR one the glTF BRDF and
+// its lobe-mixture pdf as the MIS partner.
+float3 es_nee_direct(float3 p, float3 n, EsSurface s, float3 v, float far, bool last,
+                     uint k_pick, uint k_area, uint k_sky) {
+    float3 f = s.base * ES_INV_PI;
     float3 out_rgb = float3(0.0, 0.0, 0.0);
 
     uint n_l = es_n_lights();
@@ -545,10 +588,12 @@ float3 es_nee_direct(float3 p, float3 n, float3 albedo, float far, bool last, ui
             float cos_s = dot(n, dir);
             float p_light = es_light_pdf(light, dir, dist2, n_lights);
             if (cos_s > 0.0 && p_light > 0.0) {
-                float w = last ? 1.0 : es_power_heuristic(p_light, cos_s * ES_INV_PI);
+                float pb = s.pbr ? es_bsdf_pdf(s, n, v, dir) : cos_s * ES_INV_PI;
+                float w = last ? 1.0 : es_power_heuristic(p_light, pb);
                 // `dist * (1 - 1e-3)` so the shadow ray stops short of the light itself.
                 if (!es_any_hit(p, dir, 0.0, dist * (1.0 - 1e-3))) {
-                    out_rgb += (f * light.emission) * (cos_s / p_light * w);
+                    float3 fd = s.pbr ? es_brdf(s, n, v, dir) : f;
+                    out_rgb += (fd * light.emission) * (cos_s / p_light * w);
                 }
             }
         }
@@ -559,7 +604,8 @@ float3 es_nee_direct(float3 p, float3 n, float3 albedo, float far, bool last, ui
         float3 l = es_light_dir();
         float cos_s = dot(n, l);
         if (cos_s > 0.0 && !es_any_hit(p, l, 0.0, ES_SHADOW_FAR)) {
-            out_rgb += (f * lrgb) * cos_s;
+            float3 fl = s.pbr ? es_brdf(s, n, v, l) : f;
+            out_rgb += (fl * lrgb) * cos_s;
         }
     }
 
@@ -569,11 +615,39 @@ float3 es_nee_direct(float3 p, float3 n, float3 albedo, float far, bool last, ui
         float cos_s = dot(n, d);
         float pdf = cos_s * ES_INV_PI;
         if (pdf > 0.0 && !es_any_hit(p, d, 0.0, far)) {
-            float w = last ? 1.0 : es_power_heuristic(pdf, pdf);
-            out_rgb += (f * sky) * (cos_s / pdf * w);
+            float pb = s.pbr ? es_bsdf_pdf(s, n, v, d) : cos_s * ES_INV_PI;
+            float w = last ? 1.0 : es_power_heuristic(pdf, pb);
+            float3 fs = s.pbr ? es_brdf(s, n, v, d) : f;
+            out_rgb += (fs * sky) * (cos_s / pdf * w);
         }
     }
     return out_rgb;
+}
+
+// One BSDF bounce (plan H, HT1). Mirror of `cpu::bounce_dir`: a Lambertian surface is the
+// cosine-weighted direction of stream 0 with a throughput factor of `base` and both pdfs the
+// one `cos / pi`; a PBR one samples the lobe mixture (stream 7) and weights by f cos / pdf.
+void es_bounce(EsSurface s, float3 n, float3 v, uint key_dir, uint key_lobe,
+               out float3 dir, out float3 weight, out float pdf, out float sky_pdf) {
+    float3 cosine = es_cosine_hemisphere(n, key_dir);
+    if (!s.pbr) {
+        dir = cosine;
+        weight = s.base;
+        pdf = dot(n, cosine) * ES_INV_PI;
+        sky_pdf = pdf;
+        return;
+    }
+    float3 u = float3(es_rng_uniform(key_lobe, 0), es_rng_uniform(key_lobe, 1),
+                      es_rng_uniform(key_lobe, 2));
+    float3 t;
+    float3 b;
+    es_onb(n, t, b);
+    float3 l = es_norm3(es_bsdf_sample(s, n, v, cosine, u, t, b));
+    float nl = es_dot3(n, l);
+    pdf = es_bsdf_pdf(s, n, v, l);
+    weight = (pdf > 0.0 && nl > 0.0) ? es_brdf(s, n, v, l) * (nl / pdf) : float3(0.0, 0.0, 0.0);
+    sky_pdf = max(nl, 0.0) * ES_INV_PI;
+    dir = l;
 }
 
 #endif

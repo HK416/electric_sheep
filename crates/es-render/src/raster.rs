@@ -367,6 +367,7 @@ mod tests {
                 albedo: [0.8, 0.45, 0.2],
                 emission: [0.0; 3],
                 seg: 1,
+                ..Tri::default()
             }],
             ..TriScene::default()
         };
@@ -426,6 +427,7 @@ mod tests {
             albedo,
             emission: [0.0; 3],
             seg: 1,
+            ..Tri::default()
         };
         let scene = TriScene {
             tris: vec![arm(true, [0.8, 0.1, 0.1]), arm(false, [0.1, 0.1, 0.8])],

@@ -22,7 +22,7 @@ Crate: `es-render`, layer 5 (§4.2). `es-core`, `es-math`, `es-gpu`, `es-assets`
 - **스플랫.** §16.2는 3DGS를 이 crate의 세 번째 렌더 경로로 둔다. `es-splat`(layer 5, 같은 layer, 어느 방향으로도 의존 없음)이 오늘 자산 측을 소유한다. 나중을 위한 훅은 `RenderPath`다: `Splat` variant가 `Rs`/`Pt` 옆에 놓여 같은 채널을 같은 아틀라스에 쓴다. 아틀라스, 채널, `Atlas::read_tile` API의 어느 것도 삼각형을 전제하지 않는다.
 - **센서 리얼리즘**(§18.3: 왜곡, 롤링 셔터, 모션 블러, 노출, 샷 노이즈, 깊이 홀). 렌더러는 깨끗한 채널을 방출하고, 리얼리즘은 아틀라스에 대한 이후 패스다. 그 결과 §7.2의 `DistortionModel::None`과 `ShutterModel::Global`만 지원되며, 렌더러는 그 외를 요청하는 뷰를 조용히 무시하는 대신 *거부한다*.
 - **옵티컬 플로우 및 속도 채널.** `Channel::Flow`는 프리미티브별 이전 프레임 변환이 필요한데, 렌더러는 아직 이전 프레임 개념이 없다. 요청하면 에러이지, 빈 버퍼가 아니다.
-- **텍스처와 머티리얼.** geom당 평평한 알베도 하나, `Geom::rgba`에서. UV 없음, 텍스처 샘플링 없음, PBR 없음.
+- **텍스처와 머티리얼** — *plan H의 HT1 이후로는 더 이상 건너뛰지 않는다*([§15](#15-텍스처와-metallic-roughness-재질-plan-h-ht1)): MJCF 2D·cube 텍스처, bilinear, 두 경로 모두에서 glTF metallic-roughness. 텍스처도 명시적 재질 속성도 없는 geom은 여전히 `Geom::rgba`의 평평한 알베도 하나이며, 비트 단위로 같다. 노멀·방출 맵은 HT2의 것이다.
 
 ## 1. 타일 아틀라스 (§15.2)
 
@@ -86,7 +86,7 @@ atlas_bytes(cfg, n_tiles, channel)
 
 `rgba`의 알파가 정확히 0인 geom은 그리지 않는다(plan H, H1). 삼각형은 하나도 내지 않지만 세그멘테이션 id는 그대로 차지하므로 뒤에 오는 geom의 id가 밀리지 않는다. MJCF가 충돌 전용 geom이나 보이지 않는 바닥을 숨기는 방식이 이것이고, 그런 geom이 없는 장면은 전과 비트 단위로 같게 렌더된다. 그 밖의 알파 값은 무시한다(투명도는 없다).
 
-버퍼 레이아웃은 삼각형당 스트라이드 20 floats(80 B)의 평평한 `f32` 배열이다 — `v0 v1 v2 n albedo emission seg pad`, 세그멘테이션 id는 슬롯 18에 `asuint` 비트캐스트된다. 버퍼 하나, 스트라이드 하나, 양쪽에서 동일하다.
+버퍼 레이아웃은 삼각형당 스트라이드 32 floats(128 B)의 평평한 `f32` 배열이다 — `v0 v1 v2 n albedo emission seg mat tc0 tc1 tc2 pad`, 세그멘테이션 id와 재질 슬롯은 슬롯 18과 19에 `asuint` 비트캐스트된다. 버퍼 하나, 스트라이드 하나, 양쪽에서 동일하다. 스트라이드는 plan H의 HT1이 재질 슬롯과 텍스처 좌표 셋을 덧붙이기 전까지 20이었다([§15](#15-텍스처와-metallic-roughness-재질-plan-h-ht1)). 레이아웃은 출력이 아니며, 모든 골든이 바뀌지 않은 채 다시 통과했다.
 
 ### 2.2 layer 5의 `ImageSpec`
 
@@ -250,8 +250,9 @@ key(view, px, py, sample, bounce, stream)
 | 4 | NEE: 어느 이미셔티브 삼각형인가 (M7/R3) | 샘플, 바운스 |
 | 5 | NEE: 그 삼각형 위의 균일 점 | 샘플, 바운스 |
 | 6 | NEE: 코사인 가중 하늘 방향 | 샘플, 바운스 |
+| 7 | PBR 바운스 (plan H, HT1): 인덱스 0이 로브를 고르고, 1과 2가 GGX 가시 노멀을 샘플 | 샘플, 바운스 |
 
-NEE의 그림자 검사에는 스트림이 없다: 난수를 추출하지 않는다. 스트림 4–6은 `nee`가 켜졌을 때만 추출되므로, `nee: false` 렌더는 M7/R3 이전과 정확히 같은 추출을 한다.
+NEE의 그림자 검사에는 스트림이 없다: 난수를 추출하지 않는다. 스트림 4–6은 `nee`가 켜졌을 때만 추출되므로, `nee: false` 렌더는 M7/R3 이전과 정확히 같은 추출을 한다. 스트림 7은 PBR 정점에서만 추출되므로, PBR 정점이 없는 씬은 HT1 이전에 뽑던 것을 뽑는다.
 
 ### 4.2 ReSTIR DI
 
@@ -1278,3 +1279,106 @@ X3는 57.5 ms/프레임에서 reach PPO 한 런의 렌더링을 ~65 h로 추정�
 - **4090에서의 동시 GPU 테스트.** 서버에서 처음 돌린 `cargo test -p es-render --test render`는 테스트 스레드 ~15개가 각자 `VkDevice`를 잡은 채 20분 동안 멈췄다: 스레드 하나는 드라이버 안에서 돌고, 나머지는 드라이버 뮤텍스에 막혀 있었다. `--test-threads=1`이면 스위트 전체가 67 s에 통과한다. 로컬에서는 기본 병렬 실행이 통과한다. 새 테스트가 드라이버 한계를 넘긴 것인지, 멈춤이 더 오래된 것인지는 모른다.
 - **수집기와 평가기의 배치.** `es loop collect`와 `es eval run`은 여전히 `EnvRenderer` 하나에 env 하나를 렌더한다. 패킷 범위 밖이다.
 - **배치에서의 시간 누적**은 거부되지 않지만(각 타일의 이력은 다중 카메라 아틀라스에서처럼 픽셀별·뷰별이다) 테스트되지 않았다: 관측 경로는 아무것도 누적하지 않는다(12.3).
+
+## 15. 텍스처와 metallic-roughness 재질 (plan H, HT1)
+
+패킷 `docs/packets/M16/plan-h.md`의 HT1, 2026-09-30 소유자 결정(M7에서 보류된 R6), 사양 15.3. 메시(M10/W2)의 선례를 따라 **가산적**이다: 텍스처도, 명시적으로 쓴 재질 속성도 없는 씬은 `scene_hash`를 그대로 두고 커밋된 모든 바이트를 이전처럼 렌더한다 — `cargo xtask verify-goldens`는 바뀐 골든이 없다고 보고하고, `es-render`와 `es-env --features render`의 오라클은 RTX 3060에서 모두 다시 통과하며, `so101_pick_place.xml`과 `go1_primitives.xml`의 고정된 `scene_hash`는 파싱 *뒤에도*, `mesh::load` 뒤에도 그대로다(`crates/es-assets/tests/texture_load.rs`).
+
+### 15.1 씬이 선언하는 것, 해시에 들어가는 것
+
+`<texture>`는 `SceneDesc::textures` 위의 `es_assets::texture::TextureSpec`이 된다. 모든 CLI 동사, 에디터, 테스트가 이미 부르는 단 하나의 로더 `es_assets::mesh::load`가 이제 텍셀도 디코드하고(`texture::load`) 그 다이제스트를 텍스처의 `AssetRef::hash`에 쓴다: `blake3("es.texture.v1", kind, sRGB, width, height, texels)`. 경로가 아니라 내용이므로, 같은 PNG는 다른 디렉터리에서 다른 이름으로 있어도 같은 해시다. 디코드는 MuJoCo 3.13의 `mjCTexture::Compile`을 줄 단위로 따른다:
+
+- **PNG**는 `png` 크레이트(이미 락파일에 있다)로, `lodepng`가 `LCT_RGB`로 줄이는 그대로 줄인다: 팔레트와 낮은 비트 깊이는 펼치고, 16비트는 상위 바이트로, 회색은 복제, 알파는 버린다(MuJoCo의 `nchannel = 3`).
+- **cube**는 언제나 MuJoCo 순서 R L U D F B = `+X −X +Y −Y +Z −Z`(OpenGL 큐브맵 순서)의 정사각형 면 여섯이다: `gridsize` / `gridlayout`으로 자른 파일 하나(선언되지 않은 면은 `rgb1`), 여섯 면 모두에 반복되는 `1 x 1` 이미지 하나, 또는 `fileright … fileback`.
+- **builtin** `checker|gradient|flat`과 `mark="edge|cross|random"`, `(std::byte)(255 c)`의 버림까지 포함한다. cube gradient의 `asin`/`acos`는 `es_math::approx::acos_f64`를, `random`은 풀어 쓴 `mt19937_64`(시드 42, libstdc++의 canonical 추출)를 거치므로 텍셀 — 그리고 다이제스트 — 은 어느 호스트에서나 같다.
+- **colorspace** `auto`는 MuJoCo가 푸는 대로 PNG의 `sRGB` 청크, builtin이면 선형이다.
+- **skybox**는 파싱하되 디코드하지 않는다: 이 렌더러에는 환경 맵이 없다.
+
+`<material>`은 **그려지는 재질일 때만** `SceneDesc::materials` 위의 `es_assets::scene::Material`이 된다: 텍스처를 가리키거나(속성 또는 `<layer role="rgb|orm|metallic|roughness">`), `specular`, `shininess`, `metallic`, `roughness`, `emission` 중 하나를 명시적으로 쓴 재질이다. 그려지는 재질은 `scene_hash`의 자기 절 `es.scene.appearance.v1`에 해시되고, 그 절은 하나라도 있을 때만 덧붙는다. `rgba`만 가진 재질은 그려지지 않고 아무것도 움직이지 않는다 — **MuJoCo와의 편차**이며 일부러 남긴 것이다: `go1_primitives.xml`의 `dark` 재질은 MuJoCo에서는 0.2 회색으로 그려지지만 여기서는 언제나처럼 자기 geom의 0.5 회색으로 그려지고, `scene_hash`와 열거된 임포터 경고를 그대로 지킨다. 그려지는 재질의 `rgba`는 MuJoCo의 `setMaterial`을 따른다: geom 자신의 `rgba`가 MuJoCo 기본값 `0.5 0.5 0.5 1`이 아니면 그것이 이긴다. [§2.1](#21-씬)의 알파 0 규칙이 읽는 것은 이렇게 풀린 알파이고, `emission`은 geom이 `emission x rgba`를 내며 광원 목록에 들게 한다. 고전 쌍은 공식 하나로 glTF에 옮겨진다, `Material::roughness`: `n = 128 shininess`, `roughness = (2 / (n + 2))^(1/4)`(Walter et al. 2007의 `alpha^2 = 2 / (n + 2)`, `alpha = roughness^2`) — 명시적 `shininess`에서, `specular`만 쓰였으면 MuJoCo 기본값 0.5에서. `specular` 자체는 어디에도 옮겨지지 않는다, `F0`는 glTF의 것이다. OBJ `vt`를 읽는다(서로 다른 `(v, vt)`마다 정점 하나, `v`는 MuJoCo의 OBJ 디코더처럼 `1 − v`로 뒤집는다). `vt`가 없는 파일은 이전과 똑같이 디코드된다.
+
+### 15.2 텍스처 좌표는 MuJoCo의 것이다
+
+MuJoCo 3.13 classic 렌더러(`render_context.c`의 프리미티브 디스플레이 리스트와 `render_gl3.c`의 `settexture`)에서 읽었다. 테셀레이션된 각 정점은 `texrepeat` 이전의 MuJoCo UV와, MuJoCo가 그리고 스케일하는 단위 물체 속 좌표를 지닌다. geom별 매핑이 이것을 삼각형의 텍스처 좌표 셋(`Tri::tc`, 슬롯 20–28)으로 바꾼다:
+
+| 형상 | 2D 텍스처: `(u, v)` | cube 텍스처: 방향 |
+|---|---|---|
+| `Box` | Z 면에서 `(x+1)/2, (1−y)/2`; X 면에서 `(y+1)/2, (1−z)/2`; Y 면에서 `(x+1)/2, (1−z)/2`(단위 좌표) | 단위 상자의 꼭짓점 |
+| `Plane` | 범위를 가로질러, `v`는 Y축을 따라 내려감; 무한한 변은 `0.5 x` / `−0.5 y`, 텍스처 행렬은 −0.5 이동 | `(x, y, 0)` |
+| `Sphere`, `Ellipsoid` | `az / 2π`, +Z 극에서부터 `θ / π`; 극 정점은 그 삼각형의 가운데 `u` | 단위 구의 방향 |
+| `Capsule`, `Cylinder` 옆면 | `az / 2π`, `(1 − z/hl) / 2` | `(cos, sin, ±1)` |
+| 캡슐 캡 | `v`는 적도의 1에서 위 극의 0까지(아래는 0에서 1) | `(cos t cos, cos t sin, ±(1 + sin t))` |
+| 원기둥 원판 | `0.5 + 0.5 (x, y) / r` | `(cos, sin, ±1)` |
+| `Mesh` | 자기 UV, 없으면 MuJoCo의 texgen `(0.5 s x − 0.5, −0.5 t y − 0.5)`, `s, t = texrepeat / size` | 로컬 위치 |
+
+2D 텍스처는 `texrepeat`(≤ 0은 1로 읽는다)로, `texuniform`이면 거기에 geom의 `mjvGeom` 크기를 곱해 스케일된다. cube 방향은 `texuniform`이면 그 크기가 곱해진다. cube 텍스처의 면과 그 `(s, t)`는 픽셀마다 OpenGL의 큐브맵 표를 따른다. 이 좌표는 MuJoCo 자신의 사각형 위에서 위치에 대해 아핀이므로, 이 렌더러의 더 성긴 테셀레이션 위로 보간해도 모든 정점에서 MuJoCo의 함수를 재현한다.
+
+### 15.3 샘플링과 셰이딩
+
+삼각형의 `mat` 슬롯(19)은 0이거나 `1 +` 재질 인덱스다. 재질 영역은 삼각형 버퍼에서 씬 뒤에 붙는다 — `LUT (512) | 재질 (각 8 floats) | 텍스처 헤더 (4 words) | 텍셀 (각 packed RGB8 word 하나)` — 서로 다른 표마다 한 번(배치의 env들은 자기 `SceneCache`의 표를 공유한다), 그리고 전역 슬롯 41과 42가 그 기준 위치와 재질 개수를 싣는다(`PARAM_VIEW_BASE` 41 → 43, 이것에 의존하는 출력은 없다). 그려지는 재질이 없는 씬은 영역을 전혀 올리지 않는다. 텍셀은 호스트에서 `es_math::approx`로 만든(`i/255`, 이어서 정확한 sRGB EOTF) 표를 거쳐 디코드되고, 양쪽이 같은 버퍼에서 읽는다. 샘플링은 텍셀 중심 +0.5의 bilinear, 2D 텍스처에서는 `repeat`, cube 면 안에서는 clamp-to-edge, 밉맵 없음이다. 무게중심 좌표는 Moller–Trumbore의 것을 히트에서 항 단위로 풀어 쓴 `dot`·`cross`(`es_dot3`, `es_cross`)로 다시 구한다. [§9.3](#93-gpu와-cpu가-일치하는-것)이 합산 순서가 고정되지 않았다고 확인한 SPIR-V `OpDot`은 쓰지 않는다.
+
+**재질 모델은 하나**, glTF 2.0 metallic-roughness다: 기저색 = 인자 × 텍셀, GGX `D`, height-correlated Smith `V`, `v·h`에서의 Schlick `F`, `F0 = mix(0.04, base, metallic)`, 거칠기는 ≥ 0.05로 클램프. **편차 하나**: Lambert 로브는 glTF 부록 B의 `(1 − F(v·h))` 대신 `(1 − F(n·l))(1 − F(n·v))`로 가중된다. 아래 퍼니스 오라클이 부록 B를 흰 유전체 60°, 거칠기 0.05에서 **1.025**로 쟀다(0.25에서 1.026, 0.5에서 1.011) — 들어온 빛보다 나가는 빛이 많다. 대체한 결합은 상호적이고 모든 구성을 1 이하로 지킨다. PBR은 `specular`, `shininess`, `metallic`, `roughness`(또는 맵)를 명시적으로 쓴 재질에서만 켜진다. 텍스처나 `emission`만 가져오는 재질은 텍스처가 입혀진 Lambert이고, MuJoCo의 기본값은 아무것도 켜지 않는다.
+
+| 경로 | 그려지는 재질 |
+|---|---|
+| `Rs` `Lambert` | 기저색 × Lambert 항; metallic과 roughness는 무시 |
+| `Rs` `Full`, PBR | `A hemi + π f(l, v) max(0, n·l) vis (1 − hemi) + emission`, `A = c_diff (1 − F0) + F0` — `Full` 자신의 `diffuse (1 − hemi)` 항이 가진 스케일 |
+| `Rs` `Full`, PBR 아님 | §9의 Blinn-Phong 룩을 기저색으로 |
+| `Pt`, PBR | 로브 혼합: 스트림 7 인덱스 0이 확률 `lum(F(n·v)) / (lum(F(n·v)) + lum(c_diff))`로 specular를 고르고, specular 로브는 GGX 가시 노멀을 샘플하며(Heitz 2018, 스트림 7 인덱스 1, 2), diffuse 로브는 스트림 0의 코사인 방향을 쓴다. throughput × 혼합 pdf 위의 `f cos / pdf`, 표면 아래로 가는 방향은 경로의 루프가 아니라 throughput을 0으로 만든다(사양 3.4). NEE의 세 광원 종류는 혼합 pdf와 가중되고, ReSTIR의 목표 함수는 g-buffer에서 다시 세운 시선 방향으로 `lum(f Le G)`다 |
+| `Pt`, PBR 아님 | 기저색을 쓰는 지금의 추정기: 같은 식이므로 Lambert 정점은 이전에 뽑던 것을 뽑는다 |
+
+### 15.4 오라클, 측정값 (RTX 3060, Slang 2026.8)
+
+**MuJoCo 대비 배치** (`ES_PYTHON`을 두고 `cargo test -p es-render --test textured mujoco_places_the_textures_where_we_do`; 이 Windows 데스크톱에서 `mujoco.Renderer` 오프스크린, 160×160, 픽스처의 카메라). `tests/fixtures/mjcf/textured/textured.xml`: 번들이 선언한 그대로 번들의 `block.png`를 입은 상자 둘(라이선스와 `PROVENANCE.json`과 함께 복사) — `cube_b`는 `(1, 1, 0)` 둘레로 180° 돌려 카메라가 둘 사이에서 여섯 면을 모두 본다 — 과 3번 반복된 체커 바닥. 보이는 각 면(세그멘테이션 id와 월드 축 노멀, 경계 제외)을 두 이미지 모두에서 블록의 배경색 여섯과 흰색에 대해 픽셀 단위로 분류한다. 분류 공간은 크로마(선형 RGB를 최댓값으로 나눈 것 — 두 조명 모델이 건드리지 않는 것)다:
+
+| 영역 | 픽셀 | 지배색, 우리 / MuJoCo | 픽셀 단위 일치 |
+|---|---|---|---|
+| 바닥 | 9,202 | 체커 / 체커 | 0.999 |
+| `cube_a` +X | 975 | R(보라 "E") / R | 0.923 |
+| `cube_a` −Y | 550 | D(빨강 "I") / D | 0.884 |
+| `cube_a` +Z | 736 | F(노랑 "P") / F | 0.992 |
+| `cube_b` +X | 550 | U(자홍 "A") / U | 0.856 |
+| `cube_b` −Y | 975 | L(초록 "O") / L | 0.978 |
+| `cube_b` +Z | 736 | B(분홍 "N") / B | 0.986 |
+
+여섯 면 모두, 바른 방향으로 — 글자의 흰 픽셀이 MuJoCo의 것과 같은 곳에 떨어진다. 불일치는 글자 가장자리, MuJoCo의 trilinear 밉맵이 흐리고 이 렌더러의 bilinear가 흐리지 않는 곳이다. 단언은 지배색이 같고 일치가 ≥ 0.85인 것이다.
+
+**흰 퍼니스** (`white_furnace_converges_to_the_quadrature_albedo`): 흰 하늘 아래의 흰 PBR 평면을 법선에서 60° 벗어나 8×8 픽셀 × 512 spp, 두 바운스로 보고, `es_render::material`과 독립적으로 테스트에 풀어 쓴 식으로부터 `f64` 구적(diffuse 로브는 코사인 매핑 격자, specular 로브는 GGX의 `h` 분포 격자, 각각 256² 중점)으로 적분한 방향 알베도와 비교한다:
+
+| metallic | roughness | 구적 `ρ` | `Pt`, NEE 끔 / 켬 | 최악 상대 오차 |
+|---|---|---|---|---|
+| 0 | 0.05 | 0.92036 | 0.91997 / 0.91950 | 9.4e-4 |
+| 0 | 0.25 | 0.92123 | 0.92026 / 0.91984 | 1.5e-3 |
+| 0 | 0.5 | 0.90610 | 0.90458 / 0.90472 | 1.7e-3 |
+| 0 | 0.75 | 0.88502 | 0.88339 / 0.88367 | 1.8e-3 |
+| 0 | 1 | 0.87124 | 0.86999 / 0.86998 | 1.4e-3 |
+| 1 | 0.05 | 0.99999 | 0.99997 / 0.99960 | 3.9e-4 |
+| 1 | 0.25 | 0.98875 | 0.98819 / 0.98745 | 1.3e-3 |
+| 1 | 0.5 | 0.85740 | 0.85769 / 0.85664 | 8.9e-4 |
+| 1 | 0.75 | 0.66318 | 0.66357 / 0.66328 | 5.9e-4 |
+| 1 | 1 | 0.45069 | 0.45239 / 0.45071 | 3.8e-3 |
+
+모든 `ρ` ≤ 1, 모든 추정 ≤ 1 + 5e-3. 단언은 1 %다(타일을 가로질러 시선 각도가 ±0.05 rad 변한다). BRDF는 네 `(metallic, roughness)` 쌍에서 24×24 방향 격자 위로 음이 아니고 1e-5까지 상호적이다(`brdf_is_reciprocal_and_non_negative`).
+
+**GPU 대 CPU 레퍼런스** (`gpu_matches_the_cpu_on_textures_and_materials`, 텍스처 씬 64×64, 쿼터니언이 골든의 것이 아닌 자기 카메라에서):
+
+| 비교 | 측정 |
+|---|---|
+| `Rs` `Lambert` `Rgb8`, 세그멘테이션 | 0 바이트 다름 |
+| `Rs` `Lambert` 깊이 / 노멀 | 6 ULP(상대 5.3e-7) / 0 ULP — [§14.4](#144-동등성-측정)의 카메라 잔차 |
+| `Rs` `Full` `Rgb8` | 12,288 바이트 중 0 |
+| `Pt` 1 spp, 3 바운스, NEE 없음 | 2,915 ULP, **정규화 2.0e-6** |
+| `Pt` NEE 4 spp / `ReSTIR` 1 spp | 212 ULP, 1.1e-6 / 42 ULP, 정규화 1.9e-7; `Rgb8`은 둘 다 0 바이트 |
+| 퍼니스, 재질 셋 × NEE 끔 / 켬 (`gpu_white_furnace_matches_the_cpu`) | ≤ 5 ULP, 정규화 ≤ 3.1e-7 |
+
+Lambert 씬에서는 비트 동일한 `Pt` 1 spp가 여기서는 아니다: 텍스처나 PBR 표면은 골든이 아닌 카메라의 몇 ULP짜리 깊이 잔차를 몇 ULP짜리 텍스처 좌표와 반사 방향으로 바꾸고, 평평한 알베도는 그것에 둔감하다. §5.1의 1e-5 안에 머문다.
+
+**골든**은 CPU 레퍼런스에서 `generate_textured_goldens`가 쓴다(자기 생성기라 더 오래된 골든을 다시 쓸 수 없다): `textured_rs_rgb8`, `textured_rs_full_rgb8`, `textured_pt_nee_rgb8`(4 spp, 3 바운스, NEE, 하늘 `0.3 0.35 0.4`, 노출 4). CPU는 셋 모두를 비트 단위로 재현하고, GPU도 그렇다(각각 12,288 바이트 중 0).
+
+### 15.5 HT1이 건너뛰는 것
+
+- **밉맵** — 패스 트레이서의 샘플과 `Full`의 SSAA가 풋프린트를 평균한다. 앨리어싱이 보이면 밉 체인은 나중 행이다(배치 오라클의 글자 가장자리가 재는 것이 그것이다).
+- **노멀·방출 맵, glTF 재질** — HT2. `rgb|orm|metallic|roughness` 밖의 `<layer>` 역할은 이름으로 거부한다.
+- **투명도**(0이 아닌 알파는 이전처럼 무시), **`reflectance`**(MuJoCo의 평면 거울; 표현되지 않는 속성으로 보고), 손잡이로서의 `specular`, `hflip` / `vflip` / `nchannel`(보고하되 따르지 않음).
+- **MuJoCo classic 렌더러의 cube 텍스처 색 공간**: 그 렌더러는 `colorspace`가 무엇이든 cube 면을 선형 `GL_RGB`로 올린다. 이 렌더러는 `colorspace`를 따른다. 번들의 `block.png`는 선형으로 선언되어 있으므로 둘이 그 위에서는 일치한다.
+- **영속 텍스처 버퍼**: 텍셀은 삼각형 버퍼에 실려 프레임마다 삼각형과 함께 다시 올라간다(`pack_materials`의 `ponytail:`). 손의 카메라에서 그 비용은 `frame_profile`이 잴 때까지 `Target / Status: unverified`다.
+- **에디터의 리플레이 래스터라이저**(`raster.rs`)는 텍셀이 아니라 기저색 인자를 그린다.

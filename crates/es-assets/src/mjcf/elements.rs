@@ -75,12 +75,18 @@ impl<'a> Parser<'a> {
                 }
             }
             let asset = AssetRef::from_path(kind, &name, &path);
+            // Plan H, HT1: what a texture declares and what a drawn material carries.
+            match kind {
+                AssetKind::Texture => self.parse_texture(&attrs, asset.id)?,
+                AssetKind::Material => self.parse_material(child, &attrs, asset.id)?,
+                _ => {}
+            }
             attrs.report_unknown(&mut self.warnings);
             match kind {
                 AssetKind::Mesh => self.names.meshes.insert(name, asset.id),
                 AssetKind::Material => self.names.materials.insert(name, asset.id),
                 AssetKind::HeightField => self.names.hfields.insert(name, asset.id),
-                AssetKind::Texture => None,
+                AssetKind::Texture => self.names.textures.insert(name, asset.id),
             };
             self.scene.assets.push(asset);
         }
@@ -476,7 +482,7 @@ fn head<const N: usize>(values: Option<Vec<f64>>, default: [f64; N]) -> [f64; N]
 }
 
 /// `<compiler meshdir>` + the file attribute, without pretending to be a path library.
-fn join(dir: &str, file: &str) -> String {
+pub(super) fn join(dir: &str, file: &str) -> String {
     if dir.is_empty() || file.is_empty() {
         return file.to_owned();
     }

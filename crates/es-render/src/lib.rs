@@ -39,6 +39,7 @@ pub mod bvh;
 pub mod cornell;
 pub mod cpu;
 pub mod error;
+pub mod material;
 pub mod raster;
 pub mod renderer;
 pub mod rng;

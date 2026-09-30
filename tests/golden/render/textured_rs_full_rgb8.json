@@ -1,0 +1,16 @@
+{
+  "dtype": "u8",
+  "generator": "cargo test -p es-render --test textured -- --ignored generate_textured_goldens",
+  "kernel": "raster.v2 (Shading::Full, ssaa 2, textured, glTF metallic-roughness)",
+  "layout": "row-major, little-endian, tightly packed",
+  "name": "textured_rs_full_rgb8",
+  "oracle": "es_render::cpu, the pure-Rust mirror of the Slang kernels",
+  "pins": "OpenCV camera frame and top-left image origin (spec 3.1)",
+  "scene": "tests/fixtures/mjcf/textured/textured.xml, camera `cam`",
+  "shape": [
+    64,
+    64,
+    3
+  ],
+  "spec": "docs/design/renderer.md section 15"
+}

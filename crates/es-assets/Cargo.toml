@@ -13,6 +13,8 @@ blake3 = { workspace = true }
 thiserror = { workspace = true }
 gltf = { version = "1", default-features = false, features = ["utils", "names", "KHR_materials_emissive_strength"] }
 roxmltree = "0.20"
+# PNG textures (plan H, HT1); already in the lockfile through the editor.
+png = "0.18"
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -55,7 +55,10 @@ void main(uint3 tid : SV_DispatchThreadID) {
     if (es_shading() == 0) {
         if (got) {
             EsTri tr = es_tri(hit);
-            out_rgb[p.index] = es_pack_rgba8(es_shade_lambert(tr, es_face_forward(tr.n, d)));
+            // A textured triangle shades its texel times the factor (plan H, HT1); `mat == 0`
+            // is the flat albedo, the bits every golden pins.
+            EsSurface s = es_surface(tr, vw.pos, d);
+            out_rgb[p.index] = es_pack_rgba8(es_shade_lambert_base(s.base, tr, es_face_forward(tr.n, d)));
         }
         return;
     }
@@ -76,7 +79,7 @@ void main(uint3 tid : SV_DispatchThreadID) {
             if (!es_nearest(vw.pos, ds, vw.near, vw.far, ts, hs)) { continue; }
             EsTri trs = es_tri(hs);
             float3 ns = es_face_forward(trs.n, ds);
-            acc += es_shade_full(trs, ns, vw.pos + ds * ts, ds);
+            acc += es_shade_full(trs, es_surface(trs, vw.pos, ds), ns, vw.pos + ds * ts, ds);
         }
     }
     out_rgb[p.index] = es_pack_rgba8(acc * (1.0 / float(ssaa * ssaa)));

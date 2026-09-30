@@ -54,6 +54,13 @@ impl<'a> Attrs<'a> {
             .or_else(|| self.defaults.get(name).copied())
     }
 
+    /// Whether the element (or its class) writes `name`, **without** counting it as read — so
+    /// a caller can decide whether to read an element at all and leave the unknown-attribute
+    /// warnings of one it does not read exactly as they were.
+    pub(crate) fn has(&self, name: &str) -> bool {
+        self.node.attribute(name).is_some() || self.defaults.contains_key(name)
+    }
+
     pub(crate) fn get_or(&self, name: &'static str, default: &'a str) -> &'a str {
         self.get(name).unwrap_or(default)
     }

@@ -676,6 +676,7 @@ fn full_shading_is_energy_conserving() {
         albedo,
         emission: [0.0; 3],
         seg: 1,
+        ..es_render::Tri::default()
     };
     let hemi = {
         // The same two operations `shade_full` and `common.slang` use, not `f32::midpoint`.
@@ -750,9 +751,11 @@ fn ssaa_is_a_fixed_order_box_filter() {
             albedo: [0.6, 0.5, 0.4],
             emission: [0.0; 3],
             seg: 1,
+            ..es_render::Tri::default()
         }],
         lights: Vec::new(),
         names: std::collections::BTreeMap::new(),
+        ..TriScene::default()
     };
     let cam = CameraView {
         pose: cornell_camera(N, N).pose,

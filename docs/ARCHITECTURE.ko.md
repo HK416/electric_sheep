@@ -1875,6 +1875,8 @@ Vision Encoder → Policy
 
 **출력 계약:** 세 경로 모두 동일 채널(RGB, 선형 깊이, 인스턴스/시맨틱 세그, 월드 노멀, 옵티컬 플로우, 속도)을 동일 텐서 레이아웃으로. 깊이·세그·노멀은 RS/PT가 비트 동일, RGB는 SSIM 임계.
 
+**재질과 텍스처 (plan H, HT1; 2026-09-30 소유자 결정, M7 R6):** MJCF `<texture>`(2d·cube, PNG 파일·격자·여섯 파일, builtin `checker|gradient|flat`과 mark, `colorspace`)와 `<material>`(`rgba`, `texture`, `texrepeat`, `texuniform`, `emission`, `metallic`, `roughness`, `<layer role="rgb|orm|metallic|roughness">`)을 두 경로가 그린다. 텍스처 좌표는 MuJoCo 3.13 classic 렌더러의 것(프리미티브별 UV, cube는 단위 물체 좌표의 방향, 메시는 자기 UV 또는 MuJoCo의 texgen)이고, 샘플링은 bilinear·repeat(cube 면 안에서는 clamp)·밉맵 없음이다. 재질 모델은 glTF 2.0 metallic-roughness 하나다: GGX `D`, height-correlated Smith `V`, Schlick `F`, `F0 = mix(0.04, base, metallic)`, Lambert 로브 `(1 − F(n·l))(1 − F(n·v))(1 − metallic)·base/π` — glTF 부록 B의 `(1 − F(v·h))`는 흰 퍼니스에서 1을 넘기(60°, 거칠기 0.05에서 1.025) 때문에 상호적이고 1 이하인 이 결합으로 바꾼다. `Rs` `Lambert`는 기저색(인자 × 텍셀)만, `Rs` `Full`은 PBR 재질의 직접광에 같은 BRDF, `Pt`는 GGX 가시 노멀 중요도 샘플링과 NEE·ReSTIR DI와의 MIS. PBR은 명시적으로 쓴 `specular`·`shininess`·`metallic`·`roughness`(또는 맵)만이 켜고, MuJoCo의 *기본값*은 켜지 않는다; 고전 쌍은 `roughness = (2/(128·shininess + 2))^{1/4}` 하나의 공식으로 바뀐다. **가산적이다:** 텍스처도 명시적 재질 속성도 없는 씬은 `scene_hash`와 모든 렌더 바이트가 이전과 같다 — `rgba`만 가진 재질은 그려지는 재질이 아니며, 텍스처 바이트는 경로가 아니라 내용으로 `asset_hash`에 들어간다. 텍셀 디코드는 양쪽이 같은 버퍼에서 읽는 512항목 표(선형, sRGB — `es_math::approx`로 만든)로 하고, 무게중심 좌표는 곱을 풀어 쓴 `dot`·`cross`로 다시 구해 GPU와 CPU 레퍼런스가 같은 텍스처 좌표를 본다. 상세와 측정은 `docs/design/renderer.md` §15.
+
 PT는 M4이며 §1.9 축소 순서 2번이다. **RS만으로 비전 학습이 성립한다**는 것이 설계 전제다.
 
 ### 15.4 가속 구조
@@ -2927,7 +2929,9 @@ E: `es-editor`·`es-telemetry`·`es-eval`의 훅 한 곳, R: `es-render`·`es-en
 **사다리에 없는 것과 이유.** **메시 지옴 렌더**(SO-101 상류 STL)와 **MJCF 텍스처·재질**(builtin
 checker, `texrepeat`, `specular`·`shininess`)은 각각 `es-assets`의 `Shape::Mesh` 로딩과 `Material`
 필드를 요구하고, 둘 다 `scene_hash`를 움직여 커밋된 체크포인트를 무효화한다 — 소유자 결정 뒤 R5·R6로
-이어진다. **MJWarp을 평가에**(§28.9 사다리 11)는 티어 3 백엔드가 숫자를 바꾸므로 T8이 nominal을
+이어진다. (R6은 2026-09-30 소유자 결정으로 plan H의 HT1이 되었다: 메시(M10/W2)의 선례대로 *가산적*이라,
+텍스처도 명시적 재질 속성도 없는 씬은 `scene_hash`가 그대로이고 커밋된 체크포인트는 하나도 움직이지 않았다 —
+§15.3, `docs/design/renderer.md` §15.) **MJWarp을 평가에**(§28.9 사다리 11)는 티어 3 백엔드가 숫자를 바꾸므로 T8이 nominal을
 병렬화한 뒤 그 이득이 남아 있을 때 연다. **센서 리얼리즘 패스**(§18.3)는 요구된 적이 없다. **M6**은
 보류.
 
