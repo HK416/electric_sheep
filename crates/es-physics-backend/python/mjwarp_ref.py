@@ -92,6 +92,9 @@ patch_ccd_grid_size()
 # qpos / dof width per joint type, indexed by mjtJoint (free, ball, slide, hinge).
 JOINT_DIMS = {0: (7, 6), 1: (4, 3), 2: (1, 1), 3: (1, 1)}
 
+# MuJoCo's mjMAXVAL: a qpos, qvel or qacc past it is "bad" to `mj_step` (`Sim.step`).
+MAXVAL = 1e10
+
 
 def name_of(model, objtype, index):
     return mujoco.mj_id2name(model, objtype, index) or ""
@@ -378,10 +381,14 @@ class Sim(object):
                 mjw.step(self.m, self.d)
 
         self.replay(("step", n), launch)
-        qpos = np.asarray(self.d.qpos.numpy(), dtype=np.float64).reshape(self.n_envs, -1)
-        qvel = np.asarray(self.d.qvel.numpy(), dtype=np.float64).reshape(self.n_envs, -1)
-        finite = np.isfinite(qpos).all(axis=1) & np.isfinite(qvel).all(axis=1)
-        return [int(env) for env in np.flatnonzero(~finite)]
+        # MuJoCo's own test (`mj_checkPos` / `mj_checkVel` / `mj_checkAcc`): NaN or past
+        # mjMAXVAL. mujoco_warp neither checks nor resets, and a blow-up in float32 can stay
+        # finite for many steps (qpos ~1e15), so finiteness alone misses it (packet M16/H2b).
+        bad = np.zeros(self.n_envs, dtype=bool)
+        for field in (self.d.qpos, self.d.qvel, self.d.qacc):
+            values = np.asarray(field.numpy(), dtype=np.float64).reshape(self.n_envs, -1)
+            bad |= ~(np.abs(values) <= MAXVAL).all(axis=1)
+        return [int(env) for env in np.flatnonzero(bad)]
 
 
 def handle(sim, req):
