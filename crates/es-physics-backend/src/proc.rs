@@ -42,6 +42,14 @@ pub enum Request<'a> {
         envs: Option<&'a [u32]>,
         state: Option<StatePayload<'a>>,
     },
+    /// `reset` to `mjwarp_ref.py` with its state as a frame: `qpos`, `qvel` and `act`, of the
+    /// `state_frame` lengths, follow the line as raw little-endian `f64` bytes
+    /// ([`Process::reset_frame`], packet M16/H2c).
+    #[serde(rename = "reset")]
+    ResetFrame {
+        envs: Option<&'a [u32]>,
+        state_frame: [usize; 3],
+    },
     SetCtrl {
         ctrl: &'a [f64],
     },
@@ -550,6 +558,23 @@ impl Process {
         Ok(())
     }
 
+    /// `reset` with `state` as a frame after the line (packet M16/H2c): the JSON `state`, bit
+    /// for bit, without Python parsing `rows * (nq + nv)` decimal numbers -- which, at 2,048
+    /// Shadow Hand envs resetting together, was most of a control step.
+    pub fn reset_frame(
+        &mut self,
+        envs: Option<&[u32]>,
+        state: &StatePayload<'_>,
+    ) -> Result<(), PhysicsError> {
+        let bytes: Vec<u8> = [state.qpos, state.qvel, state.act]
+            .iter()
+            .flat_map(|a| a.iter().flat_map(|v| v.to_le_bytes()))
+            .collect();
+        let state_frame = [state.qpos.len(), state.qvel.len(), state.act.len()];
+        let _: Ack = self.call_with(&Request::ResetFrame { envs, state_frame }, &bytes)?;
+        Ok(())
+    }
+
     /// The [`PhysicsError::ProcessDied`] for a call that failed with `cause` (packet M12/R6):
     /// a line the process left on stdout (a protocol error line's `error` replaces `cause`),
     /// how it exited, and the tail of its stderr. Stdout is read only after a failed write and
@@ -951,6 +976,71 @@ mod tests {
         assert_eq!(bits(&a.xpos), bits(&b.xpos));
     }
 
+    /// Packet M16/H2c: through the real protocol, a `reset` whose state is sent as a frame
+    /// leaves `mjwarp_ref.py` in the state the same reset as JSON does, bit for bit -- rows
+    /// reset out of order and a zero cube quaternion among them. Compared right after the
+    /// reset's forward pass: two processes stepping contacts on the GPU are not bitwise with
+    /// each other (tier 2, measured here JSON against JSON), so a step after it would compare
+    /// the device, not the encoding.
+    #[test]
+    fn mjwarp_reset_frame_is_the_json_reset() {
+        if let Err(why) = crate::MjWarpBackend::is_available() {
+            println!("SKIP mjwarp_reset_frame_is_the_json_reset: {why}");
+            return;
+        }
+        let mjcf = crate::tests_support::fixture("so101_pick_place.xml");
+        let load = Request::Load {
+            mjcf: &mjcf,
+            n_envs: 3,
+            timestep: None,
+            seed: 0,
+        };
+        let run = |frame: bool| {
+            let (mut p, info): (Process, LoadReply) =
+                Process::start(crate::mjwarp::SCRIPT, "MuJoCo Warp", &load).unwrap();
+            let (nq, nv) = (info.nq as usize, info.nv as usize);
+            let ctrl: Vec<f64> = (0..3 * info.nu)
+                .map(|k| 0.1 * f64::from(k) / 3.0 - 0.2)
+                .collect();
+            p.set_ctrl_frame(&ctrl).unwrap();
+            let _: StepReply = p.call(&Request::Step { n: 20 }).unwrap();
+            let envs = [2, 0];
+            // Joint coordinates drawn, everything else zero: the free joint's quaternion too.
+            let qpos: Vec<f64> = (0..2 * nq)
+                .map(|k| {
+                    if k % nq < 6 {
+                        0.01 * (k as f64) - 0.05
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            let qvel: Vec<f64> = (0..2 * nv).map(|k| 0.001 * (k as f64)).collect();
+            let state = StatePayload {
+                qpos: &qpos,
+                qvel: &qvel,
+                act: &[],
+            };
+            if frame {
+                p.reset_frame(Some(&envs), &state).unwrap();
+            } else {
+                let _: Ack = p
+                    .call(&Request::Reset {
+                        envs: Some(&envs),
+                        state: Some(state),
+                    })
+                    .unwrap();
+            }
+            p.call_state().unwrap()
+        };
+        let (a, b) = (run(true), run(false));
+        let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&a.qpos), bits(&b.qpos));
+        assert_eq!(bits(&a.qvel), bits(&b.qvel));
+        assert_eq!(bits(&a.xpos), bits(&b.xpos));
+        assert_eq!(bits(&a.xquat), bits(&b.xquat));
+    }
+
     /// Packet M16/H0: `mjwarp_ref.py`'s state frame is its old JSON state, bit for bit, after a
     /// replayed step graph.
     #[test]
@@ -990,6 +1080,13 @@ mod tests {
                 state: None
             }),
             r#"{"cmd":"reset","envs":[1],"state":null}"#
+        );
+        assert_eq!(
+            encode(&Request::ResetFrame {
+                envs: None,
+                state_frame: [4, 3, 0]
+            }),
+            r#"{"cmd":"reset","envs":null,"state_frame":[4,3,0]}"#
         );
     }
 
