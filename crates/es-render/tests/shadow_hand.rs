@@ -4,15 +4,20 @@
 //! `qpos0`, so the scene's static body poses) seen from `top`, `front` and `side` at the Task
 //! IR's 96x96:
 //!
-//! * the CPU reference (`Rs`) draws the held cube's face slabs and the goal cube's in every
-//!   camera, and draws no alpha-0 geom (the hand's collision capsules, the floor);
+//! * the CPU reference (`Rs`) draws the held cube and the goal cube in every camera, and
+//!   draws no alpha-0 geom (the hand's collision capsules, which name a material, and the
+//!   floor);
 //! * the GPU rasterizer reproduces the CPU reference bit for bit (`Rgb8`, `SegmentationId`), as
 //!   the cornell oracles in `render.rs` do;
 //! * the GPU path tracer at the X7 rerun's settings (4 spp, 3 bounces, exposure 64) gives the
-//!   cube segmentation pixels in all three cameras.
+//!   cube segmentation pixels in all three cameras;
+//! * packet H1b: the two cubes wear the bundle's `block.png` where `MuJoCo`'s own renderer puts
+//!   it (`mujoco.Renderer`, as `textured.rs`'s placement oracle; needs `ES_PYTHON`).
 //!
 //! `ES_RENDER_DUMP=<dir>` writes each frame's `Rgb8` bytes (`<camera>_<path>.rgb`, 96x96x3)
 //! there, for a person to look at. GPU tests print `SKIP` without a device or `slangc`.
+
+#![allow(clippy::many_single_char_names)]
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -43,6 +48,10 @@ fn scene() -> SceneDesc {
 /// with `+Y` up, `OpenCV` down `+Z` with `+Y` down -- a half turn about `X`
 /// (`es_env::render::camera_view`, which this crate cannot import: layer 9 over layer 5).
 fn view(scene: &SceneDesc, name: &str) -> CameraView {
+    view_at(scene, name, SIDE)
+}
+
+fn view_at(scene: &SceneDesc, name: &str, side: u32) -> CameraView {
     let camera = scene
         .cameras
         .iter()
@@ -53,7 +62,7 @@ fn view(scene: &SceneDesc, name: &str) -> CameraView {
         pose: camera
             .pose
             .compose(Pose::new(Vec3::ZERO, Quat::from_xyzw(1.0, 0.0, 0.0, 0.0))),
-        spec: ImageSpec::pinhole(SIDE, SIDE, camera.fovy),
+        spec: ImageSpec::pinhole(side, side, camera.fovy),
     }
 }
 
@@ -69,15 +78,15 @@ fn pt() -> RenderConfig {
     cfg
 }
 
-/// Pixels per geom-name prefix (`object_`, `target_`), read off a segmentation tile.
+/// Pixels per cube (`object`, `target`), read off a segmentation tile.
 fn counts(tri: &TriScene, seg: &[u32]) -> BTreeMap<&'static str, usize> {
     let mut out = BTreeMap::new();
-    for prefix in ["object_", "target_"] {
+    for cube in ["object", "target"] {
         let n = seg
             .iter()
-            .filter(|s| tri.names.get(s).is_some_and(|n| n.starts_with(prefix)))
+            .filter(|s| tri.names.get(s).is_some_and(|n| n == cube))
             .count();
-        out.insert(prefix, n);
+        out.insert(cube, n);
     }
     out
 }
@@ -101,13 +110,11 @@ fn every_camera_sees_both_cubes_and_no_alpha_zero_geom() {
     let hidden: Vec<u32> = tri
         .names
         .iter()
-        .filter(|(_, n)| {
-            n.starts_with("robot0:C_") || *n == "floor0" || *n == "object" || *n == "target"
-        })
+        .filter(|(_, n)| n.starts_with("robot0:C_") || *n == "floor0")
         .map(|(s, _)| *s)
         .collect();
-    // 20 collision geoms, the floor and the two cubes' own boxes (their slabs are drawn).
-    assert_eq!(hidden.len(), 20 + 1 + 2, "{hidden:?}");
+    // 20 collision geoms (material `robot0:MatColl`, geom alpha 0) and the floor.
+    assert_eq!(hidden.len(), 20 + 1, "{hidden:?}");
     assert!(tri.tris.iter().all(|t| !hidden.contains(&t.seg)));
 
     for name in CAMERAS {
@@ -124,8 +131,8 @@ fn every_camera_sees_both_cubes_and_no_alpha_zero_geom() {
             "rs",
             frame.tile(Channel::Rgb8).unwrap().as_u8().unwrap(),
         );
-        assert!(n["object_"] > 0, "`{name}` does not see the cube");
-        assert!(n["target_"] > 0, "`{name}` does not see the goal cube");
+        assert!(n["object"] > 0, "`{name}` does not see the cube");
+        assert!(n["target"] > 0, "`{name}` does not see the goal cube");
     }
 }
 
@@ -182,6 +189,214 @@ fn gpu_path_tracer_sees_the_cube_from_every_camera() {
         let rgb = atlas.read_tile(0, Channel::Rgb8).expect("rgb");
         dump(name, "pt", rgb.as_u8().unwrap());
         println!("{name}: Pt segmentation pixels {n:?}");
-        assert!(n["object_"] > 0, "`{name}` does not see the cube on Pt");
+        assert!(n["object"] > 0, "`{name}` does not see the cube on Pt");
     }
+}
+
+// --- packet H1b: the block texture where MuJoCo puts it ------------------------------------------
+
+/// `MuJoCo` drawing the fixture at `qpos0` from each camera, one process for all three (its
+/// GL context has failed to start now and then on this Windows desktop, so the test launches
+/// it once and skips on failure). Two edits to what it draws, both
+/// shading rather than placement: the headlight's specular is 0 (the cube materials'
+/// `specular="1"` would wash a face turned to the camera towards white, and this renderer's
+/// `Rs` Lambert draws no highlight), and the goal material's alpha is 1 (this renderer draws the
+/// goal opaque). Alpha-0 geoms go to group 5, which is not drawn, so `MuJoCo`'s transparent pass
+/// cannot occlude anything with them.
+const MUJOCO: &str = r"
+import os
+import sys
+import mujoco
+path, cameras, side = sys.argv[1], sys.argv[2].split(','), int(sys.argv[3])
+m = mujoco.MjModel.from_xml_path(path)
+m.vis.headlight.specular[:] = 0
+m.mat_rgba[m.material('material:target').id, 3] = 1
+m.geom_group[m.geom_rgba[:, 3] == 0] = 5
+d = mujoco.MjData(m)
+mujoco.mj_forward(m, d)
+opt = mujoco.MjvOption()
+opt.geomgroup[5] = 0
+r = mujoco.Renderer(m, side, side)
+for camera in cameras:
+    r.update_scene(d, camera=camera, scene_option=opt)
+    sys.stdout.buffer.write(r.render().tobytes())
+sys.stdout.buffer.flush()
+os._exit(0)  # past the GL context's teardown, which has crashed on this Windows desktop
+";
+
+/// One `side x side x 3` image per camera of [`CAMERAS`], in order.
+fn mujoco_render(side: u32) -> Result<Vec<Vec<u8>>, String> {
+    let python = match std::env::var("ES_PYTHON") {
+        Ok(p) if !p.trim().is_empty() => p,
+        _ => "python".to_owned(),
+    };
+    let dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mjcf/shadow_hand");
+    let out = std::process::Command::new(&python)
+        .args(["-c", MUJOCO])
+        .arg(dir.join("shadow_hand_repose.xml"))
+        .arg(CAMERAS.join(","))
+        .arg(side.to_string())
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("`{python}`: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "{}: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    let one = (side * side * 3) as usize;
+    if out.stdout.len() != one * CAMERAS.len() {
+        return Err(format!("{} bytes from MuJoCo", out.stdout.len()));
+    }
+    Ok(out.stdout.chunks(one).map(<[u8]>::to_vec).collect())
+}
+
+fn srgb_decode(b: u8) -> f32 {
+    let c = f32::from(b) / 255.0;
+    if c <= 0.040_45 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// Linear RGB over its largest channel: what two lighting models leave alone.
+fn chroma(lin: [f32; 3]) -> [f32; 3] {
+    let m = lin[0].max(lin[1]).max(lin[2]).max(1e-6);
+    lin.map(|c| c / m)
+}
+
+fn nearest(c: [f32; 3], palette: &[[f32; 3]]) -> usize {
+    let d = |p: &[f32; 3]| (0..3).map(|i| (c[i] - p[i]).powi(2)).sum::<f32>();
+    (0..palette.len())
+        .min_by(|a, b| d(&palette[*a]).total_cmp(&d(&palette[*b])))
+        .unwrap_or(0)
+}
+
+/// Packet H1b's placement oracle, `textured.rs`'s method on the hand: every visible face of the
+/// held cube and of the goal (a segmentation id and a world-axis normal, borders dropped, at
+/// least 200 of the 192x192 pixels) is classified per pixel against `block.png`'s six backdrop
+/// colours and white in both images; the dominant backdrop must agree, and at least 85 % of the pixels.
+/// At `qpos0` both cubes sit unrotated, so `top` sees their `+Z` faces and `front` and `side`
+/// their `-Y` and `-X` faces.
+#[test]
+fn mujoco_puts_the_block_texture_where_we_do() {
+    const PX: u32 = 192;
+    let scene = scene();
+    let tri = TriScene::from_scene(&scene).expect("the hand tessellates");
+    let block = scene
+        .assets
+        .iter()
+        .find(|a| a.name == "texture:object")
+        .expect("the block texture");
+    let block = scene.textures[&block.id].data.as_ref().expect("decoded");
+    let mut palette: Vec<[f32; 3]> = (0..6)
+        .map(|f| chroma(block.texel(f, 5, 5).map(|b| f32::from(b) / 255.0)))
+        .collect();
+    palette.push([1.0; 3]);
+    let seg_of = |name: &str| *tri.names.iter().find(|(_, n)| *n == name).unwrap().0;
+    let cubes = [seg_of("object"), seg_of("target")];
+    let s = PX as usize;
+    let images = match mujoco_render(PX) {
+        Ok(images) => images,
+        Err(why) => {
+            println!("SKIP mujoco_puts_the_block_texture_where_we_do: {why}");
+            return;
+        }
+    };
+    let (mut faces, mut wrong) = (0, Vec::new());
+    for (name, theirs) in CAMERAS.into_iter().zip(images) {
+        let cam = view_at(&scene, name, PX);
+        let ours = cpu::rasterize(
+            &tri,
+            &cam,
+            &RenderConfig::rs(TileAtlasCfg::row(PX, PX, 1)),
+            0,
+        );
+        let rgb = ours.tile(Channel::Rgb8).unwrap().as_u8().unwrap();
+        let seg = ours
+            .tile(Channel::SegmentationId)
+            .unwrap()
+            .as_u32()
+            .unwrap();
+        let normal = ours.tile(Channel::Normal).unwrap().as_f32().unwrap();
+        if let Ok(dir) = std::env::var("ES_RENDER_DUMP") {
+            let dir = PathBuf::from(dir);
+            std::fs::write(dir.join(format!("{name}_placement_ours.rgb")), rgb).unwrap();
+            std::fs::write(dir.join(format!("{name}_placement_mujoco.rgb")), &theirs).unwrap();
+        }
+        let axis = |i: usize| {
+            let n = &normal[i * 3..i * 3 + 3];
+            let w = cam.pose.orientation.rotate(Vec3::new(
+                f64::from(n[0]),
+                f64::from(n[1]),
+                f64::from(n[2]),
+            ));
+            let c = [w.x, w.y, w.z];
+            let k = (0..3)
+                .max_by(|x, y| c[*x].abs().total_cmp(&c[*y].abs()))
+                .unwrap();
+            (k, c[k] > 0.0)
+        };
+        let interior = |i: usize| {
+            let (x, y) = (i % s, i / s);
+            x > 0
+                && y > 0
+                && x + 1 < s
+                && y + 1 < s
+                && [i - 1, i + 1, i - s, i + s]
+                    .iter()
+                    .all(|j| seg[*j] == seg[i] && axis(*j) == axis(i))
+        };
+        let mut regions: BTreeMap<(u32, usize, bool), Vec<usize>> = BTreeMap::new();
+        for i in (0..s * s).filter(|i| cubes.contains(&seg[*i]) && interior(*i)) {
+            let (k, pos) = axis(i);
+            regions.entry((seg[i], k, pos)).or_default().push(i);
+        }
+        for ((id, k, pos), pixels) in &regions {
+            let class = |lin: [f32; 3]| nearest(chroma(lin), &palette);
+            let mine: Vec<usize> = pixels
+                .iter()
+                .map(|i| class([0, 1, 2].map(|c| srgb_decode(rgb[i * 3 + c]))))
+                .collect();
+            let mj: Vec<usize> = pixels
+                .iter()
+                .map(|i| class([0, 1, 2].map(|c| f32::from(theirs[i * 3 + c]) / 255.0)))
+                .collect();
+            // A face is its backdrop: the most frequent class other than the letters' white.
+            let dominant = |c: &[usize]| {
+                let mut n = [0usize; 6];
+                c.iter().filter(|x| **x < 6).for_each(|x| n[*x] += 1);
+                (0..6).max_by_key(|j| n[*j]).unwrap()
+            };
+            let agree =
+                mine.iter().zip(&mj).filter(|(x, y)| x == y).count() as f64 / pixels.len() as f64;
+            let face = format!(
+                "{} {}{}",
+                tri.names[id],
+                if *pos { '+' } else { '-' },
+                ['x', 'y', 'z'][*k]
+            );
+            println!(
+                "{name}: {face}: {} px, dominant ours {} / MuJoCo {}, agreement {agree:.3}",
+                pixels.len(),
+                dominant(&mine),
+                dominant(&mj)
+            );
+            if pixels.len() < 200 {
+                // A face seen edge-on (the goal's -X, ~100 px, 0.64) is where MuJoCo's
+                // trilinear mipmapping blurs the letters most (renderer.md 15.4).
+                continue;
+            }
+            if dominant(&mine) != dominant(&mj) || agree < 0.85 {
+                wrong.push(format!("{name}: {face}"));
+            }
+            faces += 1;
+        }
+    }
+    assert!(wrong.is_empty(), "faces that disagree: {wrong:?}");
+    assert!(faces >= 6, "only {faces} faces large enough to judge");
 }

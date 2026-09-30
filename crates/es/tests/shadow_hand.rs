@@ -114,7 +114,8 @@ const JOINT_NOISE: f64 = 0.2;
 const CUBE_NOISE: f64 = 0.01;
 const IMAGE: u32 = 96;
 /// Chosen by rendering: at 64 (the X7 rerun's) 3-6 % of each camera's pixels are the
-/// tonemap's white; at 8 none are, the brightest is 242 and the hand keeps its shading.
+/// tonemap's white; at 8 none are, the brightest is 242 and the hand keeps its shading
+/// (re-checked with packet H1b's textured cubes and `MatViz` hand: brightest 245).
 const EXPOSURE: f32 = 8.0;
 const CAMERAS: [(&str, &str); 3] = [
     ("top", "rgb_top"),
@@ -1633,7 +1634,7 @@ mod render {
                 .as_u32()
                 .expect("u32")
                 .iter()
-                .filter(|s| tri.names.get(s).is_some_and(|n| n.starts_with("object_")))
+                .filter(|s| tri.names.get(s).is_some_and(|n| n == "object"))
                 .count();
             let rgb = atlas.read_tile(0, Channel::Rgb8).expect("rgb");
             let rgb = rgb.as_u8().expect("u8");
@@ -1650,5 +1651,44 @@ mod render {
             assert_eq!(white, 0, "`{name}` saturates at exposure {EXPOSURE}");
         }
         println!("RAN the_cameras_declare_what_the_scene_renders_and_see_the_cube");
+    }
+
+    /// Packet H1b: the evaluation's `light_intensity` draw (`LightOverride::scene`) scales what
+    /// the hand scene draws -- each triangle's base colour factor, the textured cubes' and the
+    /// `MatViz` hand's included -- by the draw, and leaves the material table (the texels)
+    /// alone. Before the fix a geom that wears its material's colour (its own `rgba` at
+    /// `MuJoCo`'s default) was drawn as the default grey scaled: the cube at 0.25 instead of
+    /// 0.5, the hand at 0.25 instead of 0.465. 0.5 is a power of two, so the products are exact.
+    #[test]
+    fn a_light_intensity_draw_scales_the_drawn_colours() {
+        let (scene, _) = scene();
+        let base = TriScene::from_scene(&scene).expect("the hand tessellates");
+        let dim = es_eval::LightOverride {
+            intensity: 0.5,
+            yaw_deg: 0.0,
+        };
+        let dimmed = TriScene::from_scene(&dim.scene(&scene)).expect("the dimmed hand");
+        assert_eq!(base.tris.len(), dimmed.tris.len());
+        assert_eq!(*base.materials, *dimmed.materials, "the texels do not move");
+        for (a, b) in base.tris.iter().zip(&dimmed.tris) {
+            assert_eq!(a.mat, b.mat);
+            assert_eq!(
+                b.albedo,
+                a.albedo.map(|c| c * 0.5),
+                "{}",
+                base.names[&a.seg]
+            );
+        }
+        let albedo = |name: &str| {
+            dimmed
+                .tris
+                .iter()
+                .find(|t| dimmed.names[&t.seg] == name)
+                .unwrap_or_else(|| panic!("no triangle of {name}"))
+                .albedo
+        };
+        assert_eq!(albedo("object"), [0.5; 3], "block.png's factor, 1 x 0.5");
+        assert_eq!(albedo("robot0:V_palm"), [(0.93_f64 * 0.5) as f32; 3]);
+        println!("RAN a_light_intensity_draw_scales_the_drawn_colours");
     }
 }
