@@ -118,15 +118,17 @@ void main(uint3 gid : SV_DispatchThreadID) {
                 break;
             }
             EsTri tr = es_tri(hit);
+            // The surface this ray sees (plan H, HT1): the flat albedo and emission when
+            // `mat == 0`, the emissive texel times the emission under a map (HT2).
+            EsSurface sf = es_surface(tr, o, d);
             float w_em = 1.0;
             if (nee && b > 0) {
                 w_em = es_power_heuristic(prev_pdf, es_light_pdf(tr, d, t * t, n_lights));
             }
-            acc += (throughput * tr.emission) * w_em;
-            float3 n = es_face_forward(tr.n, d);
-            float3 hp = o + d * t + n * ES_RAY_EPS;
-            // The surface this ray sees (plan H, HT1): the flat albedo when `mat == 0`.
-            EsSurface sf = es_surface(tr, o, d);
+            acc += (throughput * sf.emission) * w_em;
+            float3 ng = es_face_forward(tr.n, d);
+            float3 hp = o + d * t + ng * ES_RAY_EPS;
+            float3 n = sf.bumped ? sf.ns : ng;
             float3 v = sf.pbr ? es_norm3(-d) : float3(0.0, 0.0, 0.0);
             if (nee) {
                 acc += throughput * es_nee_direct(
@@ -139,7 +141,7 @@ void main(uint3 gid : SV_DispatchThreadID) {
             float3 weight;
             float pdf;
             float sky_pdf;
-            es_bounce(sf, n, v,
+            es_bounce(sf, n, ng, v,
                       es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, s, b, 0),
                       es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, s, b, 7),
                       next, weight, pdf, sky_pdf);

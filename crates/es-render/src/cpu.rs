@@ -337,13 +337,18 @@ pub fn primary_dir_sub(
 /// `ponytail:` no shadows in `Rs`; add a shadow scan when a golden shows the missing contact
 /// shadow costs a policy something.
 pub(crate) fn shade_lambert(tri: &Tri, n: [f32; 3], cfg: &RenderConfig) -> [f32; 3] {
-    shade_lambert_base(tri.albedo, tri, n, cfg)
+    shade_lambert_base(tri.albedo, tri.emission, n, cfg)
 }
 
 /// [`shade_lambert`] with a base colour that is not the triangle's flat albedo — a texel
-/// times the factor, for a textured triangle (plan H, HT1). Metallic and roughness do not
-/// enter the `Lambert` look.
-fn shade_lambert_base(base: [f32; 3], tri: &Tri, n: [f32; 3], cfg: &RenderConfig) -> [f32; 3] {
+/// times the factor, for a textured triangle (plan H, HT1) — and the emission at the hit (an
+/// emissive map's texel, HT2). Metallic and roughness do not enter the `Lambert` look.
+fn shade_lambert_base(
+    base: [f32; 3],
+    emission: [f32; 3],
+    n: [f32; 3],
+    cfg: &RenderConfig,
+) -> [f32; 3] {
     let light = [
         cfg.light_dir.x as f32,
         cfg.light_dir.y as f32,
@@ -351,7 +356,7 @@ fn shade_lambert_base(base: [f32; 3], tri: &Tri, n: [f32; 3], cfg: &RenderConfig
     ];
     let ndl = dot(n, light).max(0.0);
     let lambert = cfg.ambient + ndl * (1.0 - cfg.ambient);
-    add(scale(base, lambert), tri.emission)
+    add(scale(base, lambert), emission)
 }
 
 /// [`Shading::Full`]: one shadow ray, a hemisphere ambient, a Blinn-Phong highlight (packet
@@ -374,7 +379,7 @@ pub fn shade_full(
     d: [f32; 3],
     cfg: &RenderConfig,
 ) -> [f32; 3] {
-    shade_full_surface(tris, bvh, tri, &Surface::flat(tri.albedo), n, p, d, cfg)
+    shade_full_surface(tris, bvh, tri, &Surface::of(tri), n, p, d, cfg)
 }
 
 /// [`shade_full`] on a [`Surface`] (plan H, HT1). A non-PBR surface is the Blinn-Phong look
@@ -389,11 +394,14 @@ pub fn shade_full(
 ///
 /// `pi * f * cos` is what makes a white Lambertian surface at normal incidence return its
 /// albedo, the scale `Full`'s own `diffuse * (1 - hemi)` term has.
+///
+/// A normal-mapped surface (plan H, HT2) lights and tints its hemisphere with the shading
+/// normal; the shadow ray still leaves along the geometric `n`. The emission is the surface's.
 #[allow(clippy::too_many_arguments)]
 pub fn shade_full_surface(
     tris: &[Tri],
     bvh: &Bvh,
-    tri: &Tri,
+    _tri: &Tri,
     surf: &Surface,
     n: [f32; 3],
     p: [f32; 3],
@@ -409,7 +417,7 @@ pub fn shade_full_surface(
         ..
     } = cfg.shading
     else {
-        return shade_lambert_base(surf.base, tri, n, cfg);
+        return shade_lambert_base(surf.base, surf.emission, surf.normal.unwrap_or(n), cfg);
     };
     let light = [
         cfg.light_dir.x as f32,
@@ -421,6 +429,7 @@ pub fn shade_full_surface(
     } else {
         1.0
     };
+    let n = surf.normal.unwrap_or(n);
     if surf.pbr {
         let v = normalize(scale(d, -1.0));
         let ndl = dot(n, light).max(0.0);
@@ -434,7 +443,7 @@ pub fn shade_full_surface(
             let a = c_diff[c] * (1.0 - f0[c]) + f0[c];
             a * hemi[c] + direct[c] * (1.0 - hemi[c])
         });
-        return add(rgb, tri.emission);
+        return add(rgb, surf.emission);
     }
     let diffuse = dot(n, light).max(0.0) * vis;
     let h = normalize(sub(light, d));
@@ -460,7 +469,7 @@ pub fn shade_full_surface(
         hemi[1] + diffuse * (1.0 - hemi[1]),
         hemi[2] + diffuse * (1.0 - hemi[2]),
     ];
-    add(add(mul(surf.base, lit), [spec; 3]), tri.emission)
+    add(add(mul(surf.base, lit), [spec; 3]), surf.emission)
 }
 
 /// Exact piecewise sRGB transfer (spec 3.1). `c^(1/2.4)` goes through `es_math::approx`, not
@@ -631,8 +640,9 @@ pub fn rasterize(
                     }
                     let d = primary_dir(&vp, px, py);
                     let tri = &scene.tris[(g.tri[i] - 1) as usize];
-                    let base = scene.materials.surface(tri, vp.pos, d).base;
-                    let lin = shade_lambert_base(base, tri, face_forward(tri, d), cfg);
+                    let surf = scene.materials.surface(tri, vp.pos, d);
+                    let n = surf.normal.unwrap_or_else(|| face_forward(tri, d));
+                    let lin = shade_lambert_base(surf.base, surf.emission, n, cfg);
                     for c in 0..3 {
                         rgb[i * 3 + c] = to_u8(lin[c]);
                     }
@@ -807,7 +817,7 @@ fn nee_direct(
         let pick = rng::uniform(keys[0], 0);
         let idx = ((pick * n_lights) as usize).min(scene.lights.len() - 1);
         let light = &scene.tris[scene.lights[idx] as usize];
-        let (lp, _, _) = tri_point(light, rng::uniform(keys[1], 0), rng::uniform(keys[1], 1));
+        let (lp, b0, b1) = tri_point(light, rng::uniform(keys[1], 0), rng::uniform(keys[1], 1));
         let seg = sub(lp, p);
         let dist2 = dot(seg, seg);
         let dist = approx::sqrt(dist2);
@@ -823,7 +833,8 @@ fn nee_direct(
                 };
                 // `dist * (1 - 1e-3)` so the shadow ray stops short of the light itself.
                 if !any_hit(&scene.tris, bvh, p, dir, 0.0, dist * (1.0 - 1e-3)) {
-                    out = add(out, scale(mul(f(dir), light.emission), cos_s / p_light * w));
+                    let le = scene.materials.emission_at(light, b0, b1);
+                    out = add(out, scale(mul(f(dir), le), cos_s / p_light * w));
                 }
             }
         }
@@ -867,7 +878,26 @@ fn nee_direct(
 /// (stream 0 for the diffuse lobe, stream 7 indices 1 and 2 for GGX's visible normals) and
 /// weights by `f * cos / pdf` over the lobe mixture; a direction below the surface ends the
 /// path's throughput at zero rather than its loop (spec 3.4: the bounce count stays fixed).
+///
+/// `n` is the shading normal; `ng` the geometric one. A normal-mapped surface's direction below
+/// the geometric surface is a zero-throughput one (plan H, HT2), which on any other surface
+/// never happens, since there the two normals are the same.
 fn bounce_dir(
+    surf: &Surface,
+    n: [f32; 3],
+    ng: [f32; 3],
+    v: [f32; 3],
+    key_dir: u32,
+    key_lobe: u32,
+) -> ([f32; 3], [f32; 3], f32, f32) {
+    let (l, throughput, pdf, sky) = bounce_lobe(surf, n, v, key_dir, key_lobe);
+    if surf.normal.is_some() && dot(ng, l) <= 0.0 {
+        return (l, [0.0; 3], pdf, sky);
+    }
+    (l, throughput, pdf, sky)
+}
+
+fn bounce_lobe(
     surf: &Surface,
     n: [f32; 3],
     v: [f32; 3],
@@ -1025,6 +1055,9 @@ pub fn path_trace_accum(
                         break;
                     };
                     let tri = &scene.tris[hit.tri as usize];
+                    // The surface this ray sees: its emission is the triangle's, times the
+                    // emissive texel under a map (plan H, HT2).
+                    let surf = scene.materials.surface(tri, o, d);
                     // An emissive hit reached by a BSDF bounce: the light-sampling strategy
                     // could have produced it too, so it is MIS-weighted against that pdf.
                     let w_em = if nee && bounce > 0 {
@@ -1033,10 +1066,10 @@ pub fn path_trace_accum(
                     } else {
                         1.0
                     };
-                    acc = add(acc, scale(mul(throughput, tri.emission), w_em));
-                    let n = face_forward(tri, d);
-                    let p = add(add(o, scale(d, hit.t)), scale(n, RAY_EPS));
-                    let surf = scene.materials.surface(tri, o, d);
+                    acc = add(acc, scale(mul(throughput, surf.emission), w_em));
+                    let ng = face_forward(tri, d);
+                    let p = add(add(o, scale(d, hit.t)), scale(ng, RAY_EPS));
+                    let n = surf.normal.unwrap_or(ng);
                     // The view direction a PBR lobe needs; a Lambertian one never reads it.
                     let v = if surf.pbr {
                         normalize(scale(d, -1.0))
@@ -1059,7 +1092,7 @@ pub fn path_trace_accum(
                         );
                         acc = add(acc, mul(throughput, direct));
                     }
-                    let (next, weight, pdf, sky_pdf) = bounce_dir(&surf, n, v, key(0), key(7));
+                    let (next, weight, pdf, sky_pdf) = bounce_dir(&surf, n, ng, v, key(0), key(7));
                     throughput = mul(throughput, weight);
                     o = p;
                     d = next;
@@ -1371,7 +1404,7 @@ fn di_contribution(
     let Some(light) = scene.tris.get(r.tri as usize) else {
         return ([0.0; 3], 0.0);
     };
-    let (lp, _, _) = tri_point(light, r.u, r.v);
+    let (lp, b0, b1) = tri_point(light, r.u, r.v);
     let to_light = sub(lp, shade_p);
     let dist2 = dot(to_light, to_light).max(1e-8);
     let dir = scale(to_light, 1.0 / approx::sqrt(dist2));
@@ -1386,7 +1419,7 @@ fn di_contribution(
     } else {
         scale(surf.base, std::f32::consts::FRAC_1_PI)
     };
-    let radiance = scale(mul(f, light.emission), g);
+    let radiance = scale(mul(f, scene.materials.emission_at(light, b0, b1)), g);
     (radiance, luminance(radiance))
 }
 
@@ -1431,9 +1464,10 @@ fn restir_di(
         }
         let tri = &scene.tris[(g.tri[i] - 1) as usize];
         let d = primary_dir(vp, px, py);
-        let n = face_forward(tri, d);
-        let p = add(add(vp.pos, scale(d, g.depth[i])), scale(n, RAY_EPS));
+        let ng = face_forward(tri, d);
+        let p = add(add(vp.pos, scale(d, g.depth[i])), scale(ng, RAY_EPS));
         let surf = scene.materials.surface(tri, vp.pos, d);
+        let n = surf.normal.unwrap_or(ng);
         let v = if surf.pbr {
             normalize(scale(d, -1.0))
         } else {
@@ -1601,8 +1635,7 @@ fn restir_di(
                 }
             }
             let shaded = scale(radiance, vis);
-            out[i * 3..i * 3 + 3]
-                .copy_from_slice(&add(shaded, scene.tris[(g.tri[i] - 1) as usize].emission));
+            out[i * 3..i * 3 + 3].copy_from_slice(&add(shaded, albedo.0.emission));
         }
     }
     let _ = spatial;

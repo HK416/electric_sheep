@@ -58,7 +58,8 @@ void main(uint3 tid : SV_DispatchThreadID) {
             // A textured triangle shades its texel times the factor (plan H, HT1); `mat == 0`
             // is the flat albedo, the bits every golden pins.
             EsSurface s = es_surface(tr, vw.pos, d);
-            out_rgb[p.index] = es_pack_rgba8(es_shade_lambert_base(s.base, tr, es_face_forward(tr.n, d)));
+            float3 n = s.bumped ? s.ns : es_face_forward(tr.n, d);
+            out_rgb[p.index] = es_pack_rgba8(es_shade_lambert_base(s.base, s.emission, n));
         }
         return;
     }

@@ -7,6 +7,12 @@
 //! BRDF (Appendix B): GGX `D`, the height-correlated Smith `V`, Schlick `F` with
 //! `F0 = mix(0.04, base, metallic)`, and a Lambert lobe `(1 - F) * (1 - metallic) * base / pi`.
 //!
+//! Plan H's HT2 adds two maps on the same table. A **normal map** perturbs the shading normal
+//! in the triangle's tangent frame ([`bump`]); the geometry channels keep the geometric normal.
+//! An **emissive map** multiplies the triangle's emission factor by a texel, at the hit and at a
+//! light sample alike ([`Materials::emission_at`]). Texture headers carry each axis's glTF
+//! wrap mode (repeat, clamp, mirror).
+//!
 //! This file is the reference; `material.slang` mirrors it expression for expression, the
 //! way `cpu.rs` and `common.slang` mirror each other. Texels are 8-bit and decoded through a
 //! 512-entry table built here with `es_math::approx` (linear, then sRGB), which both sides read
@@ -29,16 +35,18 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use es_assets::scene::{Material, SceneDesc};
-use es_assets::texture::TexKind;
+use es_assets::texture::{TexKind, Wrap};
 use es_core::StableId;
 use es_math::approx;
 
 use crate::error::RenderError;
 use crate::scene::Tri;
 
-/// Floats per material record in the upload buffer (mirrors `material.slang`).
-pub const MAT_STRIDE: usize = 8;
-/// Words per texture header: texel offset, width, face height, flags (bit 0 cube, bit 1 sRGB).
+/// Floats per material record in the upload buffer (mirrors `material.slang`); plan H's HT2
+/// grew it from 8 by the normal map, its scale and the emissive map (and one pad).
+pub const MAT_STRIDE: usize = 12;
+/// Words per texture header: texel offset, width, face height, flags (bit 0 cube, bit 1 sRGB,
+/// bits 2-3 and 4-5 the `s` and `t` wrap modes: 0 repeat, 1 clamp, 2 mirror).
 pub const TEX_HEADER: usize = 4;
 /// The decode table: 256 linear entries, then 256 sRGB ones.
 pub const LUT_LEN: usize = 512;
@@ -64,6 +72,13 @@ pub struct GpuMaterial {
     /// is textured and Lambertian: `MuJoCo`'s *default* `specular` / `shininess` do not switch a
     /// geom to PBR, only an explicitly written attribute does.
     pub pbr: bool,
+    /// Texture index + 1 of the tangent-space normal map, 0 for none (plan H, HT2); always a
+    /// linear 2D texture.
+    pub normal_tex: u32,
+    /// glTF's `normalTexture.scale` on the texel's X and Y.
+    pub normal_scale: f32,
+    /// Texture index + 1 of the emissive map, 0 for none: the triangle's emission x texel.
+    pub emissive_tex: u32,
 }
 
 /// One texture: packed `r | g << 8 | b << 16` per texel, faces stacked for a cube.
@@ -71,6 +86,8 @@ pub struct GpuMaterial {
 pub struct TexImage {
     pub cube: bool,
     pub srgb: bool,
+    /// `(s, t)` wrap modes: 0 repeat, 1 clamp, 2 mirror. A cube face always clamps.
+    pub wrap: [u32; 2],
     pub width: u32,
     pub height: u32,
     pub texels: Vec<u32>,
@@ -124,10 +141,13 @@ impl Materials {
     ) -> Result<(Self, BTreeMap<StableId, Look>), RenderError> {
         let mut out = Self::default();
         let mut looks = BTreeMap::new();
-        let mut tex_slot: BTreeMap<StableId, u32> = BTreeMap::new();
+        // Keyed by texture and "read linear": a normal map is decoded linearly whatever the
+        // file's colour space says (glTF 2.0 section 3.9.3), so an sRGB texture used as one
+        // gets a second, linear slot.
+        let mut tex_slot: BTreeMap<(StableId, bool), u32> = BTreeMap::new();
         for (id, m) in &scene.materials {
             let mut kinds = Vec::new();
-            let mut slot = |tex: Option<StableId>| -> Result<u32, RenderError> {
+            let mut slot = |tex: Option<StableId>, linear: bool| -> Result<u32, RenderError> {
                 let Some(tex) = tex else { return Ok(0) };
                 let name = || {
                     scene
@@ -147,7 +167,7 @@ impl Materials {
                         ))
                     })?;
                 kinds.push(data.kind);
-                if let Some(i) = tex_slot.get(&tex) {
+                if let Some(i) = tex_slot.get(&(tex, linear)) {
                     return Ok(i + 1);
                 }
                 let texels = data
@@ -156,28 +176,41 @@ impl Materials {
                     .map(|p| u32::from(p[0]) | u32::from(p[1]) << 8 | u32::from(p[2]) << 16)
                     .collect();
                 let i = u32::try_from(out.textures.len()).unwrap_or(u32::MAX);
+                let wrap = data.wrap.map(|w| match w {
+                    Wrap::Repeat => 0,
+                    Wrap::Clamp => 1,
+                    Wrap::Mirror => 2,
+                });
                 out.textures.push(TexImage {
                     cube: data.kind == TexKind::Cube,
-                    srgb: data.srgb,
+                    srgb: data.srgb && !linear,
+                    wrap,
                     width: data.width,
                     height: data.height,
                     texels,
                 });
-                tex_slot.insert(tex, i);
+                tex_slot.insert((tex, linear), i);
                 Ok(i + 1)
             };
-            let rgb = slot(m.rgb)?;
+            let rgb = slot(m.rgb, false)?;
             let (metal_tex, metal_ch) = match (m.metallic_map, m.orm) {
-                (Some(t), _) => (slot(Some(t))?, 0),
-                (None, orm) => (slot(orm)?, 2),
+                (Some(t), _) => (slot(Some(t), false)?, 0),
+                (None, orm) => (slot(orm, false)?, 2),
             };
             let (rough_tex, rough_ch) = match (m.roughness_map, m.orm) {
-                (Some(t), _) => (slot(Some(t))?, 0),
-                (None, orm) => (slot(orm)?, 1),
+                (Some(t), _) => (slot(Some(t), false)?, 0),
+                (None, orm) => (slot(orm, false)?, 1),
             };
+            let emissive_tex = slot(m.emissive_map, false)?;
+            let normal_tex = slot(m.normal_map, true)?;
             if kinds.windows(2).any(|k| k[0] != k[1]) {
                 return Err(RenderError::Config(format!(
                     "material {id} mixes 2D and cube textures"
+                )));
+            }
+            if normal_tex != 0 && kinds.last() == Some(&TexKind::Cube) {
+                return Err(RenderError::Config(format!(
+                    "material {id}: a normal map must be a 2D texture (a tangent frame needs UVs)"
                 )));
             }
             let mat = u32::try_from(out.mats.len() + 1).unwrap_or(u32::MAX);
@@ -190,6 +223,9 @@ impl Materials {
                 rough_tex,
                 rough_ch,
                 pbr: is_pbr(m),
+                normal_tex,
+                normal_scale: m.normal_scale.unwrap_or(1.0) as f32,
+                emissive_tex,
             });
             looks.insert(
                 *id,
@@ -219,11 +255,16 @@ impl Materials {
                 f32::from_bits(m.rough_tex),
                 f32::from_bits(m.rough_ch),
                 f32::from_bits(u32::from(m.pbr)),
+                f32::from_bits(m.normal_tex),
+                m.normal_scale,
+                f32::from_bits(m.emissive_tex),
+                0.0,
             ]);
         }
         let mut offset = out.len() + self.textures.len() * TEX_HEADER;
         for t in &self.textures {
-            let flags = u32::from(t.cube) | u32::from(t.srgb) << 1;
+            let flags =
+                u32::from(t.cube) | u32::from(t.srgb) << 1 | t.wrap[0] << 2 | t.wrap[1] << 4;
             for w in [
                 u32::try_from(offset).unwrap_or(u32::MAX),
                 t.width,
@@ -264,19 +305,14 @@ impl Materials {
         let (x0, y0) = (x.floor(), y.floor());
         let (fx, fy) = (x - x0, y - y0);
         let (ix, iy) = (x0 as i32, y0 as i32);
-        let (cx, cy): ([u32; 2], [u32; 2]) = if t.cube {
-            (
-                [ix.clamp(0, w - 1) as u32, (ix + 1).clamp(0, w - 1) as u32],
-                [iy.clamp(0, h - 1) as u32, (iy + 1).clamp(0, h - 1) as u32],
-            )
+        // A cube face clamps; a 2D texture folds each axis by its own wrap mode.
+        let (ws, wt) = if t.cube {
+            (1, 1)
         } else {
-            let a = ((ix % w) + w) % w;
-            let b = ((iy % h) + h) % h;
-            (
-                [a as u32, ((a + 1) % w) as u32],
-                [b as u32, ((b + 1) % h) as u32],
-            )
+            (t.wrap[0], t.wrap[1])
         };
+        let cx = [wrap(ix, w, ws), wrap(ix + 1, w, ws)];
+        let cy = [wrap(iy, h, wt), wrap(iy + 1, h, wt)];
         let c00 = self.texel(lut, t, face, cy[0], cx[0]);
         let c10 = self.texel(lut, t, face, cy[0], cx[1]);
         let c01 = self.texel(lut, t, face, cy[1], cx[0]);
@@ -289,16 +325,24 @@ impl Materials {
     }
 
     /// The surface a ray `(o, d)` sees on `tri`, which it hits. `mat == 0` is the triangle's
-    /// flat albedo and nothing else, which is what keeps every committed frame where it was.
+    /// flat albedo and emission and nothing else, which is what keeps every committed frame
+    /// where it was.
     #[must_use]
     pub fn surface(&self, tri: &Tri, o: [f32; 3], d: [f32; 3]) -> Surface {
         if tri.mat == 0 {
-            return Surface::flat(tri.albedo);
+            return Surface::of(tri);
         }
         let m = self.mats[(tri.mat - 1) as usize];
         let mut base = tri.albedo;
+        let mut emission = tri.emission;
+        let mut normal = None;
         let (mut metallic, mut roughness) = (m.metallic, m.roughness);
-        if m.rgb != 0 || m.metal_tex != 0 || m.rough_tex != 0 {
+        if m.rgb != 0
+            || m.metal_tex != 0
+            || m.rough_tex != 0
+            || m.emissive_tex != 0
+            || m.normal_tex != 0
+        {
             let tc = tex_coord(tri, o, d);
             if m.rgb != 0 {
                 let texel = self.sample(m.rgb - 1, tc);
@@ -310,14 +354,97 @@ impl Materials {
             if m.rough_tex != 0 {
                 roughness *= self.sample(m.rough_tex - 1, tc)[m.rough_ch as usize];
             }
+            if m.emissive_tex != 0 {
+                let e = self.sample(m.emissive_tex - 1, tc);
+                emission = [0, 1, 2].map(|c| emission[c] * e[c]);
+            }
+            if m.normal_tex != 0 {
+                normal = bump(tri, d, self.sample(m.normal_tex - 1, tc), m.normal_scale);
+            }
         }
         Surface {
             base,
             metallic,
             roughness: roughness.clamp(MIN_ROUGHNESS, 1.0),
             pbr: m.pbr,
+            emission,
+            normal,
         }
     }
+
+    /// The emitted radiance at barycentrics `(b0, b1)` of `tri` — the point `tri_point` puts
+    /// a light sample at: the triangle's emission, times the emissive texel there when its
+    /// material has a map (plan H, HT2). Light sampling stays uniform in area, so a textured
+    /// emitter is estimated without bias: the pdf does not depend on the radiance.
+    #[must_use]
+    pub fn emission_at(&self, tri: &Tri, b0: f32, b1: f32) -> [f32; 3] {
+        if tri.mat == 0 {
+            return tri.emission;
+        }
+        let m = self.mats[(tri.mat - 1) as usize];
+        if m.emissive_tex == 0 {
+            return tri.emission;
+        }
+        let tc = [0, 1, 2]
+            .map(|c| tri.tc[0][c] * (1.0 - b0 - b1) + tri.tc[1][c] * b0 + tri.tc[2][c] * b1);
+        let e = self.sample(m.emissive_tex - 1, tc);
+        [0, 1, 2].map(|c| tri.emission[c] * e[c])
+    }
+}
+
+/// Folds texel index `i` into `0..n` by wrap mode `mode` (0 repeat, 1 clamp, 2 mirror).
+fn wrap(i: i32, n: i32, mode: u32) -> u32 {
+    match mode {
+        1 => i.clamp(0, n - 1) as u32,
+        2 => {
+            let p = 2 * n;
+            let m = ((i % p) + p) % p;
+            (if m < n { m } else { p - 1 - m }) as u32
+        }
+        _ => (((i % n) + n) % n) as u32,
+    }
+}
+
+/// The shading normal a normal-map texel `c` (linear, in `[0, 1]`) gives on `tri`, facing the
+/// ray `d` as the geometric normal does, or `None` when the triangle's UVs have no area.
+///
+/// The tangent frame is per triangle and follows `MikkTSpace` as glTF uses it: `T` is `dP/ds`
+/// Gram-Schmidt-orthogonalised against the winding normal `n`; the bitangent is `w n x T`, with
+/// the handedness `w` chosen so that it points **up the image** — towards decreasing `t`, since
+/// row 0 is the image's top in glTF and in `MuJoCo` alike — which is `MikkTSpace` run on
+/// `(s, 1 - t)` and the "+Y up" of glTF 2.0's normal texture. On a flat-shaded triangle
+/// (this renderer has no vertex normals) `MikkTSpace`'s per-vertex frame is this per-face one.
+/// The texel maps `[0, 1] -> [-1, 1]`, X and Y times `scale`, and `n_s = normalize(T x + B y +
+/// n z)`. Seen from behind (the ray on the side the winding normal points away from) the whole
+/// frame turns over, `-n_s`, as glTF's double-sided rule has it.
+fn bump(tri: &Tri, d: [f32; 3], c: [f32; 3], k: f32) -> Option<[f32; 3]> {
+    let e1 = sub(tri.v[1], tri.v[0]);
+    let e2 = sub(tri.v[2], tri.v[0]);
+    let du1 = tri.tc[1][0] - tri.tc[0][0];
+    let dv1 = tri.tc[1][1] - tri.tc[0][1];
+    let du2 = tri.tc[2][0] - tri.tc[0][0];
+    let dv2 = tri.tc[2][1] - tri.tc[0][1];
+    let det = du1 * dv2 - du2 * dv1;
+    // NaN-safe: a degenerate or non-finite UV determinant draws the geometric normal.
+    let r = if det.abs() > 0.0 {
+        1.0 / det
+    } else {
+        return None;
+    };
+    let dpds = scale(sub(scale(e1, dv2), scale(e2, dv1)), r);
+    let dpdt = scale(sub(scale(e2, du1), scale(e1, du2)), r);
+    let n = tri.n;
+    let t = normalize(sub(dpds, scale(n, dot(n, dpds))));
+    if dot(t, t) <= 0.0 {
+        return None;
+    }
+    let nt = cross(n, t);
+    let w = if dot(nt, dpdt) > 0.0 { -1.0 } else { 1.0 };
+    let x = (c[0] * 2.0 - 1.0) * k;
+    let y = (c[1] * 2.0 - 1.0) * k;
+    let z = c[2] * 2.0 - 1.0;
+    let ns = normalize([0, 1, 2].map(|i| t[i] * x + nt[i] * w * y + n[i] * z));
+    Some(if dot(n, d) > 0.0 { scale(ns, -1.0) } else { ns })
 }
 
 /// Whether a drawn material is PBR: it writes one of the four BRDF attributes or a map.
@@ -404,9 +531,14 @@ pub struct Surface {
     pub metallic: f32,
     pub roughness: f32,
     pub pbr: bool,
+    /// Emitted radiance at the hit: the triangle's, times the emissive texel (plan H, HT2).
+    pub emission: [f32; 3],
+    /// The normal-mapped shading normal, facing the ray; `None` shades with the geometric one.
+    pub normal: Option<[f32; 3]>,
 }
 
 impl Surface {
+    /// A flat, non-emitting Lambertian colour.
     #[must_use]
     pub fn flat(albedo: [f32; 3]) -> Self {
         Self {
@@ -414,6 +546,17 @@ impl Surface {
             metallic: 0.0,
             roughness: 1.0,
             pbr: false,
+            emission: [0.0; 3],
+            normal: None,
+        }
+    }
+
+    /// The untextured triangle: its flat albedo and its emission.
+    #[must_use]
+    pub fn of(tri: &Tri) -> Self {
+        Self {
+            emission: tri.emission,
+            ..Self::flat(tri.albedo)
         }
     }
 
@@ -561,6 +704,8 @@ mod tests {
             metallic,
             roughness,
             pbr: true,
+            emission: [0.0; 3],
+            normal: None,
         }
     }
 
