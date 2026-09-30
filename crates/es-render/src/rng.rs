@@ -34,6 +34,7 @@ pub const fn mix32(mut z: u32) -> u32 {
 /// | 4 | NEE: which emissive triangle (packet M7/R3) |
 /// | 5 | NEE: the uniform point on that triangle |
 /// | 6 | NEE: the cosine-weighted sky direction |
+/// | 7 | a PBR bounce (plan H, HT1): index 0 picks the lobe, 1 and 2 sample GGX's visible normals |
 ///
 /// The NEE shadow test has no stream: it draws no random number.
 pub fn key(seed: u32, view: u32, px: u32, py: u32, sample: u32, bounce: u32, stream: u32) -> u32 {

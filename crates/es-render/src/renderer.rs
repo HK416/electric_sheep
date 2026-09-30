@@ -24,10 +24,11 @@ use crate::view::{
 /// Globals before the per-view records in the parameter buffer. Slots 0..20 are M4's and
 /// never move; 20..31 are packet M7/R2's shading block, 31..37 packet M7/R3's `Pt` block,
 /// 37..39 packet M7/R4's temporal block, 39 packet M11/X3b's triangle base and 40 its band
-/// row, each appended at the end (`common.slang` mirrors every number). A batched render
+/// row, 41..43 plan H HT1's material region base and material count, each appended at the
+/// end (`common.slang` mirrors every number). A batched render
 /// appends one copy of these slots per env after the view records
 /// ([`Renderer::render_batch`]).
-const GLOBALS: usize = 41;
+const GLOBALS: usize = 43;
 const PARAM_VIEW_BASE: usize = GLOBALS;
 /// The first atlas row of the tracer's current band (packet M11/X3b): 0 but for the second
 /// and later bands of a frame too big for one dispatch.
@@ -379,6 +380,7 @@ impl<'gpu> Renderer<'gpu> {
     pub fn upload_tris(&mut self, tri: TriScene) -> Result<(), RenderError> {
         let mut floats = Vec::new();
         self.slot = Slot::pack(&tri, &Bvh::build(&tri.tris), &mut floats);
+        pack_materials(&mut [(&mut self.slot, &tri)], &mut floats);
         self.upload_floats(&floats)?;
         self.tri_scene = tri;
         Ok(())
@@ -451,6 +453,10 @@ impl<'gpu> Renderer<'gpu> {
         p[37] = f32::from_bits(cfg.max_history().unwrap_or(0));
         p[38] = f32::from_bits(self.frame);
         p[39] = f32::from_bits(slot.tri_base);
+        // Plan H, HT1: the material region and its material count; zero, and never read, for a
+        // scene without drawn materials.
+        p[41] = f32::from_bits(slot.mat_base);
+        p[42] = f32::from_bits(slot.n_mat);
         p
     }
 
@@ -623,11 +629,17 @@ impl<'gpu> Renderer<'gpu> {
                 .collect()
         });
         let mut floats = Vec::new();
-        let slots: Vec<Slot> = envs
+        let mut slots: Vec<Slot> = envs
             .iter()
             .zip(&trees)
             .map(|((tri, _, _), bvh)| Slot::pack(tri, bvh, &mut floats))
             .collect();
+        let mut pairs: Vec<(&mut Slot, &TriScene)> = slots
+            .iter_mut()
+            .zip(envs)
+            .map(|(slot, (tri, _, _))| (slot, tri))
+            .collect();
+        pack_materials(&mut pairs, &mut floats);
         self.upload_floats(&floats)?;
         self.slot = Slot::default();
         self.tri_scene = TriScene::default();
@@ -899,6 +911,33 @@ impl<'gpu> Renderer<'gpu> {
     }
 }
 
+/// Appends each distinct material table of `scenes` once, after every scene block, and points
+/// each scene's slot at its table (plan H, HT1). Envs of one batch share their `SceneCache`'s
+/// table, so it is uploaded once however many envs wear it. A scene with no drawn material
+/// appends nothing, which is why no committed scene's upload grew.
+///
+/// `ponytail:` the texels ride in the triangle buffer and are re-uploaded with every frame's
+/// triangles; a persistent texture buffer is the upgrade when `frame_profile` shows it.
+fn pack_materials(scenes: &mut [(&mut Slot, &TriScene)], floats: &mut Vec<f32>) {
+    let mut placed: Vec<(*const crate::material::Materials, u32)> = Vec::new();
+    for (slot, tri) in scenes.iter_mut() {
+        if tri.materials.mats.is_empty() {
+            continue;
+        }
+        let key = std::sync::Arc::as_ptr(&tri.materials);
+        let base = if let Some((_, base)) = placed.iter().find(|(k, _)| *k == key) {
+            *base
+        } else {
+            let base = u32::try_from(floats.len()).unwrap_or(u32::MAX);
+            floats.extend(tri.materials.to_floats());
+            placed.push((key, base));
+            base
+        };
+        slot.mat_base = base;
+        slot.n_mat = u32::try_from(tri.materials.mats.len()).unwrap_or(u32::MAX);
+    }
+}
+
 /// Where one scene sits inside the triangle buffer, in floats and counts (packet M11/X3b): the
 /// scene-dependent half of the globals block.
 #[derive(Clone, Copy, Debug, Default)]
@@ -909,6 +948,9 @@ struct Slot {
     bvh_base: u32,
     bvh_nodes: u32,
     prim_base: u32,
+    /// Where the scene's material region starts (plan H, HT1), and how many materials.
+    mat_base: u32,
+    n_mat: u32,
 }
 
 impl Slot {
@@ -928,6 +970,8 @@ impl Slot {
             bvh_base,
             bvh_nodes,
             prim_base: bvh_base + bvh_nodes * NODE_STRIDE as u32,
+            mat_base: 0,
+            n_mat: 0,
         }
     }
 }

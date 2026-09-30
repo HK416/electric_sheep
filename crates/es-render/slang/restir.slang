@@ -80,8 +80,14 @@ void es_res_update(inout EsRes r, uint tri, float u, float v, float weight, floa
     }
 }
 
+// A shading point's surface and view direction (plan H, HT1): `v` is read only when PBR.
+struct EsShade {
+    EsSurface s;
+    float3 v;
+};
+
 // Unshadowed contribution and its target function (the luminance of that contribution).
-float3 es_di(float3 shade_p, float3 n, float3 albedo, EsRes r, out float p_hat) {
+float3 es_di(float3 shade_p, float3 n, EsShade albedo, EsRes r, out float p_hat) {
     EsTri light = es_tri(r.tri);
     float3 lp = es_tri_point(light, r.u, r.v);
     float3 to_light = lp - shade_p;
@@ -90,7 +96,10 @@ float3 es_di(float3 shade_p, float3 n, float3 albedo, EsRes r, out float p_hat) 
     float cos_s = max(dot(n, dir), 0.0);
     float cos_l = abs(dot(light.n, -dir));
     float g = cos_s * cos_l / dist2 * es_tri_area(light) * float(es_n_lights());
-    float3 radiance = (albedo * ES_INV_PI) * light.emission * g;
+    // A Lambertian point is today's `albedo / pi`; a PBR one the glTF BRDF towards the light
+    // sample (plan H, HT1). Mirror of `cpu::di_contribution`.
+    float3 f = albedo.s.pbr ? es_brdf(albedo.s, n, albedo.v, dir) : (albedo.s.base * ES_INV_PI);
+    float3 radiance = f * light.emission * g;
     p_hat = es_luminance(radiance);
     return radiance;
 }
@@ -99,20 +108,22 @@ float3 es_di(float3 shade_p, float3 n, float3 albedo, EsRes r, out float p_hat) 
 // pixel: the spatial pass needs a *neighbour's* shading point too, because pairwise MIS
 // evaluates that neighbour's own target function.
 bool es_hit_at(uint index, uint2 local, EsView vw, out float3 shade_p, out float3 n,
-               out float3 albedo) {
+               out EsShade albedo) {
     shade_p = float3(0.0, 0.0, 0.0);
     n = float3(0.0, 0.0, 1.0);
-    albedo = float3(0.0, 0.0, 0.0);
+    albedo.s = es_surface_flat(float3(0.0, 0.0, 0.0));
+    albedo.v = float3(0.0, 0.0, 0.0);
     if (g_tri[index] == 0) { return false; }
     EsTri tr = es_tri(g_tri[index] - 1);
     float3 d = es_primary_dir(vw, local);
     n = es_face_forward(tr.n, d);
     shade_p = vw.pos + d * g_depth[index] + n * ES_RAY_EPS;
-    albedo = tr.albedo;
+    albedo.s = es_surface(tr, vw.pos, d);
+    if (albedo.s.pbr) { albedo.v = es_norm3(-d); }
     return true;
 }
 
-bool es_hit_of(EsPixel p, EsView vw, out float3 shade_p, out float3 n, out float3 albedo) {
+bool es_hit_of(EsPixel p, EsView vw, out float3 shade_p, out float3 n, out EsShade albedo) {
     return es_hit_at(p.index, p.local, vw, shade_p, n, albedo);
 }
 
@@ -127,7 +138,7 @@ void initial(uint3 tid : SV_DispatchThreadID) {
     EsView vw = es_view(p.view);
     float3 shade_p;
     float3 n;
-    float3 albedo;
+    EsShade albedo;
     if (!es_hit_of(p, vw, shade_p, n, albedo)) { return; }
 
     EsRes r = es_res_zero();
@@ -165,7 +176,7 @@ void temporal(uint3 tid : SV_DispatchThreadID) {
     EsView vw = es_view(p.view);
     float3 shade_p;
     float3 n;
-    float3 albedo;
+    EsShade albedo;
     if (!es_hit_of(p, vw, shade_p, n, albedo)) { es_res_store(p.index, cur); return; }
 
     uint key = es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, 0, 0, 3);
@@ -202,7 +213,7 @@ void spatial(uint3 tid : SV_DispatchThreadID) {
     EsView vw = es_view(p.view);
     float3 shade_p;
     float3 n;
-    float3 albedo;
+    EsShade albedo;
     if (!es_hit_of(p, vw, shade_p, n, albedo)) { return; }
 
     uint key = es_rng_key(es_seed(), es_key_view, p.local.x, p.local.y, 0, 0, 2);
@@ -214,7 +225,7 @@ void spatial(uint3 tid : SV_DispatchThreadID) {
     uint nb_index[4];
     float3 nb_p[4];
     float3 nb_n[4];
-    float3 nb_a[4];
+    EsShade nb_a[4];
     uint nb_slot[4];
     uint n_nbr_i = 0;
     int2 offsets[4] = { int2(3, 0), int2(-3, 0), int2(0, 3), int2(0, -3) };
@@ -233,7 +244,7 @@ void spatial(uint3 tid : SV_DispatchThreadID) {
         if (es_res_load(res_a, j).m <= 0.0) { continue; }
         float3 pj;
         float3 nj;
-        float3 aj;
+        EsShade aj;
         if (!es_hit_at(j, uint2(uint(nx), uint(ny)), vw, pj, nj, aj)) { continue; }
         nb_index[n_nbr_i] = j;
         nb_p[n_nbr_i] = pj;

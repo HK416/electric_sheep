@@ -21,6 +21,7 @@ use es_sensor::Channel;
 
 use crate::atlas::{Tile, TileData};
 use crate::bvh::{self, Bvh};
+use crate::material::Surface;
 use crate::rng;
 use crate::scene::{Tri, TriScene};
 use crate::view::{
@@ -336,6 +337,13 @@ pub fn primary_dir_sub(
 /// `ponytail:` no shadows in `Rs`; add a shadow scan when a golden shows the missing contact
 /// shadow costs a policy something.
 pub(crate) fn shade_lambert(tri: &Tri, n: [f32; 3], cfg: &RenderConfig) -> [f32; 3] {
+    shade_lambert_base(tri.albedo, tri, n, cfg)
+}
+
+/// [`shade_lambert`] with a base colour that is not the triangle's flat albedo — a texel
+/// times the factor, for a textured triangle (plan H, HT1). Metallic and roughness do not
+/// enter the `Lambert` look.
+fn shade_lambert_base(base: [f32; 3], tri: &Tri, n: [f32; 3], cfg: &RenderConfig) -> [f32; 3] {
     let light = [
         cfg.light_dir.x as f32,
         cfg.light_dir.y as f32,
@@ -343,7 +351,7 @@ pub(crate) fn shade_lambert(tri: &Tri, n: [f32; 3], cfg: &RenderConfig) -> [f32;
     ];
     let ndl = dot(n, light).max(0.0);
     let lambert = cfg.ambient + ndl * (1.0 - cfg.ambient);
-    add(scale(tri.albedo, lambert), tri.emission)
+    add(scale(base, lambert), tri.emission)
 }
 
 /// [`Shading::Full`]: one shadow ray, a hemisphere ambient, a Blinn-Phong highlight (packet
@@ -366,6 +374,32 @@ pub fn shade_full(
     d: [f32; 3],
     cfg: &RenderConfig,
 ) -> [f32; 3] {
+    shade_full_surface(tris, bvh, tri, &Surface::flat(tri.albedo), n, p, d, cfg)
+}
+
+/// [`shade_full`] on a [`Surface`] (plan H, HT1). A non-PBR surface is the Blinn-Phong look
+/// with its base colour in place of the flat albedo; a PBR one replaces the highlight and the
+/// diffuse term by the glTF BRDF under the same directional light and hemisphere:
+///
+/// ```text
+/// direct = pi * f(l, v) * max(0, n.l) * vis                 // per channel
+/// A      = c_diff * (1 - F0) + F0                           // the hemisphere's albedo
+/// rgb    = A * hemi + direct * (1 - hemi) + emission
+/// ```
+///
+/// `pi * f * cos` is what makes a white Lambertian surface at normal incidence return its
+/// albedo, the scale `Full`'s own `diffuse * (1 - hemi)` term has.
+#[allow(clippy::too_many_arguments)]
+pub fn shade_full_surface(
+    tris: &[Tri],
+    bvh: &Bvh,
+    tri: &Tri,
+    surf: &Surface,
+    n: [f32; 3],
+    p: [f32; 3],
+    d: [f32; 3],
+    cfg: &RenderConfig,
+) -> [f32; 3] {
     let Shading::Full {
         shadows,
         specular,
@@ -375,7 +409,7 @@ pub fn shade_full(
         ..
     } = cfg.shading
     else {
-        return shade_lambert(tri, n, cfg);
+        return shade_lambert_base(surf.base, tri, n, cfg);
     };
     let light = [
         cfg.light_dir.x as f32,
@@ -387,6 +421,21 @@ pub fn shade_full(
     } else {
         1.0
     };
+    if surf.pbr {
+        let v = normalize(scale(d, -1.0));
+        let ndl = dot(n, light).max(0.0);
+        let f = surf.brdf(n, v, light);
+        let direct = scale(f, std::f32::consts::PI * ndl * vis);
+        #[allow(clippy::manual_midpoint)]
+        let t = (n[2] + 1.0) * 0.5;
+        let hemi = add(ground_rgb, scale(sub(sky_rgb, ground_rgb), t));
+        let (c_diff, f0) = surf.diffuse_and_f0();
+        let rgb = [0, 1, 2].map(|c| {
+            let a = c_diff[c] * (1.0 - f0[c]) + f0[c];
+            a * hemi[c] + direct[c] * (1.0 - hemi[c])
+        });
+        return add(rgb, tri.emission);
+    }
     let diffuse = dot(n, light).max(0.0) * vis;
     let h = normalize(sub(light, d));
     let ndh = dot(n, h).max(0.0);
@@ -411,7 +460,7 @@ pub fn shade_full(
         hemi[1] + diffuse * (1.0 - hemi[1]),
         hemi[2] + diffuse * (1.0 - hemi[2]),
     ];
-    add(add(mul(tri.albedo, lit), [spec; 3]), tri.emission)
+    add(add(mul(surf.base, lit), [spec; 3]), tri.emission)
 }
 
 /// Exact piecewise sRGB transfer (spec 3.1). `c^(1/2.4)` goes through `es_math::approx`, not
@@ -582,7 +631,8 @@ pub fn rasterize(
                     }
                     let d = primary_dir(&vp, px, py);
                     let tri = &scene.tris[(g.tri[i] - 1) as usize];
-                    let lin = shade_lambert(tri, face_forward(tri, d), cfg);
+                    let base = scene.materials.surface(tri, vp.pos, d).base;
+                    let lin = shade_lambert_base(base, tri, face_forward(tri, d), cfg);
                     for c in 0..3 {
                         rgb[i * 3 + c] = to_u8(lin[c]);
                     }
@@ -615,7 +665,11 @@ pub fn rasterize(
                             let tri = &scene.tris[hit.tri as usize];
                             let n = face_forward(tri, d);
                             let p = add(vp.pos, scale(d, hit.t));
-                            acc = add(acc, shade_full(&scene.tris, &bvh, tri, n, p, d, cfg));
+                            let surf = scene.materials.surface(tri, vp.pos, d);
+                            acc = add(
+                                acc,
+                                shade_full_surface(&scene.tris, &bvh, tri, &surf, n, p, d, cfg),
+                            );
                         }
                     }
                     let lin = scale(acc, norm);
@@ -721,12 +775,31 @@ fn nee_direct(
     cfg: &RenderConfig,
     p: [f32; 3],
     n: [f32; 3],
-    albedo: [f32; 3],
+    surf: &Surface,
+    v: [f32; 3],
     far: f32,
     last: bool,
     keys: [u32; 3],
 ) -> [f32; 3] {
-    let f = scale(albedo, std::f32::consts::FRAC_1_PI);
+    // The BRDF towards `l` and the BSDF strategy's pdf of `l` (the MIS partner). A Lambertian
+    // surface is today's `albedo / pi` and `cos / pi`, the same expressions in the same order,
+    // so every committed `Pt` frame is where it was; a PBR one is the glTF lobe mixture
+    // (plan H, HT1).
+    let lambert = scale(surf.base, std::f32::consts::FRAC_1_PI);
+    let f = |l: [f32; 3]| {
+        if surf.pbr {
+            surf.brdf(n, v, l)
+        } else {
+            lambert
+        }
+    };
+    let bsdf_pdf = |l: [f32; 3], cos_s: f32| {
+        if surf.pbr {
+            surf.pdf(n, v, l)
+        } else {
+            cos_s * std::f32::consts::FRAC_1_PI
+        }
+    };
     let mut out = [0.0f32; 3];
 
     if !scene.lights.is_empty() {
@@ -746,11 +819,11 @@ fn nee_direct(
                 let w = if last {
                     1.0
                 } else {
-                    power_heuristic(p_light, cos_s * std::f32::consts::FRAC_1_PI)
+                    power_heuristic(p_light, bsdf_pdf(dir, cos_s))
                 };
                 // `dist * (1 - 1e-3)` so the shadow ray stops short of the light itself.
                 if !any_hit(&scene.tris, bvh, p, dir, 0.0, dist * (1.0 - 1e-3)) {
-                    out = add(out, scale(mul(f, light.emission), cos_s / p_light * w));
+                    out = add(out, scale(mul(f(dir), light.emission), cos_s / p_light * w));
                 }
             }
         }
@@ -764,7 +837,7 @@ fn nee_direct(
         ];
         let cos_s = dot(n, l);
         if cos_s > 0.0 && !any_hit(&scene.tris, bvh, p, l, 0.0, SHADOW_FAR) {
-            out = add(out, scale(mul(f, cfg.light_rgb), cos_s));
+            out = add(out, scale(mul(f(l), cfg.light_rgb), cos_s));
         }
     }
 
@@ -773,11 +846,54 @@ fn nee_direct(
         let cos_s = dot(n, d);
         let pdf = cos_s * std::f32::consts::FRAC_1_PI;
         if pdf > 0.0 && !any_hit(&scene.tris, bvh, p, d, 0.0, far) {
-            let w = if last { 1.0 } else { power_heuristic(pdf, pdf) };
-            out = add(out, scale(mul(f, cfg.sky), cos_s / pdf * w));
+            let w = if last {
+                1.0
+            } else {
+                power_heuristic(pdf, bsdf_pdf(d, cos_s))
+            };
+            out = add(out, scale(mul(f(d), cfg.sky), cos_s / pdf * w));
         }
     }
     out
+}
+
+/// One BSDF bounce at a hit (plan H, HT1): the new direction, the throughput factor, the
+/// solid-angle pdf of the direction (for the MIS weight of whatever the ray hits next) and
+/// the sky strategy's pdf of it (`cos / pi`, NEE's sky sample).
+///
+/// A Lambertian surface is today's bounce exactly: a cosine-weighted direction from stream
+/// 0, a throughput factor of `base` (the cosine and the `1/pi` cancel), and both pdfs the one
+/// `cos / pi` expression. A PBR surface picks a lobe with stream 7 index 0, samples it
+/// (stream 0 for the diffuse lobe, stream 7 indices 1 and 2 for GGX's visible normals) and
+/// weights by `f * cos / pdf` over the lobe mixture; a direction below the surface ends the
+/// path's throughput at zero rather than its loop (spec 3.4: the bounce count stays fixed).
+fn bounce_dir(
+    surf: &Surface,
+    n: [f32; 3],
+    v: [f32; 3],
+    key_dir: u32,
+    key_lobe: u32,
+) -> ([f32; 3], [f32; 3], f32, f32) {
+    let cosine = cosine_hemisphere(n, key_dir);
+    if !surf.pbr {
+        let pdf = dot(n, cosine) * std::f32::consts::FRAC_1_PI;
+        return (cosine, surf.base, pdf, pdf);
+    }
+    let u = [0, 1, 2].map(|i| rng::uniform(key_lobe, i));
+    let l = normalize(surf.sample(n, v, cosine, u, onb(n)));
+    let nl = dot(n, l);
+    let pdf = surf.pdf(n, v, l);
+    let throughput = if pdf > 0.0 && nl > 0.0 {
+        scale(surf.brdf(n, v, l), nl / pdf)
+    } else {
+        [0.0; 3]
+    };
+    (
+        l,
+        throughput,
+        pdf,
+        nl.max(0.0) * std::f32::consts::FRAC_1_PI,
+    )
 }
 
 /// The reference for [`crate::Renderer::render_batch`] (packet M11/X3b): tile `k` is env `k`
@@ -892,12 +1008,16 @@ pub fn path_trace_accum(
                 // camera ray has none — no light-sampling strategy could have generated it,
                 // so its MIS weight is 1 and `cornell_pt1spp` does not move.
                 let mut prev_pdf = 0.0f32;
+                // The sky strategy's pdf of the current ray; `prev_pdf` itself on a Lambertian
+                // vertex, where the two strategies draw from the same cosine pdf.
+                let mut prev_sky = 0.0f32;
                 for bounce in 0..bounces {
                     let Some(hit) = nearest_hit(&scene.tris, &bvh, o, d, near, vp.far) else {
                         // The sky through the BSDF strategy. Its NEE counterpart draws from
-                        // the same cosine pdf, so the power heuristic splits it in half.
+                        // the cosine pdf, so on a Lambertian vertex the power heuristic splits
+                        // it in half.
                         let w = if nee && bounce > 0 {
-                            power_heuristic(prev_pdf, prev_pdf)
+                            power_heuristic(prev_pdf, prev_sky)
                         } else {
                             1.0
                         };
@@ -916,26 +1036,35 @@ pub fn path_trace_accum(
                     acc = add(acc, scale(mul(throughput, tri.emission), w_em));
                     let n = face_forward(tri, d);
                     let p = add(add(o, scale(d, hit.t)), scale(n, RAY_EPS));
+                    let surf = scene.materials.surface(tri, o, d);
+                    // The view direction a PBR lobe needs; a Lambertian one never reads it.
+                    let v = if surf.pbr {
+                        normalize(scale(d, -1.0))
+                    } else {
+                        [0.0; 3]
+                    };
+                    let key = |stream| rng::key(cfg.seed, view_index, px, py, s, bounce, stream);
                     if nee {
-                        let key =
-                            |stream| rng::key(cfg.seed, view_index, px, py, s, bounce, stream);
                         let direct = nee_direct(
                             scene,
                             &bvh,
                             cfg,
                             p,
                             n,
-                            tri.albedo,
+                            &surf,
+                            v,
                             vp.far,
                             bounce + 1 == bounces,
                             [key(4), key(5), key(6)],
                         );
                         acc = add(acc, mul(throughput, direct));
                     }
-                    throughput = mul(throughput, tri.albedo);
+                    let (next, weight, pdf, sky_pdf) = bounce_dir(&surf, n, v, key(0), key(7));
+                    throughput = mul(throughput, weight);
                     o = p;
-                    d = cosine_hemisphere(n, rng::key(cfg.seed, view_index, px, py, s, bounce, 0));
-                    prev_pdf = dot(n, d) * std::f32::consts::FRAC_1_PI;
+                    d = next;
+                    prev_pdf = pdf;
+                    prev_sky = sky_pdf;
                     near = 0.0;
                 }
             }
@@ -1204,11 +1333,14 @@ impl Reservoir {
 /// A spatial-reuse neighbour that passed the geometric similarity test: where its reservoir
 /// is, its own shading point (pairwise MIS evaluates *its* target function, not only the
 /// destination's) and which RNG slot its resampling draw takes.
+/// A `ReSTIR` shading point: position, normal, and the surface with its view direction.
+type ShadePoint = ([f32; 3], [f32; 3], (Surface, [f32; 3]));
+
 struct Neighbour {
     index: usize,
     p: [f32; 3],
     n: [f32; 3],
-    albedo: [f32; 3],
+    albedo: (Surface, [f32; 3]),
     slot: u32,
 }
 
@@ -1233,7 +1365,7 @@ fn di_contribution(
     scene: &TriScene,
     shade_p: [f32; 3],
     n: [f32; 3],
-    albedo: [f32; 3],
+    albedo: (Surface, [f32; 3]),
     r: &Reservoir,
 ) -> ([f32; 3], f32) {
     let Some(light) = scene.tris.get(r.tri as usize) else {
@@ -1246,7 +1378,14 @@ fn di_contribution(
     let cos_s = dot(n, dir).max(0.0);
     let cos_l = dot(light.n, scale(dir, -1.0)).abs();
     let g = cos_s * cos_l / dist2 * tri_area(light) * scene.lights.len() as f32;
-    let f = scale(albedo, std::f32::consts::FRAC_1_PI);
+    // The surface and the view direction at the shading point: a Lambertian surface is today's
+    // `albedo / pi`, a PBR one the glTF BRDF towards the light sample (plan H, HT1).
+    let (surf, v) = albedo;
+    let f = if surf.pbr {
+        surf.brdf(n, v, dir)
+    } else {
+        scale(surf.base, std::f32::consts::FRAC_1_PI)
+    };
     let radiance = scale(mul(f, light.emission), g);
     (radiance, luminance(radiance))
 }
@@ -1286,7 +1425,7 @@ fn restir_di(
         return out;
     }
 
-    let hit_of = |i: usize, px: u32, py: u32| -> Option<([f32; 3], [f32; 3], [f32; 3])> {
+    let hit_of = |i: usize, px: u32, py: u32| -> Option<ShadePoint> {
         if g.tri[i] == 0 {
             return None;
         }
@@ -1294,7 +1433,13 @@ fn restir_di(
         let d = primary_dir(vp, px, py);
         let n = face_forward(tri, d);
         let p = add(add(vp.pos, scale(d, g.depth[i])), scale(n, RAY_EPS));
-        Some((p, n, tri.albedo))
+        let surf = scene.materials.surface(tri, vp.pos, d);
+        let v = if surf.pbr {
+            normalize(scale(d, -1.0))
+        } else {
+            [0.0; 3]
+        };
+        Some((p, n, (surf, v)))
     };
 
     // Pass 1: RIS over `RESTIR_CANDIDATES` candidates. No shadow ray: visibility is tested

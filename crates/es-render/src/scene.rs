@@ -5,17 +5,33 @@
 //! ray-tracing extension, no acceleration-structure build — so both render paths traverse
 //! [`crate::bvh::Bvh`], built here on the CPU per frame (packet M7/R1), and its answer is the
 //! flat index-order scan's answer bit for bit.
+//!
+//! Since plan H's HT1 every triangle also carries three texture coordinates and a material
+//! slot (0 = none). A geom without a drawn material gets zeros there and renders exactly as
+//! before: the slot is read, never computed with.
+
+// `MuJoCo`'s texture coordinates are transcribed as its source writes them (`(x + 1) * 0.5`,
+// not `midpoint`), with its one-letter names (`a`, `b`, `c` corners, `s` sign, `t` angle).
+#![allow(clippy::manual_midpoint, clippy::many_single_char_names)]
 
 use es_assets::scene::{Body, Geom, SceneDesc, Shape};
 use es_core::StableId;
 use es_math::approx::{self, coeffs::PI};
 use es_math::{Pose, Vec3};
 use std::collections::BTreeMap;
+use std::sync::Arc;
+
+/// One tessellated vertex: local position, `MuJoCo`'s UV, the unit-object coordinate.
+type Vert = (Vec3, [f32; 2], [f32; 3]);
+/// A box corner and its signs.
+type Corner = (Vec3, [f64; 3]);
 
 use crate::error::RenderError;
+use crate::material::{Look, Materials};
 
-/// Floats per triangle in the flat upload buffer. `v0 v1 v2 n albedo emission seg pad`.
-pub const TRI_STRIDE: usize = 20;
+/// Floats per triangle in the flat upload buffer:
+/// `v0 v1 v2 n albedo emission seg mat tc0 tc1 tc2 pad` (packet HT1 grew it from 20).
+pub const TRI_STRIDE: usize = 32;
 
 /// Tessellation counts. Constants, not quality settings: changing one changes every golden,
 /// so it must be a deliberate edit rather than a knob somebody turns.
@@ -24,22 +40,29 @@ const SPHERE_RINGS: u32 = 8;
 const CAP_RINGS: u32 = 4;
 /// Half-extent used for a `Plane` that declares itself infinite (`half == 0`).
 const INFINITE_PLANE_HALF: f64 = 100.0;
+/// `MuJoCo`'s default geom `rgba`: a geom that writes anything else overrides its material's.
+const DEFAULT_RGBA: [f64; 4] = [0.5, 0.5, 0.5, 1.0];
 
-/// A geom whose name ends in this emits light (see `docs/design/renderer.md`). `SceneDesc`
-/// has no emissive material field, and inventing one would mean editing `es-assets`, which
-/// this packet does not own.
+/// A geom whose name ends in this emits light (see `docs/design/renderer.md`). A drawn
+/// material's `emission` is the other way (plan H, HT1).
 const LIGHT_SUFFIX: &str = "_light";
 
 /// One world-space triangle with everything both shaders need.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Tri {
     pub v: [[f32; 3]; 3],
     /// Geometric normal from the winding, unit length.
     pub n: [f32; 3],
+    /// The flat colour, and a drawn material's base colour factor.
     pub albedo: [f32; 3],
     pub emission: [f32; 3],
     /// 1-based geom id; `0` is reserved for "no hit" in the segmentation channel.
     pub seg: u32,
+    /// 1 + the index of the triangle's material in [`TriScene::materials`]; 0 for none.
+    pub mat: u32,
+    /// Per-vertex texture coordinates: `(s, t, 0)` for a 2D texture, the cube-map direction
+    /// `(s, t, r)` for a cube one (packet HT1).
+    pub tc: [[f32; 3]; 3],
 }
 
 /// A tessellated scene, ready to upload.
@@ -50,6 +73,81 @@ pub struct TriScene {
     pub lights: Vec<u32>,
     /// `seg id -> geom name`, so a segmentation map can be read back to names.
     pub names: BTreeMap<u32, String>,
+    /// The materials and textures `Tri::mat` points into, shared across frames. Empty for a
+    /// scene without drawn materials, and then nothing is uploaded for it.
+    pub materials: Arc<Materials>,
+}
+
+/// One local-frame triangle of a geom's tessellation, with what texturing needs: `MuJoCo`'s
+/// own texture coordinate of each vertex before `texrepeat` (`uv`), and the vertex in the
+/// unit object `MuJoCo` draws and scales (`unit`), which its cube mapping reads.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LocalTri {
+    p: [Vec3; 3],
+    uv: [[f32; 2]; 3],
+    unit: [[f32; 3]; 3],
+}
+
+/// How one geom is drawn, resolved once per frame from its material.
+struct Wear {
+    rgba: [f64; 4],
+    emission: f64,
+    look: Option<Look>,
+    /// `MuJoCo`'s `mjvGeom` size: what `texuniform` multiplies by.
+    size: [f32; 3],
+    /// Plane of infinite extent: its texture matrix is shifted by `-0.5`.
+    infinite: bool,
+    /// A mesh without UVs: texture coordinates are generated from the position.
+    texgen: bool,
+}
+
+impl Wear {
+    /// The texture coordinate of one local vertex.
+    fn tc(&self, uv: [f32; 2], unit: [f32; 3]) -> [f32; 3] {
+        let Some(look) = self.look else {
+            return [0.0; 3];
+        };
+        if look.cube {
+            let k = if look.texuniform { self.size } else { [1.0; 3] };
+            return [unit[0] * k[0], unit[1] * k[1], unit[2] * k[2]];
+        }
+        let mut scl = [look.texrepeat[0] as f32, look.texrepeat[1] as f32];
+        if self.texgen {
+            // `settexture`'s 2D path for a mesh without UVs: repeat per object size, then the
+            // object-linear planes (0.5 s, 0, 0, -0.5) and (0, -0.5 t, 0, -0.5).
+            for (s, size) in scl.iter_mut().zip(self.size) {
+                if size > 0.0 {
+                    *s /= size;
+                }
+            }
+            if look.texuniform {
+                for (s, size) in scl.iter_mut().zip(self.size) {
+                    if size > 0.0 {
+                        *s *= size;
+                    }
+                }
+            }
+            return [
+                0.5 * scl[0] * unit[0] - 0.5,
+                -0.5 * scl[1] * unit[1] - 0.5,
+                0.0,
+            ];
+        }
+        for s in &mut scl {
+            if *s <= 0.0 {
+                *s = 1.0;
+            }
+        }
+        if look.texuniform {
+            for (s, size) in scl.iter_mut().zip(self.size) {
+                if size > 0.0 {
+                    *s *= size;
+                }
+            }
+        }
+        let off = if self.infinite { -0.5 } else { 0.0 };
+        [uv[0] * scl[0] + off, uv[1] * scl[1] + off, 0.0]
+    }
 }
 
 impl TriScene {
@@ -76,20 +174,24 @@ impl TriScene {
         SceneCache::default().tri_scene(scene, world)
     }
 
-    fn push_geom(&mut self, geom: &Geom, pose: Pose, local: &[[Vec3; 3]]) {
+    fn push_geom(&mut self, geom: &Geom, wear: &Wear, pose: Pose, local: &[LocalTri]) {
         let seg = u32::try_from(self.names.len() + 1).unwrap_or(u32::MAX);
         let albedo = [
-            geom.rgba[0] as f32,
-            geom.rgba[1] as f32,
-            geom.rgba[2] as f32,
+            wear.rgba[0] as f32,
+            wear.rgba[1] as f32,
+            wear.rgba[2] as f32,
         ];
         let emission = if geom.name.ends_with(LIGHT_SUFFIX) {
             albedo
+        } else if wear.emission > 0.0 {
+            [0, 1, 2].map(|c| (wear.emission * wear.rgba[c]) as f32)
         } else {
             [0.0; 3]
         };
+        let mat = wear.look.map_or(0, |l| l.mat);
         self.names.insert(seg, geom.name.clone());
-        for &[a, b, c] in local {
+        for lt in local {
+            let [a, b, c] = lt.p;
             let v = [
                 to_f32(pose.transform_point(a)),
                 to_f32(pose.transform_point(b)),
@@ -102,18 +204,22 @@ impl TriScene {
                 self.lights
                     .push(u32::try_from(self.tris.len()).unwrap_or(u32::MAX));
             }
+            let tc = [0, 1, 2].map(|k| wear.tc(lt.uv[k], lt.unit[k]));
             self.tris.push(Tri {
                 v,
                 n,
                 albedo,
                 emission,
                 seg,
+                mat,
+                tc,
             });
         }
     }
 
-    /// Flat upload buffer, [`TRI_STRIDE`] floats per triangle, segmentation id bitcast into
-    /// the second-to-last slot. One buffer, one stride, the same layout on both sides.
+    /// Flat upload buffer, [`TRI_STRIDE`] floats per triangle, segmentation id and material
+    /// slot bitcast into slots 18 and 19. One buffer, one stride, the same layout on both
+    /// sides.
     pub fn to_floats(&self) -> Vec<f32> {
         let mut out = Vec::with_capacity(self.tris.len() * TRI_STRIDE);
         for t in &self.tris {
@@ -124,7 +230,11 @@ impl TriScene {
             out.extend_from_slice(&t.albedo);
             out.extend_from_slice(&t.emission);
             out.push(f32::from_bits(t.seg));
-            out.push(0.0);
+            out.push(f32::from_bits(t.mat));
+            for tc in &t.tc {
+                out.extend_from_slice(tc);
+            }
+            out.extend_from_slice(&[0.0; 3]);
         }
         out
     }
@@ -143,13 +253,22 @@ impl TriScene {
 /// asset's content hash (packet M10/W2b) — is checked on every hit: geom ids come from names
 /// (`es_assets::scene::scene_id`), so two scenes can share one, and a stale entry would be a
 /// silently wrong mesh rather than a miss.
+///
+/// It also keeps the scene's material table (packet HT1), rebuilt only when the drawn
+/// materials or a texture's content digest change, so a replay uploads one shared table.
 #[derive(Clone, Debug, Default)]
 pub struct SceneCache {
-    local: BTreeMap<StableId, (CacheKey, Vec<[Vec3; 3]>)>,
+    local: BTreeMap<StableId, (CacheKey, Vec<LocalTri>)>,
+    materials: Option<(MaterialKey, Arc<Materials>, BTreeMap<StableId, Look>)>,
 }
 
 /// The geom's shape and, for a `Mesh`, its asset's content hash (zeros otherwise).
 type CacheKey = (Shape, [u8; 32]);
+/// The drawn materials and every texture asset's digest.
+type MaterialKey = (
+    BTreeMap<StableId, es_assets::scene::Material>,
+    Vec<[u8; 32]>,
+);
 
 impl SceneCache {
     /// [`TriScene::from_scene_with_poses`], reusing whatever this cache already holds.
@@ -159,7 +278,11 @@ impl SceneCache {
         world: &BTreeMap<StableId, Pose>,
     ) -> Result<TriScene, RenderError> {
         let statics = world_poses(scene);
-        let mut out = TriScene::default();
+        let (table, looks) = self.materials(scene)?;
+        let mut out = TriScene {
+            materials: table,
+            ..TriScene::default()
+        };
         for body in &scene.bodies {
             let body_pose = world
                 .get(&body.id)
@@ -167,11 +290,12 @@ impl SceneCache {
                 .copied()
                 .unwrap_or(Pose::IDENTITY);
             for geom in &body.geoms {
-                if geom.rgba[3] == 0.0 {
+                let wear = wear(geom, scene, &looks);
+                if wear.rgba[3] == 0.0 {
                     // Alpha 0 is not drawn (collision-only geoms, an invisible floor). It
                     // keeps its segmentation id, which is the geom's traversal index
                     // (`renderer.md` section 2.1), and contributes no triangle.
-                    out.push_geom(geom, Pose::IDENTITY, &[]);
+                    out.push_geom(geom, &wear, Pose::IDENTITY, &[]);
                     continue;
                 }
                 let key = (geom.shape, content_hash(geom, scene));
@@ -180,11 +304,111 @@ impl SceneCache {
                     self.local.insert(geom.id, (key, tris));
                 }
                 let local = &self.local[&geom.id].1;
-                out.push_geom(geom, body_pose.compose(geom.pose), local);
+                out.push_geom(geom, &wear, body_pose.compose(geom.pose), local);
             }
         }
         Ok(out)
     }
+
+    fn materials(
+        &mut self,
+        scene: &SceneDesc,
+    ) -> Result<(Arc<Materials>, BTreeMap<StableId, Look>), RenderError> {
+        if scene.materials.is_empty() {
+            return Ok((Arc::default(), BTreeMap::new()));
+        }
+        let digests = scene
+            .assets
+            .iter()
+            .filter(|a| scene.textures.contains_key(&a.id))
+            .map(|a| a.hash)
+            .collect();
+        let key = (scene.materials.clone(), digests);
+        if let Some((k, table, looks)) = &self.materials {
+            if *k == key {
+                return Ok((Arc::clone(table), looks.clone()));
+            }
+        }
+        let (table, looks) = Materials::build(scene)?;
+        let table = Arc::new(table);
+        self.materials = Some((key, Arc::clone(&table), looks.clone()));
+        Ok((table, looks))
+    }
+}
+
+/// What `geom` wears: `MuJoCo`'s `setMaterial` — the material's `rgba` unless the geom writes
+/// its own — for a drawn material, the geom's `rgba` otherwise.
+fn wear(geom: &Geom, scene: &SceneDesc, looks: &BTreeMap<StableId, Look>) -> Wear {
+    let drawn = geom
+        .material
+        .and_then(|id| scene.materials.get(&id).map(|m| (id, m)));
+    let Some((id, m)) = drawn else {
+        return Wear {
+            rgba: geom.rgba,
+            emission: 0.0,
+            look: None,
+            size: [0.0; 3],
+            infinite: false,
+            texgen: false,
+        };
+    };
+    let rgba = if geom.rgba == DEFAULT_RGBA {
+        m.rgba
+    } else {
+        geom.rgba
+    };
+    let f = |x: f64| x as f32;
+    let (size, infinite, texgen) = match geom.shape {
+        Shape::Box { half_extents: h } => ([f(h.x), f(h.y), f(h.z)], false, false),
+        Shape::Sphere { radius: r } => ([f(r); 3], false, false),
+        Shape::Ellipsoid { radii: r } => ([f(r.x), f(r.y), f(r.z)], false, false),
+        Shape::Capsule {
+            radius,
+            half_length,
+        }
+        | Shape::Cylinder {
+            radius,
+            half_length,
+        } => ([f(radius), f(radius), f(half_length)], false, false),
+        Shape::Plane { half_x, half_y, .. } => (
+            [f(half_x), f(half_y), 0.0],
+            half_x <= 0.0 || half_y <= 0.0,
+            false,
+        ),
+        Shape::Mesh { asset } => {
+            let mesh = scene.meshes.get(&asset);
+            let size = mesh.map_or([0.0; 3], |m| mesh_half_size(&m.positions));
+            (size, false, mesh.is_none_or(|m| m.uvs.is_none()))
+        }
+        Shape::HeightField { .. } => ([0.0; 3], false, false),
+    };
+    Wear {
+        rgba,
+        emission: m.emission,
+        look: looks.get(&id).copied(),
+        size,
+        infinite,
+        texgen,
+    }
+}
+
+/// Half the axis-aligned extent of a mesh: `MuJoCo`'s `geom_size` for a mesh geom.
+fn mesh_half_size(positions: &[[f32; 3]]) -> [f32; 3] {
+    let mut lo = [f32::MAX; 3];
+    let mut hi = [f32::MIN; 3];
+    for p in positions {
+        for c in 0..3 {
+            lo[c] = lo[c].min(p[c]);
+            hi[c] = hi[c].max(p[c]);
+        }
+    }
+    [0, 1, 2].map(|c| {
+        if hi[c] >= lo[c] {
+            (hi[c] - lo[c]) * 0.5
+        } else {
+            0.0
+        }
+    })
 }
 
 /// The `AssetRef::hash` of a `Mesh` geom's asset (its content, once `es_assets::mesh::load`
@@ -246,7 +470,7 @@ fn world_poses(scene: &SceneDesc) -> BTreeMap<StableId, Pose> {
 }
 
 /// Local-frame triangles for a primitive, or for a mesh `scene.meshes` carries.
-fn tessellate(geom: &Geom, scene: &SceneDesc) -> Result<Vec<[Vec3; 3]>, RenderError> {
+fn tessellate(geom: &Geom, scene: &SceneDesc) -> Result<Vec<LocalTri>, RenderError> {
     let unsupported = |shape| {
         Err(RenderError::UnsupportedShape {
             geom: geom.name.clone(),
@@ -255,18 +479,7 @@ fn tessellate(geom: &Geom, scene: &SceneDesc) -> Result<Vec<[Vec3; 3]>, RenderEr
     };
     match geom.shape {
         Shape::Box { half_extents } => Ok(box_tris(half_extents)),
-        Shape::Plane { half_x, half_y, .. } => Ok(plane_tris(
-            if half_x > 0.0 {
-                half_x
-            } else {
-                INFINITE_PLANE_HALF
-            },
-            if half_y > 0.0 {
-                half_y
-            } else {
-                INFINITE_PLANE_HALF
-            },
-        )),
+        Shape::Plane { half_x, half_y, .. } => Ok(plane_tris(half_x, half_y)),
         Shape::Sphere { radius } => Ok(ellipsoid_tris(Vec3::new(radius, radius, radius))),
         Shape::Ellipsoid { radii } => Ok(ellipsoid_tris(radii)),
         Shape::Capsule {
@@ -278,18 +491,31 @@ fn tessellate(geom: &Geom, scene: &SceneDesc) -> Result<Vec<[Vec3; 3]>, RenderEr
             half_length,
         } => Ok(capsule_tris(radius, half_length, false)),
         // The file's `f32` positions widen exactly; the pose is applied per frame in `f64` by
-        // `push_geom`, exactly as for a primitive (packet M10/W2b).
+        // `push_geom`, exactly as for a primitive (packet M10/W2b). A mesh's own UVs are its
+        // texture coordinates; without them the position feeds `MuJoCo`'s texgen (packet HT1).
         Shape::Mesh { asset } => {
             let Some(mesh) = scene.meshes.get(&asset) else {
                 return unsupported("Mesh (asset not loaded: es_assets::mesh::load)");
             };
-            let vertex = |i: &u32| {
-                let p = mesh.positions.get(*i as usize)?;
-                Some(Vec3::new(f64::from(p[0]), f64::from(p[1]), f64::from(p[2])))
+            let vertex = |i: u32| -> Option<Vert> {
+                let p = *mesh.positions.get(i as usize)?;
+                let uv = match &mesh.uvs {
+                    Some(uvs) => *uvs.get(i as usize)?,
+                    None => [p[0], p[1]],
+                };
+                let v = Vec3::new(f64::from(p[0]), f64::from(p[1]), f64::from(p[2]));
+                Some((v, uv, p))
             };
             mesh.indices
                 .chunks_exact(3)
-                .map(|f| Some([vertex(&f[0])?, vertex(&f[1])?, vertex(&f[2])?]))
+                .map(|f| {
+                    let (a, b, c) = (vertex(f[0])?, vertex(f[1])?, vertex(f[2])?);
+                    Some(LocalTri {
+                        p: [a.0, b.0, c.0],
+                        uv: [a.1, b.1, c.1],
+                        unit: [a.2, b.2, c.2],
+                    })
+                })
                 .collect::<Option<Vec<_>>>()
                 .map_or_else(|| unsupported("Mesh (index out of range)"), Ok)
         }
@@ -297,61 +523,126 @@ fn tessellate(geom: &Geom, scene: &SceneDesc) -> Result<Vec<[Vec3; 3]>, RenderEr
     }
 }
 
-/// Two triangles in the local XY plane, normal +Z.
-fn plane_tris(hx: f64, hy: f64) -> Vec<[Vec3; 3]> {
-    let p = |x: f64, y: f64| Vec3::new(x, y, 0.0);
-    vec![
-        [p(-hx, -hy), p(hx, -hy), p(hx, hy)],
-        [p(-hx, -hy), p(hx, hy), p(-hx, hy)],
-    ]
+/// Two triangles in the local XY plane, normal +Z. An infinite side (`half == 0`) is drawn to
+/// a fixed half-extent; `MuJoCo`'s texture coordinates follow `makePlane`: across the extent
+/// for a finite side, `0.5 x` / `-0.5 y` for an infinite one.
+fn plane_tris(half_x: f64, half_y: f64) -> Vec<LocalTri> {
+    let hx = if half_x > 0.0 {
+        half_x
+    } else {
+        INFINITE_PLANE_HALF
+    };
+    let hy = if half_y > 0.0 {
+        half_y
+    } else {
+        INFINITE_PLANE_HALF
+    };
+    let vert = |sx: f64, sy: f64| {
+        let (x, y) = (sx * hx, sy * hy);
+        let u = if half_x > 0.0 {
+            (sx + 1.0) * 0.5
+        } else {
+            0.5 * x
+        };
+        let v = if half_y > 0.0 {
+            1.0 - (sy + 1.0) * 0.5
+        } else {
+            -0.5 * y
+        };
+        (
+            Vec3::new(x, y, 0.0),
+            [u as f32, v as f32],
+            [x as f32, y as f32, 0.0],
+        )
+    };
+    let tri = |a: Vert, b: Vert, c: Vert| LocalTri {
+        p: [a.0, b.0, c.0],
+        uv: [a.1, b.1, c.1],
+        unit: [a.2, b.2, c.2],
+    };
+    let (a, b, c, d) = (vert(-1., -1.), vert(1., -1.), vert(1., 1.), vert(-1., 1.));
+    vec![tri(a, b, c), tri(a, c, d)]
 }
 
-/// 12 triangles, all wound counter-clockwise seen from outside.
-fn box_tris(h: Vec3) -> Vec<[Vec3; 3]> {
-    let c = |sx: f64, sy: f64, sz: f64| Vec3::new(sx * h.x, sy * h.y, sz * h.z);
-    // Each face as (a, b, c, d) counter-clockwise from outside.
-    let faces = [
-        [
-            c(1., -1., -1.),
-            c(1., 1., -1.),
-            c(1., 1., 1.),
-            c(1., -1., 1.),
-        ], // +X
-        [
-            c(-1., 1., -1.),
-            c(-1., -1., -1.),
-            c(-1., -1., 1.),
-            c(-1., 1., 1.),
-        ], // -X
-        [
-            c(1., 1., -1.),
-            c(-1., 1., -1.),
-            c(-1., 1., 1.),
-            c(1., 1., 1.),
-        ], // +Y
-        [
-            c(-1., -1., -1.),
-            c(1., -1., -1.),
-            c(1., -1., 1.),
-            c(-1., -1., 1.),
-        ], // -Y
-        [
-            c(-1., -1., 1.),
-            c(1., -1., 1.),
-            c(1., 1., 1.),
-            c(-1., 1., 1.),
-        ], // +Z
-        [
-            c(-1., 1., -1.),
-            c(1., 1., -1.),
-            c(1., -1., -1.),
-            c(-1., -1., -1.),
-        ], // -Z
+/// 12 triangles, all wound counter-clockwise seen from outside. `MuJoCo`'s box UVs: `x` / `y`
+/// across a `z` face, `y` / `z` across an `x` face, `x` / `z` across a `y` face, `v` running
+/// down the second axis.
+fn box_tris(h: Vec3) -> Vec<LocalTri> {
+    let c = |sx: f64, sy: f64, sz: f64| (Vec3::new(sx * h.x, sy * h.y, sz * h.z), [sx, sy, sz]);
+    // Each face as (a, b, c, d) counter-clockwise from outside, with the unit axes its UV
+    // reads.
+    let faces: [([Corner; 4], [usize; 2]); 6] = [
+        (
+            [
+                c(1., -1., -1.),
+                c(1., 1., -1.),
+                c(1., 1., 1.),
+                c(1., -1., 1.),
+            ],
+            [1, 2],
+        ), // +X
+        (
+            [
+                c(-1., 1., -1.),
+                c(-1., -1., -1.),
+                c(-1., -1., 1.),
+                c(-1., 1., 1.),
+            ],
+            [1, 2],
+        ), // -X
+        (
+            [
+                c(1., 1., -1.),
+                c(-1., 1., -1.),
+                c(-1., 1., 1.),
+                c(1., 1., 1.),
+            ],
+            [0, 2],
+        ), // +Y
+        (
+            [
+                c(-1., -1., -1.),
+                c(1., -1., -1.),
+                c(1., -1., 1.),
+                c(-1., -1., 1.),
+            ],
+            [0, 2],
+        ), // -Y
+        (
+            [
+                c(-1., -1., 1.),
+                c(1., -1., 1.),
+                c(1., 1., 1.),
+                c(-1., 1., 1.),
+            ],
+            [0, 1],
+        ), // +Z
+        (
+            [
+                c(-1., 1., -1.),
+                c(1., 1., -1.),
+                c(1., -1., -1.),
+                c(-1., -1., -1.),
+            ],
+            [0, 1],
+        ), // -Z
     ];
-    faces
-        .iter()
-        .flat_map(|f| [[f[0], f[1], f[2]], [f[0], f[2], f[3]]])
-        .collect()
+    let mut out = Vec::new();
+    for (f, [ua, va]) in faces {
+        let uv = |k: usize| {
+            let s = f[k].1;
+            [((s[ua] + 1.0) * 0.5) as f32, ((1.0 - s[va]) * 0.5) as f32]
+        };
+        let unit = |k: usize| f[k].1.map(|x| x as f32);
+        for [i, j, k] in [[0, 1, 2], [0, 2, 3]] {
+            out.push(LocalTri {
+                p: [f[i].0, f[j].0, f[k].0],
+                uv: [uv(i), uv(j), uv(k)],
+                unit: [unit(i), unit(j), unit(k)],
+            });
+        }
+    }
+    out
 }
 
 /// Longitude angle of segment `seg`, in `f32`. `seg == SPHERE_SEGMENTS` is the wrap-around
@@ -361,44 +652,74 @@ fn phi_of(seg: u32) -> f32 {
     2.0 * PI * (seg % SPHERE_SEGMENTS) as f32 / SPHERE_SEGMENTS as f32
 }
 
+/// `u` of segment `seg`: `seg / SPHERE_SEGMENTS`, **not** folded, so the seam's two copies
+/// sit at 0 and 1 as `MuJoCo`'s do.
+fn u_of(seg: u32) -> f32 {
+    seg as f32 / SPHERE_SEGMENTS as f32
+}
+
 /// UV sphere scaled per axis. `SPHERE_RINGS` latitude bands, `SPHERE_SEGMENTS` longitude.
 ///
 /// The unit direction is computed entirely in `f32` through [`approx`] — never the host
 /// `libm` (spec 3.2, 3.4) — then widened exactly and scaled by the `f64` radii. These
 /// vertices are what `TriScene::to_floats` uploads to the GPU *and* what the CPU reference
 /// traverses, so a host-dependent `sin` here would desynchronize the two paths.
+///
+/// UVs are `MuJoCo`'s `sphere()`: `u = az / 2 pi`, `v = 0.5 - el / pi` (0 at the +Z pole), and
+/// a pole vertex takes its triangle's middle `u`.
 #[allow(clippy::many_single_char_names)]
-fn ellipsoid_tris(r: Vec3) -> Vec<[Vec3; 3]> {
-    let point = |ring: u32, seg: u32| {
+fn ellipsoid_tris(r: Vec3) -> Vec<LocalTri> {
+    let unit = |ring: u32, seg: u32| {
         let theta = PI * ring as f32 / SPHERE_RINGS as f32;
         let phi = phi_of(seg);
         let (st, ct) = (approx::sin(theta), approx::cos(theta));
         let (sp, cp) = (approx::sin(phi), approx::cos(phi));
-        Vec3::new(
-            r.x * f64::from(st * cp),
-            r.y * f64::from(st * sp),
-            r.z * f64::from(ct),
-        )
+        [st * cp, st * sp, ct]
+    };
+    // `seg_uv` is the triangle's segment, for the middle `u` of a pole vertex.
+    let point = |ring: u32, seg: u32, seg_uv: u32| {
+        let d = unit(ring, seg);
+        let p = Vec3::new(
+            r.x * f64::from(d[0]),
+            r.y * f64::from(d[1]),
+            r.z * f64::from(d[2]),
+        );
+        let u = if ring == 0 || ring == SPHERE_RINGS {
+            (seg_uv as f32 + 0.5) / SPHERE_SEGMENTS as f32
+        } else {
+            u_of(seg)
+        };
+        (p, [u, ring as f32 / SPHERE_RINGS as f32], d)
     };
     let mut out = Vec::new();
     for ring in 0..SPHERE_RINGS {
         for seg in 0..SPHERE_SEGMENTS {
-            let (a, b) = (point(ring, seg), point(ring, seg + 1));
-            let (c, d) = (point(ring + 1, seg + 1), point(ring + 1, seg));
+            let (a, b) = (point(ring, seg, seg), point(ring, seg + 1, seg));
+            let (c, d) = (point(ring + 1, seg + 1, seg), point(ring + 1, seg, seg));
             if ring > 0 {
-                out.push([a, b, c]);
+                out.push(local(a, b, c));
             }
             if ring + 1 < SPHERE_RINGS {
-                out.push([a, c, d]);
+                out.push(local(a, c, d));
             }
         }
     }
     out
 }
 
+fn local(a: Vert, b: Vert, c: Vert) -> LocalTri {
+    LocalTri {
+        p: [a.0, b.0, c.0],
+        uv: [a.1, b.1, c.1],
+        unit: [a.2, b.2, c.2],
+    }
+}
+
 /// Cylinder side along local Z, optionally capped with hemispheres (capsule) instead of
-/// flat discs (cylinder).
-fn capsule_tris(radius: f64, half_length: f64, round_caps: bool) -> Vec<[Vec3; 3]> {
+/// flat discs (cylinder). UVs are `MuJoCo`'s `cylinder()` (`v = (1 - z / hl) / 2`),
+/// `halfSphere()` (`v` from 1 at the equator to 0 at the top pole, 0 to 1 below) and `disk()`
+/// (`0.5 + 0.5 (x, y) / r`); `unit` is the vertex in the unit part `MuJoCo` draws.
+fn capsule_tris(radius: f64, half_length: f64, round_caps: bool) -> Vec<LocalTri> {
     let ring = |seg: u32, z: f64, r: f64| {
         let phi = phi_of(seg);
         Vec3::new(
@@ -407,46 +728,75 @@ fn capsule_tris(radius: f64, half_length: f64, round_caps: bool) -> Vec<[Vec3; 3
             z,
         )
     };
+    let side = |seg: u32, top: bool| {
+        let z = if top { half_length } else { -half_length };
+        let phi = phi_of(seg);
+        let h = if top { 1.0f32 } else { -1.0 };
+        (
+            ring(seg, z, radius),
+            [u_of(seg), (1.0 - h) * 0.5],
+            [approx::cos(phi), approx::sin(phi), h],
+        )
+    };
     let mut out = Vec::new();
     for seg in 0..SPHERE_SEGMENTS {
-        let (a, b) = (
-            ring(seg, -half_length, radius),
-            ring(seg + 1, -half_length, radius),
-        );
-        let (c, d) = (
-            ring(seg + 1, half_length, radius),
-            ring(seg, half_length, radius),
-        );
-        out.push([a, b, c]);
-        out.push([a, c, d]);
+        let (a, b) = (side(seg, false), side(seg + 1, false));
+        let (c, d) = (side(seg + 1, true), side(seg, true));
+        out.push(local(a, b, c));
+        out.push(local(a, c, d));
     }
     for (sign, z0) in [(1.0_f64, half_length), (-1.0, -half_length)] {
         if round_caps {
+            let s = sign as f32;
             for band in 0..CAP_RINGS {
                 for seg in 0..SPHERE_SEGMENTS {
                     let cap = |band: u32, seg: u32| {
                         let t = 0.5 * PI * band as f32 / CAP_RINGS as f32;
-                        ring(
+                        let p = ring(
                             seg,
                             z0 + sign * radius * f64::from(approx::sin(t)),
                             radius * f64::from(approx::cos(t)),
+                        );
+                        let k = band as f32 / CAP_RINGS as f32;
+                        let u = if band == CAP_RINGS {
+                            (seg as f32 - 0.5) / SPHERE_SEGMENTS as f32
+                        } else {
+                            u_of(seg)
+                        };
+                        let v = if sign > 0.0 { 1.0 - k } else { k };
+                        let phi = phi_of(seg);
+                        let (st, ct) = (approx::sin(t), approx::cos(t));
+                        (
+                            p,
+                            [u, v],
+                            [ct * approx::cos(phi), ct * approx::sin(phi), s * (1.0 + st)],
                         )
                     };
                     let (a, b) = (cap(band, seg), cap(band, seg + 1));
                     let (c, d) = (cap(band + 1, seg + 1), cap(band + 1, seg));
-                    out.push([a, b, c]);
+                    out.push(local(a, b, c));
                     if band + 1 < CAP_RINGS {
-                        out.push([a, c, d]);
+                        out.push(local(a, c, d));
                     }
                 }
             }
         } else {
-            for seg in 0..SPHERE_SEGMENTS {
-                out.push([
-                    Vec3::new(0.0, 0.0, z0),
+            let s = sign as f32;
+            let rim = |seg: u32| {
+                let phi = phi_of(seg);
+                let (c, sn) = (approx::cos(phi), approx::sin(phi));
+                (
                     ring(seg, z0, radius),
-                    ring(seg + 1, z0, radius),
-                ]);
+                    [0.5 + 0.5 * c, 0.5 + 0.5 * sn],
+                    [c, sn, s],
+                )
+            };
+            for seg in 0..SPHERE_SEGMENTS {
+                out.push(local(
+                    (Vec3::new(0.0, 0.0, z0), [0.5, 0.5], [0.0, 0.0, s]),
+                    rim(seg),
+                    rim(seg + 1),
+                ));
             }
         }
     }
