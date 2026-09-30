@@ -635,15 +635,19 @@ pub(crate) fn run(
             ))
         })?;
         write_file(&docs.join("scene.xml"), &bytes)?;
-        // The mesh files the scene names, at the same scene-relative paths, so the rollout
-        // resolves them against `docs` exactly as `load_scene` does against the scene's own
-        // directory (packet M16/H2). A primitives-only scene names none.
+        // The mesh and texture files the scene names, at the same scene-relative paths, so the
+        // rollout resolves them against `docs` exactly as `load_scene` does against the scene's
+        // own directory (packets M16/H2, H1b). A primitives-only scene names none; a builtin
+        // texture (`builtin="checker"`) names no file.
         let parsed = std::str::from_utf8(&bytes)
             .ok()
             .and_then(|xml| es_assets::parse_mjcf(xml).ok());
         let scene_dir = Path::new(scene).parent().unwrap_or(Path::new("."));
         for asset in parsed.iter().flat_map(|p| &p.scene.assets) {
-            if asset.kind == es_assets::scene::AssetKind::Mesh {
+            use es_assets::scene::AssetKind;
+            let texture_file =
+                asset.kind == AssetKind::Texture && scene_dir.join(&asset.path).is_file();
+            if asset.kind == AssetKind::Mesh || texture_file {
                 let mesh = std::fs::read(scene_dir.join(&asset.path))
                     .map_err(|e| bad(format!("{}: {e}", scene_dir.join(&asset.path).display())))?;
                 write_file(&docs.join(&asset.path), &mesh)?;
