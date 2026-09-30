@@ -171,7 +171,7 @@ impl<B: PhysicsBackend> Env<B> {
             control: ControlExecutor::new(task, n_envs),
             randomization: RandomizationPlan::compile(task, scene, &model)?,
             sensors: image_sensors(task),
-            recorder: EpisodeRecorder::new(n_envs, shape, task.config.max_episode_steps),
+            recorder: EpisodeRecorder::new(n_envs, shape),
             failure_policy: FailurePolicy::default(),
             seed,
             max_episode_steps: task.config.max_episode_steps,

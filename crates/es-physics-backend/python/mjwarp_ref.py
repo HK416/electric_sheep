@@ -5,6 +5,7 @@ from Rust:
 
     {"cmd": "load", "mjcf": str, "n_envs": int, "timestep": float|null, "seed": int}
     {"cmd": "reset", "envs": [int]|null, "state": {...}|null}
+    {"cmd": "reset", "envs": [int]|null, "state_frame": [nq, nv, na]}  # the state as bytes
     {"cmd": "set_ctrl", "ctrl": [float]}          # n_envs * nu, env-major
     {"cmd": "set_ctrl", "frame": int}             # the same, as float64 bytes after the line
     {"cmd": "step", "n": int}
@@ -431,6 +432,13 @@ def main():
             req = json.loads(line)
             if "frame" in req:
                 req["ctrl"] = read_frame(sys.stdin.buffer, int(req["frame"]))
+            if "state_frame" in req:
+                # `reset`'s state as float64 bytes after the line (packet M16/H2c): the lists
+                # the JSON `state` would have parsed to, value for value.
+                flat = read_frame(sys.stdin.buffer, sum(int(n) for n in req["state_frame"]))
+                cuts = np.cumsum([int(n) for n in req.pop("state_frame")])[:-1]
+                parts = (a.tolist() for a in np.split(flat, cuts))
+                req["state"] = dict(zip(("qpos", "qvel", "act"), parts))
             if req.get("cmd") == "quit":
                 return
             sim, payload = handle(sim, req)

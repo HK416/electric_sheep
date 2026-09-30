@@ -280,15 +280,22 @@ impl PhysicsBackend for MjWarpBackend {
         if let Some(state) = state {
             self.check_state(state, rows)?;
         }
-        let payload = state.map(|s| StatePayload {
-            qpos: s.qpos,
-            qvel: s.qvel,
-            act: s.act,
-        });
-        let _: Ack = self.process()?.call(&Request::Reset {
-            envs,
-            state: payload,
-        })?;
+        match state {
+            // As a frame (packet M16/H2c): the same values, not printed and re-parsed.
+            Some(s) => self.process()?.reset_frame(
+                envs,
+                &StatePayload {
+                    qpos: s.qpos,
+                    qvel: s.qvel,
+                    act: s.act,
+                },
+            )?,
+            None => {
+                let _: Ack = self
+                    .process()?
+                    .call(&Request::Reset { envs, state: None })?;
+            }
+        }
         // The batch shares one clock, so only a whole-batch reset rewinds it.
         if envs.is_none() {
             self.tick = PhysTick::ZERO;

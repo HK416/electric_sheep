@@ -223,8 +223,9 @@ def observe(roll, shapes: dict, n_envs: int, device="cpu") -> dict:
     """`{port: [n_envs, *shape]}` as f32 tensors, `shape` being the port's own in
     `contract.json` -- `[dim]` for a state port, `[C, H, W]` for an image port (packet M11/X3),
     which is the lowered module's layout because the lowering wrote that file from the same IR.
-    `Rollout.observe` hands each port back flat and row-major by env; nothing is transposed.
-    The tensors are built on the CPU and then moved to `device` (packet M11/R3)."""
+    `Rollout.observe` hands each port back flat and row-major by env, as f64 bytes (packet
+    M16/H2c); nothing is transposed. The tensors are built on the CPU and then moved to
+    `device` (packet M11/R3)."""
     raw = roll.observe()
     missing = [p for p in shapes if p not in raw]
     if missing:
@@ -234,9 +235,15 @@ def observe(roll, shapes: dict, n_envs: int, device="cpu") -> dict:
             % (sorted(raw), missing)
         )
     return {
-        p: torch.tensor(raw[p], dtype=torch.float32).reshape(n_envs, *shape).to(device)
+        p: f64_tensor(raw[p]).reshape(n_envs, *shape).to(device)
         for p, shape in shapes.items()
     }
+
+
+def f64_tensor(raw) -> torch.Tensor:
+    """`Rollout`'s little-endian f64 bytes as an f32 tensor: the same round-to-nearest cast
+    `torch.tensor(values, dtype=torch.float32)` makes of each Python float, without the list."""
+    return torch.frombuffer(raw, dtype=torch.float64).to(torch.float32)
 
 
 def flatten(obs: dict, ports: list) -> torch.Tensor:
@@ -486,13 +493,9 @@ def main(argv: list) -> int:
                 buf_val[t] = value(flat)
 
                 executed, events, rewards, dones = roll.act(
-                    action.reshape(-1).double().tolist()
+                    action.reshape(-1).double().cpu().numpy().tobytes()
                 )
-                executed = (
-                    torch.tensor(executed, dtype=torch.float32)
-                    .reshape(a.envs, action_dim)
-                    .to(device)
-                )
+                executed = f64_tensor(executed).reshape(a.envs, action_dim).to(device)
                 violations += sum(1 for bits in events if bits != 0)
                 # Against the *sample*, whichever estimator is in use: this row is what the
                 # envelope did, not what the gradient was taken at.
