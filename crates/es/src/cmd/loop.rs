@@ -45,7 +45,7 @@ es loop collect --policy <policy.esb> --scene <file.xml|urdf> --episodes <N> --s
 es loop intervene --dataset <root> --segments <segments.json>
 es loop distill --in <root> [--in-frames <dir>] [--in <root> [--in-frames <dir>]...]
                 [--train 0.8] [--val 0.1] [--test 0.1] [--seed <S>] --out <root>
-                [--frames <dir>]
+                [--frames <dir>] [--success-only]
 es loop cycle --recipe <cycle.toml> [--out <dir>] [--dry-run] [--from <stage>]
               [--allow-new-evaluation] [--skip-expert-gate]     (see `es loop cycle --help`)
 
@@ -128,6 +128,13 @@ distill    Merges datasets (episodes re-indexed, intervention labels and the row
            global frame order; each input's tiles are the --in-frames after its --in. Tiles
            that already are <dir> stay, when their --in is first -- what `es loop cycle`'s
            [collect] merge does with collect/frames.
+           --success-only (packet M16/H3) keeps only the episodes whose collect-time outcome
+           was a success, as `es loop collect` records each in <root>/meta/outcomes.jsonl
+           (outside every hash); an input without that file is refused, not guessed. The kept
+           episodes are re-indexed with their labels and rows, their tiles (per camera)
+           renumbered into --frames -- which then has to be a directory of its own -- and the
+           ledger's distill step records keep = success and the kept episode count;
+           dataset_content_hash moves with the episodes, as for any new dataset.
 
 cycle      Runs collect -> train -> eval -> showcase from one document, appending a step per
            stage to one ledger (spec 13.1, spec 13.3). It re-implements no stage: each one is
@@ -1310,8 +1317,14 @@ fn intervene(args: &[String]) -> Result<u8, CliError> {
 
 /// One merge. `es loop cycle`'s merge stage is this call, with the words its plan prints.
 pub(crate) fn distill(args: &[String]) -> Result<u8, CliError> {
+    let success_only = args.iter().any(|a| a == "--success-only");
+    let args: Vec<String> = args
+        .iter()
+        .filter(|a| *a != "--success-only")
+        .cloned()
+        .collect();
     let pairs = parse(
-        args,
+        &args,
         &[
             "--in",
             "--in-frames",
@@ -1366,12 +1379,12 @@ pub(crate) fn distill(args: &[String]) -> Result<u8, CliError> {
 
     // Before the dataset, so a missing tile stops the merge before any ledger records it.
     if let Some(dir) = &frames {
-        let n = merge_frames(&tiles, dir)?;
+        let n = merge_frames(&tiles, dir, success_only)?;
         println!("frames: {n} tile(s) in {}", dir.display());
     }
     let inputs: Vec<&Path> = inputs.iter().map(|(root, _)| root.as_path()).collect();
-    let identity =
-        es_data::distill(&inputs, &split, &out).map_err(|e| CliError::Runtime(e.to_string()))?;
+    let identity = es_data::distill(&inputs, &split, &out, success_only)
+        .map_err(|e| CliError::Runtime(e.to_string()))?;
     let training_hash = identity
         .training_hash()
         .map_err(|e| CliError::Runtime(e.to_string()))?;
@@ -1393,8 +1406,13 @@ pub(crate) fn distill(args: &[String]) -> Result<u8, CliError> {
 /// `<out>/<channel>/` for a collection of several cameras), the offset being the
 /// frames of the inputs before it -- `es_data::distill`'s episode order. Hard links where the
 /// volume allows, copies where not. Tiles that already are `<out>` at offset 0 (a cycle's new
-/// collection, merged first) stay where they are.
-fn merge_frames(inputs: &[(&Path, &Path)], out: &Path) -> Result<u64, CliError> {
+/// collection, merged first) stay where they are. With `success_only` only the successful
+/// episodes' tiles are carried, renumbered as `es_data::distill` re-indexes the episodes.
+fn merge_frames(
+    inputs: &[(&Path, &Path)],
+    out: &Path,
+    success_only: bool,
+) -> Result<u64, CliError> {
     let fail =
         |p: &Path, e: &dyn std::fmt::Display| CliError::Runtime(format!("{}: {e}", p.display()));
     std::fs::create_dir_all(out).map_err(|e| fail(out, &e))?;
@@ -1404,33 +1422,57 @@ fn merge_frames(inputs: &[(&Path, &Path)], out: &Path) -> Result<u64, CliError> 
     let mut moves = Vec::new();
     for (root, tiles) in inputs {
         let dataset = es_data::LeRobotDataset::open(root).map_err(|e| fail(root, &e))?;
-        let n: u64 = dataset.episodes().iter().map(|m| m.length).sum();
+        let kept = if success_only {
+            Some(es_data::collect::successful_episodes(root).map_err(|e| fail(root, &e))?)
+        } else {
+            None
+        };
+        // (first source tile, first merged tile, tiles) per carried episode.
+        let (start, mut from, mut ranges) = (next, 0u64, Vec::new());
+        for meta in dataset.episodes() {
+            if kept
+                .as_ref()
+                .is_none_or(|k| k.contains(&meta.episode_index))
+            {
+                ranges.push((from, next, meta.length));
+                next += meta.length;
+            }
+            from += meta.length;
+        }
         if tiles.canonicalize().ok().as_ref() != Some(&here) {
             // Several cameras: each one's `<channel>/` into the same `<channel>/` of `<dir>`
             // (packet M15/N3). One, or none declared: the flat tiles, as before.
             let cameras = es_data::training::camera_dirs(dataset.info(), tiles);
             if cameras.len() > 1 {
-                for (camera, from) in cameras {
-                    moves.push((from, out.join(camera), next, n));
+                for (camera, dir) in cameras {
+                    moves.push((dir, out.join(camera), ranges.clone()));
                 }
             } else {
-                moves.push((tiles.to_path_buf(), out.to_path_buf(), next, n));
+                moves.push((tiles.to_path_buf(), out.to_path_buf(), ranges));
             }
-        } else if next != 0 {
+        } else if success_only {
+            return Err(CliError::Usage(format!(
+                "--in-frames {}: these tiles are --frames itself, and --success-only renumbers \
+                 them; write the kept tiles to a --frames directory of their own\n\n{HELP}",
+                tiles.display()
+            )));
+        } else if start != 0 {
             return Err(CliError::Usage(format!(
                 "--in-frames {}: these tiles are --frames itself, so its --in has to come \
                  first\n\n{HELP}",
                 tiles.display()
             )));
         }
-        next += n;
     }
-    for (tiles, into, offset, n) in moves {
+    for (tiles, into, ranges) in moves {
         std::fs::create_dir_all(&into).map_err(|e| fail(&into, &e))?;
-        for i in 0..n {
+        for (i, o) in ranges
+            .into_iter()
+            .flat_map(|(from, to, n)| (0..n).map(move |k| (from + k, to + k)))
+        {
             for ext in ["bin", "json"] {
                 let src = tiles.join(format!("{i:06}.{ext}"));
-                let dst = into.join(format!("{:06}.{ext}", offset + i));
+                let dst = into.join(format!("{o:06}.{ext}"));
                 if ext == "json" && !src.exists() {
                     continue;
                 }

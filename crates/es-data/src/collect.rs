@@ -13,7 +13,7 @@
 //!   slots this side of the boundary cannot know are all-zero digests, never fabricated
 //!   (spec 19.3, spec 2.3: training is on the Python path).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -922,6 +922,7 @@ impl Collector {
         }
         writer.finish()?;
         crate::intervention::write_segments(spec.out_root, &segments)?;
+        write_outcomes(spec.out_root, &terminations)?;
 
         let dataset = LeRobotDataset::open(spec.out_root)?;
         let (content, schema) = identity_of(&dataset)?;
@@ -1142,6 +1143,44 @@ impl Default for SplitSpec {
 /// `info.json`).
 pub const PERTURBATIONS_FILE: &str = "meta/perturbations.jsonl";
 
+/// How each episode of a collection ended, one JSON line per episode --
+/// `{"episode":0,"termination":"success"}` -- beside [`PERTURBATIONS_FILE`] and, like it,
+/// outside every hash (packet M16/H3). The `LeRobot` columns have no place for it and the
+/// ledger's collect step only counts; this is what [`distill`]'s `success_only` keeps by.
+pub const OUTCOMES_FILE: &str = "meta/outcomes.jsonl";
+
+fn write_outcomes(root: &Path, terminations: &[Termination]) -> Result<(), DataError> {
+    let mut text = String::new();
+    for (i, t) in terminations.iter().enumerate() {
+        let t = format!("{t:?}").to_lowercase();
+        let _ = writeln!(
+            text,
+            "{}",
+            serde_json::json!({ "episode": i, "termination": t })
+        );
+    }
+    write_file(&root.join(OUTCOMES_FILE), text.as_bytes())
+}
+
+/// The episodes of the dataset at `root` whose collect-time outcome was a success
+/// ([`OUTCOMES_FILE`]). Refused, not guessed, for a dataset without the file: one collected
+/// before packet M16/H3 records only counts.
+pub fn successful_episodes(root: &Path) -> Result<BTreeSet<u32>, DataError> {
+    if !root.join(OUTCOMES_FILE).is_file() {
+        return Err(DataError::Loop(format!(
+            "{} has no {OUTCOMES_FILE}, so which of its episodes succeeded is not recorded (a \
+             collection older than packet M16/H3 counts them only); collect it again to keep \
+             its successes",
+            root.display()
+        )));
+    }
+    Ok(read_rows(root, OUTCOMES_FILE)?
+        .iter()
+        .filter(|row| row["termination"] == "success")
+        .filter_map(|row| row["episode"].as_u64().and_then(|e| u32::try_from(e).ok()))
+        .collect())
+}
+
 /// Merges datasets, splits deterministically, and writes the spec 19.3 identity.
 ///
 /// Episodes are re-indexed `0..N` in input order then original index — a total order, so two
@@ -1150,12 +1189,19 @@ pub const PERTURBATIONS_FILE: &str = "meta/perturbations.jsonl";
 /// labels survive the merge, and so is [`PERTURBATIONS_FILE`], so each episode keeps the suite
 /// it was collected under (packet M13/Z3); a merge of inputs that have none writes none.
 ///
+/// [`OUTCOMES_FILE`] is carried the same way. With `success_only` (packet M16/H3) only the
+/// episodes whose collect-time outcome was a success are merged -- re-indexed, their labels,
+/// perturbation and outcome rows carried -- and the step records `keep = success`; an input
+/// without [`OUTCOMES_FILE`], or inputs with no success at all, are refused before anything is
+/// written. Without it the merge is exactly what it always was.
+///
 /// The `Distill` loop step is appended to the output root **and** every input root: a
 /// dataset's own ledger should record that it was consumed (spec 13.3).
 pub fn distill<P: AsRef<Path>>(
     inputs: &[P],
     split: &SplitSpec,
     out_root: &Path,
+    success_only: bool,
 ) -> Result<TrainingIdentity, DataError> {
     if inputs.is_empty() {
         return Err(DataError::Loop(
@@ -1192,15 +1238,35 @@ pub fn distill<P: AsRef<Path>>(
         }
     }
 
+    let kept: Vec<Option<BTreeSet<u32>>> = datasets
+        .iter()
+        .map(|ds| {
+            success_only
+                .then(|| successful_episodes(ds.root()))
+                .transpose()
+        })
+        .collect::<Result<_, _>>()?;
+    if success_only && kept.iter().flatten().all(BTreeSet::is_empty) {
+        return Err(DataError::Loop(
+            "no episode of the inputs succeeded; there is nothing to keep".to_owned(),
+        ));
+    }
+
     let mut info = first.clone();
     crate::intervention::ensure_columns(&mut info);
     let mut writer = LeRobotWriter::create(out_root, info)?;
     let mut segments = Vec::new();
-    let mut perturbations = String::new();
+    let (mut perturbations, mut outcomes) = (String::new(), String::new());
     let mut next = 0u32;
-    for ds in &datasets {
+    for (ds, kept) in datasets.iter().zip(&kept) {
         let mut remap = BTreeMap::new();
         for meta in ds.episodes() {
+            if kept
+                .as_ref()
+                .is_some_and(|k| !k.contains(&meta.episode_index))
+            {
+                continue;
+            }
             let mut ep = ds.read_episode(meta.episode_index)?;
             remap.insert(meta.episode_index, next);
             ep.index = next;
@@ -1213,23 +1279,33 @@ pub fn distill<P: AsRef<Path>>(
                 segments.push(s);
             }
         }
-        for mut row in read_perturbations(ds.root())? {
-            let episode = row["episode"].as_u64().and_then(|e| u32::try_from(e).ok());
-            if let Some(index) = episode.and_then(|e| remap.get(&e)) {
-                row["episode"] = (*index).into();
-                perturbations.push_str(&row.to_string());
-                perturbations.push('\n');
+        for (file, text) in [
+            (PERTURBATIONS_FILE, &mut perturbations),
+            (OUTCOMES_FILE, &mut outcomes),
+        ] {
+            for mut row in read_rows(ds.root(), file)? {
+                let episode = row["episode"].as_u64().and_then(|e| u32::try_from(e).ok());
+                if let Some(index) = episode.and_then(|e| remap.get(&e)) {
+                    row["episode"] = (*index).into();
+                    text.push_str(&row.to_string());
+                    text.push('\n');
+                }
             }
         }
     }
     writer.finish()?;
     crate::intervention::write_segments(out_root, &segments)?;
-    let path = out_root.join(PERTURBATIONS_FILE);
-    if perturbations.is_empty() {
-        // An earlier merge into the same root must not name suites for these episodes.
-        let _ = std::fs::remove_file(&path);
-    } else {
-        write_file(&path, perturbations.as_bytes())?;
+    for (file, text) in [
+        (PERTURBATIONS_FILE, perturbations),
+        (OUTCOMES_FILE, outcomes),
+    ] {
+        let path = out_root.join(file);
+        if text.is_empty() {
+            // An earlier merge into the same root must not name rows for these episodes.
+            let _ = std::fs::remove_file(&path);
+        } else {
+            write_file(&path, text.as_bytes())?;
+        }
     }
 
     let merged = LeRobotDataset::open(out_root)?;
@@ -1263,7 +1339,11 @@ pub fn distill<P: AsRef<Path>>(
         .output("schema", &hex(&identity.schema))
         .output("split", &hex(&identity.split))
         .output("training_hash", &hex(&training.training_hash()?));
-    let mut step = step;
+    let mut step = if success_only {
+        step.input("keep", &"success").output("episodes", &next)
+    } else {
+        step
+    };
     for (i, ds) in datasets.iter().enumerate() {
         let (content, schema) = identity_of(ds)?;
         step = step
@@ -1279,9 +1359,10 @@ pub fn distill<P: AsRef<Path>>(
     Ok(training)
 }
 
-/// [`PERTURBATIONS_FILE`]'s rows; an absent file is none, as with the intervention segments.
-fn read_perturbations(root: &Path) -> Result<Vec<serde_json::Value>, DataError> {
-    let path = root.join(PERTURBATIONS_FILE);
+/// The rows of a JSON-lines `file` under `root` ([`PERTURBATIONS_FILE`], [`OUTCOMES_FILE`]);
+/// an absent file is none, as with the intervention segments.
+fn read_rows(root: &Path, file: &str) -> Result<Vec<serde_json::Value>, DataError> {
+    let path = root.join(file);
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),

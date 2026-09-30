@@ -56,6 +56,7 @@ in-process: nothing here re-implements what `es loop collect`, `es train`, `es e
   scene = \"tests/fixtures/mjcf/so101_pick_place.xml\"
   [collect]  policy, expert, episodes, seed, frames     # or  dataset = \"<root>\"
              perturb = { config, suites }, merge = [\"<root>\", ...]     # optional
+             success_only = true                                       # optional
   [train]    recipe = \"training.toml\"
              init = \"<bundle | lerobot pretrained_model dir>\"           # optional
   [eval]     config, checkpoint = \"last\", jobs, frames
@@ -67,7 +68,10 @@ Evaluation IR (`es loop collect --perturb --suites`), and a collection whose see
 of [eval] config or of `perturb`'s own config is refused, `--dry-run` included (spec 13.3).
 `merge` is a merge stage after collect: `es loop distill` of the new dataset and those roots
 into <out>/collect/merged, all-train, which is what trains; with `frames`, each root's tiles
-are the `frames` beside it and are linked into collect/frames after the new ones. `init` is
+are the `frames` beside it and are linked into collect/frames after the new ones.
+`success_only` (packet M16/H3) makes that stage `es loop distill --success-only` into
+<out>/collect/successes/ds, tiles into collect/successes/frames: only the episodes whose
+collect-time outcome was a success train -- for a demonstrator that is a trained policy. `init` is
 where training starts: the IR and RL routes' `[init] policy`, the lerobot route's
 `--policy.path`. Both have to be on disk before anything runs (not checked by `--dry-run`).
 
@@ -222,10 +226,10 @@ pub(crate) fn run(args: &[String]) -> Result<u8, CliError> {
         .check_inputs(plan.train.route)
         .map_err(|e| bad(e.to_string()))?;
     // The step that wrote the data the cycle trains on, for the ledger's own checks.
-    let data_kind = if cycle.merge().is_empty() {
-        LoopKind::Collect
-    } else {
+    let data_kind = if cycle.merges() {
         LoopKind::Distill
+    } else {
+        LoopKind::Collect
     };
 
     // **One socket for the whole cycle** (packet M7/E7), bound before the first stage opens

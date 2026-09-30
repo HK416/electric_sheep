@@ -1906,6 +1906,12 @@ pub struct CollectRef {
     /// tiles are the `frames` directory beside it -- the layout a cycle writes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub merge: Vec<String>,
+    /// Train on the successful episodes only (packet M16/H3): a merge stage, `es loop distill
+    /// --success-only`, of this collection (and `merge`'s roots) into
+    /// `<out>/collect/successes/ds` with its tiles in `collect/successes/frames`, which is then
+    /// what trains. For a demonstrator that is itself a policy and succeeds only sometimes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub success_only: bool,
 }
 
 /// `[collect] perturb = { config, suites }` (packet M13/Z3).
@@ -2197,14 +2203,36 @@ impl Cycle {
         }
     }
 
-    /// The dataset root this cycle trains on: `<out>/collect/ds` when it collects its own, and
-    /// `<out>/collect/merged` when that is merged with `[collect] merge` (packet M13/Z3).
+    /// The dataset root this cycle trains on: `<out>/collect/ds` when it collects its own,
+    /// `<out>/collect/merged` when that is merged with `[collect] merge` (packet M13/Z3), and
+    /// `<out>/collect/successes/ds` when only the successes are kept (packet M16/H3).
     pub fn dataset_root(&self, out: &Path) -> String {
         match &self.dataset {
             Some(root) => root.clone(),
+            None if self.success_only() => under(out, "collect/successes/ds"),
             None if self.merge().is_empty() => collect_root(out),
             None => under(out, "collect/merged"),
         }
+    }
+
+    /// The frame tiles of [`Self::dataset_root`] when the cycle collects them: the `frames`
+    /// beside it.
+    fn dataset_frames(&self, out: &Path) -> String {
+        if self.success_only() {
+            under(out, "collect/successes/frames")
+        } else {
+            under(out, "collect/frames")
+        }
+    }
+
+    /// `[collect] success_only`.
+    pub fn success_only(&self) -> bool {
+        self.collect.as_ref().is_some_and(|c| c.success_only)
+    }
+
+    /// Whether a merge stage (`es loop distill`) writes the root that trains.
+    pub fn merges(&self) -> bool {
+        !self.merge().is_empty() || self.success_only()
     }
 
     /// `[collect] merge`, empty when there is none.
@@ -2279,7 +2307,7 @@ impl Cycle {
             // The merge extends `collect/frames` with the earlier roots' tiles, so one
             // directory serves `collect/ds` and `collect/merged` alike (packet M13/Z3).
             dataset.root = self.dataset_root(out);
-            dataset.frames = collect.frames.then(|| under(out, "collect/frames"));
+            dataset.frames = collect.frames.then(|| self.dataset_frames(out));
         } else if let Some(root) = &self.dataset {
             dataset.root.clone_from(root);
         }
@@ -2392,7 +2420,9 @@ impl CyclePlan {
             // trains. All-train, because `es train` trains on every episode of its root and the
             // split `split.json` records should say so. The tiles go into `collect/frames`
             // after the new collection's own, which is the merged root's global frame order.
-            if !collect.merge.is_empty() {
+            // Packet M16/H3: `success_only` is the same stage keeping the successes, its tiles
+            // renumbered into a directory of their own beside the root it writes.
+            if cycle.merges() {
                 let mut args = Vec::new();
                 for root in std::iter::once(collect_root(out)).chain(collect.merge.clone()) {
                     let tiles = frames.as_ref().map(|_| frames_beside(&root));
@@ -2401,7 +2431,11 @@ impl CyclePlan {
                 }
                 args.extend(["--train", "1", "--val", "0", "--test", "0"].map(s));
                 args.extend([s("--out"), dataset_root.clone()]);
-                args.extend(frames.iter().flat_map(|f| [s("--frames"), f.clone()]));
+                let into = frames.as_ref().map(|_| cycle.dataset_frames(out));
+                args.extend(into.into_iter().flat_map(|f| [s("--frames"), f]));
+                if collect.success_only {
+                    args.push(s("--success-only"));
+                }
                 steps.push(CycleStep {
                     stage: Stage::Merge,
                     prefix: es(&["es", "loop", "distill"]),
@@ -3784,6 +3818,37 @@ fov = 36
             "--in /tmp/run/collect/ds --in runs/001/collect/ds --train 1 --val 0 --test 0 \
              --out /tmp/run/collect/merged"
         );
+    }
+
+    /// Packet M16/H3: `success_only` is a merge stage of the collection alone with
+    /// `--success-only`, into `collect/successes/ds` with its tiles in
+    /// `collect/successes/frames` -- which is what trains. Without it a cycle that merges
+    /// nothing has no merge stage, as before.
+    #[test]
+    fn a_success_only_cycle_trains_on_the_kept_episodes() {
+        let text = CYCLE.replace(
+            "frames = true\n[train]",
+            "frames = true\nsuccess_only = true\n[train]",
+        );
+        let cycle = Cycle::parse(&text).expect("parses");
+        let recipe = cycle.training(Some(IR), Path::new("/tmp/run")).unwrap();
+        let dataset = recipe.dataset.as_ref().unwrap();
+        assert!(dataset
+            .root
+            .replace('\\', "/")
+            .ends_with("collect/successes/ds"));
+        let frames = dataset.frames.as_deref().unwrap().replace('\\', "/");
+        assert!(frames.ends_with("collect/successes/frames"), "{frames}");
+        let plan = cycle_plan(&text, "/tmp/run");
+        assert_eq!(plan.steps[1].stage, Stage::Merge);
+        let rendered = plan.render(Path::new("/tmp/run"));
+        let line =
+            "\nes loop distill --in collect/ds --in-frames collect/frames --train 1 --val 0 \
+                    --test 0 --out collect/successes/ds --frames collect/successes/frames \
+                    --success-only\n";
+        assert!(rendered.contains(line), "{line:?} not in\n{rendered}");
+        let plain = cycle_plan(CYCLE, "/tmp/run");
+        assert!(plain.steps.iter().all(|s| s.stage != Stage::Merge));
     }
 
     /// The lerobot route starts from `--policy.path`, in place of `--policy.type`, which

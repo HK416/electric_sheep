@@ -829,7 +829,8 @@ fn distill_merges_splits_disjointly_and_is_stable() {
         seed: 20_260_913,
     };
     let out = dir.join("merged");
-    let first = es_data::distill(&[a.clone(), b.clone()], &split, &out).expect("distill runs");
+    let first =
+        es_data::distill(&[a.clone(), b.clone()], &split, &out, false).expect("distill runs");
 
     let merged = LeRobotDataset::open(&out).expect("the merged dataset opens");
     assert_eq!(merged.episodes().len(), 5, "episode counts sum");
@@ -862,7 +863,7 @@ fn distill_merges_splits_disjointly_and_is_stable() {
 
     // Stable across runs: the merged parquet is byte-identical, so every hash is.
     let again = dir.join("merged2");
-    let second = es_data::distill(&[a, b], &split, &again).expect("distill runs again");
+    let second = es_data::distill(&[a, b], &split, &again, false).expect("distill runs again");
     assert_eq!(first, second);
     assert_eq!(
         first.training_hash().unwrap(),
@@ -899,6 +900,7 @@ fn loop_jsonl_chains_collect_intervene_distill() {
         std::slice::from_ref(&root),
         &SplitSpec::default(),
         &dir.join("distilled"),
+        false,
     )
     .expect("distill runs");
 
@@ -1274,4 +1276,151 @@ fn a_second_episode_repeats_the_first_exactly() {
         i64_column(&second, ACTION_SOURCE),
         "the plane treated the two identical episodes differently"
     );
+}
+
+// --- M16/H3: keeping the successful demonstrations -------------------------------------------
+
+/// The test bundle with a success, `j0 > 0.4`: an episode whose reset drew `j0` high enough
+/// succeeds at once and the others time out -- a demonstrator that succeeds only sometimes.
+fn bundle_with_success() -> PolicyBundle {
+    use es_ir::task::{CmpOp, TerminationKind};
+    let mut b = bundle();
+    let g = &mut b.task.graph;
+    g.insert(
+        NodeId(4),
+        TaskNode::Compare {
+            op: CmpOp::Gt,
+            rhs: Some(0.4),
+            ty: joint_ty(Unit::Angle),
+        },
+    );
+    g.insert(
+        NodeId(5),
+        TaskNode::Terminate {
+            kind: TerminationKind::Success,
+        },
+    );
+    g.connect(NodeId(0), "value", NodeId(4), "a");
+    g.connect(NodeId(4), "value", NodeId(5), "value");
+    b.observation = observation_ir(b.task.task_hash().expect("task hashes"));
+    b
+}
+
+fn jsonl(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .expect("the file reads")
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("a JSON row"))
+        .collect()
+}
+
+/// Packet M16/H3: the collector records how each episode ended in `meta/outcomes.jsonl`, and
+/// `distill(.., success_only)` keeps exactly the episodes that succeeded -- re-indexed in
+/// order, each one's columns the source episode's -- carries their outcome rows, and records
+/// `keep = success` in the ledger. An unfiltered merge is what it was before the file existed,
+/// and a dataset without the file is refused, not guessed at.
+#[test]
+fn distill_success_only_keeps_the_episodes_that_succeeded() {
+    let dir = scratch("loop-success-only");
+    let root = dir.join("ds");
+    let (b, s) = (bundle_with_success(), scene());
+    let mut policy = FakePolicy { target: 0.2 };
+    let mut hook = no_intervention;
+    let report = Collector::run::<FakeBackend, _, NJ, H>(
+        &CollectSpec {
+            bundle: &b,
+            scene: &s,
+            n_episodes: 8,
+            seed: 3,
+            max_steps: STEPS,
+            out_root: &root,
+            traj_dir: None,
+        },
+        &mut policy,
+        FakeBackend::new,
+        &mut hook,
+        None,
+    )
+    .expect("the fixture collect run succeeds");
+
+    // The collector's own verdicts, one row per episode.
+    let rows = jsonl(&root.join(es_data::collect::OUTCOMES_FILE));
+    assert_eq!(rows.len(), 8);
+    for (i, (row, t)) in rows.iter().zip(&report.terminations).enumerate() {
+        assert_eq!(row["episode"], i);
+        assert_eq!(row["termination"], format!("{t:?}").to_lowercase());
+    }
+    let won: Vec<u32> = (0..8)
+        .filter(|i| report.terminations[*i as usize] == Termination::Success)
+        .collect();
+    assert!(
+        !won.is_empty() && won.len() < 8,
+        "the fixture needs both: {:?}",
+        report.terminations
+    );
+
+    let split = SplitSpec {
+        ratios: [1.0, 0.0, 0.0],
+        seed: 0,
+    };
+    let kept_root = dir.join("kept");
+    let kept = es_data::distill(std::slice::from_ref(&root), &split, &kept_root, true)
+        .expect("distill --success-only runs");
+    let (src, out) = (
+        LeRobotDataset::open(&root).expect("source"),
+        LeRobotDataset::open(&kept_root).expect("kept"),
+    );
+    assert_eq!(out.episodes().len(), won.len());
+    for (new, old) in won.iter().enumerate() {
+        let (a, b) = (
+            out.read_episode(new as u32).expect("kept episode"),
+            src.read_episode(*old).expect("source episode"),
+        );
+        assert_eq!((&a.columns, &a.timestamps), (&b.columns, &b.timestamps));
+    }
+    let carried = jsonl(&kept_root.join(es_data::collect::OUTCOMES_FILE));
+    assert_eq!(carried.len(), won.len());
+    for (i, row) in carried.iter().enumerate() {
+        assert_eq!(row["episode"].as_u64(), Some(i as u64));
+        assert_eq!(row["termination"], "success");
+    }
+    let steps = read_loop_steps(&kept_root).expect("ledger");
+    let step = steps.last().expect("the distill step");
+    assert_eq!(step.inputs["keep"], "success");
+    assert_eq!(step.outputs["episodes"], won.len().to_string());
+
+    // A new dataset, a new content hash; the same inputs, the same identity.
+    let again = es_data::distill(
+        std::slice::from_ref(&root),
+        &split,
+        &dir.join("kept2"),
+        true,
+    )
+    .expect("again");
+    assert_eq!(kept, again);
+    let all = es_data::distill(std::slice::from_ref(&root), &split, &dir.join("all"), false)
+        .expect("unfiltered");
+    assert_ne!(kept.dataset.content, all.dataset.content);
+    let all_steps = read_loop_steps(&dir.join("all")).expect("ledger");
+    assert!(!all_steps.last().expect("step").inputs.contains_key("keep"));
+
+    // Unfiltered, the outcome rows change nothing: the same identity without the file, as
+    // every collection before this packet has none. With the file gone, filtering is refused.
+    std::fs::remove_file(root.join(es_data::collect::OUTCOMES_FILE)).expect("remove");
+    let bare = es_data::distill(
+        std::slice::from_ref(&root),
+        &split,
+        &dir.join("bare"),
+        false,
+    )
+    .expect("unfiltered without outcomes");
+    assert_eq!(bare, all);
+    assert!(!dir
+        .join("bare")
+        .join(es_data::collect::OUTCOMES_FILE)
+        .exists());
+    let e = es_data::distill(std::slice::from_ref(&root), &split, &dir.join("no"), true)
+        .expect_err("refused");
+    assert!(e.to_string().contains("outcomes.jsonl"), "{e}");
+    println!("RAN distill_success_only_keeps_the_episodes_that_succeeded: kept {won:?}");
 }

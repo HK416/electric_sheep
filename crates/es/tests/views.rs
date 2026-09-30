@@ -1518,6 +1518,72 @@ fn distill_merges_each_cameras_tiles_into_its_own_directory() {
     println!("RAN distill_merges_each_cameras_tiles_into_its_own_directory");
 }
 
+/// Packet M16/H3: `es loop distill --success-only` carries the successful episodes' tiles of
+/// every camera, renumbered in the kept episodes' order, and nothing else; renumbering the
+/// tiles in place is refused before anything moves.
+#[test]
+fn distill_success_only_carries_each_cameras_kept_tiles() {
+    let dir = scratch("distill-success");
+    let (a, fa, kept, fk) = (
+        dir.join("a/ds"),
+        dir.join("a/frames"),
+        dir.join("kept/ds"),
+        dir.join("kept/frames"),
+    );
+    // Episodes of 2, 3, 1 and 2 frames: global frames 0-1, 2-4, 5, 6-7.
+    write_views_collection(&a, &fa, &[2, 3, 1, 2], 0);
+    let rows = "{\"episode\":0,\"termination\":\"timeout\"}\n\
+                {\"episode\":1,\"termination\":\"success\"}\n\
+                {\"episode\":2,\"termination\":\"failure\"}\n\
+                {\"episode\":3,\"termination\":\"success\"}\n";
+    std::fs::write(a.join(es_data::collect::OUTCOMES_FILE), rows).expect("outcomes");
+    let distill = |frames: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_es"))
+            .args(["loop", "distill", "--in"])
+            .arg(&a)
+            .arg("--in-frames")
+            .arg(&fa)
+            .args(["--train", "1", "--val", "0", "--test", "0", "--out"])
+            .arg(&kept)
+            .arg("--frames")
+            .arg(frames)
+            .arg("--success-only")
+            .output()
+            .expect("run es loop distill")
+    };
+    let o = distill(&fa);
+    assert_eq!(
+        o.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert!(!kept.exists(), "a refusal writes nothing");
+    let o = distill(&fk);
+    assert_eq!(
+        o.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert!(String::from_utf8_lossy(&o.stdout).contains("frames: 5 tile(s)"));
+    let ds = es_data::LeRobotDataset::open(&kept).expect("the kept dataset");
+    let lengths: Vec<u64> = ds.episodes().iter().map(|m| m.length).collect();
+    assert_eq!(lengths, [3, 2], "episodes 1 and 3");
+    for (k, channel) in CHANNELS.iter().enumerate() {
+        for (new, old) in [2, 3, 4, 6, 7].into_iter().enumerate() {
+            let tile = std::fs::read(fk.join(channel).join(format!("{new:06}.bin"))).expect("tile");
+            assert!(
+                tile.iter().all(|b| *b == tile_byte(0, k, old)),
+                "{channel} {new}"
+            );
+        }
+        assert!(!fk.join(channel).join("000005.bin").exists());
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    println!("RAN distill_success_only_carries_each_cameras_kept_tiles");
+}
+
 // --- the scene ------------------------------------------------------------------------------------
 
 /// The views scene is the demo scene plus two cameras and nothing else: without them it hashes
