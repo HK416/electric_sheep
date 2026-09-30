@@ -22,7 +22,7 @@ Crate: `es-render`, layer 5 (§4.2). `es-core`, `es-math`, `es-gpu`, `es-assets`
 - **스플랫.** §16.2는 3DGS를 이 crate의 세 번째 렌더 경로로 둔다. `es-splat`(layer 5, 같은 layer, 어느 방향으로도 의존 없음)이 오늘 자산 측을 소유한다. 나중을 위한 훅은 `RenderPath`다: `Splat` variant가 `Rs`/`Pt` 옆에 놓여 같은 채널을 같은 아틀라스에 쓴다. 아틀라스, 채널, `Atlas::read_tile` API의 어느 것도 삼각형을 전제하지 않는다.
 - **센서 리얼리즘**(§18.3: 왜곡, 롤링 셔터, 모션 블러, 노출, 샷 노이즈, 깊이 홀). 렌더러는 깨끗한 채널을 방출하고, 리얼리즘은 아틀라스에 대한 이후 패스다. 그 결과 §7.2의 `DistortionModel::None`과 `ShutterModel::Global`만 지원되며, 렌더러는 그 외를 요청하는 뷰를 조용히 무시하는 대신 *거부한다*.
 - **옵티컬 플로우 및 속도 채널.** `Channel::Flow`는 프리미티브별 이전 프레임 변환이 필요한데, 렌더러는 아직 이전 프레임 개념이 없다. 요청하면 에러이지, 빈 버퍼가 아니다.
-- **텍스처와 머티리얼** — *plan H의 HT1 이후로는 더 이상 건너뛰지 않는다*([§15](#15-텍스처와-metallic-roughness-재질-plan-h-ht1)): MJCF 2D·cube 텍스처, bilinear, 두 경로 모두에서 glTF metallic-roughness. 텍스처도 명시적 재질 속성도 없는 geom은 여전히 `Geom::rgba`의 평평한 알베도 하나이며, 비트 단위로 같다. 노멀·방출 맵은 HT2의 것이다.
+- **텍스처와 머티리얼** — *plan H의 HT1 이후로는 더 이상 건너뛰지 않는다*([§15](#15-텍스처와-metallic-roughness-재질-plan-h-ht1)): MJCF 2D·cube 텍스처, bilinear, 두 경로 모두에서 glTF metallic-roughness. 텍스처도 명시적 재질 속성도 없는 geom은 여전히 `Geom::rgba`의 평평한 알베도 하나이며, 비트 단위로 같다. 노멀·방출 맵과 glTF 재질은 HT2부터([§16](#16-노멀방출-맵-gltf-재질-plan-h-ht2)).
 
 ## 1. 타일 아틀라스 (§15.2)
 
@@ -1377,8 +1377,78 @@ Lambert 씬에서는 비트 동일한 `Pt` 1 spp가 여기서는 아니다: 텍�
 ### 15.5 HT1이 건너뛰는 것
 
 - **밉맵** — 패스 트레이서의 샘플과 `Full`의 SSAA가 풋프린트를 평균한다. 앨리어싱이 보이면 밉 체인은 나중 행이다(배치 오라클의 글자 가장자리가 재는 것이 그것이다).
-- **노멀·방출 맵, glTF 재질** — HT2. `rgb|orm|metallic|roughness` 밖의 `<layer>` 역할은 이름으로 거부한다.
+- **노멀·방출 맵, glTF 재질** — HT2, [§16](#16-노멀방출-맵-gltf-재질-plan-h-ht2). `rgb|orm|metallic|roughness|normal|emissive` 밖의 `<layer>` 역할은 이름으로 거부한다.
 - **투명도**(0이 아닌 알파는 이전처럼 무시), **`reflectance`**(MuJoCo의 평면 거울; 표현되지 않는 속성으로 보고), 손잡이로서의 `specular`, `hflip` / `vflip` / `nchannel`(보고하되 따르지 않음).
 - **MuJoCo classic 렌더러의 cube 텍스처 색 공간**: 그 렌더러는 `colorspace`가 무엇이든 cube 면을 선형 `GL_RGB`로 올린다. 이 렌더러는 `colorspace`를 따른다. 번들의 `block.png`는 선형으로 선언되어 있으므로 둘이 그 위에서는 일치한다.
 - **영속 텍스처 버퍼**: 텍셀은 삼각형 버퍼에 실려 프레임마다 삼각형과 함께 다시 올라간다(`pack_materials`의 `ponytail:`). 손의 카메라에서 그 비용은 `frame_profile`이 잴 때까지 `Target / Status: unverified`다.
 - **에디터의 리플레이 래스터라이저**(`raster.rs`)는 텍셀이 아니라 기저색 인자를 그린다.
+
+## 16. 노멀·방출 맵, glTF 재질 (plan H, HT2)
+
+패킷 `docs/packets/M16/plan-h.md`의 HT2로, [§15](#15-텍스처와-metallic-roughness-재질-plan-h-ht1)의 재질 표 위에 얹는다. 같은 규칙으로 **가산적이다**: 노멀 맵도 방출 맵도 방출 색도 없는 재질은 이전과 같은 해시, 같은 바이트다. 새 `scene_hash` 블록(`es.material.maps.v1`)과 텍스처의 wrap 모드는 있을 때만 다이제스트에 들어가고, 커밋된 모든 골든과 `scene_hash` 고정값이 다시 통과한다(`cargo xtask verify-goldens`; RTX 3060에서 `es-render`, `es-assets`, `es-env --features render` 스위트).
+
+### 16.1 씬이 선언하는 것
+
+| 출처 | 노멀 맵 | 방출 | wrap |
+|---|---|---|---|
+| MJCF | `<layer role="normal">` | `<layer role="emissive">`: 방출 색 = `emission`(쓰지 않으면 1) × 텍셀, `rgba`는 곱하지 **않는다** | repeat |
+| glTF | `normalTexture`와 `scale` | `emissiveTexture` × `emissiveFactor` × `KHR_materials_emissive_strength` | 샘플러의 `wrapS` / `wrapT`: repeat, clamp, mirrored repeat |
+
+`es_assets::scene::Material`에 `normal_map`, `normal_scale`, `emissive_map`, `emissive`(설정되면 `emission × rgba`를 대신하는 RGB 방출 색)가, `TextureData`에 `wrap`이 생긴다. glTF 임포터는 이제 MJCF 임포터가 채우는 표를 똑같이 채운다: 모든 재질이 그려지는 `Material`이 되고(`baseColorFactor` / `baseColorTexture`, `metallicFactor`, `roughnessFactor`, `orm` 자리의 `metallicRoughnessTexture` — G 거칠기, B 금속, R 무시), PNG 이미지는 내용 다이제스트와 함께 `SceneDesc::textures`로 디코드되며(기저색·방출은 sRGB, 나머지는 선형 — PNG가 뭐라 하든, glTF 2.0 3.9절), 메시는 `SceneDesc::meshes`에 실려 가져온 glTF가 그대로 렌더된다. 그리지 않고 보고하는 것: `alphaMode` `MASK` / `BLEND`(불투명으로 그림), 0이 아닌 `texCoord`, PNG가 아닌 이미지(JPEG은 이 crate에 없는 디코더가 필요하다; 텍스처를 버린다). `doubleSided`는 보고할 필요가 없다: 여기서는 모든 삼각형을 양면으로 그리며, 닫힌 메시에서는 그것이 단면의 모습과 같다. 방출 인자가 0이면 방출 맵을 버린다(glTF의 곱이 그렇듯).
+
+### 16.2 탄젠트 프레임
+
+삼각형마다, 월드 정점과 세 텍스처 좌표로(`material::bump`, `es_bump`): `T = dP/ds`를 와인딩 노멀 `n`에 대해 그람–슈미트 직교화하고, 바이탄젠트 `B = w (n × T)`의 `w = ±1`은 `B`가 **이미지 위쪽**, 즉 `t`가 줄어드는 쪽을 가리키게 고른다 — glTF와 MuJoCo 모두 0행이 이미지 맨 위다. 이것은 `(s, 1 − t)`에 돌린 MikkTSpace이고, glTF 노멀 텍스처의 "+Y가 위"이며, 미러링 없는 UV에서 Khronos 샘플 뷰어의 `b = n × t`다. 이 렌더러의 평평하게 셰이딩되는 삼각형(정점 노멀 없음)에서는 MikkTSpace의 정점별 평균이 평균할 것이 없으므로 면별 프레임이 그 답이다. 텍셀은 **선형**으로 읽고(sRGB로 표시된 텍스처를 노멀 맵으로 쓰면 선형 슬롯을 따로 받는다) `[0, 1] → [−1, 1]`, X·Y에 `scale`을 곱해 `n_s = normalize(T x + B y + n z)`; 와인딩 노멀 뒤에서 보면 `−n_s`다(glTF의 양면 규칙). UV 넓이가 0인 삼각형은 기하 노멀로 셰이딩하고, cube 텍스처를 노멀 맵으로 쓰면 이름으로 거부한다.
+
+`n_s`를 읽는 곳: `Rs` `Lambert`의 `n·l`, `Full`의 조명과 반구(그림자 광선은 여전히 기하 노멀로 떠난다), `Pt`의 BSDF·로브 선택·NEE 코사인·ReSTIR 목표 함수. 읽지 않는 곳: 기하 채널 — `Depth32`, `SegmentationId`, `Normal`은 두 경로 모두에서 중심 광선의 기하 값 그대로, 비트 단위로 같다 — 과 모든 광선 오프셋. *기하* 표면 아래로 가는 바운스 방향은 처리량 0을 나른다(루프를 줄이지 않는다, spec 3.4). NEE는 그런 검사가 필요 없다: 기하 오프셋에서 나간 그림자 광선이 표면 자신에 맞기 때문이다.
+
+### 16.3 방출 삼각형
+
+방출 인자가 0이 아닌 삼각형은 전과 같이 광원 목록에 들어가고, 한 점의 방사휘도는 인자 × 그 점의 방출 텍셀이다. `Materials::emission_at(tri, b0, b1)`은 `tri_point`가 광원 샘플을 놓는 무게중심 좌표에서(위치와 같은 가중치로 보간한 텍스처 좌표에서) 그것을, `Surface::emission`은 교차점에서 그것을 계산한다. **광원 샘플링은 면적에 대해 균등한 채로 둔다**(광원을 균등하게, 그 위의 점을 균등하게): pdf가 방사휘도에 의존하지 않으므로 추정량 `f Le(x) G / p(x)`는 텍스처가 무엇이든 편향이 없고, 텍스처 방출체는 분산만 든다. 텍셀을 아는 분포(광원별 휘도 CDF)는 밝고 대부분 검은 방출 텍스처가 잡음을 보일 때의 나중 행이다.
+
+### 16.4 오라클, 측정값 (RTX 3060, Slang 2026.8)
+
+`crates/es-render/tests/maps.rs`:
+
+**노멀 맵 대 기하** (`a_normal_map_shades_like_the_geometry_it_encodes`): 1 m 평면 위 높이장 `h = 0.03 sin(3πx) sin(3πy)`를 (1) 64 × 64 격자의 모든 모서리에서 변위·테셀레이션한 메시(면 8,192개)와 (2) 같은 모서리 위 유한차분 노멀(각 사각형을 지나는 평면)을 텍셀로 가진 64 × 64 노멀 맵의 평평한 평면으로 두고, 바로 위에서 `Rs` `Lambert`, 64 × 64 픽셀:
+
+| 변위 메시 대비 이미지 | 평균 | p99 | 최대 (8비트 단계) |
+|---|---|---|---|
+| **평평한 평면 + 노멀 맵** | **0.346** | **2** | **2** |
+| 평평한 평면, 맵 없음 | 5.824 | 13 | 14 |
+| 초록 채널을 뒤집은 노멀 맵 | 8.314 | 20 | 21 |
+
+단언은 평균 ≤ 1, p99 ≤ 4, 두 대조군이 맵 오차의 8배 이상 — 마지막이 바이탄젠트의 방향을 고정한다. 세그멘테이션과 `Normal`은 맵 없는 평면과 같다.
+
+**텍스처 방출체** (`a_textured_emitter_is_estimated_without_bias`): 0.4 m 높이에서 아래를 보는 0.4 m 사각형, 방출 `(3, 2.5, 2)` × 4 × 4 텍스처(1.5번 반복, `s`는 mirror, `t`는 clamp), 아래는 0.8 바닥, 하늘 없음. 사각형 중심에서 벗어난 바닥 점 `(0.1, 0.05)`에서, 테스트 안에 bilinear와 wrap 모드를 풀어 쓴 1024² 중점 규칙의 `ρ/π ∫ Le cos cos / r² dA`와 비교:
+
+| 추정량 | spp | 방사휘도 (r, g, b) | 구적 | 최악 상대 오차 |
+|---|---|---|---|---|
+| `Pt` NEE, 1 바운스 | 16,384 | 0.31784, 0.18268, 0.19717 | 0.31737, 0.18198, 0.19697 | 3.9e-3 |
+| `Pt` NEE 없음, 2 바운스 | 65,536 | 0.31752, 0.18140, 0.19824 | 위와 같음 | 6.5e-3 |
+
+단언은 1 %와 2 %. 8 × 8 이미지에서 두 추정량의 평균은 4.7e-3까지 일치한다(단언 1 %).
+
+**glTF = MJCF** (`a_gltf_material_renders_as_its_mjcf_declaration`): `tests/fixtures/gltf/textured_box/` — 그 `generate.py`가 쓴다(표준 라이브러리만, 모든 좌표가 2진 유리수; `PROVENANCE.json` 참조) — 는 기저색·metallic-roughness·노멀·방출 맵을 가진 상자 하나를 두 번 선언한다: glTF로(데이터 URI 버퍼, 외부 PNG, emissive strength 2), 그리고 MJCF로(같은 삼각형의 OBJ, `<layer>`들, `emission="2"`). 둘은 **같은** 삼각형과 재질 표로 들어오고, `Rs` `Lambert`, `Rs` `Full`, `Pt` NEE가 같은 바이트를 그린다. 임포터의 보고와 색 공간은 `crates/es-assets/tests/gltf_import.rs`(`gltf_materials_join_the_material_table`)가 고정한다.
+
+**GPU 대 CPU 레퍼런스** (`gpu_matches_the_cpu_on_normal_and_emissive_maps`, 64 × 64, 위의 세 씬):
+
+| 비교 | 범프 | 방출체 | glTF 상자 |
+|---|---|---|---|
+| `Rs` `Lambert` `Rgb8`, 세그, 깊이, 노멀 | 0 바이트 / 0 ULP | 0 / 0 | 0 / 0 |
+| `Rs` `Full` `Rgb8` | 12,288 바이트 중 0 | 0 | 0 |
+| `Pt` 1 spp, 3 바운스 | 0 ULP | 214 ULP, 정규화 7.1e-7 | 76 ULP, 2.9e-7 |
+| `Pt` NEE 4 spp | 2 ULP, 9.3e-8 | 10 ULP, 2.7e-7 | 200 ULP, 4.5e-7 |
+| `Pt` ReSTIR 1 spp | 0 ULP | 56 ULP, 3.7e-7 | 3,010 ULP, 2.6e-6 |
+
+모든 `Pt` 행에서 `Rgb8`은 0 바이트 다르다. 모두 15.4절의 허용치 안이다(`Rs` `Lambert`는 비트 동일, `Full`은 9.3절의 가장자리 규칙, `Pt`는 5.1절의 1e-5).
+
+**골든**은 `generate_maps_goldens`가 CPU 레퍼런스에서 쓴다: `maps_rs_rgb8`, `maps_rs_full_rgb8`, `maps_pt_nee_rgb8`(`box_camera`에서 본 MJCF 상자; 4 spp, 3 바운스, NEE, 하늘 `0.3 0.35 0.4`, 광원 `1 0.95 0.9`, 노출 2). CPU가 셋 모두를 비트 단위로 재현하고, GPU도 그렇다(각각 12,288 바이트 중 0).
+
+### 16.5 HT2가 건너뛰는 것
+
+- **정점 노멀과 부드러운 셰이딩**: 이 렌더러는 평평한 삼각형을 셰이딩하므로 탄젠트 프레임은 면별이다. glTF `NORMAL` / `TANGENT` 속성은 임포터가 읽되 그리지 않는다.
+- **텍셀을 아는 광원 분포**(16.3절): 없어도 편향이 없다. 잡음이 보이면 나중에.
+- **오클루전**(`orm`의 빨강 채널, glTF `occlusionTexture`), **`KHR_texture_transform`**, **JPEG** 이미지, **`TEXCOORD_1`**, **알파**(`MASK` / `BLEND`, 보고), glTF **카메라**와 **광원**(가져오지 않음), 샘플러 **필터**(항상 bilinear, 밉맵 없음, 15.5절).
+- **cube 텍스처의 노멀 맵**: 이름으로 거부한다. 탄젠트 공간에는 UV가 필요하다.
+- **에디터의 리플레이 래스터라이저**(`raster.rs`)는 여전히 기저색 인자만 그린다.

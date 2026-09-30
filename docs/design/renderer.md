@@ -45,7 +45,8 @@ Not here, deliberately:
 - **Textures and materials** — *no longer skipped since plan H's HT1* ([§15](#15-textures-and-metallic-roughness-materials-plan-h-ht1)):
   MJCF 2D and cube textures, bilinear, and glTF metallic-roughness on both paths. A geom
   without a texture or an explicit material attribute is still one flat albedo from
-  `Geom::rgba`, bit for bit. Normal and emissive maps are HT2's.
+  `Geom::rgba`, bit for bit. Normal and emissive maps and glTF materials since HT2
+  ([§16](#16-normal-and-emissive-maps-gltf-materials-plan-h-ht2)).
 
 ## 1. Tile atlas (§15.2)
 
@@ -2320,8 +2321,8 @@ reproduces all three bit for bit, and so does the GPU (0 of 12,288 bytes each).
 
 - **Mipmaps** — the path tracer's samples and `Full`'s SSAA average the footprint; a mip chain is
   a later row if aliasing shows (it is what the placement oracle's letter edges measure).
-- **Normal and emissive maps, glTF materials** — HT2. `<layer>` roles other than
-  `rgb|orm|metallic|roughness` are refused by name.
+- **Normal and emissive maps, glTF materials** — HT2, [§16](#16-normal-and-emissive-maps-gltf-materials-plan-h-ht2).
+  `<layer>` roles other than `rgb|orm|metallic|roughness|normal|emissive` are refused by name.
 - **Transparency** (an alpha other than 0 is ignored, as before), **`reflectance`** (MuJoCo's
   planar mirror; reported as an unrepresented attribute), `specular` as a knob, `hflip` /
   `vflip` / `nchannel` (reported, not honoured).
@@ -2332,3 +2333,137 @@ reproduces all three bit for bit, and so does the GPU (0 of 12,288 bytes each).
   with every frame's triangles (`ponytail:` at `pack_materials`). What that costs on the hand's
   cameras is `Target / Status: unverified` until `frame_profile` measures it.
 - **The editor's replay rasterizer** (`raster.rs`) draws the base colour factor, not the texel.
+
+## 16. Normal and emissive maps, glTF materials (plan H, HT2)
+
+Packet `docs/packets/M16/plan-h.md` task HT2, on [§15](#15-textures-and-metallic-roughness-materials-plan-h-ht1)'s
+material table. **Additive** by the same rule: a material without a normal map, an emissive map
+or an emissive colour hashes and renders as it did — the new `scene_hash` block
+(`es.material.maps.v1`) and a texture's wrap modes enter a digest only when present, and every
+committed golden and `scene_hash` pin re-passes (`cargo xtask verify-goldens`; the `es-render`,
+`es-assets` and `es-env --features render` suites on the RTX 3060).
+
+### 16.1 What a scene declares
+
+| source | normal map | emissive | wrap |
+|---|---|---|---|
+| MJCF | `<layer role="normal">` | `<layer role="emissive">`: emitted colour = `emission` (1 when unwritten) × texel, **not** × `rgba` | repeat |
+| glTF | `normalTexture` with `scale` | `emissiveTexture` × `emissiveFactor` × `KHR_materials_emissive_strength` | the sampler's `wrapS` / `wrapT`: repeat, clamp, mirrored repeat |
+
+`es_assets::scene::Material` gains `normal_map`, `normal_scale`, `emissive_map` and `emissive` (an
+RGB emitted colour that replaces `emission × rgba` when set); `TextureData` gains `wrap`. The
+glTF importer now fills the same tables the MJCF one does: every material becomes a drawn
+`Material` (`baseColorFactor` / `baseColorTexture`, `metallicFactor`, `roughnessFactor`,
+`metallicRoughnessTexture` as the `orm` slot — G roughness, B metal, R ignored), its PNG images
+are decoded (base colour and emissive as sRGB, the others linear, whatever the PNG says — glTF
+2.0 section 3.9) into `SceneDesc::textures` with their content digests, and the meshes ride on
+`SceneDesc::meshes`, so an imported glTF renders as it is. Reported, not drawn: `alphaMode`
+`MASK` / `BLEND` (drawn opaque), a `texCoord` other than 0 and an image that is not a PNG (JPEG
+needs a decoder this crate does not carry; the texture is dropped). `doubleSided` needs no
+report: every triangle here is drawn from both sides, which for a closed mesh is what a
+single-sided one looks like. An emissive factor of zero drops the emissive map, as glTF's
+product would.
+
+### 16.2 The tangent frame
+
+Per triangle, from its world vertices and its three texture coordinates (`material::bump`,
+`es_bump`): `T = dP/ds`, Gram–Schmidt-orthogonalised against the winding normal `n`; the
+bitangent `B = w (n × T)` with `w = ±1` chosen so `B` points **up the image**, towards decreasing
+`t` — row 0 is the image's top in glTF and in MuJoCo alike. That is MikkTSpace run on
+`(s, 1 − t)`, glTF's "+Y is up" for normal textures, and the Khronos sample viewer's `b = n × t`
+on unmirrored UVs; MikkTSpace's per-vertex averaging has nothing to average on this renderer's
+flat-shaded triangles (no vertex normals), so the per-face frame is its answer. The texel is read
+**linear** (an sRGB-flagged texture used as a normal map gets its own linear slot), mapped
+`[0, 1] → [−1, 1]`, X and Y times `scale`, and `n_s = normalize(T x + B y + n z)`; seen from
+behind the winding normal it is `−n_s`, glTF's double-sided rule. A triangle whose UVs have no
+area shades with its geometric normal; a cube texture as a normal map is refused by name.
+
+What reads `n_s`: `Rs` `Lambert`'s `n·l`, `Full`'s lighting and hemisphere (its shadow ray still
+leaves along the geometric normal), `Pt`'s BSDF, lobe choice, NEE cosines and ReSTIR's target.
+What does not: the geometry channels — `Depth32`, `SegmentationId` and `Normal` stay the centre
+ray's geometric values, bit for bit, on both paths — and every ray offset. A bounce direction
+below the *geometric* surface carries zero throughput (not a shorter loop, spec 3.4); NEE needs
+no such test, because its shadow ray from the geometric offset hits the surface itself.
+
+### 16.3 Emissive triangles
+
+A triangle whose emission factor is non-zero joins the light list as before; its radiance at a
+point is the factor × the emissive texel there. `Materials::emission_at(tri, b0, b1)` evaluates it
+at the barycentrics `tri_point` puts a light sample at (the texture coordinate interpolated with
+the same weights as the position), and `Surface::emission` at a hit. **Light sampling stays
+uniform in area** (a light picked uniformly, a point uniformly on it): the pdf does not depend on
+the radiance, so the estimator `f Le(x) G / p(x)` is unbiased whatever the texture; a textured
+emitter only costs variance. A texel-aware distribution (a per-light luminance CDF) is the later
+row if a bright, mostly black emissive texture ever shows the noise.
+
+### 16.4 The oracles, measured (RTX 3060, Slang 2026.8)
+
+`crates/es-render/tests/maps.rs`:
+
+**Normal map vs geometry** (`a_normal_map_shades_like_the_geometry_it_encodes`): the height field
+`h = 0.03 sin(3πx) sin(3πy)` over a 1 m plane, (1) displaced and tessellated at every corner of a
+64 × 64 grid (8,192 facets), (2) flat with a 64 × 64 normal map whose texels are the
+finite-difference normals over the same corners (the plane through each quad), looked at straight
+down, `Rs` `Lambert`, 64 × 64 pixels:
+
+| image vs the displaced mesh | mean | p99 | max (8-bit levels) |
+|---|---|---|---|
+| **flat plane + normal map** | **0.346** | **2** | **2** |
+| flat plane, no map | 5.824 | 13 | 14 |
+| normal map with its green turned over | 8.314 | 20 | 21 |
+
+The assertion is mean ≤ 1, p99 ≤ 4, and both controls ≥ 8× the mapped error — the last pins the
+bitangent's handedness. Segmentation and `Normal` equal the unmapped plane's.
+
+**A textured emitter** (`a_textured_emitter_is_estimated_without_bias`): a 0.4 m quad at 0.4 m
+facing down, emission `(3, 2.5, 2)` × a 4 × 4 texture repeated 1.5× with `s` mirrored and `t`
+clamped, over a 0.8 floor, no sky. At a floor point off the quad's centre, `(0.1, 0.05)`, against
+`ρ/π ∫ Le cos cos / r² dA` by a 1024² midpoint rule with the bilinear and the wrap modes written
+out in the test:
+
+| estimator | spp | radiance (r, g, b) | quadrature | worst relative error |
+|---|---|---|---|---|
+| `Pt` NEE, 1 bounce | 16,384 | 0.31784, 0.18268, 0.19717 | 0.31737, 0.18198, 0.19697 | 3.9e-3 |
+| `Pt` no NEE, 2 bounces | 65,536 | 0.31752, 0.18140, 0.19824 | as above | 6.5e-3 |
+
+The assertion is 1 % and 2 %. Over an 8 × 8 image the two estimators' means agree to 4.7e-3
+(asserted 1 %).
+
+**glTF = MJCF** (`a_gltf_material_renders_as_its_mjcf_declaration`):
+`tests/fixtures/gltf/textured_box/` — written by its `generate.py` (standard library only, every
+coordinate dyadic; see its `PROVENANCE.json`) — declares one box with base colour,
+metallic-roughness, normal and emissive maps twice: as glTF (buffer in a data URI, external PNGs,
+emissive strength 2) and as MJCF (an OBJ of the same triangles, `<layer>`s, `emission="2"`). Both
+import to **equal** triangles and material tables, and `Rs` `Lambert`, `Rs` `Full` and `Pt` NEE
+render the same bytes. The importer's reports and colour spaces are pinned in
+`crates/es-assets/tests/gltf_import.rs` (`gltf_materials_join_the_material_table`).
+
+**GPU against the CPU reference** (`gpu_matches_the_cpu_on_normal_and_emissive_maps`, 64 × 64,
+the three scenes above):
+
+| comparison | bump | emitter | glTF box |
+|---|---|---|---|
+| `Rs` `Lambert` `Rgb8`, segmentation, depth, normal | 0 bytes / 0 ULP | 0 / 0 | 0 / 0 |
+| `Rs` `Full` `Rgb8` | 0 of 12,288 bytes | 0 | 0 |
+| `Pt` 1 spp, 3 bounces | 0 ULP | 214 ULP, 7.1e-7 normalized | 76 ULP, 2.9e-7 |
+| `Pt` NEE 4 spp | 2 ULP, 9.3e-8 | 10 ULP, 2.7e-7 | 200 ULP, 4.5e-7 |
+| `Pt` ReSTIR 1 spp | 0 ULP | 56 ULP, 3.7e-7 | 3,010 ULP, 2.6e-6 |
+
+`Rgb8` 0 bytes differ on every `Pt` row. All inside section 15.4's tolerances (bitwise `Rs` `Lambert`,
+section 9.3's edge rule for `Full`, section 5.1's 1e-5 for `Pt`).
+
+**Goldens**, written by `generate_maps_goldens` from the CPU reference: `maps_rs_rgb8`,
+`maps_rs_full_rgb8`, `maps_pt_nee_rgb8` (the MJCF box from `box_camera`; 4 spp, 3 bounces, NEE,
+sky `0.3 0.35 0.4`, light `1 0.95 0.9`, exposure 2). The CPU reproduces all three bit for bit,
+and so does the GPU (0 of 12,288 bytes each).
+
+### 16.5 What HT2 skips
+
+- **Vertex normals and smooth shading**: this renderer shades flat triangles, so the tangent frame
+  is per face; a glTF `NORMAL` / `TANGENT` attribute is read by the importer and not drawn.
+- **A texel-aware light distribution** (section 16.3): unbiased without it; later if the noise shows.
+- **Occlusion** (the `orm` red channel, glTF `occlusionTexture`), **`KHR_texture_transform`**,
+  **JPEG** images, **`TEXCOORD_1`**, **alpha** (`MASK` / `BLEND`, reported), glTF **cameras** and
+  **lights** (not imported), sampler **filters** (bilinear always, no mipmaps, section 15.5).
+- **A normal map on a cube texture**: refused by name; tangent space needs UVs.
+- **The editor's replay rasterizer** (`raster.rs`) still draws the base colour factor only.
