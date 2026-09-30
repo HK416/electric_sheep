@@ -11623,6 +11623,7 @@ fn drain_from(addr: std::net::SocketAddr) -> std::thread::JoinHandle<Vec<Message
                 StreamId(3),
                 StreamId(4),
                 StreamId(5),
+                StreamId(6),
             ])
             .expect("subscribe");
         let mut received = Vec::new();
@@ -13195,6 +13196,16 @@ fn generate_rl_plan_golden() {
 /// backend out of process. `python/es/README.md` has the one `maturin develop` line that
 /// builds it.
 fn run_rl_train(recipe: &str, dir: &Path, name: &str) -> Option<(PathBuf, String)> {
+    run_rl_train_with(recipe, dir, name, &[])
+}
+
+/// [`run_rl_train`] with more `es train` flags (packet M16/H4's `--telemetry`).
+fn run_rl_train_with(
+    recipe: &str,
+    dir: &Path,
+    name: &str,
+    extra: &[&str],
+) -> Option<(PathBuf, String)> {
     let Ok(python) = std::env::var("ES_PYTHON") else {
         println!("SKIP {name}: ES_PYTHON is not set");
         return None;
@@ -13206,6 +13217,7 @@ fn run_rl_train(recipe: &str, dir: &Path, name: &str) -> Option<(PathBuf, String
         .current_dir(train_root())
         .args(["train", "--recipe", &train_toml_path(&path), "--out"])
         .arg(&out)
+        .args(extra)
         .output()
         .expect("run es train");
     let said = format!("{}{}", stdout(&done), stderr_of(&done));
@@ -13320,6 +13332,78 @@ fn train_rl_two_runs_are_bitwise() {
         "the estimator is not in training_hash: two different trainings claim one identity"
     );
     println!("RAN {TEST}: 3 iterations twice per estimator, bitwise");
+}
+
+/// Packet M16/H4. An `[rl]` run watched with `--progress-every 1` publishes its learning on
+/// stream 6 -- `[step, return, episode_len, success, entropy, envelope_violation_rate]`, the
+/// first two and the last two the loss curve's own row for that iteration -- while stream 5
+/// stays four numbers, and watching moves no checkpoint and no `training_hash`.
+#[test]
+#[allow(clippy::float_cmp)] // exact: the published row is the curve's own numbers
+fn train_rl_telemetry_publishes_the_learning() {
+    const TEST: &str = "train_rl_telemetry_publishes_the_learning";
+    let dir = scratch_dir("train-rl-telemetry");
+    let bundle = write_rl_bundle(&dir, "untrained.esb");
+    let recipe = rl_recipe(&bundle, 3, 4, 16, "3").replace(
+        "interpreter   = \"es-no-such-interpreter\"",
+        "interpreter   = \"python\"",
+    );
+    let Some((plain, _)) = run_rl_train(&recipe, &dir, "plain") else {
+        return;
+    };
+    let addr = format!("127.0.0.1:{}", free_loopback_port());
+    let reader = drain_from(addr.parse().expect("socket addr"));
+    let (watched, said) = run_rl_train_with(
+        &recipe,
+        &dir,
+        "watched",
+        &["--telemetry", &addr, "--progress-every", "1"],
+    )
+    .expect("the first run resolved ES_PYTHON");
+    let received = reader.join().expect("reader thread");
+    let frames = frames_of(&received);
+
+    let losses = scalars_on(&frames, 5);
+    assert_eq!(losses.len(), 3, "one stream-5 row per iteration\n{said}");
+    assert!(losses.iter().all(|r| r.len() == 4), "four numbers");
+    let rows = scalars_on(&frames, 6);
+    assert_eq!(rows.len(), 3, "one stream-6 row per iteration\n{said}");
+    let curve: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(watched.join("metrics").join("loss-curve.json")).expect("curve"),
+    )
+    .expect("the curve is JSON");
+    for (i, row) in rows.iter().enumerate() {
+        let c = &curve[i];
+        let at = |k: &str| c[k].as_f64().expect(k);
+        assert_eq!(row.len(), 6, "{row:?}");
+        assert_eq!(row[0], (i + 1) as f64, "the step");
+        assert_eq!(
+            [row[1], row[2]],
+            [at("return"), at("episode_len")],
+            "{row:?}"
+        );
+        assert_eq!(
+            [row[4], row[5]],
+            [at("entropy"), at("envelope_violation_rate")]
+        );
+        assert!(
+            row[3].is_nan() || (0.0..=1.0).contains(&row[3]),
+            "success {}",
+            row[3]
+        );
+    }
+    let name = "checkpoints/3.esb";
+    assert_eq!(
+        std::fs::read(plain.join(name)).expect(name),
+        std::fs::read(watched.join(name)).expect(name),
+        "watching moved {name}"
+    );
+    assert_eq!(
+        train_lock(&plain)["training_hash"],
+        train_lock(&watched)["training_hash"],
+        "watching moved training_hash"
+    );
+    println!("RAN {TEST}: 3 stream-6 rows, the curve's own numbers, nothing moved");
 }
 
 /// Oracle 3. A run that starts from `[init] policy` *is* that policy at iteration 0.

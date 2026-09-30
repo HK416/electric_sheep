@@ -9,10 +9,17 @@
 //! unit square and the range they were normalised against, so the shell maps a rectangle and
 //! paints a polyline — there is no plotting dependency and there is not going to be one.
 //!
+//! An `[rl]` run adds stream 6 (`[step, return, episode_len, success, entropy,
+//! envelope_violation_rate]`, packet M16/H4) -- the numbers a PPO run is judged by, since its
+//! loss says almost nothing -- folded into [`RlCurve`]. A finished `es train` output folder is
+//! read into the same view by [`TrainView::open_dir`], so the finished run and the live one are
+//! the same plots; `--attach` on top extends them.
+//!
 //! What it deliberately does not hold: per-node activation statistics (§23.3 wants them; the
 //! lowered module has no hook for them) and any control over the run — the trainer speaks no
 //! control protocol, so there is nothing to offer.
 
+use std::path::Path;
 use std::time::Duration;
 
 use es_eval::run_dir::Rgb8Image;
@@ -23,6 +30,34 @@ use crate::model::live_run::{rgb8, STREAM_EVENTS, STREAM_IMAGE};
 /// The training curve's stream. Data and not schema, like streams 1-4
 /// (`docs/design/telemetry-protocol.md` §9): `protocol.rs` names no stream id.
 pub const STREAM_TRAIN: StreamId = StreamId(5);
+
+/// A PPO run's learning (packet M16/H4). Data and not schema, as stream 5: an editor that does
+/// not know 6 never subscribes to it, and stream 5 stays the four numbers old viewers expect.
+pub const STREAM_RL: StreamId = StreamId(6);
+
+/// What `es train` writes that says a folder is its output (spec 19.3).
+pub const TRAINING_LOCK: &str = "training.lock";
+
+/// The directories `es train` makes before its trainer starts, so a run still going -- which
+/// has no `training.lock` until it ends -- is recognised too.
+const RUN_DIRS: [&str; 3] = ["weights", "metrics", "checkpoints"];
+
+/// Whether `dir` is an `es train --out` folder, finished or still running.
+pub fn is_train_dir(dir: &Path) -> bool {
+    dir.join(TRAINING_LOCK).is_file() || RUN_DIRS.iter().all(|d| dir.join(d).is_dir())
+}
+
+/// A PPO run's learning as it arrived: one entry per stream-6 row (or `loss-curve.json` row).
+/// A number nobody measured -- a success rate over no finished episode -- is NaN, never zero.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RlCurve {
+    pub step: Vec<u32>,
+    pub ret: Vec<f32>,
+    pub episode_len: Vec<f32>,
+    pub success: Vec<f32>,
+    pub entropy: Vec<f32>,
+    pub violation: Vec<f32>,
+}
 
 /// The learning curve as it arrived: one entry per progress line, oldest first.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -42,11 +77,40 @@ impl Curve {
     }
 }
 
-/// Which of the two curves a caller wants.
+/// Which curve a caller wants.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Series {
     Loss,
     Lr,
+    Return,
+    Success,
+    EpisodeLen,
+    Entropy,
+    Violation,
+}
+
+impl Series {
+    /// A PPO run's curves, in the order the Live tab draws them.
+    pub const RL: [Series; 5] = [
+        Series::Return,
+        Series::Success,
+        Series::EpisodeLen,
+        Series::Entropy,
+        Series::Violation,
+    ];
+
+    /// The string-table key of the curve's plain-language name.
+    pub fn key(self) -> &'static str {
+        match self {
+            Series::Loss => "live.loss",
+            Series::Lr => "live.lr",
+            Series::Return => "live.return",
+            Series::Success => "live.success",
+            Series::EpisodeLen => "live.episode_len",
+            Series::Entropy => "live.entropy",
+            Series::Violation => "live.violation",
+        }
+    }
 }
 
 /// One curve, ready to paint: points in the unit square with `y = 0` at the bottom of the
@@ -82,6 +146,10 @@ impl Plot {
 #[derive(Clone, Debug, Default)]
 pub struct TrainView {
     curve: Curve,
+    rl: RlCurve,
+    /// The last step read off a finished run's folder: a live row at or before it is one the
+    /// file already holds, and is not drawn twice.
+    floor: Option<u32>,
     checkpoints: Vec<(u32, String)>,
     sample: Option<Rgb8Image>,
     samples: u64,
@@ -101,7 +169,64 @@ pub struct TrainView {
 impl TrainView {
     /// Nothing has arrived: the section says so rather than drawing an empty box.
     pub fn is_empty(&self) -> bool {
-        self.curve.is_empty() && self.total.is_none()
+        self.curve.is_empty()
+            && self.rl.step.is_empty()
+            && self.checkpoints.is_empty()
+            && self.total.is_none()
+    }
+
+    /// A finished (or still running) `es train --out` folder as the view a live run builds
+    /// (packet M16/H4): the packed marks from `training.lock`, and the curve from
+    /// `metrics/loss-curve.json` (`[rl]`: one object per iteration) or `metrics/loss.json`
+    /// (the IR route: one loss per optimizer step). A run still going has neither file yet,
+    /// and `--attach` fills the curve. Neither file carries the learning rate or a success
+    /// rate, so those curves stay empty rather than drawn from a stand-in.
+    pub fn open_dir(dir: &Path) -> Result<TrainView, String> {
+        let read = |name: &str| std::fs::read_to_string(dir.join(name));
+        let json = |name: &str, text: String| {
+            serde_json::from_str::<serde_json::Value>(&text)
+                .map_err(|e| format!("{}: {e}", dir.join(name).display()))
+        };
+        if !is_train_dir(dir) {
+            return Err(format!("{}: not an es train output folder", dir.display()));
+        }
+        let mut view = TrainView::default();
+        if let Ok(text) = read(TRAINING_LOCK) {
+            let lock = json(TRAINING_LOCK, text)?;
+            for mark in lock["checkpoints"].as_array().into_iter().flatten() {
+                if let Some(step) = mark["step"].as_u64() {
+                    let hash = mark["policy_hash"].as_str().unwrap_or_default();
+                    view.checkpoints.push((step as u32, hash.to_owned()));
+                }
+            }
+        }
+        let number = |v: &serde_json::Value| v.as_f64().map_or(f32::NAN, |x| x as f32);
+        if let Ok(text) = read("metrics/loss-curve.json") {
+            let rows = json("metrics/loss-curve.json", text)?;
+            for (i, row) in rows.as_array().into_iter().flatten().enumerate() {
+                let step = i as u32 + 1;
+                view.curve.step.push(step);
+                view.curve.loss.push(number(&row["loss"]));
+                view.curve.lr.push(f32::NAN);
+                let rl = &mut view.rl;
+                rl.step.push(step);
+                rl.ret.push(number(&row["return"]));
+                rl.episode_len.push(number(&row["episode_len"]));
+                rl.success.push(f32::NAN);
+                rl.entropy.push(number(&row["entropy"]));
+                rl.violation.push(number(&row["envelope_violation_rate"]));
+                view.throughput = row["samples_per_sec"].as_f64();
+            }
+        } else if let Ok(text) = read("metrics/loss.json") {
+            let losses = json("metrics/loss.json", text)?;
+            for (i, loss) in losses.as_array().into_iter().flatten().enumerate() {
+                view.curve.step.push(i as u32 + 1);
+                view.curve.loss.push(number(loss));
+                view.curve.lr.push(f32::NAN);
+            }
+        }
+        view.floor = view.curve.step.last().copied();
+        Ok(view)
     }
 
     /// Folds one message. Anything that is not the training producer's is ignored, so a
@@ -112,6 +237,7 @@ impl TrainView {
         };
         match (frame.stream, &frame.payload) {
             (STREAM_TRAIN, Payload::Scalars(v)) => self.progress(v, frame.wall_ns),
+            (STREAM_RL, Payload::Scalars(v)) => self.rl_progress(v),
             (STREAM_EVENTS, Payload::Event { kind, fields }) => match kind.as_str() {
                 "train.begin" => {
                     self.total = fields.get("total_steps").and_then(|s| s.parse().ok());
@@ -119,7 +245,10 @@ impl TrainView {
                 "checkpoint" => {
                     let step = fields.get("step").and_then(|s| s.parse().ok()).unwrap_or(0);
                     let hash = fields.get("policy_hash").cloned().unwrap_or_default();
-                    self.checkpoints.push((step, hash));
+                    // Already read off the run's `training.lock`, when its folder is open.
+                    if !self.checkpoints.iter().any(|(s, _)| *s == step) {
+                        self.checkpoints.push((step, hash));
+                    }
                 }
                 _ => {}
             },
@@ -150,6 +279,9 @@ impl TrainView {
             return;
         };
         let step = *step as u32;
+        if self.floor.is_some_and(|f| step <= f) {
+            return;
+        }
         self.first.get_or_insert((wall_ns, step));
         self.last_wall = wall_ns;
         self.curve.step.push(step);
@@ -158,8 +290,31 @@ impl TrainView {
         self.throughput = throughput.is_finite().then_some(*throughput);
     }
 
+    /// One `[step, return, episode_len, success, entropy, envelope_violation_rate]`; a
+    /// shorter row is not this stream's, and numbers a later producer appends are ignored.
+    fn rl_progress(&mut self, v: &[f64]) {
+        let [step, ret, len, success, entropy, violation, ..] = *v else {
+            return;
+        };
+        let step = step as u32;
+        if self.floor.is_some_and(|f| step <= f) {
+            return;
+        }
+        let rl = &mut self.rl;
+        rl.step.push(step);
+        rl.ret.push(ret as f32);
+        rl.episode_len.push(len as f32);
+        rl.success.push(success as f32);
+        rl.entropy.push(entropy as f32);
+        rl.violation.push(violation as f32);
+    }
+
     pub fn curve(&self) -> &Curve {
         &self.curve
+    }
+
+    pub fn rl(&self) -> &RlCurve {
+        &self.rl
     }
 
     /// `(step, policy_hash)` per packed mark, in the order they were packed.
@@ -218,13 +373,16 @@ impl TrainView {
     /// value cannot be logged and is dropped from the plotted set rather than clamped to
     /// something it is not. The reported `min`/`max` stay the series' own units either way.
     pub fn plot(&self, series: Series, log: bool) -> Option<Plot> {
-        let values: &[f32] = match series {
-            Series::Loss => &self.curve.loss,
-            Series::Lr => &self.curve.lr,
+        let (steps, values): (&[u32], &[f32]) = match series {
+            Series::Loss => (&self.curve.step, &self.curve.loss),
+            Series::Lr => (&self.curve.step, &self.curve.lr),
+            Series::Return => (&self.rl.step, &self.rl.ret),
+            Series::Success => (&self.rl.step, &self.rl.success),
+            Series::EpisodeLen => (&self.rl.step, &self.rl.episode_len),
+            Series::Entropy => (&self.rl.step, &self.rl.entropy),
+            Series::Violation => (&self.rl.step, &self.rl.violation),
         };
-        let pairs: Vec<(u32, f32)> = self
-            .curve
-            .step
+        let pairs: Vec<(u32, f32)> = steps
             .iter()
             .copied()
             .zip(values.iter().copied())
@@ -419,5 +577,132 @@ mod tests {
         assert!(late < early, "{late:?} is not shorter than {early:?}");
         view.ingest(&scalars(STREAM_TRAIN, vec![1000.0, 0.1, 1e-4, 8.0]));
         assert_eq!(view.eta(1000), None, "a finished run has no estimate");
+    }
+
+    /// Packet M16/H4 oracle 2. A recorded `[rl]` run -- stream 5 and stream 6 interleaved, as
+    /// `es train --telemetry` sends them -- folds into the loss curve it always did and the
+    /// learning curves beside it; a success over no finished episode is not drawn, a short
+    /// stream-6 row is dropped, and a longer one keeps its first six numbers.
+    #[test]
+    #[allow(clippy::float_cmp)] // exact: the fold keeps the numbers it was sent
+    fn an_rl_run_folds_its_learning_beside_the_loss() {
+        let nan = f64::NAN;
+        let mut messages = vec![event("train.begin", &[("total_steps", "4")])];
+        for (step, ret, len, success, entropy, violation) in [
+            (1.0, 0.5, 40.0, nan, -4.5, 0.5),
+            (2.0, 1.5, 64.0, 0.25, -4.0, 0.25),
+            (3.0, 2.0, 96.0, 0.5, -2.0, 0.125),
+        ] {
+            messages.push(scalars(STREAM_TRAIN, vec![step, 0.1 / step, 3e-4, 512.0]));
+            messages.push(scalars(
+                STREAM_RL,
+                vec![step, ret, len, success, entropy, violation],
+            ));
+        }
+        messages.push(scalars(STREAM_RL, vec![4.0, 9.0, 9.0]));
+        messages.push(scalars(
+            STREAM_RL,
+            vec![4.0, 0.75, 32.0, 0.0, 3.5, 1.0, 7.0],
+        ));
+        let mut model = TelemetryModel::default();
+        let mut source = replay(messages);
+        model.pump(&mut source, 100);
+        let view = &model.train;
+
+        assert_eq!(view.curve().len(), 3, "stream 5 is unchanged");
+        let rl = view.rl();
+        assert_eq!(rl.step, [1, 2, 3, 4]);
+        assert_eq!(rl.ret, [0.5, 1.5, 2.0, 0.75]);
+        assert_eq!(rl.episode_len, [40.0, 64.0, 96.0, 32.0]);
+        assert_eq!(rl.entropy, [-4.5, -4.0, -2.0, 3.5]);
+        assert_eq!(rl.violation, [0.5, 0.25, 0.125, 1.0]);
+        assert!(rl.success[0].is_nan());
+        assert_eq!(rl.success[1..], [0.25, 0.5, 0.0]);
+
+        let success = view.plot(Series::Success, false).expect("three measured");
+        assert_eq!(
+            success.points.len(),
+            3,
+            "the unmeasured first row is not drawn"
+        );
+        assert_eq!(success.steps, [2, 4]);
+        let ret = view.plot(Series::Return, false).expect("four points");
+        assert_eq!((ret.min, ret.max), (0.5, 2.0));
+        assert_eq!(ret.points[2][1], 1.0, "the peak is the top of the plot");
+        for series in Series::RL {
+            assert!(view.plot(series, false).is_some(), "{series:?}");
+            for lang in crate::model::i18n::Lang::ALL {
+                let label = crate::model::i18n::t(lang, series.key());
+                assert_ne!(label, series.key(), "{series:?} has no {lang:?} label");
+            }
+        }
+    }
+
+    /// Packet M16/H4 oracle 3. An `es train --out` folder opens as the view a live run builds:
+    /// the marks from `training.lock`, the loss and the learning from `loss-curve.json`. The
+    /// file has no learning rate and no success rate, so those draw nothing; a live stream
+    /// attached on top extends the curves past the file and repeats none of it.
+    #[test]
+    #[allow(clippy::float_cmp)] // exact: the fold keeps the numbers the file holds
+    fn a_train_folder_opens_as_the_finished_live_view() {
+        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))
+            .join("tests/fixtures/editor/train-rl");
+        assert_eq!(
+            crate::model::recent::classify(&dir),
+            crate::model::recent::Kind::Training
+        );
+        let mut view = TrainView::open_dir(&dir).expect("the fixture folder");
+        let hashes = |c: char| c.to_string().repeat(64);
+        assert_eq!(
+            view.checkpoints(),
+            [(2, hashes('a')), (4, hashes('b'))].as_slice()
+        );
+        assert_eq!(view.curve().loss, [0.5, 0.25, 0.125, 0.0625]);
+        assert_eq!(view.rl().ret, [0.25, 1.5, 2.0, 0.75]);
+        assert_eq!(view.rl().episode_len, [40.0, 64.0, 96.0, 32.0]);
+        assert_eq!(view.rl().entropy, [-4.5, -4.0, -2.0, 3.5]);
+        assert_eq!(view.rl().violation, [0.5, 0.25, 0.125, 1.0]);
+        assert_eq!((view.step(), view.throughput()), (Some(4), Some(4096.0)));
+        assert!(!view.is_empty());
+        assert!(view.plot(Series::Return, false).is_some());
+        assert!(view.plot(Series::Lr, false).is_none(), "the file has no lr");
+        assert!(
+            view.plot(Series::Success, false).is_none(),
+            "nor a success rate"
+        );
+
+        view.ingest(&scalars(STREAM_TRAIN, vec![4.0, 9.0, 3e-4, 1.0]));
+        view.ingest(&scalars(STREAM_RL, vec![4.0, 9.0, 9.0, 1.0, 9.0, 9.0]));
+        view.ingest(&event(
+            "checkpoint",
+            &[("step", "4"), ("policy_hash", "cc".repeat(32).as_str())],
+        ));
+        assert_eq!(view.curve().len(), 4, "step 4 is the file's already");
+        assert_eq!(view.rl().step.len(), 4);
+        assert_eq!(view.checkpoints().len(), 2, "mark 4 is the lock's already");
+        view.ingest(&scalars(STREAM_TRAIN, vec![5.0, 0.03, 3e-4, 1.0]));
+        view.ingest(&scalars(STREAM_RL, vec![5.0, 1.0, 50.0, 0.5, 4.0, 0.5]));
+        assert_eq!(view.curve().step.last(), Some(&5));
+        assert_eq!(view.rl().step.last(), Some(&5));
+        assert!(
+            TrainView::open_dir(&dir.join("metrics")).is_err(),
+            "not a run"
+        );
+
+        // A run still going has the three directories and nothing in them yet: it opens
+        // empty, for `--attach` to fill.
+        let running = std::env::temp_dir().join(format!("es-train-running-{}", std::process::id()));
+        for d in RUN_DIRS {
+            std::fs::create_dir_all(running.join(d)).expect("scratch");
+        }
+        assert_eq!(
+            crate::model::recent::classify(&running),
+            crate::model::recent::Kind::Training
+        );
+        let mut live = TrainView::open_dir(&running).expect("a running folder");
+        assert!(live.is_empty());
+        live.ingest(&scalars(STREAM_RL, vec![1.0, 0.5, 40.0, 0.0, -4.5, 0.5]));
+        assert_eq!(live.rl().step, [1]);
+        let _ = std::fs::remove_dir_all(&running);
     }
 }

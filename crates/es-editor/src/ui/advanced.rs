@@ -964,6 +964,12 @@ impl EditorApp {
             }
         });
         ui.separator();
+        // A training run's curves first: its speed table is all "not measured" (packet M16/H4).
+        let learning_first = !self.telemetry.train.is_empty();
+        if learning_first {
+            self.training_section(ui);
+            ui.separator();
+        }
         ui.heading(self.t("live.performance"))
             .on_hover_text(self.t("live.performance.hint"));
         if self.telemetry.received == 0 {
@@ -984,8 +990,10 @@ impl EditorApp {
             }
         });
         ui.separator();
-        self.training_section(ui);
-        ui.separator();
+        if !learning_first {
+            self.training_section(ui);
+            ui.separator();
+        }
         ui.heading(self.t("live.streams"));
         egui::Grid::new("streams").striped(true).show(ui, |ui| {
             for (key, tick, value) in self.telemetry.latest() {
@@ -1044,32 +1052,59 @@ impl EditorApp {
                     &[&format!("{rate:.0}")],
                 ));
             }
-            if !train.checkpoints().is_empty() {
-                ui.label(i18n::fill(
-                    lang,
-                    "live.checkpoints",
-                    &[&train.checkpoints().len().to_string()],
-                ))
-                .on_hover_text(
-                    train
-                        .checkpoints()
-                        .iter()
-                        .map(|(step, hash)| format!("{step}: {hash}"))
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                );
-            }
         });
+        // The packed marks, one row each: step and `policy_hash` (packet M16/H4 -- a finished
+        // run's folder is opened for these as much as for its curve).
+        if !train.checkpoints().is_empty() {
+            let title = i18n::fill(
+                lang,
+                "live.checkpoints",
+                &[&train.checkpoints().len().to_string()],
+            );
+            egui::CollapsingHeader::new(title)
+                .id_salt("train-marks")
+                .show(ui, |ui| {
+                    for (step, hash) in train.checkpoints() {
+                        ui.monospace(format!("{step:>8}  {hash}"));
+                    }
+                });
+        }
         let mut log = train.log_scale;
         ui.checkbox(&mut log, self.t("live.log_scale"));
         let loss = train.plot(Series::Loss, log);
         let lr = train.plot(Series::Lr, false);
+        // An `[rl]` run's learning (packet M16/H4): drawn only for a run that has any.
+        let rl: Vec<(Series, Option<Plot>)> = if train.rl().step.is_empty() {
+            Vec::new()
+        } else {
+            Series::RL.map(|s| (s, train.plot(s, false))).to_vec()
+        };
         let (sample, samples) = (train.sample().cloned(), train.samples());
         self.telemetry.train.log_scale = log;
 
+        // An `[rl]` run is judged by its learning, not its loss, so that comes first; and a
+        // rollout has no sample image to show, so its column is not offered.
+        let picture = rl.is_empty() || sample.is_some();
         ui.horizontal_top(|ui| {
             ui.vertical(|ui| {
-                ui.set_max_width((ui.available_width() - 180.0).max(240.0));
+                if picture {
+                    ui.set_max_width((ui.available_width() - 180.0).max(240.0));
+                }
+                if !rl.is_empty() {
+                    ui.strong(i18n::t(lang, "live.rl"))
+                        .on_hover_text(i18n::t(lang, "live.rl.hint"));
+                }
+                for (i, (series, plot)) in rl.into_iter().enumerate() {
+                    ui.label(i18n::t(lang, series.key()));
+                    match plot {
+                        Some(plot) => {
+                            paint_curve(ui, &plot, RL_COLOURS[i % RL_COLOURS.len()], 70.0);
+                        }
+                        None => {
+                            ui.label(i18n::t(lang, "value.not_measured"));
+                        }
+                    }
+                }
                 for (key, plot, colour) in [
                     ("live.loss", loss, Color32::from_rgb(120, 200, 255)),
                     ("live.lr", lr, Color32::from_rgb(200, 160, 255)),
@@ -1085,6 +1120,9 @@ impl EditorApp {
                     }
                 }
             });
+            if !picture {
+                return;
+            }
             // What the network is looking at, beside the curve: the batch's own image input
             // after augmentation, uploaded once per sample rather than once per repaint.
             ui.vertical(|ui| {
@@ -1282,6 +1320,15 @@ pub(crate) fn paint_timeline(lang: Lang, ui: &mut egui::Ui, buckets: &[Bucket]) 
 /// numbers beside it are the range the model normalised against, in the series' own units.
 /// `height` in points: a strip in the Live pane, the whole centre while ③ trains (M12/Y12).
 /// Returns the rectangle the unit square was mapped onto, for ③'s preview marks (M13/Z5a).
+/// One colour per `Series::RL` curve, in its order.
+const RL_COLOURS: [Color32; 5] = [
+    Color32::from_rgb(120, 220, 140),
+    Color32::from_rgb(250, 210, 90),
+    Color32::from_rgb(160, 200, 255),
+    Color32::from_rgb(255, 150, 120),
+    Color32::from_rgb(230, 120, 200),
+];
+
 pub(crate) fn paint_curve(ui: &mut egui::Ui, plot: &Plot, colour: Color32, height: f32) -> Rect {
     let (response, painter) =
         ui.allocate_painter(Vec2::new(ui.available_width(), height), Sense::hover());
@@ -1314,6 +1361,14 @@ pub(crate) fn paint_curve(ui: &mut egui::Ui, plot: &Plot, colour: Color32, heigh
     };
     text(rect.left_top(), Align2::LEFT_TOP, plot.max);
     text(rect.left_bottom(), Align2::LEFT_BOTTOM, plot.min);
+    // The steps the two ends stand for, so a peak can be read off by where it falls.
+    painter.text(
+        rect.right_bottom(),
+        Align2::RIGHT_BOTTOM,
+        format!("{} … {}", plot.steps[0], plot.steps[1]),
+        FontId::monospace(10.0),
+        ui.visuals().weak_text_color(),
+    );
     rect
 }
 

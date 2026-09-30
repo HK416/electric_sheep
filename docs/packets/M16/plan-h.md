@@ -162,3 +162,20 @@ Observation IR per camera (`observation-views.toml`'s chain), joint state and `g
 `cube_pose`; Learning IR as `learning-views.toml` (or `learning-mad.toml`); Evaluation IR;
 training recipe; cycle with `[collect] policy = teacher`. Collect the teacher's successful
 episodes under the three `Pt` cameras, train, evaluate, all watched in the editor.
+
+### Task H4: the editor shows an RL run's learning
+
+**Files:** `python/es/train_ppo.py`, `crates/es-py/src/{rollout,pybind}.rs` (+ `tests/rollout.rs`),
+`crates/es/src/cmd/{train,telemetry}.rs` (+ `tests/cli.rs`), `crates/es-editor-model/src/model/{train_view,live_run,recent}.rs`
+and `i18n/*.toml`, `crates/es-editor/src/{app.rs,ui/advanced.rs}`, `tests/fixtures/editor/train-rl/**`,
+`docs/design/telemetry-protocol.md` (+ko), `docs/design/rl-continuation.md` (+ko).
+
+Observed in E1: the teacher could be watched only as a loss curve, and `es-editor <es train --out>`
+opened the start page. `train_ppo.py`'s progress line adds the window means of `return`,
+`episode_len`, `entropy`, `envelope_violation_rate` and the success fraction
+(`Rollout.successes()`, additive); `es train` republishes them on **stream 6** (stream 5 stays four
+numbers: its reader destructures exactly four); the Live pane draws them; a folder with
+`training.lock` opens as the same plots from `loss-curve.json`, extended by `--attach`. Decision
+and reasons: `telemetry-protocol.md` section 9.2. **Oracle:** `train_rl_telemetry_publishes_the_learning`
+(stream 6 = the curve's rows, checkpoints and `training_hash` unmoved), `train_rl_two_runs_are_bitwise`,
+`an_rl_run_folds_its_learning_beside_the_loss`, `a_train_folder_opens_as_the_finished_live_view`.

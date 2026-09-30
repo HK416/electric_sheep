@@ -46,7 +46,7 @@ use es_assets::scene::{Actuator, SceneDesc};
 use es_compile::{CpuPlan, PlanMode, Tensor, TensorRef};
 use es_core::{PhysTick, TickRate};
 use es_env::scheduler::BatchDomains;
-use es_env::{Env, EnvMetrics, StepOutcome};
+use es_env::{Env, EnvMetrics, StepOutcome, Termination};
 use es_eval::runner::{capture_at, input_sources, joint_state, previous_action_initial, Capture};
 use es_eval::LightOverride;
 use es_ir::deployment::{ActionSpace, ExecutionMode, Micros};
@@ -152,6 +152,9 @@ pub struct Rollout<const NJ: usize, const H: usize> {
     /// declares no such channel.
     previous: Vec<Vec<f64>>,
     initial: Vec<f64>,
+    /// Per env, whether the last [`Rollout::act`] closed its episode on the Task IR's
+    /// `Terminate Success` (packet M16/H4): what a trainer's watcher counts as a success.
+    successes: Vec<bool>,
     /// One renderer per env for the image input, empty when the observation has none (packet
     /// M11/X3). Per env because the `Tick` seed clock is per-episode state.
     #[cfg(feature = "render")]
@@ -402,6 +405,7 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
             ctrl: vec![0.0; n_envs as usize * nu],
             previous: vec![initial.clone(); n_envs as usize],
             initial,
+            successes: vec![false; n_envs as usize],
             #[cfg(feature = "render")]
             cameras,
             #[cfg(feature = "render")]
@@ -603,6 +607,10 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
                 prev.copy_from_slice(&actions[i * NJ..(i + 1) * NJ]);
             }
         }
+        self.successes.fill(false);
+        for episode in &out.episodes {
+            self.successes[episode.env as usize] = episode.termination == Termination::Success;
+        }
         // `Env::step` already reset every env it closed an episode on; the plane and the plan
         // it left behind are what still hold the old episode (packet P-M7-R1).
         for i in 0..self.n_envs {
@@ -616,6 +624,12 @@ impl<const NJ: usize, const H: usize> Rollout<NJ, H> {
             rewards: out.rewards,
             dones: out.dones,
         })
+    }
+
+    /// Per env, whether the last [`Rollout::act`] ended its episode in `Success` (packet
+    /// M16/H4). `Act::dones` says an episode ended; this says how, without changing `Act`.
+    pub fn successes(&self) -> &[bool] {
+        &self.successes
     }
 
     /// Control ticks since construction — the plane's own clock, not `Env::tick`'s

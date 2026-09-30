@@ -78,9 +78,11 @@ pub enum Kind {
     Run,
     /// A project folder, holding `project.toml` (packet M12/Y6).
     Project,
+    /// An `es train --out` folder, finished (`training.lock`) or running (packet M16/H4).
+    Training,
 }
 
-/// Which of the four `path` is.
+/// Which of the five `path` is.
 ///
 /// A project is asked about first ([`Project::is_project_dir`]): its `project.toml` is what it
 /// is, whatever else the folder holds. A run is recognised by [`RunDir::is_run_dir`] — the
@@ -92,6 +94,8 @@ pub fn classify(path: &Path) -> Kind {
         Kind::Project
     } else if RunDir::is_run_dir(path) {
         Kind::Run
+    } else if crate::model::train_view::is_train_dir(path) {
+        Kind::Training
     } else if path.is_dir() {
         Kind::Documents
     } else {

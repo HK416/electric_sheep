@@ -28,14 +28,16 @@ pub const STREAM_METRICS: StreamId = StreamId(3);
 pub const STREAM_IMAGE: StreamId = StreamId(4);
 
 /// Every stream a viewer of a run wants, for `Client::subscribe`. Stream 5 is the training
-/// curve (packet M7/E7, `crate::model::train_view`): one subscription covers a whole cycle,
+/// curve (packet M7/E7, `crate::model::train_view`) and 6 an `[rl]` run's learning (packet
+/// M16/H4): one subscription covers a whole cycle,
 /// because a cycle publishes every stage on one socket.
-pub const RUN_STREAMS: [StreamId; 5] = [
+pub const RUN_STREAMS: [StreamId; 6] = [
     STREAM_EVENTS,
     STREAM_TICKS,
     STREAM_METRICS,
     STREAM_IMAGE,
     crate::model::train_view::STREAM_TRAIN,
+    crate::model::train_view::STREAM_RL,
 ];
 
 /// The row's identity (packet M7/R12): the stage a cell ran in and the cell's own name. A

@@ -267,7 +267,9 @@ Task IR(`tests/fixtures/rl/task-reach.toml`)은 기존 노드(`GetBodyPose`, `Ar
   읽는다(§28.10 규칙 2: 실제 값 또는 `unset`, 결코 날조하지 않는다).
 - `metrics/loss-curve.json`은 반복마다 `return`, `episode_len`, `envelope_violation_rate`,
   `executed_ne_sampled_rate`를 얻는다(S4b); 스트림 5가 정책 손실을 날라서 에디터의 Live 탭이
-  그것을 그대로 그린다(E7).
+  그것을 그대로 그린다(E7). 지켜보는 실행에서는 스트림 6이 `return`, `episode_len`, 성공 비율,
+  `entropy`, `envelope_violation_rate`를 나르고, 끝난 `es train` 폴더는 `loss-curve.json`에서 같은
+  그림으로 열린다(M16/H4, `telemetry-protocol.md` 9.2절).
 
 ## 7. 측정됨
 

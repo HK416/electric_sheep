@@ -322,6 +322,14 @@ fn through_rollout(task: &str, observation: &str, deployment: &str, scene_xml: &
         let qpos: Vec<f64> = (0..n_envs).flat_map(|i| roll.qpos(i)).collect();
         let observations = roll.observe().expect("observe");
         let act = roll.act(&actions(step, n_envs)).expect("act");
+        // Packet M16/H4: a success is an episode that ended, on this step.
+        assert_eq!(roll.successes().len(), n_envs);
+        for (won, done) in roll.successes().iter().zip(&act.dones) {
+            assert!(
+                !won || *done,
+                "step {step}: a success on an env that did not end"
+            );
+        }
         steps.push(StepRec {
             qpos,
             observations,

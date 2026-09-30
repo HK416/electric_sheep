@@ -285,7 +285,10 @@ deviate (MJX support for `implicitfast`/`elliptic`/`condim 6`), the deviation is
   run (§28.10 rule 2: real or `unset`, never fabricated).
 - `metrics/loss-curve.json` gains per-iteration `return`, `episode_len`,
   `envelope_violation_rate`, `executed_ne_sampled_rate` (S4b); stream 5 carries the policy loss
-  so the editor's Live tab draws it unchanged (E7).
+  so the editor's Live tab draws it unchanged (E7). Watched, stream 6 carries `return`,
+  `episode_len`, the success fraction, `entropy` and `envelope_violation_rate`, and a finished
+  `es train` folder opens as the same plots from `loss-curve.json` (M16/H4,
+  `telemetry-protocol.md` section 9.2).
 
 ## 7. Measured
 

@@ -263,6 +263,7 @@ unmoved (`cycle_telemetry_is_one_address`).
 | `3` | `Metrics(PerfMetrics)` | eval | at each `cell.end` |
 | `4` | `Image { format: "rgb8" }` | eval, collect, train | every `--telemetry-image-every` ticks; for a training run that is the **sample image** every `--sample-every` optimizer steps |
 | `5` | `Scalars([step, loss, lr, samples_per_s])` | train | every `--progress-every` optimizer steps |
+| `6` | `Scalars([step, return, episode_len, success, entropy, envelope_violation_rate])` | train (`[rl]`) | every `--progress-every` iterations (packet M16/H4, section 9.2 below) |
 
 Stream 5 is the one new id and it is still data, not schema: `protocol.rs` is frozen at its
 version, and a consumer that does not know 5 ignores it.
@@ -316,3 +317,37 @@ assumed: a document normalising by mean/std would show through as a washed-out p
 `"mapping": "clamp(v, 0, 1) * 255"` beside it, rather than as a wrong one nobody can question.
 Undoing an arbitrary chain would need the chain, and that is a manifest change this packet
 does not make.
+
+### 9.2 A PPO run's learning on its own stream (packet M16/H4)
+
+A PPO run's loss says almost nothing about whether it is learning: the Shadow Hand teacher
+(2026-09-30) peaked at 500–1,000 iterations and then let its noise grow (entropy −4.5 → +21,
+every sampled action clamped) while stream 5 showed an unremarkable curve, and the numbers that
+said so were in `loss-curve.json` only once the run had ended. `train_ppo.py --progress-every N`
+therefore adds, to the same `{"progress": ...}` line, the means over the iterations since the
+previous line of the curve's own `return`, `episode_len`, `entropy` and
+`envelope_violation_rate`, and `success` -- the fraction of the episodes that ended in those
+iterations on the Task IR's `Terminate Success`, which `es_native.Rollout.successes()` reports
+per env for the last `act` (additive: `act`'s tuple is unchanged). No episode ended, or an
+`es_native` too old to say, is `null`, never a zero. `es train` republishes them as **stream
+6**: `Scalars([step, return, episode_len, success, entropy, envelope_violation_rate])`, `tick`
+zero like stream 5, a `null` as NaN. `train_act.py`'s line carries no `return` and publishes
+nothing on 6.
+
+**Why a new id and not three more numbers on stream 5.** Stream 5's one reader in this
+repository, `TrainView`, destructures exactly four numbers (`let [step, loss, lr, throughput] =
+v`) and drops any other row, so an editor built before this packet would have lost the whole
+curve of every `[rl]` run the moment stream 5 grew. A new stream costs an old client nothing --
+it never subscribes to 6 -- and `protocol.rs` stays frozen, because a stream id is data. The
+reader of 6 takes the first six numbers and ignores more, so the next addition can be appended
+there.
+
+**The finished run is the same plots.** `es-editor <es train --out>` (the folder holding
+`training.lock`, or -- while the run goes -- the `weights/`, `metrics/` and `checkpoints/` that
+`es train` makes before its trainer starts) reads the marks from `training.lock` and the curve from
+`metrics/loss-curve.json` (`[rl]`, one row per iteration) or `metrics/loss.json` (the IR route)
+into the same `TrainView` the live stream fills, and opens the Live pane on it; `--attach` on
+top extends it, dropping a row whose step the file already holds. The file has no learning rate
+and no success, so those two curves stay empty for a finished run rather than drawn from a
+stand-in; putting them into `loss-curve.json` would move a training byte, which this packet does
+not do (`train_rl_two_runs_are_bitwise`, `train_rl_telemetry_publishes_the_learning`).

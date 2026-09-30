@@ -254,6 +254,7 @@ E4 뒤로는 `es eval run`만이 발행했다. 이제 세 프로듀서가 더 �
 | `3` | `Metrics(PerfMetrics)` | 평가 | `cell.end`마다 |
 | `4` | `Image { format: "rgb8" }` | 평가, 수집, 학습 | `--telemetry-image-every` 틱마다. 학습에서는 `--sample-every` 옵티마이저 스텝마다의 **샘플 이미지** |
 | `5` | `Scalars([step, loss, lr, samples_per_s])` | 학습 | `--progress-every` 옵티마이저 스텝마다 |
+| `6` | `Scalars([step, return, episode_len, success, entropy, envelope_violation_rate])` | 학습(`[rl]`) | `--progress-every` 반복마다(패킷 M16/H4, 아래 9.2절) |
 
 스트림 5가 새로 생긴 유일한 id이고 그것도 여전히 스키마가 아니라 데이터다: `protocol.rs`는 자기
 버전에 고정되어 있고, 5를 모르는 소비자는 그냥 무시한다.
@@ -302,3 +303,35 @@ env가 하나이므로 스텝당 `validate`는 정확히 한 번이고, 수가 �
 **사이드카에 기록된다**: 평균/표준편차로 정규화하는 문서라면 `"mapping": "clamp(v, 0, 1) * 255"`가
 옆에 붙은 채 색이 바랜 그림으로 드러나지, 아무도 의심할 수 없는 틀린 그림으로 드러나지 않는다.
 임의의 체인을 되돌리려면 체인이 필요하고, 그것은 이 패킷이 하지 않는 매니페스트 변경이다.
+
+### 9.2 PPO 실행의 학습은 자기 스트림으로 (패킷 M16/H4)
+
+PPO 실행의 손실은 그 실행이 배우고 있는지에 대해 거의 아무것도 말하지 않는다. Shadow Hand
+teacher(2026-09-30)는 500–1,000 반복에서 정점을 찍은 뒤 노이즈를 키워 갔는데(entropy −4.5 → +21,
+샘플된 행동이 전부 잘림) 스트림 5는 평범한 곡선을 보여 주었고, 그것을 말해 주는 숫자는 실행이
+끝난 뒤에야 `loss-curve.json`에 있었다. 그래서 `train_ppo.py --progress-every N`은 같은
+`{"progress": ...}` 줄에, 이전 줄 이후 반복들에 대한 곡선 자신의 `return`, `episode_len`,
+`entropy`, `envelope_violation_rate`의 평균과 `success`를 더한다. `success`는 그 반복들에서 끝난
+에피소드 가운데 Task IR의 `Terminate Success`로 끝난 비율이고, `es_native.Rollout.successes()`가
+마지막 `act`에 대해 env마다 알려 준다(추가만 했다: `act`의 튜플은 그대로다). 끝난 에피소드가
+없거나 `es_native`가 너무 오래되어 말할 수 없으면 `null`이지 0이 아니다. `es train`은 이것들을
+**스트림 6**으로 다시 내보낸다: `Scalars([step, return, episode_len, success, entropy,
+envelope_violation_rate])`, 스트림 5처럼 `tick`은 0, `null`은 NaN. `train_act.py`의 줄에는
+`return`이 없으므로 6에는 아무것도 나가지 않는다.
+
+**왜 스트림 5에 숫자 셋을 더 붙이지 않고 새 id인가.** 이 저장소에서 스트림 5를 읽는 유일한 쪽인
+`TrainView`는 정확히 네 숫자를 분해하고(`let [step, loss, lr, throughput] = v`) 다른 모양의 행은
+버린다. 그래서 스트림 5가 길어지는 순간 이 패킷 이전에 빌드된 에디터는 모든 `[rl]` 실행의 곡선을
+통째로 잃었을 것이다. 새 스트림은 옛 클라이언트에게 아무 비용도 없고 — 6을 구독하지 않는다 —
+스트림 id는 데이터이므로 `protocol.rs`는 고정된 채로 남는다. 6을 읽는 쪽은 앞의 여섯 숫자를
+취하고 그 뒤는 무시하므로, 다음 추가는 거기에 덧붙이면 된다.
+
+**끝난 실행도 같은 그림이다.** `es-editor <es train --out>`(`training.lock`이 있는 폴더, 또는
+실행 중이라면 `es train`이 트레이너를 시작하기 전에 만드는 `weights/`, `metrics/`, `checkpoints/`가
+있는 폴더)은
+`training.lock`에서 체크포인트를, `metrics/loss-curve.json`(`[rl]`, 반복마다 한 행) 또는
+`metrics/loss.json`(IR 경로)에서 곡선을 읽어 라이브 스트림이 채우는 것과 같은 `TrainView`에 넣고
+그 위에서 Live 창을 연다. 여기에 `--attach`를 더하면 곡선이 이어지고, 파일에 이미 있는 스텝의 행은
+버린다. 파일에는 학습률도 성공률도 없으므로 끝난 실행에서 그 두 곡선은 대용 값으로 그리지 않고
+비워 둔다. 그것을 `loss-curve.json`에 넣으면 학습 바이트가 움직이는데, 이 패킷은 그렇게 하지
+않는다(`train_rl_two_runs_are_bitwise`, `train_rl_telemetry_publishes_the_learning`).

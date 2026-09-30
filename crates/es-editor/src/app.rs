@@ -42,6 +42,7 @@ use crate::model::run_view;
 use crate::model::search::Search;
 use crate::model::telemetry_view::{Source, TelemetryModel};
 use crate::model::template;
+use crate::model::train_view::TrainView;
 use crate::model::watch::Watch;
 use crate::model::workflow::{self, Phase, PhaseState, RunFacts};
 use crate::ui::advanced::{Drag, SHOWCASE_CAMERA};
@@ -352,6 +353,17 @@ impl EditorApp {
                     self.recent.push(&path);
                 }
                 Err(e) => self.status = e.to_string(),
+            },
+            // An `es train --out` folder (packet M16/H4): its curves and marks in the Live
+            // pane, where an `--attach`ed run goes on extending them.
+            Kind::Training => match TrainView::open_dir(&path) {
+                Ok(view) => {
+                    self.telemetry.train = view;
+                    self.status = self.fill("live.opened_training", &[&path.display().to_string()]);
+                    self.focus(Pane::AdvancedLive);
+                    self.recent.push(&path);
+                }
+                Err(e) => self.status = e,
             },
             Kind::Bundle | Kind::Documents => self.open_bundle(&path),
         }

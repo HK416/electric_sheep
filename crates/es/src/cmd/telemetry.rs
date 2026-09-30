@@ -38,6 +38,9 @@ pub(crate) const STREAM_METRICS: StreamId = StreamId(3);
 pub(crate) const STREAM_IMAGE: StreamId = StreamId(4);
 /// The training curve (packet M7/E7): `[step, loss, lr, samples_per_s]` per progress line.
 pub(crate) const STREAM_TRAIN: StreamId = StreamId(5);
+/// A PPO run's learning (packet M16/H4): `[step, return, episode_len, success, entropy,
+/// envelope_violation_rate]` per progress line. Its own id, so stream 5 stays four numbers.
+pub(crate) const STREAM_RL: StreamId = StreamId(6);
 
 /// The `stage` field every stream-1 event carries. A cycle's stages arrive on one socket, so
 /// this is what tells them apart; a standalone command names itself.
@@ -405,6 +408,17 @@ impl Publisher {
             tick: self.last.map_or_else(Default::default, |e| e.tick),
             wall_ns: wall_ns(),
             stream: STREAM_TRAIN,
+            payload: Payload::Scalars(row.to_vec()),
+        });
+    }
+
+    /// One `[step, return, episode_len, success, entropy, envelope_violation_rate]` row on
+    /// stream 6, from a `train_ppo.py` progress line (packet M16/H4); tick zero as stream 5's.
+    pub(crate) fn rl_row(&self, row: [f64; 6]) {
+        self.send(Frame {
+            tick: self.last.map_or_else(Default::default, |e| e.tick),
+            wall_ns: wall_ns(),
+            stream: STREAM_RL,
             payload: Payload::Scalars(row.to_vec()),
         });
     }

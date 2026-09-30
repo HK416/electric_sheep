@@ -650,6 +650,12 @@ impl Rollout {
         Ok(d)
     }
 
+    /// `successes() -> [bool] * n_envs`: whether the last `act` ended each env's episode on
+    /// the Task IR's `Terminate Success` (packet M16/H4). `act`'s tuple is unchanged.
+    fn successes(&mut self) -> Vec<bool> {
+        on!(self, r => r.successes().to_vec())
+    }
+
     /// Control ticks since construction — the plane's clock (packet M5/V17).
     fn tick(&mut self) -> u64 {
         on!(self, r => r.tick())

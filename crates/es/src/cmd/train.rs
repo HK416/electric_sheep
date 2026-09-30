@@ -91,8 +91,10 @@ the repository root: the IR route's trainer is `python/es/train_act.py` and a Ta
 --telemetry <addr>
               publish the run live on this address (spec 23.1), e.g. 127.0.0.1:7777. The
               trainer's stdout is then read line by line rather than at exit, and what it
-              says goes out on stream 5 as [step, loss, lr, samples_per_s], with a
-              `checkpoint` event per packed mark on stream 1 and the sample image on stream 4.
+              says goes out on stream 5 as [step, loss, lr, samples_per_s] (an [rl] run also
+              on stream 6 as [step, return, episode_len, success, entropy,
+              envelope_violation_rate]), with a `checkpoint` event per packed mark on stream 1
+              and the sample image on stream 4.
               The summary is still the trainer's last stdout line and still what
               training.lock records. On the lerobot route each checkpoint is imported as
               soon as `lerobot-train` has finished writing it -- `model.safetensors` and
@@ -1052,6 +1054,9 @@ fn stream(
                 if let Some(row) = progress_row(progress) {
                     p.train_row(row);
                 }
+                if let Some(row) = rl_row(progress) {
+                    p.rl_row(row);
+                }
             }
             (Some(p), None, Some(Value::String(path))) => p.sample(Path::new(path)),
             _ => {}
@@ -1088,6 +1093,21 @@ fn progress_row(progress: &Value) -> Option<[f64; 4]> {
         loss,
         at("lr").unwrap_or(f64::NAN),
         at("samples_per_s").unwrap_or(f64::NAN),
+    ])
+}
+
+/// A `train_ppo.py` progress line's learning numbers as the stream-6 row `[step, return,
+/// episode_len, success, entropy, envelope_violation_rate]` (packet M16/H4). A line without a
+/// `return` -- every `train_act.py` line -- is none; a `null` success (no episode ended) is NaN.
+fn rl_row(progress: &Value) -> Option<[f64; 6]> {
+    let at = |k: &str| progress.get(k).and_then(Value::as_f64);
+    Some([
+        at("step")?,
+        at("return")?,
+        at("episode_len").unwrap_or(f64::NAN),
+        at("success").unwrap_or(f64::NAN),
+        at("entropy").unwrap_or(f64::NAN),
+        at("envelope_violation_rate").unwrap_or(f64::NAN),
     ])
 }
 
@@ -1484,7 +1504,7 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        lerobot_said, progress_row, progress_step, relay, training_bar, CheckpointWatch,
+        lerobot_said, progress_row, progress_step, relay, rl_row, training_bar, CheckpointWatch,
         LerobotProgress, LerobotSaid,
     };
 
@@ -1532,6 +1552,23 @@ mod tests {
         let both = lerobot_said(BAR_THEN_METRIC);
         assert_eq!(both.tqdm, Some((3200, 5000, Some(15.62))));
         assert_eq!((both.loss, both.lr), (Some(0.131), Some(1.0e-4)));
+    }
+
+    /// Packet M16/H4: an `[rl]` progress line is a stream-6 row, a `train_act.py` line is not.
+    #[test]
+    #[allow(clippy::float_cmp)] // exact: the row carries the parsed values themselves
+    fn an_rl_progress_line_is_a_stream_6_row_and_a_supervised_one_is_not() {
+        let rl = rl_row(&json!({"step": 20, "loss": 0.1, "lr": 3e-4, "return": 1.5,
+                                "episode_len": 90.0, "success": null, "entropy": -4.5,
+                                "envelope_violation_rate": 0.25}))
+        .expect("an [rl] line");
+        assert_eq!(rl[..3], [20.0, 1.5, 90.0]);
+        assert!(
+            rl[3].is_nan(),
+            "no episode ended: NaN, never a zero success"
+        );
+        assert_eq!(rl[4..], [-4.5, 0.25]);
+        assert_eq!(rl_row(&json!({"step": 10, "loss": 0.25, "lr": 1e-4})), None);
     }
 
     /// Packet P-M14-R1: a diverged run is drawn as one. The trainer writes a non-finite loss as

@@ -85,8 +85,13 @@ Two runs of one recipe on one machine give bitwise-equal checkpoints, which
 `envelope_violation_rate`, `executed_ne_sampled_rate` and `samples_per_sec`. `--progress-every
 N` additionally prints `{"progress": {"step", "loss", "lr", "samples_per_s", "elapsed_s"}}`
 every N iterations, which `es train --telemetry` republishes on stream 5 so the editor's Live
-tab draws it unchanged (packet M7/E7). Without the flag nothing is printed and nothing is
-computed for a watcher who is not there.
+tab draws it unchanged (packet M7/E7). The same line also carries what a PPO run is judged by,
+averaged over the iterations since the previous line (packet M16/H4): the curve's own `return`,
+`episode_len`, `entropy` and `envelope_violation_rate`, and `success`, the fraction of the
+episodes that ended in those iterations on the Task IR's `Terminate Success` (`null` when none
+ended, or when `es_native` is too old to say); `es train --telemetry` republishes those on
+stream 6. Without the flag nothing is printed and nothing is computed for a watcher who is not
+there.
 
 No format that can execute code on load is read or written here (`INV-16`): the checkpoints
 and the value network are safetensors in the layout `crates/es-policy/src/weights.rs`
@@ -450,6 +455,12 @@ def main(argv: list) -> int:
     episode_steps = torch.zeros(a.envs, device=device)
     started = time.perf_counter()
     collect_s, update_s = 0.0, 0.0
+    # What the progress line averages over (packet M16/H4): the curve rows and the finished
+    # episodes since the last line. Success is read only for a watcher, and only from an
+    # `es_native` that can tell it (`Rollout.successes`: the step's resets that ended in the
+    # Task IR's `Terminate Success`).
+    watch_success = a.progress_every > 0 and hasattr(roll, "successes")
+    since, ended_n, succeeded_n = 0, 0, 0
 
     for iteration in range(a.iterations):
         lr_now = (
@@ -519,6 +530,10 @@ def main(argv: list) -> int:
                 # an element-wise loop costs one device round trip per env, which on a GPU
                 # with a thousand envs finishing together is most of the collect time.
                 ended = buf_done[t].nonzero().flatten()
+                if len(ended) and watch_success:
+                    won = roll.successes()
+                    ended_n += len(ended)
+                    succeeded_n += sum(1 for i in ended.tolist() if won[i])
                 if len(ended):
                     finished.extend(
                         zip(episode_return[ended].tolist(), episode_steps[ended].tolist())
@@ -615,6 +630,8 @@ def main(argv: list) -> int:
         # to a watcher on this iteration whatever the period, and no checkpoint after it.
         diverged = not math.isfinite(last["loss"])
         if a.progress_every > 0 and ((iteration + 1) % a.progress_every == 0 or diverged):
+            window = curve[since:]
+            mean = lambda k: sum(c[k] for c in window) / len(window)  # noqa: E731
             sys.stdout.write(
                 json_text(
                     {
@@ -624,12 +641,18 @@ def main(argv: list) -> int:
                             "lr": lr_now,
                             "samples_per_s": curve[-1]["samples_per_sec"],
                             "elapsed_s": elapsed,
+                            "return": mean("return"),
+                            "episode_len": mean("episode_len"),
+                            "success": succeeded_n / ended_n if ended_n else None,
+                            "entropy": mean("entropy"),
+                            "envelope_violation_rate": mean("envelope_violation_rate"),
                         }
                     }
                 )
                 + "\n"
             )
             sys.stdout.flush()
+            since, ended_n, succeeded_n = len(curve), 0, 0
         if diverged:
             break
         if (iteration + 1) in marks:

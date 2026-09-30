@@ -297,6 +297,14 @@
 "live.sample" = "What the network is looking at"
 "live.sample.hint" = "One image input of the current batch, after augmentation, de-normalised for display only (spec 23.3)"
 "live.sample.empty" = "No picture yet. Ask the run for one with --telemetry-image-every."
+"live.rl" = "How well the robot is doing"
+"live.rl.hint" = "A reinforcement-learning ([rl]) run's scores: the mean over the iterations since the last line, on stream 6; a finished run's are read from metrics/loss-curve.json (packet M16/H4)"
+"live.return" = "Reward collected"
+"live.success" = "How often it succeeds"
+"live.episode_len" = "Steps an attempt lasts"
+"live.entropy" = "How random its moves are"
+"live.violation" = "How often the safety limits stepped in"
+"live.opened_training" = "Training run: {}"
 "results.stages" = "Steps of this run"
 
 # --- what the policy sees ---------------------------------------------------------------

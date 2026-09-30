@@ -159,3 +159,20 @@ MikkTSpace 호환), 이미시브 텍스처(이미시브 삼각형은 `Pt`의 광
 없음. Learning IR은 `learning-views.toml`(또는 `learning-mad.toml`)과 같게, Evaluation IR, 학습
 레시피, `[collect] policy = teacher`를 가진 사이클. `Pt` 카메라 세 대 아래에서 교사의 성공한
 에피소드를 수집하고, 학습하고, 평가하며, 모두 에디터로 지켜본다.
+
+### 작업 H4: 에디터가 RL 실행의 학습을 보여 준다
+
+**파일:** `python/es/train_ppo.py`, `crates/es-py/src/{rollout,pybind}.rs`(+ `tests/rollout.rs`),
+`crates/es/src/cmd/{train,telemetry}.rs`(+ `tests/cli.rs`), `crates/es-editor-model/src/model/{train_view,live_run,recent}.rs`와
+`i18n/*.toml`, `crates/es-editor/src/{app.rs,ui/advanced.rs}`, `tests/fixtures/editor/train-rl/**`,
+`docs/design/telemetry-protocol.md`(+ko), `docs/design/rl-continuation.md`(+ko).
+
+E1에서 본 것: teacher는 손실 곡선으로만 지켜볼 수 있었고, `es-editor <es train --out>`은 시작
+페이지를 열었다. `train_ppo.py`의 진행 줄이 `return`, `episode_len`, `entropy`,
+`envelope_violation_rate`의 구간 평균과 성공 비율(`Rollout.successes()`, 추가만 함)을 더하고,
+`es train`이 이를 **스트림 6**으로 다시 내보낸다(스트림 5는 네 숫자 그대로: 그 독자는 정확히 넷을
+분해한다). Live 창이 이를 그리고, `training.lock`이 있는 폴더는 `loss-curve.json`에서 같은 그림으로
+열리며 `--attach`가 그것을 이어 간다. 결정과 이유: `telemetry-protocol.md` 9.2절. **오라클:**
+`train_rl_telemetry_publishes_the_learning`(스트림 6 = 곡선의 행, 체크포인트와 `training_hash`는
+그대로), `train_rl_two_runs_are_bitwise`, `an_rl_run_folds_its_learning_beside_the_loss`,
+`a_train_folder_opens_as_the_finished_live_view`.
