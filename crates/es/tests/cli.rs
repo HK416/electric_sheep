@@ -4736,6 +4736,194 @@ fn expert_passes_the_evaluation_harness() {
     );
 }
 
+/// Review M17 F-7 (packet M17/R2) -- **an `.estraj` ends on the state its episode ended in.**
+///
+/// A row is the state a control step was entered with (packet M5/V12), and `Env::step` resets
+/// a done env before it returns, so no row used to hold the state a termination was decided
+/// on: GV's success episodes ended on a row where the box still moved at 0.1-0.4 m/s, one step
+/// before the "still" clause held. The writers now append `Env::terminal_state`.
+///
+/// The scripted expert through `es_eval::Evaluation`, one pinned seed, `traj_dir` on:
+/// * **success** -- `episode_length + 1` rows; the last satisfies the demo's success predicate
+///   evaluated on it, and the one before does not;
+/// * **timeout, both ways an episode runs out** -- the Task IR's own budget (`Env::step`
+///   auto-resets) and the runner's `max_steps` (an explicit reset): `BUDGET + 1` rows each, and
+///   the two files identical, so the auto-reset path's last row is the post-step state and not
+///   the next episode's draw.
+///
+/// Needs `mujoco` (`ES_PYTHON`); prints a reason and skips without it.
+#[test]
+fn a_trajectory_ends_on_the_state_its_episode_ended_in() {
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    const NJ: usize = 6;
+    const H: usize = 16;
+    /// Control steps of the timeout episodes: far short of the expert's success.
+    const BUDGET: u32 = 40;
+
+    if let Err(reason) = es_physics_backend::MuJoCoCpuBackend::is_available() {
+        println!("SKIP a_trajectory_ends_on_the_state_its_episode_ended_in: {reason}");
+        return;
+    }
+    let read = |name: &str| std::fs::read_to_string(vl_fixture(name)).expect(name);
+    let task = es_ir::serial::task_from_toml(&read("task.toml")).expect("task.toml");
+    let obs =
+        es_ir::serial::observation_from_toml(&read("observation.toml")).expect("observation.toml");
+    let deploy =
+        es_ir::serial::deployment_from_toml(&read("deployment.toml")).expect("deployment.toml");
+    let latency_ms = es_ir::serial::learning_from_toml(&read("learning.toml"))
+        .expect("learning.toml")
+        .policy
+        .contract
+        .runtime
+        .expected_latency_ms;
+    let scene = es_assets::parse_mjcf(
+        &std::fs::read_to_string(demo_scene_path()).expect("the demo scene is in the repo"),
+    )
+    .expect("the demo scene parses")
+    .scene;
+    let cube = scene
+        .joints
+        .iter()
+        .find(|j| j.kind == es_assets::scene::JointKind::Free)
+        .expect("the scene has one free-joint body to pick up")
+        .id;
+    let dir = scratch_dir("terminal-row");
+
+    // One episode of seed `SEEDS[0]`, as `expert_passes_the_evaluation_harness` runs it: its
+    // success rate, its length, and its `.estraj`.
+    let run = |task: &es_ir::task::TaskIr, max_steps: Option<u32>, tag: &str| {
+        let mut cfg = es_env::expert::demo_cfg(cube);
+        cfg.pace_to(&deploy, demo_replan(&deploy));
+        let expert = es_env::expert::ScriptedExpert::new(&scene, cfg).expect("the expert builds");
+        let seen: SeenState = Rc::new(RefCell::new(None));
+        let mut ir = demo_evaluation_ir(
+            hex(&task.task_hash().expect("task hash")),
+            hex(&obs.observation_hash().expect("observation hash")),
+        );
+        ir.episodes = es_ir::evaluation::EpisodeBatch {
+            n_episodes: 1,
+            seeds: es_ir::evaluation::SeedPlan::Explicit(vec![SEEDS[0]]),
+        };
+        ir.suites.truncate(1);
+        let mut policy = ExpertPolicy::<NJ, H> {
+            expert,
+            seen: Rc::clone(&seen),
+            calls: Rc::default(),
+        };
+        // The expert reads joints, never pixels: a constant frame, as in the harness oracle.
+        let blank = vec![0u8; 96 * 96 * 3];
+        let mut frames =
+            move |_: &str,
+                  _light: &es_env::randomize::RenderOverrides,
+                  model: &es_physics_core::backend::ModelInfo,
+                  state: &es_physics_core::backend::StateView<'_>| {
+                let mut row = state.qpos_of(0).to_vec();
+                row.extend_from_slice(state.qvel_of(0));
+                *seen.borrow_mut() = Some((model.clone(), row));
+                Ok::<Vec<u8>, String>(blank.clone())
+            };
+        let traj_dir = dir.join(tag);
+        let (report, _lock) =
+            es_eval::Evaluation::run_with_frames::<es_physics_backend::MuJoCoCpuBackend, _, NJ, H>(
+                &ir,
+                task,
+                &scene,
+                &obs,
+                &mut policy,
+                &deploy,
+                es_physics_backend::MuJoCoCpuBackend::new,
+                &es_eval::RunConfig {
+                    expected_latency_ms: latency_ms,
+                    max_steps,
+                    traj_dir: Some(traj_dir.clone()),
+                    ..es_eval::RunConfig::default()
+                },
+                Some(&mut frames),
+                None,
+            )
+            .expect("the expert runs through the evaluation harness");
+        let metric = |m: es_ir::evaluation::MetricSpec| {
+            report
+                .cells
+                .iter()
+                .find(|c| c.suite == "nominal" && c.metric == m)
+                .and_then(|c| match c.value {
+                    es_ir::evaluation::MetricValue::Scalar(v) => Some(v),
+                    _ => None,
+                })
+                .expect("a scalar metric")
+        };
+        let traj = es_env::Trajectory::read(&traj_dir.join("nominal-00.estraj"))
+            .expect("the evaluation wrote an .estraj");
+        (
+            metric(es_ir::evaluation::MetricSpec::SuccessRate),
+            metric(es_ir::evaluation::MetricSpec::EpisodeLength) as usize,
+            traj,
+        )
+    };
+
+    // --- success ---------------------------------------------------------------------------
+    let (rate, steps, traj) = run(&task, None, "success");
+    assert!(rate > 0.0, "seed {} must end in Success", SEEDS[0]);
+    // `task.toml`'s success predicate on one row: nodes 9-12 read the cube free joint's first
+    // `qpos` / `qvel` index -- its x, `[6]` after the six arm joints -- and node 32 the
+    // gripper's `qpos[5]`.
+    let clauses = |k: usize| (traj.qpos(k)[6], traj.qvel(k)[6], traj.qpos(k)[5]);
+    let holds = |(x, vx, grip): (f64, f64, f64)| {
+        x > 0.09 && x < 0.19 && vx > -0.05 && vx < 0.05 && grip > 0.85
+    };
+    let last = traj.ticks() - 1;
+    println!(
+        "success at step {steps}: {} rows; the last two (x, vx, gripper) {:?} {:?}",
+        traj.ticks(),
+        clauses(last - 1),
+        clauses(last)
+    );
+    assert_eq!(
+        traj.ticks(),
+        steps + 1,
+        "{steps} recorded steps: one row per step and one for the state the episode ended in"
+    );
+    let (last, before) = (clauses(steps), clauses(steps - 1));
+    assert!(
+        holds(last),
+        "the last row (x, vx, gripper) = {last:?} fails the success predicate the episode \
+         ended on"
+    );
+    assert!(
+        !holds(before),
+        "the row before the last, {before:?}, already satisfies the success predicate: the \
+         episode would have ended a step earlier"
+    );
+
+    // --- timeout, by the task's budget and by the runner's ----------------------------------
+    let mut short = task.clone();
+    short.config.max_episode_steps = BUDGET;
+    let (_, own_steps, own) = run(&short, None, "timeout-task");
+    let (_, runner_steps, runner) = run(&task, Some(BUDGET), "timeout-runner");
+    let n = BUDGET as usize;
+    assert_eq!((own_steps, runner_steps), (n, n), "both episodes ran out");
+    assert_eq!(
+        (own.ticks(), runner.ticks()),
+        (n + 1, n + 1),
+        "a timeout of {n} steps is {} rows",
+        n + 1
+    );
+    assert_eq!(
+        own.to_bytes(),
+        runner.to_bytes(),
+        "the auto-reset timeout's last row is not the state the explicit reset closed the \
+         same episode in"
+    );
+    println!(
+        "RAN a_trajectory_ends_on_the_state_its_episode_ended_in: success at step {steps}, \
+         last row (x, vx, gripper) {last:?}, the row before {before:?}; timeouts {} rows",
+        n + 1
+    );
+}
+
 /// Packet M5/V6b (b) -- **`--seed S` names the same scene on both paths**, bit for bit.
 ///
 /// The Task IR's `Randomization` node draws from `(seed, env, episode)` (§6.3), so episode 0 of
@@ -5093,8 +5281,8 @@ fn demo_latency_ms(bundle: &es_compile::PolicyBundle) -> f32 {
 /// section 7.30.
 ///
 /// Both files are written by `es_env::traj::Trajectory` from the state at the top of a control
-/// step, before `Env::step` (packet M5/V12), so the comparison is of the same instant on both
-/// paths and not of two conventions.
+/// step, before `Env::step` (packet M5/V12), and end on `Env::terminal_state` (review M17
+/// F-7), so the comparison is of the same instant on both paths and not of two conventions.
 ///
 /// **The server oracle** -- the SO-101 scene needs `MuJoCoCpuBackend`; without `mujoco` it
 /// prints a reason and skips. Ignored by default because it runs two full episodes of physics:
@@ -5233,9 +5421,10 @@ fn collection_and_evaluation_draw_the_same_trajectory() {
         .expect("the collector wrote an .estraj");
     let b = es_env::Trajectory::read(&eval_traj.join("nominal-00.estraj"))
         .expect("the evaluation wrote an .estraj");
+    // One row per step and the state the episode ended in (review M17 F-7).
     assert_eq!(
         (a.ticks(), b.ticks()),
-        (STEPS as usize, STEPS as usize),
+        (STEPS as usize + 1, STEPS as usize + 1),
         "both paths ran the whole budget: collection {} ticks, evaluation {} ticks",
         a.ticks(),
         b.ticks()
@@ -7616,13 +7805,16 @@ fn a_showcase_replay_reproduces_the_frames_the_policy_saw() {
     let traj = es_env::traj::Trajectory::read(&traj_dir.join("nominal-00.estraj"))
         .expect("the run wrote a trajectory");
     let cell = frames_dir.join("nominal-00");
+    // One record per frame the run wrote, then the state the episode ended in, which no frame
+    // shows (review M17 F-7).
+    let frames = sink.events["nominal-00"].len();
     assert_eq!(
         traj.ticks(),
-        sink.events["nominal-00"].len(),
-        "one trajectory record per frame the run wrote"
+        frames + 1,
+        "one trajectory record per frame the run wrote, and the terminal state"
     );
-    assert!(traj.ticks() > 0, "the run recorded nothing");
-    for tick in 0..traj.ticks() {
+    assert!(frames > 0, "the run recorded nothing");
+    for tick in 0..frames {
         let recorded = std::fs::read(cell.join(format!("{tick:06}.bin")))
             .unwrap_or_else(|e| panic!("frame {tick}: {e}"));
         assert_eq!(
@@ -7632,8 +7824,7 @@ fn a_showcase_replay_reproduces_the_frames_the_policy_saw() {
         );
     }
     println!(
-        "RAN a_showcase_replay_reproduces_the_frames_the_policy_saw: {} frame(s) identical",
-        traj.ticks()
+        "RAN a_showcase_replay_reproduces_the_frames_the_policy_saw: {frames} frame(s) identical"
     );
 }
 
@@ -15613,11 +15804,12 @@ fn dr_collect_eval_frames_match_rollout() {
         };
         let c_traj = traj(dir.join(format!("ds/traj/ep-{episode:03}.estraj")));
         let e_traj = traj(eval_out.join(format!("traj/nominal-{episode:02}.estraj")));
-        let steps = c_traj.ticks();
+        // Frames each path rendered: every row but the terminal one (review M17 F-7).
+        let steps = c_traj.ticks() - 1;
         let cell = eval_out
             .join("frames")
             .join(format!("nominal-{episode:02}"));
-        let evaluated = e_traj.ticks();
+        let evaluated = e_traj.ticks() - 1;
         assert!(
             steps > 0 && evaluated > 0,
             "episode {episode}: nothing rendered"

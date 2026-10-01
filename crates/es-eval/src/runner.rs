@@ -1165,6 +1165,7 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
     // and the same dense index a `StepEvent` calls its `frame` -- kept here too so a run
     // that writes no frames still has the number (packet M7/E4).
     let mut captured = 0u64;
+    let mut closed = None;
     for step in 0..max_steps {
         let dropped = step_state.drop_observation();
         // Read before the ring is touched below: whether *this* step captured an observation
@@ -1328,14 +1329,22 @@ fn run_episode<B: PhysicsBackend, const NJ: usize, const H: usize>(
         step_state.apply_per_step(&mut ctrl);
         let out = env.step(&ctrl)?;
         if let Some(ep) = out.episodes.into_iter().next() {
-            return Ok(ep);
+            closed = Some(ep);
+            break;
         }
     }
-    // The step budget ran out before a terminal condition: close the open episode.
-    env.reset(None)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| EvalError::Plan("the env closed no episode on reset".to_owned()))
+    let episode = match closed {
+        Some(ep) => Some(ep),
+        // The step budget ran out before a terminal condition: close the open episode.
+        None => env.reset(None)?.into_iter().next(),
+    }
+    .ok_or_else(|| EvalError::Plan("the env closed no episode on reset".to_owned()))?;
+    // The state the episode ended in, which no step was entered with: the last row, past the
+    // last frame (review M17 F-7).
+    if let Some(t) = traj {
+        t.push(env.model(), &env.terminal_state(), 0)?;
+    }
+    Ok(episode)
 }
 
 /// The plan's input buffers, filled from the physics state.

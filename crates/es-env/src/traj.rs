@@ -18,6 +18,13 @@
 //! which is `StableId` order because it is a `BTreeMap` (spec 3.4). The length is implied by
 //! the header and checked before anything is allocated: a truncated or over-long file is
 //! refused, never padded (spec 25.1).
+//!
+//! A row is the state a control step was *entered* with (packet M5/V12), one per frame, so the
+//! episode's writers -- `es eval run`, `es loop collect` -- append one more: the state the
+//! episode ended in, read from [`crate::Env::terminal_state`] (review M17 F-7). Row `k` is
+//! still frame `k`, and the last row, which no frame has, is the state the termination was
+//! decided on, for success, failure and timeout alike: `steps + 1` rows when every step
+//! captured a frame. Files written before that end one row early and parse the same.
 
 use std::collections::BTreeMap;
 use std::path::Path;

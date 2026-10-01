@@ -5,7 +5,8 @@
 //! record. Envs that terminated are reset at the end of the same call, so an episode boundary
 //! is always a tick boundary. The recorded row's *state* is the one the step was entered with
 //! — the state its `ctrl` was computed from — while its reward, termination and failure are
-//! the transition's (packet M5/V12).
+//! the transition's (packet M5/V12). The post-step state a termination was decided on is gone
+//! from the backend once the env is reset; [`Env::terminal_state`] keeps it (review M17 F-7).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -105,6 +106,8 @@ pub struct Env<B: PhysicsBackend> {
     /// Scratch, allocated once: the state one control step is entered with, which is the state
     /// the recorded row carries (§13.2, packet M5/V12).
     pre: PreStep,
+    /// The state each env's last episode ended in, copied out by the reset that closed it.
+    terminal: Terminal,
     ports: BTreeMap<String, f64>,
     metrics: EnvMetrics,
 }
@@ -184,6 +187,7 @@ impl<B: PhysicsBackend> Env<B> {
             reset_qvel: vec![0.0; envs * shape.nv],
             last_ctrl: vec![0.0; envs * shape.nu],
             pre: PreStep::default(),
+            terminal: Terminal::default(),
             ports: BTreeMap::new(),
             metrics: EnvMetrics::default(),
             model,
@@ -249,6 +253,14 @@ impl<B: PhysicsBackend> Env<B> {
             }
             None => (0..self.n_envs).collect(),
         };
+        // The state the closing episodes ended in, before anything below draws the next one:
+        // from `step`, exactly the state their termination was decided on.
+        {
+            let state = self.backend.state();
+            for env in &list {
+                self.terminal.record(&state, *env);
+            }
+        }
         let (nq, nv) = (self.model.nq as usize, self.model.nv as usize);
         let mut closed = Vec::with_capacity(list.len());
         let mut rows_qpos = Vec::with_capacity(list.len() * nq);
@@ -549,6 +561,26 @@ impl<B: PhysicsBackend> Env<B> {
         self.recorder.open(env)
     }
 
+    /// The state each env's last episode ended in: the post-step state `step` decided its
+    /// termination on, or the state a caller's [`Self::reset`] closed it in. No recorded row
+    /// holds it -- a row is the state a step was entered with -- and the backend no longer
+    /// does once a done env is reset, so a trajectory reads its last row here (review M17
+    /// F-7). Row `e` is env `e`'s at the reset that closed its last episode; `tick` is the
+    /// latest reset's.
+    pub fn terminal_state(&self) -> StateView<'_> {
+        let t = &self.terminal;
+        StateView {
+            n_envs: self.n_envs,
+            tick: t.tick,
+            qpos: &t.qpos,
+            qvel: &t.qvel,
+            act: &t.act,
+            sensordata: &t.sensordata,
+            xpos: &t.xpos,
+            xquat: &t.xquat,
+        }
+    }
+
     /// Sets `env`'s episode counter so that the **next** [`Self::reset`] draws episode
     /// `episode` (§6.3: the randomization is keyed by `(seed, env, episode, stream)`;
     /// §28.9 ladder 10).
@@ -607,6 +639,44 @@ impl PreStep {
         ] {
             dst.clear();
             dst.extend_from_slice(src);
+        }
+    }
+}
+
+/// Each env's rows of the state its last episode ended in ([`Env::terminal_state`]).
+#[derive(Clone, Debug, Default)]
+struct Terminal {
+    tick: PhysTick,
+    qpos: Vec<f64>,
+    qvel: Vec<f64>,
+    act: Vec<f64>,
+    sensordata: Vec<f64>,
+    xpos: Vec<f64>,
+    xquat: Vec<f64>,
+}
+
+impl Terminal {
+    /// Copies `env`'s rows of `state`, and only those: a reset of a few envs in a large batch
+    /// copies a few rows. Each array keeps the backend's own length, so a backend that reports
+    /// no `xpos` leaves none here either and `body_poses` finds no body rather than one at the
+    /// origin.
+    fn record(&mut self, state: &StateView<'_>, env: u32) {
+        self.tick = state.tick;
+        let n = state.n_envs.max(1) as usize;
+        for (dst, src) in [
+            (&mut self.qpos, state.qpos),
+            (&mut self.qvel, state.qvel),
+            (&mut self.act, state.act),
+            (&mut self.sensordata, state.sensordata),
+            (&mut self.xpos, state.xpos),
+            (&mut self.xquat, state.xquat),
+        ] {
+            dst.resize(src.len(), 0.0);
+            let width = src.len() / n;
+            let rows = env as usize * width..(env as usize + 1) * width;
+            if let (Some(d), Some(s)) = (dst.get_mut(rows.clone()), src.get(rows)) {
+                d.copy_from_slice(s);
+            }
         }
     }
 }
@@ -1064,6 +1134,12 @@ pub(crate) mod tests {
         assert_eq!(env.open_episode(0).steps(), 0, "a fresh episode is open");
         // Reset re-drew the constant, so the env is back at 2.0 rad.
         assert_eq!(env.backend().state().qpos_of(0)[0], 2.0);
+        // ...while the state the predicate fired on is kept: one step of the spring back from
+        // 2.0, still past 1.5 (review M17 F-7).
+        for e in 0..2 {
+            let ended = env.terminal_state().qpos_of(e)[0];
+            assert!(ended > 1.5 && ended < 2.0, "env {e} ended at {ended}");
+        }
     }
 
     /// Packet M7/T8 oracle 2. A seek over an episode that has already recorded steps would

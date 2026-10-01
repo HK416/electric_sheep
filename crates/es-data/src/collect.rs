@@ -805,7 +805,8 @@ impl Collector {
                     // `Env::step` records the same instant, so trajectory index, frame index
                     // and row index still agree -- and the terminal step no longer renders
                     // the *next* episode's reset state, which is what the post-step read did
-                    // once `Env::step` auto-reset a done env.
+                    // once `Env::step` auto-reset a done env. The state the episode ended in
+                    // is the trajectory's one extra row, pushed when it closes.
                     if let Some(t) = traj.as_mut() {
                         t.push(env.model(), &state, 0).map_err(|e| bad(&e))?;
                     }
@@ -935,6 +936,12 @@ impl Collector {
                 episode.termination = Termination::Failure;
             }
             terminations.push(episode.termination);
+            // The state the episode ended in, which no step was entered with: the last row,
+            // past the last frame (review M17 F-7).
+            if let Some(t) = traj.as_mut() {
+                t.push(env.model(), &env.terminal_state(), 0)
+                    .map_err(|e| bad(&e))?;
+            }
             if let (Some(dir), Some(t)) = (spec.traj_dir.as_ref(), &traj) {
                 t.write(&dir.join(format!("ep-{index:03}.estraj")))
                     .map_err(|e| bad(&e))?;
