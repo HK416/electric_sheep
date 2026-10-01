@@ -265,11 +265,13 @@ pub fn rsqrt(x: f32) -> f32 {
 //
 // The importers (`es-assets` MJCF / URDF) turn `euler=`, `axisangle=`, `zaxis=` and `rpy` into
 // quaternions whose bits enter `scene_hash` (spec 5.3), so they cannot call the host's libm:
-// the same XML hashed differently on Windows and Linux (M8 S-2). These two are thin wrappers
-// over the pure-Rust `libm` port (musl), so the bits are fixed by the crate and not by the
+// the same XML hashed differently on Windows and Linux (M8 S-2). These are thin wrappers over
+// the pure-Rust `libm` port (musl), so the bits are fixed by the crate and not by the
 // platform. They are `f64`, CPU-only, have no Slang mirror and are not the <= 2 ULP polynomial
 // family above; nothing on a kernel path may call them. `sqrt` stays `f64::sqrt` (IEEE,
-// correctly rounded).
+// correctly rounded). `es project generate` (M17 G3d) takes the same route for the numbers it
+// writes into a Task / Observation IR document (a cosine threshold, a focal length, a tilt
+// bound), whose bits enter `task_hash` / `observation_hash`.
 
 /// `(sin x, cos x)` in `f64`, bits fixed by the `libm` crate — offline asset path only.
 #[must_use]
@@ -281,6 +283,13 @@ pub fn sin_cos_f64(x: f64) -> (f64, f64) {
 #[must_use]
 pub fn acos_f64(x: f64) -> f64 {
     libm::acos(x)
+}
+
+/// `tan x` in `f64`, bits fixed by the `libm` crate (musl's `tan`: `__rem_pio2` + `__tan`, not
+/// `sin / cos`, which is one ULP off at 22.5°) — offline asset path only.
+#[must_use]
+pub fn tan_f64(x: f64) -> f64 {
+    libm::tan(x)
 }
 
 #[cfg(test)]
@@ -484,5 +493,46 @@ mod tests {
             acos_f64(0.0).to_bits(),
             core::f64::consts::FRAC_PI_2.to_bits()
         );
+    }
+
+    /// Packet M17/G3d oracle: `tan_f64` against the host's `tan` over 1°–179° in steps of
+    /// 0.001°, at `x` and at `x / 2` (the pinhole's and the tilt bound's argument). The two agree
+    /// at the committed fields of view (45°, 70°: both correctly rounded there), so no committed
+    /// hash moves; elsewhere they are faithful, not equal — on Windows 11's UCRT (2026-10-01)
+    /// 14,720 of 356,002 points differ by one ULP, the correctly rounded side split about evenly.
+    /// Reported, not claimed beyond one ULP: the host is what this replaces.
+    #[test]
+    fn tan_f64_against_the_host_over_the_fields_of_view() {
+        for deg in [45.0f64, 70.0] {
+            let x = deg.to_radians() / 2.0;
+            assert_eq!(tan_f64(x).to_bits(), x.tan().to_bits(), "{deg}°");
+        }
+        let (mut n, mut moved) = (0, 0);
+        for i in 1_000..=179_000 {
+            let x = (f64::from(i) / 1_000.0).to_radians();
+            for x in [x, x / 2.0] {
+                let (ours, host) = (tan_f64(x).to_bits(), x.tan().to_bits());
+                assert!(ours.abs_diff(host) <= 1, "{x}: {ours:x} vs {host:x}");
+                n += 1;
+                moved += usize::from(ours != host);
+            }
+        }
+        println!("tan_f64: {moved} of {n} points one ULP from the host");
+    }
+
+    /// `tan_f64`'s bits (musl's) at the committed fields of view and at controls; the same
+    /// constants on every host.
+    #[test]
+    fn tan_f64_bit_patterns_are_pinned() {
+        let half = |deg: f64| tan_f64(deg.to_radians() / 2.0).to_bits();
+        assert_eq!(half(45.0), 0x3fda_8279_99fc_ef32);
+        assert_eq!(half(70.0), 0x3fe6_6819_a3a0_bf7a);
+        assert_eq!(
+            tan_f64(core::f64::consts::FRAC_PI_4).to_bits(),
+            0x3fef_ffff_ffff_ffff
+        );
+        assert_eq!(tan_f64(0.0).to_bits(), 0);
+        assert_eq!(tan_f64(-0.0).to_bits(), (-0.0f64).to_bits());
+        assert!(tan_f64(f64::NAN).is_nan() && tan_f64(f64::INFINITY).is_nan());
     }
 }
