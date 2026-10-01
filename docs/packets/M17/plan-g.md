@@ -17,7 +17,7 @@ generated documents — and trains it, without writing MJCF, TOML IR or Rust.
 - **Every committed document, golden and hash stays as it is.** A scene read from `.esscene`
   hashes by its `SceneDesc` exactly as one read from MJCF.
 - Layers (§4.2): readers, writers and include expansion in `es-assets` (2); the task-spec compiler
-  in `es-script` (11); CLI in `es`; scene model in `es-editor-model` (12); widgets in `es-editor`
+  in `es-script` (11); CLI in `es`; scene model in `es-editor-scene` (12, G5); widgets in `es-editor`
   (13). No new extension point (INV-17).
 
 ## Waves
@@ -191,6 +191,14 @@ xtask's table in the same packet), `crates/es-editor/src/ui/**` (hierarchy, insp
   random command sequences); an invalid edit is refused with the field; a rename rewrites the spec
   and the regenerated documents (G3b) still validate; the saved document re-reads equal; a screenshot
   of ① editing the cube's size and colour in the Shadow Hand project copy.
+
+**G5 as merged (2026-10-01):** the scene model is a new layer-12 crate, `es-editor-scene`
+(`es-editor-model` stood at 8,942 of its 10,000-line cap); spec §4.2 rule 4 and Appendix C.8 name
+both layer-12 crates, which do not know each other. A refused command is not applied, so every
+undo step is a scene that expands. "Make an editable copy" keeps the template's `scene_hash`; the
+generated IRs differ from the committed ones only where they name the scene file or cite its hash.
+Steps ② to ⑤ of an editable project still run the template's documents until G9. Design note §5.1
+records the rest.
 
 ### Task G6: viewport picking and gizmos (after G5)
 
