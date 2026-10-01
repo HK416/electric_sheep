@@ -16,6 +16,7 @@ use es_render::TriScene;
 use crate::model::project::Project;
 use crate::model::replay_view::load_scene;
 use crate::model::template::{load, templates_root, Method, Template};
+use crate::model::viewport::Shot;
 use crate::model::watch::source_of;
 
 /// Where the replay camera starts: the demo's showcase view (`es video showcase --eye`).
@@ -32,6 +33,7 @@ pub const SHOWCASE_CAMERA: Camera = Camera {
 /// A scene file, parsed, and its triangles at the initial pose.
 #[derive(Debug)]
 pub struct ScenePreview {
+    path: PathBuf,
     scene: SceneDesc,
     tris: TriScene,
 }
@@ -50,9 +52,25 @@ impl ScenePreview {
     /// at zero and every free body where the file puts it, which is the scene's own body poses -
     /// what `TriScene::from_scene` tessellates. No joint value is made up here.
     pub fn open(scene: &Path) -> Result<Self, String> {
+        let path = scene.to_path_buf();
         let scene = load_scene(scene).map_err(|e| e.to_string())?;
         let tris = TriScene::from_scene(&scene).map_err(|e| e.to_string())?;
-        Ok(Self { scene, tris })
+        Ok(Self { path, scene, tris })
+    }
+
+    /// The scene at its initial pose from `camera`, for the slower looks (packet M16/H8).
+    pub fn shot(&self, camera: &Camera) -> Shot {
+        Shot {
+            scene: self.path.clone(),
+            traj: None,
+            tick: 0,
+            camera: *camera,
+        }
+    }
+
+    /// The triangles at the initial pose, for the material look.
+    pub fn tris(&self) -> TriScene {
+        self.tris.clone()
     }
 
     /// The scene seen from `camera`, back to front; empty for a camera with no orientation.

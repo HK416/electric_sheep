@@ -102,7 +102,7 @@ pub struct EditorApp {
     pub(crate) replay_cell: String,
     /// The last frame the panel rasterised and what it was drawn for, `(tick, camera)`
     /// (packet M7/E8). Dropped whenever `replay` is.
-    pub(crate) replay_texture: Option<((usize, Camera), egui::TextureHandle)>,
+    pub(crate) replay_texture: crate::ui::advanced::Canvas,
     pub(crate) camera: Camera,
     pub(crate) telemetry: TelemetryModel,
     pub(crate) source: Source,
@@ -167,7 +167,7 @@ impl EditorApp {
             frames_path: String::new(),
             replay: None,
             replay_cell: String::new(),
-            replay_texture: None,
+            replay_texture: crate::ui::advanced::Canvas::default(),
             camera: SHOWCASE_CAMERA,
             telemetry: TelemetryModel::default(),
             source,
@@ -357,7 +357,7 @@ impl EditorApp {
         self.run_frames.clear();
         self.replay = None;
         self.replay_cell.clear();
-        self.replay_texture = None;
+        self.replay_texture = crate::ui::advanced::Canvas::default();
         self.search.set_hits(Vec::new());
         self.project = None;
         match recent::classify(&path) {

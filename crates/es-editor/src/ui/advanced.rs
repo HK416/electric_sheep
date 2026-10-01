@@ -32,9 +32,11 @@ use crate::model::launch::{Kind as LaunchKind, State as LaunchState};
 use crate::model::live_run::cell_key;
 use crate::model::replay_view::{self, ReplayView};
 use crate::model::run_view;
+use crate::model::scene_view::ScenePreview;
 use crate::model::search::Search;
 use crate::model::telemetry_view;
 use crate::model::train_view::{Plot, Series};
+use crate::model::viewport::{Mode, Shot, Viewport};
 
 const NODE_W: f32 = 178.0;
 const NODE_H: f32 = 40.0;
@@ -885,7 +887,7 @@ impl EditorApp {
                         *status = format!("{cell}: {} tick(s) replayed", view.ticks());
                         cell.clone_into(replay_cell);
                         *replay = Some(view);
-                        *replay_texture = None;
+                        *replay_texture = Canvas::default();
                     }
                     Err(e) => *status = e.to_string(),
                 }
@@ -929,7 +931,7 @@ impl EditorApp {
             ui.add(egui::Slider::new(&mut view.tick, 0..=last).text("tick"));
         });
 
-        replay_canvas(ui, ui.available_size(), view, camera, replay_texture);
+        replay_canvas(ui, lang, ui.available_size(), view, camera, replay_texture);
         if view.playing {
             ui.ctx().request_repaint();
         }
@@ -1386,29 +1388,108 @@ pub(crate) const REPLAY_RATE_HZ: f64 = 50.0;
 const ORBIT_PER_POINT: f64 = 0.008;
 const ZOOM_PER_POINT: f64 = 0.002;
 
+/// One viewport's pictures between frames: the fast raster and what it was drawn for
+/// `(tick, camera)` (packet M7/E8), and the slower looks of packet M16/H8 with the texture of
+/// their newest picture. Dropped with whatever it shows.
+#[derive(Default)]
+pub(crate) struct Canvas {
+    raster: Option<((usize, Camera), egui::TextureHandle)>,
+    look: Viewport,
+    picture: Option<(u64, egui::TextureHandle)>,
+    es: Option<std::path::PathBuf>,
+}
+
+/// What a canvas shows: a template's scene at its initial pose, or a replay at its tick.
+#[derive(Clone, Copy)]
+pub(crate) enum Posed<'a> {
+    Scene(&'a ScenePreview),
+    Replay(&'a ReplayView),
+}
+
+impl Posed<'_> {
+    fn tick(self) -> usize {
+        match self {
+            Self::Scene(_) => 0,
+            Self::Replay(view) => view.tick,
+        }
+    }
+
+    fn project(self, camera: &Camera) -> Projected {
+        match self {
+            Self::Scene(preview) => preview.project(camera),
+            Self::Replay(view) => view.project(view.tick, camera),
+        }
+    }
+
+    fn shot(self, camera: &Camera) -> Shot {
+        match self {
+            Self::Scene(preview) => preview.shot(camera),
+            Self::Replay(view) => view.shot(camera),
+        }
+    }
+
+    fn tris(self) -> Result<es_render::TriScene, String> {
+        match self {
+            Self::Scene(preview) => Ok(preview.tris()),
+            Self::Replay(view) => view.scene_at(view.tick).map_err(|e| e.to_string()),
+        }
+    }
+}
+
+/// The look every viewport draws, for the session: egui's own temporary memory, which no
+/// store persists (packet M16/H8).
+fn mode_id() -> egui::Id {
+    egui::Id::new("viewport-look")
+}
+
+pub(crate) fn viewport_mode(ctx: &egui::Context) -> Mode {
+    ctx.data(|d| d.get_temp(mode_id())).unwrap_or_default()
+}
+
+/// `es-editor --viewport <look>` and the selector above every viewport.
+pub fn set_viewport_mode(ctx: &egui::Context, mode: Mode) {
+    ctx.data_mut(|d| d.insert_temp(mode_id(), mode));
+}
+
 /// One replay frame in a `size` canvas: drag orbits, scroll zooms. Shared by the Replay panel
 /// and the results screen's player (packet M12/Y13).
 pub(crate) fn replay_canvas(
     ui: &mut egui::Ui,
+    lang: Lang,
     size: Vec2,
     view: &ReplayView,
     camera: &mut Camera,
-    texture: &mut Option<((usize, Camera), egui::TextureHandle)>,
+    canvas: &mut Canvas,
 ) {
-    let project = |camera: &Camera| view.project(view.tick, camera);
-    scene_canvas(ui, size, view.tick, project, camera, texture);
+    scene_canvas(ui, lang, size, Posed::Replay(view), camera, canvas);
 }
 
-/// [`replay_canvas`] for any posed scene: `tick` is what changes the picture besides the
-/// camera, and `project` draws it. ① and ② show a template's scene with it (packet M12/Y15).
+/// [`replay_canvas`] for any posed scene, under the look selector (packet M16/H8). ① and ②
+/// show a template's scene with it (packet M12/Y15).
 pub(crate) fn scene_canvas(
     ui: &mut egui::Ui,
+    lang: Lang,
     size: Vec2,
-    tick: usize,
-    project: impl Fn(&Camera) -> Projected,
+    posed: Posed<'_>,
     camera: &mut Camera,
-    texture: &mut Option<((usize, Camera), egui::TextureHandle)>,
+    canvas: &mut Canvas,
 ) {
+    let mut mode = viewport_mode(ui.ctx());
+    let row = ui.horizontal(|ui| {
+        ui.label(i18n::t(lang, "viewport.label"));
+        for look in Mode::ALL {
+            ui.selectable_value(&mut mode, look, i18n::t(lang, look.key()))
+                .on_hover_text(i18n::t(lang, look.hint()));
+        }
+        if let Some(status) = canvas.look.status() {
+            let (key, args) = status.line();
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            ui.weak(i18n::fill(lang, key, &args));
+        }
+    });
+    set_viewport_mode(ui.ctx(), mode);
+    let gap = row.response.rect.height() + ui.spacing().item_spacing.y;
+    let size = Vec2::new(size.x, (size.y - gap).max(1.0));
     let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
     (camera.width, camera.height) =
         Raster::size_for([response.rect.width(), response.rect.height()]);
@@ -1426,20 +1507,35 @@ pub(crate) fn scene_canvas(
         }
     }
     painter.rect_filled(response.rect, 0.0, Color32::from_gray(BACKGROUND));
-    // One CPU frame per tick or camera change, never per repaint: the raster is the same
-    // bytes until one of them moves, and re-drawing 2,700 triangles for a picture that
-    // did not change would burn a core holding still.
-    let key = (tick, *camera);
-    if texture.as_ref().is_none_or(|(k, _)| *k != key) {
-        let raster = Raster::draw(&project(camera), camera.width, camera.height);
-        let image = egui::ColorImage::from_rgb([raster.w as usize, raster.h as usize], &raster.rgb);
-        *texture = Some((
-            key,
-            ui.ctx()
-                .load_texture("replay", image, egui::TextureOptions::LINEAR),
-        ));
-    }
-    if let Some((_, texture)) = texture.as_ref() {
+    let es = (canvas.es).get_or_insert_with(|| crate::model::launch::es_binary().path);
+    let shot = posed.shot(camera);
+    let now = std::time::Instant::now();
+    canvas.look.update(mode, &shot, now, es, || posed.tris());
+    let texture = if let Some((picture, revision)) = canvas.look.picture() {
+        if canvas.picture.as_ref().is_none_or(|(r, _)| *r != revision) {
+            let px = [picture.width as usize, picture.height as usize];
+            let image = egui::ColorImage::from_rgb(px, &picture.rgb);
+            let options = egui::TextureOptions::LINEAR;
+            let texture = ui.ctx().load_texture("viewport-look", image, options);
+            canvas.picture = Some((revision, texture));
+        }
+        canvas.picture.as_ref().map(|(_, t)| t)
+    } else {
+        // One CPU frame per tick or camera change, never per repaint: the raster is the same
+        // bytes until one of them moves, and re-drawing 2,700 triangles for a picture that
+        // did not change would burn a core holding still.
+        let key = (posed.tick(), *camera);
+        if canvas.raster.as_ref().is_none_or(|(k, _)| *k != key) {
+            let raster = Raster::draw(&posed.project(camera), camera.width, camera.height);
+            let px = [raster.w as usize, raster.h as usize];
+            let image = egui::ColorImage::from_rgb(px, &raster.rgb);
+            let options = egui::TextureOptions::LINEAR;
+            let texture = ui.ctx().load_texture("replay", image, options);
+            canvas.raster = Some((key, texture));
+        }
+        canvas.raster.as_ref().map(|(_, t)| t)
+    };
+    if let Some(texture) = texture {
         // Stretched over the whole canvas: `size_for` kept the aspect, so this only ever
         // scales the picture up, and never by much.
         painter.image(
@@ -1448,6 +1544,10 @@ pub(crate) fn scene_canvas(
             Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
             Color32::WHITE,
         );
+    }
+    if canvas.look.busy() {
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(50));
     }
 }
 

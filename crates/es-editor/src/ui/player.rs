@@ -16,7 +16,7 @@ use es_render::raster::{Camera, BACKGROUND};
 use crate::model::i18n::{t, Lang};
 use crate::model::replay_view::ReplayView;
 use crate::model::results::{self, View};
-use crate::ui::advanced::{paint_timeline, replay_canvas, rgb_texture, REPLAY_RATE_HZ};
+use crate::ui::advanced::{paint_timeline, replay_canvas, rgb_texture, Canvas, REPLAY_RATE_HZ};
 
 /// One attempt, playing.
 pub(crate) struct Player {
@@ -30,7 +30,7 @@ pub(crate) struct Player {
     /// The playhead when there is no motion to carry it.
     index: usize,
     camera: Camera,
-    picture: Option<((usize, Camera), egui::TextureHandle)>,
+    picture: Canvas,
     eye: Option<(usize, Option<egui::TextureHandle>)>,
 }
 
@@ -56,7 +56,7 @@ impl Player {
             note,
             index: 0,
             camera: crate::model::scene_view::camera_for(scene),
-            picture: None,
+            picture: Canvas::default(),
             eye: None,
         }
     }
@@ -133,11 +133,11 @@ pub(crate) fn play(
     let half = Vec2::new(size.x / 2.0 - 4.0, size.y);
     match (p.view, p.replay.as_ref()) {
         (View::Outside, Some(replay)) => {
-            replay_canvas(ui, size, replay, &mut p.camera, &mut p.picture);
+            replay_canvas(ui, lang, size, replay, &mut p.camera, &mut p.picture);
         }
         (View::SideBySide, Some(replay)) => {
             ui.horizontal(|ui| {
-                replay_canvas(ui, half, replay, &mut p.camera, &mut p.picture);
+                replay_canvas(ui, lang, half, replay, &mut p.camera, &mut p.picture);
                 let tick = replay.tick;
                 eye(ui, half, dir, &p.cell, p.frames, tick, &mut p.eye);
             });
