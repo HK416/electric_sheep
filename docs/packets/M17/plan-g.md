@@ -157,3 +157,49 @@ clause functions only), `crates/es-script/tests/estask_scripted.rs`, design note
   `estask_scripted.rs`); every committed task document's evaluation unchanged (its `task_hash`
   and the reach / SO-101 / Shadow Hand reward goldens and bitwise RL tests); the two reference
   specs still compile to their committed `task_hash`.
+
+**G3b as merged (2026-10-01):** `es project generate` regenerates both reference sets — the Shadow
+Hand set and the SO-101 views / cam / MAD arms — IR document for IR document by semantic hash, the
+recipes and cycles as equal structs; `visible-learning/deployment.toml` (a hand-tuned envelope) is
+the one committed file the scene's ranges do not produce. The host `cos` / `tan` stay (a sin/cos
+`tan` moves the 45° cameras' focal length by one ULP); musl's `tan` matched the host's bits at every
+probed field of view, so G3d removes the host call without moving a hash.
+
+### Task G3d: generated documents without the host libm
+
+**Files:** `crates/es-math/src/approx*` (a `tan_f64` beside `sin_cos_f64`), `crates/es-script/src/spec/compile.rs`
+(the three host calls), the design note §4.3 (+ko). Use `es_math::approx` for the angle threshold's
+cosine, the camera focal length's tangent and the tilt bound; **oracle:** every committed
+`task_hash` and every G3b hash unmoved, plus a sweep of `tan_f64` against the host over 1°–179° and
+the committed fields of view. If any bit moves, stop and report (the owner decides).
+
+### Task G5: the editor's scene model
+
+**Files:** the scene model (new modules, or a new layer-12 crate `es-editor-scene` if
+`es-editor-model`'s 10,000-line cap requires it — then §4.2 / Appendix C.8's `LAYERS`, ko first, and
+xtask's table in the same packet), `crates/es-editor/src/ui/**` (hierarchy, inspector), i18n.
+
+- An editable project holds `scene.esscene` + `task.estask`. The model: the `EsScene` document (G1),
+  a selection, **commands** (add / delete / duplicate entity, set a field, set a pose, re-parent,
+  rename — a rename also rewrites the names in `task.estask`), an undo / redo stack, validation after
+  every command (G1's `expand` + the mapping report of the project's backend, refusals in plain words
+  on the field), save. A template project's scene stays read-only, with "make an editable copy".
+- ①: a hierarchy panel (tree, includes folded, search, visibility) and an inspector (pose in metres
+  and Euler degrees through `es_math::approx`, shape and size, mass, friction, colour / material /
+  texture, joint kind and range), editing through commands; the viewport (H9) re-renders on change.
+- **Oracles:** headless: apply / undo / redo returns the identical document (a property test over
+  random command sequences); an invalid edit is refused with the field; a rename rewrites the spec
+  and the regenerated documents (G3b) still validate; the saved document re-reads equal; a screenshot
+  of ① editing the cube's size and colour in the Shadow Hand project copy.
+
+### Task G6: viewport picking and gizmos (after G5)
+
+**Files:** `crates/es-editor-model` / the scene crate (pick and gizmo decisions), `crates/es-editor`
+(drawing, input), `crates/es-render` only if a segmentation readback needs an API.
+
+- Click to select (the segmentation channel of the in-process render gives the geom → its entity),
+  translate / rotate / scale gizmos with snapping (cm, 15°), frame-selected; a drag is one command
+  (one undo step); the policy camera's view in the viewport's corner (the declared camera, its
+  resolution and render path, in process).
+- **Oracles:** headless pick → entity and gizmo drag → pose delta on scripted rays; a drag is one
+  undo step; screenshots of a gizmo drag and the corner view.
