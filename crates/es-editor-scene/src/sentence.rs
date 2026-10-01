@@ -22,7 +22,8 @@ use es_render::cpu::nearest_hit_flat;
 use es_render::TriScene;
 use es_script::spec::vocab::takes;
 use es_script::spec::{
-    Clauses, Observe, RenderDoc, RenderPath, RewardDoc, Shaping, SpecError, Start, StartItem,
+    Clauses, CycleDoc, Observe, RenderDoc, RenderPath, RewardDoc, Shaping, SpecError, Start,
+    StartItem, Student, Teacher,
 };
 
 // What `es-editor` names through this module, which has no `es-script` of its own.
@@ -1039,9 +1040,77 @@ fn robot(scene: &SceneDesc, doc: &EsScene) -> String {
     at.map(|b| b.name.clone()).unwrap_or_default()
 }
 
+/// "Say the task"'s learners (packet M17/G9; design note section 5.4, the owner's to change).
+/// `[reward] scale` is plan H's (`rl_games`' `scale_value`), which the weight levels were read
+/// against; the bonus is the medium level.
+pub const REWARD_SCALE: f64 = 0.01;
+/// The student's chunk: plan H's and plan N's 16 rows.
+pub const HORIZON: u32 = 16;
+/// The cycle's demonstrations (the cube cards' 200) and first collect seed — plan H's 1001,
+/// clear of the evaluation's default seeds (101 on).
+pub const EPISODES: u32 = 200;
+pub const SEED: u64 = 1001;
+
+/// The rows a chunk executes before the next is asked for: the largest of 1 to 10 that divides
+/// `control_hz` (`control_hz / execute` must be whole, XIR-023) — 10 at 50 or 60 Hz, as the
+/// committed students' 5 and 10 Hz replanning.
+fn execute(control_hz: f64) -> u32 {
+    (1..=10_u32)
+        .rev()
+        .find(|&d| (control_hz / f64::from(d)).fract() == 0.0)
+        .unwrap_or(1)
+}
+
+/// What "say the task" adds so that `generate` writes the whole set (packet M17/G9): the
+/// robot's joints, velocities and last action observed, the first free body's pose and velocity
+/// for the teacher alone; a success bonus; the PPO teacher reading every channel (G3b's
+/// defaults: plan H's preset); a camera student over every observed camera reading the joint
+/// positions (`h3`, the `tanh` head); and a cycle the trained teacher demonstrates, its
+/// successes kept.
+fn learners(spec: &mut TaskSpec, scene: &SceneDesc) {
+    for source in [
+        "robot.joint_pos",
+        "robot.joint_vel",
+        "robot.previous_action",
+    ] {
+        add_source(spec, source, false);
+    }
+    if let Some(body) = free_bodies(scene).into_iter().next() {
+        add_source(spec, &format!("{body}.pose"), true);
+        add_source(spec, &format!("{body}.vel"), true);
+    }
+    spec.reward = Some(RewardDoc {
+        scale: Some(REWARD_SCALE),
+        success: Some(BONUS[1]),
+        failure: None,
+    });
+    spec.teacher = Some(Teacher::default());
+    spec.student = Some(Student {
+        name: None,
+        views: None,
+        state: Some(vec!["joint_pos".to_owned()]),
+        family: None,
+        preset: None,
+        horizon: HORIZON,
+        execute: execute(spec.control_hz),
+        training: None,
+    });
+    spec.cycle = Some(CycleDoc {
+        runs: None,
+        expert: None,
+        episodes: EPISODES,
+        seed: SEED,
+        success_only: Some(true),
+        nominal_only: None,
+        jobs: None,
+        preview: None,
+        showcase: None,
+    });
+}
+
 /// "Say the task": the robot, `control_hz`, 8 s, every camera observed at 96 px, and one clause
-/// a fresh scene can satisfy — the first free body still (under 5 cm/s). The person edits from
-/// there.
+/// a fresh scene can satisfy — the first free body still (under 5 cm/s) — and the learners
+/// ([`learners`]). The person edits from there.
 pub fn new_spec(scene: &SceneDesc, doc: &EsScene, control_hz: f64) -> TaskSpec {
     let mut spec = TaskSpec {
         kind: "task-spec".to_owned(),
@@ -1065,6 +1134,7 @@ pub fn new_spec(scene: &SceneDesc, doc: &EsScene, control_hz: f64) -> TaskSpec {
     for c in &scene.cameras {
         set_camera(&mut spec, &c.name, true);
     }
+    learners(&mut spec, scene);
     spec
 }
 
@@ -1080,7 +1150,11 @@ fn subject_bodies(spec: &TaskSpec, scene: &SceneDesc) -> Vec<String> {
         .iter()
         .chain(spec.failure.iter().flat_map(|f| &f.clauses));
     for c in all {
-        if scene.joints.iter().any(|j| j.name == c.subject) {
+        // A free joint named as its body is the body's (packet M17/G9), as the compiler reads it.
+        let moves = |j: &&es_assets::scene::Joint| {
+            j.name == c.subject && matches!(j.kind, JointKind::Hinge | JointKind::Slide)
+        };
+        if scene.joints.iter().any(|j| moves(&j)) {
             continue;
         }
         let name = c

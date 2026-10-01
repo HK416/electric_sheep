@@ -49,7 +49,7 @@ pub use command::{
 pub use copy::make_editable;
 pub use es_physics_backend::BackendKind;
 pub use gizmo::{Drag, Gizmo, Step, Tool};
-pub use model::{Regen, SceneModel};
+pub use model::{on_disk, Regen, SceneModel};
 pub use policy::PolicyCamera;
 pub use tree::{Row, RowKind};
 pub use view::{Camera, Ray};

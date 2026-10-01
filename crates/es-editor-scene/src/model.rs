@@ -38,6 +38,37 @@ pub enum Regen {
     Written(Vec<String>),
     /// Why not; `generated/` was emptied, so nothing stale is left to read.
     Failed(String),
+    /// `generated/` does not hold what the saved documents generate: never generated, or
+    /// changed since (packet M17/G9, [`on_disk`]).
+    Stale,
+}
+
+/// What `generated/` holds against what the saved documents at `root` generate (packet
+/// M17/G9): `Written` when it holds every file `generate` makes of them, byte for byte (the
+/// generator has no clock); `Stale` when not; `Failed` when they do not generate; `NoSpec`
+/// without a specification. Nothing is written.
+pub fn on_disk(root: &Path) -> Regen {
+    let path = root.join(SPEC_FILE);
+    if !path.is_file() {
+        return Regen::NoSpec;
+    }
+    let spec = read(&path).and_then(|t| TaskSpec::from_toml(&t).map_err(|e| e.to_string()));
+    let docs =
+        spec.and_then(|s| generate(&s, root, GENERATED_DIR, SPEC_FILE).map_err(|e| e.to_string()));
+    match docs {
+        Err(why) => Regen::Failed(why),
+        Ok(docs) => {
+            let dir = root.join(GENERATED_DIR);
+            let held = |d: &es_script::spec::Document| {
+                std::fs::read_to_string(dir.join(&d.file)).is_ok_and(|t| t == d.text)
+            };
+            if docs.iter().all(held) {
+                Regen::Written(docs.into_iter().map(|d| d.file).collect())
+            } else {
+                Regen::Stale
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -365,6 +396,11 @@ impl SceneModel {
         self.preview = None;
         self.regenerate();
         Ok(())
+    }
+
+    /// What `generated/` holds as the project is opened ([`on_disk`]), without writing.
+    pub fn refresh(&mut self) {
+        self.generated = on_disk(&self.root);
     }
 
     /// `generate` (G3b) from the saved documents into `generated/`, emptied first: after a

@@ -11,7 +11,7 @@
 // that renaming would move `scene_hash` for a scene nobody edited. A path out of the template's
 // directory (`..`) is refused rather than flattened.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 use es_assets::esscene::{expand, EsScene};
 use es_assets::scene::AssetKind;
@@ -64,6 +64,42 @@ pub fn make_editable(root: &Path, scene: &Path, spec: Option<&Path>) -> Result<(
         write(&root.join(SPEC_FILE), &t)?;
     }
     write(&target, &text)
+}
+
+/// An editable project's documents copied from `from` into `to` (packet M17/G9): "save as
+/// template" (a project into a template's folder) and a project made from a saved template (the
+/// other way). `assets/` is copied whole, not by what the scene names: a glTF's buffers are not
+/// in its asset list (G7). Then `task.estask` when there is one, and `scene.esscene` last, as
+/// [`make_editable`] writes it. Refuses a `to` that already holds a scene document.
+pub fn documents(from: &Path, to: &Path) -> Result<(), String> {
+    let target = to.join(SCENE_FILE);
+    if target.exists() {
+        return Err(format!("{}: already editable", target.display()));
+    }
+    let fail = |p: &Path, e: std::io::Error| format!("{}: {e}", p.display());
+    std::fs::create_dir_all(to).map_err(|e| fail(to, e))?;
+    let mut todo = vec![PathBuf::from(crate::import::ASSETS)];
+    while let Some(rel) = todo.pop() {
+        let Ok(entries) = std::fs::read_dir(from.join(&rel)) else {
+            continue;
+        };
+        std::fs::create_dir_all(to.join(&rel)).map_err(|e| fail(&to.join(&rel), e))?;
+        for e in entries.flatten() {
+            let rel = rel.join(e.file_name());
+            if e.path().is_dir() {
+                todo.push(rel);
+            } else {
+                std::fs::copy(e.path(), to.join(&rel)).map_err(|err| fail(&e.path(), err))?;
+            }
+        }
+    }
+    for file in [SPEC_FILE, SCENE_FILE] {
+        let src = from.join(file);
+        if src.is_file() {
+            std::fs::copy(&src, to.join(file)).map_err(|e| fail(&src, e))?;
+        }
+    }
+    Ok(())
 }
 
 /// The specification `text` with its `scene` line naming the project's scene document; the

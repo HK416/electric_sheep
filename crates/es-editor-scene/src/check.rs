@@ -64,6 +64,17 @@ pub fn check(doc: &EsScene, dir: &Path, backends: &[BackendKind]) -> Result<Scen
     Ok(scene)
 }
 
+/// Whether the saved scene of the project at `root` maps onto `backend` (packet M17/G9: ②'s
+/// teacher trains on `MuJoCo` Warp, which a project is not checked against while it is built),
+/// or why not.
+pub fn maps_onto(root: &Path, backend: BackendKind) -> Result<(), Refusal> {
+    let path = root.join(crate::SCENE_FILE);
+    let other = |why: String| Refusal::new("scene", OTHER, vec![why]);
+    let text = std::fs::read_to_string(&path).map_err(|e| other(format!("{e}")))?;
+    let doc = EsScene::from_toml(&text).map_err(|e| other(e.to_string()))?;
+    check(&doc, root, &[backend]).map(|_| ())
+}
+
 /// The name a geom is refused by: its own, or `geom<n>` as G1 names the n-th unnamed one.
 pub(crate) fn geom_label(g: &GeomDoc, unnamed: &mut u32) -> String {
     g.name.clone().unwrap_or_else(|| {

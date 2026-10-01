@@ -367,9 +367,103 @@ fn a_new_task_on_the_so101_copy_compiles_and_generates() {
         ]
     );
     m.save().unwrap();
+    // Packet M17/G9: "say the task" also says who learns it, so the whole set is generated.
+    let all = [
+        "task.toml",
+        "observation-teacher.toml",
+        "learning-teacher.toml",
+        "deployment-teacher.toml",
+        "evaluation-teacher.toml",
+        "training-teacher.toml",
+        "observation-student.toml",
+        "learning-student.toml",
+        "deployment-student.toml",
+        "evaluation-student.toml",
+        "evaluation-student-nominal.toml",
+        "training-student.toml",
+        "cycle-student.toml",
+    ];
     match m.generated() {
-        Regen::Written(files) => assert_eq!(files, &["task.toml"]),
+        Regen::Written(files) => assert_eq!(files, &all),
         other => panic!("{other:?}"),
+    }
+    // What is on disk is what the saved documents generate; a changed one on disk is not.
+    assert_eq!(es_editor_scene::on_disk(m.root()), *m.generated());
+    let spec_path = m.root().join(es_editor_scene::SPEC_FILE);
+    let text = std::fs::read_to_string(&spec_path).unwrap();
+    std::fs::write(
+        &spec_path,
+        text.replace("timeout_s = 8.0", "timeout_s = 9.0"),
+    )
+    .unwrap();
+    assert_eq!(es_editor_scene::on_disk(m.root()), Regen::Stale);
+    m.refresh();
+    assert_eq!(m.generated(), &Regen::Stale);
+    std::fs::write(&spec_path, text.replace("execute = 10", "execute = 3")).unwrap();
+    let failed = es_editor_scene::on_disk(m.root());
+    assert!(
+        matches!(&failed, Regen::Failed(why) if why.contains("execute")),
+        "{failed:?}"
+    );
+    std::fs::write(&spec_path, &text).unwrap();
+    assert!(matches!(
+        es_editor_scene::on_disk(m.root()),
+        Regen::Written(_)
+    ));
+    std::fs::remove_file(&spec_path).unwrap();
+    assert_eq!(es_editor_scene::on_disk(m.root()), Regen::NoSpec);
+    let _ = std::fs::remove_dir_all(m.root());
+}
+
+/// Packet M17/G9: "say the task" says who learns it — the robot's joints, velocities and last
+/// action and the first free body's pose and velocity observed (that body's for the teacher
+/// alone), a medium success bonus at plan H's scale, plan H's PPO teacher over every channel, a
+/// camera student over every observed camera reading the joints, and a cycle the trained
+/// teacher demonstrates, its successes kept.
+#[test]
+fn say_the_task_says_who_learns_it() {
+    let m = so101("learners");
+    let said = s::new_spec(m.scene(), m.doc(), 50.0);
+    let o = said.observe.as_ref().unwrap();
+    let names = |t: &Option<std::collections::BTreeMap<String, String>>| -> Vec<(String, String)> {
+        t.iter()
+            .flatten()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect()
+    };
+    let pair = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+    assert_eq!(
+        names(&o.state),
+        [
+            pair("joint_pos", "robot.joint_pos"),
+            pair("joint_vel", "robot.joint_vel"),
+            pair("previous_action", "robot.previous_action"),
+        ]
+    );
+    assert_eq!(
+        names(&o.privileged),
+        [pair("cube_pose", "cube.pose"), pair("cube_vel", "cube.vel")]
+    );
+    let r = said.reward.as_ref().unwrap();
+    assert_eq!(
+        (r.scale, r.success),
+        (Some(s::REWARD_SCALE), Some(s::BONUS[1]))
+    );
+    assert_eq!(said.teacher, Some(es_script::spec::Teacher::default()));
+    let st = said.student.as_ref().unwrap();
+    assert_eq!(
+        (st.views.clone(), st.state.clone(), st.horizon, st.execute),
+        (None, Some(vec!["joint_pos".to_owned()]), 16, 10)
+    );
+    let c = said.cycle.as_ref().unwrap();
+    assert_eq!(
+        (c.expert.clone(), c.episodes, c.seed, c.success_only),
+        (None, s::EPISODES, s::SEED, Some(true))
+    );
+    // At 60 Hz the chunk still replans at a whole rate; at 25 Hz too.
+    for (hz, execute) in [(60.0, 10), (25.0, 5), (7.0, 7)] {
+        let said = s::new_spec(m.scene(), m.doc(), hz);
+        assert_eq!(said.student.unwrap().execute, execute, "{hz}");
     }
     let _ = std::fs::remove_dir_all(m.root());
 }
@@ -428,4 +522,48 @@ fn the_camera_check_sees_and_misses() {
     put(&mut m, next).unwrap();
     assert_eq!(m.unseen()[0].1, Vec::<String>::new());
     let _ = std::fs::remove_dir_all(m.root());
+}
+
+/// Packet M17/G9: on the empty scene, the library's SO-101 and a box from the Add menu — whose
+/// free joint is unnamed, so it is named as the box — "say the task" compiles: the box still is
+/// the box's speed, not a joint's (the compiler reads only a hinge or slide joint by name).
+#[test]
+fn say_the_task_on_an_object_from_the_add_menu() {
+    let root = scratch("added");
+    let empty = repo().join("tests/fixtures/esscene/empty.esscene");
+    make_editable(&root, &empty, None).expect("copy");
+    let mut m = SceneModel::open(&root, vec![BackendKind::MuJoCoCpu]).unwrap();
+    let lib = es_editor_scene::add::library(&repo()).unwrap();
+    let so101 = lib.into_iter().find(|r| r.id == "so101").unwrap();
+    let view = |at: [f64; 3]| es_editor_scene::Camera {
+        eye: [at[0] + 0.5, at[1] - 0.5, 0.6],
+        look_at: at,
+        fov_y: std::f64::consts::FRAC_PI_4,
+        width: 640,
+        height: 400,
+    };
+    m.add(&es_editor_scene::Item::Robot(so101), &view([0.0; 3]), true)
+        .unwrap();
+    let object = es_editor_scene::inspect::ShapeKind::Box;
+    m.add(
+        &es_editor_scene::Item::Object(object),
+        &view([0.3, 0.3, 0.0]),
+        true,
+    )
+    .unwrap();
+    let Some(Entity::Body(name)) = m.selection().cloned() else {
+        panic!("a body")
+    };
+    assert!(
+        m.scene().joints.iter().any(|j| j.name == name),
+        "named as its body"
+    );
+    let said = s::new_spec(m.scene(), m.doc(), s::CONTROL_HZ);
+    let c = &said.success.clauses[0];
+    assert_eq!(
+        (c.subject.as_str(), c.relation),
+        (name.as_str(), Relation::Still)
+    );
+    put(&mut m, said).expect("it compiles");
+    let _ = std::fs::remove_dir_all(root);
 }
