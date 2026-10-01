@@ -421,7 +421,7 @@ every committed document lowers to the same `Expr` as before.
   only as a literal, the reason `near` a point is a per-lane `Normalize`), and a region the
   editor writes is unrotated, so a rotated site — itself or any body above it — is refused by
   name, and so is a site that moves (a joint on its body or above it). Inside is strict: on a
-  face is outside. `inside` a region takes no shaping yet.
+  face is outside. `inside` a region took no shaping until R5 (section 4.7.1).
 - **Subjects.** `<body>.x` of a free body stays its free joint's first `qpos` lane (G3a's form;
   the SO-101 hash depends on it). Every other `<body>.x|y|z` — `y`, `z`, and `x` of a body
   without a free joint — is a `Slice` of `GetBodyPose.pos`, for `still` of
@@ -610,6 +610,40 @@ inside the robot's base. Oracles `crates/es-script/tests/estask.rs` (`scene_pose
   `shadow_hand_repose.estask` would fix that, and would move the committed `task_hash` and with
   it the trained teacher's documents; so101_views' cube would also gain its quaternion (identity,
   as the backend already read it). Left as committed.
+
+### 4.7.1 What R5 settled (shaping toward a region; joints at `qpos0`)
+
+M17's review, N-2 and F-9. Oracles `crates/es-script/tests/estask.rs` (`region_distance`),
+`estask_scripted.rs` (`inside_a_region_pays_the_distance_to_its_centre`) and
+`crates/es-editor-scene/tests/sentences.rs` (`the_region_distance_toggle_is_one_undo_step`).
+
+- **`inside` a region takes `shaping = "distance"`**: `weight × ‖p − c‖`, `p` the body's world
+  position, `c` the region's centre (section 4.4's), the distance clamped to [0, 1] m as `near`'s
+  is. It is `near` a point's construction: `GetBodyPose.pos`, a per-lane `Normalize`
+  `[c − 1, c + 1] → [−1, 1]`, `Norm L2`, `Normalize [0, 1] → [0, 1]`, `Reward`. Each lane clamps
+  at 1 m, which changes nothing: a lane past 1 m puts the distance past 1 m, where the term is
+  clamped anyway. The term is `term`, absent `<subject>_distance`. Opt-in: without `shaping` the
+  clause compiles as before (G3c's tests unchanged; on GV's project an unshaped region clause has
+  the same `task_hash` and the same document bytes as before R5).
+- **The sentences.** The region clause shows the shaping toggle and its levels as the other forms
+  do (a distance costs: medium is `weight = −1`). A newly picked "inside a region" — a new clause,
+  or a relation or subject change that lands on it — starts on at medium, unless the clause had a
+  distance term to keep (G8's rule: the shaping stays when the form does, so `near` shaped at high
+  that becomes `inside` stays at high). Picking the relation the clause already has changes
+  nothing, so a toggle turned off stays off. "Say the task"'s clause is still the first free body
+  still; it gains the term only where it lands on a region, a scene with no free body.
+- **F-9: no joint starts away from its `qpos0`.** `SceneDesc` has no `ref`: the MJCF parser warns
+  that the attribute is not represented and drops it, `.esscene` has no such field, and the
+  backends' MuJoCo model is written from `SceneDesc` (`scene_to_mjcf`). So every hinge and slide's
+  `qpos0` is 0 in the model the pipeline runs, the pose the file draws, and `Env::reset`'s zero is
+  that `qpos0`. No committed scene has a `ref` either (nor a ball joint; the only floating-base
+  robot, `go1_primitives.xml`, is in no `.estask`, and M6's `task.toml` is not compiled). Nothing
+  is emitted for any committed, GV or library scene, and no code was added. What would change it
+  is `ref` in `SceneDesc`, an `es-assets` packet
+  (the parser, the `.esscene` field, both MJCF writers, `scene_hash` appending it only when non-zero
+  as the appearance block does); then `scene_poses` emits a constant `ResetState` for each unset
+  hinge or slide whose `ref` is not 0 (stream `scene.<joint>`), and none under `zero_unset = true`.
+  `a_hinges_ref_is_not_represented_and_nothing_is_emitted` fails the day `ref` is parsed.
 
 ## 5. The editor (① and ②)
 

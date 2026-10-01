@@ -402,8 +402,8 @@ shaping = ["orientation", "distance"]
   들어간다. 콘에는 벡터를 회전시킬 상수 노드가 없고(세계의 점은 리터럴로만 들어온다 — 점에
   대한 `near`가 레인별 `Normalize`인 이유다), 에디터가 쓰는 영역은 회전이 없다. 그래서 회전한
   사이트는(자신이든 위의 어느 바디든) 이름으로 거부하고, 움직이는 사이트(자기 바디나 그 위에
-  관절이 있는 것)도 거부한다. 안쪽은 엄격하다: 면 위는 바깥이다. 영역 `inside`에는 아직
-  성형이 없다.
+  관절이 있는 것)도 거부한다. 안쪽은 엄격하다: 면 위는 바깥이다. 영역 `inside`에는 R5 전까지
+  성형이 없었다(4.7.1절).
 - **주어.** 자유 바디의 `<body>.x`는 여전히 자유 관절의 첫 `qpos` 레인이다(G3a의 형태.
   SO-101의 해시가 거기에 달려 있다). 나머지 `<body>.x|y|z` — `y`, `z`, 그리고 자유 관절이 없는
   바디의 `x` — 는 `GetBodyPose.pos`의 `Slice`이고, `still`에서는 `GetBodyVelocity.linear`의
@@ -573,6 +573,37 @@ GV의 직접 만든 프로젝트(SO-101, (0.22, 0, 0.025)의 5 cm 상자, 시작
   `shadow_hand_repose.estask`에서 `zero_unset`을 빼면 고쳐지지만, 커밋된 `task_hash`가 움직이고
   그와 함께 학습된 교사의 문서도 움직인다. so101_views의 큐브도 쿼터니언(항등, 백엔드가 이미 그렇게
   읽던 값)을 얻게 된다. 커밋된 대로 둔다.
+
+### 4.7.1 R5가 정한 세부 (영역 쪽으로 이끄는 성형, `qpos0`의 관절)
+
+M17 리뷰의 N-2와 F-9. 오라클은 `crates/es-script/tests/estask.rs`(`region_distance`),
+`estask_scripted.rs`(`inside_a_region_pays_the_distance_to_its_centre`),
+`crates/es-editor-scene/tests/sentences.rs`(`the_region_distance_toggle_is_one_undo_step`).
+
+- **영역 `inside`는 `shaping = "distance"`를 받는다**: `weight × ‖p − c‖`. `p`는 바디의 세계 위치,
+  `c`는 영역의 중심(4.4절의 중심)이고, 거리는 `near`처럼 [0, 1] m로 자른다. 점에 대한 `near`와 같은
+  구성이다: `GetBodyPose.pos`, 레인별 `Normalize` `[c − 1, c + 1] → [−1, 1]`, `Norm L2`,
+  `Normalize [0, 1] → [0, 1]`, `Reward`. 레인마다 1 m에서 잘리지만 결과는 같다: 한 레인이 1 m를
+  넘으면 거리도 1 m를 넘고, 항은 어차피 거기서 잘린다. 항 이름은 `term`, 없으면 `<subject>_distance`.
+  켜야 생긴다: `shaping`이 없으면 절은 전과 같이 컴파일된다(G3c의 테스트는 그대로다. GV의
+  프로젝트에서 성형 없는 영역 절은 R5 이전과 같은 `task_hash`, 같은 문서 바이트를 낸다).
+- **문장.** 영역 절은 다른 형태처럼 성형 토글과 단계를 보인다(거리는 비용: 보통은 `weight = −1`).
+  "영역 안"을 새로 고르면 — 새 절이든, 관계나 주어를 바꿔 거기에 이르든 — 보통 단계로 켜진 채
+  시작한다. 단, 지킬 거리 항이 이미 있으면 그것을 지킨다(G8의 규칙: 형태가 같으면 성형을 그대로
+  둔다. 그래서 많이로 성형된 `near`가 `inside`가 되면 많이 그대로다). 절이 이미 가진 관계를 다시
+  고르면 아무것도 바뀌지 않으므로, 꺼 둔 토글은 꺼진 채다. "과제 정하기"의 절은 여전히 첫 자유
+  바디의 멈춤이다. 그 절이 영역에 이를 때만, 곧 자유 바디가 없는 장면에서만 이 항을 얻는다.
+- **F-9: `qpos0`에서 벗어나 시작하는 관절은 없다.** `SceneDesc`에는 `ref`가 없다: MJCF 파서는 이
+  속성이 표현되지 않는다고 경고하고 버린다. `.esscene`에도 그런 필드가 없고, 백엔드의 MuJoCo
+  모델은 `SceneDesc`에서 쓴다(`scene_to_mjcf`). 그래서 파이프라인이 돌리는 모델에서 모든 경첩과
+  미끄럼 관절의 `qpos0`은 0, 곧 파일이 그린 자세이고, `Env::reset`의 0이 바로 그 `qpos0`이다.
+  커밋된 장면에도 `ref`는 없다(볼 관절도 없다. 떠 있는 받침의 로봇은 `go1_primitives.xml` 하나인데
+  어느 `.estask`에도 쓰이지 않는다. M6의 `task.toml`은 컴파일되지 않는다). 커밋된 장면, GV의
+  장면, 라이브러리의 장면 어디에도 나오는 노드가 없으므로 코드를 더하지 않았다. 이것을 바꾸려면 `SceneDesc`에 `ref`가 들어와야 한다. `es-assets`
+  패킷이다(파서, `.esscene` 필드, 두 MJCF 작성기, 외관 블록처럼 0이 아닐 때만 덧붙이는
+  `scene_hash`). 그다음 `scene_poses`가 정하지 않은 경첩과 미끄럼 관절 가운데 `ref`가 0이 아닌
+  것마다 상수 `ResetState`를 내고(스트림 `scene.<joint>`), `zero_unset = true`에서는 내지 않는다.
+  `ref`를 읽게 되는 날 `a_hinges_ref_is_not_represented_and_nothing_is_emitted`가 실패한다.
 
 ## 5. 에디터 (①과 ②)
 
