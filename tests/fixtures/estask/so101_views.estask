@@ -41,3 +41,37 @@ cameras = ["overhead", "wrist", "side"]
 camera_px = 96
 state = { joint_state = "robot.joint_pos" }
 privileged = { sim_cube_pose = "cube.qpos" }
+
+# --- the other documents (packet G3b): `es project generate` writes plan N's three-view arm ---
+
+# The SO-101 demos' student form (U3's), seen by all three cameras; 16 rows predicted, 10
+# executed, replanning at 5 Hz.
+[student]
+name = "views"
+preset = "u3"
+horizon = 16
+execute = 10
+
+# Where plan N's first collection lives.
+[student.training.dataset]
+root = "runs/collect-001/ds"
+frames = "runs/collect-001/frames"
+
+[student.training.policy]
+bundle = "runs/collect-001/untrained.esb"
+
+[deploy]
+name = "so101"
+workspace = { min = [-0.45, -0.45, -0.01], max = [0.45, 0.45, 0.6] }
+
+[evaluate]
+first_seed = 101
+episodes = 16
+
+# 200 expert demonstrations on seed 1, evaluated on every suite.
+[cycle]
+expert = "so101-pick-place"
+episodes = 200
+seed = 1
+jobs = 6
+showcase = { cell = "nominal-00", eye = [0.66, -0.46, 0.52], look_at = [0.14, -0.04, 0.04], fov = 36, width = 1280, height = 720 }

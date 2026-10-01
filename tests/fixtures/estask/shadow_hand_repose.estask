@@ -41,3 +41,44 @@ privileged = { cube_pose = "object.pose", object_vel = "object.vel" }
 [reward]
 scale = 0.01
 success = 250.0
+
+# --- the other documents (packet G3b): `es project generate` writes plan H's set from here ---
+
+# The PPO teacher reads what the simulator knows, in this order (its state vector's layout).
+[teacher]
+state = ["joint_pos", "joint_vel", "cube_pose", "object_vel", "goal_pose", "last_action"]
+
+# The run plan H's E1 measured (training-teacher-v2.toml) is the preset; its bundle's name.
+[teacher.training.policy]
+bundle = "runs/shadow-hand/teacher-untrained-v2.esb"
+
+# The three-view student reads the hand's joints and the goal, never the cube's pose; it
+# predicts 16 rows (0.27 s) and executes 6, replanning at 10 Hz.
+[student]
+state = ["joint_pos", "target_qpos"]
+horizon = 16
+execute = 6
+
+# Plan N's E1/E2 length: three times the preset's 20,000 steps.
+[student.training.run]
+steps = 60000
+checkpoint_at = [1000, 5000, 20000, 60000]
+
+[deploy]
+name = "shadow_hand"
+workspace = { min = [0.7, 0.5, 0.0], max = [1.3, 1.5, 0.6] }
+
+# 64 held-out seeds, outside the cycle's 1001-1300.
+[evaluate]
+first_seed = 301
+episodes = 64
+
+# The teacher demonstrates 300 episodes; its successes train the student, judged on the
+# nominal suite (six suites of three 32-spp cameras is ~14 h on this PC).
+[cycle]
+runs = "runs/shadow-hand"
+episodes = 300
+seed = 1001
+success_only = true
+nominal_only = true
+jobs = 4

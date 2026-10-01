@@ -353,6 +353,12 @@ mod generated {
                 start: b.2,
                 observe: b.3,
                 reward: b.4,
+                // G3b's sections: their round trip is `estask_generate.rs`'s, on the fixtures.
+                teacher: None,
+                student: None,
+                deploy: None,
+                evaluate: None,
+                cycle: None,
             })
     }
 

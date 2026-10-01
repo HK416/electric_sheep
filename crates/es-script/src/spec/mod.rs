@@ -8,6 +8,11 @@
 //! radians except `within_deg`, times seconds.
 
 mod compile;
+mod generate;
+mod learning;
+mod project;
+mod recipes;
+mod robot;
 
 use std::collections::BTreeMap;
 
@@ -16,6 +21,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use compile::compile_task;
+pub use generate::{generate, Document};
+pub use project::{BoxDoc, CycleDoc, Deploy, Evaluate, Family, Preset, Student, Teacher};
 
 /// Why a specification did not read or compile. A refusal names where and which field.
 #[derive(Debug, Error)]
@@ -61,8 +68,9 @@ pub struct TaskSpec {
     /// The scene file (`.esscene`, MJCF, URDF), relative to the project root [`compile_task`]
     /// is given; written into `SceneRef.path` as it is written here.
     pub scene: String,
-    /// The robot's root body. Its subtree's joints are `robot.joints`; the scene's actuators
-    /// are its action.
+    /// The robot's root body, or an `.esscene` `[[include]]` naming it (its one root body whose
+    /// subtree has joints). Its subtree's joints are `robot.joints`; the scene's actuators are
+    /// its action.
     pub robot: String,
     pub control_hz: f64,
     /// The episode budget; `control_hz × timeout_s` control steps.
@@ -78,6 +86,17 @@ pub struct TaskSpec {
     pub observe: Option<Observe>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reward: Option<RewardDoc>,
+    // The other documents' sections (packet G3b, `project.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub teacher: Option<Teacher>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub student: Option<Student>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy: Option<Deploy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluate: Option<Evaluate>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle: Option<CycleDoc>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]

@@ -54,7 +54,8 @@ pub fn compile_task(spec: &TaskSpec, root: &Path) -> Result<TaskIr, SpecError> {
             format!("{steps} control steps at control_hz is not a whole number"),
         );
     }
-    let mut c = Compiler::new(spec, &scene)?;
+    let robot = super::robot::root_body(spec, root, &scene)?;
+    let mut c = Compiler::new(spec, &scene, &robot)?;
     if let Some(observe) = &spec.observe {
         c.observe(observe)?;
     }
@@ -101,7 +102,7 @@ pub fn compile_task(spec: &TaskSpec, root: &Path) -> Result<TaskIr, SpecError> {
 /// What `es_tools::backend::load_scene` does (a layer-11 sibling, so not callable here): the
 /// scene by extension, then its mesh files relative to its directory. Also the file's bytes,
 /// whose digest is `SceneRef.asset_hash`, as in every committed document.
-fn load_scene(path: &Path) -> Result<(SceneDesc, Vec<u8>), String> {
+pub(super) fn load_scene(path: &Path) -> Result<(SceneDesc, Vec<u8>), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let raw = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -139,8 +140,8 @@ struct Compiler<'a> {
 }
 
 impl<'a> Compiler<'a> {
-    fn new(spec: &'a TaskSpec, scene: &'a SceneDesc) -> Result<Self, SpecError> {
-        let Some(root) = scene.bodies.iter().find(|b| b.name == spec.robot) else {
+    fn new(spec: &'a TaskSpec, scene: &'a SceneDesc, robot: &str) -> Result<Self, SpecError> {
+        let Some(root) = scene.bodies.iter().find(|b| b.name == robot) else {
             return refuse("task-spec", "robot", no("body", &spec.robot));
         };
         // Bodies come parent first (MJCF's tree order, G1's `parent` names one defined before).
