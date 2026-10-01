@@ -1590,9 +1590,10 @@ const LEARNING_STUDENT_HEADER: &str = "\
 # envelope exactly (soft margin 0), and the teacher's saturated tanh leaves its demonstrations
 # on and near those limits. The first student (runs/shadow-hand/student-001) had an unsquashed
 # head: it fitted the demonstrations to ~1 mrad -- the scale was right, slope 1.000 on every
-# channel -- but crossed a limit by up to 3.6 mrad on 74 % of its training frames, and the
-# plane clamped and counted 96.8 % of its evaluation ticks. A tanh head, the teacher's own,
-# cannot leave the envelope.
+# channel -- but crossed a limit by up to 3.6 mrad on 74 % of its training frames, and on the
+# states of a fresh evaluation seed its head reached 1.43 (0.20 rad past a limit) on every
+# frame: the plane clamped and counted 96.8 % of its evaluation ticks. A tanh head, the
+# teacher's own, cannot leave the envelope.
 #
 # WHY CONCAT, NOT learning-mad.toml's shared encoder + Sum: MAD's gain is deploying on fewer
 # cameras without retraining, and this student is deployed with the three it is trained on.
@@ -2004,8 +2005,9 @@ fn the_student_documents_agree_and_check() {
 /// margin 0). So the head before it must be bounded to `[-1, 1]`: the teacher's is `tanh`, and
 /// the student's was an unsquashed regression. The teacher's saturated `tanh` leaves its
 /// demonstrations on and near the limits; the student fitted them to ~1 mrad and crossed by up
-/// to 3.6 mrad on 74 % of its training frames, which the plane counted on 96.8 % of the
-/// evaluation's ticks (`runs/shadow-hand/student-001`, `envelope_violation_rate` 0.968).
+/// to 3.6 mrad on 74 % of its training frames, and on a fresh seed's states its head reached
+/// 1.43 (0.20 rad past a limit) on every frame; the plane counted 96.8 % of the evaluation's
+/// ticks (`runs/shadow-hand/student-001`, `envelope_violation_rate` 0.968).
 ///
 /// `head * std + mean` is evaluated in f32, as the lowered module does. The tolerance is one f32
 /// rounding: channel 1's limits (-0.698, 0.489) are not both reachable exactly from an f32

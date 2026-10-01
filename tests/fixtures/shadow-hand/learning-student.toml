@@ -19,9 +19,10 @@
 # envelope exactly (soft margin 0), and the teacher's saturated tanh leaves its demonstrations
 # on and near those limits. The first student (runs/shadow-hand/student-001) had an unsquashed
 # head: it fitted the demonstrations to ~1 mrad -- the scale was right, slope 1.000 on every
-# channel -- but crossed a limit by up to 3.6 mrad on 74 % of its training frames, and the
-# plane clamped and counted 96.8 % of its evaluation ticks. A tanh head, the teacher's own,
-# cannot leave the envelope.
+# channel -- but crossed a limit by up to 3.6 mrad on 74 % of its training frames, and on the
+# states of a fresh evaluation seed its head reached 1.43 (0.20 rad past a limit) on every
+# frame: the plane clamped and counted 96.8 % of its evaluation ticks. A tanh head, the
+# teacher's own, cannot leave the envelope.
 #
 # WHY CONCAT, NOT learning-mad.toml's shared encoder + Sum: MAD's gain is deploying on fewer
 # cameras without retraining, and this student is deployed with the three it is trained on.
