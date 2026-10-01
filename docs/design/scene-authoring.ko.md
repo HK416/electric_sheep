@@ -80,9 +80,16 @@ mass = 0.216
 friction = [1.0, 0.0, 0.0]
 material = "block"
 
+[[texture]]
+name = "block"
+file = "textures/block.png"
+kind = "cube"
+gridsize = [3, 4]
+gridlayout = ".U..LFRB.D.."
+
 [[material]]
 name = "block"
-texture = { file = "textures/block.png", kind = "cube", gridsize = [3, 4], gridlayout = ".U..LFRB.D.." }
+texture = "block"
 roughness = 0.6
 
 [[camera]]
@@ -100,7 +107,7 @@ intensity = 1.0
 
 [[region]]                      # a site: no collision, no mass; sentences name it
 name = "target_area"
-shape = { box = [0.1, 0.1, 0.01] }
+size = [0.1, 0.1, 0.01]
 pos = [0.25, 0.0, 0.0]
 ```
 
@@ -135,6 +142,56 @@ pos = [0.25, 0.0, 0.0]
 하나로(카메라, 조명, 재질, 텍스처, 텐던, 쌍, gravcomp — `SceneDesc`가 담는 모든 것) 자산을
 옆에 두고 쓴다. `es-assets`(계층 2)의 완전 충실도 라이터이며, 동역학이 없는 것은 일부러
 버리는 `es-physics-backend`의 `mjcf_out`이 아니다. URDF와 USD 내보내기는 나중 항목이다.
+
+### 3.4 G1이 정한 세부 (구현된 스키마)
+
+`crates/es-assets/src/esscene/`(`EsScene::from_toml` / `to_toml`, `expand`), 오라클
+`crates/es-assets/tests/esscene.rs`. 위 예시와 다른 점과 위에서 열어 둔 점:
+
+- **최상위**: `kind = "scene"`, `schema = 1`, `name`(`SceneDesc::name`, 해시 입력; 없으면
+  `"scene"`), `[physics]`(필드마다 선택, 없으면 MuJoCo 기본값; `integrator`는
+  `euler|rk4|implicit|implicitfast`), `[[geom]]`(월드 바디에 붙는 정적 배경 — 테이블, 바닥,
+  통). 모든 선택 필드는 `Option`이라 쓴 것만 다시 쓴다(읽기 ∘ 쓰기 = 항등, 속성 테스트).
+- **인클루드**: `name`은 문서 안의 손잡이(과제가 로봇을 이 이름으로 부른다)이고, 이름 접두사는
+  따로 `prefix`다. 없으면 파일 자신의 이름과 **id**를 그대로 쓴다(거울 오라클이 성립하는 이유).
+  있으면 모든 이름 앞에 붙이고 id를 MJCF 이름 경로 규칙으로 다시 만든다. 파일의 루트 바디는
+  월드 아래로 들어가고(감싸는 바디 없음), `pos`/`quat`가 단위가 아니면 루트 바디와 월드 수준
+  요소에 합성된다. 파일이 이름 붙인 메시·텍스처 경로는 문서 디렉터리 기준으로 다시 붙는다.
+  파일의 `<option>`과 모델 이름은 읽지 않는다(장면의 것은 문서의 `[physics]`와 `name`).
+  `[include.set.joint.<이름>]`(`range`, `damping`, `armature`, `stiffness`, `frictionloss`),
+  `[include.set.actuator.<이름>]`(`kp`, `kv`, `ctrlrange`, `forcerange`),
+  `[include.set.geom.<이름>]`(`rgba`, `material` — 파일의 재질 또는 문서의 재질). 없는 대상은
+  필드 이름으로 거부한다. MJCF·URDF·glTF는 읽고, **USD는 거부한다**: `es-usd`는 같은 계층 2의
+  형제이고 `SceneDesc`가 아니라 stage를 준다(USD 인클루드는 나중 항목).
+- **바디**: `parent`는 앞서 정의된 바디(인클루드된 것 포함)의 이름, 없으면 월드. `joint = { kind,
+  name, axis, pos, range, damping, armature, stiffness, frictionloss, springref }` — `kind`는
+  `fixed|free|ball|hinge|slide`(`fixed`와 없음은 용접, MJCF처럼 관절을 내지 않는다), `name`이
+  없으면 바디 이름. `inertial = { mass, pos, quat, diaginertia | fullinertia }`, `gravcomp`.
+  `[[body.geom]]`의 `shape`는 `{ plane | sphere | capsule | cylinder | box | ellipsoid = 크기 }`
+  또는 `{ mesh = "파일" }`(자산 이름은 파일 줄기); 이름이 없으면 MJCF처럼 `geom<n>`.
+- **텍스처는 이름 붙은 `[[texture]]`**이고 재질은 슬롯(`texture`, `orm`, `metallic_map`,
+  `roughness_map`, `normal_map`, `emissive_map`)마다 그 이름을 쓴다: 텍스처 하나를 재질 둘이
+  나눠 쓰므로(Shadow Hand의 큐브와 목표) 인라인으로 둘 수 없다. MJCF처럼 `rgba`만 쓴 재질은
+  이름일 뿐 그려지는 재질이 아니다.
+- **카메라**: `fovy`는 도(MJCF와 같은 변환), `parent`가 없으면 월드에 고정.
+- **조명**: 오늘의 렌더러가 받는 그대로 — 월드에 놓인 얇은 발광 상자 `<name>_light`(`size`는
+  x·y 반폭, 두께 반폭 0.005 m, `rgba = [rgb × intensity, 1]`, 충돌 없음). `kind`는 지금
+  `area` 하나.
+- **영역**: 사이트다. `SceneDesc::Site`에 모양이 없으므로 `shape`가 아니라 `size`(반폭).
+- **쿼터니언 비트**: 이미 정규형(단위에서 1e-12 안, `w ≥ 0`)인 쿼터니언은 쓴 비트 그대로
+  저장하고, 그 밖의 것은 `Quat::normalize`로 정규화한다. 에디터가 `SceneDesc`의 비트를 다시
+  쓰므로 왕복이 비트를 바꾸지 않는다.
+- **순서**: 월드 바디, 인클루드들(차례로), 그다음 문서 자신의 것 — 월드 지오메트리와 조명,
+  텍스처와 재질, 바디, 카메라, 영역 — 각각 문서 순서. 거울 오라클(SO-101, Shadow Hand)은
+  `SceneDesc`의 모든 값과 순서, `scene_hash`(커밋된 문서들이 지닌 값), 에셋 내용 해시가 같음을
+  확인한다. 집합으로 비교하는 것은 `assets` 목록 하나다: Shadow Hand 파일은 큐브의 텍스처·재질을
+  손의 것 사이에 끼워 두는데 인클루드의 자산이 문서의 것보다 먼저 오며, 그 순서를 읽는 것은
+  없다(`scene_hash`가 정렬하고, 로더와 렌더러는 id로 찾는다). Shadow Hand의 바닥은 손 파일에
+  남는다: 빈 `floor0` 바디가 MuJoCo의 바디 순서에서 손보다 앞서기 때문이다. 에셋 경로는 해시
+  입력이므로 Shadow Hand 문서는 원래 파일 옆(`tests/fixtures/mjcf/shadow_hand/`)에 둔다.
+- `SceneRef.asset_hash`(커밋된 문서에서는 장면 *파일* 바이트의 blake3, M11의 열린 결정)는 파일이
+  다르면 당연히 다르다. 같은 것은 `SceneDesc`의 에셋별 해시다. `.esscene`에 대해 무엇을 넣을지
+  (인클루드 파일까지 덮을지)는 G3가 문서를 생성할 때 정한다.
 
 ## 4. 과제 명세 (`*.estask`)와 `es project generate`
 
