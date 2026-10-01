@@ -511,11 +511,12 @@
 "teach.teacher.runs" = "Teacher runs"
 "teach.teacher.no_runs" = "No teacher run yet."
 "teach.teacher.train" = "Train a new teacher"
-"teach.teacher.train.hint" = "es train on the template's teacher recipe ([rl] PPO on MuJoCo Warp), about 1 to 1.5 hours on this PC"
+"teach.teacher.train.hint" = "es train on the template's teacher recipe ([rl] PPO on MuJoCo Warp)"
 "teach.teacher.stop" = "Stop"
 "teach.teacher.job.train" = "Training teacher {}..."
 "teach.teacher.job.test" = "Testing step {}..."
 "teach.teacher.job.pack" = "Preparing the chosen teacher..."
+"teach.teacher.job.repack" = "Preparing step {} for its test..."
 "teach.teacher.queued" = "{} more waiting"
 "teach.teacher.ended" = "The last job did not finish: {}"
 "teach.teacher.curves" = "How teacher {} learned"
@@ -530,6 +531,9 @@
 "teach.teacher.use" = "Use as teacher"
 "teach.teacher.in_use" = "in use"
 "teach.teacher.time" = "Training a teacher takes about 1 to 1.5 hours on this PC, and testing one checkpoint a few minutes. The best test score is usually the teacher to use."
+"teach.teacher.time.live" = "The teacher training now has done {} of {} iterations; at its own pace about {} minutes are left. Testing one checkpoint takes a few minutes."
+"teach.teacher.time.measured" = "Training a teacher takes about {} minutes on this PC: teacher {} took {} s per iteration, and the recipe runs {} iterations. Testing one checkpoint takes a few minutes. The best test score is usually the teacher to use."
+"teach.teacher.time.first" = "How long training a teacher takes on this PC is measured by its first run. Testing one checkpoint takes a few minutes. The best test score is usually the teacher to use."
 
 # --- ② teach: the demonstration as action blocks (packet M14/Q3) ---------------------------------
 "teach.field.target" = "Target"

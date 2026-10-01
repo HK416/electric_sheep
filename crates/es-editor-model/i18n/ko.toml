@@ -513,11 +513,12 @@
 "teach.teacher.runs" = "교사 실행"
 "teach.teacher.no_runs" = "아직 교사 실행이 없습니다."
 "teach.teacher.train" = "새 교사 학습시키기"
-"teach.teacher.train.hint" = "템플릿의 교사 레시피로 es train 실행 ([rl] PPO, MuJoCo Warp), 이 PC에서 1~1.5시간쯤 걸립니다"
+"teach.teacher.train.hint" = "템플릿의 교사 레시피로 es train 실행 ([rl] PPO, MuJoCo Warp)"
 "teach.teacher.stop" = "멈추기"
 "teach.teacher.job.train" = "{}번 교사 학습 중..."
 "teach.teacher.job.test" = "{}단계 시험 중..."
 "teach.teacher.job.pack" = "고른 교사를 준비하는 중..."
+"teach.teacher.job.repack" = "{}단계를 시험하려고 준비하는 중..."
 "teach.teacher.queued" = "{}개 더 기다리는 중"
 "teach.teacher.ended" = "마지막 작업이 끝까지 가지 못했습니다: {}"
 "teach.teacher.curves" = "{}번 교사가 배워 온 과정"
@@ -532,6 +533,9 @@
 "teach.teacher.use" = "교사로 쓰기"
 "teach.teacher.in_use" = "사용 중"
 "teach.teacher.time" = "교사 학습은 이 PC에서 1~1.5시간, 단계 하나를 시험하는 데는 몇 분 걸립니다. 보통 시험 점수가 가장 높은 단계를 교사로 씁니다."
+"teach.teacher.time.live" = "지금 학습 중인 교사는 반복 {}번을 마쳤습니다 (모두 {}번). 지금 속도라면 {}분쯤 남았습니다. 단계 하나를 시험하는 데는 몇 분 걸립니다."
+"teach.teacher.time.measured" = "이 PC에서 교사 학습은 {}분쯤 걸립니다. {}번 교사가 반복 한 번에 {}초 걸렸고, 레시피는 {}번 반복합니다. 단계 하나를 시험하는 데는 몇 분 걸립니다. 보통 시험 점수가 가장 높은 단계를 교사로 씁니다."
+"teach.teacher.time.first" = "이 PC에서 교사 학습에 걸리는 시간은 첫 실행이 재어 줍니다. 단계 하나를 시험하는 데는 몇 분 걸립니다. 보통 시험 점수가 가장 높은 단계를 교사로 씁니다."
 
 # --- ② 가르치기: 동작 블록으로 보여 주는 시범 (작업 패킷 M14/Q3) ----------------------------------
 "teach.field.target" = "목표"

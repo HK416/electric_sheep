@@ -48,6 +48,9 @@ pub(crate) struct State {
     chosen: Option<Choice>,
     /// The selected run's curves as its folder has them.
     curves: Option<Result<TrainView, String>>,
+    /// The newest run's measured pace and the recipe's iterations: the card's time (M17/R7).
+    measured: Option<(u32, f64)>,
+    iterations: Option<u32>,
     note: Option<String>,
 }
 
@@ -127,6 +130,7 @@ fn open(app: &mut EditorApp) {
         .and_then(|_| maps_onto(&open.project.root, BackendKind::MjWarp).err());
     *s = State {
         project: Some(open.project.root.clone()),
+        iterations: (source.as_ref()).and_then(|(t, root)| teacher::iterations(t, root)),
         source,
         warp,
         jobs: std::mem::take(&mut s.jobs),
@@ -145,6 +149,7 @@ fn reload(s: &mut State) {
         return;
     };
     s.runs = project.teacher_runs();
+    s.measured = teacher::measured(&s.runs);
     s.chosen = teacher::chosen(&project);
     let numbers: Vec<u32> = s.runs.iter().map(|r| r.number).collect();
     if s.selected.is_none_or(|n| !numbers.contains(&n)) {
@@ -196,13 +201,15 @@ fn perform(app: &mut EditorApp, action: Action) {
             s.selected = Some(n);
             Ok(())
         }
+        // Packet M17/R7: packed first on documents saved since the checkpoint trained.
         Action::Test(steps) => {
             let run = selected(s).cloned();
             (run.into_iter().flat_map(|run| {
-                (steps.iter()).map(move |&step| teacher::evaluate(template, root, &run, step))
+                (steps.iter())
+                    .map(move |&step| teacher::test(template, root, &open.project, &run, step))
             }))
             .collect::<Result<Vec<_>, _>>()
-            .map(|all| all.into_iter().for_each(|argv| s.jobs.push(argv)))
+            .map(|all| all.into_iter().flatten().for_each(|argv| s.jobs.push(argv)))
         }
         Action::Use(step) => match selected(s).cloned() {
             None => Ok(()),
@@ -445,5 +452,8 @@ fn summary(app: &EditorApp, ui: &mut egui::Ui) {
         ui.label(RichText::new(line).color(colour(Colour::Optional)));
     }
     ui.separator();
-    ui.label(t(lang, "teach.teacher.time"));
+    let s = &app.teacher;
+    let live = s.jobs.training().map(|_| &app.telemetry.train);
+    let time = teacher::time_text(lang, live, s.measured, s.iterations, template.generated);
+    ui.label(time);
 }

@@ -11,6 +11,7 @@
 //! teacher/001/            `es train --out teacher/001`, plus
 //!   recipe.toml           the template's recipe, `[policy] bundle` = teacher-untrained.esb
 //!   eval/<step>/          `es eval run --out`, one per judged checkpoint
+//!   repacked/<step>.esb   a checkpoint packed on documents saved since it trained, for its test
 //! teacher-untrained.esb   `es policy init` of the template's `[teacher]` documents
 //! teacher.esb             the chosen checkpoint; `teacher.toml` names its run and step
 //! ```
@@ -28,6 +29,7 @@ use crate::model::launch::LaunchModel;
 use crate::model::project::{Project, ProjectError, RunFolder};
 use crate::model::results::card;
 use crate::model::template::{TeacherDocs, Template};
+use crate::model::train_view::TrainView;
 
 /// The recipe a teacher run ran, written into its folder before launch.
 pub const RECIPE: &str = "recipe.toml";
@@ -38,6 +40,8 @@ pub const CHOICE: &str = "teacher.toml";
 const EVAL: &str = "eval";
 const CHECKPOINTS: &str = "checkpoints";
 const REPORT: &str = "report.json";
+/// A checkpoint re-packed on the current documents for its test (packet M17/R7).
+const REPACKED: &str = "repacked";
 
 fn fail(path: &Path, e: impl std::fmt::Display) -> ProjectError {
     ProjectError(format!("{}: {e}", path.display()))
@@ -173,7 +177,10 @@ pub fn untrained(
     )
     .map_err(|e| ProjectError(format!("template {}: {e}", template.id)))?;
     let path = project.root.join(UNTRAINED);
-    std::fs::write(&path, bytes).map_err(|e| fail(&path, e))?;
+    // Unchanged, it is not rewritten: a teacher training now may be reading it.
+    if std::fs::read(&path).ok().as_ref() != Some(&bytes) {
+        std::fs::write(&path, bytes).map_err(|e| fail(&path, e))?;
+    }
     Ok(path)
 }
 
@@ -215,6 +222,40 @@ pub fn evaluate(
     run: &RunFolder,
     step: u32,
 ) -> Result<Vec<String>, ProjectError> {
+    eval_argv(template, repo, run, step, &checkpoint(run, step))
+}
+
+/// The jobs that test checkpoint `step` (packet M17/R7): its evaluation, and before it, when its
+/// documents are not the untrained teacher's - rebuilt from the current ones, which a save in ①
+/// may have regenerated since it trained - `es policy pack` of its weights on that teacher into
+/// `repacked/<step>.esb`, which is then what is evaluated (`es eval run` refuses a bundle built
+/// on other documents, spec 10.4).
+pub fn test(
+    template: &Template,
+    repo: &Path,
+    project: &Project,
+    run: &RunFolder,
+    step: u32,
+) -> Result<Vec<Vec<String>>, ProjectError> {
+    let untrained = untrained(template, repo, project)?;
+    if same_documents(&open(&checkpoint(run, step))?.1, &open(&untrained)?.1) {
+        return Ok(vec![evaluate(template, repo, run, step)?]);
+    }
+    let repacked = run.path.join(REPACKED).join(format!("{step}.esb"));
+    remove(&repacked)?;
+    Ok(vec![
+        pack(&untrained, run, step, &repacked),
+        eval_argv(template, repo, run, step, &repacked)?,
+    ])
+}
+
+fn eval_argv(
+    template: &Template,
+    repo: &Path,
+    run: &RunFolder,
+    step: u32,
+    policy: &Path,
+) -> Result<Vec<String>, ProjectError> {
     let t = docs(template)?;
     Ok(vec![
         "eval".into(),
@@ -222,7 +263,7 @@ pub fn evaluate(
         "--config".into(),
         arg(&repo.join(&t.evaluation)),
         "--policy".into(),
-        arg(&checkpoint(run, step)),
+        arg(policy),
         "--scene".into(),
         arg(&repo.join(&template.scene)),
         "--out".into(),
@@ -260,19 +301,10 @@ pub fn choose(
     step: u32,
 ) -> Result<Chose, ProjectError> {
     let untrained = untrained(template, repo, project)?;
-    let ckpt = checkpoint(run, step);
-    let open = |path: &Path| {
-        let bytes = std::fs::read(path).map_err(|e| fail(path, e))?;
-        let bundle = PolicyBundle::open(&bytes).map_err(|e| fail(path, e))?;
-        Ok::<_, ProjectError>((bytes, bundle.manifest.hashes))
-    };
-    let (bytes, hashes) = open(&ckpt)?;
+    let (bytes, hashes) = open(&checkpoint(run, step))?;
     let same = same_documents(&hashes, &open(&untrained)?.1);
     let target = project.teacher_bundle();
-    match std::fs::remove_file(&target) {
-        Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(fail(&target, e)),
-        _ => {}
-    }
+    remove(&target)?;
     Choice {
         run: run.number,
         step,
@@ -282,28 +314,111 @@ pub fn choose(
         std::fs::write(&target, bytes).map_err(|e| fail(&target, e))?;
         return Ok(Chose::Copied);
     }
+    Ok(Chose::Pack(pack(&untrained, run, step, &target)))
+}
+
+/// A bundle's bytes and its hashes.
+fn open(path: &Path) -> Result<(Vec<u8>, BundleHashes), ProjectError> {
+    let bytes = std::fs::read(path).map_err(|e| fail(path, e))?;
+    let bundle = PolicyBundle::open(&bytes).map_err(|e| fail(path, e))?;
+    Ok((bytes, bundle.manifest.hashes))
+}
+
+/// Gone, or never there: a pack that fails then leaves nothing under the name it was to write.
+fn remove(path: &Path) -> Result<(), ProjectError> {
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(fail(path, e)),
+        _ => Ok(()),
+    }
+}
+
+/// `es policy pack` of checkpoint `step`'s weights on `untrained`, into `out`.
+fn pack(untrained: &Path, run: &RunFolder, step: u32, out: &Path) -> Vec<String> {
     let weights = (run.path.join("weights")).join(format!("model-{step}.safetensors"));
-    Ok(Chose::Pack(vec![
+    vec![
         "policy".into(),
         "pack".into(),
         "--policy".into(),
-        arg(&untrained),
+        arg(untrained),
         "--weights".into(),
         arg(&weights),
         "--out".into(),
-        arg(&target),
-    ]))
+        arg(out),
+    ]
+}
+
+/// Seconds per iteration a finished teacher run took (packet M17/R7): the wall clock over the
+/// iterations of `metrics/env-metrics.json`, which `train_ppo.py` writes beside its loss curve.
+pub fn pace(run: &RunFolder) -> Option<f64> {
+    let text = std::fs::read_to_string(run.path.join("metrics/env-metrics.json")).ok()?;
+    let m: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let (wall, n) = (m["wall_clock_s"].as_f64()?, m["iterations"].as_f64()?);
+    (wall > 0.0 && n > 0.0).then(|| wall / n)
+}
+
+/// The newest of `runs` that measured its [`pace`], by number.
+pub fn measured(runs: &[RunFolder]) -> Option<(u32, f64)> {
+    runs.iter().rev().find_map(|r| Some((r.number, pace(r)?)))
+}
+
+/// The iterations the template's teacher recipe runs, `[run] steps`.
+pub fn iterations(template: &Template, repo: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(repo.join(&docs(template).ok()?.recipe)).ok()?;
+    Some(Recipe::parse(&text).ok()?.run.steps)
+}
+
+/// What the card says about time (packet M17/R7). While `live`, the run training now, has a
+/// rate: its iterations done of the total and what is left at its own pace. Else a `measured`
+/// run's pace times the recipe's `iterations`. Else, on `generated` documents, that the first
+/// run measures it; a built-in template keeps its own sentence.
+pub fn time_text(
+    lang: Lang,
+    live: Option<&TrainView>,
+    measured: Option<(u32, f64)>,
+    iterations: Option<u32>,
+    generated: bool,
+) -> String {
+    let minutes = |s: f64| format!("{:.0}", (s / 60.0).max(1.0));
+    let live = live.and_then(|v| {
+        let total = v.total()?;
+        Some((v.step()?, total, v.eta(total)?))
+    });
+    if let Some((done, total, left)) = live {
+        let left = minutes(left.as_secs_f64());
+        return fill(
+            lang,
+            "teach.teacher.time.live",
+            &[&done.to_string(), &total.to_string(), &left],
+        );
+    }
+    match (measured, iterations) {
+        (Some((run, pace)), Some(n)) => fill(
+            lang,
+            "teach.teacher.time.measured",
+            &[
+                &minutes(pace * f64::from(n)),
+                &format!("{run:03}"),
+                &format!("{pace:.2}"),
+                &n.to_string(),
+            ],
+        ),
+        _ if generated => t(lang, "teach.teacher.time.first").to_owned(),
+        _ => t(lang, "teach.teacher.time").to_owned(),
+    }
 }
 
 /// What a job of [`Jobs`] is doing, in words: training which teacher, testing which step, or
-/// preparing the chosen teacher.
+/// preparing the chosen teacher or a step for its test.
 pub fn job_text(lang: Lang, argv: &[String]) -> String {
-    let out = (argv.windows(2).find(|w| w[0] == "--out"))
-        .and_then(|w| Path::new(&w[1]).file_name())
+    let out = (argv.windows(2).find(|w| w[0] == "--out")).map(|w| Path::new(&w[1]));
+    let name = (out.and_then(Path::file_stem))
         .map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let repack =
+        (out.and_then(Path::parent).and_then(Path::file_name)).is_some_and(|n| n == REPACKED);
     match argv.first().map(String::as_str) {
-        Some("train") => fill(lang, "teach.teacher.job.train", &[&out]),
-        Some("eval") => fill(lang, "teach.teacher.job.test", &[&out]),
+        Some("train") => fill(lang, "teach.teacher.job.train", &[&name]),
+        Some("eval") => fill(lang, "teach.teacher.job.test", &[&name]),
+        _ if repack => fill(lang, "teach.teacher.job.repack", &[&name]),
         _ => t(lang, "teach.teacher.job.pack").to_owned(),
     }
 }
@@ -555,11 +670,124 @@ pub(crate) mod tests {
         };
         let train = vec!["train".into(), "--out".into(), arg(&run.path)];
         let test = evaluate(&hand(), &repo(), &run, 1750).unwrap();
+        let repack = pack(
+            Path::new("u.esb"),
+            &run,
+            1750,
+            &run.path.join("repacked/1750.esb"),
+        );
         for lang in Lang::ALL {
             assert!(job_text(lang, &train).contains("002"));
             assert!(job_text(lang, &test).contains("1750"));
             let pack = job_text(lang, &["policy".into(), "pack".into()]);
             assert_ne!(pack, "teach.teacher.job.pack");
+            assert!(job_text(lang, &repack).contains("1750"));
         }
+    }
+
+    /// Packet M17/R7 (F-1): a checkpoint on the teacher's documents is tested as before; one on
+    /// other documents is first packed on the untrained teacher, and its re-pack is tested.
+    #[test]
+    fn a_checkpoint_on_other_documents_is_repacked_for_its_test() {
+        let p = hand_project("test");
+        let run = fake_run(&p, &[250]);
+        let same = test(&hand(), &repo(), &p, &run, 250).unwrap();
+        assert_eq!(same, [evaluate(&hand(), &repo(), &run, 250).unwrap()]);
+        // The teacher's documents as if a save had regenerated them since: another task's.
+        let other = template("cube-into-bin-hint").bundle.unwrap();
+        let mut moved = hand();
+        let t = moved.teacher.as_mut().unwrap();
+        (t.task, t.observation, t.deployment) = (other.task, other.observation, other.deployment);
+        t.learning = other.learning.unwrap();
+        let repacked = run.path.join(REPACKED).join("250.esb");
+        std::fs::create_dir_all(repacked.parent().unwrap()).unwrap();
+        std::fs::write(&repacked, "stale").unwrap();
+        let jobs = test(&moved, &repo(), &p, &run, 250).unwrap();
+        assert!(!repacked.exists(), "a stale re-pack is never evaluated");
+        let weights = run.path.join("weights").join("model-250.safetensors");
+        let untrained = p.root.join(UNTRAINED);
+        let mut eval = evaluate(&moved, &repo(), &run, 250).unwrap();
+        eval[5] = arg(&repacked);
+        assert_eq!(
+            jobs,
+            [
+                vec![
+                    "policy".into(),
+                    "pack".into(),
+                    "--policy".into(),
+                    arg(&untrained),
+                    "--weights".into(),
+                    arg(&weights),
+                    "--out".into(),
+                    arg(&repacked),
+                ],
+                eval
+            ]
+        );
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
+    /// A live training view of `total` iterations at one second each, `done` of them done.
+    fn live(done: u32, total: u32) -> TrainView {
+        use es_telemetry::protocol::{Frame, Message, Payload};
+        let frame = |stream, wall_ns, payload| {
+            Message::Frame(Frame {
+                tick: es_core::PhysTick(0),
+                wall_ns,
+                stream,
+                payload,
+            })
+        };
+        let mut view = TrainView::default();
+        let begin = Payload::Event {
+            kind: "train.begin".into(),
+            fields: [("total_steps".to_owned(), total.to_string())].into(),
+        };
+        view.ingest(&frame(crate::model::live_run::STREAM_EVENTS, 0, begin));
+        for step in [1, done] {
+            let row = Payload::Scalars(vec![f64::from(step), 0.1, 1e-4, 1.0]);
+            let wall = u64::from(step) * 1_000_000_000;
+            view.ingest(&frame(crate::model::train_view::STREAM_TRAIN, wall, row));
+        }
+        view
+    }
+
+    /// Packet M17/R7 (F-3): the card's time is the run's own while it trains, a finished run's
+    /// measured pace times the recipe before one does, and no number with neither.
+    #[test]
+    fn the_card_time_is_measured_or_says_the_first_run_measures_it() {
+        let p = hand_project("time");
+        let run = fake_run(&p, &[250]);
+        assert_eq!(measured(&p.teacher_runs()), None, "no measurement");
+        let metrics = run.path.join("metrics");
+        std::fs::create_dir_all(&metrics).unwrap();
+        let text = r#"{"iterations": 3000, "envs": 2048, "wall_clock_s": 2846.7}"#;
+        std::fs::write(metrics.join("env-metrics.json"), text).unwrap();
+        let (number, pace) = measured(&p.teacher_runs()).unwrap();
+        assert_eq!(number, 1);
+        assert!((pace - 0.9489).abs() < 1e-4, "{pace}");
+        assert!(iterations(&hand(), &repo()).is_some_and(|n| n > 0));
+        let digits = |s: &str| s.chars().filter(char::is_ascii_digit).count();
+        for lang in Lang::ALL {
+            let before = time_text(lang, None, Some((number, pace)), Some(3000), true);
+            for part in ["47", "001", "0.95", "3000"] {
+                assert!(before.contains(part), "{before}");
+            }
+            let now = time_text(lang, Some(&live(1200, 3000)), None, Some(3000), true);
+            for part in ["1200", "3000", "30"] {
+                assert!(now.contains(part), "{now}");
+            }
+            let starting = time_text(lang, Some(&live(1, 3000)), None, Some(3000), true);
+            let first = time_text(lang, None, None, Some(3000), true);
+            assert_eq!(starting, first, "no rate yet");
+            assert_eq!(digits(&first), 0, "{first}");
+            let kept = time_text(lang, None, None, Some(3000), false);
+            assert_eq!(
+                kept,
+                t(lang, "teach.teacher.time"),
+                "a template keeps its words"
+            );
+        }
+        std::fs::remove_dir_all(&p.root).ok();
     }
 }
