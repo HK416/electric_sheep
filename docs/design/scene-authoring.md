@@ -254,16 +254,23 @@ shaping = ["orientation", "distance"]
 
 ### 4.1 The vocabulary is what `es-env` lowers
 
-Each relation compiles to Task IR nodes `es-env` already lowers (`GetBodyPose`, `GetJointState`,
-`GetBodyVelocity`, `Arith`, `Norm`, `Dot`, `MathFn{Abs,Sqrt}`, `Compare`, `Logic`, `Reduce`,
-`Normalize`, `Clamp`, `Concat`, `Slice`, `ResetState`, `Randomization`, `Terminate`, `Reward`):
+Each relation compiles to Task IR nodes that `es-env`'s reward / termination cone lowering
+(`crates/es-env/src/plan.rs`) reads: the sources `GetJointState` (position, velocity),
+`GetBodyPose` (`pos`, `quat`), `GetBodyVelocity` (a free body; since G3c), `GetSensor`, `GetTime`
+— world frame only; the transforms `Arith`, `Norm{L2}`, `Dot`, `MathFn{Abs,Sqrt}`, `Compare`,
+`Logic`, `Normalize`, `Clamp` (one lane) and, since G3c, `Slice`, `Concat`, `Reduce` (axis 0);
+the sinks `Reward` and `Terminate`; and the reset's `ResetState` and `Randomization`. Refused by
+name inside a cone: `GetContact`, `GetRandom`, `Transform`, `Cross`, `Select`, `Norm{L1,Linf}`,
+the other `MathFn`s.
 
 | Relation | Compiles to |
 |---|---|
-| `inside` (a region) | per-axis `Compare` of the subject's position against the region's box, `And` |
-| `above` / `below` (by m) | `Slice` z, `Arith Sub`, `Compare` |
+| `inside` a region | per axis: `Slice` of the body's position, `Compare >` the box's low face and `<` its high face, `And`; the three axes `And`ed (section 4.4) |
+| `inside` a range | the scalar subject, `Compare >` lo and `<` hi, `And` |
+| `above` / `below` a value | the scalar subject, `Compare` |
+| `above` / `below` a body (by m) | `Slice` z of both positions, `Arith Sub`, `Compare > m` |
 | `near` / `farther_than` (m) | `Arith Sub`, `Norm L2`, `Compare` |
-| `still` (for s) | velocity `Norm` under a bound — IR-D has no hold node, so "for 1 s" compiles to "inside and nearly still" (the demo's settling bound, `editor-redesign.md` §5 S4) |
+| `still` (for s) | a body: `GetBodyVelocity.linear`'s `Norm L2 <` speed (and `.angular`'s under `angular`); a coordinate: its velocity within ±speed — IR-D has no hold node, so "for 1 s" compiles to "inside and nearly still" (the demo's settling bound, `editor-redesign.md` §5 S4) |
 | `orientation_matches` (deg) | `Dot` of quaternions, `MathFn Abs`, `Compare ≥ cos(θ/2)` (plan H's construction) |
 | `joint` `above` / `below` (gripper open) | `GetJointState`, `Compare` |
 | `touches` | waits for `GetContact` lowering — offered when it lands |
@@ -316,12 +323,12 @@ appended at 31–33). Where it differs from the example above, and what the text
   `[point − 1, point + 1]`, plan H's construction, and `m` < 1); `orientation_matches` `object`
   and `within_deg` (`|q·g| ≥ cos(θ/2)`). A field a relation does not take, or a missing one, is
   refused naming the clause (`success[1] (cube.x still)`) and the field; unknown keys by name.
-- **What does not lower yet is refused by name**: `touches` (`GetContact`); `<body>.y` / `.z`,
-  and with them `inside` a region, `above` / `below` another body and a 3-axis `still`. The
-  cone lowering (`crates/es-env/src/plan.rs`) has no `Slice`, `Concat`, `Reduce` or
-  `GetBodyVelocity` — the node list at the top of 4.1 overstates it — so today `inside` is the
+- **What did not lower at G3a was refused by name**: `touches` (`GetContact`); `<body>.y` / `.z`,
+  and with them `inside` a region, `above` / `below` another body and a 3-axis `still` — the
+  cone lowering had no `Slice`, `Concat`, `Reduce` or `GetBodyVelocity`, so `inside` was the
   subject's x span and `still` its x velocity, exactly task.toml's ceiling ("the bin's x span
-  plus a settling bound"). Lowering `Slice` there is the item that makes them 3-axis.
+  plus a settling bound"). G3c lowered the four nodes and made the relations 3-axis (4.4);
+  `touches` still waits for `GetContact`.
 - **Shaping**, per clause, named where the references needed more than 4.1: `shaping` is the
   term's form, `weight` its weight, `term` its name (absent `<subject>_<shaping>`): `distance`
   (`near` / `farther_than`: `weight × distance`, clamped to [0, 1] m), `ramp` (`inside`, with
@@ -371,6 +378,55 @@ appended at 31–33). Where it differs from the example above, and what the text
   use the host's `cos` / `tan`, as the generators this replaces did (the first two agree with the
   committed documents on this PC). A correctly rounded implementation would make a generated document
   host-independent (M10's `scene_hash` lesson) — open.
+
+### 4.4 What G3c settled (three-axis relations)
+
+`crates/es-env/src/plan.rs` (oracle `slice_concat_reduce_and_body_velocity_lower`) and the clause
+functions of `crates/es-script/src/spec/compile.rs` (oracles `crates/es-script/tests/estask*.rs`,
+fixture `tests/fixtures/estask/so101_region.esscene`). Both reference specs still compile to
+their committed `task_hash`; no committed cone contained the four nodes (they were refused), so
+every committed document lowers to the same `Expr` as before.
+
+- **The four nodes in a cone.** A cone's value is one row of lanes, so axis 0 is the only axis;
+  another, or a slice past the end, is refused by name. `Slice` takes lanes `start..start+len`,
+  `Concat` its inputs `in0, in1, …` in order, `Reduce` folds in lane order — the association
+  `Norm` and `Dot` already used (`DET-020`) — with `Mean` that sum divided by the lane count.
+  `unordered = true` lowers the same way (lane order is one admissible order; the validator
+  refuses it in deterministic mode, `DET-030`).
+- **`GetBodyVelocity` is derived exactly from what `StateView` carries**: it has no
+  body-velocity array, but a free body's six `qvel` are MuJoCo's free-joint convention — the
+  body origin's linear velocity in the world frame, then the angular velocity in the body frame
+  — which every backend's view follows (`physx_ref.py` converts PhysX's to it). `linear` is the
+  first three lanes as they are (the ports `GetJointState(Velocity)` binds: `cube.x still` and
+  `cube still` read the same numbers); `angular` is the last three rotated into the world by
+  `xquat` (the orientation `GetBodyPose.quat` reads), `v + w·t + u × t`, `t = 2 u × v` —
+  polynomial, no `DET-010` function. On `mujoco-cpu`, a cube tilted 60° spinning at 5 rad/s
+  about its own z reads `5 R e_z` within 2e-15 (`a_spinning_cubes_angular_velocity_is_read_in_the_world_frame`;
+  read as the world's it would be `(0, 0, 5)`). A body without a free joint would need its
+  Jacobian, which `StateView` does not carry: refused by name, as is any frame but the world.
+- **A region** is a site — an `.esscene` `[[region]]` or an MJCF `<site>` — and its `size` the
+  box's half-extents. The box is **axis-aligned in the world frame**: its centre is the site's
+  position plus its bodies' (summed from the world down), and the faces enter the cone as
+  `Compare` literals. A cone has no constant node to rotate a vector by (a world point enters
+  only as a literal, the reason `near` a point is a per-lane `Normalize`), and a region the
+  editor writes is unrotated, so a rotated site — itself or any body above it — is refused by
+  name, and so is a site that moves (a joint on its body or above it). Inside is strict: on a
+  face is outside. `inside` a region takes no shaping yet.
+- **Subjects.** `<body>.x` of a free body stays its free joint's first `qpos` lane (G3a's form;
+  the SO-101 hash depends on it). Every other `<body>.x|y|z` — `y`, `z`, and `x` of a body
+  without a free joint — is a `Slice` of `GetBodyPose.pos`, for `still` of
+  `GetBodyVelocity.linear` (a free body). The two position arrays are one frame but not one
+  instant on MuJoCo: `mj_step` computes `xpos` in the kinematics before it integrates, so after
+  a step `xpos` trails `qpos` by one physics substep (they agree after a reset); `near` and
+  `farther_than` already read `xpos`.
+- **`still`** of a subject that names a body — not a joint (a joint name wins: the SO-101's
+  `gripper` is both) and not `<body>.<axis>` — is `‖v‖ < speed`, and with `angular` (rad/s,
+  new field) also `‖ω‖ < angular`; the body needs a free joint. A coordinate keeps G3a's
+  `−speed < v < speed` and refuses `angular`.
+- **`above` / `below` a body**: `object` and `m` (the margin, absent 0): above is
+  `z_subject − z_object > m`, below `z_object − z_subject > m`.
+- `object` excludes `range` (`inside`), `value` (`above` / `below`) and `point` (`near`,
+  `farther_than`): "either `object` or …", naming the clause.
 
 ## 5. The editor (① and ②)
 

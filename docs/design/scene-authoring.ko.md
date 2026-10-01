@@ -242,16 +242,22 @@ shaping = ["orientation", "distance"]
 
 ### 4.1 어휘는 `es-env`가 낮추는 것이다
 
-각 관계는 `es-env`가 이미 낮추는 Task IR 노드로 컴파일된다(`GetBodyPose`, `GetJointState`,
-`GetBodyVelocity`, `Arith`, `Norm`, `Dot`, `MathFn{Abs,Sqrt}`, `Compare`, `Logic`, `Reduce`,
-`Normalize`, `Clamp`, `Concat`, `Slice`, `ResetState`, `Randomization`, `Terminate`, `Reward`):
+각 관계는 `es-env`의 보상 / 종료 콘 낮추기(`crates/es-env/src/plan.rs`)가 읽는 Task IR
+노드로 컴파일된다: 원천은 `GetJointState`(위치, 속도), `GetBodyPose`(`pos`, `quat`),
+`GetBodyVelocity`(자유 바디, G3c부터), `GetSensor`, `GetTime` — 모두 세계 좌표계만. 변환은
+`Arith`, `Norm{L2}`, `Dot`, `MathFn{Abs,Sqrt}`, `Compare`, `Logic`, `Normalize`, `Clamp`(레인
+하나), 그리고 G3c부터 `Slice`, `Concat`, `Reduce`(축 0). 싱크는 `Reward`와 `Terminate`, 리셋은
+`ResetState`와 `Randomization`. 콘 안에서 이름으로 거부되는 것: `GetContact`, `GetRandom`,
+`Transform`, `Cross`, `Select`, `Norm{L1,Linf}`, 나머지 `MathFn`.
 
 | 관계 | 컴파일 결과 |
 |---|---|
-| `inside` (영역) | 대상의 위치를 영역의 상자와 축마다 `Compare`한 뒤 `And` |
-| `above` / `below` (m만큼) | `Slice` z, `Arith Sub`, `Compare` |
+| `inside` 영역 | 축마다: 바디 위치의 `Slice`, 상자의 낮은 면보다 `Compare >`, 높은 면보다 `<`, `And`. 세 축을 `And` (4.4절) |
+| `inside` 구간 | 스칼라 주어, lo보다 `Compare >`, hi보다 `<`, `And` |
+| `above` / `below` 값 | 스칼라 주어, `Compare` |
+| `above` / `below` 바디 (m만큼) | 두 위치의 `Slice` z, `Arith Sub`, `Compare > m` |
 | `near` / `farther_than` (m) | `Arith Sub`, `Norm L2`, `Compare` |
-| `still` (s 동안) | 속도 `Norm`이 한계 아래 — IR-D에는 유지 노드가 없어서 "1초 동안"은 "안에 있고 거의 정지"로 컴파일된다(데모의 안정화 한계, `editor-redesign.md` §5 S4) |
+| `still` (s 동안) | 바디: `GetBodyVelocity.linear`의 `Norm L2 <` speed(`angular`가 있으면 `.angular`도 그 아래). 좌표: 속도가 ±speed 안 — IR-D에는 유지 노드가 없어서 "1초 동안"은 "안에 있고 거의 정지"로 컴파일된다(데모의 안정화 한계, `editor-redesign.md` §5 S4) |
 | `orientation_matches` (deg) | 쿼터니언의 `Dot`, `MathFn Abs`, `Compare ≥ cos(θ/2)` (플랜 H의 구성) |
 | `joint` `above` / `below` (그리퍼 열림) | `GetJointState`, `Compare` |
 | `touches` | `GetContact` 낮추기를 기다린다 — 들어오면 제공 |
@@ -303,12 +309,11 @@ shaping = ["orientation", "distance"]
   중 하나, `orientation_matches`는 `object`와 `within_deg`(`|q·g| ≥ cos(θ/2)`). 관계가 받지
   않는 필드나 빠진 필드는 절(`success[1] (cube.x still)`)과 필드를 짚어 거부하고, 모르는 키는
   이름으로 거부한다.
-- **아직 낮아지지 않는 것은 이름으로 거부한다**: `touches`(`GetContact`), `<body>.y` / `.z`,
-  그리고 그 때문에 영역 `inside`, 다른 바디 기준 `above` / `below`, 3축 `still`. 콘 낮추기
-  (`crates/es-env/src/plan.rs`)에는 `Slice`, `Concat`, `Reduce`, `GetBodyVelocity`가 없다 —
-  4.1 첫머리의 노드 목록은 과장이다. 그래서 지금 `inside`는 주어의 x 구간이고 `still`은 x
-  속도다. 정확히 task.toml의 한계("상자의 x 구간과 안정화 한계")다. 거기서 `Slice`를 낮추면
-  셋 다 3축이 된다.
+- **G3a 때 낮아지지 않던 것은 이름으로 거부했다**: `touches`(`GetContact`), `<body>.y` / `.z`,
+  그리고 그 때문에 영역 `inside`, 다른 바디 기준 `above` / `below`, 3축 `still` — 콘 낮추기에
+  `Slice`, `Concat`, `Reduce`, `GetBodyVelocity`가 없어서 `inside`는 주어의 x 구간이고
+  `still`은 x 속도였다. 정확히 task.toml의 한계("상자의 x 구간과 안정화 한계")다. G3c가 네
+  노드를 낮추고 관계들을 3축으로 만들었다(4.4). `touches`는 여전히 `GetContact`를 기다린다.
 - **성형**은 절마다 붙고, 참조 문서가 4.1보다 더 필요로 한 곳은 이름 있는 선택지로 두었다:
   `shaping`은 항의 형태, `weight`는 가중치, `term`은 이름(없으면 `<subject>_<shaping>`)이다.
   `distance`(`near` / `farther_than`: `weight × 거리`, [0, 1] m로 자름), `ramp`(`inside`,
@@ -358,6 +363,53 @@ shaping = ["orientation", "distance"]
   일치한다).
   올바르게 반올림하는 구현이면 생성된 문서가 호스트에 무관해진다(M10의 `scene_hash` 교훈) —
   열린 항목.
+
+### 4.4 G3c가 정한 세부 (3축 관계)
+
+`crates/es-env/src/plan.rs`(오라클 `slice_concat_reduce_and_body_velocity_lower`)와
+`crates/es-script/src/spec/compile.rs`의 절 함수들(오라클 `crates/es-script/tests/estask*.rs`,
+픽스처 `tests/fixtures/estask/so101_region.esscene`). 두 참조 명세는 여전히 커밋된
+`task_hash`로 컴파일된다. 커밋된 어떤 콘에도 네 노드가 없었으므로(거부되었으니까) 커밋된
+문서는 모두 전과 같은 `Expr`로 낮아진다.
+
+- **콘 안의 네 노드.** 콘의 값은 레인 한 줄이라 축은 0 하나뿐이다. 다른 축이나 끝을 넘는
+  슬라이스는 이름으로 거부한다. `Slice`는 레인 `start..start+len`을, `Concat`은 입력
+  `in0, in1, …`을 차례로 잇고, `Reduce`는 레인 순서로 접는다 — `Norm`과 `Dot`이 이미 쓰던
+  결합 순서다(`DET-020`). `Mean`은 그 합을 레인 수로 나눈 것이다. `unordered = true`도 같게
+  낮춘다(레인 순서도 허용되는 순서 중 하나다. 결정론 모드에서는 검증기가 거부한다, `DET-030`).
+- **`GetBodyVelocity`는 `StateView`가 가진 것에서 정확히 유도한다**: 바디 속도 배열은 없지만,
+  자유 바디의 `qvel` 여섯은 MuJoCo의 자유 관절 규약이다 — 바디 원점의 선속도는 세계
+  좌표계로, 그다음 각속도는 바디 좌표계로. 모든 백엔드의 뷰가 이를 따른다(`physx_ref.py`가
+  PhysX의 값을 이 규약으로 바꾼다). `linear`는 앞의 세 레인 그대로다(`GetJointState(Velocity)`가
+  묶는 포트와 같다: `cube.x still`과 `cube still`은 같은 수를 읽는다). `angular`는 뒤의 세
+  레인을 `xquat`(`GetBodyPose.quat`이 읽는 방향)으로 세계 좌표계에 돌린 것이다,
+  `v + w·t + u × t`, `t = 2 u × v` — 다항식이라 `DET-010` 함수가 없다. `mujoco-cpu`에서
+  x축으로 60° 기운 채 자기 z축으로 5 rad/s 도는 큐브는 `5 R e_z`를 2e-15 안으로 읽는다
+  (`a_spinning_cubes_angular_velocity_is_read_in_the_world_frame`. 세계 좌표계 값으로 잘못
+  읽었다면 `(0, 0, 5)`였을 것이다). 자유 관절이 없는 바디는 야코비안이 필요한데 `StateView`에
+  없으므로 이름으로 거부하고, 세계 외의 좌표계도 거부한다.
+- **영역**은 사이트다 — `.esscene`의 `[[region]]`이나 MJCF의 `<site>` — 그리고 `size`가
+  상자의 반폭이다. 상자는 **세계 좌표계 축에 정렬**된다: 중심은 사이트의 위치에 그 위
+  바디들의 위치를 더한 것이고(세계에서 아래로 합한다), 면들은 `Compare`의 리터럴로 콘에
+  들어간다. 콘에는 벡터를 회전시킬 상수 노드가 없고(세계의 점은 리터럴로만 들어온다 — 점에
+  대한 `near`가 레인별 `Normalize`인 이유다), 에디터가 쓰는 영역은 회전이 없다. 그래서 회전한
+  사이트는(자신이든 위의 어느 바디든) 이름으로 거부하고, 움직이는 사이트(자기 바디나 그 위에
+  관절이 있는 것)도 거부한다. 안쪽은 엄격하다: 면 위는 바깥이다. 영역 `inside`에는 아직
+  성형이 없다.
+- **주어.** 자유 바디의 `<body>.x`는 여전히 자유 관절의 첫 `qpos` 레인이다(G3a의 형태.
+  SO-101의 해시가 거기에 달려 있다). 나머지 `<body>.x|y|z` — `y`, `z`, 그리고 자유 관절이 없는
+  바디의 `x` — 는 `GetBodyPose.pos`의 `Slice`이고, `still`에서는 `GetBodyVelocity.linear`의
+  `Slice`다(자유 바디). 두 위치 배열은 MuJoCo에서 같은 좌표계지만 같은 순간은 아니다:
+  `mj_step`은 적분하기 전 운동학에서 `xpos`를 계산하므로 스텝 뒤의 `xpos`는 `qpos`보다 물리
+  서브스텝 하나 늦다(리셋 직후에는 같다). `near`와 `farther_than`은 이미 `xpos`를 읽는다.
+- 바디를 가리키는 주어의 **`still`** — 관절이 아니고(관절 이름이 이긴다: SO-101의 `gripper`는
+  둘 다다) `<body>.<axis>`도 아닌 것 — 은 `‖v‖ < speed`이고, `angular`(rad/s, 새 필드)가
+  있으면 `‖ω‖ < angular`도 붙는다. 바디에는 자유 관절이 있어야 한다. 좌표 주어는 G3a의
+  `−speed < v < speed`를 그대로 쓰고 `angular`를 거부한다.
+- **바디 기준 `above` / `below`**: `object`와 `m`(여유, 없으면 0). above는
+  `z_subject − z_object > m`, below는 `z_object − z_subject > m`.
+- `object`는 `range`(`inside`), `value`(`above` / `below`), `point`(`near`, `farther_than`)와
+  함께 쓸 수 없다: "either `object` or …", 절을 짚어서.
 
 ## 5. 에디터 (①과 ②)
 

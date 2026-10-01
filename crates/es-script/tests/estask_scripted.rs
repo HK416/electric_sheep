@@ -23,14 +23,25 @@ use es_physics_core::caps::{BatchSupport, Capabilities, DeterminismTier, FloatPr
 use es_script::spec::{compile_task, TaskSpec};
 
 const SCENE: &str = "tests/fixtures/mjcf/so101_pick_place_views.xml";
+/// The same scene with regions (packet G3c): the bodies and joints keep their rows.
+const REGIONS: &str = "tests/fixtures/estask/so101_region.esscene";
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+fn load(rel: &str) -> SceneDesc {
+    let path = repo().join(rel);
+    let text = std::fs::read_to_string(&path).expect("the scene");
+    if rel.ends_with(".esscene") {
+        let doc = es_assets::esscene::EsScene::from_toml(&text).expect("reads");
+        return es_assets::esscene::expand(&doc, path.parent().expect("a dir")).expect("expands");
+    }
+    es_assets::parse_mjcf(&text).expect("parses").scene
+}
+
 fn scene() -> SceneDesc {
-    let xml = std::fs::read_to_string(repo().join(SCENE)).expect("the scene");
-    es_assets::parse_mjcf(&xml).expect("parses").scene
+    load(SCENE)
 }
 
 /// One env whose state is whatever was last written: `step` only moves the clock.
@@ -164,12 +175,19 @@ impl PhysicsBackend for Still {
 
 /// The SO-101 views scene with `body` (TOML) after the header.
 fn task(body: &str) -> TaskIr {
+    task_on(SCENE, body)
+}
+
+fn spec_on(scene: &str, body: &str) -> Result<TaskIr, es_script::spec::SpecError> {
     let text = format!(
-        "kind = \"task-spec\"\nschema = 1\nscene = \"{SCENE}\"\nrobot = \"base\"\n\
+        "kind = \"task-spec\"\nschema = 1\nscene = \"{scene}\"\nrobot = \"base\"\n\
          control_hz = 50\ntimeout_s = 36.0\n{body}"
     );
-    let spec = TaskSpec::from_toml(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
-    compile_task(&spec, &repo()).unwrap_or_else(|e| panic!("{e}\n{text}"))
+    compile_task(&TaskSpec::from_toml(&text)?, &repo())
+}
+
+fn task_on(scene: &str, body: &str) -> TaskIr {
+    spec_on(scene, body).unwrap_or_else(|e| panic!("{e}\n{body}"))
 }
 
 /// The state a step is scored on: `qpos`, `qvel`, `xpos`, `xquat` (xyzw).
@@ -183,7 +201,7 @@ struct State {
 /// One control step entered with the reset's state as `edit` leaves it: the reward and how
 /// the episode stands after it.
 fn score(task: &TaskIr, edit: impl Fn(&mut State)) -> (f64, Termination) {
-    let scene = scene();
+    let scene = load(&task.scene.path);
     let domains = BatchDomains::single_env_at(
         TickRate::from_period_secs(scene.options.timestep).expect("200 Hz"),
         TickRate::hz(50),
@@ -220,7 +238,11 @@ fn score(task: &TaskIr, edit: impl Fn(&mut State)) -> (f64, Termination) {
 
 /// The scene row of body `name` in `xpos` / `xquat`.
 fn row(name: &str) -> usize {
-    scene()
+    row_in(SCENE, name)
+}
+
+fn row_in(scene: &str, name: &str) -> usize {
+    load(scene)
         .bodies
         .iter()
         .position(|b| b.name == name)
@@ -278,6 +300,204 @@ fn still_bounds_the_velocity_both_ways() {
     assert_eq!(score(&t, |s| s.qvel[6] = 0.01).1, Termination::Success);
     assert_eq!(score(&t, |s| s.qvel[6] = 0.2).1, Termination::Running);
     assert_eq!(score(&t, |s| s.qvel[6] = -0.2).1, Termination::Running);
+}
+
+// ---- packet G3c: three-axis relations --------------------------------------------------------
+
+/// `inside` a region: the site's box along the world axes, every axis strictly inside it. On
+/// the world (`bin_area`), on a welded body (`shelf_area`: the body's position composed in) and
+/// an MJCF file's own site (`baseframe` on the arm's fixed base, MJCF's default half-size).
+#[test]
+fn inside_a_region_holds_on_all_three_axes_and_not_on_its_boundary() {
+    let cube = row_in(REGIONS, "cube");
+    assert_eq!(cube, row("cube"), "the include keeps the demo's rows");
+    let inside = |scene: &str, region: &str| {
+        task_on(
+            scene,
+            &format!(
+                "[success]\nclauses = [{{ subject = \"cube\", relation = \"inside\", \
+                 object = \"{region}\" }}]"
+            ),
+        )
+    };
+    let at = |p: [f64; 3]| move |s: &mut State| s.xpos[cube * 3..cube * 3 + 3].copy_from_slice(&p);
+    let how = |t: &TaskIr, p: [f64; 3]| score(t, at(p)).1;
+    for (t, c, h) in [
+        (
+            inside(REGIONS, "bin_area"),
+            [0.14, -0.1, 0.05],
+            [0.05, 0.05, 0.05],
+        ),
+        (
+            inside(REGIONS, "shelf_area"),
+            [0.0, 0.3, 0.1 + 0.05],
+            [0.1, 0.05, 0.05],
+        ),
+        (
+            inside(SCENE, "baseframe"),
+            [0.0, 0.0, 0.0],
+            [0.005, 0.005, 0.005],
+        ),
+    ] {
+        assert_eq!(how(&t, c), Termination::Success, "the centre of {c:?}");
+        for axis in 0..3 {
+            for face in [c[axis] - h[axis], c[axis] + h[axis]] {
+                let mut p = c;
+                p[axis] = face;
+                assert_eq!(how(&t, p), Termination::Running, "{p:?} on a face");
+                // A micrometre to either side of the face.
+                let out = (face - c[axis]).signum() * 1e-6;
+                p[axis] = face - out;
+                assert_eq!(how(&t, p), Termination::Success, "{p:?} just inside");
+                p[axis] = face + out;
+                assert_eq!(how(&t, p), Termination::Running, "{p:?} just outside");
+            }
+        }
+    }
+}
+
+/// `above` / `below` another body: the difference of the two world heights, beyond `m`
+/// (absent: 0), strictly.
+#[test]
+fn above_and_below_another_body_compare_world_heights() {
+    let (cube, jaw) = (row("cube"), row("gripper"));
+    let heights = |c: f64, g: f64| {
+        move |s: &mut State| {
+            s.xpos[cube * 3 + 2] = c;
+            s.xpos[jaw * 3 + 2] = g;
+        }
+    };
+    let above = task(
+        "[success]\nclauses = [{ subject = \"cube\", relation = \"above\", object = \"gripper\", \
+         m = 0.05 }]",
+    );
+    assert_eq!(score(&above, heights(0.2, 0.1)).1, Termination::Success);
+    assert_eq!(score(&above, heights(0.12, 0.1)).1, Termination::Running);
+    let below = task(
+        "[success]\nclauses = [{ subject = \"cube\", relation = \"below\", object = \"gripper\" }]",
+    );
+    assert_eq!(score(&below, heights(0.02, 0.1)).1, Termination::Success);
+    assert_eq!(score(&below, heights(0.1, 0.1)).1, Termination::Running);
+    assert_eq!(score(&below, heights(0.2, 0.1)).1, Termination::Running);
+}
+
+/// `<body>.y` / `.z` read the body's world position (`xpos`) and its free joint's linear
+/// velocity; `.x` of a free body stays its free joint's `qpos` (G3a), and of another body is
+/// its world position too.
+#[test]
+fn y_and_z_subjects_read_the_world_position_and_the_linear_velocity() {
+    let (cube, jaw) = (row("cube"), row("gripper"));
+    let t = task(
+        "[success]\nclauses = [\n\
+           { subject = \"cube.y\", relation = \"inside\", range = [0.03, 0.05] },\n\
+           { subject = \"cube.z\", relation = \"below\", value = 0.1 },\n\
+           { subject = \"cube.z\", relation = \"still\", speed = 0.05 },\n\
+           { subject = \"gripper.x\", relation = \"above\", value = 0.2 },\n\
+         ]",
+    );
+    let set = |y: f64, z: f64, vz: f64, gx: f64| {
+        move |s: &mut State| {
+            s.qpos[7] = 0.0; // the free joint's y: not what `cube.y` reads
+            s.xpos[cube * 3 + 1] = y;
+            s.xpos[cube * 3 + 2] = z;
+            s.qvel[8] = vz;
+            s.xpos[jaw * 3] = gx;
+        }
+    };
+    assert_eq!(score(&t, set(0.04, 0.02, 0.0, 0.3)).1, Termination::Success);
+    for (state, why) in [
+        (set(0.06, 0.02, 0.0, 0.3), "y outside"),
+        (set(0.04, 0.12, 0.0, 0.3), "z above 0.1"),
+        (set(0.04, 0.02, -0.08, 0.3), "falling"),
+        (set(0.04, 0.02, 0.0, 0.1), "the jaw's x below 0.2"),
+    ] {
+        assert_eq!(score(&t, state).1, Termination::Running, "{why}");
+    }
+}
+
+/// `still` of a body: its speed `‖v‖` (not each axis) under `speed`, and its angular rate
+/// under `angular` — the rate's norm whatever the body's orientation.
+#[test]
+fn still_of_a_body_bounds_its_speed_and_its_angular_rate() {
+    let cube = row("cube");
+    let t = task(
+        "[success]\nclauses = [{ subject = \"cube\", relation = \"still\", speed = 0.05, \
+         angular = 0.5 }]",
+    );
+    let moving = |v: f64, w: f64, q: [f64; 4]| {
+        move |s: &mut State| {
+            s.qvel[6..9].copy_from_slice(&[v; 3]);
+            s.qvel[9..12].copy_from_slice(&[w; 3]);
+            s.xquat[cube * 4..cube * 4 + 4].copy_from_slice(&q);
+        }
+    };
+    let id = [0.0, 0.0, 0.0, 1.0];
+    let h = std::f64::consts::FRAC_1_SQRT_2;
+    let turned = [0.0, h, 0.0, h];
+    assert_eq!(score(&t, moving(0.02, 0.2, id)).1, Termination::Success);
+    assert_eq!(score(&t, moving(0.02, 0.2, turned)).1, Termination::Success);
+    // Each axis under 0.05, the speed 0.052 over it.
+    assert_eq!(score(&t, moving(0.03, 0.2, id)).1, Termination::Running);
+    // 0.52 rad/s, in either orientation.
+    assert_eq!(score(&t, moving(0.02, 0.3, id)).1, Termination::Running);
+    assert_eq!(score(&t, moving(0.02, 0.3, turned)).1, Termination::Running);
+}
+
+/// What G3c's relations refuse, naming the clause and the field.
+#[test]
+fn three_axis_refusals_name_the_region_and_the_field() {
+    let refused = |scene: &str, clause: &str, needles: &[&str]| {
+        let err = spec_on(scene, &format!("[success]\nclauses = [{clause}]"))
+            .expect_err(clause)
+            .to_string();
+        for n in needles {
+            assert!(err.contains(n), "`{clause}`: `{err}` does not name `{n}`");
+        }
+    };
+    let inside = |region: &str| {
+        format!("{{ subject = \"cube\", relation = \"inside\", object = \"{region}\" }}")
+    };
+    refused(
+        REGIONS,
+        &inside("tilted"),
+        &["success[0] (cube inside)", "object", "rotated"],
+    );
+    refused(
+        REGIONS,
+        &inside("on_cube"),
+        &["object", "moves with joint `cube_free`"],
+    );
+    refused(
+        SCENE,
+        &inside("gripperframe"),
+        &["object", "moves with joint"],
+    );
+    refused(REGIONS, &inside("nowhere"), &["object", "nowhere"]);
+    refused(
+        REGIONS,
+        "{ subject = \"cube\", relation = \"inside\", object = \"bin_area\", range = [0.0, 1.0] }",
+        &["object", "either `object` or `range`"],
+    );
+    refused(
+        SCENE,
+        "{ subject = \"cube\", relation = \"above\", object = \"base\", value = 0.1 }",
+        &["object", "either `object` or `value`"],
+    );
+    refused(
+        SCENE,
+        "{ subject = \"cube.z\", relation = \"still\", speed = 0.1, angular = 1.0 }",
+        &["success[0] (cube.z still)", "angular"],
+    );
+    refused(
+        SCENE,
+        "{ subject = \"base\", relation = \"still\", speed = 0.1 }",
+        &["subject", "no free joint"],
+    );
+    refused(
+        SCENE,
+        "{ subject = \"base.z\", relation = \"still\", speed = 0.1 }",
+        &["subject", "no free joint"],
+    );
 }
 
 #[test]
@@ -496,5 +716,83 @@ fn normalizes<B: PhysicsBackend>(name: &str, t: &TaskIr, backend: B) {
         env.step(&[0.0; 6]).expect("a step");
         let after = env.backend().state().qpos[9..13].to_vec();
         assert!(unit(&after), "{name}: qpos after a step {after:?}");
+    }
+}
+
+/// Packet G3c: `GetBodyVelocity.angular` is the world-frame rate. `MuJoCo`'s free joint keeps it
+/// in the body frame (`qvel[9..12]`) and the lowering rotates it by `xquat`; here the real
+/// backend says which. The cube tilted 60° about x spins at 5 rad/s about its own z in free
+/// fall — a principal axis, so neither the rate nor that axis moves — and its world rate is
+/// `5 R e_z = 5 (0, −sin 60°, cos 60°)`; read as if `qvel` were already the world's, it would
+/// be `(0, 0, 5)`. Needs `ES_PYTHON` (`MuJoCo`); prints SKIP without.
+#[test]
+fn a_spinning_cubes_angular_velocity_is_read_in_the_world_frame() {
+    use es_ir::graph::{IrNode, NodeId};
+    use es_ir::task::{Aggregation, TaskNode};
+    use es_physics_backend::MuJoCoCpuBackend;
+    if std::env::var_os("ES_PYTHON").is_none() {
+        println!("SKIP a_spinning_cubes_angular_velocity_is_read_in_the_world_frame: no ES_PYTHON");
+        return;
+    }
+    let half = 30.0_f64.to_radians();
+    let want = [0.0, -5.0 * (2.0 * half).sin(), 5.0 * (2.0 * half).cos()];
+    for (lane, want) in want.iter().enumerate() {
+        // `still` brings the node; one more reward reads the lane.
+        let mut t = task(
+            "[success]\nclauses = [{ subject = \"cube\", relation = \"still\", speed = 9.0, \
+             angular = 99.0 }]",
+        );
+        let (vel, ty) = t
+            .graph
+            .nodes
+            .iter()
+            .find_map(|(id, n)| {
+                let port = n.outputs().into_iter().find(|p| p.name == "angular")?;
+                Some((*id, port.ty))
+            })
+            .expect("the still clause's GetBodyVelocity");
+        let slice = TaskNode::Slice {
+            ty,
+            axis: 0,
+            start: lane as u64,
+            len: 1,
+        };
+        let reward = TaskNode::Reward {
+            name: "w".to_owned(),
+            weight: 1.0,
+            aggregation: Aggregation::Sum,
+            ty: slice.outputs()[0].ty.clone(),
+        };
+        let at = NodeId(t.graph.nodes.len() as u32);
+        let next = NodeId(at.0 + 1);
+        t.graph.insert(at, slice);
+        t.graph.insert(next, reward);
+        t.graph.connect(vel, "angular", at, "value");
+        t.graph.connect(at, "value", next, "value");
+
+        let scene = scene();
+        let rate = TickRate::from_period_secs(scene.options.timestep).expect("200 Hz");
+        let domains = BatchDomains::single_env_at(rate, TickRate::hz(50)).expect("4");
+        let mut env = match Env::new(&t, &scene, MuJoCoCpuBackend::new(), &domains, 7) {
+            Ok(env) => env,
+            Err(e) => return println!("SKIP mujoco-cpu: {e}"),
+        };
+        let (mut qpos, mut qvel) = {
+            let s = env.backend().state();
+            (s.qpos.to_vec(), s.qvel.to_vec())
+        };
+        // High above the table, away from the arm; `qpos` is x y z, then w x y z.
+        qpos[6..13].copy_from_slice(&[0.24, 0.3, 0.6, half.cos(), half.sin(), 0.0, 0.0]);
+        qvel[6..12].copy_from_slice(&[0.0, 0.0, 0.0, 0.0, 0.0, 5.0]);
+        let view = StateView {
+            n_envs: 1,
+            qpos: &qpos,
+            qvel: &qvel,
+            ..StateView::default()
+        };
+        env.backend_mut().set_state(&view).expect("set");
+        let got = env.step(&[0.0; 6]).expect("a step").rewards[0];
+        println!("lane {lane}: {got} vs {want}");
+        assert!((got - want).abs() < 1e-9, "lane {lane}: {got} vs {want}");
     }
 }

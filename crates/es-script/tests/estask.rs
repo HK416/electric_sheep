@@ -171,8 +171,8 @@ fn refusals_name_the_clause_and_the_field() {
         ),
         (
             "subject = \"cube.x\", relation = \"still\"",
-            "subject = \"cube.z\", relation = \"still\"",
-            &["success[1]", "subject", "Slice"],
+            "subject = \"cube.w\", relation = \"still\"",
+            &["success[1]", "subject", "x, y or z"],
         ),
         (
             "what = \"cube.z\"",
@@ -246,6 +246,7 @@ mod generated {
                 of(num()),
                 of(num()),
                 of(num()),
+                of(num()),
             ),
             (of(shaping), of(num()), of([num(), num()]), of(name())),
         )
@@ -258,6 +259,7 @@ mod generated {
                 value: b.1,
                 m: b.2,
                 speed: b.3,
+                angular: b.5,
                 within_deg: b.4,
                 shaping: c.0,
                 weight: c.1,
