@@ -23,6 +23,9 @@ mod appearance;
 mod attrs;
 mod elements;
 mod orient;
+mod write;
+
+pub use write::{write_mjcf, WriteError};
 
 use std::collections::{BTreeMap, BTreeSet};
 
