@@ -199,7 +199,7 @@ refused disappears. V3 implements `LightIntensity` and `LightDirection` only; `C
 
 A grep for `inverse_kinematic|jacobian|damped_least|mj_jac|pinv` over `crates/`, `python/` and `xtask/`
 returns only MJCF's `<option jacobian=>` solver attribute (`crates/es-assets/src/mjcf/mod.rs:422-426`,
-`crates/es-assets/src/scene.rs:370`). `es-math` is `approx`, `conventions`, `reduce`, `scalar`, `simd`;
+`crates/es-assets/src/scene/options.rs`). `es-math` is `approx`, `conventions`, `reduce`, `scalar`, `simd`;
 `es-actuator` is the transduction model only.
 
 But forward kinematics is already free: `StateView` carries `xpos` (`n_envs * nbody * 3`) and `xquat`

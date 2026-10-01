@@ -198,7 +198,7 @@ Evaluation IR 쪽은 아니다: `PerturbationKind::ObjectPose`는 "`Env::reset`�
 
 `crates/`, `python/`, `xtask/`에서 `inverse_kinematic|jacobian|damped_least|mj_jac|pinv`를 grep하면
 MJCF의 `<option jacobian=>` 솔버 속성만 나온다 (`crates/es-assets/src/mjcf/mod.rs:422-426`,
-`crates/es-assets/src/scene.rs:370`). `es-math`는 `approx`, `conventions`, `reduce`, `scalar`, `simd`이고
+`crates/es-assets/src/scene/options.rs`). `es-math`는 `approx`, `conventions`, `reduce`, `scalar`, `simd`이고
 `es-actuator`는 전달 모델뿐이다.
 
 하지만 순기구학은 이미 공짜다: `StateView`가 모든 바디의 `xpos` (`n_envs * nbody * 3`)와 `xquat`
