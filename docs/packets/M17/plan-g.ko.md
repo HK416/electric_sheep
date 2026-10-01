@@ -24,7 +24,7 @@ MJCF, TOML IR, Rust를 쓰지 않고 학습시킨다.
 |---|---|---|
 | 1 | G1 장면 문서 · G2 완전한 MJCF 내보내기 | — |
 | 2 | G3a 작업 명세 → Task IR · G4 `es scene simulate`와 ①의 물리 미리보기(`es render`는 H8/H9로 들어왔다) | G1 |
-| 2b | G3b 나머지 문서 + `es project generate` | G3a |
+| 2b | G3b 나머지 문서 + `es project generate` · G3c 세 축 관계(`Slice`, `Concat`, `Reduce`, `GetBodyVelocity` 낮춤) | G3a |
 | 3 | G5 에디터 장면 모델 · G6 뷰포트 선택과 기즈모 | G1, G4, H8 |
 | 4 | G7 추가(프리미티브, 메시, 로봇, 카메라, 조명, 영역) · G8 문장 편집기 | G5, G3 |
 | 5 | G9 빈 프로젝트 카드, 템플릿으로 저장, 생성된 작업을 위한 ② 교사 | G3, G8 |
@@ -128,3 +128,26 @@ MJCF, TOML IR, Rust를 쓰지 않고 학습시킨다.
 - **오라클:** CLI의 궤적은 같은 장면을 `MuJoCoCpuBackend`로 직접 스텝한 것과 같다(`mujoco-cpu`에서
   비트 단위). 평면 위에서 떨어뜨린 큐브는 그 위에 멈춘다. 뷰모델의 결정은 헤드리스로 검사한다.
   Shadow Hand 프로젝트에서 찍은 미리보기 스크린샷.
+
+**G3a 병합 결과(2026-10-01):** 두 명세 모두 커밋된 `task_hash`로 컴파일된다(Shadow Hand
+`e16b44a9…`, SO-101 views `33f55c29…`). `task_graph_hash`는 다르다(노드 id가 섞이는데, 커밋된
+번호 매김은 생성기의 역사다) — **오케스트레이터는 G3b에서도 의미상의 `task_hash` 일치를 목표로
+받아들인다**. `inside`와 `still`이 한 축짜리인 것은 es-env의 콘 낮춤에 `Slice`, `Concat`, `Reduce`,
+`GetBodyVelocity`가 없기 때문이다(G3c). 컴파일러는 각도 임계값, 카메라 초점 거리, 기울기 한계에
+호스트의 `cos` / `tan`을 호출한다(G3b가 정리한다).
+
+### 작업 G3c: 세 축 관계
+
+**Files:** `crates/es-env/src/plan.rs`(와 그 테스트), `crates/es-script/src/spec/compile.rs`(절
+함수만), `crates/es-script/tests/estask_scripted.rs`, 설계 노트 §4.1(+ko).
+
+- es-env가 보상 / 종료 콘에서 `Slice`, `Concat`, `Reduce`, `GetBodyVelocity`를 `es-ir`가 정의한
+  의미대로 낮춘다(`crates/es-ir/src/task.rs`의 출력 타입과 CPU 참조 평가기가 있으면 그것을 확인한다).
+  그러면 관계가 3-벡터를 읽을 수 있다.
+- 그러면 어휘는 장면 **영역**(`.esscene`의 `[[region]]` / MJCF site 박스, 세 축 모두) 안에 있음을
+  뜻하는 `inside`, 몸체의 선속도(3차원)와 선택적으로 각속도를 쓰는 `still`, 다른 몸체의 `above` /
+  `below`, 그리고 `<body>.y` / `.z` 주어를 제공한다.
+- **오라클:** 낮춰진 각 노드를 스크립트된 상태에서 손으로 계산한 값과 비교한다(G3a의
+  `estask_scripted.rs`처럼). 커밋된 모든 작업 문서의 평가는 그대로다(`task_hash`와 reach / SO-101 /
+  Shadow Hand 보상 골든, 비트 단위 RL 테스트). 두 기준 명세는 여전히 커밋된 `task_hash`로
+  컴파일된다.
