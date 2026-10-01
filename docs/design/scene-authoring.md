@@ -179,6 +179,18 @@ above left open:
   fullinertia }`, `gravcomp`. A `[[body.geom]]`'s `shape` is `{ plane | sphere | capsule |
   cylinder | box | ellipsoid = sizes }` or `{ mesh = "file" }` (the asset is named by the file's
   stem); an unnamed geom is `geom<n>`, as in MJCF.
+- **A mesh's scale** (packet M17/R3): `shape = { mesh = "file", scale = [sx, sy, sz] }`, each
+  vertex times `scale` per axis. Absent and `[1, 1, 1]` read to the same `SceneDesc`, bit for
+  bit; `scale` beside another shape, two shape keys, or a scale that is not positive is refused
+  by field. `SceneDesc` gains `mesh_scales` (by mesh asset id), which is MJCF's `<mesh scale>`:
+  the MJCF reader now reads it instead of refusing it (`refpos` and `refquat` are still
+  refused), and G2's writer writes it. It is hashed in a section of its own, present only when
+  the map is not empty, so no committed `scene_hash` moves. `meshes` keeps the file's own
+  vertices, so G2 re-encodes the file unchanged; `SceneDesc::mesh_positions` gives them scaled
+  (`f32(f64(v) · s)`), and the backend emitter (the MJCF every backend loads) and the renderer
+  draw and simulate those. A scaled mesh's asset is named `stem@s` (`stem@x,y,z` when not
+  uniform), so one file at two scales is two `<mesh>`es. URDF's `<mesh scale>` is still a
+  warning (a later item).
 - **Textures are named `[[texture]]`s** and a material names one per slot (`texture`, `orm`,
   `metallic_map`, `roughness_map`, `normal_map`, `emissive_map`): one texture is shared by two
   materials (the Shadow Hand's cube and goal), so it cannot be inline. As in MJCF, a material
@@ -781,9 +793,11 @@ the same lowering the env uses. There is no IR change and no hash change.**
 - **Handles.** Move and turn work in the frame the document writes the place in (the parent's;
   the world's for most things), through the thing's own origin, so a move changes exactly one
   coordinate of `pos` and a turn is `dq · q` in that frame. Size works in the shape's own frame:
-  a geom, static scenery, a region, a light, and a body with exactly one geom (its geom). A mesh,
-  a camera, an include and a body of several geoms have no size handles. A handle is 15 % of its
-  distance from the eye long, so it keeps its size on screen. W, E, R pick the tool; F frames.
+  a geom, static scenery, a region, a light, and a body with exactly one geom (its geom). A
+  camera, an include and a body of several geoms have no size handles. A mesh's handles change
+  its scale (packet M17/R3, section 5.3), the same factor on all three axes. A handle is 15 % of
+  its distance from the eye long, so it keeps its size on screen. W, E, R pick the tool; F
+  frames.
 - **Snapping** (on by default, one checkbox) rounds in the document's units: the moved coordinate
   to a whole centimetre (`(v · 100).round() / 100`, so the document writes `1.05`), the drag's
   turn to a multiple of 15°, a size's whole extent (the inspector's width, height or diameter)
@@ -878,9 +892,16 @@ the same lowering the env uses. There is no IR change and no hash change.**
   and `outside`, a camera 1.2 m back and 1.2 m up, looking down at the origin at 45°.
 - **Measured**: every item adds, expands and maps onto `mujoco-cpu` on the Shadow Hand copy and on
   `empty.esscene`; the twelve Shadow Hand meshes, imported, hash as the source's.
-- **Left open**: a mesh has no size handles and no scale, since neither `SceneDesc` nor the
-  document carries a mesh scale (an STL in millimetres comes in 1000 times too large). A URDF whose
-  meshes lie outside its folder is refused, and USD is refused as in G1.
+- **A mesh's unit** (packet M17/R3, the schema in section 3.4). Picking a mesh file opens a small
+  window: metres, centimetres or millimetres (the scale 1, 0.01 or 0.001 the mesh is written
+  with, metres chosen first), the file's size in that unit, and, when a side is longer than 5 m,
+  "That is bigger than a room. The file was probably drawn in millimetres: choose millimetres."
+  Add adds it at that scale, its scaled lowest vertex on the hit. The inspector shows a mesh's
+  scale as one number while it is uniform (three otherwise); 1 is written as no scale. Its size
+  handles (section 5.2) multiply all three by one factor, the dragged extent snapped to whole
+  centimetres as G6's sizes are, one `Set` per drag.
+- **Left open**: a URDF whose meshes lie outside its folder is refused, and USD is refused as in
+  G1.
 
 ### 5.4 What G9 settled (an authored project runs end to end)
 
