@@ -21,6 +21,10 @@ es-render = { workspace = true }
 es-core = { workspace = true }
 # The cameras a policy sees, as its Task IR and Observation IR declare them (the corner view).
 es-ir = { workspace = true }
+# ⑤'s explanation by the missing clause (packet M17/R8): a run's rows and trajectories (layer 10)
+# read back through the env's own cone lowering (layer 9).
+es-eval = { workspace = true }
+es-env = { workspace = true }
 # ①'s Add (packet M17/G7): files copied into the project under their content's blake3; the robot
 # library's list (`templates/robots.toml`); a glTF's buffer files and the picture import's
 # texture and material, read and made as the documents' own serde types.

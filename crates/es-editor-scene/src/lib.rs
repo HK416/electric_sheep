@@ -31,6 +31,8 @@ pub mod gizmo;
 pub mod import;
 pub mod inspect;
 pub mod marker;
+// ⑤'s explanation of an authored project's failures by the missing clause (packet M17/R8).
+pub mod missing;
 pub mod model;
 pub mod overrides;
 pub mod policy;
