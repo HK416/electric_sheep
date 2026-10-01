@@ -8,12 +8,13 @@
 //! copies are [`crate::model::results`]'s, under test.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use eframe::egui;
 use egui::load::SizedTexture;
 use egui::{Color32, RichText, Vec2};
+use es_editor_scene::sentence::At;
 
 use crate::app::EditorApp;
 use crate::model::dialogs;
@@ -21,19 +22,21 @@ use crate::model::i18n::{fill, t, Lang};
 use crate::model::labels::{self, Browse};
 use crate::model::layout::{self, Pane};
 use crate::model::project::RunFolder;
-use crate::model::results::{self, RunResults, TileFilter};
+use crate::model::results::{self, Missing, RunResults, TileFilter};
+use crate::model::template::Generated;
 use crate::model::workflow::{Phase, PhaseState};
 use crate::ui::advanced::{metric_text, rgb_texture, short_hash};
 use crate::ui::player::{play, Player};
+use crate::ui::sentence::words;
 
 const GREEN: Color32 = Color32::from_rgb(120, 200, 120);
 const RED: Color32 = Color32::from_rgb(230, 120, 110);
 /// A tile's thumbnail width, in points.
 const TILE: f32 = 96.0;
 
-/// Where a run was read from, and `report.json`'s time then: evaluating again into the same
-/// folder is read again.
-type Stamp = (PathBuf, Option<SystemTime>);
+/// Where a run was read from, `report.json`'s time then and the language its explanation is
+/// worded in: evaluating again into the same folder, or another language, is read again.
+type Stamp = (PathBuf, Option<SystemTime>, Lang);
 
 /// ⑤ between frames. It belongs to one project; opening another starts afresh.
 #[derive(Default)]
@@ -72,7 +75,7 @@ pub fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
     {
         return false;
     }
-    refresh(app, ui.ctx().cumulative_pass_nr());
+    refresh(app, ui.ctx().cumulative_pass_nr(), app.settings.lang);
     match pane {
         Pane::StepPanel => step_panel(app, ui),
         Pane::Viewport => viewport(app, ui),
@@ -82,7 +85,7 @@ pub fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
 }
 
 /// Lists the project's finished runs and reads the one shown, when it is not what was read.
-fn refresh(app: &mut EditorApp, pass: u64) {
+fn refresh(app: &mut EditorApp, pass: u64, lang: Lang) {
     let Some(open) = &app.project else { return };
     let s = &mut app.results;
     if s.pass == Some(pass) {
@@ -104,7 +107,7 @@ fn refresh(app: &mut EditorApp, pass: u64) {
     let modified = std::fs::metadata(run.report_path())
         .and_then(|m| m.modified())
         .ok();
-    let stamp = (run.path.clone(), modified);
+    let stamp = (run.path.clone(), modified, lang);
     if s.shown.as_ref().is_some_and(|(k, _)| *k == stamp) {
         return;
     }
@@ -114,13 +117,43 @@ fn refresh(app: &mut EditorApp, pass: u64) {
         source.map(|(t, _)| t.clone()),
         source.map(|(_, r)| r.as_path()),
     );
-    let read = RunResults::read_from(&open.project, run, template, root);
+    let mut read = RunResults::read_from(&open.project, run, template, root);
+    // An authored project's failures by the clause that was missing (packet M17/R8).
+    if let (Ok(r), Some(Generated::Fresh(_))) = (&mut read, &open.generated) {
+        r.missing = missing(lang, &open.project.root, r);
+    }
     s.thumbs.clear();
     s.player = read.as_ref().ok().and_then(|r| {
         let cell = results::first_to_play(r.rows.as_deref(), r.dir.cells())?;
         Some(Player::open(&r.dir, r.scene.as_deref(), cell))
     });
     s.shown = Some((stamp, read));
+}
+
+/// `es-editor-scene`'s explanation of `r`'s failed attempts in G8's sentences, for ⑤.
+fn missing(lang: Lang, root: &Path, r: &RunResults) -> Option<Missing> {
+    let e = es_editor_scene::missing::explain(root, &r.dir, r.rows.as_deref()?)?;
+    let said = |at: &At, not: &str| {
+        let line = e.lines.iter().find(|l| l.at == *at)?;
+        let key = if at.failure {
+            "results.missing.ended"
+        } else {
+            not
+        };
+        Some(fill(lang, key, &[&words(lang, &line.sentence)]))
+    };
+    Some(Missing {
+        lines: (e.lines.iter())
+            .filter_map(|l| Some((said(&l.at, "results.missing.not")?, l.attempts)))
+            .collect(),
+        failed: e.failed,
+        tiles: (e.cells.iter())
+            .filter_map(|(cell, why)| {
+                Some((cell.clone(), said(why.first()?, "results.missing.tile")?))
+            })
+            .collect(),
+        before_end: e.before_end,
+    })
 }
 
 /// Left: the run list, the verdict, the acceptance lines, why attempts failed, the buttons.
@@ -168,7 +201,20 @@ fn step_panel(app: &mut EditorApp, ui: &mut egui::Ui) {
         if causes.is_empty() {
             ui.label(t(lang, "results.no_failures"));
         }
-        for (cause, n) in causes {
+        // An authored project's lines stand where a template's outcome classes stand (M17/R8).
+        if let Some(m) = &shown.missing {
+            for (line, n) in &m.lines {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new(line).strong());
+                    let count = [n.to_string(), m.failed.to_string()];
+                    ui.weak(fill(lang, "results.missing.count", &[&count[0], &count[1]]));
+                });
+            }
+            if m.before_end {
+                ui.weak(t(lang, "results.missing.before_end"));
+            }
+        }
+        for (cause, n) in causes.into_iter().filter(|(c, _)| !shown.explained(*c)) {
             ui.horizontal_wrapped(|ui| {
                 ui.label(RichText::new(shown.cause_label(lang, cause)).strong());
                 ui.weak(fill(lang, "results.times", &[&n.to_string()]));
@@ -333,13 +379,19 @@ fn tiles(
         .id_salt("results-tiles")
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            ui.horizontal_wrapped(|ui| {
+            // Rows of tiles, top-aligned: each is asked for at its width, so a row wraps before
+            // it rather than cutting it off at the pane's edge (`ui.vertical` is placed with no
+            // wrap, M17/R8).
+            let rows_of = egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true);
+            ui.with_layout(rows_of, |ui| {
                 for tile in results::tiles(rows, *filter, &shown.outcomes) {
                     let thumb = thumbs.entry(tile.cell.clone()).or_insert_with(|| {
                         let img = results::thumbnail(&shown.dir, &tile.cell)?;
                         Some(rgb_texture(&ctx, &tile.cell, &img))
                     });
-                    ui.vertical(|ui| {
+                    let wide = Vec2::new(TILE + 2.0 * ui.spacing().button_padding.x, TILE);
+                    let column = egui::Layout::top_down(egui::Align::Min);
+                    ui.allocate_ui_with_layout(wide, column, |ui| {
                         ui.set_width(TILE);
                         let mark = if tile.success { "\u{2714}" } else { "\u{2716}" };
                         let button = match thumb {

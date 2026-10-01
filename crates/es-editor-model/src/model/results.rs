@@ -805,6 +805,23 @@ pub struct RunResults {
     pub teacher: Option<Score>,
     /// "Train again on what failed", or the i18n key of why not ([`again`]).
     pub again: Result<Again, &'static str>,
+    /// An authored project's failures by the clause that was missing, which `es-editor` reads
+    /// with `es-editor-scene` and hands in, as it hands in the generation state (packet M17/R8).
+    pub missing: Option<Missing>,
+}
+
+/// Why an authored project's attempts failed, in G8's sentences (design note
+/// `scene-authoring.md` section 4.8): it stands where a template's outcome classes stand.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Missing {
+    /// Each clause's line and the failed attempts it explains, most first.
+    pub lines: Vec<(String, u32)>,
+    /// The failed attempts read.
+    pub failed: u32,
+    /// Each explained attempt's word, by cell: its first clause.
+    pub tiles: BTreeMap<String, String>,
+    /// The end rows are the last recorded ones, a step before the end (an older run).
+    pub before_end: bool,
 }
 
 impl RunResults {
@@ -891,7 +908,17 @@ impl RunResults {
             outcomes,
             angles,
             teacher: teacher::chosen_score(project),
+            missing: None,
         })
+    }
+
+    /// Whether [`Self::missing`]'s lines say `cause` instead: how an authored attempt ran out of
+    /// time or met a failure clause.
+    ///
+    /// ponytail: a timeout without a readable trajectory is then in no line; every `es eval run`
+    /// writes one.
+    pub fn explained(&self, cause: Cause) -> bool {
+        self.missing.is_some() && matches!(cause, Cause::Timeout | Cause::FailureCondition)
     }
 
     /// The template's `[outcome]` when it is a reorientation.
@@ -901,6 +928,10 @@ impl RunResults {
 
     /// A tile's word: its cause, and for a reorientation's timeout how far it ended off the goal.
     pub fn tile_label(&self, lang: Lang, cell: &str, cause: Cause) -> String {
+        let clause = (self.missing.as_ref()).and_then(|m| m.tiles.get(cell));
+        if let Some(word) = clause.filter(|_| self.explained(cause)) {
+            return word.clone();
+        }
         match (cause, self.angles.get(cell)) {
             (Cause::Timeout, Some(deg)) => {
                 fill(lang, "outcome.not_aligned_by", &[&format!("{deg:.0}")])
@@ -1457,8 +1488,26 @@ mod tests {
             );
         }
         // Without a checkout there is no template, so no class: the recorded causes stand.
-        let bare = RunResults::read(&p, &run, None).unwrap();
+        let mut bare = RunResults::read(&p, &run, None).unwrap();
         assert!(bare.outcomes.is_empty() && bare.outcome.is_none());
+        // Packet M17/R8: an authored run's missing clauses say its timeouts and failures.
+        assert!(!bare.explained(Cause::Timeout) && bare.missing.is_none());
+        bare.missing = Some(Missing {
+            tiles: BTreeMap::from([("light-01".to_owned(), "not: box is inside".to_owned())]),
+            ..Missing::default()
+        });
+        assert!(bare.explained(Cause::Timeout) && bare.explained(Cause::FailureCondition));
+        assert!(!bare.explained(Cause::SafetyLimit));
+        let label = |cell, cause| bare.tile_label(Lang::En, cell, cause);
+        assert_eq!(label("light-01", Cause::Timeout), "not: box is inside");
+        assert_eq!(
+            label("light-01", Cause::SafetyLimit),
+            t(Lang::En, "cause.safety_limit")
+        );
+        assert_eq!(
+            label("nominal-01", Cause::Timeout),
+            t(Lang::En, "cause.timeout")
+        );
         std::fs::remove_dir_all(&p.root).ok();
     }
 

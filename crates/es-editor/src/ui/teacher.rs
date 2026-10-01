@@ -51,6 +51,8 @@ pub(crate) struct State {
     /// The newest run's measured pace and the recipe's iterations: the card's time (M17/R7).
     measured: Option<(u32, f64)>,
     iterations: Option<u32>,
+    /// The attempts a Test runs, its evaluation's own count (M17/R8).
+    attempts: Option<u32>,
     note: Option<String>,
 }
 
@@ -131,6 +133,7 @@ fn open(app: &mut EditorApp) {
     *s = State {
         project: Some(open.project.root.clone()),
         iterations: (source.as_ref()).and_then(|(t, root)| teacher::iterations(t, root)),
+        attempts: (source.as_ref()).and_then(|(t, root)| teacher::attempts(t, root)),
         source,
         warp,
         jobs: std::mem::take(&mut s.jobs),
@@ -406,6 +409,8 @@ fn marks(lang: Lang, ui: &mut egui::Ui, s: &State, run: &RunFolder, action: &mut
                 step,
             })
     };
+    let attempts = s.attempts.map_or_else(|| "?".to_owned(), |n| n.to_string());
+    let hint = fill(lang, "teach.teacher.test.hint", &[&attempts]);
     egui::Grid::new("teacher-marks")
         .striped(true)
         .show(ui, |ui| {
@@ -420,7 +425,7 @@ fn marks(lang: Lang, ui: &mut egui::Ui, s: &State, run: &RunFolder, action: &mut
                 };
                 let test = ui
                     .button(t(lang, "teach.teacher.test"))
-                    .on_hover_text(t(lang, "teach.teacher.test.hint"));
+                    .on_hover_text(&hint);
                 if test.clicked() {
                     *action = Some(Action::Test(vec![mark.step]));
                 }

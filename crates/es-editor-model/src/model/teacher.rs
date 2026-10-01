@@ -367,6 +367,13 @@ pub fn iterations(template: &Template, repo: &Path) -> Option<u32> {
     Some(Recipe::parse(&text).ok()?.run.steps)
 }
 
+/// The attempts a Test runs: the template's teacher evaluation's episodes, in every suite (R8).
+pub fn attempts(template: &Template, repo: &Path) -> Option<u32> {
+    let text = std::fs::read_to_string(repo.join(&docs(template).ok()?.evaluation)).ok()?;
+    let ir = es_ir::serial::evaluation_from_toml(&text).ok()?;
+    Some(ir.episodes.n_episodes * ir.suites.len() as u32)
+}
+
 /// What the card says about time (packet M17/R7). While `live`, the run training now, has a
 /// rate: its iterations done of the total and what is left at its own pace. Else a `measured`
 /// run's pace times the recipe's `iterations`. Else, on `generated` documents, that the first
@@ -767,6 +774,8 @@ pub(crate) mod tests {
         assert_eq!(number, 1);
         assert!((pace - 0.9489).abs() < 1e-4, "{pace}");
         assert!(iterations(&hand(), &repo()).is_some_and(|n| n > 0));
+        // A Test's attempts are its evaluation's own: the hand's 64 (R8).
+        assert_eq!(attempts(&hand(), &repo()), Some(64));
         let digits = |s: &str| s.chars().filter(char::is_ascii_digit).count();
         for lang in Lang::ALL {
             let before = time_text(lang, None, Some((number, pace)), Some(3000), true);
