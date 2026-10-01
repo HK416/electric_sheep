@@ -3,26 +3,25 @@
 //! The export a person opens in `MuJoCo`'s viewer: everything the scene carries — bodies,
 //! joints, geoms, sites, cameras, `_light` geoms, materials and textures, meshes, tendons,
 //! actuators, sensors, contact pairs and excludes, `gravcomp`, `<option>` — written so that
-//! [`super::parse_str`] of the text, followed by [`crate::mesh::load`] of `out_dir`, gives the
-//! scene back field for field, with the same `scene_hash` and asset hashes. Unlike
+//! [`super::parse_str`] of the text, then [`crate::mesh::load`] of `out_dir`, gives the scene
+//! back field for field, with the same `scene_hash` and asset hashes. Unlike
 //! `es-physics-backend`'s `mjcf_out`, which drops what carries no dynamics, nothing is
 //! dropped: what MJCF cannot say is a [`WriteError::Inexpressible`] naming it.
 //!
 //! How the round trip is kept exact:
 //!
-//! * Angles are radians (`<compiler angle="radian">`), so ranges read back unscaled; `fovy`,
-//!   always degrees in MJCF, is written as the degree value whose product with `DEG_TO_RAD` is
-//!   the stored radian value.
-//! * The parser normalises every `quat` and joint `axis` it reads, and normalising is not
-//!   bitwise idempotent (`es-math`), so the value written is a pre-image: the stored one, or
-//!   the neighbour within an ULP per component that normalises onto it.
-//! * Names the parser generated for unnamed elements (`geom3`) are left out again, so `MuJoCo`
-//!   sees no duplicate name; every other name is written.
+//! * Angles are radians (`<compiler angle="radian">`); `fovy`, always degrees in MJCF, is the
+//!   degree value whose product with `DEG_TO_RAD` is the stored radian value.
+//! * The reader normalises every `quat` and joint `axis` (a pose's quaternion twice), and
+//!   normalising is not bitwise idempotent (`es-math`), so what is written is a pre-image.
+//! * Names the parser generated for unnamed elements (`geom3`) are left out again; every
+//!   other name is written.
 //! * Asset files are re-encoded from the decoded data (STL, OBJ, PNG) at the asset's own
 //!   scene-relative path — the path is hash input (spec 5.3) — or, for an absolute or `..`
-//!   path, under `<kind>/<name>.<ext>`, which then moves that asset's path digest. A file
-//!   already in `out_dir` with other bytes is never overwritten.
-//! * Every number is Rust's shortest round-trip decimal.
+//!   path, under `<kind>/<name>.<ext>`, which moves that asset's path digest. A file already
+//!   in `out_dir` with other bytes is never overwritten.
+//! * Every number is Rust's shortest round-trip decimal; a value equal to the reader's default
+//!   (`MuJoCo`'s) is left out.
 
 // `w`, `h`, `x`, `y`, `z`: the texture and quaternion components, as everywhere in this crate.
 #![allow(clippy::many_single_char_names)]
@@ -37,10 +36,10 @@ use es_math::{Pose, Quat, Vec3};
 use thiserror::Error;
 
 use crate::scene::{
-    ActuatorKind, ActuatorTarget, AssetKind, AssetRef, Body, FrictionCone, Geom, Integrator,
-    Jacobian, JointKind, SceneDesc, SensorKind, SensorTarget, Shape, Solver, TendonKind,
+    ActuatorKind, ActuatorTarget, AssetKind, AssetRef, Body, Geom, JointKind, SceneDesc,
+    SensorKind, SensorTarget, Shape, TendonKind,
 };
-use crate::texture::{Builtin, ColorSpace, Mark, TexKind, TextureData};
+use crate::texture::{Builtin, ColorSpace, TexKind, TextureData};
 
 /// Why a scene was not written.
 #[derive(Debug, Error)]
@@ -52,9 +51,42 @@ pub enum WriteError {
     Io { path: String, reason: String },
 }
 
-fn no(what: impl Into<String>) -> WriteError {
-    WriteError::Inexpressible(what.into())
+macro_rules! no {
+    ($($t:tt)*) => { WriteError::Inexpressible(format!($($t)*)) };
 }
+
+/// The enums' MJCF spellings, indexed by declaration order.
+const INTEGRATORS: [&str; 4] = ["Euler", "RK4", "implicit", "implicitfast"];
+const CONES: [&str; 2] = ["pyramidal", "elliptic"];
+const JACOBIANS: [&str; 3] = ["dense", "sparse", "auto"];
+const SOLVERS: [&str; 3] = ["PGS", "CG", "Newton"];
+const TEX_KINDS: [&str; 3] = ["2d", "cube", "skybox"];
+const COLORSPACES: [&str; 3] = ["auto", "sRGB", "linear"];
+const BUILTINS: [&str; 4] = ["none", "gradient", "checker", "flat"];
+const MARKS: [&str; 4] = ["none", "edge", "cross", "random"];
+const SENSORS: [&str; 12] = [
+    "jointpos",
+    "jointvel",
+    "actuatorfrc",
+    "framepos",
+    "framequat",
+    "accelerometer",
+    "gyro",
+    "force",
+    "torque",
+    "touch",
+    "rangefinder",
+    "camprojection",
+];
+/// `<texture>`'s six single-face file attributes, in face order.
+const SIDES: [&str; 6] = [
+    "fileright",
+    "fileleft",
+    "fileup",
+    "filedown",
+    "filefront",
+    "fileback",
+];
 
 /// Writes `scene` as MJCF text and its mesh and texture files under `out_dir`; the caller
 /// writes the returned text to a file in `out_dir`.
@@ -63,24 +95,19 @@ pub fn write_mjcf(scene: &SceneDesc, out_dir: &Path) -> Result<String, WriteErro
     w.document()?;
     for (rel, bytes) in &w.files {
         let path = out_dir.join(rel);
-        let io = |e: std::io::Error| WriteError::Io {
+        let fail = |reason: String| WriteError::Io {
             path: path.display().to_string(),
-            reason: e.to_string(),
+            reason,
         };
         match std::fs::read(&path) {
             Ok(old) if &old == bytes => continue,
-            Ok(_) => {
-                return Err(WriteError::Io {
-                    path: path.display().to_string(),
-                    reason: "exists with other bytes; not overwritten".to_owned(),
-                })
-            }
+            Ok(_) => return Err(fail("exists with other bytes; not overwritten".to_owned())),
             Err(_) => {}
         }
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(io)?;
+            std::fs::create_dir_all(parent).map_err(|e| fail(e.to_string()))?;
         }
-        std::fs::write(&path, bytes).map_err(io)?;
+        std::fs::write(&path, bytes).map_err(|e| fail(e.to_string()))?;
     }
     Ok(w.out)
 }
@@ -110,11 +137,11 @@ fn esc(s: &str) -> String {
 /// `v` moved by `k` in {0, +1, -1, +2, -2} units in the last place (by bit pattern).
 fn nudge(v: f64, k: u32) -> f64 {
     let step = u64::from(k.div_ceil(2));
-    if k % 2 == 1 {
-        f64::from_bits(v.to_bits().wrapping_add(step))
+    f64::from_bits(if k % 2 == 1 {
+        v.to_bits().wrapping_add(step)
     } else {
-        f64::from_bits(v.to_bits().wrapping_sub(step))
-    }
+        v.to_bits().wrapping_sub(step)
+    })
 }
 
 /// A value `normalize` maps onto `target` bit for bit, else `target`: `target` scaled by
@@ -127,8 +154,7 @@ fn preimage<const N: usize>(
     normalize: impl Fn([f64; N]) -> [f64; N],
 ) -> [f64; N] {
     for k in 0..=1000u32 {
-        let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
-        let scale = 1.0 + sign * f64::from(k) * 1e-9;
+        let scale = 1.0 + f64::from(k) * if k % 2 == 0 { 1e-9 } else { -1e-9 };
         for d in 0..5u32.pow(N as u32) {
             let mut c = target;
             for (i, v) in c.iter_mut().enumerate() {
@@ -141,16 +167,6 @@ fn preimage<const N: usize>(
     }
     target
 }
-
-/// `<texture>`'s six single-face file attributes, in face order.
-const SIDES: [&str; 6] = [
-    "fileright",
-    "fileleft",
-    "fileup",
-    "filedown",
-    "filefront",
-    "fileback",
-];
 
 /// One element's opening tag, built attribute by attribute.
 struct El(String);
@@ -174,11 +190,14 @@ impl El {
         }
     }
 
-    fn i(self, k: &str, v: i64, default: i64) -> Self {
+    /// An enum or integer attribute, written unless it is the default.
+    #[allow(clippy::needless_pass_by_value)]
+    fn e(self, k: &str, v: impl ToString, default: &str) -> Self {
+        let v = v.to_string();
         if v == default {
             self
         } else {
-            self.s(k, &v.to_string())
+            self.s(k, &v)
         }
     }
 
@@ -190,8 +209,12 @@ impl El {
     }
 
     fn range(self, k: &str, v: Option<(f64, f64)>) -> Self {
+        self.opt_vec(k, v.map(|(lo, hi)| vec![lo, hi]))
+    }
+
+    fn opt_vec(self, k: &str, v: Option<Vec<f64>>) -> Self {
         match v {
-            Some((lo, hi)) => self.s(k, &nums(&[lo, hi])),
+            Some(v) => self.s(k, &nums(&v)),
             None => self,
         }
     }
@@ -213,28 +236,16 @@ impl El {
             return self;
         }
         let [x, y, z, w] = preimage([q.x, q.y, q.z, q.w], |[x, y, z, w]| {
-            let mut n = Quat::from_xyzw(x, y, z, w);
-            for _ in 0..times {
-                n = n.normalize();
-            }
+            let n = (0..times).fold(Quat::from_xyzw(x, y, z, w), |q, _| q.normalize());
             [n.x, n.y, n.z, n.w]
         });
         self.s("quat", &nums(&[w, x, y, z]))
     }
 }
 
-/// MJCF name namespaces, in the parser's order of `Names`.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
-enum Ns {
-    Body,
-    Joint,
-    Geom,
-    Site,
-    Camera,
-    Tendon,
-    Actuator,
-    Asset(u8),
-}
+/// MJCF name namespaces: bodies, joints, geoms, sites, cameras, tendons, actuators, and one
+/// per asset kind.
+type Ns = u8;
 
 struct Writer<'a> {
     scene: &'a SceneDesc,
@@ -250,67 +261,41 @@ struct Writer<'a> {
 
 impl<'a> Writer<'a> {
     fn new(scene: &'a SceneDesc) -> Self {
-        let mut names = BTreeMap::new();
-        for b in &scene.bodies {
-            names.insert(b.id, (Ns::Body, b.name.as_str()));
-            names.extend(b.geoms.iter().map(|g| (g.id, (Ns::Geom, g.name.as_str()))));
-            names.extend(b.sites.iter().map(|s| (s.id, (Ns::Site, s.name.as_str()))));
-        }
-        names.extend(
-            scene
-                .joints
-                .iter()
-                .map(|j| (j.id, (Ns::Joint, j.name.as_str()))),
-        );
-        names.extend(
-            scene
-                .cameras
-                .iter()
-                .map(|c| (c.id, (Ns::Camera, c.name.as_str()))),
-        );
-        names.extend(
-            scene
-                .tendons
-                .iter()
-                .map(|t| (t.id, (Ns::Tendon, t.name.as_str()))),
-        );
-        names.extend(
-            scene
-                .actuators
-                .iter()
-                .map(|a| (a.id, (Ns::Actuator, a.name.as_str()))),
-        );
-        names.extend(
-            scene
-                .assets
-                .iter()
-                .map(|a| (a.id, (Ns::Asset(a.kind as u8), a.name.as_str()))),
-        );
+        let s = scene;
+        let bodies = s.bodies.iter();
+        let names: BTreeMap<StableId, (Ns, &str)> = (bodies.clone().map(|b| (b.id, 0, &b.name)))
+            .chain(s.joints.iter().map(|j| (j.id, 1, &j.name)))
+            .chain(
+                bodies
+                    .clone()
+                    .flat_map(|b| &b.geoms)
+                    .map(|g| (g.id, 2, &g.name)),
+            )
+            .chain(bodies.flat_map(|b| &b.sites).map(|x| (x.id, 3, &x.name)))
+            .chain(s.cameras.iter().map(|c| (c.id, 4, &c.name)))
+            .chain(s.tendons.iter().map(|t| (t.id, 5, &t.name)))
+            .chain(s.actuators.iter().map(|a| (a.id, 6, &a.name)))
+            .chain(s.assets.iter().map(|a| (a.id, 7 + a.kind as u8, &a.name)))
+            .map(|(id, ns, name)| (id, (ns, name.as_str())))
+            .collect();
         let mut counts = BTreeMap::new();
         for key in names.values() {
             *counts.entry(*key).or_insert(0) += 1;
         }
-        let mut referenced = BTreeSet::new();
-        for p in &scene.contact_pairs {
-            referenced.extend([p.geom1, p.geom2]);
-        }
-        for (a, b) in &scene.contact_excludes {
-            referenced.extend([*a, *b]);
-        }
-        for t in &scene.tendons {
+        let mut referenced: BTreeSet<StableId> = s
+            .contact_excludes
+            .iter()
+            .flat_map(|(a, b)| [*a, *b])
+            .collect();
+        referenced.extend(s.contact_pairs.iter().flat_map(|p| [p.geom1, p.geom2]));
+        for t in &s.tendons {
             match &t.kind {
                 TendonKind::Fixed { joints } => referenced.extend(joints.iter().map(|j| j.0)),
                 TendonKind::Spatial { sites } => referenced.extend(sites.iter().copied()),
             }
         }
-        for a in &scene.actuators {
-            let (ActuatorTarget::Joint(id) | ActuatorTarget::Tendon(id) | ActuatorTarget::Site(id)) =
-                a.target;
-            referenced.insert(id);
-        }
-        for s in &scene.sensors {
-            referenced.insert(sensor_target(s.target).1);
-        }
+        referenced.extend(s.actuators.iter().map(|a| actuator_target(a.target).1));
+        referenced.extend(s.sensors.iter().map(|x| sensor_target(x.target).1));
         Self {
             scene,
             out: String::new(),
@@ -325,38 +310,36 @@ impl<'a> Writer<'a> {
     /// The name another element refers to `id` by; it must be unique in its namespace, or the
     /// reader would resolve it to another element.
     fn r(&self, id: StableId) -> Result<&'a str, WriteError> {
-        let (ns, name) = self
-            .names
-            .get(&id)
-            .copied()
-            .ok_or_else(|| no(format!("a reference to {id}, which is not in the scene,")))?;
+        let Some(&(ns, name)) = self.names.get(&id) else {
+            return Err(no!("a reference to {id}, which is not in the scene,"));
+        };
         if self.counts[&(ns, name)] > 1 {
-            return Err(no(format!("a reference to `{name}`, a name used twice,")));
+            return Err(no!("a reference to `{name}`, a name used twice,"));
         }
         Ok(name)
     }
 
-    /// `name=`, unless `name` is the one the parser generates for an unnamed `tag` here.
+    /// `name=`, unless `name` is the one the parser generates for an unnamed `tag` here. A name
+    /// another element of its namespace also has (a URDF's per-link `visual1`) is qualified by
+    /// its owner, `base_link/visual1`: `MuJoCo` refuses a repeated name, so such a scene could
+    /// not be opened at all, and its read-back names (and ids) are the qualified ones.
     fn named(&mut self, el: El, tag: &str, owner: &str, id: StableId, name: &str) -> El {
         let key = format!("{owner}/{tag}");
         let next = self.counters.get(&key).copied().unwrap_or(0) + 1;
         if name == format!("{tag}{next}") && !self.referenced.contains(&id) {
             self.counters.insert(key, next);
-            el
-        } else {
-            el.s("name", name)
+            return el;
         }
+        if self.names.get(&id).is_some_and(|key| self.counts[key] > 1) {
+            let parent = owner.rsplit('/').next().unwrap_or(owner);
+            return el.s("name", &format!("{parent}/{name}"));
+        }
+        el.s("name", name)
     }
 
     fn line(&mut self, depth: usize, El(el): El, close: bool) {
-        let _ = writeln!(
-            self.out,
-            "{:w$}{}{}>",
-            "",
-            el,
-            if close { "/" } else { "" },
-            w = 2 * depth
-        );
+        let close = if close { "/" } else { "" };
+        let _ = writeln!(self.out, "{:w$}{el}{close}>", "", w = 2 * depth);
     }
 
     fn end(&mut self, depth: usize, tag: &str) {
@@ -364,8 +347,8 @@ impl<'a> Writer<'a> {
     }
 
     fn document(&mut self) -> Result<(), WriteError> {
-        let s = self.scene;
-        self.line(0, El::new("mujoco").s("model", &s.name), false);
+        let o = &self.scene.options;
+        self.line(0, El::new("mujoco").s("model", &self.scene.name), false);
         self.line(
             1,
             El::new("compiler")
@@ -373,75 +356,55 @@ impl<'a> Writer<'a> {
                 .s("autolimits", "true"),
             true,
         );
-        self.option();
-        self.assets()?;
+        let option = El::new("option")
+            .s("timestep", &num(o.timestep))
+            .s("gravity", &nums(&[o.gravity.x, o.gravity.y, o.gravity.z]))
+            .s("integrator", INTEGRATORS[o.integrator as usize])
+            .s("cone", CONES[o.cone as usize])
+            .s("jacobian", JACOBIANS[o.jacobian as usize])
+            .s("solver", SOLVERS[o.solver as usize])
+            .s("iterations", &o.iterations.to_string())
+            .s("ls_iterations", &o.ls_iterations.to_string())
+            .s("impratio", &num(o.impratio));
+        self.line(1, option, o.eulerdamp);
+        if !o.eulerdamp {
+            self.line(2, El::new("flag").s("eulerdamp", "disable"), true);
+            self.end(1, "option");
+        }
+        self.section("asset", Self::assets)?;
         self.worldbody()?;
-        self.contact()?;
-        self.tendons()?;
-        self.actuators()?;
-        self.sensors()?;
+        self.section("contact", Self::contact)?;
+        self.section("tendon", Self::tendons)?;
+        self.section("actuator", Self::actuators)?;
+        self.section("sensor", Self::sensors)?;
         self.end(0, "mujoco");
         Ok(())
     }
 
-    fn option(&mut self) {
-        let o = &self.scene.options;
-        let el = El::new("option")
-            .s("timestep", &num(o.timestep))
-            .s("gravity", &nums(&[o.gravity.x, o.gravity.y, o.gravity.z]))
-            .s(
-                "integrator",
-                match o.integrator {
-                    Integrator::Euler => "Euler",
-                    Integrator::Rk4 => "RK4",
-                    Integrator::Implicit => "implicit",
-                    Integrator::ImplicitFast => "implicitfast",
-                },
-            )
-            .s(
-                "cone",
-                match o.cone {
-                    FrictionCone::Pyramidal => "pyramidal",
-                    FrictionCone::Elliptic => "elliptic",
-                },
-            )
-            .s(
-                "jacobian",
-                match o.jacobian {
-                    Jacobian::Dense => "dense",
-                    Jacobian::Sparse => "sparse",
-                    Jacobian::Auto => "auto",
-                },
-            )
-            .s(
-                "solver",
-                match o.solver {
-                    Solver::Pgs => "PGS",
-                    Solver::Cg => "CG",
-                    Solver::Newton => "Newton",
-                },
-            )
-            .s("iterations", &o.iterations.to_string())
-            .s("ls_iterations", &o.ls_iterations.to_string())
-            .s("impratio", &num(o.impratio));
-        if o.eulerdamp {
-            self.line(1, el, true);
+    /// `<tag>` around what `body` writes, or nothing when it writes nothing.
+    fn section(
+        &mut self,
+        tag: &str,
+        body: fn(&mut Self) -> Result<(), WriteError>,
+    ) -> Result<(), WriteError> {
+        let mark = self.out.len();
+        self.line(1, El::new(tag), false);
+        let inner = self.out.len();
+        body(self)?;
+        if self.out.len() == inner {
+            self.out.truncate(mark);
         } else {
-            self.line(1, el, false);
-            self.line(2, El::new("flag").s("eulerdamp", "disable"), true);
-            self.end(1, "option");
+            self.end(1, tag);
         }
+        Ok(())
     }
 
     // ---- <asset> ----------------------------------------------------------------------
 
     /// Where an asset file goes: its own path when that stays inside `out_dir`.
     fn file_path(a: &AssetRef, path: &str, suffix: &str) -> String {
-        let safe = !path.is_empty()
-            && Path::new(path)
-                .components()
-                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
-        if safe {
+        let inside = |c: Component| matches!(c, Component::Normal(_) | Component::CurDir);
+        if !path.is_empty() && Path::new(path).components().all(inside) {
             return path.to_owned();
         }
         let ext = Path::new(path)
@@ -458,158 +421,103 @@ impl<'a> Writer<'a> {
                 }
             })
             .collect();
-        // ponytail: two assets whose names sanitise alike collide here; the conflict check in
-        // `add_file` refuses that instead of overwriting.
+        // ponytail: two assets whose names sanitise alike collide here; `add_file` refuses
+        // that instead of overwriting.
         format!("{}/{stem}{suffix}{ext}", a.kind.tag())
     }
 
-    fn add_file(&mut self, rel: String, bytes: Vec<u8>) -> Result<(), WriteError> {
-        match self.files.get(&rel) {
-            Some(old) if *old != bytes => Err(no(format!("two different files at `{rel}`"))),
-            _ => {
-                self.files.insert(rel, bytes);
-                Ok(())
-            }
+    fn add_file(&mut self, rel: &str, bytes: Vec<u8>) -> Result<(), WriteError> {
+        if self.files.get(rel).is_some_and(|old| *old != bytes) {
+            return Err(no!("two different files at `{rel}`"));
         }
+        self.files.insert(rel.to_owned(), bytes);
+        Ok(())
     }
 
     fn assets(&mut self) -> Result<(), WriteError> {
-        if self.scene.assets.is_empty() {
-            return Ok(());
-        }
-        self.line(1, El::new("asset"), false);
         for a in &self.scene.assets {
             match a.kind {
                 AssetKind::Mesh => self.mesh(a)?,
                 AssetKind::Texture => self.texture(a)?,
                 AssetKind::Material => self.material(a)?,
                 AssetKind::HeightField => {
-                    return Err(no(format!(
+                    return Err(no!(
                         "height field `{}` (SceneDesc carries no samples)",
                         a.name
-                    )))
+                    ))
                 }
             }
         }
-        self.end(1, "asset");
         Ok(())
     }
 
     fn mesh(&mut self, a: &AssetRef) -> Result<(), WriteError> {
-        let data = self.scene.meshes.get(&a.id).ok_or_else(|| {
-            no(format!(
-                "mesh `{}` (not loaded: run mesh::load first)",
-                a.name
-            ))
-        })?;
+        let Some(data) = self.scene.meshes.get(&a.id) else {
+            return Err(no!("mesh `{}` (not loaded: run mesh::load first)", a.name));
+        };
         let ext = Path::new(&a.path)
             .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        let bytes = match ext.as_str() {
-            "stl" => stl(&data.positions, &data.indices),
-            "obj" => obj(&data.positions, data.uvs.as_deref(), &data.indices),
+            .map(|e| e.to_string_lossy().to_lowercase());
+        let bytes = match ext.as_deref() {
+            Some("stl") => stl(&data.positions, &data.indices),
+            Some("obj") => obj(&data.positions, data.uvs.as_deref(), &data.indices),
             _ => {
-                return Err(no(format!(
-                    "mesh `{}` from `{}` (MJCF meshes here are .stl or .obj)",
-                    a.name, a.path
-                )))
+                return Err(no!(
+                    "mesh `{}` from `{}` (only .stl and .obj)",
+                    a.name,
+                    a.path
+                ))
             }
         };
         let rel = Self::file_path(a, &a.path, "");
-        self.add_file(rel.clone(), bytes)?;
+        self.add_file(&rel, bytes)?;
         self.line(2, El::new("mesh").s("name", &a.name).s("file", &rel), true);
         Ok(())
     }
 
     fn texture(&mut self, a: &AssetRef) -> Result<(), WriteError> {
-        let tex = self
-            .scene
-            .textures
-            .get(&a.id)
-            .ok_or_else(|| no(format!("texture `{}` without a declaration", a.name)))?;
-        let s = &tex.spec;
-        let d = crate::texture::TextureSpec::default();
+        let Some(tex) = self.scene.textures.get(&a.id) else {
+            return Err(no!("texture `{}` without a declaration", a.name));
+        };
+        let (s, d) = (&tex.spec, crate::texture::TextureSpec::default());
         let mut el = El::new("texture")
             .s("name", &a.name)
-            .s(
-                "type",
-                match s.kind {
-                    TexKind::TwoD => "2d",
-                    TexKind::Cube => "cube",
-                    TexKind::Skybox => "skybox",
-                },
-            )
+            .s("type", TEX_KINDS[s.kind as usize])
+            .e("colorspace", COLORSPACES[s.colorspace as usize], "auto")
+            .e("builtin", BUILTINS[s.builtin as usize], "none")
+            .e("mark", MARKS[s.mark as usize], "none")
             .f("rgb1", &s.rgb1, &d.rgb1)
             .f("rgb2", &s.rgb2, &d.rgb2)
             .f("markrgb", &s.markrgb, &d.markrgb)
-            .f("random", &[s.random], &[d.random]);
-        for (attr, value, default) in [
-            (
-                "colorspace",
-                match s.colorspace {
-                    ColorSpace::Auto => "auto",
-                    ColorSpace::Srgb => "sRGB",
-                    ColorSpace::Linear => "linear",
-                },
-                "auto",
-            ),
-            (
-                "builtin",
-                match s.builtin {
-                    Builtin::None => "none",
-                    Builtin::Gradient => "gradient",
-                    Builtin::Checker => "checker",
-                    Builtin::Flat => "flat",
-                },
-                "none",
-            ),
-            (
-                "mark",
-                match s.mark {
-                    Mark::None => "none",
-                    Mark::Edge => "edge",
-                    Mark::Cross => "cross",
-                    Mark::Random => "random",
-                },
-                "none",
-            ),
-        ] {
-            if value != default {
-                el = el.s(attr, value);
-            }
-        }
-        for (attr, v) in [("width", s.width), ("height", s.height)] {
-            if v != 0 {
-                el = el.s(attr, &v.to_string());
-            }
-        }
-        if s.gridsize != d.gridsize {
-            el = el.s("gridsize", &format!("{} {}", s.gridsize[0], s.gridsize[1]));
-        }
-        if s.gridlayout != d.gridlayout {
-            el = el.s("gridlayout", &s.gridlayout);
-        }
+            .f("random", &[s.random], &[d.random])
+            .e("width", s.width, "0")
+            .e("height", s.height, "0")
+            .e(
+                "gridsize",
+                format!("{} {}", s.gridsize[0], s.gridsize[1]),
+                "1 1",
+            )
+            .e("gridlayout", &s.gridlayout, &d.gridlayout);
         let has_files = s.file.is_some() || s.cubefiles.iter().any(Option::is_some);
         if has_files && s.builtin != Builtin::None {
-            return Err(no(format!("texture `{}`: a builtin with a file", a.name)));
+            return Err(no!("texture `{}`: a builtin with a file", a.name));
         }
         let data = match (&tex.data, has_files) {
             (_, false) => None,
             (Some(data), true) => Some(data),
             (None, true) => {
-                return Err(no(format!(
-                    "texture `{}` (not decoded: a skybox, or the scene was not loaded)",
+                return Err(no!(
+                    "texture `{}` (not decoded: a skybox, or not loaded)",
                     a.name
-                )))
+                ))
             }
         };
         // `auto` reads the PNG's own sRGB chunk, so the chunk carries the resolved space.
-        let srgb_chunk = s.colorspace == ColorSpace::Auto && data.is_some_and(|d| d.srgb);
+        let srgb = s.colorspace == ColorSpace::Auto && data.is_some_and(|d| d.srgb);
         if let (Some(file), Some(data)) = (&s.file, data) {
             let (w, h, rgb) = texture_image(data, s.gridsize, &s.gridlayout);
             let rel = Self::file_path(a, file, "");
-            self.add_file(rel.clone(), png(w, h, &rgb, srgb_chunk)?)?;
+            self.add_file(&rel, png(w, h, &rgb, srgb)?)?;
             el = el.s("file", &rel);
         }
         for (f, (file, attr)) in s.cubefiles.iter().zip(SIDES).enumerate() {
@@ -617,9 +525,16 @@ impl<'a> Writer<'a> {
                 continue;
             };
             let face = (data.width * data.width * 3) as usize;
-            let rgb = data.rgb[f * face..(f + 1) * face].to_vec();
             let rel = Self::file_path(a, file, &format!("_{attr}"));
-            self.add_file(rel.clone(), png(data.width, data.width, &rgb, srgb_chunk)?)?;
+            self.add_file(
+                &rel,
+                png(
+                    data.width,
+                    data.width,
+                    &data.rgb[f * face..(f + 1) * face],
+                    srgb,
+                )?,
+            )?;
             el = el.s(attr, &rel);
         }
         self.line(2, el, true);
@@ -631,16 +546,13 @@ impl<'a> Writer<'a> {
         let Some(m) = self.scene.materials.get(&a.id) else {
             // A material that only names a colour: the parser keeps nothing but its name.
             if !a.path.is_empty() {
-                return Err(no(format!(
-                    "material `{}` naming a texture but not drawn",
-                    a.name
-                )));
+                return Err(no!("material `{}` naming a texture but not drawn", a.name));
             }
             self.line(2, el, true);
             return Ok(());
         };
         if m.normal_scale.is_some() {
-            return Err(no(format!("material `{}`: a normal-map scale", a.name)));
+            return Err(no!("material `{}`: a normal-map scale", a.name));
         }
         el = el
             .f("rgba", &m.rgba, &[1.0; 4])
@@ -648,64 +560,54 @@ impl<'a> Writer<'a> {
             .opt("shininess", m.shininess)
             .opt("metallic", m.metallic)
             .opt("roughness", m.roughness)
-            .f("texrepeat", &m.texrepeat, &[1.0, 1.0]);
-        if m.texuniform {
-            el = el.s("texuniform", "true");
-        }
-        // `emission` is always written: it is what makes the reader keep a drawn material.
+            .f("texrepeat", &m.texrepeat, &[1.0, 1.0])
+            .e("texuniform", m.texuniform, "false");
+        // `emission` is always written -- it is what makes the reader keep a drawn material --
+        // except where an emissive layer's strength is the default 1.
         el = match (m.emissive_map, m.emissive) {
             (None, None) => el.s("emission", &num(m.emission)),
-            (Some(_), Some([e, g, b])) if same(&[e, e], &[g, b]) => {
-                if same(&[e], &[m.emission]) {
-                    el.s("emission", &num(e))
-                } else if same(&[m.emission, e], &[0.0, 1.0]) {
-                    el
-                } else {
-                    return Err(no(format!(
-                        "material `{}`: emission {} with an emissive map of strength {e}",
-                        a.name, m.emission
-                    )));
-                }
+            (Some(_), Some([e, g, b])) if same(&[e, e], &[g, b]) && same(&[e], &[m.emission]) => {
+                el.s("emission", &num(e))
             }
+            (Some(_), Some(e)) if same(&[m.emission], &[0.0]) && same(&e, &[1.0; 3]) => el,
             _ => {
-                return Err(no(format!(
-                    "material `{}`: an emissive colour other than an MJCF emissive layer's",
+                return Err(no!(
+                    "material `{}`: an emissive colour no MJCF emissive layer gives",
                     a.name
-                )))
+                ))
             }
         };
-        let layers: Vec<(&str, StableId)> = [
+        let maps = [
             ("rgb", m.rgb),
             ("orm", m.orm),
             ("metallic", m.metallic_map),
             ("roughness", m.roughness_map),
             ("normal", m.normal_map),
             ("emissive", m.emissive_map),
-        ]
-        .into_iter()
-        .filter_map(|(role, t)| t.map(|t| (role, t)))
-        .collect();
+        ];
+        let layers: Vec<(&str, StableId)> = maps
+            .into_iter()
+            .filter_map(|(role, t)| Some((role, t?)))
+            .collect();
         if !a.path.is_empty() {
             // The `texture` attribute: the asset path is that texture's name.
             if layers.len() != 1 || layers[0].0 != "rgb" || self.r(layers[0].1)? != a.path {
-                return Err(no(format!(
+                return Err(no!(
                     "material `{}`: a `texture` attribute together with other maps",
                     a.name
-                )));
+                ));
             }
             self.line(2, el.s("texture", &a.path), true);
             return Ok(());
         }
-        if layers.is_empty() {
-            self.line(2, el, true);
-            return Ok(());
+        self.line(2, el, layers.is_empty());
+        if !layers.is_empty() {
+            for (role, t) in layers {
+                let el = El::new("layer").s("role", role).s("texture", self.r(t)?);
+                self.line(3, el, true);
+            }
+            self.end(2, "material");
         }
-        self.line(2, el, false);
-        for (role, t) in layers {
-            let name = self.r(t)?;
-            self.line(3, El::new("layer").s("role", role).s("texture", name), true);
-        }
-        self.end(2, "material");
         Ok(())
     }
 
@@ -722,10 +624,9 @@ impl<'a> Writer<'a> {
             .iter()
             .find(|b| b.parent.is_none() && b.name == "world");
         self.line(1, El::new("worldbody"), false);
-        if let Some(world) = world {
-            self.contents(world, "world", 2)?;
-        } else {
-            self.cameras(None, "world", 2);
+        match world {
+            Some(world) => self.contents(world, "world", 2)?,
+            None => self.cameras(None, "world", 2),
         }
         for root in children.get(&None).into_iter().flatten() {
             if world.is_some_and(|w| w.id == root.id) {
@@ -743,10 +644,7 @@ impl<'a> Writer<'a> {
             .iter()
             .find(|c| c.body.is_some_and(|b| !homes.contains(&b)))
         {
-            return Err(no(format!(
-                "camera `{}` on a body not in the scene",
-                c.name
-            )));
+            return Err(no!("camera `{}` on a body not in the scene", c.name));
         }
         Ok(())
     }
@@ -758,14 +656,10 @@ impl<'a> Writer<'a> {
         children: &BTreeMap<Option<StableId>, Vec<&'a Body>>,
         depth: usize,
     ) -> Result<(), WriteError> {
-        let mut el = El::new("body");
-        el = self.named(el, "body", parent_path, b.id, &b.name);
-        el = el.pose(b.pose);
-        if let Some(g) = self.scene.gravcomp.get(&b.id) {
-            el = el.s("gravcomp", &num(*g));
-        }
+        let el = self.named(El::new("body"), "body", parent_path, b.id, &b.name);
+        let gravcomp = self.scene.gravcomp.get(&b.id).copied();
+        self.line(depth, el.pose(b.pose).opt("gravcomp", gravcomp), false);
         let path = format!("{parent_path}/{}", b.name);
-        self.line(depth, el, false);
         self.contents(b, &path, depth + 1)?;
         for child in children.get(&Some(b.id)).into_iter().flatten() {
             self.body(child, &path, children, depth + 1)?;
@@ -777,16 +671,22 @@ impl<'a> Writer<'a> {
     /// A body's own elements: inertial, joints, geoms, sites, cameras.
     fn contents(&mut self, b: &'a Body, path: &str, depth: usize) -> Result<(), WriteError> {
         let world = path == "world";
-        if world && (!b.pose.position.eq(&Vec3::ZERO) || b.pose.orientation != Quat::IDENTITY) {
-            return Err(no("a pose on the world body"));
-        }
-        if world && self.scene.gravcomp.contains_key(&b.id) {
-            return Err(no("gravcomp on the world body"));
+        let joints: Vec<_> = self
+            .scene
+            .joints
+            .iter()
+            .filter(|j| j.body == b.id)
+            .collect();
+        if world {
+            if let Some(j) = joints.first() {
+                return Err(no!("joint `{}` on the world body", j.name));
+            }
+            let posed = b.pose.position != Vec3::ZERO || b.pose.orientation != Quat::IDENTITY;
+            if posed || b.inertial.is_some() || self.scene.gravcomp.contains_key(&b.id) {
+                return Err(no!("a pose, inertial or gravcomp on the world body"));
+            }
         }
         if let Some(i) = &b.inertial {
-            if world {
-                return Err(no("an inertial on the world body"));
-            }
             let m = i.inertia.matrix();
             let el = El::new("inertial")
                 .s("pos", &nums(&[i.com.x, i.com.y, i.com.z]))
@@ -800,79 +700,62 @@ impl<'a> Writer<'a> {
                     &nums(&[m[0][0], m[1][1], m[2][2], m[0][1], m[0][2], m[1][2]]),
                 )
             } else {
-                return Err(no(format!(
+                return Err(no!(
                     "body `{}`: a full inertia tensor in a rotated frame",
                     b.name
-                )));
+                ));
             };
             self.line(depth, el, true);
         }
-        for j in self.scene.joints.iter().filter(|j| j.body == b.id) {
-            if world {
-                return Err(no(format!("joint `{}` on the world body", j.name)));
+        for j in joints {
+            if j.kind == JointKind::Fixed {
+                // Welded: MJCF spells it as a body without a joint.
+                let name = esc(&j.name).replace("--", "- -");
+                let _ = writeln!(
+                    self.out,
+                    "{:w$}<!-- fixed joint `{name}`: welded -->",
+                    "",
+                    w = 2 * depth
+                );
+                continue;
             }
-            let defaults = j.range.is_none()
+            let plain = j.range.is_none()
+                && j.anchor == Vec3::ZERO
+                && j.axis == Vec3::new(0.0, 0.0, 1.0)
                 && same(
                     &[
-                        j.axis.x,
-                        j.axis.y,
-                        j.axis.z,
-                        j.anchor.x,
-                        j.anchor.y,
-                        j.anchor.z,
                         j.damping,
                         j.armature,
                         j.stiffness,
                         j.friction_loss,
                         j.spring_ref,
                     ],
-                    &[0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                    &[0.0; 5],
                 );
-            let tag = match j.kind {
-                JointKind::Fixed => {
-                    // Welded: MJCF spells it as a body without a joint.
-                    let _ = writeln!(
-                        self.out,
-                        "{:w$}<!-- fixed joint `{}`: welded, no MJCF joint -->",
-                        "",
-                        esc(&j.name).replace("--", "- -"),
-                        w = 2 * depth
-                    );
-                    continue;
-                }
-                JointKind::Free
-                    if defaults
-                        && j.name
-                            == format!(
-                                "freejoint{}",
-                                self.counters
-                                    .get(&format!("{path}/freejoint"))
-                                    .copied()
-                                    .unwrap_or(0)
-                                    + 1
-                            ) =>
-                {
-                    "freejoint"
-                }
-                _ => "joint",
+            let auto_free = format!(
+                "freejoint{}",
+                self.counters
+                    .get(&format!("{path}/freejoint"))
+                    .unwrap_or(&0)
+                    + 1
+            );
+            let tag = if j.kind == JointKind::Free && plain && j.name == auto_free {
+                "freejoint"
+            } else {
+                "joint"
             };
-            let mut el = El::new(tag);
-            el = self.named(el, tag, path, j.id, &j.name);
+            let mut el = self.named(El::new(tag), tag, path, j.id, &j.name);
             if tag == "joint" {
-                let kind = match j.kind {
-                    JointKind::Free => "free",
-                    JointKind::Ball => "ball",
-                    JointKind::Slide => "slide",
-                    _ => "hinge",
-                };
-                if kind != "hinge" {
-                    el = el.s("type", kind);
-                }
                 let axis = preimage([j.axis.x, j.axis.y, j.axis.z], |[x, y, z]| {
                     let n = Vec3::new(x, y, z).normalize();
                     [n.x, n.y, n.z]
                 });
                 el = el
+                    .e(
+                        "type",
+                        ["free", "ball", "hinge", "slide"][j.kind as usize],
+                        "hinge",
+                    )
                     .pos(j.anchor)
                     .f("axis", &axis, &[0.0, 0.0, 1.0])
                     .range("range", j.range)
@@ -889,14 +772,13 @@ impl<'a> Writer<'a> {
             self.line(depth, el, true);
         }
         for site in &b.sites {
-            let mut el = El::new("site");
-            el = self.named(el, "site", path, site.id, &site.name);
-            el = el.pose(site.pose).f(
-                "size",
-                &[site.size.x, site.size.y, site.size.z],
-                &[0.005; 3],
+            let el = self.named(El::new("site"), "site", path, site.id, &site.name);
+            let size = [site.size.x, site.size.y, site.size.z];
+            self.line(
+                depth,
+                el.pose(site.pose).f("size", &size, &[0.005; 3]),
+                true,
             );
-            self.line(depth, el, true);
         }
         self.cameras((!world).then_some(b.id), path, depth);
         Ok(())
@@ -904,64 +786,58 @@ impl<'a> Writer<'a> {
 
     fn cameras(&mut self, body: Option<StableId>, path: &str, depth: usize) {
         for c in self.scene.cameras.iter().filter(|c| c.body == body) {
-            let mut el = El::new("camera");
-            el = self.named(el, "camera", path, c.id, &c.name);
+            let el = self.named(El::new("camera"), "camera", path, c.id, &c.name);
             let deg = c.fovy / DEG_TO_RAD;
             let deg = (0..3)
                 .map(|k| nudge(deg, k))
                 .find(|d| same(&[d * DEG_TO_RAD], &[c.fovy]))
                 .unwrap_or(deg);
-            el = el.pose(c.pose).f("fovy", &[deg], &[45.0]);
-            self.line(depth, el, true);
+            self.line(depth, el.pose(c.pose).f("fovy", &[deg], &[45.0]), true);
         }
     }
 
     fn geom(&mut self, g: &Geom, path: &str) -> Result<El, WriteError> {
         if g.visual_only != (g.contype == 0 && g.conaffinity == 0) {
-            return Err(no(format!(
+            return Err(no!(
                 "geom `{}`: visual_only {} with contype {} conaffinity {}",
-                g.name, g.visual_only, g.contype, g.conaffinity
-            )));
+                g.name,
+                g.visual_only,
+                g.contype,
+                g.conaffinity
+            ));
         }
-        let mut el = El::new("geom");
-        el = self.named(el, "geom", path, g.id, &g.name);
-        el = match g.shape {
+        let el = self.named(El::new("geom"), "geom", path, g.id, &g.name);
+        let (kind, size) = match g.shape {
             Shape::Plane {
                 half_x,
                 half_y,
                 grid,
-            } => el
-                .s("type", "plane")
-                .s("size", &nums(&[half_x, half_y, grid])),
-            Shape::Sphere { radius } => el.s("type", "sphere").s("size", &num(radius)),
+            } => ("plane", vec![half_x, half_y, grid]),
+            Shape::Sphere { radius } => ("sphere", vec![radius]),
             Shape::Capsule {
                 radius,
                 half_length,
-            } => el
-                .s("type", "capsule")
-                .s("size", &nums(&[radius, half_length])),
+            } => ("capsule", vec![radius, half_length]),
             Shape::Cylinder {
                 radius,
                 half_length,
-            } => el
-                .s("type", "cylinder")
-                .s("size", &nums(&[radius, half_length])),
-            Shape::Box { half_extents: v } => {
-                el.s("type", "box").s("size", &nums(&[v.x, v.y, v.z]))
-            }
-            Shape::Ellipsoid { radii: v } => {
-                el.s("type", "ellipsoid").s("size", &nums(&[v.x, v.y, v.z]))
-            }
+            } => ("cylinder", vec![radius, half_length]),
+            Shape::Box { half_extents: v } => ("box", vec![v.x, v.y, v.z]),
+            Shape::Ellipsoid { radii: v } => ("ellipsoid", vec![v.x, v.y, v.z]),
+            Shape::Mesh { .. } | Shape::HeightField { .. } => ("", vec![]),
+        };
+        let mut el = match g.shape {
             Shape::Mesh { asset } => el.s("type", "mesh").s("mesh", self.r(asset)?),
             Shape::HeightField { asset } => el.s("type", "hfield").s("hfield", self.r(asset)?),
+            _ => el.s("type", kind).s("size", &nums(&size)),
         };
         el = el
             .pose(g.pose)
             .f("friction", &g.friction, &[1.0, 0.005, 0.0001])
-            .i("contype", g.contype.into(), 1)
-            .i("conaffinity", g.conaffinity.into(), 1)
-            .i("condim", g.condim.into(), 3)
-            .i("priority", g.priority.into(), 0)
+            .e("contype", g.contype, "1")
+            .e("conaffinity", g.conaffinity, "1")
+            .e("condim", g.condim, "3")
+            .e("priority", g.priority, "0")
             .f("density", &[g.density], &[1000.0])
             .opt("mass", g.mass)
             .f("margin", &[g.margin], &[0.0])
@@ -979,28 +855,20 @@ impl<'a> Writer<'a> {
 
     fn contact(&mut self) -> Result<(), WriteError> {
         let s = self.scene;
-        if s.contact_pairs.is_empty() && s.contact_excludes.is_empty() {
-            return Ok(());
-        }
-        self.line(1, El::new("contact"), false);
         for p in &s.contact_pairs {
-            let mut el = El::new("pair")
+            let el = El::new("pair")
                 .s("geom1", self.r(p.geom1)?)
-                .s("geom2", self.r(p.geom2)?);
-            if let Some(c) = p.condim {
-                el = el.s("condim", &c.to_string());
-            }
-            for (k, v) in [
-                ("friction", p.friction.map(|v| v.to_vec())),
-                ("solref", p.solref.map(|v| v.to_vec())),
-                ("solimp", p.solimp.map(|v| v.to_vec())),
-                ("margin", p.margin.map(|v| vec![v])),
-                ("gap", p.gap.map(|v| vec![v])),
-            ] {
-                if let Some(v) = v {
-                    el = el.s(k, &nums(&v));
-                }
-            }
+                .s("geom2", self.r(p.geom2)?)
+                .e(
+                    "condim",
+                    p.condim.map_or(String::new(), |c| c.to_string()),
+                    "",
+                )
+                .opt_vec("friction", p.friction.map(|v| v.to_vec()))
+                .opt_vec("solref", p.solref.map(|v| v.to_vec()))
+                .opt_vec("solimp", p.solimp.map(|v| v.to_vec()))
+                .opt("margin", p.margin)
+                .opt("gap", p.gap);
             self.line(2, el, true);
         }
         for (a, b) in &s.contact_excludes {
@@ -1009,15 +877,10 @@ impl<'a> Writer<'a> {
                 .s("body2", self.r(*b)?);
             self.line(2, el, true);
         }
-        self.end(1, "contact");
         Ok(())
     }
 
     fn tendons(&mut self) -> Result<(), WriteError> {
-        if self.scene.tendons.is_empty() {
-            return Ok(());
-        }
-        self.line(1, El::new("tendon"), false);
         for t in &self.scene.tendons {
             let tag = match t.kind {
                 TendonKind::Fixed { .. } => "fixed",
@@ -1032,10 +895,9 @@ impl<'a> Writer<'a> {
             match &t.kind {
                 TendonKind::Fixed { joints } => {
                     for (j, coef) in joints {
-                        let el =
-                            El::new("joint")
-                                .s("joint", self.r(*j)?)
-                                .f("coef", &[*coef], &[1.0]);
+                        let el = El::new("joint")
+                            .s("joint", self.r(*j)?)
+                            .s("coef", &num(*coef));
                         self.line(3, el, true);
                     }
                 }
@@ -1048,15 +910,10 @@ impl<'a> Writer<'a> {
             }
             self.end(2, tag);
         }
-        self.end(1, "tendon");
         Ok(())
     }
 
     fn actuators(&mut self) -> Result<(), WriteError> {
-        if self.scene.actuators.is_empty() {
-            return Ok(());
-        }
-        self.line(1, El::new("actuator"), false);
         for a in &self.scene.actuators {
             let el =
                 match a.kind {
@@ -1065,25 +922,30 @@ impl<'a> Writer<'a> {
                         .f("kp", &[kp], &[1.0])
                         .f("kv", &[kv], &[0.0]),
                     ActuatorKind::Velocity { kv } => El::new("velocity").f("kv", &[kv], &[1.0]),
-                    ActuatorKind::General { gain, bias } => {
-                        let mut el = El::new("general")
-                            .f("gainprm", &gain, &[1.0, 0.0, 0.0])
-                            .f("biasprm", &bias, &[0.0; 3]);
-                        // `MuJoCo` reads the affine terms only under these types.
-                        if !same(&gain[1..], &[0.0; 2]) {
-                            el = el.s("gaintype", "affine");
-                        }
-                        if !same(&bias, &[0.0; 3]) {
-                            el = el.s("biastype", "affine");
-                        }
-                        el
-                    }
+                    // `MuJoCo` reads the affine terms only under the affine types.
+                    ActuatorKind::General { gain, bias } => El::new("general")
+                        .f("gainprm", &gain, &[1.0, 0.0, 0.0])
+                        .f("biasprm", &bias, &[0.0; 3])
+                        .e(
+                            "gaintype",
+                            if same(&gain[1..], &[0.0; 2]) {
+                                "fixed"
+                            } else {
+                                "affine"
+                            },
+                            "fixed",
+                        )
+                        .e(
+                            "biastype",
+                            if same(&bias, &[0.0; 3]) {
+                                "none"
+                            } else {
+                                "affine"
+                            },
+                            "none",
+                        ),
                 };
-            let (attr, id) = match a.target {
-                ActuatorTarget::Joint(id) => ("joint", id),
-                ActuatorTarget::Tendon(id) => ("tendon", id),
-                ActuatorTarget::Site(id) => ("site", id),
-            };
+            let (attr, id) = actuator_target(a.target);
             let el = el
                 .s("name", &a.name)
                 .s(attr, self.r(id)?)
@@ -1092,67 +954,51 @@ impl<'a> Writer<'a> {
                 .range("forcerange", a.force_range);
             self.line(2, el, true);
         }
-        self.end(1, "actuator");
         Ok(())
     }
 
     fn sensors(&mut self) -> Result<(), WriteError> {
-        if self.scene.sensors.is_empty() {
-            return Ok(());
-        }
-        self.line(1, El::new("sensor"), false);
         for s in &self.scene.sensors {
             let (kind, id) = sensor_target(s.target);
-            let name = self.r(id)?;
-            let el = match (s.kind, kind) {
-                (SensorKind::JointPos, "joint") => El::new("jointpos").s("joint", name),
-                (SensorKind::JointVel, "joint") => El::new("jointvel").s("joint", name),
-                (SensorKind::ActuatorFrc, "actuator") => El::new("actuatorfrc").s("actuator", name),
-                (
-                    SensorKind::FramePos | SensorKind::FrameQuat,
-                    "body" | "site" | "geom" | "camera",
-                ) => {
-                    let tag = if s.kind == SensorKind::FramePos {
-                        "framepos"
-                    } else {
-                        "framequat"
-                    };
-                    El::new(tag).s("objtype", kind).s("objname", name)
-                }
-                (SensorKind::Camera, "camera") => El::new("camprojection").s("camera", name),
-                (
-                    SensorKind::Accelerometer
-                    | SensorKind::Gyro
-                    | SensorKind::Force
-                    | SensorKind::Torque
-                    | SensorKind::Touch
-                    | SensorKind::RangeFinder,
-                    "site",
-                ) => El::new(match s.kind {
-                    SensorKind::Accelerometer => "accelerometer",
-                    SensorKind::Gyro => "gyro",
-                    SensorKind::Force => "force",
-                    SensorKind::Torque => "torque",
-                    SensorKind::Touch => "touch",
-                    _ => "rangefinder",
-                })
-                .s("site", name),
-                _ => {
-                    return Err(no(format!(
-                        "sensor `{}`: a {:?} sensor on a {kind}",
-                        s.name, s.kind
-                    )))
-                }
+            let attr = match s.kind {
+                SensorKind::JointPos | SensorKind::JointVel => "joint",
+                SensorKind::ActuatorFrc => "actuator",
+                SensorKind::Camera => "camera",
+                SensorKind::FramePos | SensorKind::FrameQuat => "objname",
+                _ => "site",
             };
-            let el = el.s("name", &s.name).f("noise", &[s.noise], &[0.0]).f(
-                "cutoff",
-                &[s.cutoff],
-                &[0.0],
-            );
+            let fits = if attr == "objname" {
+                !matches!(kind, "joint" | "actuator")
+            } else {
+                attr == kind
+            };
+            if !fits {
+                return Err(no!(
+                    "sensor `{}`: a {:?} sensor on a {kind}",
+                    s.name,
+                    s.kind
+                ));
+            }
+            let mut el = El::new(SENSORS[s.kind as usize]);
+            if attr == "objname" {
+                el = el.s("objtype", kind);
+            }
+            let el = el
+                .s(attr, self.r(id)?)
+                .s("name", &s.name)
+                .f("noise", &[s.noise], &[0.0])
+                .f("cutoff", &[s.cutoff], &[0.0]);
             self.line(2, el, true);
         }
-        self.end(1, "sensor");
         Ok(())
+    }
+}
+
+fn actuator_target(t: ActuatorTarget) -> (&'static str, StableId) {
+    match t {
+        ActuatorTarget::Joint(id) => ("joint", id),
+        ActuatorTarget::Tendon(id) => ("tendon", id),
+        ActuatorTarget::Site(id) => ("site", id),
     }
 }
 
@@ -1172,15 +1018,16 @@ fn sensor_target(t: SensorTarget) -> (&'static str, StableId) {
 /// Binary STL with zero facet normals, so the reader keeps the stored winding; its
 /// first-seen deduplication gives back the same positions and indices.
 fn stl(positions: &[[f32; 3]], indices: &[u32]) -> Vec<u8> {
-    let tris = indices.len() / 3;
     let mut out = vec![0u8; 80];
-    out.extend_from_slice(&u32::try_from(tris).unwrap_or(u32::MAX).to_le_bytes());
+    out.extend_from_slice(
+        &u32::try_from(indices.len() / 3)
+            .unwrap_or(u32::MAX)
+            .to_le_bytes(),
+    );
     for tri in indices.chunks_exact(3) {
         out.extend_from_slice(&[0u8; 12]);
-        for &i in tri {
-            for c in positions[i as usize] {
-                out.extend_from_slice(&c.to_le_bytes());
-            }
+        for c in tri.iter().flat_map(|&i| positions[i as usize]) {
+            out.extend_from_slice(&c.to_le_bytes());
         }
         out.extend_from_slice(&[0u8; 2]);
     }
@@ -1197,18 +1044,17 @@ fn obj(positions: &[[f32; 3]], uvs: Option<&[[f32; 2]]>, indices: &[u32]) -> Vec
     for t in uvs.unwrap_or_default() {
         let v0 = 1.0 - t[1];
         let v = [0u32, 1, u32::MAX, 2, u32::MAX - 1]
-            .iter()
-            .map(|d| f32::from_bits(v0.to_bits().wrapping_add(*d)))
+            .map(|d| f32::from_bits(v0.to_bits().wrapping_add(d)))
+            .into_iter()
             .find(|v| (1.0 - v).to_bits() == t[1].to_bits())
             .unwrap_or(v0);
         let _ = writeln!(out, "vt {:?} {v:?}", t[0]);
     }
     for tri in indices.chunks_exact(3) {
         let [a, b, c] = [tri[0] + 1, tri[1] + 1, tri[2] + 1];
-        let _ = if uvs.is_some() {
-            writeln!(out, "f {a}/{a} {b}/{b} {c}/{c}")
-        } else {
-            writeln!(out, "f {a} {b} {c}")
+        let _ = match uvs {
+            Some(_) => writeln!(out, "f {a}/{a} {b}/{b} {c}/{c}"),
+            None => writeln!(out, "f {a} {b} {c}"),
         };
     }
     out.into_bytes()
@@ -1216,31 +1062,31 @@ fn obj(positions: &[[f32; 3]], uvs: Option<&[[f32; 2]]>, indices: &[u32]) -> Vec
 
 /// The single image a texture's `file` was cut from: a 2D texture as it is, a cube's
 /// `gridsize` x `gridlayout` sheet (one face for a 1 x 1 grid; undeclared cells black).
-fn texture_image(data: &TextureData, grid: [u32; 2], layout: &str) -> (u32, u32, Vec<u8>) {
-    if data.kind == TexKind::TwoD {
-        return (data.width, data.height, data.rgb.clone());
-    }
+fn texture_image(data: &TextureData, [rows, cols]: [u32; 2], layout: &str) -> (u32, u32, Vec<u8>) {
     let w = data.width;
     let face = (w * w * 3) as usize;
-    let [rows, cols] = grid;
+    if data.kind == TexKind::TwoD {
+        return (w, data.height, data.rgb.clone());
+    }
     if rows * cols == 1 {
         return (w, w, data.rgb[..face].to_vec());
     }
-    let (width, height) = (cols * w, rows * w);
-    let mut rgb = vec![0u8; (width * height * 3) as usize];
+    let (width, row) = (cols * w, (w * 3) as usize);
+    let mut rgb = vec![0u8; (width * rows * w * 3) as usize];
     for (k, symbol) in layout.chars().enumerate() {
         let Some(f) = "RLUDFB".find(symbol) else {
             continue;
         };
         let (r0, c0) = (w * (k as u32 / cols), w * (k as u32 % cols));
         for j in 0..w {
-            let dst = (((j + r0) * width + c0) * 3) as usize;
-            let src = f * face + (j * w * 3) as usize;
-            rgb[dst..dst + (w * 3) as usize]
-                .copy_from_slice(&data.rgb[src..src + (w * 3) as usize]);
+            let (dst, src) = (
+                (((j + r0) * width + c0) * 3) as usize,
+                f * face + j as usize * row,
+            );
+            rgb[dst..dst + row].copy_from_slice(&data.rgb[src..src + row]);
         }
     }
-    (width, height, rgb)
+    (width, rows * w, rgb)
 }
 
 /// 8-bit RGB PNG, with an sRGB chunk when the texture's `auto` colour space resolved to it.

@@ -20,6 +20,7 @@ pub mod ir;
 pub mod r#loop;
 pub mod mcp;
 pub mod policy;
+pub mod scene;
 pub mod task;
 pub mod telemetry;
 pub mod train;

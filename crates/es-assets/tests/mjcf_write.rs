@@ -117,7 +117,7 @@ fn every_committed_mjcf_scene_round_trips() {
     // G1's robot part of the SO-101 scene document, and HT2's MJCF twin of a glTF box.
     xmls(&root().join("esscene"), &mut files);
     xmls(&root().join("gltf"), &mut files);
-    let mut failures = Vec::new();
+    let (mut failures, mut pairs) = (Vec::new(), Vec::new());
     for path in files {
         let rel = path
             .strip_prefix(root())
@@ -129,14 +129,17 @@ fn every_committed_mjcf_scene_round_trips() {
             Err(e) => Err(format!("not read: {e}")),
             Ok(original) => match round_trip(&original, "fixture") {
                 Err(e) => Err(e),
-                Ok((again, _)) => match differs(&original, &again) {
+                Ok((again, export)) => match differs(&original, &again) {
                     Some(d) => Err(format!("differs at {d}")),
-                    None => Ok(original.scene_hash()),
+                    None => Ok((original.scene_hash(), export)),
                 },
             },
         };
         match outcome {
-            Ok(hash) => println!("{rel:<45} round trips, scene_hash {}", hex(&hash)),
+            Ok((hash, export)) => {
+                println!("{rel:<45} round trips, scene_hash {}", hex(&hash));
+                pairs.push((path.clone(), export));
+            }
             Err(why) => {
                 println!("{rel:<45} {}", why.lines().next().unwrap_or_default());
                 failures.push((rel, why));
@@ -151,6 +154,34 @@ fn every_committed_mjcf_scene_round_trips() {
         );
     }
     assert_eq!(failures.len(), EXPECTED.len(), "{failures:#?}");
+
+    // `MuJoCo` opens every export whose original it opens.
+    let Some(python) = std::env::var("ES_PYTHON")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+    else {
+        println!("SKIP MuJoCo loads: ES_PYTHON is not set");
+        return;
+    };
+    let script = "import sys, mujoco\n\
+                  for a, b in zip(sys.argv[1::2], sys.argv[2::2]):\n\
+                  \x20   try:\n\
+                  \x20       mujoco.MjModel.from_xml_path(a)\n\
+                  \x20   except Exception as e:\n\
+                  \x20       print('original refused', a, e); continue\n\
+                  \x20   mujoco.MjModel.from_xml_path(b)\n\
+                  \x20   print('loads', b)\n";
+    let out = Command::new(&python)
+        .args(["-c", script])
+        .args(pairs.iter().flat_map(|(a, b)| [a, b]))
+        .output()
+        .unwrap();
+    println!("{}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        out.status.success(),
+        "MuJoCo refuses an export: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// Plan G, G1's scene documents: the expansion exports and reads back as itself, and its

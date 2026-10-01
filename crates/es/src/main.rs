@@ -37,6 +37,7 @@ USAGE:
     es backend compare --scene <file.xml|urdf> --backends mujoco-cpu,mjwarp[,newton,physx]
     es bench [--memory-report --obs <obs.toml> ...]
     es render --scene <file.xml|urdf> --eye X,Y,Z --look-at X,Y,Z --out <file.ppm|-> [OPTIONS]
+    es scene export <file.xml|urdf|esscene> --mjcf <out.xml>
     es video mosaic --frames <dir> --events <events.json> --report <report.json>
                     --grid RxC --out <dir> [--label-height N]
 
@@ -70,6 +71,7 @@ fn dispatch(args: &[String]) -> Result<u8, CliError> {
         Some("policy") => Ok(cmd::policy::dispatch(&args[1..]) as u8),
         Some("backend") => cmd::backend::dispatch(&args[1..]),
         Some("bench") => cmd::bench::dispatch(&args[1..]),
+        Some("scene") => cmd::scene::dispatch(&args[1..]),
         Some("video") => Ok(cmd::video::dispatch(&args[1..]) as u8),
         #[cfg(feature = "render")]
         Some("render") => es_tools::render::run(&args[1..]),
