@@ -203,3 +203,12 @@ xtask's table in the same packet), `crates/es-editor/src/ui/**` (hierarchy, insp
   resolution and render path, in process).
 - **Oracles:** headless pick → entity and gizmo drag → pose delta on scripted rays; a drag is one
   undo step; screenshots of a gizmo drag and the corner view.
+
+**G3d as merged (2026-10-01):** the compiler takes `cos` and `tan` from `es_math::approx` (musl via
+the `libm` crate), so generated documents are host-independent; no committed or G3b-pinned hash
+moved. The G3b paragraph's "musl's `tan` matched the host at every probed field of view" holds only
+at the committed angles (45°, 70°): over 1°–179° in 0.001° steps 4.1 % of values differ by one ULP
+(neither side is correctly rounded), so a document generated before G3d on Windows with such an
+angle (e.g. a 68° camera) may differ from a regenerated one in its last bit. The orchestrator kept
+musl — spec §5.3's rule for numbers that enter a hash. The fixture generators in
+`crates/es/tests/{shadow_hand,views}.rs` still call the host; they agree at their committed angles.
