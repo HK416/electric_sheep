@@ -273,6 +273,92 @@ shaping = ["orientation", "distance"]
 생성기는 회귀 오라클이 된다: SO-101과 Shadow Hand 명세는 커밋된 문서를 바이트 단위로 똑같이
 다시 만들어 낸다.
 
+### 4.3 G3a가 정한 세부 (구현된 스키마)
+
+`crates/es-script/src/spec/`(`TaskSpec::from_toml` / `to_toml`, `compile_task(spec, root)`),
+오라클은 `crates/es-script/tests/estask*.rs`. 두 명세
+`tests/fixtures/estask/{shadow_hand_repose,so101_views}.estask`는
+`tests/fixtures/shadow-hand/task-repose.toml`과 `tests/fixtures/visible-learning/task-views.toml`의
+`task_hash`로 컴파일된다(의미 해시. `task_graph_hash`는 다르다: 컴파일러는 노드에 명세 순서로
+번호를 붙이고, 커밋된 문서는 생성기의 순서로 붙였다 — SO-101은 이력대로라서 그리퍼 절이
+31–33에 덧붙어 있다). 위 예시와 다른 점, 그리고 본문이 열어 둔 것:
+
+- **최상위**: `scene`은 `compile_task`에 주는 프로젝트 루트 기준 상대 경로이고, 적힌 그대로
+  `SceneRef.path`에 들어간다. `asset_hash`는 어떤 종류든 장면 파일 바이트의 blake3이다.
+  `.esscene`도 마찬가지다(인클루드가 가져오는 것은 `SceneDesc`와 자산별 내용 해시를 거쳐
+  `scene_hash`에 들어 있다). `robot`은 로봇의 **루트 바디** 이름이지 인클루드 핸들이 아니다
+  (인클루드에는 루트가 여럿일 수 있다: Shadow Hand 파일의 `floor0`). 그 하위 트리의 관절이
+  `robot.joints`이고, 장면의 액추에이터 전부가 그 행동이다(`JointPosition`, 과제당 로봇 하나).
+  `timeout_s × control_hz`는 정수여야 한다: 그것이 `max_episode_steps`이고,
+  `리셋 이후 시간 ≥ timeout_s`가 `Timeout` 노드다.
+- **절**(`[success]`는 전부, `[failure]`는 하나라도): `{ subject, relation, ... }`. 문서 순서대로
+  `And`로 접어 `Terminate(Success)` 하나에, `Or`로 접어 `Terminate(Failure)` 하나에 잇는다.
+  **스칼라** 주어(`inside`, `above`, `below`, `still`)는 관절(로봇 관절은 로봇의 관절 벡터로서
+  루트 바디를 통해 읽고, 다른 관절은 자기 자신으로 읽는다)이거나 `<body>.x`, 곧 바디 자유
+  관절의 첫 좌표다 — `GetJointState`가 읽는 단 하나의 레인이다. **바디** 주어(`near`,
+  `farther_than`, `orientation_matches`)는 바디다. 필드: `inside`는 `range = [lo, hi]`,
+  `above` / `below`는 `value`, `still`은 `speed`(속도가 ±speed 안), `near` / `farther_than`은
+  `m`과 `object`(바디: `Arith Sub`, `Norm`) 또는 `point = [x, y, z]`(상수 노드가 없으므로
+  `p − point`는 `[point − 1, point + 1]` 위의 레인별 `Normalize`, 플랜 H의 구성이고 `m` < 1)
+  중 하나, `orientation_matches`는 `object`와 `within_deg`(`|q·g| ≥ cos(θ/2)`). 관계가 받지
+  않는 필드나 빠진 필드는 절(`success[1] (cube.x still)`)과 필드를 짚어 거부하고, 모르는 키는
+  이름으로 거부한다.
+- **아직 낮아지지 않는 것은 이름으로 거부한다**: `touches`(`GetContact`), `<body>.y` / `.z`,
+  그리고 그 때문에 영역 `inside`, 다른 바디 기준 `above` / `below`, 3축 `still`. 콘 낮추기
+  (`crates/es-env/src/plan.rs`)에는 `Slice`, `Concat`, `Reduce`, `GetBodyVelocity`가 없다 —
+  4.1 첫머리의 노드 목록은 과장이다. 그래서 지금 `inside`는 주어의 x 구간이고 `still`은 x
+  속도다. 정확히 task.toml의 한계("상자의 x 구간과 안정화 한계")다. 거기서 `Slice`를 낮추면
+  셋 다 3축이 된다.
+- **성형**은 절마다 붙고, 참조 문서가 4.1보다 더 필요로 한 곳은 이름 있는 선택지로 두었다:
+  `shaping`은 항의 형태, `weight`는 가중치, `term`은 이름(없으면 `<subject>_<shaping>`)이다.
+  `distance`(`near` / `farther_than`: `weight × 거리`, [0, 1] m로 자름), `ramp`(`inside`,
+  `ramp = [a, b]`와 함께: `weight × (s − a)/(b − a)`를 [0, 1]로 자름 — SO-101의
+  `cube_towards_bin`), `inverse_angle`(`orientation_matches`: `weight / (s + 0.1)`,
+  `s = √(8(1 − |q·g|))`를 플랜 H의 아홉 매듭에서의 구간 선형 보간으로, 항은 `<term>_0..7`,
+  그리고 매 스텝 주는 `<term>_floor`). `[reward]`: `scale`은 모든 가중치에 곱한다(rl_games의
+  `scale_value`, Shadow Hand의 0.01). `success` / `failure`는 같은 이름의 희소 항이고 접힌
+  술어가 먹인다. 문서의 가중치는 숫자다. 체크 박스의 세 단계를 숫자로 적는 것은 문장
+  편집기(G8)의 몫이다.
+- **시작** 항목 `{ what, ... }`: `robot.joints`(`noise`는 각 관절 범위에 대한 비율, Isaac Lab의
+  `reset_dof_pos_noise`. `coupled = true`면 두 관절짜리 고정 텐던으로 다른 관절에 묶인 관절은
+  그 관절의 스트림에서 결합 비율만큼 비례해 뽑는다 — 플랜 H의 J0/J1), 관절, `<body>.x|y|z`
+  (`value`, `value ± noise`, `range`), 또는 `draw`를 가진 `<body>.orientation`(아래).
+  `value`는 `Constant`(잡음 0일 때도), `range`는 언제나 `Uniform`이다(task.toml의
+  `Uniform{0, 0}` 홈 자세). `stream`은 뽑기의 이름이다(없으면 `what`, 관절은 `reset.<joint>`).
+  같은 스트림의 항목들은 한 번의 뽑기를 나눠 쓴다. `dice = true`(🎲)면 `ResetState` 대신
+  `Randomization` 노드가 된다(task.toml의 큐브 x / y). `strength`는 모든 🎲 항목의 `range`를
+  중심 기준으로, `noise`를 그대로 배율한다(없으면 적힌 대로).
+- **방향 뽑기**(소유자, 2026-10-01: Shadow Hand를 yaw만 돌리기에서 큐브 뒤집기로 바꾸는 것이
+  한 문장이어야 한다). 리셋 노드는 수 하나를 쓰므로 쿼터니언의 레인마다 뽑기가 하나다(같은
+  스트림의 레인은 그 뽑기를 나눠 쓴다). 쓰인 쿼터니언은 백엔드가 정규화한다 — MuJoCo와
+  MJWarp 모두 `xquat`은 즉시, `qpos`는 첫 스텝 뒤에(H2b, `any`에 대해서는
+  `the_backends_normalize_a_drawn_quaternion`이 다시 확인):
+  - `draw = "yaw"`(+ `tilt`): 플랜 H의 `(1, t, −t·u, u)`, `u ~ U(−1, 1)` 하나. 세계 X축에 대한
+    안착 기울기 `2·atan(t)`와 반 바퀴 [−90°, 90°] 안의 yaw `2·atan(u)`.
+  - `draw = "tilt"`, `tilt_max_deg = θ`(< 180): `(1, a, b, g)`, `a, b ~ U(−m, m)`,
+    `m = tan(θ/2)/√2`, `g ~ N(0, 1)`. 수직에서의 기울기는 θ를 넘지 않고
+    (`a² + b² ≤ tan²(θ/2)·(1 + g²)`, `g = 0`이고 모서리일 때 닿는다) 모든 방위가 뽑힌다
+    (`2·atan(g)`: 68 %가 ±90° 안, 8 %가 ±120° 밖). 균일한 구성이 아니라(캡 위로도, yaw로도)
+    가장 가까운 정확한 구성이다: 기울기 한계에는 yaw 쌍 `(w, z)`가 0에서 떨어져 있어야 하는데,
+    모든 방위를 덮는 유계 뽑기로는 그럴 수 없다(그 쌍의 집합은 상자이고, 방향이 반 바퀴에
+    걸치는 볼록 집합은 원점에 닿는다). 그래서 yaw 레인을 유계가 아니게 했다.
+  - `draw = "any"`: `<stream>.w|x|y|z`의 `N(0, 1)` 레인 넷, 백엔드가 정규화: SO(3) 위의 균일
+    분포(`EnvRng`의 Box–Muller 정밀도까지).
+- **관측**: `cameras`(채널 `rgb_<camera>`, `camera_px` 정사각 RGB8, 렌더러가 제어 주기로
+  내놓는 `ImageSpec`)와 모두에 쓰는 `render` 하나. `state`와 `privileged`는 목록이 아니라
+  `channel = "source"` **테이블**이다 — 채널 이름이 해시 입력인데 참조 문서들의 이름은 한
+  규칙을 따르지 않는다(`object_vel`, `target_qpos`, `sim_cube_pose`). 출처:
+  `robot.joint_pos`(루트 바디의 `JointState`: 앞쪽 `dof`개, 로봇의 관절이 장면 관절의 맨
+  앞이 아니면 거부), `robot.joint_vel`(첫 관절의 `JointState`: id마다 입력 버퍼가 하나),
+  `robot.previous_action`(`initial`은 각 ctrlrange의 중앙), `<body>.pose`(`BodyPose`),
+  `<body>.qpos` / `<body>.vel`(자유 관절의 7 / 6). `state`와 `privileged`(교사의 추가 입력)는
+  Task IR에서는 `ObservationSpec` 하나이고, 나눔은 G3b가 읽는다.
+- **libm에서 오는 수**: `within_deg`의 코사인, 카메라 초점 거리, `tilt_max_deg`의 `m`은
+  대체하는 생성기들처럼 호스트의 `cos` / `tan`을 쓴다(앞의 둘은 이 PC에서 커밋된 문서와
+  일치한다).
+  올바르게 반올림하는 구현이면 생성된 문서가 호스트에 무관해진다(M10의 `scene_hash` 교훈) —
+  열린 항목.
+
 ## 5. 에디터 (①과 ②)
 
 - **계층 구조 패널**: 장면 트리(인클루드는 접힘), 검색, 가시성. 끌어서 부모를 바꾼다.
