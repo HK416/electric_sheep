@@ -15,12 +15,13 @@ use std::path::{Path, PathBuf};
 use es_assets::scene::{JointKind, SceneDesc};
 use es_core::time::{PhysTick, TickRate};
 use es_env::{BatchDomains, Env, Termination};
+use es_ir::graph::NodeId;
 use es_ir::task::TaskIr;
 use es_physics_core::backend::{
     IndexRange, LoadConfig, ModelInfo, PhysicsBackend, PhysicsError, StateView, StepReport,
 };
 use es_physics_core::caps::{BatchSupport, Capabilities, DeterminismTier, FloatPrecision};
-use es_script::spec::{compile_task, TaskSpec};
+use es_script::spec::{compile_clauses, compile_task, TaskSpec};
 
 const SCENE: &str = "tests/fixtures/mjcf/so101_pick_place_views.xml";
 /// The same scene with regions (packet G3c): the bodies and joints keep their rows.
@@ -201,6 +202,17 @@ struct State {
 /// One control step entered with the reset's state as `edit` leaves it: the reward and how
 /// the episode stands after it.
 fn score(task: &TaskIr, edit: impl Fn(&mut State)) -> (f64, Termination) {
+    let (reward, how, _) = score_nodes(task, &[], edit);
+    (reward, how)
+}
+
+/// [`score`], and the value of each of `nodes` on the state the step is scored on, read after
+/// the fact through `es_env::plan::eval_nodes` (packet M17/R8).
+fn score_nodes(
+    task: &TaskIr,
+    nodes: &[NodeId],
+    edit: impl Fn(&mut State),
+) -> (f64, Termination, Vec<f64>) {
     let scene = load(&task.scene.path);
     let domains = BatchDomains::single_env_at(
         TickRate::from_period_secs(scene.options.timestep).expect("200 Hz"),
@@ -227,13 +239,15 @@ fn score(task: &TaskIr, edit: impl Fn(&mut State)) -> (f64, Termination) {
         ..StateView::default()
     };
     env.backend_mut().set_state(&view).expect("set");
+    let truth = es_env::plan::eval_nodes(task, &scene, env.model(), nodes, &view, 0.0)
+        .expect("the nodes evaluate");
     let out = env.step(&[0.0; 6]).expect("one step");
     let how = if out.dones[0] {
         out.episodes[0].termination
     } else {
         Termination::Running
     };
-    (out.rewards[0], how)
+    (out.rewards[0], how, truth)
 }
 
 /// The scene row of body `name` in `xpos` / `xquat`.
@@ -754,7 +768,7 @@ fn normalizes<B: PhysicsBackend>(name: &str, t: &TaskIr, backend: B) {
 /// be `(0, 0, 5)`. Needs `ES_PYTHON` (`MuJoCo`); prints SKIP without.
 #[test]
 fn a_spinning_cubes_angular_velocity_is_read_in_the_world_frame() {
-    use es_ir::graph::{IrNode, NodeId};
+    use es_ir::graph::IrNode;
     use es_ir::task::{Aggregation, TaskNode};
     use es_physics_backend::MuJoCoCpuBackend;
     if std::env::var_os("ES_PYTHON").is_none() {
@@ -822,4 +836,97 @@ fn a_spinning_cubes_angular_velocity_is_read_in_the_world_frame() {
         println!("lane {lane}: {got} vs {want}");
         assert!((got - want).abs() < 1e-9, "lane {lane}: {got} vs {want}");
     }
+}
+
+// ---- packet R8: each clause's truth, read after the fact ------------------------------------
+
+/// Packet M17/R8 (design note section 4.8): the node `compile_clauses` names for each clause,
+/// evaluated after the fact on a state through `es_env::plan::eval_nodes`, is what the env itself
+/// decides on that state: the termination of a task with that clause alone, and of the task with
+/// all of them (success when every success clause holds, else failure when the failure clause
+/// does). Inside a region, still, near a point and farther than a point, on states built to make
+/// each true and false.
+#[test]
+fn each_clauses_truth_is_the_envs_own_predicate() {
+    let cube = row_in(REGIONS, "cube");
+    let c = [0.14, -0.1, 0.05];
+    let success = [
+        "{ subject = \"cube\", relation = \"inside\", object = \"bin_area\" }",
+        "{ subject = \"cube\", relation = \"still\", speed = 0.05 }",
+        "{ subject = \"cube\", relation = \"near\", point = [0.14, -0.1, 0.05], m = 0.03 }",
+    ];
+    let failure =
+        "{ subject = \"cube\", relation = \"farther_than\", point = [0.14, -0.1, 0.05], m = 0.3 }";
+    // Never true: the success a lone failure clause needs.
+    let never = "{ subject = \"gripper\", relation = \"above\", value = 9.0 }";
+    let spec = |s: &[&str], f: &[&str]| {
+        let failure = match f {
+            [] => String::new(),
+            f => format!("[failure]\nclauses = [{}]\n", f.join(", ")),
+        };
+        format!("[success]\nclauses = [{}]\n{failure}", s.join(", "))
+    };
+    let all = spec(&success, &[failure]);
+    let text = format!(
+        "kind = \"task-spec\"\nschema = 1\nscene = \"{REGIONS}\"\nrobot = \"base\"\n\
+         control_hz = 50\ntimeout_s = 36.0\n{all}"
+    );
+    let (task, clauses) =
+        compile_clauses(&TaskSpec::from_toml(&text).expect("reads"), &repo()).expect("compiles");
+    assert_eq!(task, task_on(REGIONS, &all), "the side table moves no byte");
+    let nodes: Vec<NodeId> = clauses.iter().map(|c| c.2).collect();
+    // Each clause alone: a success clause as the success, the failure clause beside `never`.
+    let alone: Vec<(TaskIr, Termination)> = (success.iter())
+        .map(|s| (task_on(REGIONS, &spec(&[s], &[])), Termination::Success))
+        .chain([(
+            task_on(REGIONS, &spec(&[never], &[failure])),
+            Termination::Failure,
+        )])
+        .collect();
+    // The cube's world position and its velocity along x.
+    let state = |p: [f64; 3], v: f64| {
+        move |s: &mut State| {
+            s.xpos[cube * 3..cube * 3 + 3].copy_from_slice(&p);
+            s.qvel[6] = v;
+        }
+    };
+    let mut seen = [[false; 2]; 4];
+    for (p, v) in [
+        // Every success clause: success.
+        (c, 0.0),
+        // Moving.
+        (c, 0.2),
+        // Inside and still, not near.
+        ([c[0] + 0.04, c[1], c[2]], 0.0),
+        // On the region's face: outside.
+        ([c[0] + 0.05, c[1], c[2]], 0.0),
+        // All three, slowly.
+        ([c[0], c[1] + 0.02, c[2]], -0.04),
+        // Pushed away: the failure clause, still and moving.
+        ([0.6, 0.3, 0.05], 0.0),
+        ([0.6, 0.3, 0.05], 0.5),
+    ] {
+        let (_, how, truth) = score_nodes(&task, &nodes, state(p, v));
+        assert_eq!(truth.len(), 4);
+        for (i, (single, ends)) in alone.iter().enumerate() {
+            let holds = truth[i] == 1.0;
+            assert!(
+                holds || truth[i] == 0.0,
+                "{p:?} {v}: clause {i} is {}",
+                truth[i]
+            );
+            let want = if holds { *ends } else { Termination::Running };
+            assert_eq!(score(single, state(p, v)).1, want, "{p:?} {v}: clause {i}");
+            seen[i][usize::from(holds)] = true;
+        }
+        let folded = if truth[..3].iter().all(|t| *t == 1.0) {
+            Termination::Success
+        } else if truth[3] == 1.0 {
+            Termination::Failure
+        } else {
+            Termination::Running
+        };
+        assert_eq!(how, folded, "{p:?} {v}: the folded task");
+    }
+    assert_eq!(seen, [[true; 2]; 4], "every clause seen true and false");
 }
