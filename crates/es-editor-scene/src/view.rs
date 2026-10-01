@@ -77,7 +77,7 @@ pub(crate) fn pose(pos: Option<[f64; 3]>, quat: Option<[f64; 4]>) -> Pose {
 
 /// Body `id`'s world pose: its chain of poses from the world down, composed as the renderer
 /// places a still scene's bodies.
-fn world(scene: &SceneDesc, id: StableId) -> Pose {
+pub(crate) fn world(scene: &SceneDesc, id: StableId) -> Pose {
     let mut chain = Vec::new();
     let mut at = Some(id);
     // Bounded by the body count: an expanded scene has no cycle, and this cannot hang on one.

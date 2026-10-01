@@ -34,6 +34,8 @@ pub mod marker;
 pub mod model;
 pub mod overrides;
 pub mod policy;
+// ①'s task as sentences (packet M17/G8).
+pub mod sentence;
 pub mod tree;
 pub mod view;
 

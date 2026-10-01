@@ -18,8 +18,9 @@ use std::sync::Arc;
 
 use es_assets::esscene::{EsScene, Include};
 use es_assets::scene::SceneDesc;
+use es_ir::task::TaskIr;
 use es_physics_backend::BackendKind;
-use es_script::spec::{generate, TaskSpec};
+use es_script::spec::{compile_task, generate, TaskSpec};
 
 use crate::check::{check, Refusal};
 use crate::command::{self, apply, Command, Docs, Entity, Record};
@@ -198,15 +199,32 @@ impl SceneModel {
         command::unique(base, &|n| self.taken(n))
     }
 
-    /// Applies `cmd` if the documents it leaves expand and map onto every backend; refuses it
-    /// otherwise and changes nothing. A command that changes nothing is no step.
+    /// Applies `cmd` if the documents it leaves expand and map onto every backend, and the task
+    /// specification still compiles on the scene (packet M17/G8: it always does, or there is
+    /// none); refuses it otherwise and changes nothing. A command that changes nothing is no step.
     pub fn apply(&mut self, cmd: &Command) -> Result<(), Refusal> {
         let mut next = self.docs.clone();
         let select = apply(&mut next, cmd, &|n| self.taken(n))?;
         if next == self.docs {
             return Ok(());
         }
-        let scene = check(&next.scene, &self.root, &self.backends)?;
+        let scene = if next.scene == self.docs.scene {
+            Arc::clone(&self.scene)
+        } else {
+            Arc::new(check(&next.scene, &self.root, &self.backends)?)
+        };
+        if let Some(spec) = &next.spec {
+            if let Err(why) = self.compiles(spec, &next.scene) {
+                // A scene edit is refused for breaking the specification, not for one that was
+                // already broken (a hand-edited file): that one is the sentences' to mend.
+                let current = self.docs.clone();
+                let was_fine = (current.spec.as_ref())
+                    .is_some_and(|s| self.compiles(s, &current.scene).is_ok());
+                if matches!(cmd, Command::Spec(_)) || was_fine {
+                    return Err(why);
+                }
+            }
+        }
         let before = std::mem::replace(&mut self.docs, next);
         self.undo.push(Step {
             before,
@@ -214,8 +232,27 @@ impl SceneModel {
         });
         self.redo.clear();
         self.settle(scene);
-        self.selection = select;
+        if !matches!(cmd, Command::Spec(_)) {
+            self.selection = select;
+        }
         Ok(())
+    }
+
+    /// `spec` compiled on the scene `doc`, read from a file as `compile_task` reads one: the
+    /// saved document when `doc` is it, else `doc` written to [`PREVIEW_FILE`].
+    pub(crate) fn compiles(&mut self, spec: &TaskSpec, doc: &EsScene) -> Result<TaskIr, Refusal> {
+        let other = |why: String| Refusal::new("scene", crate::check::OTHER, vec![why]);
+        let file = if *doc == self.saved.scene {
+            SCENE_FILE
+        } else {
+            let text = doc.to_toml().map_err(|e| other(e.to_string()))?;
+            write_atomic(&self.root.join(PREVIEW_FILE), &text).map_err(other)?;
+            self.preview = (*doc == self.docs.scene).then_some(self.revision);
+            PREVIEW_FILE
+        };
+        let mut spec = spec.clone();
+        file.clone_into(&mut spec.scene);
+        compile_task(&spec, &self.root).map_err(crate::sentence::refusal)
     }
 
     /// Back one step; `false` with nothing to undo.
@@ -243,7 +280,7 @@ impl SceneModel {
     /// The documents of an undo step expanded once already; they still do.
     fn reexpand(&mut self) {
         match check(&self.docs.scene, &self.root, &self.backends) {
-            Ok(scene) => self.settle(scene),
+            Ok(scene) => self.settle(Arc::new(scene)),
             // A file the scene names changed on disk since: keep drawing the last scene.
             Err(_) => self.revision += 1,
         }
@@ -257,12 +294,12 @@ impl SceneModel {
         }
     }
 
-    fn settle(&mut self, scene: SceneDesc) {
+    fn settle(&mut self, scene: Arc<SceneDesc>) {
         if self.includes.0 != self.docs.scene.includes {
             let read = tree::contents(&self.docs.scene, &self.root);
             self.includes = (self.docs.scene.includes.clone(), read);
         }
-        self.scene = Arc::new(scene);
+        self.scene = scene;
         self.revision += 1;
     }
 

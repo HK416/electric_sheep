@@ -78,6 +78,9 @@ pub enum Command {
     /// The whole scene document after an edit of several parts (G7's picture import: a texture,
     /// a material and the geom naming it), and what to select after it.
     Scene(Box<EsScene>, Option<Entity>),
+    /// Replaces the task specification (packet M17/G8's sentences; `None`: no task said). The
+    /// model checks it with `compile_task` on the scene as edited.
+    Spec(Option<Box<TaskSpec>>),
 }
 
 /// The scene document and the task specification: what a command changes and an undo step
@@ -452,6 +455,10 @@ pub(crate) fn apply(
         Command::Scene(scene, select) => {
             doc.clone_from(scene);
             Ok(select.clone())
+        }
+        Command::Spec(spec) => {
+            d.spec = spec.as_deref().cloned();
+            Ok(None)
         }
         Command::Rename(e, new) => {
             let new = new.trim();
