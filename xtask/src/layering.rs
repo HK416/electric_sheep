@@ -6,8 +6,9 @@ use std::path::Path;
 use std::process::Command;
 
 /// Layer table, spec 4.2 / Appendix B.8. Layers 12 (`es-editor-model`,
-/// `es-editor-scene`) and 13 (`es-editor`) are rule 4's: nothing may depend on
-/// `es-editor` regardless of layer, and nothing but `es-editor` on a layer-12 crate.
+/// `es-editor-scene`, `es-editor-graph`) and 13 (`es-editor`) are rule 4's: nothing
+/// may depend on `es-editor` regardless of layer, and nothing but `es-editor` on a
+/// layer-12 crate.
 const LAYERS: &[(&str, u8)] = &[
     ("es-math", 0),
     ("es-core", 1),
@@ -40,6 +41,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("es-transport", 11),
     ("es-editor-model", 12),
     ("es-editor-scene", 12),
+    ("es-editor-graph", 12),
     ("es-editor", 13),
 ];
 
@@ -79,7 +81,7 @@ pub fn check_layering(pkgs: &[Pkg]) -> Vec<String> {
                 ));
             }
             // Rule 4: nothing but es-editor depends on the editor's layer-12 crates.
-            if (dep == "es-editor-model" || dep == "es-editor-scene") && pkg.name != "es-editor" {
+            if layer_of(dep) == Some(12) && pkg.name != "es-editor" {
                 errors.push(format!(
                     "{}: only es-editor may depend on {dep} (rule 4)",
                     pkg.name
@@ -337,6 +339,33 @@ mod tests {
                 "{third}: {errors:?}"
             );
         }
+
+        // The Advanced graph's models (M17/R1), the third layer-12 crate: the check is the
+        // layer, not a list of names, so neither the other two nor a third crate may use it.
+        let graph = pkg("es-editor-graph", &["es-compile"]);
+        let all = pkg(
+            "es-editor",
+            &["es-editor-model", "es-editor-scene", "es-editor-graph"],
+        );
+        let ok = vec![model.clone(), scene.clone(), graph.clone(), all];
+        assert!(check_layering(&ok).is_empty(), "{:?}", check_layering(&ok));
+        for sibling in [
+            pkg("es-editor-model", &["es-editor-graph"]),
+            pkg("es-editor-scene", &["es-editor-graph"]),
+        ] {
+            let errors = check_layering(&[graph.clone(), sibling]);
+            assert!(
+                errors.iter().any(|e| e.contains("same-layer")),
+                "{errors:?}"
+            );
+        }
+        let errors = check_layering(&[graph, pkg("es-eval", &["es-editor-graph"])]);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("only es-editor may depend on es-editor-graph")),
+            "{errors:?}"
+        );
     }
 
     #[test]
