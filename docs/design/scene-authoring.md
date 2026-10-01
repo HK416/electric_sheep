@@ -697,6 +697,61 @@ the same lowering the env uses. There is no IR change and no hash change.**
     clause that is false on its end row. All four held clauses are true on the twelve successes.
   - A screenshot of ⑤ with the explanation.
 
+**What R8 settled** (review F-11; `crates/es-script/src/spec/compile.rs` `compile_clauses`,
+`crates/es-env/src/plan.rs` `eval_nodes` / `eval_on_row`, `crates/es-physics-backend/src/mjcf_out.rs`
+`layout`, `crates/es-editor-scene/src/missing.rs` `explain`, drawn by `crates/es-editor/src/ui/results.rs`):
+
+- **The side table.** `compile_clauses(spec, root)` returns the Task IR and
+  `[(TerminationKind, index, node)]`, every clause in document order; `compile_task` is the same call
+  without the table, so no compiled byte moved (G3a's, G3b's, GV's and R5's oracles pass unchanged).
+  `eval_nodes` lowers each node's `value` output with the termination cones' own lowering and reads
+  the ports as the env does (`Source::read`, which `Env::bind_ports` now calls too); `eval_on_row`
+  does it on one `.estraj` row. A cone that reads a sensor (a trajectory records none) and a body the
+  trajectory lacks are refused. Oracle `estask_scripted.rs`
+  (`each_clauses_truth_is_the_envs_own_predicate`): inside a region, still, near a point and farther
+  than a point, on seven scripted states; each clause's truth is the termination of the task with
+  that clause alone, and the four-clause task's termination is their fold.
+- **The layout is a pure function of the scene (option 1)**: `layout(scene)`, beside the emitter whose
+  order `MuJoCo` numbers — bodies in the order `scene_to_mjcf` writes them (the world 0, then depth
+  first, children in scene order), each body's joints in scene order (a fixed joint is none), the
+  addresses summed. Why not option 2: GV's run 001 and every run before R8 have no layout file and
+  would stay unexplained, and a file written at run time sits beside the pinned `traj/` folder; the
+  pure function writes nothing and keeps the order next to the code that makes it. Oracle
+  `crates/es-physics-backend/tests/layout.rs`: equal to `mujoco-cpu`'s `nq`, `nv`, `nbody`, `qpos`,
+  `dof` and `body` on the 17 committed scenes that load there and on GV's (`actuated.xml` and
+  `urdf/arm2.urdf` do not load on `mujoco-cpu`; the readers' refusal fixtures and
+  `so101_reach_mjx.xml` are not read). Body rows come from the layout, the poses from the
+  trajectory by body id.
+- **Which run.** A run is explained only when the generated evaluation whose hash is the run's
+  report's names the Task IR the saved specification compiles to: a run from before the task
+  changed is not explained by clauses it did not have. ⑤ asks for it only in an authored project
+  whose `generated/` is fresh (`Generated::Fresh`).
+- **The end row** is the trajectory's last row: the end state when it is one past the frames (one
+  past the steps when no frames were written), else a run from before R2, which ⑤ says it read on the
+  last recorded state, a step before the end. A success clause explains a failed attempt that ended
+  without it, a failure clause one that ended holding it. Success is folded first (ascending node
+  id), so on a timeout's end row some success clause is false; on the old last row too, since it is
+  the state after the step before, on which the env decided to go on.
+- **The words.** A line is G8's sentence of the clause, framed: "Not so at the end: {sentence}" for a
+  success clause, "Ended by: {sentence}" for a failure clause, then "n of m failed attempts"; most
+  attempts first, a clause that explains none left out. A tile's word is its first clause, "not:
+  {sentence}". The lines stand in ⑤'s why list for "not done in time" and the failure condition;
+  every other cause stays. Not negated sentences: a negated form of every template and relation word
+  in both languages would double the tables and read badly ("was not slower than"), while the frame
+  keeps ①'s words as the person wrote them. The owner's to change.
+- **Measured on GV** (`crates/es-editor-scene/tests/missing.rs`). Run 001 as GV wrote it (12
+  successes, 4 timeouts, no end rows): all four timeouts ended without "box is inside target";
+  nominal-03, -12 and -15 also without "box is within 5 cm of (22, 12, 2.5) cm", and nominal-10 ended
+  within 5 cm of the region's centre but outside its box. In all four the box was still and the
+  gripper near it. On the twelve successes the last recorded row has "box is still" false: it is the
+  state a step before success, the case the end row exists for. Evaluated again from the student
+  checkpoint 20000 into a copy (`es eval run`, 16 episodes, the same terminations and steps): the
+  same explanation on the end rows, and every success clause true on every success's end row.
+- **Fixed on the way (found by R7).** ⑤'s tiles wrap: a `ui.vertical` in a wrapping row is placed
+  with no wrap, so 10 of 16 showed and the rest were cut off on the right; each tile is now allocated
+  at its width in a top-aligned wrapping row. ②'s Test tooltip gives the teacher evaluation's own
+  attempts, episodes times suites (`teacher::attempts`: 16 for GV, 64 for the hand), not "64".
+
 ## 5. The editor (① and ②)
 
 - **Hierarchy panel**: the scene tree (includes folded), search, visibility; drag to re-parent.
