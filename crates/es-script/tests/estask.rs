@@ -208,6 +208,202 @@ fn refusals_name_the_clause_and_the_field() {
     refused(&hand, "m = 0.24", "m = 1.5", &["failure[0]", "`m`", "1 m"]);
 }
 
+/// GV's finding (design note section 4.7): a coordinate of a free body no start item sets starts
+/// where the scene puts the body, not at zero. The scene is `empty.esscene` with the SO-101 arm
+/// included, as an authored project's, and the bodies written here.
+mod scene_pose {
+    // The poses are the scene's bits, compared as such.
+    #![allow(clippy::float_cmp)]
+
+    use std::path::{Path, PathBuf};
+
+    use es_assets::scene::{JointKind, SceneDesc};
+    use es_env::{BatchDomains, Env};
+    use es_ir::task::{Distribution, TaskIr, TaskNode};
+    use es_physics_backend::MuJoCoCpuBackend;
+    use es_physics_core::backend::PhysicsBackend;
+    use es_script::spec::{compile_task, TaskSpec};
+
+    use super::{read, repo};
+
+    /// GV's box: 5 cm, on the floor in front of the arm.
+    const BOX: &str = r#"
+[[body]]
+name = "box"
+pos = [0.22, 0.0, 0.025]
+joint = { kind = "free" }
+
+[[body.geom]]
+name = "box_geom"
+shape = { box = [0.025, 0.025, 0.025] }
+"#;
+
+    /// A box turned 45° about Z, `[x, y, z, w]` (canonical, so `expand` keeps the bits).
+    const TURNED: &str = r#"
+[[body]]
+name = "turned"
+pos = [0.3, 0.1, 0.025]
+quat = [0.0, 0.0, 0.3826834323650898, 0.9238795325112867]
+joint = { kind = "free" }
+
+[[body.geom]]
+name = "turned_geom"
+shape = { box = [0.025, 0.025, 0.025] }
+"#;
+
+    /// GV's start: the box's x and y drawn, nothing else.
+    const XY: &str = r#"
+[start]
+items = [
+  { what = "box.x", value = 0.22, noise = 0.02, dice = true },
+  { what = "box.y", value = 0.0, noise = 0.02, dice = true },
+]
+"#;
+
+    type Reset = (bool, String, Distribution, String);
+
+    /// A scratch project: `scene.esscene` (the empty scene, the arm, `bodies`) and the arm's file.
+    fn project(tag: &str, bodies: &str) -> PathBuf {
+        let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("estask-{tag}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let arm = "tests/fixtures/esscene/so101.xml";
+        std::fs::copy(repo().join(arm), dir.join("so101.xml")).unwrap();
+        let empty = read("tests/fixtures/esscene/empty.esscene");
+        let text =
+            format!("{empty}\n[[include]]\nname = \"arm\"\nsource = \"so101.xml\"\n{bodies}");
+        std::fs::write(dir.join("scene.esscene"), text).unwrap();
+        dir
+    }
+
+    fn scene(dir: &Path) -> SceneDesc {
+        let text = std::fs::read_to_string(dir.join("scene.esscene")).unwrap();
+        let doc = es_assets::esscene::EsScene::from_toml(&text).unwrap();
+        es_assets::esscene::expand(&doc, dir).unwrap()
+    }
+
+    fn spec(start: &str) -> TaskSpec {
+        let text = format!(
+            "kind = \"task-spec\"\nschema = 1\nscene = \"scene.esscene\"\nrobot = \"arm\"\n\
+             control_hz = 50\ntimeout_s = 8.0\n\n[success]\n\
+             clauses = [{{ subject = \"box\", relation = \"still\", speed = 0.05 }}]\n{start}"
+        );
+        TaskSpec::from_toml(&text).unwrap()
+    }
+
+    /// Every reset node in node order: `(dice, target, dist, stream)`.
+    fn resets(task: &TaskIr) -> Vec<Reset> {
+        let row = |dice, t: &String, d: &Distribution, s: &String| {
+            Some((dice, t.clone(), d.clone(), s.clone()))
+        };
+        (task.graph.nodes.values())
+            .filter_map(|n| match n {
+                TaskNode::ResetState {
+                    target,
+                    dist,
+                    stream,
+                } => row(false, target, dist, stream),
+                TaskNode::Randomization {
+                    target,
+                    dist,
+                    stream,
+                } => row(true, target, dist, stream),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn node(dice: bool, lane: u32, dist: Distribution, stream: &str) -> Reset {
+        (dice, format!("qpos[{lane}]"), dist, stream.to_owned())
+    }
+
+    /// Oracles 2 and 4: the box placed by x and y gets constant `ResetState`s for its z and its
+    /// quaternion, the scene's (`qpos[6..13]`: the arm's six hinges come first); none for x or
+    /// y beyond the items' own. `zero_unset = true` gives the items' nodes alone.
+    #[test]
+    fn unset_coordinates_start_at_the_scenes_pose() {
+        let dir = project("compile", BOX);
+        let task = compile_task(&spec(XY), &dir).unwrap();
+        let (x, y) = (
+            Distribution::Uniform {
+                lo: 0.22 - 0.02,
+                hi: 0.22 + 0.02,
+            },
+            Distribution::Uniform {
+                lo: -0.02,
+                hi: 0.02,
+            },
+        );
+        let items = vec![node(true, 6, x, "box.x"), node(true, 7, y, "box.y")];
+        let c = Distribution::Constant;
+        let mut want = items.clone();
+        want.extend([
+            node(false, 8, c(0.025), "scene.box.pos.2"),
+            node(false, 9, c(1.0), "scene.box.quat.0"),
+            node(false, 10, c(0.0), "scene.box.quat.1"),
+            node(false, 11, c(0.0), "scene.box.quat.2"),
+            node(false, 12, c(0.0), "scene.box.quat.3"),
+        ]);
+        assert_eq!(resets(&task), want);
+        for s in ["scene.box.pos.2", "scene.box.quat.0", "scene.box.quat.3"] {
+            assert!(task.config.rng_streams.contains(s), "{s}");
+        }
+
+        let with = |v: &str| spec(&XY.replace("[start]", &format!("[start]\nzero_unset = {v}")));
+        let old = compile_task(&with("true"), &dir).unwrap();
+        assert_eq!(resets(&old), items);
+        // `false` is the rule, as absent is.
+        let rule = compile_task(&with("false"), &dir).unwrap();
+        assert_eq!(rule.task_hash().unwrap(), task.task_hash().unwrap());
+    }
+
+    /// The free joint's seven `qpos` lanes of body `name` at tick 0.
+    fn lanes(env: &Env<MuJoCoCpuBackend>, scene: &SceneDesc, name: &str) -> Vec<f64> {
+        let body = scene.bodies.iter().find(|b| b.name == name).unwrap();
+        let joint = (scene.joints.iter())
+            .find(|j| j.body == body.id && j.kind == JointKind::Free)
+            .unwrap();
+        let at = &env.model().qpos[&joint.id];
+        let state = env.backend().state();
+        state.qpos_of(0)[at.start as usize..(at.start + at.len) as usize].to_vec()
+    }
+
+    /// Oracle 3, on `mujoco-cpu`: the box placed by x and y starts at `(x, y, 0.025)` with the
+    /// identity; the turned box, which no item names, keeps its place and its turn; with no
+    /// start items at all, both start at the scene's pose.
+    #[test]
+    fn an_env_starts_free_bodies_at_the_scenes_pose() {
+        if let Err(why) = MuJoCoCpuBackend::is_available() {
+            eprintln!("SKIP an_env_starts_free_bodies_at_the_scenes_pose: {why}");
+            return;
+        }
+        let dir = project("env", &format!("{BOX}{TURNED}"));
+        let scene = scene(&dir);
+        let turned = [
+            0.3,
+            0.1,
+            0.025,
+            0.923_879_532_511_286_7,
+            0.0,
+            0.0,
+            0.382_683_432_365_089_8,
+        ];
+        for start in [XY, ""] {
+            let task = compile_task(&spec(start), &dir).unwrap();
+            let domains = BatchDomains::single_env();
+            let env = Env::new(&task, &scene, MuJoCoCpuBackend::new(), &domains, 7).unwrap();
+            let b = lanes(&env, &scene, "box");
+            if start.is_empty() {
+                assert_eq!(b, [0.22, 0.0, 0.025, 1.0, 0.0, 0.0, 0.0]);
+            } else {
+                let drawn = (0.2..=0.24).contains(&b[0]) && (-0.02..=0.02).contains(&b[1]);
+                assert!(drawn, "{b:?}");
+                assert_eq!(b[2..], [0.025, 1.0, 0.0, 0.0, 0.0], "{b:?}");
+            }
+            assert_eq!(lanes(&env, &scene, "turned"), turned, "{start}");
+        }
+    }
+}
+
 mod generated {
     use es_script::spec::{
         Clause, Clauses, Draw, Observe, Relation, RenderDoc, RenderPath, RewardDoc, Shaping, Start,
@@ -325,8 +521,16 @@ mod generated {
     fn spec() -> impl Strategy<Value = TaskSpec> {
         let clauses =
             || proptest::collection::vec(clause(), 0..3).prop_map(|clauses| Clauses { clauses });
-        let start = (of(num()), proptest::collection::vec(item(), 0..3))
-            .prop_map(|(strength, items)| Start { strength, items });
+        let start = (
+            of(num()),
+            of(any::<bool>()),
+            proptest::collection::vec(item(), 0..3),
+        )
+            .prop_map(|(strength, zero_unset, items)| Start {
+                strength,
+                zero_unset,
+                items,
+            });
         let reward =
             (of(num()), of(num()), of(num())).prop_map(|(scale, success, failure)| RewardDoc {
                 scale,

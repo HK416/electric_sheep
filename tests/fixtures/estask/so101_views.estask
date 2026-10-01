@@ -24,6 +24,8 @@ clauses = [
 
 # The arm at home, the cube on the table; where on the table is the dice's.
 [start]
+# Unset coordinates start at zero: this reproduces a document committed before the scene-pose rule.
+zero_unset = true
 items = [
   { what = "shoulder_pan", range = [0.0, 0.0], stream = "reset.0" },
   { what = "shoulder_lift", range = [0.0, 0.0], stream = "reset.1" },

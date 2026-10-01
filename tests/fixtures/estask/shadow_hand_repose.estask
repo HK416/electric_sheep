@@ -21,6 +21,8 @@ clauses = [
 ]
 
 [start]
+# Unset coordinates start at zero: this reproduces a document committed before the scene-pose rule.
+zero_unset = true
 items = [
   { what = "robot.joints", noise = 0.2, coupled = true },
   { what = "object.x", value = 1.0, noise = 0.01, stream = "cube.pos.0" },

@@ -773,7 +773,8 @@ fn tidy(spec: &mut TaskSpec) {
         spec.observe = None;
     }
     let start = spec.start.as_ref();
-    if start.is_some_and(|s| s.items.is_empty() && s.strength.is_none()) {
+    // `zero_unset` is no sentence but the committed fixtures' switch: it keeps the table.
+    if start.is_some_and(|s| s.items.is_empty() && s.strength.is_none() && s.zero_unset.is_none()) {
         spec.start = None;
     }
 }

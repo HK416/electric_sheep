@@ -219,6 +219,12 @@ pub struct Start {
     /// written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub strength: Option<f64>,
+    /// `true`: a coordinate of a free body (outside the robot) that no item sets starts at zero,
+    /// its quaternion all zeros (the backend reads it as the identity), as in the documents
+    /// committed before the rule. Absent or `false`: it starts where the scene puts it, the
+    /// body's own pose (`qpos0`, design note section 4.7).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zero_unset: Option<bool>,
     pub items: Vec<StartItem>,
 }
 

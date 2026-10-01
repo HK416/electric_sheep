@@ -75,6 +75,10 @@ pub fn compile_task(spec: &TaskSpec, root: &Path) -> Result<TaskIr, SpecError> {
             c.start_item(&at, item, start.strength)?;
         }
     }
+    let zero_unset = spec.start.as_ref().and_then(|s| s.zero_unset) == Some(true);
+    if !zero_unset {
+        c.scene_poses();
+    }
     let task = TaskIr {
         schema_version: es_ir::task::SCHEMA_VERSION,
         scene: SceneRef {
@@ -139,6 +143,8 @@ struct Compiler<'a> {
     graph: TaskGraph,
     channels: BTreeMap<String, ObsChannel>,
     streams: BTreeSet<String>,
+    /// The `qpos` lanes a start item writes.
+    placed: BTreeSet<usize>,
 }
 
 impl<'a> Compiler<'a> {
@@ -166,6 +172,7 @@ impl<'a> Compiler<'a> {
             graph: TaskGraph::new(es_ir::task::SCHEMA_VERSION),
             channels: BTreeMap::new(),
             streams: BTreeSet::new(),
+            placed: BTreeSet::new(),
         })
     }
 
@@ -851,6 +858,7 @@ impl<'a> Compiler<'a> {
                     None => return refuse(at, "draw", "required: `yaw`, `tilt` or `any`"),
                 };
                 for (lane, (dist, stream)) in lanes.into_iter().enumerate() {
+                    self.placed.insert(q + 3 + lane);
                     self.reset(format!("qpos[{}]", q + 3 + lane), dist, stream, dice);
                 }
                 return Ok(());
@@ -864,6 +872,7 @@ impl<'a> Compiler<'a> {
             };
             only(&["value", "noise", "range", "stream"])?;
             let dist = value_or_range(at, item, k)?;
+            self.placed.insert(q + axis);
             self.reset(format!("qpos[{}]", q + axis), dist, stream, dice);
             return Ok(());
         }
@@ -881,8 +890,40 @@ impl<'a> Compiler<'a> {
             .stream
             .clone()
             .unwrap_or_else(|| format!("reset.{}", j.name));
+        // `joint.<j>.qpos` writes the joint's first lane, a free joint's x too.
+        self.placed.insert(self.qpos_of(j));
         self.reset(format!("joint.{}.qpos", j.name), dist, stream, dice);
         Ok(())
+    }
+
+    /// Every lane of a free joint outside the robot that no start item writes starts where the
+    /// scene puts the body (`qpos0`: its pose, `x y z` then the quaternion `w x y z`, read bit
+    /// for bit): a constant `ResetState` on stream `scene.<body>.pos.<i>` / `.quat.<i>`, in the
+    /// scene's joint order. `Env::reset` zeroes `qpos` first, so without it the body would start
+    /// at the origin (design note section 4.7).
+    fn scene_poses(&mut self) {
+        let scene = self.scene;
+        for j in &scene.joints {
+            if j.kind != JointKind::Free || self.joints.iter().any(|r| r.id == j.id) {
+                continue;
+            }
+            let Some(body) = scene.bodies.iter().find(|b| b.id == j.body) else {
+                continue;
+            };
+            let (p, o) = (body.pose.position, body.pose.orientation);
+            let q = self.qpos_of(j);
+            for (lane, v) in [p.x, p.y, p.z, o.w, o.x, o.y, o.z].into_iter().enumerate() {
+                if self.placed.contains(&(q + lane)) {
+                    continue;
+                }
+                let stream = match lane {
+                    0..3 => format!("scene.{}.pos.{lane}", body.name),
+                    _ => format!("scene.{}.quat.{}", body.name, lane - 3),
+                };
+                let target = format!("qpos[{}]", q + lane);
+                self.reset(target, Distribution::Constant(v), stream, false);
+            }
+        }
     }
 
     /// `(J1, J0, k)` for every two-joint fixed tendon over the robot's joints: `J0 = k · J1`
