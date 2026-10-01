@@ -46,9 +46,22 @@ previews during training, collection under the Evaluation IR's perturbations on 
 by `ScriptedExpert`, pinned by `tests/golden/expert/`), `--expert <program.toml>`, and ② edits it as blocks with a one-episode
 try. Their real runs found and fixed a collector abort leak, invisible NaN training, training on failed collections and
 several editor gaps; measured, the hint card still does not pass (long preset: nominal 0/16, and 2/16 with 1 s grip waits) and
-its shared failure is that the robot does not let go (27 release frames per demonstration). Next, by the owner's order: the
-multi-camera design note (MAD, arXiv 2505.04619), then S4 with failures explained by the success predicate's missing clause;
-open human decisions are M14's H-1 (the grip wait) and H-2 (letting go vs. the Task IR's immediate termination).
+its shared failure is that the robot does not let go (27 release frames per demonstration); open human decisions are
+M14's H-1 (the grip wait) and H-2 (letting go vs. the Task IR's immediate termination). **M15 plan N** (`docs/design/multi-camera.md`,
+`docs/packets/M15/`, results in `NV-verification.md`): the SO-101 cube task seen by three cameras through every path, MAD's shared
+encoder with `Sum` fusion and single-view training, a three-view policy deployed on fewer; three views reached nominal 7/16, the
+best camera-only number then. **M16 plan H** (`docs/packets/M16/plan-h.md`): Shadow Hand cube reorientation from three `Pt`
+cameras — textures and metallic-roughness PBR (HT1/HT2), binary physics frames and CUDA graphs for `mjwarp`, a state PPO teacher
+(`[rl]` on `mjwarp`, 0.52 on 64 seeds) distilled into a three-view ACT student (0.23 nominal; the `tanh` head fix H6, the retrain
+stopped by the owner), the Shadow Hand as a template project, and an in-process Vulkan viewport in the editor (H8/H9). **M17 plan G**
+(`docs/design/scene-authoring.md`, `docs/packets/M17/plan-g.md`, review `docs/reviews/M17.md`): game-engine-like scene authoring —
+the scene document `*.esscene` with a full MJCF exporter, the task specification `*.estask` compiled to the five IRs by
+`es project generate`, ①'s scene model (crate `es-editor-scene`: commands, undo, picking, handles, the Add menu, imports by
+content, sentences), the empty project, save as template, and authored projects that run ② to ⑤ on `generated/`. Its end-to-end
+run built an SO-101 box-pushing task from the empty project: teacher 16/16, camera student 0.75 nominal. The review's R-list
+(R1–R8) split `es-editor-graph` out of `es-editor-model`, recorded the terminal state in trajectories, added mesh scale, region
+shaping, measured teacher times and ⑤'s failures explained by the missing clause. Open there: F-8 (a hold node, an IR-D spec item)
+and the review's H-items (the committed Shadow Hand goal starts at the origin).
 The next campaign waits on the human decisions in `docs/reviews/M11.md` (the envelope for a learning policy, a cross-render
 condition, a declared source latency, `asset_hash`), `docs/reviews/M10.md` (the cycle recipe's step count, the next source policy),
 `docs/reviews/M9.md` (the buffered-path watchdog for delta policies) and the older ones in `docs/reviews/M7.md` (the stop rule's reading,
