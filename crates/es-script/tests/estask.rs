@@ -214,22 +214,10 @@ fn refusals_name_the_clause_and_the_field() {
 #[test]
 fn a_held_section_compiles_to_its_terminates_hold() {
     use es_ir::task::{TaskNode, TerminationKind};
+    use TerminationKind::{Failure, Success, Timeout};
     let so = read(FIXTURES[1]);
-    let held = so
-        .replace(
-            "[success]
-",
-            "[success]
-hold_s = 1.0
-",
-        )
-        .replace(
-            "[failure]
-",
-            "[failure]
-hold_s = 0.1
-",
-        );
+    let held = (so.replace("[success]", "[success]\nhold_s = 1.0"))
+        .replace("[failure]", "[failure]\nhold_s = 0.1");
     let doc = TaskSpec::from_toml(&held).unwrap();
     assert_eq!(
         (doc.success.hold_s, doc.failure.as_ref().unwrap().hold_s),
@@ -246,7 +234,6 @@ hold_s = 0.1
             })
             .collect()
     };
-    use TerminationKind::{Failure, Success, Timeout};
     assert_eq!(
         hold(&plain),
         [(Success, None), (Failure, None), (Timeout, None)]
@@ -265,24 +252,10 @@ hold_s = 0.1
     }
     assert_eq!(back, plain);
 
-    refused(
-        &so,
-        "[success]
-",
-        "[success]
-hold_s = 0.01
-",
-        &["success", "`hold_s`", "0.5"],
-    );
-    refused(
-        &so,
-        "[failure]
-",
-        "[failure]
-hold_s = 0.0
-",
-        &["failure", "`hold_s`"],
-    );
+    let short = "[success]\nhold_s = 0.01";
+    refused(&so, "[success]", short, &["success", "`hold_s`", "0.5"]);
+    let zero = "[failure]\nhold_s = 0.0";
+    refused(&so, "[failure]", zero, &["failure", "`hold_s`"]);
 }
 
 /// GV's finding (design note section 4.7): a coordinate of a free body no start item sets starts
