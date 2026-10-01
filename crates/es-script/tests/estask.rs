@@ -208,6 +208,83 @@ fn refusals_name_the_clause_and_the_field() {
     refused(&hand, "m = 0.24", "m = 1.5", &["failure[0]", "`m`", "1 m"]);
 }
 
+/// Packet M18/K7 (design note section 4.9): `[success] hold_s` and `[failure] hold_s` compile to
+/// their section's `Terminate { hold_ticks }`, in whole control ticks, and to nothing else; a hold
+/// that is not whole ticks is refused naming `success.hold_s`.
+#[test]
+fn a_held_section_compiles_to_its_terminates_hold() {
+    use es_ir::task::{TaskNode, TerminationKind};
+    let so = read(FIXTURES[1]);
+    let held = so
+        .replace(
+            "[success]
+",
+            "[success]
+hold_s = 1.0
+",
+        )
+        .replace(
+            "[failure]
+",
+            "[failure]
+hold_s = 0.1
+",
+        );
+    let doc = TaskSpec::from_toml(&held).unwrap();
+    assert_eq!(
+        (doc.success.hold_s, doc.failure.as_ref().unwrap().hold_s),
+        (Some(1.0), Some(0.1))
+    );
+    assert_eq!(TaskSpec::from_toml(&doc.to_toml().unwrap()).unwrap(), doc);
+    let plain = compile_task(&spec(FIXTURES[1]), &repo()).unwrap();
+    let task = compile_task(&doc, &repo()).unwrap();
+    let hold = |ir: &TaskIr| -> Vec<(TerminationKind, Option<u32>)> {
+        (ir.graph.nodes.values())
+            .filter_map(|n| match n {
+                TaskNode::Terminate { kind, hold_ticks } => Some((*kind, *hold_ticks)),
+                _ => None,
+            })
+            .collect()
+    };
+    use TerminationKind::{Failure, Success, Timeout};
+    assert_eq!(
+        hold(&plain),
+        [(Success, None), (Failure, None), (Timeout, None)]
+    );
+    assert_eq!(
+        hold(&task),
+        [(Success, Some(50)), (Failure, Some(5)), (Timeout, None)]
+    );
+    assert_ne!(task.task_hash().unwrap(), plain.task_hash().unwrap());
+    // Nothing else moved: with the holds taken out, the same graph.
+    let mut back = task.clone();
+    for n in back.graph.nodes.values_mut() {
+        if let TaskNode::Terminate { hold_ticks, .. } = n {
+            *hold_ticks = None;
+        }
+    }
+    assert_eq!(back, plain);
+
+    refused(
+        &so,
+        "[success]
+",
+        "[success]
+hold_s = 0.01
+",
+        &["success", "`hold_s`", "0.5"],
+    );
+    refused(
+        &so,
+        "[failure]
+",
+        "[failure]
+hold_s = 0.0
+",
+        &["failure", "`hold_s`"],
+    );
+}
+
 /// GV's finding (design note section 4.7): a coordinate of a free body no start item sets starts
 /// where the scene puts the body, not at zero. The scene is `empty.esscene` with the SO-101 arm
 /// included, as an authored project's, and the bodies written here.
@@ -661,8 +738,10 @@ mod generated {
     }
 
     fn spec() -> impl Strategy<Value = TaskSpec> {
-        let clauses =
-            || proptest::collection::vec(clause(), 0..3).prop_map(|clauses| Clauses { clauses });
+        let clauses = || {
+            (of(num()), proptest::collection::vec(clause(), 0..3))
+                .prop_map(|(hold_s, clauses)| Clauses { hold_s, clauses })
+        };
         let start = (
             of(num()),
             of(any::<bool>()),

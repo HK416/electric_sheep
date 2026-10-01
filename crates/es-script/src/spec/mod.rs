@@ -103,6 +103,11 @@ pub struct TaskSpec {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Clauses {
+    /// The section holds for this long before it ends the attempt (packet M18/K7): "all of these
+    /// hold for 1 s". `hold_s × control_hz` must be whole control ticks; it compiles to the
+    /// section's `Terminate { hold_ticks }`. Absent is the tick they hold, as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_s: Option<f64>,
     pub clauses: Vec<Clause>,
 }
 

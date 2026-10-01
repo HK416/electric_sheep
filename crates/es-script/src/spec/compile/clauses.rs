@@ -66,7 +66,11 @@ impl Compiler<'_> {
                 acc = Some(acc.map_or(p, |a| self.logic(op, a, p)));
             }
             let acc = acc.expect("non-empty");
-            let stop = self.add(TaskNode::Terminate { kind });
+            let hold_ticks = clauses
+                .hold_s
+                .map(|s| ticks(section, s, spec.control_hz))
+                .transpose()?;
+            let stop = self.add(TaskNode::Terminate { kind, hold_ticks });
             self.graph.connect(acc, "value", stop, "value");
             if let Some(w) = bonus {
                 self.reward(acc, section.to_owned(), w * scale);
@@ -76,6 +80,7 @@ impl Compiler<'_> {
         let late = self.compare(time, CmpOp::Ge, spec.timeout_s);
         let stop = self.add(TaskNode::Terminate {
             kind: TerminationKind::Timeout,
+            hold_ticks: None,
         });
         self.graph.connect(late, "value", stop, "value");
         Ok(())
@@ -356,4 +361,17 @@ fn check_fields(at: &str, c: &Clause) -> Result<(), SpecError> {
         return refuse(at, "object", "either `object` or `point`");
     }
     Ok(())
+}
+
+/// A section's `hold_s` in control ticks: whole, and at least one (packet M18/K7).
+fn ticks(section: &str, hold_s: f64, control_hz: f64) -> Result<u32, SpecError> {
+    let n = hold_s * control_hz;
+    if !(n >= 1.0 && n.fract() == 0.0 && n <= f64::from(u32::MAX)) {
+        return refuse(
+            section,
+            "hold_s",
+            format!("{n} control steps at control_hz is not a whole number of at least 1"),
+        );
+    }
+    Ok(n as u32)
 }
