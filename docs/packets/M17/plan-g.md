@@ -440,3 +440,37 @@ thirteen documents. ②'s teacher card serves any project with a `[teacher]`, ch
 `<documents>/Electric Sheep/templates/<name>/`. Only the dry-runs were measured; no learning run
 was made. The default reward of "[box] is inside [area]" is the success bonus alone. Design note
 section 5.4 records the rest. CI passed on 832f0db.
+
+**GV as run (2026-10-01, the orchestrator):** an authored task from the empty project to a camera
+student, on this PC. The editor watched every stage: ② attached to the teacher run, and ③
+switched to ⑤ by itself when the cycle ended.
+
+- **The project** `push-box` (owner's documents folder):
+  - **Scene:** the empty project with the library's SO-101, a 5 cm box at (0.22, 0, 0.025), a
+    target area of 8 × 8 cm at (0.22, 0.12), and two cameras (`top`, `side`).
+  - **Success:** the box is still, inside the area, within 5 cm of its centre (distance shaping
+    −10), and the gripper is within 40 cm of the box (distance shaping −1).
+  - **Failure:** the box is pushed 25 cm away.
+  - **Start:** the box drawn ±2 cm in x and y, joint noise 0.1.
+  - **Observation:** PT at 32 spp, 96 px.
+  - **How it was built:** `--edit-demo authored`, then the cameras and clauses written as the
+    sentence editor writes them, then `es project generate`.
+- **Teacher:** the generated PPO recipe on `mjwarp` (2,048 envs, 3,000 iterations) took 47 min,
+  0.84 s per iteration. Its last training success rate was 0.99. Checkpoint 2000, repacked on the
+  regenerated documents, scored 16/16 on `mujoco-cpu`'s nominal suite (mean 29 control steps).
+- **Cycle** (③'s recipe as `project::write_run` writes it; medium length):
+  - **Collect:** the teacher demonstrated 200 episodes in 12 min, two PT cameras each. 187
+    succeeded, 2 failed and 11 timed out.
+  - **Train:** ACT took 31 min for 20,000 steps on the 187 successes (5,466 frames). Previews
+    were 4/4 at 1,000 and 5,000 steps and 3/4 at 20,000.
+  - **Evaluate:** the held-out nominal suite scored **12/16 = 0.75**, against a pass mark of 0.5.
+    All 4 failures were timeouts.
+- **Fixed on the way** (each with an oracle):
+  - `d90d183`: `es train` finds its trainer scripts above the executable, so it works in a
+    project folder. The `[rl]` route writes a scene document as one MJCF (G2's writer) for the
+    rollout, and `Env::new` confirmed the pinned `scene_hash` on it.
+  - `d6072f8`: a free body's coordinates that no start item sets start at the scene's pose. They
+    used to start at zero: the box began half in the floor, and with "say the task"'s defaults
+    every object began at the origin. `[start] zero_unset = true` keeps the two committed
+    specifications' documents. Design note section 4.7.
+- **Left for later:** see `docs/reviews/M17.md`.
