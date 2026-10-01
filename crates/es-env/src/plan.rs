@@ -8,11 +8,11 @@
 
 use std::collections::BTreeMap;
 
-use es_assets::scene::SceneDesc;
+use es_assets::scene::{JointKind, SceneDesc};
 use es_ir::graph::{NodeId, PortRef};
 use es_ir::task::{
-    Aggregation, ArithOp, Expr, JointQuantity, LogicOp, MathFunc, NormKind, TaskGraph, TaskIr,
-    TaskNode, TerminationKind,
+    Aggregation, ArithOp, Expr, JointQuantity, LogicOp, MathFunc, NormKind, ReduceOp, TaskGraph,
+    TaskIr, TaskNode, TerminationKind,
 };
 use es_ir::types::Frame;
 use es_physics_core::backend::ModelInfo;
@@ -200,6 +200,58 @@ impl Ctx<'_> {
             TaskNode::GetBodyPose { body, relative_to } => {
                 self.body_pose_leaf(*body, *relative_to, &from.port)
             }
+            TaskNode::GetBodyVelocity { body, relative_to } => {
+                self.body_velocity_leaf(*body, *relative_to, &from.port)
+            }
+            // Packet M17/G3c: a cone's value is one row of lanes, so axis 0 is the only axis.
+            TaskNode::Slice {
+                axis, start, len, ..
+            } => {
+                let lanes = self.lower_input(id, "value", depth)?;
+                let (s, n) = (*start as usize, *len as usize);
+                if *axis != 0 || n == 0 || s + n > lanes.len() {
+                    return Err(EnvError::Unsupported(format!(
+                        "Slice {{ axis: {axis}, start: {start}, len: {len} }} of {} lanes in a \
+                         reward or termination cone",
+                        lanes.len()
+                    )));
+                }
+                Ok(lanes[s..s + n].to_vec())
+            }
+            TaskNode::Concat { parts, axis } => {
+                if *axis != 0 {
+                    return Err(EnvError::Unsupported(format!(
+                        "Concat {{ axis: {axis} }} in a reward or termination cone"
+                    )));
+                }
+                let mut lanes = Vec::new();
+                for i in 0..parts.len() {
+                    lanes.extend(self.lower_input(id, &format!("in{i}"), depth)?);
+                }
+                Ok(lanes)
+            }
+            // Folded in lane order, the association `Norm` and `Dot` use (`DET-020`); `Mean` is
+            // that sum divided by the lane count. `unordered = true` lets any order stand, and
+            // lane order is one (the validator refuses it in deterministic mode, `DET-030`).
+            TaskNode::Reduce { op, axis, .. } => {
+                let lanes = self.lower_input(id, "value", depth)?;
+                let n = lanes.len();
+                let fold_op = match op {
+                    ReduceOp::Sum | ReduceOp::Mean => ArithOp::Add,
+                    ReduceOp::Min => ArithOp::Min,
+                    ReduceOp::Max => ArithOp::Max,
+                };
+                let folded = fold(fold_op, lanes).filter(|_| *axis == 0).ok_or_else(|| {
+                    EnvError::Unsupported(format!(
+                        "Reduce {{ axis: {axis} }} over {n} lanes in a reward or termination cone"
+                    ))
+                })?;
+                Ok(vec![if *op == ReduceOp::Mean {
+                    arith(ArithOp::Div, folded, Expr::Const(n as f64))
+                } else {
+                    folded
+                }])
+            }
             TaskNode::Arith { op, .. } => {
                 let a = self.lower_input(id, "a", depth)?;
                 let b = self.lower_input(id, "b", depth)?;
@@ -213,23 +265,8 @@ impl Ctx<'_> {
                 kind: NormKind::L2, ..
             } => {
                 let lanes = self.lower_input(id, "value", depth)?;
-                let mut sum: Option<Expr> = None;
-                for lane in lanes {
-                    let square = Expr::Arith {
-                        op: ArithOp::Mul,
-                        lhs: Box::new(lane.clone()),
-                        rhs: Box::new(lane),
-                    };
-                    sum = Some(match sum {
-                        None => square,
-                        Some(acc) => Expr::Arith {
-                            op: ArithOp::Add,
-                            lhs: Box::new(acc),
-                            rhs: Box::new(square),
-                        },
-                    });
-                }
-                let sum = sum
+                let squares = lanes.into_iter().map(|x| arith(ArithOp::Mul, x.clone(), x));
+                let sum = fold(ArithOp::Add, squares)
                     .ok_or_else(|| EnvError::Task("Norm over a value with no lanes".to_owned()))?;
                 Ok(vec![Expr::Sqrt(Box::new(sum))])
             }
@@ -248,18 +285,9 @@ impl Ctx<'_> {
                         b.len()
                     )));
                 }
-                let mut sum: Option<Expr> = None;
-                for product in lane_wise(ArithOp::Mul, &a, &b)? {
-                    sum = Some(match sum {
-                        None => product,
-                        Some(acc) => Expr::Arith {
-                            op: ArithOp::Add,
-                            lhs: Box::new(acc),
-                            rhs: Box::new(product),
-                        },
-                    });
-                }
-                Ok(sum.into_iter().collect())
+                Ok(fold(ArithOp::Add, lane_wise(ArithOp::Mul, &a, &b)?)
+                    .into_iter()
+                    .collect())
             }
             // Lane by lane. `Abs` is `max(x, 0 - x)` and `Sqrt` the IEEE root; both are basic
             // operations, not `DET-010` transcendentals, and `Expr` has no polynomial for the
@@ -381,12 +409,7 @@ impl Ctx<'_> {
         relative_to: Frame,
         port: &str,
     ) -> Result<Vec<Expr>, EnvError> {
-        let name = self
-            .scene
-            .bodies
-            .iter()
-            .find(|b| b.id == body)
-            .map_or_else(|| body.to_string(), |b| b.name.clone());
+        let name = self.body_name(body);
         if relative_to != Frame::World {
             return Err(EnvError::Unsupported(format!(
                 "GetBodyPose(\"{name}\") relative to {relative_to:?} in a reward or \
@@ -427,6 +450,62 @@ impl Ctx<'_> {
                 )
             })
             .collect())
+    }
+
+    fn body_name(&self, body: es_core::StableId) -> String {
+        self.scene
+            .bodies
+            .iter()
+            .find(|b| b.id == body)
+            .map_or_else(|| body.to_string(), |b| b.name.clone())
+    }
+
+    /// A free body's velocity (packet M17/G3c). `StateView` has no body-velocity array; what it
+    /// carries exactly is the free joint's six `qvel` in `MuJoCo`'s convention, which every
+    /// backend's view follows (`physx_ref.py` converts to it): the body origin's linear velocity
+    /// in the world frame, then the angular velocity in the body frame. So `linear` is the
+    /// first three lanes as they are -- the very ports `GetJointState(Velocity)` binds -- and
+    /// `angular` is the last three rotated into the world by the orientation `GetBodyPose.quat`
+    /// reads (`xquat`, unit). A body without a free joint (a robot link) would need its
+    /// Jacobian, which `StateView` does not carry, and is refused by name.
+    fn body_velocity_leaf(
+        &mut self,
+        body: es_core::StableId,
+        relative_to: Frame,
+        port: &str,
+    ) -> Result<Vec<Expr>, EnvError> {
+        let name = self.body_name(body);
+        if relative_to != Frame::World || (port != "linear" && port != "angular") {
+            return Err(EnvError::Unsupported(format!(
+                "GetBodyVelocity(\"{name}\").{port} relative to {relative_to:?} in a reward or \
+                 termination cone"
+            )));
+        }
+        let free = self
+            .scene
+            .joints
+            .iter()
+            .find(|j| j.body == body && j.kind == JointKind::Free)
+            .and_then(|j| self.model.dof.get(&j.id))
+            .ok_or_else(|| {
+                EnvError::Unsupported(format!(
+                    "GetBodyVelocity(\"{name}\") in a reward or termination cone: the body has \
+                     no free joint in the loaded model, and StateView carries no other body \
+                     velocity"
+                ))
+            })?;
+        let lanes = if port == "linear" { 0..3 } else { 3..6 };
+        let v: Vec<Expr> = lanes
+            .map(|i| {
+                let at = free.start + i;
+                self.bind(format!("qvel[{at}]"), Source::Qvel(at))
+            })
+            .collect();
+        if port == "linear" {
+            return Ok(v);
+        }
+        let q = self.body_pose_leaf(body, relative_to, "quat")?;
+        Ok(rotate(&q, &v))
     }
 
     fn joint_leaf(
@@ -493,6 +572,54 @@ fn affine(x: Expr, lo: f64, hi: f64, out_lo: f64, out_hi: f64) -> Result<Expr, E
         lo: out_lo.min(out_hi),
         hi: out_lo.max(out_hi),
     })
+}
+
+fn arith(op: ArithOp, lhs: Expr, rhs: Expr) -> Expr {
+    Expr::Arith {
+        op,
+        lhs: Box::new(lhs),
+        rhs: Box::new(rhs),
+    }
+}
+
+/// `((l0 op l1) op l2) op ...`: lane order, the one association every reduction here uses.
+fn fold(op: ArithOp, lanes: impl IntoIterator<Item = Expr>) -> Option<Expr> {
+    lanes.into_iter().reduce(|acc, x| arith(op, acc, x))
+}
+
+/// `v` rotated by the unit quaternion `q` (`x y z w`): `v + w t + u × t`, `t = 2 (u × v)`,
+/// `u = (x, y, z)` -- polynomial, so no `DET-010` function is involved.
+// Written in the formula's symbols.
+#[allow(clippy::many_single_char_names)]
+fn rotate(q: &[Expr], v: &[Expr]) -> Vec<Expr> {
+    let cross = |a: &[Expr], b: &[Expr]| -> Vec<Expr> {
+        (0..3)
+            .map(|i| {
+                let (j, k) = ((i + 1) % 3, (i + 2) % 3);
+                arith(
+                    ArithOp::Sub,
+                    arith(ArithOp::Mul, a[j].clone(), b[k].clone()),
+                    arith(ArithOp::Mul, a[k].clone(), b[j].clone()),
+                )
+            })
+            .collect()
+    };
+    let (u, w) = (&q[..3], &q[3]);
+    let t: Vec<Expr> = cross(u, v)
+        .into_iter()
+        .map(|c| arith(ArithOp::Mul, Expr::Const(2.0), c))
+        .collect();
+    let ut = cross(u, &t);
+    (0..3)
+        .map(|i| {
+            let wt = arith(ArithOp::Mul, w.clone(), t[i].clone());
+            arith(
+                ArithOp::Add,
+                arith(ArithOp::Add, v[i].clone(), wt),
+                ut[i].clone(),
+            )
+        })
+        .collect()
 }
 
 /// `Arith` lane by lane, with a one-lane operand broadcast over the other side.
@@ -1063,5 +1190,246 @@ Const(0.85) } }), (Failure, Compare { op: Gt, lhs: Port(\"qpos[6]\"), rhs: Const
         let err = ScalarPlan::compile(&short, &scene, &model).expect_err("2 bounds for 3 lanes");
         assert!(err.to_string().contains("3 lanes with 2 lo"), "{err}");
         println!("RAN quaternion_dot_abs_sqrt_and_per_lane_normalize_lower");
+    }
+
+    /// Packet M17/G3c: `Slice`, `Concat`, `Reduce` and `GetBodyVelocity` in reward cones,
+    /// each evaluated through the `Expr` the env runs against the same numbers by hand. The
+    /// demo scene: six arm joints, then the cube's free joint (`qvel[6..12]`).
+    // Exact association is the property under test: these comparisons are deliberate; the
+    // rotation is written in the quaternion's symbols.
+    #[allow(clippy::float_cmp, clippy::many_single_char_names)]
+    #[test]
+    fn slice_concat_reduce_and_body_velocity_lower() {
+        use es_ir::task::ReduceOp;
+        use es_ir::types::{Frame, Unit};
+
+        let scene = scene();
+        let mut model = ModelInfo {
+            nq: 13,
+            nv: 12,
+            nbody: scene.bodies.len() as u32,
+            ..ModelInfo::default()
+        };
+        for (row, b) in scene.bodies.iter().enumerate() {
+            model.body.insert(b.id, IndexRange::new(row as u32, 1));
+        }
+        let cube_free = joint_id(&scene, "cube_free");
+        model.qpos.insert(cube_free, IndexRange::new(6, 7));
+        model.dof.insert(cube_free, IndexRange::new(6, 6));
+        let (cube, base) = (body_id(&scene, "cube"), body_id(&scene, "base"));
+        let row = |id: StableId| model.body[&id].start as usize;
+        let (cr, br) = (row(cube), row(base));
+
+        let p3 = vec_ty(3, Unit::Length);
+        let reduce = |op| TaskNode::Reduce {
+            op,
+            axis: 0,
+            unordered: false,
+            ty: vec_ty(6, Unit::Length),
+        };
+        let slice = |ty: &es_ir::types::PortType, start| TaskNode::Slice {
+            ty: ty.clone(),
+            axis: 0,
+            start,
+            len: 1,
+        };
+        let reward = |name: &str| TaskNode::Reward {
+            name: name.to_owned(),
+            weight: 1.0,
+            aggregation: Aggregation::Sum,
+            ty: vec_ty(1, Unit::Length),
+        };
+        let w3 = vec_ty(3, Unit::AngularVelocity);
+        let mut task = crate::env::tests::task_with(&[
+            TaskNode::GetBodyPose {
+                body: cube,
+                relative_to: Frame::World,
+            },
+            TaskNode::GetBodyPose {
+                body: base,
+                relative_to: Frame::World,
+            },
+            TaskNode::GetBodyVelocity {
+                body: cube,
+                relative_to: Frame::World,
+            },
+            TaskNode::Concat {
+                parts: vec![p3.clone(), p3.clone()],
+                axis: 0,
+            },
+            reduce(ReduceOp::Sum),
+            reward("sum"),
+            reduce(ReduceOp::Mean),
+            reward("mean"),
+            reduce(ReduceOp::Min),
+            reward("min"),
+            reduce(ReduceOp::Max),
+            reward("max"),
+            slice(&p3, 2),
+            reward("z"),
+            TaskNode::Norm {
+                kind: NormKind::L2,
+                ty: vec_ty(3, Unit::Velocity),
+            },
+            reward("speed"),
+            slice(&w3, 0),
+            reward("w0"),
+            slice(&w3, 1),
+            reward("w1"),
+            slice(&w3, 2),
+            reward("w2"),
+        ]);
+        let n = NodeId;
+        for (from, fp, to, tp) in [
+            (0, "pos", 3, "in0"),
+            (1, "pos", 3, "in1"),
+            (3, "value", 4, "value"),
+            (4, "value", 5, "value"),
+            (3, "value", 6, "value"),
+            (6, "value", 7, "value"),
+            (3, "value", 8, "value"),
+            (8, "value", 9, "value"),
+            (3, "value", 10, "value"),
+            (10, "value", 11, "value"),
+            (0, "pos", 12, "value"),
+            (12, "value", 13, "value"),
+            (2, "linear", 14, "value"),
+            (14, "value", 15, "value"),
+            (2, "angular", 16, "value"),
+            (16, "value", 17, "value"),
+            (2, "angular", 18, "value"),
+            (18, "value", 19, "value"),
+            (2, "angular", 20, "value"),
+            (20, "value", 21, "value"),
+        ] {
+            task.graph.connect(n(from), fp, n(to), tp);
+        }
+        let plan = ScalarPlan::compile(&task, &scene, &model).expect("the cones lower");
+        // `linear` is the free joint's own `qvel` ports, the ones `GetJointState` binds.
+        assert_eq!(plan.bindings["qvel[6]"], Source::Qvel(6));
+        assert_eq!(plan.bindings["qvel[11]"], Source::Qvel(11));
+
+        let (c, b) = ([0.13, -0.27, 0.31], [-0.4, 0.05, 0.17]);
+        let lin = [0.5, -0.25, 0.125];
+        let omega = [0.3, -0.7, 0.2];
+        let eval = |q: [f64; 4]| {
+            let mut ports = BTreeMap::new();
+            for i in 0..3 {
+                ports.insert(format!("xpos[{}]", cr * 3 + i), c[i]);
+                ports.insert(format!("xpos[{}]", br * 3 + i), b[i]);
+                ports.insert(format!("qvel[{}]", 6 + i), lin[i]);
+                ports.insert(format!("qvel[{}]", 9 + i), omega[i]);
+            }
+            for (i, v) in q.iter().enumerate() {
+                ports.insert(format!("xquat[{}]", cr * 4 + i), *v);
+            }
+            plan.rewards
+                .iter()
+                .map(|r| (r.name.clone(), r.expr.eval(&ports).expect("evaluates")))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let q = [0.1, -0.2, 0.3, 0.927_361_849_549_570_3];
+        let r = eval(q);
+        let sum = ((((c[0] + c[1]) + c[2]) + b[0]) + b[1]) + b[2];
+        assert_eq!(r["sum"], sum, "summed in lane order");
+        assert_eq!(r["mean"], sum / 6.0);
+        assert_eq!(r["min"], -0.4);
+        assert_eq!(r["max"], 0.31);
+        assert_eq!(r["z"], c[2]);
+        assert_eq!(
+            r["speed"],
+            ((lin[0] * lin[0] + lin[1] * lin[1]) + lin[2] * lin[2]).sqrt()
+        );
+        // The body-frame rate in the world: `R(q) omega` with the rotation matrix of `q`.
+        let [x, y, z, w] = q;
+        let m = [
+            [
+                1.0 - 2.0 * (y * y + z * z),
+                2.0 * (x * y - z * w),
+                2.0 * (x * z + y * w),
+            ],
+            [
+                2.0 * (x * y + z * w),
+                1.0 - 2.0 * (x * x + z * z),
+                2.0 * (y * z - x * w),
+            ],
+            [
+                2.0 * (x * z - y * w),
+                2.0 * (y * z + x * w),
+                1.0 - 2.0 * (x * x + y * y),
+            ],
+        ];
+        for (i, row) in m.iter().enumerate() {
+            let want: f64 = (0..3).map(|j| row[j] * omega[j]).sum();
+            let got = r[&format!("w{i}")];
+            assert!((got - want).abs() < 1e-15, "lane {i}: {got} vs {want}");
+        }
+        // The identity orientation leaves the lanes as they are, bit for bit.
+        let r = eval([0.0, 0.0, 0.0, 1.0]);
+        assert_eq!([r["w0"], r["w1"], r["w2"]], omega);
+
+        // Refused by name: a slice past the end, a reduction over a second axis, a body with
+        // no free joint, another frame.
+        for (patch, wanted) in [
+            (
+                Box::new(|t: &mut TaskIr| {
+                    t.graph.insert(
+                        n(12),
+                        TaskNode::Slice {
+                            ty: vec_ty(3, Unit::Length),
+                            axis: 0,
+                            start: 2,
+                            len: 2,
+                        },
+                    );
+                }) as Box<dyn Fn(&mut TaskIr)>,
+                "Slice { axis: 0, start: 2, len: 2 } of 3 lanes",
+            ),
+            (
+                Box::new(|t: &mut TaskIr| {
+                    t.graph.insert(
+                        n(4),
+                        TaskNode::Reduce {
+                            op: ReduceOp::Sum,
+                            axis: 1,
+                            unordered: false,
+                            ty: vec_ty(6, Unit::Length),
+                        },
+                    );
+                }),
+                "Reduce { axis: 1 }",
+            ),
+            (
+                Box::new(|t: &mut TaskIr| {
+                    t.graph.insert(
+                        n(2),
+                        TaskNode::GetBodyVelocity {
+                            body: body_id(&scene, "gripper"),
+                            relative_to: Frame::World,
+                        },
+                    );
+                }),
+                "\"gripper\") in a reward or termination cone: the body has no free joint",
+            ),
+            (
+                Box::new(|t: &mut TaskIr| {
+                    t.graph.insert(
+                        n(2),
+                        TaskNode::GetBodyVelocity {
+                            body: cube,
+                            relative_to: Frame::LocalOrigin,
+                        },
+                    );
+                }),
+                "LocalOrigin",
+            ),
+        ] {
+            let mut broken = task.clone();
+            patch(&mut broken);
+            let err = ScalarPlan::compile(&broken, &scene, &model)
+                .expect_err("an unsupported cone must be refused");
+            assert!(err.to_string().contains(wanted), "{wanted}: {err}");
+        }
+        println!("RAN slice_concat_reduce_and_body_velocity_lower");
     }
 }
