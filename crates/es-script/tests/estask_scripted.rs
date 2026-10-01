@@ -356,6 +356,33 @@ fn inside_a_region_holds_on_all_three_axes_and_not_on_its_boundary() {
     }
 }
 
+/// Packet R5 (N-2, design note section 4.7.1): `inside` a region shaped by `distance` pays
+/// `weight × ‖p − c‖` to the region's centre `c`, the distance clamped to [0, 1] m — at the
+/// centre, on a face, inside 1 m, past it, and with one axis past 1 m (each lane clamps there).
+#[test]
+fn inside_a_region_pays_the_distance_to_its_centre() {
+    let cube = row_in(REGIONS, "cube");
+    let t = task_on(
+        REGIONS,
+        "[success]\nclauses = [{ subject = \"cube\", relation = \"inside\", object = \"bin_area\", \
+         shaping = \"distance\", weight = -2.0 }]",
+    );
+    let c = [0.14, -0.1, 0.05];
+    let off = |d: [f64; 3]| [c[0] + d[0], c[1] + d[1], c[2] + d[2]];
+    for (p, how) in [
+        (c, Termination::Success),
+        (off([0.05, 0.0, 0.0]), Termination::Running),
+        (off([0.3, 0.0, 0.4]), Termination::Running),
+        (off([0.6, 0.6, 0.6]), Termination::Running),
+        (off([1.86, 0.0, 0.0]), Termination::Running),
+    ] {
+        let d = (0..3).map(|i| (p[i] - c[i]).powi(2)).sum::<f64>().sqrt();
+        let (r, got) = score(&t, |s| s.xpos[cube * 3..cube * 3 + 3].copy_from_slice(&p));
+        assert_eq!(got, how, "{p:?}");
+        assert!((r + 2.0 * d.min(1.0)).abs() < 1e-12, "{p:?}: {r} vs {d}");
+    }
+}
+
 /// `above` / `below` another body: the difference of the two world heights, beyond `m`
 /// (absent: 0), strictly.
 #[test]

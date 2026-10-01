@@ -149,9 +149,10 @@ impl Relation {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Shaping {
-    /// `near` / `farther_than`: `weight × distance`, the distance clamped to [0, 1] m.
+    /// `near` / `farther_than`, and `inside` a region (the distance to its centre):
+    /// `weight × distance`, the distance clamped to [0, 1] m.
     Distance,
-    /// `inside`: `weight × (s − ramp[0]) / (ramp[1] − ramp[0])`, clamped to [0, 1].
+    /// `inside` a range: `weight × (s − ramp[0]) / (ramp[1] − ramp[0])`, clamped to [0, 1].
     Ramp,
     /// `orientation_matches`: `weight / (s + 0.1)`, `s = √(8 (1 − |q·g|))` — Isaac Lab's
     /// rotation reward, as its piecewise-linear interpolant at nine knots (plan H) plus the

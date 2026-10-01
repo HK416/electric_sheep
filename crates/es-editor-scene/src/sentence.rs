@@ -640,7 +640,8 @@ fn bare(subject: String, relation: Relation) -> Clause {
 
 /// The clause with relation `r` (measured against something named when `object`): the fields
 /// the new relation takes are kept where they fit, the ones it needs get defaults, and the
-/// shaping stays when its form does.
+/// shaping stays when its form does. A newly picked `inside` a region with no shaping to keep
+/// pays its distance to the region's centre at the medium level (design note section 4.7.1).
 pub fn set_relation(scene: &SceneDesc, c: &mut Clause, r: Relation, object: bool) {
     let old = std::mem::replace(c, bare(c.subject.clone(), r));
     let t = takes(r, object);
@@ -698,6 +699,8 @@ pub fn set_relation(scene: &SceneDesc, c: &mut Clause, r: Relation, object: bool
     }
     if old.shaping.is_some() && old.shaping == t.shaping {
         (c.shaping, c.weight, c.ramp, c.term) = (old.shaping, old.weight, old.ramp, old.term);
+    } else if form(c) == (Relation::Inside, true) && form(&old) != form(c) {
+        set_shaping(c, Some(Level::Medium));
     }
 }
 

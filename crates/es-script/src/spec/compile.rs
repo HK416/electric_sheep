@@ -403,17 +403,36 @@ impl<'a> Compiler<'a> {
         }))
     }
 
-    /// `|value| < bound`, the L2 norm of a vector.
-    fn norm_below(&mut self, from: (NodeId, &str), bound: f64) -> NodeId {
-        let norm = self.feed(from, "value", |ty| TaskNode::Norm {
+    /// The L2 norm of a vector.
+    fn norm(&mut self, from: (NodeId, &str)) -> NodeId {
+        self.feed(from, "value", |ty| TaskNode::Norm {
             kind: NormKind::L2,
             ty,
-        });
+        })
+    }
+
+    /// `|value| < bound`, the L2 norm of a vector.
+    fn norm_below(&mut self, from: (NodeId, &str), bound: f64) -> NodeId {
+        let norm = self.norm(from);
         self.compare(norm, CmpOp::Lt, bound)
     }
 
-    /// Region (site) `name` as `(lo, hi)` per world axis: the site's world position ± its
-    /// half-extents (`size`). The box is axis-aligned in the **world** frame: a cone takes a
+    /// `p − point` with no constant node: a per-lane `Normalize` whose map is the identity
+    /// shifted by the point, `[p − 1, p + 1] → [−1, 1]` (plan H), so each lane clamps at 1 m.
+    fn minus_point(&mut self, from: (NodeId, &str), point: [f64; 3]) -> NodeId {
+        let lo = point.iter().map(|v| v - 1.0).collect();
+        let hi = point.iter().map(|v| v + 1.0).collect();
+        self.normalize(from, lo, hi, [-1.0, 1.0])
+    }
+
+    /// `weight × distance`, the distance clamped to [0, 1] m.
+    fn distance_term(&mut self, dist: NodeId, name: String, weight: f64) {
+        let metres = self.normalize((dist, "value"), vec![0.0], vec![1.0], [0.0, 1.0]);
+        self.reward(metres, name, weight);
+    }
+
+    /// Region (site) `name` as `(centre, half-extents)` per world axis: the site's world
+    /// position and its `size`. The box is axis-aligned in the **world** frame: a cone takes a
     /// world point only as `Compare`'s literal (the IR has no constant node to rotate a vector
     /// by), and a region the editor writes is unrotated — so a rotated site, or one that moves
     /// (a joint on its body or on an ancestor), is refused by name.
@@ -461,11 +480,7 @@ impl<'a> Compiler<'a> {
                 c[2] + p.position.z,
             ]
         });
-        let h = [site.size.x, site.size.y, site.size.z];
-        Ok((
-            std::array::from_fn(|i| c[i] - h[i]),
-            std::array::from_fn(|i| c[i] + h[i]),
-        ))
+        Ok((c, [site.size.x, site.size.y, site.size.z]))
     }
 
     // --- clauses --------------------------------------------------------------------------
@@ -543,19 +558,26 @@ impl<'a> Compiler<'a> {
                 .unwrap_or_else(|| format!("{}_{kind}", c.subject))
         };
         match c.relation {
-            // A body inside a region: each world axis of its position strictly inside the box.
+            // A body inside a region: each world axis of its position strictly inside the box;
+            // shaped, its distance to the box's centre (design note section 4.7.1).
             Relation::Inside if c.object.is_some() => {
-                let (lo, hi) = self.region(at, c.object.as_deref().expect("matched"))?;
+                let (centre, half) = self.region(at, c.object.as_deref().expect("matched"))?;
                 let body = self.body(at, "subject", &c.subject)?;
                 let mut acc = None;
                 for axis in 0..3 {
                     let lane = self.coordinate(at, body, axis as u64, JointQuantity::Position)?;
                     let (gt, lt) = (
-                        self.compare(lane, CmpOp::Gt, lo[axis]),
-                        self.compare(lane, CmpOp::Lt, hi[axis]),
+                        self.compare(lane, CmpOp::Gt, centre[axis] - half[axis]),
+                        self.compare(lane, CmpOp::Lt, centre[axis] + half[axis]),
                     );
                     let within = self.logic(LogicOp::And, gt, lt);
                     acc = Some(acc.map_or(within, |prev| self.logic(LogicOp::And, prev, within)));
+                }
+                if c.shaping.is_some() {
+                    let p = self.pose(body.id);
+                    let offset = self.minus_point((p, "pos"), centre);
+                    let dist = self.norm((offset, "value"));
+                    self.distance_term(dist, term("distance"), weight);
                 }
                 Ok(acc.expect("three axes"))
             }
@@ -651,23 +673,14 @@ impl<'a> Compiler<'a> {
                     };
                     self.pair((s, "pos"), (o, "pos"), node)
                 } else {
-                    // No constant node: `p − point` is a per-lane `Normalize` whose map is the
-                    // identity shifted by the point, `[p − 1, p + 1] → [−1, 1]` (plan H).
                     if m >= 1.0 {
                         return refuse(at, "m", "against a point, offsets clamp at 1 m per axis");
                     }
-                    let p = c.point.expect("checked");
-                    let lo = p.iter().map(|v| v - 1.0).collect();
-                    let hi = p.iter().map(|v| v + 1.0).collect();
-                    self.normalize((s, "pos"), lo, hi, [-1.0, 1.0])
+                    self.minus_point((s, "pos"), c.point.expect("checked"))
                 };
-                let dist = self.feed((offset, "value"), "value", |ty| TaskNode::Norm {
-                    kind: NormKind::L2,
-                    ty,
-                });
+                let dist = self.norm((offset, "value"));
                 if c.shaping.is_some() {
-                    let metres = self.normalize((dist, "value"), vec![0.0], vec![1.0], [0.0, 1.0]);
-                    self.reward(metres, term("distance"), weight);
+                    self.distance_term(dist, term("distance"), weight);
                 }
                 let op = if c.relation == Relation::Near {
                     CmpOp::Lt

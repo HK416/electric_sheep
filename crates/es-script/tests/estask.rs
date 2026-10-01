@@ -227,7 +227,7 @@ mod scene_pose {
     use super::{read, repo};
 
     /// GV's box: 5 cm, on the floor in front of the arm.
-    const BOX: &str = r#"
+    pub(super) const BOX: &str = r#"
 [[body]]
 name = "box"
 pos = [0.22, 0.0, 0.025]
@@ -263,7 +263,7 @@ items = [
     type Reset = (bool, String, Distribution, String);
 
     /// A scratch project: `scene.esscene` (the empty scene, the arm, `bodies`) and the arm's file.
-    fn project(tag: &str, bodies: &str) -> PathBuf {
+    pub(super) fn project(tag: &str, bodies: &str) -> PathBuf {
         let dir = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("estask-{tag}"));
         std::fs::create_dir_all(&dir).unwrap();
         let arm = "tests/fixtures/esscene/so101.xml";
@@ -275,7 +275,7 @@ items = [
         dir
     }
 
-    fn scene(dir: &Path) -> SceneDesc {
+    pub(super) fn scene(dir: &Path) -> SceneDesc {
         let text = std::fs::read_to_string(dir.join("scene.esscene")).unwrap();
         let doc = es_assets::esscene::EsScene::from_toml(&text).unwrap();
         es_assets::esscene::expand(&doc, dir).unwrap()
@@ -400,6 +400,148 @@ items = [
                 assert_eq!(b[2..], [0.025, 1.0, 0.0, 0.0, 0.0], "{b:?}");
             }
             assert_eq!(lanes(&env, &scene, "turned"), turned, "{start}");
+        }
+    }
+}
+
+/// Packet R5 (design note section 4.7.1): "[box] is inside [area]" shaped by `distance`, on GV's
+/// project (the empty scene, the arm, the box, the area), and what an unset joint starts at.
+mod region_distance {
+    // The literals are the scene's bits, compared as such.
+    #![allow(clippy::float_cmp)]
+
+    use es_ir::graph::NodeId;
+    use es_ir::task::{Aggregation, NormKind, TaskIr, TaskNode};
+    use es_script::spec::{compile_task, TaskSpec};
+
+    use super::scene_pose::{project, BOX};
+
+    /// GV's target area.
+    const AREA: &str = r#"
+[[region]]
+name = "target"
+pos = [0.22, 0.12, 0.025]
+size = [0.04, 0.04, 0.03]
+"#;
+
+    fn spec(shaping: &str) -> TaskSpec {
+        let text = format!(
+            "kind = \"task-spec\"\nschema = 1\nscene = \"scene.esscene\"\nrobot = \"arm\"\n\
+             control_hz = 50\ntimeout_s = 8.0\n\n[success]\n\
+             clauses = [{{ subject = \"box\", relation = \"inside\", object = \"target\"{shaping} }}]"
+        );
+        TaskSpec::from_toml(&text).unwrap()
+    }
+
+    /// What feeds `port` of `node`.
+    fn input(task: &TaskIr, node: NodeId, port: &str) -> (NodeId, String) {
+        let e = (task.graph.edges.iter())
+            .find(|e| e.to.node == node && e.to.port == port)
+            .expect("an edge");
+        (e.from.node, e.from.port.clone())
+    }
+
+    /// The term's four nodes, pinned: the box's world position less the area's centre (one
+    /// clamped lane per axis), its norm, clamped to [0, 1] m, paid at the weight. Without
+    /// `shaping` the compiled nodes are the same less those four.
+    #[test]
+    fn inside_a_region_pays_the_distance_to_the_centre() {
+        let dir = project("region", &format!("{BOX}{AREA}"));
+        let task = compile_task(&spec(", shaping = \"distance\", weight = -1.0"), &dir).unwrap();
+        let reward = (task.graph.nodes.iter())
+            .find(|(_, n)| matches!(n, TaskNode::Reward { name, .. } if name == "box_distance"))
+            .map(|(id, _)| *id)
+            .expect("the term, named `<subject>_distance`");
+        let TaskNode::Reward {
+            weight,
+            aggregation,
+            ..
+        } = &task.graph.nodes[&reward]
+        else {
+            unreachable!()
+        };
+        assert_eq!((*weight, *aggregation), (-1.0, Aggregation::Sum));
+        let (metres, _) = input(&task, reward, "value");
+        let (norm, _) = input(&task, metres, "value");
+        let (offset, _) = input(&task, norm, "value");
+        let (pose, port) = input(&task, offset, "value");
+        let n = |id: NodeId| &task.graph.nodes[&id];
+        assert!(
+            matches!(n(metres), TaskNode::Normalize { lo, hi, out_lo, out_hi, .. }
+                if *lo == [0.0] && *hi == [1.0] && (*out_lo, *out_hi) == (0.0, 1.0)),
+            "{:?}",
+            n(metres)
+        );
+        assert!(matches!(
+            n(norm),
+            TaskNode::Norm {
+                kind: NormKind::L2,
+                ..
+            }
+        ));
+        let c = [0.22, 0.12, 0.025];
+        assert!(
+            matches!(n(offset), TaskNode::Normalize { lo, hi, out_lo, out_hi, .. }
+                if *lo == c.map(|v| v - 1.0) && *hi == c.map(|v| v + 1.0)
+                    && (*out_lo, *out_hi) == (-1.0, 1.0)),
+            "{:?}",
+            n(offset)
+        );
+        assert_eq!(port, "pos");
+        let scene = super::scene_pose::scene(&dir);
+        let box_id = scene.bodies.iter().find(|b| b.name == "box").unwrap().id;
+        assert!(matches!(n(pose), TaskNode::GetBodyPose { body, .. } if *body == box_id));
+
+        let plain = compile_task(&spec(""), &dir).unwrap();
+        let shaping = [offset, norm, metres, reward];
+        let less: Vec<&TaskNode> = (task.graph.nodes.iter())
+            .filter(|(id, _)| !shaping.contains(id))
+            .map(|(_, n)| n)
+            .collect();
+        assert_eq!(plain.graph.nodes.values().collect::<Vec<_>>(), less);
+    }
+
+    /// F-9: a hinge's `ref` does not reach `SceneDesc` (the MJCF parser warns that it is not
+    /// represented), so every hinge and slide's `qpos0` is 0 — what `Env::reset` writes — and
+    /// no reset node is emitted for it. When `ref` is represented this fails: section 4.7.1
+    /// says what the compiler then emits.
+    #[test]
+    fn a_hinges_ref_is_not_represented_and_nothing_is_emitted() {
+        let dir = std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("estask-ref");
+        std::fs::create_dir_all(&dir).unwrap();
+        let xml = r#"<mujoco model="ref">
+  <compiler angle="radian"/>
+  <worldbody>
+    <body name="base">
+      <body name="link">
+        <joint name="hinge" type="hinge" axis="0 0 1" ref="0.5" range="-1 1"/>
+        <geom type="box" size="0.05 0.05 0.05"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator><position name="drive" joint="hinge"/></actuator>
+</mujoco>"#;
+        std::fs::write(dir.join("ref.xml"), xml).unwrap();
+        let parsed = es_assets::parse_mjcf(xml).unwrap();
+        assert!(
+            (parsed.warnings.iter()).any(|w| w.message.contains("`ref` is not represented")),
+            "{:?}",
+            parsed.warnings
+        );
+        for start in ["", "\n[start]\nzero_unset = true\nitems = []"] {
+            let text = format!(
+                "kind = \"task-spec\"\nschema = 1\nscene = \"ref.xml\"\nrobot = \"base\"\n\
+                 control_hz = 50\ntimeout_s = 1.0\n\n[success]\n\
+                 clauses = [{{ subject = \"hinge\", relation = \"above\", value = 0.9 }}]{start}"
+            );
+            let task = compile_task(&TaskSpec::from_toml(&text).unwrap(), &dir).unwrap();
+            let resets = (task.graph.nodes.values()).filter(|n| {
+                matches!(
+                    n,
+                    TaskNode::ResetState { .. } | TaskNode::Randomization { .. }
+                )
+            });
+            assert_eq!(resets.count(), 0, "{start}");
         }
     }
 }

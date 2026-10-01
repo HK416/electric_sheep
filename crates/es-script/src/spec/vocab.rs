@@ -19,7 +19,7 @@ pub struct Takes {
 pub fn takes(relation: Relation, object: bool) -> Takes {
     let (fields, needs, shaping): (&'static [&'static str], &'static [&'static str], _) =
         match relation {
-            Relation::Inside if object => (&["object"], &[], None),
+            Relation::Inside if object => (&["object"], &[], Some(Shaping::Distance)),
             Relation::Inside => (&["range"], &["range"], Some(Shaping::Ramp)),
             Relation::Above | Relation::Below if object => (&["object", "m"], &[], None),
             Relation::Above | Relation::Below => (&["value"], &["value"], None),

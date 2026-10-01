@@ -354,6 +354,14 @@ fn a_new_task_on_the_so101_copy_compiles_and_generates() {
         Slot::Relation(Relation::Inside, true),
     );
     assert_eq!(first.object.as_deref(), Some("bin_area"));
+    // Packet R5: a newly picked "inside a region" pays its distance to the centre, at medium.
+    assert_eq!(
+        (first.shaping, s::shaping_level(first)),
+        (
+            Some(es_script::spec::Shaping::Distance),
+            Some(Level::Medium)
+        )
+    );
     put(&mut m, next).expect("cube inside bin_area, cube still");
     let sp = spec(&m);
     let words: Vec<(String, Relation)> = (sp.success.clauses.iter())
@@ -412,6 +420,43 @@ fn a_new_task_on_the_so101_copy_compiles_and_generates() {
     ));
     std::fs::remove_file(&spec_path).unwrap();
     assert_eq!(es_editor_scene::on_disk(m.root()), Regen::NoSpec);
+    let _ = std::fs::remove_dir_all(m.root());
+}
+
+/// Packet R5 (design note section 4.7.1): an "inside a region" clause offers the distance
+/// toggle; turning it on at a level and off is one undo step that compiles, it reads back at
+/// its level through its sentence, and re-picking the relation it has does not turn it back on.
+#[test]
+fn the_region_distance_toggle_is_one_undo_step() {
+    let mut m = so101("region");
+    let said = s::new_spec(m.scene(), m.doc(), 50.0);
+    m.apply(&Command::Spec(Some(Box::new(said)))).unwrap();
+    let mut region = new_region("bin_area");
+    region.pos = Some([0.14, -0.1, 0.05]);
+    m.apply(&Command::Add(Record::Region(region))).unwrap();
+    let scene = m.scene().clone();
+    let inside = Slot::Relation(Relation::Inside, true);
+    step(&mut m, |sp, scene| {
+        s::edit_clause(
+            scene,
+            &mut sp.success.clauses[0],
+            Field::Relation,
+            inside.clone(),
+        );
+    });
+    assert!(s::shapable(&spec(&m).success.clauses[0]).is_some());
+    for level in [Some(Level::High), None, Some(Level::Low)] {
+        step(&mut m, |sp, _| {
+            s::set_shaping(&mut sp.success.clauses[0], level);
+        });
+        let now = spec(&m);
+        assert_eq!(s::shaping_level(&now.success.clauses[0]), level);
+        assert_eq!(written_back(&now, &scene), now, "{level:?}");
+    }
+    let mut off = spec(&m).success.clauses[0].clone();
+    s::set_shaping(&mut off, None);
+    s::edit_clause(&scene, &mut off, Field::Relation, inside);
+    assert_eq!(off.shaping, None, "the same relation picked again");
     let _ = std::fs::remove_dir_all(m.root());
 }
 
