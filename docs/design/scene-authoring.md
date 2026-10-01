@@ -777,6 +777,99 @@ live only in documentation and string tables).
   document carries a mesh scale (an STL in millimetres comes in 1000 times too large). A URDF whose
   meshes lie outside its folder is refused, and USD is refused as in G1.
 
+### 5.4 What G9 settled (an authored project runs end to end)
+
+`templates/empty.toml`; `crates/es-editor-model/src/model/template.rs` (`source`, `authored`,
+`Generated`, `load_saved`, `write_saved`), `project.rs` and `watch.rs` (`with_source`,
+`set_source`, the gate); `crates/es-editor-scene/src/{model,copy,check,sentence}.rs` (`on_disk`,
+`refresh`, `Regen::Stale`, `copy::documents`, `check::maps_onto`, the learners "say the task"
+writes); `crates/es-editor/src/ui/{scene,author,teacher,teach,results,train,home}.rs` draw and
+wire. Oracles `crates/es-editor/tests/authored.rs` (the packet's 1 to 4) and
+`crates/es-editor-scene/tests/{sentences,documents}.rs`.
+
+- **The empty project is a template without documents**, not a project kind of its own.
+  `Template.bundle` is optional, `cycle` and `robot` may be empty, and `templates/empty.toml`
+  names `[editable] scene = empty.esscene` and nothing a task has. Why: every place that resolves
+  a project's template keeps one type and one lookup; a project kind would have doubled the
+  branches of the start screen, the project file and every step. Its card (sorted by id beside
+  the others) makes the folder: the start screen copies the scene in as ①'s editable copy does
+  (`make_editable`), then `Project::create` writes `project.toml` and builds no bundle. It needs
+  `mujoco`, `torch`, `vulkan` and `render`, not `mjwarp`: building a scene needs no GPU
+  simulator, and ② says on the teacher's card what is missing.
+- **What ② to ⑤ run** is one function, `template::source(project, repo, generated)`:
+  - a template project (not editable): the template's documents, `es` in the repository root,
+    exactly as before;
+  - an editable project with no task: its template's documents when it has some (an SO-101
+    copy), else nothing ("there is no task yet");
+  - an editable project with a task: the documents in `generated/` when they are exactly what
+    the saved scene and task generate, `es` in the project's own folder.
+
+  "Exactly" is `es-editor-scene`'s `on_disk`: `generate` run in memory and every file compared
+  byte for byte (the generator has no clock). `es-editor-model` does not have the generator, so
+  `es-editor` carries the answer: from disk when the project opens, then every frame from ①'s
+  model (saved, unsaved, the last generation). When it changes, ③'s source, ②'s teacher card
+  and program, and ⑤ are read again.
+- **The authored template** (`template::authored`) is the project's template — its words, needs,
+  lengths and view — with `generated/`'s student arm as the bundle, its `[teacher]` documents, its
+  cycle and `scene.esscene`. `method = "teacher"` when there is a teacher and the cycle names no
+  expert. It has no `[outcome]`: the template's outcome is its own task's, and explaining a
+  failure by the missing clause is S4's next item. `untrained.esb` is rebuilt from the generated
+  documents before each run, since they change with every save, as `es policy init` builds it.
+- **`es` runs in the project root**, not with absolute paths. The generated documents name
+  `scene.esscene` relative to the project (it is hash input, `SceneRef.path`) and the recipes
+  derive `runs/…` from `[cycle] runs`, both relative, as G3b's `generate` writes them. The launch
+  model already starts every `es` in a folder (`start_in`), so the documents run as written.
+  Absolute paths would have meant rewriting generated documents, and a scene path that is hash
+  input, per machine. What the editor writes itself stays absolute (run folders, bundles, run
+  recipes), as before.
+- **Blocking.** ③ does not start, and says why, while ① holds an unsaved task
+  (`watch.task.unsaved`), while `generated/` is not what the saved documents make
+  (`watch.task.stale`: changed on disk, or never generated), or when generation failed
+  (`watch.task.failed`, with the generator's reason). ① is then the step that is not done, so the
+  step bar opens there, and its Save button reads "Save and generate". Saving clears the block.
+  ② says the same in its panel.
+- **"Say the task" says who learns it** (section 4.6's defaults, and):
+  - state: the robot's `joint_pos`, `joint_vel` and `previous_action`; privileged: the first free
+    body's `pose` and `vel`;
+  - `[reward] scale = 0.01` (plan H's) and the medium success bonus (100);
+  - `[teacher]` empty: every channel, plan H's PPO preset (2,048 envs, 3,000 iterations on
+    `mjwarp`, a checkpoint every 250);
+  - `[student]` over every observed camera, reading `joint_pos`, preset `h3` (the `tanh` head),
+    16 rows, executing the largest of 1 to 10 that divides `control_hz` (10 at 50 Hz);
+  - `[cycle]`: 200 demonstrations from seed 1001 by the trained teacher, `success_only`.
+
+  All of these are the owner's to change (section 9).
+- **The teacher card for any project with a `[teacher]`** is plan H's card (H7) on the generated
+  recipe, evaluation and documents; its words say "every object", not the cube. Before anything
+  runs, the saved scene is checked against `mjwarp`'s mapping report (`check::maps_onto`): a
+  blocked feature is said on the card in plain words, and Train is off. While a project is
+  built, it is checked against `mujoco-cpu` only.
+- **Save as template**: ①'s toolbar, a name, and the folder
+  `<documents>/Electric Sheep/templates/<name>/` (`<name> 2`… when taken; never the
+  repository). It gets the saved documents (saved first if edited): `scene.esscene`, `task.estask`
+  and `assets/` whole, since a glTF's buffers are not in the scene's asset list. Then
+  `template.toml` is written last: the project's template's words, needs, lengths and view under
+  the person's name, `id = "saved:<folder>"`, no documents, and `base`, the built-in template it
+  comes from. The start screen lists saved templates after the built-in ones. A project made from
+  one copies the documents the same way and names `base` in its `project.toml`, so it never
+  depends on a folder the person may delete. `ES_DOCUMENTS` replaces the documents folder for
+  tests and captures.
+- **Fixed on the way.** An object from the Add menu has an unnamed free joint, which takes the
+  body's name, and the compiler read "[box] is still" as that joint and refused it ("not a hinge
+  or slide"). A name is now read as a joint only when it is a hinge's or a slide's, as
+  `vocab::relations` already read it. No committed specification's output moved: their free
+  joints are named apart from their bodies. The camera check reads names the same way.
+- **Measured** (oracle 1, on the empty project with the library's SO-101, a 5 cm box at
+  (0.22, 0, 0.025), a target area at (0.22, 0.12, 0.025), "say the task" and "[box] is inside
+  [target]"): thirteen documents; `es ir check` passes the teacher arm and the student arm with
+  each of its evaluations; both recipe headers' `es policy init` build their bundles;
+  `es train --dry-run` of ②'s teacher run plans `train_ppo` on `mjwarp`; and
+  `es loop cycle --dry-run` passes on the generated cycle and on the run recipe ③ writes, all in
+  the project's folder. The SO-101 scene maps onto `mjwarp` (its meshes are a warning there).
+- **Left open.** The teacher card's time sentence is the hand's ("1 to 1.5 hours"); an SO-101
+  teacher's run is unmeasured until GV. ⑤ explains failures for a template's own task only. An
+  authored project whose cycle names an expert runs, but gets no demonstration program file.
+
 ## 6. Where the code goes (layers, §4.2)
 
 | What | Crate (layer) |
@@ -826,6 +919,9 @@ G5 put the scene model in a new layer-12 crate, `es-editor-scene` (5.1).
    `GetContact` lowering.
 5. Reward: **derived from the sentences with three-level weights**; a free-form reward editor is
    the Advanced graph's (M3 stage 2) and not part of ①.
+6. Who learns a said task (G9): **the defaults section 5.4 lists** — the observed channels,
+   `[reward] scale = 0.01` and the medium bonus, plan H's PPO preset on `mjwarp`, the `h3` camera
+   student, 200 demonstrations from seed 1001 with `success_only`.
 
 ## 10. Plan (M17 plan G) — packets in order
 
