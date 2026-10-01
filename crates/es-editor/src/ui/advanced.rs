@@ -1484,11 +1484,15 @@ pub(crate) fn replay_canvas(
     camera: &mut Camera,
     canvas: &mut Canvas,
 ) {
-    scene_canvas(ui, lang, size, Posed::Replay(view), camera, canvas);
+    scene_canvas(ui, lang, size, Posed::Replay(view), camera, canvas, None);
 }
 
+/// What ① draws over its viewport (packet M17/G6): the canvas, its painter and the camera at
+/// the picture's size; `true` while it holds the pointer, so the drag does not also turn the view.
+pub(crate) type Overlay<'a> = &'a mut dyn FnMut(&egui::Response, &egui::Painter, &Camera) -> bool;
+
 /// [`replay_canvas`] for any posed scene, under the look selector (packet M16/H8). ① and ②
-/// show a template's scene with it (packet M12/Y15).
+/// show a template's scene with it (packet M12/Y15), and draw their `overlay` over it.
 pub(crate) fn scene_canvas(
     ui: &mut egui::Ui,
     lang: Lang,
@@ -1496,6 +1500,7 @@ pub(crate) fn scene_canvas(
     posed: Posed<'_>,
     camera: &mut Camera,
     canvas: &mut Canvas,
+    overlay: Option<Overlay<'_>>,
 ) {
     let mut mode = viewport_mode(ui.ctx());
     let row = ui.horizontal(|ui| {
@@ -1532,7 +1537,11 @@ pub(crate) fn scene_canvas(
     let (response, painter) = ui.allocate_painter(size, Sense::click_and_drag());
     (camera.width, camera.height) =
         Raster::size_for([response.rect.width(), response.rect.height()]);
-    if response.dragged() {
+    painter.rect_filled(response.rect, 0.0, Color32::from_gray(BACKGROUND));
+    // The picture goes under whatever the overlay draws: its place is kept, filled below.
+    let picture_at = painter.add(egui::Shape::Noop);
+    let held = overlay.is_some_and(|o| o(&response, &painter, camera));
+    if response.dragged() && !held {
         let drag = response.drag_delta();
         *camera = camera.orbit(
             f64::from(-drag.x) * ORBIT_PER_POINT,
@@ -1549,7 +1558,6 @@ pub(crate) fn scene_canvas(
     if demo == Some(true) {
         *camera = camera.orbit(0.01, 0.0);
     }
-    painter.rect_filled(response.rect, 0.0, Color32::from_gray(BACKGROUND));
     let shot = posed.shot(camera);
     let gpu = canvas.gpu.update(mode, &shot, || posed.source());
     let picture = if gpu {
@@ -1600,12 +1608,9 @@ pub(crate) fn scene_canvas(
     if let Some(texture) = texture {
         // Stretched over the whole canvas: `size_for` kept the aspect, so this only ever
         // scales the picture up, and never by much.
-        painter.image(
-            texture.id(),
-            response.rect,
-            Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-            Color32::WHITE,
-        );
+        let uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        let image = egui::Shape::image(texture.id(), response.rect, uv, Color32::WHITE);
+        painter.set(picture_at, image);
     }
     if (gpu && canvas.gpu.busy(mode, &shot)) || demo == Some(true) {
         ui.ctx().request_repaint();

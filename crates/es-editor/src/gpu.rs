@@ -13,6 +13,11 @@
 //! the decisions are `es-editor-model`'s, the device is this crate's (spec 4.2). A machine
 //! with no device keeps H8's paths ([`viewport::Viewport`]): [`Look::update`] says `false`
 //! and the canvas falls back.
+//!
+//! The same worker draws the viewport's corner (packet M17/G6, [`Sensor`]): one frame of a scene
+//! camera under the render its Task IR channel declares, through `es-env`'s own single-camera
+//! steps (`drawn_frame`, the episode's first seed) — the observation the policy is given of the
+//! scene at its own pose. It has no fallback without a device; the corner says so.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -22,7 +27,11 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Instant;
 
+use es_assets::scene::SceneDesc;
+use es_env::randomize::RenderOverrides;
+use es_env::render::{drawn_frame, frame_seed, EnvRendererCfg};
 use es_gpu::{Gpu, GpuOptions};
+use es_ir::task::SeedStream;
 use es_render::{
     Channel, RenderConfig, RenderPath, Renderer, SceneCache, Shading, Temporal, TileAtlasCfg,
 };
@@ -63,7 +72,24 @@ struct Want {
 
 enum Msg {
     Want(u64, Want),
+    Sensor(u64, SensorWant),
     Forget(u64),
+}
+
+/// What a corner's frame is of: the scene's revision and the camera's name.
+pub(crate) type SensorKey = (usize, String);
+
+/// A frame for the corner (packet M17/G6): the scene, and the camera and render a Task IR
+/// channel declares (`es_env::render::sensor_cfg`'s).
+pub(crate) struct SensorJob {
+    pub scene: Arc<SceneDesc>,
+    pub cfg: EnvRendererCfg,
+}
+
+struct SensorWant {
+    key: SensorKey,
+    job: SensorJob,
+    reply: Sender<(SensorKey, Result<Picture, String>)>,
 }
 
 struct Worker {
@@ -217,6 +243,128 @@ impl Look {
     }
 }
 
+/// One corner's end of the worker (packet M17/G6): it asks for a frame once per key and keeps
+/// the newest that came back.
+pub(crate) struct Sensor {
+    id: u64,
+    tx: Sender<(SensorKey, Result<Picture, String>)>,
+    rx: Receiver<(SensorKey, Result<Picture, String>)>,
+    asked: Option<SensorKey>,
+    newest: Option<(SensorKey, Result<Picture, String>)>,
+    /// Moves with every frame received, so the corner re-uploads its texture only then.
+    revision: u64,
+}
+
+impl Default for Sensor {
+    fn default() -> Self {
+        let (tx, rx) = mpsc::channel();
+        Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            tx,
+            rx,
+            asked: None,
+            newest: None,
+            revision: 0,
+        }
+    }
+}
+
+impl Drop for Sensor {
+    fn drop(&mut self) {
+        if WORKER.get().is_some() {
+            send(Msg::Forget(self.id));
+        }
+    }
+}
+
+impl Sensor {
+    /// Takes what arrived and asks for `key`'s frame if it was not asked for yet (`job` is built
+    /// only then). `false` without a device. Never blocks.
+    pub fn update(&mut self, key: &SensorKey, job: impl FnOnce() -> Option<SensorJob>) -> bool {
+        if matches!(health(), Some(Health::Failed(_))) {
+            return false;
+        }
+        for frame in self.rx.try_iter() {
+            self.newest = Some(frame);
+            self.revision += 1;
+        }
+        if self.asked.as_ref() != Some(key) {
+            self.asked = Some(key.clone());
+            if let Some(job) = job() {
+                let want = SensorWant {
+                    key: key.clone(),
+                    job,
+                    reply: self.tx.clone(),
+                };
+                if !send(Msg::Sensor(self.id, want)) {
+                    return false;
+                }
+            }
+        }
+        !matches!(health(), Some(Health::Failed(_)))
+    }
+
+    /// The newest frame (of this key or the one before), whether it is of `key`, and its revision.
+    pub fn newest(&self, key: &SensorKey) -> Option<(&Result<Picture, String>, bool, u64)> {
+        let (k, frame) = self.newest.as_ref()?;
+        Some((frame, k == key, self.revision))
+    }
+}
+
+/// The worker's renderer for one corner, and the camera config it was built for.
+#[derive(Debug, Default)]
+struct SensorSlot<'gpu> {
+    renderer: Option<(EnvRendererCfg, Renderer<'gpu>)>,
+    cache: SceneCache,
+}
+
+/// One frame of `job`'s camera, as `es_env::render::EnvRenderer` draws an episode's first frame
+/// of one camera: `drawn_frame` with no draws, the renderer built on its config, the lighting
+/// set, the `Tick` stream's seed for tick 0, the scene uploaded, one render, the tile read back.
+fn sensor_frame<'gpu>(
+    gpu: &'gpu Gpu,
+    slot: &mut SensorSlot<'gpu>,
+    job: &SensorJob,
+) -> Result<Picture, String> {
+    let none = RenderOverrides::default();
+    let (tri, view, rc) = drawn_frame(
+        &job.scene,
+        &job.cfg,
+        &none,
+        &BTreeMap::new(),
+        &mut slot.cache,
+    )
+    .map_err(|e| e.to_string())?;
+    if slot.renderer.as_ref().is_none_or(|(c, _)| *c != job.cfg) {
+        slot.renderer = None;
+        let r = Renderer::new(gpu, rc.clone()).map_err(|e| format!("renderer: {e}"))?;
+        slot.renderer = Some((job.cfg.clone(), r));
+    }
+    let Some((_, r)) = slot.renderer.as_mut() else {
+        return Err("renderer".into());
+    };
+    r.set_lighting(&rc);
+    if job.cfg.seed_stream == SeedStream::Tick {
+        r.set_seed(frame_seed(SeedStream::Tick, rc.seed, 0));
+    }
+    r.upload_tris(tri)
+        .map_err(|e| format!("scene upload: {e}"))?;
+    let rgb = (r.render(&[view]))
+        .and_then(|mut atlas| atlas.read_tile(0, job.cfg.channel))
+        .map_err(|e| format!("render: {e}"))?
+        .to_bytes();
+    let samples = match job.cfg.path {
+        RenderPath::Pt { spp, .. } => spp,
+        RenderPath::Rs => 1,
+    };
+    Ok(Picture {
+        width: job.cfg.width,
+        height: job.cfg.height,
+        rgb,
+        samples,
+    })
+}
+
 /// The config `es render` builds for the same look (`--path rs|full|pt` with H8's budget), so
 /// a frame here is that command's frame for the same shot.
 pub fn config(mode: Mode, width: u32, height: u32) -> RenderConfig {
@@ -351,6 +499,7 @@ fn run(rx: &Receiver<Msg>, health: &Mutex<Health>) {
     );
     let mut slots: BTreeMap<u64, Slot<'_>> = BTreeMap::new();
     let mut wants: BTreeMap<u64, Want> = BTreeMap::new();
+    let mut sensors: BTreeMap<u64, SensorSlot<'_>> = BTreeMap::new();
     loop {
         let first = if wants.is_empty() {
             match rx.recv() {
@@ -365,9 +514,17 @@ fn run(rx: &Receiver<Msg>, health: &Mutex<Health>) {
                 Msg::Want(id, want) => {
                     wants.insert(id, want);
                 }
+                // A corner's frame is one render, drawn as it is asked for: a failure is that
+                // frame's, said in the corner, and does not take the viewport's device down.
+                Msg::Sensor(id, want) => {
+                    let slot = sensors.entry(id).or_default();
+                    let frame = sensor_frame(&gpu, slot, &want.job);
+                    let _ = want.reply.send((want.key, frame));
+                }
                 Msg::Forget(id) => {
                     wants.remove(&id);
                     slots.remove(&id);
+                    sensors.remove(&id);
                 }
             }
         }

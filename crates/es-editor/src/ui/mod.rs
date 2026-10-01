@@ -4,7 +4,9 @@
 //! [`train`] is ③ and ④, a run started, watched and stopped (packet M12/Y12).
 //! [`results`] is ⑤, a finished run read in plain words (packet M12/Y13).
 //! [`scene`] is ①, a template's scene, and ② read-only for a project with no program (M12/Y15);
-//! [`author`] is ① of an editable project: hierarchy, inspector, undo and save (packet M17/G5).
+//! [`author`] is ① of an editable project: hierarchy, inspector, undo and save (packet M17/G5),
+//! picking and move / turn / size handles over the viewport (M17/G6).
+//! [`corner`] is the policy camera's view in ①'s viewport corner (packet M17/G6).
 //! [`teach`] is ②, the demonstration program as blocks, edited and tried once (packet M14/Q4).
 //! [`teacher`] is ② for a template taught by a trained teacher policy (packet M16/H7).
 //! [`player`] plays one attempt of an evaluation, for ⑤ and for ③'s checks (packet M13/Z5a).
@@ -15,6 +17,7 @@
 
 pub mod advanced;
 pub mod author;
+pub mod corner;
 pub mod home;
 pub mod player;
 pub mod results;

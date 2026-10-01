@@ -25,6 +25,7 @@ use crate::model::template::{templates_root, Template};
 use crate::model::workflow::Phase;
 use crate::ui::advanced::{replay_canvas, scene_canvas, Canvas, Posed};
 use crate::ui::author::Author;
+use crate::ui::corner::Corner;
 
 /// ① and ② between frames. It belongs to one project; opening another reads its scene afresh
 /// and ends a preview still computing.
@@ -42,6 +43,15 @@ pub(crate) struct State {
     physics: Option<Physics>,
     /// The preview's pictures, apart from the static scene's: both start at tick 0.
     played: Canvas,
+    /// The policy camera's view over a template's scene (packet M17/G6).
+    corner: Corner,
+}
+
+/// A template's bundle Task IR and Observation IR: the cameras its policy sees.
+fn bundle_of(template: &Template) -> Option<[PathBuf; 2]> {
+    let root = templates_root()?;
+    let b = &template.bundle;
+    Some([root.join(&b.task), root.join(&b.observation)])
 }
 
 fn at_start_id() -> egui::Id {
@@ -58,9 +68,10 @@ pub fn preview_at_start(ctx: &egui::Context) {
     ctx.data_mut(|d| d.insert_temp(at_start_id(), true));
 }
 
-/// `es-editor --edit-demo copy|select|edit|undo`: ① makes the editable copy if the project
-/// has none, then selects the cube, then resizes and recolours it, then undoes that — each
-/// stage after the ones before it (packet M17/G5's captures).
+/// `es-editor --edit-demo copy|select|edit|undo|drag|corner`: ① makes the editable copy if the
+/// project has none, then selects the cube, then resizes and recolours it, then undoes that —
+/// each stage after the ones before it (packet M17/G5's captures). `drag` holds the cube's move
+/// handle mid-drag; `corner` lets it go and selects the front camera (packet M17/G6's).
 pub fn edit_demo(ctx: &egui::Context, stage: String) {
     ctx.data_mut(|d| d.insert_temp(demo_id(), stage));
 }
@@ -81,7 +92,7 @@ fn copy(root: &Path, template: &Template) -> Result<Author, String> {
     };
     let spec = e.spec.as_ref().map(|s| repo.join(s));
     es_editor_scene::make_editable(root, &repo.join(&e.scene), spec.as_deref())?;
-    let mut author = Author::open(root, backends(Some(template)))?;
+    let mut author = Author::open(root, backends(Some(template)), bundle_of(template))?;
     author.model.regenerate();
     Ok(author)
 }
@@ -102,8 +113,8 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
     if state.project.as_ref() != Some(root) {
         let step = scene_view::open_step(&open.project, templates_root());
         let template = step.as_ref().map(|(t, _)| t);
-        let author =
-            (es_editor_scene::is_editable(root)).then(|| Author::open(root, backends(template)));
+        let author = (es_editor_scene::is_editable(root))
+            .then(|| Author::open(root, backends(template), template.and_then(bundle_of)));
         *state = State {
             project: Some(root.clone()),
             step,
@@ -128,7 +139,10 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
             }
         }
         if let (Some(Ok(author)), false) = (&mut state.author, stage == "copy") {
-            author.demo(stage);
+            let camera = state
+                .camera
+                .get_or_insert_with(|| scene_view::camera_of(Some(template)));
+            author.demo(stage, camera);
         }
     }
     if phase == Phase::Scene {
@@ -168,18 +182,22 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
             let size = ui.available_size();
             let played = (state.physics.as_mut().filter(|_| phase == Phase::Scene))
                 .and_then(|p| Some((p.rate_hz, p.replay()?)));
-            match played {
-                Some((rate, view)) => {
-                    playback(ui, lang, size, rate, view, camera, &mut state.played);
-                }
-                None => scene_canvas(
-                    ui,
-                    lang,
-                    size,
-                    Posed::Scene(preview),
-                    camera,
-                    &mut state.picture,
-                ),
+            if let Some((rate, view)) = played {
+                playback(ui, lang, size, rate, view, camera, &mut state.played);
+            } else {
+                // The policy's camera in the corner (packet M17/G6), as the bundle declares it.
+                let (scene, corner) = (preview.source().0, &mut state.corner);
+                let mut overlay = |r: &egui::Response, p: &egui::Painter, _: &Camera| {
+                    let cameras = || match bundle_of(template) {
+                        Some([task, obs]) => es_editor_scene::policy::bundle(&task, &obs, &scene),
+                        None => Ok(Vec::new()),
+                    };
+                    corner.paint(p, r.rect, lang, &scene, 0, None, cameras);
+                    false
+                };
+                let posed = Posed::Scene(preview);
+                let picture = &mut state.picture;
+                scene_canvas(ui, lang, size, posed, camera, picture, Some(&mut overlay));
             }
         }
         (Pane::StepPanel, Phase::Scene, _) => {
@@ -260,7 +278,7 @@ fn editable(
     match pane {
         Pane::StepPanel => author.hierarchy(ui, lang, camera.look_at),
         Pane::Viewport => {
-            author.toolbar(ui, lang);
+            author.toolbar(ui, lang, camera);
             let preview = match author.preview() {
                 Ok(p) => p,
                 Err(why) => {
@@ -268,15 +286,18 @@ fn editable(
                     return;
                 }
             };
-            physics_row(ui, lang, preview, physics, played);
-            ui.weak(t(lang, "setup.orbit_hint"));
+            physics_row(ui, lang, &preview, physics, played);
             let size = ui.available_size();
-            match physics
-                .as_mut()
-                .and_then(|p| Some((p.rate_hz, p.replay()?)))
-            {
-                Some((rate, view)) => playback(ui, lang, size, rate, view, camera, played),
-                None => scene_canvas(ui, lang, size, Posed::Scene(preview), camera, picture),
+            let replay = (physics.as_mut()).and_then(|p| Some((p.rate_hz, p.replay()?)));
+            if let Some((rate, view)) = replay {
+                playback(ui, lang, size, rate, view, camera, played);
+            } else {
+                // Picking, the handles and the corner (packet M17/G6).
+                let mut overlay = |r: &egui::Response, p: &egui::Painter, c: &Camera| {
+                    author.overlay(lang, r, p, c)
+                };
+                let posed = Posed::Scene(&preview);
+                scene_canvas(ui, lang, size, posed, camera, picture, Some(&mut overlay));
             }
         }
         _ => author.inspector(ui, lang),
