@@ -501,6 +501,85 @@ validated and each arm passes the cross-IR check before anything is written.
   hand-tuned envelope (3 rad/s, 80 rad/s², a 0.05 rad soft margin) the scene's ranges do not
   give; the SO-101 spec gets plan H's rule.
 
+### 4.6 What G8 settled (the sentence editor)
+
+`crates/es-editor-scene/src/sentence.rs` (sentences, edits, levels, "say the task", the camera
+check) and `crates/es-script/src/spec/vocab.rs` (the vocabulary as the compiler reads it), drawn by
+`crates/es-editor/src/ui/sentence.rs`; oracles `crates/es-editor-scene/tests/sentences.rs` and
+`crates/es-editor/tests/sentences.rs` (the words, pinned in `sentences.txt` beside it: Korean may
+live only in documentation and string tables).
+
+- **One command.** `Command::Spec(Option<Box<TaskSpec>>)` replaces the specification.
+  `SceneModel::apply` compiles the specification with `compile_task` on the scene as edited (an
+  unsaved scene is read from `.preview.esscene`) after **every** command, not only this one: a
+  scene edit that would break a sentence (deleting the goal a clause names) is refused too, so
+  the model's specification always compiles, or there is none. A scene edit is not refused for a
+  specification that was broken before it (a hand-edited file); the sentences mend that one. A
+  refusal is G3a's error as a `Refusal`: the field is the clause's place and the key
+  (`success[0].within_deg`, `timeout_s`, `observe.state.goal_pose`), the words a key of the tables
+  (`author.task.required`, `.ticks`, `.touches`, `.no_success`, else the compiler's reason).
+- **The vocabulary is the compiler's.** `vocab::takes(relation, object)` is the table
+  `check_fields` reads, moved out of it (no compiled byte changed: G3a's and G3b's oracles pass
+  as they were). `vocab::subjects`: every body but the world, every hinge and slide joint,
+  `<body>.x|y|z` of every free body. `vocab::relations(scene, subject)`: a joint or a coordinate
+  is inside a range, above or below a value, or still (a coordinate only of a free body); a body
+  is inside a region, above or below a body, near or farther than a body or a fixed point, still
+  (a free body), turned like a body, or touching (shown disabled with its reason). A name that is
+  both a joint and a body (SO-101's `gripper`) reads as the joint where both could, as the
+  compiler reads it, and takes the body-only relations too. `vocab::regions`: the sites on bodies
+  that do not move. A region is an object, never a subject (the compiler reads none as one).
+- **Sentences.** A clause, the time limit and a start item are a key of the tables with numbered
+  holes (`{0}` the subject, `{1}` the relation, then its fields), so each language puts the slots
+  where it reads them; a slot is a name, a relation, a way to draw, a number or a point. Numbers
+  show in cm, °, cm/s, °/s, s and % (a resting tilt `t` as its angle `2·atan t`), two decimals at
+  most. The document keeps its own units and bits: a slot carries the document's value (absent
+  stays absent) and a number is written back (the tilt through `es_math::approx`) only when the
+  person changes it. Oracle 1: both committed specifications, read as sentences and written back
+  slot by slot, are equal field for field.
+- **Edits.** A new subject keeps its relation when it takes it, else gets its first; a new
+  relation keeps the fields it takes, fills the ones it needs (a range ± 5 cm about the subject's
+  place, a value at it, 5 cm/s, 10°, 5 cm near and 25 cm farther, the first region or another
+  body — a free one first) and keeps its shaping when the form stays. Clauses are added (the first
+  free body, still), removed and moved within their section; an empty failure section is dropped.
+  Start items are added (the first free body's x where it stands, ± 2 cm, 🎲) and removed, and
+  their `what`, 🎲, value, range, noise and draw change (`tilt` brings a 30° bound). Observe is a
+  checklist of the scene's cameras (a checked one appended, `camera_px` 96 if unset; an unchecked
+  one leaves the student's `views` too), `camera_px`, the look and the sources (a new channel is
+  named after its source, `cube.pose` → `cube_pose`; a removed one leaves the teacher's and the
+  student's `state` too).
+- **Levels** (section 9, item 5; the owner's to change). A shaping weight is `0.1`, `1` or `10`,
+  signed as its form pays (a distance or a ramp costs, an angle pays); the success bonus is `25`,
+  `100`, `250` or none; `[start] strength` is `0.5`, absent or `1.5` (es-script scales every 🎲
+  range about its centre, and its noise, by it; medium writes no `strength` because `1.0` is not
+  the absent one bit for bit — `c ± 1·h` need not give back `lo` and `hi`). The committed weights
+  read as levels: Shadow Hand's rotation `1` medium, cube distance `−10` high, bonus `250` high;
+  SO-101's ramp `−1` medium. A number at no level reads "as written (0.37)" and is kept. A ramp
+  turned on starts at the range's low edge and ends a range's width past its high one. Weights are
+  before `[reward] scale`, which the sentences do not show.
+- **The look**: quick (no `render`) or light traced (`pt` at plan H's 32 samples, 3 bounces, a
+  seed per tick), samples and bounces as numbers. The viewport's materials look is shown
+  disabled: a Task IR sensor has only the rasterizer and the path tracer.
+- **Say the task** (a project with no `task.estask`): the robot is the scene document's first
+  include, else the root of the first hinge or slide joint's body; `control_hz` is the template's
+  Task IR's `control_rate_hz` (SO-101's 50; 50 without one); 8 s; one success clause, the first
+  free body still (`speed = 0.05`, SO-101's settling bound); every camera of the scene observed at
+  96 px. Oracle 4: on the SO-101 copy, with a region over the bin and "[cube] is inside
+  [bin_area]", it compiles and `generate` writes `task.toml`.
+- **The camera check.** For each observed camera and each body a clause is about (a coordinate's
+  body; a joint is skipped): one ray from the camera to the body's origin where the start puts it
+  (a free body's `x|y|z` item: its value, or the middle of its range), inside the square
+  picture's field of view, whose nearest hit — `nearest_hit_flat` on the scene's triangles, G6's
+  rule — must be one of the body's own shapes. Measured on the SO-101 copy: the overhead camera
+  does **not** see the cube at its start — the lower arm at the home pose is on the line to the
+  cube's centre (the corner's own frame shows the same). Oracle 5: a camera level with the cube
+  sees it; turned away, or behind a board, it does not; the cube's start lifted over the board,
+  it does again. One ray to the centre is the packet's rule, so a half-hidden cube reads as
+  unseen.
+- **The editor.** ①'s right pane has two tabs, the selection's fields and the task. A sentence's
+  widgets sit between its words in the reader's order. The edited specification is handed over
+  once the person lets go, one undo step; a refused one stays in its sentences with the reason
+  above, again under the clause it names, and "put back".
+
 ## 5. The editor (① and ②)
 
 - **Hierarchy panel**: the scene tree (includes folded), search, visibility; drag to re-parent.
