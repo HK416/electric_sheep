@@ -580,6 +580,37 @@ live only in documentation and string tables).
   once the person lets go, one undo step; a refused one stays in its sentences with the reason
   above, again under the clause it names, and "put back".
 
+### 4.7 What GV settled (where an unset coordinate starts)
+
+GV's authored project (SO-101, a 5 cm box at (0.22, 0, 0.025), start items `box.x` and `box.y`)
+found that `Env::reset` zeroes `qpos` before the reset nodes run, so a free body's coordinate no
+start item set started at **zero**: the box at z = 0, half in the floor, popping up over the first
+five ticks; its quaternion all zeros, which the backend reads as the identity, losing a rotation
+the scene gave it; and under "say the task" (no start items) every free body at the origin,
+inside the robot's base. Oracles `crates/es-script/tests/estask.rs` (`scene_pose`).
+
+- **The rule.** For every free joint whose body is outside the robot's subtree, `compile_task`
+  emits a constant `ResetState` on each of its seven `qpos` lanes no start item writes (by
+  `<body>.x|y|z`, `<body>.orientation` or the joint's name): the value is the scene's own,
+  `qpos0` — the body's position `x y z`, then its orientation `w x y z` (MuJoCo's order), read
+  bit for bit from `SceneDesc`, no arithmetic. Target `qpos[<lane>]`, stream
+  `scene.<body>.pos.<i>` or `scene.<body>.quat.<i>`; the nodes follow the start items' own, in
+  the scene's joint order and lane order. A constant draws nothing, so no other draw moves. On
+  GV's scene the box gets z = 0.025 and `(1, 0, 0, 0)`; a box turned in the scene keeps its turn;
+  with no `[start]` at all every free body starts at its scene pose (measured on `mujoco-cpu`).
+- **The opt-out.** `[start] zero_unset = true` keeps the old behaviour: no such node, unset lanes
+  at zero. Absent or `false` is the rule. The two committed specifications set it (one comment
+  line says why: they reproduce documents committed before the rule), so their `task_hash` and
+  G3b's regenerated documents are unchanged; the Shadow Hand template's editable copy copies it.
+  It is no sentence (G8): the sentences keep it as read, and a `[start]` table holding only it
+  is not dropped.
+- **Open for the owner.** Under the opt-out the committed Shadow Hand task's goal (`target`, a
+  free body with gravity compensation, only its orientation drawn) starts at the origin (0, 0, 0)
+  every episode, not where the scene puts it. Removing `zero_unset` from
+  `shadow_hand_repose.estask` would fix that, and would move the committed `task_hash` and with
+  it the trained teacher's documents; so101_views' cube would also gain its quaternion (identity,
+  as the backend already read it). Left as committed.
+
 ## 5. The editor (① and ②)
 
 - **Hierarchy panel**: the scene tree (includes folded), search, visibility; drag to re-parent.
