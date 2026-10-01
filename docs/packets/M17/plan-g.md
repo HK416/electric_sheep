@@ -25,7 +25,8 @@ generated documents — and trains it, without writing MJCF, TOML IR or Rust.
 | Wave | Tasks | Needs |
 |---|---|---|
 | 1 | G1 the scene document · G2 the full MJCF exporter | — |
-| 2 | G3 task spec + `es project generate` · G4 `es render` / `es scene simulate` | G1 |
+| 2 | G3a task spec → Task IR · G4 `es scene simulate` and ①'s physics preview (`es render` landed as H8/H9) | G1 |
+| 2b | G3b the other documents + `es project generate` | G3a |
 | 3 | G5 editor scene model · G6 viewport picking and gizmos | G1, G4, H8 |
 | 4 | G7 Add (primitives, meshes, robots, cameras, lights, regions) · G8 sentence editor | G5, G3 |
 | 5 | G9 empty-project card, save as template, ② teacher for generated tasks | G3, G8 |
@@ -77,3 +78,59 @@ and §6 (`SceneRef`), `docs/design/scene-authoring.md` (+ko) if the schema settl
   the rest), plus a property test over generated `SceneDesc`s; (2) MuJoCo (Python, skips without
   `ES_PYTHON`) loading the export steps bit-identically to MuJoCo loading the original for the
   SO-101 and Shadow Hand scenes (H1's parity method); (3) committed goldens unmoved.
+
+### Task G3a: the task specification compiles to the Task IR
+
+**Files:** `crates/es-script/src/spec/**` (new: the `*.estask` model and its compiler),
+`crates/es-script/src/lib.rs` (the module line), `crates/es-script/Cargo.toml` (`es-assets`,
+`toml` if needed), `crates/es-script/tests/estask*.rs`, new fixtures `tests/fixtures/estask/`,
+`docs/design/scene-authoring.md` (+ko) §4 if the schema settles a detail.
+
+- The `*.estask` model (serde, TOML, `kind = "task-spec"`, `schema = 1`) of the design's §4:
+  `scene`, `robot` (an include), `control_hz`, `[success]` / `[failure]` clause lists, `timeout_s`,
+  `[start]` (placements, 🎲 items, strength), `[observe]` (cameras with resolution and render,
+  state channels, privileged channels), `[reward]` (levels, shaping). Read and write; unknown keys
+  refused by name; every relation of §4.1 except `touches` (refused by name until `GetContact`
+  lowers).
+- `compile_task(spec, scene_dir) -> TaskIr`: the scene through G1's `load_scene` path, names
+  resolved to `StableId`s (a missing name refused with the name), each clause to the nodes of
+  §4.1, rewards per §4.1, reset and randomization, the `ObservationSpec` channels and their
+  sensors (`render` as the Task IR declares it), the `ActionSpec` from the robot's actuators.
+- **Oracles:** (1) a spec for the Shadow Hand repose task compiles to a Task IR whose **`task_hash`
+  equals `tests/fixtures/shadow-hand/task-repose.toml`'s** (the committed document is the reference;
+  the compiler takes over what `crates/es/tests/shadow_hand.rs` builds by hand); (2) the same for
+  the SO-101 three-view task `tests/fixtures/visible-learning/task-views.toml`; if a committed
+  document carries a construction the vocabulary cannot express, extend the vocabulary
+  minimally and say what (do not change the committed document); (3) each relation on scripted
+  states: true / false and its reward (as H2's `the_task_scores_scripted_states`); (4) refusals
+  name the clause and the field; (5) committed hashes unmoved.
+
+### Task G3b: the other documents and `es project generate`
+
+**Files:** `crates/es-script/src/spec/**`, `crates/es/src/cmd/project.rs` (new) + its
+registration, tests, fixtures. After G3a.
+
+- From the spec and the scene: Observation IRs (teacher state, student views), Learning IRs (the
+  state MLP teacher, the three-view ACT student, `tanh` heads — H6's invariant), the Deployment IR
+  (envelope from joint and control ranges), Evaluation IRs (held-out seeds, the suites that
+  apply, nominal-only sibling), training recipes, the cycle; `es project generate --scene <s>
+  --spec <t> --out <dir>` writes them. **Oracle:** the Shadow Hand and SO-101 views specs
+  regenerate every committed document of their sets hash-for-hash (bodies byte-for-byte where the
+  committed file was itself generated).
+
+### Task G4: `es scene simulate` and ①'s physics preview
+
+**Files:** `crates/es/src/cmd/scene.rs` (a `simulate` verb beside G2's `export`), its test,
+`crates/es-editor-model/src/model/{scene_view,viewport}.rs` (the preview's decisions),
+`crates/es-editor/src/**` (the button and playback), i18n tables.
+
+- `es scene simulate <scene> --seconds S [--ctrl hold|zero] [--backend mujoco-cpu] --out
+  <traj.estraj>`: the scene from its initial pose, every actuator held at its initial target
+  (`hold`) or zero, stepped for S seconds, the trajectory written in the `.estraj` format the
+  replay reads. No Task IR is needed (a scene alone).
+- ①: a "물리 미리보기" button runs it (an argv, as every editor run) and plays the result back in
+  the viewport with H8/H9's renderer and the replay's timeline; a plain-language status while it
+  runs and if it fails (the mapping report's refusal named).
+- **Oracles:** the CLI's trajectory equals stepping the same scene through `MuJoCoCpuBackend`
+  directly (bitwise on `mujoco-cpu`); a cube dropped above a plane comes to rest on it; the
+  view-model's decisions headless; a screenshot of the preview on the Shadow Hand project.
