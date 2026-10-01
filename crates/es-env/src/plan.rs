@@ -15,8 +15,10 @@ use es_ir::task::{
     TaskIr, TaskNode, TerminationKind,
 };
 use es_ir::types::Frame;
-use es_physics_core::backend::ModelInfo;
+use es_physics_core::backend::{ModelInfo, StateView};
 
+use crate::env::at;
+use crate::traj::Trajectory;
 use crate::EnvError;
 
 /// Where a lowered leaf reads its value from, as an index into one env's state row.
@@ -102,6 +104,120 @@ impl ScalarPlan {
         plan.bindings = ctx.bindings;
         Ok(plan)
     }
+}
+
+impl Source {
+    /// This leaf's value in env `env` of `state`; `secs(since_reset)` is the time it reads.
+    pub(crate) fn read(
+        self,
+        state: &StateView<'_>,
+        model: &ModelInfo,
+        env: u32,
+        secs: impl Fn(bool) -> f64,
+    ) -> f64 {
+        match self {
+            Source::Qpos(i) => at(state.qpos, env, model.nq, i),
+            Source::Qvel(i) => at(state.qvel, env, model.nv, i),
+            Source::Sensor(i) => at(state.sensordata, env, model.nsensordata, i),
+            // `xpos` is `n_envs * nbody * 3`, env-major (§18.5): the body's row times three,
+            // plus the axis.
+            Source::Xpos { row, axis } => at(state.xpos, env, model.nbody * 3, row * 3 + axis),
+            // `xquat` is `n_envs * nbody * 4`, env-major, `x y z w` (packet M16/H2).
+            Source::Xquat { row, axis } => at(state.xquat, env, model.nbody * 4, row * 4 + axis),
+            Source::Time { since_reset } => secs(since_reset),
+        }
+    }
+}
+
+/// The value of each node's `value` output on env 0 of `state`, `secs` after its reset: the cone
+/// ending there lowered exactly as a `Terminate` input is, and evaluated as the env evaluates it
+/// (a predicate is 1.0 or 0.0). What explains an attempt after the fact: each clause's truth on
+/// its recorded end state (design note `scene-authoring.md` section 4.8, review M17 F-11).
+pub fn eval_nodes(
+    task: &TaskIr,
+    scene: &SceneDesc,
+    model: &ModelInfo,
+    nodes: &[NodeId],
+    state: &StateView<'_>,
+    secs: f64,
+) -> Result<Vec<f64>, EnvError> {
+    let mut ctx = Ctx {
+        graph: &task.graph,
+        scene,
+        model,
+        bindings: BTreeMap::new(),
+    };
+    let mut exprs = Vec::with_capacity(nodes.len());
+    for node in nodes {
+        let lanes = ctx.lower(&PortRef::new(*node, "value"), 1)?;
+        let n = lanes.len();
+        exprs.push(lanes.into_iter().next().filter(|_| n == 1).ok_or_else(|| {
+            EnvError::Unsupported(format!("node {} is {n} lanes, not one", node.0))
+        })?);
+    }
+    if state.sensordata.is_empty() {
+        if let Some(name) =
+            (ctx.bindings.iter()).find_map(|(n, s)| matches!(s, Source::Sensor(_)).then_some(n))
+        {
+            return Err(EnvError::Unsupported(format!(
+                "{name}: the state carries no sensor"
+            )));
+        }
+    }
+    let ports: BTreeMap<String, f64> = (ctx.bindings.iter())
+        .map(|(name, s)| (name.clone(), s.read(state, model, 0, |_| secs)))
+        .collect();
+    exprs
+        .iter()
+        .zip(nodes)
+        .map(|(e, node)| {
+            e.eval(&ports)
+                .ok_or_else(|| EnvError::Task(format!("node {} does not evaluate", node.0)))
+        })
+        .collect()
+}
+
+/// [`eval_nodes`] on row `tick` of `traj`, laid out as `model` says: its `qpos`, `qvel`, and each
+/// body's recorded pose at the row `model.body` gives it, `tick / control_rate_hz` seconds after
+/// the reset. A trajectory records no `sensordata`, so a cone that reads a sensor is refused, as
+/// is a body the trajectory lacks.
+pub fn eval_on_row(
+    task: &TaskIr,
+    scene: &SceneDesc,
+    model: &ModelInfo,
+    nodes: &[NodeId],
+    traj: &Trajectory,
+    tick: usize,
+) -> Result<Vec<f64>, EnvError> {
+    let (n, (nq, nv)) = (traj.ticks(), (model.nq as usize, model.nv as usize));
+    let widths = (tick < n).then(|| (traj.qpos(tick), traj.qvel(tick)));
+    let Some((qpos, qvel)) = widths.filter(|(q, v)| (q.len(), v.len()) == (nq, nv)) else {
+        let why = format!("row {tick} of {n}, `qpos` / `qvel` {nq} / {nv} wide");
+        return Err(EnvError::Trajectory(why));
+    };
+    let poses = traj.poses(tick);
+    let (mut xpos, mut xquat) = (
+        vec![0.0; model.nbody as usize * 3],
+        vec![0.0; model.nbody as usize * 4],
+    );
+    for (id, range) in &model.body {
+        let (Some(p), r) = (poses.get(id), range.start as usize) else {
+            return Err(EnvError::Trajectory(format!("body {id} is not recorded")));
+        };
+        xpos[r * 3..r * 3 + 3].copy_from_slice(&[p.position.x, p.position.y, p.position.z]);
+        let q = p.orientation;
+        xquat[r * 4..r * 4 + 4].copy_from_slice(&[q.x, q.y, q.z, q.w]);
+    }
+    let state = StateView {
+        n_envs: 1,
+        qpos,
+        qvel,
+        xpos: &xpos,
+        xquat: &xquat,
+        ..StateView::default()
+    };
+    let secs = tick as f64 / f64::from(task.config.control_rate_hz);
+    eval_nodes(task, scene, model, nodes, &state, secs)
 }
 
 struct Ctx<'a> {
@@ -1189,6 +1305,34 @@ Const(0.85) } }), (Failure, Compare { op: Gt, lhs: Port(\"qpos[6]\"), rhs: Const
         );
         let err = ScalarPlan::compile(&short, &scene, &model).expect_err("2 bounds for 3 lanes");
         assert!(err.to_string().contains("3 lanes with 2 lo"), "{err}");
+
+        // Packet M17/R8: the predicate and the offset's norm, read after the fact on the same
+        // state, and on that state recorded as a trajectory row, are what the env reads.
+        let (qpos, qvel) = ([0.0; 2], [0.0; 2]);
+        let mut xpos = vec![0.0; model.nbody as usize * 3];
+        let mut xquat = [0.0, 0.0, 0.0, 1.0].repeat(model.nbody as usize);
+        xpos[3..6].copy_from_slice(&pos);
+        xquat[4..8].copy_from_slice(&a);
+        xquat[8..12].copy_from_slice(&b);
+        let state = StateView {
+            n_envs: 1,
+            qpos: &qpos,
+            qvel: &qvel,
+            xpos: &xpos,
+            xquat: &xquat,
+            ..StateView::default()
+        };
+        let nodes = [n(4), n(9)];
+        let now = eval_nodes(&task, &scene, &model, &nodes, &state, 0.0).expect("evaluates");
+        assert_eq!(now, [1.0, offset]);
+        let mut traj = Trajectory::new(&model);
+        traj.push(&model, &state, 0).expect("one row");
+        let row = eval_on_row(&task, &scene, &model, &nodes, &traj, 0).expect("evaluates");
+        assert_eq!(row, now);
+        assert!(
+            eval_on_row(&task, &scene, &model, &nodes, &traj, 1).is_err(),
+            "no row 1"
+        );
         println!("RAN quaternion_dot_abs_sqrt_and_per_lane_normalize_lower");
     }
 

@@ -22,7 +22,7 @@ use es_safety::SafetyPlane;
 use crate::control::ControlExecutor;
 use crate::domains::DomainRunner;
 use crate::episode::{self, Episode, EpisodeRecorder, EpisodeShape, StepRow, Termination};
-use crate::plan::{ScalarPlan, Source};
+use crate::plan::ScalarPlan;
 use crate::randomize::{ParamScales, RandomizationPlan, RenderOverrides, ResetBuffer};
 use crate::scheduler::{BatchDomains, Schedule};
 use crate::EnvError;
@@ -477,29 +477,15 @@ impl<B: PhysicsBackend> Env<B> {
         let episode_ticks = u64::from(self.steps[env as usize])
             * u64::from(self.schedule.domains().inference.period);
         for (name, source) in &self.scalar.bindings {
-            let value = match *source {
-                Source::Qpos(i) => at(state.qpos, env, self.model.nq, i),
-                Source::Qvel(i) => at(state.qvel, env, self.model.nv, i),
-                Source::Sensor(i) => at(state.sensordata, env, self.model.nsensordata, i),
-                // `xpos` is `n_envs * nbody * 3`, env-major (§18.5): the body's row times
-                // three, plus the axis.
-                Source::Xpos { row, axis } => {
-                    at(state.xpos, env, self.model.nbody * 3, row * 3 + axis)
-                }
-                // `xquat` is `n_envs * nbody * 4`, env-major, `x y z w` (packet M16/H2).
-                Source::Xquat { row, axis } => {
-                    at(state.xquat, env, self.model.nbody * 4, row * 4 + axis)
-                }
-                // Seconds are derived from a tick count at the edge, never accumulated (§18.1).
-                Source::Time { since_reset } => {
-                    let ticks = if since_reset {
-                        PhysTick(episode_ticks)
-                    } else {
-                        self.tick
-                    };
-                    SimTime::new(ticks, rate).as_secs_f64()
-                }
-            };
+            // Seconds are derived from a tick count at the edge, never accumulated (§18.1).
+            let value = source.read(&state, &self.model, env, |since_reset| {
+                let ticks = if since_reset {
+                    PhysTick(episode_ticks)
+                } else {
+                    self.tick
+                };
+                SimTime::new(ticks, rate).as_secs_f64()
+            });
             self.ports.insert(name.clone(), value);
         }
     }
@@ -686,7 +672,7 @@ fn row_of(values: &[f64], env: u32, width: u32) -> &[f64] {
     values.get(start..start + width as usize).unwrap_or(&[])
 }
 
-fn at(values: &[f64], env: u32, width: u32, index: u32) -> f64 {
+pub(crate) fn at(values: &[f64], env: u32, width: u32, index: u32) -> f64 {
     row_of(values, env, width)
         .get(index as usize)
         .copied()
