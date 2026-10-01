@@ -37,6 +37,8 @@ pub struct ScenePreview {
     path: PathBuf,
     scene: std::sync::Arc<SceneDesc>,
     tris: TriScene,
+    /// Which edit of ①'s document this is (packet M17/G5); 0 for a file as it is.
+    revision: usize,
 }
 
 /// What the step panel lists, by scene names in scene order: the robot's root body, the things
@@ -55,19 +57,36 @@ impl ScenePreview {
     pub fn open(scene: &Path) -> Result<Self, String> {
         let path = scene.to_path_buf();
         let scene = load_scene(scene).map_err(|e| e.to_string())?;
-        let tris = TriScene::from_scene(&scene).map_err(|e| e.to_string())?;
-        let scene = scene.into();
-        Ok(Self { path, scene, tris })
+        Self::from_scene(path, scene, 0)
     }
 
-    /// The scene at its initial pose from `camera`, for the slower looks (packet M16/H8).
+    /// A scene already read — ①'s document as edited (packet M17/G5) — drawn as [`Self::open`]
+    /// draws a file. `path` is the file holding it, for what reads a scene from a file (the
+    /// physics preview, `es render`); `revision` tells one edit of it from the next.
+    pub fn from_scene(path: PathBuf, scene: SceneDesc, revision: usize) -> Result<Self, String> {
+        let tris = TriScene::from_scene(&scene).map_err(|e| e.to_string())?;
+        let scene = scene.into();
+        Ok(Self {
+            path,
+            scene,
+            tris,
+            revision,
+        })
+    }
+
+    /// The scene at its initial pose from `camera`, for the slower looks (packet M16/H8). A
+    /// still scene has no tick; its slot is the document's revision, so an edit is a new shot.
     pub fn shot(&self, camera: &Camera) -> Shot {
         Shot {
             scene: self.path.clone(),
             traj: None,
-            tick: 0,
+            tick: self.revision,
             camera: *camera,
         }
+    }
+
+    pub fn revision(&self) -> usize {
+        self.revision
     }
 
     /// The scene at its initial pose (no body moved), for a renderer that tessellates through
@@ -458,6 +477,27 @@ mod tests {
         assert!(view.playing && view.ticks() > 1);
         drop(physics);
         std::fs::remove_file(&out).ok();
+    }
+
+    /// Packet M17/G5: a scene read elsewhere draws as the file does, and each revision of an
+    /// edited document is a shot of its own, so every viewport draws it afresh.
+    #[test]
+    fn an_edited_scene_is_a_new_shot_per_revision() {
+        let file = ScenePreview::open(&fixture()).expect("the demo scene");
+        let scene = load_scene(&fixture()).unwrap();
+        let edited = ScenePreview::from_scene(fixture(), scene, 3).unwrap();
+        assert_eq!(
+            edited.project(&SHOWCASE_CAMERA),
+            file.project(&SHOWCASE_CAMERA)
+        );
+        assert_eq!(edited.shot(&SHOWCASE_CAMERA).tick, 3);
+        assert_eq!(file.shot(&SHOWCASE_CAMERA).tick, 0);
+        assert_ne!(edited.shot(&SHOWCASE_CAMERA), file.shot(&SHOWCASE_CAMERA));
+        // A scene document reads as the file it mirrors (G1): what a physics preview of an
+        // edited scene is played back on.
+        let doc = load_scene(&repo().join("tests/fixtures/esscene/so101_pick_place.esscene"));
+        let xml = load_scene(&fixture()).unwrap();
+        assert_eq!(doc.unwrap().scene_hash(), xml.scene_hash());
     }
 
     #[test]

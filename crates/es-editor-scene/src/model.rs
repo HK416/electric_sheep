@@ -180,6 +180,19 @@ impl SceneModel {
             || d.regions.iter().any(|r| r.name == name)
     }
 
+    /// The bodies `e` may hang from, in scene order: every body but the world and, for a body,
+    /// itself and what hangs from it.
+    pub fn parents(&self, e: &Entity) -> Vec<String> {
+        let own = match e {
+            Entity::Body(n) => command::subtree(&self.docs.scene, n),
+            _ => BTreeSet::new(),
+        };
+        (self.scene.bodies.iter().skip(1))
+            .map(|b| b.name.clone())
+            .filter(|n| !own.contains(n))
+            .collect()
+    }
+
     /// `base`, or `base_<n>` when it is taken: the name a new entity is offered.
     pub fn unique(&self, base: &str) -> String {
         command::unique(base, &|n| self.taken(n))

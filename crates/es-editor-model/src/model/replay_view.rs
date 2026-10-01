@@ -199,14 +199,23 @@ impl ReplayView {
     }
 }
 
-/// MJCF or URDF by extension, as `es backend`'s `load_scene` and `es video showcase` do, then
-/// the mesh files the scene names, relative to its directory (packet M10/W2b).
+/// A scene document (`.esscene`, packet M17/G1), MJCF or URDF by extension, as `es backend`'s
+/// `load_scene` and `es video showcase` do, then the mesh files the scene names, relative to its
+/// directory (packet M10/W2b).
 pub(crate) fn load_scene(path: &Path) -> Result<SceneDesc, ReplayError> {
     let bad = |message: String| ReplayError::Scene {
         path: path.display().to_string(),
         message,
     };
     let raw = std::fs::read_to_string(path).map_err(|e| bad(e.to_string()))?;
+    let dir = path.parent().unwrap_or(Path::new("."));
+    if path
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("esscene"))
+    {
+        let doc = es_assets::esscene::EsScene::from_toml(&raw).map_err(|e| bad(e.to_string()))?;
+        return es_assets::esscene::expand(&doc, dir).map_err(|e| bad(e.to_string()));
+    }
     let mut scene = if path
         .extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("urdf"))
@@ -220,8 +229,7 @@ pub(crate) fn load_scene(path: &Path) -> Result<SceneDesc, ReplayError> {
             .map_err(|e| bad(e.to_string()))?
             .scene
     };
-    es_assets::mesh::load(&mut scene, path.parent().unwrap_or(Path::new(".")))
-        .map_err(|e| bad(e.to_string()))?;
+    es_assets::mesh::load(&mut scene, dir).map_err(|e| bad(e.to_string()))?;
     Ok(scene)
 }
 

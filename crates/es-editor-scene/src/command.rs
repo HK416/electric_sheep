@@ -93,20 +93,25 @@ pub fn new_body(name: &str, shape: ShapeDoc) -> BodyDoc {
         pos: None,
         quat: None,
         gravcomp: None,
-        joint: Some(JointDoc {
-            kind: JointKindDoc::Free,
-            name: None,
-            axis: None,
-            pos: None,
-            range: None,
-            damping: None,
-            armature: None,
-            stiffness: None,
-            frictionloss: None,
-            springref: None,
-        }),
+        joint: Some(new_joint(JointKindDoc::Free)),
         inertial: None,
         geoms: vec![new_geom(shape)],
+    }
+}
+
+/// A joint of `kind` named as its body, every other field left to `MuJoCo`'s default.
+pub fn new_joint(kind: JointKindDoc) -> JointDoc {
+    JointDoc {
+        kind,
+        name: None,
+        axis: None,
+        pos: None,
+        range: None,
+        damping: None,
+        armature: None,
+        stiffness: None,
+        frictionloss: None,
+        springref: None,
     }
 }
 
@@ -169,11 +174,11 @@ pub fn new_region(name: &str) -> RegionDoc {
 }
 
 /// A record's `pos` and `quat`.
-type PoseSlots<'a> = (&'a mut Option<[f64; 3]>, &'a mut Option<[f64; 4]>);
+pub type PoseSlots<'a> = (&'a mut Option<[f64; 3]>, &'a mut Option<[f64; 4]>);
 
 impl Record {
     /// The place fields, when the entity has a place.
-    fn pose_mut(&mut self) -> Option<PoseSlots<'_>> {
+    pub fn pose_mut(&mut self) -> Option<PoseSlots<'_>> {
         match self {
             Self::Physics(_) => None,
             Self::Include(x) => Some((&mut x.pos, &mut x.quat)),
@@ -320,7 +325,7 @@ fn put(doc: &mut EsScene, e: &Entity, r: Record) -> Result<(), Refusal> {
 }
 
 /// The document's bodies hanging from `name`, `name` itself first.
-fn subtree(doc: &EsScene, name: &str) -> BTreeSet<String> {
+pub(crate) fn subtree(doc: &EsScene, name: &str) -> BTreeSet<String> {
     let mut out = BTreeSet::from([name.to_owned()]);
     // Parents come before children in a document that expands; one pass per level otherwise.
     for _ in 0..doc.bodies.len() {

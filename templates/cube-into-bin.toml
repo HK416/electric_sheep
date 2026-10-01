@@ -65,3 +65,9 @@ lift_m      = 0.02
 object_name = "outcome.cube"
 target_name = "outcome.bin"
 release     = { joint = "gripper", above = 0.85 }
+
+# ①'s "make an editable copy" (packet M17/G5): the scene as a scene document (G1's mirror of
+# `scene`, the arm included from so101.xml, the same scene_hash). No task specification says
+# this card's task yet (`task.toml` predates them), so the copy is the scene alone.
+[editable]
+scene = "tests/fixtures/esscene/so101_pick_place.esscene"

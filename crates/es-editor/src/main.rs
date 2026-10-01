@@ -1,12 +1,14 @@
 //! `es-editor [project-dir|bundle.esb|run-dir] [--attach <addr> [--token <t>]] [--step <1-5>]
-//! [--viewport fast|material|pt] [--fps | --orbit-demo] [--physics-preview]` — the editor shell
-//! of spec 23.
+//! [--viewport fast|material|pt] [--fps | --orbit-demo] [--physics-preview]
+//! [--edit-demo copy|select|edit|undo]` — the editor shell of spec 23.
 //!
 //! `--fps` prints each viewport's frames per second on stderr; `--orbit-demo` also turns every
 //! viewport's camera a little each frame (packet M16/H9's measurement and captures). Both keep
 //! the session's window and dock state in the temp directory, not the person's own.
 //! `--physics-preview` has ① start its physics preview as soon as it shows the scene (packet
-//! M17/G4's captures).
+//! M17/G4's captures). `--edit-demo` has ① make the editable copy, select the cube, resize and
+//! recolour it and undo that, up to the stage named (packet M17/G5's captures); it too keeps
+//! the session's state in the temp directory.
 //!
 //! `es-editor --import <project-dir> --template <id> ...` makes a project of runs that ran
 //! outside the editor and opens it; the grammar is [`es_editor::model::import`]'s (packet
@@ -24,7 +26,7 @@ use es_editor::EditorApp;
 fn main() -> eframe::Result<()> {
     let (mut path, mut addr, mut token, mut step) = (None, None, None, None);
     let mut look = None;
-    let (mut demo, mut physics) = (None, false);
+    let (mut demo, mut physics, mut edit) = (None, false, None);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -35,6 +37,8 @@ fn main() -> eframe::Result<()> {
             "--viewport" => look = args.next().as_deref().and_then(Mode::parse),
             // ① starts its physics preview at once (packet M17/G4's captures).
             "--physics-preview" => physics = true,
+            // ①'s scripted edits (packet M17/G5's captures).
+            "--edit-demo" => edit = args.next(),
             "--fps" => demo = Some(false),
             "--orbit-demo" => demo = Some(true),
             "--import" => match import(&args.by_ref().collect::<Vec<_>>()) {
@@ -63,7 +67,7 @@ fn main() -> eframe::Result<()> {
     };
 
     let mut options = eframe::NativeOptions::default();
-    if demo.is_some() {
+    if demo.is_some() || edit.is_some() {
         options.persistence_path = Some(std::env::temp_dir().join("es-editor-demo"));
     }
     let result = eframe::run_native(
@@ -87,6 +91,9 @@ fn main() -> eframe::Result<()> {
             }
             if physics {
                 es_editor::ui::scene::preview_at_start(&cc.egui_ctx);
+            }
+            if let Some(stage) = edit {
+                es_editor::ui::scene::edit_demo(&cc.egui_ctx, stage);
             }
             if let Some(path) = &path {
                 app = app.with_path(path);

@@ -1411,9 +1411,10 @@ pub(crate) enum Posed<'a> {
 }
 
 impl Posed<'_> {
+    /// A still scene's slot is its revision: an edit of ①'s document is a new picture.
     fn tick(self) -> usize {
         match self {
-            Self::Scene(_) => 0,
+            Self::Scene(preview) => preview.revision(),
             Self::Replay(view) => view.tick,
         }
     }

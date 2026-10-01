@@ -3,7 +3,8 @@
 //! [`home`] is the start screen and the new-project dialog (packet M12/Y11).
 //! [`train`] is ③ and ④, a run started, watched and stopped (packet M12/Y12).
 //! [`results`] is ⑤, a finished run read in plain words (packet M12/Y13).
-//! [`scene`] is ①, a template's scene, and ② read-only for a project with no program (M12/Y15).
+//! [`scene`] is ①, a template's scene, and ② read-only for a project with no program (M12/Y15);
+//! [`author`] is ① of an editable project: hierarchy, inspector, undo and save (packet M17/G5).
 //! [`teach`] is ②, the demonstration program as blocks, edited and tried once (packet M14/Q4).
 //! [`teacher`] is ② for a template taught by a trained teacher policy (packet M16/H7).
 //! [`player`] plays one attempt of an evaluation, for ⑤ and for ③'s checks (packet M13/Z5a).
@@ -13,6 +14,7 @@
 //! widgets.
 
 pub mod advanced;
+pub mod author;
 pub mod home;
 pub mod player;
 pub mod results;

@@ -77,3 +77,7 @@ lift_m      = 0.02
 object_name = "outcome.cube"
 target_name = "outcome.bin"
 release     = { joint = "gripper", above = 0.85 }
+
+# ①'s "make an editable copy" (packet M17/G5): as `cube-into-bin.toml`'s.
+[editable]
+scene = "tests/fixtures/esscene/so101_pick_place.esscene"

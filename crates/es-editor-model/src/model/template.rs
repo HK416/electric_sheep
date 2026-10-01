@@ -113,6 +113,16 @@ pub struct Release {
     pub above: f64,
 }
 
+/// `[editable]` (packet M17/G5): the template's scene as a scene document (`*.esscene`, the
+/// robot included by reference) and, when one says the task, its task specification
+/// (`*.estask`) — what ①'s "make an editable copy" copies into a project.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EditableDocs {
+    pub scene: String,
+    pub spec: Option<String>,
+}
+
 /// `viewport`: where the editor's outside camera starts on the template's scene, metres.
 #[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -149,6 +159,8 @@ pub struct Template {
     pub lengths: Lengths,
     /// Absent: failures keep the causes the evaluation recorded.
     pub outcome: Option<OutcomeSpec>,
+    /// Absent: ① offers no editable copy.
+    pub editable: Option<EditableDocs>,
 }
 
 const KIND: &str = "template";
@@ -259,12 +271,16 @@ mod tests {
             let cube = ok.iter().find(|t| t.id == id).expect(id);
             let b = &cube.bundle;
             assert_eq!(b.learning.is_some(), has_learning, "{id}");
+            // Packet M17/G5: the scene as a scene document, and no task specification yet.
+            let editable = cube.editable.as_ref().expect("[editable]");
+            assert!(editable.spec.is_none(), "{id}");
             for p in [
                 &cube.cycle,
                 &cube.scene,
                 &b.task,
                 &b.observation,
                 &b.deployment,
+                &editable.scene,
             ]
             .into_iter()
             .chain(b.learning.as_ref())
@@ -333,6 +349,12 @@ mod tests {
         assert!(hand.teach.is_none() && hand.needs.iter().any(|n| n == "mjwarp"));
         let t = hand.teacher.as_ref().expect("[teacher]");
         let b = &hand.bundle;
+        // Packet M17/G5: its scene document and task specification, for an editable copy.
+        let editable = hand.editable.as_ref().expect("[editable]");
+        let spec = editable.spec.as_ref().expect("a task specification");
+        for p in [&editable.scene, spec] {
+            assert!(root.join(p).is_file(), "{p}");
+        }
         for p in [
             &hand.cycle,
             &hand.scene,

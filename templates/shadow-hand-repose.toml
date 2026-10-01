@@ -74,3 +74,12 @@ target_name = "outcome.goal"
 angle_rad   = 0.1
 drop_m      = 0.24
 chance      = 0.06
+
+# ①'s "make an editable copy" (packet M17/G5): the scene as a scene document -- the hand
+# included from shadow_hand.xml by reference, the cube, the goal, the cameras and the light
+# written in it (G1's mirror of `scene`, the same scene_hash) -- and the task as a task
+# specification (G3a, the same task_hash). Both are copied into the project with the files they
+# name, the specification naming the copy; nothing under tests/ is ever written.
+[editable]
+scene = "tests/fixtures/mjcf/shadow_hand/shadow_hand_repose.esscene"
+spec  = "tests/fixtures/estask/shadow_hand_repose.estask"

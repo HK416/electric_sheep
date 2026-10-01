@@ -18,13 +18,16 @@ pub mod check;
 pub mod command;
 pub mod copy;
 pub mod euler;
+pub mod inspect;
 pub mod model;
 pub mod tree;
 
 use std::path::Path;
 
 pub use check::Refusal;
-pub use command::{new_body, new_camera, new_light, new_region, Command, Entity, Record};
+pub use command::{
+    new_body, new_camera, new_geom, new_joint, new_light, new_region, Command, Entity, Record,
+};
 pub use copy::make_editable;
 pub use es_physics_backend::BackendKind;
 pub use model::{Regen, SceneModel};

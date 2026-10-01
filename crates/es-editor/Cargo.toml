@@ -21,6 +21,11 @@ file-dialogs = ["es-editor-model/file-dialogs"]
 # The headless half (packet M12/R4): everything the window shows. Spec 4.2 rule 4: nothing
 # but this crate depends on it.
 es-editor-model = { workspace = true }
+# ①'s scene model (packet M17/G5): the scene document under edit, layer 12 beside the above;
+# its record types are es-assets', its angles es-math's units.
+es-editor-scene = { workspace = true }
+es-assets = { workspace = true }
+es-math = { workspace = true }
 es-ir = { workspace = true }
 es-compile = { workspace = true }
 es-eval = { workspace = true }
