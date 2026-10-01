@@ -126,7 +126,7 @@ impl Gizmo {
 }
 
 /// How far `p` is from the segment `a`-`b`.
-fn distance(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
+pub(crate) fn distance(p: [f64; 2], a: [f64; 2], b: [f64; 2]) -> f64 {
     let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
     let len2 = dx * dx + dy * dy;
     let t = if len2 > 0.0 {

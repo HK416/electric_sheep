@@ -17,20 +17,29 @@
 //! The viewport's decisions are here too (packet M17/G6): what a click selects and how big the
 //! selection is ([`view`]), the move, turn and size handles and the one command a drag of them
 //! makes ([`gizmo`]), and the camera the policy sees for the corner ([`policy`]).
+//!
+//! ①'s Add (packet M17/G7): what each item makes and where it goes ([`add`]), files copied into
+//! the project by content ([`import`]), cameras and regions drawn and picked as lines
+//! ([`marker`]), and an include's overrides ([`overrides`]).
 
+pub mod add;
 pub mod check;
 pub mod command;
 pub mod copy;
 pub mod euler;
 pub mod gizmo;
+pub mod import;
 pub mod inspect;
+pub mod marker;
 pub mod model;
+pub mod overrides;
 pub mod policy;
 pub mod tree;
 pub mod view;
 
 use std::path::Path;
 
+pub use add::{Item, Robot};
 pub use check::Refusal;
 pub use command::{
     new_body, new_camera, new_geom, new_joint, new_light, new_region, Command, Entity, Record,

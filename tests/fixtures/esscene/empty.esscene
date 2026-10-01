@@ -1,0 +1,24 @@
+# An empty scene (plan G, packet G7): a floor, a light and one camera from outside, which is what
+# an empty project starts from. Everything else is added in ① (crates/es-editor-scene/tests/add.rs).
+kind = "scene"
+schema = 1
+name = "empty"
+
+# An endless floor (MJCF's `size="0 0 ..."`); the renderer draws it 200 m across.
+[[geom]]
+name = "floor"
+shape = { plane = [0.0, 0.0, 0.05] }
+rgba = [0.55, 0.55, 0.55, 1.0]
+
+# 1.2 m back and 1.2 m up, looking down at the origin at 45 degrees: a turn of 45 degrees about X.
+[[camera]]
+name = "outside"
+pos = [0.0, -1.2, 1.2]
+quat = [0.3826834323650898, 0.0, 0.0, 0.9238795325112867]
+fovy = 45.0
+
+# The path tracer's emitter (the geom `ceiling_light`).
+[[light]]
+name = "ceiling"
+pos = [0.0, 0.0, 1.5]
+size = [0.3, 0.3]

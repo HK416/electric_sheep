@@ -1,0 +1,23 @@
+# The robot library ①'s Add menu offers (plan G, packet M17/G7): each robot's file, relative to the
+# repository root as every template's paths are, and where it stands from the point it is added at
+# (the middle of the view on the scene). Adding one copies its file, and the files the file names,
+# into the project under `assets/<blake3 of the file>/` (design note section 3.1).
+#
+# Not a template: `es-editor`'s template loader passes this file by.
+
+kind = "robots"
+
+# The SO-101 arm of the cube templates, as G1 split it from `so101_pick_place.xml`: its base stands
+# on the point.
+[[robot]]
+id = "so101"
+name = "author.add.robot.so101"   # es-editor i18n key
+source = "tests/fixtures/esscene/so101.xml"
+
+# The Shadow Hand of plan H with its own (invisible) floor. Its file hangs the hand's mount at
+# (1, 1.25, 0.15): moved back by (1, 1.25), the mount hangs 15 cm over the point.
+[[robot]]
+id = "shadow_hand"
+name = "author.add.robot.shadow_hand"   # es-editor i18n key
+source = "tests/fixtures/mjcf/shadow_hand/shadow_hand.xml"
+pos = [-1.0, -1.25, 0.0]

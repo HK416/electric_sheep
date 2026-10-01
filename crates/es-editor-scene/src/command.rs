@@ -75,6 +75,9 @@ pub enum Command {
     Reparent(Entity, Option<String>),
     /// Renames the entity and every reference to it, in the scene and in `task.estask`.
     Rename(Entity, String),
+    /// The whole scene document after an edit of several parts (G7's picture import: a texture,
+    /// a material and the geom naming it), and what to select after it.
+    Scene(Box<EsScene>, Option<Entity>),
 }
 
 /// The scene document and the task specification: what a command changes and an undo step
@@ -446,6 +449,10 @@ pub(crate) fn apply(
             put(doc, entity, r).map(|()| Some(entity.clone()))
         }
         Command::Reparent(e, parent) => reparent(doc, e, parent.clone()).map(|()| Some(e.clone())),
+        Command::Scene(scene, select) => {
+            doc.clone_from(scene);
+            Ok(select.clone())
+        }
         Command::Rename(e, new) => {
             let new = new.trim();
             if new.is_empty() {

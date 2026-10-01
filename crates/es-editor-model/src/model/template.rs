@@ -207,6 +207,8 @@ pub fn load(root: &Path) -> (Vec<Template>, Vec<(PathBuf, String)>) {
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.is_file() && p.extension().is_some_and(|x| x == "toml"))
+        // The robot library of ①'s Add menu (packet M17/G7) is not a template.
+        .filter(|p| !p.ends_with("robots.toml"))
         .collect();
     paths.sort();
     let (mut ok, mut bad) = (Vec::new(), Vec::new());

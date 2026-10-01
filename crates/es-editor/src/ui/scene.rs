@@ -72,6 +72,8 @@ pub fn preview_at_start(ctx: &egui::Context) {
 /// project has none, then selects the cube, then resizes and recolours it, then undoes that —
 /// each stage after the ones before it (packet M17/G5's captures). `drag` holds the cube's move
 /// handle mid-drag; `corner` lets it go and selects the front camera (packet M17/G6's).
+/// `add-menu`, `add-box` and `add-robot` open the Add menu, add a box and add the library's
+/// first robot where the view looks (packet M17/G7's).
 pub fn edit_demo(ctx: &egui::Context, stage: String) {
     ctx.data_mut(|d| d.insert_temp(demo_id(), stage));
 }
@@ -276,7 +278,7 @@ fn editable(
     played: &mut Canvas,
 ) {
     match pane {
-        Pane::StepPanel => author.hierarchy(ui, lang, camera.look_at),
+        Pane::StepPanel => author.hierarchy(ui, lang, camera),
         Pane::Viewport => {
             author.toolbar(ui, lang, camera);
             let preview = match author.preview() {

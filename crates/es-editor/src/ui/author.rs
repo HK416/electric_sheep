@@ -2,6 +2,8 @@
 //! hierarchy on the left, the viewport's undo / redo / save row, and the inspector on the right,
 //! over [`es_editor_scene::SceneModel`]. Over the viewport (packet M17/G6): the selection's tint,
 //! its move / turn / size handles, a click to pick, and the policy camera's view in the corner.
+//! ①'s Add menu and picture import, cameras and regions drawn as lines, and an include's
+//! overrides in the inspector are packet M17/G7's, in this module's children.
 //!
 //! Drawing only. Which rows there are, what a search keeps, what is hidden, which commands exist,
 //! whether one is refused and why, how a size or an angle is shown, what a click selects, where a
@@ -16,14 +18,13 @@ use std::sync::Arc;
 
 use eframe::egui;
 use egui::{Color32, Pos2, Rect, RichText, Stroke, Vec2};
-use es_assets::esscene::{GeomDoc, JointDoc, JointKindDoc, ShapeDoc};
+use es_assets::esscene::{GeomDoc, JointDoc, JointKindDoc};
 use es_editor_scene::inspect::{self, ShapeKind};
 use es_editor_scene::policy;
 use es_editor_scene::view::{project, ray};
 use es_editor_scene::{
-    euler, new_body, new_camera, new_joint, new_light, new_region, tree, BackendKind, Camera,
-    Command, Drag, Entity, Gizmo, PolicyCamera, Ray, Record, Refusal, Regen, RowKind, SceneModel,
-    Step, Tool,
+    euler, new_joint, tree, BackendKind, Camera, Command, Drag, Entity, Gizmo, PolicyCamera, Ray,
+    Record, Refusal, Regen, RowKind, SceneModel, Step, Tool,
 };
 use es_math::units::{DEG_TO_RAD, RAD_TO_DEG};
 use es_math::Vec3;
@@ -31,6 +32,10 @@ use es_math::Vec3;
 use crate::model::i18n::{fill, t, Lang};
 use crate::model::scene_view::ScenePreview;
 use crate::ui::corner::{self, Corner};
+
+mod add;
+mod markers;
+mod overrides;
 
 const RED: Color32 = Color32::from_rgb(220, 80, 70);
 const IDENTITY: [f64; 4] = [0.0, 0.0, 0.0, 1.0];
@@ -118,26 +123,9 @@ pub(crate) struct Author {
     /// The template's bundle (Task IR, Observation IR): the corner's cameras while the project
     /// has no task specification of its own (it trains on the template's documents until G9).
     bundle: Option<[PathBuf; 2]>,
+    /// The Add menu's and the overrides' state (packet M17/G7).
+    add: add::State,
 }
-
-/// What the Add menu makes.
-#[derive(Clone, Copy)]
-enum Add {
-    Shape(ShapeKind),
-    Camera,
-    Light,
-    Region,
-}
-
-const ADD: [(Add, &str); 7] = [
-    (Add::Shape(ShapeKind::Box), "author.shape.box"),
-    (Add::Shape(ShapeKind::Sphere), "author.shape.sphere"),
-    (Add::Shape(ShapeKind::Cylinder), "author.shape.cylinder"),
-    (Add::Shape(ShapeKind::Capsule), "author.shape.capsule"),
-    (Add::Camera, "author.kind.camera"),
-    (Add::Light, "author.kind.light"),
-    (Add::Region, "author.kind.region"),
-];
 
 fn fold_key(row: &es_editor_scene::Row) -> String {
     format!("{:?}/{}", row.kind, row.name)
@@ -171,6 +159,7 @@ impl Author {
             tint: None,
             corner: Corner::default(),
             bundle,
+            add: add::State::default(),
         })
     }
 
@@ -200,7 +189,11 @@ impl Author {
     /// `drag` holds its move handle 5.37 cm along X (snapped: 5 cm) as seen from `camera`, and
     /// `corner` lets that drag go — one command — and selects the front camera, which the corner
     /// then shows (packet M17/G6's captures).
+    /// The Add menu's stages (packet M17/G7) are [`Self::add_demo`]'s.
     pub(crate) fn demo(&mut self, stage: &str, camera: &Camera) {
+        if self.add_demo(stage, camera) {
+            return;
+        }
         let doc = self.model.doc();
         let free = doc.bodies.iter().find(|b| {
             b.joint
@@ -338,17 +331,10 @@ impl Author {
     }
 
     /// The hierarchy: the Add menu and the search, then the rows — fold arrow, eye, name and
-    /// kind; a right click duplicates, deletes or renames. New things go where the viewport looks.
-    pub(crate) fn hierarchy(&mut self, ui: &mut egui::Ui, lang: Lang, at: [f64; 3]) {
+    /// kind; a right click duplicates, deletes or renames. New things go where `view` looks.
+    pub(crate) fn hierarchy(&mut self, ui: &mut egui::Ui, lang: Lang, view: &Camera) {
         ui.horizontal(|ui| {
-            ui.menu_button(t(lang, "author.add"), |ui| {
-                for (what, key) in ADD {
-                    if ui.button(t(lang, key)).clicked() {
-                        self.add(what, at);
-                        ui.close();
-                    }
-                }
-            });
+            self.add_menu(ui, lang, view);
             let search =
                 egui::TextEdit::singleline(&mut self.search).hint_text(t(lang, "author.search"));
             ui.add(search);
@@ -464,36 +450,6 @@ impl Author {
         }
     }
 
-    #[allow(clippy::many_single_char_names)] // a record per kind, and a point's x, y, z
-    fn add(&mut self, what: Add, [x, y, z]: [f64; 3]) {
-        let m = &self.model;
-        let record = match what {
-            Add::Shape(kind) => {
-                let name = m.unique(kind.base());
-                let shape = inspect::reshape(&ShapeDoc::Box([0.025; 3]), kind);
-                let mut b = new_body(&name, shape);
-                b.pos = Some([x, y, z + 0.05]);
-                Record::Body(b)
-            }
-            Add::Camera => {
-                let mut c = new_camera(&m.unique("camera"));
-                c.pos = Some([x, y, z + 0.5]);
-                Record::Camera(c)
-            }
-            Add::Light => {
-                let mut l = new_light(&m.unique("light"));
-                l.pos = Some([x, y, z + 1.0]);
-                Record::Light(l)
-            }
-            Add::Region => {
-                let mut r = new_region(&m.unique("region"));
-                r.pos = Some([x, y, z]);
-                Record::Region(r)
-            }
-        };
-        self.apply(&Command::Add(record), None);
-    }
-
     /// The selected entity's fields. Name and parent apply as they change (a rename, a
     /// re-parent); every other field is one `Set` once the person lets go.
     #[allow(clippy::many_single_char_names)] // one short name per record kind
@@ -532,6 +488,9 @@ impl Author {
         let doc = self.model.doc().clone();
         let parents = self.model.parents(&e);
         let refused = self.refusal.as_ref().map(|(r, _)| r.field.clone());
+        let brought = self.brought(&e);
+        // A geom whose material is to be a picture (packet M17/G7).
+        let mut picture = None;
         let d = self.draft.as_mut().expect("set above");
         let prefix = e.field(&doc);
         let mut cmd = None;
@@ -620,10 +579,16 @@ impl Author {
                             };
                             ui.strong(fill(lang, "author.part", &[&ge.label(&doc)]));
                             ui.end_row();
-                            geom(ui, &f, g, &doc, index);
+                            if geom(ui, &f, g, &doc, index) {
+                                picture = Some(index);
+                            }
                         }
                     }
-                    Record::Scenery(g) | Record::Geom(g) => geom(ui, &f, g, &doc, 0),
+                    Record::Scenery(g) | Record::Geom(g) => {
+                        if geom(ui, &f, g, &doc, 0) {
+                            picture = Some(0);
+                        }
+                    }
                     Record::Camera(c) => {
                         f.label(ui, "author.fovy", "fovy");
                         opt1(ui, &mut c.fovy, inspect::FOVY, 0.5, "\u{b0}");
@@ -664,8 +629,15 @@ impl Author {
                     }
                 }
             });
+        if let (Record::Include(i), Some(b)) = (&mut d.record, &brought) {
+            overrides::show(ui, lang, &mut i.set, b, &doc);
+        }
         ui.add_space(8.0);
         ui.weak(t(lang, "author.uses_template"));
+        if let Some(index) = picture {
+            self.picture(&e, index);
+            return;
+        }
 
         // Once the person lets go: the fields as one command, unless that value was refused.
         let mut record = d.record.clone();
@@ -749,7 +721,10 @@ impl Author {
                 let at = response.interact_pointer_pos();
                 let handle = (gizmo.as_ref().zip(at)).and_then(|(g, at)| on_handle(g, at));
                 if let (Some(at), None) = (at, handle) {
-                    let hit = ray(camera, screen.px(at)).and_then(|r| self.model.hit(&r));
+                    // A camera's or region's lines first (packet M17/G7), then what is drawn.
+                    let px = screen.px(at);
+                    let hit = (self.model.marker_at(camera, px, reach))
+                        .or_else(|| ray(camera, px).and_then(|r| self.model.hit(&r)));
                     self.model.select(hit);
                 }
             }
@@ -793,6 +768,7 @@ impl Author {
             None => p,
         };
         let to = |p: Vec3| project(camera, at(p)).map(|q| screen.pt(q));
+        self.paint_markers(painter, camera, |q| screen.pt(q));
         let mut mesh = egui::Mesh::default();
         for t in self.tint.iter().flat_map(|(_, _, tris)| tris) {
             let corners = t.map(|v| to(Vec3::new(v[0].into(), v[1].into(), v[2].into())));
@@ -1021,14 +997,15 @@ fn joint(ui: &mut egui::Ui, f: &Fields<'_>, j: &mut Option<JointDoc>) {
     ui.end_row();
 }
 
-/// A geom's shape and sizes, mass or density, friction, colour and material.
+/// A geom's shape and sizes, mass or density, friction, colour and material; `true` when its
+/// material is to be a picture from a file (packet M17/G7).
 fn geom(
     ui: &mut egui::Ui,
     f: &Fields<'_>,
     g: &mut GeomDoc,
     doc: &es_assets::esscene::EsScene,
     salt: usize,
-) {
+) -> bool {
     let lang = f.lang;
     let kind = ShapeKind::of(&g.shape);
     f.label(ui, "author.shape", "shape");
@@ -1103,6 +1080,7 @@ fn geom(
     ui.end_row();
     f.label(ui, "author.material", "material");
     let none = t(lang, "author.material.none").to_owned();
+    let mut picture = false;
     egui::ComboBox::from_id_salt(("author-material", salt))
         .selected_text(g.material.clone().unwrap_or_else(|| none.clone()))
         .show_ui(ui, |ui| {
@@ -1114,6 +1092,8 @@ fn geom(
                 };
                 ui.selectable_value(&mut g.material, Some(m.name.clone()), label);
             }
+            picture = add::picture(ui, lang);
         });
     ui.end_row();
+    picture
 }

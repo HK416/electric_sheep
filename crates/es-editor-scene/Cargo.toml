@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "es-editor-scene -- the editor's scene model: the scene document, commands, undo, checks, save (plan G, G5), picking and gizmos (G6); only es-editor depends on it"
+description = "es-editor-scene -- the editor's scene model: the scene document, commands, undo, checks, save (plan G, G5), picking and gizmos (G6), Add and file import (G7); only es-editor depends on it"
 
 [dependencies]
 # The scene document (`*.esscene`, G1) and its expansion, the check every command passes.
@@ -21,10 +21,16 @@ es-render = { workspace = true }
 es-core = { workspace = true }
 # The cameras a policy sees, as its Task IR and Observation IR declare them (the corner view).
 es-ir = { workspace = true }
+# ①'s Add (packet M17/G7): files copied into the project under their content's blake3; the robot
+# library's list (`templates/robots.toml`); a glTF's buffer files and the picture import's
+# texture and material, read and made as the documents' own serde types.
+blake3 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-blake3 = { workspace = true }
 
 [lints]
 workspace = true
