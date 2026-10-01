@@ -747,6 +747,64 @@ M17 리뷰의 N-2와 F-9. 오라클은 `crates/es-script/tests/estask.rs`(`regio
   발동하지 않는다.
 - 문장이 이 필드를 왕복하고, R8이 너무 짧은 유지를 설명한다.
 
+**K7이 정한 세부** (스펙 §6.3. `crates/es-ir/src/task/node.rs`와 `validate.rs`,
+`crates/es-env/src/episode.rs`의 `evaluate`와 `env.rs`, `crates/es-script/src/spec/compile/clauses.rs`,
+`crates/es-editor-scene/src/sentence.rs`의 `section` / `set_hold`와 `missing.rs`. 그리는 것은
+`crates/es-editor/src/ui/sentence.rs`와 `results.rs`):
+
+- **IR.** `hold_ticks`는 serde에서 선택 항목이고 없으면 쓰지 않는다. 정규 인코더는 값이 있을 때만 그것을
+  kind 뒤에 덧붙인다(`SensorRender::seed`의 규칙). `Some(0)`은 `TASK-004`다. 오라클은
+  `crates/es-ir/tests/terminate_hold.rs`: `tests/fixtures` 아래 커밋된 Task IR 문서 20개(`Terminate`
+  노드 46개)는 유지 없이 읽히고, `hold_ticks`를 쓰지 않으며, 왕복한 뒤에도 해시가 같다. `task.toml`은
+  여전히 `86a7f3a3…`다. 유지를 주면 해시가 바뀌고 그 길이를 바꿔도 바뀌며, 왕복한다. G3a, G3b, R5, R8의
+  `estask*` 테스트, 교차 IR 픽스처, 속성 테스트, `es`의 `shadow_hand`·`views` 생성기, 롤아웃 골든
+  (`rollout_matches_es_eval_loop`, `rollout_state_only_is_unchanged`)이 그대로 통과하고,
+  `verify-goldens`는 바뀐 파일 0개를 보고한다.
+- **카운터.** `Env`는 환경마다 `Terminate`마다 `u32` 하나를 두고, `reset`이 환경의 다른 에피소드 상태와
+  함께 0으로 만든다. `episode::evaluate`는 그 환경의 행을 받는다. 유지가 있는 종료는 참인 틱에 1을
+  더하고(포화), 거짓이거나 평가할 수 없는 틱에 0이 되며, `n`에 이르면 발동한다. 유지가 없는 종료는 전과
+  같다. 종료는 여전히 노드 순서로 보고 먼저 발동한 것이 이기므로, 그 뒤의 카운터는 그 틱에 늘지 않는다.
+  에피소드가 거기서 끝나고 리셋이 0으로 만들기 때문이다. 세는 중인 실행도 예산이 끝낸다. 평가, 수집,
+  `es_native.Rollout`이 모두 같은 `Env`를 돌리고, `es-py`는 고칠 것이 없었다(빌더가 역직렬화하며 없으면
+  `None`이다). 오라클은 `episode.rs`의 `a_held_termination_fires_on_the_nth_consecutive_true_tick`(`n = 3`에
+  참, 참, 거짓, 참, 평가 불가, 참, 참, 참: 여덟 번째 틱에서만 발동)과 `env.rs`의
+  `a_held_termination_counts_per_env_and_restarts_with_the_episode`(환경 둘: 하나는 세 번째로 이어서 참인
+  틱에 발동하고 리셋 뒤 네 번째가 아니라 세 틱 뒤에 다시 발동한다. 거짓인 틱에 끊긴 다른 하나는 6번째
+  스텝에서만 발동한다).
+- **명세.** `hold_s`는 묶음(`Clauses`)의 필드라서 `[success]`와 `[failure]`가 모두 받는다.
+  `hold_s × control_hz`는 1 이상의 정수여야 하며, 아니면 `success: hold_s`로 거절한다(G8에서는
+  `success.hold_s`, 말은 `author.task.hold_ticks`). 그 묶음의 `Terminate { hold_ticks }`로만 컴파일되고
+  다른 것은 바뀌지 않는다(`estask.rs`의 `a_held_section_compiles_to_its_terminates_hold`: 유지를 빼면
+  보통 그래프와 같다). 희소 항 `success`와 `failure`는 여전히 순간 판정을 접은 값을 읽는다. 그래서 유지가
+  있는 성공은 끝에 한 번이 아니라 유지하는 동안 절들이 맞는 틱마다 보너스를 받는다: 버티면 보상받는다.
+  소유자가 바꿀 수 있다. 한 번만 주려면 보상 원뿔 안에 카운터가 있어야 하고, 그것은 노드다.
+- **문장.** 성공 머리말은 칸 하나(초 단위 숫자)를 가진 G8 문장 `author.task.success`다: "아래가 모두
+  [1 s] 동안 맞으면 성공", "It succeeds when all of these hold for [1 s]". 실패 머리말은
+  `author.task.failure_hold`, "아래 중 하나라도 [1 s] 동안 맞으면 실패"이고, 실패 묶음이 없으면 칸 없는
+  "…맞으면 바로 실패"로 남는다(유지할 것이 없다). 유지가 없으면 0 s로 보인다. 없는 숫자를 보이는 G8의
+  규칙이다. 도움말(`author.task.hold.hint`)이 0 s는 맞는 그 순간이라고 말한다. 0을 넣으면 `hold_s`가
+  지워져 문서는 바이트 단위로 원래대로 돌아간다. 편집은 `Command::Spec` 하나, 되돌리기 한 단계다
+  (`every_edit_is_one_undo_step_that_compiles`: 60 Hz에서 1 s와 0.5 s는 60틱과 30틱으로 컴파일되고, 0 s로
+  돌리면 처음의 `task_hash`가 나온다). 필드는 문장을 거쳐 왕복하고
+  (`committed_specifications_round_trip_through_their_sentences`), 머리말의 말은
+  `crates/es-editor/tests/sentences.txt`에 고정된다. 칸 뒤에 조사가 오지 않으므로 R4가 고를 것은 없다.
+- **R8의 설명.** `Explanation`에 `hold_s`와 `held`(셀에서 초로)가 더해진다. 성공 묶음에 유지가 있으면,
+  끝 행에서 모든 성공 절이 맞는 실패 시도는 그 행부터 거슬러 모든 성공 절이 맞는 행을 센다. 0번 행(리셋,
+  어떤 틱도 평가하지 않은 상태)은 세지 않고, `control_hz`로 나눈다. ⑤의 줄은 "모두 맞았지만 길어야 {X}
+  동안이었음 ({hold}보다 짧음)", "All held, but for {X} at most, less than {hold}"이며 X는 그중 가장 긴
+  것이다. 다른 줄과 함께 정렬된다. 절이 없는 타일은 "{X}만 유지", "held only {X}"라고 읽는다. 오라클은
+  `crates/es-editor-scene/tests/missing.rs`의 `a_too_short_hold_is_explained_by_how_long_it_held`: 50 Hz
+  SO-101 복사본에 손으로 쓴 시간 초과 세 번. 마지막 20행만 멈춰 있으면 0.4 s, 리셋부터 내내 멈춰 있으면
+  31행에 0.6 s(30틱), 끝에 움직이고 있으면 전처럼 그 절이다.
+- **`mujoco-cpu`에서 잰 것** (`crates/es-editor-scene/tests/hold.rs`, `ES_PYTHON` 필요): ①이 만드는 GV의
+  장면에서 상자를 아무렇게나 돌려 15 cm 높이에서 떨어뜨리고, "과제 정하기"의 "[box]가 멈춰 있다"
+  (5 cm/s)를 쓴다. 유지 없이는 상자가 처음 느려진 틱에 성공한다: 시드 7, 8, 9에서 13, 12, 14번째 스텝.
+  시드 7과 9에서 그 틱은 떨어지는 도중의 한순간이고, 상자는 다시 빨라진다(0.19 m/s와 0.07 m/s까지).
+  1초 유지로는 느린 틱이 50번 이어진 뒤, 66번째와 65번째 스텝에서 성공한다. 시드 8은 떨어져 그대로
+  멈추고, 유지로는 처음 느려진 틱에서 49틱 뒤(61번째 스텝)에 성공한다. 유지는 에피소드가 끝나는 때를
+  바꿀 뿐 물리를 바꾸지 않는다: 두 실행의 속도는 첫 성공까지 같다.
+- **스크린샷**은 `[success] hold_s = 1.0`을 넣은 GV 프로젝트 복사본에서 ①의 과제 탭을 한국어로 찍은 것이다.
+
 ## 5. 에디터 (①과 ②)
 
 - **계층 구조 패널**: 장면 트리(인클루드는 접힘), 검색, 가시성. 끌어서 부모를 바꾼다.

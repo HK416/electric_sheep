@@ -799,6 +799,68 @@ the end through the trajectory's rows, one row per control tick, with the same p
   bounce and the 1 s hold does not.
 - The sentence round-trips the field, and R8 explains a too-short hold.
 
+**What K7 settled** (spec §6.3; `crates/es-ir/src/task/node.rs` and `validate.rs`,
+`crates/es-env/src/episode.rs` `evaluate` and `env.rs`, `crates/es-script/src/spec/compile/clauses.rs`,
+`crates/es-editor-scene/src/sentence.rs` `section` / `set_hold` and `missing.rs`, drawn by
+`crates/es-editor/src/ui/sentence.rs` and `results.rs`):
+
+- **The IR.** `hold_ticks` is serde-optional and not written when absent; the canonical encoder
+  appends it after the kind only when it is there (`SensorRender::seed`'s rule). `Some(0)` is
+  `TASK-004`. Oracle `crates/es-ir/tests/terminate_hold.rs`: the 20 committed Task IR documents under
+  `tests/fixtures` (46 `Terminate` nodes) read with no hold, write no `hold_ticks` and hash the same
+  after a round trip, `task.toml` still `86a7f3a3…`; a hold moves the hash, so does its length, and it
+  round-trips. G3a's, G3b's, R5's and R8's `estask*` tests, the cross-IR fixtures, the property tests,
+  `es`'s `shadow_hand` and `views` generators and the rollout golden (`rollout_matches_es_eval_loop`,
+  `rollout_state_only_is_unchanged`) pass unchanged, and `verify-goldens` reports 0 changed.
+- **The counter.** `Env` keeps one `u32` per env per `Terminate`, zeroed by `reset` with the rest of
+  the env's episode state. `episode::evaluate` takes the env's row: a held termination counts one more
+  on a true tick (saturating) and 0 on a false or unevaluable one, and fires when it reaches `n`; one
+  without a hold fires as before. Terminations are still taken in node order and the first that fires
+  wins, so a counter after it is not advanced on that tick: the episode ends there and the reset zeroes
+  it. The budget still ends a run that is counting. Evaluation, collection and `es_native.Rollout`
+  step the same `Env`; `es-py` needed nothing (its builder deserializes, and absent is `None`). Oracles
+  `episode.rs` `a_held_termination_fires_on_the_nth_consecutive_true_tick` (true, true, false, true,
+  unevaluable, true, true, true at `n = 3`: it fires on the 8th tick only) and `env.rs`
+  `a_held_termination_counts_per_env_and_restarts_with_the_episode` (two envs: one fires on its third
+  true tick in a row and again three ticks after its reset, not on the fourth; the other, broken by a
+  false tick, fires on step 6 only).
+- **The specification.** `hold_s` is a field of the section (`Clauses`), so `[success]` and
+  `[failure]` both take it. `hold_s × control_hz` must be whole and at least 1, refused as
+  `success: hold_s` (G8's `success.hold_s`, words `author.task.hold_ticks`). It compiles to that
+  section's `Terminate { hold_ticks }` and to nothing else (`estask.rs`
+  `a_held_section_compiles_to_its_terminates_hold`: with the holds taken out, the graph is the plain
+  one). The sparse `success` and `failure` terms still read the instantaneous fold, so a held success
+  pays its bonus on every tick its clauses hold during the hold, not once at the end: holding pays.
+  The owner's to change; paying it once would need the counter in a reward cone, which is a node.
+- **The sentence.** The success header is G8's sentence `author.task.success` with one slot, a number
+  in seconds: "아래가 모두 [1 s] 동안 맞으면 성공", "It succeeds when all of these hold for [1 s]". The
+  failure header is `author.task.failure_hold`, "아래 중 하나라도 [1 s] 동안 맞으면 실패", and stays
+  "…맞으면 바로 실패" with no slot when there is no failure section (nothing to hold). An absent hold
+  shows 0 s, G8's rule for an absent number; the hover (`author.task.hold.hint`) says 0 s is the
+  moment they hold. Setting 0 removes `hold_s`, so the document is again what it was byte for byte.
+  The edit is one `Command::Spec`, one undo step (`every_edit_is_one_undo_step_that_compiles`: 1 s and
+  0.5 s at 60 Hz compile to 60 and 30 ticks, and back to 0 s gives the first `task_hash`); the field
+  round-trips through the sentences (`committed_specifications_round_trip_through_their_sentences`);
+  the headers' words are pinned in `crates/es-editor/tests/sentences.txt`. No particle follows the
+  slot, so R4 has nothing to choose there.
+- **R8's explanation.** `Explanation` gains `hold_s` and `held` (cell to seconds). When the success
+  section holds, a failed attempt whose end row holds every success clause is counted back from that
+  row over the rows on which every success clause holds, row 0 (the reset, which no tick evaluated)
+  left out, and divided by `control_hz`. ⑤'s line is "모두 맞았지만 길어야 {X} 동안이었음 ({hold}보다
+  짧음)", "All held, but for {X} at most, less than {hold}", X the longest of them, sorted with the
+  other lines; a tile with no clause reads "{X}만 유지", "held only {X}". Oracle
+  `crates/es-editor-scene/tests/missing.rs` `a_too_short_hold_is_explained_by_how_long_it_held`, three
+  hand-written timeouts on the SO-101 copy at 50 Hz: still on its last 20 rows, 0.4 s; still from the
+  reset on, 31 rows, 0.6 s (30 ticks); moving at the end, the clause as before.
+- **Measured on `mujoco-cpu`** (`crates/es-editor-scene/tests/hold.rs`, with `ES_PYTHON`): GV's scene
+  as ① builds it, the box dropped turned at random from 15 cm, and "say the task"'s "[box] is still"
+  (5 cm/s). At once, success comes the first tick the box is slow: step 13, 12 and 14 for seeds 7, 8
+  and 9. On seeds 7 and 9 that tick is a moment of the landing, and the box speeds up again (to 0.19
+  and 0.07 m/s); held for 1 s it succeeds at steps 66 and 65, after 50 slow ticks in a row. Seed 8
+  lands and stays, and held succeeds 49 ticks after its first slow tick (step 61). The hold changes
+  when the episode ends, not the physics: the two runs' speeds are equal up to the first success.
+- **The screenshot** is ①'s task tab in Korean on a copy of GV's project with `[success] hold_s = 1.0`.
+
 ## 5. The editor (① and ②)
 
 - **Hierarchy panel**: the scene tree (includes folded), search, visibility; drag to re-parent.
