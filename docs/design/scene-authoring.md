@@ -645,6 +645,46 @@ M17's review, N-2 and F-9. Oracles `crates/es-script/tests/estask.rs` (`region_d
   hinge or slide whose `ref` is not 0 (stream `scene.<joint>`), and none under `zero_unset = true`.
   `a_hinges_ref_is_not_represented_and_nothing_is_emitted` fails the day `ref` is parsed.
 
+### 4.8 Why an attempt failed: the missing clause (design for packet M17/R8)
+
+The owner's approved S4 direction: ⑤ explains a failed attempt by the success clause that did not
+hold at its end, in ①'s words. Example: "the box was not inside the target area (3 of 4 failed
+attempts)". M17's GV showed why it matters: ⑤ said only "not done in time" for all four failures.
+
+**Decision: the clauses are evaluated after the fact, on the attempt's recorded end state, with
+the same lowering the env uses. There is no IR change and no hash change.**
+
+- **The end state** is the trajectory's last row (packet R2: since `6ba08d6` an `.estraj` ends on the
+  post-step state its episode ended in). An older trajectory, without that row, is explained on its
+  last row, and ⑤ says so.
+- **Which node is a clause.** `compile_task` folds the clauses into one `Terminate(Success)` (`And`)
+  and one `Terminate(Failure)` (`Or`). The fold cannot be undone from the Task IR alone, because a
+  clause can itself be an `And` tree (inside a region). So the compiler also returns a side table,
+  `[(section, index, node)]`: the node each clause's predicate ends in. It is not part of the IR
+  and enters no hash.
+- **Evaluating a node.** `es-env` gains a function that lowers one node's cone exactly as it lowers
+  a termination cone (`plan.rs`) and evaluates it on a `StateView` built from a trajectory row
+  (`qpos`, `qvel`, body poses).
+- **The layout.** That needs the model's layout: which `qpos` and `qvel` lanes each joint has, and
+  which row each body is in. The packet chooses one of two ways, and records why:
+  1. a pure function of the scene that reproduces the backends' layout, with an oracle that equals
+     `mujoco-cpu`'s `ModelInfo` on every committed scene;
+  2. the layout written beside the evaluation's trajectories at run time, where it must move no
+     pinned file or hash (`demo_trajectories_are_unmoved` hashes the `traj/` folder's files).
+- **Where the words come from.** `es-editor-scene` holds the specification and G8's sentences. It
+  evaluates the clauses of each failed attempt and hands ⑤ a list:
+  - per success clause, how many failed attempts ended without it;
+  - per failure clause, how many attempts it ended.
+
+  ⑤ shows the list in the place of the outcome classes for an authored project. A template project
+  keeps its `[outcome]` classes. `es-editor-model` (layer 12) cannot depend on `es-editor-scene`, so
+  `es-editor` passes the list in, as G9 passes the generation state.
+- **Oracles.**
+  - On scripted end states, each clause's truth equals the env's own predicate.
+  - On GV's evaluation (16 attempts, 4 timeouts), the explanation of each timeout names a success
+    clause that is false on its end row. All four held clauses are true on the twelve successes.
+  - A screenshot of ⑤ with the explanation.
+
 ## 5. The editor (① and ②)
 
 - **Hierarchy panel**: the scene tree (includes folded), search, visibility; drag to re-parent.
