@@ -8,7 +8,7 @@ use es_math::approx::{acos_f64, sin_cos_f64};
 use es_math::units::{DEG_TO_RAD, RAD_TO_DEG};
 
 /// `atan2` from `acos`: exact in sign and quadrant, `atan2(0, 0) = 0`.
-fn atan2(y: f64, x: f64) -> f64 {
+pub(crate) fn atan2(y: f64, x: f64) -> f64 {
     let h = (x * x + y * y).sqrt();
     if h == 0.0 {
         return 0.0;

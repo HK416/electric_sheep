@@ -13,14 +13,21 @@
 //!
 //! An editable project is a project folder that holds `scene.esscene` and, once the task is
 //! said, `task.estask` (G3a); [`make_editable`] writes both from a template's.
+//!
+//! The viewport's decisions are here too (packet M17/G6): what a click selects and how big the
+//! selection is ([`view`]), the move, turn and size handles and the one command a drag of them
+//! makes ([`gizmo`]), and the camera the policy sees for the corner ([`policy`]).
 
 pub mod check;
 pub mod command;
 pub mod copy;
 pub mod euler;
+pub mod gizmo;
 pub mod inspect;
 pub mod model;
+pub mod policy;
 pub mod tree;
+pub mod view;
 
 use std::path::Path;
 
@@ -30,8 +37,11 @@ pub use command::{
 };
 pub use copy::make_editable;
 pub use es_physics_backend::BackendKind;
+pub use gizmo::{Drag, Gizmo, Step, Tool};
 pub use model::{Regen, SceneModel};
+pub use policy::PolicyCamera;
 pub use tree::{Row, RowKind};
+pub use view::{Camera, Ray};
 
 /// The scene document of an editable project, in its root.
 pub const SCENE_FILE: &str = "scene.esscene";

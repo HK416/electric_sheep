@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "es-editor-scene -- the editor's scene model: the scene document, commands, undo, checks, save (plan G, G5); only es-editor depends on it"
+description = "es-editor-scene -- the editor's scene model: the scene document, commands, undo, checks, save (plan G, G5), picking and gizmos (G6); only es-editor depends on it"
 
 [dependencies]
 # The scene document (`*.esscene`, G1) and its expansion, the check every command passes.
@@ -15,10 +15,15 @@ es-script = { workspace = true }
 es-math = { workspace = true }
 # The semantic mapping report (spec 17.2) every command is checked against.
 es-physics-backend = { workspace = true }
+# The viewport's headless half (packet M17/G6): the renderer's tessellation and nearest-hit
+# rule for picking, its free camera for rays and handles; layer 5, no device.
+es-render = { workspace = true }
+es-core = { workspace = true }
+# The cameras a policy sees, as its Task IR and Observation IR declare them (the corner view).
+es-ir = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
-es-ir = { workspace = true }
 blake3 = { workspace = true }
 
 [lints]

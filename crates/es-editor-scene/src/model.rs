@@ -271,6 +271,11 @@ impl SceneModel {
         tree::rows(&self.docs.scene, &self.includes.1)
     }
 
+    /// What each include brings, in include order.
+    pub(crate) fn contents(&self) -> &[Contents] {
+        &self.includes.1
+    }
+
     pub fn hidden(&self, e: &Entity) -> bool {
         self.hidden.contains(e)
     }

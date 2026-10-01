@@ -13,6 +13,8 @@ pub const RGBA: [f64; 4] = [0.5, 0.5, 0.5, 1.0];
 pub const DENSITY: f64 = 1000.0;
 /// A camera's `fovy` (degrees) when the document writes none.
 pub const FOVY: f64 = 45.0;
+/// A region's half-extents (metres) when the document writes none (G1's `expand`).
+pub const REGION: [f64; 3] = [0.005; 3];
 
 /// The shapes a person picks from; a mesh comes from a file (G7's import).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
