@@ -13,8 +13,8 @@
 use es_ir::graph::NodeId;
 use es_ir::serial::IrKind;
 
-use crate::model::edit::EditSession;
-use crate::model::graph_view::{self, LayeredGraph};
+use crate::edit::EditSession;
+use crate::graph_view::{self, LayeredGraph};
 
 /// Which band of spec 23.2's stack, and which node in it. The two IRs do not share a `NodeId`
 /// namespace, so neither half of this pair identifies a node on its own.
@@ -153,8 +153,8 @@ mod tests {
     use es_ir::graph::NodeId;
     use es_ir::serial::Layout;
 
-    use crate::model::edit::{EditIr, EditSession};
-    use crate::model::graph_view::{LayeredGraph, LEARNING, TASK};
+    use crate::edit::{EditIr, EditSession};
+    use crate::graph_view::{LayeredGraph, LEARNING, TASK};
 
     fn fixtures() -> PathBuf {
         Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../.."))

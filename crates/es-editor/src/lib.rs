@@ -3,9 +3,10 @@
 //! (read-only and editable), telemetry, and the before/after image pair.
 //!
 //! Layer rule (spec 4.2 rule 4): this crate may depend on anything, and **nothing may depend
-//! on it**; nothing but it may depend on `es-editor-model` (layer 12), whose [`model`] it
-//! re-exports under the path it had before packet M12/R4 split the two. `cargo xtask
-//! layering` enforces all of it.
+//! on it**; nothing but it may depend on the layer-12 crates. [`model`] joins
+//! `es-editor-model`'s view-models and `es-editor-graph`'s graph models under the one path
+//! they had before packets M12/R4 and M17/R1 split them out. `cargo xtask layering` enforces
+//! all of it.
 //!
 //! Spec 23.1: the editor does not host training. It is a client that attaches to a running
 //! process. Everything it knows arrives as an IR bundle on disk or as telemetry messages.
@@ -37,7 +38,12 @@ pub mod app;
 pub mod gpu;
 pub mod ui;
 
-pub use es_editor_model::model;
+/// The headless half: `es-editor-model`'s modules and `es-editor-graph`'s (packet M17/R1), under
+/// the path they shared before the split, so a type is still `model::<module>::<Type>`.
+pub mod model {
+    pub use es_editor_graph::{edit, graph_view, image_view, inspector, palette, search};
+    pub use es_editor_model::model::*;
+}
 
 pub use app::EditorApp;
 pub use model::edit::{Edit, EditSession};

@@ -16,7 +16,7 @@
 //! * **An erroneous field never emits an edit.** [`Inspector::edit`] records the parse error
 //!   on the field and returns `None`; the session is not touched.
 //!
-//! There is no per-kind code here, exactly as in [`crate::model::edit`]: the fields come from
+//! There is no per-kind code here, exactly as in [`crate::edit`]: the fields come from
 //! the registry's [`NodeSchema`] and the node's own serialization, so a node kind added to
 //! `es-ir` is inspectable with no change below this line (`docs/design/node-sdk.md`).
 
@@ -25,7 +25,7 @@ use es_ir::graph::NodeId;
 use es_ir::IrNode;
 use serde::Serialize;
 
-use crate::model::edit::{Edit, EditIr, EditSession};
+use crate::edit::{Edit, EditIr, EditSession};
 
 /// The control one parameter is edited with. One variant per [`ParamType`] — the mapping is a
 /// bijection so that [`widget_for`]'s exhaustive match is worth having.
@@ -345,8 +345,8 @@ mod tests {
     use es_ir::serial::Layout;
     use es_ir::task::{ObservationSpec, SceneRef, TaskConfig, TaskIr};
 
-    use crate::model::edit::{Edit, EditIr, EditSession};
-    use crate::model::palette::Palette;
+    use crate::edit::{Edit, EditIr, EditSession};
+    use crate::palette::Palette;
 
     fn task_session() -> EditSession {
         EditSession::new(

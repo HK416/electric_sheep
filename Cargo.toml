@@ -31,6 +31,7 @@ es-editor = { path = "crates/es-editor" }
 # Without its default `file-dialogs`: es-editor forwards its own feature to it.
 es-editor-model = { path = "crates/es-editor-model", default-features = false }
 es-editor-scene = { path = "crates/es-editor-scene" }
+es-editor-graph = { path = "crates/es-editor-graph" }
 es-eval = { path = "crates/es-eval" }
 es-splat = { path = "crates/es-splat" }
 es-script = { path = "crates/es-script" }

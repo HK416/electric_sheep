@@ -6,21 +6,16 @@
 //! rest rather than being left to `app.rs` (spec 28.10 rule 3).
 
 pub mod dialogs;
-pub mod edit;
 pub mod fonts;
-pub mod graph_view;
 pub mod health;
 pub mod home;
 pub mod i18n;
-pub mod image_view;
 pub mod import;
-pub mod inspector;
 pub mod labels;
 pub mod launch;
 pub mod layout;
 pub mod live_run;
 pub mod outcome;
-pub mod palette;
 pub mod preview;
 pub mod project;
 pub mod recent;
@@ -28,7 +23,6 @@ pub mod replay_view;
 pub mod results;
 pub mod run_view;
 pub mod scene_view;
-pub mod search;
 pub mod teach;
 pub mod teacher;
 pub mod telemetry_view;

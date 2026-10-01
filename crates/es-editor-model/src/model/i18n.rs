@@ -129,7 +129,8 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     /// Every `.rs` file of this crate, source and tests alike, of `es-editor`, the shell that
-    /// shows the same tables (packet M12/R4 split the two), and of `es-editor-scene`.
+    /// shows the same tables (packet M12/R4 split the two), of `es-editor-scene`, and of
+    /// `es-editor-graph` (packet M17/R1 moved part of this crate there).
     fn sources() -> Vec<String> {
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             let Ok(entries) = std::fs::read_dir(dir) else {
@@ -152,6 +153,8 @@ mod tests {
         walk(&root.join("../es-editor/src"), &mut paths);
         // The scene model (packet M17/G5) names its refusals by these tables' keys.
         walk(&root.join("../es-editor-scene/src"), &mut paths);
+        walk(&root.join("../es-editor-graph/src"), &mut paths);
+        walk(&root.join("../es-editor-graph/tests"), &mut paths);
         assert!(
             own > 0 && paths.len() > own,
             "this crate's and the shell's sources"

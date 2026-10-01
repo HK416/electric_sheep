@@ -8,7 +8,7 @@ mod common;
 use std::collections::BTreeMap;
 
 use common::Fixture;
-use es_editor_model::model::graph_view::{LayeredGraph, DEPLOYMENT, LEARNING, OBSERVATION, TASK};
+use es_editor_graph::graph_view::{LayeredGraph, DEPLOYMENT, LEARNING, OBSERVATION, TASK};
 use es_ir::codes;
 use es_ir::graph::NodeId;
 use es_ir::serial::{IrKind, Layout};

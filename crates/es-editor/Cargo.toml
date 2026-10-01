@@ -24,6 +24,9 @@ es-editor-model = { workspace = true }
 # ①'s scene model (packet M17/G5): the scene document under edit, layer 12 beside the above;
 # its record types are es-assets', its angles es-math's units.
 es-editor-scene = { workspace = true }
+# The Advanced graph's models (packet M17/R1): the IR graph view, edits, inspector, palette,
+# search and the before/after images, moved out of `es-editor-model`; layer 12 beside both.
+es-editor-graph = { workspace = true }
 es-assets = { workspace = true }
 es-math = { workspace = true }
 es-ir = { workspace = true }

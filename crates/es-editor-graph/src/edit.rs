@@ -1,6 +1,6 @@
 //! The editable graph of spec 23.4 stage 2, as a headless edit model.
 //!
-//! Everything an edit *decides* lives here and is judged by `cargo test -p es-editor-model`;
+//! Everything an edit *decides* lives here and is judged by `cargo test -p es-editor-graph`;
 //! `es_editor::app` only turns a mouse gesture into an [`Edit`] and paints the result. CI has no
 //! display, so a decision that leaks into the egui half is a decision nothing tests.
 //!
@@ -32,7 +32,7 @@ use es_ir::serial::{self, AnyIr, IrKind, Layout, SerialError};
 use es_ir::task::TaskIr;
 use es_ir::{codes, Diagnostic, IrNode};
 
-use crate::model::palette::Registries;
+use crate::palette::Registries;
 
 /// Runs `$body` with `$g` bound to the `Graph<N>` inside `$ir`, whichever IR that is. The three
 /// IRs spell their graph field differently and their node types differ, so this is a macro and
@@ -588,7 +588,7 @@ pub fn kinds_by_id(graph: &EditIr) -> BTreeMap<NodeId, &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::palette::Palette;
+    use crate::palette::Palette;
 
     use es_ir::factory::{NodeSchema, ParamSchema, ParamType, TaskNodeFactory};
     use es_ir::graph::{Graph, Port};

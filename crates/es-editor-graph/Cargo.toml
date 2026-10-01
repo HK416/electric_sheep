@@ -1,0 +1,24 @@
+[package]
+name = "es-editor-graph"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "es-editor-graph -- the Advanced graph's headless models: the IR graph view, edits, inspector, palette, search and the Observation IR's before/after images (spec 23.2-23.4); only es-editor depends on it"
+
+[dependencies]
+es-core = { workspace = true }
+es-ir = { workspace = true }
+# The before/after images run the opened Observation IR through `es_compile::CpuPlan`, the
+# compiler's own reference execution, and hand `es_eval::run_dir::Rgb8Image`s to the shell.
+es-compile = { workspace = true }
+es-eval = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+es-math = { workspace = true }
+
+[lints]
+workspace = true
