@@ -18,7 +18,7 @@ use crate::model::layout::Pane;
 use crate::model::scene_view::{self, ScenePreview};
 use crate::model::template::{templates_root, Template};
 use crate::model::workflow::Phase;
-use crate::ui::advanced::scene_canvas;
+use crate::ui::advanced::{scene_canvas, Canvas, Posed};
 
 /// ① and ② between frames. It belongs to one project; opening another reads its scene afresh.
 #[derive(Default)]
@@ -26,7 +26,7 @@ pub(crate) struct State {
     project: Option<PathBuf>,
     step: Option<(Template, Result<ScenePreview, String>)>,
     camera: Option<Camera>,
-    picture: Option<((usize, Camera), egui::TextureHandle)>,
+    picture: Canvas,
 }
 
 /// ①'s and ②'s step panel, viewport and summary; `false` for every other pane and step.
@@ -65,15 +65,9 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
             ui.weak(t(lang, "setup.orbit_hint"));
             let camera =
                 (state.camera).get_or_insert_with(|| scene_view::camera_of(Some(template)));
-            let project = |camera: &Camera| preview.project(camera);
-            scene_canvas(
-                ui,
-                ui.available_size(),
-                0,
-                project,
-                camera,
-                &mut state.picture,
-            );
+            let size = ui.available_size();
+            let posed = Posed::Scene(preview);
+            scene_canvas(ui, lang, size, posed, camera, &mut state.picture);
         }
         (Pane::StepPanel, Phase::Scene, _) => {
             ui.heading(t(lang, "setup.contents"));

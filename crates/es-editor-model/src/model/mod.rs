@@ -34,5 +34,6 @@ pub mod teacher;
 pub mod telemetry_view;
 pub mod template;
 pub mod train_view;
+pub mod viewport;
 pub mod watch;
 pub mod workflow;

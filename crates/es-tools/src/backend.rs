@@ -10,7 +10,7 @@ use es_physics_core::{LoadConfig, PhysicsBackend};
 use crate::error::CliError;
 
 const HELP: &str = "\
-es backend compare --scene <file.xml|urdf> --backends mujoco-cpu,mjwarp[,newton,physx] [OPTIONS]
+es backend compare --scene <file.xml|urdf|esscene> --backends mujoco-cpu,mjwarp[,newton,physx] [OPTIONS]
 es backend compare --task <task.toml> --backends ...
 
 Parses a scene (or a Task IR's SceneRef) and, for every requested backend, prints the
@@ -21,7 +21,7 @@ prints a spec 3.5 tier 3 comparison (spec 14.4: a mapping blocked by severity er
 runs). `physx` needs ES_ISAAC_PYTHON (the Isaac Sim interpreter, packet M11/I1);
 ES_PHYSX_DEVICE=cpu|cuda:0 picks its pipeline.
 
-    --scene <path>     MJCF (.xml) or URDF (.urdf) scene file
+    --scene <path>     MJCF (.xml), URDF (.urdf) or scene document (.esscene)
     --task <path>      Task IR TOML; reads its SceneRef path (must not be hash-only)
     --backends <csv>   backend names, comma separated (mujoco-cpu, mjwarp, newton, physx)
     --ticks N          physics ticks to compare (default 100)
@@ -124,16 +124,23 @@ fn parse_args(args: &[String]) -> Result<Args, CliError> {
     })
 }
 
-/// MJCF or URDF by extension, then the mesh files the scene names, relative to the scene
-/// file's directory (packet M10/W2b) — the one loader every CLI verb that opens a scene uses.
+/// MJCF, URDF or a scene document (`.esscene`, plan G / G1) by extension, then the mesh files
+/// the scene names, relative to the scene file's directory (packet M10/W2b) — the one loader
+/// every CLI verb that opens a scene uses.
 pub fn load_scene(path: &str) -> Result<SceneDesc, CliError> {
     let fail = |e: &dyn std::fmt::Display| CliError::Runtime(format!("{path}: {e}"));
     let raw = std::fs::read_to_string(path).map_err(|e| fail(&e))?;
     let file = std::path::Path::new(path);
-    let is_urdf = file
-        .extension()
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("urdf"));
-    let mut scene = if is_urdf {
+    let dir = file.parent().unwrap_or(std::path::Path::new("."));
+    let is = |want: &str| {
+        file.extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case(want))
+    };
+    if is("esscene") {
+        let doc = es_assets::esscene::EsScene::from_toml(&raw).map_err(|e| fail(&e))?;
+        return es_assets::esscene::expand(&doc, dir).map_err(|e| fail(&e));
+    }
+    let mut scene = if is("urdf") {
         let resolver = es_assets::urdf::PackageResolver::from_env();
         es_assets::urdf::parse_urdf(&raw, &resolver)
             .map_err(|e| fail(&e))?
@@ -141,7 +148,6 @@ pub fn load_scene(path: &str) -> Result<SceneDesc, CliError> {
     } else {
         es_assets::parse_mjcf(&raw).map_err(|e| fail(&e))?.scene
     };
-    let dir = file.parent().unwrap_or(std::path::Path::new("."));
     es_assets::mesh::load(&mut scene, dir).map_err(|e| fail(&e))?;
     Ok(scene)
 }
@@ -278,5 +284,26 @@ pub fn dispatch(args: &[String]) -> Result<u8, CliError> {
         Some(other) => Err(CliError::Usage(format!(
             "es backend: unknown subcommand '{other}'"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// Plan G, G1 oracle 4: a scene document loads to what `expand` gives — and to the MJCF
+    /// scene it mirrors, so every verb reading either sees one scene.
+    #[test]
+    fn load_scene_reads_a_scene_document() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/");
+        let doc_path = format!("{root}mjcf/shadow_hand/shadow_hand_repose.esscene");
+        let loaded = super::load_scene(&doc_path).expect("loads");
+        let doc =
+            es_assets::esscene::EsScene::from_toml(&std::fs::read_to_string(&doc_path).unwrap())
+                .unwrap();
+        let dir = std::path::Path::new(&doc_path).parent().unwrap();
+        let expanded = es_assets::esscene::expand(&doc, dir).unwrap();
+        assert_eq!(format!("{loaded:?}"), format!("{expanded:?}"));
+        let mjcf = super::load_scene(&format!("{root}mjcf/shadow_hand/shadow_hand_repose.xml"))
+            .expect("loads");
+        assert_eq!(loaded.scene_hash(), mjcf.scene_hash());
     }
 }

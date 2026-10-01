@@ -114,7 +114,7 @@ fn usage(msg: impl std::fmt::Display) -> CliError {
     CliError::Usage(format!("{msg}\n\n{HELP}"))
 }
 
-fn vec3(raw: &str, flag: &str) -> Result<[f64; 3], CliError> {
+pub(crate) fn vec3(raw: &str, flag: &str) -> Result<[f64; 3], CliError> {
     let parts: Vec<&str> = raw.split(',').collect();
     let [x, y, z] = parts.as_slice() else {
         return Err(usage(format!("{flag}: expected X,Y,Z, got {raw:?}")));

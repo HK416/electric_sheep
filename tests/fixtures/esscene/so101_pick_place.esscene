@@ -1,0 +1,81 @@
+# The SO-101 cube-into-bin scene as a scene document (plan G, packet G1): the arm is included
+# from so101.xml, the table, the bin, the cube, the camera and the emitter are written here.
+# It expands to the SceneDesc tests/fixtures/mjcf/so101_pick_place.xml reads to, with the same
+# scene_hash (crates/es-assets/tests/esscene.rs).
+kind = "scene"
+schema = 1
+name = "so101_pick_place"
+
+[physics]
+timestep = 0.005
+integrator = "implicitfast"
+cone = "elliptic"
+iterations = 10
+impratio = 10.0
+
+[[include]]
+name = "arm"
+source = "so101.xml"
+
+# The table: the ground plane the arm, the cube and the bin stand on.
+[[geom]]
+name = "table"
+shape = { plane = [0.6, 0.6, 0.05] }
+rgba = [0.76, 0.71, 0.62, 1.0]
+
+# The bin: a floor plate and four thin walls.
+[[geom]]
+name = "bin_floor"
+shape = { box = [0.054, 0.054, 0.004] }
+pos = [0.14, -0.1, 0.004]
+rgba = [0.25, 0.35, 0.55, 1.0]
+
+[[geom]]
+name = "bin_wall_nx"
+shape = { box = [0.004, 0.054, 0.045] }
+pos = [0.086, -0.1, 0.045]
+rgba = [0.25, 0.35, 0.55, 1.0]
+
+[[geom]]
+name = "bin_wall_px"
+shape = { box = [0.004, 0.054, 0.045] }
+pos = [0.194, -0.1, 0.045]
+rgba = [0.25, 0.35, 0.55, 1.0]
+
+[[geom]]
+name = "bin_wall_ny"
+shape = { box = [0.054, 0.004, 0.045] }
+pos = [0.14, -0.154, 0.045]
+rgba = [0.25, 0.35, 0.55, 1.0]
+
+[[geom]]
+name = "bin_wall_py"
+shape = { box = [0.054, 0.004, 0.045] }
+pos = [0.14, -0.046, 0.045]
+rgba = [0.25, 0.35, 0.55, 1.0]
+
+# The manipulated cube. Its free joint is the Task IR's randomization target.
+[[body]]
+name = "cube"
+pos = [0.24, 0.0, 0.02]
+joint = { kind = "free", name = "cube_free" }
+inertial = { mass = 0.05, diaginertia = [9.2708e-06, 9.2708e-06, 5.2083e-06] }
+
+[[body.geom]]
+name = "cube_geom"
+shape = { box = [0.0125, 0.0125, 0.02] }
+condim = 3
+friction = [1.0, 0.03, 0.003]
+rgba = [0.85, 0.2, 0.15, 1.0]
+
+# The one fixed overhead camera the Observation IR declares: identity looks along -Z.
+[[camera]]
+name = "overhead"
+pos = [0.16, 0.0, 0.5]
+fovy = 45.0
+
+# The path tracer's emitter (the geom `ceiling_light`).
+[[light]]
+name = "ceiling"
+pos = [0.16, 0.0, 0.8]
+size = [0.12, 0.12]

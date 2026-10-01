@@ -19,6 +19,9 @@ pub mod bench;
 pub mod error;
 pub mod evidence;
 pub mod gap;
+/// `es render` (packet M16/H8): one frame of a free camera, for the editor's viewport.
+#[cfg(feature = "render")]
+pub mod render;
 /// `es video showcase` (packet M5/V9): only with the `render` feature, because it is the one
 /// subcommand that opens a Vulkan device.
 #[cfg(feature = "render")]

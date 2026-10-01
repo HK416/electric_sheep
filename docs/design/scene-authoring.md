@@ -80,9 +80,16 @@ mass = 0.216
 friction = [1.0, 0.0, 0.0]
 material = "block"
 
+[[texture]]
+name = "block"
+file = "textures/block.png"
+kind = "cube"
+gridsize = [3, 4]
+gridlayout = ".U..LFRB.D.."
+
 [[material]]
 name = "block"
-texture = { file = "textures/block.png", kind = "cube", gridsize = [3, 4], gridlayout = ".U..LFRB.D.." }
+texture = "block"
 roughness = 0.6
 
 [[camera]]
@@ -100,7 +107,7 @@ intensity = 1.0
 
 [[region]]                      # a site: no collision, no mass; sentences name it
 name = "target_area"
-shape = { box = [0.1, 0.1, 0.01] }
+size = [0.1, 0.1, 0.01]
 pos = [0.25, 0.0, 0.0]
 ```
 
@@ -137,6 +144,64 @@ self-contained MJCF (cameras, lights, materials, textures, tendons, pairs, gravc
 `SceneDesc` carries) with its assets beside it. It is a full-fidelity writer in `es-assets`
 (layer 2), not `es-physics-backend`'s `mjcf_out` (which by design drops what carries no
 dynamics). URDF and USD export are later items.
+
+### 3.4 What G1 settled (the schema as built)
+
+`crates/es-assets/src/esscene/` (`EsScene::from_toml` / `to_toml`, `expand`), oracle
+`crates/es-assets/tests/esscene.rs`. Where it differs from the example above, and what the text
+above left open:
+
+- **Top level**: `kind = "scene"`, `schema = 1`, `name` (`SceneDesc::name`, hash input; absent is
+  `"scene"`), `[physics]` (every field optional, absent is MuJoCo's default; `integrator` is
+  `euler|rk4|implicit|implicitfast`), `[[geom]]` (static scenery on the world body: a table, a
+  floor, a bin). Every optional field is an `Option`, so writing back writes only what was
+  written (read ∘ write is the identity, a property test).
+- **Includes**: `name` is the include's handle in the document (a task names its robot by it);
+  the name prefix is a separate `prefix`. Absent, the file's own names **and ids** are kept (why
+  the mirror oracle holds); present, it is prepended to every name and each id is re-derived by
+  the MJCF name path scheme. The file's root bodies go under the world (no wrapper body); a
+  non-identity `pos` / `quat` is composed onto the root bodies and world-level elements. The mesh
+  and texture paths the file names are re-based onto the document's directory. The file's
+  `<option>` and model name are not read (the scene's are the document's `[physics]` and
+  `name`). `[include.set.joint.<name>]` (`range`, `damping`, `armature`, `stiffness`,
+  `frictionloss`), `[include.set.actuator.<name>]` (`kp`, `kv`, `ctrlrange`, `forcerange`),
+  `[include.set.geom.<name>]` (`rgba`, `material` — the file's material or the document's); an
+  unknown target is refused by field. MJCF, URDF and glTF are read; **USD is refused**: `es-usd`
+  is a layer-2 sibling and yields a stage, not a `SceneDesc` (a USD include is a later item).
+- **Bodies**: `parent` names a body defined before (an included one too), absent is the world.
+  `joint = { kind, name, axis, pos, range, damping, armature, stiffness, frictionloss, springref }`
+  — `kind` is `fixed|free|ball|hinge|slide` (`fixed` and absent weld, emitting no joint, as in
+  MJCF), `name` absent is the body's name. `inertial = { mass, pos, quat, diaginertia |
+  fullinertia }`, `gravcomp`. A `[[body.geom]]`'s `shape` is `{ plane | sphere | capsule |
+  cylinder | box | ellipsoid = sizes }` or `{ mesh = "file" }` (the asset is named by the file's
+  stem); an unnamed geom is `geom<n>`, as in MJCF.
+- **Textures are named `[[texture]]`s** and a material names one per slot (`texture`, `orm`,
+  `metallic_map`, `roughness_map`, `normal_map`, `emissive_map`): one texture is shared by two
+  materials (the Shadow Hand's cube and goal), so it cannot be inline. As in MJCF, a material
+  that writes only `rgba` is a name, not a drawn material.
+- **Cameras**: `fovy` in degrees (MJCF's conversion), absent `parent` is fixed to the world.
+- **Lights**: what today's renderer takes — a thin emissive box on the world named
+  `<name>_light` (`size` the x / y half-extents, half thickness 0.005 m,
+  `rgba = [rgb × intensity, 1]`, no collision). `kind` is `area`, the one kind today.
+- **Regions** are sites; `SceneDesc::Site` has no shape, so a region has a `size` (half-extents),
+  not a `shape`.
+- **Quaternion bits**: a quaternion already canonical (unit within 1e-12, `w ≥ 0`) is stored as
+  written, bit for bit; anything else is normalised by `Quat::normalize`. The editor writes
+  `SceneDesc`'s bits back, so a round trip moves none.
+- **Order**: the world body, the includes in turn, then the document's own entities — world geoms
+  and lights, textures and materials, bodies, cameras, regions — each in document order. The
+  mirror oracles (SO-101, Shadow Hand) check every value and order of the `SceneDesc`, the
+  `scene_hash` (the digest the committed documents carry) and the asset content hashes. The one
+  list compared as a set is `assets`: the Shadow Hand file interleaves the cube's texture and
+  materials with the hand's while an include's assets come before the document's, and nothing
+  reads that order (`scene_hash` sorts it, the loaders and the renderer look up by id). The
+  Shadow Hand's floor stays in the hand file: its empty `floor0` body precedes the hand in
+  MuJoCo's body order. Asset paths are hash input, so the Shadow Hand document sits beside the
+  source file (`tests/fixtures/mjcf/shadow_hand/`).
+- `SceneRef.asset_hash` (in the committed documents, blake3 of the scene *file*'s bytes, M11's open
+  decision) necessarily differs for a different file; what is equal is the `SceneDesc`'s per-asset
+  hashes. What it holds for an `.esscene` (whether it also covers the included files) is G3's to
+  decide when it generates documents.
 
 ## 4. The task specification (`*.estask`) and `es project generate`
 

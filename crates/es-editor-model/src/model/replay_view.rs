@@ -15,6 +15,8 @@ use es_env::traj::Trajectory;
 use es_render::raster::{project_scene, Camera, Projected, RasterError};
 use es_render::TriScene;
 
+use crate::model::viewport::Shot;
+
 /// Everything that stops a replay from opening, each naming its file.
 #[derive(Debug)]
 pub enum ReplayError {
@@ -72,6 +74,8 @@ pub fn panel_height(replay: Option<&ReplayView>, available: f32) -> Option<f32> 
 /// An opened scene + trajectory, and where playback is in it.
 #[derive(Debug)]
 pub struct ReplayView {
+    /// The two files it was opened from, which the path tracer's `es render` reads again.
+    paths: (std::path::PathBuf, std::path::PathBuf),
     scene: SceneDesc,
     traj: Trajectory,
     pub playing: bool,
@@ -93,6 +97,7 @@ impl ReplayView {
             message: e.to_string(),
         })?;
         let view = Self {
+            paths: (scene_path.to_path_buf(), traj_path.to_path_buf()),
             scene,
             traj,
             playing: false,
@@ -135,6 +140,16 @@ impl ReplayView {
             path: self.scene.name.clone(),
             message: e.to_string(),
         })
+    }
+
+    /// The shown tick from `camera`, for the slower looks (packet M16/H8).
+    pub fn shot(&self, camera: &Camera) -> Shot {
+        Shot {
+            scene: self.paths.0.clone(),
+            traj: Some(self.paths.1.clone()),
+            tick: self.tick,
+            camera: *camera,
+        }
     }
 
     /// `tick` seen from `camera`, back to front. A pure function of (trajectory, camera):
