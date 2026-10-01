@@ -293,7 +293,8 @@ shaping = ["orientation", "distance"]
   `SceneRef.path`에 들어간다. `asset_hash`는 어떤 종류든 장면 파일 바이트의 blake3이다.
   `.esscene`도 마찬가지다(인클루드가 가져오는 것은 `SceneDesc`와 자산별 내용 해시를 거쳐
   `scene_hash`에 들어 있다). `robot`은 로봇의 **루트 바디** 이름이지 인클루드 핸들이 아니다
-  (인클루드에는 루트가 여럿일 수 있다: Shadow Hand 파일의 `floor0`). 그 하위 트리의 관절이
+  (인클루드에는 루트가 여럿일 수 있다: Shadow Hand 파일의 `floor0`. G3b부터는 핸들도 받는다,
+  4.5절). 그 하위 트리의 관절이
   `robot.joints`이고, 장면의 액추에이터 전부가 그 행동이다(`JointPosition`, 과제당 로봇 하나).
   `timeout_s × control_hz`는 정수여야 한다: 그것이 `max_episode_steps`이고,
   `리셋 이후 시간 ≥ timeout_s`가 `Timeout` 노드다.
@@ -360,9 +361,14 @@ shaping = ["orientation", "distance"]
   Task IR에서는 `ObservationSpec` 하나이고, 나눔은 G3b가 읽는다.
 - **libm에서 오는 수**: `within_deg`의 코사인, 카메라 초점 거리, `tilt_max_deg`의 `m`은
   대체하는 생성기들처럼 호스트의 `cos` / `tan`을 쓴다(앞의 둘은 이 PC에서 커밋된 문서와
-  일치한다).
-  올바르게 반올림하는 구현이면 생성된 문서가 호스트에 무관해진다(M10의 `scene_hash` 교훈) —
-  열린 항목.
+  일치한다). **소유자 결정(오케스트레이터, G3b, 2026-10-01): 호스트 호출을 그대로 두므로, 생성된
+  문서는 이 비트들에서 플랫폼마다 다를 수 있다.** 이 PC에서 잰 것: `es_math::approx::sin_cos_f64`
+  (`libm` 크레이트, musl)는 0.05 rad의 코사인을 호스트와 같게 주지만, `tan`을 sin / cos로 구하면
+  45° 카메라의 초점 거리가 한 ULP 움직이고(`115.88225099390856`, 커밋된 값은 `…857`), 그와 함께
+  두 기준 `task_hash`가 모두 움직인다. musl 자체의 `tan`(`libm::tan`)은 시험한 모든 화각(30°–90°,
+  커밋된 45°와 70° 포함)에서 호스트와 같은 비트를 주었으므로, 그 위에 세 줄짜리
+  `es_math::approx::tan_f64`를 두면 커밋된 해시를 하나도 움직이지 않고 문서가 호스트에 무관해진다
+  — 소유자가 다룰 일이다.
 
 ### 4.4 G3c가 정한 세부 (3축 관계)
 
@@ -410,6 +416,63 @@ shaping = ["orientation", "distance"]
   `z_subject − z_object > m`, below는 `z_object − z_subject > m`.
 - `object`는 `range`(`inside`), `value`(`above` / `below`), `point`(`near`, `farther_than`)와
   함께 쓸 수 없다: "either `object` or …", 절을 짚어서.
+
+### 4.5 G3b가 정한 세부 (`es project generate`)
+
+`crates/es-script/src/spec/`의 `generate(spec, root, out, source)`(`generate.rs`, `learning.rs`,
+`recipes.rs`, 섹션은 `project.rs`, `robot.rs`)와 동사
+`es project generate --spec <x.estask> --out <dir> [--scene <s>]`(경로는 현재 디렉터리, 곧
+프로젝트 루트 기준이고, `--out`은 주어진 그대로 사이클에 적힌다). 오라클은
+`crates/es-script/tests/estask_generate.rs`(해시, 결정성, 거부)와 `crates/es/tests/project.rs`(각
+팔에 `es ir check`와 `es policy init`, 레시피와 사이클의 dry-run). 명세에 선택 섹션 다섯 개가
+붙는다. 모든 기본값은 커밋된 두 세트의 값이므로, 과제가 그것들과 다른 곳에만 필드를 쓴다. 모든
+문서는 검증되고, 각 팔은 무엇이든 쓰기 전에 교차 IR 검사를 통과한다.
+
+- **`[teacher]`**(없으면 교사도 없다): `state`는 상태 벡터 순서대로 놓인 채널들이다(`[observe]
+  state`와 `privileged` 어느 쪽이든. 없으면 `state` 전부, 이어서 `privileged` 전부). `training`은
+  `training.toml`의 어느 부분이든 되며 PPO 프리셋(플랜 H의 `training-teacher-v2.toml`) 위에
+  병합된다(모르는 키는 `Recipe`가 이름으로 거부한다). 문서: 플랜 H의 상태 MLP(ELU
+  `[512, 256] → 128`, `tanh` 헤드, 틱마다 한 행, ctrlrange 역정규화, 마감은 정수 ms로 된 제어
+  주기 하나), 그 배포(horizon 1), 그 평가(공칭 스위트).
+- **`[student]`**: `name`(팔 이름: `observation-<name>.toml`, …. 없으면 `student`), `views`
+  (`[observe] cameras`에서. 없으면 전부), `state`(`[observe] state` 채널만 — 특권 채널은 거부),
+  `family`(`act`는 플랜 N의 뷰마다 ResNet18을 두고 `Concat`으로, `mad`는 뷰들이 첫 인코더를 함께
+  쓰고 더해지며 프리셋에 단일 뷰 손실이 들어 있다), `preset` — 커밋된 두 학생 사이에서 다를 뿐
+  다른 뜻은 없는 관례: `h3`(기본, 플랜 H의 것: `tanh` 헤드와 ctrlrange 역정규화, H6의 불변식.
+  상태는 이어 붙여 표준화한 `state` 입력 하나. 모든 뷰는 카메라 이름의 포트로 융합) 또는 `u3`
+  (SO-101 데모의 것: 행이 곧 목표인 무한 헤드. 상태 채널 하나를 제 이름으로 `[-1, 1]`로. 첫 뷰는
+  `image` 포트로) — `horizon`과 `execute`(필수. `control_hz / execute`는 정수, XIR-023), 그리고
+  ACT 프리셋(플랜 N의 `training-views.toml`)이나 MAD 프리셋(`training-mad.toml`) 위의
+  `training`.
+- **관측**: 뷰마다 Task IR 채널의 `ImageSpec` 위에 플랜 U의 사슬(`Dequantize`,
+  `Normalize [0, 1]`, `Pad 4`, `Crop Random`, 학습 때만 `ColorJitter 0.2 / 0.2`). 상태 통계는
+  장면과 절에서 온다: 관절 위치는 그 범위로, 관절 속도는 5 rad/s로, 이전 행동은 ctrlrange로,
+  바디 위치는 그것을 한 점에서 재는 거리 절로(그 점, 그 반경: 떨어짐 반경) 아니면 장면 위치
+  ± 1 m로, 쿼터니언은 그대로, 속도는 1 m/s와 5 rad/s로.
+- **`[deploy]`**: `name`과 `workspace`(없으면 `robot`, 루트 바디 ± 1 m). 포락선은 장면의 것이다 —
+  각 ctrlrange와 forcerange, 플랜 H의 속도 규칙(속도 `2 w hz`, 가속도 `4 w hz²`, 차분 `2 w` /
+  `4 w`) — 제어 주기는 장면의 timestep을 정수 나노초로 둔 것을 데시메이션으로 정확히 나눈 것이고,
+  추론 주기는 그것을 다시 `execute`로 나눈 것이다.
+- **`[evaluate]`**: `first_seed`, `episodes`, `success_rate`(없으면 101, 16, 0.5). 학생의 평가는
+  플랜 U의 섭동 스위트 다섯 개(지연은 정수 ms로 된 제어 주기 하나와 둘)를 더하고 `-nominal`
+  형제가 있다. 교사의 평가는 공칭 스위트다.
+- **`[cycle]`**: `runs`(없으면 `runs`), `expert`(없으면 학습된 교사 `<runs>/teacher.esb`),
+  `episodes`, `seed`, `success_only`, `nominal_only`, `jobs`, `preview`(없으면 켬), `showcase`.
+  레시피의 경로는 `runs`에서 나온다 — `<runs>/teacher-untrained.esb`,
+  `<runs>/<name>-untrained.esb`, 데이터셋 `<runs>/<name>-001/collect[/successes]/{ds,frames}` —
+  그리고 전문가의 수집은 학생 번들(그 Task IR) 아래 기록된다. 레시피마다 머리말에 문서에서 번들을
+  만드는 `es policy init` 줄이 있다. 동사가 번들을 직접 만들지는 않는다.
+- **`robot`**은 `.esscene` 인클루드를 가리켜도 된다(오케스트레이터, 2026-10-01): 하위 트리에 관절이
+  있는 루트 바디 하나(`hand` → `floor0`을 지나 `robot0:hand mount`). 여럿이면 거부한다.
+- **재현된 것**(IR 문서는 의미 해시로, 레시피와 사이클은 파싱한 `Recipe` / `Cycle`로):
+  `tests/fixtures/shadow-hand/`의 모든 문서(`evaluation-teacher.toml`은 `episodes = 16`에서,
+  `-64`는 명세의 64에서), SO-101의 세 뷰 팔(`*-views.toml`), 한 뷰 팔(`views = ["overhead"]`,
+  `*-cam.toml`), MAD 세트(`family = "mad"`, `learning-`, `evaluation-`, `training-`,
+  `cycle-mad.toml`). IR 문서 스무 개 중 열두 개는 바이트까지 같다. 나머지는 노드 번호를 다른
+  순서로 붙였다. 커밋된 실행이 쓴 경로 가운데 규칙이 주지 않는 것은 두 명세의 덮어쓰기다
+  (`teacher-untrained-v2.esb`, 플랜 N의 `runs/collect-001/`). **재현하지 않은 것**:
+  `visible-learning/deployment.toml`, 장면의 범위가 주지 않는 손으로 맞춘 포락선(3 rad/s,
+  80 rad/s², 0.05 rad 소프트 여유). SO-101 명세는 플랜 H의 규칙을 받는다.
 
 ## 5. 에디터 (①과 ②)
 

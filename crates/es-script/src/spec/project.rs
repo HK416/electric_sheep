@@ -110,8 +110,8 @@ pub struct BoxDoc {
 }
 
 /// `[evaluate]`: held-out seeds and the acceptance. The teacher is judged on the nominal suite;
-/// the student on every suite that applies (light only with cameras, then delay, torque noise,
-/// backlash) and, in its `-nominal` sibling, on the nominal one.
+/// the student on plan U's six (nominal, light intensity and direction, observation delay,
+/// torque noise, backlash) and, in its `-nominal` sibling, on the nominal one.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Evaluate {

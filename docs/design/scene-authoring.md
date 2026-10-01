@@ -307,7 +307,8 @@ appended at 31–33). Where it differs from the example above, and what the text
   into `SceneRef.path` as written; `asset_hash` is blake3 of the scene file's bytes for every
   kind, an `.esscene` too (what an include brings is in `scene_hash` through the `SceneDesc` and
   its per-asset content hashes). `robot` names the robot's **root body**, not an include handle
-  (an include can have several roots: the Shadow Hand file's `floor0`); its subtree's joints are
+  (an include can have several roots: the Shadow Hand file's `floor0`; G3b also takes the handle,
+  section 4.5); its subtree's joints are
   `robot.joints`, and every actuator of the scene is its action (`JointPosition`, one robot per
   task). `timeout_s × control_hz` must be whole: it is `max_episode_steps`, and
   `time since reset ≥ timeout_s` is the `Timeout` node.
@@ -376,8 +377,14 @@ appended at 31–33). Where it differs from the example above, and what the text
   (the teacher's extra inputs) are one `ObservationSpec` in the Task IR; G3b reads the split.
 - **Numbers from libm**: `within_deg`'s cosine, a camera's focal length and `tilt_max_deg`'s `m`
   use the host's `cos` / `tan`, as the generators this replaces did (the first two agree with the
-  committed documents on this PC). A correctly rounded implementation would make a generated document
-  host-independent (M10's `scene_hash` lesson) — open.
+  committed documents on this PC). **Owner decision (orchestrator, G3b, 2026-10-01): the host call
+  stays, so generated documents may differ across platforms in these bits.** Measured on this PC:
+  `es_math::approx::sin_cos_f64` (the `libm` crate, musl) gives the host's cosine of 0.05 rad, but
+  `tan` as sin / cos moves the 45° cameras' focal length by one ULP (`115.88225099390856` against
+  the committed `…857`), and with it both reference `task_hash`es. musl's own `tan` (`libm::tan`)
+  gave the host's bits at every field of view probed (30°–90°, the committed 45° and 70° among
+  them), so a three-line `es_math::approx::tan_f64` over it would make the documents
+  host-independent without moving a committed hash — the owner's to take up.
 
 ### 4.4 What G3c settled (three-axis relations)
 
@@ -427,6 +434,69 @@ every committed document lowers to the same `Expr` as before.
   `z_subject − z_object > m`, below `z_object − z_subject > m`.
 - `object` excludes `range` (`inside`), `value` (`above` / `below`) and `point` (`near`,
   `farther_than`): "either `object` or …", naming the clause.
+
+### 4.5 What G3b settled (`es project generate`)
+
+`generate(spec, root, out, source)` in `crates/es-script/src/spec/` (`generate.rs`,
+`learning.rs`, `recipes.rs`, the sections in `project.rs`, `robot.rs`) and the verb
+`es project generate --spec <x.estask> --out <dir> [--scene <s>]` (paths relative to the
+current directory, the project root; `--out` is written into the cycle as given). Oracles
+`crates/es-script/tests/estask_generate.rs` (hashes, determinism, refusals) and
+`crates/es/tests/project.rs` (`es ir check` and `es policy init` on each arm, the recipes and
+the cycle dry-run). The spec gains five optional sections; every default is a value of the two
+committed sets, so a field is written only where a task differs from them. Every document is
+validated and each arm passes the cross-IR check before anything is written.
+
+- **`[teacher]`** (absent: no teacher): `state`, its channels in the state vector's order (any of
+  `[observe] state` and `privileged`; absent, every `state` then every `privileged` one) and
+  `training`, any part of a `training.toml` merged over the PPO preset (plan H's
+  `training-teacher-v2.toml`; `Recipe` refuses an unknown key by name). Documents: plan H's state
+  MLP (ELU `[512, 256] → 128`, `tanh` head, one row per tick, the ctrlrange unnormalizer, the
+  deadline one control period in whole ms), its deployment (horizon 1) and its evaluation (the
+  nominal suite).
+- **`[student]`**: `name` (the arm: `observation-<name>.toml`, …; absent `student`), `views`
+  (from `[observe] cameras`; absent all), `state` (`[observe] state` channels only — a privileged
+  one is refused), `family` (`act`, plan N's ResNet18 per view into a `Concat`; `mad`, the views
+  sharing the first encoder and summed, with the single-view loss in its preset), `preset` — the
+  conventions that differ between the two committed students and mean nothing else: `h3` (default,
+  plan H's: `tanh` head and the ctrlrange unnormalizer, H6's invariant; the state concatenated and
+  standardized as one `state` input; every view fused on a port named by its camera) or `u3` (the
+  SO-101 demos': an unbounded head whose rows are the targets; one state channel under its own name
+  as `[-1, 1]`; the first view on port `image`) — `horizon` and `execute` (required;
+  `control_hz / execute` whole, XIR-023), and `training` over the ACT preset (plan N's
+  `training-views.toml`) or MAD's (`training-mad.toml`).
+- **Observation**: each view is plan U's chain (`Dequantize`, `Normalize [0, 1]`, `Pad 4`,
+  `Crop Random`, `ColorJitter 0.2 / 0.2` training only) on the Task IR channel's `ImageSpec`. The
+  state statistics come from the scene and the clauses: a joint position by its range, a joint
+  velocity by 5 rad/s, the previous action by the ctrlrange, a body's position by the distance
+  clause that measures it from a point (that point, that radius: the drop radius) or else its scene
+  position ± 1 m, a quaternion as it is, a velocity by 1 m/s and 5 rad/s.
+- **`[deploy]`**: `name` and `workspace` (absent: `robot`, the root body ± 1 m). The envelope is
+  the scene's — each ctrlrange and forcerange, plan H's rate rule (velocity `2 w hz`, acceleration
+  `4 w hz²`, differences `2 w` / `4 w`) — at a control rate that is the scene's timestep in whole
+  nanoseconds over the decimation, exactly, and an inference rate that over `execute`.
+- **`[evaluate]`**: `first_seed`, `episodes`, `success_rate` (absent 101, 16, 0.5). The student's
+  adds plan U's five perturbation suites (the delay one and two control periods in whole ms) and
+  has a `-nominal` sibling; the teacher's is the nominal suite.
+- **`[cycle]`**: `runs` (absent `runs`), `expert` (absent: the trained teacher,
+  `<runs>/teacher.esb`), `episodes`, `seed`, `success_only`, `nominal_only`, `jobs`, `preview`
+  (absent on), `showcase`. The recipes' paths derive from `runs` — `<runs>/teacher-untrained.esb`,
+  `<runs>/<name>-untrained.esb`, the dataset `<runs>/<name>-001/collect[/successes]/{ds,frames}` —
+  and an expert's collection is recorded under the student's bundle (its Task IR). Each recipe's
+  header carries the `es policy init` line that builds its bundle from the documents; the verb
+  does not build bundles itself.
+- **`robot`** may name an `.esscene` include (the orchestrator, 2026-10-01): its one root body
+  whose subtree has joints (`hand` → `robot0:hand mount`, past `floor0`); several are refused.
+- **Reproduced** (IR documents by their semantic hash, recipes and cycles as the parsed
+  `Recipe` / `Cycle`): every document of `tests/fixtures/shadow-hand/` (`evaluation-teacher.toml`
+  at `episodes = 16`, `-64` at the spec's 64), the SO-101 three-view arm (`*-views.toml`), its
+  one-view arm (`views = ["overhead"]`, `*-cam.toml`) and its MAD set (`family = "mad"`,
+  `learning-`, `evaluation-`, `training-`, `cycle-mad.toml`). Twelve of the twenty IR documents
+  are byte-equal too; the rest number their nodes in another order. The paths the committed runs
+  used that the rule does not give are overrides in the two specs (`teacher-untrained-v2.esb`,
+  plan N's `runs/collect-001/`). **Not reproduced**: `visible-learning/deployment.toml`, a
+  hand-tuned envelope (3 rad/s, 80 rad/s², a 0.05 rad soft margin) the scene's ranges do not
+  give; the SO-101 spec gets plan H's rule.
 
 ## 5. The editor (① and ②)
 
