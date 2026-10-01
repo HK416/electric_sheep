@@ -456,7 +456,7 @@ switched to ⑤ by itself when the cycle ended.
   - **How it was built:** `--edit-demo authored`, then the cameras and clauses written as the
     sentence editor writes them, then `es project generate`.
 - **Teacher:** the generated PPO recipe on `mjwarp` (2,048 envs, 3,000 iterations) took 47 min,
-  0.84 s per iteration. Its last training success rate was 0.99. Checkpoint 2000, repacked on the
+  0.95 s per iteration (0.84 s collecting, 0.11 s updating). Its last training success rate was 0.99. Checkpoint 2000, repacked on the
   regenerated documents, scored 16/16 on `mujoco-cpu`'s nominal suite (mean 29 control steps).
 - **Cycle** (③'s recipe as `project::write_run` writes it; medium length):
   - **Collect:** the teacher demonstrated 200 episodes in 12 min, two PT cameras each. 187
