@@ -30,7 +30,7 @@ use crate::model::project::{
 };
 use crate::model::results::{self, Again};
 use crate::model::telemetry_view::{self, Closed, Event, SeriesKey, Source, TelemetryModel};
-use crate::model::template::{self, Length, Template};
+use crate::model::template::{self, Length, Method, Template};
 use crate::model::train_view::STREAM_TRAIN;
 use crate::model::workflow::{
     self, Child, LiveFacts, Phase, PhaseState, RunFacts, EVALUATE_STAGES, TRAIN_STAGES,
@@ -631,6 +631,9 @@ pub struct Watch {
     /// changes.
     previews: Vec<Preview>,
     heard_previews: Vec<Preview>,
+    /// `method = "teacher"`: the project's `teacher.esb`, which every run collects with (packet
+    /// M16/H7). `None` for a template taught any other way.
+    teacher: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for Watch {
@@ -671,7 +674,6 @@ impl Watch {
             },
             again: None,
             demonstrations: run.as_ref().and_then(demonstrations_of).unwrap_or(0),
-            source,
             run,
             ours: false,
             queued: None,
@@ -686,6 +688,22 @@ impl Watch {
             evaluate: disk[3].clone(),
             previews,
             heard_previews: Vec::new(),
+            teacher: (source.as_ref().ok())
+                .filter(|(t, _)| t.method == Method::Teacher)
+                .map(|_| project.teacher_bundle()),
+            source,
+        }
+    }
+
+    /// No teacher is chosen yet for a project that needs one.
+    fn no_teacher(&self) -> bool {
+        self.teacher.as_ref().is_some_and(|p| !p.is_file())
+    }
+
+    /// ② is what is left to do while a project that needs a teacher has none (packet M16/H7).
+    pub fn gate(&self, phases: &mut [PhaseState; 5]) {
+        if self.no_teacher() && phases[1] == PhaseState::Done {
+            phases[1] = PhaseState::NotStarted;
         }
     }
 
@@ -777,6 +795,7 @@ impl Watch {
         let report = self.facts.as_ref().is_some_and(|f| f.report);
         self.ended = ending(child, self.failed.as_ref(), report);
         settle(&mut phases, self.ended);
+        self.gate(&mut phases);
         tick.done = just_done(&self.evaluate, &phases, at);
         self.evaluate = phases[3].clone();
         (tick, phases)
@@ -861,6 +880,7 @@ impl Watch {
         let running = launch.pid().is_some();
         let checking = matches!(self.dial, Dial::Dialling(_));
         let free = self.source.is_ok()
+            && !self.no_teacher()
             && !checking
             && may_start(launch.pid(), self.queued.is_some(), phases);
         let resume = phases[2..4].iter().find_map(|p| match p {
@@ -906,7 +926,8 @@ impl Watch {
                 && phases[2..4]
                     .iter()
                     .any(|p| matches!(p, PhaseState::Interrupted { .. })),
-            cannot_start: self.source.as_ref().err().copied(),
+            cannot_start: (self.source.as_ref().err().copied())
+                .or_else(|| self.no_teacher().then_some("watch.no_teacher")),
             previews: if phase == Phase::Train {
                 self.previews.clone()
             } else {
@@ -1133,6 +1154,49 @@ mod tests {
 
     /// Review focus 2: Start pressed while a child runs, or pressed twice before the child is
     /// up, makes no run folder - one child, one run directory.
+    #[test]
+    fn a_hand_project_starts_once_a_teacher_is_chosen() {
+        let p = crate::model::teacher::tests::hand_project("watch");
+        let mut watch = Watch::new(&p, Some(repo()));
+        let mut launch = LaunchModel::default();
+        let telemetry = TelemetryModel::default();
+        let now = Instant::now();
+        let (_, phases) = watch.tick(&mut launch, &telemetry, Phase::Teach, now);
+        assert_eq!(phases[1], NotStarted, "② is what is left");
+        assert_eq!(layout::start_phase(&phases), Phase::Teach);
+        let view = watch.view(Phase::Train, &launch, &telemetry, &phases, now);
+        assert_eq!(
+            (view.cannot_start, view.start),
+            (Some("watch.no_teacher"), None)
+        );
+        assert!(project::write_run(
+            &crate::model::teacher::tests::hand(),
+            &repo(),
+            &p,
+            settings(),
+            &p.next_run_dir(),
+            "127.0.0.1:7011"
+        )
+        .is_err());
+
+        // A chosen teacher: ② is done, Start is offered and the run collects with it.
+        std::fs::write(p.teacher_bundle(), "esb").unwrap();
+        let (_, phases) = watch.tick(&mut launch, &telemetry, Phase::Teach, now);
+        assert_eq!(phases[1], Done);
+        let view = watch.view(Phase::Train, &launch, &telemetry, &phases, now);
+        assert_eq!((view.cannot_start, view.start), (None, Some("watch.start")));
+        watch.settings = settings();
+        assert_eq!(watch.start(&p, None, &phases), Ok(true));
+        let run = watch.run.clone().expect("the run");
+        let cycle = Cycle::parse(&std::fs::read_to_string(run.path.join(RUN_RECIPE)).unwrap())
+            .expect("the recipe");
+        let collect = cycle.collect.expect("[collect]");
+        assert_eq!(collect.policy, p.teacher_bundle().display().to_string());
+        assert_eq!(collect.expert, None);
+        assert!(collect.success_only);
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
     #[test]
     fn start_while_running_makes_no_run_folder() {
         assert!(may_start(None, false, &fresh()));

@@ -16,9 +16,7 @@ use es_render::raster::{Camera, BACKGROUND};
 use crate::model::i18n::{t, Lang};
 use crate::model::replay_view::ReplayView;
 use crate::model::results::{self, View};
-use crate::ui::advanced::{
-    paint_timeline, replay_canvas, rgb_texture, REPLAY_RATE_HZ, SHOWCASE_CAMERA,
-};
+use crate::ui::advanced::{paint_timeline, replay_canvas, rgb_texture, REPLAY_RATE_HZ};
 
 /// One attempt, playing.
 pub(crate) struct Player {
@@ -57,7 +55,7 @@ impl Player {
             replay,
             note,
             index: 0,
-            camera: SHOWCASE_CAMERA,
+            camera: crate::model::scene_view::camera_for(scene),
             picture: None,
             eye: None,
         }

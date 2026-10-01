@@ -6,6 +6,10 @@
 //!   untrained.esb     the collect bundle, from the template's `[bundle]` documents
 //!   teach.toml        the demonstration program, a copy of the template's (packet M14/Q3)
 //!   try/001/          one try of it from ② Teach: `es eval run --expert` on one seed
+//!   teacher/001/      `method = "teacher"` (packet M16/H7): what `es train --out` writes, plus
+//!     recipe.toml     the teacher recipe it ran, and `eval/<step>/`, each checkpoint judged
+//!   teacher.esb       the chosen teacher, `[collect] policy` of every run; `teacher.toml`
+//!                     says which run and step it is
 //!   runs/001/         exactly what `es loop cycle --out runs/001` writes, plus
 //!     cycle.toml      the recipe this run used, written just before launch
 //!     telemetry.txt   the live address, so a re-opened editor can attach again
@@ -24,7 +28,7 @@ use es_ir::serial::evaluation_from_toml;
 use serde::{Deserialize, Serialize};
 
 use crate::model::results::Again;
-use crate::model::template::{Length, Template};
+use crate::model::template::{Length, Method, Template};
 
 pub const PROJECT_FILE: &str = "project.toml";
 pub const RUNS_DIR: &str = "runs";
@@ -35,6 +39,8 @@ pub const COLLECT_BUNDLE: &str = "untrained.esb";
 /// completeness test would read as a typo.
 pub const TEACH_FILE: &str = concat!("teach", ".toml");
 pub const TRY_DIR: &str = "try";
+pub const TEACHER_DIR: &str = "teacher";
+pub const TEACHER_BUNDLE: &str = "teacher.esb";
 
 const KIND: &str = "project";
 
@@ -175,6 +181,21 @@ impl Project {
     /// `try/NNN`, ascending: ②'s tries of the program, numbered as runs are.
     pub fn tries(&self) -> Vec<RunFolder> {
         self.numbered(TRY_DIR)
+    }
+
+    /// `teacher/NNN`, ascending: ②'s teacher runs (packet M16/H7).
+    pub fn teacher_runs(&self) -> Vec<RunFolder> {
+        self.numbered(TEACHER_DIR)
+    }
+
+    /// As [`Self::next_run_dir`], under `teacher/`.
+    pub fn next_teacher_dir(&self) -> PathBuf {
+        self.next_in(TEACHER_DIR)
+    }
+
+    /// The chosen teacher, `[collect] policy` of a `method = "teacher"` project's runs.
+    pub fn teacher_bundle(&self) -> PathBuf {
+        self.root.join(TEACHER_BUNDLE)
     }
 
     fn numbered(&self, dir: &str) -> Vec<RunFolder> {
@@ -414,8 +435,23 @@ fn run_cycle(
     })?;
     collect.episodes = settings.demonstrations;
     collect.policy = bundle;
-    if project.teach().is_file() {
-        collect.expert = Some(arg(&project.teach()));
+    match template.method {
+        Method::Blocks if project.teach().is_file() => {
+            collect.expert = Some(arg(&project.teach()));
+        }
+        Method::Blocks => {}
+        // Packet M16/H7: the chosen teacher demonstrates; there is no program to run.
+        Method::Teacher => {
+            let teacher = project.teacher_bundle();
+            if !teacher.is_file() {
+                return Err(err(
+                    &teacher,
+                    "no teacher is chosen yet; choose one in step 2",
+                ));
+            }
+            collect.policy = arg(&teacher);
+            collect.expert = None;
+        }
     }
     Ok((cycle, cycle_path))
 }
@@ -472,7 +508,7 @@ pub(crate) mod tests {
         find_root(Some(Path::new(env!("CARGO_MANIFEST_DIR")))).expect("a checkout")
     }
 
-    fn template(id: &str) -> Template {
+    pub(crate) fn template(id: &str) -> Template {
         let (ok, bad) = load(&repo());
         assert!(bad.is_empty(), "{bad:?}");
         ok.into_iter().find(|t| t.id == id).expect(id)

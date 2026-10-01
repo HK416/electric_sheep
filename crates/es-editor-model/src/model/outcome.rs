@@ -34,6 +34,7 @@ use es_core::StableId;
 use es_env::traj::Trajectory;
 use es_eval::episodes::EpisodeRow;
 use es_eval::run_dir::RunDir;
+use es_math::Quat;
 use es_render::TriScene;
 
 use crate::model::replay_view::load_scene;
@@ -215,6 +216,44 @@ pub fn outcomes(
         .filter_map(|r| {
             let traj = Trajectory::read(&run.traj_path(&r.cell)).ok()?;
             Some((r.cell.clone(), judge.classify(&traj)?))
+        })
+        .collect()
+}
+
+/// The rotation between two orientations, in degrees: `2 acos |a . b|` (a quaternion and its
+/// negation are one orientation).
+pub fn angle_deg(a: Quat, b: Quat) -> f64 {
+    let dot = (a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w)
+        .abs()
+        .min(1.0);
+    2.0 * dot.acos().to_degrees()
+}
+
+/// A reorientation (`[outcome] kind = "reorient"`, packet M16/H7): each timed-out attempt's
+/// final angle off the goal, in degrees, by cell - the rotation between the `object` and the
+/// `target` bodies' orientations at the last tick of its trajectory. What the success predicate
+/// (`|q_cube . q_goal| >= cos(angle / 2)`) still missed when time ran out. Empty when the scene or
+/// either body cannot be found; an attempt without a readable trajectory has no angle.
+pub fn final_angles(
+    scene: &Path,
+    spec: &OutcomeSpec,
+    rows: &[EpisodeRow],
+    run: &RunDir,
+) -> BTreeMap<String, f64> {
+    let Ok(scene) = load_scene(scene) else {
+        return BTreeMap::new();
+    };
+    let id = |name: &str| (scene.bodies.iter()).find(|b| b.name == name).map(|b| b.id);
+    let (Some(object), Some(target)) = (id(&spec.object), id(&spec.target)) else {
+        return BTreeMap::new();
+    };
+    rows.iter()
+        .filter(|r| r.termination == TIMEOUT)
+        .filter_map(|r| {
+            let traj = Trajectory::read(&run.traj_path(&r.cell)).ok()?;
+            let poses = traj.poses(traj.ticks().checked_sub(1)?);
+            let (o, t) = (poses.get(&object)?, poses.get(&target)?);
+            Some((r.cell.clone(), angle_deg(o.orientation, t.orientation)))
         })
         .collect()
 }
@@ -412,6 +451,56 @@ mod tests {
         // What the editor said before the release condition.
         let before = Judge { release: None, ..j };
         assert_eq!(before.classify(&traj), Some(Outcome::InsideTooLate));
+    }
+
+    /// Packet M16/H7: the angle between two orientations, either sign of a quaternion.
+    #[test]
+    fn the_angle_between_orientations() {
+        let q = |deg: f64| {
+            let h = deg.to_radians() / 2.0;
+            Quat {
+                x: 0.0,
+                y: 0.0,
+                z: h.sin(),
+                w: h.cos(),
+            }
+        };
+        assert!(angle_deg(q(0.0), q(0.0)).abs() < 1e-9);
+        assert!((angle_deg(q(10.0), q(40.0)) - 30.0).abs() < 1e-9);
+        let minus = Quat {
+            x: -0.0,
+            y: -0.0,
+            z: -q(40.0).z,
+            w: -q(40.0).w,
+        };
+        assert!((angle_deg(q(10.0), minus) - 30.0).abs() < 1e-9, "-q is q");
+        assert!((angle_deg(q(0.0), q(180.0)) - 180.0).abs() < 1e-9);
+    }
+
+    /// The student's real evaluation (plan H, E2): every timed-out attempt has an angle, and
+    /// none is under the success angle. Read from the owner's checkout, never committed.
+    #[test]
+    fn the_real_student_attempts_end_off_the_goal() {
+        const EVIDENCE: &str = "F:/Projects/electric_sheep/runs/shadow-hand/student-001/eval";
+        let dir = Path::new(EVIDENCE);
+        if !dir.join("episodes.json").is_file() {
+            eprintln!("skipped: {EVIDENCE} is not on this machine");
+            return;
+        }
+        let hand = crate::model::teacher::tests::hand();
+        let spec = hand.outcome.as_ref().expect("[outcome]");
+        let run = RunDir::open(dir).expect("the evaluation");
+        let rows = es_eval::episodes::read_episodes(dir)
+            .expect("episodes.json")
+            .expect("rows");
+        let angles = final_angles(&repo().join(&hand.scene), spec, &rows, &run);
+        let timeouts = rows.iter().filter(|r| r.termination == TIMEOUT).count();
+        assert!(timeouts > 0 && angles.len() == timeouts, "{angles:?}");
+        let success = spec.angle_rad.to_degrees();
+        assert!(
+            angles.values().all(|&a| a > success && a <= 180.0),
+            "{angles:?}"
+        );
     }
 
     /// The committed E2 fixture sweeps the arm and never touches the cube.

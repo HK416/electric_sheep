@@ -269,6 +269,10 @@ impl TabViewer for Panes<'_> {
         if crate::ui::train::draw(app, ui, *pane) {
             return;
         }
+        // ② of a project taught by a teacher policy: its runs and the chosen one (M16/H7).
+        if crate::ui::teacher::draw(app, ui, *pane) {
+            return;
+        }
         // ② draws its program's blocks, the try and the inspector (packet M14/Q4).
         if crate::ui::teach::draw(app, ui, *pane) {
             return;

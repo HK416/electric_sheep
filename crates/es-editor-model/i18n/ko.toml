@@ -345,9 +345,20 @@
 "template.cube_into_bin_hint.name" = "큐브를 통에 넣기 - 큐브 위치 알려 주기"
 "template.cube_into_bin_hint.summary" = "팔도, 큐브도, 통도 같습니다. 다만 카메라와 관절에 더해 큐브가 정확히 어디 있는지도 정책에 알려 줍니다."
 "template.cube_into_bin_hint.notice" = "연습용: 시뮬레이터가 큐브 위치까지 정책에 알려 줍니다. 실제 로봇은 알 수 없는 정보라서, 실제보다 훨씬 쉬운 문제가 됩니다."
+"template.shadow_hand.name" = "섀도 핸드 - 큐브를 목표 방향으로 돌리기"
+"template.shadow_hand.summary" = "다섯 손가락 로봇 손이 손바닥 위의 큐브를 굴려, 옆에 놓인 목표 큐브와 같은 방향이 되게 합니다. 큐브 위치를 아는 교사가 먼저 배우고, 카메라 세 대와 관절, 목표만 보는 학생이 교사의 성공한 시도를 보고 배웁니다."
+"template.shadow_hand.notice" = "실험 단계: 카메라만 보는 학생은 지금까지 64번 중 15번 성공했습니다 (교사는 64번 중 33번)."
 # 템플릿의 `[outcome]`이 물체와 목표를 부르는 이름 (패킷 M13/Z6).
 "outcome.cube" = "큐브"
 "outcome.bin" = "통"
+"outcome.goal" = "목표"
+# 방향 맞추기 작업의 시도 (작업 패킷 M16/H7).
+"outcome.dropped" = "떨어뜨림: {}가 손바닥에서 {} cm 넘게 벗어남"
+"outcome.not_aligned" = "시간 안에 {} 방향으로 돌리지 못함"
+"outcome.not_aligned_by" = "시간 초과: {}° 어긋남"
+"outcome.angles" = "시간이 다 됐을 때 큐브는 목표와 아직 {}° 어긋나 있었습니다 (중앙값, {}°~{}°). {}° 안으로 들어와야 성공입니다."
+"outcome.teacher" = "교사 {} → 학생 {}"
+"outcome.chance" = "우연히 성공하는 시도가 약 {}%입니다. 목표 방향이 큐브의 처음 방향과 {}° 안쪽으로 뽑히는 경우가 있기 때문입니다."
 
 # --- 이 PC 점검: 템플릿에 필요한 것 ---------------------------------------------------------
 "deps.python" = "Python"
@@ -356,6 +367,7 @@
 "deps.lerobot" = "LeRobot 로봇 학습 도구"
 "deps.vulkan" = "Vulkan 그래픽 드라이버"
 "deps.render" = "카메라 화면 그리기 (es에 들어 있는 기능)"
+"deps.mjwarp" = "MuJoCo Warp (GPU 물리 시뮬레이터)"
 
 # --- 단계 표시줄: 다섯 단계와 각 단계의 상태 -------------------------------------------------
 "phase.scene" = "장면"
@@ -427,6 +439,7 @@
 "watch.resume.hint" = "같은 실행 폴더에서 새 --telemetry 주소로 es loop cycle --from <단계>를 실행합니다"
 "watch.no_checkout" = "여기서는 실행을 시작할 수 없습니다. 편집기는 프로젝트 소스 사본 안에서 실행될 때만 템플릿을 찾습니다."
 "watch.no_template" = "여기서는 실행을 시작할 수 없습니다. 이 프로젝트의 템플릿({})이 없습니다."
+"watch.no_teacher" = "먼저 ②에서 교사를 정하세요. 학생은 교사가 성공한 시도를 보고 배웁니다."
 "watch.checking" = "실행이 아직 진행 중인지 확인하는 중..."
 "watch.interrupted" = "이 실행은 끝나기 전에 멈췄습니다. 편집기나 실행이 닫혔습니다. 이어서 하기는 마지막으로 끝난 단계 다음부터 계속하고, 처음부터 다시는 새 실행을 시작합니다."
 "watch.waiting" = "대기 중"
@@ -468,6 +481,35 @@
 "teach.heading" = "로봇을 가르치는 방법"
 "teach.blocks" = "미리 짜 둔 시범: 준비된 시범 프로그램이 {}에게 할 일을 보여 줍니다."
 "teach.demonstrations" = "학습 전에 시범을 {}번 기록합니다. 횟수는 ③ 학습에서 바꿀 수 있습니다."
+"teach.by_teacher" = "교사에게 배우기: {} 같은 손은 이동·잡기 블록으로 보여 줄 수 없어서, 교사 정책이 먼저 작업을 익히고 시범을 보입니다."
+
+# --- ② 교사 정하기 (작업 패킷 M16/H7) ----------------------------------------------------------
+"teach.teacher.heading" = "교사 정하기"
+"teach.teacher.about" = "먼저 큐브 위치를 정확히 아는 교사가 시행착오로 작업을 익힙니다. 교사가 성공한 시도를 카메라 세 대로 찍어 두면, ③에서 카메라만 보는 학생이 그것을 보고 배웁니다."
+"teach.teacher.chosen" = "교사: {}번 실행, {}단계 - {}"
+"teach.teacher.none" = "아직 교사를 정하지 않았습니다. 교사를 학습시키고, 저장된 단계들을 시험한 뒤 가장 나은 것을 고르세요."
+"teach.teacher.runs" = "교사 실행"
+"teach.teacher.no_runs" = "아직 교사 실행이 없습니다."
+"teach.teacher.train" = "새 교사 학습시키기"
+"teach.teacher.train.hint" = "템플릿의 교사 레시피로 es train 실행 ([rl] PPO, MuJoCo Warp), 이 PC에서 1~1.5시간쯤 걸립니다"
+"teach.teacher.stop" = "멈추기"
+"teach.teacher.job.train" = "{}번 교사 학습 중..."
+"teach.teacher.job.test" = "{}단계 시험 중..."
+"teach.teacher.job.pack" = "고른 교사를 준비하는 중..."
+"teach.teacher.queued" = "{}개 더 기다리는 중"
+"teach.teacher.ended" = "마지막 작업이 끝까지 가지 못했습니다: {}"
+"teach.teacher.curves" = "{}번 교사가 배워 온 과정"
+"teach.teacher.no_curves" = "이 실행의 학습 곡선을 찾지 못했습니다."
+"teach.teacher.checkpoints" = "저장된 단계"
+"teach.teacher.step" = "단계"
+"teach.teacher.success" = "시험 성공률"
+"teach.teacher.untested" = "시험 안 함"
+"teach.teacher.test" = "시험하기"
+"teach.teacher.test.hint" = "이 단계를 템플릿의 교사 평가로 es eval run (처음 보는 시도 64번, 몇 분)"
+"teach.teacher.test_all" = "시험 안 한 단계 모두 시험하기"
+"teach.teacher.use" = "교사로 쓰기"
+"teach.teacher.in_use" = "사용 중"
+"teach.teacher.time" = "교사 학습은 이 PC에서 1~1.5시간, 단계 하나를 시험하는 데는 몇 분 걸립니다. 보통 시험 점수가 가장 높은 단계를 교사로 씁니다."
 
 # --- ② 가르치기: 동작 블록으로 보여 주는 시범 (작업 패킷 M14/Q3) ----------------------------------
 "teach.field.target" = "목표"

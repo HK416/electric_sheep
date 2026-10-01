@@ -33,7 +33,8 @@ use crate::model::i18n::{fill, t, Lang, Strings};
 use crate::model::labels::{cause_key, metric_label, perturbation_key};
 use crate::model::outcome::{self, Outcome};
 use crate::model::project::{Project, RunFolder, StartSettings, RUN_RECIPE};
-use crate::model::template::{load, Length, OutcomeSpec, Template};
+use crate::model::teacher::{self, Score};
+use crate::model::template::{load, Length, OutcomeKind, OutcomeSpec, Template};
 
 /// Why an episode failed, in the words a person reads - one per group of histogram buckets.
 /// The order is the tie-break of [`causes`] and a tile's pick: how the episode ended first.
@@ -790,6 +791,11 @@ pub struct RunResults {
     /// says one (packet M13/Z4).
     pub outcome: Option<OutcomeSpec>,
     pub outcomes: Outcomes,
+    /// A reorientation's timed-out attempts: how far each ended off the goal, degrees, by cell
+    /// (packet M16/H7, [`outcome::final_angles`]).
+    pub angles: BTreeMap<String, f64>,
+    /// The project's chosen teacher's own score, the student's reference (packet M16/H7).
+    pub teacher: Option<Score>,
     /// "Train again on what failed", or the i18n key of why not ([`again`]).
     pub again: Result<Again, &'static str>,
 }
@@ -843,10 +849,13 @@ impl RunResults {
         let refused = (ir.as_ref().zip(deploy.as_ref()))
             .map_or_else(Vec::new, |(ir, deploy)| uncollectable(ir, deploy));
         let outcome = template.and_then(|t| t.outcome);
-        let outcomes = match (&rows, &outcome, &scene) {
-            (Some(rows), Some(spec), Some(scene)) => outcome::outcomes(scene, spec, rows, &dir),
-            _ => Outcomes::new(),
-        };
+        let (mut outcomes, mut angles) = (Outcomes::new(), BTreeMap::new());
+        if let (Some(rows), Some(spec), Some(scene)) = (&rows, &outcome, &scene) {
+            match spec.kind {
+                OutcomeKind::Place => outcomes = outcome::outcomes(scene, spec, rows, &dir),
+                OutcomeKind::Reorient => angles = outcome::final_angles(scene, spec, rows, &dir),
+            }
+        }
         let bars = situations(&dir.report, rows.as_deref(), ir.as_ref());
         Ok(Self {
             again: again(run, cycle.as_ref(), &bars, &refused),
@@ -862,7 +871,51 @@ impl RunResults {
             settings,
             outcome,
             outcomes,
+            angles,
+            teacher: teacher::chosen_score(project),
         })
+    }
+
+    /// The template's `[outcome]` when it is a reorientation.
+    fn reorient(&self) -> Option<&OutcomeSpec> {
+        (self.outcome.as_ref()).filter(|o| o.kind == OutcomeKind::Reorient)
+    }
+
+    /// A tile's word: its cause, and for a reorientation's timeout how far it ended off the goal.
+    pub fn tile_label(&self, lang: Lang, cell: &str, cause: Cause) -> String {
+        match (cause, self.angles.get(cell)) {
+            (Cause::Timeout, Some(deg)) => {
+                fill(lang, "outcome.not_aligned_by", &[&format!("{deg:.0}")])
+            }
+            _ => self.cause_label(lang, cause),
+        }
+    }
+
+    /// ⑤'s lines for a reorientation (packet M16/H7): the teacher's score beside the student's,
+    /// the share that succeeds by chance, and how far the timed-out attempts ended off the goal.
+    pub fn reorient_lines(&self, lang: Lang) -> Vec<String> {
+        let Some(o) = self.reorient() else {
+            return Vec::new();
+        };
+        let success = format!("{:.1}", o.angle_rad.to_degrees());
+        let mut lines = Vec::new();
+        let student = card(&self.dir.report, self.rows.as_deref());
+        if let (Some(t), true) = (self.teacher, student.episodes > 0) {
+            let s = f64::from(student.successes) / f64::from(student.episodes);
+            let [t, s] = [t.rate(), s].map(|r| format!("{r:.2}"));
+            lines.push(fill(lang, "outcome.teacher", &[&t, &s]));
+        }
+        if let Some(chance) = o.chance {
+            let chance = format!("{:.0}", chance * 100.0);
+            lines.push(fill(lang, "outcome.chance", &[&chance, &success]));
+        }
+        let mut a: Vec<f64> = self.angles.values().copied().collect();
+        a.sort_by(f64::total_cmp);
+        if let (Some(lo), Some(hi)) = (a.first(), a.last()) {
+            let [median, lo, hi] = [a[a.len() / 2], *lo, *hi].map(|d| format!("{d:.0}"));
+            lines.push(fill(lang, "outcome.angles", &[&median, &lo, &hi, &success]));
+        }
+        lines
     }
 
     pub fn comparison(&self) -> Comparison {
@@ -872,6 +925,18 @@ impl RunResults {
     /// A cause's plain name; an outcome class's names the template's object and target.
     pub fn cause_label(&self, lang: Lang, cause: Cause) -> String {
         let table = Strings::get(lang);
+        if let Some(o) = self.reorient() {
+            match cause {
+                Cause::FailureCondition => {
+                    let cm = format!("{:.0}", o.drop_m * 100.0);
+                    return fill(lang, "outcome.dropped", &[table.t(&o.object_name), &cm]);
+                }
+                Cause::Timeout => {
+                    return fill(lang, "outcome.not_aligned", &[table.t(&o.target_name)]);
+                }
+                _ => {}
+            }
+        }
         let names: Vec<&str> = (self.outcome.iter())
             .flat_map(|o| [table.t(&o.object_name), table.t(&o.target_name)])
             .collect();
@@ -1265,6 +1330,60 @@ mod tests {
     /// Packet M13/Z4, review focus 3: a timed-out attempt with a trajectory is named by where
     /// the cube went, in the template's words; one without keeps "not done in time", and a
     /// failure something else ended keeps its own cause.
+    #[test]
+    fn a_reorientation_names_drops_and_misses_and_shows_the_teacher() {
+        use crate::model::teacher::tests::{fake_run, hand_project};
+        let p = hand_project("results");
+        let teacher = fake_run(&p, &[250]);
+        crate::model::teacher::choose(&teacher::tests::hand(), &repo(), &p, &teacher, 250).unwrap();
+        let run = copy_fixture(&p, 1);
+        let rows = [
+            row("nominal", 0, "timeout", &[]),
+            row("nominal", 1, "failure", &[]),
+            row("nominal", 2, "success", &[]),
+            row("nominal", 3, "timeout", &[]),
+        ];
+        write_episodes(&rows, &run.eval_dir()).unwrap();
+        let mut r = RunResults::read(&p, &run, Some(&repo())).unwrap();
+        assert!(r.outcomes.is_empty(), "no place classes");
+        assert_eq!(
+            r.teacher,
+            Some(Score {
+                successes: 31,
+                episodes: 64
+            })
+        );
+        // The fixture's trajectory is the arm's: no cube body, so no angle from it.
+        assert!(r.angles.is_empty());
+        r.angles = BTreeMap::from([("nominal-00".into(), 37.4), ("nominal-03".into(), 120.0)]);
+        for lang in Lang::ALL {
+            let dropped = r.cause_label(lang, Cause::FailureCondition);
+            assert!(dropped.contains("24") && dropped.contains(t(lang, "outcome.cube")));
+            let late = r.cause_label(lang, Cause::Timeout);
+            assert!(late.contains(t(lang, "outcome.goal")) && !late.contains("{}"));
+            assert!(r
+                .tile_label(lang, "nominal-00", Cause::Timeout)
+                .contains("37"));
+            assert_eq!(r.tile_label(lang, "nominal-01", Cause::Timeout), late);
+            let lines = r.reorient_lines(lang);
+            assert_eq!(lines.len(), 3, "{lines:?}");
+            assert!(
+                lines[0].contains("0.48") && lines[0].contains("0.25"),
+                "{lines:?}"
+            );
+            assert!(
+                lines[1].contains('6') && lines[1].contains("5.7"),
+                "{lines:?}"
+            );
+            assert!(
+                lines[2].contains("120") && lines[2].contains("37"),
+                "{lines:?}"
+            );
+            assert!(lines.iter().all(|l| !l.contains("{}")));
+        }
+        std::fs::remove_dir_all(&p.root).ok();
+    }
+
     #[test]
     fn a_timeout_with_a_trajectory_is_named_by_its_outcome() {
         let p = scratch("outcome");

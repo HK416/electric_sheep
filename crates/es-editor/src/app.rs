@@ -88,6 +88,8 @@ pub struct EditorApp {
     pub(crate) scene: crate::ui::scene::State,
     /// ② between frames: the program being edited and its try (packet M14/Q4).
     pub(crate) teach: crate::ui::teach::State,
+    /// ② of a project taught by a teacher policy: its runs and its jobs (packet M16/H7).
+    pub(crate) teacher: crate::ui::teacher::State,
     /// Frames of the selected cell's filmstrip, keyed `<cell>#<index>`.
     pub(crate) run_frames: BTreeMap<String, egui::TextureHandle>,
     /// The scene the replay poses (packet M7/E2). A run directory does not carry one, so it
@@ -159,6 +161,7 @@ impl EditorApp {
             previews: crate::ui::train::Previews::default(),
             scene: crate::ui::scene::State::default(),
             teach: crate::ui::teach::State::default(),
+            teacher: crate::ui::teacher::State::default(),
             run_frames: BTreeMap::new(),
             scene_path: String::new(),
             frames_path: String::new(),
@@ -321,6 +324,21 @@ impl EditorApp {
         self
     }
 
+    /// The step an opened project shows first (`es-editor <project> --step <1-5>`), when it can
+    /// be opened; a number out of range or a locked step leaves the step the project opened at.
+    #[must_use]
+    pub fn with_step(mut self, step: usize) -> Self {
+        if let Some(open) = self.project.as_mut() {
+            let i = step.wrapping_sub(1);
+            if let (Some(&phase), Some(state)) = (Phase::ALL.get(i), open.phases.get(i)) {
+                if layout::can_open(state) {
+                    open.phase = phase;
+                }
+            }
+        }
+        self
+    }
+
     /// Open a project, a bundle or a run directory at startup (`es-editor <path>`).
     #[must_use]
     pub fn with_path(mut self, path: &str) -> Self {
@@ -377,13 +395,15 @@ impl EditorApp {
         match Project::open(path) {
             Ok(project) => {
                 let facts = project.latest_run().map(|run| RunFacts::read(&run));
-                let phases = workflow::phases(facts.as_ref(), None);
+                let mut phases = workflow::phases(facts.as_ref(), None);
+                let watch = Watch::new(&project, template::templates_root());
+                watch.gate(&mut phases);
                 self.status = self.fill("shell.project", &[&project.file.name]);
                 self.opened = None;
                 self.edit = None;
                 self.recent.push(path);
                 self.project = Some(OpenProject {
-                    watch: Watch::new(&project, template::templates_root()),
+                    watch,
                     project,
                     phase: layout::start_phase(&phases),
                     phases,
@@ -477,8 +497,9 @@ impl eframe::App for EditorApp {
         }
         // ③ and ④: the open project's run (packet M12/Y12).
         crate::ui::train::tick(self, ctx);
-        // ②: a try's own child (packet M14/Q4).
+        // ②: a try's own child (packet M14/Q4), and a teacher's jobs (packet M16/H7).
         crate::ui::teach::tick(self);
+        crate::ui::teacher::tick(self);
 
         // A dropped file goes through the same function the path field does (packet M7/E3):
         // one way in means one set of errors out.

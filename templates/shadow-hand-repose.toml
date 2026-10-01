@@ -1,0 +1,76 @@
+# The Shadow Hand template (plan H, packet M16/H7): a five-fingered hand turns a cube in its palm
+# until it matches a goal orientation, seen by three path-traced cameras. A hand cannot be taught
+# with move/grip blocks, so the demonstrator is itself a policy -- a state-based PPO **teacher**
+# that knows the cube's pose, trained and chosen in ② (`method = "teacher"`). The camera-only
+# **student** (ACT over the three views, the joints and the goal; no cube pose) imitates the
+# teacher's successful episodes in ③ and is judged in ④, exactly as the SO-101 cards' cycle is.
+#
+# Measured (plan H, E1/E2 on this PC): the teacher `runs/shadow-hand/teacher-002` reached 0.52
+# success on 64 held-out seeds at 1,750 iterations; the student trained on its 108 successful
+# demonstrations of 300 scored 15/64 (0.23) on the same seeds, nominal suite. About 6% of attempts succeed by chance
+# (the goal is drawn within 0.1 rad of the start), so the card says experimental (`notice`).
+#
+# Every path is a committed document, relative to the repository root, and none is copied (see
+# `cube-into-bin.toml`).
+
+kind = "template"
+id = "shadow-hand-repose"
+name = "template.shadow_hand.name"        # es-editor i18n key
+summary = "template.shadow_hand.summary"  # es-editor i18n key
+notice = "template.shadow_hand.notice"    # es-editor i18n key: experimental
+robot = "Shadow Hand"
+method = "teacher"
+# `mjwarp`: the teacher trains on MuJoCo Warp (`training-teacher-v2.toml`'s `[rl] backend`).
+needs = ["mujoco", "torch", "vulkan", "render", "mjwarp"]
+# `[collect] policy` is replaced by the project's chosen `teacher.esb`; nothing else of the
+# cycle's collect changes (300 episodes from seed 1001, frames, `success_only`).
+cycle = "tests/fixtures/shadow-hand/cycle-student.toml"
+scene = "tests/fixtures/mjcf/shadow_hand/shadow_hand_repose.xml"
+demonstrations = 300
+
+# Where the editor's outside camera starts: the hand hangs from (1, 1.25, 0.15) palm down over
+# the cube at about (1, 0.87, 0.2), a metre from the arm demo's origin the default view frames.
+viewport = { eye = [1.5, 0.4, 0.6], look_at = [1.02, 0.95, 0.2] }
+
+# The student's four documents: `Project::create` builds `untrained.esb` from them, which is what
+# `training-student.toml`'s `[policy] bundle` trains (its header has the same `es policy init`).
+[bundle]
+task        = "tests/fixtures/shadow-hand/task-repose.toml"
+observation = "tests/fixtures/shadow-hand/observation-student.toml"
+learning    = "tests/fixtures/shadow-hand/learning-student.toml"
+deployment  = "tests/fixtures/shadow-hand/deployment-student.toml"
+
+# ②'s teacher: `es train --recipe <recipe>` (its `[policy] bundle` replaced by the project's
+# `teacher-untrained.esb`, built from the four documents below as `es policy init` builds it),
+# each checkpoint judged by `es eval run --config <evaluation> --jobs <jobs>`, and the chosen one
+# re-packed on these documents when its hashes differ (`es policy pack`).
+[teacher]
+recipe      = "tests/fixtures/shadow-hand/training-teacher-v2.toml"
+evaluation  = "tests/fixtures/shadow-hand/evaluation-teacher-64.toml"
+task        = "tests/fixtures/shadow-hand/task-repose.toml"
+observation = "tests/fixtures/shadow-hand/observation-teacher.toml"
+learning    = "tests/fixtures/shadow-hand/learning-teacher.toml"
+deployment  = "tests/fixtures/shadow-hand/deployment-hand.toml"
+jobs        = 4
+
+# Student training lengths: `training-student.toml`'s marks; `long` is its own 60,000 steps (the
+# measured 15/64), `medium` and `short` stop earlier on the same marks.
+[lengths]
+short  = [1000, 5000]
+medium = [1000, 5000, 20000]
+long   = [1000, 5000, 20000, 60000]
+
+# How ⑤ explains an attempt (`docs/design/editor-redesign.md`; the owner's S4 direction: by the
+# success predicate's missing clause). Success is task-repose.toml's `|q_cube . q_goal| >= cos
+# 0.05` (0.1 rad); a failure is its drop condition (the cube 0.24 m from the palm reference); a
+# timeout is told by how far the `object` body's orientation still was from the `target` body's
+# at the last tick of its trajectory. `chance` is the share that succeeds by chance (E1).
+[outcome]
+kind        = "reorient"
+object      = "object"
+target      = "target"
+object_name = "outcome.cube"
+target_name = "outcome.goal"
+angle_rad   = 0.1
+drop_m      = 0.24
+chance      = 0.06

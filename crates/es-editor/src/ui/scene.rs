@@ -18,7 +18,7 @@ use crate::model::layout::Pane;
 use crate::model::scene_view::{self, ScenePreview};
 use crate::model::template::{templates_root, Template};
 use crate::model::workflow::Phase;
-use crate::ui::advanced::{scene_canvas, SHOWCASE_CAMERA};
+use crate::ui::advanced::scene_canvas;
 
 /// ① and ② between frames. It belongs to one project; opening another reads its scene afresh.
 #[derive(Default)]
@@ -63,7 +63,8 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
         }
         (Pane::Viewport, _, Ok(preview)) => {
             ui.weak(t(lang, "setup.orbit_hint"));
-            let camera = state.camera.get_or_insert(SHOWCASE_CAMERA);
+            let camera =
+                (state.camera).get_or_insert_with(|| scene_view::camera_of(Some(template)));
             let project = |camera: &Camera| preview.project(camera);
             scene_canvas(
                 ui,

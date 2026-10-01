@@ -1,19 +1,33 @@
-//! `es-editor [project-dir|bundle.esb|run-dir] [--attach <addr> [--token <t>]]` — the editor
-//! shell of spec 23.
+//! `es-editor [project-dir|bundle.esb|run-dir] [--attach <addr> [--token <t>]] [--step <1-5>]`
+//! — the editor shell of spec 23.
+//!
+//! `es-editor --import <project-dir> --template <id> ...` makes a project of runs that ran
+//! outside the editor and opens it; the grammar is [`es_editor::model::import`]'s (packet
+//! M16/H7).
 //!
 //! The window is the only thing this file owns. Everything it shows is
 //! [`es_editor::model`], which runs headless.
 
+use es_editor::model::import::Import;
 use es_editor::model::telemetry_view::{attach, replay};
+use es_editor::model::template;
 use es_editor::EditorApp;
 
 fn main() -> eframe::Result<()> {
-    let (mut path, mut addr, mut token) = (None, None, None);
+    let (mut path, mut addr, mut token, mut step) = (None, None, None, None);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--attach" => addr = args.next(),
             "--token" => token = args.next(),
+            "--step" => step = args.next().and_then(|s| s.parse::<usize>().ok()),
+            "--import" => match import(&args.by_ref().collect::<Vec<_>>()) {
+                Ok(project) => path = Some(project),
+                Err(e) => {
+                    eprintln!("es-editor --import: {e}");
+                    std::process::exit(2);
+                }
+            },
             _ => path = Some(arg),
         }
     }
@@ -48,10 +62,29 @@ fn main() -> eframe::Result<()> {
             if let Some(path) = &path {
                 app = app.with_path(path);
             }
+            if let Some(step) = step {
+                app = app.with_step(step);
+            }
             if let Some(status) = status {
                 app = app.with_status(status);
             }
             Ok(Box::new(app))
         }),
     )
+}
+
+/// `--import`: the project made, said on stdout, and its folder to open.
+fn import(args: &[String]) -> Result<String, String> {
+    let spec = Import::parse(args)?;
+    let root = template::templates_root().ok_or("no checkout: templates/ was not found")?;
+    let found = (template::load(&root).0.into_iter())
+        .find(|t| t.id == spec.template)
+        .ok_or_else(|| format!("no template {}", spec.template))?;
+    let (project, choice) = spec.run(&found, &root).map_err(|e| e.to_string())?;
+    println!("project: {}", project.root.display());
+    match choice {
+        Some(c) => println!("teacher: run {:03}, step {}", c.run, c.step),
+        None => println!("teacher: none chosen"),
+    }
+    Ok(project.root.display().to_string())
 }

@@ -1321,7 +1321,7 @@ pub(crate) fn paint_timeline(lang: Lang, ui: &mut egui::Ui, buckets: &[Bucket]) 
 /// `height` in points: a strip in the Live pane, the whole centre while ③ trains (M12/Y12).
 /// Returns the rectangle the unit square was mapped onto, for ③'s preview marks (M13/Z5a).
 /// One colour per `Series::RL` curve, in its order.
-const RL_COLOURS: [Color32; 5] = [
+pub(crate) const RL_COLOURS: [Color32; 5] = [
     Color32::from_rgb(120, 220, 140),
     Color32::from_rgb(250, 210, 90),
     Color32::from_rgb(160, 200, 255),

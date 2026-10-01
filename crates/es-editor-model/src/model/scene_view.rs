@@ -15,7 +15,7 @@ use es_render::TriScene;
 
 use crate::model::project::Project;
 use crate::model::replay_view::load_scene;
-use crate::model::template::{Method, Template};
+use crate::model::template::{load, templates_root, Method, Template};
 use crate::model::watch::source_of;
 
 /// Where the replay camera starts: the demo's showcase view (`es video showcase --eye`).
@@ -142,10 +142,33 @@ pub fn open_step(
     Some((template, preview))
 }
 
+/// Where the outside camera starts on `template`'s scene: its `viewport`, else the showcase
+/// view (packet M16/H7: the hand sits a metre from the arm's origin, out of that view).
+pub fn camera_of(template: Option<&Template>) -> Camera {
+    match template.and_then(|t| t.viewport) {
+        Some(v) => Camera {
+            eye: v.eye,
+            look_at: v.look_at,
+            ..SHOWCASE_CAMERA
+        },
+        None => SHOWCASE_CAMERA,
+    }
+}
+
+/// [`camera_of`] the checkout's template whose scene `scene` is; a motion re-posed in ③, ④ or
+/// ⑤ knows its scene, not its template.
+pub fn camera_for(scene: Option<&Path>) -> Camera {
+    let found = scene
+        .zip(templates_root())
+        .and_then(|(scene, root)| (load(&root).0.into_iter()).find(|t| scene.ends_with(&t.scene)));
+    camera_of(found.as_ref())
+}
+
 /// ②'s sentence for a teaching method; `{}` is the robot.
 pub fn method_key(method: Method) -> &'static str {
     match method {
         Method::Blocks => "teach.blocks",
+        Method::Teacher => "teach.by_teacher",
     }
 }
 
@@ -175,6 +198,22 @@ mod tests {
                 cameras: vec!["overhead".into()],
             }
         );
+    }
+
+    /// Packet M16/H7: a re-posed motion of the hand scene starts on the hand template's
+    /// viewport, which sees the hand; the cube cards keep the showcase view.
+    #[test]
+    fn the_hand_scene_starts_on_its_template_viewport() {
+        let hand = crate::model::teacher::tests::hand();
+        let scene = repo().join(&hand.scene);
+        let camera = camera_for(Some(&scene));
+        assert_eq!(camera, camera_of(Some(&hand)));
+        assert_ne!(camera, SHOWCASE_CAMERA);
+        let preview = ScenePreview::open(&scene).expect("the hand scene");
+        let seen = preview.project(&camera).len();
+        assert!(seen > 1000, "{seen}");
+        assert_eq!(camera_for(Some(&fixture())), SHOWCASE_CAMERA);
+        assert_eq!(camera_for(None), SHOWCASE_CAMERA);
     }
 
     #[test]

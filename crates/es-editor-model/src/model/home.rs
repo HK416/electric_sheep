@@ -154,8 +154,14 @@ const NEEDS: [Need; 5] = [
     ("render", "deps.render", |d| d.render),
 ];
 
+/// `needs` names that are a physics backend (packet M16/H7): judged from the probe's backend
+/// list, which the PC-check line already shows as optional extras, so they are not shown twice.
+const BACKEND_NEEDS: [Need; 1] = [("mjwarp", "deps.mjwarp", |d| {
+    (d.backends.iter()).any(|b| b.name == "mjwarp" && b.available)
+})];
+
 fn need(name: &str) -> Option<&'static Need> {
-    NEEDS.iter().find(|n| n.0 == name)
+    NEEDS.iter().chain(&BACKEND_NEEDS).find(|n| n.0 == name)
 }
 
 /// The i18n key naming a `needs` item in plain words, or `None` for a name this editor does
@@ -543,6 +549,28 @@ mod tests {
             .into_iter()
             .find(|t| t.id == "cube-into-bin")
             .expect("the committed cube template")
+    }
+
+    /// Packet M16/H7: the hand card needs `MuJoCo` Warp, which the probe reports as a backend.
+    #[test]
+    fn the_hand_card_needs_the_gpu_simulator() {
+        let hand = (templates().into_iter())
+            .find(|t| t.id == "shadow-hand-repose")
+            .expect("the hand template");
+        let mut d = parse_deps(READY).unwrap();
+        let missing = Availability::Missing(vec!["mjwarp".into()]);
+        assert_eq!(availability(&hand, Some(&d)), missing);
+        d.backends.push(Backend {
+            name: "mjwarp".into(),
+            available: true,
+            reason: None,
+        });
+        assert_eq!(availability(&hand, Some(&d)), Availability::Ready);
+        assert_eq!(need_label("mjwarp"), Some("deps.mjwarp"));
+        // Shown once, among the simulators, not again among what a template needs.
+        let items = pc_check(&d);
+        assert_eq!(items.len(), 1 + NEEDS.len() + 2);
+        assert!(items.iter().all(|i| i.key != "deps.mjwarp"));
     }
 
     #[test]

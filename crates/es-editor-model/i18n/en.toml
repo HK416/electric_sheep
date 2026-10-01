@@ -346,9 +346,20 @@
 "template.cube_into_bin_hint.name" = "Cube into bin - with the cube's position"
 "template.cube_into_bin_hint.summary" = "The same arm, cube and bin. Besides the camera and its joints, the policy is told exactly where the cube is."
 "template.cube_into_bin_hint.notice" = "Practice: the simulator also tells the policy where the cube is, which a real robot cannot know. That makes the task much easier than it is for a real robot."
+"template.shadow_hand.name" = "Shadow Hand - turn the cube to the goal"
+"template.shadow_hand.summary" = "A five-fingered robot hand turns a cube in its palm until it faces the same way as the goal cube beside it. A teacher that knows where the cube is learns first; a student that sees only three cameras, its joints and the goal learns from the teacher's successful attempts."
+"template.shadow_hand.notice" = "Experimental: the camera-only student has reached 15 of 64 attempts so far (its teacher 33 of 64)."
 # What a template's `[outcome]` names its object and target (packet M13/Z6).
 "outcome.cube" = "cube"
 "outcome.bin" = "bin"
+"outcome.goal" = "goal"
+# A reorientation's attempts (packet M16/H7).
+"outcome.dropped" = "Dropped: the {} fell more than {} cm from the palm"
+"outcome.not_aligned" = "Not turned to the {} in time"
+"outcome.not_aligned_by" = "Not turned in time: {}° off"
+"outcome.angles" = "When time ran out the cube was still {}° off the goal (median; from {}° to {}°). Success needs under {}°."
+"outcome.teacher" = "Teacher {} → student {}"
+"outcome.chance" = "About {}% of attempts succeed by chance: some goals are drawn within {}° of where the cube starts."
 
 # --- the PC check: what a template needs ----------------------------------------------------
 "deps.python" = "Python"
@@ -357,6 +368,7 @@
 "deps.lerobot" = "LeRobot robot learning tools"
 "deps.vulkan" = "Vulkan graphics driver"
 "deps.render" = "Camera picture drawing, built into es"
+"deps.mjwarp" = "MuJoCo Warp, the GPU physics simulator"
 
 # --- the step bar: the five steps, and where each one is ----------------------------------
 "phase.scene" = "Scene"
@@ -428,6 +440,7 @@
 "watch.resume.hint" = "es loop cycle --from <stage> on the same run folder, at a new --telemetry address"
 "watch.no_checkout" = "A run cannot be started here: the editor finds its templates only when it runs from a copy of the project's source."
 "watch.no_template" = "A run cannot be started here: this project's template ({}) is missing."
+"watch.no_teacher" = "Choose a teacher in ② first: the student learns from the teacher's successful attempts."
 "watch.checking" = "Checking whether the run is still going..."
 "watch.interrupted" = "This run stopped before it finished: the editor or the run was closed. Resume carries on after the last step that finished; Start over begins a new run."
 "watch.waiting" = "Waiting"
@@ -469,6 +482,35 @@
 "teach.heading" = "How the robot is taught"
 "teach.blocks" = "Scripted demonstrations: a ready-made demonstration program shows the {} what to do."
 "teach.demonstrations" = "{} demonstrations are recorded before training. You can change the number in ③ Train."
+"teach.by_teacher" = "Taught by a teacher: a {} cannot be shown with move and grip blocks, so a teacher policy learns the task first and demonstrates it."
+
+# --- ② choose a teacher (packet M16/H7) -------------------------------------------------------
+"teach.teacher.heading" = "Choose a teacher"
+"teach.teacher.about" = "First a teacher that knows exactly where the cube is learns the task by trial and error. Its successful attempts, seen through the three cameras, are what the camera-only student learns from in ③."
+"teach.teacher.chosen" = "Teacher: run {}, step {} - {}"
+"teach.teacher.none" = "No teacher chosen yet. Train one, test its checkpoints and use the best."
+"teach.teacher.runs" = "Teacher runs"
+"teach.teacher.no_runs" = "No teacher run yet."
+"teach.teacher.train" = "Train a new teacher"
+"teach.teacher.train.hint" = "es train on the template's teacher recipe ([rl] PPO on MuJoCo Warp), about 1 to 1.5 hours on this PC"
+"teach.teacher.stop" = "Stop"
+"teach.teacher.job.train" = "Training teacher {}..."
+"teach.teacher.job.test" = "Testing step {}..."
+"teach.teacher.job.pack" = "Preparing the chosen teacher..."
+"teach.teacher.queued" = "{} more waiting"
+"teach.teacher.ended" = "The last job did not finish: {}"
+"teach.teacher.curves" = "How teacher {} learned"
+"teach.teacher.no_curves" = "No learning curve was found for this run."
+"teach.teacher.checkpoints" = "Saved checkpoints"
+"teach.teacher.step" = "Step"
+"teach.teacher.success" = "Success in the test"
+"teach.teacher.untested" = "not tested"
+"teach.teacher.test" = "Test"
+"teach.teacher.test.hint" = "es eval run of this checkpoint on the template's teacher evaluation (64 held-out attempts, a few minutes)"
+"teach.teacher.test_all" = "Test every untested checkpoint"
+"teach.teacher.use" = "Use as teacher"
+"teach.teacher.in_use" = "in use"
+"teach.teacher.time" = "Training a teacher takes about 1 to 1.5 hours on this PC, and testing one checkpoint a few minutes. The best test score is usually the teacher to use."
 
 # --- ② teach: the demonstration as action blocks (packet M14/Q3) ---------------------------------
 "teach.field.target" = "Target"

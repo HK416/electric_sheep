@@ -5,6 +5,7 @@
 //! [`results`] is ⑤, a finished run read in plain words (packet M12/Y13).
 //! [`scene`] is ①, a template's scene, and ② read-only for a project with no program (M12/Y15).
 //! [`teach`] is ②, the demonstration program as blocks, edited and tried once (packet M14/Q4).
+//! [`teacher`] is ② for a template taught by a trained teacher policy (packet M16/H7).
 //! [`player`] plays one attempt of an evaluation, for ⑤ and for ③'s checks (packet M13/Z5a).
 //!
 //! Compiled only, never run by CI (`docs/design/editor-shell.md` section 2): every branch that
@@ -18,6 +19,7 @@ pub mod results;
 pub mod scene;
 pub mod shell;
 pub mod teach;
+pub mod teacher;
 pub mod train;
 
 use eframe::egui;

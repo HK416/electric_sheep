@@ -7,11 +7,13 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-/// How the robot is taught. `Blocks` is the scripted demonstrator (the only one S1 has).
+/// How the robot is taught. `Blocks` is the scripted demonstrator; `Teacher` is a policy trained
+/// and chosen in ② whose successful episodes are the demonstrations (packet M16/H7).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Method {
     Blocks,
+    Teacher,
 }
 
 /// The three training lengths a person picks from.
@@ -33,6 +35,26 @@ pub struct BundleDocs {
     pub deployment: String,
 }
 
+/// `[teacher]` (packet M16/H7): the teacher's training recipe, the Evaluation IR its checkpoints
+/// are judged by (with `jobs` workers) and the four documents its bundle is built and re-packed
+/// on.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TeacherDocs {
+    pub recipe: String,
+    pub evaluation: String,
+    pub task: String,
+    pub observation: String,
+    pub learning: String,
+    pub deployment: String,
+    #[serde(default = "one")]
+    pub jobs: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+
 /// `[lengths]`: each preset is a `[run] checkpoint_at` series.
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,17 +64,40 @@ pub struct Lengths {
     pub long: Vec<u32>,
 }
 
+/// What kind of task `[outcome]` explains.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutcomeKind {
+    /// Put the object in the target (the cube cards).
+    #[default]
+    Place,
+    /// Turn the object to the target body's orientation (packet M16/H7).
+    Reorient,
+}
+
 /// `[outcome]` (packet M13/Z4, Z6): what a timed-out attempt is judged by - where the `object`
 /// body went against the region the scene geoms of the `target` stem cover
-/// ([`crate::model::outcome`]). `object_name` and `target_name` are i18n keys: the two things in
-/// the words a failure cause names them by.
+/// ([`crate::model::outcome`]); for `kind = "reorient"`, how far the `object` body's orientation
+/// ended from the `target` body's. `object_name` and `target_name` are i18n keys: the two things
+/// in the words a failure cause names them by.
 #[derive(Clone, Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutcomeSpec {
+    #[serde(default)]
+    pub kind: OutcomeKind,
     pub object: String,
     pub target: String,
-    /// The height gain, in metres, that counts as lifted.
+    /// The height gain, in metres, that counts as lifted (`place`).
+    #[serde(default)]
     pub lift_m: f64,
+    /// The angle under which the task counts the object turned, radians (`reorient`).
+    #[serde(default)]
+    pub angle_rad: f64,
+    /// How far from where it belongs the object counts as dropped, metres (`reorient`).
+    #[serde(default)]
+    pub drop_m: f64,
+    /// The share of attempts that succeeds by chance, when it was measured.
+    pub chance: Option<f64>,
     pub object_name: String,
     pub target_name: String,
     /// Absent: an object that ends inside the target is always *too late* (packet M13/R4).
@@ -66,6 +111,14 @@ pub struct OutcomeSpec {
 pub struct Release {
     pub joint: String,
     pub above: f64,
+}
+
+/// `viewport`: where the editor's outside camera starts on the template's scene, metres.
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Viewport {
+    pub eye: [f64; 3],
+    pub look_at: [f64; 3],
 }
 
 /// One `templates/<id>.toml`. `name`, `summary` and `notice` (what the card warns about, such
@@ -89,6 +142,10 @@ pub struct Template {
     /// [`Project::create`](crate::model::project::Project::create) copies into the project as
     /// `teach.toml`. Absent: the cycle's `[collect] expert` name is used as it is.
     pub teach: Option<String>,
+    /// `method = "teacher"`'s teacher (packet M16/H7).
+    pub teacher: Option<TeacherDocs>,
+    /// Absent: the demo's showcase view ([`crate::model::scene_view::SHOWCASE_CAMERA`]).
+    pub viewport: Option<Viewport>,
     pub lengths: Lengths,
     /// Absent: failures keep the causes the evaluation recorded.
     pub outcome: Option<OutcomeSpec>,
@@ -259,6 +316,63 @@ mod tests {
                 for key in [&o.object_name, &o.target_name] {
                     assert_ne!(Strings::get(lang).t(key), key, "{id}: {key}");
                 }
+            }
+        }
+    }
+
+    /// The hand card (packet M16/H7): taught by a teacher policy, every document it names is
+    /// committed, its outcome is a reorientation, and its words are in both tables.
+    #[test]
+    fn the_hand_template_names_its_teacher_and_a_reorientation() {
+        use super::{Method, OutcomeKind};
+        let root = find_root(Some(Path::new(env!("CARGO_MANIFEST_DIR")))).expect("a checkout");
+        let hand = (load(&root).0.into_iter())
+            .find(|t| t.id == "shadow-hand-repose")
+            .expect("the hand template");
+        assert_eq!(hand.method, Method::Teacher);
+        assert!(hand.teach.is_none() && hand.needs.iter().any(|n| n == "mjwarp"));
+        let t = hand.teacher.as_ref().expect("[teacher]");
+        let b = &hand.bundle;
+        for p in [
+            &hand.cycle,
+            &hand.scene,
+            &b.task,
+            &b.observation,
+            &b.deployment,
+            &t.recipe,
+            &t.evaluation,
+            &t.task,
+            &t.observation,
+            &t.learning,
+            &t.deployment,
+        ]
+        .into_iter()
+        .chain(b.learning.as_ref())
+        {
+            assert!(root.join(p).is_file(), "{p}");
+        }
+        let o = hand.outcome.as_ref().expect("[outcome]");
+        assert_eq!(o.kind, OutcomeKind::Reorient);
+        assert_eq!(
+            (
+                hand.name.as_str(),
+                hand.summary.as_str(),
+                hand.notice.as_deref(),
+                o.target_name.as_str()
+            ),
+            (
+                "template.shadow_hand.name",
+                "template.shadow_hand.summary",
+                Some("template.shadow_hand.notice"),
+                "outcome.goal"
+            )
+        );
+        assert_eq!((o.angle_rad, o.drop_m, o.chance), (0.1, 0.24, Some(0.06)));
+        assert_eq!(hand.marks(Length::Long), [1000, 5000, 20000, 60000]);
+        for lang in Lang::ALL {
+            let keys = [&hand.name, &hand.summary, &o.object_name, &o.target_name];
+            for key in keys.into_iter().chain(hand.notice.as_ref()) {
+                assert_ne!(Strings::get(lang).t(key), key, "{key}");
             }
         }
     }

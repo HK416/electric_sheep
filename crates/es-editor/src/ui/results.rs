@@ -246,6 +246,10 @@ fn verdict(lang: Lang, ui: &mut egui::Ui, shown: &RunResults) {
     if let Some(change) = results::change_text(lang, &shown.comparison(), previous) {
         ui.label(change);
     }
+    // A reorientation (packet M16/H7): the teacher beside the student, chance, the angles.
+    for line in shown.reorient_lines(lang) {
+        ui.label(line);
+    }
     ui.add_space(6.0);
     ui.strong(t(lang, "results.to_pass"))
         .on_hover_text(t(lang, "results.acceptance.hint"));
@@ -360,7 +364,9 @@ fn tiles(
                         }
                         let (colour, word) = match (tile.success, tile.cause) {
                             (true, _) => (GREEN, t(lang, "results.tile.success").to_owned()),
-                            (false, Some(cause)) => (RED, shown.cause_label(lang, cause)),
+                            (false, Some(cause)) => {
+                                (RED, shown.tile_label(lang, &tile.cell, cause))
+                            }
                             (false, None) => (RED, t(lang, "results.tile.failure").to_owned()),
                         };
                         // One line each, the whole of it on hover: a tile is a thumbnail wide.
