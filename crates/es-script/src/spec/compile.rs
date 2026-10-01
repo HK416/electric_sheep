@@ -19,6 +19,8 @@ use es_ir::task::{
     TaskConfig, TaskGraph, TaskIr, TaskNode, TerminationKind,
 };
 use es_ir::types::{Align, ElemType, Frame, PortType, Shape, TimeRef, Unit};
+// A number written into a document has musl's bits, not the host's (spec 5.3, M17 G3d).
+use es_math::approx;
 
 use super::{
     refuse, Clause, Draw, Observe, Relation, RenderDoc, RenderPath, Shaping, SpecError, StartItem,
@@ -675,9 +677,7 @@ impl<'a> Compiler<'a> {
                 let d = self.math(dot, MathFunc::Abs);
                 // `|q·g| ≥ cos(theta/2)`: the rotation between them is at most theta.
                 let half = c.within_deg.expect("checked").to_radians() / 2.0;
-                // ponytail: the host's libm `cos`, as the generators this replaces; a correctly
-                // rounded one would make the document host-independent (M10's `scene_hash`).
-                let reached = self.compare(d, CmpOp::Ge, half.cos());
+                let reached = self.compare(d, CmpOp::Ge, approx::sin_cos_f64(half).1);
                 if c.shaping.is_some() {
                     self.inverse_angle(d, &term("inverse_angle"), weight);
                 }
@@ -814,9 +814,8 @@ impl<'a> Compiler<'a> {
                                 "required, in (0, 180); 180 is `any`",
                             );
                         }
-                        // ponytail: the host's libm `tan`; a correctly rounded one would make
-                        // the document host-independent (M10's `scene_hash`).
-                        let m = (theta.to_radians() / 2.0).tan() / std::f64::consts::SQRT_2;
+                        let m =
+                            approx::tan_f64(theta.to_radians() / 2.0) / std::f64::consts::SQRT_2;
                         let ab = Distribution::Uniform { lo: -m, hi: m };
                         vec![
                             (Distribution::Constant(1.0), stream.clone()),
@@ -1242,8 +1241,7 @@ fn f32v(n: u64, unit: Unit, frame: Frame) -> PortType {
 /// A `px`×`px` RGB8 pinhole camera of vertical field of view `fovy` (rad), as the renderer
 /// delivers it (`es_env::render::image_spec`).
 fn camera_ty(camera: StableId, fovy: f64, px: u32, hz: f32) -> PortType {
-    // ponytail: the host's libm `tan`, as the generators this replaces.
-    let f = f64::from(px) / 2.0 / (fovy / 2.0).tan();
+    let f = f64::from(px) / 2.0 / approx::tan_f64(fovy / 2.0);
     let c = f64::from(px) / 2.0;
     PortType {
         elem: ElemType::U8,
