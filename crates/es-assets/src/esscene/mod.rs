@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub use expand::expand;
+pub(crate) use expand::mesh_asset;
 
 use crate::mesh::MeshError;
 use crate::scene::SceneError;

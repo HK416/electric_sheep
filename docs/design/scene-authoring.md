@@ -189,8 +189,9 @@ above left open:
   vertices, so G2 re-encodes the file unchanged; `SceneDesc::mesh_positions` gives them scaled
   (`f32(f64(v) · s)`), and the backend emitter (the MJCF every backend loads) and the renderer
   draw and simulate those. A scaled mesh's asset is named `stem@s` (`stem@x,y,z` when not
-  uniform), so one file at two scales is two `<mesh>`es. URDF's `<mesh scale>` is still a
-  warning (a later item).
+  uniform), so one file at two scales is two `<mesh>`es. Since packet M18/K8 URDF's `<mesh
+  scale>` maps onto `mesh_scales` the same way (the same name, absent or 1 adds nothing, a scale
+  that is not positive is refused by name) instead of warning.
 - **Textures are named `[[texture]]`s** and a material names one per slot (`texture`, `orm`,
   `metallic_map`, `roughness_map`, `normal_map`, `emissive_map`): one texture is shared by two
   materials (the Shadow Hand's cube and goal), so it cannot be inline. As in MJCF, a material

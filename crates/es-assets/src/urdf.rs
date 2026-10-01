@@ -296,15 +296,7 @@ pub fn parse_urdf(xml: &str, resolver: &PackageResolver) -> Result<Import, UrdfE
         let pose = parent_joint.map_or(Pose::IDENTITY, |j| j.origin);
         let parent = parent_joint.map(|j| scene_id("body", &j.parent));
         let inertial = parse_inertial(*node, &doc)?;
-        let geoms = parse_geoms(
-            *node,
-            name,
-            &doc,
-            resolver,
-            &mut assets_by_path,
-            &mut scene,
-            &mut warnings,
-        )?;
+        let geoms = parse_geoms(*node, name, &doc, resolver, &mut assets_by_path, &mut scene)?;
         scene.bodies.push(Body {
             id: scene_id("body", name),
             name: name.clone(),
@@ -493,7 +485,6 @@ fn parse_geoms(
     resolver: &PackageResolver,
     assets_by_path: &mut BTreeMap<String, StableId>,
     scene: &mut SceneDesc,
-    warnings: &mut Vec<Warning>,
 ) -> Result<Vec<Geom>, UrdfError> {
     let mut geoms = Vec::new();
     for (tag, visual) in [("visual", true), ("collision", false)] {
@@ -511,15 +502,7 @@ fn parse_geoms(
                 .children()
                 .find(Node::is_element)
                 .ok_or_else(|| UrdfError::missing(line, "geometry", "shape"))?;
-            let shape = parse_shape(
-                shape_node,
-                line,
-                &name,
-                resolver,
-                assets_by_path,
-                scene,
-                warnings,
-            )?;
+            let shape = parse_shape(shape_node, line, &name, resolver, assets_by_path, scene)?;
 
             let contype = u32::from(!visual);
             geoms.push(Geom {
@@ -555,7 +538,6 @@ fn parse_shape(
     resolver: &PackageResolver,
     assets_by_path: &mut BTreeMap<String, StableId>,
     scene: &mut SceneDesc,
-    warnings: &mut Vec<Warning>,
 ) -> Result<Shape, UrdfError> {
     match node.tag_name().name() {
         "box" => {
@@ -584,20 +566,21 @@ fn parse_shape(
             let filename = node
                 .attribute("filename")
                 .ok_or_else(|| UrdfError::missing(line, "mesh", "filename"))?;
-            let resolved = resolver.resolve(filename)?;
-            if let Some(scale) = node.attribute("scale") {
-                let scale =
-                    parse_vec3(scale).map_err(|()| UrdfError::bad(line, "mesh", "scale", scale))?;
-                if scale != Vec3::new(1.0, 1.0, 1.0) {
-                    warnings.push(Warning {
-                        line,
-                        message: format!(
-                            "mesh `{filename}`: non-unit scale is not represented in SceneDesc"
-                        ),
-                    });
+            let path = resolver.resolve(filename)?.to_string_lossy().into_owned();
+            // `scale` is `SceneDesc::mesh_scales`, named as a scene document names it (packet
+            // M18/K8); absent and 1 add nothing, so an unscaled mesh keeps its geom's name.
+            if let Some(text) = node.attribute("scale") {
+                let scale = parse_vec3(text)
+                    .ok()
+                    .map(|v| [v.x, v.y, v.z])
+                    .filter(|v| v.iter().all(|x| x.is_finite() && *x > 0.0))
+                    .ok_or_else(|| UrdfError::bad(line, "mesh", "scale", text))?;
+                #[allow(clippy::float_cmp)] // 1 exactly is no scale
+                if scale != [1.0; 3] {
+                    let asset = crate::esscene::mesh_asset(scene, &path, Some(scale));
+                    return Ok(Shape::Mesh { asset });
                 }
             }
-            let path = resolved.to_string_lossy().into_owned();
             let id = *assets_by_path.entry(path.clone()).or_insert_with(|| {
                 let asset = AssetRef::from_path(AssetKind::Mesh, name, &path);
                 let id = asset.id;

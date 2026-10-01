@@ -373,9 +373,10 @@ fn geom(
 
 /// The mesh asset of `file` at `scale` (`None` and 1 alike: absent from `mesh_scales`), added on
 /// first use and named by the file's stem — and `@` the scale when it has one (`part@0.001`,
-/// `part@1,2,1`), so one file at two scales is two `<mesh>`es, as MJCF needs.
+/// `part@1,2,1`), so one file at two scales is two `<mesh>`es, as MJCF needs. The URDF reader
+/// names its scaled meshes here too (packet M18/K8).
 #[allow(clippy::float_cmp)] // 1 exactly is no scale; equal bits are one number in the name
-fn mesh_asset(s: &mut SceneDesc, file: &str, scale: Option<[f64; 3]>) -> StableId {
+pub(crate) fn mesh_asset(s: &mut SceneDesc, file: &str, scale: Option<[f64; 3]>) -> StableId {
     let scale = scale.filter(|v| *v != [1.0; 3]);
     let same = |a: &&AssetRef| {
         a.kind == AssetKind::Mesh && a.path == file && s.mesh_scales.get(&a.id) == scale.as_ref()

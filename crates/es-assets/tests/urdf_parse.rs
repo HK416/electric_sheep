@@ -182,6 +182,186 @@ fn urdf_scene_hash_ignores_link_and_joint_order() {
     assert_eq!(a.scene_hash(), b.scene_hash());
 }
 
+// --- packet M18/K8: `<mesh scale>` -------------------------------------------------------
+
+/// A fresh directory holding `part.stl`, a 100 x 60 x 20 mm box written in millimetres
+/// (outward-wound, so `MuJoCo` takes its volume), and nothing else.
+fn mm_box_dir(tag: &str) -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("es-urdf-{tag}-{nanos}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let h = [50.0f32, 30.0, 10.0];
+    let corner = |i: usize| [0, 1, 2].map(|k| if i >> k & 1 == 1 { h[k] } else { -h[k] });
+    let quads = [
+        [0, 2, 3, 1],
+        [4, 5, 7, 6],
+        [0, 1, 5, 4],
+        [2, 6, 7, 3],
+        [0, 4, 6, 2],
+        [1, 3, 7, 5],
+    ];
+    let mut stl = vec![0u8; 80];
+    stl.extend(12u32.to_le_bytes());
+    for [a, b, c, d] in quads {
+        for tri in [[a, b, c], [a, c, d]] {
+            stl.extend([0u8; 12]);
+            for v in tri.into_iter().flat_map(corner) {
+                stl.extend(v.to_le_bytes());
+            }
+            stl.extend([0u8; 2]);
+        }
+    }
+    std::fs::write(dir.join("part.stl"), stl).unwrap();
+    dir
+}
+
+fn one_mesh_urdf(scale: Option<&str>) -> String {
+    let scale = scale.map_or_else(String::new, |s| format!(" scale=\"{s}\""));
+    format!(
+        "<robot name=\"r\"><link name=\"a\">\
+         <inertial><mass value=\"1\"/><inertia ixx=\"1\" iyy=\"1\" izz=\"1\" ixy=\"0\" ixz=\"0\" iyz=\"0\"/></inertial>\
+         <collision><geometry><mesh filename=\"part.stl\"{scale}/></geometry></collision>\
+         </link></robot>"
+    )
+}
+
+fn mesh_of(scene: &es_assets::SceneDesc) -> es_core::StableId {
+    match scene.bodies.iter().find(|b| b.name == "a").unwrap().geoms[0].shape {
+        Shape::Mesh { asset } => asset,
+        ref other => panic!("{other:?}"),
+    }
+}
+
+/// A millimetre STL at `scale="0.001 0.001 0.001"` reads as the MJCF `<mesh>` G2 writes for it:
+/// the same asset (`part@0.001`), the same `mesh_scales` entry, the same scaled vertices.
+#[test]
+#[allow(clippy::float_cmp)] // the same bits are the point
+fn urdf_mesh_scale_reads_as_mjcf_mesh_scale() {
+    let dir = mm_box_dir("scale");
+    let urdf = |scale| {
+        let mut import = parse_urdf(&one_mesh_urdf(scale), &no_packages()).unwrap();
+        es_assets::mesh::load(&mut import.scene, &dir).unwrap();
+        import
+    };
+    let import = urdf(Some("0.001 0.001 0.001"));
+    assert!(import.warnings.iter().all(|w| !w.message.contains("scale")));
+    let u = import.scene;
+    let mjcf = r#"<mujoco><asset><mesh name="part@0.001" file="part.stl" scale="0.001 0.001 0.001"/>
+        </asset><worldbody><body name="a"><geom name="g" type="mesh" mesh="part@0.001"/></body>
+        </worldbody></mujoco>"#;
+    let mut m = es_assets::parse_mjcf(mjcf).unwrap().scene;
+    es_assets::mesh::load(&mut m, &dir).unwrap();
+
+    let (ua, ma) = (mesh_of(&u), mesh_of(&m));
+    assert_eq!(ua, ma);
+    let asset = |s: &es_assets::SceneDesc| {
+        let a = s.assets.iter().find(|a| a.id == ua).unwrap();
+        (a.name.clone(), a.path.clone(), a.hash)
+    };
+    assert_eq!(asset(&u).0, "part@0.001");
+    assert_eq!(asset(&u), asset(&m));
+    assert_eq!(u.mesh_scales, m.mesh_scales);
+    assert_eq!(u.mesh_scales[&ua], [0.001; 3]);
+    assert_eq!(u.meshes[&ua].positions, m.meshes[&ua].positions);
+    let positions = u.mesh_positions(ua).unwrap();
+    assert_eq!(*positions, *m.mesh_positions(ua).unwrap());
+    assert_eq!(
+        extents(&positions),
+        [0.1, 0.06, 0.02].map(|e: f64| e as f32)
+    );
+
+    // Not uniform: every axis in the name. Absent and 1 add nothing: no `scene_hash` moves.
+    let u = urdf(Some("0.001 0.002 0.001")).scene;
+    let id = mesh_of(&u);
+    let name = &u.assets.iter().find(|a| a.id == id).unwrap().name;
+    assert_eq!(name, "part@0.001,0.002,0.001");
+    let (absent, one) = (urdf(None).scene, urdf(Some("1 1 1")).scene);
+    assert!(one.mesh_scales.is_empty());
+    assert_eq!(absent.scene_hash(), one.scene_hash());
+    assert_eq!(
+        one.assets[0].name, "collision1",
+        "an unscaled mesh keeps its geom's name"
+    );
+}
+
+fn extents(p: &[[f32; 3]]) -> [f32; 3] {
+    [0, 1, 2].map(|k| {
+        let (lo, hi) = p.iter().fold((f32::MAX, f32::MIN), |(lo, hi), v| {
+            (lo.min(v[k]), hi.max(v[k]))
+        });
+        hi - lo
+    })
+}
+
+/// A zero, negative or non-finite scale has no mesh to give; the parse fails naming `scale`.
+#[test]
+fn urdf_non_positive_mesh_scale_is_refused_by_name() {
+    for scale in ["0 0 0", "0.001 -0.001 0.001", "1 inf 1", "1 1"] {
+        let err = parse_urdf(&one_mesh_urdf(Some(scale)), &no_packages()).unwrap_err();
+        assert!(
+            matches!(err, UrdfError::BadAttr { attr: "scale", .. }),
+            "{err}"
+        );
+        assert!(err.to_string().contains("`scale`"), "{err}");
+    }
+}
+
+/// `MuJoCo` reading the URDF itself and reading the MJCF `write_mjcf` makes of our reading give
+/// the millimetre box its size in metres. Needs `ES_PYTHON` with `mujoco`; prints `SKIP` without.
+#[test]
+fn urdf_scaled_mesh_loads_on_mujoco_at_its_size() {
+    let Some(python) = std::env::var("ES_PYTHON")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+    else {
+        println!("SKIP urdf_scaled_mesh_loads_on_mujoco_at_its_size: ES_PYTHON is not set");
+        return;
+    };
+    let dir = mm_box_dir("mujoco");
+    let urdf = one_mesh_urdf(Some("0.001 0.001 0.001"));
+    std::fs::write(dir.join("r.urdf"), &urdf).unwrap();
+    let mut scene = parse_urdf(&urdf, &no_packages()).unwrap().scene;
+    es_assets::mesh::load(&mut scene, &dir).unwrap();
+    let out = dir.join("export");
+    std::fs::create_dir_all(&out).unwrap();
+    let xml = es_assets::mjcf::write_mjcf(&scene, &out).unwrap();
+    std::fs::write(out.join("scene.xml"), xml).unwrap();
+
+    let script = "import sys, mujoco\n\
+                  for p in sys.argv[1:]:\n\
+                  \x20   m = mujoco.MjModel.from_xml_path(p)\n\
+                  \x20   a, n = m.mesh_vertadr[0], m.mesh_vertnum[0]\n\
+                  \x20   v = m.mesh_vert[a:a + n]\n\
+                  \x20   print(*sorted(float(x) for x in v.max(0) - v.min(0)))\n";
+    let run = std::process::Command::new(&python)
+        .args(["-c", script])
+        .arg(dir.join("r.urdf"))
+        .arg(out.join("scene.xml"))
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&run.stdout);
+    assert!(
+        run.status.success(),
+        "{stdout}{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let ours = scene.mesh_positions(mesh_of(&scene)).unwrap();
+    let mut want = extents(&ours).map(f64::from);
+    want.sort_by(f64::total_cmp);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{stdout}");
+    for (what, line) in ["MuJoCo's URDF reader", "write_mjcf"].iter().zip(lines) {
+        let got: Vec<f64> = line.split(' ').map(|x| x.parse().unwrap()).collect();
+        println!("{what}: extents {got:?} (ours {want:?})");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-6, "{what}: {got:?} vs {want:?}");
+        }
+    }
+}
+
 #[test]
 fn urdf_unknown_element_is_a_warning_not_an_error() {
     let xml = "<robot name=\"r\"><link name=\"a\"/><totally_unknown foo=\"bar\"/></robot>";
