@@ -23,7 +23,8 @@ MJCF, TOML IR, Rust를 쓰지 않고 학습시킨다.
 | 웨이브 | 작업 | 선행 |
 |---|---|---|
 | 1 | G1 장면 문서 · G2 완전한 MJCF 내보내기 | — |
-| 2 | G3 작업 명세 + `es project generate` · G4 `es render` / `es scene simulate` | G1 |
+| 2 | G3a 작업 명세 → Task IR · G4 `es scene simulate`와 ①의 물리 미리보기(`es render`는 H8/H9로 들어왔다) | G1 |
+| 2b | G3b 나머지 문서 + `es project generate` | G3a |
 | 3 | G5 에디터 장면 모델 · G6 뷰포트 선택과 기즈모 | G1, G4, H8 |
 | 4 | G7 추가(프리미티브, 메시, 로봇, 카메라, 조명, 영역) · G8 문장 편집기 | G5, G3 |
 | 5 | G9 빈 프로젝트 카드, 템플릿으로 저장, 생성된 작업을 위한 ② 교사 | G3, G8 |
@@ -73,3 +74,57 @@ MJCF, TOML IR, Rust를 쓰지 않고 학습시킨다.
   생성한 `SceneDesc`에 대한 속성 테스트. (2) MuJoCo(Python, `ES_PYTHON`이 없으면 건너뜀)가 내보낸
   파일을 로드해 스텝한 결과가, SO-101과 Shadow Hand 장면에서 원본을 로드한 MuJoCo와 비트 단위로
   같다(H1의 일치 방법). (3) 커밋된 골든은 움직이지 않는다.
+
+### 작업 G3a: 작업 명세가 Task IR로 컴파일된다
+
+**Files:** `crates/es-script/src/spec/**`(새 파일: `*.estask` 모델과 그 컴파일러),
+`crates/es-script/src/lib.rs`(모듈 줄), `crates/es-script/Cargo.toml`(`es-assets`, 필요하면 `toml`),
+`crates/es-script/tests/estask*.rs`, `tests/fixtures/estask/`의 새 픽스처, 스키마가 세부 사항을
+확정하면 `docs/design/scene-authoring.md`(+ko) §4.
+
+- 설계 §4의 `*.estask` 모델(serde, TOML, `kind = "task-spec"`, `schema = 1`): `scene`, `robot`
+  (include), `control_hz`, `[success]` / `[failure]` 절 목록, `timeout_s`, `[start]`(배치, 🎲 항목,
+  강도), `[observe]`(해상도와 render를 가진 카메라, 상태 채널, 특권 채널), `[reward]`(수준, 셰이핑).
+  읽기와 쓰기를 하고, 알 수 없는 키는 이름을 대어 거부하며, §4.1의 관계는 `touches`를 뺀 전부를
+  다룬다(`GetContact`가 낮춰질 때까지 `touches`는 이름을 대어 거부한다).
+- `compile_task(spec, scene_dir) -> TaskIr`: 장면은 G1의 `load_scene` 경로로 읽고, 이름은
+  `StableId`로 해석하며(없는 이름은 그 이름을 대어 거부), 각 절은 §4.1의 노드로, 보상은 §4.1대로,
+  리셋과 무작위화, `ObservationSpec` 채널과 그 센서(`render`는 Task IR이 선언하는 그대로), 로봇의
+  액추에이터로부터 `ActionSpec`을 만든다.
+- **오라클:** (1) Shadow Hand repose 작업의 명세는 **`tests/fixtures/shadow-hand/task-repose.toml`과
+  `task_hash`가 같은** Task IR로 컴파일된다(커밋된 문서가 기준이며, 컴파일러는
+  `crates/es/tests/shadow_hand.rs`가 손으로 만들던 것을 넘겨받는다). (2) SO-101 세 시점 작업
+  `tests/fixtures/visible-learning/task-views.toml`도 같다. 커밋된 문서에 어휘로 표현할 수 없는
+  구성이 있으면 어휘를 최소한으로 확장하고 무엇을 확장했는지 밝힌다(커밋된 문서는 바꾸지 않는다).
+  (3) 각 관계를 스크립트된 상태에서 검사한다: 참 / 거짓과 그 보상(H2의
+  `the_task_scores_scripted_states`처럼). (4) 거부는 절과 필드를 이름으로 댄다. (5) 커밋된 해시는
+  움직이지 않는다.
+
+### 작업 G3b: 나머지 문서와 `es project generate`
+
+**Files:** `crates/es-script/src/spec/**`, `crates/es/src/cmd/project.rs`(새 파일)와 그 등록, 테스트,
+픽스처. G3a 이후.
+
+- 명세와 장면으로부터: Observation IR(교사 상태, 학생 시점), Learning IR(상태 MLP 교사, 세 시점 ACT
+  학생, `tanh` 헤드 — H6의 불변식), Deployment IR(조인트와 제어 범위에서 낸 엔벨로프), Evaluation
+  IR(홀드아웃 시드, 해당하는 스위트, nominal 전용 짝), 학습 레시피, 사이클을 만든다. `es project
+  generate --scene <s> --spec <t> --out <dir>`이 이것들을 쓴다. **오라클:** Shadow Hand와 SO-101
+  views 명세는 각 세트의 커밋된 모든 문서를 해시 단위로 재생성한다(커밋된 파일이 스스로 생성된
+  것이었다면 본문은 바이트 단위로).
+
+### 작업 G4: `es scene simulate`와 ①의 물리 미리보기
+
+**Files:** `crates/es/src/cmd/scene.rs`(G2의 `export` 옆에 `simulate` 동사), 그 테스트,
+`crates/es-editor-model/src/model/{scene_view,viewport}.rs`(미리보기의 결정),
+`crates/es-editor/src/**`(버튼과 재생), i18n 표.
+
+- `es scene simulate <scene> --seconds S [--ctrl hold|zero] [--backend mujoco-cpu] --out
+  <traj.estraj>`: 장면을 초기 자세에서 시작해, 모든 액추에이터를 초기 목표에 고정하거나(`hold`) 0으로
+  두고(`zero`) S초 동안 스텝하며, 궤적은 리플레이가 읽는 `.estraj` 형식으로 쓴다. Task IR는
+  필요 없다(장면만으로 된다).
+- ①: "물리 미리보기" 버튼이 이를 실행하고(모든 에디터 실행처럼 argv로) 결과를 H8/H9의 렌더러와
+  리플레이의 타임라인으로 뷰포트에서 재생한다. 실행 중과 실패했을 때(매핑 보고서의 거부를 이름으로
+  댄다)의 쉬운 말 상태를 보여 준다.
+- **오라클:** CLI의 궤적은 같은 장면을 `MuJoCoCpuBackend`로 직접 스텝한 것과 같다(`mujoco-cpu`에서
+  비트 단위). 평면 위에서 떨어뜨린 큐브는 그 위에 멈춘다. 뷰모델의 결정은 헤드리스로 검사한다.
+  Shadow Hand 프로젝트에서 찍은 미리보기 스크린샷.
