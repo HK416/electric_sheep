@@ -752,6 +752,52 @@ the same lowering the env uses. There is no IR change and no hash change.**
   at its width in a top-aligned wrapping row. ②'s Test tooltip gives the teacher evaluation's own
   attempts, episodes times suites (`teacher::attempts`: 16 for GV, 64 for the hand), not "64".
 
+### 4.9 Holding for a while (design for packet M18/K7, M17's F-8)
+
+**The problem.** "[box] is still" is decided on one control tick. A tumbling box that is slow for a
+moment on landing satisfies it (M17 GV), and "for 1 s" in section 4.1's table only means "nearly
+still now", because IR-D has no hold node.
+
+**Why not a new IR-D node.** Spec §6.2 makes IR-D a pure DAG with no side effects, and §6.3 sends
+`Wait` / `Repeat` / `Condition` to IR-C. A node whose output depends on earlier ticks breaks that.
+IR-C (`docs/design/control-graph.md`) can express a dwell. Its stage predicates, however, are
+`Expr`s over raw ports, so the compiler would have to write every clause a second time in another
+language, outside the lowering R8's explanations rely on.
+
+**Decision: the hold belongs to the `Terminate` sink, not to the graph.**
+- **The schema.** `Terminate { kind, hold_ticks: Option<u32> }`. With `hold_ticks = n`, the episode
+  ends with `kind` on the first control tick at which the sink's predicate has been true on each of
+  the last `n` ticks, counted per env. The counter is an integer that resets with the episode.
+- **Where it lives.** The predicate cone stays the same pure DAG. The counter lives where the episode
+  budget is already counted (`episode::evaluate`, `Env`'s per-env state), so no IR-D node gains
+  state.
+- **Hashes.** `None` (absent) is today's behaviour bit for bit, and it serializes and hashes as
+  absent. No committed `task_hash` moves.
+- **Spec.** §6.3's `Terminate` line gains the optional hold. This is a spec edit, ko first, in the
+  packet.
+
+**The specification and the sentences.**
+- **The field.** `[success] hold_s = 1.0` holds the whole success set: "all of these hold for 1 s".
+  The same field exists under `[failure]`. `hold_s × control_hz` must be whole ticks and is
+  refused by name otherwise.
+- **The sentence.** It gets the slot in its section header: "아래가 모두 [1초] 동안 맞으면 성공",
+  "Succeeds when all of these hold for [1 s]". Empty means today's "the moment they all hold".
+- **Why one hold per section.** A per-clause hold would need a counter per clause and an IR change to
+  name them. A whole-section hold says what people mean ("the box rests in the bin"), and the
+  instantaneous `still` clause stays as it is.
+
+**R8's explanations.** A failed attempt whose end row satisfies every success clause, but which ended
+without the hold, is explained as "they held for only X s, less than 1 s". X is counted back from
+the end through the trajectory's rows, one row per control tick, with the same per-clause reading.
+
+**Oracles.**
+- On scripted tick sequences, `hold_ticks = n` fires exactly on the `n`-th consecutive true tick,
+  never earlier, and restarts after a false tick.
+- With `hold_ticks` absent, every committed `task_hash` and rollout golden is unchanged.
+- In an `mujoco-cpu` episode where a box lands and bounces, the instantaneous success fires at the
+  bounce and the 1 s hold does not.
+- The sentence round-trips the field, and R8 explains a too-short hold.
+
 ## 5. The editor (① and ②)
 
 - **Hierarchy panel**: the scene tree (includes folded), search, visibility; drag to re-parent.

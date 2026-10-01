@@ -53,7 +53,8 @@
 | 2 | K4 (es-eval, es's train and eval verbs) · K5 (es-import, es-render's CPU path) · K6 (es-editor-scene's sentences, es-assets' scene model) |
 | 3 | K7 the hold node (M17's F-8) · K8 URDF mesh scale |
 
-- **K7, the hold node (M17 F-8).** "[box] is still for [1 s]" compiles today to "still now" (IR-D
+- **K7, holding for a while (M17 F-8).** Design: `docs/design/scene-authoring.md` section 4.9 (a
+  `hold_ticks` on the `Terminate` sink, not a new IR-D node). The paragraph below was the first sketch. "[box] is still for [1 s]" compiles today to "still now" (IR-D
   has no hold node), so a box momentarily slow while tumbling counts.
   - A stateful node (true while its input has held for `n` control ticks, per env, reset with the
     episode) is a spec change to the Task IR's node set (§6, ko first).
