@@ -13,6 +13,7 @@ mod learning;
 mod project;
 mod recipes;
 mod robot;
+pub mod vocab;
 
 use std::collections::BTreeMap;
 

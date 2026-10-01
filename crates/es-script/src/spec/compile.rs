@@ -1111,22 +1111,11 @@ fn value_or_range(at: &str, item: &StartItem, k: Option<f64>) -> Result<Distribu
 
 /// Which fields a relation takes, and which it needs.
 fn check_fields(at: &str, c: &Clause) -> Result<(), SpecError> {
-    let (fields, needs, shaping): (&[&str], &[&str], Option<Shaping>) = match c.relation {
-        Relation::Inside if c.object.is_some() => (&["object"], &[], None),
-        Relation::Inside => (&["range"], &["range"], Some(Shaping::Ramp)),
-        Relation::Above | Relation::Below if c.object.is_some() => (&["object", "m"], &[], None),
-        Relation::Above | Relation::Below => (&["value"], &["value"], None),
-        Relation::Still => (&["speed", "angular"], &["speed"], None),
-        Relation::Near | Relation::FartherThan => {
-            (&["object", "point", "m"], &["m"], Some(Shaping::Distance))
-        }
-        Relation::OrientationMatches => (
-            &["object", "within_deg"],
-            &["object", "within_deg"],
-            Some(Shaping::InverseAngle),
-        ),
-        Relation::Touches => (&[], &[], None),
-    };
+    let super::vocab::Takes {
+        fields,
+        needs,
+        shaping,
+    } = super::vocab::takes(c.relation, c.object.is_some());
     let present = [
         ("object", c.object.is_some()),
         ("point", c.point.is_some()),
