@@ -13233,6 +13233,67 @@ fn run_rl_train_with(
     Some((out, said))
 }
 
+/// Packet M17/GV: an authored project runs `es` in its own folder, on a scene document. The
+/// `[rl]` route finds its trainer above the executable, not in the working directory, and
+/// hands the rollout the document written as one MJCF (G2's writer), whose `scene_hash` is
+/// the one the Task IR pins (`Env::new` refuses any other). The scene is SO-101's mirror
+/// document (`tests/fixtures/esscene/so101_pick_place.esscene`, G1: the same `scene_hash` as
+/// the MJCF the demo's Task IR names).
+#[test]
+fn train_rl_runs_a_scene_document_outside_the_repository() {
+    let Ok(python) = std::env::var("ES_PYTHON") else {
+        println!(
+            "SKIP train_rl_runs_a_scene_document_outside_the_repository: ES_PYTHON is not set"
+        );
+        return;
+    };
+    let dir = scratch_dir("train-rl-esscene");
+    let doc = train_root().join("tests/fixtures/esscene/so101_pick_place.esscene");
+    assert!(doc.is_file(), "{}", doc.display());
+    let task = std::fs::read_to_string(vl_fixture("task.toml")).expect("the demo's Task IR");
+    let from = "path = \"tests/fixtures/mjcf/so101_pick_place.xml\"";
+    assert!(task.contains(from));
+    let task = task.replace(from, &format!("path = \"{}\"", train_toml_path(&doc)));
+    write(&dir.join("task.toml"), &task);
+    // The Observation IR cites the Task IR by hash, and the scene's path is part of it.
+    let ir = es_ir::serial::task_from_toml(&task).expect("the Task IR parses");
+    let text = std::fs::read_to_string(rl_fixture("observation-state.toml")).expect("obs");
+    let mut obs = es_ir::serial::observation_from_toml(&text).expect("the Observation IR");
+    obs.task_ref = ir.task_hash().expect("a task hash");
+    let obs = es_ir::serial::observation_to_toml(&obs).expect("the Observation IR writes");
+    write(&dir.join("observation.toml"), &obs);
+    let bytes = pack_untrained(
+        &dir.join("task.toml"),
+        &dir.join("observation.toml"),
+        &rl_fixture("learning-state.toml"),
+        &rl_fixture("deployment-rl.toml"),
+    );
+    let bundle = dir.join("untrained.esb");
+    std::fs::write(&bundle, bytes).expect("write the bundle");
+    let recipe = rl_recipe(&bundle, 1, 2, 4, "1").replace(
+        "interpreter   = \"es-no-such-interpreter\"",
+        "interpreter   = \"python\"",
+    );
+    write(&dir.join("recipe.toml"), &recipe);
+    let done = bin()
+        .current_dir(&dir)
+        .args(["train", "--recipe", "recipe.toml", "--out", "run"])
+        .output()
+        .expect("run es train");
+    let said = format!("{}{}", stdout(&done), stderr_of(&done));
+    if said.contains("cannot import") || said.contains("es_native is not importable") {
+        println!("SKIP: {python} cannot import what the rl route needs\n{said}");
+        return;
+    }
+    assert!(done.status.success(), "es train failed:\n{said}");
+    assert!(dir.join("run/checkpoints/1.esb").is_file(), "{said}");
+    let xml = std::fs::read_to_string(dir.join("run/docs/scene.xml")).expect("docs/scene.xml");
+    assert!(
+        xml.trim_start().starts_with('<'),
+        "the document went out as MJCF:\n{xml}"
+    );
+}
+
 /// Oracle 2. Two runs of one `[rl]` recipe on the CPU backend are bitwise equal -- every
 /// checkpoint, the `training_hash` and the loss curve -- and the run records what it does not
 /// know rather than inventing it.

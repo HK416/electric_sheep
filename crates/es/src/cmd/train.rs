@@ -630,19 +630,33 @@ pub(crate) fn run(
         // one self-contained directory and the trainer parses no TOML to find an XML file.
         // `scene.path` is repository-relative and `es train` runs from the repository root.
         let scene = &bundle.task.scene.path;
-        let bytes = std::fs::read(scene).map_err(|e| {
-            bad(format!(
-                "{scene}: {e}\nThe Task IR's `scene.path` is repository-relative; run `es \
-                 train` from the repository root."
-            ))
-        })?;
+        let document = Path::new(scene)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("esscene"));
+        // A scene document (packet M17/G1) and what it includes are one MJCF here, with its
+        // mesh and texture files beside it: G2's writer, whose reading back is the same scene
+        // (`Env::new` checks the Task IR's `scene_hash` on it).
+        let bytes = if document {
+            let expanded = super::backend::load_scene(scene)?;
+            let xml = es_assets::mjcf::write_mjcf(&expanded, &docs)
+                .map_err(|e| bad(format!("{scene}: as MJCF: {e}")))?;
+            xml.into_bytes()
+        } else {
+            std::fs::read(scene).map_err(|e| {
+                bad(format!(
+                    "{scene}: {e}\nThe Task IR's `scene.path` is relative to the working \
+                     directory: the repository root, or an authored project's own folder."
+                ))
+            })?
+        };
         write_file(&docs.join("scene.xml"), &bytes)?;
         // The mesh and texture files the scene names, at the same scene-relative paths, so the
         // rollout resolves them against `docs` exactly as `load_scene` does against the scene's
         // own directory (packets M16/H2, H1b). A primitives-only scene names none; a builtin
         // texture (`builtin="checker"`) names no file.
-        let parsed = std::str::from_utf8(&bytes)
-            .ok()
+        let parsed = (!document)
+            .then(|| std::str::from_utf8(&bytes).ok())
+            .flatten()
             .and_then(|xml| es_assets::parse_mjcf(xml).ok());
         let scene_dir = Path::new(scene).parent().unwrap_or(Path::new("."));
         for asset in parsed.iter().flat_map(|p| &p.scene.assets) {
@@ -757,7 +771,9 @@ pub(crate) fn fetch_base_model(plan: &Plan, recipe: &Recipe) -> Result<(), CliEr
     }
     let command = words.join(" ");
     println!("$ {command}");
-    let why = match Command::new(&words[0]).args(&words[1..]).status() {
+    let mut fetch = Command::new(&words[0]);
+    fetch.arg(installed(&words[1])).args(&words[2..]);
+    let why = match fetch.status() {
         Ok(status) if status.success() => return Ok(()),
         Ok(status) => format!("it exited with {}", status.code().unwrap_or(-1)),
         Err(e) => format!("{}: {e}", words[0]),
@@ -768,6 +784,22 @@ pub(crate) fn fetch_base_model(plan: &Plan, recipe: &Recipe) -> Result<(), CliEr
          (set ES_PYTHON to one that has them) and, the first time, the network. Nothing else \
          has run."
     )))
+}
+
+/// One of `es`'s own scripts (`python/es/train_ppo.py`, ...): as the plan names it when it is
+/// there from the working directory (the repository root, as before), else the same path
+/// under the nearest folder above this executable that holds it. An authored project runs `es`
+/// in its own folder (packet M17/G9), where the repository's scripts are not.
+fn installed(script: &str) -> PathBuf {
+    let rel = Path::new(script);
+    if rel.is_absolute() || rel.exists() {
+        return rel.to_path_buf();
+    }
+    let exe = std::env::current_exe().ok();
+    (exe.iter().flat_map(|e| e.ancestors().skip(1)))
+        .map(|dir| dir.join(rel))
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| rel.to_path_buf())
 }
 
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), CliError> {
@@ -967,7 +999,10 @@ fn spawn(
 ) -> Result<Value, CliError> {
     let capture = route.captures_trainer_stdout();
     let mut cmd = Command::new(&step.prefix[0]);
-    cmd.args(&step.prefix[1..]).args(&step.args);
+    let script = step.prefix.get(1).map(|s| installed(s));
+    cmd.args(script)
+        .args(step.prefix.iter().skip(2))
+        .args(&step.args);
     let extra = watch.trainer_flags(route);
     if !extra.is_empty() {
         println!("  + {}", extra.join(" "));
@@ -1504,9 +1539,28 @@ mod tests {
     use serde_json::{json, Value};
 
     use super::{
-        lerobot_said, progress_row, progress_step, relay, rl_row, training_bar, CheckpointWatch,
-        LerobotProgress, LerobotSaid,
+        installed, lerobot_said, progress_row, progress_step, relay, rl_row, training_bar,
+        CheckpointWatch, LerobotProgress, LerobotSaid,
     };
+
+    /// Packet M17/GV: a test runs in `crates/es`, where `python/es/` is not, as an authored
+    /// project's `es` runs in the project's folder; the trainer is found above the executable.
+    #[test]
+    fn a_trainer_script_is_found_above_the_executable() {
+        for script in [es_data::training::TRAIN_PPO, es_data::training::TRAIN_ACT] {
+            assert!(!Path::new(script).exists(), "the test's cwd holds {script}");
+            let found = installed(script);
+            assert!(
+                found.is_absolute() && found.is_file(),
+                "{script}: {found:?}"
+            );
+            assert!(found.ends_with(script), "{found:?}");
+        }
+        assert_eq!(
+            installed("no/such/script.py"),
+            Path::new("no/such/script.py")
+        );
+    }
 
     // Copied from a real `lerobot-train` 0.6.1 run (Y-V item 1, `target/yv/cube-cam/runs/001/
     // es.log`). tqdm and the logger both write stderr, so a metric line lands on the end of
