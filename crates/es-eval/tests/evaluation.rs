@@ -3314,9 +3314,11 @@ fn demo_trajectories_are_unmoved() {
         h.update(name.as_bytes());
         h.update(&std::fs::read(traj_dir.join(name)).expect("the trajectory"));
     }
+    // Packet M17/R2 (the owner approved the move, 2026-10-01): each file gained its last row,
+    // the state its episode ended in; no earlier row changed. It was 52869bb8...0c716.
     assert_eq!(
         h.finalize().to_hex().to_string(),
-        "52869bb8e65fc8ffbd78398ffa0a9d601a2118a7c4b4e2b36733181714f0c716",
+        "030c5682cc3323914f6b48c20203bebffdc2821e6beb924fef20a940d93e3e38",
         "a JointPosition state trajectory moved"
     );
 
