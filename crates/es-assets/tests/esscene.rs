@@ -428,17 +428,32 @@ fn doc() -> impl Strategy<Value = EsScene> {
             quat: None,
             size,
         });
-    let include =
-        (name(), name(), opt(name()), opt(arr::<3>())).prop_map(|(name, source, prefix, pos)| {
-            Include {
-                name,
-                source,
-                prefix,
-                pos,
-                quat: None,
-                set: None,
-            }
-        });
+    // Override targets are TOML keys: names with `:`, `/`, `.` and spaces must come back.
+    let set = prop::collection::btree_map(name(), opt(finite()), 0..3).prop_map(|joints| {
+        es_assets::esscene::IncludeSet {
+            joint: joints
+                .into_iter()
+                .map(|(k, damping)| {
+                    let set = es_assets::esscene::JointSet {
+                        damping,
+                        ..Default::default()
+                    };
+                    (k, set)
+                })
+                .collect(),
+            ..Default::default()
+        }
+    });
+    let include = (name(), name(), opt(name()), opt(arr::<3>()), opt(set)).prop_map(
+        |(name, source, prefix, pos, set)| Include {
+            name,
+            source,
+            prefix,
+            pos,
+            quat: None,
+            set,
+        },
+    );
     let physics = opt(
         (opt(finite()), opt(0u32..100)).prop_map(|(timestep, iterations)| Physics {
             timestep,
