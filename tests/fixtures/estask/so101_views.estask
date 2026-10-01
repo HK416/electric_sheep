@@ -1,0 +1,43 @@
+# The SO-101 cube-into-bin demo seen by three cameras (plan N) as a person writes it. It
+# compiles to tests/fixtures/visible-learning/task-views.toml's task_hash
+# (crates/es-script/tests/estask.rs); task.toml's header says why each number is what it is.
+kind = "task-spec"
+schema = 1
+scene = "tests/fixtures/mjcf/so101_pick_place_views.xml"
+robot = "base"
+control_hz = 50
+timeout_s = 36.0
+
+# The cube over the bin's floor, settled, and the gripper let go.
+[success]
+clauses = [
+  { subject = "cube.x", relation = "inside", range = [0.09, 0.19], shaping = "ramp", ramp = [0.09, 0.3], weight = -1.0, term = "cube_towards_bin" },
+  { subject = "cube.x", relation = "still", speed = 0.05 },
+  { subject = "gripper", relation = "above", value = 0.85 },
+]
+
+# The cube pushed out of the arm's reach.
+[failure]
+clauses = [
+  { subject = "cube.x", relation = "above", value = 0.55 },
+]
+
+# The arm at home, the cube on the table; where on the table is the dice's.
+[start]
+items = [
+  { what = "shoulder_pan", range = [0.0, 0.0], stream = "reset.0" },
+  { what = "shoulder_lift", range = [0.0, 0.0], stream = "reset.1" },
+  { what = "elbow_flex", range = [0.0, 0.0], stream = "reset.2" },
+  { what = "wrist_flex", range = [0.0, 0.0], stream = "reset.3" },
+  { what = "wrist_roll", range = [0.0, 0.0], stream = "reset.4" },
+  { what = "gripper", range = [0.0, 0.0], stream = "reset.5" },
+  { what = "cube.z", range = [0.02, 0.02], stream = "reset.cube.z" },
+  { what = "cube.x", range = [0.21, 0.27], dice = true },
+  { what = "cube.y", range = [-0.03, 0.05], dice = true },
+]
+
+[observe]
+cameras = ["overhead", "wrist", "side"]
+camera_px = 96
+state = { joint_state = "robot.joint_pos" }
+privileged = { sim_cube_pose = "cube.qpos" }

@@ -286,6 +286,92 @@ suites that apply), `training-*.toml`, `cycle.toml`. Every hash is derived, none
 committed generators in `crates/es/tests/{views,shadow_hand}.rs` become regression oracles:
 the SO-101 and Shadow Hand specs regenerate their committed documents byte for byte.
 
+### 4.3 What G3a settled (the schema as built)
+
+`crates/es-script/src/spec/` (`TaskSpec::from_toml` / `to_toml`, `compile_task(spec, root)`),
+oracles `crates/es-script/tests/estask*.rs`. The two specs
+`tests/fixtures/estask/{shadow_hand_repose,so101_views}.estask` compile to the `task_hash` of
+`tests/fixtures/shadow-hand/task-repose.toml` and `tests/fixtures/visible-learning/task-views.toml`
+(the semantic hash; `task_graph_hash` differs: the compiler numbers nodes in the spec's order,
+the committed documents in their generators' — SO-101's in its history, the gripper clause
+appended at 31–33). Where it differs from the example above, and what the text left open:
+
+- **Top level**: `scene` is relative to the project root `compile_task` is given and is written
+  into `SceneRef.path` as written; `asset_hash` is blake3 of the scene file's bytes for every
+  kind, an `.esscene` too (what an include brings is in `scene_hash` through the `SceneDesc` and
+  its per-asset content hashes). `robot` names the robot's **root body**, not an include handle
+  (an include can have several roots: the Shadow Hand file's `floor0`); its subtree's joints are
+  `robot.joints`, and every actuator of the scene is its action (`JointPosition`, one robot per
+  task). `timeout_s × control_hz` must be whole: it is `max_episode_steps`, and
+  `time since reset ≥ timeout_s` is the `Timeout` node.
+- **Clauses** (`[success]` all, `[failure]` any): `{ subject, relation, ... }`, folded in
+  document order with `And` into one `Terminate(Success)` and with `Or` into one
+  `Terminate(Failure)`. A **scalar** subject (`inside`, `above`, `below`, `still`) is a joint (a
+  robot joint is read through the robot's root body, as the robot's joint vector; another joint
+  through itself) or `<body>.x`, the first coordinate of the body's free joint — the one lane
+  `GetJointState` reads. A **body** subject (`near`, `farther_than`, `orientation_matches`) is a
+  body. Fields: `inside` `range = [lo, hi]`; `above` / `below` `value`; `still` `speed` (the
+  velocity within ±speed); `near` / `farther_than` `m` and either `object` (a body: `Arith Sub`,
+  `Norm`) or `point = [x, y, z]` (no constant node, so `p − point` is a per-lane `Normalize` over
+  `[point − 1, point + 1]`, plan H's construction, and `m` < 1); `orientation_matches` `object`
+  and `within_deg` (`|q·g| ≥ cos(θ/2)`). A field a relation does not take, or a missing one, is
+  refused naming the clause (`success[1] (cube.x still)`) and the field; unknown keys by name.
+- **What does not lower yet is refused by name**: `touches` (`GetContact`); `<body>.y` / `.z`,
+  and with them `inside` a region, `above` / `below` another body and a 3-axis `still`. The
+  cone lowering (`crates/es-env/src/plan.rs`) has no `Slice`, `Concat`, `Reduce` or
+  `GetBodyVelocity` — the node list at the top of 4.1 overstates it — so today `inside` is the
+  subject's x span and `still` its x velocity, exactly task.toml's ceiling ("the bin's x span
+  plus a settling bound"). Lowering `Slice` there is the item that makes them 3-axis.
+- **Shaping**, per clause, named where the references needed more than 4.1: `shaping` is the
+  term's form, `weight` its weight, `term` its name (absent `<subject>_<shaping>`): `distance`
+  (`near` / `farther_than`: `weight × distance`, clamped to [0, 1] m), `ramp` (`inside`, with
+  `ramp = [a, b]`: `weight × (s − a)/(b − a)` clamped to [0, 1] — SO-101's `cube_towards_bin`),
+  `inverse_angle` (`orientation_matches`: `weight / (s + 0.1)`, `s = √(8(1 − |q·g|))`, as its
+  piecewise-linear interpolant at plan H's nine knots, terms `<term>_0..7`, plus `<term>_floor`
+  paid every step). `[reward]`: `scale` multiplies every weight (rl_games' `scale_value`, the
+  Shadow Hand's 0.01); `success` / `failure` are the sparse terms of those names, fed by the
+  folded predicate. Weights are numbers in the document; the check boxes' three levels are the
+  sentence editor's (G8) to write as numbers.
+- **Start** items `{ what, ... }`: `robot.joints` (`noise` is the fraction of each joint's
+  range, Isaac Lab's `reset_dof_pos_noise`; `coupled = true` lets a joint coupled to another by
+  a two-joint fixed tendon draw from the other's stream, scaled by the coupling — plan H's
+  J0/J1), a joint, `<body>.x|y|z` (`value`, `value ± noise`, or `range`), or
+  `<body>.orientation` with `draw` (below). `value` is a `Constant` (also at zero noise), `range`
+  a `Uniform` always (task.toml's `Uniform{0, 0}` home pose). `stream` names the draw (absent:
+  `what`, or `reset.<joint>`); items on one stream share its draw. `dice = true` (🎲) makes a
+  `Randomization` node instead of a `ResetState` (task.toml's cube x / y); `strength` scales
+  every 🎲 item's `range` about its centre and its `noise` (absent: as written).
+- **Orientation draws** (the owner, 2026-10-01: switching the Shadow Hand from yaw-only to
+  flipping the cube is one sentence). A reset node writes one number, so each quaternion lane is
+  one draw (lanes on one stream share it), and the backend normalizes what is written — MuJoCo
+  and MJWarp, `xquat` at once and `qpos` after the first step (H2b; again for `any` by
+  `the_backends_normalize_a_drawn_quaternion`):
+  - `draw = "yaw"` (+ `tilt`): plan H's `(1, t, −t·u, u)`, one `u ~ U(−1, 1)`: the resting tilt
+    `2·atan(t)` about world X and a yaw `2·atan(u)` over the half turn [−90°, 90°].
+  - `draw = "tilt"`, `tilt_max_deg = θ` (< 180): `(1, a, b, g)`, `a, b ~ U(−m, m)`,
+    `m = tan(θ/2)/√2`, `g ~ N(0, 1)`. The tilt from vertical never exceeds θ
+    (`a² + b² ≤ tan²(θ/2)·(1 + g²)`, reached at `g = 0` and the corners) and every heading is
+    drawn (`2·atan(g)`: 68 % within ±90°, 8 % beyond ±120°). This is the closest exact
+    construction, not a uniform one (neither over the cap nor in yaw): a tilt bound needs the yaw
+    pair `(w, z)` away from zero, and no bounded draw of that pair covers every heading (its set
+    is a box, and a convex set whose directions span a half turn reaches the origin), so the yaw
+    lane is unbounded instead.
+  - `draw = "any"`: four `N(0, 1)` lanes on `<stream>.w|x|y|z`, normalized by the backend:
+    uniform over SO(3), to the precision of `EnvRng`'s Box–Muller.
+- **Observe**: `cameras` (channel `rgb_<camera>`, `camera_px` square RGB8, the `ImageSpec` the
+  renderer delivers at the control rate) and one `render` for all; `state` and `privileged` are
+  **tables** `channel = "source"`, not lists — channel names are hash input and the reference
+  documents' follow no one rule (`object_vel`, `target_qpos`, `sim_cube_pose`). Sources:
+  `robot.joint_pos` (`JointState` on the root body: the leading `dof`, refused unless the
+  robot's joints lead the scene's), `robot.joint_vel` (`JointState` on the first joint: one input
+  buffer per id), `robot.previous_action` (`initial` each ctrlrange's centre), `<body>.pose`
+  (`BodyPose`), `<body>.qpos` / `<body>.vel` (the free joint's 7 / 6). `state` and `privileged`
+  (the teacher's extra inputs) are one `ObservationSpec` in the Task IR; G3b reads the split.
+- **Numbers from libm**: `within_deg`'s cosine, a camera's focal length and `tilt_max_deg`'s `m`
+  use the host's `cos` / `tan`, as the generators this replaces did (the first two agree with the
+  committed documents on this PC). A correctly rounded implementation would make a generated document
+  host-independent (M10's `scene_hash` lesson) — open.
+
 ## 5. The editor (① and ②)
 
 - **Hierarchy panel**: the scene tree (includes folded), search, visibility; drag to re-parent.
