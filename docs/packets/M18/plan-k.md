@@ -68,3 +68,54 @@
     writes it before the packet runs.
 - **K8, URDF mesh scale.** A URDF `<mesh scale>` maps onto R3's `SceneDesc::mesh_scales` instead of
   warning.
+
+## As merged (2026-10-02)
+
+All eight packets are merged. `cargo xtask ci` is green at `ba7c7fe` with `ES_PYTHON`. No golden or committed hash moved.
+
+**Files (K1–K6).** The 14 files over 1,000 counted lines are split by responsibility. Each parent
+stays at its path and re-exports what moved, so no other crate and no cited path changed.
+
+| packet | files | largest module now |
+|---|---|---|
+| K1 `f1e32b4`, `c3d9d2a` | `es-data` `training.rs` (9 modules), `collect.rs` (5) | `collect.rs` 514 |
+| K2 `1db60d9`, `72c2c0e` | `es-editor` `ui/advanced.rs` (9), `ui/author.rs` (5 new) | `author/inspector.rs` 469 |
+| K3 `0dc231c`, `3e6cf85`, `c1168a7` | `es-ir` `task.rs`, `learning.rs`; `es-script` `compile.rs` | `task/node.rs` 582 |
+| K4 `361142a`, `4456cfa`, `3e229b8` | `es-eval` `runner.rs`; `es` `cmd/train.rs`, `cmd/eval.rs` | `runner.rs` 629 |
+| K5 `c86dab7`, `2e74a21` | `es-render` `cpu.rs`; `es-import` `rl_import.rs` | `rl_import.rs` 480 |
+| K6 `16a706d`, `3935fbb` | `es-assets` `scene.rs`; `es-editor-scene` `sentence.rs` | `scene/hash.rs` 480 |
+
+**How each split was checked.**
+- **Line diff:** exact line ranges were copied, and a multiset line diff against the original was
+  empty except for imports, module docs, re-exports and `pub(super)`.
+- **Test names:** the same before and after.
+- **Source scans:** every test that reads source as text was kept true. Two `es-eval` tests count
+  calls in `run_episode`, so it stayed in `runner.rs`.
+- **Renderer:** the CPU path reproduces every render golden bit for bit.
+- **Editor:** six pairs of screenshots, taken before and after the split, are pixel-identical.
+- **Hashes:** a probe over 15 fixtures found `scene_hash`, `Debug` and TOML byte-identical.
+
+**Crate totals.** They rose slightly with the new import lines. `es-ir` crossed its 6,000-line
+target (6,031), and the four crates already over it stay WARN. The owner chose file level only, so
+no crate was split.
+
+**Features (K7, K8).**
+- **K7 `72a7312`…`ba7c7fe` closes M17's F-8.** `Terminate` takes an optional `hold_ticks`
+  (spec §6.3, ko first; `TASK-004` refuses 0).
+  - **How it holds:** an integer counter per env lives where the episode budget is counted, so
+    IR-D stays a pure DAG.
+  - **The task specification:** `[success] hold_s` and `[failure] hold_s`. ① reads it as "아래가
+    모두 [1초] 동안 맞으면 성공".
+  - **R8's explanations:** a too-short hold is explained as "held for only X s".
+  - **Measured:** a dropped box succeeds at the bounce without a hold, and with a 1 s hold only
+    once it rests (steps 61–66 instead of 12–14).
+  - **Hashes:** all 20 committed Task IRs (46 `Terminate` nodes) keep their hashes.
+- **K8 `45e4717` closes M17's URDF item.** A URDF `<mesh scale>` maps onto
+  `SceneDesc::mesh_scales` by the scene document's own function, so the names and the vertices
+  equal MJCF's. Unscaled URDFs keep their hashes.
+
+**Defaults K7 chose (the owner's to change).**
+- The success bonus is paid on every tick of a hold. The bonus reads the instantaneous fold, and
+  paying it once would need a new node.
+- An absent hold shows as "0 s".
+- A specification with no failure section shows no failure hold slot.
