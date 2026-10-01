@@ -17,7 +17,10 @@ es-ir-types = { workspace = true }
 es-compile = { workspace = true }
 es-eval = { workspace = true }
 es-data = { workspace = true }
+es-assets = { workspace = true }
+es-math = { workspace = true }
 serde = { workspace = true }
+toml = { workspace = true }
 serde_json = { workspace = true }
 blake3 = { workspace = true }
 thiserror = { workspace = true }
@@ -25,6 +28,9 @@ ureq = { version = "2", optional = true, default-features = false, features = ["
 
 [dev-dependencies]
 proptest = { workspace = true }
+es-env = { workspace = true }
+es-physics-core = { workspace = true }
+es-physics-backend = { workspace = true }
 es-ir = { workspace = true, features = ["testing"] }
 
 [lints]

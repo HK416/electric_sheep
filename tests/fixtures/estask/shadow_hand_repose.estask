@@ -1,0 +1,43 @@
+# The Shadow Hand cube reorientation (plan H) as a person writes it. It compiles to
+# tests/fixtures/shadow-hand/task-repose.toml's task_hash (crates/es-script/tests/estask.rs);
+# that document's header says why each number is what it is.
+kind = "task-spec"
+schema = 1
+scene = "tests/fixtures/mjcf/shadow_hand/shadow_hand_repose.xml"
+robot = "robot0:hand mount"
+control_hz = 60
+timeout_s = 8.0
+
+# The cube turned to the goal: under 0.1 rad (5.7296 deg) between them.
+[success]
+clauses = [
+  { subject = "object", relation = "orientation_matches", object = "target", within_deg = 5.729577951308232, shaping = "inverse_angle", weight = 1.0, term = "rotation" },
+]
+
+# The cube 0.24 m from where it rests on the palm.
+[failure]
+clauses = [
+  { subject = "object", relation = "farther_than", point = [1.0, 0.867, 0.1772], m = 0.24, shaping = "distance", weight = -10.0, term = "cube_distance" },
+]
+
+[start]
+items = [
+  { what = "robot.joints", noise = 0.2, coupled = true },
+  { what = "object.x", value = 1.0, noise = 0.01, stream = "cube.pos.0" },
+  { what = "object.y", value = 0.867, noise = 0.01, stream = "cube.pos.1" },
+  { what = "object.z", value = 0.1772, stream = "cube.pos.2" },
+  { what = "object.orientation", draw = "yaw", tilt = 0.0355, stream = "cube.yaw" },
+  { what = "target.orientation", draw = "yaw", tilt = 0.0355, stream = "goal.yaw" },
+]
+
+[observe]
+cameras = ["top", "front", "side"]
+camera_px = 96
+render = { path = "pt", spp = 32, bounces = 3, exposure = 8.0, seed = "tick" }
+state = { joint_pos = "robot.joint_pos", joint_vel = "robot.joint_vel", goal_pose = "target.pose", target_qpos = "target.qpos", last_action = "robot.previous_action" }
+privileged = { cube_pose = "object.pose", object_vel = "object.vel" }
+
+# Isaac Lab's terms at rl_games' scale.
+[reward]
+scale = 0.01
+success = 250.0
