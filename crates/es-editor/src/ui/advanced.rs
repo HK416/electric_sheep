@@ -1397,6 +1397,10 @@ pub(crate) struct Canvas {
     look: Viewport,
     picture: Option<(u64, egui::TextureHandle)>,
     es: Option<std::path::PathBuf>,
+    /// The in-process device's frames (packet M16/H9); `look` is the fallback without one.
+    gpu: crate::gpu::Look,
+    /// `--orbit-demo` / `--fps`: frames shown since `.0`, and their worker milliseconds.
+    meter: Option<(std::time::Instant, u32, f32)>,
 }
 
 /// What a canvas shows: a template's scene at its initial pose, or a replay at its tick.
@@ -1428,6 +1432,13 @@ impl Posed<'_> {
         }
     }
 
+    fn source(self) -> crate::model::viewport::Source {
+        match self {
+            Self::Scene(preview) => preview.source(),
+            Self::Replay(view) => view.source_at(view.tick),
+        }
+    }
+
     fn tris(self) -> Result<es_render::TriScene, String> {
         match self {
             Self::Scene(preview) => Ok(preview.tris()),
@@ -1449,6 +1460,17 @@ pub(crate) fn viewport_mode(ctx: &egui::Context) -> Mode {
 /// `es-editor --viewport <look>` and the selector above every viewport.
 pub fn set_viewport_mode(ctx: &egui::Context, mode: Mode) {
     ctx.data_mut(|d| d.insert_temp(mode_id(), mode));
+}
+
+/// `es-editor --fps` (`orbit: false`) and `--orbit-demo` (`true`): every viewport prints the
+/// frames it showed each second, and with `orbit` turns its camera a little every frame - a
+/// drag without a mouse, to measure and capture the look while it moves (packet M16/H9).
+pub fn set_demo(ctx: &egui::Context, orbit: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("viewport-demo"), orbit));
+}
+
+fn demo(ctx: &egui::Context) -> Option<bool> {
+    ctx.data(|d| d.get_temp(egui::Id::new("viewport-demo")))
 }
 
 /// One replay frame in a `size` canvas: drag orbits, scroll zooms. Shared by the Replay panel
@@ -1481,10 +1503,26 @@ pub(crate) fn scene_canvas(
             ui.selectable_value(&mut mode, look, i18n::t(lang, look.key()))
                 .on_hover_text(i18n::t(lang, look.hint()));
         }
-        if let Some(status) = canvas.look.status() {
+        // The look's own line first (it is what changes), then which device draws it.
+        let health = crate::gpu::health();
+        let status = match &health {
+            Some(crate::gpu::Health::Failed(_)) => canvas.look.status(),
+            _ => canvas.gpu.status(mode, &posed.shot(camera)),
+        };
+        if let Some(status) = status {
             let (key, args) = status.line();
             let args: Vec<&str> = args.iter().map(String::as_str).collect();
             ui.weak(i18n::fill(lang, key, &args));
+        }
+        match health {
+            Some(crate::gpu::Health::Failed(why)) => {
+                ui.weak(i18n::fill(lang, "viewport.cpu_fallback", &[&why]));
+            }
+            Some(crate::gpu::Health::Ready { device, bytes }) => {
+                let mb = (bytes / (1 << 20)).to_string();
+                ui.weak(i18n::fill(lang, "viewport.gpu", &[&device, &mb]));
+            }
+            _ => {}
         }
     });
     set_viewport_mode(ui.ctx(), mode);
@@ -1506,18 +1544,41 @@ pub(crate) fn scene_canvas(
             *camera = camera.zoom(f64::from(-scroll).mul_add(ZOOM_PER_POINT, 1.0));
         }
     }
+    let demo = demo(ui.ctx());
+    if demo == Some(true) {
+        *camera = camera.orbit(0.01, 0.0);
+    }
     painter.rect_filled(response.rect, 0.0, Color32::from_gray(BACKGROUND));
-    let es = (canvas.es).get_or_insert_with(|| crate::model::launch::es_binary().path);
     let shot = posed.shot(camera);
-    let now = std::time::Instant::now();
-    canvas.look.update(mode, &shot, now, es, || posed.tris());
-    let texture = if let Some((picture, revision)) = canvas.look.picture() {
+    let gpu = canvas.gpu.update(mode, &shot, || posed.source());
+    let picture = if gpu {
+        canvas
+            .gpu
+            .newest()
+            .map(|(f, r)| (&f.picture, r, Some(f.ms)))
+    } else {
+        let es = (canvas.es).get_or_insert_with(|| crate::model::launch::es_binary().path);
+        let now = std::time::Instant::now();
+        canvas.look.update(mode, &shot, now, es, || posed.tris());
+        canvas.look.picture().map(|(p, r)| (p, r, None))
+    };
+    let texture = if let Some((picture, revision, ms)) = picture {
         if canvas.picture.as_ref().is_none_or(|(r, _)| *r != revision) {
             let px = [picture.width as usize, picture.height as usize];
             let image = egui::ColorImage::from_rgb(px, &picture.rgb);
             let options = egui::TextureOptions::LINEAR;
-            let texture = ui.ctx().load_texture("viewport-look", image, options);
-            canvas.picture = Some((revision, texture));
+            // One texture per viewport, rewritten: a new one per frame of a drag would allocate
+            // on the GL side every frame.
+            if let Some((r, texture)) = &mut canvas.picture {
+                texture.set(image, options);
+                *r = revision;
+            } else {
+                let texture = ui.ctx().load_texture("viewport-look", image, options);
+                canvas.picture = Some((revision, texture));
+            }
+            if let (Some(_), Some(ms)) = (demo, ms) {
+                meter(&mut canvas.meter, mode, picture, ms);
+            }
         }
         canvas.picture.as_ref().map(|(_, t)| t)
     } else {
@@ -1545,9 +1606,35 @@ pub(crate) fn scene_canvas(
             Color32::WHITE,
         );
     }
-    if canvas.look.busy() {
+    if (gpu && canvas.gpu.busy(mode, &shot)) || demo == Some(true) {
+        ui.ctx().request_repaint();
+    } else if !gpu && canvas.look.busy() {
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(50));
+    }
+}
+
+/// `--fps`: one line a second on stderr - frames shown, and the worker's mean milliseconds.
+fn meter(
+    meter: &mut Option<(std::time::Instant, u32, f32)>,
+    mode: Mode,
+    picture: &crate::model::viewport::Picture,
+    ms: f32,
+) {
+    let (since, frames, total) = meter.get_or_insert((std::time::Instant::now(), 0, 0.0));
+    *frames += 1;
+    *total += ms;
+    let secs = since.elapsed().as_secs_f32();
+    if secs >= 1.0 {
+        eprintln!(
+            "viewport {mode:?} {}x{}: {:.1} frames/s shown, {:.1} ms per frame on the device, {} spp",
+            picture.width,
+            picture.height,
+            *frames as f32 / secs,
+            *total / *frames as f32,
+            picture.samples
+        );
+        *meter = None;
     }
 }
 

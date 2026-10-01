@@ -25,6 +25,9 @@ es-ir = { workspace = true }
 es-compile = { workspace = true }
 es-eval = { workspace = true }
 es-render = { workspace = true }
+# The viewport's one device (packet M16/H9, `src/gpu.rs`): the editor draws with `es-render`
+# in process since the owner's decision of 2026-10-01. `es-editor-model` stays without it.
+es-gpu = { workspace = true }
 # `persistence` is the one feature added on top of the workspace's minimal set: it is what
 # gives `eframe::App::save` a `Storage`, and the recent-files list (packet M7/E3) is kept
 # there rather than in a config file of this crate's own invention. No new dependency entry -

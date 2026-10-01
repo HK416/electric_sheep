@@ -1,5 +1,9 @@
 //! `es-editor [project-dir|bundle.esb|run-dir] [--attach <addr> [--token <t>]] [--step <1-5>]
-//! [--viewport fast|material|pt]` — the editor shell of spec 23.
+//! [--viewport fast|material|pt] [--fps | --orbit-demo]` — the editor shell of spec 23.
+//!
+//! `--fps` prints each viewport's frames per second on stderr; `--orbit-demo` also turns every
+//! viewport's camera a little each frame (packet M16/H9's measurement and captures). Both keep
+//! the session's window and dock state in the temp directory, not the person's own.
 //!
 //! `es-editor --import <project-dir> --template <id> ...` makes a project of runs that ran
 //! outside the editor and opens it; the grammar is [`es_editor::model::import`]'s (packet
@@ -17,6 +21,7 @@ use es_editor::EditorApp;
 fn main() -> eframe::Result<()> {
     let (mut path, mut addr, mut token, mut step) = (None, None, None, None);
     let mut look = None;
+    let mut demo = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -25,6 +30,8 @@ fn main() -> eframe::Result<()> {
             "--step" => step = args.next().and_then(|s| s.parse::<usize>().ok()),
             // The viewport's look at start (packet M16/H8); the selector changes it after.
             "--viewport" => look = args.next().as_deref().and_then(Mode::parse),
+            "--fps" => demo = Some(false),
+            "--orbit-demo" => demo = Some(true),
             "--import" => match import(&args.by_ref().collect::<Vec<_>>()) {
                 Ok(project) => path = Some(project),
                 Err(e) => {
@@ -50,9 +57,13 @@ fn main() -> eframe::Result<()> {
         None => (replay(Vec::new()), None),
     };
 
-    eframe::run_native(
+    let mut options = eframe::NativeOptions::default();
+    if demo.is_some() {
+        options.persistence_path = Some(std::env::temp_dir().join("es-editor-demo"));
+    }
+    let result = eframe::run_native(
         "Electric Sheep editor",
-        eframe::NativeOptions::default(),
+        options,
         Box::new(move |cc| {
             // `cc.storage` is the previous session's recent list (packet M7/E3) and dock
             // arrangements (M12/Y10), read before a path on the command line is opened so
@@ -66,6 +77,9 @@ fn main() -> eframe::Result<()> {
             if let Some(look) = look {
                 es_editor::ui::advanced::set_viewport_mode(&cc.egui_ctx, look);
             }
+            if let Some(orbit) = demo {
+                es_editor::ui::advanced::set_demo(&cc.egui_ctx, orbit);
+            }
             if let Some(path) = &path {
                 app = app.with_path(path);
             }
@@ -77,7 +91,10 @@ fn main() -> eframe::Result<()> {
             }
             Ok(Box::new(app))
         }),
-    )
+    );
+    // The viewport's device, released before the process goes (packet M16/H9).
+    es_editor::gpu::shutdown();
+    result
 }
 
 /// `--import`: the project made, said on stdout, and its folder to open.

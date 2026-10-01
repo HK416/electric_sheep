@@ -5,15 +5,24 @@
 //! the Replay panel all show one scene from one camera at one tick - a [`Shot`] - and this
 //! decides which picture of it is on screen.
 //!
-//! The editor still creates no Vulkan device (`docs/design/editor-redesign.md` section 5, S4):
-//! the material look is the CPU reference, the realistic one is `es render --out -`, whose
-//! frames arrive on a pipe as binary PPMs, one per accumulated frame.
+//! Since packet M16/H9 (the owner's decision of 2026-10-01) `es-editor` draws
+//! all three looks in process on one Vulkan device, every frame the shot changes; [`next`] and
+//! [`gpu_status`] are that path's decisions. What is below them is H8's path, kept as the
+//! fallback for a machine without a device: the material look is the CPU reference, the
+//! realistic one is `es render --out -`, whose frames arrive on a pipe as binary PPMs, one per
+//! accumulated frame.
 
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use es_assets::scene::SceneDesc;
+use es_core::StableId;
+use es_math::Pose;
 
 use es_render::raster::Camera;
 use es_render::{Channel, RenderConfig, Shading, TileAtlasCfg, TriScene};
@@ -142,6 +151,49 @@ pub fn plan(mode: Mode, still: Duration, started: bool) -> Plan {
         () if started => Plan::Keep,
         () if still < SETTLE => Plan::Wait,
         () => Plan::Start,
+    }
+}
+
+/// A shot's scene for a renderer that tessellates it itself: the parsed scene, shared, and the
+/// world pose of every body that moved (none: the scene's own pose).
+pub type Source = (Arc<SceneDesc>, BTreeMap<StableId, Pose>);
+
+/// What the in-process viewport (packet M16/H9) draws next for the shot it is asked for.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Next {
+    /// The newest picture is of this shot and there is nothing to add to it.
+    Idle,
+    /// The shot moved (camera, tick, scene, size or look): one frame of it from scratch,
+    /// the path tracer's history started over.
+    Restart,
+    /// The path tracer on a still shot: one more frame onto its history.
+    Accumulate,
+}
+
+/// `drawn` is whether the newest picture is of exactly this shot in this look, `frames` how
+/// many path-traced frames it holds. Every look draws a moved shot at once - no [`SETTLE`]:
+/// the device is fast enough that the picture follows the drag - and only the path tracer
+/// keeps adding to a still one, up to its budget.
+pub fn next(mode: Mode, drawn: bool, frames: u32) -> Next {
+    match () {
+        () if !drawn => Next::Restart,
+        () if mode == Mode::Realistic && frames < PT_FRAMES => Next::Accumulate,
+        () => Next::Idle,
+    }
+}
+
+/// The line under the in-process picture: `samples` is what the newest picture holds and
+/// `drawn` whether it is of the shot asked for. A moved shot keeps its old picture on screen
+/// (never the flat raster), and says it is drawing.
+pub fn gpu_status(mode: Mode, picture: Option<(bool, u32)>) -> Option<Status> {
+    let total = PT_SPP * PT_FRAMES;
+    match (mode, picture) {
+        (_, None) | (Mode::Realistic, Some((false, _))) => Some(Status::Rendering),
+        (Mode::Realistic, Some((true, done))) if done < total => {
+            Some(Status::Samples { done, total })
+        }
+        (Mode::Realistic, Some((true, samples))) => Some(Status::Finished { samples }),
+        _ => None,
     }
 }
 
@@ -542,6 +594,31 @@ mod tests {
             assert_eq!(plan(mode, SETTLE, false), Plan::Start);
             assert_eq!(plan(mode, ms(5000), true), Plan::Keep);
         }
+    }
+
+    /// The in-process path (packet M16/H9): every look draws a moved shot at once, only the
+    /// path tracer adds to a still one and stops at its budget; a moved shot keeps its old
+    /// picture and says nothing on the rasterized looks.
+    #[test]
+    fn the_device_path_draws_every_move_and_accumulates_only_the_path_tracer() {
+        for mode in Mode::ALL {
+            assert_eq!(next(mode, false, 0), Next::Restart, "{mode:?}");
+            assert_eq!(next(mode, false, PT_FRAMES), Next::Restart, "{mode:?}");
+        }
+        assert_eq!(next(Mode::Fast, true, 1), Next::Idle);
+        assert_eq!(next(Mode::Material, true, 1), Next::Idle);
+        assert_eq!(next(Mode::Realistic, true, 1), Next::Accumulate);
+        assert_eq!(next(Mode::Realistic, true, PT_FRAMES - 1), Next::Accumulate);
+        assert_eq!(next(Mode::Realistic, true, PT_FRAMES), Next::Idle);
+
+        let total = PT_SPP * PT_FRAMES;
+        assert_eq!(gpu_status(Mode::Material, None), Some(Status::Rendering));
+        assert_eq!(gpu_status(Mode::Material, Some((false, 1))), None);
+        assert_eq!(gpu_status(Mode::Fast, Some((true, 1))), None);
+        let pt = |p| gpu_status(Mode::Realistic, Some(p));
+        assert_eq!(pt((false, 64)), Some(Status::Rendering));
+        assert_eq!(pt((true, 8)), Some(Status::Samples { done: 8, total }));
+        assert_eq!(pt((true, total)), Some(Status::Finished { samples: total }));
     }
 
     #[test]
