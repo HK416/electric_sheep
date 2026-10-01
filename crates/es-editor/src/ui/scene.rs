@@ -1,9 +1,10 @@
 //! ① Scene and ② Teach of a template project (packet M12/Y15, `docs/design/editor-redesign.md`
 //! sections 3 and 6.3): the template's scene through the CPU raster in the centre, what is in it
 //! or how the robot is taught on the left, and the template's own words on the right. Read-only.
+//! ①'s physics preview (packet M17/G4) plays `es scene simulate`'s motion where the scene was.
 //!
-//! Drawing only. The template, the scene at its initial pose, what is in it and the method's
-//! words are [`crate::model::scene_view`]'s, under test.
+//! Drawing only. The template, the scene at its initial pose, what is in it, the method's
+//! words and the preview's argv and lines are [`crate::model::scene_view`]'s, under test.
 
 use std::path::PathBuf;
 
@@ -13,20 +14,35 @@ use es_render::raster::Camera;
 
 use crate::app::EditorApp;
 use crate::model::home::Mark;
-use crate::model::i18n::{fill, t, Strings};
+use crate::model::i18n::{fill, t, Lang, Strings};
 use crate::model::layout::Pane;
-use crate::model::scene_view::{self, ScenePreview};
+use crate::model::results::SPEEDS;
+use crate::model::scene_view::{self, Physics, ScenePreview};
 use crate::model::template::{templates_root, Template};
 use crate::model::workflow::Phase;
-use crate::ui::advanced::{scene_canvas, Canvas, Posed};
+use crate::ui::advanced::{replay_canvas, scene_canvas, Canvas, Posed};
 
-/// ① and ② between frames. It belongs to one project; opening another reads its scene afresh.
+/// ① and ② between frames. It belongs to one project; opening another reads its scene afresh
+/// and ends a preview still computing.
 #[derive(Default)]
 pub(crate) struct State {
     project: Option<PathBuf>,
     step: Option<(Template, Result<ScenePreview, String>)>,
     camera: Option<Camera>,
     picture: Canvas,
+    physics: Option<Physics>,
+    /// The preview's pictures, apart from the static scene's: both start at tick 0.
+    played: Canvas,
+}
+
+fn at_start_id() -> egui::Id {
+    egui::Id::new("physics-preview-at-start")
+}
+
+/// `es-editor --physics-preview`: ① starts its physics preview as soon as it shows a scene,
+/// for captures where a synthetic click does not reach the window (packet M17/G4).
+pub fn preview_at_start(ctx: &egui::Context) {
+    ctx.data_mut(|d| d.insert_temp(at_start_id(), true));
 }
 
 /// ①'s and ②'s step panel, viewport and summary; `false` for every other pane and step.
@@ -62,12 +78,28 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
             ui.label(fill(lang, "setup.load_failed", &[why]));
         }
         (Pane::Viewport, _, Ok(preview)) => {
+            if phase == Phase::Scene {
+                physics_row(ui, lang, preview, &mut state.physics, &mut state.played);
+            }
             ui.weak(t(lang, "setup.orbit_hint"));
             let camera =
                 (state.camera).get_or_insert_with(|| scene_view::camera_of(Some(template)));
             let size = ui.available_size();
-            let posed = Posed::Scene(preview);
-            scene_canvas(ui, lang, size, posed, camera, &mut state.picture);
+            let played = (state.physics.as_mut().filter(|_| phase == Phase::Scene))
+                .and_then(|p| Some((p.rate_hz, p.replay()?)));
+            match played {
+                Some((rate, view)) => {
+                    playback(ui, lang, size, rate, view, camera, &mut state.played);
+                }
+                None => scene_canvas(
+                    ui,
+                    lang,
+                    size,
+                    Posed::Scene(preview),
+                    camera,
+                    &mut state.picture,
+                ),
+            }
         }
         (Pane::StepPanel, Phase::Scene, _) => {
             ui.heading(t(lang, "setup.contents"));
@@ -116,4 +148,103 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
         }
     }
     true
+}
+
+/// The preview button, what its child is doing, and once the motion plays: play / pause, the
+/// speeds and the way back to the static scene.
+fn physics_row(
+    ui: &mut egui::Ui,
+    lang: Lang,
+    preview: &ScenePreview,
+    physics: &mut Option<Physics>,
+    played: &mut Canvas,
+) {
+    if let Some(p) = physics.as_mut() {
+        p.poll();
+        if p.running() {
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
+        }
+    }
+    let at_start = ui.ctx().data_mut(|d| d.remove_temp::<bool>(at_start_id()));
+    ui.horizontal_wrapped(|ui| {
+        let running = physics.as_ref().is_some_and(Physics::running);
+        let button = ui.add_enabled(!running, egui::Button::new(t(lang, "setup.physics")));
+        let start = button
+            .on_hover_text(t(lang, "setup.physics.hint"))
+            .clicked();
+        if start || at_start == Some(true) {
+            let es = crate::model::launch::es_binary().path;
+            *physics = Some(Physics::start(preview, &es, scene_view::physics_out()));
+            *played = Canvas::default();
+        }
+        let Some(p) = physics.as_mut() else {
+            return;
+        };
+        if p.running() {
+            ui.spinner();
+        }
+        if let Some((key, args)) = p.line() {
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            ui.label(fill(lang, key, &args));
+        }
+        if let Some(view) = p.replay() {
+            let key = if view.playing {
+                "replay.pause"
+            } else {
+                "replay.play"
+            };
+            if ui.button(t(lang, key)).clicked() {
+                // Play at the end starts over.
+                if !view.playing && view.tick + 1 >= view.ticks() {
+                    view.tick = 0;
+                }
+                view.playing = !view.playing;
+            }
+            for speed in SPEEDS {
+                ui.selectable_value(&mut view.speed, speed, format!("{speed}\u{d7}"));
+            }
+        }
+        if ui.button(t(lang, "setup.physics.back")).clicked() {
+            *physics = None;
+        }
+    });
+}
+
+/// The preview's motion in the viewport, under the look selector, and its timeline in seconds.
+fn playback(
+    ui: &mut egui::Ui,
+    lang: Lang,
+    size: egui::Vec2,
+    rate: f64,
+    view: &mut crate::model::replay_view::ReplayView,
+    camera: &mut Camera,
+    canvas: &mut Canvas,
+) {
+    view.advance(f64::from(ui.input(|i| i.stable_dt)), rate);
+    let len = view.ticks();
+    if view.playing && view.tick + 1 >= len {
+        view.playing = false;
+    }
+    if view.playing {
+        ui.ctx().request_repaint();
+    }
+    let slider = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+    let size = egui::Vec2::new(size.x, (size.y - slider).max(1.0));
+    replay_canvas(ui, lang, size, view, camera, canvas);
+    let mut at = view.tick;
+    let secs = |tick: usize| tick as f64 / rate;
+    ui.horizontal(|ui| {
+        ui.label(format!(
+            "{:.2} / {:.2} s",
+            secs(at),
+            secs(len.saturating_sub(1))
+        ));
+        ui.spacing_mut().slider_width = ui.available_width().max(80.0);
+        let slider = egui::Slider::new(&mut at, 0..=len.saturating_sub(1)).show_value(false);
+        if ui.add(slider).changed() {
+            view.tick = at;
+            view.playing = false;
+        }
+    });
 }
