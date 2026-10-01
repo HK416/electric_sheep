@@ -664,13 +664,15 @@ Compare    Logic      Select  Concat  Slice  Reduce
 ObservationSpec   관측 선언 (구현은 Observation IR)
 ActionSpec        액션 공간 선언 (§9.2)
 Reward            보상 항 (name, weight, aggregation)
-Terminate         success | failure | timeout
+Terminate         success | failure | timeout, 선택적으로 n 제어 틱 동안 유지
 Randomization     대상 파라미터 + 분포
 ResetState        초기 상태 분포
 Record            데이터셋 기록 대상
 ```
 
 **센서의 렌더 경로.** `Sensor` 소스는 `render = { path = "rs" | "pt", spp, bounces, exposure, tonemap }`로 시뮬레이션이 그 센서를 어떻게 만드는지 선언한다(패킷 M7/R5). 기본값은 `rs`이며 **부재 = 기본값 = 오늘의 정규형**이라 커밋된 `task_hash`는 움직이지 않는다; `pt`는 `task_hash`를 움직이므로 새 문서다(§13.3). 관측 IR은 이것을 모른다 — 센서가 *무엇*인지는 `ImageSpec`이, 시뮬레이션이 그것을 *어떻게* 만드는지는 Task IR이 말한다. `render.seed = "fixed" | "tick"`(패킷 M10/W1a)은 패스 트레이서가 어떤 샘플 키 시드를 쓰는지 말한다: `fixed`(부재 = 기본값 = 오늘의 바이트)는 잡음을 픽셀만으로 키잉해 그레인이 포즈별 고정 텍스처가 되고, `tick`은 에피소드 상대 틱을 시드에 섞어 같은 포즈라도 두 틱의 그레인이 다르며, 수집기와 평가기는 같은 `(에피소드, 틱)`에서 여전히 비트 동일하다.
+
+**종료의 유지(패킷 M18/K7).** `Terminate`는 선택적 `hold_ticks = n`을 가진다: 그 술어가 마지막 `n`개의 제어 틱 각각에서 참이었던 첫 제어 틱에 에피소드가 그 종류(`kind`)로 끝난다. 세는 것은 env별 정수 카운터다 — 술어가 참인 제어 틱마다 1 늘고 거짓이면 0이 되며, 에피소드가 리셋될 때 0으로 돌아간다. 벽시계는 쓰지 않는다(`DET-002`). 카운터는 에피소드 예산을 세는 곳에 있으므로 술어 콘은 같은 순수 DAG로 남고(§6.2) 상태를 가진 IR-D 노드는 없다. `hold_ticks = 0`은 `TASK-004`로 거부된다. **부재 = 오늘의 동작 = 오늘의 정규형**(`task_hash`는 값이 있을 때만 그것을 덧붙인다)이라 커밋된 `task_hash`는 움직이지 않는다.
 
 `Parallel`은 존재하지 않는다. 병렬화는 컴파일러가 결정한다. `Wait`·`Repeat`·`Condition`은 IR-C 또는 `Compare`+`Select`로 대체된다.
 

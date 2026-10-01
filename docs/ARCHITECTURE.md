@@ -663,13 +663,15 @@ Compare    Logic      Select  Concat  Slice  Reduce
 ObservationSpec   observation declaration (implemented in Observation IR)
 ActionSpec        action space declaration (§9.2)
 Reward            reward term (name, weight, aggregation)
-Terminate         success | failure | timeout
+Terminate         success | failure | timeout, optionally held for n control ticks
 Randomization     target parameters + distribution
 ResetState        initial state distribution
 Record            dataset recording target
 ```
 
 **A sensor's render path.** A `Sensor` source declares how the simulation produces it with `render = { path = "rs" | "pt", spp, bounces, exposure, tonemap }` (packet M7/R5). The default is `rs`, and **absent = default = today's canonical form**, so no committed `task_hash` moves; `pt` moves `task_hash` and is therefore a new document (§13.3). The Observation IR does not know about it — what the sensor *is* belongs to `ImageSpec`, how the simulation *makes* it belongs to the Task IR. `render.seed = "fixed" | "tick"` (packet M10/W1a) says which sample-key seed the path tracer uses: `fixed` (absent = default = today's bytes) keys the noise by pixel alone, so the grain is a fixed texture per pose; `tick` mixes the episode-relative tick into the seed, so the same pose at two ticks carries different grain, and the collector and the evaluator still agree bit for bit at the same `(episode, tick)`.
+
+**Holding a termination (packet M18/K7).** `Terminate` takes an optional `hold_ticks = n`: the episode ends with its `kind` on the first control tick at which its predicate has been true on each of the last `n` control ticks. What counts is an integer counter per env — one more on a control tick whose predicate is true, zero on one where it is false, and zero again when the episode resets. No wall clock is read (`DET-002`). The counter lives where the episode budget is counted, so the predicate cone stays the same pure DAG (§6.2) and no IR-D node holds state. `hold_ticks = 0` is refused with `TASK-004`. **Absent = today's behaviour = today's canonical form** (`task_hash` appends the value only when there is one), so no committed `task_hash` moves.
 
 `Parallel` does not exist. Parallelization is decided by the compiler. `Wait` / `Repeat` / `Condition` are replaced by IR-C or `Compare`+`Select`.
 
