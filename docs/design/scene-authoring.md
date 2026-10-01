@@ -511,9 +511,9 @@ validated and each arm passes the cross-IR check before anything is written.
   (H9), and the policy camera's view in the corner rendered by the same in-process renderer at
   the camera's declared resolution and render path (the real observation; `es render` without a
   device).
-- **Commands and undo**: every edit is a command on a scene model in `es-editor-model` (layer
-  12), applied to the document, validated, and undoable; the layout (`*.eslayout`, §14.3) never
-  enters the scene document.
+- **Commands and undo**: every edit is a command on a scene model in `es-editor-scene` (layer
+  12, 5.1), applied to the document, validated, and undoable; the layout (`*.eslayout`, §14.3)
+  never enters the scene document.
 - **Physics preview**: `es scene simulate --seconds 3 --out <traj>` on `mujoco-cpu`, played back
   in the viewport (the editor runs no physics).
 - **Checks** in plain words, computed by `es` or pure functions: the mapping report ("this
@@ -523,19 +523,73 @@ validated and each arm passes the cross-IR check before anything is written.
 - **Save** writes `scene.esscene`; generation runs on demand (and before ③), so the person never
   sees an IR document unless they open the Advanced tabs.
 
+### 5.1 What G5 settled (the scene model)
+
+`crates/es-editor-scene/` (a new layer-12 crate: `SceneModel`, `Command`, `check`, `tree`,
+`inspect`, `euler`, `make_editable`), drawn by `crates/es-editor/src/ui/author.rs`, oracles
+`crates/es-editor-scene/tests/scene_model.rs`.
+
+- **The crate**: `es-editor-model` stood at 8,942 of its 10,000-line cap and the scene model is
+  about 1,400 lines, so it went into a new layer-12 crate `es-editor-scene` (spec §4.2's table and
+  rule 4, Appendix C.8, xtask's `LAYERS`). Neither knows the other (rule 1); only `es-editor`
+  uses both. A refusal's words are keys of `es-editor-model`'s string tables, and the tables'
+  completeness test reads this crate's sources too.
+- **An editable project** holds `scene.esscene` (and `task.estask`) in its root. The generated
+  documents go to `generated/` (`generate`'s `out` is `"generated"`), emptied before each
+  regeneration, so a failure leaves nothing stale. A template names its editable sources as
+  `[editable] scene / spec`. "Make an editable copy" copies the template's scene document byte for
+  byte and the files it names (includes, meshes, textures) **under the same relative paths**:
+  asset paths are hash input, so moving them to `assets/<blake3>` would move the `scene_hash` of a
+  scene nobody edited (3.1's rule is left to G7's import). The specification is copied with only
+  its `scene` line changed to `scene.esscene` (comments kept). Measured (oracle 5): the Shadow Hand
+  copy expands to the template's `scene_hash`, and its generated documents equal the committed
+  ones but for what names the scene *file*: the Task IR's `scene.path` and `asset_hash`, the
+  Deployment IR's simulated robot target, and through the hash chain an Observation IR's
+  `task_ref` and an Evaluation IR's `task` and `observation`; the Learning IRs are unchanged. The
+  two SO-101 cube templates copy the scene only (no specification says their `task.toml`).
+- **Commands**: `Add` (a body with its geoms, static scenery, a camera, a light, a region; an
+  include is G7's), `Delete` (a body with the bodies, cameras and regions hanging from it),
+  `Duplicate` (beside the original, `<stem>_<n>`; an include's copy gets a prefix), `Set` (the
+  fields; not the name), `SetPose` (for G6's gizmos), `Reparent` (the bodies reordered so a parent
+  comes first; a cycle refused), `Rename` (the document's parent references and, in
+  `task.estask`, the robot, each clause's subject and object, each start item's `what`, the
+  observed cameras and sources, the student's views; `robot.` stays the specification's word).
+  Identity is the name; a geom is its place in its list.
+- **Validation policy: a refused command is not applied.** The check is: the values (a negative
+  mass, density or friction, a zero size, a colour outside [0, 1], the field of view, the order of
+  limits, an empty name), then G1's `expand` (a second name, a missing parent, an unknown
+  material, a missing file), then the mapping report of `mujoco-cpu` (and `mjwarp` when the
+  template trains there). A refusal is the field path as G1 names it, a key of the tables and its
+  arguments. Why not apply-with-error: this way the document, the viewport, every undo step and
+  the physics preview always hold a scene that expands; the typed value stays in its inspector
+  field, its label red and the reason above.
+- **Undo**: the whole documents (scene and specification) before and after, per step; a command
+  that changes nothing is no step. Dirty is "the documents differ from the saved ones"; save
+  writes both atomically (a temporary file, then a rename) and regenerates.
+- **Visibility** is the editor's, in memory only (no `.eslayout` is written yet).
+- **Inspector**: angles are roll, pitch, yaw in degrees about fixed X, Y, Z, converted with
+  `es_math::approx`'s `acos_f64` and `sin_cos_f64`, and a quaternion is written only when an
+  angle changes. Sizes show whole (widths, diameters) and are stored halved, exactly. A value is
+  handed over once the person lets go (no pointer held, no text being typed), so a drag is one
+  undo step.
+- **Viewport**: `ScenePreview::from_scene`; a still scene's shot carries the document's revision
+  in its tick, so every edit is drawn afresh. An unsaved document is written to
+  `.preview.esscene` beside the scene for `es render` and `es scene simulate`; the editor's
+  replay loader reads `.esscene` too.
+- **Until G9**, ② to ⑤ still run the template's documents; ① says so.
+
 ## 6. Where the code goes (layers, §4.2)
 
 | What | Crate (layer) |
 |---|---|
 | `.esscene` reader and writer, include expansion, full MJCF exporter | `es-assets` (2) |
-| task-spec compiler and `es project generate`'s core (pure: scene + spec → documents) | `es-script` (11), the authoring crate; `es-editor-model` calls it directly |
+| task-spec compiler and `es project generate`'s core (pure: scene + spec → documents) | `es-script` (11), the authoring crate; `es-editor-scene` calls it directly |
 | `es scene export / simulate`, `es render`, `es project generate` CLI | `es` |
-| scene model, commands, undo, checks, sentence editor model | `es-editor-model` (12) |
+| scene model, commands, undo, checks (G5), sentence editor model (G8) | `es-editor-scene` (12) |
 | hierarchy, inspector widgets, gizmos | `es-editor` (13) |
 
-No new extension point (INV-17). `es-editor-model` is over its line target (≈8,400 of 10,000):
-the scene model goes into a new module set sized for a split, and the plan's first editor packet
-does the split the budget requires.
+No new extension point (INV-17). `es-editor-model` is over its line target (8,942 of 10,000), so
+G5 put the scene model in a new layer-12 crate, `es-editor-scene` (5.1).
 
 ## 7. Spec changes (ko first, with the packet that needs them)
 

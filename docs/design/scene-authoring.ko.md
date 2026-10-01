@@ -485,7 +485,7 @@ shaping = ["orientation", "distance"]
   선택 물체로 맞추기, 프로세스 안에서 매 프레임 그리는 H8의 렌더 모드(H9), 그리고 모서리의
   정책 카메라 화면을 같은 프로세스 내 렌더러가 그 카메라에 선언된 해상도와 렌더 경로로
   렌더한다(실제 관찰. 장치가 없으면 `es render`).
-- **명령과 실행 취소**: 모든 편집은 `es-editor-model`(계층 12)의 장면 모델에 대한 명령이며,
+- **명령과 실행 취소**: 모든 편집은 `es-editor-scene`(계층 12, 5.1)의 장면 모델에 대한 명령이며,
   문서에 적용되고, 검증되고, 되돌릴 수 있다. 레이아웃(`*.eslayout`, §14.3)은 장면 문서에
   들어가지 않는다.
 - **물리 미리보기**: `mujoco-cpu`에서 `es scene simulate --seconds 3 --out <traj>`를 돌려
@@ -496,19 +496,64 @@ shaping = ["orientation", "distance"]
 - **저장**은 `scene.esscene`을 쓴다. 생성은 요청이 있을 때(그리고 ③ 앞에서) 돌아가므로,
   Advanced 탭을 열지 않는 한 사람은 IR 문서를 보지 않는다.
 
+### 5.1 G5가 정한 세부 (장면 모델)
+
+`crates/es-editor-scene/`(새 계층 12 크레이트: `SceneModel`, `Command`, `check`, `tree`,
+`inspect`, `euler`, `make_editable`), 그리기는 `crates/es-editor/src/ui/author.rs`, 오라클은
+`crates/es-editor-scene/tests/scene_model.rs`.
+
+- **크레이트**: `es-editor-model`이 10,000줄 상한 중 8,942줄이었고 장면 모델은 약 1,400줄이라
+  §4.2의 새 계층 12 크레이트 `es-editor-scene`으로 갔다(스펙 §4.2 표와 규칙 4, 부록 C.8, xtask의
+  `LAYERS`). 둘은 서로를 모르고(규칙 1) `es-editor`만 둘 다 쓴다. 거부 이유의 말은
+  `es-editor-model` 문자열 표의 키이고, 표 완전성 테스트가 이 크레이트의 소스도 읽는다.
+- **편집 가능한 프로젝트**: 프로젝트 루트에 `scene.esscene`(과 `task.estask`)이 있는 것. 생성 문서는
+  `generated/`에 쓰고(`generate`의 `out`이 `"generated"`), 다시 만들기 전에 비우므로 실패하면
+  낡은 문서가 남지 않는다. 템플릿은 편집 원본을 `[editable] scene / spec`으로 이름한다. "편집 가능한
+  복사본 만들기"는 템플릿의 장면 문서를 바이트 그대로, 그 문서가 이름하는 파일(인클루드, 메시,
+  텍스처)을 **같은 상대 경로로** 복사한다. 자산 경로는 해시 입력이라 `assets/<blake3>`로 옮기면
+  아무것도 고치지 않은 장면의 `scene_hash`가 움직인다(§3.1의 그 규칙은 G7의 가져오기에 남긴다).
+  명세는 `scene` 줄만 `scene.esscene`으로 바꿔(주석은 그대로) 복사한다. 측정(오라클 5): 섀도 핸드
+  복사본은 템플릿의 `scene_hash`로 펼쳐지고, 생성 문서는 커밋된 문서와 같다. 다른 것은 장면
+  *파일*을 가리키는 것뿐이다: Task IR의 `scene.path`와 `asset_hash`, Deployment IR의 시뮬레이션
+  로봇 대상 경로, 그리고 해시 체인을 따라 Observation IR의 `task_ref`와 Evaluation IR의
+  `task`·`observation`. Learning IR은 그대로다. SO-101 큐브 템플릿 둘은 장면만 복사한다(그
+  `task.toml`을 말하는 명세가 없다).
+- **명령**: `Add`(물체와 그 모양, 고정 물체, 카메라, 조명, 영역, 인클루드는 G7), `Delete`(물체는 그
+  아래 물체와 거기 붙은 카메라·영역과 함께), `Duplicate`(원본 옆, `<이름>_<n>`, 인클루드 복사본은
+  접두사를 받는다), `Set`(필드. 이름은 아니다), `SetPose`(G6의 기즈모용), `Reparent`(부모가 앞에
+  오도록 물체 순서를 고치고 순환은 거부), `Rename`(문서의 부모 참조와 `task.estask`의 robot, 절의
+  subject·object, start의 `what`, observe의 카메라와 출처, 학생의 views를 고친다. `robot.`은 명세의
+  낱말이라 그대로). 정체는 이름, 모양(geom)은 목록 안의 자리.
+- **검증 정책: 거부된 명령은 적용하지 않는다.** 검사 순서는 값(음수 질량·밀도·마찰, 0 크기, [0, 1]
+  밖의 색, 시야각, 한계 순서, 빈 이름) → G1의 `expand`(같은 이름, 없는 부모, 없는 재질, 없는 파일)
+  → `mujoco-cpu`의 매핑 리포트(템플릿이 MJWarp에서 배우면 그것도). 거부는 G1이 부르는 필드 경로 +
+  표의 키 + 인자. 적용하고 오류를 다는 방식을 버린 이유: 그러면 문서, 뷰포트, 실행 취소의 모든
+  단계, 물리 미리보기가 언제나 펼쳐지는 장면이다. 입력한 값은 인스펙터 칸에 남고 그 칸 이름이
+  빨갛게, 이유가 위에 나온다.
+- **실행 취소**: 단계마다 문서 전체(장면 + 명세)의 스냅숏. 바뀐 것이 없는 명령은 단계가 아니다.
+  dirty는 문서 ≠ 저장본, 저장은 둘을 원자적으로(임시 파일 + 이름 바꾸기) 쓰고 다시 생성한다.
+- **보이기/숨기기**는 에디터의 것, 메모리에만 있다(아직 `.eslayout`도 쓰지 않는다).
+- **인스펙터**: 각도는 roll/pitch/yaw 도(고정 X, Y, Z 축), `es_math::approx`의 `acos_f64` ·
+  `sin_cos_f64`로 변환하고, 각도를 바꿀 때만 쿼터니언을 쓴다. 크기는 전체 폭·지름으로 보이고 절반으로
+  저장한다(이진수로 정확). 값은 사람이 손을 뗄 때(포인터를 놓고 글자를 입력하지 않을 때) 명령 하나로
+  넘어가므로 끌기 한 번이 실행 취소 한 단계다.
+- **뷰포트**: `ScenePreview::from_scene`, 정지 장면 샷의 틱 자리는 문서 리비전이라 편집마다 새로
+  그린다. 저장하지 않은 문서는 `es render`·`es scene simulate`를 위해 장면 옆 `.preview.esscene`에
+  쓴다. 에디터의 재생용 로더도 `.esscene`을 읽는다.
+- **G9까지**: ②–⑤는 여전히 템플릿의 문서로 돈다. ①이 그렇게 말한다.
+
 ## 6. 코드가 가는 곳 (계층, §4.2)
 
 | 무엇 | 크레이트 (계층) |
 |---|---|
 | `.esscene` 리더와 라이터, 인클루드 펼치기, 완전한 MJCF 내보내기 | `es-assets` (2) |
-| 과제 명세 컴파일러와 `es project generate`의 핵심(순수: 장면 + 명세 → 문서) | `es-script` (11), 작성 크레이트. `es-editor-model`이 직접 부른다 |
+| 과제 명세 컴파일러와 `es project generate`의 핵심(순수: 장면 + 명세 → 문서) | `es-script` (11), 작성 크레이트. `es-editor-scene`이 직접 부른다 |
 | `es scene export / simulate`, `es render`, `es project generate` CLI | `es` |
-| 장면 모델, 명령, 실행 취소, 검사, 문장 편집기 모델 | `es-editor-model` (12) |
+| 장면 모델, 명령, 실행 취소, 검사 (G5), 문장 편집기 모델 (G8) | `es-editor-scene` (12) |
 | 계층 구조, 인스펙터 위젯, 기즈모 | `es-editor` (13) |
 
-새 확장점은 없다(INV-17). `es-editor-model`은 줄 수 목표를 넘었다(10,000 중 약 8,400). 장면
-모델은 분할을 염두에 둔 새 모듈 묶음으로 들어가고, 플랜의 첫 에디터 패킷이 예산이 요구하는
-분할을 한다.
+새 확장점은 없다(INV-17). `es-editor-model`은 줄 수 목표를 넘었으므로(10,000 중 8,942) G5가 장면
+모델을 새 계층 12 크레이트 `es-editor-scene`에 두었다(5.1).
 
 ## 7. 스펙 변경 (ko 먼저, 그것이 필요한 패킷과 함께)
 
