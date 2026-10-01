@@ -429,3 +429,14 @@ camera check found that SO-101's overhead camera does not see the cube's centre 
     per-clause truth at each attempt's end, a design item of its own.
 - **Line budget:** `es-editor-model` is at 8,969 of 10,000 code lines. G9 must not take it past
   9,600. If it would, stop and report: a split packet comes first.
+
+**G9 as merged (2026-10-01):** the empty project is a template without documents
+(`templates/empty.toml`; `Template.bundle` is optional). An editable project with a task runs
+② to ⑤ on `generated/`, with `es` in the project's own folder. This holds only while
+`generated/` is exactly what the saved documents generate; otherwise ③ is blocked with the
+reason. "Say the task" also writes `[teacher]`, `[student]` and `[cycle]`, so a save generates
+thirteen documents. ②'s teacher card serves any project with a `[teacher]`, checked against
+`mjwarp`'s mapping report first. Save as template writes to
+`<documents>/Electric Sheep/templates/<name>/`. Only the dry-runs were measured; no learning run
+was made. The default reward of "[box] is inside [area]" is the success bonus alone. Design note
+section 5.4 records the rest. CI passed on 832f0db.
