@@ -21,7 +21,7 @@ use es_ir::task::{SeedStream, Tonemap};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use compile::compile_task;
+pub use compile::{compile_clauses, compile_task, load_scene, ClauseNode};
 pub use generate::{generate, Document};
 pub use project::{BoxDoc, CycleDoc, Deploy, Evaluate, Family, Preset, Student, Teacher};
 

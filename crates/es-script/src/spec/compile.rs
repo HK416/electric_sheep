@@ -43,6 +43,20 @@ const KNOTS: [f64; 9] = [
 
 /// Compiles `spec` against its scene, `root.join(spec.scene)`.
 pub fn compile_task(spec: &TaskSpec, root: &Path) -> Result<TaskIr, SpecError> {
+    compile_clauses(spec, root).map(|(task, _)| task)
+}
+
+/// Where one clause's predicate ends: its section (`Success` or `Failure`), its index there and
+/// the node, whose `value` is the clause's truth before the fold into `Terminate`.
+pub type ClauseNode = (TerminationKind, usize, NodeId);
+
+/// [`compile_task`], and the node each clause's predicate ends in, every clause in document order
+/// (design note `scene-authoring.md` section 4.8): a side table, not IR. The fold cannot be undone
+/// from the Task IR alone, since a clause can itself be an `And` tree (inside a region).
+pub fn compile_clauses(
+    spec: &TaskSpec,
+    root: &Path,
+) -> Result<(TaskIr, Vec<ClauseNode>), SpecError> {
     let (scene, bytes) =
         load_scene(&root.join(&spec.scene)).map_err(|reason| SpecError::Scene {
             path: spec.scene.clone(),
@@ -79,6 +93,7 @@ pub fn compile_task(spec: &TaskSpec, root: &Path) -> Result<TaskIr, SpecError> {
     if !zero_unset {
         c.scene_poses();
     }
+    let clauses = std::mem::take(&mut c.clauses);
     let task = TaskIr {
         schema_version: es_ir::task::SCHEMA_VERSION,
         scene: SceneRef {
@@ -102,13 +117,13 @@ pub fn compile_task(spec: &TaskSpec, root: &Path) -> Result<TaskIr, SpecError> {
     if !diags.is_empty() {
         return refuse("the compiled Task IR", "validate", format!("{diags:?}"));
     }
-    Ok(task)
+    Ok((task, clauses))
 }
 
 /// What `es_tools::backend::load_scene` does (a layer-11 sibling, so not callable here): the
 /// scene by extension, then its mesh files relative to its directory. Also the file's bytes,
 /// whose digest is `SceneRef.asset_hash`, as in every committed document.
-pub(super) fn load_scene(path: &Path) -> Result<(SceneDesc, Vec<u8>), String> {
+pub fn load_scene(path: &Path) -> Result<(SceneDesc, Vec<u8>), String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
     let raw = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
     let dir = path.parent().unwrap_or(Path::new("."));
@@ -145,6 +160,8 @@ struct Compiler<'a> {
     streams: BTreeSet<String>,
     /// The `qpos` lanes a start item writes.
     placed: BTreeSet<usize>,
+    /// Each clause's predicate node ([`compile_clauses`]).
+    clauses: Vec<ClauseNode>,
 }
 
 impl<'a> Compiler<'a> {
@@ -173,6 +190,7 @@ impl<'a> Compiler<'a> {
             channels: BTreeMap::new(),
             streams: BTreeSet::new(),
             placed: BTreeSet::new(),
+            clauses: Vec::new(),
         })
     }
 
@@ -522,6 +540,7 @@ impl<'a> Compiler<'a> {
             for (i, c) in clauses.clauses.iter().enumerate() {
                 let at = format!("{section}[{i}] ({} {})", c.subject, c.relation.name());
                 let p = self.clause(&at, c)?;
+                self.clauses.push((kind, i, p));
                 acc = Some(acc.map_or(p, |a| self.logic(op, a, p)));
             }
             let acc = acc.expect("non-empty");
