@@ -9,6 +9,7 @@
 //! the scene's textures through [`texture::load`] -- an importer is still handed bytes.
 #![forbid(unsafe_code)]
 
+pub mod esscene;
 pub mod fuzz;
 pub mod gltf;
 pub mod mesh;
