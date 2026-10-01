@@ -225,6 +225,22 @@ pub fn any_hit_flat(tris: &[Tri], o: [f32; 3], d: [f32; 3], near: f32, far: f32)
 /// Is anything in `(near, far)`? A boolean does not depend on the visit order at all, so this
 /// is the same descent with an early return.
 pub fn any_hit(tris: &[Tri], bvh: &Bvh, o: [f32; 3], d: [f32; 3], near: f32, far: f32) -> bool {
+    any_hit_but_panels(tris, bvh, o, d, near, far, false)
+}
+
+/// [`any_hit`], passing through the `_light` panels ([`Tri::light`]) when `skip_panels`: the
+/// [`Shading::Full`] shadow ray's (packet M17/R6). A panel is the path tracer's emitter, the
+/// light the directional one stands for, and an emitter does not occlude its own light. The
+/// path tracer's rays keep the panel: there it is a surface, and it emits.
+fn any_hit_but_panels(
+    tris: &[Tri],
+    bvh: &Bvh,
+    o: [f32; 3],
+    d: [f32; 3],
+    near: f32,
+    far: f32,
+    skip_panels: bool,
+) -> bool {
     if bvh.nodes.is_empty() {
         return false;
     }
@@ -245,8 +261,11 @@ pub fn any_hit(tris: &[Tri], bvh: &Bvh, o: [f32; 3], d: [f32; 3], near: f32, far
             continue;
         }
         for k in 0..node.count as usize {
-            let i = bvh.prim[node.a as usize + k] as usize;
-            if intersect(&tris[i], o, d).is_some_and(|t| t > near && t < far) {
+            let tri = &tris[bvh.prim[node.a as usize + k] as usize];
+            if skip_panels && tri.light {
+                continue;
+            }
+            if intersect(tri, o, d).is_some_and(|t| t > near && t < far) {
                 return true;
             }
         }
@@ -365,7 +384,8 @@ fn shade_lambert_base(
 ///
 /// `n` is the world-space normal already face-forwarded, `p` the hit point, `d` the (not
 /// normalised) view ray. The shadow ray runs on `(0, SHADOW_FAR)` from `p + n * RAY_EPS`
-/// towards the light, so the surface cannot shadow itself. `pow` is `exp(ln(x) * k)` guarded at
+/// towards the light, so the surface cannot shadow itself, and passes through the `_light`
+/// panels (packet M17/R6, [`Tri::light`]). `pow` is `exp(ln(x) * k)` guarded at
 /// `x <= 0` — no `std`, no `GLSL.std.450` (spec 3.2 `DET-010`).
 ///
 /// A [`Shading::Lambert`] config never reaches here; it is answered as itself so this is a
@@ -424,7 +444,8 @@ pub fn shade_full_surface(
         cfg.light_dir.y as f32,
         cfg.light_dir.z as f32,
     ];
-    let vis = if shadows && any_hit(tris, bvh, add(p, scale(n, RAY_EPS)), light, 0.0, SHADOW_FAR) {
+    let o = add(p, scale(n, RAY_EPS));
+    let vis = if shadows && any_hit_but_panels(tris, bvh, o, light, 0.0, SHADOW_FAR, true) {
         0.0
     } else {
         1.0

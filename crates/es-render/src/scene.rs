@@ -30,7 +30,8 @@ use crate::error::RenderError;
 use crate::material::{Look, Materials};
 
 /// Floats per triangle in the flat upload buffer:
-/// `v0 v1 v2 n albedo emission seg mat tc0 tc1 tc2 pad` (packet HT1 grew it from 20).
+/// `v0 v1 v2 n albedo emission seg mat tc0 tc1 tc2 light pad` (packet HT1 grew it from 20;
+/// packet M17/R6 put [`Tri::light`] in the first pad slot).
 pub const TRI_STRIDE: usize = 32;
 
 /// Tessellation counts. Constants, not quality settings: changing one changes every golden,
@@ -63,6 +64,10 @@ pub struct Tri {
     /// Per-vertex texture coordinates: `(s, t, 0)` for a 2D texture, the cube-map direction
     /// `(s, t, r)` for a cube one (packet HT1).
     pub tc: [[f32; 3]; 3],
+    /// A `_light` geom's triangle: the path tracer's emitter, which stands for the light the
+    /// `Full` look's directional light is, so that look's shadow ray passes through it (packet
+    /// M17/R6). A drawn material's emission does not set it: a glowing object still occludes.
+    pub light: bool,
 }
 
 /// A tessellated scene, ready to upload.
@@ -183,7 +188,8 @@ impl TriScene {
             wear.rgba[1] as f32,
             wear.rgba[2] as f32,
         ];
-        let emission = if geom.name.ends_with(LIGHT_SUFFIX) {
+        let light = geom.name.ends_with(LIGHT_SUFFIX);
+        let emission = if light {
             albedo
         } else if let Some(e) = wear.emissive {
             e.map(|c| c as f32)
@@ -217,13 +223,14 @@ impl TriScene {
                 seg,
                 mat,
                 tc,
+                light,
             });
         }
     }
 
     /// Flat upload buffer, [`TRI_STRIDE`] floats per triangle, segmentation id and material
-    /// slot bitcast into slots 18 and 19. One buffer, one stride, the same layout on both
-    /// sides.
+    /// slot bitcast into slots 18 and 19, [`Tri::light`] into 29 as `0`/`1`. One buffer, one
+    /// stride, the same layout on both sides.
     pub fn to_floats(&self) -> Vec<f32> {
         let mut out = Vec::with_capacity(self.tris.len() * TRI_STRIDE);
         for t in &self.tris {
@@ -238,7 +245,8 @@ impl TriScene {
             for tc in &t.tc {
                 out.extend_from_slice(tc);
             }
-            out.extend_from_slice(&[0.0; 3]);
+            out.push(f32::from_bits(u32::from(t.light)));
+            out.extend_from_slice(&[0.0; 2]);
         }
         out
     }

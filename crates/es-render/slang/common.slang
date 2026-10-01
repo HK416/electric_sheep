@@ -120,6 +120,8 @@ struct EsTri {
     float3 tc0;
     float3 tc1;
     float3 tc2;
+    // Packet M17/R6: a `_light` geom's triangle, which the Full look's shadow ray passes through.
+    bool light;
 };
 
 EsTri es_tri(uint i) {
@@ -136,6 +138,7 @@ EsTri es_tri(uint i) {
     t.tc0 = float3(es_tris[b + 20], es_tris[b + 21], es_tris[b + 22]);
     t.tc1 = float3(es_tris[b + 23], es_tris[b + 24], es_tris[b + 25]);
     t.tc2 = float3(es_tris[b + 26], es_tris[b + 27], es_tris[b + 28]);
+    t.light = asuint(es_tris[b + 29]) != 0u;
     return t;
 }
 
@@ -339,7 +342,9 @@ bool es_nearest(float3 o, float3 d, float near, float far, out float best_t, out
 }
 
 // A boolean does not depend on the visit order at all: the same descent with an early return.
-bool es_any_hit(float3 o, float3 d, float near, float far) {
+// `skip_panels` passes through the `_light` panels: the Full look's shadow ray (packet M17/R6).
+// Mirror of `cpu::any_hit_but_panels`.
+bool es_any_hit_but_panels(float3 o, float3 d, float near, float far, bool skip_panels) {
     if (es_bvh_nodes() == 0) { return false; }
     float3 inv = float3(es_rcp_safe(d.x), es_rcp_safe(d.y), es_rcp_safe(d.z));
     uint stack[ES_BVH_STACK];
@@ -357,13 +362,20 @@ bool es_any_hit(float3 o, float3 d, float near, float far) {
             continue;
         }
         for (uint k = 0; k < node.count; ++k) {
+            EsTri tr = es_tri(es_bvh_prim(node.a + k));
+            if (skip_panels && tr.light) { continue; }
             float t;
-            if (es_intersect(es_tri(es_bvh_prim(node.a + k)), o, d, t)) {
+            if (es_intersect(tr, o, d, t)) {
                 if (t > near && t < far) { return true; }
             }
         }
     }
     return false;
+}
+
+// Mirror of `cpu::any_hit`: every triangle occludes.
+bool es_any_hit(float3 o, float3 d, float near, float far) {
+    return es_any_hit_but_panels(o, d, near, far, false);
 }
 
 float3 es_face_forward(float3 n, float3 d) {
@@ -427,7 +439,8 @@ float3 es_normalize(float3 a) {
 float3 es_shade_full(EsTri tr, EsSurface s, float3 n, float3 p, float3 d) {
     float3 light = es_light_dir();
     float vis = 1.0;
-    if (es_shadows() && es_any_hit(p + n * ES_RAY_EPS, light, 0.0, ES_SHADOW_FAR)) { vis = 0.0; }
+    float3 o = p + n * ES_RAY_EPS;
+    if (es_shadows() && es_any_hit_but_panels(o, light, 0.0, ES_SHADOW_FAR, true)) { vis = 0.0; }
     // A normal-mapped surface lights with its shading normal (plan H, HT2); the shadow ray
     // above left along the geometric one.
     if (s.bumped) { n = s.ns; }

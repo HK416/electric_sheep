@@ -635,6 +635,146 @@ fn a_shadow_ray_darkens_only_occluded_pixels() {
     );
 }
 
+/// Packet M17/R6 (review M17 F-6): a `_light` panel — the path tracer's emitter — casts no
+/// `Full` shadow, and every other geom still does. A floor, a block and a panel above them, at
+/// `ssaa: 1` so one pixel is one ray. A pixel the shadow ray darkens is one whose ray towards
+/// the light meets the block; the floor in the panel's shadow is its `shadows: false` pixel.
+/// The device renders the same frame (renderer.md section 9.3's rule).
+#[test]
+fn a_light_panel_casts_no_shadow() {
+    use es_render::bvh::Bvh;
+    const XML: &str = r#"<mujoco model="panel">
+  <worldbody>
+    <geom name="floor" type="box" size="2 2 0.05" pos="0 0 -0.05" rgba="0.8 0.8 0.8 1"/>
+    <geom name="block" type="box" size="0.15 0.15 0.4" pos="0.5 0.5 0.4" rgba="0.8 0.3 0.2 1"/>
+    <geom name="ceiling_light" type="box" size="0.3 0.3 0.005" pos="0 0 1.5" rgba="1 1 1 1"
+          contype="0" conaffinity="0"/>
+  </worldbody>
+</mujoco>"#;
+    type Aabb = ([f32; 3], [f32; 3]);
+    let desc = es_assets::parse_mjcf(XML).expect("parses").scene;
+    let scene = TriScene::from_scene(&desc).expect("tessellates");
+    let cam = es_render::raster::Camera {
+        eye: [-1.0, -2.6, 1.1],
+        look_at: [0.0, 0.0, 0.3],
+        fov_y: 60f64.to_radians(),
+        width: TILE,
+        height: TILE,
+    }
+    .view()
+    .expect("view");
+    let (on, off) = (rs_full_with(true, 1), rs_full_with(false, 1));
+    let rgb = |f: &Frame| f.tile(Channel::Rgb8).unwrap().to_bytes();
+    let lit = rgb(&cpu::rasterize(&scene, &cam, &off, 0));
+    let shadowed = rgb(&cpu::rasterize(&scene, &cam, &on, 0));
+
+    // Does the ray from `p` towards the light cross the box? Slabs; no light component is 0.
+    let l = [
+        on.light_dir.x as f32,
+        on.light_dir.y as f32,
+        on.light_dir.z as f32,
+    ];
+    let crosses = |p: [f32; 3], (lo, hi): Aabb| {
+        let (mut t0, mut t1) = (0.0f32, f32::INFINITY);
+        for k in 0..3 {
+            let (a, b) = ((lo[k] - p[k]) / l[k], (hi[k] - p[k]) / l[k]);
+            t0 = t0.max(a.min(b));
+            t1 = t1.min(a.max(b));
+        }
+        t0 <= t1
+    };
+    // A margin either way, so a pixel at a shadow's edge is in no class.
+    let grow = |(lo, hi): Aabb, m: f32| -> Aabb { (lo.map(|v| v - m), hi.map(|v| v + m)) };
+    let panel: Aabb = ([-0.3, -0.3, 1.495], [0.3, 0.3, 1.505]);
+    let block: Aabb = ([0.35, 0.35, 0.0], [0.65, 0.65, 0.8]);
+
+    let vp = es_render::ViewParams::new(&cam);
+    let bvh = Bvh::build(&scene.tris);
+    let (mut under, mut behind, mut glow) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut darkened, mut by_panel) = (0, 0);
+    for py in 0..TILE {
+        for px in 0..TILE {
+            let i = (py * TILE + px) as usize * 3;
+            let d = cpu::primary_dir(&vp, px, py);
+            let Some(hit) = cpu::nearest_hit(&scene.tris, &bvh, vp.pos, d, vp.near, vp.far) else {
+                continue;
+            };
+            let p = [0, 1, 2].map(|k| vp.pos[k] + d[k] * hit.t);
+            let name = scene.names[&scene.tris[hit.tri as usize].seg].as_str();
+            match name {
+                "ceiling_light" => glow.push(i),
+                "floor" if crosses(p, grow(panel, -0.02)) && !crosses(p, grow(block, 0.02)) => {
+                    under.push(i);
+                }
+                "floor" if crosses(p, grow(block, -0.02)) && !crosses(p, grow(panel, 0.02)) => {
+                    behind.push(i);
+                }
+                _ => {}
+            }
+            if shadowed[i..i + 3] != lit[i..i + 3] {
+                darkened += 1;
+                // Only the block may stand between a darkened pixel and the light.
+                if name != "block" && !crosses(p, grow(block, 0.02)) {
+                    by_panel += 1;
+                }
+            }
+        }
+    }
+    let mean = |px: &[usize], img: &[u8]| {
+        [0, 1, 2].map(|c| px.iter().map(|i| f64::from(img[i + c])).sum::<f64>() / px.len() as f64)
+    };
+    for (what, px) in [
+        ("floor under the panel", &under),
+        ("floor behind the block", &behind),
+        ("the panel itself", &glow),
+    ] {
+        println!(
+            "{what}: {} pixels, mean Rgb8 shadows on {:.1?}, off {:.1?}",
+            px.len(),
+            mean(px, &shadowed),
+            mean(px, &lit)
+        );
+    }
+    println!("{darkened} pixels darkened, {by_panel} of them by the panel alone");
+    assert_eq!(by_panel, 0, "the panel casts a shadow");
+    assert!(
+        under.len() >= 20 && behind.len() >= 10 && glow.len() >= 20,
+        "the camera must see the panel and both shadows' floor"
+    );
+    for &i in &under {
+        assert_eq!(
+            shadowed[i..i + 3],
+            lit[i..i + 3],
+            "the panel darkened the floor"
+        );
+    }
+    for &i in &behind {
+        let dark = (0..3).all(|c| shadowed[i + c] < lit[i + c]);
+        assert!(dark, "the block no longer shadows the floor");
+    }
+    for &i in &glow {
+        assert_eq!(shadowed[i..i + 3], [255; 3], "the panel is drawn as it was");
+    }
+
+    let Some(gpu) = open("a_light_panel_casts_no_shadow") else {
+        return;
+    };
+    let mut r = Renderer::new(&gpu, on).expect("renderer");
+    r.upload_tris(scene).expect("upload");
+    let got = (r.render(std::slice::from_ref(&cam)))
+        .and_then(|mut a| a.read_tile(0, Channel::Rgb8))
+        .expect("render")
+        .to_bytes();
+    let differ = (got.chunks(3).zip(shadowed.chunks(3)))
+        .filter(|(a, b)| a != b)
+        .count();
+    println!("GPU vs CPU: {differ} of {} pixels differ", TILE * TILE);
+    for &i in &under {
+        assert_eq!(got[i..i + 3], shadowed[i..i + 3], "GPU: the panel's shadow");
+    }
+    assert!(differ * 1000 <= (TILE * TILE) as usize, "GPU vs CPU");
+}
+
 /// The shading mix is energy-conserving (amended at review): a surface in full light returns
 /// its albedo, a shadowed one returns `albedo * hemi`, and neither can exceed the albedo.
 ///
