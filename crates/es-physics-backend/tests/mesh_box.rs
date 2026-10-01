@@ -90,14 +90,19 @@ fn pythons() -> Vec<String> {
 
 /// Runs [`SCRIPT`] over the emitted MJCF, or the reason it could not.
 fn facts() -> Option<BTreeMap<String, f64>> {
+    run(SCRIPT, &scene())
+}
+
+/// Runs `script` over `scene`'s emitted MJCF, or the reason it could not.
+fn run(script: &str, scene: &SceneDesc) -> Option<BTreeMap<String, f64>> {
     if let Err(reason) = MuJoCoCpuBackend::is_available() {
         println!("SKIP mesh_box: {reason}");
         return None;
     }
-    let mjcf = scene_to_mjcf(&scene()).expect("the loaded mesh scene emits");
+    let mjcf = scene_to_mjcf(scene).expect("the loaded mesh scene emits");
     let python = pythons().remove(0);
     let mut child = Command::new(&python)
-        .args(["-c", SCRIPT])
+        .args(["-c", script])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -200,6 +205,65 @@ fn mesh_box_mass_and_inertia_match_the_primitive() {
         let error = rel(a, b);
         assert!(error < 1e-6, "inertia[{k}] {a} vs {b} (relative {error:e})");
     }
+}
+
+/// Packet M17/R3: `box.stl` drawn in millimetres (every vertex times 1000) and placed in a scene
+/// document at `scale = 0.001` is, in `MuJoCo`, the 10 cm box again: the same bounding box and
+/// mass as the primitive beside it, and it comes to rest beside it.
+#[test]
+fn a_millimetre_mesh_at_a_thousandth_is_the_box_in_mujoco() {
+    let dir = std::env::temp_dir().join(format!("es-mesh-mm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let stl = std::fs::read(fixtures_dir().join("meshes/box.stl")).unwrap();
+    let (positions, indices) = es_assets::stl::parse(&stl).unwrap();
+    let mut mm = vec![0u8; 80];
+    mm.extend_from_slice(&(indices.len() as u32 / 3).to_le_bytes());
+    for f in indices.chunks_exact(3) {
+        mm.extend_from_slice(&[0u8; 12]);
+        for &i in f {
+            for c in positions[i as usize] {
+                mm.extend_from_slice(&(c * 1000.0).to_le_bytes());
+            }
+        }
+        mm.extend_from_slice(&[0u8; 2]);
+    }
+    std::fs::write(dir.join("box_mm.stl"), mm).unwrap();
+    let doc = "kind = \"scene\"\nschema = 1\n\
+               [[geom]]\nshape = { plane = [0.0, 0.0, 0.05] }\n\
+               [[body]]\nname = \"mm_box\"\npos = [0.0, 0.0, 0.2]\njoint = { kind = \"free\" }\n\
+               [[body.geom]]\nname = \"mm\"\nshape = { mesh = \"box_mm.stl\", scale = [0.001, 0.001, 0.001] }\n\
+               [[body]]\nname = \"prim_box\"\npos = [0.5, 0.0, 0.2]\njoint = { kind = \"free\" }\n\
+               [[body.geom]]\nname = \"prim\"\nshape = { box = [0.05, 0.05, 0.05] }\n";
+    let doc = es_assets::esscene::EsScene::from_toml(doc).unwrap();
+    let scene = es_assets::esscene::expand(&doc, &dir).unwrap();
+    let script = r#"
+import sys
+import mujoco
+model = mujoco.MjModel.from_xml_string(sys.stdin.read())
+data = mujoco.MjData(model)
+out = []
+for n in ("mm", "prim"):
+    g = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, n)
+    for k in range(3):
+        out.append(("half.%s.%d" % (n, k), model.geom_aabb[g][3 + k]))
+    out.append(("mass.%s" % n, model.body_mass[model.geom_bodyid[g]]))
+for _ in range(2000):
+    mujoco.mj_step(model, data)
+for n in ("mm_box", "prim_box"):
+    out.append(("z.%s" % n, data.xpos[mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, n)][2]))
+sys.stdout.write("".join("%s %r\n" % (k, float(v)) for k, v in out))
+"#;
+    let Some(f) = run(script, &scene) else { return };
+    for k in 0..3 {
+        let (mm, prim) = (f[&format!("half.mm.{k}")], f[&format!("half.prim.{k}")]);
+        assert!(rel(mm, prim) < 1e-6, "half-extent {k}: {mm} vs {prim}");
+    }
+    assert!(rel(f["mass.mm"], f["mass.prim"]) < 1e-6, "{f:?}");
+    let (mm, prim) = (f["z.mm_box"], f["z.prim_box"]);
+    assert!(
+        (mm - prim).abs() < 1e-3 && (mm - REST_Z).abs() < 2e-3,
+        "{mm} {prim}"
+    );
 }
 
 /// The packet left this unverified: does `MuJoCo` 3.13's default `<mesh inertia="legacy">` agree

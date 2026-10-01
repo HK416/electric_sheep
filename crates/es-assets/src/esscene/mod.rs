@@ -241,9 +241,10 @@ pub struct InertialDoc {
     pub fullinertia: Option<[f64; 6]>,
 }
 
-/// Sizes are `SceneDesc::Shape`'s: half-extents, radii, half-lengths, m.
+/// Sizes are `SceneDesc::Shape`'s: half-extents, radii, half-lengths, m. Written as a table of
+/// one shape key, `{ box = [0.03, 0.03, 0.03] }`, and beside `mesh` an optional `scale`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[serde(try_from = "ShapeTable", into = "ShapeTable")]
 pub enum ShapeDoc {
     /// Half x, half y (0 = infinite), grid spacing.
     Plane([f64; 3]),
@@ -253,8 +254,78 @@ pub enum ShapeDoc {
     Cylinder([f64; 2]),
     Box([f64; 3]),
     Ellipsoid([f64; 3]),
-    /// An `.stl` / `.obj` file relative to the document; the asset is named by its stem.
-    Mesh(String),
+    /// An `.stl` / `.obj` file relative to the document, its vertices times `scale` per axis
+    /// (absent is 1; packet M17/R3). The asset is named by the file's stem.
+    Mesh {
+        file: String,
+        scale: Option<[f64; 3]>,
+    },
+}
+
+/// [`ShapeDoc`] as written: exactly one shape key, and `scale` only beside `mesh`.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ShapeTable {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plane: Option<[f64; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sphere: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capsule: Option<[f64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cylinder: Option<[f64; 2]>,
+    #[serde(rename = "box", skip_serializing_if = "Option::is_none")]
+    cuboid: Option<[f64; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ellipsoid: Option<[f64; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mesh: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scale: Option<[f64; 3]>,
+}
+
+impl TryFrom<ShapeTable> for ShapeDoc {
+    type Error = String;
+
+    fn try_from(t: ShapeTable) -> Result<Self, String> {
+        let scale = t.scale;
+        let mut given = [
+            t.plane.map(Self::Plane),
+            t.sphere.map(Self::Sphere),
+            t.capsule.map(Self::Capsule),
+            t.cylinder.map(Self::Cylinder),
+            t.cuboid.map(Self::Box),
+            t.ellipsoid.map(Self::Ellipsoid),
+            t.mesh.map(|file| Self::Mesh { file, scale }),
+        ]
+        .into_iter()
+        .flatten();
+        match (given.next(), given.next()) {
+            (Some(s @ Self::Mesh { .. }), None) => Ok(s),
+            (Some(s), None) if scale.is_none() => Ok(s),
+            (Some(_), None) => Err("`scale` is a mesh's".to_owned()),
+            _ => Err(
+                "a shape is one of plane, sphere, capsule, cylinder, box, ellipsoid, mesh"
+                    .to_owned(),
+            ),
+        }
+    }
+}
+
+impl From<ShapeDoc> for ShapeTable {
+    fn from(s: ShapeDoc) -> Self {
+        let mut t = Self::default();
+        match s {
+            ShapeDoc::Plane(v) => t.plane = Some(v),
+            ShapeDoc::Sphere(r) => t.sphere = Some(r),
+            ShapeDoc::Capsule(v) => t.capsule = Some(v),
+            ShapeDoc::Cylinder(v) => t.cylinder = Some(v),
+            ShapeDoc::Box(v) => t.cuboid = Some(v),
+            ShapeDoc::Ellipsoid(v) => t.ellipsoid = Some(v),
+            ShapeDoc::Mesh { file, scale } => (t.mesh, t.scale) = (Some(file), scale),
+        }
+        t
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

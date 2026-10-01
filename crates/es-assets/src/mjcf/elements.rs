@@ -52,17 +52,20 @@ impl<'a> Parser<'a> {
                 AssetKind::Material => attrs.get("texture").unwrap_or_default().to_owned(),
                 _ => join(dir, file.unwrap_or_default()),
             };
+            let asset = AssetRef::from_path(kind, &name, &path);
             if kind == AssetKind::Mesh {
-                // `scale` / `refpos` / `refquat` transform the vertices before MuJoCo sees
-                // them, and this packet bakes none of them into the decoded mesh. Left as a
-                // `report_unknown` warning they would become a silent geometry error the
-                // moment the mesh is drawn and collided with, so a non-default value is
-                // refused by name -- the `<compiler coordinate>` pattern above.
-                for (attr, default) in [
-                    ("scale", "1 1 1"),
-                    ("refpos", "0 0 0"),
-                    ("refquat", "1 0 0 0"),
-                ] {
+                // `scale` is `SceneDesc::mesh_scales` (packet M17/R3); 1 is not written there.
+                #[allow(clippy::float_cmp)] // 1 exactly is the default
+                let scale = attrs.fixed::<3>("scale")?.filter(|s| *s != [1.0; 3]);
+                if let Some(s) = scale {
+                    self.scene.mesh_scales.insert(asset.id, s);
+                }
+                // `refpos` / `refquat` transform the vertices before MuJoCo sees them, and
+                // nothing here applies them. Left as a `report_unknown` warning they would
+                // become a silent geometry error the moment the mesh is drawn and collided
+                // with, so a non-default value is refused by name -- the `<compiler
+                // coordinate>` pattern above.
+                for (attr, default) in [("refpos", "0 0 0"), ("refquat", "1 0 0 0")] {
                     let Some(value) = attrs.get(attr) else {
                         continue;
                     };
@@ -74,7 +77,6 @@ impl<'a> Parser<'a> {
                     }
                 }
             }
-            let asset = AssetRef::from_path(kind, &name, &path);
             // Plan H, HT1: what a texture declares and what a drawn material carries.
             match kind {
                 AssetKind::Texture => self.parse_texture(&attrs, asset.id)?,

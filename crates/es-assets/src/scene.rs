@@ -37,6 +37,7 @@
 //! elements in the source file therefore cannot change the hash. Each [`AssetRef`] contributes
 //! its own `asset_hash`, so `asset_hash -> scene_hash` of spec 5.3 holds by construction.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use es_core::StableId;
@@ -103,6 +104,13 @@ pub struct SceneDesc {
     /// [`AssetRef`] is what the chain covers, as for meshes.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub textures: BTreeMap<StableId, crate::texture::Texture>,
+    /// MJCF `<mesh scale>`, by mesh asset id (packet M17/R3): every vertex is multiplied by it
+    /// before anything draws or simulates the mesh ([`SceneDesc::mesh_positions`]). A mesh
+    /// absent here has scale 1. `meshes` keeps the file's own vertices, so a writer re-encodes
+    /// the file unchanged. Hashed into [`SceneDesc::scene_hash`] in its own section, present
+    /// only when this map is non-empty.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mesh_scales: BTreeMap<StableId, [f64; 3]>,
 }
 
 /// A drawn material (plan H, HT1): the file's values, unset ones `None`. The renderer's glTF
@@ -719,7 +727,30 @@ impl SceneDesc {
                 name: body.to_string(),
             });
         }
+        let mesh =
+            |id: &StableId| (self.assets.iter()).any(|a| a.id == *id && a.kind == AssetKind::Mesh);
+        if let Some(id) = self.mesh_scales.keys().find(|id| !mesh(id)) {
+            return Err(SceneError::DanglingRef {
+                kind: "mesh scale",
+                name: id.to_string(),
+            });
+        }
         Ok(())
+    }
+
+    /// The vertices of mesh asset `id` as they are drawn and simulated: the decoded file's
+    /// times the mesh's scale, in `f64` and rounded to `f32` (`MuJoCo`'s arithmetic); the
+    /// decoded ones, borrowed, when it has none. `None` when the mesh is not loaded.
+    pub fn mesh_positions(&self, id: StableId) -> Option<Cow<'_, [[f32; 3]]>> {
+        let positions = &self.meshes.get(&id)?.positions;
+        Some(match self.mesh_scales.get(&id) {
+            None => Cow::Borrowed(positions),
+            Some(s) => Cow::Owned(
+                (positions.iter())
+                    .map(|p| [0, 1, 2].map(|k| (f64::from(p[k]) * s[k]) as f32))
+                    .collect(),
+            ),
+        })
     }
 
     // ponytail: parent-chain walk per body, O(n * depth). A scene has hundreds of bodies and a
@@ -797,6 +828,18 @@ impl SceneDesc {
         );
         self.encode_contact(&mut c);
         self.encode_appearance(&mut c);
+        // Packet M17/R3: mesh scales, appended only when a mesh has one, so every scene
+        // without one keeps the digest it had (spec 28.13 rule 2).
+        if !self.mesh_scales.is_empty() {
+            c.str("es.scene.mesh_scale.v1");
+            c.seq(self.mesh_scales.len());
+            for (id, s) in &self.mesh_scales {
+                c.id(*id);
+                for v in s {
+                    c.f64(*v);
+                }
+            }
+        }
         c.finish()
     }
 

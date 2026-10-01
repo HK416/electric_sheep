@@ -332,9 +332,14 @@ fn geom(
         ShapeDoc::Ellipsoid(r) => Shape::Ellipsoid {
             radii: vec3(Some(*r), Vec3::ZERO),
         },
-        ShapeDoc::Mesh(file) => Shape::Mesh {
-            asset: mesh_asset(s, file),
-        },
+        ShapeDoc::Mesh { file, scale } => {
+            if scale.is_some_and(|v| v.iter().any(|x| !(x.is_finite() && *x > 0.0))) {
+                return refuse(format!("{field}.shape.scale"), "a scale is positive");
+            }
+            Shape::Mesh {
+                asset: mesh_asset(s, file, *scale),
+            }
+        }
     };
     let mut out = default_geom(
         scene_id("geom", &format!("{body_path}/{name}")),
@@ -366,20 +371,31 @@ fn geom(
     Ok(out)
 }
 
-/// The mesh asset of `file`, added on first use and named by the file's stem.
-fn mesh_asset(s: &mut SceneDesc, file: &str) -> StableId {
-    if let Some(a) = s
-        .assets
-        .iter()
-        .find(|a| a.kind == AssetKind::Mesh && a.path == file)
-    {
+/// The mesh asset of `file` at `scale` (`None` and 1 alike: absent from `mesh_scales`), added on
+/// first use and named by the file's stem — and `@` the scale when it has one (`part@0.001`,
+/// `part@1,2,1`), so one file at two scales is two `<mesh>`es, as MJCF needs.
+#[allow(clippy::float_cmp)] // 1 exactly is no scale; equal bits are one number in the name
+fn mesh_asset(s: &mut SceneDesc, file: &str, scale: Option<[f64; 3]>) -> StableId {
+    let scale = scale.filter(|v| *v != [1.0; 3]);
+    let same = |a: &&AssetRef| {
+        a.kind == AssetKind::Mesh && a.path == file && s.mesh_scales.get(&a.id) == scale.as_ref()
+    };
+    if let Some(a) = s.assets.iter().find(same) {
         return a.id;
     }
     let base = file.rsplit(['/', '\\']).next().unwrap_or(file);
     let stem = base.rsplit_once('.').map_or(base, |(stem, _)| stem);
-    let a = AssetRef::from_path(AssetKind::Mesh, stem, file);
+    let name = match scale {
+        None => stem.to_owned(),
+        Some([x, y, z]) if x == y && y == z => format!("{stem}@{x}"),
+        Some([x, y, z]) => format!("{stem}@{x},{y},{z}"),
+    };
+    let a = AssetRef::from_path(AssetKind::Mesh, &name, file);
     let id = a.id;
     s.assets.push(a);
+    if let Some(v) = scale {
+        s.mesh_scales.insert(id, v);
+    }
     id
 }
 

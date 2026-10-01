@@ -164,6 +164,94 @@ fn refusals_name_the_field() {
     assert!(msg.contains("`base`"), "{msg}");
 }
 
+// ---- a mesh's scale (packet M17/R3) --------------------------------------------------------
+
+/// `box` (the 10 cm `meshes/box.stl`) as written, at `scale`; and the same file once more at
+/// a thousandth.
+fn boxes(scale: &str) -> String {
+    format!(
+        "{HEAD}[[body]]\nname = \"a\"\n[[body.geom]]\nshape = {{ mesh = \"meshes/box.stl\"{scale} }}\n\
+         [[body]]\nname = \"b\"\n[[body.geom]]\n\
+         shape = {{ mesh = \"meshes/box.stl\", scale = [0.001, 0.001, 0.001] }}\n"
+    )
+}
+
+fn expand_text(text: &str) -> SceneDesc {
+    let doc = EsScene::from_toml(text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+    expand(&doc, &fixtures().join("mjcf")).unwrap_or_else(|e| panic!("{e}"))
+}
+
+#[test]
+fn a_mesh_scale_reaches_the_scene_and_one_is_absent() {
+    let s = expand_text(&boxes(""));
+    let mesh = |body: &str| match s.bodies.iter().find(|b| b.name == body).unwrap().geoms[0].shape {
+        es_assets::scene::Shape::Mesh { asset } => asset,
+        other => panic!("{other:?}"),
+    };
+    let (a, b) = (mesh("a"), mesh("b"));
+    let name = |id| s.assets.iter().find(|x| x.id == id).unwrap().name.clone();
+    assert_eq!(
+        (name(a), name(b)),
+        ("box".to_owned(), "box@0.001".to_owned())
+    );
+    // One file, so one content digest; the scale is the scene's, not the file's.
+    let digest = |id| s.assets.iter().find(|x| x.id == id).unwrap().hash;
+    assert_eq!(digest(a), digest(b));
+    assert_eq!(s.meshes[&a].positions, s.meshes[&b].positions);
+    let (pa, pb) = (s.mesh_positions(a).unwrap(), s.mesh_positions(b).unwrap());
+    assert_eq!(*pa, s.meshes[&a].positions[..]);
+    for (p, q) in pa.iter().zip(pb.iter()) {
+        assert_eq!(*q, p.map(|v| (f64::from(v) * 0.001) as f32));
+    }
+    let extent = |ps: &[[f32; 3]]| {
+        let (lo, hi) = ps
+            .iter()
+            .fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), p| {
+                (
+                    [0, 1, 2].map(|k| lo[k].min(p[k])),
+                    [0, 1, 2].map(|k| hi[k].max(p[k])),
+                )
+            });
+        [0, 1, 2].map(|k| f64::from(hi[k] - lo[k]))
+    };
+    let (ea, eb) = (extent(&pa), extent(&pb));
+    for k in 0..3 {
+        assert!((eb[k] - ea[k] / 1000.0).abs() < 1e-9, "{ea:?} {eb:?}");
+    }
+    assert!((ea[0] - 0.1).abs() < 1e-6, "{ea:?}");
+    // Absent and 1 are the same scene, bit for bit; any other scale moves the hash.
+    let one = expand_text(&boxes(", scale = [1.0, 1.0, 1.0]"));
+    assert_eq!(hex(&one.scene_hash()), hex(&s.scene_hash()));
+    assert_eq!(format!("{one:?}"), format!("{s:?}"));
+    let half = expand_text(&boxes(", scale = [0.5, 0.5, 0.5]"));
+    assert_ne!(half.scene_hash(), s.scene_hash());
+    // Read after write keeps it.
+    let doc = EsScene::from_toml(&boxes("")).unwrap();
+    let text = doc.to_toml().unwrap();
+    assert!(text.contains("scale = [0.001, 0.001, 0.001]"), "{text}");
+    assert_eq!(EsScene::from_toml(&text).unwrap(), doc);
+}
+
+#[test]
+fn a_mesh_scale_is_refused_where_it_does_not_belong() {
+    let body =
+        |shape: &str| format!("{HEAD}[[body]]\nname = \"a\"\n[[body.geom]]\nshape = {shape}\n");
+    for (shape, why) in [
+        (
+            "{ box = [0.1, 0.1, 0.1], scale = [2.0, 2.0, 2.0] }",
+            "a mesh's",
+        ),
+        ("{ box = [0.1, 0.1, 0.1], sphere = 0.1 }", "one of"),
+        (
+            "{ mesh = \"meshes/box.stl\", scale = [0.0, 1.0, 1.0] }",
+            "`body[a].geom[geom1].shape.scale`",
+        ),
+    ] {
+        let msg = refusal(&body(shape));
+        assert!(msg.contains(why), "`{why}` not in: {msg}");
+    }
+}
+
 // ---- include placement, prefix, overrides ------------------------------------------------
 
 #[test]
@@ -253,7 +341,7 @@ fn geom_doc() -> impl Strategy<Value = es_assets::esscene::GeomDoc> {
         finite().prop_map(ShapeDoc::Sphere),
         arr::<2>().prop_map(ShapeDoc::Capsule),
         arr::<3>().prop_map(ShapeDoc::Box),
-        name().prop_map(ShapeDoc::Mesh),
+        (name(), opt(arr::<3>())).prop_map(|(file, scale)| ShapeDoc::Mesh { file, scale }),
     ];
     (
         opt(name()),

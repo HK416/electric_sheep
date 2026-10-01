@@ -50,8 +50,9 @@ pub enum Item {
     Object(ShapeKind),
     /// Static scenery: one geom on the world.
     Fixed(ShapeKind),
-    /// A free body with one mesh geom, from an STL or OBJ file.
-    Mesh(PathBuf),
+    /// A free body with one mesh geom, from an STL or OBJ file, its vertices times this scale:
+    /// the unit the file was drawn in ([`import::UNITS`]).
+    Mesh(PathBuf, f64),
     /// An `[[include]]`: a robot of the library or from a file.
     Robot(Robot),
     Camera,
@@ -136,7 +137,7 @@ fn extent(shape: &ShapeDoc, n: Vec3) -> f64 {
         ShapeDoc::Ellipsoid([a, b, c]) => {
             ((a * x).powi(2) + (b * y).powi(2) + (c * z).powi(2)).sqrt()
         }
-        ShapeDoc::Plane(_) | ShapeDoc::Mesh(_) => 0.0,
+        ShapeDoc::Plane(_) | ShapeDoc::Mesh { .. } => 0.0,
     }
 }
 
@@ -223,10 +224,12 @@ impl SceneModel {
                     ..new_geom(shape(*kind))
                 })
             }
-            Item::Mesh(src) => {
+            Item::Mesh(src, unit) => {
                 let field = "body.geom.shape";
-                let (path, w) = import::file(self.root(), src).map_err(|why| other(field, why))?;
-                let mut b = new_body(&self.unique(&stem(src)), ShapeDoc::Mesh(path));
+                let (file, w) = import::file(self.root(), src).map_err(|why| other(field, why))?;
+                let mesh = ShapeDoc::Mesh { file, scale: None };
+                let mesh = inspect::with_scale(&mesh, [*unit; 3]);
+                let mut b = new_body(&self.unique(&stem(src)), mesh);
                 match self.lowest(&b, n) {
                     Ok(low) => b.pos = rest(low),
                     Err(r) => {
@@ -289,8 +292,10 @@ impl SceneModel {
         let mut doc = import::empty();
         doc.bodies.push(b.clone());
         let s = check(&doc, self.root(), &[])?;
-        let points = s.meshes.values().flat_map(|m| &m.positions);
-        let low = points
+        let points: Vec<[f32; 3]> = (s.meshes.keys())
+            .flat_map(|id| s.mesh_positions(*id).unwrap_or_default().into_owned())
+            .collect();
+        let low = (points.iter())
             .map(|p| n.dot(Vec3::new(p[0].into(), p[1].into(), p[2].into())))
             .fold(f64::INFINITY, f64::min);
         Ok(if low.is_finite() { -low } else { 0.0 })

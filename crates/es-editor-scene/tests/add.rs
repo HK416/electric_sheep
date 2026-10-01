@@ -119,7 +119,7 @@ fn items() -> Vec<Item> {
     .collect();
     out.extend([
         Item::Fixed(ShapeKind::Box),
-        Item::Mesh(fixtures.join("mjcf/meshes/box.stl")),
+        Item::Mesh(fixtures.join("mjcf/meshes/box.stl"), 1.0),
         Item::Robot(library_robot("so101")),
         Item::Robot(library_robot("shadow_hand")),
         Item::Robot(Robot::file(&fixtures.join("urdf/arm2.urdf"))),
@@ -137,7 +137,7 @@ fn items() -> Vec<Item> {
 fn made_by(item: &Item, e: &Entity) -> bool {
     matches!(
         (item, e),
-        (Item::Object(_) | Item::Mesh(_), Entity::Body(_))
+        (Item::Object(_) | Item::Mesh(..), Entity::Body(_))
             | (Item::Fixed(_), Entity::Scenery(_))
             | (Item::Robot(_), Entity::Include(_))
             | (Item::Camera, Entity::Camera(_))
@@ -301,7 +301,7 @@ fn imports_are_copied_by_content() {
     m.redo();
     for item in [
         Item::Robot(Robot::file(&junk.join("broken.xml"))),
-        Item::Mesh(junk.join("broken.stl")),
+        Item::Mesh(junk.join("broken.stl"), 1.0),
     ] {
         let refused = m.add(&item, &view, true).expect_err("refused");
         assert!(!refused.args.is_empty(), "{refused:?} says why");
@@ -315,7 +315,7 @@ fn imports_are_copied_by_content() {
 
     // A document naming an imported mesh survives a save and a read.
     let stl = repo().join("tests/fixtures/mjcf/meshes/box.stl");
-    m.add(&Item::Mesh(stl.clone()), &view, true).unwrap();
+    m.add(&Item::Mesh(stl.clone(), 1.0), &view, true).unwrap();
     let Some(Entity::Body(b)) = m.selection().cloned() else {
         panic!("a body")
     };
@@ -323,7 +323,10 @@ fn imports_are_copied_by_content() {
     let hash = blake3::hash(&std::fs::read(&stl).unwrap()).to_hex();
     assert_eq!(
         geom.shape,
-        es_assets::esscene::ShapeDoc::Mesh(format!("{ASSETS}/{hash}.stl"))
+        es_assets::esscene::ShapeDoc::Mesh {
+            file: format!("{ASSETS}/{hash}.stl"),
+            scale: None
+        }
     );
     m.save().unwrap();
     let text = std::fs::read_to_string(m.root().join(es_editor_scene::SCENE_FILE)).unwrap();
@@ -331,6 +334,89 @@ fn imports_are_copied_by_content() {
     let reopened = SceneModel::open(m.root(), vec![BackendKind::MuJoCoCpu]).unwrap();
     assert_eq!(reopened.doc(), m.doc());
     assert_eq!(mesh_hashes(reopened.scene()), mesh_hashes(m.scene()));
+}
+
+/// The whole extent of the expanded mesh of the body `b` of `m`, along each axis.
+fn mesh_extent(m: &SceneModel, b: &str) -> [f64; 3] {
+    let s = m.scene();
+    let body = s.bodies.iter().find(|x| x.name == b).unwrap();
+    let es_assets::scene::Shape::Mesh { asset } = body.geoms[0].shape else {
+        panic!("a mesh")
+    };
+    let p = s.mesh_positions(asset).unwrap();
+    let axis = |k: usize| p.iter().map(move |v| f64::from(v[k]));
+    [0, 1, 2].map(|k| axis(k).fold(f64::MIN, f64::max) - axis(k).fold(f64::MAX, f64::min))
+}
+
+/// Packet M17/R3: the import's unit is the mesh's scale — millimetres a thousandth, metres none
+/// written — and it rests at its scaled lowest point; a size handle on a mesh is one `Set` of
+/// its scale, its extent snapped to whole centimetres, one undo step.
+#[test]
+fn a_mesh_unit_is_its_scale_and_its_handles_size_it() {
+    let stl = repo().join("tests/fixtures/mjcf/meshes/box.stl");
+    let size = import::mesh_size(&stl).unwrap();
+    assert!(size.iter().all(|v| (v - 0.1).abs() < 1e-6), "{size:?}");
+    assert_eq!(import::UNITS.map(|u| u.1), [1.0, 0.01, 0.001]);
+
+    let mut m = open("mesh-unit", EMPTY_SCENE, None);
+    let mut made = Vec::new();
+    let mut view = towards([0.0; 3], [0.0; 3]);
+    for (unit, x) in [(0.001, 0.3), (1.0, -0.3)] {
+        view = towards([x, -1.2, 1.2], [x, 0.0, 0.0]);
+        m.add(&Item::Mesh(stl.clone(), unit), &view, false).unwrap();
+        let Some(Entity::Body(b)) = m.selection().cloned() else {
+            panic!("a body")
+        };
+        let body = m.doc().bodies.iter().find(|x| x.name == b).unwrap();
+        let es_assets::esscene::ShapeDoc::Mesh { scale, .. } = &body.geoms[0].shape else {
+            panic!("a mesh")
+        };
+        assert_eq!(*scale, (unit != 1.0).then_some([unit; 3]));
+        let e = mesh_extent(&m, &b);
+        assert!(
+            e.iter().all(|v| (v - 0.1 * unit).abs() < 1e-7 * unit),
+            "{unit}: {e:?}"
+        );
+        // Its lowest vertex on the floor.
+        let z = body.pos.unwrap()[2];
+        assert!((z - 0.05 * unit).abs() < 1e-7 * unit, "{unit}: {z}");
+        made.push(b);
+    }
+
+    // The metre box's size handle along X, grabbed 4 cm out and let go at 8 cm: 10 cm to 20 cm.
+    let e = Entity::Body(made[1].clone());
+    let g = m
+        .gizmo(&e, es_editor_scene::Tool::Scale, &view)
+        .expect("a mesh has size handles");
+    assert_eq!(g.on, [true; 3]);
+    let at = |s: f64| {
+        ray(
+            &view,
+            project(&view, g.origin + g.axes[0].scale(s)).unwrap(),
+        )
+        .unwrap()
+    };
+    let drag = m.drag(&e, g.clone(), 0, at(0.04)).unwrap();
+    let Some(es_editor_scene::Step::Scale { from, to }) = drag.step(&at(0.08), true) else {
+        panic!("a size")
+    };
+    assert!((from - 0.1).abs() < 1e-6 && to == 0.2, "{from} {to}");
+    let before = bytes(&m);
+    let cmd = drag.command(&at(0.08), true).unwrap();
+    assert!(matches!(cmd, Command::Set(..)), "{cmd:?}");
+    m.apply(&cmd).unwrap();
+    let body = m.doc().bodies.iter().find(|x| x.name == made[1]).unwrap();
+    let es_assets::esscene::ShapeDoc::Mesh { scale: Some(s), .. } = body.geoms[0].shape else {
+        panic!("a scale written")
+    };
+    assert!(
+        s[0] == s[1] && s[1] == s[2] && (s[0] - 2.0).abs() < 1e-6,
+        "{s:?}"
+    );
+    let ext = mesh_extent(&m, &made[1]);
+    assert!(ext.iter().all(|v| (v - 0.2).abs() < 1e-6), "{ext:?}");
+    assert!(m.undo());
+    assert_eq!(bytes(&m), before, "one step");
 }
 
 /// Oracle 4: the library's SO-101 on the empty scene is `so101.xml`, placed at its pose.

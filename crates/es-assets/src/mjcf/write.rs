@@ -471,7 +471,9 @@ impl<'a> Writer<'a> {
         };
         let rel = Self::file_path(a, &a.path, "");
         self.add_file(&rel, bytes)?;
-        self.line(2, El::new("mesh").s("name", &a.name).s("file", &rel), true);
+        let scale = self.scene.mesh_scales.get(&a.id).unwrap_or(&[1.0; 3]);
+        let el = El::new("mesh").s("name", &a.name).s("file", &rel);
+        self.line(2, el.f("scale", scale, &[1.0; 3]), true);
         Ok(())
     }
 

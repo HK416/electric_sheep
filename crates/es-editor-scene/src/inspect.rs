@@ -47,7 +47,7 @@ impl ShapeKind {
             ShapeDoc::Capsule(_) => Self::Capsule,
             ShapeDoc::Ellipsoid(_) => Self::Ellipsoid,
             ShapeDoc::Plane(_) => Self::Plane,
-            ShapeDoc::Mesh(_) => Self::Mesh,
+            ShapeDoc::Mesh { .. } => Self::Mesh,
         }
     }
 
@@ -86,7 +86,8 @@ const LENGTH: &str = "author.size.length";
 const GRID: &str = "author.size.grid";
 
 /// The sizes the inspector shows, each with the key of its word: whole extents in metres. A
-/// plane's width or depth of 0 is endless; its grid spacing is as written. A mesh has none.
+/// plane's width or depth of 0 is endless; its grid spacing is as written. A mesh has none: its
+/// size is its file's times its [`scale`].
 pub fn dims(s: &ShapeDoc) -> Vec<(&'static str, f64)> {
     match s {
         ShapeDoc::Box([x, y, z]) => vec![(WIDTH, 2.0 * x), (DEPTH, 2.0 * y), (HEIGHT, 2.0 * z)],
@@ -98,7 +99,28 @@ pub fn dims(s: &ShapeDoc) -> Vec<(&'static str, f64)> {
             vec![(DIAMETER, 2.0 * r), (LENGTH, 2.0 * h)]
         }
         ShapeDoc::Plane([x, y, grid]) => vec![(WIDTH, 2.0 * x), (DEPTH, 2.0 * y), (GRID, *grid)],
-        ShapeDoc::Mesh(_) => Vec::new(),
+        ShapeDoc::Mesh { .. } => Vec::new(),
+    }
+}
+
+/// A mesh's scale per axis, 1 where the document writes none; `None` for a primitive.
+pub fn scale(s: &ShapeDoc) -> Option<[f64; 3]> {
+    match s {
+        ShapeDoc::Mesh { scale, .. } => Some(scale.unwrap_or([1.0; 3])),
+        _ => None,
+    }
+}
+
+/// `s` with its mesh's scale `v`, written absent when it is 1, so a mesh set back to 1 is the
+/// document it was. A primitive is unchanged.
+#[allow(clippy::float_cmp)] // 1 exactly is no scale
+pub fn with_scale(s: &ShapeDoc, v: [f64; 3]) -> ShapeDoc {
+    match s {
+        ShapeDoc::Mesh { file, .. } => ShapeDoc::Mesh {
+            file: file.clone(),
+            scale: (v != [1.0; 3]).then_some(v),
+        },
+        other => other.clone(),
     }
 }
 
@@ -112,7 +134,7 @@ pub fn with_dims(s: &ShapeDoc, v: &[f64]) -> ShapeDoc {
         ShapeDoc::Capsule(_) => ShapeDoc::Capsule([h(0), h(1)]),
         ShapeDoc::Cylinder(_) => ShapeDoc::Cylinder([h(0), h(1)]),
         ShapeDoc::Plane(_) => ShapeDoc::Plane([h(0), h(1), v.get(2).copied().unwrap_or_default()]),
-        ShapeDoc::Mesh(f) => ShapeDoc::Mesh(f.clone()),
+        ShapeDoc::Mesh { .. } => s.clone(),
     }
 }
 
@@ -126,7 +148,7 @@ pub fn reshape(s: &ShapeDoc, kind: ShapeKind) -> ShapeDoc {
         ShapeDoc::Sphere(r) => *r,
         ShapeDoc::Capsule([r, h]) | ShapeDoc::Cylinder([r, h]) => r.max(*h),
         ShapeDoc::Plane([x, y, _]) => x.max(*y),
-        ShapeDoc::Mesh(_) => 0.05,
+        ShapeDoc::Mesh { .. } => 0.05,
     };
     let r = if r > 0.0 { r } else { 0.05 };
     match kind {

@@ -274,8 +274,8 @@ pub struct SceneCache {
     materials: Option<(MaterialKey, Arc<Materials>, BTreeMap<StableId, Look>)>,
 }
 
-/// The geom's shape and, for a `Mesh`, its asset's content hash (zeros otherwise).
-type CacheKey = (Shape, [u8; 32]);
+/// The geom's shape and, for a `Mesh`, its asset's content hash (zeros otherwise) and scale.
+type CacheKey = (Shape, ([u8; 32], Option<[f64; 3]>));
 /// The drawn materials and every texture asset's digest.
 type MaterialKey = (
     BTreeMap<StableId, es_assets::scene::Material>,
@@ -390,7 +390,9 @@ fn wear(geom: &Geom, scene: &SceneDesc, looks: &BTreeMap<StableId, Look>) -> Wea
         ),
         Shape::Mesh { asset } => {
             let mesh = scene.meshes.get(&asset);
-            let size = mesh.map_or([0.0; 3], |m| mesh_half_size(&m.positions));
+            let size = scene
+                .mesh_positions(asset)
+                .map_or([0.0; 3], |p| mesh_half_size(&p));
             (size, false, mesh.is_none_or(|m| m.uvs.is_none()))
         }
         Shape::HeightField { .. } => ([0.0; 3], false, false),
@@ -426,15 +428,16 @@ fn mesh_half_size(positions: &[[f32; 3]]) -> [f32; 3] {
 }
 
 /// The `AssetRef::hash` of a `Mesh` geom's asset (its content, once `es_assets::mesh::load`
-/// ran), zeros for every other shape.
-fn content_hash(geom: &Geom, scene: &SceneDesc) -> [u8; 32] {
+/// ran) and its scale; zeros and none for every other shape.
+fn content_hash(geom: &Geom, scene: &SceneDesc) -> ([u8; 32], Option<[f64; 3]>) {
     match geom.shape {
-        Shape::Mesh { asset } => scene
-            .assets
-            .iter()
-            .find(|a| a.id == asset)
-            .map_or([0; 32], |a| a.hash),
-        _ => [0; 32],
+        Shape::Mesh { asset } => (
+            (scene.assets.iter())
+                .find(|a| a.id == asset)
+                .map_or([0; 32], |a| a.hash),
+            scene.mesh_scales.get(&asset).copied(),
+        ),
+        _ => ([0; 32], None),
     }
 }
 
@@ -504,15 +507,18 @@ fn tessellate(geom: &Geom, scene: &SceneDesc) -> Result<Vec<LocalTri>, RenderErr
             radius,
             half_length,
         } => Ok(capsule_tris(radius, half_length, false)),
-        // The file's `f32` positions widen exactly; the pose is applied per frame in `f64` by
-        // `push_geom`, exactly as for a primitive (packet M10/W2b). A mesh's own UVs are its
-        // texture coordinates; without them the position feeds `MuJoCo`'s texgen (packet HT1).
+        // The file's `f32` positions (times the mesh's scale, as `MuJoCo` is given them: packet
+        // M17/R3) widen exactly; the pose is applied per frame in `f64` by `push_geom`, exactly
+        // as for a primitive (packet M10/W2b). A mesh's own UVs are its texture coordinates;
+        // without them the position feeds `MuJoCo`'s texgen (packet HT1).
         Shape::Mesh { asset } => {
-            let Some(mesh) = scene.meshes.get(&asset) else {
+            let (Some(mesh), Some(positions)) =
+                (scene.meshes.get(&asset), scene.mesh_positions(asset))
+            else {
                 return unsupported("Mesh (asset not loaded: es_assets::mesh::load)");
             };
             let vertex = |i: u32| -> Option<Vert> {
-                let p = *mesh.positions.get(i as usize)?;
+                let p = *positions.get(i as usize)?;
                 let uv = match &mesh.uvs {
                     Some(uvs) => *uvs.get(i as usize)?,
                     None => [p[0], p[1]],
@@ -1099,6 +1105,39 @@ mod tests {
             a, b,
             "the cache served the first scene's mesh to the second"
         );
+    }
+
+    /// Packet M17/R3: a mesh drawn in millimetres at a thousandth tessellates to the triangles
+    /// of the same mesh drawn in metres, and a scale is part of the cache's key.
+    #[test]
+    fn a_mesh_scale_scales_the_tessellation() {
+        let make = |size: f32, scale: Option<f64>| {
+            let (p, i) = tetra(size);
+            let mut s = with_mesh(
+                scene(vec![body("b", Pose::IDENTITY, vec![mesh_geom("m", "tet")])]),
+                "tet",
+                p,
+                i,
+                [1; 32],
+            );
+            if let Some(k) = scale {
+                s.mesh_scales.insert(scene_id("asset", "tet"), [k; 3]);
+            }
+            s
+        };
+        let verts = |t: &TriScene| t.tris.iter().map(|t| t.v).collect::<Vec<_>>();
+        let (mm, m) = (make(1000.0, Some(0.001)), make(1.0, None));
+        assert_eq!(
+            verts(&TriScene::from_scene(&mm).unwrap()),
+            verts(&TriScene::from_scene(&m).unwrap())
+        );
+        let mut cache = SceneCache::default();
+        let none = BTreeMap::new();
+        let big = make(1000.0, None);
+        let first = cache.tri_scene(&big, &none).unwrap();
+        let again = cache.tri_scene(&mm, &none).unwrap();
+        assert_ne!(verts(&first), verts(&again), "the cache ignored the scale");
+        assert_eq!(again, TriScene::from_scene(&mm).unwrap());
     }
 
     /// The tessellation feeds both paths: `to_floats` is what `Renderer::upload_tris`

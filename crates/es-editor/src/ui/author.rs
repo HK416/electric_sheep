@@ -1074,6 +1074,30 @@ fn geom(
         }
         ui.end_row();
     }
+    // A mesh's size is its file's times its scale (packet M17/R3): one number while uniform.
+    if let Some(mut v) = inspect::scale(&g.shape) {
+        f.label(ui, "author.scale", "shape")
+            .on_hover_text(t(lang, "author.scale.hint"));
+        let speed = (v[0].abs() * 0.01).max(1e-6);
+        let changed = ui
+            .horizontal(|ui| {
+                if v.iter().all(|x| x.to_bits() == v[0].to_bits()) {
+                    let changed = num(ui, &mut v[0], speed, "").changed();
+                    v = [v[0]; 3];
+                    return changed;
+                }
+                let mut changed = false;
+                for x in &mut v {
+                    changed |= num(ui, x, speed, "").changed();
+                }
+                changed
+            })
+            .inner;
+        if changed {
+            g.shape = inspect::with_scale(&g.shape, v);
+        }
+        ui.end_row();
+    }
     let mut given = g.mass.is_some();
     f.label(
         ui,

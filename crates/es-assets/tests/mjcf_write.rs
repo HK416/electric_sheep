@@ -272,6 +272,24 @@ fn what_mjcf_cannot_say_is_an_error_naming_it() {
     expect(&s, "mesh `part` (not loaded");
 }
 
+/// Packet M17/R3: a scene document's mesh at a thousandth, beside the same file unscaled, comes
+/// back from the writer as it went in — `<mesh scale>` on one, the file's own vertices in both.
+#[test]
+fn a_scaled_mesh_round_trips() {
+    let text = "kind = \"scene\"\nschema = 1\n\
+                [[body]]\nname = \"a\"\njoint = { kind = \"free\" }\n[[body.geom]]\n\
+                shape = { mesh = \"meshes/box.stl\" }\n\
+                [[body]]\nname = \"b\"\n[[body.geom]]\n\
+                shape = { mesh = \"meshes/box.stl\", scale = [0.001, 0.002, 0.001] }\n";
+    let doc = es_assets::esscene::EsScene::from_toml(text).unwrap();
+    let scene = es_assets::esscene::expand(&doc, &fixtures()).unwrap();
+    assert_eq!(scene.mesh_scales.len(), 1);
+    let (again, path) = round_trip(&scene, "mesh-scale").unwrap();
+    let xml = std::fs::read_to_string(path).unwrap();
+    assert!(xml.contains("scale=\"0.001 0.002 0.001\""), "{xml}");
+    assert_eq!(differs(&scene, &again), None);
+}
+
 // ---- generated scenes ----------------------------------------------------------------------
 
 /// splitmix64.

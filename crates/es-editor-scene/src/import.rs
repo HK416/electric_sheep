@@ -11,7 +11,7 @@
 use std::path::{Component, Path, PathBuf};
 
 use es_assets::esscene::{expand, EsScene, Include};
-use es_assets::scene::AssetKind;
+use es_assets::scene::{AssetKind, AssetRef, SceneDesc};
 
 /// Where imports go, relative to the project's root.
 pub const ASSETS: &str = "assets";
@@ -95,6 +95,39 @@ pub fn file(root: &Path, src: &Path) -> Result<(String, Written), String> {
     });
     let rel = format!("{ASSETS}/{}{ext}", hash(&bytes));
     Written::guard(|w| w.put(root, &rel, &bytes)).map(|w| (rel, w))
+}
+
+/// The units a mesh file may be drawn in (packet M17/R3): the key of each one's word and the
+/// scale the mesh is written with.
+pub const UNITS: [(&str, f64); 3] = [
+    ("author.unit.m", 1.0),
+    ("author.unit.cm", 0.01),
+    ("author.unit.mm", 0.001),
+];
+
+/// A mesh with a side longer than this many metres looks like it was drawn in millimetres.
+pub const TOO_BIG: f64 = 5.0;
+
+/// The whole extent of the mesh file `src` along each of its axes, in the file's own units.
+pub fn mesh_size(src: &Path) -> Result<[f64; 3], String> {
+    let mut s = SceneDesc::default();
+    let a = AssetRef::from_path(AssetKind::Mesh, "mesh", &src.to_string_lossy());
+    let id = a.id;
+    s.assets.push(a);
+    es_assets::mesh::load(&mut s, Path::new("")).map_err(|e| e.to_string())?;
+    Ok(size(&s.meshes[&id].positions))
+}
+
+/// The whole extent of `points` along each axis; 0 for none.
+pub(crate) fn size(points: &[[f32; 3]]) -> [f64; 3] {
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for p in points {
+        for k in 0..3 {
+            (lo[k], hi[k]) = (lo[k].min(p[k]), hi[k].max(p[k]));
+        }
+    }
+    [0, 1, 2].map(|k| f64::from(hi[k] - lo[k]).max(0.0))
 }
 
 /// A robot file (MJCF, URDF, glTF), copied to `assets/<blake3 of the file>/<its name>` with the

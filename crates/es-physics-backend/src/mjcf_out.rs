@@ -187,22 +187,25 @@ pub fn scene_to_mjcf(scene: &SceneDesc) -> Result<String, PhysicsError> {
 ///
 /// `MuJoCo` builds the collision convex hull and the inertia from exactly these numbers, so the
 /// `f32` bits the content hash covers (spec 5.3) are what reaches the solver; `{:?}` is the
-/// shortest decimal that round-trips them. An unreferenced mesh is still written: it is what
-/// the scene says it carries, and dropping it silently is what spec 17.2 forbids.
+/// shortest decimal that round-trips them. A scaled mesh's vertices are written scaled
+/// (`SceneDesc::mesh_positions`, packet M17/R3), the ones the renderer draws. An unreferenced
+/// mesh is still written: it is what the scene says it carries, and dropping it silently is
+/// what spec 17.2 forbids.
 fn write_meshes(out: &mut String, scene: &SceneDesc) {
     if scene.meshes.is_empty() {
         return;
     }
     out.push_str("  <asset>\n");
-    for data in scene.meshes.values() {
-        write_mesh(out, data);
+    for (id, data) in &scene.meshes {
+        let positions = scene.mesh_positions(*id).unwrap_or_default();
+        write_mesh(out, data, &positions);
     }
     out.push_str("  </asset>\n");
 }
 
-fn write_mesh(out: &mut String, data: &MeshData) {
+fn write_mesh(out: &mut String, data: &MeshData, positions: &[[f32; 3]]) {
     let _ = write!(out, "    <mesh name=\"{}\" vertex=\"", esc(&data.name));
-    for (i, p) in data.positions.iter().enumerate() {
+    for (i, p) in positions.iter().enumerate() {
         for (k, c) in p.iter().enumerate() {
             if i + k > 0 {
                 out.push(' ');

@@ -25,9 +25,9 @@ use es_math::{Pose, Quat, Vec3};
 
 use crate::command::{Command, Entity, Record};
 use crate::euler::atan2;
-use crate::inspect;
 use crate::model::SceneModel;
 use crate::view::{pose, project, Camera, Ray};
+use crate::{import, inspect};
 
 /// Which handles the selection shows.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -162,8 +162,9 @@ fn on_plane(o: Vec3, n: Vec3, ray: &Ray) -> Option<Vec3> {
     (t > 0.0).then(|| ray.origin + ray.dir.scale(t) - o)
 }
 
-/// What a size handle on `axis` changes of `s`: the index of the size in [`inspect::dims`], and
-/// the shape's axes that size stretches.
+/// What a size handle on `axis` changes of `s`: the index of the size in [`inspect::dims`] (for
+/// a mesh, of its extent along that axis), and the shape's axes that size stretches. A mesh
+/// grows the same along all three (packet M17/R3): its handles write one uniform factor.
 fn shape_dim(s: &ShapeDoc, axis: usize) -> Option<(usize, [bool; 3])> {
     let one = |k: usize| [k == 0, k == 1, k == 2];
     match s {
@@ -172,12 +173,12 @@ fn shape_dim(s: &ShapeDoc, axis: usize) -> Option<(usize, [bool; 3])> {
         ShapeDoc::Capsule(_) | ShapeDoc::Cylinder(_) if axis < 2 => Some((0, [true, true, false])),
         ShapeDoc::Capsule(_) | ShapeDoc::Cylinder(_) => Some((1, one(2))),
         ShapeDoc::Plane(_) => (axis < 2).then(|| (axis, one(axis))),
-        ShapeDoc::Mesh(_) => None,
+        ShapeDoc::Mesh { .. } => Some((axis, [true; 3])),
     }
 }
 
 /// Where the shape of a record sits in its entity's frame and which axes can be sized; `None`
-/// for what has no size (a camera, an include, a body of several geoms, a mesh).
+/// for what has no size (a camera, an include, a body of several geoms).
 fn sizes(r: &Record) -> Option<(Pose, [bool; 3])> {
     let on = |s: &ShapeDoc| Some([0, 1, 2].map(|k| shape_dim(s, k).is_some())).filter(|v| v[0]);
     match r {
@@ -203,6 +204,9 @@ pub struct Drag {
     pos: [f64; 3],
     quat: [f64; 4],
     record: Record,
+    /// The whole extent of the record's mesh along each axis as it is drawn now; `None` when it
+    /// has no mesh, or its file does not read.
+    mesh: Option<[f64; 3]>,
 }
 
 /// How far a drag has gone.
@@ -253,6 +257,19 @@ impl SceneModel {
             pos.unwrap_or_default(),
             quat.unwrap_or([0.0, 0.0, 0.0, 1.0]),
         );
+        let shape = match &record {
+            Record::Geom(g) | Record::Scenery(g) => Some(&g.shape),
+            Record::Body(b) => b.geoms.first().map(|g| &g.shape),
+            _ => None,
+        };
+        let mesh = match shape {
+            Some(s @ ShapeDoc::Mesh { file, .. }) => {
+                let size = import::mesh_size(&self.root().join(file)).ok();
+                let scale = inspect::scale(s).unwrap_or([1.0; 3]);
+                size.map(|e| [0, 1, 2].map(|k| e[k] * scale[k]))
+            }
+            _ => None,
+        };
         Some(Drag {
             entity: e.clone(),
             gizmo,
@@ -261,6 +278,7 @@ impl SceneModel {
             pos,
             quat,
             record,
+            mesh,
         })
     }
 }
@@ -271,7 +289,10 @@ impl Drag {
         let k = self.axis;
         let shape = |s: &ShapeDoc| {
             let (i, axes) = shape_dim(s, k)?;
-            Some((inspect::dims(s)[i].1, axes))
+            match s {
+                ShapeDoc::Mesh { .. } => Some((self.mesh?[i], axes)),
+                _ => Some((inspect::dims(s)[i].1, axes)),
+            }
         };
         let one = [k == 0, k == 1, k == 2];
         match &self.record {
@@ -363,6 +384,11 @@ impl Drag {
                 }
                 let k = self.axis;
                 let resize = |s: &mut ShapeDoc| {
+                    // A mesh's extent goes from `from` to `to` by its scale, uniformly.
+                    if let Some(v) = inspect::scale(s) {
+                        *s = inspect::with_scale(s, v.map(|x| x * to / from));
+                        return Some(());
+                    }
                     let (i, _) = shape_dim(s, k)?;
                     let mut v: Vec<f64> = inspect::dims(s).iter().map(|d| d.1).collect();
                     v[i] = to;

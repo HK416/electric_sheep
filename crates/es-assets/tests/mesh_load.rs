@@ -208,16 +208,19 @@ fn committed_scenes_are_unmoved_by_load() {
 
 // --- refusals ---------------------------------------------------------------------------------
 
-/// `<mesh scale>` / `refpos` / `refquat` transform the vertices, and this packet bakes none of
-/// them. A warning would be a silent geometry error once the mesh is drawn and collided with,
-/// so the parse fails by name instead (spec 17.2's rule applied to the importer).
+/// `<mesh refpos>` / `refquat` transform the vertices, and nothing applies them. A warning would
+/// be a silent geometry error once the mesh is drawn and collided with, so the parse fails by
+/// name instead (spec 17.2's rule applied to the importer). `scale` is represented since
+/// packet M17/R3 (`SceneDesc::mesh_scales`), 1 as absent.
 #[test]
-fn scale_refpos_refquat_are_refused_by_name() {
-    for (attr, value) in [
-        ("scale", "0.001 0.001 0.001"),
-        ("refpos", "0 0 0.1"),
-        ("refquat", "0 1 0 0"),
-    ] {
+fn refpos_refquat_are_refused_by_name_and_scale_is_kept() {
+    let xml = r#"<mujoco><asset><mesh name="m" file="m.stl" scale="0.001 0.002 0.001"/>
+           <mesh name="one" file="m.stl" scale="1 1 1"/></asset>
+           <worldbody><geom name="g" type="mesh" mesh="m"/></worldbody></mujoco>"#;
+    let scene = es_assets::parse_mjcf(xml).expect("a scale is read").scene;
+    let scales: Vec<[f64; 3]> = scene.mesh_scales.values().copied().collect();
+    assert_eq!(scales, [[0.001, 0.002, 0.001]]);
+    for (attr, value) in [("refpos", "0 0 0.1"), ("refquat", "0 1 0 0")] {
         let xml = format!(
             r#"<mujoco><asset><mesh name="m" file="m.stl" {attr}="{value}"/></asset>
                <worldbody><geom name="g" type="mesh" mesh="m"/></worldbody></mujoco>"#

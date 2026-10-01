@@ -182,7 +182,7 @@ fn geom(g: &GeomDoc, at: &str) -> Result<(), Refusal> {
         ShapeDoc::Sphere(r) => std::slice::from_ref(r),
         ShapeDoc::Capsule(v) | ShapeDoc::Cylinder(v) => v,
         ShapeDoc::Box(v) | ShapeDoc::Ellipsoid(v) => v,
-        ShapeDoc::Mesh(_) => &[],
+        ShapeDoc::Mesh { scale, .. } => scale.as_ref().map_or(&[][..], |s| &s[..]),
     };
     for v in sizes {
         above(*v, &shape)?;

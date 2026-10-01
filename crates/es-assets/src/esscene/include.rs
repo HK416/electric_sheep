@@ -80,6 +80,7 @@ pub(super) fn expand_include(
     s.gravcomp.append(&mut sub.gravcomp);
     s.materials.append(&mut sub.materials);
     s.textures.append(&mut sub.textures);
+    s.mesh_scales.append(&mut sub.mesh_scales);
     Ok(())
 }
 
@@ -338,6 +339,10 @@ fn remap(s: &mut SceneDesc, map: &BTreeMap<StableId, StableId>) {
         .map(|(k, v)| (rekey(k), v))
         .collect();
     s.textures = std::mem::take(&mut s.textures)
+        .into_iter()
+        .map(|(k, v)| (rekey(k), v))
+        .collect();
+    s.mesh_scales = std::mem::take(&mut s.mesh_scales)
         .into_iter()
         .map(|(k, v)| (rekey(k), v))
         .collect();

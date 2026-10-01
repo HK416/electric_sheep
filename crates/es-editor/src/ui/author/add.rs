@@ -1,10 +1,12 @@
 //! ①'s Add menu and picture import (packet M17/G7). Drawing only: what each item makes, where it
 //! goes, what a file becomes and why one is refused are `es_editor_scene::add`'s, under test.
 
+use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
 use eframe::egui;
 use es_editor_scene::add::library;
+use es_editor_scene::import::{mesh_size, TOO_BIG, UNITS};
 use es_editor_scene::inspect::ShapeKind;
 use es_editor_scene::overrides::Brought;
 use es_editor_scene::{Camera, Entity, Item, Robot, RowKind};
@@ -34,6 +36,15 @@ pub(super) struct State {
     open: bool,
     /// What the selected include brings, by its name and file, read once per include.
     brought: Option<(String, String, Option<Arc<Brought>>)>,
+    /// A mesh file waiting for its unit (packet M17/R3): the file, its size in its own units
+    /// (or why it does not read), and the index of the chosen unit in [`UNITS`].
+    mesh: Option<(PathBuf, Result<[f64; 3], String>, usize)>,
+}
+
+/// `v` with at most three decimals and no trailing zeros: `120`, `0.12`.
+fn short(v: f64) -> String {
+    let s = format!("{v:.3}");
+    s.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
 /// A button that opens the OS's file dialog: disabled, saying why, in a build without one.
@@ -72,7 +83,10 @@ impl Author {
                 });
             }
             if file_button(ui, lang, "author.add.mesh") {
-                chosen = pick_file(("STL, OBJ", &["stl", "obj"])).map(Item::Mesh);
+                if let Some(path) = pick_file(("STL, OBJ", &["stl", "obj"])) {
+                    self.add.mesh = Some((path.clone(), mesh_size(&path), 0));
+                    ui.close();
+                }
             }
             ui.separator();
             ui.label(t(lang, "author.add.robot"));
@@ -116,6 +130,54 @@ impl Author {
         if let Some(item) = chosen {
             self.add_item(&item, view);
         }
+        self.mesh_units(ui.ctx(), lang, view);
+    }
+
+    /// The unit of the mesh file waiting to be added: metres, centimetres or millimetres, its
+    /// size in the one chosen, and a word when that is bigger than a room; Add adds it.
+    fn mesh_units(&mut self, ctx: &egui::Context, lang: Lang, view: &Camera) {
+        let Some((path, size, unit)) = &mut self.add.mesh else {
+            return;
+        };
+        let (mut open, mut add) = (true, false);
+        egui::Window::new(t(lang, "author.import.mesh"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                ui.horizontal(|ui| {
+                    for (i, (key, _)) in UNITS.iter().enumerate() {
+                        ui.radio_value(unit, i, t(lang, key));
+                    }
+                });
+                match size {
+                    Ok(e) => {
+                        let m = e.map(|v| v * UNITS[*unit].1);
+                        let words = m.map(short);
+                        let words: Vec<&str> = words.iter().map(String::as_str).collect();
+                        ui.label(fill(lang, "author.import.size", &words));
+                        if m.iter().any(|v| *v > TOO_BIG) {
+                            let warn = ui.visuals().warn_fg_color;
+                            ui.colored_label(warn, t(lang, "author.import.mm"));
+                        }
+                    }
+                    Err(why) => {
+                        ui.colored_label(ui.visuals().error_fg_color, why.as_str());
+                    }
+                }
+                let can = size.is_ok();
+                add = ui
+                    .add_enabled(can, egui::Button::new(t(lang, "author.add")))
+                    .clicked();
+            });
+        if add {
+            let item = Item::Mesh(path.clone(), UNITS[*unit].1);
+            self.add.mesh = None;
+            self.add_item(&item, view);
+        } else if !open {
+            self.add.mesh = None;
+        }
     }
 
     /// `item` added where `view` looks; a refusal is shown as every other one is. A new include
@@ -133,12 +195,21 @@ impl Author {
 
     /// `--edit-demo add-menu|add-box|add-robot` (packet M17/G7's captures): the menu open; a box
     /// where `view`'s eye sees a free spot of the SO-101 table, (0.3, 0.15); the library's first
-    /// robot where `view` looks. `false` for any other stage.
+    /// robot where `view` looks. `--edit-demo mesh-m=<file>|mesh-mm=<file>` (packet M17/R3's):
+    /// the mesh file added there in metres or in millimetres, and its unit window open on that
+    /// unit. `false` for any other stage.
     pub(super) fn add_demo(&mut self, stage: &str, view: &Camera) -> bool {
         let table = Camera {
             look_at: [0.3, 0.15, 0.0],
             ..*view
         };
+        if let Some((how @ ("mesh-m" | "mesh-mm"), file)) = stage.split_once('=') {
+            let unit = if how == "mesh-mm" { 2 } else { 0 };
+            let path = PathBuf::from(file);
+            self.add_item(&Item::Mesh(path.clone(), UNITS[unit].1), &table);
+            self.add.mesh = Some((path.clone(), mesh_size(&path), unit));
+            return true;
+        }
         match stage {
             "add-menu" => self.add.open = true,
             "add-box" => self.add_item(&Item::Object(ShapeKind::Box), &table),
