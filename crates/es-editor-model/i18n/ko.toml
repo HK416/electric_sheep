@@ -5,6 +5,9 @@
 #
 # `*.hint` 값은 마우스를 올렸을 때 나오는 설명이다. 원래 이름과 명세 절 번호가 나와도 되는
 # 곳은 여기뿐이다.
+#
+# 칸 뒤의 조사는 `이(가)`, `은(는)`, `을(를)`, `와(과)`, `(으)로`로 적는다. `fill`로 채운 문구와 ①의
+# 과제 문장은 앞 낱말의 끝소리로 그중 하나를 고른다 (`i18n.rs`의 `ending`, 작업 패킷 M17/R4).
 
 # --- 위쪽 막대 ---------------------------------------------------------------------------
 "menu.file" = "파일"
@@ -807,23 +810,23 @@
 "author.task.rel.still" = "멈춰 있다"
 "author.task.rel.turned" = "같은 방향이다"
 "author.task.rel.touches" = "닿아 있다"
-"author.task.draw.yaw" = "세로축으로 아무렇게나 돌려"
-"author.task.draw.tilt" = "아무렇게나 기울여"
-"author.task.draw.any" = "어느 쪽으로든 아무렇게나 돌려"
+"author.task.draw.yaw" = "세로축을 중심으로 아무렇게나 돌린 채"
+"author.task.draw.tilt" = "아무렇게나 기울인 채"
+"author.task.draw.any" = "아무 방향으로나 돌린 채"
 "author.task.inside_region" = "{0}이(가) {2} {1}"
-"author.task.inside_range" = "{0}이(가) {2}와 {3} {1}"
+"author.task.inside_range" = "{0}이(가) {2}와(과) {3} {1}"
 "author.task.compare_value" = "{0}이(가) {2}{1}"
 "author.task.compare_body" = "{0}이(가) {2}보다 {3} 넘게 {1}"
 "author.task.near" = "{0}이(가) {2}에서 {3} {1}"
 "author.task.farther" = "{0}이(가) {2}에서 {3}{1}"
 "author.task.still" = "{0}이(가) {1}: {2}보다 느리다"
 "author.task.still_turning" = "{0}이(가) {1}: {2}보다 느리고, {3}보다 느리게 돈다"
-"author.task.orientation" = "{0}이(가) {2}와(과) {3} 안으로 {1}"
+"author.task.orientation" = "{0}이(가) {2}와(과) {3} 이내로 {1}"
 "author.task.touching" = "{0}이(가) {2}에 {1}"
 "author.task.timeout" = "{0} 안에 끝나지 않으면 실패"
 "author.task.start_joints" = "로봇 관절은 각 범위의 {0} 안 어디서든 시작한다"
 "author.task.start_at" = "{0}은(는) {1} ± {2}에서 시작한다"
-"author.task.start_between" = "{0}은(는) {1}와 {2} 사이에서 시작한다"
+"author.task.start_between" = "{0}은(는) {1}와(과) {2} 사이에서 시작한다"
 "author.task.start_yaw" = "{0}은(는) {1} 시작하고, {2} 기울어 있다"
 "author.task.start_tilt" = "{0}은(는) 최대 {2}까지 {1} 시작한다"
 "author.task.start_any" = "{0}은(는) {1} 시작한다"

@@ -21,7 +21,7 @@ use es_editor_scene::sentence::{
 };
 use es_editor_scene::{new_body, new_region, Camera, Command, Item, Record, Refusal, SceneModel};
 
-use crate::model::i18n::{fill, t, Lang};
+use crate::model::i18n::{fill, particles, t, Lang};
 use crate::model::template::templates_root;
 use crate::ui::author::Author;
 
@@ -82,9 +82,10 @@ fn said(lang: Lang, slot: &Slot) -> String {
     }
 }
 
-/// A sentence in `lang`'s words, 🎲 after a start item drawn anew every attempt.
+/// A sentence in `lang`'s words, its Korean particles picked from the slots before them, 🎲
+/// after a start item drawn anew every attempt.
 pub fn words(lang: Lang, sentence: &Sentence) -> String {
-    let mut out: String = (pieces(t(lang, sentence.key)).iter())
+    let text: String = (pieces(t(lang, sentence.key)).iter())
         .map(|p| match p {
             Piece::Text(x) => (*x).to_owned(),
             Piece::Hole(i) => {
@@ -92,6 +93,7 @@ pub fn words(lang: Lang, sentence: &Sentence) -> String {
             }
         })
         .collect();
+    let mut out = particles("", &text);
     if sentence.dice {
         out.push_str(" \u{1f3b2}");
     }
@@ -112,6 +114,53 @@ pub(crate) fn summary(ui: &mut egui::Ui, lang: Lang, author: &mut Author) {
             .show(ui, |ui| panel(ui, lang, author));
     } else {
         author.inspector(ui, lang);
+    }
+}
+
+/// Ends the row of a wrapping layout when `width` more would not fit on it (packet M17/R4).
+fn fit(ui: &mut egui::Ui, width: f32) {
+    if ui.available_size_before_wrap().x < width && ui.cursor().left() > ui.max_rect().left() {
+        ui.end_row();
+    }
+}
+
+/// `text` on one line, in `style`.
+fn wide(ui: &egui::Ui, text: &str, style: egui::TextStyle) -> f32 {
+    let one_line = Some(egui::TextWrapMode::Extend);
+    let galley = egui::WidgetText::from(text).into_galley(ui, one_line, f32::INFINITY, style);
+    galley.size().x
+}
+
+/// A combo box as egui sizes it: its text and icon, at least `combo_width`, and the padding.
+fn combo_width(ui: &egui::Ui, text: &str) -> f32 {
+    let s = ui.spacing();
+    let pad = 2.0 * s.button_padding.x;
+    let inner = wide(ui, text, egui::TextStyle::Button) + s.icon_spacing + s.icon_width;
+    inner.max(s.combo_width - pad) + pad
+}
+
+/// A drop-down that wraps with the words around it. egui puts a combo box at the cursor, past the
+/// pane's edge if need be, and every later row then wraps at that edge: so the row ends first when
+/// the box would not fit, and a box wider than the row wraps its own text.
+fn combo(ui: &mut egui::Ui, salt: impl std::hash::Hash, text: &str) -> egui::ComboBox {
+    fit(ui, combo_width(ui, text));
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(text)
+        .wrap()
+}
+
+/// How wide a slot's widget is, to keep the particle after it on its row: a drop-down as egui
+/// sizes it, a number by its text (the drag value may show a decimal more). A point, four
+/// widgets, is not kept with its particle.
+fn slot_width(ui: &egui::Ui, slot: &Slot, said: &str) -> Option<f32> {
+    let s = ui.spacing();
+    match slot {
+        Slot::Point(_) => None,
+        Slot::Number(..) => {
+            let text = wide(ui, said, egui::TextStyle::Button) + 2.0 * s.button_padding.x;
+            Some(text.max(s.interact_size.x))
+        }
+        _ => Some(combo_width(ui, said)),
     }
 }
 
@@ -145,16 +194,14 @@ fn level(
         )
     };
     let mut pick = now;
-    egui::ComboBox::from_id_salt(salt)
-        .selected_text(word(now))
-        .show_ui(ui, |ui| {
-            if off {
-                ui.selectable_value(&mut pick, None, word(None));
-            }
-            for l in s::LEVELS {
-                ui.selectable_value(&mut pick, Some(l), word(Some(l)));
-            }
-        });
+    combo(ui, salt, &word(now)).show_ui(ui, |ui| {
+        if off {
+            ui.selectable_value(&mut pick, None, word(None));
+        }
+        for l in s::LEVELS {
+            ui.selectable_value(&mut pick, Some(l), word(Some(l)));
+        }
+    });
     pick
 }
 
@@ -172,39 +219,31 @@ fn widget(
     match slot {
         Slot::Name(n) => {
             let mut pick = Slot::Name(n.clone());
-            egui::ComboBox::from_id_salt(salt)
-                .selected_text(n.as_str())
-                .show_ui(ui, |ui| {
-                    for c in s::choices(scene, field, of) {
-                        ui.selectable_value(&mut pick, Slot::Name(c.clone()), c);
-                    }
-                    if point {
-                        let at = scene
-                            .bodies
-                            .iter()
-                            .find(|b| b.name == *n)
-                            .map(|b| b.pose.position);
-                        let p = at.map_or([0.0; 3], |p| [p.x, p.y, p.z]);
-                        ui.selectable_value(
-                            &mut pick,
-                            Slot::Point(p),
-                            t(lang, "author.task.point"),
-                        );
-                    }
-                });
+            combo(ui, salt, n.as_str()).show_ui(ui, |ui| {
+                for c in s::choices(scene, field, of) {
+                    ui.selectable_value(&mut pick, Slot::Name(c.clone()), c);
+                }
+                if point {
+                    let at = scene
+                        .bodies
+                        .iter()
+                        .find(|b| b.name == *n)
+                        .map(|b| b.pose.position);
+                    let p = at.map_or([0.0; 3], |p| [p.x, p.y, p.z]);
+                    ui.selectable_value(&mut pick, Slot::Point(p), t(lang, "author.task.point"));
+                }
+            });
             (pick != *slot).then_some(pick)
         }
         Slot::Point(p) => {
             let mut pick = None;
-            egui::ComboBox::from_id_salt(salt)
-                .selected_text(t(lang, "author.task.point"))
-                .show_ui(ui, |ui| {
-                    for c in s::choices(scene, field, of) {
-                        if ui.selectable_label(false, &c).clicked() {
-                            pick = Some(Slot::Name(c));
-                        }
+            combo(ui, salt, t(lang, "author.task.point")).show_ui(ui, |ui| {
+                for c in s::choices(scene, field, of) {
+                    if ui.selectable_label(false, &c).clicked() {
+                        pick = Some(Slot::Name(c));
                     }
-                });
+                }
+            });
             let mut q = *p;
             let mut changed = false;
             for v in &mut q {
@@ -221,30 +260,26 @@ fn widget(
                 _ => "",
             };
             let mut pick = (*r, *o);
-            egui::ComboBox::from_id_salt(salt)
-                .selected_text(t(lang, s::relation_key(*r, *o)))
-                .show_ui(ui, |ui| {
-                    for (rel, obj) in vocab::relations(scene, subject) {
-                        let word = t(lang, s::relation_key(rel, obj));
-                        if rel == Relation::Touches {
-                            ui.add_enabled(false, egui::Button::selectable(false, word))
-                                .on_disabled_hover_text(t(lang, s::TOUCHES));
-                        } else {
-                            ui.selectable_value(&mut pick, (rel, obj), word);
-                        }
+            combo(ui, salt, t(lang, s::relation_key(*r, *o))).show_ui(ui, |ui| {
+                for (rel, obj) in vocab::relations(scene, subject) {
+                    let word = t(lang, s::relation_key(rel, obj));
+                    if rel == Relation::Touches {
+                        ui.add_enabled(false, egui::Button::selectable(false, word))
+                            .on_disabled_hover_text(t(lang, s::TOUCHES));
+                    } else {
+                        ui.selectable_value(&mut pick, (rel, obj), word);
                     }
-                });
+                }
+            });
             (pick != (*r, *o)).then_some(Slot::Relation(pick.0, pick.1))
         }
         Slot::Draw(d) => {
             let mut pick = *d;
-            egui::ComboBox::from_id_salt(salt)
-                .selected_text(t(lang, s::draw_key(*d)))
-                .show_ui(ui, |ui| {
-                    for x in s::DRAWS {
-                        ui.selectable_value(&mut pick, x, t(lang, s::draw_key(x)));
-                    }
-                });
+            combo(ui, salt, t(lang, s::draw_key(*d))).show_ui(ui, |ui| {
+                for x in s::DRAWS {
+                    ui.selectable_value(&mut pick, x, t(lang, s::draw_key(x)));
+                }
+            });
             (pick != *d).then_some(Slot::Draw(pick))
         }
         Slot::Number(v, u) => {
@@ -263,16 +298,30 @@ fn sentence(
     of: &Sentence,
 ) -> Option<(Field, Slot)> {
     let mut changed = None;
-    for piece in pieces(t(lang, of.key)) {
+    let mut before = String::new();
+    let template = pieces(t(lang, of.key));
+    for (k, piece) in template.iter().enumerate() {
         match piece {
             Piece::Text(x) if !x.trim().is_empty() => {
-                ui.label(x.trim());
+                ui.label(particles(&before, x).trim());
             }
             Piece::Text(_) => {}
             Piece::Hole(i) => {
-                let Some((field, slot)) = of.slots.get(i) else {
+                let Some((field, slot)) = of.slots.get(*i) else {
                     continue;
                 };
+                before = said(lang, slot);
+                // The words glued after a slot (a particle) do not start the next row alone.
+                if let (Some(Piece::Text(x)), Some(w)) =
+                    (template.get(k + 1), slot_width(ui, slot, &before))
+                {
+                    let next = particles(&before, x);
+                    let glued = next.split(' ').next().unwrap_or_default();
+                    if !glued.is_empty() {
+                        let gap = ui.spacing().item_spacing.x;
+                        fit(ui, w + gap + wide(ui, glued, egui::TextStyle::Body));
+                    }
+                }
                 if let Some(new) = widget(ui, lang, scene, of, *field, slot) {
                     changed = Some((*field, new));
                 }
@@ -383,7 +432,7 @@ fn start(
     spec: &mut TaskSpec,
     refused: Option<&Refusal>,
 ) {
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         ui.label(t(lang, "author.task.strength"))
             .on_hover_text(t(lang, "author.task.strength.hint"));
         let now = s::strength(spec);
@@ -550,15 +599,13 @@ fn observe(
         None => {}
     }
     let mut add = None;
-    egui::ComboBox::from_id_salt("add-source")
-        .selected_text(t(lang, "author.task.add_source"))
-        .show_ui(ui, |ui| {
-            for source in s::sources(scene) {
-                if ui.selectable_label(false, &source).clicked() {
-                    add = Some(source);
-                }
+    combo(ui, "add-source", t(lang, "author.task.add_source")).show_ui(ui, |ui| {
+        for source in s::sources(scene) {
+            if ui.selectable_label(false, &source).clicked() {
+                add = Some(source);
             }
-        });
+        }
+    });
     if let Some(source) = add {
         s::add_source(spec, &source, false);
     }
@@ -611,15 +658,13 @@ fn panel(ui: &mut egui::Ui, lang: Lang, author: &mut Author) {
         }
         Some(spec) => {
             let refused = refused.as_ref();
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(t(lang, "author.task.robot"));
-                egui::ComboBox::from_id_salt("robot")
-                    .selected_text(spec.robot.as_str())
-                    .show_ui(ui, |ui| {
-                        for r in s::robots(&scene, author.model.doc()) {
-                            ui.selectable_value(&mut spec.robot, r.clone(), r);
-                        }
-                    });
+                combo(ui, "robot", spec.robot.as_str()).show_ui(ui, |ui| {
+                    for r in s::robots(&scene, author.model.doc()) {
+                        ui.selectable_value(&mut spec.robot, r.clone(), r);
+                    }
+                });
             });
             reason(ui, lang, refused, "robot");
             ui.heading(t(lang, "author.task.success"));
@@ -640,7 +685,7 @@ fn panel(ui: &mut egui::Ui, lang: Lang, author: &mut Author) {
             observe(ui, lang, &scene, spec, &unseen);
             reason(ui, lang, refused, "observe");
             ui.heading(t(lang, "author.task.reward"));
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
                 ui.label(t(lang, "author.task.bonus"));
                 let now = s::bonus(spec);
                 let pick = level(ui, lang, "bonus", now, true);
