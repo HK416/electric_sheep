@@ -628,6 +628,76 @@ validated and each arm passes the cross-IR check before anything is written.
   with nearest filtering. `es-editor` takes `es-env` with its `render` feature for it. Without a
   device the corner says so: `es render` draws only a free camera, so it is no fallback here.
 
+### 5.3 What G7 settled (Add, imports, markers, overrides)
+
+`crates/es-editor-scene/src/{add,import,marker,overrides}.rs` decide;
+`crates/es-editor/src/ui/author/{add,markers,overrides}.rs` draw; oracles
+`crates/es-editor-scene/tests/add.rs`. The robot library is `templates/robots.toml`, the empty scene
+`tests/fixtures/esscene/empty.esscene`.
+
+- **The menu**: object (box, sphere, cylinder, capsule: a free body with one 5 cm geom), fixed
+  object (the same shapes as scenery on the world), mesh file (STL, OBJ: a free body with one mesh
+  geom), robot (the library's, or an MJCF, URDF or glTF file: an `[[include]]`), camera, light,
+  area. One Add is one command (G5's `Add`), one undo step, and what it made is selected.
+- **Where it goes.** The view's centre ray meets the drawn triangles under the renderer's
+  nearest-hit rule (`SceneModel::surface`, `hit`'s sibling, which also gives the triangle's
+  normal). The point is met again in `f64`, and on a level surface its height is the triangle's
+  own, so the table's 0 stays 0. The new thing's lowest point sits at the hit: a primitive's
+  half-extent along the normal (it is added unturned), a mesh's lowest vertex, a region's box. With
+  no hit it goes at the origin, on the ground plane. With snapping on (G6's toggle) a point on a
+  level surface is rounded across the surface to whole centimetres; its height does not move.
+  - A camera goes at the view's eye, looking where the view looks: the renderer's look-at
+    quaternion turned half about X into MJCF's camera frame, so no trigonometry; with snapping, the
+    eye and the target are whole centimetres first; `fovy` is the view's, to 1e-6°.
+  - A light hangs 1 m above the point (a ceiling panel, as G5's Add put it).
+  - A robot stands at the point plus its library offset, in its library orientation (absent: the
+    file's own).
+- **Imports by content.**
+  - A mesh or a picture goes to `assets/<blake3>.<ext>` (the extension in lower case, since the
+    readers choose by it).
+  - A robot file goes to `assets/<blake3 of the file>/<its name>`, with the files it names under
+    their relative paths: what its reader loads (mesh and texture paths, texture and cube files,
+    a `.gltf`'s buffer and image URIs). They are found by expanding the file alone from its own
+    folder, so a broken file is refused before anything is written. A file that names something
+    outside its folder (`../`, an absolute path) is refused by name.
+  - The same bytes already there are not written again; a different file at that path is
+    refused.
+  - The check every command passes expands from disk, so the files are copied first, and a
+    refused Add removes exactly what it wrote (the files and the folders it made). Undo leaves an
+    imported file in place (redo needs it); it is a cache by content. G5's editable copy keeps its
+    relative paths.
+- **Names**: a new body, camera, light or area is `unique(stem)` in G5's name space; scenery is
+  unique among the world's geoms; an include's handle is the library id or the file's stem. When an
+  include's own names meet the scene's (a second SO-101), the Add is tried once more with the
+  prefix `<handle>:`, the prefix a duplicated include gets.
+- **Picture import** is the material picker's last entry. It is one command, `Command::Scene` (the
+  whole document replaced, the one new command): a `[[texture]]` (2D, the file) and a
+  `[[material]]` (that texture), both named by the picture's stem — or the pair the same picture
+  made before — and the geom's `material`. PNG only, as the texture loader decodes; anything else
+  is refused and its copy taken back.
+- **Markers.** Cameras and regions are drawn as lines: a camera's frustum (12 % of its distance
+  from the eye deep, so one size on screen; a square picture of its `fovy`; a tick on its top edge)
+  and a region's box, the selected one lit. A click within 8 points of those lines picks the camera
+  or region, before the ray looks for a drawn geom; G6's handles follow (a region's size too).
+- **Overrides.** The inspector of an include lists what its file declares, by the file's names:
+  `SceneModel::brought` expands the file alone, without overrides and prefix — every joint but a
+  free one, each actuator (`kp`, `kv` only where it has that gain), each geom, the file's
+  materials. Each value is the override or else the file's, with ↺ back to the file's. An edit is
+  G5's `Set` of the include with its `set` pruned (`overrides::prune`): a cleared field drops its
+  override, an emptied target drops its table, and an empty `set` is absent. Ranges show in degrees
+  for hinge and ball joints.
+- **The library** (`kind = "robots"`, `[[robot]]` with `id`, `name` — an i18n key — `source`
+  relative to the repository root, and optional `pos`, `quat`, `prefix`). The template loader
+  passes the file by. SO-101 is `so101.xml` with its base on the point; the Shadow Hand is
+  `shadow_hand.xml` moved by (-1, -1.25, 0), so its mount hangs 15 cm over the point.
+- **`empty.esscene`**: an endless floor (`plane = [0, 0, 0.05]`), a 60 cm ceiling light at 1.5 m,
+  and `outside`, a camera 1.2 m back and 1.2 m up, looking down at the origin at 45°.
+- **Measured**: every item adds, expands and maps onto `mujoco-cpu` on the Shadow Hand copy and on
+  `empty.esscene`; the twelve Shadow Hand meshes, imported, hash as the source's.
+- **Left open**: a mesh has no size handles and no scale, since neither `SceneDesc` nor the
+  document carries a mesh scale (an STL in millimetres comes in 1000 times too large). A URDF whose
+  meshes lie outside its folder is refused, and USD is refused as in G1.
+
 ## 6. Where the code goes (layers, §4.2)
 
 | What | Crate (layer) |
