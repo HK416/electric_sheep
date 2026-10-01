@@ -449,14 +449,14 @@ Piercing all layers:  hash · version · provenance · telemetry · replay · ev
 | 9 | `es-env` (execution orchestration, batch domain), `es-import` (external policy and config importers: LeRobot config, RoboVerse, RL actors) |
 | 10 | `es-data`, `es-telemetry`, `es-eval` |
 | 11 | `es-ros2`, `es-py`, `es-script`, `es-transport`, `es-tools` (the `es` verbs that read artifacts: video, showcase, backend, evidence, gap, bench) |
-| 12 | `es-editor-model` (the editor's headless view-models and string tables) |
+| 12 | `es-editor-model` (the editor's headless view-models and string tables), `es-editor-scene` (the scene document's editing model: commands, undo, checks, save; plan G, G5) |
 | 13 | `es-editor` |
 
 **Rules (CI-enforced)**
 1. Upper → lower only. Dependency between crates in the same layer is forbidden
 2. `es-physics-cpu` ⇎ `es-physics-gpu`. Sharing goes through `es-physics-core`
 3. Layers ≤2 do not know Vulkan symbols (`es-gpu` exception)
-4. **No crate depends on `es-editor`.** Nothing but `es-editor` depends on `es-editor-model`
+4. **No crate depends on `es-editor`.** Nothing but `es-editor` depends on layer 12's `es-editor-model` and `es-editor-scene` (neither knows the other: rule 1)
 5. The core does not link CUDA/HIP symbols. Only `es-transport` is the exception
 6. **`es-ir` does not know the compiler, backends, or PyTorch.** IR is neutral with respect to the means of execution
 7. **`es-ir` does not know UI types.** Layout is an `.eslayout` sidecar
@@ -3590,7 +3590,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("es-env",9),
     ("es-data",10), ("es-telemetry",10), ("es-eval",10),
     ("es-ros2",11), ("es-py",11), ("es-script",11), ("es-transport",11),
-    ("es-editor-model",12), ("es-editor",13),
+    ("es-editor-model",12), ("es-editor-scene",12), ("es-editor",13),
 ];
 // Additional checks:
 //   does es-safety not depend on es-policy               (rule 8)

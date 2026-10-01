@@ -5,9 +5,9 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 
-/// Layer table, spec 4.2 / Appendix B.8. Layers 12 (`es-editor-model`) and 13
-/// (`es-editor`) are rule 4's: nothing may depend on `es-editor` regardless of
-/// layer, and nothing but `es-editor` on `es-editor-model`.
+/// Layer table, spec 4.2 / Appendix B.8. Layers 12 (`es-editor-model`,
+/// `es-editor-scene`) and 13 (`es-editor`) are rule 4's: nothing may depend on
+/// `es-editor` regardless of layer, and nothing but `es-editor` on a layer-12 crate.
 const LAYERS: &[(&str, u8)] = &[
     ("es-math", 0),
     ("es-core", 1),
@@ -39,6 +39,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("es-tools", 11),
     ("es-transport", 11),
     ("es-editor-model", 12),
+    ("es-editor-scene", 12),
     ("es-editor", 13),
 ];
 
@@ -77,10 +78,10 @@ pub fn check_layering(pkgs: &[Pkg]) -> Vec<String> {
                     pkg.name
                 ));
             }
-            // Rule 4: nothing but es-editor depends on es-editor-model.
-            if dep == "es-editor-model" && pkg.name != "es-editor" {
+            // Rule 4: nothing but es-editor depends on the editor's layer-12 crates.
+            if (dep == "es-editor-model" || dep == "es-editor-scene") && pkg.name != "es-editor" {
                 errors.push(format!(
-                    "{}: only es-editor may depend on es-editor-model (rule 4)",
+                    "{}: only es-editor may depend on {dep} (rule 4)",
                     pkg.name
                 ));
             }
@@ -308,12 +309,31 @@ mod tests {
             "{errors:?}"
         );
 
+        // The scene model (plan G, G5) is the same: es-editor uses both, neither the other.
+        let scene = pkg("es-editor-scene", &["es-script"]);
+        let both = pkg("es-editor", &["es-editor-model", "es-editor-scene"]);
+        let ok = vec![model.clone(), scene.clone(), both];
+        assert!(check_layering(&ok).is_empty(), "{:?}", check_layering(&ok));
+        let sideways = pkg("es-editor-scene", &["es-editor-model"]);
+        let errors = check_layering(&[model.clone(), sideways]);
+        assert!(
+            errors.iter().any(|e| e.contains("same-layer")),
+            "{errors:?}"
+        );
+
         for third in ["es-eval", "es-py", "es-tools"] {
             let errors = check_layering(&[model.clone(), pkg(third, &["es-editor-model"])]);
             assert!(
                 errors
                     .iter()
                     .any(|e| e.contains("only es-editor may depend")),
+                "{third}: {errors:?}"
+            );
+            let errors = check_layering(&[scene.clone(), pkg(third, &["es-editor-scene"])]);
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("only es-editor may depend on es-editor-scene")),
                 "{third}: {errors:?}"
             );
         }

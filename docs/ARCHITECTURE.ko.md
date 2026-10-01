@@ -449,14 +449,14 @@ float controls        (capability 확인 + execution mode 명시)
 | 9 | `es-env` (실행 오케스트레이션, 배치 도메인), `es-import` (외부 정책·설정 임포터: LeRobot config, RoboVerse, RL 액터) |
 | 10 | `es-data`, `es-telemetry`, `es-eval` |
 | 11 | `es-ros2`, `es-py`, `es-script`, `es-transport`, `es-tools` (아티팩트를 읽는 `es` 동사들: video, showcase, backend, evidence, gap, bench) |
-| 12 | `es-editor-model` (에디터의 헤드리스 뷰모델과 문자열 표) |
+| 12 | `es-editor-model` (에디터의 헤드리스 뷰모델과 문자열 표), `es-editor-scene` (장면 문서의 편집 모델: 명령·실행 취소·검사·저장, 계획 G의 G5) |
 | 13 | `es-editor` |
 
 **규칙 (CI 강제)**
 1. 상위 → 하위만. 동일 레이어 간 의존 금지
 2. `es-physics-cpu` ⇎ `es-physics-gpu`. 공유는 `es-physics-core`
 3. 레이어 ≤2 는 Vulkan 심볼을 모른다 (`es-gpu` 예외)
-4. **어떤 크레이트도 `es-editor`를 의존하지 않는다.** `es-editor-model`은 `es-editor`만 의존한다
+4. **어떤 크레이트도 `es-editor`를 의존하지 않는다.** 레이어 12의 `es-editor-model`과 `es-editor-scene`은 `es-editor`만 의존한다 (둘은 서로를 모른다: 규칙 1)
 5. 코어는 CUDA/HIP 심볼을 링크하지 않는다. `es-transport`만 예외
 6. **`es-ir`는 컴파일러·백엔드·PyTorch를 모른다.** IR은 실행 수단에 중립이다
 7. **`es-ir`는 UI 타입을 모른다.** 레이아웃은 `.eslayout` 사이드카
@@ -3514,7 +3514,7 @@ const LAYERS: &[(&str, u8)] = &[
     ("es-env",9),
     ("es-data",10), ("es-telemetry",10), ("es-eval",10),
     ("es-ros2",11), ("es-py",11), ("es-script",11), ("es-transport",11),
-    ("es-editor-model",12), ("es-editor",13),
+    ("es-editor-model",12), ("es-editor-scene",12), ("es-editor",13),
 ];
 // 추가 검사:
 //   es-safety 가 es-policy 를 의존하지 않는가        (규칙 8)
