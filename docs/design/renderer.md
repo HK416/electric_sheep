@@ -167,8 +167,9 @@ MJCF hides a collision-only geom or an invisible floor, and a scene without one 
 bit as before. Any other alpha is ignored (there is no transparency).
 
 Buffer layout is a flat `f32` array, stride 32 floats (128 B) per triangle — `v0 v1 v2 n
-albedo emission seg mat tc0 tc1 tc2 pad` — the segmentation id and the material slot
-`asuint`-bitcast into slots 18 and 19. One buffer, one stride, the same on both sides. The
+albedo emission seg mat tc0 tc1 tc2 light pad` — the segmentation id and the material slot
+`asuint`-bitcast into slots 18 and 19, and slot 29 a `_light` geom's flag (`0`/`1`, M17/R6,
+section 17). One buffer, one stride, the same on both sides. The
 stride was 20 until plan H's HT1 appended the material slot and three texture coordinates
 ([§15](#15-textures-and-metallic-roughness-materials-plan-h-ht1)); a layout is not an
 output, and every golden re-passed unchanged.
@@ -806,7 +807,8 @@ defaults to `lambert`.
   light is *directional* — infinitely far — so the occluder may stand outside the camera's
   far plane and the view frustum's `far` is the wrong bound. `1e30` rather than infinity
   because `rcp_safe` clamps reciprocals to ±1e30 to keep `0 * inf` out of the slab test, and
-  an infinite `far` would put it back in.
+  an infinite `far` would put it back in. Since M17/R6 it passes through the `_light` panels
+  (section 17).
 - **`vis` multiplies the diffuse *and* the specular term, never the ambient.** A surface in
   shadow keeps its hemisphere ambient, which is what stops the shadowed floor of the Cornell
   box from going black.
@@ -2473,3 +2475,47 @@ and so does the GPU (0 of 12,288 bytes each).
   **lights** (not imported), sampler **filters** (bilinear always, no mipmaps, section 15.5).
 - **A normal map on a cube texture**: refused by name; tangent space needs UVs.
 - **The editor's replay rasterizer** (`raster.rs`) still draws the base colour factor only (the M16/H8 looks draw the maps).
+
+## 17. A light panel casts no `Full` shadow (M17/R6)
+
+Review M17 F-6: in the editor's material look (`Rs` with `Shading::FULL`) a scene's `_light`
+panel — the path tracer's emitter — cast a large shadow on the floor, in every template and every
+authored scene (the editor's lights are `_light` boxes, scene-authoring section 3.4). Section
+9.1's shadow ray is an any-hit against every triangle, the panel's included, and the directional
+light it was looking for is the light that panel stands for.
+
+- **The flag.** `Tri::light` is set from the `_light` suffix, the same test that makes the geom
+  emit, and rides in slot 29 of the triangle buffer, the first of the three pad slots (section
+  2.1). The `Full` shadow ray is `cpu::any_hit_but_panels` / `es_any_hit_but_panels` with
+  `skip_panels = true`, which passes through a flagged triangle; every other caller keeps
+  `any_hit` / `es_any_hit`, the same traversal with `false`.
+- **Not every emitter.** A drawn material's emission (an MJCF `emission`, HT2's emissive maps)
+  does not set the flag: a glowing object is an object, and it still occludes. It is also what
+  keeps the goldens: skipping every emissive triangle moved `textured_rs_full_rgb8`, whose
+  glowing `bean` shadows the floor.
+- **Not the path tracer, not `Lambert`.** `Pt`'s rays keep the panel: there it is a surface,
+  and it emits (its NEE ray already stops short of the point it samples). `Lambert` casts no
+  shadow ray. An observation renders one of those two (section 9.5, section 12), so no
+  observation, dataset or trained policy sees a different pixel.
+- **The panel itself** is drawn as before. Its own shadow ray passes through it as well, so a
+  face turned from the light can gain the highlight term; a panel's emission already saturates
+  every one this repository ships (`rgba` 1).
+
+Measured (RTX 3060):
+
+- `a_light_panel_casts_no_shadow` (`tests/render.rs`): a floor, a block and a 60 cm panel at
+  1.5 m, 64 × 64, `ssaa: 1`. Before, the 110 floor pixels in the panel's shadow averaged
+  Rgb8 (177, 191, 215) against (230.1, 231.5, 234.2) with `shadows: false`; after, each one is
+  its `shadows: false` pixel. The 16 floor pixels in the block's shadow stay at (177, 191, 215)
+  against (228.2, 229.6, 232.4). 21 pixels darken, none of them by the panel alone; the GPU
+  frame equals the CPU's, 0 of 4,096 pixels differ.
+- Every render golden is unchanged on the CPU and the GPU, the three `Full` ones included:
+  `cornell_rs_full_rgb8` (a closed room: a ray that passes the panel meets the ceiling),
+  `maps_rs_full_rgb8` (no panel) and `textured_rs_full_rgb8` (its panel's shadow falls off the
+  floor). `batch_so101_pt_rgb8`, the SO-101 scene with its panel on `Pt`, is 0 of 12,288 bytes
+  from its golden on the device.
+- The editor's material look, before and after, at 1700 × 1000: on the SO-101 cube card's
+  editable copy 31,182 of 497,004 viewport pixels move, all of them the panel's shadow on the
+  table (mean (173.7, 181.5, 192.1) before, (220, 215, 205) after); on the empty project
+  25,058 move, the 60 cm panel's shadow. The robot's, the bin's and the cube's shadows do not
+  move a pixel.
