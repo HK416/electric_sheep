@@ -376,15 +376,18 @@ appended at 31–33). Where it differs from the example above, and what the text
   (`BodyPose`), `<body>.qpos` / `<body>.vel` (the free joint's 7 / 6). `state` and `privileged`
   (the teacher's extra inputs) are one `ObservationSpec` in the Task IR; G3b reads the split.
 - **Numbers from libm**: `within_deg`'s cosine, a camera's focal length and `tilt_max_deg`'s `m`
-  use the host's `cos` / `tan`, as the generators this replaces did (the first two agree with the
-  committed documents on this PC). **Owner decision (orchestrator, G3b, 2026-10-01): the host call
-  stays, so generated documents may differ across platforms in these bits.** Measured on this PC:
-  `es_math::approx::sin_cos_f64` (the `libm` crate, musl) gives the host's cosine of 0.05 rad, but
-  `tan` as sin / cos moves the 45° cameras' focal length by one ULP (`115.88225099390856` against
-  the committed `…857`), and with it both reference `task_hash`es. musl's own `tan` (`libm::tan`)
-  gave the host's bits at every field of view probed (30°–90°, the committed 45° and 70° among
-  them), so a three-line `es_math::approx::tan_f64` over it would make the documents
-  host-independent without moving a committed hash — the owner's to take up.
+  come from `es_math::approx` (`sin_cos_f64`, `tan_f64` — the `libm` crate, musl), as the asset
+  path's numbers do (§5.3, M10 W0b), so **a generated document has the same bits on every host**
+  (G3d, 2026-10-01; G3b had kept the host's `cos` / `tan`). No committed hash moved: at the
+  committed angles (the cosine of 0.05 rad, `tan` of 22.5° and 35°) musl and this PC's UCRT give
+  the same bits, both correctly rounded. Elsewhere the two are faithful, not equal: over 1°–179° in
+  0.001° steps `tan` differs by one ULP at 14,720 of 356,002 arguments (`x` and `x / 2`) and the
+  half-angle cosine at 4,902 of 178,001, neither side always the correctly rounded one — a
+  document generated on Windows before G3d with, say, a 68° camera differs from today's in its
+  focal length's last bit. (`tan` as sin / cos was not taken: it moves the 45° cameras' focal
+  length by one ULP, `115.88225099390856` against the committed `…857`.) What still calls the
+  host: the fixture generators in `crates/es/tests/{shadow_hand,views}.rs`, which G3b's tests
+  compare against and which agree at the committed angles.
 
 ### 4.4 What G3c settled (three-axis relations)
 
