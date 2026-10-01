@@ -10,7 +10,7 @@ use es_editor_scene::inspect;
 use es_editor_scene::overrides::{prune, Brought};
 use es_math::units::RAD_TO_DEG;
 
-use super::{num, round};
+use super::inspector::{num, round};
 use crate::model::i18n::{t, Lang};
 
 /// The ↺ that drops an override, or an empty cell where there is none.

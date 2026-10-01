@@ -6,7 +6,8 @@ use eframe::egui;
 use egui::{Color32, Pos2, Stroke};
 use es_editor_scene::{Camera, Entity};
 
-use super::{Author, HOT};
+use super::overlay::HOT;
+use super::Author;
 
 const CAMERA: Color32 = Color32::from_rgb(120, 200, 240);
 const REGION: Color32 = Color32::from_rgb(120, 230, 150);
