@@ -1230,11 +1230,14 @@ fn learning_student(task: &TaskIr) -> LearningGraph {
                     p.name = fused(&p.name);
                 }
             }
+            // `tanh`, as the teacher's head: the unnormalizer's [-1, 1] is the envelope, so an
+            // unbounded head crosses it wherever the teacher's saturated actions sit (M16/H6).
             LearningNode::PolicyHead {
                 action_dim,
                 horizon,
+                squash,
                 ..
-            } => (*action_dim, *horizon) = (20, CHUNK),
+            } => (*action_dim, *horizon, *squash) = (20, CHUNK, Squash::Tanh),
             LearningNode::ActionChunker {
                 inputs,
                 horizon,
@@ -1574,14 +1577,22 @@ const LEARNING_STUDENT_HEADER: &str = "\
 #   rgb_top   -> VisionEncoder{ResNet18, ImageNet} 0 -.
 #   rgb_front -> VisionEncoder{ResNet18, ImageNet} 6 -+
 #   rgb_side  -> VisionEncoder{ResNet18, ImageNet} 7 -+- Fusion{Concat 4x512 -> 512} 2
-#   state     -> StateEncoder{Mlp[256]} 1            -'   -> TemporalEncoder -> PolicyHead
+#   state     -> StateEncoder{Mlp[256]} 1            -'   -> TemporalEncoder -> PolicyHead{tanh}
 #                                                         -> ActionChunker -> Normalizer{Inverse}
 #
 # What differs from learning-views.toml: the inputs renamed (rgb_top / rgb_front / rgb_side,
 # `state` 31 wide) and the fusion's ports with them (top, state, front, side); action_dim 20;
 # the unnormalizer learning-teacher.toml ends with (mean = each ctrlrange's centre, std = its
-# half-range), so the head works in about [-1, 1] and the chunk leaves in radians -- the hand's
+# half-range), so the head works in [-1, 1] and the chunk leaves in radians -- the hand's
 # servos span 0.4-1.6 rad where SO-101's six were alike.
+#
+# WHY THE HEAD IS TANH (packet M16/H6): the unnormalizer's [-1, 1] is the deployment's position
+# envelope exactly (soft margin 0), and the teacher's saturated tanh leaves its demonstrations
+# on and near those limits. The first student (runs/shadow-hand/student-001) had an unsquashed
+# head: it fitted the demonstrations to ~1 mrad -- the scale was right, slope 1.000 on every
+# channel -- but crossed a limit by up to 3.6 mrad on 74 % of its training frames, and the
+# plane clamped and counted 96.8 % of its evaluation ticks. A tanh head, the teacher's own,
+# cannot leave the envelope.
 #
 # WHY CONCAT, NOT learning-mad.toml's shared encoder + Sum: MAD's gain is deploying on fewer
 # cameras without retraining, and this student is deployed with the three it is trained on.
@@ -1984,6 +1995,62 @@ fn the_student_documents_agree_and_check() {
         }
     }
     println!("RAN the_student_documents_agree_and_check");
+}
+
+/// The chunk a policy emits cannot leave its Deployment IR's position envelope (packet M16/H6).
+///
+/// Both hand policies end in the ctrlrange unnormalizer (mean = centre, std = half-range), whose
+/// `[-1, 1]` *is* the envelope, and the plane clamps -- and counts -- any bit past it (soft
+/// margin 0). So the head before it must be bounded to `[-1, 1]`: the teacher's is `tanh`, and
+/// the student's was an unsquashed regression. The teacher's saturated `tanh` leaves its
+/// demonstrations on and near the limits; the student fitted them to ~1 mrad and crossed by up
+/// to 3.6 mrad on 74 % of its training frames, which the plane counted on 96.8 % of the
+/// evaluation's ticks (`runs/shadow-hand/student-001`, `envelope_violation_rate` 0.968).
+///
+/// `head * std + mean` is evaluated in f32, as the lowered module does. The tolerance is one f32
+/// rounding: channel 1's limits (-0.698, 0.489) are not both reachable exactly from an f32
+/// centre and half-range, and land 3e-8 / 6e-8 rad outside -- only at a fully saturated `tanh`.
+#[test]
+fn the_policies_chunks_stay_inside_their_envelope() {
+    for (learning, deployment) in [
+        ("learning-teacher.toml", "deployment-hand.toml"),
+        ("learning-student.toml", "deployment-student.toml"),
+    ] {
+        let g = es_ir::serial::learning_from_toml(&read(&fixture(learning))).expect(learning);
+        let d = es_ir::serial::deployment_from_toml(&read(&fixture(deployment))).expect(deployment);
+        let mut heads = g.nodes.nodes.values().filter_map(|n| match n {
+            LearningNode::PolicyHead { kind, squash, .. } => Some((*kind, *squash)),
+            _ => None,
+        });
+        assert_eq!(
+            heads.next(),
+            Some((HeadKind::Regression, Squash::Tanh)),
+            "{learning}: the head before the ctrlrange unnormalizer must be bounded to [-1, 1]"
+        );
+        let stats = g.nodes.nodes.values().find_map(|n| match n {
+            LearningNode::Normalizer {
+                direction: NormalizeDir::Inverse,
+                stats: StatsSource::MeanStd { mean, std },
+                ..
+            } => Some((mean.clone(), std.clone())),
+            _ => None,
+        });
+        let (mean, std) = stats.expect("an unnormalizer");
+        assert_eq!(mean.len(), d.safety.position.len(), "{learning}");
+        for (i, limit) in d.safety.position.iter().enumerate() {
+            for head in [-1.0f32, 1.0] {
+                let out = f64::from(head * std[i] as f32 + mean[i] as f32);
+                assert!(
+                    out >= limit.lower - 1e-7 && out <= limit.upper + 1e-7,
+                    "{learning}: channel {i} at head {head} is {out}, outside \
+                     [{}, {}] of {deployment}",
+                    limit.lower,
+                    limit.upper
+                );
+            }
+        }
+    }
+    println!("RAN the_policies_chunks_stay_inside_their_envelope");
 }
 
 /// `es policy init` builds the untrained student bundle, which opens and passes XIR-040

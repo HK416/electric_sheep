@@ -6,14 +6,22 @@
 #   rgb_top   -> VisionEncoder{ResNet18, ImageNet} 0 -.
 #   rgb_front -> VisionEncoder{ResNet18, ImageNet} 6 -+
 #   rgb_side  -> VisionEncoder{ResNet18, ImageNet} 7 -+- Fusion{Concat 4x512 -> 512} 2
-#   state     -> StateEncoder{Mlp[256]} 1            -'   -> TemporalEncoder -> PolicyHead
+#   state     -> StateEncoder{Mlp[256]} 1            -'   -> TemporalEncoder -> PolicyHead{tanh}
 #                                                         -> ActionChunker -> Normalizer{Inverse}
 #
 # What differs from learning-views.toml: the inputs renamed (rgb_top / rgb_front / rgb_side,
 # `state` 31 wide) and the fusion's ports with them (top, state, front, side); action_dim 20;
 # the unnormalizer learning-teacher.toml ends with (mean = each ctrlrange's centre, std = its
-# half-range), so the head works in about [-1, 1] and the chunk leaves in radians -- the hand's
+# half-range), so the head works in [-1, 1] and the chunk leaves in radians -- the hand's
 # servos span 0.4-1.6 rad where SO-101's six were alike.
+#
+# WHY THE HEAD IS TANH (packet M16/H6): the unnormalizer's [-1, 1] is the deployment's position
+# envelope exactly (soft margin 0), and the teacher's saturated tanh leaves its demonstrations
+# on and near those limits. The first student (runs/shadow-hand/student-001) had an unsquashed
+# head: it fitted the demonstrations to ~1 mrad -- the scale was right, slope 1.000 on every
+# channel -- but crossed a limit by up to 3.6 mrad on 74 % of its training frames, and the
+# plane clamped and counted 96.8 % of its evaluation ticks. A tanh head, the teacher's own,
+# cannot leave the envelope.
 #
 # WHY CONCAT, NOT learning-mad.toml's shared encoder + Sum: MAD's gain is deploying on fewer
 # cameras without retraining, and this student is deployed with the three it is trained on.
@@ -306,6 +314,7 @@ unit = "Dimensionless"
 action_dim = 20
 horizon = 16
 kind = "Regression"
+squash = "Tanh"
 
 [[body.nodes.nodes.4.PolicyHead.inputs]]
 name = "feat"
