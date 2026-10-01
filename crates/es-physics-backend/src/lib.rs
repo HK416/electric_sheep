@@ -22,7 +22,7 @@ pub use mapping::{
     compare_backends, lookup, mapping_report, BackendKind, CompareReport, Mapping, MappingReport,
     MappingRow, MjcfRow, SemanticMapping, Severity, Spec17Row, Status, TaskFeature,
 };
-pub use mjcf_out::scene_to_mjcf;
+pub use mjcf_out::{layout, scene_to_mjcf};
 pub use mjwarp::MjWarpBackend;
 pub use mujoco::MuJoCoCpuBackend;
 pub use newton::NewtonBackend;

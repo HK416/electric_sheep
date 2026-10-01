@@ -31,7 +31,7 @@ use es_assets::scene::{
 };
 use es_core::StableId;
 use es_math::{Quat, Vec3};
-use es_physics_core::PhysicsError;
+use es_physics_core::{IndexRange, ModelInfo, PhysicsError};
 
 fn unsupported(what: impl Into<String>) -> PhysicsError {
     PhysicsError::Unsupported(what.into())
@@ -181,6 +181,62 @@ pub fn scene_to_mjcf(scene: &SceneDesc) -> Result<String, PhysicsError> {
     write_sensors(&mut out, &scene.sensors, &joint_names)?;
     out.push_str("</mujoco>\n");
     Ok(out)
+}
+
+/// The layout `MuJoCo` gives the model [`scene_to_mjcf`] writes, without loading it: bodies
+/// numbered in the order they are written, the world first; each body's joints in the scene's
+/// order (a fixed one is no joint); `qpos` / `qvel` addresses summed over them. Only `nq`, `nv`,
+/// `nbody`, `qpos`, `dof` and `body` are filled: what reading a recorded state back needs
+/// (design note `scene-authoring.md` section 4.8). `tests/layout.rs` holds it equal to
+/// `mujoco-cpu`'s on every committed scene.
+pub fn layout(scene: &SceneDesc) -> ModelInfo {
+    fn walk<'a>(
+        b: &'a Body,
+        children: &BTreeMap<StableId, Vec<&'a Body>>,
+        out: &mut Vec<&'a Body>,
+    ) {
+        out.push(b);
+        for child in children.get(&b.id).into_iter().flatten() {
+            walk(child, children, out);
+        }
+    }
+    let mut children: BTreeMap<StableId, Vec<&Body>> = BTreeMap::new();
+    for body in &scene.bodies {
+        if let Some(parent) = body.parent {
+            children.entry(parent).or_default().push(body);
+        }
+    }
+    let mut info = ModelInfo {
+        nbody: 1,
+        ..ModelInfo::default()
+    };
+    let mut written = Vec::new();
+    for root in scene.bodies.iter().filter(|b| b.parent.is_none()) {
+        if root.name == "world" {
+            info.body.insert(root.id, IndexRange::new(0, 1));
+            for child in children.get(&root.id).into_iter().flatten() {
+                walk(child, &children, &mut written);
+            }
+        } else {
+            walk(root, &children, &mut written);
+        }
+    }
+    for body in written {
+        info.body.insert(body.id, IndexRange::new(info.nbody, 1));
+        info.nbody += 1;
+        for joint in scene.joints.iter().filter(|j| j.body == body.id) {
+            let (nq, nv) = match joint.kind {
+                JointKind::Free => (7, 6),
+                JointKind::Ball => (4, 3),
+                JointKind::Hinge | JointKind::Slide => (1, 1),
+                JointKind::Fixed => continue,
+            };
+            info.qpos.insert(joint.id, IndexRange::new(info.nq, nq));
+            info.dof.insert(joint.id, IndexRange::new(info.nv, nv));
+            (info.nq, info.nv) = (info.nq + nq, info.nv + nv);
+        }
+    }
+    info
 }
 
 /// `<asset><mesh name vertex face>` for every mesh the scene carries, inline.
