@@ -1,9 +1,12 @@
 //! `es-editor [project-dir|bundle.esb|run-dir] [--attach <addr> [--token <t>]] [--step <1-5>]
-//! [--viewport fast|material|pt] [--fps | --orbit-demo]` — the editor shell of spec 23.
+//! [--viewport fast|material|pt] [--fps | --orbit-demo] [--physics-preview]` — the editor shell
+//! of spec 23.
 //!
 //! `--fps` prints each viewport's frames per second on stderr; `--orbit-demo` also turns every
 //! viewport's camera a little each frame (packet M16/H9's measurement and captures). Both keep
 //! the session's window and dock state in the temp directory, not the person's own.
+//! `--physics-preview` has ① start its physics preview as soon as it shows the scene (packet
+//! M17/G4's captures).
 //!
 //! `es-editor --import <project-dir> --template <id> ...` makes a project of runs that ran
 //! outside the editor and opens it; the grammar is [`es_editor::model::import`]'s (packet
@@ -21,7 +24,7 @@ use es_editor::EditorApp;
 fn main() -> eframe::Result<()> {
     let (mut path, mut addr, mut token, mut step) = (None, None, None, None);
     let mut look = None;
-    let mut demo = None;
+    let (mut demo, mut physics) = (None, false);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -30,6 +33,8 @@ fn main() -> eframe::Result<()> {
             "--step" => step = args.next().and_then(|s| s.parse::<usize>().ok()),
             // The viewport's look at start (packet M16/H8); the selector changes it after.
             "--viewport" => look = args.next().as_deref().and_then(Mode::parse),
+            // ① starts its physics preview at once (packet M17/G4's captures).
+            "--physics-preview" => physics = true,
             "--fps" => demo = Some(false),
             "--orbit-demo" => demo = Some(true),
             "--import" => match import(&args.by_ref().collect::<Vec<_>>()) {
@@ -79,6 +84,9 @@ fn main() -> eframe::Result<()> {
             }
             if let Some(orbit) = demo {
                 es_editor::ui::advanced::set_demo(&cc.egui_ctx, orbit);
+            }
+            if physics {
+                es_editor::ui::scene::preview_at_start(&cc.egui_ctx);
             }
             if let Some(path) = &path {
                 app = app.with_path(path);

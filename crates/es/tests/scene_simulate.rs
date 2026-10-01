@@ -35,8 +35,11 @@ fn mujoco() -> bool {
     }
 }
 
+/// Runs in `out`'s directory: `MuJoCo` writes `MUJOCO_LOG.TXT` into the working directory when
+/// it warns (the divergence test), and that belongs in the scratch directory, not the crate.
 fn simulate(scene: &Path, args: &[&str], out: &Path) -> Output {
     Command::new(env!("CARGO_BIN_EXE_es"))
+        .current_dir(out.parent().unwrap())
         .args(["scene", "simulate"])
         .arg(scene)
         .args(args)

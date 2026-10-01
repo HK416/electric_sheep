@@ -13,8 +13,9 @@ use es_core::StableId;
 use es_render::raster::{project_scene, Camera, Projected};
 use es_render::TriScene;
 
+use crate::model::launch::{exit_meaning, LaunchModel, State};
 use crate::model::project::Project;
-use crate::model::replay_view::load_scene;
+use crate::model::replay_view::{load_scene, ReplayView};
 use crate::model::template::{load, templates_root, Method, Template};
 use crate::model::viewport::{Shot, Source};
 use crate::model::watch::source_of;
@@ -189,6 +190,125 @@ pub fn camera_for(scene: Option<&Path>) -> Camera {
     camera_of(found.as_ref())
 }
 
+/// How long ①'s physics preview lets the scene fall, in seconds (`scene-authoring.md` section 5).
+pub const PHYSICS_SECONDS: &str = "3";
+
+/// `es`'s argv for ①'s physics preview of `scene` into `out`: the scene alone, its servos held
+/// where they start, on the reference backend.
+pub fn physics_argv(scene: &Path, out: &Path) -> Vec<String> {
+    let (scene, out) = (scene.display().to_string(), out.display().to_string());
+    let args = ["scene", "simulate", &scene, "--seconds", PHYSICS_SECONDS];
+    let rest = ["--ctrl", "hold", "--backend", "mujoco-cpu", "--out", &out];
+    args.iter().chain(&rest).map(|a| (*a).to_owned()).collect()
+}
+
+/// The file a preview writes: one per editor, so a second preview replaces the first.
+pub fn physics_out() -> PathBuf {
+    let name = format!("es-physics-preview-{}.estraj", std::process::id());
+    std::env::temp_dir().join(name)
+}
+
+/// What the line beside the preview button says of `es scene simulate`'s child, by
+/// `cmd/scene.rs`'s own words: what the mapping report blocks, when it diverged, what this
+/// machine lacks (exit 3), else its last error line.
+pub fn physics_line(state: &State) -> Option<(&'static str, Vec<String>)> {
+    let secs = || vec![PHYSICS_SECONDS.to_owned()];
+    let (code, lines) = match state {
+        State::Idle => return None,
+        State::Running { .. } => return Some(("setup.physics.running", secs())),
+        State::Exited { code: 0, .. } => return Some(("setup.physics.done", secs())),
+        State::Failed(why) => return Some(("setup.physics.failed", vec![why.clone()])),
+        State::Exited { code, lines } => (*code, lines),
+    };
+    let after = |mark: &str| {
+        lines
+            .iter()
+            .find_map(|l| Some(l.split_once(mark)?.1.to_owned()))
+    };
+    if let Some(names) = after("cannot simulate this scene: ") {
+        return Some(("setup.physics.blocked", vec![names]));
+    }
+    if let Some(at) = after("diverged at ") {
+        let secs = at.split(' ').next().unwrap_or_default().to_owned();
+        return Some(("setup.physics.diverged", vec![secs]));
+    }
+    let said = |p: &str| lines.iter().rev().find_map(|l| l.strip_prefix(p));
+    let why = (said("error: ").or_else(|| said("SKIPPED: ")))
+        .or_else(|| lines.iter().rev().map(|l| l.trim()).find(|l| !l.is_empty()))
+        .unwrap_or_else(|| exit_meaning(code));
+    let key = if code == 3 {
+        "setup.physics.unavailable"
+    } else {
+        "setup.physics.failed"
+    };
+    Some((key, vec![why.to_owned()]))
+}
+
+/// ①'s physics preview (packet M17/G4): `es scene simulate` into [`physics_out`], then that motion
+/// played back where the static scene was. The editor runs no physics (spec 23.1); dropping this
+/// ends the child.
+#[derive(Debug)]
+pub struct Physics {
+    launch: LaunchModel,
+    scene: PathBuf,
+    out: PathBuf,
+    /// Ticks per second it plays at: one per physics step of the scene.
+    pub rate_hz: f64,
+    replay: Option<Result<ReplayView, String>>,
+}
+
+impl Physics {
+    /// Starts `es` on `preview`'s scene; a file a previous preview left is removed first, so it
+    /// can never play as this one's.
+    pub fn start(preview: &ScenePreview, es: &Path, out: PathBuf) -> Self {
+        let _ = std::fs::remove_file(&out);
+        let mut launch = LaunchModel::default();
+        launch.start_program(es, &physics_argv(&preview.path, &out));
+        Self {
+            launch,
+            scene: preview.path.clone(),
+            out,
+            rate_hz: 1.0 / preview.scene.options.timestep,
+            replay: None,
+        }
+    }
+
+    /// Once a frame. When the child is gone, what it wrote opens, playing: a diverged run's
+    /// ticks before the divergence as well.
+    pub fn poll(&mut self) {
+        self.launch.poll();
+        if self.replay.is_none() && !self.running() && self.out.is_file() {
+            let opened = ReplayView::open(&self.scene, &self.out).map_err(|e| e.to_string());
+            self.replay = Some(opened.map(|mut view| {
+                view.playing = true;
+                view
+            }));
+        }
+    }
+
+    pub fn running(&self) -> bool {
+        self.launch.pid().is_some()
+    }
+
+    pub fn line(&self) -> Option<(&'static str, Vec<String>)> {
+        match &self.replay {
+            Some(Err(why)) => Some(("setup.physics.failed", vec![why.clone()])),
+            _ => physics_line(self.launch.state()),
+        }
+    }
+
+    /// The motion, once it is written and read.
+    pub fn replay(&mut self) -> Option<&mut ReplayView> {
+        self.replay.as_mut()?.as_mut().ok()
+    }
+}
+
+impl Drop for Physics {
+    fn drop(&mut self) {
+        self.launch.kill();
+    }
+}
+
 /// ②'s sentence for a teaching method; `{}` is the robot.
 pub fn method_key(method: Method) -> &'static str {
     match method {
@@ -239,6 +359,105 @@ mod tests {
         assert!(seen > 1000, "{seen}");
         assert_eq!(camera_for(Some(&fixture())), SHOWCASE_CAMERA);
         assert_eq!(camera_for(None), SHOWCASE_CAMERA);
+    }
+
+    /// Packet M17/G4: the preview's command line, and what its line says for every way
+    /// `es scene simulate` can end, in both languages with its argument shown.
+    #[test]
+    fn the_physics_preview_says_what_its_child_did() {
+        let argv = physics_argv(Path::new("s/scene.xml"), Path::new("t/p.estraj"));
+        assert_eq!(
+            argv.join(" "),
+            "scene simulate s/scene.xml --seconds 3 --ctrl hold --backend mujoco-cpu --out t/p.estraj"
+        );
+        let exited = |code, lines: &[&str]| State::Exited {
+            code,
+            lines: lines.iter().map(|l| (*l).to_owned()).collect(),
+        };
+        let blocked = "error: newton cannot simulate this scene: ActuatorPosition, ContactElliptic";
+        let diverged = "error: diverged at 1.250 s (tick 150): the backend reported NanDetected";
+        let skipped = "SKIPPED: mujoco-cpu is not available on this machine: no mujoco";
+        let since = std::time::Instant::now();
+        let cases = [
+            (State::Idle, None),
+            (
+                State::Running { pid: 1, since },
+                Some(("setup.physics.running", "3")),
+            ),
+            (
+                exited(0, &["wrote p.estraj"]),
+                Some(("setup.physics.done", "3")),
+            ),
+            (
+                exited(1, &[blocked]),
+                Some(("setup.physics.blocked", "ActuatorPosition, ContactElliptic")),
+            ),
+            (
+                exited(1, &[diverged, "wrote p.estraj (150 tick(s))"]),
+                Some(("setup.physics.diverged", "1.250")),
+            ),
+            (
+                exited(3, &[skipped]),
+                Some(("setup.physics.unavailable", &skipped[9..])),
+            ),
+            (
+                exited(1, &["error: x.xml: not found", " "]),
+                Some(("setup.physics.failed", "x.xml: not found")),
+            ),
+            (
+                exited(-1, &[]),
+                Some(("setup.physics.failed", exit_meaning(-1))),
+            ),
+            (
+                State::Failed("es.exe: not found".into()),
+                Some(("setup.physics.failed", "es.exe: not found")),
+            ),
+        ];
+        for (state, want) in cases {
+            let got = physics_line(&state);
+            let short = got.as_ref().map(|(k, a)| (*k, a[0].as_str()));
+            assert_eq!(short, want, "{state:?}");
+            let Some((key, args)) = got else { continue };
+            for lang in Lang::ALL {
+                let line = fill(lang, key, &[&args[0]]);
+                assert!(line.contains(&args[0]) && !line.contains("{}"), "{line}");
+            }
+        }
+        for key in ["setup.physics", "setup.physics.hint", "setup.physics.back"] {
+            assert!(Lang::ALL.iter().all(|l| fill(*l, key, &[]) != key), "{key}");
+        }
+    }
+
+    /// The preview's own flow, without `es`: a stale file is removed, a program that is not
+    /// there fails by name, and once nothing runs the file in its place opens, playing at one
+    /// tick per physics step of the scene.
+    #[test]
+    fn a_written_preview_opens_playing_and_a_missing_es_fails_by_name() {
+        let preview = ScenePreview::open(&fixture()).expect("the demo scene");
+        let out = std::env::temp_dir().join(format!("es-g4-{}.estraj", std::process::id()));
+        std::fs::write(&out, b"stale").unwrap();
+        let mut physics = Physics::start(&preview, Path::new("no-such-es-g4"), out.clone());
+        assert!(!out.exists(), "the stale file is still there");
+        physics.poll();
+        let (key, args) = physics.line().expect("a line");
+        assert_eq!(key, "setup.physics.failed");
+        assert!(args[0].contains("no-such-es-g4"), "{args:?}");
+        assert!(physics.replay().is_none() && !physics.running());
+
+        // What `es scene simulate` writes; here a committed motion on the same scene.
+        let traj = "tests/fixtures/visible-learning/run/traj/nominal-00.estraj";
+        std::fs::copy(repo().join(traj), &out).unwrap();
+        physics.poll();
+        // The arm scene steps at 5 ms.
+        assert!(
+            (physics.rate_hz - 200.0).abs() < 1e-9,
+            "{}",
+            physics.rate_hz
+        );
+        let view = physics.replay().expect("the written motion opens");
+        assert!(view.playing && view.ticks() > 1);
+        drop(physics);
+        std::fs::remove_file(&out).ok();
     }
 
     #[test]
