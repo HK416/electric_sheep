@@ -162,7 +162,18 @@ Directions already fixed for S2–S6 (each still gets its own design pass):
   device. (Packet M16/H8 built its free-camera half: `es render --scene … [--traj … --tick N]
   --eye … --look-at … --path rs|full|pt --out -` streams accumulated path-traced frames as PPMs,
   and every viewport has a look selector — fast raster, materials through `es_render::cpu`'s
-  `Rs` `Full` on worker threads, path-traced through that command.) The sentence editor offers only what `es-env` lowers. "Held for 1 s" compiles to
+  `Rs` `Full` on worker threads, path-traced through that command.) **Reversed by the owner, 2026-10-01** ("카메라
+  움직이면 재질이 안입혀지는건 아쉬운데" — then: "에디터도 Vulkan 으로 그려줘"): since packet M16/H9
+  the editor opens **one** `es-gpu` device itself, lazily on the first 3D view, on a worker
+  thread (`crates/es-editor/src/gpu.rs`), and draws all three looks in process every frame the
+  shot changes — fast is `Rs` `Lambert`, material `Rs` `Full`, realistic `Pt` restarting its
+  history on any change and accumulating to 256 spp while still — and uploads each frame as the
+  egui texture (eframe stays on `glow`; read back, no interop). A shot's frame is `es render`'s
+  frame for it bit for bit (`crates/es-editor/tests/gpu_viewport.rs`). Measured on the RTX 3060,
+  Shadow Hand (40,825 triangles), orbiting at 960×540: fast 6 ms (the CPU raster it replaces
+  13–15 ms), material 22–31 ms (33–45 fps), realistic 4 spp 41–55 ms, 256 spp still in 2.5 s.
+  Without a device the H8 paths above stay as the fallback, and say so. §23.1 still holds:
+  drawing a preview is not hosting learning. The sentence editor offers only what `es-env` lowers. "Held for 1 s" compiles to
   "inside and nearly still" (the demo's settling bound) because IR-D has no hold node; the
   lowering gains multi-lane `GetJointState`, `Slice` and `GetBodyVelocity` (`es-env`, not
   `es-ir`). Contact conditions wait for `GetContact` lowering. **Why an attempt failed comes from

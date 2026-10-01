@@ -1380,7 +1380,7 @@ Lambert 씬에서는 비트 동일한 `Pt` 1 spp가 여기서는 아니다: 텍�
 - **노멀·방출 맵, glTF 재질** — HT2, [§16](#16-노멀방출-맵-gltf-재질-plan-h-ht2). `rgb|orm|metallic|roughness|normal|emissive` 밖의 `<layer>` 역할은 이름으로 거부한다.
 - **투명도**(0이 아닌 알파는 이전처럼 무시), **`reflectance`**(MuJoCo의 평면 거울; 표현되지 않는 속성으로 보고), 손잡이로서의 `specular`, `hflip` / `vflip` / `nchannel`(보고하되 따르지 않음).
 - **MuJoCo classic 렌더러의 cube 텍스처 색 공간**: 그 렌더러는 `colorspace`가 무엇이든 cube 면을 선형 `GL_RGB`로 올린다. 이 렌더러는 `colorspace`를 따른다. 번들의 `block.png`는 선형으로 선언되어 있으므로 둘이 그 위에서는 일치한다.
-- **영속 텍스처 버퍼**: 텍셀은 삼각형 버퍼에 실려 프레임마다 삼각형과 함께 다시 올라간다(`pack_materials`의 `ponytail:`). 손의 카메라에서 그 비용은 `frame_profile`이 잴 때까지 `Target / Status: unverified`다.
+- **영속 텍스처 버퍼**: 텍셀은 삼각형 버퍼에 실려 프레임마다 삼각형과 함께 다시 올라간다(`pack_materials`의 `ponytail:`). 패킷 M16/H9가 Shadow Hand(RTX 3060)에서 쟀다: 재질 영역은 업로드 한 번의 1,982,765 floats 중 375,564개(19 %)다. 다시 테셀레이션하고 다시 올리는 리플레이 프레임은 42–45 ms, 아무것도 올리지 않는 궤도 프레임은 22 ms이고, 트리 빌드와 float 패킹만으로 CPU에서 12 ms가 들므로 텍셀은 작은 쪽이다. 하지 않았다: 에디터 뷰포트는 장면이나 틱이 바뀔 때만 올리고, 카메라만 도는 동안에는 아무것도 올리지 않는다. 렌더러는 `Renderer::restart_history`(H9)로 시간 이력을 새로 시작할 수 있다: 프레임 0, 유효한 뷰 없음이므로 거기서부터의 `K` 프레임은 새 렌더러의 `K` 프레임과 비트 단위로 같다.
 - **에디터의 리플레이 래스터라이저**(`raster.rs`)는 텍셀이 아니라 기저색 인자를 그린다(패킷 M16/H8의 뷰포트 재질·경로 추적 보기는 텍셀을 그린다).
 
 ## 16. 노멀·방출 맵, glTF 재질 (plan H, HT2)

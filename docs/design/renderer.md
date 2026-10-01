@@ -2330,8 +2330,14 @@ reproduces all three bit for bit, and so does the GPU (0 of 12,288 bytes each).
   cube faces as linear `GL_RGB` whatever `colorspace` says; this one honours `colorspace`. The
   bundle's `block.png` is declared linear, so the two agree on it.
 - **A persistent texture buffer**: the texels ride in the triangle buffer and are re-uploaded
-  with every frame's triangles (`ponytail:` at `pack_materials`). What that costs on the hand's
-  cameras is `Target / Status: unverified` until `frame_profile` measures it.
+  with every frame's triangles (`ponytail:` at `pack_materials`). Measured by packet M16/H9 on
+  the Shadow Hand (RTX 3060): the material region is 375,564 of 1,982,765 floats per upload
+  (19 %); a replay frame that re-tessellates and re-uploads costs 42–45 ms against 22 ms for an
+  orbit frame that uploads nothing, and building the tree and packing the floats alone take
+  12 ms on the CPU, so the texels are the smaller part. Not done: the editor's viewport uploads
+  only when the scene or its tick moves, and a still-camera orbit uploads nothing. A renderer
+  can start its temporal history over with `Renderer::restart_history` (H9): frame 0, no valid
+  view, so `K` frames from there are a fresh renderer's `K` frames bit for bit.
 - **The editor's replay rasterizer** (`raster.rs`) draws the base colour factor, not the texel (the viewport's material and path-traced looks of packet M16/H8 draw it).
 
 ## 16. Normal and emissive maps, glTF materials (plan H, HT2)

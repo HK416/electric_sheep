@@ -31,7 +31,7 @@ Everything else below is a proposal with a default; section 9 lists what the own
    edits name, shape, size, mass, friction, colour / material / texture, joint (fixed, free,
    hinge, slide) and its limits. Delete, duplicate, undo / redo. A *physics preview* button
    drops everything for three seconds and plays it back. The policy's camera view is always in
-   the viewport's corner (the real observation, H8's renderer).
+   the viewport's corner (the real observation, H8's looks drawn in process since H9).
 3. **Say what success is** in ①'s sentence editor: "[cube] is [inside] [bin]", "[cube] is
    [still] for [1 s]", "[cube] matches [goal]'s orientation within [6°]", "fails if [cube] is
    farther than [24 cm] from [palm]", "fails if not done within [8 s]". What starts where:
@@ -43,8 +43,12 @@ Everything else below is a proposal with a default; section 9 lists what the own
    (the method plan H built: the reward comes from the same sentences), teleoperation (S6).
 6. **③ / ④ / ⑤** exactly as for a template project.
 
-Nothing here runs learning or physics inside the editor (§23.1, §4.2 rule 4): previews, renders
-and generation are `es` subcommands the editor hands an argv, or pure functions of the documents.
+Nothing here runs learning or physics inside the editor (§23.1, §4.2 rule 4): previews and
+generation are `es` subcommands the editor hands an argv, or pure functions of the documents.
+Rendering is the one exception, by the owner's decision of 2026-10-01 ("에디터도 Vulkan 으로
+그려줘", after the material look dropped to flat colour whenever the camera moved): the viewport
+draws with `es-render` in process on one Vulkan device (packet M16/H9,
+`editor-redesign.md` section 5, S4), and `es render` stays for a machine without one.
 
 ## 3. The scene document (`*.esscene`)
 
@@ -288,8 +292,10 @@ the SO-101 and Shadow Hand specs regenerate their committed documents byte for b
 - **Inspector**: the selected thing's fields with 🎲 toggles; units in words; invalid values
   refused in place with the reason (`SceneDesc::validate`, the mapping report).
 - **Viewport**: picking (the segmentation channel already gives geom ids), translate / rotate /
-  scale gizmos with snapping, frame-selected, H8's render modes, and the policy camera's view in
-  the corner rendered by `es render` (the real observation, including its resolution).
+  scale gizmos with snapping, frame-selected, H8's render modes drawn in process every frame
+  (H9), and the policy camera's view in the corner rendered by the same in-process renderer at
+  the camera's declared resolution and render path (the real observation; `es render` without a
+  device).
 - **Commands and undo**: every edit is a command on a scene model in `es-editor-model` (layer
   12), applied to the document, validated, and undoable; the layout (`*.eslayout`, §14.3) never
   enters the scene document.
