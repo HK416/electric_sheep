@@ -335,15 +335,8 @@ fn tiles(
         .show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 for tile in results::tiles(rows, *filter, &shown.outcomes) {
-                    let frames = shown
-                        .dir
-                        .cells()
-                        .iter()
-                        .find(|c| c.name == tile.cell)
-                        .map_or(0, |c| c.frames);
                     let thumb = thumbs.entry(tile.cell.clone()).or_insert_with(|| {
-                        let last = results::frame_at(usize::MAX, frames)?;
-                        let img = shown.dir.frame(&tile.cell, last)?;
+                        let img = results::thumbnail(&shown.dir, &tile.cell)?;
                         Some(rgb_texture(&ctx, &tile.cell, &img))
                     });
                     ui.vertical(|ui| {

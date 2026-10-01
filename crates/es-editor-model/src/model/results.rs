@@ -20,7 +20,7 @@ use es_data::training::{collect_root, lerobot_checkpoint, Cycle, Route};
 use es_eval::episodes::{read_episodes, EpisodeRow};
 use es_eval::metrics::{failure_name, violation_name};
 use es_eval::perturb::unseen_age;
-use es_eval::run_dir::{CellRow, RunDir};
+use es_eval::run_dir::{CellRow, Rgb8Image, RunDir};
 use es_ir::deployment::DeploymentIr;
 use es_ir::evaluation::{
     AcceptanceResult, Comparator, EvaluationIr, EvaluationReport, MetricSpec, MetricValue,
@@ -434,6 +434,13 @@ pub const SPEEDS: [f64; 3] = [0.5, 1.0, 2.0];
 /// where it captures the frame, so the two share an index; past the last picture, the last.
 pub fn frame_at(tick: usize, frames: usize) -> Option<usize> {
     frames.checked_sub(1).map(|last| tick.min(last))
+}
+
+/// A tile's picture: its attempt's last frame, the first camera's when there are several
+/// (packet M17/R7, `RunDir`'s choice).
+pub fn thumbnail(dir: &RunDir, cell: &str) -> Option<Rgb8Image> {
+    let frames = (dir.cells().iter().find(|c| c.name == cell)).map_or(0, |c| c.frames);
+    dir.frame(cell, frame_at(usize::MAX, frames)?)
 }
 
 /// The attempt the player opens on: the first failure (spec 10.5 replays failures first), else
@@ -1567,6 +1574,40 @@ mod tests {
             assert_eq!(words.len(), 6, "{lang:?}");
             assert!(words.iter().all(|w| !w.contains('.')), "{words:?}");
         }
+    }
+
+    /// Packet M17/R7 (F-2): an evaluation of several cameras writes each to `<cell>/<channel>/`;
+    /// a tile's picture is the first camera's last frame, and a one-camera cell's is as before.
+    #[test]
+    fn a_tile_of_two_cameras_shows_the_first_cameras_last_frame() {
+        let p = scratch("cameras");
+        let run = copy_fixture(&p, 1);
+        let frames = run.eval_dir().join("frames");
+        let one = std::fs::read(frames.join("nominal-00/000000.bin")).unwrap();
+        let cell = frames.join("nominal-01");
+        std::fs::remove_dir_all(&cell).unwrap();
+        for (camera, shade) in [("rgb_top", 10u8), ("rgb_side", 20)] {
+            let dir = cell.join(camera);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::copy(
+                frames.join("nominal-00/layout.json"),
+                dir.join("layout.json"),
+            )
+            .unwrap();
+            for i in 0..2u8 {
+                std::fs::write(dir.join(format!("{i:06}.bin")), vec![shade + i; one.len()])
+                    .unwrap();
+            }
+        }
+        let r = RunResults::read(&p, &run, None).unwrap();
+        let picture = thumbnail(&r.dir, "nominal-01").expect("a picture");
+        assert_eq!((picture.width, picture.height), (96, 96));
+        assert!(
+            picture.data.iter().all(|&b| b == 21),
+            "rgb_side's frame 1: the first camera by name, its last frame"
+        );
+        assert_eq!(thumbnail(&r.dir, "nominal-00").unwrap().data, one);
+        std::fs::remove_dir_all(&p.root).ok();
     }
 
     #[test]

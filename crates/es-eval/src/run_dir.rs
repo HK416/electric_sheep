@@ -2,7 +2,8 @@
 //! on the other end (spec 23.3, spec 10.5; packet M7/E1, moved here from the editor by M12/Y4).
 //!
 //! A run is `report.json` plus, optionally, `events.json`, `traj/<cell>.estraj` and
-//! `frames/<cell>/NNNNNN.bin` — the files [`crate::runner`] writes. Only `report.json` is
+//! `frames/<cell>/NNNNNN.bin` (`frames/<cell>/<channel>/` per camera when there are several; the
+//! first is read) — the files [`crate::runner`] writes. Only `report.json` is
 //! required: a directory that holds it and nothing else opens, and [`RunDir::missing`] names
 //! what was not there — the run someone opens is often the one that did not finish writing.
 //!
@@ -393,7 +394,7 @@ impl RunDir {
     /// ([`crate::runner`]'s own directory shape). Nothing is cached: a filmstrip asks for
     /// eight of them and a 96x96 frame is 27 kB.
     pub fn frame(&self, cell: &str, index: usize) -> Option<Rgb8Image> {
-        let dir = self.frames_root.join(cell);
+        let dir = cell_dir(&self.frames_root, cell);
         let layout: FrameLayout = read_json(&dir.join("layout.json")).ok()?;
         let [rows, cols, chans] = layout.shape;
         let (rows, cols, chans) = (rows as usize, cols as usize, chans as usize);
@@ -538,7 +539,7 @@ fn build_rows(
                 metrics,
                 n_episodes,
                 has_traj: traj.contains(&name),
-                frames: count_frames(&frames_root.join(&name)),
+                frames: count_frames(&cell_dir(frames_root, &name)),
                 suite,
                 name,
             }
@@ -548,6 +549,20 @@ fn build_rows(
 
 fn count_frames(dir: &Path) -> usize {
     stems(dir, Some("bin")).len()
+}
+
+/// Where a cell's frames are: `<root>/<cell>` for one camera, and for several - each in
+/// `<cell>/<channel>/` (packet M15/N2) - the first camera's, by name, which is the Task IR's
+/// channel order (packet M17/R7).
+fn cell_dir(root: &Path, cell: &str) -> PathBuf {
+    let dir = root.join(cell);
+    if dir.join("layout.json").is_file() {
+        return dir;
+    }
+    (stems(&dir, None).into_iter())
+        .map(|camera| dir.join(camera))
+        .find(|d| d.join("layout.json").is_file())
+        .unwrap_or(dir)
 }
 
 /// The suite a cell belongs to: the longest suite name the report carries that the cell name
