@@ -16,7 +16,7 @@ use es_render::TriScene;
 use crate::model::project::Project;
 use crate::model::replay_view::load_scene;
 use crate::model::template::{load, templates_root, Method, Template};
-use crate::model::viewport::Shot;
+use crate::model::viewport::{Shot, Source};
 use crate::model::watch::source_of;
 
 /// Where the replay camera starts: the demo's showcase view (`es video showcase --eye`).
@@ -34,7 +34,7 @@ pub const SHOWCASE_CAMERA: Camera = Camera {
 #[derive(Debug)]
 pub struct ScenePreview {
     path: PathBuf,
-    scene: SceneDesc,
+    scene: std::sync::Arc<SceneDesc>,
     tris: TriScene,
 }
 
@@ -55,6 +55,7 @@ impl ScenePreview {
         let path = scene.to_path_buf();
         let scene = load_scene(scene).map_err(|e| e.to_string())?;
         let tris = TriScene::from_scene(&scene).map_err(|e| e.to_string())?;
+        let scene = scene.into();
         Ok(Self { path, scene, tris })
     }
 
@@ -66,6 +67,12 @@ impl ScenePreview {
             tick: 0,
             camera: *camera,
         }
+    }
+
+    /// The scene at its initial pose (no body moved), for a renderer that tessellates through
+    /// its own `SceneCache` (packet M16/H9).
+    pub fn source(&self) -> Source {
+        (self.scene.clone(), std::collections::BTreeMap::new())
     }
 
     /// The triangles at the initial pose, for the material look.

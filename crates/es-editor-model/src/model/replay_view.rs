@@ -15,7 +15,7 @@ use es_env::traj::Trajectory;
 use es_render::raster::{project_scene, Camera, Projected, RasterError};
 use es_render::TriScene;
 
-use crate::model::viewport::Shot;
+use crate::model::viewport::{Shot, Source};
 
 /// Everything that stops a replay from opening, each naming its file.
 #[derive(Debug)]
@@ -76,7 +76,7 @@ pub fn panel_height(replay: Option<&ReplayView>, available: f32) -> Option<f32> 
 pub struct ReplayView {
     /// The two files it was opened from, which the path tracer's `es render` reads again.
     paths: (std::path::PathBuf, std::path::PathBuf),
-    scene: SceneDesc,
+    scene: std::sync::Arc<SceneDesc>,
     traj: Trajectory,
     pub playing: bool,
     pub tick: usize,
@@ -98,7 +98,7 @@ impl ReplayView {
         })?;
         let view = Self {
             paths: (scene_path.to_path_buf(), traj_path.to_path_buf()),
-            scene,
+            scene: scene.into(),
             traj,
             playing: false,
             tick: 0,
@@ -131,15 +131,22 @@ impl ReplayView {
     /// The world triangles of `tick` -- the same call `es video showcase` renders, so the
     /// replay draws exactly the geometry the showcase does (packet M5/V9).
     pub fn scene_at(&self, tick: usize) -> Result<TriScene, ReplayError> {
+        let (_, poses) = self.source_at(tick);
+        TriScene::from_scene_with_poses(&self.scene, &poses).map_err(|e| ReplayError::Scene {
+            path: self.scene.name.clone(),
+            message: e.to_string(),
+        })
+    }
+
+    /// The scene and its body poses at `tick` (none past the end: the static scene), for a
+    /// renderer that tessellates through its own `SceneCache` (packet M16/H9).
+    pub fn source_at(&self, tick: usize) -> Source {
         let poses = if tick < self.ticks() {
             self.traj.poses(tick)
         } else {
             std::collections::BTreeMap::new()
         };
-        TriScene::from_scene_with_poses(&self.scene, &poses).map_err(|e| ReplayError::Scene {
-            path: self.scene.name.clone(),
-            message: e.to_string(),
-        })
+        (self.scene.clone(), poses)
     }
 
     /// The shown tick from `camera`, for the slower looks (packet M16/H8).

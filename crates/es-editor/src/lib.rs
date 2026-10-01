@@ -34,6 +34,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod gpu;
 pub mod ui;
 
 pub use es_editor_model::model;
