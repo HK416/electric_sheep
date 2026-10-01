@@ -424,6 +424,31 @@ fn clauses(
     }
 }
 
+/// A section's header, a heading with its hold slot (packet M18/K7): "It succeeds when all of
+/// these hold for [1 s]".
+fn header(
+    ui: &mut egui::Ui,
+    lang: Lang,
+    scene: &SceneDesc,
+    spec: &mut TaskSpec,
+    failure: bool,
+    refused: Option<&Refusal>,
+) {
+    let said = s::section(spec, failure);
+    let row = ui.horizontal_wrapped(|ui| {
+        ui.style_mut().override_text_style = Some(egui::TextStyle::Heading);
+        sentence(ui, lang, scene, &said)
+    });
+    if let Some((_, Slot::Number(v, _))) = row.inner {
+        s::set_hold(spec, failure, v);
+    }
+    if !said.slots.is_empty() {
+        row.response.on_hover_text(t(lang, "author.task.hold.hint"));
+    }
+    let section = if failure { "failure" } else { "success" };
+    reason(ui, lang, refused, &format!("{section}.hold_s"));
+}
+
 /// What starts where: the strength of the 🎲, each placement with its 🎲 toggle.
 fn start(
     ui: &mut egui::Ui,
@@ -667,9 +692,9 @@ fn panel(ui: &mut egui::Ui, lang: Lang, author: &mut Author) {
                 });
             });
             reason(ui, lang, refused, "robot");
-            ui.heading(t(lang, "author.task.success"));
+            header(ui, lang, &scene, spec, false, refused);
             clauses(ui, lang, &scene, spec, false, refused);
-            ui.heading(t(lang, "author.task.failure"));
+            header(ui, lang, &scene, spec, true, refused);
             clauses(ui, lang, &scene, spec, true, refused);
             ui.horizontal_wrapped(|ui| {
                 if let Some((_, Slot::Number(Some(v), _))) =

@@ -3,7 +3,10 @@
 //! trajectory's last row, is read back through the env's own lowering of every clause
 //! ([`eval_on_row`]) on the layout `MuJoCo` gives the scene ([`layout`]): no IR change, no hash
 //! change. A success clause explains the attempts that ended without it, a failure clause the
-//! attempts it ended; `es-editor` words them with G8's sentences and hands them to ⑤.
+//! attempts it ended; `es-editor` words them with G8's sentences and hands them to ⑤. When the
+//! success section holds for a while (packet M18/K7), an attempt that ended with every success
+//! clause true is explained by how long they had held: counted back from its end row, one row per
+//! control tick, with the same per-clause reading.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -45,6 +48,11 @@ pub struct Explanation {
     /// Some attempt was read on its last recorded row, the state before its last step: a run
     /// written before trajectories ended on the end state (review M17 F-7).
     pub before_end: bool,
+    /// The success section's `hold_s`, when it has one (packet M18/K7).
+    pub hold_s: Option<f64>,
+    /// With a hold: each failed attempt whose end row held every success clause, by cell, and for
+    /// how long they had held then, in seconds — less than `hold_s`, or it would have succeeded.
+    pub held: BTreeMap<String, f64>,
 }
 
 /// The failed attempts of `run` (`rows`) explained by the clauses of the specification at
@@ -64,11 +72,28 @@ pub fn explain(root: &Path, run: &RunDir, rows: &[EpisodeRow]) -> Option<Explana
     let (scene, _) = load_scene(&root.join(&spec.scene)).ok()?;
     let model = layout(&scene);
     let nodes: Vec<_> = clauses.iter().map(|&(_, _, node)| node).collect();
+    let success: Vec<_> = (clauses.iter())
+        .filter(|c| c.0 == TerminationKind::Success)
+        .map(|c| c.2)
+        .collect();
+    // The control ticks the env had counted toward the hold when an attempt ended: the rows in a
+    // row, back from its end row, on which every success clause holds. Row 0 is the reset state,
+    // which no control tick evaluated.
+    let held = |traj: &Trajectory, last: usize| {
+        let all = |row| {
+            let truth = eval_on_row(&task, &scene, &model, &success, traj, row);
+            truth.is_ok_and(|v| v.iter().all(|x| *x != 0.0))
+        };
+        (1..=last).rev().take_while(|r| all(*r)).count() as u32
+    };
     let at = |&(kind, index, _): &(TerminationKind, usize, _)| At {
         failure: kind == TerminationKind::Failure,
         index,
     };
-    let mut out = Explanation::default();
+    let mut out = Explanation {
+        hold_s: spec.success.hold_s,
+        ..Explanation::default()
+    };
     let mut counts = vec![0; clauses.len()];
     for row in rows.iter().filter(|r| r.termination != "success") {
         let Ok(traj) = Trajectory::read(&run.traj_path(&row.cell)) else {
@@ -94,6 +119,10 @@ pub fn explain(root: &Path, run: &RunDir, rows: &[EpisodeRow]) -> Option<Explana
             })
             .collect();
         why.sort_by_key(|a| !a.failure);
+        if out.hold_s.is_some() && why.iter().all(|a| a.failure) {
+            let ticks = held(&traj, last);
+            (out.held).insert(row.cell.clone(), f64::from(ticks) / spec.control_hz);
+        }
         out.cells.insert(row.cell.clone(), why);
     }
     for (c, &attempts) in clauses.iter().zip(&counts).filter(|(_, n)| **n > 0) {

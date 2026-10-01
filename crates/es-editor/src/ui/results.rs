@@ -142,16 +142,29 @@ fn missing(lang: Lang, root: &Path, r: &RunResults) -> Option<Missing> {
         };
         Some(fill(lang, key, &[&words(lang, &line.sentence)]))
     };
+    let mut lines: Vec<(String, u32)> = (e.lines.iter())
+        .filter_map(|l| Some((said(&l.at, "results.missing.not")?, l.attempts)))
+        .collect();
+    let mut tiles: std::collections::BTreeMap<_, _> = (e.cells.iter())
+        .filter_map(|(cell, why)| Some((cell.clone(), said(why.first()?, "results.missing.tile")?)))
+        .collect();
+    // Every success clause held at the end, but not for the section's hold (packet M18/K7).
+    if let (Some(hold), false) = (e.hold_s, e.held.is_empty()) {
+        let secs =
+            |v: f64| es_editor_scene::sentence::show(v, es_editor_scene::sentence::Unit::Seconds);
+        let longest = e.held.values().copied().fold(0.0, f64::max);
+        let line = fill(lang, "results.missing.held", &[&secs(longest), &secs(hold)]);
+        lines.push((line, e.held.len() as u32));
+        lines.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (cell, x) in &e.held {
+            let word = fill(lang, "results.missing.held_tile", &[&secs(*x)]);
+            tiles.entry(cell.clone()).or_insert(word);
+        }
+    }
     Some(Missing {
-        lines: (e.lines.iter())
-            .filter_map(|l| Some((said(&l.at, "results.missing.not")?, l.attempts)))
-            .collect(),
+        lines,
         failed: e.failed,
-        tiles: (e.cells.iter())
-            .filter_map(|(cell, why)| {
-                Some((cell.clone(), said(why.first()?, "results.missing.tile")?))
-            })
-            .collect(),
+        tiles,
         before_end: e.before_end,
     })
 }

@@ -52,6 +52,7 @@ pub const REQUIRED: &str = "author.task.required";
 pub const TICKS: &str = "author.task.ticks";
 pub const TOUCHES: &str = "author.task.touches";
 pub const NO_SUCCESS: &str = "author.task.no_success";
+pub const HOLD_TICKS: &str = "author.task.hold_ticks";
 
 /// The compiler's refusal in the editor's words. Its field is the clause's place and the key
 /// (`success[1].within_deg`, `timeout_s`, `observe.cameras`), as G3a names them.
@@ -69,6 +70,7 @@ pub(crate) fn refusal(e: SpecError) -> Refusal {
             };
             let key = match field.as_str() {
                 "timeout_s" => TICKS,
+                "hold_s" => HOLD_TICKS,
                 "relation" if reason.contains("touches") => TOUCHES,
                 "clauses" => NO_SUCCESS,
                 _ if reason.starts_with("required") => REQUIRED,
@@ -118,6 +120,8 @@ pub enum Field {
     Tilt,
     TiltMax,
     Timeout,
+    /// A section's `hold_s` (packet M18/K7).
+    Hold,
 }
 
 impl Field {
@@ -139,6 +143,7 @@ impl Field {
             Self::Tilt => "tilt",
             Self::TiltMax => "tilt_max_deg",
             Self::Timeout => "timeout_s",
+            Self::Hold => "hold_s",
         }
     }
 }
@@ -293,6 +298,47 @@ pub fn timeout(spec: &TaskSpec) -> Sentence {
             Slot::Number(Some(spec.timeout_s), Unit::Seconds),
         )],
         dice: false,
+    }
+}
+
+/// A section's header (packet M18/K7): "It succeeds when all of these hold for [1 s]", "It fails
+/// when one of these holds for [1 s]". An absent hold reads as 0 s, the tick they hold. A failure
+/// section that has no clauses reads "It fails as soon as one of these holds", with no slot: there
+/// is nothing to hold.
+pub fn section(spec: &TaskSpec, failure: bool) -> Sentence {
+    let held = if failure {
+        spec.failure.as_ref().map(|f| f.hold_s)
+    } else {
+        Some(spec.success.hold_s)
+    };
+    let (key, slots) = match held {
+        None => ("author.task.failure", vec![]),
+        Some(h) => (
+            if failure {
+                "author.task.failure_hold"
+            } else {
+                "author.task.success"
+            },
+            vec![(Field::Hold, Slot::Number(h, Unit::Seconds))],
+        ),
+    };
+    Sentence {
+        key,
+        slots,
+        dice: false,
+    }
+}
+
+/// Sets a section's hold; 0 s, or none, is the tick they hold and writes nothing, so the document
+/// is today's again. A failure section that is not there gets none.
+pub fn set_hold(spec: &mut TaskSpec, failure: bool, hold_s: Option<f64>) {
+    let hold_s = hold_s.filter(|h| *h != 0.0);
+    if failure {
+        if let Some(f) = spec.failure.as_mut() {
+            f.hold_s = hold_s;
+        }
+    } else {
+        spec.success.hold_s = hold_s;
     }
 }
 

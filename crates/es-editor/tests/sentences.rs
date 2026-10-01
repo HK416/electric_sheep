@@ -29,12 +29,16 @@ fn scene(rel: &str) -> SceneDesc {
     }
 }
 
-/// Every sentence of `spec`: success, failure, the time limit, the start.
+/// Every sentence of `spec`: success and failure, each under its header (packet M18/K7: an
+/// absent hold reads 0 s), the time limit, the start.
 fn sentences(lang: Lang, scene: &SceneDesc, spec: &TaskSpec) -> Vec<String> {
-    let failure = spec.failure.iter().flat_map(|f| &f.clauses);
-    let mut out: Vec<String> = (spec.success.clauses.iter().chain(failure))
-        .map(|c| words(lang, &s::clause(scene, c)))
-        .collect();
+    let mut out = Vec::new();
+    let success: Vec<_> = spec.success.clauses.iter().collect();
+    let failure: Vec<_> = spec.failure.iter().flat_map(|f| &f.clauses).collect();
+    for (header, clauses) in [(false, success), (true, failure)] {
+        out.push(words(lang, &s::section(spec, header)));
+        out.extend(clauses.iter().map(|c| words(lang, &s::clause(scene, c))));
+    }
     out.push(words(lang, &s::timeout(spec)));
     let items = spec.start.iter().flat_map(|st| &st.items);
     out.extend(items.map(|i| words(lang, &s::start_item(scene, i))));

@@ -1,12 +1,15 @@
 # The sentences ①'s task pane reads the two committed task specifications as, in English and in
 # Korean (packet M17/G8, oracle 1), pinned by crates/es-editor/tests/sentences.rs: success, then
-# failure, the time limit, and the start. A block is `[<specification> <language>]` and its lines.
+# failure, each under its header (packet M18/K7: an absent hold reads 0 s), the time limit, and
+# the start. A block is `[<specification> <language>]` and its lines.
 # Korean lives here, not in the test, because only documentation and string tables may hold it.
 # The Korean particles are the ones the noun before them takes (packet M17/R4, `ending` in
 # es-editor-model's i18n.rs).
 
 [tests/fixtures/estask/shadow_hand_repose.estask en]
+It succeeds when all of these hold for 0 s
 object is turned like target within 5.73°
+It fails when one of these holds for 0 s
 object is farther than 24 cm from (100, 86.7, 17.72) cm
 It fails if not done within 8 s
 The robot's joints start anywhere in 20 % of their range
@@ -17,7 +20,9 @@ object starts turned at random about the vertical, tilted 4.07°
 target starts turned at random about the vertical, tilted 4.07°
 
 [tests/fixtures/estask/shadow_hand_repose.estask ko]
+아래가 모두 0 s 동안 맞으면 성공
 object가 target과 5.73° 이내로 같은 방향이다
+아래 중 하나라도 0 s 동안 맞으면 실패
 object가 (100, 86.7, 17.72) cm에서 24 cm보다 멀다
 8 s 안에 끝나지 않으면 실패
 로봇 관절은 각 범위의 20 % 안 어디서든 시작한다
@@ -28,9 +33,11 @@ object는 세로축을 중심으로 아무렇게나 돌린 채 시작하고, 4.0
 target은 세로축을 중심으로 아무렇게나 돌린 채 시작하고, 4.07° 기울어 있다
 
 [tests/fixtures/estask/so101_views.estask en]
+It succeeds when all of these hold for 0 s
 cube.x is between 9 cm and 19 cm
 cube.x is still: slower than 5 cm/s
 gripper is above 48.7°
+It fails when one of these holds for 0 s
 cube.x is above 55 cm
 It fails if not done within 36 s
 shoulder_pan starts between 0° and 0°
@@ -44,9 +51,11 @@ cube.x starts between 21 cm and 27 cm 🎲
 cube.y starts between -3 cm and 5 cm 🎲
 
 [tests/fixtures/estask/so101_views.estask ko]
+아래가 모두 0 s 동안 맞으면 성공
 cube.x가 9 cm와 19 cm 사이에 있다
 cube.x가 멈춰 있다: 5 cm/s보다 느리다
 gripper가 48.7°보다 크다
+아래 중 하나라도 0 s 동안 맞으면 실패
 cube.x가 55 cm보다 크다
 36 s 안에 끝나지 않으면 실패
 shoulder_pan은 0°와 0° 사이에서 시작한다

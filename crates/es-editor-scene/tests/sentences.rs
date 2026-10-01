@@ -82,6 +82,13 @@ fn written_back(spec: &TaskSpec, scene: &es_assets::scene::SceneDesc) -> TaskSpe
             s::edit_item(item, field, slot);
         }
     }
+    for failure in [false, true] {
+        for (_, slot) in s::section(spec, failure).slots {
+            if let Slot::Number(v, _) = slot {
+                s::set_hold(&mut out, failure, v);
+            }
+        }
+    }
     s::set_bonus(&mut out, s::bonus(spec));
     s::set_strength(&mut out, s::strength(spec));
     s::set_look(&mut out, s::look(spec));
@@ -114,7 +121,30 @@ fn committed_specifications_round_trip_through_their_sentences() {
         let back = written_back(&spec, &desc);
         assert_eq!(back, spec, "{file}");
         assert_eq!(TaskSpec::from_toml(&back.to_toml().unwrap()).unwrap(), spec);
+        // Packet M18/K7: an absent hold reads as an empty slot, and a held section round-trips.
+        assert_eq!(
+            s::section(&spec, false).slots,
+            [(Field::Hold, Slot::Number(None, s::Unit::Seconds))]
+        );
+        let mut held = spec.clone();
+        held.success.hold_s = Some(1.0);
+        if let Some(f) = held.failure.as_mut() {
+            f.hold_s = Some(0.5);
+        }
+        assert_eq!(
+            s::section(&held, false).slots,
+            [(Field::Hold, Slot::Number(Some(1.0), s::Unit::Seconds))]
+        );
+        assert_eq!(written_back(&held, &desc), held, "{file} held");
     }
+    // A failure section that is not there has no hold to show.
+    let mut none =
+        TaskSpec::from_toml(&std::fs::read_to_string(repo().join(VIEWS_SPEC)).unwrap()).unwrap();
+    none.failure = None;
+    let header = s::section(&none, true);
+    assert_eq!((header.key, header.slots.len()), ("author.task.failure", 0));
+    s::set_hold(&mut none, true, Some(1.0));
+    assert!(none.failure.is_none());
 
     let text = std::fs::read_to_string(repo().join(HAND_SPEC)).unwrap();
     let hand = TaskSpec::from_toml(&text).unwrap();
@@ -232,6 +262,23 @@ fn every_edit_is_one_undo_step_that_compiles() {
         s::set_shaping(&mut sp.success.clauses[0], Some(Level::Low));
     });
     step(&mut m, s::add_item);
+    // Packet M18/K7: a section's hold, set and cleared again by 0 s.
+    let (task0, _) = hashes(&m);
+    step(&mut m, |sp, _| s::set_hold(sp, false, Some(1.0)));
+    step(&mut m, |sp, _| s::set_hold(sp, true, Some(0.5)));
+    let (task1, _) = hashes(&m);
+    assert_ne!(task0, task1, "a hold moves the task_hash");
+    let held = compile_task(&spec(&m), m.root()).unwrap();
+    let holds: Vec<_> = (held.graph.nodes.values())
+        .filter_map(|n| match n {
+            es_ir::task::TaskNode::Terminate { hold_ticks, .. } => Some(*hold_ticks),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(holds, [Some(60), Some(30), None], "at 60 Hz");
+    step(&mut m, |sp, _| s::set_hold(sp, false, Some(0.0)));
+    step(&mut m, |sp, _| s::set_hold(sp, true, None));
+    assert_eq!(hashes(&m).0, task0, "0 s is the document as it was");
     let _ = std::fs::remove_dir_all(m.root());
 }
 
@@ -270,7 +317,12 @@ fn refusals_name_the_clause_and_field_and_change_nothing() {
     assert!(vocab::subjects(&scene).iter().any(|x| x == "object.z"));
 
     let start = spec(&m);
-    let cases: [(&str, &str, Edit); 4] = [
+    let cases: [(&str, &str, Edit); 5] = [
+        (
+            "success.hold_s",
+            s::HOLD_TICKS,
+            Box::new(|sp: &mut TaskSpec| sp.success.hold_s = Some(0.01)),
+        ),
         (
             "success[0].within_deg",
             s::REQUIRED,
