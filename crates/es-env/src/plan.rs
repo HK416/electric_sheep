@@ -59,6 +59,9 @@ pub(crate) struct RewardTerm {
 pub(crate) struct ScalarPlan {
     pub rewards: Vec<RewardTerm>,
     pub terminations: Vec<(TerminationKind, Expr)>,
+    /// Each termination's `hold_ticks` (spec 6.3, packet M18/K7), in the same order: `None` fires
+    /// on the tick its predicate holds, `Some(n)` on the `n`-th consecutive one.
+    pub holds: Vec<Option<u32>>,
     /// Port name to state index. `BTreeMap` so filling it is deterministic (§3.4).
     pub bindings: BTreeMap<String, Source>,
 }
@@ -94,9 +97,10 @@ impl ScalarPlan {
                         expr: ctx.scalar_input(*id, "value", 0, "Reward")?,
                     });
                 }
-                TaskNode::Terminate { kind } => {
+                TaskNode::Terminate { kind, hold_ticks } => {
                     plan.terminations
                         .push((*kind, ctx.scalar_input(*id, "value", 0, "Terminate")?));
+                    plan.holds.push(*hold_ticks);
                 }
                 _ => {}
             }
@@ -1077,6 +1081,7 @@ Const(0.85) } }), (Failure, Compare { op: Gt, lhs: Port(\"qpos[6]\"), rhs: Const
             NodeId(6),
             TaskNode::Terminate {
                 kind: TerminationKind::Success,
+                hold_ticks: None,
             },
         );
         vector_into_compare
@@ -1203,6 +1208,7 @@ Const(0.85) } }), (Failure, Compare { op: Gt, lhs: Port(\"qpos[6]\"), rhs: Const
             },
             TaskNode::Terminate {
                 kind: TerminationKind::Success,
+                hold_ticks: None,
             },
             TaskNode::MathFn {
                 func: MathFunc::Sqrt,

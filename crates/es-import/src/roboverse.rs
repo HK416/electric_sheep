@@ -341,6 +341,7 @@ fn add_success_nodes(
         term_id,
         TaskNode::Terminate {
             kind: TerminationKind::Success,
+            hold_ticks: None,
         },
     );
     graph.connect(gate, gate_port, term_id, "value");
@@ -767,6 +768,7 @@ pub fn convert(task: &RoboVerseTask) -> Result<Converted, ConvertError> {
         timeout_id,
         TaskNode::Terminate {
             kind: TerminationKind::Timeout,
+            hold_ticks: None,
         },
     );
     graph.connect(over_id, "value", timeout_id, "value");

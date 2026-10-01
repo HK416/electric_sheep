@@ -225,6 +225,12 @@ pub enum TaskNode {
     },
     Terminate {
         kind: TerminationKind,
+        /// Spec 6.3 (packet M18/K7): the episode ends with `kind` only once the predicate has
+        /// held on each of the last `n` control ticks, counted per env by `es-env` and reset
+        /// with the episode. Absent is today's "the tick it holds", and hashes as absent; `0`
+        /// is `TASK-004`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        hold_ticks: Option<u32>,
     },
     Randomization {
         target: String,
@@ -610,7 +616,14 @@ impl IrNode for TaskNode {
                 wdbg(w, aggregation);
                 ty.canonical(w);
             }
-            Self::Terminate { kind } => wdbg(w, kind),
+            Self::Terminate { kind, hold_ticks } => {
+                wdbg(w, kind);
+                // Appended only when present: an absent hold is today's bytes, so no committed
+                // `task_hash` moves (spec 6.3, the `SensorRender::seed` rule).
+                if let Some(n) = hold_ticks {
+                    w.u32(*n);
+                }
+            }
             Self::Randomization {
                 target,
                 dist,

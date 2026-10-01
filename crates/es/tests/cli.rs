@@ -3664,7 +3664,8 @@ fn add_gripper_open_term(task: &mut es_ir::task::TaskIr) {
             matches!(
                 n,
                 TaskNode::Terminate {
-                    kind: TerminationKind::Success
+                    kind: TerminationKind::Success,
+                    ..
                 }
             )
         })
@@ -6643,6 +6644,7 @@ fn go1_task(scene: &es_assets::scene::SceneDesc, xml: &[u8]) -> TaskIr {
         NodeId(2),
         TaskNode::Terminate {
             kind: es_ir::task::TerminationKind::Timeout,
+            hold_ticks: None,
         },
     );
     graph.connect(NodeId(0), "value", NodeId(1), "a");
@@ -6672,6 +6674,7 @@ fn go1_task(scene: &es_assets::scene::SceneDesc, xml: &[u8]) -> TaskIr {
         NodeId(5),
         TaskNode::Terminate {
             kind: es_ir::task::TerminationKind::Failure,
+            hold_ticks: None,
         },
     );
     graph.connect(NodeId(3), "value", NodeId(4), "a");
@@ -13958,6 +13961,7 @@ fn reach_task() -> TaskIr {
         },
         TaskNode::Terminate {
             kind: TerminationKind::Success,
+            hold_ticks: None,
         },
         TaskNode::GetTime { since_reset: true },
         TaskNode::Compare {
@@ -13967,6 +13971,7 @@ fn reach_task() -> TaskIr {
         },
         TaskNode::Terminate {
             kind: TerminationKind::Timeout,
+            hold_ticks: None,
         },
     ];
     for (i, node) in nodes.into_iter().enumerate() {

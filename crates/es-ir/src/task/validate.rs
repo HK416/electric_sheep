@@ -70,6 +70,14 @@ impl TaskIr {
                             .at(*id),
                     );
                 }
+                TaskNode::Terminate {
+                    hold_ticks: Some(0),
+                    ..
+                } => diags.push(
+                    Diagnostic::new(codes::TASK_004, "Terminate holds for 0 control ticks")
+                        .at(*id)
+                        .with_hint("hold for at least 1 tick, or leave hold_ticks out"),
+                ),
                 TaskNode::Reward { ty, name, .. } => {
                     if let Err(d) = ty.check_policy_input() {
                         diags.push(d.at(*id).with_hint(format!(

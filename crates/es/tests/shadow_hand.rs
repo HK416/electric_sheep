@@ -436,6 +436,7 @@ fn task() -> TaskIr {
     b.link(dist, "value", fell, "a");
     let stop = b.add(TaskNode::Terminate {
         kind: TerminationKind::Failure,
+        hold_ticks: None,
     });
     b.link(fell, "value", stop, "value");
 
@@ -465,6 +466,7 @@ fn task() -> TaskIr {
     b.link(reached, "value", bonus, "value");
     let done = b.add(TaskNode::Terminate {
         kind: TerminationKind::Success,
+        hold_ticks: None,
     });
     b.link(reached, "value", done, "value");
     // s = sqrt(8 (1 - d)), then `1 / (s + 0.1)` as the sum of one clamped ramp per knot
@@ -528,6 +530,7 @@ fn task() -> TaskIr {
     b.link(time, "value", late, "a");
     let timeout = b.add(TaskNode::Terminate {
         kind: TerminationKind::Timeout,
+        hold_ticks: None,
     });
     b.link(late, "value", timeout, "value");
 

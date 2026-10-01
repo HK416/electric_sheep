@@ -581,6 +581,7 @@ mod tests {
             NodeId(10),
             TaskNode::Terminate {
                 kind: TerminationKind::Success,
+                hold_ticks: None,
             },
         );
         task.graph.connect(NodeId(0), "value", n, "a");

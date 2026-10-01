@@ -376,6 +376,7 @@ fn task_ir() -> TaskIr {
         NodeId(3),
         TaskNode::Terminate {
             kind: TerminationKind::Success,
+            hold_ticks: None,
         },
     );
     graph.insert(

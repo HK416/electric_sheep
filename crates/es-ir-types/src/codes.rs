@@ -48,6 +48,8 @@ pub const TASK_001: &str = "TASK-001";
 pub const TASK_002: &str = "TASK-002";
 /// A sensor declares `svgf` on the rasterizer (spec 6.3, packet M11/X6).
 pub const TASK_003: &str = "TASK-003";
+/// A `Terminate` holds for 0 control ticks (spec 6.3, packet M18/K7).
+pub const TASK_004: &str = "TASK-004";
 
 // --- Control graph / IR-C (spec 6.2) ------------------------------------------------------
 pub const CTRL_001: &str = "CTRL-001";
@@ -244,6 +246,7 @@ pub const CODES: &[CodeEntry] = &[
     e(TASK_001, Error, "ObservationSpec declaration and graph disagree", "7.4"),
     e(TASK_002, Error, "unsupported Task IR schema version", "6.1"),
     e(TASK_003, Error, "svgf is declared on a sensor that is not path traced", "6.3"),
+    e(TASK_004, Error, "Terminate holds for 0 control ticks", "6.3"),
     e(TYPE_001, Error, "element type mismatch", "5.4"),
     e(TYPE_002, Error, "shape mismatch", "5.4"),
     e(TYPE_003, Error, "unit mismatch", "5.4"),
@@ -339,6 +342,7 @@ mod tests {
             TASK_001,
             TASK_002,
             TASK_003,
+            TASK_004,
             CTRL_001,
             CTRL_002,
             CTRL_003,

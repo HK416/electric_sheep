@@ -294,6 +294,7 @@ fn example_task_node(kind: &str) -> Option<TaskNode> {
         },
         "Terminate" => TaskNode::Terminate {
             kind: TerminationKind::Timeout,
+            hold_ticks: None,
         },
         "Randomization" => TaskNode::Randomization {
             target: "target_0".to_owned(),

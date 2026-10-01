@@ -1298,6 +1298,7 @@ fn bundle_with_success() -> PolicyBundle {
         NodeId(5),
         TaskNode::Terminate {
             kind: TerminationKind::Success,
+            hold_ticks: None,
         },
     );
     g.connect(NodeId(0), "value", NodeId(4), "a");

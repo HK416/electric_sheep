@@ -98,6 +98,9 @@ pub struct Env<B: PhysicsBackend> {
     tick: PhysTick,
     episode: Vec<u64>,
     steps: Vec<u32>,
+    /// Per env, per `Terminate` of the plan: how many control ticks in a row its predicate has
+    /// held (spec 6.3 `hold_ticks`, packet M18/K7). `n_envs * terminations`, zeroed by `reset`.
+    held: Vec<u32>,
     health: Vec<EnvHealth>,
     /// Scratch, allocated once: reset state rows, the last control vector, and the port map.
     reset_qpos: Vec<f64>,
@@ -169,8 +172,10 @@ impl<B: PhysicsBackend> Env<B> {
             nsensordata: model.nsensordata as usize,
         };
         let envs = n_envs as usize;
+        let scalar = ScalarPlan::compile(task, scene, &model)?;
         let mut env = Self {
-            scalar: ScalarPlan::compile(task, scene, &model)?,
+            held: vec![0; envs * scalar.terminations.len()],
+            scalar,
             control: ControlExecutor::new(task, n_envs),
             randomization: RandomizationPlan::compile(task, scene, &model)?,
             sensors: image_sensors(task),
@@ -269,6 +274,8 @@ impl<B: PhysicsBackend> Env<B> {
         for env in &list {
             let i = *env as usize;
             self.steps[i] = 0;
+            let terms = self.scalar.terminations.len();
+            self.held[i * terms..(i + 1) * terms].fill(0);
             self.health[i] = EnvHealth::Ok;
             let (qpos, qvel) = (
                 &mut self.reset_qpos[i * nq..(i + 1) * nq],
@@ -495,11 +502,14 @@ impl<B: PhysicsBackend> Env<B> {
     /// whole-episode statement and wins over a stage transition.
     fn evaluate_env(&mut self, env: u32) -> Termination {
         self.bind_ports(env);
+        let terms = self.scalar.terminations.len();
+        let i = env as usize;
         let task_level = episode::evaluate(
             &self.scalar,
             &self.ports,
-            self.steps[env as usize],
+            self.steps[i],
             self.max_episode_steps,
+            &mut self.held[i * terms..(i + 1) * terms],
         );
         let Some(control) = self.control.as_mut() else {
             return task_level;
@@ -822,6 +832,7 @@ pub(crate) mod tests {
             },
             TaskNode::Terminate {
                 kind: TerminationKind::Failure,
+                hold_ticks: None,
             },
         ]);
         task.graph.connect(NodeId(0), "value", NodeId(1), "value");
@@ -1268,6 +1279,41 @@ pub(crate) mod tests {
         assert_eq!(ep.ctrl, vec![0.3], "with the ctrl that was applied to it");
     }
 
+    /// Packet M18/K7 oracle 1, through `Env`: `|angle| > 1.5` held for 3 control ticks. Before
+    /// each step the script puts each env at 3 rad (true after the step) or at rest at 0 (false).
+    /// Env 1 fires on its 3rd consecutive true tick and again 3 ticks after its reset, not on the
+    /// 4th, so the counter restarted with the episode; env 0 is broken by a false tick and fires
+    /// only on step 6, unmoved by env 1's ending beside it.
+    #[test]
+    fn a_held_termination_counts_per_env_and_restarts_with_the_episode() {
+        let mut task = pendulum_task(0, None);
+        task.graph.insert(
+            NodeId(4),
+            TaskNode::Terminate {
+                kind: TerminationKind::Failure,
+                hold_ticks: Some(3),
+            },
+        );
+        let mut env = env_of(&task, 2, 0);
+        let (nq, nv) = (env.model().nq as usize, env.model().nv as usize);
+        let script = [[true, true], [true, true], [false, true], [true, true]];
+        let script = script.iter().chain(&[[true, true]; 2]);
+        let mut ended = Vec::new();
+        for (step, truth) in script.enumerate() {
+            for (e, on) in truth.iter().enumerate() {
+                let b = env.backend_mut();
+                b.qpos[e * nq] = if *on { 3.0 } else { 0.0 };
+                b.qvel[e * nv] = 0.0;
+            }
+            let out = env.step(&[0.0, 0.0]).unwrap();
+            for ep in &out.episodes {
+                assert_eq!(ep.termination, Termination::Failure);
+                ended.push((step + 1, ep.env, ep.steps()));
+            }
+        }
+        assert_eq!(ended, [(3, 1, 3), (6, 0, 6), (6, 1, 3)]);
+    }
+
     #[test]
     fn a_time_source_reads_ticks_not_an_accumulated_float() {
         let mut task = pendulum_task(0, None);
@@ -1285,6 +1331,7 @@ pub(crate) mod tests {
             NodeId(9),
             TaskNode::Terminate {
                 kind: TerminationKind::Success,
+                hold_ticks: None,
             },
         );
         task.graph.connect(NodeId(7), "value", NodeId(8), "a");

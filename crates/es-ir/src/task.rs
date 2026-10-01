@@ -296,6 +296,7 @@ pub mod testing {
             &mut g,
             TaskNode::Terminate {
                 kind: TerminationKind::Timeout,
+                hold_ticks: None,
             },
         );
         g.connect(time, "value", over, "a");

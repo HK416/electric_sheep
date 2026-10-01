@@ -37,20 +37,34 @@ impl Termination {
     }
 }
 
-/// Evaluates the task's `Terminate` predicates, then the episode budget.
+/// Evaluates the task's `Terminate` predicates, then the episode budget, on one control tick.
 ///
 /// Predicates are taken in the order they were lowered (ascending `NodeId`, §6.4) and the first
-/// one that holds wins, so two predicates firing on the same tick resolve identically every
+/// one that fires wins, so two predicates firing on the same tick resolve identically every
 /// run. A predicate that cannot be evaluated (a missing port, a division by zero — `Expr::eval`
-/// returns `None` rather than a `NaN`) counts as "did not fire".
+/// returns `None` rather than a `NaN`) counts as "did not hold".
+///
+/// `held` is this env's counter per termination (packet M18/K7, spec 6.3): one more on a tick its
+/// predicate holds, zero on one it does not. A termination with `hold_ticks = n` fires when its
+/// counter reaches `n`; one without fires the tick it holds. The caller zeroes `held` with the
+/// episode. Integers only, no clock (§3.4).
 pub(crate) fn evaluate(
     plan: &ScalarPlan,
     ports: &BTreeMap<String, f64>,
     steps: u32,
     max_steps: u32,
+    held: &mut [u32],
 ) -> Termination {
-    for (kind, expr) in &plan.terminations {
-        if expr.eval(ports).is_some_and(|v| v != 0.0) {
+    for (k, (kind, expr)) in plan.terminations.iter().enumerate() {
+        let holds = expr.eval(ports).is_some_and(|v| v != 0.0);
+        let fired = match plan.holds.get(k).copied().flatten() {
+            None => holds,
+            Some(n) => {
+                held[k] = if holds { held[k].saturating_add(1) } else { 0 };
+                held[k] >= n
+            }
+        };
+        if fired {
             return Termination::of(*kind);
         }
     }
@@ -285,15 +299,61 @@ mod tests {
             ..ScalarPlan::default()
         };
         let ports = |v: f64| BTreeMap::from([("hit".to_owned(), v)]);
-        assert_eq!(evaluate(&plan, &ports(0.0), 3, 10), Termination::Running);
-        assert_eq!(evaluate(&plan, &ports(1.0), 3, 10), Termination::Success);
-        // Timeout only once no predicate fires.
-        assert_eq!(evaluate(&plan, &ports(0.0), 10, 10), Termination::Timeout);
-        assert_eq!(evaluate(&plan, &ports(1.0), 10, 10), Termination::Success);
-        // A missing port is "did not fire", not a panic and not a NaN.
+        let held = &mut [0];
         assert_eq!(
-            evaluate(&plan, &BTreeMap::new(), 0, 0),
+            evaluate(&plan, &ports(0.0), 3, 10, held),
             Termination::Running
         );
+        assert_eq!(
+            evaluate(&plan, &ports(1.0), 3, 10, held),
+            Termination::Success
+        );
+        // Timeout only once no predicate fires.
+        assert_eq!(
+            evaluate(&plan, &ports(0.0), 10, 10, held),
+            Termination::Timeout
+        );
+        assert_eq!(
+            evaluate(&plan, &ports(1.0), 10, 10, held),
+            Termination::Success
+        );
+        // A missing port is "did not fire", not a panic and not a NaN.
+        assert_eq!(
+            evaluate(&plan, &BTreeMap::new(), 0, 0, held),
+            Termination::Running
+        );
+        assert_eq!(held, &[0], "no hold, no count");
+    }
+
+    /// Packet M18/K7 oracle 1, on a scripted tick sequence: `hold_ticks = 3` fires exactly on the
+    /// third consecutive true tick, never earlier, restarts after a false tick, and a missing
+    /// port breaks the run as a false tick does. The timeout still ends a run that is counting.
+    #[test]
+    fn a_held_termination_fires_on_the_nth_consecutive_true_tick() {
+        let plan = ScalarPlan {
+            terminations: vec![(TerminationKind::Success, Expr::Port("hit".to_owned()))],
+            holds: vec![Some(3)],
+            ..ScalarPlan::default()
+        };
+        let tick = |v: Option<f64>, held: &mut [u32], steps| {
+            let ports = v.map_or_else(BTreeMap::new, |v| BTreeMap::from([("hit".to_owned(), v)]));
+            evaluate(&plan, &ports, steps, 100, held)
+        };
+        let (t, f) = (Some(1.0), Some(0.0));
+        let script = [t, t, f, t, None, t, t, t];
+        let mut held = [0];
+        let ended: Vec<Termination> = (script.iter().enumerate())
+            .map(|(i, v)| tick(*v, &mut held, i as u32 + 1))
+            .collect();
+        let r = Termination::Running;
+        assert_eq!(ended, [r, r, r, r, r, r, r, Termination::Success]);
+        assert_eq!(held, [3]);
+        // The caller zeroes the counter with the episode: the next one counts from nothing.
+        held = [0];
+        assert_eq!(tick(t, &mut held, 1), r);
+        // A run that is still counting at the budget times out.
+        let mut held = [1];
+        assert_eq!(tick(t, &mut held, 100), Termination::Timeout);
+        assert_eq!(held, [2]);
     }
 }
