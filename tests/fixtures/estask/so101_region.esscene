@@ -1,0 +1,48 @@
+# The SO-101 three-view scene with regions (plan G, packet G3c's oracle,
+# crates/es-script/tests/estask_scripted.rs): the demo file included as it is, a welded shelf,
+# and four sites for `inside` to name — over the bin on the world, on the shelf, rotated, and
+# riding on the cube.
+kind = "scene"
+schema = 1
+name = "so101_region"
+
+[physics]
+timestep = 0.005
+integrator = "implicitfast"
+cone = "elliptic"
+iterations = 10
+impratio = 10.0
+
+[[include]]
+name = "demo"
+source = "../mjcf/so101_pick_place_views.xml"
+
+# Welded to the world (no joint): a region on it stays put.
+[[body]]
+name = "shelf"
+pos = [0.0, 0.3, 0.1]
+
+# The bin's inside, from its floor plate up to twice its wall height.
+[[region]]
+name = "bin_area"
+pos = [0.14, -0.1, 0.05]
+size = [0.05, 0.05, 0.05]
+
+[[region]]
+name = "shelf_area"
+parent = "shelf"
+pos = [0.0, 0.0, 0.05]
+size = [0.1, 0.05, 0.05]
+
+# 45 degrees about z: refused, a region is a box along the world axes.
+[[region]]
+name = "tilted"
+pos = [0.3, 0.0, 0.05]
+quat = [0.0, 0.0, 0.3826834323650898, 0.9238795325112867]
+size = [0.05, 0.05, 0.05]
+
+# On the cube's free body: refused, a region is fixed in the world.
+[[region]]
+name = "on_cube"
+parent = "cube"
+size = [0.01, 0.01, 0.01]

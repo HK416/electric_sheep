@@ -305,9 +305,11 @@ impl<'a> Compiler<'a> {
         Some((body, field.to_owned()))
     }
 
-    /// A scalar subject as `GetJointState` reads it: a joint (a robot joint through the
-    /// robot's root body, as the robot's joint vector; any other through itself) or
-    /// `<body>.x`, the first coordinate of the body's free joint.
+    /// A scalar subject: a joint as `GetJointState` reads it (a robot joint through the
+    /// robot's root body, as the robot's joint vector; any other through itself), `<body>.x`
+    /// of a free body — its free joint's first lane, G3a's form — or any other
+    /// `<body>.x|y|z`, one lane of the body's world position or linear velocity
+    /// ([`Self::coordinate`]).
     fn scalar(
         &mut self,
         at: &str,
@@ -315,22 +317,26 @@ impl<'a> Compiler<'a> {
         quantity: JointQuantity,
     ) -> Result<NodeId, SpecError> {
         let (owner, joint) = if let Some((body, field)) = self.dotted(subject) {
-            if field != "x" {
+            let Some(axis) = ["x", "y", "z"].iter().position(|a| *a == field) else {
                 return refuse(
                     at,
                     "subject",
-                    format!(
-                        "`{subject}`: GetJointState reads a free joint's first lane, x; y and z \
-                         wait for Slice lowering in es-env"
-                    ),
+                    format!("`{subject}`: a body's coordinate is x, y or z"),
                 );
+            };
+            let scene = self.scene;
+            match scene
+                .joints
+                .iter()
+                .find(|j| j.body == body.id && j.kind == JointKind::Free)
+            {
+                Some(j) if axis == 0 => (j.id, j),
+                _ => return self.coordinate(at, body, axis as u64, quantity),
             }
-            let j = self.free_joint(at, "subject", body)?;
-            (j.id, j)
         } else {
             let scene = self.scene;
             let Some(j) = scene.joints.iter().find(|j| j.name == subject) else {
-                return refuse(at, "subject", no("joint or `<body>.x`", subject));
+                return refuse(at, "subject", no("joint or `<body>.x|y|z`", subject));
             };
             if !matches!(j.kind, JointKind::Hinge | JointKind::Slide) {
                 return refuse(
@@ -354,6 +360,102 @@ impl<'a> Compiler<'a> {
             body,
             relative_to: Frame::World,
         })
+    }
+
+    fn velocity(&mut self, body: StableId) -> NodeId {
+        self.source(TaskNode::GetBodyVelocity {
+            body,
+            relative_to: Frame::World,
+        })
+    }
+
+    /// Lane `axis` of a body's world position (`GetBodyPose.pos`, any body) or of its linear
+    /// velocity (`GetBodyVelocity.linear`, a free body: `es-env` reads it from the free
+    /// joint's `qvel`), by `Slice`.
+    fn coordinate(
+        &mut self,
+        at: &str,
+        body: &Body,
+        axis: u64,
+        quantity: JointQuantity,
+    ) -> Result<NodeId, SpecError> {
+        let from = if quantity == JointQuantity::Velocity {
+            self.free_joint(at, "subject", body)?;
+            (self.velocity(body.id), "linear")
+        } else {
+            (self.pose(body.id), "pos")
+        };
+        Ok(self.feed(from, "value", |ty| TaskNode::Slice {
+            ty,
+            axis: 0,
+            start: axis,
+            len: 1,
+        }))
+    }
+
+    /// `|value| < bound`, the L2 norm of a vector.
+    fn norm_below(&mut self, from: (NodeId, &str), bound: f64) -> NodeId {
+        let norm = self.feed(from, "value", |ty| TaskNode::Norm {
+            kind: NormKind::L2,
+            ty,
+        });
+        self.compare(norm, CmpOp::Lt, bound)
+    }
+
+    /// Region (site) `name` as `(lo, hi)` per world axis: the site's world position ± its
+    /// half-extents (`size`). The box is axis-aligned in the **world** frame: a cone takes a
+    /// world point only as `Compare`'s literal (the IR has no constant node to rotate a vector
+    /// by), and a region the editor writes is unrotated — so a rotated site, or one that moves
+    /// (a joint on its body or on an ancestor), is refused by name.
+    fn region(&self, at: &str, name: &str) -> Result<([f64; 3], [f64; 3]), SpecError> {
+        let scene = self.scene;
+        let Some((mut body, site)) = scene
+            .bodies
+            .iter()
+            .find_map(|b| b.sites.iter().find(|s| s.name == name).map(|s| (b, s)))
+        else {
+            return refuse(at, "object", no("region (site)", name));
+        };
+        let mut chain = vec![site.pose];
+        loop {
+            if let Some(j) = scene.joints.iter().find(|j| j.body == body.id) {
+                return refuse(
+                    at,
+                    "object",
+                    format!("region `{name}` moves with joint `{}`", j.name),
+                );
+            }
+            chain.push(body.pose);
+            let Some(parent) = body.parent else { break };
+            let Some(up) = scene.bodies.iter().find(|b| b.id == parent) else {
+                let why = format!("body `{}` names a parent the scene lacks", body.name);
+                return refuse(at, "object", why);
+            };
+            body = up;
+        }
+        if chain
+            .iter()
+            .any(|p| p.orientation != es_math::Quat::IDENTITY)
+        {
+            return refuse(
+                at,
+                "object",
+                format!("region `{name}` is rotated; a region is a box along the world axes"),
+            );
+        }
+        // From the world down, as the frames compose.
+        let c = chain.iter().rev().fold([0.0; 3], |c, p| {
+            [
+                c[0] + p.position.x,
+                c[1] + p.position.y,
+                c[2] + p.position.z,
+            ]
+        });
+        let h = [site.size.x, site.size.y, site.size.z];
+        Ok((
+            std::array::from_fn(|i| c[i] - h[i]),
+            std::array::from_fn(|i| c[i] + h[i]),
+        ))
     }
 
     // --- clauses --------------------------------------------------------------------------
@@ -431,6 +533,59 @@ impl<'a> Compiler<'a> {
                 .unwrap_or_else(|| format!("{}_{kind}", c.subject))
         };
         match c.relation {
+            // A body inside a region: each world axis of its position strictly inside the box.
+            Relation::Inside if c.object.is_some() => {
+                let (lo, hi) = self.region(at, c.object.as_deref().expect("matched"))?;
+                let body = self.body(at, "subject", &c.subject)?;
+                let mut acc = None;
+                for axis in 0..3 {
+                    let lane = self.coordinate(at, body, axis as u64, JointQuantity::Position)?;
+                    let (gt, lt) = (
+                        self.compare(lane, CmpOp::Gt, lo[axis]),
+                        self.compare(lane, CmpOp::Lt, hi[axis]),
+                    );
+                    let within = self.logic(LogicOp::And, gt, lt);
+                    acc = Some(acc.map_or(within, |prev| self.logic(LogicOp::And, prev, within)));
+                }
+                Ok(acc.expect("three axes"))
+            }
+            // A body above (below) another: the difference of their world heights beyond `m`.
+            Relation::Above | Relation::Below if c.object.is_some() => {
+                let subject = self.body(at, "subject", &c.subject)?;
+                let other = self.body(at, "object", c.object.as_deref().expect("matched"))?;
+                let z_s = self.coordinate(at, subject, 2, JointQuantity::Position)?;
+                let z_o = self.coordinate(at, other, 2, JointQuantity::Position)?;
+                let (hi, lo) = if c.relation == Relation::Above {
+                    (z_s, z_o)
+                } else {
+                    (z_o, z_s)
+                };
+                let ty = self.out((hi, "value"));
+                let node = TaskNode::Arith {
+                    op: ArithOp::Sub,
+                    ty,
+                };
+                let gap = self.pair((hi, "value"), (lo, "value"), node);
+                Ok(self.compare(gap, CmpOp::Gt, c.m.unwrap_or(0.0)))
+            }
+            // A body (not a joint, not `<body>.<axis>`): its speed `‖v‖`, and its angular rate
+            // when `angular` bounds it.
+            Relation::Still
+                if self.dotted(&c.subject).is_none()
+                    && !self.scene.joints.iter().any(|j| j.name == c.subject) =>
+            {
+                let body = self.body(at, "subject", &c.subject)?;
+                self.free_joint(at, "subject", body)?;
+                let vel = self.velocity(body.id);
+                let slow = self.norm_below((vel, "linear"), c.speed.expect("checked"));
+                Ok(match c.angular {
+                    Some(rate) => {
+                        let calm = self.norm_below((vel, "angular"), rate);
+                        self.logic(LogicOp::And, slow, calm)
+                    }
+                    None => slow,
+                })
+            }
             Relation::Inside => {
                 let [lo, hi] = c.range.expect("checked");
                 let x = self.scalar(at, &c.subject, JointQuantity::Position)?;
@@ -454,6 +609,13 @@ impl<'a> Compiler<'a> {
                 Ok(self.compare(x, op, c.value.expect("checked")))
             }
             Relation::Still => {
+                if c.angular.is_some() {
+                    return refuse(
+                        at,
+                        "angular",
+                        "a body's bound; the subject is one coordinate",
+                    );
+                }
                 let v = self.scalar(at, &c.subject, JointQuantity::Velocity)?;
                 let speed = c.speed.expect("checked");
                 let (a, b) = (
@@ -950,9 +1112,11 @@ fn value_or_range(at: &str, item: &StartItem, k: Option<f64>) -> Result<Distribu
 /// Which fields a relation takes, and which it needs.
 fn check_fields(at: &str, c: &Clause) -> Result<(), SpecError> {
     let (fields, needs, shaping): (&[&str], &[&str], Option<Shaping>) = match c.relation {
+        Relation::Inside if c.object.is_some() => (&["object"], &[], None),
         Relation::Inside => (&["range"], &["range"], Some(Shaping::Ramp)),
+        Relation::Above | Relation::Below if c.object.is_some() => (&["object", "m"], &[], None),
         Relation::Above | Relation::Below => (&["value"], &["value"], None),
-        Relation::Still => (&["speed"], &["speed"], None),
+        Relation::Still => (&["speed", "angular"], &["speed"], None),
         Relation::Near | Relation::FartherThan => {
             (&["object", "point", "m"], &["m"], Some(Shaping::Distance))
         }
@@ -970,6 +1134,7 @@ fn check_fields(at: &str, c: &Clause) -> Result<(), SpecError> {
         ("value", c.value.is_some()),
         ("m", c.m.is_some()),
         ("speed", c.speed.is_some()),
+        ("angular", c.angular.is_some()),
         ("within_deg", c.within_deg.is_some()),
         ("shaping", c.shaping.is_some()),
         ("weight", c.weight.is_some()),
@@ -977,6 +1142,16 @@ fn check_fields(at: &str, c: &Clause) -> Result<(), SpecError> {
         ("term", c.term.is_some()),
     ];
     let has = |f: &str| present.iter().any(|(n, p)| *p && *n == f);
+    // Where `inside`, `above` / `below` and `near` / `farther_than` measure from: one of two.
+    let either = match c.relation {
+        Relation::Inside => Some("range"),
+        Relation::Above | Relation::Below => Some("value"),
+        Relation::Near | Relation::FartherThan => Some("point"),
+        _ => None,
+    };
+    if let Some(alt) = either.filter(|alt| has("object") && has(alt)) {
+        return refuse(at, "object", format!("either `object` or `{alt}`"));
+    }
     let shaped: &[&str] = match (c.shaping, shaping) {
         (None, _) => &[],
         (Some(s), Some(t)) if s == t && s == Shaping::Ramp => {

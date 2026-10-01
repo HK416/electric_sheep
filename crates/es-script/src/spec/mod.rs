@@ -90,17 +90,18 @@ pub struct Clauses {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Relation {
-    /// A scalar inside `range`.
+    /// A scalar inside `range`, or a body inside the region (site) `object`, all three axes.
     Inside,
-    /// A scalar above `value`.
+    /// A scalar above `value`, or a body higher than the body `object` by more than `m`.
     Above,
-    /// A scalar below `value`.
+    /// A scalar below `value`, or a body lower than the body `object` by more than `m`.
     Below,
     /// A body within `m` of `object` or `point`.
     Near,
     /// A body farther than `m` from `object` or `point`.
     FartherThan,
-    /// A scalar's velocity within ±`speed`.
+    /// A scalar's velocity within ±`speed`, or a free body's speed under `speed` (and its
+    /// angular rate under `angular`).
     Still,
     /// A body's orientation within `within_deg` of `object`'s.
     OrientationMatches,
@@ -140,15 +141,18 @@ pub enum Shaping {
 
 /// One sentence: `subject relation [object | point | range | value ...]`.
 ///
-/// A **scalar** subject (`inside`, `above`, `below`, `still`) is a joint, or `<body>.x` — the
-/// first coordinate of the body's free joint, the one lane `GetJointState` reads. A **body**
-/// subject (`near`, `farther_than`, `orientation_matches`) is a body.
+/// A **scalar** subject (`inside` a `range`, `above` / `below` a `value`, `still`) is a joint, or
+/// `<body>.x|y|z` — a free body's `x` is its free joint's first lane, every other coordinate a
+/// lane of the body's world position (or velocity). A **body** subject (`near`,
+/// `farther_than`, `orientation_matches`, `inside` a region, `above` / `below` a body, `still`
+/// of a body that is not also a joint's name) is a body.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Clause {
     pub subject: String,
     pub relation: Relation,
-    /// The other body of `near`, `farther_than`, `orientation_matches`.
+    /// The other body of `near`, `farther_than`, `orientation_matches`, `above` / `below`; the
+    /// region (a site) of `inside`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<String>,
     /// A fixed world point in place of `object` (`near`, `farther_than`); offsets clamp at 1 m
@@ -161,12 +165,16 @@ pub struct Clause {
     /// `above` / `below`: the bound, exclusive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<f64>,
-    /// `near` / `farther_than`: the distance, exclusive.
+    /// `near` / `farther_than`: the distance, exclusive; `above` / `below` a body: the margin,
+    /// exclusive, absent 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub m: Option<f64>,
-    /// `still`: the velocity bound, exclusive, either way.
+    /// `still`: the velocity bound, exclusive, either way (a body: its speed `‖v‖`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub speed: Option<f64>,
+    /// `still` of a body: the bound on its angular rate `‖w‖`, rad/s, exclusive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub angular: Option<f64>,
     /// `orientation_matches`: the largest rotation between the two, in degrees, inclusive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub within_deg: Option<f64>,
