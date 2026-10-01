@@ -631,6 +631,8 @@ Forbidden direct ECS mutation, physics solver internals, blocking, GPU synchroni
 
 Forbidding is implemented not as "block it at runtime" but as **"there is no such node in the IR."**
 
+The scene reference's (`SceneRef { path, scene_hash, asset_hash }`) `path` names an MJCF or URDF file or a scene document `*.esscene` (§14.3, M17 plan G, G1). Either reads to the same `SceneDesc`, and `scene_hash` is that `SceneDesc`'s (§5.3). The `path` is hash input as before.
+
 ### 6.2 IR-D / IR-C Separation
 
 | | **IR-D (Dataflow)** | **IR-C (Control)** |
@@ -1736,6 +1738,8 @@ python train.py        ┘
 
 Everything can be run without an editor.
 
+The same principle holds for scenes. The scene document `*.esscene` (§14.3) is one more frontend beside the MJCF, URDF and glTF readers and produces the same `SceneDesc`, so `scene_hash` and the per-asset content hashes do not depend on the file format: a scene one MJCF file writes and a document that writes the same content and includes only the robot are the same `SceneDesc` with the same `scene_hash` (`crates/es-assets/tests/esscene.rs`, the SO-101 and Shadow Hand scenes). Asset path strings are hash input, so the two files must name the same files by the same strings.
+
 ### 14.2 Python Builder
 
 ```python
@@ -1808,6 +1812,8 @@ Task.save_bundle("tasks/pick_cube/", task, obs, lrn, dep)
 | `*.esgraph` | Graph editor storage (explicit nodes/edges, stable IDs) |
 | `*.eslayout` | Editor metadata sidecar. **Does not enter the IR** |
 | `bundle.eslock` | Hashes of the five IRs + pinned references |
+| `*.esscene` | Scene document (M17 plan G, G1): the scene a person edits. An authoring format read into `SceneDesc`, **not an IR**. A robot is a reference to its own file (MJCF, URDF, glTF) by `[[include]]` (a pose, an optional name prefix, `[include.set]` overrides addressed by its own names); everything else (bodies, geoms, materials, textures, cameras, lights, regions) is written in the document. Rotations are quaternions `[x, y, z, w]`. Read and written (the editor round-trips the document, not its expansion); an unknown key is refused by name. Schema: `docs/design/scene-authoring.md` §3 |
+| `*.estask` | Task specification (M17 plan G, G3): success, failure, start and observation sentences over the scene's objects and a fixed vocabulary of relations. **A recipe, not an IR**: `es project generate` compiles it with the scene into the five IR documents (§5.1 rule 6) |
 
 ### 14.4 External Conversion
 

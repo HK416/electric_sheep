@@ -1,0 +1,103 @@
+# The Shadow Hand reorientation scene as a scene document (plan G, packet G1): the hand (with
+# the source's floor) is included from shadow_hand.xml; the cube, the goal, their texture and
+# materials, the three cameras and the emitter are written here. It sits beside
+# shadow_hand_repose.xml because asset paths are hash input (spec 5.3): `textures/block.png` and
+# the hand's `meshes/*.stl` must name the same files by the same strings. It expands to the
+# SceneDesc shadow_hand_repose.xml reads to, with the same scene_hash
+# (crates/es-assets/tests/esscene.rs).
+kind = "scene"
+schema = 1
+name = "shadow_hand_repose"
+
+[physics]
+timestep = 0.008333333333333333
+integrator = "implicitfast"
+iterations = 20
+
+[[include]]
+name = "hand"
+source = "shadow_hand.xml"
+
+[[texture]]
+name = "texture:object"
+kind = "cube"
+colorspace = "linear"
+file = "textures/block.png"
+gridsize = [3, 4]
+gridlayout = ".U..LFRB.D.."
+
+[[material]]
+name = "material:object"
+texture = "texture:object"
+specular = 1.0
+shininess = 0.3
+
+[[material]]
+name = "material:target"
+texture = "texture:object"
+specular = 1.0
+shininess = 0.3
+rgba = [1.0, 1.0, 1.0, 0.5]
+
+# The cube the hand turns.
+[[body]]
+name = "object"
+pos = [1.0, 0.87, 0.2]
+joint = { kind = "free", name = "object:joint" }
+
+[[body.geom]]
+name = "object"
+shape = { box = [0.03, 0.03, 0.03] }
+condim = 4
+mass = 0.216
+friction = [1.0, 0.0, 0.0]
+material = "material:object"
+
+# The goal cube floats (gravcomp) beside the hand; the Task IR's reset sets its pose.
+[[body]]
+name = "target"
+pos = [1.12, 0.87, 0.2]
+gravcomp = 1.0
+joint = { kind = "free", name = "target:joint" }
+
+[[body.geom]]
+name = "target"
+shape = { box = [0.03, 0.03, 0.03] }
+contype = 0
+conaffinity = 0
+condim = 4
+material = "material:target"
+
+# Plan H's three cameras, fixed to the world (front and side: the source's `xyaxes` as the
+# quaternions SceneDesc stores).
+[[camera]]
+name = "top"
+pos = [1.04, 0.88, 0.56]
+fovy = 45.0
+
+[[camera]]
+name = "front"
+pos = [1.04, 0.52, 0.36]
+quat = [0.5113322683999748, 0.0, 0.0, 0.8593830992595421]
+fovy = 45.0
+
+[[camera]]
+name = "side"
+pos = [0.68, 0.72, 0.36]
+quat = [0.44588548386736987, -0.2897786360949244, -0.4614900074980309, 0.7100996059137015]
+fovy = 45.0
+
+[[light]]
+name = "ceiling"
+pos = [1.0, 0.95, 0.9]
+size = [0.6, 0.6]
+
+[[region]]
+name = "object:center"
+parent = "object"
+size = [0.01, 0.01, 0.01]
+
+[[region]]
+name = "target:center"
+parent = "target"
+size = [0.01, 0.01, 0.01]

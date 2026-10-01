@@ -632,6 +632,8 @@ ERROR TYPE-014  시간 정렬이 명시되지 않았습니다
 
 금지는 "런타임에 막는다"가 아니라 **"IR에 그런 노드가 없다"**로 구현한다.
 
+씬 참조(`SceneRef { path, scene_hash, asset_hash }`)의 `path`는 MJCF·URDF 파일이거나 씬 문서 `*.esscene`(§14.3, M17 plan G, G1)이다. 어느 쪽이든 같은 `SceneDesc`로 읽히고 `scene_hash`는 그 `SceneDesc`의 것이다(§5.3). `path`는 지금처럼 해시 입력이다.
+
 ### 6.2 IR-D / IR-C 분리
 
 | | **IR-D (Dataflow)** | **IR-C (Control)** |
@@ -1726,6 +1728,8 @@ python train.py        ┘
 
 에디터 없이 모든 것을 실행할 수 있다.
 
+씬에도 같은 원칙이 적용된다. 씬 문서 `*.esscene`(§14.3)은 MJCF·URDF·glTF 리더와 나란한 프론트엔드 하나로, 같은 `SceneDesc`를 만든다. 그러므로 `scene_hash`와 에셋별 내용 해시는 파일 포맷과 무관하다: MJCF 하나가 쓴 씬과, 같은 내용을 문서로 쓰고 로봇만 포함(include)한 씬은 같은 `SceneDesc`, 같은 `scene_hash`다(`crates/es-assets/tests/esscene.rs`, SO-101과 Shadow Hand 씬). 에셋 경로 문자열은 해시 입력이므로 두 파일이 같은 파일을 같은 문자열로 불러야 한다.
+
 ### 14.2 Python 빌더
 
 ```python
@@ -1798,6 +1802,8 @@ Task.save_bundle("tasks/pick_cube/", task, obs, lrn, dep)
 | `*.esgraph` | 그래프 에디터 저장 (명시적 노드·엣지, 안정 ID) |
 | `*.eslayout` | 편집기 메타데이터 사이드카. **IR에 들어가지 않는다** |
 | `bundle.eslock` | 다섯 IR의 해시 + 참조 고정 |
+| `*.esscene` | 씬 문서(M17 plan G, G1): 사람이 편집하는 씬. `SceneDesc`로 읽히는 저작 포맷이며 **IR이 아니다**. 로봇은 자기 파일(MJCF·URDF·glTF)을 `[[include]]`로 참조하고(자세, 선택적 이름 접두사, 자기 이름으로 지정하는 `[include.set]` 덮어쓰기), 나머지(바디·지오메트리·재질·텍스처·카메라·조명·영역)는 문서에 직접 쓴다. 회전은 쿼터니언 `[x, y, z, w]`. 읽기와 쓰기 모두 지원하며(에디터는 확장 결과가 아니라 문서를 왕복한다), 모르는 키는 이름을 대며 거부한다. 스키마: `docs/design/scene-authoring.md` §3 |
+| `*.estask` | 태스크 명세(M17 plan G, G3): 씬의 물체와 고정 어휘의 관계로 쓴 성공·실패·시작·관측 문장. **IR이 아닌 레시피**이며, `es project generate`가 씬과 함께 다섯 IR 문서로 컴파일한다(§5.1 규칙 6) |
 
 ### 14.4 외부 변환
 
