@@ -152,7 +152,7 @@ inference / training — have independent sizes and schedules (§5.2, §12).
 `es-physics-backend`/`-cpu`/`-gpu`(4) → `es-render`/`es-splat`(5) → `es-ir`(6) →
 `es-compile`(7) → `es-policy`/`es-safety`(8) → `es-env`(9) → `es-data`/`es-telemetry`/
 `es-eval`(10) → `es-ros2`/`es-py`/`es-script`/`es-transport`(11) → `es-editor-model`/
-`es-editor-scene`(12) → `es-editor`(13). Upper depends on lower only; no same-layer deps;
+`es-editor-scene`/`es-editor-graph`(12) → `es-editor`(13). Upper depends on lower only; no same-layer deps;
 nothing depends on `es-editor`, and nothing but `es-editor` on the layer-12 crates.
 
 ## Non-negotiable invariants (§4.2, §7.2, §9, App. D) — do not violate
