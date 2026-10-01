@@ -140,6 +140,12 @@ impl Gpu {
         self.validation
     }
 
+    /// Bytes of device memory the allocator holds right now, free sub-ranges included: what a
+    /// long-lived user (the editor's viewport, packet M16/H9) reports as its footprint.
+    pub fn memory_reserved(&self) -> u64 {
+        self.allocator.borrow().capacity()
+    }
+
     pub(crate) fn device(&self) -> &Device {
         &self.device
     }

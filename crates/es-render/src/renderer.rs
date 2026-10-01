@@ -365,6 +365,17 @@ impl<'gpu> Renderer<'gpu> {
         self.cfg.shading = from.shading;
     }
 
+    /// Starts the temporal history over, as a fresh renderer would (packet M16/H9): the next
+    /// [`Self::render`] is frame 0 with no valid history, so `K` frames from here are bit for
+    /// bit the `K` frames a new `Renderer` draws (`es render --accumulate K`). A moved camera
+    /// already drops its tile's history but keeps counting frames; a changed scene under a
+    /// still camera keeps whatever pixels still agree. A viewport that wants a clean start on
+    /// either calls this. The buffer is not re-zeroed: an invalid view overwrites every pixel.
+    pub fn restart_history(&mut self) {
+        self.prev_views.clear();
+        self.frame = 0;
+    }
+
     /// The seed the next [`Self::render`] will draw with.
     pub fn seed(&self) -> u32 {
         self.cfg.seed
