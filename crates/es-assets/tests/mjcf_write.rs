@@ -28,8 +28,12 @@ use es_math::units::DEG_TO_RAD;
 use es_math::{Inertia, Pose, Quat, Vec3};
 use proptest::prelude::*;
 
+fn root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures")
+}
+
 fn fixtures() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/mjcf")
+    root().join("mjcf")
 }
 
 fn xmls(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -100,20 +104,23 @@ fn round_trip(scene: &SceneDesc, tag: &str) -> Result<(SceneDesc, PathBuf), Stri
 /// The fixtures that do not round trip, and why. Everything else must.
 const EXPECTED: [(&str, &str); 3] = [
     // Parser tests of malformed `<default>` trees: they are refused before any scene exists.
-    ("default_cycle.xml", "not read"),
-    ("default_duplicate.xml", "not read"),
+    ("mjcf/default_cycle.xml", "not read"),
+    ("mjcf/default_duplicate.xml", "not read"),
     // A parser test of `<asset>` spellings whose files are not committed.
-    ("assets.xml", "not read"),
+    ("mjcf/assets.xml", "not read"),
 ];
 
 #[test]
 fn every_committed_mjcf_scene_round_trips() {
     let mut files = Vec::new();
     xmls(&fixtures(), &mut files);
+    // G1's robot part of the SO-101 scene document, and HT2's MJCF twin of a glTF box.
+    xmls(&root().join("esscene"), &mut files);
+    xmls(&root().join("gltf"), &mut files);
     let mut failures = Vec::new();
     for path in files {
         let rel = path
-            .strip_prefix(fixtures())
+            .strip_prefix(root())
             .unwrap()
             .to_string_lossy()
             .replace('\\', "/");
@@ -144,6 +151,39 @@ fn every_committed_mjcf_scene_round_trips() {
         );
     }
     assert_eq!(failures.len(), EXPECTED.len(), "{failures:#?}");
+}
+
+/// Plan G, G1's scene documents: the expansion exports and reads back as itself, and its
+/// `scene_hash` is the MJCF original's (`es scene export x.esscene` is this path).
+#[test]
+fn the_scene_documents_export_as_their_mjcf_originals() {
+    for (doc, original) in [
+        (
+            "../esscene/so101_pick_place.esscene",
+            "so101_pick_place.xml",
+        ),
+        (
+            "shadow_hand/shadow_hand_repose.esscene",
+            "shadow_hand/shadow_hand_repose.xml",
+        ),
+    ] {
+        let path = fixtures().join(doc);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed = es_assets::esscene::EsScene::from_toml(&text).unwrap();
+        let expanded = es_assets::esscene::expand(&parsed, path.parent().unwrap()).unwrap();
+        let (again, _) = round_trip(&expanded, "esscene").unwrap();
+        if let Some(d) = differs(&expanded, &again) {
+            panic!("{doc}: {d}");
+        }
+        let mjcf = fixtures().join(original);
+        let xml = std::fs::read_to_string(&mjcf).unwrap();
+        let reference = load(&xml, mjcf.parent().unwrap()).unwrap();
+        assert_eq!(again.scene_hash(), reference.scene_hash(), "{doc}");
+        println!(
+            "{doc}: round trips, scene_hash {}",
+            hex(&again.scene_hash())
+        );
+    }
 }
 
 fn hex(h: &[u8; 32]) -> String {

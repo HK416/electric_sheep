@@ -440,7 +440,7 @@ impl<'a> Writer<'a> {
         let safe = !path.is_empty()
             && Path::new(path)
                 .components()
-                .all(|c| matches!(c, Component::Normal(_)));
+                .all(|c| matches!(c, Component::Normal(_) | Component::CurDir));
         if safe {
             return path.to_owned();
         }
