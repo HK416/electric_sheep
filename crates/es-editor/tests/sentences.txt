@@ -1,0 +1,58 @@
+# The sentences ①'s task pane reads the two committed task specifications as, in English and in
+# Korean (packet M17/G8, oracle 1), pinned by crates/es-editor/tests/sentences.rs: success, then
+# failure, the time limit, and the start. A block is `[<specification> <language>]` and its lines.
+# Korean lives here, not in the test, because only documentation and string tables may hold it.
+
+[tests/fixtures/estask/shadow_hand_repose.estask en]
+object is turned like target within 5.73°
+object is farther than 24 cm from (100, 86.7, 17.72) cm
+It fails if not done within 8 s
+The robot's joints start anywhere in 20 % of their range
+object.x starts at 100 cm ± 1 cm
+object.y starts at 86.7 cm ± 1 cm
+object.z starts at 17.72 cm ± 0 cm
+object starts turned at random about the vertical, tilted 4.07°
+target starts turned at random about the vertical, tilted 4.07°
+
+[tests/fixtures/estask/shadow_hand_repose.estask ko]
+object이(가) target와(과) 5.73° 안으로 같은 방향이다
+object이(가) (100, 86.7, 17.72) cm에서 24 cm보다 멀다
+8 s 안에 끝나지 않으면 실패
+로봇 관절은 각 범위의 20 % 안 어디서든 시작한다
+object.x은(는) 100 cm ± 1 cm에서 시작한다
+object.y은(는) 86.7 cm ± 1 cm에서 시작한다
+object.z은(는) 17.72 cm ± 0 cm에서 시작한다
+object은(는) 세로축으로 아무렇게나 돌려 시작하고, 4.07° 기울어 있다
+target은(는) 세로축으로 아무렇게나 돌려 시작하고, 4.07° 기울어 있다
+
+[tests/fixtures/estask/so101_views.estask en]
+cube.x is between 9 cm and 19 cm
+cube.x is still: slower than 5 cm/s
+gripper is above 48.7°
+cube.x is above 55 cm
+It fails if not done within 36 s
+shoulder_pan starts between 0° and 0°
+shoulder_lift starts between 0° and 0°
+elbow_flex starts between 0° and 0°
+wrist_flex starts between 0° and 0°
+wrist_roll starts between 0° and 0°
+gripper starts between 0° and 0°
+cube.z starts between 2 cm and 2 cm
+cube.x starts between 21 cm and 27 cm 🎲
+cube.y starts between -3 cm and 5 cm 🎲
+
+[tests/fixtures/estask/so101_views.estask ko]
+cube.x이(가) 9 cm와 19 cm 사이에 있다
+cube.x이(가) 멈춰 있다: 5 cm/s보다 느리다
+gripper이(가) 48.7°보다 크다
+cube.x이(가) 55 cm보다 크다
+36 s 안에 끝나지 않으면 실패
+shoulder_pan은(는) 0°와 0° 사이에서 시작한다
+shoulder_lift은(는) 0°와 0° 사이에서 시작한다
+elbow_flex은(는) 0°와 0° 사이에서 시작한다
+wrist_flex은(는) 0°와 0° 사이에서 시작한다
+wrist_roll은(는) 0°와 0° 사이에서 시작한다
+gripper은(는) 0°와 0° 사이에서 시작한다
+cube.z은(는) 2 cm와 2 cm 사이에서 시작한다
+cube.x은(는) 21 cm와 27 cm 사이에서 시작한다 🎲
+cube.y은(는) -3 cm와 5 cm 사이에서 시작한다 🎲

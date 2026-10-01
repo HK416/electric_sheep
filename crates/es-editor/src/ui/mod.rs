@@ -7,6 +7,7 @@
 //! [`author`] is ① of an editable project: hierarchy, inspector, undo and save (packet M17/G5),
 //! picking and move / turn / size handles over the viewport (M17/G6).
 //! [`corner`] is the policy camera's view in ①'s viewport corner (packet M17/G6).
+//! [`sentence`] is ①'s task as sentences, beside the inspector (packet M17/G8).
 //! [`teach`] is ②, the demonstration program as blocks, edited and tried once (packet M14/Q4).
 //! [`teacher`] is ② for a template taught by a trained teacher policy (packet M16/H7).
 //! [`player`] plays one attempt of an evaluation, for ⑤ and for ③'s checks (packet M13/Z5a).
@@ -22,6 +23,7 @@ pub mod home;
 pub mod player;
 pub mod results;
 pub mod scene;
+pub mod sentence;
 pub mod shell;
 pub mod teach;
 pub mod teacher;

@@ -1,7 +1,7 @@
 //! `es-editor [project-dir|bundle.esb|run-dir] [--attach <addr> [--token <t>]] [--step <1-5>]
 //! [--viewport fast|material|pt] [--fps | --orbit-demo] [--physics-preview]
-//! [--edit-demo copy|select|edit|undo|drag|corner|add-menu|add-box|add-robot]` — the editor
-//! shell of spec 23.
+//! [--edit-demo copy|select|edit|undo|drag|corner|add-menu|add-box|add-robot|sentences|refuse|
+//! new-task]` — the editor shell of spec 23.
 //!
 //! `--fps` prints each viewport's frames per second on stderr; `--orbit-demo` also turns every
 //! viewport's camera a little each frame (packet M16/H9's measurement and captures). Both keep
@@ -11,7 +11,9 @@
 //! recolour it and undo that, up to the stage named (packet M17/G5's captures); `drag` holds the
 //! cube's move handle mid-drag and `corner` lets it go and selects the front camera (packet
 //! M17/G6's); `add-menu|add-box|add-robot` open ①'s Add menu, add a box and add the library's
-//! first robot (packet M17/G7's); it too keeps the session's state in the temp directory.
+//! first robot (packet M17/G7's); `sentences`, `refuse` and `new-task` show the task as
+//! sentences, a refused edit and a task said on a project with none (packet M17/G8's,
+//! `ui::sentence::demo`); it too keeps the session's state in the temp directory.
 //!
 //! `es-editor --import <project-dir> --template <id> ...` makes a project of runs that ran
 //! outside the editor and opens it; the grammar is [`es_editor::model::import`]'s (packet

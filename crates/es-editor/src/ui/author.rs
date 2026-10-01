@@ -122,9 +122,11 @@ pub(crate) struct Author {
     corner: Corner,
     /// The template's bundle (Task IR, Observation IR): the corner's cameras while the project
     /// has no task specification of its own (it trains on the template's documents until G9).
-    bundle: Option<[PathBuf; 2]>,
+    pub(crate) bundle: Option<[PathBuf; 2]>,
     /// The Add menu's and the overrides' state (packet M17/G7).
     add: add::State,
+    /// The task as sentences (packet M17/G8).
+    pub(crate) task: crate::ui::sentence::Task,
 }
 
 fn fold_key(row: &es_editor_scene::Row) -> String {
@@ -160,6 +162,7 @@ impl Author {
             corner: Corner::default(),
             bundle,
             add: add::State::default(),
+            task: crate::ui::sentence::Task::default(),
         })
     }
 
@@ -191,7 +194,7 @@ impl Author {
     /// then shows (packet M17/G6's captures).
     /// The Add menu's stages (packet M17/G7) are [`Self::add_demo`]'s.
     pub(crate) fn demo(&mut self, stage: &str, camera: &Camera) {
-        if self.add_demo(stage, camera) {
+        if self.add_demo(stage, camera) || crate::ui::sentence::demo(self, stage) {
             return;
         }
         let doc = self.model.doc();

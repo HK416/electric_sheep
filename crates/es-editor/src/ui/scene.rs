@@ -73,7 +73,8 @@ pub fn preview_at_start(ctx: &egui::Context) {
 /// each stage after the ones before it (packet M17/G5's captures). `drag` holds the cube's move
 /// handle mid-drag; `corner` lets it go and selects the front camera (packet M17/G6's).
 /// `add-menu`, `add-box` and `add-robot` open the Add menu, add a box and add the library's
-/// first robot where the view looks (packet M17/G7's).
+/// first robot where the view looks (packet M17/G7's). `sentences`, `refuse` and `new-task` are
+/// the task's (packet M17/G8's, `sentence::demo`).
 pub fn edit_demo(ctx: &egui::Context, stage: String) {
     ctx.data_mut(|d| d.insert_temp(demo_id(), stage));
 }
@@ -302,7 +303,8 @@ fn editable(
                 scene_canvas(ui, lang, size, posed, camera, picture, Some(&mut overlay));
             }
         }
-        _ => author.inspector(ui, lang),
+        // The inspector, or the task as sentences (packet M17/G8).
+        _ => crate::ui::sentence::summary(ui, lang, author),
     }
 }
 
