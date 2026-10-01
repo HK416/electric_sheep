@@ -343,3 +343,89 @@ editor reads (the vocabulary, a clause's words) that changes no compiled byte, t
 G7 and G8 run in parallel, each in new files. Where both must touch a shared file (`lib.rs`,
 `author.rs`, the i18n tables), each keeps its hook small and its keys in a block of its own. The
 orchestrator rebases the second onto the first.
+
+**G7 as merged (2026-10-01):** ①'s Add menu (objects, fixed objects, STL / OBJ meshes, library
+and file robots, cameras, lights, regions) places a new thing where the view's centre ray meets
+the scene. Imports go to `assets/<blake3>…`. Camera and region markers are picked on screen, and
+`[include.set]` has an inspector. `templates/robots.toml` holds the library, and
+`tests/fixtures/esscene/empty.esscene` is the empty scene. Meshes have no scale yet (an STL in
+millimetres comes in 1000× too large). Design note section 5.3 records the rest.
+
+**G8 as merged (2026-10-01):** the specification reads as sentences in ①'s Task tab, and
+`Command::Spec` replaces it. After every command `SceneModel` compiles the specification, so a
+scene edit that would break a sentence is refused. The vocabulary is the compiler's table
+(`es-script`'s `spec/vocab.rs`, no compiled byte moved). The weight levels are 0.1 / 1 / 10, the
+bonus 25 / 100 / 250, and the strength 0.5 / absent / 1.5; these are the owner's to change. The
+camera check found that SO-101's overhead camera does not see the cube's centre at the home pose
+(the lower arm is in the way). Design note section 4.6 records the rest. Wave 4's CI passed on
+5cc21fe.
+
+### Task G9: an authored project runs end to end
+
+**Files:**
+- `crates/es-editor-model` (the start screen's card, an authored project's documents, the
+  working directory of the `es` it launches);
+- `crates/es-editor-scene` (the defaults "say the task" writes, the paths of the generated
+  documents, save as template);
+- `crates/es-editor/src/ui/**`;
+- `crates/es-script/src/spec/**`, only if `generate` needs an option; no committed
+  specification's output may move;
+- `templates/empty.toml` (new), i18n, and the design note's section 5.4 (+ko).
+
+- **The empty project.**
+  - The start screen gets an "empty project" card beside the templates. It makes an editable
+    project from `tests/fixtures/esscene/empty.esscene`, with no specification.
+  - Either the template's bundle becomes optional (`templates/empty.toml` with `[editable]` and
+    no bundle), or the empty project is a project kind of its own. The packet chooses and records
+    the choice.
+  - ① works fully. Until there is a specification and its documents are generated, ② to ⑤ say in
+    words what is missing.
+- **② to ⑤ run the generated documents.** An editable project qualifies when its specification
+  compiles and `generated/` holds a `Regen::Written` set from the saved documents. Every step then
+  uses the generated documents instead of the template's: the bundle, the teacher (its recipe and
+  bundle), the cycle and the evaluations.
+  - **Paths.** Generated documents name `scene.esscene` relative to the project root, and recipes
+  derive their paths from `runs`. So every `es` the editor launches for such a project either runs
+  with the project root as its working directory, or gets absolute paths. Choose one and say why.
+  - **Bundles** are built by the `es policy init` line in each recipe's header.
+  - **Stale or failed generation.** If the documents differ from the saved ones, or the result is
+    `Regen::Failed`, ③ is blocked with the reason and ① offers "save and generate".
+  - **Template projects** keep running the template's documents exactly as before.
+- **The teacher for generated tasks (②).**
+  - "Say the task" also writes `[teacher]`, `[student]` and `[cycle]` defaults, so `generate`
+    writes the full set:
+    - `[teacher]`: every `[observe] state` and `privileged` channel, and the PPO preset;
+    - `[student]`: the observed cameras as its views;
+    - `[cycle]`: as G3b defaults it.
+  - ② offers the teacher trained by reward for every project with a `[teacher]`. This is plan H's
+    card (H7) generalized from the Shadow Hand template, and it needs `mjwarp`, as the hand's does.
+- **Save as template.** Any editable project can be saved as a template. The template is written
+  under the person's documents, not the repository, and the start screen lists it beside the
+  built-in ones. It holds:
+  - the scene document;
+  - `assets/`, copied whole (a glTF's `.bin` is not in the scene's asset list);
+  - the specification;
+  - a template file whose `[editable]` names them.
+
+  A project made from it has the source project's `scene_hash`.
+- **Oracles** (headless unless noted):
+  1. **End to end.** An empty project gets the library's SO-101, a box, a region, "say the task"
+     and "[box] is inside [region]", then a save. That gives `Regen::Written` with the full set. As
+     the editor would launch them:
+     - every generated document passes `es ir check`;
+     - every recipe's `es policy init` line builds its bundle;
+     - `es loop cycle --dry-run` on the generated cycle passes.
+  2. **Argvs.** The argvs the editor builds for ② to ⑤ on that project name the generated
+     documents (pinned). A template project's argvs are unchanged (pinned).
+  3. **Blocking.** A stale or failed generation blocks ③ with its reason, and saving clears the
+     block.
+  4. **Template round trip.** Save as template, then make a new project from it. The `scene_hash`
+     is equal, the specification is equal, and the generated documents' hashes are equal.
+  5. **Screenshots:** the start screen with the empty card; ② of an authored project with the
+     teacher card; ③ ready on generated documents.
+- **Not in this packet:**
+  - a learning run (the orchestrator's GV runs one);
+  - ⑤ explaining a failure by its missing clause, the owner's approved S4 direction. That needs
+    per-clause truth at each attempt's end, a design item of its own.
+- **Line budget:** `es-editor-model` is at 8,969 of 10,000 code lines. G9 must not take it past
+  9,600. If it would, stop and report: a split packet comes first.
