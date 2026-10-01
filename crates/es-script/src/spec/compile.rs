@@ -571,11 +571,14 @@ impl<'a> Compiler<'a> {
                 let gap = self.pair((hi, "value"), (lo, "value"), node);
                 Ok(self.compare(gap, CmpOp::Gt, c.m.unwrap_or(0.0)))
             }
-            // A body (not a joint, not `<body>.<axis>`): its speed `‖v‖`, and its angular rate
-            // when `angular` bounds it.
+            // A body (not a hinge or slide joint, not `<body>.<axis>`): its speed `‖v‖`, and its
+            // angular rate when `angular` bounds it. A free joint named as its body (an
+            // unnamed one, packet M17/G9) is that body's, as `vocab::relations` reads it.
             Relation::Still
                 if self.dotted(&c.subject).is_none()
-                    && !self.scene.joints.iter().any(|j| j.name == c.subject) =>
+                    && !(self.scene.joints.iter()).any(|j| {
+                        j.name == c.subject && matches!(j.kind, JointKind::Hinge | JointKind::Slide)
+                    }) =>
             {
                 let body = self.body(at, "subject", &c.subject)?;
                 self.free_joint(at, "subject", body)?;
