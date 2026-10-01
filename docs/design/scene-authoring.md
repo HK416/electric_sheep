@@ -578,6 +578,56 @@ validated and each arm passes the cross-IR check before anything is written.
   replay loader reads `.esscene` too.
 - **Until G9**, ② to ⑤ still run the template's documents; ① says so.
 
+### 5.2 What G6 settled (picking, handles, the corner view)
+
+`crates/es-editor-scene/src/{view,gizmo,policy}.rs` decide; `crates/es-editor/src/ui/author.rs`
+(the overlay), `ui/corner.rs` and `gpu.rs` (`Sensor`) draw; oracles
+`crates/es-editor-scene/tests/viewport.rs`.
+
+- **Picking is the segmentation channel at the clicked point, read on the CPU.** The ray the
+  renderer casts through the point (`es_render::cpu::primary_dir`, in `f64`) meets the drawn
+  scene's triangles under the renderer's own nearest-hit rule (`nearest_hit_flat`), and the hit
+  triangle's segmentation id is the geom. No readback and no `es-render` change: the viewport
+  draws `Rgb8` only, a click is one ray rather than a second channel per frame, and the answer is
+  testable on scripted rays. A body's geom selects the body; anything an include brings selects
+  the include (which has only its own pose to edit; its parts stay read-only); a document world
+  geom is scenery; a light's panel is the light. Cameras and regions draw nothing, so the
+  hierarchy selects them. What is hidden is not hit, so the ray goes on behind it; empty space
+  selects nothing.
+- **Handles.** Move and turn work in the frame the document writes the place in (the parent's;
+  the world's for most things), through the thing's own origin, so a move changes exactly one
+  coordinate of `pos` and a turn is `dq · q` in that frame. Size works in the shape's own frame:
+  a geom, static scenery, a region, a light, and a body with exactly one geom (its geom). A mesh,
+  a camera, an include and a body of several geoms have no size handles. A handle is 15 % of its
+  distance from the eye long, so it keeps its size on screen. W, E, R pick the tool; F frames.
+- **Snapping** (on by default, one checkbox) rounds in the document's units: the moved coordinate
+  to a whole centimetre (`(v · 100).round() / 100`, so the document writes `1.05`), the drag's
+  turn to a multiple of 15°, a size's whole extent (the inspector's width, height or diameter)
+  to a whole centimetre, at least 1 cm. The turn is measured with `es_math::approx`'s `acos_f64`
+  (the inspector's `atan2`) and written with its `sin_cos_f64`, so what a drag writes does not
+  depend on the host's `libm`.
+- **A drag is one command.** While a handle is held the document does not change: the viewport
+  draws the selection's tint where the drag puts it, the handles there, and how far it has gone
+  (`+5.0 cm`, `+30°`, `6.0 → 9.0 cm`). Letting go applies one `SetPose` (move, turn) or one
+  `Set` (size), which is one undo step; a drag that snaps back to where it started makes none.
+- **Selection** is a translucent tint over the selection's drawn triangles, drawn over the
+  picture (an x-ray, not depth tested). **Frame-selected** keeps the camera's direction and puts
+  the sphere about what the selection draws (10 cm at its place when it draws nothing) in the
+  middle of the picture, filling most of its height.
+- **The corner** shows a camera the policy is given. An editable project with a task
+  specification: the student's `views`, else `[observe] cameras`, compiled by `compile_task` on
+  the scene as edited (`.preview.esscene` when unsaved). A template, and an editable copy with no
+  specification: the cameras the bundle's Observation IR reads (`ImageInput` sensors, node
+  order), as the bundle's Task IR declares them. The selected camera when the policy sees it,
+  else the first. Measured: the Shadow Hand copy's three corner cameras are declared exactly as
+  `task-repose.toml`'s channels (96 × 96, `Pt` 32 spp, 3 bounces, exposure 8, a seed per tick).
+- **The corner's frame** is drawn in process by the viewport's worker (H9) through `es-env`'s
+  own single-camera steps — `sensor_cfg`, `drawn_frame` with no draws, the `Tick` stream's seed
+  for tick 0, one render, one readback — so it is the observation of the scene at its own pose
+  (not a reset draw), at the declared size and path, once per scene revision and camera, shown
+  with nearest filtering. `es-editor` takes `es-env` with its `render` feature for it. Without a
+  device the corner says so: `es render` draws only a free camera, so it is no fallback here.
+
 ## 6. Where the code goes (layers, §4.2)
 
 | What | Crate (layer) |
@@ -585,7 +635,7 @@ validated and each arm passes the cross-IR check before anything is written.
 | `.esscene` reader and writer, include expansion, full MJCF exporter | `es-assets` (2) |
 | task-spec compiler and `es project generate`'s core (pure: scene + spec → documents) | `es-script` (11), the authoring crate; `es-editor-scene` calls it directly |
 | `es scene export / simulate`, `es render`, `es project generate` CLI | `es` |
-| scene model, commands, undo, checks (G5), sentence editor model (G8) | `es-editor-scene` (12) |
+| scene model, commands, undo, checks (G5), picking, handle and corner decisions (G6), sentence editor model (G8) | `es-editor-scene` (12) |
 | hierarchy, inspector widgets, gizmos | `es-editor` (13) |
 
 No new extension point (INV-17). `es-editor-model` is over its line target (8,942 of 10,000), so
