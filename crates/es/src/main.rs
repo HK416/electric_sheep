@@ -38,6 +38,7 @@ USAGE:
     es bench [--memory-report --obs <obs.toml> ...]
     es render --scene <file.xml|urdf> --eye X,Y,Z --look-at X,Y,Z --out <file.ppm|-> [OPTIONS]
     es scene export <file.xml|urdf|esscene> --mjcf <out.xml>
+    es project generate --spec <task.estask> --out <dir> [--scene <scene>]
     es video mosaic --frames <dir> --events <events.json> --report <report.json>
                     --grid RxC --out <dir> [--label-height N]
 
@@ -69,6 +70,7 @@ fn dispatch(args: &[String]) -> Result<u8, CliError> {
         Some("dataset") => cmd::dataset::dispatch(&args[1..]),
         Some("train") => cmd::train::dispatch(&args[1..]),
         Some("policy") => Ok(cmd::policy::dispatch(&args[1..]) as u8),
+        Some("project") => cmd::project::dispatch(&args[1..]),
         Some("backend") => cmd::backend::dispatch(&args[1..]),
         Some("bench") => cmd::bench::dispatch(&args[1..]),
         Some("scene") => cmd::scene::dispatch(&args[1..]),
