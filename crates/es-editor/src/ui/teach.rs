@@ -19,11 +19,9 @@ use crate::model::i18n::{fill, t, Lang};
 use crate::model::launch::{LaunchModel, State as LaunchState};
 use crate::model::layout::Pane;
 use crate::model::results::{self, Tile};
-use crate::model::scene_view;
 use crate::model::teach::{
     grip_key, Action, Field, FieldName, Grip, Notes, Target, TargetKind, Teach, TeachError, OBJECT,
 };
-use crate::model::template::templates_root;
 use crate::model::workflow::Phase;
 use crate::ui::player::{play, Player};
 
@@ -124,6 +122,13 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
     true
 }
 
+impl State {
+    /// Read again on the next frame: what ② to ⑤ run has changed (packet M17/G9).
+    pub(crate) fn forget(&mut self) {
+        self.project = None;
+    }
+}
+
 /// Reads the open project's program, once per project, with the first block selected and its
 /// newest try shown.
 fn open(app: &mut EditorApp) {
@@ -132,8 +137,10 @@ fn open(app: &mut EditorApp) {
     if s.project.as_ref() == Some(&open.project.root) {
         return;
     }
-    let root = templates_root();
-    let template = scene_view::open_step(&open.project, root.clone()).map(|(t, _)| t);
+    // The documents ② to ⑤ run: an authored project's own, in its own folder (packet M17/G9).
+    let source = open.watch.source().as_ref().ok();
+    let root = source.map(|(_, root)| root.clone());
+    let template = source.map(|(t, _)| t.clone());
     let teach = template
         .as_ref()
         .zip(root.as_ref())

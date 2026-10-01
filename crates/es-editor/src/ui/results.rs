@@ -22,7 +22,6 @@ use crate::model::labels::{self, Browse};
 use crate::model::layout::{self, Pane};
 use crate::model::project::RunFolder;
 use crate::model::results::{self, RunResults, TileFilter};
-use crate::model::template;
 use crate::model::workflow::{Phase, PhaseState};
 use crate::ui::advanced::{metric_text, rgb_texture, short_hash};
 use crate::ui::player::{play, Player};
@@ -109,7 +108,13 @@ fn refresh(app: &mut EditorApp, pass: u64) {
     if s.shown.as_ref().is_some_and(|(k, _)| *k == stamp) {
         return;
     }
-    let read = RunResults::read(&open.project, run, template::templates_root().as_deref());
+    // The template and the folder its paths are relative to: an authored project's own (M17/G9).
+    let source = open.watch.source().as_ref().ok();
+    let (template, root) = (
+        source.map(|(t, _)| t.clone()),
+        source.map(|(_, r)| r.as_path()),
+    );
+    let read = RunResults::read_from(&open.project, run, template, root);
     s.thumbs.clear();
     s.player = read.as_ref().ok().and_then(|r| {
         let cell = results::first_to_play(r.rows.as_deref(), r.dir.cells())?;

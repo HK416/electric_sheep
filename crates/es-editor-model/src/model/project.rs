@@ -18,7 +18,9 @@
 //! The editor runs no learning (spec 23.1): it writes a recipe and hands `es` an argv. The
 //! template's documents are named by path, never copied (a scene path is hash input), so `es`
 //! runs with the repository root as its working directory and every path this file writes
-//! into a recipe or an argv is absolute.
+//! into a recipe or an argv is absolute. An authored project (packet M17/G9) runs its own
+//! `generated/` documents with its own root as `es`'s working directory instead
+//! ([`crate::model::template::source`]); the rule is the same, with the project as the root.
 
 use std::path::{Path, PathBuf};
 
@@ -117,28 +119,25 @@ impl Project {
         if Self::is_project_dir(&root) {
             return Err(err(&root.join(PROJECT_FILE), "already a project"));
         }
-        let b = &template.bundle;
+        let bundle = (template.bundle.as_ref())
+            .map(|_| collect_bundle(template, repo_root))
+            .transpose()?;
         let doc = |p: &String| repo_root.join(p);
-        let bundle = es_data::training::untrained_bundle(
-            &doc(&b.task),
-            &doc(&b.observation),
-            b.learning.as_ref().map(doc).as_deref(),
-            &doc(&b.deployment),
-            BUNDLE_SEED,
-        )
-        .map_err(|e| ProjectError(format!("template {}: {e}", template.id)))?;
         let teach = (template.teach.as_ref())
             .map(|p| std::fs::read(doc(p)).map_err(|e| err(&doc(p), e)))
             .transpose()?;
         std::fs::create_dir_all(&root).map_err(|e| err(&root, e))?;
-        write(&root.join(COLLECT_BUNDLE), bundle)?;
+        if let Some(bytes) = bundle {
+            write(&root.join(COLLECT_BUNDLE), bytes)?;
+        }
         if let Some(bytes) = teach {
             write(&root.join(TEACH_FILE), bytes)?;
         }
+        // A saved template's project names the template it was saved from (packet M17/G9).
         let file = ProjectFile {
             kind: KIND.to_owned(),
             name: name.to_owned(),
-            template: template.id.clone(),
+            template: template.base.clone().unwrap_or_else(|| template.id.clone()),
         };
         let text = toml::to_string(&file).map_err(|e| err(&root.join(PROJECT_FILE), e))?;
         write(&root.join(PROJECT_FILE), text)?;
@@ -265,6 +264,24 @@ impl RunFolder {
 
 fn read(path: &Path) -> Result<String, ProjectError> {
     std::fs::read_to_string(path).map_err(|e| err(path, e))
+}
+
+/// `untrained.esb` as `es policy init` builds it from the template's `[bundle]` documents.
+fn collect_bundle(template: &Template, repo_root: &Path) -> Result<Vec<u8>, ProjectError> {
+    let fail = |e: &dyn std::fmt::Display| ProjectError(format!("template {}: {e}", template.id));
+    let b = template
+        .bundle
+        .as_ref()
+        .ok_or_else(|| fail(&"no [bundle]"))?;
+    let doc = |p: &String| repo_root.join(p);
+    es_data::training::untrained_bundle(
+        &doc(&b.task),
+        &doc(&b.observation),
+        b.learning.as_ref().map(doc).as_deref(),
+        &doc(&b.deployment),
+        BUNDLE_SEED,
+    )
+    .map_err(|e| fail(&e))
 }
 
 fn arg(path: &Path) -> String {
@@ -408,6 +425,11 @@ fn run_cycle(
     let steps = *marks
         .last()
         .ok_or_else(|| ProjectError(format!("template {}: an empty length", template.id)))?;
+    // An authored project's documents are regenerated whenever it is saved (packet M17/G9), so
+    // its collect bundle is built from them for each run; a project made without one gets it.
+    if template.generated || !project.bundle().is_file() {
+        write(&project.bundle(), collect_bundle(template, repo_root)?)?;
+    }
     let bundle = arg(&project.bundle());
     let mut policy = recipe.policy;
     if policy.bundle.is_some() {

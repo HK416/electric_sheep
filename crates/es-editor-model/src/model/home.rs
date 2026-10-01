@@ -20,7 +20,7 @@ use serde::Deserialize;
 use crate::model::i18n::{self, Lang};
 use crate::model::project::{Project, ProjectError};
 use crate::model::recent::{self, Recent};
-use crate::model::template::{load, templates_root, Template};
+use crate::model::template::{load, load_saved, templates_root, Template};
 use crate::model::workflow::{phases, PhaseState, RunFacts};
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -357,15 +357,36 @@ const PROJECTS_DIR: &str = "Electric Sheep";
 /// call (a dependency and `unsafe` this crate forbids); a Documents folder redirected elsewhere
 /// (to a cloud drive) is not followed. The dialog's folder picker is the way out; the
 /// known-folder call comes with a dependency the orchestrator approves.
+///
+/// `ES_DOCUMENTS`, when set, is that folder instead (packet M17/G9): tests and captures point
+/// the editor at a scratch folder, never at the person's own projects and templates.
 pub fn documents_dir() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("ES_DOCUMENTS").filter(|d| !d.is_empty()) {
+        return Some(PathBuf::from(dir));
+    }
     let home = std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
     Some(PathBuf::from(home).join("Documents"))
 }
 
+/// `<documents>/Electric Sheep`.
+fn projects_dir(documents: Option<&Path>) -> PathBuf {
+    documents.map_or_else(|| PathBuf::from(PROJECTS_DIR), |d| d.join(PROJECTS_DIR))
+}
+
 /// `<documents>/Electric Sheep/<name>`.
 pub fn default_folder(documents: Option<&Path>, name: &str) -> PathBuf {
-    let base = documents.map_or_else(|| PathBuf::from(PROJECTS_DIR), |d| d.join(PROJECTS_DIR));
-    free(&base, name)
+    free(&projects_dir(documents), name)
+}
+
+/// Where the person's own templates live (packet M17/G9): `<documents>/Electric Sheep/templates`,
+/// never the repository.
+pub fn saved_dir(documents: Option<&Path>) -> PathBuf {
+    projects_dir(documents).join("templates")
+}
+
+/// A new saved template's folder: `<saved_dir>/<name>`, or `<name> 2`... when that is taken.
+pub fn saved_folder(documents: Option<&Path>, name: &str) -> PathBuf {
+    free(&saved_dir(documents), name)
 }
 
 /// `<base>/<name>`, or `<name> 2`, `<name> 3`... when that is taken: a second project from the
@@ -482,14 +503,27 @@ impl StartScreen {
         Self::at(templates_root())
     }
 
+    /// The checkout's templates, then the person's saved ones (packet M17/G9), which need the
+    /// checkout's too (a project names the template it was saved from).
     fn at(root: Option<PathBuf>) -> Self {
-        let (templates, broken) = root.as_deref().map(load).unwrap_or_default();
+        let (mut templates, mut broken) = root.as_deref().map(load).unwrap_or_default();
+        if root.is_some() {
+            let (saved, bad) = load_saved(&saved_dir(documents_dir().as_deref()));
+            templates.extend(saved);
+            broken.extend(bad);
+        }
         Self {
             root,
             templates,
             broken,
             ..Self::default()
         }
+    }
+
+    /// The templates read again, after one was saved; the PC check is kept.
+    pub fn reload(&mut self) {
+        let fresh = Self::at(self.root.clone());
+        (self.templates, self.broken) = (fresh.templates, fresh.broken);
     }
 
     /// The PC check's answer so far. The probe is started on the first call, with `es`, so an

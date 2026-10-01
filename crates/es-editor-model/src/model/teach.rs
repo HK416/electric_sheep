@@ -413,13 +413,14 @@ impl World {
         let scene_path = root.join(&template.scene);
         let scene = load_scene(&scene_path).map_err(|e| e.to_string())?;
         let links = Links::from_scene(&scene).map_err(|e| e.to_string())?;
-        let deploy = root.join(&template.bundle.deployment);
+        let b =
+            (template.bundle.as_ref()).ok_or_else(|| format!("{}: no [bundle]", template.id))?;
+        let deploy = root.join(&b.deployment);
         let deploy = deployment_from_toml(&read(&deploy)?).map_err(|e| e.to_string())?;
         let replan = es_env::replan_interval(deploy.rate)
             .map_err(|e| e.to_string())?
             .min(deploy.action.execute_chunk as u64);
-        let task =
-            task_from_toml(&read(&root.join(&template.bundle.task))?).map_err(|e| e.to_string())?;
+        let task = task_from_toml(&read(&root.join(&b.task))?).map_err(|e| e.to_string())?;
         let objects = ScenePreview::open(&scene_path)?.contents().objects;
         Ok(Self {
             scene,

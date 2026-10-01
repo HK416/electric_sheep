@@ -30,7 +30,7 @@ use crate::model::project::{
 };
 use crate::model::results::{self, Again};
 use crate::model::telemetry_view::{self, Closed, Event, SeriesKey, Source, TelemetryModel};
-use crate::model::template::{self, Length, Method, Template};
+use crate::model::template::{self, Length, Method, Template, Why};
 use crate::model::train_view::STREAM_TRAIN;
 use crate::model::workflow::{
     self, Child, LiveFacts, Phase, PhaseState, RunFacts, EVALUATE_STAGES, TRAIN_STAGES,
@@ -547,8 +547,8 @@ pub struct View {
     /// The re-open dial has not answered yet.
     pub checking: bool,
     pub interrupted: bool,
-    /// Why no run can start here (an i18n key), when none can.
-    pub cannot_start: Option<&'static str>,
+    /// Why no run can start here (an i18n key and its argument), when none can.
+    pub cannot_start: Option<Why>,
     /// The checkpoints' short tests, newest first (packet M13/Z4): from disk, and from stream 1
     /// while the run is watched. ③'s only (packet M13/Z5a): ④ shows its own attempts.
     pub previews: Vec<Preview>,
@@ -606,8 +606,9 @@ pub struct Watch {
     pub settings: StartSettings,
     /// ⑤'s plan, until Start starts it or Cancel drops it.
     again: Option<AgainPlan>,
-    /// The template and the repository root `es` runs in, or the i18n key of why there are none.
-    source: Result<(Template, PathBuf), &'static str>,
+    /// The template and the folder `es` runs in — the repository root, or an authored
+    /// project's own (packet M17/G9) — or why there are none.
+    source: Result<(Template, PathBuf), Why>,
     /// The run's `[collect] episodes`.
     demonstrations: u32,
     /// Whether the launch model's child is this run: started or resumed here.
@@ -653,7 +654,12 @@ impl Watch {
     /// *interrupted* - and [`Self::tick`] dials again every [`REDIAL_S`] while it stays so.
     /// `repo_root` is `template::templates_root()`'s answer.
     pub fn new(project: &Project, repo_root: Option<PathBuf>) -> Self {
-        let source = source_of(project, repo_root);
+        Self::with_source(project, source_of(project, repo_root))
+    }
+
+    /// [`Self::new`] on what [`template::source`] resolved, an editable project's generated
+    /// documents taken into account (packet M17/G9).
+    pub fn with_source(project: &Project, source: Result<(Template, PathBuf), Why>) -> Self {
         let run = project.latest_run();
         let facts = run.as_ref().map(RunFacts::read);
         let disk = workflow::phases(facts.as_ref(), None);
@@ -688,11 +694,23 @@ impl Watch {
             evaluate: disk[3].clone(),
             previews,
             heard_previews: Vec::new(),
-            teacher: (source.as_ref().ok())
-                .filter(|(t, _)| t.method == Method::Teacher)
-                .map(|_| project.teacher_bundle()),
+            teacher: teacher_of(project, &source),
             source,
         }
+    }
+
+    /// What ② to ⑤ run now: after ① saved (or unsaved) an editable project's documents.
+    pub fn set_source(&mut self, project: &Project, source: Result<(Template, PathBuf), Why>) {
+        self.teacher = teacher_of(project, &source);
+        if let Ok((t, _)) = &source {
+            self.settings.demonstrations = t.demonstrations;
+        }
+        self.source = source;
+    }
+
+    /// The template and the folder `es` runs in, or why ② to ⑤ cannot run.
+    pub fn source(&self) -> &Result<(Template, PathBuf), Why> {
+        &self.source
     }
 
     /// No teacher is chosen yet for a project that needs one.
@@ -700,10 +718,14 @@ impl Watch {
         self.teacher.as_ref().is_some_and(|p| !p.is_file())
     }
 
-    /// ② is what is left to do while a project that needs a teacher has none (packet M16/H7).
+    /// ② is what is left to do while a project that needs a teacher has none (packet M16/H7),
+    /// and ① and ② while an editable project's own documents are missing (packet M17/G9).
     pub fn gate(&self, phases: &mut [PhaseState; 5]) {
         if self.no_teacher() && phases[1] == PhaseState::Done {
             phases[1] = PhaseState::NotStarted;
+        }
+        if (self.source.as_ref().err()).is_some_and(|(key, _)| key.starts_with("watch.task.")) {
+            phases[..2].fill(PhaseState::NotStarted);
         }
     }
 
@@ -926,8 +948,8 @@ impl Watch {
                 && phases[2..4]
                     .iter()
                     .any(|p| matches!(p, PhaseState::Interrupted { .. })),
-            cannot_start: (self.source.as_ref().err().copied())
-                .or_else(|| self.no_teacher().then_some("watch.no_teacher")),
+            cannot_start: (self.source.as_ref().err().cloned())
+                .or_else(|| (self.no_teacher()).then(|| ("watch.no_teacher", String::new()))),
             previews: if phase == Phase::Train {
                 self.previews.clone()
             } else {
@@ -1073,17 +1095,20 @@ impl Watch {
     }
 }
 
+/// The project's template and the repository root, as before plan G: [`template::source`] of
+/// a project whose generated documents are not asked about.
 pub(crate) fn source_of(
     project: &Project,
     repo_root: Option<PathBuf>,
-) -> Result<(Template, PathBuf), &'static str> {
-    let root = repo_root.ok_or("watch.no_checkout")?;
-    let (templates, _) = template::load(&root);
-    let found = templates
-        .into_iter()
-        .find(|t| t.id == project.file.template)
-        .ok_or("watch.no_template")?;
-    Ok((found, root))
+) -> Result<(Template, PathBuf), Why> {
+    template::source(project, repo_root, None)
+}
+
+/// `teacher.esb`, which every run of a project taught by a teacher collects with.
+fn teacher_of(project: &Project, source: &Result<(Template, PathBuf), Why>) -> Option<PathBuf> {
+    (source.as_ref().ok())
+        .filter(|(t, _)| t.method == Method::Teacher)
+        .map(|_| project.teacher_bundle())
 }
 
 #[cfg(test)]
@@ -1167,7 +1192,7 @@ mod tests {
         let view = watch.view(Phase::Train, &launch, &telemetry, &phases, now);
         assert_eq!(
             (view.cannot_start, view.start),
-            (Some("watch.no_teacher"), None)
+            (Some(("watch.no_teacher", String::new())), None)
         );
         assert!(project::write_run(
             &crate::model::teacher::tests::hand(),

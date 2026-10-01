@@ -127,6 +127,10 @@ pub(crate) struct Author {
     add: add::State,
     /// The task as sentences (packet M17/G8).
     pub(crate) task: crate::ui::sentence::Task,
+    /// "Save as template": the name being typed while its dialog is open, and what the last one
+    /// did — the folder it wrote, or why not (packet M17/G9).
+    pub(crate) save_as: Option<String>,
+    pub(crate) saved_as: Option<Result<PathBuf, String>>,
 }
 
 fn fold_key(row: &es_editor_scene::Row) -> String {
@@ -141,7 +145,9 @@ impl Author {
         backends: Vec<BackendKind>,
         bundle: Option<[PathBuf; 2]>,
     ) -> Result<Self, String> {
-        let model = SceneModel::open(root, backends)?;
+        let mut model = SceneModel::open(root, backends)?;
+        // What `generated/` holds against the saved documents (packet M17/G9).
+        model.refresh();
         let folded = (model.rows().iter())
             .filter(|r| r.kind == RowKind::Include)
             .map(fold_key)
@@ -163,6 +169,8 @@ impl Author {
             bundle,
             add: add::State::default(),
             task: crate::ui::sentence::Task::default(),
+            save_as: None,
+            saved_as: None,
         })
     }
 
@@ -294,22 +302,25 @@ impl Author {
                 m.redo();
             }
             let dirty = m.dirty();
-            let word = if dirty {
-                format!("{} \u{25cf}", t(lang, "edit.save"))
-            } else {
-                t(lang, "edit.save").to_owned()
+            // A task whose documents are not what its saved documents make is saved and
+            // generated again by the same button (packet M17/G9).
+            let stale = m.spec().is_some() && !matches!(m.generated(), Regen::Written(_));
+            let (word, hint) = match (dirty, stale) {
+                (_, true) => ("author.save_generate", "author.save_generate.hint"),
+                (true, false) => ("edit.save", "author.unsaved"),
+                (false, false) => ("edit.save", "author.save.hint"),
             };
-            let hint = if dirty {
-                "author.unsaved"
+            let word = if dirty {
+                format!("{} \u{25cf}", t(lang, word))
             } else {
-                "author.save.hint"
+                t(lang, word).to_owned()
             };
             let clicked = ui
-                .add_enabled(dirty, egui::Button::new(word))
+                .add_enabled(dirty || stale, egui::Button::new(word))
                 .on_hover_text(t(lang, hint))
                 .on_disabled_hover_text(t(lang, hint))
                 .clicked();
-            if (clicked || save) && dirty {
+            if (clicked || save) && (dirty || stale) {
                 self.saved = Some(m.save());
             }
             let line = match (&self.saved, m.generated()) {
@@ -320,10 +331,29 @@ impl Author {
                 (_, Regen::Failed(why)) => Some(("author.generate_failed", vec![why.clone()])),
                 (_, Regen::NoSpec) => Some(("author.no_spec", vec![])),
                 (_, Regen::NotYet) => Some(("author.not_generated", vec![])),
+                (_, Regen::Stale) => Some(("author.stale", vec![])),
             };
             if let Some((key, args)) = line {
                 let args: Vec<&str> = args.iter().map(String::as_str).collect();
                 ui.weak(fill(lang, key, &args));
+            }
+            let as_template = ui
+                .button(t(lang, "author.save_template"))
+                .on_hover_text(t(lang, "author.save_template.hint"));
+            if as_template.clicked() {
+                self.save_as = Some(String::new());
+            }
+            let note = match &self.saved_as {
+                Some(Ok(dir)) => fill(
+                    lang,
+                    "author.save_template.done",
+                    &[&dir.display().to_string()],
+                ),
+                Some(Err(why)) => fill(lang, "author.save_template.failed", &[why]),
+                None => String::new(),
+            };
+            if !note.is_empty() {
+                ui.weak(note);
             }
         });
         if delete {

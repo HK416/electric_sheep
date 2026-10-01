@@ -41,7 +41,7 @@ use crate::model::replay_view::ReplayView;
 use crate::model::run_view;
 use crate::model::search::Search;
 use crate::model::telemetry_view::{Source, TelemetryModel};
-use crate::model::template;
+use crate::model::template::{self, Generated};
 use crate::model::train_view::TrainView;
 use crate::model::watch::Watch;
 use crate::model::workflow::{self, Phase, PhaseState, RunFacts};
@@ -68,6 +68,9 @@ pub(crate) struct OpenProject {
     pub(crate) phases: [PhaseState; 5],
     pub(crate) phase: Phase,
     pub(crate) watch: Watch,
+    /// An editable project's `generated/` against its saved documents, which decides what ② to
+    /// ⑤ run (packet M17/G9); `None` for a template project. ① keeps it current.
+    pub(crate) generated: Option<Generated>,
 }
 
 pub struct EditorApp {
@@ -396,7 +399,13 @@ impl EditorApp {
             Ok(project) => {
                 let facts = project.latest_run().map(|run| RunFacts::read(&run));
                 let mut phases = workflow::phases(facts.as_ref(), None);
-                let watch = Watch::new(&project, template::templates_root());
+                // An authored project runs what it generated (packet M17/G9).
+                let generated = (es_editor_scene::is_editable(&project.root)).then(|| {
+                    crate::ui::scene::generated(&es_editor_scene::on_disk(&project.root), false)
+                });
+                let root = template::templates_root();
+                let source = template::source(&project, root, generated.as_ref());
+                let watch = Watch::with_source(&project, source);
                 watch.gate(&mut phases);
                 self.status = self.fill("shell.project", &[&project.file.name]);
                 self.opened = None;
@@ -407,6 +416,7 @@ impl EditorApp {
                     project,
                     phase: layout::start_phase(&phases),
                     phases,
+                    generated,
                 });
             }
             Err(e) => self.status = e.to_string(),
@@ -495,6 +505,8 @@ impl eframe::App for EditorApp {
                 Err(e) => self.status = e,
             }
         }
+        // What ② to ⑤ run follows ①'s save (packet M17/G9).
+        crate::ui::scene::sync(self);
         // ③ and ④: the open project's run (packet M12/Y12).
         crate::ui::train::tick(self, ctx);
         // ②: a try's own child (packet M14/Q4), and a teacher's jobs (packet M16/H7).

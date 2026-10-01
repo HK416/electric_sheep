@@ -183,8 +183,8 @@ fn panel(app: &mut EditorApp, ui: &mut egui::Ui, phase: Phase, view: &View) {
     if view.interrupted {
         ui.label(i18n::t(lang, "watch.interrupted"));
     }
-    if let Some(key) = view.cannot_start {
-        ui.label(i18n::fill(lang, key, &[&open.project.file.template]));
+    if let Some((key, arg)) = &view.cannot_start {
+        ui.label(i18n::fill(lang, key, &[arg]));
     }
     let mut action = None;
     if let Some(key) = view.start {

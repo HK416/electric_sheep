@@ -1,0 +1,37 @@
+# The empty project (plan G, packet M17/G9; `docs/design/scene-authoring.md` section 5.4): a
+# floor, a light and one camera from outside, and nothing else. The person adds the robot and the
+# objects in ①, says the task in sentences and saves; ② to ⑤ then run the documents generated
+# from that scene and task (`generated/`), with `es` run in the project's own folder. Until then
+# they say in words what is missing.
+#
+# No `[bundle]`, `cycle`, `[teacher]` or `[outcome]`: nothing here is a committed document of a
+# task, since the task is the person's. `Project::create` builds no bundle, and the start screen
+# copies `[editable] scene` into the new project as its `scene.esscene` (no task specification
+# yet: "say the task" in ① writes one).
+
+kind = "template"
+id = "empty"
+name = "template.empty.name"        # es-editor i18n key
+summary = "template.empty.summary"  # es-editor i18n key
+# "Say the task" gives a teacher trained by reward (PPO, `[teacher]`), whose recipe runs on
+# MuJoCo Warp. Not listed here: building a scene needs no GPU simulator, and ② says so on the
+# teacher's card when this PC or the scene cannot run it.
+method = "teacher"
+needs = ["mujoco", "torch", "vulkan", "render"]
+scene = "tests/fixtures/esscene/empty.esscene"
+# "Say the task"'s `[cycle] episodes`: the cube cards' 200.
+demonstrations = 200
+
+# Where the editor's outside camera starts: over the origin, where the floor's middle is and a
+# robot added at the view's centre lands.
+viewport = { eye = [0.8, -0.8, 0.6], look_at = [0.1, 0.0, 0.1] }
+
+# The camera student's training lengths (`[run] checkpoint_at`): plan N's ACT preset marks, as
+# the hand card's.
+[lengths]
+short  = [1000, 5000]
+medium = [1000, 5000, 20000]
+long   = [1000, 5000, 20000, 60000]
+
+[editable]
+scene = "tests/fixtures/esscene/empty.esscene"

@@ -46,5 +46,9 @@ egui = { workspace = true }
 # The dock under the step bar (packet M12/Y10): panes a person can drag and re-dock.
 egui_dock = { workspace = true }
 
+[dev-dependencies]
+# The recipes and cycles ② and ③ write, read back by the authored project's oracles (M17/G9).
+es-data = { workspace = true }
+
 [lints]
 workspace = true

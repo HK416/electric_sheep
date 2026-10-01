@@ -12,16 +12,16 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use egui::{Color32, RichText};
-use es_editor_scene::BackendKind;
+use es_editor_scene::{BackendKind, Regen, SCENE_FILE, SPEC_FILE};
 use es_render::raster::Camera;
 
 use crate::app::EditorApp;
-use crate::model::home::Mark;
+use crate::model::home::{self, Mark};
 use crate::model::i18n::{fill, t, Lang, Strings};
 use crate::model::layout::Pane;
 use crate::model::results::SPEEDS;
 use crate::model::scene_view::{self, Physics, ScenePreview};
-use crate::model::template::{templates_root, Template};
+use crate::model::template::{self, templates_root, EditableDocs, Generated, Template};
 use crate::model::workflow::Phase;
 use crate::ui::advanced::{replay_canvas, scene_canvas, Canvas, Posed};
 use crate::ui::author::Author;
@@ -50,8 +50,129 @@ pub(crate) struct State {
 /// A template's bundle Task IR and Observation IR: the cameras its policy sees.
 fn bundle_of(template: &Template) -> Option<[PathBuf; 2]> {
     let root = templates_root()?;
-    let b = &template.bundle;
+    let b = template.bundle.as_ref()?;
     Some([root.join(&b.task), root.join(&b.observation)])
+}
+
+// --- an authored project (packet M17/G9) ------------------------------------------------------
+
+/// What `es-editor-scene` found of an editable project's `generated/`, in `es-editor-model`'s
+/// terms: `unsaved` when ① holds a task that is not saved.
+pub fn generated(regen: &Regen, unsaved: bool) -> Generated {
+    match regen {
+        _ if unsaved => Generated::Unsaved,
+        Regen::NoSpec => Generated::NoSpec,
+        Regen::Written(files) => Generated::Fresh(files.clone()),
+        Regen::Failed(why) => Generated::Failed(why.clone()),
+        Regen::NotYet | Regen::Stale => Generated::Stale,
+    }
+}
+
+/// Once a frame: the open project's `generated/` as ① has it now, and — when that changed (a
+/// save, an edit, a failed generation) — what ② to ⑤ run, read again.
+pub(crate) fn sync(app: &mut EditorApp) {
+    let Some(open) = app.project.as_mut() else {
+        return;
+    };
+    let author = (app.scene.project.as_ref() == Some(&open.project.root))
+        .then_some(app.scene.author.as_ref())
+        .flatten();
+    let Some(Ok(author)) = author else {
+        return;
+    };
+    let m = &author.model;
+    let now = generated(m.generated(), m.dirty() && m.spec().is_some());
+    if open.generated.as_ref() == Some(&now) {
+        return;
+    }
+    let source = template::source(&open.project, templates_root(), Some(&now));
+    open.generated = Some(now);
+    open.watch.set_source(&open.project, source);
+    app.teacher.forget();
+    app.teach.forget();
+    app.results = crate::ui::results::State::default();
+}
+
+/// A new project's own documents, before `Project::create` writes its `project.toml`: a saved
+/// template's copied whole, a template without documents of its own (`empty.toml`) as ①'s
+/// editable copy makes them; nothing for any other template.
+pub fn new_documents(root: &Path, template: &Template, repo: &Path) -> Result<(), String> {
+    let Some(e) = template
+        .editable
+        .as_ref()
+        .filter(|_| template.bundle.is_none())
+    else {
+        return Ok(());
+    };
+    std::fs::create_dir_all(root).map_err(|e| format!("{}: {e}", root.display()))?;
+    if template.base.is_some() {
+        let dir = Path::new(&e.scene).parent().unwrap_or(Path::new("."));
+        return es_editor_scene::copy::documents(dir, root);
+    }
+    let spec = e.spec.as_ref().map(|s| repo.join(s));
+    es_editor_scene::make_editable(root, &repo.join(&e.scene), spec.as_deref())
+}
+
+/// The template `--edit-demo save-template` saves.
+const DEMO: &str = "My push task";
+
+/// "Save as template" of the project at `root`, made from `base`, as `name`: its saved documents
+/// copied into a new folder under `documents`' templates, and its `template.toml` written last.
+pub fn save_template(
+    root: &Path,
+    base: &Template,
+    name: &str,
+    documents: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let dir = home::saved_folder(documents, name);
+    es_editor_scene::copy::documents(root, &dir)?;
+    let spec = root.join(SPEC_FILE).is_file().then(|| SPEC_FILE.to_owned());
+    let editable = EditableDocs {
+        scene: SCENE_FILE.to_owned(),
+        spec,
+    };
+    template::write_saved(base, name, &dir, editable)?;
+    Ok(dir)
+}
+
+/// The "save as template" dialog, while ①'s toolbar has it open: a name and Save. Saving saves
+/// the edited documents first. `true` once a template was written.
+fn save_as(ctx: &egui::Context, lang: Lang, author: &mut Author, base: &Template) -> bool {
+    let Some(mut name) = author.save_as.take() else {
+        return false;
+    };
+    let (mut save, mut cancel) = (false, false);
+    let modal = egui::Modal::new(egui::Id::new("save-as-template")).show(ctx, |ui| {
+        ui.heading(t(lang, "author.save_template"));
+        ui.horizontal(|ui| {
+            ui.label(t(lang, "author.save_template.name"));
+            ui.text_edit_singleline(&mut name);
+        });
+        ui.horizontal(|ui| {
+            let ok = !name.trim().is_empty();
+            let button = egui::Button::new(t(lang, "author.save_template.save"));
+            save = ui.add_enabled(ok, button).clicked();
+            cancel = ui.button(t(lang, "home.cancel")).clicked();
+        });
+    });
+    if save {
+        let edited = if author.model.dirty() {
+            author.model.save()
+        } else {
+            Ok(())
+        };
+        let saved = edited.and_then(|()| {
+            let docs = home::documents_dir();
+            save_template(author.model.root(), base, name.trim(), docs.as_deref())
+        });
+        let done = saved.is_ok();
+        author.saved_as = Some(saved);
+        return done;
+    }
+    if !(cancel || modal.should_close()) {
+        author.save_as = Some(name);
+    }
+    false
 }
 
 fn at_start_id() -> egui::Id {
@@ -74,7 +195,9 @@ pub fn preview_at_start(ctx: &egui::Context) {
 /// handle mid-drag; `corner` lets it go and selects the front camera (packet M17/G6's).
 /// `add-menu`, `add-box` and `add-robot` open the Add menu, add a box and add the library's
 /// first robot where the view looks (packet M17/G7's). `sentences`, `refuse` and `new-task` are
-/// the task's (packet M17/G8's, `sentence::demo`).
+/// the task's (packet M17/G8's, `sentence::demo`). `authored` builds a task on the empty project
+/// and saves it, and `save-template` saves the project as a template of the person's (packet
+/// M17/G9's).
 pub fn edit_demo(ctx: &egui::Context, stage: String) {
     ctx.data_mut(|d| d.insert_temp(demo_id(), stage));
 }
@@ -145,7 +268,15 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
             let camera = state
                 .camera
                 .get_or_insert_with(|| scene_view::camera_of(Some(template)));
-            author.demo(stage, camera);
+            if stage == "save-template" {
+                // Packet M17/G9's captures: the project saved as a template of the person's.
+                let docs = home::documents_dir();
+                let saved = save_template(author.model.root(), template, DEMO, docs.as_deref());
+                author.saved_as = Some(saved);
+                app.home.reload();
+            } else {
+                author.demo(stage, camera);
+            }
         }
     }
     if phase == Phase::Scene {
@@ -153,16 +284,22 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
             let camera =
                 (state.camera).get_or_insert_with(|| scene_view::camera_of(Some(template)));
             match author {
-                Ok(author) => editable(
-                    ui,
-                    lang,
-                    pane,
-                    author,
-                    camera,
-                    &mut state.physics,
-                    &mut state.picture,
-                    &mut state.played,
-                ),
+                Ok(author) => {
+                    editable(
+                        ui,
+                        lang,
+                        pane,
+                        author,
+                        camera,
+                        &mut state.physics,
+                        &mut state.picture,
+                        &mut state.played,
+                    );
+                    // Once a frame (the viewport's turn): the "save as template" dialog.
+                    if pane == Pane::Viewport && save_as(ui.ctx(), lang, author, template) {
+                        app.home.reload();
+                    }
+                }
                 Err(why) => {
                     ui.label(fill(lang, "author.open_failed", &[why]));
                 }

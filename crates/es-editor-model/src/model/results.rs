@@ -809,6 +809,23 @@ impl RunResults {
         run: &RunFolder,
         repo_root: Option<&Path>,
     ) -> Result<Self, String> {
+        let template = repo_root.and_then(|root| {
+            load(root)
+                .0
+                .into_iter()
+                .find(|t| t.id == project.file.template)
+        });
+        Self::read_from(project, run, template, repo_root)
+    }
+
+    /// [`Self::read`] on a template already resolved and the folder its paths are relative to:
+    /// an authored project's, whose runs name its generated documents (packet M17/G9).
+    pub fn read_from(
+        project: &Project,
+        run: &RunFolder,
+        template: Option<Template>,
+        repo_root: Option<&Path>,
+    ) -> Result<Self, String> {
         let dir = RunDir::open(&run.eval_dir()).map_err(|e| e.to_string())?;
         let (rows, rows_error) = match read_episodes(&run.eval_dir()) {
             Ok(rows) => (rows, None),
@@ -817,12 +834,6 @@ impl RunResults {
         let cycle = std::fs::read_to_string(run.path.join(RUN_RECIPE))
             .ok()
             .and_then(|text| Cycle::parse(&text).ok());
-        let template = repo_root.and_then(|root| {
-            load(root)
-                .0
-                .into_iter()
-                .find(|t| t.id == project.file.template)
-        });
         let ir = cycle.as_ref().zip(repo_root).and_then(|(c, root)| {
             let text = std::fs::read_to_string(root.join(&c.eval.config)).ok()?;
             evaluation_from_toml(&text).ok()
@@ -843,7 +854,7 @@ impl RunResults {
         // the project's collect bundle was built from. Without it or the Evaluation IR nothing
         // is known to be refused, and the collection itself still refuses by name.
         let deploy = template.as_ref().zip(repo_root).and_then(|(t, root)| {
-            let text = std::fs::read_to_string(root.join(&t.bundle.deployment)).ok()?;
+            let text = std::fs::read_to_string(root.join(&t.bundle.as_ref()?.deployment)).ok()?;
             deployment_from_toml(&text).ok()
         });
         let refused = (ir.as_ref().zip(deploy.as_ref()))

@@ -10,15 +10,19 @@
 //! is one undo step; a refused specification stays in its sentences with the reason above and is
 //! not tried again until it changes.
 
+use std::path::Path;
+
 use eframe::egui;
 use egui::{Color32, RichText};
+use es_assets::esscene::ShapeDoc;
 use es_assets::scene::SceneDesc;
 use es_editor_scene::sentence::{
     self as s, vocab, At, Clause, Field, Level, Look, Relation, Sentence, Slot, TaskSpec, Unit,
 };
-use es_editor_scene::{new_region, Command, Record, Refusal};
+use es_editor_scene::{new_body, new_region, Camera, Command, Item, Record, Refusal, SceneModel};
 
 use crate::model::i18n::{fill, t, Lang};
+use crate::model::template::templates_root;
 use crate::ui::author::Author;
 
 const RED: Color32 = Color32::from_rgb(220, 80, 70);
@@ -667,13 +671,18 @@ fn panel(ui: &mut egui::Ui, lang: Lang, author: &mut Author) {
 /// `es-editor --edit-demo sentences|refuse|new-task` (packet M17/G8's captures): ① shows the
 /// task; `refuse` then tries an 8.01 s time limit, which is not whole control ticks and is
 /// refused; `new-task` says the task of a project that has none, adds a region over SO-101's bin,
-/// says "[cube] is inside [it]" and saves. `false` for every other stage.
+/// says "[cube] is inside [it]" and saves. `authored` builds a task on the empty project
+/// (packet M17/G9's captures, [`authored`]). `false` for every other stage.
 pub(crate) fn demo(author: &mut Author, stage: &str) -> bool {
-    if !matches!(stage, "sentences" | "refuse" | "new-task") {
+    if !matches!(stage, "sentences" | "refuse" | "new-task" | "authored") {
         return false;
     }
     author.task.shown = true;
     let m = &mut author.model;
+    if stage == "authored" {
+        let _ = templates_root().map(|repo| authored(m, &repo));
+        return true;
+    }
     if stage == "refuse" {
         if let Some(mut spec) = m.spec().cloned() {
             spec.timeout_s = 8.01;
@@ -709,4 +718,44 @@ pub(crate) fn demo(author: &mut Author, stage: &str) -> bool {
         }
     }
     true
+}
+
+/// A task built on the empty project as a person builds it in ① (packet M17/G9: its oracle 1
+/// and `--edit-demo authored`): the library's SO-101 where a view of the origin looks, a 5 cm
+/// box in front of it and a target area beside the box, "say the task" (whose default clause is
+/// the box still), "[box] is inside [area]", and a save, which generates the documents.
+pub fn authored(m: &mut SceneModel, repo: &Path) -> Result<(), String> {
+    let refused = |r: Refusal| format!("{}: {} {:?}", r.field, r.key, r.args);
+    let lib = es_editor_scene::add::library(repo)?;
+    let so101 = (lib.into_iter().find(|r| r.id == "so101")).ok_or("no so101 in the library")?;
+    let origin = Camera {
+        eye: [0.6, -0.6, 0.8],
+        look_at: [0.0; 3],
+        fov_y: std::f64::consts::FRAC_PI_4,
+        width: 640,
+        height: 400,
+    };
+    m.add(&Item::Robot(so101), &origin, true).map_err(refused)?;
+    let mut cube = new_body(&m.unique("box"), ShapeDoc::Box([0.025; 3]));
+    cube.pos = Some([0.22, 0.0, 0.025]);
+    cube.geoms[0].rgba = Some([0.85, 0.2, 0.15, 1.0]);
+    let name = cube.name.clone();
+    m.apply(&Command::Add(Record::Body(cube)))
+        .map_err(refused)?;
+    let mut area = new_region(&m.unique("target"));
+    (area.pos, area.size) = (Some([0.22, 0.12, 0.025]), Some([0.04, 0.04, 0.03]));
+    let target = area.name.clone();
+    m.apply(&Command::Add(Record::Region(area)))
+        .map_err(refused)?;
+    let scene = std::sync::Arc::clone(m.scene());
+    let mut spec = s::new_spec(&scene, m.doc(), s::CONTROL_HZ);
+    s::add_clause(&mut spec, &scene, false);
+    let first = &mut spec.success.clauses[1];
+    first.subject = name;
+    let inside = Slot::Relation(Relation::Inside, true);
+    s::edit_clause(&scene, first, Field::Relation, inside);
+    first.object = Some(target);
+    m.apply(&Command::Spec(Some(Box::new(spec))))
+        .map_err(refused)?;
+    m.save()
 }

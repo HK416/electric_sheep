@@ -12,6 +12,8 @@ use std::path::PathBuf;
 
 use eframe::egui;
 use egui::{Color32, RichText};
+use es_editor_scene::check::maps_onto;
+use es_editor_scene::{BackendKind, Refusal};
 
 use crate::app::EditorApp;
 use crate::model::home::Mark as Colour;
@@ -21,7 +23,7 @@ use crate::model::layout::Pane;
 use crate::model::project::RunFolder;
 use crate::model::teacher::{self, Choice, Chose, Jobs, Mark};
 use crate::model::telemetry_view::TelemetryModel;
-use crate::model::template::{self, Method, Template};
+use crate::model::template::{Method, Template};
 use crate::model::train_view::{Series, TrainView};
 use crate::model::workflow::Phase;
 use crate::ui::advanced::{paint_curve, RL_COLOURS};
@@ -33,9 +35,12 @@ const LAST_LINES: usize = 6;
 #[derive(Default)]
 pub(crate) struct State {
     project: Option<PathBuf>,
-    /// The template and the repository root `es` runs in; `None` for a project taught any
-    /// other way, or whose template is not here.
+    /// The template and the folder `es` runs in (an authored project's own, packet M17/G9);
+    /// `None` for a project taught any other way, or whose template is not here.
     source: Option<(Template, PathBuf)>,
+    /// Why an authored project's saved scene does not map onto `MuJoCo` Warp, which the teacher
+    /// trains on (packet M17/G9).
+    warp: Option<Refusal>,
     jobs: Jobs,
     runs: Vec<RunFolder>,
     selected: Option<u32>,
@@ -73,7 +78,7 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
     }
     open(app);
     if app.teacher.source.is_none() {
-        return false;
+        return missing(app, ui, pane);
     }
     match pane {
         Pane::StepPanel => panel(app, ui),
@@ -83,6 +88,31 @@ pub(crate) fn draw(app: &mut EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
     true
 }
 
+/// ② of an editable project whose own documents are missing (packet M17/G9): what is missing,
+/// in words; the scene is ①'s to show. `false` for any other project.
+fn missing(app: &EditorApp, ui: &mut egui::Ui, pane: Pane) -> bool {
+    let Some(Err((key, arg))) = app.project.as_ref().map(|p| p.watch.source().clone()) else {
+        return false;
+    };
+    if !key.starts_with("watch.task.") {
+        return false;
+    }
+    if pane != Pane::StepPanel {
+        return true;
+    }
+    let lang = app.settings.lang;
+    ui.heading(t(lang, "teach.heading"));
+    ui.colored_label(colour(Colour::Optional), fill(lang, key, &[&arg]));
+    true
+}
+
+impl State {
+    /// Read again on the next frame: what ② to ⑤ run has changed (packet M17/G9).
+    pub(crate) fn forget(&mut self) {
+        self.project = None;
+    }
+}
+
 /// Reads the open project's teacher runs, once per project.
 fn open(app: &mut EditorApp) {
     let Some(open) = &app.project else { return };
@@ -90,14 +120,15 @@ fn open(app: &mut EditorApp) {
     if s.project.as_ref() == Some(&open.project.root) {
         return;
     }
-    let source = template::templates_root().and_then(|root| {
-        let found = (template::load(&root).0.into_iter())
-            .find(|t| t.id == open.project.file.template && t.method == Method::Teacher)?;
-        Some((found, root))
-    });
+    let source = (open.watch.source().as_ref().ok())
+        .filter(|(t, _)| t.method == Method::Teacher)
+        .cloned();
+    let warp = (source.as_ref().filter(|(t, _)| t.generated))
+        .and_then(|_| maps_onto(&open.project.root, BackendKind::MjWarp).err());
     *s = State {
         project: Some(open.project.root.clone()),
         source,
+        warp,
         jobs: std::mem::take(&mut s.jobs),
         ..State::default()
     };
@@ -191,7 +222,24 @@ fn panel(app: &mut EditorApp, ui: &mut egui::Ui) {
     let lang = app.settings.lang;
     let s = &app.teacher;
     ui.heading(t(lang, "teach.teacher.heading"));
-    ui.label(t(lang, "teach.teacher.about"));
+    let generated = s.source.as_ref().is_some_and(|(t, _)| t.generated);
+    ui.label(t(
+        lang,
+        if generated {
+            "teach.teacher.about_generated"
+        } else {
+            "teach.teacher.about"
+        },
+    ));
+    // Packet M17/G9: a scene the GPU simulator cannot take is said here, not by a failed run.
+    if let Some(r) = &s.warp {
+        let args: Vec<&str> = r.args.iter().map(String::as_str).collect();
+        let why = fill(lang, r.key, &args);
+        ui.colored_label(
+            colour(Colour::Missing),
+            fill(lang, "teach.teacher.no_warp", &[&why]),
+        );
+    }
     ui.add_space(6.0);
     let chosen = s.chosen.map(|c| {
         let score = (s.runs.iter().find(|r| r.number == c.run))
@@ -233,7 +281,7 @@ fn panel(app: &mut EditorApp, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         let train = ui
             .add_enabled(
-                !s.jobs.busy(),
+                !s.jobs.busy() && s.warp.is_none(),
                 egui::Button::new(t(lang, "teach.teacher.train")),
             )
             .on_hover_text(t(lang, "teach.teacher.train.hint"));

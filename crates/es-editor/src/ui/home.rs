@@ -370,9 +370,14 @@ pub(crate) fn dialog(app: &mut EditorApp, ctx: &egui::Context) {
         ui.horizontal(|ui| {
             let create = egui::Button::new(app.t("home.create_button"));
             if ui.add_enabled(d.can_create(), create).clicked() {
-                match d.create() {
+                // A template without documents of its own gives its project its own scene
+                // first (packet M17/G9): the empty one, or a saved template's.
+                let folder = Path::new(d.folder.trim());
+                let made = crate::ui::scene::new_documents(folder, &d.template, &d.root)
+                    .and_then(|()| d.create().map_err(|e| e.to_string()));
+                match made {
                     Ok(project) => created = Some(project.root),
-                    Err(e) => d.error = Some(e.to_string()),
+                    Err(e) => d.error = Some(e),
                 }
             }
             if ui.button(app.t("home.cancel")).clicked() {

@@ -2,14 +2,22 @@
 //! M12/Y5): `templates/<id>.toml` at the repository root, each naming committed documents by
 //! path. Nothing here copies a document - a scene path is hash input - so `es` runs with the
 //! directory [`find_root`] returns as its working directory.
+//!
+//! Plan G (packet M17/G9) adds the templates without documents — `empty.toml`, and the ones the
+//! person saves under their documents folder ([`load_saved`], [`write_saved`]) — and the
+//! authored project, whose ② to ⑤ run its own generated documents in its own folder
+//! ([`source`]).
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use es_data::training::Cycle;
+use serde::{Deserialize, Serialize};
+
+use crate::model::project::Project;
 
 /// How the robot is taught. `Blocks` is the scripted demonstrator; `Teacher` is a policy trained
 /// and chosen in ② whose successful episodes are the demonstrations (packet M16/H7).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Method {
     Blocks,
@@ -26,7 +34,7 @@ pub enum Length {
 
 /// The documents `es policy init` builds the collect bundle from. No `learning` is spec 8.1's
 /// external-policy shape (packet M12/Y5b): the Observation IR has no committed Learning IR.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BundleDocs {
     pub task: String,
@@ -38,7 +46,7 @@ pub struct BundleDocs {
 /// `[teacher]` (packet M16/H7): the teacher's training recipe, the Evaluation IR its checkpoints
 /// are judged by (with `jobs` workers) and the four documents its bundle is built and re-packed
 /// on.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TeacherDocs {
     pub recipe: String,
@@ -56,7 +64,7 @@ fn one() -> u32 {
 }
 
 /// `[lengths]`: each preset is a `[run] checkpoint_at` series.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Lengths {
     pub short: Vec<u32>,
@@ -65,7 +73,7 @@ pub struct Lengths {
 }
 
 /// What kind of task `[outcome]` explains.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutcomeKind {
     /// Put the object in the target (the cube cards).
@@ -80,7 +88,7 @@ pub enum OutcomeKind {
 /// ([`crate::model::outcome`]); for `kind = "reorient"`, how far the `object` body's orientation
 /// ended from the `target` body's. `object_name` and `target_name` are i18n keys: the two things
 /// in the words a failure cause names them by.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutcomeSpec {
     #[serde(default)]
@@ -106,7 +114,7 @@ pub struct OutcomeSpec {
 
 /// `[outcome] release` (packet M13/R4): the scene joint whose opening lets the object go, and
 /// the position it must pass for the task to count the object as let go.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Release {
     pub joint: String,
@@ -116,7 +124,7 @@ pub struct Release {
 /// `[editable]` (packet M17/G5): the template's scene as a scene document (`*.esscene`, the
 /// robot included by reference) and, when one says the task, its task specification
 /// (`*.estask`) — what ①'s "make an editable copy" copies into a project.
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EditableDocs {
     pub scene: String,
@@ -124,7 +132,7 @@ pub struct EditableDocs {
 }
 
 /// `viewport`: where the editor's outside camera starts on the template's scene, metres.
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Viewport {
     pub eye: [f64; 3],
@@ -133,7 +141,11 @@ pub struct Viewport {
 
 /// One `templates/<id>.toml`. `name`, `summary` and `notice` (what the card warns about, such
 /// as an experimental route) are i18n keys; every path is relative to the repository root.
-#[derive(Clone, Debug, PartialEq, Deserialize)]
+///
+/// A template without `bundle` (packet M17/G9: `empty.toml`, and every template the person
+/// saves) has no documents of its own: its projects are editable from the start and run what
+/// they generate ([`source`]); `cycle` is then empty and `robot` is the scene's.
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Template {
     pub kind: String,
@@ -141,13 +153,15 @@ pub struct Template {
     pub name: String,
     pub summary: String,
     pub notice: Option<String>,
+    #[serde(default)]
     pub robot: String,
     pub method: Method,
     pub needs: Vec<String>,
+    #[serde(default)]
     pub cycle: String,
     pub scene: String,
     pub demonstrations: u32,
-    pub bundle: BundleDocs,
+    pub bundle: Option<BundleDocs>,
     /// The demonstration program a project starts from (packet M14/Q3), which
     /// [`Project::create`](crate::model::project::Project::create) copies into the project as
     /// `teach.toml`. Absent: the cycle's `[collect] expert` name is used as it is.
@@ -161,6 +175,13 @@ pub struct Template {
     pub outcome: Option<OutcomeSpec>,
     /// Absent: ① offers no editable copy.
     pub editable: Option<EditableDocs>,
+    /// A template the person saved (packet M17/G9): the template its project was made from,
+    /// which a project made from this one names in its `project.toml`. Absent: this one.
+    pub base: Option<String>,
+    /// Set on the template [`authored`] makes: its documents are a project's `generated/`, and
+    /// its collect bundle is rebuilt from them before each run.
+    #[serde(skip)]
+    pub generated: bool,
 }
 
 const KIND: &str = "template";
@@ -213,26 +234,206 @@ pub fn load(root: &Path) -> (Vec<Template>, Vec<(PathBuf, String)>) {
     paths.sort();
     let (mut ok, mut bad) = (Vec::new(), Vec::new());
     for path in paths {
-        let parsed = std::fs::read_to_string(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|text| toml::from_str::<Template>(&text).map_err(|e| e.to_string()))
-            .and_then(|t| {
-                if t.kind == KIND {
-                    Ok(t)
-                } else {
-                    Err(format!(
-                        "kind = {:?}; a template says kind = {KIND:?}",
-                        t.kind
-                    ))
-                }
-            });
-        match parsed {
+        match read(&path) {
             Ok(t) => ok.push(t),
             Err(why) => bad.push((path, why)),
         }
     }
     ok.sort_by(|a: &Template, b: &Template| a.id.cmp(&b.id));
     (ok, bad)
+}
+
+fn read(path: &Path) -> Result<Template, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let t = toml::from_str::<Template>(&text).map_err(|e| e.to_string())?;
+    if t.kind == KIND {
+        Ok(t)
+    } else {
+        Err(format!(
+            "kind = {:?}; a template says kind = {KIND:?}",
+            t.kind
+        ))
+    }
+}
+
+// --- templates the person saves (packet M17/G9) ----------------------------------------------
+
+/// The file in a saved template's folder; beside it are its documents. Spelt in two literals:
+/// whole, it is shaped like a key of the `template` group (as `project::TEACH_FILE`).
+pub const SAVED_FILE: &str = concat!("template", ".toml");
+
+/// Every `<dir>/<folder>/template.toml` that parses and names its `base`, its document paths
+/// made absolute under its folder, sorted by `id`; and every one that does not, with why.
+pub fn load_saved(dir: &Path) -> (Vec<Template>, Vec<(PathBuf, String)>) {
+    let entries = std::fs::read_dir(dir).into_iter().flatten().flatten();
+    let mut paths: Vec<PathBuf> = (entries.map(|e| e.path().join(SAVED_FILE)))
+        .filter(|p| p.is_file())
+        .collect();
+    paths.sort();
+    let (mut ok, mut bad) = (Vec::new(), Vec::new());
+    for path in paths {
+        let folder = path.parent().unwrap_or(dir).to_path_buf();
+        let abs = |p: &mut String| *p = folder.join(&*p).display().to_string();
+        match read(&path) {
+            Ok(mut t) if t.base.is_some() => {
+                abs(&mut t.scene);
+                if let Some(e) = t.editable.as_mut() {
+                    abs(&mut e.scene);
+                    e.spec.iter_mut().for_each(abs);
+                }
+                ok.push(t);
+            }
+            Ok(_) => bad.push((path, "a saved template names its `base`".to_owned())),
+            Err(why) => bad.push((path, why)),
+        }
+    }
+    ok.sort_by(|a: &Template, b: &Template| a.id.cmp(&b.id));
+    (ok, bad)
+}
+
+/// "Save as template": `<dir>/template.toml` for a project made from `base`, whose documents
+/// `editable` names were copied into `dir` first (`es-editor-scene`'s `copy::documents`). It
+/// keeps `base`'s words, needs, lengths and view under the person's `name`, has no documents
+/// of its own, and names the template its projects are made from — `base`'s own base, so a
+/// project never depends on a folder the person may delete. Written last: its presence is what
+/// makes `dir` a template.
+pub fn write_saved(
+    base: &Template,
+    name: &str,
+    dir: &Path,
+    editable: EditableDocs,
+) -> Result<Template, String> {
+    let folder = dir.file_name().unwrap_or_default().to_string_lossy();
+    let saved = Template {
+        id: format!("saved:{folder}"),
+        name: name.to_owned(),
+        summary: "template.saved.summary".to_owned(),
+        notice: None,
+        cycle: String::new(),
+        scene: editable.scene.clone(),
+        bundle: None,
+        teach: None,
+        teacher: None,
+        outcome: None,
+        editable: Some(editable),
+        base: Some(base.base.clone().unwrap_or_else(|| base.id.clone())),
+        generated: false,
+        ..base.clone()
+    };
+    let path = dir.join(SAVED_FILE);
+    let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+    let text = toml::to_string(&saved).map_err(|e| fail(&e))?;
+    std::fs::write(&path, text).map_err(|e| fail(&e))?;
+    Ok(saved)
+}
+
+// --- what ② to ⑤ run (packet M17/G9) ---------------------------------------------------------
+
+/// Why a project's steps ② to ⑤ cannot run: a key of the string tables and the one argument
+/// its `{}` takes (empty when it takes none). The `watch.task.*` keys are mended in ①.
+pub type Why = (&'static str, String);
+
+/// What an editable project's `generated/` holds against its saved documents, as `es-editor`
+/// found it with `es-editor-scene` (which runs the generator this crate does not have).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Generated {
+    /// No task specification.
+    NoSpec,
+    /// What the saved documents generate: these files.
+    Fresh(Vec<String>),
+    /// ① has changes that are not saved.
+    Unsaved,
+    /// Not what the saved documents generate: never generated, or changed since.
+    Stale,
+    /// The saved documents do not generate: why.
+    Failed(String),
+}
+
+/// The generated documents' folder in an authored project: `generate`'s `out`.
+pub const GENERATED: &str = "generated";
+
+/// The documents ② to ⑤ run for `project`, and the folder `es` runs in. `generated` is `None`
+/// for a project that is not editable: its template's documents, in the repository root, as
+/// before plan G. An editable project without a task of its own keeps its template's documents
+/// when the template has some. With a task it runs what `generated/` holds, in its own root —
+/// the generated documents name `scene.esscene` and the recipes' `runs/` relative to it — or
+/// nothing, with why, while that set is not what its saved documents generate.
+pub fn source(
+    project: &Project,
+    repo_root: Option<PathBuf>,
+    generated: Option<&Generated>,
+) -> Result<(Template, PathBuf), Why> {
+    let root = repo_root.ok_or(("watch.no_checkout", String::new()))?;
+    let id = &project.file.template;
+    let template = (load(&root).0.into_iter())
+        .find(|t| &t.id == id)
+        .ok_or_else(|| ("watch.no_template", id.clone()))?;
+    let why = |key: &'static str| Err((key, String::new()));
+    match generated {
+        None => Ok((template, root)),
+        Some(Generated::NoSpec) if template.bundle.is_some() => Ok((template, root)),
+        Some(Generated::NoSpec) => why("watch.task.none"),
+        Some(Generated::Unsaved) => why("watch.task.unsaved"),
+        Some(Generated::Stale) => why("watch.task.stale"),
+        Some(Generated::Failed(e)) => Err(("watch.task.failed", e.clone())),
+        Some(Generated::Fresh(files)) => {
+            let t = authored(&template, &project.root, files)?;
+            Ok((t, project.root.clone()))
+        }
+    }
+}
+
+/// `base` with an authored project's documents, relative to its `root`: the student arm of
+/// `generated/` as the collect bundle, its teacher when there is one, its cycle and its scene.
+/// The trained teacher demonstrates unless the cycle names an expert. `base` keeps its words,
+/// needs, lengths and view; its outcome is its own task's, so it is not carried over.
+pub fn authored(base: &Template, root: &Path, files: &[String]) -> Result<Template, Why> {
+    let cycle_file = (files.iter().find(|f| f.starts_with("cycle-")))
+        .ok_or(("watch.task.no_cycle", String::new()))?;
+    let at = |f: &str| format!("{GENERATED}/{f}");
+    let path = root.join(at(cycle_file));
+    let cycle = (std::fs::read_to_string(&path).map_err(|e| e.to_string()))
+        .and_then(|text| Cycle::parse(&text).map_err(|e| e.to_string()))
+        .map_err(|e| ("watch.task.failed", format!("{}: {e}", path.display())))?;
+    let name = cycle_file
+        .trim_start_matches("cycle-")
+        .trim_end_matches(".toml");
+    let arm = |kind: &str| at(&format!("{kind}-{name}.toml"));
+    let teacher = files
+        .iter()
+        .any(|f| f == "training-teacher.toml")
+        .then(|| TeacherDocs {
+            recipe: at("training-teacher.toml"),
+            evaluation: at("evaluation-teacher.toml"),
+            task: at("task.toml"),
+            observation: at("observation-teacher.toml"),
+            learning: at("learning-teacher.toml"),
+            deployment: at("deployment-teacher.toml"),
+            jobs: cycle.eval.jobs,
+        });
+    let collect = cycle.collect.as_ref();
+    let by_teacher = teacher.is_some() && collect.is_some_and(|c| c.expert.is_none());
+    Ok(Template {
+        method: if by_teacher {
+            Method::Teacher
+        } else {
+            Method::Blocks
+        },
+        cycle: at(cycle_file),
+        scene: cycle.scene.clone(),
+        demonstrations: collect.map_or(base.demonstrations, |c| c.episodes),
+        bundle: Some(BundleDocs {
+            task: at("task.toml"),
+            observation: arm("observation"),
+            learning: Some(arm("learning")),
+            deployment: arm("deployment"),
+        }),
+        teacher,
+        teach: None,
+        outcome: None,
+        generated: true,
+        ..base.clone()
+    })
 }
 
 #[cfg(test)]
@@ -271,7 +472,7 @@ mod tests {
         ];
         for (id, has_learning, [name, summary, notice]) in cards {
             let cube = ok.iter().find(|t| t.id == id).expect(id);
-            let b = &cube.bundle;
+            let b = cube.bundle.as_ref().expect("[bundle]");
             assert_eq!(b.learning.is_some(), has_learning, "{id}");
             // Packet M17/G5: the scene as a scene document, and no task specification yet.
             let editable = cube.editable.as_ref().expect("[editable]");
@@ -350,7 +551,7 @@ mod tests {
         assert_eq!(hand.method, Method::Teacher);
         assert!(hand.teach.is_none() && hand.needs.iter().any(|n| n == "mjwarp"));
         let t = hand.teacher.as_ref().expect("[teacher]");
-        let b = &hand.bundle;
+        let b = hand.bundle.as_ref().expect("[bundle]");
         // Packet M17/G5: its scene document and task specification, for an editable copy.
         let editable = hand.editable.as_ref().expect("[editable]");
         let spec = editable.spec.as_ref().expect("a task specification");
@@ -396,6 +597,34 @@ mod tests {
         for lang in Lang::ALL {
             let keys = [&hand.name, &hand.summary, &o.object_name, &o.target_name];
             for key in keys.into_iter().chain(hand.notice.as_ref()) {
+                assert_ne!(Strings::get(lang).t(key), key, "{key}");
+            }
+        }
+    }
+
+    /// The empty card (packet M17/G9): no documents of its own — no bundle, cycle, teacher or
+    /// outcome — the empty scene as its scene document, no GPU simulator needed to build one,
+    /// and its words in both tables.
+    #[test]
+    fn the_empty_template_has_no_documents_of_its_own() {
+        use super::Method;
+        let root = find_root(Some(Path::new(env!("CARGO_MANIFEST_DIR")))).expect("a checkout");
+        let empty = (load(&root).0.into_iter())
+            .find(|t| t.id == "empty")
+            .expect("the empty template");
+        assert!(empty.bundle.is_none() && empty.teacher.is_none() && empty.outcome.is_none());
+        assert!(empty.cycle.is_empty() && empty.teach.is_none() && empty.base.is_none());
+        assert_eq!(empty.method, Method::Teacher);
+        let e = empty.editable.as_ref().expect("[editable]");
+        let scene = "tests/fixtures/esscene/empty.esscene";
+        assert_eq!((e.scene.as_str(), e.spec.as_deref()), (scene, None));
+        assert_eq!(empty.scene, scene);
+        assert!(root.join(scene).is_file());
+        assert!(!empty.needs.iter().any(|n| n == "mjwarp"));
+        let words = ["template.empty.name", "template.empty.summary"];
+        assert_eq!([empty.name.as_str(), empty.summary.as_str()], words);
+        for lang in Lang::ALL {
+            for key in words {
                 assert_ne!(Strings::get(lang).t(key), key, "{key}");
             }
         }
