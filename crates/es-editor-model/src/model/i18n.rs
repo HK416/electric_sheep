@@ -116,9 +116,106 @@ pub fn t(lang: Lang, key: &'static str) -> &'static str {
     Strings::get(lang).t(key)
 }
 
-/// [`Strings::fill`] on `lang`'s table.
+/// [`Strings::fill`] on `lang`'s table, its Korean particles picked from the words filled in
+/// ([`particles`]).
 pub fn fill(lang: Lang, key: &str, args: &[&str]) -> String {
-    Strings::get(lang).fill(key, args)
+    particles("", &Strings::get(lang).fill(key, args))
+}
+
+/// How a word ends when a Korean reader reads it aloud, which picks the particle after it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ending {
+    /// No final consonant (batchim).
+    Vowel,
+    /// A final consonant other than rieul.
+    Consonant,
+    /// A final rieul: a consonant, except that it takes ro rather than euro.
+    Rieul,
+}
+
+/// The particle pairs the Korean table writes after a hole, in the textbook's placeholder form,
+/// and the form each [`Ending`] takes, in its order. Romanized, since source files hold no
+/// Hangul: i(ga), eun(neun), eul(reul), wa(gwa), (eu)ro.
+const PAIRS: [(&str, [&str; 3]); 5] = [
+    ("\u{c774}(\u{ac00})", ["\u{ac00}", "\u{c774}", "\u{c774}"]),
+    ("\u{c740}(\u{b294})", ["\u{b294}", "\u{c740}", "\u{c740}"]),
+    ("\u{c744}(\u{b97c})", ["\u{b97c}", "\u{c744}", "\u{c744}"]),
+    ("\u{c640}(\u{acfc})", ["\u{c640}", "\u{acfc}", "\u{acfc}"]),
+    (
+        "(\u{c73c})\u{b85c}",
+        ["\u{b85c}", "\u{c73c}\u{b85c}", "\u{b85c}"],
+    ),
+];
+
+/// How `word` ends when read in Korean (packet M17/R4):
+///
+/// - a Hangul syllable by its final consonant, `(c - 0xAC00) % 28` (0 none, 8 rieul);
+/// - a number's unit as the task's sentences write it (` cm`, `°`, ` s`, `/s`, `%`: senti-miteo,
+///   do, cho, peosenteu): a vowel;
+/// - a digit as Sino-Korean reads it: 2, 4, 5, 9 a vowel (i, sa, o, gu); 1, 7, 8 rieul (il,
+///   chil, pal); 3, 6 and 0 a consonant (sam, yuk; 0 is yeong alone and sip, baek, cheon closing
+///   a longer number);
+/// - a Latin word by how Korean writes its end (the loanword orthography), a silent `e` after
+///   `l`, `m` or `n` dropped: `l` rieul (roll, table); `m`, `n` or `ng` a consonant (arm, pan,
+///   zone, ring); `p`, `t`, `k` or `ck` after a single vowel letter a consonant, a short vowel's
+///   final stop being written as a final consonant (cup, target, pick); anything else a vowel
+///   (object, cube, box, gripper, x);
+/// - anything else, the empty word included: a vowel.
+pub fn ending(word: &str) -> Ending {
+    if [" cm", "\u{b0}", " s", "/s", "%"]
+        .iter()
+        .any(|u| word.ends_with(u))
+    {
+        return Ending::Vowel;
+    }
+    match word.chars().last() {
+        Some(c @ '\u{ac00}'..='\u{d7a3}') => match (u32::from(c) - 0xac00) % 28 {
+            0 => Ending::Vowel,
+            8 => Ending::Rieul,
+            _ => Ending::Consonant,
+        },
+        Some('1' | '7' | '8') => Ending::Rieul,
+        Some('0' | '3' | '6') => Ending::Consonant,
+        Some(c) if c.is_ascii_alphabetic() => {
+            let w = word.to_ascii_lowercase();
+            let vowel = |c: Option<char>| c.is_some_and(|c| "aeiou".contains(c));
+            let short_stop = ["p", "t", "k", "ck"].iter().any(|stop| {
+                w.strip_suffix(stop).is_some_and(|rest| {
+                    let mut r = rest.chars().rev();
+                    vowel(r.next()) && !vowel(r.next())
+                })
+            });
+            let spoken = (w.strip_suffix('e')).filter(|r| r.ends_with(['l', 'm', 'n']));
+            let spoken = spoken.unwrap_or(&w);
+            if spoken.ends_with('l') {
+                Ending::Rieul
+            } else if spoken.ends_with(['m', 'n']) || spoken.ends_with("ng") || short_stop {
+                Ending::Consonant
+            } else {
+                Ending::Vowel
+            }
+        }
+        _ => Ending::Vowel,
+    }
+}
+
+/// `text` with each particle pair of the Korean table resolved by the word before it
+/// ([`ending`]): the text before the pair, or `before` for a pair that opens `text` (a sentence's
+/// words after a slot's widget). A text without pairs, English, comes back as it was.
+pub fn particles(before: &str, text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(c) = rest.chars().next() {
+        if let Some((pair, forms)) = PAIRS.iter().find(|(p, _)| rest.starts_with(p)) {
+            let end = ending(if out.is_empty() { before } else { &out });
+            out.push_str(forms[end as usize]);
+            rest = &rest[pair.len()..];
+        } else {
+            out.push(c);
+            rest = &rest[c.len_utf8()..];
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -261,5 +358,90 @@ mod tests {
         // More holes than arguments leaves the rest alone rather than panicking.
         let short = fill(Lang::En, concat!("status", ".", "hash"), &["Task"]);
         assert!(short.contains("Task") && short.contains("{}"), "{short}");
+    }
+
+    /// Oracle 1 (packet M17/R4): how a word ends, by script. Hangul is written as escapes,
+    /// romanized beside them, since source files hold none.
+    #[test]
+    fn a_words_ending_is_read_from_its_last_sound() {
+        use super::{ending, Ending::*};
+        for (word, want) in [
+            ("\u{ac00}", Vowel),         // ga
+            ("\u{c0c1}\u{c790}", Vowel), // sangja
+            ("\u{ac01}", Consonant),     // gak
+            ("\u{ac15}", Consonant),     // gang
+            ("\u{ac08}", Rieul),         // gal
+            ("\u{bb3c}", Rieul),         // mul
+            ("object", Vowel),           // obeujekteu
+            ("cube", Vowel),             // kyubeu
+            ("box", Vowel),              // bakseu
+            ("gripper", Vowel),          // geurippeo
+            ("cube.x", Vowel),           // ekseu
+            ("shoulder_lift", Vowel),    // lipeuteu
+            ("seat", Vowel),             // siteu: a long vowel's stop is no final consonant
+            ("target", Consonant),       // tagit
+            ("robot", Consonant),        // robot
+            ("CUP", Consonant),          // keop
+            ("pick", Consonant),         // pik
+            ("shoulder_pan", Consonant), // paen
+            ("arm", Consonant),          // am
+            ("ring", Consonant),         // ring
+            ("zone", Consonant),         // jon: the e is silent
+            ("wrist_roll", Rieul),       // rol
+            ("table", Rieul),            // teibeul
+            ("l", Rieul),                // el
+            ("2", Vowel),                // i
+            ("9", Vowel),                // gu
+            ("cube2", Vowel),            // i
+            ("1", Rieul),                // il
+            ("86.7", Rieul),             // chil
+            ("8", Rieul),                // pal
+            ("3", Consonant),            // sam
+            ("6", Consonant),            // yuk
+            ("0", Consonant),            // yeong
+            ("10", Consonant),           // sip
+            ("9 cm", Vowel),             // senti-miteo
+            ("(100, 86.7, 17.72) cm", Vowel),
+            ("5.73\u{b0}", Vowel), // do
+            ("5 cm/s", Vowel),
+            ("10\u{b0}/s", Vowel),
+            ("8 s", Vowel),  // cho
+            ("20 %", Vowel), // peosenteu
+            ("", Vowel),
+            (")", Vowel),
+        ] {
+            assert_eq!(ending(word), want, "{word:?}");
+        }
+    }
+
+    /// Oracle 1 (packet M17/R4): each pair takes the form its word asks for, (eu)ro takes ro
+    /// after rieul, a text without pairs is unchanged, and `fill` picks them.
+    #[test]
+    fn particles_follow_the_word_before_them() {
+        use super::particles;
+        const I_GA: &str = "\u{c774}(\u{ac00})";
+        const WA_GWA: &str = "\u{c640}(\u{acfc})";
+        const EURO: &str = "(\u{c73c})\u{b85c}";
+        // object-ga target-gwa
+        let text = format!("object{I_GA} target{WA_GWA} ");
+        assert_eq!(particles("", &text), "object\u{ac00} target\u{acfc} ");
+        // A pair that opens the text follows `before`: a slot's widget.
+        assert_eq!(particles("target", &format!("{I_GA} ")), "\u{c774} ");
+        assert_eq!(particles("", I_GA), "\u{ac00}", "no word: a vowel");
+        // mul-lo, gak-euro, cube-ro
+        assert_eq!(particles("\u{bb3c}", EURO), "\u{b85c}");
+        assert_eq!(particles("\u{ac01}", EURO), "\u{c73c}\u{b85c}");
+        assert_eq!(particles("cube", EURO), "\u{b85c}");
+        // eun(neun), eul(reul)
+        let eun = particles("pan", "\u{c740}(\u{b294})");
+        let reul = particles("box", "\u{c744}(\u{b97c})");
+        assert_eq!([eun.as_str(), reul.as_str()], ["\u{c740}", "\u{b97c}"]);
+        assert_eq!(particles("x", "is inside (2)"), "is inside (2)");
+        let missing = fill(
+            Lang::Ko,
+            concat!("author", ".", "refused", ".", "missing"),
+            &["box"],
+        );
+        assert!(missing.starts_with("box\u{ac00} "), "{missing}");
     }
 }
