@@ -220,3 +220,126 @@ at the committed angles (45°, 70°): over 1°–179° in 0.001° steps 4.1 % of
 angle (e.g. a 68° camera) may differ from a regenerated one in its last bit. The orchestrator kept
 musl — spec §5.3's rule for numbers that enter a hash. The fixture generators in
 `crates/es/tests/{shadow_hand,views}.rs` still call the host; they agree at their committed angles.
+
+**G6 as merged (2026-10-01):** picking is the segmentation id at the clicked point read on the CPU
+(the renderer's own ray and nearest-hit rule against the drawn triangles; no readback, no
+`es-render` change). Anything an include brings selects the include. Snapping is on by default.
+The corner draws the policy's declared camera through `es-env`'s single-camera render steps, so
+`es-editor` now takes `es-env` with `render`. Design note section 5.2 records the rest. `es-editor` is
+at 6,816 lines (past its 6,000 target, under the cap). Wave 3's CI passed on 1bc3bfc.
+
+### Task G7: Add (primitives, files, robot library, camera, light, region)
+
+**Files:** `crates/es-editor-scene` (new modules: what each Add item makes and where it goes, file
+import into `assets/`, include overrides), `crates/es-editor/src/ui/**` (the Add menu in a new file,
+camera and region markers, the overrides inspector), i18n, a robot library list
+`templates/robots.toml`, a test fixture `tests/fixtures/esscene/empty.esscene` (floor, light, one
+camera), the design note's section 5.3 (+ko). Not `es-assets`, unless a reader refuses a file the library
+needs.
+
+- **①'s Add menu.**
+  - **Object:** a box, sphere, cylinder or capsule, as a free body with one geom.
+  - **Fixed object:** static scenery.
+  - **Mesh file:** an STL or OBJ, as a free body with a mesh geom.
+  - **Robot:** from the library (SO-101, Shadow Hand), or from an MJCF, URDF or glTF file. Either
+    way it becomes an `[[include]]`.
+  - **Camera:** at the viewport's eye, looking where the view looks.
+  - **Light** and **region** (a box zone).
+- **Where a new thing goes.** It goes where the view's centre ray meets the scene
+  (`SceneModel::hit`), resting on that surface; with no hit, at the origin. Its name is
+  `unique(stem)`. It ends up selected, and one Add is one undo step.
+- **Imports are copied by content** (design note section 3.1, its section 9 default 3).
+  - A mesh or texture file goes to `assets/<blake3>.<ext>`.
+  - A robot file goes to `assets/<blake3 of the file>/`, together with the files it names (meshes,
+    textures, `meshdir`), keeping their relative paths, so its reader resolves them unchanged.
+    The library's robots are copied the same way.
+  - Copying the same file twice writes nothing new.
+  - A file that does not read or expand is refused with the reader's reason, and leaves nothing
+    behind.
+- **Texture import:** the material picker gains "from an image file". That one command adds a
+  `[[texture]]` and a `[[material]]` and sets the selected geom's material.
+- **Cameras and regions in the viewport.**
+  - They are drawn as line overlays: a camera's frustum, a region's box.
+  - They are picked in screen space within a few pixels, and get G6's handles (a region's size
+    too).
+- **Include overrides:** the inspector edits `[include.set]` (G1's targets: joint `range`,
+  `damping`, `armature`, `stiffness`, `frictionloss`; actuator `kp`, `kv`, `ctrlrange`,
+  `forcerange`; geom `rgba`, `material`), by the asset's own names. Clearing a field drops its
+  override.
+- **Oracles** (headless unless noted):
+  1. **Each Add item** on the Shadow Hand copy and on `empty.esscene`:
+     - the result expands and maps onto `mujoco-cpu`;
+     - the new entity is selected;
+     - it is one undo step, and undo restores the bytes.
+  2. **Placement:** a box added on a scripted centre ray at the SO-101 table rests on it (its
+     bottom at the hit height, within 1e-9). A ray that hits nothing places it at the origin.
+  3. **Import by content.**
+     - Importing `so101.xml` with its meshes twice into a temporary project writes
+       `assets/<hash>/…` once.
+     - The expansion's per-asset content hashes equal the source's.
+     - A broken file is refused, with nothing added and no new file.
+     - A document with an imported mesh survives a read and write round trip.
+  4. **The library's SO-101**, added to `empty.esscene`, expands to `so101.xml`'s bodies, joints
+     and actuators (names, ranges) at its pose.
+  5. **Overrides:** setting an included joint's range writes `[include.set.joint.<name>]`, which
+     the expansion shows; clearing the field removes the table.
+  6. **Picking markers:** screen-space picks of a camera marker and a region box, on scripted
+     points.
+  7. **Screenshots:** the Add menu; a box added on the table in the SO-101 copy; a robot added to
+     an empty scene.
+
+### Task G8: the sentence editor
+
+**Files:** `crates/es-editor-scene` (a new module: the specification as sentence rows, the
+vocabulary each subject takes, commands on the specification), `crates/es-editor/src/ui/**` (the
+sentence panel in ①, in a new file), i18n, `crates/es-script/src/spec/**` only for a helper the
+editor reads (the vocabulary, a clause's words) that changes no compiled byte, the design note's section 4.6
+(+ko).
+
+- **The task part of ①.** The specification reads as sentences with a drop-down per slot
+  ("[cube] is [inside] [bin]", "fails if [cube] is farther than [24 cm] from [palm]", "fails if
+  not done within [8 s]").
+  - **Subjects:** the scene's bodies, the robot's joints, `<body>.x/.y/.z`, regions.
+  - **Relations:** only those the subject's kind takes (design note sections 4.1, 4.3, 4.4). `touches` is shown
+    disabled, with its reason.
+  - **Fields:** numbers in the person's units (cm, °, s).
+  - **Clauses:** add, remove, reorder; failure clauses; the time limit.
+  - **Start items:** `what`, 🎲, noise, and one strength (low / medium / high).
+  - **Observe:** the cameras as a checklist of the scene's cameras, `camera_px`, the render look
+    (quick / material / PT with samples), the state and privileged sources.
+  - **Reward:** the success bonus, and each clause's shaping on or off with a three-level weight.
+    The numbers behind the levels are this packet's default and the owner's to change (design note section 9, item 5). A
+    weight at no level shows as "custom (value)" and is kept as written.
+- **Every edit is one command** on `SceneModel`: a command that replaces the specification. It is
+  checked by `compile_task` on the scene as edited and refused in place, naming the clause and the
+  field (G3a's refusals). It is one undo step, and the corner follows it (the revision moves).
+  G5's policy holds: the model's specification always compiles, or there is none.
+- **A project with no `task.estask`** (an SO-101 copy) starts one with "say the task". That is one
+  command producing a specification that compiles, from defaults the person then edits.
+- **A check as the person goes:** an observed camera that does not see a clause's subject at its
+  start position. This is one CPU ray from the camera to the subject (G6's `view` and `hit`); the
+  first hit must be the subject. It is shown in words beside the camera.
+- **Oracles** (headless unless noted):
+  1. **Round trip:** each committed specification (`shadow_hand_repose.estask`,
+     `so101_views.estask`) loaded into the sentence model and written back without an edit gives
+     an equal `TaskSpec`. Its sentences, in Korean and English, are pinned in the test.
+  2. **Every edit kind** is one undo step that compiles:
+     - a clause added, removed or moved; a relation; a field;
+     - a start item's 🎲, noise and the strength;
+     - the cameras, the render look, a reward level.
+
+     Changing the success angle moves `task_hash` and not `scene_hash`.
+  3. **Refusals:** a relation the subject does not take is not offered. A missing field, a time
+     limit that is not whole ticks, and `touches` are refused, naming the clause and field, and
+     nothing changes.
+  4. **A new task on the SO-101 copy:** "say the task", a region added (G5's `Add`), then
+     "[cube] is inside [region]" and "[cube] is still". It compiles, and `generate` writes the
+     documents.
+  5. **The camera check** on scripted scenes: a camera looking at the cube passes; one turned
+     away or blocked fails.
+  6. **Screenshots:** the Shadow Hand copy's sentences in Korean; an edit with a refusal; the
+     SO-101 copy with its new task.
+
+G7 and G8 run in parallel, each in new files. Where both must touch a shared file (`lib.rs`,
+`author.rs`, the i18n tables), each keeps its hook small and its keys in a block of its own. The
+orchestrator rebases the second onto the first.
