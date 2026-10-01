@@ -26,7 +26,7 @@ generated documents — and trains it, without writing MJCF, TOML IR or Rust.
 |---|---|---|
 | 1 | G1 the scene document · G2 the full MJCF exporter | — |
 | 2 | G3a task spec → Task IR · G4 `es scene simulate` and ①'s physics preview (`es render` landed as H8/H9) | G1 |
-| 2b | G3b the other documents + `es project generate` | G3a |
+| 2b | G3b the other documents + `es project generate` · G3c three-axis relations (`Slice`, `Concat`, `Reduce`, `GetBodyVelocity` lowered) | G3a |
 | 3 | G5 editor scene model · G6 viewport picking and gizmos | G1, G4, H8 |
 | 4 | G7 Add (primitives, meshes, robots, cameras, lights, regions) · G8 sentence editor | G5, G3 |
 | 5 | G9 empty-project card, save as template, ② teacher for generated tasks | G3, G8 |
@@ -134,3 +134,26 @@ registration, tests, fixtures. After G3a.
 - **Oracles:** the CLI's trajectory equals stepping the same scene through `MuJoCoCpuBackend`
   directly (bitwise on `mujoco-cpu`); a cube dropped above a plane comes to rest on it; the
   view-model's decisions headless; a screenshot of the preview on the Shadow Hand project.
+
+**G3a as merged (2026-10-01):** both specs compile to the committed `task_hash` (Shadow Hand
+`e16b44a9…`, SO-101 views `33f55c29…`); `task_graph_hash` differs (it mixes node ids; the committed
+numbering is generator history) — **the orchestrator accepts semantic `task_hash` equality as the
+target for G3b too**. `inside` and `still` are one-axis because es-env's cone lowering has no
+`Slice`, `Concat`, `Reduce` or `GetBodyVelocity` (G3c). The compiler calls the host's `cos` / `tan`
+for the angle threshold, the camera focal length and the tilt bound (G3b settles it).
+
+### Task G3c: three-axis relations
+
+**Files:** `crates/es-env/src/plan.rs` (+ its tests), `crates/es-script/src/spec/compile.rs` (the
+clause functions only), `crates/es-script/tests/estask_scripted.rs`, design note §4.1 (+ko).
+
+- es-env lowers `Slice`, `Concat`, `Reduce` and `GetBodyVelocity` in its reward / termination
+  cones, with the semantics `es-ir` defines (check `crates/es-ir/src/task.rs`'s output types and
+  any CPU reference evaluator), so a relation can read a 3-vector.
+- The vocabulary then offers `inside` a scene **region** (an `.esscene` `[[region]]` / MJCF site
+  box, all three axes), `still` as the body's linear speed (3-D) and optionally angular, `above`
+  / `below` another body, and `<body>.y` / `.z` subjects.
+- **Oracles:** each lowered node against hand-computed values on scripted states (as G3a's
+  `estask_scripted.rs`); every committed task document's evaluation unchanged (its `task_hash`
+  and the reach / SO-101 / Shadow Hand reward goldens and bitwise RL tests); the two reference
+  specs still compile to their committed `task_hash`.
