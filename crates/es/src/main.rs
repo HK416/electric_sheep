@@ -36,6 +36,7 @@ USAGE:
     es policy pack --policy <in.esb> --weights <model.safetensors> --out <out.esb>
     es backend compare --scene <file.xml|urdf> --backends mujoco-cpu,mjwarp[,newton,physx]
     es bench [--memory-report --obs <obs.toml> ...]
+    es render --scene <file.xml|urdf> --eye X,Y,Z --look-at X,Y,Z --out <file.ppm|-> [OPTIONS]
     es video mosaic --frames <dir> --events <events.json> --report <report.json>
                     --grid RxC --out <dir> [--label-height N]
 
@@ -70,6 +71,12 @@ fn dispatch(args: &[String]) -> Result<u8, CliError> {
         Some("backend") => cmd::backend::dispatch(&args[1..]),
         Some("bench") => cmd::bench::dispatch(&args[1..]),
         Some("video") => Ok(cmd::video::dispatch(&args[1..]) as u8),
+        #[cfg(feature = "render")]
+        Some("render") => es_tools::render::run(&args[1..]),
+        #[cfg(not(feature = "render"))]
+        Some("render") => Err(CliError::Usage(
+            "es render needs the `render` feature; this build links no renderer".to_owned(),
+        )),
         Some(other) => Err(CliError::Usage(format!(
             "unknown command '{other}'\n\n{TOP_HELP}"
         ))),
