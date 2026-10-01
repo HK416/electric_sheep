@@ -159,7 +159,10 @@ Directions already fixed for S2–S6 (each still gets its own design pass):
   `es project generate` command turns scene + choices into the five documents (so the CLI and
   the editor share it); an `es render` command renders one frame of a declared camera through
   `es-render`, so the preview is the real observation and the editor still creates no Vulkan
-  device. The sentence editor offers only what `es-env` lowers. "Held for 1 s" compiles to
+  device. (Packet M16/H8 built its free-camera half: `es render --scene … [--traj … --tick N]
+  --eye … --look-at … --path rs|full|pt --out -` streams accumulated path-traced frames as PPMs,
+  and every viewport has a look selector — fast raster, materials through `es_render::cpu`'s
+  `Rs` `Full` on worker threads, path-traced through that command.) The sentence editor offers only what `es-env` lowers. "Held for 1 s" compiles to
   "inside and nearly still" (the demo's settling bound) because IR-D has no hold node; the
   lowering gains multi-lane `GetJointState`, `Slice` and `GetBodyVelocity` (`es-env`, not
   `es-ir`). Contact conditions wait for `GetContact` lowering. **Why an attempt failed comes from

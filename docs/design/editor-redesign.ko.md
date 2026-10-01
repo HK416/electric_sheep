@@ -148,7 +148,10 @@ S2–S6에 이미 정한 방향(각자 설계를 한 번 더 거친다):
 - **S4.** 에디터는 장면 모델을 편집하고 `scene_to_mjcf`로 MJCF를 쓴다. `es project generate`
   명령이 장면과 선택을 문서 다섯 개로 바꾼다(CLI와 에디터가 공유). `es render` 명령이 선언된
   카메라의 한 프레임을 `es-render`로 렌더하므로, 미리보기는 실제 관찰이고 에디터는 여전히
-  Vulkan 장치를 만들지 않는다. 문장 편집기는 `es-env`가 낮출 수 있는 것만 보여 준다.
+  Vulkan 장치를 만들지 않는다. (패킷 M16/H8이 자유 카메라 쪽을 만들었다: `es render --scene …
+  [--traj … --tick N] --eye … --look-at … --path rs|full|pt --out -`가 누적된 경로 추적 프레임을
+  PPM으로 내보내고, 모든 뷰포트에 보기 선택이 생겼다 — 빠른 래스터, 작업 스레드에서 도는
+  `es_render::cpu`의 `Rs` `Full`로 그린 재질, 이 명령으로 그린 경로 추적.) 문장 편집기는 `es-env`가 낮출 수 있는 것만 보여 준다.
   "1초 머묾"은 IR-D에 머묾 노드가 없으므로 "안에 있고 거의 멈춤"(데모의 정착 기준)으로
   컴파일한다. 낮추기는 여러 lane의 `GetJointState`, `Slice`, `GetBodyVelocity`를 얻는다
   (`es-ir`이 아니라 `es-env`). 접촉 조건은 `GetContact` 낮추기를 기다린다. **시도가 왜 실패했는지는
