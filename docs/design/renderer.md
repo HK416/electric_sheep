@@ -2332,7 +2332,7 @@ reproduces all three bit for bit, and so does the GPU (0 of 12,288 bytes each).
 - **A persistent texture buffer**: the texels ride in the triangle buffer and are re-uploaded
   with every frame's triangles (`ponytail:` at `pack_materials`). What that costs on the hand's
   cameras is `Target / Status: unverified` until `frame_profile` measures it.
-- **The editor's replay rasterizer** (`raster.rs`) draws the base colour factor, not the texel.
+- **The editor's replay rasterizer** (`raster.rs`) draws the base colour factor, not the texel (the viewport's material and path-traced looks of packet M16/H8 draw it).
 
 ## 16. Normal and emissive maps, glTF materials (plan H, HT2)
 
@@ -2466,4 +2466,4 @@ and so does the GPU (0 of 12,288 bytes each).
   **JPEG** images, **`TEXCOORD_1`**, **alpha** (`MASK` / `BLEND`, reported), glTF **cameras** and
   **lights** (not imported), sampler **filters** (bilinear always, no mipmaps, section 15.5).
 - **A normal map on a cube texture**: refused by name; tangent space needs UVs.
-- **The editor's replay rasterizer** (`raster.rs`) still draws the base colour factor only.
+- **The editor's replay rasterizer** (`raster.rs`) still draws the base colour factor only (the M16/H8 looks draw the maps).

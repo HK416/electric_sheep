@@ -575,3 +575,16 @@
 "teach.try.success" = "성공"
 "teach.try.failed" = "실패"
 "teach.try.failed_because" = "실패 — {}"
+
+# 뷰포트의 세 가지 보기 (packet M16/H8).
+"viewport.label" = "보기:"
+"viewport.fast" = "빠르게"
+"viewport.material" = "재질"
+"viewport.realistic" = "사실적 (PT)"
+"viewport.fast.hint" = "단색으로 곧바로 그립니다. 시점을 돌려도 부드럽습니다."
+"viewport.material.hint" = "텍스처와 재질을 입혀 그립니다. 시점이 멈추고 잠시 뒤 이 PC의 프로세서가 그립니다."
+"viewport.realistic.hint" = "그래픽카드에서 빛을 추적해 그립니다. 시점을 오래 멈춰 둘수록 그림이 깨끗해지고, 움직이는 동안에는 빠른 보기로 보여 줍니다."
+"viewport.rendering" = "그리는 중..."
+"viewport.samples" = "점점 깨끗해지는 중: 샘플 {} / {}"
+"viewport.finished" = "완료: 샘플 {}"
+"viewport.failed" = "이 보기로 그리지 못했습니다: {}"

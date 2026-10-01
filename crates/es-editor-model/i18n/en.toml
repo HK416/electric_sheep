@@ -576,3 +576,16 @@
 "teach.try.success" = "Succeeded"
 "teach.try.failed" = "Failed"
 "teach.try.failed_because" = "Failed — {}"
+
+# The viewport's three looks (packet M16/H8).
+"viewport.label" = "Look:"
+"viewport.fast" = "Fast"
+"viewport.material" = "Materials"
+"viewport.realistic" = "Realistic (PT)"
+"viewport.fast.hint" = "Plain colours, drawn at once, so turning the view stays smooth."
+"viewport.material.hint" = "Textures and materials, drawn on this PC's processor a moment after the view stops moving."
+"viewport.realistic.hint" = "Light traced on the graphics card. The picture gets cleaner the longer the view holds still; while it moves, the fast look stands in."
+"viewport.rendering" = "Drawing..."
+"viewport.samples" = "Getting cleaner: {} of {} samples"
+"viewport.finished" = "Done: {} samples"
+"viewport.failed" = "Could not draw this look: {}"

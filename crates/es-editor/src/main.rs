@@ -1,5 +1,5 @@
-//! `es-editor [project-dir|bundle.esb|run-dir] [--attach <addr> [--token <t>]] [--step <1-5>]`
-//! — the editor shell of spec 23.
+//! `es-editor [project-dir|bundle.esb|run-dir] [--attach <addr> [--token <t>]] [--step <1-5>]
+//! [--viewport fast|material|pt]` — the editor shell of spec 23.
 //!
 //! `es-editor --import <project-dir> --template <id> ...` makes a project of runs that ran
 //! outside the editor and opens it; the grammar is [`es_editor::model::import`]'s (packet
@@ -11,16 +11,20 @@
 use es_editor::model::import::Import;
 use es_editor::model::telemetry_view::{attach, replay};
 use es_editor::model::template;
+use es_editor::model::viewport::Mode;
 use es_editor::EditorApp;
 
 fn main() -> eframe::Result<()> {
     let (mut path, mut addr, mut token, mut step) = (None, None, None, None);
+    let mut look = None;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--attach" => addr = args.next(),
             "--token" => token = args.next(),
             "--step" => step = args.next().and_then(|s| s.parse::<usize>().ok()),
+            // The viewport's look at start (packet M16/H8); the selector changes it after.
+            "--viewport" => look = args.next().as_deref().and_then(Mode::parse),
             "--import" => match import(&args.by_ref().collect::<Vec<_>>()) {
                 Ok(project) => path = Some(project),
                 Err(e) => {
@@ -59,6 +63,9 @@ fn main() -> eframe::Result<()> {
             // M7/E6). Which font, where in the fallback chain, and what a machine with none
             // is told are all `model/fonts.rs`'s and the string tables'.
             app.apply_style(&cc.egui_ctx);
+            if let Some(look) = look {
+                es_editor::ui::advanced::set_viewport_mode(&cc.egui_ctx, look);
+            }
             if let Some(path) = &path {
                 app = app.with_path(path);
             }
